@@ -56,6 +56,15 @@
   #type-bars { display: flex; gap: 0; padding: 0 20px; flex-shrink: 0; border-bottom: 1px solid #141828; background: #08081a; overflow: hidden; height: 28px; align-items: center; }
   .type-segment { height: 6px; transition: flex 0.5s ease-out; border-radius: 3px; margin: 0 1px; min-width: 2px; }
 
+  /* ---- PEERS ---- */
+  #peers-bar { display: flex; gap: 0; padding: 4px 20px; flex-shrink: 0; border-bottom: 1px solid #141828; background: #08081a; align-items: center; font-size: 11px; overflow: hidden; cursor: pointer; }
+  #peers-bar:hover { background: #0c0c20; }
+  #peers-label { color: #3a4a6a; margin-right: 12px; white-space: nowrap; }
+  #peers-list { display: flex; gap: 6px; overflow: hidden; flex: 1; }
+  .peer-chip { background: #101028; border: 1px solid #1a1a30; border-radius: 3px; padding: 2px 8px; color: #4a6a9a; white-space: nowrap; font-size: 10px; }
+  .peer-chip .hops { color: #2a3a5a; margin-left: 4px; }
+  #peers-count { color: #0085FF; margin-left: 8px; white-space: nowrap; }
+
   /* ---- FEED ---- */
   #feed-container { flex: 1; padding: 8px 20px 36px; overflow: hidden; }
   #feed { height: 100%; overflow-y: auto; border: 1px solid #141828; border-radius: 4px; background: #08081a; }
@@ -135,6 +144,13 @@
 <!-- Type distribution bar -->
 <div id="type-bars"></div>
 
+<!-- Peer list -->
+<div id="peers-bar">
+  <span id="peers-label">PEERS</span>
+  <div id="peers-list"></div>
+  <span id="peers-count"></span>
+</div>
+
 <!-- Stats row -->
 <div id="stats-row">
   <div class="stat-cell">msgs <span class="val" id="msg-count">0</span></div>
@@ -162,6 +178,8 @@ const uptimeEl = document.getElementById('uptime');
 const sparkContainer = document.getElementById('sparkline-container');
 const cycleEl = document.getElementById('cycle');
 const typeBarsEl = document.getElementById('type-bars');
+const peersListEl = document.getElementById('peers-list');
+const peersCountEl = document.getElementById('peers-count');
 
 let count = 0, valCount = 0, propCount = 0, txCount = 0;
 let startTime = Date.now();
@@ -199,6 +217,16 @@ const typeColors = {
   GetLedger: '#ef4444', LedgerData: '#14b8a6', Ping: '#1a2030'
 };
 const typeCounts = {};
+
+function updatePeers(peers) {
+  if (!peers || peers.length === 0) return;
+  peersCountEl.textContent = peers.length;
+  let html = '';
+  for (const p of peers) {
+    html += `<div class="peer-chip">${p.endpoint}<span class="hops">h${p.hops}</span></div>`;
+  }
+  peersListEl.innerHTML = html;
+}
 
 function updateSparkline() {
   const now = Math.floor(Date.now() / 1000);
@@ -277,6 +305,7 @@ function addMessage(ev) {
   }
 
   updateCycle(ev.msg_type);
+  if (ev.peers) updatePeers(ev.peers);
 
   const row = document.createElement('div');
   row.className = `msg t-${ev.msg_type} new`;

@@ -32,6 +32,14 @@ struct MessageEvent {
     detail: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     ledger_seq: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peers: Option<Vec<PeerEntry>>,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct PeerEntry {
+    endpoint: String,
+    hops: u32,
 }
 
 #[tokio::main]
@@ -85,6 +93,7 @@ async fn run_peer_connection(tx: &broadcast::Sender<MessageEvent>) -> Result<(),
         msg_type: "CONNECTED".into(),
         detail: format!("Handshake with {TESTNET_PEER}"),
         ledger_seq: None,
+        peers: None,
     });
 
     let mut codec = MessageCodec;
@@ -102,7 +111,7 @@ async fn run_peer_connection(tx: &broadcast::Sender<MessageEvent>) -> Result<(),
                     msg_seq += 1;
                     let elapsed = start.elapsed().as_secs_f64();
 
-                    let (msg_type, detail, ledger_seq) = format_message(&msg);
+                    let (msg_type, detail, ledger_seq, peers) = format_message(&msg);
 
                     let event = MessageEvent {
                         seq: msg_seq,
@@ -110,6 +119,7 @@ async fn run_peer_connection(tx: &broadcast::Sender<MessageEvent>) -> Result<(),
                         msg_type,
                         detail,
                         ledger_seq,
+                        peers,
                     };
 
                     let _ = tx.send(event);
@@ -134,7 +144,7 @@ async fn run_peer_connection(tx: &broadcast::Sender<MessageEvent>) -> Result<(),
     }
 }
 
-fn format_message(msg: &PeerMessage) -> (String, String, Option<u32>) {
+fn format_message(msg: &PeerMessage) -> (String, String, Option<u32>, Option<Vec<PeerEntry>>) {
     match msg {
         PeerMessage::StatusChange(sc) => {
             let status = sc.new_status.map(|s| match s {
@@ -156,45 +166,53 @@ fn format_message(msg: &PeerMessage) -> (String, String, Option<u32>) {
                 "StatusChange".into(),
                 format!("status={status} event={event}"),
                 sc.ledger_seq,
+                None,
             )
         }
         PeerMessage::Validation(v) => {
             let bytes = v.validation.len();
-            ("Validation".into(), format!("{bytes}B signed validation"), None)
+            ("Validation".into(), format!("{bytes}B signed validation"), None, None)
         }
         PeerMessage::Manifests(m) => {
-            ("Manifests".into(), format!("{} validator manifests", m.list.len()), None)
+            ("Manifests".into(), format!("{} validator manifests", m.list.len()), None, None)
         }
         PeerMessage::ValidatorListCollection(_) => {
-            ("ValidatorList".into(), "UNL bootstrap".into(), None)
+            ("ValidatorList".into(), "UNL bootstrap".into(), None, None)
         }
         PeerMessage::Transaction(t) => {
             let bytes = t.raw_transaction.len();
             let status = t.status;
-            ("Transaction".into(), format!("{bytes}B status={status}"), None)
+            ("Transaction".into(), format!("{bytes}B status={status}"), None, None)
         }
         PeerMessage::ProposeSet(p) => {
             let hash = hex::encode(&p.current_tx_hash[..std::cmp::min(8, p.current_tx_hash.len())]);
-            ("Proposal".into(), format!("seq={} hash={hash}...", p.propose_seq), None)
+            ("Proposal".into(), format!("seq={} hash={hash}...", p.propose_seq), None, None)
         }
         PeerMessage::HaveTransactionSet(h) => {
             let hash = hex::encode(&h.hash[..std::cmp::min(8, h.hash.len())]);
-            ("HaveTxSet".into(), format!("hash={hash}..."), None)
+            ("HaveTxSet".into(), format!("hash={hash}..."), None, None)
         }
         PeerMessage::Endpoints(e) => {
-            ("Endpoints".into(), format!("{} peers", e.endpoints_v2.len()), None)
+            let peers: Vec<PeerEntry> = e.endpoints_v2.iter()
+                .map(|ep| PeerEntry {
+                    endpoint: ep.endpoint.clone(),
+                    hops: ep.hops,
+                })
+                .collect();
+            let detail = format!("{} peers", peers.len());
+            ("Endpoints".into(), detail, None, Some(peers))
         }
         PeerMessage::GetLedger(g) => {
-            ("GetLedger".into(), format!("seq={:?}", g.ledger_seq), None)
+            ("GetLedger".into(), format!("seq={:?}", g.ledger_seq), None, None)
         }
         PeerMessage::LedgerData(d) => {
-            ("LedgerData".into(), format!("{} nodes seq={}", d.nodes.len(), d.ledger_seq), None)
+            ("LedgerData".into(), format!("{} nodes seq={}", d.nodes.len(), d.ledger_seq), None, None)
         }
         PeerMessage::Ping(p) => {
             let kind = if p.r#type == 0 { "ping" } else { "pong" };
-            ("Ping".into(), format!("{kind} seq={:?}", p.seq), None)
+            ("Ping".into(), format!("{kind} seq={:?}", p.seq), None, None)
         }
-        other => (other.name().into(), String::new(), None),
+        other => (other.name().into(), String::new(), None, None),
     }
 }
 
