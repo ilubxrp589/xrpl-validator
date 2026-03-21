@@ -40,6 +40,7 @@ impl Decoder for MessageCodec {
         // Peek at the length without consuming.
         let payload_len = u32::from_be_bytes([src[0], src[1], src[2], src[3]]);
 
+
         if payload_len > MAX_MESSAGE_SIZE {
             return Err(NodeError::MessageDecode(format!(
                 "message too large: {payload_len} bytes (max {MAX_MESSAGE_SIZE})"
@@ -70,6 +71,15 @@ impl Decoder for MessageCodec {
         let compressed = raw_type_code & COMPRESSION_FLAG != 0;
         let type_code = raw_type_code & !COMPRESSION_FLAG;
 
+        tracing::trace!(
+            payload_len,
+            raw_type_code,
+            type_code,
+            compressed,
+            proto_bytes = frame.len(),
+            "decoding frame"
+        );
+
         let proto_data = &frame[..];
 
         // Decompress if needed.
@@ -84,8 +94,16 @@ impl Decoder for MessageCodec {
             proto_data.to_vec()
         };
 
-        let msg = PeerMessage::decode(type_code, &data)?;
-        Ok(Some(msg))
+        match PeerMessage::decode(type_code, &data) {
+            Ok(msg) => Ok(Some(msg)),
+            Err(e) => {
+                // Log and skip undecodable messages rather than killing the stream.
+                // Some message types may use formats we don't fully support yet.
+                tracing::debug!(type_code, "skipping undecodable message: {e}");
+                // Recurse to try the next frame in the buffer
+                self.decode(src)
+            }
+        }
     }
 }
 

@@ -2,3 +2,7 @@
 //!
 //! Routes incoming peer messages to the correct handler subsystem
 //! (mempool, consensus, ledger sync, UNL manager).
+
+pub mod router;
+
+pub use router::{OverlayRouter, RouterChannels};

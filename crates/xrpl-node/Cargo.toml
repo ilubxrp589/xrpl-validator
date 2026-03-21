@@ -32,6 +32,8 @@ tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 rcgen = { workspace = true }
+openssl = { workspace = true }
+tokio-openssl = { workspace = true }
 axum = { workspace = true }
 dashmap = { workspace = true }
 bytes = { workspace = true }

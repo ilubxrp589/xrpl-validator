@@ -28,6 +28,9 @@ tokio-rustls = "0.26"
 rustls = "0.23"
 rustls-pemfile = "2"
 rcgen = "0.13"
+# OpenSSL needed for peer protocol (SSL_get_finished compatibility)
+openssl = "0.10"
+tokio-openssl = "0.6"
 
 # Protobuf
 prost = "0.13"

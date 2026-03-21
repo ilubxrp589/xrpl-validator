@@ -22,6 +22,7 @@ pub mod codec;
 pub mod connection;
 pub mod handshake;
 pub mod identity;
+pub mod manager;
 pub mod message;
 #[allow(clippy::all)]
 pub mod protocol;

@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use rcgen::{CertificateParams, KeyPair as RcgenKeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use xrpl_core::address::KeyType;
 use xrpl_core::crypto::signing::{Keypair, Seed};
 
 use crate::NodeError;
@@ -27,9 +28,9 @@ pub struct NodeIdentity {
 }
 
 impl NodeIdentity {
-    /// Generate a new random node identity (Ed25519).
+    /// Generate a new random node identity (Secp256k1 — required by XRPL peer protocol).
     pub fn generate() -> Result<Self, NodeError> {
-        let seed = Seed::generate();
+        let seed = Seed::generate_with_type(KeyType::Secp256k1);
         Self::from_seed(&seed)
     }
 
@@ -199,9 +200,13 @@ mod tests {
     fn generate_identity() {
         let identity = NodeIdentity::generate().unwrap();
 
-        // Ed25519 public key is 33 bytes: 0xED prefix + 32-byte key
+        // Secp256k1 compressed public key is 33 bytes: 0x02 or 0x03 prefix
         assert_eq!(identity.public_key().len(), 33);
-        assert_eq!(identity.public_key()[0], 0xED);
+        assert!(
+            identity.public_key()[0] == 0x02 || identity.public_key()[0] == 0x03,
+            "expected compressed secp256k1 prefix, got 0x{:02x}",
+            identity.public_key()[0]
+        );
 
         // Hex is 66 chars
         assert_eq!(identity.public_key_hex().len(), 66);

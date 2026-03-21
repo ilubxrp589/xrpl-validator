@@ -6,7 +6,6 @@ use std::time::Instant;
 use futures::SinkExt;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio_rustls::client::TlsStream;
 use tokio_util::codec::Framed;
 use tracing::{debug, trace, warn};
 use xrpl_core::types::Hash256;
@@ -67,7 +66,7 @@ impl PeerHandle {
 /// connection's lifetime. The connection runs until the stream closes,
 /// an error occurs, or the shutdown signal fires.
 pub fn spawn_connection(
-    stream: TlsStream<TcpStream>,
+    stream: tokio_openssl::SslStream<TcpStream>,
     peer_public_key: Vec<u8>,
     address: SocketAddr,
     inbound_tx: mpsc::Sender<(PeerId, PeerMessage)>,
@@ -114,7 +113,7 @@ pub fn spawn_connection(
 }
 
 async fn run_connection(
-    stream: TlsStream<TcpStream>,
+    stream: tokio_openssl::SslStream<TcpStream>,
     info: PeerInfo,
     inbound_tx: mpsc::Sender<(PeerId, PeerMessage)>,
     mut outbound_rx: mpsc::Receiver<PeerMessage>,

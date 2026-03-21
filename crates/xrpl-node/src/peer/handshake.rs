@@ -1,27 +1,12 @@
 //! XRPL peer handshake — HTTP upgrade from HTTPS to XRPL/2.0.
 //!
-//! After establishing a TLS connection, peers exchange HTTP headers to
-//! upgrade the connection to the XRPL binary peer protocol.
-//!
-//! ## Outbound handshake
-//! 1. Connect via TLS
-//! 2. Send `GET / HTTP/1.1` with upgrade headers
-//! 3. Receive `HTTP/1.1 101 Switching Protocols`
-//! 4. Transition to binary message framing
-//!
-//! ## Key headers
-//! - `Upgrade: XRPL/2.2` — protocol version
-//! - `Connection: Upgrade`
-//! - `Connect-As: Peer`
-//! - `Public-Key: <base58 node pubkey>`
-//! - `Session-Signature: <base64 signed shared value>`
-//! - `Network-ID: 0` (mainnet) or `1` (testnet)
-//! - `Crawl: public`
+//! Uses OpenSSL for TLS (required for `SSL_get_finished` compatibility
+//! with rippled's session cookie mechanism).
 
+use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use sha2::{Digest, Sha512};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio_rustls::{client::TlsStream, TlsConnector};
 
 use super::identity::NodeIdentity;
 use crate::NodeError;
@@ -34,23 +19,22 @@ pub const NETWORK_ID_DEVNET: u32 = 2;
 /// Result of a successful handshake.
 pub struct HandshakeResult {
     /// The TLS stream, ready for binary framing.
-    pub stream: TlsStream<TcpStream>,
+    pub stream: tokio_openssl::SslStream<TcpStream>,
     /// The peer's public key (extracted from their Public-Key header).
     pub peer_public_key: Vec<u8>,
     /// The peer's reported ledger sequence (if any).
     pub peer_ledger_seq: Option<u32>,
+    /// Any bytes read after the HTTP headers that belong to the binary protocol.
+    /// Must be prepended to the framed codec's buffer.
+    pub remaining_bytes: Vec<u8>,
 }
 
 /// Perform an outbound handshake to an XRPL peer.
-///
-/// Connects via TLS, sends HTTP upgrade request, validates the
-/// 101 response, and returns the upgraded stream.
 pub async fn outbound_handshake(
     addr: &str,
     identity: &NodeIdentity,
     network_id: u32,
 ) -> Result<HandshakeResult, NodeError> {
-    // Parse address
     let (host, _port) = parse_addr(addr)?;
 
     // TCP connect
@@ -58,25 +42,37 @@ pub async fn outbound_handshake(
         .await
         .map_err(|e| NodeError::Connection(format!("TCP connect to {addr}: {e}")))?;
 
-    // TLS connect
-    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
-        .unwrap_or_else(|_| rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap());
+    // OpenSSL TLS connect (required for SSL_get_finished compatibility)
+    let mut ssl_builder = SslConnector::builder(SslMethod::tls())
+        .map_err(|e| NodeError::Connection(format!("SSL builder: {e}")))?;
 
-    let connector = TlsConnector::from(identity.client_config());
-    let mut tls = connector
-        .connect(server_name, tcp)
+    // Don't verify peer certs (self-signed network)
+    ssl_builder.set_verify(SslVerifyMode::NONE);
+
+    let ssl_connector = ssl_builder.build();
+    let ssl = ssl_connector
+        .configure()
+        .map_err(|e| NodeError::Connection(format!("SSL configure: {e}")))?
+        .into_ssl(host)
+        .map_err(|e| NodeError::Connection(format!("SSL create: {e}")))?;
+
+    let mut tls = tokio_openssl::SslStream::new(ssl, tcp)
+        .map_err(|e| NodeError::Connection(format!("SSL stream: {e}")))?;
+
+    std::pin::Pin::new(&mut tls)
+        .connect()
         .await
-        .map_err(|e| NodeError::Connection(format!("TLS to {addr}: {e}")))?;
+        .map_err(|e| NodeError::Connection(format!("TLS handshake to {addr}: {e}")))?;
 
-    // Compute shared value from TLS session
+    // Compute shared value from TLS finished messages
     let shared_value = compute_shared_value(&tls)?;
 
-    // Sign the shared value
+    // Sign the shared value with our node key
     let signature = identity.sign(&shared_value)?;
     let sig_b64 = base64_encode(&signature);
 
-    // Encode our public key as hex (rippled also accepts base58, but hex is simpler)
-    let pubkey_hex = identity.public_key_hex();
+    // Encode our public key as base58 with node public key prefix (0x1C)
+    let pubkey_b58 = encode_node_public_key(identity.public_key());
 
     // Build HTTP upgrade request
     let request = format!(
@@ -84,7 +80,7 @@ pub async fn outbound_handshake(
          Upgrade: XRPL/2.2, XRPL/2.1, XRPL/2.0\r\n\
          Connection: Upgrade\r\n\
          Connect-As: Peer\r\n\
-         Public-Key: {pubkey_hex}\r\n\
+         Public-Key: {pubkey_b58}\r\n\
          Session-Signature: {sig_b64}\r\n\
          Crawl: public\r\n\
          Network-ID: {network_id}\r\n\
@@ -96,95 +92,125 @@ pub async fn outbound_handshake(
         .await
         .map_err(|e| NodeError::HandshakeFailed(format!("write request: {e}")))?;
 
-    // Read response
-    let mut reader = BufReader::new(&mut tls);
-    let mut status_line = String::new();
-    reader
-        .read_line(&mut status_line)
-        .await
-        .map_err(|e| NodeError::HandshakeFailed(format!("read status: {e}")))?;
+    // Read HTTP response into a buffer, then split at the header boundary.
+    // We read in chunks and look for \r\n\r\n. Any bytes after the headers
+    // belong to the binary protocol and must be preserved.
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::with_capacity(4096);
+    let header_end;
 
-    // Check for 101 Switching Protocols
+    loop {
+        let mut chunk = [0u8; 1024];
+        let n = tls
+            .read(&mut chunk)
+            .await
+            .map_err(|e| NodeError::HandshakeFailed(format!("read response: {e}")))?;
+        if n == 0 {
+            return Err(NodeError::HandshakeFailed("connection closed during headers".to_string()));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+
+        // Look for \r\n\r\n
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            header_end = Some(pos + 4);
+            break;
+        }
+
+        if buf.len() > 16384 {
+            return Err(NodeError::HandshakeFailed("headers too large".to_string()));
+        }
+    }
+
+    let header_end = header_end.unwrap();
+    let header_bytes = &buf[..header_end];
+    let remaining = buf[header_end..].to_vec();
+
+    // Parse headers
+    let header_str = String::from_utf8_lossy(header_bytes);
+
+    #[cfg(debug_assertions)]
+    {
+        eprintln!(
+            "[handshake] buf_len={} header_end={} remaining={}",
+            buf.len(), header_end, remaining.len()
+        );
+        eprintln!("[handshake] full headers:\n{}", header_str);
+    }
+    let lines: Vec<&str> = header_str.split("\r\n").collect();
+
+    let status_line = lines.first().unwrap_or(&"");
     if !status_line.contains("101") {
         return Err(NodeError::HandshakeFailed(format!(
-            "expected 101, got: {}",
-            status_line.trim()
+            "expected 101, got: {status_line}"
         )));
     }
 
-    // Parse response headers
     let mut peer_public_key = Vec::new();
     let peer_ledger_seq = None;
 
-    loop {
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .await
-            .map_err(|e| NodeError::HandshakeFailed(format!("read header: {e}")))?;
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            break; // End of headers
-        }
-
-        if let Some((key, value)) = trimmed.split_once(':') {
+    for line in &lines[1..] {
+        if let Some((key, value)) = line.split_once(':') {
             let key = key.trim().to_lowercase();
             let value = value.trim();
 
-            match key.as_str() {
-                "public-key" => {
-                    peer_public_key = hex::decode(value).unwrap_or_default();
-                }
-                "closed-ledger" => {
-                    // Could parse ledger hash here
-                }
-                _ => {}
+            if key == "public-key" {
+                peer_public_key = hex::decode(value).unwrap_or_default();
             }
         }
     }
-
-    // Drain any remaining buffered data back onto the stream
-    // (BufReader may have read ahead)
-    drop(reader);
 
     Ok(HandshakeResult {
         stream: tls,
         peer_public_key,
         peer_ledger_seq,
+        remaining_bytes: remaining,
     })
 }
 
-/// Compute the shared value from TLS session finished messages.
+/// Compute the shared value from TLS finished messages.
 ///
-/// shared_value = SHA512Half(SHA512(local_finished) XOR SHA512(peer_finished))
-///
-/// With rustls, we don't have direct access to the SSL finished messages
-/// the way OpenSSL exposes them. Instead, we use the TLS exporter keying
-/// material (RFC 5705) which serves the same purpose — binding the
-/// application layer to the specific TLS session.
+/// Algorithm (matching rippled exactly):
+/// 1. cookie1 = SHA512(SSL_get_finished())
+/// 2. cookie2 = SHA512(SSL_get_peer_finished())
+/// 3. result = cookie1 XOR cookie2
+/// 4. shared_value = SHA512Half(result)
 fn compute_shared_value(
-    tls: &TlsStream<TcpStream>,
+    tls: &tokio_openssl::SslStream<TcpStream>,
 ) -> Result<[u8; 32], NodeError> {
-    // Try to get the TLS exporter keying material
-    let (_, conn) = tls.get_ref();
+    let ssl = tls.ssl();
 
-    // Use the TLS exporter to derive a session-bound value.
-    // rippled uses SSL_get_finished/SSL_get_peer_finished, but rustls
-    // doesn't expose those directly. The exporter serves the same
-    // cryptographic binding purpose.
-    let mut exported = [0u8; 64];
-    conn.export_keying_material(
-        &mut exported,
-        b"XRPL peer handshake shared value",
-        None,
-    )
-    .map_err(|e| {
-        NodeError::HandshakeFailed(format!("TLS export keying material: {e}"))
-    })?;
+    // Get local finished message
+    let mut local_finished = vec![0u8; 64];
+    let local_len = ssl.finished(&mut local_finished);
+    if local_len == 0 {
+        return Err(NodeError::HandshakeFailed(
+            "SSL_get_finished returned empty".to_string(),
+        ));
+    }
+    local_finished.truncate(local_len);
 
-    // SHA512-half of the exported material
-    let hash = Sha512::digest(exported);
+    // Get peer finished message
+    let mut peer_finished = vec![0u8; 64];
+    let peer_len = ssl.peer_finished(&mut peer_finished);
+    if peer_len == 0 {
+        return Err(NodeError::HandshakeFailed(
+            "SSL_get_peer_finished returned empty".to_string(),
+        ));
+    }
+    peer_finished.truncate(peer_len);
+
+    // Hash both with SHA-512
+    let cookie1: [u8; 64] = Sha512::digest(&local_finished).into();
+    let cookie2: [u8; 64] = Sha512::digest(&peer_finished).into();
+
+    // XOR the two hashes
+    let mut xored = [0u8; 64];
+    for i in 0..64 {
+        xored[i] = cookie1[i] ^ cookie2[i];
+    }
+
+    // SHA512-half of the XOR result
+    let hash = Sha512::digest(xored);
     let mut result = [0u8; 32];
     result.copy_from_slice(&hash[..32]);
     Ok(result)
@@ -197,13 +223,53 @@ fn parse_addr(addr: &str) -> Result<(&str, u16), NodeError> {
             .map_err(|_| NodeError::Connection(format!("invalid port in {addr}")))?;
         Ok((host, port))
     } else {
-        Ok((addr, 51235)) // Default XRPL peer port
+        Ok((addr, 51235))
     }
+}
+
+/// Encode a 33-byte public key as a base58check node public key.
+/// Uses prefix byte `0x1C` (28), producing strings starting with 'n'.
+fn encode_node_public_key(pubkey: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    const XRPL_ALPHABET: &[u8; 58] =
+        b"rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz";
+
+    let mut payload = Vec::with_capacity(1 + pubkey.len() + 4);
+    payload.push(0x1C);
+    payload.extend_from_slice(pubkey);
+
+    let hash1 = Sha256::digest(&payload);
+    let hash2 = Sha256::digest(hash1);
+    payload.extend_from_slice(&hash2[..4]);
+
+    let leading_zeros = payload.iter().take_while(|&&b| b == 0).count();
+    let mut digits: Vec<u8> = Vec::new();
+    for &byte in &payload {
+        let mut carry = byte as u32;
+        for digit in digits.iter_mut() {
+            carry += (*digit as u32) * 256;
+            *digit = (carry % 58) as u8;
+            carry /= 58;
+        }
+        while carry > 0 {
+            digits.push((carry % 58) as u8);
+            carry /= 58;
+        }
+    }
+
+    let mut result = String::with_capacity(leading_zeros + digits.len());
+    for _ in 0..leading_zeros {
+        result.push(XRPL_ALPHABET[0] as char);
+    }
+    for &d in digits.iter().rev() {
+        result.push(XRPL_ALPHABET[d as usize] as char);
+    }
+    result
 }
 
 fn base64_encode(data: &[u8]) -> String {
     use std::fmt::Write;
-    // Simple base64 encoding without pulling in another crate
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
@@ -252,5 +318,13 @@ mod tests {
         assert_eq!(base64_encode(b"f"), "Zg==");
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_encode(b"foo"), "Zm9v");
+    }
+
+    #[test]
+    fn test_encode_node_public_key() {
+        // A node public key should start with 'n'
+        let fake_key = [0x02; 33]; // compressed secp256k1 point
+        let encoded = encode_node_public_key(&fake_key);
+        assert!(encoded.starts_with('n'), "expected 'n' prefix, got: {encoded}");
     }
 }
