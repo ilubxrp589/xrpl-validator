@@ -11,6 +11,9 @@ use tokio::net::TcpStream;
 use super::identity::NodeIdentity;
 use crate::NodeError;
 
+/// Maximum allowed frame size (must match codec).
+const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
+
 /// Network ID constants.
 pub const NETWORK_ID_MAINNET: u32 = 0;
 pub const NETWORK_ID_TESTNET: u32 = 1;
@@ -128,14 +131,12 @@ pub async fn outbound_handshake(
     // Parse headers
     let header_str = String::from_utf8_lossy(header_bytes);
 
-    #[cfg(debug_assertions)]
-    {
-        eprintln!(
-            "[handshake] buf_len={} header_end={} remaining={}",
-            buf.len(), header_end, remaining.len()
-        );
-        eprintln!("[handshake] full headers:\n{}", header_str);
-    }
+    tracing::debug!(
+        buf_len = buf.len(),
+        header_end,
+        remaining = remaining.len(),
+        "parsed HTTP response headers"
+    );
     let lines: Vec<&str> = header_str.split("\r\n").collect();
 
     let status_line = lines.first().unwrap_or(&"");
@@ -154,16 +155,53 @@ pub async fn outbound_handshake(
             let value = value.trim();
 
             if key == "public-key" {
-                peer_public_key = hex::decode(value).unwrap_or_default();
+                // Peer sends base58-encoded node public key (n-prefixed).
+                // Try hex first, then store raw string as fallback.
+                // Full base58 decoding will be added with xrpl-core integration.
+                peer_public_key = hex::decode(value)
+                    .unwrap_or_else(|_| value.as_bytes().to_vec());
             }
         }
     }
+
+    // Read the first chunk of binary protocol data and find the first valid frame.
+    // OpenSSL may insert a few bytes between SSL records at the protocol boundary.
+    let mut initial_buf = vec![0u8; 16384];
+    let n = tls
+        .read(&mut initial_buf)
+        .await
+        .map_err(|e| NodeError::HandshakeFailed(format!("initial binary read: {e}")))?;
+    initial_buf.truncate(n);
+
+    // Scan for the first valid frame header (4-byte length < 16MB, known type code)
+    let known_types: &[u16] = &[2, 3, 5, 15, 30, 31, 32, 33, 34, 35, 41, 42, 54, 55, 56, 57, 58, 59, 60, 63, 64];
+    let mut frame_start = 0;
+    for offset in 0..n.saturating_sub(5) {
+        let len = u32::from_be_bytes([initial_buf[offset], initial_buf[offset+1], initial_buf[offset+2], initial_buf[offset+3]]);
+        let tc = u16::from_be_bytes([initial_buf[offset+4], initial_buf[offset+5]]);
+        let actual_tc = tc & 0x7FFF;
+        if (2..MAX_FRAME_SIZE).contains(&len) && known_types.contains(&actual_tc) {
+            frame_start = offset;
+            break;
+        }
+    }
+
+    let protocol_bytes = if frame_start > 0 {
+        tracing::debug!(skipped = frame_start, "skipped bytes before first frame");
+        initial_buf[frame_start..].to_vec()
+    } else {
+        initial_buf
+    };
+
+    // Combine any header remaining bytes with the protocol bytes
+    let mut all_remaining = remaining;
+    all_remaining.extend_from_slice(&protocol_bytes);
 
     Ok(HandshakeResult {
         stream: tls,
         peer_public_key,
         peer_ledger_seq,
-        remaining_bytes: remaining,
+        remaining_bytes: all_remaining,
     })
 }
 

@@ -1,4 +1,7 @@
 //! Live integration test: connect to XRPL testnet peer.
+//!
+//! Run with: cargo test -p xrpl-node --features live-tests -- peer_connect --nocapture
+
 #![cfg(feature = "live-tests")]
 
 use std::time::Duration;
@@ -30,44 +33,11 @@ async fn connect_to_testnet_peer() {
     .expect("handshake failed");
 
     println!("Handshake successful!");
+    println!("  Remaining bytes: {}", hs.remaining_bytes.len());
 
-    // Manually decode messages using the codec on a BytesMut buffer.
-    // This avoids any Framed<SslStream> compatibility issues.
     let mut codec = MessageCodec;
     let mut buf = BytesMut::with_capacity(65536);
-
-    // Seed with any remaining bytes from handshake
     buf.extend_from_slice(&hs.remaining_bytes);
-
-    // Read first chunk and find the start of binary framing.
-    // rippled may send a few bytes between the HTTP headers and binary protocol.
-    {
-        let mut initial = vec![0u8; 8192];
-        let n = hs.stream.read(&mut initial).await.expect("initial read");
-        initial.truncate(n);
-        eprintln!("[debug] initial read: {} bytes, first 20: {:02x?}", n, &initial[..std::cmp::min(20, n)]);
-
-        // Find the first valid frame: look for a 4-byte big-endian length
-        // where the value is reasonable (< 16MB) and the following 2-byte
-        // type code matches a known message type.
-        let known_types: &[u16] = &[2, 3, 5, 15, 30, 31, 32, 33, 34, 35, 41, 42, 54, 55, 56, 57, 58, 59, 60, 63, 64];
-        let mut offset = 0;
-        while offset + 6 <= n {
-            let len = u32::from_be_bytes([initial[offset], initial[offset+1], initial[offset+2], initial[offset+3]]);
-            let tc = u16::from_be_bytes([initial[offset+4], initial[offset+5]]);
-            let actual_tc = tc & 0x7FFF;
-            if len < 16_000_000 && len >= 2 && known_types.contains(&actual_tc) {
-                eprintln!("[debug] found valid frame at offset {offset}: len={len} type={actual_tc}");
-                buf.extend_from_slice(&initial[offset..]);
-                break;
-            }
-            offset += 1;
-        }
-        if offset + 6 > n {
-            eprintln!("[debug] no valid frame found in initial {} bytes!", n);
-            buf.extend_from_slice(&initial);
-        }
-    }
 
     let mut msg_count = 0;
     let start = std::time::Instant::now();
@@ -75,7 +45,7 @@ async fn connect_to_testnet_peer() {
     println!("Reading messages for up to 30 seconds...");
 
     while start.elapsed() < Duration::from_secs(30) && msg_count < 30 {
-        // Try to decode from existing buffer first
+        // Decode from buffer
         loop {
             match codec.decode(&mut buf) {
                 Ok(Some(msg)) => {
@@ -93,9 +63,9 @@ async fn connect_to_testnet_peer() {
                         _ => String::new(),
                     };
                     println!("  [{msg_count:>3}] {} {detail}", msg.name());
-                    continue; // Try to decode more from buffer
+                    continue;
                 }
-                Ok(None) => break,    // Need more data
+                Ok(None) => break,
                 Err(e) => {
                     println!("  [err] {e}");
                     break;
@@ -107,20 +77,14 @@ async fn connect_to_testnet_peer() {
             break;
         }
 
-        if msg_count == 0 && !buf.is_empty() {
-            println!("  Buffer first 16 bytes: {:02x?}", &buf[..std::cmp::min(16, buf.len())]);
-        }
-
-        // Read more data from the stream
+        // Read more from stream
         let mut chunk = vec![0u8; 32768];
         match timeout(Duration::from_secs(10), hs.stream.read(&mut chunk)).await {
             Ok(Ok(0)) => {
                 println!("  Stream ended");
                 break;
             }
-            Ok(Ok(n)) => {
-                buf.extend_from_slice(&chunk[..n]);
-            }
+            Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
             Ok(Err(e)) => {
                 println!("  Read error: {e}");
                 break;

@@ -69,6 +69,7 @@ pub fn spawn_connection(
     stream: tokio_openssl::SslStream<TcpStream>,
     peer_public_key: Vec<u8>,
     address: SocketAddr,
+    remaining_bytes: Vec<u8>,
     inbound_tx: mpsc::Sender<(PeerId, PeerMessage)>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> PeerHandle {
@@ -100,6 +101,7 @@ pub fn spawn_connection(
     tokio::spawn(async move {
         run_connection(
             stream,
+            remaining_bytes,
             info,
             inbound_tx,
             outbound_rx,
@@ -114,6 +116,7 @@ pub fn spawn_connection(
 
 async fn run_connection(
     stream: tokio_openssl::SslStream<TcpStream>,
+    remaining_bytes: Vec<u8>,
     info: PeerInfo,
     inbound_tx: mpsc::Sender<(PeerId, PeerMessage)>,
     mut outbound_rx: mpsc::Receiver<PeerMessage>,
@@ -124,6 +127,13 @@ async fn run_connection(
     let peer_id = info.peer_id;
     let peer_hex = hex::encode(&peer_id.0[..8]);
     let mut framed = Framed::new(stream, MessageCodec);
+
+    // Prepend any bytes from the handshake that belong to the binary protocol.
+    // The HTTP header read may have consumed bytes past the \r\n\r\n boundary.
+    if !remaining_bytes.is_empty() {
+        framed.read_buffer_mut().extend_from_slice(&remaining_bytes);
+        trace!(peer = %peer_hex, bytes = remaining_bytes.len(), "injected remaining handshake bytes");
+    }
 
     loop {
         tokio::select! {

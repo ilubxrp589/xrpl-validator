@@ -1,8 +1,8 @@
 //! Node cryptographic identity — keypair + TLS certificate.
 //!
-//! Each XRPL node is identified by an Ed25519 public key.
-//! The key is embedded in a self-signed TLS certificate used
-//! for peer connections.
+//! Each XRPL node is identified by a Secp256k1 public key
+//! (required by the rippled peer protocol). The key is embedded
+//! in a self-signed TLS certificate used for peer connections.
 
 use std::sync::Arc;
 
@@ -15,7 +15,7 @@ use crate::NodeError;
 
 /// Cryptographic identity of this node on the XRPL peer network.
 pub struct NodeIdentity {
-    /// The XRPL keypair (Ed25519). Public key is 33 bytes: 0xED + 32-byte key.
+    /// The XRPL keypair (Secp256k1). Public key is 33 bytes: 0x02/0x03 compressed point.
     keypair: Keypair,
     /// DER-encoded self-signed TLS certificate.
     tls_cert_der: Vec<u8>,
@@ -91,7 +91,7 @@ impl NodeIdentity {
         })
     }
 
-    /// The 33-byte XRPL public key (0xED prefix for Ed25519).
+    /// The 33-byte compressed Secp256k1 public key (0x02 or 0x03 prefix).
     pub fn public_key(&self) -> &[u8] {
         &self.keypair.public_key
     }

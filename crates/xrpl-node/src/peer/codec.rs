@@ -32,76 +32,84 @@ impl Decoder for MessageCodec {
     type Error = NodeError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<PeerMessage>, NodeError> {
-        // Need at least 4 bytes for the length prefix.
-        if src.len() < 4 {
-            return Ok(None);
-        }
+        // Loop to skip undecodable frames without recursion.
+        // At most skip 10 consecutive bad frames before giving up.
+        let mut skipped = 0;
+        loop {
+            // Need at least 4 bytes for the length prefix.
+            if src.len() < 4 {
+                return Ok(None);
+            }
 
-        // Peek at the length without consuming.
-        let payload_len = u32::from_be_bytes([src[0], src[1], src[2], src[3]]);
+            // Peek at the length without consuming.
+            let payload_len = u32::from_be_bytes([src[0], src[1], src[2], src[3]]);
 
 
-        if payload_len > MAX_MESSAGE_SIZE {
-            return Err(NodeError::MessageDecode(format!(
-                "message too large: {payload_len} bytes (max {MAX_MESSAGE_SIZE})"
-            )));
-        }
 
-        if payload_len < 2 {
-            return Err(NodeError::MessageDecode(format!(
-                "payload too short: {payload_len} bytes (need at least 2 for type code)"
-            )));
-        }
+            if payload_len > MAX_MESSAGE_SIZE {
+                return Err(NodeError::MessageDecode(format!(
+                    "message too large: {payload_len} bytes (max {MAX_MESSAGE_SIZE})"
+                )));
+            }
 
-        let total_frame_len = 4 + payload_len as usize;
+            if payload_len < 2 {
+                return Err(NodeError::MessageDecode(format!(
+                    "payload too short: {payload_len} bytes (need at least 2 for type code)"
+                )));
+            }
 
-        // Wait for the full frame.
-        if src.len() < total_frame_len {
-            // Reserve space to avoid repeated allocations.
-            src.reserve(total_frame_len - src.len());
-            return Ok(None);
-        }
+            let total_frame_len = 4 + payload_len as usize;
 
-        // Consume the frame.
-        let mut frame = src.split_to(total_frame_len);
-        frame.advance(4); // skip length prefix
+            // Wait for the full frame.
+            if src.len() < total_frame_len {
+                src.reserve(total_frame_len - src.len());
+                return Ok(None);
+            }
 
-        // Read 2-byte type code.
-        let raw_type_code = frame.get_u16();
-        let compressed = raw_type_code & COMPRESSION_FLAG != 0;
-        let type_code = raw_type_code & !COMPRESSION_FLAG;
+            // Consume the frame.
+            let mut frame = src.split_to(total_frame_len);
+            frame.advance(4); // skip length prefix
 
-        tracing::trace!(
-            payload_len,
-            raw_type_code,
-            type_code,
-            compressed,
-            proto_bytes = frame.len(),
-            "decoding frame"
-        );
+            // Read 2-byte type code.
+            let raw_type_code = frame.get_u16();
+            let compressed = raw_type_code & COMPRESSION_FLAG != 0;
+            let type_code = raw_type_code & !COMPRESSION_FLAG;
 
-        let proto_data = &frame[..];
+            tracing::trace!(
+                payload_len,
+                raw_type_code,
+                type_code,
+                compressed,
+                proto_bytes = frame.len(),
+                "decoding frame"
+            );
 
-        // Decompress if needed.
-        let data = if compressed {
-            let mut decoder = ZlibDecoder::new(proto_data);
-            let mut decompressed = Vec::new();
-            decoder.read_to_end(&mut decompressed).map_err(|e| {
-                NodeError::MessageDecode(format!("zlib decompression failed: {e}"))
-            })?;
-            decompressed
-        } else {
-            proto_data.to_vec()
-        };
+            let proto_data = &frame[..];
 
-        match PeerMessage::decode(type_code, &data) {
-            Ok(msg) => Ok(Some(msg)),
-            Err(e) => {
-                // Log and skip undecodable messages rather than killing the stream.
-                // Some message types may use formats we don't fully support yet.
-                tracing::debug!(type_code, "skipping undecodable message: {e}");
-                // Recurse to try the next frame in the buffer
-                self.decode(src)
+            // Decompress if needed.
+            let data = if compressed {
+                let mut decoder = ZlibDecoder::new(proto_data);
+                let mut decompressed = Vec::new();
+                decoder.read_to_end(&mut decompressed).map_err(|e| {
+                    NodeError::MessageDecode(format!("zlib decompression failed: {e}"))
+                })?;
+                decompressed
+            } else {
+                proto_data.to_vec()
+            };
+
+            match PeerMessage::decode(type_code, &data) {
+                Ok(msg) => return Ok(Some(msg)),
+                Err(e) => {
+                    skipped += 1;
+                    tracing::debug!(type_code, skipped, "skipping undecodable message: {e}");
+                    if skipped >= 10 {
+                        return Err(NodeError::MessageDecode(format!(
+                            "too many consecutive undecodable frames ({skipped}), last: {e}"
+                        )));
+                    }
+                    // Continue loop to try the next frame
+                }
             }
         }
     }

@@ -74,6 +74,7 @@ impl PeerManager {
             result.stream,
             result.peer_public_key,
             socket_addr,
+            result.remaining_bytes,
             self.inbound_tx.clone(),
             self.shutdown_rx.clone(),
         );
