@@ -67,6 +67,7 @@ async fn main() {
     // Web server
     let app = Router::new()
         .route("/", get(index_page))
+        .route("/consensus", get(consensus_page))
         .route("/events", get(move || sse_handler(tx.clone())));
 
     let addr = "0.0.0.0:3777";
@@ -255,6 +256,10 @@ fn extract_key_from_validation(blob: &[u8]) -> Option<String> {
 
 async fn index_page() -> Html<&'static str> {
     Html(include_str!("../../static/viewer.html"))
+}
+
+async fn consensus_page() -> Html<&'static str> {
+    Html(include_str!("../../static/consensus.html"))
 }
 
 async fn sse_handler(
