@@ -19,6 +19,8 @@
 /// - [`protocol::TmCluster`] — Cluster node status
 /// - [`protocol::TmSquelch`] — Validator message squelching
 pub mod codec;
+pub mod connection;
+pub mod handshake;
 pub mod identity;
 pub mod message;
 #[allow(clippy::all)]
