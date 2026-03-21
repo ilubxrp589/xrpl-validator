@@ -34,6 +34,8 @@ struct MessageEvent {
     ledger_seq: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     peers: Option<Vec<PeerEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    validator: Option<String>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -94,6 +96,7 @@ async fn run_peer_connection(tx: &broadcast::Sender<MessageEvent>) -> Result<(),
         detail: format!("Handshake with {TESTNET_PEER}"),
         ledger_seq: None,
         peers: None,
+        validator: None,
     });
 
     let mut codec = MessageCodec;
@@ -111,7 +114,7 @@ async fn run_peer_connection(tx: &broadcast::Sender<MessageEvent>) -> Result<(),
                     msg_seq += 1;
                     let elapsed = start.elapsed().as_secs_f64();
 
-                    let (msg_type, detail, ledger_seq, peers) = format_message(&msg);
+                    let (msg_type, detail, ledger_seq, peers, validator) = format_message(&msg);
 
                     let event = MessageEvent {
                         seq: msg_seq,
@@ -120,6 +123,7 @@ async fn run_peer_connection(tx: &broadcast::Sender<MessageEvent>) -> Result<(),
                         detail,
                         ledger_seq,
                         peers,
+                        validator,
                     };
 
                     let _ = tx.send(event);
@@ -144,7 +148,8 @@ async fn run_peer_connection(tx: &broadcast::Sender<MessageEvent>) -> Result<(),
     }
 }
 
-fn format_message(msg: &PeerMessage) -> (String, String, Option<u32>, Option<Vec<PeerEntry>>) {
+/// Returns (msg_type, detail, ledger_seq, peers, validator_key_short)
+fn format_message(msg: &PeerMessage) -> (String, String, Option<u32>, Option<Vec<PeerEntry>>, Option<String>) {
     match msg {
         PeerMessage::StatusChange(sc) => {
             let status = sc.new_status.map(|s| match s {
@@ -167,30 +172,41 @@ fn format_message(msg: &PeerMessage) -> (String, String, Option<u32>, Option<Vec
                 format!("status={status} event={event}"),
                 sc.ledger_seq,
                 None,
+                None,
             )
         }
         PeerMessage::Validation(v) => {
-            let bytes = v.validation.len();
-            ("Validation".into(), format!("{bytes}B signed validation"), None, None)
+            // Extract validator key from serialized validation blob.
+            // The blob is an XRPL serialized object. The SigningPubKey field
+            // (field code 0x73) is typically at a known offset. We scan for
+            // the 33-byte key prefix (0x02/0x03 for secp256k1, 0xED for ed25519).
+            let vkey = extract_key_from_validation(&v.validation);
+            let detail = format!("{}B", v.validation.len());
+            ("Validation".into(), detail, None, None, vkey)
         }
         PeerMessage::Manifests(m) => {
-            ("Manifests".into(), format!("{} validator manifests", m.list.len()), None, None)
+            ("Manifests".into(), format!("{} manifests", m.list.len()), None, None, None)
         }
         PeerMessage::ValidatorListCollection(_) => {
-            ("ValidatorList".into(), "UNL bootstrap".into(), None, None)
+            ("ValidatorList".into(), "UNL bootstrap".into(), None, None, None)
         }
         PeerMessage::Transaction(t) => {
             let bytes = t.raw_transaction.len();
             let status = t.status;
-            ("Transaction".into(), format!("{bytes}B status={status}"), None, None)
+            ("Transaction".into(), format!("{bytes}B status={status}"), None, None, None)
         }
         PeerMessage::ProposeSet(p) => {
             let hash = hex::encode(&p.current_tx_hash[..std::cmp::min(8, p.current_tx_hash.len())]);
-            ("Proposal".into(), format!("seq={} hash={hash}...", p.propose_seq), None, None)
+            let vkey = if !p.node_pub_key.is_empty() {
+                Some(hex::encode(&p.node_pub_key))
+            } else {
+                None
+            };
+            ("Proposal".into(), format!("seq={} hash={hash}...", p.propose_seq), None, None, vkey)
         }
         PeerMessage::HaveTransactionSet(h) => {
             let hash = hex::encode(&h.hash[..std::cmp::min(8, h.hash.len())]);
-            ("HaveTxSet".into(), format!("hash={hash}..."), None, None)
+            ("HaveTxSet".into(), format!("hash={hash}..."), None, None, None)
         }
         PeerMessage::Endpoints(e) => {
             let peers: Vec<PeerEntry> = e.endpoints_v2.iter()
@@ -200,20 +216,41 @@ fn format_message(msg: &PeerMessage) -> (String, String, Option<u32>, Option<Vec
                 })
                 .collect();
             let detail = format!("{} peers", peers.len());
-            ("Endpoints".into(), detail, None, Some(peers))
+            ("Endpoints".into(), detail, None, Some(peers), None)
         }
         PeerMessage::GetLedger(g) => {
-            ("GetLedger".into(), format!("seq={:?}", g.ledger_seq), None, None)
+            ("GetLedger".into(), format!("seq={:?}", g.ledger_seq), None, None, None)
         }
         PeerMessage::LedgerData(d) => {
-            ("LedgerData".into(), format!("{} nodes seq={}", d.nodes.len(), d.ledger_seq), None, None)
+            ("LedgerData".into(), format!("{} nodes seq={}", d.nodes.len(), d.ledger_seq), None, None, None)
         }
         PeerMessage::Ping(p) => {
             let kind = if p.r#type == 0 { "ping" } else { "pong" };
-            ("Ping".into(), format!("{kind} seq={:?}", p.seq), None, None)
+            ("Ping".into(), format!("{kind} seq={:?}", p.seq), None, None, None)
         }
-        other => (other.name().into(), String::new(), None, None),
+        other => (other.name().into(), String::new(), None, None, None),
     }
+}
+
+/// Try to extract a public key from a serialized XRPL validation object.
+/// Scans for the SigningPubKey field: type code 0x73 followed by a
+/// length byte (0x21 = 33) and a 33-byte compressed public key.
+fn extract_key_from_validation(blob: &[u8]) -> Option<String> {
+    // Scan for 0x73 0x21 (SigningPubKey, length 33)
+    for i in 0..blob.len().saturating_sub(35) {
+        if blob[i] == 0x73 && blob[i + 1] == 0x21 {
+            let key_start = i + 2;
+            let key_end = key_start + 33;
+            if key_end <= blob.len() {
+                let first_byte = blob[key_start];
+                // Valid compressed key prefix: 0x02, 0x03 (secp256k1) or 0xED (ed25519)
+                if first_byte == 0x02 || first_byte == 0x03 || first_byte == 0xED {
+                    return Some(hex::encode(&blob[key_start..key_end]));
+                }
+            }
+        }
+    }
+    None
 }
 
 async fn index_page() -> Html<&'static str> {

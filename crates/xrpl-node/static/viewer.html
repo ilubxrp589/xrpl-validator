@@ -11,62 +11,91 @@
   body { background: #060610; color: #c8d0dc; font-family: 'JetBrains Mono', monospace; font-size: 13px; display: flex; flex-direction: column; }
 
   /* ---- HEADER ---- */
-  #header { padding: 12px 20px; border-bottom: 1px solid #141828; display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; background: #0a0a18; }
+  #header { padding: 10px 20px; border-bottom: 1px solid #141828; display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; background: #0a0a18; }
   #header h1 { font-family: 'Orbitron', sans-serif; font-size: 14px; color: #0085FF; letter-spacing: 2px; text-shadow: 0 0 12px rgba(0,133,255,0.3); }
   #header h1 .tag { color: #3a4055; font-size: 10px; font-family: 'JetBrains Mono', monospace; font-weight: 400; margin-left: 10px; letter-spacing: 0; }
+  #header-right { display: flex; align-items: center; gap: 16px; font-size: 11px; }
+  .header-link { color: #3a4a6a; cursor: pointer; padding: 4px 10px; border: 1px solid #1a1a30; border-radius: 3px; transition: all 0.2s; }
+  .header-link:hover { color: #0085FF; border-color: #0085FF; background: rgba(0,133,255,0.05); }
+  .header-link.active { color: #0085FF; border-color: #0085FF; background: rgba(0,133,255,0.1); }
+  #uptime { color: #2a3050; }
   #status { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 10px; }
   .connected { background: #0085FF; box-shadow: 0 0 8px #0085FF; animation: pulse-dot 2s ease-in-out infinite; }
   .disconnected { background: #ff4444; box-shadow: 0 0 8px #ff4444; }
   @keyframes pulse-dot { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
 
   /* ---- DASHBOARD ---- */
-  #dashboard { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; padding: 12px 20px; flex-shrink: 0; border-bottom: 1px solid #141828; }
+  #dashboard { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 12px; padding: 12px 20px; flex-shrink: 0; border-bottom: 1px solid #141828; }
   .panel { background: #0c0c1a; border: 1px solid #1a1a30; border-radius: 6px; padding: 12px 16px; }
   .panel-label { font-size: 10px; color: #3a4a6a; text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 8px; }
 
   /* Ledger counter */
-  #ledger-big { font-family: 'Orbitron', sans-serif; font-size: 32px; font-weight: 900; color: #0085FF; text-shadow: 0 0 20px rgba(0,133,255,0.25); transition: color 0.3s, text-shadow 0.3s; line-height: 1.2; }
+  #ledger-big { font-family: 'Orbitron', sans-serif; font-size: 28px; font-weight: 900; color: #0085FF; text-shadow: 0 0 20px rgba(0,133,255,0.25); transition: color 0.3s, text-shadow 0.3s; line-height: 1.2; }
   #ledger-big.flash { color: #00C3FF; text-shadow: 0 0 30px rgba(0,195,255,0.5); }
   .ledger-meta { font-size: 11px; color: #2a3a5a; margin-top: 4px; }
   .ledger-meta span { color: #4a6a9a; }
 
+  /* Consensus status */
+  #consensus-state { font-family: 'Orbitron', sans-serif; font-size: 16px; font-weight: 700; line-height: 1.2; transition: color 0.3s; }
+  .cons-open { color: #3a4a6a; }
+  .cons-propose { color: #0085FF; text-shadow: 0 0 10px rgba(0,133,255,0.3); }
+  .cons-validate { color: #ffd93d; text-shadow: 0 0 10px rgba(255,217,61,0.3); }
+  .cons-accepted { color: #00ff88; text-shadow: 0 0 10px rgba(0,255,136,0.3); }
+  #consensus-detail { font-size: 11px; color: #2a3a5a; margin-top: 4px; }
+  #consensus-detail span { color: #4a6a9a; }
+  #val-per-ledger { font-size: 20px; font-weight: 700; color: #ffd93d; margin-top: 2px; }
+  #val-per-ledger small { font-size: 11px; color: #3a4a6a; font-weight: 400; }
+
+  /* Validator grid */
+  #validator-grid { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 6px; max-height: 60px; overflow: hidden; }
+  .vdot { width: 8px; height: 8px; border-radius: 2px; background: #141828; transition: background 0.3s, box-shadow 0.3s; }
+  .vdot.proposed { background: #0085FF; box-shadow: 0 0 4px rgba(0,133,255,0.4); }
+  .vdot.validated { background: #ffd93d; box-shadow: 0 0 4px rgba(255,217,61,0.4); }
+  .vdot.agreed { background: #00ff88; box-shadow: 0 0 4px rgba(0,255,136,0.4); }
+
   /* Rate sparkline */
-  #sparkline-container { height: 48px; display: flex; align-items: flex-end; gap: 1px; }
+  #sparkline-container { height: 44px; display: flex; align-items: flex-end; gap: 1px; }
   .spark-bar { flex: 1; background: #0085FF; min-width: 0; border-radius: 1px 1px 0 0; transition: height 0.3s ease-out; opacity: 0.7; }
   .spark-bar:last-child { opacity: 1; box-shadow: 0 0 4px rgba(0,133,255,0.4); }
-  .rate-value { font-size: 20px; font-weight: 700; color: #00C3FF; margin-top: 4px; }
+  .rate-value { font-size: 18px; font-weight: 700; color: #00C3FF; margin-top: 4px; }
   .rate-value small { font-size: 11px; color: #3a4a6a; font-weight: 400; }
 
-  /* Consensus cycle */
-  #cycle { display: flex; gap: 3px; height: 32px; align-items: flex-end; margin-bottom: 6px; }
-  .cycle-tick { width: 4px; border-radius: 1px 1px 0 0; transition: height 0.2s ease-out; }
+  /* Consensus cycle viz */
+  #cycle { display: flex; gap: 2px; height: 28px; align-items: flex-end; margin-bottom: 4px; }
+  .cycle-tick { width: 3px; border-radius: 1px 1px 0 0; transition: height 0.2s ease-out; }
   .cycle-tick.propose { background: #0085FF; }
   .cycle-tick.validate { background: #ffd93d; }
   .cycle-tick.close { background: #ff6b6b; box-shadow: 0 0 6px rgba(255,107,107,0.4); }
-  #cycle-legend { display: flex; gap: 12px; font-size: 10px; color: #3a4a6a; }
-  #cycle-legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+  #cycle-legend { display: flex; gap: 10px; font-size: 9px; color: #3a4a6a; }
+  #cycle-legend i { display: inline-block; width: 6px; height: 6px; border-radius: 1px; margin-right: 3px; vertical-align: middle; }
+
+  /* ---- TYPE BARS ---- */
+  #type-bars { display: flex; gap: 0; padding: 0 20px; flex-shrink: 0; border-bottom: 1px solid #141828; background: #08081a; overflow: hidden; height: 24px; align-items: center; }
+  .type-segment { height: 5px; transition: flex 0.5s ease-out; border-radius: 3px; margin: 0 1px; min-width: 2px; }
 
   /* ---- STATS ROW ---- */
   #stats-row { display: flex; gap: 0; padding: 0 20px; flex-shrink: 0; border-bottom: 1px solid #141828; background: #08081a; }
-  .stat-cell { flex: 1; padding: 8px 16px; border-right: 1px solid #141828; font-size: 11px; color: #3a4a6a; }
+  .stat-cell { flex: 1; padding: 6px 14px; border-right: 1px solid #141828; font-size: 10px; color: #3a4a6a; }
   .stat-cell:last-child { border-right: none; }
-  .stat-cell .val { color: #7a9acc; font-weight: 500; font-size: 13px; }
+  .stat-cell .val { color: #7a9acc; font-weight: 500; font-size: 12px; }
 
-  /* ---- TYPE BARS ---- */
-  #type-bars { display: flex; gap: 0; padding: 0 20px; flex-shrink: 0; border-bottom: 1px solid #141828; background: #08081a; overflow: hidden; height: 28px; align-items: center; }
-  .type-segment { height: 6px; transition: flex 0.5s ease-out; border-radius: 3px; margin: 0 1px; min-width: 2px; }
-
-  /* ---- PEERS ---- */
-  #peers-bar { display: flex; gap: 0; padding: 4px 20px; flex-shrink: 0; border-bottom: 1px solid #141828; background: #08081a; align-items: center; font-size: 11px; overflow: hidden; cursor: pointer; }
-  #peers-bar:hover { background: #0c0c20; }
-  #peers-label { color: #3a4a6a; margin-right: 12px; white-space: nowrap; }
-  #peers-list { display: flex; gap: 6px; overflow: hidden; flex: 1; }
-  .peer-chip { background: #101028; border: 1px solid #1a1a30; border-radius: 3px; padding: 2px 8px; color: #4a6a9a; white-space: nowrap; font-size: 10px; }
-  .peer-chip .hops { color: #2a3a5a; margin-left: 4px; }
-  #peers-count { color: #0085FF; margin-left: 8px; white-space: nowrap; }
+  /* ---- PEER PANEL (overlay) ---- */
+  #peer-panel { display: none; position: fixed; top: 40px; right: 20px; width: 380px; max-height: 70vh; background: #0c0c1a; border: 1px solid #1a1a30; border-radius: 8px; z-index: 100; overflow: hidden; box-shadow: 0 8px 32px rgba(0,0,0,0.5); }
+  #peer-panel.show { display: block; }
+  #peer-panel-header { padding: 12px 16px; border-bottom: 1px solid #1a1a30; display: flex; justify-content: space-between; align-items: center; }
+  #peer-panel-header h2 { font-family: 'Orbitron', sans-serif; font-size: 12px; color: #0085FF; letter-spacing: 1px; }
+  #peer-panel-close { color: #3a4a6a; cursor: pointer; font-size: 16px; padding: 4px 8px; }
+  #peer-panel-close:hover { color: #ff6b6b; }
+  #peer-panel-list { overflow-y: auto; max-height: calc(70vh - 50px); padding: 8px 0; }
+  .peer-row { display: flex; justify-content: space-between; padding: 5px 16px; font-size: 11px; border-bottom: 1px solid #0e0e1e; }
+  .peer-row:hover { background: #101028; }
+  .peer-addr { color: #7a9acc; }
+  .peer-hops { color: #3a4a6a; font-size: 10px; }
+  .peer-row .peer-hops-badge { background: #141830; border-radius: 3px; padding: 1px 6px; font-size: 9px; color: #4a6a9a; }
+  #peer-panel-count { color: #4a6a9a; font-size: 11px; }
 
   /* ---- FEED ---- */
-  #feed-container { flex: 1; padding: 8px 20px 36px; overflow: hidden; }
+  #feed-container { flex: 1; padding: 6px 20px 36px; overflow: hidden; }
   #feed { height: 100%; overflow-y: auto; border: 1px solid #141828; border-radius: 4px; background: #08081a; }
   #feed::-webkit-scrollbar { width: 4px; }
   #feed::-webkit-scrollbar-track { background: #08081a; }
@@ -74,12 +103,11 @@
   .msg { padding: 3px 14px; display: flex; gap: 10px; border-bottom: 1px solid #0c0c1a; font-size: 12px; }
   .msg:hover { background: #0e0e20; }
   .msg-seq { color: #252a3a; min-width: 44px; text-align: right; }
-  .msg-time { color: #2a3050; min-width: 60px; }
-  .msg-type { min-width: 130px; font-weight: 500; }
+  .msg-time { color: #2a3050; min-width: 56px; }
+  .msg-type { min-width: 120px; font-weight: 500; }
   .msg-detail { color: #4a5570; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .msg-ledger { color: #0085FF; min-width: 90px; text-align: right; }
 
-  /* Type colors */
   .t-StatusChange .msg-type { color: #ff6b6b; }
   .t-Validation .msg-type { color: #ffd93d; }
   .t-Proposal .msg-type { color: #0085FF; }
@@ -96,12 +124,14 @@
   .new { animation: row-flash 0.4s ease-out; }
   @keyframes row-flash { from { background: #0a1a30; } to { background: transparent; } }
 
-  /* ---- FOOTER ---- */
-  #built-with { position: fixed; bottom: 8px; right: 20px; font-size: 10px; color: #1a2040; }
+  #built-with { position: fixed; bottom: 6px; right: 20px; font-size: 10px; color: #1a2040; }
   #built-with span { color: #2a3060; }
 
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+  }
+  @media (max-width: 900px) {
+    #dashboard { grid-template-columns: 1fr 1fr; }
   }
 </style>
 </head>
@@ -109,27 +139,33 @@
 
 <div id="header">
   <h1><span id="status" class="disconnected"></span>XRPL VALIDATOR<span class="tag">TESTNET</span></h1>
-  <div style="font-size:11px;color:#2a3050;">
+  <div id="header-right">
+    <span class="header-link" id="peers-toggle">PEERS <span id="peer-badge">0</span></span>
     <span id="uptime">0s</span>
   </div>
 </div>
 
 <div id="dashboard">
-  <!-- Ledger Counter -->
   <div class="panel">
     <div class="panel-label">Current Ledger</div>
     <div id="ledger-big">--</div>
-    <div class="ledger-meta">close interval: <span id="close-interval">--</span>s</div>
+    <div class="ledger-meta">interval: <span id="close-interval">--</span>s</div>
   </div>
 
-  <!-- Message Rate -->
+  <div class="panel">
+    <div class="panel-label">Consensus</div>
+    <div id="consensus-state" class="cons-open">WAITING</div>
+    <div id="val-per-ledger">0 <small>validators</small></div>
+    <div id="consensus-detail">round: <span id="propose-count">0</span> proposals</div>
+    <div id="validator-grid"></div>
+  </div>
+
   <div class="panel">
     <div class="panel-label">Messages / Second</div>
     <div id="sparkline-container"></div>
     <div class="rate-value"><span id="msg-rate-big">0</span> <small>msg/s</small></div>
   </div>
 
-  <!-- Consensus Cycle -->
   <div class="panel">
     <div class="panel-label">Consensus Cycle</div>
     <div id="cycle"></div>
@@ -141,17 +177,8 @@
   </div>
 </div>
 
-<!-- Type distribution bar -->
 <div id="type-bars"></div>
 
-<!-- Peer list -->
-<div id="peers-bar">
-  <span id="peers-label">PEERS</span>
-  <div id="peers-list"></div>
-  <span id="peers-count"></span>
-</div>
-
-<!-- Stats row -->
 <div id="stats-row">
   <div class="stat-cell">msgs <span class="val" id="msg-count">0</span></div>
   <div class="stat-cell">validations <span class="val" id="val-count">0</span></div>
@@ -160,14 +187,23 @@
   <div class="stat-cell">ledger <span class="val" id="ledger-seq">--</span></div>
 </div>
 
+<!-- Peer panel overlay -->
+<div id="peer-panel">
+  <div id="peer-panel-header">
+    <h2>NETWORK PEERS</h2>
+    <div><span id="peer-panel-count">0 peers</span> <span id="peer-panel-close">X</span></div>
+  </div>
+  <div id="peer-panel-list"></div>
+</div>
+
 <div id="feed-container"><div id="feed"></div></div>
-<div id="built-with">built with <span>Rust + tokio + OpenSSL + prost + axum</span> — a from-scratch XRPL peer protocol implementation. no libraries, no shortcuts, just raw binary frames off the wire.</div>
+<div id="built-with">built with <span>Rust + tokio + OpenSSL + prost + axum</span> — from-scratch XRPL peer protocol. no libraries, no shortcuts, raw binary frames off the wire.</div>
 
 <script>
 const feed = document.getElementById('feed');
 const statusDot = document.getElementById('status');
 const ledgerBig = document.getElementById('ledger-big');
-const closeInterval = document.getElementById('close-interval');
+const closeIntervalEl = document.getElementById('close-interval');
 const msgRateBig = document.getElementById('msg-rate-big');
 const msgCountEl = document.getElementById('msg-count');
 const valCountEl = document.getElementById('val-count');
@@ -178,20 +214,63 @@ const uptimeEl = document.getElementById('uptime');
 const sparkContainer = document.getElementById('sparkline-container');
 const cycleEl = document.getElementById('cycle');
 const typeBarsEl = document.getElementById('type-bars');
-const peersListEl = document.getElementById('peers-list');
-const peersCountEl = document.getElementById('peers-count');
+const consensusState = document.getElementById('consensus-state');
+const valPerLedger = document.getElementById('val-per-ledger');
+const proposeCountEl = document.getElementById('propose-count');
+const peersToggle = document.getElementById('peers-toggle');
+const peerBadge = document.getElementById('peer-badge');
+const peerPanel = document.getElementById('peer-panel');
+const peerPanelList = document.getElementById('peer-panel-list');
+const peerPanelCount = document.getElementById('peer-panel-count');
+const peerPanelClose = document.getElementById('peer-panel-close');
 
 let count = 0, valCount = 0, propCount = 0, txCount = 0;
 let startTime = Date.now();
 let lastLedger = null, lastLedgerTime = null;
 const MAX_ROWS = 400;
 
-// Sparkline: msgs per second over last 60s
+// Consensus tracking per ledger round
+let roundProposals = 0, roundValidations = 0;
+let consensusPhase = 'open';
+
+// Validator tracking: key → {state: 'proposed'|'validated', shortKey}
+const validators = new Map();
+const validatorGrid = document.getElementById('validator-grid');
+
+function getOrCreateValidator(key) {
+  if (!key) return null;
+  const short = key.slice(0, 8);
+  if (!validators.has(short)) {
+    validators.set(short, { state: 'idle', fullKey: key });
+    const dot = document.createElement('div');
+    dot.className = 'vdot';
+    dot.id = 'v-' + short;
+    dot.title = key.slice(0, 16) + '...';
+    validatorGrid.appendChild(dot);
+  }
+  return short;
+}
+
+function setValidatorState(key, state) {
+  const short = getOrCreateValidator(key);
+  if (!short) return;
+  validators.get(short).state = state;
+  const dot = document.getElementById('v-' + short);
+  if (dot) dot.className = 'vdot ' + state;
+}
+
+function resetValidatorStates() {
+  for (const [short, v] of validators) {
+    v.state = 'idle';
+    const dot = document.getElementById('v-' + short);
+    if (dot) dot.className = 'vdot';
+  }
+}
+
+// Sparkline
 const rateHistory = new Array(60).fill(0);
 let currentSecond = Math.floor(Date.now() / 1000);
 let currentSecondCount = 0;
-
-// Init sparkline bars
 for (let i = 0; i < 60; i++) {
   const bar = document.createElement('div');
   bar.className = 'spark-bar';
@@ -199,9 +278,9 @@ for (let i = 0; i < 60; i++) {
   sparkContainer.appendChild(bar);
 }
 
-// Consensus cycle: last 80 events
+// Cycle viz
 const cycleHistory = [];
-const CYCLE_MAX = 80;
+const CYCLE_MAX = 100;
 for (let i = 0; i < CYCLE_MAX; i++) {
   const tick = document.createElement('div');
   tick.className = 'cycle-tick';
@@ -209,7 +288,12 @@ for (let i = 0; i < CYCLE_MAX; i++) {
   cycleEl.appendChild(tick);
 }
 
-// Type distribution
+// Peers
+let peerData = [];
+peersToggle.onclick = () => peerPanel.classList.toggle('show');
+peerPanelClose.onclick = () => peerPanel.classList.remove('show');
+
+// Type colors
 const typeColors = {
   Proposal: '#0085FF', Validation: '#ffd93d', StatusChange: '#ff6b6b',
   Transaction: '#a855f7', Manifests: '#6366f1', ValidatorList: '#6366f1',
@@ -217,16 +301,6 @@ const typeColors = {
   GetLedger: '#ef4444', LedgerData: '#14b8a6', Ping: '#1a2030'
 };
 const typeCounts = {};
-
-function updatePeers(peers) {
-  if (!peers || peers.length === 0) return;
-  peersCountEl.textContent = peers.length;
-  let html = '';
-  for (const p of peers) {
-    html += `<div class="peer-chip">${p.endpoint}<span class="hops">h${p.hops}</span></div>`;
-  }
-  peersListEl.innerHTML = html;
-}
 
 function updateSparkline() {
   const now = Math.floor(Date.now() / 1000);
@@ -239,32 +313,24 @@ function updateSparkline() {
   const max = Math.max(...rateHistory, 1);
   const bars = sparkContainer.children;
   for (let i = 0; i < 60; i++) {
-    const h = (rateHistory[i] / max) * 48;
-    bars[i].style.height = h + 'px';
+    bars[i].style.height = (rateHistory[i] / max) * 44 + 'px';
   }
   msgRateBig.textContent = rateHistory[rateHistory.length - 1] || currentSecondCount;
 }
 
 function updateCycle(type) {
   let cls = '', h = 0;
-  if (type === 'Proposal') { cls = 'propose'; h = 16; }
-  else if (type === 'Validation') { cls = 'validate'; h = 24; }
-  else if (type === 'StatusChange') { cls = 'close'; h = 32; }
+  if (type === 'Proposal') { cls = 'propose'; h = 14; }
+  else if (type === 'Validation') { cls = 'validate'; h = 22; }
+  else if (type === 'StatusChange') { cls = 'close'; h = 28; }
   else return;
-
   cycleHistory.push({ cls, h });
   if (cycleHistory.length > CYCLE_MAX) cycleHistory.shift();
-
   const ticks = cycleEl.children;
   for (let i = 0; i < CYCLE_MAX; i++) {
-    const entry = cycleHistory[i];
-    if (entry) {
-      ticks[i].className = 'cycle-tick ' + entry.cls;
-      ticks[i].style.height = entry.h + 'px';
-    } else {
-      ticks[i].className = 'cycle-tick';
-      ticks[i].style.height = '0px';
-    }
+    const e = cycleHistory[i];
+    if (e) { ticks[i].className = 'cycle-tick ' + e.cls; ticks[i].style.height = e.h + 'px'; }
+    else { ticks[i].className = 'cycle-tick'; ticks[i].style.height = '0px'; }
   }
 }
 
@@ -273,18 +339,76 @@ function updateTypeBars() {
   let html = '';
   for (const [type, cnt] of Object.entries(typeCounts)) {
     if (cnt === 0) continue;
-    const pct = (cnt / total) * 100;
     const color = typeColors[type] || '#333';
-    html += `<div class="type-segment" style="flex:${pct};background:${color}" title="${type}: ${cnt}"></div>`;
+    html += `<div class="type-segment" style="flex:${(cnt/total)*100};background:${color}" title="${type}: ${cnt}"></div>`;
   }
   typeBarsEl.innerHTML = html;
+}
+
+function updateConsensus(type, detail, validatorKey) {
+  if (type === 'Proposal') {
+    roundProposals++;
+    proposeCountEl.textContent = roundProposals;
+    if (validatorKey) setValidatorState(validatorKey, 'proposed');
+    if (consensusPhase === 'open' || consensusPhase === 'accepted') {
+      consensusPhase = 'propose';
+      consensusState.className = 'cons-propose';
+      consensusState.textContent = 'PROPOSING';
+      roundValidations = 0;
+      resetValidatorStates();
+      if (validatorKey) setValidatorState(validatorKey, 'proposed');
+    }
+  } else if (type === 'Validation') {
+    roundValidations++;
+    valPerLedger.innerHTML = roundValidations + ' <small>validators</small>';
+    if (validatorKey) setValidatorState(validatorKey, 'validated');
+    if (consensusPhase !== 'validate') {
+      consensusPhase = 'validate';
+      consensusState.className = 'cons-validate';
+      consensusState.textContent = 'VALIDATING';
+    }
+  } else if (type === 'StatusChange') {
+    if (detail && detail.includes('ACCEPTED')) {
+      consensusPhase = 'accepted';
+      consensusState.className = 'cons-accepted';
+      consensusState.textContent = 'CONSENSUS';
+      // Flash all active validators green
+      for (const [short, v] of validators) {
+        if (v.state === 'validated' || v.state === 'proposed') {
+          setValidatorState(v.fullKey, 'agreed');
+        }
+      }
+      setTimeout(() => {
+        if (consensusPhase === 'accepted') {
+          roundProposals = 0;
+          proposeCountEl.textContent = '0';
+        }
+      }, 2000);
+    } else if (detail && detail.includes('CLOSING')) {
+      consensusState.className = 'cons-propose';
+      consensusState.textContent = 'CLOSING';
+    }
+  }
+}
+
+function updatePeers(peers) {
+  if (!peers || peers.length === 0) return;
+  peerData = peers;
+  peerBadge.textContent = peers.length;
+  peerPanelCount.textContent = peers.length + ' peers';
+  let html = '';
+  // Sort by hops ascending
+  const sorted = [...peers].sort((a, b) => a.hops - b.hops);
+  for (const p of sorted) {
+    html += `<div class="peer-row"><span class="peer-addr">${p.endpoint}</span><span class="peer-hops-badge">hop ${p.hops}</span></div>`;
+  }
+  peerPanelList.innerHTML = html;
 }
 
 function addMessage(ev) {
   count++;
   currentSecondCount++;
   msgCountEl.textContent = count.toLocaleString();
-
   typeCounts[ev.msg_type] = (typeCounts[ev.msg_type] || 0) + 1;
 
   if (ev.msg_type === 'Validation') { valCount++; valCountEl.textContent = valCount.toLocaleString(); }
@@ -293,9 +417,7 @@ function addMessage(ev) {
 
   if (ev.ledger_seq) {
     const now = Date.now();
-    if (lastLedgerTime) {
-      closeInterval.textContent = ((now - lastLedgerTime) / 1000).toFixed(1);
-    }
+    if (lastLedgerTime) closeIntervalEl.textContent = ((now - lastLedgerTime) / 1000).toFixed(1);
     lastLedger = ev.ledger_seq;
     lastLedgerTime = now;
     ledgerBig.textContent = lastLedger.toLocaleString();
@@ -305,6 +427,7 @@ function addMessage(ev) {
   }
 
   updateCycle(ev.msg_type);
+  updateConsensus(ev.msg_type, ev.detail, ev.validator);
   if (ev.peers) updatePeers(ev.peers);
 
   const row = document.createElement('div');
