@@ -5,13 +5,15 @@
 <title>XRPL Validator — Live Peer Feed</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { background: #0a0a0a; color: #e0e0e0; font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 13px; }
-  #header { padding: 16px 20px; border-bottom: 1px solid #222; display: flex; justify-content: space-between; align-items: center; }
+  html, body { height: 100%; overflow: hidden; }
+  body { background: #0a0a0a; color: #e0e0e0; font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 13px; display: flex; flex-direction: column; }
+  #header { padding: 16px 20px; border-bottom: 1px solid #222; display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; }
   #header h1 { font-size: 16px; color: #00ff88; letter-spacing: 1px; }
   #stats { display: flex; gap: 24px; font-size: 12px; color: #888; }
   .stat-val { color: #00ff88; font-weight: bold; }
-  #feed { padding: 8px 0; overflow-y: auto; height: calc(100vh - 60px); }
-  .msg { padding: 4px 20px; display: flex; gap: 12px; border-bottom: 1px solid #111; transition: background 0.3s; }
+  #feed-container { flex: 1; padding: 16px 20px 40px; overflow: hidden; }
+  #feed { height: 100%; overflow-y: auto; border: 1px solid #1a1a1a; border-radius: 4px; background: #060606; }
+  .msg { padding: 4px 16px; display: flex; gap: 12px; border-bottom: 1px solid #0e0e0e; transition: background 0.3s; }
   .msg:hover { background: #111; }
   .msg-seq { color: #444; min-width: 50px; text-align: right; }
   .msg-time { color: #555; min-width: 70px; }
@@ -53,7 +55,7 @@
     <div>uptime: <span class="stat-val" id="uptime">0s</span></div>
   </div>
 </div>
-<div id="feed"></div>
+<div id="feed-container"><div id="feed"></div></div>
 <div id="built-with">built with <span>Rust + tokio + OpenSSL + prost + axum</span> — a from-scratch XRPL peer protocol implementation. no libraries, no shortcuts, just raw binary frames off the wire.</div>
 
 <script>
