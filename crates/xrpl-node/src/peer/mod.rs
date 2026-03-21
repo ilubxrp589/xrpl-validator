@@ -18,5 +18,8 @@
 /// - [`protocol::TmEndpoints`] — Peer discovery endpoints
 /// - [`protocol::TmCluster`] — Cluster node status
 /// - [`protocol::TmSquelch`] — Validator message squelching
+pub mod codec;
+pub mod identity;
+pub mod message;
 #[allow(clippy::all)]
 pub mod protocol;
