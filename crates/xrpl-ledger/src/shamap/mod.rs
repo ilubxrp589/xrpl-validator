@@ -7,3 +7,9 @@
 //!
 //! Nodes are identified by 256-bit hashes. Navigation through the trie
 //! uses nibbles (4-bit segments) of the key.
+
+pub mod hash;
+pub mod node;
+pub mod tree;
+
+pub use tree::{SHAMap, TreeType};
