@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>XRPL Validator — Live Peer Feed</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0a0a0a; color: #e0e0e0; font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 13px; }
+  #header { padding: 16px 20px; border-bottom: 1px solid #222; display: flex; justify-content: space-between; align-items: center; }
+  #header h1 { font-size: 16px; color: #00ff88; letter-spacing: 1px; }
+  #stats { display: flex; gap: 24px; font-size: 12px; color: #888; }
+  .stat-val { color: #00ff88; font-weight: bold; }
+  #feed { padding: 8px 0; overflow-y: auto; height: calc(100vh - 60px); }
+  .msg { padding: 4px 20px; display: flex; gap: 12px; border-bottom: 1px solid #111; transition: background 0.3s; }
+  .msg:hover { background: #111; }
+  .msg-seq { color: #444; min-width: 50px; text-align: right; }
+  .msg-time { color: #555; min-width: 70px; }
+  .msg-type { min-width: 140px; font-weight: bold; }
+  .msg-detail { color: #888; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .msg-ledger { color: #00aaff; min-width: 100px; text-align: right; }
+
+  /* Type colors */
+  .t-StatusChange .msg-type { color: #ff6b6b; }
+  .t-Validation .msg-type { color: #ffd93d; }
+  .t-Proposal .msg-type { color: #6bcb77; }
+  .t-Transaction .msg-type { color: #4d96ff; }
+  .t-Manifests .msg-type { color: #9b59b6; }
+  .t-ValidatorList .msg-type { color: #9b59b6; }
+  .t-HaveTxSet .msg-type { color: #3498db; }
+  .t-Ping .msg-type { color: #333; }
+  .t-Endpoints .msg-type { color: #e67e22; }
+  .t-CONNECTED .msg-type { color: #00ff88; }
+  .t-GetLedger .msg-type { color: #e74c3c; }
+  .t-LedgerData .msg-type { color: #1abc9c; }
+
+  .new { animation: flash 0.5s ease-out; }
+  @keyframes flash { from { background: #1a3a1a; } to { background: transparent; } }
+
+  #status { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; }
+  .connected { background: #00ff88; box-shadow: 0 0 6px #00ff88; }
+  .disconnected { background: #ff4444; box-shadow: 0 0 6px #ff4444; }
+</style>
+</head>
+<body>
+<div id="header">
+  <h1><span id="status" class="disconnected"></span>XRPL VALIDATOR — LIVE PEER FEED</h1>
+  <div id="stats">
+    <div>msgs: <span class="stat-val" id="msg-count">0</span></div>
+    <div>ledger: <span class="stat-val" id="ledger-seq">—</span></div>
+    <div>msgs/s: <span class="stat-val" id="msg-rate">0</span></div>
+    <div>uptime: <span class="stat-val" id="uptime">0s</span></div>
+  </div>
+</div>
+<div id="feed"></div>
+
+<script>
+const feed = document.getElementById('feed');
+const msgCount = document.getElementById('msg-count');
+const ledgerSeq = document.getElementById('ledger-seq');
+const msgRate = document.getElementById('msg-rate');
+const uptimeEl = document.getElementById('uptime');
+const statusDot = document.getElementById('status');
+
+let count = 0;
+let startTime = Date.now();
+let lastLedger = null;
+const MAX_ROWS = 500;
+
+function addMessage(ev) {
+  count++;
+  msgCount.textContent = count;
+
+  if (ev.ledger_seq) {
+    lastLedger = ev.ledger_seq;
+    ledgerSeq.textContent = lastLedger.toLocaleString();
+  }
+
+  const elapsed = (Date.now() - startTime) / 1000;
+  msgRate.textContent = (count / Math.max(elapsed, 1)).toFixed(1);
+
+  const row = document.createElement('div');
+  row.className = `msg t-${ev.msg_type} new`;
+  row.innerHTML = `
+    <span class="msg-seq">${ev.seq}</span>
+    <span class="msg-time">${ev.time.toFixed(1)}s</span>
+    <span class="msg-type">${ev.msg_type}</span>
+    <span class="msg-detail">${ev.detail}</span>
+    <span class="msg-ledger">${ev.ledger_seq ? '#' + ev.ledger_seq.toLocaleString() : ''}</span>
+  `;
+
+  feed.prepend(row);
+
+  // Trim old rows
+  while (feed.children.length > MAX_ROWS) {
+    feed.removeChild(feed.lastChild);
+  }
+
+  setTimeout(() => row.classList.remove('new'), 500);
+}
+
+function updateUptime() {
+  const s = Math.floor((Date.now() - startTime) / 1000);
+  if (s < 60) uptimeEl.textContent = s + 's';
+  else if (s < 3600) uptimeEl.textContent = Math.floor(s/60) + 'm ' + (s%60) + 's';
+  else uptimeEl.textContent = Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+}
+setInterval(updateUptime, 1000);
+
+const es = new EventSource('/events');
+es.onopen = () => {
+  statusDot.className = 'connected';
+  startTime = Date.now();
+};
+es.onmessage = (e) => {
+  try {
+    const ev = JSON.parse(e.data);
+    addMessage(ev);
+  } catch {}
+};
+es.onerror = () => {
+  statusDot.className = 'disconnected';
+};
+</script>
+</body>
+</html>
