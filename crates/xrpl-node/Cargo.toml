@@ -1,0 +1,48 @@
+[package]
+name = "xrpl-node"
+version = "0.1.0"
+edition = "2021"
+description = "XRPL validator node — peer protocol, consensus, and RPC server"
+license = "MIT"
+repository = "https://github.com/ilubxrp589/xrpl-validator"
+authors = ["XRPL Rust SDK Contributors"]
+keywords = ["xrpl", "xrp", "ripple", "validator", "consensus"]
+categories = ["network-programming", "cryptography"]
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = []
+live-tests = []
+
+[dependencies]
+xrpl-core = { workspace = true }
+xrpl-ledger = { path = "../xrpl-ledger" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tokio = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rcgen = { workspace = true }
+axum = { workspace = true }
+dashmap = { workspace = true }
+bytes = { workspace = true }
+tower = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+flate2 = { workspace = true }
+futures = { workspace = true }
+
+[build-dependencies]
+prost-build = "0.13"
+
+[dev-dependencies]
+serde_json = { workspace = true }
