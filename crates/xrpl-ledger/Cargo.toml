@@ -16,6 +16,7 @@ crate-type = ["rlib"]
 default = ["std"]
 std = ["serde/std", "serde_json", "thiserror/std"]
 sled-backend = ["sled"]
+live-tests = []
 
 [dependencies]
 xrpl-core = { workspace = true }
@@ -31,3 +32,5 @@ sled = { version = "0.34", optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+tokio = { workspace = true }

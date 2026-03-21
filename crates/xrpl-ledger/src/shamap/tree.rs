@@ -1,4 +1,7 @@
 //! SHAMap trie — insert, lookup, delete, and root hash computation.
+//!
+//! Inner nodes store actual child node references (not just hashes),
+//! enabling full traversal for lookup and deletion.
 
 use xrpl_core::types::Hash256;
 
@@ -18,8 +21,12 @@ pub enum TreeType {
 ///
 /// Keys are 256-bit hashes. Navigation uses nibbles (4-bit segments) of the key.
 /// Maximum depth: 64 (one nibble per level, 32 bytes = 64 nibbles).
+///
+/// Inner nodes store actual child references, enabling full traversal.
+/// The root hash is computed lazily from the tree structure.
 #[derive(Debug, Clone)]
 pub struct SHAMap {
+    /// Root node — always starts as an empty InnerNode.
     root: SHAMapNode,
     tree_type: TreeType,
     size: usize,
@@ -35,17 +42,14 @@ impl SHAMap {
         }
     }
 
-    /// The type of this tree.
     pub fn tree_type(&self) -> TreeType {
         self.tree_type
     }
 
-    /// Number of leaf entries.
     pub fn len(&self) -> usize {
         self.size
     }
 
-    /// Check if the tree is empty.
     pub fn is_empty(&self) -> bool {
         self.size == 0
     }
@@ -58,134 +62,162 @@ impl SHAMap {
         self.root.hash()
     }
 
-    /// Look up a value by key.
-    pub fn lookup(&self, key: &Hash256) -> Option<&[u8]> {
-        Self::lookup_recursive(&self.root, key, 0)
+    /// Access the root node (for traversal, e.g., diff).
+    pub fn root_node(&self) -> &SHAMapNode {
+        &self.root
     }
 
-    /// Insert a key-value pair. Overwrites if key already exists.
-    pub fn insert(&mut self, key: Hash256, data: Vec<u8>) -> Result<(), LedgerError> {
-        let new_root = Self::insert_recursive(self.root.clone(), key, data, 0)?;
+    /// Look up a value by key.
+    pub fn lookup(&self, key: &Hash256) -> Option<&[u8]> {
+        lookup_in(&self.root, key, 0)
+    }
+
+    /// Insert a key-value pair. Returns true if the key was new (not an overwrite).
+    pub fn insert(&mut self, key: Hash256, data: Vec<u8>) -> Result<bool, LedgerError> {
+        let (new_root, is_new) = insert_into(self.root.clone(), key, data, 0)?;
         self.root = new_root;
-        self.size += 1; // Note: overcounts on overwrite, but fine for now
-        Ok(())
+        if is_new {
+            self.size += 1;
+        }
+        Ok(is_new)
     }
 
     /// Delete a key. Returns true if the key was found and removed.
     pub fn delete(&mut self, key: &Hash256) -> Result<bool, LedgerError> {
-        let (new_root, found) = Self::delete_recursive(self.root.clone(), key, 0)?;
+        let (new_root, found) = delete_from(self.root.clone(), key, 0)?;
         if found {
             self.root = new_root;
             self.size -= 1;
         }
         Ok(found)
     }
+}
 
-    // ---- Recursive helpers ----
+// ---- Recursive helpers ----
 
-    fn lookup_recursive<'a>(node: &'a SHAMapNode, key: &Hash256, depth: usize) -> Option<&'a [u8]> {
-        match node {
-            SHAMapNode::Leaf(leaf) => {
-                if leaf.key() == key {
-                    Some(leaf.data())
-                } else {
-                    None
-                }
+fn lookup_in<'a>(node: &'a SHAMapNode, key: &Hash256, depth: usize) -> Option<&'a [u8]> {
+    match node {
+        SHAMapNode::Leaf(leaf) => {
+            if leaf.key() == key {
+                Some(leaf.data())
+            } else {
+                None
             }
-            SHAMapNode::Inner(inner) => {
-                let nibble = nibble_at(key, depth);
-                if !inner.has_child(nibble) {
-                    return None;
-                }
-                // We can't follow the child hash to the actual node in this
-                // in-memory implementation — we store the tree structurally.
-                // This means we need a different approach: store children as
-                // SHAMapNode references, not just hashes.
-                //
-                // For now, this lookup traverses the structural tree.
-                // The hash-based lookup will be added with NodeStore integration.
-                None // Placeholder — see structural_lookup below
-            }
+        }
+        SHAMapNode::Inner(inner) => {
+            let nibble = nibble_at(key, depth);
+            inner.get_child_node(nibble).and_then(|child| lookup_in(child, key, depth + 1))
         }
     }
+}
 
-    fn insert_recursive(
-        node: SHAMapNode,
-        key: Hash256,
-        data: Vec<u8>,
-        depth: usize,
-    ) -> Result<SHAMapNode, LedgerError> {
-        if depth >= 64 {
-            return Err(LedgerError::InvalidTreeType(
-                "SHAMap depth exceeded 64".to_string(),
-            ));
-        }
-
-        match node {
-            SHAMapNode::Inner(mut inner) => {
-                let nibble = nibble_at(&key, depth);
-                // For the structural tree, we need to store child nodes, not just hashes.
-                // This simplified implementation rebuilds the path.
-                // A production version would use NodeStore for persistence.
-                let new_leaf = SHAMapNode::Leaf(LeafNode::new(key, data));
-                inner.set_child(nibble, new_leaf.hash());
-                Ok(SHAMapNode::Inner(inner))
-            }
-            SHAMapNode::Leaf(existing) => {
-                if existing.key() == &key {
-                    // Overwrite
-                    Ok(SHAMapNode::Leaf(LeafNode::new(key, data)))
-                } else {
-                    // Collision — split into inner node
-                    let mut new_inner = Box::<InnerNode>::default();
-                    let existing_nibble = nibble_at(existing.key(), depth);
-                    let new_nibble = nibble_at(&key, depth);
-
-                    if existing_nibble == new_nibble {
-                        // Same nibble — need to recurse deeper
-                        let child = Self::insert_recursive(
-                            SHAMapNode::Leaf(existing),
-                            key,
-                            data,
-                            depth + 1,
-                        )?;
-                        new_inner.set_child(existing_nibble, child.hash());
-                    } else {
-                        // Different nibbles — place both as direct children
-                        let existing_node = SHAMapNode::Leaf(existing);
-                        let new_node = SHAMapNode::Leaf(LeafNode::new(key, data));
-                        new_inner.set_child(existing_nibble, existing_node.hash());
-                        new_inner.set_child(new_nibble, new_node.hash());
-                    }
-                    Ok(SHAMapNode::Inner(new_inner))
-                }
-            }
-        }
+fn insert_into(
+    node: SHAMapNode,
+    key: Hash256,
+    data: Vec<u8>,
+    depth: usize,
+) -> Result<(SHAMapNode, bool), LedgerError> {
+    if depth >= 64 {
+        return Err(LedgerError::InvalidTreeType(
+            "SHAMap depth exceeded 64".to_string(),
+        ));
     }
 
-    fn delete_recursive(
-        node: SHAMapNode,
-        key: &Hash256,
-        depth: usize,
-    ) -> Result<(SHAMapNode, bool), LedgerError> {
-        match node {
-            SHAMapNode::Leaf(leaf) => {
-                if leaf.key() == key {
-                    // Replace with empty inner node (will be collapsed by parent)
-                    Ok((SHAMapNode::Inner(Box::<InnerNode>::default()), true))
-                } else {
-                    Ok((SHAMapNode::Leaf(leaf), false))
-                }
-            }
-            SHAMapNode::Inner(mut inner) => {
-                let nibble = nibble_at(key, depth);
-                if !inner.has_child(nibble) {
-                    return Ok((SHAMapNode::Inner(inner), false));
-                }
-                // In the structural version, we'd recurse into the child.
-                // For the hash-only version, we just remove the child hash.
-                inner.remove_child(nibble);
+    match node {
+        SHAMapNode::Inner(mut inner) => {
+            let nibble = nibble_at(&key, depth);
+
+            if let Some(existing_child) = inner.take_child_node(nibble) {
+                // Recurse into the existing child
+                let (new_child, is_new) = insert_into(existing_child, key, data, depth + 1)?;
+                inner.set_child_node(nibble, new_child);
+                Ok((SHAMapNode::Inner(inner), is_new))
+            } else {
+                // Empty slot — place the leaf directly
+                let leaf = SHAMapNode::Leaf(LeafNode::new(key, data));
+                inner.set_child_node(nibble, leaf);
                 Ok((SHAMapNode::Inner(inner), true))
+            }
+        }
+        SHAMapNode::Leaf(existing) => {
+            if existing.key() == &key {
+                // Overwrite existing leaf
+                Ok((SHAMapNode::Leaf(LeafNode::new(key, data)), false))
+            } else {
+                // Collision — split into inner node with both leaves
+                let mut new_inner = Box::<InnerNode>::default();
+                let existing_nibble = nibble_at(existing.key(), depth);
+                let new_nibble = nibble_at(&key, depth);
+
+                if existing_nibble == new_nibble {
+                    // Same nibble at this depth — recurse deeper
+                    let (child, _) = insert_into(
+                        SHAMapNode::Leaf(existing),
+                        key,
+                        data,
+                        depth + 1,
+                    )?;
+                    new_inner.set_child_node(existing_nibble, child);
+                } else {
+                    // Different nibbles — place both as children
+                    new_inner.set_child_node(existing_nibble, SHAMapNode::Leaf(existing));
+                    new_inner.set_child_node(new_nibble, SHAMapNode::Leaf(LeafNode::new(key, data)));
+                }
+                Ok((SHAMapNode::Inner(new_inner), true))
+            }
+        }
+    }
+}
+
+fn delete_from(
+    node: SHAMapNode,
+    key: &Hash256,
+    depth: usize,
+) -> Result<(SHAMapNode, bool), LedgerError> {
+    match node {
+        SHAMapNode::Leaf(leaf) => {
+            if leaf.key() == key {
+                // Replace with empty inner (parent will handle collapsing)
+                Ok((SHAMapNode::Inner(Box::<InnerNode>::default()), true))
+            } else {
+                Ok((SHAMapNode::Leaf(leaf), false))
+            }
+        }
+        SHAMapNode::Inner(mut inner) => {
+            let nibble = nibble_at(key, depth);
+
+            if let Some(child) = inner.take_child_node(nibble) {
+                let (new_child, found) = delete_from(child, key, depth + 1)?;
+                if found {
+                    // Check if the new child is an empty inner node
+                    match &new_child {
+                        SHAMapNode::Inner(i) if i.is_empty() => {
+                            // Don't put the empty inner back — slot becomes None
+                        }
+                        _ => {
+                            inner.set_child_node(nibble, new_child);
+                        }
+                    }
+
+                    // Collapse: if only one child remains, and it's a leaf, promote it
+                    if inner.child_count() == 1 {
+                        if let Some(only_idx) = inner.only_child_index() {
+                            if let Some(SHAMapNode::Leaf(_)) = inner.get_child_node(only_idx) {
+                                if let Some(promoted) = inner.take_child_node(only_idx) {
+                                    return Ok((promoted, true));
+                                }
+                            }
+                        }
+                    }
+
+                    Ok((SHAMapNode::Inner(inner), true))
+                } else {
+                    // Key not found deeper — put child back
+                    inner.set_child_node(nibble, new_child);
+                    Ok((SHAMapNode::Inner(inner), false))
+                }
+            } else {
+                Ok((SHAMapNode::Inner(inner), false))
             }
         }
     }
@@ -208,12 +240,119 @@ mod tests {
     }
 
     #[test]
-    fn insert_one() {
+    fn insert_and_lookup() {
         let mut tree = SHAMap::new(TreeType::State);
-        tree.insert(make_key(0xAA), vec![1, 2, 3]).unwrap();
+        let key = make_key(0xAA);
+        tree.insert(key, vec![1, 2, 3]).unwrap();
+
         assert_eq!(tree.len(), 1);
-        assert!(!tree.is_empty());
-        assert_ne!(tree.root_hash(), ZERO_HASH);
+        assert_eq!(tree.lookup(&key), Some(&[1, 2, 3][..]));
+        assert_eq!(tree.lookup(&make_key(0xBB)), None);
+    }
+
+    #[test]
+    fn insert_overwrite() {
+        let mut tree = SHAMap::new(TreeType::State);
+        let key = make_key(0xAA);
+
+        let is_new = tree.insert(key, vec![1]).unwrap();
+        assert!(is_new);
+        assert_eq!(tree.len(), 1);
+
+        let is_new = tree.insert(key, vec![2]).unwrap();
+        assert!(!is_new);
+        assert_eq!(tree.len(), 1); // size unchanged
+        assert_eq!(tree.lookup(&key), Some(&[2][..]));
+    }
+
+    #[test]
+    fn insert_multiple_different_first_nibble() {
+        let mut tree = SHAMap::new(TreeType::State);
+
+        let mut k1 = [0u8; 32]; k1[0] = 0x10;
+        let mut k2 = [0u8; 32]; k2[0] = 0x20;
+        let mut k3 = [0u8; 32]; k3[0] = 0x30;
+
+        tree.insert(Hash256(k1), vec![1]).unwrap();
+        tree.insert(Hash256(k2), vec![2]).unwrap();
+        tree.insert(Hash256(k3), vec![3]).unwrap();
+
+        assert_eq!(tree.len(), 3);
+        assert_eq!(tree.lookup(&Hash256(k1)), Some(&[1][..]));
+        assert_eq!(tree.lookup(&Hash256(k2)), Some(&[2][..]));
+        assert_eq!(tree.lookup(&Hash256(k3)), Some(&[3][..]));
+    }
+
+    #[test]
+    fn insert_collision_same_first_nibble() {
+        let mut tree = SHAMap::new(TreeType::State);
+
+        let mut k1 = [0u8; 32]; k1[0] = 0xA1;
+        let mut k2 = [0u8; 32]; k2[0] = 0xA2;
+
+        tree.insert(Hash256(k1), vec![1]).unwrap();
+        tree.insert(Hash256(k2), vec![2]).unwrap();
+
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree.lookup(&Hash256(k1)), Some(&[1][..]));
+        assert_eq!(tree.lookup(&Hash256(k2)), Some(&[2][..]));
+    }
+
+    #[test]
+    fn insert_deep_collision() {
+        let mut tree = SHAMap::new(TreeType::State);
+
+        // Keys share the first 4 nibbles (2 bytes) but differ at nibble 4
+        let mut k1 = [0u8; 32]; k1[0] = 0xAB; k1[1] = 0xC1;
+        let mut k2 = [0u8; 32]; k2[0] = 0xAB; k2[1] = 0xC2;
+
+        tree.insert(Hash256(k1), vec![1]).unwrap();
+        tree.insert(Hash256(k2), vec![2]).unwrap();
+
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree.lookup(&Hash256(k1)), Some(&[1][..]));
+        assert_eq!(tree.lookup(&Hash256(k2)), Some(&[2][..]));
+    }
+
+    #[test]
+    fn delete_existing() {
+        let mut tree = SHAMap::new(TreeType::State);
+        let key = make_key(0xBB);
+
+        tree.insert(key, vec![1, 2, 3]).unwrap();
+        assert_eq!(tree.len(), 1);
+
+        let found = tree.delete(&key).unwrap();
+        assert!(found);
+        assert_eq!(tree.len(), 0);
+        assert_eq!(tree.lookup(&key), None);
+    }
+
+    #[test]
+    fn delete_nonexistent() {
+        let mut tree = SHAMap::new(TreeType::State);
+        tree.insert(make_key(0xAA), vec![1]).unwrap();
+
+        let found = tree.delete(&make_key(0xBB)).unwrap();
+        assert!(!found);
+        assert_eq!(tree.len(), 1);
+    }
+
+    #[test]
+    fn delete_preserves_siblings() {
+        let mut tree = SHAMap::new(TreeType::State);
+
+        let mut k1 = [0u8; 32]; k1[0] = 0x10;
+        let mut k2 = [0u8; 32]; k2[0] = 0x20;
+
+        tree.insert(Hash256(k1), vec![1]).unwrap();
+        tree.insert(Hash256(k2), vec![2]).unwrap();
+        assert_eq!(tree.len(), 2);
+
+        tree.delete(&Hash256(k1)).unwrap();
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree.lookup(&Hash256(k1)), None);
+        assert_eq!(tree.lookup(&Hash256(k2)), Some(&[2][..]));
     }
 
     #[test]
@@ -239,96 +378,46 @@ mod tests {
     }
 
     #[test]
-    fn insert_multiple_different_nibbles() {
-        let mut tree = SHAMap::new(TreeType::State);
+    fn order_independence() {
+        let mut t1 = SHAMap::new(TreeType::State);
+        let mut t2 = SHAMap::new(TreeType::State);
 
-        // Keys with different first nibbles
-        let mut k1 = [0u8; 32];
-        k1[0] = 0x10; // first nibble = 1
-        let mut k2 = [0u8; 32];
-        k2[0] = 0x20; // first nibble = 2
-        let mut k3 = [0u8; 32];
-        k3[0] = 0x30; // first nibble = 3
+        let keys: Vec<(Hash256, Vec<u8>)> = (0..10u8).map(|i| {
+            let mut k = [0u8; 32];
+            k[0] = i * 17;
+            (Hash256(k), vec![i])
+        }).collect();
 
-        tree.insert(Hash256(k1), vec![1]).unwrap();
-        tree.insert(Hash256(k2), vec![2]).unwrap();
-        tree.insert(Hash256(k3), vec![3]).unwrap();
+        // Forward order
+        for (k, v) in &keys {
+            t1.insert(*k, v.clone()).unwrap();
+        }
 
-        assert_eq!(tree.len(), 3);
+        // Reverse order
+        for (k, v) in keys.iter().rev() {
+            t2.insert(*k, v.clone()).unwrap();
+        }
+
+        assert_eq!(t1.root_hash(), t2.root_hash());
+
+        // Verify all lookups work in both
+        for (k, v) in &keys {
+            assert_eq!(t1.lookup(k), Some(v.as_slice()));
+            assert_eq!(t2.lookup(k), Some(v.as_slice()));
+        }
     }
 
     #[test]
-    fn insert_collision_same_first_nibble() {
-        let mut tree = SHAMap::new(TreeType::State);
-
-        // Keys share first nibble but differ later
-        let mut k1 = [0u8; 32];
-        k1[0] = 0xA1; // nibbles: A, 1
-        let mut k2 = [0u8; 32];
-        k2[0] = 0xA2; // nibbles: A, 2 — same first, different second
-
-        tree.insert(Hash256(k1), vec![1]).unwrap();
-        tree.insert(Hash256(k2), vec![2]).unwrap();
-
-        assert_eq!(tree.len(), 2);
-        assert_ne!(tree.root_hash(), ZERO_HASH);
-    }
-
-    #[test]
-    fn delete_from_tree() {
-        let mut tree = SHAMap::new(TreeType::State);
-        let key = make_key(0xBB);
-
-        tree.insert(key, vec![1, 2, 3]).unwrap();
-        assert_eq!(tree.len(), 1);
-
-        let found = tree.delete(&key).unwrap();
-        assert!(found);
-        assert_eq!(tree.len(), 0);
-    }
-
-    #[test]
-    fn delete_nonexistent() {
-        let mut tree = SHAMap::new(TreeType::State);
-        tree.insert(make_key(0xAA), vec![1]).unwrap();
-
-        let found = tree.delete(&make_key(0xBB)).unwrap();
-        assert!(!found);
-        assert_eq!(tree.len(), 1);
-    }
-
-    #[test]
-    fn insert_many_keys() {
+    fn insert_many_and_lookup_all() {
         let mut tree = SHAMap::new(TreeType::State);
         for i in 0..=255u8 {
             tree.insert(make_key(i), vec![i]).unwrap();
         }
         assert_eq!(tree.len(), 256);
-        assert_ne!(tree.root_hash(), ZERO_HASH);
-    }
 
-    #[test]
-    fn order_independence() {
-        // Inserting in different orders should produce the same root hash
-        let mut t1 = SHAMap::new(TreeType::State);
-        let mut t2 = SHAMap::new(TreeType::State);
-
-        let keys: Vec<Hash256> = (0..10u8).map(|i| {
-            let mut k = [0u8; 32];
-            k[0] = i * 17; // spread across nibbles
-            Hash256(k)
-        }).collect();
-
-        // Forward order
-        for (i, k) in keys.iter().enumerate() {
-            t1.insert(*k, vec![i as u8]).unwrap();
+        for i in 0..=255u8 {
+            assert_eq!(tree.lookup(&make_key(i)), Some(&[i][..]),
+                "lookup failed for key 0x{i:02x}");
         }
-
-        // Reverse order
-        for (i, k) in keys.iter().enumerate().rev() {
-            t2.insert(*k, vec![i as u8]).unwrap();
-        }
-
-        assert_eq!(t1.root_hash(), t2.root_hash());
     }
 }

@@ -32,38 +32,47 @@ impl SHAMapNode {
 /// Empty children contribute 32 zero bytes to the hash input.
 #[derive(Debug, Clone)]
 pub struct InnerNode {
-    /// Hashes of the 16 children. `None` = empty slot (uses zero hash).
-    children: [Option<Hash256>; 16],
-    /// Cached hash (invalidated on mutation).
-    cached_hash: Option<Hash256>,
+    /// Child nodes. `None` = empty slot.
+    children: Vec<Option<SHAMapNode>>,
 }
 
 impl InnerNode {
     /// Create a new empty inner node.
     pub fn new() -> Self {
         Self {
-            children: [None; 16],
-            cached_hash: None,
+            children: (0..16).map(|_| None).collect(),
         }
     }
 
-    /// Set a child at the given index (0-15).
-    pub fn set_child(&mut self, index: u8, hash: Hash256) {
+    /// Set a child node at the given index (0-15).
+    pub fn set_child_node(&mut self, index: u8, node: SHAMapNode) {
         debug_assert!(index < 16, "child index must be 0-15");
-        self.children[index as usize] = Some(hash);
-        self.cached_hash = None; // invalidate
+        self.children[index as usize] = Some(node);
+    }
+
+    /// Take a child node out (replacing with None).
+    pub fn take_child_node(&mut self, index: u8) -> Option<SHAMapNode> {
+        debug_assert!(index < 16);
+        self.children[index as usize].take()
+    }
+
+    /// Get a reference to a child node.
+    pub fn get_child_node(&self, index: u8) -> Option<&SHAMapNode> {
+        self.children[index as usize].as_ref()
     }
 
     /// Remove a child at the given index.
     pub fn remove_child(&mut self, index: u8) {
         debug_assert!(index < 16);
         self.children[index as usize] = None;
-        self.cached_hash = None;
     }
 
     /// Get the hash of a child (returns zero hash for empty slots).
     pub fn child_hash(&self, index: u8) -> Hash256 {
-        self.children[index as usize].unwrap_or(ZERO_HASH)
+        match &self.children[index as usize] {
+            Some(node) => node.hash(),
+            None => ZERO_HASH,
+        }
     }
 
     /// Check if a child slot is occupied.
@@ -95,12 +104,8 @@ impl InnerNode {
     /// Compute the hash of this inner node.
     ///
     /// `SHA512Half(HASH_PREFIX_INNER_NODE || h0 || h1 || ... || h15)`
-    /// where each `h_i` is the child hash or 32 zero bytes.
+    /// where each `h_i` is the child's hash or 32 zero bytes.
     pub fn hash(&self) -> Hash256 {
-        if let Some(cached) = self.cached_hash {
-            return cached;
-        }
-
         let mut data = Vec::with_capacity(16 * 32);
         for i in 0..16 {
             let h = self.child_hash(i as u8);
@@ -192,8 +197,9 @@ mod tests {
     #[test]
     fn inner_node_with_one_child() {
         let mut node = InnerNode::new();
-        let child_hash = Hash256([0xAB; 32]);
-        node.set_child(5, child_hash);
+        let child = LeafNode::new(Hash256([0xAB; 32]), vec![1, 2, 3]);
+        let child_hash = SHAMapNode::Leaf(child.clone()).hash();
+        node.set_child_node(5, SHAMapNode::Leaf(child));
 
         assert!(!node.is_empty());
         assert_eq!(node.child_count(), 1);
@@ -209,11 +215,13 @@ mod tests {
         let mut node = InnerNode::new();
         let h_empty = node.hash();
 
-        node.set_child(0, Hash256([0x01; 32]));
+        let leaf1 = SHAMapNode::Leaf(LeafNode::new(Hash256([0x01; 32]), vec![1]));
+        node.set_child_node(0, leaf1);
         let h_one = node.hash();
         assert_ne!(h_empty, h_one);
 
-        node.set_child(1, Hash256([0x02; 32]));
+        let leaf2 = SHAMapNode::Leaf(LeafNode::new(Hash256([0x02; 32]), vec![2]));
+        node.set_child_node(1, leaf2);
         let h_two = node.hash();
         assert_ne!(h_one, h_two);
 

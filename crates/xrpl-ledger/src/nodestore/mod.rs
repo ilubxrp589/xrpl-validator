@@ -20,3 +20,7 @@ pub trait NodeStore: Send + Sync {
     /// Store multiple nodes atomically.
     fn batch_store(&self, items: &[(Hash256, Vec<u8>)]) -> Result<(), LedgerError>;
 }
+
+pub mod memory;
+
+pub use memory::InMemoryStore;
