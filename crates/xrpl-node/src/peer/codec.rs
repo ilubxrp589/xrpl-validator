@@ -4,10 +4,12 @@
 //! protobuf messages:
 //!
 //! ```text
-//! [4 bytes: payload_len (big-endian u32)] [2 bytes: type_code (big-endian u16)] [N bytes: protobuf]
+//! [4 bytes: payload_len (big-endian u32)] [2 bytes: type_code (big-endian u16)] [payload_len bytes: protobuf]
 //! ```
 //!
-//! `payload_len` includes the 2-byte type code, so protobuf data length = payload_len - 2.
+//! `payload_len` is the protobuf payload size only — it does NOT include the
+//! 2-byte type code. Total frame size = 4 + 2 + payload_len.
+//!
 //! If bit 15 of the type code is set, the protobuf payload is zlib-compressed.
 
 use bytes::{Buf, BufMut, BytesMut};
@@ -24,6 +26,9 @@ const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 /// Bit mask for compression flag in the type code.
 const COMPRESSION_FLAG: u16 = 1 << 15;
 
+/// Fixed overhead: 4-byte length + 2-byte type code.
+const HEADER_SIZE: usize = 6;
+
 /// Length-prefixed protobuf codec for the XRPL peer protocol.
 pub struct MessageCodec;
 
@@ -32,19 +37,15 @@ impl Decoder for MessageCodec {
     type Error = NodeError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<PeerMessage>, NodeError> {
-        // Loop to skip undecodable frames without recursion.
-        // At most skip 10 consecutive bad frames before giving up.
         let mut skipped = 0;
         loop {
-            // Need at least 4 bytes for the length prefix.
-            if src.len() < 4 {
+            // Need at least the 6-byte header.
+            if src.len() < HEADER_SIZE {
                 return Ok(None);
             }
 
-            // Peek at the length without consuming.
+            // Peek at the 4-byte protobuf payload length (does NOT include type code).
             let payload_len = u32::from_be_bytes([src[0], src[1], src[2], src[3]]);
-
-
 
             if payload_len > MAX_MESSAGE_SIZE {
                 return Err(NodeError::MessageDecode(format!(
@@ -52,13 +53,8 @@ impl Decoder for MessageCodec {
                 )));
             }
 
-            if payload_len < 2 {
-                return Err(NodeError::MessageDecode(format!(
-                    "payload too short: {payload_len} bytes (need at least 2 for type code)"
-                )));
-            }
-
-            let total_frame_len = 4 + payload_len as usize;
+            // Total frame = 4 (length) + 2 (type code) + payload_len (protobuf)
+            let total_frame_len = HEADER_SIZE + payload_len as usize;
 
             // Wait for the full frame.
             if src.len() < total_frame_len {
@@ -77,7 +73,6 @@ impl Decoder for MessageCodec {
 
             tracing::trace!(
                 payload_len,
-                raw_type_code,
                 type_code,
                 compressed,
                 proto_bytes = frame.len(),
@@ -108,7 +103,6 @@ impl Decoder for MessageCodec {
                             "too many consecutive undecodable frames ({skipped}), last: {e}"
                         )));
                     }
-                    // Continue loop to try the next frame
                 }
             }
         }
@@ -122,8 +116,7 @@ impl Encoder<PeerMessage> for MessageCodec {
         let type_code = item.type_code();
         let proto_bytes = item.encode_to_vec();
 
-        // payload = 2-byte type code + protobuf bytes
-        let payload_len = 2 + proto_bytes.len();
+        let payload_len = proto_bytes.len();
 
         if payload_len > MAX_MESSAGE_SIZE as usize {
             return Err(NodeError::MessageDecode(format!(
@@ -131,7 +124,8 @@ impl Encoder<PeerMessage> for MessageCodec {
             )));
         }
 
-        dst.reserve(4 + payload_len);
+        // Frame: 4-byte length + 2-byte type + protobuf payload
+        dst.reserve(HEADER_SIZE + payload_len);
         dst.put_u32(payload_len as u32);
         dst.put_u16(type_code);
         dst.put_slice(&proto_bytes);
@@ -157,10 +151,14 @@ mod tests {
         let mut codec = MessageCodec;
         let mut buf = BytesMut::new();
 
-        // Encode
         codec.encode(ping, &mut buf).unwrap();
 
-        // Decode
+        // Verify frame structure: 4-byte len + 2-byte type + protobuf
+        let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let tc = u16::from_be_bytes([buf[4], buf[5]]);
+        assert_eq!(tc, 3); // TMPing type code
+        assert_eq!(len as usize + HEADER_SIZE, buf.len()); // length is protobuf-only
+
         let decoded = codec.decode(&mut buf).unwrap().unwrap();
 
         match decoded {
@@ -205,9 +203,9 @@ mod tests {
     fn partial_frame_waits() {
         let mut codec = MessageCodec;
 
-        // Only 2 bytes — not enough for length prefix
-        let mut buf = BytesMut::from(&[0u8, 0, 0, 10][..]);
-        // We said payload is 10 bytes but only have the 4-byte header
+        // 4-byte header saying payload is 10 bytes, but we only have 6 bytes total
+        let mut buf = BytesMut::from(&[0u8, 0, 0, 10, 0, 3][..]);
+        // Need 6 + 10 = 16 bytes total, only have 6
         assert!(codec.decode(&mut buf).unwrap().is_none());
     }
 
@@ -230,7 +228,6 @@ mod tests {
         let mut codec = MessageCodec;
         let mut buf = BytesMut::new();
 
-        // Encode two pings
         let ping1 = PeerMessage::Ping(protocol::TmPing {
             r#type: protocol::tm_ping::PingType::PtPing as i32,
             seq: Some(1),
@@ -247,7 +244,6 @@ mod tests {
         codec.encode(ping1, &mut buf).unwrap();
         codec.encode(ping2, &mut buf).unwrap();
 
-        // Decode both
         let msg1 = codec.decode(&mut buf).unwrap().unwrap();
         let msg2 = codec.decode(&mut buf).unwrap().unwrap();
 
@@ -260,7 +256,33 @@ mod tests {
             _ => panic!("expected Ping"),
         }
 
-        // Buffer should be empty
         assert!(codec.decode(&mut buf).unwrap().is_none());
+    }
+
+    #[test]
+    fn frame_layout_matches_spec() {
+        // Verify our frame format: [4-byte len][2-byte type][protobuf...]
+        // where len = protobuf size only (NOT including type code)
+        let mut codec = MessageCodec;
+        let mut buf = BytesMut::new();
+
+        let ping = PeerMessage::Ping(protocol::TmPing {
+            r#type: protocol::tm_ping::PingType::PtPing as i32,
+            seq: Some(1),
+            ping_time: None,
+            net_time: None,
+        });
+
+        codec.encode(ping, &mut buf).unwrap();
+
+        let payload_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let type_code = u16::from_be_bytes([buf[4], buf[5]]);
+        let total = buf.len();
+
+        // Total = 4 (len field) + 2 (type field) + payload_len (protobuf)
+        assert_eq!(total, 4 + 2 + payload_len);
+        assert_eq!(type_code, 3); // TMPing
+        // Protobuf data starts at byte 6
+        assert!(payload_len > 0);
     }
 }
