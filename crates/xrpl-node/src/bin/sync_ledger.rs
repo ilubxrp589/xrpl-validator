@@ -23,7 +23,7 @@ const RPC_ENDPOINTS: &[&str] = &[
 
 const PAGE_SIZE: u32 = 2048;
 const MAX_CONCURRENT: usize = 6; // parallel requests
-const SAVE_DIR: &str = "/tmp/xrpl-sync";
+const SAVE_DIR: &str = "/mnt/xrpl-data/sync";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

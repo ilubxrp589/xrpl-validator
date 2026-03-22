@@ -190,6 +190,7 @@
   <div class="stat-cell">validations <span class="val" id="val-count">0</span></div>
   <div class="stat-cell">proposals <span class="val" id="prop-count">0</span></div>
   <div class="stat-cell">transactions <span class="val" id="tx-count">0</span></div>
+  <div class="stat-cell">tx/s <span class="val" id="tx-rate">0</span></div>
   <div class="stat-cell">ledger <span class="val" id="ledger-seq">--</span></div>
 </div>
 
@@ -215,6 +216,7 @@ const msgCountEl = document.getElementById('msg-count');
 const valCountEl = document.getElementById('val-count');
 const propCountEl = document.getElementById('prop-count');
 const txCountEl = document.getElementById('tx-count');
+const txRateEl = document.getElementById('tx-rate');
 const ledgerSeqEl = document.getElementById('ledger-seq');
 const uptimeEl = document.getElementById('uptime');
 const sparkContainer = document.getElementById('sparkline-container');
@@ -234,6 +236,18 @@ let count = 0, valCount = 0, propCount = 0, txCount = 0;
 let startTime = Date.now();
 let lastLedger = null, lastLedgerTime = null;
 const MAX_ROWS = 400;
+
+// Tx/s tracking
+let txPerSec = 0, txThisSecond = 0, txCurrentSec = Math.floor(Date.now() / 1000);
+setInterval(() => {
+  const now = Math.floor(Date.now() / 1000);
+  if (now !== txCurrentSec) {
+    txPerSec = txThisSecond;
+    txThisSecond = 0;
+    txCurrentSec = now;
+    txRateEl.textContent = txPerSec;
+  }
+}, 500);
 
 // Consensus tracking per ledger round
 let roundProposals = 0, roundValidations = 0;
@@ -419,7 +433,7 @@ function addMessage(ev) {
 
   if (ev.msg_type === 'Validation') { valCount++; valCountEl.textContent = valCount.toLocaleString(); }
   if (ev.msg_type === 'Proposal') { propCount++; propCountEl.textContent = propCount.toLocaleString(); }
-  if (ev.msg_type === 'Transaction') { txCount++; txCountEl.textContent = txCount.toLocaleString(); }
+  if (ev.msg_type === 'Transaction') { txCount++; txCountEl.textContent = txCount.toLocaleString(); txThisSecond++; }
 
   if (ev.ledger_seq) {
     const now = Date.now();

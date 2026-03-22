@@ -69,6 +69,13 @@
     <canvas id="c-rate"></canvas>
   </div>
 
+  <!-- Tx/s -->
+  <div class="card">
+    <div class="card-title">Transactions / Second</div>
+    <div class="card-value purple" id="m-txrate">0</div>
+    <canvas id="c-txrate"></canvas>
+  </div>
+
   <!-- Ledger -->
   <div class="card">
     <div class="card-title">Ledger Sequence</div>
@@ -166,13 +173,14 @@ class Sparkline {
 
 const sTotal = new Sparkline('c-total', 'rgb(0,133,255)');
 const sRate = new Sparkline('c-rate', 'rgb(0,255,136)');
+const sTxRate = new Sparkline('c-txrate', 'rgb(168,85,247)');
 const sInterval = new Sparkline('c-interval', 'rgb(0,133,255)');
 const sVals = new Sparkline('c-vals', 'rgb(255,217,61)');
 const sProps = new Sparkline('c-props', 'rgb(0,133,255)');
 const sTxs = new Sparkline('c-txs', 'rgb(168,85,247)');
 
 // Per-second rate tracking
-let secCount = 0;
+let secCount = 0, txSecCount = 0;
 let currentSec = Math.floor(Date.now() / 1000);
 
 setInterval(() => {
@@ -180,7 +188,10 @@ setInterval(() => {
   if (now !== currentSec) {
     sRate.push(secCount);
     document.getElementById('m-rate').textContent = secCount;
+    sTxRate.push(txSecCount);
+    document.getElementById('m-txrate').textContent = txSecCount;
     secCount = 0;
+    txSecCount = 0;
     currentSec = now;
   }
   sTotal.push(total);
@@ -237,6 +248,7 @@ function handleEvent(ev) {
   }
   if (ev.msg_type === 'Transaction') {
     txTotal++;
+    txSecCount++;
     document.getElementById('m-txs').textContent = txTotal;
     if (ev.tx_info) {
       if (ev.tx_info.sig_verified) sigOk++; else sigFail++;
