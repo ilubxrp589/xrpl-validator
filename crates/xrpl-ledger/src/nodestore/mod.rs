@@ -22,5 +22,9 @@ pub trait NodeStore: Send + Sync {
 }
 
 pub mod memory;
+pub mod sled_store;
 
 pub use memory::InMemoryStore;
+
+#[cfg(feature = "sled-backend")]
+pub use sled_store::SledStore;
