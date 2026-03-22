@@ -5,3 +5,20 @@ Cargo.lock
 *.swo
 .env
 .DS_Store
+
+# Validator keys — NEVER commit these
+*.seed
+*.key
+*.token
+keys.json
+validator_keys.json
+validator_token.txt
+config.toml
+
+# Sled databases
+*.sled/
+state.sled/
+
+# Sync data
+objects.jsonl
+marker.txt
