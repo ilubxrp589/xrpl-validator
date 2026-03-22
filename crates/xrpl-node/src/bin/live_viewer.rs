@@ -4,6 +4,8 @@
 //! Run: cargo run -p xrpl-node --bin live_viewer
 //! Open: http://localhost:3777
 
+use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -12,6 +14,7 @@ use axum::routing::get;
 use axum::Router;
 use bytes::BytesMut;
 use futures::stream::Stream;
+use parking_lot::Mutex;
 use tokio::io::AsyncReadExt;
 use tokio::sync::broadcast;
 use tokio::time::timeout;
@@ -69,21 +72,25 @@ async fn main() {
     let (tx, _) = broadcast::channel::<MessageEvent>(1000);
     let tx2 = tx.clone();
 
-    // Spawn a connection task for each mainnet peer
+    // Shared set of peers we've already connected/tried
+    let known_peers: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let connected_count: Arc<std::sync::atomic::AtomicUsize> = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let max_peers: usize = 15;
+
+    // Seed with initial peers
     for peer in MAINNET_PEERS {
-        let tx_clone = tx2.clone();
-        let peer = peer.to_string();
-        tokio::spawn(async move {
-            loop {
-                eprintln!("[peer] Connecting to {peer}...");
-                match run_peer_connection(&peer, &tx_clone).await {
-                    Ok(()) => eprintln!("[peer] {peer} connection ended"),
-                    Err(e) => eprintln!("[peer] {peer} error: {e}"),
-                }
-                eprintln!("[peer] {peer} reconnecting in 5 seconds...");
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        });
+        known_peers.lock().insert(peer.to_string());
+    }
+
+    // Spawn connections to seed peers
+    for peer in MAINNET_PEERS {
+        spawn_peer_connection(
+            peer.to_string(),
+            tx2.clone(),
+            known_peers.clone(),
+            connected_count.clone(),
+            max_peers,
+        );
     }
 
     // Web server
@@ -102,7 +109,38 @@ async fn main() {
     }
 }
 
-async fn run_peer_connection(peer_addr: &str, tx: &broadcast::Sender<MessageEvent>) -> Result<(), String> {
+fn spawn_peer_connection(
+    peer: String,
+    tx: broadcast::Sender<MessageEvent>,
+    known_peers: Arc<Mutex<HashSet<String>>>,
+    connected_count: Arc<std::sync::atomic::AtomicUsize>,
+    max_peers: usize,
+) {
+    tokio::spawn(async move {
+        loop {
+            let current = connected_count.load(std::sync::atomic::Ordering::Relaxed);
+            if current >= max_peers {
+                return; // don't exceed max
+            }
+            connected_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            eprintln!("[peer] Connecting to {peer}...");
+            match run_peer_connection(&peer, &tx, &known_peers, &connected_count, max_peers).await {
+                Ok(()) => eprintln!("[peer] {peer} disconnected"),
+                Err(e) => eprintln!("[peer] {peer}: {e}"),
+            }
+            connected_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+    });
+}
+
+async fn run_peer_connection(
+    peer_addr: &str,
+    tx: &broadcast::Sender<MessageEvent>,
+    known_peers: &Arc<Mutex<HashSet<String>>>,
+    connected_count: &Arc<std::sync::atomic::AtomicUsize>,
+    max_peers: usize,
+) -> Result<(), String> {
     let identity = NodeIdentity::generate().map_err(|e| format!("identity: {e}"))?;
 
     let mut hs = timeout(
@@ -140,6 +178,35 @@ async fn run_peer_connection(peer_addr: &str, tx: &broadcast::Sender<MessageEven
                 Ok(Some(msg)) => {
                     msg_seq += 1;
                     let elapsed = start.elapsed().as_secs_f64();
+
+                    // Auto-discover peers from Endpoints messages
+                    if let PeerMessage::Endpoints(ref ep) = msg {
+                        let current = connected_count.load(std::sync::atomic::Ordering::Relaxed);
+                        if current < max_peers {
+                            for peer_ep in &ep.endpoints_v2 {
+                                if peer_ep.hops <= 1 {
+                                    let addr = peer_ep.endpoint.clone();
+                                    // Skip invalid/local addresses
+                                    if addr.starts_with("[::") || addr.starts_with("0.") || addr.starts_with("127.") || addr.starts_with("10.") || addr.starts_with("192.168.") {
+                                        continue;
+                                    }
+                                    let mut known = known_peers.lock();
+                                    if !known.contains(&addr) {
+                                        known.insert(addr.clone());
+                                        drop(known);
+                                        eprintln!("[discovery] Found new peer: {addr}");
+                                        spawn_peer_connection(
+                                            addr,
+                                            tx.clone(),
+                                            known_peers.clone(),
+                                            connected_count.clone(),
+                                            max_peers,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     let (msg_type, detail, ledger_seq, peers, validator, tx_info) = format_message(&msg);
 
