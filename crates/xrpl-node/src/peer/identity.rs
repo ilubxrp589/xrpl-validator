@@ -196,8 +196,13 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
 mod tests {
     use super::*;
 
+    fn init_crypto() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     #[test]
     fn generate_identity() {
+        init_crypto();
         let identity = NodeIdentity::generate().unwrap();
 
         // Secp256k1 compressed public key is 33 bytes: 0x02 or 0x03 prefix
@@ -218,6 +223,7 @@ mod tests {
 
     #[test]
     fn sign_and_verify() {
+        init_crypto();
         let identity = NodeIdentity::generate().unwrap();
         let message = b"hello xrpl network";
 
@@ -230,6 +236,7 @@ mod tests {
 
     #[test]
     fn deterministic_from_seed() {
+        init_crypto();
         let seed = Seed::generate();
         let id1 = NodeIdentity::from_seed(&seed).unwrap();
         let id2 = NodeIdentity::from_seed(&seed).unwrap();
@@ -240,6 +247,7 @@ mod tests {
 
     #[test]
     fn public_key_in_cert_cn() {
+        init_crypto();
         let identity = NodeIdentity::generate().unwrap();
         let pubkey_hex = identity.public_key_hex();
 

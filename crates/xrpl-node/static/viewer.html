@@ -112,6 +112,9 @@
   .t-Validation .msg-type { color: #ffd93d; }
   .t-Proposal .msg-type { color: #0085FF; }
   .t-Transaction .msg-type { color: #a855f7; }
+  .sig-ok { color: #00ff88; font-size: 10px; font-weight: 700; margin-left: 6px; }
+  .sig-fail { color: #ff4444; font-size: 10px; font-weight: 700; margin-left: 6px; }
+  .tx-badge { background: #141828; border-radius: 3px; padding: 1px 6px; font-size: 10px; margin-left: 4px; color: #6a8abb; }
   .t-Manifests .msg-type { color: #6366f1; }
   .t-ValidatorList .msg-type { color: #6366f1; }
   .t-HaveTxSet .msg-type { color: #00C3FF; }
@@ -431,12 +434,20 @@ function addMessage(ev) {
   updateConsensus(ev.msg_type, ev.detail, ev.validator);
   if (ev.peers) updatePeers(ev.peers);
 
+  let txExtra = '';
+  if (ev.tx_info) {
+    const t = ev.tx_info;
+    const sigClass = t.sig_verified ? 'sig-ok' : 'sig-fail';
+    const sigText = t.sig_verified ? 'SIG OK' : 'SIG FAIL';
+    txExtra = `<span class="tx-badge">${t.tx_type}</span><span class="tx-badge">${t.account.slice(0,12)}...</span><span class="tx-badge">${t.fee}d</span><span class="${sigClass}">${sigText}</span>`;
+  }
+
   const row = document.createElement('div');
   row.className = `msg t-${ev.msg_type} new`;
   row.innerHTML = `
     <span class="msg-seq">${ev.seq}</span>
     <span class="msg-time">${ev.time.toFixed(1)}s</span>
-    <span class="msg-type">${ev.msg_type}</span>
+    <span class="msg-type">${ev.msg_type}${txExtra}</span>
     <span class="msg-detail">${ev.detail}</span>
     <span class="msg-ledger">${ev.ledger_seq ? '#' + ev.ledger_seq.toLocaleString() : ''}</span>
   `;

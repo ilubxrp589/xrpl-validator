@@ -7,6 +7,7 @@
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
+| #14693 | 9:01 PM | 🔴 | Fixed message formatting to include transaction info field in all handlers | ~366 |
 | #14627 | 7:24 PM | 🔴 | Fixed LedgerData message formatting return type mismatch | ~278 |
 | #14621 | " | 🔴 | Fixed Validation message format to match 4-tuple signature in live viewer | ~323 |
 | #14620 | " | 🔴 | Fixed tuple return type mismatch in live viewer StatusChange message formatting | ~171 |

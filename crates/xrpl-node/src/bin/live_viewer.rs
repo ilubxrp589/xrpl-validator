@@ -36,6 +36,18 @@ struct MessageEvent {
     peers: Option<Vec<PeerEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     validator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tx_info: Option<TxInfo>,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct TxInfo {
+    account: String,
+    fee: u64,
+    sequence: u32,
+    hash: String,
+    sig_verified: bool,
+    tx_type: String,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -98,6 +110,7 @@ async fn run_peer_connection(tx: &broadcast::Sender<MessageEvent>) -> Result<(),
         ledger_seq: None,
         peers: None,
         validator: None,
+        tx_info: None,
     });
 
     let mut codec = MessageCodec;
@@ -115,7 +128,7 @@ async fn run_peer_connection(tx: &broadcast::Sender<MessageEvent>) -> Result<(),
                     msg_seq += 1;
                     let elapsed = start.elapsed().as_secs_f64();
 
-                    let (msg_type, detail, ledger_seq, peers, validator) = format_message(&msg);
+                    let (msg_type, detail, ledger_seq, peers, validator, tx_info) = format_message(&msg);
 
                     let event = MessageEvent {
                         seq: msg_seq,
@@ -125,6 +138,7 @@ async fn run_peer_connection(tx: &broadcast::Sender<MessageEvent>) -> Result<(),
                         ledger_seq,
                         peers,
                         validator,
+                        tx_info,
                     };
 
                     let _ = tx.send(event);
@@ -149,8 +163,9 @@ async fn run_peer_connection(tx: &broadcast::Sender<MessageEvent>) -> Result<(),
     }
 }
 
-/// Returns (msg_type, detail, ledger_seq, peers, validator_key_short)
-fn format_message(msg: &PeerMessage) -> (String, String, Option<u32>, Option<Vec<PeerEntry>>, Option<String>) {
+/// Returns (msg_type, detail, ledger_seq, peers, validator_key, tx_info)
+#[allow(clippy::type_complexity)]
+fn format_message(msg: &PeerMessage) -> (String, String, Option<u32>, Option<Vec<PeerEntry>>, Option<String>, Option<TxInfo>) {
     match msg {
         PeerMessage::StatusChange(sc) => {
             let status = sc.new_status.map(|s| match s {
@@ -174,6 +189,7 @@ fn format_message(msg: &PeerMessage) -> (String, String, Option<u32>, Option<Vec
                 sc.ledger_seq,
                 None,
                 None,
+                None,
             )
         }
         PeerMessage::Validation(v) => {
@@ -183,18 +199,45 @@ fn format_message(msg: &PeerMessage) -> (String, String, Option<u32>, Option<Vec
             // the 33-byte key prefix (0x02/0x03 for secp256k1, 0xED for ed25519).
             let vkey = extract_key_from_validation(&v.validation);
             let detail = format!("{}B", v.validation.len());
-            ("Validation".into(), detail, None, None, vkey)
+            ("Validation".into(), detail, None, None, vkey, None)
         }
         PeerMessage::Manifests(m) => {
-            ("Manifests".into(), format!("{} manifests", m.list.len()), None, None, None)
+            ("Manifests".into(), format!("{} manifests", m.list.len()), None, None, None, None)
         }
         PeerMessage::ValidatorListCollection(_) => {
-            ("ValidatorList".into(), "UNL bootstrap".into(), None, None, None)
+            ("ValidatorList".into(), "UNL bootstrap".into(), None, None, None, None)
         }
         PeerMessage::Transaction(t) => {
-            let bytes = t.raw_transaction.len();
-            let status = t.status;
-            ("Transaction".into(), format!("{bytes}B status={status}"), None, None, None)
+            use xrpl_node::mempool::{validate_transaction, ValidationResult};
+
+            let (result, tx_hash, fields) = validate_transaction(&t.raw_transaction);
+            let sig_ok = matches!(result, ValidationResult::Valid);
+
+            let tx_info = fields.map(|f| {
+                // Try to get TransactionType from decoded blob
+                let tx_type = xrpl_core::codec::decode_transaction_binary(&t.raw_transaction)
+                    .ok()
+                    .and_then(|v| v.get("TransactionType").and_then(|t| t.as_str()).map(String::from))
+                    .unwrap_or_else(|| "?".into());
+
+                TxInfo {
+                    account: f.account.clone(),
+                    fee: f.fee,
+                    sequence: f.sequence,
+                    hash: hex::encode(&tx_hash.0[..8]),
+                    sig_verified: sig_ok,
+                    tx_type,
+                }
+            });
+
+            let detail = if let Some(ref info) = tx_info {
+                let sig_icon = if info.sig_verified { "OK" } else { "FAIL" };
+                format!("{} from {} fee={} sig={sig_icon}", info.tx_type, &info.account[..8], info.fee)
+            } else {
+                format!("{}B undecoded", t.raw_transaction.len())
+            };
+
+            ("Transaction".into(), detail, None, None, None, tx_info)
         }
         PeerMessage::ProposeSet(p) => {
             let hash = hex::encode(&p.current_tx_hash[..std::cmp::min(8, p.current_tx_hash.len())]);
@@ -203,11 +246,11 @@ fn format_message(msg: &PeerMessage) -> (String, String, Option<u32>, Option<Vec
             } else {
                 None
             };
-            ("Proposal".into(), format!("seq={} hash={hash}...", p.propose_seq), None, None, vkey)
+            ("Proposal".into(), format!("seq={} hash={hash}...", p.propose_seq), None, None, vkey, None)
         }
         PeerMessage::HaveTransactionSet(h) => {
             let hash = hex::encode(&h.hash[..std::cmp::min(8, h.hash.len())]);
-            ("HaveTxSet".into(), format!("hash={hash}..."), None, None, None)
+            ("HaveTxSet".into(), format!("hash={hash}..."), None, None, None, None)
         }
         PeerMessage::Endpoints(e) => {
             let peers: Vec<PeerEntry> = e.endpoints_v2.iter()
@@ -217,19 +260,19 @@ fn format_message(msg: &PeerMessage) -> (String, String, Option<u32>, Option<Vec
                 })
                 .collect();
             let detail = format!("{} peers", peers.len());
-            ("Endpoints".into(), detail, None, Some(peers), None)
+            ("Endpoints".into(), detail, None, Some(peers), None, None)
         }
         PeerMessage::GetLedger(g) => {
-            ("GetLedger".into(), format!("seq={:?}", g.ledger_seq), None, None, None)
+            ("GetLedger".into(), format!("seq={:?}", g.ledger_seq), None, None, None, None)
         }
         PeerMessage::LedgerData(d) => {
-            ("LedgerData".into(), format!("{} nodes seq={}", d.nodes.len(), d.ledger_seq), None, None, None)
+            ("LedgerData".into(), format!("{} nodes seq={}", d.nodes.len(), d.ledger_seq), None, None, None, None)
         }
         PeerMessage::Ping(p) => {
             let kind = if p.r#type == 0 { "ping" } else { "pong" };
-            ("Ping".into(), format!("{kind} seq={:?}", p.seq), None, None, None)
+            ("Ping".into(), format!("{kind} seq={:?}", p.seq), None, None, None, None)
         }
-        other => (other.name().into(), String::new(), None, None, None),
+        other => (other.name().into(), String::new(), None, None, None, None),
     }
 }
 
