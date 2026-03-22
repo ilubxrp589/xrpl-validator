@@ -103,19 +103,6 @@ const sSeen = document.getElementById('s-seen');
 const sInt = document.getElementById('s-int');
 
 let roundProps = 0, roundVals = 0, phase = 'open', lastLedgerTime = null;
-let tabHidden = false;
-
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden) {
-    tabHidden = true;
-  } else {
-    // Tab is back — flush all accumulated visual state
-    tabHidden = false;
-    pulses.length = 0;
-    for (const [, node] of nodes) node.fireTime = 0;
-    lastT = performance.now();
-  }
-});
 
 // Nebula
 const blobs = [];
@@ -364,20 +351,8 @@ function render(dt) {
 
 let lastT = 0;
 function loop(ts) {
-  const rawDt = (ts - lastT) / 1000;
+  const dt = Math.min((ts - lastT) / 1000, 0.05);
   lastT = ts;
-
-  // If >0.5s gap (tab was backgrounded), flush all visual state
-  if (rawDt > 0.5) {
-    pulses.length = 0;
-    for (const [, node] of nodes) node.fireTime = 0;
-    renderNebula();
-    render(0.016);
-    requestAnimationFrame(loop);
-    return;
-  }
-
-  const dt = Math.min(rawDt, 0.05);
   renderNebula();
   render(dt);
   requestAnimationFrame(loop);
@@ -388,18 +363,18 @@ function handleEvent(ev) {
   if (ev.msg_type === 'Proposal') {
     roundProps++; sProp.textContent = roundProps;
     const node = getNode(ev.validator);
-    if (node) { node.state = 'proposed'; if (!tabHidden) fireNode(ev.validator?.slice(0,10), [0,133,255]); }
+    if (node) { node.state = 'proposed'; fireNode(ev.validator?.slice(0,10), [0,133,255]); }
     if (phase === 'open' || phase === 'accepted') {
       phase = 'propose'; phaseEl.className = 'ph-propose'; phaseEl.textContent = 'PROPOSING';
       roundVals = 0; sVal.textContent = '0';
       resetNodes();
-      if (node) { node.state = 'proposed'; if (!tabHidden) fireNode(ev.validator?.slice(0,10), [0,133,255]); }
+      if (node) { node.state = 'proposed'; fireNode(ev.validator?.slice(0,10), [0,133,255]); }
     }
   }
   else if (ev.msg_type === 'Validation') {
     roundVals++; sVal.textContent = roundVals;
     const node = getNode(ev.validator);
-    if (node) { node.state = 'validated'; if (!tabHidden) fireNode(ev.validator?.slice(0,10), [255,217,61]); }
+    if (node) { node.state = 'validated'; fireNode(ev.validator?.slice(0,10), [255,217,61]); }
     if (phase !== 'validate') {
       phase = 'validate'; phaseEl.className = 'ph-validate'; phaseEl.textContent = 'VALIDATING';
     }
@@ -407,7 +382,7 @@ function handleEvent(ev) {
   else if (ev.msg_type === 'StatusChange') {
     if (ev.detail && ev.detail.includes('ACCEPTED')) {
       phase = 'accepted'; phaseEl.className = 'ph-accepted'; phaseEl.textContent = 'CONSENSUS';
-      if (!tabHidden) cascadeAll([0, 255, 136]);
+      cascadeAll([0, 255, 136]);
       setTimeout(() => { if (phase === 'accepted') { roundProps = 0; sProp.textContent = '0'; } }, 2000);
     } else if (ev.detail && ev.detail.includes('CLOSING')) {
       phaseEl.className = 'ph-propose'; phaseEl.textContent = 'CLOSING';

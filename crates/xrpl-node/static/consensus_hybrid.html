@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XRPL Consensus — Hybrid</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Orbitron:wght@700;900&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; }
+  body { background: #060610; color: #c8d0dc; font-family: 'JetBrains Mono', monospace; }
+
+  #nebula { position: fixed; top: 0; left: 0; width: 100%; height: 100%; filter: blur(80px); opacity: 0.18; z-index: 0; }
+  #main { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 1; }
+
+  #ui { position: relative; z-index: 10; height: 100%; display: flex; flex-direction: column; pointer-events: none; }
+  #ui > * { pointer-events: auto; }
+
+  #top-bar { padding: 8px 24px; display: flex; justify-content: space-between; align-items: center; background: rgba(6,6,16,0.75); backdrop-filter: blur(8px); border-bottom: 1px solid rgba(255,255,255,0.03); }
+  #top-bar h1 { font-family: 'Orbitron', sans-serif; font-size: 12px; color: #0085FF; letter-spacing: 2px; }
+  .tag { color: #3a4055; font-size: 10px; font-family: 'JetBrains Mono', monospace; margin-left: 8px; }
+  #top-bar nav { display: flex; gap: 6px; }
+  #top-bar a { color: #3a4a6a; text-decoration: none; font-size: 10px; border: 1px solid rgba(255,255,255,0.06); padding: 3px 10px; border-radius: 3px; transition: all 0.2s; }
+  #top-bar a:hover { color: #0085FF; border-color: rgba(0,133,255,0.3); }
+  #status { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 8px; }
+  .connected { background: #0085FF; box-shadow: 0 0 6px #0085FF; }
+  .disconnected { background: #ff4444; }
+
+  #info { position: fixed; top: 48px; left: 50%; transform: translateX(-50%); z-index: 15; text-align: center; pointer-events: none; }
+  #phase { font-family: 'Orbitron', sans-serif; font-size: 18px; font-weight: 900; letter-spacing: 3px; transition: color 0.3s; }
+  .ph-open { color: #2a3a5a; }
+  .ph-propose { color: #0085FF; }
+  .ph-validate { color: #ffd93d; }
+  .ph-accepted { color: #00ff88; }
+  #ledger { font-family: 'Orbitron', sans-serif; font-size: 28px; font-weight: 900; color: #0085FF; transition: color 0.3s; margin-top: 2px; }
+  #ledger.flash { color: #00ff88; }
+  #stats { display: flex; gap: 16px; font-size: 10px; color: #3a4a6a; margin-top: 4px; justify-content: center; }
+  #stats .n { color: #6a8abb; font-weight: 700; }
+
+  #bottom-bar { position: fixed; bottom: 0; left: 0; right: 0; z-index: 10; padding: 6px 24px; display: flex; justify-content: space-between; align-items: center; background: rgba(6,6,16,0.75); backdrop-filter: blur(8px); border-top: 1px solid rgba(255,255,255,0.03); }
+  #legend { display: flex; gap: 14px; font-size: 9px; color: #3a4a6a; }
+  .ldot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
+  #footer-text { font-size: 9px; color: #1a2040; }
+
+  @media(prefers-reduced-motion:reduce) { #nebula,#main { display:none; } #info { top: 40%; } }
+</style>
+</head>
+<body>
+<canvas id="nebula"></canvas>
+<canvas id="main"></canvas>
+
+<div id="ui">
+  <div id="top-bar">
+    <h1><span id="status" class="disconnected"></span>CONSENSUS<span class="tag">MAINNET</span></h1>
+    <nav><a href="/">FEED</a><a href="/metrics">METRICS</a></nav>
+  </div>
+</div>
+
+<div id="info">
+  <div id="phase" class="ph-open">CONNECTING</div>
+  <div id="ledger">--</div>
+  <div id="stats">
+    <div>proposals <span class="n" id="s-prop">0</span></div>
+    <div>validations <span class="n" id="s-val">0</span></div>
+    <div>validators <span class="n" id="s-seen">0</span></div>
+    <div>interval <span class="n" id="s-int">--</span>s</div>
+  </div>
+</div>
+
+<div id="bottom-bar">
+  <div id="legend">
+    <span><span class="ldot" style="background:#0085FF"></span>Propose</span>
+    <span><span class="ldot" style="background:#ffd93d"></span>Validate</span>
+    <span><span class="ldot" style="background:#00ff88"></span>Consensus</span>
+  </div>
+  <div id="footer-text">Rust + tokio + OpenSSL + prost + axum</div>
+</div>
+
+<script>
+/* ── Canvas setup ── */
+const nebCvs = document.getElementById('nebula');
+const nebCtx = nebCvs.getContext('2d');
+const cvs = document.getElementById('main');
+const ctx = cvs.getContext('2d');
+let W, H, dpr;
+let radarCX, radarCY, radarR;
+const SPEC_MAX_H = 90;
+const SPEC_BOTTOM_PAD = 32;
+
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  nebCvs.width = W * 0.5; nebCvs.height = H * 0.5;
+  nebCvs.style.width = W + 'px'; nebCvs.style.height = H + 'px';
+  cvs.width = W * dpr; cvs.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  radarCX = W / 2;
+  radarCY = H * 0.40;
+  radarR = Math.min(W * 0.38, H * 0.30);
+}
+window.addEventListener('resize', resize);
+
+const statusDot = document.getElementById('status');
+const phaseEl = document.getElementById('phase');
+const ledgerEl = document.getElementById('ledger');
+const sProp = document.getElementById('s-prop');
+const sVal = document.getElementById('s-val');
+const sSeen = document.getElementById('s-seen');
+const sInt = document.getElementById('s-int');
+
+let roundProps = 0, roundVals = 0, phase = 'open', lastLedgerTime = null;
+
+/* ── Nebula background (unchanged) ── */
+const blobs = [];
+function initNebula() {
+  const colors = [[0,40,140],[50,0,140],[0,80,160],[40,0,80],[0,60,180]];
+  for (let i = 0; i < 5; i++) {
+    blobs.push({ x: Math.random()*W, y: Math.random()*H, vx: (Math.random()-0.5)*0.3, vy: (Math.random()-0.5)*0.2, r: 150+Math.random()*200, color: colors[i%colors.length] });
+  }
+}
+function renderNebula() {
+  const nw = nebCvs.width, nh = nebCvs.height, sx = nw/W, sy = nh/H;
+  nebCtx.clearRect(0, 0, nw, nh);
+  for (const b of blobs) {
+    b.x += b.vx; b.y += b.vy;
+    if (b.x < -100 || b.x > W+100) b.vx *= -1;
+    if (b.y < -100 || b.y > H+100) b.vy *= -1;
+    const g = nebCtx.createRadialGradient(b.x*sx, b.y*sy, 0, b.x*sx, b.y*sy, b.r*sx);
+    g.addColorStop(0, `rgba(${b.color[0]},${b.color[1]},${b.color[2]},0.7)`);
+    g.addColorStop(1, `rgba(${b.color[0]},${b.color[1]},${b.color[2]},0)`);
+    nebCtx.fillStyle = g;
+    nebCtx.fillRect(0, 0, nw, nh);
+  }
+}
+
+/* ── Unified validator data ── */
+const validators = new Map();
+let validatorCount = 0;
+
+function hashCode(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+  return Math.abs(h);
+}
+
+function getValidator(key) {
+  if (!key) return null;
+  const short = key.slice(0, 10);
+  if (!validators.has(short)) {
+    const h = hashCode(short);
+    const h2 = hashCode(short + 'x');
+    validators.set(short, {
+      // Radar position (deterministic from key)
+      angle: (h % 3600) / 3600 * Math.PI * 2,
+      dist: 0.40 + (h2 % 60) / 100,
+      // State
+      state: 'idle',
+      brightness: 0,
+      // Spectrum bar spring
+      barPos: 0.03,
+      barVel: 0,
+      barTarget: 0.03,
+    });
+    validatorCount++;
+    sSeen.textContent = validatorCount;
+  }
+  return validators.get(short);
+}
+
+function valXY(v) {
+  return {
+    x: radarCX + Math.cos(v.angle) * v.dist * radarR,
+    y: radarCY + Math.sin(v.angle) * v.dist * radarR,
+  };
+}
+
+function resetValidators() {
+  for (const [, v] of validators) {
+    v.state = 'idle';
+    v.barTarget = 0.03;
+  }
+}
+
+/* ── Color helpers ── */
+function stateColor(state) {
+  if (state === 'agreed') return [0, 255, 136];
+  if (state === 'validated') return [255, 217, 61];
+  if (state === 'proposed') return [0, 133, 255];
+  return [25, 35, 65];
+}
+
+/* ═══════════════════════════════════════
+   LAYER 1: RIPPLE POOL
+   ═══════════════════════════════════════ */
+const ripples = [];
+const MAX_RIPPLES = 35;
+
+function addRipple(x, y, color, intensity) {
+  if (ripples.length >= MAX_RIPPLES) ripples.shift();
+  ripples.push({ x, y, t: 0, max: 2.8, r: color[0], g: color[1], b: color[2], i: intensity || 1 });
+}
+
+function renderRipples(dt) {
+  for (let i = ripples.length - 1; i >= 0; i--) {
+    const rp = ripples[i];
+    rp.t += dt;
+    if (rp.t >= rp.max) { ripples.splice(i, 1); continue; }
+
+    const progress = rp.t / rp.max;
+    const fade = (1 - progress);
+    const maxRad = Math.min(W, H) * 0.38;
+
+    for (let ring = 0; ring < 3; ring++) {
+      const radius = progress * maxRad - ring * 18;
+      if (radius < 1) continue;
+      const alpha = rp.i * fade * fade * 0.10 * (1 - ring * 0.3);
+      if (alpha < 0.003) continue;
+
+      ctx.beginPath();
+      ctx.arc(rp.x, rp.y, radius, 0, Math.PI * 2);
+      ctx.strokeStyle = `rgba(${rp.r},${rp.g},${rp.b},${alpha})`;
+      ctx.lineWidth = 1.8 - ring * 0.5;
+      ctx.stroke();
+    }
+  }
+}
+
+/* ═══════════════════════════════════════
+   LAYER 2: RADAR / SONAR HUD
+   ═══════════════════════════════════════ */
+let sweepAngle = 0;
+let sweepSpeed = Math.PI * 0.5; // 1 rotation per ~4s
+
+function renderRadar(dt) {
+  sweepAngle += sweepSpeed * dt;
+  const cx = radarCX, cy = radarCY, R = radarR;
+
+  /* Range rings (dashed) */
+  ctx.save();
+  ctx.setLineDash([2, 8]);
+  for (let i = 1; i <= 4; i++) {
+    ctx.beginPath();
+    ctx.arc(cx, cy, (i / 4) * R, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(0,133,255,0.05)';
+    ctx.lineWidth = 0.5;
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  ctx.restore();
+
+  /* Cross-hairs */
+  ctx.beginPath();
+  ctx.moveTo(cx - R * 1.05, cy); ctx.lineTo(cx + R * 1.05, cy);
+  ctx.moveTo(cx, cy - R * 1.05); ctx.lineTo(cx, cy + R * 1.05);
+  ctx.strokeStyle = 'rgba(0,133,255,0.03)';
+  ctx.lineWidth = 0.5;
+  ctx.stroke();
+
+  /* Tick marks around outer ring */
+  for (let a = 0; a < 360; a += 30) {
+    const rad = a * Math.PI / 180;
+    const inner = a % 90 === 0 ? R * 0.95 : R * 0.97;
+    ctx.beginPath();
+    ctx.moveTo(cx + Math.cos(rad) * inner, cy + Math.sin(rad) * inner);
+    ctx.lineTo(cx + Math.cos(rad) * R * 1.02, cy + Math.sin(rad) * R * 1.02);
+    ctx.strokeStyle = 'rgba(0,133,255,0.08)';
+    ctx.lineWidth = a % 90 === 0 ? 1 : 0.5;
+    ctx.stroke();
+  }
+
+  /* Sweep arm trail */
+  const trailArc = 0.7;
+  const segments = 18;
+  for (let s = 0; s < segments; s++) {
+    const f = s / segments;
+    const aStart = sweepAngle - trailArc * ((s + 1) / segments);
+    const aEnd = sweepAngle - trailArc * f;
+    const alpha = 0.07 * (1 - f);
+
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.arc(cx, cy, R, aStart, aEnd);
+    ctx.closePath();
+    ctx.fillStyle = `rgba(0,133,255,${alpha})`;
+    ctx.fill();
+  }
+
+  /* Sweep line */
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.lineTo(cx + Math.cos(sweepAngle) * R, cy + Math.sin(sweepAngle) * R);
+  ctx.strokeStyle = 'rgba(0,133,255,0.35)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  /* Center dot */
+  ctx.beginPath();
+  ctx.arc(cx, cy, 2, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(0,133,255,0.4)';
+  ctx.fill();
+
+  /* Validator blips */
+  for (const [, v] of validators) {
+    const { x, y } = valXY(v);
+    if (v.brightness > 0) v.brightness -= dt * 1.8;
+
+    const [r, g, b] = stateColor(v.state);
+    const bright = Math.max(0, v.brightness);
+    const isActive = v.state !== 'idle';
+    const alpha = (isActive ? 0.75 : 0.15) + bright * 0.25;
+    const size = isActive ? (v.state === 'agreed' ? 4 : 3) : 1.5;
+
+    if (v.state === 'validated' || v.state === 'agreed') {
+      /* Diamond blip */
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(Math.PI / 4);
+      ctx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
+      ctx.fillRect(-size * 0.6, -size * 0.6, size * 1.2, size * 1.2);
+      ctx.restore();
+    } else {
+      /* Circle blip */
+      ctx.beginPath();
+      ctx.arc(x, y, size, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
+      ctx.fill();
+    }
+
+    /* Brightness pulse ring */
+    if (bright > 0.15) {
+      ctx.beginPath();
+      ctx.arc(x, y, size + bright * 12, 0, Math.PI * 2);
+      ctx.strokeStyle = `rgba(${r},${g},${b},${bright * 0.15})`;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+  }
+}
+
+/* ═══════════════════════════════════════
+   LAYER 3: SONAR PINGS
+   ═══════════════════════════════════════ */
+const pings = [];
+
+function addPing() {
+  pings.push({ radius: 0, alpha: 0.6 });
+}
+
+function renderPings(dt) {
+  for (let i = pings.length - 1; i >= 0; i--) {
+    const p = pings[i];
+    p.radius += dt * 350;
+    p.alpha -= dt * 0.28;
+    if (p.alpha <= 0) { pings.splice(i, 1); continue; }
+
+    ctx.beginPath();
+    ctx.arc(radarCX, radarCY, p.radius, 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(0,255,136,${p.alpha})`;
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+
+    /* Inner trailing ring */
+    if (p.radius > 25) {
+      ctx.beginPath();
+      ctx.arc(radarCX, radarCY, p.radius - 18, 0, Math.PI * 2);
+      ctx.strokeStyle = `rgba(0,255,136,${p.alpha * 0.25})`;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+  }
+}
+
+/* ═══════════════════════════════════════
+   LAYER 4: FREQUENCY SPECTRUM
+   ═══════════════════════════════════════ */
+function renderSpectrum(dt) {
+  const n = validators.size;
+  if (n === 0) return;
+
+  const baseY = H - SPEC_BOTTOM_PAD;
+  const gap = 2;
+  const barW = Math.max(3, Math.min(14, (W - 60) / n - gap));
+  const totalW = n * (barW + gap);
+  const startX = (W - totalW) / 2;
+  const maxH = SPEC_MAX_H;
+
+  /* Panel background */
+  const panelTop = baseY - maxH - 14;
+  ctx.fillStyle = 'rgba(6,6,16,0.45)';
+  ctx.fillRect(0, panelTop, W, H - panelTop);
+  ctx.beginPath();
+  ctx.moveTo(0, panelTop); ctx.lineTo(W, panelTop);
+  ctx.strokeStyle = 'rgba(0,133,255,0.06)';
+  ctx.lineWidth = 0.5;
+  ctx.stroke();
+
+  /* Baseline */
+  ctx.beginPath();
+  ctx.moveTo(startX - 6, baseY); ctx.lineTo(startX + totalW + 6, baseY);
+  ctx.strokeStyle = 'rgba(0,133,255,0.08)';
+  ctx.lineWidth = 0.5;
+  ctx.stroke();
+
+  let idx = 0;
+  for (const [, v] of validators) {
+    /* Spring physics */
+    const force = (v.barTarget - v.barPos) * 10;
+    v.barVel += force * dt;
+    v.barVel *= 0.90;
+    v.barPos += v.barVel * dt;
+    v.barPos = Math.max(0, Math.min(1.05, v.barPos));
+
+    const x = startX + idx * (barW + gap);
+    const h = v.barPos * maxH;
+    const [r, g, b] = stateColor(v.state);
+
+    if (h > 0.5) {
+      /* Bar gradient */
+      const grad = ctx.createLinearGradient(x, baseY, x, baseY - h);
+      grad.addColorStop(0, `rgba(${r},${g},${b},0.20)`);
+      grad.addColorStop(1, `rgba(${r},${g},${b},0.65)`);
+      ctx.fillStyle = grad;
+      ctx.fillRect(x, baseY - h, barW, h);
+
+      /* Bright cap */
+      ctx.fillStyle = `rgba(${r},${g},${b},0.85)`;
+      ctx.fillRect(x, baseY - h, barW, 1.5);
+
+      /* Reflection below baseline */
+      const reflH = h * 0.25;
+      const reflGrad = ctx.createLinearGradient(x, baseY, x, baseY + reflH);
+      reflGrad.addColorStop(0, `rgba(${r},${g},${b},0.06)`);
+      reflGrad.addColorStop(1, `rgba(${r},${g},${b},0)`);
+      ctx.fillStyle = reflGrad;
+      ctx.fillRect(x, baseY + 1, barW, reflH);
+    }
+
+    idx++;
+  }
+}
+
+/* ═══════════════════════════════════════
+   LAYER 5: PARTICLES
+   ═══════════════════════════════════════ */
+const particles = [];
+const MAX_PARTICLES = 350;
+const rainbow = [[255,60,60],[255,140,30],[255,230,50],[0,255,110],[0,160,255],[130,60,255],[255,80,200]];
+
+function burstAt(x, y, count, colors, speedMul) {
+  const mul = speedMul || 1;
+  for (let j = 0; j < count; j++) {
+    if (particles.length >= MAX_PARTICLES) return;
+    const angle = Math.random() * Math.PI * 2;
+    const speed = (40 + Math.random() * 180) * mul;
+    const c = colors[Math.floor(Math.random() * colors.length)];
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed - 50,
+      life: 1,
+      decay: 0.35 + Math.random() * 0.55,
+      size: 0.8 + Math.random() * 2.2,
+      r: c[0], g: c[1], b: c[2],
+    });
+  }
+}
+
+function barFountain() {
+  const n = validators.size;
+  if (n === 0) return;
+  const gap = 2;
+  const barW = Math.max(3, Math.min(14, (W - 60) / n - gap));
+  const totalW = n * (barW + gap);
+  const startX = (W - totalW) / 2;
+  const baseY = H - SPEC_BOTTOM_PAD;
+
+  let idx = 0;
+  for (const [, v] of validators) {
+    const x = startX + idx * (barW + gap) + barW / 2;
+    const h = v.barPos * SPEC_MAX_H;
+    /* Particles launch upward from bar tips */
+    for (let p = 0; p < 2; p++) {
+      if (particles.length >= MAX_PARTICLES) return;
+      const c = rainbow[Math.floor(Math.random() * rainbow.length)];
+      particles.push({
+        x: x + (Math.random() - 0.5) * barW,
+        y: baseY - h,
+        vx: (Math.random() - 0.5) * 40,
+        vy: -80 - Math.random() * 120,
+        life: 1,
+        decay: 0.5 + Math.random() * 0.5,
+        size: 0.6 + Math.random() * 1.5,
+        r: c[0], g: c[1], b: c[2],
+      });
+    }
+    idx++;
+  }
+}
+
+function renderParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.vy += 140 * dt; // gravity
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.life -= p.decay * dt;
+
+    if (p.life <= 0 || p.y > H + 30) {
+      particles.splice(i, 1);
+      continue;
+    }
+
+    const alpha = Math.max(0, p.life) * 0.85;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.size * (0.5 + p.life * 0.5), 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(${p.r},${p.g},${p.b},${alpha})`;
+    ctx.fill();
+  }
+}
+
+/* ═══════════════════════════════════════
+   RENDER LOOP
+   ═══════════════════════════════════════ */
+let time = 0, lastT = 0;
+
+function loop(ts) {
+  const dt = Math.min((ts - lastT) / 1000, 0.05);
+  lastT = ts;
+  time += dt;
+
+  renderNebula();
+  ctx.clearRect(0, 0, W, H);
+
+  renderRipples(dt);
+  renderRadar(dt);
+  renderPings(dt);
+  renderSpectrum(dt);
+  renderParticles(dt);
+
+  requestAnimationFrame(loop);
+}
+
+/* ═══════════════════════════════════════
+   CONSENSUS EVENT HANDLER
+   ═══════════════════════════════════════ */
+function handleEvent(ev) {
+  if (ev.msg_type === 'Proposal') {
+    roundProps++;
+    sProp.textContent = roundProps;
+    const v = getValidator(ev.validator);
+
+    if (phase === 'open' || phase === 'accepted') {
+      phase = 'propose';
+      phaseEl.className = 'ph-propose';
+      phaseEl.textContent = 'PROPOSING';
+      roundVals = 0;
+      sVal.textContent = '0';
+      sweepSpeed = Math.PI * 0.5;
+      resetValidators();
+    }
+
+    if (v) {
+      v.state = 'proposed';
+      v.brightness = 1;
+      v.barTarget = 0.35 + Math.random() * 0.30;
+      const pos = valXY(v);
+      addRipple(pos.x, pos.y, [0, 133, 255], 0.7);
+    }
+  }
+  else if (ev.msg_type === 'Validation') {
+    roundVals++;
+    sVal.textContent = roundVals;
+    const v = getValidator(ev.validator);
+
+    if (phase !== 'validate') {
+      phase = 'validate';
+      phaseEl.className = 'ph-validate';
+      phaseEl.textContent = 'VALIDATING';
+      sweepSpeed = Math.PI; // double speed
+    }
+
+    if (v) {
+      v.state = 'validated';
+      v.brightness = 1;
+      v.barTarget = 0.55 + Math.random() * 0.25;
+      const pos = valXY(v);
+      addRipple(pos.x, pos.y, [255, 217, 61], 0.5);
+    }
+  }
+  else if (ev.msg_type === 'StatusChange') {
+    if (ev.detail && ev.detail.includes('ACCEPTED')) {
+      phase = 'accepted';
+      phaseEl.className = 'ph-accepted';
+      phaseEl.textContent = 'CONSENSUS';
+      sweepSpeed = Math.PI * 2.5; // fast spin burst
+
+      /* All validators agree */
+      for (const [, v] of validators) {
+        v.state = 'agreed';
+        v.brightness = 1.5;
+        v.barTarget = 1.0;
+      }
+
+      /* Sonar ping from radar center */
+      addPing();
+
+      /* Big converging ripple */
+      addRipple(radarCX, radarCY, [0, 255, 136], 1.8);
+
+      /* Particle explosion from radar center */
+      burstAt(radarCX, radarCY, 80, rainbow, 1.3);
+
+      /* Bar fountain (staggered) */
+      setTimeout(barFountain, 120);
+
+      /* Reset after cooldown */
+      setTimeout(() => {
+        if (phase === 'accepted') {
+          roundProps = 0;
+          sProp.textContent = '0';
+          sweepSpeed = Math.PI * 0.5;
+        }
+      }, 2200);
+    }
+    else if (ev.detail && ev.detail.includes('CLOSING')) {
+      phaseEl.className = 'ph-propose';
+      phaseEl.textContent = 'CLOSING';
+    }
+  }
+
+  if (ev.ledger_seq) {
+    const now = Date.now();
+    if (lastLedgerTime) sInt.textContent = ((now - lastLedgerTime) / 1000).toFixed(1);
+    lastLedgerTime = now;
+    ledgerEl.textContent = ev.ledger_seq.toLocaleString();
+    ledgerEl.classList.add('flash');
+    setTimeout(() => ledgerEl.classList.remove('flash'), 500);
+  }
+}
+
+/* ── Init ── */
+resize();
+initNebula();
+requestAnimationFrame(loop);
+
+const es = new EventSource('/events');
+es.onopen = () => { statusDot.className = 'connected'; phaseEl.textContent = 'WAITING'; phaseEl.className = 'ph-open'; };
+es.onmessage = (e) => { try { handleEvent(JSON.parse(e.data)); } catch {} };
+es.onerror = () => { statusDot.className = 'disconnected'; phaseEl.textContent = 'DISCONNECTED'; phaseEl.className = 'ph-open'; };
+</script>
+</body>
+</html>
