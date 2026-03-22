@@ -148,6 +148,7 @@ pub async fn outbound_handshake(
     }
 
     let mut peer_public_key = Vec::new();
+    let mut peer_session_sig = String::new();
     let peer_ledger_seq = None;
 
     for line in &lines[1..] {
@@ -155,12 +156,42 @@ pub async fn outbound_handshake(
             let key = key.trim().to_lowercase();
             let value = value.trim();
 
-            if key == "public-key" {
-                // Peer sends base58-encoded node public key (n-prefixed).
-                // Try hex first, then store raw string as fallback.
-                // Full base58 decoding will be added with xrpl-core integration.
-                peer_public_key = hex::decode(value)
-                    .unwrap_or_else(|_| value.as_bytes().to_vec());
+            match key.as_str() {
+                "public-key" => {
+                    peer_public_key = hex::decode(value)
+                        .unwrap_or_else(|_| value.as_bytes().to_vec());
+                }
+                "session-signature" => {
+                    peer_session_sig = value.to_string();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Verify peer's session signature if we have their public key
+    if !peer_public_key.is_empty() && !peer_session_sig.is_empty() {
+        if let Ok(sig_bytes) = base64_decode(&peer_session_sig) {
+            // Peer signs the same shared value we computed
+            let valid = if peer_public_key.len() == 33 {
+                if peer_public_key[0] == 0x02 || peer_public_key[0] == 0x03 {
+                    xrpl_core::crypto::secp256k1::verify(&peer_public_key, &shared_value, &sig_bytes)
+                        .unwrap_or(false)
+                } else if peer_public_key[0] == 0xED {
+                    let mut prefixed = shared_value.to_vec();
+                    xrpl_core::crypto::ed25519::verify(&peer_public_key, &prefixed, &sig_bytes)
+                        .unwrap_or(false)
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if valid {
+                tracing::debug!("peer session signature verified");
+            } else {
+                tracing::warn!("peer session signature FAILED verification (continuing anyway)");
             }
         }
     }
@@ -272,6 +303,44 @@ fn encode_node_public_key(pubkey: &[u8]) -> String {
         result.push(XRPL_ALPHABET[d as usize] as char);
     }
     result
+}
+
+fn base64_decode(input: &str) -> Result<Vec<u8>, ()> {
+    const DECODE: [u8; 128] = {
+        let mut t = [255u8; 128];
+        let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut i = 0;
+        while i < 64 { t[chars[i] as usize] = i as u8; i += 1; }
+        t
+    };
+    let input = input.trim_end_matches('=');
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        let (a, b, c, d) = (
+            DECODE.get(bytes[i] as usize).copied().unwrap_or(255),
+            DECODE.get(bytes[i+1] as usize).copied().unwrap_or(255),
+            DECODE.get(bytes[i+2] as usize).copied().unwrap_or(255),
+            DECODE.get(bytes[i+3] as usize).copied().unwrap_or(255),
+        );
+        if a == 255 || b == 255 { return Err(()); }
+        out.push((a << 2) | (b >> 4));
+        if c != 255 { out.push((b << 4) | (c >> 2)); }
+        if d != 255 { out.push((c << 6) | d); }
+        i += 4;
+    }
+    // Handle remaining 2-3 chars
+    if i + 1 < bytes.len() {
+        let a = DECODE.get(bytes[i] as usize).copied().unwrap_or(255);
+        let b = DECODE.get(bytes[i+1] as usize).copied().unwrap_or(255);
+        if a != 255 && b != 255 { out.push((a << 2) | (b >> 4)); }
+        if i + 2 < bytes.len() {
+            let c = DECODE.get(bytes[i+2] as usize).copied().unwrap_or(255);
+            if c != 255 { out.push((b << 4) | (c >> 2)); }
+        }
+    }
+    Ok(out)
 }
 
 fn base64_encode(data: &[u8]) -> String {

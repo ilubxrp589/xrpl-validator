@@ -72,10 +72,22 @@ async fn main() {
     let (tx, _) = broadcast::channel::<MessageEvent>(1000);
     let tx2 = tx.clone();
 
+    // Message dedup: hash of recent messages to avoid duplicates from multiple peers
+    let seen_msgs: Arc<dashmap::DashMap<u64, ()>> = Arc::new(dashmap::DashMap::new());
+
+    // Periodic cleanup of seen messages (every 30s, clear all)
+    let seen_cleanup = seen_msgs.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            seen_cleanup.clear();
+        }
+    });
+
     // Shared set of peers we've already connected/tried
     let known_peers: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let connected_count: Arc<std::sync::atomic::AtomicUsize> = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let max_peers: usize = 15;
+    let max_peers: usize = 50;
 
     // Seed with initial peers
     for peer in MAINNET_PEERS {
@@ -90,6 +102,7 @@ async fn main() {
             known_peers.clone(),
             connected_count.clone(),
             max_peers,
+            seen_msgs.clone(),
         );
     }
 
@@ -130,16 +143,17 @@ fn spawn_peer_connection(
     known_peers: Arc<Mutex<HashSet<String>>>,
     connected_count: Arc<std::sync::atomic::AtomicUsize>,
     max_peers: usize,
+    seen_msgs: Arc<dashmap::DashMap<u64, ()>>,
 ) {
     tokio::spawn(async move {
         loop {
             let current = connected_count.load(std::sync::atomic::Ordering::Relaxed);
             if current >= max_peers {
-                return; // don't exceed max
+                return;
             }
             connected_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             eprintln!("[peer] Connecting to {peer}...");
-            match run_peer_connection(&peer, &tx, &known_peers, &connected_count, max_peers).await {
+            match run_peer_connection(&peer, &tx, &known_peers, &connected_count, max_peers, &seen_msgs).await {
                 Ok(()) => eprintln!("[peer] {peer} disconnected"),
                 Err(e) => eprintln!("[peer] {peer}: {e}"),
             }
@@ -155,6 +169,7 @@ async fn run_peer_connection(
     known_peers: &Arc<Mutex<HashSet<String>>>,
     connected_count: &Arc<std::sync::atomic::AtomicUsize>,
     max_peers: usize,
+    seen_msgs: &Arc<dashmap::DashMap<u64, ()>>,
 ) -> Result<(), String> {
     let identity = NodeIdentity::generate().map_err(|e| format!("identity: {e}"))?;
 
@@ -216,12 +231,26 @@ async fn run_peer_connection(
                                             known_peers.clone(),
                                             connected_count.clone(),
                                             max_peers,
+                                            seen_msgs.clone(),
                                         );
                                     }
                                 }
                             }
                         }
                     }
+
+                    // Dedup: hash the raw message bytes to skip duplicates from multiple peers
+                    let msg_hash = {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        // Hash the protobuf bytes for uniqueness
+                        msg.encode_to_vec().hash(&mut h);
+                        h.finish()
+                    };
+                    if seen_msgs.contains_key(&msg_hash) {
+                        continue; // duplicate from another peer, skip
+                    }
+                    seen_msgs.insert(msg_hash, ());
 
                     let (msg_type, detail, ledger_seq, peers, validator, tx_info) = format_message(&msg);
 

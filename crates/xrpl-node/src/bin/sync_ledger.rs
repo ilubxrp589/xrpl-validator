@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 use xrpl_core::types::Hash256;
 use xrpl_ledger::ledger::header::LedgerHeader;
+use xrpl_ledger::nodestore::NodeStore;
 
 // Multiple public RPC endpoints for parallel downloads
 const RPC_ENDPOINTS: &[&str] = &[
@@ -29,8 +30,11 @@ const SAVE_DIR: &str = "/mnt/xrpl-data/sync";
 async fn main() -> anyhow::Result<()> {
     eprintln!("=== XRPL Mainnet Ledger Sync (Parallel) ===\n");
 
-    // Create save directory
+    // Create save directory and open sled DB
     std::fs::create_dir_all(SAVE_DIR)?;
+    let sled_path = format!("{SAVE_DIR}/state.sled");
+    let db = sled::open(&sled_path)?;
+    eprintln!("  Sled DB: {sled_path} ({} existing entries)", db.len());
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
@@ -133,16 +137,23 @@ async fn main() -> anyhow::Result<()> {
 
         if let Some(objects) = state {
             use std::io::Write;
+            let mut batch = sled::Batch::default();
             for obj in objects {
                 let index = obj["index"].as_str().unwrap_or("");
                 let data_hex = obj["data"].as_str().unwrap_or("");
                 if !index.is_empty() && !data_hex.is_empty() {
-                    total_bytes.fetch_add(data_hex.len() as u64 / 2, Ordering::Relaxed);
-                    total_objects.fetch_add(1, Ordering::Relaxed);
-                    // Save to disk as JSONL
-                    writeln!(file, "{}\t{}", index, data_hex)?;
+                    if let Ok(data) = hex::decode(data_hex) {
+                        total_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        total_objects.fetch_add(1, Ordering::Relaxed);
+                        // Write to sled (binary key → binary data)
+                        let key_bytes = hex::decode(index).unwrap_or_default();
+                        batch.insert(key_bytes.as_slice(), data.as_slice());
+                        // Also keep JSONL for compatibility
+                        writeln!(file, "{}\t{}", index, data_hex)?;
+                    }
                 }
             }
+            db.apply_batch(batch)?;
         }
 
         // Save marker for resume
