@@ -19,6 +19,9 @@ pub enum LedgerError {
     #[error("invalid ledger header: {0}")]
     InvalidHeader(String),
 
+    #[error("invariant violation: {0}")]
+    Invariant(String),
+
     #[error("codec error: {0}")]
     Codec(#[from] xrpl_core::CoreError),
 }

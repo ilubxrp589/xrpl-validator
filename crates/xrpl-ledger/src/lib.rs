@@ -14,5 +14,6 @@ pub mod error;
 pub mod ledger;
 pub mod nodestore;
 pub mod shamap;
+pub mod tx;
 
 pub use error::LedgerError;
