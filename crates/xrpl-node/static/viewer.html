@@ -146,7 +146,7 @@
     <a href="/consensus" class="header-link" style="text-decoration:none;">CONSENSUS</a>
     <a href="/metrics" class="header-link" style="text-decoration:none;">METRICS</a>
     <a href="https://github.com/ilubxrp589/xrpl-validator" target="_blank" class="header-link" style="text-decoration:none;">GITHUB</a>
-    <span class="header-link" id="peers-toggle">PEERS <span id="peer-badge">0</span></span>
+    <span class="header-link" id="peers-toggle">PEERS <span id="peer-connected" style="color:#00ff88">0</span>/<span id="peer-known">0</span></span>
     <span id="uptime">0s</span>
   </div>
 </div>
@@ -208,7 +208,7 @@
 <div id="peer-panel">
   <div id="peer-panel-header">
     <h2>NETWORK PEERS</h2>
-    <div><span id="peer-panel-count">0 peers</span> <span id="peer-panel-close">X</span></div>
+    <div><span id="peer-panel-count" style="color:#00ff88">0</span> connected / <span id="peer-panel-known">0</span> discovered <span id="peer-panel-close">X</span></div>
   </div>
   <div id="peer-panel-list"></div>
 </div>
@@ -422,18 +422,29 @@ function updateConsensus(type, detail, validatorKey) {
 }
 
 function updatePeers(peers) {
+  // TMEndpoints data — keep for the event feed
   if (!peers || peers.length === 0) return;
   peerData = peers;
-  peerBadge.textContent = peers.length;
-  peerPanelCount.textContent = peers.length + ' peers';
-  let html = '';
-  // Sort by hops ascending
-  const sorted = [...peers].sort((a, b) => a.hops - b.hops);
-  for (const p of sorted) {
-    html += `<div class="peer-row"><span class="peer-addr">${p.endpoint}</span><span class="peer-hops-badge">hop ${p.hops}</span></div>`;
-  }
-  peerPanelList.innerHTML = html;
 }
+
+async function pollPeers() {
+  try {
+    const r = await fetch('/api/peers');
+    const d = await r.json();
+    document.getElementById('peer-connected').textContent = d.connected;
+    document.getElementById('peer-known').textContent = d.known;
+    document.getElementById('peer-panel-count').textContent = d.connected;
+    document.getElementById('peer-panel-known').textContent = d.known;
+    let html = '';
+    const sorted = [...d.peers].sort();
+    for (const p of sorted) {
+      html += `<div class="peer-row"><span class="peer-addr">${p}</span></div>`;
+    }
+    peerPanelList.innerHTML = html;
+  } catch {}
+}
+pollPeers();
+setInterval(pollPeers, 5000);
 
 function addMessage(ev) {
   count++;

@@ -93,13 +93,28 @@ async fn main() {
         );
     }
 
+    // Share peer state with web handlers
+    let web_known = known_peers.clone();
+    let web_connected = connected_count.clone();
+
     // Web server
     let app = Router::new()
         .route("/", get(index_page))
         .route("/consensus", get(consensus_page))
         .route("/metrics", get(metrics_page))
         .route("/events", get(move || sse_handler(tx.clone())))
-        .route("/api/sync-status", get(sync_status));
+        .route("/api/sync-status", get(sync_status))
+        .route("/api/peers", get(move || async move {
+            let known = web_known.lock().len();
+            let connected = web_connected.load(std::sync::atomic::Ordering::Relaxed);
+            let peers: Vec<String> = web_known.lock().iter().cloned().collect();
+            axum::Json(serde_json::json!({
+                "connected": connected,
+                "known": known,
+                "max": max_peers,
+                "peers": peers,
+            }))
+        }));
 
     let addr = "0.0.0.0:3777";
     eprintln!("[web] Listening on http://{addr}");
