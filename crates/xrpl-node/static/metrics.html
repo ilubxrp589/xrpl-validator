@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XRPL Node — Live Metrics</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Orbitron:wght@700;900&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow-y: auto; overflow-x: hidden; }
+  body { background: #060610; color: #c8d0dc; font-family: 'JetBrains Mono', monospace; font-size: 13px; }
+
+  #top-bar { padding: 10px 24px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #141828; background: #0a0a18; position: sticky; top: 0; z-index: 10; }
+  #top-bar h1 { font-family: 'Orbitron', sans-serif; font-size: 13px; color: #0085FF; letter-spacing: 2px; text-shadow: 0 0 12px rgba(0,133,255,0.3); }
+  .tag { color: #3a4055; font-size: 10px; font-family: 'JetBrains Mono', monospace; font-weight: 400; margin-left: 10px; }
+  #top-bar nav { display: flex; gap: 8px; }
+  #top-bar a { color: #3a4a6a; text-decoration: none; font-size: 11px; border: 1px solid #1a1a30; padding: 4px 12px; border-radius: 3px; }
+  #top-bar a:hover { color: #0085FF; border-color: rgba(0,133,255,0.3); }
+  #status { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 10px; }
+  .connected { background: #0085FF; box-shadow: 0 0 8px #0085FF; }
+  .disconnected { background: #ff4444; box-shadow: 0 0 8px #ff4444; }
+
+  #grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 20px 24px; }
+  @media (max-width: 800px) { #grid { grid-template-columns: 1fr; } }
+
+  .card { background: #0c0c1a; border: 1px solid #1a1a30; border-radius: 8px; padding: 16px 20px; }
+  .card-title { font-size: 10px; color: #3a4a6a; text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 8px; }
+  .card-value { font-family: 'Orbitron', sans-serif; font-size: 28px; font-weight: 900; color: #0085FF; margin-bottom: 8px; }
+  .card-sub { font-size: 11px; color: #2a3a5a; }
+
+  canvas { width: 100%; height: 80px; display: block; margin-top: 8px; }
+
+  .card-value.green { color: #00ff88; }
+  .card-value.yellow { color: #ffd93d; }
+  .card-value.purple { color: #a855f7; }
+
+  #footer { padding: 12px 24px; font-size: 10px; color: #1a2040; text-align: right; border-top: 1px solid #141828; }
+  #footer span { color: #2a3060; }
+</style>
+</head>
+<body>
+<div id="top-bar">
+  <h1><span id="status" class="disconnected"></span>NODE METRICS<span class="tag">TESTNET</span></h1>
+  <nav>
+    <a href="/">FEED</a>
+    <a href="/consensus">CONSENSUS</a>
+  </nav>
+</div>
+
+<div id="grid">
+  <!-- Uptime -->
+  <div class="card">
+    <div class="card-title">Uptime</div>
+    <div class="card-value" id="m-uptime">0s</div>
+    <div class="card-sub">connected <span id="m-connected-at">--</span></div>
+  </div>
+
+  <!-- Messages Total -->
+  <div class="card">
+    <div class="card-title">Messages Received</div>
+    <div class="card-value" id="m-total">0</div>
+    <canvas id="c-total"></canvas>
+  </div>
+
+  <!-- Messages/sec -->
+  <div class="card">
+    <div class="card-title">Messages / Second</div>
+    <div class="card-value green" id="m-rate">0</div>
+    <canvas id="c-rate"></canvas>
+  </div>
+
+  <!-- Ledger -->
+  <div class="card">
+    <div class="card-title">Ledger Sequence</div>
+    <div class="card-value" id="m-ledger">--</div>
+    <div class="card-sub">close interval: <span id="m-interval">--</span>s</div>
+    <canvas id="c-interval"></canvas>
+  </div>
+
+  <!-- Validations / round -->
+  <div class="card">
+    <div class="card-title">Validations / Round</div>
+    <div class="card-value yellow" id="m-vals">0</div>
+    <canvas id="c-vals"></canvas>
+  </div>
+
+  <!-- Proposals / round -->
+  <div class="card">
+    <div class="card-title">Proposals / Round</div>
+    <div class="card-value" id="m-props">0</div>
+    <canvas id="c-props"></canvas>
+  </div>
+
+  <!-- Transactions -->
+  <div class="card">
+    <div class="card-title">Transactions Seen</div>
+    <div class="card-value purple" id="m-txs">0</div>
+    <div class="card-sub">sig verified: <span id="m-sig-ok">0</span> | failed: <span id="m-sig-fail">0</span></div>
+    <canvas id="c-txs"></canvas>
+  </div>
+
+  <!-- Type Distribution -->
+  <div class="card">
+    <div class="card-title">Message Type Distribution</div>
+    <div id="type-bars"></div>
+  </div>
+</div>
+
+<div id="footer">built with <span>Rust + tokio + OpenSSL + prost + axum</span> — from-scratch XRPL peer protocol</div>
+
+<script>
+const statusDot = document.getElementById('status');
+let startTime = Date.now();
+let total = 0, ledger = null, lastLedgerTime = null;
+let roundVals = 0, roundProps = 0, txTotal = 0, sigOk = 0, sigFail = 0;
+const typeCounts = {};
+
+// Sparkline helper
+class Sparkline {
+  constructor(canvasId, color, maxPoints = 120) {
+    this.canvas = document.getElementById(canvasId);
+    this.ctx = this.canvas.getContext('2d');
+    this.color = color;
+    this.data = [];
+    this.max = maxPoints;
+  }
+  push(val) {
+    this.data.push(val);
+    if (this.data.length > this.max) this.data.shift();
+    this.draw();
+  }
+  draw() {
+    const c = this.canvas, ctx = this.ctx;
+    const dpr = window.devicePixelRatio || 1;
+    const w = c.clientWidth, h = c.clientHeight;
+    c.width = w * dpr; c.height = h * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+
+    if (this.data.length < 2) return;
+    const max = Math.max(...this.data, 1);
+    const step = w / (this.max - 1);
+
+    // Area fill
+    ctx.beginPath();
+    ctx.moveTo(0, h);
+    for (let i = 0; i < this.data.length; i++) {
+      ctx.lineTo(i * step, h - (this.data[i] / max) * (h - 4));
+    }
+    ctx.lineTo((this.data.length - 1) * step, h);
+    ctx.closePath();
+    ctx.fillStyle = this.color.replace(')', ',0.1)').replace('rgb', 'rgba');
+    ctx.fill();
+
+    // Line
+    ctx.beginPath();
+    for (let i = 0; i < this.data.length; i++) {
+      const x = i * step, y = h - (this.data[i] / max) * (h - 4);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = this.color;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+}
+
+const sTotal = new Sparkline('c-total', 'rgb(0,133,255)');
+const sRate = new Sparkline('c-rate', 'rgb(0,255,136)');
+const sInterval = new Sparkline('c-interval', 'rgb(0,133,255)');
+const sVals = new Sparkline('c-vals', 'rgb(255,217,61)');
+const sProps = new Sparkline('c-props', 'rgb(0,133,255)');
+const sTxs = new Sparkline('c-txs', 'rgb(168,85,247)');
+
+// Per-second rate tracking
+let secCount = 0;
+let currentSec = Math.floor(Date.now() / 1000);
+
+setInterval(() => {
+  const now = Math.floor(Date.now() / 1000);
+  if (now !== currentSec) {
+    sRate.push(secCount);
+    document.getElementById('m-rate').textContent = secCount;
+    secCount = 0;
+    currentSec = now;
+  }
+  sTotal.push(total);
+
+  // Uptime
+  const s = Math.floor((Date.now() - startTime) / 1000);
+  const el = document.getElementById('m-uptime');
+  if (s < 60) el.textContent = s + 's';
+  else if (s < 3600) el.textContent = Math.floor(s/60) + 'm ' + (s%60) + 's';
+  else el.textContent = Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+}, 1000);
+
+// Type bars
+const typeColors = {
+  Proposal:'#0085FF', Validation:'#ffd93d', StatusChange:'#ff6b6b',
+  Transaction:'#a855f7', Manifests:'#6366f1', ValidatorList:'#6366f1',
+  HaveTxSet:'#00C3FF', Endpoints:'#f59e0b', Ping:'#1a2030',
+  CONNECTED:'#0085FF', GetLedger:'#ef4444', LedgerData:'#14b8a6'
+};
+
+function updateTypeBars() {
+  const el = document.getElementById('type-bars');
+  const totalMsgs = Object.values(typeCounts).reduce((a,b) => a+b, 0) || 1;
+  let html = '';
+  const sorted = Object.entries(typeCounts).sort((a,b) => b[1] - a[1]);
+  for (const [type, cnt] of sorted) {
+    const pct = (cnt / totalMsgs * 100).toFixed(1);
+    const color = typeColors[type] || '#333';
+    html += `<div style="display:flex;align-items:center;gap:8px;margin:4px 0;font-size:11px;">
+      <span style="color:#3a4a6a;min-width:100px">${type}</span>
+      <div style="flex:1;height:8px;background:#0a0a18;border-radius:4px;overflow:hidden">
+        <div style="width:${pct}%;height:100%;background:${color};border-radius:4px;transition:width 0.5s"></div>
+      </div>
+      <span style="color:#4a6a9a;min-width:50px;text-align:right">${cnt}</span>
+    </div>`;
+  }
+  el.innerHTML = html;
+}
+setInterval(updateTypeBars, 2000);
+
+function handleEvent(ev) {
+  total++;
+  secCount++;
+  typeCounts[ev.msg_type] = (typeCounts[ev.msg_type] || 0) + 1;
+  document.getElementById('m-total').textContent = total.toLocaleString();
+
+  if (ev.msg_type === 'Validation') {
+    roundVals++;
+    document.getElementById('m-vals').textContent = roundVals;
+  }
+  if (ev.msg_type === 'Proposal') {
+    roundProps++;
+    document.getElementById('m-props').textContent = roundProps;
+  }
+  if (ev.msg_type === 'Transaction') {
+    txTotal++;
+    document.getElementById('m-txs').textContent = txTotal;
+    if (ev.tx_info) {
+      if (ev.tx_info.sig_verified) sigOk++; else sigFail++;
+      document.getElementById('m-sig-ok').textContent = sigOk;
+      document.getElementById('m-sig-fail').textContent = sigFail;
+    }
+    sTxs.push(txTotal);
+  }
+
+  if (ev.ledger_seq) {
+    ledger = ev.ledger_seq;
+    document.getElementById('m-ledger').textContent = ledger.toLocaleString();
+    const now = Date.now();
+    if (lastLedgerTime) {
+      const interval = (now - lastLedgerTime) / 1000;
+      document.getElementById('m-interval').textContent = interval.toFixed(1);
+      sInterval.push(interval);
+    }
+    lastLedgerTime = now;
+
+    // Push per-round values then reset
+    sVals.push(roundVals);
+    sProps.push(roundProps);
+    roundVals = 0; roundProps = 0;
+  }
+}
+
+const es = new EventSource('/events');
+es.onopen = () => {
+  statusDot.className = 'connected';
+  startTime = Date.now();
+  document.getElementById('m-connected-at').textContent = new Date().toLocaleTimeString();
+};
+es.onmessage = (e) => { try { handleEvent(JSON.parse(e.data)); } catch {} };
+es.onerror = () => { statusDot.className = 'disconnected'; };
+</script>
+</body>
+</html>

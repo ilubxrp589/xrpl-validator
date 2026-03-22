@@ -7,6 +7,8 @@
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
+| #14747 | 9:57 PM | 🔄 | Improved error handling in live viewer web server | ~336 |
+| #14744 | 9:55 PM | 🔵 | Comprehensive security audit reveals critical vulnerabilities in peer protocol | ~920 |
 | #14693 | 9:01 PM | 🔴 | Fixed message formatting to include transaction info field in all handlers | ~366 |
 | #14627 | 7:24 PM | 🔴 | Fixed LedgerData message formatting return type mismatch | ~278 |
 | #14621 | " | 🔴 | Fixed Validation message format to match 4-tuple signature in live viewer | ~323 |

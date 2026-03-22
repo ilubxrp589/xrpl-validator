@@ -99,20 +99,21 @@ pub async fn outbound_handshake(
     let mut buf = Vec::with_capacity(4096);
     let header_end;
 
+    let read_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         let mut chunk = [0u8; 1024];
-        let n = tls
-            .read(&mut chunk)
-            .await
-            .map_err(|e| NodeError::HandshakeFailed(format!("read response: {e}")))?;
+        let n = match tokio::time::timeout_at(read_deadline, tls.read(&mut chunk)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(NodeError::HandshakeFailed(format!("read response: {e}"))),
+            Err(_) => return Err(NodeError::HandshakeFailed("header read timed out".to_string())),
+        };
         if n == 0 {
             return Err(NodeError::HandshakeFailed("connection closed during headers".to_string()));
         }
         buf.extend_from_slice(&chunk[..n]);
 
-        // Look for \r\n\r\n
         if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            header_end = Some(pos + 4);
+            header_end = pos + 4;
             break;
         }
 
@@ -120,8 +121,6 @@ pub async fn outbound_handshake(
             return Err(NodeError::HandshakeFailed("headers too large".to_string()));
         }
     }
-
-    let header_end = header_end.unwrap();
     let header_bytes = &buf[..header_end];
     let remaining = buf[header_end..].to_vec();
 
@@ -137,7 +136,12 @@ pub async fn outbound_handshake(
     let lines: Vec<&str> = header_str.split("\r\n").collect();
 
     let status_line = lines.first().unwrap_or(&"");
-    if !status_line.contains("101") {
+    // Parse status code: "HTTP/1.1 101 Switching Protocols"
+    let status_ok = status_line
+        .split_whitespace()
+        .nth(1)
+        .is_some_and(|code| code == "101");
+    if !status_ok {
         return Err(NodeError::HandshakeFailed(format!(
             "expected 101, got: {status_line}"
         )));

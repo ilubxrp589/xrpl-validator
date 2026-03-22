@@ -25,7 +25,7 @@ futures = "0.3"
 
 # Networking & TLS
 tokio-rustls = "0.26"
-rustls = "0.23"
+rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
 rcgen = "0.13"
 # OpenSSL needed for peer protocol (SSL_get_finished compatibility)

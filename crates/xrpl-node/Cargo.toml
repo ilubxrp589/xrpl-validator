@@ -44,6 +44,9 @@ tracing-subscriber = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true }
 async-stream = { workspace = true }
+clap = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
 
 [build-dependencies]
 prost-build = "0.13"

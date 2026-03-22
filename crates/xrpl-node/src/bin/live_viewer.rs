@@ -60,6 +60,9 @@ struct PeerEntry {
 async fn main() {
     eprintln!("Starting XRPL Live Viewer...");
 
+    // Init rustls crypto provider
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let (tx, _) = broadcast::channel::<MessageEvent>(1000);
     let tx2 = tx.clone();
 
@@ -80,12 +83,15 @@ async fn main() {
     let app = Router::new()
         .route("/", get(index_page))
         .route("/consensus", get(consensus_page))
+        .route("/metrics", get(metrics_page))
         .route("/events", get(move || sse_handler(tx.clone())));
 
     let addr = "0.0.0.0:3777";
     eprintln!("[web] Listening on http://{addr}");
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await.expect("failed to bind port 3777");
+    if let Err(e) = axum::serve(listener, app).await {
+        eprintln!("[web] Server error: {e}");
+    }
 }
 
 async fn run_peer_connection(tx: &broadcast::Sender<MessageEvent>) -> Result<(), String> {
@@ -303,6 +309,10 @@ async fn index_page() -> Html<&'static str> {
 
 async fn consensus_page() -> Html<&'static str> {
     Html(include_str!("../../static/consensus.html"))
+}
+
+async fn metrics_page() -> Html<&'static str> {
+    Html(include_str!("../../static/metrics.html"))
 }
 
 async fn sse_handler(

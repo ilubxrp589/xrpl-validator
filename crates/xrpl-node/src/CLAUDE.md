@@ -8,6 +8,4 @@
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
 | #14744 | 9:55 PM | 🔵 | Comprehensive security audit reveals critical vulnerabilities in peer protocol | ~920 |
-| #14738 | 9:54 PM | 🔵 | Reviewed peer message protocol structure for orchestrator integration | ~459 |
-| #14676 | 8:49 PM | 🔴 | Fixed missing crypto provider initialization in sign_and_verify test | ~335 |
 </claude-mem-context>
