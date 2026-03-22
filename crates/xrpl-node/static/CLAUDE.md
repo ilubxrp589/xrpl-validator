@@ -7,5 +7,6 @@
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
+| #14660 | 8:28 PM | 🟣 | Rainbow particle explosion effects added to consensus visualization | ~429 |
 | #14577 | 5:41 PM | 🟣 | Live web viewer for XRPL validator peer protocol monitoring | ~438 |
 </claude-mem-context>
