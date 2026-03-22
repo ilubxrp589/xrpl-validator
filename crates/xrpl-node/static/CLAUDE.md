@@ -7,6 +7,7 @@
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
+| #14755 | 10:10 PM | ✅ | Updated web viewer display label from TESTNET to MAINNET | ~326 |
 | #14660 | 8:28 PM | 🟣 | Rainbow particle explosion effects added to consensus visualization | ~429 |
 | #14577 | 5:41 PM | 🟣 | Live web viewer for XRPL validator peer protocol monitoring | ~438 |
 </claude-mem-context>

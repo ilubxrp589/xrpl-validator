@@ -22,7 +22,7 @@ use xrpl_node::peer::handshake;
 use xrpl_node::peer::identity::NodeIdentity;
 use xrpl_node::peer::message::PeerMessage;
 
-const TESTNET_PEER: &str = "s.altnet.rippletest.net:51235";
+const MAINNET_PEER: &str = "s1.ripple.com:51235";
 
 #[derive(Clone, serde::Serialize)]
 struct MessageEvent {
@@ -69,7 +69,7 @@ async fn main() {
     // Spawn the peer connection task
     tokio::spawn(async move {
         loop {
-            eprintln!("[peer] Connecting to {TESTNET_PEER}...");
+            eprintln!("[peer] Connecting to {MAINNET_PEER}...");
             match run_peer_connection(&tx2).await {
                 Ok(()) => eprintln!("[peer] Connection ended cleanly"),
                 Err(e) => eprintln!("[peer] Error: {e}"),
@@ -100,7 +100,7 @@ async fn run_peer_connection(tx: &broadcast::Sender<MessageEvent>) -> Result<(),
 
     let mut hs = timeout(
         Duration::from_secs(15),
-        handshake::outbound_handshake(TESTNET_PEER, &identity, handshake::NETWORK_ID_TESTNET),
+        handshake::outbound_handshake(MAINNET_PEER, &identity, handshake::NETWORK_ID_MAINNET),
     )
     .await
     .map_err(|_| "handshake timeout".to_string())?
@@ -112,7 +112,7 @@ async fn run_peer_connection(tx: &broadcast::Sender<MessageEvent>) -> Result<(),
         seq: 0,
         time: 0.0,
         msg_type: "CONNECTED".into(),
-        detail: format!("Handshake with {TESTNET_PEER}"),
+        detail: format!("Handshake with {MAINNET_PEER}"),
         ledger_seq: None,
         peers: None,
         validator: None,

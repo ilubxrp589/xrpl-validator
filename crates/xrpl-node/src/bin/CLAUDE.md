@@ -7,6 +7,7 @@
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
+| #14754 | 10:10 PM | ✅ | Live viewer switched from testnet to mainnet for production consensus observation | ~401 |
 | #14747 | 9:57 PM | 🔄 | Improved error handling in live viewer web server | ~336 |
 | #14744 | 9:55 PM | 🔵 | Comprehensive security audit reveals critical vulnerabilities in peer protocol | ~920 |
 | #14693 | 9:01 PM | 🔴 | Fixed message formatting to include transaction info field in all handlers | ~366 |
