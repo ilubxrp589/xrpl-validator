@@ -185,6 +185,16 @@
 
 <div id="type-bars"></div>
 
+<div id="sync-bar" style="display:none;padding:4px 20px;background:#08081a;border-bottom:1px solid #141828;font-size:10px;color:#3a4a6a;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;">
+    <span>LEDGER SYNC <span id="sync-status" style="color:#0085FF;">checking...</span></span>
+    <span><span id="sync-pct" style="color:#0085FF;">0</span>% — <span id="sync-objects">0</span> objects (<span id="sync-size">0</span>MB)</span>
+  </div>
+  <div style="height:4px;background:#101020;border-radius:2px;overflow:hidden;">
+    <div id="sync-fill" style="height:100%;background:#0085FF;border-radius:2px;transition:width 1s ease-out;width:0%"></div>
+  </div>
+</div>
+
 <div id="stats-row">
   <div class="stat-cell">msgs <span class="val" id="msg-count">0</span></div>
   <div class="stat-cell">validations <span class="val" id="val-count">0</span></div>
@@ -482,6 +492,24 @@ function updateUptime() {
 setInterval(updateUptime, 1000);
 setInterval(updateSparkline, 1000);
 setInterval(updateTypeBars, 2000);
+
+// Sync status polling
+async function pollSync() {
+  try {
+    const r = await fetch('/api/sync-status');
+    const d = await r.json();
+    const bar = document.getElementById('sync-bar');
+    bar.style.display = 'block';
+    document.getElementById('sync-pct').textContent = d.percent;
+    document.getElementById('sync-objects').textContent = d.objects.toLocaleString();
+    document.getElementById('sync-size').textContent = d.size_mb.toLocaleString();
+    document.getElementById('sync-fill').style.width = d.percent + '%';
+    document.getElementById('sync-status').textContent = d.syncing ? 'syncing...' : (d.percent >= 100 ? 'complete' : 'paused');
+    document.getElementById('sync-status').style.color = d.syncing ? '#00ff88' : (d.percent >= 100 ? '#00ff88' : '#ffd93d');
+  } catch {}
+}
+pollSync();
+setInterval(pollSync, 5000);
 
 const es = new EventSource('/events');
 es.onopen = () => { statusDot.className = 'connected'; startTime = Date.now(); };

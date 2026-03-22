@@ -84,7 +84,8 @@ async fn main() {
         .route("/", get(index_page))
         .route("/consensus", get(consensus_page))
         .route("/metrics", get(metrics_page))
-        .route("/events", get(move || sse_handler(tx.clone())));
+        .route("/events", get(move || sse_handler(tx.clone())))
+        .route("/api/sync-status", get(sync_status));
 
     let addr = "0.0.0.0:3777";
     eprintln!("[web] Listening on http://{addr}");
@@ -301,6 +302,40 @@ fn extract_key_from_validation(blob: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+async fn sync_status() -> axum::Json<serde_json::Value> {
+    let sync_file = "/mnt/xrpl-data/sync/objects.jsonl";
+    let estimated_total: u64 = 30_000_000; // ~30M objects on mainnet
+
+    let (objects, size_bytes) = match std::fs::metadata(sync_file) {
+        Ok(meta) => {
+            let size = meta.len();
+            // Estimate line count from file size (avg ~430 bytes per line)
+            let lines = size / 430;
+            (lines, size)
+        }
+        Err(_) => (0, 0),
+    };
+
+    let pct = if estimated_total > 0 {
+        (objects as f64 / estimated_total as f64 * 100.0).min(100.0)
+    } else {
+        0.0
+    };
+
+    let syncing = std::fs::metadata(sync_file)
+        .and_then(|m| m.modified())
+        .map(|t| t.elapsed().map(|e| e.as_secs() < 30).unwrap_or(false))
+        .unwrap_or(false);
+
+    axum::Json(serde_json::json!({
+        "objects": objects,
+        "estimated_total": estimated_total,
+        "percent": (pct * 10.0).round() / 10.0,
+        "size_mb": size_bytes / 1_048_576,
+        "syncing": syncing,
+    }))
 }
 
 async fn index_page() -> Html<&'static str> {
