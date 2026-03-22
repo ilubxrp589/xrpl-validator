@@ -22,7 +22,10 @@ use xrpl_node::peer::handshake;
 use xrpl_node::peer::identity::NodeIdentity;
 use xrpl_node::peer::message::PeerMessage;
 
-const MAINNET_PEER: &str = "s1.ripple.com:51235";
+const MAINNET_PEERS: &[&str] = &[
+    "s1.ripple.com:51235",
+    "s2.ripple.com:51235",
+];
 
 #[derive(Clone, serde::Serialize)]
 struct MessageEvent {
@@ -66,18 +69,22 @@ async fn main() {
     let (tx, _) = broadcast::channel::<MessageEvent>(1000);
     let tx2 = tx.clone();
 
-    // Spawn the peer connection task
-    tokio::spawn(async move {
-        loop {
-            eprintln!("[peer] Connecting to {MAINNET_PEER}...");
-            match run_peer_connection(&tx2).await {
-                Ok(()) => eprintln!("[peer] Connection ended cleanly"),
-                Err(e) => eprintln!("[peer] Error: {e}"),
+    // Spawn a connection task for each mainnet peer
+    for peer in MAINNET_PEERS {
+        let tx_clone = tx2.clone();
+        let peer = peer.to_string();
+        tokio::spawn(async move {
+            loop {
+                eprintln!("[peer] Connecting to {peer}...");
+                match run_peer_connection(&peer, &tx_clone).await {
+                    Ok(()) => eprintln!("[peer] {peer} connection ended"),
+                    Err(e) => eprintln!("[peer] {peer} error: {e}"),
+                }
+                eprintln!("[peer] {peer} reconnecting in 5 seconds...");
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
-            eprintln!("[peer] Reconnecting in 5 seconds...");
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        }
-    });
+        });
+    }
 
     // Web server
     let app = Router::new()
@@ -95,25 +102,24 @@ async fn main() {
     }
 }
 
-async fn run_peer_connection(tx: &broadcast::Sender<MessageEvent>) -> Result<(), String> {
+async fn run_peer_connection(peer_addr: &str, tx: &broadcast::Sender<MessageEvent>) -> Result<(), String> {
     let identity = NodeIdentity::generate().map_err(|e| format!("identity: {e}"))?;
-    eprintln!("[peer] Node key: {}", identity.public_key_hex());
 
     let mut hs = timeout(
         Duration::from_secs(15),
-        handshake::outbound_handshake(MAINNET_PEER, &identity, handshake::NETWORK_ID_MAINNET),
+        handshake::outbound_handshake(peer_addr, &identity, handshake::NETWORK_ID_MAINNET),
     )
     .await
     .map_err(|_| "handshake timeout".to_string())?
     .map_err(|e| format!("handshake: {e}"))?;
 
-    eprintln!("[peer] Handshake successful!");
+    eprintln!("[peer] Handshake with {peer_addr} successful!");
 
     let _ = tx.send(MessageEvent {
         seq: 0,
         time: 0.0,
         msg_type: "CONNECTED".into(),
-        detail: format!("Handshake with {MAINNET_PEER}"),
+        detail: format!("Handshake with {peer_addr}"),
         ledger_seq: None,
         peers: None,
         validator: None,

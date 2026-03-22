@@ -7,6 +7,7 @@
 
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
+| #14835 | 11:52 PM | ✅ | Dashboard panel height constraint for consistent UI layout | ~228 |
 | #14830 | 11:47 PM | 🟣 | Added ledger state synchronization progress card to metrics dashboard | ~413 |
 | #14779 | 10:23 PM | 🟣 | 3D perspective rendering added to consensus visualization particles | ~544 |
 | #14755 | 10:10 PM | ✅ | Updated web viewer display label from TESTNET to MAINNET | ~326 |
