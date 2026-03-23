@@ -112,6 +112,36 @@
     <div id="type-bars"></div>
   </div>
 
+  <!-- Fee Burn -->
+  <div class="card">
+    <div class="card-title">XRP Fee Burn</div>
+    <div class="card-value" id="m-fee-burn" style="color:#ff6b6b">0</div>
+    <div class="card-sub">this round: <span id="m-fee-round">0</span> drops | <span id="m-fee-xrp">0</span> XRP total</div>
+    <canvas id="c-fees"></canvas>
+  </div>
+
+  <!-- Tx Type Breakdown -->
+  <div class="card">
+    <div class="card-title">Transaction Types (Current Round)</div>
+    <div id="tx-type-bars"></div>
+    <div class="card-sub" style="margin-top:8px;">
+      engine: <span id="m-engine-supported" style="color:#00ff88">0</span> supported / <span id="m-engine-unsupported" style="color:#ff6b6b">0</span> unsupported
+    </div>
+  </div>
+
+  <!-- Engine Coverage -->
+  <div class="card">
+    <div class="card-title">Engine Coverage</div>
+    <div class="card-value green" id="m-coverage">--</div>
+    <div class="card-sub">
+      <span id="m-engine-ledgers">0</span> ledgers processed |
+      <span id="m-engine-total-tx">0</span> total txs
+    </div>
+    <div style="height:6px;background:#101020;border-radius:3px;overflow:hidden;margin-top:8px;">
+      <div id="m-coverage-fill" style="height:100%;background:#00ff88;border-radius:3px;transition:width 1s ease-out;width:0%"></div>
+    </div>
+  </div>
+
   <!-- Ledger Sync -->
   <div class="card">
     <div class="card-title">Ledger State Sync</div>
@@ -188,9 +218,69 @@ const sInterval = new Sparkline('c-interval', 'rgb(0,133,255)');
 const sVals = new Sparkline('c-vals', 'rgb(255,217,61)');
 const sProps = new Sparkline('c-props', 'rgb(0,133,255)');
 const sTxs = new Sparkline('c-txs', 'rgb(168,85,247)');
+const sFees = new Sparkline('c-fees', 'rgb(255,107,107)');
+
+// Tx type colors for the breakdown
+const txTypeColors = {
+  Payment:'#0085FF', OfferCreate:'#f59e0b', OfferCancel:'#ef4444',
+  TrustSet:'#a855f7', AccountSet:'#14b8a6', AccountDelete:'#ff6b6b',
+  EscrowCreate:'#6366f1', EscrowFinish:'#6366f1', EscrowCancel:'#6366f1',
+  NFTokenMint:'#ec4899', NFTokenBurn:'#ec4899', NFTokenCreateOffer:'#ec4899',
+  NFTokenAcceptOffer:'#ec4899', CredentialCreate:'#06b6d4', CredentialDelete:'#06b6d4',
+  CredentialAccept:'#06b6d4',
+};
+
+// Engine polling
+async function pollEngine() {
+  try {
+    const r = await fetch('/api/engine');
+    const d = await r.json();
+
+    // Fee burn
+    document.getElementById('m-fee-burn').textContent = d.total_fees_burned.toLocaleString();
+    document.getElementById('m-fee-round').textContent = d.round_fees.toLocaleString();
+    document.getElementById('m-fee-xrp').textContent = (d.total_fees_burned / 1_000_000).toFixed(2);
+    sFees.push(d.round_fees);
+
+    // Tx type breakdown
+    const el = document.getElementById('tx-type-bars');
+    const totalRound = d.round_tx_count || 1;
+    let html = '';
+    const sorted = Object.entries(d.round_tx_types || {}).sort((a,b) => b[1] - a[1]);
+    for (const [type, cnt] of sorted) {
+      const pct = (cnt / totalRound * 100).toFixed(0);
+      const color = txTypeColors[type] || '#3a4a6a';
+      html += '<div style="display:flex;align-items:center;gap:8px;margin:3px 0;font-size:11px;">' +
+        '<span style="color:' + color + ';min-width:110px">' + type + '</span>' +
+        '<div style="flex:1;height:8px;background:#0a0a18;border-radius:4px;overflow:hidden">' +
+        '<div style="width:' + pct + '%;height:100%;background:' + color + ';border-radius:4px;min-width:2px;transition:width 0.5s"></div>' +
+        '</div>' +
+        '<span style="color:#4a6a9a;min-width:30px;text-align:right">' + cnt + '</span>' +
+        '</div>';
+    }
+    if (sorted.length === 0) html = '<div style="color:#2a3a5a;font-size:11px">waiting for transactions...</div>';
+    el.innerHTML = html;
+
+    // Engine coverage
+    document.getElementById('m-engine-supported').textContent = d.round_supported;
+    document.getElementById('m-engine-unsupported').textContent = d.round_unsupported;
+    document.getElementById('m-engine-ledgers').textContent = d.ledgers_processed;
+    document.getElementById('m-engine-total-tx').textContent = (d.total_txs + d.round_tx_count).toLocaleString();
+
+    const coverage = d.round_tx_count > 0
+      ? ((d.round_supported / d.round_tx_count) * 100).toFixed(0)
+      : '--';
+    document.getElementById('m-coverage').textContent = coverage + '%';
+    document.getElementById('m-coverage-fill').style.width = coverage + '%';
+    document.getElementById('m-coverage-fill').style.background =
+      parseInt(coverage) >= 100 ? '#00ff88' : parseInt(coverage) >= 80 ? '#ffd93d' : '#ff6b6b';
+  } catch {}
+}
+pollEngine();
+setInterval(pollEngine, 2000);
 
 // Per-second rate tracking
-let secCount = 0, txSecCount = 0;
+let secCount = 0, txSecCount = 0, lastTotal = 0;
 let currentSec = Math.floor(Date.now() / 1000);
 
 setInterval(() => {
@@ -200,11 +290,14 @@ setInterval(() => {
     document.getElementById('m-rate').textContent = secCount;
     sTxRate.push(txSecCount);
     document.getElementById('m-txrate').textContent = txSecCount;
+    sTxs.push(txTotal);
     secCount = 0;
     txSecCount = 0;
     currentSec = now;
   }
-  sTotal.push(total);
+  const totalDelta = total - lastTotal;
+  lastTotal = total;
+  sTotal.push(totalDelta);
 
   // Uptime
   const s = Math.floor((Date.now() - startTime) / 1000);
@@ -265,7 +358,6 @@ function handleEvent(ev) {
       document.getElementById('m-sig-ok').textContent = sigOk;
       document.getElementById('m-sig-fail').textContent = sigFail;
     }
-    sTxs.push(txTotal);
   }
 
   if (ev.ledger_seq) {

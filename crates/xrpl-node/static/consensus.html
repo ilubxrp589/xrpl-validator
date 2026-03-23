@@ -65,6 +65,7 @@
     <div>validators <span class="n" id="s-seen">0</span></div>
     <div>interval <span class="n" id="s-int">--</span>s</div>
   </div>
+  <div id="fee-flash" style="font-family:'Orbitron',sans-serif;font-size:12px;color:#ff6b6b;opacity:0;transition:opacity 0.3s;margin-top:4px;letter-spacing:1px;"></div>
 </div>
 
 <div id="bottom-bar">
@@ -383,18 +384,35 @@ function loop(ts) {
   requestAnimationFrame(loop);
 }
 
+// Tx type → color for neural network pulses
+const txTypeColor = {
+  Payment: [0, 133, 255],       // blue
+  OfferCreate: [245, 158, 11],  // orange
+  OfferCancel: [239, 68, 68],   // red
+  TrustSet: [168, 85, 247],     // purple
+  AccountSet: [20, 184, 166],   // teal
+  AccountDelete: [255, 60, 60], // bright red
+};
+
+// Track fees per round for the flash
+let roundFees = 0;
+const feeFlash = document.getElementById('fee-flash');
+let feeFlashTimer = null;
+let propsResetTimer = null;
+let ledgerFlashTimer = null;
+
 // Consensus events
 function handleEvent(ev) {
   if (ev.msg_type === 'Proposal') {
     roundProps++; sProp.textContent = roundProps;
-    const node = getNode(ev.validator);
-    if (node) { node.state = 'proposed'; if (!tabHidden) fireNode(ev.validator?.slice(0,10), [0,133,255]); }
     if (phase === 'open' || phase === 'accepted') {
       phase = 'propose'; phaseEl.className = 'ph-propose'; phaseEl.textContent = 'PROPOSING';
       roundVals = 0; sVal.textContent = '0';
+      roundFees = 0;
       resetNodes();
-      if (node) { node.state = 'proposed'; if (!tabHidden) fireNode(ev.validator?.slice(0,10), [0,133,255]); }
     }
+    const node = getNode(ev.validator);
+    if (node) { node.state = 'proposed'; if (!tabHidden) fireNode(ev.validator?.slice(0,10), [0,133,255]); }
   }
   else if (ev.msg_type === 'Validation') {
     roundVals++; sVal.textContent = roundVals;
@@ -404,11 +422,36 @@ function handleEvent(ev) {
       phase = 'validate'; phaseEl.className = 'ph-validate'; phaseEl.textContent = 'VALIDATING';
     }
   }
+  else if (ev.msg_type === 'Transaction') {
+    // Color-code by transaction type
+    if (ev.tx_info && !tabHidden) {
+      const color = txTypeColor[ev.tx_info.tx_type] || [100, 100, 120];
+      // Fire a random node with the tx-type color
+      const keys = [...nodes.keys()];
+      if (keys.length > 0) {
+        const rk = keys[Math.floor(Math.random() * keys.length)];
+        fireNode(rk, color);
+      }
+      roundFees += ev.tx_info.fee || 0;
+    }
+  }
   else if (ev.msg_type === 'StatusChange') {
     if (ev.detail && ev.detail.includes('ACCEPTED')) {
       phase = 'accepted'; phaseEl.className = 'ph-accepted'; phaseEl.textContent = 'CONSENSUS';
       if (!tabHidden) cascadeAll([0, 255, 136]);
-      setTimeout(() => { if (phase === 'accepted') { roundProps = 0; sProp.textContent = '0'; } }, 2000);
+
+      // Fee burn flash
+      if (roundFees > 0) {
+        const xrp = (roundFees / 1000000);
+        const xrpStr = xrp < 0.01 ? xrp.toFixed(6) : xrp.toFixed(4);
+        feeFlash.innerHTML = '-' + roundFees.toLocaleString() + ' drops <span style="font-family:JetBrains Mono,monospace;font-size:11px;color:#ff8888;margin-left:6px">' + xrpStr + ' XRP burned</span>';
+        feeFlash.style.opacity = '1';
+        if (feeFlashTimer) clearTimeout(feeFlashTimer);
+        feeFlashTimer = setTimeout(() => { feeFlash.style.opacity = '0'; }, 2500);
+      }
+
+      if (propsResetTimer) clearTimeout(propsResetTimer);
+      propsResetTimer = setTimeout(() => { if (phase === 'accepted') { roundProps = 0; sProp.textContent = '0'; } }, 2000);
     } else if (ev.detail && ev.detail.includes('CLOSING')) {
       phaseEl.className = 'ph-propose'; phaseEl.textContent = 'CLOSING';
     }
@@ -420,7 +463,8 @@ function handleEvent(ev) {
     lastLedgerTime = now;
     ledgerEl.textContent = ev.ledger_seq.toLocaleString();
     ledgerEl.classList.add('flash');
-    setTimeout(() => ledgerEl.classList.remove('flash'), 500);
+    if (ledgerFlashTimer) clearTimeout(ledgerFlashTimer);
+    ledgerFlashTimer = setTimeout(() => ledgerEl.classList.remove('flash'), 500);
   }
 }
 

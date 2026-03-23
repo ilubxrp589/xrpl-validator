@@ -62,6 +62,29 @@ struct PeerEntry {
     hops: u32,
 }
 
+/// Consensus engine state — tracks per-round transaction stats.
+#[derive(Clone, Default, serde::Serialize)]
+struct EngineState {
+    /// Current ledger sequence being tracked.
+    ledger_seq: u32,
+    /// Transactions seen in the current round.
+    round_tx_count: u32,
+    /// Total fees accumulated in the current round (drops).
+    round_fees: u64,
+    /// Transaction type counts for the current round.
+    round_tx_types: std::collections::HashMap<String, u32>,
+    /// Total transactions processed since startup.
+    total_txs: u64,
+    /// Total fees burned since startup (drops).
+    total_fees_burned: u64,
+    /// Ledgers processed since startup.
+    ledgers_processed: u32,
+    /// Supported tx type count in current round.
+    round_supported: u32,
+    /// Unsupported tx type count in current round.
+    round_unsupported: u32,
+}
+
 #[tokio::main]
 async fn main() {
     eprintln!("Starting XRPL Live Viewer...");
@@ -106,6 +129,59 @@ async fn main() {
         );
     }
 
+    // Engine state — tracks consensus round stats
+    let engine_state: Arc<Mutex<EngineState>> = Arc::new(Mutex::new(EngineState::default()));
+
+    // Subscribe to message events for engine tracking
+    let engine_rx = tx2.subscribe();
+    let engine = engine_state.clone();
+    tokio::spawn(async move {
+        let mut rx = engine_rx;
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    let mut state = engine.lock();
+
+                    // Track ledger sequence changes (new round)
+                    if let Some(seq) = event.ledger_seq {
+                        if seq > state.ledger_seq {
+                            // New ledger — finalize previous round
+                            if state.ledger_seq > 0 {
+                                state.total_txs += state.round_tx_count as u64;
+                                state.total_fees_burned += state.round_fees;
+                                state.ledgers_processed += 1;
+                            }
+                            // Reset round stats
+                            state.ledger_seq = seq;
+                            state.round_tx_count = 0;
+                            state.round_fees = 0;
+                            state.round_tx_types.clear();
+                            state.round_supported = 0;
+                            state.round_unsupported = 0;
+                        }
+                    }
+
+                    // Track transactions
+                    if event.msg_type == "Transaction" {
+                        if let Some(ref info) = event.tx_info {
+                            state.round_tx_count += 1;
+                            state.round_fees += info.fee;
+                            *state.round_tx_types.entry(info.tx_type.clone()).or_insert(0) += 1;
+
+                            if xrpl_ledger::tx::dispatch::is_supported(&info.tx_type) {
+                                state.round_supported += 1;
+                            } else {
+                                state.round_unsupported += 1;
+                            }
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+    });
+
     // Share peer state with web handlers
     let web_known = known_peers.clone();
     let web_connected = connected_count.clone();
@@ -117,10 +193,22 @@ async fn main() {
         .route("/metrics", get(metrics_page))
         .route("/events", get(move || sse_handler(tx.clone())))
         .route("/api/sync-status", get(sync_status))
+        .route("/api/engine", get({
+            let engine_web = engine_state.clone();
+            move || {
+                let engine_web = engine_web.clone();
+                async move {
+                    let state = engine_web.lock().clone();
+                    axum::Json(serde_json::json!(state))
+                }
+            }
+        }))
         .route("/api/peers", get(move || async move {
-            let known = web_known.lock().len();
             let connected = web_connected.load(std::sync::atomic::Ordering::Relaxed);
-            let peers: Vec<String> = web_known.lock().iter().cloned().collect();
+            let guard = web_known.lock();
+            let known = guard.len();
+            let peers: Vec<String> = guard.iter().cloned().collect();
+            drop(guard);
             axum::Json(serde_json::json!({
                 "connected": connected,
                 "known": known,
