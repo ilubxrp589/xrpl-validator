@@ -259,7 +259,7 @@ fn unsupported_type_still_burns_fee() {
 
     let tx = TxFields {
         account: alice,
-        tx_type: "EscrowCreate".to_string(),
+        tx_type: "BatchSubmit".to_string(),
         fee: 100,
         sequence: 1,
         ticket_seq: None,

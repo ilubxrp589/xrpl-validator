@@ -115,6 +115,14 @@
   .sig-ok { color: #00ff88; font-size: 10px; font-weight: 700; margin-left: 6px; }
   .sig-fail { color: #ff4444; font-size: 10px; font-weight: 700; margin-left: 6px; }
   .tx-badge { background: #141828; border-radius: 3px; padding: 1px 6px; font-size: 10px; margin-left: 4px; color: #6a8abb; }
+  .tx-badge.tb-Payment { border-left: 2px solid #0085FF; color: #0085FF; }
+  .tx-badge.tb-OfferCreate { border-left: 2px solid #f59e0b; color: #f59e0b; }
+  .tx-badge.tb-OfferCancel { border-left: 2px solid #ef4444; color: #ef4444; }
+  .tx-badge.tb-TrustSet { border-left: 2px solid #a855f7; color: #a855f7; }
+  .tx-badge.tb-AccountSet { border-left: 2px solid #14b8a6; color: #14b8a6; }
+  .tx-badge.tb-AccountDelete { border-left: 2px solid #ff6b6b; color: #ff6b6b; }
+  .stat-cell .burn { color: #ff6b6b; }
+  .stat-cell .engine { color: #00ff88; }
   .t-Manifests .msg-type { color: #6366f1; }
   .t-ValidatorList .msg-type { color: #6366f1; }
   .t-HaveTxSet .msg-type { color: #00C3FF; }
@@ -201,6 +209,8 @@
   <div class="stat-cell">proposals <span class="val" id="prop-count">0</span></div>
   <div class="stat-cell">transactions <span class="val" id="tx-count">0</span></div>
   <div class="stat-cell">tx/s <span class="val" id="tx-rate">0</span></div>
+  <div class="stat-cell">burned <span class="val burn" id="fee-burn">0</span> <span style="color:#2a3050;font-size:9px">XRP</span></div>
+  <div class="stat-cell">engine <span class="val engine" id="engine-cov">--</span></div>
   <div class="stat-cell">ledger <span class="val" id="ledger-seq">--</span></div>
 </div>
 
@@ -476,7 +486,7 @@ function addMessage(ev) {
     const t = ev.tx_info;
     const sigClass = t.sig_verified ? 'sig-ok' : 'sig-fail';
     const sigText = t.sig_verified ? 'SIG OK' : 'SIG FAIL';
-    txExtra = `<span class="tx-badge">${t.tx_type}</span><span class="tx-badge">${t.account.slice(0,12)}...</span><span class="tx-badge">${t.fee}d</span><span class="${sigClass}">${sigText}</span>`;
+    txExtra = `<span class="tx-badge tb-${t.tx_type}">${t.tx_type}</span><span class="tx-badge">${t.account.slice(0,12)}...</span><span class="tx-badge">${t.fee}d</span><span class="${sigClass}">${sigText}</span>`;
   }
 
   const row = document.createElement('div');
@@ -521,6 +531,22 @@ async function pollSync() {
 }
 pollSync();
 setInterval(pollSync, 5000);
+
+// Engine status polling
+async function pollEngine() {
+  try {
+    const r = await fetch('/api/engine');
+    const d = await r.json();
+    const burned = d.lifetime_burned > 0 ? d.lifetime_burned : d.total_fees_burned + d.round_fees;
+    document.getElementById('fee-burn').textContent = (burned / 1_000_000).toLocaleString(undefined, {maximumFractionDigits: 2});
+    const cov = d.round_tx_count > 0
+      ? Math.round((d.round_supported / d.round_tx_count) * 100) + '%'
+      : '100%';
+    document.getElementById('engine-cov').textContent = cov;
+  } catch {}
+}
+pollEngine();
+setInterval(pollEngine, 2000);
 
 const es = new EventSource('/events');
 es.onopen = () => { statusDot.className = 'connected'; startTime = Date.now(); };

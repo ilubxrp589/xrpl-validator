@@ -339,7 +339,7 @@ mod tests {
 
         let tx = TxFields {
             account: alice,
-            tx_type: "EscrowCreate".to_string(), // not implemented yet
+            tx_type: "BatchSubmit".to_string(), // not implemented yet
             fee: 15,
             sequence: 1,
             last_ledger_seq: None,

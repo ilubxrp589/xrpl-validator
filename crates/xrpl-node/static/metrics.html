@@ -114,9 +114,9 @@
 
   <!-- Fee Burn -->
   <div class="card">
-    <div class="card-title">XRP Fee Burn</div>
+    <div class="card-title">XRP Burned (All Time)</div>
     <div class="card-value" id="m-fee-burn" style="color:#ff6b6b">0</div>
-    <div class="card-sub">this round: <span id="m-fee-round">0</span> drops | <span id="m-fee-xrp">0</span> XRP total</div>
+    <div class="card-sub"><span id="m-fee-xrp">0</span> XRP destroyed forever | this round: <span id="m-fee-round">0</span> XRP</div>
     <canvas id="c-fees"></canvas>
   </div>
 
@@ -236,10 +236,12 @@ async function pollEngine() {
     const r = await fetch('/api/engine');
     const d = await r.json();
 
-    // Fee burn
-    document.getElementById('m-fee-burn').textContent = d.total_fees_burned.toLocaleString();
-    document.getElementById('m-fee-round').textContent = d.round_fees.toLocaleString();
-    document.getElementById('m-fee-xrp').textContent = (d.total_fees_burned / 1_000_000).toFixed(2);
+    // Fee burn — use lifetime if available, otherwise session
+    const burned = d.lifetime_burned > 0 ? d.lifetime_burned : d.total_fees_burned;
+    const burnedXrp = burned / 1_000_000;
+    document.getElementById('m-fee-burn').textContent = burnedXrp.toLocaleString(undefined, {maximumFractionDigits: 2});
+    document.getElementById('m-fee-round').textContent = (d.round_fees / 1_000_000).toFixed(6);
+    document.getElementById('m-fee-xrp').textContent = burnedXrp.toLocaleString(undefined, {maximumFractionDigits: 2});
     sFees.push(d.round_fees);
 
     // Tx type breakdown

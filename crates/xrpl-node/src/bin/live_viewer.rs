@@ -62,6 +62,9 @@ struct PeerEntry {
     hops: u32,
 }
 
+/// Original XRPL supply: 100 billion XRP in drops.
+const ORIGINAL_SUPPLY_DROPS: u64 = 100_000_000_000_000_000;
+
 /// Consensus engine state — tracks per-round transaction stats.
 #[derive(Clone, Default, serde::Serialize)]
 struct EngineState {
@@ -83,6 +86,10 @@ struct EngineState {
     round_supported: u32,
     /// Unsupported tx type count in current round.
     round_unsupported: u32,
+    /// Current total_coins from the network (drops). 0 if not yet fetched.
+    network_total_coins: u64,
+    /// All-time XRP burned (original supply - current total_coins) in drops.
+    lifetime_burned: u64,
 }
 
 #[tokio::main]
@@ -110,7 +117,7 @@ async fn main() {
     // Shared set of peers we've already connected/tried
     let known_peers: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let connected_count: Arc<std::sync::atomic::AtomicUsize> = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let max_peers: usize = 50;
+    let max_peers: usize = 1000;
 
     // Seed with initial peers
     for peer in MAINNET_PEERS {
@@ -131,6 +138,37 @@ async fn main() {
 
     // Engine state — tracks consensus round stats
     let engine_state: Arc<Mutex<EngineState>> = Arc::new(Mutex::new(EngineState::default()));
+
+    // Background task: poll total_coins from network every 30s
+    let coins_engine = engine_state.clone();
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
+        loop {
+            if let Ok(resp) = client
+                .post("https://xrplcluster.com")
+                .json(&serde_json::json!({
+                    "method": "ledger",
+                    "params": [{"ledger_index": "validated"}]
+                }))
+                .send()
+                .await
+            {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    if let Some(coins_str) = body["result"]["ledger"]["total_coins"].as_str() {
+                        if let Ok(coins) = coins_str.parse::<u64>() {
+                            let mut state = coins_engine.lock();
+                            state.network_total_coins = coins;
+                            state.lifetime_burned = ORIGINAL_SUPPLY_DROPS.saturating_sub(coins);
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    });
 
     // Subscribe to message events for engine tracking
     let engine_rx = tx2.subscribe();
@@ -302,7 +340,7 @@ async fn run_peer_connection(
                         let current = connected_count.load(std::sync::atomic::Ordering::Relaxed);
                         if current < max_peers {
                             for peer_ep in &ep.endpoints_v2 {
-                                if peer_ep.hops <= 1 {
+                                if peer_ep.hops <= 3 {
                                     let addr = peer_ep.endpoint.clone();
                                     // Skip invalid/local addresses
                                     if addr.starts_with("[::") || addr.starts_with("0.") || addr.starts_with("127.") || addr.starts_with("10.") || addr.starts_with("192.168.") {

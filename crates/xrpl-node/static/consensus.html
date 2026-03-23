@@ -444,7 +444,7 @@ function handleEvent(ev) {
       if (roundFees > 0) {
         const xrp = (roundFees / 1000000);
         const xrpStr = xrp < 0.01 ? xrp.toFixed(6) : xrp.toFixed(4);
-        feeFlash.innerHTML = '-' + roundFees.toLocaleString() + ' drops <span style="font-family:JetBrains Mono,monospace;font-size:11px;color:#ff8888;margin-left:6px">' + xrpStr + ' XRP burned</span>';
+        feeFlash.innerHTML = '<span style="font-family:JetBrains Mono,monospace;font-size:12px;color:#ff6b6b">-' + xrpStr + ' XRP burned</span>';
         feeFlash.style.opacity = '1';
         if (feeFlashTimer) clearTimeout(feeFlashTimer);
         feeFlashTimer = setTimeout(() => { feeFlash.style.opacity = '0'; }, 2500);
