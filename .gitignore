@@ -8,17 +8,24 @@ Cargo.lock
 
 # Validator keys — NEVER commit these
 *.seed
+*.hex
 *.key
+*.pem
 *.token
 keys.json
 validator_keys.json
 validator_token.txt
+validator_seed*
 config.toml
 
-# Sled databases
+# Databases
 *.sled/
 state.sled/
+*.rocks/
+state.rocks/
 
 # Sync data
 objects.jsonl
 marker.txt
+engine_state.json
+*.log

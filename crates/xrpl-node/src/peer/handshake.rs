@@ -192,7 +192,9 @@ pub async fn outbound_handshake(
             if valid {
                 tracing::debug!("peer session signature verified");
             } else {
-                tracing::warn!("peer session signature FAILED verification (continuing anyway)");
+                return Err(NodeError::HandshakeFailed(
+                    "peer session signature verification failed".to_string()
+                ));
             }
         }
     }
