@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XRPL Validator — Peer Network</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Orbitron:wght@700;900&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; }
+  body { background: #060610; color: #c8d0dc; font-family: 'JetBrains Mono', monospace; }
+
+  #canvas { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 0; }
+
+  #ui { position: relative; z-index: 10; height: 100%; display: flex; flex-direction: column; pointer-events: none; }
+  #ui > * { pointer-events: auto; }
+
+  #top-bar { padding: 8px 20px; display: flex; justify-content: space-between; align-items: center; background: rgba(6,6,16,0.85); backdrop-filter: blur(8px); border-bottom: 1px solid rgba(255,255,255,0.03); }
+  #top-bar h1 { font-family: 'Orbitron', sans-serif; font-size: 12px; color: #0085FF; letter-spacing: 2px; }
+  .tag { color: #3a4055; font-size: 10px; font-family: 'JetBrains Mono', monospace; margin-left: 8px; }
+  #top-bar nav { display: flex; gap: 6px; }
+  #top-bar a { color: #3a4a6a; text-decoration: none; font-size: 10px; border: 1px solid rgba(255,255,255,0.06); padding: 3px 10px; border-radius: 3px; transition: all 0.2s; }
+  #top-bar a:hover { color: #0085FF; border-color: rgba(0,133,255,0.3); }
+  #status { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 8px; }
+  .connected { background: #0085FF; box-shadow: 0 0 6px #0085FF; }
+  .disconnected { background: #ff4444; }
+
+  #info { position: fixed; top: 48px; left: 50%; transform: translateX(-50%); z-index: 15; text-align: center; pointer-events: none; }
+  #info h2 { font-family: 'Orbitron', sans-serif; font-size: 14px; color: #0085FF; letter-spacing: 2px; }
+  #peer-stats { font-size: 11px; color: #3a4a6a; margin-top: 4px; }
+  #peer-stats .n { color: #6a8abb; font-weight: 700; }
+
+  #bottom-bar { position: fixed; bottom: 0; left: 0; right: 0; z-index: 10; padding: 6px 20px; display: flex; justify-content: space-between; align-items: center; background: rgba(6,6,16,0.85); backdrop-filter: blur(8px); border-top: 1px solid rgba(255,255,255,0.03); }
+  #legend { display: flex; gap: 14px; font-size: 9px; color: #3a4a6a; }
+  .ldot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
+  #footer-text { font-size: 9px; color: #1a2040; }
+
+  #hover-info { display: none; position: fixed; z-index: 20; background: rgba(12,12,26,0.95); border: 1px solid #1a1a30; border-radius: 4px; padding: 8px 12px; font-size: 10px; color: #7a9acc; pointer-events: none; }
+
+  @media(prefers-reduced-motion:reduce) { #canvas { display: none; } }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+
+<div id="ui">
+  <div id="top-bar">
+    <h1><span id="status" class="disconnected"></span>PEER NETWORK<span class="tag">MAINNET</span></h1>
+    <nav><a href="/">FEED</a><a href="/consensus">CONSENSUS</a><a href="/metrics">METRICS</a></nav>
+  </div>
+</div>
+
+<div id="info">
+  <h2>NETWORK TOPOLOGY</h2>
+  <div id="peer-stats">
+    <span class="n" id="s-connected">0</span> connected /
+    <span class="n" id="s-known">0</span> discovered /
+    <span class="n" id="s-max">1000</span> max
+  </div>
+</div>
+
+<div id="bottom-bar">
+  <div id="legend">
+    <span><span class="ldot" style="background:#00ff88"></span>Our Node</span>
+    <span><span class="ldot" style="background:#0085FF"></span>Connected Peer</span>
+    <span><span class="ldot" style="background:#1a2040"></span>Discovered (not connected)</span>
+  </div>
+  <div id="footer-text">force-directed layout — live data from /api/peers</div>
+</div>
+
+<div id="hover-info"></div>
+
+<script>
+const cvs = document.getElementById('canvas');
+const ctx = cvs.getContext('2d');
+const hoverEl = document.getElementById('hover-info');
+let W, H, dpr;
+
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  cvs.width = W * dpr; cvs.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Nodes: our node in center + peer nodes
+const nodes = new Map(); // addr -> {x, y, vx, vy, connected, label}
+const CX = () => W / 2;
+const CY = () => H / 2;
+
+// Our node
+const US = { x: CX(), y: CY(), vx: 0, vy: 0, connected: true, label: 'THIS NODE', isUs: true };
+
+function hashStr(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+  return Math.abs(h);
+}
+
+function getNode(addr, connected) {
+  if (!nodes.has(addr)) {
+    const h = hashStr(addr);
+    const angle = (h % 3600) / 3600 * Math.PI * 2;
+    const dist = 120 + (h >> 10) % 200;
+    nodes.set(addr, {
+      x: CX() + Math.cos(angle) * dist + (Math.random() - 0.5) * 40,
+      y: CY() + Math.sin(angle) * dist + (Math.random() - 0.5) * 40,
+      vx: 0, vy: 0,
+      connected,
+      label: addr,
+      name: null, // filled by crawl
+    });
+  } else {
+    nodes.get(addr).connected = connected;
+  }
+  return nodes.get(addr);
+}
+
+// Force simulation
+function simulate(dt) {
+  dt = Math.min(dt, 0.05);
+  const allNodes = [US, ...nodes.values()];
+
+  // Keep US at center
+  US.x = CX(); US.y = CY();
+
+  for (const n of nodes.values()) {
+    // Attract connected nodes toward center, repel disconnected further
+    const dx = CX() - n.x;
+    const dy = CY() - n.y;
+    const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+
+    if (n.connected) {
+      // Spring to center — ideal distance ~150-250
+      const ideal = 180;
+      const force = (dist - ideal) * 0.002;
+      n.vx += (dx / dist) * force;
+      n.vy += (dy / dist) * force;
+    } else {
+      // Push disconnected outward — ideal distance ~300-400
+      const ideal = 350;
+      const force = (dist - ideal) * 0.001;
+      n.vx += (dx / dist) * force;
+      n.vy += (dy / dist) * force;
+    }
+
+    // Node-node repulsion
+    for (const other of nodes.values()) {
+      if (other === n) continue;
+      const ox = n.x - other.x;
+      const oy = n.y - other.y;
+      const od = Math.sqrt(ox * ox + oy * oy) || 1;
+      if (od < 60) {
+        const repel = (60 - od) * 0.05;
+        n.vx += (ox / od) * repel;
+        n.vy += (oy / od) * repel;
+      }
+    }
+
+    // Damping
+    n.vx *= 0.92;
+    n.vy *= 0.92;
+
+    // Apply velocity
+    n.x += n.vx;
+    n.y += n.vy;
+
+    // Keep in bounds
+    n.x = Math.max(30, Math.min(W - 30, n.x));
+    n.y = Math.max(50, Math.min(H - 40, n.y));
+  }
+}
+
+// Render
+let time = 0;
+function render(dt) {
+  time += dt;
+  ctx.clearRect(0, 0, W, H);
+
+  // Draw connections (lines from us to connected peers) + pulse
+  for (const [addr, n] of nodes) {
+    if (!n.connected) continue;
+    // Base line
+    ctx.beginPath();
+    ctx.moveTo(US.x, US.y);
+    ctx.lineTo(n.x, n.y);
+    ctx.strokeStyle = 'rgba(0,133,255,0.08)';
+    ctx.lineWidth = 0.5;
+    ctx.stroke();
+
+    // Pulse dot traveling along the line
+    // Each peer gets a unique phase offset from its hash
+    const phase = (hashStr(addr) % 1000) / 1000;
+    const speed = 1.2; // full trip per second
+    const t = ((time * speed + phase) % 1) ; // 0→1 position along line
+    const px = US.x + (n.x - US.x) * t;
+    const py = US.y + (n.y - US.y) * t;
+    const alpha = 1 - Math.abs(t - 0.5) * 1.6; // fade at endpoints
+
+    ctx.beginPath();
+    ctx.arc(px, py, 1.5, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(0,133,255,${Math.max(0, alpha) * 0.5})`;
+    ctx.fill();
+  }
+
+  // No lines to discovered — just dots
+
+  // Draw discovered nodes (dim, bigger)
+  for (const n of nodes.values()) {
+    if (n.connected) continue;
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, 4, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(26,32,64,0.5)';
+    ctx.fill();
+  }
+
+  // Draw connected nodes (bigger orbs, no labels — hover only)
+  for (const [addr, n] of nodes) {
+    if (!n.connected) continue;
+
+    // Outer glow
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, 12, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(0,133,255,0.06)';
+    ctx.fill();
+
+    // Ring
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, 9, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(0,133,255,0.15)';
+    ctx.lineWidth = 0.8;
+    ctx.stroke();
+
+    // Core orb
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, 5, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(0,133,255,0.8)';
+    ctx.fill();
+  }
+
+  // Draw our node (center, bigger)
+  ctx.beginPath();
+  ctx.arc(US.x, US.y, 10, 0, Math.PI * 2);
+  ctx.fillStyle = '#00ff88';
+  ctx.fill();
+
+  ctx.beginPath();
+  ctx.arc(US.x, US.y, 18, 0, Math.PI * 2);
+  ctx.strokeStyle = 'rgba(0,255,136,0.15)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.arc(US.x, US.y, 28, 0, Math.PI * 2);
+  ctx.strokeStyle = 'rgba(0,255,136,0.06)';
+  ctx.lineWidth = 0.5;
+  ctx.stroke();
+}
+
+let lastT = 0;
+function loop(ts) {
+  const dt = Math.min((ts - lastT) / 1000, 0.05);
+  lastT = ts;
+  simulate(dt);
+  render(dt);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// Hover detection
+let hoveredNode = null;
+cvs.addEventListener('mousemove', (e) => {
+  const mx = e.clientX, my = e.clientY;
+  hoveredNode = null;
+
+  // Check connected nodes first (larger hit area)
+  for (const [addr, n] of nodes) {
+    const dx = mx - n.x, dy = my - n.y;
+    if (dx * dx + dy * dy < 225) { // 15px radius
+      hoveredNode = { addr, node: n };
+      break;
+    }
+  }
+
+  if (hoveredNode) {
+    hoverEl.style.display = 'block';
+    hoverEl.style.left = (mx + 14) + 'px';
+    hoverEl.style.top = (my - 10) + 'px';
+    const n = hoveredNode.node;
+    const nameLine = n.name ? `<div style="color:#4a6a9a;font-size:9px;margin-top:2px">${n.name}</div>` : '';
+    hoverEl.innerHTML = `<div style="color:${n.connected ? '#0085FF' : '#3a4a6a'};font-weight:700">${hoveredNode.addr}</div>
+      ${nameLine}
+      <div style="color:${n.connected ? '#00ff88' : '#ff6b6b'};margin-top:2px">${n.connected ? 'CONNECTED' : 'DISCOVERED'}</div>`;
+  } else {
+    hoverEl.style.display = 'none';
+  }
+});
+
+// Poll peers
+async function pollPeers() {
+  try {
+    const r = await fetch('/api/peers');
+    const d = await r.json();
+
+    document.getElementById('s-connected').textContent = d.connected;
+    document.getElementById('s-known').textContent = d.known;
+    document.getElementById('s-max').textContent = d.max;
+    document.getElementById('status').className = 'connected';
+
+    const connectedSet = new Set(d.peers);
+
+    // Update/create connected nodes + apply versions from server crawl
+    for (const addr of d.peers) {
+      getNode(addr, true);
+    }
+    if (d.peer_details) {
+      for (const pd of d.peer_details) {
+        if (pd.version && nodes.has(pd.addr)) {
+          nodes.get(pd.addr).name = pd.version;
+        }
+      }
+    }
+
+    // Update/create discovered (not connected) nodes
+    if (d.discovered) {
+      for (const addr of d.discovered) {
+        getNode(addr, false);
+      }
+    }
+
+    // Sync connection status
+    for (const [addr, n] of nodes) {
+      n.connected = connectedSet.has(addr);
+    }
+
+    // Remove very old disconnected nodes to avoid unbounded growth
+    if (nodes.size > 2000) {
+      let removed = 0;
+      for (const [addr, n] of nodes) {
+        if (!n.connected && removed < 500) {
+          nodes.delete(addr);
+          removed++;
+        }
+      }
+    }
+  } catch {
+    document.getElementById('status').className = 'disconnected';
+  }
+}
+pollPeers();
+setInterval(pollPeers, 3000);
+
+// Versions come from server-side crawl via peer_details in /api/peers
+
+// Also listen for new connections via SSE
+const es = new EventSource('/events');
+es.onmessage = (e) => {
+  try {
+    const ev = JSON.parse(e.data);
+    if (ev.msg_type === 'CONNECTED' && ev.detail) {
+      const match = ev.detail.match(/Handshake with (.+)/);
+      if (match) getNode(match[1], true);
+    }
+    // Endpoints message — add discovered peers
+    if (ev.msg_type === 'Endpoints' && ev.peers) {
+      for (const p of ev.peers) {
+        if (p.endpoint && !nodes.has(p.endpoint)) {
+          getNode(p.endpoint, false);
+        }
+      }
+    }
+  } catch {}
+};
+</script>
+</body>
+</html>

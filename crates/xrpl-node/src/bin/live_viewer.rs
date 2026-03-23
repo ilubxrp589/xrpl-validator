@@ -65,6 +65,33 @@ struct PeerEntry {
 /// Original XRPL supply: 100 billion XRP in drops.
 const ORIGINAL_SUPPLY_DROPS: u64 = 100_000_000_000_000_000;
 
+/// Path for persisted engine stats.
+const ENGINE_STATE_PATH: &str = "/mnt/xrpl-data/engine_state.json";
+
+/// Persistent stats saved to disk.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct PersistedStats {
+    total_txs: u64,
+    total_fees_burned: u64,
+    ledgers_processed: u32,
+    last_ledger_seq: u32,
+}
+
+impl PersistedStats {
+    fn load() -> Self {
+        std::fs::read_to_string(ENGINE_STATE_PATH)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self) {
+        if let Ok(json) = serde_json::to_string(self) {
+            let _ = std::fs::write(ENGINE_STATE_PATH, json);
+        }
+    }
+}
+
 /// Consensus engine state — tracks per-round transaction stats.
 #[derive(Clone, Default, serde::Serialize)]
 struct EngineState {
@@ -90,6 +117,22 @@ struct EngineState {
     network_total_coins: u64,
     /// All-time XRP burned (original supply - current total_coins) in drops.
     lifetime_burned: u64,
+    /// Total messages received since startup.
+    total_messages: u64,
+    /// Total validations received since startup.
+    total_validations: u64,
+    /// Total proposals received since startup.
+    total_proposals: u64,
+    /// Validations in current round.
+    round_validations: u32,
+    /// Proposals in current round.
+    round_proposals: u32,
+    /// Signature verified count.
+    sig_ok: u64,
+    /// Signature failed count.
+    sig_fail: u64,
+    /// Uptime start (unix millis).
+    start_time_ms: u64,
 }
 
 #[tokio::main]
@@ -117,6 +160,8 @@ async fn main() {
     // Shared set of peers we've already connected/tried
     let known_peers: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let connected_count: Arc<std::sync::atomic::AtomicUsize> = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Track which peers are currently connected (for the peers page)
+    let connected_peers: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let max_peers: usize = 1000;
 
     // Seed with initial peers
@@ -133,11 +178,49 @@ async fn main() {
             connected_count.clone(),
             max_peers,
             seen_msgs.clone(),
+            connected_peers.clone(),
         );
     }
 
-    // Engine state — tracks consensus round stats
-    let engine_state: Arc<Mutex<EngineState>> = Arc::new(Mutex::new(EngineState::default()));
+    // Live engine — opens sled DB and applies transactions to real state
+    // Disabled while sync is running (sled lock conflict)
+    let sync_running = std::fs::metadata("/mnt/xrpl-data/sync/state.sled/db")
+        .and_then(|m| m.modified())
+        .map(|t| t.elapsed().map(|e| e.as_secs() < 60).unwrap_or(false))
+        .unwrap_or(false);
+
+    let live_engine: Arc<Mutex<Option<xrpl_node::engine::LiveEngine>>> = if std::env::var("XRPL_NO_ENGINE").is_ok() {
+        eprintln!("[live-engine] Disabled via XRPL_NO_ENGINE env var");
+        Arc::new(Mutex::new(None))
+    } else {
+        Arc::new(Mutex::new(
+            match xrpl_node::engine::LiveEngine::open(std::path::Path::new("/mnt/xrpl-data/sync/state.sled")) {
+                Ok(e) => {
+                    eprintln!("[live-engine] Opened sled with {} entries", e.entry_count());
+                    Some(e)
+                }
+                Err(e) => {
+                    eprintln!("[live-engine] Failed to open sled: {e} (sync running?)");
+                    None
+                }
+            }
+        ))
+    };
+
+    // Engine state — load persisted stats, then track consensus round stats
+    let persisted = PersistedStats::load();
+    eprintln!("[engine] Loaded persisted stats: {} txs, {} ledgers, {} fees burned",
+        persisted.total_txs, persisted.ledgers_processed, persisted.total_fees_burned);
+    let mut initial_state = EngineState::default();
+    initial_state.total_txs = persisted.total_txs;
+    initial_state.total_fees_burned = persisted.total_fees_burned;
+    initial_state.ledgers_processed = persisted.ledgers_processed;
+    initial_state.ledger_seq = persisted.last_ledger_seq;
+    initial_state.start_time_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let engine_state: Arc<Mutex<EngineState>> = Arc::new(Mutex::new(initial_state));
 
     // Background task: poll total_coins from network every 30s
     let coins_engine = engine_state.clone();
@@ -170,9 +253,26 @@ async fn main() {
         }
     });
 
+    // Persist engine stats to disk every 60s
+    let persist_engine = engine_state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let state = persist_engine.lock().clone();
+            let stats = PersistedStats {
+                total_txs: state.total_txs + state.round_tx_count as u64,
+                total_fees_burned: state.total_fees_burned + state.round_fees,
+                ledgers_processed: state.ledgers_processed,
+                last_ledger_seq: state.ledger_seq,
+            };
+            stats.save();
+        }
+    });
+
     // Subscribe to message events for engine tracking
     let engine_rx = tx2.subscribe();
     let engine = engine_state.clone();
+    let le = live_engine.clone();
     tokio::spawn(async move {
         let mut rx = engine_rx;
         loop {
@@ -196,20 +296,43 @@ async fn main() {
                             state.round_tx_types.clear();
                             state.round_supported = 0;
                             state.round_unsupported = 0;
+                            state.round_validations = 0;
+                            state.round_proposals = 0;
                         }
                     }
 
-                    // Track transactions
-                    if event.msg_type == "Transaction" {
+                    // Count all messages
+                    state.total_messages += 1;
+
+                    // Track by type
+                    if event.msg_type == "Validation" {
+                        state.total_validations += 1;
+                        state.round_validations += 1;
+                    } else if event.msg_type == "Proposal" {
+                        state.total_proposals += 1;
+                        state.round_proposals += 1;
+                    } else if event.msg_type == "Transaction" {
                         if let Some(ref info) = event.tx_info {
                             state.round_tx_count += 1;
                             state.round_fees += info.fee;
                             *state.round_tx_types.entry(info.tx_type.clone()).or_insert(0) += 1;
 
+                            if info.sig_verified { state.sig_ok += 1; } else { state.sig_fail += 1; }
+
                             if xrpl_ledger::tx::dispatch::is_supported(&info.tx_type) {
                                 state.round_supported += 1;
                             } else {
                                 state.round_unsupported += 1;
+                            }
+
+                            // Apply to live state via sled
+                            if let Some(ref mut eng) = *le.lock() {
+                                if let Some(id) = xrpl_node::engine::decode_address(&info.account) {
+                                    eng.apply_transaction(
+                                        &info.tx_type, &id, info.fee,
+                                        &serde_json::Value::Null,
+                                    );
+                                }
                             }
                         }
                     }
@@ -220,38 +343,119 @@ async fn main() {
         }
     });
 
+    // Peer info cache — crawled versions/names
+    let peer_info_cache: Arc<Mutex<std::collections::HashMap<String, String>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+    // Background: crawl connected peers for version info
+    let crawl_cache = peer_info_cache.clone();
+    let crawl_active = connected_peers.clone();
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(4))
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap_or_default();
+        loop {
+            let peers: Vec<String> = crawl_active.lock().iter().cloned().collect();
+            for addr in peers {
+                if crawl_cache.lock().contains_key(&addr) {
+                    continue;
+                }
+                let ip = addr.split(':').next().unwrap_or(&addr);
+                let port = addr.split(':').nth(1).unwrap_or("51235");
+                let url = format!("https://{}:{}/crawl", ip, port);
+                if let Ok(resp) = client.get(&url).send().await {
+                    if let Ok(body) = resp.json::<serde_json::Value>().await {
+                        let version = body.get("server")
+                            .and_then(|s| s.get("build_version"))
+                            .and_then(|v| v.as_str())
+                            .map(|v| format!("rippled-{}", v))
+                            .or_else(|| {
+                                body.get("overlay")
+                                    .and_then(|o| o.get("active"))
+                                    .and_then(|a| a.as_array())
+                                    .and_then(|a| a.first())
+                                    .and_then(|p| p.get("version"))
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from)
+                            });
+                        if let Some(v) = version {
+                            crawl_cache.lock().insert(addr.clone(), v);
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    });
+
     // Share peer state with web handlers
     let web_known = known_peers.clone();
     let web_connected = connected_count.clone();
+    let web_active = connected_peers.clone();
+    let web_peer_info = peer_info_cache.clone();
 
     // Web server
     let app = Router::new()
         .route("/", get(index_page))
         .route("/consensus", get(consensus_page))
         .route("/metrics", get(metrics_page))
+        .route("/peers", get(peers_page))
         .route("/events", get(move || sse_handler(tx.clone())))
         .route("/api/sync-status", get(sync_status))
         .route("/api/engine", get({
             let engine_web = engine_state.clone();
+            let le_web = live_engine.clone();
             move || {
                 let engine_web = engine_web.clone();
+                let le_web = le_web.clone();
                 async move {
                     let state = engine_web.lock().clone();
-                    axum::Json(serde_json::json!(state))
+                    let mut json = serde_json::to_value(&state).unwrap_or_default();
+                    // Add live engine stats
+                    if let Some(ref eng) = *le_web.lock() {
+                        json["live_engine"] = serde_json::json!({
+                            "active": true,
+                            "sled_entries": eng.entry_count(),
+                            "round_applied": eng.round_applied,
+                            "round_failed": eng.round_failed,
+                            "total_applied": eng.total_applied,
+                            "total_coins": eng.total_coins,
+                        });
+                    } else {
+                        json["live_engine"] = serde_json::json!({"active": false});
+                    }
+                    axum::Json(json)
                 }
             }
         }))
         .route("/api/peers", get(move || async move {
-            let connected = web_connected.load(std::sync::atomic::Ordering::Relaxed);
+            let connected_count = web_connected.load(std::sync::atomic::Ordering::Relaxed);
+            let active: Vec<String> = web_active.lock().iter().cloned().collect();
             let guard = web_known.lock();
             let known = guard.len();
-            let peers: Vec<String> = guard.iter().cloned().collect();
+            let all_known: Vec<String> = guard.iter().cloned().collect();
             drop(guard);
+            let active_set: std::collections::HashSet<&str> = active.iter().map(|s| s.as_str()).collect();
+            let discovered: Vec<&str> = all_known.iter()
+                .filter(|p| !active_set.contains(p.as_str()))
+                .map(|s| s.as_str())
+                .collect();
+            let info = web_peer_info.lock();
+            let peer_details: Vec<serde_json::Value> = active.iter().map(|addr| {
+                let version = info.get(addr).cloned().unwrap_or_default();
+                serde_json::json!({"addr": addr, "version": version})
+            }).collect();
+            drop(info);
             axum::Json(serde_json::json!({
-                "connected": connected,
+                "connected": connected_count,
                 "known": known,
                 "max": max_peers,
-                "peers": peers,
+                "peers": active,
+                "peer_details": peer_details,
+                "discovered": discovered,
             }))
         }));
 
@@ -270,6 +474,7 @@ fn spawn_peer_connection(
     connected_count: Arc<std::sync::atomic::AtomicUsize>,
     max_peers: usize,
     seen_msgs: Arc<dashmap::DashMap<u64, ()>>,
+    active_peers: Arc<Mutex<HashSet<String>>>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -278,11 +483,13 @@ fn spawn_peer_connection(
                 return;
             }
             connected_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            active_peers.lock().insert(peer.clone());
             eprintln!("[peer] Connecting to {peer}...");
-            match run_peer_connection(&peer, &tx, &known_peers, &connected_count, max_peers, &seen_msgs).await {
+            match run_peer_connection(&peer, &tx, &known_peers, &connected_count, max_peers, &seen_msgs, &active_peers).await {
                 Ok(()) => eprintln!("[peer] {peer} disconnected"),
                 Err(e) => eprintln!("[peer] {peer}: {e}"),
             }
+            active_peers.lock().remove(&peer);
             connected_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             tokio::time::sleep(Duration::from_secs(10)).await;
         }
@@ -296,6 +503,7 @@ async fn run_peer_connection(
     connected_count: &Arc<std::sync::atomic::AtomicUsize>,
     max_peers: usize,
     seen_msgs: &Arc<dashmap::DashMap<u64, ()>>,
+    active_peers: &Arc<Mutex<HashSet<String>>>,
 ) -> Result<(), String> {
     let identity = NodeIdentity::generate().map_err(|e| format!("identity: {e}"))?;
 
@@ -358,6 +566,7 @@ async fn run_peer_connection(
                                             connected_count.clone(),
                                             max_peers,
                                             seen_msgs.clone(),
+                                            active_peers.clone(),
                                         );
                                     }
                                 }
@@ -591,6 +800,10 @@ async fn consensus_page() -> Html<&'static str> {
 
 async fn metrics_page() -> Html<&'static str> {
     Html(include_str!("../../static/metrics.html"))
+}
+
+async fn peers_page() -> Html<&'static str> {
+    Html(include_str!("../../static/peers.html"))
 }
 
 async fn sse_handler(

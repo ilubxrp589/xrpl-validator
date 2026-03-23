@@ -16,6 +16,7 @@
 
 pub mod config;
 pub mod consensus;
+pub mod engine;
 pub mod error;
 pub mod mempool;
 pub mod node;

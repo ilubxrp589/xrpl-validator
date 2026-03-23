@@ -84,7 +84,8 @@ pub async fn outbound_handshake(
          Session-Signature: {sig_b64}\r\n\
          Crawl: public\r\n\
          Network-ID: {network_id}\r\n\
-         User-Agent: xrpl-node-rs/0.1.0\r\n\
+         Server-Name: xrpl-rust-validator\r\n\
+         User-Agent: xrpl-rust-validator/0.1.0\r\n\
          \r\n"
     );
 

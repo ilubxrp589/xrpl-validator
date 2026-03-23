@@ -10,168 +10,165 @@
   html, body { height: 100%; overflow-y: auto; overflow-x: hidden; }
   body { background: #060610; color: #c8d0dc; font-family: 'JetBrains Mono', monospace; font-size: 13px; }
 
-  #top-bar { padding: 10px 24px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #141828; background: #0a0a18; position: sticky; top: 0; z-index: 10; }
-  #top-bar h1 { font-family: 'Orbitron', sans-serif; font-size: 13px; color: #0085FF; letter-spacing: 2px; text-shadow: 0 0 12px rgba(0,133,255,0.3); }
-  .tag { color: #3a4055; font-size: 10px; font-family: 'JetBrains Mono', monospace; font-weight: 400; margin-left: 10px; }
-  #top-bar nav { display: flex; gap: 8px; }
-  #top-bar a { color: #3a4a6a; text-decoration: none; font-size: 11px; border: 1px solid #1a1a30; padding: 4px 12px; border-radius: 3px; }
+  /* Nav */
+  #top-bar { padding: 8px 20px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #141828; background: #0a0a18; position: sticky; top: 0; z-index: 10; }
+  #top-bar h1 { font-family: 'Orbitron', sans-serif; font-size: 12px; color: #0085FF; letter-spacing: 2px; }
+  .tag { color: #3a4055; font-size: 10px; font-family: 'JetBrains Mono', monospace; margin-left: 8px; }
+  #top-bar nav { display: flex; gap: 6px; }
+  #top-bar a { color: #3a4a6a; text-decoration: none; font-size: 10px; border: 1px solid #1a1a30; padding: 3px 10px; border-radius: 3px; transition: all 0.2s; }
   #top-bar a:hover { color: #0085FF; border-color: rgba(0,133,255,0.3); }
-  #status { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 10px; }
-  .connected { background: #0085FF; box-shadow: 0 0 8px #0085FF; }
-  .disconnected { background: #ff4444; box-shadow: 0 0 8px #ff4444; }
+  #status { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 8px; }
+  .connected { background: #0085FF; box-shadow: 0 0 6px #0085FF; }
+  .disconnected { background: #ff4444; }
 
-  #grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 20px 24px; }
-  @media (max-width: 800px) { #grid { grid-template-columns: 1fr; } }
+  /* Stats strip */
+  #stats-strip { display: flex; padding: 6px 20px; gap: 0; border-bottom: 1px solid #141828; background: #08081a; overflow-x: auto; }
+  .ss { flex: 1; padding: 4px 12px; border-right: 1px solid #141828; font-size: 9px; color: #3a4a6a; text-transform: uppercase; letter-spacing: 1px; white-space: nowrap; }
+  .ss:last-child { border-right: none; }
+  .ss .v { display: block; font-size: 14px; font-family: 'Orbitron', sans-serif; font-weight: 700; color: #0085FF; margin-top: 2px; letter-spacing: 0; }
+  .ss .v.green { color: #00ff88; }
+  .ss .v.yellow { color: #ffd93d; }
+  .ss .v.purple { color: #a855f7; }
+  .ss .v.red { color: #ff6b6b; }
 
-  .card { background: #0c0c1a; border: 1px solid #1a1a30; border-radius: 8px; padding: 16px 20px; }
-  .card-title { font-size: 10px; color: #3a4a6a; text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 8px; }
-  .card-value { font-family: 'Orbitron', sans-serif; font-size: 28px; font-weight: 900; color: #0085FF; margin-bottom: 8px; }
-  .card-sub { font-size: 11px; color: #2a3a5a; }
+  /* Grid */
+  #grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; padding: 14px 20px; }
+  @media (max-width: 1024px) { #grid { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 700px) { #grid { grid-template-columns: 1fr; } }
 
-  canvas { width: 100%; height: 80px; display: block; margin-top: 8px; }
+  .card { background: #0c0c1a; border: 1px solid #1a1a30; border-radius: 6px; padding: 12px 14px; }
+  .card-title { font-size: 9px; color: #3a4a6a; text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 6px; }
+  .card-value { font-family: 'Orbitron', sans-serif; font-size: 26px; font-weight: 900; color: #0085FF; margin-bottom: 4px; line-height: 1.2; }
+  .card-sub { font-size: 10px; color: #2a3a5a; }
+
+  canvas { width: 100%; height: 60px; display: block; margin-top: 6px; }
 
   .card-value.green { color: #00ff88; }
   .card-value.yellow { color: #ffd93d; }
   .card-value.purple { color: #a855f7; }
+  .card-value.red { color: #ff6b6b; }
 
-  #footer { padding: 12px 24px; font-size: 10px; color: #1a2040; text-align: right; border-top: 1px solid #141828; }
+  /* Progress bars */
+  .prog-track { height: 5px; background: #101020; border-radius: 3px; overflow: hidden; margin-top: 6px; }
+  .prog-fill { height: 100%; border-radius: 3px; transition: width 0.5s ease-out; }
+
+  #footer { padding: 8px 20px; font-size: 9px; color: #1a2040; text-align: right; border-top: 1px solid #141828; }
   #footer span { color: #2a3060; }
+
+  @media(prefers-reduced-motion:reduce) { canvas { display: none; } .prog-fill { transition: none; } }
 </style>
 </head>
 <body>
+
 <div id="top-bar">
   <h1><span id="status" class="disconnected"></span>NODE METRICS<span class="tag">MAINNET</span></h1>
-  <nav>
-    <a href="/">FEED</a>
-    <a href="/consensus">CONSENSUS</a>
-  </nav>
+  <nav><a href="/">FEED</a><a href="/consensus">CONSENSUS</a><a href="/peers">PEERS</a></nav>
 </div>
 
+<!-- Stats Strip -->
+<div id="stats-strip">
+  <div class="ss">uptime<span class="v" id="m-uptime">0s</span></div>
+  <div class="ss">ledger<span class="v" id="m-ledger">--</span></div>
+  <div class="ss">interval<span class="v" id="m-interval">--</span></div>
+  <div class="ss">msg/s<span class="v green" id="m-rate">0</span></div>
+  <div class="ss">tx/s<span class="v purple" id="m-txrate">0</span></div>
+  <div class="ss">messages<span class="v" id="m-total">0</span></div>
+  <div class="ss">engine<span class="v green" id="m-coverage">--</span></div>
+</div>
+
+<!-- 3-Column Grid -->
 <div id="grid">
-  <!-- Uptime -->
+  <!-- Row 1 -->
   <div class="card">
-    <div class="card-title">Uptime</div>
-    <div class="card-value" id="m-uptime">0s</div>
-    <div class="card-sub">connected <span id="m-connected-at">--</span></div>
+    <div class="card-title">XRP Burned (All Time)</div>
+    <div class="card-value red" id="m-fee-burn">0</div>
+    <div class="card-sub"><span id="m-fee-xrp">0</span> XRP destroyed | round: <span id="m-fee-round">0</span> XRP</div>
+    <canvas id="c-fees"></canvas>
   </div>
 
-  <!-- Messages Total -->
-  <div class="card">
-    <div class="card-title">Messages Received</div>
-    <div class="card-value" id="m-total">0</div>
-    <canvas id="c-total"></canvas>
-  </div>
-
-  <!-- Messages/sec -->
-  <div class="card">
-    <div class="card-title">Messages / Second</div>
-    <div class="card-value green" id="m-rate">0</div>
-    <canvas id="c-rate"></canvas>
-  </div>
-
-  <!-- Tx/s -->
-  <div class="card">
-    <div class="card-title">Transactions / Second</div>
-    <div class="card-value purple" id="m-txrate">0</div>
-    <canvas id="c-txrate"></canvas>
-  </div>
-
-  <!-- Ledger -->
-  <div class="card">
-    <div class="card-title">Ledger Sequence</div>
-    <div class="card-value" id="m-ledger">--</div>
-    <div class="card-sub">close interval: <span id="m-interval">--</span>s</div>
-    <canvas id="c-interval"></canvas>
-  </div>
-
-  <!-- Validations / round -->
   <div class="card">
     <div class="card-title">Validations / Round</div>
     <div class="card-value yellow" id="m-vals">0</div>
     <canvas id="c-vals"></canvas>
   </div>
 
-  <!-- Proposals / round -->
   <div class="card">
     <div class="card-title">Proposals / Round</div>
     <div class="card-value" id="m-props">0</div>
     <canvas id="c-props"></canvas>
   </div>
 
-  <!-- Transactions -->
+  <!-- Row 2 -->
+  <div class="card">
+    <div class="card-title">Transaction Types (Round)</div>
+    <div id="tx-type-bars"></div>
+    <div class="card-sub" style="margin-top:6px;">
+      <span id="m-engine-supported" style="color:#00ff88">0</span> supported /
+      <span id="m-engine-unsupported" style="color:#ff6b6b">0</span> unsupported
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Engine Coverage</div>
+    <div class="card-value green" id="m-coverage-val">--</div>
+    <div class="card-sub">
+      <span id="m-engine-ledgers">0</span> ledgers |
+      <span id="m-engine-total-tx">0</span> txs
+    </div>
+    <div class="prog-track">
+      <div id="m-coverage-fill" class="prog-fill" style="background:#00ff88;width:0%"></div>
+    </div>
+  </div>
+
   <div class="card">
     <div class="card-title">Transactions Seen</div>
     <div class="card-value purple" id="m-txs">0</div>
-    <div class="card-sub">sig verified: <span id="m-sig-ok">0</span> | failed: <span id="m-sig-fail">0</span></div>
+    <div class="card-sub">sig ok: <span id="m-sig-ok">0</span> | fail: <span id="m-sig-fail">0</span></div>
     <canvas id="c-txs"></canvas>
   </div>
 
-  <!-- Type Distribution -->
+  <!-- Row 3 -->
+  <div class="card">
+    <div class="card-title">Messages / Second</div>
+    <div class="card-value green" id="m-rate-card">0</div>
+    <canvas id="c-rate"></canvas>
+  </div>
+
   <div class="card">
     <div class="card-title">Message Type Distribution</div>
     <div id="type-bars"></div>
   </div>
 
-  <!-- Fee Burn -->
-  <div class="card">
-    <div class="card-title">XRP Burned (All Time)</div>
-    <div class="card-value" id="m-fee-burn" style="color:#ff6b6b">0</div>
-    <div class="card-sub"><span id="m-fee-xrp">0</span> XRP destroyed forever | this round: <span id="m-fee-round">0</span> XRP</div>
-    <canvas id="c-fees"></canvas>
-  </div>
-
-  <!-- Tx Type Breakdown -->
-  <div class="card">
-    <div class="card-title">Transaction Types (Current Round)</div>
-    <div id="tx-type-bars"></div>
-    <div class="card-sub" style="margin-top:8px;">
-      engine: <span id="m-engine-supported" style="color:#00ff88">0</span> supported / <span id="m-engine-unsupported" style="color:#ff6b6b">0</span> unsupported
-    </div>
-  </div>
-
-  <!-- Engine Coverage -->
-  <div class="card">
-    <div class="card-title">Engine Coverage</div>
-    <div class="card-value green" id="m-coverage">--</div>
-    <div class="card-sub">
-      <span id="m-engine-ledgers">0</span> ledgers processed |
-      <span id="m-engine-total-tx">0</span> total txs
-    </div>
-    <div style="height:6px;background:#101020;border-radius:3px;overflow:hidden;margin-top:8px;">
-      <div id="m-coverage-fill" style="height:100%;background:#00ff88;border-radius:3px;transition:width 1s ease-out;width:0%"></div>
-    </div>
-  </div>
-
-  <!-- Ledger Sync -->
   <div class="card">
     <div class="card-title">Ledger State Sync</div>
-    <div class="card-value" id="m-sync-pct" style="font-size:24px;">--</div>
+    <div class="card-value" id="m-sync-pct" style="font-size:22px;">--</div>
     <div class="card-sub"><span id="m-sync-objects">0</span> objects (<span id="m-sync-size">0</span>MB) — <span id="m-sync-status" style="color:#3a4a6a">checking...</span></div>
-    <div style="height:6px;background:#101020;border-radius:3px;overflow:hidden;margin-top:8px;">
-      <div id="m-sync-fill" style="height:100%;background:#0085FF;border-radius:3px;transition:width 1s ease-out;width:0%"></div>
+    <div class="prog-track">
+      <div id="m-sync-fill" class="prog-fill" style="background:#0085FF;width:0%"></div>
     </div>
   </div>
 </div>
 
-<div id="footer">built with <span>Rust + tokio + OpenSSL + prost + axum</span> — from-scratch XRPL peer protocol</div>
+<div id="footer">built with <span>Rust + tokio + OpenSSL + prost + axum</span></div>
 
 <script>
 const statusDot = document.getElementById('status');
-let startTime = Date.now();
-let total = 0, ledger = null, lastLedgerTime = null;
-let roundVals = 0, roundProps = 0, txTotal = 0, sigOk = 0, sigFail = 0;
+let ledger = null, lastLedgerTime = null;
 const typeCounts = {};
+let secCount = 0, txSecCount = 0;
 
-// Sparkline helper
+// Sparkline
 class Sparkline {
-  constructor(canvasId, color, maxPoints = 120) {
-    this.canvas = document.getElementById(canvasId);
+  constructor(id, color, max = 120) {
+    this.canvas = document.getElementById(id);
+    if (!this.canvas) return;
     this.ctx = this.canvas.getContext('2d');
     this.color = color;
     this.data = [];
-    this.max = maxPoints;
+    this.max = max;
   }
   push(val) {
+    if (!this.canvas) return;
     this.data.push(val);
     if (this.data.length > this.max) this.data.shift();
     this.draw();
@@ -180,30 +177,24 @@ class Sparkline {
     const c = this.canvas, ctx = this.ctx;
     const dpr = window.devicePixelRatio || 1;
     const w = c.clientWidth, h = c.clientHeight;
+    if (w === 0 || h === 0) return;
     c.width = w * dpr; c.height = h * dpr;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
-
     if (this.data.length < 2) return;
     const max = Math.max(...this.data, 1);
     const step = w / (this.max - 1);
-
-    // Area fill
     ctx.beginPath();
     ctx.moveTo(0, h);
-    for (let i = 0; i < this.data.length; i++) {
-      ctx.lineTo(i * step, h - (this.data[i] / max) * (h - 4));
-    }
+    for (let i = 0; i < this.data.length; i++) ctx.lineTo(i * step, h - (this.data[i] / max) * (h - 4));
     ctx.lineTo((this.data.length - 1) * step, h);
     ctx.closePath();
-    ctx.fillStyle = this.color.replace(')', ',0.1)').replace('rgb', 'rgba');
+    ctx.fillStyle = this.color.replace(')', ',0.08)').replace('rgb', 'rgba');
     ctx.fill();
-
-    // Line
     ctx.beginPath();
     for (let i = 0; i < this.data.length; i++) {
       const x = i * step, y = h - (this.data[i] / max) * (h - 4);
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
     }
     ctx.strokeStyle = this.color;
     ctx.lineWidth = 1.5;
@@ -211,105 +202,23 @@ class Sparkline {
   }
 }
 
-const sTotal = new Sparkline('c-total', 'rgb(0,133,255)');
 const sRate = new Sparkline('c-rate', 'rgb(0,255,136)');
-const sTxRate = new Sparkline('c-txrate', 'rgb(168,85,247)');
-const sInterval = new Sparkline('c-interval', 'rgb(0,133,255)');
 const sVals = new Sparkline('c-vals', 'rgb(255,217,61)');
 const sProps = new Sparkline('c-props', 'rgb(0,133,255)');
 const sTxs = new Sparkline('c-txs', 'rgb(168,85,247)');
 const sFees = new Sparkline('c-fees', 'rgb(255,107,107)');
 
-// Tx type colors for the breakdown
+// Tx type colors
 const txTypeColors = {
   Payment:'#0085FF', OfferCreate:'#f59e0b', OfferCancel:'#ef4444',
   TrustSet:'#a855f7', AccountSet:'#14b8a6', AccountDelete:'#ff6b6b',
   EscrowCreate:'#6366f1', EscrowFinish:'#6366f1', EscrowCancel:'#6366f1',
   NFTokenMint:'#ec4899', NFTokenBurn:'#ec4899', NFTokenCreateOffer:'#ec4899',
   NFTokenAcceptOffer:'#ec4899', CredentialCreate:'#06b6d4', CredentialDelete:'#06b6d4',
-  CredentialAccept:'#06b6d4',
+  CredentialAccept:'#06b6d4', AMMCreate:'#22d3ee', AMMDeposit:'#22d3ee',
+  AMMWithdraw:'#22d3ee', AMMVote:'#22d3ee',
 };
 
-// Engine polling
-async function pollEngine() {
-  try {
-    const r = await fetch('/api/engine');
-    const d = await r.json();
-
-    // Fee burn — use lifetime if available, otherwise session
-    const burned = d.lifetime_burned > 0 ? d.lifetime_burned : d.total_fees_burned;
-    const burnedXrp = burned / 1_000_000;
-    document.getElementById('m-fee-burn').textContent = burnedXrp.toLocaleString(undefined, {maximumFractionDigits: 2});
-    document.getElementById('m-fee-round').textContent = (d.round_fees / 1_000_000).toFixed(6);
-    document.getElementById('m-fee-xrp').textContent = burnedXrp.toLocaleString(undefined, {maximumFractionDigits: 2});
-    sFees.push(d.round_fees);
-
-    // Tx type breakdown
-    const el = document.getElementById('tx-type-bars');
-    const totalRound = d.round_tx_count || 1;
-    let html = '';
-    const sorted = Object.entries(d.round_tx_types || {}).sort((a,b) => b[1] - a[1]);
-    for (const [type, cnt] of sorted) {
-      const pct = (cnt / totalRound * 100).toFixed(0);
-      const color = txTypeColors[type] || '#3a4a6a';
-      html += '<div style="display:flex;align-items:center;gap:8px;margin:3px 0;font-size:11px;">' +
-        '<span style="color:' + color + ';min-width:110px">' + type + '</span>' +
-        '<div style="flex:1;height:8px;background:#0a0a18;border-radius:4px;overflow:hidden">' +
-        '<div style="width:' + pct + '%;height:100%;background:' + color + ';border-radius:4px;min-width:2px;transition:width 0.5s"></div>' +
-        '</div>' +
-        '<span style="color:#4a6a9a;min-width:30px;text-align:right">' + cnt + '</span>' +
-        '</div>';
-    }
-    if (sorted.length === 0) html = '<div style="color:#2a3a5a;font-size:11px">waiting for transactions...</div>';
-    el.innerHTML = html;
-
-    // Engine coverage
-    document.getElementById('m-engine-supported').textContent = d.round_supported;
-    document.getElementById('m-engine-unsupported').textContent = d.round_unsupported;
-    document.getElementById('m-engine-ledgers').textContent = d.ledgers_processed;
-    document.getElementById('m-engine-total-tx').textContent = (d.total_txs + d.round_tx_count).toLocaleString();
-
-    const coverage = d.round_tx_count > 0
-      ? ((d.round_supported / d.round_tx_count) * 100).toFixed(0)
-      : '--';
-    document.getElementById('m-coverage').textContent = coverage + '%';
-    document.getElementById('m-coverage-fill').style.width = coverage + '%';
-    document.getElementById('m-coverage-fill').style.background =
-      parseInt(coverage) >= 100 ? '#00ff88' : parseInt(coverage) >= 80 ? '#ffd93d' : '#ff6b6b';
-  } catch {}
-}
-pollEngine();
-setInterval(pollEngine, 2000);
-
-// Per-second rate tracking
-let secCount = 0, txSecCount = 0, lastTotal = 0;
-let currentSec = Math.floor(Date.now() / 1000);
-
-setInterval(() => {
-  const now = Math.floor(Date.now() / 1000);
-  if (now !== currentSec) {
-    sRate.push(secCount);
-    document.getElementById('m-rate').textContent = secCount;
-    sTxRate.push(txSecCount);
-    document.getElementById('m-txrate').textContent = txSecCount;
-    sTxs.push(txTotal);
-    secCount = 0;
-    txSecCount = 0;
-    currentSec = now;
-  }
-  const totalDelta = total - lastTotal;
-  lastTotal = total;
-  sTotal.push(totalDelta);
-
-  // Uptime
-  const s = Math.floor((Date.now() - startTime) / 1000);
-  const el = document.getElementById('m-uptime');
-  if (s < 60) el.textContent = s + 's';
-  else if (s < 3600) el.textContent = Math.floor(s/60) + 'm ' + (s%60) + 's';
-  else el.textContent = Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
-}, 1000);
-
-// Type bars
 const typeColors = {
   Proposal:'#0085FF', Validation:'#ffd93d', StatusChange:'#ff6b6b',
   Transaction:'#a855f7', Manifests:'#6366f1', ValidatorList:'#6366f1',
@@ -317,78 +226,134 @@ const typeColors = {
   CONNECTED:'#0085FF', GetLedger:'#ef4444', LedgerData:'#14b8a6'
 };
 
+// === Engine poll (50ms) ===
+async function poll() {
+  try {
+    const r = await fetch('/api/engine');
+    const d = await r.json();
+
+    // Stats strip
+    document.getElementById('m-total').textContent = d.total_messages.toLocaleString();
+    document.getElementById('m-vals').textContent = d.round_validations;
+    document.getElementById('m-props').textContent = d.round_proposals;
+    document.getElementById('m-txs').textContent = (d.total_txs + d.round_tx_count).toLocaleString();
+    document.getElementById('m-sig-ok').textContent = d.sig_ok.toLocaleString();
+    document.getElementById('m-sig-fail').textContent = d.sig_fail;
+
+    // Uptime
+    if (d.start_time_ms > 0) {
+      const s = Math.floor((Date.now() - d.start_time_ms) / 1000);
+      const el = document.getElementById('m-uptime');
+      if (s < 60) el.textContent = s + 's';
+      else if (s < 3600) el.textContent = Math.floor(s/60) + 'm ' + (s%60) + 's';
+      else if (s < 86400) el.textContent = Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+      else el.textContent = Math.floor(s/86400) + 'd ' + Math.floor((s%86400)/3600) + 'h';
+    }
+
+    // Fee burn
+    const burned = d.lifetime_burned > 0 ? d.lifetime_burned : d.total_fees_burned;
+    const bx = burned / 1_000_000;
+    document.getElementById('m-fee-burn').textContent = bx.toLocaleString(undefined, {maximumFractionDigits: 2});
+    document.getElementById('m-fee-round').textContent = (d.round_fees / 1_000_000).toFixed(6);
+    document.getElementById('m-fee-xrp').textContent = bx.toLocaleString(undefined, {maximumFractionDigits: 2});
+    sFees.push(d.round_fees);
+
+    // Tx type bars
+    const el = document.getElementById('tx-type-bars');
+    const tr = d.round_tx_count || 1;
+    let html = '';
+    for (const [type, cnt] of Object.entries(d.round_tx_types || {}).sort((a,b) => b[1] - a[1])) {
+      const pct = (cnt / tr * 100).toFixed(0);
+      const c = txTypeColors[type] || '#3a4a6a';
+      html += `<div style="display:flex;align-items:center;gap:6px;margin:2px 0;font-size:10px">
+        <span style="color:${c};min-width:100px">${type}</span>
+        <div style="flex:1;height:6px;background:#0a0a18;border-radius:3px;overflow:hidden">
+          <div style="width:${pct}%;height:100%;background:${c};border-radius:3px;min-width:2px"></div>
+        </div>
+        <span style="color:#4a6a9a;min-width:24px;text-align:right">${cnt}</span>
+      </div>`;
+    }
+    if (!html) html = '<div style="color:#2a3a5a;font-size:10px">waiting...</div>';
+    el.innerHTML = html;
+
+    // Engine coverage
+    document.getElementById('m-engine-supported').textContent = d.round_supported;
+    document.getElementById('m-engine-unsupported').textContent = d.round_unsupported;
+    document.getElementById('m-engine-ledgers').textContent = d.ledgers_processed;
+    document.getElementById('m-engine-total-tx').textContent = (d.total_txs + d.round_tx_count).toLocaleString();
+    const cov = d.round_tx_count > 0 ? ((d.round_supported / d.round_tx_count) * 100).toFixed(0) : '--';
+    document.getElementById('m-coverage').textContent = cov + (cov !== '--' ? '%' : '');
+    document.getElementById('m-coverage-val').textContent = cov + (cov !== '--' ? '%' : '');
+    const covFill = document.getElementById('m-coverage-fill');
+    covFill.style.width = (cov === '--' ? '100' : cov) + '%';
+    covFill.style.background = cov === '--' || parseInt(cov) >= 100 ? '#00ff88' : parseInt(cov) >= 80 ? '#ffd93d' : '#ff6b6b';
+
+    // Sparklines from server
+    sVals.push(d.round_validations);
+    sProps.push(d.round_proposals);
+  } catch {}
+}
+poll();
+setInterval(poll, 50);
+
+// === Per-second rates ===
+let currentSec = Math.floor(Date.now() / 1000);
+setInterval(() => {
+  const now = Math.floor(Date.now() / 1000);
+  if (now !== currentSec) {
+    sRate.push(secCount);
+    document.getElementById('m-rate').textContent = secCount;
+    document.getElementById('m-rate-card').textContent = secCount;
+    document.getElementById('m-txrate').textContent = txSecCount;
+    secCount = 0;
+    txSecCount = 0;
+    currentSec = now;
+  }
+}, 1000);
+
+// === Message type bars ===
 function updateTypeBars() {
   const el = document.getElementById('type-bars');
-  const totalMsgs = Object.values(typeCounts).reduce((a,b) => a+b, 0) || 1;
+  const total = Object.values(typeCounts).reduce((a,b) => a+b, 0) || 1;
   let html = '';
-  const sorted = Object.entries(typeCounts).sort((a,b) => b[1] - a[1]);
-  for (const [type, cnt] of sorted) {
-    const pct = (cnt / totalMsgs * 100).toFixed(1);
-    const color = typeColors[type] || '#333';
-    html += `<div style="display:flex;align-items:center;gap:8px;margin:4px 0;font-size:11px;">
-      <span style="color:#3a4a6a;min-width:100px">${type}</span>
-      <div style="flex:1;height:8px;background:#0a0a18;border-radius:4px;overflow:hidden">
-        <div style="width:${pct}%;height:100%;background:${color};border-radius:4px;transition:width 0.5s"></div>
+  for (const [type, cnt] of Object.entries(typeCounts).sort((a,b) => b[1] - a[1])) {
+    const pct = (cnt / total * 100).toFixed(1);
+    const c = typeColors[type] || '#333';
+    html += `<div style="display:flex;align-items:center;gap:6px;margin:2px 0;font-size:10px">
+      <span style="color:#3a4a6a;min-width:90px">${type}</span>
+      <div style="flex:1;height:6px;background:#0a0a18;border-radius:3px;overflow:hidden">
+        <div style="width:${pct}%;height:100%;background:${c};border-radius:3px"></div>
       </div>
-      <span style="color:#4a6a9a;min-width:50px;text-align:right">${cnt}</span>
+      <span style="color:#4a6a9a;min-width:40px;text-align:right">${cnt}</span>
     </div>`;
   }
   el.innerHTML = html;
 }
 setInterval(updateTypeBars, 2000);
 
+// === SSE for rates ===
 function handleEvent(ev) {
-  total++;
   secCount++;
   typeCounts[ev.msg_type] = (typeCounts[ev.msg_type] || 0) + 1;
-  document.getElementById('m-total').textContent = total.toLocaleString();
-
-  if (ev.msg_type === 'Validation') {
-    roundVals++;
-    document.getElementById('m-vals').textContent = roundVals;
-  }
-  if (ev.msg_type === 'Proposal') {
-    roundProps++;
-    document.getElementById('m-props').textContent = roundProps;
-  }
-  if (ev.msg_type === 'Transaction') {
-    txTotal++;
-    txSecCount++;
-    document.getElementById('m-txs').textContent = txTotal;
-    if (ev.tx_info) {
-      if (ev.tx_info.sig_verified) sigOk++; else sigFail++;
-      document.getElementById('m-sig-ok').textContent = sigOk;
-      document.getElementById('m-sig-fail').textContent = sigFail;
-    }
-  }
-
+  if (ev.msg_type === 'Transaction') txSecCount++;
   if (ev.ledger_seq) {
     ledger = ev.ledger_seq;
     document.getElementById('m-ledger').textContent = ledger.toLocaleString();
     const now = Date.now();
     if (lastLedgerTime) {
-      const interval = (now - lastLedgerTime) / 1000;
-      document.getElementById('m-interval').textContent = interval.toFixed(1);
-      sInterval.push(interval);
+      const iv = (now - lastLedgerTime) / 1000;
+      document.getElementById('m-interval').textContent = iv.toFixed(1) + 's';
     }
     lastLedgerTime = now;
-
-    // Push per-round values then reset
-    sVals.push(roundVals);
-    sProps.push(roundProps);
-    roundVals = 0; roundProps = 0;
   }
 }
 
 const es = new EventSource('/events');
-es.onopen = () => {
-  statusDot.className = 'connected';
-  startTime = Date.now();
-  document.getElementById('m-connected-at').textContent = new Date().toLocaleTimeString();
-};
+es.onopen = () => { statusDot.className = 'connected'; };
 es.onmessage = (e) => { try { handleEvent(JSON.parse(e.data)); } catch {} };
 es.onerror = () => { statusDot.className = 'disconnected'; };
 
+// === Sync poll ===
 async function pollSync() {
   try {
     const r = await fetch('/api/sync-status');
