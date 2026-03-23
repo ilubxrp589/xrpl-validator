@@ -23,6 +23,7 @@ pub mod node;
 pub mod overlay;
 pub mod peer;
 pub mod rpc;
+pub mod validation;
 
 pub use config::{NodeConfig, NodeMode};
 pub use error::NodeError;

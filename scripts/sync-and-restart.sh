@@ -20,7 +20,27 @@ while kill -0 "$SYNC_PID" 2>/dev/null; do
 done
 
 echo ""
-echo "[$(date '+%H:%M:%S')] Sync complete!"
+echo "[$(date '+%H:%M:%S')] Sync process exited."
+
+# Check sled has enough entries before enabling engine
+MIN_ENTRIES=30000000
+SLED_SIZE=$(du -b /mnt/xrpl-data/sync/state.sled/db 2>/dev/null | cut -f1)
+SLED_SIZE=${SLED_SIZE:-0}
+
+# Rough check: sled db file should be >10GB for a complete sync
+MIN_SLED_BYTES=10000000000
+
+if [ "$SLED_SIZE" -lt "$MIN_SLED_BYTES" ]; then
+  echo "[$(date '+%H:%M:%S')] WARNING: Sled DB is only $(( SLED_SIZE / 1048576 ))MB — sync may have crashed before completing."
+  echo "Expected at least $(( MIN_SLED_BYTES / 1073741824 ))GB."
+  echo "NOT restarting engine. Restart sync manually:"
+  echo "  rm -f /mnt/xrpl-data/sync/marker.txt"
+  echo "  nohup ./target/release/sync_ledger >> /mnt/xrpl-data/sync/sync.log 2>&1 &"
+  echo "  nohup bash scripts/sync-and-restart.sh >> /mnt/xrpl-data/sync/restart-monitor.log 2>&1 &"
+  exit 1
+fi
+
+echo "[$(date '+%H:%M:%S')] Sled DB is $(( SLED_SIZE / 1048576 ))MB — looks complete."
 echo "Restarting validator with live engine enabled..."
 
 # Delete the old PM2 process (which has XRPL_NO_ENGINE set)

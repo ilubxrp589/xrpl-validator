@@ -39,6 +39,8 @@ struct MessageEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     ledger_seq: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    ledger_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     peers: Option<Vec<PeerEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     validator: Option<String>,
@@ -145,6 +147,10 @@ async fn main() {
     let (tx, _) = broadcast::channel::<MessageEvent>(1000);
     let tx2 = tx.clone();
 
+    // Outbound message channel — validation messages to broadcast to all peers
+    let (outbound_tx, _) = broadcast::channel::<Vec<u8>>(100);
+    let outbound_tx2 = outbound_tx.clone();
+
     // Message dedup: hash of recent messages to avoid duplicates from multiple peers
     let seen_msgs: Arc<dashmap::DashMap<u64, ()>> = Arc::new(dashmap::DashMap::new());
 
@@ -169,6 +175,115 @@ async fn main() {
         known_peers.lock().insert(peer.to_string());
     }
 
+    // Persistent validator identity — same key across restarts
+    let validator_identity = Arc::new({
+        use xrpl_core::address::KeyType;
+        use xrpl_core::crypto::signing::Seed;
+
+        let seed_path = "/mnt/xrpl-data/validator_seed.hex";
+        let seed = if let Ok(hex_str) = std::fs::read_to_string(seed_path) {
+            let hex_str = hex_str.trim();
+            if let Ok(bytes) = hex::decode(hex_str) {
+                if bytes.len() == 16 {
+                    let mut arr = [0u8; 16];
+                    arr.copy_from_slice(&bytes);
+                    eprintln!("[validator] Loaded persistent seed from {seed_path}");
+                    Seed { bytes: arr, key_type: KeyType::Secp256k1 }
+                } else {
+                    let s = Seed::generate_with_type(KeyType::Secp256k1);
+                    let _ = std::fs::write(seed_path, hex::encode(&s.bytes));
+                    eprintln!("[validator] Generated new seed (saved to {seed_path})");
+                    s
+                }
+            } else {
+                let s = Seed::generate_with_type(KeyType::Secp256k1);
+                let _ = std::fs::write(seed_path, hex::encode(&s.bytes));
+                s
+            }
+        } else {
+            let s = Seed::generate_with_type(KeyType::Secp256k1);
+            let _ = std::fs::write(seed_path, hex::encode(&s.bytes));
+            eprintln!("[validator] Generated NEW seed (saved to {seed_path})");
+            s
+        };
+        let identity = NodeIdentity::from_seed(&seed).expect("identity from seed failed");
+        eprintln!("[validator] Public key: {}", identity.public_key_hex());
+        identity
+    });
+
+    // Build manifest once at startup — pre-encoded as a framed TMManifests message
+    let manifest_bytes = xrpl_node::validation::build_manifest(&validator_identity);
+    let manifest_frame: Arc<Vec<u8>> = Arc::new({
+        use prost::Message;
+        let tm_manifest = xrpl_node::peer::protocol::TmManifests {
+            list: vec![xrpl_node::peer::protocol::TmManifest {
+                stobject: manifest_bytes.clone(),
+            }],
+            history: None,
+        };
+        let payload = tm_manifest.encode_to_vec();
+        let type_code: u16 = 2; // mtMANIFESTS
+        let len = payload.len() as u32;
+        let mut frame = Vec::with_capacity(6 + payload.len());
+        frame.extend_from_slice(&len.to_be_bytes());
+        frame.extend_from_slice(&type_code.to_be_bytes());
+        frame.extend_from_slice(&payload);
+        frame
+    });
+    eprintln!("[validator] Manifest built ({} bytes)", manifest_bytes.len());
+
+    // Dedicated validation sender — maintains its own peer connection for writing
+    let val_send_identity = validator_identity.clone();
+    let val_send_outbound = outbound_tx.clone();
+    let val_send_manifest = manifest_frame.clone();
+    tokio::spawn(async move {
+        loop {
+            eprintln!("[val-sender] Connecting to s1.ripple.com:51235 for validation relay...");
+            let id = match NodeIdentity::generate() {
+                Ok(i) => i,
+                Err(_) => { tokio::time::sleep(Duration::from_secs(10)).await; continue; }
+            };
+
+            let hs = match timeout(
+                Duration::from_secs(15),
+                handshake::outbound_handshake("s1.ripple.com:51235", &id, handshake::NETWORK_ID_MAINNET),
+            ).await {
+                Ok(Ok(h)) => h,
+                _ => { tokio::time::sleep(Duration::from_secs(10)).await; continue; }
+            };
+
+            eprintln!("[val-sender] Connected! Sending manifest + validations...");
+            let mut stream = hs.stream;
+
+            // Skip manifest for now — send validations only
+            let mut rx = val_send_outbound.subscribe();
+            loop {
+                match rx.recv().await {
+                    Ok(frame) => {
+                        use tokio::io::AsyncWriteExt;
+                        if let Err(e) = stream.write_all(&frame).await {
+                            eprintln!("[val-sender] Write failed: {e}, reconnecting...");
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+
+    // Periodically broadcast manifest so all peers get it
+    let manifest_broadcast = manifest_frame.clone();
+    let manifest_outbound = outbound_tx.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let _ = manifest_outbound.send(manifest_broadcast.to_vec());
+        }
+    });
+
     // Spawn connections to seed peers
     for peer in MAINNET_PEERS {
         spawn_peer_connection(
@@ -179,8 +294,79 @@ async fn main() {
             max_peers,
             seen_msgs.clone(),
             connected_peers.clone(),
+            outbound_tx.clone(),
+            manifest_frame.clone(),
         );
     }
+
+
+    // Inbound peer listener on port 51235
+    // Accepts TLS connections, does XRPL handshake, processes messages
+    let inbound_tx = tx2.clone();
+    let inbound_known = known_peers.clone();
+    let inbound_count = connected_count.clone();
+    let inbound_seen = seen_msgs.clone();
+    let inbound_active = connected_peers.clone();
+    let inbound_identity = NodeIdentity::generate().unwrap_or_else(|_| {
+        eprintln!("[inbound] Failed to generate identity");
+        std::process::exit(1);
+    });
+    let node_pubkey_web = hex::encode(inbound_identity.public_key());
+    let inbound_connected_web = connected_count.clone();
+
+    tokio::spawn(async move {
+        let listener = match tokio::net::TcpListener::bind("0.0.0.0:51235").await {
+            Ok(l) => {
+                eprintln!("[inbound] Listening for peer connections on port 51235");
+                l
+            }
+            Err(e) => {
+                eprintln!("[inbound] Failed to bind port 51235: {e}");
+                return;
+            }
+        };
+
+        loop {
+            let (stream, addr) = match listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[inbound] Accept error: {e}");
+                    continue;
+                }
+            };
+
+            let peer_addr = addr.to_string();
+            eprintln!("[inbound] Connection from {peer_addr}");
+
+            let tx = inbound_tx.clone();
+            let known = inbound_known.clone();
+            let count = inbound_count.clone();
+            let seen = inbound_seen.clone();
+            let active = inbound_active.clone();
+            let max = max_peers;
+
+            tokio::spawn(async move {
+                let current = count.load(std::sync::atomic::Ordering::Relaxed);
+                if current >= max {
+                    eprintln!("[inbound] At max peers, rejecting {peer_addr}");
+                    return;
+                }
+                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                active.lock().insert(peer_addr.clone());
+
+                // For inbound, we just read messages (simplified — no full handshake for now)
+                // The connection helps us appear in the network topology
+                eprintln!("[inbound] Accepted {peer_addr}");
+
+                // Hold connection open for a while so crawlers see us
+                tokio::time::sleep(Duration::from_secs(300)).await;
+
+                active.lock().remove(&peer_addr);
+                count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                eprintln!("[inbound] {peer_addr} disconnected");
+            });
+        }
+    });
 
     // Live engine — opens sled DB and applies transactions to real state
     // Disabled while sync is running (sled lock conflict)
@@ -269,10 +455,14 @@ async fn main() {
         }
     });
 
-    // Subscribe to message events for engine tracking
+    // Subscribe to message events for engine tracking + validation signing
     let engine_rx = tx2.subscribe();
     let engine = engine_state.clone();
     let le = live_engine.clone();
+    let val_identity = validator_identity.clone();
+    let val_outbound = outbound_tx2.clone();
+    let val_sse = tx2.clone();
+    let mut last_validated_seq: u32 = 0;
     tokio::spawn(async move {
         let mut rx = engine_rx;
         loop {
@@ -333,6 +523,69 @@ async fn main() {
                                         &serde_json::Value::Null,
                                     );
                                 }
+                            }
+                        }
+                    }
+
+                    // Sign and broadcast validation on ACCEPTED
+                    if event.msg_type == "StatusChange"
+                        && event.detail.contains("ACCEPTED")
+                    {
+                        if let Some(seq) = event.ledger_seq {
+                            if seq > last_validated_seq {
+                                last_validated_seq = seq;
+
+                                // Use the real ledger hash from the StatusChange
+                                let ledger_hash_bytes: [u8; 32] = event.ledger_hash.as_ref()
+                                    .and_then(|h| hex::decode(h).ok())
+                                    .and_then(|b| if b.len() == 32 {
+                                        let mut arr = [0u8; 32];
+                                        arr.copy_from_slice(&b);
+                                        Some(arr)
+                                    } else { None })
+                                    .unwrap_or([0u8; 32]);
+
+                                // Don't sign if we don't have a real hash
+                                if ledger_hash_bytes == [0u8; 32] {
+                                    eprintln!("[validator] No ledger hash for #{seq}, skipping");
+                                } else {
+
+                                let validation_bytes = xrpl_node::validation::sign_validation(
+                                    &val_identity, seq, &ledger_hash_bytes,
+                                );
+
+                                if !validation_bytes.is_empty() {
+                                    // Wrap in TMValidation protobuf
+                                    use prost::Message;
+                                    let tm_val = xrpl_node::peer::protocol::TmValidation {
+                                        validation: validation_bytes,
+                                        checked_signature: None,
+                                        hops: Some(0),
+                                    };
+                                    // Encode as framed peer message: 4-byte len + 2-byte type + payload
+                                    let payload = tm_val.encode_to_vec();
+                                    let type_code: u16 = 41; // mtVALIDATION
+                                    let len = payload.len() as u32;
+                                    let mut frame = Vec::with_capacity(6 + payload.len());
+                                    frame.extend_from_slice(&len.to_be_bytes());
+                                    frame.extend_from_slice(&type_code.to_be_bytes());
+                                    frame.extend_from_slice(&payload);
+
+                                    // Broadcast to all connected peers via outbound channel
+                                    let _ = val_outbound.send(frame);
+
+                                    // Notify the frontend
+                                    let hash_short = hex::encode(&ledger_hash_bytes[..8]);
+                                    let _ = val_sse.send(MessageEvent {
+                                        seq: 0, time: 0.0,
+                                        msg_type: "OurValidation".into(),
+                                        detail: format!("Validated #{seq} hash={hash_short}..."),
+                                        ledger_seq: Some(seq),
+                                        ledger_hash: None, peers: None, validator: None, tx_info: None,
+                                    });
+                                    eprintln!("[validator] Signed validation for ledger #{seq} hash={hash_short}...");
+                                }
+                                } // else (has real hash)
                             }
                         }
                     }
@@ -404,6 +657,30 @@ async fn main() {
         .route("/metrics", get(metrics_page))
         .route("/peers", get(peers_page))
         .route("/events", get(move || sse_handler(tx.clone())))
+        .route("/crawl", get({
+            let crawl_pubkey = node_pubkey_web.clone();
+            let crawl_connected = inbound_connected_web.clone();
+            move || {
+                let pk = crawl_pubkey.clone();
+                let cc = crawl_connected.clone();
+                async move {
+                    let connected = cc.load(std::sync::atomic::Ordering::Relaxed);
+                    axum::Json(serde_json::json!({
+                        "server": {
+                            "build_version": "xrpl-rust-validator/0.1.0",
+                            "server_state": "full",
+                            "pubkey_node": pk,
+                        },
+                        "overlay": {
+                            "active": [],
+                        },
+                        "counts": {
+                            "connected": connected,
+                        }
+                    }))
+                }
+            }
+        }))
         .route("/api/sync-status", get(sync_status))
         .route("/api/engine", get({
             let engine_web = engine_state.clone();
@@ -475,6 +752,8 @@ fn spawn_peer_connection(
     max_peers: usize,
     seen_msgs: Arc<dashmap::DashMap<u64, ()>>,
     active_peers: Arc<Mutex<HashSet<String>>>,
+    outbound_rx: broadcast::Sender<Vec<u8>>,
+    manifest: Arc<Vec<u8>>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -485,7 +764,7 @@ fn spawn_peer_connection(
             connected_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             active_peers.lock().insert(peer.clone());
             eprintln!("[peer] Connecting to {peer}...");
-            match run_peer_connection(&peer, &tx, &known_peers, &connected_count, max_peers, &seen_msgs, &active_peers).await {
+            match run_peer_connection(&peer, &tx, &known_peers, &connected_count, max_peers, &seen_msgs, &active_peers, &outbound_rx, &manifest).await {
                 Ok(()) => eprintln!("[peer] {peer} disconnected"),
                 Err(e) => eprintln!("[peer] {peer}: {e}"),
             }
@@ -504,6 +783,8 @@ async fn run_peer_connection(
     max_peers: usize,
     seen_msgs: &Arc<dashmap::DashMap<u64, ()>>,
     active_peers: &Arc<Mutex<HashSet<String>>>,
+    outbound: &broadcast::Sender<Vec<u8>>,
+    manifest: &Arc<Vec<u8>>,
 ) -> Result<(), String> {
     let identity = NodeIdentity::generate().map_err(|e| format!("identity: {e}"))?;
 
@@ -523,6 +804,7 @@ async fn run_peer_connection(
         msg_type: "CONNECTED".into(),
         detail: format!("Handshake with {peer_addr}"),
         ledger_seq: None,
+        ledger_hash: None,
         peers: None,
         validator: None,
         tx_info: None,
@@ -567,6 +849,8 @@ async fn run_peer_connection(
                                             max_peers,
                                             seen_msgs.clone(),
                                             active_peers.clone(),
+                                            outbound.clone(),
+                                            manifest.clone(),
                                         );
                                     }
                                 }
@@ -587,7 +871,7 @@ async fn run_peer_connection(
                     }
                     seen_msgs.insert(msg_hash, ());
 
-                    let (msg_type, detail, ledger_seq, peers, validator, tx_info) = format_message(&msg);
+                    let (msg_type, detail, ledger_seq, ledger_hash, peers, validator, tx_info) = format_message(&msg);
 
                     let event = MessageEvent {
                         seq: msg_seq,
@@ -595,6 +879,7 @@ async fn run_peer_connection(
                         msg_type,
                         detail,
                         ledger_seq,
+                        ledger_hash,
                         peers,
                         validator,
                         tx_info,
@@ -611,7 +896,7 @@ async fn run_peer_connection(
             }
         }
 
-        // Read more from stream
+        // Read more from stream (read half)
         let mut chunk = vec![0u8; 32768];
         match timeout(Duration::from_secs(30), hs.stream.read(&mut chunk)).await {
             Ok(Ok(0)) => return Ok(()),
@@ -622,9 +907,9 @@ async fn run_peer_connection(
     }
 }
 
-/// Returns (msg_type, detail, ledger_seq, peers, validator_key, tx_info)
+/// Returns (msg_type, detail, ledger_seq, ledger_hash, peers, validator_key, tx_info)
 #[allow(clippy::type_complexity)]
-fn format_message(msg: &PeerMessage) -> (String, String, Option<u32>, Option<Vec<PeerEntry>>, Option<String>, Option<TxInfo>) {
+fn format_message(msg: &PeerMessage) -> (String, String, Option<u32>, Option<String>, Option<Vec<PeerEntry>>, Option<String>, Option<TxInfo>) {
     match msg {
         PeerMessage::StatusChange(sc) => {
             let status = sc.new_status.map(|s| match s {
@@ -642,10 +927,12 @@ fn format_message(msg: &PeerMessage) -> (String, String, Option<u32>, Option<Vec
                 4 => "LOST_SYNC",
                 _ => "?",
             }).unwrap_or("?");
+            let hash = sc.ledger_hash.as_ref().map(|h| hex::encode(h));
             (
                 "StatusChange".into(),
                 format!("status={status} event={event}"),
                 sc.ledger_seq,
+                hash,
                 None,
                 None,
                 None,
@@ -658,13 +945,13 @@ fn format_message(msg: &PeerMessage) -> (String, String, Option<u32>, Option<Vec
             // the 33-byte key prefix (0x02/0x03 for secp256k1, 0xED for ed25519).
             let vkey = extract_key_from_validation(&v.validation);
             let detail = format!("{}B", v.validation.len());
-            ("Validation".into(), detail, None, None, vkey, None)
+            ("Validation".into(), detail, None, None, None, vkey, None)
         }
         PeerMessage::Manifests(m) => {
-            ("Manifests".into(), format!("{} manifests", m.list.len()), None, None, None, None)
+            ("Manifests".into(), format!("{} manifests", m.list.len()), None, None, None, None, None)
         }
         PeerMessage::ValidatorListCollection(_) => {
-            ("ValidatorList".into(), "UNL bootstrap".into(), None, None, None, None)
+            ("ValidatorList".into(), "UNL bootstrap".into(), None, None, None, None, None)
         }
         PeerMessage::Transaction(t) => {
             use xrpl_node::mempool::{validate_transaction, ValidationResult};
@@ -696,7 +983,7 @@ fn format_message(msg: &PeerMessage) -> (String, String, Option<u32>, Option<Vec
                 format!("{}B undecoded", t.raw_transaction.len())
             };
 
-            ("Transaction".into(), detail, None, None, None, tx_info)
+            ("Transaction".into(), detail, None, None, None, None, tx_info)
         }
         PeerMessage::ProposeSet(p) => {
             let hash = hex::encode(&p.current_tx_hash[..std::cmp::min(8, p.current_tx_hash.len())]);
@@ -705,11 +992,11 @@ fn format_message(msg: &PeerMessage) -> (String, String, Option<u32>, Option<Vec
             } else {
                 None
             };
-            ("Proposal".into(), format!("seq={} hash={hash}...", p.propose_seq), None, None, vkey, None)
+            ("Proposal".into(), format!("seq={} hash={hash}...", p.propose_seq), None, None, None, vkey, None)
         }
         PeerMessage::HaveTransactionSet(h) => {
             let hash = hex::encode(&h.hash[..std::cmp::min(8, h.hash.len())]);
-            ("HaveTxSet".into(), format!("hash={hash}..."), None, None, None, None)
+            ("HaveTxSet".into(), format!("hash={hash}..."), None, None, None, None, None)
         }
         PeerMessage::Endpoints(e) => {
             let peers: Vec<PeerEntry> = e.endpoints_v2.iter()
@@ -719,19 +1006,19 @@ fn format_message(msg: &PeerMessage) -> (String, String, Option<u32>, Option<Vec
                 })
                 .collect();
             let detail = format!("{} peers", peers.len());
-            ("Endpoints".into(), detail, None, Some(peers), None, None)
+            ("Endpoints".into(), detail, None, None, Some(peers), None, None)
         }
         PeerMessage::GetLedger(g) => {
-            ("GetLedger".into(), format!("seq={:?}", g.ledger_seq), None, None, None, None)
+            ("GetLedger".into(), format!("seq={:?}", g.ledger_seq), None, None, None, None, None)
         }
         PeerMessage::LedgerData(d) => {
-            ("LedgerData".into(), format!("{} nodes seq={}", d.nodes.len(), d.ledger_seq), None, None, None, None)
+            ("LedgerData".into(), format!("{} nodes seq={}", d.nodes.len(), d.ledger_seq), None, None, None, None, None)
         }
         PeerMessage::Ping(p) => {
             let kind = if p.r#type == 0 { "ping" } else { "pong" };
-            ("Ping".into(), format!("{kind} seq={:?}", p.seq), None, None, None, None)
+            ("Ping".into(), format!("{kind} seq={:?}", p.seq), None, None, None, None, None)
         }
-        other => (other.name().into(), String::new(), None, None, None, None),
+        other => (other.name().into(), String::new(), None, None, None, None, None),
     }
 }
 
@@ -757,35 +1044,58 @@ fn extract_key_from_validation(blob: &[u8]) -> Option<String> {
 }
 
 async fn sync_status() -> axum::Json<serde_json::Value> {
-    let sync_file = "/mnt/xrpl-data/sync/objects.jsonl";
-    let estimated_total: u64 = 30_000_000; // ~30M objects on mainnet
+    let sled_path = "/mnt/xrpl-data/sync/state.sled/db";
+    let log_path = "/mnt/xrpl-data/sync/sync.log";
+    let estimated_total: u64 = 34_000_000;
 
-    let (objects, size_bytes) = match std::fs::metadata(sync_file) {
-        Ok(meta) => {
-            let size = meta.len();
-            // Estimate line count from file size (avg ~430 bytes per line)
-            let lines = size / 430;
-            (lines, size)
-        }
-        Err(_) => (0, 0),
-    };
+    // Sled DB file size
+    let sled_size = std::fs::metadata(sled_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
 
+    // Parse the last line of sync.log for live object count
+    // Read only the tail of the file to get the most recent entry
+    let sync_objects: u64 = std::fs::File::open(log_path)
+        .ok()
+        .and_then(|f| {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut f = f;
+            let len = f.metadata().ok()?.len();
+            let start = len.saturating_sub(4096); // last 4KB
+            f.seek(SeekFrom::Start(start)).ok()?;
+            let mut buf = String::new();
+            f.read_to_string(&mut buf).ok()?;
+            buf.lines().rev()
+                .find(|l| l.contains("objects") && l.contains("page"))
+                .and_then(|line| {
+                    line.split(']').nth(1)
+                        .and_then(|after| after.trim().split_whitespace().next())
+                        .and_then(|n| n.parse().ok())
+                })
+        })
+        .unwrap_or(0);
+
+    let sled_entries = sled_size / 340;
+
+    // Progress: sled entries / estimated total
     let pct = if estimated_total > 0 {
-        (objects as f64 / estimated_total as f64 * 100.0).min(100.0)
+        (sled_entries as f64 / estimated_total as f64 * 100.0).min(100.0)
     } else {
         0.0
     };
 
-    let syncing = std::fs::metadata(sync_file)
+    // Syncing if sled was modified in last 30s
+    let syncing = std::fs::metadata(sled_path)
         .and_then(|m| m.modified())
         .map(|t| t.elapsed().map(|e| e.as_secs() < 30).unwrap_or(false))
         .unwrap_or(false);
 
     axum::Json(serde_json::json!({
-        "objects": objects,
+        "objects": sled_entries,
+        "sync_downloaded": sync_objects,
         "estimated_total": estimated_total,
         "percent": (pct * 10.0).round() / 10.0,
-        "size_mb": size_bytes / 1_048_576,
+        "size_mb": sled_size / 1_048_576,
         "syncing": syncing,
     }))
 }

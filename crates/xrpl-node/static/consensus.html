@@ -34,6 +34,7 @@
   .ph-accepted { color: #00ff88; }
   #ledger { font-family: 'Orbitron', sans-serif; font-size: 28px; font-weight: 900; color: #0085FF; transition: all 0.3s; margin-top: 2px; }
   #ledger.flash { color: #00ff88; }
+  #our-val { display: inline-block; font-family: 'Orbitron', sans-serif; font-size: 9px; font-weight: 700; color: #00ff88; letter-spacing: 2px; opacity: 0; transition: opacity 0.3s; margin-left: 12px; }
   #stats { display: flex; gap: 16px; font-size: 10px; color: #3a4a6a; margin-top: 4px; justify-content: center; }
   #stats .n { color: #6a8abb; font-weight: 700; }
 
@@ -73,6 +74,12 @@
     <span><span class="ldot" style="background:#0085FF"></span>Propose</span>
     <span><span class="ldot" style="background:#ffd93d"></span>Validate</span>
     <span><span class="ldot" style="background:#00ff88"></span>Consensus</span>
+    <span style="margin-left:12px;border-left:1px solid #1a1a30;padding-left:12px"><span class="ldot" style="background:#0085FF"></span>Payment</span>
+    <span><span class="ldot" style="background:#f59e0b"></span>OfferCreate</span>
+    <span><span class="ldot" style="background:#ef4444"></span>OfferCancel</span>
+    <span><span class="ldot" style="background:#a855f7"></span>TrustSet</span>
+    <span><span class="ldot" style="background:#14b8a6"></span>AccountSet</span>
+    <span id="our-val">VALIDATED</span>
   </div>
   <div id="footer-text">Rust + tokio + OpenSSL + prost + axum</div>
 </div>
@@ -103,7 +110,7 @@ const sVal = document.getElementById('s-val');
 const sSeen = document.getElementById('s-seen');
 const sInt = document.getElementById('s-int');
 
-let roundProps = 0, roundVals = 0, phase = 'open', lastLedgerTime = null;
+let roundProps = 0, roundVals = 0, phase = 'open', lastLedgerTime = null, lastLedgerSeq = null;
 let tabHidden = false;
 
 document.addEventListener('visibilitychange', () => {
@@ -153,7 +160,7 @@ function getNode(key) {
   const short = key.slice(0, 10);
   if (!nodes.has(short)) {
     nodes.set(short, {
-      x: W/2, y: H/2, targetX: 0, targetY: 0,
+      x: W/2, y: H/2, z: 0, targetX: 0, targetY: 0, targetZ: 0,
       state: 'idle', fireTime: 0,
       connections: [],
     });
@@ -173,17 +180,19 @@ function layoutNodes() {
   // Spread nodes across the screen in an organic mesh
   // Use a combination of circle + noise for brain-like placement
   const cx = W / 2, cy = H / 2;
-  const rx = (W - margin * 2) * 0.42;
-  const ry = (H - margin * 2) * 0.35;
+  const rx = (W - margin * 2) * 0.45;
+  const ry = (H - margin * 2) * 0.40;
 
   for (let i = 0; i < keys.length; i++) {
     const node = nodes.get(keys[i]);
     const angle = (i / total) * Math.PI * 2;
-    const layer = 0.5 + (i % 3) * 0.25; // vary distance from center
-    const jitterX = Math.sin(i * 13.7) * 40;
-    const jitterY = Math.cos(i * 17.3) * 30;
+    const layer = 0.5 + (i % 3) * 0.25;
+    const jitterX = Math.sin(i * 13.7) * 35;
+    const jitterY = Math.cos(i * 17.3) * 25;
     node.targetX = cx + Math.cos(angle) * rx * layer + jitterX;
     node.targetY = cy + Math.sin(angle) * ry * layer + jitterY;
+    // Z depth: -1 (far) to +1 (close), spread across full range
+    node.targetZ = Math.sin(i * 7.3) * 0.6 + Math.cos(i * 3.1) * 0.4;
   }
 }
 
@@ -254,6 +263,7 @@ function resetNodes() {
   for (const [, node] of nodes) {
     node.targetX += (Math.random() - 0.5) * 15;
     node.targetY += (Math.random() - 0.5) * 10;
+    node.targetZ += (Math.random() - 0.5) * 0.2;
   }
 }
 
@@ -263,12 +273,19 @@ function render(dt) {
   time += dt;
   ctx.clearRect(0, 0, W, H);
 
-  // Move nodes toward targets (smooth drift)
+  // Move nodes toward targets (smooth drift) including z
   for (const [, node] of nodes) {
     node.x += (node.targetX - node.x) * 0.03;
     node.y += (node.targetY - node.y) * 0.03;
+    node.z += (node.targetZ - node.z) * 0.03;
     if (node.fireTime > 0) node.fireTime -= dt * 1.5;
   }
+
+  // Z-depth scale helper: z ranges -1 to +1, returns scale factor
+  // +1 (close) = 1.6x, 0 (mid) = 1.0x, -1 (far) = 0.5x
+  // z: -1 (far) to +1 (close). Far = tiny + dim, close = big + bright
+  function zScale(z) { return 0.3 + (z + 1) * 0.7; }  // 0.3x far → 1.7x close
+  function zAlpha(z) { return 0.35 + (z + 1) * 0.325; } // 0.35 far → 1.0 close
 
   // Draw connections (dim lines)
   for (const [key, node] of nodes) {
@@ -283,10 +300,12 @@ function render(dt) {
       ctx.beginPath();
       ctx.moveTo(node.x, node.y);
       ctx.lineTo(other.x, other.y);
+      const avgZ = (node.z + other.z) / 2;
+      const lineAlpha = alpha * zAlpha(avgZ);
       ctx.strokeStyle = brightness > 0.5
-        ? `rgba(${node.state === 'agreed' ? '0,255,136' : node.state === 'validated' ? '255,217,61' : '0,133,255'},${alpha})`
-        : `rgba(30,40,70,${alpha})`;
-      ctx.lineWidth = 0.5 + brightness * 1;
+        ? `rgba(${node.state === 'agreed' ? '0,255,136' : node.state === 'validated' ? '255,217,61' : '0,133,255'},${lineAlpha})`
+        : `rgba(30,40,70,${lineAlpha})`;
+      ctx.lineWidth = (0.5 + brightness * 1) * zScale(avgZ);
       ctx.stroke();
     }
   }
@@ -312,9 +331,12 @@ function render(dt) {
     const py = from.y + (to.y - from.y) * p.progress;
     const alpha = 1 - Math.abs(p.progress - 0.5) * 1.5; // fade at ends
 
+    const pz = from.z + (to.z - from.z) * p.progress;
+    const ps = zScale(pz);
+
     ctx.beginPath();
-    ctx.arc(px, py, 2.5, 0, Math.PI * 2);
-    ctx.fillStyle = `rgba(${p.r},${p.g},${p.b},${Math.max(0, alpha) * 0.9})`;
+    ctx.arc(px, py, 3.5 * ps, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(${p.r},${p.g},${p.b},${Math.max(0, alpha) * 0.9 * zAlpha(pz)})`;
     ctx.fill();
 
     // Trail
@@ -323,43 +345,42 @@ function render(dt) {
     ctx.beginPath();
     ctx.moveTo(px, py);
     ctx.lineTo(tx, ty);
-    ctx.strokeStyle = `rgba(${p.r},${p.g},${p.b},${Math.max(0, alpha) * 0.4})`;
-    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = `rgba(${p.r},${p.g},${p.b},${Math.max(0, alpha) * 0.4 * zAlpha(pz)})`;
+    ctx.lineWidth = 2 * ps;
     ctx.stroke();
   }
 
-  // Draw nodes
-  for (const [key, node] of nodes) {
+  // Sort nodes by z for proper depth ordering (far first, close on top)
+  const sortedNodes = [...nodes.entries()].sort((a, b) => a[1].z - b[1].z);
+
+  // Draw nodes with 3D depth
+  for (const [key, node] of sortedNodes) {
     const fire = Math.max(0, node.fireTime);
-    let r, g, b, size, alpha;
+    const s = zScale(node.z);
+    const za = zAlpha(node.z);
+    let r, g, b, baseSize, alpha;
 
     if (node.state === 'agreed' || fire > 0.8) {
       const c = node.state === 'agreed' ? [0,255,136] : node.state === 'validated' ? [255,217,61] : [0,133,255];
       r = c[0]; g = c[1]; b = c[2];
-      size = 3 + fire * 2;
-      alpha = 0.5 + fire * 0.5;
+      baseSize = 6 + fire * 3;
+      alpha = (0.85 + fire * 0.15) * za;
     } else if (node.state === 'validated') {
-      r = 255; g = 217; b = 61; size = 3; alpha = 0.7;
+      r = 255; g = 217; b = 61; baseSize = 5.5; alpha = 0.9 * za;
     } else if (node.state === 'proposed') {
-      r = 0; g = 133; b = 255; size = 2.5; alpha = 0.6;
+      r = 0; g = 133; b = 255; baseSize = 5; alpha = 0.85 * za;
     } else {
-      r = 40; g = 50; b = 80; size = 1.5;
-      alpha = 0.25 + Math.sin(time * 2 + node.x * 0.01) * 0.1;
+      r = 40; g = 50; b = 80; baseSize = 3;
+      alpha = (0.5 + Math.sin(time * 2 + node.x * 0.01) * 0.1) * za;
     }
 
-    // Node dot
+    const size = baseSize * s;
+
+    // Node orb
     ctx.beginPath();
     ctx.arc(node.x, node.y, size, 0, Math.PI * 2);
     ctx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
     ctx.fill();
-
-    // Fire halo
-    if (fire > 0.2) {
-      ctx.beginPath();
-      ctx.arc(node.x, node.y, size + fire * 8, 0, Math.PI * 2);
-      ctx.fillStyle = `rgba(${r},${g},${b},${fire * 0.08})`;
-      ctx.fill();
-    }
   }
 }
 
@@ -393,6 +414,10 @@ const txTypeColor = {
   AccountSet: [20, 184, 166],   // teal
   AccountDelete: [255, 60, 60], // bright red
 };
+
+// Our validation flash
+const ourVal = document.getElementById('our-val');
+let ourValTimer = null;
 
 // Track fees per round for the flash
 let roundFees = 0;
@@ -435,8 +460,20 @@ function handleEvent(ev) {
       roundFees += ev.tx_info.fee || 0;
     }
   }
+  else if (ev.msg_type === 'OurValidation') {
+    // Our node signed a validation — bright center flash
+    if (!tabHidden) {
+      // Fire ALL nodes bright green simultaneously
+      for (const [k] of nodes) {
+        fireNode(k, [0, 255, 180]);
+      }
+    }
+    ourVal.style.opacity = '1';
+    if (ourValTimer) clearTimeout(ourValTimer);
+    ourValTimer = setTimeout(() => { ourVal.style.opacity = '0'; }, 1500);
+  }
   else if (ev.msg_type === 'StatusChange') {
-    if (ev.detail && ev.detail.includes('ACCEPTED')) {
+    if (ev.detail && ev.detail.includes('ACCEPTED') && phase !== 'accepted') {
       phase = 'accepted'; phaseEl.className = 'ph-accepted'; phaseEl.textContent = 'CONSENSUS';
       if (!tabHidden) cascadeAll([0, 255, 136]);
 
@@ -452,12 +489,14 @@ function handleEvent(ev) {
 
       if (propsResetTimer) clearTimeout(propsResetTimer);
       propsResetTimer = setTimeout(() => { if (phase === 'accepted') { roundProps = 0; sProp.textContent = '0'; } }, 2000);
-    } else if (ev.detail && ev.detail.includes('CLOSING')) {
-      phaseEl.className = 'ph-propose'; phaseEl.textContent = 'CLOSING';
+    } else if (ev.detail && ev.detail.includes('CLOSING') && phase !== 'closing') {
+      phase = 'closing'; phaseEl.className = 'ph-propose'; phaseEl.textContent = 'CLOSING';
     }
   }
 
-  if (ev.ledger_seq) {
+  // Only update ledger number if it actually changed
+  if (ev.ledger_seq && ev.ledger_seq !== lastLedgerSeq) {
+    lastLedgerSeq = ev.ledger_seq;
     const now = Date.now();
     if (lastLedgerTime) sInt.textContent = ((now - lastLedgerTime) / 1000).toFixed(1);
     lastLedgerTime = now;
