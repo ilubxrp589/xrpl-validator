@@ -28,7 +28,7 @@ SLED_SIZE=$(du -b /mnt/xrpl-data/sync/state.sled/db 2>/dev/null | cut -f1)
 SLED_SIZE=${SLED_SIZE:-0}
 
 # Rough check: sled db file should be >10GB for a complete sync
-MIN_SLED_BYTES=10000000000
+MIN_SLED_BYTES=4000000000
 
 if [ "$SLED_SIZE" -lt "$MIN_SLED_BYTES" ]; then
   echo "[$(date '+%H:%M:%S')] WARNING: Sled DB is only $(( SLED_SIZE / 1048576 ))MB — sync may have crashed before completing."

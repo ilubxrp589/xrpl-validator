@@ -146,6 +146,7 @@
   <div class="st">tx/s<span class="v p" id="tx-rate">0</span></div>
   <div class="st">burned<span class="v r" id="fee-burn">0</span></div>
   <div class="st">engine<span class="v g" id="engine-cov">--</span></div>
+  <div class="st">hit rate<span class="v g" id="engine-hit">--</span></div>
 </div>
 
 <div id="dash">
@@ -371,6 +372,12 @@ async function pollEngine() {
     document.getElementById('fee-burn').textContent = (burned / 1_000_000).toLocaleString(undefined, {maximumFractionDigits: 2});
     const cov = d.round_tx_count > 0 ? Math.round((d.round_supported / d.round_tx_count) * 100) + '%' : '100%';
     document.getElementById('engine-cov').textContent = cov;
+    if (d.live_engine && d.live_engine.active) {
+      const la = d.live_engine.total_applied;
+      const lf = d.live_engine.round_failed;
+      const lt = la + lf;
+      document.getElementById('engine-hit').textContent = lt > 0 ? ((la/lt)*100).toFixed(1)+'%' : '100%';
+    }
   } catch {}
 }
 pollEngine(); setInterval(pollEngine, 2000);

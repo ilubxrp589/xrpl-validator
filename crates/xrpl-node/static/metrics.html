@@ -140,6 +140,15 @@
   </div>
 
   <div class="card">
+    <div class="card-title">Live Engine</div>
+    <div class="card-value green" id="m-engine-hit">--</div>
+    <div class="card-sub">
+      <span id="m-engine-applied">0</span> txs applied |
+      <span id="m-engine-entries">0</span> state objects
+    </div>
+  </div>
+
+  <div class="card">
     <div class="card-title">Ledger State Sync</div>
     <div class="card-value" id="m-sync-pct" style="font-size:22px;">--</div>
     <div class="card-sub"><span id="m-sync-objects">0</span> objects (<span id="m-sync-size">0</span>MB) — <span id="m-sync-status" style="color:#3a4a6a">checking...</span></div>
@@ -276,6 +285,18 @@ async function poll() {
     if (!html) html = '<div style="color:#2a3a5a;font-size:10px">waiting...</div>';
     el.innerHTML = html;
 
+    // Live engine hit rate
+    if (d.live_engine && d.live_engine.active) {
+      const la = d.live_engine.total_applied;
+      const lf = d.live_engine.round_failed;
+      const lt = la + lf;
+      const hr = lt > 0 ? ((la / lt) * 100).toFixed(1) : '100.0';
+      document.getElementById('m-engine-hit').textContent = hr + '%';
+      document.getElementById('m-engine-applied').textContent = la.toLocaleString();
+      document.getElementById('m-engine-entries').textContent = d.live_engine.sled_entries.toLocaleString();
+      window._lastEngineEntries = d.live_engine.sled_entries;
+    }
+
     // Engine coverage
     document.getElementById('m-engine-supported').textContent = d.round_supported;
     document.getElementById('m-engine-unsupported').textContent = d.round_unsupported;
@@ -359,7 +380,9 @@ async function pollSync() {
     const r = await fetch('/api/sync-status');
     const d = await r.json();
     document.getElementById('m-sync-pct').textContent = d.percent + '%';
-    document.getElementById('m-sync-objects').textContent = d.objects.toLocaleString();
+    // Use live engine entry count if available (more accurate than file size estimate)
+    const engineEntries = window._lastEngineEntries || d.objects;
+    document.getElementById('m-sync-objects').textContent = engineEntries.toLocaleString();
     document.getElementById('m-sync-size').textContent = d.size_mb.toLocaleString();
     document.getElementById('m-sync-fill').style.width = d.percent + '%';
     const s = document.getElementById('m-sync-status');

@@ -47,8 +47,9 @@ async-stream = { workspace = true }
 clap = { workspace = true }
 toml = { workspace = true }
 anyhow = { workspace = true }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"] }
 sled = "0.34"
+rocksdb = { version = "0.22", default-features = false }
 
 [build-dependencies]
 prost-build = "0.13"

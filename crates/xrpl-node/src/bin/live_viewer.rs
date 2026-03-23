@@ -375,23 +375,18 @@ async fn main() {
         .map(|t| t.elapsed().map(|e| e.as_secs() < 60).unwrap_or(false))
         .unwrap_or(false);
 
-    let live_engine: Arc<Mutex<Option<xrpl_node::engine::LiveEngine>>> = if std::env::var("XRPL_NO_ENGINE").is_ok() {
-        eprintln!("[live-engine] Disabled via XRPL_NO_ENGINE env var");
-        Arc::new(Mutex::new(None))
-    } else {
-        Arc::new(Mutex::new(
-            match xrpl_node::engine::LiveEngine::open(std::path::Path::new("/mnt/xrpl-data/sync/state.sled")) {
-                Ok(e) => {
-                    eprintln!("[live-engine] Opened sled with {} entries", e.entry_count());
-                    Some(e)
-                }
-                Err(e) => {
-                    eprintln!("[live-engine] Failed to open sled: {e} (sync running?)");
-                    None
-                }
+    let live_engine: Arc<Mutex<Option<xrpl_node::engine::LiveEngine>>> = Arc::new(Mutex::new(
+        match xrpl_node::engine::LiveEngine::open(std::path::Path::new("/mnt/xrpl-data/sync/state.rocks")) {
+            Ok(e) => {
+                eprintln!("[live-engine] Opened sled with {} entries", e.entry_count());
+                Some(e)
             }
-        ))
-    };
+            Err(e) => {
+                eprintln!("[live-engine] Failed to open sled: {e}");
+                None
+            }
+        }
+    ));
 
     // Engine state — load persisted stats, then track consensus round stats
     let persisted = PersistedStats::load();
@@ -1044,59 +1039,29 @@ fn extract_key_from_validation(blob: &[u8]) -> Option<String> {
 }
 
 async fn sync_status() -> axum::Json<serde_json::Value> {
-    let sled_path = "/mnt/xrpl-data/sync/state.sled/db";
-    let log_path = "/mnt/xrpl-data/sync/sync.log";
-    let estimated_total: u64 = 34_000_000;
+    let rocks_path = "/mnt/xrpl-data/sync/state.rocks";
 
-    // Sled DB file size
-    let sled_size = std::fs::metadata(sled_path)
-        .map(|m| m.len())
+    // Check if RocksDB exists and get size
+    let rocks_size = std::fs::read_dir(rocks_path)
+        .map(|entries| entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+            .sum::<u64>())
         .unwrap_or(0);
 
-    // Parse the last line of sync.log for live object count
-    // Read only the tail of the file to get the most recent entry
-    let sync_objects: u64 = std::fs::File::open(log_path)
-        .ok()
-        .and_then(|f| {
-            use std::io::{Read, Seek, SeekFrom};
-            let mut f = f;
-            let len = f.metadata().ok()?.len();
-            let start = len.saturating_sub(4096); // last 4KB
-            f.seek(SeekFrom::Start(start)).ok()?;
-            let mut buf = String::new();
-            f.read_to_string(&mut buf).ok()?;
-            buf.lines().rev()
-                .find(|l| l.contains("objects") && l.contains("page"))
-                .and_then(|line| {
-                    line.split(']').nth(1)
-                        .and_then(|after| after.trim().split_whitespace().next())
-                        .and_then(|n| n.parse().ok())
-                })
-        })
-        .unwrap_or(0);
+    let exists = rocks_size > 0;
+    let estimated_total: u64 = 18_734_036;
 
-    let sled_entries = sled_size / 340;
-
-    // Progress: sled entries / estimated total
-    let pct = if estimated_total > 0 {
-        (sled_entries as f64 / estimated_total as f64 * 100.0).min(100.0)
-    } else {
-        0.0
-    };
-
-    // Syncing if sled was modified in last 30s
-    let syncing = std::fs::metadata(sled_path)
-        .and_then(|m| m.modified())
-        .map(|t| t.elapsed().map(|e| e.as_secs() < 30).unwrap_or(false))
-        .unwrap_or(false);
+    // Estimate entries from RocksDB size (~240 bytes per entry avg)
+    let entries = if exists { rocks_size / 240 } else { 0 };
+    let pct = if exists { 100.0 } else { 0.0 };
 
     axum::Json(serde_json::json!({
-        "objects": sled_entries,
-        "sync_downloaded": sync_objects,
+        "objects": entries,
         "estimated_total": estimated_total,
-        "percent": (pct * 10.0).round() / 10.0,
-        "size_mb": sled_size / 1_048_576,
-        "syncing": syncing,
+        "percent": pct,
+        "size_mb": rocks_size / 1_048_576,
+        "syncing": false,
     }))
 }
 

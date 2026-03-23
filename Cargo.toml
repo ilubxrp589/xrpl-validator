@@ -7,7 +7,7 @@ members = [
 
 [workspace.dependencies]
 # Core types, codec, and crypto from the XRPL Rust SDK
-xrpl-core = { git = "https://github.com/ilubxrp589/xrpl-sdk", version = "0.1.0" }
+xrpl-core = { path = "../XRPL Rust SDK/crates/xrpl-core" }
 
 # Serialization
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
