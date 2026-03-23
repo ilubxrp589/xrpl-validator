@@ -67,8 +67,12 @@ struct PeerEntry {
 /// Original XRPL supply: 100 billion XRP in drops.
 const ORIGINAL_SUPPLY_DROPS: u64 = 100_000_000_000_000_000;
 
-/// Path for persisted engine stats.
-const ENGINE_STATE_PATH: &str = "/mnt/xrpl-data/engine_state.json";
+/// Default path for persisted engine stats.
+const DEFAULT_ENGINE_STATE_PATH: &str = "/mnt/xrpl-data/engine_state.json";
+
+fn engine_state_path() -> String {
+    std::env::var("XRPL_ENGINE_STATE_PATH").unwrap_or_else(|_| DEFAULT_ENGINE_STATE_PATH.to_string())
+}
 
 /// Persistent stats saved to disk.
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -81,7 +85,7 @@ struct PersistedStats {
 
 impl PersistedStats {
     fn load() -> Self {
-        std::fs::read_to_string(ENGINE_STATE_PATH)
+        std::fs::read_to_string(engine_state_path())
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
@@ -89,7 +93,7 @@ impl PersistedStats {
 
     fn save(&self) {
         if let Ok(json) = serde_json::to_string(self) {
-            let _ = std::fs::write(ENGINE_STATE_PATH, json);
+            let _ = std::fs::write(engine_state_path(), json);
         }
     }
 }
@@ -180,8 +184,8 @@ async fn main() {
         use xrpl_core::address::KeyType;
         use xrpl_core::crypto::signing::Seed;
 
-        let seed_path = "/mnt/xrpl-data/validator_seed.hex";
-        let seed = if let Ok(hex_str) = std::fs::read_to_string(seed_path) {
+        let seed_path = std::env::var("XRPL_SEED_PATH").unwrap_or_else(|_| "/mnt/xrpl-data/validator_seed.hex".to_string());
+        let seed = if let Ok(hex_str) = std::fs::read_to_string(&seed_path) {
             let hex_str = hex_str.trim();
             if let Ok(bytes) = hex::decode(hex_str) {
                 if bytes.len() == 16 {
@@ -191,18 +195,18 @@ async fn main() {
                     Seed { bytes: arr, key_type: KeyType::Secp256k1 }
                 } else {
                     let s = Seed::generate_with_type(KeyType::Secp256k1);
-                    let _ = std::fs::write(seed_path, hex::encode(&s.bytes));
+                    let _ = std::fs::write(&seed_path, hex::encode(&s.bytes));
                     eprintln!("[validator] Generated new seed (saved to {seed_path})");
                     s
                 }
             } else {
                 let s = Seed::generate_with_type(KeyType::Secp256k1);
-                let _ = std::fs::write(seed_path, hex::encode(&s.bytes));
+                let _ = std::fs::write(&seed_path, hex::encode(&s.bytes));
                 s
             }
         } else {
             let s = Seed::generate_with_type(KeyType::Secp256k1);
-            let _ = std::fs::write(seed_path, hex::encode(&s.bytes));
+            let _ = std::fs::write(&seed_path, hex::encode(&s.bytes));
             eprintln!("[validator] Generated NEW seed (saved to {seed_path})");
             s
         };
@@ -375,8 +379,9 @@ async fn main() {
         .map(|t| t.elapsed().map(|e| e.as_secs() < 60).unwrap_or(false))
         .unwrap_or(false);
 
+    let rocks_db_path = std::env::var("XRPL_ROCKS_PATH").unwrap_or_else(|_| "/mnt/xrpl-data/sync/state.rocks".to_string());
     let live_engine: Arc<Mutex<Option<xrpl_node::engine::LiveEngine>>> = Arc::new(Mutex::new(
-        match xrpl_node::engine::LiveEngine::open(std::path::Path::new("/mnt/xrpl-data/sync/state.rocks")) {
+        match xrpl_node::engine::LiveEngine::open(std::path::Path::new(&rocks_db_path)) {
             Ok(e) => {
                 eprintln!("[live-engine] Opened sled with {} entries", e.entry_count());
                 Some(e)
@@ -731,7 +736,7 @@ async fn main() {
             }))
         }));
 
-    let addr = "0.0.0.0:3777";
+    let addr = "127.0.0.1:3777";
     eprintln!("[web] Listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await.expect("failed to bind port 3777");
     if let Err(e) = axum::serve(listener, app).await {
@@ -1039,7 +1044,7 @@ fn extract_key_from_validation(blob: &[u8]) -> Option<String> {
 }
 
 async fn sync_status() -> axum::Json<serde_json::Value> {
-    let rocks_path = "/mnt/xrpl-data/sync/state.rocks";
+    let rocks_path = std::env::var("XRPL_ROCKS_PATH").unwrap_or_else(|_| "/mnt/xrpl-data/sync/state.rocks".to_string());
 
     // Check if RocksDB exists and get size
     let rocks_size = std::fs::read_dir(rocks_path)

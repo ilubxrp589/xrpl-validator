@@ -121,7 +121,7 @@ impl NodeIdentity {
     }
 
     /// DER-encoded TLS private key.
-    pub fn tls_key_der(&self) -> &[u8] {
+    pub(crate) fn tls_key_der(&self) -> &[u8] {
         &self.tls_key_der
     }
 
@@ -136,7 +136,7 @@ impl NodeIdentity {
     }
 
     /// Reference to the underlying keypair.
-    pub fn keypair(&self) -> &Keypair {
+    pub(crate) fn keypair(&self) -> &Keypair {
         &self.keypair
     }
 }
