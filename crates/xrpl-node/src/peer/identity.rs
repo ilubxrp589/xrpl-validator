@@ -10,6 +10,7 @@ use rcgen::{CertificateParams, KeyPair as RcgenKeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use xrpl_core::address::KeyType;
 use xrpl_core::crypto::signing::{Keypair, Seed};
+use zeroize::Zeroize;
 
 use crate::NodeError;
 
@@ -138,6 +139,12 @@ impl NodeIdentity {
     /// Reference to the underlying keypair.
     pub(crate) fn keypair(&self) -> &Keypair {
         &self.keypair
+    }
+}
+
+impl Drop for NodeIdentity {
+    fn drop(&mut self) {
+        self.tls_key_der.zeroize();
     }
 }
 

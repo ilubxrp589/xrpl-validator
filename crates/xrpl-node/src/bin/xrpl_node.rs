@@ -59,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
     // CLI overrides
     if cli.testnet {
         config.seed_peers = vec!["s.altnet.rippletest.net:51235".into()];
+        config.network_id = 1;
     }
     if let Some(port) = cli.rpc_port {
         config.rpc_port = port;
@@ -77,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
     // Start RPC server
     let rpc_state = node.rpc_state();
     let rpc_router = rpc::create_router(rpc_state);
-    let rpc_addr = format!("0.0.0.0:{}", config.rpc_port);
+    let rpc_addr = format!("127.0.0.1:{}", config.rpc_port);
 
     tracing::info!(addr = %rpc_addr, "RPC server starting");
     let listener = tokio::net::TcpListener::bind(&rpc_addr).await?;

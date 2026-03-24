@@ -44,18 +44,28 @@ fn bs58_encode(_bytes: &[u8]) -> String {
 /// followed by 8 bytes of XRP amount encoding.
 fn extract_xrp_balance(data: &[u8]) -> Option<u64> {
     // Scan for 0x61 byte (sfBalance = STI_AMOUNT | 1)
-    for i in 0..data.len().saturating_sub(9) {
+    // Skip the first 4 bytes — field headers in an AccountRoot always come
+    // after at least the object type and flags fields, so a match at i < 4
+    // is almost certainly a false positive on payload data.
+    let start = 4.min(data.len());
+    for i in start..data.len().saturating_sub(9) {
         if data[i] == 0x61 {
             // Next 8 bytes are the XRP amount
             let amount_bytes: [u8; 8] = data[i+1..i+9].try_into().ok()?;
             let raw = u64::from_be_bytes(amount_bytes);
             // XRP amounts: bit 63 = 0 (not IOU), bit 62 = 1 (positive)
-            // Drops = raw & 0x3FFFFFFFFFFFFFFF
-            if raw & 0x8000000000000000 == 0 {
-                // XRP amount
-                let drops = raw & 0x3FFFFFFFFFFFFFFF;
-                return Some(drops);
+            // Validate: bit 63 must be 0 (native XRP, not IOU)
+            //           bit 62 must be 1 (positive amount)
+            if raw & 0x8000000000000000 != 0 {
+                // Bit 63 set — this is an IOU amount, not XRP; skip
+                continue;
             }
+            if raw & 0x4000000000000000 == 0 {
+                // Bit 62 clear — negative/zero XRP amount; unlikely for Balance; skip
+                continue;
+            }
+            let drops = raw & 0x3FFFFFFFFFFFFFFF;
+            return Some(drops);
         }
     }
     None
@@ -105,7 +115,7 @@ impl LiveEngine {
             let client = reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()
-                .unwrap_or_default();
+                .expect("reqwest client builder failed");
 
             while let Ok((acct_id, key)) = fetch_rx.recv() {
                 let addr = format!("r{}", bs58_encode(&acct_id));
@@ -133,6 +143,9 @@ impl LiveEngine {
             db,
             fetch_tx,
             ledger_seq: 0,
+            // Approximate total XRP in drops as of early 2026.
+            // This is a bootstrap value — the network poll (server_info)
+            // corrects it every ~30s with the actual on-ledger total.
             total_coins: 99_985_687_626_634_189,
             round_applied: 0,
             round_failed: 0,

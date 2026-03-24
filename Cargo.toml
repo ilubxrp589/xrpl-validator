@@ -17,6 +17,7 @@ hex = { version = "0.4", default-features = false, features = ["alloc"] }
 
 # Crypto
 sha2 = { version = "0.10", default-features = false }
+zeroize = { version = "1", features = ["derive"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

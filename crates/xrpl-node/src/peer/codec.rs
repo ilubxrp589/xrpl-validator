@@ -83,7 +83,7 @@ impl Decoder for MessageCodec {
 
             // Decompress if needed.
             let data = if compressed {
-                let mut decoder = ZlibDecoder::new(proto_data);
+                let mut decoder = ZlibDecoder::new(proto_data).take(16 * 1024 * 1024);
                 let mut decompressed = Vec::new();
                 decoder.read_to_end(&mut decompressed).map_err(|e| {
                     NodeError::MessageDecode(format!("zlib decompression failed: {e}"))

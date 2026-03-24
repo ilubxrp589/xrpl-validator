@@ -58,13 +58,7 @@ impl PeerManager {
 
     /// Connect to a specific peer address.
     pub async fn connect_to(&self, addr: &str) -> Result<PeerHandle, crate::NodeError> {
-        let network_id = if self.config.seed_peers.iter().any(|s| s.contains("altnet") || s.contains("testnet")) {
-            handshake::NETWORK_ID_TESTNET
-        } else {
-            handshake::NETWORK_ID_MAINNET
-        };
-
-        let result = handshake::outbound_handshake(addr, &self.identity, network_id).await?;
+        let result = handshake::outbound_handshake(addr, &self.identity, self.config.network_id).await?;
 
         let socket_addr: SocketAddr = addr
             .parse()

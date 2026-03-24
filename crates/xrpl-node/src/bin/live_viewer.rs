@@ -259,13 +259,36 @@ async fn main() {
             eprintln!("[val-sender] Connected! Sending manifest + validations...");
             let mut stream = hs.stream;
 
-            // Skip manifest for now — send validations only
+            // Send manifest so peers know our validator identity
+            {
+                use tokio::io::AsyncWriteExt;
+                if let Err(e) = stream.write_all(&val_send_manifest).await {
+                    eprintln!("[val-sender] Manifest write failed: {e}");
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    continue;
+                }
+                eprintln!("[val-sender] Manifest sent ({} bytes)", val_send_manifest.len());
+            }
+            // Split into read (drain) + write (validations)
+            let (mut reader, mut writer) = tokio::io::split(stream);
+
+            // Drain incoming messages so the connection doesn't stall
+            let drain = tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match reader.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {} // discard
+                    }
+                }
+            });
+
             let mut rx = val_send_outbound.subscribe();
             loop {
                 match rx.recv().await {
                     Ok(frame) => {
                         use tokio::io::AsyncWriteExt;
-                        if let Err(e) = stream.write_all(&frame).await {
+                        if let Err(e) = writer.write_all(&frame).await {
                             eprintln!("[val-sender] Write failed: {e}, reconnecting...");
                             break;
                         }
@@ -274,6 +297,7 @@ async fn main() {
                     Err(_) => break,
                 }
             }
+            drain.abort();
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
@@ -414,7 +438,7 @@ async fn main() {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
-            .unwrap_or_default();
+            .expect("reqwest client builder failed");
         loop {
             if let Ok(resp) = client
                 .post("https://xrplcluster.com")
@@ -608,7 +632,7 @@ async fn main() {
             .timeout(Duration::from_secs(4))
             .danger_accept_invalid_certs(true)
             .build()
-            .unwrap_or_default();
+            .expect("reqwest client builder failed");
         loop {
             let peers: Vec<String> = crawl_active.lock().iter().cloned().collect();
             for addr in peers {
@@ -833,7 +857,7 @@ async fn run_peer_connection(
                                 if peer_ep.hops <= 3 {
                                     let addr = peer_ep.endpoint.clone();
                                     // Skip invalid/local addresses
-                                    if addr.starts_with("[::") || addr.starts_with("0.") || addr.starts_with("127.") || addr.starts_with("10.") || addr.starts_with("192.168.") {
+                                    if addr.starts_with("[::") || addr.starts_with("0.") || addr.starts_with("127.") || addr.starts_with("10.") || addr.starts_with("192.168.") || addr.starts_with("172.") || addr.starts_with("169.") || addr.starts_with("100.64") {
                                         continue;
                                     }
                                     let mut known = known_peers.lock();
@@ -948,6 +972,30 @@ fn format_message(msg: &PeerMessage) -> (String, String, Option<u32>, Option<Str
             ("Validation".into(), detail, None, None, None, vkey, None)
         }
         PeerMessage::Manifests(m) => {
+            // Dump first manifest for debugging
+            if !m.list.is_empty() {
+                static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    let raw = &m.list[0].stobject;
+                    eprintln!("[manifest-debug] Real manifest: {} bytes: {}", raw.len(), hex::encode(raw));
+                    // Parse fields
+                    let mut i = 0;
+                    while i < raw.len() {
+                        let b = raw[i];
+                        let (tc, fc) = if b & 0xF0 != 0 && b & 0x0F != 0 {
+                            (b >> 4, b & 0x0F)
+                        } else if b & 0xF0 == 0 {
+                            i += 1; if i >= raw.len() { break; }
+                            (raw[i], b & 0x0F)
+                        } else {
+                            i += 1; if i >= raw.len() { break; }
+                            (b >> 4, raw[i])
+                        };
+                        eprintln!("[manifest-debug]   offset={i} byte=0x{b:02X} type={tc} field={fc}");
+                        i += 1;
+                    }
+                }
+            }
             ("Manifests".into(), format!("{} manifests", m.list.len()), None, None, None, None, None)
         }
         PeerMessage::ValidatorListCollection(_) => {

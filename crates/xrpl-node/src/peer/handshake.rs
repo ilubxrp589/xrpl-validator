@@ -7,6 +7,7 @@ use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use sha2::{Digest, Sha512};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+use zeroize::Zeroize;
 
 use super::identity::NodeIdentity;
 use crate::NodeError;
@@ -65,7 +66,7 @@ pub async fn outbound_handshake(
         .map_err(|e| NodeError::Connection(format!("TLS handshake to {addr}: {e}")))?;
 
     // Compute shared value from TLS finished messages
-    let shared_value = compute_shared_value(&tls)?;
+    let mut shared_value = compute_shared_value(&tls)?;
 
     // Sign the shared value with our node key
     let signature = identity.sign(&shared_value)?;
@@ -180,8 +181,10 @@ pub async fn outbound_handshake(
                         .unwrap_or(false)
                 } else if peer_public_key[0] == 0xED {
                     let mut prefixed = shared_value.to_vec();
-                    xrpl_core::crypto::ed25519::verify(&peer_public_key, &prefixed, &sig_bytes)
-                        .unwrap_or(false)
+                    let result = xrpl_core::crypto::ed25519::verify(&peer_public_key, &prefixed, &sig_bytes)
+                        .unwrap_or(false);
+                    prefixed.zeroize();
+                    result
                 } else {
                     false
                 }
@@ -196,6 +199,44 @@ pub async fn outbound_handshake(
                 // due to a likely mismatch in shared_value computation or key extraction.
                 tracing::warn!("peer session signature verification failed (not enforced yet)");
             }
+        }
+    }
+
+    // Zeroize shared value now that signature verification is complete
+    shared_value.zeroize();
+
+    // Log TLS cert vs advertised key mismatch for security monitoring
+    // (Full cert pinning requires changing SslVerifyMode which breaks self-signed peers)
+    if !peer_public_key.is_empty() {
+        if let Some(peer_cert) = tls.ssl().peer_certificate() {
+            match peer_cert.public_key() {
+                Ok(cert_pkey) => match cert_pkey.public_key_to_der() {
+                    Ok(cert_pubkey_der) => {
+                        // The advertised Public-Key header is a 33-byte compressed secp256k1 key.
+                        // The TLS certificate's public key is DER-encoded (SubjectPublicKeyInfo).
+                        // We can't directly compare them since they use different formats/algorithms,
+                        // but if the cert's raw key bytes contain the advertised key bytes,
+                        // that suggests they match. Otherwise, log a warning.
+                        let contains_key = cert_pubkey_der.windows(peer_public_key.len())
+                            .any(|w| w == peer_public_key.as_slice());
+                        if !contains_key {
+                            tracing::warn!(
+                                peer_key_len = peer_public_key.len(),
+                                cert_key_len = cert_pubkey_der.len(),
+                                "peer advertised Public-Key does not match TLS certificate public key — possible identity mismatch"
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        tracing::debug!("could not extract DER public key from peer TLS certificate");
+                    }
+                },
+                Err(_) => {
+                    tracing::debug!("could not extract public key from peer TLS certificate");
+                }
+            }
+        } else {
+            tracing::debug!("no peer TLS certificate available for key comparison");
         }
     }
 
@@ -240,8 +281,8 @@ fn compute_shared_value(
     peer_finished.truncate(peer_len);
 
     // Hash both with SHA-512
-    let cookie1: [u8; 64] = Sha512::digest(&local_finished).into();
-    let cookie2: [u8; 64] = Sha512::digest(&peer_finished).into();
+    let mut cookie1: [u8; 64] = Sha512::digest(&local_finished).into();
+    let mut cookie2: [u8; 64] = Sha512::digest(&peer_finished).into();
 
     // XOR the two hashes
     let mut xored = [0u8; 64];
@@ -250,9 +291,15 @@ fn compute_shared_value(
     }
 
     // SHA512-half of the XOR result
-    let hash = Sha512::digest(xored);
+    let hash = Sha512::digest(&xored);
     let mut result = [0u8; 32];
     result.copy_from_slice(&hash[..32]);
+
+    // Zeroize intermediate cryptographic material
+    cookie1.zeroize();
+    cookie2.zeroize();
+    xored.zeroize();
+
     Ok(result)
 }
 

@@ -52,6 +52,10 @@ pub struct NodeConfig {
     #[serde(default)]
     pub validator_token: Option<String>,
 
+    /// Network ID (0 = mainnet, 1 = testnet).
+    #[serde(default)]
+    pub network_id: u32,
+
     /// Fee voting preferences.
     #[serde(default)]
     pub fee_config: FeeConfig,
@@ -95,6 +99,7 @@ impl Default for NodeConfig {
             max_peers: default_max_peers(),
             unl_keys: Vec::new(),
             validator_token: None,
+            network_id: 0,
             fee_config: FeeConfig::default(),
         }
     }

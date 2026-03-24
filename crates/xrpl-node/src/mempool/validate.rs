@@ -149,7 +149,12 @@ pub fn validate_transaction(tx_blob: &[u8]) -> (ValidationResult, Hash256, Optio
                 }
             }
             Err(e) => {
-                tracing::debug!("encode_for_signing failed: {e}, skipping sig verification");
+                tracing::debug!("encode_for_signing failed: {e}");
+                return (
+                    ValidationResult::Invalid(format!("encode_for_signing failed: {e}")),
+                    tx_hash,
+                    Some(TxFields { tx_hash, fee, account, sequence, last_ledger_seq }),
+                );
             }
         }
     }

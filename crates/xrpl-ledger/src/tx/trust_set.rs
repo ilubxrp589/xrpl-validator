@@ -97,7 +97,7 @@ impl Transactor for TrustSetTransactor {
                 if let Some(qout) = tx.fields.get("QualityOut") {
                     line["QualityOut"] = qout.clone();
                 }
-                sandbox.write(line_key, serde_json::to_vec(&line).unwrap());
+                sandbox.write(line_key, serde_json::to_vec(&line).expect("serializing valid JSON Value"));
             }
         } else {
             // Create new trust line
@@ -128,7 +128,7 @@ impl Transactor for TrustSetTransactor {
                 },
                 "Flags": 0,
             });
-            sandbox.write(line_key, serde_json::to_vec(&line_obj).unwrap());
+            sandbox.write(line_key, serde_json::to_vec(&line_obj).expect("serializing valid JSON Value"));
 
             // Increment OwnerCount for both accounts
             for id in [&tx.account, &issuer] {
@@ -137,7 +137,7 @@ impl Transactor for TrustSetTransactor {
                     if let Ok(mut acct) = serde_json::from_slice::<serde_json::Value>(&data) {
                         let count = acct["OwnerCount"].as_u64().unwrap_or(0);
                         acct["OwnerCount"] = serde_json::Value::Number((count + 1).into());
-                        sandbox.write(acct_key, serde_json::to_vec(&acct).unwrap());
+                        sandbox.write(acct_key, serde_json::to_vec(&acct).expect("serializing valid JSON Value"));
                     }
                 }
             }

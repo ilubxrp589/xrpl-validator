@@ -158,7 +158,7 @@ impl Transactor for EscrowCreateTransactor {
         let oc = owner_count_of(&sender);
         sender["OwnerCount"] = serde_json::Value::Number((oc + 1).into());
 
-        sandbox.write(sender_key, serde_json::to_vec(&sender).unwrap());
+        sandbox.write(sender_key, serde_json::to_vec(&sender).expect("serializing valid JSON Value"));
 
         // --- Create the Escrow ledger entry ---
         let escrow_key = keylet::escrow_key(&tx.account, tx.sequence);
@@ -182,7 +182,7 @@ impl Transactor for EscrowCreateTransactor {
             escrow["Condition"] = v.clone();
         }
 
-        sandbox.write(escrow_key, serde_json::to_vec(&escrow).unwrap());
+        sandbox.write(escrow_key, serde_json::to_vec(&escrow).expect("serializing valid JSON Value"));
 
         TxResult::Success
     }
@@ -228,8 +228,14 @@ impl Transactor for EscrowFinishTransactor {
 
     /// val-074: State validation — escrow must exist.
     fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
-        let owner_id = Self::owner(tx).unwrap();
-        let offer_seq = Self::offer_sequence(tx).unwrap();
+        let owner_id = match Self::owner(tx) {
+            Some(id) => id,
+            None => return TxResult::Malformed,
+        };
+        let offer_seq = match Self::offer_sequence(tx) {
+            Some(s) => s,
+            None => return TxResult::Malformed,
+        };
         let esc_key = keylet::escrow_key(&owner_id, offer_seq);
 
         if !sandbox.exists(&esc_key) {
@@ -309,7 +315,7 @@ impl Transactor for EscrowFinishTransactor {
             None => return TxResult::Malformed,
         };
         dest["Balance"] = serde_json::Value::String(new_dest_balance.to_string());
-        sandbox.write(dest_key, serde_json::to_vec(&dest).unwrap());
+        sandbox.write(dest_key, serde_json::to_vec(&dest).expect("serializing valid JSON Value"));
 
         // --- Delete the Escrow object ---
         sandbox.delete(esc_key);
@@ -327,7 +333,7 @@ impl Transactor for EscrowFinishTransactor {
 
         let oc = owner_count_of(&owner_acct);
         owner_acct["OwnerCount"] = serde_json::Value::Number(oc.saturating_sub(1).into());
-        sandbox.write(owner_key, serde_json::to_vec(&owner_acct).unwrap());
+        sandbox.write(owner_key, serde_json::to_vec(&owner_acct).expect("serializing valid JSON Value"));
 
         TxResult::Success
     }
@@ -373,8 +379,14 @@ impl Transactor for EscrowCancelTransactor {
 
     /// val-077: State validation — escrow must exist.
     fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
-        let owner_id = Self::owner(tx).unwrap();
-        let offer_seq = Self::offer_sequence(tx).unwrap();
+        let owner_id = match Self::owner(tx) {
+            Some(id) => id,
+            None => return TxResult::Malformed,
+        };
+        let offer_seq = match Self::offer_sequence(tx) {
+            Some(s) => s,
+            None => return TxResult::Malformed,
+        };
         let esc_key = keylet::escrow_key(&owner_id, offer_seq);
 
         if !sandbox.exists(&esc_key) {
@@ -445,7 +457,7 @@ impl Transactor for EscrowCancelTransactor {
         let oc = owner_count_of(&owner_acct);
         owner_acct["OwnerCount"] = serde_json::Value::Number(oc.saturating_sub(1).into());
 
-        sandbox.write(owner_key, serde_json::to_vec(&owner_acct).unwrap());
+        sandbox.write(owner_key, serde_json::to_vec(&owner_acct).expect("serializing valid JSON Value"));
 
         // --- Delete the Escrow object ---
         sandbox.delete(esc_key);

@@ -89,7 +89,11 @@ impl Transactor for PaymentTransactor {
         }
 
         // Can't send to yourself (rippled allows it but it's a no-op)
-        let dest = Self::destination(tx).unwrap();
+        // Safe: we already checked destination is Some above
+        let dest = match Self::destination(tx) {
+            Some(d) => d,
+            None => return TxResult::Malformed,
+        };
         if dest == tx.account {
             // rippled actually allows this — it's just a fee burn
             // We'll allow it too
@@ -146,7 +150,10 @@ impl Transactor for PaymentTransactor {
         }
 
         // If destination doesn't exist, amount must meet reserve
-        let dest = Self::destination(tx).unwrap();
+        let dest = match Self::destination(tx) {
+            Some(d) => d,
+            None => return TxResult::Malformed,
+        };
         let dest_key = keylet::account_root_key(&dest);
         if !sandbox.exists(&dest_key) {
             let reserve = Self::reserve_base(sandbox);
@@ -192,7 +199,7 @@ impl Transactor for PaymentTransactor {
         }
 
         sender["Balance"] = serde_json::Value::String((sender_balance - amount).to_string());
-        sandbox.write(sender_key, serde_json::to_vec(&sender).unwrap());
+        sandbox.write(sender_key, serde_json::to_vec(&sender).expect("serializing valid JSON Value"));
 
         // --- Destination side ---
         let dest_key = keylet::account_root_key(&dest_id);
@@ -214,7 +221,7 @@ impl Transactor for PaymentTransactor {
                 None => return TxResult::Malformed,
             };
             dest["Balance"] = serde_json::Value::String(new_dest_balance.to_string());
-            sandbox.write(dest_key, serde_json::to_vec(&dest).unwrap());
+            sandbox.write(dest_key, serde_json::to_vec(&dest).expect("serializing valid JSON Value"));
         } else {
             // Destination doesn't exist — create new AccountRoot
             let reserve = Self::reserve_base(sandbox);
@@ -230,7 +237,7 @@ impl Transactor for PaymentTransactor {
                 "OwnerCount": 0,
                 "Flags": 0,
             });
-            sandbox.write(dest_key, serde_json::to_vec(&new_account).unwrap());
+            sandbox.write(dest_key, serde_json::to_vec(&new_account).expect("serializing valid JSON Value"));
         }
 
         TxResult::Success

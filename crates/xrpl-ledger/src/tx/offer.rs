@@ -170,7 +170,7 @@ fn adjust_xrp_balance(account: &[u8; 20], delta: i64, sandbox: &mut Sandbox) {
                 return;
             }
             acct["Balance"] = serde_json::Value::String(new_balance.to_string());
-            sandbox.write(key, serde_json::to_vec(&acct).unwrap());
+            sandbox.write(key, serde_json::to_vec(&acct).expect("serializing valid JSON Value"));
         }
     }
 }
@@ -298,7 +298,7 @@ impl Transactor for OfferCreateTransactor {
                     "TakerGets": gets_json,
                     "Flags": tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0),
                 });
-                sandbox.write(offer_key, serde_json::to_vec(&offer_obj).unwrap());
+                sandbox.write(offer_key, serde_json::to_vec(&offer_obj).expect("serializing valid JSON Value"));
 
                 // Increment OwnerCount
                 let acct_key = keylet::account_root_key(&tx.account);
@@ -306,7 +306,7 @@ impl Transactor for OfferCreateTransactor {
                     if let Ok(mut acct) = serde_json::from_slice::<serde_json::Value>(&data) {
                         let count = acct["OwnerCount"].as_u64().unwrap_or(0);
                         acct["OwnerCount"] = serde_json::Value::Number((count + 1).into());
-                        sandbox.write(acct_key, serde_json::to_vec(&acct).unwrap());
+                        sandbox.write(acct_key, serde_json::to_vec(&acct).expect("serializing valid JSON Value"));
                     }
                 }
             }
@@ -362,7 +362,7 @@ impl Transactor for OfferCancelTransactor {
                     if count > 0 {
                         acct["OwnerCount"] = serde_json::Value::Number((count - 1).into());
                     }
-                    sandbox.write(acct_key, serde_json::to_vec(&acct).unwrap());
+                    sandbox.write(acct_key, serde_json::to_vec(&acct).expect("serializing valid JSON Value"));
                 }
             }
         }

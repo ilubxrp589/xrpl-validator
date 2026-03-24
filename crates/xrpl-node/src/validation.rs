@@ -52,7 +52,12 @@ fn build_validation_for_signing(
 
     // Type 7 (VL): SigningPubKey(3) — length-prefixed
     buf.extend_from_slice(&field::SIGNING_PUB_KEY);
-    buf.push(signing_pub_key.len() as u8);
+    let spk_len = signing_pub_key.len();
+    if spk_len > 192 {
+        eprintln!("[validation] signing pub key too long ({spk_len} bytes, max 192)");
+        return Vec::new();
+    }
+    buf.push(spk_len as u8);
     buf.extend_from_slice(signing_pub_key);
 
     buf
@@ -71,7 +76,11 @@ pub fn sign_validation(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let signing_time = (now_unix - 946684800) as u32;
+    let signing_time: u32 = now_unix
+        .checked_sub(946684800)
+        .unwrap_or(0)
+        .try_into()
+        .unwrap_or(u32::MAX);
 
     // Flags: 0x80000000 = vfFullValidation (we fully validated this ledger)
     let flags: u32 = 0x80000000;
@@ -89,7 +98,9 @@ pub fn sign_validation(
     hasher.update(&prefix);
     hasher.update(&unsigned);
     let full_hash = hasher.finalize();
-    let sign_hash: [u8; 32] = full_hash[..32].try_into().unwrap();
+    let sign_hash: [u8; 32] = full_hash[..32]
+        .try_into()
+        .expect("SHA-512 output is always 64 bytes, first 32 always converts");
 
     // Sign with our Secp256k1 key
     let signature = match identity.sign(&sign_hash) {
@@ -139,21 +150,28 @@ pub fn build_manifest(identity: &NodeIdentity) -> Vec<u8> {
 
     // PublicKey = master key (VL, type=7 field=1 → 0x71)
     unsigned.push(0x71);
-    unsigned.push(pub_key.len() as u8);
+    let pk_len = pub_key.len();
+    if pk_len > 192 {
+        eprintln!("[manifest] public key too long ({pk_len} bytes, max 192)");
+        return Vec::new();
+    }
+    unsigned.push(pk_len as u8);
     unsigned.extend_from_slice(pub_key);
 
     // SigningPubKey = same key (VL, type=7 field=3 → 0x73)
     unsigned.push(0x73);
-    unsigned.push(pub_key.len() as u8);
+    unsigned.push(pk_len as u8);
     unsigned.extend_from_slice(pub_key);
 
-    // Sign with MAN\0 prefix
+    // Sign with MAN\0 prefix — same hash used for both signatures
     let prefix: [u8; 4] = [0x4D, 0x41, 0x4E, 0x00]; // "MAN\0"
     let mut hasher = Sha512::new();
     hasher.update(&prefix);
     hasher.update(&unsigned);
     let full_hash = hasher.finalize();
-    let sign_hash: [u8; 32] = full_hash[..32].try_into().unwrap();
+    let sign_hash: [u8; 32] = full_hash[..32]
+        .try_into()
+        .expect("SHA-512 output is always 64 bytes, first 32 always converts");
 
     let signature = match identity.sign(&sign_hash) {
         Ok(sig) => sig,
@@ -163,15 +181,24 @@ pub fn build_manifest(identity: &NodeIdentity) -> Vec<u8> {
         }
     };
 
-    // Build full manifest with MasterSignature
+    // Build full manifest with BOTH Signature and MasterSignature
+    // (rippled requires both even when master == signing key)
     let mut manifest = unsigned;
 
-    // MasterSignature (VL, type=7 field=0x12 → needs 2-byte field code)
-    // Field 0x12 = 18, type 7: high nibble = 7, low nibble = 0 (field > 15)
-    // Encoding: 0x70 0x12
+    // Signature (VL, type=7 field=6 → 0x76) — ephemeral key signature
+    manifest.push(0x76);
+    let sig_len = signature.len();
+    if sig_len > 192 {
+        eprintln!("[manifest] signature too long ({sig_len} bytes, max 192)");
+        return Vec::new();
+    }
+    manifest.push(sig_len as u8);
+    manifest.extend_from_slice(&signature);
+
+    // MasterSignature (VL, type=7 field=18 → 0x70 0x12) — master key signature
     manifest.push(0x70);
     manifest.push(0x12);
-    manifest.push(signature.len() as u8);
+    manifest.push(sig_len as u8);
     manifest.extend_from_slice(&signature);
 
     manifest
