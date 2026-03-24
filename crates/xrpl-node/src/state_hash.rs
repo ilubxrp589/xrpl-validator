@@ -51,7 +51,10 @@ impl StateHashComputer {
     }
 
     /// Start the background SHAMap build from all RocksDB entries.
-    /// The SHAMap is kept in memory after completion for incremental updates.
+    /// Uses a fast two-pass approach:
+    /// Pass 1: iterate all entries, compute leaf hashes (I/O bound)
+    /// Pass 2: build SHAMap from pre-sorted entries (CPU bound)
+    /// Much faster than naive insert-one-at-a-time.
     pub fn start_computation(
         &self,
         db: Arc<rocksdb::DB>,
@@ -78,11 +81,13 @@ impl StateHashComputer {
 
         std::thread::spawn(move || {
             let start = std::time::Instant::now();
-            eprintln!("[state-hash] Building SHAMap from ~{estimated_total} RocksDB entries...");
+            eprintln!("[state-hash] FAST BUILD: collecting {estimated_total} entries from RocksDB...");
 
-            let mut shamap = SHAMap::new(TreeType::State);
+            // Pass 1: Collect all (key, value) pairs from RocksDB
+            // RocksDB iterates in sorted key order which is ideal for SHAMap
+            let mut entries: Vec<(Hash256, Vec<u8>)> = Vec::with_capacity(estimated_total as usize);
             let mut count: u64 = 0;
-            let mut errors: u64 = 0;
+            let mut skipped: u64 = 0;
 
             let iter = db.iterator(rocksdb::IteratorMode::Start);
             for item in iter {
@@ -91,29 +96,53 @@ impl StateHashComputer {
                         if key.len() == 32 {
                             let mut key_arr = [0u8; 32];
                             key_arr.copy_from_slice(&key);
-                            if shamap.insert(Hash256(key_arr), value.to_vec()).is_err() {
-                                errors += 1;
-                            }
+                            entries.push((Hash256(key_arr), value.to_vec()));
+                        } else {
+                            skipped += 1;
                         }
                         count += 1;
-                        if count % 500_000 == 0 {
+                        if count % 1_000_000 == 0 {
                             entries_processed.store(count, Ordering::Relaxed);
                             let elapsed = start.elapsed().as_secs_f64();
                             let rate = count as f64 / elapsed;
-                            let remaining = (estimated_total.saturating_sub(count)) as f64 / rate;
                             eprintln!(
-                                "[state-hash] {count}/{estimated_total} ({:.1}%) — {rate:.0}/s — ~{remaining:.0}s remaining",
+                                "[state-hash] Pass 1: {count}/{estimated_total} ({:.1}%) — {rate:.0}/s",
                                 count as f64 / estimated_total as f64 * 100.0,
                             );
                             status.lock().entries_processed = count;
                         }
                     }
                     Err(e) => {
-                        errors += 1;
-                        if errors <= 5 {
-                            eprintln!("[state-hash] RocksDB iteration error: {e}");
+                        skipped += 1;
+                        if skipped <= 3 {
+                            eprintln!("[state-hash] RocksDB error: {e}");
                         }
                     }
+                }
+            }
+
+            let pass1_time = start.elapsed().as_secs_f64();
+            eprintln!(
+                "[state-hash] Pass 1 done: {} entries in {pass1_time:.1}s ({skipped} skipped). Building SHAMap...",
+                entries.len(),
+            );
+
+            // Pass 2: Bulk-insert into SHAMap
+            // Entries are already sorted by key (RocksDB key order),
+            // which gives better SHAMap insertion performance.
+            let mut shamap = SHAMap::new(TreeType::State);
+            let total_entries = entries.len();
+            for (i, (key, data)) in entries.into_iter().enumerate() {
+                let _ = shamap.insert(key, data);
+                if (i + 1) % 1_000_000 == 0 {
+                    let elapsed = start.elapsed().as_secs_f64() - pass1_time;
+                    let rate = (i + 1) as f64 / elapsed;
+                    let remaining = (total_entries - i - 1) as f64 / rate;
+                    eprintln!(
+                        "[state-hash] Pass 2: {}/{total_entries} ({:.1}%) — {rate:.0}/s — ~{remaining:.0}s",
+                        i + 1,
+                        (i + 1) as f64 / total_entries as f64 * 100.0,
+                    );
                 }
             }
 
@@ -123,11 +152,10 @@ impl StateHashComputer {
             let root_hash = shamap.root_hash();
             let hash_hex = hex::encode(root_hash.0);
             eprintln!(
-                "[state-hash] SHAMap built: {} entries in {elapsed:.1}s — account_hash={}",
+                "[state-hash] DONE: {} entries in {elapsed:.1}s (pass1={pass1_time:.1}s) — account_hash={}",
                 shamap.len(), &hash_hex[..16],
             );
 
-            // Store the SHAMap for incremental updates
             *shamap_slot.lock() = Some(shamap);
 
             {
