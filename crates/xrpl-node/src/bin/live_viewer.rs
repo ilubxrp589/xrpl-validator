@@ -514,6 +514,7 @@ async fn main() {
     let val_outbound = outbound_tx2.clone();
     let val_sse = tx2.clone();
     let consensus_loop = consensus.clone();
+    let state_hash_for_close = state_hash_computer.clone();
     let mut last_validated_seq: u32 = 0;
     // Buffer raw transactions per round for full ledger close
     let mut round_raw_txs: Vec<(xrpl_core::types::Hash256, Vec<u8>)> = Vec::new();
@@ -577,7 +578,8 @@ async fn main() {
 
                                     let total_coins = state.network_total_coins;
 
-                                    // Run full ledger close in background
+                                    // Run full ledger close + incremental SHAMap update
+                                    let hash_comp = state_hash_for_close.clone();
                                     tokio::task::spawn_blocking(move || {
                                         if let Some(result) = xrpl_node::ledger_close::close_ledger(
                                             &db,
@@ -588,13 +590,10 @@ async fn main() {
                                             now_ripple,
                                             now_ripple.saturating_sub(4),
                                         ) {
-                                            eprintln!(
-                                                "[ledger-close] account_hash={} tx_hash={} ledger_hash={} fees={}",
-                                                hex::encode(&result.account_hash.0[..8]),
-                                                hex::encode(&result.tx_hash.0[..8]),
-                                                hex::encode(&result.ledger_hash.0[..8]),
-                                                result.total_fees,
-                                            );
+                                            // Incrementally update the full SHAMap
+                                            if hash_comp.is_ready() {
+                                                hash_comp.update_round(&db, &result.modified_keys);
+                                            }
                                         }
                                     });
                                 }
@@ -750,8 +749,8 @@ async fn main() {
                             if seq > last_validated_seq {
                                 last_validated_seq = seq;
 
-                                // Use the real ledger hash from the StatusChange
-                                let ledger_hash_bytes: [u8; 32] = event.ledger_hash.as_ref()
+                                // Get network's ledger hash from StatusChange
+                                let network_hash_bytes: [u8; 32] = event.ledger_hash.as_ref()
                                     .and_then(|h| hex::decode(h).ok())
                                     .and_then(|b| if b.len() == 32 {
                                         let mut arr = [0u8; 32];
@@ -759,6 +758,17 @@ async fn main() {
                                         Some(arr)
                                     } else { None })
                                     .unwrap_or([0u8; 32]);
+
+                                // Use our own hash if independently verified, otherwise use network's
+                                let (ledger_hash_bytes, hash_source) = if state_hash_for_close.is_ready_to_sign() {
+                                    if let Some(our_hash) = state_hash_for_close.current_hash() {
+                                        (our_hash.0, "OUR_HASH")
+                                    } else {
+                                        (network_hash_bytes, "network")
+                                    }
+                                } else {
+                                    (network_hash_bytes, "network")
+                                };
 
                                 // Don't sign if we don't have a real hash
                                 if ledger_hash_bytes == [0u8; 32] {
@@ -808,7 +818,7 @@ async fn main() {
                                         ledger_seq: Some(seq),
                                         ledger_hash: None, peers: None, validator: None, tx_info: None,
                                     });
-                                    eprintln!("[validator] Signed validation for ledger #{seq} hash={hash_short}...");
+                                    eprintln!("[validator] Signed validation for ledger #{seq} hash={hash_short}... (src={hash_source})");
                                 }
                                 } // else (has real hash)
                             }

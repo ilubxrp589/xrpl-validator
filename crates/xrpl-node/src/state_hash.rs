@@ -1,11 +1,11 @@
-//! State hash computation — build SHAMap from RocksDB and verify against network.
+//! State hash computation — build SHAMap from RocksDB, incrementally update,
+//! and verify against network's account_hash each round.
 //!
-//! Iterates all ledger objects in RocksDB, inserts them into a SHAMap,
-//! and computes the root hash (account_hash). This is compared to the
-//! network's account_hash to independently verify our state is correct.
+//! The SHAMap is kept in memory after the initial build so it can be
+//! incrementally updated each round with only the modified entries.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use xrpl_core::types::Hash256;
@@ -14,59 +14,59 @@ use xrpl_ledger::shamap::tree::{SHAMap, TreeType};
 /// State hash computation result.
 #[derive(Clone, Default, serde::Serialize)]
 pub struct StateHashStatus {
-    /// Whether the computation is currently running.
     pub computing: bool,
-    /// Number of entries processed so far.
     pub entries_processed: u64,
-    /// Total estimated entries.
     pub entries_total: u64,
-    /// Computed root hash (hex). Empty if not yet computed.
     pub computed_hash: String,
-    /// Network's account_hash for comparison. Empty if not yet fetched.
     pub network_hash: String,
-    /// Whether the hashes match.
     pub matches: Option<bool>,
-    /// Last computation time in seconds.
     pub compute_time_secs: f64,
-    /// Ledger sequence the hash was computed for.
     pub ledger_seq: u32,
+    /// How many consecutive rounds the hash matched.
+    pub consecutive_matches: u32,
+    /// Whether we're ready to sign with our own hash.
+    pub ready_to_sign: bool,
 }
 
 /// Shared state for the background hash computation.
 pub struct StateHashComputer {
     pub status: Arc<Mutex<StateHashStatus>>,
+    /// The live SHAMap — kept in memory for incremental updates.
+    shamap: Arc<Mutex<Option<SHAMap>>>,
     computing: Arc<AtomicBool>,
     entries_processed: Arc<AtomicU64>,
+    /// Consecutive rounds where our hash matched the network.
+    consecutive_matches: Arc<AtomicU32>,
 }
 
 impl StateHashComputer {
     pub fn new() -> Self {
         Self {
             status: Arc::new(Mutex::new(StateHashStatus::default())),
+            shamap: Arc::new(Mutex::new(None)),
             computing: Arc::new(AtomicBool::new(false)),
             entries_processed: Arc::new(AtomicU64::new(0)),
+            consecutive_matches: Arc::new(AtomicU32::new(0)),
         }
     }
 
-    /// Start the background hash computation.
-    /// Iterates all RocksDB entries and builds a SHAMap.
-    /// This is CPU-intensive and may take minutes for 16M+ entries.
+    /// Start the background SHAMap build from all RocksDB entries.
+    /// The SHAMap is kept in memory after completion for incremental updates.
     pub fn start_computation(
         &self,
         db: Arc<rocksdb::DB>,
         estimated_total: u64,
     ) {
         if self.computing.swap(true, Ordering::SeqCst) {
-            eprintln!("[state-hash] Already computing, skipping");
             return;
         }
 
         let status = self.status.clone();
+        let shamap_slot = self.shamap.clone();
         let computing = self.computing.clone();
         let entries_processed = self.entries_processed.clone();
 
         entries_processed.store(0, Ordering::Relaxed);
-
         {
             let mut s = status.lock();
             s.computing = true;
@@ -78,7 +78,7 @@ impl StateHashComputer {
 
         std::thread::spawn(move || {
             let start = std::time::Instant::now();
-            eprintln!("[state-hash] Starting SHAMap build from ~{estimated_total} RocksDB entries...");
+            eprintln!("[state-hash] Building SHAMap from ~{estimated_total} RocksDB entries...");
 
             let mut shamap = SHAMap::new(TreeType::State);
             let mut count: u64 = 0;
@@ -91,7 +91,7 @@ impl StateHashComputer {
                         if key.len() == 32 {
                             let mut key_arr = [0u8; 32];
                             key_arr.copy_from_slice(&key);
-                            if let Err(_e) = shamap.insert(Hash256(key_arr), value.to_vec()) {
+                            if shamap.insert(Hash256(key_arr), value.to_vec()).is_err() {
                                 errors += 1;
                             }
                         }
@@ -105,7 +105,6 @@ impl StateHashComputer {
                                 "[state-hash] {count}/{estimated_total} ({:.1}%) — {rate:.0}/s — ~{remaining:.0}s remaining",
                                 count as f64 / estimated_total as f64 * 100.0,
                             );
-                            // Update status
                             status.lock().entries_processed = count;
                         }
                     }
@@ -121,15 +120,15 @@ impl StateHashComputer {
             let elapsed = start.elapsed().as_secs_f64();
             entries_processed.store(count, Ordering::Relaxed);
 
-            eprintln!(
-                "[state-hash] Built SHAMap with {} entries in {elapsed:.1}s ({} errors)",
-                shamap.len(), errors,
-            );
-
-            // Compute root hash
             let root_hash = shamap.root_hash();
             let hash_hex = hex::encode(root_hash.0);
-            eprintln!("[state-hash] account_hash = {hash_hex}");
+            eprintln!(
+                "[state-hash] SHAMap built: {} entries in {elapsed:.1}s — account_hash={}",
+                shamap.len(), &hash_hex[..16],
+            );
+
+            // Store the SHAMap for incremental updates
+            *shamap_slot.lock() = Some(shamap);
 
             {
                 let mut s = status.lock();
@@ -143,55 +142,111 @@ impl StateHashComputer {
         });
     }
 
-    /// Update the network hash for comparison.
-    pub fn set_network_hash(&self, hash: &str, ledger_seq: u32) {
+    /// Incrementally update the SHAMap with modified entries after a round.
+    /// Reads the current data for each modified key from RocksDB and updates the tree.
+    /// Returns the new root hash, or None if the SHAMap isn't ready yet.
+    pub fn update_round(
+        &self,
+        db: &Arc<rocksdb::DB>,
+        modified_keys: &[Hash256],
+    ) -> Option<Hash256> {
+        if modified_keys.is_empty() {
+            // No changes — return current hash
+            let guard = self.shamap.lock();
+            return guard.as_ref().map(|m| m.root_hash());
+        }
+
+        let mut guard = self.shamap.lock();
+        let shamap = guard.as_mut()?;
+
+        let mut updated = 0;
+        for key in modified_keys {
+            match db.get(&key.0) {
+                Ok(Some(data)) => {
+                    let _ = shamap.insert(*key, data.to_vec());
+                    updated += 1;
+                }
+                Ok(None) => {
+                    // Object deleted — remove from SHAMap
+                    let _ = shamap.delete(key);
+                }
+                Err(_) => {}
+            }
+        }
+
+        let root = shamap.root_hash();
+        let hash_hex = hex::encode(root.0);
+
+        // Update status
+        {
+            let mut s = self.status.lock();
+            s.computed_hash = hash_hex;
+        }
+
+        if updated > 0 {
+            eprintln!(
+                "[state-hash] Incremental update: {updated}/{} keys — hash={}",
+                modified_keys.len(),
+                hex::encode(&root.0[..8]),
+            );
+        }
+
+        Some(root)
+    }
+
+    /// Compare our hash against the network's. Returns true if they match.
+    pub fn set_network_hash(&self, hash: &str, ledger_seq: u32) -> bool {
         let mut s = self.status.lock();
         s.network_hash = hash.to_string();
         s.ledger_seq = ledger_seq;
+
         if !s.computed_hash.is_empty() && !s.network_hash.is_empty() {
-            s.matches = Some(s.computed_hash == s.network_hash);
+            let matches = s.computed_hash.to_uppercase() == s.network_hash.to_uppercase();
+            s.matches = Some(matches);
+            if matches {
+                let n = self.consecutive_matches.fetch_add(1, Ordering::Relaxed) + 1;
+                s.consecutive_matches = n;
+                s.ready_to_sign = n >= 3; // 3 consecutive matches = ready
+                if n <= 5 || n % 100 == 0 {
+                    eprintln!("[state-hash] MATCH #{n}! Our hash matches network for ledger #{ledger_seq}");
+                }
+            } else {
+                self.consecutive_matches.store(0, Ordering::Relaxed);
+                s.consecutive_matches = 0;
+                s.ready_to_sign = false;
+            }
+            matches
+        } else {
+            false
         }
     }
 
-    /// Get the current progress (entries processed).
+    /// Check if we're ready to sign with our own hash (3+ consecutive matches).
+    pub fn is_ready_to_sign(&self) -> bool {
+        self.consecutive_matches.load(Ordering::Relaxed) >= 3
+    }
+
+    /// Get the current computed hash.
+    pub fn current_hash(&self) -> Option<Hash256> {
+        let guard = self.shamap.lock();
+        guard.as_ref().map(|m| m.root_hash())
+    }
+
     pub fn progress(&self) -> u64 {
         self.entries_processed.load(Ordering::Relaxed)
     }
 
-    /// Check if computation is currently running.
     pub fn is_computing(&self) -> bool {
         self.computing.load(Ordering::SeqCst)
     }
 
-    /// Incrementally update the SHAMap with modified keylets from a round.
-    /// Each modified key's current data is read from RocksDB and inserted.
-    pub fn update_incremental(
-        &self,
-        db: &Arc<rocksdb::DB>,
-        modified_keys: &[Hash256],
-    ) {
-        if modified_keys.is_empty() || self.is_computing() {
-            return;
-        }
-
-        let status = self.status.clone();
-
-        // Re-read modified objects from DB and note we need a recomputation
-        // For now, mark the hash as stale — next full computation will pick up changes
-        let mut s = status.lock();
-        if !s.computed_hash.is_empty() {
-            s.computed_hash.clear();
-            s.matches = None;
-        }
+    /// Check if the SHAMap has been built.
+    pub fn is_ready(&self) -> bool {
+        self.shamap.lock().is_some()
     }
 }
 
 /// Compute a ledger header hash independently.
-///
-/// The XRPL ledger header hash is:
-/// `SHA512Half("LWR\0" || ledger_seq(u32) || total_drops(u64) || parent_hash(32) ||
-///              tx_hash(32) || account_hash(32) || parent_close_time(u32) ||
-///              close_time(u32) || close_resolution(u8) || close_flags(u8))`
 pub fn compute_ledger_hash(
     ledger_seq: u32,
     total_drops: u64,
@@ -204,9 +259,7 @@ pub fn compute_ledger_hash(
     close_flags: u8,
 ) -> Hash256 {
     use sha2::{Digest, Sha512};
-
     let prefix: [u8; 4] = [0x4C, 0x57, 0x52, 0x00]; // "LWR\0"
-
     let mut hasher = Sha512::new();
     hasher.update(&prefix);
     hasher.update(&ledger_seq.to_be_bytes());
@@ -218,7 +271,6 @@ pub fn compute_ledger_hash(
     hasher.update(&close_time.to_be_bytes());
     hasher.update(&[close_resolution]);
     hasher.update(&[close_flags]);
-
     let full = hasher.finalize();
     let mut result = [0u8; 32];
     result.copy_from_slice(&full[..32]);
@@ -226,21 +278,12 @@ pub fn compute_ledger_hash(
 }
 
 /// Compute a transaction tree hash from a list of transaction hashes.
-/// Builds a SHAMap of type Transaction and returns the root hash.
 pub fn compute_tx_hash(tx_hashes: &[Hash256]) -> Hash256 {
-    use xrpl_ledger::shamap::tree::{SHAMap, TreeType};
-
     if tx_hashes.is_empty() {
         return Hash256([0u8; 32]);
     }
-
     let mut tree = SHAMap::new(TreeType::Transaction);
     for hash in tx_hashes {
-        // In the tx tree, the key is the tx hash and the data is the
-        // serialized tx + metadata. We don't have full metadata, so
-        // we use the hash as a placeholder. This gives us a consistent
-        // tree structure even though the exact hash won't match rippled
-        // (which includes full tx+meta as the leaf data).
         let _ = tree.insert(*hash, hash.0.to_vec());
     }
     tree.root_hash()
@@ -255,12 +298,9 @@ mod tests {
         let parent = [0xAA; 32];
         let tx = [0xBB; 32];
         let acct = [0xCC; 32];
-
         let h1 = compute_ledger_hash(100, 99_000_000, &parent, &tx, &acct, 700, 701, 10, 0);
         let h2 = compute_ledger_hash(100, 99_000_000, &parent, &tx, &acct, 700, 701, 10, 0);
         assert_eq!(h1, h2);
-
-        // Different seq → different hash
         let h3 = compute_ledger_hash(101, 99_000_000, &parent, &tx, &acct, 700, 701, 10, 0);
         assert_ne!(h1, h3);
     }
@@ -273,10 +313,7 @@ mod tests {
 
     #[test]
     fn tx_hash_deterministic() {
-        let hashes = vec![
-            Hash256([0x01; 32]),
-            Hash256([0x02; 32]),
-        ];
+        let hashes = vec![Hash256([0x01; 32]), Hash256([0x02; 32])];
         let h1 = compute_tx_hash(&hashes);
         let h2 = compute_tx_hash(&hashes);
         assert_eq!(h1, h2);
