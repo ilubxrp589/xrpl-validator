@@ -18,6 +18,7 @@ pub mod config;
 pub mod consensus;
 pub mod consensus_engine;
 pub mod engine;
+pub mod ledger_close;
 pub mod error;
 pub mod mempool;
 pub mod node;

@@ -515,6 +515,8 @@ async fn main() {
     let val_sse = tx2.clone();
     let consensus_loop = consensus.clone();
     let mut last_validated_seq: u32 = 0;
+    // Buffer raw transactions per round for full ledger close
+    let mut round_raw_txs: Vec<(xrpl_core::types::Hash256, Vec<u8>)> = Vec::new();
     tokio::spawn(async move {
         let mut rx = engine_rx;
         loop {
@@ -549,6 +551,55 @@ async fn main() {
                                     (Vec::new(), Vec::new())
                                 }
                             };
+
+                            // --- Full ledger close: apply all buffered txs ---
+                            let prev_round_txs = std::mem::take(&mut round_raw_txs);
+                            if !prev_round_txs.is_empty() {
+                                let db_for_close = {
+                                    le.lock().as_ref().map(|e| e.db_arc())
+                                };
+                                if let Some(db) = db_for_close {
+                                    let prev_seq = seq.saturating_sub(1);
+                                    let ledger_hash = event.ledger_hash.as_ref()
+                                        .and_then(|h| hex::decode(h).ok())
+                                        .and_then(|b| if b.len() == 32 {
+                                            let mut arr = [0u8; 32];
+                                            arr.copy_from_slice(&b);
+                                            Some(arr)
+                                        } else { None })
+                                        .unwrap_or([0u8; 32]);
+
+                                    let now_ripple = (std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs()
+                                        .saturating_sub(946684800)) as u32;
+
+                                    let total_coins = state.network_total_coins;
+
+                                    // Run full ledger close in background
+                                    tokio::task::spawn_blocking(move || {
+                                        if let Some(result) = xrpl_node::ledger_close::close_ledger(
+                                            &db,
+                                            &prev_round_txs,
+                                            prev_seq,
+                                            ledger_hash,
+                                            total_coins,
+                                            now_ripple,
+                                            now_ripple.saturating_sub(4),
+                                        ) {
+                                            eprintln!(
+                                                "[ledger-close] account_hash={} tx_hash={} ledger_hash={} fees={}",
+                                                hex::encode(&result.account_hash.0[..8]),
+                                                hex::encode(&result.tx_hash.0[..8]),
+                                                hex::encode(&result.ledger_hash.0[..8]),
+                                                result.total_fees,
+                                            );
+                                        }
+                                    });
+                                }
+                            }
+
                             eprintln!("[verify] Round ended, {prev_modified_count} accounts to verify, {key_count} keylets modified",
                                 prev_modified_count = prev_modified.len(),
                                 key_count = _modified_keys.len());
@@ -662,7 +713,17 @@ async fn main() {
                                 }
                             }
 
-                            // Apply to live state via RocksDB (full execution with write-back)
+                            // Buffer raw tx for full ledger close
+                            if !info.raw_tx.is_empty() {
+                                let mut hash = [0u8; 32];
+                                let tx_hash_bytes = hex::decode(&info.hash).unwrap_or_default();
+                                hash[..tx_hash_bytes.len().min(32)].copy_from_slice(
+                                    &tx_hash_bytes[..tx_hash_bytes.len().min(32)]
+                                );
+                                round_raw_txs.push((xrpl_core::types::Hash256(hash), info.raw_tx.clone()));
+                            }
+
+                            // Apply to live state via RocksDB (tracking only, no write-back)
                             if let Some(ref mut eng) = *le.lock() {
                                 if let Some(id) = xrpl_node::engine::decode_address(&info.account) {
                                     eng.apply_transaction(
