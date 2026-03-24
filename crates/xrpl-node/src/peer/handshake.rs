@@ -160,8 +160,13 @@ pub async fn outbound_handshake(
 
             match key.as_str() {
                 "public-key" => {
-                    peer_public_key = hex::decode(value)
-                        .unwrap_or_else(|_| value.as_bytes().to_vec());
+                    // Peer sends base58-encoded node public key (n9K...)
+                    // Decode from base58 to get the raw 33-byte compressed key
+                    peer_public_key = decode_node_public_key(value)
+                        .unwrap_or_else(|| {
+                            // Fallback: try hex decode
+                            hex::decode(value).unwrap_or_default()
+                        });
                 }
                 "session-signature" => {
                     peer_session_sig = value.to_string();
@@ -174,7 +179,6 @@ pub async fn outbound_handshake(
     // Verify peer's session signature if we have their public key
     if !peer_public_key.is_empty() && !peer_session_sig.is_empty() {
         if let Ok(sig_bytes) = base64_decode(&peer_session_sig) {
-            // Peer signs the same shared value we computed
             let valid = if peer_public_key.len() == 33 {
                 if peer_public_key[0] == 0x02 || peer_public_key[0] == 0x03 {
                     xrpl_core::crypto::secp256k1::verify(&peer_public_key, &shared_value, &sig_bytes)
@@ -195,9 +199,9 @@ pub async fn outbound_handshake(
             if valid {
                 tracing::debug!("peer session signature verified");
             } else {
-                // TODO: fix verification and enforce. Currently failing for all peers
-                // due to a likely mismatch in shared_value computation or key extraction.
-                tracing::warn!("peer session signature verification failed (not enforced yet)");
+                return Err(NodeError::HandshakeFailed(
+                    "peer session signature verification failed".to_string()
+                ));
             }
         }
     }
@@ -353,6 +357,38 @@ fn encode_node_public_key(pubkey: &[u8]) -> String {
         result.push(XRPL_ALPHABET[d as usize] as char);
     }
     result
+}
+
+/// Decode a base58-encoded node public key (n...) to raw 33 bytes.
+fn decode_node_public_key(encoded: &str) -> Option<Vec<u8>> {
+    const XRPL_ALPHABET: &[u8; 58] =
+        b"rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz";
+
+    let mut n: Vec<u8> = vec![0];
+    for ch in encoded.bytes() {
+        let carry = XRPL_ALPHABET.iter().position(|&c| c == ch)?;
+        let mut c = carry;
+        for byte in n.iter_mut().rev() {
+            c += (*byte as usize) * 58;
+            *byte = (c & 0xFF) as u8;
+            c >>= 8;
+        }
+        while c > 0 {
+            n.insert(0, (c & 0xFF) as u8);
+            c >>= 8;
+        }
+    }
+
+    let leading = encoded.bytes().take_while(|&b| b == XRPL_ALPHABET[0]).count();
+    let mut result = vec![0u8; leading];
+    result.extend_from_slice(&n);
+
+    // result = 1 byte prefix (0x1C) + 33 bytes key + 4 bytes checksum
+    if result.len() < 38 { return None; }
+    if result[0] != 0x1C { return None; }
+
+    // Extract the 33-byte public key (skip prefix, drop checksum)
+    Some(result[1..34].to_vec())
 }
 
 fn base64_decode(input: &str) -> Result<Vec<u8>, ()> {
