@@ -47,7 +47,9 @@ fn extract_xrp_balance(data: &[u8]) -> Option<u64> {
     // Skip the first 4 bytes — field headers in an AccountRoot always come
     // after at least the object type and flags fields, so a match at i < 4
     // is almost certainly a false positive on payload data.
-    let start = 4.min(data.len());
+    // Start at offset 7 to skip LedgerEntryType (0x11 0x00 0x61) + Flags (0x22 + 4 bytes)
+    // The 0x61 at offset 2 is the AccountRoot type VALUE, not the Balance field
+    let start = 7.min(data.len());
     for i in start..data.len().saturating_sub(9) {
         if data[i] == 0x61 {
             // Next 8 bytes are the XRP amount
@@ -60,10 +62,8 @@ fn extract_xrp_balance(data: &[u8]) -> Option<u64> {
                 // Bit 63 set — this is an IOU amount, not XRP; skip
                 continue;
             }
-            if raw & 0x4000000000000000 == 0 {
-                // Bit 62 clear — negative/zero XRP amount; unlikely for Balance; skip
-                continue;
-            }
+            // Bit 62: 1 = positive, 0 = zero/negative
+            // Accept both — zero balance accounts are valid
             let drops = raw & 0x3FFFFFFFFFFFFFFF;
             return Some(drops);
         }
@@ -108,36 +108,42 @@ impl LiveEngine {
             .unwrap_or(0);
         eprintln!("[engine] Opened RocksDB: ~{count} entries");
 
-        // Background fetcher — picks up missing accounts and caches them
+        // Background fetchers — multiple threads for concurrent RPC lookups
         let (fetch_tx, fetch_rx) = std::sync::mpsc::channel::<([u8; 20], [u8; 32])>();
-        let fetch_db = db.clone();
-        std::thread::spawn(move || {
-            let client = reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .expect("reqwest client builder failed");
+        let fetch_rx = Arc::new(std::sync::Mutex::new(fetch_rx));
+        for worker in 0..4 {
+            let fetch_db = db.clone();
+            let rx = fetch_rx.clone();
+            std::thread::spawn(move || {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .expect("reqwest client builder failed");
 
-            while let Ok((acct_id, key)) = fetch_rx.recv() {
-                let addr = format!("r{}", bs58_encode(&acct_id));
-                // Fetch binary ledger entry
-                let resp = client.post("https://xrplcluster.com")
-                    .json(&serde_json::json!({
-                        "method": "ledger_entry",
-                        "params": [{"index": hex::encode(key), "binary": true, "ledger_index": "validated"}]
-                    }))
-                    .send();
+                loop {
+                    let (acct_id, key) = match rx.lock().unwrap().recv() {
+                        Ok(v) => v,
+                        Err(_) => break,
+                    };
+                    let resp = client.post("https://xrplcluster.com")
+                        .json(&serde_json::json!({
+                            "method": "ledger_entry",
+                            "params": [{"index": hex::encode(key), "binary": true, "ledger_index": "validated"}]
+                        }))
+                        .send();
 
-                if let Ok(r) = resp {
-                    if let Ok(body) = r.json::<serde_json::Value>() {
-                        if let Some(data_hex) = body["result"]["node_binary"].as_str() {
-                            if let Ok(data) = hex::decode(data_hex) {
-                                let _ = fetch_db.put(key, &data);
+                    if let Ok(r) = resp {
+                        if let Ok(body) = r.json::<serde_json::Value>() {
+                            if let Some(data_hex) = body["result"]["node_binary"].as_str() {
+                                if let Ok(data) = hex::decode(data_hex) {
+                                    let _ = fetch_db.put(key, &data);
+                                }
                             }
                         }
                     }
                 }
-            }
-        });
+            });
+        }
 
         Ok(Self {
             db,
@@ -153,8 +159,10 @@ impl LiveEngine {
         })
     }
 
-    /// Queue a missing account for background fetch from RPC.
+    /// Queue a missing account for background fetch from RPC (deduplicated).
     fn queue_fetch(&self, account_id: &[u8; 20], key: &Hash256) {
+        // Quick check: don't re-queue if already in DB (race with fetcher)
+        if self.get(&key.0).is_some() { return; }
         let _ = self.fetch_tx.send((*account_id, key.0));
     }
 
@@ -186,19 +194,21 @@ impl LiveEngine {
         let acct_data = match self.get(&acct_key.0) {
             Some(d) => d,
             None => {
-                // Not in DB — queue a background fetch so it's cached next time
                 self.queue_fetch(account_id, &acct_key);
                 self.round_failed += 1;
+                if self.round_failed <= 3 {
+                    eprintln!("[engine] MISS key={}", hex::encode(&acct_key.0[..8]));
+                }
                 return (false, fee);
             }
         };
 
-        // Extract Balance directly from raw binary.
-        // Balance field: type=6(Amount), field=1 → field code byte 0x61
-        // XRP amount: 8 bytes, high bit clear, remaining 63 bits = drops + 0x4000000000000000 offset
         let balance = match extract_xrp_balance(&acct_data) {
             Some(b) => b,
             None => {
+                // Bad cached entry — delete and re-fetch next time
+                let _ = self.db.delete(&acct_key.0);
+                self.queue_fetch(account_id, &acct_key);
                 self.round_failed += 1;
                 return (false, fee);
             }
