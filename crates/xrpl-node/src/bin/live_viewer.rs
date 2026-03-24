@@ -891,6 +891,7 @@ async fn main() {
         .route("/consensus", get(consensus_page))
         .route("/metrics", get(metrics_page))
         .route("/peers", get(peers_page))
+        .route("/state", get(state_page))
         .route("/events", get(move || sse_handler(tx.clone())))
         .route("/crawl", get({
             let crawl_pubkey = node_pubkey_web.clone();
@@ -1554,6 +1555,10 @@ async fn metrics_page() -> Html<&'static str> {
 
 async fn peers_page() -> Html<&'static str> {
     Html(include_str!("../../static/peers.html"))
+}
+
+async fn state_page() -> Html<&'static str> {
+    Html(include_str!("../../static/state.html"))
 }
 
 async fn sse_handler(
