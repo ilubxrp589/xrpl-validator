@@ -438,13 +438,37 @@ async fn main() {
     let engine_state: Arc<Mutex<EngineState>> = Arc::new(Mutex::new(initial_state));
 
     // State hash computation — build SHAMap from RocksDB in background
+    // Bulk sync: re-download ALL state objects from network as fresh binary,
+    // then rebuild the SHAMap for hash verification.
+    let bulk_syncer = Arc::new(xrpl_node::bulk_sync::BulkSyncer::new());
     let state_hash_computer = Arc::new(xrpl_node::state_hash::StateHashComputer::new());
     {
         let engine_guard = live_engine.lock();
         if let Some(ref eng) = *engine_guard {
             let db = eng.db_arc();
             let estimated = eng.entry_count() as u64;
-            state_hash_computer.start_computation(db, estimated);
+
+            // Start bulk sync first — once done, rebuild SHAMap
+            bulk_syncer.start(db.clone(), estimated);
+
+            // Monitor bulk sync completion, then trigger SHAMap build
+            let syncer = bulk_syncer.clone();
+            let hash_comp = state_hash_computer.clone();
+            let db2 = db.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    if !syncer.is_running() {
+                        let synced = syncer.objects_synced();
+                        if synced > 0 {
+                            eprintln!("[startup] Bulk sync done ({synced} objects) — building SHAMap...");
+                            let est = synced.max(estimated);
+                            hash_comp.start_computation(db2, est);
+                        }
+                        break;
+                    }
+                }
+            });
         }
     }
 
@@ -981,11 +1005,14 @@ async fn main() {
         }))
         .route("/api/state-hash", get({
             let hash_status = state_hash_computer.clone();
+            let sync_status = bulk_syncer.clone();
             move || {
                 let hash_status = hash_status.clone();
+                let sync_status = sync_status.clone();
                 async move {
-                    let status = hash_status.status.lock().clone();
-                    axum::Json(serde_json::to_value(&status).unwrap_or_default())
+                    let mut status = serde_json::to_value(&hash_status.status.lock().clone()).unwrap_or_default();
+                    status["bulk_sync"] = serde_json::to_value(&sync_status.status.lock().clone()).unwrap_or_default();
+                    axum::Json(status)
                 }
             }
         }))

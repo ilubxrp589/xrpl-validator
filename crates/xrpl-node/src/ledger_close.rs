@@ -252,17 +252,11 @@ pub fn close_ledger(
         .map(keylet::account_root_key)
         .collect();
 
-    // Step 5: Write post-execution state back to RocksDB
-    // The new_state.state_map has correctly modified JSON objects.
-    // Write them back so our state stays in sync with the network.
-    let mut written = 0;
-    for account_id in &affected_accounts {
-        let acct_key = keylet::account_root_key(account_id);
-        if let Some(json_bytes) = new_state.state_map.lookup(&acct_key) {
-            let _ = db.put(&acct_key.0, json_bytes);
-            written += 1;
-        }
-    }
+    // Step 5: Do NOT write JSON state back to RocksDB.
+    // RocksDB must stay binary (as-fetched from network) for hash matching.
+    // The background fetcher refreshes entries with correct binary data.
+    // Execution results are verified in-memory only.
+    let written = 0u32;
 
     eprintln!(
         "[ledger-close] Ledger #{} closed: {} txs, {} fees, {} state writes, hash={}",
