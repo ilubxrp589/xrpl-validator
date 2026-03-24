@@ -287,41 +287,22 @@ impl LiveEngine {
             return (false, 0);
         }
 
-        // --- Fee deduction: debit sender and write back ---
-        let new_sender_balance = balance - fee;
+        // Track execution in-memory only — do NOT write modified balances
+        // back to RocksDB. The cached state must stay clean (as-fetched from
+        // network) because we only handle partial execution (fees + XRP payments).
+        // Writing partial updates causes state drift and crashes the hit rate.
+        //
+        // The modified_keys list tracks what WOULD change for SHAMap updates
+        // once we have full execution for all tx types.
+        self.round_modified_keys.push(acct_key);
 
-        // For Payment txs, also debit the sent amount
-        let mut xrp_sent: u64 = 0;
+        // For Payment txs, also track the destination
         if tx_type == "Payment" {
-            if let Some(amount) = extract_tx_amount(raw_tx) {
-                if new_sender_balance >= amount {
-                    xrp_sent = amount;
-                }
-                // If insufficient balance for amount, tx still succeeds for fee
-                // (the payment itself would fail but fee is still burned)
-            }
-        }
-
-        let final_sender_balance = new_sender_balance.saturating_sub(xrp_sent);
-        if set_xrp_balance(&mut acct_data, final_sender_balance) {
-            let _ = self.db.put(&acct_key.0, &acct_data);
-            self.round_modified_keys.push(acct_key);
-        }
-
-        // --- Credit destination for XRP Payments ---
-        if xrp_sent > 0 {
             if let Some(dest_id) = extract_destination(raw_tx) {
                 let dest_key = xrpl_ledger::ledger::keylet::account_root_key(&dest_id);
-                if let Some(mut dest_data) = self.get(&dest_key.0) {
-                    if let Some(dest_balance) = extract_xrp_balance(&dest_data) {
-                        let new_dest_balance = dest_balance.saturating_add(xrp_sent);
-                        if set_xrp_balance(&mut dest_data, new_dest_balance) {
-                            let _ = self.db.put(&dest_key.0, &dest_data);
-                            self.round_modified_keys.push(dest_key);
-                        }
-                    }
-                } else {
-                    // Destination not in our DB — queue fetch
+                self.round_modified_keys.push(dest_key);
+                // Queue fetch for destination if not cached
+                if self.get(&dest_key.0).is_none() {
                     self.queue_fetch(&dest_id, &dest_key);
                 }
             }
