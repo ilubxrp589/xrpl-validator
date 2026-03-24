@@ -77,30 +77,26 @@ pub fn decode_raw_tx(raw_tx: &[u8]) -> Option<(Hash256, TxFields)> {
 /// Handles both formats: raw binary (XRPL serialization) and already-JSON.
 /// Tolerant of trailing bytes (network objects may have appended index/metadata).
 pub fn decode_ledger_object(data: &[u8]) -> Option<serde_json::Value> {
-    // Check if it's already JSON (starts with '{')
-    if data.first() == Some(&0x7B) {
-        // Try direct parse first
+    // Check if it's likely JSON — starts with '{"' (0x7B 0x22)
+    if data.len() > 2 && data[0] == 0x7B && data[1] == 0x22 {
+        // Try direct parse
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(data) {
             return Some(v);
         }
-        // JSON might be corrupted — try parsing just the valid prefix
-        // (find the last '}' and parse up to there)
+        // Try truncating at last '}'
         if let Some(end) = data.iter().rposition(|&b| b == 0x7D) {
-            return serde_json::from_slice(&data[..=end]).ok();
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&data[..=end]) {
+                return Some(v);
+            }
         }
-        return None;
+        // JSON is corrupted — fall through to binary decode
     }
-    // Try binary decode — be tolerant of trailing bytes
-    // The codec is strict about consuming all bytes, but RocksDB entries
-    // from network RPC may have extra data (index, metadata bytes).
-    // Strategy: try full, then progressively strip trailing bytes.
-    if let Ok(v) = xrpl_core::codec::decode_transaction_binary(data) {
-        return Some(v);
-    }
-    // Try stripping trailing bytes — the object likely ends before the data does
-    for trim in [30, 32, 48, 53, 64, 76] {
-        if data.len() > trim {
-            if let Ok(v) = xrpl_core::codec::decode_transaction_binary(&data[..data.len() - trim]) {
+
+    // Try binary decode with progressive trailing byte stripping
+    for trim in [0, 24, 30, 32, 48, 53, 63, 64, 76] {
+        if data.len() > trim + 10 {
+            let slice = if trim == 0 { data } else { &data[..data.len() - trim] };
+            if let Ok(v) = xrpl_core::codec::decode_transaction_binary(slice) {
                 return Some(v);
             }
         }
@@ -201,18 +197,14 @@ pub fn close_ledger(
                         }
                     }
                     None => {
-                        // Decode failed — log first few with actual error
+                        // Decode failed — self-heal: delete corrupted entry
+                        // so the background fetcher re-downloads it as clean binary
+                        let _ = db.delete(&acct_key.0);
                         if failed < 3 {
-                            let err = if binary_data.first() == Some(&0x7B) {
-                                format!("JSON parse: {:?}", serde_json::from_slice::<serde_json::Value>(&binary_data).err())
-                            } else {
-                                format!("Binary decode: {:?}", xrpl_core::codec::decode_transaction_binary(&binary_data).err())
-                            };
                             eprintln!(
-                                "[ledger-close] Decode failed key={} len={} err={}",
+                                "[ledger-close] Decode failed key={} len={} — deleted for re-fetch",
                                 hex::encode(&acct_key.0[..8]),
                                 binary_data.len(),
-                                err,
                             );
                         }
                         failed += 1;
