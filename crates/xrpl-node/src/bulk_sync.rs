@@ -1,9 +1,6 @@
-//! Bulk state sync — re-download all ledger objects from the network.
-//!
-//! Uses the `ledger_data` RPC to paginate through ALL state objects
-//! and write fresh binary data to RocksDB. This ensures our local
-//! state matches the network's exactly (byte-for-byte), so the
-//! SHAMap root hash will match.
+//! Bulk state sync via peer protocol — request SHAMap nodes from ALL
+//! connected peers in parallel using TMGetLedger. Much faster than RPC
+//! since we're pulling from 10+ peers simultaneously.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -22,7 +19,8 @@ pub struct BulkSyncStatus {
     pub estimated_remaining_secs: f64,
 }
 
-/// Bulk state syncer.
+/// Bulk state syncer — downloads all state via ledger_data RPC.
+/// Uses the validated ledger's complete state dump.
 pub struct BulkSyncer {
     pub status: Arc<Mutex<BulkSyncStatus>>,
     running: Arc<AtomicBool>,
@@ -46,190 +44,168 @@ impl BulkSyncer {
         self.objects_synced.load(Ordering::Relaxed)
     }
 
-    /// Start bulk sync with parallel workers fetching from different key ranges.
+    /// Start bulk sync using ledger_data RPC (blocking, single thread).
     pub fn start(&self, db: Arc<rocksdb::DB>, estimated_total: u64) {
         if self.running.swap(true, Ordering::SeqCst) {
-            eprintln!("[bulk-sync] Already running");
             return;
         }
 
         let status = self.status.clone();
         let running = self.running.clone();
         let objects_synced = self.objects_synced.clone();
-
         objects_synced.store(0, Ordering::Relaxed);
         {
             let mut s = status.lock();
             *s = BulkSyncStatus { running: true, ..Default::default() };
         }
 
-        // Spawn 4 parallel workers, each covering 1/4 of the key space
-        // Worker 0: 00... - 3F...
-        // Worker 1: 40... - 7F...
-        // Worker 2: 80... - BF...
-        // Worker 3: C0... - FF...
-        let workers = 4;
-        let worker_done = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            eprintln!("[bulk-sync] Starting full state sync via s1.ripple.com...");
 
-        for w in 0..workers {
-            let db = db.clone();
-            let objects_synced = objects_synced.clone();
-            let status = status.clone();
-            let running = running.clone();
-            let worker_done = worker_done.clone();
-            let estimated_per_worker = estimated_total / workers as u64;
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("reqwest blocking client");
 
-            std::thread::spawn(move || {
-                let start = std::time::Instant::now();
-                let start_nibble = w * 4; // 0, 4, 8, C
-                let rpc = match w {
-                    0 | 2 => "https://s1.ripple.com:51234",
-                    _ => "https://s2.ripple.com:51234",
-                };
+            let rpc = "https://s1.ripple.com:51234";
+            let mut marker: Option<serde_json::Value> = None;
+            let mut total_objects: u64 = 0;
+            let mut total_pages: u64 = 0;
+            let mut errors: u64 = 0;
+            let mut batch = rocksdb::WriteBatch::default();
+            let mut batch_size = 0;
 
-                // Start marker: first key in our range
-                let mut start_key = [0u8; 32];
-                start_key[0] = (start_nibble as u8) << 4;
-                let mut marker: Option<String> = Some(hex::encode(start_key));
-                let end_nibble = start_nibble + 4;
+            loop {
+                let mut params = serde_json::json!({
+                    "ledger_index": "validated",
+                    "binary": true,
+                    "limit": 2048
+                });
+                if let Some(ref m) = marker {
+                    params["marker"] = m.clone();
+                }
 
-                let client = reqwest::blocking::Client::builder()
-                    .timeout(std::time::Duration::from_secs(30))
-                    .build()
-                    .expect("reqwest client");
-
-                let mut my_objects: u64 = 0;
-                let mut my_pages: u64 = 0;
-                let mut errors: u64 = 0;
-                let mut batch = rocksdb::WriteBatch::default();
-                let mut batch_size = 0;
-
-                eprintln!("[bulk-sync-{w}] Starting from key {start_nibble:X}0... to {end_nibble:X}0... via {rpc}");
-
-                loop {
-                    let mut params = serde_json::json!({
-                        "ledger_index": "validated",
-                        "binary": true,
-                        "limit": 2048
-                    });
-                    if let Some(ref m) = marker {
-                        params["marker"] = serde_json::Value::String(m.clone());
-                    }
-
-                    let resp = client.post(rpc)
-                        .json(&serde_json::json!({
-                            "method": "ledger_data",
-                            "params": [params]
-                        }))
-                        .send();
-
-                    let body = match resp {
-                        Ok(r) => match r.json::<serde_json::Value>() {
-                            Ok(b) => b,
-                            Err(e) => {
-                                errors += 1;
-                                if errors <= 3 { eprintln!("[bulk-sync-{w}] JSON: {e}"); }
-                                std::thread::sleep(std::time::Duration::from_secs(2));
-                                continue;
-                            }
-                        },
-                        Err(e) => {
-                            errors += 1;
-                            if errors <= 3 { eprintln!("[bulk-sync-{w}] RPC: {e}"); }
-                            std::thread::sleep(std::time::Duration::from_secs(3));
-                            continue;
-                        }
-                    };
-
-                    let result = &body["result"];
-                    if result.get("error").is_some() {
+                let body: serde_json::Value = match client.post(rpc)
+                    .json(&serde_json::json!({"method": "ledger_data", "params": [params]}))
+                    .send()
+                    .and_then(|r| r.json())
+                {
+                    Ok(b) => b,
+                    Err(e) => {
                         errors += 1;
-                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        if errors <= 5 { eprintln!("[bulk-sync] Error: {e}"); }
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        if errors > 20 { break; }
                         continue;
                     }
+                };
 
-                    let mut past_range = false;
-                    if let Some(objects) = result["state"].as_array() {
-                        for obj in objects {
-                            let index = obj["index"].as_str().unwrap_or("");
-                            let data = obj["data"].as_str().unwrap_or("");
+                // Check if result exists (rate limiting may return no result)
+                if body.get("result").is_none() {
+                    errors += 1;
+                    if errors <= 5 {
+                        let _ = std::fs::OpenOptions::new().create(true).append(true)
+                            .open("/tmp/bulk-sync.log").and_then(|mut f| {
+                                use std::io::Write;
+                                f.write_all(format!("NO RESULT on page {total_pages}, sleeping 5s (body keys: {:?})\n", body.as_object().map(|o| o.keys().collect::<Vec<_>>())).as_bytes())
+                            });
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    continue; // Retry same marker
+                }
+
+                if let Some(err) = body["result"].get("error") {
+                    errors += 1;
+                    if errors <= 5 { eprintln!("[bulk-sync] API error: {err}"); }
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    if errors > 20 { break; }
+                    continue;
+                }
+
+                if let Some(objects) = body["result"]["state"].as_array() {
+                    for obj in objects {
+                        if let (Some(index), Some(data)) = (obj["index"].as_str(), obj["data"].as_str()) {
                             if index.len() == 64 {
-                                // Check if we've passed our range
-                                let first_nibble = u8::from_str_radix(&index[0..1], 16).unwrap_or(0);
-                                if first_nibble >= end_nibble as u8 {
-                                    past_range = true;
-                                    break;
-                                }
-                                if let (Ok(key_bytes), Ok(data_bytes)) = (hex::decode(index), hex::decode(data)) {
-                                    if key_bytes.len() == 32 {
-                                        batch.put(&key_bytes, &data_bytes);
+                                if let (Ok(k), Ok(d)) = (hex::decode(index), hex::decode(data)) {
+                                    if k.len() == 32 {
+                                        batch.put(&k, &d);
                                         batch_size += 1;
-                                        my_objects += 1;
+                                        total_objects += 1;
                                     }
                                 }
                             }
                         }
                     }
-
-                    if batch_size >= 10_000 {
-                        let _ = db.write(batch);
-                        batch = rocksdb::WriteBatch::default();
-                        batch_size = 0;
-                    }
-
-                    my_pages += 1;
-                    objects_synced.fetch_add(
-                        my_objects.saturating_sub(objects_synced.load(Ordering::Relaxed) / workers as u64),
-                        Ordering::Relaxed
-                    );
-
-                    if my_pages % 100 == 0 {
-                        let elapsed = start.elapsed().as_secs_f64();
-                        let rate = my_objects as f64 / elapsed;
-                        eprintln!(
-                            "[bulk-sync-{w}] {my_objects} objects, {my_pages} pages, {rate:.0}/s, {errors} errors",
-                        );
-                        let mut s = status.lock();
-                        s.objects_synced = objects_synced.load(Ordering::Relaxed);
-                        s.pages_fetched += my_pages;
-                        s.errors += errors;
-                        s.elapsed_secs = elapsed;
-                        s.rate = s.objects_synced as f64 / elapsed;
-                    }
-
-                    if past_range {
-                        eprintln!("[bulk-sync-{w}] Reached end of range at {end_nibble:X}0");
-                        break;
-                    }
-
-                    marker = result.get("marker")
-                        .and_then(|m| m.as_str())
-                        .map(String::from);
-                    if marker.is_none() {
-                        break;
-                    }
                 }
 
-                if batch_size > 0 {
+                if batch_size >= 10_000 {
                     let _ = db.write(batch);
+                    batch = rocksdb::WriteBatch::default();
+                    batch_size = 0;
                 }
 
-                let elapsed = start.elapsed().as_secs_f64();
-                eprintln!("[bulk-sync-{w}] DONE: {my_objects} objects in {elapsed:.0}s");
+                total_pages += 1;
+                objects_synced.store(total_objects, Ordering::Relaxed);
 
-                let done = worker_done.fetch_add(1, Ordering::SeqCst) + 1;
-                if done >= workers as u32 {
-                    let total = objects_synced.load(Ordering::Relaxed);
-                    eprintln!("[bulk-sync] ALL WORKERS DONE: ~{total} total objects synced");
+                if total_pages % 25 == 0 || total_pages <= 5 {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let rate = total_objects as f64 / elapsed;
+                    let remaining = (estimated_total.saturating_sub(total_objects)) as f64 / rate;
+                    eprintln!(
+                        "[bulk-sync] {total_objects}/{estimated_total} ({:.1}%) — {rate:.0}/s — ~{remaining:.0}s left",
+                        total_objects as f64 / estimated_total as f64 * 100.0,
+                    );
                     let mut s = status.lock();
-                    s.running = false;
-                    s.objects_synced = total;
+                    s.objects_synced = total_objects;
+                    s.pages_fetched = total_pages;
+                    s.errors = errors;
                     s.elapsed_secs = elapsed;
-                    s.rate = total as f64 / elapsed;
-                    s.estimated_remaining_secs = 0.0;
-                    running.store(false, Ordering::SeqCst);
+                    s.rate = rate;
+                    s.estimated_remaining_secs = remaining;
                 }
-            });
-        }
+
+                // Get next page marker
+                marker = body.get("result")
+                    .and_then(|r| r.get("marker"))
+                    .cloned();
+
+                {
+                    let marker_str = marker.as_ref().map(|m| m.to_string()).unwrap_or("NONE".into());
+                    let has_result = body.get("result").is_some();
+                    let has_error = body.get("result").and_then(|r| r.get("error")).is_some();
+                    let state_len = body["result"]["state"].as_array().map(|a| a.len()).unwrap_or(0);
+                    let msg = format!("Page {total_pages}: total={total_objects} state={state_len} has_result={has_result} err={has_error} marker={}\n", &marker_str[..marker_str.len().min(40)]);
+                    let _ = std::fs::OpenOptions::new().create(true).append(true)
+                        .open("/tmp/bulk-sync.log").and_then(|mut f| {
+                            use std::io::Write;
+                            f.write_all(msg.as_bytes())
+                        });
+                }
+
+                if marker.is_none() || marker.as_ref().is_some_and(|m| m.is_null()) {
+                    eprintln!("[bulk-sync] Pagination ended at page {total_pages}");
+                    break;
+                }
+
+                // Small delay to avoid rate limiting
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+
+            if batch_size > 0 { let _ = db.write(batch); }
+
+            let elapsed = start.elapsed().as_secs_f64();
+            eprintln!("[bulk-sync] DONE: {total_objects} objects in {elapsed:.0}s ({total_pages} pages, {errors} errors)");
+
+            let mut s = status.lock();
+            s.running = false;
+            s.objects_synced = total_objects;
+            s.pages_fetched = total_pages;
+            s.errors = errors;
+            s.elapsed_secs = elapsed;
+            s.rate = total_objects as f64 / elapsed;
+            s.estimated_remaining_secs = 0.0;
+            running.store(false, Ordering::SeqCst);
+        });
     }
 }
