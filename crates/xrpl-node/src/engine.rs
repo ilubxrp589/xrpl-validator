@@ -63,6 +63,63 @@ fn extract_xrp_balance(data: &[u8]) -> Option<u64> {
     None
 }
 
+/// Set the XRP balance in a raw binary AccountRoot object.
+/// Finds the 0x61 (Balance) field and overwrites the 8-byte amount in-place.
+/// Returns the modified data, or None if the balance field wasn't found.
+fn set_xrp_balance(data: &mut [u8], new_drops: u64) -> bool {
+    let start = 7.min(data.len());
+    for i in start..data.len().saturating_sub(9) {
+        if data[i] == 0x61 {
+            let amount_bytes: [u8; 8] = match data[i+1..i+9].try_into() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let raw = u64::from_be_bytes(amount_bytes);
+            if raw & 0x8000000000000000 != 0 { continue; } // skip IOUs
+            // Encode new XRP balance: bit 62 set = positive, bits 0-61 = drops
+            let new_raw = if new_drops > 0 {
+                0x4000000000000000 | new_drops
+            } else {
+                0x4000000000000000 // zero balance
+            };
+            data[i+1..i+9].copy_from_slice(&new_raw.to_be_bytes());
+            return true;
+        }
+    }
+    false
+}
+
+/// Extract the Destination account ID from a raw binary transaction.
+/// Scans for field code 0x83 (STI_ACCOUNT type=8, field=3 = Destination)
+/// followed by a VL-length byte (0x14 = 20 bytes) and 20-byte account ID.
+pub fn extract_destination(tx_data: &[u8]) -> Option<[u8; 20]> {
+    for i in 0..tx_data.len().saturating_sub(22) {
+        if tx_data[i] == 0x83 && tx_data[i + 1] == 0x14 {
+            let mut id = [0u8; 20];
+            id.copy_from_slice(&tx_data[i + 2..i + 22]);
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// Extract the Amount (XRP drops) from a raw binary transaction.
+/// Scans for field code 0x61 (STI_AMOUNT type=6, field=1 = Amount).
+pub fn extract_tx_amount(tx_data: &[u8]) -> Option<u64> {
+    for i in 0..tx_data.len().saturating_sub(9) {
+        if tx_data[i] == 0x61 {
+            let amount_bytes: [u8; 8] = tx_data[i+1..i+9].try_into().ok()?;
+            let raw = u64::from_be_bytes(amount_bytes);
+            // Only XRP amounts (bit 63 = 0), positive (bit 62 = 1)
+            if raw & 0x8000000000000000 != 0 { continue; } // IOU
+            if raw & 0x4000000000000000 == 0 { continue; } // negative/zero
+            let drops = raw & 0x3FFFFFFFFFFFFFFF;
+            return Some(drops);
+        }
+    }
+    None
+}
+
 /// Live engine state — RocksDB backed.
 pub struct LiveEngine {
     db: Arc<rocksdb::DB>,
@@ -81,6 +138,8 @@ pub struct LiveEngine {
     pub total_failed: u64,
     /// Accounts modified this round (for verification).
     round_modified: Vec<([u8; 20], u64, u64)>, // (account_id, balance_before, fee)
+    /// Keylets modified this round (for SHAMap incremental update).
+    round_modified_keys: Vec<Hash256>,
     /// Verification stats.
     pub verified_match: u64,
     pub verified_mismatch: u64,
@@ -158,6 +217,7 @@ impl LiveEngine {
             total_applied: 0,
             total_failed: 0,
             round_modified: Vec::new(),
+            round_modified_keys: Vec::new(),
             verified_match: 0,
             verified_mismatch: 0,
             verified_total: 0,
@@ -186,17 +246,21 @@ impl LiveEngine {
         self.db.delete(key).map_err(|e| format!("rocksdb delete: {e}"))
     }
 
-    /// Apply a decoded transaction to the state.
+    /// Apply a decoded transaction to the state with full write-back.
+    ///
+    /// Deducts the fee from the sender's balance and writes it back to RocksDB.
+    /// For XRP Payment transactions, also credits the destination account.
+    /// Returns (success, fee_burned).
     pub fn apply_transaction(
         &mut self,
-        _tx_type: &str,
+        tx_type: &str,
         account_id: &[u8; 20],
         fee: u64,
-        _fields: &serde_json::Value,
+        raw_tx: &[u8],
     ) -> (bool, u64) {
         let acct_key = xrpl_ledger::ledger::keylet::account_root_key(account_id);
 
-        let acct_data = match self.get(&acct_key.0) {
+        let mut acct_data = match self.get(&acct_key.0) {
             Some(d) => d,
             None => {
                 self.queue_fetch(account_id, &acct_key);
@@ -211,7 +275,6 @@ impl LiveEngine {
         let balance = match extract_xrp_balance(&acct_data) {
             Some(b) => b,
             None => {
-                // Bad cached entry — delete and re-fetch next time
                 let _ = self.db.delete(&acct_key.0);
                 self.queue_fetch(account_id, &acct_key);
                 self.round_failed += 1; self.total_failed += 1;
@@ -224,25 +287,65 @@ impl LiveEngine {
             return (false, 0);
         }
 
-        // Don't write back — just track the fee destruction
+        // --- Fee deduction: debit sender and write back ---
+        let new_sender_balance = balance - fee;
+
+        // For Payment txs, also debit the sent amount
+        let mut xrp_sent: u64 = 0;
+        if tx_type == "Payment" {
+            if let Some(amount) = extract_tx_amount(raw_tx) {
+                if new_sender_balance >= amount {
+                    xrp_sent = amount;
+                }
+                // If insufficient balance for amount, tx still succeeds for fee
+                // (the payment itself would fail but fee is still burned)
+            }
+        }
+
+        let final_sender_balance = new_sender_balance.saturating_sub(xrp_sent);
+        if set_xrp_balance(&mut acct_data, final_sender_balance) {
+            let _ = self.db.put(&acct_key.0, &acct_data);
+            self.round_modified_keys.push(acct_key);
+        }
+
+        // --- Credit destination for XRP Payments ---
+        if xrp_sent > 0 {
+            if let Some(dest_id) = extract_destination(raw_tx) {
+                let dest_key = xrpl_ledger::ledger::keylet::account_root_key(&dest_id);
+                if let Some(mut dest_data) = self.get(&dest_key.0) {
+                    if let Some(dest_balance) = extract_xrp_balance(&dest_data) {
+                        let new_dest_balance = dest_balance.saturating_add(xrp_sent);
+                        if set_xrp_balance(&mut dest_data, new_dest_balance) {
+                            let _ = self.db.put(&dest_key.0, &dest_data);
+                            self.round_modified_keys.push(dest_key);
+                        }
+                    }
+                } else {
+                    // Destination not in our DB — queue fetch
+                    self.queue_fetch(&dest_id, &dest_key);
+                }
+            }
+        }
 
         self.total_coins = self.total_coins.saturating_sub(fee);
         self.round_applied += 1;
         self.total_applied += 1;
 
-        // Track for verification: balance before our deduction + fee amount
+        // Track for verification
         self.round_modified.push((*account_id, balance, fee));
 
         (true, fee)
     }
 
-    /// Called when a new ledger round starts. Returns accounts to verify from the previous round.
-    pub fn new_round(&mut self, ledger_seq: u32) -> Vec<([u8; 20], u64, u64)> {
+    /// Called when a new ledger round starts.
+    /// Returns (accounts to verify, keylets modified) from the previous round.
+    pub fn new_round(&mut self, ledger_seq: u32) -> (Vec<([u8; 20], u64, u64)>, Vec<Hash256>) {
         let prev_modified = std::mem::take(&mut self.round_modified);
+        let prev_keys = std::mem::take(&mut self.round_modified_keys);
         self.ledger_seq = ledger_seq;
         self.round_applied = 0;
         self.round_failed = 0;
-        prev_modified
+        (prev_modified, prev_keys)
     }
 
     /// Record verification result.

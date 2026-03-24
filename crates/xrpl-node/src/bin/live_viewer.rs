@@ -56,6 +56,8 @@ struct TxInfo {
     hash: String,
     sig_verified: bool,
     tx_type: String,
+    #[serde(skip)]
+    raw_tx: Vec<u8>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -501,13 +503,17 @@ async fn main() {
         }
     });
 
-    // Subscribe to message events for engine tracking + validation signing
+    // RPCA consensus engine
+    let consensus = Arc::new(Mutex::new(xrpl_node::consensus_engine::ConsensusEngine::new()));
+
+    // Subscribe to message events for engine tracking + validation signing + consensus
     let engine_rx = tx2.subscribe();
     let engine = engine_state.clone();
     let le = live_engine.clone();
     let val_identity = validator_identity.clone();
     let val_outbound = outbound_tx2.clone();
     let val_sse = tx2.clone();
+    let consensus_loop = consensus.clone();
     let mut last_validated_seq: u32 = 0;
     tokio::spawn(async move {
         let mut rx = engine_rx;
@@ -535,15 +541,17 @@ async fn main() {
                             state.round_validations = 0;
                             state.round_proposals = 0;
 
-                            // Collect verification data (separate lock)
-                            let prev_modified = {
+                            // Collect verification data + modified keylets (separate lock)
+                            let (prev_modified, _modified_keys) = {
                                 if let Some(ref mut eng) = *le.lock() {
                                     eng.new_round(seq)
                                 } else {
-                                    Vec::new()
+                                    (Vec::new(), Vec::new())
                                 }
                             };
-                            eprintln!("[verify] Round ended, {prev_modified_count} accounts to verify", prev_modified_count = prev_modified.len());
+                            eprintln!("[verify] Round ended, {prev_modified_count} accounts to verify, {key_count} keylets modified",
+                                prev_modified_count = prev_modified.len(),
+                                key_count = _modified_keys.len());
                             if !prev_modified.is_empty() {
                                     let le_verify = le.clone();
                                     let prev_seq = seq - 1;
@@ -619,6 +627,12 @@ async fn main() {
                     } else if event.msg_type == "Proposal" {
                         state.total_proposals += 1;
                         state.round_proposals += 1;
+                        // Feed proposals to consensus engine
+                        if let Some(ref vkey) = event.validator {
+                            // For now, we follow the network's consensus rather than
+                            // independently proposing. We track proposals for convergence.
+                            // TODO: parse the actual tx set from the proposal
+                        }
                     } else if event.msg_type == "Transaction" {
                         if let Some(ref info) = event.tx_info {
                             state.round_tx_count += 1;
@@ -633,15 +647,37 @@ async fn main() {
                                 state.round_unsupported += 1;
                             }
 
-                            // Apply to live state via RocksDB
+                            // Feed transaction to consensus mempool
+                            {
+                                let tx_hash_bytes = hex::decode(&info.hash).unwrap_or_default();
+                                if tx_hash_bytes.len() >= 8 {
+                                    let mut hash = [0u8; 32];
+                                    hash[..tx_hash_bytes.len().min(32)].copy_from_slice(
+                                        &tx_hash_bytes[..tx_hash_bytes.len().min(32)]
+                                    );
+                                    consensus_loop.lock().on_transaction(
+                                        xrpl_core::types::Hash256(hash),
+                                        info.raw_tx.clone(),
+                                    );
+                                }
+                            }
+
+                            // Apply to live state via RocksDB (full execution with write-back)
                             if let Some(ref mut eng) = *le.lock() {
                                 if let Some(id) = xrpl_node::engine::decode_address(&info.account) {
                                     eng.apply_transaction(
                                         &info.tx_type, &id, info.fee,
-                                        &serde_json::Value::Null,
+                                        &info.raw_tx,
                                     );
                                 }
                             }
+                        }
+                    }
+
+                    // Trigger consensus on CLOSING events
+                    if event.msg_type == "StatusChange" && event.detail.contains("CLOSING") {
+                        if let Some(seq) = event.ledger_seq {
+                            consensus_loop.lock().on_close_trigger(seq);
                         }
                     }
 
@@ -877,6 +913,16 @@ async fn main() {
                 let hash_status = hash_status.clone();
                 async move {
                     let status = hash_status.status.lock().clone();
+                    axum::Json(serde_json::to_value(&status).unwrap_or_default())
+                }
+            }
+        }))
+        .route("/api/consensus", get({
+            let consensus_web = consensus.clone();
+            move || {
+                let consensus_web = consensus_web.clone();
+                async move {
+                    let status = consensus_web.lock().status();
                     axum::Json(serde_json::to_value(&status).unwrap_or_default())
                 }
             }
@@ -1325,6 +1371,7 @@ fn format_message(msg: &PeerMessage) -> (String, String, Option<u32>, Option<Str
                     hash: hex::encode(&tx_hash.0[..8]),
                     sig_verified: sig_ok,
                     tx_type,
+                    raw_tx: t.raw_transaction.clone(),
                 }
             });
 

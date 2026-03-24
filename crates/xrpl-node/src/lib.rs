@@ -16,6 +16,7 @@
 
 pub mod config;
 pub mod consensus;
+pub mod consensus_engine;
 pub mod engine;
 pub mod error;
 pub mod mempool;
