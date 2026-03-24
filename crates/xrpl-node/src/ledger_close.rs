@@ -73,10 +73,39 @@ pub fn decode_raw_tx(raw_tx: &[u8]) -> Option<(Hash256, TxFields)> {
     Some((tx_hash, tx_fields))
 }
 
-/// Decode a raw binary ledger object (AccountRoot, etc.) to JSON.
-/// Uses the same codec as transaction decoding — XRPL serialization is uniform.
-pub fn decode_ledger_object(binary: &[u8]) -> Option<serde_json::Value> {
-    xrpl_core::codec::decode_transaction_binary(binary).ok()
+/// Decode a ledger object to JSON.
+/// Handles both formats: raw binary (XRPL serialization) and already-JSON.
+/// Tolerant of trailing bytes (network objects may have appended index/metadata).
+pub fn decode_ledger_object(data: &[u8]) -> Option<serde_json::Value> {
+    // Check if it's already JSON (starts with '{')
+    if data.first() == Some(&0x7B) {
+        // Try direct parse first
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(data) {
+            return Some(v);
+        }
+        // JSON might be corrupted — try parsing just the valid prefix
+        // (find the last '}' and parse up to there)
+        if let Some(end) = data.iter().rposition(|&b| b == 0x7D) {
+            return serde_json::from_slice(&data[..=end]).ok();
+        }
+        return None;
+    }
+    // Try binary decode — be tolerant of trailing bytes
+    // The codec is strict about consuming all bytes, but RocksDB entries
+    // from network RPC may have extra data (index, metadata bytes).
+    // Strategy: try full, then progressively strip trailing bytes.
+    if let Ok(v) = xrpl_core::codec::decode_transaction_binary(data) {
+        return Some(v);
+    }
+    // Try stripping trailing bytes — the object likely ends before the data does
+    for trim in [30, 32, 48, 53, 64, 76] {
+        if data.len() > trim {
+            if let Ok(v) = xrpl_core::codec::decode_transaction_binary(&data[..data.len() - trim]) {
+                return Some(v);
+            }
+        }
+    }
+    None
 }
 
 /// Result of a ledger close operation.
@@ -157,17 +186,43 @@ pub fn close_ledger(
     // Load affected accounts from RocksDB into the state SHAMap
     let mut loaded = 0;
     let mut failed = 0;
+    let mut missing = 0;
     for account_id in &affected_accounts {
         let acct_key = keylet::account_root_key(account_id);
-        if let Some(binary_data) = db.get(&acct_key.0).ok().flatten() {
-            if let Some(json_obj) = decode_ledger_object(&binary_data) {
-                if let Ok(json_bytes) = serde_json::to_vec(&json_obj) {
-                    let _ = state.state_map.insert(acct_key, json_bytes);
-                    loaded += 1;
-                } else {
-                    failed += 1;
+        match db.get(&acct_key.0) {
+            Ok(Some(binary_data)) => {
+                match decode_ledger_object(&binary_data) {
+                    Some(json_obj) => {
+                        if let Ok(json_bytes) = serde_json::to_vec(&json_obj) {
+                            let _ = state.state_map.insert(acct_key, json_bytes);
+                            loaded += 1;
+                        } else {
+                            failed += 1;
+                        }
+                    }
+                    None => {
+                        // Decode failed — log first few with actual error
+                        if failed < 3 {
+                            let err = if binary_data.first() == Some(&0x7B) {
+                                format!("JSON parse: {:?}", serde_json::from_slice::<serde_json::Value>(&binary_data).err())
+                            } else {
+                                format!("Binary decode: {:?}", xrpl_core::codec::decode_transaction_binary(&binary_data).err())
+                            };
+                            eprintln!(
+                                "[ledger-close] Decode failed key={} len={} err={}",
+                                hex::encode(&acct_key.0[..8]),
+                                binary_data.len(),
+                                err,
+                            );
+                        }
+                        failed += 1;
+                    }
                 }
-            } else {
+            }
+            Ok(None) => {
+                missing += 1;
+            }
+            Err(_) => {
                 failed += 1;
             }
         }
@@ -178,7 +233,7 @@ pub fn close_ledger(
     }
 
     eprintln!(
-        "[ledger-close] Loaded {loaded}/{} affected accounts ({failed} decode failures), applying {} txs",
+        "[ledger-close] Loaded {loaded}/{} affected accounts ({failed} decode failures, {missing} missing), applying {} txs",
         affected_accounts.len(), tx_fields.len()
     );
 
