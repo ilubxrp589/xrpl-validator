@@ -23,6 +23,7 @@ pub mod node;
 pub mod overlay;
 pub mod peer;
 pub mod rpc;
+pub mod state_hash;
 pub mod validation;
 
 pub use config::{NodeConfig, NodeMode};

@@ -288,13 +288,13 @@ async function poll() {
     // Live engine hit rate
     if (d.live_engine && d.live_engine.active) {
       const la = d.live_engine.total_applied;
-      const lf = d.live_engine.round_failed;
+      const lf = d.live_engine.total_failed || 0;
       const lt = la + lf;
       const hr = lt > 0 ? ((la / lt) * 100).toFixed(1) : '100.0';
       document.getElementById('m-engine-hit').textContent = hr + '%';
       document.getElementById('m-engine-applied').textContent = la.toLocaleString();
-      document.getElementById('m-engine-entries').textContent = d.live_engine.sled_entries.toLocaleString();
-      window._lastEngineEntries = d.live_engine.sled_entries;
+      document.getElementById('m-engine-entries').textContent = d.live_engine.entries.toLocaleString();
+      window._lastEngineEntries = d.live_engine.entries;
     }
 
     // Engine coverage

@@ -374,7 +374,7 @@ async function pollEngine() {
     document.getElementById('engine-cov').textContent = cov;
     if (d.live_engine && d.live_engine.active) {
       const la = d.live_engine.total_applied;
-      const lf = d.live_engine.round_failed;
+      const lf = d.live_engine.total_failed || 0;
       const lt = la + lf;
       document.getElementById('engine-hit').textContent = lt > 0 ? ((la/lt)*100).toFixed(1)+'%' : '100%';
     }

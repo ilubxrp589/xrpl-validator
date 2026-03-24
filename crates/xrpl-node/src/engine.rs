@@ -42,28 +42,20 @@ fn bs58_encode(_bytes: &[u8]) -> String {
 /// Extract XRP Balance from raw binary AccountRoot.
 /// Scans for field code 0x61 (Amount type=6, field=1 = Balance)
 /// followed by 8 bytes of XRP amount encoding.
+/// Public version for use in verification
+pub fn extract_xrp_balance_pub(data: &[u8]) -> Option<u64> {
+    extract_xrp_balance(data)
+}
+
 fn extract_xrp_balance(data: &[u8]) -> Option<u64> {
     // Scan for 0x61 byte (sfBalance = STI_AMOUNT | 1)
-    // Skip the first 4 bytes — field headers in an AccountRoot always come
-    // after at least the object type and flags fields, so a match at i < 4
-    // is almost certainly a false positive on payload data.
     // Start at offset 7 to skip LedgerEntryType (0x11 0x00 0x61) + Flags (0x22 + 4 bytes)
-    // The 0x61 at offset 2 is the AccountRoot type VALUE, not the Balance field
     let start = 7.min(data.len());
     for i in start..data.len().saturating_sub(9) {
         if data[i] == 0x61 {
-            // Next 8 bytes are the XRP amount
             let amount_bytes: [u8; 8] = data[i+1..i+9].try_into().ok()?;
             let raw = u64::from_be_bytes(amount_bytes);
-            // XRP amounts: bit 63 = 0 (not IOU), bit 62 = 1 (positive)
-            // Validate: bit 63 must be 0 (native XRP, not IOU)
-            //           bit 62 must be 1 (positive amount)
-            if raw & 0x8000000000000000 != 0 {
-                // Bit 63 set — this is an IOU amount, not XRP; skip
-                continue;
-            }
-            // Bit 62: 1 = positive, 0 = zero/negative
-            // Accept both — zero balance accounts are valid
+            if raw & 0x8000000000000000 != 0 { continue; }
             let drops = raw & 0x3FFFFFFFFFFFFFFF;
             return Some(drops);
         }
@@ -85,6 +77,14 @@ pub struct LiveEngine {
     pub round_failed: u32,
     /// Total transactions applied since startup.
     pub total_applied: u64,
+    /// Total failures since startup.
+    pub total_failed: u64,
+    /// Accounts modified this round (for verification).
+    round_modified: Vec<([u8; 20], u64, u64)>, // (account_id, balance_before, fee)
+    /// Verification stats.
+    pub verified_match: u64,
+    pub verified_mismatch: u64,
+    pub verified_total: u64,
 }
 
 impl LiveEngine {
@@ -125,7 +125,7 @@ impl LiveEngine {
                         Ok(v) => v,
                         Err(_) => break,
                     };
-                    let resp = client.post("https://xrplcluster.com")
+                    let resp = client.post("https://s2.ripple.com:51234")
                         .json(&serde_json::json!({
                             "method": "ledger_entry",
                             "params": [{"index": hex::encode(key), "binary": true, "ledger_index": "validated"}]
@@ -156,6 +156,11 @@ impl LiveEngine {
             round_applied: 0,
             round_failed: 0,
             total_applied: 0,
+            total_failed: 0,
+            round_modified: Vec::new(),
+            verified_match: 0,
+            verified_mismatch: 0,
+            verified_total: 0,
         })
     }
 
@@ -195,7 +200,7 @@ impl LiveEngine {
             Some(d) => d,
             None => {
                 self.queue_fetch(account_id, &acct_key);
-                self.round_failed += 1;
+                self.round_failed += 1; self.total_failed += 1;
                 if self.round_failed <= 3 {
                     eprintln!("[engine] MISS key={}", hex::encode(&acct_key.0[..8]));
                 }
@@ -209,13 +214,13 @@ impl LiveEngine {
                 // Bad cached entry — delete and re-fetch next time
                 let _ = self.db.delete(&acct_key.0);
                 self.queue_fetch(account_id, &acct_key);
-                self.round_failed += 1;
+                self.round_failed += 1; self.total_failed += 1;
                 return (false, fee);
             }
         };
 
         if balance < fee {
-            self.round_failed += 1;
+            self.round_failed += 1; self.total_failed += 1;
             return (false, 0);
         }
 
@@ -225,14 +230,31 @@ impl LiveEngine {
         self.round_applied += 1;
         self.total_applied += 1;
 
+        // Track for verification: balance before our deduction + fee amount
+        self.round_modified.push((*account_id, balance, fee));
+
         (true, fee)
     }
 
-    /// Called when a new ledger round starts.
-    pub fn new_round(&mut self, ledger_seq: u32) {
+    /// Called when a new ledger round starts. Returns accounts to verify from the previous round.
+    pub fn new_round(&mut self, ledger_seq: u32) -> Vec<([u8; 20], u64, u64)> {
+        let prev_modified = std::mem::take(&mut self.round_modified);
         self.ledger_seq = ledger_seq;
         self.round_applied = 0;
         self.round_failed = 0;
+        prev_modified
+    }
+
+    /// Record verification result.
+    pub fn record_verification(&mut self, matches: u32, mismatches: u32) {
+        self.verified_match += matches as u64;
+        self.verified_mismatch += mismatches as u64;
+        self.verified_total += (matches + mismatches) as u64;
+    }
+
+    /// Get DB handle for background verification.
+    pub fn db_ref(&self) -> &Arc<rocksdb::DB> {
+        &self.db
     }
 
     /// Estimated entry count.
@@ -242,6 +264,12 @@ impl LiveEngine {
             .flatten()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0)
+    }
+
+    /// Get a snapshot of the DB for consistent iteration.
+    /// Returns an Arc to the DB for use in background tasks.
+    pub fn db_arc(&self) -> Arc<rocksdb::DB> {
+        self.db.clone()
     }
 }
 

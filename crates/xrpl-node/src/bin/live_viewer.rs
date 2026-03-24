@@ -151,8 +151,8 @@ async fn main() {
     let (tx, _) = broadcast::channel::<MessageEvent>(1000);
     let tx2 = tx.clone();
 
-    // Outbound message channel — validation messages to broadcast to all peers
-    let (outbound_tx, _) = broadcast::channel::<Vec<u8>>(100);
+    // Outbound message channel — validation + transaction relay to broadcast to all peers
+    let (outbound_tx, _) = broadcast::channel::<Vec<u8>>(2000);
     let outbound_tx2 = outbound_tx.clone();
 
     // Message dedup: hash of recent messages to avoid duplicates from multiple peers
@@ -237,7 +237,12 @@ async fn main() {
     eprintln!("[validator] Manifest built ({} bytes)", manifest_bytes.len());
 
     // Dedicated validation senders — multiple peers for redundancy
-    for relay_peer in &["s1.ripple.com:51235", "s2.ripple.com:51235"] {
+    for relay_peer in &[
+        "s1.ripple.com:51235",
+        "s2.ripple.com:51235",
+        "xrplcluster.com:51235",
+        "r.ripple.com:51235",
+    ] {
         let peer = relay_peer.to_string();
         let val_send_outbound = outbound_tx.clone();
         let val_send_manifest = manifest_frame.clone();
@@ -314,6 +319,22 @@ async fn main() {
         }
     });
 
+    // Live engine — opens RocksDB and applies transactions to real state
+    // (created early so peer connections can serve ledger data)
+    let rocks_db_path = std::env::var("XRPL_ROCKS_PATH").unwrap_or_else(|_| "/mnt/xrpl-data/sync/state.rocks".to_string());
+    let live_engine: Arc<Mutex<Option<xrpl_node::engine::LiveEngine>>> = Arc::new(Mutex::new(
+        match xrpl_node::engine::LiveEngine::open(std::path::Path::new(&rocks_db_path)) {
+            Ok(e) => {
+                eprintln!("[live-engine] Opened RocksDB with {} entries", e.entry_count());
+                Some(e)
+            }
+            Err(e) => {
+                eprintln!("[live-engine] Failed to open RocksDB: {e}");
+                None
+            }
+        }
+    ));
+
     // Spawn connections to seed peers
     for peer in MAINNET_PEERS {
         spawn_peer_connection(
@@ -326,6 +347,7 @@ async fn main() {
             connected_peers.clone(),
             outbound_tx.clone(),
             manifest_frame.clone(),
+            live_engine.clone(),
         );
     }
 
@@ -398,27 +420,6 @@ async fn main() {
         }
     });
 
-    // Live engine — opens sled DB and applies transactions to real state
-    // Disabled while sync is running (sled lock conflict)
-    let sync_running = std::fs::metadata("/mnt/xrpl-data/sync/state.sled/db")
-        .and_then(|m| m.modified())
-        .map(|t| t.elapsed().map(|e| e.as_secs() < 60).unwrap_or(false))
-        .unwrap_or(false);
-
-    let rocks_db_path = std::env::var("XRPL_ROCKS_PATH").unwrap_or_else(|_| "/mnt/xrpl-data/sync/state.rocks".to_string());
-    let live_engine: Arc<Mutex<Option<xrpl_node::engine::LiveEngine>>> = Arc::new(Mutex::new(
-        match xrpl_node::engine::LiveEngine::open(std::path::Path::new(&rocks_db_path)) {
-            Ok(e) => {
-                eprintln!("[live-engine] Opened sled with {} entries", e.entry_count());
-                Some(e)
-            }
-            Err(e) => {
-                eprintln!("[live-engine] Failed to open sled: {e}");
-                None
-            }
-        }
-    ));
-
     // Engine state — load persisted stats, then track consensus round stats
     let persisted = PersistedStats::load();
     eprintln!("[engine] Loaded persisted stats: {} txs, {} ledgers, {} fees burned",
@@ -434,8 +435,20 @@ async fn main() {
         .as_millis() as u64;
     let engine_state: Arc<Mutex<EngineState>> = Arc::new(Mutex::new(initial_state));
 
-    // Background task: poll total_coins from network every 30s
+    // State hash computation — build SHAMap from RocksDB in background
+    let state_hash_computer = Arc::new(xrpl_node::state_hash::StateHashComputer::new());
+    {
+        let engine_guard = live_engine.lock();
+        if let Some(ref eng) = *engine_guard {
+            let db = eng.db_arc();
+            let estimated = eng.entry_count() as u64;
+            state_hash_computer.start_computation(db, estimated);
+        }
+    }
+
+    // Background task: poll total_coins + account_hash from network every 30s
     let coins_engine = engine_state.clone();
+    let hash_computer = state_hash_computer.clone();
     tokio::spawn(async move {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -443,7 +456,7 @@ async fn main() {
             .expect("reqwest client builder failed");
         loop {
             if let Ok(resp) = client
-                .post("https://xrplcluster.com")
+                .post("https://s2.ripple.com:51234")
                 .json(&serde_json::json!({
                     "method": "ledger",
                     "params": [{"ledger_index": "validated"}]
@@ -458,6 +471,13 @@ async fn main() {
                             state.network_total_coins = coins;
                             state.lifetime_burned = ORIGINAL_SUPPLY_DROPS.saturating_sub(coins);
                         }
+                    }
+                    // Also capture account_hash for state verification
+                    if let Some(account_hash) = body["result"]["ledger"]["account_hash"].as_str() {
+                        let seq = body["result"]["ledger"]["ledger_index"].as_str()
+                            .and_then(|s| s.parse::<u32>().ok())
+                            .unwrap_or(0);
+                        hash_computer.set_network_hash(account_hash, seq);
                     }
                 }
             }
@@ -514,6 +534,78 @@ async fn main() {
                             state.round_unsupported = 0;
                             state.round_validations = 0;
                             state.round_proposals = 0;
+
+                            // Collect verification data (separate lock)
+                            let prev_modified = {
+                                if let Some(ref mut eng) = *le.lock() {
+                                    eng.new_round(seq)
+                                } else {
+                                    Vec::new()
+                                }
+                            };
+                            eprintln!("[verify] Round ended, {prev_modified_count} accounts to verify", prev_modified_count = prev_modified.len());
+                            if !prev_modified.is_empty() {
+                                    let le_verify = le.clone();
+                                    let prev_seq = seq - 1;
+                                    tokio::spawn(async move {
+                                        // Verify a sample (up to 10) against RPC
+                                        let sample: Vec<_> = prev_modified.iter()
+                                            .take(10)
+                                            .cloned()
+                                            .collect();
+
+                                        let client = reqwest::Client::builder()
+                                            .timeout(Duration::from_secs(5))
+                                            .build()
+                                            .unwrap_or_default();
+
+                                        let mut matches = 0u32;
+                                        let mut mismatches = 0u32;
+
+                                        for (acct_id, balance_before, fee) in &sample {
+                                            let acct_key = xrpl_ledger::ledger::keylet::account_root_key(acct_id);
+                                            let index_hex = hex::encode(acct_key.0);
+                                            let resp = client.post("https://s2.ripple.com:51234")
+                                                .json(&serde_json::json!({
+                                                    "method": "ledger_entry",
+                                                    "params": [{"index": index_hex, "binary": true, "ledger_index": prev_seq}]
+                                                }))
+                                                .send()
+                                                .await;
+
+                                            if let Ok(r) = resp {
+                                                if let Ok(body) = r.json::<serde_json::Value>().await {
+                                                    if let Some(data_hex) = body["result"]["node_binary"].as_str() {
+                                                        if let Ok(data) = hex::decode(data_hex) {
+                                                            if let Some(net_balance) = xrpl_node::engine::extract_xrp_balance_pub(&data) {
+                                                                // Verify: network balance should be <= our balance_before - fee
+                                                                // (could be lower due to other txs in the round)
+                                                                let expected_max = balance_before.saturating_sub(*fee);
+                                                                if net_balance <= expected_max {
+                                                                    matches += 1;
+                                                                } else {
+                                                                    mismatches += 1;
+                                                                    if mismatches <= 2 {
+                                                                        eprintln!("[verify] Balance mismatch: before={} fee={} expected_max={} network={}", balance_before, fee, expected_max, net_balance);
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        if matches + mismatches > 0 {
+                                            if let Some(ref mut eng) = *le_verify.lock() {
+                                                eng.record_verification(matches, mismatches);
+                                            }
+                                            if mismatches > 0 {
+                                                eprintln!("[verify] Ledger #{prev_seq}: {matches}/{} matched, {mismatches} MISMATCH", matches + mismatches);
+                                            }
+                                        }
+                                    });
+                            }
                         }
                     }
 
@@ -541,7 +633,7 @@ async fn main() {
                                 state.round_unsupported += 1;
                             }
 
-                            // Apply to live state via sled
+                            // Apply to live state via RocksDB
                             if let Some(ref mut eng) = *le.lock() {
                                 if let Some(id) = xrpl_node::engine::decode_address(&info.account) {
                                     eng.apply_transaction(
@@ -576,8 +668,18 @@ async fn main() {
                                     eprintln!("[validator] No ledger hash for #{seq}, skipping");
                                 } else {
 
+                                // On flag ledgers (every 256th), include amendment votes
+                                let amendments = if xrpl_node::consensus::amendment_vote::is_flag_ledger(seq) {
+                                    let a = xrpl_node::validation::supported_amendments();
+                                    eprintln!("[validator] Flag ledger #{seq} — voting on {} amendments", a.len());
+                                    Some(a)
+                                } else {
+                                    None
+                                };
+
                                 let validation_bytes = xrpl_node::validation::sign_validation(
                                     &val_identity, seq, &ledger_hash_bytes,
+                                    amendments.as_deref(),
                                 );
 
                                 if !validation_bytes.is_empty() {
@@ -719,13 +821,21 @@ async fn main() {
                     let mut json = serde_json::to_value(&state).unwrap_or_default();
                     // Add live engine stats
                     if let Some(ref eng) = *le_web.lock() {
+                        let verify_pct = if eng.verified_total > 0 {
+                            eng.verified_match as f64 / eng.verified_total as f64 * 100.0
+                        } else { 0.0 };
                         json["live_engine"] = serde_json::json!({
                             "active": true,
-                            "sled_entries": eng.entry_count(),
+                            "entries": eng.entry_count(),
                             "round_applied": eng.round_applied,
                             "round_failed": eng.round_failed,
                             "total_applied": eng.total_applied,
+                            "total_failed": eng.total_failed,
                             "total_coins": eng.total_coins,
+                            "verified_match": eng.verified_match,
+                            "verified_mismatch": eng.verified_mismatch,
+                            "verified_total": eng.verified_total,
+                            "verify_pct": (verify_pct * 10.0).round() / 10.0,
                         });
                     } else {
                         json["live_engine"] = serde_json::json!({"active": false});
@@ -760,6 +870,16 @@ async fn main() {
                 "peer_details": peer_details,
                 "discovered": discovered,
             }))
+        }))
+        .route("/api/state-hash", get({
+            let hash_status = state_hash_computer.clone();
+            move || {
+                let hash_status = hash_status.clone();
+                async move {
+                    let status = hash_status.status.lock().clone();
+                    axum::Json(serde_json::to_value(&status).unwrap_or_default())
+                }
+            }
         }));
 
     let addr = "127.0.0.1:3777";
@@ -780,6 +900,7 @@ fn spawn_peer_connection(
     active_peers: Arc<Mutex<HashSet<String>>>,
     outbound_rx: broadcast::Sender<Vec<u8>>,
     manifest: Arc<Vec<u8>>,
+    rocks_db: Arc<Mutex<Option<xrpl_node::engine::LiveEngine>>>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -790,7 +911,7 @@ fn spawn_peer_connection(
             connected_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             active_peers.lock().insert(peer.clone());
             eprintln!("[peer] Connecting to {peer}...");
-            match run_peer_connection(&peer, &tx, &known_peers, &connected_count, max_peers, &seen_msgs, &active_peers, &outbound_rx, &manifest).await {
+            match run_peer_connection(&peer, &tx, &known_peers, &connected_count, max_peers, &seen_msgs, &active_peers, &outbound_rx, &manifest, &rocks_db).await {
                 Ok(()) => eprintln!("[peer] {peer} disconnected"),
                 Err(e) => eprintln!("[peer] {peer}: {e}"),
             }
@@ -811,6 +932,7 @@ async fn run_peer_connection(
     active_peers: &Arc<Mutex<HashSet<String>>>,
     outbound: &broadcast::Sender<Vec<u8>>,
     manifest: &Arc<Vec<u8>>,
+    rocks_db: &Arc<Mutex<Option<xrpl_node::engine::LiveEngine>>>,
 ) -> Result<(), String> {
     let identity = NodeIdentity::generate().map_err(|e| format!("identity: {e}"))?;
 
@@ -835,6 +957,10 @@ async fn run_peer_connection(
         validator: None,
         tx_info: None,
     });
+
+    // Split stream for read + write (needed to respond to GetLedger/GetObjects)
+    let (mut reader, writer) = tokio::io::split(hs.stream);
+    let writer = Arc::new(tokio::sync::Mutex::new(writer));
 
     let mut codec = MessageCodec;
     let mut buf = BytesMut::with_capacity(65536);
@@ -877,6 +1003,7 @@ async fn run_peer_connection(
                                             active_peers.clone(),
                                             outbound.clone(),
                                             manifest.clone(),
+                                            rocks_db.clone(),
                                         );
                                     }
                                 }
@@ -896,6 +1023,53 @@ async fn run_peer_connection(
                         continue; // duplicate from another peer, skip
                     }
                     seen_msgs.insert(msg_hash, ());
+
+                    // --- Transaction relay: forward to all relay peers ---
+                    if let PeerMessage::Transaction(_) = &msg {
+                        let payload = msg.encode_to_vec();
+                        let type_code: u16 = 30; // mtTRANSACTION
+                        let len = payload.len() as u32;
+                        let mut frame = Vec::with_capacity(6 + payload.len());
+                        frame.extend_from_slice(&len.to_be_bytes());
+                        frame.extend_from_slice(&type_code.to_be_bytes());
+                        frame.extend_from_slice(&payload);
+                        let _ = outbound.send(frame);
+                    }
+
+                    // --- Serve ledger data: respond to GetLedger / GetObjects ---
+                    if let PeerMessage::GetLedger(ref req) = msg {
+                        // Respond with objects from RocksDB if we have them
+                        let writer_c = writer.clone();
+                        let db_c = rocks_db.clone();
+                        let itype = req.itype;
+                        let node_ids = req.node_i_ds.clone();
+                        let ledger_hash_req = req.ledger_hash.clone();
+                        let ledger_seq_req = req.ledger_seq;
+                        let cookie = req.request_cookie;
+                        tokio::spawn(async move {
+                            serve_get_ledger(
+                                &writer_c, &db_c, itype, &node_ids,
+                                ledger_hash_req.as_deref(), ledger_seq_req, cookie,
+                            ).await;
+                        });
+                    }
+
+                    if let PeerMessage::GetObjects(ref req) = msg {
+                        if req.query {
+                            let writer_c = writer.clone();
+                            let db_c = rocks_db.clone();
+                            let objects = req.objects.clone();
+                            let obj_type = req.r#type;
+                            let ledger_hash_req = req.ledger_hash.clone();
+                            let seq = req.seq;
+                            tokio::spawn(async move {
+                                serve_get_objects(
+                                    &writer_c, &db_c, obj_type, &objects,
+                                    ledger_hash_req.as_deref(), seq,
+                                ).await;
+                            });
+                        }
+                    }
 
                     let (msg_type, detail, ledger_seq, ledger_hash, peers, validator, tx_info) = format_message(&msg);
 
@@ -922,15 +1096,143 @@ async fn run_peer_connection(
             }
         }
 
-        // Read more from stream (read half)
+        // Read more from stream
         let mut chunk = vec![0u8; 32768];
-        match timeout(Duration::from_secs(30), hs.stream.read(&mut chunk)).await {
+        match timeout(Duration::from_secs(30), reader.read(&mut chunk)).await {
             Ok(Ok(0)) => return Ok(()),
             Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
             Ok(Err(e)) => return Err(format!("read: {e}")),
             Err(_) => continue,
         }
     }
+}
+
+/// Write a framed peer protocol message to a stream.
+async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &tokio::sync::Mutex<W>,
+    type_code: u16,
+    payload: &[u8],
+) {
+    use tokio::io::AsyncWriteExt;
+    let len = payload.len() as u32;
+    let mut frame = Vec::with_capacity(6 + payload.len());
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(&type_code.to_be_bytes());
+    frame.extend_from_slice(payload);
+    let mut w = writer.lock().await;
+    let _ = w.write_all(&frame).await;
+}
+
+/// Serve a TMGetLedger request — look up SHAMap nodes from RocksDB.
+async fn serve_get_ledger<W: tokio::io::AsyncWrite + Unpin + Send>(
+    writer: &tokio::sync::Mutex<W>,
+    rocks_db: &Arc<Mutex<Option<xrpl_node::engine::LiveEngine>>>,
+    itype: i32,
+    node_ids: &[Vec<u8>],
+    ledger_hash: Option<&[u8]>,
+    ledger_seq: Option<u32>,
+    cookie: Option<u64>,
+) {
+    use prost::Message;
+
+    // Only serve account state nodes (liAS_NODE = 2) and tx nodes (1)
+    if itype != 2 && itype != 1 {
+        return;
+    }
+
+    // Look up nodes under the lock, then drop it before awaiting
+    let (nodes, hash_vec, seq_val) = {
+        let engine_guard = rocks_db.lock();
+        let engine = match engine_guard.as_ref() {
+            Some(e) => e,
+            None => return,
+        };
+
+        let mut nodes = Vec::new();
+        for node_id in node_ids {
+            if node_id.len() != 32 { continue; }
+            if let Some(data) = engine.get(node_id) {
+                nodes.push(xrpl_node::peer::protocol::TmLedgerNode {
+                    nodedata: data,
+                    nodeid: Some(node_id.clone()),
+                });
+            }
+        }
+        (nodes, ledger_hash.map(|h| h.to_vec()).unwrap_or_default(), ledger_seq.unwrap_or(0))
+    }; // engine_guard dropped here
+
+    if nodes.is_empty() {
+        return;
+    }
+
+    let resp = xrpl_node::peer::protocol::TmLedgerData {
+        ledger_hash: hash_vec,
+        ledger_seq: seq_val,
+        r#type: itype,
+        nodes,
+        request_cookie: cookie.map(|c| c as u32),
+        error: None,
+    };
+
+    let payload = resp.encode_to_vec();
+    write_frame(writer, 32, &payload).await; // mtLEDGER_DATA = 32
+}
+
+/// Serve a TMGetObjectByHash request — look up objects from RocksDB.
+async fn serve_get_objects<W: tokio::io::AsyncWrite + Unpin + Send>(
+    writer: &tokio::sync::Mutex<W>,
+    rocks_db: &Arc<Mutex<Option<xrpl_node::engine::LiveEngine>>>,
+    obj_type: i32,
+    objects: &[xrpl_node::peer::protocol::TmIndexedObject],
+    ledger_hash: Option<&[u8]>,
+    seq: Option<u32>,
+) {
+    use prost::Message;
+
+    // Look up objects under the lock, then drop it before awaiting
+    let (found, hash_vec) = {
+        let engine_guard = rocks_db.lock();
+        let engine = match engine_guard.as_ref() {
+            Some(e) => e,
+            None => return,
+        };
+
+        let mut found = Vec::new();
+        for obj in objects {
+            let key = obj.hash.as_deref()
+                .or(obj.index.as_deref());
+            if let Some(k) = key {
+                if k.len() == 32 {
+                    if let Some(data) = engine.get(k) {
+                        found.push(xrpl_node::peer::protocol::TmIndexedObject {
+                            hash: obj.hash.clone(),
+                            node_id: obj.node_id.clone(),
+                            index: obj.index.clone(),
+                            data: Some(data),
+                            ledger_seq: obj.ledger_seq,
+                        });
+                    }
+                }
+            }
+        }
+        (found, ledger_hash.map(|h| h.to_vec()))
+    }; // engine_guard dropped here
+
+    if found.is_empty() {
+        return;
+    }
+
+    let resp = xrpl_node::peer::protocol::TmGetObjectByHash {
+        r#type: obj_type,
+        query: false, // This is a reply
+        seq,
+        ledger_hash: hash_vec,
+        fat: None,
+        objects: found,
+    };
+
+    let payload = resp.encode_to_vec();
+    write_frame(writer, 42, &payload).await; // mtGET_OBJECTS = 42
 }
 
 /// Returns (msg_type, detail, ledger_seq, ledger_hash, peers, validator_key, tx_info)

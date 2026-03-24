@@ -23,15 +23,73 @@ mod field {
     // STI_VL (variable length, type 7)
     pub const SIGNING_PUB_KEY: [u8; 1] = [0x73]; // type=7, field=3
     pub const SIGNATURE: [u8; 1] = [0x76];        // type=7, field=6
+
+    // STI_VECTOR256 (type 19 = 0x13, field 3 = Amendments)
+    // Since type >= 16: first byte = (0 << 4) | field, second byte = type
+    pub const AMENDMENTS: [u8; 2] = [0x03, 0x13];
+}
+
+/// Compute amendment hash from its name string: SHA-512Half(amendment_name).
+fn amendment_hash(name: &str) -> Hash256 {
+    let mut hasher = Sha512::new();
+    hasher.update(name.as_bytes());
+    let full = hasher.finalize();
+    let mut result = [0u8; 32];
+    result.copy_from_slice(&full[..32]);
+    Hash256(result)
+}
+
+/// Known XRPL amendments we support — vote YES on flag ledgers.
+/// This list includes all enabled mainnet amendments as of 2026-03.
+pub fn supported_amendments() -> Vec<Hash256> {
+    // All currently enabled + voting amendments on XRPL mainnet
+    let names = [
+        "MultiSign", "TrustSetAuth", "FeeEscalation",
+        "PayChan", "CryptoConditions", "TickSize",
+        "fix1368", "Escrow", "CryptoConditionsSuite",
+        "fix1373", "EnforceInvariants", "FlowCross",
+        "SortedDirectories", "fix1201", "fix1512",
+        "fix1513", "fix1523", "fix1528",
+        "DepositAuth", "Checks", "fix1571",
+        "fix1543", "fix1623", "DepositPreauth",
+        "fix1515", "fix1578", "MultiSignReserve",
+        "fixTakerDryOfferRemoval", "fixMasterKeyAsRegularKey",
+        "fixCheckThreading", "fixPayChanRecipientOwnerDir",
+        "DeletableAccounts", "fixQualityUpperBound",
+        "RequireFullyCanonicalSig", "fix1781",
+        "HardenedValidations", "fixAmendmentMajorityCalc",
+        "NegativeUNL", "TicketBatch", "FlowSortStrands",
+        "fixSTAmountCanonicalize", "fixRmSmallIncreasedQOffers",
+        "CheckCashMakesTrustLine", "ExpandedSignerList",
+        "NonFungibleTokensV1_1", "fixTrustLinesToSelf",
+        "fixRemoveNFTokenAutoTrustLine", "ImmediateOfferKilled",
+        "DisallowIncoming", "XRPFees", "fixUniversalNumber",
+        "fixNonFungibleTokensV1_2", "fixNFTokenRemint",
+        "fixReducedOffersV1", "Clawback",
+        "AMM", "XChainBridge",
+        "fixDisallowIncomingV1", "DID",
+        "fixFillOrKill", "fixNFTokenReserve",
+        "fixInnerObjTemplate", "fixAMMOverflowOffer",
+        "PriceOracle", "fixEmptyDID",
+        "fixXChainRewardRounding", "fixPreviousTxnID",
+        "fixAMMv1_1", "NFTokenMintOffer",
+        "DeepFreeze", "PermissionedDomains",
+        "Credentials", "AMMClawback",
+        "fixReducedOffersV2", "fixEnforceNFTokenTrustline",
+        "fixInnerObjTemplate2",
+    ];
+    names.iter().map(|n| amendment_hash(n)).collect()
 }
 
 /// Build the serialized validation object (without signature) for signing.
+/// If `amendments` is Some, includes the Amendments field (for flag ledger votes).
 fn build_validation_for_signing(
     ledger_seq: u32,
     ledger_hash: &[u8; 32],
     signing_time: u32,
     signing_pub_key: &[u8],
     flags: u32,
+    amendments: Option<&[Hash256]>,
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(128);
 
@@ -60,15 +118,46 @@ fn build_validation_for_signing(
     buf.push(spk_len as u8);
     buf.extend_from_slice(signing_pub_key);
 
+    // Type 19 (VECTOR256): Amendments(3) — only on flag ledgers
+    if let Some(amends) = amendments {
+        if !amends.is_empty() {
+            buf.extend_from_slice(&field::AMENDMENTS);
+            // VL length: total bytes = num_amendments * 32
+            let total_bytes = amends.len() * 32;
+            encode_vl_length(&mut buf, total_bytes);
+            for h in amends {
+                buf.extend_from_slice(&h.0);
+            }
+        }
+    }
+
     buf
+}
+
+/// Encode a VL (variable length) prefix into the buffer.
+fn encode_vl_length(buf: &mut Vec<u8>, len: usize) {
+    if len <= 192 {
+        buf.push(len as u8);
+    } else if len <= 12480 {
+        let adjusted = len - 193;
+        buf.push((adjusted / 256 + 193) as u8);
+        buf.push((adjusted % 256) as u8);
+    } else {
+        let adjusted = len - 12481;
+        buf.push(241);
+        buf.push((adjusted / 65536) as u8);
+        buf.push(((adjusted / 256) % 256) as u8);
+    }
 }
 
 /// Sign a validation for the given ledger.
 /// Returns the full serialized validation (including signature) ready for TMValidation.
+/// If `amendments` is Some, includes amendment votes (for flag ledgers).
 pub fn sign_validation(
     identity: &NodeIdentity,
     ledger_seq: u32,
     ledger_hash: &[u8; 32],
+    amendments: Option<&[Hash256]>,
 ) -> Vec<u8> {
     // Signing time: seconds since Ripple epoch (2000-01-01)
     // Ripple epoch = 946684800 Unix seconds
@@ -89,7 +178,7 @@ pub fn sign_validation(
 
     // Build the validation object without signature
     let unsigned = build_validation_for_signing(
-        ledger_seq, ledger_hash, signing_time, pub_key, flags,
+        ledger_seq, ledger_hash, signing_time, pub_key, flags, amendments,
     );
 
     // Hash for signing: SHA512Half(VAL\0 || unsigned_validation)
@@ -214,7 +303,7 @@ mod tests {
         let identity = NodeIdentity::generate().unwrap();
         let ledger_hash = [0xAB; 32];
 
-        let validation = sign_validation(&identity, 100, &ledger_hash);
+        let validation = sign_validation(&identity, 100, &ledger_hash, None);
 
         // Should be non-empty
         assert!(validation.len() > 50);
@@ -225,5 +314,32 @@ mod tests {
         // Should contain the public key
         let pk = identity.public_key();
         assert!(validation.windows(pk.len()).any(|w| w == pk));
+    }
+
+    #[test]
+    fn sign_validation_with_amendments() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let identity = NodeIdentity::generate().unwrap();
+        let ledger_hash = [0xAB; 32];
+
+        let amendments = supported_amendments();
+        let validation = sign_validation(&identity, 256, &ledger_hash, Some(&amendments));
+
+        // Should be larger than without amendments
+        let plain = sign_validation(&identity, 256, &ledger_hash, None);
+        assert!(validation.len() > plain.len());
+
+        // Should contain the Amendments field code [0x03, 0x13]
+        assert!(validation.windows(2).any(|w| w == [0x03, 0x13]));
+    }
+
+    #[test]
+    fn amendment_hash_deterministic() {
+        let h1 = amendment_hash("MultiSign");
+        let h2 = amendment_hash("MultiSign");
+        assert_eq!(h1, h2);
+
+        let h3 = amendment_hash("PayChan");
+        assert_ne!(h1, h3);
     }
 }
