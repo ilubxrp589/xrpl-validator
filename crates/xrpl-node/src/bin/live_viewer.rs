@@ -438,7 +438,7 @@ async fn main() {
     let engine_state: Arc<Mutex<EngineState>> = Arc::new(Mutex::new(initial_state));
 
     // State hash computation — build SHAMap from RocksDB in background
-    // State hash: build SHAMap directly from RocksDB (already has fresh binary data)
+    // State hash: first do a targeted re-sync of corrupted entries, then build SHAMap
     let bulk_syncer = Arc::new(xrpl_node::bulk_sync::BulkSyncer::new());
     let state_hash_computer = Arc::new(xrpl_node::state_hash::StateHashComputer::new());
     {
@@ -446,8 +446,26 @@ async fn main() {
         if let Some(ref eng) = *engine_guard {
             let db = eng.db_arc();
             let estimated = eng.entry_count() as u64;
-            // Build SHAMap immediately — RocksDB already has data from previous syncs
-            state_hash_computer.start_computation(db, estimated);
+
+            // Do a full re-sync via s1 (the fast server) — this overwrites ALL entries
+            // with fresh binary, fixing any corrupted JSON entries.
+            // Then build SHAMap from the clean data.
+            bulk_syncer.start(db.clone(), estimated);
+
+            let syncer = bulk_syncer.clone();
+            let hash_comp = state_hash_computer.clone();
+            let db2 = db.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    if !syncer.is_running() {
+                        let synced = syncer.objects_synced();
+                        eprintln!("[startup] Sync done ({synced} objects) — building SHAMap...");
+                        hash_comp.start_computation(db2, synced.max(estimated));
+                        break;
+                    }
+                }
+            });
         }
     }
 

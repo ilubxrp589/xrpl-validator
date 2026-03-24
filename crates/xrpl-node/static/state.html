@@ -284,8 +284,29 @@ async function poll() {
   } catch(e) { /* ignore */ }
 }
 
-setInterval(poll, 1000);
+setInterval(poll, 500);
 poll();
+
+// Also show bulk sync progress
+async function pollSync() {
+  try {
+    const r = await fetch('/api/state-hash');
+    const d = await r.json();
+    const bs = d.bulk_sync || {};
+    if (bs.running && bs.objects_synced > 0) {
+      const pct = (bs.objects_synced / 18700000 * 100).toFixed(1);
+      document.getElementById('hero-sub').textContent =
+        `Syncing: ${(bs.objects_synced/1e6).toFixed(1)}M / 18.7M (${pct}%) — ${bs.rate.toFixed(0)}/s — ~${(bs.estimated_remaining_secs/60).toFixed(0)}min left`;
+      document.getElementById('progress-fill').style.width = pct + '%';
+      document.getElementById('progress-text').textContent = `${pct}% — ${bs.rate.toFixed(0)} objects/sec`;
+      document.getElementById('progress-wrap').classList.add('visible');
+      document.getElementById('hero-status').className = 'computing';
+      document.getElementById('hero-status').textContent = 'SYNCING';
+    }
+  } catch(e) {}
+}
+setInterval(pollSync, 500);
+pollSync();
 </script>
 </body>
 </html>
