@@ -236,13 +236,14 @@ async fn main() {
     });
     eprintln!("[validator] Manifest built ({} bytes)", manifest_bytes.len());
 
-    // Dedicated validation sender — maintains its own peer connection for writing
-    let val_send_identity = validator_identity.clone();
-    let val_send_outbound = outbound_tx.clone();
-    let val_send_manifest = manifest_frame.clone();
-    tokio::spawn(async move {
+    // Dedicated validation senders — multiple peers for redundancy
+    for relay_peer in &["s1.ripple.com:51235", "s2.ripple.com:51235"] {
+        let peer = relay_peer.to_string();
+        let val_send_outbound = outbound_tx.clone();
+        let val_send_manifest = manifest_frame.clone();
+        tokio::spawn(async move {
         loop {
-            eprintln!("[val-sender] Connecting to s1.ripple.com:51235 for validation relay...");
+            eprintln!("[val-sender] Connecting to {peer} for validation relay...");
             let id = match NodeIdentity::generate() {
                 Ok(i) => i,
                 Err(_) => { tokio::time::sleep(Duration::from_secs(10)).await; continue; }
@@ -250,7 +251,7 @@ async fn main() {
 
             let hs = match timeout(
                 Duration::from_secs(15),
-                handshake::outbound_handshake("s1.ripple.com:51235", &id, handshake::NETWORK_ID_MAINNET),
+                handshake::outbound_handshake(&peer, &id, handshake::NETWORK_ID_MAINNET),
             ).await {
                 Ok(Ok(h)) => h,
                 _ => { tokio::time::sleep(Duration::from_secs(10)).await; continue; }
@@ -301,6 +302,7 @@ async fn main() {
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
+    } // end for relay_peer
 
     // Periodically broadcast manifest so all peers get it
     let manifest_broadcast = manifest_frame.clone();
