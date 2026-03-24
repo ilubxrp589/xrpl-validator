@@ -120,6 +120,8 @@ pub struct LedgerCloseResult {
     pub modified_keys: Vec<Hash256>,
     /// New total coins after fee burn.
     pub new_total_coins: u64,
+    /// Number of state writes to RocksDB.
+    pub state_writes: u32,
 }
 
 /// Close a ledger round: apply all transactions and produce the new state.
@@ -250,11 +252,24 @@ pub fn close_ledger(
         .map(keylet::account_root_key)
         .collect();
 
+    // Step 5: Write post-execution state back to RocksDB
+    // The new_state.state_map has correctly modified JSON objects.
+    // Write them back so our state stays in sync with the network.
+    let mut written = 0;
+    for account_id in &affected_accounts {
+        let acct_key = keylet::account_root_key(account_id);
+        if let Some(json_bytes) = new_state.state_map.lookup(&acct_key) {
+            let _ = db.put(&acct_key.0, json_bytes);
+            written += 1;
+        }
+    }
+
     eprintln!(
-        "[ledger-close] Ledger #{} closed: {} txs, {} fees, hash={}",
+        "[ledger-close] Ledger #{} closed: {} txs, {} fees, {} state writes, hash={}",
         prev_ledger_seq + 1,
         applied.len(),
         total_fees,
+        written,
         hex::encode(&ledger_hash.0[..8]),
     );
 
@@ -266,5 +281,6 @@ pub fn close_ledger(
         total_fees,
         modified_keys,
         new_total_coins: new_state.header.total_coins,
+        state_writes: written,
     })
 }
