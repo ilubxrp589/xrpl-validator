@@ -55,12 +55,16 @@ impl BulkSyncer {
         let objects_synced = self.objects_synced.clone();
         objects_synced.store(0, Ordering::Relaxed);
 
-        // Public XRPL servers we can pull from
+        // 8 workers across 4 public XRPL servers (2 connections each)
         let servers: Vec<&str> = vec![
             "https://s1.ripple.com:51234",
-            "https://s2.ripple.com:51234",
+            "https://s1.ripple.com:51234",
+            "https://xrplcluster.com",
             "https://xrplcluster.com",
             "https://xrpl.ws",
+            "https://xrpl.ws",
+            "https://xrpl.link",
+            "https://xrpl.link",
         ];
         let num_workers = servers.len() as u32;
 
