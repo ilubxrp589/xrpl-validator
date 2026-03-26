@@ -32,15 +32,18 @@ impl SHAMapNode {
 /// Empty children contribute 32 zero bytes to the hash input.
 #[derive(Debug, Clone)]
 pub struct InnerNode {
-    /// Child nodes. `None` = empty slot.
-    children: Vec<Option<SHAMapNode>>,
+    /// Child nodes — fixed 16 slots (branching factor 16). `None` = empty slot.
+    children: [Option<SHAMapNode>; 16],
+    /// Cached hash — invalidated on mutation, recomputed lazily.
+    cached_hash: Option<Hash256>,
 }
 
 impl InnerNode {
     /// Create a new empty inner node.
     pub fn new() -> Self {
         Self {
-            children: (0..16).map(|_| None).collect(),
+            children: std::array::from_fn(|_| None),
+            cached_hash: None,
         }
     }
 
@@ -48,11 +51,13 @@ impl InnerNode {
     pub fn set_child_node(&mut self, index: u8, node: SHAMapNode) {
         debug_assert!(index < 16, "child index must be 0-15");
         self.children[index as usize] = Some(node);
+        self.cached_hash = None;
     }
 
     /// Take a child node out (replacing with None).
     pub fn take_child_node(&mut self, index: u8) -> Option<SHAMapNode> {
         debug_assert!(index < 16);
+        self.cached_hash = None;
         self.children[index as usize].take()
     }
 
@@ -61,10 +66,17 @@ impl InnerNode {
         self.children[index as usize].as_ref()
     }
 
+    /// Get a mutable reference to a child node.
+    pub fn get_child_node_mut(&mut self, index: u8) -> Option<&mut SHAMapNode> {
+        self.cached_hash = None;
+        self.children[index as usize].as_mut()
+    }
+
     /// Remove a child at the given index.
     pub fn remove_child(&mut self, index: u8) {
         debug_assert!(index < 16);
         self.children[index as usize] = None;
+        self.cached_hash = None;
     }
 
     /// Get the hash of a child (returns zero hash for empty slots).
@@ -101,15 +113,24 @@ impl InnerNode {
             .map(|i| i as u8)
     }
 
+    /// Set the cached hash (used by bulk_build to avoid recomputation).
+    pub fn set_cached_hash(&mut self, hash: Hash256) {
+        self.cached_hash = Some(hash);
+    }
+
     /// Compute the hash of this inner node.
     ///
     /// `SHA512Half(HASH_PREFIX_INNER_NODE || h0 || h1 || ... || h15)`
     /// where each `h_i` is the child's hash or 32 zero bytes.
     pub fn hash(&self) -> Hash256 {
-        let mut data = Vec::with_capacity(16 * 32);
+        if let Some(h) = self.cached_hash {
+            return h;
+        }
+
+        let mut data = [0u8; 16 * 32];
         for i in 0..16 {
             let h = self.child_hash(i as u8);
-            data.extend_from_slice(&h.0);
+            data[i * 32..(i + 1) * 32].copy_from_slice(&h.0);
         }
 
         sha512_half_prefixed(&HASH_PREFIX_INNER_NODE, &data)
@@ -126,18 +147,30 @@ impl Default for InnerNode {
 ///
 /// Hash computation:
 /// `SHA512Half(HASH_PREFIX_LEAF_NODE || key || data)`
+///
+/// Supports a "hash-only" mode where data is empty and the pre-computed
+/// hash is cached. Used by StateHashComputer where leaf data is never read back.
 #[derive(Debug, Clone)]
 pub struct LeafNode {
     /// The 256-bit key (e.g., account state key or transaction hash).
     key: Hash256,
     /// The serialized data (e.g., encoded ledger object or transaction).
+    /// Empty in hash-only mode.
     data: Vec<u8>,
+    /// Pre-computed hash — avoids recomputation when set.
+    cached_hash: Option<Hash256>,
 }
 
 impl LeafNode {
-    /// Create a new leaf node.
+    /// Create a new leaf node with data.
     pub fn new(key: Hash256, data: Vec<u8>) -> Self {
-        Self { key, data }
+        Self { key, data, cached_hash: None }
+    }
+
+    /// Create a hash-only leaf node (no data stored, only the pre-computed hash).
+    /// Used for memory-efficient state hash computation.
+    pub fn new_hash_only(key: Hash256, leaf_hash: Hash256) -> Self {
+        Self { key, data: Vec::new(), cached_hash: Some(leaf_hash) }
     }
 
     /// The leaf's key.
@@ -154,6 +187,9 @@ impl LeafNode {
     ///
     /// `SHA512Half(HASH_PREFIX_LEAF_NODE || key || data)`
     pub fn hash(&self) -> Hash256 {
+        if let Some(h) = self.cached_hash {
+            return h;
+        }
         let mut buf = Vec::with_capacity(32 + self.data.len());
         buf.extend_from_slice(&self.key.0);
         buf.extend_from_slice(&self.data);

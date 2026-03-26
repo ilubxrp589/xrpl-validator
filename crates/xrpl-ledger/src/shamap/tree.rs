@@ -42,6 +42,11 @@ impl SHAMap {
         }
     }
 
+    /// Create a SHAMap from a pre-built root node (bulk construction).
+    pub fn from_root(root: SHAMapNode, tree_type: TreeType, size: usize) -> Self {
+        Self { root, tree_type, size }
+    }
+
     pub fn tree_type(&self) -> TreeType {
         self.tree_type
     }
@@ -74,8 +79,17 @@ impl SHAMap {
 
     /// Insert a key-value pair. Returns true if the key was new (not an overwrite).
     pub fn insert(&mut self, key: Hash256, data: Vec<u8>) -> Result<bool, LedgerError> {
-        let (new_root, is_new) = insert_into(self.root.clone(), key, data, 0)?;
-        self.root = new_root;
+        let is_new = insert_into_mut(&mut self.root, key, data, 0)?;
+        if is_new {
+            self.size += 1;
+        }
+        Ok(is_new)
+    }
+
+    /// Insert a hash-only leaf (no data stored). Used for memory-efficient
+    /// state hash computation where leaf data is never read back.
+    pub fn insert_hash_only(&mut self, key: Hash256, leaf_hash: Hash256) -> Result<bool, LedgerError> {
+        let is_new = insert_hash_only_mut(&mut self.root, key, leaf_hash, 0)?;
         if is_new {
             self.size += 1;
         }
@@ -84,9 +98,8 @@ impl SHAMap {
 
     /// Delete a key. Returns true if the key was found and removed.
     pub fn delete(&mut self, key: &Hash256) -> Result<bool, LedgerError> {
-        let (new_root, found) = delete_from(self.root.clone(), key, 0)?;
+        let found = delete_from_mut(&mut self.root, key, 0)?;
         if found {
-            self.root = new_root;
             self.size -= 1;
         }
         Ok(found)
@@ -111,12 +124,13 @@ fn lookup_in<'a>(node: &'a SHAMapNode, key: &Hash256, depth: usize) -> Option<&'
     }
 }
 
-fn insert_into(
-    node: SHAMapNode,
+/// In-place insert — modifies the tree without cloning.
+fn insert_into_mut(
+    node: &mut SHAMapNode,
     key: Hash256,
     data: Vec<u8>,
     depth: usize,
-) -> Result<(SHAMapNode, bool), LedgerError> {
+) -> Result<bool, LedgerError> {
     if depth >= 64 {
         return Err(LedgerError::InvalidTreeType(
             "SHAMap depth exceeded 64".to_string(),
@@ -124,100 +138,156 @@ fn insert_into(
     }
 
     match node {
-        SHAMapNode::Inner(mut inner) => {
+        SHAMapNode::Inner(ref mut inner) => {
             let nibble = nibble_at(&key, depth);
 
-            if let Some(existing_child) = inner.take_child_node(nibble) {
-                // Recurse into the existing child
-                let (new_child, is_new) = insert_into(existing_child, key, data, depth + 1)?;
-                inner.set_child_node(nibble, new_child);
-                Ok((SHAMapNode::Inner(inner), is_new))
+            if inner.has_child(nibble) {
+                // Recurse into the existing child in-place
+                let child = inner.get_child_node_mut(nibble).unwrap();
+                insert_into_mut(child, key, data, depth + 1)
             } else {
                 // Empty slot — place the leaf directly
-                let leaf = SHAMapNode::Leaf(LeafNode::new(key, data));
-                inner.set_child_node(nibble, leaf);
-                Ok((SHAMapNode::Inner(inner), true))
+                inner.set_child_node(nibble, SHAMapNode::Leaf(LeafNode::new(key, data)));
+                Ok(true)
             }
         }
-        SHAMapNode::Leaf(existing) => {
+        SHAMapNode::Leaf(ref existing) => {
             if existing.key() == &key {
-                // Overwrite existing leaf
-                Ok((SHAMapNode::Leaf(LeafNode::new(key, data)), false))
+                // Overwrite existing leaf in place
+                *node = SHAMapNode::Leaf(LeafNode::new(key, data));
+                Ok(false)
             } else {
-                // Collision — split into inner node with both leaves
-                let mut new_inner = Box::<InnerNode>::default();
-                let existing_nibble = nibble_at(existing.key(), depth);
+                // Collision — replace this leaf with an inner node containing both
+                let existing_key = *existing.key();
+                let existing_nibble = nibble_at(&existing_key, depth);
                 let new_nibble = nibble_at(&key, depth);
 
-                if existing_nibble == new_nibble {
-                    // Same nibble at this depth — recurse deeper
-                    let (child, _) = insert_into(
-                        SHAMapNode::Leaf(existing),
-                        key,
-                        data,
-                        depth + 1,
-                    )?;
-                    new_inner.set_child_node(existing_nibble, child);
-                } else {
-                    // Different nibbles — place both as children
-                    new_inner.set_child_node(existing_nibble, SHAMapNode::Leaf(existing));
-                    new_inner.set_child_node(new_nibble, SHAMapNode::Leaf(LeafNode::new(key, data)));
+                // Take the existing leaf out, replace with inner
+                let old_node = std::mem::replace(
+                    node,
+                    SHAMapNode::Inner(Box::<InnerNode>::default()),
+                );
+
+                if let SHAMapNode::Inner(ref mut inner) = node {
+                    if existing_nibble == new_nibble {
+                        // Same nibble — place existing leaf, then recurse to split deeper
+                        inner.set_child_node(existing_nibble, old_node);
+                        let child = inner.get_child_node_mut(existing_nibble).unwrap();
+                        insert_into_mut(child, key, data, depth + 1)?;
+                    } else {
+                        // Different nibbles — place both as direct children
+                        inner.set_child_node(existing_nibble, old_node);
+                        inner.set_child_node(new_nibble, SHAMapNode::Leaf(LeafNode::new(key, data)));
+                    }
                 }
-                Ok((SHAMapNode::Inner(new_inner), true))
+                Ok(true)
             }
         }
     }
 }
 
-fn delete_from(
-    node: SHAMapNode,
+/// In-place delete — modifies the tree without cloning.
+fn delete_from_mut(
+    node: &mut SHAMapNode,
     key: &Hash256,
     depth: usize,
-) -> Result<(SHAMapNode, bool), LedgerError> {
+) -> Result<bool, LedgerError> {
     match node {
-        SHAMapNode::Leaf(leaf) => {
+        SHAMapNode::Leaf(ref leaf) => {
             if leaf.key() == key {
-                // Replace with empty inner (parent will handle collapsing)
-                Ok((SHAMapNode::Inner(Box::<InnerNode>::default()), true))
+                // Replace leaf with empty inner (parent handles collapsing)
+                *node = SHAMapNode::Inner(Box::<InnerNode>::default());
+                Ok(true)
             } else {
-                Ok((SHAMapNode::Leaf(leaf), false))
+                Ok(false)
             }
         }
-        SHAMapNode::Inner(mut inner) => {
+        SHAMapNode::Inner(ref mut inner) => {
             let nibble = nibble_at(key, depth);
 
-            if let Some(child) = inner.take_child_node(nibble) {
-                let (new_child, found) = delete_from(child, key, depth + 1)?;
-                if found {
-                    // Check if the new child is an empty inner node
-                    match &new_child {
-                        SHAMapNode::Inner(i) if i.is_empty() => {
-                            // Don't put the empty inner back — slot becomes None
-                        }
-                        _ => {
-                            inner.set_child_node(nibble, new_child);
-                        }
-                    }
+            if !inner.has_child(nibble) {
+                return Ok(false);
+            }
 
-                    // Collapse: if only one child remains, and it's a leaf, promote it
-                    if inner.child_count() == 1 {
-                        if let Some(only_idx) = inner.only_child_index() {
-                            if let Some(SHAMapNode::Leaf(_)) = inner.get_child_node(only_idx) {
-                                if let Some(promoted) = inner.take_child_node(only_idx) {
-                                    return Ok((promoted, true));
-                                }
-                            }
-                        }
-                    }
+            let child = inner.get_child_node_mut(nibble).unwrap();
+            let found = delete_from_mut(child, key, depth + 1)?;
 
-                    Ok((SHAMapNode::Inner(inner), true))
-                } else {
-                    // Key not found deeper — put child back
-                    inner.set_child_node(nibble, new_child);
-                    Ok((SHAMapNode::Inner(inner), false))
+            if !found {
+                return Ok(false);
+            }
+
+            // If child became an empty inner node, remove it
+            if let SHAMapNode::Inner(ref i) = inner.get_child_node(nibble).unwrap() {
+                if i.is_empty() {
+                    inner.remove_child(nibble);
                 }
+            }
+
+            // Collapse: if only one child remains and it's a leaf, promote it
+            if inner.child_count() == 1 {
+                if let Some(only_idx) = inner.only_child_index() {
+                    if matches!(inner.get_child_node(only_idx), Some(SHAMapNode::Leaf(_))) {
+                        let promoted = inner.take_child_node(only_idx).unwrap();
+                        *node = promoted;
+                    }
+                }
+            }
+
+            Ok(true)
+        }
+    }
+}
+
+/// In-place insert of a hash-only leaf — no data stored, only the pre-computed hash.
+fn insert_hash_only_mut(
+    node: &mut SHAMapNode,
+    key: Hash256,
+    leaf_hash: Hash256,
+    depth: usize,
+) -> Result<bool, LedgerError> {
+    if depth >= 64 {
+        return Err(LedgerError::InvalidTreeType(
+            "SHAMap depth exceeded 64".to_string(),
+        ));
+    }
+
+    match node {
+        SHAMapNode::Inner(ref mut inner) => {
+            let nibble = nibble_at(&key, depth);
+
+            if inner.has_child(nibble) {
+                let child = inner.get_child_node_mut(nibble).unwrap();
+                insert_hash_only_mut(child, key, leaf_hash, depth + 1)
             } else {
-                Ok((SHAMapNode::Inner(inner), false))
+                inner.set_child_node(nibble, SHAMapNode::Leaf(LeafNode::new_hash_only(key, leaf_hash)));
+                Ok(true)
+            }
+        }
+        SHAMapNode::Leaf(ref existing) => {
+            if existing.key() == &key {
+                *node = SHAMapNode::Leaf(LeafNode::new_hash_only(key, leaf_hash));
+                Ok(false)
+            } else {
+                let existing_key = *existing.key();
+                let existing_nibble = nibble_at(&existing_key, depth);
+                let new_nibble = nibble_at(&key, depth);
+
+                let old_node = std::mem::replace(
+                    node,
+                    SHAMapNode::Inner(Box::<InnerNode>::default()),
+                );
+
+                if let SHAMapNode::Inner(ref mut inner) = node {
+                    if existing_nibble == new_nibble {
+                        inner.set_child_node(existing_nibble, old_node);
+                        let child = inner.get_child_node_mut(existing_nibble).unwrap();
+                        insert_hash_only_mut(child, key, leaf_hash, depth + 1)?;
+                    } else {
+                        inner.set_child_node(existing_nibble, old_node);
+                        inner.set_child_node(new_nibble, SHAMapNode::Leaf(LeafNode::new_hash_only(key, leaf_hash)));
+                    }
+                }
+                Ok(true)
             }
         }
     }
