@@ -78,11 +78,7 @@
   }
   .hash-box.match { animation: pulse-glow 2s infinite; }
 
-  @keyframes flash-in {
-    from { opacity: 0; transform: translateY(-4px); }
-    to { opacity: 1; transform: translateY(0); }
-  }
-  .log-entry { animation: flash-in 0.3s ease-out; }
+  .log-entry { }
 </style>
 </head>
 <body>
@@ -102,7 +98,7 @@
   <div id="hero">
     <div id="hero-label">Independent State Verification</div>
     <div id="hero-status" class="pending">INITIALIZING</div>
-    <div id="hero-sub">Building SHAMap from 18.7M ledger objects...</div>
+    <div id="hero-sub">Building SHAMap from ledger objects...</div>
   </div>
 
   <div id="progress-wrap" class="visible">
@@ -205,10 +201,21 @@ async function poll() {
     // Hero status
     const hero = document.getElementById('hero-status');
     const heroSub = document.getElementById('hero-sub');
-    if (state.computing) {
+    const bs = state.bulk_sync || {};
+    const dbEntries = state.db_entries || 0;
+    const realEntries = state.entries_total || dbEntries;
+    if (bs.running) {
+      const pct = Math.min((dbEntries / 18800000 * 100), 100).toFixed(1);
+      hero.className = 'computing';
+      hero.textContent = 'SYNCING';
+      heroSub.textContent = `${(dbEntries/1e6).toFixed(1)}M / 18.8M (${pct}%) — ${bs.rate.toFixed(0)}/s — ~${Math.round(bs.estimated_remaining_secs/60)}min left`;
+      progWrap.classList.add('visible');
+      document.getElementById('progress-fill').style.width = pct + '%';
+      document.getElementById('progress-text').textContent = `${pct}% — ${bs.rate.toFixed(0)} objects/sec`;
+    } else if (state.computing) {
       hero.className = 'computing';
       hero.textContent = 'BUILDING';
-      heroSub.textContent = `Hashing ${(state.entries_total/1e6).toFixed(1)}M ledger objects...`;
+      heroSub.textContent = `Hashing ${(realEntries/1e6).toFixed(1)}M ledger objects...`;
     } else if (state.ready_to_sign) {
       hero.className = 'independent';
       hero.textContent = 'INDEPENDENT';
@@ -249,7 +256,8 @@ async function poll() {
     // Stats
     document.getElementById('s-ledger').textContent = state.ledger_seq || '—';
     document.getElementById('s-entries').textContent =
-      state.entries_processed > 0 ? (state.entries_processed/1e6).toFixed(1) + 'M' : '—';
+      state.entries_processed > 0 ? (state.entries_processed/1e6).toFixed(1) + 'M' :
+      state.entries_total > 0 ? (state.entries_total/1e6).toFixed(1) + 'M' : '—';
     document.getElementById('s-time').textContent =
       state.compute_time_secs > 0 ? state.compute_time_secs.toFixed(0) + 's' : '—';
 
@@ -259,10 +267,10 @@ async function poll() {
 
     const signEl = document.getElementById('s-signing');
     if (state.ready_to_sign) {
-      signEl.textContent = 'OURS';
+      signEl.textContent = 'RUST RIPPLED';
       signEl.className = 'stat-value green';
     } else {
-      signEl.textContent = 'NET';
+      signEl.textContent = 'RIPPLED';
       signEl.className = 'stat-value';
     }
 
@@ -287,26 +295,6 @@ async function poll() {
 setInterval(poll, 500);
 poll();
 
-// Also show bulk sync progress
-async function pollSync() {
-  try {
-    const r = await fetch('/api/state-hash');
-    const d = await r.json();
-    const bs = d.bulk_sync || {};
-    if (bs.running && bs.objects_synced > 0) {
-      const pct = (bs.objects_synced / 18700000 * 100).toFixed(1);
-      document.getElementById('hero-sub').textContent =
-        `Syncing: ${(bs.objects_synced/1e6).toFixed(1)}M / 18.7M (${pct}%) — ${bs.rate.toFixed(0)}/s — ~${(bs.estimated_remaining_secs/60).toFixed(0)}min left`;
-      document.getElementById('progress-fill').style.width = pct + '%';
-      document.getElementById('progress-text').textContent = `${pct}% — ${bs.rate.toFixed(0)} objects/sec`;
-      document.getElementById('progress-wrap').classList.add('visible');
-      document.getElementById('hero-status').className = 'computing';
-      document.getElementById('hero-status').textContent = 'SYNCING';
-    }
-  } catch(e) {}
-}
-setInterval(pollSync, 500);
-pollSync();
 </script>
 </body>
 </html>

@@ -199,9 +199,8 @@ pub fn close_ledger(
                         }
                     }
                     None => {
-                        // Decode failed — self-heal: delete corrupted entry
-                        // so the background fetcher re-downloads it as clean binary
-                        let _ = db.delete(&acct_key.0);
+                        // Decode failed — do NOT delete, it corrupts the pinned state snapshot
+                        // let _ = db.delete(&acct_key.0);
                         if failed < 3 {
                             eprintln!(
                                 "[ledger-close] Decode failed key={} len={} — deleted for re-fetch",

@@ -167,42 +167,10 @@ impl LiveEngine {
             .unwrap_or(0);
         eprintln!("[engine] Opened RocksDB: ~{count} entries");
 
-        // Background fetchers — multiple threads for concurrent RPC lookups
-        let (fetch_tx, fetch_rx) = std::sync::mpsc::channel::<([u8; 20], [u8; 32])>();
-        let fetch_rx = Arc::new(std::sync::Mutex::new(fetch_rx));
-        for worker in 0..4 {
-            let fetch_db = db.clone();
-            let rx = fetch_rx.clone();
-            std::thread::spawn(move || {
-                let client = reqwest::blocking::Client::builder()
-                    .timeout(std::time::Duration::from_secs(5))
-                    .build()
-                    .expect("reqwest client builder failed");
-
-                loop {
-                    let (acct_id, key) = match rx.lock().unwrap().recv() {
-                        Ok(v) => v,
-                        Err(_) => break,
-                    };
-                    let resp = client.post("https://s2.ripple.com:51234")
-                        .json(&serde_json::json!({
-                            "method": "ledger_entry",
-                            "params": [{"index": hex::encode(key), "binary": true, "ledger_index": "validated"}]
-                        }))
-                        .send();
-
-                    if let Ok(r) = resp {
-                        if let Ok(body) = r.json::<serde_json::Value>() {
-                            if let Some(data_hex) = body["result"]["node_binary"].as_str() {
-                                if let Ok(data) = hex::decode(data_hex) {
-                                    let _ = fetch_db.put(key, &data);
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-        }
+        // Background fetchers DISABLED — they write data from "validated" (latest)
+        // ledger into our pinned-ledger state DB, corrupting the consistent snapshot.
+        // TODO: re-enable once incremental sync is managing state updates properly.
+        let (fetch_tx, _fetch_rx) = std::sync::mpsc::channel::<([u8; 20], [u8; 32])>();
 
         Ok(Self {
             db,
@@ -229,6 +197,12 @@ impl LiveEngine {
         // Quick check: don't re-queue if already in DB (race with fetcher)
         if self.get(&key.0).is_some() { return; }
         let _ = self.fetch_tx.send((*account_id, key.0));
+    }
+
+    /// Queue re-fetch for a stale entry (bypasses exists-check).
+    /// Used after each round to refresh modified accounts with network ground truth.
+    pub fn queue_refetch_key(&self, key: &Hash256) {
+        let _ = self.fetch_tx.send(([0u8; 20], key.0));
     }
 
     /// Look up a ledger object by its keylet hash.

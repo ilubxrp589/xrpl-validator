@@ -121,6 +121,13 @@ impl StateHashComputer {
                 }
             }
 
+            // Update entries_total with REAL count (not the broken estimate)
+            {
+                let real_count = entries.len() as u64;
+                status.lock().entries_total = real_count;
+                entries_processed.store(real_count, Ordering::Relaxed);
+            }
+
             let pass1_time = start.elapsed().as_secs_f64();
             eprintln!(
                 "[state-hash] Pass 1 done: {} entries in {pass1_time:.1}s ({skipped} skipped). Computing hash...",
@@ -169,7 +176,10 @@ impl StateHashComputer {
                     return ZERO_HASH;
                 }
                 if leaves.len() == 1 {
-                    return leaves[0].1; // single leaf — return its hash
+                    // In rippled's SHAMap, a single leaf in a subtree lives at
+                    // whatever depth it becomes unique — its leaf hash goes directly
+                    // into the parent inner node's child slot.
+                    return leaves[0].1;
                 }
 
                 // Group by nibble at this depth
@@ -212,18 +222,53 @@ impl StateHashComputer {
             let root_hash = compute_inner_hash(&leaf_hashes, 0);
             let hash_hex = hex::encode(root_hash.0);
 
+
             let elapsed = start.elapsed().as_secs_f64();
             entries_processed.store(count, Ordering::Relaxed);
             eprintln!(
                 "[state-hash] DONE: {total_entries} entries in {elapsed:.1}s — account_hash={hash_hex}",
             );
 
-            // Also build the SHAMap for incremental updates (in background)
-            // Use a simpler approach: just keep the leaf hashes for now
-            // and rebuild on demand
+            // Build the full SHAMap for incremental updates.
+            // This takes a while but only happens once at startup.
+            eprintln!("[state-hash] Building full SHAMap for incremental updates...");
+            let shamap_start = std::time::Instant::now();
             let mut shamap = SHAMap::new(TreeType::State);
-            // Don't build full SHAMap here — too slow. Incremental updates
-            // will be applied directly. For now, store a marker SHAMap.
+            {
+                // Re-iterate RocksDB to get (key, data) pairs for the SHAMap
+                let iter = db.iterator(rocksdb::IteratorMode::Start);
+                let mut inserted: u64 = 0;
+                for item in iter {
+                    if let Ok((key, value)) = item {
+                        if key.len() == 32 {
+                            let mut key_arr = [0u8; 32];
+                            key_arr.copy_from_slice(&key);
+                            let _ = shamap.insert(Hash256(key_arr), value.to_vec());
+                            inserted += 1;
+                            if inserted % 1_000_000 == 0 {
+                                eprintln!(
+                                    "[state-hash] SHAMap insert: {inserted}/{total_entries} ({:.1}%)",
+                                    inserted as f64 / total_entries as f64 * 100.0,
+                                );
+                            }
+                        }
+                    }
+                }
+                eprintln!(
+                    "[state-hash] SHAMap built: {} entries in {:.1}s",
+                    inserted, shamap_start.elapsed().as_secs_f64(),
+                );
+
+                // Verify SHAMap root matches our computed hash
+                let shamap_hash = hex::encode(shamap.root_hash().0);
+                if shamap_hash == hash_hex {
+                    eprintln!("[state-hash] SHAMap root hash MATCHES computed hash!");
+                } else {
+                    eprintln!(
+                        "[state-hash] WARNING: SHAMap root hash DIFFERS!\n  computed: {hash_hex}\n  shamap:   {shamap_hash}",
+                    );
+                }
+            }
             *shamap_slot.lock() = Some(shamap);
 
             {

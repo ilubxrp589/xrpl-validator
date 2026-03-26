@@ -441,31 +441,46 @@ async fn main() {
     // State hash: first do a targeted re-sync of corrupted entries, then build SHAMap
     let bulk_syncer = Arc::new(xrpl_node::bulk_sync::BulkSyncer::new());
     let state_hash_computer = Arc::new(xrpl_node::state_hash::StateHashComputer::new());
+    let incremental_syncer = Arc::new(xrpl_node::incremental_sync::IncrementalSyncer::new());
     {
         let engine_guard = live_engine.lock();
         if let Some(ref eng) = *engine_guard {
             let db = eng.db_arc();
             let estimated = eng.entry_count() as u64;
 
-            // Do a full re-sync via s1 (the fast server) — this overwrites ALL entries
-            // with fresh binary, fixing any corrupted JSON entries.
-            // Then build SHAMap from the clean data.
-            bulk_syncer.start(db.clone(), estimated);
+            // Always do a full bulk sync to get clean, consistent state.
+            // After completion: build SHAMap, then incremental sync takes over.
+            // This will NOT re-trigger on restart — see the completion marker below.
+            let marker_path = "/mnt/xrpl-data/sync/sync_complete.marker";
+            let sync_done = std::path::Path::new(marker_path).exists();
 
-            let syncer = bulk_syncer.clone();
-            let hash_comp = state_hash_computer.clone();
-            let db2 = db.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    if !syncer.is_running() {
-                        let synced = syncer.objects_synced();
-                        eprintln!("[startup] Sync done ({synced} objects) — building SHAMap...");
-                        hash_comp.start_computation(db2, synced.max(estimated));
-                        break;
+            if sync_done {
+                eprintln!("[startup] Sync already completed — building SHAMap directly (~{estimated} entries)");
+                state_hash_computer.start_computation(db.clone(), estimated);
+                // Sweep disabled — waiting for local rippled node to reach "full"
+                // before doing a clean pinned re-sync.
+                // incremental_syncer.start_sweep(db.clone(), "/mnt/xrpl-data/sync");
+            } else {
+                eprintln!("[startup] Running full state sync — this is the final one");
+                bulk_syncer.start(db.clone(), 30_000_000);
+
+                let syncer = bulk_syncer.clone();
+                let hash_comp = state_hash_computer.clone();
+                let db2 = db.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        if !syncer.is_running() {
+                            let synced = syncer.objects_synced();
+                            eprintln!("[startup] Sync COMPLETE ({synced} objects) — writing marker + building SHAMap");
+                            // Write marker so we NEVER bulk sync again
+                            let _ = std::fs::write(marker_path, format!("{synced}"));
+                            hash_comp.start_computation(db2, synced.max(estimated));
+                            break;
+                        }
                     }
-                }
-            });
+                });
+            }
         }
     }
 
@@ -536,6 +551,8 @@ async fn main() {
     let val_sse = tx2.clone();
     let consensus_loop = consensus.clone();
     let state_hash_for_close = state_hash_computer.clone();
+    let inc_syncer = incremental_syncer.clone();
+    let inc_hash_comp = state_hash_computer.clone();
     let mut last_validated_seq: u32 = 0;
     // Buffer raw transactions per round for full ledger close
     let mut round_raw_txs: Vec<(xrpl_core::types::Hash256, Vec<u8>)> = Vec::new();
@@ -617,6 +634,20 @@ async fn main() {
                                             }
                                         }
                                     });
+
+                                    // Incremental sync: fetch ALL changed state objects
+                                    // (not just accounts — offers, trust lines, directories too)
+                                    // Incremental sync — pointed at local rippled (localhost:5005)
+                                    {
+                                        let inc_db = le.lock().as_ref().map(|e| e.db_arc());
+                                        if let Some(idb) = inc_db {
+                                            inc_syncer.sync_ledger(
+                                                prev_seq,
+                                                idb,
+                                                inc_hash_comp.clone(),
+                                            );
+                                        }
+                                    }
                                 }
                             }
 
@@ -938,7 +969,62 @@ async fn main() {
                 }
             }
         }))
-        .route("/api/sync-status", get(sync_status))
+        .route("/api/sync-status", get({
+            let sync_le = live_engine.clone();
+            let sync_bulk = bulk_syncer.clone();
+            move || {
+                let sync_le = sync_le.clone();
+                let sync_bulk = sync_bulk.clone();
+                async move {
+                    // Check completion marker first — if it exists, sync is done
+                    let marker_path = "/mnt/xrpl-data/sync/sync_complete.marker";
+                    let marker_count: u64 = std::fs::read_to_string(marker_path)
+                        .ok()
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(0);
+
+                    let rocks_path = std::env::var("XRPL_ROCKS_PATH")
+                        .unwrap_or_else(|_| "/mnt/xrpl-data/sync/state.rocks".to_string());
+                    let db_size_mb = std::fs::read_dir(&rocks_path)
+                        .map(|es| es.filter_map(|e| e.ok())
+                            .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+                            .sum::<u64>())
+                        .unwrap_or(0) / 1_048_576;
+
+                    if marker_count > 0 {
+                        // Sync completed — show 100%
+                        axum::Json(serde_json::json!({
+                            "objects": marker_count,
+                            "estimated_total": marker_count,
+                            "percent": 100.0,
+                            "size_mb": db_size_mb,
+                            "syncing": false,
+                            "sync_rate": 0,
+                            "sync_objects": marker_count,
+                            "sync_eta_secs": 0,
+                        }))
+                    } else {
+                        // Still syncing — show bulk sync progress
+                        let bulk = sync_bulk.status.lock().clone();
+                        let entries = if let Some(ref eng) = *sync_le.lock() {
+                            eng.entry_count() as u64
+                        } else { 0 };
+                        let estimated_total: u64 = 30_000_000;
+                        let pct = (entries as f64 / estimated_total as f64 * 100.0).min(100.0);
+                        axum::Json(serde_json::json!({
+                            "objects": entries,
+                            "estimated_total": estimated_total,
+                            "percent": (pct * 10.0).round() / 10.0,
+                            "size_mb": db_size_mb,
+                            "syncing": bulk.running,
+                            "sync_rate": (bulk.rate * 10.0).round() / 10.0,
+                            "sync_objects": bulk.objects_synced,
+                            "sync_eta_secs": bulk.estimated_remaining_secs.round() as u64,
+                        }))
+                    }
+                }
+            }
+        }))
         .route("/api/engine", get({
             let engine_web = engine_state.clone();
             let le_web = live_engine.clone();
@@ -1003,12 +1089,25 @@ async fn main() {
         .route("/api/state-hash", get({
             let hash_status = state_hash_computer.clone();
             let sync_status = bulk_syncer.clone();
+            let hash_le = live_engine.clone();
+            let inc_status = incremental_syncer.clone();
             move || {
                 let hash_status = hash_status.clone();
                 let sync_status = sync_status.clone();
+                let hash_le = hash_le.clone();
+                let inc_status = inc_status.clone();
                 async move {
                     let mut status = serde_json::to_value(&hash_status.status.lock().clone()).unwrap_or_default();
                     status["bulk_sync"] = serde_json::to_value(&sync_status.status.lock().clone()).unwrap_or_default();
+                    status["incremental_sync"] = serde_json::to_value(&inc_status.stats.lock().clone()).unwrap_or_default();
+                    // Use marker file count (accurate) instead of estimate-num-keys (broken)
+                    let marker_count: u64 = std::fs::read_to_string("/mnt/xrpl-data/sync/sync_complete.marker")
+                        .ok()
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or_else(|| {
+                            hash_le.lock().as_ref().map(|e| e.entry_count() as u64).unwrap_or(0)
+                        });
+                    status["db_entries"] = serde_json::json!(marker_count);
                     axum::Json(status)
                 }
             }
@@ -1536,33 +1635,6 @@ fn extract_key_from_validation(blob: &[u8]) -> Option<String> {
         }
     }
     None
-}
-
-async fn sync_status() -> axum::Json<serde_json::Value> {
-    let rocks_path = std::env::var("XRPL_ROCKS_PATH").unwrap_or_else(|_| "/mnt/xrpl-data/sync/state.rocks".to_string());
-
-    // Check if RocksDB exists and get size
-    let rocks_size = std::fs::read_dir(rocks_path)
-        .map(|entries| entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
-            .sum::<u64>())
-        .unwrap_or(0);
-
-    let exists = rocks_size > 0;
-    let estimated_total: u64 = 18_734_036;
-
-    // Estimate entries from RocksDB size (~240 bytes per entry avg)
-    let entries = if exists { rocks_size / 240 } else { 0 };
-    let pct = if exists { 100.0 } else { 0.0 };
-
-    axum::Json(serde_json::json!({
-        "objects": entries,
-        "estimated_total": estimated_total,
-        "percent": pct,
-        "size_mb": rocks_size / 1_048_576,
-        "syncing": false,
-    }))
 }
 
 async fn index_page() -> Html<&'static str> {

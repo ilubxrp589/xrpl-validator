@@ -31,7 +31,7 @@
   /* Dashboard - 3 compact panels */
   #dash { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; padding: 10px 20px; flex-shrink: 0; border-bottom: 1px solid #141828; }
   @media (max-width: 900px) { #dash { grid-template-columns: 1fr 1fr; } }
-  .panel { background: #0c0c1a; border: 1px solid #1a1a30; border-radius: 6px; padding: 10px 14px; overflow: hidden; }
+  .panel { background: #0c0c1a; border: 1px solid #1a1a30; border-radius: 6px; padding: 10px 14px; overflow: hidden; display: flex; flex-direction: column; }
   .panel-label { font-size: 9px; color: #3a4a6a; text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 6px; }
 
   /* Consensus state */
@@ -51,8 +51,8 @@
   .rv small { font-size: 10px; color: #3a4a6a; font-weight: 400; }
 
   /* Cycle viz */
-  #cyc { display: flex; gap: 1px; height: 24px; align-items: flex-end; }
-  .ct { width: 3px; border-radius: 1px 1px 0 0; transition: height 0.2s; }
+  #cyc { display: flex; gap: 1px; height: 48px; align-items: flex-end; }
+  .ct { flex: 1; border-radius: 1px 1px 0 0; transition: height 0.2s; min-width: 2px; }
   .ct.cp { background: #0085FF; } .ct.cv { background: #ffd93d; } .ct.cc { background: #ff6b6b; }
   #cleg { display: flex; gap: 8px; font-size: 8px; color: #3a4a6a; margin-top: 4px; }
   #cleg i { display: inline-block; width: 5px; height: 5px; border-radius: 1px; margin-right: 2px; vertical-align: middle; }
@@ -131,6 +131,7 @@
     <a href="/consensus" class="header-link">CONSENSUS</a>
     <a href="/metrics" class="header-link">METRICS</a>
     <a href="/peers" class="header-link">PEERS</a>
+    <a href="/state" class="header-link">STATE</a>
     <a href="https://github.com/ilubxrp589/xrpl-validator" target="_blank" class="header-link">GITHUB</a>
     <span class="header-link" id="pt">PEERS <span id="pc" style="color:#00ff88">0</span>/<span id="pk">0</span></span>
   </div>
@@ -262,9 +263,9 @@ function updateSpark() {
 
 function updateCyc(type) {
   let cls = '', h = 0;
-  if (type === 'Proposal') { cls = 'cp'; h = 10; }
-  else if (type === 'Validation') { cls = 'cv'; h = 18; }
-  else if (type === 'StatusChange') { cls = 'cc'; h = 24; }
+  if (type === 'Proposal') { cls = 'cp'; h = 20; }
+  else if (type === 'Validation') { cls = 'cv'; h = 36; }
+  else if (type === 'StatusChange') { cls = 'cc'; h = 48; }
   else return;
   ch.push({ cls, h }); if (ch.length > CM) ch.shift();
   const ticks = cycEl.children;
