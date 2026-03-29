@@ -879,6 +879,15 @@ async fn sync_ledger_state(
     modified_indices.insert("2E8A59AA9D3B5B186B0B9E0F62E6C02587CA74A4D778938E957B6357D364B244".to_string()); // NegativeUNL
     modified_indices.insert("7DB0788C020F02780A673DC74757F23823FA3014C1866E72CC4CD8B226CD6EF4".to_string()); // Amendments
     modified_indices.insert("4BC50C9B0D8515D3EAAE1E74B29A95804346C491EE1A95BF25E4AAB854A6A651".to_string()); // FeeSettings
+    // LedgerHashes sub-page: key = SHA512Half(0x0073 || uint32_be(seq/65536))
+    {
+        use sha2::{Sha512, Digest};
+        let group = seq / 65536;
+        let mut data = vec![0x00u8, 0x73];
+        data.extend_from_slice(&group.to_be_bytes());
+        let hash = Sha512::digest(&data);
+        modified_indices.insert(hex::encode(&hash[..32]).to_uppercase());
+    }
 
     // Step 3: Fetch ALL modified objects into memory FIRST.
     // Only commit to RocksDB if every single fetch succeeds.

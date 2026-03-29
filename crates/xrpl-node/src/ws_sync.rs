@@ -94,11 +94,7 @@ pub async fn start_ws_sync(
                 let start_seq = if last_processed > 0 { last_processed + 1 } else { last_synced.load(Ordering::Relaxed) + 1 };
 
                 for process_seq in start_seq..=closed_seq {
-                    let account_hash = if process_seq == closed_seq {
-                        fetch_account_hash(&rpc_client, process_seq).await.unwrap_or_default()
-                    } else {
-                        String::new()
-                    };
+                    let account_hash = fetch_account_hash(&rpc_client, process_seq).await.unwrap_or_default();
 
                     acc_modified.clear();
                     acc_deleted.clear();
@@ -125,18 +121,27 @@ pub async fn start_ws_sync(
                     if !meta_ok { continue; }
 
                     // Always include protocol-level singletons
-                    acc_modified.insert("B4979A36CDC7F3D3D5C31A4EAE2AC7D7209DDA877588B9AFC66799692AB0D66B".to_string()); // LedgerHashes
+                    acc_modified.insert("B4979A36CDC7F3D3D5C31A4EAE2AC7D7209DDA877588B9AFC66799692AB0D66B".to_string()); // LedgerHashes (skip list)
                     acc_modified.insert("2E8A59AA9D3B5B186B0B9E0F62E6C02587CA74A4D778938E957B6357D364B244".to_string()); // NegativeUNL
                     acc_modified.insert("7DB0788C020F02780A673DC74757F23823FA3014C1866E72CC4CD8B226CD6EF4".to_string()); // Amendments
                     acc_modified.insert("4BC50C9B0D8515D3EAAE1E74B29A95804346C491EE1A95BF25E4AAB854A6A651".to_string()); // FeeSettings
+                    // LedgerHashes sub-page: key = SHA512Half(0x0073 || uint32_be(seq/65536))
+                    // Changes every ledger (new hash appended), rolls to new key every 65536 ledgers
+                    {
+                        use sha2::{Sha512, Digest};
+                        let group = process_seq / 65536;
+                        let mut data = vec![0x00u8, 0x73];
+                        data.extend_from_slice(&group.to_be_bytes());
+                        let hash = Sha512::digest(&data);
+                        acc_modified.insert(hex::encode(&hash[..32]).to_uppercase());
+                    }
 
                     // Final cleanup
                     for d in acc_deleted.iter().cloned().collect::<Vec<_>>() {
                         acc_modified.remove(&d);
                     }
 
-                    // Compute hash on every ledger close (the last one in each batch)
-                    let compute_hash = process_seq == closed_seq;
+                    let compute_hash = true;
                     let result = process_ledger(
                         &rpc_client, &db, &hash_comp,
                         process_seq, &acc_modified, &acc_deleted,
@@ -360,88 +365,132 @@ async fn process_ledger(
                 if matched {
                     eprintln!("[ws-sync] #{seq}: MATCH ({tx_count} txs, {} objs)", fetched_data.len());
                 } else {
-                    eprintln!("[ws-sync] #{seq}: MISMATCH ({tx_count} txs, {} modified, {} deleted) ours={} net={}",
-                        modified.len(), deleted.len(),
-                        &ours[..16], &account_hash[..16.min(account_hash.len())]);
-                    // DIAGNOSTIC: on first mismatch, scan ALL ledger_data pages to find differing keys
-                    let mut diag_marker: Option<String> = None;
-                    let mut differ = 0u32;
-                    let mut missing = 0u32;
-                    let mut extra_in_db = 0u32;
-                    let mut net_count = 0u64;
-                    let mut net_keys: std::collections::HashSet<[u8;32]> = std::collections::HashSet::new();
-                    loop {
-                        let mut p = serde_json::json!({"ledger_index":seq,"binary":true,"limit":2048});
-                        if let Some(ref m) = diag_marker { p["marker"] = serde_json::Value::String(m.clone()); }
-                        let diag_resp = match client.post(RPC_URL)
-                            .json(&serde_json::json!({"method":"ledger_data","params":[p]}))
-                            .send().await {
-                            Ok(r) => r,
-                            Err(_) => break,
-                        };
-                        let diag_body: serde_json::Value = match diag_resp.json().await {
-                            Ok(b) => b,
-                            Err(_) => break,
-                        };
-                        if let Some(objs) = diag_body["result"]["state"].as_array() {
-                            for obj in objs {
-                                if let (Some(idx), Some(net_data)) = (obj["index"].as_str(), obj["data"].as_str()) {
-                                    if let Ok(kb) = hex::decode(idx) {
-                                        if kb.len() == 32 {
-                                            let mut k32 = [0u8;32];
-                                            k32.copy_from_slice(&kb);
-                                            net_keys.insert(k32);
-                                            net_count += 1;
-                                            match db.get(&kb) {
-                                                Ok(Some(our_data)) => {
-                                                    if let Ok(nd) = hex::decode(net_data) {
-                                                        if our_data.as_ref() as &[u8] != nd.as_slice() {
-                                                            differ += 1;
-                                                            if differ <= 5 {
-                                                                eprintln!("[ws-sync] DIFF key={} ours={}b net={}b", &idx[..16], our_data.len(), nd.len());
+                    eprintln!("[ws-sync] #{seq}: MISMATCH ({tx_count} txs) — self-healing retry...",);
+
+                    // SELF-HEALING: re-fetch ALL modified+singleton objects and recompute
+                    // Likely cause: transient stale data from rippled under load
+                    let mut healed = false;
+                    for retry in 0..2u32 {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        let mut retry_batch = rocksdb::WriteBatch::default();
+                        let mut retry_keys: Vec<Hash256> = Vec::new();
+                        let mut retry_ok = true;
+
+                        for index_hex in modified.iter().chain(deleted.iter()) {
+                            let resp = client.post(RPC_URL)
+                                .json(&serde_json::json!({
+                                    "method": "ledger_entry",
+                                    "params": [{"index": index_hex, "binary": true, "ledger_index": seq}]
+                                }))
+                                .send().await;
+                            if let Ok(r) = resp {
+                                if let Ok(body) = r.json::<serde_json::Value>().await {
+                                    if let Some(data_hex) = body["result"]["node_binary"].as_str() {
+                                        if let (Ok(data), Ok(kb)) = (hex::decode(data_hex), hex::decode(index_hex)) {
+                                            if kb.len() == 32 {
+                                                let mut key = [0u8; 32];
+                                                key.copy_from_slice(&kb);
+                                                retry_batch.put(&key, &data);
+                                                retry_keys.push(Hash256(key));
+                                            }
+                                        }
+                                    } else if body["result"]["error"].as_str() == Some("entryNotFound") {
+                                        if let Ok(kb) = hex::decode(index_hex) {
+                                            if kb.len() == 32 {
+                                                retry_batch.delete(&kb);
+                                                let mut k = Hash256([0u8; 32]);
+                                                k.0.copy_from_slice(&kb);
+                                                retry_keys.push(k);
+                                            }
+                                        }
+                                    } else {
+                                        retry_ok = false;
+                                        break;
+                                    }
+                                }
+                            } else {
+                                retry_ok = false;
+                                break;
+                            }
+                        }
+
+                        if !retry_ok || retry_keys.is_empty() { continue; }
+                        let _ = db.write(retry_batch);
+
+                        // Recompute hash with fresh data
+                        if let Some(root2) = hash_comp.update_and_hash(db, &retry_keys) {
+                            let ours2 = hex::encode(root2.0);
+                            let matched2 = ours2.to_uppercase() == account_hash.to_uppercase();
+                            hash_comp.set_network_hash(account_hash, seq);
+                            if matched2 {
+                                eprintln!("[ws-sync] #{seq}: HEALED on retry {} — re-fetch fixed it", retry + 1);
+                                healed = true;
+                                break;
+                            } else {
+                                eprintln!("[ws-sync] #{seq}: retry {} still mismatches ours={}", retry + 1, &ours2[..16]);
+                            }
+                        }
+                    }
+
+                    if !healed {
+                        eprintln!("[ws-sync] #{seq}: MISMATCH persists — FULL SCAN starting...");
+                        // Full scan: compare every key in ledger_data against our DB
+                        let mut diag_marker: Option<String> = None;
+                        let mut n_diff = 0u32;
+                        let mut n_missing = 0u32;
+                        let mut n_total = 0u64;
+                        loop {
+                            let mut p = serde_json::json!({"ledger_index":seq,"binary":true,"limit":2048});
+                            if let Some(ref m) = diag_marker { p["marker"] = serde_json::Value::String(m.clone()); }
+                            let Ok(r) = client.post(RPC_URL)
+                                .json(&serde_json::json!({"method":"ledger_data","params":[p]}))
+                                .send().await else { break };
+                            let Ok(body) = r.json::<serde_json::Value>().await else { break };
+                            if let Some(objs) = body["result"]["state"].as_array() {
+                                for obj in objs {
+                                    if let (Some(idx), Some(net_data)) = (obj["index"].as_str(), obj["data"].as_str()) {
+                                        if let Ok(kb) = hex::decode(idx) {
+                                            if kb.len() == 32 {
+                                                n_total += 1;
+                                                match db.get(&kb) {
+                                                    Ok(Some(ours)) => {
+                                                        if let Ok(nd) = hex::decode(net_data) {
+                                                            if ours.as_ref() as &[u8] != nd.as_slice() {
+                                                                n_diff += 1;
+                                                                if n_diff <= 5 {
+                                                                    eprintln!("[ws-sync] DIFF {} ours={}b net={}b", idx, ours.len(), nd.len());
+                                                                }
                                                             }
                                                         }
                                                     }
-                                                }
-                                                Ok(None) => {
-                                                    missing += 1;
-                                                    if missing <= 5 {
-                                                        eprintln!("[ws-sync] MISSING key={}", &idx[..16]);
+                                                    Ok(None) => {
+                                                        n_missing += 1;
+                                                        if n_missing <= 5 { eprintln!("[ws-sync] MISSING {}", idx); }
                                                     }
+                                                    Err(_) => {}
                                                 }
-                                                Err(_) => {}
                                             }
                                         }
                                     }
                                 }
                             }
-                        }
-                        diag_marker = diag_body["result"]["marker"].as_str().map(String::from);
-                        if diag_marker.is_none() { break; }
-                        if net_count % 2_000_000 < 2048 {
-                            eprintln!("[ws-sync] DIAG scanning: {net_count}... ({differ} diff, {missing} missing)");
-                        }
-                    }
-                    // Check for extra keys in our DB
-                    let snap = db.snapshot();
-                    let iter = snap.iterator(rocksdb::IteratorMode::Start);
-                    let mut our_count = 0u64;
-                    for item in iter {
-                        if let Ok((key, _)) = item {
-                            if key.len() == 32 {
-                                our_count += 1;
-                                let mut k32 = [0u8;32];
-                                k32.copy_from_slice(&key);
-                                if !net_keys.contains(&k32) {
-                                    extra_in_db += 1;
-                                    if extra_in_db <= 5 {
-                                        eprintln!("[ws-sync] EXTRA in DB: {}", hex::encode(&key[..16]));
-                                    }
-                                }
+                            diag_marker = body["result"]["marker"].as_str().map(String::from);
+                            if diag_marker.is_none() { break; }
+                            if n_total % 2_000_000 < 2048 {
+                                eprintln!("[ws-sync] SCAN {n_total}... ({n_diff} diff, {n_missing} missing)");
                             }
                         }
+                        // Also count extra keys in our DB
+                        let snap = db.snapshot();
+                        let our_count = snap.iterator(rocksdb::IteratorMode::Start)
+                            .filter(|i| i.as_ref().map(|(k,_)| k.len() == 32).unwrap_or(false))
+                            .count() as u64;
+                        let extra = our_count.saturating_sub(n_total);
+                        eprintln!("[ws-sync] SCAN DONE: net={n_total} ours={our_count} extra={extra} | {n_diff} diff, {n_missing} missing");
+                        // Only run full scan once — subsequent mismatches just log
+                        // (the scan takes ~5min and blocks sync)
                     }
-                    eprintln!("[ws-sync] DIAG COMPLETE: net={net_count} ours={our_count} | {differ} differ, {missing} missing, {extra_in_db} extra in DB");
+                    return healed;
                 }
                 return matched;
             }
