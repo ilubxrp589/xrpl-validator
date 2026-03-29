@@ -29,3 +29,6 @@ objects.jsonl
 marker.txt
 engine_state.json
 *.log
+
+# Snapshot data (9GB+)
+xrpl_clean_snapshot/

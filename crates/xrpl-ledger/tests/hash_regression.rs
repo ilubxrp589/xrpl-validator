@@ -37,9 +37,10 @@ fn leaf_node_hash_uses_correct_prefix() {
 
     let leaf = LeafNode::new(key, data.clone());
     let expected = {
+        // Rippled order: prefix || data || key
         let mut buf = Vec::new();
-        buf.extend_from_slice(&key.0);
         buf.extend_from_slice(&data);
+        buf.extend_from_slice(&key.0);
         sha512_half_prefixed(&HASH_PREFIX_LEAF_NODE, &buf)
     };
 

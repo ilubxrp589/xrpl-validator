@@ -122,7 +122,12 @@ pub fn extract_tx_amount(tx_data: &[u8]) -> Option<u64> {
 
 /// Live engine state — RocksDB backed.
 pub struct LiveEngine {
-    db: Arc<rocksdb::DB>,
+    /// State DB — read-only reference. Owned by incremental sync for hash computation.
+    /// The engine MUST NOT write to this DB.
+    state_db: Arc<rocksdb::DB>,
+    /// Engine's own local DB for tracking state (fee deductions, balance changes).
+    /// Completely isolated from the state hash pipeline.
+    local_db: rocksdb::DB,
     fetch_tx: std::sync::mpsc::Sender<([u8; 20], [u8; 32])>,
     /// Current ledger sequence we're tracking.
     pub ledger_seq: u32,
@@ -147,38 +152,54 @@ pub struct LiveEngine {
 }
 
 impl LiveEngine {
-    /// Open the RocksDB at the given path.
-    pub fn open(path: &Path) -> Result<Self, String> {
-        let mut opts = rocksdb::Options::default();
-        opts.create_if_missing(true);
-        opts.set_max_open_files(256);
-        opts.set_keep_log_file_num(2);
-        // Optimize for reads
-        opts.set_max_background_jobs(2);
-        opts.optimize_for_point_lookup(64); // 64MB block cache
+    /// Open the engine with two separate databases:
+    /// - `state_path`: the shared state DB (read-only for engine, owned by inc-sync)
+    /// - Engine gets its own local DB at `{state_path}.engine` for any writes
+    pub fn open(state_path: &Path) -> Result<Self, String> {
+        // State DB: tuned for 64GB RAM system with NVMe
+        let mut state_opts = rocksdb::Options::default();
+        state_opts.create_if_missing(true);
+        state_opts.set_max_open_files(16_000);
+        state_opts.set_keep_log_file_num(2);
+        state_opts.increase_parallelism(8);
+        state_opts.set_write_buffer_size(512 * 1024 * 1024); // 512MB per buffer
+        state_opts.set_max_write_buffer_number(4);            // 4 buffers = 2GB total
+        // Use default compression (Snappy) — LZ4 is untested and may cause issues
+        // state_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        state_opts.set_level_compaction_dynamic_level_bytes(true);
 
-        let db = Arc::new(rocksdb::DB::open(&opts, path)
-            .map_err(|e| format!("rocksdb open: {e}"))?);
+        // 4GB block cache with 10-bit bloom filter
+        let mut block_opts = rocksdb::BlockBasedOptions::default();
+        block_opts.set_block_cache(&rocksdb::Cache::new_lru_cache(4 * 1024 * 1024 * 1024));
+        block_opts.set_bloom_filter(10.0, false);
+        state_opts.set_block_based_table_factory(&block_opts);
 
-        let count = db.property_value("rocksdb.estimate-num-keys")
+        let state_db = Arc::new(rocksdb::DB::open(&state_opts, state_path)
+            .map_err(|e| format!("rocksdb state open: {e}"))?);
+
+        let count = state_db.property_value("rocksdb.estimate-num-keys")
             .ok()
             .flatten()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0);
-        eprintln!("[engine] Opened RocksDB: ~{count} entries");
+        eprintln!("[engine] Opened state DB: ~{count} entries");
 
-        // Background fetchers DISABLED — they write data from "validated" (latest)
-        // ledger into our pinned-ledger state DB, corrupting the consistent snapshot.
-        // TODO: re-enable once incremental sync is managing state updates properly.
+        // Local DB: engine's own — completely isolated from state hash pipeline
+        let local_path = format!("{}.engine", state_path.display());
+        let mut local_opts = rocksdb::Options::default();
+        local_opts.create_if_missing(true);
+        local_opts.set_max_open_files(64);
+        let local_db = rocksdb::DB::open(&local_opts, &local_path)
+            .map_err(|e| format!("rocksdb local open: {e}"))?;
+        eprintln!("[engine] Opened local DB at {local_path}");
+
         let (fetch_tx, _fetch_rx) = std::sync::mpsc::channel::<([u8; 20], [u8; 32])>();
 
         Ok(Self {
-            db,
+            state_db,
+            local_db,
             fetch_tx,
             ledger_seq: 0,
-            // Approximate total XRP in drops as of early 2026.
-            // This is a bootstrap value — the network poll (server_info)
-            // corrects it every ~30s with the actual on-ledger total.
             total_coins: 99_985_687_626_634_189,
             round_applied: 0,
             round_failed: 0,
@@ -205,19 +226,19 @@ impl LiveEngine {
         let _ = self.fetch_tx.send(([0u8; 20], key.0));
     }
 
-    /// Look up a ledger object by its keylet hash.
+    /// Look up a ledger object from the state DB (read-only).
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.db.get(key).ok()?
+        self.state_db.get(key).ok()?
     }
 
-    /// Write a ledger object.
+    /// Write to the engine's LOCAL db (never touches state DB).
     pub fn put(&self, key: &[u8], data: &[u8]) -> Result<(), String> {
-        self.db.put(key, data).map_err(|e| format!("rocksdb put: {e}"))
+        self.local_db.put(key, data).map_err(|e| format!("rocksdb put: {e}"))
     }
 
-    /// Delete a ledger object.
+    /// Delete from the engine's LOCAL db (never touches state DB).
     pub fn delete(&self, key: &[u8]) -> Result<(), String> {
-        self.db.delete(key).map_err(|e| format!("rocksdb delete: {e}"))
+        self.local_db.delete(key).map_err(|e| format!("rocksdb delete: {e}"))
     }
 
     /// Apply a decoded transaction to the state with full write-back.
@@ -249,7 +270,8 @@ impl LiveEngine {
         let balance = match extract_xrp_balance(&acct_data) {
             Some(b) => b,
             None => {
-                let _ = self.db.delete(&acct_key.0);
+                // Delete from LOCAL db only — state DB is untouched
+                let _ = self.local_db.delete(&acct_key.0);
                 self.queue_fetch(account_id, &acct_key);
                 self.round_failed += 1; self.total_failed += 1;
                 return (false, fee);
@@ -310,24 +332,24 @@ impl LiveEngine {
         self.verified_total += (matches + mismatches) as u64;
     }
 
-    /// Get DB handle for background verification.
+    /// Get state DB handle for background verification.
     pub fn db_ref(&self) -> &Arc<rocksdb::DB> {
-        &self.db
+        &self.state_db
     }
 
     /// Estimated entry count.
     pub fn entry_count(&self) -> usize {
-        self.db.property_value("rocksdb.estimate-num-keys")
+        self.state_db.property_value("rocksdb.estimate-num-keys")
             .ok()
             .flatten()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0)
     }
 
-    /// Get a snapshot of the DB for consistent iteration.
-    /// Returns an Arc to the DB for use in background tasks.
+    /// Get the state DB Arc for inc-sync and hash computation.
+    /// The engine NEVER writes to this — it's read-only from the engine's perspective.
     pub fn db_arc(&self) -> Arc<rocksdb::DB> {
-        self.db.clone()
+        self.state_db.clone()
     }
 }
 

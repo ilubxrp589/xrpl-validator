@@ -1,5 +1,6 @@
 //! SHAMap node types — inner nodes (branching factor 16) and leaf nodes.
 
+use std::cell::Cell;
 use xrpl_core::types::Hash256;
 
 use super::hash::{sha512_half_prefixed, HASH_PREFIX_INNER_NODE, HASH_PREFIX_LEAF_NODE};
@@ -22,6 +23,19 @@ impl SHAMapNode {
             Self::Leaf(leaf) => leaf.hash(),
         }
     }
+
+    /// Recursively clear all cached inner node hashes.
+    /// After this, the next `hash()` call recomputes everything from scratch.
+    /// Leaves are unaffected (their hash is stored, not cached).
+    /// Cost: O(inner_nodes) — pure memory traversal, no I/O. ~2-3 seconds for 18.7M leaves.
+    pub fn invalidate_all_caches(&mut self) {
+        if let SHAMapNode::Inner(inner) = self {
+            inner.cached_hash.set(None);
+            for slot in inner.children.iter_mut().flatten() {
+                slot.invalidate_all_caches();
+            }
+        }
+    }
 }
 
 /// Inner node in the SHAMap — has up to 16 children (branching factor 16).
@@ -34,8 +48,9 @@ impl SHAMapNode {
 pub struct InnerNode {
     /// Child nodes — fixed 16 slots (branching factor 16). `None` = empty slot.
     children: [Option<SHAMapNode>; 16],
-    /// Cached hash — invalidated on mutation, recomputed lazily.
-    cached_hash: Option<Hash256>,
+    /// Cached hash — invalidated on mutation, recomputed and cached lazily.
+    /// Uses Cell for interior mutability so hash() can cache from &self.
+    cached_hash: Cell<Option<Hash256>>,
 }
 
 impl InnerNode {
@@ -43,7 +58,7 @@ impl InnerNode {
     pub fn new() -> Self {
         Self {
             children: std::array::from_fn(|_| None),
-            cached_hash: None,
+            cached_hash: Cell::new(None),
         }
     }
 
@@ -51,13 +66,13 @@ impl InnerNode {
     pub fn set_child_node(&mut self, index: u8, node: SHAMapNode) {
         debug_assert!(index < 16, "child index must be 0-15");
         self.children[index as usize] = Some(node);
-        self.cached_hash = None;
+        self.cached_hash.set(None);
     }
 
     /// Take a child node out (replacing with None).
     pub fn take_child_node(&mut self, index: u8) -> Option<SHAMapNode> {
         debug_assert!(index < 16);
-        self.cached_hash = None;
+        self.cached_hash.set(None);
         self.children[index as usize].take()
     }
 
@@ -68,7 +83,7 @@ impl InnerNode {
 
     /// Get a mutable reference to a child node.
     pub fn get_child_node_mut(&mut self, index: u8) -> Option<&mut SHAMapNode> {
-        self.cached_hash = None;
+        self.cached_hash.set(None);
         self.children[index as usize].as_mut()
     }
 
@@ -76,7 +91,7 @@ impl InnerNode {
     pub fn remove_child(&mut self, index: u8) {
         debug_assert!(index < 16);
         self.children[index as usize] = None;
-        self.cached_hash = None;
+        self.cached_hash.set(None);
     }
 
     /// Get the hash of a child (returns zero hash for empty slots).
@@ -115,15 +130,16 @@ impl InnerNode {
 
     /// Set the cached hash (used by bulk_build to avoid recomputation).
     pub fn set_cached_hash(&mut self, hash: Hash256) {
-        self.cached_hash = Some(hash);
+        self.cached_hash.set(Some(hash));
     }
 
     /// Compute the hash of this inner node.
+    /// Caches the result via interior mutability for O(1) subsequent calls.
     ///
     /// `SHA512Half(HASH_PREFIX_INNER_NODE || h0 || h1 || ... || h15)`
     /// where each `h_i` is the child's hash or 32 zero bytes.
     pub fn hash(&self) -> Hash256 {
-        if let Some(h) = self.cached_hash {
+        if let Some(h) = self.cached_hash.get() {
             return h;
         }
 
@@ -133,7 +149,9 @@ impl InnerNode {
             data[i * 32..(i + 1) * 32].copy_from_slice(&h.0);
         }
 
-        sha512_half_prefixed(&HASH_PREFIX_INNER_NODE, &data)
+        let hash = sha512_half_prefixed(&HASH_PREFIX_INNER_NODE, &data);
+        self.cached_hash.set(Some(hash));
+        hash
     }
 }
 
@@ -190,9 +208,10 @@ impl LeafNode {
         if let Some(h) = self.cached_hash {
             return h;
         }
-        let mut buf = Vec::with_capacity(32 + self.data.len());
-        buf.extend_from_slice(&self.key.0);
+        // Rippled order: prefix || data || key
+        let mut buf = Vec::with_capacity(self.data.len() + 32);
         buf.extend_from_slice(&self.data);
+        buf.extend_from_slice(&self.key.0);
         sha512_half_prefixed(&HASH_PREFIX_LEAF_NODE, &buf)
     }
 }

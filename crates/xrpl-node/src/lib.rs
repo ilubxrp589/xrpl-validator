@@ -29,6 +29,7 @@ pub mod peer;
 pub mod rpc;
 pub mod state_hash;
 pub mod validation;
+pub mod ws_sync;
 
 pub use config::{NodeConfig, NodeMode};
 pub use error::NodeError;

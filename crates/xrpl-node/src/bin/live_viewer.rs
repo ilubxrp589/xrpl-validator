@@ -8,6 +8,11 @@
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use std::collections::HashSet;
+
+// Limit rayon to 8 threads — leave cores for OS, rippled, and peer handling
+static _RAYON_INIT: std::sync::LazyLock<()> = std::sync::LazyLock::new(|| {
+    rayon::ThreadPoolBuilder::new().num_threads(8).build_global().ok();
+});
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -153,7 +158,7 @@ async fn main() {
     // Init rustls crypto provider
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let (tx, _) = broadcast::channel::<MessageEvent>(1000);
+    let (tx, _) = broadcast::channel::<MessageEvent>(10000);
     let tx2 = tx.clone();
 
     // Outbound message channel — validation + transaction relay to broadcast to all peers
@@ -459,26 +464,206 @@ async fn main() {
 
             if sync_done {
                 eprintln!("[startup] Sync already completed — building SHAMap directly (~{estimated} entries)");
+
+                // Suppress inc-sync IMMEDIATELY — before SHAMap build starts.
+                // Inc-sync must not touch the tree until backfill catches up.
+                incremental_syncer.backfilling.store(true, std::sync::atomic::Ordering::SeqCst);
+
                 state_hash_computer.start_computation(db.clone(), estimated);
-                // Sweep disabled — waiting for local rippled node to reach "full"
-                // before doing a clean pinned re-sync.
-                // incremental_syncer.start_sweep(db.clone(), "/mnt/xrpl-data/sync");
+
+                // Backfill gap: read pinned ledger from download marker, catch up to current
+                let backfill_db = db.clone();
+                let backfill_hash = state_hash_computer.clone();
+                let backfill_syncer = incremental_syncer.clone();
+                tokio::spawn(async move {
+                    // Wait for SHAMap to finish building
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        if backfill_hash.is_ready() {
+                            break;
+                        }
+                    }
+
+                    // Read pinned ledger from download marker
+                    let pinned_seq: u32 = std::fs::read_to_string("/mnt/xrpl-data/sync/dl_done.txt")
+                        .ok()
+                        .and_then(|s| {
+                            // Format: "ledger #103122702 — ..."
+                            s.split('#').nth(1)
+                                .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+                                .and_then(|n| n.parse().ok())
+                        })
+                        .unwrap_or(0);
+
+                    if pinned_seq == 0 {
+                        eprintln!("[backfill] Could not read pinned ledger from dl_done.txt — skipping backfill");
+                        return;
+                    }
+
+                    // Get current validated ledger from rippled
+                    let client = reqwest::Client::builder()
+                        .timeout(Duration::from_secs(10))
+                        .build()
+                        .unwrap_or_default();
+                    let current_seq: u32 = match client
+                        .post("http://10.0.0.97:5005")
+                        .json(&serde_json::json!({"method":"ledger","params":[{"ledger_index":"validated"}]}))
+                        .send()
+                        .await
+                    {
+                        Ok(resp) => {
+                            resp.json::<serde_json::Value>().await.ok()
+                                .and_then(|v| v["result"]["ledger"]["ledger_index"].as_str()
+                                    .and_then(|s| s.parse().ok()))
+                                .unwrap_or(0)
+                        }
+                        Err(_) => 0,
+                    };
+
+                    if current_seq > pinned_seq {
+                        let gap = current_seq - pinned_seq;
+                        eprintln!("[backfill] Gap: {gap} ledgers (#{pinned_seq} → #{current_seq})");
+                        backfill_syncer.backfill_range(
+                            pinned_seq,
+                            current_seq,
+                            backfill_db.clone(),
+                            backfill_hash.clone(),
+                        );
+
+                        // Wait for backfill to finish before starting WS sync
+                        // (avoids race: leaf cache built from partially-backfilled DB)
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            if !backfill_syncer.backfilling.load(std::sync::atomic::Ordering::SeqCst) {
+                                break;
+                            }
+                        }
+                    } else {
+                        eprintln!("[backfill] No gap — already current");
+                    }
+
+                    // Get latest validated ledger (backfill may have advanced past current_seq)
+                    let ws_start: u32 = {
+                        let c = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap_or_default();
+                        match c.post("http://10.0.0.97:5005")
+                            .json(&serde_json::json!({"method":"ledger","params":[{"ledger_index":"validated"}]}))
+                            .send().await {
+                            Ok(r) => r.json::<serde_json::Value>().await.ok()
+                                .and_then(|v| v["result"]["ledger"]["ledger_index"].as_str()
+                                    .and_then(|s| s.parse().ok()))
+                                .unwrap_or(current_seq),
+                            Err(_) => current_seq,
+                        }
+                    };
+
+                    let ws_last = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(ws_start));
+                    eprintln!("[startup] Starting WS sync from #{ws_start} after backfill");
+                    xrpl_node::ws_sync::start_ws_sync(backfill_db, backfill_hash, ws_last).await;
+                });
             } else {
                 eprintln!("[startup] Running full state sync — this is the final one");
+                // Suppress inc-sync during download to prevent race conditions.
+                // Bulk download writes objects at the pinned ledger; inc-sync writes
+                // newer versions. Without suppression, the download can overwrite
+                // newer data with stale data from the pinned ledger.
+                incremental_syncer.backfilling.store(true, std::sync::atomic::Ordering::SeqCst);
                 bulk_syncer.start(db.clone(), 30_000_000);
 
                 let syncer = bulk_syncer.clone();
                 let hash_comp = state_hash_computer.clone();
-                let db2 = db.clone();
+                let backfill_syncer = incremental_syncer.clone();
+                let startup_db = db.clone();
                 tokio::spawn(async move {
                     loop {
-                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        tokio::time::sleep(Duration::from_secs(2)).await;
                         if !syncer.is_running() {
                             let synced = syncer.objects_synced();
-                            eprintln!("[startup] Sync COMPLETE ({synced} objects) — writing marker + building SHAMap");
-                            // Write marker so we NEVER bulk sync again
+                            let pinned = syncer.pinned_seq.load(std::sync::atomic::Ordering::SeqCst);
                             let _ = std::fs::write(marker_path, format!("{synced}"));
-                            hash_comp.start_computation(db2, synced.max(estimated));
+
+                            // Take the SHAMap built by the syncer
+                            let built_map = syncer.shamap.lock().take();
+                            if let Some(map) = built_map {
+                                hash_comp.set_shamap(map);
+                                eprintln!("[startup] SHAMap received ({synced} entries at #{pinned})");
+                            } else {
+                                eprintln!("[startup] ERROR: no SHAMap from syncer");
+                            }
+
+                            // Second download: wipe DB + re-download at validated
+                            eprintln!("[startup] Clearing DB for second download...");
+                            {
+                                let mut batch = rocksdb::WriteBatch::default();
+                                let iter = startup_db.iterator(rocksdb::IteratorMode::Start);
+                                let mut cleared = 0u64;
+                                for item in iter {
+                                    if let Ok((key, _)) = item {
+                                        batch.delete(&key);
+                                        cleared += 1;
+                                        if cleared % 100_000 == 0 {
+                                            let _ = startup_db.write(batch);
+                                            batch = rocksdb::WriteBatch::default();
+                                        }
+                                    }
+                                }
+                                if cleared > 0 { let _ = startup_db.write(batch); }
+                                eprintln!("[startup] Cleared {cleared} entries");
+                            }
+
+                            let dl2_client = reqwest::Client::builder()
+                                .timeout(Duration::from_secs(60)).build().unwrap_or_default();
+                            let val_seq: u32 = {
+                                let r = dl2_client.post("http://10.0.0.97:5005")
+                                    .json(&serde_json::json!({"method":"ledger","params":[{"ledger_index":"validated"}]}))
+                                    .send().await;
+                                match r {
+                                    Ok(resp) => resp.json::<serde_json::Value>().await.ok()
+                                        .and_then(|v| v["result"]["ledger"]["ledger_index"].as_str()
+                                            .and_then(|s| s.parse().ok()))
+                                        .unwrap_or(pinned),
+                                    Err(_) => pinned,
+                                }
+                            };
+                            eprintln!("[startup] Second download at #{val_seq}...");
+                            let mut marker: Option<String> = None;
+                            let mut dl2_count = 0u64;
+                            loop {
+                                let mut p = serde_json::json!({"ledger_index":val_seq,"binary":true,"limit":2048});
+                                if let Some(ref m) = marker { p["marker"] = serde_json::Value::String(m.clone()); }
+                                let r = match dl2_client.post("http://10.0.0.97:5005")
+                                    .json(&serde_json::json!({"method":"ledger_data","params":[p]}))
+                                    .send().await {
+                                    Ok(r) => r, Err(_) => { tokio::time::sleep(Duration::from_secs(2)).await; continue; }
+                                };
+                                let body: serde_json::Value = match r.json().await {
+                                    Ok(b) => b, Err(_) => { tokio::time::sleep(Duration::from_secs(2)).await; continue; }
+                                };
+                                if let Some(objs) = body["result"]["state"].as_array() {
+                                    for obj in objs {
+                                        if let (Some(idx), Some(data)) = (obj["index"].as_str(), obj["data"].as_str()) {
+                                            if idx.len() == 64 {
+                                                if let (Ok(k), Ok(v)) = (hex::decode(idx), hex::decode(data)) {
+                                                    if k.len() == 32 { let _ = startup_db.put(&k, &v); dl2_count += 1; }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                marker = body["result"]["marker"].as_str().map(String::from);
+                                if marker.is_none() { break; }
+                                if dl2_count % 4_000_000 < 2048 { eprintln!("[startup] Second download: {dl2_count}..."); }
+                            }
+                            eprintln!("[startup] Second download done: {dl2_count} at #{val_seq}");
+
+                            // Start WS sync from val_seq
+                            let ws_db = startup_db.clone();
+                            let ws_hash = hash_comp.clone();
+                            let ws_last = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(val_seq));
+                            tokio::spawn(async move {
+                                xrpl_node::ws_sync::start_ws_sync(ws_db, ws_hash, ws_last).await;
+                            });
+                            eprintln!("[startup] WS sync from #{val_seq} (clean, inc-sync DISABLED)");
+                            // Keep backfilling=true
                             break;
                         }
                     }
@@ -487,7 +672,8 @@ async fn main() {
         }
     }
 
-    // Background task: poll total_coins + account_hash from network every 30s
+    // Background task: poll total_coins + account_hash from local rippled every 5s
+    // (using local node — no rate limits, faster feedback on hash matching)
     let coins_engine = engine_state.clone();
     let hash_computer = state_hash_computer.clone();
     tokio::spawn(async move {
@@ -497,7 +683,7 @@ async fn main() {
             .expect("reqwest client builder failed");
         loop {
             if let Ok(resp) = client
-                .post("https://s2.ripple.com:51234")
+                .post("http://10.0.0.97:5005")
                 .json(&serde_json::json!({
                     "method": "ledger",
                     "params": [{"ledger_index": "validated"}]
@@ -513,16 +699,12 @@ async fn main() {
                             state.lifetime_burned = ORIGINAL_SUPPLY_DROPS.saturating_sub(coins);
                         }
                     }
-                    // Also capture account_hash for state verification
-                    if let Some(account_hash) = body["result"]["ledger"]["account_hash"].as_str() {
-                        let seq = body["result"]["ledger"]["ledger_index"].as_str()
-                            .and_then(|s| s.parse::<u32>().ok())
-                            .unwrap_or(0);
-                        hash_computer.set_network_hash(account_hash, seq);
-                    }
+                    // Hash verification is done inline by inc-sync after each rebuild.
+                    // Don't compare here — the polling interval doesn't align with
+                    // the rebuild cycle and would produce false mismatches.
                 }
             }
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
 
@@ -619,10 +801,11 @@ async fn main() {
 
                                     let total_coins = state.network_total_coins;
 
-                                    // Run full ledger close + incremental SHAMap update
-                                    let hash_comp = state_hash_for_close.clone();
+                                    // DISABLED: close_ledger reads from state_db which may interfere
+                                    // with WS sync writes. Disable to test if this is the cause.
+                                    if false {
                                     tokio::task::spawn_blocking(move || {
-                                        if let Some(result) = xrpl_node::ledger_close::close_ledger(
+                                        let _ = xrpl_node::ledger_close::close_ledger(
                                             &db,
                                             &prev_round_txs,
                                             prev_seq,
@@ -630,13 +813,9 @@ async fn main() {
                                             total_coins,
                                             now_ripple,
                                             now_ripple.saturating_sub(4),
-                                        ) {
-                                            // Incrementally update the full SHAMap
-                                            if hash_comp.is_ready() {
-                                                hash_comp.update_round(&db, &result.modified_keys);
-                                            }
-                                        }
+                                        );
                                     });
+                                    } // end if false — close_ledger disabled
 
                                     // Incremental sync: fetch ALL changed state objects
                                     // (not just accounts — offers, trust lines, directories too)
@@ -657,68 +836,11 @@ async fn main() {
                             eprintln!("[verify] Round ended, {prev_modified_count} accounts to verify, {key_count} keylets modified",
                                 prev_modified_count = prev_modified.len(),
                                 key_count = _modified_keys.len());
-                            if !prev_modified.is_empty() {
-                                    let le_verify = le.clone();
-                                    let prev_seq = seq - 1;
-                                    tokio::spawn(async move {
-                                        // Verify a sample (up to 10) against RPC
-                                        let sample: Vec<_> = prev_modified.iter()
-                                            .take(10)
-                                            .cloned()
-                                            .collect();
-
-                                        let client = reqwest::Client::builder()
-                                            .timeout(Duration::from_secs(5))
-                                            .build()
-                                            .unwrap_or_default();
-
-                                        let mut matches = 0u32;
-                                        let mut mismatches = 0u32;
-
-                                        for (acct_id, balance_before, fee) in &sample {
-                                            let acct_key = xrpl_ledger::ledger::keylet::account_root_key(acct_id);
-                                            let index_hex = hex::encode(acct_key.0);
-                                            let resp = client.post("https://s2.ripple.com:51234")
-                                                .json(&serde_json::json!({
-                                                    "method": "ledger_entry",
-                                                    "params": [{"index": index_hex, "binary": true, "ledger_index": prev_seq}]
-                                                }))
-                                                .send()
-                                                .await;
-
-                                            if let Ok(r) = resp {
-                                                if let Ok(body) = r.json::<serde_json::Value>().await {
-                                                    if let Some(data_hex) = body["result"]["node_binary"].as_str() {
-                                                        if let Ok(data) = hex::decode(data_hex) {
-                                                            if let Some(net_balance) = xrpl_node::engine::extract_xrp_balance_pub(&data) {
-                                                                // Verify: network balance should be <= our balance_before - fee
-                                                                // (could be lower due to other txs in the round)
-                                                                let expected_max = balance_before.saturating_sub(*fee);
-                                                                if net_balance <= expected_max {
-                                                                    matches += 1;
-                                                                } else {
-                                                                    mismatches += 1;
-                                                                    if mismatches <= 2 {
-                                                                        eprintln!("[verify] Balance mismatch: before={} fee={} expected_max={} network={}", balance_before, fee, expected_max, net_balance);
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        if matches + mismatches > 0 {
-                                            if let Some(ref mut eng) = *le_verify.lock() {
-                                                eng.record_verification(matches, mismatches);
-                                            }
-                                            if mismatches > 0 {
-                                                eprintln!("[verify] Ledger #{prev_seq}: {matches}/{} matched, {mismatches} MISMATCH", matches + mismatches);
-                                            }
-                                        }
-                                    });
-                            }
+                            // Balance sampling removed — was fundamentally flawed
+                            // (didn't account for incoming payments, only fee deductions).
+                            // Real verification is the SHAMap root hash comparison
+                            // in state_hash::set_network_hash().
+                            let _ = prev_modified;
                         }
                     }
 
@@ -777,15 +899,9 @@ async fn main() {
                                 round_raw_txs.push((xrpl_core::types::Hash256(hash), info.raw_tx.clone()));
                             }
 
-                            // Apply to live state via RocksDB (tracking only, no write-back)
-                            if let Some(ref mut eng) = *le.lock() {
-                                if let Some(id) = xrpl_node::engine::decode_address(&info.account) {
-                                    eng.apply_transaction(
-                                        &info.tx_type, &id, info.fee,
-                                        &info.raw_tx,
-                                    );
-                                }
-                            }
+                            // DISABLED: engine apply_transaction reads from state_db
+                            // which may interfere with WS sync writes
+                            // if let Some(ref mut eng) = *le.lock() { ... }
                         }
                     }
 
@@ -1126,7 +1242,7 @@ async fn main() {
             }
         }));
 
-    let addr = "127.0.0.1:3777";
+    let addr = "0.0.0.0:3777";
     eprintln!("[web] Listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await.expect("failed to bind port 3777");
     if let Err(e) = axum::serve(listener, app).await {

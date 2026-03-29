@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
+use rayon::prelude::*;
 use xrpl_core::types::Hash256;
 use xrpl_ledger::shamap::tree::{SHAMap, TreeType};
 
@@ -37,6 +38,9 @@ pub struct StateHashComputer {
     entries_processed: Arc<AtomicU64>,
     /// Consecutive rounds where our hash matched the network.
     consecutive_matches: Arc<AtomicU32>,
+    /// Persistent sorted leaf hashes — kept in memory, updated incrementally.
+    /// Eliminates the 22s RocksDB scan on every round.
+    pub leaf_cache: Arc<Mutex<Vec<(Hash256, Hash256)>>>,
 }
 
 impl StateHashComputer {
@@ -47,6 +51,7 @@ impl StateHashComputer {
             computing: Arc::new(AtomicBool::new(false)),
             entries_processed: Arc::new(AtomicU64::new(0)),
             consecutive_matches: Arc::new(AtomicU32::new(0)),
+            leaf_cache: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -102,9 +107,10 @@ impl StateHashComputer {
                             let hash_key = Hash256(key_arr);
 
                             // Compute leaf hash inline — data is never stored
-                            let mut buf = Vec::with_capacity(32 + value.len());
-                            buf.extend_from_slice(&key_arr);
+                            // Rippled order: prefix || data || key
+                            let mut buf = Vec::with_capacity(value.len() + 32);
                             buf.extend_from_slice(&value);
+                            buf.extend_from_slice(&key_arr);
                             let leaf_hash = sha512_half_prefixed(&HASH_PREFIX_LEAF_NODE, &buf);
 
                             leaf_hashes.push((hash_key, leaf_hash));
@@ -144,63 +150,16 @@ impl StateHashComputer {
                 "[state-hash] {total_entries} leaf hashes computed in {pass1_time:.1}s ({skipped} skipped)",
             );
 
-            // Build hash-only SHAMap tree bottom-up from sorted (key, hash) pairs.
-            // No object data is stored in the tree — only pre-computed hashes.
-            fn bulk_build(
-                leaf_hashes: &[(Hash256, Hash256)],
-                depth: usize,
-            ) -> (SHAMapNode, Hash256) {
-                use xrpl_ledger::shamap::hash::{sha512_half_prefixed, HASH_PREFIX_INNER_NODE};
-                use xrpl_ledger::shamap::node::{ZERO_HASH, InnerNode, LeafNode, SHAMapNode};
-
-                if leaf_hashes.is_empty() {
-                    return (SHAMapNode::Inner(Box::<InnerNode>::default()), ZERO_HASH);
-                }
-                if leaf_hashes.len() == 1 {
-                    let node = SHAMapNode::Leaf(LeafNode::new_hash_only(leaf_hashes[0].0, leaf_hashes[0].1));
-                    return (node, leaf_hashes[0].1);
-                }
-
-                let mut inner = Box::<InnerNode>::default();
-                let mut child_hashes_arr: [Hash256; 16] = [ZERO_HASH; 16];
-                let mut child_start = 0;
-
-                for nibble in 0..16u8 {
-                    let end = leaf_hashes[child_start..].partition_point(|&(key, _)| {
-                        let byte = key.0[depth / 2];
-                        let n = if depth % 2 == 0 { (byte >> 4) & 0x0F } else { byte & 0x0F };
-                        n <= nibble
-                    }) + child_start;
-
-                    let start_for_nibble = leaf_hashes[child_start..end].partition_point(|&(key, _)| {
-                        let byte = key.0[depth / 2];
-                        let n = if depth % 2 == 0 { (byte >> 4) & 0x0F } else { byte & 0x0F };
-                        n < nibble
-                    }) + child_start;
-
-                    if start_for_nibble < end {
-                        let (child_node, child_hash) = bulk_build(
-                            &leaf_hashes[start_for_nibble..end],
-                            depth + 1,
-                        );
-                        inner.set_child_node(nibble, child_node);
-                        child_hashes_arr[nibble as usize] = child_hash;
-                    }
-                    child_start = end;
-                }
-
-                let mut data = [0u8; 16 * 32];
-                for (i, h) in child_hashes_arr.iter().enumerate() {
-                    data[i * 32..(i + 1) * 32].copy_from_slice(&h.0);
-                }
-                let hash = sha512_half_prefixed(&HASH_PREFIX_INNER_NODE, &data);
-                inner.set_cached_hash(hash);
-                (SHAMapNode::Inner(inner), hash)
-            }
-
-            eprintln!("[state-hash] Building hash-only SHAMap tree (bottom-up bulk)...");
+            // Build SHAMap using insert_hash_only (same tree structure as incremental updates).
+            // This avoids the structural mismatch between bulk_build and insert_hash_only
+            // that causes incremental updates to produce incorrect hashes.
+            eprintln!("[state-hash] Building SHAMap tree via insert_hash_only...");
             let build_start = std::time::Instant::now();
-            let (root_node, root_hash) = bulk_build(&leaf_hashes, 0);
+            let mut shamap = SHAMap::new(TreeType::State);
+            for (key, leaf_hash) in &leaf_hashes {
+                let _ = shamap.insert_hash_only(*key, *leaf_hash);
+            }
+            let root_hash = shamap.root_hash();
             let hash_hex = hex::encode(root_hash.0);
             let build_time = build_start.elapsed().as_secs_f64();
             eprintln!(
@@ -209,8 +168,6 @@ impl StateHashComputer {
 
             drop(leaf_hashes);
 
-            // Create SHAMap with the bulk-built root
-            let shamap = SHAMap::from_root(root_node, TreeType::State, total_entries);
             *shamap_slot.lock() = Some(shamap);
 
             let elapsed = start.elapsed().as_secs_f64();
@@ -255,9 +212,10 @@ impl StateHashComputer {
             match db.get(&key.0) {
                 Ok(Some(data)) => {
                     // Compute leaf hash inline — don't store data in tree
-                    let mut buf = Vec::with_capacity(32 + data.len());
-                    buf.extend_from_slice(&key.0);
+                    // Rippled order: prefix || data || key
+                    let mut buf = Vec::with_capacity(data.len() + 32);
                     buf.extend_from_slice(&data);
+                    buf.extend_from_slice(&key.0);
                     let leaf_hash = sha512_half_prefixed(&HASH_PREFIX_LEAF_NODE, &buf);
                     let _ = shamap.insert_hash_only(*key, leaf_hash);
                     updated += 1;
@@ -310,6 +268,11 @@ impl StateHashComputer {
                 self.consecutive_matches.store(0, Ordering::Relaxed);
                 s.consecutive_matches = 0;
                 s.ready_to_sign = false;
+                eprintln!(
+                    "[state-hash] MISMATCH ledger #{ledger_seq}: ours={} network={}",
+                    &s.computed_hash[..16],
+                    &s.network_hash[..16.min(s.network_hash.len())],
+                );
             }
             matches
         } else {
@@ -328,6 +291,224 @@ impl StateHashComputer {
         guard.as_ref().map(|m| m.root_hash())
     }
 
+    /// Fast incremental hash: update changed entries in the cached sorted array,
+    /// then recompute root hash. ~2.5s per round instead of 25s full scan.
+    /// First call does a full scan to populate the cache.
+    pub fn update_and_hash(&self, db: &Arc<rocksdb::DB>, modified_keys: &[Hash256]) -> Option<Hash256> {
+        use xrpl_ledger::shamap::hash::{sha512_half_prefixed, HASH_PREFIX_LEAF_NODE, HASH_PREFIX_INNER_NODE};
+        use xrpl_ledger::shamap::node::{ZERO_HASH, nibble_at};
+
+        let start = std::time::Instant::now();
+        let mut cache = self.leaf_cache.lock();
+
+        // First call: populate cache from RocksDB
+        if cache.is_empty() {
+            eprintln!("[state-hash] First round — building leaf cache from RocksDB...");
+            let snapshot = db.snapshot();
+            let iter = snapshot.iterator(rocksdb::IteratorMode::Start);
+            for item in iter {
+                if let Ok((key, value)) = item {
+                    if key.len() == 32 {
+                        let mut k = [0u8; 32];
+                        k.copy_from_slice(&key);
+                        let mut buf = Vec::with_capacity(value.len() + 32);
+                        buf.extend_from_slice(&value);
+                        buf.extend_from_slice(&k);
+                        let lh = sha512_half_prefixed(&HASH_PREFIX_LEAF_NODE, &buf);
+                        cache.push((Hash256(k), lh));
+                    }
+                }
+            }
+            drop(snapshot);
+            // Already sorted (RocksDB key order)
+            let build_time = start.elapsed().as_secs_f64();
+            eprintln!("[state-hash] Leaf cache built: {} entries in {build_time:.1}s", cache.len());
+        } else {
+            // Incremental update: for each modified key, update or insert/delete
+            for key in modified_keys {
+                match db.get(&key.0) {
+                    Ok(Some(data)) => {
+                        let mut buf = Vec::with_capacity(data.len() + 32);
+                        buf.extend_from_slice(&data);
+                        buf.extend_from_slice(&key.0);
+                        let lh = sha512_half_prefixed(&HASH_PREFIX_LEAF_NODE, &buf);
+                        // Binary search for existing key
+                        match cache.binary_search_by(|e| e.0.0.cmp(&key.0)) {
+                            Ok(idx) => cache[idx].1 = lh, // update existing
+                            Err(idx) => cache.insert(idx, (*key, lh)), // insert new
+                        }
+                    }
+                    Ok(None) => {
+                        // Deleted — remove from cache
+                        if let Ok(idx) = cache.binary_search_by(|e| e.0.0.cmp(&key.0)) {
+                            cache.remove(idx);
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+
+        let update_time = start.elapsed().as_secs_f64();
+        let count = cache.len();
+
+        // Compute root hash from sorted cache (bottom-up, parallel at root level)
+        fn compute_subtree(entries: &[(Hash256, Hash256)], depth: usize) -> Hash256 {
+            if entries.is_empty() { return ZERO_HASH; }
+            if entries.len() == 1 { return entries[0].1; }
+            let mut child_hashes = [ZERO_HASH; 16];
+            let mut pos = 0;
+            for nibble in 0..16u8 {
+                let end = entries[pos..].partition_point(|&(key, _)| nibble_at(&key, depth) <= nibble) + pos;
+                let bucket_start = entries[pos..end].partition_point(|&(key, _)| nibble_at(&key, depth) < nibble) + pos;
+                if bucket_start < end {
+                    child_hashes[nibble as usize] = compute_subtree(&entries[bucket_start..end], depth + 1);
+                }
+                pos = end;
+            }
+            let mut data = [0u8; 16 * 32];
+            for (i, h) in child_hashes.iter().enumerate() {
+                data[i * 32..(i + 1) * 32].copy_from_slice(&h.0);
+            }
+            sha512_half_prefixed(&HASH_PREFIX_INNER_NODE, &data)
+        }
+
+        // Parallel at root level
+        let mut buckets: Vec<&[(Hash256, Hash256)]> = Vec::with_capacity(16);
+        let mut pos = 0;
+        for nibble in 0..16u8 {
+            let end = cache[pos..].partition_point(|&(key, _)| nibble_at(&key, 0) <= nibble) + pos;
+            let bucket_start = cache[pos..end].partition_point(|&(key, _)| nibble_at(&key, 0) < nibble) + pos;
+            buckets.push(&cache[bucket_start..end]);
+            pos = end;
+        }
+        let child_hashes: Vec<Hash256> = buckets.par_iter()
+            .map(|bucket| compute_subtree(bucket, 1))
+            .collect();
+
+        let mut root_data = [0u8; 16 * 32];
+        for (i, h) in child_hashes.iter().enumerate() {
+            root_data[i * 32..(i + 1) * 32].copy_from_slice(&h.0);
+        }
+        let root_hash = sha512_half_prefixed(&HASH_PREFIX_INNER_NODE, &root_data);
+
+        let hash_hex = hex::encode(root_hash.0);
+        let total = start.elapsed().as_secs_f64();
+        eprintln!("[state-hash] FAST: {count} entries in {total:.1}s (update={update_time:.1}s compute={:.1}s) — {}",
+            total - update_time, &hash_hex[..16]);
+
+        let mut s = self.status.lock();
+        s.computed_hash = hash_hex;
+        s.computing = false;
+
+        Some(root_hash)
+    }
+
+    /// Compute root hash from RocksDB using sorted bottom-up approach.
+    /// No tree structure — just sort + recursive hash computation.
+    /// Proven correct: produces identical hash to insert_hash_only and rippled.
+    /// Phase 1: scan RocksDB snapshot (~9s)
+    /// Phase 2: parallel leaf hashing with rayon (~3s)
+    /// Phase 3: sort + recursive bottom-up hash (~9s)
+    /// Total: ~20s
+    pub fn rebuild(&self, db: &Arc<rocksdb::DB>) {
+        use rayon::prelude::*;
+        use xrpl_ledger::shamap::hash::{sha512_half_prefixed, HASH_PREFIX_LEAF_NODE, HASH_PREFIX_INNER_NODE};
+        use xrpl_ledger::shamap::node::{ZERO_HASH, nibble_at};
+
+        let start = std::time::Instant::now();
+        eprintln!("[state-hash] Computing hash (single-pass bottom-up)...");
+
+        // Single pass: scan RocksDB snapshot + compute leaf hashes inline.
+        // RocksDB iterates in key-sorted order — no sort needed.
+        // No separate entries Vec — hash each value immediately, discard data.
+        // Memory: only the leaf_hashes Vec (~1.2GB for 18.7M entries).
+        let snapshot = db.snapshot();
+        let mut leaf_hashes: Vec<(Hash256, Hash256)> = Vec::with_capacity(19_000_000);
+        let iter = snapshot.iterator(rocksdb::IteratorMode::Start);
+        for item in iter {
+            if let Ok((key, value)) = item {
+                if key.len() == 32 {
+                    let mut k = [0u8; 32];
+                    k.copy_from_slice(&key);
+                    let mut buf = Vec::with_capacity(value.len() + 32);
+                    buf.extend_from_slice(&value);
+                    buf.extend_from_slice(&k);
+                    let lh = sha512_half_prefixed(&HASH_PREFIX_LEAF_NODE, &buf);
+                    leaf_hashes.push((Hash256(k), lh));
+                }
+            }
+        }
+        drop(snapshot);
+        let scan_time = start.elapsed().as_secs_f64();
+        let count = leaf_hashes.len();
+        // Already sorted (RocksDB key order) — no sort needed
+
+        fn compute_subtree(entries: &[(Hash256, Hash256)], depth: usize) -> Hash256 {
+            if entries.is_empty() { return ZERO_HASH; }
+            if entries.len() == 1 { return entries[0].1; }
+            let mut child_hashes = [ZERO_HASH; 16];
+            let mut pos = 0;
+            for nibble in 0..16u8 {
+                let end = entries[pos..].partition_point(|&(key, _)| {
+                    nibble_at(&key, depth) <= nibble
+                }) + pos;
+                let bucket_start = entries[pos..end].partition_point(|&(key, _)| {
+                    nibble_at(&key, depth) < nibble
+                }) + pos;
+                if bucket_start < end {
+                    child_hashes[nibble as usize] = compute_subtree(&entries[bucket_start..end], depth + 1);
+                }
+                pos = end;
+            }
+            let mut data = [0u8; 16 * 32];
+            for (i, h) in child_hashes.iter().enumerate() {
+                data[i * 32..(i + 1) * 32].copy_from_slice(&h.0);
+            }
+            sha512_half_prefixed(&HASH_PREFIX_INNER_NODE, &data)
+        }
+
+        // Parallelize: split into 16 subtrees by first nibble, compute each in parallel
+        let mut buckets: Vec<&[(Hash256, Hash256)]> = Vec::with_capacity(16);
+        let mut pos = 0;
+        for nibble in 0..16u8 {
+            let end = leaf_hashes[pos..].partition_point(|&(key, _)| {
+                nibble_at(&key, 0) <= nibble
+            }) + pos;
+            let bucket_start = leaf_hashes[pos..end].partition_point(|&(key, _)| {
+                nibble_at(&key, 0) < nibble
+            }) + pos;
+            buckets.push(&leaf_hashes[bucket_start..end]);
+            pos = end;
+        }
+
+        let child_hashes: Vec<Hash256> = buckets.par_iter()
+            .map(|bucket| compute_subtree(bucket, 1))
+            .collect();
+
+        let mut root_data = [0u8; 16 * 32];
+        for (i, h) in child_hashes.iter().enumerate() {
+            root_data[i * 32..(i + 1) * 32].copy_from_slice(&h.0);
+        }
+        let root_hash = sha512_half_prefixed(&HASH_PREFIX_INNER_NODE, &root_data);
+        drop(leaf_hashes); // Free 1.2GB before logging
+        let hash_hex = hex::encode(root_hash.0);
+        let total = start.elapsed().as_secs_f64();
+        eprintln!("[state-hash] DONE: {count} entries in {total:.1}s (scan+hash={scan_time:.1}s compute={:.1}s) — {hash_hex}",
+            total - scan_time);
+
+        // Force jemalloc to return freed memory to OS
+        #[cfg(target_os = "linux")]
+        unsafe { libc::malloc_trim(0); }
+
+        let mut s = self.status.lock();
+        s.computed_hash = hash_hex.clone();
+        s.computing = false;
+
+        let elapsed = start.elapsed().as_secs_f64();
+        eprintln!("[state-hash] REBUILD DONE: {count} entries in {elapsed:.1}s — hash={hash_hex}");
+    }
+
     pub fn progress(&self) -> u64 {
         self.entries_processed.load(Ordering::Relaxed)
     }
@@ -336,9 +517,62 @@ impl StateHashComputer {
         self.computing.load(Ordering::SeqCst)
     }
 
+    /// Accept a pre-built SHAMap (from inline download build).
+    pub fn set_shamap(&self, map: SHAMap) {
+        let root_hash = map.root_hash();
+        let hash_hex = hex::encode(root_hash.0);
+        *self.shamap.lock() = Some(map);
+        let mut s = self.status.lock();
+        s.computed_hash = hash_hex;
+        s.computing = false;
+        self.computing.store(false, Ordering::SeqCst);
+    }
+
     /// Check if the SHAMap has been built.
     pub fn is_ready(&self) -> bool {
         self.shamap.lock().is_some()
+    }
+}
+
+/// Insert a leaf into a SHAMap subtree starting at a given depth.
+/// Used for parallel tree construction — each subtree starts at depth 1.
+fn insert_at_depth(node: &mut xrpl_ledger::shamap::node::SHAMapNode, key: Hash256, leaf_hash: Hash256, depth: usize) {
+    use xrpl_ledger::shamap::node::{InnerNode, LeafNode, SHAMapNode, nibble_at};
+
+    if depth >= 64 { return; }
+
+    match node {
+        SHAMapNode::Inner(ref mut inner) => {
+            let nibble = nibble_at(&key, depth);
+            if inner.has_child(nibble) {
+                let child = inner.get_child_node_mut(nibble).unwrap();
+                insert_at_depth(child, key, leaf_hash, depth + 1);
+            } else {
+                inner.set_child_node(nibble, SHAMapNode::Leaf(LeafNode::new_hash_only(key, leaf_hash)));
+            }
+        }
+        SHAMapNode::Leaf(ref existing) => {
+            if existing.key() == &key {
+                *node = SHAMapNode::Leaf(LeafNode::new_hash_only(key, leaf_hash));
+            } else {
+                let existing_key = *existing.key();
+                let existing_nibble = nibble_at(&existing_key, depth);
+                let new_nibble = nibble_at(&key, depth);
+
+                let old_node = std::mem::replace(node, SHAMapNode::Inner(Box::<InnerNode>::default()));
+
+                if let SHAMapNode::Inner(ref mut inner) = node {
+                    if existing_nibble == new_nibble {
+                        inner.set_child_node(existing_nibble, old_node);
+                        let child = inner.get_child_node_mut(existing_nibble).unwrap();
+                        insert_at_depth(child, key, leaf_hash, depth + 1);
+                    } else {
+                        inner.set_child_node(existing_nibble, old_node);
+                        inner.set_child_node(new_nibble, SHAMapNode::Leaf(LeafNode::new_hash_only(key, leaf_hash)));
+                    }
+                }
+            }
+        }
     }
 }
 

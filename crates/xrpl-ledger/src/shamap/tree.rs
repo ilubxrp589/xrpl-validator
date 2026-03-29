@@ -27,7 +27,7 @@ pub enum TreeType {
 #[derive(Debug, Clone)]
 pub struct SHAMap {
     /// Root node — always starts as an empty InnerNode.
-    root: SHAMapNode,
+    pub root: SHAMapNode,
     tree_type: TreeType,
     size: usize,
 }
@@ -57,6 +57,12 @@ impl SHAMap {
 
     pub fn is_empty(&self) -> bool {
         self.size == 0
+    }
+
+    /// Clear all cached inner node hashes. The next root_hash() recomputes from scratch.
+    /// This is a workaround for stale cache bugs in the incremental update path.
+    pub fn invalidate_caches(&mut self) {
+        self.root.invalidate_all_caches();
     }
 
     /// Compute the root hash of the tree.

@@ -1,7 +1,8 @@
-//! Fast parallel ledger state sync — downloads the full XRPL state.
+//! Fast full-state download — downloads the entire XRPL state tree at a
+//! pinned ledger sequence directly into RocksDB.
 //!
-//! Uses multiple RPC endpoints in parallel for maximum throughput.
-//! Saves progress to disk so it can resume if interrupted.
+//! Uses a local rippled node (no rate limits) for maximum throughput.
+//! Saves progress via marker so it can resume if interrupted.
 //!
 //! Run: cargo run --release -p xrpl-node --bin sync_ledger
 
@@ -10,180 +11,181 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use tokio::sync::Semaphore;
-use xrpl_core::types::Hash256;
-use xrpl_ledger::ledger::header::LedgerHeader;
-use xrpl_ledger::nodestore::NodeStore;
 
-// Multiple public RPC endpoints for parallel downloads
-const RPC_ENDPOINTS: &[&str] = &[
-    "https://xrplcluster.com",
-    "https://s1.ripple.com:51234",
-    "https://s2.ripple.com:51234",
-];
-
+const RPC_ENDPOINT: &str = "http://10.0.0.97:5005";
 const PAGE_SIZE: u32 = 2048;
-const MAX_CONCURRENT: usize = 6; // parallel requests
-const SAVE_DIR: &str = "/mnt/xrpl-data/sync";
+const ROCKS_PATH: &str = "/mnt/xrpl-data/sync/state.rocks";
+const MARKER_FILE: &str = "/mnt/xrpl-data/sync/dl_marker.txt";
+const DONE_FILE: &str = "/mnt/xrpl-data/sync/dl_done.txt";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    eprintln!("=== XRPL Mainnet Ledger Sync (Parallel) ===\n");
+    eprintln!("=== XRPL Full State Download (local rippled, no rate limits) ===\n");
+    eprintln!("  RPC: {RPC_ENDPOINT}");
+    eprintln!("  DB:  {ROCKS_PATH}\n");
 
-    // Create save directory and open sled DB
-    std::fs::create_dir_all(SAVE_DIR)?;
-    let sled_path = format!("{SAVE_DIR}/state.sled");
-    let db = sled::open(&sled_path)?;
-    eprintln!("  Sled DB: {sled_path} ({} existing entries)", db.len());
+    // Check if already completed
+    if std::path::Path::new(DONE_FILE).exists() {
+        let info = std::fs::read_to_string(DONE_FILE).unwrap_or_default();
+        eprintln!("  Already completed! {info}");
+        eprintln!("  Delete {DONE_FILE} to re-run.");
+        return Ok(());
+    }
+
+    // Open RocksDB
+    let mut opts = rocksdb::Options::default();
+    opts.create_if_missing(true);
+    opts.set_write_buffer_size(256 * 1024 * 1024); // 256MB write buffer
+    opts.set_max_write_buffer_number(4);
+    opts.set_target_file_size_base(128 * 1024 * 1024);
+    opts.set_compression_type(rocksdb::DBCompressionType::None);
+    let db = rocksdb::DB::open(&opts, ROCKS_PATH)?;
+    let db = Arc::new(db);
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .pool_max_idle_per_host(10)
+        .timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(4)
         .build()?;
 
-    // Step 1: Get validated ledger header
-    eprintln!("[1/3] Fetching validated ledger...");
-    let (header, ledger_index, account_hash_hex) = fetch_header(&client).await?;
-    let our_hash = header.hash();
-    let expected_hash_hex = hex::encode_upper(our_hash.0);
+    // Step 1: Get validated ledger and pin to it
+    eprintln!("[1/2] Fetching validated ledger...");
+    let resp = rpc(&client, "ledger", json!({"ledger_index": "validated"})).await?;
+    let ledger = &resp["result"]["ledger"];
+    let ledger_seq: u32 = ledger["ledger_index"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| ledger["ledger_index"].as_u64().map(|n| n as u32))
+        .unwrap_or(0);
+    let account_hash = ledger["account_hash"].as_str().unwrap_or("???");
 
-    eprintln!("  Ledger:     #{ledger_index}");
-    eprintln!("  Hash:       {expected_hash_hex}");
-    eprintln!("  State hash: {account_hash_hex}");
+    if ledger_seq == 0 {
+        anyhow::bail!("Could not get validated ledger from {RPC_ENDPOINT}");
+    }
+
+    eprintln!("  Ledger:       #{ledger_seq}");
+    eprintln!("  account_hash: {account_hash}");
     eprintln!();
 
-    // Step 2: Download all state objects with parallel workers
-    eprintln!("[2/3] Downloading state (parallel across {} endpoints)...", RPC_ENDPOINTS.len());
+    // Step 2: Paginate through all state objects
+    eprintln!("[2/2] Downloading all state objects...");
     let start = Instant::now();
-
     let total_objects = Arc::new(AtomicU64::new(0));
     let total_bytes = Arc::new(AtomicU64::new(0));
-    let total_pages = Arc::new(AtomicU64::new(0));
-    let errors = Arc::new(AtomicU64::new(0));
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
 
-    // We'll use a sequential approach with parallel retries
-    // since ledger_data pagination requires a marker from the previous page
+    // Check for resume
     let mut marker: Option<String> = None;
-
-    // Check for resume marker
-    let resume_file = format!("{SAVE_DIR}/marker.txt");
-    let objects_file = format!("{SAVE_DIR}/objects.jsonl");
-
-    if let Ok(saved_marker) = std::fs::read_to_string(&resume_file) {
-        let saved_marker = saved_marker.trim().to_string();
-        if !saved_marker.is_empty() {
-            // Count existing objects
-            let existing = std::fs::read_to_string(&objects_file)
-                .map(|s| s.lines().count() as u64)
+    if let Ok(saved) = std::fs::read_to_string(MARKER_FILE) {
+        let saved = saved.trim().to_string();
+        if !saved.is_empty() {
+            marker = Some(saved);
+            // Estimate how many we already have
+            let est = db
+                .property_value("rocksdb.estimate-num-keys")
+                .ok()
+                .flatten()
+                .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0);
-            total_objects.store(existing, Ordering::Relaxed);
-            marker = Some(saved_marker.clone());
-            eprintln!("  Resuming from marker ({}+ objects already saved)", existing);
+            total_objects.store(est, Ordering::Relaxed);
+            eprintln!("  Resuming from marker (~{est} objects already in DB)");
         }
     }
 
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&objects_file)?;
-
-    let mut endpoint_idx = 0;
-    let mut consecutive_errors = 0u32;
+    let mut page: u64 = 0;
+    let mut consecutive_errors: u32 = 0;
 
     loop {
-        let page = total_pages.fetch_add(1, Ordering::Relaxed) + 1;
-
-        // Use primary endpoint for pagination (marker is endpoint-specific)
-        let endpoint = RPC_ENDPOINTS[0];
+        page += 1;
 
         let params = if let Some(ref m) = marker {
             json!({
-                "ledger_index": ledger_index,
+                "ledger_index": ledger_seq,
                 "limit": PAGE_SIZE,
                 "binary": true,
                 "marker": m,
             })
         } else {
             json!({
-                "ledger_index": ledger_index,
+                "ledger_index": ledger_seq,
                 "limit": PAGE_SIZE,
                 "binary": true,
             })
         };
 
-        // Make request with retry
-        let resp = match rpc_with_retry(&client, endpoint, "ledger_data", params, 3).await {
+        let resp = match rpc(&client, "ledger_data", params).await {
             Ok(r) => {
                 consecutive_errors = 0;
                 r
             }
             Err(e) => {
-                errors.fetch_add(1, Ordering::Relaxed);
                 consecutive_errors += 1;
-                eprintln!("  [page {page}] Error from {endpoint}: {e}");
-                if consecutive_errors >= 10 {
-                    eprintln!("  Too many consecutive errors, stopping.");
+                eprintln!("  [page {page}] Error: {e}");
+                if consecutive_errors >= 20 {
+                    eprintln!("  Too many errors, stopping. Re-run to resume.");
                     break;
                 }
-                // Try next endpoint
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             }
         };
 
         let result = &resp["result"];
-        let state = result["state"].as_array();
+        if let Some(objects) = result["state"].as_array() {
+            let mut batch = rocksdb::WriteBatch::default();
+            let mut page_bytes: u64 = 0;
 
-        if let Some(objects) = state {
-            use std::io::Write;
-            let mut batch = sled::Batch::default();
             for obj in objects {
                 let index = obj["index"].as_str().unwrap_or("");
                 let data_hex = obj["data"].as_str().unwrap_or("");
-                if !index.is_empty() && !data_hex.is_empty() {
-                    if let Ok(data) = hex::decode(data_hex) {
-                        total_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+                if index.is_empty() || data_hex.is_empty() {
+                    continue;
+                }
+                if let (Ok(key), Ok(data)) = (hex::decode(index), hex::decode(data_hex)) {
+                    if key.len() == 32 {
+                        page_bytes += data.len() as u64;
+                        batch.put(&key, &data);
                         total_objects.fetch_add(1, Ordering::Relaxed);
-                        // Write to sled (binary key → binary data)
-                        let key_bytes = hex::decode(index).unwrap_or_default();
-                        batch.insert(key_bytes.as_slice(), data.as_slice());
-                        // Also keep JSONL for compatibility
-                        writeln!(file, "{}\t{}", index, data_hex)?;
                     }
                 }
             }
-            db.apply_batch(batch)?;
+
+            total_bytes.fetch_add(page_bytes, Ordering::Relaxed);
+            db.write(batch)?;
         }
 
         // Save marker for resume
         marker = result["marker"].as_str().map(String::from);
         if let Some(ref m) = marker {
-            std::fs::write(&resume_file, m)?;
+            let _ = std::fs::write(MARKER_FILE, m);
         }
 
-        // Progress
-        let obj_count = total_objects.load(Ordering::Relaxed);
-        let byte_count = total_bytes.load(Ordering::Relaxed);
-        let elapsed = start.elapsed().as_secs_f64();
-        let rate = obj_count as f64 / elapsed.max(0.1);
-        let err_count = errors.load(Ordering::Relaxed);
-
-        if page % 5 == 0 || page <= 3 {
+        // Progress every 10 pages
+        if page % 10 == 0 || page <= 3 {
+            let obj_count = total_objects.load(Ordering::Relaxed);
+            let byte_count = total_bytes.load(Ordering::Relaxed);
+            let elapsed = start.elapsed().as_secs_f64();
+            let rate = obj_count as f64 / elapsed.max(0.1);
+            let est_total = 30_000_000u64;
+            let eta_min = if rate > 0.0 {
+                (est_total.saturating_sub(obj_count)) as f64 / rate / 60.0
+            } else {
+                0.0
+            };
             eprintln!(
-                "  [page {:>5}] {:>8} objects | {:>6.1}MB | {:>5.0}/s | {:.0}s | {} errors | {}",
-                page, obj_count, byte_count as f64 / 1_048_576.0,
-                rate, elapsed, err_count, endpoint
+                "  [page {:>6}] {:>10} objects | {:>7.1} MB | {:>6.0}/s | ETA ~{:.0}min",
+                page,
+                obj_count,
+                byte_count as f64 / 1_048_576.0,
+                rate,
+                eta_min,
             );
         }
 
         if marker.is_none() {
-            eprintln!("  No more pages — download complete!");
+            eprintln!("\n  Download complete!");
             break;
         }
 
-        // Small delay to avoid overwhelming the RPC
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // No delay — local rippled, no rate limits
     }
 
     let elapsed = start.elapsed();
@@ -191,85 +193,45 @@ async fn main() -> anyhow::Result<()> {
     let byte_count = total_bytes.load(Ordering::Relaxed);
 
     eprintln!();
-    eprintln!("  Download finished!");
     eprintln!("  Objects:  {obj_count}");
-    eprintln!("  Size:     {:.1}MB", byte_count as f64 / 1_048_576.0);
-    eprintln!("  Time:     {:.0}s ({:.1}m)", elapsed.as_secs_f64(), elapsed.as_secs_f64() / 60.0);
+    eprintln!("  Size:     {:.1} GB", byte_count as f64 / 1_073_741_824.0);
+    eprintln!("  Time:     {:.1} min", elapsed.as_secs_f64() / 60.0);
     eprintln!("  Rate:     {:.0}/s", obj_count as f64 / elapsed.as_secs_f64().max(0.1));
-    eprintln!("  Saved to: {objects_file}");
-    eprintln!();
+    eprintln!("  Pinned:   ledger #{ledger_seq}");
+    eprintln!("  DB:       {ROCKS_PATH}");
 
-    // Step 3: Report
-    eprintln!("[3/3] Summary");
-    eprintln!("  Ledger #{ledger_index} — {obj_count} state objects — {:.1}MB",
-        byte_count as f64 / 1_048_576.0);
-    eprintln!("  Data saved to {SAVE_DIR}/objects.jsonl");
-    eprintln!("  Resume marker saved to {SAVE_DIR}/marker.txt");
-    eprintln!("  Re-run this binary to continue downloading.");
+    // Mark complete
+    let info = format!(
+        "ledger #{ledger_seq} — {obj_count} objects — {:.1}GB — {:.1}min",
+        byte_count as f64 / 1_073_741_824.0,
+        elapsed.as_secs_f64() / 60.0,
+    );
+    std::fs::write(DONE_FILE, &info)?;
+    let _ = std::fs::remove_file(MARKER_FILE);
 
-    // Clean up marker if complete
-    if obj_count > 0 {
-        eprintln!("\n  To verify state hash, load all objects into SHAMap");
-        eprintln!("  (requires full download — mainnet has ~30M+ objects)");
-    }
+    eprintln!("\n  Saved to {DONE_FILE}");
+    eprintln!("  Now restart live_viewer — it will rebuild the SHAMap from this consistent state.");
 
     Ok(())
 }
 
-async fn fetch_header(client: &reqwest::Client) -> anyhow::Result<(LedgerHeader, u32, String)> {
-    let resp = rpc_with_retry(client, RPC_ENDPOINTS[0], "ledger", json!({
-        "ledger_index": "validated",
-    }), 5).await?;
-
-    let ledger = &resp["result"]["ledger"];
-    let ledger_index: u32 = ledger["ledger_index"].as_str()
-        .and_then(|s| s.parse().ok())
-        .or_else(|| ledger["ledger_index"].as_u64().map(|n| n as u32))
-        .unwrap_or(0);
-
-    let account_hash_hex = ledger["account_hash"].as_str().unwrap_or("").to_string();
-
-    let header = LedgerHeader {
-        sequence: ledger_index,
-        total_coins: ledger["total_coins"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0),
-        parent_hash: hex_to_hash(ledger["parent_hash"].as_str().unwrap_or("")),
-        transaction_hash: hex_to_hash(ledger["transaction_hash"].as_str().unwrap_or("")),
-        account_hash: hex_to_hash(&account_hash_hex),
-        parent_close_time: ledger["parent_close_time"].as_u64().unwrap_or(0) as u32,
-        close_time: ledger["close_time"].as_u64().unwrap_or(0) as u32,
-        close_time_resolution: ledger["close_time_resolution"].as_u64().unwrap_or(10) as u8,
-        close_flags: ledger["close_flags"].as_u64().unwrap_or(0) as u8,
-    };
-
-    Ok((header, ledger_index, account_hash_hex))
-}
-
-async fn rpc_with_retry(
-    client: &reqwest::Client,
-    endpoint: &str,
-    method: &str,
-    params: Value,
-    max_retries: u32,
-) -> anyhow::Result<Value> {
+async fn rpc(client: &reqwest::Client, method: &str, params: Value) -> anyhow::Result<Value> {
     let body = json!({ "method": method, "params": [params] });
-
-    for attempt in 0..max_retries {
-        match client.post(endpoint).json(&body).send().await {
-            Ok(resp) => {
-                match resp.json::<Value>().await {
-                    Ok(v) => return Ok(v),
-                    Err(e) => {
-                        if attempt < max_retries - 1 {
-                            tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
-                            continue;
-                        }
-                        return Err(e.into());
+    for attempt in 0..5u32 {
+        match client.post(RPC_ENDPOINT).json(&body).send().await {
+            Ok(resp) => match resp.json::<Value>().await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    if attempt < 4 {
+                        tokio::time::sleep(Duration::from_millis(200 * (1 << attempt))).await;
+                        continue;
                     }
+                    return Err(e.into());
                 }
-            }
+            },
             Err(e) => {
-                if attempt < max_retries - 1 {
-                    tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+                if attempt < 4 {
+                    tokio::time::sleep(Duration::from_millis(200 * (1 << attempt))).await;
                     continue;
                 }
                 return Err(e.into());
@@ -277,15 +239,4 @@ async fn rpc_with_retry(
         }
     }
     anyhow::bail!("max retries exceeded")
-}
-
-fn hex_to_hash(s: &str) -> Hash256 {
-    let bytes = hex::decode(s).unwrap_or_default();
-    if bytes.len() == 32 {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        Hash256(arr)
-    } else {
-        Hash256([0u8; 32])
-    }
 }
