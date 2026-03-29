@@ -91,10 +91,23 @@ pub async fn start_ws_sync(
                 if closed_seq == 0 { continue; }
 
                 // Fill gap from last_processed+1 to closed_seq
-                let start_seq = if last_processed > 0 { last_processed + 1 } else { last_synced.load(Ordering::Relaxed) + 1 };
+                let mut start_seq = if last_processed > 0 { last_processed + 1 } else { last_synced.load(Ordering::Relaxed) + 1 };
+
+                // If too far behind, skip ahead — old ledgers get pruned by rippled
+                if closed_seq > start_seq + 50 {
+                    eprintln!("[ws-sync] {} ledgers behind — skipping to #{} (rebuilding leaf cache)",
+                        closed_seq - start_seq, closed_seq);
+                    start_seq = closed_seq;
+                    // Clear leaf cache so it rebuilds from current RocksDB state
+                    hash_comp.leaf_cache.lock().clear();
+                }
 
                 for process_seq in start_seq..=closed_seq {
-                    let account_hash = fetch_account_hash(&rpc_client, process_seq).await.unwrap_or_default();
+                    let account_hash = if process_seq == closed_seq {
+                        fetch_account_hash(&rpc_client, process_seq).await.unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
 
                     acc_modified.clear();
                     acc_deleted.clear();
@@ -141,7 +154,7 @@ pub async fn start_ws_sync(
                         acc_modified.remove(&d);
                     }
 
-                    let compute_hash = true;
+                    let compute_hash = process_seq == closed_seq;
                     let result = process_ledger(
                         &rpc_client, &db, &hash_comp,
                         process_seq, &acc_modified, &acc_deleted,
@@ -496,12 +509,14 @@ async fn process_ledger(
             }
         }
     } else {
-        // Fast path: just update the leaf cache, skip root hash computation
-        // This takes ~0.5s instead of ~3s
+        // Fast path: update leaf cache + mark dirty branches, skip root hash computation
         use xrpl_ledger::shamap::hash::{sha512_half_prefixed, HASH_PREFIX_LEAF_NODE};
+        use xrpl_ledger::shamap::node::nibble_at;
         let mut cache = hash_comp.leaf_cache.lock();
         if !cache.is_empty() {
+            let mut dirty: u16 = 0;
             for key in &keys {
+                dirty |= 1 << (nibble_at(key, 0) as u16);
                 match db.get(&key.0) {
                     Ok(Some(data)) => {
                         let mut buf = Vec::with_capacity(data.len() + 32);
@@ -521,6 +536,9 @@ async fn process_ledger(
                     Err(_) => {}
                 }
             }
+            // Mark affected branches as dirty for next hash computation
+            let mut db_dirty = hash_comp.dirty_branches.lock();
+            *db_dirty |= dirty;
         }
         eprintln!("[ws-sync] #{seq}: synced ({tx_count} txs, {} objs)", fetched_data.len());
     }

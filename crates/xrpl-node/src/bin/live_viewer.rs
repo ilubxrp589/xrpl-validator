@@ -590,79 +590,18 @@ async fn main() {
                                 eprintln!("[startup] ERROR: no SHAMap from syncer");
                             }
 
-                            // Second download: wipe DB + re-download at validated
-                            eprintln!("[startup] Clearing DB for second download...");
-                            {
-                                let mut batch = rocksdb::WriteBatch::default();
-                                let iter = startup_db.iterator(rocksdb::IteratorMode::Start);
-                                let mut cleared = 0u64;
-                                for item in iter {
-                                    if let Ok((key, _)) = item {
-                                        batch.delete(&key);
-                                        cleared += 1;
-                                        if cleared % 100_000 == 0 {
-                                            let _ = startup_db.write(batch);
-                                            batch = rocksdb::WriteBatch::default();
-                                        }
-                                    }
-                                }
-                                if cleared > 0 { let _ = startup_db.write(batch); }
-                                eprintln!("[startup] Cleared {cleared} entries");
-                            }
-
-                            let dl2_client = reqwest::Client::builder()
-                                .timeout(Duration::from_secs(60)).build().unwrap_or_default();
-                            let val_seq: u32 = {
-                                let r = dl2_client.post("http://10.0.0.97:5005")
-                                    .json(&serde_json::json!({"method":"ledger","params":[{"ledger_index":"validated"}]}))
-                                    .send().await;
-                                match r {
-                                    Ok(resp) => resp.json::<serde_json::Value>().await.ok()
-                                        .and_then(|v| v["result"]["ledger"]["ledger_index"].as_str()
-                                            .and_then(|s| s.parse().ok()))
-                                        .unwrap_or(pinned),
-                                    Err(_) => pinned,
-                                }
-                            };
-                            eprintln!("[startup] Second download at #{val_seq}...");
-                            let mut marker: Option<String> = None;
-                            let mut dl2_count = 0u64;
-                            loop {
-                                let mut p = serde_json::json!({"ledger_index":val_seq,"binary":true,"limit":2048});
-                                if let Some(ref m) = marker { p["marker"] = serde_json::Value::String(m.clone()); }
-                                let r = match dl2_client.post("http://10.0.0.97:5005")
-                                    .json(&serde_json::json!({"method":"ledger_data","params":[p]}))
-                                    .send().await {
-                                    Ok(r) => r, Err(_) => { tokio::time::sleep(Duration::from_secs(2)).await; continue; }
-                                };
-                                let body: serde_json::Value = match r.json().await {
-                                    Ok(b) => b, Err(_) => { tokio::time::sleep(Duration::from_secs(2)).await; continue; }
-                                };
-                                if let Some(objs) = body["result"]["state"].as_array() {
-                                    for obj in objs {
-                                        if let (Some(idx), Some(data)) = (obj["index"].as_str(), obj["data"].as_str()) {
-                                            if idx.len() == 64 {
-                                                if let (Ok(k), Ok(v)) = (hex::decode(idx), hex::decode(data)) {
-                                                    if k.len() == 32 { let _ = startup_db.put(&k, &v); dl2_count += 1; }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                marker = body["result"]["marker"].as_str().map(String::from);
-                                if marker.is_none() { break; }
-                                if dl2_count % 4_000_000 < 2048 { eprintln!("[startup] Second download: {dl2_count}..."); }
-                            }
-                            eprintln!("[startup] Second download done: {dl2_count} at #{val_seq}");
-
-                            // Start WS sync from val_seq
+                            // Skip second download — start WS sync directly from pinned ledger
+                            // The first download data is at the pinned ledger; ws_sync catches up the gap
                             let ws_db = startup_db.clone();
                             let ws_hash = hash_comp.clone();
-                            let ws_last = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(val_seq));
+                            let ws_last = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(pinned));
+                            // Save pinned ledger for restart backfill
+                            let _ = std::fs::write("/mnt/xrpl-data/sync/dl_done.txt",
+                                format!("ledger #{pinned} — {synced} objects"));
                             tokio::spawn(async move {
                                 xrpl_node::ws_sync::start_ws_sync(ws_db, ws_hash, ws_last).await;
                             });
-                            eprintln!("[startup] WS sync from #{val_seq} (clean, inc-sync DISABLED)");
+                            eprintln!("[startup] WS sync from #{pinned} (no second download, inc-sync DISABLED)");
                             // Keep backfilling=true
                             break;
                         }

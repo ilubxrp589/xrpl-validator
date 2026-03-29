@@ -41,6 +41,11 @@ pub struct StateHashComputer {
     /// Persistent sorted leaf hashes — kept in memory, updated incrementally.
     /// Eliminates the 22s RocksDB scan on every round.
     pub leaf_cache: Arc<Mutex<Vec<(Hash256, Hash256)>>>,
+    /// Cached hashes for each of the 16 root-level branches.
+    /// Only dirty branches are recomputed each round.
+    branch_hashes: Arc<Mutex<[Hash256; 16]>>,
+    /// Bitmask of which branches need recomputing (bit N = branch N is dirty).
+    pub dirty_branches: Arc<Mutex<u16>>,
 }
 
 impl StateHashComputer {
@@ -52,6 +57,8 @@ impl StateHashComputer {
             entries_processed: Arc::new(AtomicU64::new(0)),
             consecutive_matches: Arc::new(AtomicU32::new(0)),
             leaf_cache: Arc::new(Mutex::new(Vec::new())),
+            branch_hashes: Arc::new(Mutex::new([Hash256([0u8; 32]); 16])),
+            dirty_branches: Arc::new(Mutex::new(0xFFFF)), // all dirty initially
         }
     }
 
@@ -325,21 +332,23 @@ impl StateHashComputer {
             eprintln!("[state-hash] Leaf cache built: {} entries in {build_time:.1}s", cache.len());
         } else {
             // Incremental update: for each modified key, update or insert/delete
+            // Track which root-level branches are affected
+            let mut dirty: u16 = 0;
             for key in modified_keys {
+                let branch = nibble_at(key, 0) as u16;
+                dirty |= 1 << branch;
                 match db.get(&key.0) {
                     Ok(Some(data)) => {
                         let mut buf = Vec::with_capacity(data.len() + 32);
                         buf.extend_from_slice(&data);
                         buf.extend_from_slice(&key.0);
                         let lh = sha512_half_prefixed(&HASH_PREFIX_LEAF_NODE, &buf);
-                        // Binary search for existing key
                         match cache.binary_search_by(|e| e.0.0.cmp(&key.0)) {
-                            Ok(idx) => cache[idx].1 = lh, // update existing
-                            Err(idx) => cache.insert(idx, (*key, lh)), // insert new
+                            Ok(idx) => cache[idx].1 = lh,
+                            Err(idx) => cache.insert(idx, (*key, lh)),
                         }
                     }
                     Ok(None) => {
-                        // Deleted — remove from cache
                         if let Ok(idx) = cache.binary_search_by(|e| e.0.0.cmp(&key.0)) {
                             cache.remove(idx);
                         }
@@ -347,6 +356,9 @@ impl StateHashComputer {
                     Err(_) => {}
                 }
             }
+            // Merge with any previously dirty branches
+            let mut db_dirty = self.dirty_branches.lock();
+            *db_dirty |= dirty;
         }
 
         let update_time = start.elapsed().as_secs_f64();
@@ -373,28 +385,57 @@ impl StateHashComputer {
             sha512_half_prefixed(&HASH_PREFIX_INNER_NODE, &data)
         }
 
-        // Parallel at root level
-        let mut buckets: Vec<&[(Hash256, Hash256)]> = Vec::with_capacity(16);
+        // Only recompute dirty branches — massive speedup for incremental updates
+        let mut dirty_bits = self.dirty_branches.lock();
+        let dirty = *dirty_bits;
+        *dirty_bits = 0; // reset
+        drop(dirty_bits);
+
+        let dirty_count = dirty.count_ones();
+
+        // Partition cache into 16 root-level buckets
+        let mut bucket_ranges: Vec<(usize, usize)> = Vec::with_capacity(16);
         let mut pos = 0;
         for nibble in 0..16u8 {
             let end = cache[pos..].partition_point(|&(key, _)| nibble_at(&key, 0) <= nibble) + pos;
             let bucket_start = cache[pos..end].partition_point(|&(key, _)| nibble_at(&key, 0) < nibble) + pos;
-            buckets.push(&cache[bucket_start..end]);
+            bucket_ranges.push((bucket_start, end));
             pos = end;
         }
-        let child_hashes: Vec<Hash256> = buckets.par_iter()
-            .map(|bucket| compute_subtree(bucket, 1))
-            .collect();
+
+        let mut bh = self.branch_hashes.lock();
+
+        if dirty == 0xFFFF {
+            // All branches dirty (first call or cache rebuild) — compute all in parallel
+            let buckets: Vec<&[(Hash256, Hash256)]> = bucket_ranges.iter()
+                .map(|&(s, e)| &cache[s..e])
+                .collect();
+            let results: Vec<Hash256> = buckets.par_iter()
+                .map(|bucket| compute_subtree(bucket, 1))
+                .collect();
+            for (i, h) in results.into_iter().enumerate() {
+                bh[i] = h;
+            }
+        } else {
+            // Only recompute dirty branches — typically 3-5 out of 16
+            for nibble in 0..16u8 {
+                if dirty & (1 << nibble) != 0 {
+                    let (s, e) = bucket_ranges[nibble as usize];
+                    bh[nibble as usize] = compute_subtree(&cache[s..e], 1);
+                }
+            }
+        }
 
         let mut root_data = [0u8; 16 * 32];
-        for (i, h) in child_hashes.iter().enumerate() {
+        for (i, h) in bh.iter().enumerate() {
             root_data[i * 32..(i + 1) * 32].copy_from_slice(&h.0);
         }
+        drop(bh);
         let root_hash = sha512_half_prefixed(&HASH_PREFIX_INNER_NODE, &root_data);
 
         let hash_hex = hex::encode(root_hash.0);
         let total = start.elapsed().as_secs_f64();
-        eprintln!("[state-hash] FAST: {count} entries in {total:.1}s (update={update_time:.1}s compute={:.1}s) — {}",
+        eprintln!("[state-hash] FAST: {count} entries in {total:.1}s (update={update_time:.1}s compute={:.1}s dirty={dirty_count}/16) — {}",
             total - update_time, &hash_hex[..16]);
 
         let mut s = self.status.lock();
