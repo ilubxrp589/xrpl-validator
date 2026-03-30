@@ -331,32 +331,58 @@ impl StateHashComputer {
             let build_time = start.elapsed().as_secs_f64();
             eprintln!("[state-hash] Leaf cache built: {} entries in {build_time:.1}s", cache.len());
         } else {
-            // Incremental update: for each modified key, update or insert/delete
-            // Track which root-level branches are affected
+            // Single-pass merge: collect changes, sort, merge into new Vec in one sweep.
+            // O(n + k·log k) instead of O(k·n) from individual inserts/removes.
             let mut dirty: u16 = 0;
+            let mut updates: Vec<(Hash256, Option<Hash256>)> = Vec::with_capacity(modified_keys.len());
             for key in modified_keys {
-                let branch = nibble_at(key, 0) as u16;
-                dirty |= 1 << branch;
+                dirty |= 1 << (nibble_at(key, 0) as u16);
                 match db.get(&key.0) {
                     Ok(Some(data)) => {
                         let mut buf = Vec::with_capacity(data.len() + 32);
                         buf.extend_from_slice(&data);
                         buf.extend_from_slice(&key.0);
                         let lh = sha512_half_prefixed(&HASH_PREFIX_LEAF_NODE, &buf);
-                        match cache.binary_search_by(|e| e.0.0.cmp(&key.0)) {
-                            Ok(idx) => cache[idx].1 = lh,
-                            Err(idx) => cache.insert(idx, (*key, lh)),
-                        }
+                        updates.push((*key, Some(lh)));
                     }
                     Ok(None) => {
-                        if let Ok(idx) = cache.binary_search_by(|e| e.0.0.cmp(&key.0)) {
-                            cache.remove(idx);
-                        }
+                        updates.push((*key, None)); // delete
                     }
                     Err(_) => {}
                 }
             }
-            // Merge with any previously dirty branches
+            updates.sort_unstable_by(|a, b| a.0 .0.cmp(&b.0 .0));
+
+            // Merge: single pass through old cache + sorted updates → new cache
+            let mut new_cache = Vec::with_capacity(cache.len() + updates.len());
+            let mut ci = 0usize;
+            let mut ui = 0usize;
+            while ci < cache.len() || ui < updates.len() {
+                if ui >= updates.len() {
+                    // No more updates — copy rest of cache
+                    new_cache.extend_from_slice(&cache[ci..]);
+                    break;
+                } else if ci >= cache.len() {
+                    // No more cache — insert remaining updates
+                    for u in &updates[ui..] {
+                        if let Some(h) = u.1 { new_cache.push((u.0, h)); }
+                    }
+                    break;
+                } else if cache[ci].0 .0 < updates[ui].0 .0 {
+                    new_cache.push(cache[ci]);
+                    ci += 1;
+                } else if cache[ci].0 .0 > updates[ui].0 .0 {
+                    if let Some(h) = updates[ui].1 { new_cache.push((updates[ui].0, h)); }
+                    ui += 1;
+                } else {
+                    // Same key — update or delete
+                    if let Some(h) = updates[ui].1 { new_cache.push((updates[ui].0, h)); }
+                    ci += 1;
+                    ui += 1;
+                }
+            }
+            *cache = new_cache;
+
             let mut db_dirty = self.dirty_branches.lock();
             *db_dirty |= dirty;
         }

@@ -103,35 +103,37 @@ pub async fn start_ws_sync(
                 }
 
                 for process_seq in start_seq..=closed_seq {
-                    let account_hash = if process_seq == closed_seq {
-                        fetch_account_hash(&rpc_client, process_seq).await.unwrap_or_default()
-                    } else {
-                        String::new()
-                    };
+                    let account_hash = fetch_account_hash(&rpc_client, process_seq).await.unwrap_or_default();
 
                     acc_modified.clear();
                     acc_deleted.clear();
                     acc_tx_count = 0;
 
                     let mut meta_ok = false;
-                    for attempt in 0..5u32 {
+                    for attempt in 0..3u32 {
                         match fetch_ledger_metadata(&rpc_client, process_seq, &mut acc_modified, &mut acc_deleted, &mut acc_tx_count).await {
                             Ok(()) => { meta_ok = true; break; }
                             Err(e) => {
-                                if attempt < 4 {
-                                    let delay = 500 * (1 << attempt); // 500ms, 1s, 2s, 4s
-                                    eprintln!("[ws-sync] Metadata #{process_seq} attempt {}: {e} — retry in {delay}ms", attempt + 1);
-                                    tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
+                                if attempt < 2 {
+                                    eprintln!("[ws-sync] Metadata #{process_seq} attempt {}: {e} — retry", attempt + 1);
+                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                                     acc_modified.clear();
                                     acc_deleted.clear();
                                     acc_tx_count = 0;
                                 } else {
-                                    eprintln!("[ws-sync] Metadata #{process_seq} FAILED after 5 attempts: {e} — skipping");
+                                    // Ledger too old — skip rest of batch, let next ledgerClosed catch up
+                                    eprintln!("[ws-sync] Metadata #{process_seq} FAILED — breaking batch");
+                                    break;
                                 }
                             }
                         }
                     }
-                    if !meta_ok { continue; }
+                    if !meta_ok {
+                        // Break the entire batch — let the next ledgerClosed event
+                        // trigger skip-ahead if we're too far behind
+                        last_processed = process_seq;
+                        break;
+                    }
 
                     // Always include protocol-level singletons
                     acc_modified.insert("B4979A36CDC7F3D3D5C31A4EAE2AC7D7209DDA877588B9AFC66799692AB0D66B".to_string()); // LedgerHashes (skip list)
@@ -154,7 +156,7 @@ pub async fn start_ws_sync(
                         acc_modified.remove(&d);
                     }
 
-                    let compute_hash = process_seq == closed_seq;
+                    let compute_hash = true;
                     let result = process_ledger(
                         &rpc_client, &db, &hash_comp,
                         process_seq, &acc_modified, &acc_deleted,
@@ -335,8 +337,10 @@ async fn process_ledger(
     }
 
     if failed > 0 {
-        eprintln!("[ws-sync] Ledger #{seq}: {failed} failures — skipping");
-        return false;
+        eprintln!("[ws-sync] Ledger #{seq}: {failed} failures — applying {}/{} objects anyway",
+            fetched_data.len(), fetched_data.len() + failed as usize);
+        // Don't skip — write what we got. Failed keys will get corrected on future rounds
+        // when those objects are modified again.
     }
 
     // Atomic write to RocksDB
@@ -369,8 +373,13 @@ async fn process_ledger(
     }
 
     if compute_hash {
-        // Full hash computation (~2.5s) — update cache + compute root
-        if let Some(root) = hash_comp.update_and_hash(db, &keys) {
+        // Full hash computation (~2.8s) — run on blocking thread pool to keep SSE/peers responsive
+        let hc = hash_comp.clone();
+        let d = db.clone();
+        let hash_result = tokio::task::spawn_blocking(move || {
+            hc.update_and_hash(&d, &keys)
+        }).await.ok().flatten();
+        if let Some(root) = hash_result {
             let ours = hex::encode(root.0);
             if !account_hash.is_empty() {
                 let matched = ours.to_uppercase() == account_hash.to_uppercase();
@@ -430,8 +439,13 @@ async fn process_ledger(
                         if !retry_ok || retry_keys.is_empty() { continue; }
                         let _ = db.write(retry_batch);
 
-                        // Recompute hash with fresh data
-                        if let Some(root2) = hash_comp.update_and_hash(db, &retry_keys) {
+                        // Recompute hash with fresh data (on blocking thread)
+                        let hc2 = hash_comp.clone(); let d2 = db.clone();
+                        let rk = retry_keys;
+                        let root2 = tokio::task::spawn_blocking(move || {
+                            hc2.update_and_hash(&d2, &rk)
+                        }).await.ok().flatten();
+                        if let Some(root2) = root2 {
                             let ours2 = hex::encode(root2.0);
                             let matched2 = ours2.to_uppercase() == account_hash.to_uppercase();
                             hash_comp.set_network_hash(account_hash, seq);
@@ -509,12 +523,13 @@ async fn process_ledger(
             }
         }
     } else {
-        // Fast path: update leaf cache + mark dirty branches, skip root hash computation
+        // Fast path: single-pass merge into leaf cache + mark dirty branches
         use xrpl_ledger::shamap::hash::{sha512_half_prefixed, HASH_PREFIX_LEAF_NODE};
         use xrpl_ledger::shamap::node::nibble_at;
         let mut cache = hash_comp.leaf_cache.lock();
         if !cache.is_empty() {
             let mut dirty: u16 = 0;
+            let mut updates: Vec<(Hash256, Option<Hash256>)> = Vec::with_capacity(keys.len());
             for key in &keys {
                 dirty |= 1 << (nibble_at(key, 0) as u16);
                 match db.get(&key.0) {
@@ -523,20 +538,34 @@ async fn process_ledger(
                         buf.extend_from_slice(&data);
                         buf.extend_from_slice(&key.0);
                         let lh = sha512_half_prefixed(&HASH_PREFIX_LEAF_NODE, &buf);
-                        match cache.binary_search_by(|e| e.0 .0.cmp(&key.0)) {
-                            Ok(idx) => cache[idx].1 = lh,
-                            Err(idx) => cache.insert(idx, (*key, lh)),
-                        }
+                        updates.push((*key, Some(lh)));
                     }
-                    Ok(None) => {
-                        if let Ok(idx) = cache.binary_search_by(|e| e.0 .0.cmp(&key.0)) {
-                            cache.remove(idx);
-                        }
-                    }
+                    Ok(None) => { updates.push((*key, None)); }
                     Err(_) => {}
                 }
             }
-            // Mark affected branches as dirty for next hash computation
+            updates.sort_unstable_by(|a, b| a.0 .0.cmp(&b.0 .0));
+
+            let mut new_cache = Vec::with_capacity(cache.len() + updates.len());
+            let (mut ci, mut ui) = (0usize, 0usize);
+            while ci < cache.len() || ui < updates.len() {
+                if ui >= updates.len() {
+                    new_cache.extend_from_slice(&cache[ci..]);
+                    break;
+                } else if ci >= cache.len() {
+                    for u in &updates[ui..] { if let Some(h) = u.1 { new_cache.push((u.0, h)); } }
+                    break;
+                } else if cache[ci].0 .0 < updates[ui].0 .0 {
+                    new_cache.push(cache[ci]); ci += 1;
+                } else if cache[ci].0 .0 > updates[ui].0 .0 {
+                    if let Some(h) = updates[ui].1 { new_cache.push((updates[ui].0, h)); } ui += 1;
+                } else {
+                    if let Some(h) = updates[ui].1 { new_cache.push((updates[ui].0, h)); }
+                    ci += 1; ui += 1;
+                }
+            }
+            *cache = new_cache;
+
             let mut db_dirty = hash_comp.dirty_branches.lock();
             *db_dirty |= dirty;
         }
