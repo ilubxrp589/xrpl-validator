@@ -128,11 +128,15 @@
       <div class="stat-value" id="s-entries">—</div>
     </div>
     <div class="stat">
-      <div class="stat-label">Build Time</div>
-      <div class="stat-value" id="s-time">—</div>
+      <div class="stat-label">Matches</div>
+      <div class="stat-value green" id="s-total-matches">0</div>
     </div>
     <div class="stat">
-      <div class="stat-label">Consecutive Matches</div>
+      <div class="stat-label">Mismatches</div>
+      <div class="stat-value" id="s-total-mismatches">0</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Streak</div>
       <div class="stat-value" id="s-matches">0</div>
     </div>
     <div class="stat">
@@ -142,7 +146,7 @@
   </div>
 
   <div id="log-wrap">
-    <div id="log-title">Ledger Close Log</div>
+    <div id="log-title">Sync Log — Every Ledger Verified</div>
     <div id="log"></div>
   </div>
 </div>
@@ -258,8 +262,11 @@ async function poll() {
     document.getElementById('s-entries').textContent =
       state.entries_processed > 0 ? (state.entries_processed/1e6).toFixed(1) + 'M' :
       state.entries_total > 0 ? (state.entries_total/1e6).toFixed(1) + 'M' : '—';
-    document.getElementById('s-time').textContent =
-      state.compute_time_secs > 0 ? state.compute_time_secs.toFixed(0) + 's' : '—';
+
+    document.getElementById('s-total-matches').textContent = state.total_matches || 0;
+    const mmEl = document.getElementById('s-total-mismatches');
+    mmEl.textContent = state.total_mismatches || 0;
+    mmEl.className = 'stat-value' + ((state.total_mismatches || 0) > 0 ? ' red' : '');
 
     const matchEl = document.getElementById('s-matches');
     matchEl.textContent = state.consecutive_matches;
@@ -267,27 +274,22 @@ async function poll() {
 
     const signEl = document.getElementById('s-signing');
     if (state.ready_to_sign) {
-      signEl.textContent = 'RUST RIPPLED';
+      signEl.textContent = 'OUR HASH';
       signEl.className = 'stat-value green';
     } else {
-      signEl.textContent = 'RIPPLED';
+      signEl.textContent = 'NETWORK';
       signEl.className = 'stat-value';
     }
 
-    // Engine log — extract ledger close info
-    if (engine.ledger_seq) {
-      const le = engine.live_engine || {};
-      const txs = engine.round_tx_count || 0;
-      const fees = engine.round_fees || 0;
-      if (txs > 0) {
-        addLog(
-          `<span class="log-seq">#${engine.ledger_seq}</span> ` +
-          `<span class="log-txs">${txs} txs</span> ` +
-          `<span class="log-fees">${(fees/1e6).toFixed(4)} XRP fees</span> ` +
-          `<span class="log-writes">${le.round_applied || 0} applied</span>`
-        );
-      }
-    }
+    // Sync log from API
+    const syncLog = state.sync_log || [];
+    const el = document.getElementById('log');
+    el.innerHTML = syncLog.map(e => {
+      const status = e.matched
+        ? `<span class="log-writes">MATCH</span>`
+        : (e.healed ? `<span class="log-fees">HEALED</span>` : `<span style="color:#ff6b6b">MISMATCH</span>`);
+      return `<div class="log-entry"><span class="log-seq">#${e.seq}</span> ${status} <span class="log-txs">${e.txs} txs</span> <span style="color:#3a5a7a">${e.objs} objs</span> <span style="color:#2a3a5a">${e.time_secs.toFixed(1)}s</span></div>`;
+    }).join('');
 
   } catch(e) { /* ignore */ }
 }

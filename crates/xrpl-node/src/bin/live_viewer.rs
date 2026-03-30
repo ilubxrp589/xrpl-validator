@@ -869,16 +869,16 @@ async fn main() {
                                     } else { None })
                                     .unwrap_or([0u8; 32]);
 
-                                // Use our own hash if independently verified, otherwise use network's
-                                let (ledger_hash_bytes, hash_source) = if state_hash_for_close.is_ready_to_sign() {
-                                    if let Some(our_hash) = state_hash_for_close.current_hash() {
-                                        (our_hash.0, "OUR_HASH")
-                                    } else {
-                                        (network_hash_bytes, "network")
-                                    }
+                                // Always sign with the network's ledger_hash (hash of full header).
+                                // Our state verification confirms account_hash is correct,
+                                // which is one component of the ledger header.
+                                // "OUR_HASH" means we've independently verified the state.
+                                let hash_source = if state_hash_for_close.is_ready_to_sign() {
+                                    "VERIFIED"
                                 } else {
-                                    (network_hash_bytes, "network")
+                                    "network"
                                 };
+                                let ledger_hash_bytes = network_hash_bytes;
 
                                 // Don't sign if we don't have a real hash
                                 if ledger_hash_bytes == [0u8; 32] {

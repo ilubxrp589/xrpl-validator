@@ -27,6 +27,21 @@ pub struct StateHashStatus {
     pub consecutive_matches: u32,
     /// Whether we're ready to sign with our own hash.
     pub ready_to_sign: bool,
+    /// Total match/mismatch counts since startup.
+    pub total_matches: u64,
+    pub total_mismatches: u64,
+    /// Recent sync log entries (ring buffer, newest first).
+    pub sync_log: Vec<SyncLogEntry>,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct SyncLogEntry {
+    pub seq: u32,
+    pub matched: bool,
+    pub txs: u32,
+    pub objs: u32,
+    pub time_secs: f64,
+    pub healed: bool,
 }
 
 /// Shared state for the background hash computation.
@@ -285,6 +300,18 @@ impl StateHashComputer {
         } else {
             false
         }
+    }
+
+    /// Push a sync log entry (called from ws_sync after each ledger).
+    pub fn push_sync_log(&self, entry: SyncLogEntry) {
+        let mut s = self.status.lock();
+        if entry.matched {
+            s.total_matches += 1;
+        } else {
+            s.total_mismatches += 1;
+        }
+        s.sync_log.insert(0, entry);
+        s.sync_log.truncate(100); // keep last 100
     }
 
     /// Check if we're ready to sign with our own hash (3+ consecutive matches).

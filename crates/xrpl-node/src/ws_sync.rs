@@ -253,6 +253,7 @@ async fn process_ledger(
     tx_count: u32,
     compute_hash: bool,
 ) -> bool {
+    let ledger_start = std::time::Instant::now();
     // Fetch all modified objects sequentially (hot in cache)
     let mut fetched_data: Vec<([u8; 32], Vec<u8>)> = Vec::new();
     let mut failed = 0u32;
@@ -384,6 +385,10 @@ async fn process_ledger(
             if !account_hash.is_empty() {
                 let matched = ours.to_uppercase() == account_hash.to_uppercase();
                 hash_comp.set_network_hash(account_hash, seq);
+                hash_comp.push_sync_log(crate::state_hash::SyncLogEntry {
+                    seq, matched, txs: tx_count, objs: fetched_data.len() as u32,
+                    time_secs: ledger_start.elapsed().as_secs_f64(), healed: false,
+                });
                 if matched {
                     eprintln!("[ws-sync] #{seq}: MATCH ({tx_count} txs, {} objs)", fetched_data.len());
                 } else {
@@ -516,6 +521,12 @@ async fn process_ledger(
                         eprintln!("[ws-sync] SCAN DONE: net={n_total} ours={our_count} extra={extra} | {n_diff} diff, {n_missing} missing");
                         // Only run full scan once — subsequent mismatches just log
                         // (the scan takes ~5min and blocks sync)
+                    }
+                    if healed {
+                        hash_comp.push_sync_log(crate::state_hash::SyncLogEntry {
+                            seq, matched: true, txs: tx_count, objs: fetched_data.len() as u32,
+                            time_secs: ledger_start.elapsed().as_secs_f64(), healed: true,
+                        });
                     }
                     return healed;
                 }
