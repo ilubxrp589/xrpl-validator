@@ -16,26 +16,24 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::connect_async;
 use xrpl_core::types::Hash256;
 use xrpl_ledger::shamap::hash::{sha512_half_prefixed, HASH_PREFIX_LEAF_NODE};
-
-const WS_URL: &str = "ws://10.0.0.97:6006";
-const RPC_URL: &str = "http://10.0.0.97:5005";
+use crate::rippled_client::RippledClient;
 
 pub async fn start_ws_sync(
     db: Arc<rocksdb::DB>,
     hash_comp: Arc<crate::state_hash::StateHashComputer>,
     last_synced: Arc<AtomicU32>,
 ) {
-    let rpc_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .unwrap();
+    let rpc = RippledClient::new();
 
     loop {
-        eprintln!("[ws-sync] Connecting to {WS_URL}...");
-        let ws = match connect_async(WS_URL).await {
+        let ws_url = rpc.ws_url();
+        eprintln!("[ws-sync] Connecting to {ws_url}...");
+        let ws = match connect_async(ws_url).await {
             Ok((ws, _)) => ws,
             Err(e) => {
                 eprintln!("[ws-sync] Connect failed: {e}");
+                let next = rpc.next_ws_endpoint();
+                eprintln!("[ws-sync] Switching to {next}");
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
@@ -103,7 +101,7 @@ pub async fn start_ws_sync(
                 }
 
                 for process_seq in start_seq..=closed_seq {
-                    let account_hash = fetch_account_hash(&rpc_client, process_seq).await.unwrap_or_default();
+                    let account_hash = fetch_account_hash(&rpc, process_seq).await.unwrap_or_default();
 
                     acc_modified.clear();
                     acc_deleted.clear();
@@ -111,7 +109,7 @@ pub async fn start_ws_sync(
 
                     let mut meta_ok = false;
                     for attempt in 0..3u32 {
-                        match fetch_ledger_metadata(&rpc_client, process_seq, &mut acc_modified, &mut acc_deleted, &mut acc_tx_count).await {
+                        match fetch_ledger_metadata(&rpc, process_seq, &mut acc_modified, &mut acc_deleted, &mut acc_tx_count).await {
                             Ok(()) => { meta_ok = true; break; }
                             Err(e) => {
                                 if attempt < 2 {
@@ -158,7 +156,7 @@ pub async fn start_ws_sync(
 
                     let compute_hash = true;
                     let result = process_ledger(
-                        &rpc_client, &db, &hash_comp,
+                        &rpc, &db, &hash_comp,
                         process_seq, &acc_modified, &acc_deleted,
                         &account_hash, acc_tx_count, compute_hash,
                     ).await;
@@ -211,18 +209,11 @@ fn extract_affected_nodes(body: &serde_json::Value, modified: &mut HashSet<Strin
 }
 
 async fn fetch_ledger_metadata(
-    client: &reqwest::Client, seq: u32,
+    rpc: &RippledClient, seq: u32,
     modified: &mut HashSet<String>, deleted: &mut HashSet<String>,
     tx_count: &mut u32,
 ) -> Result<(), String> {
-    let resp = client.post(RPC_URL)
-        .json(&serde_json::json!({
-            "method": "ledger",
-            "params": [{"ledger_index": seq, "transactions": true, "expand": true, "binary": false}]
-        }))
-        .send().await.map_err(|e| format!("{e}"))?;
-
-    let body: serde_json::Value = resp.json().await.map_err(|e| format!("{e}"))?;
+    let body = rpc.call("ledger", serde_json::json!({"ledger_index": seq, "transactions": true, "expand": true, "binary": false})).await?;
     let txs = body["result"]["ledger"]["transactions"].as_array()
         .ok_or("no transactions")?;
 
@@ -243,7 +234,7 @@ async fn fetch_ledger_metadata(
 }
 
 async fn process_ledger(
-    client: &reqwest::Client,
+    rpc: &RippledClient,
     db: &Arc<rocksdb::DB>,
     hash_comp: &Arc<crate::state_hash::StateHashComputer>,
     seq: u32,
@@ -261,7 +252,7 @@ async fn process_ledger(
     for index_hex in modified {
         let mut ok = false;
         for _ in 0..3u32 {
-            let resp = client.post(RPC_URL)
+            let resp = rpc.client.post(rpc.rpc_url())
                 .json(&serde_json::json!({
                     "method": "ledger_entry",
                     "params": [{"index": index_hex, "binary": true, "ledger_index": seq}]
@@ -290,45 +281,16 @@ async fn process_ledger(
                         }
                     }
                     if body["result"]["error"].as_str() == Some("entryNotFound") {
-                        // Try xrplcluster.com as fallback (full history)
-                        let fb = client.post("https://xrplcluster.com")
-                            .json(&serde_json::json!({
-                                "method": "ledger_entry",
-                                "params": [{"index": index_hex, "binary": true, "ledger_index": seq}]
-                            }))
-                            .send().await;
-                        if let Ok(r2) = fb {
-                            if let Ok(body2) = r2.json::<serde_json::Value>().await {
-                                if let Some(data_hex) = body2["result"]["node_binary"].as_str() {
-                                    if let Ok(data) = hex::decode(data_hex) {
-                                        if let Ok(kb) = hex::decode(index_hex) {
-                                            if kb.len() == 32 {
-                                                let mut key = [0u8; 32];
-                                                key.copy_from_slice(&kb);
-                                                fetched_data.push((key, data));
-                                                ok = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                                // Both local + public say entryNotFound — object was deleted
-                                // Treat as deletion: add to fetched with empty marker so we delete from DB
-                                if body2["result"]["error"].as_str() == Some("entryNotFound") {
-                                    if let Ok(kb) = hex::decode(index_hex) {
-                                        if kb.len() == 32 {
-                                            let mut key = [0u8; 32];
-                                            key.copy_from_slice(&kb);
-                                            // Push with empty data — we'll detect and delete below
-                                            fetched_data.push((key, Vec::new()));
-                                        }
-                                    }
-                                    ok = true;
-                                    break;
-                                }
+                        // Object doesn't exist at this ledger — treat as deletion
+                        if let Ok(kb) = hex::decode(index_hex) {
+                            if kb.len() == 32 {
+                                let mut key = [0u8; 32];
+                                key.copy_from_slice(&kb);
+                                fetched_data.push((key, Vec::new()));
                             }
                         }
-                        break; // fallback failed — ok stays false
+                        ok = true;
+                        break;
                     }
                 }
             }
@@ -404,7 +366,7 @@ async fn process_ledger(
                         let mut retry_ok = true;
 
                         for index_hex in modified.iter().chain(deleted.iter()) {
-                            let resp = client.post(RPC_URL)
+                            let resp = rpc.client.post(rpc.rpc_url())
                                 .json(&serde_json::json!({
                                     "method": "ledger_entry",
                                     "params": [{"index": index_hex, "binary": true, "ledger_index": seq}]
@@ -474,7 +436,7 @@ async fn process_ledger(
                         loop {
                             let mut p = serde_json::json!({"ledger_index":seq,"binary":true,"limit":2048});
                             if let Some(ref m) = diag_marker { p["marker"] = serde_json::Value::String(m.clone()); }
-                            let Ok(r) = client.post(RPC_URL)
+                            let Ok(r) = rpc.client.post(rpc.rpc_url())
                                 .json(&serde_json::json!({"method":"ledger_data","params":[p]}))
                                 .send().await else { break };
                             let Ok(body) = r.json::<serde_json::Value>().await else { break };
@@ -585,10 +547,7 @@ async fn process_ledger(
     false
 }
 
-async fn fetch_account_hash(client: &reqwest::Client, seq: u32) -> Option<String> {
-    let resp = client.post(RPC_URL)
-        .json(&serde_json::json!({"method":"ledger","params":[{"ledger_index":seq}]}))
-        .send().await.ok()?;
-    let body: serde_json::Value = resp.json().await.ok()?;
+async fn fetch_account_hash(rpc: &RippledClient, seq: u32) -> Option<String> {
+    let body = rpc.call("ledger", serde_json::json!({"ledger_index": seq})).await.ok()?;
     body["result"]["ledger"]["account_hash"].as_str().map(String::from)
 }
