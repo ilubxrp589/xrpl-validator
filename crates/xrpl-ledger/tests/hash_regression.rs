@@ -115,3 +115,343 @@ fn ripple_epoch_offset() {
     // 2000-01-01 00:00:00 UTC
     assert_eq!(LedgerHeader::ripple_to_unix(0), 946684800);
 }
+
+#[test]
+fn flat_vs_tree_hash() {
+    use xrpl_ledger::shamap::tree::{SHAMap, TreeType};
+    use xrpl_ledger::shamap::hash::{sha512_half_prefixed, HASH_PREFIX_INNER_NODE, HASH_PREFIX_LEAF_NODE};
+    use xrpl_ledger::shamap::node::{ZERO_HASH, nibble_at};
+    use xrpl_core::types::Hash256;
+
+    fn compute_subtree(entries: &[(Hash256, Hash256)], depth: usize) -> Hash256 {
+        if entries.is_empty() { return ZERO_HASH; }
+        if entries.len() == 1 { return entries[0].1; }
+        let mut child_hashes = [ZERO_HASH; 16];
+        let mut pos = 0;
+        for nibble in 0..16u8 {
+            let end = entries[pos..].partition_point(|&(key, _)| nibble_at(&key, depth) <= nibble) + pos;
+            let bucket_start = entries[pos..end].partition_point(|&(key, _)| nibble_at(&key, depth) < nibble) + pos;
+            if bucket_start < end {
+                child_hashes[nibble as usize] = compute_subtree(&entries[bucket_start..end], depth + 1);
+            }
+            pos = end;
+        }
+        let mut data = [0u8; 16 * 32];
+        for (i, h) in child_hashes.iter().enumerate() {
+            data[i * 32..(i + 1) * 32].copy_from_slice(&h.0);
+        }
+        sha512_half_prefixed(&HASH_PREFIX_INNER_NODE, &data)
+    }
+
+    let mut entries: Vec<(Hash256, Hash256)> = Vec::new();
+    for i in 0u32..100 {
+        let mut key = [0u8; 32];
+        key[0..4].copy_from_slice(&i.to_be_bytes());
+        let mut data = vec![0u8; 50];
+        data[0..4].copy_from_slice(&(i * 7 + 13).to_be_bytes());
+        data.extend_from_slice(&key);
+        let lh = sha512_half_prefixed(&HASH_PREFIX_LEAF_NODE, &data);
+        entries.push((Hash256(key), lh));
+    }
+    entries.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+
+    let flat = compute_subtree(&entries, 0);
+
+    let mut tree = SHAMap::new(TreeType::State);
+    for (k, h) in &entries {
+        tree.insert_hash_only(*k, *h).unwrap();
+    }
+    let tree_hash = tree.root_hash();
+
+    eprintln!("Flat:  {}", hex::encode(&flat.0[..16]));
+    eprintln!("Tree:  {}", hex::encode(&tree_hash.0[..16]));
+
+    // Test 1 entry
+    let one = &entries[..1];
+    let flat1 = compute_subtree(one, 0);
+    let mut t1 = SHAMap::new(TreeType::State);
+    t1.insert_hash_only(one[0].0, one[0].1).unwrap();
+    eprintln!("1 entry — flat: {} tree: {}", hex::encode(&flat1.0[..8]), hex::encode(&t1.root_hash().0[..8]));
+
+    // Test 2 entries
+    let two = &entries[..2];
+    let flat2 = compute_subtree(two, 0);
+    let mut t2 = SHAMap::new(TreeType::State);
+    for (k, h) in two { t2.insert_hash_only(*k, *h).unwrap(); }
+    eprintln!("2 entries — flat: {} tree: {}", hex::encode(&flat2.0[..8]), hex::encode(&t2.root_hash().0[..8]));
+
+    assert_eq!(flat, tree_hash, "100 entries: flat vs tree mismatch");
+}
+
+#[test]
+fn flat_vs_tree_hash_sha_keys() {
+    use xrpl_ledger::shamap::tree::{SHAMap, TreeType};
+    use xrpl_ledger::shamap::hash::{sha512_half_prefixed, HASH_PREFIX_INNER_NODE, HASH_PREFIX_LEAF_NODE};
+    use xrpl_ledger::shamap::node::{ZERO_HASH, nibble_at};
+    use xrpl_core::types::Hash256;
+    use sha2::{Sha256, Digest};
+
+    fn compute_subtree(entries: &[(Hash256, Hash256)], depth: usize) -> Hash256 {
+        if entries.is_empty() { return ZERO_HASH; }
+        if entries.len() == 1 { return entries[0].1; }
+        let mut child_hashes = [ZERO_HASH; 16];
+        let mut pos = 0;
+        for nibble in 0..16u8 {
+            let end = entries[pos..].partition_point(|&(key, _)| nibble_at(&key, depth) <= nibble) + pos;
+            let bucket_start = entries[pos..end].partition_point(|&(key, _)| nibble_at(&key, depth) < nibble) + pos;
+            if bucket_start < end {
+                child_hashes[nibble as usize] = compute_subtree(&entries[bucket_start..end], depth + 1);
+            }
+            pos = end;
+        }
+        let mut data = [0u8; 16 * 32];
+        for (i, h) in child_hashes.iter().enumerate() {
+            data[i * 32..(i + 1) * 32].copy_from_slice(&h.0);
+        }
+        sha512_half_prefixed(&HASH_PREFIX_INNER_NODE, &data)
+    }
+
+    // Use SHA256 hashed keys (realistic distribution like XRPL)
+    let mut entries: Vec<(Hash256, Hash256)> = Vec::new();
+    for i in 0u32..10000 {
+        let h = Sha256::digest(i.to_be_bytes());
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&h);
+        let mut data = vec![0u8; 100];
+        data[0..4].copy_from_slice(&i.to_be_bytes());
+        data.extend_from_slice(&key);
+        let lh = sha512_half_prefixed(&HASH_PREFIX_LEAF_NODE, &data);
+        entries.push((Hash256(key), lh));
+    }
+    entries.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+
+    let flat = compute_subtree(&entries, 0);
+
+    let mut tree = SHAMap::new(TreeType::State);
+    for (k, h) in &entries {
+        tree.insert_hash_only(*k, *h).unwrap();
+    }
+    let tree_hash = tree.root_hash();
+
+    eprintln!("10k SHA keys — flat: {} tree: {} match={}", 
+        hex::encode(&flat.0[..8]), hex::encode(&tree_hash.0[..8]), flat == tree_hash);
+
+    assert_eq!(flat, tree_hash, "10k SHA keys: flat vs tree mismatch");
+}
+
+#[test]
+fn flat_vs_tree_incremental_update() {
+    use xrpl_ledger::shamap::tree::{SHAMap, TreeType};
+    use xrpl_ledger::shamap::hash::{sha512_half_prefixed, HASH_PREFIX_INNER_NODE, HASH_PREFIX_LEAF_NODE};
+    use xrpl_ledger::shamap::node::{ZERO_HASH, nibble_at};
+    use xrpl_core::types::Hash256;
+    use sha2::{Sha256, Digest};
+
+    fn compute_subtree(entries: &[(Hash256, Hash256)], depth: usize) -> Hash256 {
+        if entries.is_empty() { return ZERO_HASH; }
+        if entries.len() == 1 { return entries[0].1; }
+        let mut child_hashes = [ZERO_HASH; 16];
+        let mut pos = 0;
+        for nibble in 0..16u8 {
+            let end = entries[pos..].partition_point(|&(key, _)| nibble_at(&key, depth) <= nibble) + pos;
+            let bucket_start = entries[pos..end].partition_point(|&(key, _)| nibble_at(&key, depth) < nibble) + pos;
+            if bucket_start < end {
+                child_hashes[nibble as usize] = compute_subtree(&entries[bucket_start..end], depth + 1);
+            }
+            pos = end;
+        }
+        let mut data = [0u8; 16 * 32];
+        for (i, h) in child_hashes.iter().enumerate() {
+            data[i * 32..(i + 1) * 32].copy_from_slice(&h.0);
+        }
+        sha512_half_prefixed(&HASH_PREFIX_INNER_NODE, &data)
+    }
+
+    fn make_entry(i: u32) -> (Hash256, Hash256) {
+        let h = Sha256::digest(i.to_be_bytes());
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&h);
+        let mut data = vec![0u8; 100];
+        data[0..4].copy_from_slice(&i.to_be_bytes());
+        data.extend_from_slice(&key);
+        let lh = sha512_half_prefixed(&HASH_PREFIX_LEAF_NODE, &data);
+        (Hash256(key), lh)
+    }
+
+    // Build initial set
+    let mut entries: Vec<(Hash256, Hash256)> = (0..1000).map(make_entry).collect();
+    entries.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+
+    let mut tree = SHAMap::new(TreeType::State);
+    for (k, h) in &entries { tree.insert_hash_only(*k, *h).unwrap(); }
+
+    let flat1 = compute_subtree(&entries, 0);
+    let tree1 = tree.root_hash();
+    eprintln!("Initial 1000: flat={} tree={} match={}", hex::encode(&flat1.0[..8]), hex::encode(&tree1.0[..8]), flat1 == tree1);
+    assert_eq!(flat1, tree1, "Initial build mismatch");
+
+    // Simulate a ledger round: update 50 existing keys with new hashes
+    for i in 0..50u32 {
+        let (key, _) = make_entry(i);
+        let new_data = vec![i as u8; 200]; // different data
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&new_data);
+        buf.extend_from_slice(&key.0);
+        let new_hash = sha512_half_prefixed(&HASH_PREFIX_LEAF_NODE, &buf);
+        
+        // Update tree
+        tree.insert_hash_only(key, new_hash).unwrap();
+        
+        // Update flat array
+        if let Ok(idx) = entries.binary_search_by(|e| e.0.0.cmp(&key.0)) {
+            entries[idx].1 = new_hash;
+        }
+    }
+
+    // Add 10 new entries
+    for i in 1000..1010u32 {
+        let (key, hash) = make_entry(i);
+        tree.insert_hash_only(key, hash).unwrap();
+        let pos = entries.binary_search_by(|e| e.0.0.cmp(&key.0)).unwrap_err();
+        entries.insert(pos, (key, hash));
+    }
+
+    // Delete 5 entries
+    for i in 50..55u32 {
+        let (key, _) = make_entry(i);
+        tree.delete(&key).unwrap();
+        if let Ok(idx) = entries.binary_search_by(|e| e.0.0.cmp(&key.0)) {
+            entries.remove(idx);
+        }
+    }
+
+    let flat2 = compute_subtree(&entries, 0);
+    let tree2 = tree.root_hash();
+    eprintln!("After updates: flat={} tree={} match={}", hex::encode(&flat2.0[..8]), hex::encode(&tree2.0[..8]), flat2 == tree2);
+    assert_eq!(flat2, tree2, "Incremental update mismatch");
+}
+
+#[test]
+fn tree_update_vs_rebuild() {
+    use xrpl_ledger::shamap::tree::{SHAMap, TreeType};
+    use xrpl_ledger::shamap::hash::{sha512_half_prefixed, HASH_PREFIX_LEAF_NODE};
+    use xrpl_core::types::Hash256;
+    use sha2::{Sha256, Digest};
+
+    fn make_entry(i: u32) -> (Hash256, Hash256) {
+        let h = Sha256::digest(i.to_be_bytes());
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&h);
+        let mut data = vec![0u8; 100];
+        data[0..4].copy_from_slice(&i.to_be_bytes());
+        data.extend_from_slice(&key);
+        (Hash256(key), sha512_half_prefixed(&HASH_PREFIX_LEAF_NODE, &data))
+    }
+
+    fn make_entry_v2(i: u32) -> (Hash256, Hash256) {
+        let h = Sha256::digest(i.to_be_bytes());
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&h);
+        let mut data = vec![1u8; 200]; // different data
+        data[0..4].copy_from_slice(&i.to_be_bytes());
+        data.extend_from_slice(&key);
+        (Hash256(key), sha512_half_prefixed(&HASH_PREFIX_LEAF_NODE, &data))
+    }
+
+    // Build tree with 50000 entries
+    let mut tree = SHAMap::new(TreeType::State);
+    for i in 0..50000u32 {
+        let (k, h) = make_entry(i);
+        tree.insert_hash_only(k, h).unwrap();
+    }
+    let hash1 = tree.root_hash();
+    eprintln!("Initial 50k: {}", hex::encode(&hash1.0[..8]));
+
+    // Update 200 entries (simulate a ledger round)
+    for i in 0..200u32 {
+        let (k, h) = make_entry_v2(i);
+        tree.insert_hash_only(k, h).unwrap();
+    }
+    let hash_updated = tree.root_hash();
+    eprintln!("After update: {}", hex::encode(&hash_updated.0[..8]));
+
+    // Build fresh tree with the same final state
+    let mut fresh = SHAMap::new(TreeType::State);
+    for i in 200..50000u32 {
+        let (k, h) = make_entry(i); // unchanged
+        fresh.insert_hash_only(k, h).unwrap();
+    }
+    for i in 0..200u32 {
+        let (k, h) = make_entry_v2(i); // updated
+        fresh.insert_hash_only(k, h).unwrap();
+    }
+    let hash_fresh = fresh.root_hash();
+    eprintln!("Fresh build:  {}", hex::encode(&hash_fresh.0[..8]));
+
+    assert_ne!(hash1, hash_updated, "update should change hash");
+    assert_eq!(hash_updated, hash_fresh, "incremental update should match fresh build");
+}
+
+#[test]
+fn tree_vs_rebuild_after_update_500k() {
+    use xrpl_ledger::shamap::tree::{SHAMap, TreeType};
+    use xrpl_ledger::shamap::hash::{sha512_half_prefixed, HASH_PREFIX_LEAF_NODE};
+    use xrpl_core::types::Hash256;
+    use sha2::{Sha256, Digest};
+
+    fn make(i: u32, version: u8) -> (Hash256, Hash256) {
+        let h = Sha256::digest(i.to_be_bytes());
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&h);
+        let mut data = vec![version; 100 + (i % 200) as usize];
+        data[0..4].copy_from_slice(&i.to_be_bytes());
+        data.extend_from_slice(&key);
+        (Hash256(key), sha512_half_prefixed(&HASH_PREFIX_LEAF_NODE, &data))
+    }
+
+    // Build tree with 500k entries
+    let mut tree = SHAMap::new(TreeType::State);
+    for i in 0..500_000u32 {
+        let (k, h) = make(i, 0);
+        tree.insert_hash_only(k, h).unwrap();
+    }
+    let h1 = tree.root_hash();
+    eprintln!("500k initial: {}", hex::encode(&h1.0[..8]));
+
+    // Update 200 keys with new data
+    for i in 0..200u32 {
+        let (k, h) = make(i, 1);
+        tree.insert_hash_only(k, h).unwrap();
+    }
+    // Add 5 new keys
+    for i in 500_000..500_005u32 {
+        let (k, h) = make(i, 1);
+        tree.insert_hash_only(k, h).unwrap();
+    }
+    // Delete 3 keys
+    for i in 200..203u32 {
+        let (k, _) = make(i, 0);
+        tree.delete(&k).unwrap();
+    }
+    let h2 = tree.root_hash();
+
+    // Build fresh tree with same final state
+    let mut fresh = SHAMap::new(TreeType::State);
+    for i in 0..200u32 {
+        let (k, h) = make(i, 1); // updated
+        fresh.insert_hash_only(k, h).unwrap();
+    }
+    for i in 203..500_000u32 { // skip deleted 200-202
+        let (k, h) = make(i, 0); // original
+        fresh.insert_hash_only(k, h).unwrap();
+    }
+    for i in 500_000..500_005u32 {
+        let (k, h) = make(i, 1); // new
+        fresh.insert_hash_only(k, h).unwrap();
+    }
+    let h3 = fresh.root_hash();
+
+    eprintln!("500k updated:  {} entries={}", hex::encode(&h2.0[..8]), tree.len());
+    eprintln!("500k fresh:    {} entries={}", hex::encode(&h3.0[..8]), fresh.len());
+    assert_eq!(h2, h3, "500k incremental vs fresh mismatch");
+}
