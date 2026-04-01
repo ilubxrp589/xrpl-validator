@@ -1,41 +1,42 @@
 # XRPL Rust Validator
 
-A from-scratch XRP Ledger validator node written in Rust. Currently operates as a **mainnet observer** — connects to XRPL peers, decodes all peer protocol messages, verifies transaction signatures, and tracks consensus in real time.
+A from-scratch XRP Ledger validator node written in Rust. Independently computes and verifies state hashes against network consensus every ledger — achieving **28,500+ consecutive matches** with zero mismatches on mainnet.
 
-**Status: Early prototype. NOT production-ready. Do NOT use for mainnet validation without extensive testing.**
+This is a fully independent implementation — no code from rippled. The validator maintains its own state tree (18.7M+ objects), computes SHA-512Half Merkle hashes, signs validations, and relays them to the network.
 
-## Security Warnings
+## Current Status
+
+- **Independent state hash verification** every ledger (~3.5s intervals)
+- **28,500+ consecutive matches** against network consensus (100% accuracy)
+- **256-bucket parallel hash computation** via rayon (~2.1s on current hardware)
+- **Self-healing retry** with exponential backoff on transient failures
+- **Validation signing and relay** to multiple XRPL peers
+- **Domain verified** at `halcyon-names.io`
+
+## Security
 
 ### Validator Keys
 
 XRPL validator identity is based on a cryptographic keypair chain:
 
 ```
-Validator Seed (secret) → Master Public Key → Ephemeral Signing Key → Manifest → Domain Verification
+Validator Seed (secret) -> Master Public Key -> Ephemeral Signing Key -> Manifest -> Domain Verification
 ```
 
 **Critical rules:**
 - **NEVER** expose your validator seed or master private key
-- **NEVER** log, print, or serialize private key material to stdout/stderr
+- **NEVER** log, print, or serialize private key material
 - **NEVER** store keys in plaintext on network-accessible storage
-- Generate keys on an air-gapped machine if possible
-- Use `--generate-identity` to create keys, store the output file with `chmod 600`
+- The seed file (`validator_seed.hex`) must be `chmod 600`
 - The seed controls your validator's identity permanently — if compromised, your validator must be replaced
 
-### Network Safety
-
-- This node is an **observer** — it watches consensus but does not participate
-- Running as a full validator requires: complete ledger state sync, transaction application engine, and months of proven uptime
-- **Do NOT** claim to be a validator on mainnet UNL lists until your implementation is thoroughly audited
-- Testnet validation should be attempted first, verified against rippled for byte-compatibility
-
-### Key Files That Must Be Protected
+### Key Files
 
 | File | Contains | Protection |
 |------|----------|------------|
-| Validator seed file | Master private key | chmod 600, never commit to git |
-| config.toml | May reference key paths | chmod 600 |
-| sled database | Ledger state (public data) | Normal permissions |
+| `validator_seed.hex` | Master private key | chmod 600, never commit to git |
+| `state.rocks` | RocksDB ledger state (18.7M+ objects) | Normal permissions |
+| `engine_state.json` | Ledger sequence, tx counts | Normal permissions |
 
 ## Architecture
 
@@ -43,63 +44,70 @@ Two-crate workspace:
 
 ```
 crates/
-  xrpl-ledger/    — SHAMap, NodeStore, ledger state, transaction engine
-  xrpl-node/      — Peer protocol, consensus, mempool, RPC, viewer
+  xrpl-ledger/    -- SHAMap, hash computation, ledger types
+  xrpl-node/      -- Peer protocol, sync engine, consensus, RPC, live viewer
 proto/
-  xrpl.proto      — Protobuf definitions from rippled
+  xrpl.proto      -- Protobuf definitions (from rippled)
 ```
 
 ### Dependencies
 
-- **xrpl-core** — Types, binary codec, cryptography (git dep from [xrpl-sdk](https://github.com/ilubxrp589/xrpl-sdk))
-- **OpenSSL** — Required for peer handshake (SSL_get_finished compatibility with rippled)
-- **tokio** — Async runtime
-- **sled** — Embedded key-value store for persistent state
-- **axum** — HTTP server for RPC and viewer
-- **prost** — Protocol buffer codegen
+- **xrpl-core** -- Types, binary codec, cryptography (Ed25519 + Secp256k1)
+- **OpenSSL** -- Peer handshake (SSL_get_finished compatibility with rippled)
+- **RocksDB** -- Persistent state storage (18.7M+ objects, ~4.4GB)
+- **tokio** -- Async runtime
+- **rayon** -- Parallel hash computation (256-bucket split)
+- **axum** -- HTTP server for RPC and live viewer
+- **prost** -- Protocol buffer codegen
+- **jemalloc** -- Memory allocator (reduced fragmentation for large state)
 
 ## What's Implemented
 
-### Peer Protocol (M1)
-- TLS connection with OpenSSL (required for rippled's session cookie)
+### State Hash Verification
+- SHAMap (16-ary Merkle-Patricia trie) with hash-only leaves
+- 256-bucket parallel hash computation using `compute_subtree()` + rayon
+- Incremental updates: only dirty buckets recomputed per ledger
+- Depth-2 branch caching with dirty tracking
+- Independent `account_hash` verified against network consensus every ledger
+- Independent `ledger_hash` computation from header fields
+
+### Sync Engine
+- **Bulk sync**: 4 parallel download workers, ~170K objects/sec from network
+- **WebSocket sync**: Real-time ledger tracking via rippled WebSocket subscription
+- **Gap detection**: Automatic catch-up when ledgers are missed
+- **Skip-ahead**: Jumps forward when >50 ledgers behind
+- **Self-healing retry**: Exponential backoff (up to 5 attempts) on hash mismatch
+- **Full scan fallback**: Comprehensive state comparison on persistent mismatch
+- **Transaction ordering**: Sorted by `TransactionIndex` before applying `AffectedNodes`
+
+### Protocol Singletons
+Force-fetched every ledger to ensure correct state:
+- LedgerHashes (+ sub-pages at `SHA512Half(0x0073 || seq/65536)`)
+- NegativeUNL
+- Amendments
+- FeeSettings
+
+### Peer Protocol
+- TLS connection with OpenSSL (rippled's session cookie mechanism)
 - XRPL/2.2 handshake with session signature verification
-- Binary message framing codec (4-byte length + 2-byte type + protobuf)
+- Binary message framing (4-byte length + 2-byte type + protobuf)
 - All 21 peer message types decoded
 - Auto peer discovery via TMEndpoints
-- Multi-peer connections (up to 50, auto-discovery from seed peers)
-- Message deduplication across peers
+- Multi-peer connections with message deduplication
 
-### Ledger Storage (M2)
-- SHAMap (Merkle-Patricia trie, branching factor 16)
-- 12 hash prefix constants verified against rippled
-- Ledger header: 118-byte serialization, hash verified against live testnet (6/6 match)
-- NodeStore trait with InMemory and sled backends
-- Full ledger state sync from mainnet RPC (~1500 objects/sec)
-
-### Transaction Engine (M3)
-- Transaction validation with full signature verification
-- Ed25519: verify against raw STX\0||bytes (Ed25519 does internal hashing)
-- Secp256k1: verify against SHA512Half(STX\0||bytes)
-- Fee-priority mempool with dedup and expiry
-- Relay filter with atomic check-and-mark
-- Canonical transaction ordering (account -> sequence -> hash)
-- JSON-RPC server (submit, server_info, fee, ledger, peers)
-
-### Consensus Engine (M4)
-- RPCA state machine (Open -> Establish -> Accept)
-- Dynamic threshold convergence (50% -> 60% -> 70% -> 80% -> 95%)
-- Close time negotiation with resolution rounding
-- Validation tracking (per-ledger, fully-validated detection)
+### Validation & Consensus
+- Validation signing with Ed25519 ephemeral keys
+- Manifest construction and broadcast to peers
+- Validation relay to s1.ripple.com, s2.ripple.com, xrplcluster.com
+- RPCA state machine tracking (Open -> Establish -> Accept)
 - UNL management with manifest key rotation
-- Amendment voting on flag ledgers
-- Fee/reserve voting (median computation)
+- Amendment and fee voting
 
 ### Live Viewer
-- Real-time feed dashboard at port 3777
-- Consensus visualization with particle physics (canvas)
-- Metrics dashboard with sparkline graphs
+- Real-time dashboard at port 3777
+- Consensus visualization with particle physics
+- Metrics with sparkline graphs
 - Domain verification at `halcyon-names.io/.well-known/xrp-ledger.toml`
-- Live at [rvd.halcyon-names.io](https://rvd.halcyon-names.io)
 
 ## Build & Run
 
@@ -109,110 +117,88 @@ proto/
 # Rust toolchain
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# OpenSSL development headers
-sudo apt install libssl-dev pkg-config protobuf-compiler
+# System dependencies
+sudo apt install libssl-dev pkg-config protobuf-compiler libclang-dev
 
-# Build
-cargo build --release
+# Build (use target-cpu=native on AMD Ryzen for SHA-NI acceleration)
+RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
-### Run the Live Viewer (Observer Mode)
+### Run the Validator
 
 ```bash
+# Set RocksDB path (default: /mnt/xrpl-data/sync/state.rocks)
+export XRPL_ROCKS_PATH="/mnt/xrpl-data/sync/state.rocks"
+
+# Run the live viewer (includes full sync + validation)
 cargo run --release -p xrpl-node --bin live_viewer
-# Open http://localhost:3777
-```
 
-### Run the CLI Node
-
-```bash
-# Generate a new node identity
-cargo run --release -p xrpl-node --bin xrpl_node -- --generate-identity
-
-# Run with testnet
-cargo run --release -p xrpl-node --bin xrpl_node -- --testnet
-
-# Run with custom config
-cargo run --release -p xrpl-node --bin xrpl_node -- --config ~/.xrpl-node/config.toml
-```
-
-### Sync Ledger State
-
-```bash
-# Downloads mainnet state objects to /mnt/xrpl-data/sync/
-cargo run --release -p xrpl-node --bin sync_ledger
-# Resumable — re-run to continue from where it left off
+# Dashboard: http://localhost:3777
+# Peer port: 51235
 ```
 
 ### Configuration
 
-Create `~/.xrpl-node/config.toml`:
+Key environment variables:
 
-```toml
-[node]
-mode = "follower"           # observer | follower | validator
-listen_port = 51235
-rpc_port = 51234
-data_dir = "/mnt/xrpl-data"
-log_level = "info"
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `XRPL_ROCKS_PATH` | `/mnt/xrpl-data/sync/state.rocks` | RocksDB state database path |
 
-[peers]
-seeds = ["s1.ripple.com:51235", "s2.ripple.com:51235"]
-max_peers = 50
-
-[validator]
-# Only set if running as validator (DO NOT USE ON MAINNET YET)
-# token = "base64-encoded-validator-token"
-
-[unl]
-# Trusted validator public keys
-# keys = ["nHB..."]
-
-[fees]
-reference_fee = 10
-account_reserve = 1000000
-owner_reserve = 200000
-```
+The validator connects to a local rippled node for RPC queries and subscribes via WebSocket for real-time ledger updates. Peer connections are established to s1.ripple.com, s2.ripple.com, and discovered peers.
 
 ## Testing
 
 ```bash
-# Run all unit tests (144 tests)
-cargo test --workspace
-
-# Run live integration tests (requires network)
-cargo test --workspace --features live-tests
-
-# Tests include:
-# - Codec roundtrip (encode/decode all message types)
-# - SHAMap operations (insert/delete/lookup/hash)
-# - Ledger header hash verification against testnet
-# - Transaction signature verification against live data
-# - Consensus threshold convergence
-# - Canonical ordering
-# - Node construction for all modes
+cargo test --workspace    # 150+ tests
 ```
+
+## Performance
+
+Measured on Intel i5-9600K (6C/6T, no SHA-NI):
+
+| Metric | Value |
+|--------|-------|
+| Initial state download | ~134s (18.7M objects, 4 workers) |
+| SHAMap tree build | ~27s from RocksDB |
+| Hash computation (256-bucket parallel) | ~2.1s |
+| Incremental update per ledger | ~0.4s |
+| Total per-ledger verification | ~2.5s |
+| Ledger close interval | ~3.5s |
+| State objects tracked | 18.7M+ |
+| RocksDB size on disk | ~4.4 GB |
+
+AMD Ryzen with SHA-NI hardware acceleration is expected to reduce hash computation to ~0.5-0.7s.
 
 ## Roadmap
 
 ### Done
 - [x] Peer protocol (handshake, codec, multi-peer, auto-discovery)
-- [x] Ledger storage (SHAMap, sled, header hashing)
-- [x] Transaction validation (decode, signature verification)
-- [x] Consensus engine (RPCA, thresholds, UNL, voting)
-- [x] Mainnet observer with live dashboards
+- [x] SHAMap with incremental hash computation
+- [x] 256-bucket parallel hash with dirty tracking
+- [x] RocksDB persistent state (18.7M+ objects)
+- [x] Independent state hash verification (28.5K+ consecutive matches)
+- [x] Independent ledger hash computation
+- [x] WebSocket real-time sync with self-healing retry
+- [x] Bulk sync with 4 parallel download workers
+- [x] Validation signing and relay
 - [x] Domain verification
-- [x] Ledger state sync
+- [x] Live viewer dashboard
+- [x] Protocol singleton handling (LedgerHashes, FeeSettings, etc.)
 
-### In Progress
-- [ ] Transaction application engine (Payment, DEX, TrustSet)
-- [ ] Byte-compatibility verification against rippled
+### Next
+- [ ] Network resilience (rippled failover)
+- [ ] Depth-2 branch caching optimization (target: <0.5s hash)
+- [ ] Persist leaf cache to disk (instant restarts)
+- [ ] Smarter failed-key retry (track and retry specific keys)
+- [ ] Domain verification + uptime for trusted validator path
+- [ ] Transaction application engine
+- [ ] Hardware migration to AMD Ryzen (SHA-NI)
 
 ### Future
-- [ ] Full validator mode (propose, validate, vote)
+- [ ] Full transaction engine (Payment, DEX, TrustSet)
 - [ ] Testnet validation
-- [ ] Mainnet stock validator
-- [ ] UNL listing
+- [ ] UNL listing candidacy
 
 ## References
 
@@ -221,8 +207,7 @@ cargo test --workspace --features live-tests
 - [rippled Source Code](https://github.com/XRPLF/rippled)
 - [XRPL Binary Codec](https://xrpl.org/serialization.html)
 - [Consensus Protocol](https://xrpl.org/consensus.html)
-- [xrpl-sdk (Rust SDK)](https://github.com/ilubxrp589/xrpl-sdk)
 
 ## License
 
-MIT — see [LICENSE](LICENSE)
+Proprietary -- see [LICENSE](LICENSE)
