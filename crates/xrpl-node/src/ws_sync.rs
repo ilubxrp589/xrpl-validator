@@ -49,6 +49,8 @@ pub async fn start_ws_sync(
         }
         eprintln!("[ws-sync] Connected + subscribed");
 
+        // Flat cache builds from RocksDB on first call — no invalidation needed.
+
         // Accumulate tx metadata per ledger
         let mut acc_seq: u32 = 0;
         let mut acc_modified: HashSet<String> = HashSet::new();
@@ -91,17 +93,20 @@ pub async fn start_ws_sync(
                 // Fill gap from last_processed+1 to closed_seq
                 let mut start_seq = if last_processed > 0 { last_processed + 1 } else { last_synced.load(Ordering::Relaxed) + 1 };
 
-                // If too far behind, skip ahead — old ledgers get pruned by rippled
-                if closed_seq > start_seq + 50 {
-                    eprintln!("[ws-sync] {} ledgers behind — skipping to #{} (rebuilding leaf cache)",
-                        closed_seq - start_seq, closed_seq);
-                    start_seq = closed_seq;
-                    // Clear leaf cache so it rebuilds from current RocksDB state
-                    hash_comp.leaf_cache.lock().clear();
+                // If behind, skip to current. DON'T invalidate the tree — it's correct.
+                // Gap ledgers are processed via fast path (tree update, no hash check).
+                // Only the final ledger gets a hash check.
+                if closed_seq > start_seq + 1 {
+                    let gap = closed_seq - start_seq;
+                    eprintln!("[ws-sync] {gap} ledgers behind — processing gap via fast path");
                 }
 
                 for process_seq in start_seq..=closed_seq {
-                    let account_hash = fetch_account_hash(&rpc, process_seq).await.unwrap_or_default();
+                    let account_hash = if process_seq == closed_seq {
+                        fetch_account_hash(&rpc, process_seq).await.unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
 
                     acc_modified.clear();
                     acc_deleted.clear();
@@ -154,7 +159,8 @@ pub async fn start_ws_sync(
                         acc_modified.remove(&d);
                     }
 
-                    let compute_hash = true;
+                    // Only hash-check the last ledger in the batch — gap ledgers use fast path
+                    let compute_hash = process_seq == closed_seq;
                     let result = process_ledger(
                         &rpc, &db, &hash_comp,
                         process_seq, &acc_modified, &acc_deleted,
@@ -300,10 +306,8 @@ async fn process_ledger(
     }
 
     if failed > 0 {
-        eprintln!("[ws-sync] Ledger #{seq}: {failed} failures — applying {}/{} objects anyway",
-            fetched_data.len(), fetched_data.len() + failed as usize);
-        // Don't skip — write what we got. Failed keys will get corrected on future rounds
-        // when those objects are modified again.
+        eprintln!("[ws-sync] Ledger #{seq}: {failed} failures — invalidating tree for rebuild");
+        hash_comp.invalidate_tree();
     }
 
     // Atomic write to RocksDB
@@ -336,7 +340,7 @@ async fn process_ledger(
     }
 
     if compute_hash {
-        // Full hash computation (~2.8s) — run on blocking thread pool to keep SSE/peers responsive
+        // Run on blocking thread pool — keeps SSE feed + peers responsive during 2.5s hash
         let hc = hash_comp.clone();
         let d = db.clone();
         let hash_result = tokio::task::spawn_blocking(move || {
@@ -406,11 +410,10 @@ async fn process_ledger(
                         if !retry_ok || retry_keys.is_empty() { continue; }
                         let _ = db.write(retry_batch);
 
-                        // Recompute hash with fresh data (on blocking thread)
+                        // Recompute hash with fresh data
                         let hc2 = hash_comp.clone(); let d2 = db.clone();
-                        let rk = retry_keys;
                         let root2 = tokio::task::spawn_blocking(move || {
-                            hc2.update_and_hash(&d2, &rk)
+                            hc2.update_and_hash(&d2, &retry_keys)
                         }).await.ok().flatten();
                         if let Some(root2) = root2 {
                             let ours2 = hex::encode(root2.0);
@@ -496,51 +499,35 @@ async fn process_ledger(
             }
         }
     } else {
-        // Fast path: single-pass merge into leaf cache + mark dirty branches
+        // Fast path: update flat cache via merge (no hash computation)
         use xrpl_ledger::shamap::hash::{sha512_half_prefixed, HASH_PREFIX_LEAF_NODE};
         use xrpl_ledger::shamap::node::nibble_at;
         let mut cache = hash_comp.leaf_cache.lock();
         if !cache.is_empty() {
-            let mut dirty: u16 = 0;
             let mut updates: Vec<(Hash256, Option<Hash256>)> = Vec::with_capacity(keys.len());
             for key in &keys {
-                dirty |= 1 << (nibble_at(key, 0) as u16);
                 match db.get(&key.0) {
                     Ok(Some(data)) => {
                         let mut buf = Vec::with_capacity(data.len() + 32);
                         buf.extend_from_slice(&data);
                         buf.extend_from_slice(&key.0);
-                        let lh = sha512_half_prefixed(&HASH_PREFIX_LEAF_NODE, &buf);
-                        updates.push((*key, Some(lh)));
+                        updates.push((*key, Some(sha512_half_prefixed(&HASH_PREFIX_LEAF_NODE, &buf))));
                     }
-                    Ok(None) => { updates.push((*key, None)); }
+                    Ok(None) => updates.push((*key, None)),
                     Err(_) => {}
                 }
             }
             updates.sort_unstable_by(|a, b| a.0 .0.cmp(&b.0 .0));
-
-            let mut new_cache = Vec::with_capacity(cache.len() + updates.len());
-            let (mut ci, mut ui) = (0usize, 0usize);
+            let mut nc = Vec::with_capacity(cache.len() + updates.len());
+            let (mut ci, mut ui) = (0, 0);
             while ci < cache.len() || ui < updates.len() {
-                if ui >= updates.len() {
-                    new_cache.extend_from_slice(&cache[ci..]);
-                    break;
-                } else if ci >= cache.len() {
-                    for u in &updates[ui..] { if let Some(h) = u.1 { new_cache.push((u.0, h)); } }
-                    break;
-                } else if cache[ci].0 .0 < updates[ui].0 .0 {
-                    new_cache.push(cache[ci]); ci += 1;
-                } else if cache[ci].0 .0 > updates[ui].0 .0 {
-                    if let Some(h) = updates[ui].1 { new_cache.push((updates[ui].0, h)); } ui += 1;
-                } else {
-                    if let Some(h) = updates[ui].1 { new_cache.push((updates[ui].0, h)); }
-                    ci += 1; ui += 1;
-                }
+                if ui >= updates.len() { nc.extend_from_slice(&cache[ci..]); break; }
+                else if ci >= cache.len() { for u in &updates[ui..] { if let Some(h) = u.1 { nc.push((u.0, h)); } } break; }
+                else if cache[ci].0 .0 < updates[ui].0 .0 { nc.push(cache[ci]); ci += 1; }
+                else if cache[ci].0 .0 > updates[ui].0 .0 { if let Some(h) = updates[ui].1 { nc.push((updates[ui].0, h)); } ui += 1; }
+                else { if let Some(h) = updates[ui].1 { nc.push((updates[ui].0, h)); } ci += 1; ui += 1; }
             }
-            *cache = new_cache;
-
-            let mut db_dirty = hash_comp.dirty_branches.lock();
-            *db_dirty |= dirty;
+            *cache = nc;
         }
         eprintln!("[ws-sync] #{seq}: synced ({tx_count} txs, {} objs)", fetched_data.len());
     }

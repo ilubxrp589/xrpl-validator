@@ -136,11 +136,23 @@ impl InnerNode {
     /// Compute the hash of this inner node.
     /// Caches the result via interior mutability for O(1) subsequent calls.
     ///
-    /// `SHA512Half(HASH_PREFIX_INNER_NODE || h0 || h1 || ... || h15)`
-    /// where each `h_i` is the child's hash or 32 zero bytes.
+    /// Special case: if this node has exactly one child and it's a leaf,
+    /// return the leaf hash directly (no inner node wrapping). This matches
+    /// rippled's SHAMap behavior where single-leaf subtrees are collapsed.
     pub fn hash(&self) -> Hash256 {
         if let Some(h) = self.cached_hash.get() {
             return h;
+        }
+
+        // Single-leaf collapse: if exactly 1 child and it's a leaf, return leaf hash.
+        if self.child_count() == 1 {
+            if let Some(idx) = self.only_child_index() {
+                if let Some(SHAMapNode::Leaf(ref leaf)) = self.children[idx as usize] {
+                    let h = leaf.hash();
+                    self.cached_hash.set(Some(h));
+                    return h;
+                }
+            }
         }
 
         let mut data = [0u8; 16 * 32];

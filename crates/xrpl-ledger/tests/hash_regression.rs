@@ -455,3 +455,138 @@ fn tree_vs_rebuild_after_update_500k() {
     eprintln!("500k fresh:    {} entries={}", hex::encode(&h3.0[..8]), fresh.len());
     assert_eq!(h2, h3, "500k incremental vs fresh mismatch");
 }
+
+#[test]
+fn insertion_order_independence() {
+    use xrpl_ledger::shamap::tree::{SHAMap, TreeType};
+    use xrpl_ledger::shamap::hash::{sha512_half_prefixed, HASH_PREFIX_LEAF_NODE};
+    use xrpl_core::types::Hash256;
+    use sha2::{Sha256, Digest};
+
+    fn make(i: u32) -> (Hash256, Hash256) {
+        let h = Sha256::digest(i.to_be_bytes());
+        let mut key = [0u8; 32]; key.copy_from_slice(&h);
+        let mut data = vec![0u8; 100]; data[0..4].copy_from_slice(&i.to_be_bytes());
+        data.extend_from_slice(&key);
+        (Hash256(key), sha512_half_prefixed(&HASH_PREFIX_LEAF_NODE, &data))
+    }
+
+    // Build tree in order 0..1000
+    let mut t1 = SHAMap::new(TreeType::State);
+    for i in 0..1000u32 { let (k,h) = make(i); t1.insert_hash_only(k,h).unwrap(); }
+
+    // Build tree in reverse order
+    let mut t2 = SHAMap::new(TreeType::State);
+    for i in (0..1000u32).rev() { let (k,h) = make(i); t2.insert_hash_only(k,h).unwrap(); }
+
+    // Build tree in random-ish order
+    let mut t3 = SHAMap::new(TreeType::State);
+    let order: Vec<u32> = (0..1000).map(|i| (i * 7 + 13) % 1000).collect();
+    for i in order { let (k,h) = make(i); t3.insert_hash_only(k,h).unwrap(); }
+
+    let h1 = t1.root_hash();
+    let h2 = t2.root_hash();
+    let h3 = t3.root_hash();
+    eprintln!("Forward:  {}", hex::encode(&h1.0[..8]));
+    eprintln!("Reverse:  {}", hex::encode(&h2.0[..8]));
+    eprintln!("Shuffled: {}", hex::encode(&h3.0[..8]));
+    assert_eq!(h1, h2, "forward vs reverse");
+    assert_eq!(h1, h3, "forward vs shuffled");
+}
+
+#[test]
+fn tree_30_sequential_updates() {
+    use xrpl_ledger::shamap::tree::{SHAMap, TreeType};
+    use xrpl_ledger::shamap::hash::{sha512_half_prefixed, HASH_PREFIX_LEAF_NODE, HASH_PREFIX_INNER_NODE};
+    use xrpl_ledger::shamap::node::{ZERO_HASH, nibble_at};
+    use xrpl_core::types::Hash256;
+    use sha2::{Sha256, Digest};
+
+    fn compute_subtree(entries: &[(Hash256, Hash256)], depth: usize) -> Hash256 {
+        if entries.is_empty() { return ZERO_HASH; }
+        if entries.len() == 1 { return entries[0].1; }
+        let mut child_hashes = [ZERO_HASH; 16];
+        let mut pos = 0;
+        for nibble in 0..16u8 {
+            let end = entries[pos..].partition_point(|&(key, _)| nibble_at(&key, depth) <= nibble) + pos;
+            let bucket_start = entries[pos..end].partition_point(|&(key, _)| nibble_at(&key, depth) < nibble) + pos;
+            if bucket_start < end { child_hashes[nibble as usize] = compute_subtree(&entries[bucket_start..end], depth + 1); }
+            pos = end;
+        }
+        let mut data = [0u8; 16 * 32];
+        for (i, h) in child_hashes.iter().enumerate() { data[i*32..(i+1)*32].copy_from_slice(&h.0); }
+        sha512_half_prefixed(&HASH_PREFIX_INNER_NODE, &data)
+    }
+
+    fn make(i: u32, v: u32) -> (Hash256, Hash256) {
+        let h = Sha256::digest(i.to_be_bytes());
+        let mut key = [0u8; 32]; key.copy_from_slice(&h);
+        let mut data = vec![v as u8; 50 + (i % 150) as usize];
+        data[0..4].copy_from_slice(&v.to_be_bytes());
+        data.extend_from_slice(&key);
+        (Hash256(key), sha512_half_prefixed(&HASH_PREFIX_LEAF_NODE, &data))
+    }
+
+    // Build with 100k entries (larger than previous tests)
+    let n = 100_000u32;
+    let mut tree = SHAMap::new(TreeType::State);
+    let mut flat: Vec<(Hash256, Hash256)> = Vec::new();
+    for i in 0..n {
+        let (k, h) = make(i, 0);
+        tree.insert_hash_only(k, h).unwrap();
+        flat.push((k, h));
+    }
+    flat.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+
+    // Verify initial
+    assert_eq!(compute_subtree(&flat, 0), tree.root_hash(), "initial mismatch");
+
+    // Apply 30 "rounds" of updates — like 30 ledgers
+    for round in 1..=30u32 {
+        let base = round * 200; // different keys each round
+        let mut updates = Vec::new();
+
+        // Update 100 existing keys
+        for i in 0..100u32 {
+            let idx = (base + i) % n;
+            let (k, h) = make(idx, round);
+            tree.insert_hash_only(k, h).unwrap();
+            updates.push((k, Some(h)));
+        }
+        // Insert 20 new keys
+        for i in 0..20u32 {
+            let (k, h) = make(n + round * 20 + i, round);
+            tree.insert_hash_only(k, h).unwrap();
+            updates.push((k, Some(h)));
+        }
+        // Delete 10 keys
+        for i in 0..10u32 {
+            let idx = (base + 100 + i) % n;
+            let (k, _) = make(idx, 0);
+            let _ = tree.delete(&k);
+            updates.push((k, None));
+        }
+
+        // Apply same updates to flat array
+        updates.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+        let mut new_flat = Vec::with_capacity(flat.len() + updates.len());
+        let (mut ci, mut ui) = (0, 0);
+        while ci < flat.len() || ui < updates.len() {
+            if ui >= updates.len() { new_flat.extend_from_slice(&flat[ci..]); break; }
+            else if ci >= flat.len() { for u in &updates[ui..] { if let Some(h) = u.1 { new_flat.push((u.0, h)); } } break; }
+            else if flat[ci].0.0 < updates[ui].0.0 { new_flat.push(flat[ci]); ci += 1; }
+            else if flat[ci].0.0 > updates[ui].0.0 { if let Some(h) = updates[ui].1 { new_flat.push((updates[ui].0, h)); } ui += 1; }
+            else { if let Some(h) = updates[ui].1 { new_flat.push((updates[ui].0, h)); } ci += 1; ui += 1; }
+        }
+        flat = new_flat;
+
+        let fh = compute_subtree(&flat, 0);
+        let th = tree.root_hash();
+        if fh != th {
+            eprintln!("DIVERGENCE at round {round}: flat={} tree={} flat_len={} tree_len={}",
+                hex::encode(&fh.0[..8]), hex::encode(&th.0[..8]), flat.len(), tree.len());
+            assert_eq!(fh, th, "round {round} mismatch");
+        }
+    }
+    eprintln!("All 30 rounds matched! Final: {} entries", flat.len());
+}

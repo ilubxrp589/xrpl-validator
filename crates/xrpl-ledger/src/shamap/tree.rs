@@ -229,12 +229,27 @@ fn delete_from_mut(
                 }
             }
 
-            // Collapse: if only one child remains and it's a leaf, promote it
-            if inner.child_count() == 1 {
-                if let Some(only_idx) = inner.only_child_index() {
-                    if matches!(inner.get_child_node(only_idx), Some(SHAMapNode::Leaf(_))) {
-                        let promoted = inner.take_child_node(only_idx).unwrap();
-                        *node = promoted;
+            // Recursive structural collapse: if this inner node has exactly 1 child,
+            // and walking down single-child inners leads to a leaf, promote
+            // that leaf all the way up to this position.
+            // Prevents inner→inner→...→leaf chains from forming after multiple deletes.
+            fn find_sole_leaf(n: &SHAMapNode) -> Option<(Hash256, Hash256)> {
+                match n {
+                    SHAMapNode::Leaf(l) => Some((*l.key(), l.hash())),
+                    SHAMapNode::Inner(i) => {
+                        if i.child_count() == 1 {
+                            if let Some(idx) = i.only_child_index() {
+                                return find_sole_leaf(i.get_child_node(idx).unwrap());
+                            }
+                        }
+                        None // 0 or 2+ children
+                    }
+                }
+            }
+            if let SHAMapNode::Inner(ref i) = node {
+                if i.child_count() == 1 {
+                    if let Some((key, hash)) = find_sole_leaf(node) {
+                        *node = SHAMapNode::Leaf(LeafNode::new_hash_only(key, hash));
                     }
                 }
             }
