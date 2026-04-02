@@ -449,6 +449,25 @@ async fn main() {
     // State hash: first do a targeted re-sync of corrupted entries, then build SHAMap
     let bulk_syncer = Arc::new(xrpl_node::bulk_sync::BulkSyncer::new());
     let state_hash_computer = Arc::new(xrpl_node::state_hash::StateHashComputer::new());
+    // Set cache path next to the RocksDB for instant restarts
+    {
+        let cache_dir = std::path::Path::new(&rocks_db_path).parent().unwrap_or(std::path::Path::new("."));
+        state_hash_computer.set_cache_path(cache_dir.join("leaf_cache.bin"));
+    }
+    // Save cache on SIGTERM for instant restart (works with nohup/background)
+    {
+        let shc = state_hash_computer.clone();
+        tokio::spawn(async move {
+            let mut sigterm = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::terminate()
+            ).expect("failed to register SIGTERM handler");
+            sigterm.recv().await;
+            eprintln!("[shutdown] SIGTERM received — saving leaf cache...");
+            shc.save_cache();
+            eprintln!("[shutdown] Cache saved. Exiting.");
+            std::process::exit(0);
+        });
+    }
     let incremental_syncer = Arc::new(xrpl_node::incremental_sync::IncrementalSyncer::new());
     {
         let engine_guard = live_engine.lock();

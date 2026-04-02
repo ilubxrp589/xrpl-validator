@@ -4,6 +4,7 @@
 //! Only dirty buckets are recomputed each round via rayon parallelism.
 //! Proven correct: same compute_subtree algorithm as the 28k-match run.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -178,6 +179,70 @@ impl FlatHasher {
         }
         sha512_half_prefixed(&HASH_PREFIX_INNER_NODE, &root_data)
     }
+
+    /// Save cache to disk as raw binary. Atomic: writes .tmp then renames.
+    /// Format: "XRPLCACH" + version(u32) + count(u64) + entries(key[32] + hash[32])
+    fn save(&self, path: &Path) -> std::io::Result<()> {
+        use std::io::{BufWriter, Write};
+        let temp = path.with_extension("tmp");
+        let f = std::fs::File::create(&temp)?;
+        let mut w = BufWriter::with_capacity(8 * 1024 * 1024, f);
+        w.write_all(b"XRPLCACH")?;
+        w.write_all(&1u32.to_le_bytes())?;
+        w.write_all(&(self.total as u64).to_le_bytes())?;
+        for bucket in &self.buckets {
+            for (key, hash) in bucket {
+                w.write_all(&key.0)?;
+                w.write_all(&hash.0)?;
+            }
+        }
+        w.flush()?;
+        drop(w);
+        std::fs::rename(&temp, path)?;
+        Ok(())
+    }
+
+    /// Load cache from disk. Returns None if file missing, corrupt, or wrong version.
+    fn load(path: &Path) -> Option<Self> {
+        let start = std::time::Instant::now();
+        let data = std::fs::read(path).ok()?;
+        if data.len() < 20 { return None; }
+        if &data[..8] != b"XRPLCACH" { return None; }
+        let ver = u32::from_le_bytes(data[8..12].try_into().ok()?);
+        if ver != 1 { return None; }
+        let count = u64::from_le_bytes(data[12..20].try_into().ok()?) as usize;
+        if data.len() != 20 + count * 64 {
+            eprintln!("[state-hash] Cache file size mismatch: expected {} bytes, got {}", 20 + count * 64, data.len());
+            return None;
+        }
+
+        let mut buckets: Vec<Vec<(Hash256, Hash256)>> = (0..256).map(|_| Vec::with_capacity(count / 256 + 1)).collect();
+        let entries = &data[20..];
+        for i in 0..count {
+            let off = i * 64;
+            let mut key = [0u8; 32];
+            let mut hash = [0u8; 32];
+            key.copy_from_slice(&entries[off..off + 32]);
+            hash.copy_from_slice(&entries[off + 32..off + 64]);
+            buckets[key[0] as usize].push((Hash256(key), Hash256(hash)));
+        }
+
+        let read_time = start.elapsed().as_secs_f64();
+
+        // Compute bucket hashes in parallel
+        let hashes: Vec<Hash256> = buckets.par_iter()
+            .map(|b| compute_subtree(b, 2))
+            .collect();
+        let mut bucket_hashes = [ZERO_HASH; 256];
+        for (i, h) in hashes.into_iter().enumerate() {
+            bucket_hashes[i] = h;
+        }
+
+        let total_time = start.elapsed().as_secs_f64();
+        eprintln!("[state-hash] Cache loaded: {count} entries in {total_time:.1}s (read={read_time:.1}s hash={:.1}s)",
+            total_time - read_time);
+        Some(Self { buckets, bucket_hashes, dirty: [false; 256], total: count })
+    }
 }
 
 // ---- StateHashComputer ----
@@ -191,6 +256,8 @@ pub struct StateHashComputer {
     consecutive_matches: Arc<AtomicU32>,
     /// Flat 256-bucket hasher — the hot path for hash computation.
     hasher: Arc<Mutex<Option<FlatHasher>>>,
+    /// Path for persisting the leaf cache to disk.
+    cache_path: Mutex<Option<PathBuf>>,
     // Legacy fields kept for API compat (unused in hot path)
     pub leaf_cache: Arc<Mutex<Vec<(Hash256, Hash256)>>>,
     pub dirty_branches: Arc<Mutex<u16>>,
@@ -205,8 +272,27 @@ impl StateHashComputer {
             entries_processed: Arc::new(AtomicU64::new(0)),
             consecutive_matches: Arc::new(AtomicU32::new(0)),
             hasher: Arc::new(Mutex::new(None)),
+            cache_path: Mutex::new(None),
             leaf_cache: Arc::new(Mutex::new(Vec::new())),
             dirty_branches: Arc::new(Mutex::new(0xFFFF)),
+        }
+    }
+
+    /// Set the path for persisting the leaf cache.
+    pub fn set_cache_path(&self, path: PathBuf) {
+        *self.cache_path.lock() = Some(path);
+    }
+
+    /// Save the current cache to disk (call periodically or on shutdown).
+    pub fn save_cache(&self) {
+        let path = self.cache_path.lock().clone();
+        if let Some(ref path) = path {
+            if let Some(ref h) = *self.hasher.lock() {
+                match h.save(path) {
+                    Ok(()) => eprintln!("[state-hash] Cache saved: {} entries to {}", h.total, path.display()),
+                    Err(e) => eprintln!("[state-hash] Cache save failed: {e}"),
+                }
+            }
         }
     }
 
@@ -358,6 +444,21 @@ impl StateHashComputer {
                 if n <= 5 || n % 100 == 0 {
                     eprintln!("[state-hash] MATCH #{n}! Our hash matches network for ledger #{ledger_seq}");
                 }
+                // Auto-save cache every 500 matches
+                if n % 500 == 0 && n > 0 {
+                    let hasher = self.hasher.clone();
+                    let path = self.cache_path.lock().clone();
+                    if let Some(path) = path {
+                        std::thread::spawn(move || {
+                            if let Some(ref h) = *hasher.lock() {
+                                match h.save(&path) {
+                                    Ok(()) => eprintln!("[state-hash] Auto-saved cache: {} entries", h.total),
+                                    Err(e) => eprintln!("[state-hash] Auto-save failed: {e}"),
+                                }
+                            }
+                        });
+                    }
+                }
             } else {
                 self.consecutive_matches.store(0, Ordering::Relaxed);
                 s.consecutive_matches = 0;
@@ -407,12 +508,21 @@ impl StateHashComputer {
         let start = std::time::Instant::now();
         let mut guard = self.hasher.lock();
 
-        // Lazy build from RocksDB
+        // Lazy build — try disk cache first, then RocksDB scan
         if guard.is_none() {
-            eprintln!("[state-hash] Building 256-bucket hasher from RocksDB...");
-            let h = FlatHasher::build_from_db(db);
-            eprintln!("[state-hash] Hasher built: {} entries in {:.1}s", h.total, start.elapsed().as_secs_f64());
-            *guard = Some(h);
+            let loaded = self.cache_path.lock().as_ref().and_then(|p| {
+                eprintln!("[state-hash] Trying disk cache: {}", p.display());
+                FlatHasher::load(p)
+            });
+            if let Some(h) = loaded {
+                eprintln!("[state-hash] Loaded from disk: {} entries in {:.1}s", h.total, start.elapsed().as_secs_f64());
+                *guard = Some(h);
+            } else {
+                eprintln!("[state-hash] Building 256-bucket hasher from RocksDB...");
+                let h = FlatHasher::build_from_db(db);
+                eprintln!("[state-hash] Hasher built: {} entries in {:.1}s", h.total, start.elapsed().as_secs_f64());
+                *guard = Some(h);
+            }
         }
 
         let hasher = guard.as_mut().unwrap();
