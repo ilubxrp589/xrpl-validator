@@ -558,6 +558,8 @@ impl StateHashComputer {
             let loaded = self.cache_path.lock().as_ref().and_then(|p| {
                 eprintln!("[state-hash] Trying disk cache: {}", p.display());
                 let h = FlatHasher::load(p)?;
+                // Reject if cache is more than ~30 ledgers behind RocksDB (~2 min)
+                // This prevents stale cache from triggering full scan loops on restart
                 // Reject cache if RocksDB is empty or counts differ by >5%
                 if db_count < 1_000_000 {
                     eprintln!("[state-hash] RocksDB only has ~{db_count} entries — cache stale, rebuilding");
@@ -617,7 +619,11 @@ impl StateHashComputer {
     pub fn invalidate_tree(&self) {
         *self.hasher.lock() = None;
         *self.shamap.lock() = None;
-        eprintln!("[state-hash] Hasher cleared — will rebuild from RocksDB");
+        // Delete disk cache to prevent stale load on next restart
+        if let Some(ref path) = *self.cache_path.lock() {
+            let _ = std::fs::remove_file(path);
+        }
+        eprintln!("[state-hash] Hasher + cache cleared — will rebuild from RocksDB");
     }
 
     /// Full rebuild from RocksDB (used by inc-sync backfill).

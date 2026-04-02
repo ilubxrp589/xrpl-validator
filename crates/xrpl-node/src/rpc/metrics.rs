@@ -1,9 +1,12 @@
-//! Prometheus-compatible metrics endpoint.
+//! Prometheus-compatible metrics endpoint for XRPL Rust Validator.
+//!
+//! Renders metrics in Prometheus text exposition format (text/plain).
+//! No external crate dependency — hand-rendered for minimal footprint.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-/// Node metrics for monitoring.
+/// Node-level metrics counters.
 pub struct NodeMetrics {
     pub start_time: Instant,
     pub messages_received: AtomicU64,
@@ -34,41 +37,96 @@ impl Default for NodeMetrics {
     }
 }
 
-/// Render metrics in Prometheus text exposition format.
-pub fn render_metrics(
-    metrics: &NodeMetrics,
-    peer_count: usize,
-    mempool_size: usize,
-    latest_ledger: u32,
-) -> String {
-    let uptime = metrics.start_time.elapsed().as_secs();
-    let received = metrics.messages_received.load(Ordering::Relaxed);
-    let sent = metrics.messages_sent.load(Ordering::Relaxed);
+/// Snapshot of all validator metrics for Prometheus rendering.
+pub struct ValidatorMetricsSnapshot {
+    pub uptime_secs: u64,
+    pub peer_count: usize,
+    pub ledger_seq: u32,
+    pub messages_received: u64,
+    pub messages_sent: u64,
+    pub consecutive_matches: u32,
+    pub total_matches: u64,
+    pub total_mismatches: u64,
+    pub round_time_secs: f64,
+    pub compute_time_secs: f64,
+    pub state_objects: u64,
+    pub ready_to_sign: bool,
+    pub total_txs: u64,
+}
+
+/// Render full validator metrics in Prometheus text exposition format.
+pub fn render_prometheus(snap: &ValidatorMetricsSnapshot) -> String {
+    let ready = if snap.ready_to_sign { 1 } else { 0 };
 
     format!(
-        "# HELP xrpl_node_uptime_seconds Node uptime in seconds\n\
-         # TYPE xrpl_node_uptime_seconds gauge\n\
-         xrpl_node_uptime_seconds {uptime}\n\
+        "# HELP xrpl_validator_uptime_seconds Seconds since validator process started\n\
+         # TYPE xrpl_validator_uptime_seconds gauge\n\
+         xrpl_validator_uptime_seconds {}\n\
          \n\
-         # HELP xrpl_node_peers_connected Current number of connected peers\n\
-         # TYPE xrpl_node_peers_connected gauge\n\
-         xrpl_node_peers_connected {peer_count}\n\
+         # HELP xrpl_validator_ledger_sequence Latest validated ledger sequence\n\
+         # TYPE xrpl_validator_ledger_sequence gauge\n\
+         xrpl_validator_ledger_sequence {}\n\
          \n\
-         # HELP xrpl_node_mempool_size Transactions in mempool\n\
-         # TYPE xrpl_node_mempool_size gauge\n\
-         xrpl_node_mempool_size {mempool_size}\n\
+         # HELP xrpl_validator_consecutive_matches Current consecutive state hash match streak\n\
+         # TYPE xrpl_validator_consecutive_matches gauge\n\
+         xrpl_validator_consecutive_matches {}\n\
          \n\
-         # HELP xrpl_node_ledger_sequence Latest validated ledger sequence\n\
-         # TYPE xrpl_node_ledger_sequence gauge\n\
-         xrpl_node_ledger_sequence {latest_ledger}\n\
+         # HELP xrpl_validator_total_matches Total state hash matches since startup\n\
+         # TYPE xrpl_validator_total_matches counter\n\
+         xrpl_validator_total_matches {}\n\
          \n\
-         # HELP xrpl_node_messages_received_total Total messages received from peers\n\
-         # TYPE xrpl_node_messages_received_total counter\n\
-         xrpl_node_messages_received_total {received}\n\
+         # HELP xrpl_validator_total_mismatches Total state hash mismatches since startup\n\
+         # TYPE xrpl_validator_total_mismatches counter\n\
+         xrpl_validator_total_mismatches {}\n\
          \n\
-         # HELP xrpl_node_messages_sent_total Total messages sent to peers\n\
-         # TYPE xrpl_node_messages_sent_total counter\n\
-         xrpl_node_messages_sent_total {sent}\n"
+         # HELP xrpl_validator_round_time_seconds Time for most recent ledger round\n\
+         # TYPE xrpl_validator_round_time_seconds gauge\n\
+         xrpl_validator_round_time_seconds {:.6}\n\
+         \n\
+         # HELP xrpl_validator_compute_time_seconds Hash computation time for most recent round\n\
+         # TYPE xrpl_validator_compute_time_seconds gauge\n\
+         xrpl_validator_compute_time_seconds {:.6}\n\
+         \n\
+         # HELP xrpl_validator_peers_connected Currently connected XRPL peers\n\
+         # TYPE xrpl_validator_peers_connected gauge\n\
+         xrpl_validator_peers_connected {}\n\
+         \n\
+         # HELP xrpl_validator_state_objects Total state objects in SHAMap\n\
+         # TYPE xrpl_validator_state_objects gauge\n\
+         xrpl_validator_state_objects {}\n\
+         \n\
+         # HELP xrpl_validator_ready_to_sign Whether validator is signing with own hash\n\
+         # TYPE xrpl_validator_ready_to_sign gauge\n\
+         xrpl_validator_ready_to_sign {}\n\
+         \n\
+         # HELP xrpl_validator_messages_received_total Total peer messages received\n\
+         # TYPE xrpl_validator_messages_received_total counter\n\
+         xrpl_validator_messages_received_total {}\n\
+         \n\
+         # HELP xrpl_validator_messages_sent_total Total peer messages sent\n\
+         # TYPE xrpl_validator_messages_sent_total counter\n\
+         xrpl_validator_messages_sent_total {}\n\
+         \n\
+         # HELP xrpl_validator_transactions_total Total transactions processed\n\
+         # TYPE xrpl_validator_transactions_total counter\n\
+         xrpl_validator_transactions_total {}\n\
+         \n\
+         # HELP xrpl_validator_info Validator identity and version info\n\
+         # TYPE xrpl_validator_info gauge\n\
+         xrpl_validator_info{{version=\"0.1.0\",implementation=\"rust\",domain=\"halcyon-names.io\"}} 1\n",
+        snap.uptime_secs,
+        snap.ledger_seq,
+        snap.consecutive_matches,
+        snap.total_matches,
+        snap.total_mismatches,
+        snap.round_time_secs,
+        snap.compute_time_secs,
+        snap.peer_count,
+        snap.state_objects,
+        ready,
+        snap.messages_received,
+        snap.messages_sent,
+        snap.total_txs,
     )
 }
 
@@ -77,18 +135,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn render_contains_all_metrics() {
-        let m = NodeMetrics::new();
-        m.inc_received();
-        m.inc_received();
-        m.inc_sent();
-
-        let output = render_metrics(&m, 5, 10, 12345);
-        assert!(output.contains("xrpl_node_uptime_seconds"));
-        assert!(output.contains("xrpl_node_peers_connected 5"));
-        assert!(output.contains("xrpl_node_mempool_size 10"));
-        assert!(output.contains("xrpl_node_ledger_sequence 12345"));
-        assert!(output.contains("xrpl_node_messages_received_total 2"));
-        assert!(output.contains("xrpl_node_messages_sent_total 1"));
+    fn render_prometheus_format() {
+        let snap = ValidatorMetricsSnapshot {
+            uptime_secs: 3600,
+            peer_count: 10,
+            ledger_seq: 103000000,
+            messages_received: 50000,
+            messages_sent: 30000,
+            consecutive_matches: 500,
+            total_matches: 500,
+            total_mismatches: 0,
+            round_time_secs: 0.065,
+            compute_time_secs: 0.015,
+            state_objects: 18750000,
+            ready_to_sign: true,
+            total_txs: 100000,
+        };
+        let output = render_prometheus(&snap);
+        assert!(output.contains("xrpl_validator_uptime_seconds 3600"));
+        assert!(output.contains("xrpl_validator_consecutive_matches 500"));
+        assert!(output.contains("xrpl_validator_state_objects 18750000"));
+        assert!(output.contains("xrpl_validator_ready_to_sign 1"));
+        assert!(output.contains("xrpl_validator_info{"));
+        assert!(output.contains("# TYPE xrpl_validator_total_matches counter"));
     }
 }

@@ -154,6 +154,7 @@ struct EngineState {
 #[tokio::main]
 async fn main() {
     eprintln!("Starting XRPL Live Viewer...");
+    let start_time = std::time::Instant::now();
 
     // Init rustls crypto provider
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -1018,7 +1019,49 @@ async fn main() {
     let app = Router::new()
         .route("/", get(index_page))
         .route("/consensus", get(consensus_page))
-        .route("/metrics", get(metrics_page))
+        .route("/dashboard", get(metrics_page))
+        .route("/metrics", get({
+            let prom_hash = state_hash_computer.clone();
+            let prom_engine = engine_state.clone();
+            let prom_connected = connected_count.clone();
+            let prom_le = live_engine.clone();
+            let prom_start = start_time;
+            move || {
+                let prom_hash = prom_hash.clone();
+                let prom_engine = prom_engine.clone();
+                let prom_connected = prom_connected.clone();
+                let prom_le = prom_le.clone();
+                async move {
+                    let hash_status = prom_hash.status.lock().clone();
+                    let engine = prom_engine.lock().clone();
+                    let peers = prom_connected.load(std::sync::atomic::Ordering::Relaxed);
+                    let db_entries = prom_le.lock().as_ref().map(|e| e.entry_count() as u64).unwrap_or(0);
+                    let round_time = hash_status.sync_log.first().map(|e| e.time_secs).unwrap_or(0.0);
+
+                    let snap = xrpl_node::rpc::metrics::ValidatorMetricsSnapshot {
+                        uptime_secs: prom_start.elapsed().as_secs(),
+                        peer_count: peers,
+                        ledger_seq: hash_status.ledger_seq,
+                        messages_received: 0, // TODO: wire node_metrics
+                        messages_sent: 0,
+                        consecutive_matches: hash_status.consecutive_matches,
+                        total_matches: hash_status.total_matches,
+                        total_mismatches: hash_status.total_mismatches,
+                        round_time_secs: round_time,
+                        compute_time_secs: hash_status.compute_time_secs,
+                        state_objects: db_entries,
+                        ready_to_sign: hash_status.ready_to_sign,
+                        total_txs: engine.total_txs,
+                    };
+                    let body = xrpl_node::rpc::metrics::render_prometheus(&snap);
+                    (
+                        axum::http::StatusCode::OK,
+                        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+                        body,
+                    )
+                }
+            }
+        }))
         .route("/peers", get(peers_page))
         .route("/state", get(state_page))
         .route("/events", get(move || sse_handler(tx.clone())))
