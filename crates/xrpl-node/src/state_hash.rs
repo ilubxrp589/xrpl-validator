@@ -73,23 +73,33 @@ fn leaf_hash(data: &[u8], key: &[u8; 32]) -> Hash256 {
     sha512_half_prefixed(&HASH_PREFIX_LEAF_NODE, &buf)
 }
 
-/// 256-bucket hasher with dirty tracking and cached subtree hashes.
+/// 65536-bucket hasher (depth-4) with dirty tracking and cached subtree hashes.
+/// Index = first 2 bytes of key = 65536 buckets, ~286 entries each.
+/// With ~500 modified keys/ledger, only ~500 of 65536 buckets are dirty (0.8%).
+const NUM_BUCKETS: usize = 65536;
+
 struct FlatHasher {
-    /// 256 sorted vecs indexed by key[0] (first byte = depth-2 in trie).
+    /// 65536 sorted vecs indexed by key[0..2] (first 2 bytes = depth-4 in trie).
     buckets: Vec<Vec<(Hash256, Hash256)>>,
     /// Cached subtree hash per bucket — only recomputed when dirty.
-    bucket_hashes: [Hash256; 256],
+    bucket_hashes: Vec<Hash256>,
     /// Dirty flags per bucket.
-    dirty: [bool; 256],
+    dirty: Vec<bool>,
     /// Total entry count across all buckets.
     total: usize,
 }
 
 impl FlatHasher {
+    /// Bucket index from key: first 2 bytes = u16.
+    #[inline]
+    fn bucket_idx(key: &Hash256) -> usize {
+        ((key.0[0] as usize) << 8) | (key.0[1] as usize)
+    }
+
     /// Build from a RocksDB snapshot. RocksDB iterates in sorted key order,
     /// so entries within each bucket are already sorted.
     fn build_from_db(db: &rocksdb::DB) -> Self {
-        let mut buckets: Vec<Vec<(Hash256, Hash256)>> = (0..256).map(|_| Vec::with_capacity(80_000)).collect();
+        let mut buckets: Vec<Vec<(Hash256, Hash256)>> = (0..NUM_BUCKETS).map(|_| Vec::with_capacity(300)).collect();
         let snapshot = db.snapshot();
         let mut total = 0usize;
         for item in snapshot.iterator(rocksdb::IteratorMode::Start) {
@@ -97,7 +107,8 @@ impl FlatHasher {
                 if key.len() == 32 {
                     let mut k = [0u8; 32];
                     k.copy_from_slice(&key);
-                    buckets[k[0] as usize].push((Hash256(k), leaf_hash(&value, &k)));
+                    let h = Hash256(k);
+                    buckets[Self::bucket_idx(&h)].push((h, leaf_hash(&value, &k)));
                     total += 1;
                     if total % 2_000_000 == 0 {
                         eprintln!("[state-hash] Scanning: {total}...");
@@ -107,22 +118,18 @@ impl FlatHasher {
         }
         drop(snapshot);
 
-        // Compute all 256 bucket hashes in parallel
-        let hashes: Vec<Hash256> = buckets.par_iter()
-            .map(|b| compute_subtree(b, 2))
+        // Compute all 65536 bucket hashes in parallel
+        let bucket_hashes: Vec<Hash256> = buckets.par_iter()
+            .map(|b| compute_subtree(b, 4))
             .collect();
-        let mut bucket_hashes = [ZERO_HASH; 256];
-        for (i, h) in hashes.into_iter().enumerate() {
-            bucket_hashes[i] = h;
-        }
 
-        Self { buckets, bucket_hashes, dirty: [false; 256], total }
+        Self { buckets, bucket_hashes, dirty: vec![false; NUM_BUCKETS], total }
     }
 
     /// Update a single key. `new_hash` = Some for upsert, None for delete.
     #[inline]
     fn update(&mut self, key: Hash256, new_hash: Option<Hash256>) {
-        let idx = key.0[0] as usize;
+        let idx = Self::bucket_idx(&key);
         let bucket = &mut self.buckets[idx];
         match bucket.binary_search_by(|&(k, _)| k.0.cmp(&key.0)) {
             Ok(pos) => match new_hash {
@@ -138,19 +145,19 @@ impl FlatHasher {
     }
 
     /// Compute root hash — only recomputes dirty buckets via rayon.
+    /// With depth-4: 65536 buckets → 256 depth-2 → 16 depth-1 → 1 root.
     fn root_hash(&mut self) -> Hash256 {
         if self.total == 0 { return ZERO_HASH; }
 
-        // Collect dirty bucket indices and their slices
-        let dirty_work: Vec<(usize, &[(Hash256, Hash256)])> = (0..256)
+        // Recompute only dirty buckets in parallel
+        let dirty_work: Vec<(usize, &[(Hash256, Hash256)])> = (0..NUM_BUCKETS)
             .filter(|&i| self.dirty[i])
             .map(|i| (i, self.buckets[i].as_slice()))
             .collect();
 
-        let n_dirty = dirty_work.len();
-        if n_dirty > 0 {
+        if !dirty_work.is_empty() {
             let new_hashes: Vec<(usize, Hash256)> = dirty_work.par_iter()
-                .map(|&(i, slice)| (i, compute_subtree(slice, 2)))
+                .map(|&(i, slice)| (i, compute_subtree(slice, 4)))
                 .collect();
             for (i, h) in new_hashes {
                 self.bucket_hashes[i] = h;
@@ -158,13 +165,44 @@ impl FlatHasher {
             }
         }
 
-        // Combine: 256 bucket hashes → 16 depth-1 hashes → 1 root hash
+        // Combine: 65536 → 4096 → 256 → 16 → 1
+        // Step 1: 65536 buckets → 4096 depth-3 hashes (group by first 3 nibbles)
+        let mut depth3 = vec![ZERO_HASH; 4096];
+        for d3 in 0..4096usize {
+            let mut data = [0u8; 16 * 32];
+            let mut any = false;
+            for n in 0..16usize {
+                let h = &self.bucket_hashes[d3 * 16 + n];
+                data[n * 32..(n + 1) * 32].copy_from_slice(&h.0);
+                if *h != ZERO_HASH { any = true; }
+            }
+            if any {
+                depth3[d3] = sha512_half_prefixed(&HASH_PREFIX_INNER_NODE, &data);
+            }
+        }
+
+        // Step 2: 4096 → 256 depth-2 hashes
+        let mut depth2 = [ZERO_HASH; 256];
+        for d2 in 0..256usize {
+            let mut data = [0u8; 16 * 32];
+            let mut any = false;
+            for n in 0..16usize {
+                let h = &depth3[d2 * 16 + n];
+                data[n * 32..(n + 1) * 32].copy_from_slice(&h.0);
+                if *h != ZERO_HASH { any = true; }
+            }
+            if any {
+                depth2[d2] = sha512_half_prefixed(&HASH_PREFIX_INNER_NODE, &data);
+            }
+        }
+
+        // Step 3: 256 → 16 depth-1 hashes
         let mut depth1 = [ZERO_HASH; 16];
         for n0 in 0..16usize {
             let mut data = [0u8; 16 * 32];
             let mut any = false;
             for n1 in 0..16usize {
-                let h = &self.bucket_hashes[n0 * 16 + n1];
+                let h = &depth2[n0 * 16 + n1];
                 data[n1 * 32..(n1 + 1) * 32].copy_from_slice(&h.0);
                 if *h != ZERO_HASH { any = true; }
             }
@@ -173,6 +211,7 @@ impl FlatHasher {
             }
         }
 
+        // Step 4: 16 → 1 root hash
         let mut root_data = [0u8; 16 * 32];
         for (i, h) in depth1.iter().enumerate() {
             root_data[i * 32..(i + 1) * 32].copy_from_slice(&h.0);
@@ -188,7 +227,7 @@ impl FlatHasher {
         let f = std::fs::File::create(&temp)?;
         let mut w = BufWriter::with_capacity(8 * 1024 * 1024, f);
         w.write_all(b"XRPLCACH")?;
-        w.write_all(&1u32.to_le_bytes())?;
+        w.write_all(&2u32.to_le_bytes())?; // v2: 65536 buckets
         w.write_all(&(self.total as u64).to_le_bytes())?;
         for bucket in &self.buckets {
             for (key, hash) in bucket {
@@ -209,14 +248,17 @@ impl FlatHasher {
         if data.len() < 20 { return None; }
         if &data[..8] != b"XRPLCACH" { return None; }
         let ver = u32::from_le_bytes(data[8..12].try_into().ok()?);
-        if ver != 1 { return None; }
+        if ver != 2 {
+            eprintln!("[state-hash] Cache version {ver} != 2 — rebuilding");
+            return None;
+        }
         let count = u64::from_le_bytes(data[12..20].try_into().ok()?) as usize;
         if data.len() != 20 + count * 64 {
             eprintln!("[state-hash] Cache file size mismatch: expected {} bytes, got {}", 20 + count * 64, data.len());
             return None;
         }
 
-        let mut buckets: Vec<Vec<(Hash256, Hash256)>> = (0..256).map(|_| Vec::with_capacity(count / 256 + 1)).collect();
+        let mut buckets: Vec<Vec<(Hash256, Hash256)>> = (0..NUM_BUCKETS).map(|_| Vec::with_capacity(count / NUM_BUCKETS + 1)).collect();
         let entries = &data[20..];
         for i in 0..count {
             let off = i * 64;
@@ -224,24 +266,21 @@ impl FlatHasher {
             let mut hash = [0u8; 32];
             key.copy_from_slice(&entries[off..off + 32]);
             hash.copy_from_slice(&entries[off + 32..off + 64]);
-            buckets[key[0] as usize].push((Hash256(key), Hash256(hash)));
+            let h = Hash256(key);
+            buckets[Self::bucket_idx(&h)].push((h, Hash256(hash)));
         }
 
         let read_time = start.elapsed().as_secs_f64();
 
         // Compute bucket hashes in parallel
-        let hashes: Vec<Hash256> = buckets.par_iter()
-            .map(|b| compute_subtree(b, 2))
+        let bucket_hashes: Vec<Hash256> = buckets.par_iter()
+            .map(|b| compute_subtree(b, 4))
             .collect();
-        let mut bucket_hashes = [ZERO_HASH; 256];
-        for (i, h) in hashes.into_iter().enumerate() {
-            bucket_hashes[i] = h;
-        }
 
         let total_time = start.elapsed().as_secs_f64();
         eprintln!("[state-hash] Cache loaded: {count} entries in {total_time:.1}s (read={read_time:.1}s hash={:.1}s)",
             total_time - read_time);
-        Some(Self { buckets, bucket_hashes, dirty: [false; 256], total: count })
+        Some(Self { buckets, bucket_hashes, dirty: vec![false; NUM_BUCKETS], total: count })
     }
 }
 
@@ -510,9 +549,27 @@ impl StateHashComputer {
 
         // Lazy build — try disk cache first, then RocksDB scan
         if guard.is_none() {
+            // Check RocksDB entry count to validate cache freshness
+            let db_count = db.property_value("rocksdb.estimate-num-keys")
+                .ok().flatten()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+
             let loaded = self.cache_path.lock().as_ref().and_then(|p| {
                 eprintln!("[state-hash] Trying disk cache: {}", p.display());
-                FlatHasher::load(p)
+                let h = FlatHasher::load(p)?;
+                // Reject cache if RocksDB is empty or counts differ by >5%
+                if db_count < 1_000_000 {
+                    eprintln!("[state-hash] RocksDB only has ~{db_count} entries — cache stale, rebuilding");
+                    return None;
+                }
+                let diff = (h.total as f64 - db_count as f64).abs() / db_count as f64;
+                if diff > 0.05 {
+                    eprintln!("[state-hash] Cache has {} entries but RocksDB has ~{db_count} — {:.1}% drift, rebuilding",
+                        h.total, diff * 100.0);
+                    return None;
+                }
+                Some(h)
             });
             if let Some(h) = loaded {
                 eprintln!("[state-hash] Loaded from disk: {} entries in {:.1}s", h.total, start.elapsed().as_secs_f64());
