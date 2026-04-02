@@ -255,7 +255,7 @@ async fn process_ledger(
     // Fetch all modified objects in parallel — 32 concurrent requests max.
     // Previous sequential approach: 500 objs × 3ms = 1.5s
     // Parallel with 32 concurrent: 16 batches × 3ms = ~50ms
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(32));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(64));
     let rpc_url = rpc.rpc_url().to_string();
     let client = rpc.client.clone();
 
