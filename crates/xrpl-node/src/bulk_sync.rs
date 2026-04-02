@@ -12,7 +12,7 @@ use xrpl_ledger::shamap::hash::{sha512_half_prefixed, HASH_PREFIX_LEAF_NODE};
 use xrpl_ledger::shamap::tree::{SHAMap, TreeType};
 
 const RPC_ENDPOINTS: &[&str] = &[
-    "http://10.0.0.39:5005",       // local rippled on localai
+    "http://10.0.0.39:5005",       // local rippled on localai (fast LAN)
     "https://xrplcluster.com",     // public fallback
     "https://s1.ripple.com:51234", // Ripple public
 ];
@@ -136,8 +136,16 @@ impl BulkSyncer {
                     let mut params = serde_json::json!({"ledger_index":pinned_seq,"binary":true,"limit":2048});
                     if let Some(ref m) = marker { params["marker"] = serde_json::Value::String(m.clone()); }
 
-                    let req_body = serde_json::json!({"method":"ledger_data","params":[params]});
-                    let body: serde_json::Value = match rpc_failover(&client, &req_body) {
+                    // CRITICAL: use ONLY the first endpoint for pagination.
+                    // rpc_failover can switch servers between pages, corrupting markers.
+                    let resp = match client.post(RPC_ENDPOINTS[0])
+                        .json(&serde_json::json!({"method":"ledger_data","params":[params]}))
+                        .send() {
+                        Ok(r) => r,
+                        Err(_) => { errors += 1; std::thread::sleep(std::time::Duration::from_secs(2));
+                            if errors > 50 { break; } continue; }
+                    };
+                    let body: serde_json::Value = match resp.json() {
                         Ok(b) => b,
                         Err(_) => { errors += 1; std::thread::sleep(std::time::Duration::from_secs(2));
                             if errors > 50 { break; } continue; }

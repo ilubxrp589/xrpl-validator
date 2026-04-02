@@ -251,58 +251,74 @@ async fn process_ledger(
     compute_hash: bool,
 ) -> bool {
     let ledger_start = std::time::Instant::now();
-    // Fetch all modified objects sequentially (hot in cache)
-    let mut fetched_data: Vec<([u8; 32], Vec<u8>)> = Vec::new();
-    let mut failed = 0u32;
 
-    for index_hex in modified {
-        let mut ok = false;
-        for _ in 0..3u32 {
-            let resp = rpc.client.post(rpc.rpc_url())
-                .json(&serde_json::json!({
-                    "method": "ledger_entry",
-                    "params": [{"index": index_hex, "binary": true, "ledger_index": seq}]
-                }))
-                .send().await;
+    // Fetch all modified objects in parallel — 32 concurrent requests max.
+    // Previous sequential approach: 500 objs × 3ms = 1.5s
+    // Parallel with 32 concurrent: 16 batches × 3ms = ~50ms
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(32));
+    let rpc_url = rpc.rpc_url().to_string();
+    let client = rpc.client.clone();
 
-            if let Ok(r) = resp {
-                if let Ok(body) = r.json::<serde_json::Value>().await {
-                    // Verify response is for the correct ledger
-                    let resp_seq = body["result"]["ledger_index"].as_u64().unwrap_or(0) as u32;
-                    if resp_seq != 0 && resp_seq != seq {
-                        eprintln!("[ws-sync] WRONG LEDGER for {}: requested={seq} got={resp_seq}", &index_hex[..8]);
-                        continue; // retry
-                    }
-                    if let Some(data_hex) = body["result"]["node_binary"].as_str() {
-                        if let Ok(data) = hex::decode(data_hex) {
-                            if let Ok(kb) = hex::decode(index_hex) {
+    let fetch_futures: Vec<_> = modified.iter().map(|index_hex| {
+        let sem = semaphore.clone();
+        let client = client.clone();
+        let url = rpc_url.clone();
+        let index_hex = index_hex.clone();
+        async move {
+            let _permit = sem.acquire().await.ok()?;
+            for attempt in 0..3u32 {
+                let resp = client.post(&url)
+                    .json(&serde_json::json!({
+                        "method": "ledger_entry",
+                        "params": [{"index": &index_hex, "binary": true, "ledger_index": seq}]
+                    }))
+                    .send().await;
+
+                if let Ok(r) = resp {
+                    if let Ok(body) = r.json::<serde_json::Value>().await {
+                        let resp_seq = body["result"]["ledger_index"].as_u64().unwrap_or(0) as u32;
+                        if resp_seq != 0 && resp_seq != seq {
+                            if attempt < 2 { continue; }
+                            return None;
+                        }
+                        if let Some(data_hex) = body["result"]["node_binary"].as_str() {
+                            if let Ok(data) = hex::decode(data_hex) {
+                                if let Ok(kb) = hex::decode(&index_hex) {
+                                    if kb.len() == 32 {
+                                        let mut key = [0u8; 32];
+                                        key.copy_from_slice(&kb);
+                                        return Some((key, data));
+                                    }
+                                }
+                            }
+                        }
+                        if body["result"]["error"].as_str() == Some("entryNotFound") {
+                            if let Ok(kb) = hex::decode(&index_hex) {
                                 if kb.len() == 32 {
                                     let mut key = [0u8; 32];
                                     key.copy_from_slice(&kb);
-                                    fetched_data.push((key, data));
-                                    ok = true;
-                                    break;
+                                    return Some((key, Vec::new()));
                                 }
                             }
                         }
                     }
-                    if body["result"]["error"].as_str() == Some("entryNotFound") {
-                        // Object doesn't exist at this ledger — treat as deletion
-                        if let Ok(kb) = hex::decode(index_hex) {
-                            if kb.len() == 32 {
-                                let mut key = [0u8; 32];
-                                key.copy_from_slice(&kb);
-                                fetched_data.push((key, Vec::new()));
-                            }
-                        }
-                        ok = true;
-                        break;
-                    }
+                }
+                if attempt < 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            None
         }
-        if !ok { failed += 1; }
+    }).collect();
+
+    let results = futures_util::future::join_all(fetch_futures).await;
+    let mut fetched_data: Vec<([u8; 32], Vec<u8>)> = Vec::with_capacity(results.len());
+    let mut failed = 0u32;
+    for r in results {
+        match r {
+            Some(pair) => fetched_data.push(pair),
+            None => failed += 1,
+        }
     }
 
     if failed > 0 {
