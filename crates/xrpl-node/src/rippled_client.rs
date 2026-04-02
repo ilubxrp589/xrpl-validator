@@ -5,14 +5,14 @@ use std::sync::Arc;
 
 /// Ordered list of RPC endpoints to try.
 const ENDPOINTS: &[&str] = &[
-    "http://10.0.0.97:5005",       // local rippled on m3060
+    "http://10.0.0.39:5005",       // local rippled on localai (NVMe)
     "https://xrplcluster.com",     // public cluster (full history)
     "https://s1.ripple.com:51234", // Ripple's public server
 ];
 
 /// WebSocket endpoints for subscription.
 const WS_ENDPOINTS: &[&str] = &[
-    "ws://10.0.0.97:6006",        // local rippled WS
+    "ws://10.0.0.39:6006",        // local rippled WS on localai
     "wss://xrplcluster.com",      // public WS
     "wss://s1.ripple.com:51233",  // Ripple's public WS
 ];

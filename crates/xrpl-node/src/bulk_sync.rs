@@ -11,8 +11,30 @@ use xrpl_core::types::Hash256;
 use xrpl_ledger::shamap::hash::{sha512_half_prefixed, HASH_PREFIX_LEAF_NODE};
 use xrpl_ledger::shamap::tree::{SHAMap, TreeType};
 
-const RPC_URL: &str = "http://10.0.0.39:5005";
+const RPC_ENDPOINTS: &[&str] = &[
+    "http://10.0.0.39:5005",       // local rippled on localai
+    "https://xrplcluster.com",     // public fallback
+    "https://s1.ripple.com:51234", // Ripple public
+];
 const NUM_WORKERS: u32 = 4;
+
+/// Try RPC request against each endpoint until one succeeds.
+fn rpc_failover(client: &reqwest::blocking::Client, body: &serde_json::Value) -> Result<serde_json::Value, String> {
+    for (i, url) in RPC_ENDPOINTS.iter().enumerate() {
+        match client.post(*url).json(body).send() {
+            Ok(resp) => match resp.json::<serde_json::Value>() {
+                Ok(json) => {
+                    if json["result"]["error"].as_str() == Some("noNetwork") { continue; }
+                    if i > 0 { eprintln!("[sync] Failover to {url}"); }
+                    return Ok(json);
+                }
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        }
+    }
+    Err("all endpoints failed".into())
+}
 
 #[derive(Clone, Default, serde::Serialize)]
 pub struct BulkSyncStatus {
@@ -62,17 +84,13 @@ impl BulkSyncer {
             let client = reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build().unwrap();
-            let resp = client.post(RPC_URL)
-                .json(&serde_json::json!({"method":"ledger","params":[{"ledger_index":"validated"}]}))
-                .send();
-            match resp {
-                Ok(r) => {
-                    if let Ok(body) = r.json::<serde_json::Value>() {
-                        body["result"]["ledger_index"].as_u64()
-                            .or_else(|| body["result"]["ledger"]["ledger_index"]
-                                .as_str().and_then(|s| s.parse().ok()))
-                            .unwrap_or(0) as u32
-                    } else { 0 }
+            let body = serde_json::json!({"method":"ledger","params":[{"ledger_index":"validated"}]});
+            match rpc_failover(&client, &body) {
+                Ok(json) => {
+                    json["result"]["ledger_index"].as_u64()
+                        .or_else(|| json["result"]["ledger"]["ledger_index"]
+                            .as_str().and_then(|s| s.parse().ok()))
+                        .unwrap_or(0) as u32
                 }
                 Err(_) => 0,
             }
@@ -118,14 +136,8 @@ impl BulkSyncer {
                     let mut params = serde_json::json!({"ledger_index":pinned_seq,"binary":true,"limit":2048});
                     if let Some(ref m) = marker { params["marker"] = serde_json::Value::String(m.clone()); }
 
-                    let resp = match client.post(RPC_URL)
-                        .json(&serde_json::json!({"method":"ledger_data","params":[params]}))
-                        .send() {
-                        Ok(r) => r,
-                        Err(_) => { errors += 1; std::thread::sleep(std::time::Duration::from_secs(2));
-                            if errors > 50 { break; } continue; }
-                    };
-                    let body: serde_json::Value = match resp.json() {
+                    let req_body = serde_json::json!({"method":"ledger_data","params":[params]});
+                    let body: serde_json::Value = match rpc_failover(&client, &req_body) {
                         Ok(b) => b,
                         Err(_) => { errors += 1; std::thread::sleep(std::time::Duration::from_secs(2));
                             if errors > 50 { break; } continue; }

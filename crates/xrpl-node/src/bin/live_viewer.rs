@@ -506,7 +506,7 @@ async fn main() {
                         .build()
                         .unwrap_or_default();
                     let current_seq: u32 = match client
-                        .post("http://10.0.0.97:5005")
+                        .post("http://10.0.0.39:5005")
                         .json(&serde_json::json!({"method":"ledger","params":[{"ledger_index":"validated"}]}))
                         .send()
                         .await
@@ -545,7 +545,7 @@ async fn main() {
                     // Get latest validated ledger (backfill may have advanced past current_seq)
                     let ws_start: u32 = {
                         let c = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap_or_default();
-                        match c.post("http://10.0.0.97:5005")
+                        match c.post("http://10.0.0.39:5005")
                             .json(&serde_json::json!({"method":"ledger","params":[{"ledger_index":"validated"}]}))
                             .send().await {
                             Ok(r) => r.json::<serde_json::Value>().await.ok()
@@ -622,7 +622,7 @@ async fn main() {
             .expect("reqwest client builder failed");
         loop {
             if let Ok(resp) = client
-                .post("http://10.0.0.97:5005")
+                .post("http://10.0.0.39:5005")
                 .json(&serde_json::json!({
                     "method": "ledger",
                     "params": [{"ledger_index": "validated"}]

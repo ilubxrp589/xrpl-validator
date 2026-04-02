@@ -8,7 +8,7 @@ use xrpl_ledger::shamap::hash::{sha512_half_prefixed, HASH_PREFIX_LEAF_NODE, HAS
 use xrpl_ledger::shamap::node::{ZERO_HASH, nibble_at};
 use xrpl_ledger::shamap::tree::{SHAMap, TreeType};
 
-const RPC: &str = "http://10.0.0.97:5005";
+const RPC: &str = "http://10.0.0.39:5005";
 
 fn compute_subtree(entries: &[(Hash256, Hash256)], depth: usize) -> Hash256 {
     if entries.is_empty() { return ZERO_HASH; }
