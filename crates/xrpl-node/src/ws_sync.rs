@@ -92,7 +92,8 @@ pub async fn start_ws_sync(
                 if closed_seq == 0 { continue; }
 
                 // Fill gap from last_processed+1 to closed_seq
-                let mut start_seq = if last_processed > 0 { last_processed + 1 } else { last_synced.load(Ordering::Relaxed) + 1 };
+                // SECURITY(5.3): Use Acquire ordering to ensure visibility of prior stores
+                let mut start_seq = if last_processed > 0 { last_processed + 1 } else { last_synced.load(Ordering::Acquire) + 1 };
 
                 // If behind, skip to current. DON'T invalidate the tree — it's correct.
                 // Gap ledgers are processed via fast path (tree update, no hash check).
@@ -171,7 +172,8 @@ pub async fn start_ws_sync(
 
                     last_processed = process_seq;
                     if result {
-                        last_synced.store(process_seq, Ordering::Relaxed);
+                        // SECURITY(5.3): Use Release ordering so Acquire loads see this
+                        last_synced.store(process_seq, Ordering::Release);
                     }
                 } // end for process_seq
 

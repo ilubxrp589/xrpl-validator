@@ -40,6 +40,8 @@ pub struct HistorySummary {
 /// SQLite-backed history store.
 pub struct HistoryStore {
     conn: Connection,
+    /// Counter for periodic pruning — prune every N inserts.
+    insert_count: std::cell::Cell<u64>,
 }
 
 impl HistoryStore {
@@ -65,10 +67,10 @@ impl HistoryStore {
         ).map_err(|e| format!("sqlite init: {e}"))?;
 
         eprintln!("[history] Opened SQLite database at {path}");
-        Ok(Self { conn })
+        Ok(Self { conn, insert_count: std::cell::Cell::new(0) })
     }
 
-    /// Record a ledger round.
+    /// Record a ledger round. Automatically prunes old data every 10000 inserts.
     pub fn record(&self, r: &LedgerRound) {
         if let Err(e) = self.conn.execute(
             "INSERT OR REPLACE INTO ledger_rounds (seq, matched, healed, txs, objs, round_time_ms, compute_time_ms, peers, timestamp)
@@ -86,6 +88,29 @@ impl HistoryStore {
             ],
         ) {
             eprintln!("[history] SQLite write failed: {e}");
+        }
+
+        // SECURITY(4.4): Periodic pruning to prevent unbounded growth
+        let count = self.insert_count.get() + 1;
+        self.insert_count.set(count);
+        if count % 10_000 == 0 {
+            self.prune(90);
+        }
+    }
+
+    /// Delete rows older than `keep_days` days. Default retention: 90 days.
+    pub fn prune(&self, keep_days: u64) {
+        let cutoff = now_secs().saturating_sub(keep_days * 86400);
+        match self.conn.execute(
+            "DELETE FROM ledger_rounds WHERE timestamp < ?1",
+            params![cutoff],
+        ) {
+            Ok(deleted) => {
+                if deleted > 0 {
+                    eprintln!("[history] Pruned {deleted} rows older than {keep_days} days");
+                }
+            }
+            Err(e) => eprintln!("[history] Prune failed: {e}"),
         }
     }
 

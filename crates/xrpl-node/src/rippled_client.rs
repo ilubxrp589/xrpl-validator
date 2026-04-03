@@ -33,10 +33,23 @@ pub struct RippledClient {
     pub on_fallback: Arc<AtomicBool>,
     /// Consecutive successes on current endpoint (used to try switching back to primary).
     consecutive_ok: Arc<AtomicU64>,
+    /// Optional env-var override for primary RPC URL.
+    rpc_override: Option<String>,
+    /// Optional env-var override for primary WS URL.
+    ws_override: Option<String>,
 }
 
 impl RippledClient {
     pub fn new() -> Self {
+        // SECURITY(10.1): Read env var overrides for primary endpoints
+        let rpc_override = std::env::var("XRPL_RPC_URL").ok();
+        let ws_override = std::env::var("XRPL_WS_URL").ok();
+        if let Some(ref url) = rpc_override {
+            eprintln!("[rpc] Using XRPL_RPC_URL override: {url}");
+        }
+        if let Some(ref url) = ws_override {
+            eprintln!("[rpc] Using XRPL_WS_URL override: {url}");
+        }
         Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
@@ -48,18 +61,32 @@ impl RippledClient {
             total_failovers: Arc::new(AtomicU64::new(0)),
             on_fallback: Arc::new(AtomicBool::new(false)),
             consecutive_ok: Arc::new(AtomicU64::new(0)),
+            rpc_override,
+            ws_override,
         }
     }
 
     /// Get the current RPC endpoint URL.
-    pub fn rpc_url(&self) -> &'static str {
+    /// Returns XRPL_RPC_URL env override for primary (index 0), otherwise hardcoded fallback.
+    pub fn rpc_url(&self) -> &str {
         let idx = self.active_rpc.load(Ordering::Relaxed) as usize;
+        if idx == 0 {
+            if let Some(ref url) = self.rpc_override {
+                return url.as_str();
+            }
+        }
         ENDPOINTS[idx.min(ENDPOINTS.len() - 1)]
     }
 
     /// Get the current WebSocket endpoint URL.
-    pub fn ws_url(&self) -> &'static str {
+    /// Returns XRPL_WS_URL env override for primary (index 0), otherwise hardcoded fallback.
+    pub fn ws_url(&self) -> &str {
         let idx = self.active_ws.load(Ordering::Relaxed) as usize;
+        if idx == 0 {
+            if let Some(ref url) = self.ws_override {
+                return url.as_str();
+            }
+        }
         WS_ENDPOINTS[idx.min(WS_ENDPOINTS.len() - 1)]
     }
 
@@ -125,11 +152,16 @@ impl RippledClient {
     }
 
     /// Switch to the next WS endpoint (called when WS disconnects).
-    pub fn next_ws_endpoint(&self) -> &'static str {
+    pub fn next_ws_endpoint(&self) -> &str {
         let old = self.active_ws.fetch_add(1, Ordering::Relaxed) as usize;
         let new_idx = (old + 1) % WS_ENDPOINTS.len();
         self.active_ws.store(new_idx as u64, Ordering::Relaxed);
         self.on_fallback.store(new_idx > 0, Ordering::Relaxed);
+        if new_idx == 0 {
+            if let Some(ref url) = self.ws_override {
+                return url.as_str();
+            }
+        }
         WS_ENDPOINTS[new_idx]
     }
 

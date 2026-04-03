@@ -3,6 +3,7 @@
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use parking_lot;
 use xrpl_core::types::Hash256;
 
 /// Tracks which transaction hashes we've already relayed.
@@ -12,6 +13,8 @@ pub struct RelayFilter {
     seen: DashMap<Hash256, Instant>,
     /// How long to remember a hash before allowing re-relay.
     ttl: Duration,
+    /// Last time cleanup was run (for auto-cleanup in check_and_mark path).
+    last_cleanup: parking_lot::Mutex<Instant>,
 }
 
 impl RelayFilter {
@@ -19,13 +22,23 @@ impl RelayFilter {
         Self {
             seen: DashMap::new(),
             ttl,
+            last_cleanup: parking_lot::Mutex::new(Instant::now()),
         }
     }
 
     /// Check if we should relay this transaction.
     /// Returns true if not seen recently (and marks it as seen).
     /// Uses entry API for atomic check-and-insert to prevent races.
+    /// SECURITY(4.5): Auto-cleans expired entries every 10 minutes.
     pub fn should_relay(&self, hash: &Hash256) -> bool {
+        // Auto-cleanup: purge expired entries every 10 minutes
+        {
+            let mut last = self.last_cleanup.lock();
+            if last.elapsed() > Duration::from_secs(600) {
+                *last = Instant::now();
+                self.seen.retain(|_, time| time.elapsed() < self.ttl);
+            }
+        }
         use dashmap::mapref::entry::Entry;
         match self.seen.entry(*hash) {
             Entry::Occupied(mut e) => {

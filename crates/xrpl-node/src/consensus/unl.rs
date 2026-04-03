@@ -61,6 +61,14 @@ impl UNL {
 
     /// Process a manifest — update the master→signing key mapping.
     /// Only accepts if sequence > existing sequence for this master key.
+    ///
+    /// SECURITY(7.5): The manifest's master key signature is NOT verified.
+    /// A valid manifest should be signed by the master key to prove the
+    /// master→ephemeral key binding. Without verification, an attacker could
+    /// inject a forged manifest to redirect a validator's identity to an
+    /// attacker-controlled ephemeral key. Full verification requires
+    /// deserializing the manifest STObject, extracting the signature field,
+    /// and verifying it against the master public key.
     pub fn process_manifest(&mut self, manifest: Manifest) {
         let key = hex::encode_upper(&manifest.master_key);
         let dominated = self
@@ -69,6 +77,7 @@ impl UNL {
             .is_some_and(|existing| existing.sequence >= manifest.sequence);
 
         if !dominated {
+            eprintln!("[unl] Accepting UNVERIFIED manifest for {} (seq={})", &key[..8.min(key.len())], manifest.sequence);
             self.manifests.insert(key, manifest);
         }
     }

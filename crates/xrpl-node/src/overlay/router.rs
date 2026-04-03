@@ -1,7 +1,7 @@
 //! Message router — dispatches incoming peer messages to subsystems.
 
 use tokio::sync::mpsc;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::peer::connection::PeerId;
 use crate::peer::message::PeerMessage;
@@ -78,8 +78,16 @@ impl OverlayRouter {
                 }
 
                 // Consensus messages → consensus engine
+                // SECURITY(7.3): Validation messages are forwarded without cryptographic
+                // signature verification. The TmValidation protobuf contains a serialized
+                // validation blob with a signature field, but we do not verify it here.
+                // Full Ed25519/Secp256k1 verification should be added before trusting
+                // validation data for consensus decisions.
+                PeerMessage::Validation(_) => {
+                    warn!(peer = %peer_hex, "forwarding UNVERIFIED validation — signature not checked");
+                    self.consensus_tx.send((peer_id, msg)).await
+                }
                 PeerMessage::ProposeSet(_)
-                | PeerMessage::Validation(_)
                 | PeerMessage::HaveTransactionSet(_) => {
                     self.consensus_tx.send((peer_id, msg)).await
                 }

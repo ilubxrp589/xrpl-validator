@@ -15,6 +15,12 @@ use zeroize::Zeroize;
 use crate::NodeError;
 
 /// Cryptographic identity of this node on the XRPL peer network.
+///
+/// NOTE(6.2): The TLS keypair (Ed25519) is regenerated on every startup, so the
+/// node's TLS fingerprint changes each time. This is by design — the XRPL peer
+/// protocol identifies nodes by the Secp256k1 public key embedded in the TLS
+/// certificate's Subject CN, not by the TLS key itself. The Secp256k1 keypair
+/// is persisted via the seed file (XRPL_SEED_PATH) and remains stable across restarts.
 pub struct NodeIdentity {
     /// The XRPL keypair (Secp256k1). Public key is 33 bytes: 0x02/0x03 compressed point.
     keypair: Keypair,
@@ -144,6 +150,9 @@ impl NodeIdentity {
 
 impl Drop for NodeIdentity {
     fn drop(&mut self) {
+        // SECURITY(1.6): Zeroize TLS private key material on drop.
+        // The XRPL Keypair's private_key field is automatically zeroed via
+        // ZeroizeOnDrop derived on the Keypair struct in xrpl-core.
         self.tls_key_der.zeroize();
     }
 }

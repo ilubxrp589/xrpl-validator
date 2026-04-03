@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use tracing;
 use xrpl_core::types::Hash256;
 
 use crate::consensus::proposal::compute_tx_set_hash;
@@ -113,7 +114,17 @@ impl ConsensusEngine {
     }
 
     /// Called when we receive a TMProposeSet from a peer.
+    ///
+    /// SECURITY(7.4): The proposal's `signature` field (from TmProposeSet) is NOT verified
+    /// against the `validator_key`. An attacker could forge proposals to influence consensus.
+    /// Proper verification requires deserializing the proposal, hashing the signed fields,
+    /// and verifying the signature against the validator's known public key.
     pub fn on_peer_proposal(&mut self, validator_key: String, tx_hashes: HashSet<Hash256>) {
+        tracing::debug!(
+            validator = %validator_key,
+            txs = tx_hashes.len(),
+            "accepting UNVERIFIED peer proposal — signature not checked"
+        );
         self.state.add_peer_proposal(validator_key, tx_hashes);
     }
 

@@ -196,6 +196,23 @@ async fn main() {
         use xrpl_core::crypto::signing::Seed;
 
         let seed_path = std::env::var("XRPL_SEED_PATH").unwrap_or_else(|_| "/mnt/xrpl-data/validator_seed.hex".to_string());
+
+        // SECURITY(6.1): Check seed file permissions — warn if group/other-readable
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(meta) = std::fs::metadata(&seed_path) {
+                let mode = meta.mode();
+                if mode & 0o077 != 0 {
+                    eprintln!(
+                        "[SECURITY WARNING] Seed file {} has mode {:o} — readable by group/others! \
+                         Run: chmod 600 {}",
+                        seed_path, mode & 0o777, seed_path
+                    );
+                }
+            }
+        }
+
         let seed = if let Ok(hex_str) = std::fs::read_to_string(&seed_path) {
             let hex_str = hex_str.trim();
             if let Ok(bytes) = hex::decode(hex_str) {
@@ -1286,6 +1303,11 @@ async fn main() {
             }
         }));
 
+    // SECURITY(10.3): All /api/* endpoints are read-only (sync-status, engine, peers,
+    // state-hash, history, consensus). There is no submit/transaction endpoint.
+    // If a submit endpoint is ever added, it MUST require authentication (API key or mTLS).
+    // Binding to 0.0.0.0 is acceptable for read-only status since Caddy fronts this
+    // on the public side with its own access controls.
     let addr = "0.0.0.0:3777";
     eprintln!("[web] Listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await.expect("failed to bind port 3777");

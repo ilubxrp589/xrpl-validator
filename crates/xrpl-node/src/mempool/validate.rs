@@ -34,7 +34,8 @@ pub fn validate_transaction(tx_blob: &[u8]) -> (ValidationResult, Hash256, Optio
     if tx_blob.len() < 20 {
         return (ValidationResult::Invalid("transaction too small".into()), tx_hash, None);
     }
-    if tx_blob.len() > 1_000_000 {
+    // SECURITY(3.4): Reduced from 1MB to 250KB to match rippled's practical limit.
+    if tx_blob.len() > 250_000 {
         return (ValidationResult::Invalid("transaction too large".into()), tx_hash, None);
     }
 
@@ -191,7 +192,7 @@ mod tests {
 
     #[test]
     fn too_large() {
-        let (result, _, _) = validate_transaction(&vec![0u8; 2_000_000]);
+        let (result, _, _) = validate_transaction(&vec![0u8; 300_000]);
         assert!(matches!(result, ValidationResult::Invalid(_)));
     }
 

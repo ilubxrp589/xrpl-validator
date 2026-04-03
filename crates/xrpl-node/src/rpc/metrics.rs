@@ -57,6 +57,8 @@ pub struct ValidatorMetricsSnapshot {
 /// Render full validator metrics in Prometheus text exposition format.
 pub fn render_prometheus(snap: &ValidatorMetricsSnapshot) -> String {
     let ready = if snap.ready_to_sign { 1 } else { 0 };
+    // SECURITY(10.2): Read domain from env var instead of hardcoding
+    let domain = std::env::var("XRPL_DOMAIN").unwrap_or_else(|_| "halcyon-names.io".to_string());
 
     format!(
         "# HELP xrpl_validator_uptime_seconds Seconds since validator process started\n\
@@ -113,7 +115,7 @@ pub fn render_prometheus(snap: &ValidatorMetricsSnapshot) -> String {
          \n\
          # HELP xrpl_validator_info Validator identity and version info\n\
          # TYPE xrpl_validator_info gauge\n\
-         xrpl_validator_info{{version=\"0.1.0\",implementation=\"rust\",domain=\"halcyon-names.io\"}} 1\n",
+         xrpl_validator_info{{version=\"0.1.0\",implementation=\"rust\",domain=\"{domain}\"}} 1\n",
         snap.uptime_secs,
         snap.ledger_seq,
         snap.consecutive_matches,
@@ -127,6 +129,7 @@ pub fn render_prometheus(snap: &ValidatorMetricsSnapshot) -> String {
         snap.messages_received,
         snap.messages_sent,
         snap.total_txs,
+        domain = domain,
     )
 }
 

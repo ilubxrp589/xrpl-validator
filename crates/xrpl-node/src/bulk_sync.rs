@@ -16,6 +16,11 @@ const RPC_ENDPOINTS: &[&str] = &[
     "https://xrplcluster.com",     // public fallback
     "https://s1.ripple.com:51234", // Ripple public
 ];
+
+/// SECURITY(10.1): Read XRPL_RPC_URL to override the primary RPC endpoint.
+fn primary_rpc_endpoint() -> String {
+    std::env::var("XRPL_RPC_URL").unwrap_or_else(|_| RPC_ENDPOINTS[0].to_string())
+}
 const NUM_WORKERS: u32 = 4;
 
 /// Try RPC request against each endpoint until one succeeds.
@@ -105,8 +110,9 @@ impl BulkSyncer {
 
         { let mut s = status.lock(); *s = BulkSyncStatus { running: true, workers_total: NUM_WORKERS, ..Default::default() }; }
 
-        // Unbounded channel — workers never block
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<([u8; 32], Vec<u8>)>>();
+        // SECURITY(4.2): Bounded channel — workers block when builder falls behind
+        // instead of accumulating unbounded memory. 32 batches ≈ ~64K objects max queued.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<([u8; 32], Vec<u8>)>>(32);
         let start_time = std::time::Instant::now();
         let range_size = 256u32 / NUM_WORKERS;
 
@@ -138,7 +144,8 @@ impl BulkSyncer {
 
                     // CRITICAL: use ONLY the first endpoint for pagination.
                     // rpc_failover can switch servers between pages, corrupting markers.
-                    let resp = match client.post(RPC_ENDPOINTS[0])
+                    let primary = primary_rpc_endpoint();
+                    let resp = match client.post(&primary)
                         .json(&serde_json::json!({"method":"ledger_data","params":[params]}))
                         .send() {
                         Ok(r) => r,

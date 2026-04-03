@@ -477,7 +477,8 @@ impl StateHashComputer {
             let matches = s.computed_hash.to_uppercase() == s.network_hash.to_uppercase();
             s.matches = Some(matches);
             if matches {
-                let n = self.consecutive_matches.fetch_add(1, Ordering::Relaxed) + 1;
+                // SECURITY(5.3): Use AcqRel ordering — this value gates ready_to_sign
+                let n = self.consecutive_matches.fetch_add(1, Ordering::AcqRel) + 1;
                 s.consecutive_matches = n;
                 s.ready_to_sign = n >= 3;
                 if n <= 5 || n % 100 == 0 {
@@ -499,7 +500,7 @@ impl StateHashComputer {
                     }
                 }
             } else {
-                self.consecutive_matches.store(0, Ordering::Relaxed);
+                self.consecutive_matches.store(0, Ordering::Release);
                 s.consecutive_matches = 0;
                 s.ready_to_sign = false;
                 eprintln!(
@@ -522,7 +523,7 @@ impl StateHashComputer {
     }
 
     pub fn is_ready_to_sign(&self) -> bool {
-        self.consecutive_matches.load(Ordering::Relaxed) >= 3
+        self.consecutive_matches.load(Ordering::Acquire) >= 3
     }
 
     pub fn current_hash(&self) -> Option<Hash256> {

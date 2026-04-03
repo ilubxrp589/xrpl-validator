@@ -20,8 +20,10 @@ use tokio_util::codec::{Decoder, Encoder};
 use super::message::PeerMessage;
 use crate::NodeError;
 
-/// Maximum allowed message size (16 MB, same as rippled).
-const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
+/// Maximum allowed message size (4 MB). rippled's practical limit for most
+/// message types is ~4 MB. The previous 16 MB was unnecessarily large and
+/// could allow memory exhaustion via oversized frames.
+const MAX_MESSAGE_SIZE: u32 = 4 * 1024 * 1024;
 
 /// Bit mask for compression flag in the type code.
 const COMPRESSION_FLAG: u16 = 1 << 15;
@@ -83,7 +85,7 @@ impl Decoder for MessageCodec {
 
             // Decompress if needed.
             let data = if compressed {
-                let mut decoder = ZlibDecoder::new(proto_data).take(16 * 1024 * 1024);
+                let mut decoder = ZlibDecoder::new(proto_data).take(MAX_MESSAGE_SIZE as u64);
                 let mut decompressed = Vec::new();
                 decoder.read_to_end(&mut decompressed).map_err(|e| {
                     NodeError::MessageDecode(format!("zlib decompression failed: {e}"))

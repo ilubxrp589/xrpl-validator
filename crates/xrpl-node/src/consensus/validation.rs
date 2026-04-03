@@ -31,11 +31,17 @@ impl ValidationCollector {
     }
 
     /// Record a validation for a ledger.
+    /// SECURITY(4.6): Auto-prunes when per_ledger exceeds 1000 entries.
     pub fn track(&mut self, ledger_hash: Hash256, validator_key_hex: String) {
         self.per_ledger
             .entry(ledger_hash)
             .or_default()
             .push(validator_key_hex);
+
+        // Auto-prune: keep at most 1000 ledger entries
+        if self.per_ledger.len() > 1000 {
+            self.prune(500);
+        }
     }
 
     /// Check if a ledger is fully validated (>80% of UNL).
