@@ -80,7 +80,7 @@
 <div id="grid">
   <!-- Row 1 -->
   <div class="card">
-    <div class="card-title">XRP Burned (All Time)</div>
+    <div class="card-title">XRP Burned (Lifetime)</div>
     <div class="card-value red" id="m-fee-burn">0</div>
     <div class="card-sub"><span id="m-fee-xrp">0</span> XRP destroyed | round: <span id="m-fee-round">0</span> XRP</div>
     <canvas id="c-fees"></canvas>
@@ -298,7 +298,7 @@ async function poll() {
       const la = d.live_engine.total_applied;
       const lf = d.live_engine.total_failed || 0;
       const lt = la + lf;
-      const hr = lt > 0 ? ((la / lt) * 100).toFixed(1) : '100.0';
+      const hr = lt > 0 ? ((la / lt) * 100).toFixed(1) : '--';
       document.getElementById('m-engine-hit').textContent = hr + '%';
       document.getElementById('m-engine-applied').textContent = la.toLocaleString();
       document.getElementById('m-engine-entries').textContent = d.live_engine.entries.toLocaleString();
