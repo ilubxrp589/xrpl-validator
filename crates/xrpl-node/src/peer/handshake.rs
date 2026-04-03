@@ -238,9 +238,12 @@ pub async fn outbound_handshake(
                         let contains_key = cert_pubkey_der.windows(peer_public_key.len())
                             .any(|w| w == peer_public_key.as_slice());
                         if !contains_key {
-                            return Err(NodeError::HandshakeFailed(
-                                "peer Public-Key does not match TLS certificate — rejecting".to_string()
-                            ));
+                            // XRPL peers use ephemeral TLS keys separate from their node identity.
+                            // The TLS cert key and protocol Public-Key are intentionally different.
+                            // This is by design — authentication happens via session signatures, not TLS.
+                            tracing::debug!(
+                                "peer TLS cert key differs from protocol Public-Key (expected in XRPL)"
+                            );
                         }
                     }
                     Err(_) => {
