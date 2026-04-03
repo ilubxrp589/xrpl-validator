@@ -175,8 +175,8 @@ impl Default for InnerNode {
 
 /// Leaf node in the SHAMap — holds a key and associated data.
 ///
-/// Hash computation:
-/// `SHA512Half(HASH_PREFIX_LEAF_NODE || key || data)`
+/// Hash computation (rippled order):
+/// `SHA512Half(HASH_PREFIX_LEAF_NODE || data || key)`
 ///
 /// Supports a "hash-only" mode where data is empty and the pre-computed
 /// hash is cached. Used by StateHashComputer where leaf data is never read back.

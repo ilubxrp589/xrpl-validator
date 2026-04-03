@@ -176,34 +176,48 @@ pub async fn outbound_handshake(
         }
     }
 
-    // Verify peer's session signature if we have their public key
-    if !peer_public_key.is_empty() && !peer_session_sig.is_empty() {
-        if let Ok(sig_bytes) = base64_decode(&peer_session_sig) {
-            let valid = if peer_public_key.len() == 33 {
-                if peer_public_key[0] == 0x02 || peer_public_key[0] == 0x03 {
-                    xrpl_core::crypto::secp256k1::verify(&peer_public_key, &shared_value, &sig_bytes)
-                        .unwrap_or(false)
-                } else if peer_public_key[0] == 0xED {
-                    let mut prefixed = shared_value.to_vec();
-                    let result = xrpl_core::crypto::ed25519::verify(&peer_public_key, &prefixed, &sig_bytes)
-                        .unwrap_or(false);
-                    prefixed.zeroize();
-                    result
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
+    // Reject peers that don't provide a public key
+    if peer_public_key.is_empty() {
+        return Err(NodeError::HandshakeFailed(
+            "peer did not provide a Public-Key header".to_string()
+        ));
+    }
 
-            if valid {
-                tracing::debug!("peer session signature verified");
-            } else {
-                return Err(NodeError::HandshakeFailed(
-                    "peer session signature verification failed".to_string()
-                ));
-            }
+    // Reject peers that don't provide a session signature
+    if peer_session_sig.is_empty() {
+        return Err(NodeError::HandshakeFailed(
+            "peer did not provide a Session-Signature header".to_string()
+        ));
+    }
+
+    // Decode and verify session signature — reject on ANY failure
+    let sig_bytes = base64_decode(&peer_session_sig).map_err(|_| {
+        NodeError::HandshakeFailed("invalid base64 in Session-Signature".to_string())
+    })?;
+
+    let valid = if peer_public_key.len() == 33 {
+        if peer_public_key[0] == 0x02 || peer_public_key[0] == 0x03 {
+            xrpl_core::crypto::secp256k1::verify(&peer_public_key, &shared_value, &sig_bytes)
+                .unwrap_or(false)
+        } else if peer_public_key[0] == 0xED {
+            let mut prefixed = shared_value.to_vec();
+            let result = xrpl_core::crypto::ed25519::verify(&peer_public_key, &prefixed, &sig_bytes)
+                .unwrap_or(false);
+            prefixed.zeroize();
+            result
+        } else {
+            false
         }
+    } else {
+        false
+    };
+
+    if valid {
+        tracing::debug!("peer session signature verified");
+    } else {
+        return Err(NodeError::HandshakeFailed(
+            "peer session signature verification failed".to_string()
+        ));
     }
 
     // Zeroize shared value now that signature verification is complete
@@ -224,11 +238,9 @@ pub async fn outbound_handshake(
                         let contains_key = cert_pubkey_der.windows(peer_public_key.len())
                             .any(|w| w == peer_public_key.as_slice());
                         if !contains_key {
-                            tracing::warn!(
-                                peer_key_len = peer_public_key.len(),
-                                cert_key_len = cert_pubkey_der.len(),
-                                "peer advertised Public-Key does not match TLS certificate public key — possible identity mismatch"
-                            );
+                            return Err(NodeError::HandshakeFailed(
+                                "peer Public-Key does not match TLS certificate — rejecting".to_string()
+                            ));
                         }
                     }
                     Err(_) => {
@@ -386,6 +398,16 @@ fn decode_node_public_key(encoded: &str) -> Option<Vec<u8>> {
     // result = 1 byte prefix (0x1C) + 33 bytes key + 4 bytes checksum
     if result.len() < 38 { return None; }
     if result[0] != 0x1C { return None; }
+
+    // Verify SHA-256d checksum (last 4 bytes)
+    let payload = &result[..34]; // prefix + key
+    let checksum = &result[34..38];
+    use sha2::{Digest as _, Sha256};
+    let h1 = Sha256::digest(payload);
+    let h2 = Sha256::digest(h1);
+    if &h2[..4] != checksum {
+        return None; // checksum mismatch — corrupted or tampered key
+    }
 
     // Extract the 33-byte public key (skip prefix, drop checksum)
     Some(result[1..34].to_vec())

@@ -20,7 +20,7 @@ pub struct LedgerRound {
 }
 
 /// Aggregated summary over a time period.
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, Default, serde::Serialize)]
 pub struct HistorySummary {
     pub total_rounds: u64,
     pub total_matches: u64,
@@ -70,7 +70,7 @@ impl HistoryStore {
 
     /// Record a ledger round.
     pub fn record(&self, r: &LedgerRound) {
-        let _ = self.conn.execute(
+        if let Err(e) = self.conn.execute(
             "INSERT OR REPLACE INTO ledger_rounds (seq, matched, healed, txs, objs, round_time_ms, compute_time_ms, peers, timestamp)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
@@ -84,19 +84,24 @@ impl HistoryStore {
                 r.peers,
                 r.timestamp,
             ],
-        );
+        ) {
+            eprintln!("[history] SQLite write failed: {e}");
+        }
     }
 
     /// Get summary statistics for a time period (in seconds from now).
     pub fn summary(&self, period_secs: u64) -> HistorySummary {
         let cutoff = now_secs().saturating_sub(period_secs);
-        let mut stmt = self.conn.prepare(
+        let mut stmt = match self.conn.prepare(
             "SELECT COUNT(*), SUM(matched), SUM(healed),
                     AVG(round_time_ms), AVG(compute_time_ms),
                     MIN(round_time_ms), MAX(round_time_ms),
                     MIN(seq), MAX(seq), MIN(timestamp), MAX(timestamp)
              FROM ledger_rounds WHERE timestamp >= ?1"
-        ).unwrap();
+        ) {
+            Ok(s) => s,
+            Err(_) => return HistorySummary::default(),
+        };
 
         stmt.query_row(params![cutoff], |row| {
             let total: u64 = row.get(0).unwrap_or(0);
@@ -137,10 +142,10 @@ impl HistoryStore {
 
     /// Get recent ledger rounds.
     pub fn recent(&self, limit: usize) -> Vec<LedgerRound> {
-        let mut stmt = self.conn.prepare(
+        let Ok(mut stmt) = self.conn.prepare(
             "SELECT seq, matched, healed, txs, objs, round_time_ms, compute_time_ms, peers, timestamp
              FROM ledger_rounds ORDER BY seq DESC LIMIT ?1"
-        ).unwrap();
+        ) else { return Vec::new(); };
 
         stmt.query_map(params![limit as u32], |row| {
             Ok(LedgerRound {
@@ -154,7 +159,7 @@ impl HistoryStore {
                 peers: row.get(7)?,
                 timestamp: row.get(8)?,
             })
-        }).unwrap().filter_map(|r| r.ok()).collect()
+        }).map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
     }
 
     /// Total rounds ever recorded.

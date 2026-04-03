@@ -437,7 +437,9 @@ async fn process_ledger(
                         }
 
                         if !retry_ok || retry_keys.is_empty() { continue; }
-                        let _ = db.write(retry_batch);
+                        if let Err(e) = db.write(retry_batch) {
+                            eprintln!("[ws-sync] Retry DB write failed: {e}");
+                        }
 
                         // Recompute hash with fresh data
                         let hc2 = hash_comp.clone(); let d2 = db.clone();

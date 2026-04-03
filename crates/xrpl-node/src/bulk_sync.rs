@@ -222,13 +222,19 @@ impl BulkSyncer {
                 }
 
                 if batch_size >= 10_000 {
-                    let _ = db.write(batch);
+                    if let Err(e) = db.write(batch) {
+                        eprintln!("[sync] RocksDB write failed: {e}");
+                    }
                     batch = rocksdb::WriteBatch::default();
                     batch_size = 0;
                 }
             }
 
-            if batch_size > 0 { let _ = db.write(batch); }
+            if batch_size > 0 {
+                if let Err(e) = db.write(batch) {
+                    eprintln!("[sync] Final RocksDB write failed: {e}");
+                }
+            }
 
             let root = shamap.root_hash();
             let elapsed = start_time.elapsed().as_secs_f64();
