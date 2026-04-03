@@ -58,6 +58,7 @@ tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
 native-tls = "0.2"
 tikv-jemallocator = "0.6"
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [build-dependencies]
 prost-build = "0.13"

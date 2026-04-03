@@ -22,6 +22,7 @@ pub async fn start_ws_sync(
     db: Arc<rocksdb::DB>,
     hash_comp: Arc<crate::state_hash::StateHashComputer>,
     last_synced: Arc<AtomicU32>,
+    history: Option<Arc<parking_lot::Mutex<crate::history::HistoryStore>>>,
 ) {
     let rpc = RippledClient::new();
 
@@ -165,6 +166,7 @@ pub async fn start_ws_sync(
                         &rpc, &db, &hash_comp,
                         process_seq, &acc_modified, &acc_deleted,
                         &account_hash, acc_tx_count, compute_hash,
+                        &history,
                     ).await;
 
                     last_processed = process_seq;
@@ -249,6 +251,7 @@ async fn process_ledger(
     account_hash: &str,
     tx_count: u32,
     compute_hash: bool,
+    history: &Option<Arc<parking_lot::Mutex<crate::history::HistoryStore>>>,
 ) -> bool {
     let ledger_start = std::time::Instant::now();
 
@@ -367,10 +370,20 @@ async fn process_ledger(
             if !account_hash.is_empty() {
                 let matched = ours.to_uppercase() == account_hash.to_uppercase();
                 hash_comp.set_network_hash(account_hash, seq);
+                let round_time = ledger_start.elapsed().as_secs_f64();
                 hash_comp.push_sync_log(crate::state_hash::SyncLogEntry {
                     seq, matched, txs: tx_count, objs: fetched_data.len() as u32,
-                    time_secs: ledger_start.elapsed().as_secs_f64(), healed: false,
+                    time_secs: round_time, healed: false,
                 });
+                if let Some(ref hist) = history {
+                    hist.lock().record(&crate::history::LedgerRound {
+                        seq, matched, healed: false, txs: tx_count,
+                        objs: fetched_data.len() as u32,
+                        round_time_ms: (round_time * 1000.0) as u32,
+                        compute_time_ms: 0, peers: 0,
+                        timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                    });
+                }
                 if matched {
                     eprintln!("[ws-sync] #{seq}: MATCH ({tx_count} txs, {} objs)", fetched_data.len());
                 } else {
@@ -504,10 +517,20 @@ async fn process_ledger(
                         // (the scan takes ~5min and blocks sync)
                     }
                     if healed {
+                        let heal_time = ledger_start.elapsed().as_secs_f64();
                         hash_comp.push_sync_log(crate::state_hash::SyncLogEntry {
                             seq, matched: true, txs: tx_count, objs: fetched_data.len() as u32,
-                            time_secs: ledger_start.elapsed().as_secs_f64(), healed: true,
+                            time_secs: heal_time, healed: true,
                         });
+                        if let Some(ref hist) = history {
+                            hist.lock().record(&crate::history::LedgerRound {
+                                seq, matched: true, healed: true, txs: tx_count,
+                                objs: fetched_data.len() as u32,
+                                round_time_ms: (heal_time * 1000.0) as u32,
+                                compute_time_ms: 0, peers: 0,
+                                timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                            });
+                        }
                     }
                     return healed;
                 }

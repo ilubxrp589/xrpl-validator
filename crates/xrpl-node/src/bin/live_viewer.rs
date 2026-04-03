@@ -455,6 +455,16 @@ async fn main() {
         let cache_dir = std::path::Path::new(&rocks_db_path).parent().unwrap_or(std::path::Path::new("."));
         state_hash_computer.set_cache_path(cache_dir.join("leaf_cache.bin"));
     }
+    // Historical data — SQLite time-series for uptime tracking
+    let history_store: Arc<parking_lot::Mutex<xrpl_node::history::HistoryStore>> = {
+        let history_path = std::path::Path::new(&rocks_db_path)
+            .parent().unwrap_or(std::path::Path::new("."))
+            .join("history.sqlite");
+        let store = xrpl_node::history::HistoryStore::open(history_path.to_str().unwrap_or("history.sqlite"))
+            .expect("failed to open history database");
+        Arc::new(parking_lot::Mutex::new(store))
+    };
+
     // Save cache on SIGTERM for instant restart (works with nohup/background)
     {
         let shc = state_hash_computer.clone();
@@ -495,7 +505,9 @@ async fn main() {
                 let backfill_db = db.clone();
                 let backfill_hash = state_hash_computer.clone();
                 let backfill_syncer = incremental_syncer.clone();
+                let backfill_hist = history_store.clone();
                 tokio::spawn(async move {
+                    let history_store = backfill_hist;
                     // Wait for SHAMap to finish building
                     loop {
                         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -578,7 +590,7 @@ async fn main() {
 
                     let ws_last = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(ws_start));
                     eprintln!("[startup] Starting WS sync from #{ws_start} after backfill");
-                    xrpl_node::ws_sync::start_ws_sync(backfill_db, backfill_hash, ws_last).await;
+                    xrpl_node::ws_sync::start_ws_sync(backfill_db, backfill_hash, ws_last, Some(history_store.clone())).await;
                 });
             } else {
                 eprintln!("[startup] Running full state sync — this is the final one");
@@ -593,7 +605,9 @@ async fn main() {
                 let hash_comp = state_hash_computer.clone();
                 let backfill_syncer = incremental_syncer.clone();
                 let startup_db = db.clone();
+                let startup_hist = history_store.clone();
                 tokio::spawn(async move {
+                    let history_store = startup_hist;
                     loop {
                         tokio::time::sleep(Duration::from_secs(2)).await;
                         if !syncer.is_running() {
@@ -618,8 +632,9 @@ async fn main() {
                             // Save pinned ledger for restart backfill
                             let _ = std::fs::write("/mnt/xrpl-data/sync/dl_done.txt",
                                 format!("ledger #{pinned} — {synced} objects"));
+                            let ws_hist = history_store.clone();
                             tokio::spawn(async move {
-                                xrpl_node::ws_sync::start_ws_sync(ws_db, ws_hash, ws_last).await;
+                                xrpl_node::ws_sync::start_ws_sync(ws_db, ws_hash, ws_last, Some(ws_hist)).await;
                             });
                             eprintln!("[startup] WS sync from #{pinned} (no second download, inc-sync DISABLED)");
                             // Keep backfilling=true
@@ -1229,6 +1244,31 @@ async fn main() {
                         });
                     status["db_entries"] = serde_json::json!(marker_count);
                     axum::Json(status)
+                }
+            }
+        }))
+        .route("/api/history", get({
+            let hist = history_store.clone();
+            move || {
+                let hist = hist.clone();
+                async move {
+                    // Default: 24h summary. Query params parsed from request if needed later.
+                    let h = hist.lock();
+                    let s1h = h.summary(3600);
+                    let s24h = h.summary(86400);
+                    let s7d = h.summary(604800);
+                    let s30d = h.summary(2592000);
+                    let recent = h.recent(50);
+                    let total = h.total_rounds();
+                    drop(h);
+                    axum::Json(serde_json::json!({
+                        "total_recorded": total,
+                        "1h": s1h,
+                        "24h": s24h,
+                        "7d": s7d,
+                        "30d": s30d,
+                        "recent": recent,
+                    }))
                 }
             }
         }))
