@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Halcyon XRPL Validator — Incidents</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #060610; color: #c8d0e0; font-family: 'Inter', -apple-system, sans-serif; font-size: 15px; line-height: 1.6; }
+  .container { max-width: 960px; margin: 0 auto; padding: 0 24px; }
+
+  nav { padding: 16px 0; border-bottom: 1px solid #12162a; }
+  nav .inner { display: flex; justify-content: space-between; align-items: center; }
+  nav .brand { font-family: 'JetBrains Mono', monospace; font-weight: 700; font-size: 14px; color: #e8ecf4; letter-spacing: 1px; text-decoration: none; }
+  nav .links a { color: #4a5a7a; text-decoration: none; font-size: 13px; margin-left: 16px; }
+  nav .links a:hover { color: #0085FF; }
+
+  .hero { text-align: center; padding: 48px 0 32px; }
+  .current-status { display: inline-flex; align-items: center; gap: 8px; padding: 8px 20px; border-radius: 20px; font-size: 13px; font-weight: 600; letter-spacing: 1px; }
+  .current-status.ok { background: rgba(0,255,136,0.08); color: #00ff88; border: 1px solid rgba(0,255,136,0.2); }
+  .current-status.issue { background: rgba(255,107,107,0.08); color: #ff6b6b; border: 1px solid rgba(255,107,107,0.2); }
+  .current-status .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .current-status.ok .dot { background: #00ff88; }
+  .current-status.issue .dot { background: #ff6b6b; }
+  h1 { font-size: 28px; font-weight: 700; color: #e8ecf4; margin-top: 16px; }
+
+  .timeline { padding: 32px 0; }
+  .incident { border-left: 2px solid #1a1e30; padding: 0 0 32px 24px; margin-left: 8px; position: relative; }
+  .incident:last-child { padding-bottom: 0; }
+  .incident::before { content: ''; position: absolute; left: -5px; top: 4px; width: 8px; height: 8px; border-radius: 50%; background: #2a3a5a; }
+  .incident.resolved::before { background: #00ff88; }
+  .incident .date { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #4a5a7a; margin-bottom: 4px; }
+  .incident .title { font-size: 16px; font-weight: 600; color: #e8ecf4; margin-bottom: 4px; }
+  .incident .duration { font-size: 12px; color: #3a4a6a; margin-bottom: 8px; }
+  .incident .detail { font-size: 14px; color: #6a7a9a; }
+  .incident .detail strong { color: #8a9aba; }
+
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; margin-right: 6px; }
+  .tag.resolved { background: rgba(0,255,136,0.1); color: #00ff88; }
+  .tag.monitoring { background: rgba(0,133,255,0.1); color: #0085FF; }
+
+  footer { padding: 32px 0; border-top: 1px solid #12162a; text-align: center; }
+  footer a { color: #4a5a7a; text-decoration: none; font-size: 12px; }
+  footer a:hover { color: #0085FF; }
+</style>
+</head>
+<body>
+
+<nav><div class="container inner">
+  <a href="/validator" class="brand">HALCYON VALIDATOR</a>
+  <div class="links">
+    <a href="/validator">Status</a>
+    <a href="/state">Dashboard</a>
+    <a href="/metrics">Metrics</a>
+  </div>
+</div></nav>
+
+<div class="container">
+  <div class="hero">
+    <div id="current-status" class="current-status ok">
+      <span class="dot"></span>
+      <span id="status-label">All Systems Operational</span>
+    </div>
+    <h1>Incident History</h1>
+  </div>
+
+  <div class="timeline" id="timeline">
+    <div class="incident resolved">
+      <div class="date">2026-04-01 — Infrastructure Migration</div>
+      <div class="title">Validator migrated from Intel i5-9600K to AMD Ryzen 5 5500</div>
+      <div class="duration"><span class="tag resolved">RESOLVED</span> Duration: ~30 minutes</div>
+      <div class="detail">
+        <strong>Impact:</strong> Validator offline during migration.<br>
+        <strong>Root cause:</strong> Planned hardware migration for SHA-NI support and improved hash computation performance.<br>
+        <strong>Resolution:</strong> Full state re-sync on new hardware. Hash compute time improved from 2.4s to 15ms (depth-4 bucket caching). Round time dropped from 2.5s to ~100ms.<br>
+        <strong>Follow-up:</strong> rippled moved to separate machine (localai) to eliminate CPU contention.
+      </div>
+    </div>
+
+    <div class="incident resolved">
+      <div class="date">2026-04-01 — DNS Volume Resolver</div>
+      <div class="title">Volume resolver container causing resource contention</div>
+      <div class="duration"><span class="tag resolved">RESOLVED</span> Duration: ~2 hours (intermittent)</div>
+      <div class="detail">
+        <strong>Impact:</strong> Incomplete state downloads (8.4M of 18.7M objects). rippled RPC timeouts under concurrent load.<br>
+        <strong>Root cause:</strong> Docker volume-resolver container consuming excessive resources on the same machine as rippled, causing RPC request failures during bulk state download.<br>
+        <strong>Resolution:</strong> Volume resolver stopped. All machines switched to 8.8.8.8 DNS. Full state download completed successfully.
+      </div>
+    </div>
+
+    <div class="incident resolved">
+      <div class="date">2026-03-29 — LedgerHashes Sub-page Fix</div>
+      <div class="title">Hash mismatches caused by incorrect LedgerHashes sub-page key computation</div>
+      <div class="duration"><span class="tag resolved">RESOLVED</span> Duration: ~6 hours (debugging)</div>
+      <div class="detail">
+        <strong>Impact:</strong> Intermittent hash mismatches every ~100 ledgers.<br>
+        <strong>Root cause:</strong> LedgerHashes sub-page key divisor was 256 instead of 65536. The sub-page key is computed as SHA512Half(0x0073 || seq/65536), not seq/256.<br>
+        <strong>Resolution:</strong> Fixed divisor. Achieved 28,500+ consecutive matches with zero mismatches. Self-healing retry mechanism verified working.
+      </div>
+    </div>
+
+    <div class="incident resolved">
+      <div class="date">2026-03-29 — Transaction Ordering Bug</div>
+      <div class="title">State hash divergence from incorrect transaction application order</div>
+      <div class="duration"><span class="tag resolved">RESOLVED</span> Duration: ~12 hours (investigation + fix)</div>
+      <div class="detail">
+        <strong>Impact:</strong> Consistent hash mismatches on every ledger.<br>
+        <strong>Root cause:</strong> rippled returns transactions in arbitrary array order, not execution order. Transactions must be sorted by TransactionIndex before applying AffectedNodes. When transactions touch the same objects (create then modify), processing out of order produces incorrect state.<br>
+        <strong>Resolution:</strong> Sort transactions by TransactionIndex before processing. Also fixed: FeeSettings singleton, entryNotFound handling, backfill race condition, and response ledger verification.
+      </div>
+    </div>
+  </div>
+</div>
+
+<footer><div class="container">
+  <a href="/validator">Back to Validator Status</a>
+</div></footer>
+
+<script>
+async function checkStatus() {
+  try {
+    const r = await fetch('/api/state-hash');
+    const d = await r.json();
+    const el = document.getElementById('current-status');
+    const label = document.getElementById('status-label');
+    if (d.consecutive_matches > 3) {
+      el.className = 'current-status ok';
+      label.textContent = 'All Systems Operational';
+    } else {
+      el.className = 'current-status issue';
+      label.textContent = 'Syncing / Recovering';
+    }
+  } catch {}
+}
+checkStatus();
+setInterval(checkStatus, 10000);
+</script>
+</body>
+</html>
