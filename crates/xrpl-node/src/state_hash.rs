@@ -555,33 +555,12 @@ impl StateHashComputer {
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0);
 
-            let loaded = self.cache_path.lock().as_ref().and_then(|p| {
-                eprintln!("[state-hash] Trying disk cache: {}", p.display());
-                let h = FlatHasher::load(p)?;
-                // Reject if cache is more than ~30 ledgers behind RocksDB (~2 min)
-                // This prevents stale cache from triggering full scan loops on restart
-                // Reject cache if RocksDB is empty or counts differ by >5%
-                if db_count < 1_000_000 {
-                    eprintln!("[state-hash] RocksDB only has ~{db_count} entries — cache stale, rebuilding");
-                    return None;
-                }
-                let diff = (h.total as f64 - db_count as f64).abs() / db_count as f64;
-                if diff > 0.05 {
-                    eprintln!("[state-hash] Cache has {} entries but RocksDB has ~{db_count} — {:.1}% drift, rebuilding",
-                        h.total, diff * 100.0);
-                    return None;
-                }
-                Some(h)
-            });
-            if let Some(h) = loaded {
-                eprintln!("[state-hash] Loaded from disk: {} entries in {:.1}s", h.total, start.elapsed().as_secs_f64());
-                *guard = Some(h);
-            } else {
-                eprintln!("[state-hash] Building 256-bucket hasher from RocksDB...");
-                let h = FlatHasher::build_from_db(db);
-                eprintln!("[state-hash] Hasher built: {} entries in {:.1}s", h.total, start.elapsed().as_secs_f64());
-                *guard = Some(h);
-            }
+            // Always build from RocksDB — fast enough (~20s) and avoids stale cache issues.
+            // Cache is still SAVED on SIGTERM and every 500 matches for future optimization.
+            eprintln!("[state-hash] Building 65536-bucket hasher from RocksDB...");
+            let h = FlatHasher::build_from_db(db);
+            eprintln!("[state-hash] Hasher built: {} entries in {:.1}s", h.total, start.elapsed().as_secs_f64());
+            *guard = Some(h);
         }
 
         let hasher = guard.as_mut().unwrap();
@@ -611,6 +590,7 @@ impl StateHashComputer {
 
         let mut s = self.status.lock();
         s.computed_hash = hash_hex;
+        s.compute_time_secs = total - update_time;
         s.computing = false;
         Some(root)
     }

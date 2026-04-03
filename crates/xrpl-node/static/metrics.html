@@ -62,7 +62,7 @@
 
 <div id="top-bar">
   <h1><span id="status" class="disconnected"></span>NODE METRICS<span class="tag">MAINNET</span></h1>
-  <nav><a href="/">FEED</a><a href="/consensus">CONSENSUS</a><a href="/peers">PEERS</a><a href="/state">STATE</a></nav>
+  <nav><a href="/">HOME</a><a href="/consensus">CONSENSUS</a><a href="/peers">PEERS</a><a href="/state">STATE</a><a href="/dashboard" style="color:#0085FF;border-color:rgba(0,133,255,0.4);">METRICS</a><a href="https://github.com/ilubxrp589/xrpl-validator" target="_blank">GITHUB</a></nav>
 </div>
 
 <!-- Stats Strip -->
@@ -100,15 +100,6 @@
 
   <!-- Row 2 -->
   <div class="card">
-    <div class="card-title">Transaction Types (Round)</div>
-    <div id="tx-type-bars"></div>
-    <div class="card-sub" style="margin-top:6px;">
-      <span id="m-engine-supported" style="color:#00ff88">0</span> supported /
-      <span id="m-engine-unsupported" style="color:#ff6b6b">0</span> unsupported
-    </div>
-  </div>
-
-  <div class="card">
     <div class="card-title">Engine Coverage</div>
     <div class="card-value green" id="m-coverage-val">--</div>
     <div class="card-sub">
@@ -127,13 +118,13 @@
     <canvas id="c-txs"></canvas>
   </div>
 
-  <!-- Row 3 -->
   <div class="card">
     <div class="card-title">Messages / Second</div>
     <div class="card-value green" id="m-rate-card">0</div>
     <canvas id="c-rate"></canvas>
   </div>
 
+  <!-- Row 3 -->
   <div class="card">
     <div class="card-title">Message Type Distribution</div>
     <div id="type-bars"></div>
@@ -154,6 +145,16 @@
     <div class="card-sub"><span id="m-sync-objects">0</span> objects (<span id="m-sync-size">0</span>MB) — <span id="m-sync-status" style="color:#3a4a6a">checking...</span></div>
     <div class="prog-track">
       <div id="m-sync-fill" class="prog-fill" style="background:#0085FF;width:0%"></div>
+    </div>
+  </div>
+
+  <!-- Full-width Transaction Types -->
+  <div class="card" style="grid-column: 1 / -1;">
+    <div class="card-title">Transaction Types (Round)</div>
+    <div id="tx-type-bars" style="min-height:200px;"></div>
+    <div class="card-sub" style="margin-top:6px;">
+      <span id="m-engine-supported" style="color:#00ff88">0</span> supported /
+      <span id="m-engine-unsupported" style="color:#ff6b6b">0</span> unsupported
     </div>
   </div>
 </div>
@@ -267,22 +268,29 @@ async function poll() {
     document.getElementById('m-fee-xrp').textContent = bx.toLocaleString(undefined, {maximumFractionDigits: 2});
     sFees.push(d.round_fees);
 
-    // Tx type bars
+    // Tx type bars — show ALL known types, stable layout
     const el = document.getElementById('tx-type-bars');
     const tr = d.round_tx_count || 1;
+    const types = d.round_tx_types || {};
+    const allTypes = Object.keys(txTypeColors);
+    // Merge any new types from data
+    for (const t of Object.keys(types)) { if (!allTypes.includes(t)) allTypes.push(t); }
+    // Sort: active types first by count, then inactive
+    allTypes.sort((a, b) => (types[b] || 0) - (types[a] || 0));
     let html = '';
-    for (const [type, cnt] of Object.entries(d.round_tx_types || {}).sort((a,b) => b[1] - a[1])) {
+    for (const type of allTypes) {
+      const cnt = types[type] || 0;
       const pct = (cnt / tr * 100).toFixed(0);
       const c = txTypeColors[type] || '#3a4a6a';
-      html += `<div style="display:flex;align-items:center;gap:6px;margin:2px 0;font-size:10px">
-        <span style="color:${c};min-width:100px">${type}</span>
+      const opacity = cnt > 0 ? '1' : '0.3';
+      html += `<div style="display:flex;align-items:center;gap:6px;margin:2px 0;font-size:10px;opacity:${opacity}">
+        <span style="color:${c};min-width:120px">${type}</span>
         <div style="flex:1;height:6px;background:#0a0a18;border-radius:3px;overflow:hidden">
-          <div style="width:${pct}%;height:100%;background:${c};border-radius:3px;min-width:2px"></div>
+          <div style="width:${pct}%;height:100%;background:${c};border-radius:3px;transition:width 0.3s;min-width:${cnt > 0 ? '2' : '0'}px"></div>
         </div>
-        <span style="color:#4a6a9a;min-width:24px;text-align:right">${cnt}</span>
+        <span style="color:#4a6a9a;min-width:30px;text-align:right">${cnt}</span>
       </div>`;
     }
-    if (!html) html = '<div style="color:#2a3a5a;font-size:10px">waiting...</div>';
     el.innerHTML = html;
 
     // Live engine hit rate

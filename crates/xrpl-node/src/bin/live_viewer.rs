@@ -1032,7 +1032,8 @@ async fn main() {
 
     // Web server
     let app = Router::new()
-        .route("/", get(index_page))
+        .route("/", get(validator_page))
+        .route("/feed", get(index_page))
         .route("/consensus", get(consensus_page))
         .route("/validator", get(validator_page))
         .route("/incidents", get(incidents_page))
