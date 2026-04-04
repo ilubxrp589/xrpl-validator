@@ -228,30 +228,26 @@ pub fn sign_validation(
 /// - Signature from signing key (VL, type=7 field=6 → 0x76)
 /// - MasterSignature from master key (VL, type=7 field=18 → 0x70 0x12)
 pub fn build_manifest(identity: &NodeIdentity) -> Vec<u8> {
-    let pub_key = identity.public_key();
+    let master_key = identity.master_public_key(); // Ed25519 (33 bytes, 0xED prefix)
+    let signing_key = identity.public_key();        // Secp256k1 (33 bytes, 0x02/0x03 prefix)
     let domain = std::env::var("XRPL_DOMAIN").unwrap_or_else(|_| "halcyon-names.io".to_string());
 
     // Build unsigned manifest (fields in canonical order by type then field)
-    let mut unsigned = Vec::with_capacity(192);
+    let mut unsigned = Vec::with_capacity(256);
 
     // Sequence = 1 (UINT32, type=2 field=4 → 0x24)
     unsigned.push(0x24);
     unsigned.extend_from_slice(&1u32.to_be_bytes());
 
-    // PublicKey = master key (VL, type=7 field=1 → 0x71)
+    // PublicKey = Ed25519 master key (VL, type=7 field=1 → 0x71)
     unsigned.push(0x71);
-    let pk_len = pub_key.len();
-    if pk_len > 192 {
-        eprintln!("[manifest] public key too long ({pk_len} bytes, max 192)");
-        return Vec::new();
-    }
-    unsigned.push(pk_len as u8);
-    unsigned.extend_from_slice(pub_key);
+    unsigned.push(master_key.len() as u8);
+    unsigned.extend_from_slice(master_key);
 
-    // SigningPubKey = same key (VL, type=7 field=3 → 0x73)
+    // SigningPubKey = Secp256k1 ephemeral key (VL, type=7 field=3 → 0x73)
     unsigned.push(0x73);
-    unsigned.push(pk_len as u8);
-    unsigned.extend_from_slice(pub_key);
+    unsigned.push(signing_key.len() as u8);
+    unsigned.extend_from_slice(signing_key);
 
     // Domain (VL, type=7 field=7 → 0x77) — raw ASCII bytes
     if !domain.is_empty() {
@@ -261,7 +257,7 @@ pub fn build_manifest(identity: &NodeIdentity) -> Vec<u8> {
         unsigned.extend_from_slice(domain_bytes);
     }
 
-    // Sign with MAN\0 prefix
+    // Hash for signing: SHA512Half(MAN\0 || unsigned_manifest)
     let prefix: [u8; 4] = [0x4D, 0x41, 0x4E, 0x00]; // "MAN\0"
     let mut hasher = Sha512::new();
     hasher.update(&prefix);
@@ -271,34 +267,42 @@ pub fn build_manifest(identity: &NodeIdentity) -> Vec<u8> {
         .try_into()
         .expect("SHA-512 output is always 64 bytes, first 32 always converts");
 
-    let signature = match identity.sign(&sign_hash) {
+    // Signature from SIGNING key (Secp256k1) — proves the ephemeral key authorized this manifest
+    let signing_sig = match identity.sign(&sign_hash) {
         Ok(sig) => sig,
         Err(e) => {
-            eprintln!("[manifest] Signing failed: {e}");
+            eprintln!("[manifest] Signing key signature failed: {e}");
             return Vec::new();
         }
     };
 
-    // Build full manifest with BOTH Signature and MasterSignature
+    // MasterSignature from MASTER key (Ed25519) — proves the master key authorized this manifest
+    let master_sig = match identity.master_sign(&sign_hash) {
+        Ok(sig) => sig,
+        Err(e) => {
+            eprintln!("[manifest] Master key signature failed: {e}");
+            return Vec::new();
+        }
+    };
+
+    // Build full manifest with both signatures
     let mut manifest = unsigned;
 
-    // Signature (VL, type=7 field=6 → 0x76) — ephemeral key signature
+    // Signature (VL, type=7 field=6 → 0x76) — from signing/ephemeral key
     manifest.push(0x76);
-    let sig_len = signature.len();
-    if sig_len > 192 {
-        eprintln!("[manifest] signature too long ({sig_len} bytes, max 192)");
-        return Vec::new();
-    }
-    manifest.push(sig_len as u8);
-    manifest.extend_from_slice(&signature);
+    encode_vl_length(&mut manifest, signing_sig.len());
+    manifest.extend_from_slice(&signing_sig);
 
-    // MasterSignature (VL, type=7 field=18 → 0x70 0x12) — master key signature
+    // MasterSignature (VL, type=7 field=18 → 0x70 0x12) — from master key
     manifest.push(0x70);
     manifest.push(0x12);
-    manifest.push(sig_len as u8);
-    manifest.extend_from_slice(&signature);
+    encode_vl_length(&mut manifest, master_sig.len());
+    manifest.extend_from_slice(&master_sig);
 
-    eprintln!("[manifest] Built with domain=\"{domain}\" ({} bytes)", manifest.len());
+    eprintln!("[manifest] Master key: {}", hex::encode(master_key));
+    eprintln!("[manifest] Signing key: {}", hex::encode(signing_key));
+    eprintln!("[manifest] Domain: {domain}");
+    eprintln!("[manifest] Built manifest ({} bytes)", manifest.len());
     manifest
 }
 

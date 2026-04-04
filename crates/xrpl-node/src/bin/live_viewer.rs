@@ -239,7 +239,8 @@ async fn main() {
             s
         };
         let identity = NodeIdentity::from_seed(&seed).expect("identity from seed failed");
-        eprintln!("[validator] Public key: {}", identity.public_key_hex());
+        eprintln!("[validator] Signing key (Secp256k1): {}", identity.public_key_hex());
+        eprintln!("[validator] Master key (Ed25519):    {}", hex::encode(identity.master_public_key()));
         identity
     });
 

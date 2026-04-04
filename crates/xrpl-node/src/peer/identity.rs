@@ -16,14 +16,17 @@ use crate::NodeError;
 
 /// Cryptographic identity of this node on the XRPL peer network.
 ///
-/// NOTE(6.2): The TLS keypair (Ed25519) is regenerated on every startup, so the
-/// node's TLS fingerprint changes each time. This is by design — the XRPL peer
-/// protocol identifies nodes by the Secp256k1 public key embedded in the TLS
-/// certificate's Subject CN, not by the TLS key itself. The Secp256k1 keypair
-/// is persisted via the seed file (XRPL_SEED_PATH) and remains stable across restarts.
+/// Two keypairs derived from the same seed:
+/// - **Master key** (Ed25519): permanent validator identity, signs manifests
+/// - **Signing key** (Secp256k1): ephemeral key, signs validations and peer handshakes
+///
+/// The TLS keypair is separate (regenerated each startup). The XRPL peer protocol
+/// identifies nodes by the Secp256k1 public key in the TLS certificate CN.
 pub struct NodeIdentity {
-    /// The XRPL keypair (Secp256k1). Public key is 33 bytes: 0x02/0x03 compressed point.
+    /// The XRPL signing keypair (Secp256k1). Signs validations and peer handshakes.
     keypair: Keypair,
+    /// The master keypair (Ed25519). Permanent validator identity, signs manifests.
+    master_keypair: Keypair,
     /// DER-encoded self-signed TLS certificate.
     tls_cert_der: Vec<u8>,
     /// DER-encoded private key for TLS.
@@ -35,23 +38,31 @@ pub struct NodeIdentity {
 }
 
 impl NodeIdentity {
-    /// Generate a new random node identity (Secp256k1 — required by XRPL peer protocol).
+    /// Generate a new random node identity.
     pub fn generate() -> Result<Self, NodeError> {
         let seed = Seed::generate_with_type(KeyType::Secp256k1);
         Self::from_seed(&seed)
     }
 
     /// Derive node identity from an existing seed.
+    /// Generates both Ed25519 (master) and Secp256k1 (signing) keypairs from the same seed bytes.
     pub fn from_seed(seed: &Seed) -> Result<Self, NodeError> {
-        let keypair = Keypair::from_seed(seed)
-            .map_err(|e| NodeError::Config(format!("keypair derivation failed: {e}")))?;
+        // Signing key: Secp256k1 (used for validations + peer handshakes)
+        let secp_seed = Seed { bytes: seed.bytes, key_type: KeyType::Secp256k1 };
+        let keypair = Keypair::from_seed(&secp_seed)
+            .map_err(|e| NodeError::Config(format!("secp256k1 keypair derivation failed: {e}")))?;
+
+        // Master key: Ed25519 (permanent validator identity, signs manifests)
+        let ed_seed = Seed { bytes: seed.bytes, key_type: KeyType::Ed25519 };
+        let master_keypair = Keypair::from_seed(&ed_seed)
+            .map_err(|e| NodeError::Config(format!("ed25519 master keypair derivation failed: {e}")))?;
 
         let pubkey_hex = hex::encode_upper(&keypair.public_key);
-        Self::from_keypair(keypair, &pubkey_hex)
+        Self::from_keypair(keypair, master_keypair, &pubkey_hex)
     }
 
-    /// Build identity from an already-derived keypair.
-    fn from_keypair(keypair: Keypair, cn: &str) -> Result<Self, NodeError> {
+    /// Build identity from already-derived keypairs.
+    fn from_keypair(keypair: Keypair, master_keypair: Keypair, cn: &str) -> Result<Self, NodeError> {
         // Generate a separate TLS keypair (Ed25519) via rcgen.
         // The XRPL node public key goes in the certificate Subject CN
         // so peers can extract it during handshake.
@@ -91,6 +102,7 @@ impl NodeIdentity {
 
         Ok(Self {
             keypair,
+            master_keypair,
             tls_cert_der,
             tls_key_der,
             server_config: Arc::new(server_config),
@@ -99,8 +111,22 @@ impl NodeIdentity {
     }
 
     /// The 33-byte compressed Secp256k1 public key (0x02 or 0x03 prefix).
+    /// This is the signing/ephemeral key used for validations and peer handshakes.
     pub fn public_key(&self) -> &[u8] {
         &self.keypair.public_key
+    }
+
+    /// The 33-byte Ed25519 master public key (0xED prefix + 32 bytes).
+    /// This is the permanent validator identity used in manifests.
+    pub fn master_public_key(&self) -> &[u8] {
+        &self.master_keypair.public_key
+    }
+
+    /// Sign a message with the master (Ed25519) key.
+    pub fn master_sign(&self, message: &[u8]) -> Result<Vec<u8>, NodeError> {
+        self.master_keypair
+            .sign(message)
+            .map_err(|e| NodeError::PeerProtocol(format!("master signing failed: {e}")))
     }
 
     /// Hex-encoded public key (uppercase).
