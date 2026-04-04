@@ -13,7 +13,7 @@ fn main() {
         .timeout(std::time::Duration::from_secs(10))
         .build().unwrap();
     let resp: serde_json::Value = client
-        .post("http://10.0.0.39:5005")
+        .post("http://localhost:5005")
         .json(&serde_json::json!({"method":"ledger","params":[{"ledger_index":"validated"}]}))
         .send().unwrap().json().unwrap();
     let seq: u32 = resp["result"]["ledger"]["ledger_index"].as_str()
@@ -52,7 +52,7 @@ fn main() {
     
     // Get hash AFTER scan too (to see if ledger moved)
     let resp2: serde_json::Value = client
-        .post("http://10.0.0.39:5005")
+        .post("http://localhost:5005")
         .json(&serde_json::json!({"method":"ledger","params":[{"ledger_index":"validated"}]}))
         .send().unwrap().json().unwrap();
     let seq2: u32 = resp2["result"]["ledger"]["ledger_index"].as_str()
@@ -65,7 +65,7 @@ fn main() {
     eprintln!("\nChecking recent ledgers:");
     for check_seq in (seq2.saturating_sub(15))..=seq2 {
         let resp: serde_json::Value = client
-            .post("http://10.0.0.39:5005")
+            .post("http://localhost:5005")
             .json(&serde_json::json!({"method":"ledger","params":[{"ledger_index":check_seq}]}))
             .send().unwrap().json().unwrap();
         if let Some(hash) = resp["result"]["ledger"]["account_hash"].as_str() {

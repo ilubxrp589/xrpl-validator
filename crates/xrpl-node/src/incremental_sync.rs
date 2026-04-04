@@ -110,9 +110,9 @@ impl IncrementalSyncer {
                     .expect("sweep client");
 
                 let endpoints = [
-                    "http://10.0.0.39:5005",
-                    "http://10.0.0.39:5005",
-                    "http://10.0.0.39:5005",
+                    "http://localhost:5005",
+                    "http://localhost:5005",
+                    "http://localhost:5005",
                 ];
 
                 let pinned_seq: u32 = match client.post(endpoints[0])
@@ -300,7 +300,7 @@ impl IncrementalSyncer {
                     let diag_hash = hash_comp.status.lock().computed_hash.clone();
                     let verify_client = reqwest::Client::builder()
                         .timeout(std::time::Duration::from_secs(5)).build().unwrap_or_default();
-                    if let Ok(resp) = verify_client.post("http://10.0.0.39:5005")
+                    if let Ok(resp) = verify_client.post("http://localhost:5005")
                         .json(&serde_json::json!({"method":"ledger","params":[{"ledger_index":last_gap_seq}]}))
                         .send().await
                     {
@@ -341,7 +341,7 @@ impl IncrementalSyncer {
                                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                             }
                             let resp = client
-                                .post("http://10.0.0.39:5005")
+                                .post("http://localhost:5005")
                                 .json(&serde_json::json!({
                                     "method": "ledger",
                                     "params": [{"ledger_index": fill_seq, "transactions": true, "expand": true, "binary": false}]
@@ -420,7 +420,7 @@ impl IncrementalSyncer {
                             let fetch_seq = seq; // current ledger — always available
                             handles.push(tokio::spawn(async move {
                                 let resp = client
-                                    .post("http://10.0.0.39:5005")
+                                    .post("http://localhost:5005")
                                     .json(&serde_json::json!({
                                         "method": "ledger_entry",
                                         "params": [{"index": index, "binary": true, "ledger_index": fetch_seq}]
@@ -603,7 +603,7 @@ impl IncrementalSyncer {
                     .build()
                     .unwrap_or_default();
                 if let Ok(resp) = client
-                    .post("http://10.0.0.39:5005")
+                    .post("http://localhost:5005")
                     .json(&serde_json::json!({
                         "method": "ledger",
                         "params": [{"ledger_index": seq}]
@@ -707,7 +707,7 @@ impl IncrementalSyncer {
                     .build()
                     .unwrap_or_default();
                 let latest: u32 = match client
-                    .post("http://10.0.0.39:5005")
+                    .post("http://localhost:5005")
                     .json(&serde_json::json!({"method":"ledger","params":[{"ledger_index":"validated"}]}))
                     .send()
                     .await
@@ -801,7 +801,7 @@ async fn sync_ledger_state(
 
     // Step 1: Fetch the ledger with transaction metadata
     let resp = client
-        .post("http://10.0.0.39:5005")
+        .post("http://localhost:5005")
         .json(&serde_json::json!({
             "method": "ledger",
             "params": [{
@@ -905,7 +905,7 @@ async fn sync_ledger_state(
         let mut ok = false;
         for _attempt in 0..3u32 {
             let resp = client
-                .post("http://10.0.0.39:5005")
+                .post("http://localhost:5005")
                 .json(&serde_json::json!({
                     "method": "ledger_entry",
                     "params": [{"index": index_hex, "binary": true, "ledger_index": seq}]
@@ -1029,7 +1029,7 @@ async fn repair_failed_keys(
     let mut repaired = 0usize;
     for (_orig_seq, index_hex) in pending {
         let resp = client
-            .post("http://10.0.0.39:5005")
+            .post("http://localhost:5005")
             .json(&serde_json::json!({
                 "method": "ledger_entry",
                 "params": [{"index": index_hex, "binary": true, "ledger_index": current_seq}]

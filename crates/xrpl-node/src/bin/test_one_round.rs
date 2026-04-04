@@ -6,7 +6,7 @@ use xrpl_core::types::Hash256;
 use xrpl_ledger::shamap::hash::{sha512_half_prefixed, HASH_PREFIX_LEAF_NODE};
 use xrpl_ledger::shamap::tree::{SHAMap, TreeType};
 
-const RPC: &str = "http://10.0.0.39:5005";
+const RPC: &str = "http://localhost:5005";
 
 fn build_hash(db: &rocksdb::DB) -> (String, u64) {
     let mut map = SHAMap::new(TreeType::State);

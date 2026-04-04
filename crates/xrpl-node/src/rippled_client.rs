@@ -3,18 +3,18 @@
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::sync::Arc;
 
-/// Ordered list of RPC endpoints to try.
+/// RPC endpoints — override primary with XRPL_RPC_URL env var.
 const ENDPOINTS: &[&str] = &[
-    "http://10.0.0.39:5005",       // local rippled on localai (NVMe)
+    "http://localhost:5005",        // local rippled RPC
     "https://xrplcluster.com",     // public cluster (full history)
     "https://s1.ripple.com:51234", // Ripple's public server
 ];
 
-/// WebSocket endpoints for subscription.
+/// WebSocket endpoints — override primary with XRPL_WS_URL env var.
 const WS_ENDPOINTS: &[&str] = &[
-    "ws://10.0.0.39:6006",        // local rippled WS on localai
-    "wss://xrplcluster.com",      // public WS
-    "wss://s1.ripple.com:51233",  // Ripple's public WS
+    "ws://localhost:6006",          // local rippled WS
+    "wss://xrplcluster.com",       // public WS
+    "wss://s1.ripple.com:51233",   // Ripple's public WS
 ];
 
 /// A resilient RPC client that automatically fails over between endpoints.

@@ -12,7 +12,7 @@ use xrpl_ledger::shamap::hash::{sha512_half_prefixed, HASH_PREFIX_LEAF_NODE};
 use xrpl_ledger::shamap::tree::{SHAMap, TreeType};
 
 const RPC_ENDPOINTS: &[&str] = &[
-    "http://10.0.0.39:5005",       // local rippled on localai (fast LAN)
+    "http://localhost:5005",        // local rippled RPC
     "https://xrplcluster.com",     // public fallback
     "https://s1.ripple.com:51234", // Ripple public
 ];

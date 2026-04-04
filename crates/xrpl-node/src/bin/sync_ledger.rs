@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-const RPC_ENDPOINT: &str = "http://10.0.0.39:5005";
+const RPC_ENDPOINT: &str = "http://localhost:5005";
 const PAGE_SIZE: u32 = 2048;
 const ROCKS_PATH: &str = "/mnt/xrpl-data/sync/state.rocks";
 const MARKER_FILE: &str = "/mnt/xrpl-data/sync/dl_marker.txt";

@@ -47,9 +47,9 @@ echo "Restarting validator with live engine enabled..."
 pm2 delete xrpl-validator 2>/dev/null
 
 # Start fresh WITHOUT the env var — live engine will open sled
-pm2 start /home/localai/Desktop/xrpl-validator/target/release/live_viewer \
+pm2 start ./target/release/live_viewer \
   --name xrpl-validator \
-  --cwd /home/localai/Desktop/xrpl-validator
+  --cwd .
 
 pm2 save
 

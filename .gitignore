@@ -32,3 +32,10 @@ engine_state.json
 
 # Snapshot data (9GB+)
 xrpl_clean_snapshot/
+
+# AI context files
+CLAUDE.md
+**/CLAUDE.md
+
+# SQLite history
+*.sqlite

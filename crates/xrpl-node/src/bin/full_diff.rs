@@ -15,7 +15,7 @@ fn main() {
 
     // Get validated ledger
     let resp: serde_json::Value = client
-        .post("http://10.0.0.39:5005")
+        .post("http://localhost:5005")
         .json(&serde_json::json!({"method":"ledger","params":[{"ledger_index":"validated"}]}))
         .send().unwrap().json().unwrap();
     let seq: u32 = resp["result"]["ledger"]["ledger_index"].as_str()
@@ -38,7 +38,7 @@ fn main() {
             params["marker"] = serde_json::Value::String(m.clone());
         }
 
-        let resp: serde_json::Value = match client.post("http://10.0.0.39:5005")
+        let resp: serde_json::Value = match client.post("http://localhost:5005")
             .json(&serde_json::json!({"method":"ledger_data","params":[params]}))
             .send()
         {

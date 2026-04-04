@@ -13,7 +13,7 @@ fn main() {
 
     // Get current validated ledger
     let resp: serde_json::Value = client
-        .post("http://10.0.0.39:5005")
+        .post("http://localhost:5005")
         .json(&serde_json::json!({"method":"ledger","params":[{"ledger_index":"validated"}]}))
         .send().unwrap().json().unwrap();
     let seq: u32 = resp["result"]["ledger"]["ledger_index"].as_str()
@@ -41,7 +41,7 @@ fn main() {
             
             let key_hex = hex::encode(&key);
             let resp: serde_json::Value = client
-                .post("http://10.0.0.39:5005")
+                .post("http://localhost:5005")
                 .json(&serde_json::json!({
                     "method": "ledger_entry",
                     "params": [{"index": &key_hex, "binary": true, "ledger_index": "validated"}]

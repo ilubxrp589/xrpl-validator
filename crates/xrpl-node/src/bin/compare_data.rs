@@ -30,7 +30,7 @@ fn main() {
     
     for (key_hex, rocks_data) in &samples {
         let resp: serde_json::Value = client
-            .post("http://10.0.0.39:5005")
+            .post("http://localhost:5005")
             .json(&serde_json::json!({
                 "method": "ledger_entry",
                 "params": [{"index": key_hex, "binary": true, "ledger_index": "validated"}]
