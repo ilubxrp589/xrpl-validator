@@ -257,17 +257,21 @@ pub fn build_manifest(identity: &NodeIdentity) -> Vec<u8> {
         unsigned.extend_from_slice(domain_bytes);
     }
 
-    // Hash for signing: SHA512Half(MAN\0 || unsigned_manifest)
+    // Signing data: prefix || unsigned_manifest
     let prefix: [u8; 4] = [0x4D, 0x41, 0x4E, 0x00]; // "MAN\0"
+    let mut sign_data = Vec::with_capacity(4 + unsigned.len());
+    sign_data.extend_from_slice(&prefix);
+    sign_data.extend_from_slice(&unsigned);
+
+    // Secp256k1 signs SHA512Half(data) — pre-hash required
     let mut hasher = Sha512::new();
-    hasher.update(&prefix);
-    hasher.update(&unsigned);
+    hasher.update(&sign_data);
     let full_hash = hasher.finalize();
     let sign_hash: [u8; 32] = full_hash[..32]
         .try_into()
         .expect("SHA-512 output is always 64 bytes, first 32 always converts");
 
-    // Signature from SIGNING key (Secp256k1) — proves the ephemeral key authorized this manifest
+    // Signature from SIGNING key (Secp256k1) — signs the HASH
     let signing_sig = match identity.sign(&sign_hash) {
         Ok(sig) => sig,
         Err(e) => {
@@ -276,8 +280,8 @@ pub fn build_manifest(identity: &NodeIdentity) -> Vec<u8> {
         }
     };
 
-    // MasterSignature from MASTER key (Ed25519) — proves the master key authorized this manifest
-    let master_sig = match identity.master_sign(&sign_hash) {
+    // MasterSignature from MASTER key (Ed25519) — signs RAW data (Ed25519 hashes internally)
+    let master_sig = match identity.master_sign(&sign_data) {
         Ok(sig) => sig,
         Err(e) => {
             eprintln!("[manifest] Master key signature failed: {e}");
