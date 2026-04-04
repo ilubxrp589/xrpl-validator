@@ -217,21 +217,22 @@ pub fn sign_validation(
     full
 }
 
-/// Build a validator manifest — maps master key to signing key.
-/// For simplicity, we use the same key for both (sequence=1).
+/// Build a validator manifest — maps master key to signing key + declares domain.
+/// Uses the same key for both master and signing (sequence=1).
 ///
-/// Manifest format (XRPL serialized object):
-/// - Sequence (UINT32, field 0x24)
-/// - PublicKey / master key (VL, field 0x71)
-/// - SigningPubKey / ephemeral key (VL, field 0x73)
-/// - Signature from master key (VL, field 0x76)
-///
-/// If master == signing, only one signature is needed.
+/// Manifest format (XRPL serialized object, canonical field order):
+/// - Sequence (UINT32, type=2 field=4 → 0x24)
+/// - PublicKey / master key (VL, type=7 field=1 → 0x71)
+/// - SigningPubKey / ephemeral key (VL, type=7 field=3 → 0x73)
+/// - Domain (VL, type=7 field=7 → 0x77) — ASCII domain for verification
+/// - Signature from signing key (VL, type=7 field=6 → 0x76)
+/// - MasterSignature from master key (VL, type=7 field=18 → 0x70 0x12)
 pub fn build_manifest(identity: &NodeIdentity) -> Vec<u8> {
     let pub_key = identity.public_key();
+    let domain = std::env::var("XRPL_DOMAIN").unwrap_or_else(|_| "halcyon-names.io".to_string());
 
-    // Build unsigned manifest
-    let mut unsigned = Vec::with_capacity(128);
+    // Build unsigned manifest (fields in canonical order by type then field)
+    let mut unsigned = Vec::with_capacity(192);
 
     // Sequence = 1 (UINT32, type=2 field=4 → 0x24)
     unsigned.push(0x24);
@@ -252,7 +253,15 @@ pub fn build_manifest(identity: &NodeIdentity) -> Vec<u8> {
     unsigned.push(pk_len as u8);
     unsigned.extend_from_slice(pub_key);
 
-    // Sign with MAN\0 prefix — same hash used for both signatures
+    // Domain (VL, type=7 field=7 → 0x77) — raw ASCII bytes
+    if !domain.is_empty() {
+        let domain_bytes = domain.as_bytes();
+        unsigned.push(0x77);
+        encode_vl_length(&mut unsigned, domain_bytes.len());
+        unsigned.extend_from_slice(domain_bytes);
+    }
+
+    // Sign with MAN\0 prefix
     let prefix: [u8; 4] = [0x4D, 0x41, 0x4E, 0x00]; // "MAN\0"
     let mut hasher = Sha512::new();
     hasher.update(&prefix);
@@ -271,7 +280,6 @@ pub fn build_manifest(identity: &NodeIdentity) -> Vec<u8> {
     };
 
     // Build full manifest with BOTH Signature and MasterSignature
-    // (rippled requires both even when master == signing key)
     let mut manifest = unsigned;
 
     // Signature (VL, type=7 field=6 → 0x76) — ephemeral key signature
@@ -290,6 +298,7 @@ pub fn build_manifest(identity: &NodeIdentity) -> Vec<u8> {
     manifest.push(sig_len as u8);
     manifest.extend_from_slice(&signature);
 
+    eprintln!("[manifest] Built with domain=\"{domain}\" ({} bytes)", manifest.len());
     manifest
 }
 
