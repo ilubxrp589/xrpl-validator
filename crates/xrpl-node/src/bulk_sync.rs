@@ -24,9 +24,14 @@ fn primary_rpc_endpoint() -> String {
 const NUM_WORKERS: u32 = 4;
 
 /// Try RPC request against each endpoint until one succeeds.
+/// Uses XRPL_RPC_URL env override as the first endpoint if set.
 fn rpc_failover(client: &reqwest::blocking::Client, body: &serde_json::Value) -> Result<serde_json::Value, String> {
-    for (i, url) in RPC_ENDPOINTS.iter().enumerate() {
-        match client.post(*url).json(body).send() {
+    let primary = primary_rpc_endpoint();
+    let endpoints: Vec<String> = std::iter::once(primary)
+        .chain(RPC_ENDPOINTS.iter().map(|s| s.to_string()))
+        .collect();
+    for (i, url) in endpoints.iter().enumerate() {
+        match client.post(url.as_str()).json(body).send() {
             Ok(resp) => match resp.json::<serde_json::Value>() {
                 Ok(json) => {
                     if json["result"]["error"].as_str() == Some("noNetwork") { continue; }
