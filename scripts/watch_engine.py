@@ -46,22 +46,30 @@ def render():
     # Consensus (Phase A)
     # FFI (libxrpl integration)
     if isinstance(ffi, dict):
-        out.append(colored("── libxrpl FFI (rippled tx engine integration) ──", "1;35"))
+        out.append(colored("── libxrpl FFI (live mainnet tx → rippled C++ engine) ──", "1;35"))
         if ffi.get("enabled") is False:
             out.append(f"  {colored('DISABLED', '33')} — {ffi.get('note', 'build with --features ffi')}")
         else:
             ver = ffi.get("libxrpl_version", "?")
+            parsed = ffi.get("live_txs_parsed", 0)
+            pf_ok = ffi.get("live_txs_preflight_ok", 0)
+            pf_fail = ffi.get("live_txs_preflight_fail", 0)
+            live_seq = ffi.get("live_ledger_seq", 0)
+            last_type = ffi.get("live_last_type", "?")
+            last_ter = ffi.get("live_last_ter", "?")
+            pct = (pf_ok / parsed * 100) if parsed else 0
+            out.append(f"  libxrpl:     {colored(ver, '36')}")
+            out.append(f"  live ledger: #{live_seq}")
+            out.append(f"  txs through FFI: {colored(f'{parsed:,}', '36')}  |  preflight OK: {colored(f'{pf_ok:,}', '32')}  fail: {colored(f'{pf_fail:,}', '31' if pf_fail else '32')}  ({pct:.1f}%)")
+            out.append(f"  last tx:     {last_type}  TER={colored(last_ter, '32' if last_ter == 'tesSUCCESS' else '33')}")
+            types = ffi.get("live_types_seen", {})
+            if types:
+                top = sorted(types.items(), key=lambda x: -x[1])[:6]
+                type_line = "  types:       " + " | ".join(f"{k}:{colored(str(v), '36')}" for k, v in top)
+                out.append(type_line)
             checks = ffi.get("health_checks", 0)
             passed = ffi.get("health_passed", 0)
-            last_ter = ffi.get("last_ter_name", "?")
-            last_muts = ffi.get("last_mutations", 0)
-            last_ms = ffi.get("last_check_ms", 0)
-            pass_pct = (passed / checks * 100) if checks else 0
-            status_color = "32" if pass_pct >= 99 else "33" if pass_pct >= 80 else "31"
-            health_str = f"{passed}/{checks}"
-            out.append(f"  libxrpl:     {colored(ver, '36')}")
-            out.append(f"  health:      {colored(health_str, status_color)} ({pass_pct:.1f}% pass)")
-            out.append(f"  last check:  TER={colored(last_ter, '32' if last_ter == 'tesSUCCESS' else '31')}  mutations={last_muts}  {last_ms}ms")
+            out.append(f"  self-test:   {colored(f'{passed}/{checks}', '32' if passed == checks and checks > 0 else '31')}  (hardcoded Payment apply, every 500ms)")
         out.append("")
 
     out.append(colored("── Consensus Monitor (Phase A) ──", "1;35"))

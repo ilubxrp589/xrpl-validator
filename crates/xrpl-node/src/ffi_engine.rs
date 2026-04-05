@@ -49,6 +49,7 @@ impl<'a> SleProvider for RocksDbProvider<'a> {
 #[derive(Clone, Default, serde::Serialize)]
 pub struct FfiStats {
     pub libxrpl_version: String,
+    // Self-test (same hardcoded tx in a loop)
     pub health_checks: u64,
     pub health_passed: u64,
     pub last_ter: i32,
@@ -56,6 +57,15 @@ pub struct FfiStats {
     pub last_applied: bool,
     pub last_mutations: usize,
     pub last_check_ms: u64,
+    // Live mainnet tx processing
+    pub live_txs_parsed: u64,
+    pub live_txs_preflight_ok: u64,
+    pub live_txs_preflight_fail: u64,
+    pub live_last_type: String,
+    pub live_last_hash: String,
+    pub live_last_ter: String,
+    pub live_ledger_seq: u32,
+    pub live_types_seen: std::collections::BTreeMap<String, u64>,
 }
 
 pub type SharedFfiStats = Arc<Mutex<FfiStats>>;
@@ -175,4 +185,28 @@ pub fn health_check(stats: &SharedFfiStats) -> bool {
     s.last_mutations = outcome.mutations.len();
     s.last_check_ms = elapsed_ms;
     passed
+}
+
+/// Process a single live mainnet tx: parse + preflight via FFI, update stats.
+/// Does NOT call apply (no state access). Just validates signature + format
+/// against libxrpl's canonical rules.
+pub fn process_live_tx(stats: &SharedFfiStats, tx_bytes: &[u8], ledger_seq: u32) {
+    let parsed = match parse_tx(tx_bytes) {
+        Some(p) => p,
+        None => return,
+    };
+    let pf = preflight(tx_bytes, &[], 0, 0);
+
+    let mut s = stats.lock();
+    s.live_txs_parsed += 1;
+    if pf.is_success() {
+        s.live_txs_preflight_ok += 1;
+    } else {
+        s.live_txs_preflight_fail += 1;
+    }
+    s.live_last_type = parsed.tx_type.clone();
+    s.live_last_hash = hex::encode_upper(parsed.hash);
+    s.live_last_ter = pf.ter_name.clone();
+    s.live_ledger_seq = ledger_seq;
+    *s.live_types_seen.entry(parsed.tx_type).or_insert(0) += 1;
 }
