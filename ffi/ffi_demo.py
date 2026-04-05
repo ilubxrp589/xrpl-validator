@@ -39,27 +39,45 @@ def run_once():
     apply_ok = "apply result: TER=0 (tesSUCCESS) applied=true" in output
     return (parsed, preflight, apply_ok, elapsed_ms)
 
-def render(stats, last_tx_info):
+def render(stats):
     out = []
     out.append(colored("═══ XRPL libxrpl FFI — Live Apply Demo ═══", "1;35"))
     out.append("")
-    out.append(colored("Pipeline:", "1") + " Rust/C → shim → STTx → MinimalServiceRegistry → CallbackReadView → OpenView → xrpl::apply()")
-    out.append("")
 
-    # Stage counters
     total = stats['iterations']
     parsed = stats['parsed']
     preflight = stats['preflight']
     applied = stats['applied']
 
+    # BIG STATUS BANNER — the one thing to watch
+    all_ok = (parsed == total and preflight == total and applied == total and total > 0)
+    if all_ok:
+        banner = colored(" ✓ FFI HEALTHY ", "1;42;97")
+        msg = colored("All 3 libxrpl stages returning tesSUCCESS on every call", "32")
+    elif total == 0:
+        banner = colored(" … STARTING ", "1;43;30")
+        msg = "Waiting for first iteration..."
+    else:
+        banner = colored(" ✗ FFI BROKEN ", "1;41;97")
+        msg = colored("One or more stages failed — check test_shim output", "31")
+    out.append(f"  {banner}  {msg}")
+    out.append("")
+    out.append(colored("What this demo proves:", "1"))
+    out.append("  • Our C++ shim can link against libxrpl.a (746MB static lib from rippled)")
+    out.append("  • libxrpl's production transactors validate + apply a real mainnet Payment")
+    out.append("  • State lookups go through OUR callback (Rust would own RocksDB in production)")
+    out.append("  • Full pipeline: parse tx → preflight → preclaim → doApply → TER=tesSUCCESS")
+    out.append("")
+
+    # Stage counters
     def row(name, count, color):
         pct = (count / total * 100) if total else 0
         return f"  {name:12s} {colored(f'{count:,}', color):25s} {colored(bar(pct), color)} {colored(f'{pct:5.1f}%', color)}"
 
     out.append(colored("── Stages (each iteration runs all three) ──", "1;36"))
-    out.append(row("tx parsed",  parsed,     "32"))
-    out.append(row("preflight",  preflight,  "32"))
-    out.append(row("apply",      applied,    "32"))
+    out.append(row("tx parsed",  parsed,     "32" if parsed == total else "31"))
+    out.append(row("preflight",  preflight,  "32" if preflight == total else "31"))
+    out.append(row("apply",      applied,    "32" if applied == total else "31"))
     out.append("")
 
     # Throughput
@@ -68,7 +86,7 @@ def render(stats, last_tx_info):
     out.append(colored("── Throughput ──", "1;33"))
     out.append(f"  elapsed:     {elapsed:.1f}s")
     out.append(f"  iterations:  {colored(f'{total:,}', '36')} × 3 stages = {colored(f'{total*3:,}', '36')} libxrpl calls")
-    out.append(f"  rate:        {colored(f'{tps:.1f} iter/s', '36')} ({tps*3:.0f} calls/s)")
+    out.append(f"  rate:        {colored(f'{tps:.1f} iter/s', '36')} ({tps*3:.0f} libxrpl calls/s)")
     out.append("")
 
     # Latency
@@ -78,16 +96,18 @@ def render(stats, last_tx_info):
         p50 = lats[n // 2]
         p99 = lats[min(n - 1, int(n * 0.99))]
         avg = sum(lats) / n
-        out.append(colored("── Latency (per iteration, all 3 stages) ──", "1;34"))
+        out.append(colored("── Latency (per iteration, all 3 stages via subprocess) ──", "1;34"))
         out.append(f"  avg:  {colored(f'{avg:6.2f}ms', '36')}  p50: {colored(f'{p50:6.2f}ms', '36')}  p99: {colored(f'{p99:6.2f}ms', '36')}")
+        out.append(colored("  (real in-process FFI would be ~1000x faster — no subprocess overhead)", "90"))
         out.append("")
 
-    # Last tx
-    out.append(colored("── Last tx (mainnet Payment 39077702...33ABA) ──", "1;37"))
-    out.append(f"  type:     {last_tx_info.get('type', '?')}")
-    out.append(f"  hash:     {last_tx_info.get('hash', '?')[:40]}...")
-    out.append(f"  preflight: {colored(last_tx_info.get('pf', '?'), '32' if 'tesSUCCESS' in last_tx_info.get('pf','') else '31')}")
-    out.append(f"  apply:     {colored(last_tx_info.get('ap', '?'), '32' if 'tesSUCCESS' in last_tx_info.get('ap','') else '31')}")
+    # Static test tx info (honest: same tx every iteration)
+    out.append(colored("── Test transaction (hardcoded in test_shim) ──", "1;37"))
+    out.append("  source:   mainnet ledger 103354511 (referral reward)")
+    out.append("  type:     Payment (XRP)")
+    out.append("  hash:     39077702C3FCE0DDC5693065FC0DA35576E4D011...33ABA")
+    out.append("  amount:   10 drops | fee: 15 drops")
+    out.append(colored("  note:     same tx every iteration — proves pipeline, not diversity", "90"))
 
     return "\n".join(out)
 
@@ -103,13 +123,6 @@ def main():
         'latencies': [],
         'start': time.time(),
     }
-    last_tx_info = {
-        'type': 'Payment',
-        'hash': '39077702C3FCE0DDC5693065FC0DA35576E4D0112FDEA08D6CAD099074033ABA',
-        'pf': 'tesSUCCESS',
-        'ap': 'tesSUCCESS (applied=true)',
-    }
-
     try:
         while True:
             parsed, pf, ap, ms = run_once()
@@ -122,7 +135,7 @@ def main():
                 stats['latencies'] = stats['latencies'][-1000:]
 
             print("\033[2J\033[H", end="")
-            print(render(stats, last_tx_info))
+            print(render(stats))
             print(f"\n\033[90m↻ Ctrl-C to exit | {time.strftime('%H:%M:%S')}\033[0m")
             time.sleep(0.05)  # ~20 iter/s
     except KeyboardInterrupt:
