@@ -45,3 +45,4 @@ ffi/vendor/
 ffi/*.o
 ffi/*.a
 ffi/test_shim
+ffi/build/

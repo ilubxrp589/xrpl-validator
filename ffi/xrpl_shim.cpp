@@ -7,8 +7,12 @@
 #include "xrpl_shim.h"
 
 #include <xrpl/protocol/BuildInfo.h>
+#include <xrpl/protocol/STTx.h>
+#include <xrpl/protocol/Serializer.h>
+#include <xrpl/protocol/TxFormats.h>
 
 #include <cstring>
+#include <stdexcept>
 #include <string>
 
 namespace {
@@ -86,8 +90,33 @@ bool xrpl_result_mutation_at(
 
 void xrpl_result_destroy(XrplApplyResult *r) { delete r; }
 
-bool xrpl_tx_parse(const uint8_t *, size_t, uint8_t[32], char *, size_t) {
-    return false;
+bool xrpl_tx_parse(
+    const uint8_t *tx_bytes, size_t tx_len,
+    uint8_t out_hash[32],
+    char *out_type_name, size_t type_name_buf_len) {
+    try {
+        xrpl::SerialIter sit(tx_bytes, tx_len);
+        xrpl::STTx tx(sit);
+
+        // Write tx hash (32 bytes)
+        auto const id = tx.getTransactionID();
+        std::memcpy(out_hash, id.data(), 32);
+
+        // Look up type name via TxFormats
+        xrpl::TxType type = tx.getTxnType();
+        auto const *item = xrpl::TxFormats::getInstance().findByType(type);
+        std::string name = item ? item->getName() : "Unknown";
+
+        // Copy type name (null-terminated, truncate if needed)
+        if (out_type_name && type_name_buf_len > 0) {
+            size_t copy_len = std::min(name.size(), type_name_buf_len - 1);
+            std::memcpy(out_type_name, name.data(), copy_len);
+            out_type_name[copy_len] = '\0';
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 bool xrpl_tx_check_signature(const uint8_t *, size_t, const uint8_t *, size_t) {
