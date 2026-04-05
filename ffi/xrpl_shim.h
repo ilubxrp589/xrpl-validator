@@ -175,6 +175,28 @@ bool xrpl_tx_check_signature(
     const uint8_t *rules_bytes, size_t rules_len  /* active amendments */
 );
 
+/* ============================================================
+ * preflight — tx format + signature validation (no ledger state)
+ *
+ * Calls libxrpl::preflight() which runs:
+ *   - Basic format checks (fee > 0, fields present, etc.)
+ *   - Signature verification against tx's public key
+ *
+ * Returns the TER result code. Positive/0 = success (tesSUCCESS),
+ * Negative = failure. See TER.h for full enum.
+ *
+ * Does not need ledger state — just Rules (amendments) and the tx.
+ * ============================================================ */
+
+int32_t xrpl_preflight(
+    const uint8_t *tx_bytes, size_t tx_len,
+    const uint8_t *amendments_bytes, size_t amendments_len,  /* concatenated 32-byte feature IDs */
+    uint32_t apply_flags,
+    uint32_t network_id,
+    /* Output */
+    char *out_ter_name, size_t ter_name_buf_len
+);
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

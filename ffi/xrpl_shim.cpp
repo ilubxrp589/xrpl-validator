@@ -5,15 +5,22 @@
 // against libxrpl.a, and expose a version string via extern "C".
 
 #include "xrpl_shim.h"
+#include "MinimalServiceRegistry.h"
 
 #include <xrpl/protocol/BuildInfo.h>
+#include <xrpl/protocol/Rules.h>
 #include <xrpl/protocol/STTx.h>
 #include <xrpl/protocol/Serializer.h>
+#include <xrpl/protocol/TER.h>
 #include <xrpl/protocol/TxFormats.h>
+#include <xrpl/tx/applySteps.h>
+#include <xrpl/beast/utility/Journal.h>
 
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 
 namespace {
 constexpr const char *SHIM_VERSION = "0.1.0";
@@ -121,6 +128,69 @@ bool xrpl_tx_parse(
 
 bool xrpl_tx_check_signature(const uint8_t *, size_t, const uint8_t *, size_t) {
     return false;
+}
+
+int32_t xrpl_preflight(
+    const uint8_t *tx_bytes, size_t tx_len,
+    const uint8_t *amendments_bytes, size_t amendments_len,
+    uint32_t apply_flags,
+    uint32_t network_id,
+    char *out_ter_name, size_t ter_name_buf_len) {
+    try {
+        // Parse tx
+        xrpl::SerialIter sit(tx_bytes, tx_len);
+        xrpl::STTx tx(sit);
+
+        // Build Rules from amendment list (each 32 bytes, concatenated)
+        std::unordered_set<xrpl::uint256, beast::uhash<>> presets;
+        if (amendments_bytes && amendments_len > 0 && amendments_len % 32 == 0) {
+            size_t n = amendments_len / 32;
+            for (size_t i = 0; i < n; i++) {
+                xrpl::uint256 feature;
+                std::memcpy(feature.data(), amendments_bytes + i * 32, 32);
+                presets.insert(feature);
+            }
+        }
+        xrpl::Rules rules(presets);
+
+        // Construct MinimalServiceRegistry
+        xrpl::MinimalServiceRegistry registry(network_id);
+
+        // Null journal
+        beast::Journal journal(beast::Journal::getNullSink());
+
+        // Run preflight
+        auto result = xrpl::preflight(
+            registry,
+            rules,
+            tx,
+            static_cast<xrpl::ApplyFlags>(apply_flags),
+            journal);
+
+        // Extract TER (TERtoInt is a hidden friend, found via ADL)
+        xrpl::TER ter = result.ter;
+        int32_t ter_code = TERtoInt(ter);
+
+        // Copy TER name string
+        if (out_ter_name && ter_name_buf_len > 0) {
+            std::string name = xrpl::transToken(ter);
+            size_t copy_len = std::min(name.size(), ter_name_buf_len - 1);
+            std::memcpy(out_ter_name, name.data(), copy_len);
+            out_ter_name[copy_len] = '\0';
+        }
+
+        return ter_code;
+    } catch (std::exception const& e) {
+        if (out_ter_name && ter_name_buf_len > 0) {
+            std::snprintf(out_ter_name, ter_name_buf_len, "EXCEPTION: %s", e.what());
+        }
+        return -399;  // tefINTERNAL
+    } catch (...) {
+        if (out_ter_name && ter_name_buf_len > 0) {
+            std::snprintf(out_ter_name, ter_name_buf_len, "UNKNOWN_EXCEPTION");
+        }
+        return -399;
+    }
 }
 
 }  // extern "C"

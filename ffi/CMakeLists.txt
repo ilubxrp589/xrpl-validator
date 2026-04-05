@@ -27,7 +27,10 @@ find_package(ed25519 REQUIRED)
 find_package(secp256k1 REQUIRED)
 
 # Shim library
-add_library(xrpl_shim STATIC xrpl_shim.cpp)
+add_library(xrpl_shim STATIC
+    xrpl_shim.cpp
+    MinimalServiceRegistry.cpp
+)
 target_include_directories(xrpl_shim PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${RIPPLED_SRC_DIR}/include

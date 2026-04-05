@@ -75,5 +75,16 @@ int test_main(int argc, char **argv) {
     xrpl_engine_destroy(engine);
     printf("Destroyed engine.\n");
 
+    /* === CALL PREFLIGHT with real mainnet tx === */
+    printf("\n=== Calling xrpl::preflight() via shim ===\n");
+    char ter_name[128];
+    int32_t ter = xrpl_preflight(
+        tx_bytes, tx_len,
+        NULL, 0,           /* no amendments (empty Rules) */
+        0,                 /* ApplyFlags = tapNONE */
+        0,                 /* network_id = mainnet */
+        ter_name, sizeof(ter_name));
+    printf("preflight result: TER=%d (%s)\n", ter, ter_name);
+
     return 0;
 }
