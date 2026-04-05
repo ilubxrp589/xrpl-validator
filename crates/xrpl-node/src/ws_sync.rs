@@ -145,13 +145,12 @@ pub async fn start_ws_sync(
                         }
                     }
                     // FFI independent verification — blocking, spawn off-thread.
-                    // CRITICAL ordering: the snapshot is taken HERE, BEFORE
-                    // process_ledger() runs below and writes POST-ledger state
-                    // to the DB. The OwnedSnapshot is an Arc<DB> + snapshot
-                    // bundle — rocksdb's MVCC guarantees the snapshot view
-                    // stays at the pre-write state regardless of concurrent
-                    // writes. So verify(N) sees PRE-N state, which is exactly
-                    // what libxrpl needs to reproduce N's txs.
+                    // Uses pure RPC path (no DB snapshot) to avoid libxrpl
+                    // crashes from stale state during catchup. The OwnedSnapshot
+                    // approach is correct in steady state but lethal during
+                    // gap-fill where DB is many ledgers behind verify target.
+                    // TODO: enable DB snapshot once we detect steady state
+                    // (last_synced within 1 ledger of process_seq).
                     #[cfg(feature = "ffi")]
                     if meta_ok {
                         if let Some(ref verifier) = ffi_verifier {
@@ -160,17 +159,13 @@ pub async fn start_ws_sync(
                                 let v = verifier.clone();
                                 let hdr = ledger_header.clone();
                                 let seq = process_seq;
-                                let owned_snap = std::sync::Arc::new(
-                                    crate::ffi_engine::OwnedSnapshot::new(db.clone())
-                                );
                                 tokio::task::spawn_blocking(move || {
-                                    v.verify_ledger_with_snapshot(
+                                    v.verify_ledger(
                                         seq,
                                         &tx_blobs,
                                         hdr.parent_hash,
                                         hdr.parent_close_time,
                                         hdr.total_drops,
-                                        Some(owned_snap.as_ref()),
                                     );
                                 });
                             }
