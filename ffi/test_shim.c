@@ -145,6 +145,51 @@ int test_main(int argc, char **argv) {
     printf("apply result: TER=%d (%s) applied=%s\n", apply_ter, ter_name,
            applied ? "true" : "false");
 
+    /* === APPLY WITH MUTATIONS === */
+    printf("\n=== Calling xrpl_apply_with_mutations() ===\n");
+    XrplApplyResult *result = xrpl_apply_with_mutations(
+        tx_bytes, tx_len,
+        NULL, 0,
+        103354511, 797193960, 99985687626634189ULL,
+        parent_hash, 10, 10000000, 2000000,
+        0, 0,
+        sle_lookup, &db);
+
+    printf("result: TER=%d (%s) applied=%s drops_destroyed=%lld\n",
+           xrpl_result_ter(result),
+           xrpl_result_ter_name(result),
+           xrpl_result_applied(result) ? "true" : "false",
+           (long long)xrpl_result_drops_destroyed(result));
+
+    size_t n_mutations = xrpl_result_mutation_count(result);
+    printf("\nSLE mutations: %zu\n", n_mutations);
+    const char *kind_names[] = {"Created", "Modified", "Deleted"};
+    for (size_t i = 0; i < n_mutations; i++) {
+        uint8_t key[32]; uint8_t kind;
+        const uint8_t *data = NULL; size_t data_len = 0;
+        if (xrpl_result_mutation_at(result, i, key, &kind, &data, &data_len)) {
+            printf("  [%zu] %s  key=", i, kind_names[kind]);
+            for (int j = 0; j < 8; j++) printf("%02X", key[j]);
+            printf("...  %zu bytes\n", data_len);
+            /* Scan for Balance field (0x62) and print drops */
+            for (size_t j = 7; j + 9 < data_len; j++) {
+                if (data[j] == 0x62) {
+                    uint64_t raw = 0;
+                    for (int k = 0; k < 8; k++) raw = (raw << 8) | data[j+1+k];
+                    if ((raw & 0x8000000000000000ULL) == 0 && (raw & 0x4000000000000000ULL) != 0) {
+                        uint64_t drops = raw & 0x3FFFFFFFFFFFFFFFULL;
+                        if (drops <= 100000000000000000ULL) {
+                            printf("         Balance: %lu drops\n", drops);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    xrpl_result_destroy(result);
+
     return 0;
 }
 

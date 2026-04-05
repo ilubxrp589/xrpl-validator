@@ -234,6 +234,32 @@ int32_t xrpl_apply(
     bool *out_applied
 );
 
+/* ============================================================
+ * Apply with mutations — same as xrpl_apply() but returns an
+ * XrplApplyResult handle that you can iterate for mutations.
+ *
+ * Caller MUST call xrpl_result_destroy() to free it.
+ * Returns NULL on internal error.
+ * ============================================================ */
+
+XrplApplyResult *xrpl_apply_with_mutations(
+    const uint8_t *tx_bytes, size_t tx_len,
+    const uint8_t *amendments_bytes, size_t amendments_len,
+    uint32_t ledger_seq,
+    uint32_t parent_close_time,
+    uint64_t total_drops,
+    const uint8_t parent_hash[32],
+    uint64_t base_fee_drops,
+    uint64_t reserve_drops,
+    uint64_t increment_drops,
+    uint32_t apply_flags,
+    uint32_t network_id,
+    XrplSleLookupFn lookup_fn,
+    void *lookup_user_data
+);
+
+int64_t xrpl_result_drops_destroyed(const XrplApplyResult *result);
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

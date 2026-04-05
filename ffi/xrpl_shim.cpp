@@ -7,6 +7,7 @@
 #include "xrpl_shim.h"
 #include "MinimalServiceRegistry.h"
 #include "CallbackReadView.h"
+#include "MutationCollector.h"
 
 #include <xrpl/protocol/BuildInfo.h>
 #include <xrpl/protocol/LedgerHeader.h>
@@ -46,6 +47,8 @@ struct XrplLedger {
 struct XrplApplyResult {
     int32_t ter;
     bool applied;
+    std::string ter_name;
+    xrpl::MutationCollector collector;
 };
 
 extern "C" {
@@ -83,21 +86,42 @@ void xrpl_ledger_destroy(XrplLedger *ledger) {
 XrplApplyResult *xrpl_apply_tx(
     XrplLedger *, const uint8_t *, size_t, uint32_t) {
     // Stub: return a fake "not implemented" result
-    return new XrplApplyResult{-399, false};  // -399 = tefINTERNAL
+    auto *r = new XrplApplyResult{};
+    r->ter = -399;
+    r->applied = false;
+    r->ter_name = "tefINTERNAL";
+    return r;
 }
 
 int32_t xrpl_result_ter(const XrplApplyResult *r) { return r->ter; }
 bool xrpl_result_applied(const XrplApplyResult *r) { return r->applied; }
-const char *xrpl_result_ter_name(const XrplApplyResult *) { return "tefINTERNAL"; }
+const char *xrpl_result_ter_name(const XrplApplyResult *r) { return r->ter_name.c_str(); }
 
 size_t xrpl_result_meta_size(const XrplApplyResult *) { return 0; }
 void xrpl_result_meta_bytes(const XrplApplyResult *, uint8_t *, size_t) {}
 
-size_t xrpl_result_mutation_count(const XrplApplyResult *) { return 0; }
+size_t xrpl_result_mutation_count(const XrplApplyResult *r) {
+    return r ? r->collector.sle_mutations().size() : 0;
+}
+
 bool xrpl_result_mutation_at(
-    const XrplApplyResult *, size_t, uint8_t[32],
-    uint8_t *, const uint8_t **, size_t *) {
-    return false;
+    const XrplApplyResult *r,
+    size_t index,
+    uint8_t out_key[32],
+    uint8_t *out_kind,
+    const uint8_t **out_data,
+    size_t *out_data_len) {
+    if (!r || index >= r->collector.sle_mutations().size()) return false;
+    auto const& m = r->collector.sle_mutations()[index];
+    if (out_key) std::memcpy(out_key, m.key.data(), 32);
+    if (out_kind) *out_kind = static_cast<uint8_t>(m.kind);
+    if (out_data) *out_data = m.data.empty() ? nullptr : m.data.data();
+    if (out_data_len) *out_data_len = m.data.size();
+    return true;
+}
+
+int64_t xrpl_result_drops_destroyed(const XrplApplyResult *r) {
+    return r ? r->collector.drops_destroyed() : 0;
 }
 
 void xrpl_result_destroy(XrplApplyResult *r) { delete r; }
@@ -297,6 +321,85 @@ int32_t xrpl_apply(
             std::snprintf(out_ter_name, ter_name_buf_len, "UNKNOWN_EXCEPTION");
         }
         return -399;
+    }
+}
+
+XrplApplyResult *xrpl_apply_with_mutations(
+    const uint8_t *tx_bytes, size_t tx_len,
+    const uint8_t *amendments_bytes, size_t amendments_len,
+    uint32_t ledger_seq,
+    uint32_t parent_close_time,
+    uint64_t total_drops,
+    const uint8_t parent_hash[32],
+    uint64_t base_fee_drops,
+    uint64_t reserve_drops,
+    uint64_t increment_drops,
+    uint32_t apply_flags,
+    uint32_t network_id,
+    XrplSleLookupFn lookup_fn,
+    void *lookup_user_data) {
+    auto *result = new XrplApplyResult{};
+    try {
+        xrpl::SerialIter sit(tx_bytes, tx_len);
+        xrpl::STTx tx(sit);
+
+        std::unordered_set<xrpl::uint256, beast::uhash<>> presets;
+        if (amendments_bytes && amendments_len > 0 && amendments_len % 32 == 0) {
+            size_t n = amendments_len / 32;
+            for (size_t i = 0; i < n; i++) {
+                xrpl::uint256 feature;
+                std::memcpy(feature.data(), amendments_bytes + i * 32, 32);
+                presets.insert(feature);
+            }
+        }
+        xrpl::Rules rules(presets);
+
+        xrpl::LedgerHeader header;
+        header.seq = ledger_seq;
+        header.parentCloseTime = xrpl::NetClock::time_point(xrpl::NetClock::duration(parent_close_time));
+        std::memcpy(header.parentHash.data(), parent_hash, 32);
+        header.drops = xrpl::XRPAmount(static_cast<std::int64_t>(total_drops));
+        header.closeTimeResolution = xrpl::NetClock::duration(10);
+
+        xrpl::Fees fees;
+        fees.base = xrpl::XRPAmount(static_cast<std::int64_t>(base_fee_drops));
+        fees.reserve = xrpl::XRPAmount(static_cast<std::int64_t>(reserve_drops));
+        fees.increment = xrpl::XRPAmount(static_cast<std::int64_t>(increment_drops));
+
+        xrpl::SleLookupCallback cpp_lookup =
+            [lookup_fn, lookup_user_data](xrpl::uint256 const& key, uint8_t const** out_data, size_t* out_len) -> bool {
+                return lookup_fn(lookup_user_data, key.data(), out_data, out_len);
+            };
+
+        auto read_view = std::make_shared<xrpl::CallbackReadView>(
+            header, rules, fees, /*open=*/true, cpp_lookup);
+        xrpl::OpenView open_view(xrpl::open_ledger, rules, read_view);
+
+        xrpl::MinimalServiceRegistry registry(network_id);
+        beast::Journal journal(beast::Journal::getNullSink());
+
+        auto apply_result = xrpl::apply(
+            registry, open_view, tx,
+            static_cast<xrpl::ApplyFlags>(apply_flags), journal);
+
+        result->ter = TERtoInt(apply_result.ter);
+        result->applied = apply_result.applied;
+        result->ter_name = xrpl::transToken(apply_result.ter);
+
+        // Flush mutations into collector
+        open_view.apply(result->collector);
+
+        return result;
+    } catch (std::exception const& e) {
+        result->ter = -399;
+        result->applied = false;
+        result->ter_name = std::string("EXCEPTION: ") + e.what();
+        return result;
+    } catch (...) {
+        result->ter = -399;
+        result->applied = false;
+        result->ter_name = "UNKNOWN_EXCEPTION";
+        return result;
     }
 }
 
