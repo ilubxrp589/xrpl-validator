@@ -84,6 +84,7 @@ extern "C" {
     pub fn xrpl_result_applied(result: *const XrplApplyResult) -> bool;
     pub fn xrpl_result_ter_name(result: *const XrplApplyResult) -> *const c_char;
     pub fn xrpl_result_drops_destroyed(result: *const XrplApplyResult) -> i64;
+    pub fn xrpl_result_last_fatal(result: *const XrplApplyResult) -> *const c_char;
     pub fn xrpl_result_mutation_count(result: *const XrplApplyResult) -> usize;
     pub fn xrpl_result_mutation_at(
         result: *const XrplApplyResult,
@@ -237,6 +238,8 @@ pub struct ApplyOutcome {
     pub applied: bool,
     pub drops_destroyed: i64,
     pub mutations: Vec<SleMutation>,
+    /// Captured fatal-log text from libxrpl (non-empty for tefEXCEPTION).
+    pub last_fatal: String,
 }
 
 impl ApplyOutcome {
@@ -325,6 +328,10 @@ pub fn apply_with_mutations<P: SleProvider>(
         let ptr = xrpl_result_ter_name(result_ptr);
         std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
     };
+    let last_fatal = unsafe {
+        let ptr = xrpl_result_last_fatal(result_ptr);
+        std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
+    };
 
     let n = unsafe { xrpl_result_mutation_count(result_ptr) };
     let mut mutations = Vec::with_capacity(n);
@@ -362,6 +369,7 @@ pub fn apply_with_mutations<P: SleProvider>(
         applied,
         drops_destroyed,
         mutations,
+        last_fatal,
     })
 }
 

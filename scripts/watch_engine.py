@@ -70,20 +70,32 @@ def render():
             # Full apply stats (RPC-fetched state)
             apply_attempted = ffi.get("live_apply_attempted", 0)
             apply_ok = ffi.get("live_apply_ok", 0)
-            apply_failed = ffi.get("live_apply_failed", 0)
+            apply_claimed = ffi.get("live_apply_claimed", 0)
+            apply_diverged = ffi.get("live_apply_diverged", 0)
             apply_ms = ffi.get("live_apply_last_ms", 0)
             apply_last_ter = ffi.get("live_apply_last_ter", "?")
             apply_muts = ffi.get("live_apply_last_mutations", 0)
-            apply_pct = (apply_ok / apply_attempted * 100) if apply_attempted else 0
+            agreed = apply_ok + apply_claimed
+            agreed_pct = (agreed / apply_attempted * 100) if apply_attempted else 0
+            ok_pct = (apply_ok / apply_attempted * 100) if apply_attempted else 0
             out.append("")
             out.append(colored("  Full apply() on sampled live txs (RPC pre-state):", "1"))
-            out.append(f"    attempted: {colored(f'{apply_attempted:,}', '36')}  OK: {colored(f'{apply_ok:,}', '32')}  failed: {colored(f'{apply_failed:,}', '33')}  ({apply_pct:.1f}%)")
-            out.append(f"    last apply: TER={colored(apply_last_ter, '32' if apply_last_ter == 'tesSUCCESS' else '33')}  muts={apply_muts}  {apply_ms}ms")
+            agreed_color = "1;32" if agreed_pct >= 99.9 else ("33" if agreed_pct >= 95 else "31")
+            out.append(f"    {colored('MAINNET AGREEMENT:', '1')} {colored(f'{agreed_pct:.2f}%', agreed_color)}   ({agreed:,}/{apply_attempted:,}  diverged={apply_diverged})")
+            out.append(f"      └─ tesSUCCESS: {colored(f'{apply_ok:,}', '32')} ({ok_pct:.1f}%)  +  tec* claimed-by-mainnet: {colored(f'{apply_claimed:,}', '36')}")
+            out.append(f"    last apply: TER={colored(apply_last_ter, '32' if apply_last_ter == 'tesSUCCESS' else ('36' if apply_last_ter.startswith('tec') else '33'))}  muts={apply_muts}  {apply_ms}ms")
             ters = ffi.get("live_apply_ter_counts", {})
             if ters:
                 top_t = sorted(ters.items(), key=lambda x: -x[1])[:5]
                 t_line = "    TER codes: " + " | ".join(f"{k}:{colored(str(v), '36')}" for k, v in top_t)
                 out.append(t_line)
+            # Per-(type, TER) divergence buckets
+            by_type = ffi.get("live_diverged_by_type", {})
+            if by_type:
+                top_d = sorted(by_type.items(), key=lambda x: -x[1])[:8]
+                out.append(colored("    Top diverged (tx_type/TER):", "1;33"))
+                for k, v in top_d:
+                    out.append(f"      {k:<38s} {colored(str(v), '31')}")
             # Self-test (tiny line)
             checks = ffi.get("health_checks", 0)
             passed = ffi.get("health_passed", 0)

@@ -48,7 +48,27 @@ struct XrplApplyResult {
     int32_t ter;
     bool applied;
     std::string ter_name;
+    std::string last_fatal; // captures fatal log lines (exception messages)
     xrpl::MutationCollector collector;
+};
+
+// Journal sink that captures fatal-level messages into a std::string.
+// Used to surface the libxrpl exception text that causes tefEXCEPTION.
+class CapturingSink : public beast::Journal::Sink {
+public:
+    CapturingSink(std::string& dest)
+        : beast::Journal::Sink(beast::severities::kFatal, false), dest_(dest) {}
+    void write(beast::severities::Severity level, std::string const& text) override {
+        if (level >= beast::severities::kError) {
+            if (!dest_.empty()) dest_.append(" | ");
+            dest_.append(text);
+        }
+    }
+    void writeAlways(beast::severities::Severity level, std::string const& text) override {
+        write(level, text);
+    }
+private:
+    std::string& dest_;
 };
 
 extern "C" {
@@ -122,6 +142,10 @@ bool xrpl_result_mutation_at(
 
 int64_t xrpl_result_drops_destroyed(const XrplApplyResult *r) {
     return r ? r->collector.drops_destroyed() : 0;
+}
+
+const char *xrpl_result_last_fatal(const XrplApplyResult *r) {
+    return r ? r->last_fatal.c_str() : "";
 }
 
 void xrpl_result_destroy(XrplApplyResult *r) { delete r; }
@@ -258,7 +282,10 @@ int32_t xrpl_apply(
 
         // Build LedgerHeader
         xrpl::LedgerHeader header;
-        header.seq = ledger_seq;
+        // OpenView(open_ledger, ..., base) sets its seq = base->seq() + 1, so
+        // the header we pass represents the PARENT of the ledger we're building.
+        // Caller passes ledger_seq = the ledger these txs closed in.
+        header.seq = ledger_seq > 0 ? ledger_seq - 1 : 0;
         header.parentCloseTime = xrpl::NetClock::time_point(xrpl::NetClock::duration(parent_close_time));
         std::memcpy(header.parentHash.data(), parent_hash, 32);
         header.drops = xrpl::XRPAmount(static_cast<std::int64_t>(total_drops));
@@ -355,7 +382,10 @@ XrplApplyResult *xrpl_apply_with_mutations(
         xrpl::Rules rules(presets);
 
         xrpl::LedgerHeader header;
-        header.seq = ledger_seq;
+        // OpenView(open_ledger, ..., base) sets its seq = base->seq() + 1, so
+        // the header we pass represents the PARENT of the ledger we're building.
+        // Caller passes ledger_seq = the ledger these txs closed in.
+        header.seq = ledger_seq > 0 ? ledger_seq - 1 : 0;
         header.parentCloseTime = xrpl::NetClock::time_point(xrpl::NetClock::duration(parent_close_time));
         std::memcpy(header.parentHash.data(), parent_hash, 32);
         header.drops = xrpl::XRPAmount(static_cast<std::int64_t>(total_drops));
@@ -376,7 +406,8 @@ XrplApplyResult *xrpl_apply_with_mutations(
         xrpl::OpenView open_view(xrpl::open_ledger, rules, read_view);
 
         xrpl::MinimalServiceRegistry registry(network_id);
-        beast::Journal journal(beast::Journal::getNullSink());
+        CapturingSink capturing_sink(result->last_fatal);
+        beast::Journal journal(capturing_sink);
 
         auto apply_result = xrpl::apply(
             registry, open_view, tx,

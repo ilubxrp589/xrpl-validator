@@ -16,6 +16,7 @@
 #include <xrpl/core/HashRouter.h>
 #include <xrpl/core/NetworkIDService.h>
 #include <xrpl/core/ServiceRegistry.h>
+#include <xrpl/ledger/OrderBookDB.h>
 #include <xrpl/server/LoadFeeTrack.h>
 #include <xrpl/beast/utility/Journal.h>
 
@@ -35,6 +36,25 @@ private:
     std::uint32_t id_;
 };
 
+/** No-op OrderBookDB — OfferCreate/AMMCreate notify this on addOrderBook,
+ *  but for stateless replay we don't need to track books. All methods are
+ *  safe no-ops so transactors can call addOrderBook() without throwing. */
+class NoopOrderBookDB final : public OrderBookDB
+{
+public:
+    void setup(std::shared_ptr<ReadView const> const&) override {}
+    void addOrderBook(Book const&) override {}
+    std::vector<Book> getBooksByTakerPays(Issue const&, std::optional<Domain> const&) override {
+        return {};
+    }
+    int getBookSize(Issue const&, std::optional<Domain> const&) override { return 0; }
+    bool isBookToXRP(Issue const&, std::optional<Domain> const&) override { return false; }
+    void processTxn(std::shared_ptr<ReadView const> const&, AcceptedLedgerTx const&,
+                    MultiApiJson const&) override {}
+    BookListeners::pointer getBookListeners(Book const&) override { return nullptr; }
+    BookListeners::pointer makeBookListeners(Book const&) override { return nullptr; }
+};
+
 /** Minimum viable ServiceRegistry for preflight/apply of Payment XRP. */
 class MinimalServiceRegistry : public ServiceRegistry
 {
@@ -50,6 +70,7 @@ public:
     beast::Journal getJournal(std::string const& /*name*/) override { return nullJournal_; }
     std::optional<uint256> const& getTrapTxID() const override { return trapTxID_; }
     bool isStopping() const override { return false; }
+    OrderBookDB& getOrderBookDB() override { return orderBookDB_; }
 
     // === STUBS (throw if called — not on the Payment preflight path) ===
     // Defined out-of-line to keep header small.
@@ -83,7 +104,6 @@ public:
     OpenLedger& getOpenLedger() override;
     OpenLedger const& getOpenLedger() const override;
     NetworkOPs& getOPs() override;
-    OrderBookDB& getOrderBookDB() override;
     TransactionMaster& getMasterTransaction() override;
     TxQ& getTxQ() override;
     PathRequestManager& getPathRequestManager() override;
@@ -100,6 +120,7 @@ private:
     std::unique_ptr<LoadFeeTrack> feeTrack_;
     beast::Journal nullJournal_;
     std::optional<uint256> trapTxID_;  // always empty
+    NoopOrderBookDB orderBookDB_;
 };
 
 }  // namespace xrpl

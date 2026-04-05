@@ -260,6 +260,11 @@ XrplApplyResult *xrpl_apply_with_mutations(
 
 int64_t xrpl_result_drops_destroyed(const XrplApplyResult *result);
 
+/* Returns libxrpl's captured fatal-log text (e.g. the exception message
+ * for tefEXCEPTION). Empty string if no fatal was logged. Lifetime tied
+ * to the result. */
+const char *xrpl_result_last_fatal(const XrplApplyResult *result);
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

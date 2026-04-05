@@ -59,7 +59,7 @@ STUB_METHOD(LedgerReplayer&, getLedgerReplayer)
 STUB_METHOD(PendingSaves&, getPendingSaves)
 STUB_METHOD(OpenLedger&, getOpenLedger)
 STUB_METHOD(NetworkOPs&, getOPs)
-STUB_METHOD(OrderBookDB&, getOrderBookDB)
+// Real no-op implementation — below
 STUB_METHOD(TransactionMaster&, getMasterTransaction)
 STUB_METHOD(TxQ&, getTxQ)
 STUB_METHOD(PathRequestManager&, getPathRequestManager)
