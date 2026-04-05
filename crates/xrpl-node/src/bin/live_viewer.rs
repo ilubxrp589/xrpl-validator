@@ -604,9 +604,21 @@ async fn main() {
             std::process::exit(0);
         });
     }
-    // Transaction application engine — independently verifies tx effects
-    let tx_engine = Arc::new(xrpl_node::tx_engine::TxEngine::new());
-    eprintln!("[tx-engine] Transaction verification engine initialized");
+    // FFI verifier — replays every ledger's txs through libxrpl (rippled's
+    // C++ engine) and checks 100% TER agreement with mainnet. Feature-gated.
+    #[cfg(feature = "ffi")]
+    let ffi_verifier = {
+        let rpc_urls: Vec<String> = std::env::var("XRPL_RPC_URLS")
+            .or_else(|_| std::env::var("XRPL_RPC_URL"))
+            .unwrap_or_else(|_| "http://10.0.0.39:5005".to_string())
+            .split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        eprintln!("[ffi] initializing FfiVerifier with {} RPC endpoint(s)", rpc_urls.len());
+        Arc::new(xrpl_node::ffi_verifier::FfiVerifier::new(rpc_urls))
+    };
+    #[cfg(not(feature = "ffi"))]
+    let ffi_verifier: Option<Arc<()>> = None;
+    #[cfg(feature = "ffi")]
+    eprintln!("[ffi] verifier ready");
 
     let incremental_syncer = Arc::new(xrpl_node::incremental_sync::IncrementalSyncer::new());
     {
@@ -635,7 +647,10 @@ async fn main() {
                 let backfill_hash = state_hash_computer.clone();
                 let backfill_syncer = incremental_syncer.clone();
                 let backfill_hist = history_store.clone();
-                let backfill_tx_engine = tx_engine.clone();
+                #[cfg(feature = "ffi")]
+                let backfill_ffi = Some(ffi_verifier.clone());
+                #[cfg(not(feature = "ffi"))]
+                let backfill_ffi: Option<Arc<()>> = None;
                 tokio::spawn(async move {
                     let history_store = backfill_hist;
                     // Wait for SHAMap to finish building
@@ -720,7 +735,7 @@ async fn main() {
 
                     let ws_last = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(ws_start));
                     eprintln!("[startup] Starting WS sync from #{ws_start} after backfill");
-                    xrpl_node::ws_sync::start_ws_sync(backfill_db, backfill_hash, ws_last, Some(history_store.clone()), Some(backfill_tx_engine)).await;
+                    xrpl_node::ws_sync::start_ws_sync(backfill_db, backfill_hash, ws_last, Some(history_store.clone()), backfill_ffi).await;
                 });
             } else {
                 eprintln!("[startup] Running full state sync — this is the final one");
@@ -736,7 +751,10 @@ async fn main() {
                 let backfill_syncer = incremental_syncer.clone();
                 let startup_db = db.clone();
                 let startup_hist = history_store.clone();
-                let startup_tx_engine = tx_engine.clone();
+                #[cfg(feature = "ffi")]
+                let startup_ffi = ffi_verifier.clone();
+                #[cfg(not(feature = "ffi"))]
+                let startup_ffi: () = ();
                 tokio::spawn(async move {
                     let history_store = startup_hist;
                     loop {
@@ -764,9 +782,12 @@ async fn main() {
                             let _ = std::fs::write("/mnt/xrpl-data/sync/dl_done.txt",
                                 format!("ledger #{pinned} — {synced} objects"));
                             let ws_hist = history_store.clone();
-                            let ws_tx_engine = startup_tx_engine.clone();
+                            #[cfg(feature = "ffi")]
+                            let ws_ffi = Some(startup_ffi.clone());
+                            #[cfg(not(feature = "ffi"))]
+                            let ws_ffi: Option<Arc<()>> = None;
                             tokio::spawn(async move {
-                                xrpl_node::ws_sync::start_ws_sync(ws_db, ws_hash, ws_last, Some(ws_hist), Some(ws_tx_engine)).await;
+                                xrpl_node::ws_sync::start_ws_sync(ws_db, ws_hash, ws_last, Some(ws_hist), ws_ffi).await;
                             });
                             eprintln!("[startup] WS sync from #{pinned} (no second download, inc-sync DISABLED)");
                             // Keep backfilling=true
@@ -1402,11 +1423,13 @@ async fn main() {
         .route("/api/engine", get({
             let engine_web = engine_state.clone();
             let le_web = live_engine.clone();
-            let txe_web = tx_engine.clone();
+            #[cfg(feature = "ffi")]
+            let ffi_web = ffi_verifier.clone();
             move || {
                 let engine_web = engine_web.clone();
                 let le_web = le_web.clone();
-                let txe_web = txe_web.clone();
+                #[cfg(feature = "ffi")]
+                let ffi_web = ffi_web.clone();
                 async move {
                     let state = engine_web.lock().clone();
                     let mut json = serde_json::to_value(&state).unwrap_or_default();
@@ -1431,9 +1454,16 @@ async fn main() {
                     } else {
                         json["live_engine"] = serde_json::json!({"active": false});
                     }
-                    // Add tx engine verification stats
-                    let txe_stats = txe_web.stats();
-                    json["tx_engine"] = serde_json::to_value(&txe_stats).unwrap_or_default();
+                    // FFI verification stats (replaces deprecated tx_engine)
+                    #[cfg(feature = "ffi")]
+                    {
+                        let ffi_stats = ffi_web.stats();
+                        json["ffi_verifier"] = serde_json::to_value(&ffi_stats).unwrap_or_default();
+                    }
+                    #[cfg(not(feature = "ffi"))]
+                    {
+                        json["ffi_verifier"] = serde_json::json!({"enabled": false, "note": "build with --features ffi"});
+                    }
                     axum::Json(json)
                 }
             }

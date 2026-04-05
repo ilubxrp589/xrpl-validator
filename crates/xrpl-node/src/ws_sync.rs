@@ -18,12 +18,17 @@ use xrpl_core::types::Hash256;
 use xrpl_ledger::shamap::hash::{sha512_half_prefixed, HASH_PREFIX_LEAF_NODE};
 use crate::rippled_client::RippledClient;
 
+#[cfg(feature = "ffi")]
+type FfiVerifierHandle = Arc<crate::ffi_verifier::FfiVerifier>;
+#[cfg(not(feature = "ffi"))]
+type FfiVerifierHandle = Arc<()>;
+
 pub async fn start_ws_sync(
     db: Arc<rocksdb::DB>,
     hash_comp: Arc<crate::state_hash::StateHashComputer>,
     last_synced: Arc<AtomicU32>,
     history: Option<Arc<parking_lot::Mutex<crate::history::HistoryStore>>>,
-    tx_engine: Option<Arc<crate::tx_engine::TxEngine>>,
+    ffi_verifier: Option<FfiVerifierHandle>,
 ) {
     let rpc = RippledClient::new();
 
@@ -116,13 +121,11 @@ pub async fn start_ws_sync(
                     acc_tx_count = 0;
 
                     let mut meta_ok = false;
+                    let mut ledger_header: LedgerHeader = LedgerHeader::default();
                     for attempt in 0..3u32 {
                         match fetch_ledger_metadata(&rpc, process_seq, &mut acc_modified, &mut acc_deleted, &mut acc_tx_count).await {
-                            Ok(sorted_txs) => {
-                                // Independent transaction verification (dual-path)
-                                if let Some(ref engine) = tx_engine {
-                                    engine.apply_ledger(&sorted_txs, &db);
-                                }
+                            Ok((_sorted_txs, hdr)) => {
+                                ledger_header = hdr;
                                 meta_ok = true;
                                 break;
                             }
@@ -141,6 +144,29 @@ pub async fn start_ws_sync(
                             }
                         }
                     }
+                    // FFI independent verification — blocking, spawn off-thread
+                    #[cfg(feature = "ffi")]
+                    if meta_ok {
+                        if let Some(ref verifier) = ffi_verifier {
+                            let tx_blobs = fetch_ledger_tx_blobs(&rpc, process_seq).await;
+                            if !tx_blobs.is_empty() {
+                                let v = verifier.clone();
+                                let hdr = ledger_header.clone();
+                                let seq = process_seq;
+                                tokio::task::spawn_blocking(move || {
+                                    v.verify_ledger(
+                                        seq,
+                                        &tx_blobs,
+                                        hdr.parent_hash,
+                                        hdr.parent_close_time,
+                                        hdr.total_drops,
+                                    );
+                                });
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "ffi"))]
+                    let _ = (&ffi_verifier, &ledger_header);
                     if !meta_ok {
                         // Break the entire batch — let the next ledgerClosed event
                         // trigger skip-ahead if we're too far behind
@@ -226,14 +252,42 @@ fn extract_affected_nodes(body: &serde_json::Value, modified: &mut HashSet<Strin
     }
 }
 
+/// Ledger header fields needed by FFI apply.
+#[derive(Debug, Clone, Default)]
+pub struct LedgerHeader {
+    pub parent_hash: [u8; 32],
+    pub parent_close_time: u32,
+    pub total_drops: u64,
+}
+
 async fn fetch_ledger_metadata(
     rpc: &RippledClient, seq: u32,
     modified: &mut HashSet<String>, deleted: &mut HashSet<String>,
     tx_count: &mut u32,
-) -> Result<Vec<serde_json::Value>, String> {
+) -> Result<(Vec<serde_json::Value>, LedgerHeader), String> {
     let body = rpc.call("ledger", serde_json::json!({"ledger_index": seq, "transactions": true, "expand": true, "binary": false})).await?;
-    let txs = body["result"]["ledger"]["transactions"].as_array()
+    let ledger = &body["result"]["ledger"];
+    let txs = ledger["transactions"].as_array()
         .ok_or("no transactions")?;
+
+    // Extract header fields needed for FFI apply
+    let parent_hash = ledger["parent_hash"].as_str()
+        .and_then(|s| hex::decode(s).ok())
+        .and_then(|b| {
+            if b.len() == 32 {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&b);
+                Some(a)
+            } else {
+                None
+            }
+        })
+        .unwrap_or([0u8; 32]);
+    let parent_close_time = ledger["parent_close_time"].as_u64().unwrap_or(0) as u32;
+    let total_drops = ledger["total_coins"].as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0u64);
+    let header = LedgerHeader { parent_hash, parent_close_time, total_drops };
 
     // Sort by TransactionIndex (execution order) — array order can differ!
     let mut sorted_txs: Vec<serde_json::Value> = txs.iter().cloned().collect();
@@ -248,7 +302,45 @@ async fn fetch_ledger_metadata(
         extract_affected_nodes(tx, modified, deleted);
         *tx_count += 1;
     }
-    Ok(sorted_txs)
+    Ok((sorted_txs, header))
+}
+
+/// Fetch binary tx_blobs for every tx in the ledger, sorted by TransactionIndex.
+/// Used only when FFI verification is enabled — adds one extra RPC per ledger.
+/// Returns an empty Vec on error (FFI verification skipped for this ledger).
+#[cfg(feature = "ffi")]
+async fn fetch_ledger_tx_blobs(rpc: &RippledClient, seq: u32) -> Vec<Vec<u8>> {
+    let body = match rpc.call(
+        "ledger",
+        serde_json::json!({"ledger_index": seq, "transactions": true, "expand": true, "binary": true}),
+    ).await {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    let empty = Vec::new();
+    let txs = body["result"]["ledger"]["transactions"].as_array().unwrap_or(&empty);
+    // Pair each blob with its TransactionIndex extracted from the meta blob.
+    // Meta prefix: sfTransactionIndex = 0x20 0x1C + u32 big-endian.
+    let mut ordered: Vec<(u32, Vec<u8>)> = Vec::with_capacity(txs.len());
+    for tx in txs.iter() {
+        let tx_blob_hex = tx["tx_blob"].as_str().or_else(|| tx.as_str());
+        let Some(hex_str) = tx_blob_hex else { continue; };
+        let Ok(bytes) = hex::decode(hex_str) else { continue; };
+        let meta_hex = tx["meta"].as_str().unwrap_or("");
+        let idx = if meta_hex.len() >= 12 {
+            let meta_bytes = hex::decode(&meta_hex[..12]).unwrap_or_default();
+            if meta_bytes.len() >= 6 && meta_bytes[0] == 0x20 && meta_bytes[1] == 0x1C {
+                u32::from_be_bytes([meta_bytes[2], meta_bytes[3], meta_bytes[4], meta_bytes[5]])
+            } else {
+                u32::MAX
+            }
+        } else {
+            u32::MAX
+        };
+        ordered.push((idx, bytes));
+    }
+    ordered.sort_by_key(|(i, _)| *i);
+    ordered.into_iter().map(|(_, b)| b).collect()
 }
 
 async fn process_ledger(

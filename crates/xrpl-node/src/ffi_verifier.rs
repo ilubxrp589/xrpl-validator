@@ -1,0 +1,103 @@
+//! FFI-based independent tx verifier for the live validator.
+//!
+//! Replaces the deprecated pure-Rust `tx_engine` module. Every ledger that the
+//! validator syncs gets its tx set replayed through libxrpl (via `ffi_engine`)
+//! and tracked against mainnet for any divergence. 100% agreement is the
+//! correctness SLO — see `docs/SLO.md`.
+//!
+//! Feature-gated behind `--features ffi`.
+//!
+//! ## Architecture
+//!
+//! - One `FfiVerifier` instance per validator process, cloned via `Arc` into
+//!   each sync task.
+//! - Holds the active mainnet amendments (fetched once at startup) and a
+//!   shared `FfiStats` snapshot exposed on `/api/status`.
+//! - `verify_ledger(...)` takes a pre-ordered list of tx blobs plus the
+//!   ledger header fields and delegates to `ffi_engine::apply_ledger_in_order`.
+//! - Every diverged result is recorded to `logs/divergences.jsonl` via
+//!   `DivergenceLog` (append-only, survives restarts).
+//!
+//! ## Current state provider
+//!
+//! Uses `RpcProvider` with multi-endpoint failover and retry-on-overload.
+//! A future revision will swap to `RocksDbProvider` (validator's own DB
+//! snapshot) so we stop hammering rippled — but the RPC path is the
+//! reference implementation we verified to 100% agreement on live mainnet.
+//!
+//! ## API (same shape as old TxEngine)
+//!
+//! - `FfiVerifier::new(rpc_urls)` — constructor
+//! - `verify_ledger(seq, tx_blobs, parent_hash, parent_close_time, total_drops)`
+//! - `stats()` → `FfiStats`
+
+use std::sync::Arc;
+
+use crate::ffi_engine::{
+    apply_ledger_in_order, fetch_mainnet_amendments, new_stats, DivergenceLog, FfiStats,
+    SharedFfiStats,
+};
+
+/// FFI-based per-ledger tx verifier. Send + Sync, cheap to `Arc`-clone.
+pub struct FfiVerifier {
+    stats: SharedFfiStats,
+    rpc_urls: Vec<String>,
+    amendments: Vec<[u8; 32]>,
+    divergence_log: Arc<DivergenceLog>,
+}
+
+impl FfiVerifier {
+    /// Construct a verifier and load the active mainnet amendments from the
+    /// first RPC endpoint. Blocks while amendments are fetched (up to ~40s
+    /// on rippled overload — see `fetch_mainnet_amendments`).
+    pub fn new(rpc_urls: Vec<String>) -> Self {
+        assert!(!rpc_urls.is_empty(), "at least one RPC endpoint required");
+        let amendments = fetch_mainnet_amendments(&rpc_urls[0]);
+        tracing::info!(
+            count = amendments.len(),
+            "ffi_verifier: loaded active mainnet amendments"
+        );
+        Self {
+            stats: new_stats(),
+            rpc_urls,
+            amendments,
+            divergence_log: Arc::new(DivergenceLog::new()),
+        }
+    }
+
+    /// Apply and verify every tx in a ledger, in `TransactionIndex` order,
+    /// against mainnet's recorded TER via libxrpl. Blocking — call from a
+    /// spawn_blocking task or a dedicated thread. Each diverged result is
+    /// logged to `logs/divergences.jsonl` and counted in `stats()`.
+    pub fn verify_ledger(
+        &self,
+        ledger_seq: u32,
+        sorted_tx_blobs: &[Vec<u8>],
+        parent_hash: [u8; 32],
+        parent_close_time: u32,
+        total_drops: u64,
+    ) {
+        apply_ledger_in_order(
+            &self.stats,
+            sorted_tx_blobs,
+            ledger_seq,
+            &self.rpc_urls,
+            &self.amendments,
+            parent_hash,
+            parent_close_time,
+            total_drops,
+            Some(self.divergence_log.as_ref()),
+        );
+    }
+
+    /// Snapshot the shared `FfiStats` (cheap clone, holds the mutex briefly).
+    pub fn stats(&self) -> FfiStats {
+        self.stats.lock().clone()
+    }
+
+    /// Direct access to the shared stats handle (for consumers that want to
+    /// avoid cloning each time, e.g. Prometheus render).
+    pub fn shared_stats(&self) -> SharedFfiStats {
+        Arc::clone(&self.stats)
+    }
+}

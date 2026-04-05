@@ -30,13 +30,15 @@ pub mod overlay;
 pub mod peer;
 pub mod rpc;
 pub mod state_hash;
-pub mod tx_engine;
 pub mod unl_fetch;
 pub mod validation;
 pub mod ws_sync;
 
 #[cfg(feature = "ffi")]
 pub mod ffi_engine;
+
+#[cfg(feature = "ffi")]
+pub mod ffi_verifier;
 
 pub use config::{NodeConfig, NodeMode};
 pub use error::NodeError;
