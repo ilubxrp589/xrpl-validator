@@ -15,10 +15,14 @@ crate-type = ["rlib"]
 [features]
 default = []
 live-tests = []
+# Link against libxrpl via xrpl-ffi for authoritative tx application.
+# Requires ffi/build/libxrpl_shim.a to be built first (see ffi/README).
+ffi = ["dep:xrpl-ffi"]
 
 [dependencies]
 xrpl-core = { workspace = true }
 xrpl-ledger = { path = "../xrpl-ledger" }
+xrpl-ffi = { path = "../xrpl-ffi", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

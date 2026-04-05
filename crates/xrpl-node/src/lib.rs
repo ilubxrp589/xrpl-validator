@@ -35,5 +35,8 @@ pub mod unl_fetch;
 pub mod validation;
 pub mod ws_sync;
 
+#[cfg(feature = "ffi")]
+pub mod ffi_engine;
+
 pub use config::{NodeConfig, NodeMode};
 pub use error::NodeError;

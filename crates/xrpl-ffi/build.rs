@@ -118,12 +118,16 @@ fn collect_conan_libs(conan_gen: &std::path::Path) {
         println!("cargo:rustc-link-search=native={dir}");
     }
 
-    // boost_test_exec_monitor / boost_prg_exec_monitor define main() → skip.
-    // boost_unit_test_framework does too.
+    // Exclusions:
+    // - boost_test_exec_monitor / boost_prg_exec_monitor / boost_unit_test_framework
+    //   define main() → skip.
+    // - rocksdb/snappy/lz4/zlib: xrpl-node's rocksdb crate ships its own C++
+    //   rocksdb; linking conan's copy causes duplicate symbols.
     let exclude_prefixes = [
         "boost_test_exec_monitor",
         "boost_prg_exec_monitor",
         "boost_unit_test_framework",
+        "rocksdb",
     ];
     let mut emitted: HashSet<String> = HashSet::new();
     for lib in &libs {

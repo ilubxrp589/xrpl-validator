@@ -871,6 +871,25 @@ async fn main() {
     // and validators fetch contents via TMGetObjectByHash. So we track hash-level
     // agreement: "which tx_set hash do most validators propose?".
     let consensus_monitor: Arc<Mutex<ConsensusMonitor>> = Arc::new(Mutex::new(ConsensusMonitor::default()));
+
+    // FFI health check — runs periodically to verify libxrpl integration stays healthy
+    #[cfg(feature = "ffi")]
+    let ffi_stats = {
+        let stats = xrpl_node::ffi_engine::new_stats();
+        eprintln!("[ffi] Linked against libxrpl {}", stats.lock().libxrpl_version);
+        // Run initial health check
+        let passed = xrpl_node::ffi_engine::health_check(&stats);
+        eprintln!("[ffi] Initial health check: {}", if passed { "PASSED" } else { "FAILED" });
+        // Periodic health checks (every 10s)
+        let hc_stats = stats.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                xrpl_node::ffi_engine::health_check(&hc_stats);
+            }
+        });
+        stats
+    };
     {
         let monitor = consensus_monitor.clone();
         let consensus_for_monitor = consensus.clone();
@@ -1511,6 +1530,25 @@ async fn main() {
                 }
             }
         }));
+
+    #[cfg(feature = "ffi")]
+    let app = app.route("/api/ffi-status", get({
+        let ffi_stats_web = ffi_stats.clone();
+        move || {
+            let ffi_stats_web = ffi_stats_web.clone();
+            async move {
+                let snapshot = ffi_stats_web.lock().clone();
+                axum::Json(serde_json::to_value(&snapshot).unwrap_or_default())
+            }
+        }
+    }));
+    #[cfg(not(feature = "ffi"))]
+    let app = app.route("/api/ffi-status", get(|| async {
+        axum::Json(serde_json::json!({
+            "enabled": false,
+            "note": "Build with --features ffi to enable libxrpl integration"
+        }))
+    }));
 
     // SECURITY(10.3): All /api/* endpoints are read-only (sync-status, engine, peers,
     // state-hash, history, consensus). There is no submit/transaction endpoint.
