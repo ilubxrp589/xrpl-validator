@@ -11,15 +11,37 @@
 async fn main() {
     use std::sync::Arc;
     use std::time::Duration;
+    use tracing::{info, warn};
 
-    println!("=== xrpl-node FFI stats server ===\n");
+    // Structured JSON logs to stderr. Override format with LOG_FORMAT=text.
+    let log_format = std::env::var("LOG_FORMAT").unwrap_or_else(|_| "json".into());
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    if log_format == "text" {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_env_filter(env_filter)
+            .with_writer(std::io::stderr)
+            .init();
+    }
 
     let stats = xrpl_node::ffi_engine::new_stats();
-    println!("libxrpl version: {}", stats.lock().libxrpl_version);
+    let version = stats.lock().libxrpl_version.clone();
+    info!(component = "ffi_test", libxrpl_version = %version, "starting");
 
     // Initial health check
     let passed = xrpl_node::ffi_engine::health_check(&stats);
-    println!("Initial health check: {}", if passed { "PASSED ✓" } else { "FAILED ✗" });
+    if passed {
+        info!(check = "health", result = "pass", "initial self-test passed");
+    } else {
+        warn!(check = "health", result = "fail", "initial self-test failed");
+    }
 
     // Periodic health checks
     let hc_stats = stats.clone();
@@ -32,7 +54,11 @@ async fn main() {
 
     // Live mainnet tx feeder — fetch ledgers from rippled, push every tx through FFI
     let live_stats = stats.clone();
+    let divergence_log = Arc::new(xrpl_node::ffi_engine::DivergenceLog::new());
+    let live_dlog = divergence_log.clone();
+    info!(path = %divergence_log.path().display(), "divergence log opened");
     tokio::spawn(async move {
+        use tracing::info;
         let rpc_url = std::env::var("XRPL_RPC_URL")
             .unwrap_or_else(|_| "http://10.0.0.39:5005".to_string());
 
@@ -43,14 +69,14 @@ async fn main() {
         })
         .await
         .unwrap_or_default();
-        println!("[ffi-live] Loaded {} active mainnet amendments", amendments.len());
+        info!(count = amendments.len(), "loaded active mainnet amendments");
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .expect("reqwest client");
         let mut last_processed: u32 = 0;
-        println!("[ffi-live] Fetching live mainnet txs from {rpc_url}");
+        info!(rpc_url = %rpc_url, "fetching live mainnet txs");
         loop {
             // Get validated ledger index
             let resp = client
@@ -127,11 +153,12 @@ async fn main() {
                         (ph, pct, td)
                     } else { ([0u8;32], 0, 0) }
                 } else { ([0u8;32], 0, 0) };
-                eprintln!("[ffi-live] Applying {} txs from ledger #{seq} (drops={total_drops}) in TransactionIndex order...", sorted_blobs.len());
+                info!(ledger_seq = seq, txs = sorted_blobs.len(), total_drops, "applying ledger in transaction-index order");
 
                 let apply_stats = live_stats.clone();
                 let rpc_url_owned = rpc_url.clone();
                 let amendments_owned = amendments.clone();
+                let dlog = live_dlog.clone();
                 tokio::task::spawn_blocking(move || {
                     xrpl_node::ffi_engine::apply_ledger_in_order(
                         &apply_stats,
@@ -142,6 +169,7 @@ async fn main() {
                         parent_hash,
                         parent_close_time,
                         total_drops,
+                        Some(dlog.as_ref()),
                     );
                 });
             }
@@ -155,27 +183,48 @@ async fn main() {
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(3778);
 
-    use axum::{routing::get, Json, Router};
+    use axum::{http::header, response::IntoResponse, routing::get, Json, Router};
     let api_stats = Arc::clone(&stats);
-    let app = Router::new().route(
-        "/api/ffi-status",
-        get(move || {
-            let stats = api_stats.clone();
-            async move {
-                let snapshot = stats.lock().clone();
-                Json(serde_json::to_value(&snapshot).unwrap_or_default())
-            }
-        }),
-    );
+    let metrics_stats = Arc::clone(&stats);
+    let app = Router::new()
+        .route(
+            "/api/ffi-status",
+            get(move || {
+                let stats = api_stats.clone();
+                async move {
+                    let snapshot = stats.lock().clone();
+                    Json(serde_json::to_value(&snapshot).unwrap_or_default())
+                }
+            }),
+        )
+        .route(
+            "/metrics",
+            get(move || {
+                let stats = metrics_stats.clone();
+                async move {
+                    let snapshot = stats.lock().clone();
+                    let body = xrpl_node::ffi_engine::render_prometheus(&snapshot);
+                    (
+                        [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+                        body,
+                    )
+                        .into_response()
+                }
+            }),
+        )
+        .route(
+            "/health",
+            get(move || async move {
+                (axum::http::StatusCode::OK, "ok")
+            }),
+        );
 
     let addr = format!("0.0.0.0:{port}");
-    println!("\n[ffi] HTTP stats server listening on http://{addr}/api/ffi-status");
-    println!("[ffi] Running health checks every 500ms...");
-    println!("\nPress Ctrl-C to stop.\n");
+    info!(bind = %addr, routes = "/api/ffi-status,/metrics,/health", "http server listening");
 
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
     if let Err(e) = axum::serve(listener, app).await {
-        eprintln!("server error: {e}");
+        tracing::error!(error = %e, "server error");
     }
 }
 

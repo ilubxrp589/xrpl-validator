@@ -1,0 +1,83 @@
+# Prometheus alert rules for the XRPL FFI engine.
+# Load into Prometheus via `rule_files: [alerts/xrpl-ffi.rules.yml]`.
+# See docs/SLO.md for the definitions behind each alert.
+
+groups:
+  - name: xrpl-ffi.correctness
+    rules:
+      - alert: XrplFfiMainnetDivergence
+        expr: increase(xrpl_ffi_apply_total{result="diverged"}[1m]) > 0
+        for: 1m
+        labels:
+          severity: page
+          slo: correctness
+        annotations:
+          summary: "FFI diverged from mainnet ({{ $value }} txs in last minute)"
+          description: "The libxrpl FFI engine produced a different TER than mainnet for at least one tx. Correctness SLO is zero tolerance. See logs/divergences.jsonl."
+          runbook: "docs/SLO.md#1-correctness--zero-tolerance"
+
+      - alert: XrplFfiAgreementRatioBelow100
+        expr: xrpl_ffi_mainnet_agreement_ratio < 1.0
+        for: 2m
+        labels:
+          severity: page
+          slo: correctness
+        annotations:
+          summary: "Mainnet agreement ratio {{ $value }} (target 1.0)"
+          description: "The cumulative mainnet-agreement ratio has dropped below 1.0 and stayed there for 2 minutes."
+
+  - name: xrpl-ffi.availability
+    rules:
+      - alert: XrplFfiDown
+        expr: up{job="xrpl-ffi"} == 0
+        for: 2m
+        labels:
+          severity: page
+          slo: availability
+        annotations:
+          summary: "XRPL FFI instance {{ $labels.instance }} is down"
+          description: "Prometheus has been unable to scrape xrpl-ffi at {{ $labels.instance }} for 2 minutes."
+
+  - name: xrpl-ffi.latency
+    rules:
+      - alert: XrplFfiApplyP99High
+        expr: histogram_quantile(0.99, rate(xrpl_ffi_apply_duration_seconds_bucket[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: warn
+          slo: latency
+        annotations:
+          summary: "Apply p99 {{ $value | humanizeDuration }} (target < 100ms)"
+          description: "The p99 apply duration has been above 100ms for 10 minutes. Check rippled backing store health."
+
+  - name: xrpl-ffi.rpc-provider
+    rules:
+      - alert: XrplFfiRpcMissRateHigh
+        expr: |
+          (
+            rate(xrpl_ffi_rpc_sle_lookups_total{result="miss"}[5m])
+            /
+            ignoring(result) sum without(result)(rate(xrpl_ffi_rpc_sle_lookups_total[5m]))
+          ) > 0.15
+        for: 5m
+        labels:
+          severity: warn
+          slo: rpc-efficiency
+        annotations:
+          summary: "RPC SLE miss rate {{ $value | humanizePercentage }} (target < 10%)"
+          description: "The fallback rippled RPC is returning entryNotFound for >15% of SLE lookups. Possible causes: pruned history, stale ledger index, or unreachable backing node."
+
+  - name: xrpl-ffi.health
+    rules:
+      - alert: XrplFfiSelfTestFailing
+        expr: |
+          rate(xrpl_ffi_health_passed_total[5m])
+          <
+          rate(xrpl_ffi_health_checks_total[5m])
+        for: 2m
+        labels:
+          severity: page
+          slo: correctness
+        annotations:
+          summary: "Self-test failures in last 5m"
+          description: "The hardcoded-tx self-test (runs every 500ms) has failed at least once in the last 5 minutes. libxrpl FFI build is broken."

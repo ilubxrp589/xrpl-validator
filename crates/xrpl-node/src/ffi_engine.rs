@@ -274,6 +274,229 @@ pub struct FfiStats {
     pub rpc_sle_miss_samples: Vec<String>,
     /// Sample of up to 10 diverged tx hashes (tx_type/TER/hash) for mainnet lookup
     pub diverged_tx_samples: Vec<String>,
+    /// Apply-latency histogram buckets (milliseconds). Cumulative counts
+    /// (Prometheus-style: bucket[i] = count of observations ≤ bucket_bound[i]).
+    /// Bounds: 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, +Inf
+    pub apply_duration_buckets_ms: [u64; 11],
+    pub apply_duration_count: u64,
+    pub apply_duration_sum_ms: u64,
+    /// Per-tx-type apply counts (independent of TER)
+    pub apply_by_type: std::collections::BTreeMap<String, u64>,
+    /// Number of ledgers fully applied (for throughput metrics)
+    pub ledgers_applied: u64,
+}
+
+/// Histogram bucket bounds (in milliseconds) for apply latency.
+pub const APPLY_LATENCY_BUCKETS_MS: [u64; 10] = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000];
+
+/// Render FfiStats as a Prometheus OpenMetrics exposition.
+///
+/// Exposes counters, gauges and one histogram. Labels follow Prometheus
+/// conventions (snake_case metric names, value-typed labels).
+pub fn render_prometheus(s: &FfiStats) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(4096);
+
+    // libxrpl build info (gauge-as-label trick)
+    let _ = writeln!(out, "# HELP xrpl_ffi_build_info libxrpl version info");
+    let _ = writeln!(out, "# TYPE xrpl_ffi_build_info gauge");
+    let _ = writeln!(
+        out,
+        "xrpl_ffi_build_info{{libxrpl_version=\"{}\"}} 1",
+        escape_label(&s.libxrpl_version)
+    );
+
+    // Self-test health (gauge)
+    let _ = writeln!(out, "# HELP xrpl_ffi_health_checks_total Self-test runs");
+    let _ = writeln!(out, "# TYPE xrpl_ffi_health_checks_total counter");
+    let _ = writeln!(out, "xrpl_ffi_health_checks_total {}", s.health_checks);
+    let _ = writeln!(out, "# HELP xrpl_ffi_health_passed_total Self-test runs that passed");
+    let _ = writeln!(out, "# TYPE xrpl_ffi_health_passed_total counter");
+    let _ = writeln!(out, "xrpl_ffi_health_passed_total {}", s.health_passed);
+
+    // Live feed — preflight
+    let _ = writeln!(out, "# HELP xrpl_ffi_preflight_total Live mainnet txs run through parse+preflight");
+    let _ = writeln!(out, "# TYPE xrpl_ffi_preflight_total counter");
+    let _ = writeln!(out, "xrpl_ffi_preflight_total{{result=\"ok\"}} {}", s.live_txs_preflight_ok);
+    let _ = writeln!(out, "xrpl_ffi_preflight_total{{result=\"fail\"}} {}", s.live_txs_preflight_fail);
+    let _ = writeln!(out, "# HELP xrpl_ffi_parsed_total Live mainnet txs successfully parsed");
+    let _ = writeln!(out, "# TYPE xrpl_ffi_parsed_total counter");
+    let _ = writeln!(out, "xrpl_ffi_parsed_total {}", s.live_txs_parsed);
+
+    // Live feed — full apply
+    let _ = writeln!(out, "# HELP xrpl_ffi_apply_total Apply() calls by result class");
+    let _ = writeln!(out, "# TYPE xrpl_ffi_apply_total counter");
+    let _ = writeln!(out, "xrpl_ffi_apply_total{{result=\"tesSUCCESS\"}} {}", s.live_apply_ok);
+    let _ = writeln!(out, "xrpl_ffi_apply_total{{result=\"tec_claimed\"}} {}", s.live_apply_claimed);
+    let _ = writeln!(out, "xrpl_ffi_apply_total{{result=\"diverged\"}} {}", s.live_apply_diverged);
+    let _ = writeln!(out, "xrpl_ffi_apply_attempted_total {}", s.live_apply_attempted);
+
+    // Mainnet agreement ratio (gauge)
+    let agreed = s.live_apply_ok + s.live_apply_claimed;
+    let ratio: f64 = if s.live_apply_attempted > 0 {
+        agreed as f64 / s.live_apply_attempted as f64
+    } else {
+        1.0
+    };
+    let _ = writeln!(out, "# HELP xrpl_ffi_mainnet_agreement_ratio Fraction of apply() results that matched mainnet (tesSUCCESS + tec*)");
+    let _ = writeln!(out, "# TYPE xrpl_ffi_mainnet_agreement_ratio gauge");
+    let _ = writeln!(out, "xrpl_ffi_mainnet_agreement_ratio {ratio:.6}");
+
+    // Per-TER counts
+    let _ = writeln!(out, "# HELP xrpl_ffi_apply_ter_total Apply() calls by TER code");
+    let _ = writeln!(out, "# TYPE xrpl_ffi_apply_ter_total counter");
+    for (ter, count) in &s.live_apply_ter_counts {
+        let _ = writeln!(out, "xrpl_ffi_apply_ter_total{{ter=\"{}\"}} {}", escape_label(ter), count);
+    }
+
+    // Per-tx-type counts
+    let _ = writeln!(out, "# HELP xrpl_ffi_apply_by_type_total Apply() calls by tx_type");
+    let _ = writeln!(out, "# TYPE xrpl_ffi_apply_by_type_total counter");
+    for (ty, count) in &s.apply_by_type {
+        let _ = writeln!(out, "xrpl_ffi_apply_by_type_total{{tx_type=\"{}\"}} {}", escape_label(ty), count);
+    }
+
+    // Divergence breakdown (tx_type × TER)
+    let _ = writeln!(out, "# HELP xrpl_ffi_diverged_total Diverged apply results by tx_type and TER");
+    let _ = writeln!(out, "# TYPE xrpl_ffi_diverged_total counter");
+    for (combo, count) in &s.live_diverged_by_type {
+        if let Some((ty, ter)) = combo.split_once('/') {
+            let _ = writeln!(
+                out,
+                "xrpl_ffi_diverged_total{{tx_type=\"{}\",ter=\"{}\"}} {}",
+                escape_label(ty), escape_label(ter), count
+            );
+        }
+    }
+
+    // Apply-latency histogram (convert ms → seconds for Prometheus convention)
+    let _ = writeln!(out, "# HELP xrpl_ffi_apply_duration_seconds Apply() latency in seconds");
+    let _ = writeln!(out, "# TYPE xrpl_ffi_apply_duration_seconds histogram");
+    for (i, bound_ms) in APPLY_LATENCY_BUCKETS_MS.iter().enumerate() {
+        let le = *bound_ms as f64 / 1000.0;
+        let _ = writeln!(
+            out,
+            "xrpl_ffi_apply_duration_seconds_bucket{{le=\"{le}\"}} {}",
+            s.apply_duration_buckets_ms[i]
+        );
+    }
+    let _ = writeln!(
+        out,
+        "xrpl_ffi_apply_duration_seconds_bucket{{le=\"+Inf\"}} {}",
+        s.apply_duration_buckets_ms[10]
+    );
+    let _ = writeln!(
+        out,
+        "xrpl_ffi_apply_duration_seconds_sum {:.3}",
+        s.apply_duration_sum_ms as f64 / 1000.0
+    );
+    let _ = writeln!(out, "xrpl_ffi_apply_duration_seconds_count {}", s.apply_duration_count);
+
+    // RPC provider
+    let _ = writeln!(out, "# HELP xrpl_ffi_rpc_sle_lookups_total SLE lookups via rippled RPC");
+    let _ = writeln!(out, "# TYPE xrpl_ffi_rpc_sle_lookups_total counter");
+    let _ = writeln!(out, "xrpl_ffi_rpc_sle_lookups_total{{result=\"hit\"}} {}", s.rpc_sle_hits);
+    let _ = writeln!(out, "xrpl_ffi_rpc_sle_lookups_total{{result=\"miss\"}} {}", s.rpc_sle_misses);
+
+    // Ledger progress
+    let _ = writeln!(out, "# HELP xrpl_ffi_ledgers_applied_total Ledgers fully applied via FFI");
+    let _ = writeln!(out, "# TYPE xrpl_ffi_ledgers_applied_total counter");
+    let _ = writeln!(out, "xrpl_ffi_ledgers_applied_total {}", s.ledgers_applied);
+    let _ = writeln!(out, "# HELP xrpl_ffi_live_ledger_seq Most recent ledger sequence fed through FFI");
+    let _ = writeln!(out, "# TYPE xrpl_ffi_live_ledger_seq gauge");
+    let _ = writeln!(out, "xrpl_ffi_live_ledger_seq {}", s.live_ledger_seq);
+
+    out
+}
+
+/// Escape a Prometheus label value per OpenMetrics rules.
+fn escape_label(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Append-only JSONL log for every diverged tx. Survives restarts.
+///
+/// One record per divergence. Opening the file is lazy + per-line flushed
+/// so readers can tail it live. Path defaults to logs/divergences.jsonl
+/// under the cwd; override via XRPL_FFI_DIVERGENCE_LOG env var.
+pub struct DivergenceLog {
+    path: std::path::PathBuf,
+    file: parking_lot::Mutex<Option<std::fs::File>>,
+}
+
+impl DivergenceLog {
+    pub fn new() -> Self {
+        let path = std::env::var("XRPL_FFI_DIVERGENCE_LOG")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("logs/divergences.jsonl"));
+        Self { path, file: parking_lot::Mutex::new(None) }
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Record one divergence. Swallows I/O errors (divergence recording must
+    /// never crash the apply loop).
+    pub fn record(
+        &self,
+        ledger_seq: u32,
+        tx_hash: &str,
+        tx_type: &str,
+        our_ter: &str,
+        duration_ms: u64,
+        fatal: &str,
+    ) {
+        use std::io::Write;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let line = serde_json::json!({
+            "ts": ts,
+            "ledger_seq": ledger_seq,
+            "tx_hash": tx_hash,
+            "tx_type": tx_type,
+            "our_ter": our_ter,
+            "duration_ms": duration_ms,
+            "fatal": fatal,
+        });
+        let mut guard = self.file.lock();
+        if guard.is_none() {
+            // Ensure parent directory exists
+            if let Some(parent) = self.path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let opened = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path);
+            if let Ok(f) = opened {
+                *guard = Some(f);
+            } else {
+                return;
+            }
+        }
+        if let Some(f) = guard.as_mut() {
+            let _ = writeln!(f, "{line}");
+            let _ = f.flush();
+        }
+    }
+}
+
+impl Default for DivergenceLog {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub type SharedFfiStats = Arc<Mutex<FfiStats>>;
@@ -438,6 +661,7 @@ pub fn apply_ledger_in_order(
     parent_hash: [u8; 32],
     parent_close_time: u32,
     total_drops: u64,
+    divergence_log: Option<&DivergenceLog>,
 ) {
     let fallback = RpcProvider::new(rpc_url.to_string(), ledger_seq.saturating_sub(1));
     let overlay: parking_lot::Mutex<std::collections::HashMap<[u8; 32], Option<Vec<u8>>>> =
@@ -508,11 +732,15 @@ pub fn apply_ledger_in_order(
             }
             post_overlay_size = ov.len();
         }
-        // Only log non-success so we see the failure patterns
-        if !outcome.is_success() && tx_num % 10 == 1 {
-            eprintln!(
-                "  [tx #{tx_num}] {} mutations={} overlay={}",
-                outcome.ter_name, outcome.mutations.len(), post_overlay_size
+        // Trace-level structured event for non-success — so we can correlate
+        // with divergence log entries without spamming at info level.
+        if !outcome.is_success() {
+            tracing::trace!(
+                tx_num,
+                ter = %outcome.ter_name,
+                mutations = outcome.mutations.len(),
+                overlay_size = post_overlay_size,
+                "apply non-success"
             );
         }
         let _ = (overlay_hits, prior_overlay_size);
@@ -538,12 +766,38 @@ pub fn apply_ledger_in_order(
                 };
                 s.diverged_tx_samples.push(format!("{}/{} {}{}", tx_type, outcome.ter_name, tx_hash, tail));
             }
+            drop(s);
+            if let Some(log) = divergence_log {
+                log.record(ledger_seq, &tx_hash, &tx_type, &outcome.ter_name, elapsed_ms, &outcome.last_fatal);
+            }
+            // Re-acquire — remaining fields updated below
+            s = stats.lock();
         }
         s.live_apply_last_ter = outcome.ter_name.clone();
         s.live_apply_last_mutations = outcome.mutations.len();
         s.live_apply_last_ms = elapsed_ms;
         *s.live_apply_ter_counts.entry(outcome.ter_name).or_insert(0) += 1;
+        *s.apply_by_type.entry(tx_type.clone()).or_insert(0) += 1;
+        // Histogram: find the first bucket bound >= elapsed_ms, increment it
+        // and every bucket after (Prometheus cumulative convention).
+        s.apply_duration_count += 1;
+        s.apply_duration_sum_ms += elapsed_ms;
+        let mut found = false;
+        for (i, bound) in APPLY_LATENCY_BUCKETS_MS.iter().enumerate() {
+            if elapsed_ms <= *bound {
+                for j in i..11 {
+                    s.apply_duration_buckets_ms[j] += 1;
+                }
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            // Overflowed all finite bounds → only +Inf bucket
+            s.apply_duration_buckets_ms[10] += 1;
+        }
     }
+    stats.lock().ledgers_applied += 1;
 
     // Export cumulative RPC provider counters (per-ledger)
     use std::sync::atomic::Ordering;
