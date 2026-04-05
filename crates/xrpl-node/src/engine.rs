@@ -48,34 +48,135 @@ pub fn extract_xrp_balance_pub(data: &[u8]) -> Option<u64> {
 }
 
 fn extract_xrp_balance(data: &[u8]) -> Option<u64> {
-    // Scan for 0x61 byte (sfBalance = STI_AMOUNT | 1)
-    // Start at offset 7 to skip LedgerEntryType (0x11 0x00 0x61) + Flags (0x22 + 4 bytes)
-    let start = 7.min(data.len());
-    for i in start..data.len().saturating_sub(9) {
-        if data[i] == 0x61 {
-            let amount_bytes: [u8; 8] = data[i+1..i+9].try_into().ok()?;
-            let raw = u64::from_be_bytes(amount_bytes);
-            if raw & 0x8000000000000000 != 0 { continue; }
-            let drops = raw & 0x3FFFFFFFFFFFFFFF;
-            return Some(drops);
+    // Structural XRPL binary parse: walk fields in order, extract Balance (0x62).
+    // Avoids false matches inside hash fields (PreviousTxnID, etc.) that byte-scanning suffers from.
+    parse_account_root_balance(data)
+}
+
+/// Walks an AccountRoot binary object field-by-field until it finds Balance.
+/// Returns None if the field isn't present or parsing fails.
+fn parse_account_root_balance(data: &[u8]) -> Option<u64> {
+    let mut pos = 0;
+    while pos < data.len() {
+        let (type_code, field_code, header_len) = read_field_header(data, pos)?;
+        pos += header_len;
+
+        // Balance: type=6 (Amount), field=2
+        if type_code == 6 && field_code == 2 {
+            if pos + 8 > data.len() { return None; }
+            let raw = u64::from_be_bytes(data[pos..pos + 8].try_into().ok()?);
+            if raw & 0x8000000000000000 != 0 { return None; } // IOU — not XRP
+            if raw & 0x4000000000000000 == 0 { return None; } // not positive
+            return Some(raw & 0x3FFFFFFFFFFFFFFF);
         }
+
+        // Skip the field's value based on its type
+        let value_len = match type_code {
+            1 => 2,                              // UInt16
+            2 => 4,                              // UInt32
+            3 => 8,                              // UInt64
+            4 => 16,                             // Hash128 / UInt128
+            5 => 32,                             // Hash256 / UInt256
+            16 => 1,                             // UInt8
+            17 => 20,                            // Hash160
+            6 => {
+                // Amount: 8 bytes XRP, 48 bytes IOU (bit 63 of first byte determines)
+                if pos >= data.len() { return None; }
+                if data[pos] & 0x80 != 0 { 48 } else { 8 }
+            }
+            7 | 8 => {
+                // VL types (Blob, AccountID): read length prefix
+                let (vl, vl_header) = read_vl_length(data, pos)?;
+                pos += vl_header;
+                vl
+            }
+            14 => {
+                // STObject: skip until end marker 0xE1
+                let mut depth = 1;
+                let mut p = pos;
+                while p < data.len() && depth > 0 {
+                    let b = data[p];
+                    if b == 0xE1 { depth -= 1; p += 1; }
+                    else if b == 0xE0 { depth += 1; p += 1; }
+                    else {
+                        // Skip one field recursively — too complex, bail
+                        return None;
+                    }
+                }
+                p - pos
+            }
+            15 => {
+                // STArray: skip until end marker 0xF1
+                let mut p = pos;
+                while p < data.len() && data[p] != 0xF1 { p += 1; }
+                p - pos + 1
+            }
+            _ => return None, // unknown type
+        };
+        pos += value_len;
     }
     None
 }
 
+/// Read a field header. Returns (type_code, field_code, bytes_consumed).
+fn read_field_header(data: &[u8], pos: usize) -> Option<(u8, u8, usize)> {
+    if pos >= data.len() { return None; }
+    let tag = data[pos];
+    let type_high = tag >> 4;
+    let field_low = tag & 0x0F;
+
+    if type_high != 0 && field_low != 0 {
+        // Both fit in one byte
+        Some((type_high, field_low, 1))
+    } else if type_high == 0 && field_low == 0 {
+        // Both in next two bytes
+        if pos + 2 >= data.len() { return None; }
+        Some((data[pos + 1], data[pos + 2], 3))
+    } else if type_high == 0 {
+        // Type in next byte, field in low nibble
+        if pos + 1 >= data.len() { return None; }
+        Some((data[pos + 1], field_low, 2))
+    } else {
+        // Type in high nibble, field in next byte
+        if pos + 1 >= data.len() { return None; }
+        Some((type_high, data[pos + 1], 2))
+    }
+}
+
+/// Read a variable-length (VL) length prefix. Returns (length, bytes_consumed).
+fn read_vl_length(data: &[u8], pos: usize) -> Option<(usize, usize)> {
+    if pos >= data.len() { return None; }
+    let b1 = data[pos] as usize;
+    if b1 <= 192 {
+        Some((b1, 1))
+    } else if b1 <= 240 {
+        if pos + 1 >= data.len() { return None; }
+        let b2 = data[pos + 1] as usize;
+        Some((193 + (b1 - 193) * 256 + b2, 2))
+    } else if b1 <= 254 {
+        if pos + 2 >= data.len() { return None; }
+        let b2 = data[pos + 1] as usize;
+        let b3 = data[pos + 2] as usize;
+        Some((12481 + (b1 - 241) * 65536 + b2 * 256 + b3, 3))
+    } else {
+        None
+    }
+}
+
 /// Set the XRP balance in a raw binary AccountRoot object.
-/// Finds the 0x61 (Balance) field and overwrites the 8-byte amount in-place.
+/// Finds the 0x62 (Balance, type=6 field=2) field and overwrites the 8-byte amount in-place.
 /// Returns the modified data, or None if the balance field wasn't found.
 fn set_xrp_balance(data: &mut [u8], new_drops: u64) -> bool {
     let start = 7.min(data.len());
     for i in start..data.len().saturating_sub(9) {
-        if data[i] == 0x61 {
+        if data[i] == 0x62 {
             let amount_bytes: [u8; 8] = match data[i+1..i+9].try_into() {
                 Ok(b) => b,
                 Err(_) => continue,
             };
             let raw = u64::from_be_bytes(amount_bytes);
             if raw & 0x8000000000000000 != 0 { continue; } // skip IOUs
+            if raw & 0x4000000000000000 == 0 { continue; } // not positive XRP
             // Encode new XRP balance: bit 62 set = positive, bits 0-61 = drops
             let new_raw = if new_drops > 0 {
                 0x4000000000000000 | new_drops

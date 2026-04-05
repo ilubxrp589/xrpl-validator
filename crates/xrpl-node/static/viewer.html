@@ -371,7 +371,9 @@ async function pollEngine() {
     const r = await fetch('/api/engine'); const d = await r.json();
     const burned = d.lifetime_burned > 0 ? d.lifetime_burned : d.total_fees_burned + d.round_fees;
     document.getElementById('fee-burn').textContent = (burned / 1_000_000).toLocaleString(undefined, {maximumFractionDigits: 2});
-    const cov = d.round_tx_count > 0 ? Math.round((d.round_supported / d.round_tx_count) * 100) + '%' : '100%';
+    const cov = (d.tx_engine && d.tx_engine.total_txs > 0)
+      ? d.tx_engine.coverage_pct.toFixed(1) + '%'
+      : (d.round_tx_count > 0 ? Math.round((d.round_supported / d.round_tx_count) * 100) + '%' : '--');
     document.getElementById('engine-cov').textContent = cov;
     if (d.live_engine && d.live_engine.active) {
       const la = d.live_engine.total_applied;

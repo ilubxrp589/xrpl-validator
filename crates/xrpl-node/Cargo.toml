@@ -59,6 +59,7 @@ futures-util = "0.3"
 native-tls = "0.2"
 tikv-jemallocator = "0.6"
 rusqlite = { version = "0.31", features = ["bundled"] }
+base64 = "0.22"
 
 [build-dependencies]
 prost-build = "0.13"

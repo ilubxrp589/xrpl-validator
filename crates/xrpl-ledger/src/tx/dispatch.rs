@@ -14,8 +14,14 @@ use super::credential::{
 };
 use super::escrow::{EscrowCancelTransactor, EscrowCreateTransactor, EscrowFinishTransactor};
 use super::misc::{
-    ClawbackTransactor, DepositPreauthTransactor, SetRegularKeyTransactor,
-    SignerListSetTransactor,
+    AMMClawbackTransactor, ClawbackTransactor, DIDDeleteTransactor, DIDSetTransactor,
+    DepositPreauthTransactor, MPTokenAuthorizeTransactor, MPTokenIssuanceCreateTransactor,
+    MPTokenIssuanceDestroyTransactor, MPTokenIssuanceSetTransactor, OracleDeleteTransactor,
+    OracleSetTransactor, PermissionedDomainDeleteTransactor, PermissionedDomainSetTransactor,
+    SetRegularKeyTransactor, SignerListSetTransactor, TicketCreateTransactor,
+    XChainAccountCreateCommitTransactor, XChainAddAccountCreateAttestationTransactor,
+    XChainAddClaimAttestationTransactor, XChainClaimTransactor, XChainCommitTransactor,
+    XChainCreateBridgeTransactor, XChainCreateClaimIDTransactor, XChainModifyBridgeTransactor,
 };
 use super::nftoken::{
     NFTokenAcceptOfferTransactor, NFTokenBurnTransactor, NFTokenCancelOfferTransactor,
@@ -66,6 +72,26 @@ pub fn get_transactor(tx_type: &str) -> Option<Box<dyn Transactor>> {
         "AMMVote" => Some(Box::new(AMMVoteTransactor)),
         "AMMBid" => Some(Box::new(AMMBidTransactor)),
         "AMMDelete" => Some(Box::new(AMMDeleteTransactor)),
+        "AMMClawback" => Some(Box::new(AMMClawbackTransactor)),
+        "TicketCreate" => Some(Box::new(TicketCreateTransactor)),
+        "OracleSet" => Some(Box::new(OracleSetTransactor)),
+        "OracleDelete" => Some(Box::new(OracleDeleteTransactor)),
+        "DIDSet" => Some(Box::new(DIDSetTransactor)),
+        "DIDDelete" => Some(Box::new(DIDDeleteTransactor)),
+        "XChainCreateBridge" => Some(Box::new(XChainCreateBridgeTransactor)),
+        "XChainCreateClaimID" => Some(Box::new(XChainCreateClaimIDTransactor)),
+        "XChainCommit" => Some(Box::new(XChainCommitTransactor)),
+        "XChainClaim" => Some(Box::new(XChainClaimTransactor)),
+        "XChainModifyBridge" => Some(Box::new(XChainModifyBridgeTransactor)),
+        "XChainAccountCreateCommit" => Some(Box::new(XChainAccountCreateCommitTransactor)),
+        "XChainAddClaimAttestation" => Some(Box::new(XChainAddClaimAttestationTransactor)),
+        "XChainAddAccountCreateAttestation" => Some(Box::new(XChainAddAccountCreateAttestationTransactor)),
+        "PermissionedDomainSet" => Some(Box::new(PermissionedDomainSetTransactor)),
+        "PermissionedDomainDelete" => Some(Box::new(PermissionedDomainDeleteTransactor)),
+        "MPTokenIssuanceCreate" => Some(Box::new(MPTokenIssuanceCreateTransactor)),
+        "MPTokenIssuanceDestroy" => Some(Box::new(MPTokenIssuanceDestroyTransactor)),
+        "MPTokenIssuanceSet" => Some(Box::new(MPTokenIssuanceSetTransactor)),
+        "MPTokenAuthorize" => Some(Box::new(MPTokenAuthorizeTransactor)),
         _ => None,
     }
 }
@@ -92,6 +118,16 @@ mod tests {
             "SetRegularKey", "SignerListSet", "DepositPreauth", "Clawback",
             "CredentialCreate", "CredentialDelete", "CredentialAccept",
             "AMMCreate", "AMMDeposit", "AMMWithdraw", "AMMVote", "AMMBid", "AMMDelete",
+            "AMMClawback",
+            "TicketCreate",
+            "OracleSet", "OracleDelete",
+            "DIDSet", "DIDDelete",
+            "XChainCreateBridge", "XChainCreateClaimID", "XChainCommit",
+            "XChainClaim", "XChainModifyBridge", "XChainAccountCreateCommit",
+            "XChainAddClaimAttestation", "XChainAddAccountCreateAttestation",
+            "PermissionedDomainSet", "PermissionedDomainDelete",
+            "MPTokenIssuanceCreate", "MPTokenIssuanceDestroy",
+            "MPTokenIssuanceSet", "MPTokenAuthorize",
         ] {
             assert!(is_supported(ty), "{} should be supported", ty);
         }

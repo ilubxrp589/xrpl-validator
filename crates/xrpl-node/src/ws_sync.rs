@@ -23,6 +23,7 @@ pub async fn start_ws_sync(
     hash_comp: Arc<crate::state_hash::StateHashComputer>,
     last_synced: Arc<AtomicU32>,
     history: Option<Arc<parking_lot::Mutex<crate::history::HistoryStore>>>,
+    tx_engine: Option<Arc<crate::tx_engine::TxEngine>>,
 ) {
     let rpc = RippledClient::new();
 
@@ -117,7 +118,14 @@ pub async fn start_ws_sync(
                     let mut meta_ok = false;
                     for attempt in 0..3u32 {
                         match fetch_ledger_metadata(&rpc, process_seq, &mut acc_modified, &mut acc_deleted, &mut acc_tx_count).await {
-                            Ok(()) => { meta_ok = true; break; }
+                            Ok(sorted_txs) => {
+                                // Independent transaction verification (dual-path)
+                                if let Some(ref engine) = tx_engine {
+                                    engine.apply_ledger(&sorted_txs, &db);
+                                }
+                                meta_ok = true;
+                                break;
+                            }
                             Err(e) => {
                                 if attempt < 2 {
                                     eprintln!("[ws-sync] Metadata #{process_seq} attempt {}: {e} — retry", attempt + 1);
@@ -222,13 +230,13 @@ async fn fetch_ledger_metadata(
     rpc: &RippledClient, seq: u32,
     modified: &mut HashSet<String>, deleted: &mut HashSet<String>,
     tx_count: &mut u32,
-) -> Result<(), String> {
+) -> Result<Vec<serde_json::Value>, String> {
     let body = rpc.call("ledger", serde_json::json!({"ledger_index": seq, "transactions": true, "expand": true, "binary": false})).await?;
     let txs = body["result"]["ledger"]["transactions"].as_array()
         .ok_or("no transactions")?;
 
     // Sort by TransactionIndex (execution order) — array order can differ!
-    let mut sorted_txs: Vec<&serde_json::Value> = txs.iter().collect();
+    let mut sorted_txs: Vec<serde_json::Value> = txs.iter().cloned().collect();
     sorted_txs.sort_by_key(|tx| {
         let meta = if tx["meta"].is_object() { &tx["meta"] }
             else if tx["metaData"].is_object() { &tx["metaData"] }
@@ -236,11 +244,11 @@ async fn fetch_ledger_metadata(
         meta["TransactionIndex"].as_u64().unwrap_or(0)
     });
 
-    for tx in sorted_txs {
+    for tx in &sorted_txs {
         extract_affected_nodes(tx, modified, deleted);
         *tx_count += 1;
     }
-    Ok(())
+    Ok(sorted_txs)
 }
 
 async fn process_ledger(

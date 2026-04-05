@@ -74,6 +74,108 @@ struct PeerEntry {
     hops: u32,
 }
 
+/// Tracks tx_hash agreement across UNL validators.
+///
+/// For each trusted validator, stores their latest proposed tx_hash.
+/// Groups by hash to detect supermajority agreement (threshold for consensus).
+#[derive(Default, serde::Serialize, Clone)]
+struct ConsensusMonitor {
+    /// validator_key_hex → (tx_hash_hex, propose_seq, close_time, last_seen_millis)
+    #[serde(skip)]
+    positions: std::collections::HashMap<String, (String, u32, u32, u64)>,
+    /// Last observed agreement (cached).
+    pub last_agreement: Option<Agreement>,
+    /// Total proposals received since startup.
+    pub total_proposals: u64,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct Agreement {
+    pub tx_hash: String,
+    pub count: usize,
+    pub pct: f64,
+    pub propose_seq_max: u32,
+}
+
+impl ConsensusMonitor {
+    fn record(&mut self, validator: String, tx_hash: String, propose_seq: u32, close_time: u32) {
+        self.total_proposals += 1;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        // Keep the HIGHER propose_seq (latest position this round)
+        let entry = self.positions.entry(validator).or_insert((tx_hash.clone(), propose_seq, close_time, now));
+        if propose_seq >= entry.1 {
+            *entry = (tx_hash, propose_seq, close_time, now);
+        }
+    }
+
+    fn expire_old(&mut self, _current_ledger: u32) {
+        // Drop positions older than 15s (network has moved on to next ledger)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.positions.retain(|_, (_, _, _, seen)| now.saturating_sub(*seen) < 15_000);
+    }
+
+    fn check_agreement(&mut self, unl_size: usize) -> Option<Agreement> {
+        if unl_size == 0 || self.positions.is_empty() {
+            self.last_agreement = None;
+            return None;
+        }
+        // Group by tx_hash
+        let mut counts: std::collections::HashMap<String, (usize, u32)> = std::collections::HashMap::new();
+        for (_, (tx_hash, seq, _, _)) in &self.positions {
+            let entry = counts.entry(tx_hash.clone()).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 = entry.1.max(*seq);
+        }
+        // Find the highest-count hash
+        let best = counts.into_iter().max_by_key(|(_, (c, _))| *c);
+        if let Some((hash, (count, seq))) = best {
+            let pct = count as f64 / unl_size as f64;
+            let agreement = Agreement {
+                tx_hash: hash,
+                count,
+                pct,
+                propose_seq_max: seq,
+            };
+            self.last_agreement = Some(agreement.clone());
+            Some(agreement)
+        } else {
+            self.last_agreement = None;
+            None
+        }
+    }
+
+    fn snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "tracked_validators": self.positions.len(),
+            "total_proposals": self.total_proposals,
+            "agreement": self.last_agreement,
+        })
+    }
+}
+
+/// Raw peer proposal data for the consensus engine.
+/// Decoded from TmProposeSet. Since added/removed are empty for large sets,
+/// we primarily track validators' current_tx_hash for agreement detection.
+#[derive(Clone, Debug)]
+struct PeerProposal {
+    /// Validator's public key (node_pub_key from TmProposeSet).
+    validator_key: Vec<u8>,
+    /// Proposal round number.
+    propose_seq: u32,
+    /// Hash identifying the full tx set this validator is proposing.
+    current_tx_hash: Vec<u8>,
+    /// Close time (ripple epoch seconds).
+    close_time: u32,
+    /// Hash of the previous ledger this proposal builds on.
+    previous_ledger: Vec<u8>,
+}
+
 /// Original XRPL supply: 100 billion XRP in drops.
 const ORIGINAL_SUPPLY_DROPS: u64 = 100_000_000_000_000_000;
 
@@ -161,6 +263,10 @@ async fn main() {
 
     let (tx, _) = broadcast::channel::<MessageEvent>(10000);
     let tx2 = tx.clone();
+
+    // Peer proposal channel — full TmProposeSet data for consensus engine
+    let (proposal_tx, _) = broadcast::channel::<PeerProposal>(4000);
+    let proposal_tx_for_handler = proposal_tx.clone();
 
     // Outbound message channel — validation + transaction relay to broadcast to all peers
     let (outbound_tx, _) = broadcast::channel::<Vec<u8>>(2000);
@@ -377,6 +483,7 @@ async fn main() {
             outbound_tx.clone(),
             manifest_frame.clone(),
             live_engine.clone(),
+            proposal_tx_for_handler.clone(),
         );
     }
 
@@ -497,6 +604,10 @@ async fn main() {
             std::process::exit(0);
         });
     }
+    // Transaction application engine — independently verifies tx effects
+    let tx_engine = Arc::new(xrpl_node::tx_engine::TxEngine::new());
+    eprintln!("[tx-engine] Transaction verification engine initialized");
+
     let incremental_syncer = Arc::new(xrpl_node::incremental_sync::IncrementalSyncer::new());
     {
         let engine_guard = live_engine.lock();
@@ -524,6 +635,7 @@ async fn main() {
                 let backfill_hash = state_hash_computer.clone();
                 let backfill_syncer = incremental_syncer.clone();
                 let backfill_hist = history_store.clone();
+                let backfill_tx_engine = tx_engine.clone();
                 tokio::spawn(async move {
                     let history_store = backfill_hist;
                     // Wait for SHAMap to finish building
@@ -556,7 +668,7 @@ async fn main() {
                         .build()
                         .unwrap_or_default();
                     let current_seq: u32 = match client
-                        .post("http://localhost:5005")
+                        .post("http://10.0.0.39:5005")
                         .json(&serde_json::json!({"method":"ledger","params":[{"ledger_index":"validated"}]}))
                         .send()
                         .await
@@ -595,7 +707,7 @@ async fn main() {
                     // Get latest validated ledger (backfill may have advanced past current_seq)
                     let ws_start: u32 = {
                         let c = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap_or_default();
-                        match c.post("http://localhost:5005")
+                        match c.post("http://10.0.0.39:5005")
                             .json(&serde_json::json!({"method":"ledger","params":[{"ledger_index":"validated"}]}))
                             .send().await {
                             Ok(r) => r.json::<serde_json::Value>().await.ok()
@@ -608,7 +720,7 @@ async fn main() {
 
                     let ws_last = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(ws_start));
                     eprintln!("[startup] Starting WS sync from #{ws_start} after backfill");
-                    xrpl_node::ws_sync::start_ws_sync(backfill_db, backfill_hash, ws_last, Some(history_store.clone())).await;
+                    xrpl_node::ws_sync::start_ws_sync(backfill_db, backfill_hash, ws_last, Some(history_store.clone()), Some(backfill_tx_engine)).await;
                 });
             } else {
                 eprintln!("[startup] Running full state sync — this is the final one");
@@ -624,6 +736,7 @@ async fn main() {
                 let backfill_syncer = incremental_syncer.clone();
                 let startup_db = db.clone();
                 let startup_hist = history_store.clone();
+                let startup_tx_engine = tx_engine.clone();
                 tokio::spawn(async move {
                     let history_store = startup_hist;
                     loop {
@@ -651,8 +764,9 @@ async fn main() {
                             let _ = std::fs::write("/mnt/xrpl-data/sync/dl_done.txt",
                                 format!("ledger #{pinned} — {synced} objects"));
                             let ws_hist = history_store.clone();
+                            let ws_tx_engine = startup_tx_engine.clone();
                             tokio::spawn(async move {
-                                xrpl_node::ws_sync::start_ws_sync(ws_db, ws_hash, ws_last, Some(ws_hist)).await;
+                                xrpl_node::ws_sync::start_ws_sync(ws_db, ws_hash, ws_last, Some(ws_hist), Some(ws_tx_engine)).await;
                             });
                             eprintln!("[startup] WS sync from #{pinned} (no second download, inc-sync DISABLED)");
                             // Keep backfilling=true
@@ -675,7 +789,7 @@ async fn main() {
             .expect("reqwest client builder failed");
         loop {
             if let Ok(resp) = client
-                .post("http://localhost:5005")
+                .post("http://10.0.0.39:5005")
                 .json(&serde_json::json!({
                     "method": "ledger",
                     "params": [{"ledger_index": "validated"}]
@@ -718,6 +832,91 @@ async fn main() {
 
     // RPCA consensus engine
     let consensus = Arc::new(Mutex::new(xrpl_node::consensus_engine::ConsensusEngine::new()));
+
+    // Fetch UNL (trusted validators) from published sources — required for consensus threshold math
+    {
+        let consensus_for_unl = consensus.clone();
+        tokio::spawn(async move {
+            match xrpl_node::unl_fetch::fetch_default_unl().await {
+                Ok(entries) => {
+                    let mut eng = consensus_for_unl.lock();
+                    // TMProposeSet messages are signed with EPHEMERAL signing keys, not master keys.
+                    // So we trust the signing keys in our UNL (extracted from each validator's manifest).
+                    // Fall back to master key if no signing key available (manifest rotation not tracked yet).
+                    let mut with_signing = 0;
+                    for e in &entries {
+                        if let Some(ref sk) = e.signing_key {
+                            eng.unl.add_trusted(sk.clone());
+                            with_signing += 1;
+                        } else {
+                            eng.unl.add_trusted(e.public_key.clone());
+                        }
+                    }
+                    eprintln!(
+                        "[consensus] UNL loaded: {} validators, {} with signing keys, trust_count={}",
+                        entries.len(), with_signing, eng.unl.trusted_count()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("[consensus] UNL fetch failed: {e} — consensus disabled");
+                }
+            }
+        });
+    }
+
+    // Consensus monitor: tracks tx_hash agreement across trusted validators.
+    //
+    // XRPL proposals only include added/removed transactions when the set is small.
+    // For typical ledger closes (>8 txs), only current_tx_hash identifies the set,
+    // and validators fetch contents via TMGetObjectByHash. So we track hash-level
+    // agreement: "which tx_set hash do most validators propose?".
+    let consensus_monitor: Arc<Mutex<ConsensusMonitor>> = Arc::new(Mutex::new(ConsensusMonitor::default()));
+    {
+        let monitor = consensus_monitor.clone();
+        let consensus_for_monitor = consensus.clone();
+        let mut prop_rx = proposal_tx.subscribe();
+        tokio::spawn(async move {
+            while let Ok(p) = prop_rx.recv().await {
+                let validator_key_hex = hex::encode_upper(&p.validator_key);
+                let tx_hash_hex = hex::encode_upper(&p.current_tx_hash);
+
+                // Only track proposals from trusted UNL validators
+                let is_trusted = consensus_for_monitor.lock().unl.is_trusted(&validator_key_hex);
+                if !is_trusted {
+                    continue;
+                }
+
+                let mut m = monitor.lock();
+                m.record(validator_key_hex, tx_hash_hex, p.propose_seq, p.close_time);
+            }
+        });
+    }
+
+    // Consensus monitor driver: every 1s, check current agreement level
+    {
+        let monitor = consensus_monitor.clone();
+        let consensus_for_check = consensus.clone();
+        tokio::spawn(async move {
+            let mut last_reported_hash: Option<String> = None;
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let unl_size = consensus_for_check.lock().unl.trusted_count();
+                let current_ledger = consensus_for_check.lock().ledger_seq;
+                let mut m = monitor.lock();
+                m.expire_old(current_ledger);
+                let agreement = m.check_agreement(unl_size);
+                if let Some(ref a) = agreement {
+                    if last_reported_hash.as_ref() != Some(&a.tx_hash) {
+                        eprintln!(
+                            "[consensus] Agreement: {}/{} validators on tx_hash {}... ({:.0}%)",
+                            a.count, unl_size, &a.tx_hash[..16.min(a.tx_hash.len())], a.pct * 100.0
+                        );
+                        last_reported_hash = Some(a.tx_hash.clone());
+                    }
+                }
+            }
+        });
+    }
 
     // Subscribe to message events for engine tracking + validation signing + consensus
     let engine_rx = tx2.subscribe();
@@ -1184,9 +1383,11 @@ async fn main() {
         .route("/api/engine", get({
             let engine_web = engine_state.clone();
             let le_web = live_engine.clone();
+            let txe_web = tx_engine.clone();
             move || {
                 let engine_web = engine_web.clone();
                 let le_web = le_web.clone();
+                let txe_web = txe_web.clone();
                 async move {
                     let state = engine_web.lock().clone();
                     let mut json = serde_json::to_value(&state).unwrap_or_default();
@@ -1211,6 +1412,9 @@ async fn main() {
                     } else {
                         json["live_engine"] = serde_json::json!({"active": false});
                     }
+                    // Add tx engine verification stats
+                    let txe_stats = txe_web.stats();
+                    json["tx_engine"] = serde_json::to_value(&txe_stats).unwrap_or_default();
                     axum::Json(json)
                 }
             }
@@ -1295,11 +1499,15 @@ async fn main() {
         }))
         .route("/api/consensus", get({
             let consensus_web = consensus.clone();
+            let monitor_web = consensus_monitor.clone();
             move || {
                 let consensus_web = consensus_web.clone();
+                let monitor_web = monitor_web.clone();
                 async move {
                     let status = consensus_web.lock().status();
-                    axum::Json(serde_json::to_value(&status).unwrap_or_default())
+                    let mut json = serde_json::to_value(&status).unwrap_or_default();
+                    json["monitor"] = monitor_web.lock().snapshot();
+                    axum::Json(json)
                 }
             }
         }));
@@ -1328,6 +1536,7 @@ fn spawn_peer_connection(
     outbound_rx: broadcast::Sender<Vec<u8>>,
     manifest: Arc<Vec<u8>>,
     rocks_db: Arc<Mutex<Option<xrpl_node::engine::LiveEngine>>>,
+    proposal_tx: broadcast::Sender<PeerProposal>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -1338,7 +1547,7 @@ fn spawn_peer_connection(
             connected_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             active_peers.lock().insert(peer.clone());
             eprintln!("[peer] Connecting to {peer}...");
-            match run_peer_connection(&peer, &tx, &known_peers, &connected_count, max_peers, &seen_msgs, &active_peers, &outbound_rx, &manifest, &rocks_db).await {
+            match run_peer_connection(&peer, &tx, &known_peers, &connected_count, max_peers, &seen_msgs, &active_peers, &outbound_rx, &manifest, &rocks_db, &proposal_tx).await {
                 Ok(()) => eprintln!("[peer] {peer} disconnected"),
                 Err(e) => eprintln!("[peer] {peer}: {e}"),
             }
@@ -1360,6 +1569,7 @@ async fn run_peer_connection(
     outbound: &broadcast::Sender<Vec<u8>>,
     manifest: &Arc<Vec<u8>>,
     rocks_db: &Arc<Mutex<Option<xrpl_node::engine::LiveEngine>>>,
+    proposal_tx: &broadcast::Sender<PeerProposal>,
 ) -> Result<(), String> {
     let identity = NodeIdentity::generate().map_err(|e| format!("identity: {e}"))?;
 
@@ -1431,6 +1641,7 @@ async fn run_peer_connection(
                                             outbound.clone(),
                                             manifest.clone(),
                                             rocks_db.clone(),
+                                            proposal_tx.clone(),
                                         );
                                     }
                                 }
@@ -1494,6 +1705,19 @@ async fn run_peer_connection(
                                     &writer_c, &db_c, obj_type, &objects,
                                     ledger_hash_req.as_deref(), seq,
                                 ).await;
+                            });
+                        }
+                    }
+
+                    // Publish peer proposals to consensus engine channel
+                    if let PeerMessage::ProposeSet(p) = &msg {
+                        if !p.node_pub_key.is_empty() {
+                            let _ = proposal_tx.send(PeerProposal {
+                                validator_key: p.node_pub_key.clone(),
+                                propose_seq: p.propose_seq,
+                                current_tx_hash: p.current_tx_hash.clone(),
+                                close_time: p.close_time,
+                                previous_ledger: p.previousledger.clone(),
                             });
                         }
                     }

@@ -39,3 +39,9 @@ CLAUDE.md
 
 # SQLite history
 *.sqlite
+
+# FFI build artifacts + vendored rippled (1.6GB)
+ffi/vendor/
+ffi/*.o
+ffi/*.a
+ffi/test_shim

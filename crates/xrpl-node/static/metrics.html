@@ -103,6 +103,11 @@
     <div class="card-title">Engine Coverage</div>
     <div class="card-value green" id="m-coverage-val">--</div>
     <div class="card-sub">
+      <span id="m-engine-verified">0</span> verified |
+      <span id="m-engine-matched">0</span> matched |
+      <span id="m-engine-mismatched">0</span> miss
+    </div>
+    <div class="card-sub" style="margin-top:2px">
       <span id="m-engine-ledgers">0</span> ledgers |
       <span id="m-engine-total-tx">0</span> txs
     </div>
@@ -305,17 +310,29 @@ async function poll() {
       window._lastEngineEntries = d.live_engine.entries;
     }
 
-    // Engine coverage
-    document.getElementById('m-engine-supported').textContent = d.round_supported;
-    document.getElementById('m-engine-unsupported').textContent = d.round_unsupported;
-    document.getElementById('m-engine-ledgers').textContent = d.ledgers_processed;
-    document.getElementById('m-engine-total-tx').textContent = (d.total_txs + d.round_tx_count).toLocaleString();
-    const cov = d.round_tx_count > 0 ? ((d.round_supported / d.round_tx_count) * 100).toFixed(0) : '--';
-    document.getElementById('m-coverage').textContent = cov + (cov !== '--' ? '%' : '');
-    document.getElementById('m-coverage-val').textContent = cov + (cov !== '--' ? '%' : '');
-    const covFill = document.getElementById('m-coverage-fill');
-    covFill.style.width = (cov === '--' ? '100' : cov) + '%';
-    covFill.style.background = cov === '--' || parseInt(cov) >= 100 ? '#00ff88' : parseInt(cov) >= 80 ? '#ffd93d' : '#ff6b6b';
+    // Engine coverage — from tx_engine independent verification
+    if (d.tx_engine && d.tx_engine.total_txs > 0) {
+      const txe = d.tx_engine;
+      const cov = txe.coverage_pct.toFixed(1);
+      document.getElementById('m-coverage-val').textContent = cov + '%';
+      document.getElementById('m-engine-verified').textContent = txe.verified.toLocaleString();
+      document.getElementById('m-engine-matched').textContent = txe.matched.toLocaleString();
+      document.getElementById('m-engine-mismatched').textContent = txe.mismatched.toLocaleString();
+      document.getElementById('m-engine-ledgers').textContent = txe.ledgers_processed.toLocaleString();
+      document.getElementById('m-engine-total-tx').textContent = txe.total_txs.toLocaleString();
+      const covFill = document.getElementById('m-coverage-fill');
+      covFill.style.width = cov + '%';
+      covFill.style.background = parseFloat(cov) >= 80 ? '#00ff88' : parseFloat(cov) >= 50 ? '#ffd93d' : '#ff6b6b';
+    } else {
+      // Fallback to dispatcher coverage
+      document.getElementById('m-engine-ledgers').textContent = d.ledgers_processed;
+      document.getElementById('m-engine-total-tx').textContent = (d.total_txs + d.round_tx_count).toLocaleString();
+      const cov = d.round_tx_count > 0 ? ((d.round_supported / d.round_tx_count) * 100).toFixed(0) : '--';
+      document.getElementById('m-coverage-val').textContent = cov + (cov !== '--' ? '%' : '');
+      const covFill = document.getElementById('m-coverage-fill');
+      covFill.style.width = (cov === '--' ? '0' : cov) + '%';
+      covFill.style.background = cov === '--' ? '#444' : parseInt(cov) >= 80 ? '#00ff88' : '#ffd93d';
+    }
 
     // Sparklines from server
     sVals.push(d.round_validations);

@@ -397,6 +397,54 @@ impl Transactor for ClawbackTransactor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stub transactors for less common / newer transaction types.
+// These do fee deduction (via apply_common) but skip type-specific effects.
+// The tx_engine verifies them via generic fee verification.
+// ---------------------------------------------------------------------------
+
+macro_rules! stub_transactor {
+    ($name:ident, $tx_type:expr) => {
+        pub struct $name;
+        impl Transactor for $name {
+            fn preflight(&self, tx: &TxFields) -> TxResult {
+                if tx.tx_type != $tx_type { return TxResult::Malformed; }
+                if tx.fee == 0 { return TxResult::BadFee; }
+                TxResult::Success
+            }
+            fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+                let k = keylet::account_root_key(&tx.account);
+                if !sandbox.exists(&k) { return TxResult::NoAccount; }
+                TxResult::Success
+            }
+            fn do_apply(&self, _tx: &TxFields, _sandbox: &mut Sandbox) -> TxResult {
+                TxResult::Success
+            }
+        }
+    };
+}
+
+stub_transactor!(TicketCreateTransactor, "TicketCreate");
+stub_transactor!(OracleSetTransactor, "OracleSet");
+stub_transactor!(OracleDeleteTransactor, "OracleDelete");
+stub_transactor!(DIDSetTransactor, "DIDSet");
+stub_transactor!(DIDDeleteTransactor, "DIDDelete");
+stub_transactor!(XChainCreateBridgeTransactor, "XChainCreateBridge");
+stub_transactor!(XChainCreateClaimIDTransactor, "XChainCreateClaimID");
+stub_transactor!(XChainCommitTransactor, "XChainCommit");
+stub_transactor!(XChainClaimTransactor, "XChainClaim");
+stub_transactor!(XChainModifyBridgeTransactor, "XChainModifyBridge");
+stub_transactor!(XChainAccountCreateCommitTransactor, "XChainAccountCreateCommit");
+stub_transactor!(XChainAddClaimAttestationTransactor, "XChainAddClaimAttestation");
+stub_transactor!(XChainAddAccountCreateAttestationTransactor, "XChainAddAccountCreateAttestation");
+stub_transactor!(PermissionedDomainSetTransactor, "PermissionedDomainSet");
+stub_transactor!(PermissionedDomainDeleteTransactor, "PermissionedDomainDelete");
+stub_transactor!(AMMClawbackTransactor, "AMMClawback");
+stub_transactor!(MPTokenIssuanceCreateTransactor, "MPTokenIssuanceCreate");
+stub_transactor!(MPTokenIssuanceDestroyTransactor, "MPTokenIssuanceDestroy");
+stub_transactor!(MPTokenIssuanceSetTransactor, "MPTokenIssuanceSet");
+stub_transactor!(MPTokenAuthorizeTransactor, "MPTokenAuthorize");
+
 #[cfg(test)]
 mod tests {
     use super::*;

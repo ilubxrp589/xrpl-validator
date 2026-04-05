@@ -30,6 +30,8 @@ pub mod overlay;
 pub mod peer;
 pub mod rpc;
 pub mod state_hash;
+pub mod tx_engine;
+pub mod unl_fetch;
 pub mod validation;
 pub mod ws_sync;
 
