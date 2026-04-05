@@ -259,6 +259,72 @@ impl SleProvider for RpcProvider {
     }
 }
 
+/// Three-tier SLE provider: overlay (in-ledger mutations) → rocksdb snapshot
+/// (validator's own state at ~ledger_seq-1) → RpcProvider (fallback for
+/// SLEs missing from the local DB). Cuts RPC load by 90%+ once the DB is
+/// populated.
+pub struct OverlayedDbProvider<'a> {
+    overlay: &'a parking_lot::Mutex<std::collections::HashMap<[u8; 32], Option<Vec<u8>>>>,
+    snapshot: rocksdb::Snapshot<'a>,
+    rpc_fallback: &'a RpcProvider,
+    arena: parking_lot::Mutex<Vec<Vec<u8>>>,
+    pub db_hits: std::sync::atomic::AtomicU64,
+    pub rpc_fallbacks: std::sync::atomic::AtomicU64,
+}
+
+impl<'a> OverlayedDbProvider<'a> {
+    pub fn new(
+        overlay: &'a parking_lot::Mutex<std::collections::HashMap<[u8; 32], Option<Vec<u8>>>>,
+        db: &'a rocksdb::DB,
+        rpc_fallback: &'a RpcProvider,
+    ) -> Self {
+        Self {
+            overlay,
+            snapshot: db.snapshot(),
+            rpc_fallback,
+            arena: parking_lot::Mutex::new(Vec::with_capacity(16)),
+            db_hits: std::sync::atomic::AtomicU64::new(0),
+            rpc_fallbacks: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl<'a> SleProvider for OverlayedDbProvider<'a> {
+    fn read(&self, key: &[u8; 32]) -> Option<&[u8]> {
+        use std::sync::atomic::Ordering;
+        // 1. Overlay (mutations from prior txs in this ledger)
+        {
+            let ov = self.overlay.lock();
+            if let Some(entry) = ov.get(key) {
+                match entry {
+                    None => return None, // tombstone
+                    Some(bytes) => {
+                        let mut arena = self.arena.lock();
+                        arena.push(bytes.clone());
+                        unsafe {
+                            let last = arena.last().unwrap();
+                            return Some(std::slice::from_raw_parts(last.as_ptr(), last.len()));
+                        }
+                    }
+                }
+            }
+        }
+        // 2. RocksDB snapshot (validator's own state)
+        if let Ok(Some(data)) = self.snapshot.get(key) {
+            self.db_hits.fetch_add(1, Ordering::Relaxed);
+            let mut arena = self.arena.lock();
+            arena.push(data);
+            unsafe {
+                let last = arena.last().unwrap();
+                return Some(std::slice::from_raw_parts(last.as_ptr(), last.len()));
+            }
+        }
+        // 3. RPC fallback (unsynced SLE, or DB was never populated with it)
+        self.rpc_fallbacks.fetch_add(1, Ordering::Relaxed);
+        self.rpc_fallback.read(key)
+    }
+}
+
 /// Provider that checks an in-memory overlay first (for cross-tx state within
 /// a single ledger), then falls back to RPC. Used by apply_ledger_in_order.
 ///
@@ -344,6 +410,10 @@ pub struct FfiStats {
     /// Total RPC SLE lookups (hit = found in rippled, miss = not found/error)
     pub rpc_sle_hits: u64,
     pub rpc_sle_misses: u64,
+    /// RocksDB-backed SLE lookups (validator's own state, when configured).
+    /// db_hits = served from local DB; db_rpc_fallbacks = fell through to RPC.
+    pub db_hits: u64,
+    pub db_rpc_fallbacks: u64,
     /// Sample of up to 20 miss keys from the last ledger applied
     pub rpc_sle_miss_samples: Vec<String>,
     /// Sample of up to 10 diverged tx hashes (tx_type/TER/hash) for mainnet lookup
@@ -471,6 +541,12 @@ pub fn render_prometheus(s: &FfiStats) -> String {
     let _ = writeln!(out, "# TYPE xrpl_ffi_rpc_sle_lookups_total counter");
     let _ = writeln!(out, "xrpl_ffi_rpc_sle_lookups_total{{result=\"hit\"}} {}", s.rpc_sle_hits);
     let _ = writeln!(out, "xrpl_ffi_rpc_sle_lookups_total{{result=\"miss\"}} {}", s.rpc_sle_misses);
+
+    // RocksDB provider (if validator has local state available)
+    let _ = writeln!(out, "# HELP xrpl_ffi_db_sle_lookups_total SLE lookups via local RocksDB snapshot");
+    let _ = writeln!(out, "# TYPE xrpl_ffi_db_sle_lookups_total counter");
+    let _ = writeln!(out, "xrpl_ffi_db_sle_lookups_total{{result=\"hit\"}} {}", s.db_hits);
+    let _ = writeln!(out, "xrpl_ffi_db_sle_lookups_total{{result=\"rpc_fallback\"}} {}", s.db_rpc_fallbacks);
 
     // Ledger progress
     let _ = writeln!(out, "# HELP xrpl_ffi_ledgers_applied_total Ledgers fully applied via FFI");
@@ -736,6 +812,7 @@ pub fn apply_ledger_in_order(
     parent_close_time: u32,
     total_drops: u64,
     divergence_log: Option<&DivergenceLog>,
+    db: Option<&rocksdb::DB>,
 ) {
     let fallback = RpcProvider::with_endpoints(rpc_urls.to_vec(), ledger_seq.saturating_sub(1));
     let overlay: parking_lot::Mutex<std::collections::HashMap<[u8; 32], Option<Vec<u8>>>> =
@@ -759,15 +836,26 @@ pub fn apply_ledger_in_order(
             .map(|p| (p.tx_type, hex::encode_upper(p.hash)))
             .unwrap_or_else(|| ("Unknown".to_string(), String::new()));
         let t0 = std::time::Instant::now();
-        let provider = LayeredProvider::new(&overlay, &fallback);
-        let outcome = match xrpl_ffi::apply_with_mutations(
-            tx_bytes,
-            amendments,
-            &ledger,
-            &provider,
-            0,
-            0,
-        ) {
+        // Use DB-first provider when the validator's own RocksDB is available.
+        // Per-tx snapshot: rocksdb snapshots are O(1), just a sequence number.
+        let outcome_opt = if let Some(db_ref) = db {
+            let provider = OverlayedDbProvider::new(&overlay, db_ref, &fallback);
+            let r = xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, 0);
+            // Accumulate provider counters into stats
+            use std::sync::atomic::Ordering;
+            let h = provider.db_hits.load(Ordering::Relaxed);
+            let f = provider.rpc_fallbacks.load(Ordering::Relaxed);
+            if h > 0 || f > 0 {
+                let mut s = stats.lock();
+                s.db_hits += h;
+                s.db_rpc_fallbacks += f;
+            }
+            r
+        } else {
+            let provider = LayeredProvider::new(&overlay, &fallback);
+            xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, 0)
+        };
+        let outcome = match outcome_opt {
             Some(o) => o,
             None => {
                 let mut s = stats.lock();

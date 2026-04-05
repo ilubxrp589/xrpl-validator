@@ -144,7 +144,9 @@ pub async fn start_ws_sync(
                             }
                         }
                     }
-                    // FFI independent verification — blocking, spawn off-thread
+                    // FFI independent verification — blocking, spawn off-thread.
+                    // Pass the validator's DB so the FFI provider prefers local
+                    // state and only falls through to RPC on miss.
                     #[cfg(feature = "ffi")]
                     if meta_ok {
                         if let Some(ref verifier) = ffi_verifier {
@@ -153,6 +155,7 @@ pub async fn start_ws_sync(
                                 let v = verifier.clone();
                                 let hdr = ledger_header.clone();
                                 let seq = process_seq;
+                                let db_clone = db.clone();
                                 tokio::task::spawn_blocking(move || {
                                     v.verify_ledger(
                                         seq,
@@ -160,6 +163,7 @@ pub async fn start_ws_sync(
                                         hdr.parent_hash,
                                         hdr.parent_close_time,
                                         hdr.total_drops,
+                                        Some(db_clone.as_ref()),
                                     );
                                 });
                             }

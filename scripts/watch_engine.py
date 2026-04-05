@@ -2,10 +2,12 @@
 """Watch validator live: tx_engine + consensus agreement + state hash.
 Usage: python3 watch_engine.py
 """
-import json, sys, time, urllib.request
+import json, os, sys, time, urllib.request
 
-BASE = "http://localhost:3777"
-FFI_BASE = "http://10.0.0.39:3778"  # ffi_test server on localai
+BASE = os.environ.get("VALIDATOR_BASE", "http://localhost:3777")
+# Override with FFI_BASE env var — defaults to m3060 (100%-agreement sidecar).
+# Set FFI_BASE=http://10.0.0.39:3778 for localai.
+FFI_BASE = os.environ.get("FFI_BASE", "http://10.0.0.97:3778")
 
 def fetch(path, base=None):
     try:

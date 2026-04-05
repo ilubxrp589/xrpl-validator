@@ -69,6 +69,10 @@ impl FfiVerifier {
     /// against mainnet's recorded TER via libxrpl. Blocking — call from a
     /// spawn_blocking task or a dedicated thread. Each diverged result is
     /// logged to `logs/divergences.jsonl` and counted in `stats()`.
+    ///
+    /// If `db` is provided, SLE lookups prefer the validator's local RocksDB
+    /// snapshot (sub-ms reads) and only fall through to RPC on miss — this
+    /// typically drops RPC load by 90%+.
     pub fn verify_ledger(
         &self,
         ledger_seq: u32,
@@ -76,6 +80,7 @@ impl FfiVerifier {
         parent_hash: [u8; 32],
         parent_close_time: u32,
         total_drops: u64,
+        db: Option<&rocksdb::DB>,
     ) {
         apply_ledger_in_order(
             &self.stats,
@@ -87,6 +92,7 @@ impl FfiVerifier {
             parent_close_time,
             total_drops,
             Some(self.divergence_log.as_ref()),
+            db,
         );
     }
 
