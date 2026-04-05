@@ -59,8 +59,16 @@ async fn main() {
     info!(path = %divergence_log.path().display(), "divergence log opened");
     tokio::spawn(async move {
         use tracing::info;
-        let rpc_url = std::env::var("XRPL_RPC_URL")
-            .unwrap_or_else(|_| "http://10.0.0.39:5005".to_string());
+        // Comma-separated list of RPC endpoints for failover. First URL is primary.
+        let rpc_urls: Vec<String> = std::env::var("XRPL_RPC_URLS")
+            .or_else(|_| std::env::var("XRPL_RPC_URL"))
+            .unwrap_or_else(|_| "http://10.0.0.39:5005".to_string())
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let rpc_url = rpc_urls[0].clone();
+        info!(endpoints = ?rpc_urls, "rpc endpoints configured");
 
         // Fetch active mainnet amendments at startup (kills most tefEXCEPTION)
         let rpc_url_for_amend = rpc_url.clone();
@@ -156,7 +164,7 @@ async fn main() {
                 info!(ledger_seq = seq, txs = sorted_blobs.len(), total_drops, "applying ledger in transaction-index order");
 
                 let apply_stats = live_stats.clone();
-                let rpc_url_owned = rpc_url.clone();
+                let rpc_urls_owned = rpc_urls.clone();
                 let amendments_owned = amendments.clone();
                 let dlog = live_dlog.clone();
                 tokio::task::spawn_blocking(move || {
@@ -164,7 +172,7 @@ async fn main() {
                         &apply_stats,
                         &sorted_blobs,
                         seq,
-                        &rpc_url_owned,
+                        &rpc_urls_owned,
                         &amendments_owned,
                         parent_hash,
                         parent_close_time,

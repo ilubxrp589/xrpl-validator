@@ -46,3 +46,5 @@ ffi/*.o
 ffi/*.a
 ffi/test_shim
 ffi/build/
+logs/
+scripts/__pycache__/

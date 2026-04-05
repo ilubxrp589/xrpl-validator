@@ -49,6 +49,9 @@ impl<'a> SleProvider for RocksDbProvider<'a> {
 ///
 /// Returns a list of 32-byte feature IDs. Used to construct Rules for
 /// preflight/apply — without these, amendment-gated txs fail with tefEXCEPTION.
+///
+/// Retries up to 10 times with exponential backoff to handle rippled overload
+/// at startup — a ledger with 0 amendments would cause massive divergence.
 pub fn fetch_mainnet_amendments(rpc_url: &str) -> Vec<[u8; 32]> {
     let client = match reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -57,70 +60,104 @@ pub fn fetch_mainnet_amendments(rpc_url: &str) -> Vec<[u8; 32]> {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
-    // Amendments singleton keylet
-    let resp = match client
-        .post(rpc_url)
-        .json(&serde_json::json!({
-            "method": "ledger_entry",
-            "params": [{
-                "index": "7DB0788C020F02780A673DC74757F23823FA3014C1866E72CC4CD8B226CD6EF4",
-                "ledger_index": "validated",
-                "binary": false
-            }]
-        }))
-        .send()
-    {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-    let body: serde_json::Value = match resp.json() {
-        Ok(b) => b,
-        Err(_) => return Vec::new(),
-    };
-    let empty = Vec::new();
-    let amendments = body["result"]["node"]["Amendments"]
-        .as_array()
-        .unwrap_or(&empty);
-    let mut out = Vec::with_capacity(amendments.len());
-    for a in amendments {
-        if let Some(hex_str) = a.as_str() {
-            if let Ok(bytes) = hex::decode(hex_str) {
-                if bytes.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&bytes);
-                    out.push(arr);
+    let mut backoff_ms: u64 = 250;
+    for attempt in 0..10 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+            backoff_ms = (backoff_ms * 2).min(8000);
+        }
+        // Amendments singleton keylet
+        let resp = match client
+            .post(rpc_url)
+            .json(&serde_json::json!({
+                "method": "ledger_entry",
+                "params": [{
+                    "index": "7DB0788C020F02780A673DC74757F23823FA3014C1866E72CC4CD8B226CD6EF4",
+                    "ledger_index": "validated",
+                    "binary": false
+                }]
+            }))
+            .send()
+        {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let body_text = match resp.text() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let tt = body_text.trim();
+        if tt.starts_with("Server is overloaded") || tt.starts_with("Server too busy") {
+            continue;
+        }
+        let body: serde_json::Value = match serde_json::from_str(&body_text) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let empty = Vec::new();
+        let amendments = body["result"]["node"]["Amendments"]
+            .as_array()
+            .unwrap_or(&empty);
+        if amendments.is_empty() {
+            // Most likely rippled returned an error — retry
+            continue;
+        }
+        let mut out = Vec::with_capacity(amendments.len());
+        for a in amendments {
+            if let Some(hex_str) = a.as_str() {
+                if let Ok(bytes) = hex::decode(hex_str) {
+                    if bytes.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&bytes);
+                        out.push(arr);
+                    }
                 }
             }
         }
+        return out;
     }
-    out
+    Vec::new()
 }
 
 /// RPC-backed SleProvider: fetches SLEs synchronously from rippled via
 /// `ledger_entry` RPC at a fixed pre-ledger index. Slow but works from anywhere.
+///
+/// Supports a list of RPC endpoints for failover. On "Server is overloaded"
+/// or network errors, rotates to the next endpoint before retrying.
 pub struct RpcProvider {
     client: reqwest::blocking::Client,
-    rpc_url: String,
+    rpc_urls: Vec<String>,
     ledger_index: u32,
     arena: parking_lot::Mutex<Vec<Vec<u8>>>,
     pub hits: std::sync::atomic::AtomicU64,
     pub misses: std::sync::atomic::AtomicU64,
     pub miss_keys: parking_lot::Mutex<Vec<String>>,
+    /// Next endpoint index to try first (round-robin on failover).
+    next_url_idx: std::sync::atomic::AtomicUsize,
 }
 
 impl RpcProvider {
+    /// Single-endpoint constructor (backwards compatible).
     pub fn new(rpc_url: String, ledger_index: u32) -> Self {
+        Self::with_endpoints(vec![rpc_url], ledger_index)
+    }
+
+    /// Multi-endpoint constructor. Endpoints are tried in order, starting
+    /// from the last-successful one (sticky), failing over on overload/error.
+    pub fn with_endpoints(rpc_urls: Vec<String>, ledger_index: u32) -> Self {
+        assert!(!rpc_urls.is_empty(), "at least one RPC endpoint required");
         Self {
             client: reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()
                 .expect("reqwest blocking client"),
-            rpc_url,
+            rpc_urls,
             ledger_index,
             arena: parking_lot::Mutex::new(Vec::with_capacity(16)),
             hits: std::sync::atomic::AtomicU64::new(0),
             misses: std::sync::atomic::AtomicU64::new(0),
             miss_keys: parking_lot::Mutex::new(Vec::new()),
+            next_url_idx: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -129,59 +166,96 @@ impl SleProvider for RpcProvider {
     fn read(&self, key: &[u8; 32]) -> Option<&[u8]> {
         use std::sync::atomic::Ordering;
         let key_hex = hex::encode_upper(key);
-        let resp = match self
-            .client
-            .post(&self.rpc_url)
-            .json(&serde_json::json!({
-                "method": "ledger_entry",
-                "params": [{
-                    "index": key_hex,
-                    "ledger_index": self.ledger_index,
-                    "binary": true
-                }]
-            }))
-            .send()
-        {
-            Ok(r) => r,
-            Err(_) => {
-                self.misses.fetch_add(1, Ordering::Relaxed);
-                return None;
+        // Retry loop for transient "server overloaded" and network errors.
+        // Up to 6 attempts, rotating endpoints after each failure with
+        // exponential backoff (10ms, 20, 40, 80, 160, 320ms).
+        let mut backoff_ms: u64 = 10;
+        let mut last_err = String::from("no attempts");
+        let mut url_idx = self.next_url_idx.load(Ordering::Relaxed) % self.rpc_urls.len();
+        for attempt in 0..6 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                backoff_ms *= 2;
+                url_idx = (url_idx + 1) % self.rpc_urls.len();
             }
-        };
-        let body: serde_json::Value = match resp.json() {
-            Ok(b) => b,
-            Err(_) => {
-                self.misses.fetch_add(1, Ordering::Relaxed);
-                return None;
+            let rpc_url = &self.rpc_urls[url_idx];
+            let resp = match self
+                .client
+                .post(rpc_url)
+                .json(&serde_json::json!({
+                    "method": "ledger_entry",
+                    "params": [{
+                        "index": key_hex,
+                        "ledger_index": self.ledger_index,
+                        "binary": true
+                    }]
+                }))
+                .send()
+            {
+                Ok(r) => r,
+                Err(e) => { last_err = format!("send_err: {e}"); continue; }
+            };
+            // Read raw text first so we can detect non-JSON overload responses
+            let body_text = match resp.text() {
+                Ok(t) => t,
+                Err(e) => { last_err = format!("body_err: {e}"); continue; }
+            };
+            let tt = body_text.trim();
+            if tt.starts_with("Server is overloaded")
+                || tt.starts_with("Server too busy")
+                || tt.contains("service unavailable")
+            {
+                last_err = "rippled_overloaded".into();
+                continue;
             }
-        };
-        let data_hex = match body["result"]["node_binary"].as_str() {
-            Some(s) => s,
-            None => {
-                self.misses.fetch_add(1, Ordering::Relaxed);
-                let mut mk = self.miss_keys.lock();
-                if mk.len() < 20 {
-                    // Also capture rippled's error string if present
-                    let err = body["result"]["error"].as_str().unwrap_or("no_node_binary");
-                    mk.push(format!("{}@{}: {}", &key_hex[..16], self.ledger_index, err));
+            let body: serde_json::Value = match serde_json::from_str(&body_text) {
+                Ok(b) => b,
+                Err(_) => { last_err = format!("non_json: {}", &tt[..tt.len().min(40)]); continue; }
+            };
+            // Check for error responses that mean we should retry
+            if let Some(err_str) = body["result"]["error"].as_str() {
+                // entryNotFound is a legit "this SLE doesn't exist" — don't retry.
+                if err_str == "entryNotFound" {
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                    let mut mk = self.miss_keys.lock();
+                    if mk.len() < 20 {
+                        mk.push(format!("{}@{}: entryNotFound", &key_hex[..16], self.ledger_index));
+                    }
+                    return None;
                 }
-                return None;
+                // Other errors (overloaded, invalidParams, etc.) — retry.
+                last_err = err_str.to_string();
+                continue;
             }
-        };
-        let bytes = match hex::decode(data_hex) {
-            Ok(b) => b,
-            Err(_) => {
-                self.misses.fetch_add(1, Ordering::Relaxed);
-                return None;
+            let data_hex = match body["result"]["node_binary"].as_str() {
+                Some(s) => s,
+                None => {
+                    last_err = "no_node_binary".into();
+                    continue;
+                }
+            };
+            let bytes = match hex::decode(data_hex) {
+                Ok(b) => b,
+                Err(_) => { last_err = "bad_hex".into(); continue; }
+            };
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            // Remember which endpoint worked (sticky) so the next call
+            // doesn't pay the cost of re-discovering a healthy endpoint.
+            self.next_url_idx.store(url_idx, Ordering::Relaxed);
+            let mut arena = self.arena.lock();
+            arena.push(bytes);
+            unsafe {
+                let last = arena.last().unwrap();
+                return Some(std::slice::from_raw_parts(last.as_ptr(), last.len()));
             }
-        };
-        self.hits.fetch_add(1, Ordering::Relaxed);
-        let mut arena = self.arena.lock();
-        arena.push(bytes);
-        unsafe {
-            let last = arena.last().unwrap();
-            Some(std::slice::from_raw_parts(last.as_ptr(), last.len()))
         }
+        // All retries exhausted
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        let mut mk = self.miss_keys.lock();
+        if mk.len() < 20 {
+            mk.push(format!("{}@{}: EXHAUSTED {}", &key_hex[..16], self.ledger_index, last_err));
+        }
+        None
     }
 }
 
@@ -656,14 +730,14 @@ pub fn apply_ledger_in_order(
     stats: &SharedFfiStats,
     txs_in_order: &[Vec<u8>],
     ledger_seq: u32,
-    rpc_url: &str,
+    rpc_urls: &[String],
     amendments: &[[u8; 32]],
     parent_hash: [u8; 32],
     parent_close_time: u32,
     total_drops: u64,
     divergence_log: Option<&DivergenceLog>,
 ) {
-    let fallback = RpcProvider::new(rpc_url.to_string(), ledger_seq.saturating_sub(1));
+    let fallback = RpcProvider::with_endpoints(rpc_urls.to_vec(), ledger_seq.saturating_sub(1));
     let overlay: parking_lot::Mutex<std::collections::HashMap<[u8; 32], Option<Vec<u8>>>> =
         parking_lot::Mutex::new(std::collections::HashMap::new());
     let ledger = LedgerInfo {
