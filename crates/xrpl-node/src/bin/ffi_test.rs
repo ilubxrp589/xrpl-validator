@@ -74,11 +74,25 @@ async fn main() {
             let Ok(body) = r.json::<serde_json::Value>().await else { continue; };
             let empty = Vec::new();
             let txs = body["result"]["ledger"]["transactions"].as_array().unwrap_or(&empty);
-            for tx in txs {
+            // Sample: apply ~3 txs per ledger via full FFI apply (RPC-fetched state).
+            // Doing every tx would swamp rippled with ledger_entry calls.
+            let apply_every_n = (txs.len() / 3).max(1);
+            for (i, tx) in txs.iter().enumerate() {
                 let tx_blob_hex = tx["tx_blob"].as_str().or_else(|| tx.as_str());
                 let Some(hex_str) = tx_blob_hex else { continue; };
                 let Ok(bytes) = hex::decode(hex_str) else { continue; };
                 xrpl_node::ffi_engine::process_live_tx(&live_stats, &bytes, seq);
+                // Full apply on sampled txs (blocking RPC calls per SLE fetch)
+                if i % apply_every_n == 0 {
+                    let apply_stats = live_stats.clone();
+                    let tx_bytes_owned = bytes.clone();
+                    let rpc_url_owned = rpc_url.clone();
+                    tokio::task::spawn_blocking(move || {
+                        xrpl_node::ffi_engine::apply_live_tx(
+                            &apply_stats, &tx_bytes_owned, seq, &rpc_url_owned,
+                        );
+                    });
+                }
             }
             last_processed = seq;
             tokio::time::sleep(Duration::from_secs(2)).await;

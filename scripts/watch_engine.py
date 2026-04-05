@@ -67,9 +67,28 @@ def render():
                 top = sorted(types.items(), key=lambda x: -x[1])[:6]
                 type_line = "  types:       " + " | ".join(f"{k}:{colored(str(v), '36')}" for k, v in top)
                 out.append(type_line)
+            # Full apply stats (RPC-fetched state)
+            apply_attempted = ffi.get("live_apply_attempted", 0)
+            apply_ok = ffi.get("live_apply_ok", 0)
+            apply_failed = ffi.get("live_apply_failed", 0)
+            apply_ms = ffi.get("live_apply_last_ms", 0)
+            apply_last_ter = ffi.get("live_apply_last_ter", "?")
+            apply_muts = ffi.get("live_apply_last_mutations", 0)
+            apply_pct = (apply_ok / apply_attempted * 100) if apply_attempted else 0
+            out.append("")
+            out.append(colored("  Full apply() on sampled live txs (RPC pre-state):", "1"))
+            out.append(f"    attempted: {colored(f'{apply_attempted:,}', '36')}  OK: {colored(f'{apply_ok:,}', '32')}  failed: {colored(f'{apply_failed:,}', '33')}  ({apply_pct:.1f}%)")
+            out.append(f"    last apply: TER={colored(apply_last_ter, '32' if apply_last_ter == 'tesSUCCESS' else '33')}  muts={apply_muts}  {apply_ms}ms")
+            ters = ffi.get("live_apply_ter_counts", {})
+            if ters:
+                top_t = sorted(ters.items(), key=lambda x: -x[1])[:5]
+                t_line = "    TER codes: " + " | ".join(f"{k}:{colored(str(v), '36')}" for k, v in top_t)
+                out.append(t_line)
+            # Self-test (tiny line)
             checks = ffi.get("health_checks", 0)
             passed = ffi.get("health_passed", 0)
-            out.append(f"  self-test:   {colored(f'{passed}/{checks}', '32' if passed == checks and checks > 0 else '31')}  (hardcoded Payment apply, every 500ms)")
+            out.append("")
+            out.append(f"  self-test:   {colored(f'{passed}/{checks}', '32' if passed == checks and checks > 0 else '31')}  (hardcoded tx every 500ms, sanity check)")
         out.append("")
 
     out.append(colored("── Consensus Monitor (Phase A) ──", "1;35"))

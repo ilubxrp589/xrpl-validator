@@ -45,6 +45,57 @@ impl<'a> SleProvider for RocksDbProvider<'a> {
     }
 }
 
+/// RPC-backed SleProvider: fetches SLEs synchronously from rippled via
+/// `ledger_entry` RPC at a fixed pre-ledger index. Slow but works from anywhere.
+pub struct RpcProvider {
+    client: reqwest::blocking::Client,
+    rpc_url: String,
+    ledger_index: u32,
+    arena: parking_lot::Mutex<Vec<Vec<u8>>>,
+}
+
+impl RpcProvider {
+    pub fn new(rpc_url: String, ledger_index: u32) -> Self {
+        Self {
+            client: reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .expect("reqwest blocking client"),
+            rpc_url,
+            ledger_index,
+            arena: parking_lot::Mutex::new(Vec::with_capacity(16)),
+        }
+    }
+}
+
+impl SleProvider for RpcProvider {
+    fn read(&self, key: &[u8; 32]) -> Option<&[u8]> {
+        let key_hex = hex::encode_upper(key);
+        let resp = self
+            .client
+            .post(&self.rpc_url)
+            .json(&serde_json::json!({
+                "method": "ledger_entry",
+                "params": [{
+                    "index": key_hex,
+                    "ledger_index": self.ledger_index,
+                    "binary": true
+                }]
+            }))
+            .send()
+            .ok()?;
+        let body: serde_json::Value = resp.json().ok()?;
+        let data_hex = body["result"]["node_binary"].as_str()?;
+        let bytes = hex::decode(data_hex).ok()?;
+        let mut arena = self.arena.lock();
+        arena.push(bytes);
+        unsafe {
+            let last = arena.last().unwrap();
+            Some(std::slice::from_raw_parts(last.as_ptr(), last.len()))
+        }
+    }
+}
+
 /// Live FFI stats for the dashboard.
 #[derive(Clone, Default, serde::Serialize)]
 pub struct FfiStats {
@@ -57,7 +108,7 @@ pub struct FfiStats {
     pub last_applied: bool,
     pub last_mutations: usize,
     pub last_check_ms: u64,
-    // Live mainnet tx processing
+    // Live mainnet tx processing (parse + preflight)
     pub live_txs_parsed: u64,
     pub live_txs_preflight_ok: u64,
     pub live_txs_preflight_fail: u64,
@@ -66,6 +117,14 @@ pub struct FfiStats {
     pub live_last_ter: String,
     pub live_ledger_seq: u32,
     pub live_types_seen: std::collections::BTreeMap<String, u64>,
+    // Full apply on live mainnet tx (with RPC-fetched state)
+    pub live_apply_attempted: u64,
+    pub live_apply_ok: u64,
+    pub live_apply_failed: u64,
+    pub live_apply_last_ter: String,
+    pub live_apply_last_mutations: usize,
+    pub live_apply_last_ms: u64,
+    pub live_apply_ter_counts: std::collections::BTreeMap<String, u64>,
 }
 
 pub type SharedFfiStats = Arc<Mutex<FfiStats>>;
@@ -209,4 +268,49 @@ pub fn process_live_tx(stats: &SharedFfiStats, tx_bytes: &[u8], ledger_seq: u32)
     s.live_last_ter = pf.ter_name.clone();
     s.live_ledger_seq = ledger_seq;
     *s.live_types_seen.entry(parsed.tx_type).or_insert(0) += 1;
+}
+
+/// Apply a live mainnet tx via libxrpl's full tx engine.
+///
+/// State lookups go through an RPC-backed provider that fetches SLEs from
+/// rippled at `ledger_seq - 1` (pre-tx state).
+pub fn apply_live_tx(
+    stats: &SharedFfiStats,
+    tx_bytes: &[u8],
+    ledger_seq: u32,
+    rpc_url: &str,
+) {
+    let t0 = std::time::Instant::now();
+    let provider = RpcProvider::new(rpc_url.to_string(), ledger_seq.saturating_sub(1));
+    let ledger = LedgerInfo {
+        seq: ledger_seq,
+        parent_close_time: 0,
+        total_drops: 99_985_687_626_634_189,
+        parent_hash: [0u8; 32],
+        base_fee_drops: 10,
+        reserve_drops: 10_000_000,
+        increment_drops: 2_000_000,
+    };
+    let outcome = match xrpl_ffi::apply_with_mutations(tx_bytes, &[], &ledger, &provider, 0, 0) {
+        Some(o) => o,
+        None => {
+            let mut s = stats.lock();
+            s.live_apply_attempted += 1;
+            s.live_apply_failed += 1;
+            s.live_apply_last_ter = "FFI_NULL".into();
+            return;
+        }
+    };
+    let elapsed_ms = t0.elapsed().as_micros() as u64 / 1000;
+    let mut s = stats.lock();
+    s.live_apply_attempted += 1;
+    if outcome.is_success() && outcome.applied {
+        s.live_apply_ok += 1;
+    } else {
+        s.live_apply_failed += 1;
+    }
+    s.live_apply_last_ter = outcome.ter_name.clone();
+    s.live_apply_last_mutations = outcome.mutations.len();
+    s.live_apply_last_ms = elapsed_ms;
+    *s.live_apply_ter_counts.entry(outcome.ter_name).or_insert(0) += 1;
 }
