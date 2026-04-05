@@ -98,7 +98,11 @@ impl RippledClient {
 
         for attempt in 0..ENDPOINTS.len() {
             let idx = (start_idx + attempt) % ENDPOINTS.len();
-            let url = ENDPOINTS[idx];
+            let url = if idx == 0 {
+                if let Some(ref o) = self.rpc_override { o.as_str() } else { ENDPOINTS[0] }
+            } else {
+                ENDPOINTS[idx]
+            };
 
             match self.client.post(url).json(body).send().await {
                 Ok(resp) => {
