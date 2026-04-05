@@ -197,6 +197,43 @@ int32_t xrpl_preflight(
     char *out_ter_name, size_t ter_name_buf_len
 );
 
+/* ============================================================
+ * apply — full transaction application against a ledger view.
+ *
+ * Runs: preflight → preclaim → doApply through libxrpl.
+ *
+ * Needs a callback to read SLEs from Rust-owned state.
+ * The callback's returned data pointer must remain valid for the duration
+ * of this function call (lives in an arena managed by Rust).
+ *
+ * Returns TER code. out_applied says whether the tx was "applied" (fee claimed).
+ * ============================================================ */
+
+int32_t xrpl_apply(
+    /* Transaction */
+    const uint8_t *tx_bytes, size_t tx_len,
+    /* Rules */
+    const uint8_t *amendments_bytes, size_t amendments_len,
+    /* Ledger header */
+    uint32_t ledger_seq,
+    uint32_t parent_close_time,
+    uint64_t total_drops,
+    const uint8_t parent_hash[32],
+    /* Fees for this ledger */
+    uint64_t base_fee_drops,
+    uint64_t reserve_drops,
+    uint64_t increment_drops,
+    /* Application params */
+    uint32_t apply_flags,
+    uint32_t network_id,
+    /* SLE lookup callback (Rust side) */
+    XrplSleLookupFn lookup_fn,
+    void *lookup_user_data,
+    /* Output */
+    char *out_ter_name, size_t ter_name_buf_len,
+    bool *out_applied
+);
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

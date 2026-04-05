@@ -6,13 +6,18 @@
 
 #include "xrpl_shim.h"
 #include "MinimalServiceRegistry.h"
+#include "CallbackReadView.h"
 
 #include <xrpl/protocol/BuildInfo.h>
+#include <xrpl/protocol/LedgerHeader.h>
 #include <xrpl/protocol/Rules.h>
 #include <xrpl/protocol/STTx.h>
 #include <xrpl/protocol/Serializer.h>
 #include <xrpl/protocol/TER.h>
 #include <xrpl/protocol/TxFormats.h>
+#include <xrpl/protocol/XRPAmount.h>
+#include <xrpl/ledger/OpenView.h>
+#include <xrpl/tx/apply.h>
 #include <xrpl/tx/applySteps.h>
 #include <xrpl/beast/utility/Journal.h>
 
@@ -185,6 +190,108 @@ int32_t xrpl_preflight(
             std::snprintf(out_ter_name, ter_name_buf_len, "EXCEPTION: %s", e.what());
         }
         return -399;  // tefINTERNAL
+    } catch (...) {
+        if (out_ter_name && ter_name_buf_len > 0) {
+            std::snprintf(out_ter_name, ter_name_buf_len, "UNKNOWN_EXCEPTION");
+        }
+        return -399;
+    }
+}
+
+int32_t xrpl_apply(
+    const uint8_t *tx_bytes, size_t tx_len,
+    const uint8_t *amendments_bytes, size_t amendments_len,
+    uint32_t ledger_seq,
+    uint32_t parent_close_time,
+    uint64_t total_drops,
+    const uint8_t parent_hash[32],
+    uint64_t base_fee_drops,
+    uint64_t reserve_drops,
+    uint64_t increment_drops,
+    uint32_t apply_flags,
+    uint32_t network_id,
+    XrplSleLookupFn lookup_fn,
+    void *lookup_user_data,
+    char *out_ter_name, size_t ter_name_buf_len,
+    bool *out_applied) {
+    if (out_applied) *out_applied = false;
+    try {
+        // Parse tx
+        xrpl::SerialIter sit(tx_bytes, tx_len);
+        xrpl::STTx tx(sit);
+
+        // Build Rules
+        std::unordered_set<xrpl::uint256, beast::uhash<>> presets;
+        if (amendments_bytes && amendments_len > 0 && amendments_len % 32 == 0) {
+            size_t n = amendments_len / 32;
+            for (size_t i = 0; i < n; i++) {
+                xrpl::uint256 feature;
+                std::memcpy(feature.data(), amendments_bytes + i * 32, 32);
+                presets.insert(feature);
+            }
+        }
+        xrpl::Rules rules(presets);
+
+        // Build LedgerHeader
+        xrpl::LedgerHeader header;
+        header.seq = ledger_seq;
+        header.parentCloseTime = xrpl::NetClock::time_point(xrpl::NetClock::duration(parent_close_time));
+        std::memcpy(header.parentHash.data(), parent_hash, 32);
+        header.drops = xrpl::XRPAmount(static_cast<std::int64_t>(total_drops));
+        header.closeTimeResolution = xrpl::NetClock::duration(10);
+
+        // Build Fees
+        xrpl::Fees fees;
+        fees.base = xrpl::XRPAmount(static_cast<std::int64_t>(base_fee_drops));
+        fees.reserve = xrpl::XRPAmount(static_cast<std::int64_t>(reserve_drops));
+        fees.increment = xrpl::XRPAmount(static_cast<std::int64_t>(increment_drops));
+
+        // Wrap C callback in std::function
+        xrpl::SleLookupCallback cpp_lookup =
+            [lookup_fn, lookup_user_data](xrpl::uint256 const& key, uint8_t const** out_data, size_t* out_len) -> bool {
+                return lookup_fn(lookup_user_data, key.data(), out_data, out_len);
+            };
+
+        // Construct CallbackReadView
+        auto read_view = std::make_shared<xrpl::CallbackReadView>(
+            header, rules, fees, /*open=*/true, cpp_lookup);
+
+        // Construct OpenView (wraps the ReadView for writable apply)
+        xrpl::OpenView open_view(xrpl::open_ledger, rules, read_view);
+
+        // Construct ServiceRegistry
+        xrpl::MinimalServiceRegistry registry(network_id);
+
+        // Null journal
+        beast::Journal journal(beast::Journal::getNullSink());
+
+        // Call apply()
+        auto result = xrpl::apply(
+            registry,
+            open_view,
+            tx,
+            static_cast<xrpl::ApplyFlags>(apply_flags),
+            journal);
+
+        if (out_applied) *out_applied = result.applied;
+
+        // Extract TER
+        int32_t ter_code = TERtoInt(result.ter);
+
+        // Copy TER name
+        if (out_ter_name && ter_name_buf_len > 0) {
+            std::string name = xrpl::transToken(result.ter);
+            size_t copy_len = std::min(name.size(), ter_name_buf_len - 1);
+            std::memcpy(out_ter_name, name.data(), copy_len);
+            out_ter_name[copy_len] = '\0';
+        }
+
+        return ter_code;
+    } catch (std::exception const& e) {
+        if (out_ter_name && ter_name_buf_len > 0) {
+            std::snprintf(out_ter_name, ter_name_buf_len, "EXCEPTION: %s", e.what());
+        }
+        return -399;
     } catch (...) {
         if (out_ter_name && ter_name_buf_len > 0) {
             std::snprintf(out_ter_name, ter_name_buf_len, "UNKNOWN_EXCEPTION");

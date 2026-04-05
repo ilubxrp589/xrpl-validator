@@ -30,6 +30,7 @@ find_package(secp256k1 REQUIRED)
 add_library(xrpl_shim STATIC
     xrpl_shim.cpp
     MinimalServiceRegistry.cpp
+    CallbackReadView.cpp
 )
 target_include_directories(xrpl_shim PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}

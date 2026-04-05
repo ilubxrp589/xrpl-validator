@@ -86,5 +86,76 @@ int test_main(int argc, char **argv) {
         ter_name, sizeof(ter_name));
     printf("preflight result: TER=%d (%s)\n", ter, ter_name);
 
+    /* === CALL APPLY with SLE callback === */
+    printf("\n=== Calling xrpl::apply() via shim ===\n");
+
+    /* Pre-fetched SLEs from mainnet ledger 103354510 */
+    /* sender keylet = CED60F22A245F8DE393F2351C5097A81836153584DC3C24B803FA1B9906A506A */
+    uint8_t sender_key[32];
+    uint8_t sender_sle[256];
+    size_t sender_sle_len = decode_hex(
+        "CED60F22A245F8DE393F2351C5097A81836153584DC3C24B803FA1B9906A506A",
+        sender_key, 32);
+    (void)sender_sle_len;
+    /* Note: SLE state at ledger 103354510. Sender sequence bumped from 6D to 6E
+     * because an earlier tx in ledger 103354511 touched this account first.
+     * (tx 39077702 expects sequence 6E) */
+    sender_sle_len = decode_hex(
+        "11006122000000002404E59B6E25062910882D0000000055B8E0C782ADB99C79445A6C72A3553C6FFD6E7BC529A906DF6FEEE09F439EADFA62400000000776FE378114E5A5902FEBDA49C3BDE5B7E4522C62F3D49E4666",
+        sender_sle, sizeof(sender_sle));
+
+    /* dest keylet = 5180078F1F6E062E4F01B17D6D05E734DF5976F0EDB187ED9EBF652A6F47D28D */
+    uint8_t dest_key[32];
+    uint8_t dest_sle[256];
+    decode_hex("5180078F1F6E062E4F01B17D6D05E734DF5976F0EDB187ED9EBF652A6F47D28D",
+        dest_key, 32);
+    size_t dest_sle_len = decode_hex(
+        "1100612200000000240432660C2506290E532D00000012553059070AA6AB0E4DEAC9CEE66914270E0FAD957168D465B657C359132498A64462400000000C234F9F811492BD9E89265D9F5853BF1AAB400766CDDBDAEC3C",
+        dest_sle, sizeof(dest_sle));
+
+    printf("sender SLE: %zu bytes, dest SLE: %zu bytes\n", sender_sle_len, dest_sle_len);
+
+    /* Callback context */
+    struct SleDb {
+        const uint8_t *sk; const uint8_t *sv; size_t slen;
+        const uint8_t *dk; const uint8_t *dv; size_t dlen;
+    } db = {sender_key, sender_sle, sender_sle_len, dest_key, dest_sle, dest_sle_len};
+
+    /* SLE lookup callback */
+    extern bool sle_lookup(void *user_data, const uint8_t key[32],
+                           const uint8_t **out_data, size_t *out_len);
+
+    uint8_t parent_hash[32] = {0};  /* dummy — not critical for Payment apply */
+    bool applied = false;
+    int32_t apply_ter = xrpl_apply(
+        tx_bytes, tx_len,
+        NULL, 0,                       /* empty rules */
+        103354511,                     /* ledger seq */
+        797193960,                     /* parent_close_time (approx, NetClock) */
+        99985687626634189ULL,          /* total_drops */
+        parent_hash,
+        10,                            /* base_fee */
+        10000000,                      /* reserve (10 XRP) */
+        2000000,                       /* increment (2 XRP) */
+        0,                             /* apply_flags */
+        0,                             /* network_id */
+        sle_lookup, &db,
+        ter_name, sizeof(ter_name),
+        &applied);
+    printf("apply result: TER=%d (%s) applied=%s\n", apply_ter, ter_name,
+           applied ? "true" : "false");
+
     return 0;
+}
+
+#include <string.h>
+bool sle_lookup(void *user_data, const uint8_t key[32],
+                const uint8_t **out_data, size_t *out_len) {
+    struct SleDb {
+        const uint8_t *sk; const uint8_t *sv; size_t slen;
+        const uint8_t *dk; const uint8_t *dv; size_t dlen;
+    } *db = (struct SleDb*)user_data;
+    if (memcmp(key, db->sk, 32) == 0) { *out_data = db->sv; *out_len = db->slen; return true; }
+    if (memcmp(key, db->dk, 32) == 0) { *out_data = db->dv; *out_len = db->dlen; return true; }
+    return false;
 }
