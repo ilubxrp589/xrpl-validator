@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use crate::ffi_engine::{
     apply_ledger_in_order, fetch_mainnet_amendments, new_stats, DivergenceLog, FfiStats,
-    SharedFfiStats,
+    OwnedSnapshot, SharedFfiStats,
 };
 
 /// FFI-based per-ledger tx verifier. Send + Sync, cheap to `Arc`-clone.
@@ -70,9 +70,8 @@ impl FfiVerifier {
     /// spawn_blocking task or a dedicated thread. Each diverged result is
     /// logged to `logs/divergences.jsonl` and counted in `stats()`.
     ///
-    /// If `db` is provided, SLE lookups prefer the validator's local RocksDB
-    /// snapshot (sub-ms reads) and only fall through to RPC on miss — this
-    /// typically drops RPC load by 90%+.
+    /// Pure RPC path — used by the sidecar `ffi_test` binary that has no
+    /// local state DB.
     pub fn verify_ledger(
         &self,
         ledger_seq: u32,
@@ -80,7 +79,6 @@ impl FfiVerifier {
         parent_hash: [u8; 32],
         parent_close_time: u32,
         total_drops: u64,
-        db: Option<&rocksdb::DB>,
     ) {
         apply_ledger_in_order(
             &self.stats,
@@ -92,7 +90,35 @@ impl FfiVerifier {
             parent_close_time,
             total_drops,
             Some(self.divergence_log.as_ref()),
-            db,
+            None,
+        );
+    }
+
+    /// Apply + verify using a pre-captured `OwnedSnapshot` as the SLE
+    /// source (with RPC fallback on miss). The snapshot MUST be taken at
+    /// the PRE-ledger boundary — i.e., before ws_sync's process_ledger()
+    /// writes post-state to the DB. Owner of this invariant is the caller
+    /// (see ws_sync.rs call site).
+    pub fn verify_ledger_with_snapshot(
+        &self,
+        ledger_seq: u32,
+        sorted_tx_blobs: &[Vec<u8>],
+        parent_hash: [u8; 32],
+        parent_close_time: u32,
+        total_drops: u64,
+        snapshot: Option<&OwnedSnapshot>,
+    ) {
+        apply_ledger_in_order(
+            &self.stats,
+            sorted_tx_blobs,
+            ledger_seq,
+            &self.rpc_urls,
+            &self.amendments,
+            parent_hash,
+            parent_close_time,
+            total_drops,
+            Some(self.divergence_log.as_ref()),
+            snapshot,
         );
     }
 

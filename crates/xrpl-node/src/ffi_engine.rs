@@ -259,13 +259,55 @@ impl SleProvider for RpcProvider {
     }
 }
 
-/// Three-tier SLE provider: overlay (in-ledger mutations) → rocksdb snapshot
-/// (validator's own state at ~ledger_seq-1) → RpcProvider (fallback for
-/// SLEs missing from the local DB). Cuts RPC load by 90%+ once the DB is
-/// populated.
+/// A rocksdb snapshot bundled with an Arc<DB> that keeps it alive. The
+/// snapshot borrows from the DB, but we own the Arc, so the borrow is
+/// safe for the lifetime of this struct. This makes the snapshot Send +
+/// 'static so it can cross thread/task boundaries (e.g. into
+/// spawn_blocking for FFI verify).
+///
+/// SAFETY invariant: `snapshot` is dropped before `_db`. Rust's struct
+/// field drop order (declaration order) guarantees this. The 'static
+/// lifetime on the snapshot is a managed lie — the snapshot is only valid
+/// for as long as this struct (and its inner Arc<DB>) is alive.
+pub struct OwnedSnapshot {
+    // Field order matters: snapshot must drop before _db.
+    snapshot: rocksdb::Snapshot<'static>,
+    _db: std::sync::Arc<rocksdb::DB>,
+}
+
+// SAFETY: rocksdb::Snapshot is inherently Send once we control the DB
+// lifetime ourselves (via the Arc).
+unsafe impl Send for OwnedSnapshot {}
+unsafe impl Sync for OwnedSnapshot {}
+
+impl OwnedSnapshot {
+    pub fn new(db: std::sync::Arc<rocksdb::DB>) -> Self {
+        // Take snapshot against &DB dereferenced from Arc.
+        let snapshot: rocksdb::Snapshot<'_> = db.snapshot();
+        // SAFETY: we're about to store `db` inside the same struct as this
+        // snapshot. The snapshot borrows from `*db`. Drop order ensures
+        // snapshot is dropped before db. The 'static lifetime here is
+        // upheld by struct invariant, not by the compiler.
+        let snapshot: rocksdb::Snapshot<'static> =
+            unsafe { std::mem::transmute(snapshot) };
+        Self { snapshot, _db: db }
+    }
+
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, rocksdb::Error> {
+        self.snapshot.get(key)
+    }
+}
+
+/// Three-tier SLE provider: overlay (in-ledger mutations) → OwnedSnapshot
+/// of the validator's state at the PRE-ledger boundary → RpcProvider
+/// fallback. Cuts RPC load by 90%+ once the DB is populated.
+///
+/// The snapshot must be taken BEFORE any concurrent writes to the DB that
+/// would reflect post-ledger state. See ws_sync.rs for the ordering
+/// contract.
 pub struct OverlayedDbProvider<'a> {
     overlay: &'a parking_lot::Mutex<std::collections::HashMap<[u8; 32], Option<Vec<u8>>>>,
-    snapshot: rocksdb::Snapshot<'a>,
+    snapshot: &'a OwnedSnapshot,
     rpc_fallback: &'a RpcProvider,
     arena: parking_lot::Mutex<Vec<Vec<u8>>>,
     pub db_hits: std::sync::atomic::AtomicU64,
@@ -275,12 +317,12 @@ pub struct OverlayedDbProvider<'a> {
 impl<'a> OverlayedDbProvider<'a> {
     pub fn new(
         overlay: &'a parking_lot::Mutex<std::collections::HashMap<[u8; 32], Option<Vec<u8>>>>,
-        db: &'a rocksdb::DB,
+        snapshot: &'a OwnedSnapshot,
         rpc_fallback: &'a RpcProvider,
     ) -> Self {
         Self {
             overlay,
-            snapshot: db.snapshot(),
+            snapshot,
             rpc_fallback,
             arena: parking_lot::Mutex::new(Vec::with_capacity(16)),
             db_hits: std::sync::atomic::AtomicU64::new(0),
@@ -309,7 +351,7 @@ impl<'a> SleProvider for OverlayedDbProvider<'a> {
                 }
             }
         }
-        // 2. RocksDB snapshot (validator's own state)
+        // 2. Owned snapshot (validator's own state, pre-ledger)
         if let Ok(Some(data)) = self.snapshot.get(key) {
             self.db_hits.fetch_add(1, Ordering::Relaxed);
             let mut arena = self.arena.lock();
@@ -812,7 +854,7 @@ pub fn apply_ledger_in_order(
     parent_close_time: u32,
     total_drops: u64,
     divergence_log: Option<&DivergenceLog>,
-    db: Option<&rocksdb::DB>,
+    db_snapshot: Option<&OwnedSnapshot>,
 ) {
     let fallback = RpcProvider::with_endpoints(rpc_urls.to_vec(), ledger_seq.saturating_sub(1));
     let overlay: parking_lot::Mutex<std::collections::HashMap<[u8; 32], Option<Vec<u8>>>> =
@@ -836,10 +878,10 @@ pub fn apply_ledger_in_order(
             .map(|p| (p.tx_type, hex::encode_upper(p.hash)))
             .unwrap_or_else(|| ("Unknown".to_string(), String::new()));
         let t0 = std::time::Instant::now();
-        // Use DB-first provider when the validator's own RocksDB is available.
-        // Per-tx snapshot: rocksdb snapshots are O(1), just a sequence number.
-        let outcome_opt = if let Some(db_ref) = db {
-            let provider = OverlayedDbProvider::new(&overlay, db_ref, &fallback);
+        // Use DB-first provider when a pre-ledger OwnedSnapshot is supplied.
+        // The snapshot is stable (rocksdb MVCC) — safe against concurrent writes.
+        let outcome_opt = if let Some(snap) = db_snapshot {
+            let provider = OverlayedDbProvider::new(&overlay, snap, &fallback);
             let r = xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, 0);
             // Accumulate provider counters into stats
             use std::sync::atomic::Ordering;
@@ -1016,4 +1058,62 @@ pub fn apply_live_tx(
     s.live_apply_last_mutations = outcome.mutations.len();
     s.live_apply_last_ms = elapsed_ms;
     *s.live_apply_ter_counts.entry(outcome.ter_name).or_insert(0) += 1;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// OwnedSnapshot must isolate reads from concurrent writes to the DB.
+    /// This is the exact invariant ws_sync depends on when FFI verify runs
+    /// concurrently with process_ledger's writes.
+    #[test]
+    fn owned_snapshot_isolates_from_concurrent_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(rocksdb::DB::open_default(tmp.path()).unwrap());
+
+        // Populate pre-snapshot state
+        db.put(b"key_pre", b"value_pre").unwrap();
+        db.put(b"key_mutated", b"pre_value").unwrap();
+
+        // Take the snapshot — this is "pre-ledger" state
+        let snap = OwnedSnapshot::new(db.clone());
+
+        // Simulate process_ledger writing POST-ledger state CONCURRENTLY
+        db.put(b"key_mutated", b"post_value").unwrap();
+        db.put(b"key_new", b"value_new").unwrap();
+        db.delete(b"key_pre").unwrap();
+
+        // Snapshot must still see pre-ledger state exactly
+        assert_eq!(snap.get(b"key_pre").unwrap(), Some(b"value_pre".to_vec()));
+        assert_eq!(snap.get(b"key_mutated").unwrap(), Some(b"pre_value".to_vec()));
+        assert_eq!(snap.get(b"key_new").unwrap(), None);
+
+        // Direct DB reads see post-ledger state (control group)
+        assert_eq!(db.get(b"key_pre").unwrap(), None);
+        assert_eq!(db.get(b"key_mutated").unwrap(), Some(b"post_value".to_vec()));
+        assert_eq!(db.get(b"key_new").unwrap(), Some(b"value_new".to_vec()));
+    }
+
+    /// OwnedSnapshot must be Send — it crosses into spawn_blocking tasks.
+    #[test]
+    fn owned_snapshot_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<OwnedSnapshot>();
+    }
+
+    /// OwnedSnapshot survives the DB's original borrow lifetime going out of
+    /// scope — only the Arc inside matters.
+    #[test]
+    fn owned_snapshot_outlives_original_arc_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snap = {
+            let db = std::sync::Arc::new(rocksdb::DB::open_default(tmp.path()).unwrap());
+            db.put(b"scoped_key", b"scoped_val").unwrap();
+            OwnedSnapshot::new(db)
+            // `db` Arc drops here but OwnedSnapshot internally holds another
+            // Arc clone, so the DB stays alive.
+        };
+        assert_eq!(snap.get(b"scoped_key").unwrap(), Some(b"scoped_val".to_vec()));
+    }
 }

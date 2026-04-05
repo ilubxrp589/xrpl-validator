@@ -178,7 +178,7 @@ async fn main() {
                         parent_close_time,
                         total_drops,
                         Some(dlog.as_ref()),
-                        None, // no RocksDB — sidecar uses pure RPC path
+                        None, // no snapshot — sidecar uses pure RPC path
                     );
                 });
             }
