@@ -124,8 +124,11 @@ pub async fn start_ws_sync(
                     let mut ledger_header: LedgerHeader = LedgerHeader::default();
                     for attempt in 0..3u32 {
                         match fetch_ledger_metadata(&rpc, process_seq, &mut acc_modified, &mut acc_deleted, &mut acc_tx_count).await {
-                            Ok((_sorted_txs, hdr)) => {
+                            Ok((_sorted_txs, hdr, wallet_delta)) => {
                                 ledger_header = hdr;
+                                if wallet_delta != 0 {
+                                    hash_comp.adjust_wallet_count(wallet_delta, process_seq);
+                                }
                                 meta_ok = true;
                                 break;
                             }
@@ -237,6 +240,29 @@ pub async fn start_ws_sync(
     }
 }
 
+/// Count AccountRoot creates minus deletes in one tx's metadata.
+fn count_wallet_delta(body: &serde_json::Value) -> i64 {
+    let meta = if body["meta"].is_object() { &body["meta"] }
+        else if body["metaData"].is_object() { &body["metaData"] }
+        else { return 0; };
+    let mut delta: i64 = 0;
+    if let Some(nodes) = meta["AffectedNodes"].as_array() {
+        for node in nodes {
+            if let Some(c) = node.get("CreatedNode") {
+                if c["LedgerEntryType"].as_str() == Some("AccountRoot") {
+                    delta += 1;
+                }
+            }
+            if let Some(d) = node.get("DeletedNode") {
+                if d["LedgerEntryType"].as_str() == Some("AccountRoot") {
+                    delta -= 1;
+                }
+            }
+        }
+    }
+    delta
+}
+
 fn extract_affected_nodes(body: &serde_json::Value, modified: &mut HashSet<String>, deleted: &mut HashSet<String>) {
     let meta = if body["meta"].is_object() { &body["meta"] }
         else if body["metaData"].is_object() { &body["metaData"] }
@@ -280,7 +306,7 @@ async fn fetch_ledger_metadata(
     rpc: &RippledClient, seq: u32,
     modified: &mut HashSet<String>, deleted: &mut HashSet<String>,
     tx_count: &mut u32,
-) -> Result<(Vec<serde_json::Value>, LedgerHeader), String> {
+) -> Result<(Vec<serde_json::Value>, LedgerHeader, i64), String> {
     let body = rpc.call("ledger", serde_json::json!({"ledger_index": seq, "transactions": true, "expand": true, "binary": false})).await?;
     let ledger = &body["result"]["ledger"];
     let txs = ledger["transactions"].as_array()
@@ -314,11 +340,13 @@ async fn fetch_ledger_metadata(
         meta["TransactionIndex"].as_u64().unwrap_or(0)
     });
 
+    let mut wallet_delta: i64 = 0;
     for tx in &sorted_txs {
         extract_affected_nodes(tx, modified, deleted);
+        wallet_delta += count_wallet_delta(tx);
         *tx_count += 1;
     }
-    Ok((sorted_txs, header))
+    Ok((sorted_txs, header, wallet_delta))
 }
 
 /// Fetch binary tx_blobs for every tx in the ledger, sorted by TransactionIndex.

@@ -300,6 +300,10 @@ pub struct StateHashComputer {
     // Legacy fields kept for API compat (unused in hot path)
     pub leaf_cache: Arc<Mutex<Vec<(Hash256, Hash256)>>>,
     pub dirty_branches: Arc<Mutex<u16>>,
+    /// Live wallet (AccountRoot) count — scanned at startup, adjusted per-ledger.
+    pub wallet_count: Arc<std::sync::atomic::AtomicU64>,
+    /// Recent wallet count history (ledger_seq, count) for graphing. Ring buffer, last 300.
+    pub wallet_history: Arc<Mutex<Vec<(u32, u64)>>>,
 }
 
 impl StateHashComputer {
@@ -314,6 +318,46 @@ impl StateHashComputer {
             cache_path: Mutex::new(None),
             leaf_cache: Arc::new(Mutex::new(Vec::new())),
             dirty_branches: Arc::new(Mutex::new(0xFFFF)),
+            wallet_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            wallet_history: Arc::new(Mutex::new(Vec::with_capacity(300))),
+        }
+    }
+
+    /// Scan RocksDB for AccountRoot entries (sfLedgerEntryType == 0x0061).
+    /// Called once at startup after bulk sync completes. Typically takes 5-10s
+    /// over 18.8M entries.
+    pub fn scan_wallet_count(&self, db: &rocksdb::DB) {
+        let t0 = std::time::Instant::now();
+        let mut count: u64 = 0;
+        let iter = db.iterator(rocksdb::IteratorMode::Start);
+        for item in iter {
+            let Ok((_key, value)) = item else { continue; };
+            // AccountRoot SLE: first 2 bytes after the outer type marker
+            // Binary SLE format: 0x11 0x00 <LedgerEntryType u16>
+            // AccountRoot = 0x0061 → bytes [0]=0x11, [1]=0x00, [2]=0x61
+            if value.len() >= 3 && value[0] == 0x11 && value[1] == 0x00 && value[2] == 0x61 {
+                count += 1;
+            }
+        }
+        self.wallet_count.store(count, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[wallets] Scanned {count} AccountRoot entries in {:.1}s", t0.elapsed().as_secs_f64());
+    }
+
+    /// Adjust wallet count when ledger processing finds created/deleted AccountRoots.
+    pub fn adjust_wallet_count(&self, created: i64, ledger_seq: u32) {
+        use std::sync::atomic::Ordering;
+        if created > 0 {
+            self.wallet_count.fetch_add(created as u64, Ordering::Relaxed);
+        } else if created < 0 {
+            self.wallet_count.fetch_sub((-created) as u64, Ordering::Relaxed);
+        }
+        let current = self.wallet_count.load(Ordering::Relaxed);
+        let mut hist = self.wallet_history.lock();
+        hist.push((ledger_seq, current));
+        // Keep last 300 entries (~15 min at 3s/ledger)
+        if hist.len() > 300 {
+            let excess = hist.len() - 300;
+            hist.drain(..excess);
         }
     }
 

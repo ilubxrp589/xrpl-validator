@@ -142,10 +142,22 @@
                     Ledger <span class="text-slate-200" id="hero-ledger">#103,363,812</span>
 </div>
 <div id="hero-objects">18.8M objects</div>
+<div id="hero-wallets" class="text-green-400">0 wallets</div>
 <div id="hero-sync" class="hidden text-amber-500"></div>
 <div class="flex items-center gap-1">State hash <span class="text-green-500 font-bold" id="hero-hash-status">✓ MATCH</span></div>
 <div id="hero-ledgers-verified">284 ledgers verified</div>
 </div>
+</section>
+<!-- WALLET CHART -->
+<section class="bg-slate-900 border border-slate-800 rounded-lg p-4">
+<div class="flex justify-between items-center mb-2">
+<div class="flex items-center gap-2">
+<span class="material-symbols-outlined text-green-500 text-sm">account_circle</span>
+<span class="text-[10px] text-slate-500 font-bold uppercase tracking-widest">Live Wallet Count</span>
+</div>
+<span class="font-mono text-sm text-green-400" id="chart-wallet-count">0</span>
+</div>
+<canvas id="wallet-chart" height="80" class="w-full"></canvas>
 </section>
 <!-- SECTION 2: FFI ENGINE -->
 <section class="bg-slate-900 border border-slate-800 rounded-lg overflow-hidden flex flex-col">
@@ -348,6 +360,49 @@ function histPct(buckets, count, p) {
     return '>1s';
 }
 
+function drawWalletChart(history) {
+    const canvas = $('wallet-chart');
+    if (!canvas || !history || history.length < 2) return;
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width = canvas.offsetWidth * 2;
+    const h = canvas.height = canvas.offsetHeight * 2;
+    ctx.clearRect(0, 0, w, h);
+
+    const vals = history.map(e => e[1]);
+    const min = Math.min(...vals);
+    const max = Math.max(...vals);
+    const range = max - min || 1;
+    const pad = 4;
+
+    // Fill gradient
+    const grad = ctx.createLinearGradient(0, 0, 0, h);
+    grad.addColorStop(0, 'rgba(0,200,83,0.3)');
+    grad.addColorStop(1, 'rgba(0,200,83,0)');
+
+    ctx.beginPath();
+    ctx.moveTo(pad, h - pad);
+    for (let i = 0; i < vals.length; i++) {
+        const x = pad + (i / (vals.length - 1)) * (w - pad * 2);
+        const y = h - pad - ((vals[i] - min) / range) * (h - pad * 2);
+        ctx.lineTo(x, y);
+    }
+    ctx.lineTo(w - pad, h - pad);
+    ctx.closePath();
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Line
+    ctx.beginPath();
+    for (let i = 0; i < vals.length; i++) {
+        const x = pad + (i / (vals.length - 1)) * (w - pad * 2);
+        const y = h - pad - ((vals[i] - min) / range) * (h - pad * 2);
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = '#00C853';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+}
+
 async function tick() {
     try {
         const [eng, cons, sh] = await Promise.all([
@@ -427,10 +482,17 @@ async function tick() {
             syncEl.classList.remove('hidden');
         }
 
-        // Object count from db_entries
+        // Object count + wallet count
         if (dbEntries > 0) {
             $('hero-objects').textContent = (dbEntries / 1_000_000).toFixed(1) + 'M objects';
         }
+        const wallets = sh.wallet_count || 0;
+        if (wallets > 0) {
+            $('hero-wallets').textContent = fmt(wallets) + ' wallets';
+            $('chart-wallet-count').textContent = fmt(wallets);
+        }
+        const wHist = sh.wallet_history || [];
+        drawWalletChart(wHist);
 
         // Tx type bars — per-ledger round, ALL types shown (inactive = grayed)
         const roundTypes = f.round_tx_types || {};

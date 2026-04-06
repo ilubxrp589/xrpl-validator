@@ -642,6 +642,15 @@ async fn main() {
 
                 state_hash_computer.start_computation(db.clone(), estimated);
 
+                // Scan wallet count in background
+                {
+                    let wc_db = db.clone();
+                    let wc_hash = state_hash_computer.clone();
+                    tokio::task::spawn_blocking(move || {
+                        wc_hash.scan_wallet_count(wc_db.as_ref());
+                    });
+                }
+
                 // Backfill gap: read pinned ledger from download marker, catch up to current
                 let backfill_db = db.clone();
                 let backfill_hash = state_hash_computer.clone();
@@ -769,6 +778,12 @@ async fn main() {
                             if let Some(map) = built_map {
                                 hash_comp.set_shamap(map);
                                 eprintln!("[startup] SHAMap received ({synced} entries at #{pinned})");
+                                // Scan for wallet count in background
+                                let wc_db = startup_db.clone();
+                                let wc_hash = hash_comp.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    wc_hash.scan_wallet_count(wc_db.as_ref());
+                                });
                             } else {
                                 eprintln!("[startup] ERROR: no SHAMap from syncer");
                             }
@@ -1517,6 +1532,12 @@ async fn main() {
                             hash_le.lock().as_ref().map(|e| e.entry_count() as u64).unwrap_or(0)
                         });
                     status["db_entries"] = serde_json::json!(marker_count);
+                    status["wallet_count"] = serde_json::json!(
+                        hash_status.wallet_count.load(std::sync::atomic::Ordering::Relaxed)
+                    );
+                    status["wallet_history"] = serde_json::json!(
+                        hash_status.wallet_history.lock().clone()
+                    );
                     axum::Json(status)
                 }
             }
