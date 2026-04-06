@@ -195,47 +195,13 @@
 </div>
 </div>
 </div>
-<!-- Tx Visuals -->
-<div class="flex flex-col justify-between">
-<div class="space-y-4">
-<div class="flex flex-col gap-1.5">
-<div class="flex justify-between font-mono text-[10px] text-slate-400">
-<span>OfferCancel</span>
-<span>42%</span>
+<!-- Live Tx Type Bars -->
+<div class="flex flex-col">
+<div class="flex justify-between items-center mb-3">
+<span class="text-[9px] text-slate-500 font-bold uppercase tracking-widest">Transaction Types</span>
+<span class="text-[9px] font-mono text-slate-500" id="ffi-total-types">0 types</span>
 </div>
-<div class="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
-<div class="bg-green-500 h-full w-[42%]"></div>
-</div>
-</div>
-<div class="flex flex-col gap-1.5">
-<div class="flex justify-between font-mono text-[10px] text-slate-400">
-<span>OfferCreate</span>
-<span>38%</span>
-</div>
-<div class="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
-<div class="bg-blue-500 h-full w-[38%]"></div>
-</div>
-</div>
-<div class="flex flex-col gap-1.5">
-<div class="flex justify-between font-mono text-[10px] text-slate-400">
-<span>Payment</span>
-<span>20%</span>
-</div>
-<div class="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
-<div class="bg-slate-400 h-full w-[20%]"></div>
-</div>
-</div>
-</div>
-<div class="flex gap-4 mt-6">
-<div class="px-3 py-2 border border-slate-800 rounded bg-slate-900 flex-1">
-<div class="font-mono text-[9px] text-slate-500 mb-1">TOP TER CODE</div>
-<div class="font-mono text-sm text-green-400">tesSUCCESS</div>
-</div>
-<div class="px-3 py-2 border border-slate-800 rounded bg-slate-900 flex-1">
-<div class="font-mono text-[9px] text-slate-500 mb-1">ENGINE UPTIME</div>
-<div class="font-mono text-sm text-slate-200">72:14:05</div>
-</div>
-</div>
+<div id="tx-type-bars" class="space-y-1.5" style="min-height:200px"></div>
 </div>
 </div>
 </section>
@@ -348,6 +314,15 @@ const $ = id => document.getElementById(id);
 const fmt = n => n.toLocaleString();
 const pct = (n, d) => d > 0 ? (n / d * 100).toFixed(1) + '%' : '0%';
 
+const txColors = {
+    OfferCancel: '#00C853', OfferCreate: '#00B0FF', Payment: '#7C4DFF',
+    TrustSet: '#FFD600', AccountSet: '#FF6D00', NFTokenCreateOffer: '#E040FB',
+    NFTokenAcceptOffer: '#EA80FC', NFTokenMint: '#B388FF', NFTokenBurn: '#FF5252',
+    NFTokenCancelOffer: '#F48FB1', TicketCreate: '#80CBC4', CheckCash: '#4FC3F7',
+    CheckCreate: '#81D4FA', OracleSet: '#FFAB40', AMMDeposit: '#69F0AE',
+    AMMWithdraw: '#B9F6CA', AMMVote: '#A7FFEB', AccountDelete: '#FF1744',
+};
+
 // Compute histogram percentile from cumulative buckets
 function histPct(buckets, count, p) {
     const bounds = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000];
@@ -404,6 +379,25 @@ async function tick() {
         $('ffi-claimed-pct').textContent = pct(claimed, att);
         $('ffi-p95').textContent = histPct(buckets, durCount, 0.95);
         $('ffi-p99').textContent = histPct(buckets, durCount, 0.99);
+
+        // Tx type bars — live fill
+        const types = f.apply_by_type || {};
+        const total = Object.values(types).reduce((a, b) => a + b, 0) || 1;
+        const sorted = Object.entries(types).sort((a, b) => b[1] - a[1]);
+        $('ffi-total-types').textContent = sorted.length + ' types';
+        let barsHtml = '';
+        for (const [type, cnt] of sorted) {
+            const p = (cnt / total * 100).toFixed(0);
+            const c = txColors[type] || '#6E7681';
+            barsHtml += `<div class="flex items-center gap-2 font-mono text-[10px]">
+                <span style="color:${c};min-width:130px" class="truncate">${type}</span>
+                <div class="flex-1 h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                    <div style="width:${p}%;background:${c};transition:width 0.3s" class="h-full rounded-full"></div>
+                </div>
+                <span class="text-slate-500 min-w-[50px] text-right">${fmt(cnt)}</span>
+            </div>`;
+        }
+        $('tx-type-bars').innerHTML = barsHtml;
 
         // Network
         // Peer count from consensus endpoint
