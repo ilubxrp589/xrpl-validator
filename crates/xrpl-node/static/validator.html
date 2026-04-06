@@ -1,309 +1,346 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Halcyon XRPL Validator</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+
+<html class="dark" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>HALCYON XRPL | Validator Monitoring</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&amp;family=Inter:wght@300;400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500;600&amp;family=IBM+Plex+Sans:wght@300;400;500;600&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    colors: {
+                        slate: {
+                            950: "#0D1117",
+                            900: "#161B22",
+                            800: "#21262D",
+                            700: "#30363D",
+                            400: "#8B949E",
+                            500: "#6E7681"
+                        },
+                        green: {
+                            500: "#00C853",
+                            400: "#00E676",
+                            600: "#00A441"
+                        },
+                        amber: {
+                            500: "#FFD600"
+                        },
+                        red: {
+                            500: "#FF1744"
+                        }
+                    },
+                    borderRadius: {
+                        "DEFAULT": "0.125rem",
+                        "lg": "0.25rem",
+                        "xl": "0.5rem",
+                        "full": "9999px"
+                    },
+                    fontFamily: {
+                        headline: ["Space Grotesk", "sans-serif"],
+                        body: ["Inter", "sans-serif"],
+                        mono: ["IBM Plex Mono", "monospace"],
+                        label: ["IBM Plex Sans", "sans-serif"]
+                    }
+                },
+            },
+        }
+    </script>
 <style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { background: #060610; color: #c8d0e0; font-family: 'Inter', -apple-system, sans-serif; font-size: 15px; line-height: 1.6; }
-
-  .container { max-width: 960px; margin: 0 auto; padding: 0 24px; }
-
-  /* Nav */
-  nav { padding: 16px 0; border-bottom: 1px solid #12162a; }
-  nav .inner { display: flex; justify-content: space-between; align-items: center; }
-  nav .brand { font-family: 'JetBrains Mono', monospace; font-weight: 700; font-size: 14px; color: #e8ecf4; letter-spacing: 1px; }
-  nav .links { display: flex; gap: 16px; }
-  nav .links a { color: #4a5a7a; text-decoration: none; font-size: 13px; transition: color 0.2s; }
-  nav .links a:hover { color: #0085FF; }
-
-  /* Hero */
-  .hero { text-align: center; padding: 64px 0 48px; }
-  .status-badge { display: inline-flex; align-items: center; gap: 8px; padding: 6px 16px; border-radius: 20px; font-size: 12px; font-weight: 600; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 24px; }
-  .status-badge.operational { background: rgba(0,255,136,0.08); color: #00ff88; border: 1px solid rgba(0,255,136,0.2); }
-  .status-badge.degraded { background: rgba(255,217,61,0.08); color: #ffd93d; border: 1px solid rgba(255,217,61,0.2); }
-  .status-badge .dot { width: 8px; height: 8px; border-radius: 50%; animation: pulse 2s infinite; }
-  .status-badge.operational .dot { background: #00ff88; }
-  .status-badge.degraded .dot { background: #ffd93d; }
-  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
-
-  h1 { font-size: 36px; font-weight: 700; color: #e8ecf4; margin-bottom: 8px; }
-  .subtitle { font-size: 16px; color: #4a5a7a; margin-bottom: 8px; }
-  .ledger-seq { font-family: 'JetBrains Mono', monospace; font-size: 13px; color: #2a3a5a; }
-
-  /* Metrics Grid */
-  .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; padding: 0 0 48px; }
-  @media (max-width: 768px) { .metrics { grid-template-columns: repeat(2, 1fr); } }
-  .metric-card { background: #0c0c18; border: 1px solid #161a2e; border-radius: 12px; padding: 20px; text-align: center; }
-  .metric-value { font-family: 'JetBrains Mono', monospace; font-size: 28px; font-weight: 700; color: #0085FF; margin-bottom: 4px; }
-  .metric-value.green { color: #00ff88; }
-  .metric-label { font-size: 12px; color: #4a5a7a; text-transform: uppercase; letter-spacing: 1px; }
-
-  /* Sections */
-  .section { padding: 32px 0; border-top: 1px solid #12162a; }
-  .section-title { font-size: 13px; font-weight: 600; color: #4a5a7a; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 20px; }
-
-  /* Verification */
-  .verify-row { display: flex; gap: 16px; align-items: center; }
-  @media (max-width: 768px) { .verify-row { flex-direction: column; } }
-  .hash-box { flex: 1; background: #0c0c18; border: 1px solid #161a2e; border-radius: 8px; padding: 14px; }
-  .hash-box .label { font-size: 11px; color: #4a5a7a; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
-  .hash-box .hash { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #6a7a9a; word-break: break-all; }
-  .hash-box.match { border-color: rgba(0,255,136,0.3); }
-  .hash-box.match .hash { color: #00ff88; }
-  .verify-icon { font-size: 24px; color: #00ff88; flex-shrink: 0; }
-  .verify-note { font-size: 13px; color: #3a4a6a; margin-top: 12px; text-align: center; }
-
-  /* Architecture */
-  .arch-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
-  @media (max-width: 768px) { .arch-grid { grid-template-columns: 1fr; } }
-  .arch-item { background: #0c0c18; border: 1px solid #161a2e; border-radius: 8px; padding: 14px; }
-  .arch-item .label { font-size: 13px; color: #e8ecf4; font-weight: 500; margin-bottom: 4px; }
-  .arch-item .detail { font-size: 12px; color: #4a5a7a; }
-
-  /* Uptime Chart */
-  .chart-container { background: #0c0c18; border: 1px solid #161a2e; border-radius: 8px; padding: 16px; }
-  .chart-row { display: flex; gap: 2px; align-items: flex-end; height: 60px; }
-  .chart-bar { flex: 1; min-width: 2px; border-radius: 2px 2px 0 0; transition: height 0.3s; }
-  .chart-bar.match { background: #00ff88; }
-  .chart-bar.mismatch { background: #ff6b6b; }
-  .chart-legend { display: flex; gap: 16px; margin-top: 8px; font-size: 11px; color: #4a5a7a; }
-  .chart-legend .dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
-
-  /* Performance */
-  .perf-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
-  @media (max-width: 768px) { .perf-grid { grid-template-columns: 1fr; } }
-  .perf-item { text-align: center; }
-  .perf-value { font-family: 'JetBrains Mono', monospace; font-size: 20px; font-weight: 700; color: #0085FF; }
-  .perf-label { font-size: 11px; color: #4a5a7a; text-transform: uppercase; letter-spacing: 1px; margin-top: 4px; }
-
-  /* Footer */
-  footer { padding: 32px 0; border-top: 1px solid #12162a; text-align: center; }
-  .pubkey { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #2a3a5a; word-break: break-all; margin-bottom: 12px; }
-  .footer-links { display: flex; justify-content: center; gap: 24px; margin-bottom: 16px; }
-  .footer-links a { color: #4a5a7a; text-decoration: none; font-size: 12px; transition: color 0.2s; }
-  .footer-links a:hover { color: #0085FF; }
-  .tagline { font-size: 12px; color: #1a2a4a; }
-</style>
+        body {
+            background-color: #0D1117;
+            color: #C9D1D9;
+        }
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+        }
+        .status-glow {
+            box-shadow: 0 0 20px rgba(0, 200, 83, 0.15);
+        }
+        .grid-bg {
+            background-image: radial-gradient(circle at 2px 2px, #21262d 1px, transparent 0);
+            background-size: 24px 24px;
+        }
+    </style>
 </head>
-<body>
-
-<nav><div class="container inner">
-  <div class="brand">HALCYON VALIDATOR</div>
-  <div class="links">
-    <a href="/consensus">Consensus</a>
-    <a href="/peers">Peers</a>
-    
-    <a href="/dashboard">Metrics</a>
-    <a href="https://github.com/ilubxrp589/xrpl-validator" target="_blank">GitHub</a>
-  </div>
-</div></nav>
-
-<div class="container">
-
-  <!-- Hero -->
-  <div class="hero">
-    <div id="status-badge" class="status-badge operational">
-      <span class="dot"></span>
-      <span id="status-text">OPERATIONAL</span>
-    </div>
-    <h1>Halcyon XRPL Validator</h1>
-    <div class="subtitle">Independent Rust Implementation</div>
-    <div class="ledger-seq">Ledger #<span id="ledger-seq">--</span></div>
-  </div>
-
-  <!-- Key Metrics -->
-  <div class="metrics">
-    <div class="metric-card">
-      <div class="metric-value green" id="m-uptime">--</div>
-      <div class="metric-label">Uptime (24h)</div>
-    </div>
-    <div class="metric-card">
-      <div class="metric-value" id="m-matches">--</div>
-      <div class="metric-label">Consecutive Matches</div>
-    </div>
-    <div class="metric-card">
-      <div class="metric-value" id="m-objects">--</div>
-      <div class="metric-label">State Objects</div>
-    </div>
-    <div class="metric-card">
-      <div class="metric-value" id="m-round">--</div>
-      <div class="metric-label">Avg Round Time</div>
-    </div>
-  </div>
-
-  <!-- Verification -->
-  <div class="section">
-    <div class="section-title">Independent State Verification</div>
-    <div class="verify-row">
-      <div class="hash-box match" id="hash-ours-box">
-        <div class="label">Our Hash</div>
-        <div class="hash" id="hash-ours">--</div>
-      </div>
-      <div class="verify-icon" id="verify-icon">=</div>
-      <div class="hash-box match" id="hash-net-box">
-        <div class="label">Network Hash</div>
-        <div class="hash" id="hash-net">--</div>
-      </div>
-    </div>
-    <div class="verify-note">
-      Independently computing SHA-512Half Merkle root over <span id="obj-count">18.7M+</span> state objects every ledger
-    </div>
-  </div>
-
-  <!-- Performance -->
-  <div class="section">
-    <div class="section-title">Performance</div>
-    <div class="perf-grid">
-      <div class="perf-item">
-        <div class="perf-value" id="p-compute">--</div>
-        <div class="perf-label">Hash Compute</div>
-      </div>
-      <div class="perf-item">
-        <div class="perf-value" id="p-round">--</div>
-        <div class="perf-label">Round Time</div>
-      </div>
-      <div class="perf-item">
-        <div class="perf-value" id="p-peers">--</div>
-        <div class="perf-label">Connected Peers</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Uptime Chart -->
-  <div class="section">
-    <div class="section-title">Recent Ledger History</div>
-    <div class="chart-container">
-      <div class="chart-row" id="chart"></div>
-      <div class="chart-legend">
-        <span><span class="dot" style="background:#00ff88"></span>Match</span>
-        <span><span class="dot" style="background:#ff6b6b"></span>Mismatch</span>
-      </div>
-    </div>
-  </div>
-
-  <!-- Architecture -->
-  <div class="section">
-    <div class="section-title">Architecture</div>
-    <div class="arch-grid">
-      <div class="arch-item">
-        <div class="label">100% Rust</div>
-        <div class="detail">Zero rippled code. Fully independent implementation.</div>
-      </div>
-      <div class="arch-item">
-        <div class="label">SHAMap Verification</div>
-        <div class="detail">65,536-bucket parallel hash with dirty tracking via rayon.</div>
-      </div>
-      <div class="arch-item">
-        <div class="label">RocksDB State</div>
-        <div class="detail">18.7M+ objects persisted. Incremental sync every ledger.</div>
-      </div>
-      <div class="arch-item">
-        <div class="label">Ed25519 Signing</div>
-        <div class="detail">Validation signing with ephemeral keys and manifest broadcast.</div>
-      </div>
-      <div class="arch-item">
-        <div class="label">SHA-NI Acceleration</div>
-        <div class="detail">Hardware SHA-512 on AMD Ryzen. 15ms hash over 18.7M objects.</div>
-      </div>
-      <div class="arch-item">
-        <div class="label">Domain Verified</div>
-        <div class="detail">halcyon-names.io with xrp-ledger.toml verification.</div>
-      </div>
-    </div>
-  </div>
-
+<body class="font-body antialiased min-h-screen flex flex-col">
+<!-- TopNavBar - Shared Component -->
+<header class="bg-slate-950 text-green-500 font-mono text-sm tracking-tight docked full-width top-0 border-b border-slate-800 flex justify-between items-center px-6 w-full h-14 z-50 fixed">
+<div class="flex items-center gap-8">
+<span class="text-xl font-black tracking-tighter text-green-500">HALCYON XRPL</span>
+<nav class="hidden md:flex gap-6">
+<a class="text-green-400 border-b-2 border-green-500 pb-1 transition-colors duration-150" href="#">Dashboard</a>
+<a class="text-slate-400 hover:text-green-300 hover:bg-slate-900 transition-colors duration-150" href="#">Ledger</a>
+<a class="text-slate-400 hover:text-green-300 hover:bg-slate-900 transition-colors duration-150" href="#">Network</a>
+<a class="text-slate-400 hover:text-green-300 hover:bg-slate-900 transition-colors duration-150" href="#">Governance</a>
+<a class="text-slate-400 hover:text-green-300 hover:bg-slate-900 transition-colors duration-150" href="#">Config</a>
+</nav>
 </div>
-
-<footer><div class="container">
-  <div class="pubkey" id="pubkey">Loading...</div>
-  <div class="footer-links">
-    <a href="/incidents">Incident Log</a>
-    <a href="/metrics">Prometheus Metrics</a>
-    <a href="/.well-known/xrp-ledger.toml">xrp-ledger.toml</a>
-  </div>
-  <div class="tagline">Built with Rust. Verified by math.</div>
-</div></footer>
-
-<script>
-async function poll() {
-  try {
-    const [stateRes, histRes, crawlRes] = await Promise.all([
-      fetch('/api/state-hash'),
-      fetch('/api/history'),
-      fetch('/crawl'),
-    ]);
-    const state = await stateRes.json();
-    const hist = await histRes.json();
-    const crawl = await crawlRes.json();
-
-    // Status
-    const badge = document.getElementById('status-badge');
-    const statusText = document.getElementById('status-text');
-    if (state.consecutive_matches > 3) {
-      badge.className = 'status-badge operational';
-      statusText.textContent = 'OPERATIONAL';
-    } else {
-      badge.className = 'status-badge degraded';
-      statusText.textContent = 'SYNCING';
-    }
-
-    // Ledger
-    document.getElementById('ledger-seq').textContent = state.ledger_seq?.toLocaleString() || '--';
-
-    // Metrics
-    const s24 = hist['24h'] || {};
-    document.getElementById('m-uptime').textContent = s24.uptime_pct ? s24.uptime_pct.toFixed(2) + '%' : '--';
-    document.getElementById('m-matches').textContent = state.consecutive_matches?.toLocaleString() || '--';
-    const objs = state.db_entries || (state.bulk_sync || {}).objects_synced || 0;
-    document.getElementById('m-objects').textContent = objs > 1000000 ? (objs / 1000000).toFixed(1) + 'M' : objs.toLocaleString();
-    document.getElementById('obj-count').textContent = objs > 1000000 ? (objs / 1000000).toFixed(1) + 'M' : objs.toLocaleString();
-    document.getElementById('m-round').textContent = s24.avg_round_time_ms ? s24.avg_round_time_ms.toFixed(0) + 'ms' : '--';
-
-    // Hashes
-    const ours = state.computed_hash || '';
-    const net = state.network_hash || '';
-    document.getElementById('hash-ours').textContent = ours || '--';
-    document.getElementById('hash-net').textContent = net || '--';
-    const match = ours && net && ours.toUpperCase() === net.toUpperCase();
-    document.getElementById('hash-ours-box').className = 'hash-box' + (match ? ' match' : '');
-    document.getElementById('hash-net-box').className = 'hash-box' + (match ? ' match' : '');
-    document.getElementById('verify-icon').textContent = match ? '=' : '\u2260';
-    document.getElementById('verify-icon').style.color = match ? '#00ff88' : '#ff6b6b';
-
-    // Performance
-    const latest = (state.sync_log || [])[0];
-    if (latest) {
-      document.getElementById('p-round').textContent = (latest.time_secs * 1000).toFixed(0) + 'ms';
-    }
-    document.getElementById('p-compute').textContent = state.compute_time_secs !== undefined
-      ? (state.compute_time_secs * 1000).toFixed(1) + 'ms' : '--';
-    document.getElementById('p-peers').textContent = crawl?.counts?.connected || '--';
-
-    // Chart — recent entries from history
-    const recent = hist.recent || [];
-    const chart = document.getElementById('chart');
-    if (recent.length > 0) {
-      const maxTime = Math.max(...recent.map(e => e.round_time_ms), 1);
-      chart.innerHTML = recent.slice(0, 100).reverse().map(e => {
-        const h = Math.max(4, (e.round_time_ms / maxTime) * 56);
-        const cls = e.matched ? 'match' : 'mismatch';
-        return `<div class="chart-bar ${cls}" style="height:${h}px" title="#${e.seq} ${e.round_time_ms}ms"></div>`;
-      }).join('');
-    }
-
-    // Public key
-    if (crawl?.server?.pubkey_node) {
-      document.getElementById('pubkey').textContent = crawl.server.pubkey_node;
-    }
-
-  } catch(e) { console.error('poll error', e); }
-}
-
-poll();
-setInterval(poll, 5000);
-</script>
-</body>
-</html>
+<div class="flex items-center gap-4">
+<div class="hidden sm:flex items-center gap-2 px-3 py-1 bg-slate-900 border border-slate-800 rounded">
+<span class="material-symbols-outlined text-xs">search</span>
+<span class="text-slate-500 uppercase text-[10px]">search_ledger...</span>
+</div>
+<span class="material-symbols-outlined text-slate-400 cursor-pointer hover:text-green-300">settings</span>
+<span class="material-symbols-outlined text-slate-400 cursor-pointer hover:text-green-300">notifications_active</span>
+<img alt="Validator Node Admin" class="w-8 h-8 rounded border border-slate-700" data-alt="abstract circular server farm visual with green circuit patterns representing node administrative control panel avatar" src="https://lh3.googleusercontent.com/aida-public/AB6AXuD2GGTqZC1AluMfHK-aFo4rO-y0qddI1aiMT2uXuF5gxqwR9F67bxfnNkb6LRkkjvhCITjQ_MpB_YpIkLgL4GT_r81LHBSbFn09HWfVf-pF9gcloPx5W5YR7DQ8YbQbvqGMBaWXRtN92b-1IhdxO4U6YJG4VD95TT0DG-UT_m5rd2uauOQL8842tFJ0tZGqTV54h2IvBkuLJhu-KYHJFfOXcBYGvFfzorXbwaR_igzwzkR97DrqBh9EhvBU6TlN5G7WH4wLNWc83n8"/>
+</div>
+</header>
+<!-- SideNavBar - Shared Component -->
+<aside class="bg-slate-950 text-green-500 font-mono text-xs fixed left-0 top-14 flex flex-col items-center py-4 space-y-6 docked left-0 h-screen border-r border-slate-800 w-20 z-40">
+<div class="flex flex-col items-center gap-1 mb-4">
+<span class="material-symbols-outlined text-2xl text-green-500">memory</span>
+<span class="text-[10px] text-slate-500 font-bold">NODE-01</span>
+</div>
+<div class="flex flex-col gap-8 w-full">
+<button class="flex flex-col items-center gap-1 w-full py-2 bg-green-500/10 text-green-500 border-r-2 border-green-500 scale-95 duration-75">
+<span class="material-symbols-outlined">monitoring</span>
+<span>Real-time</span>
+</button>
+<button class="flex flex-col items-center gap-1 w-full py-2 text-slate-500 hover:bg-slate-900 hover:text-slate-300 scale-95 duration-75">
+<span class="material-symbols-outlined">history</span>
+<span>Historical</span>
+</button>
+<button class="flex flex-col items-center gap-1 w-full py-2 text-slate-500 hover:bg-slate-900 hover:text-slate-300 scale-95 duration-75">
+<span class="material-symbols-outlined">terminal</span>
+<span>Logs</span>
+</button>
+<button class="flex flex-col items-center gap-1 w-full py-2 text-slate-500 hover:bg-slate-900 hover:text-slate-300 scale-95 duration-75">
+<span class="material-symbols-outlined">hub</span>
+<span>Peers</span>
+</button>
+<button class="flex flex-col items-center gap-1 w-full py-2 text-slate-500 hover:bg-slate-900 hover:text-slate-300 scale-95 duration-75">
+<span class="material-symbols-outlined">pulse_alert</span>
+<span>Health</span>
+</button>
+</div>
+</aside>
+<!-- Main Content Canvas -->
+<main class="flex-grow ml-20 mt-14 p-6 space-y-6 grid-bg">
+<!-- SECTION 1: HERO BANNER -->
+<section class="relative bg-slate-900 border border-slate-800 rounded-lg p-8 overflow-hidden group">
+<div class="absolute inset-0 bg-gradient-to-br from-green-500/5 via-transparent to-transparent"></div>
+<div class="relative z-10 flex flex-col md:flex-row justify-between items-end gap-6">
+<div>
+<h1 class="font-headline text-4xl font-black tracking-tighter text-white mb-1">HALCYON VALIDATOR</h1>
+<p class="font-mono text-slate-500 text-sm tracking-widest">halcyon-names.io</p>
+</div>
+<div class="text-right">
+<div class="font-mono text-6xl font-black text-green-500 drop-shadow-[0_0_15px_rgba(0,200,83,0.3)]">
+                        100.00%
+                    </div>
+<div class="font-mono text-xs text-green-500 tracking-wider font-bold">MAINNET AGREEMENT</div>
+</div>
+</div>
+<div class="relative z-10 mt-8 pt-6 border-t border-slate-800/50 flex flex-wrap gap-x-8 gap-y-2 font-mono text-[11px] text-slate-400">
+<div class="flex items-center gap-2">
+<span class="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
+                    Ledger <span class="text-slate-200">#103,363,812</span>
+</div>
+<div>18.8M objects</div>
+<div class="flex items-center gap-1">State hash <span class="text-green-500 font-bold">✓ MATCH</span></div>
+<div>284 ledgers verified</div>
+</div>
+</section>
+<!-- SECTION 2: FFI ENGINE -->
+<section class="bg-slate-900 border border-slate-800 rounded-lg overflow-hidden flex flex-col">
+<div class="bg-slate-800/40 px-6 py-3 flex justify-between items-center">
+<div class="flex items-center gap-2">
+<span class="material-symbols-outlined text-slate-400 text-sm">settings_input_component</span>
+<h2 class="font-headline font-bold text-slate-200 uppercase tracking-wider text-xs">libxrpl FFI Engine</h2>
+</div>
+<span class="bg-slate-700 text-slate-300 font-mono text-[10px] px-2 py-0.5 rounded">3.2.0-b0</span>
+</div>
+<div class="p-6 grid grid-cols-1 lg:grid-cols-2 gap-8">
+<!-- Stats Grid -->
+<div class="space-y-6">
+<div class="grid grid-cols-4 gap-4 border-b border-slate-800 pb-4">
+<div class="flex flex-col">
+<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">Applied</span>
+<span class="font-mono text-xl text-slate-200">53,930</span>
+</div>
+<div class="flex flex-col">
+<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">Diverged</span>
+<span class="font-mono text-xl text-red-500">0</span>
+</div>
+<div class="flex flex-col">
+<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">Verified</span>
+<span class="font-mono text-xl text-slate-200">284</span>
+</div>
+<div class="flex flex-col">
+<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">p50 Latency</span>
+<span class="font-mono text-xl text-green-500">0.4ms</span>
+</div>
+</div>
+<div class="grid grid-cols-4 gap-4">
+<div class="flex flex-col">
+<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">tesSUCCESS</span>
+<span class="font-mono text-xl text-slate-200">89.4%</span>
+</div>
+<div class="flex flex-col">
+<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">tecClaimed</span>
+<span class="font-mono text-xl text-slate-200">10.6%</span>
+</div>
+<div class="flex flex-col">
+<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">p95 Latency</span>
+<span class="font-mono text-xl text-amber-500">38ms</span>
+</div>
+<div class="flex flex-col">
+<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">p99 Latency</span>
+<span class="font-mono text-xl text-slate-200">125ms</span>
+</div>
+</div>
+</div>
+<!-- Tx Visuals -->
+<div class="flex flex-col justify-between">
+<div class="space-y-4">
+<div class="flex flex-col gap-1.5">
+<div class="flex justify-between font-mono text-[10px] text-slate-400">
+<span>OfferCancel</span>
+<span>42%</span>
+</div>
+<div class="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
+<div class="bg-green-500 h-full w-[42%]"></div>
+</div>
+</div>
+<div class="flex flex-col gap-1.5">
+<div class="flex justify-between font-mono text-[10px] text-slate-400">
+<span>OfferCreate</span>
+<span>38%</span>
+</div>
+<div class="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
+<div class="bg-blue-500 h-full w-[38%]"></div>
+</div>
+</div>
+<div class="flex flex-col gap-1.5">
+<div class="flex justify-between font-mono text-[10px] text-slate-400">
+<span>Payment</span>
+<span>20%</span>
+</div>
+<div class="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
+<div class="bg-slate-400 h-full w-[20%]"></div>
+</div>
+</div>
+</div>
+<div class="flex gap-4 mt-6">
+<div class="px-3 py-2 border border-slate-800 rounded bg-slate-900 flex-1">
+<div class="font-mono text-[9px] text-slate-500 mb-1">TOP TER CODE</div>
+<div class="font-mono text-sm text-green-400">tesSUCCESS</div>
+</div>
+<div class="px-3 py-2 border border-slate-800 rounded bg-slate-900 flex-1">
+<div class="font-mono text-[9px] text-slate-500 mb-1">ENGINE UPTIME</div>
+<div class="font-mono text-sm text-slate-200">72:14:05</div>
+</div>
+</div>
+</div>
+</div>
+</section>
+<!-- SECTION 3: NETWORK + CONSENSUS -->
+<section class="grid grid-cols-1 md:grid-cols-2 gap-6">
+<!-- Network Card -->
+<div class="bg-slate-900 border border-slate-800 rounded-lg p-6 flex flex-col justify-between">
+<div>
+<h3 class="font-headline text-xs font-bold text-slate-500 uppercase tracking-widest mb-6">Network Topology</h3>
+<div class="space-y-4">
+<div class="flex justify-between items-center">
+<span class="font-body text-sm text-slate-300">Peers Connected</span>
+<span class="font-mono text-sm text-green-500">8</span>
+</div>
+<div class="flex justify-between items-center">
+<span class="font-body text-sm text-slate-300">Peer Discovery</span>
+<span class="flex items-center gap-2 font-mono text-[10px] px-2 py-0.5 bg-green-500/10 text-green-500 rounded border border-green-500/20">
+                                ACTIVE
+                            </span>
+</div>
+<div class="flex justify-between items-center">
+<span class="font-body text-sm text-slate-300">Validation Relay</span>
+<span class="font-mono text-sm text-slate-200">4 endpoints</span>
+</div>
+</div>
+</div>
+<div class="mt-8">
+<img alt="Network Map" class="w-full h-24 object-cover rounded border border-slate-800 opacity-50 grayscale hover:grayscale-0 transition-all" data-alt="abstract tech visualization of interconnected global data points with glowing neon lines on a dark digital world map background" src="https://lh3.googleusercontent.com/aida-public/AB6AXuBsvTGeHv_riC0O63dNKxKIXXiB9PfoHoWVPnzBOXOrn83dNtes39nmZfkvtZqkhSt8G9_H8_Ozm-vVSKYW42wqEZpIFJpkemmH-b76N_91G3DCKs8FutiY1A77yLvAeRjDoT2cIUWZwj2BThYBBcxft1oasXDZLEzs3Y9XYYbZL6wIeEKBYLw6shbGvkzpGyAsz_B2RDj9QM9mwtLNjt1A01vop7ycMxpElXP9au09FdeB6QSVuNb8WNwZXHe236iKHAmrnSTgWc8"/>
+</div>
+</div>
+<!-- Consensus Card -->
+<div class="bg-slate-900 border border-slate-800 rounded-lg p-6 flex flex-col justify-between">
+<div>
+<h3 class="font-headline text-xs font-bold text-slate-500 uppercase tracking-widest mb-6">Consensus Engine</h3>
+<div class="space-y-4">
+<div class="flex justify-between items-center">
+<span class="font-body text-sm text-slate-300">UNL Active</span>
+<span class="font-mono text-sm text-slate-200">35 validators</span>
+</div>
+<div class="flex justify-between items-center">
+<span class="font-body text-sm text-slate-300">Agreement Level</span>
+<span class="font-mono text-sm text-green-500">33/35 (94%)</span>
+</div>
+<div class="flex justify-between items-center">
+<span class="font-body text-sm text-slate-300">Current Phase</span>
+<span class="font-mono text-sm text-amber-500 italic">open</span>
+</div>
+<div class="flex justify-between items-center">
+<span class="font-body text-sm text-slate-300">Proposals Tracked</span>
+<span class="font-mono text-sm text-slate-200">12,450</span>
+</div>
+</div>
+</div>
+<div class="mt-8 pt-4 border-t border-slate-800">
+<div class="flex justify-between mb-2">
+<span class="text-[9px] font-mono text-slate-500 uppercase">State Hash Streak</span>
+<span class="text-[9px] font-mono text-green-500">284 consecutive matches</span>
+</div>
+<div class="w-full h-1 bg-slate-800 rounded-full overflow-hidden">
+<div class="h-full bg-green-500 w-[85%]"></div>
+</div>
+</div>
+</div>
+</section>
+<!-- SECTION 4: VALIDATOR IDENTITY -->
+<section class="bg-slate-900 border border-slate-800 rounded-lg p-6">
+<div class="flex flex-wrap items-center gap-4 mb-6">
+<span class="bg-slate-800 text-[10px] font-mono px-2 py-1 rounded text-slate-300 border border-slate-700">FFI ENABLED</span>
+<span class="bg-slate-800 text-[10px] font-mono px-2 py-1 rounded text-slate-300 border border-slate-700">libxrpl 3.2.0-b0</span>
+<span class="bg-slate-800 text-[10px] font-mono px-2 py-1 rounded text-slate-300 border border-slate-700">RUST + C++</span>
+</div>
+<div class="grid grid-cols-1 md:grid-cols-2 gap-y-4 gap-x-12">
+<div class="flex flex-col gap-1">
+<span class="text-[9px] font-bold text-slate-500 uppercase">Domain</span>
+<span class="font-mono text-sm text-slate-200 break-all">halcyon-names.io</span>
+</div>
+<div class="flex flex-col gap-1">
+<span class="text-[9px] font-bold text-slate-500 uppercase">Signing Key</span>
+<span class="font-mono text-sm text-slate-400 break-all">0225BBFD07C6BC2A89F735EB649983196EF5F7B46F35</span>
+</div>
+<div class="flex flex-col gap-1">
+<span class="text-[9px] font-bold text-slate-500 uppercase">Master Public Key</span>
+<span class="font-mono text-sm text-slate-400 break-all">ed9f67a12666a4225381f728c46765798951010368a5</span>
+</div>
+<div class="flex flex-col gap-1">
+<span class="text-[9px] font-bold text-slate-500 uppercase">Manifest Status</span>
+<div class="flex items-center gap-3">
+<span class="font-mono text-sm text-slate-200">233 bytes</span>
+<span class="text-slate-600">|</span>
+<span class="font-mono text-sm text-slate-200">Seq 1</span>
+</div>
+</div>
+</div>
+</section>
+</main>
+<!-- Footer - Shared Component -->
+<footer class="bg-slate-950 text-green-600 font-mono text-[10px] uppercase tracking-widest flex justify-between items-center px-6 py-2 w-full docked full-width bottom-0 border-t border-slate-900">
+<div class="flex items-center gap-4">
+<span class="text-green-500 font-bold">HALCYON XRPL VALIDATOR • SYSTEM_UPTIME: 99.998%</span>
+</div>
+<div class="hidden md:flex items-center gap-6">
+<a class="text-slate-600 hover:text-green-400 transition-none" href="#">Validator Keys</a>
+<a class="text-slate-600 hover:text-green-400 transition-none" href="#">Manifest</a>
+<a class="text-slate-600 hover:text-green-400 transition-none" href="#">UNL Policy</a>
+<a class="text-slate-600 hover:text-green-400 transition-none" href="#">Documentation</a>
+</div>
+</footer>
+</body></html>
