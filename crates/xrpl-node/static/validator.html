@@ -336,11 +336,10 @@ function histPct(buckets, count, p) {
 
 async function tick() {
     try {
-        const [eng, cons, sh, status] = await Promise.all([
+        const [eng, cons, sh] = await Promise.all([
             fetch('/api/engine').then(r => r.json()),
             fetch('/api/consensus').then(r => r.json()),
             fetch('/api/state-hash').then(r => r.json()),
-            fetch('/api/status').then(r => r.json()).catch(() => ({})),
         ]);
         const f = eng.ffi_verifier || {};
         const att = f.live_apply_attempted || 0;
@@ -382,22 +381,13 @@ async function tick() {
         $('ffi-p95').textContent = histPct(buckets, durCount, 0.95);
         $('ffi-p99').textContent = histPct(buckets, durCount, 0.99);
 
-        // Sync indicator
-        const bs = status.bulk_sync || {};
+        // Sync indicator — infer from FFI state
         const syncEl = $('hero-sync');
-        if (bs.running) {
-            const synced = bs.objects_synced || 0;
-            syncEl.textContent = '⟳ SYNCING: ' + fmt(synced) + ' objects...';
+        if (att === 0 && (f.ledgers_applied || 0) === 0) {
+            syncEl.textContent = '⟳ SYNCING STATE...';
             syncEl.classList.remove('hidden');
         } else {
             syncEl.classList.add('hidden');
-        }
-
-        // Object count from status
-        const entries = status.marker_count || eng.entry_count || 0;
-        if (entries > 0) {
-            const m = (entries / 1_000_000).toFixed(1);
-            $('hero-objects').textContent = m + 'M objects';
         }
 
         // Tx type bars — per-ledger round (resets each new ledger)
