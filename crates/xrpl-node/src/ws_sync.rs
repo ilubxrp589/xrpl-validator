@@ -145,12 +145,8 @@ pub async fn start_ws_sync(
                         }
                     }
                     // FFI independent verification — blocking, spawn off-thread.
-                    // Uses pure RPC path (no DB snapshot) to avoid libxrpl
-                    // crashes from stale state during catchup. The OwnedSnapshot
-                    // approach is correct in steady state but lethal during
-                    // gap-fill where DB is many ledgers behind verify target.
-                    // TODO: enable DB snapshot once we detect steady state
-                    // (last_synced within 1 ledger of process_seq).
+                    // Use OwnedSnapshot when DB is caught up (steady state),
+                    // fall back to pure RPC during catchup (stale DB = crash).
                     #[cfg(feature = "ffi")]
                     if meta_ok {
                         if let Some(ref verifier) = ffi_verifier {
@@ -159,15 +155,29 @@ pub async fn start_ws_sync(
                                 let v = verifier.clone();
                                 let hdr = ledger_header.clone();
                                 let seq = process_seq;
-                                tokio::task::spawn_blocking(move || {
-                                    v.verify_ledger(
-                                        seq,
-                                        &tx_blobs,
-                                        hdr.parent_hash,
-                                        hdr.parent_close_time,
-                                        hdr.total_drops,
+                                // Steady state = last successful DB write is
+                                // within 2 ledgers of what we're verifying.
+                                let synced = last_synced.load(Ordering::Acquire);
+                                let steady = synced > 0 && process_seq.saturating_sub(synced) <= 2;
+                                if steady {
+                                    let snap = std::sync::Arc::new(
+                                        crate::ffi_engine::OwnedSnapshot::new(db.clone())
                                     );
-                                });
+                                    tokio::task::spawn_blocking(move || {
+                                        v.verify_ledger_with_snapshot(
+                                            seq, &tx_blobs,
+                                            hdr.parent_hash, hdr.parent_close_time, hdr.total_drops,
+                                            Some(snap.as_ref()),
+                                        );
+                                    });
+                                } else {
+                                    tokio::task::spawn_blocking(move || {
+                                        v.verify_ledger(
+                                            seq, &tx_blobs,
+                                            hdr.parent_hash, hdr.parent_close_time, hdr.total_drops,
+                                        );
+                                    });
+                                }
                             }
                         }
                     }
@@ -327,11 +337,18 @@ async fn fetch_ledger_tx_blobs(rpc: &RippledClient, seq: u32) -> Vec<Vec<u8>> {
     let txs = body["result"]["ledger"]["transactions"].as_array().unwrap_or(&empty);
     // Pair each blob with its TransactionIndex extracted from the meta blob.
     // Meta prefix: sfTransactionIndex = 0x20 0x1C + u32 big-endian.
+    // Pseudo-tx type IDs (network-generated, no signature, skip FFI verify)
+    const PSEUDO_TX_TYPES: [u16; 3] = [100, 101, 102]; // EnableAmendment, SetFee, UNLModify
     let mut ordered: Vec<(u32, Vec<u8>)> = Vec::with_capacity(txs.len());
     for tx in txs.iter() {
         let tx_blob_hex = tx["tx_blob"].as_str().or_else(|| tx.as_str());
         let Some(hex_str) = tx_blob_hex else { continue; };
         let Ok(bytes) = hex::decode(hex_str) else { continue; };
+        // Skip pseudo-txs: first byte 0x12 (sfTransactionType), next 2 bytes = type u16
+        if bytes.len() >= 3 && bytes[0] == 0x12 {
+            let tt = u16::from_be_bytes([bytes[1], bytes[2]]);
+            if PSEUDO_TX_TYPES.contains(&tt) { continue; }
+        }
         let meta_hex = tx["meta"].as_str().unwrap_or("");
         let idx = if meta_hex.len() >= 12 {
             let meta_bytes = hex::decode(&meta_hex[..12]).unwrap_or_default();
