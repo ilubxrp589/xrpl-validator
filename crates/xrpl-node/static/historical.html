@@ -148,14 +148,16 @@ let chartData = []; // stored for hover lookup
 
 function drawChart(rawHistory) {
     const canvas = $('wallet-chart');
+    const container = canvas ? canvas.parentElement : null;
     // Filter out pre-scan entries (wallet count < 1M = scan not done yet)
     const history = rawHistory ? rawHistory.filter(e => e[1] > 1000000) : [];
-    if (!canvas || history.length < 2) return;
+    if (!canvas || !container || history.length < 2) return;
     chartData = history;
     const ctx = canvas.getContext('2d');
     const dpr = window.devicePixelRatio || 1;
-    const w = canvas.width = canvas.offsetWidth * dpr;
-    const h = canvas.height = canvas.offsetHeight * dpr;
+    const rect = container.getBoundingClientRect();
+    const w = canvas.width = Math.round(rect.width * dpr);
+    const h = canvas.height = Math.round(rect.height * dpr);
     ctx.clearRect(0, 0, w, h);
 
     const rawVals = history.map(e => e[1]);
@@ -211,7 +213,7 @@ function drawChart(rawHistory) {
     ctx.fill();
 
     // Axis labels
-    $('chart-start').textContent = '#' + fmt(seqs[0]);
+    $('chart-start').textContent = '#' + fmt(seqs[0]) + ' (delta: +' + Math.min(...vals) + ' to +' + Math.max(...vals) + ')';
     $('chart-end').textContent = '#' + fmt(seqs[seqs.length - 1]);
 }
 
