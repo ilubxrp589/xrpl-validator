@@ -161,38 +161,42 @@
 <div class="space-y-6">
 <div class="grid grid-cols-4 gap-4 border-b border-slate-800 pb-4">
 <div class="flex flex-col">
-<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">Applied</span>
+<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">Txs Applied via FFI</span>
 <span class="font-mono text-xl text-slate-200" id="ffi-applied">53,930</span>
 </div>
 <div class="flex flex-col">
-<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">Diverged</span>
+<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">Disagreements</span>
 <span class="font-mono text-xl text-red-500" id="ffi-diverged">0</span>
 </div>
 <div class="flex flex-col">
-<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">Verified</span>
+<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">Ledgers Verified</span>
 <span class="font-mono text-xl text-slate-200" id="ffi-ledgers">284</span>
 </div>
 <div class="flex flex-col">
-<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">p50 Latency</span>
+<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">Median Apply Time</span>
 <span class="font-mono text-xl text-green-500" id="ffi-p50">0.4ms</span>
 </div>
 </div>
 <div class="grid grid-cols-4 gap-4">
 <div class="flex flex-col">
-<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">tesSUCCESS</span>
+<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">Succeeded (tesSUCCESS)</span>
 <span class="font-mono text-xl text-slate-200" id="ffi-success-pct">89.4%</span>
+<span class="text-[8px] text-slate-600 mt-0.5">tx applied, state changed</span>
 </div>
 <div class="flex flex-col">
-<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">tecClaimed</span>
+<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">Claimed (tec*)</span>
 <span class="font-mono text-xl text-slate-200" id="ffi-claimed-pct">10.6%</span>
+<span class="text-[8px] text-slate-600 mt-0.5">fee paid, tx rejected by rules</span>
 </div>
 <div class="flex flex-col">
-<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">p95 Latency</span>
+<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">95th % Apply Time</span>
 <span class="font-mono text-xl text-amber-500" id="ffi-p95">38ms</span>
+<span class="text-[8px] text-slate-600 mt-0.5">95% of txs faster than this</span>
 </div>
 <div class="flex flex-col">
-<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">p99 Latency</span>
+<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">99th % Apply Time</span>
 <span class="font-mono text-xl text-slate-200" id="ffi-p99">125ms</span>
+<span class="text-[8px] text-slate-600 mt-0.5">worst-case (slowest 1%)</span>
 </div>
 </div>
 </div>
