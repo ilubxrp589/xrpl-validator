@@ -470,6 +470,10 @@ pub struct FfiStats {
     pub apply_by_type: std::collections::BTreeMap<String, u64>,
     /// Number of ledgers fully applied (for throughput metrics)
     pub ledgers_applied: u64,
+    /// Per-round (current ledger) tx type counts — resets each ledger.
+    pub round_tx_types: std::collections::BTreeMap<String, u64>,
+    pub round_tx_count: u64,
+    pub round_ledger_seq: u32,
 }
 
 /// Histogram bucket bounds (in milliseconds) for apply latency.
@@ -869,6 +873,13 @@ pub fn apply_ledger_in_order(
         increment_drops: 200_000,   // Mainnet: 0.2 XRP
     };
 
+    // Reset per-round stats for this ledger
+    {
+        let mut s = stats.lock();
+        s.round_tx_types.clear();
+        s.round_tx_count = 0;
+        s.round_ledger_seq = ledger_seq;
+    }
     let mut tx_num = 0u32;
     let mut overlay_hits = 0u32;
     for tx_bytes in txs_in_order {
@@ -982,6 +993,8 @@ pub fn apply_ledger_in_order(
         s.live_apply_last_ms = elapsed_ms;
         *s.live_apply_ter_counts.entry(outcome.ter_name).or_insert(0) += 1;
         *s.apply_by_type.entry(tx_type.clone()).or_insert(0) += 1;
+        *s.round_tx_types.entry(tx_type.clone()).or_insert(0) += 1;
+        s.round_tx_count += 1;
         // Histogram: find the first bucket bound >= elapsed_ms, increment it
         // and every bucket after (Prometheus cumulative convention).
         s.apply_duration_count += 1;
