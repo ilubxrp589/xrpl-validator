@@ -131,7 +131,7 @@
 </div>
 <div class="text-right">
 <div class="font-mono text-6xl font-black text-green-500 drop-shadow-[0_0_15px_rgba(0,200,83,0.3)]">
-                        100.00%
+                        <span id="agreement-pct">100.00</span>%
                     </div>
 <div class="font-mono text-xs text-green-500 tracking-wider font-bold">MAINNET AGREEMENT</div>
 </div>
@@ -139,11 +139,11 @@
 <div class="relative z-10 mt-8 pt-6 border-t border-slate-800/50 flex flex-wrap gap-x-8 gap-y-2 font-mono text-[11px] text-slate-400">
 <div class="flex items-center gap-2">
 <span class="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
-                    Ledger <span class="text-slate-200">#103,363,812</span>
+                    Ledger <span class="text-slate-200" id="hero-ledger">#103,363,812</span>
 </div>
-<div>18.8M objects</div>
-<div class="flex items-center gap-1">State hash <span class="text-green-500 font-bold">✓ MATCH</span></div>
-<div>284 ledgers verified</div>
+<div id="hero-objects">18.8M objects</div>
+<div class="flex items-center gap-1">State hash <span class="text-green-500 font-bold" id="hero-hash-status">✓ MATCH</span></div>
+<div id="hero-ledgers-verified">284 ledgers verified</div>
 </div>
 </section>
 <!-- SECTION 2: FFI ENGINE -->
@@ -161,37 +161,37 @@
 <div class="grid grid-cols-4 gap-4 border-b border-slate-800 pb-4">
 <div class="flex flex-col">
 <span class="text-[10px] text-slate-500 font-bold uppercase mb-1">Applied</span>
-<span class="font-mono text-xl text-slate-200">53,930</span>
+<span class="font-mono text-xl text-slate-200" id="ffi-applied">53,930</span>
 </div>
 <div class="flex flex-col">
 <span class="text-[10px] text-slate-500 font-bold uppercase mb-1">Diverged</span>
-<span class="font-mono text-xl text-red-500">0</span>
+<span class="font-mono text-xl text-red-500" id="ffi-diverged">0</span>
 </div>
 <div class="flex flex-col">
 <span class="text-[10px] text-slate-500 font-bold uppercase mb-1">Verified</span>
-<span class="font-mono text-xl text-slate-200">284</span>
+<span class="font-mono text-xl text-slate-200" id="ffi-ledgers">284</span>
 </div>
 <div class="flex flex-col">
 <span class="text-[10px] text-slate-500 font-bold uppercase mb-1">p50 Latency</span>
-<span class="font-mono text-xl text-green-500">0.4ms</span>
+<span class="font-mono text-xl text-green-500" id="ffi-p50">0.4ms</span>
 </div>
 </div>
 <div class="grid grid-cols-4 gap-4">
 <div class="flex flex-col">
 <span class="text-[10px] text-slate-500 font-bold uppercase mb-1">tesSUCCESS</span>
-<span class="font-mono text-xl text-slate-200">89.4%</span>
+<span class="font-mono text-xl text-slate-200" id="ffi-success-pct">89.4%</span>
 </div>
 <div class="flex flex-col">
 <span class="text-[10px] text-slate-500 font-bold uppercase mb-1">tecClaimed</span>
-<span class="font-mono text-xl text-slate-200">10.6%</span>
+<span class="font-mono text-xl text-slate-200" id="ffi-claimed-pct">10.6%</span>
 </div>
 <div class="flex flex-col">
 <span class="text-[10px] text-slate-500 font-bold uppercase mb-1">p95 Latency</span>
-<span class="font-mono text-xl text-amber-500">38ms</span>
+<span class="font-mono text-xl text-amber-500" id="ffi-p95">38ms</span>
 </div>
 <div class="flex flex-col">
 <span class="text-[10px] text-slate-500 font-bold uppercase mb-1">p99 Latency</span>
-<span class="font-mono text-xl text-slate-200">125ms</span>
+<span class="font-mono text-xl text-slate-200" id="ffi-p99">125ms</span>
 </div>
 </div>
 </div>
@@ -248,7 +248,7 @@
 <div class="space-y-4">
 <div class="flex justify-between items-center">
 <span class="font-body text-sm text-slate-300">Peers Connected</span>
-<span class="font-mono text-sm text-green-500">8</span>
+<span class="font-mono text-sm text-green-500" id="net-peers">8</span>
 </div>
 <div class="flex justify-between items-center">
 <span class="font-body text-sm text-slate-300">Peer Discovery</span>
@@ -273,29 +273,29 @@
 <div class="space-y-4">
 <div class="flex justify-between items-center">
 <span class="font-body text-sm text-slate-300">UNL Active</span>
-<span class="font-mono text-sm text-slate-200">35 validators</span>
+<span class="font-mono text-sm text-slate-200" id="cons-unl">35 validators</span>
 </div>
 <div class="flex justify-between items-center">
 <span class="font-body text-sm text-slate-300">Agreement Level</span>
-<span class="font-mono text-sm text-green-500">33/35 (94%)</span>
+<span class="font-mono text-sm text-green-500" id="cons-agreement">33/35 (94%)</span>
 </div>
 <div class="flex justify-between items-center">
 <span class="font-body text-sm text-slate-300">Current Phase</span>
-<span class="font-mono text-sm text-amber-500 italic">open</span>
+<span class="font-mono text-sm text-amber-500 italic" id="cons-phase">open</span>
 </div>
 <div class="flex justify-between items-center">
 <span class="font-body text-sm text-slate-300">Proposals Tracked</span>
-<span class="font-mono text-sm text-slate-200">12,450</span>
+<span class="font-mono text-sm text-slate-200" id="cons-proposals">12,450</span>
 </div>
 </div>
 </div>
 <div class="mt-8 pt-4 border-t border-slate-800">
 <div class="flex justify-between mb-2">
 <span class="text-[9px] font-mono text-slate-500 uppercase">State Hash Streak</span>
-<span class="text-[9px] font-mono text-green-500">284 consecutive matches</span>
+<span class="text-[9px] font-mono text-green-500" id="hash-streak">284 consecutive matches</span>
 </div>
 <div class="w-full h-1 bg-slate-800 rounded-full overflow-hidden">
-<div class="h-full bg-green-500 w-[85%]"></div>
+<div class="h-full bg-green-500" id="hash-streak-bar" style="width:85%"></div>
 </div>
 </div>
 </div>
@@ -343,4 +343,91 @@
 <a class="text-slate-600 hover:text-green-400 transition-none" href="#">Documentation</a>
 </div>
 </footer>
+<script>
+const $ = id => document.getElementById(id);
+const fmt = n => n.toLocaleString();
+const pct = (n, d) => d > 0 ? (n / d * 100).toFixed(1) + '%' : '0%';
+
+// Compute histogram percentile from cumulative buckets
+function histPct(buckets, count, p) {
+    const bounds = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000];
+    const target = count * p;
+    for (let i = 0; i < bounds.length; i++) {
+        if (buckets[i] >= target) return bounds[i] + 'ms';
+    }
+    return '>1s';
+}
+
+async function tick() {
+    try {
+        const [eng, cons, sh] = await Promise.all([
+            fetch('/api/engine').then(r => r.json()),
+            fetch('/api/consensus').then(r => r.json()),
+            fetch('/api/state-hash').then(r => r.json()),
+        ]);
+        const f = eng.ffi_verifier || {};
+        const att = f.live_apply_attempted || 0;
+        const ok = f.live_apply_ok || 0;
+        const claimed = f.live_apply_claimed || 0;
+        const div = f.live_apply_diverged || 0;
+        const agreed = ok + claimed;
+        const agreedPct = att > 0 ? (agreed / att * 100) : 0;
+        const buckets = f.apply_duration_buckets_ms || [];
+        const durCount = f.apply_duration_count || 0;
+
+        // Hero
+        $('agreement-pct').textContent = agreedPct.toFixed(2);
+        const hero = $('agreement-pct').closest('.text-6xl');
+        if (hero) {
+            hero.className = hero.className.replace(/text-(green|amber|red)-500/g, '');
+            hero.classList.add(agreedPct >= 99.99 ? 'text-green-500' : agreedPct >= 95 ? 'text-amber-500' : 'text-red-500');
+        }
+        $('hero-ledger').textContent = '#' + fmt(eng.ledger_seq || 0);
+        $('hero-ledgers-verified').textContent = fmt(f.ledgers_applied || 0) + ' ledgers verified';
+
+        // State hash
+        const matches = sh.total_matches || 0;
+        const mismatches = sh.total_mismatches || 0;
+        const consec = sh.consecutive_matches || 0;
+        $('hero-hash-status').textContent = consec > 0 ? '✓ MATCH' : '✗ MISMATCH';
+        $('hero-hash-status').className = consec > 0
+            ? 'text-green-500 font-bold' : 'text-red-500 font-bold';
+
+        // FFI Engine
+        $('ffi-applied').textContent = fmt(att);
+        $('ffi-diverged').textContent = fmt(div);
+        $('ffi-diverged').className = div > 0
+            ? 'font-mono text-xl text-red-500 animate-pulse' : 'font-mono text-xl text-green-500';
+        $('ffi-ledgers').textContent = fmt(f.ledgers_applied || 0);
+        $('ffi-p50').textContent = histPct(buckets, durCount, 0.5);
+        $('ffi-success-pct').textContent = pct(ok, att);
+        $('ffi-claimed-pct').textContent = pct(claimed, att);
+        $('ffi-p95').textContent = histPct(buckets, durCount, 0.95);
+        $('ffi-p99').textContent = histPct(buckets, durCount, 0.99);
+
+        // Network
+        // Peer count from consensus endpoint
+        const monitor = cons.monitor || {};
+        const unl = cons.unl_size || 0;
+        const tracked = monitor.tracked_validators || 0;
+        const proposals = monitor.total_proposals || 0;
+        const agreement = monitor.agreement || {};
+        const agreeCount = agreement.count || 0;
+
+        $('cons-unl').textContent = unl + ' validators';
+        $('cons-agreement').textContent = agreeCount + '/' + unl +
+            (unl > 0 ? ' (' + Math.round(agreeCount / unl * 100) + '%)' : '');
+        $('cons-phase').textContent = cons.phase || 'open';
+        $('cons-proposals').textContent = fmt(proposals);
+
+        // State hash streak
+        $('hash-streak').textContent = fmt(consec) + ' consecutive matches';
+        const streakPct = Math.min(100, consec / 3 * 1);  // ~300 = full bar
+        $('hash-streak-bar').style.width = streakPct + '%';
+    } catch (e) { /* silent — next tick retries */ }
+}
+
+setInterval(tick, 500);
+tick();
+</script>
 </body></html>
