@@ -74,6 +74,8 @@ body { background-color: #0D1117; color: #C9D1D9; }
 </div>
 <div style="height:200px;position:relative">
 <canvas id="wallet-chart" style="position:absolute;top:0;left:0;width:100%;height:100%" class="bg-slate-950 rounded border border-slate-800"></canvas>
+<div id="chart-tooltip" class="hidden absolute pointer-events-none bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono text-[10px] text-green-400 z-10" style="transform:translate(-50%,-120%)"></div>
+<div id="chart-crosshair" class="hidden absolute pointer-events-none top-0 bottom-0 w-px bg-slate-600 z-5"></div>
 </div>
 <div class="flex justify-between mt-2 font-mono text-[9px] text-slate-600">
 <span id="chart-start">-</span>
@@ -142,12 +144,14 @@ body { background-color: #0D1117; color: #C9D1D9; }
 <script>
 const $ = id => document.getElementById(id);
 const fmt = n => n.toLocaleString();
+let chartData = []; // stored for hover lookup
 
 function drawChart(rawHistory) {
     const canvas = $('wallet-chart');
     // Filter out pre-scan entries (wallet count < 1M = scan not done yet)
     const history = rawHistory ? rawHistory.filter(e => e[1] > 1000000) : [];
     if (!canvas || history.length < 2) return;
+    chartData = history;
     const ctx = canvas.getContext('2d');
     const dpr = window.devicePixelRatio || 1;
     const w = canvas.width = canvas.offsetWidth * dpr;
@@ -247,5 +251,33 @@ async function tick() {
 
 setInterval(tick, 500);
 tick();
+
+// Hover tooltip on wallet chart
+const chartCanvas = $('wallet-chart');
+const tooltip = $('chart-tooltip');
+const crosshair = $('chart-crosshair');
+const chartContainer = chartCanvas.parentElement;
+
+chartContainer.addEventListener('mousemove', (e) => {
+    if (chartData.length < 2) return;
+    const rect = chartCanvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const pct = x / rect.width;
+    const idx = Math.min(Math.max(0, Math.round(pct * (chartData.length - 1))), chartData.length - 1);
+    const [seq, count] = chartData[idx];
+
+    tooltip.textContent = '#' + fmt(seq) + ' · ' + fmt(count) + ' wallets';
+    tooltip.style.left = x + 'px';
+    tooltip.style.top = (rect.height * 0.3) + 'px';
+    tooltip.classList.remove('hidden');
+
+    crosshair.style.left = x + 'px';
+    crosshair.classList.remove('hidden');
+});
+
+chartContainer.addEventListener('mouseleave', () => {
+    tooltip.classList.add('hidden');
+    crosshair.classList.add('hidden');
+});
 </script>
 </body></html>
