@@ -315,13 +315,21 @@ const $ = id => document.getElementById(id);
 const fmt = n => n.toLocaleString();
 const pct = (n, d) => d > 0 ? (n / d * 100).toFixed(1) + '%' : '0%';
 
+// All known XRPL tx types with assigned colors — always shown, grayed when inactive
 const txColors = {
-    OfferCancel: '#00C853', OfferCreate: '#00B0FF', Payment: '#7C4DFF',
-    TrustSet: '#FFD600', AccountSet: '#FF6D00', NFTokenCreateOffer: '#E040FB',
-    NFTokenAcceptOffer: '#EA80FC', NFTokenMint: '#B388FF', NFTokenBurn: '#FF5252',
-    NFTokenCancelOffer: '#F48FB1', TicketCreate: '#80CBC4', CheckCash: '#4FC3F7',
-    CheckCreate: '#81D4FA', OracleSet: '#FFAB40', AMMDeposit: '#69F0AE',
-    AMMWithdraw: '#B9F6CA', AMMVote: '#A7FFEB', AccountDelete: '#FF1744',
+    Payment: '#7C4DFF', OfferCreate: '#00B0FF', OfferCancel: '#00C853',
+    TrustSet: '#FFD600', AccountSet: '#FF6D00', AccountDelete: '#FF1744',
+    CheckCreate: '#81D4FA', CheckCash: '#4FC3F7', CheckCancel: '#4DD0E1',
+    EscrowCreate: '#26C6DA', EscrowFinish: '#00BCD4', EscrowCancel: '#0097A7',
+    TicketCreate: '#80CBC4', DepositPreauth: '#A5D6A7',
+    NFTokenMint: '#B388FF', NFTokenBurn: '#FF5252', NFTokenCreateOffer: '#E040FB',
+    NFTokenAcceptOffer: '#EA80FC', NFTokenCancelOffer: '#F48FB1',
+    AMMCreate: '#00E5FF', AMMDeposit: '#69F0AE', AMMWithdraw: '#B9F6CA',
+    AMMVote: '#A7FFEB', AMMBid: '#84FFFF', AMMClawback: '#FF8A80',
+    OracleSet: '#FFAB40', OracleDelete: '#FF9100',
+    SetRegularKey: '#CE93D8', SignerListSet: '#BA68C8',
+    PaymentChannelCreate: '#9FA8DA', PaymentChannelFund: '#7986CB', PaymentChannelClaim: '#5C6BC0',
+    Clawback: '#EF5350', EnableAmendment: '#78909C', SetFee: '#90A4AE', UNLModify: '#B0BEC5',
 };
 
 // Compute histogram percentile from cumulative buckets
@@ -390,22 +398,36 @@ async function tick() {
             syncEl.classList.add('hidden');
         }
 
-        // Tx type bars — per-ledger round (resets each new ledger)
-        const types = f.round_tx_types || {};
+        // Tx type bars — per-ledger round, ALL types shown (inactive = grayed)
+        const roundTypes = f.round_tx_types || {};
         const roundCount = f.round_tx_count || 0;
-        const total = Object.values(types).reduce((a, b) => a + b, 0) || 1;
-        const sorted = Object.entries(types).sort((a, b) => b[1] - a[1]);
-        $('ffi-total-types').textContent = roundCount + ' txs · ' + sorted.length + ' types · #' + (f.round_ledger_seq || 0);
+        const roundTotal = Object.values(roundTypes).reduce((a, b) => a + b, 0) || 1;
+        // Merge any unknown types from current round into the master list
+        const allTypes = Object.keys(txColors);
+        for (const t of Object.keys(roundTypes)) {
+            if (!allTypes.includes(t)) allTypes.push(t);
+        }
+        // Sort: active first by count desc, then inactive alphabetically
+        allTypes.sort((a, b) => {
+            const ca = roundTypes[a] || 0, cb = roundTypes[b] || 0;
+            if (ca > 0 && cb === 0) return -1;
+            if (cb > 0 && ca === 0) return 1;
+            if (ca > 0 && cb > 0) return cb - ca;
+            return a.localeCompare(b);
+        });
+        $('ffi-total-types').textContent = roundCount + ' txs · #' + (f.round_ledger_seq || 0);
         let barsHtml = '';
-        for (const [type, cnt] of sorted) {
-            const p = (cnt / total * 100).toFixed(0);
+        for (const type of allTypes) {
+            const cnt = roundTypes[type] || 0;
+            const p = cnt > 0 ? (cnt / roundTotal * 100).toFixed(0) : '0';
             const c = txColors[type] || '#6E7681';
-            barsHtml += `<div class="flex items-center gap-2 font-mono text-[10px]">
-                <span style="color:${c};min-width:130px" class="truncate">${type}</span>
+            const active = cnt > 0;
+            barsHtml += `<div class="flex items-center gap-2 font-mono text-[10px]" style="opacity:${active ? '1' : '0.25'}">
+                <span style="color:${active ? c : '#30363D'};min-width:145px" class="truncate">${type}</span>
                 <div class="flex-1 h-1.5 bg-slate-800 rounded-full overflow-hidden">
-                    <div style="width:${p}%;background:${c};transition:width 0.3s" class="h-full rounded-full"></div>
+                    <div style="width:${p}%;background:${c};transition:width 0.3s" class="h-full rounded-full${active ? '' : ' opacity-0'}"></div>
                 </div>
-                <span class="text-slate-500 min-w-[50px] text-right">${fmt(cnt)}</span>
+                <span class="text-slate-500 min-w-[40px] text-right">${active ? cnt : ''}</span>
             </div>`;
         }
         $('tx-type-bars').innerHTML = barsHtml;
