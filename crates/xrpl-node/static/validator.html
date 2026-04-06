@@ -389,13 +389,41 @@ async function tick() {
         $('ffi-p95').textContent = histPct(buckets, durCount, 0.95);
         $('ffi-p99').textContent = histPct(buckets, durCount, 0.99);
 
-        // Sync indicator — infer from FFI state
+        // State lifecycle: sync → build → match
         const syncEl = $('hero-sync');
-        if (att === 0 && (f.ledgers_applied || 0) === 0) {
-            syncEl.textContent = '⟳ SYNCING STATE...';
+        const bs = sh.bulk_sync || {};
+        const dbEntries = sh.db_entries || 0;
+        const computing = sh.computing || false;
+        const computeMs = ((sh.compute_time_secs || 0) * 1000).toFixed(0);
+        const ourHash = (sh.computed_hash || '').slice(0, 16);
+
+        if (bs.running) {
+            const synced = bs.objects_synced || 0;
+            const rate = Math.round(bs.rate || 0);
+            syncEl.textContent = '⟳ SYNCING: ' + fmt(synced) + ' objects (' + fmt(rate) + '/s)';
+            syncEl.className = 'text-amber-500 font-mono text-[11px]';
+            syncEl.classList.remove('hidden');
+        } else if (computing) {
+            syncEl.textContent = '⟳ BUILDING HASH...';
+            syncEl.className = 'text-blue-400 font-mono text-[11px]';
+            syncEl.classList.remove('hidden');
+        } else if (consec > 0) {
+            syncEl.textContent = '✓ HASH MATCH · ' + ourHash + '... · ' + computeMs + 'ms · ' + fmt(dbEntries) + ' entries';
+            syncEl.className = 'text-green-500 font-mono text-[11px]';
+            syncEl.classList.remove('hidden');
+        } else if (att === 0) {
+            syncEl.textContent = '⟳ WAITING FOR DATA...';
+            syncEl.className = 'text-slate-500 font-mono text-[11px]';
             syncEl.classList.remove('hidden');
         } else {
-            syncEl.classList.add('hidden');
+            syncEl.textContent = '✗ HASH MISMATCH · ' + ourHash + '...';
+            syncEl.className = 'text-red-500 font-mono text-[11px] animate-pulse';
+            syncEl.classList.remove('hidden');
+        }
+
+        // Object count from db_entries
+        if (dbEntries > 0) {
+            $('hero-objects').textContent = (dbEntries / 1_000_000).toFixed(1) + 'M objects';
         }
 
         // Tx type bars — per-ledger round, ALL types shown (inactive = grayed)
