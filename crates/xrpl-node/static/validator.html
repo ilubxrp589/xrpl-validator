@@ -433,8 +433,10 @@ async function tick() {
             $('hero-objects').textContent = (dbEntries / 1_000_000).toFixed(1) + 'M objects';
         }
         const wallets = sh.wallet_count || 0;
-        if (wallets > 0) {
+        if (wallets > 1000000) {
             $('hero-wallets').textContent = fmt(wallets) + ' wallets';
+        } else {
+            $('hero-wallets').textContent = 'scanning wallets...';
         }
 
         // Tx type bars — per-ledger round, ALL types shown (inactive = grayed)
