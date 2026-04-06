@@ -144,9 +144,11 @@ body { background-color: #0D1117; color: #C9D1D9; }
 const $ = id => document.getElementById(id);
 const fmt = n => n.toLocaleString();
 
-function drawChart(history) {
+function drawChart(rawHistory) {
     const canvas = $('wallet-chart');
-    if (!canvas || !history || history.length < 2) return;
+    // Filter out pre-scan entries (wallet count < 1M = scan not done yet)
+    const history = rawHistory ? rawHistory.filter(e => e[1] > 1000000) : [];
+    if (!canvas || history.length < 2) return;
     const ctx = canvas.getContext('2d');
     const dpr = window.devicePixelRatio || 1;
     const w = canvas.width = canvas.offsetWidth * dpr;
