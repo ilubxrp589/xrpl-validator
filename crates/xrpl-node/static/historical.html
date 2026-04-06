@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html class="dark" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>HALCYON XRPL | Historical</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&amp;family=Inter:wght@300;400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500;600&amp;family=IBM+Plex+Sans:wght@300;400;500;600&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script>
+tailwind.config = {
+    darkMode: "class",
+    theme: {
+        extend: {
+            colors: {
+                slate: { 950: "#0D1117", 900: "#161B22", 800: "#21262D", 700: "#30363D", 400: "#8B949E", 500: "#6E7681" },
+                green: { 500: "#00C853", 400: "#00E676", 600: "#00A441" },
+                amber: { 500: "#FFD600" },
+                red: { 500: "#FF1744" }
+            },
+            fontFamily: {
+                headline: ["Space Grotesk", "sans-serif"],
+                body: ["Inter", "sans-serif"],
+                mono: ["IBM Plex Mono", "monospace"],
+                label: ["IBM Plex Sans", "sans-serif"]
+            }
+        },
+    },
+}
+</script>
+<style>
+body { background-color: #0D1117; color: #C9D1D9; }
+.material-symbols-outlined { font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24; }
+</style>
+</head>
+<body class="font-body antialiased min-h-screen flex flex-col">
+<!-- Top Nav -->
+<header class="bg-slate-950 text-green-500 font-mono text-sm tracking-tight fixed top-0 border-b border-slate-800 flex justify-between items-center px-6 w-full h-14 z-50">
+<div class="flex items-center gap-8">
+<a href="/" class="text-xl font-black tracking-tighter text-green-500">HALCYON XRPL</a>
+<nav class="hidden md:flex gap-6">
+<a class="text-slate-400 hover:text-green-300" href="/">Dashboard</a>
+<a class="text-green-400 border-b-2 border-green-500 pb-1" href="/historical">Historical</a>
+</nav>
+</div>
+</header>
+<!-- Sidebar -->
+<aside class="bg-slate-950 text-green-500 font-mono text-xs fixed left-0 top-14 flex flex-col items-center py-4 space-y-6 border-r border-slate-800 w-20 z-40 h-screen">
+<div class="flex flex-col items-center gap-1 mb-4">
+<span class="material-symbols-outlined text-2xl text-green-500">memory</span>
+<span class="text-[10px] text-slate-500 font-bold">NODE-01</span>
+</div>
+<a href="/" class="flex flex-col items-center gap-1 w-full py-2 text-slate-500 hover:bg-slate-900 hover:text-slate-300">
+<span class="material-symbols-outlined">monitoring</span>
+<span>Real-time</span>
+</a>
+<a href="/historical" class="flex flex-col items-center gap-1 w-full py-2 bg-green-500/10 text-green-500 border-r-2 border-green-500">
+<span class="material-symbols-outlined">history</span>
+<span>Historical</span>
+</a>
+</aside>
+<!-- Main -->
+<main class="flex-grow ml-20 mt-14 p-6 space-y-6">
+<!-- Wallet Count -->
+<section class="bg-slate-900 border border-slate-800 rounded-lg p-6">
+<div class="flex justify-between items-center mb-4">
+<div class="flex items-center gap-2">
+<span class="material-symbols-outlined text-green-500">account_circle</span>
+<h2 class="font-headline font-bold text-slate-200 uppercase tracking-wider text-xs">Live Wallet Count (AccountRoot)</h2>
+</div>
+<div class="text-right">
+<span class="font-mono text-3xl text-green-400" id="wallet-count">0</span>
+<span class="font-mono text-xs text-slate-500 ml-2">wallets</span>
+</div>
+</div>
+<canvas id="wallet-chart" height="200" class="w-full bg-slate-950 rounded border border-slate-800"></canvas>
+<div class="flex justify-between mt-2 font-mono text-[9px] text-slate-600">
+<span id="chart-start">-</span>
+<span>Last 300 ledgers (~15 min)</span>
+<span id="chart-end">-</span>
+</div>
+</section>
+
+<!-- FFI Agreement Over Time -->
+<section class="bg-slate-900 border border-slate-800 rounded-lg p-6">
+<div class="flex justify-between items-center mb-4">
+<div class="flex items-center gap-2">
+<span class="material-symbols-outlined text-green-500">verified</span>
+<h2 class="font-headline font-bold text-slate-200 uppercase tracking-wider text-xs">Mainnet Agreement</h2>
+</div>
+<div class="text-right">
+<span class="font-mono text-3xl text-green-400" id="agreement-pct">100.00</span>
+<span class="font-mono text-xs text-slate-500">%</span>
+</div>
+</div>
+<div class="grid grid-cols-4 gap-4">
+<div class="flex flex-col">
+<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">Txs Applied</span>
+<span class="font-mono text-lg text-slate-200" id="h-applied">0</span>
+</div>
+<div class="flex flex-col">
+<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">Divergences</span>
+<span class="font-mono text-lg text-green-500" id="h-diverged">0</span>
+</div>
+<div class="flex flex-col">
+<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">Ledgers Verified</span>
+<span class="font-mono text-lg text-slate-200" id="h-ledgers">0</span>
+</div>
+<div class="flex flex-col">
+<span class="text-[10px] text-slate-500 font-bold uppercase mb-1">State Hash Matches</span>
+<span class="font-mono text-lg text-green-500" id="h-matches">0</span>
+</div>
+</div>
+</section>
+
+<!-- State Hash History -->
+<section class="bg-slate-900 border border-slate-800 rounded-lg p-6">
+<div class="flex items-center gap-2 mb-4">
+<span class="material-symbols-outlined text-green-500">fingerprint</span>
+<h2 class="font-headline font-bold text-slate-200 uppercase tracking-wider text-xs">State Hash Streak</h2>
+</div>
+<div class="flex items-center gap-4">
+<span class="font-mono text-4xl text-green-400" id="h-streak">0</span>
+<span class="text-slate-500 text-sm">consecutive matches</span>
+</div>
+<div class="w-full h-2 bg-slate-800 rounded-full overflow-hidden mt-4">
+<div class="h-full bg-green-500 transition-all duration-500" id="h-streak-bar" style="width:0%"></div>
+</div>
+<div class="flex justify-between mt-1 font-mono text-[9px] text-slate-600">
+<span>0</span>
+<span>Target: 300+</span>
+</div>
+</section>
+</main>
+
+<footer class="bg-slate-950 text-green-600 font-mono text-[10px] uppercase tracking-widest flex justify-between items-center px-6 py-2 w-full border-t border-slate-900">
+<span class="text-amber-500">DASHBOARD IN DEVELOPMENT — NOT ALL LINKS ARE FUNCTIONAL</span>
+<span class="text-slate-600 mx-2">|</span>
+<span class="text-green-500 font-bold">HALCYON XRPL VALIDATOR</span>
+</footer>
+
+<script>
+const $ = id => document.getElementById(id);
+const fmt = n => n.toLocaleString();
+
+function drawChart(history) {
+    const canvas = $('wallet-chart');
+    if (!canvas || !history || history.length < 2) return;
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.width = canvas.offsetWidth * dpr;
+    const h = canvas.height = canvas.offsetHeight * dpr;
+    ctx.clearRect(0, 0, w, h);
+
+    const vals = history.map(e => e[1]);
+    const seqs = history.map(e => e[0]);
+    const min = Math.min(...vals);
+    const max = Math.max(...vals);
+    const range = max - min || 1;
+    const pad = 8;
+
+    // Grid lines
+    ctx.strokeStyle = '#21262D';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+        const y = pad + (i / 4) * (h - pad * 2);
+        ctx.beginPath(); ctx.moveTo(pad, y); ctx.lineTo(w - pad, y); ctx.stroke();
+    }
+
+    // Fill gradient
+    const grad = ctx.createLinearGradient(0, 0, 0, h);
+    grad.addColorStop(0, 'rgba(0,200,83,0.25)');
+    grad.addColorStop(1, 'rgba(0,200,83,0)');
+    ctx.beginPath();
+    ctx.moveTo(pad, h - pad);
+    for (let i = 0; i < vals.length; i++) {
+        const x = pad + (i / (vals.length - 1)) * (w - pad * 2);
+        const y = h - pad - ((vals[i] - min) / range) * (h - pad * 2);
+        ctx.lineTo(x, y);
+    }
+    ctx.lineTo(w - pad, h - pad);
+    ctx.closePath();
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Line
+    ctx.beginPath();
+    for (let i = 0; i < vals.length; i++) {
+        const x = pad + (i / (vals.length - 1)) * (w - pad * 2);
+        const y = h - pad - ((vals[i] - min) / range) * (h - pad * 2);
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = '#00C853';
+    ctx.lineWidth = 2 * dpr;
+    ctx.stroke();
+
+    // Latest point dot
+    const lastX = w - pad;
+    const lastY = h - pad - ((vals[vals.length - 1] - min) / range) * (h - pad * 2);
+    ctx.beginPath();
+    ctx.arc(lastX, lastY, 4 * dpr, 0, Math.PI * 2);
+    ctx.fillStyle = '#00E676';
+    ctx.fill();
+
+    // Axis labels
+    $('chart-start').textContent = '#' + fmt(seqs[0]);
+    $('chart-end').textContent = '#' + fmt(seqs[seqs.length - 1]);
+}
+
+async function tick() {
+    try {
+        const [eng, sh] = await Promise.all([
+            fetch('/api/engine').then(r => r.json()),
+            fetch('/api/state-hash').then(r => r.json()),
+        ]);
+        const f = eng.ffi_verifier || {};
+        const att = f.live_apply_attempted || 0;
+        const ok = f.live_apply_ok || 0;
+        const cl = f.live_apply_claimed || 0;
+        const div = f.live_apply_diverged || 0;
+        const agreed = ok + cl;
+
+        // Wallet
+        const wallets = sh.wallet_count || 0;
+        $('wallet-count').textContent = fmt(wallets);
+        drawChart(sh.wallet_history || []);
+
+        // Agreement
+        $('agreement-pct').textContent = att > 0 ? (agreed / att * 100).toFixed(2) : '0.00';
+        $('h-applied').textContent = fmt(att);
+        $('h-diverged').textContent = fmt(div);
+        $('h-diverged').className = div > 0 ? 'font-mono text-lg text-red-500' : 'font-mono text-lg text-green-500';
+        $('h-ledgers').textContent = fmt(f.ledgers_applied || 0);
+
+        // State hash
+        const matches = sh.total_matches || 0;
+        const consec = sh.consecutive_matches || 0;
+        $('h-matches').textContent = fmt(matches);
+        $('h-streak').textContent = fmt(consec);
+        $('h-streak-bar').style.width = Math.min(100, consec / 3) + '%';
+    } catch (e) {}
+}
+
+setInterval(tick, 500);
+tick();
+</script>
+</body></html>

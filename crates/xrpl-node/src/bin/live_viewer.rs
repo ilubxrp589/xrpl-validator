@@ -1309,6 +1309,7 @@ async fn main() {
         .route("/consensus", get(consensus_page))
         .route("/validator", get(validator_page))
         .route("/incidents", get(incidents_page))
+        .route("/historical", get(historical_page))
         .route("/dashboard", get(metrics_page))
         .route("/metrics", get({
             let prom_hash = state_hash_computer.clone();
@@ -2162,6 +2163,10 @@ async fn validator_page() -> Html<&'static str> {
 
 async fn incidents_page() -> Html<&'static str> {
     Html(include_str!("../../static/incidents.html"))
+}
+
+async fn historical_page() -> Html<&'static str> {
+    Html(include_str!("../../static/historical.html"))
 }
 
 async fn sse_handler(
