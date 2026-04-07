@@ -859,14 +859,6 @@ pub fn process_live_tx(stats: &SharedFfiStats, tx_bytes: &[u8], ledger_seq: u32)
 /// for created/modified SLEs, `None` for deleted (tombstoned) SLEs.
 pub type LedgerOverlay = std::collections::HashMap<[u8; 32], Option<Vec<u8>>>;
 
-/// Compute a shadow state hash: clone the current hasher, apply FFI overlay
-/// mutations, return the root. Does NOT modify the real state hash.
-pub fn compute_shadow_hash(
-    hash_comp: &crate::state_hash::StateHashComputer,
-    overlay: &LedgerOverlay,
-) -> Option<xrpl_core::types::Hash256> {
-    hash_comp.shadow_hash(overlay)
-}
 
 pub fn apply_ledger_in_order(
     stats: &SharedFfiStats,

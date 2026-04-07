@@ -324,6 +324,30 @@ impl StateHashComputer {
         }
     }
 
+    /// Clone the current FlatHasher for shadow hash computation.
+    /// MUST be called BEFORE process_ledger modifies the real hasher.
+    /// Returns None if hasher isn't built yet.
+    pub fn snapshot_hasher(&self) -> Option<Box<dyn std::any::Any + Send>> {
+        let guard = self.hasher.lock();
+        guard.as_ref().map(|h| Box::new(h.clone()) as Box<dyn std::any::Any + Send>)
+    }
+
+    /// Compute shadow hash using a pre-captured hasher snapshot + overlay.
+    pub fn shadow_hash_from_snapshot(
+        hasher_snapshot: Box<dyn std::any::Any + Send>,
+        overlay: &std::collections::HashMap<[u8; 32], Option<Vec<u8>>>,
+    ) -> Option<Hash256> {
+        let mut shadow = *hasher_snapshot.downcast::<FlatHasher>().ok()?;
+        for (key, value) in overlay {
+            let hash256_key = Hash256(*key);
+            match value {
+                Some(data) => shadow.update(hash256_key, Some(leaf_hash(data, key))),
+                None => shadow.update(hash256_key, None),
+            }
+        }
+        Some(shadow.root_hash())
+    }
+
     /// Compute a shadow state hash by cloning the current hasher and applying
     /// the FFI overlay mutations on top. Returns `None` if the hasher isn't
     /// built yet (still syncing).

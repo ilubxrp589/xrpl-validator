@@ -120,6 +120,21 @@ def render():
     consec = sh.get("consecutive_matches", 0) if isinstance(sh, dict) else 0
     out.append(f"  {colored(f'{matches:,}', '32')} matches | {colored(f'{mismatches:,}', '31' if mismatches else '32')} mismatches | {consec} consecutive")
 
+    # Shadow state hash (FFI-derived)
+    sha_att = ffi.get("shadow_hash_attempted", 0) if isinstance(ffi, dict) else 0
+    if sha_att > 0:
+        sha_m = ffi.get("shadow_hash_matched", 0)
+        sha_mm = ffi.get("shadow_hash_mismatched", 0)
+        sha_pct = sha_m / sha_att * 100 if sha_att else 0
+        sha_color = "32" if sha_pct >= 99.9 else ("33" if sha_pct >= 90 else "31")
+        out.append(colored("── Shadow Hash (FFI-derived state) ──", "1;35"))
+        out.append(f"  {colored(f'{sha_m}/{sha_att}', sha_color)} matched ({sha_pct:.1f}%)  |  {colored(f'{sha_mm}', '31' if sha_mm else '32')} mismatched")
+        last = ffi.get("shadow_hash_last", "")[:24]
+        net = ffi.get("shadow_hash_last_network", "")[:24]
+        if last:
+            out.append(f"  ours:    {colored(last, '36')}...")
+            out.append(f"  network: {colored(net, '36')}...")
+
     return "\n".join(out)
 
 def main():

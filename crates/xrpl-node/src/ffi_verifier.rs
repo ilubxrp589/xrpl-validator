@@ -31,10 +31,11 @@
 //! - `verify_ledger(seq, tx_blobs, parent_hash, parent_close_time, total_drops)`
 //! - `stats()` → `FfiStats`
 
+use std::any::Any;
 use std::sync::Arc;
 
 use crate::ffi_engine::{
-    apply_ledger_in_order, compute_shadow_hash, fetch_mainnet_amendments, new_stats,
+    apply_ledger_in_order, fetch_mainnet_amendments, new_stats,
     DivergenceLog, FfiStats, LedgerOverlay, OwnedSnapshot, SharedFfiStats,
 };
 
@@ -122,15 +123,17 @@ impl FfiVerifier {
         )
     }
 
-    /// Compute shadow state hash from FFI mutations + existing state.
-    /// Compare against rippled's account_hash and update stats.
+    /// Compute shadow state hash using a PRE-CAPTURED hasher snapshot.
+    /// The snapshot must be taken BEFORE process_ledger writes to the real hasher.
     pub fn check_shadow_hash(
         &self,
-        hash_comp: &crate::state_hash::StateHashComputer,
+        hasher_snapshot: Box<dyn std::any::Any + Send>,
         overlay: &LedgerOverlay,
         network_hash: &str,
     ) -> bool {
-        let shadow = match compute_shadow_hash(hash_comp, overlay) {
+        let shadow = match crate::state_hash::StateHashComputer::shadow_hash_from_snapshot(
+            hasher_snapshot, overlay,
+        ) {
             Some(h) => h,
             None => return false,
         };

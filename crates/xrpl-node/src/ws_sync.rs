@@ -162,8 +162,10 @@ pub async fn start_ws_sync(
                                 // within 2 ledgers of what we're verifying.
                                 let synced = last_synced.load(Ordering::Acquire);
                                 let steady = synced > 0 && process_seq.saturating_sub(synced) <= 2;
-                                let shadow_hc = hash_comp.clone();
                                 let shadow_ah = account_hash.clone();
+                                // CRITICAL: snapshot the hasher NOW, before
+                                // process_ledger modifies the real hasher below.
+                                let hasher_snap = hash_comp.snapshot_hasher();
                                 if steady {
                                     let snap = std::sync::Arc::new(
                                         crate::ffi_engine::OwnedSnapshot::new(db.clone())
@@ -175,9 +177,11 @@ pub async fn start_ws_sync(
                                             Some(snap.as_ref()),
                                         );
                                         if !shadow_ah.is_empty() && !overlay.is_empty() {
-                                            let matched = v.check_shadow_hash(&shadow_hc, &overlay, &shadow_ah);
-                                            if !matched {
-                                                eprintln!("[ffi-shadow] MISMATCH at #{seq}");
+                                            if let Some(hs) = hasher_snap {
+                                                let matched = v.check_shadow_hash(hs, &overlay, &shadow_ah);
+                                                if !matched {
+                                                    eprintln!("[ffi-shadow] MISMATCH at #{seq}");
+                                                }
                                             }
                                         }
                                     });
@@ -188,9 +192,11 @@ pub async fn start_ws_sync(
                                             hdr.parent_hash, hdr.parent_close_time, hdr.total_drops,
                                         );
                                         if !shadow_ah.is_empty() && !overlay.is_empty() {
-                                            let matched = v.check_shadow_hash(&shadow_hc, &overlay, &shadow_ah);
-                                            if !matched {
-                                                eprintln!("[ffi-shadow] MISMATCH at #{seq}");
+                                            if let Some(hs) = hasher_snap {
+                                                let matched = v.check_shadow_hash(hs, &overlay, &shadow_ah);
+                                                if !matched {
+                                                    eprintln!("[ffi-shadow] MISMATCH at #{seq}");
+                                                }
                                             }
                                         }
                                     });
