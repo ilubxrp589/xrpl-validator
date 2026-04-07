@@ -168,7 +168,7 @@ async fn main() {
                 let amendments_owned = amendments.clone();
                 let dlog = live_dlog.clone();
                 tokio::task::spawn_blocking(move || {
-                    xrpl_node::ffi_engine::apply_ledger_in_order(
+                    let _overlay = xrpl_node::ffi_engine::apply_ledger_in_order(
                         &apply_stats,
                         &sorted_blobs,
                         seq,

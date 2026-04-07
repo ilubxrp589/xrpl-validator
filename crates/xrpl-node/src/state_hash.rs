@@ -78,6 +78,7 @@ fn leaf_hash(data: &[u8], key: &[u8; 32]) -> Hash256 {
 /// With ~500 modified keys/ledger, only ~500 of 65536 buckets are dirty (0.8%).
 const NUM_BUCKETS: usize = 65536;
 
+#[derive(Clone)]
 struct FlatHasher {
     /// 65536 sorted vecs indexed by key[0..2] (first 2 bytes = depth-4 in trie).
     buckets: Vec<Vec<(Hash256, Hash256)>>,
@@ -321,6 +322,37 @@ impl StateHashComputer {
             wallet_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             wallet_history: Arc::new(Mutex::new(Vec::with_capacity(300))),
         }
+    }
+
+    /// Compute a shadow state hash by cloning the current hasher and applying
+    /// the FFI overlay mutations on top. Returns `None` if the hasher isn't
+    /// built yet (still syncing).
+    ///
+    /// This does NOT modify the real state hash — the clone is discarded after
+    /// computing the root.
+    pub fn shadow_hash(
+        &self,
+        overlay: &std::collections::HashMap<[u8; 32], Option<Vec<u8>>>,
+    ) -> Option<Hash256> {
+        let hasher_guard = self.hasher.lock();
+        let hasher = hasher_guard.as_ref()?;
+        let mut shadow = hasher.clone();
+        drop(hasher_guard);
+
+        for (key, value) in overlay {
+            let hash256_key = Hash256(*key);
+            match value {
+                Some(data) => {
+                    let lh = leaf_hash(data, key);
+                    shadow.update(hash256_key, Some(lh));
+                }
+                None => {
+                    shadow.update(hash256_key, None);
+                }
+            }
+        }
+
+        Some(shadow.root_hash())
     }
 
     /// Scan RocksDB for AccountRoot entries (sfLedgerEntryType == 0x0061).

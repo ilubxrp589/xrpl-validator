@@ -34,8 +34,8 @@
 use std::sync::Arc;
 
 use crate::ffi_engine::{
-    apply_ledger_in_order, fetch_mainnet_amendments, new_stats, DivergenceLog, FfiStats,
-    OwnedSnapshot, SharedFfiStats,
+    apply_ledger_in_order, compute_shadow_hash, fetch_mainnet_amendments, new_stats,
+    DivergenceLog, FfiStats, LedgerOverlay, OwnedSnapshot, SharedFfiStats,
 };
 
 /// FFI-based per-ledger tx verifier. Send + Sync, cheap to `Arc`-clone.
@@ -79,7 +79,7 @@ impl FfiVerifier {
         parent_hash: [u8; 32],
         parent_close_time: u32,
         total_drops: u64,
-    ) {
+    ) -> LedgerOverlay {
         apply_ledger_in_order(
             &self.stats,
             sorted_tx_blobs,
@@ -91,7 +91,7 @@ impl FfiVerifier {
             total_drops,
             Some(self.divergence_log.as_ref()),
             None,
-        );
+        )
     }
 
     /// Apply + verify using a pre-captured `OwnedSnapshot` as the SLE
@@ -107,7 +107,7 @@ impl FfiVerifier {
         parent_close_time: u32,
         total_drops: u64,
         snapshot: Option<&OwnedSnapshot>,
-    ) {
+    ) -> LedgerOverlay {
         apply_ledger_in_order(
             &self.stats,
             sorted_tx_blobs,
@@ -119,7 +119,36 @@ impl FfiVerifier {
             total_drops,
             Some(self.divergence_log.as_ref()),
             snapshot,
-        );
+        )
+    }
+
+    /// Compute shadow state hash from FFI mutations + existing state.
+    /// Compare against rippled's account_hash and update stats.
+    pub fn check_shadow_hash(
+        &self,
+        hash_comp: &crate::state_hash::StateHashComputer,
+        overlay: &LedgerOverlay,
+        network_hash: &str,
+    ) -> bool {
+        let shadow = match compute_shadow_hash(hash_comp, overlay) {
+            Some(h) => h,
+            None => return false,
+        };
+        let ours = hex::encode(shadow.0).to_uppercase();
+        let net = network_hash.to_uppercase();
+        let matched = ours == net;
+
+        let mut s = self.stats.lock();
+        s.shadow_hash_attempted += 1;
+        if matched {
+            s.shadow_hash_matched += 1;
+        } else {
+            s.shadow_hash_mismatched += 1;
+        }
+        s.shadow_hash_last = ours;
+        s.shadow_hash_last_network = net;
+        s.shadow_hash_last_matched = matched;
+        matched
     }
 
     /// Snapshot the shared `FfiStats` (cheap clone, holds the mutex briefly).

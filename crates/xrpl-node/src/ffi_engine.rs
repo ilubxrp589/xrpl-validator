@@ -474,6 +474,13 @@ pub struct FfiStats {
     pub round_tx_types: std::collections::BTreeMap<String, u64>,
     pub round_tx_count: u64,
     pub round_ledger_seq: u32,
+    /// Shadow state hash — FFI-derived state vs rippled's account_hash.
+    pub shadow_hash_attempted: u64,
+    pub shadow_hash_matched: u64,
+    pub shadow_hash_mismatched: u64,
+    pub shadow_hash_last: String,
+    pub shadow_hash_last_network: String,
+    pub shadow_hash_last_matched: bool,
 }
 
 /// Histogram bucket bounds (in milliseconds) for apply latency.
@@ -848,6 +855,19 @@ pub fn process_live_tx(stats: &SharedFfiStats, tx_bytes: &[u8], ledger_seq: u32)
 /// - `ledger_seq`: sequence of the ledger these txs close
 /// - `rpc_url`: rippled RPC for pre-state lookups
 /// - `amendments`: active amendment feature IDs
+/// Accumulated mutations from a full ledger apply. Keys map to `Some(data)`
+/// for created/modified SLEs, `None` for deleted (tombstoned) SLEs.
+pub type LedgerOverlay = std::collections::HashMap<[u8; 32], Option<Vec<u8>>>;
+
+/// Compute a shadow state hash: clone the current hasher, apply FFI overlay
+/// mutations, return the root. Does NOT modify the real state hash.
+pub fn compute_shadow_hash(
+    hash_comp: &crate::state_hash::StateHashComputer,
+    overlay: &LedgerOverlay,
+) -> Option<xrpl_core::types::Hash256> {
+    hash_comp.shadow_hash(overlay)
+}
+
 pub fn apply_ledger_in_order(
     stats: &SharedFfiStats,
     txs_in_order: &[Vec<u8>],
@@ -859,7 +879,7 @@ pub fn apply_ledger_in_order(
     total_drops: u64,
     divergence_log: Option<&DivergenceLog>,
     db_snapshot: Option<&OwnedSnapshot>,
-) {
+) -> LedgerOverlay {
     let fallback = RpcProvider::with_endpoints(rpc_urls.to_vec(), ledger_seq.saturating_sub(1));
     let overlay: parking_lot::Mutex<std::collections::HashMap<[u8; 32], Option<Vec<u8>>>> =
         parking_lot::Mutex::new(std::collections::HashMap::new());
@@ -1026,6 +1046,9 @@ pub fn apply_ledger_in_order(
     s.rpc_sle_misses += m;
     s.rpc_sle_miss_samples = miss_samples;
     let _ = overlay_hits;
+
+    // Return accumulated mutations for shadow state hash computation
+    overlay.into_inner()
 }
 
 /// Apply a live mainnet tx via libxrpl's full tx engine.

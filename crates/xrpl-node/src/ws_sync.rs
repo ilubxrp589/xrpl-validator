@@ -162,23 +162,37 @@ pub async fn start_ws_sync(
                                 // within 2 ledgers of what we're verifying.
                                 let synced = last_synced.load(Ordering::Acquire);
                                 let steady = synced > 0 && process_seq.saturating_sub(synced) <= 2;
+                                let shadow_hc = hash_comp.clone();
+                                let shadow_ah = account_hash.clone();
                                 if steady {
                                     let snap = std::sync::Arc::new(
                                         crate::ffi_engine::OwnedSnapshot::new(db.clone())
                                     );
                                     tokio::task::spawn_blocking(move || {
-                                        v.verify_ledger_with_snapshot(
+                                        let overlay = v.verify_ledger_with_snapshot(
                                             seq, &tx_blobs,
                                             hdr.parent_hash, hdr.parent_close_time, hdr.total_drops,
                                             Some(snap.as_ref()),
                                         );
+                                        if !shadow_ah.is_empty() && !overlay.is_empty() {
+                                            let matched = v.check_shadow_hash(&shadow_hc, &overlay, &shadow_ah);
+                                            if !matched {
+                                                eprintln!("[ffi-shadow] MISMATCH at #{seq}");
+                                            }
+                                        }
                                     });
                                 } else {
                                     tokio::task::spawn_blocking(move || {
-                                        v.verify_ledger(
+                                        let overlay = v.verify_ledger(
                                             seq, &tx_blobs,
                                             hdr.parent_hash, hdr.parent_close_time, hdr.total_drops,
                                         );
+                                        if !shadow_ah.is_empty() && !overlay.is_empty() {
+                                            let matched = v.check_shadow_hash(&shadow_hc, &overlay, &shadow_ah);
+                                            if !matched {
+                                                eprintln!("[ffi-shadow] MISMATCH at #{seq}");
+                                            }
+                                        }
                                     });
                                 }
                             }
