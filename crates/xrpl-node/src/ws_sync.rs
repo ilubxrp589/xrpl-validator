@@ -180,7 +180,10 @@ pub async fn start_ws_sync(
                                 let synced = last_synced.load(Ordering::Acquire);
                                 let steady = synced > 0 && process_seq.saturating_sub(synced) <= 2;
                                 let shadow_ah = account_hash.clone();
-                                let hasher_snap = hash_comp.snapshot_hasher();
+                                // Skip shadow hash during first 5 state-hash matches
+                                // — hasher is still settling after sync
+                                let consec = hash_comp.consecutive_matches.load(Ordering::Acquire);
+                                let hasher_snap = if consec >= 5 { hash_comp.snapshot_hasher() } else { None };
                                 // Collect protocol-level modified objects for shadow hash.
                                 // These are the keys ws_sync knows about but FFI doesn't
                                 // apply (singletons, pseudo-tx effects). Fetch post-state

@@ -293,7 +293,7 @@ pub struct StateHashComputer {
     pub shamap: Arc<Mutex<Option<SHAMap>>>,
     computing: Arc<AtomicBool>,
     entries_processed: Arc<AtomicU64>,
-    consecutive_matches: Arc<AtomicU32>,
+    pub consecutive_matches: Arc<AtomicU32>,
     /// Flat 256-bucket hasher — the hot path for hash computation.
     hasher: Arc<Mutex<Option<FlatHasher>>>,
     /// Path for persisting the leaf cache to disk.
