@@ -147,6 +147,7 @@
 <div class="flex items-center gap-1">State hash <span class="text-green-500 font-bold" id="hero-hash-status">✓ MATCH</span></div>
 <div id="hero-ledgers-verified">284 ledgers verified</div>
 <div id="hero-shadow" class="text-green-400">Shadow hash: 0/0</div>
+<div id="hero-shadow-hashes" class="hidden font-mono text-[9px] text-slate-500"></div>
 </div>
 </section>
 <!-- SECTION 2: FFI ENGINE -->
@@ -441,6 +442,17 @@ async function tick() {
             const sha_color = sha_mm === 0 ? 'text-green-400' : 'text-red-400';
             $('hero-shadow').className = sha_color + ' flex items-center gap-1';
             $('hero-shadow').innerHTML = (sha_mm === 0 ? '&#x2713; ' : '&#x2717; ') + 'Shadow hash: ' + fmt(sha_m) + '/' + fmt(sha_a);
+            const ours = (f.shadow_hash_last || '').slice(0, 16);
+            const net = (f.shadow_hash_last_network || '').slice(0, 16);
+            if (ours && net) {
+                const matched = f.shadow_hash_last_matched;
+                const el = $('hero-shadow-hashes');
+                el.innerHTML = '<span class="' + (matched ? 'text-green-500' : 'text-red-500') + '">' + ours + '...</span>' +
+                    ' = ' +
+                    '<span class="' + (matched ? 'text-green-500' : 'text-red-500') + '">' + net + '...</span>' +
+                    ' <span class="' + (matched ? 'text-green-400' : 'text-red-400') + '">' + (matched ? '✓' : '✗') + '</span>';
+                el.classList.remove('hidden');
+            }
         }
 
         const wallets = sh.wallet_count || 0;
