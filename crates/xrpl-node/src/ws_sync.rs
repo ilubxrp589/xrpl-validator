@@ -147,6 +147,25 @@ pub async fn start_ws_sync(
                             }
                         }
                     }
+                    // Include protocol-level singletons BEFORE FFI shadow hash
+                    // so the shadow overlay covers ALL state changes.
+                    if meta_ok {
+                        acc_modified.insert("B4979A36CDC7F3D3D5C31A4EAE2AC7D7209DDA877588B9AFC66799692AB0D66B".to_string()); // LedgerHashes
+                        acc_modified.insert("2E8A59AA9D3B5B186B0B9E0F62E6C02587CA74A4D778938E957B6357D364B244".to_string()); // NegativeUNL
+                        acc_modified.insert("7DB0788C020F02780A673DC74757F23823FA3014C1866E72CC4CD8B226CD6EF4".to_string()); // Amendments
+                        acc_modified.insert("4BC50C9B0D8515D3EAAE1E74B29A95804346C491EE1A95BF25E4AAB854A6A651".to_string()); // FeeSettings
+                        {
+                            use sha2::{Sha512, Digest};
+                            let group = process_seq / 65536;
+                            let mut data = vec![0x00u8, 0x73];
+                            data.extend_from_slice(&group.to_be_bytes());
+                            let hash = Sha512::digest(&data);
+                            acc_modified.insert(hex::encode(&hash[..32]).to_uppercase());
+                        }
+                        for d in acc_deleted.iter().cloned().collect::<Vec<_>>() {
+                            acc_modified.remove(&d);
+                        }
+                    }
                     // FFI independent verification — blocking, spawn off-thread.
                     // Use OwnedSnapshot when DB is caught up (steady state),
                     // fall back to pure RPC during catchup (stale DB = crash).
@@ -229,27 +248,6 @@ pub async fn start_ws_sync(
                         // trigger skip-ahead if we're too far behind
                         last_processed = process_seq;
                         break;
-                    }
-
-                    // Always include protocol-level singletons
-                    acc_modified.insert("B4979A36CDC7F3D3D5C31A4EAE2AC7D7209DDA877588B9AFC66799692AB0D66B".to_string()); // LedgerHashes (skip list)
-                    acc_modified.insert("2E8A59AA9D3B5B186B0B9E0F62E6C02587CA74A4D778938E957B6357D364B244".to_string()); // NegativeUNL
-                    acc_modified.insert("7DB0788C020F02780A673DC74757F23823FA3014C1866E72CC4CD8B226CD6EF4".to_string()); // Amendments
-                    acc_modified.insert("4BC50C9B0D8515D3EAAE1E74B29A95804346C491EE1A95BF25E4AAB854A6A651".to_string()); // FeeSettings
-                    // LedgerHashes sub-page: key = SHA512Half(0x0073 || uint32_be(seq/65536))
-                    // Changes every ledger (new hash appended), rolls to new key every 65536 ledgers
-                    {
-                        use sha2::{Sha512, Digest};
-                        let group = process_seq / 65536;
-                        let mut data = vec![0x00u8, 0x73];
-                        data.extend_from_slice(&group.to_be_bytes());
-                        let hash = Sha512::digest(&data);
-                        acc_modified.insert(hex::encode(&hash[..32]).to_uppercase());
-                    }
-
-                    // Final cleanup
-                    for d in acc_deleted.iter().cloned().collect::<Vec<_>>() {
-                        acc_modified.remove(&d);
                     }
 
                     // Only hash-check the last ledger in the batch — gap ledgers use fast path
