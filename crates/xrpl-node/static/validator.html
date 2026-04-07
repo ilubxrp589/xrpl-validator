@@ -146,6 +146,7 @@
 <div id="hero-sync" class="hidden text-amber-500"></div>
 <div class="flex items-center gap-1">State hash <span class="text-green-500 font-bold" id="hero-hash-status">✓ MATCH</span></div>
 <div id="hero-ledgers-verified">284 ledgers verified</div>
+<div id="hero-shadow" class="text-green-400">Shadow hash: 0/0</div>
 </div>
 </section>
 <!-- SECTION 2: FFI ENGINE -->
@@ -432,6 +433,16 @@ async function tick() {
         if (dbEntries > 0) {
             $('hero-objects').textContent = (dbEntries / 1_000_000).toFixed(1) + 'M objects';
         }
+        // Shadow hash counter
+        const sha_a = f.shadow_hash_attempted || 0;
+        const sha_m = f.shadow_hash_matched || 0;
+        const sha_mm = f.shadow_hash_mismatched || 0;
+        if (sha_a > 0) {
+            const sha_color = sha_mm === 0 ? 'text-green-400' : 'text-red-400';
+            $('hero-shadow').className = sha_color + ' flex items-center gap-1';
+            $('hero-shadow').innerHTML = (sha_mm === 0 ? '&#x2713; ' : '&#x2717; ') + 'Shadow hash: ' + fmt(sha_m) + '/' + fmt(sha_a);
+        }
+
         const wallets = sh.wallet_count || 0;
         if (wallets > 1000000) {
             $('hero-wallets').textContent = fmt(wallets) + ' wallets';
