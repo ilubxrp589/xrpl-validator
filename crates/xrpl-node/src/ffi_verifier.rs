@@ -143,6 +143,17 @@ impl FfiVerifier {
 
         if !matched {
             eprintln!("[ffi-shadow] overlay keys: {}  ours: {}  network: {}", overlay.len(), &ours[..16], &net[..16]);
+            // Diagnostic: dump first 3 overlay keys + data length for investigation
+            let mut count = 0;
+            for (key, val) in overlay.iter() {
+                if count >= 3 { break; }
+                let key_hex = hex::encode_upper(key);
+                match val {
+                    Some(data) => eprintln!("[ffi-shadow]   key={} len={} first8={}", &key_hex[..16], data.len(), hex::encode_upper(&data[..data.len().min(8)])),
+                    None => eprintln!("[ffi-shadow]   key={} DELETED", &key_hex[..16]),
+                }
+                count += 1;
+            }
         }
         let mut s = self.stats.lock();
         s.shadow_hash_attempted += 1;

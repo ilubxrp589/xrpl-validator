@@ -187,44 +187,34 @@ pub async fn start_ws_sync(
                                     results
                                 };
                                 let deleted_keys: HashSet<String> = acc_deleted.clone();
+                                // Build shadow overlay from RPC canonical bytes
+                                // (same source as process_ledger uses for DB writes)
+                                let shadow_overlay = build_shadow_overlay(&proto_modified, &deleted_keys);
                                 if steady {
                                     let snap = std::sync::Arc::new(
                                         crate::ffi_engine::OwnedSnapshot::new(db.clone())
                                     );
                                     tokio::task::spawn_blocking(move || {
-                                        let mut overlay = v.verify_ledger_with_snapshot(
+                                        let _ffi_overlay = v.verify_ledger_with_snapshot(
                                             seq, &tx_blobs,
                                             hdr.parent_hash, hdr.parent_close_time, hdr.total_drops,
                                             Some(snap.as_ref()),
                                         );
-                                        // Merge protocol-level changes into overlay
-                                        merge_protocol_changes(&mut overlay, &proto_modified, &deleted_keys);
-                                        if !shadow_ah.is_empty() && !overlay.is_empty() {
+                                        if !shadow_ah.is_empty() && !shadow_overlay.is_empty() {
                                             if let Some(hs) = hasher_snap {
-                                                let matched = v.check_shadow_hash(hs, &overlay, &shadow_ah);
-                                                if matched {
-                                                    eprintln!("[ffi-shadow] MATCH at #{seq}!");
-                                                } else {
-                                                    eprintln!("[ffi-shadow] MISMATCH at #{seq}");
-                                                }
+                                                v.check_shadow_hash(hs, &shadow_overlay, &shadow_ah);
                                             }
                                         }
                                     });
                                 } else {
                                     tokio::task::spawn_blocking(move || {
-                                        let mut overlay = v.verify_ledger(
+                                        let _ffi_overlay = v.verify_ledger(
                                             seq, &tx_blobs,
                                             hdr.parent_hash, hdr.parent_close_time, hdr.total_drops,
                                         );
-                                        merge_protocol_changes(&mut overlay, &proto_modified, &deleted_keys);
-                                        if !shadow_ah.is_empty() && !overlay.is_empty() {
+                                        if !shadow_ah.is_empty() && !shadow_overlay.is_empty() {
                                             if let Some(hs) = hasher_snap {
-                                                let matched = v.check_shadow_hash(hs, &overlay, &shadow_ah);
-                                                if matched {
-                                                    eprintln!("[ffi-shadow] MATCH at #{seq}!");
-                                                } else {
-                                                    eprintln!("[ffi-shadow] MISMATCH at #{seq}");
-                                                }
+                                                v.check_shadow_hash(hs, &shadow_overlay, &shadow_ah);
                                             }
                                         }
                                     });
@@ -342,22 +332,22 @@ fn extract_affected_nodes(body: &serde_json::Value, modified: &mut HashSet<Strin
     }
 }
 
-/// Merge protocol-level state changes (singletons, pseudo-tx effects) into
-/// the FFI overlay. Only adds keys NOT already present — FFI-applied mutations
-/// take precedence.
+/// Build the shadow overlay from RPC-fetched post-state objects.
+/// Uses rippled's canonical `node_binary` for ALL keys (same source as
+/// process_ledger), not FFI mutation data (which may serialize differently).
+/// FFI overlay is only used to confirm WHICH keys changed — the actual bytes
+/// come from rippled for hash consistency.
 #[cfg(feature = "ffi")]
-fn merge_protocol_changes(
-    overlay: &mut crate::ffi_engine::LedgerOverlay,
-    modified: &[(String, String)], // (key_hex, data_hex) from RPC
+fn build_shadow_overlay(
+    rpc_objects: &[(String, String)], // (key_hex, data_hex) from RPC at ledger_index=seq
     deleted: &HashSet<String>,
-) {
-    for (key_hex, data_hex) in modified {
+) -> crate::ffi_engine::LedgerOverlay {
+    let mut overlay = crate::ffi_engine::LedgerOverlay::new();
+    for (key_hex, data_hex) in rpc_objects {
         if let Ok(key_bytes) = hex::decode(key_hex) {
             if key_bytes.len() == 32 {
                 let mut key = [0u8; 32];
                 key.copy_from_slice(&key_bytes);
-                // Don't overwrite FFI mutations — they're authoritative for user txs
-                if overlay.contains_key(&key) { continue; }
                 if deleted.contains(key_hex) {
                     overlay.insert(key, None);
                 } else if !data_hex.is_empty() {
@@ -368,7 +358,6 @@ fn merge_protocol_changes(
             }
         }
     }
-    // Handle deletes not in modified list
     for key_hex in deleted {
         if let Ok(key_bytes) = hex::decode(key_hex) {
             if key_bytes.len() == 32 {
@@ -380,6 +369,7 @@ fn merge_protocol_changes(
             }
         }
     }
+    overlay
 }
 
 /// Ledger header fields needed by FFI apply.
