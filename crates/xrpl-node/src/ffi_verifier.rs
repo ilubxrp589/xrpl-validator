@@ -141,6 +141,9 @@ impl FfiVerifier {
         let net = network_hash.to_uppercase();
         let matched = ours == net;
 
+        if !matched {
+            eprintln!("[ffi-shadow] overlay keys: {}  ours: {}  network: {}", overlay.len(), &ours[..16], &net[..16]);
+        }
         let mut s = self.stats.lock();
         s.shadow_hash_attempted += 1;
         if matched {
