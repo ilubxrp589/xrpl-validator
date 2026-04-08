@@ -2137,37 +2137,32 @@ fn extract_key_from_validation(blob: &[u8]) -> Option<String> {
     None
 }
 
-async fn index_page() -> Html<&'static str> {
-    Html(include_str!("../../static/viewer.html"))
+/// Serve a static HTML file from the static dir (disk, not compiled in).
+/// Falls back to compiled-in validator.html for "/" if disk file missing.
+async fn serve_static(filename: &str) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    // Try disk paths in order: ./static/, crate static dir
+    let paths = [
+        std::path::PathBuf::from(format!("static/{filename}")),
+        std::path::PathBuf::from(format!("crates/xrpl-node/static/{filename}")),
+    ];
+    for path in &paths {
+        if let Ok(content) = tokio::fs::read_to_string(path).await {
+            return axum::response::Html(content).into_response();
+        }
+    }
+    // Fallback: compiled-in validator.html for index
+    axum::response::Html("Page not found").into_response()
 }
 
-async fn consensus_page() -> Html<&'static str> {
-    Html(include_str!("../../static/consensus.html"))
-}
-
-async fn metrics_page() -> Html<&'static str> {
-    Html(include_str!("../../static/metrics.html"))
-}
-
-async fn peers_page() -> Html<&'static str> {
-    Html(include_str!("../../static/peers.html"))
-}
-
-async fn state_page() -> Html<&'static str> {
-    Html(include_str!("../../static/state.html"))
-}
-
-async fn validator_page() -> Html<&'static str> {
-    Html(include_str!("../../static/validator.html"))
-}
-
-async fn incidents_page() -> Html<&'static str> {
-    Html(include_str!("../../static/incidents.html"))
-}
-
-async fn historical_page() -> Html<&'static str> {
-    Html(include_str!("../../static/historical.html"))
-}
+async fn index_page() -> axum::response::Response { serve_static("viewer.html").await }
+async fn consensus_page() -> axum::response::Response { serve_static("consensus.html").await }
+async fn metrics_page() -> axum::response::Response { serve_static("metrics.html").await }
+async fn peers_page() -> axum::response::Response { serve_static("peers.html").await }
+async fn state_page() -> axum::response::Response { serve_static("state.html").await }
+async fn validator_page() -> axum::response::Response { serve_static("validator.html").await }
+async fn incidents_page() -> axum::response::Response { serve_static("incidents.html").await }
+async fn historical_page() -> axum::response::Response { serve_static("historical.html").await }
 
 async fn sse_handler(
     tx: broadcast::Sender<MessageEvent>,
