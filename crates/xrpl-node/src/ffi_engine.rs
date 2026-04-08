@@ -982,10 +982,24 @@ pub fn apply_ledger_in_order(
                 }
             }
             if let Some(key) = sender_key {
-                // Fetch at CURRENT ledger (not ledger-1) to get post-prior-tx state
+                // Try current ledger first, then ledger-1
+                let mut recovered = false;
                 let repair = RpcProvider::with_endpoints(rpc_urls.to_vec(), ledger_seq);
                 if let Some(data) = repair.read(&key) {
                     overlay.lock().insert(key, Some(data.to_vec()));
+                    eprintln!("[ffi] terPRE_SEQ recovery: injected sender AccountRoot ({} bytes) at #{ledger_seq}", data.len());
+                    recovered = true;
+                }
+                if !recovered {
+                    let repair2 = RpcProvider::with_endpoints(rpc_urls.to_vec(), ledger_seq.saturating_sub(1));
+                    if let Some(data) = repair2.read(&key) {
+                        overlay.lock().insert(key, Some(data.to_vec()));
+                        eprintln!("[ffi] terPRE_SEQ recovery: injected sender AccountRoot ({} bytes) at #{} (fallback)", data.len(), ledger_seq - 1);
+                        recovered = true;
+                    }
+                }
+                if !recovered {
+                    eprintln!("[ffi] terPRE_SEQ recovery FAILED at #{ledger_seq}");
                 }
             }
         }
