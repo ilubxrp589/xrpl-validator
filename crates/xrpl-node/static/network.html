@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+
+<html class="dark" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Halcyon XRPL - Network Topology</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&amp;family=Inter:wght@300;400;500;600;700&amp;family=IBM+Plex+Sans:wght@300;400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    colors: {
+                        green: {
+                            400: '#4ade80',
+                            500: '#00C853',
+                        },
+                        blue: {
+                            400: '#00B0FF',
+                            500: '#0091EA',
+                        },
+                        zinc: {
+                            800: '#27272a',
+                            900: '#18181b',
+                            950: '#09090b',
+                        }
+                    },
+                    borderRadius: {
+                        "DEFAULT": "0.25rem",
+                        "lg": "0.5rem",
+                        "xl": "0.75rem",
+                        "full": "9999px"
+                    },
+                    fontFamily: {
+                        "headline": ["Space Grotesk", "sans-serif"],
+                        "body": ["Inter", "sans-serif"],
+                        "label": ["IBM Plex Sans", "sans-serif"],
+                        "mono": ["IBM Plex Mono", "monospace"]
+                    }
+                },
+            },
+        }
+    </script>
+<style>
+        body {
+            background-color: #09090b;
+            background-image: 
+                linear-gradient(rgba(0, 200, 83, 0.03) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(0, 200, 83, 0.03) 1px, transparent 1px);
+            background-size: 20px 20px;
+        }
+        .scanline {
+            width: 100%;
+            height: 100px;
+            z-index: 99;
+            background: linear-gradient(0deg, rgba(0, 0, 0, 0) 0%, rgba(0, 200, 83, 0.02) 50%, rgba(0, 0, 0, 0) 100%);
+            opacity: 0.1;
+            position: fixed;
+            pointer-events: none;
+        }
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+        }
+
+        /* PCB Specific Styles */
+        .pcb-grid {
+            background-color: #0A0A14;
+            background-image: 
+                radial-gradient(circle, rgba(0, 200, 83, 0.1) 1px, transparent 1px);
+            background-size: 15px 15px;
+        }
+        
+        @keyframes pulse-travel {
+            0% { offset-distance: 0%; opacity: 0; }
+            10% { opacity: 1; }
+            90% { opacity: 1; }
+            100% { offset-distance: 100%; opacity: 0; }
+        }
+
+        .data-pulse {
+            offset-rotate: 0deg;
+            animation: pulse-travel 3s infinite linear;
+        }
+
+        .pulse-delay-1 { animation-delay: 0.5s; }
+        .pulse-delay-2 { animation-delay: 1.5s; }
+        .pulse-delay-3 { animation-delay: 2.2s; }
+    </style>
+</head>
+<body class="font-mono text-zinc-300 antialiased overflow-x-hidden">
+<div class="scanline"></div>
+<!-- TopNavBar -->
+<nav class="fixed top-0 w-full z-50 bg-zinc-950 flex justify-between items-center px-6 h-14 w-full border-b border-zinc-800">
+<div class="flex items-center gap-8">
+<span class="text-xl font-black text-green-500 tracking-widest font-mono uppercase tracking-tighter">Halcyon XRPL</span>
+<div class="hidden md:flex gap-6">
+<a class="text-zinc-500 hover:text-green-400 hover:bg-zinc-900 transition-colors duration-150 font-mono uppercase tracking-tighter" href="#">Dashboard</a>
+<a class="text-zinc-500 hover:text-green-400 hover:bg-zinc-900 transition-colors duration-150 font-mono uppercase tracking-tighter" href="#">Ledger</a>
+<a class="text-green-400 border-b-2 border-green-500 pb-1 font-mono uppercase tracking-tighter" href="#">Network</a>
+<a class="text-zinc-500 hover:text-green-400 hover:bg-zinc-900 transition-colors duration-150 font-mono uppercase tracking-tighter" href="#">Governance</a>
+<a class="text-zinc-500 hover:text-green-400 hover:bg-zinc-900 transition-colors duration-150 font-mono uppercase tracking-tighter" href="#">Config</a>
+</div>
+</div>
+<div class="flex items-center gap-4">
+<span class="material-symbols-outlined text-zinc-500 cursor-pointer hover:text-green-400">settings</span>
+<span class="material-symbols-outlined text-zinc-500 cursor-pointer hover:text-green-400">account_circle</span>
+</div>
+</nav>
+<!-- SideNavBar -->
+<aside class="fixed left-0 top-14 h-[calc(100vh-3.5rem)] w-64 bg-zinc-950 border-r border-zinc-800 flex flex-col pt-4 hidden md:flex">
+<div class="px-4 mb-6">
+<div class="text-green-500 text-xs font-bold uppercase tracking-widest">Validator Node</div>
+<div class="text-zinc-600 text-[10px]">v2.1.0-stable</div>
+</div>
+<nav class="flex-1">
+<a class="bg-green-500/10 text-green-400 border-r-4 border-green-500 px-4 py-3 flex items-center gap-3 transition-all duration-200 ease-in-out" href="#">
+<span class="material-symbols-outlined">monitoring</span>
+<span class="font-mono text-sm">Real-time</span>
+</a>
+<a class="text-zinc-500 px-4 py-3 flex items-center gap-3 hover:bg-zinc-900 hover:text-zinc-300 transition-all duration-200 ease-in-out" href="#">
+<span class="material-symbols-outlined">history</span>
+<span class="font-mono text-sm">Historical</span>
+</a>
+<a class="text-zinc-500 px-4 py-3 flex items-center gap-3 hover:bg-zinc-900 hover:text-zinc-300 transition-all duration-200 ease-in-out" href="#">
+<span class="material-symbols-outlined">terminal</span>
+<span class="font-mono text-sm">Logs</span>
+</a>
+<a class="text-zinc-500 px-4 py-3 flex items-center gap-3 hover:bg-zinc-900 hover:text-zinc-300 transition-all duration-200 ease-in-out" href="#">
+<span class="material-symbols-outlined">group</span>
+<span class="font-mono text-sm">Peers</span>
+</a>
+<a class="text-zinc-500 px-4 py-3 flex items-center gap-3 hover:bg-zinc-900 hover:text-zinc-300 transition-all duration-200 ease-in-out" href="#">
+<span class="material-symbols-outlined">analytics</span>
+<span class="font-mono text-sm">Health</span>
+</a>
+</nav>
+</aside>
+<!-- Main Content -->
+<main class="md:ml-64 mt-14 mb-8 p-6 space-y-6">
+<!-- SECTION 1: REDESIGNED PEER MAP (PCB STYLE) -->
+<section class="w-full pcb-grid border border-zinc-800 rounded relative overflow-hidden h-[350px]">
+<div class="absolute top-4 left-4 z-20">
+<h2 class="text-green-500 text-[10px] font-bold uppercase tracking-widest font-mono">8 PEERS · 4 RELAY · 24 DISCOVERED</h2>
+</div>
+<div class="absolute inset-0">
+<svg class="w-full h-full" preserveaspectratio="xMidYMid slice" viewbox="0 0 1000 350">
+<defs>
+<filter id="glow">
+<fegaussianblur result="coloredBlur" stddeviation="2"></fegaussianblur>
+<femerge>
+<femergenode in="coloredBlur"></femergenode>
+<femergenode in="SourceGraphic"></femergenode>
+</femerge>
+</filter>
+</defs>
+<!-- PCB Traces (Greens - Peers) -->
+<path d="M 500 175 H 420 V 100 H 340" fill="none" id="trace1" opacity="0.4" stroke="#00C853" stroke-width="1.5"></path>
+<path d="M 500 175 H 580 V 250 H 660" fill="none" id="trace2" opacity="0.4" stroke="#00C853" stroke-width="1.5"></path>
+<path d="M 500 175 H 400 V 240 H 280" fill="none" id="trace3" opacity="0.4" stroke="#00C853" stroke-width="1.5"></path>
+<path d="M 500 175 H 620 V 100 H 720" fill="none" id="trace4" opacity="0.4" stroke="#00C853" stroke-width="1.5"></path>
+<!-- PCB Traces (Blues - Relays) -->
+<path d="M 500 175 V 60 H 150" fill="none" id="trace-r1" opacity="0.6" stroke="#00B0FF" stroke-width="1.5"></path>
+<path d="M 500 175 V 290 H 850" fill="none" id="trace-r2" opacity="0.6" stroke="#00B0FF" stroke-width="1.5"></path>
+<path d="M 500 175 H 550 V 60 H 800" fill="none" id="trace-r3" opacity="0.6" stroke="#00B0FF" stroke-width="1.5"></path>
+<path d="M 500 175 H 450 V 290 H 200" fill="none" id="trace-r4" opacity="0.6" stroke="#00B0FF" stroke-width="1.5"></path>
+<!-- Animated Pulses -->
+<circle class="data-pulse" fill="#4ade80" r="2.5" style="offset-path: path('M 500 175 H 420 V 100 H 340');"></circle>
+<circle class="data-pulse pulse-delay-1" fill="#4ade80" r="2.5" style="offset-path: path('M 500 175 H 620 V 100 H 720');"></circle>
+<circle class="data-pulse pulse-delay-2" fill="#00B0FF" filter="url(#glow)" r="2.5" style="offset-path: path('M 500 175 V 60 H 150');"></circle>
+<circle class="data-pulse pulse-delay-3" fill="#00B0FF" filter="url(#glow)" r="2.5" style="offset-path: path('M 500 175 V 290 H 850');"></circle>
+<!-- Vias (Small Circles at turns) -->
+<circle cx="420" cy="100" fill="#0A0A14" r="2" stroke="#00C853" stroke-width="1"></circle>
+<circle cx="580" cy="250" fill="#0A0A14" r="2" stroke="#00C853" stroke-width="1"></circle>
+<circle cx="400" cy="240" fill="#0A0A14" r="2" stroke="#00C853" stroke-width="1"></circle>
+<circle cx="620" cy="100" fill="#0A0A14" r="2" stroke="#00C853" stroke-width="1"></circle>
+<circle cx="500" cy="60" fill="#0A0A14" r="2" stroke="#00B0FF" stroke-width="1"></circle>
+<circle cx="500" cy="290" fill="#0A0A14" r="2" stroke="#00B0FF" stroke-width="1"></circle>
+<!-- Center Chip -->
+<g filter="url(#glow)">
+<rect fill="#09090b" height="60" rx="2" stroke="#00C853" stroke-width="2" width="70" x="465" y="145"></rect>
+<text fill="#00C853" font-family="monospace" font-size="8" font-weight="bold" text-anchor="middle" x="500" y="170">HALCYON</text>
+<text fill="#00C853" font-family="monospace" font-size="7" text-anchor="middle" x="500" y="185">NODE-01</text>
+<!-- Pins -->
+<line stroke="#00C853" stroke-width="1" x1="465" x2="460" y1="155" y2="155"></line>
+<line stroke="#00C853" stroke-width="1" x1="465" x2="460" y1="165" y2="165"></line>
+<line stroke="#00C853" stroke-width="1" x1="465" x2="460" y1="175" y2="175"></line>
+<line stroke="#00C853" stroke-width="1" x1="465" x2="460" y1="185" y2="185"></line>
+<line stroke="#00C853" stroke-width="1" x1="465" x2="460" y1="195" y2="195"></line>
+<line stroke="#00C853" stroke-width="1" x1="535" x2="540" y1="155" y2="155"></line>
+<line stroke="#00C853" stroke-width="1" x1="535" x2="540" y1="165" y2="165"></line>
+<line stroke="#00C853" stroke-width="1" x1="535" x2="540" y1="175" y2="175"></line>
+<line stroke="#00C853" stroke-width="1" x1="535" x2="540" y1="185" y2="185"></line>
+<line stroke="#00C853" stroke-width="1" x1="535" x2="540" y1="195" y2="195"></line>
+</g>
+<!-- Peer Chips -->
+<g>
+<rect fill="#09090b" height="30" opacity="0.8" rx="1" stroke="#00C853" stroke-width="1" width="40" x="300" y="85"></rect>
+<text fill="#00C853" font-family="monospace" font-size="6" opacity="0.7" text-anchor="middle" x="320" y="125">192.158</text>
+<rect fill="#09090b" height="30" opacity="0.8" rx="1" stroke="#00C853" stroke-width="1" width="40" x="660" y="235"></rect>
+<text fill="#00C853" font-family="monospace" font-size="6" opacity="0.7" text-anchor="middle" x="680" y="275">203.0.11</text>
+<rect fill="#09090b" height="30" opacity="0.8" rx="1" stroke="#00C853" stroke-width="1" width="40" x="240" y="225"></rect>
+<text fill="#00C853" font-family="monospace" font-size="6" opacity="0.7" text-anchor="middle" x="260" y="265">81.56.16</text>
+<rect fill="#09090b" height="30" opacity="0.8" rx="1" stroke="#00C853" stroke-width="1" width="40" x="720" y="85"></rect>
+<text fill="#00C853" font-family="monospace" font-size="6" opacity="0.7" text-anchor="middle" x="740" y="125">45.79.20</text>
+</g>
+<!-- Relay Chips (Blue) -->
+<g>
+<rect fill="#09090b" height="30" rx="1" stroke="#00B0FF" stroke-width="1" width="40" x="110" y="45"></rect>
+<text fill="#00B0FF" font-family="monospace" font-size="6" text-anchor="middle" x="130" y="85">s1.ripple</text>
+<rect fill="#09090b" height="30" rx="1" stroke="#00B0FF" stroke-width="1" width="40" x="850" y="275"></rect>
+<text fill="#00B0FF" font-family="monospace" font-size="6" text-anchor="middle" x="870" y="315">s2.ripple</text>
+<rect fill="#09090b" height="30" rx="1" stroke="#00B0FF" stroke-width="1" width="50" x="800" y="45"></rect>
+<text fill="#00B0FF" font-family="monospace" font-size="6" text-anchor="middle" x="825" y="85">xrplcluster</text>
+<rect fill="#09090b" height="30" rx="1" stroke="#00B0FF" stroke-width="1" width="50" x="150" y="275"></rect>
+<text fill="#00B0FF" font-family="monospace" font-size="6" text-anchor="middle" x="175" y="315">r.ripple</text>
+</g>
+<!-- Silk-screen details -->
+<text fill="white" font-family="monospace" font-size="5" letter-spacing="2" opacity="0.1" x="400" y="50">HW_REV_2.1_CORE_SYNC</text>
+<text fill="white" font-family="monospace" font-size="5" letter-spacing="2" opacity="0.1" x="600" y="320">HALCYON_NET_LAYER_07</text>
+</svg>
+</div>
+</section>
+<div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+<!-- SECTION 2: CONNECTED PEERS TABLE -->
+<div class="lg:col-span-2 bg-zinc-950 border border-zinc-800 rounded flex flex-col">
+<div class="px-4 py-3 border-b border-zinc-800 flex justify-between items-center bg-zinc-900/50">
+<span class="text-xs font-bold text-green-500 uppercase tracking-widest">Active Connected Peers</span>
+<span class="text-[10px] text-zinc-500">8 NODES ONLINE</span>
+</div>
+<div class="overflow-x-auto">
+<table class="w-full text-left border-collapse">
+<thead>
+<tr class="text-[10px] text-zinc-500 uppercase tracking-tighter border-b border-zinc-800/50 bg-zinc-900/20">
+<th class="px-4 py-2 font-medium">Peer Address</th>
+<th class="px-4 py-2 font-medium text-center">Version</th>
+<th class="px-4 py-2 font-medium text-right">Latency</th>
+<th class="px-4 py-2 font-medium text-center">Status</th>
+<th class="px-4 py-2 font-medium text-right">Duration</th>
+</tr>
+</thead>
+<tbody class="text-xs">
+<tr class="border-b border-zinc-800/50 hover:bg-green-500/5 transition-colors">
+<td class="px-4 py-3 font-mono text-white">192.158.1.38:51235</td>
+<td class="px-4 py-3 text-center text-zinc-400">rippled-2.1.0</td>
+<td class="px-4 py-3 text-right text-green-500">12ms</td>
+<td class="px-4 py-3 text-center">
+<div class="flex items-center justify-center gap-2">
+<div class="w-1.5 h-1.5 rounded-full bg-green-500 shadow-[0_0_5px_rgba(0,200,83,0.5)]"></div>
+<span class="text-zinc-300">CONNECTED</span>
+</div>
+</td>
+<td class="px-4 py-3 text-right text-zinc-500">14d 02h</td>
+</tr>
+<tr class="border-b border-zinc-800/50 hover:bg-green-500/5 transition-colors">
+<td class="px-4 py-3 font-mono text-white">203.0.113.12:51235</td>
+<td class="px-4 py-3 text-center text-zinc-400">rippled-2.1.0</td>
+<td class="px-4 py-3 text-right text-green-500">18ms</td>
+<td class="px-4 py-3 text-center">
+<div class="flex items-center justify-center gap-2">
+<div class="w-1.5 h-1.5 rounded-full bg-green-500 shadow-[0_0_5px_rgba(0,200,83,0.5)]"></div>
+<span class="text-zinc-300">CONNECTED</span>
+</div>
+</td>
+<td class="px-4 py-3 text-right text-zinc-500">03d 12h</td>
+</tr>
+<tr class="border-b border-zinc-800/50 hover:bg-green-500/5 transition-colors">
+<td class="px-4 py-3 font-mono text-white">45.79.201.44:51235</td>
+<td class="px-4 py-3 text-center text-zinc-400">rippled-2.0.1</td>
+<td class="px-4 py-3 text-right text-yellow-500">45ms</td>
+<td class="px-4 py-3 text-center">
+<div class="flex items-center justify-center gap-2">
+<div class="w-1.5 h-1.5 rounded-full bg-yellow-500"></div>
+<span class="text-zinc-300">HANDSHAKE</span>
+</div>
+</td>
+<td class="px-4 py-3 text-right text-zinc-500">00d 01h</td>
+</tr>
+<tr class="border-b border-zinc-800/50 hover:bg-green-500/5 transition-colors">
+<td class="px-4 py-3 font-mono text-white">172.67.129.5:51235</td>
+<td class="px-4 py-3 text-center text-zinc-400">rippled-2.1.0</td>
+<td class="px-4 py-3 text-right text-green-500">22ms</td>
+<td class="px-4 py-3 text-center">
+<div class="flex items-center justify-center gap-2">
+<div class="w-1.5 h-1.5 rounded-full bg-green-500 shadow-[0_0_5px_rgba(0,200,83,0.5)]"></div>
+<span class="text-zinc-300">CONNECTED</span>
+</div>
+</td>
+<td class="px-4 py-3 text-right text-zinc-500">122d 15h</td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+<!-- SECTION 3: VALIDATION RELAY -->
+<div class="bg-zinc-950 border border-zinc-800 rounded">
+<div class="px-4 py-3 border-b border-zinc-800 bg-zinc-900/50">
+<span class="text-xs font-bold text-green-500 uppercase tracking-widest">Validation Relays</span>
+</div>
+<div class="p-4 space-y-4">
+<div class="p-3 bg-zinc-900/50 border border-zinc-800 rounded">
+<div class="flex justify-between items-start mb-1">
+<span class="text-[10px] text-white font-bold">s1.ripple.com:51235</span>
+<span class="text-[8px] bg-green-500/20 text-green-400 px-1.5 py-0.5 rounded">PRIMARY</span>
+</div>
+<div class="text-[10px] text-zinc-500 flex justify-between items-center">
+<span>Last Manifest: <span class="text-zinc-300">2024-05-20 14:22:01</span></span>
+<span class="material-symbols-outlined text-green-500 text-sm">check_circle</span>
+</div>
+</div>
+<div class="p-3 bg-zinc-900/50 border border-zinc-800 rounded">
+<div class="flex justify-between items-start mb-1">
+<span class="text-[10px] text-white font-bold">s2.ripple.com:51235</span>
+<span class="text-[8px] bg-green-500/20 text-green-400 px-1.5 py-0.5 rounded">BACKUP</span>
+</div>
+<div class="text-[10px] text-zinc-500 flex justify-between items-center">
+<span>Last Manifest: <span class="text-zinc-300">2024-05-20 14:22:05</span></span>
+<span class="material-symbols-outlined text-green-500 text-sm">check_circle</span>
+</div>
+</div>
+<div class="p-3 bg-zinc-900/50 border border-zinc-800 rounded">
+<div class="flex justify-between items-start mb-1">
+<span class="text-[10px] text-white font-bold">xrplcluster.com:51235</span>
+<span class="text-[8px] bg-zinc-800 text-zinc-500 px-1.5 py-0.5 rounded">COMMUNITY</span>
+</div>
+<div class="text-[10px] text-zinc-500 flex justify-between items-center">
+<span>Last Manifest: <span class="text-zinc-300">2024-05-20 14:21:58</span></span>
+<span class="material-symbols-outlined text-green-500 text-sm">check_circle</span>
+</div>
+</div>
+<div class="p-3 bg-zinc-900/50 border border-zinc-800 rounded">
+<div class="flex justify-between items-start mb-1">
+<span class="text-[10px] text-white font-bold">r.ripple.com:51235</span>
+<span class="text-[8px] bg-zinc-800 text-zinc-500 px-1.5 py-0.5 rounded">HUB</span>
+</div>
+<div class="text-[10px] text-zinc-500 flex justify-between items-center">
+<span>Last Manifest: <span class="text-zinc-300">2024-05-20 14:22:03</span></span>
+<span class="material-symbols-outlined text-yellow-500 text-sm">warning</span>
+</div>
+</div>
+</div>
+</div>
+</div>
+<!-- SECTION 4: NETWORK STATS -->
+<div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+<div class="p-4 bg-zinc-950 border border-zinc-800 rounded">
+<div class="text-[10px] text-zinc-500 uppercase tracking-widest mb-1">Inbound Connections</div>
+<div class="text-2xl font-black text-white">124</div>
+<div class="text-[10px] text-green-500 mt-1">↑ 12% vs last hour</div>
+</div>
+<div class="p-4 bg-zinc-950 border border-zinc-800 rounded">
+<div class="text-[10px] text-zinc-500 uppercase tracking-widest mb-1">Peer Discovery Rate</div>
+<div class="text-2xl font-black text-white">4.2 <span class="text-xs text-zinc-500 font-normal">p/h</span></div>
+<div class="text-[10px] text-zinc-500 mt-1">Stable baseline</div>
+</div>
+<div class="p-4 bg-zinc-950 border border-zinc-800 rounded">
+<div class="text-[10px] text-zinc-500 uppercase tracking-widest mb-1">Handshake Success</div>
+<div class="text-2xl font-black text-white">99.8%</div>
+<div class="text-[10px] text-green-500 mt-1">Optimal performance</div>
+</div>
+<div class="p-4 bg-zinc-950 border border-zinc-800 rounded">
+<div class="text-[10px] text-zinc-500 uppercase tracking-widest mb-1">Network Uptime</div>
+<div class="text-2xl font-black text-white">365d</div>
+<div class="text-[10px] text-green-500 mt-1">100.00% Availability</div>
+</div>
+</div>
+</main>
+<!-- Footer -->
+<footer class="fixed bottom-0 w-full z-50 bg-zinc-950 border-t border-zinc-800 flex justify-between items-center px-4 py-1 w-full">
+<span class="font-mono text-[10px] uppercase text-green-500">Halcyon XRPL System v1.0.4 - Status: Healthy</span>
+<div class="flex gap-4">
+<span class="font-mono text-[10px] uppercase text-zinc-400">Uptime: 99.99%</span>
+<span class="font-mono text-[10px] uppercase text-zinc-400">Latency: 12ms</span>
+<span class="font-mono text-[10px] uppercase text-zinc-400">Peers: 42</span>
+</div>
+</footer>
+</body></html>

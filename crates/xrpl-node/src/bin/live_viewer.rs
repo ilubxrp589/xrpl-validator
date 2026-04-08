@@ -1310,6 +1310,8 @@ async fn main() {
         .route("/validator", get(validator_page))
         .route("/incidents", get(incidents_page))
         .route("/historical", get(historical_page))
+        .route("/network", get(network_page))
+        .route("/page/:name", get(catch_all_page))
         .route("/dashboard", get(metrics_page))
         .route("/metrics", get({
             let prom_hash = state_hash_computer.clone();
@@ -2163,6 +2165,15 @@ async fn state_page() -> axum::response::Response { serve_static("state.html").a
 async fn validator_page() -> axum::response::Response { serve_static("validator.html").await }
 async fn incidents_page() -> axum::response::Response { serve_static("incidents.html").await }
 async fn historical_page() -> axum::response::Response { serve_static("historical.html").await }
+async fn network_page() -> axum::response::Response { serve_static("network.html").await }
+
+/// Catch-all: serve any page from static/ by name (e.g., /network → network.html)
+async fn catch_all_page(axum::extract::Path(page): axum::extract::Path<String>) -> axum::response::Response {
+    // Sanitize: only allow alphanumeric + hyphens + underscores
+    let clean: String = page.chars().filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_').collect();
+    if clean.is_empty() { return serve_static("validator.html").await; }
+    serve_static(&format!("{clean}.html")).await
+}
 
 async fn sse_handler(
     tx: broadcast::Sender<MessageEvent>,
