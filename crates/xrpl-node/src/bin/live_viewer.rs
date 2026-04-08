@@ -1311,7 +1311,7 @@ async fn main() {
         .route("/incidents", get(incidents_page))
         .route("/historical", get(historical_page))
         .route("/network", get(network_page))
-        .route("/page/:name", get(catch_all_page))
+        .route("/page/{name}", get(catch_all_page))
         .route("/dashboard", get(metrics_page))
         .route("/metrics", get({
             let prom_hash = state_hash_computer.clone();
