@@ -40,5 +40,8 @@ pub mod ffi_engine;
 #[cfg(feature = "ffi")]
 pub mod ffi_verifier;
 
+#[cfg(feature = "ffi")]
+pub mod stage3;
+
 pub use config::{NodeConfig, NodeMode};
 pub use error::NodeError;
