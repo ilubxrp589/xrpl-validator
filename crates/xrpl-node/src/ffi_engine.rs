@@ -702,6 +702,39 @@ impl Default for DivergenceLog {
     }
 }
 
+/// Extract the sender's AccountRoot keylet from a serialized XRPL transaction.
+///
+/// In canonical XRPL binary form, sfAccount is encoded as:
+///     [0x81] [0x14] [20 bytes of AccountID]
+///
+/// where 0x81 is the field code (type 8 / field 1) and 0x14 (20) is the
+/// VL-encoded length. We scan for this 2-byte pattern rather than just 0x81
+/// because random 0x81 bytes commonly appear inside SigningPubKey (33 bytes)
+/// and TxnSignature (~70 bytes), which canonically come BEFORE sfAccount in
+/// the serialized tx.
+///
+/// Returns the AccountRoot SLE keylet (`sha512_half(0x0061 || account_id)[..32]`),
+/// ready for direct use with the SLE provider.
+pub fn extract_sender_account_root_key(tx_bytes: &[u8]) -> Option<[u8; 32]> {
+    if tx_bytes.len() < 22 {
+        return None;
+    }
+    let end = tx_bytes.len() - 22;
+    for i in 0..=end {
+        if tx_bytes[i] == 0x81 && tx_bytes[i + 1] == 0x14 {
+            use sha2::{Digest, Sha512};
+            let mut h = Sha512::new();
+            h.update([0x00u8, 0x61]); // account root keylet prefix
+            h.update(&tx_bytes[i + 2..i + 22]);
+            let hash = h.finalize();
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&hash[..32]);
+            return Some(key);
+        }
+    }
+    None
+}
+
 pub type SharedFfiStats = Arc<Mutex<FfiStats>>;
 
 pub fn new_stats() -> SharedFfiStats {
@@ -966,28 +999,7 @@ pub fn apply_ledger_in_order(
         // This prevents cascading terPRE_SEQ for all subsequent txs from
         // this sender in this ledger.
         if outcome.ter_name == "terPRE_SEQ" {
-            // Extract sender AccountID from canonical binary form.
-            // sfAccount is field code 0x81, followed by VL length 0x14 (20),
-            // followed by 20 bytes of AccountID. The 2-byte pattern 0x81 0x14
-            // is far more selective than just 0x81 — random 0x81 bytes appear
-            // inside SigningPubKey/TxnSignature blobs but rarely followed by 0x14.
-            let mut sender_key = None;
-            if tx_bytes.len() >= 22 {
-                let end = tx_bytes.len() - 22;
-                for i in 0..=end {
-                    if tx_bytes[i] == 0x81 && tx_bytes[i + 1] == 0x14 {
-                        use sha2::{Sha512, Digest};
-                        let mut h = Sha512::new();
-                        h.update([0x00u8, 0x61]); // account root keylet prefix
-                        h.update(&tx_bytes[i + 2..i + 22]);
-                        let hash = h.finalize();
-                        let mut key = [0u8; 32];
-                        key.copy_from_slice(&hash[..32]);
-                        sender_key = Some(key);
-                        break;
-                    }
-                }
-            }
+            let sender_key = extract_sender_account_root_key(tx_bytes);
             if let Some(key) = sender_key {
                 // Try current ledger first, then ledger-1
                 let mut recovered = false;
@@ -1179,6 +1191,96 @@ mod tests {
     fn owned_snapshot_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<OwnedSnapshot>();
+    }
+
+    /// Real-world OfferCancel blob from mainnet ledger 103446686, tx
+    /// 0564259CCBFCD6F8B4132416ED1ECFEE5FF613183030F18DAF1AB0ABBC2259E2.
+    /// Sender: rMWVf1qJsgHgEd1Tuy378Zs53noKh4BujK
+    /// (AccountID hex E0F60CFE821A65D1DB15EB041359ECB0CA16F47A).
+    /// AccountRoot keylet: 91A0E3FA537D68D286B4452BD890BA6D2051800AE3EDED1797418D657B9D8537
+    ///
+    /// This is the exact tx type that bit us at ledger 103446686 — 75
+    /// terPRE_SEQ failures from this sender in one ledger because the old
+    /// scanner extracted the wrong account.
+    #[test]
+    fn extract_sender_real_offer_cancel_mainnet() {
+        // Canonical full blob fetched from mainnet via xrplcluster.
+        let blob = hex::decode(
+            "12000824061B23BC2019061B238D68400000000000000A7321ED8EDE2A52E0BB5D6AE861D\
+             87B08D80D01369944B703095A439515C704B75D0AE674401A24DA6F655EE58419034B7358\
+             494AD3E37EF43232052E4C92ABA9A6A03A62B7993867848BCA8E0D039028CA2B51EED5F2F\
+             079B6B08437EC3B0AEE6FE20CA1068114E0F60CFE821A65D1DB15EB041359ECB0CA16F47A"
+                .replace([' ', '\n', '\r', '\t'], "")
+                .as_str(),
+        )
+        .unwrap();
+        assert_eq!(blob.len(), 146, "real OfferCancel blob is 146 bytes");
+
+        let key = extract_sender_account_root_key(&blob).expect("must extract");
+        let expected = hex::decode(
+            "91A0E3FA537D68D286B4452BD890BA6D2051800AE3EDED1797418D657B9D8537",
+        )
+        .unwrap();
+        assert_eq!(&key[..], &expected[..], "AccountRoot keylet must match the rMWVf1qJ... account");
+    }
+
+    /// Regression test for the off-by-one bug. The OLD scanner did
+    /// `hash(tx_bytes[i+1..i+21])` which included the VL length byte (0x14)
+    /// and dropped the last account byte. The buggy keylet for the real
+    /// rMWVf1qJ... blob is `DA85A0C9200C6CF3...` — make sure we never
+    /// produce that hash again.
+    #[test]
+    fn extract_sender_off_by_one_regression() {
+        let blob = hex::decode(
+            "12000824061B23BC2019061B238D68400000000000000A7321ED8EDE2A52E0BB5D6AE861D\
+             87B08D80D01369944B703095A439515C704B75D0AE674401A24DA6F655EE58419034B7358\
+             494AD3E37EF43232052E4C92ABA9A6A03A62B7993867848BCA8E0D039028CA2B51EED5F2F\
+             079B6B08437EC3B0AEE6FE20CA1068114E0F60CFE821A65D1DB15EB041359ECB0CA16F47A"
+                .replace([' ', '\n', '\r', '\t'], "")
+                .as_str(),
+        )
+        .unwrap();
+        let key = extract_sender_account_root_key(&blob).unwrap();
+        let buggy = hex::decode(
+            "DA85A0C9200C6CF3C8F65A02EBBDDEF656CC86B80791F83EC0276FFEEAA247B8",
+        )
+        .unwrap();
+        assert_ne!(&key[..], &buggy[..], "must NOT reproduce the off-by-one keylet");
+    }
+
+    /// Synthetic test: a stray 0x81 byte (not followed by 0x14) appears in
+    /// the SigningPubKey. The OLD scanner would have grabbed the next 20
+    /// bytes after that stray and built a totally wrong keylet. The fixed
+    /// scanner requires the 2-byte pattern `[0x81, 0x14]` and skips past
+    /// the false match.
+    #[test]
+    fn extract_sender_skips_false_0x81_match() {
+        // Construct: [stray 0x81, 0xFF, 30 random bytes, real 0x81, 0x14, 20 zero bytes]
+        let mut blob = Vec::new();
+        blob.push(0x81);
+        blob.push(0xFF);
+        blob.extend_from_slice(&[0xAB; 30]);
+        blob.push(0x81);
+        blob.push(0x14);
+        blob.extend_from_slice(&[0u8; 20]);
+
+        let key = extract_sender_account_root_key(&blob).unwrap();
+
+        // Expected keylet for the all-zero AccountID
+        use sha2::{Digest, Sha512};
+        let mut h = Sha512::new();
+        h.update([0x00u8, 0x61]);
+        h.update([0u8; 20]);
+        let expected = h.finalize();
+        assert_eq!(&key[..], &expected[..32]);
+    }
+
+    /// Buffer too short to contain even an sfAccount field.
+    #[test]
+    fn extract_sender_returns_none_when_too_short() {
+        assert!(extract_sender_account_root_key(&[]).is_none());
+        assert!(extract_sender_account_root_key(&[0x81; 21]).is_none());
+        assert!(extract_sender_account_root_key(&[0x81; 22]).is_none()); // no 0x14 after
     }
 
     /// OwnedSnapshot survives the DB's original borrow lifetime going out of

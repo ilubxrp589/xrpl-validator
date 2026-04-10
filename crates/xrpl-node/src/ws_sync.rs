@@ -849,3 +849,125 @@ async fn fetch_account_hash(rpc: &RippledClient, seq: u32) -> Option<String> {
     let body = rpc.call("ledger", serde_json::json!({"ledger_index": seq})).await.ok()?;
     body["result"]["ledger"]["account_hash"].as_str().map(String::from)
 }
+
+#[cfg(all(test, feature = "ffi"))]
+mod tests {
+    use super::*;
+
+    fn key_hex_for(seed: u8) -> String {
+        // 32 bytes = 64 hex chars; fill with the seed for deterministic test keys.
+        let mut k = String::with_capacity(64);
+        for _ in 0..32 {
+            k.push_str(&format!("{seed:02X}"));
+        }
+        k
+    }
+
+    /// Modified key with present RPC bytes lands as `Some(data)` in the overlay.
+    #[test]
+    fn shadow_overlay_present_modified_key() {
+        let key = key_hex_for(0xAA);
+        let data_hex = "DEADBEEF".to_string();
+        let rpc_objects = vec![(key.clone(), Some(data_hex.clone()))];
+        let deleted: HashSet<String> = HashSet::new();
+
+        let overlay = build_shadow_overlay(&rpc_objects, &deleted);
+
+        assert_eq!(overlay.len(), 1);
+        let key_bytes: [u8; 32] = hex::decode(&key).unwrap().try_into().unwrap();
+        assert_eq!(overlay.get(&key_bytes).unwrap().as_ref().unwrap(), &hex::decode(&data_hex).unwrap());
+    }
+
+    /// Modified key that rippled reports as `entryNotFound` (`classified = None`)
+    /// MUST appear as a tombstone (`Some(None)`) in the overlay, not be silently
+    /// dropped. This is the bug we just fixed.
+    #[test]
+    fn shadow_overlay_modified_key_entry_not_found_becomes_tombstone() {
+        let key = key_hex_for(0xBB);
+        let rpc_objects = vec![(key.clone(), None)];
+        let deleted: HashSet<String> = HashSet::new();
+
+        let overlay = build_shadow_overlay(&rpc_objects, &deleted);
+
+        let key_bytes: [u8; 32] = hex::decode(&key).unwrap().try_into().unwrap();
+        assert_eq!(overlay.len(), 1, "modified+entryNotFound must NOT be dropped");
+        assert!(overlay.get(&key_bytes).unwrap().is_none(), "must be tombstone");
+    }
+
+    /// A key that's in the deleted set always becomes a tombstone, even if its
+    /// rpc_objects entry was somehow `Some(...)`.
+    #[test]
+    fn shadow_overlay_deleted_set_always_wins() {
+        let key = key_hex_for(0xCC);
+        let rpc_objects = vec![(key.clone(), Some("01020304".to_string()))];
+        let mut deleted: HashSet<String> = HashSet::new();
+        deleted.insert(key.clone());
+
+        let overlay = build_shadow_overlay(&rpc_objects, &deleted);
+
+        let key_bytes: [u8; 32] = hex::decode(&key).unwrap().try_into().unwrap();
+        assert_eq!(overlay.len(), 1);
+        assert!(overlay.get(&key_bytes).unwrap().is_none());
+    }
+
+    /// A key that's only in the deleted set (never appears in rpc_objects)
+    /// must still land in the overlay as a tombstone.
+    #[test]
+    fn shadow_overlay_deleted_only_key_lands_as_tombstone() {
+        let key = key_hex_for(0xDD);
+        let rpc_objects: Vec<(String, Option<String>)> = vec![];
+        let mut deleted: HashSet<String> = HashSet::new();
+        deleted.insert(key.clone());
+
+        let overlay = build_shadow_overlay(&rpc_objects, &deleted);
+
+        let key_bytes: [u8; 32] = hex::decode(&key).unwrap().try_into().unwrap();
+        assert_eq!(overlay.len(), 1);
+        assert!(overlay.get(&key_bytes).unwrap().is_none());
+    }
+
+    /// Mixed case: 1 modified+present, 1 modified+notfound, 1 deleted-only.
+    /// The pre-fix bug would have produced overlay.len() == 2 (silently
+    /// dropping the modified+notfound key). Fixed code returns 3.
+    #[test]
+    fn shadow_overlay_mixed_modes_yields_complete_overlay() {
+        let k_present = key_hex_for(0x11);
+        let k_notfound = key_hex_for(0x22);
+        let k_deleted = key_hex_for(0x33);
+
+        let rpc_objects = vec![
+            (k_present.clone(), Some("AABBCCDD".to_string())),
+            (k_notfound.clone(), None),
+            (k_deleted.clone(), None),
+        ];
+        let mut deleted: HashSet<String> = HashSet::new();
+        deleted.insert(k_deleted.clone());
+
+        let overlay = build_shadow_overlay(&rpc_objects, &deleted);
+
+        assert_eq!(overlay.len(), 3, "no key may be silently dropped");
+
+        let kp: [u8; 32] = hex::decode(&k_present).unwrap().try_into().unwrap();
+        let kn: [u8; 32] = hex::decode(&k_notfound).unwrap().try_into().unwrap();
+        let kd: [u8; 32] = hex::decode(&k_deleted).unwrap().try_into().unwrap();
+
+        assert!(overlay.get(&kp).unwrap().is_some(), "present must carry bytes");
+        assert!(overlay.get(&kn).unwrap().is_none(), "notfound must be tombstone");
+        assert!(overlay.get(&kd).unwrap().is_none(), "deleted must be tombstone");
+    }
+
+    /// Malformed key entries (wrong hex length, bad hex) must be skipped
+    /// without panicking and without polluting the overlay.
+    #[test]
+    fn shadow_overlay_skips_malformed_keys() {
+        let rpc_objects = vec![
+            ("not-hex".to_string(), Some("DEADBEEF".to_string())),
+            ("AA".to_string(), Some("DEADBEEF".to_string())),
+            (key_hex_for(0xEE), Some("CAFEBABE".to_string())),
+        ];
+        let deleted: HashSet<String> = HashSet::new();
+
+        let overlay = build_shadow_overlay(&rpc_objects, &deleted);
+        assert_eq!(overlay.len(), 1, "only the well-formed key survives");
+    }
+}
