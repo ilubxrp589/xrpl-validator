@@ -1,8 +1,21 @@
 //! Bulk state sync with inline SHAMap build.
 //!
-//! Workers download in parallel → send objects through unbounded channel.
+//! Workers download in parallel → send objects through bounded channel.
 //! Builder thread receives objects, writes to RocksDB AND builds SHAMap.
-//! When download finishes, SHAMap is ready within seconds — zero gap.
+//! When download finishes, the locally-built SHAMap root is verified against
+//! rippled's `account_hash` for the seed ledger. The `dl_done.txt` marker
+//! (which downstream code uses as "the database is ready") is ONLY written
+//! after that verification passes.
+//!
+//! This is the safety net for a class of silent-gap bugs we hit during the
+//! 63K-ledger battle test on m3060: rippled occasionally returned a partial
+//! `ledger_data` page (missing leaves it didn't have locally cached) and we
+//! trusted whatever came back. After catchup, ~91 specific SLEs were missing
+//! from `state.rocks`, which manifested as 290 false `tefBAD_LEDGER`
+//! divergences whenever an `AccountDelete` walked an owner directory that
+//! pointed to one of the missing keys. With root verification, that gap is
+//! caught BEFORE the marker is written, the next startup re-syncs, and the
+//! catchup never sees those false divergences.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU32, Ordering};
@@ -22,6 +35,46 @@ fn primary_rpc_endpoint() -> String {
     std::env::var("XRPL_RPC_URL").unwrap_or_else(|_| RPC_ENDPOINTS[0].to_string())
 }
 const NUM_WORKERS: u32 = 4;
+
+/// Parse the `complete_ledgers` field from rippled's `server_info` response.
+/// The string is comma-separated half-open ranges like `"32570-32802,103468480-103475279"`
+/// (or `"empty"` if rippled has no ledgers). Returns inclusive `(lo, hi)` pairs.
+pub fn parse_complete_ledgers(s: &str) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    if s.trim().eq_ignore_ascii_case("empty") {
+        return out;
+    }
+    for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        if let Some((a, b)) = part.split_once('-') {
+            if let (Ok(lo), Ok(hi)) = (a.trim().parse::<u32>(), b.trim().parse::<u32>()) {
+                if lo <= hi {
+                    out.push((lo, hi));
+                }
+            }
+        } else if let Ok(n) = part.parse::<u32>() {
+            out.push((n, n));
+        }
+    }
+    out
+}
+
+/// Returns true iff `seq` falls inside any of the given inclusive ranges.
+/// Used to verify the seed ledger has FULL state on the chosen rippled
+/// before we start paginating `ledger_data` against it.
+pub fn seed_in_complete_ledgers(seq: u32, ranges: &[(u32, u32)]) -> bool {
+    ranges.iter().any(|&(lo, hi)| seq >= lo && seq <= hi)
+}
+
+/// Compare a locally-built SHAMap root hash to rippled's reported
+/// `account_hash` for the same ledger. Both inputs are uppercased and
+/// trimmed before comparison so cosmetic differences don't cause a false
+/// negative. Returns `(matched, ours_upper, theirs_upper)`.
+pub fn verify_root_against_account_hash(ours: &Hash256, theirs: &str) -> (bool, String, String) {
+    let ours_hex = hex::encode_upper(ours.0);
+    let theirs_hex = theirs.trim().to_ascii_uppercase();
+    let matched = !theirs_hex.is_empty() && ours_hex == theirs_hex;
+    (matched, ours_hex, theirs_hex)
+}
 
 /// Try RPC request against each endpoint until one succeeds.
 /// Uses XRPL_RPC_URL env override as the first endpoint if set.
@@ -57,6 +110,10 @@ pub struct BulkSyncStatus {
     pub estimated_remaining_secs: f64,
     pub workers_done: u32,
     pub workers_total: u32,
+    /// Set to true after the post-build SHAMap root has been verified
+    /// against rippled's `account_hash` for the seed ledger. Stays false
+    /// if the verification failed or could not be performed.
+    pub verified: bool,
 }
 
 pub struct BulkSyncer {
@@ -90,12 +147,13 @@ impl BulkSyncer {
         let pinned_out = self.pinned_seq.clone();
         synced.store(0, Ordering::Relaxed);
 
+        let init_client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build().unwrap();
+
         let pinned_seq: u32 = {
-            let client = reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build().unwrap();
             let body = serde_json::json!({"method":"ledger","params":[{"ledger_index":"validated"}]});
-            match rpc_failover(&client, &body) {
+            match rpc_failover(&init_client, &body) {
                 Ok(json) => {
                     json["result"]["ledger_index"].as_u64()
                         .or_else(|| json["result"]["ledger"]["ledger_index"]
@@ -109,6 +167,30 @@ impl BulkSyncer {
             eprintln!("[sync] FATAL: could not fetch validated ledger seq");
             self.running.store(false, Ordering::SeqCst);
             return;
+        }
+
+        // PRECONDITION: the seed ledger MUST be inside rippled's
+        // `complete_ledgers` range. If it's not, ledger_data will silently
+        // return partial pages and we'll end up with an incomplete
+        // state.rocks. The sync would "succeed" but Stage 2 / Stage 3 would
+        // diverge later. Better to fail loudly here.
+        let server_info_body = serde_json::json!({"method":"server_info","params":[{}]});
+        match rpc_failover(&init_client, &server_info_body) {
+            Ok(json) => {
+                let cl_str = json["result"]["info"]["complete_ledgers"].as_str().unwrap_or("");
+                let ranges = parse_complete_ledgers(cl_str);
+                if !seed_in_complete_ledgers(pinned_seq, &ranges) {
+                    eprintln!(
+                        "[sync] FATAL: seed ledger #{pinned_seq} is NOT in rippled's complete_ledgers ({cl_str:?}) — refusing to start, would produce incomplete state"
+                    );
+                    self.running.store(false, Ordering::SeqCst);
+                    return;
+                }
+                eprintln!("[sync] OK: seed #{pinned_seq} is inside complete_ledgers ({cl_str})");
+            }
+            Err(e) => {
+                eprintln!("[sync] WARNING: could not query server_info to verify complete_ledgers ({e}) — proceeding anyway");
+            }
         }
         pinned_out.store(pinned_seq, Ordering::SeqCst);
         eprintln!("[sync] Pinning to #{pinned_seq} ({NUM_WORKERS} workers + inline SHAMap)");
@@ -154,13 +236,27 @@ impl BulkSyncer {
                         .json(&serde_json::json!({"method":"ledger_data","params":[params]}))
                         .send() {
                         Ok(r) => r,
-                        Err(_) => { errors += 1; std::thread::sleep(std::time::Duration::from_secs(2));
-                            if errors > 50 { break; } continue; }
+                        Err(e) => {
+                            errors += 1;
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                            if errors > 50 {
+                                eprintln!("[{label}] FATAL: aborting after {errors} send errors at marker {marker:?} — STATE WILL BE INCOMPLETE (last err: {e})");
+                                break;
+                            }
+                            continue;
+                        }
                     };
                     let body: serde_json::Value = match resp.json() {
                         Ok(b) => b,
-                        Err(_) => { errors += 1; std::thread::sleep(std::time::Duration::from_secs(2));
-                            if errors > 50 { break; } continue; }
+                        Err(e) => {
+                            errors += 1;
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                            if errors > 50 {
+                                eprintln!("[{label}] FATAL: aborting after {errors} JSON parse errors at marker {marker:?} — STATE WILL BE INCOMPLETE (last err: {e})");
+                                break;
+                            }
+                            continue;
+                        }
                     };
 
                     let mut page_batch: Vec<([u8; 32], Vec<u8>)> = Vec::with_capacity(2048);
@@ -253,12 +349,56 @@ impl BulkSyncer {
             eprintln!("[sync] DONE: {count} objects in {elapsed:.0}s ({:.0}/s) — SHAMap hash={}",
                 count as f64 / elapsed, hex::encode(&root.0[..8]));
 
-            let data_dir = std::env::var("XRPL_DATA_DIR")
-                .unwrap_or_else(|_| "/mnt/xrpl-data/sync".to_string());
-            let _ = std::fs::write(
-                format!("{data_dir}/dl_done.txt"),
-                format!("ledger #{pinned_seq} — {count} objects"),
-            );
+            // POST-CONDITION: our locally-built SHAMap MUST match rippled's
+            // account_hash for the seed ledger. If it doesn't, we silently
+            // missed leaves (rippled returned partial pages, a worker hit
+            // its error abort, etc.) and `state.rocks` is incomplete.
+            // Refuse to write the dl_done.txt marker so the next startup
+            // re-runs the sync, instead of pretending success and leaking
+            // false divergences during catchup.
+            let verify_client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .ok();
+            let mut seed_account_hash = String::new();
+            if let Some(c) = &verify_client {
+                let body = serde_json::json!({
+                    "method":"ledger",
+                    "params":[{"ledger_index": pinned_seq, "transactions": false, "expand": false, "binary": false}]
+                });
+                if let Ok(j) = rpc_failover(c, &body) {
+                    seed_account_hash = j["result"]["ledger"]["account_hash"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                }
+            }
+            let (matched, ours_hex, theirs_hex) =
+                verify_root_against_account_hash(&root, &seed_account_hash);
+
+            if matched {
+                eprintln!("[sync] VERIFIED: SHAMap root matches rippled account_hash for #{pinned_seq} ({})", &ours_hex[..16]);
+                let data_dir = std::env::var("XRPL_DATA_DIR")
+                    .unwrap_or_else(|_| "/mnt/xrpl-data/sync".to_string());
+                let _ = std::fs::write(
+                    format!("{data_dir}/dl_done.txt"),
+                    format!("ledger #{pinned_seq} — {count} objects"),
+                );
+            } else if seed_account_hash.is_empty() {
+                eprintln!(
+                    "[sync] WARNING: could not fetch seed account_hash for #{pinned_seq} — writing dl_done.txt without verification (downstream catchup will detect drift)"
+                );
+                let data_dir = std::env::var("XRPL_DATA_DIR")
+                    .unwrap_or_else(|_| "/mnt/xrpl-data/sync".to_string());
+                let _ = std::fs::write(
+                    format!("{data_dir}/dl_done.txt"),
+                    format!("ledger #{pinned_seq} — {count} objects (UNVERIFIED)"),
+                );
+            } else {
+                eprintln!(
+                    "[sync] FATAL: SHAMap root MISMATCH for seed #{pinned_seq}\n         ours    = {ours_hex}\n         rippled = {theirs_hex}\n         Refusing to write dl_done.txt — state.rocks is incomplete. Wipe sync data and retry."
+                );
+            }
 
             *shamap_out.lock() = Some(shamap);
             let mut s = status.lock();
@@ -268,7 +408,135 @@ impl BulkSyncer {
             s.rate = count as f64 / elapsed;
             s.estimated_remaining_secs = 0.0;
             s.workers_done = NUM_WORKERS;
+            s.verified = matched;
             running.store(false, Ordering::SeqCst);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- parse_complete_ledgers ----
+
+    #[test]
+    fn parse_complete_ledgers_single_range() {
+        let r = parse_complete_ledgers("103468480-103475279");
+        assert_eq!(r, vec![(103468480, 103475279)]);
+    }
+
+    #[test]
+    fn parse_complete_ledgers_multiple_ranges() {
+        let r = parse_complete_ledgers("32570-32802,103468480-103475279");
+        assert_eq!(r, vec![(32570, 32802), (103468480, 103475279)]);
+    }
+
+    #[test]
+    fn parse_complete_ledgers_handles_empty() {
+        assert!(parse_complete_ledgers("empty").is_empty());
+        assert!(parse_complete_ledgers("EMPTY").is_empty());
+        assert!(parse_complete_ledgers("").is_empty());
+    }
+
+    #[test]
+    fn parse_complete_ledgers_handles_whitespace_and_singles() {
+        let r = parse_complete_ledgers("  100 , 200-300 , 500  ");
+        assert_eq!(r, vec![(100, 100), (200, 300), (500, 500)]);
+    }
+
+    #[test]
+    fn parse_complete_ledgers_skips_malformed_segments() {
+        let r = parse_complete_ledgers("garbage,100-200,bad-range,300-400");
+        assert_eq!(r, vec![(100, 200), (300, 400)]);
+    }
+
+    #[test]
+    fn parse_complete_ledgers_skips_inverted_range() {
+        let r = parse_complete_ledgers("500-100,200-300");
+        assert_eq!(r, vec![(200, 300)]);
+    }
+
+    // ---- seed_in_complete_ledgers ----
+
+    #[test]
+    fn seed_inside_single_range() {
+        let r = vec![(100, 200)];
+        assert!(seed_in_complete_ledgers(150, &r));
+        assert!(seed_in_complete_ledgers(100, &r)); // boundary
+        assert!(seed_in_complete_ledgers(200, &r)); // boundary
+    }
+
+    #[test]
+    fn seed_outside_all_ranges() {
+        let r = vec![(100, 200), (500, 600)];
+        assert!(!seed_in_complete_ledgers(50, &r));
+        assert!(!seed_in_complete_ledgers(300, &r));
+        assert!(!seed_in_complete_ledgers(700, &r));
+    }
+
+    #[test]
+    fn seed_inside_one_of_many_ranges() {
+        let r = vec![(100, 200), (500, 600)];
+        assert!(seed_in_complete_ledgers(550, &r));
+    }
+
+    #[test]
+    fn seed_against_empty_ranges_is_false() {
+        assert!(!seed_in_complete_ledgers(123, &[]));
+    }
+
+    /// The exact regression case: m3060's local rippled retention was
+    /// `103468480-103475279` and we tried to bulk sync from a much older
+    /// seed `103411239`. The new precondition would catch that.
+    #[test]
+    fn seed_outside_retention_is_caught() {
+        let ranges = parse_complete_ledgers("103468480-103475279");
+        assert!(!seed_in_complete_ledgers(103_411_239, &ranges));
+        assert!(seed_in_complete_ledgers(103_475_000, &ranges));
+    }
+
+    // ---- verify_root_against_account_hash ----
+
+    #[test]
+    fn root_verify_matches_case_insensitive() {
+        let root = Hash256([0xAB; 32]);
+        let theirs = "abababababababababababababababababababababababababababababababab";
+        let (matched, ours, them) = verify_root_against_account_hash(&root, theirs);
+        assert!(matched);
+        assert_eq!(ours, "AB".repeat(32));
+        assert_eq!(them, "AB".repeat(32));
+    }
+
+    #[test]
+    fn root_verify_matches_with_whitespace() {
+        let root = Hash256([0xCD; 32]);
+        let theirs = "  CDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCD  ";
+        let (matched, _, _) = verify_root_against_account_hash(&root, theirs);
+        assert!(matched);
+    }
+
+    #[test]
+    fn root_verify_detects_mismatch() {
+        let root = Hash256([0xAA; 32]);
+        let theirs = "BB".repeat(32);
+        let (matched, ours, them) = verify_root_against_account_hash(&root, &theirs);
+        assert!(!matched);
+        assert_eq!(ours, "AA".repeat(32));
+        assert_eq!(them, "BB".repeat(32));
+    }
+
+    #[test]
+    fn root_verify_empty_theirs_is_not_matched() {
+        let root = Hash256([0xFF; 32]);
+        let (matched, _, _) = verify_root_against_account_hash(&root, "");
+        assert!(!matched, "an empty hash from rippled must NOT be treated as a match");
+    }
+
+    #[test]
+    fn root_verify_whitespace_only_theirs_is_not_matched() {
+        let root = Hash256([0xFF; 32]);
+        let (matched, _, _) = verify_root_against_account_hash(&root, "   \n   ");
+        assert!(!matched);
     }
 }
