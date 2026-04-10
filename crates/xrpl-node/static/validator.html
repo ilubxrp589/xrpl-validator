@@ -73,54 +73,16 @@
 <div class="flex items-center gap-8">
 <span class="text-xl font-black tracking-tighter text-green-500">HALCYON XRPL</span>
 <nav class="hidden md:flex gap-6">
-<a class="text-green-400 border-b-2 border-green-500 pb-1 transition-colors duration-150" href="#">Dashboard</a>
-<a class="text-slate-400 hover:text-green-300 hover:bg-slate-900 transition-colors duration-150" href="#">Ledger</a>
-<a class="text-slate-400 hover:text-green-300 hover:bg-slate-900 transition-colors duration-150" href="#">Network</a>
-<a class="text-slate-400 hover:text-green-300 hover:bg-slate-900 transition-colors duration-150" href="#">Governance</a>
-<a class="text-slate-400 hover:text-green-300 hover:bg-slate-900 transition-colors duration-150" href="#">Config</a>
+<a class="text-green-400 border-b-2 border-green-500 pb-1 transition-colors duration-150" href="/">Dashboard</a>
+<a class="text-slate-400 hover:text-green-300 hover:bg-slate-900 transition-colors duration-150" href="/historical">Historical</a>
+<span class="text-slate-700 cursor-not-allowed">Network</span>
+<a class="text-slate-400 hover:text-green-300 hover:bg-slate-900 transition-colors duration-150" href="/consensus">Consensus</a>
+<a class="text-slate-400 hover:text-green-300 hover:bg-slate-900 transition-colors duration-150" href="/peers">Peers</a>
 </nav>
 </div>
-<div class="flex items-center gap-4">
-<div class="hidden sm:flex items-center gap-2 px-3 py-1 bg-slate-900 border border-slate-800 rounded">
-<span class="material-symbols-outlined text-xs">search</span>
-<span class="text-slate-500 uppercase text-[10px]">search_ledger...</span>
-</div>
-<span class="material-symbols-outlined text-slate-400 cursor-pointer hover:text-green-300">settings</span>
-<span class="material-symbols-outlined text-slate-400 cursor-pointer hover:text-green-300">notifications_active</span>
-<img alt="Validator Node Admin" class="w-8 h-8 rounded border border-slate-700" data-alt="abstract circular server farm visual with green circuit patterns representing node administrative control panel avatar" src="https://lh3.googleusercontent.com/aida-public/AB6AXuD2GGTqZC1AluMfHK-aFo4rO-y0qddI1aiMT2uXuF5gxqwR9F67bxfnNkb6LRkkjvhCITjQ_MpB_YpIkLgL4GT_r81LHBSbFn09HWfVf-pF9gcloPx5W5YR7DQ8YbQbvqGMBaWXRtN92b-1IhdxO4U6YJG4VD95TT0DG-UT_m5rd2uauOQL8842tFJ0tZGqTV54h2IvBkuLJhu-KYHJFfOXcBYGvFfzorXbwaR_igzwzkR97DrqBh9EhvBU6TlN5G7WH4wLNWc83n8"/>
-</div>
 </header>
-<!-- SideNavBar - Shared Component -->
-<aside class="bg-slate-950 text-green-500 font-mono text-xs fixed left-0 top-14 flex flex-col items-center py-4 space-y-6 docked left-0 h-screen border-r border-slate-800 w-20 z-40">
-<div class="flex flex-col items-center gap-1 mb-4">
-<span class="material-symbols-outlined text-2xl text-green-500">memory</span>
-<span class="text-[10px] text-slate-500 font-bold">NODE-01</span>
-</div>
-<div class="flex flex-col gap-8 w-full">
-<a href="/" class="flex flex-col items-center gap-1 w-full py-2 bg-green-500/10 text-green-500 border-r-2 border-green-500">
-<span class="material-symbols-outlined">monitoring</span>
-<span>Real-time</span>
-</a>
-<a href="/historical" class="flex flex-col items-center gap-1 w-full py-2 text-slate-500 hover:bg-slate-900 hover:text-slate-300">
-<span class="material-symbols-outlined">history</span>
-<span>Historical</span>
-</a>
-<a href="/feed" class="flex flex-col items-center gap-1 w-full py-2 text-slate-500 hover:bg-slate-900 hover:text-slate-300">
-<span class="material-symbols-outlined">terminal</span>
-<span>Feed</span>
-</a>
-<a href="/peers" class="flex flex-col items-center gap-1 w-full py-2 text-slate-500 hover:bg-slate-900 hover:text-slate-300">
-<span class="material-symbols-outlined">hub</span>
-<span>Peers</span>
-</a>
-<a href="/consensus" class="flex flex-col items-center gap-1 w-full py-2 text-slate-500 hover:bg-slate-900 hover:text-slate-300">
-<span class="material-symbols-outlined">pulse_alert</span>
-<span>Consensus</span>
-</a>
-</div>
-</aside>
 <!-- Main Content Canvas -->
-<main class="flex-grow ml-20 mt-14 p-6 space-y-6 grid-bg">
+<main class="flex-grow mt-14 p-6 space-y-6 grid-bg">
 <!-- SECTION 1: HERO BANNER -->
 <section class="relative bg-slate-900 border border-slate-800 rounded-lg p-8 overflow-hidden group">
 <div class="absolute inset-0 bg-gradient-to-br from-green-500/5 via-transparent to-transparent"></div>
@@ -159,7 +121,7 @@
 </div>
 <span class="bg-slate-700 text-slate-300 font-mono text-[10px] px-2 py-0.5 rounded">3.2.0-b0</span>
 </div>
-<div class="p-6 grid grid-cols-1 lg:grid-cols-2 gap-8">
+<div class="p-6 space-y-6">
 <!-- Stats Grid -->
 <div class="space-y-6">
 <div class="grid grid-cols-4 gap-4 border-b border-slate-800 pb-4">
@@ -202,75 +164,38 @@
 <span class="text-[8px] text-slate-600 mt-0.5">worst-case (slowest 1%)</span>
 </div>
 </div>
-</div>
-<!-- Live Tx Type Bars -->
+</div><!-- end stats -->
+<!-- Transaction Flow — Stacked Streaming Area -->
 <div class="flex flex-col">
-<div class="flex justify-between items-center mb-3">
-<span class="text-[9px] text-slate-500 font-bold uppercase tracking-widest">Transaction Types</span>
-<span class="text-[9px] font-mono text-slate-500" id="ffi-total-types">0 types</span>
+<div class="flex justify-between items-center mb-2">
+<div class="flex items-center gap-2">
+<span class="font-mono text-[9px] font-bold tracking-widest text-green-500 uppercase">TRANSACTION FLOW</span>
+<span class="h-1.5 w-1.5 bg-green-500 rounded-full animate-pulse"></span>
 </div>
-<div id="tx-type-bars" class="space-y-1.5" style="min-height:200px"></div>
+<span class="text-[9px] font-mono text-slate-500" id="ffi-total-types">0 txs</span>
+</div>
+<div style="height:275px;position:relative;background:#0A0A14;border-radius:6px;border:1px solid #1A1A24;overflow:hidden">
+<canvas id="streamCanvas" style="position:absolute;top:0;left:0;width:100%;height:100%"></canvas>
+</div>
 </div>
 </div>
 </section>
-<!-- SECTION 3: NETWORK + CONSENSUS -->
-<section class="grid grid-cols-1 md:grid-cols-2 gap-6">
-<!-- Network Card -->
-<div class="bg-slate-900 border border-slate-800 rounded-lg p-6 flex flex-col justify-between">
-<div>
-<h3 class="font-headline text-xs font-bold text-slate-500 uppercase tracking-widest mb-6">Network Topology</h3>
-<div class="space-y-4">
-<div class="flex justify-between items-center">
-<span class="font-body text-sm text-slate-300">Peers Connected</span>
-<span class="font-mono text-sm text-green-500" id="net-peers">8</span>
+<!-- SECTION 3: CONSENSUS PCB -->
+<section class="bg-slate-900 border border-slate-800 rounded-lg overflow-hidden">
+<div class="bg-slate-800/40 px-6 py-3 flex justify-between items-center">
+<div class="flex items-center gap-2">
+<span class="material-symbols-outlined text-slate-400 text-sm">how_to_vote</span>
+<h2 class="font-headline font-bold text-slate-200 uppercase tracking-wider text-xs">Consensus</h2>
+<span class="h-1.5 w-1.5 bg-green-500 rounded-full animate-pulse"></span>
 </div>
-<div class="flex justify-between items-center">
-<span class="font-body text-sm text-slate-300">Peer Discovery</span>
-<span class="flex items-center gap-2 font-mono text-[10px] px-2 py-0.5 bg-green-500/10 text-green-500 rounded border border-green-500/20">
-                                ACTIVE
-                            </span>
-</div>
-<div class="flex justify-between items-center">
-<span class="font-body text-sm text-slate-300">Validation Relay</span>
-<span class="font-mono text-sm text-slate-200">4 endpoints</span>
+<div class="flex items-center gap-4">
+<span class="font-mono text-lg text-green-400" id="cons-count">0/35</span>
+<span class="text-[9px] font-mono text-slate-500" id="cons-info">35 UNL · 0 proposals</span>
 </div>
 </div>
-</div>
-<div class="mt-8">
-<img alt="Network Map" class="w-full h-24 object-cover rounded border border-slate-800 opacity-50 grayscale hover:grayscale-0 transition-all" data-alt="abstract tech visualization of interconnected global data points with glowing neon lines on a dark digital world map background" src="https://lh3.googleusercontent.com/aida-public/AB6AXuBsvTGeHv_riC0O63dNKxKIXXiB9PfoHoWVPnzBOXOrn83dNtes39nmZfkvtZqkhSt8G9_H8_Ozm-vVSKYW42wqEZpIFJpkemmH-b76N_91G3DCKs8FutiY1A77yLvAeRjDoT2cIUWZwj2BThYBBcxft1oasXDZLEzs3Y9XYYbZL6wIeEKBYLw6shbGvkzpGyAsz_B2RDj9QM9mwtLNjt1A01vop7ycMxpElXP9au09FdeB6QSVuNb8WNwZXHe236iKHAmrnSTgWc8"/>
-</div>
-</div>
-<!-- Consensus Card -->
-<div class="bg-slate-900 border border-slate-800 rounded-lg p-6 flex flex-col justify-between">
-<div>
-<h3 class="font-headline text-xs font-bold text-slate-500 uppercase tracking-widest mb-6">Consensus Engine</h3>
-<div class="space-y-4">
-<div class="flex justify-between items-center">
-<span class="font-body text-sm text-slate-300">UNL Active</span>
-<span class="font-mono text-sm text-slate-200" id="cons-unl">35 validators</span>
-</div>
-<div class="flex justify-between items-center">
-<span class="font-body text-sm text-slate-300">Agreement Level</span>
-<span class="font-mono text-sm text-green-500" id="cons-agreement">33/35 (94%)</span>
-</div>
-<div class="flex justify-between items-center">
-<span class="font-body text-sm text-slate-300">Current Phase</span>
-<span class="font-mono text-sm text-amber-500 italic" id="cons-phase">open</span>
-</div>
-<div class="flex justify-between items-center">
-<span class="font-body text-sm text-slate-300">Proposals Tracked</span>
-<span class="font-mono text-sm text-slate-200" id="cons-proposals">12,450</span>
-</div>
-</div>
-</div>
-<div class="mt-8 pt-4 border-t border-slate-800">
-<div class="flex justify-between mb-2">
-<span class="text-[9px] font-mono text-slate-500 uppercase">State Hash Streak</span>
-<span class="text-[9px] font-mono text-green-500" id="hash-streak">284 consecutive matches</span>
-</div>
-<div class="w-full h-1 bg-slate-800 rounded-full overflow-hidden">
-<div class="h-full bg-green-500" id="hash-streak-bar" style="width:85%"></div>
-</div>
+<div class="p-4">
+<div style="height:300px;position:relative;background:#0A0A14;border-radius:6px;border:1px solid #1A1A24;overflow:hidden">
+<canvas id="consCanvas" style="position:absolute;top:0;left:0;width:100%;height:100%"></canvas>
 </div>
 </div>
 </section>
@@ -462,63 +387,577 @@ async function tick() {
             $('hero-wallets').textContent = 'scanning wallets...';
         }
 
-        // Tx type bars — per-ledger round, ALL types shown (inactive = grayed)
+        // Streaming area chart — feed live tx data per ledger
+        // Feed tx data to chart — simple push like sparkline
         const roundTypes = f.round_tx_types || {};
         const roundCount = f.round_tx_count || 0;
-        const roundTotal = Object.values(roundTypes).reduce((a, b) => a + b, 0) || 1;
-        // Merge any unknown types from current round into the master list
-        const allTypes = Object.keys(txColors);
-        for (const t of Object.keys(roundTypes)) {
-            if (!allTypes.includes(t)) allTypes.push(t);
-        }
-        // Sort: active first by count desc, then inactive alphabetically
-        allTypes.sort((a, b) => {
-            const ca = roundTypes[a] || 0, cb = roundTypes[b] || 0;
-            if (ca > 0 && cb === 0) return -1;
-            if (cb > 0 && ca === 0) return 1;
-            if (ca > 0 && cb > 0) return cb - ca;
-            return a.localeCompare(b);
-        });
         $('ffi-total-types').textContent = roundCount + ' txs · #' + (f.round_ledger_seq || 0);
-        let barsHtml = '';
-        for (const type of allTypes) {
-            const cnt = roundTypes[type] || 0;
-            const p = cnt > 0 ? (cnt / roundTotal * 100).toFixed(0) : '0';
-            const c = txColors[type] || '#6E7681';
-            const active = cnt > 0;
-            barsHtml += `<div class="flex items-center gap-2 font-mono text-[10px]" style="opacity:${active ? '1' : '0.25'}">
-                <span style="color:${active ? c : '#30363D'};min-width:145px" class="truncate">${type}</span>
-                <div class="flex-1 h-1.5 bg-slate-800 rounded-full overflow-hidden">
-                    <div style="width:${p}%;background:${c};transition:width 0.3s" class="h-full rounded-full${active ? '' : ' opacity-0'}"></div>
-                </div>
-                <span class="text-slate-500 min-w-[40px] text-right">${active ? cnt : ''}</span>
-            </div>`;
+        const active = Object.entries(roundTypes).filter(([,v]) => v > 0);
+        if (active.length > 0) {
+            const snap = { _seq: f.round_ledger_seq || 0 };
+            for (const [type, cnt] of active) snap[type] = cnt;
+            txChart.push(snap);
         }
-        $('tx-type-bars').innerHTML = barsHtml;
 
-        // Network
-        // Peer count from consensus endpoint
+        // Consensus data — feed to PCB board
         const monitor = cons.monitor || {};
         const unl = cons.unl_size || 0;
-        const tracked = monitor.tracked_validators || 0;
         const proposals = monitor.total_proposals || 0;
         const agreement = monitor.agreement || {};
         const agreeCount = agreement.count || 0;
+        const phase = cons.phase || 'open';
 
-        $('cons-unl').textContent = unl + ' validators';
-        $('cons-agreement').textContent = agreeCount + '/' + unl +
-            (unl > 0 ? ' (' + Math.round(agreeCount / unl * 100) + '%)' : '');
-        $('cons-phase').textContent = cons.phase || 'open';
-        $('cons-proposals').textContent = fmt(proposals);
-
-        // State hash streak
-        $('hash-streak').textContent = fmt(consec) + ' consecutive matches';
-        const streakPct = Math.min(100, consec / 3 * 1);  // ~300 = full bar
-        $('hash-streak-bar').style.width = streakPct + '%';
+        $('cons-count').textContent = agreeCount + '/' + unl;
+        $('cons-count').className = agreeCount >= 28 ? 'font-mono text-lg text-green-400' : 'font-mono text-lg text-amber-400';
+        $('cons-info').textContent = fmt(proposals) + ' proposals · ' + phase;
+        consPCB.agreed = agreeCount;
+        consPCB.total = unl || 35;
     } catch (e) { /* silent — next tick retries */ }
 }
 
-setInterval(tick, 500);
+// === TX FLOW CHART — Sparkline pattern (simple, proven) ===
+const TX_TYPES = ['OfferCancel','OfferCreate','Payment','TrustSet','AccountSet',
+    'NFTokenCreateOffer','NFTokenAcceptOffer','NFTokenMint','NFTokenBurn',
+    'TicketCreate','CheckCash','OracleSet','AMMDeposit','AMMWithdraw'];
+const TX_MAX = 900;
+
+const txChart = {
+    data: JSON.parse(localStorage.getItem('txChartData') || '[]'),
+    canvas: null, ctx: null,
+    push(snap) {
+        this.data.push(snap);
+        if (this.data.length > TX_MAX) this.data.shift();
+        this.draw();
+    },
+    draw() {
+        const c = this.canvas, ctx = this.ctx;
+        if (!c || !ctx) return;
+        const dpr = window.devicePixelRatio || 1;
+        const w = c.clientWidth, h = c.clientHeight;
+        if (w === 0 || h === 0) return;
+        c.width = w * dpr; c.height = h * dpr;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, w, h);
+
+        const n = this.data.length;
+        if (n < 2) return;
+
+        const step = w / (TX_MAX - 1);
+        const padTop = 40, padBot = 20;
+        const pad = padTop; // compat
+
+        // Find max total for Y scale
+        let maxTotal = 1;
+        for (const snap of this.data) {
+            let t = 0;
+            for (const k of TX_TYPES) t += snap[k] || 0;
+            if (t > maxTotal) maxTotal = t;
+        }
+
+        // Subtle grid
+        ctx.strokeStyle = 'rgba(26,26,36,0.8)';
+        ctx.lineWidth = 1;
+        for (let g = 1; g <= 4; g++) {
+            const gy = pad + (g / 5) * (h - padTop - padBot);
+            ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(w, gy); ctx.stroke();
+        }
+
+        // Draw stacked areas — bottom type first
+        for (let ti = TX_TYPES.length - 1; ti >= 0; ti--) {
+            const type = TX_TYPES[ti];
+            const color = txColors[type] || '#6E7681';
+            let hasData = false;
+            for (const snap of this.data) { if (snap[type]) { hasData = true; break; } }
+            if (!hasData) continue;
+
+            const tops = [], bottoms = [];
+            for (let i = 0; i < n; i++) {
+                let below = 0;
+                for (let j = TX_TYPES.length - 1; j > ti; j--) below += this.data[i][TX_TYPES[j]] || 0;
+                const val = this.data[i][type] || 0;
+                bottoms.push(below);
+                tops.push(below + val);
+            }
+
+            // Filled area
+            ctx.beginPath();
+            for (let i = 0; i < n; i++) {
+                const x = i * step, y = pad + (h - padTop - padBot) - (tops[i] / maxTotal) * (h - padTop - padBot);
+                i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+            }
+            for (let i = n - 1; i >= 0; i--) {
+                const x = i * step, y = pad + (h - padTop - padBot) - (bottoms[i] / maxTotal) * (h - padTop - padBot);
+                ctx.lineTo(x, y);
+            }
+            ctx.closePath();
+            const grad = ctx.createLinearGradient(0, pad, 0, h);
+            grad.addColorStop(0, color + 'AA');
+            grad.addColorStop(1, color + '11');
+            ctx.fillStyle = grad;
+            ctx.fill();
+
+            // Top stroke
+            ctx.beginPath();
+            for (let i = 0; i < n; i++) {
+                const x = i * step, y = pad + (h - padTop - padBot) - (tops[i] / maxTotal) * (h - padTop - padBot);
+                i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+            }
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+        }
+
+        // Top counters — all active types from latest
+        if (n > 0) {
+            const latest = this.data[n - 1];
+            const activeTypes = TX_TYPES.filter(t => (latest[t] || 0) > 0)
+                .sort((a, b) => (latest[b] || 0) - (latest[a] || 0));
+            const spacing = w / (activeTypes.length + 1);
+            for (let i = 0; i < activeTypes.length; i++) {
+                const t = activeTypes[i];
+                const c = txColors[t] || '#6E7681';
+                const val = latest[t] || 0;
+                const x = spacing * (i + 1);
+                ctx.fillStyle = c; ctx.fillRect(x - 30, 8, 6, 6);
+                ctx.fillStyle = 'rgba(255,255,255,0.6)'; ctx.textAlign = 'left';
+                ctx.font = '9px IBM Plex Mono, monospace';
+                ctx.fillText(t, x - 20, 14);
+                ctx.fillStyle = c; ctx.font = 'bold 14px IBM Plex Mono, monospace';
+                ctx.fillText(val.toLocaleString(), x - 20, 30);
+            }
+        }
+
+        // Ledger labels along bottom — find ledger boundaries
+        ctx.font = '8px IBM Plex Mono, monospace';
+        ctx.textAlign = 'center';
+        ctx.fillStyle = 'rgba(255,255,255,0.45)';
+        const labels = [];
+        let prevSeq = 0;
+        for (let i = 0; i < n; i++) {
+            const seq = this.data[i]._seq || 0;
+            if (seq !== prevSeq && seq > 0) {
+                labels.push({ i, seq });
+                prevSeq = seq;
+            }
+        }
+        // Show evenly spaced labels — max ~8
+        const showEvery = Math.max(1, Math.ceil(labels.length / 8));
+        for (let li = 0; li < labels.length; li++) {
+            if (li % showEvery !== 0 && li !== labels.length - 1) continue;
+            const x = labels[li].i * step;
+            if (x < 25 || x > w - 25) continue;
+            ctx.fillText('#' + labels[li].seq.toLocaleString(), x, h - 3);
+        }
+
+        // Glow dot on latest
+        if (n > 0) {
+            let topTotal = 0;
+            for (const t of TX_TYPES) topTotal += this.data[n-1][t] || 0;
+            const dotX = (n - 1) * step;
+            const dotY = pad + (h - padTop - padBot) - (topTotal / maxTotal) * (h - padTop - padBot);
+            ctx.beginPath(); ctx.arc(dotX, dotY, 3, 0, Math.PI * 2);
+            ctx.fillStyle = '#00E676'; ctx.shadowBlur = 8; ctx.shadowColor = '#00C853';
+            ctx.fill(); ctx.shadowBlur = 0;
+        }
+    }
+};
+txChart.canvas = $('streamCanvas');
+txChart.ctx = txChart.canvas ? txChart.canvas.getContext('2d') : null;
+if (txChart.data.length > 1) txChart.draw(); // draw persisted data immediately
+
+// Save to localStorage periodically
+setInterval(() => {
+    try { localStorage.setItem('txChartData', JSON.stringify(txChart.data.slice(-TX_MAX))); } catch(e) {}
+}, 2000);
+
+// === CONSENSUS PCB BOARD ===
+const consPCB = {
+    canvas: $('consCanvas'),
+    ctx: null,
+    agreed: 0,
+    total: 35,
+    chipGlow: new Array(35).fill(0), // 0-1 glow intensity per chip
+    centerGlow: 0,
+    init() {
+        if (!this.canvas) return;
+        this.ctx = this.canvas.getContext('2d');
+        const self = this;
+        function resize() {
+            const r = self.canvas.parentElement.getBoundingClientRect();
+            const dpr = window.devicePixelRatio || 1;
+            self.canvas.width = Math.round(r.width * dpr);
+            self.canvas.height = Math.round(r.height * dpr);
+            self.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        }
+        resize();
+        window.addEventListener('resize', resize);
+        this.animate();
+    },
+    animate() {
+        if (!this.ctx) return;
+        const c = this.canvas, ctx = this.ctx;
+        const w = c.clientWidth, h = c.clientHeight;
+        if (w === 0 || h === 0) { requestAnimationFrame(() => this.animate()); return; }
+
+        ctx.clearRect(0, 0, w, h);
+
+        // === CYBERPUNK PCB BOARD ===
+
+        // PCB crosshatch grid
+        ctx.strokeStyle = 'rgba(20,20,30,0.8)';
+        ctx.lineWidth = 0.5;
+        for (let gx = 0; gx < w; gx += 16) { ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, h); ctx.stroke(); }
+        for (let gy = 0; gy < h; gy += 16) { ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(w, gy); ctx.stroke(); }
+
+        // Scanline overlay
+        ctx.fillStyle = 'rgba(0,0,0,0.04)';
+        for (let sy = 0; sy < h; sy += 4) { ctx.fillRect(0, sy, w, 2); }
+
+        // Corner mounting holes
+        const holes = [[12,12],[w-12,12],[12,h-12],[w-12,h-12]];
+        for (const [hx,hy] of holes) {
+            ctx.beginPath(); ctx.arc(hx, hy, 6, 0, Math.PI*2);
+            ctx.strokeStyle = 'rgba(42,31,20,0.6)'; ctx.lineWidth = 2; ctx.stroke();
+            ctx.beginPath(); ctx.arc(hx, hy, 2, 0, Math.PI*2);
+            ctx.fillStyle = 'rgba(13,13,21,1)'; ctx.fill();
+        }
+
+        const cols = 7, rows = 5;
+        const chipW = 48, chipH = 32;
+        const padX = 28, padY = 20;
+        const gapX = (w - padX*2 - cols*chipW) / (cols-1);
+        const gapY = (h - padY*2 - rows*chipH) / (rows-1);
+
+        // Update chip glow
+        for (let i = 0; i < 35; i++) {
+            const target = i < this.agreed ? 1.0 : 0.0;
+            this.chipGlow[i] += (target - this.chipGlow[i]) * 0.08;
+        }
+
+        const busGlow = this.agreed >= 28 ? 1.0 : 0.0;
+        this.centerGlow += (busGlow - this.centerGlow) * 0.06;
+
+        // Chip positions — precompute for trace routing
+        const chipPos = [];
+        for (let row = 0; row < rows; row++) {
+            for (let col = 0; col < cols; col++) {
+                const i = row * cols + col;
+                if (i >= 35) { chipPos.push(null); continue; }
+                const offX = (row % 2 === 1) ? gapX * 0.3 : 0;
+                const x = padX + col * (chipW + gapX) + offX;
+                const y = padY + row * (chipH + gapY);
+                chipPos.push(x + chipW > w - 10 ? null : {x, y, i});
+            }
+        }
+
+        // Draw chip-to-chip traces — horizontal (right pins → left pins of neighbor)
+        // and vertical (bottom pins → top pins of chip below)
+        for (let row = 0; row < rows; row++) {
+            for (let col = 0; col < cols; col++) {
+                const idx = row * cols + col;
+                const chip = chipPos[idx];
+                if (!chip) continue;
+                const g = this.chipGlow[chip.i];
+
+                // Horizontal trace to right neighbor
+                if (col < cols - 1) {
+                    const right = chipPos[idx + 1];
+                    if (right) {
+                        const bothLit = Math.min(g, this.chipGlow[right.i]);
+                        const traceG = bothLit > 0.1 ? bothLit : 0;
+                        // Route: right pin → jog right → straight → jog left → left pin
+                        const fromX = chip.x + chipW + 6;
+                        const toX = right.x - 6;
+                        const py1 = chip.y + 11; // pin 2 of 4
+                        const py2 = right.y + 11;
+                        const midX = (fromX + toX) / 2;
+                        ctx.beginPath();
+                        ctx.moveTo(fromX, py1);
+                        ctx.lineTo(midX, py1);
+                        ctx.lineTo(midX, py2);
+                        ctx.lineTo(toX, py2);
+                        ctx.strokeStyle = traceG > 0.1 ? `rgba(0,255,65,${traceG*0.5})` : 'rgba(42,31,20,0.25)';
+                        ctx.lineWidth = 1;
+                        ctx.stroke();
+                        // Via at bend
+                        if (traceG > 0.1) {
+                            ctx.beginPath(); ctx.arc(midX, py1, 1.5, 0, Math.PI*2);
+                            ctx.fillStyle = `rgba(0,255,65,${traceG*0.3})`; ctx.fill();
+                        }
+                    }
+                }
+                // Vertical trace to chip below
+                if (row < rows - 1) {
+                    const below = chipPos[idx + cols];
+                    if (below) {
+                        const bothLit = Math.min(g, this.chipGlow[below.i]);
+                        const traceG = bothLit > 0.1 ? bothLit : 0;
+                        const fromY = chip.y + chipH;
+                        const toY = below.y;
+                        const px1 = chip.x + chipW/2 + 4;
+                        const px2 = below.x + chipW/2 + 4;
+                        const midY = (fromY + toY) / 2;
+                        ctx.beginPath();
+                        ctx.moveTo(px1, fromY);
+                        ctx.lineTo(px1, midY);
+                        ctx.lineTo(px2, midY);
+                        ctx.lineTo(px2, toY);
+                        ctx.strokeStyle = traceG > 0.1 ? `rgba(0,255,65,${traceG*0.4})` : 'rgba(42,31,20,0.2)';
+                        ctx.lineWidth = 1;
+                        ctx.stroke();
+                        if (traceG > 0.1) {
+                            ctx.beginPath(); ctx.arc(px1, midY, 1.5, 0, Math.PI*2);
+                            ctx.fillStyle = `rgba(0,255,65,${traceG*0.25})`; ctx.fill();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Decorative passive components scattered between chips
+        const seed = 42;
+        for (let d = 0; d < 20; d++) {
+            const dx = (((d * 137 + seed) % 100) / 100) * (w - 60) + 30;
+            const dy = (((d * 211 + seed) % 100) / 100) * (h - 40) + 20;
+            if (d % 3 === 0) {
+                // Resistor — small rectangle
+                ctx.fillStyle = 'rgba(42,31,20,0.3)';
+                ctx.fillRect(dx, dy, 8, 3);
+                ctx.strokeStyle = 'rgba(60,45,30,0.3)'; ctx.lineWidth = 0.5;
+                ctx.strokeRect(dx, dy, 8, 3);
+            } else if (d % 3 === 1) {
+                // Capacitor — tiny square
+                ctx.fillStyle = 'rgba(50,50,60,0.3)';
+                ctx.fillRect(dx, dy, 4, 4);
+            } else {
+                // Via hole
+                ctx.beginPath(); ctx.arc(dx, dy, 1.5, 0, Math.PI*2);
+                ctx.fillStyle = 'rgba(42,31,20,0.4)'; ctx.fill();
+            }
+        }
+
+        // Draw 35 chips
+        for (let row = 0; row < rows; row++) {
+            for (let col = 0; col < cols; col++) {
+                const idx = row * cols + col;
+                const chip = chipPos[idx];
+                if (!chip) continue;
+                const i = chip.i;
+                const g = this.chipGlow[i];
+                const x = chip.x, y = chip.y;
+
+                // IC pins — 4 per side, copper colored
+                const pinColor = g > 0.1 ? `rgba(0,255,65,${0.3+g*0.5})` : 'rgba(42,31,20,0.5)';
+                ctx.strokeStyle = pinColor; ctx.lineWidth = 1.5;
+                for (let p = 0; p < 4; p++) {
+                    const py = y + 4 + p * 7;
+                    ctx.beginPath(); ctx.moveTo(x-6, py); ctx.lineTo(x, py); ctx.stroke();
+                    ctx.beginPath(); ctx.moveTo(x+chipW, py); ctx.lineTo(x+chipW+6, py); ctx.stroke();
+                }
+
+                // Chip body — dark when off, neon bloom when on
+                if (g > 0.4) {
+                    ctx.shadowBlur = 12 * g;
+                    ctx.shadowColor = '#00FF41';
+                }
+                ctx.fillStyle = g > 0.1
+                    ? `rgba(0,255,65,${0.05 + g*0.3})`
+                    : 'rgba(13,13,21,0.9)';
+                ctx.strokeStyle = g > 0.1
+                    ? `rgba(0,255,65,${0.3 + g*0.7})`
+                    : 'rgba(42,31,20,0.5)';
+                ctx.lineWidth = 1;
+                ctx.fillRect(x, y, chipW, chipH);
+                ctx.strokeRect(x, y, chipW, chipH);
+                ctx.shadowBlur = 0;
+
+                // Notch on top edge (IC orientation mark)
+                ctx.beginPath(); ctx.arc(x + chipW/2, y, 3, 0, Math.PI);
+                ctx.fillStyle = g > 0.1 ? `rgba(0,255,65,${g*0.3})` : 'rgba(20,20,30,0.8)';
+                ctx.fill();
+
+                // LED indicator — tiny dot top-right of chip
+                ctx.beginPath(); ctx.arc(x + chipW - 5, y + 5, 2, 0, Math.PI*2);
+                ctx.fillStyle = g > 0.1 ? `rgba(0,255,65,${0.5+g*0.5})` : 'rgba(30,30,40,0.5)';
+                if (g > 0.5) { ctx.shadowBlur = 6; ctx.shadowColor = '#00FF41'; }
+                ctx.fill(); ctx.shadowBlur = 0;
+
+                // Silkscreen label
+                ctx.fillStyle = g > 0.1
+                    ? `rgba(0,255,65,${0.5+g*0.5})`
+                    : 'rgba(80,80,90,0.5)';
+                ctx.font = '7px IBM Plex Mono, monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText('V' + String(i+1).padStart(2,'0'), x+chipW/2, y+chipH/2+3);
+            }
+        }
+
+        // Glitchy text on left edge
+        ctx.save();
+        ctx.translate(8, h/2);
+        ctx.rotate(-Math.PI/2);
+        ctx.fillStyle = 'rgba(0,255,65,0.06)';
+        ctx.font = 'bold 8px IBM Plex Mono, monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('XRPL_CONSENSUS_BUS_v3.2', 0, 0);
+        ctx.restore();
+
+        requestAnimationFrame(() => this.animate());
+    }
+};
+consPCB.init();
+
+function _consDraw_REMOVED() { return; // replaced by consPCB
+    const cont = consCanvas.parentElement;
+    const w = cont.getBoundingClientRect().width;
+    const h = cont.getBoundingClientRect().height;
+    const pad = { top: 50, bottom: 24, left: 0, right: 0 };
+    const plotH = h - pad.top - pad.bottom;
+    const plotW = w - pad.left - pad.right;
+    const n = consData.length;
+    const minColW = 8;
+    const maxPts = Math.floor(plotW / minColW);
+    const colW = n > 1 ? plotW / (Math.min(n, maxPts) - 1) : plotW;
+
+    consCtx.clearRect(0, 0, w, h);
+
+    if (n < 2) {
+        consCtx.fillStyle = 'rgba(110,118,129,0.3)';
+        consCtx.font = '10px IBM Plex Mono, monospace';
+        consCtx.textAlign = 'center';
+        consCtx.fillText('Waiting for consensus data...', w/2, h/2);
+        requestAnimationFrame(consDraw);
+        return;
+    }
+
+    // Sync + interpolate display
+    while (consDisplay.length < n) consDisplay.push({ agreed: 0, disagreed: 0 });
+    while (consDisplay.length > n) consDisplay.shift();
+    for (let i = 0; i < n; i++) {
+        consDisplay[i].agreed += (consData[i].agreed - consDisplay[i].agreed) * CONS_LERP;
+        consDisplay[i].disagreed += (consData[i].disagreed - consDisplay[i].disagreed) * CONS_LERP;
+    }
+
+    const maxVal = consData[0].unl || 35;
+
+    // Grid lines
+    consCtx.strokeStyle = 'rgba(26,26,36,0.8)';
+    consCtx.lineWidth = 1;
+    for (let i = 1; i <= 4; i++) {
+        const gy = pad.top + (i / 5) * plotH;
+        consCtx.beginPath(); consCtx.moveTo(0, gy); consCtx.lineTo(w, gy); consCtx.stroke();
+    }
+
+    const xOff = 0;
+
+    // Agreed area (green)
+    consCtx.beginPath();
+    for (let i = 0; i < n; i++) {
+        const x = pad.left + xOff + i * colW;
+        const y = pad.top + plotH - (consDisplay[i].agreed / maxVal) * plotH;
+        i === 0 ? consCtx.moveTo(x, y) : consCtx.lineTo(x, y);
+    }
+    for (let i = n - 1; i >= 0; i--) {
+        const x = pad.left + xOff + i * colW;
+        consCtx.lineTo(x, pad.top + plotH);
+    }
+    consCtx.closePath();
+    const agreeGrad = consCtx.createLinearGradient(0, pad.top, 0, h);
+    agreeGrad.addColorStop(0, '#00C853CC');
+    agreeGrad.addColorStop(1, '#00C85311');
+    consCtx.fillStyle = agreeGrad;
+    consCtx.fill();
+    // Stroke
+    consCtx.beginPath();
+    for (let i = 0; i < n; i++) {
+        const x = pad.left + xOff + i * colW;
+        const y = pad.top + plotH - (consDisplay[i].agreed / maxVal) * plotH;
+        i === 0 ? consCtx.moveTo(x, y) : consCtx.lineTo(x, y);
+    }
+    consCtx.strokeStyle = '#00C853';
+    consCtx.lineWidth = 1.5;
+    consCtx.stroke();
+
+    // Disagreed area (amber, stacked on top of agreed)
+    consCtx.beginPath();
+    for (let i = 0; i < n; i++) {
+        const x = pad.left + xOff + i * colW;
+        const total = consDisplay[i].agreed + consDisplay[i].disagreed;
+        const y = pad.top + plotH - (total / maxVal) * plotH;
+        i === 0 ? consCtx.moveTo(x, y) : consCtx.lineTo(x, y);
+    }
+    for (let i = n - 1; i >= 0; i--) {
+        const x = pad.left + xOff + i * colW;
+        const y = pad.top + plotH - (consDisplay[i].agreed / maxVal) * plotH;
+        consCtx.lineTo(x, y);
+    }
+    consCtx.closePath();
+    const disGrad = consCtx.createLinearGradient(0, pad.top, 0, h);
+    disGrad.addColorStop(0, '#FFD600AA');
+    disGrad.addColorStop(1, '#FFD60011');
+    consCtx.fillStyle = disGrad;
+    consCtx.fill();
+
+    // Top counters
+    const lastAgreed = Math.round(consDisplay[n-1].agreed);
+    const lastDisagreed = Math.round(consDisplay[n-1].disagreed);
+    const lastPhase = consData[n-1].phase || '';
+    const lastProposals = consData[n-1].proposals || 0;
+
+    consCtx.textAlign = 'left';
+    // Agreed
+    consCtx.fillStyle = '#00C853'; consCtx.fillRect(20, 12, 6, 6);
+    consCtx.fillStyle = 'rgba(255,255,255,0.6)'; consCtx.font = '9px IBM Plex Mono, monospace';
+    consCtx.fillText('Agreed', 30, 18);
+    consCtx.fillStyle = '#00C853'; consCtx.font = 'bold 16px IBM Plex Mono, monospace';
+    consCtx.fillText(lastAgreed + '/35', 30, 36);
+
+    // Disagreed
+    consCtx.fillStyle = '#FFD600'; consCtx.fillRect(130, 12, 6, 6);
+    consCtx.fillStyle = 'rgba(255,255,255,0.6)'; consCtx.font = '9px IBM Plex Mono, monospace';
+    consCtx.fillText('Disagreed', 140, 18);
+    consCtx.fillStyle = '#FFD600'; consCtx.font = 'bold 16px IBM Plex Mono, monospace';
+    consCtx.fillText(lastDisagreed + '/35', 140, 36);
+
+    // Phase
+    consCtx.fillStyle = '#00B0FF'; consCtx.fillRect(260, 12, 6, 6);
+    consCtx.fillStyle = 'rgba(255,255,255,0.6)'; consCtx.font = '9px IBM Plex Mono, monospace';
+    consCtx.fillText('Phase', 270, 18);
+    consCtx.fillStyle = '#00B0FF'; consCtx.font = 'bold 12px IBM Plex Mono, monospace';
+    consCtx.fillText(lastPhase, 270, 34);
+
+    // Proposals
+    consCtx.fillStyle = '#7C4DFF'; consCtx.fillRect(440, 12, 6, 6);
+    consCtx.fillStyle = 'rgba(255,255,255,0.6)'; consCtx.font = '9px IBM Plex Mono, monospace';
+    consCtx.fillText('Proposals', 450, 18);
+    consCtx.fillStyle = '#7C4DFF'; consCtx.font = 'bold 16px IBM Plex Mono, monospace';
+    consCtx.fillText(fmt(lastProposals), 450, 36);
+
+    // Time labels along bottom
+    consCtx.font = '8px IBM Plex Mono, monospace';
+    consCtx.textAlign = 'center';
+    const labelEvery = Math.max(1, Math.floor(n / 8));
+    for (let i = 0; i < n; i++) {
+        if (i % labelEvery !== 0 && i !== n - 1) continue;
+        const x = pad.left + xOff + i * colW;
+        if (x < 30 || x > w - 30) continue;
+        consCtx.fillStyle = 'rgba(255,255,255,0.5)';
+        consCtx.fillText(consData[i]._time || '', x, h - 2);
+    }
+
+    // Glow dot
+    const dotX = pad.left + (n - 1) * colW;
+    const dotY = pad.top + plotH - (consDisplay[n-1].agreed / maxVal) * plotH;
+    consCtx.beginPath();
+    consCtx.arc(dotX, dotY, 3, 0, Math.PI * 2);
+    consCtx.fillStyle = '#00E676';
+    consCtx.shadowBlur = 8; consCtx.shadowColor = '#00C853';
+    consCtx.fill(); consCtx.shadowBlur = 0;
+
+    requestAnimationFrame(consDraw);
+}
+setInterval(tick, 20);
 tick();
+
 </script>
 </body></html>
