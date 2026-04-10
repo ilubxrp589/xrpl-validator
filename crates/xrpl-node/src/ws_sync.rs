@@ -188,22 +188,48 @@ pub async fn start_ws_sync(
                                 // These are the keys ws_sync knows about but FFI doesn't
                                 // apply (singletons, pseudo-tx effects). Fetch post-state
                                 // from RPC so the shadow overlay is complete.
-                                let proto_modified: Vec<(String, String)> = {
+                                //
+                                // Properly classify each RPC result as: present (use bytes),
+                                // entryNotFound (treat as deleted), or fetch_error. If ANY
+                                // modified key fails to fetch, abort the shadow check rather
+                                // than reporting a false mismatch with an incomplete overlay.
+                                let mut shadow_fetch_ok = true;
+                                let proto_modified: Vec<(String, Option<String>)> = {
                                     let mut keys: Vec<String> = acc_modified.iter().cloned().collect();
                                     keys.extend(acc_deleted.iter().map(|k| k.clone()));
                                     let mut results = Vec::with_capacity(keys.len());
                                     for key_hex in &keys {
-                                        if key_hex.len() == 64 {
-                                            // Fetch binary post-state from rippled
-                                            let body = rpc.call("ledger_entry", serde_json::json!({
+                                        if key_hex.len() != 64 { continue; }
+                                        let mut classified: Option<Option<String>> = None;
+                                        for attempt in 0..3u32 {
+                                            match rpc.call("ledger_entry", serde_json::json!({
                                                 "index": key_hex,
                                                 "ledger_index": process_seq,
                                                 "binary": true
-                                            })).await;
-                                            let data_hex = body.ok()
-                                                .and_then(|b| b["result"]["node_binary"].as_str().map(|s| s.to_string()))
-                                                .unwrap_or_default();
-                                            results.push((key_hex.clone(), data_hex));
+                                            })).await {
+                                                Ok(b) => {
+                                                    if let Some(s) = b["result"]["node_binary"].as_str() {
+                                                        classified = Some(Some(s.to_string()));
+                                                        break;
+                                                    } else if b["result"]["error"].as_str() == Some("entryNotFound") {
+                                                        classified = Some(None);
+                                                        break;
+                                                    } else if attempt == 2 {
+                                                        break;
+                                                    }
+                                                }
+                                                Err(_) if attempt == 2 => break,
+                                                Err(_) => {}
+                                            }
+                                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                        }
+                                        match classified {
+                                            Some(c) => results.push((key_hex.clone(), c)),
+                                            None => {
+                                                shadow_fetch_ok = false;
+                                                eprintln!("[ffi-shadow] #{process_seq}: fetch failed for {} — skipping shadow check", &key_hex[..16]);
+                                                break;
+                                            }
                                         }
                                     }
                                     results
@@ -212,6 +238,7 @@ pub async fn start_ws_sync(
                                 // Build shadow overlay from RPC canonical bytes
                                 // (same source as process_ledger uses for DB writes)
                                 let shadow_overlay = build_shadow_overlay(&proto_modified, &deleted_keys);
+                                let shadow_ok = shadow_fetch_ok;
                                 if steady {
                                     let snap = std::sync::Arc::new(
                                         crate::ffi_engine::OwnedSnapshot::new(db.clone())
@@ -222,7 +249,7 @@ pub async fn start_ws_sync(
                                             hdr.parent_hash, hdr.parent_close_time, hdr.total_drops,
                                             Some(snap.as_ref()),
                                         );
-                                        if !shadow_ah.is_empty() && !shadow_overlay.is_empty() {
+                                        if shadow_ok && !shadow_ah.is_empty() && !shadow_overlay.is_empty() {
                                             if let Some(hs) = hasher_snap {
                                                 v.check_shadow_hash(hs, &shadow_overlay, &shadow_ah);
                                             }
@@ -234,7 +261,7 @@ pub async fn start_ws_sync(
                                             seq, &tx_blobs,
                                             hdr.parent_hash, hdr.parent_close_time, hdr.total_drops,
                                         );
-                                        if !shadow_ah.is_empty() && !shadow_overlay.is_empty() {
+                                        if shadow_ok && !shadow_ah.is_empty() && !shadow_overlay.is_empty() {
                                             if let Some(hs) = hasher_snap {
                                                 v.check_shadow_hash(hs, &shadow_overlay, &shadow_ah);
                                             }
@@ -338,23 +365,34 @@ fn extract_affected_nodes(body: &serde_json::Value, modified: &mut HashSet<Strin
 /// process_ledger), not FFI mutation data (which may serialize differently).
 /// FFI overlay is only used to confirm WHICH keys changed — the actual bytes
 /// come from rippled for hash consistency.
+///
+/// `rpc_objects` is `(key_hex, classified)` where `Some(data_hex)` means the
+/// RPC returned bytes and `None` means rippled said `entryNotFound` (treat as
+/// deletion). Keys that hit a fetch error must NOT appear here — the caller is
+/// responsible for skipping the shadow check entirely in that case.
 #[cfg(feature = "ffi")]
 fn build_shadow_overlay(
-    rpc_objects: &[(String, String)], // (key_hex, data_hex) from RPC at ledger_index=seq
+    rpc_objects: &[(String, Option<String>)],
     deleted: &HashSet<String>,
 ) -> crate::ffi_engine::LedgerOverlay {
     let mut overlay = crate::ffi_engine::LedgerOverlay::new();
-    for (key_hex, data_hex) in rpc_objects {
-        if let Ok(key_bytes) = hex::decode(key_hex) {
-            if key_bytes.len() == 32 {
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&key_bytes);
-                if deleted.contains(key_hex) {
-                    overlay.insert(key, None);
-                } else if !data_hex.is_empty() {
+    for (key_hex, classified) in rpc_objects {
+        let Ok(key_bytes) = hex::decode(key_hex) else { continue; };
+        if key_bytes.len() != 32 { continue; }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&key_bytes);
+        if deleted.contains(key_hex) {
+            overlay.insert(key, None);
+        } else {
+            match classified {
+                Some(data_hex) if !data_hex.is_empty() => {
                     if let Ok(data) = hex::decode(data_hex) {
                         overlay.insert(key, Some(data));
                     }
+                }
+                Some(_) | None => {
+                    // entryNotFound at this ledger → treat as deletion
+                    overlay.insert(key, None);
                 }
             }
         }

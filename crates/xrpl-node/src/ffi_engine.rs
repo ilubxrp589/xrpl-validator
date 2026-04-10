@@ -966,19 +966,26 @@ pub fn apply_ledger_in_order(
         // This prevents cascading terPRE_SEQ for all subsequent txs from
         // this sender in this ledger.
         if outcome.ter_name == "terPRE_SEQ" {
-            // Extract sender AccountID: sfAccount = field code 0x81, 20 bytes
+            // Extract sender AccountID from canonical binary form.
+            // sfAccount is field code 0x81, followed by VL length 0x14 (20),
+            // followed by 20 bytes of AccountID. The 2-byte pattern 0x81 0x14
+            // is far more selective than just 0x81 — random 0x81 bytes appear
+            // inside SigningPubKey/TxnSignature blobs but rarely followed by 0x14.
             let mut sender_key = None;
-            for i in 0..tx_bytes.len().saturating_sub(20) {
-                if tx_bytes[i] == 0x81 {
-                    use sha2::{Sha512, Digest};
-                    let mut h = Sha512::new();
-                    h.update(&[0x00, 0x61]); // account root keylet prefix
-                    h.update(&tx_bytes[i+1..i+21]);
-                    let hash = h.finalize();
-                    let mut key = [0u8; 32];
-                    key.copy_from_slice(&hash[..32]);
-                    sender_key = Some(key);
-                    break;
+            if tx_bytes.len() >= 22 {
+                let end = tx_bytes.len() - 22;
+                for i in 0..=end {
+                    if tx_bytes[i] == 0x81 && tx_bytes[i + 1] == 0x14 {
+                        use sha2::{Sha512, Digest};
+                        let mut h = Sha512::new();
+                        h.update([0x00u8, 0x61]); // account root keylet prefix
+                        h.update(&tx_bytes[i + 2..i + 22]);
+                        let hash = h.finalize();
+                        let mut key = [0u8; 32];
+                        key.copy_from_slice(&hash[..32]);
+                        sender_key = Some(key);
+                        break;
+                    }
                 }
             }
             if let Some(key) = sender_key {
