@@ -27,6 +27,7 @@ pub mod error;
 pub mod mempool;
 pub mod node;
 pub mod overlay;
+pub mod paths;
 pub mod peer;
 pub mod rpc;
 pub mod state_hash;

@@ -378,20 +378,16 @@ impl BulkSyncer {
 
             if matched {
                 eprintln!("[sync] VERIFIED: SHAMap root matches rippled account_hash for #{pinned_seq} ({})", &ours_hex[..16]);
-                let data_dir = std::env::var("XRPL_DATA_DIR")
-                    .unwrap_or_else(|_| "/mnt/xrpl-data/sync".to_string());
                 let _ = std::fs::write(
-                    format!("{data_dir}/dl_done.txt"),
+                    crate::paths::dl_done_path(),
                     format!("ledger #{pinned_seq} — {count} objects"),
                 );
             } else if seed_account_hash.is_empty() {
                 eprintln!(
                     "[sync] WARNING: could not fetch seed account_hash for #{pinned_seq} — writing dl_done.txt without verification (downstream catchup will detect drift)"
                 );
-                let data_dir = std::env::var("XRPL_DATA_DIR")
-                    .unwrap_or_else(|_| "/mnt/xrpl-data/sync".to_string());
                 let _ = std::fs::write(
-                    format!("{data_dir}/dl_done.txt"),
+                    crate::paths::dl_done_path(),
                     format!("ledger #{pinned_seq} — {count} objects (UNVERIFIED)"),
                 );
             } else {

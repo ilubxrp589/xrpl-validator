@@ -179,11 +179,10 @@ struct PeerProposal {
 /// Original XRPL supply: 100 billion XRP in drops.
 const ORIGINAL_SUPPLY_DROPS: u64 = 100_000_000_000_000_000;
 
-/// Default path for persisted engine stats.
-const DEFAULT_ENGINE_STATE_PATH: &str = "/mnt/xrpl-data/engine_state.json";
-
+/// Persisted engine stats path. Delegates to the central `paths` helper so
+/// the writer (here) and any reader stay in agreement under `XRPL_DATA_DIR`.
 fn engine_state_path() -> String {
-    std::env::var("XRPL_ENGINE_STATE_PATH").unwrap_or_else(|_| DEFAULT_ENGINE_STATE_PATH.to_string())
+    xrpl_node::paths::engine_state_path()
 }
 
 /// Persistent stats saved to disk.
@@ -301,7 +300,7 @@ async fn main() {
         use xrpl_core::address::KeyType;
         use xrpl_core::crypto::signing::Seed;
 
-        let seed_path = std::env::var("XRPL_SEED_PATH").unwrap_or_else(|_| "/mnt/xrpl-data/validator_seed.hex".to_string());
+        let seed_path = xrpl_node::paths::seed_path();
 
         // SECURITY(6.1): Check seed file permissions — warn if group/other-readable
         #[cfg(unix)]
@@ -456,7 +455,7 @@ async fn main() {
 
     // Live engine — opens RocksDB and applies transactions to real state
     // (created early so peer connections can serve ledger data)
-    let rocks_db_path = std::env::var("XRPL_ROCKS_PATH").unwrap_or_else(|_| "/mnt/xrpl-data/sync/state.rocks".to_string());
+    let rocks_db_path = xrpl_node::paths::state_rocks_path();
     let live_engine: Arc<Mutex<Option<xrpl_node::engine::LiveEngine>>> = Arc::new(Mutex::new(
         match xrpl_node::engine::LiveEngine::open(std::path::Path::new(&rocks_db_path)) {
             Ok(e) => {
@@ -630,8 +629,8 @@ async fn main() {
             // Always do a full bulk sync to get clean, consistent state.
             // After completion: build SHAMap, then incremental sync takes over.
             // This will NOT re-trigger on restart — see the completion marker below.
-            let marker_path = "/mnt/xrpl-data/sync/sync_complete.marker";
-            let sync_done = std::path::Path::new(marker_path).exists();
+            let marker_path = xrpl_node::paths::sync_complete_marker_path();
+            let sync_done = std::path::Path::new(&marker_path).exists();
 
             if sync_done {
                 eprintln!("[startup] Sync already completed — building SHAMap directly (~{estimated} entries)");
@@ -671,7 +670,7 @@ async fn main() {
                     }
 
                     // Read pinned ledger from download marker
-                    let pinned_seq: u32 = std::fs::read_to_string("/mnt/xrpl-data/sync/dl_done.txt")
+                    let pinned_seq: u32 = std::fs::read_to_string(xrpl_node::paths::dl_done_path())
                         .ok()
                         .and_then(|s| {
                             // Format: "ledger #103122702 — ..."
@@ -794,7 +793,7 @@ async fn main() {
                             let ws_hash = hash_comp.clone();
                             let ws_last = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(pinned));
                             // Save pinned ledger for restart backfill
-                            let _ = std::fs::write("/mnt/xrpl-data/sync/dl_done.txt",
+                            let _ = std::fs::write(xrpl_node::paths::dl_done_path(),
                                 format!("ledger #{pinned} — {synced} objects"));
                             let ws_hist = history_store.clone();
                             #[cfg(feature = "ffi")]
@@ -1390,14 +1389,12 @@ async fn main() {
                 let sync_bulk = sync_bulk.clone();
                 async move {
                     // Check completion marker first — if it exists, sync is done
-                    let marker_path = "/mnt/xrpl-data/sync/sync_complete.marker";
-                    let marker_count: u64 = std::fs::read_to_string(marker_path)
+                    let marker_count: u64 = std::fs::read_to_string(xrpl_node::paths::sync_complete_marker_path())
                         .ok()
                         .and_then(|s| s.trim().parse().ok())
                         .unwrap_or(0);
 
-                    let rocks_path = std::env::var("XRPL_ROCKS_PATH")
-                        .unwrap_or_else(|_| "/mnt/xrpl-data/sync/state.rocks".to_string());
+                    let rocks_path = xrpl_node::paths::state_rocks_path();
                     let db_size_mb = std::fs::read_dir(&rocks_path)
                         .map(|es| es.filter_map(|e| e.ok())
                             .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
@@ -1528,7 +1525,7 @@ async fn main() {
                     status["bulk_sync"] = serde_json::to_value(&sync_status.status.lock().clone()).unwrap_or_default();
                     status["incremental_sync"] = serde_json::to_value(&inc_status.stats.lock().clone()).unwrap_or_default();
                     // Use marker file count (accurate) instead of estimate-num-keys (broken)
-                    let marker_count: u64 = std::fs::read_to_string("/mnt/xrpl-data/sync/sync_complete.marker")
+                    let marker_count: u64 = std::fs::read_to_string(xrpl_node::paths::sync_complete_marker_path())
                         .ok()
                         .and_then(|s| s.trim().parse().ok())
                         .unwrap_or_else(|| {
