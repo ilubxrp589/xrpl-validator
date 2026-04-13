@@ -474,6 +474,14 @@ pub struct FfiStats {
     pub round_tx_types: std::collections::BTreeMap<String, u64>,
     pub round_tx_count: u64,
     pub round_ledger_seq: u32,
+    /// Sum of fees (in drops) burned across all txs in the current ledger.
+    /// Resets each ledger alongside `round_tx_count`. Cumulative across the
+    /// process lifetime is in `total_fees_burned_drops`.
+    pub round_fees_drops: u64,
+    /// Lifetime sum of fees burned by every tx the FFI engine has processed
+    /// in this process. Authoritative counterpart to the gossip-inflated
+    /// `round_fees` exposed by the peer-relay tracker at the engine level.
+    pub total_fees_burned_drops: u64,
     /// Shadow state hash — FFI-derived state vs rippled's account_hash.
     pub shadow_hash_attempted: u64,
     pub shadow_hash_matched: u64,
@@ -702,6 +710,47 @@ impl Default for DivergenceLog {
     }
 }
 
+/// Extract the fee (in drops) from a serialized XRPL transaction.
+///
+/// In canonical XRPL binary form, sfFee (type 6, field 8) is encoded as
+/// field code 0x68 followed by an 8-byte STAmount in native-XRP form. The
+/// high byte of that 8-byte block has the layout:
+///
+///     bit 7 (0x80) = 0 → native XRP (clear) / 1 → IOU
+///     bit 6 (0x40) = 1 → positive       / 0 → negative
+///     bits 5..0    = top 6 bits of the 62-bit drops value
+///
+/// Fees are always native and positive, so the high byte is `0x40 | (top6)`.
+/// The 2-byte pattern `[0x68, 0x4_]` (where the second byte's top two bits
+/// are exactly `01`) is far more selective than scanning for `0x68` alone —
+/// random `0x68` bytes inside SigningPubKey or TxnSignature blobs almost
+/// never have the matching native-positive flag in the next byte.
+///
+/// Canonical field order also puts sfFee BEFORE sfSigningPubKey and
+/// sfTxnSignature in the binary tx, so the first hit when scanning forward
+/// is overwhelmingly the real fee. Returns the fee in drops, or `None` if
+/// no plausible match is found.
+pub fn extract_fee_drops(tx_bytes: &[u8]) -> Option<u64> {
+    if tx_bytes.len() < 9 {
+        return None;
+    }
+    let end = tx_bytes.len() - 9;
+    for i in 0..=end {
+        if tx_bytes[i] == 0x68 && (tx_bytes[i + 1] & 0xC0) == 0x40 {
+            let mut val: u64 = ((tx_bytes[i + 1] & 0x3F) as u64) << 56;
+            val |= (tx_bytes[i + 2] as u64) << 48;
+            val |= (tx_bytes[i + 3] as u64) << 40;
+            val |= (tx_bytes[i + 4] as u64) << 32;
+            val |= (tx_bytes[i + 5] as u64) << 24;
+            val |= (tx_bytes[i + 6] as u64) << 16;
+            val |= (tx_bytes[i + 7] as u64) << 8;
+            val |= tx_bytes[i + 8] as u64;
+            return Some(val);
+        }
+    }
+    None
+}
+
 /// Extract the sender's AccountRoot keylet from a serialized XRPL transaction.
 ///
 /// In canonical XRPL binary form, sfAccount is encoded as:
@@ -923,6 +972,7 @@ pub fn apply_ledger_in_order(
         let mut s = stats.lock();
         s.round_tx_types.clear();
         s.round_tx_count = 0;
+        s.round_fees_drops = 0;
         s.round_ledger_seq = ledger_seq;
     }
     let mut tx_num = 0u32;
@@ -1070,6 +1120,16 @@ pub fn apply_ledger_in_order(
         *s.apply_by_type.entry(tx_type.clone()).or_insert(0) += 1;
         *s.round_tx_types.entry(tx_type.clone()).or_insert(0) += 1;
         s.round_tx_count += 1;
+        // Per-tx fee burn — sum into both the per-round counter (resets on
+        // each new ledger) and the lifetime counter. rippled charges the
+        // fee on every tx that gets applied regardless of whether it ended
+        // tesSUCCESS or tec*, so we count it for everything that wasn't a
+        // hard preflight reject (those don't reach this branch anyway —
+        // diverged ones are categorized above and still pay their fee).
+        if let Some(fee) = extract_fee_drops(tx_bytes) {
+            s.round_fees_drops = s.round_fees_drops.saturating_add(fee);
+            s.total_fees_burned_drops = s.total_fees_burned_drops.saturating_add(fee);
+        }
         // Histogram: find the first bucket bound >= elapsed_ms, increment it
         // and every bucket after (Prometheus cumulative convention).
         s.apply_duration_count += 1;
@@ -1273,6 +1333,89 @@ mod tests {
         h.update([0u8; 20]);
         let expected = h.finalize();
         assert_eq!(&key[..], &expected[..32]);
+    }
+
+    /// Real-world OfferCancel blob from mainnet has sfFee = 10 drops
+    /// (`6840000000000000000A` in canonical form). Verify the parser
+    /// extracts the right value.
+    #[test]
+    fn extract_fee_real_offer_cancel_mainnet() {
+        let blob = hex::decode(
+            "12000824061B23BC2019061B238D68400000000000000A7321ED8EDE2A52E0BB5D6AE861D\
+             87B08D80D01369944B703095A439515C704B75D0AE674401A24DA6F655EE58419034B7358\
+             494AD3E37EF43232052E4C92ABA9A6A03A62B7993867848BCA8E0D039028CA2B51EED5F2F\
+             079B6B08437EC3B0AEE6FE20CA1068114E0F60CFE821A65D1DB15EB041359ECB0CA16F47A"
+                .replace([' ', '\n', '\r', '\t'], "")
+                .as_str(),
+        )
+        .unwrap();
+        assert_eq!(extract_fee_drops(&blob), Some(10));
+    }
+
+    /// Synthetic small fee (typical 12 drops on mainnet).
+    #[test]
+    fn extract_fee_small_value() {
+        // [0x68, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C] = 12 drops
+        let blob = vec![
+            0x12, 0x00, 0x00, // TransactionType
+            0x68, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, // sfFee = 12
+            0x73, 0x21, // sfSigningPubKey marker (rest doesn't matter for the test)
+        ];
+        assert_eq!(extract_fee_drops(&blob), Some(12));
+    }
+
+    /// Larger fee that uses bits in higher bytes of the 8-byte amount.
+    #[test]
+    fn extract_fee_multibyte() {
+        // 0x000000000001E240 = 123456 drops
+        let blob = vec![
+            0x12, 0x00, 0x00,
+            0x68, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01, 0xE2, 0x40,
+            0x73, 0x21,
+        ];
+        assert_eq!(extract_fee_drops(&blob), Some(123456));
+    }
+
+    /// Fee whose value uses the top 6 bits of the high byte.
+    /// 0x?? = 0x40 | 0x05 = 0x45, value bits 0b000101_<56 zeros> = 5 << 56
+    #[test]
+    fn extract_fee_uses_top_value_bits() {
+        let blob = vec![
+            0x12, 0x00, 0x00,
+            0x68, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x73, 0x21,
+        ];
+        assert_eq!(extract_fee_drops(&blob), Some(5u64 << 56));
+    }
+
+    /// A stray 0x68 byte preceded by a non-matching second byte (0xAA, top
+    /// bits = 10, IOU not native) must be skipped, and the real sfFee must
+    /// still be found further along.
+    #[test]
+    fn extract_fee_skips_false_0x68_match() {
+        let blob = vec![
+            0x68, 0xAA, // false: high bits = 10, not 01
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0x68, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, // real, 7 drops
+        ];
+        assert_eq!(extract_fee_drops(&blob), Some(7));
+    }
+
+    /// Buffers that can't possibly contain a full sfFee return None.
+    #[test]
+    fn extract_fee_returns_none_when_too_short() {
+        assert!(extract_fee_drops(&[]).is_none());
+        assert!(extract_fee_drops(&[0x68; 8]).is_none()); // 8 bytes — not enough
+        // 9-byte buffer with a good marker → should succeed (boundary case)
+        let ok = vec![0x68, 0x40, 0, 0, 0, 0, 0, 0, 0x2A];
+        assert_eq!(extract_fee_drops(&ok), Some(42));
+    }
+
+    /// No sfFee at all → None.
+    #[test]
+    fn extract_fee_returns_none_when_no_fee_field() {
+        let blob = vec![0x12, 0x00, 0x00, 0x73, 0x21, 0xAA, 0xBB, 0xCC, 0xDD];
+        assert!(extract_fee_drops(&blob).is_none());
     }
 
     /// Buffer too short to contain even an sfAccount field.

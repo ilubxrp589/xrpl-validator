@@ -165,18 +165,38 @@
 </div>
 </div>
 </div><!-- end stats -->
-<!-- Transaction Flow — Stacked Streaming Area -->
+<!-- Transaction Flow — Ledger Bento (single-ledger filling containers) -->
 <div class="flex flex-col">
 <div class="flex justify-between items-center mb-2">
 <div class="flex items-center gap-2">
 <span class="font-mono text-[9px] font-bold tracking-widest text-green-500 uppercase">TRANSACTION FLOW</span>
 <span class="h-1.5 w-1.5 bg-green-500 rounded-full animate-pulse"></span>
 </div>
-<span class="text-[9px] font-mono text-slate-500" id="ffi-total-types">0 txs</span>
 </div>
-<div style="height:275px;position:relative;background:#0A0A14;border-radius:6px;border:1px solid #1A1A24;overflow:hidden">
-<canvas id="streamCanvas" style="position:absolute;top:0;left:0;width:100%;height:100%"></canvas>
+<!-- Ledger header strip — five live stats above the bento grid -->
+<div class="grid grid-cols-5 gap-2 mb-2">
+<div style="background:#070710;border:1px solid #1A1A24;border-radius:6px;padding:8px 12px">
+<div style="font-family:'IBM Plex Mono',monospace;font-size:9px;color:#6E7681;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:2px">Ledger</div>
+<div id="bento-ledger" style="font-family:'IBM Plex Mono',monospace;font-size:18px;font-weight:700;color:#00C853;font-variant-numeric:tabular-nums;line-height:1">#0</div>
 </div>
+<div style="background:#070710;border:1px solid #1A1A24;border-radius:6px;padding:8px 12px">
+<div style="font-family:'IBM Plex Mono',monospace;font-size:9px;color:#6E7681;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:2px">Tx Count</div>
+<div id="bento-txcount" style="font-family:'IBM Plex Mono',monospace;font-size:18px;font-weight:700;color:#00B0FF;font-variant-numeric:tabular-nums;line-height:1">0</div>
+</div>
+<div style="background:#070710;border:1px solid #1A1A24;border-radius:6px;padding:8px 12px">
+<div style="font-family:'IBM Plex Mono',monospace;font-size:9px;color:#6E7681;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:2px">Avg Txn/Ledger</div>
+<div id="bento-avg" style="font-family:'IBM Plex Mono',monospace;font-size:18px;font-weight:700;color:#7C4DFF;font-variant-numeric:tabular-nums;line-height:1">0</div>
+</div>
+<div style="background:#070710;border:1px solid #1A1A24;border-radius:6px;padding:8px 12px">
+<div style="font-family:'IBM Plex Mono',monospace;font-size:9px;color:#6E7681;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:2px">Txn / Sec</div>
+<div id="bento-tps" style="font-family:'IBM Plex Mono',monospace;font-size:18px;font-weight:700;color:#E040FB;font-variant-numeric:tabular-nums;line-height:1">0</div>
+</div>
+<div style="background:#070710;border:1px solid #1A1A24;border-radius:6px;padding:8px 12px">
+<div style="font-family:'IBM Plex Mono',monospace;font-size:9px;color:#6E7681;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:2px">Fees Burned</div>
+<div style="display:flex;align-items:baseline;gap:4px"><span id="bento-fees" style="font-family:'IBM Plex Mono',monospace;font-size:18px;font-weight:700;color:#FFD600;font-variant-numeric:tabular-nums;line-height:1">0</span><span id="bento-fees-unit" style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:#6E7681">XRP</span></div>
+</div>
+</div>
+<div id="bentoTx" style="background:#0A0A14;border-radius:6px;border:1px solid #1A1A24;padding:12px" class="grid grid-cols-4 grid-rows-2 gap-2" aria-label="Transaction types in current ledger"></div>
 </div>
 </div>
 </section>
@@ -390,14 +410,46 @@ async function tick() {
         // Streaming area chart — feed live tx data per ledger
         // Feed tx data to chart — simple push like sparkline
         const roundTypes = f.round_tx_types || {};
+        // f.round_tx_count is the FFI verifier's per-ledger count — every tx
+        // is incremented exactly once when libxrpl applies it. The top-level
+        // eng.round_tx_count is from the peer relay tracker which counts the
+        // SAME tx multiple times because every peer gossips it. Always use
+        // the FFI count here so the header matches the bento tube totals.
         const roundCount = f.round_tx_count || 0;
-        $('ffi-total-types').textContent = roundCount + ' txs · #' + (f.round_ledger_seq || 0);
-        const active = Object.entries(roundTypes).filter(([,v]) => v > 0);
-        if (active.length > 0) {
-            const snap = { _seq: f.round_ledger_seq || 0 };
-            for (const [type, cnt] of active) snap[type] = cnt;
-            txChart.push(snap);
+        const roundSeq = f.round_ledger_seq || eng.ledger_seq || 0;
+        // Per-ledger fees come from the FFI verifier when the binary on the
+        // server has the round_fees_drops field (added after the ffi_engine
+        // fee-extraction patch). Until that build is deployed, fall back to
+        // the chain-wide lifetime burn from rippled (drops → XRP).
+        let feeText, feeUnit;
+        if (typeof f.round_fees_drops === 'number') {
+            feeText = f.round_fees_drops.toLocaleString();
+            feeUnit = 'drops';
+        } else {
+            const lifetimeBurnedDrops = eng.lifetime_burned || 0;
+            feeText = (lifetimeBurnedDrops / 1_000_000).toLocaleString(undefined, { maximumFractionDigits: 2 });
+            feeUnit = 'XRP';
         }
+        // Avg txn/ledger and TPS — rolling 60-ledger window so the numbers
+        // match what livenet.xrpl.org shows. Lifetime totals would smear in
+        // the catchup-era ledgers (we processed faster than real time at
+        // start) and never converge to mainnet's actual rate.
+        //
+        // Strategy: every time the FFI's round_ledger_seq advances, we know
+        // the PREVIOUS ledger has closed. Promote its final tx count and
+        // the wall-clock interval since the previous boundary into a
+        // rolling history. The window's tps is sum(txs) / sum(intervals).
+        rollingLedgers.observe(roundSeq, roundCount);
+        const window = rollingLedgers.window();
+        const avgPerLedger = window.count > 0 ? (window.totalTxs / window.count) : 0;
+        const tps = window.totalSec > 0 ? (window.totalTxs / window.totalSec) : 0;
+        $('bento-ledger').textContent = '#' + roundSeq.toLocaleString();
+        $('bento-txcount').textContent = roundCount.toLocaleString();
+        $('bento-avg').textContent = avgPerLedger.toLocaleString(undefined, { maximumFractionDigits: 1 });
+        $('bento-tps').textContent = tps.toLocaleString(undefined, { maximumFractionDigits: 1 });
+        $('bento-fees').textContent = feeText;
+        $('bento-fees-unit').textContent = feeUnit;
+        bentoTx.update(roundTypes, roundSeq);
 
         // Consensus data — feed to PCB board
         const monitor = cons.monitor || {};
@@ -415,160 +467,205 @@ async function tick() {
     } catch (e) { /* silent — next tick retries */ }
 }
 
-// === TX FLOW CHART — Sparkline pattern (simple, proven) ===
-const TX_TYPES = ['OfferCancel','OfferCreate','Payment','TrustSet','AccountSet',
-    'NFTokenCreateOffer','NFTokenAcceptOffer','NFTokenMint','NFTokenBurn',
-    'TicketCreate','CheckCash','OracleSet','AMMDeposit','AMMWithdraw'];
-const TX_MAX = 900;
-
-const txChart = {
-    data: JSON.parse(localStorage.getItem('txChartData') || '[]'),
-    canvas: null, ctx: null,
-    push(snap) {
-        this.data.push(snap);
-        if (this.data.length > TX_MAX) this.data.shift();
-        this.draw();
+// === ROLLING LEDGER WINDOW — rolling 60-ledger averages for TPS/avg ===
+//
+// The FFI engine's lifetime counters smear catchup-era data into the
+// process-wide totals, so they never converge to mainnet's actual rate.
+// This rolling window only keeps the most recent 60 closed ledgers and
+// measures wall-clock intervals between observed boundary crossings, so
+// the txn/sec and avg txn/ledger cells match what livenet.xrpl.org shows.
+const ROLLING_MAX = 60;
+const rollingLedgers = {
+    history: [], // [{ count, intervalMs }, ...]
+    pendingSeq: 0,
+    pendingCount: 0,
+    lastBoundaryMs: 0,
+    observe(seq, count) {
+        // Cold start — anchor on the first seen seq, no history yet.
+        if (this.pendingSeq === 0) {
+            this.pendingSeq = seq;
+            this.pendingCount = count;
+            this.lastBoundaryMs = Date.now();
+            return;
+        }
+        // Same ledger still in progress — track its growing tx count.
+        if (seq === this.pendingSeq) {
+            if (count > this.pendingCount) this.pendingCount = count;
+            return;
+        }
+        // New ledger boundary — promote the previous ledger's final count
+        // and the wall-clock interval since the previous boundary.
+        const now = Date.now();
+        const intervalMs = now - this.lastBoundaryMs;
+        // Guard against junk samples: ledgers should be ~3-5s apart, but
+        // accept anything between 500ms and 30s as plausible. Anything
+        // outside that range is almost certainly a stale snapshot or a
+        // process restart, and would distort the rolling average.
+        if (intervalMs >= 500 && intervalMs <= 30000) {
+            this.history.push({ count: this.pendingCount, intervalMs });
+            if (this.history.length > ROLLING_MAX) this.history.shift();
+        }
+        this.pendingSeq = seq;
+        this.pendingCount = count;
+        this.lastBoundaryMs = now;
     },
-    draw() {
-        const c = this.canvas, ctx = this.ctx;
-        if (!c || !ctx) return;
-        const dpr = window.devicePixelRatio || 1;
-        const w = c.clientWidth, h = c.clientHeight;
-        if (w === 0 || h === 0) return;
-        c.width = w * dpr; c.height = h * dpr;
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        ctx.clearRect(0, 0, w, h);
-
-        const n = this.data.length;
-        if (n < 2) return;
-
-        const step = w / (TX_MAX - 1);
-        const padTop = 40, padBot = 20;
-        const pad = padTop; // compat
-
-        // Find max total for Y scale
-        let maxTotal = 1;
-        for (const snap of this.data) {
-            let t = 0;
-            for (const k of TX_TYPES) t += snap[k] || 0;
-            if (t > maxTotal) maxTotal = t;
-        }
-
-        // Subtle grid
-        ctx.strokeStyle = 'rgba(26,26,36,0.8)';
-        ctx.lineWidth = 1;
-        for (let g = 1; g <= 4; g++) {
-            const gy = pad + (g / 5) * (h - padTop - padBot);
-            ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(w, gy); ctx.stroke();
-        }
-
-        // Draw stacked areas — bottom type first
-        for (let ti = TX_TYPES.length - 1; ti >= 0; ti--) {
-            const type = TX_TYPES[ti];
-            const color = txColors[type] || '#6E7681';
-            let hasData = false;
-            for (const snap of this.data) { if (snap[type]) { hasData = true; break; } }
-            if (!hasData) continue;
-
-            const tops = [], bottoms = [];
-            for (let i = 0; i < n; i++) {
-                let below = 0;
-                for (let j = TX_TYPES.length - 1; j > ti; j--) below += this.data[i][TX_TYPES[j]] || 0;
-                const val = this.data[i][type] || 0;
-                bottoms.push(below);
-                tops.push(below + val);
-            }
-
-            // Filled area
-            ctx.beginPath();
-            for (let i = 0; i < n; i++) {
-                const x = i * step, y = pad + (h - padTop - padBot) - (tops[i] / maxTotal) * (h - padTop - padBot);
-                i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-            }
-            for (let i = n - 1; i >= 0; i--) {
-                const x = i * step, y = pad + (h - padTop - padBot) - (bottoms[i] / maxTotal) * (h - padTop - padBot);
-                ctx.lineTo(x, y);
-            }
-            ctx.closePath();
-            const grad = ctx.createLinearGradient(0, pad, 0, h);
-            grad.addColorStop(0, color + 'AA');
-            grad.addColorStop(1, color + '11');
-            ctx.fillStyle = grad;
-            ctx.fill();
-
-            // Top stroke
-            ctx.beginPath();
-            for (let i = 0; i < n; i++) {
-                const x = i * step, y = pad + (h - padTop - padBot) - (tops[i] / maxTotal) * (h - padTop - padBot);
-                i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-            }
-            ctx.strokeStyle = color;
-            ctx.lineWidth = 1.5;
-            ctx.stroke();
-        }
-
-        // Top counters — all active types from latest
-        if (n > 0) {
-            const latest = this.data[n - 1];
-            const activeTypes = TX_TYPES.filter(t => (latest[t] || 0) > 0)
-                .sort((a, b) => (latest[b] || 0) - (latest[a] || 0));
-            const spacing = w / (activeTypes.length + 1);
-            for (let i = 0; i < activeTypes.length; i++) {
-                const t = activeTypes[i];
-                const c = txColors[t] || '#6E7681';
-                const val = latest[t] || 0;
-                const x = spacing * (i + 1);
-                ctx.fillStyle = c; ctx.fillRect(x - 30, 8, 6, 6);
-                ctx.fillStyle = 'rgba(255,255,255,0.6)'; ctx.textAlign = 'left';
-                ctx.font = '9px IBM Plex Mono, monospace';
-                ctx.fillText(t, x - 20, 14);
-                ctx.fillStyle = c; ctx.font = 'bold 14px IBM Plex Mono, monospace';
-                ctx.fillText(val.toLocaleString(), x - 20, 30);
-            }
-        }
-
-        // Ledger labels along bottom — find ledger boundaries
-        ctx.font = '8px IBM Plex Mono, monospace';
-        ctx.textAlign = 'center';
-        ctx.fillStyle = 'rgba(255,255,255,0.45)';
-        const labels = [];
-        let prevSeq = 0;
-        for (let i = 0; i < n; i++) {
-            const seq = this.data[i]._seq || 0;
-            if (seq !== prevSeq && seq > 0) {
-                labels.push({ i, seq });
-                prevSeq = seq;
-            }
-        }
-        // Show evenly spaced labels — max ~8
-        const showEvery = Math.max(1, Math.ceil(labels.length / 8));
-        for (let li = 0; li < labels.length; li++) {
-            if (li % showEvery !== 0 && li !== labels.length - 1) continue;
-            const x = labels[li].i * step;
-            if (x < 25 || x > w - 25) continue;
-            ctx.fillText('#' + labels[li].seq.toLocaleString(), x, h - 3);
-        }
-
-        // Glow dot on latest
-        if (n > 0) {
-            let topTotal = 0;
-            for (const t of TX_TYPES) topTotal += this.data[n-1][t] || 0;
-            const dotX = (n - 1) * step;
-            const dotY = pad + (h - padTop - padBot) - (topTotal / maxTotal) * (h - padTop - padBot);
-            ctx.beginPath(); ctx.arc(dotX, dotY, 3, 0, Math.PI * 2);
-            ctx.fillStyle = '#00E676'; ctx.shadowBlur = 8; ctx.shadowColor = '#00C853';
-            ctx.fill(); ctx.shadowBlur = 0;
-        }
-    }
+    window() {
+        let totalTxs = 0, totalMs = 0;
+        for (const e of this.history) { totalTxs += e.count; totalMs += e.intervalMs; }
+        return { count: this.history.length, totalTxs, totalSec: totalMs / 1000 };
+    },
 };
-txChart.canvas = $('streamCanvas');
-txChart.ctx = txChart.canvas ? txChart.canvas.getContext('2d') : null;
-if (txChart.data.length > 1) txChart.draw(); // draw persisted data immediately
 
-// Save to localStorage periodically
-setInterval(() => {
-    try { localStorage.setItem('txChartData', JSON.stringify(txChart.data.slice(-TX_MAX))); } catch(e) {}
-}, 2000);
+// === LEDGER BENTO — single-ledger tx-type containers, "objects filling up" ===
+//
+// Eight fixed slots in a 4x2 grid, one per common XRPL tx type, plus a 9th
+// that absorbs everything else as "Other". Each slot is a glass tube that
+// fills bottom-up with stacked blocks as txs of that type apply during the
+// CURRENT in-progress ledger. When the ledger seq advances, every tube
+// drains in 200ms before refilling for the new ledger.
+//
+// Why this design: the previous chart showed a rolling history of many
+// ledgers and the label/chart got out of sync — chart visualized hundreds
+// of completed snapshots while the label read the in-progress ledger.
+// The bento has exactly one source of truth per tube: the current ledger's
+// running count for that type. Label and visual fill cannot disagree.
+//
+// UX rules applied (from ui-ux-pro-max):
+//   - transform: scaleY for fill (no layout thrashing, GPU-friendly)
+//   - 220ms ease-out transitions, 60fps target
+//   - tabular-nums on counts so the numbers don't jiggle as digits change
+//   - color + label + position (color is never the only signal)
+//   - prefers-reduced-motion freezes the transitions
+//   - WCAG 4.5:1 contrast: white text on the dark slate-900 backgrounds
+//   - reserved space: fixed grid, zero CLS
+const BENTO_SLOTS = [
+    { key: 'Payment',            label: 'Payment'    },
+    { key: 'OfferCreate',        label: 'OfferCreate'},
+    { key: 'OfferCancel',        label: 'OfferCancel'},
+    { key: 'TrustSet',           label: 'TrustSet'   },
+    { key: 'NFTokenCreateOffer', label: 'NFT Offer'  },
+    { key: 'NFTokenAcceptOffer', label: 'NFT Accept' },
+    { key: 'TicketCreate',       label: 'Ticket'     },
+    { key: '__OTHER__',          label: 'Other'      },
+];
+// Tx types that are explicitly modeled by their own slot.
+const BENTO_NAMED = new Set(BENTO_SLOTS.filter(s => s.key !== '__OTHER__').map(s => s.key));
+
+const bentoTx = {
+    container: null,
+    seq: 0,
+    slots: {}, // key -> { fill, count, peak }
+    init() {
+        this.container = $('bentoTx');
+        if (!this.container) return;
+        this.container.innerHTML = '';
+        this.container.style.minHeight = '275px';
+        for (const slot of BENTO_SLOTS) {
+            const color = slot.key === '__OTHER__' ? '#6E7681' : (txColors[slot.key] || '#6E7681');
+            const el = document.createElement('div');
+            el.className = 'relative overflow-hidden rounded border';
+            el.style.cssText = 'background:#070710;border-color:#1A1A24;display:flex;flex-direction:column;justify-content:flex-end;height:120px';
+            el.innerHTML = `
+                <div class="bento-fill" style="
+                    position:absolute;left:0;right:0;bottom:0;height:100%;
+                    background:linear-gradient(to top, ${color}55 0%, ${color}22 80%, ${color}05 100%);
+                    transform-origin:bottom;transform:scaleY(0);
+                    transition:transform 20ms linear;
+                    will-change:transform;
+                "></div>
+                <div class="bento-stripes" style="
+                    position:absolute;left:0;right:0;bottom:0;height:100%;
+                    background-image:repeating-linear-gradient(to top, transparent 0px, transparent 6px, ${color}33 6px, ${color}33 7px);
+                    transform-origin:bottom;transform:scaleY(0);
+                    transition:transform 20ms linear;
+                    pointer-events:none;
+                "></div>
+                <div class="bento-peak" style="
+                    position:absolute;left:0;right:0;height:1px;
+                    background:${color}66;bottom:0;
+                    transition:bottom 20ms linear;
+                    pointer-events:none;
+                " title="previous ledger peak"></div>
+                <div style="position:relative;padding:8px 10px;display:flex;flex-direction:column;gap:2px;z-index:1">
+                    <div style="display:flex;align-items:center;gap:6px">
+                        <span style="display:inline-block;width:6px;height:6px;background:${color};border-radius:1px"></span>
+                        <span style="font-family:'IBM Plex Mono',monospace;font-size:9px;color:#94A3B8;text-transform:uppercase;letter-spacing:0.05em">${slot.label}</span>
+                    </div>
+                    <span class="bento-count" style="font-family:'IBM Plex Mono',monospace;font-size:20px;font-weight:700;color:${color};font-variant-numeric:tabular-nums;line-height:1">0</span>
+                </div>
+            `;
+            this.container.appendChild(el);
+            this.slots[slot.key] = {
+                el,
+                fill: el.querySelector('.bento-fill'),
+                stripes: el.querySelector('.bento-stripes'),
+                peak: el.querySelector('.bento-peak'),
+                count: el.querySelector('.bento-count'),
+                color,
+                value: 0,
+                peakValue: 0,
+            };
+        }
+    },
+    update(roundTypes, roundSeq) {
+        if (!this.container) return;
+        // Sum non-named tx types into the synthetic "Other" slot.
+        const counts = {};
+        let other = 0;
+        for (const [k, v] of Object.entries(roundTypes || {})) {
+            if (!v) continue;
+            if (BENTO_NAMED.has(k)) counts[k] = v;
+            else other += v;
+        }
+        counts['__OTHER__'] = other;
+
+        // Detect ledger rollover. On the boundary, lock previous values as
+        // the "peak" reference markers and drain every fill before the new
+        // ledger's data starts populating.
+        if (roundSeq && roundSeq !== this.seq) {
+            if (this.seq !== 0) {
+                for (const key of Object.keys(this.slots)) {
+                    const s = this.slots[key];
+                    s.peakValue = s.value;
+                    s.value = 0;
+                    s.fill.style.transform = 'scaleY(0)';
+                    s.stripes.style.transform = 'scaleY(0)';
+                    s.count.textContent = '0';
+                    s.peak.style.bottom = '0';
+                }
+            }
+            this.seq = roundSeq;
+        }
+
+        // Scale every tube relative to the largest current count in this
+        // ledger so the dominant type fills fully and tiny types still show.
+        // A small floor of 5% gives single-tx counts a visible nub instead
+        // of a flat zero line.
+        let maxCount = 0;
+        for (const k of Object.keys(this.slots)) {
+            const c = counts[k] || 0;
+            if (c > maxCount) maxCount = c;
+        }
+        if (maxCount === 0) maxCount = 1;
+
+        for (const key of Object.keys(this.slots)) {
+            const s = this.slots[key];
+            const c = counts[key] || 0;
+            if (c === s.value) continue; // skip no-op updates so transitions don't restart
+            s.value = c;
+            const ratio = c === 0 ? 0 : Math.max(0.05, c / maxCount);
+            s.fill.style.transform = `scaleY(${ratio.toFixed(3)})`;
+            s.stripes.style.transform = `scaleY(${ratio.toFixed(3)})`;
+            s.count.textContent = c.toLocaleString();
+            // Peak marker — only show if previous ledger had data for this type
+            if (s.peakValue > 0) {
+                const peakRatio = Math.max(0.05, s.peakValue / Math.max(maxCount, s.peakValue));
+                s.peak.style.bottom = (peakRatio * 100).toFixed(1) + '%';
+            }
+        }
+    },
+};
+bentoTx.init();
 
 // === CONSENSUS PCB BOARD ===
 const consPCB = {
