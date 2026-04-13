@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useValidatorData } from '@/hooks/use-validator-data';
 import { fmt } from '@/lib/utils';
 
@@ -63,42 +63,61 @@ export function TransactionFlow() {
   // Rolling window state — persists across renders.
   const windowRef = useRef<RoundSample[]>([]);
   const lastSeqRef = useRef<number>(0);
-  const lastRenderMs = useRef<number>(Date.now());
+  const lastBoundaryMs = useRef<number>(Date.now());
+  // Track the highest tx count seen for the current in-progress ledger.
+  // When the seq advances, THIS is the completed ledger's final count —
+  // not f.round_tx_count which is already the new ledger's tiny count.
+  const pendingMaxCount = useRef<number>(0);
 
   // Derived rolling stats
   const avgRef = useRef<number>(0);
   const tpsRef = useRef<number>(0);
 
-  // Update rolling window when the ledger sequence changes.
+  // Update rolling window.
   useEffect(() => {
     if (!data) return;
 
     const f = data.engine.ffi_verifier;
     const seq = f.round_ledger_seq;
+    const count = f.round_tx_count;
     const now = Date.now();
 
-    if (seq > 0 && seq !== lastSeqRef.current) {
-      // Capture the previous round's data.
-      if (lastSeqRef.current > 0) {
-        const intervalMs = now - lastRenderMs.current;
-        const sample: RoundSample = {
-          count: f.round_tx_count,
-          intervalMs: Math.max(intervalMs, 1),
-        };
-        const win = windowRef.current;
-        win.push(sample);
-        if (win.length > MAX_WINDOW) win.shift();
+    if (seq === 0) return;
 
-        // Recompute running averages.
-        const totalTxs = win.reduce((s, r) => s + r.count, 0);
-        const totalMs = win.reduce((s, r) => s + r.intervalMs, 0);
-        avgRef.current = win.length > 0 ? totalTxs / win.length : 0;
-        tpsRef.current = totalMs > 0 ? (totalTxs / totalMs) * 1000 : 0;
-      }
-
+    // First observation — just anchor.
+    if (lastSeqRef.current === 0) {
       lastSeqRef.current = seq;
-      lastRenderMs.current = now;
+      pendingMaxCount.current = count;
+      lastBoundaryMs.current = now;
+      return;
     }
+
+    // Same ledger still in progress — track its growing tx count.
+    if (seq === lastSeqRef.current) {
+      if (count > pendingMaxCount.current) pendingMaxCount.current = count;
+      return;
+    }
+
+    // Ledger boundary — promote the PREVIOUS ledger's peak count.
+    const intervalMs = now - lastBoundaryMs.current;
+    if (intervalMs >= 500 && intervalMs <= 30000) {
+      const sample: RoundSample = {
+        count: pendingMaxCount.current,
+        intervalMs,
+      };
+      const win = windowRef.current;
+      win.push(sample);
+      if (win.length > MAX_WINDOW) win.shift();
+
+      const totalTxs = win.reduce((s, r) => s + r.count, 0);
+      const totalMs = win.reduce((s, r) => s + r.intervalMs, 0);
+      avgRef.current = win.length > 0 ? totalTxs / win.length : 0;
+      tpsRef.current = totalMs > 0 ? (totalTxs / totalMs) * 1000 : 0;
+    }
+
+    lastSeqRef.current = seq;
+    pendingMaxCount.current = count;
+    lastBoundaryMs.current = now;
   }, [data]);
 
   if (loading || !data) {
@@ -125,11 +144,12 @@ export function TransactionFlow() {
       ? `${fmt(f.round_fees_drops)} drops`
       : `${(data.engine.lifetime_burned / 1e6).toFixed(4)} XRP`;
 
-  // Build sorted tx-type entries (count > 0, descending, limit 8).
-  const txTypes = Object.entries(f.round_tx_types)
-    .filter(([, count]) => count > 0)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 8);
+  // Live feed — sorted by count descending so the most active type is always
+  // on top. Only types with count > 0 are shown.
+  const roundTypes = f.round_tx_types || {};
+  const txTypes = Object.entries(roundTypes)
+    .filter(([, c]) => c > 0)
+    .sort((a, b) => b[1] - a[1]);
 
   const maxCount = txTypes.length > 0 ? txTypes[0][1] : 1;
 
@@ -152,51 +172,39 @@ export function TransactionFlow() {
 
         {txTypes.length === 0 ? (
           <p className="py-4 text-center font-mono text-sm text-halcyon-muted">
-            No transactions in current round
+            Waiting for transactions...
           </p>
         ) : (
           <div className="flex flex-col gap-1.5">
             {txTypes.map(([type, count]) => {
-              const pct = Math.max((count / maxCount) * 100, 2); // min 2% width (~4px at 200px)
+              const pct = Math.max((count / maxCount) * 100, 3);
               const color = txColor(type);
-              const truncName =
-                type.length > 18 ? type.slice(0, 16) + '..' : type;
 
               return (
                 <div key={type} className="flex items-center gap-2">
-                  {/* Label */}
                   <span className="w-[130px] shrink-0 truncate font-mono text-xs text-halcyon-text sm:w-[160px]">
-                    {truncName}
+                    {type}
                   </span>
-
-                  {/* Bar */}
                   <div className="relative flex-1">
                     <div
                       className="flex h-7 items-center rounded-sm px-2"
                       style={{
                         width: `${pct}%`,
-                        minWidth: '4px',
                         backgroundColor: color,
                         opacity: 0.85,
+                        transition: 'width 400ms ease-out',
                       }}
                     >
-                      {pct > 15 && (
-                        <span className="font-mono text-xs font-medium text-black">
+                      {pct > 20 && (
+                        <span className="whitespace-nowrap font-mono text-xs font-medium text-black">
                           {fmt(count)}
                         </span>
                       )}
                     </div>
                   </div>
-
-                  {/* Count — shown outside bar when bar is narrow */}
-                  {pct <= 15 && (
-                    <span
-                      className="font-mono text-xs tabular-nums"
-                      style={{ color }}
-                    >
-                      {fmt(count)}
-                    </span>
-                  )}
+                  <span className="w-10 text-right font-mono text-xs tabular-nums" style={{ color }}>
+                    {fmt(count)}
+                  </span>
                 </div>
               );
             })}

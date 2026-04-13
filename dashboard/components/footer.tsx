@@ -22,7 +22,7 @@ export function Footer() {
           </span>
           <span className="hidden sm:inline text-halcyon-border">|</span>
           <span className="hidden sm:inline">
-            Built with Rust + libxrpl FFI
+            Built with &#10084;&#65039; on Rust + libxrpl FFI
           </span>
         </div>
         <div className="flex items-center gap-4">

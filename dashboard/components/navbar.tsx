@@ -1,6 +1,6 @@
 'use client';
 
-import { CheckCircle2, Radio, ExternalLink } from 'lucide-react';
+import { CheckCircle2, Radio, ExternalLink, Github, Share2 } from 'lucide-react';
 import { useValidatorData } from '@/hooks/use-validator-data';
 import { fmt } from '@/lib/utils';
 
@@ -21,6 +21,7 @@ const STATUS_DOT: Record<string, string> = {
 export function Navbar() {
   const { data, loading, status } = useValidatorData();
   const ledgerSeq = data?.engine.ledger_seq ?? 0;
+  const peers = data?.peers ?? 0;
 
   return (
     <header className="sticky top-0 z-50 h-14 border-b border-halcyon-border bg-halcyon-bg/80 backdrop-blur-md">
@@ -57,15 +58,45 @@ export function Navbar() {
               <>
                 <span className="text-halcyon-muted">|</span>
                 <span className="font-mono text-xs tabular-nums text-white">
-                  Ledger #{fmt(ledgerSeq)}
+                  #{fmt(ledgerSeq)}
                 </span>
+                {peers > 0 && (
+                  <>
+                    <span className="text-halcyon-muted">|</span>
+                    <span className="font-mono text-xs tabular-nums text-halcyon-accent">
+                      {peers} peers
+                    </span>
+                  </>
+                )}
               </>
             )}
           </div>
         </div>
 
-        {/* ---- Right: version badge + live indicator ---- */}
-        <div className="flex items-center gap-3">
+        {/* ---- Right: GitHub, Share, version badge, live indicator ---- */}
+        <div className="flex items-center gap-2 sm:gap-3">
+          <a
+            href="https://github.com/ilubxrp589/xrpl-validator"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="rounded p-1.5 text-halcyon-muted transition-colors hover:text-halcyon-accent"
+            aria-label="GitHub"
+          >
+            <Github className="h-4 w-4" />
+          </a>
+          <button
+            onClick={() => {
+              if (navigator.share) {
+                navigator.share({ title: 'Halcyon XRPL Validator', url: window.location.href });
+              } else {
+                navigator.clipboard.writeText(window.location.href);
+              }
+            }}
+            className="rounded p-1.5 text-halcyon-muted transition-colors hover:text-halcyon-accent"
+            aria-label="Share"
+          >
+            <Share2 className="h-4 w-4" />
+          </button>
           <span className="hidden rounded border border-halcyon-border bg-halcyon-card px-2 py-0.5 font-mono text-[10px] text-halcyon-muted sm:inline-block">
             LIBXRPL 3.2.0-b0
           </span>

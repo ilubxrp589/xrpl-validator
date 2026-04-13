@@ -1,11 +1,8 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
 import {
   AreaChart,
   Area,
-  LineChart,
-  Line,
   XAxis,
   YAxis,
   Tooltip,
@@ -13,68 +10,40 @@ import {
   CartesianGrid,
 } from 'recharts';
 import { useValidatorData } from '@/hooks/use-validator-data';
-import { histPercentile } from '@/lib/types';
 
-interface AgreementPoint {
-  time: string;
-  pct: number;
+interface LedgerTime {
+  seq: string;
+  ms: number;
+  txs: number;
 }
 
-interface LatencyPoint {
-  time: string;
-  p50: number;
-  p95: number;
-  p99: number;
+interface WalletPoint {
+  seq: string;
+  count: number;
 }
-
-const MAX_POINTS = 200; // ~12 minutes at 3.5s/ledger
 
 export function TrendCharts() {
   const { data } = useValidatorData();
-  const [agreement, setAgreement] = useState<AgreementPoint[]>([]);
-  const [latency, setLatency] = useState<LatencyPoint[]>([]);
-  const lastSeq = useRef(0);
 
-  useEffect(() => {
-    if (!data) return;
-    const f = data.engine.ffi_verifier;
-    const seq = f.round_ledger_seq;
-    if (seq === lastSeq.current || seq === 0) return;
-    lastSeq.current = seq;
+  // Wallet growth — from wallet_history ([seq, count][] pairs)
+  const rawWallets = data?.stateHash.wallet_history ?? [];
+  const walletData: WalletPoint[] = rawWallets.slice(-100).map(([seq, count]) => ({
+    seq: `#${seq}`,
+    count,
+  }));
 
-    const now = new Date();
-    const time = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
-
-    const att = f.live_apply_attempted;
-    const ok = f.live_apply_ok + f.live_apply_claimed;
-    const pct = att > 0 ? (ok / att) * 100 : 100;
-
-    setAgreement((prev) => {
-      const next = [...prev, { time, pct }];
-      return next.length > MAX_POINTS ? next.slice(-MAX_POINTS) : next;
-    });
-
-    const buckets = f.apply_duration_buckets_ms;
-    const count = f.apply_duration_count;
-    const parseMs = (s: string) => {
-      if (s === '>1s') return 1000;
-      if (s === '—') return 0;
-      return parseInt(s, 10) || 0;
-    };
-
-    setLatency((prev) => {
-      const next = [
-        ...prev,
-        {
-          time,
-          p50: parseMs(histPercentile(buckets, count, 0.5)),
-          p95: parseMs(histPercentile(buckets, count, 0.95)),
-          p99: parseMs(histPercentile(buckets, count, 0.99)),
-        },
-      ];
-      return next.length > MAX_POINTS ? next.slice(-MAX_POINTS) : next;
-    });
-  }, [data]);
+  // Per-ledger apply time — from sync_log (last 100 ledgers, each with
+  // actual round time and tx count). This shows REAL variation per ledger
+  // instead of flat cumulative percentiles.
+  const syncLog = data?.stateHash.sync_log ?? [];
+  const ledgerTimes: LedgerTime[] = syncLog
+    .slice(0, 100)
+    .reverse()
+    .map((entry) => ({
+      seq: `#${entry.seq}`,
+      ms: Math.round(entry.time_secs * 1000),
+      txs: entry.txs,
+    }));
 
   const chartStyle = {
     fontSize: 10,
@@ -83,45 +52,51 @@ export function TrendCharts() {
 
   return (
     <section className="grid grid-cols-1 md:grid-cols-2 gap-4">
-      {/* Agreement trend */}
+      {/* Wallet growth */}
       <div className="bg-halcyon-card border border-halcyon-border rounded-lg p-4">
         <h3 className="text-xs font-mono text-halcyon-muted uppercase tracking-wider mb-3">
-          Agreement % (rolling)
+          Wallet Growth (recent)
         </h3>
         <div className="h-40">
           <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={agreement} style={chartStyle}>
+            <AreaChart data={walletData} style={chartStyle}>
               <CartesianGrid strokeDasharray="3 3" stroke="#1A1A1A" />
-              <XAxis dataKey="time" tick={{ fill: '#666' }} interval="preserveStartEnd" />
-              <YAxis domain={[99, 100.1]} tick={{ fill: '#666' }} tickFormatter={(v) => `${v}%`} />
+              <XAxis dataKey="seq" tick={{ fill: '#666' }} interval="preserveStartEnd" />
+              <YAxis
+                tick={{ fill: '#666' }}
+                domain={['dataMin - 10', 'dataMax + 10']}
+                tickFormatter={(v: number) => v.toLocaleString()}
+              />
               <Tooltip
                 contentStyle={{ background: '#111', border: '1px solid #1A1A1A', borderRadius: 6, fontSize: 11, fontFamily: 'IBM Plex Mono' }}
                 labelStyle={{ color: '#666' }}
+                formatter={(value: number) => [value.toLocaleString(), 'Wallets']}
               />
-              <Line type="monotone" dataKey="pct" stroke="#00FF9F" strokeWidth={2} dot={false} name="Agreement %" />
-            </LineChart>
+              <Area type="monotone" dataKey="count" fill="#7C4DFF20" stroke="#7C4DFF" strokeWidth={1.5} name="count" />
+            </AreaChart>
           </ResponsiveContainer>
         </div>
       </div>
 
-      {/* Latency trend */}
+      {/* Per-ledger apply time */}
       <div className="bg-halcyon-card border border-halcyon-border rounded-lg p-4">
         <h3 className="text-xs font-mono text-halcyon-muted uppercase tracking-wider mb-3">
-          Apply Latency Percentiles (rolling)
+          Ledger Apply Time (last {ledgerTimes.length} ledgers)
         </h3>
         <div className="h-40">
           <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={latency} style={chartStyle}>
+            <AreaChart data={ledgerTimes} style={chartStyle}>
               <CartesianGrid strokeDasharray="3 3" stroke="#1A1A1A" />
-              <XAxis dataKey="time" tick={{ fill: '#666' }} interval="preserveStartEnd" />
-              <YAxis tick={{ fill: '#666' }} tickFormatter={(v) => `${v}ms`} />
+              <XAxis dataKey="seq" tick={{ fill: '#666' }} interval="preserveStartEnd" />
+              <YAxis tick={{ fill: '#666' }} tickFormatter={(v: number) => `${v}ms`} />
               <Tooltip
                 contentStyle={{ background: '#111', border: '1px solid #1A1A1A', borderRadius: 6, fontSize: 11, fontFamily: 'IBM Plex Mono' }}
                 labelStyle={{ color: '#666' }}
+                formatter={(value: number, name: string) =>
+                  name === 'ms' ? [`${value}ms`, 'Apply Time'] : [value, 'Txs']
+                }
               />
-              <Area type="monotone" dataKey="p99" fill="#FF636340" stroke="#FF6363" strokeWidth={1} name="p99" />
-              <Area type="monotone" dataKey="p95" fill="#FFD60040" stroke="#FFD600" strokeWidth={1} name="p95" />
-              <Area type="monotone" dataKey="p50" fill="#00FF9F40" stroke="#00FF9F" strokeWidth={1.5} name="p50 (median)" />
+              <Area type="monotone" dataKey="ms" fill="#00FF9F20" stroke="#00FF9F" strokeWidth={1.5} name="ms" />
             </AreaChart>
           </ResponsiveContainer>
         </div>

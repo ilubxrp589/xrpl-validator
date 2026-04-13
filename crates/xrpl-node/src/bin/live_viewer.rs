@@ -288,7 +288,7 @@ async fn main() {
     let connected_count: Arc<std::sync::atomic::AtomicUsize> = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // Track which peers are currently connected (for the peers page)
     let connected_peers: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-    let max_peers: usize = 1000;
+    let max_peers: usize = 125;
 
     // Seed with initial peers
     for peer in MAINNET_PEERS {

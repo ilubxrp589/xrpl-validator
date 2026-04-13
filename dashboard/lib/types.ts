@@ -81,9 +81,13 @@ export interface ConsensusMonitor {
 
 export interface ConsensusData {
   phase: string;
-  round: number;
   unl_size: number;
   monitor: ConsensusMonitor;
+  establish_rounds?: number;
+  candidate_set_size?: number;
+  mempool_size?: number;
+  ledger_seq?: number;
+  peer_proposals?: number;
 }
 
 export interface StateHashStatus {
@@ -97,7 +101,8 @@ export interface StateHashStatus {
   ready_to_sign: boolean;
   db_entries: number;
   wallet_count: number;
-  wallet_history: Array<{ seq: number; count: number; ts: number }>;
+  /** Raw shape from the API is `[seq, count][]`, not objects. */
+  wallet_history: Array<[number, number]>;
   bulk_sync: {
     running: boolean;
     objects_synced: number;
@@ -118,6 +123,8 @@ export interface ValidatorSnapshot {
   engine: EngineData;
   consensus: ConsensusData;
   stateHash: StateHashStatus;
+  /** Number of connected peers from /api/peers. */
+  peers: number;
   /** Milliseconds since epoch when this snapshot was captured. */
   updatedAt: number;
 }

@@ -43,7 +43,7 @@ export function useValidatorData() {
 // Provider — polls 3 endpoints, merges into one snapshot, throttles at 50ms
 // ---------------------------------------------------------------------------
 
-const POLL_INTERVAL = 3500; // ~1 per mainnet ledger close
+const POLL_INTERVAL = 50;
 const STALE_THRESHOLD = 15_000; // 15s without a fresh ledger → "stale"
 
 /**
@@ -66,10 +66,11 @@ export function ValidatorProvider({ children }: { children: ReactNode }) {
 
   const fetchAll = useCallback(async () => {
     try {
-      const [engRes, consRes, shRes] = await Promise.all([
+      const [engRes, consRes, shRes, peerRes] = await Promise.all([
         fetch('/api/engine'),
         fetch('/api/consensus'),
         fetch('/api/state-hash'),
+        fetch('/api/peers').catch(() => null),
       ]);
       if (!engRes.ok || !consRes.ok || !shRes.ok) {
         setStatus('error');
@@ -80,6 +81,7 @@ export function ValidatorProvider({ children }: { children: ReactNode }) {
         consRes.json(),
         shRes.json(),
       ])) as [EngineData, ConsensusData, StateHashStatus];
+      const peers = peerRes?.ok ? await peerRes.json() : null;
 
       const now = Date.now();
       const newSeq = engine.ledger_seq || 0;
@@ -93,7 +95,7 @@ export function ValidatorProvider({ children }: { children: ReactNode }) {
         setStatus('stale');
       }
 
-      setSnapshot({ engine, consensus, stateHash, updatedAt: now });
+      setSnapshot({ engine, consensus, stateHash, peers: peers?.connected ?? 0, updatedAt: now });
       setLoading(false);
     } catch {
       setStatus('error');

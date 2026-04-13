@@ -36,11 +36,14 @@ export function HeroBanner() {
       ? ((ffi.live_apply_ok + ffi.live_apply_claimed) / attempted) * 100
       : 0;
   const agreementStr = agreement.toFixed(2) + '%';
-  const isPerfect = agreement >= 100;
+  const isPerfect = agreement >= 99.99;
 
-  // Hash match
-  const hashMatched = stateHash.computed_hash === stateHash.network_hash &&
-    stateHash.computed_hash.length > 0;
+  // Hash match — use the server-side consecutive_matches counter as the
+  // source of truth. It does case-insensitive comparison internally.
+  // Don't compare the hex strings client-side (computed_hash is lowercase
+  // from hex::encode, network_hash is uppercase from rippled — strict
+  // equality would always fail and show a false "MISMATCH").
+  const hashMatched = stateHash.consecutive_matches > 0;
   const displayHash = stateHash.computed_hash || '—';
 
   // Compute time
@@ -70,7 +73,8 @@ export function HeroBanner() {
         {/* ---- Agreement hero number ---- */}
         <div className="flex flex-col items-center gap-2 pb-8">
           <span
-            className={`animate-pulse-glow font-mono text-7xl font-bold tabular-nums md:text-8xl ${
+            data-chaos-trigger
+            className={`animate-pulse-glow cursor-default select-none font-mono text-7xl font-bold tabular-nums text-glow md:text-8xl ${
               isPerfect
                 ? 'text-halcyon-accent drop-shadow-[0_0_24px_#00FF9F60]'
                 : 'text-amber-400 drop-shadow-[0_0_24px_#F59E0B60]'
@@ -93,9 +97,10 @@ export function HeroBanner() {
             <p className="font-mono text-2xl font-bold tabular-nums text-white">
               #{fmt(engine.ledger_seq)}
             </p>
-            <p className="mt-1 flex items-center gap-1.5 text-xs text-halcyon-accent">
+            <p className="tooltip-trigger mt-1 flex items-center gap-1.5 text-xs text-halcyon-accent">
               <CheckCircle2 className="h-3 w-3" />
               verified via FFI
+              <span className="tooltip-content">Fast Foreign Interface — Rust + libxrpl direct ledger access (no JSON-RPC lag)</span>
             </p>
           </div>
 
