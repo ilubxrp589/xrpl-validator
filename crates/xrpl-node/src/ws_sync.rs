@@ -32,6 +32,13 @@ pub async fn start_ws_sync(
 ) {
     let rpc = RippledClient::new();
 
+    #[cfg(feature = "ffi")]
+    let stage3_cfg = crate::stage3::Stage3Config::from_env();
+    #[cfg(feature = "ffi")]
+    if stage3_cfg.enabled {
+        eprintln!("[stage3] ENABLED — FFI overlay will source state.rocks bytes (singletons still RPC)");
+    }
+
     loop {
         let ws_url = rpc.ws_url();
         eprintln!("[ws-sync] Connecting to {ws_url}...");
@@ -119,6 +126,9 @@ pub async fn start_ws_sync(
                     acc_modified.clear();
                     acc_deleted.clear();
                     acc_tx_count = 0;
+
+                    #[cfg(feature = "ffi")]
+                    let mut ffi_overlay_opt: Option<crate::ffi_engine::LedgerOverlay> = None;
 
                     let mut meta_ok = false;
                     let mut ledger_header: LedgerHeader = LedgerHeader::default();
@@ -239,12 +249,12 @@ pub async fn start_ws_sync(
                                 // (same source as process_ledger uses for DB writes)
                                 let shadow_overlay = build_shadow_overlay(&proto_modified, &deleted_keys);
                                 let shadow_ok = shadow_fetch_ok;
-                                if steady {
+                                let task = if steady {
                                     let snap = std::sync::Arc::new(
                                         crate::ffi_engine::OwnedSnapshot::new(db.clone())
                                     );
                                     tokio::task::spawn_blocking(move || {
-                                        let _ffi_overlay = v.verify_ledger_with_snapshot(
+                                        let overlay = v.verify_ledger_with_snapshot(
                                             seq, &tx_blobs,
                                             hdr.parent_hash, hdr.parent_close_time, hdr.total_drops,
                                             Some(snap.as_ref()),
@@ -254,10 +264,11 @@ pub async fn start_ws_sync(
                                                 v.check_shadow_hash(hs, &shadow_overlay, &shadow_ah);
                                             }
                                         }
-                                    });
+                                        overlay
+                                    })
                                 } else {
                                     tokio::task::spawn_blocking(move || {
-                                        let _ffi_overlay = v.verify_ledger(
+                                        let overlay = v.verify_ledger(
                                             seq, &tx_blobs,
                                             hdr.parent_hash, hdr.parent_close_time, hdr.total_drops,
                                         );
@@ -266,8 +277,16 @@ pub async fn start_ws_sync(
                                                 v.check_shadow_hash(hs, &shadow_overlay, &shadow_ah);
                                             }
                                         }
-                                    });
+                                        overlay
+                                    })
+                                };
+                                if stage3_cfg.enabled {
+                                    match task.await {
+                                        Ok(o) => ffi_overlay_opt = Some(o),
+                                        Err(e) => eprintln!("[stage3] FFI verify task join failed for #{seq}: {e}"),
+                                    }
                                 }
+                                // else: drop(task) is implicit; task continues running fire-and-forget
                             }
                         }
                     }
@@ -287,6 +306,7 @@ pub async fn start_ws_sync(
                         process_seq, &acc_modified, &acc_deleted,
                         &account_hash, acc_tx_count, compute_hash,
                         &history,
+                        #[cfg(feature = "ffi")] ffi_overlay_opt.take(),
                     ).await;
 
                     last_processed = process_seq;
@@ -522,57 +542,62 @@ async fn process_ledger(
     tx_count: u32,
     compute_hash: bool,
     history: &Option<Arc<parking_lot::Mutex<crate::history::HistoryStore>>>,
+    #[cfg(feature = "ffi")] ffi_overlay: Option<crate::ffi_engine::LedgerOverlay>,
 ) -> bool {
     let ledger_start = std::time::Instant::now();
 
-    // Fetch all modified objects in parallel — 32 concurrent requests max.
-    // Previous sequential approach: 500 objs × 3ms = 1.5s
-    // Parallel with 32 concurrent: 16 batches × 3ms = ~50ms
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(64));
-    let rpc_url = rpc.rpc_url().to_string();
-    let client = rpc.client.clone();
+    // Stage 3: when ffi_overlay is supplied (caller has XRPL_FFI_STAGE3=1), the
+    // FFI mutation overlay is the authoritative source for mutated SLEs. Only
+    // keys NOT covered by libxrpl (the 5 protocol singletons mutated by
+    // pseudo-txs, which apply_ledger_in_order filters out) fall back to RPC.
+    let mut fetched_data: Vec<([u8; 32], Vec<u8>)> = Vec::new();
+    let mut failed = 0u32;
+    let mut stage3_used = false;
+    #[cfg(feature = "ffi")]
+    let mut stage3_overlay_keys: HashSet<[u8; 32]> = HashSet::new();
 
-    let fetch_futures: Vec<_> = modified.iter().map(|index_hex| {
-        let sem = semaphore.clone();
-        let client = client.clone();
-        let url = rpc_url.clone();
-        let index_hex = index_hex.clone();
-        async move {
-            let _permit = sem.acquire().await.ok()?;
+    #[cfg(feature = "ffi")]
+    if let Some(overlay) = ffi_overlay {
+        stage3_used = true;
+        fetched_data.reserve(overlay.len() + 8);
+        for (key, val) in &overlay {
+            stage3_overlay_keys.insert(*key);
+            match val {
+                Some(data) => fetched_data.push((*key, data.clone())),
+                None => fetched_data.push((*key, Vec::new())),
+            }
+        }
+        // Fetch keys in modified ∪ deleted that aren't in the overlay
+        // (the 5 protocol singletons mutated by pseudo-txs).
+        for index_hex in modified.iter().chain(deleted.iter()) {
+            let kb = match hex::decode(index_hex) {
+                Ok(b) if b.len() == 32 => b,
+                _ => continue,
+            };
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&kb);
+            if stage3_overlay_keys.contains(&k) { continue; }
+            let mut got = false;
             for attempt in 0..3u32 {
-                let resp = client.post(&url)
+                let resp = rpc.client.post(rpc.rpc_url())
                     .json(&serde_json::json!({
                         "method": "ledger_entry",
-                        "params": [{"index": &index_hex, "binary": true, "ledger_index": seq}]
+                        "params": [{"index": index_hex, "binary": true, "ledger_index": seq}]
                     }))
                     .send().await;
-
                 if let Ok(r) = resp {
                     if let Ok(body) = r.json::<serde_json::Value>().await {
-                        let resp_seq = body["result"]["ledger_index"].as_u64().unwrap_or(0) as u32;
-                        if resp_seq != 0 && resp_seq != seq {
-                            if attempt < 2 { continue; }
-                            return None;
-                        }
                         if let Some(data_hex) = body["result"]["node_binary"].as_str() {
                             if let Ok(data) = hex::decode(data_hex) {
-                                if let Ok(kb) = hex::decode(&index_hex) {
-                                    if kb.len() == 32 {
-                                        let mut key = [0u8; 32];
-                                        key.copy_from_slice(&kb);
-                                        return Some((key, data));
-                                    }
-                                }
+                                fetched_data.push((k, data));
+                                got = true;
+                                break;
                             }
                         }
                         if body["result"]["error"].as_str() == Some("entryNotFound") {
-                            if let Ok(kb) = hex::decode(&index_hex) {
-                                if kb.len() == 32 {
-                                    let mut key = [0u8; 32];
-                                    key.copy_from_slice(&kb);
-                                    return Some((key, Vec::new()));
-                                }
-                            }
+                            fetched_data.push((k, Vec::new()));
+                            got = true;
+                            break;
                         }
                     }
                 }
@@ -580,17 +605,77 @@ async fn process_ledger(
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
             }
-            None
+            if !got { failed += 1; }
         }
-    }).collect();
+    }
 
-    let results = futures_util::future::join_all(fetch_futures).await;
-    let mut fetched_data: Vec<([u8; 32], Vec<u8>)> = Vec::with_capacity(results.len());
-    let mut failed = 0u32;
-    for r in results {
-        match r {
-            Some(pair) => fetched_data.push(pair),
-            None => failed += 1,
+    if !stage3_used {
+        // Fetch all modified objects in parallel — 64 concurrent requests max.
+        // Previous sequential approach: 500 objs × 3ms = 1.5s
+        // Parallel with 64 concurrent: ~50ms
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(64));
+        let rpc_url = rpc.rpc_url().to_string();
+        let client = rpc.client.clone();
+
+        let fetch_futures: Vec<_> = modified.iter().map(|index_hex| {
+            let sem = semaphore.clone();
+            let client = client.clone();
+            let url = rpc_url.clone();
+            let index_hex = index_hex.clone();
+            async move {
+                let _permit = sem.acquire().await.ok()?;
+                for attempt in 0..3u32 {
+                    let resp = client.post(&url)
+                        .json(&serde_json::json!({
+                            "method": "ledger_entry",
+                            "params": [{"index": &index_hex, "binary": true, "ledger_index": seq}]
+                        }))
+                        .send().await;
+
+                    if let Ok(r) = resp {
+                        if let Ok(body) = r.json::<serde_json::Value>().await {
+                            let resp_seq = body["result"]["ledger_index"].as_u64().unwrap_or(0) as u32;
+                            if resp_seq != 0 && resp_seq != seq {
+                                if attempt < 2 { continue; }
+                                return None;
+                            }
+                            if let Some(data_hex) = body["result"]["node_binary"].as_str() {
+                                if let Ok(data) = hex::decode(data_hex) {
+                                    if let Ok(kb) = hex::decode(&index_hex) {
+                                        if kb.len() == 32 {
+                                            let mut key = [0u8; 32];
+                                            key.copy_from_slice(&kb);
+                                            return Some((key, data));
+                                        }
+                                    }
+                                }
+                            }
+                            if body["result"]["error"].as_str() == Some("entryNotFound") {
+                                if let Ok(kb) = hex::decode(&index_hex) {
+                                    if kb.len() == 32 {
+                                        let mut key = [0u8; 32];
+                                        key.copy_from_slice(&kb);
+                                        return Some((key, Vec::new()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if attempt < 2 {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                }
+                None
+            }
+        }).collect();
+
+        let results = futures_util::future::join_all(fetch_futures).await;
+        fetched_data.reserve(results.len());
+        for r in results {
+            match r {
+                Some(pair) => fetched_data.push(pair),
+                None => failed += 1,
+            }
         }
     }
 
@@ -612,13 +697,15 @@ async fn process_ledger(
         }
         keys.push(Hash256(*key));
     }
-    for index_hex in deleted {
-        if let Ok(kb) = hex::decode(index_hex) {
-            if kb.len() == 32 {
-                batch.delete(&kb);
-                let mut k = Hash256([0u8; 32]);
-                k.0.copy_from_slice(&kb);
-                keys.push(k);
+    if !stage3_used {
+        for index_hex in deleted {
+            if let Ok(kb) = hex::decode(index_hex) {
+                if kb.len() == 32 {
+                    batch.delete(&kb);
+                    let mut k = Hash256([0u8; 32]);
+                    k.0.copy_from_slice(&kb);
+                    keys.push(k);
+                }
             }
         }
     }
