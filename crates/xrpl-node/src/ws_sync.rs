@@ -35,6 +35,12 @@ pub async fn start_ws_sync(
     #[cfg(feature = "ffi")]
     let stage3_cfg = crate::stage3::Stage3Config::from_env();
     #[cfg(feature = "ffi")]
+    eprintln!(
+        "[stage3] start_ws_sync reached: Stage3Config.enabled={} XRPL_FFI_STAGE3={:?}",
+        stage3_cfg.enabled,
+        std::env::var("XRPL_FFI_STAGE3").ok()
+    );
+    #[cfg(feature = "ffi")]
     if stage3_cfg.enabled {
         eprintln!("[stage3] ENABLED — FFI overlay will source state.rocks bytes (singletons still RPC)");
     }
