@@ -1,146 +1,98 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
 import { useValidatorData } from '@/hooks/use-validator-data';
+import { fmt } from '@/lib/utils';
 
-// ---------------------------------------------------------------------------
-// Arc geometry helpers
-// ---------------------------------------------------------------------------
-
-const RADIUS = 60;
-const CX = 70;
-const CY = 70;
-const STROKE_WIDTH = 10;
-const MAX_TPS = 50;
-
-// 270-degree arc from 135deg to 405deg (i.e. -225deg gap at the bottom)
-const START_ANGLE = 135; // degrees
-const END_ANGLE = 405; // degrees
-const ARC_SPAN = END_ANGLE - START_ANGLE; // 270
-
-function polarToCartesian(cx: number, cy: number, r: number, angleDeg: number) {
-  const rad = ((angleDeg - 90) * Math.PI) / 180;
-  return {
-    x: cx + r * Math.cos(rad),
-    y: cy + r * Math.sin(rad),
-  };
-}
-
-function describeArc(cx: number, cy: number, r: number, startDeg: number, endDeg: number) {
-  const start = polarToCartesian(cx, cy, r, endDeg);
-  const end = polarToCartesian(cx, cy, r, startDeg);
-  const largeArc = endDeg - startDeg > 180 ? 1 : 0;
-  return `M ${start.x} ${start.y} A ${r} ${r} 0 ${largeArc} 0 ${end.x} ${end.y}`;
-}
-
-// Full background arc path
-const BG_ARC = describeArc(CX, CY, RADIUS, START_ANGLE, END_ANGLE);
-
-// Circumference of the 270-degree arc (for dasharray)
-const ARC_LENGTH = (ARC_SPAN / 360) * 2 * Math.PI * RADIUS;
-
-// ---------------------------------------------------------------------------
-// Component
-// ---------------------------------------------------------------------------
+const BATTLE_TARGET = 100_000;
 
 export function Speedometer() {
   const { data } = useValidatorData();
-  const [tps, setTps] = useState(0);
 
-  const prevSeq = useRef<number>(0);
-  const prevTime = useRef<number>(0);
-  const prevTxCount = useRef<number>(0);
-  const tpsWindow = useRef<number[]>([]);
+  const ffi = data?.engine.ffi_verifier;
+  const applied = ffi?.ledgers_applied ?? 0;
+  const shadowMatched = ffi?.shadow_hash_matched ?? 0;
+  const shadowAttempted = ffi?.shadow_hash_attempted ?? 0;
+  const shadowMiss = ffi?.shadow_hash_mismatched ?? 0;
+  const diverged = ffi?.live_apply_diverged ?? 0;
+  const dbHits = ffi?.db_hits ?? 0;
+  const rpcFallbacks = ffi?.db_rpc_fallbacks ?? 0;
+  const dbTotal = dbHits + rpcFallbacks;
+  const dbHitPct = dbTotal > 0 ? ((dbHits / dbTotal) * 100).toFixed(1) : '—';
+  const battlePct = Math.min((applied / BATTLE_TARGET) * 100, 100);
+  const etaDays = applied > 0 ? Math.max(0, Math.ceil((BATTLE_TARGET - applied) / 17000)) : 0;
 
-  useEffect(() => {
-    if (!data) return;
-
-    const seq = data.engine.ledger_seq;
-    const txCount = data.engine.round_tx_count;
-    const now = Date.now();
-
-    if (prevSeq.current > 0 && seq > prevSeq.current) {
-      const intervalMs = now - prevTime.current;
-      if (intervalMs > 0) {
-        const instantTps = (txCount / intervalMs) * 1000;
-        tpsWindow.current = [...tpsWindow.current.slice(-9), instantTps];
-        const avg =
-          tpsWindow.current.reduce((s, v) => s + v, 0) /
-          tpsWindow.current.length;
-        setTps(Math.min(avg, MAX_TPS));
-      }
-    }
-
-    prevSeq.current = seq;
-    prevTime.current = now;
-    prevTxCount.current = txCount;
-  }, [data]);
-
-  // Compute the value arc dash
-  const ratio = Math.min(tps / MAX_TPS, 1);
-  const dashLen = ratio * ARC_LENGTH;
-  const dashGap = ARC_LENGTH - dashLen;
+  // Uptime
+  const startMs = data?.engine.start_time_ms ?? 0;
+  const uptimeSec = startMs > 0 ? Math.floor((Date.now() - startMs) / 1000) : 0;
+  const uptimeH = Math.floor(uptimeSec / 3600);
+  const uptimeM = Math.floor((uptimeSec % 3600) / 60);
+  const uptimeStr = uptimeH > 0 ? `${uptimeH}h ${uptimeM}m` : `${uptimeM}m`;
 
   return (
-    <div className="bg-halcyon-card border border-halcyon-border rounded-lg p-4 card-hover flex flex-col items-center">
-      <svg viewBox="0 0 140 140" width={140} height={140}>
-        <defs>
-          <filter id="glow">
-            <feGaussianBlur stdDeviation="3" />
-            <feMerge>
-              <feMergeNode />
-              <feMergeNode in="SourceGraphic" />
-            </feMerge>
-          </filter>
-        </defs>
+    <div className="bg-halcyon-card border border-halcyon-border rounded-lg p-4 card-hover">
+      {/* Shadow Hash — the big number */}
+      <div className="flex items-center justify-between mb-3">
+        <span className="font-mono text-[10px] uppercase tracking-widest text-halcyon-muted">
+          Shadow Hash
+        </span>
+        <span className={`font-mono text-xs font-bold ${shadowMiss === 0 ? 'text-halcyon-accent' : 'text-halcyon-danger'}`}>
+          {shadowMiss === 0 ? '100% MATCH' : `${shadowMiss} MISS`}
+        </span>
+      </div>
+      <div className="flex items-baseline gap-1">
+        <span className="font-mono text-2xl font-bold tabular-nums text-halcyon-accent">
+          {fmt(shadowMatched)}
+        </span>
+        <span className="font-mono text-sm text-halcyon-muted">/ {fmt(shadowAttempted)}</span>
+      </div>
 
-        {/* Background arc */}
-        <path
-          d={BG_ARC}
-          fill="none"
-          stroke="#1A1A1A"
-          strokeWidth={STROKE_WIDTH}
-          strokeLinecap="round"
-        />
+      {/* Key stats */}
+      <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1.5">
+        <div>
+          <span className="font-mono text-[9px] text-halcyon-muted block">FFI Diverged</span>
+          <span className={`font-mono text-sm font-bold tabular-nums ${diverged > 0 ? 'text-amber-400' : 'text-halcyon-accent'}`}>
+            {diverged}
+          </span>
+        </div>
+        <div>
+          <span className="font-mono text-[9px] text-halcyon-muted block">DB Hit Rate</span>
+          <span className="font-mono text-sm font-bold tabular-nums text-halcyon-accent">{dbHitPct}%</span>
+        </div>
+        <div>
+          <span className="font-mono text-[9px] text-halcyon-muted block">Ledgers</span>
+          <span className="font-mono text-sm font-bold tabular-nums text-white">{fmt(applied)}</span>
+        </div>
+        <div>
+          <span className="font-mono text-[9px] text-halcyon-muted block">Uptime</span>
+          <span className="font-mono text-sm font-bold tabular-nums text-white">{uptimeStr}</span>
+        </div>
+      </div>
 
-        {/* Value arc */}
-        <path
-          d={BG_ARC}
-          fill="none"
-          stroke="#00FF9F"
-          strokeWidth={STROKE_WIDTH}
-          strokeLinecap="round"
-          strokeDasharray={`${dashLen} ${dashGap}`}
-          filter="url(#glow)"
-          style={{ transition: 'stroke-dasharray 0.5s ease' }}
-        />
-
-        {/* Center text — TPS value */}
-        <text
-          x={CX}
-          y={CY - 2}
-          textAnchor="middle"
-          dominantBaseline="central"
-          className="font-mono text-2xl font-bold"
-          fill="#00FF9F"
-          style={{ fontSize: 28 }}
-        >
-          {tps.toFixed(1)}
-        </text>
-
-        {/* Label */}
-        <text
-          x={CX}
-          y={CY + 20}
-          textAnchor="middle"
-          dominantBaseline="central"
-          className="font-mono"
-          fill="#666666"
-          style={{ fontSize: 10, letterSpacing: '0.1em' }}
-        >
-          TX/SEC
-        </text>
-      </svg>
+      {/* Battle test progress */}
+      {applied > 0 && (
+        <div className="mt-3 border-t border-halcyon-border pt-3">
+          <div className="flex items-center justify-between mb-1.5">
+            <span className="flex items-center gap-1.5">
+              <span className="relative flex h-1.5 w-1.5">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-halcyon-accent opacity-75" />
+                <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-halcyon-accent" />
+              </span>
+              <span className="font-mono text-[9px] uppercase tracking-widest text-halcyon-muted">Phase A</span>
+            </span>
+            <span className="font-mono text-[10px] tabular-nums text-halcyon-accent">
+              {(applied / 1000).toFixed(1)}K / 100K · ~{etaDays}d
+            </span>
+          </div>
+          <div className="h-1.5 w-full rounded-full bg-halcyon-border overflow-hidden">
+            <div className="h-full rounded-full" style={{
+              width: `${battlePct}%`,
+              background: 'linear-gradient(90deg, #00FF9F, #00f0ff)',
+              boxShadow: '0 0 6px #00FF9F60',
+              transition: 'width 500ms ease-out',
+            }} />
+          </div>
+        </div>
+      )}
     </div>
   );
 }

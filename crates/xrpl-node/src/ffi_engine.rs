@@ -1096,7 +1096,7 @@ pub fn apply_ledger_in_order(
             s.live_apply_diverged += 1;
             s.live_apply_failed += 1; // keep deprecated field in sync
             *s.live_diverged_by_type.entry(format!("{}/{}", tx_type, outcome.ter_name)).or_insert(0) += 1;
-            if s.diverged_tx_samples.len() < 10 && !tx_hash.is_empty() {
+            if !tx_hash.is_empty() {
                 let tail = if outcome.last_fatal.is_empty() {
                     String::new()
                 } else {
@@ -1104,7 +1104,10 @@ pub fn apply_ledger_in_order(
                     let trimmed = if f.len() > 140 { &f[..140] } else { f.as_str() };
                     format!(" :: {trimmed}")
                 };
-                s.diverged_tx_samples.push(format!("{}/{} {}{}", tx_type, outcome.ter_name, tx_hash, tail));
+                s.diverged_tx_samples.push(format!("L{} {}/{} {}{}", ledger_seq, tx_type, outcome.ter_name, tx_hash, tail));
+                if s.diverged_tx_samples.len() > 50 {
+                    s.diverged_tx_samples.remove(0);
+                }
             }
             drop(s);
             if let Some(log) = divergence_log {

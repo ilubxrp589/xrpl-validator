@@ -21,17 +21,15 @@ export default function Home() {
         <div className="flex flex-col min-h-screen">
           <Navbar />
 
-          <main className="flex-1 max-w-7xl mx-auto w-full px-4 sm:px-6 py-6 space-y-6">
+          <main className="flex-1 max-w-7xl mx-auto w-full px-4 sm:px-6 py-6 space-y-4">
             <HeroBanner />
             <NodeResources />
+            <MetricsGrid />
 
-            {/* Metrics + Speedometer side by side */}
-            <div className="grid grid-cols-1 md:grid-cols-[1fr_200px] gap-4">
-              <MetricsGrid />
-              <div className="flex flex-col gap-4">
-                <Speedometer />
-                <DisagreementHistory />
-              </div>
+            {/* Speedometer + Disagreements side by side, compact */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <Speedometer />
+              <DisagreementHistory />
             </div>
 
             <TransactionFlow />

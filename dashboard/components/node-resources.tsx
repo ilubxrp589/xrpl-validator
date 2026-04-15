@@ -1,77 +1,72 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
-
-// ---------------------------------------------------------------------------
-// Random-walk helpers
-// ---------------------------------------------------------------------------
-
-function clamp(v: number, lo: number, hi: number) {
-  return Math.max(lo, Math.min(hi, v));
-}
-
-function drift(current: number, step: number, lo: number, hi: number) {
-  return clamp(current + (Math.random() - 0.5) * 2 * step, lo, hi);
-}
-
-// ---------------------------------------------------------------------------
-// Sparkline canvas drawing
-// ---------------------------------------------------------------------------
+import { useEffect, useRef, useState, useCallback } from 'react';
 
 const ACCENT = '#00FF9F';
 const CYAN = '#00f0ff';
 const PURPLE = '#a855f7';
+const HISTORY = 30;
+const POLL_MS = 100;
+const SMOOTH_WINDOW = 8;
+
+/** Exponential moving average — smooth a single new value against the last. */
+function ema(prev: number, cur: number): number {
+  const alpha = 2 / (SMOOTH_WINDOW + 1);
+  return prev === 0 ? cur : prev + alpha * (cur - prev);
+}
+
+interface SysMetrics {
+  cpu_pct: number;
+  validator_cpu_pct: number;
+  ram_used_gb: number;
+  ram_total_gb: number;
+  validator_ram_gb: number;
+  disk_read_mbs: number;
+  disk_write_mbs: number;
+  net_in_mbs: number;
+  net_out_mbs: number;
+  cores: number;
+  validator_pid: number | null;
+}
 
 function drawSparkline(
-  canvas: HTMLCanvasElement,
+  ctx: CanvasRenderingContext2D,
   points: number[],
   lo: number,
   hi: number,
   color: string,
-  offsetX = 0,
-  width?: number,
+  x0: number,
+  y0: number,
+  w: number,
+  h: number,
 ) {
-  const ctx = canvas.getContext('2d');
-  if (!ctx || points.length < 2) return;
-
-  const dpr = window.devicePixelRatio || 1;
-  const w = width ?? canvas.width / dpr;
-  const h = canvas.height / dpr;
-
+  if (points.length < 2) return;
   const range = hi - lo || 1;
   const step = w / (points.length - 1);
 
-  // Line path
   ctx.save();
-  ctx.translate(offsetX, 0);
   ctx.beginPath();
   for (let i = 0; i < points.length; i++) {
-    const x = i * step;
-    const y = h - ((points[i] - lo) / range) * h;
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
+    const x = x0 + i * step;
+    const y = y0 + h - ((points[i] - lo) / range) * h;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
   }
-
-  // Fill gradient below
-  const grad = ctx.createLinearGradient(0, 0, 0, h);
-  grad.addColorStop(0, color + '33'); // ~20%
+  const grad = ctx.createLinearGradient(0, y0, 0, y0 + h);
+  grad.addColorStop(0, color + '33');
   grad.addColorStop(1, 'transparent');
-
   ctx.save();
-  ctx.lineTo((points.length - 1) * step, h);
-  ctx.lineTo(0, h);
+  ctx.lineTo(x0 + (points.length - 1) * step, y0 + h);
+  ctx.lineTo(x0, y0 + h);
   ctx.closePath();
   ctx.fillStyle = grad;
   ctx.fill();
   ctx.restore();
 
-  // Stroke with glow
   ctx.beginPath();
   for (let i = 0; i < points.length; i++) {
-    const x = i * step;
-    const y = h - ((points[i] - lo) / range) * h;
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
+    const x = x0 + i * step;
+    const y = y0 + h - ((points[i] - lo) / range) * h;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
   }
   ctx.strokeStyle = color;
   ctx.lineWidth = 2;
@@ -81,49 +76,34 @@ function drawSparkline(
   ctx.restore();
 }
 
-function clearCanvas(canvas: HTMLCanvasElement) {
+function sizeAndDraw(
+  canvas: HTMLCanvasElement | null,
+  points: number[],
+  lo: number,
+  hi: number,
+  color: string,
+  points2?: number[],
+  color2?: string,
+) {
+  if (!canvas) return;
+  const dpr = window.devicePixelRatio || 1;
+  const parent = canvas.parentElement;
+  if (!parent) return;
+  const w = parent.clientWidth;
+  const h = 50;
+  canvas.style.width = `${w}px`;
+  canvas.style.height = `${h}px`;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
-  const dpr = window.devicePixelRatio || 1;
-  ctx.clearRect(0, 0, canvas.width / dpr, canvas.height / dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  drawSparkline(ctx, points, lo, hi, color, 0, 0, w, h);
+  if (points2 && color2) {
+    drawSparkline(ctx, points2, lo, hi, color2, 0, 0, w, h);
+  }
 }
-
-// ---------------------------------------------------------------------------
-// Sparkline card sub-component
-// ---------------------------------------------------------------------------
-
-interface SparkCardProps {
-  label: string;
-  valueText: string;
-  canvasRef: React.RefObject<HTMLCanvasElement | null>;
-}
-
-function SparkCard({ label, valueText, canvasRef }: SparkCardProps) {
-  return (
-    <div className="bg-halcyon-card border border-halcyon-border rounded-lg p-3 card-hover">
-      <p className="text-[10px] font-mono uppercase tracking-wider text-halcyon-muted">
-        {label}
-      </p>
-      <p className="font-mono text-lg font-bold tabular-nums text-halcyon-accent mt-0.5">
-        {valueText}
-      </p>
-      <canvas
-        ref={canvasRef}
-        width={360}
-        height={120}
-        className="mt-1"
-        style={{ width: 180, height: 60 }}
-      />
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Main component
-// ---------------------------------------------------------------------------
-
-const HISTORY = 30;
-const INTERVAL_MS = 3000;
 
 export function NodeResources() {
   const cpuRef = useRef<HTMLCanvasElement>(null);
@@ -131,114 +111,95 @@ export function NodeResources() {
   const diskRef = useRef<HTMLCanvasElement>(null);
   const netRef = useRef<HTMLCanvasElement>(null);
 
-  const cpuPts = useRef<number[]>([40]);
-  const ramPts = useRef<number[]>([6.8]);
-  const diskPts = useRef<number[]>([120]);
-  const netInPts = useRef<number[]>([8]);
-  const netOutPts = useRef<number[]>([12]);
+  const cpuPts = useRef<number[]>([]);
+  const ramPts = useRef<number[]>([]);
+  const diskPts = useRef<number[]>([]);
+  const netInPts = useRef<number[]>([]);
+  const netOutPts = useRef<number[]>([]);
 
-  const [cpu, setCpu] = useState(40);
-  const [ram, setRam] = useState(6.8);
-  const [disk, setDisk] = useState(120);
-  const [netIn, setNetIn] = useState(8);
-  const [netOut, setNetOut] = useState(12);
+  const [m, setM] = useState<SysMetrics | null>(null);
+
+  const drawAll = useCallback(() => {
+    const pad = (arr: number[], floor: number) => Math.max(...arr, floor) * 1.3;
+    sizeAndDraw(cpuRef.current, cpuPts.current, 0, 100, ACCENT);
+    sizeAndDraw(ramRef.current, ramPts.current, 0, pad(ramPts.current, 1), ACCENT);
+    sizeAndDraw(diskRef.current, diskPts.current, 0, pad(diskPts.current, 1), ACCENT);
+    sizeAndDraw(netRef.current, netInPts.current, 0, pad([...netInPts.current, ...netOutPts.current], 1), CYAN, netOutPts.current, PURPLE);
+  }, [m?.ram_total_gb]);
 
   useEffect(() => {
-    function tick() {
-      // Drift values
-      const newCpu = drift(cpuPts.current[cpuPts.current.length - 1], 3, 5, 95);
-      const newRam = drift(ramPts.current[ramPts.current.length - 1], 0.2, 2, 14);
-      const newDisk = drift(diskPts.current[diskPts.current.length - 1], 20, 10, 500);
-      const newIn = drift(netInPts.current[netInPts.current.length - 1], 1.5, 0.5, 40);
-      const newOut = drift(netOutPts.current[netOutPts.current.length - 1], 1.5, 0.5, 40);
+    async function poll() {
+      try {
+        const res = await fetch('/system/metrics');
+        if (!res.ok) return;
+        const data: SysMetrics = await res.json();
+        setM(data);
 
-      // Push and trim
-      cpuPts.current = [...cpuPts.current.slice(-(HISTORY - 1)), newCpu];
-      ramPts.current = [...ramPts.current.slice(-(HISTORY - 1)), newRam];
-      diskPts.current = [...diskPts.current.slice(-(HISTORY - 1)), newDisk];
-      netInPts.current = [...netInPts.current.slice(-(HISTORY - 1)), newIn];
-      netOutPts.current = [...netOutPts.current.slice(-(HISTORY - 1)), newOut];
+        const lastCpu = cpuPts.current[cpuPts.current.length - 1] ?? 0;
+        const lastDisk = diskPts.current[diskPts.current.length - 1] ?? 0;
+        const lastIn = netInPts.current[netInPts.current.length - 1] ?? 0;
+        const lastOut = netOutPts.current[netOutPts.current.length - 1] ?? 0;
 
-      setCpu(newCpu);
-      setRam(newRam);
-      setDisk(newDisk);
-      setNetIn(newIn);
-      setNetOut(newOut);
+        cpuPts.current = [...cpuPts.current.slice(-(HISTORY - 1)), ema(lastCpu, Math.min(data.validator_cpu_pct, 100))];
+        ramPts.current = [...ramPts.current.slice(-(HISTORY - 1)), data.validator_ram_gb];
+        diskPts.current = [...diskPts.current.slice(-(HISTORY - 1)), ema(lastDisk, data.disk_read_mbs + data.disk_write_mbs)];
+        netInPts.current = [...netInPts.current.slice(-(HISTORY - 1)), ema(lastIn, data.net_in_mbs)];
+        netOutPts.current = [...netOutPts.current.slice(-(HISTORY - 1)), ema(lastOut, data.net_out_mbs)];
 
-      // Draw sparklines
-      if (cpuRef.current) {
-        clearCanvas(cpuRef.current);
-        drawSparkline(cpuRef.current, cpuPts.current, 0, 100, ACCENT);
-      }
-      if (ramRef.current) {
-        clearCanvas(ramRef.current);
-        drawSparkline(ramRef.current, ramPts.current, 0, 16, ACCENT);
-      }
-      if (diskRef.current) {
-        clearCanvas(diskRef.current);
-        drawSparkline(diskRef.current, diskPts.current, 0, 600, ACCENT);
-      }
-      if (netRef.current) {
-        clearCanvas(netRef.current);
-        const halfW = 90;
-        drawSparkline(netRef.current, netInPts.current, 0, 50, CYAN, 0, halfW);
-        drawSparkline(netRef.current, netOutPts.current, 0, 50, PURPLE, halfW, halfW);
-      }
+        drawAll();
+      } catch { /* silent */ }
     }
 
-    // Initial draw
-    tick();
-    const id = setInterval(tick, INTERVAL_MS);
-    return () => clearInterval(id);
-  }, []);
-
-  // Set up HiDPI scaling once for each canvas
-  useEffect(() => {
-    const canvases = [cpuRef.current, ramRef.current, diskRef.current, netRef.current];
-    const dpr = window.devicePixelRatio || 1;
-    for (const c of canvases) {
-      if (!c) continue;
-      const ctx = c.getContext('2d');
-      if (!ctx) continue;
-      ctx.scale(dpr, dpr);
-    }
-  }, []);
+    poll();
+    const id = setInterval(poll, POLL_MS);
+    window.addEventListener('resize', drawAll);
+    return () => { clearInterval(id); window.removeEventListener('resize', drawAll); };
+  }, [drawAll]);
 
   return (
     <div>
       <p className="text-[10px] font-mono uppercase tracking-widest text-halcyon-muted mb-2">
-        Live Node Resources
+        Live Node Resources · m3060
       </p>
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <SparkCard
-          label="CPU"
-          valueText={`${cpu.toFixed(1)}%`}
-          canvasRef={cpuRef}
-        />
-        <SparkCard
-          label="RAM"
-          valueText={`${ram.toFixed(1)} GB`}
-          canvasRef={ramRef}
-        />
-        <SparkCard
-          label="Disk I/O"
-          valueText={`${disk.toFixed(0)} MB/s`}
-          canvasRef={diskRef}
-        />
-        <div className="bg-halcyon-card border border-halcyon-border rounded-lg p-3 card-hover">
-          <p className="text-[10px] font-mono uppercase tracking-wider text-halcyon-muted">
-            Network
+        <div className="bg-halcyon-card border border-halcyon-border rounded-lg p-3 card-hover overflow-hidden">
+          <p className="text-[10px] font-mono uppercase tracking-wider text-halcyon-muted">CPU (validator)</p>
+          <p className="font-mono text-lg font-bold tabular-nums text-halcyon-accent">
+            {m ? `${Math.min(m.validator_cpu_pct, 100).toFixed(1)}%` : '—'}
           </p>
-          <p className="font-mono text-lg font-bold tabular-nums text-halcyon-accent mt-0.5">
-            In: {netIn.toFixed(1)} MB/s | Out: {netOut.toFixed(1)} MB/s
+          {m && <p className="text-[9px] font-mono text-halcyon-muted">{m.cpu_pct}% system · {m.cores} cores</p>}
+          <canvas ref={cpuRef} className="mt-1 block w-full" />
+        </div>
+        <div className="bg-halcyon-card border border-halcyon-border rounded-lg p-3 card-hover overflow-hidden">
+          <p className="text-[10px] font-mono uppercase tracking-wider text-halcyon-muted">RAM (validator)</p>
+          <p className="font-mono text-lg font-bold tabular-nums text-halcyon-accent">
+            {m ? `${m.validator_ram_gb} GB` : '—'}
           </p>
-          <canvas
-            ref={netRef}
-            width={360}
-            height={120}
-            className="mt-1"
-            style={{ width: 180, height: 60 }}
-          />
+          {m && <p className="text-[9px] font-mono text-halcyon-muted">{m.ram_used_gb} / {m.ram_total_gb} GB system</p>}
+          <canvas ref={ramRef} className="mt-1 block w-full" />
+        </div>
+        <div className="bg-halcyon-card border border-halcyon-border rounded-lg p-3 card-hover overflow-hidden">
+          <p className="text-[10px] font-mono uppercase tracking-wider text-halcyon-muted">Disk I/O</p>
+          <p className="font-mono text-lg font-bold tabular-nums text-halcyon-accent">
+            {m ? `${(m.disk_read_mbs + m.disk_write_mbs).toFixed(1)} MB/s` : '—'}
+          </p>
+          <canvas ref={diskRef} className="mt-1 block w-full" />
+        </div>
+        <div className="bg-halcyon-card border border-halcyon-border rounded-lg p-3 card-hover overflow-hidden">
+          <p className="text-[10px] font-mono uppercase tracking-wider text-halcyon-muted">Network</p>
+          <div className="flex items-baseline gap-2 mt-0.5">
+            <span className="font-mono text-sm font-bold tabular-nums" style={{ color: CYAN }}>
+              {m ? m.net_in_mbs.toFixed(1) : '—'}
+            </span>
+            <span className="text-[9px] font-mono" style={{ color: CYAN }}>IN</span>
+            <span className="text-halcyon-muted text-[10px]">/</span>
+            <span className="font-mono text-sm font-bold tabular-nums" style={{ color: PURPLE }}>
+              {m ? m.net_out_mbs.toFixed(1) : '—'}
+            </span>
+            <span className="text-[9px] font-mono" style={{ color: PURPLE }}>OUT</span>
+            <span className="text-[9px] text-halcyon-muted">MB/s</span>
+          </div>
+          <canvas ref={netRef} className="mt-1 block w-full" />
         </div>
       </div>
     </div>

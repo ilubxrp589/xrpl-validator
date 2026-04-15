@@ -48,3 +48,6 @@ ffi/test_shim
 ffi/build/
 logs/
 scripts/__pycache__/
+
+# Next.js build cache (only dashboard/ should run next; root .next is a leak)
+/.next/

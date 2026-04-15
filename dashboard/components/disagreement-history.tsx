@@ -10,19 +10,32 @@ import { fmt } from '@/lib/utils';
 // ---------------------------------------------------------------------------
 
 interface ParsedDisagreement {
+  ledger: number | null;
   txType: string;
   ter: string;
   hash: string;
 }
 
 function parseSample(raw: string): ParsedDisagreement | null {
-  const spaceIdx = raw.indexOf(' ');
+  // New format: "L103554081 OfferCreate/terPRE_SEQ C286F04DB93BF00D..."
+  // Old format: "OfferCreate/terPRE_SEQ C286F04DB93BF00D..."
+  let rest = raw;
+  let ledger: number | null = null;
+  if (rest.startsWith('L')) {
+    const spaceIdx = rest.indexOf(' ');
+    if (spaceIdx !== -1) {
+      ledger = parseInt(rest.slice(1, spaceIdx), 10) || null;
+      rest = rest.slice(spaceIdx + 1);
+    }
+  }
+  const spaceIdx = rest.indexOf(' ');
   if (spaceIdx === -1) return null;
-  const typeAndTer = raw.slice(0, spaceIdx);
-  const hash = raw.slice(spaceIdx + 1).trim();
+  const typeAndTer = rest.slice(0, spaceIdx);
+  const hash = rest.slice(spaceIdx + 1).trim();
   const slashIdx = typeAndTer.indexOf('/');
   if (slashIdx === -1) return null;
   return {
+    ledger,
     txType: typeAndTer.slice(0, slashIdx),
     ter: typeAndTer.slice(slashIdx + 1),
     hash,
@@ -45,7 +58,7 @@ export function DisagreementHistory() {
   const f = data.engine.ffi_verifier;
   const totalDiverged = f.live_apply_diverged;
   const samples = f.diverged_tx_samples ?? [];
-  const parsed = samples.map(parseSample).filter(Boolean) as ParsedDisagreement[];
+  const parsed = samples.map(parseSample).filter(Boolean).reverse() as ParsedDisagreement[];
 
   const countColor = totalDiverged > 0 ? 'text-halcyon-danger' : 'text-halcyon-accent';
 
@@ -54,7 +67,7 @@ export function DisagreementHistory() {
       {/* Header */}
       <div className="flex items-start justify-between">
         <p className="font-mono text-xs uppercase tracking-wider text-halcyon-muted">
-          Last Disagreements
+          Last Disagreements from FFI Engine
         </p>
         <p className={`font-mono text-2xl font-bold tabular-nums ${countColor}`}>
           {fmt(totalDiverged)}
@@ -95,7 +108,7 @@ export function DisagreementHistory() {
                 {/* Content */}
                 <div className="pb-4">
                   <p className="font-mono text-xs text-halcyon-muted">
-                    Ledger #{fmt(data.engine.ledger_seq)}
+                    Ledger #{entry.ledger ? fmt(entry.ledger) : fmt(data.engine.ledger_seq)}
                   </p>
                   <p className="font-mono text-sm text-halcyon-danger">
                     {entry.txType}/{entry.ter}
