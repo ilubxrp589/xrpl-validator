@@ -730,6 +730,19 @@ impl Default for DivergenceLog {
 /// sfTxnSignature in the binary tx, so the first hit when scanning forward
 /// is overwhelmingly the real fee. Returns the fee in drops, or `None` if
 /// no plausible match is found.
+/// Scan a serialized AccountRoot SLE for the `Sequence` field. UInt32 field 4
+/// is encoded as byte `0x24` followed by 4 big-endian bytes. Used by debug
+/// tooling and tests to pull the Sequence out of raw overlay bytes without a
+/// full SLE parse.
+pub fn scan_sequence_in_account_root(data: &[u8]) -> Option<u32> {
+    for i in 0..data.len().saturating_sub(5) {
+        if data[i] == 0x24 {
+            return Some(u32::from_be_bytes(data[i + 1..i + 5].try_into().ok()?));
+        }
+    }
+    None
+}
+
 pub fn extract_fee_drops(tx_bytes: &[u8]) -> Option<u64> {
     if tx_bytes.len() < 9 {
         return None;
