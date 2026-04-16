@@ -800,11 +800,12 @@ async fn process_ledger(
                 if matched {
                     eprintln!("[ws-sync] #{seq}: MATCH ({tx_count} txs, {} objs)", fetched_data.len());
                 } else {
-                    eprintln!("[ws-sync] #{seq}: MISMATCH ({tx_count} txs) — self-healing retry...",);
-
-                    // SELF-HEALING: re-fetch ALL modified+singleton objects and recompute
-                    // Likely cause: transient stale data from rippled under load
+                    eprintln!("[ws-sync] #{seq}: MISMATCH ({tx_count} txs) — logging and moving on (shadow diff will capture root cause)");
+                    return false;
+                    // --- unreachable retry+scan code below, kept for reference ---
+                    #[allow(unreachable_code)]
                     let mut healed = false;
+                    #[allow(unreachable_code)]
                     for retry in 0..2u32 {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         let mut retry_batch = rocksdb::WriteBatch::default();
