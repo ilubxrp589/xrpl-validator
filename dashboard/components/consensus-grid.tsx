@@ -7,16 +7,10 @@ import { fmt } from '@/lib/utils';
 const CHIP_COUNT = 35;
 const chips = Array.from({ length: CHIP_COUNT }, (_, i) => `V${String(i + 1).padStart(2, '0')}`);
 
-// Simulated per-validator agreement percentages. In production these would
-// come from the backend tracking each UNL validator's historical agreement.
-// For now we generate stable fake data seeded by chip index so the heatmap
-// looks realistic and consistent across renders.
-function fakeAgreementPct(idx: number): number {
-  // Most validators are at 100%. A few have slightly lower percentages.
-  const lowOnes: Record<number, number> = {
-    5: 98.7, 13: 96.2, 21: 99.1, 27: 92.3, 31: 97.5, 33: 94.8,
-  };
-  return lowOnes[idx] ?? 100;
+// Per-validator agreement: active chips show 100% since we track aggregate
+// agreement count, not per-validator history. Active = agreed in latest round.
+function agreementPct(active: boolean): number {
+  return active ? 100 : 0;
 }
 
 function heatColor(pct: number): string {
@@ -53,11 +47,10 @@ export function ConsensusGrid() {
 
   // Per-chip agreement data (stable across renders)
   const chipData = useMemo(
-    () => chips.map((label, idx) => ({
-      label,
-      pct: fakeAgreementPct(idx),
-      active: idx < agreementCount,
-    })),
+    () => chips.map((label, idx) => {
+      const active = idx < agreementCount;
+      return { label, pct: agreementPct(active), active };
+    }),
     [agreementCount],
   );
 
