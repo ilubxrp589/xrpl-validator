@@ -1157,13 +1157,11 @@ pub fn apply_ledger_in_order(
         *s.apply_by_type.entry(tx_type.clone()).or_insert(0) += 1;
         *s.round_tx_types.entry(tx_type.clone()).or_insert(0) += 1;
         s.round_tx_count += 1;
-        // Per-tx fee burn — sum into both the per-round counter (resets on
-        // each new ledger) and the lifetime counter. rippled charges the
-        // fee on every tx that gets applied regardless of whether it ended
-        // tesSUCCESS or tec*, so we count it for everything that wasn't a
-        // hard preflight reject (those don't reach this branch anyway —
-        // diverged ones are categorized above and still pay their fee).
-        if let Some(fee) = extract_fee_drops(tx_bytes) {
+        // Per-tx fee burn from the FFI result (drops_destroyed). This is
+        // authoritative — the byte-pattern scanner (extract_fee_drops) was
+        // hitting false positives inside tx signatures, producing absurd values.
+        if outcome.drops_destroyed > 0 {
+            let fee = outcome.drops_destroyed as u64;
             s.round_fees_drops = s.round_fees_drops.saturating_add(fee);
             s.total_fees_burned_drops = s.total_fees_burned_drops.saturating_add(fee);
         }
