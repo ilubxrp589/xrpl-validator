@@ -10,6 +10,8 @@
 
 namespace ripple {
 
+Application::Application() : beast::PropertyStream::Source("app") {}
+
 MinimalApp::MinimalApp(std::uint32_t networkID)
     : config_(std::make_unique<Config>())
     , logs_(std::make_unique<Logs>(beast::severities::kFatal))

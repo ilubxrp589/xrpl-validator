@@ -82,6 +82,8 @@ list(FILTER xrpld_ledger_sources EXCLUDE REGEX "LedgerReplay\\.cpp$")
 list(FILTER xrpld_ledger_sources EXCLUDE REGEX "LedgerCleaner\\.cpp$")
 list(FILTER xrpld_ledger_sources EXCLUDE REGEX "TransactionStateSF\\.cpp$")
 list(FILTER xrpld_ledger_sources EXCLUDE REGEX "AccountStateSF\\.cpp$")
+list(FILTER xrpld_ledger_sources EXCLUDE REGEX "BookListeners\\.cpp$")
+list(FILTER xrpld_ledger_sources EXCLUDE REGEX "/Ledger\\.cpp$")
 list(FILTER xrpld_misc_sources EXCLUDE REGEX "ValidatorList\\.cpp$")
 list(FILTER xrpld_misc_sources EXCLUDE REGEX "ValidatorSite\\.cpp$")
 list(FILTER xrpld_misc_sources EXCLUDE REGEX "NetworkOPs\\.cpp$")
@@ -114,6 +116,8 @@ target_compile_definitions(xrpl_shim PUBLIC
     BOOST_ASIO_DISABLE_CONCEPTS
     RIPPLE_ROCKSDB_AVAILABLE=1
 )
+target_compile_options(xrpl_shim PRIVATE -ffunction-sections -fdata-sections)
+target_link_options(xrpl_shim PUBLIC -Wl,--gc-sections)
 target_link_libraries(xrpl_shim PUBLIC
     ${RIPPLED_BUILD_DIR}/libxrpl.a
     ${RIPPLED_BUILD_DIR}/libxrpl.libpb.a
