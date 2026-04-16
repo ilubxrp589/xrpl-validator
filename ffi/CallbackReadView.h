@@ -40,7 +40,7 @@ public:
     ~CallbackReadView() override = default;
 
     // === Header / metadata ===
-    LedgerHeader const& header() const override { return header_; }
+    LedgerInfo const& info() const override { return header_; }
     bool open() const override { return open_; }
     Fees const& fees() const override { return fees_; }
     Rules const& rules() const override { return rules_; }
