@@ -273,7 +273,10 @@ pub async fn start_ws_sync(
                                         );
                                         if shadow_ok && !shadow_ah.is_empty() && !shadow_overlay.is_empty() {
                                             if let Some(hs) = hasher_snap {
-                                                v.check_shadow_hash(hs, &shadow_overlay, &shadow_ah);
+                                                let matched = v.check_shadow_hash(hs, &shadow_overlay, &shadow_ah);
+                                                if !matched {
+                                                    dump_overlay_diff(seq, &overlay, &shadow_overlay);
+                                                }
                                             }
                                         }
                                         overlay
@@ -286,7 +289,10 @@ pub async fn start_ws_sync(
                                         );
                                         if shadow_ok && !shadow_ah.is_empty() && !shadow_overlay.is_empty() {
                                             if let Some(hs) = hasher_snap {
-                                                v.check_shadow_hash(hs, &shadow_overlay, &shadow_ah);
+                                                let matched = v.check_shadow_hash(hs, &shadow_overlay, &shadow_ah);
+                                                if !matched {
+                                                    dump_overlay_diff(seq, &overlay, &shadow_overlay);
+                                                }
                                             }
                                         }
                                         overlay
@@ -441,6 +447,43 @@ fn build_shadow_overlay(
         }
     }
     overlay
+}
+
+/// Dump set-difference between FFI overlay and RPC-derived shadow overlay on
+/// mismatch. Writes to logs/overlay_diff_{seq}.txt. Keys in FFI but not shadow
+/// = AffectedNodes missed them. Keys in shadow but not FFI = FFI didn't
+/// compute them (e.g. tx-engine bug or state_rocks staleness).
+#[cfg(feature = "ffi")]
+fn dump_overlay_diff(
+    seq: u32,
+    ffi_overlay: &crate::ffi_engine::LedgerOverlay,
+    shadow_overlay: &crate::ffi_engine::LedgerOverlay,
+) {
+    use std::io::Write;
+    let path = std::path::PathBuf::from(format!("logs/overlay_diff_{seq}.txt"));
+    if let Some(p) = path.parent() { let _ = std::fs::create_dir_all(p); }
+    let Ok(mut f) = std::fs::File::create(&path) else { return; };
+    let ffi_keys: HashSet<[u8; 32]> = ffi_overlay.keys().copied().collect();
+    let shadow_keys: HashSet<[u8; 32]> = shadow_overlay.keys().copied().collect();
+    let only_ffi: Vec<&[u8; 32]> = ffi_keys.difference(&shadow_keys).collect();
+    let only_shadow: Vec<&[u8; 32]> = shadow_keys.difference(&ffi_keys).collect();
+    let _ = writeln!(f, "# Ledger #{seq} overlay diff");
+    let _ = writeln!(f, "# FFI overlay: {} keys", ffi_keys.len());
+    let _ = writeln!(f, "# Shadow overlay (AffectedNodes-derived): {} keys", shadow_keys.len());
+    let _ = writeln!(f, "\n## Keys ONLY in FFI overlay ({}) — AffectedNodes missed these", only_ffi.len());
+    for k in only_ffi {
+        let ffi_val = ffi_overlay.get(k);
+        let tag = match ffi_val { Some(Some(d)) => format!("PUT({}B)", d.len()), Some(None) => "DEL".into(), _ => "??".into() };
+        let _ = writeln!(f, "{} {tag}", hex::encode_upper(k));
+    }
+    let _ = writeln!(f, "\n## Keys ONLY in shadow overlay ({}) — FFI didn't emit these", only_shadow.len());
+    for k in only_shadow {
+        let sh_val = shadow_overlay.get(k);
+        let tag = match sh_val { Some(Some(d)) => format!("PUT({}B)", d.len()), Some(None) => "DEL".into(), _ => "??".into() };
+        let _ = writeln!(f, "{} {tag}", hex::encode_upper(k));
+    }
+    let _ = f.flush();
+    eprintln!("[ffi-shadow] wrote key diff to {}", path.display());
 }
 
 /// Ledger header fields needed by FFI apply.
