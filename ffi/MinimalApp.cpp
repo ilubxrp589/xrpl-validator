@@ -33,10 +33,7 @@ MinimalApp::MinimalApp(std::uint32_t networkID)
     // normal load.
     feeTrack_ = std::make_unique<LoadFeeTrack>(nullJournal_);
 
-    // NoopOrderBookDB is our no-op implementation; apply doesn't need real
-    // book tracking for stateless replay (books are rebuilt from scratch
-    // by the new tx's own applied mutations).
-    orderBookDB_ = std::make_unique<NoopOrderBookDB>(*this);
+    orderBookDB_ = std::make_unique<OrderBookDB>(*this);
 }
 
 // ============================================================

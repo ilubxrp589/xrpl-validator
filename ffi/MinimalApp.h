@@ -38,30 +38,10 @@
 
 namespace ripple {
 
-/** No-op OrderBookDB — our apply path calls it on tx handlers that track
- *  book mutations, but for stateless replay we don't need to track anything.
- *  Every method is either a no-op or returns an empty/default value. */
-class NoopOrderBookDB final : public OrderBookDB
-{
-public:
-    NoopOrderBookDB(Application& app) : OrderBookDB(app) {}
-
-    void setup(std::shared_ptr<ReadView const> const&) override {}
-    void addOrderBook(Book const&) override {}
-    std::vector<Book> getBooksByTakerPays(Issue const&) override { return {}; }
-    int getBookSize(Issue const&) override { return 0; }
-    bool isBookToXRP(Issue const&) override { return false; }
-    BookListeners::pointer getBookListeners(Book const&) override { return {}; }
-    BookListeners::pointer makeBookListeners(Book const&) override { return {}; }
-    void processTxn(
-        std::shared_ptr<ReadView const> const&,
-        const AcceptedLedgerTx&,
-        const std::shared_ptr<ReadView const>&) override {}
-};
-
 /** Minimum viable Application for running ripple::apply() in a standalone
  *  replay context. Owns real Config / Logs / HashRouter / LoadFeeTrack
- *  instances, stubs everything else. */
+ *  instances, stubs everything else. OrderBookDB is used directly (concrete
+ *  class in 3.1.2, no virtuals) — never calling setup() keeps it empty. */
 class MinimalApp : public Application
 {
 public:
@@ -144,7 +124,7 @@ private:
     std::unique_ptr<Logs> logs_;
     std::unique_ptr<HashRouter> hashRouter_;
     std::unique_ptr<LoadFeeTrack> feeTrack_;
-    std::unique_ptr<NoopOrderBookDB> orderBookDB_;
+    std::unique_ptr<OrderBookDB> orderBookDB_;
     beast::Journal nullJournal_;
     std::optional<uint256> trapTxID_;  // always nullopt
     std::recursive_mutex masterMutex_;
