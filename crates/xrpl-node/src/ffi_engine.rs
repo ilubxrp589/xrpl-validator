@@ -460,6 +460,11 @@ pub struct FfiStats {
     pub rpc_sle_miss_samples: Vec<String>,
     /// Sample of up to 10 diverged tx hashes (tx_type/TER/hash) for mainnet lookup
     pub diverged_tx_samples: Vec<String>,
+    /// Rolling buffer of the last 50 txs applied by the FFI engine, regardless
+    /// of outcome. Format: "L{seq} {tx_type}/{ter_name} {short_hash} {ms}ms mut={N}"
+    /// where short_hash is the first 16 chars. Lets dashboards + watch_engine.py
+    /// show live per-tx activity without polling a separate endpoint.
+    pub recent_tx_samples: Vec<String>,
     /// Apply-latency histogram buckets (milliseconds). Cumulative counts
     /// (Prometheus-style: bucket[i] = count of observations ≤ bucket_bound[i]).
     /// Bounds: 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, +Inf
@@ -1132,6 +1137,18 @@ pub fn apply_ledger_in_order(
         s.live_apply_last_ter = outcome.ter_name.clone();
         s.live_apply_last_mutations = outcome.mutations.len();
         s.live_apply_last_ms = elapsed_ms;
+        // Rolling buffer of last 50 txs — powers live per-tx visibility on the
+        // dashboard + watch_engine.py via /api/engine. Regardless of outcome.
+        {
+            let short_hash = if tx_hash.len() >= 16 { &tx_hash[..16] } else { tx_hash.as_str() };
+            s.recent_tx_samples.push(format!(
+                "L{} {}/{} {} {}ms mut={}",
+                ledger_seq, tx_type, outcome.ter_name, short_hash, elapsed_ms, outcome.mutations.len()
+            ));
+            if s.recent_tx_samples.len() > 50 {
+                s.recent_tx_samples.remove(0);
+            }
+        }
         *s.live_apply_ter_counts.entry(outcome.ter_name).or_insert(0) += 1;
         *s.apply_by_type.entry(tx_type.clone()).or_insert(0) += 1;
         *s.round_tx_types.entry(tx_type.clone()).or_insert(0) += 1;
