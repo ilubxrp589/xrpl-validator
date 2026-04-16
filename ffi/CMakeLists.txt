@@ -67,8 +67,7 @@ target_include_directories(xrpl_shim PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${RIPPLED_SRC_DIR}/include
     ${RIPPLED_SRC_DIR}/src
-    ${RIPPLED_BUILD_DIR}/proto
-    ${RIPPLED_BUILD_DIR}/libxrpl
+    ${RIPPLED_BUILD_DIR}/pb-xrpl.libpb
 )
 target_compile_definitions(xrpl_shim PUBLIC
     BOOST_ASIO_DISABLE_CONCEPTS
