@@ -44,6 +44,12 @@ pub async fn start_ws_sync(
     if stage3_cfg.enabled {
         eprintln!("[stage3] ENABLED — FFI overlay will source state.rocks bytes (singletons still RPC)");
     }
+    // Publish stage3 state to FfiStats so /api/engine can expose it for
+    // dashboards + watch_engine.py. Only when the ffi verifier is present.
+    #[cfg(feature = "ffi")]
+    if let Some(ref verifier) = ffi_verifier {
+        verifier.shared_stats().lock().stage3_enabled = stage3_cfg.enabled;
+    }
 
     loop {
         let ws_url = rpc.ws_url();

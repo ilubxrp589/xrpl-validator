@@ -465,6 +465,10 @@ pub struct FfiStats {
     /// where short_hash is the first 16 chars. Lets dashboards + watch_engine.py
     /// show live per-tx activity without polling a separate endpoint.
     pub recent_tx_samples: Vec<String>,
+    /// True when `XRPL_FFI_STAGE3=1` was read at `start_ws_sync` entry. Exposed
+    /// via `/api/engine` so dashboards and watch_engine.py can show a big
+    /// "STAGE 3: ACTIVE" banner without having to grep the log.
+    pub stage3_enabled: bool,
     /// Apply-latency histogram buckets (milliseconds). Cumulative counts
     /// (Prometheus-style: bucket[i] = count of observations ≤ bucket_bound[i]).
     /// Bounds: 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, +Inf
