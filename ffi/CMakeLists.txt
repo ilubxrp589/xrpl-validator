@@ -49,13 +49,22 @@ set_target_properties(secp256k1_lib PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES ${RIPPLED_SRC_DIR}/external/secp256k1/include
 )
 
-# xrpld sources: 3.1.2 compiles these directly into the rippled executable
-# (no libxrpld.a). We glob them into our shim library instead.
+# xrpld sources needed by the apply()/preflight() path.
+# Only include the subsystems the transaction engine touches.
+# Overlay, peerfinder, consensus, perflog, and rpc are excluded
+# (they use boost::asio executor APIs our boost version lacks, and
+# they're not needed for stateless tx replay).
 file(GLOB_RECURSE xrpld_sources CONFIGURE_DEPENDS
-    "${RIPPLED_SRC_DIR}/src/xrpld/*.cpp"
+    "${RIPPLED_SRC_DIR}/src/xrpld/app/tx/*.cpp"
+    "${RIPPLED_SRC_DIR}/src/xrpld/app/ledger/*.cpp"
+    "${RIPPLED_SRC_DIR}/src/xrpld/app/misc/*.cpp"
+    "${RIPPLED_SRC_DIR}/src/xrpld/app/paths/*.cpp"
+    "${RIPPLED_SRC_DIR}/src/xrpld/app/rdb/*.cpp"
+    "${RIPPLED_SRC_DIR}/src/xrpld/core/*.cpp"
+    "${RIPPLED_SRC_DIR}/src/xrpld/conditions/*.cpp"
+    "${RIPPLED_SRC_DIR}/src/xrpld/shamap/*.cpp"
+    "${RIPPLED_SRC_DIR}/src/xrpld/nodestore/*.cpp"
 )
-list(FILTER xrpld_sources EXCLUDE REGEX "/src/xrpld/app/main/Main\\.cpp$")
-list(FILTER xrpld_sources EXCLUDE REGEX "/src/xrpld/app/main/Application\\.cpp$")
 
 add_library(xrpl_shim STATIC
     xrpl_shim.cpp
