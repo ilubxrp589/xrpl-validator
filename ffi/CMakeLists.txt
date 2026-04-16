@@ -68,6 +68,7 @@ target_include_directories(xrpl_shim PUBLIC
     ${RIPPLED_SRC_DIR}/include
     ${RIPPLED_SRC_DIR}/src
     ${RIPPLED_BUILD_DIR}/pb-xrpl.libpb
+    ${RIPPLED_BUILD_DIR}/pb-xrpl.libpb/xrpl/proto
 )
 target_compile_definitions(xrpl_shim PUBLIC
     BOOST_ASIO_DISABLE_CONCEPTS
