@@ -692,8 +692,9 @@ async fn process_ledger(
     }
 
     if failed > 0 {
-        eprintln!("[ws-sync] Ledger #{seq}: {failed} failures — invalidating tree for rebuild");
+        eprintln!("[ws-sync] Ledger #{seq}: {failed} fetch failures — ABORTING write to prevent state corruption");
         hash_comp.invalidate_tree();
+        return false;
     }
 
     // Atomic write to RocksDB
