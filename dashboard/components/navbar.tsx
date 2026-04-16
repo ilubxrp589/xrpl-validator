@@ -98,7 +98,7 @@ export function Navbar() {
             <Share2 className="h-4 w-4" />
           </button>
           <span className="hidden rounded border border-halcyon-border bg-halcyon-card px-2 py-0.5 font-mono text-[10px] text-halcyon-muted sm:inline-block">
-            LIBXRPL 3.2.0-b0
+            LIBXRPL 3.1.2
           </span>
           <div className="flex items-center gap-1.5">
             <Radio
