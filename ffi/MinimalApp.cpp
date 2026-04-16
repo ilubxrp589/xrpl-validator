@@ -4,6 +4,7 @@
 
 #include <xrpld/app/misc/HashRouter.h>
 #include <xrpld/app/misc/LoadFeeTrack.h>
+#include <xrpld/app/ledger/Ledger.h>
 #include <xrpl/basics/chrono.h>
 
 #include <stdexcept>
@@ -11,6 +12,8 @@
 namespace ripple {
 
 Application::Application() : beast::PropertyStream::Source("app") {}
+
+bool isFlagLedger(LedgerIndex seq) { return (seq % FLAG_LEDGER_INTERVAL) == 0; }
 
 MinimalApp::MinimalApp(std::uint32_t networkID)
     : config_(std::make_unique<Config>())
