@@ -953,7 +953,10 @@ async fn process_ledger(
             }
         }
     } else {
-        // Fast path: update flat cache via merge (no hash computation)
+        // Fast path: update the live hasher (so a later hash check in
+        // steady-state finds it up-to-date) without recomputing the root.
+        // Then merge into the persistent leaf_cache for restart caching.
+        hash_comp.update_only(db, &keys);
         use xrpl_ledger::shamap::hash::{sha512_half_prefixed, HASH_PREFIX_LEAF_NODE};
         use xrpl_ledger::shamap::node::nibble_at;
         let mut cache = hash_comp.leaf_cache.lock();

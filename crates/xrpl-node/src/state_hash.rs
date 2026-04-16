@@ -644,6 +644,27 @@ impl StateHashComputer {
 
     /// Flat bucketed hash — O(log n) updates, only dirty buckets recomputed.
     /// Build: ~10s from RocksDB. Incremental: ~50-100ms per ledger.
+    /// Update the hasher with the latest values for `modified_keys` from
+    /// the DB, but do NOT compute the root hash. Used in the fast-path
+    /// during gap catchup so the hasher stays in sync with state.rocks
+    /// without paying the root-compute cost.
+    pub fn update_only(&self, db: &Arc<rocksdb::DB>, modified_keys: &[Hash256]) {
+        let mut guard = self.hasher.lock();
+        if guard.is_none() {
+            // Lazy-build from DB on first call (same as update_and_hash)
+            let h = FlatHasher::build_from_db(db);
+            *guard = Some(h);
+        }
+        let hasher = guard.as_mut().unwrap();
+        for key in modified_keys {
+            match db.get(&key.0) {
+                Ok(Some(data)) => { hasher.update(*key, Some(leaf_hash(&data, &key.0))); }
+                Ok(None) => { hasher.update(*key, None); }
+                Err(_) => {}
+            }
+        }
+    }
+
     pub fn update_and_hash(&self, db: &Arc<rocksdb::DB>, modified_keys: &[Hash256]) -> Option<Hash256> {
         let start = std::time::Instant::now();
         let mut guard = self.hasher.lock();
