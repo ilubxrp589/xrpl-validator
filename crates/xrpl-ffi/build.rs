@@ -136,6 +136,8 @@ fn collect_conan_libs(conan_gen: &std::path::Path) {
         "boost_prg_exec_monitor",
         "boost_unit_test_framework",
         "rocksdb",
+        "ssl",
+        "crypto",
     ];
     let mut emitted: HashSet<String> = HashSet::new();
     for lib in &libs {
