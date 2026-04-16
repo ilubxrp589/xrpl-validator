@@ -18,8 +18,8 @@ export function Speedometer() {
   const rpcFallbacks = ffi?.db_rpc_fallbacks ?? 0;
   const dbTotal = dbHits + rpcFallbacks;
   const dbHitPct = dbTotal > 0 ? ((dbHits / dbTotal) * 100).toFixed(1) : '—';
-  const battlePct = Math.min((applied / BATTLE_TARGET) * 100, 100);
-  const etaDays = applied > 0 ? Math.max(0, Math.ceil((BATTLE_TARGET - applied) / 17000)) : 0;
+  const battlePct = Math.min((shadowAttempted / BATTLE_TARGET) * 100, 100);
+  const etaDays = shadowAttempted > 0 ? Math.max(0, Math.ceil((BATTLE_TARGET - shadowAttempted) / 17000)) : 0;
 
   // Uptime
   const startMs = data?.engine.start_time_ms ?? 0;
@@ -59,8 +59,8 @@ export function Speedometer() {
           <span className="font-mono text-sm font-bold tabular-nums text-halcyon-accent">{dbHitPct}%</span>
         </div>
         <div>
-          <span className="font-mono text-[9px] text-halcyon-muted block">Ledgers</span>
-          <span className="font-mono text-sm font-bold tabular-nums text-white">{fmt(applied)}</span>
+          <span className="font-mono text-[9px] text-halcyon-muted block">Verified</span>
+          <span className="font-mono text-sm font-bold tabular-nums text-white">{fmt(shadowAttempted)}</span>
         </div>
         <div>
           <span className="font-mono text-[9px] text-halcyon-muted block">Uptime</span>
@@ -80,7 +80,7 @@ export function Speedometer() {
               <span className="font-mono text-[9px] uppercase tracking-widest text-halcyon-muted">Validation Window</span>
             </span>
             <span className="font-mono text-[10px] tabular-nums text-halcyon-accent">
-              {(applied / 1000).toFixed(1)}K / 50K · ~{etaDays}d
+              {(shadowAttempted / 1000).toFixed(1)}K / 50K · ~{etaDays}d
             </span>
           </div>
           <div className="h-1.5 w-full rounded-full bg-halcyon-border overflow-hidden">
