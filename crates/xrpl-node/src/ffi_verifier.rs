@@ -142,7 +142,7 @@ impl FfiVerifier {
         let matched = ours == net;
 
         if !matched {
-            eprintln!("[ffi-shadow] overlay keys: {}  ours: {}  network: {}", overlay.len(), &ours[..16], &net[..16]);
+            eprintln!("[ffi-shadow] MISMATCH ledger #{seq}: overlay keys: {}  ours: {}  network: {}", overlay.len(), &ours[..16], &net[..16]);
             // Diagnostic: dump first 3 overlay keys + data length for investigation
             let mut count = 0;
             for (key, val) in overlay.iter() {
@@ -154,6 +154,8 @@ impl FfiVerifier {
                 }
                 count += 1;
             }
+            // Persist to shadow mismatch log
+            self.log_shadow_mismatch(seq, &ours, &net, overlay.len());
         }
         let mut s = self.stats.lock();
         s.shadow_hash_attempted += 1;
@@ -166,6 +168,31 @@ impl FfiVerifier {
         s.shadow_hash_last_network = net;
         s.shadow_hash_last_matched = matched;
         matched
+    }
+
+    fn log_shadow_mismatch(&self, seq: u32, ours: &str, network: &str, overlay_keys: usize) {
+        use std::io::Write;
+        let path = std::env::var("XRPL_FFI_SHADOW_LOG")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("logs/shadow_mismatches.jsonl"));
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let line = serde_json::json!({
+            "ts": ts,
+            "ledger_seq": seq,
+            "our_hash": ours,
+            "network_hash": network,
+            "overlay_keys": overlay_keys,
+        });
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(f, "{line}");
+            let _ = f.flush();
+        }
     }
 
     /// Snapshot the shared `FfiStats` (cheap clone, holds the mutex briefly).
