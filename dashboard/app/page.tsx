@@ -8,6 +8,7 @@ import { NodeResources } from '@/components/node-resources';
 import { MetricsGrid } from '@/components/metrics-grid';
 import { Speedometer } from '@/components/speedometer';
 import { DisagreementHistory } from '@/components/disagreement-history';
+import { TxFeed } from '@/components/tx-feed';
 import { TransactionFlow } from '@/components/transaction-flow';
 import { ConsensusGrid } from '@/components/consensus-grid';
 import { IdentityCard } from '@/components/identity-card';
@@ -32,6 +33,7 @@ export default function Home() {
               <DisagreementHistory />
             </div>
 
+            <TxFeed />
             <TransactionFlow />
             <ConsensusGrid />
             <IdentityCard />

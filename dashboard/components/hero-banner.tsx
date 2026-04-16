@@ -38,13 +38,19 @@ export function HeroBanner() {
   const agreementStr = agreement.toFixed(2) + '%';
   const isPerfect = agreement >= 99.99;
 
-  // Hash match — use the server-side consecutive_matches counter as the
-  // source of truth. It does case-insensitive comparison internally.
-  // Don't compare the hex strings client-side (computed_hash is lowercase
-  // from hex::encode, network_hash is uppercase from rippled — strict
-  // equality would always fail and show a false "MISMATCH").
-  const hashMatched = stateHash.consecutive_matches > 0;
+  // Hash comparison state — three distinct UI states:
+  //   PENDING   — no comparison has run yet (post-wipe, bootstrapping)
+  //   MATCH     — at least one comparison has run and the latest matched
+  //   MISMATCH  — at least one comparison has run and the latest diverged
+  const hashComparisons = stateHash.total_matches + stateHash.total_mismatches;
+  const hashState: 'pending' | 'match' | 'mismatch' =
+    hashComparisons === 0
+      ? 'pending'
+      : stateHash.consecutive_matches > 0
+      ? 'match'
+      : 'mismatch';
   const displayHash = stateHash.computed_hash || '—';
+  const stage3Enabled = ffi.stage3_enabled === true;
 
   // Compute time
   const computeMs = (stateHash.compute_time_secs * 1000).toFixed(1);
@@ -70,6 +76,31 @@ export function HeroBanner() {
   return (
     <section className="bg-halcyon-bg px-4 pb-8 pt-10">
       <div className="mx-auto max-w-7xl">
+        {/* ---- Stage 3 banner — big + obvious ---- */}
+        <div className="mb-6 flex justify-center">
+          {stage3Enabled ? (
+            <div className="flex items-center gap-3 rounded-lg border-2 border-halcyon-accent bg-halcyon-accent/10 px-5 py-2 text-halcyon-accent shadow-[0_0_24px_#00FF9F40]">
+              <span className="relative flex h-2.5 w-2.5">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-halcyon-accent opacity-75" />
+                <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-halcyon-accent" />
+              </span>
+              <span className="font-mono text-sm font-bold uppercase tracking-widest">
+                ★ Stage 3 Active ★
+              </span>
+              <span className="text-[10px] font-medium uppercase tracking-wide text-halcyon-accent/70">
+                FFI overlay writing state.rocks
+              </span>
+            </div>
+          ) : (
+            <div className="flex items-center gap-3 rounded-lg border border-halcyon-border bg-halcyon-card px-5 py-2 text-halcyon-muted">
+              <span className="h-2 w-2 rounded-full bg-halcyon-muted" />
+              <span className="font-mono text-xs uppercase tracking-widest">
+                Stage 3 inactive · shadow-only Phase A
+              </span>
+            </div>
+          )}
+        </div>
+
         {/* ---- Agreement hero number ---- */}
         <div className="flex flex-col items-center gap-2 pb-8">
           <span
@@ -128,13 +159,23 @@ export function HeroBanner() {
             <div className="flex items-center gap-2">
               <span
                 className={`font-mono text-sm font-semibold ${
-                  hashMatched ? 'text-halcyon-accent' : 'text-halcyon-danger'
+                  hashState === 'match'
+                    ? 'text-halcyon-accent'
+                    : hashState === 'pending'
+                    ? 'text-amber-400'
+                    : 'text-halcyon-danger'
                 }`}
               >
-                {hashMatched ? 'MATCH' : 'MISMATCH'}
+                {hashState === 'match'
+                  ? 'MATCH'
+                  : hashState === 'pending'
+                  ? 'PENDING'
+                  : 'MISMATCH'}
               </span>
               <span className="text-xs text-halcyon-muted">
-                {computeMs}ms &middot; p50 {p50}
+                {hashState === 'pending'
+                  ? 'waiting for first ledger check'
+                  : `${computeMs}ms · p50 ${p50}`}
               </span>
             </div>
             <div className="mt-2 flex items-center gap-1.5">

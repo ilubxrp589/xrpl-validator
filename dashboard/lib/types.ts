@@ -32,6 +32,11 @@ export interface FfiVerifier {
   db_rpc_fallbacks: number;
   health_checks: number;
   health_passed: number;
+  /** True when XRPL_FFI_STAGE3=1 was read at start_ws_sync entry. */
+  stage3_enabled?: boolean;
+  /** Rolling buffer of the last 50 txs applied by the FFI engine.
+   *  Format: "L{seq} {tx_type}/{ter_name} {short_hash} {ms}ms mut={N}" */
+  recent_tx_samples?: string[];
 }
 
 export interface LiveEngine {
