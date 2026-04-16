@@ -50,20 +50,50 @@ set_target_properties(secp256k1_lib PROPERTIES
 )
 
 # xrpld sources needed by the apply()/preflight() path.
-# Only include the subsystems the transaction engine touches.
-# Overlay, peerfinder, consensus, perflog, and rpc are excluded
-# (they use boost::asio executor APIs our boost version lacks, and
-# they're not needed for stateless tx replay).
-file(GLOB_RECURSE xrpld_sources CONFIGURE_DEPENDS
+# We include the tx engine and its direct dependencies, excluding
+# infrastructure that pulls in overlay/consensus/rpc symbols.
+file(GLOB_RECURSE xrpld_tx_sources CONFIGURE_DEPENDS
     "${RIPPLED_SRC_DIR}/src/xrpld/app/tx/*.cpp"
-    "${RIPPLED_SRC_DIR}/src/xrpld/app/ledger/*.cpp"
+)
+file(GLOB_RECURSE xrpld_misc_sources CONFIGURE_DEPENDS
     "${RIPPLED_SRC_DIR}/src/xrpld/app/misc/*.cpp"
+)
+file(GLOB_RECURSE xrpld_ledger_sources CONFIGURE_DEPENDS
+    "${RIPPLED_SRC_DIR}/src/xrpld/app/ledger/*.cpp"
+)
+file(GLOB_RECURSE xrpld_paths_sources CONFIGURE_DEPENDS
     "${RIPPLED_SRC_DIR}/src/xrpld/app/paths/*.cpp"
+)
+file(GLOB_RECURSE xrpld_other_sources CONFIGURE_DEPENDS
     "${RIPPLED_SRC_DIR}/src/xrpld/app/rdb/*.cpp"
     "${RIPPLED_SRC_DIR}/src/xrpld/core/*.cpp"
     "${RIPPLED_SRC_DIR}/src/xrpld/conditions/*.cpp"
     "${RIPPLED_SRC_DIR}/src/xrpld/shamap/*.cpp"
     "${RIPPLED_SRC_DIR}/src/xrpld/nodestore/*.cpp"
+)
+# Exclude files that reference overlay/consensus/rpc symbols we don't have
+list(FILTER xrpld_ledger_sources EXCLUDE REGEX "LedgerMaster\\.cpp$")
+list(FILTER xrpld_ledger_sources EXCLUDE REGEX "LedgerToJson\\.cpp$")
+list(FILTER xrpld_ledger_sources EXCLUDE REGEX "ConsensusTransSetSF\\.cpp$")
+list(FILTER xrpld_ledger_sources EXCLUDE REGEX "InboundLedger\\.cpp$")
+list(FILTER xrpld_ledger_sources EXCLUDE REGEX "InboundLedgers\\.cpp$")
+list(FILTER xrpld_ledger_sources EXCLUDE REGEX "LedgerReplayer\\.cpp$")
+list(FILTER xrpld_ledger_sources EXCLUDE REGEX "LedgerReplay\\.cpp$")
+list(FILTER xrpld_ledger_sources EXCLUDE REGEX "LedgerCleaner\\.cpp$")
+list(FILTER xrpld_ledger_sources EXCLUDE REGEX "TransactionStateSF\\.cpp$")
+list(FILTER xrpld_ledger_sources EXCLUDE REGEX "AccountStateSF\\.cpp$")
+list(FILTER xrpld_misc_sources EXCLUDE REGEX "ValidatorList\\.cpp$")
+list(FILTER xrpld_misc_sources EXCLUDE REGEX "ValidatorSite\\.cpp$")
+list(FILTER xrpld_misc_sources EXCLUDE REGEX "NetworkOPs\\.cpp$")
+list(FILTER xrpld_misc_sources EXCLUDE REGEX "LoadManager\\.cpp$")
+list(FILTER xrpld_paths_sources EXCLUDE REGEX "PathRequests\\.cpp$")
+list(FILTER xrpld_paths_sources EXCLUDE REGEX "PathRequest\\.cpp$")
+set(xrpld_sources
+    ${xrpld_tx_sources}
+    ${xrpld_misc_sources}
+    ${xrpld_ledger_sources}
+    ${xrpld_paths_sources}
+    ${xrpld_other_sources}
 )
 
 add_library(xrpl_shim STATIC
