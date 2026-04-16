@@ -1073,6 +1073,20 @@ pub fn apply_ledger_in_order(
         if outcome.ter_name == "terPRE_SEQ" {
             let sender_key = extract_sender_account_root_key(tx_bytes);
             if let Some(key) = sender_key {
+                // DIAGNOSTIC: dump sender state from overlay+snapshot+RPC at moment of failure
+                let ov_seq = {
+                    let ov = overlay.lock();
+                    ov.get(&key).and_then(|v| v.as_ref()).and_then(|d| scan_sequence_in_account_root(d))
+                };
+                let snap_seq = db_snapshot.and_then(|s| s.get(&key).ok().flatten()).and_then(|d| scan_sequence_in_account_root(&d));
+                let rpc_seq = {
+                    let r = RpcProvider::with_endpoints(rpc_urls.to_vec(), ledger_seq);
+                    r.read(&key).and_then(|d| scan_sequence_in_account_root(d))
+                };
+                eprintln!(
+                    "[ffi-diag] terPRE_SEQ #{ledger_seq} tx{tx_num} {tx_type} mutations={} overlay_seq={:?} snapshot_seq={:?} rpc_seq={:?}",
+                    outcome.mutations.len(), ov_seq, snap_seq, rpc_seq
+                );
                 // Try current ledger first, then ledger-1
                 let mut recovered = false;
                 let repair = RpcProvider::with_endpoints(rpc_urls.to_vec(), ledger_seq);
@@ -1091,6 +1105,29 @@ pub fn apply_ledger_in_order(
                 }
                 if !recovered {
                     eprintln!("[ffi] terPRE_SEQ recovery FAILED at #{ledger_seq}");
+                }
+            }
+        }
+        // DIAGNOSTIC: log mutation flow for tesSUCCESS to verify threading
+        if outcome.ter_name == "tesSUCCESS" {
+            let sender_key_opt = extract_sender_account_root_key(tx_bytes);
+            if let Some(key) = sender_key_opt {
+                let mut sender_in_mutations: Option<u32> = None;
+                for m in &outcome.mutations {
+                    if m.key == key {
+                        sender_in_mutations = scan_sequence_in_account_root(&m.data);
+                        break;
+                    }
+                }
+                let ov_seq_after = {
+                    let ov = overlay.lock();
+                    ov.get(&key).and_then(|v| v.as_ref()).and_then(|d| scan_sequence_in_account_root(d))
+                };
+                if sender_in_mutations.is_none() && ov_seq_after.is_some() {
+                    eprintln!(
+                        "[ffi-diag] tesSUCCESS #{ledger_seq} tx{tx_num} {tx_type} sender_in_mutations=None ov_after={:?} (sender not in mutations!)",
+                        ov_seq_after
+                    );
                 }
             }
         }
