@@ -3,7 +3,7 @@
 import { useValidatorData } from '@/hooks/use-validator-data';
 import { fmt } from '@/lib/utils';
 
-const BATTLE_TARGET = 100_000;
+const BATTLE_TARGET = 50_000;
 
 export function Speedometer() {
   const { data } = useValidatorData();
@@ -77,10 +77,10 @@ export function Speedometer() {
                 <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-halcyon-accent opacity-75" />
                 <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-halcyon-accent" />
               </span>
-              <span className="font-mono text-[9px] uppercase tracking-widest text-halcyon-muted">Phase A</span>
+              <span className="font-mono text-[9px] uppercase tracking-widest text-halcyon-muted">Validation Window</span>
             </span>
             <span className="font-mono text-[10px] tabular-nums text-halcyon-accent">
-              {(applied / 1000).toFixed(1)}K / 100K · ~{etaDays}d
+              {(applied / 1000).toFixed(1)}K / 50K · ~{etaDays}d
             </span>
           </div>
           <div className="h-1.5 w-full rounded-full bg-halcyon-border overflow-hidden">

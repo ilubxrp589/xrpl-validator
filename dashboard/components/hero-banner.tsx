@@ -95,7 +95,7 @@ export function HeroBanner() {
             <div className="flex items-center gap-3 rounded-lg border border-halcyon-border bg-halcyon-card px-5 py-2 text-halcyon-muted">
               <span className="h-2 w-2 rounded-full bg-halcyon-muted" />
               <span className="font-mono text-xs uppercase tracking-widest">
-                Stage 3 inactive · shadow-only Phase A
+                Stage 3 inactive · validation window
               </span>
             </div>
           )}
