@@ -55,6 +55,7 @@ file(GLOB_RECURSE xrpld_sources CONFIGURE_DEPENDS
     "${RIPPLED_SRC_DIR}/src/xrpld/*.cpp"
 )
 list(FILTER xrpld_sources EXCLUDE REGEX "/src/xrpld/app/main/Main\\.cpp$")
+list(FILTER xrpld_sources EXCLUDE REGEX "/src/xrpld/app/main/Application\\.cpp$")
 
 add_library(xrpl_shim STATIC
     xrpl_shim.cpp
