@@ -67,13 +67,18 @@ fn collect_conan_libs(conan_gen: &std::path::Path) {
         Err(_) => return,
     };
 
+    let skip_packages = ["OpenSSL", "openssl"];
+
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if !name.ends_with("-release-x86_64-data.cmake") {
             continue;
         }
         if name.starts_with("module-") {
-            continue; // These are alias files for find_package compatibility
+            continue;
+        }
+        if skip_packages.iter().any(|p| name.starts_with(p)) {
+            continue;
         }
         let content = fs::read_to_string(entry.path()).unwrap_or_default();
         for line in content.lines() {
