@@ -17,28 +17,43 @@ set(RIPPLED_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/rippled)
 list(PREPEND CMAKE_PREFIX_PATH ${RIPPLED_BUILD_DIR}/build/generators)
 list(PREPEND CMAKE_MODULE_PATH ${RIPPLED_BUILD_DIR}/build/generators)
 
-# Find the conan-provided deps that libxrpl pulls in transitively
+# Conan-provided dependencies (matching rippled 3.1.2's own find_package list)
 find_package(Boost REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(protobuf REQUIRED)
+find_package(gRPC REQUIRED)
 find_package(date REQUIRED)
 find_package(xxHash REQUIRED)
-find_package(ed25519 REQUIRED)
-find_package(secp256k1 REQUIRED)
+find_package(lz4 REQUIRED)
+find_package(LibArchive REQUIRED)
+find_package(SOCI REQUIRED)
+find_package(SQLite3 REQUIRED)
+find_package(RocksDB REQUIRED)
+find_package(nudb REQUIRED)
+find_package(absl REQUIRED)
+find_package(Snappy REQUIRED)
+find_package(BZip2 REQUIRED)
+find_package(ZLIB REQUIRED)
 
-# Shim library
-#
-# For 3.1.2 compatibility the shim needs symbols from rippled's xrpld tree
-# (Application, HashRouter, LoadFeeTrack, OrderBookDB). 3.1.2's cmake does
-# NOT produce a standalone libxrpld.a — xrpld sources are compiled directly
-# into the rippled executable target in RippledCore.cmake. We work around
-# that by globbing all xrpld/*.cpp and compiling them as part of our shim
-# library. This keeps the rippled build config unchanged (-Dxrpld=OFF).
+# ed25519 and secp256k1 are built from rippled's external/ subdirectories,
+# not conan packages. Import the pre-built .a files from the rippled build tree.
+add_library(ed25519_lib STATIC IMPORTED)
+set_target_properties(ed25519_lib PROPERTIES
+    IMPORTED_LOCATION ${RIPPLED_BUILD_DIR}/external/ed25519-donna/libed25519.a
+    INTERFACE_INCLUDE_DIRECTORIES ${RIPPLED_SRC_DIR}/external/ed25519-donna
+)
+
+add_library(secp256k1_lib STATIC IMPORTED)
+set_target_properties(secp256k1_lib PROPERTIES
+    IMPORTED_LOCATION ${RIPPLED_BUILD_DIR}/external/secp256k1/lib/libsecp256k1.a
+    INTERFACE_INCLUDE_DIRECTORIES ${RIPPLED_SRC_DIR}/external/secp256k1/include
+)
+
+# xrpld sources: 3.1.2 compiles these directly into the rippled executable
+# (no libxrpld.a). We glob them into our shim library instead.
 file(GLOB_RECURSE xrpld_sources CONFIGURE_DEPENDS
     "${RIPPLED_SRC_DIR}/src/xrpld/*.cpp"
 )
-# Exclude the rippled main entrypoint (Main.cpp defines main() which would
-# conflict with live_viewer's main).
 list(FILTER xrpld_sources EXCLUDE REGEX "/src/xrpld/app/main/Main\\.cpp$")
 
 add_library(xrpl_shim STATIC
@@ -51,23 +66,35 @@ add_library(xrpl_shim STATIC
 target_include_directories(xrpl_shim PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${RIPPLED_SRC_DIR}/include
-    ${RIPPLED_SRC_DIR}/src        # for <xrpld/...> headers
+    ${RIPPLED_SRC_DIR}/src
     ${RIPPLED_BUILD_DIR}/proto
     ${RIPPLED_BUILD_DIR}/libxrpl
 )
 target_compile_definitions(xrpl_shim PUBLIC
-    BOOST_ASIO_DISABLE_CONCEPTS  # rippled disables this, we must match
+    BOOST_ASIO_DISABLE_CONCEPTS
+    RIPPLE_ROCKSDB_AVAILABLE=1
 )
 target_link_libraries(xrpl_shim PUBLIC
     ${RIPPLED_BUILD_DIR}/libxrpl.a
     ${RIPPLED_BUILD_DIR}/libxrpl.libpb.a
+    ed25519_lib
+    secp256k1_lib
     boost::boost
     openssl::openssl
-    protobuf::protobuf
+    protobuf::libprotobuf
+    gRPC::grpc++
     date::date
     xxHash::xxhash
-    ed25519::ed25519
-    secp256k1::secp256k1
+    lz4::lz4
+    LibArchive::LibArchive
+    soci::soci
+    SQLite::SQLite3
+    RocksDB::rocksdb
+    NuDB::nudb
+    absl::random_random
+    Snappy::snappy
+    BZip2::BZip2
+    ZLIB::ZLIB
     pthread
     dl
 )
