@@ -16,7 +16,7 @@
 #include <functional>
 #include <optional>
 
-namespace xrpl {
+namespace ripple {
 
 /** Callback signature for SLE lookup.
  *  Returns true if found, fills out_data and out_len.
@@ -81,4 +81,4 @@ private:
     SleLookupCallback lookup_;
 };
 
-}  // namespace xrpl
+}  // namespace ripple

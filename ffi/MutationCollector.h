@@ -14,7 +14,7 @@
 #include <utility>
 #include <vector>
 
-namespace xrpl {
+namespace ripple {
 
 /** How an SLE was changed. Matches the shim C API: 0=Created, 1=Modified, 2=Deleted. */
 enum class MutationKind : uint8_t {
@@ -66,4 +66,4 @@ private:
     std::int64_t drops_destroyed_ = 0;
 };
 
-}  // namespace xrpl
+}  // namespace ripple

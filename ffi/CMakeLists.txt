@@ -27,17 +27,36 @@ find_package(ed25519 REQUIRED)
 find_package(secp256k1 REQUIRED)
 
 # Shim library
+#
+# For 3.1.2 compatibility the shim needs symbols from rippled's xrpld tree
+# (Application, HashRouter, LoadFeeTrack, OrderBookDB). 3.1.2's cmake does
+# NOT produce a standalone libxrpld.a — xrpld sources are compiled directly
+# into the rippled executable target in RippledCore.cmake. We work around
+# that by globbing all xrpld/*.cpp and compiling them as part of our shim
+# library. This keeps the rippled build config unchanged (-Dxrpld=OFF).
+file(GLOB_RECURSE xrpld_sources CONFIGURE_DEPENDS
+    "${RIPPLED_SRC_DIR}/src/xrpld/*.cpp"
+)
+# Exclude the rippled main entrypoint (Main.cpp defines main() which would
+# conflict with live_viewer's main).
+list(FILTER xrpld_sources EXCLUDE REGEX "/src/xrpld/app/main/Main\\.cpp$")
+
 add_library(xrpl_shim STATIC
     xrpl_shim.cpp
-    MinimalServiceRegistry.cpp
+    MinimalApp.cpp
     CallbackReadView.cpp
     MutationCollector.cpp
+    ${xrpld_sources}
 )
 target_include_directories(xrpl_shim PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${RIPPLED_SRC_DIR}/include
+    ${RIPPLED_SRC_DIR}/src        # for <xrpld/...> headers
     ${RIPPLED_BUILD_DIR}/proto
     ${RIPPLED_BUILD_DIR}/libxrpl
+)
+target_compile_definitions(xrpl_shim PUBLIC
+    BOOST_ASIO_DISABLE_CONCEPTS  # rippled disables this, we must match
 )
 target_link_libraries(xrpl_shim PUBLIC
     ${RIPPLED_BUILD_DIR}/libxrpl.a
