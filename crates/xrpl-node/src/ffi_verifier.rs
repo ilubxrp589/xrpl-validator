@@ -142,6 +142,7 @@ impl FfiVerifier {
         let matched = ours == net;
 
         if !matched {
+            let seq = self.stats.lock().round_ledger_seq;
             eprintln!("[ffi-shadow] MISMATCH ledger #{seq}: overlay keys: {}  ours: {}  network: {}", overlay.len(), &ours[..16], &net[..16]);
             // Diagnostic: dump first 3 overlay keys + data length for investigation
             let mut count = 0;
