@@ -129,11 +129,9 @@ pub async fn start_ws_sync(
                 }
 
                 for process_seq in start_seq..=closed_seq {
-                    let account_hash = if process_seq == closed_seq {
-                        fetch_account_hash(&rpc, process_seq).await.unwrap_or_default()
-                    } else {
-                        String::new()
-                    };
+                    // Fetch account_hash for EVERY ledger so every one can be
+                    // hash-verified (not just the latest in a gap-fill batch).
+                    let account_hash = fetch_account_hash(&rpc, process_seq).await.unwrap_or_default();
 
                     acc_modified.clear();
                     acc_deleted.clear();
