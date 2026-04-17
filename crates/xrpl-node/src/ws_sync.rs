@@ -316,8 +316,10 @@ pub async fn start_ws_sync(
                         break;
                     }
 
-                    // Only hash-check the last ledger in the batch — gap ledgers use fast path
-                    let compute_hash = process_seq == closed_seq;
+                    // Hash-check EVERY ledger (gap or tip). Validation count requires it,
+                    // and root recompute is only ~50ms per ledger (dirty-bucket parallel).
+                    let compute_hash = true;
+                    let _ = closed_seq;
                     let result = process_ledger(
                         &rpc, &db, &hash_comp,
                         process_seq, &acc_modified, &acc_deleted,
@@ -738,6 +740,7 @@ async fn process_ledger(
         hash_comp.invalidate_tree();
         return false;
     }
+    let fetch_ms = ledger_start.elapsed().as_millis() as u64;
 
     // Atomic write to RocksDB
     let mut batch = rocksdb::WriteBatch::default();
@@ -797,7 +800,10 @@ async fn process_ledger(
                     });
                 }
                 if matched {
-                    eprintln!("[ws-sync] #{seq}: MATCH ({tx_count} txs, {} objs)", fetched_data.len());
+                    let total_ms = ledger_start.elapsed().as_millis() as u64;
+                    let hash_ms = total_ms.saturating_sub(fetch_ms);
+                    eprintln!("[ws-sync] #{seq}: MATCH ({tx_count} txs, {} objs) fetch={}ms hash+write={}ms total={}ms",
+                        fetched_data.len(), fetch_ms, hash_ms, total_ms);
                 } else {
                     eprintln!("[ws-sync] #{seq}: MISMATCH ({tx_count} txs) — logging and moving on (shadow diff will capture root cause)");
                     return false;
