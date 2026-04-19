@@ -56,6 +56,21 @@ typedef bool (*XrplSleLookupFn)(
 );
 
 /* ============================================================
+ * Callback for succ() — directory traversal (Rust side provides this)
+ *
+ * Called by C++ when it needs the next key AFTER `key` in sorted order.
+ * Returns true if a successor was found and writes it to out_succ_key.
+ * If `last_key` is non-NULL, only return keys <= last_key.
+ * ============================================================ */
+
+typedef bool (*XrplSuccFn)(
+    void *user_data,
+    const uint8_t key[32],
+    const uint8_t *last_key,    /* NULL if no upper bound */
+    uint8_t out_succ_key[32]
+);
+
+/* ============================================================
  * Engine lifecycle
  *
  * Create once at startup. Holds: HashRouter, LoadFeeTrack, ServiceRegistry.
@@ -255,7 +270,9 @@ XrplApplyResult *xrpl_apply_with_mutations(
     uint32_t apply_flags,
     uint32_t network_id,
     XrplSleLookupFn lookup_fn,
-    void *lookup_user_data
+    void *lookup_user_data,
+    XrplSuccFn succ_fn,
+    void *succ_user_data
 );
 
 int64_t xrpl_result_drops_destroyed(const XrplApplyResult *result);

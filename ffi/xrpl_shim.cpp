@@ -327,7 +327,9 @@ XrplApplyResult *xrpl_apply_with_mutations(
     uint32_t apply_flags,
     uint32_t network_id,
     XrplSleLookupFn lookup_fn,
-    void *lookup_user_data) {
+    void *lookup_user_data,
+    XrplSuccFn succ_fn,
+    void *succ_user_data) {
     auto *result = new XrplApplyResult{};
     try {
         ripple::SerialIter sit(tx_bytes, tx_len);
@@ -361,8 +363,15 @@ XrplApplyResult *xrpl_apply_with_mutations(
                 return lookup_fn(lookup_user_data, key.data(), out_data, out_len);
             };
 
+        ripple::SleSuccCallback cpp_succ;
+        if (succ_fn) {
+            cpp_succ = [succ_fn, succ_user_data](ripple::uint256 const& key, ripple::uint256 const* last, ripple::uint256& out) -> bool {
+                return succ_fn(succ_user_data, key.data(), last ? last->data() : nullptr, out.data());
+            };
+        }
+
         auto read_view = std::make_shared<ripple::CallbackReadView>(
-            header, rules, fees, /*open=*/true, cpp_lookup);
+            header, rules, fees, /*open=*/true, cpp_lookup, cpp_succ);
         ripple::OpenView open_view(ripple::open_ledger, rules, read_view);
 
         ripple::MinimalApp app(network_id);

@@ -27,6 +27,15 @@ using SleLookupCallback = std::function<bool(
     uint8_t const** out_data,
     size_t* out_len)>;
 
+/** Callback for succ() — find the next key strictly greater than `key`.
+ *  If `last` is non-null, only return keys <= *last.
+ *  Returns true and fills out_key if found, false if no successor.
+ */
+using SleSuccCallback = std::function<bool(
+    uint256 const& key,
+    uint256 const* last,
+    uint256& out_key)>;
+
 class CallbackReadView : public ReadView
 {
 public:
@@ -35,7 +44,8 @@ public:
         Rules const& rules,
         Fees const& fees,
         bool open,
-        SleLookupCallback lookup);
+        SleLookupCallback lookup,
+        SleSuccCallback succ = {});
 
     ~CallbackReadView() override = default;
 
@@ -79,6 +89,7 @@ private:
     Fees fees_;
     bool open_;
     SleLookupCallback lookup_;
+    SleSuccCallback succ_;
 };
 
 }  // namespace ripple

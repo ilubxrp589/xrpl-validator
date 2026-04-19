@@ -35,6 +35,16 @@ pub type SleLookupFn = unsafe extern "C" fn(
     out_len: *mut usize,
 ) -> bool;
 
+/// Succ callback: called by C++ for directory traversal (finding the next key
+/// strictly greater than `key`). If `last_key` is non-null, only return keys
+/// <= last_key. Writes successor into `out_succ_key[32]`, returns true if found.
+pub type SuccFn = unsafe extern "C" fn(
+    user_data: *mut c_void,
+    key: *const u8,       // [u8; 32]
+    last_key: *const u8,  // [u8; 32] or null
+    out_succ_key: *mut u8, // [u8; 32]
+) -> bool;
+
 #[link(name = "xrpl_shim", kind = "static")]
 extern "C" {
     pub fn xrpl_shim_version() -> *const c_char;
@@ -78,6 +88,8 @@ extern "C" {
         network_id: u32,
         lookup_fn: SleLookupFn,
         lookup_user_data: *mut c_void,
+        succ_fn: SuccFn,
+        succ_user_data: *mut c_void,
     ) -> *mut XrplApplyResult;
 
     pub fn xrpl_result_ter(result: *const XrplApplyResult) -> i32;
@@ -255,6 +267,11 @@ impl ApplyOutcome {
 /// valid for the duration of the apply() call.
 pub trait SleProvider {
     fn read(&self, key: &[u8; 32]) -> Option<&[u8]>;
+    /// Find the next key strictly greater than `key`. If `last` is Some,
+    /// only return keys <= last. Used for directory traversal.
+    fn succ(&self, _key: &[u8; 32], _last: Option<&[u8; 32]>) -> Option<[u8; 32]> {
+        None // default: no traversal support
+    }
 }
 
 /// Apply a transaction via libxrpl's full tx engine.
@@ -290,6 +307,31 @@ pub fn apply_with_mutations<P: SleProvider>(
         }
     }
 
+    unsafe extern "C" fn succ_trampoline<P: SleProvider>(
+        user_data: *mut c_void,
+        key_ptr: *const u8,
+        last_ptr: *const u8,
+        out_succ: *mut u8,
+    ) -> bool {
+        let provider = unsafe { &*(user_data as *const P) };
+        let mut key = [0u8; 32];
+        unsafe { std::ptr::copy_nonoverlapping(key_ptr, key.as_mut_ptr(), 32) };
+        let last = if last_ptr.is_null() {
+            None
+        } else {
+            let mut l = [0u8; 32];
+            unsafe { std::ptr::copy_nonoverlapping(last_ptr, l.as_mut_ptr(), 32) };
+            Some(l)
+        };
+        match provider.succ(&key, last.as_ref()) {
+            Some(found) => {
+                unsafe { std::ptr::copy_nonoverlapping(found.as_ptr(), out_succ, 32) };
+                true
+            }
+            None => false,
+        }
+    }
+
     let amendments_flat: Vec<u8> = amendments.iter().flatten().copied().collect();
     let amendments_ptr = if amendments_flat.is_empty() {
         std::ptr::null()
@@ -313,6 +355,8 @@ pub fn apply_with_mutations<P: SleProvider>(
             apply_flags,
             network_id,
             trampoline::<P>,
+            provider as *const P as *mut c_void,
+            succ_trampoline::<P>,
             provider as *const P as *mut c_void,
         )
     };

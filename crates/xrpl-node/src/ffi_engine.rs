@@ -296,6 +296,11 @@ impl OwnedSnapshot {
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, rocksdb::Error> {
         self.snapshot.get(key)
     }
+
+    /// Iterator for succ() — find the next key after a given position.
+    pub fn iterator(&self, mode: rocksdb::IteratorMode) -> rocksdb::DBIteratorWithThreadMode<'_, rocksdb::DB> {
+        self.snapshot.iterator(mode)
+    }
 }
 
 /// Three-tier SLE provider: overlay (in-ledger mutations) → OwnedSnapshot
@@ -364,6 +369,26 @@ impl<'a> SleProvider for OverlayedDbProvider<'a> {
         // 3. RPC fallback (unsynced SLE, or DB was never populated with it)
         self.rpc_fallbacks.fetch_add(1, Ordering::Relaxed);
         self.rpc_fallback.read(key)
+    }
+
+    fn succ(&self, key: &[u8; 32], last: Option<&[u8; 32]>) -> Option<[u8; 32]> {
+        // Use the RocksDB snapshot iterator to find the next key > key
+        let iter = self.snapshot.iterator(rocksdb::IteratorMode::From(key, rocksdb::Direction::Forward));
+        for item in iter {
+            if let Ok((k, _)) = item {
+                if k.len() != 32 { continue; }
+                // Must be strictly greater than key
+                if k.as_ref() <= key.as_slice() { continue; }
+                // Check upper bound
+                if let Some(last_key) = last {
+                    if k.as_ref() > last_key.as_slice() { return None; }
+                }
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&k);
+                return Some(out);
+            }
+        }
+        None
     }
 }
 

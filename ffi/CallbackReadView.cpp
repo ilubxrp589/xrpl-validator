@@ -14,12 +14,14 @@ CallbackReadView::CallbackReadView(
     Rules const& rules,
     Fees const& fees,
     bool open,
-    SleLookupCallback lookup)
+    SleLookupCallback lookup,
+    SleSuccCallback succ)
     : header_(header)
     , rules_(rules)
     , fees_(fees)
     , open_(open)
     , lookup_(std::move(lookup))
+    , succ_(std::move(succ))
 {
 }
 
@@ -53,11 +55,16 @@ CallbackReadView::read(Keylet const& k) const
 
 std::optional<ReadView::key_type>
 CallbackReadView::succ(
-    key_type const& /*key*/,
-    std::optional<key_type> const& /*last*/) const
+    key_type const& key,
+    std::optional<key_type> const& last) const
 {
-    // succ() is used for directory iteration. Payment XRP doesn't need it.
-    // Return nullopt = "no successor" (end of iteration).
+    if (!succ_)
+        return std::nullopt;
+
+    uint256 out;
+    bool found = succ_(key, last ? &*last : nullptr, out);
+    if (found)
+        return out;
     return std::nullopt;
 }
 
