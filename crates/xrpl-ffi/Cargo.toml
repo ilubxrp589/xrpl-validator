@@ -3,7 +3,7 @@ name = "xrpl-ffi"
 version = "0.1.0"
 edition = "2021"
 description = "Rust FFI bindings to libxrpl (rippled's C++ tx engine via our shim)"
-license = "MIT"
+license = "LicenseRef-Proprietary"
 
 [lib]
 crate-type = ["rlib"]

@@ -1,8 +1,9 @@
-//! State hash computation — flat 256-bucket hasher with dirty tracking.
+//! State hash computation — flat 65536-bucket hasher with dirty tracking.
 //!
-//! Maintains 256 sorted Vec<(key, leaf_hash)> buckets indexed by key[0].
+//! Maintains 65536 sorted Vec<(key, leaf_hash)> buckets indexed by key[0..2]
+//! (the first 2 bytes of each key = depth-4 position in the SHAMap trie).
 //! Only dirty buckets are recomputed each round via rayon parallelism.
-//! Proven correct: same compute_subtree algorithm as the 28k-match run.
+//! Proven correct against mainnet account_hash (see docs/TEST_COVERAGE.md).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

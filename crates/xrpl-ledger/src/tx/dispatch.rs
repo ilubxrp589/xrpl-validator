@@ -2,6 +2,19 @@
 //!
 //! Routes decoded transactions to the correct Transactor implementation
 //! based on TransactionType string.
+//!
+//! # DEAD CODE WARNING
+//!
+//! This module is **not called** by the live validator. Production transaction
+//! application is delegated to rippled's C++ engine via FFI — see
+//! `crates/xrpl-ffi/src/lib.rs` and `crates/xrpl-node/src/ffi_engine.rs`.
+//!
+//! This code is retained as a reference implementation / learning artifact.
+//! Tests in this module prove the code works in isolation; they do NOT prove
+//! the validator is correct.
+//!
+//! If you are adding a new amendment or tx type: add it to the FFI path,
+//! not here. See `ffi/ARCHITECTURE.md` for the architectural decision record.
 
 use super::account::{AccountDeleteTransactor, AccountSetTransactor};
 use super::amm::{

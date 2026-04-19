@@ -1,3 +1,7 @@
+# This is the authoritative build for the xrpl_shim static library.
+# The old ffi/Makefile has been removed (it didn't produce the artifact
+# that crates/xrpl-ffi/build.rs expects). Build with:
+#   cmake -B build && cmake --build build
 cmake_minimum_required(VERSION 3.22)
 project(xrpl_shim CXX)
 
