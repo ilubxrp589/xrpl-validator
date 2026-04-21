@@ -12,21 +12,31 @@ shouldn't be here.
 
 ## Known issues — in flight (as of 2026-04-21)
 
-These are real, acknowledged, and being worked. Posted here first so no
-reader has to piece them together from commits.
+A third-party audit of this repo delivered **1 SEV-1** and **4 SEV-2**
+findings that remain open. Those are being addressed through the VALAUDIT
+integration track (10 phases; Phase 1 + 2 complete).
 
-| Finding | Severity | Status |
+**Following responsible-disclosure practice, specific attack-surface
+details for unfixed findings are not published here.** Summary only:
+
+| Area | Severity | Track |
 |---|---|---|
-| README overclaims "no code from rippled" — it's hybrid Rust + libxrpl FFI | SEV-1 | Rewrite queued as VALAUDIT Phase 10 |
-| Validation signing not gated on independent verification (`live_viewer.rs:1182-1206` signs network hash regardless) | SEV-2 | VALAUDIT Phase 3 next |
-| UNL publisher signature not verified (`unl_fetch.rs::fetch_unl`) | SEV-2 | VALAUDIT Phase 6 |
-| Validator seed written with default umask; permission check only warns | SEV-2 | VALAUDIT Phase 4 |
-| Master + signing keys derived from same 16-byte seed (`peer/identity.rs:49-62`) | SEV-2 | VALAUDIT Phase 9 — biggest single piece |
-| `state.rocks` completeness gap — some owner-dir-referenced SLEs missing after bulk_sync | — | Narrow retry fix shipped (commit `6dd8f22`); proactive sweeper still pending |
-| `LayeredProvider::succ()` + `RpcProvider::succ()` return `None` unconditionally (test-only path; production uses `OverlayedDbProvider`) | — | Separate card — needs RPC directory-walk helper |
+| README / docs accuracy (architecture described as pure-Rust; actually hybrid with libxrpl FFI) | SEV-1 | VALAUDIT Phase 10 |
+| Signing path credibility — validator signs the network-reported hash without strictly gating on local independent verification | SEV-2 | VALAUDIT Phase 3 (next) |
+| UNL publisher signature verification missing for the vl.* feeds | SEV-2 | VALAUDIT Phase 6 |
+| Seed file handling — permission enforcement and atomic-create hygiene | SEV-2 | VALAUDIT Phase 4 |
+| Key model — master + signing material separation / rotation workflow | SEV-2 | VALAUDIT Phase 9 |
 
-Third-party audit: 24 findings files at `audit/` (if copied in) or USB
-ENFAIN. SEV-1 and SEV-2 items above are from `audit/00_EXECUTIVE_SUMMARY.md`.
+Non-security items, safe to detail:
+
+| Finding | Status |
+|---|---|
+| `state.rocks` completeness gap — some owner-dir-referenced SLEs missing after bulk_sync | Narrow retry fix shipped (commit `6dd8f22`); proactive sweeper pending |
+| `LayeredProvider::succ()` + `RpcProvider::succ()` return `None` (test-only path; production `OverlayedDbProvider` has working succ as of commit `69bc726`) | Separate card; needs RPC directory-walk helper |
+
+Full audit text is on offline media. Once each fix ships, the relevant
+finding will get a line-level writeup at disclosure time alongside the
+commit that closes it.
 
 ---
 
