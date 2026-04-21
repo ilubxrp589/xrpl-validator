@@ -372,23 +372,59 @@ impl<'a> SleProvider for OverlayedDbProvider<'a> {
     }
 
     fn succ(&self, key: &[u8; 32], last: Option<&[u8; 32]>) -> Option<[u8; 32]> {
-        // Use the RocksDB snapshot iterator to find the next key > key
-        let iter = self.snapshot.iterator(rocksdb::IteratorMode::From(key, rocksdb::Direction::Forward));
+        // Returns the smallest key strictly greater than `key` (and <= `last` if set)
+        // that exists in the EFFECTIVE post-overlay state. Considers both:
+        //   1. snapshot keys (pre-ledger), unless overlay-tombstoned
+        //   2. overlay-inserted/-modified keys (this-ledger mutations)
+        //
+        // The pre-fix version iterated only the snapshot, so when an earlier
+        // tx in the same ledger modified or deleted an SLE in a directory the
+        // current tx walks (Offer book traversal in particular), libxrpl saw
+        // a stale RocksDB neighbor and crossed wrong offers. See
+        // diagnostics from ledger 103,679,277 (3 cascade divergences).
+        let overlay = self.overlay.lock();
+
+        // Snapshot candidate: first snapshot key strictly > `key`, in bounds,
+        // and NOT overlay-tombstoned.
+        let mut snapshot_cand: Option<[u8; 32]> = None;
+        let iter = self.snapshot.iterator(
+            rocksdb::IteratorMode::From(key, rocksdb::Direction::Forward),
+        );
         for item in iter {
-            if let Ok((k, _)) = item {
-                if k.len() != 32 { continue; }
-                // Must be strictly greater than key
-                if k.as_ref() <= key.as_slice() { continue; }
-                // Check upper bound
-                if let Some(last_key) = last {
-                    if k.as_ref() > last_key.as_slice() { return None; }
-                }
-                let mut out = [0u8; 32];
-                out.copy_from_slice(&k);
-                return Some(out);
+            let (k, _) = match item {
+                Ok(kv) => kv,
+                Err(_) => continue,
+            };
+            if k.len() != 32 { continue; }
+            if k.as_ref() <= key.as_slice() { continue; }
+            if let Some(last_key) = last {
+                if k.as_ref() > last_key.as_slice() { break; }
             }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&k);
+            // Skip if the overlay deleted this SLE in the current ledger.
+            if matches!(overlay.get(&arr), Some(None)) { continue; }
+            snapshot_cand = Some(arr);
+            break;
         }
-        None
+
+        // Overlay candidate: smallest overlay key with Some(_) value that is
+        // strictly > `key` (and <= `last` if set). This catches SLEs inserted
+        // or modified in the current ledger that are NOT in the snapshot.
+        let overlay_cand: Option<[u8; 32]> = overlay
+            .iter()
+            .filter(|(_, v)| v.is_some())
+            .map(|(k, _)| *k)
+            .filter(|k| k.as_slice() > key.as_slice())
+            .filter(|k| last.map_or(true, |lk| k.as_slice() <= lk.as_slice()))
+            .min();
+
+        match (snapshot_cand, overlay_cand) {
+            (None, None) => None,
+            (Some(s), None) => Some(s),
+            (None, Some(o)) => Some(o),
+            (Some(s), Some(o)) => Some(if o < s { o } else { s }),
+        }
     }
 }
 
@@ -1536,5 +1572,75 @@ mod tests {
             // Arc clone, so the DB stays alive.
         };
         assert_eq!(snap.get(b"scoped_key").unwrap(), Some(b"scoped_val".to_vec()));
+    }
+
+    /// Pad an arbitrary byte to a 32-byte hash key (zero-padded on the right).
+    /// Used by succ() tests to construct deterministic keys with known ordering.
+    fn k(byte: u8) -> [u8; 32] {
+        let mut arr = [0u8; 32];
+        arr[0] = byte;
+        arr
+    }
+
+    /// OverlayedDbProvider::succ() must consult the overlay, not just the
+    /// snapshot. Regression for the prod cascade bug observed in ledger
+    /// 103,679,277 where 3 OfferCancel/Create txs diverged because succ()
+    /// returned the stale RocksDB neighbor of a directory that an earlier tx
+    /// in the same ledger had just modified.
+    #[test]
+    fn overlay_succ_skips_tombstone_and_surfaces_inserts() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use parking_lot::Mutex;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(rocksdb::DB::open_default(tmp.path()).unwrap());
+        // Snapshot holds keys [0x10, 0x20, 0x30, 0x40, 0x50].
+        for b in [0x10u8, 0x20, 0x30, 0x40, 0x50] {
+            db.put(k(b), b"snap").unwrap();
+        }
+        let snap = OwnedSnapshot::new(db);
+        // RPC fallback: never called by succ(), but required by constructor.
+        let rpc = RpcProvider::new("http://127.0.0.1:1".to_string(), 0);
+
+        // Overlay:
+        //   0x20 → tombstone (deleted this ledger)
+        //   0x25 → insert (new SLE not in snapshot)
+        //   0x40 → modified (still exists, same key)
+        let mut overlay_map: HashMap<[u8; 32], Option<Vec<u8>>> = HashMap::new();
+        overlay_map.insert(k(0x20), None);                  // tombstone
+        overlay_map.insert(k(0x25), Some(b"new".to_vec())); // insert
+        overlay_map.insert(k(0x40), Some(b"mod".to_vec())); // modified
+        let overlay = Mutex::new(overlay_map);
+
+        let provider = OverlayedDbProvider::new(&overlay, &snap, &rpc);
+
+        // succ(0x10) → 0x25 (overlay insert wins over snapshot's 0x20 because 0x20 is tombstoned).
+        assert_eq!(provider.succ(&k(0x10), None), Some(k(0x25)),
+            "succ should skip tombstoned 0x20 and surface overlay-inserted 0x25");
+
+        // succ(0x25) → 0x30 (next snapshot key, overlay 0x40 is later).
+        assert_eq!(provider.succ(&k(0x25), None), Some(k(0x30)),
+            "succ should return next snapshot key when no closer overlay key exists");
+
+        // succ(0x30) → 0x40 (snapshot AND overlay both have 0x40 — same key wins).
+        assert_eq!(provider.succ(&k(0x30), None), Some(k(0x40)),
+            "succ should return 0x40 once (snapshot and overlay agree on this key)");
+
+        // succ(0x40) → 0x50 (only snapshot has 0x50).
+        assert_eq!(provider.succ(&k(0x40), None), Some(k(0x50)),
+            "succ should fall through to next snapshot key after 0x40");
+
+        // succ(0x50) → None (no more keys).
+        assert_eq!(provider.succ(&k(0x50), None), None,
+            "succ at the last key should return None");
+
+        // Bound: succ(0x10, last=0x20) → None (0x25 exceeds bound; 0x20 is tombstoned).
+        assert_eq!(provider.succ(&k(0x10), Some(&k(0x20))), None,
+            "succ with last=0x20 must respect upper bound (0x25 > 0x20, 0x20 is tombstoned)");
+
+        // Bound: succ(0x10, last=0x30) → 0x25 (insert is in window).
+        assert_eq!(provider.succ(&k(0x10), Some(&k(0x30))), Some(k(0x25)),
+            "succ with last=0x30 should still find the overlay-inserted 0x25");
     }
 }
