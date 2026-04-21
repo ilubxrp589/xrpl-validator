@@ -813,6 +813,24 @@ pub fn scan_sequence_in_account_root(data: &[u8]) -> Option<u32> {
     None
 }
 
+/// Parse the missing-SLE key out of a `tefBAD_LEDGER` fatal message from
+/// libxrpl's `DeleteAccount` path. Looks for the literal
+/// `"has index to object that is missing: "` marker followed by 64 hex chars.
+///
+/// Used by the tefBAD_LEDGER recovery path in `apply_ledger_in_order` to
+/// close state.rocks completeness gaps on demand.
+pub fn parse_missing_index_from_fatal(fatal: &str) -> Option<[u8; 32]> {
+    const MARKER: &str = "has index to object that is missing: ";
+    let pos = fatal.find(MARKER)?;
+    let hex_start = pos + MARKER.len();
+    let hex_str = fatal.get(hex_start..hex_start + 64)?;
+    let bytes = hex::decode(hex_str).ok()?;
+    if bytes.len() != 32 { return None; }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Some(arr)
+}
+
 pub fn extract_fee_drops(tx_bytes: &[u8]) -> Option<u64> {
     if tx_bytes.len() < 9 {
         return None;
@@ -1086,7 +1104,7 @@ pub fn apply_ledger_in_order(
             let provider = LayeredProvider::new(&overlay, &fallback);
             xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, 0)
         };
-        let outcome = match outcome_opt {
+        let mut outcome = match outcome_opt {
             Some(o) => o,
             None => {
                 let mut s = stats.lock();
@@ -1106,7 +1124,7 @@ pub fn apply_ledger_in_order(
         let should_thread = outcome.ter_name == "tesSUCCESS"
             || outcome.ter_name.starts_with("tec");
         let prior_overlay_size;
-        let post_overlay_size;
+        let mut post_overlay_size;
         {
             let mut ov = overlay.lock();
             prior_overlay_size = ov.len();
@@ -1124,6 +1142,73 @@ pub fn apply_ledger_in_order(
                 }
             }
             post_overlay_size = ov.len();
+        }
+        // tefBAD_LEDGER recovery: AccountDelete walks the deleted account's
+        // owner directory and hits an SLE key that's missing from state.rocks
+        // (bulk_sync/ws_sync completeness gap). Parse the missing key from the
+        // fatal message, fetch it via RPC at ledger_seq-1 (pre-ledger state),
+        // inject into overlay, and retry apply. If the retry succeeds, we also
+        // eliminate downstream cascade failures (Payment terPRE_SEQ etc.) from
+        // accounts whose state mainnet mutated as part of this AccountDelete.
+        //
+        // 100% of observed Payment terPRE_SEQ divergences correlate with an
+        // AccountDelete tefBAD_LEDGER in the same ledger — see m3060 log
+        // analysis 2026-04-21.
+        if outcome.ter_name == "tefBAD_LEDGER" {
+            if let Some(missing_key) = parse_missing_index_from_fatal(&outcome.last_fatal) {
+                let repair = RpcProvider::with_endpoints(
+                    rpc_urls.to_vec(),
+                    ledger_seq.saturating_sub(1),
+                );
+                if let Some(data) = repair.read(&missing_key) {
+                    overlay.lock().insert(missing_key, Some(data.to_vec()));
+                    eprintln!(
+                        "[ffi] tefBAD_LEDGER recovery: injected missing SLE {}… ({} bytes) at #{ledger_seq}; retrying",
+                        &hex::encode_upper(&missing_key)[..16],
+                        data.len(),
+                    );
+                    // Retry with the missing SLE now in the overlay.
+                    let retry_opt = if let Some(snap) = db_snapshot {
+                        let provider = OverlayedDbProvider::new(&overlay, snap, &fallback);
+                        xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, 0)
+                    } else {
+                        let provider = LayeredProvider::new(&overlay, &fallback);
+                        xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, 0)
+                    };
+                    if let Some(retry) = retry_opt {
+                        let upgraded = retry.ter_name == "tesSUCCESS"
+                            || retry.ter_name.starts_with("tec");
+                        if upgraded {
+                            // Thread retry mutations (the original apply didn't, since it
+                            // failed with tefBAD_LEDGER before reaching should_thread).
+                            let mut ov = overlay.lock();
+                            for m in &retry.mutations {
+                                match m.kind {
+                                    xrpl_ffi::MutationKind::Deleted => { ov.insert(m.key, None); }
+                                    _ => { ov.insert(m.key, Some(m.data.clone())); }
+                                }
+                            }
+                            post_overlay_size = ov.len();
+                            drop(ov);
+                            eprintln!(
+                                "[ffi] tefBAD_LEDGER recovery SUCCESS: {} -> {} ({} mutations)",
+                                outcome.ter_name, retry.ter_name, retry.mutations.len(),
+                            );
+                            outcome = retry;
+                        } else {
+                            eprintln!(
+                                "[ffi] tefBAD_LEDGER recovery: retry still failed ({}) — dir likely has more missing entries",
+                                retry.ter_name,
+                            );
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "[ffi] tefBAD_LEDGER recovery: RPC fetch of {}… returned nothing",
+                        &hex::encode_upper(&missing_key)[..16],
+                    );
+                }
+            }
         }
         // terPRE_SEQ recovery: sender's sequence in overlay is stale because
         // a prior tx from the same sender had a failure path that didn't
@@ -1642,5 +1727,36 @@ mod tests {
         // Bound: succ(0x10, last=0x30) → 0x25 (insert is in window).
         assert_eq!(provider.succ(&k(0x10), Some(&k(0x30))), Some(k(0x25)),
             "succ with last=0x30 should still find the overlay-inserted 0x25");
+    }
+
+    /// `parse_missing_index_from_fatal` extracts the 32-byte missing SLE key
+    /// from the fatal message libxrpl emits when `DeleteAccount` walks an
+    /// owner directory and hits an SLE that isn't in state.rocks.
+    #[test]
+    fn parse_missing_index_from_fatal_happy_path() {
+        let fatal = "DeleteAccount: directory node in ledger 103695758 has index to object that is missing: 1649C380CE939B445324CD83A577B4FB60483728820E3AEDBF070C7690B4F81B";
+        let got = parse_missing_index_from_fatal(fatal).expect("should parse");
+        assert_eq!(hex::encode_upper(got), "1649C380CE939B445324CD83A577B4FB60483728820E3AEDBF070C7690B4F81B");
+    }
+
+    #[test]
+    fn parse_missing_index_from_fatal_rejects_junk() {
+        // No marker → None.
+        assert!(parse_missing_index_from_fatal("random error text").is_none());
+        // Marker present but truncated hex → None.
+        assert!(parse_missing_index_from_fatal("... has index to object that is missing: DEADBEEF").is_none());
+        // Marker present but non-hex → None.
+        assert!(parse_missing_index_from_fatal(
+            "... has index to object that is missing: ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"
+        ).is_none());
+    }
+
+    #[test]
+    fn parse_missing_index_from_fatal_handles_trailing_text() {
+        // Real fatal strings may have text after the hex key; we should still pick up
+        // exactly 64 hex chars and ignore whatever follows.
+        let fatal = "foo has index to object that is missing: 0ADA4CCBD57B83A9522F1C96B4C8AA6422E84128DC51AB76285033075AE2CD6C (from owner dir walk)";
+        let got = parse_missing_index_from_fatal(fatal).expect("should parse with trailing text");
+        assert_eq!(hex::encode_upper(got), "0ADA4CCBD57B83A9522F1C96B4C8AA6422E84128DC51AB76285033075AE2CD6C");
     }
 }
