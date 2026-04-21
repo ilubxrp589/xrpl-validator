@@ -1145,69 +1145,117 @@ pub fn apply_ledger_in_order(
         }
         // tefBAD_LEDGER recovery: AccountDelete walks the deleted account's
         // owner directory and hits an SLE key that's missing from state.rocks
-        // (bulk_sync/ws_sync completeness gap). Parse the missing key from the
-        // fatal message, fetch it via RPC at ledger_seq-1 (pre-ledger state),
-        // inject into overlay, and retry apply. If the retry succeeds, we also
-        // eliminate downstream cascade failures (Payment terPRE_SEQ etc.) from
-        // accounts whose state mainnet mutated as part of this AccountDelete.
+        // (bulk_sync/ws_sync completeness gap). Loop: parse missing key, RPC-
+        // fetch at ledger_seq-1, inject into overlay, retry. Keep looping as
+        // long as retry returns tefBAD_LEDGER with a NEW missing key — an
+        // AccountDelete can reference several missing SLEs (NFTokenOffer, Offer,
+        // RippleState). Bounded by MAX_ITERATIONS and same-key detection.
         //
-        // 100% of observed Payment terPRE_SEQ divergences correlate with an
+        // 100% of observed Payment terPRE_SEQ divergences correlated with an
         // AccountDelete tefBAD_LEDGER in the same ledger — see m3060 log
-        // analysis 2026-04-21.
+        // analysis 2026-04-21. The single-try version (69bc726) dropped the
+        // rate ~80x but left multi-missing-SLE AccountDeletes unrecovered.
         if outcome.ter_name == "tefBAD_LEDGER" {
-            if let Some(missing_key) = parse_missing_index_from_fatal(&outcome.last_fatal) {
+            const MAX_ITERATIONS: u32 = 20;
+            let mut iter_count = 0u32;
+            let mut last_missing_key: Option<[u8; 32]> = None;
+            let mut injected_count = 0u32;
+
+            while iter_count < MAX_ITERATIONS {
+                iter_count += 1;
+
+                let missing_key = match parse_missing_index_from_fatal(&outcome.last_fatal) {
+                    Some(k) => k,
+                    None => break, // unparseable fatal (different error shape)
+                };
+
+                // Detect stuck loop — if the SAME missing key comes back, the
+                // prior fetch+inject didn't help (RPC may have returned bad bytes
+                // or libxrpl is complaining about something else). Give up.
+                if Some(missing_key) == last_missing_key {
+                    eprintln!(
+                        "[ffi] tefBAD_LEDGER recovery: loop stuck on same missing key {}… (iter {}); giving up",
+                        &hex::encode_upper(&missing_key)[..16],
+                        iter_count,
+                    );
+                    break;
+                }
+                last_missing_key = Some(missing_key);
+
                 let repair = RpcProvider::with_endpoints(
                     rpc_urls.to_vec(),
                     ledger_seq.saturating_sub(1),
                 );
-                if let Some(data) = repair.read(&missing_key) {
-                    overlay.lock().insert(missing_key, Some(data.to_vec()));
-                    eprintln!(
-                        "[ffi] tefBAD_LEDGER recovery: injected missing SLE {}… ({} bytes) at #{ledger_seq}; retrying",
-                        &hex::encode_upper(&missing_key)[..16],
-                        data.len(),
-                    );
-                    // Retry with the missing SLE now in the overlay.
-                    let retry_opt = if let Some(snap) = db_snapshot {
-                        let provider = OverlayedDbProvider::new(&overlay, snap, &fallback);
-                        xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, 0)
-                    } else {
-                        let provider = LayeredProvider::new(&overlay, &fallback);
-                        xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, 0)
-                    };
-                    if let Some(retry) = retry_opt {
-                        let upgraded = retry.ter_name == "tesSUCCESS"
-                            || retry.ter_name.starts_with("tec");
-                        if upgraded {
-                            // Thread retry mutations (the original apply didn't, since it
-                            // failed with tefBAD_LEDGER before reaching should_thread).
-                            let mut ov = overlay.lock();
-                            for m in &retry.mutations {
-                                match m.kind {
-                                    xrpl_ffi::MutationKind::Deleted => { ov.insert(m.key, None); }
-                                    _ => { ov.insert(m.key, Some(m.data.clone())); }
-                                }
-                            }
-                            post_overlay_size = ov.len();
-                            drop(ov);
-                            eprintln!(
-                                "[ffi] tefBAD_LEDGER recovery SUCCESS: {} -> {} ({} mutations)",
-                                outcome.ter_name, retry.ter_name, retry.mutations.len(),
-                            );
-                            outcome = retry;
-                        } else {
-                            eprintln!(
-                                "[ffi] tefBAD_LEDGER recovery: retry still failed ({}) — dir likely has more missing entries",
-                                retry.ter_name,
-                            );
+                let data = match repair.read(&missing_key) {
+                    Some(d) => d.to_vec(),
+                    None => {
+                        eprintln!(
+                            "[ffi] tefBAD_LEDGER recovery: RPC fetch of {}… returned nothing (iter {})",
+                            &hex::encode_upper(&missing_key)[..16],
+                            iter_count,
+                        );
+                        break;
+                    }
+                };
+
+                overlay.lock().insert(missing_key, Some(data));
+                injected_count += 1;
+
+                let retry_opt = if let Some(snap) = db_snapshot {
+                    let provider = OverlayedDbProvider::new(&overlay, snap, &fallback);
+                    xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, 0)
+                } else {
+                    let provider = LayeredProvider::new(&overlay, &fallback);
+                    xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, 0)
+                };
+                let retry = match retry_opt {
+                    Some(r) => r,
+                    None => break, // null outcome, give up
+                };
+
+                let upgraded = retry.ter_name == "tesSUCCESS"
+                    || retry.ter_name.starts_with("tec");
+                if upgraded {
+                    // Thread retry mutations (the original apply was tefBAD_LEDGER
+                    // so should_thread was false and nothing threaded yet).
+                    let mut ov = overlay.lock();
+                    for m in &retry.mutations {
+                        match m.kind {
+                            xrpl_ffi::MutationKind::Deleted => { ov.insert(m.key, None); }
+                            _ => { ov.insert(m.key, Some(m.data.clone())); }
                         }
                     }
-                } else {
+                    post_overlay_size = ov.len();
+                    drop(ov);
                     eprintln!(
-                        "[ffi] tefBAD_LEDGER recovery: RPC fetch of {}… returned nothing",
-                        &hex::encode_upper(&missing_key)[..16],
+                        "[ffi] tefBAD_LEDGER recovery SUCCESS after {} iter(s), {} SLEs injected: {} -> {} ({} mutations)",
+                        iter_count, injected_count, outcome.ter_name, retry.ter_name, retry.mutations.len(),
                     );
+                    outcome = retry;
+                    break;
                 }
+
+                if retry.ter_name == "tefBAD_LEDGER" {
+                    // Same TER but potentially a DIFFERENT missing key. Update
+                    // outcome so next iter's parse sees the new fatal, loop.
+                    outcome = retry;
+                    continue;
+                }
+
+                // Some other TER — stop, don't keep poking.
+                eprintln!(
+                    "[ffi] tefBAD_LEDGER recovery: retry returned unexpected {} (iter {}) — stopping",
+                    retry.ter_name, iter_count,
+                );
+                outcome = retry;
+                break;
+            }
+
+            if iter_count >= MAX_ITERATIONS && outcome.ter_name == "tefBAD_LEDGER" {
+                eprintln!(
+                    "[ffi] tefBAD_LEDGER recovery: hit max {} iterations ({} SLEs injected), owner dir still incomplete",
+                    MAX_ITERATIONS, injected_count,
+                );
             }
         }
         // terPRE_SEQ recovery: sender's sequence in overlay is stale because
