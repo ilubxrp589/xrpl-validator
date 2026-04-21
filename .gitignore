@@ -47,6 +47,9 @@ ffi/*.a
 ffi/test_shim
 ffi/build/
 logs/
+# Exception: dashboard's /logs route (the progress/changelog page) is NOT runtime data
+!dashboard/app/logs/
+!dashboard/app/logs/**
 scripts/__pycache__/
 
 # Next.js build cache (only dashboard/ should run next; root .next is a leak)

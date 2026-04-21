@@ -1,6 +1,7 @@
 'use client';
 
-import { CheckCircle2, Radio, ExternalLink, Github, Share2 } from 'lucide-react';
+import { CheckCircle2, Radio, ExternalLink, Github, Share2, ScrollText } from 'lucide-react';
+import Link from 'next/link';
 import { useValidatorData } from '@/hooks/use-validator-data';
 import { fmt } from '@/lib/utils';
 
@@ -26,11 +27,14 @@ export function Navbar() {
   return (
     <header className="sticky top-0 z-50 h-14 border-b border-halcyon-border bg-halcyon-bg/80 backdrop-blur-md">
       <nav className="mx-auto flex h-full max-w-7xl items-center justify-between px-4">
-        {/* ---- Left: brand + domain badge ---- */}
+        {/* ---- Left: brand + domain badge + logs link ---- */}
         <div className="flex items-center gap-3">
-          <span className="font-headline text-lg font-bold tracking-tight text-halcyon-accent">
+          <Link
+            href="/"
+            className="font-headline text-lg font-bold tracking-tight text-halcyon-accent transition-colors hover:text-halcyon-accent/80"
+          >
             HALCYON XRPL
-          </span>
+          </Link>
           <a
             href="https://halcyon-names.io"
             target="_blank"
@@ -41,6 +45,14 @@ export function Navbar() {
             <span className="font-mono">halcyon-names.io</span>
             <ExternalLink className="h-3 w-3 text-halcyon-muted" />
           </a>
+          <Link
+            href="/logs"
+            className="hidden items-center gap-1.5 rounded-full border border-halcyon-border bg-halcyon-card px-2.5 py-0.5 text-xs text-halcyon-muted transition-colors hover:border-halcyon-accent/40 hover:text-halcyon-accent sm:flex"
+            aria-label="Progress log"
+          >
+            <ScrollText className="h-3 w-3" />
+            <span className="font-mono uppercase tracking-wider">Logs</span>
+          </Link>
         </div>
 
         {/* ---- Center: live status pill ---- */}
