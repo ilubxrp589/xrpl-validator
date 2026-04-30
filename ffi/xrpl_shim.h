@@ -282,6 +282,24 @@ int64_t xrpl_result_drops_destroyed(const XrplApplyResult *result);
  * to the result. */
 const char *xrpl_result_last_fatal(const XrplApplyResult *result);
 
+/* ============================================================
+ * Test entry — exercises CallbackReadView::read in isolation.
+ *
+ * Constructs a minimal CallbackReadView whose lookup callback returns
+ * `sle_bytes` for any key, then calls `view.read(Keylet{keylet_type, key})`.
+ * Returns true if read returned a non-null SLE.
+ *
+ * Used by the xrpl-ffi crate's regression test for the ltCHILD wildcard
+ * fix. The pre-fix shim returned nullptr whenever keylet_type didn't
+ * exactly match the parsed SLE type, which broke every directory walker
+ * that uses keylet::child(K) (= Keylet{ltCHILD, K}).
+ * ============================================================ */
+bool xrpl_test_callback_read(
+    uint16_t keylet_type,
+    const uint8_t key[32],
+    const uint8_t *sle_bytes,
+    size_t sle_len);
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

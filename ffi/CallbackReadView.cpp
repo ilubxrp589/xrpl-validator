@@ -44,8 +44,13 @@ CallbackReadView::read(Keylet const& k) const
     try {
         SerialIter sit(data, len);
         auto sle = std::make_shared<STLedgerEntry>(sit, k.key);
-        // Validate keylet type matches
-        if (k.type != ltANY && sle->getType() != k.type)
+        // Validate keylet type matches. ltCHILD is a wildcard used by
+        // directory walkers (AccountDelete::preclaim, owner_dir traversal)
+        // where the caller does not yet know the entry's concrete type and
+        // checks sle->getType() itself after read. Treating ltCHILD as a
+        // type-mismatch caused 100% of AccountDelete owner-dir reads to
+        // return nullptr → tefBAD_LEDGER, defeating the recovery loop.
+        if (k.type != ltANY && k.type != ltCHILD && sle->getType() != k.type)
             return nullptr;
         return sle;
     } catch (std::exception const&) {

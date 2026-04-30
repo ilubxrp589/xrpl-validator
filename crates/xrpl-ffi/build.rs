@@ -47,6 +47,14 @@ fn main() {
     println!("cargo:rustc-link-lib=pthread");
     println!("cargo:rustc-link-lib=dl");
     println!("cargo:rustc-link-lib=m");
+    // System OpenSSL (dynamic). Conan's copy is skipped above to avoid
+    // duplicate-symbol issues with cargo's openssl-sys, but rippled's
+    // HTTPClient.cpp still has SSL_CTX_* references that need resolving
+    // at the test-binary link step. live_viewer resolves these via
+    // openssl-sys; test binaries don't pull openssl-sys, so add the
+    // system libs here directly.
+    println!("cargo:rustc-link-lib=ssl");
+    println!("cargo:rustc-link-lib=crypto");
 
     // Rerun if shim changes
     println!("cargo:rerun-if-changed={}", build_dir.join("libxrpl_shim.a").display());

@@ -107,11 +107,42 @@ extern "C" {
         out_data_len: *mut usize,
     ) -> bool;
     pub fn xrpl_result_destroy(result: *mut XrplApplyResult);
+
+    pub fn xrpl_test_callback_read(
+        keylet_type: u16,
+        key: *const u8,         // [u8; 32]
+        sle_bytes: *const u8,
+        sle_len: usize,
+    ) -> bool;
 }
 
 // =========================================================================
 // Safe Rust wrappers
 // =========================================================================
+
+/// LedgerEntryType numeric values matching rippled's `LedgerFormats.h`.
+/// Used by `test_callback_read` to exercise the type-check in
+/// `CallbackReadView::read`.
+pub mod ledger_entry_type {
+    pub const ANY: u16 = 0x0000;
+    pub const ACCOUNT_ROOT: u16 = 0x0061;
+    pub const OFFER: u16 = 0x006F;
+    pub const CHILD: u16 = 0x1CD2;
+}
+
+/// Test helper: invokes `CallbackReadView::read(Keylet{keylet_type, key})`
+/// against an in-memory SLE consisting of `sle_bytes`. Returns true if read
+/// returned a non-null SLE. Regression-tests the ltCHILD wildcard fix.
+pub fn test_callback_read(keylet_type: u16, key: &[u8; 32], sle_bytes: &[u8]) -> bool {
+    unsafe {
+        xrpl_test_callback_read(
+            keylet_type,
+            key.as_ptr(),
+            sle_bytes.as_ptr(),
+            sle_bytes.len(),
+        )
+    }
+}
 
 /// libxrpl version we're linked against.
 pub fn libxrpl_version() -> String {

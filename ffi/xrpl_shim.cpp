@@ -402,4 +402,43 @@ XrplApplyResult *xrpl_apply_with_mutations(
     }
 }
 
+bool xrpl_test_callback_read(
+    uint16_t keylet_type,
+    const uint8_t key[32],
+    const uint8_t *sle_bytes,
+    size_t sle_len) {
+    try {
+        std::unordered_set<ripple::uint256, beast::uhash<>> presets;
+        ripple::Rules rules(presets);
+
+        ripple::LedgerHeader header;
+        header.seq = 0;
+        header.closeTimeResolution = ripple::NetClock::duration(10);
+
+        ripple::Fees fees;
+        fees.base = ripple::XRPAmount(static_cast<std::int64_t>(10));
+        fees.reserve = ripple::XRPAmount(static_cast<std::int64_t>(1'000'000));
+        fees.increment = ripple::XRPAmount(static_cast<std::int64_t>(200'000));
+
+        ripple::SleLookupCallback cpp_lookup =
+            [sle_bytes, sle_len](ripple::uint256 const&, uint8_t const** out_data, size_t* out_len) -> bool {
+                if (!sle_bytes || sle_len == 0) return false;
+                *out_data = sle_bytes;
+                *out_len = sle_len;
+                return true;
+            };
+        ripple::SleSuccCallback cpp_succ;  // null — read path doesn't need succ
+
+        ripple::CallbackReadView view(header, rules, fees, /*open=*/true, cpp_lookup, cpp_succ);
+
+        ripple::uint256 k;
+        std::memcpy(k.data(), key, 32);
+        ripple::Keylet keylet{static_cast<ripple::LedgerEntryType>(keylet_type), k};
+
+        return view.read(keylet) != nullptr;
+    } catch (...) {
+        return false;
+    }
+}
+
 }  // extern "C"
