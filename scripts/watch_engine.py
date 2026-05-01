@@ -91,6 +91,13 @@ def render():
             out.append(colored("    DIVERGED:", "1;31"))
             for k, v in top_d:
                 out.append(f"      {k:<38s} {colored(str(v), '31')}")
+        # Silent divergences (our tesSUCCESS/tec* vs different network result)
+        silent_total = ffi.get("live_apply_silent_diverged", 0)
+        silent_pairs = ffi.get("silent_diverged_by_pair", {})
+        if silent_total or silent_pairs:
+            out.append(colored(f"    SILENT DIVERGED: {silent_total:,}", "1;33"))
+            for k, v in sorted(silent_pairs.items(), key=lambda x: -x[1])[:6]:
+                out.append(f"      {k:<46s} {colored(str(v), '33')}")
     elif isinstance(ffi, dict) and ffi.get("enabled") is False:
         out.append(colored("── libxrpl FFI Engine ──", "1;35"))
         out.append(f"  {colored('DISABLED', '33')} — {ffi.get('note', 'build with --features ffi')}")

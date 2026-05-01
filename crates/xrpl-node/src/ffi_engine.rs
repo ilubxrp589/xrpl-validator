@@ -510,6 +510,16 @@ pub struct FfiStats {
     pub live_apply_ter_counts: std::collections::BTreeMap<String, u64>,
     /// Divergence breakdown: "{tx_type}/{ter_name}" → count
     pub live_diverged_by_type: std::collections::BTreeMap<String, u64>,
+    /// Silent divergences: our shim returned tesSUCCESS or tec*, but the
+    /// network's recorded TransactionResult differed. Total across all
+    /// tx_type/our_ter/net_ter combos.
+    pub live_apply_silent_diverged: u64,
+    /// Silent divergence breakdown: "{tx_type}/{our_ter}->{net_ter}" → count.
+    /// Mirrors live_diverged_by_type but for cases the regular divergence
+    /// log skips because outcome is "agreement-shaped" (tesSUCCESS / tec*).
+    pub silent_diverged_by_pair: std::collections::BTreeMap<String, u64>,
+    /// Last-N silent divergences for live dashboard visibility.
+    pub silent_diverged_samples: Vec<String>,
     /// Total RPC SLE lookups (hit = found in rippled, miss = not found/error)
     pub rpc_sle_hits: u64,
     pub rpc_sle_misses: u64,
@@ -641,6 +651,25 @@ pub fn render_prometheus(s: &FfiStats) -> String {
                 "xrpl_ffi_diverged_total{{tx_type=\"{}\",ter=\"{}\"}} {}",
                 escape_label(ty), escape_label(ter), count
             );
+        }
+    }
+
+    // Silent divergences (our tesSUCCESS/tec* vs network's different result)
+    let _ = writeln!(out, "# HELP xrpl_ffi_silent_diverged_total Apply() outcomes that disagreed with network's recorded TransactionResult while still being tesSUCCESS or tec* on our side");
+    let _ = writeln!(out, "# TYPE xrpl_ffi_silent_diverged_total counter");
+    let _ = writeln!(out, "xrpl_ffi_silent_diverged_total {}", s.live_apply_silent_diverged);
+    let _ = writeln!(out, "# HELP xrpl_ffi_silent_diverged_by_pair_total Silent divergences by tx_type, our_ter, net_ter");
+    let _ = writeln!(out, "# TYPE xrpl_ffi_silent_diverged_by_pair_total counter");
+    for (combo, count) in &s.silent_diverged_by_pair {
+        // combo format: "{tx_type}/{our_ter}->{net_ter}"
+        if let Some((ty, rest)) = combo.split_once('/') {
+            if let Some((ours, net)) = rest.split_once("->") {
+                let _ = writeln!(
+                    out,
+                    "xrpl_ffi_silent_diverged_by_pair_total{{tx_type=\"{}\",our_ter=\"{}\",net_ter=\"{}\"}} {}",
+                    escape_label(ty), escape_label(ours), escape_label(net), count
+                );
+            }
         }
     }
 
@@ -1420,17 +1449,34 @@ pub fn apply_ledger_in_order(
         // tec* mutations advance Sequence by 1 only; missed TicketCreate or
         // similar effects cause sender-seq drift cascading into downstream
         // tefPAST_SEQ failures from the same sender within the same ledger.
-        if let (Some(slog), Some(net_map)) = (silent_divergence_log, expected_outcomes) {
+        if let Some(net_map) = expected_outcomes {
             if outcome.ter_name == "tesSUCCESS" || outcome.ter_name.starts_with("tec") {
                 if let Some(net_ter) = net_map.get(&tx_hash) {
                     if net_ter != &outcome.ter_name {
-                        drop(s);
-                        slog.record_silent(
-                            ledger_seq, &tx_hash, &tx_type,
-                            &outcome.ter_name, net_ter,
-                            elapsed_ms, &outcome.last_fatal,
-                        );
-                        s = stats.lock();
+                        // Counter + sample buffer for /api/engine + watch_engine.py
+                        s.live_apply_silent_diverged += 1;
+                        let pair = format!("{}/{}->{}", tx_type, outcome.ter_name, net_ter);
+                        *s.silent_diverged_by_pair.entry(pair).or_insert(0) += 1;
+                        if !tx_hash.is_empty() {
+                            let short_hash = if tx_hash.len() >= 16 { &tx_hash[..16] } else { tx_hash.as_str() };
+                            s.silent_diverged_samples.push(format!(
+                                "L{} {} ours={} net={} {}",
+                                ledger_seq, tx_type, outcome.ter_name, net_ter, short_hash,
+                            ));
+                            if s.silent_diverged_samples.len() > 50 {
+                                s.silent_diverged_samples.remove(0);
+                            }
+                        }
+                        // File log (separate from in-memory stats)
+                        if let Some(slog) = silent_divergence_log {
+                            drop(s);
+                            slog.record_silent(
+                                ledger_seq, &tx_hash, &tx_type,
+                                &outcome.ter_name, net_ter,
+                                elapsed_ms, &outcome.last_fatal,
+                            );
+                            s = stats.lock();
+                        }
                     }
                 }
             }
