@@ -197,6 +197,9 @@ pub async fn start_ws_sync(
                                 let v = verifier.clone();
                                 let hdr = ledger_header.clone();
                                 let seq = process_seq;
+                                // Network's recorded TransactionResult per tx,
+                                // for silent-divergence detection.
+                                let expected_outcomes = fetch_ledger_expected_outcomes(&rpc, process_seq).await;
                                 let synced = last_synced.load(Ordering::Acquire);
                                 let steady = synced > 0 && process_seq.saturating_sub(synced) <= 2;
                                 let shadow_ah = account_hash.clone();
@@ -262,11 +265,13 @@ pub async fn start_ws_sync(
                                     let snap = std::sync::Arc::new(
                                         crate::ffi_engine::OwnedSnapshot::new(db.clone())
                                     );
+                                    let expected = if expected_outcomes.is_empty() { None } else { Some(expected_outcomes) };
                                     tokio::task::spawn_blocking(move || {
                                         let overlay = v.verify_ledger_with_snapshot(
                                             seq, &tx_blobs,
                                             hdr.parent_hash, hdr.parent_close_time, hdr.total_drops,
                                             Some(snap.as_ref()),
+                                            expected.as_ref(),
                                         );
                                         if shadow_ok && !shadow_ah.is_empty() && !shadow_overlay.is_empty() {
                                             if let Some(hs) = hasher_snap {
@@ -279,10 +284,12 @@ pub async fn start_ws_sync(
                                         overlay
                                     })
                                 } else {
+                                    let expected = if expected_outcomes.is_empty() { None } else { Some(expected_outcomes) };
                                     tokio::task::spawn_blocking(move || {
                                         let overlay = v.verify_ledger(
                                             seq, &tx_blobs,
                                             hdr.parent_hash, hdr.parent_close_time, hdr.total_drops,
+                                            expected.as_ref(),
                                         );
                                         if shadow_ok && !shadow_ah.is_empty() && !shadow_overlay.is_empty() {
                                             if let Some(hs) = hasher_snap {
@@ -538,6 +545,39 @@ async fn fetch_ledger_metadata(
         *tx_count += 1;
     }
     Ok((sorted_txs, header, wallet_delta))
+}
+
+/// Fetch the network's recorded TransactionResult for every tx in `seq`,
+/// keyed by uppercase tx_hash. Used by silent-divergence detection to
+/// compare against our shim's outcome.ter_name. One extra RPC per ledger
+/// (uses non-binary expand mode so we get JSON `hash` and `metaData`).
+/// Returns an empty map on error — silent detection just gets skipped.
+#[cfg(feature = "ffi")]
+async fn fetch_ledger_expected_outcomes(
+    rpc: &RippledClient, seq: u32,
+) -> std::collections::HashMap<String, String> {
+    let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let body = match rpc.call(
+        "ledger",
+        serde_json::json!({"ledger_index": seq, "transactions": true, "expand": true, "binary": false}),
+    ).await {
+        Ok(b) => b,
+        Err(_) => return out,
+    };
+    let empty = Vec::new();
+    let txs = body["result"]["ledger"]["transactions"].as_array().unwrap_or(&empty);
+    for tx in txs.iter() {
+        let hash = match tx["hash"].as_str() {
+            Some(h) => h.to_uppercase(),
+            None => continue,
+        };
+        let result = match tx["metaData"]["TransactionResult"].as_str() {
+            Some(r) => r.to_string(),
+            None => continue,
+        };
+        out.insert(hash, result);
+    }
+    out
 }
 
 /// Fetch binary tx_blobs for every tx in the ledger, sorted by TransactionIndex.

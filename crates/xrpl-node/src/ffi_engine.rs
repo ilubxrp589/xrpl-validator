@@ -722,38 +722,23 @@ impl DivergenceLog {
         Self { path, file: parking_lot::Mutex::new(None) }
     }
 
+    /// Construct a log writing to an explicit path. Used for the silent
+    /// divergence log (`logs/silent_divergences.jsonl`) so it's separate
+    /// from the main ter*/tef* divergence log.
+    pub fn with_path(path: std::path::PathBuf) -> Self {
+        Self { path, file: parking_lot::Mutex::new(None) }
+    }
+
     pub fn path(&self) -> &std::path::Path {
         &self.path
     }
 
-    /// Record one divergence. Swallows I/O errors (divergence recording must
-    /// never crash the apply loop).
-    pub fn record(
-        &self,
-        ledger_seq: u32,
-        tx_hash: &str,
-        tx_type: &str,
-        our_ter: &str,
-        duration_ms: u64,
-        fatal: &str,
-    ) {
+    /// Append `line` (a serde_json::Value) to the log file. Swallows I/O
+    /// errors — divergence recording must never crash the apply loop.
+    fn write_line(&self, line: &serde_json::Value) {
         use std::io::Write;
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let line = serde_json::json!({
-            "ts": ts,
-            "ledger_seq": ledger_seq,
-            "tx_hash": tx_hash,
-            "tx_type": tx_type,
-            "our_ter": our_ter,
-            "duration_ms": duration_ms,
-            "fatal": fatal,
-        });
         let mut guard = self.file.lock();
         if guard.is_none() {
-            // Ensure parent directory exists
             if let Some(parent) = self.path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -771,6 +756,63 @@ impl DivergenceLog {
             let _ = writeln!(f, "{line}");
             let _ = f.flush();
         }
+    }
+
+    /// Record one ter*/tef*/etc divergence (our outcome wasn't tesSUCCESS
+    /// or tec*).
+    pub fn record(
+        &self,
+        ledger_seq: u32,
+        tx_hash: &str,
+        tx_type: &str,
+        our_ter: &str,
+        duration_ms: u64,
+        fatal: &str,
+    ) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.write_line(&serde_json::json!({
+            "ts": ts,
+            "ledger_seq": ledger_seq,
+            "tx_hash": tx_hash,
+            "tx_type": tx_type,
+            "our_ter": our_ter,
+            "duration_ms": duration_ms,
+            "fatal": fatal,
+        }));
+    }
+
+    /// Record a silent divergence: our shim returned a tesSUCCESS or tec*
+    /// (so the existing record() didn't fire), but the network's recorded
+    /// TransactionResult was different. The interesting case is our `tec*`
+    /// vs network's `tesSUCCESS` — see ffi_engine.rs apply_ledger_in_order
+    /// docs and the Apr 2026 ticket-threading investigation.
+    pub fn record_silent(
+        &self,
+        ledger_seq: u32,
+        tx_hash: &str,
+        tx_type: &str,
+        our_ter: &str,
+        net_ter: &str,
+        duration_ms: u64,
+        fatal: &str,
+    ) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.write_line(&serde_json::json!({
+            "ts": ts,
+            "ledger_seq": ledger_seq,
+            "tx_hash": tx_hash,
+            "tx_type": tx_type,
+            "our_ter": our_ter,
+            "net_ter": net_ter,
+            "duration_ms": duration_ms,
+            "fatal": fatal,
+        }));
     }
 }
 
@@ -1054,6 +1096,8 @@ pub fn apply_ledger_in_order(
     total_drops: u64,
     divergence_log: Option<&DivergenceLog>,
     db_snapshot: Option<&OwnedSnapshot>,
+    silent_divergence_log: Option<&DivergenceLog>,
+    expected_outcomes: Option<&std::collections::HashMap<String, String>>,
 ) -> LedgerOverlay {
     let fallback = RpcProvider::with_endpoints(rpc_urls.to_vec(), ledger_seq.saturating_sub(1));
     let overlay: parking_lot::Mutex<std::collections::HashMap<[u8; 32], Option<Vec<u8>>>> =
@@ -1368,6 +1412,28 @@ pub fn apply_ledger_in_order(
             }
             // Re-acquire — remaining fields updated below
             s = stats.lock();
+        }
+        // Silent-divergence check: our shim returned tesSUCCESS or tec* (so
+        // the regular divergence log above didn't fire), but the network's
+        // recorded TransactionResult was something else. Most-interesting
+        // case: our `tec*` (claimed) vs network's `tesSUCCESS` (full apply).
+        // tec* mutations advance Sequence by 1 only; missed TicketCreate or
+        // similar effects cause sender-seq drift cascading into downstream
+        // tefPAST_SEQ failures from the same sender within the same ledger.
+        if let (Some(slog), Some(net_map)) = (silent_divergence_log, expected_outcomes) {
+            if outcome.ter_name == "tesSUCCESS" || outcome.ter_name.starts_with("tec") {
+                if let Some(net_ter) = net_map.get(&tx_hash) {
+                    if net_ter != &outcome.ter_name {
+                        drop(s);
+                        slog.record_silent(
+                            ledger_seq, &tx_hash, &tx_type,
+                            &outcome.ter_name, net_ter,
+                            elapsed_ms, &outcome.last_fatal,
+                        );
+                        s = stats.lock();
+                    }
+                }
+            }
         }
         s.live_apply_last_ter = outcome.ter_name.clone();
         s.live_apply_last_mutations = outcome.mutations.len();

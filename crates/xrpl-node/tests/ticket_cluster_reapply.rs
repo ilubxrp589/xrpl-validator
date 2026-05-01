@@ -119,6 +119,8 @@ fn cluster_103515367_reapplies_with_zero_divergences() {
         TOTAL_DROPS,
         None, // divergence_log
         None, // db_snapshot → forces LayeredProvider path
+        None, // silent_divergence_log
+        None, // expected_outcomes
     );
 
     let s = stats.lock();
@@ -151,5 +153,124 @@ fn cluster_103515367_reapplies_with_zero_divergences() {
         "Production (m3060) sees 3 divergences from rBtVeRQ8's TicketCreate cluster. \
          Reproducing them here means we have a local, deterministic handle on the bug. \
          Zero divergences means the test matches mainnet exactly."
+    );
+}
+
+/// Mainnet AffectedNodes for BF6C928F — fetched from s2.ripple.com `tx` method
+/// and recorded here for regression comparison. libxrpl's apply of this tx
+/// should emit a mutation for each of these 10 keys when given the correct
+/// pre-apply state.
+///
+/// Source-of-truth listing (mainnet metadata from ledger 103515367):
+/// - ModifiedNode AccountRoot  2B7EE4494372DAAE... ← rBtVeRQ8 (the cascade trigger)
+/// - ModifiedNode AccountRoot  A90EA9A8D130DFF4...
+/// - ModifiedNode AccountRoot  E476CB526D88DEC7...
+/// - ModifiedNode RippleState  BAEB6B6C84253C7B...
+/// - ModifiedNode RippleState  E40A1558DC7638FF...
+/// - ModifiedNode RippleState  F5297CFDE8F496C0...
+/// - ModifiedNode DirectoryNode AC9AA39051CD0F01...
+/// - DeletedNode  DirectoryNode CFEC8953D22B1B50...
+/// - DeletedNode  Offer         982C0B255D33231A...
+/// - ModifiedNode Offer         F5D5D29A6A3CFA7A...
+const BF6C928F_MAINNET_MUTATION_KEYS: &[&str] = &[
+    "2B7EE4494372DAAEE9226010B426EFDF3B563DFA7257046F73AE3F31D142D1A9", // ModifiedNode AccountRoot (rBtVeRQ8)
+    "982C0B255D33231AB1FE9B83C5CE42CEDDF037F59E1414348E8520795AD56332", // DeletedNode  Offer (the one BF6C928F crosses)
+    "A90EA9A8D130DFF4AC38B12F56C46E93A48B166928D8D279568CCC6D91FF6F35", // ModifiedNode AccountRoot (rwnJpjMn submitter)
+    "AC9AA39051CD0F01B3C72DFCEB90E2D659E42C1E96B538B9D9B20191D16F8A63", // ModifiedNode DirectoryNode
+    "BAEB6B6C84253C7BB682E879329B11EC47480724DD4A26246848D82408071314", // ModifiedNode RippleState
+    "CFEC8953D22B1B50F20F46ECBCD51990A26BDB71951ED8265A1AA92902C9A600", // DeletedNode  DirectoryNode
+    "E40A1558DC7638FF795B2D8D10C59F8624C52988A254D51EA4A92700F14E4F68", // ModifiedNode RippleState
+    "E476CB526D88DEC7742BBB3937D20F910A7A74D4095EA8FCA34EA315C360E7BD", // ModifiedNode AccountRoot
+    "F5297CFDE8F496C0EA6EFC463DF508674DA4EC39617AC97CE83AB7805B1CEB65", // ModifiedNode RippleState
+    "F5D5D29A6A3CFA7A5E9EDFDEF22620961F680DBF2BF30D1F515253754C9A0DD9", // ModifiedNode Offer
+];
+
+/// Isolation test: run BF6C928F (the cross-account OfferCreate at tx_index=19)
+/// standalone via `apply_ledger_in_order` with a 1-tx vec. This tells us whether
+/// the 4-vs-10 mutation mismatch comes from:
+///
+/// - **Pre-ledger RPC state** — LayeredProvider → RpcProvider returns offer/book
+///   state at ledger_seq-1 that makes libxrpl cross DIFFERENT offers than
+///   mainnet did. If standalone also produces 4 mutations → this is the cause,
+///   and the fix is in how we query rippled for state.
+///
+/// - **Earlier tx interference** — one or more of mainnet's txs 0-18 mutates
+///   the offer book in a way that affects what BF6C928F sees. If standalone
+///   produces 10 mutations → this is the cause, and the fix is in how we
+///   thread those earlier mutations.
+#[test]
+#[ignore = "network-dependent: fetches pre-ledger SLE state from s2.ripple.com"]
+fn bf6c928f_isolated_mutations_match_mainnet() {
+    let all_blobs = parse_ledger_blobs(LEDGER_BLOBS_TSV);
+    assert_eq!(all_blobs.len(), 67, "expected 67 tx blobs in the data file");
+    // Pick index 19 — BF6C928F OfferCreate from rwnJpjMn
+    let bf6c928f = all_blobs.into_iter().nth(19).expect("idx 19 must exist");
+    let txs = vec![bf6c928f];
+
+    println!("Fetching mainnet amendments...");
+    let amendments = fetch_mainnet_amendments(RPC_URL);
+    println!("Loaded {} amendments", amendments.len());
+
+    let stats = new_stats();
+    let rpc_urls = vec![RPC_URL.to_string()];
+    let parent_hash = hex_to_array32(PARENT_HASH);
+
+    println!("Applying BF6C928F standalone (no prior tx state threaded)...");
+    let overlay = apply_ledger_in_order(
+        &stats,
+        &txs,
+        LEDGER_SEQ,
+        &rpc_urls,
+        &amendments,
+        parent_hash,
+        PARENT_CLOSE_TIME,
+        TOTAL_DROPS,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let s = stats.lock();
+    println!();
+    println!("=== BF6C928F standalone result ===");
+    println!("  attempted:  {}", s.live_apply_attempted);
+    println!("  ok:         {}", s.live_apply_ok);
+    println!("  claimed:    {}", s.live_apply_claimed);
+    println!("  diverged:   {}", s.live_apply_diverged);
+    println!("  overlay size: {}", overlay.len());
+    println!();
+    println!("=== Overlay contents (all mutations) ===");
+    let mut overlay_keys: Vec<String> = overlay
+        .iter()
+        .map(|(k, v)| format!("{} ({:?})", hex::encode_upper(k), v.as_ref().map(|b| b.len())))
+        .collect();
+    overlay_keys.sort();
+    for k in &overlay_keys {
+        let hex_key = &k[..64];
+        let mainnet_has = BF6C928F_MAINNET_MUTATION_KEYS.iter().any(|m| *m == hex_key);
+        let marker = if mainnet_has { "✓" } else { "✗ NOT IN MAINNET" };
+        println!("  [{marker}] {k}");
+    }
+    println!();
+    println!("=== Mainnet mutation keys NOT in our overlay ===");
+    for mainnet_key in BF6C928F_MAINNET_MUTATION_KEYS {
+        let found = overlay.keys().any(|k| hex::encode_upper(k) == *mainnet_key);
+        if !found {
+            println!("  ✗ MISSING {mainnet_key}");
+        }
+    }
+    println!();
+
+    assert_eq!(s.live_apply_diverged, 0, "BF6C928F should succeed in isolation");
+    assert_eq!(s.live_apply_ok, 1, "BF6C928F should return tesSUCCESS");
+    assert_eq!(
+        overlay.len(),
+        10,
+        "BF6C928F should emit 10 mutations to match mainnet AffectedNodes. \
+         If this assertion fails with 4, we've pinned the bug to the pre-ledger \
+         state (RpcProvider). If it passes (10 mutations), the bug is in how \
+         earlier txs in the full ledger replay are mutating state that \
+         BF6C928F subsequently reads."
     );
 }

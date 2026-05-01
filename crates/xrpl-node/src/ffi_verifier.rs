@@ -45,6 +45,11 @@ pub struct FfiVerifier {
     rpc_urls: Vec<String>,
     amendments: Vec<[u8; 32]>,
     divergence_log: Arc<DivergenceLog>,
+    /// Separate log for `tec*`/`tesSUCCESS` divergences — cases the main
+    /// `divergence_log` skips because libxrpl returned a "claimed" or
+    /// "success" outcome that our threading still acts on, but which
+    /// disagrees with the network's recorded TransactionResult.
+    silent_divergence_log: Arc<DivergenceLog>,
 }
 
 impl FfiVerifier {
@@ -58,11 +63,15 @@ impl FfiVerifier {
             count = amendments.len(),
             "ffi_verifier: loaded active mainnet amendments"
         );
+        let silent_path = std::env::var("XRPL_FFI_SILENT_DIVERGENCE_LOG")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("logs/silent_divergences.jsonl"));
         Self {
             stats: new_stats(),
             rpc_urls,
             amendments,
             divergence_log: Arc::new(DivergenceLog::new()),
+            silent_divergence_log: Arc::new(DivergenceLog::with_path(silent_path)),
         }
     }
 
@@ -80,6 +89,7 @@ impl FfiVerifier {
         parent_hash: [u8; 32],
         parent_close_time: u32,
         total_drops: u64,
+        expected_outcomes: Option<&std::collections::HashMap<String, String>>,
     ) -> LedgerOverlay {
         apply_ledger_in_order(
             &self.stats,
@@ -92,6 +102,8 @@ impl FfiVerifier {
             total_drops,
             Some(self.divergence_log.as_ref()),
             None,
+            Some(self.silent_divergence_log.as_ref()),
+            expected_outcomes,
         )
     }
 
@@ -108,6 +120,7 @@ impl FfiVerifier {
         parent_close_time: u32,
         total_drops: u64,
         snapshot: Option<&OwnedSnapshot>,
+        expected_outcomes: Option<&std::collections::HashMap<String, String>>,
     ) -> LedgerOverlay {
         apply_ledger_in_order(
             &self.stats,
@@ -120,6 +133,8 @@ impl FfiVerifier {
             total_drops,
             Some(self.divergence_log.as_ref()),
             snapshot,
+            Some(self.silent_divergence_log.as_ref()),
+            expected_outcomes,
         )
     }
 
