@@ -258,7 +258,18 @@ int32_t xrpl_apply(
         ripple::Rules rules(presets);
 
         ripple::LedgerHeader header;
-        header.seq = ledger_seq > 0 ? ledger_seq - 1 : 0;
+        // header represents the target ledger we're applying tx INTO. With
+        // the closed-ledger OpenView ctor (no seq+1 increment), view.seq()
+        // returns header.seq directly. libxrpl uses view.seq() to set new
+        // accounts' starting Sequence (sleNewDst->setFieldU32(sfSequence,
+        // view.seq()) in Payment.cpp). Setting header.seq one too low caused
+        // every just-created account's Sequence to be one less than network's,
+        // triggering terPRE_SEQ on the FIRST tx from that account →
+        // terPRE_SEQ recovery RPC-fetched END-of-ledger AccountRoot state →
+        // overlay seq jumped way ahead → subsequent same-sender txs cascaded
+        // into tefPAST_SEQ. Setting header.seq = ledger_seq makes view.seq()
+        // match the network's apply view.
+        header.seq = ledger_seq;
         // header represents ledger N-1 (the parent of the ledger being applied
         // to). When OpenView wraps it via the open_ledger overload, it copies
         // header.closeTime into info_.parentCloseTime (see OpenView.cpp:105).
@@ -363,7 +374,18 @@ XrplApplyResult *xrpl_apply_with_mutations(
         ripple::Rules rules(presets);
 
         ripple::LedgerHeader header;
-        header.seq = ledger_seq > 0 ? ledger_seq - 1 : 0;
+        // header represents the target ledger we're applying tx INTO. With
+        // the closed-ledger OpenView ctor (no seq+1 increment), view.seq()
+        // returns header.seq directly. libxrpl uses view.seq() to set new
+        // accounts' starting Sequence (sleNewDst->setFieldU32(sfSequence,
+        // view.seq()) in Payment.cpp). Setting header.seq one too low caused
+        // every just-created account's Sequence to be one less than network's,
+        // triggering terPRE_SEQ on the FIRST tx from that account →
+        // terPRE_SEQ recovery RPC-fetched END-of-ledger AccountRoot state →
+        // overlay seq jumped way ahead → subsequent same-sender txs cascaded
+        // into tefPAST_SEQ. Setting header.seq = ledger_seq makes view.seq()
+        // match the network's apply view.
+        header.seq = ledger_seq;
         // header represents ledger N-1 (the parent of the ledger being applied
         // to). When OpenView wraps it via the open_ledger overload, it copies
         // header.closeTime into info_.parentCloseTime (see OpenView.cpp:105).
