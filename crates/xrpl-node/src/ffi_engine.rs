@@ -1257,6 +1257,35 @@ pub fn apply_ledger_in_order(
         // rippled, so threading partial/empty mutations corrupts the overlay.
         let should_thread = outcome.ter_name == "tesSUCCESS"
             || outcome.ter_name.starts_with("tec");
+        // Capture pre-threading state for each Modified key BEFORE threading,
+        // so the mutation-divergence check below can detect no-op modifies
+        // (rippled's meta-build skips them at ApplyStateTable.cpp:155-156 but
+        // libxrpl still calls rawReplace, so our MutationCollector records
+        // them as Modified with bytes == pre-state). See option C in the
+        // ticket-thread for the design rationale.
+        let mut pre_state_for_modified: std::collections::HashMap<[u8; 32], Vec<u8>> =
+            std::collections::HashMap::new();
+        if expected_mutations.is_some() && should_thread {
+            let ov = overlay.lock();
+            for m in &outcome.mutations {
+                if matches!(m.kind, xrpl_ffi::MutationKind::Modified)
+                    && !pre_state_for_modified.contains_key(&m.key)
+                {
+                    let pre = if let Some(entry) = ov.get(&m.key) {
+                        entry.clone()
+                    } else if let Some(snap) = db_snapshot {
+                        snap.get(&m.key).ok().flatten()
+                    } else {
+                        None
+                    };
+                    if let Some(bytes) = pre {
+                        pre_state_for_modified.insert(m.key, bytes);
+                    }
+                    // If neither overlay nor snapshot has it, we can't detect a
+                    // no-op; treat as a real divergence (false positive — rare).
+                }
+            }
+        }
         let prior_overlay_size;
         let mut post_overlay_size;
         {
@@ -1562,7 +1591,23 @@ pub fn apply_ledger_in_order(
                             xrpl_ffi::MutationKind::Deleted => 2,
                         }
                     };
+                    // Filter out no-op Modifieds: rippled's meta-build skips
+                    // these (ApplyStateTable.cpp:155 — `(*curNode == *origNode)`),
+                    // but libxrpl still emits them via rawReplace. Comparing
+                    // them as "extra in ours" produces ~150/min phantom
+                    // divergences on Payment-heavy workloads. Honesty preserved
+                    // because outcome.mutations itself is unchanged — only the
+                    // diagnostic set is filtered.
                     let ours_set: HashSet<(String, u8)> = outcome.mutations.iter()
+                        .filter(|m| {
+                            if !matches!(m.kind, xrpl_ffi::MutationKind::Modified) {
+                                return true;
+                            }
+                            match pre_state_for_modified.get(&m.key) {
+                                Some(pre_bytes) => pre_bytes != &m.data, // keep iff actually changed
+                                None => true, // no pre-state captured → can't tell, keep it
+                            }
+                        })
                         .map(|m| (hex::encode_upper(m.key), kind_byte(&m.kind)))
                         .collect();
                     let net_set: HashSet<(String, u8)> = net_muts.iter().cloned().collect();
