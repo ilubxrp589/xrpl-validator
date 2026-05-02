@@ -121,6 +121,8 @@ fn cluster_103515367_reapplies_with_zero_divergences() {
         None, // db_snapshot → forces LayeredProvider path
         None, // silent_divergence_log
         None, // expected_outcomes
+        None, // mutation_divergence_log
+        None, // expected_mutations
     );
 
     let s = stats.lock();
@@ -225,6 +227,8 @@ fn bf6c928f_isolated_mutations_match_mainnet() {
         parent_hash,
         PARENT_CLOSE_TIME,
         TOTAL_DROPS,
+        None,
+        None,
         None,
         None,
         None,

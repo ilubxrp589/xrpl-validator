@@ -98,6 +98,13 @@ def render():
             out.append(colored(f"    SILENT DIVERGED: {silent_total:,}", "1;33"))
             for k, v in sorted(silent_pairs.items(), key=lambda x: -x[1])[:6]:
                 out.append(f"      {k:<46s} {colored(str(v), '33')}")
+        # Mutation-list divergences (TER agrees but mutation set differs — BF6C928F class)
+        mut_total = ffi.get("live_apply_mutation_diverged", 0)
+        mut_types = ffi.get("mutation_diverged_by_type", {})
+        if mut_total or mut_types:
+            out.append(colored(f"    MUTATION DIVERGED: {mut_total:,}", "1;35"))
+            for k, v in sorted(mut_types.items(), key=lambda x: -x[1])[:6]:
+                out.append(f"      {k:<46s} {colored(str(v), '35')}")
     elif isinstance(ffi, dict) and ffi.get("enabled") is False:
         out.append(colored("── libxrpl FFI Engine ──", "1;35"))
         out.append(f"  {colored('DISABLED', '33')} — {ffi.get('note', 'build with --features ffi')}")

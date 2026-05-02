@@ -197,9 +197,10 @@ pub async fn start_ws_sync(
                                 let v = verifier.clone();
                                 let hdr = ledger_header.clone();
                                 let seq = process_seq;
-                                // Network's recorded TransactionResult per tx,
-                                // for silent-divergence detection.
-                                let expected_outcomes = fetch_ledger_expected_outcomes(&rpc, process_seq).await;
+                                // Network's recorded TransactionResult AND
+                                // AffectedNodes per tx, for silent- and
+                                // mutation-divergence detection.
+                                let (expected_outcomes, expected_mutations) = fetch_ledger_expected_outcomes(&rpc, process_seq).await;
                                 let synced = last_synced.load(Ordering::Acquire);
                                 let steady = synced > 0 && process_seq.saturating_sub(synced) <= 2;
                                 let shadow_ah = account_hash.clone();
@@ -266,12 +267,14 @@ pub async fn start_ws_sync(
                                         crate::ffi_engine::OwnedSnapshot::new(db.clone())
                                     );
                                     let expected = if expected_outcomes.is_empty() { None } else { Some(expected_outcomes) };
+                                    let expected_mut = if expected_mutations.is_empty() { None } else { Some(expected_mutations) };
                                     tokio::task::spawn_blocking(move || {
                                         let overlay = v.verify_ledger_with_snapshot(
                                             seq, &tx_blobs,
                                             hdr.parent_hash, hdr.parent_close_time, hdr.total_drops,
                                             Some(snap.as_ref()),
                                             expected.as_ref(),
+                                            expected_mut.as_ref(),
                                         );
                                         if shadow_ok && !shadow_ah.is_empty() && !shadow_overlay.is_empty() {
                                             if let Some(hs) = hasher_snap {
@@ -285,11 +288,13 @@ pub async fn start_ws_sync(
                                     })
                                 } else {
                                     let expected = if expected_outcomes.is_empty() { None } else { Some(expected_outcomes) };
+                                    let expected_mut = if expected_mutations.is_empty() { None } else { Some(expected_mutations) };
                                     tokio::task::spawn_blocking(move || {
                                         let overlay = v.verify_ledger(
                                             seq, &tx_blobs,
                                             hdr.parent_hash, hdr.parent_close_time, hdr.total_drops,
                                             expected.as_ref(),
+                                            expected_mut.as_ref(),
                                         );
                                         if shadow_ok && !shadow_ah.is_empty() && !shadow_overlay.is_empty() {
                                             if let Some(hs) = hasher_snap {
@@ -547,22 +552,30 @@ async fn fetch_ledger_metadata(
     Ok((sorted_txs, header, wallet_delta))
 }
 
-/// Fetch the network's recorded TransactionResult for every tx in `seq`,
-/// keyed by uppercase tx_hash. Used by silent-divergence detection to
-/// compare against our shim's outcome.ter_name. One extra RPC per ledger
-/// (uses non-binary expand mode so we get JSON `hash` and `metaData`).
-/// Returns an empty map on error — silent detection just gets skipped.
+/// Fetch the network's recorded TransactionResult AND AffectedNodes for
+/// every tx in `seq`, keyed by uppercase tx_hash. Used by silent- and
+/// mutation-divergence detection. One extra RPC per ledger (non-binary
+/// expand mode for JSON `hash` and `metaData`). Returns empty maps on
+/// error — detection just gets skipped for that ledger.
+///
+/// Mutation set encoding: each entry is (key_hex_uppercase, kind_byte)
+/// where kind ∈ {0=Created, 1=Modified, 2=Deleted}, matching libxrpl's
+/// `xrpl_ffi::MutationKind`.
 #[cfg(feature = "ffi")]
 async fn fetch_ledger_expected_outcomes(
     rpc: &RippledClient, seq: u32,
-) -> std::collections::HashMap<String, String> {
-    let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+) -> (
+    std::collections::HashMap<String, String>,
+    std::collections::HashMap<String, Vec<(String, u8)>>,
+) {
+    let mut outcomes: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut mutations: std::collections::HashMap<String, Vec<(String, u8)>> = std::collections::HashMap::new();
     let body = match rpc.call(
         "ledger",
         serde_json::json!({"ledger_index": seq, "transactions": true, "expand": true, "binary": false}),
     ).await {
         Ok(b) => b,
-        Err(_) => return out,
+        Err(_) => return (outcomes, mutations),
     };
     let empty = Vec::new();
     let txs = body["result"]["ledger"]["transactions"].as_array().unwrap_or(&empty);
@@ -571,13 +584,32 @@ async fn fetch_ledger_expected_outcomes(
             Some(h) => h.to_uppercase(),
             None => continue,
         };
-        let result = match tx["metaData"]["TransactionResult"].as_str() {
-            Some(r) => r.to_string(),
-            None => continue,
-        };
-        out.insert(hash, result);
+        if let Some(result) = tx["metaData"]["TransactionResult"].as_str() {
+            outcomes.insert(hash.clone(), result.to_string());
+        }
+        // AffectedNodes → Vec<(LedgerIndex, kind_byte)>
+        if let Some(nodes) = tx["metaData"]["AffectedNodes"].as_array() {
+            let mut entries: Vec<(String, u8)> = Vec::with_capacity(nodes.len());
+            for node in nodes.iter() {
+                let (kind_byte, inner) = if node.get("CreatedNode").is_some() {
+                    (0u8, &node["CreatedNode"])
+                } else if node.get("ModifiedNode").is_some() {
+                    (1u8, &node["ModifiedNode"])
+                } else if node.get("DeletedNode").is_some() {
+                    (2u8, &node["DeletedNode"])
+                } else {
+                    continue;
+                };
+                if let Some(idx) = inner["LedgerIndex"].as_str() {
+                    entries.push((idx.to_uppercase(), kind_byte));
+                }
+            }
+            if !entries.is_empty() {
+                mutations.insert(hash, entries);
+            }
+        }
     }
-    out
+    (outcomes, mutations)
 }
 
 /// Fetch binary tx_blobs for every tx in the ledger, sorted by TransactionIndex.

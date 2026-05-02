@@ -50,6 +50,8 @@ pub struct FfiVerifier {
     /// "success" outcome that our threading still acts on, but which
     /// disagrees with the network's recorded TransactionResult.
     silent_divergence_log: Arc<DivergenceLog>,
+    /// Same-TER, different-mutation-set divergences (BF6C928F class).
+    mutation_divergence_log: Arc<DivergenceLog>,
 }
 
 impl FfiVerifier {
@@ -66,12 +68,16 @@ impl FfiVerifier {
         let silent_path = std::env::var("XRPL_FFI_SILENT_DIVERGENCE_LOG")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::path::PathBuf::from("logs/silent_divergences.jsonl"));
+        let mutation_path = std::env::var("XRPL_FFI_MUTATION_DIVERGENCE_LOG")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("logs/mutation_divergences.jsonl"));
         Self {
             stats: new_stats(),
             rpc_urls,
             amendments,
             divergence_log: Arc::new(DivergenceLog::new()),
             silent_divergence_log: Arc::new(DivergenceLog::with_path(silent_path)),
+            mutation_divergence_log: Arc::new(DivergenceLog::with_path(mutation_path)),
         }
     }
 
@@ -90,6 +96,7 @@ impl FfiVerifier {
         parent_close_time: u32,
         total_drops: u64,
         expected_outcomes: Option<&std::collections::HashMap<String, String>>,
+        expected_mutations: Option<&std::collections::HashMap<String, Vec<(String, u8)>>>,
     ) -> LedgerOverlay {
         apply_ledger_in_order(
             &self.stats,
@@ -104,6 +111,8 @@ impl FfiVerifier {
             None,
             Some(self.silent_divergence_log.as_ref()),
             expected_outcomes,
+            Some(self.mutation_divergence_log.as_ref()),
+            expected_mutations,
         )
     }
 
@@ -121,6 +130,7 @@ impl FfiVerifier {
         total_drops: u64,
         snapshot: Option<&OwnedSnapshot>,
         expected_outcomes: Option<&std::collections::HashMap<String, String>>,
+        expected_mutations: Option<&std::collections::HashMap<String, Vec<(String, u8)>>>,
     ) -> LedgerOverlay {
         apply_ledger_in_order(
             &self.stats,
@@ -135,6 +145,8 @@ impl FfiVerifier {
             snapshot,
             Some(self.silent_divergence_log.as_ref()),
             expected_outcomes,
+            Some(self.mutation_divergence_log.as_ref()),
+            expected_mutations,
         )
     }
 

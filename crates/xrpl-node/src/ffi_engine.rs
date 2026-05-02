@@ -520,6 +520,16 @@ pub struct FfiStats {
     pub silent_diverged_by_pair: std::collections::BTreeMap<String, u64>,
     /// Last-N silent divergences for live dashboard visibility.
     pub silent_diverged_samples: Vec<String>,
+    /// Mutation-list divergences: our shim and the network agree on the TER
+    /// (both tesSUCCESS or both same tec*) but produced different sets of
+    /// state mutations. The BF6C928F class — same outcome, different state
+    /// effects (cross-account offer paths, ticket creation count, etc).
+    pub live_apply_mutation_diverged: u64,
+    /// Mutation divergence breakdown: "{tx_type}/{ter}" → count.
+    pub mutation_diverged_by_type: std::collections::BTreeMap<String, u64>,
+    /// Last-N mutation divergences. Format:
+    /// "L{seq} {tx_type}/{ter} ours={N_keys} net={N_keys} hash"
+    pub mutation_diverged_samples: Vec<String>,
     /// Total RPC SLE lookups (hit = found in rippled, miss = not found/error)
     pub rpc_sle_hits: u64,
     pub rpc_sle_misses: u64,
@@ -670,6 +680,22 @@ pub fn render_prometheus(s: &FfiStats) -> String {
                     escape_label(ty), escape_label(ours), escape_label(net), count
                 );
             }
+        }
+    }
+
+    // Mutation-list divergences (TER agrees but mutation set differs)
+    let _ = writeln!(out, "# HELP xrpl_ffi_mutation_diverged_total Apply() results where TER matched network but mutation set differed (BF6C928F class)");
+    let _ = writeln!(out, "# TYPE xrpl_ffi_mutation_diverged_total counter");
+    let _ = writeln!(out, "xrpl_ffi_mutation_diverged_total {}", s.live_apply_mutation_diverged);
+    let _ = writeln!(out, "# HELP xrpl_ffi_mutation_diverged_by_type_total Mutation divergences by tx_type, ter");
+    let _ = writeln!(out, "# TYPE xrpl_ffi_mutation_diverged_by_type_total counter");
+    for (combo, count) in &s.mutation_diverged_by_type {
+        if let Some((ty, ter)) = combo.split_once('/') {
+            let _ = writeln!(
+                out,
+                "xrpl_ffi_mutation_diverged_by_type_total{{tx_type=\"{}\",ter=\"{}\"}} {}",
+                escape_label(ty), escape_label(ter), count
+            );
         }
     }
 
@@ -841,6 +867,39 @@ impl DivergenceLog {
             "net_ter": net_ter,
             "duration_ms": duration_ms,
             "fatal": fatal,
+        }));
+    }
+
+    /// Record a mutation-list divergence: same TER on both sides but
+    /// different sets of state mutations.
+    /// `missing_in_ours` = network had it but we didn't.
+    /// `extra_in_ours`   = we produced it but network didn't.
+    /// Each entry is "{kind}:{key_hex}" where kind ∈ {C, M, D}.
+    pub fn record_mutation_diff(
+        &self,
+        ledger_seq: u32,
+        tx_hash: &str,
+        tx_type: &str,
+        ter: &str,
+        ours_count: usize,
+        net_count: usize,
+        missing_in_ours: &[String],
+        extra_in_ours: &[String],
+    ) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.write_line(&serde_json::json!({
+            "ts": ts,
+            "ledger_seq": ledger_seq,
+            "tx_hash": tx_hash,
+            "tx_type": tx_type,
+            "ter": ter,
+            "ours_count": ours_count,
+            "net_count": net_count,
+            "missing_in_ours": missing_in_ours,
+            "extra_in_ours": extra_in_ours,
         }));
     }
 }
@@ -1127,6 +1186,8 @@ pub fn apply_ledger_in_order(
     db_snapshot: Option<&OwnedSnapshot>,
     silent_divergence_log: Option<&DivergenceLog>,
     expected_outcomes: Option<&std::collections::HashMap<String, String>>,
+    mutation_divergence_log: Option<&DivergenceLog>,
+    expected_mutations: Option<&std::collections::HashMap<String, Vec<(String, u8)>>>,
 ) -> LedgerOverlay {
     let fallback = RpcProvider::with_endpoints(rpc_urls.to_vec(), ledger_seq.saturating_sub(1));
     let overlay: parking_lot::Mutex<std::collections::HashMap<[u8; 32], Option<Vec<u8>>>> =
@@ -1474,6 +1535,67 @@ pub fn apply_ledger_in_order(
                                 ledger_seq, &tx_hash, &tx_type,
                                 &outcome.ter_name, net_ter,
                                 elapsed_ms, &outcome.last_fatal,
+                            );
+                            s = stats.lock();
+                        }
+                    }
+                }
+            }
+        }
+        // Mutation-list divergence check: TERs match, but the set of state
+        // mutations differs. Catches the BF6C928F class — same outcome, different
+        // affected nodes (cross-account paths, ticket count, etc.). Only run
+        // when our outcome was tesSUCCESS or tec* AND network's TER matches
+        // ours (otherwise the silent/regular checks above already flagged it).
+        if let Some(mut_map) = expected_mutations {
+            let same_ter = expected_outcomes
+                .and_then(|m| m.get(&tx_hash))
+                .map(|nt| nt == &outcome.ter_name)
+                .unwrap_or(false);
+            if same_ter && (outcome.ter_name == "tesSUCCESS" || outcome.ter_name.starts_with("tec")) {
+                if let Some(net_muts) = mut_map.get(&tx_hash) {
+                    use std::collections::HashSet;
+                    let kind_byte = |k: &xrpl_ffi::MutationKind| -> u8 {
+                        match k {
+                            xrpl_ffi::MutationKind::Created => 0,
+                            xrpl_ffi::MutationKind::Modified => 1,
+                            xrpl_ffi::MutationKind::Deleted => 2,
+                        }
+                    };
+                    let ours_set: HashSet<(String, u8)> = outcome.mutations.iter()
+                        .map(|m| (hex::encode_upper(m.key), kind_byte(&m.kind)))
+                        .collect();
+                    let net_set: HashSet<(String, u8)> = net_muts.iter().cloned().collect();
+                    if ours_set != net_set {
+                        let kind_label = |b: u8| match b { 0 => "C", 1 => "M", 2 => "D", _ => "?" };
+                        let fmt_entry = |(k, b): &(String, u8)| -> String {
+                            let short = if k.len() >= 16 { &k[..16] } else { k.as_str() };
+                            format!("{}:{}", kind_label(*b), short)
+                        };
+                        let missing_in_ours: Vec<String> =
+                            net_set.difference(&ours_set).map(fmt_entry).take(20).collect();
+                        let extra_in_ours: Vec<String> =
+                            ours_set.difference(&net_set).map(fmt_entry).take(20).collect();
+                        s.live_apply_mutation_diverged += 1;
+                        let key_combo = format!("{}/{}", tx_type, outcome.ter_name);
+                        *s.mutation_diverged_by_type.entry(key_combo).or_insert(0) += 1;
+                        if !tx_hash.is_empty() {
+                            let short_hash = if tx_hash.len() >= 16 { &tx_hash[..16] } else { tx_hash.as_str() };
+                            s.mutation_diverged_samples.push(format!(
+                                "L{} {}/{} ours={} net={} {}",
+                                ledger_seq, tx_type, outcome.ter_name,
+                                ours_set.len(), net_set.len(), short_hash,
+                            ));
+                            if s.mutation_diverged_samples.len() > 50 {
+                                s.mutation_diverged_samples.remove(0);
+                            }
+                        }
+                        if let Some(mlog) = mutation_divergence_log {
+                            drop(s);
+                            mlog.record_mutation_diff(
+                                ledger_seq, &tx_hash, &tx_type, &outcome.ter_name,
+                                ours_set.len(), net_set.len(),
+                                &missing_in_ours, &extra_in_ours,
                             );
                             s = stats.lock();
                         }
