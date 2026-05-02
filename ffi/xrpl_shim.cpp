@@ -259,6 +259,16 @@ int32_t xrpl_apply(
 
         ripple::LedgerHeader header;
         header.seq = ledger_seq > 0 ? ledger_seq - 1 : 0;
+        // header represents ledger N-1 (the parent of the ledger being applied
+        // to). When OpenView wraps it via the open_ledger overload, it copies
+        // header.closeTime into info_.parentCloseTime (see OpenView.cpp:105).
+        // Time-based checks during apply (offer Expiration, escrow FinishAfter,
+        // check Expiration, loan due-date) all read view.parentCloseTime(), so
+        // header.closeTime MUST be the parent ledger's close_time. We don't
+        // separately need to set header.parentCloseTime — OpenView discards
+        // base.parentCloseTime — but we set both for diagnostic readers that
+        // might inspect the LedgerHeader directly.
+        header.closeTime = ripple::NetClock::time_point(ripple::NetClock::duration(parent_close_time));
         header.parentCloseTime = ripple::NetClock::time_point(ripple::NetClock::duration(parent_close_time));
         std::memcpy(header.parentHash.data(), parent_hash, 32);
         header.drops = ripple::XRPAmount(static_cast<std::int64_t>(total_drops));
@@ -348,6 +358,16 @@ XrplApplyResult *xrpl_apply_with_mutations(
 
         ripple::LedgerHeader header;
         header.seq = ledger_seq > 0 ? ledger_seq - 1 : 0;
+        // header represents ledger N-1 (the parent of the ledger being applied
+        // to). When OpenView wraps it via the open_ledger overload, it copies
+        // header.closeTime into info_.parentCloseTime (see OpenView.cpp:105).
+        // Time-based checks during apply (offer Expiration, escrow FinishAfter,
+        // check Expiration, loan due-date) all read view.parentCloseTime(), so
+        // header.closeTime MUST be the parent ledger's close_time. We don't
+        // separately need to set header.parentCloseTime — OpenView discards
+        // base.parentCloseTime — but we set both for diagnostic readers that
+        // might inspect the LedgerHeader directly.
+        header.closeTime = ripple::NetClock::time_point(ripple::NetClock::duration(parent_close_time));
         header.parentCloseTime = ripple::NetClock::time_point(ripple::NetClock::duration(parent_close_time));
         std::memcpy(header.parentHash.data(), parent_hash, 32);
         header.drops = ripple::XRPAmount(static_cast<std::int64_t>(total_drops));
