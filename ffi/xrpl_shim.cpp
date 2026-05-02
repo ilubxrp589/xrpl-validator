@@ -284,10 +284,16 @@ int32_t xrpl_apply(
                 return lookup_fn(lookup_user_data, key.data(), out_data, out_len);
             };
 
+        // Replay path — closed-ledger semantics so ApplyStateTable::apply()
+        // takes the meta-build branch (see OpenView.cpp + ApplyStateTable.cpp).
+        // open=false makes view.open() return false; OpenView's non-open_ledger
+        // ctor inherits that, gating meta-build on `if (!to.open() ...)` (line 127).
+        // Meta-build runs threadItem + threadOwners, which add issuer/counterparty
+        // AccountRoot mutations our open-ledger path was silently dropping.
         auto read_view = std::make_shared<ripple::CallbackReadView>(
-            header, rules, fees, /*open=*/true, cpp_lookup);
+            header, rules, fees, /*open=*/false, cpp_lookup);
 
-        ripple::OpenView open_view(ripple::open_ledger, rules, read_view);
+        ripple::OpenView open_view(read_view.get(), read_view);
 
         ripple::MinimalApp app(network_id);
         beast::Journal journal(beast::Journal::getNullSink());
@@ -390,9 +396,15 @@ XrplApplyResult *xrpl_apply_with_mutations(
             };
         }
 
+        // Replay path — closed-ledger semantics so ApplyStateTable::apply()
+        // takes the meta-build branch. Same rationale as the apply path above.
+        // open=false → view.open()=false → meta-build runs → threadItem +
+        // threadOwners populate items_ with issuer/counterparty AccountRoot
+        // entries that our MutationCollector then receives via the outer
+        // apply(RawView&) flush below.
         auto read_view = std::make_shared<ripple::CallbackReadView>(
-            header, rules, fees, /*open=*/true, cpp_lookup, cpp_succ);
-        ripple::OpenView open_view(ripple::open_ledger, rules, read_view);
+            header, rules, fees, /*open=*/false, cpp_lookup, cpp_succ);
+        ripple::OpenView open_view(read_view.get(), read_view);
 
         ripple::MinimalApp app(network_id);
         CapturingSink capturing_sink(result->last_fatal);
