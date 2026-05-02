@@ -157,32 +157,6 @@ def render():
             out.append(f"  ours:    {colored(last, '36')}...")
             out.append(f"  network: {colored(net, '36')}...")
 
-    # Live per-tx feed — last N entries from recent_tx_samples buffer.
-    # Format: "L{seq} {tx_type}/{ter} {hash} {ms}ms mut={N}"
-    recent = ffi.get("recent_tx_samples", []) if isinstance(ffi, dict) else []
-    if recent:
-        out.append("")
-        out.append(colored("── Live TX Feed (last 15 applied) ──", "1;34"))
-        for line in recent[-15:]:
-            # Color-code the TER portion
-            parts = line.split(" ", 3)
-            if len(parts) >= 3 and "/" in parts[1]:
-                typ_ter = parts[1]
-                if "/tesSUCCESS" in typ_ter:
-                    color = "32"
-                elif "/tec" in typ_ter:
-                    color = "36"
-                else:
-                    color = "31"
-                rendered = f"  {parts[0]} {colored(typ_ter, color)} {' '.join(parts[2:])}"
-            else:
-                rendered = f"  {line}"
-            out.append(rendered)
-    else:
-        out.append("")
-        out.append(colored("── Live TX Feed ──", "1;34"))
-        out.append(colored("  (waiting for ws_sync to start applying txs...)", "90"))
-
     return "\n".join(out)
 
 def main():
