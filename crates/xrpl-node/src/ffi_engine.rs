@@ -317,6 +317,23 @@ pub struct OverlayedDbProvider<'a> {
     arena: parking_lot::Mutex<Vec<Vec<u8>>>,
     pub db_hits: std::sync::atomic::AtomicU64,
     pub rpc_fallbacks: std::sync::atomic::AtomicU64,
+    /// Per-LedgerEntryType counter for keys that fell through to RPC.
+    /// Tells us which SLE classes our state.rocks is missing — informs
+    /// whether to widen bulk_sync coverage or add types to ws_sync's
+    /// per-ledger fetch. Aggregated into FfiStats.db_fallback_by_le_type
+    /// at end of apply_ledger_in_order. Only populated when RPC fallback
+    /// is enabled (see `rpc_fallback_enabled`).
+    pub fallback_by_le_type: parking_lot::Mutex<std::collections::BTreeMap<String, u64>>,
+    /// Last-N fallback samples for live dashboard visibility.
+    pub fallback_samples: parking_lot::Mutex<Vec<String>>,
+    /// When false (the default), snapshot misses return None directly
+    /// instead of round-tripping to rippled. Empirically rpc_sle_hits=0
+    /// across 15k+ probes in steady-state operation — state.rocks is
+    /// complete and every RPC fallback was entryNotFound, costing ~50ms
+    /// per probe for a guaranteed-None answer.
+    /// Set XRPL_FFI_RPC_FALLBACK=1 to re-enable the RPC path (useful for
+    /// catchup investigation where state.rocks may have transient gaps).
+    rpc_fallback_enabled: bool,
 }
 
 impl<'a> OverlayedDbProvider<'a> {
@@ -332,7 +349,43 @@ impl<'a> OverlayedDbProvider<'a> {
             arena: parking_lot::Mutex::new(Vec::with_capacity(16)),
             db_hits: std::sync::atomic::AtomicU64::new(0),
             rpc_fallbacks: std::sync::atomic::AtomicU64::new(0),
+            fallback_by_le_type: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
+            fallback_samples: parking_lot::Mutex::new(Vec::with_capacity(50)),
+            rpc_fallback_enabled: std::env::var_os("XRPL_FFI_RPC_FALLBACK").is_some(),
         }
+    }
+}
+
+/// Decode an SLE's LedgerEntryType from its binary form.
+/// SLE format starts with `0x11 [type_u16_be]` (sfLedgerEntryType field).
+/// Returns a human name for known types, or "Type:0xXXXX" for unknown.
+fn parse_le_type_name(bytes: &[u8]) -> String {
+    if bytes.len() < 3 || bytes[0] != 0x11 {
+        return "Unknown".to_string();
+    }
+    let t = u16::from_be_bytes([bytes[1], bytes[2]]);
+    match t {
+        0x0061 => "AccountRoot".to_string(),
+        0x0064 => "DirectoryNode".to_string(),
+        0x0066 => "Amendments".to_string(),
+        0x0068 => "FeeSettings".to_string(),
+        0x006C => "LedgerHashes".to_string(),
+        0x006E => "Escrow".to_string(),
+        0x006F => "Offer".to_string(),
+        0x0070 => "PayChannel".to_string(),
+        0x0072 => "RippleState".to_string(),
+        0x0073 => "SignerList".to_string(),
+        0x0074 => "Ticket".to_string(),
+        0x0076 => "Check".to_string(),
+        0x0077 => "DepositPreauth".to_string(),
+        0x0078 => "NegativeUNL".to_string(),
+        0x0037 => "NFTokenOffer".to_string(),
+        0x0050 => "NFTokenPage".to_string(),
+        0x0079 => "AMM".to_string(),
+        0x007E => "Oracle".to_string(),
+        0x007F => "MPTokenIssuance".to_string(),
+        0x007C => "MPToken".to_string(),
+        _ => format!("Type:0x{:04X}", t),
     }
 }
 
@@ -366,9 +419,26 @@ impl<'a> SleProvider for OverlayedDbProvider<'a> {
                 return Some(std::slice::from_raw_parts(last.as_ptr(), last.len()));
             }
         }
-        // 3. RPC fallback (unsynced SLE, or DB was never populated with it)
+        // 3. State.rocks miss. Counter-only by default — empirically
+        // rpc_sle_hits=0 across 15k+ probes in steady-state operation,
+        // so the RPC fallback was a guaranteed-None ~50ms detour. The
+        // XRPL_FFI_RPC_FALLBACK=1 env var re-enables the round trip
+        // (use during catchup investigation when state.rocks may have
+        // transient gaps).
         self.rpc_fallbacks.fetch_add(1, Ordering::Relaxed);
-        self.rpc_fallback.read(key)
+        if !self.rpc_fallback_enabled {
+            return None;
+        }
+        let result = self.rpc_fallback.read(key);
+        if let Some(bytes) = result {
+            let type_name = parse_le_type_name(bytes);
+            *self.fallback_by_le_type.lock().entry(type_name.clone()).or_insert(0) += 1;
+            let mut samples = self.fallback_samples.lock();
+            if samples.len() < 50 {
+                samples.push(format!("{}: {}…", type_name, &hex::encode_upper(key)[..16]));
+            }
+        }
+        result
     }
 
     fn succ(&self, key: &[u8; 32], last: Option<&[u8; 32]>) -> Option<[u8; 32]> {
@@ -537,6 +607,12 @@ pub struct FfiStats {
     /// db_hits = served from local DB; db_rpc_fallbacks = fell through to RPC.
     pub db_hits: u64,
     pub db_rpc_fallbacks: u64,
+    /// Per-LedgerEntryType breakdown of which SLEs fell through to RPC.
+    /// Tells us which classes are missing from state.rocks so we can target
+    /// bulk_sync coverage / per-ledger fetch.
+    pub db_fallback_by_le_type: std::collections::BTreeMap<String, u64>,
+    /// Last-50 fallback samples ("AccountRoot: 587E2897…") for the dashboard.
+    pub db_fallback_samples: Vec<String>,
     /// Sample of up to 20 miss keys from the last ledger applied
     pub rpc_sle_miss_samples: Vec<String>,
     /// Sample of up to 10 diverged tx hashes (tx_type/TER/hash) for mainnet lookup
@@ -1232,6 +1308,19 @@ pub fn apply_ledger_in_order(
                 let mut s = stats.lock();
                 s.db_hits += h;
                 s.db_rpc_fallbacks += f;
+                // Per-type fallback aggregation
+                let by_type = provider.fallback_by_le_type.lock();
+                for (k, v) in by_type.iter() {
+                    *s.db_fallback_by_le_type.entry(k.clone()).or_insert(0) += v;
+                }
+                drop(by_type);
+                let new_samples = provider.fallback_samples.lock();
+                for sample in new_samples.iter() {
+                    s.db_fallback_samples.push(sample.clone());
+                    if s.db_fallback_samples.len() > 50 {
+                        s.db_fallback_samples.remove(0);
+                    }
+                }
             }
             r
         } else {

@@ -105,6 +105,17 @@ def render():
             out.append(colored(f"    MUTATION DIVERGED: {mut_total:,}", "1;35"))
             for k, v in sorted(mut_types.items(), key=lambda x: -x[1])[:6]:
                 out.append(f"      {k:<46s} {colored(str(v), '35')}")
+        # RPC fallbacks by SLE type — keys our state.rocks is missing
+        db_h = ffi.get("db_hits", 0)
+        db_f = ffi.get("db_rpc_fallbacks", 0)
+        fb_total = db_h + db_f
+        fb_types = ffi.get("db_fallback_by_le_type", {})
+        if fb_total > 0:
+            pct = db_f / fb_total * 100 if fb_total else 0
+            color = "32" if pct < 1 else ("33" if pct < 5 else "36")
+            out.append(f"    {colored(f'RPC FALLBACKS: {db_f:,} / {fb_total:,} ({pct:.2f}%)', color)}")
+            for k, v in sorted(fb_types.items(), key=lambda x: -x[1])[:8]:
+                out.append(f"      {k:<46s} {colored(str(v), '36')}")
     elif isinstance(ffi, dict) and ffi.get("enabled") is False:
         out.append(colored("── libxrpl FFI Engine ──", "1;35"))
         out.append(f"  {colored('DISABLED', '33')} — {ffi.get('note', 'build with --features ffi')}")
