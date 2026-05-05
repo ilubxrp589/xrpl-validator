@@ -113,7 +113,7 @@ def render():
         if fb_total > 0:
             pct = db_f / fb_total * 100 if fb_total else 0
             color = "32" if pct < 1 else ("33" if pct < 5 else "36")
-            out.append(f"    {colored(f'RPC FALLBACKS: {db_f:,} / {fb_total:,} ({pct:.2f}%)', color)}")
+            out.append(f"    {colored(f'STATE.ROCKS MISSES: {db_f:,} / {fb_total:,} ({pct:.2f}%)', color)}")
             for k, v in sorted(fb_types.items(), key=lambda x: -x[1])[:8]:
                 out.append(f"      {k:<46s} {colored(str(v), '36')}")
     elif isinstance(ffi, dict) and ffi.get("enabled") is False:
