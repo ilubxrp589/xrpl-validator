@@ -297,52 +297,23 @@ async fn main() {
 
     // Persistent validator identity — same key across restarts
     let validator_identity = Arc::new({
-        use xrpl_core::address::KeyType;
-        use xrpl_core::crypto::signing::Seed;
-
         let seed_path = xrpl_node::paths::seed_path();
 
-        // SECURITY(6.1): Check seed file permissions — warn if group/other-readable
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if let Ok(meta) = std::fs::metadata(&seed_path) {
-                let mode = meta.mode();
-                if mode & 0o077 != 0 {
-                    eprintln!(
-                        "[SECURITY WARNING] Seed file {} has mode {:o} — readable by group/others! \
-                         Run: chmod 600 {}",
-                        seed_path, mode & 0o777, seed_path
-                    );
-                }
+        // VALAUDIT Phase 4 (va-04) — seed hygiene. Fatal on bad mode, atomic
+        // 0600 create, fatal on malformed seed (no silent identity rotation).
+        // See xrpl_node::paths::load_or_create_seed for full audit rationale.
+        let (seed, was_created) = match xrpl_node::paths::load_or_create_seed(&seed_path) {
+            Ok(pair) => pair,
+            Err(msg) => {
+                eprintln!("{msg}");
+                std::process::exit(1);
             }
-        }
-
-        let seed = if let Ok(hex_str) = std::fs::read_to_string(&seed_path) {
-            let hex_str = hex_str.trim();
-            if let Ok(bytes) = hex::decode(hex_str) {
-                if bytes.len() == 16 {
-                    let mut arr = [0u8; 16];
-                    arr.copy_from_slice(&bytes);
-                    eprintln!("[validator] Loaded persistent seed from {seed_path}");
-                    Seed { bytes: arr, key_type: KeyType::Secp256k1 }
-                } else {
-                    let s = Seed::generate_with_type(KeyType::Secp256k1);
-                    let _ = std::fs::write(&seed_path, hex::encode(&s.bytes));
-                    eprintln!("[validator] Generated new seed (saved to {seed_path})");
-                    s
-                }
-            } else {
-                let s = Seed::generate_with_type(KeyType::Secp256k1);
-                let _ = std::fs::write(&seed_path, hex::encode(&s.bytes));
-                s
-            }
-        } else {
-            let s = Seed::generate_with_type(KeyType::Secp256k1);
-            let _ = std::fs::write(&seed_path, hex::encode(&s.bytes));
-            eprintln!("[validator] Generated NEW seed (saved to {seed_path})");
-            s
         };
+        if was_created {
+            eprintln!("[validator] Generated NEW seed (saved to {seed_path}, mode 0600)");
+        } else {
+            eprintln!("[validator] Loaded persistent seed from {seed_path}");
+        }
         let identity = NodeIdentity::from_seed(&seed).expect("identity from seed failed");
         eprintln!("[validator] Signing key (Secp256k1): {}", identity.public_key_hex());
         eprintln!("[validator] Master key (Ed25519):    {}", hex::encode(identity.master_public_key()));

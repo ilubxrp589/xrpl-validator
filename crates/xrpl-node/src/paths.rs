@@ -61,6 +61,90 @@ pub fn seed_path() -> String {
     std::env::var("XRPL_SEED_PATH").unwrap_or_else(|_| format!("{}/validator_seed.hex", data_dir()))
 }
 
+/// Load the validator seed from disk, or create one with mode 0600 if absent.
+///
+/// VALAUDIT Phase 4 (va-04) hardens three failure modes the previous in-line
+/// loader silently allowed:
+///
+/// 1. **Permission check is FATAL on `mode & 0o077 != 0`** instead of warning.
+///    A group/other-readable seed file is a key compromise risk; the audit's
+///    finding was that the warn-only check let operators ignore the issue.
+/// 2. **Atomic create with mode 0600** via `OpenOptions::create_new().mode(0600)`
+///    closes the umask-race window between the previous `write()` (which used
+///    default umask) and any later `chmod`. The file never exists at any other
+///    permission.
+/// 3. **Malformed seed (bad hex / wrong length) is FATAL**, not silently
+///    regenerated. The previous code called `Seed::generate_with_type()` on any
+///    parse failure — catastrophic if a future bug breaks the parser on a valid
+///    file (operator's identity silently rotated, validator becomes byzantine
+///    fork from its own UNL's perspective).
+///
+/// Returns `(Seed, was_created)` so the caller can log "Loaded" vs "Generated"
+/// without re-checking existence. Errors are formatted strings the caller
+/// should print and `exit(1)` on.
+#[cfg(unix)]
+pub fn load_or_create_seed(seed_path: &str) -> Result<(xrpl_core::crypto::signing::Seed, bool), String> {
+    use std::fs;
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use xrpl_core::address::KeyType;
+    use xrpl_core::crypto::signing::Seed;
+
+    match fs::metadata(seed_path) {
+        Ok(meta) => {
+            // 1. FATAL on bad mode — closes the warn-only audit finding.
+            let mode = meta.mode();
+            if mode & 0o077 != 0 {
+                return Err(format!(
+                    "FATAL: seed file {} has mode {:o} — readable by group or others. \
+                     Run: chmod 600 {}",
+                    seed_path, mode & 0o777, seed_path
+                ));
+            }
+            // 3. FATAL on malformed seed — refuse to silently regenerate identity.
+            let hex_str = fs::read_to_string(seed_path)
+                .map_err(|e| format!("FATAL: read seed file {}: {e}", seed_path))?;
+            let hex_str = hex_str.trim();
+            let bytes = hex::decode(hex_str)
+                .map_err(|e| format!(
+                    "FATAL: seed file {} contains invalid hex ({e}). \
+                     Refusing to silently regenerate validator identity.",
+                    seed_path
+                ))?;
+            if bytes.len() != 16 {
+                return Err(format!(
+                    "FATAL: seed file {} has {} bytes, expected 16. \
+                     Refusing to silently regenerate validator identity.",
+                    seed_path, bytes.len()
+                ));
+            }
+            let mut arr = [0u8; 16];
+            arr.copy_from_slice(&bytes);
+            Ok((Seed { bytes: arr, key_type: KeyType::Secp256k1 }, false))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Ensure the parent directory exists so create_new() can succeed.
+            if let Some(parent) = std::path::Path::new(seed_path).parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            // 2. Atomic create with 0600 — no window for the file to exist at
+            //    any wider mode.
+            let s = Seed::generate_with_type(KeyType::Secp256k1);
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(seed_path)
+                .map_err(|e| format!("FATAL: create seed file {}: {e}", seed_path))?;
+            f.write_all(hex::encode(s.bytes).as_bytes())
+                .map_err(|e| format!("FATAL: write seed {}: {e}", seed_path))?;
+            f.sync_all().ok();
+            Ok((s, true))
+        }
+        Err(e) => Err(format!("FATAL: stat seed file {}: {e}", seed_path)),
+    }
+}
+
 /// FFI engine state snapshot path (JSON). Honors `XRPL_ENGINE_STATE_PATH` if set.
 pub fn engine_state_path() -> String {
     std::env::var("XRPL_ENGINE_STATE_PATH").unwrap_or_else(|_| format!("{}/engine_state.json", data_dir()))
