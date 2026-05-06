@@ -29,6 +29,19 @@ export function HeroBanner() {
   const { engine, stateHash } = data;
   const ffi = engine.ffi_verifier;
 
+  // VALAUDIT Phase 3 (va-03) signing-gate state.
+  //   ACTIVE  — gate is open, validator signing on its own merit
+  //   WARMUP  — bootstrapping; <3 consecutive matches, gate refusing
+  //   ALERT   — gate closed mid-session OR zero_hash > 0 (anomalous)
+  const skipNotReady = stateHash.validations_skipped_not_ready ?? 0;
+  const skipZeroHash = stateHash.validations_skipped_zero_hash ?? 0;
+  const gateState: 'active' | 'warmup' | 'alert' =
+    skipZeroHash > 0
+      ? 'alert'
+      : stateHash.ready_to_sign
+      ? 'active'
+      : 'warmup';
+
   // Agreement calculation
   const attempted = ffi.live_apply_attempted || 0;
   const agreement =
@@ -76,6 +89,48 @@ export function HeroBanner() {
   return (
     <section className="bg-halcyon-bg px-4 pb-8 pt-10">
       <div className="mx-auto max-w-7xl">
+        {/* ---- VALAUDIT Phase 3 Signing Gate banner ---- */}
+        <div className="mb-3 flex justify-center">
+          {gateState === 'active' ? (
+            <div
+              className="flex items-center gap-3 rounded-lg border-2 border-halcyon-accent bg-halcyon-accent/10 px-5 py-2 text-halcyon-accent shadow-[0_0_24px_#00FF9F40]"
+              title="Validator refuses to sign until its independently-computed state hash matches the network's for 3 consecutive ledgers (VALAUDIT Phase 3)"
+            >
+              <span className="relative flex h-2.5 w-2.5">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-halcyon-accent opacity-75" />
+                <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-halcyon-accent" />
+              </span>
+              <span className="font-mono text-sm font-bold uppercase tracking-widest">
+                ✓ Signing Gate Active
+              </span>
+              <span className="text-[10px] font-medium uppercase tracking-wide text-halcyon-accent/70">
+                {fmtCompact(stateHash.consecutive_matches)} consecutive matches
+                {skipNotReady > 0 && ` · ${skipNotReady} warmup skipped`}
+              </span>
+            </div>
+          ) : gateState === 'warmup' ? (
+            <div
+              className="flex items-center gap-3 rounded-lg border border-amber-400 bg-amber-400/10 px-5 py-2 text-amber-400"
+              title="Validator is gating signing — needs 3 consecutive state-hash matches before it will sign"
+            >
+              <span className="h-2 w-2 rounded-full bg-amber-400 animate-pulse" />
+              <span className="font-mono text-xs uppercase tracking-widest font-semibold">
+                Signing Gate Warmup · {stateHash.consecutive_matches}/3 matches
+              </span>
+            </div>
+          ) : (
+            <div
+              className="flex items-center gap-3 rounded-lg border-2 border-halcyon-danger bg-halcyon-danger/10 px-5 py-2 text-halcyon-danger"
+              title="Signing gate alert — anomalous skip events. Investigate logs."
+            >
+              <span className="h-2.5 w-2.5 rounded-full bg-halcyon-danger animate-ping" />
+              <span className="font-mono text-sm font-bold uppercase tracking-widest">
+                ⚠ Gate Alert · zero_hash {skipZeroHash}
+              </span>
+            </div>
+          )}
+        </div>
+
         {/* ---- Stage 3 banner — big + obvious ---- */}
         <div className="mb-6 flex justify-center">
           {stage3Enabled ? (

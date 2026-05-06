@@ -18,6 +18,7 @@ export function MetricsGrid() {
   }
 
   const f = data.engine.ffi_verifier;
+  const sh = data.stateHash;
   const attempted = f.live_apply_attempted || 1;
   const ok = f.live_apply_ok;
   const claimed = f.live_apply_claimed;
@@ -29,9 +30,29 @@ export function MetricsGrid() {
   const p95 = histPercentile(f.apply_duration_buckets_ms, f.apply_duration_count, 0.95);
   const p99 = histPercentile(f.apply_duration_buckets_ms, f.apply_duration_count, 0.99);
 
+  // FFI replay quality (post-VALAUDIT fixes — should all read 0)
+  const silent = f.live_apply_silent_diverged ?? 0;
+  const mutation = f.live_apply_mutation_diverged ?? 0;
+
+  // State.rocks coverage. Fallbacks are libxrpl probing for non-existent
+  // SLEs (counter-only since e4500ad — no actual RPC round trip).
+  const dbHits = f.db_hits ?? 0;
+  const dbMisses = f.db_rpc_fallbacks ?? 0;
+  const dbTotal = dbHits + dbMisses;
+  const hitRate = dbTotal > 0 ? ((dbHits / dbTotal) * 100).toFixed(1) : '—';
+
+  // VALAUDIT Phase 3 (va-03) signing-gate counters
+  const skipNotReady = sh.validations_skipped_not_ready ?? 0;
+  const skipZeroHash = sh.validations_skipped_zero_hash ?? 0;
+  const skipTotal = skipNotReady + skipZeroHash;
+
   const metrics = [
     { label: 'TXs Applied', value: fmt(attempted), color: '#00FF9F' },
-    { label: 'Disagreements', value: fmt(diverged), color: diverged > 0 ? '#FF3366' : '#00FF9F' },
+    { label: 'Diverged', value: fmt(diverged), color: diverged > 0 ? '#FF3366' : '#00FF9F' },
+    { label: 'Silent Div', value: fmt(silent), color: silent > 0 ? '#F59E0B' : '#00FF9F' },
+    { label: 'Mutation Div', value: fmt(mutation), color: mutation > 0 ? '#F59E0B' : '#00FF9F' },
+    { label: 'DB Hit Rate', value: typeof hitRate === 'string' && hitRate !== '—' ? `${hitRate}%` : hitRate, color: '#00FF9F' },
+    { label: 'Skip (warmup)', value: fmt(skipTotal), color: skipZeroHash > 0 ? '#FF3366' : '#F59E0B' },
     { label: 'Median', value: median, color: '#00FF9F' },
     { label: 'p95', value: p95, color: '#F59E0B' },
     { label: 'p99', value: p99, color: '#F97316' },

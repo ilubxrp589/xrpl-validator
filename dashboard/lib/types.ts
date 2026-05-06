@@ -30,6 +30,10 @@ export interface FfiVerifier {
   shadow_hash_last_matched: boolean;
   db_hits: number;
   db_rpc_fallbacks: number;
+  /** Per-LedgerEntryType breakdown of state.rocks misses (only populated when
+   *  XRPL_FFI_RPC_FALLBACK is set; default skips RPC + leaves this empty). */
+  db_fallback_by_le_type?: Record<string, number>;
+  db_fallback_samples?: string[];
   health_checks: number;
   health_passed: number;
   /** True when XRPL_FFI_STAGE3=1 was read at start_ws_sync entry. */
@@ -37,6 +41,19 @@ export interface FfiVerifier {
   /** Rolling buffer of the last 50 txs applied by the FFI engine.
    *  Format: "L{seq} {tx_type}/{ter_name} {short_hash} {ms}ms mut={N}" */
   recent_tx_samples?: string[];
+  /** Silent divergences — same TER family on both sides but different code
+   *  (e.g. our tecINTERNAL vs network tesSUCCESS). Pre-fix: 20k+/12h.
+   *  Post all fixes: 0. */
+  live_apply_silent_diverged?: number;
+  /** Map "{tx_type}/{our_ter}->{net_ter}" → count. */
+  silent_diverged_by_pair?: Record<string, number>;
+  silent_diverged_samples?: string[];
+  /** Mutation-list divergences — same TER, different state changes
+   *  (BF6C928F class). Pre-fix: 92k+/10h. Post all fixes: 0. */
+  live_apply_mutation_diverged?: number;
+  /** Map "{tx_type}/{ter}" → count. */
+  mutation_diverged_by_type?: Record<string, number>;
+  mutation_diverged_samples?: string[];
 }
 
 export interface LiveEngine {
@@ -104,6 +121,11 @@ export interface StateHashStatus {
   compute_time_secs: number;
   computing: boolean;
   ready_to_sign: boolean;
+  /** VALAUDIT Phase 3 (va-03) signing-gate counters.
+   *  not_ready bumps when consecutive_matches < 3 at sign time.
+   *  zero_hash bumps when StatusChange arrives without ledger_hash. */
+  validations_skipped_not_ready?: number;
+  validations_skipped_zero_hash?: number;
   db_entries: number;
   wallet_count: number;
   /** Raw shape from the API is `[seq, count][]`, not objects. */
