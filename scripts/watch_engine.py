@@ -152,6 +152,14 @@ def render():
     mismatches = sh.get("total_mismatches", 0) if isinstance(sh, dict) else 0
     consec = sh.get("consecutive_matches", 0) if isinstance(sh, dict) else 0
     out.append(f"  {colored(f'{matches:,}', '32')} matches | {colored(f'{mismatches:,}', '31' if mismatches else '32')} mismatches | {consec} consecutive")
+    # VALAUDIT Phase 3 (va-03) signing-gate counters
+    skip_nr = sh.get("validations_skipped_not_ready", 0) if isinstance(sh, dict) else 0
+    skip_zh = sh.get("validations_skipped_zero_hash", 0) if isinstance(sh, dict) else 0
+    skip_total = skip_nr + skip_zh
+    if skip_total > 0:
+        # ~3 skips at warmup is normal; persistent growth is the signal
+        skip_color = "33" if skip_nr <= 5 and skip_zh == 0 else "31"
+        out.append(f"  {colored(f'VALIDATIONS SKIPPED: {skip_total:,}', skip_color)}  (not_ready: {skip_nr:,}, zero_hash: {skip_zh:,})")
 
     # Shadow state hash (FFI-derived)
     sha_att = ffi.get("shadow_hash_attempted", 0) if isinstance(ffi, dict) else 0

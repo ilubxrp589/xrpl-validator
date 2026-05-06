@@ -1175,21 +1175,58 @@ async fn main() {
                                     } else { None })
                                     .unwrap_or([0u8; 32]);
 
-                                // Always sign with the network's ledger_hash (hash of full header).
-                                // Our state verification confirms account_hash is correct,
-                                // which is one component of the ledger header.
-                                // "OUR_HASH" means we've independently verified the state.
-                                let hash_source = if state_hash_for_close.is_ready_to_sign() {
-                                    "VERIFIED"
-                                } else {
-                                    "network"
-                                };
+                                // VALAUDIT Phase 3 (va-03) — Signing Gate, simple form.
+                                // Refuse to sign until our independently-computed
+                                // account_hash has matched the network's for at least
+                                // 3 consecutive ledgers (StateHashComputer::is_ready_to_sign).
+                                //
+                                // Pre-Phase-3 behavior: hash_source was just a log label;
+                                // the validator signed network_hash_bytes regardless of
+                                // whether we'd verified anything. Per the audit, that gate
+                                // was tautological and effectively a no-op security control.
+                                //
+                                // Post-Phase-3: skip categorically (no sign, no broadcast)
+                                // for either of two reasons, both counted for /metrics +
+                                // /api/state-hash visibility:
+                                //   - not_ready: consecutive_matches < 3
+                                //   - zero_hash: StatusChange arrived without ledger_hash
+                                //
+                                // Operational expectation: ~3 not_ready skips at warmup
+                                // after every restart, then a clean stream of VERIFIED
+                                // signs forever. Mainnet 7-day watch confirms this.
+                                use std::sync::atomic::Ordering;
+                                if network_hash_bytes == [0u8; 32] {
+                                    state_hash_for_close.validations_skipped_zero_hash
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    eprintln!("[validator] Declining to sign #{seq}: zero ledger_hash from StatusChange");
+                                    let _ = val_sse.send(MessageEvent {
+                                        seq: 0, time: 0.0,
+                                        msg_type: "ValidationSkipped".into(),
+                                        detail: format!("zero ledger_hash from StatusChange"),
+                                        ledger_seq: Some(seq),
+                                        ledger_hash: None, peers: None, validator: None, tx_info: None,
+                                    });
+                                    continue;
+                                }
+                                if !state_hash_for_close.is_ready_to_sign() {
+                                    let n = state_hash_for_close.consecutive_matches.load(Ordering::Acquire);
+                                    state_hash_for_close.validations_skipped_not_ready
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    eprintln!("[validator] Declining to sign #{seq}: only {n} consecutive matches (need 3)");
+                                    let _ = val_sse.send(MessageEvent {
+                                        seq: 0, time: 0.0,
+                                        msg_type: "ValidationSkipped".into(),
+                                        detail: format!("only {n} consecutive matches (need 3)"),
+                                        ledger_seq: Some(seq),
+                                        ledger_hash: None, peers: None, validator: None, tx_info: None,
+                                    });
+                                    continue;
+                                }
+                                let hash_source = "VERIFIED";
                                 let ledger_hash_bytes = network_hash_bytes;
 
-                                // Don't sign if we don't have a real hash
-                                if ledger_hash_bytes == [0u8; 32] {
-                                    eprintln!("[validator] No ledger hash for #{seq}, skipping");
-                                } else {
+                                // Gate passed (ready_to_sign && non-zero hash) — proceed.
+                                {
 
                                 // On flag ledgers (every 256th), include amendment votes
                                 let amendments = if xrpl_node::consensus::amendment_vote::is_flag_ledger(seq) {
@@ -1236,7 +1273,7 @@ async fn main() {
                                     });
                                     eprintln!("[validator] Signed validation for ledger #{seq} hash={hash_short}... (src={hash_source})");
                                 }
-                                } // else (has real hash)
+                                } // gate-passed scope
                             }
                         }
                     }
@@ -1344,6 +1381,10 @@ async fn main() {
                         state_objects: db_entries,
                         ready_to_sign: hash_status.ready_to_sign,
                         total_txs: engine.total_txs,
+                        validations_skipped_not_ready: prom_hash.validations_skipped_not_ready
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        validations_skipped_zero_hash: prom_hash.validations_skipped_zero_hash
+                            .load(std::sync::atomic::Ordering::Relaxed),
                     };
                     let body = xrpl_node::rpc::metrics::render_prometheus(&snap);
                     (
@@ -1537,6 +1578,15 @@ async fn main() {
                     );
                     status["wallet_history"] = serde_json::json!(
                         hash_status.wallet_history.lock().clone()
+                    );
+                    // VALAUDIT Phase 3 (va-03) signing-gate skip counters.
+                    status["validations_skipped_not_ready"] = serde_json::json!(
+                        hash_status.validations_skipped_not_ready
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                    );
+                    status["validations_skipped_zero_hash"] = serde_json::json!(
+                        hash_status.validations_skipped_zero_hash
+                            .load(std::sync::atomic::Ordering::Relaxed)
                     );
                     axum::Json(status)
                 }

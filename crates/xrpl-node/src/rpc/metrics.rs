@@ -52,6 +52,9 @@ pub struct ValidatorMetricsSnapshot {
     pub state_objects: u64,
     pub ready_to_sign: bool,
     pub total_txs: u64,
+    /// VALAUDIT Phase 3 (va-03) signing-gate skip counters.
+    pub validations_skipped_not_ready: u64,
+    pub validations_skipped_zero_hash: u64,
 }
 
 /// Render full validator metrics in Prometheus text exposition format.
@@ -113,6 +116,11 @@ pub fn render_prometheus(snap: &ValidatorMetricsSnapshot) -> String {
          # TYPE xrpl_validator_transactions_total counter\n\
          xrpl_validator_transactions_total {}\n\
          \n\
+         # HELP xrpl_validator_validations_skipped_total Validations the va-03 signing gate refused to sign, by reason\n\
+         # TYPE xrpl_validator_validations_skipped_total counter\n\
+         xrpl_validator_validations_skipped_total{{reason=\"not_ready\"}} {}\n\
+         xrpl_validator_validations_skipped_total{{reason=\"zero_hash\"}} {}\n\
+         \n\
          # HELP xrpl_validator_info Validator identity and version info\n\
          # TYPE xrpl_validator_info gauge\n\
          xrpl_validator_info{{version=\"0.1.0\",implementation=\"rust\",domain=\"{domain}\"}} 1\n",
@@ -129,6 +137,8 @@ pub fn render_prometheus(snap: &ValidatorMetricsSnapshot) -> String {
         snap.messages_received,
         snap.messages_sent,
         snap.total_txs,
+        snap.validations_skipped_not_ready,
+        snap.validations_skipped_zero_hash,
         domain = domain,
     )
 }
@@ -153,10 +163,14 @@ mod tests {
             state_objects: 18750000,
             ready_to_sign: true,
             total_txs: 100000,
+            validations_skipped_not_ready: 3,
+            validations_skipped_zero_hash: 0,
         };
         let output = render_prometheus(&snap);
         assert!(output.contains("xrpl_validator_uptime_seconds 3600"));
         assert!(output.contains("xrpl_validator_consecutive_matches 500"));
+        assert!(output.contains("xrpl_validator_validations_skipped_total{reason=\"not_ready\"} 3"));
+        assert!(output.contains("xrpl_validator_validations_skipped_total{reason=\"zero_hash\"} 0"));
         assert!(output.contains("xrpl_validator_state_objects 18750000"));
         assert!(output.contains("xrpl_validator_ready_to_sign 1"));
         assert!(output.contains("xrpl_validator_info{"));

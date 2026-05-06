@@ -306,6 +306,14 @@ pub struct StateHashComputer {
     pub wallet_count: Arc<std::sync::atomic::AtomicU64>,
     /// Recent wallet count history (ledger_seq, count) for graphing. Ring buffer, last 300.
     pub wallet_history: Arc<Mutex<Vec<(u32, u64)>>>,
+    /// Validations refused because is_ready_to_sign() returned false (not enough
+    /// consecutive state-hash matches). Bumped by the live_viewer signing path
+    /// when the va-03 gate fires. Surfaces in /metrics + /api/state-hash.
+    pub validations_skipped_not_ready: Arc<AtomicU64>,
+    /// Validations refused because StatusChange's ledger_hash was zero/missing.
+    /// Bumped by the live_viewer signing path when network's ledger_hash
+    /// arrives blank. Surfaces in /metrics + /api/state-hash.
+    pub validations_skipped_zero_hash: Arc<AtomicU64>,
 }
 
 impl StateHashComputer {
@@ -322,7 +330,21 @@ impl StateHashComputer {
             dirty_branches: Arc::new(Mutex::new(0xFFFF)),
             wallet_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             wallet_history: Arc::new(Mutex::new(Vec::with_capacity(300))),
+            validations_skipped_not_ready: Arc::new(AtomicU64::new(0)),
+            validations_skipped_zero_hash: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Test-only helper: directly set consecutive_matches.
+    /// Marked `#[doc(hidden)]` instead of `#[cfg(test)]` because integration
+    /// tests live in their own crate and don't see `cfg(test)` items from
+    /// dependencies. Used by `tests/signing_gate.rs` to verify the va-03
+    /// gate's behavior across its threshold without needing a real ws_sync
+    /// run. Production code paths reach this counter via `process_ledger`
+    /// which calls fetch_add/store directly.
+    #[doc(hidden)]
+    pub fn test_set_consecutive_matches(&self, n: u32) {
+        self.consecutive_matches.store(n, Ordering::Release);
     }
 
     /// Clone the current FlatHasher for shadow hash computation.
