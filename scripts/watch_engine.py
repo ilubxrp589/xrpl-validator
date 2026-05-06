@@ -157,8 +157,11 @@ def render():
     skip_zh = sh.get("validations_skipped_zero_hash", 0) if isinstance(sh, dict) else 0
     skip_total = skip_nr + skip_zh
     if skip_total > 0:
-        # ~3 skips at warmup is normal; persistent growth is the signal
-        skip_color = "33" if skip_nr <= 5 and skip_zh == 0 else "31"
+        # not_ready up to ~100 = normal warmup (hasher build window swallows
+        # incoming ledgers). zero_hash ALWAYS anomalous (StatusChange without
+        # ledger_hash means an upstream feed problem). Operators read the
+        # absolute number — colors reflect "warmup-band" vs "always wrong".
+        skip_color = "31" if skip_zh > 0 else ("33" if skip_nr <= 100 else "1;31")
         out.append(f"  {colored(f'VALIDATIONS SKIPPED: {skip_total:,}', skip_color)}  (not_ready: {skip_nr:,}, zero_hash: {skip_zh:,})")
 
     # Shadow state hash (FFI-derived)
