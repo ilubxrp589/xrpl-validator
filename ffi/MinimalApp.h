@@ -1,6 +1,6 @@
 // MinimalApp.h — minimum ripple::Application needed to call apply()/preflight().
 //
-// Built against rippled 3.1.2 stable (Application.h). Implements only the
+// Built against rippled 3.1.3 stable (Application.h). Implements only the
 // methods the tx apply path actually touches. Everything else throws.
 //
 // Real implementations (called by the apply chain in Transactor.cpp / Payment.cpp):
@@ -41,7 +41,7 @@ namespace ripple {
 /** Minimum viable Application for running ripple::apply() in a standalone
  *  replay context. Owns real Config / Logs / HashRouter / LoadFeeTrack
  *  instances, stubs everything else. OrderBookDB is used directly (concrete
- *  class in 3.1.2, no virtuals) — never calling setup() keeps it empty. */
+ *  class in 3.1.3, no virtuals) — never calling setup() keeps it empty. */
 class MinimalApp : public Application
 {
 public:

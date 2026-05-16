@@ -99,7 +99,7 @@ print(f'State Hash: {d.get(\"total_matches\",0)} matches, {d.get(\"consecutive_m
 ```
 Rust (29,800 lines)          C++ FFI (2,314 lines)
   |                            |
-  Peer protocol                libxrpl 3.1.2
+  Peer protocol                libxrpl 3.1.3
   Consensus tracking           (rippled's tx engine)
   State storage (RocksDB)      |
   SHAMap hashing               preflight()
