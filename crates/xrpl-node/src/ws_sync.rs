@@ -32,6 +32,35 @@ pub async fn start_ws_sync(
 ) {
     let rpc = RippledClient::new();
 
+    // Drift watchdog: independent poller of rippled's validated_ledger.seq.
+    // The WebSocket subscription can silently buffer/lag and we wouldn't know
+    // about it from inside the read loop. The watchdog measures the network's
+    // live edge via HTTP RPC every 5s. The main loop compares last_processed
+    // against this atomic and forces a WebSocket reconnect when drift exceeds
+    // the threshold — reconnecting flushes any buffered/stale subscription
+    // and lets the existing hash-verified gap-fill code catch up cleanly.
+    let watchdog_live_edge: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+    let watchdog_alarms: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+    {
+        let live_edge_w = watchdog_live_edge.clone();
+        let rpc_w = rpc.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                match rpc_w.call("server_info", serde_json::json!({})).await {
+                    Ok(json) => {
+                        if let Some(seq) = json["result"]["info"]["validated_ledger"]["seq"].as_u64() {
+                            live_edge_w.store(seq as u32, Ordering::Release);
+                        }
+                    }
+                    Err(_) => {
+                        // rippled momentarily unreachable; don't alarm, just retry next tick.
+                    }
+                }
+            }
+        });
+    }
+
     #[cfg(feature = "ffi")]
     let stage3_cfg = crate::stage3::Stage3Config::from_env();
     #[cfg(feature = "ffi")]
@@ -50,6 +79,11 @@ pub async fn start_ws_sync(
     if let Some(ref verifier) = ffi_verifier {
         verifier.shared_stats().lock().stage3_enabled = stage3_cfg.enabled;
     }
+
+    // Watchdog hysteresis state: tracks the last time the watchdog forced a
+    // WebSocket reconnect. Prevents reconnect-spam if rippled momentarily
+    // stutters or we're catching up after a real fault. 30s minimum gap.
+    let mut last_watchdog_reconnect_ms: u64 = 0;
 
     loop {
         let ws_url = rpc.ws_url();
@@ -140,12 +174,35 @@ pub async fn start_ws_sync(
                     #[cfg(feature = "ffi")]
                     let mut ffi_overlay_opt: Option<crate::ffi_engine::LedgerOverlay> = None;
 
+                    // A: kick off tx_blobs fetch in parallel with metadata fetch
+                    // when we know we'll need it (FFI shadow won't be skipped).
+                    // Saves ~50ms per ledger by overlapping the two RPCs.
+                    #[cfg(feature = "ffi")]
+                    let tx_blobs_handle = {
+                        let lag = closed_seq.saturating_sub(process_seq);
+                        if lag <= 25 && ffi_verifier.is_some() {
+                            let rpc_c = rpc.clone();
+                            let seq_c = process_seq;
+                            Some(tokio::spawn(async move {
+                                fetch_ledger_tx_blobs(&rpc_c, seq_c).await
+                            }))
+                        } else {
+                            None
+                        }
+                    };
+
                     let mut meta_ok = false;
                     let mut ledger_header: LedgerHeader = LedgerHeader::default();
+                    // B: capture sorted_txs so we can extract outcomes/mutations
+                    // from the same JSON later, instead of making a duplicate RPC.
+                    #[cfg(feature = "ffi")]
+                    let mut sorted_txs: Vec<serde_json::Value> = Vec::new();
                     for attempt in 0..3u32 {
                         match fetch_ledger_metadata(&rpc, process_seq, &mut acc_modified, &mut acc_deleted, &mut acc_tx_count).await {
-                            Ok((_sorted_txs, hdr, wallet_delta)) => {
+                            Ok((_txs, hdr, wallet_delta)) => {
                                 ledger_header = hdr;
+                                #[cfg(feature = "ffi")]
+                                { sorted_txs = _txs; }
                                 if wallet_delta != 0 {
                                     hash_comp.adjust_wallet_count(wallet_delta, process_seq);
                                 }
@@ -189,18 +246,68 @@ pub async fn start_ws_sync(
                     // FFI independent verification — blocking, spawn off-thread.
                     // Use OwnedSnapshot when DB is caught up (steady state),
                     // fall back to pure RPC during catchup (stale DB = crash).
+                    //
+                    // Skip the shadow check when ws-sync is far behind the live
+                    // edge. Each shadow check fires N parallel ledger_entry RPCs
+                    // (one per modified/deleted key); when catching up, that
+                    // budget is better spent advancing process_seq. The shadow
+                    // check is diagnostic in Phase A, so skipping it during
+                    // catchup loses observability but not correctness.
                     #[cfg(feature = "ffi")]
-                    if meta_ok {
+                    let skip_shadow_for_catchup = closed_seq.saturating_sub(process_seq) > 25;
+                    #[cfg(feature = "ffi")]
+                    if meta_ok && !skip_shadow_for_catchup {
                         if let Some(ref verifier) = ffi_verifier {
-                            let tx_blobs = fetch_ledger_tx_blobs(&rpc, process_seq).await;
+                            // A: tx_blobs was started in parallel with metadata
+                            // (when lag<=25 and ffi_verifier present). Just await
+                            // the spawned task here. Sequential path remains as
+                            // fallback for the rare case the handle wasn't created.
+                            let tx_blobs = match tx_blobs_handle {
+                                Some(h) => h.await.unwrap_or_default(),
+                                None => fetch_ledger_tx_blobs(&rpc, process_seq).await,
+                            };
                             if !tx_blobs.is_empty() {
                                 let v = verifier.clone();
                                 let hdr = ledger_header.clone();
                                 let seq = process_seq;
-                                // Network's recorded TransactionResult AND
-                                // AffectedNodes per tx, for silent- and
-                                // mutation-divergence detection.
-                                let (expected_outcomes, expected_mutations) = fetch_ledger_expected_outcomes(&rpc, process_seq).await;
+                                // B: extract outcomes + mutations from the txs we
+                                // already fetched via fetch_ledger_metadata. The
+                                // previous code re-fetched the same JSON via a
+                                // duplicate RPC (fetch_ledger_expected_outcomes),
+                                // costing ~50ms per ledger for no reason.
+                                let mut expected_outcomes: std::collections::HashMap<String, String> =
+                                    std::collections::HashMap::new();
+                                let mut expected_mutations: std::collections::HashMap<String, Vec<(String, u8)>> =
+                                    std::collections::HashMap::new();
+                                for tx in &sorted_txs {
+                                    let hash = match tx["hash"].as_str() {
+                                        Some(h) => h.to_uppercase(),
+                                        None => continue,
+                                    };
+                                    if let Some(result) = tx["metaData"]["TransactionResult"].as_str() {
+                                        expected_outcomes.insert(hash.clone(), result.to_string());
+                                    }
+                                    if let Some(nodes) = tx["metaData"]["AffectedNodes"].as_array() {
+                                        let mut entries: Vec<(String, u8)> = Vec::with_capacity(nodes.len());
+                                        for node in nodes.iter() {
+                                            let (kind_byte, inner) = if node.get("CreatedNode").is_some() {
+                                                (0u8, &node["CreatedNode"])
+                                            } else if node.get("ModifiedNode").is_some() {
+                                                (1u8, &node["ModifiedNode"])
+                                            } else if node.get("DeletedNode").is_some() {
+                                                (2u8, &node["DeletedNode"])
+                                            } else {
+                                                continue;
+                                            };
+                                            if let Some(idx) = inner["LedgerIndex"].as_str() {
+                                                entries.push((idx.to_uppercase(), kind_byte));
+                                            }
+                                        }
+                                        if !entries.is_empty() {
+                                            expected_mutations.insert(hash, entries);
+                                        }
+                                    }
+                                }
                                 let synced = last_synced.load(Ordering::Acquire);
                                 let steady = synced > 0 && process_seq.saturating_sub(synced) <= 2;
                                 let shadow_ah = account_hash.clone();
@@ -216,42 +323,62 @@ pub async fn start_ws_sync(
                                 // entryNotFound (treat as deleted), or fetch_error. If ANY
                                 // modified key fails to fetch, abort the shadow check rather
                                 // than reporting a false mismatch with an incomplete overlay.
+                                //
+                                // Parallelize across keys: a single ledger may modify 100-300
+                                // state objects. Serial RPC for each (50ms+) blew the per-ledger
+                                // budget by 5-15s and was the underlying cause of ws-sync drift.
+                                // buffer_unordered(16) caps concurrent in-flight requests at 16,
+                                // which rippled handles fine on its IO thread pool.
                                 let mut shadow_fetch_ok = true;
                                 let proto_modified: Vec<(String, Option<String>)> = {
                                     let mut keys: Vec<String> = acc_modified.iter().cloned().collect();
                                     keys.extend(acc_deleted.iter().map(|k| k.clone()));
-                                    let mut results = Vec::with_capacity(keys.len());
-                                    for key_hex in &keys {
-                                        if key_hex.len() != 64 { continue; }
-                                        let mut classified: Option<Option<String>> = None;
-                                        for attempt in 0..3u32 {
-                                            match rpc.call("ledger_entry", serde_json::json!({
-                                                "index": key_hex,
-                                                "ledger_index": process_seq,
-                                                "binary": true
-                                            })).await {
-                                                Ok(b) => {
-                                                    if let Some(s) = b["result"]["node_binary"].as_str() {
-                                                        classified = Some(Some(s.to_string()));
-                                                        break;
-                                                    } else if b["result"]["error"].as_str() == Some("entryNotFound") {
-                                                        classified = Some(None);
-                                                        break;
-                                                    } else if attempt == 2 {
-                                                        break;
+                                    keys.retain(|k| k.len() == 64);
+
+                                    let seq_for_fetch = process_seq;
+                                    let fetched: Vec<(String, Option<Option<String>>)> =
+                                        futures_util::stream::iter(keys.into_iter())
+                                            .map(|key_hex| {
+                                                let rpc = rpc.clone();
+                                                async move {
+                                                    let mut classified: Option<Option<String>> = None;
+                                                    for attempt in 0..3u32 {
+                                                        match rpc.call("ledger_entry", serde_json::json!({
+                                                            "index": key_hex,
+                                                            "ledger_index": seq_for_fetch,
+                                                            "binary": true
+                                                        })).await {
+                                                            Ok(b) => {
+                                                                if let Some(s) = b["result"]["node_binary"].as_str() {
+                                                                    classified = Some(Some(s.to_string()));
+                                                                    break;
+                                                                } else if b["result"]["error"].as_str() == Some("entryNotFound") {
+                                                                    classified = Some(None);
+                                                                    break;
+                                                                }
+                                                            }
+                                                            Err(_) => {}
+                                                        }
+                                                        if attempt < 2 {
+                                                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                                        }
                                                     }
+                                                    (key_hex, classified)
                                                 }
-                                                Err(_) if attempt == 2 => break,
-                                                Err(_) => {}
-                                            }
-                                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                                        }
+                                            })
+                                            .buffer_unordered(16)
+                                            .collect()
+                                            .await;
+
+                                    let mut results = Vec::with_capacity(fetched.len());
+                                    for (key_hex, classified) in fetched {
                                         match classified {
-                                            Some(c) => results.push((key_hex.clone(), c)),
+                                            Some(c) => results.push((key_hex, c)),
                                             None => {
+                                                if shadow_fetch_ok {
+                                                    eprintln!("[ffi-shadow] #{process_seq}: fetch failed for {} — skipping shadow check", &key_hex[..16]);
+                                                }
                                                 shadow_fetch_ok = false;
-                                                eprintln!("[ffi-shadow] #{process_seq}: fetch failed for {} — skipping shadow check", &key_hex[..16]);
-                                                break;
                                             }
                                         }
                                     }
@@ -344,6 +471,30 @@ pub async fn start_ws_sync(
                         last_synced.store(process_seq, Ordering::Release);
                     }
                 } // end for process_seq
+
+                // Watchdog: compare last_processed against the independently-polled
+                // network live edge. The WebSocket subscription can silently lag
+                // (TCP backpressure, rippled queueing). If we're far behind, force
+                // a reconnect so the next subscribe lands at the real live edge
+                // and the existing gap-fill code catches us up cleanly.
+                let live = watchdog_live_edge.load(Ordering::Acquire);
+                if live > 0 && last_processed > 0 {
+                    let lag = live.saturating_sub(last_processed);
+                    if lag > 50 {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        if now_ms.saturating_sub(last_watchdog_reconnect_ms) > 30_000 {
+                            watchdog_alarms.fetch_add(1, Ordering::Relaxed);
+                            eprintln!(
+                                "[ws-sync] WATCHDOG: lag={lag} (last_processed=#{last_processed}, live=#{live}) — forcing WebSocket reconnect"
+                            );
+                            last_watchdog_reconnect_ms = now_ms;
+                            break; // exits the while-let, outer loop reconnects fresh
+                        }
+                    }
+                }
 
                 first_ledger = false;
                 acc_seq = closed_seq + 1;
@@ -550,66 +701,6 @@ async fn fetch_ledger_metadata(
         *tx_count += 1;
     }
     Ok((sorted_txs, header, wallet_delta))
-}
-
-/// Fetch the network's recorded TransactionResult AND AffectedNodes for
-/// every tx in `seq`, keyed by uppercase tx_hash. Used by silent- and
-/// mutation-divergence detection. One extra RPC per ledger (non-binary
-/// expand mode for JSON `hash` and `metaData`). Returns empty maps on
-/// error — detection just gets skipped for that ledger.
-///
-/// Mutation set encoding: each entry is (key_hex_uppercase, kind_byte)
-/// where kind ∈ {0=Created, 1=Modified, 2=Deleted}, matching libxrpl's
-/// `xrpl_ffi::MutationKind`.
-#[cfg(feature = "ffi")]
-async fn fetch_ledger_expected_outcomes(
-    rpc: &RippledClient, seq: u32,
-) -> (
-    std::collections::HashMap<String, String>,
-    std::collections::HashMap<String, Vec<(String, u8)>>,
-) {
-    let mut outcomes: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut mutations: std::collections::HashMap<String, Vec<(String, u8)>> = std::collections::HashMap::new();
-    let body = match rpc.call(
-        "ledger",
-        serde_json::json!({"ledger_index": seq, "transactions": true, "expand": true, "binary": false}),
-    ).await {
-        Ok(b) => b,
-        Err(_) => return (outcomes, mutations),
-    };
-    let empty = Vec::new();
-    let txs = body["result"]["ledger"]["transactions"].as_array().unwrap_or(&empty);
-    for tx in txs.iter() {
-        let hash = match tx["hash"].as_str() {
-            Some(h) => h.to_uppercase(),
-            None => continue,
-        };
-        if let Some(result) = tx["metaData"]["TransactionResult"].as_str() {
-            outcomes.insert(hash.clone(), result.to_string());
-        }
-        // AffectedNodes → Vec<(LedgerIndex, kind_byte)>
-        if let Some(nodes) = tx["metaData"]["AffectedNodes"].as_array() {
-            let mut entries: Vec<(String, u8)> = Vec::with_capacity(nodes.len());
-            for node in nodes.iter() {
-                let (kind_byte, inner) = if node.get("CreatedNode").is_some() {
-                    (0u8, &node["CreatedNode"])
-                } else if node.get("ModifiedNode").is_some() {
-                    (1u8, &node["ModifiedNode"])
-                } else if node.get("DeletedNode").is_some() {
-                    (2u8, &node["DeletedNode"])
-                } else {
-                    continue;
-                };
-                if let Some(idx) = inner["LedgerIndex"].as_str() {
-                    entries.push((idx.to_uppercase(), kind_byte));
-                }
-            }
-            if !entries.is_empty() {
-                mutations.insert(hash, entries);
-            }
-        }
-    }
-    (outcomes, mutations)
 }
 
 /// Fetch binary tx_blobs for every tx in the ledger, sorted by TransactionIndex.
