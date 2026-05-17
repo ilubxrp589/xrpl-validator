@@ -119,6 +119,18 @@ pub fn fetch_mainnet_amendments(rpc_url: &str) -> Vec<[u8; 32]> {
     Vec::new()
 }
 
+/// Result of an RpcProvider read with disambiguated miss reasons.
+/// Lets callers (e.g. OverlayedDbProvider) bucket state.rocks misses by
+/// what rippled thought about the key — "doesn't exist" vs "RPC errored".
+pub enum RpcReadOutcome<'a> {
+    /// rippled returned the SLE bytes — object exists on the ledger.
+    Hit(&'a [u8]),
+    /// rippled responded with `entryNotFound` — object does not exist.
+    EntryNotFound,
+    /// All retries exhausted (overload, network, etc.) — outcome unknown.
+    Exhausted(String),
+}
+
 /// RPC-backed SleProvider: fetches SLEs synchronously from rippled via
 /// `ledger_entry` RPC at a fixed pre-ledger index. Slow but works from anywhere.
 ///
@@ -162,8 +174,12 @@ impl RpcProvider {
     }
 }
 
-impl SleProvider for RpcProvider {
-    fn read(&self, key: &[u8; 32]) -> Option<&[u8]> {
+impl RpcProvider {
+    /// Read an SLE with explicit miss-reason disambiguation. Callers that
+    /// only need the bytes (`SleProvider::read`) get a thin wrapper below.
+    /// Callers that want to bucket misses by reason (e.g. state.rocks miss
+    /// instrumentation in `OverlayedDbProvider`) use this directly.
+    pub fn read_with_outcome(&self, key: &[u8; 32]) -> RpcReadOutcome<'_> {
         use std::sync::atomic::Ordering;
         let key_hex = hex::encode_upper(key);
         // Retry loop for transient "server overloaded" and network errors.
@@ -221,7 +237,7 @@ impl SleProvider for RpcProvider {
                     if mk.len() < 20 {
                         mk.push(format!("{}@{}: entryNotFound", &key_hex[..16], self.ledger_index));
                     }
-                    return None;
+                    return RpcReadOutcome::EntryNotFound;
                 }
                 // Other errors (overloaded, invalidParams, etc.) — retry.
                 last_err = err_str.to_string();
@@ -246,7 +262,7 @@ impl SleProvider for RpcProvider {
             arena.push(bytes);
             unsafe {
                 let last = arena.last().unwrap();
-                return Some(std::slice::from_raw_parts(last.as_ptr(), last.len()));
+                return RpcReadOutcome::Hit(std::slice::from_raw_parts(last.as_ptr(), last.len()));
             }
         }
         // All retries exhausted
@@ -255,7 +271,16 @@ impl SleProvider for RpcProvider {
         if mk.len() < 20 {
             mk.push(format!("{}@{}: EXHAUSTED {}", &key_hex[..16], self.ledger_index, last_err));
         }
-        None
+        RpcReadOutcome::Exhausted(last_err)
+    }
+}
+
+impl SleProvider for RpcProvider {
+    fn read(&self, key: &[u8; 32]) -> Option<&[u8]> {
+        match self.read_with_outcome(key) {
+            RpcReadOutcome::Hit(bytes) => Some(bytes),
+            RpcReadOutcome::EntryNotFound | RpcReadOutcome::Exhausted(_) => None,
+        }
     }
 }
 
@@ -317,15 +342,33 @@ pub struct OverlayedDbProvider<'a> {
     arena: parking_lot::Mutex<Vec<Vec<u8>>>,
     pub db_hits: std::sync::atomic::AtomicU64,
     pub rpc_fallbacks: std::sync::atomic::AtomicU64,
-    /// Per-LedgerEntryType counter for keys that fell through to RPC.
-    /// Tells us which SLE classes our state.rocks is missing — informs
-    /// whether to widen bulk_sync coverage or add types to ws_sync's
-    /// per-ledger fetch. Aggregated into FfiStats.db_fallback_by_le_type
-    /// at end of apply_ledger_in_order. Only populated when RPC fallback
-    /// is enabled (see `rpc_fallback_enabled`).
+    /// Per-LedgerEntryType counter for keys that fell through to RPC and
+    /// rippled returned bytes for (i.e. should_exist misses). Tells us
+    /// which SLE classes our state.rocks is missing — informs whether to
+    /// widen bulk_sync coverage or add types to ws_sync's per-ledger fetch.
+    /// Aggregated into FfiStats.db_fallback_by_le_type at end of
+    /// apply_ledger_in_order. Only populated when RPC consult happens
+    /// (legacy `rpc_fallback_enabled` flag or per-ledger consult budget).
     pub fallback_by_le_type: parking_lot::Mutex<std::collections::BTreeMap<String, u64>>,
-    /// Last-N fallback samples for live dashboard visibility.
+    /// Last-N fallback samples for live dashboard visibility (legacy field;
+    /// kept for backwards compat with existing /api/engine consumers).
     pub fallback_samples: parking_lot::Mutex<Vec<String>>,
+    /// State.rocks miss bucketing — populated only when the miss is
+    /// consulted against RPC (via legacy flag or consult budget).
+    /// Counts state.rocks misses where rippled also said "doesn't exist".
+    /// Big number here = candidate for a bloom filter on negative lookups.
+    pub db_miss_legitimate: std::sync::atomic::AtomicU64,
+    /// Counts state.rocks misses where rippled returned bytes — i.e. our
+    /// state.rocks has a gap. Big number here = candidate for read-through
+    /// caching and/or bulk_sync coverage widening.
+    pub db_miss_should_exist: std::sync::atomic::AtomicU64,
+    /// Counts state.rocks misses where the RPC consult exhausted retries.
+    /// Big number here = rippled connectivity or capacity problem,
+    /// independent of state.rocks completeness.
+    pub db_miss_rpc_error: std::sync::atomic::AtomicU64,
+    /// Last-100 should_exist samples — high-signal data for root-cause
+    /// investigation. Format: "{le_type}: {key_prefix}…".
+    pub should_exist_samples: parking_lot::Mutex<Vec<String>>,
     /// When false (the default), snapshot misses return None directly
     /// instead of round-tripping to rippled. Empirically rpc_sle_hits=0
     /// across 15k+ probes in steady-state operation — state.rocks is
@@ -334,6 +377,13 @@ pub struct OverlayedDbProvider<'a> {
     /// Set XRPL_FFI_RPC_FALLBACK=1 to re-enable the RPC path (useful for
     /// catchup investigation where state.rocks may have transient gaps).
     rpc_fallback_enabled: bool,
+    /// Optional shared per-ledger budget for RPC consults used to bucket
+    /// misses. Created by the caller (e.g. apply_ledger_in_order) once per
+    /// ledger and passed to every OverlayedDbProvider in that ledger via
+    /// `with_rpc_consult_budget`. Decremented on each consult; consults
+    /// skipped when 0. Bounds latency impact regardless of miss spike size.
+    /// When `None`, fall back to the legacy `rpc_fallback_enabled` flag.
+    rpc_consult_budget: Option<&'a std::sync::atomic::AtomicU32>,
 }
 
 impl<'a> OverlayedDbProvider<'a> {
@@ -351,8 +401,24 @@ impl<'a> OverlayedDbProvider<'a> {
             rpc_fallbacks: std::sync::atomic::AtomicU64::new(0),
             fallback_by_le_type: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             fallback_samples: parking_lot::Mutex::new(Vec::with_capacity(50)),
+            db_miss_legitimate: std::sync::atomic::AtomicU64::new(0),
+            db_miss_should_exist: std::sync::atomic::AtomicU64::new(0),
+            db_miss_rpc_error: std::sync::atomic::AtomicU64::new(0),
+            should_exist_samples: parking_lot::Mutex::new(Vec::with_capacity(100)),
             rpc_fallback_enabled: std::env::var_os("XRPL_FFI_RPC_FALLBACK").is_some(),
+            rpc_consult_budget: None,
         }
+    }
+
+    /// Attach a per-ledger RPC consult budget. The caller owns the atomic
+    /// and shares it across every OverlayedDbProvider in the same ledger so
+    /// the budget is global per ledger, not per transaction.
+    pub fn with_rpc_consult_budget(
+        mut self,
+        budget: &'a std::sync::atomic::AtomicU32,
+    ) -> Self {
+        self.rpc_consult_budget = Some(budget);
+        self
     }
 }
 
@@ -419,26 +485,78 @@ impl<'a> SleProvider for OverlayedDbProvider<'a> {
                 return Some(std::slice::from_raw_parts(last.as_ptr(), last.len()));
             }
         }
-        // 3. State.rocks miss. Counter-only by default — empirically
-        // rpc_sle_hits=0 across 15k+ probes in steady-state operation,
-        // so the RPC fallback was a guaranteed-None ~50ms detour. The
-        // XRPL_FFI_RPC_FALLBACK=1 env var re-enables the round trip
-        // (use during catchup investigation when state.rocks may have
-        // transient gaps).
+        // 3. State.rocks miss. We always increment the total miss counter.
+        // Whether we consult RPC (to bucket the miss as legitimate /
+        // should_exist / rpc_error) depends on:
+        //   a. Per-ledger consult budget — if attached, decrement-and-consult
+        //      while > 0. Bounds latency impact under miss spikes.
+        //   b. Legacy XRPL_FFI_RPC_FALLBACK env var — pre-budget behavior,
+        //      consults on every miss (~50ms each).
+        //   c. Neither — return None, no bucketing data collected.
+        // Note: bucketing is best-effort. If neither (a) nor (b) is on,
+        // rpc_fallbacks still counts the miss, but db_miss_* breakdowns
+        // sum to less than rpc_fallbacks (the gap = unbucketed misses).
         self.rpc_fallbacks.fetch_add(1, Ordering::Relaxed);
-        if !self.rpc_fallback_enabled {
+        let should_consult = match self.rpc_consult_budget {
+            Some(budget) => {
+                let mut current = budget.load(Ordering::Relaxed);
+                loop {
+                    if current == 0 {
+                        break false;
+                    }
+                    match budget.compare_exchange_weak(
+                        current,
+                        current - 1,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break true,
+                        Err(c) => current = c,
+                    }
+                }
+            }
+            None => self.rpc_fallback_enabled,
+        };
+        if !should_consult {
             return None;
         }
-        let result = self.rpc_fallback.read(key);
-        if let Some(bytes) = result {
-            let type_name = parse_le_type_name(bytes);
-            *self.fallback_by_le_type.lock().entry(type_name.clone()).or_insert(0) += 1;
-            let mut samples = self.fallback_samples.lock();
-            if samples.len() < 50 {
-                samples.push(format!("{}: {}…", type_name, &hex::encode_upper(key)[..16]));
+        let outcome = self.rpc_fallback.read_with_outcome(key);
+        match outcome {
+            RpcReadOutcome::Hit(bytes) => {
+                self.db_miss_should_exist.fetch_add(1, Ordering::Relaxed);
+                let type_name = parse_le_type_name(bytes);
+                let key_short = &hex::encode_upper(key)[..16];
+                *self.fallback_by_le_type.lock().entry(type_name.clone()).or_insert(0) += 1;
+                // High-signal ring: cap at 100, drop newest if full to avoid unbounded growth.
+                let mut hi = self.should_exist_samples.lock();
+                if hi.len() < 100 {
+                    hi.push(format!("{type_name}: {key_short}…"));
+                }
+                // Legacy ring for backwards-compat with existing dashboards.
+                let mut samples = self.fallback_samples.lock();
+                if samples.len() < 50 {
+                    samples.push(format!("{type_name}: {key_short}…"));
+                }
+                // Plumb the bytes back through the arena so the caller gets
+                // a borrow with the provider's lifetime, matching the trait
+                // contract. read_with_outcome returned a slice into the
+                // RpcProvider's arena, which won't survive its next call.
+                let mut arena = self.arena.lock();
+                arena.push(bytes.to_vec());
+                unsafe {
+                    let last = arena.last().unwrap();
+                    Some(std::slice::from_raw_parts(last.as_ptr(), last.len()))
+                }
+            }
+            RpcReadOutcome::EntryNotFound => {
+                self.db_miss_legitimate.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+            RpcReadOutcome::Exhausted(_) => {
+                self.db_miss_rpc_error.fetch_add(1, Ordering::Relaxed);
+                None
             }
         }
-        result
     }
 
     fn succ(&self, key: &[u8; 32], last: Option<&[u8; 32]>) -> Option<[u8; 32]> {
@@ -607,12 +725,26 @@ pub struct FfiStats {
     /// db_hits = served from local DB; db_rpc_fallbacks = fell through to RPC.
     pub db_hits: u64,
     pub db_rpc_fallbacks: u64,
+    /// State.rocks miss bucketing (populated by OverlayedDbProvider when an
+    /// RPC consult budget is attached or XRPL_FFI_RPC_FALLBACK is set).
+    /// Sum of these three is `<=` db_rpc_fallbacks; the difference is the
+    /// portion of misses that hit the consult-budget cap and were not bucketed.
+    /// `legitimate_miss` = rippled also said the object doesn't exist (bloom
+    /// filter candidate). `should_exist_miss` = rippled returned bytes,
+    /// state.rocks has a gap (read-through cache candidate). `rpc_error` =
+    /// retries exhausted, outcome unknown.
+    pub db_miss_legitimate: u64,
+    pub db_miss_should_exist: u64,
+    pub db_miss_rpc_error: u64,
     /// Per-LedgerEntryType breakdown of which SLEs fell through to RPC.
     /// Tells us which classes are missing from state.rocks so we can target
-    /// bulk_sync coverage / per-ledger fetch.
+    /// bulk_sync coverage / per-ledger fetch. Currently scoped to the
+    /// should_exist bucket (the only bucket where RPC returned bytes).
     pub db_fallback_by_le_type: std::collections::BTreeMap<String, u64>,
     /// Last-50 fallback samples ("AccountRoot: 587E2897…") for the dashboard.
     pub db_fallback_samples: Vec<String>,
+    /// Last-100 high-signal should_exist samples for root-cause investigation.
+    pub db_miss_should_exist_samples: Vec<String>,
     /// Sample of up to 20 miss keys from the last ledger applied
     pub rpc_sle_miss_samples: Vec<String>,
     /// Sample of up to 10 diverged tx hashes (tx_type/TER/hash) for mainnet lookup
@@ -809,6 +941,9 @@ pub fn render_prometheus(s: &FfiStats) -> String {
     let _ = writeln!(out, "# TYPE xrpl_ffi_db_sle_lookups_total counter");
     let _ = writeln!(out, "xrpl_ffi_db_sle_lookups_total{{result=\"hit\"}} {}", s.db_hits);
     let _ = writeln!(out, "xrpl_ffi_db_sle_lookups_total{{result=\"rpc_fallback\"}} {}", s.db_rpc_fallbacks);
+    let _ = writeln!(out, "xrpl_ffi_db_sle_lookups_total{{result=\"legitimate_miss\"}} {}", s.db_miss_legitimate);
+    let _ = writeln!(out, "xrpl_ffi_db_sle_lookups_total{{result=\"should_exist_miss\"}} {}", s.db_miss_should_exist);
+    let _ = writeln!(out, "xrpl_ffi_db_sle_lookups_total{{result=\"rpc_error\"}} {}", s.db_miss_rpc_error);
 
     // Ledger progress
     let _ = writeln!(out, "# HELP xrpl_ffi_ledgers_applied_total Ledgers fully applied via FFI");
@@ -1288,6 +1423,18 @@ pub fn apply_ledger_in_order(
     }
     let mut tx_num = 0u32;
     let mut overlay_hits = 0u32;
+    // Per-ledger RPC consult budget for state.rocks miss bucketing. Shared
+    // across every OverlayedDbProvider created during this ledger. Caps the
+    // number of ~50ms RPC consults at 50, keeping worst-case added latency
+    // under 2.5s (well below the 3.5s ledger interval) even under miss spikes.
+    // 50 is enough to characterize the bucket distribution per ledger; tune
+    // via XRPL_STATE_ROCKS_CONSULT_BUDGET if needed.
+    let ledger_rpc_budget = std::sync::atomic::AtomicU32::new(
+        std::env::var("XRPL_STATE_ROCKS_CONSULT_BUDGET")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(50),
+    );
     for tx_bytes in txs_in_order {
         tx_num += 1;
         // Parse to get tx_type + hash (for diagnostic buckets)
@@ -1298,17 +1445,24 @@ pub fn apply_ledger_in_order(
         // Use DB-first provider when a pre-ledger OwnedSnapshot is supplied.
         // The snapshot is stable (rocksdb MVCC) — safe against concurrent writes.
         let outcome_opt = if let Some(snap) = db_snapshot {
-            let provider = OverlayedDbProvider::new(&overlay, snap, &fallback);
+            let provider = OverlayedDbProvider::new(&overlay, snap, &fallback)
+                .with_rpc_consult_budget(&ledger_rpc_budget);
             let r = xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, 0);
             // Accumulate provider counters into stats
             use std::sync::atomic::Ordering;
             let h = provider.db_hits.load(Ordering::Relaxed);
             let f = provider.rpc_fallbacks.load(Ordering::Relaxed);
+            let m_leg = provider.db_miss_legitimate.load(Ordering::Relaxed);
+            let m_sx = provider.db_miss_should_exist.load(Ordering::Relaxed);
+            let m_err = provider.db_miss_rpc_error.load(Ordering::Relaxed);
             if h > 0 || f > 0 {
                 let mut s = stats.lock();
                 s.db_hits += h;
                 s.db_rpc_fallbacks += f;
-                // Per-type fallback aggregation
+                s.db_miss_legitimate += m_leg;
+                s.db_miss_should_exist += m_sx;
+                s.db_miss_rpc_error += m_err;
+                // Per-type fallback aggregation (should_exist bucket only).
                 let by_type = provider.fallback_by_le_type.lock();
                 for (k, v) in by_type.iter() {
                     *s.db_fallback_by_le_type.entry(k.clone()).or_insert(0) += v;
@@ -1319,6 +1473,15 @@ pub fn apply_ledger_in_order(
                     s.db_fallback_samples.push(sample.clone());
                     if s.db_fallback_samples.len() > 50 {
                         s.db_fallback_samples.remove(0);
+                    }
+                }
+                drop(new_samples);
+                // High-signal should_exist ring (last 100, drop oldest on overflow).
+                let hi_samples = provider.should_exist_samples.lock();
+                for sample in hi_samples.iter() {
+                    s.db_miss_should_exist_samples.push(sample.clone());
+                    if s.db_miss_should_exist_samples.len() > 100 {
+                        s.db_miss_should_exist_samples.remove(0);
                     }
                 }
             }
@@ -1454,7 +1617,8 @@ pub fn apply_ledger_in_order(
                 injected_count += 1;
 
                 let retry_opt = if let Some(snap) = db_snapshot {
-                    let provider = OverlayedDbProvider::new(&overlay, snap, &fallback);
+                    let provider = OverlayedDbProvider::new(&overlay, snap, &fallback)
+                        .with_rpc_consult_budget(&ledger_rpc_budget);
                     xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, 0)
                 } else {
                     let provider = LayeredProvider::new(&overlay, &fallback);
