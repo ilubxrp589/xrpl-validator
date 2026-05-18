@@ -369,6 +369,21 @@ pub struct OverlayedDbProvider<'a> {
     /// Last-100 should_exist samples — high-signal data for root-cause
     /// investigation. Format: "{le_type}: {key_prefix}…".
     pub should_exist_samples: parking_lot::Mutex<Vec<String>>,
+    /// Latency diagnostic: total nanoseconds spent in `snapshot.get()` calls
+    /// that returned `Ok(Some(_))` (hit). Pair with `db_hits` for mean cost.
+    pub db_hit_total_ns: std::sync::atomic::AtomicU64,
+    /// Latency diagnostic: total nanoseconds spent in `snapshot.get()` calls
+    /// that returned `Ok(None)` or `Err(_)` (miss). Pair with `rpc_fallbacks`
+    /// for mean cost of a state.rocks miss — the number that determines
+    /// whether an app-layer bloom filter is worth building on top of
+    /// RocksDB's SST-level bloom.
+    pub db_miss_total_ns: std::sync::atomic::AtomicU64,
+    /// Per-ns-decade histograms (counts) for hit/miss latency.
+    /// Buckets: ≤1μs, ≤10μs, ≤100μs, ≤1ms, ≤10ms, >10ms.
+    /// Tells us whether the distribution is uniform or bimodal (e.g. cheap
+    /// bloom-cached "no" vs full disk lookup).
+    pub db_hit_latency_buckets: [std::sync::atomic::AtomicU64; 6],
+    pub db_miss_latency_buckets: [std::sync::atomic::AtomicU64; 6],
     /// When false (the default), snapshot misses return None directly
     /// instead of round-tripping to rippled. Empirically rpc_sle_hits=0
     /// across 15k+ probes in steady-state operation — state.rocks is
@@ -405,6 +420,10 @@ impl<'a> OverlayedDbProvider<'a> {
             db_miss_should_exist: std::sync::atomic::AtomicU64::new(0),
             db_miss_rpc_error: std::sync::atomic::AtomicU64::new(0),
             should_exist_samples: parking_lot::Mutex::new(Vec::with_capacity(100)),
+            db_hit_total_ns: std::sync::atomic::AtomicU64::new(0),
+            db_miss_total_ns: std::sync::atomic::AtomicU64::new(0),
+            db_hit_latency_buckets: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            db_miss_latency_buckets: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             rpc_fallback_enabled: std::env::var_os("XRPL_FFI_RPC_FALLBACK").is_some(),
             rpc_consult_budget: None,
         }
@@ -420,6 +439,19 @@ impl<'a> OverlayedDbProvider<'a> {
         self.rpc_consult_budget = Some(budget);
         self
     }
+}
+
+/// Map a nanosecond duration to one of 6 log10-ish buckets used by the
+/// state.rocks miss-cost diagnostic. Buckets:
+/// 0: ≤ 1μs, 1: ≤ 10μs, 2: ≤ 100μs, 3: ≤ 1ms, 4: ≤ 10ms, 5: > 10ms.
+#[inline]
+fn latency_bucket(ns: u64) -> usize {
+    if ns <= 1_000 { 0 }
+    else if ns <= 10_000 { 1 }
+    else if ns <= 100_000 { 2 }
+    else if ns <= 1_000_000 { 3 }
+    else if ns <= 10_000_000 { 4 }
+    else { 5 }
 }
 
 /// Decode an SLE's LedgerEntryType from its binary form.
@@ -475,9 +507,20 @@ impl<'a> SleProvider for OverlayedDbProvider<'a> {
                 }
             }
         }
-        // 2. Owned snapshot (validator's own state, pre-ledger)
-        if let Ok(Some(data)) = self.snapshot.get(key) {
+        // 2. Owned snapshot (validator's own state, pre-ledger).
+        // Time this call: it's the RocksDB Get cost we're trying to
+        // characterize for the bloom-filter decision. Hit and miss go to
+        // separate counters + 6-bucket histograms so we can compute mean
+        // and spot bimodal distributions (e.g. SST-bloom-cached "no" vs
+        // full disk lookup).
+        let t_db = std::time::Instant::now();
+        let snap_result = self.snapshot.get(key);
+        let elapsed_ns = t_db.elapsed().as_nanos() as u64;
+        let bucket = latency_bucket(elapsed_ns);
+        if let Ok(Some(data)) = snap_result {
             self.db_hits.fetch_add(1, Ordering::Relaxed);
+            self.db_hit_total_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+            self.db_hit_latency_buckets[bucket].fetch_add(1, Ordering::Relaxed);
             let mut arena = self.arena.lock();
             arena.push(data);
             unsafe {
@@ -485,6 +528,9 @@ impl<'a> SleProvider for OverlayedDbProvider<'a> {
                 return Some(std::slice::from_raw_parts(last.as_ptr(), last.len()));
             }
         }
+        // Falls through to miss path — record the miss latency too.
+        self.db_miss_total_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+        self.db_miss_latency_buckets[bucket].fetch_add(1, Ordering::Relaxed);
         // 3. State.rocks miss. We always increment the total miss counter.
         // Whether we consult RPC (to bucket the miss as legitimate /
         // should_exist / rpc_error) depends on:
@@ -745,6 +791,19 @@ pub struct FfiStats {
     pub db_fallback_samples: Vec<String>,
     /// Last-100 high-signal should_exist samples for root-cause investigation.
     pub db_miss_should_exist_samples: Vec<String>,
+    /// State.rocks lookup cost diagnostic (ns). Pair with db_hits /
+    /// db_rpc_fallbacks to compute mean latency. Used to decide whether
+    /// an app-layer bloom filter would actually win against RocksDB's
+    /// built-in SST bloom (which already serves cheap "no" answers for
+    /// most non-existent keys).
+    pub db_hit_total_ns: u64,
+    pub db_miss_total_ns: u64,
+    /// Per-decade ns histograms (≤1μs, ≤10μs, ≤100μs, ≤1ms, ≤10ms, >10ms).
+    /// If the miss distribution is concentrated in the ≤1μs bucket, the
+    /// SST bloom is already doing the work and adding our own bloom
+    /// would be redundant.
+    pub db_hit_latency_buckets: [u64; 6],
+    pub db_miss_latency_buckets: [u64; 6],
     /// Sample of up to 20 miss keys from the last ledger applied
     pub rpc_sle_miss_samples: Vec<String>,
     /// Sample of up to 10 diverged tx hashes (tx_type/TER/hash) for mainnet lookup
@@ -1424,16 +1483,20 @@ pub fn apply_ledger_in_order(
     let mut tx_num = 0u32;
     let mut overlay_hits = 0u32;
     // Per-ledger RPC consult budget for state.rocks miss bucketing. Shared
-    // across every OverlayedDbProvider created during this ledger. Caps the
-    // number of ~50ms RPC consults at 50, keeping worst-case added latency
-    // under 2.5s (well below the 3.5s ledger interval) even under miss spikes.
-    // 50 is enough to characterize the bucket distribution per ledger; tune
-    // via XRPL_STATE_ROCKS_CONSULT_BUDGET if needed.
+    // across every OverlayedDbProvider created during this ledger. Acts as
+    // a permanent canary for state.rocks rot — every consulted miss that
+    // rippled answers with bytes (db_miss_should_exist) is a state.rocks
+    // gap, the same failure mode that caused the 2026-05-15 incident.
+    // 500 covers ~100% of misses in typical ledgers (~280 misses/ledger
+    // observed) and bounds worst-case latency: a single `ledger_entry`
+    // RPC against local rippled is sub-millisecond, so 500 consults is
+    // well under the 3.5s ledger interval even in pathological cases.
+    // If ws-sync timing degrades, dial back via XRPL_STATE_ROCKS_CONSULT_BUDGET.
     let ledger_rpc_budget = std::sync::atomic::AtomicU32::new(
         std::env::var("XRPL_STATE_ROCKS_CONSULT_BUDGET")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(50),
+            .unwrap_or(500),
     );
     for tx_bytes in txs_in_order {
         tx_num += 1;
@@ -1455,6 +1518,8 @@ pub fn apply_ledger_in_order(
             let m_leg = provider.db_miss_legitimate.load(Ordering::Relaxed);
             let m_sx = provider.db_miss_should_exist.load(Ordering::Relaxed);
             let m_err = provider.db_miss_rpc_error.load(Ordering::Relaxed);
+            let hit_ns = provider.db_hit_total_ns.load(Ordering::Relaxed);
+            let miss_ns = provider.db_miss_total_ns.load(Ordering::Relaxed);
             if h > 0 || f > 0 {
                 let mut s = stats.lock();
                 s.db_hits += h;
@@ -1462,6 +1527,14 @@ pub fn apply_ledger_in_order(
                 s.db_miss_legitimate += m_leg;
                 s.db_miss_should_exist += m_sx;
                 s.db_miss_rpc_error += m_err;
+                s.db_hit_total_ns += hit_ns;
+                s.db_miss_total_ns += miss_ns;
+                for i in 0..6 {
+                    s.db_hit_latency_buckets[i] +=
+                        provider.db_hit_latency_buckets[i].load(Ordering::Relaxed);
+                    s.db_miss_latency_buckets[i] +=
+                        provider.db_miss_latency_buckets[i].load(Ordering::Relaxed);
+                }
                 // Per-type fallback aggregation (should_exist bucket only).
                 let by_type = provider.fallback_by_le_type.lock();
                 for (k, v) in by_type.iter() {
