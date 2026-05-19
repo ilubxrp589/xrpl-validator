@@ -18,6 +18,26 @@ use xrpl_core::types::Hash256;
 use xrpl_ledger::shamap::hash::{sha512_half_prefixed, HASH_PREFIX_LEAF_NODE};
 use crate::rippled_client::RippledClient;
 
+/// Halt-on-mismatch: how many consecutive ws-sync MISMATCH ledgers we
+/// tolerate before SIGTERM-ing the process. The previous behaviour was
+/// "log and move on" forever, which produced 263-ledger cascades of
+/// state.rocks corruption (incident 2026-05-19). Three is enough to
+/// rule out transient causes (one bad RPC fetch, single overlay edge
+/// case) without letting the rot propagate.
+const MAX_MISMATCH_STREAK: u32 = 3;
+
+/// Cross-call counter for consecutive MISMATCH ledgers. Reset on each
+/// MATCH. Exceeding MAX_MISMATCH_STREAK triggers immediate process exit
+/// — recovery requires an operator wipe+resync (see feedback_wipe_resync_on_restart).
+static MISMATCH_STREAK: AtomicU32 = AtomicU32::new(0);
+
+/// Lag breadcrumb threshold (ledgers). When the watchdog's live_edge
+/// poller reports our last_processed is more than this many ledgers
+/// behind the network, every ledger in the danger window emits a
+/// per-stage timing breadcrumb so we can root-cause what's preceding
+/// a 51-ledger spike (the watchdog's hard trigger).
+const LAG_BREADCRUMB_THRESHOLD: u32 = 10;
+
 #[cfg(feature = "ffi")]
 type FfiVerifierHandle = Arc<crate::ffi_verifier::FfiVerifier>;
 #[cfg(not(feature = "ffi"))]
@@ -463,6 +483,7 @@ pub async fn start_ws_sync(
                         &account_hash, acc_tx_count, compute_hash,
                         &history,
                         #[cfg(feature = "ffi")] ffi_overlay_opt.take(),
+                        &watchdog_live_edge,
                     ).await;
 
                     last_processed = process_seq;
@@ -760,8 +781,15 @@ async fn process_ledger(
     compute_hash: bool,
     history: &Option<Arc<parking_lot::Mutex<crate::history::HistoryStore>>>,
     #[cfg(feature = "ffi")] ffi_overlay: Option<crate::ffi_engine::LedgerOverlay>,
+    watchdog_live_edge: &Arc<AtomicU32>,
 ) -> bool {
     let ledger_start = std::time::Instant::now();
+    // Lag breadcrumb: if the live-edge poller says we're already behind,
+    // emit per-stage timings for THIS ledger. Captures the conditions
+    // preceding a 51-ledger watchdog spike.
+    let live_now = watchdog_live_edge.load(Ordering::Acquire);
+    let lag_at_start = if live_now > seq { live_now - seq } else { 0 };
+    let lag_breadcrumb = lag_at_start > LAG_BREADCRUMB_THRESHOLD;
 
     // Stage 3: when ffi_overlay is supplied (caller has XRPL_FFI_STAGE3=1), the
     // FFI mutation overlay is the authoritative source for mutated SLEs. Only
@@ -929,18 +957,39 @@ async fn process_ledger(
         }
     }
 
+    // PART 2: Write-after-verify. Before committing the batch to state.rocks,
+    // pre-read the OLD values for every touched key so we can roll back
+    // atomically if the post-write hash doesn't match the network's
+    // account_hash. Prevents state.rocks corruption from ever landing.
+    // Cost: one snapshot.get() per touched key (~280 misses × 2.4μs = ~700μs
+    // per ledger on the happy path, well under the 3.5s ledger interval).
+    let pre_snapshot = db.snapshot();
+    let mut undo_pairs: Vec<(Hash256, Option<Vec<u8>>)> = Vec::with_capacity(keys.len());
+    for key in &keys {
+        let old = pre_snapshot.get(&key.0).ok().flatten();
+        undo_pairs.push((*key, old));
+    }
+    drop(pre_snapshot);
+
+    let write_t0 = std::time::Instant::now();
+    // Capture `keys.len()` here — `keys` itself is moved into the spawn_blocking
+    // closure below and can't be borrowed afterwards.
+    let n_keys = keys.len();
     if let Err(e) = db.write(batch) {
         eprintln!("[ws-sync] Ledger #{seq}: DB write failed: {e}");
         return false;
     }
+    let write_ms = write_t0.elapsed().as_millis() as u64;
 
     if compute_hash {
         // Run on blocking thread pool — keeps SSE feed + peers responsive during 2.5s hash
         let hc = hash_comp.clone();
         let d = db.clone();
+        let hash_t0 = std::time::Instant::now();
         let hash_result = tokio::task::spawn_blocking(move || {
             hc.update_and_hash(&d, &keys)
         }).await.ok().flatten();
+        let hash_ms_only = hash_t0.elapsed().as_millis() as u64;
         if let Some(root) = hash_result {
             let ours = hex::encode(root.0);
             if !account_hash.is_empty() {
@@ -963,10 +1012,57 @@ async fn process_ledger(
                 if matched {
                     let total_ms = ledger_start.elapsed().as_millis() as u64;
                     let hash_ms = total_ms.saturating_sub(fetch_ms);
+                    // Reset mismatch streak on every clean ledger (Part 1).
+                    MISMATCH_STREAK.store(0, Ordering::Relaxed);
                     eprintln!("[ws-sync] #{seq}: MATCH ({tx_count} txs, {} objs) fetch={}ms hash+write={}ms total={}ms",
                         fetched_data.len(), fetch_ms, hash_ms, total_ms);
+                    // Lag breadcrumb (Part 3): emit detailed per-stage timings
+                    // when the live edge poller says we're already behind.
+                    // Captures the conditions preceding a 51-ledger spike so
+                    // we can root-cause drift instead of just detecting it.
+                    if lag_breadcrumb {
+                        eprintln!("[ws-sync] LAG_BREADCRUMB #{seq}: lag_at_start={lag_at_start} fetch={fetch_ms}ms write={write_ms}ms hash={hash_ms_only}ms total={total_ms}ms n_modified={} n_deleted={} n_keys={}",
+                            modified.len(), deleted.len(), n_keys);
+                    }
                 } else {
-                    eprintln!("[ws-sync] #{seq}: MISMATCH ({tx_count} txs) — logging and moving on (shadow diff will capture root cause)");
+                    // PART 2: roll back the batch we just wrote — restore the
+                    // pre-write values via the undo_pairs we captured before
+                    // db.write. Then re-update the hasher so its in-memory state
+                    // matches the restored DB. State.rocks ends up exactly as it
+                    // was before this ledger touched it.
+                    let mut undo_batch = rocksdb::WriteBatch::default();
+                    for (key, old_val) in &undo_pairs {
+                        match old_val {
+                            Some(v) => undo_batch.put(&key.0, v),
+                            None => undo_batch.delete(&key.0),
+                        }
+                    }
+                    let undo_keys: Vec<Hash256> = undo_pairs.iter().map(|(k, _)| *k).collect();
+                    if let Err(e) = db.write(undo_batch) {
+                        eprintln!("[ws-sync] #{seq}: FATAL — undo batch write failed: {e}. State.rocks is now in an unknown state. Halting.");
+                        std::process::exit(1);
+                    }
+                    // Re-update the hasher from the now-restored DB.
+                    let hc_undo = hash_comp.clone();
+                    let d_undo = db.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        hc_undo.update_only(&d_undo, &undo_keys);
+                    }).await;
+                    eprintln!("[ws-sync] #{seq}: MISMATCH ({tx_count} txs) ours={} network={} — ROLLED BACK ({} keys restored)",
+                        &ours[..16], &account_hash[..16.min(account_hash.len())], undo_pairs.len());
+                    // Lag breadcrumb on mismatch too — high signal.
+                    if lag_breadcrumb {
+                        eprintln!("[ws-sync] LAG_BREADCRUMB #{seq}: lag_at_start={lag_at_start} (MISMATCH) fetch={fetch_ms}ms write={write_ms}ms hash={hash_ms_only}ms n_modified={} n_deleted={} n_keys={}",
+                            modified.len(), deleted.len(), n_keys);
+                    }
+                    // PART 1: bump streak; hard-stop after MAX_MISMATCH_STREAK.
+                    let streak = MISMATCH_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+                    if streak >= MAX_MISMATCH_STREAK {
+                        eprintln!("[ws-sync] FATAL: {streak} consecutive ws-sync MISMATCHes — refusing to continue. Operator must wipe state.rocks and resync. See feedback_wipe_resync_on_restart.");
+                        // SEV-1 marker for log greppers + dashboards.
+                        eprintln!("[SEV-1] ws-sync halt-on-mismatch tripped at #{seq}");
+                        std::process::exit(1);
+                    }
                     return false;
                     // --- unreachable retry+scan code below, kept for reference ---
                     #[allow(unreachable_code)]
