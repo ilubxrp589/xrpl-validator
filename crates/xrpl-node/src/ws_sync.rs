@@ -473,6 +473,71 @@ pub async fn start_ws_sync(
                         break;
                     }
 
+                    // --- Tx-set completeness gate (input-side) --------------------
+                    // Verify the pulled tx set against the header transaction_hash
+                    // BEFORE applying. A transient incomplete RPC pull (the 2026-05-28
+                    // halt) is then re-driven instead of producing a spurious state-hash
+                    // divergence that counts toward halt-on-mismatch. Mode via
+                    // XRPL_WSSYNC_TXGATE (off|shadow|enforce, default shadow), read per
+                    // ledger so shadow->enforce needs no restart. Only at low lag, where
+                    // binary blobs are cheap. NOTE: issues one extra binary:true RPC per
+                    // gated ledger — can be merged with the FFI shadow's tx_blobs fetch
+                    // when promoting past shadow.
+                    #[cfg(feature = "ffi")]
+                    {
+                        let gate = txgate_mode();
+                        if gate != TxGate::Off && closed_seq.saturating_sub(process_seq) <= 25 {
+                            let triples = fetch_ledger_tx_meta_all(&rpc, process_seq).await;
+                            if !triples.is_empty() {
+                                let root =
+                                    xrpl_ledger::shamap::tx_tree::compute_tx_tree_root(&triples);
+                                let root_ok = root.0 == ledger_header.transaction_hash;
+                                // Cross-check: the binary:true tx set (gate) must carry the
+                                // same txids as the binary:false metadata (which drives the
+                                // state writes), so a partial *either* response is caught.
+                                let blob_ids: std::collections::HashSet<String> = triples
+                                    .iter()
+                                    .map(|(tx, _)| {
+                                        hex::encode_upper(xrpl_ledger::shamap::tx_tree::tx_id(tx).0)
+                                    })
+                                    .collect();
+                                let meta_ids: std::collections::HashSet<String> = sorted_txs
+                                    .iter()
+                                    .filter_map(|tx| tx["hash"].as_str().map(|h| h.to_uppercase()))
+                                    .collect();
+                                let ids_ok = blob_ids == meta_ids;
+                                if root_ok && ids_ok {
+                                    let v = TXGATE_VERIFIED.fetch_add(1, Ordering::Relaxed) + 1;
+                                    // Heartbeat every 256 ledgers so burn-in can confirm the gate
+                                    // is live and read the running tallies (the happy path is
+                                    // otherwise silent in shadow mode).
+                                    if v % 256 == 0 {
+                                        eprintln!(
+                                            "[ws-sync] tx-gate heartbeat: verified={v} incomplete={}",
+                                            TXGATE_INCOMPLETE.load(Ordering::Relaxed)
+                                        );
+                                    }
+                                } else {
+                                    TXGATE_INCOMPLETE.fetch_add(1, Ordering::Relaxed);
+                                    let tag = if gate == TxGate::Enforce { "ENFORCE" } else { "SHADOW" };
+                                    eprintln!(
+                                        "[ws-sync] tx-set INCOMPLETE #{process_seq} [{tag}] root_ok={root_ok} ids_ok={ids_ok} computed={} header={} blob_txs={} meta_txs={}",
+                                        hex::encode_upper(root.0),
+                                        hex::encode_upper(ledger_header.transaction_hash),
+                                        blob_ids.len(),
+                                        meta_ids.len()
+                                    );
+                                    if gate == TxGate::Enforce {
+                                        // Re-drive like meta_ok==false: break the batch, do
+                                        // NOT advance process_seq, do NOT bump MISMATCH_STREAK.
+                                        last_processed = process_seq;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Hash-check EVERY ledger (gap or tip). Validation count requires it,
                     // and root recompute is only ~50ms per ledger (dirty-bucket parallel).
                     let compute_hash = true;
@@ -675,6 +740,9 @@ pub struct LedgerHeader {
     pub parent_hash: [u8; 32],
     pub parent_close_time: u32,
     pub total_drops: u64,
+    /// The ledger's transaction-tree root (Merkle commitment to the exact tx set).
+    /// Used by the tx-set completeness gate to detect incomplete RPC pulls.
+    pub transaction_hash: [u8; 32],
 }
 
 async fn fetch_ledger_metadata(
@@ -704,7 +772,19 @@ async fn fetch_ledger_metadata(
     let total_drops = ledger["total_coins"].as_str()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0u64);
-    let header = LedgerHeader { parent_hash, parent_close_time, total_drops };
+    let transaction_hash = ledger["transaction_hash"].as_str()
+        .and_then(|s| hex::decode(s).ok())
+        .and_then(|b| {
+            if b.len() == 32 {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&b);
+                Some(a)
+            } else {
+                None
+            }
+        })
+        .unwrap_or([0u8; 32]);
+    let header = LedgerHeader { parent_hash, parent_close_time, total_drops, transaction_hash };
 
     // Sort by TransactionIndex (execution order) — array order can differ!
     let mut sorted_txs: Vec<serde_json::Value> = txs.iter().cloned().collect();
@@ -767,6 +847,67 @@ async fn fetch_ledger_tx_blobs(rpc: &RippledClient, seq: u32) -> Vec<Vec<u8>> {
     }
     ordered.sort_by_key(|(i, _)| *i);
     ordered.into_iter().map(|(_, b)| b).collect()
+}
+
+/// Tx-set completeness gate mode (env `XRPL_WSSYNC_TXGATE`, default shadow).
+#[cfg(feature = "ffi")]
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum TxGate {
+    Off,
+    Shadow,
+    Enforce,
+}
+
+/// Read the gate mode fresh each ledger so shadow->enforce needs no restart.
+#[cfg(feature = "ffi")]
+fn txgate_mode() -> TxGate {
+    match std::env::var("XRPL_WSSYNC_TXGATE").ok().as_deref() {
+        Some("off") => TxGate::Off,
+        Some("enforce") => TxGate::Enforce,
+        _ => TxGate::Shadow,
+    }
+}
+
+/// Ledgers whose pulled tx set verified complete vs. the header transaction_hash.
+#[cfg(feature = "ffi")]
+pub static TXGATE_VERIFIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Ledgers where the pulled tx set was detected incomplete (re-driven in enforce).
+#[cfg(feature = "ffi")]
+pub static TXGATE_INCOMPLETE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Fetch ALL `(tx_blob, meta_blob)` pairs for a ledger, unfiltered — including
+/// pseudo-txs (SetFee / EnableAmendment / UNLModify), which ARE part of the
+/// transaction tree and contribute to the header transaction_hash. Distinct from
+/// `fetch_ledger_tx_blobs`, which drops pseudo-txs for FFI signature verification.
+/// Empty Vec on error (gate skipped for this ledger). Order is irrelevant — the
+/// transaction SHAMap is keyed by txid.
+#[cfg(feature = "ffi")]
+async fn fetch_ledger_tx_meta_all(rpc: &RippledClient, seq: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let body = match rpc
+        .call(
+            "ledger",
+            serde_json::json!({"ledger_index": seq, "transactions": true, "expand": true, "binary": true}),
+        )
+        .await
+    {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    let empty = Vec::new();
+    let txs = body["result"]["ledger"]["transactions"]
+        .as_array()
+        .unwrap_or(&empty);
+    let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(txs.len());
+    for tx in txs.iter() {
+        let (Some(tx_hex), Some(meta_hex)) = (tx["tx_blob"].as_str(), tx["meta"].as_str()) else {
+            continue;
+        };
+        let (Ok(tx_b), Ok(meta_b)) = (hex::decode(tx_hex), hex::decode(meta_hex)) else {
+            continue;
+        };
+        out.push((tx_b, meta_b));
+    }
+    out
 }
 
 async fn process_ledger(
