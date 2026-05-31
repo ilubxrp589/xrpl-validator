@@ -1,5 +1,5 @@
 //! VALAUDIT lockstep M1 — shadow harness unit tests.
-use xrpl_node::lockstep::{evaluate_ledger, LockstepOutcome};
+use xrpl_node::lockstep::{evaluate_ledger, LockstepMeter, LockstepOutcome};
 use xrpl_node::state_hash::compute_ledger_hash;
 
 const SEQ: u32 = 104_600_000;
@@ -25,4 +25,24 @@ fn mismatch_when_a_header_field_is_wrong() {
     let net = compute_ledger_hash(SEQ, DROPS, &PARENT, &TXH, &ACCT, PCT, CT, RES, FLAGS).0;
     let out = evaluate_ledger(SEQ, DROPS, &PARENT, &TXH, &ACCT, PCT, CT + 1, RES, FLAGS, &net);
     assert!(!out.matched, "a wrong close_time must not match");
+}
+
+#[test]
+fn meter_ratio_is_one_with_no_mismatches() {
+    let m = LockstepMeter::new();
+    for _ in 0..10 { m.record(true); }
+    assert_eq!(m.match_ratio(), 1.0);
+    assert_eq!(m.observed(), 10);
+}
+
+#[test]
+fn meter_ratio_drops_and_window_rolls() {
+    let m = LockstepMeter::new();
+    for _ in 0..3 { m.record(true); }
+    m.record(false);
+    assert!((m.match_ratio() - 0.75).abs() < 1e-9); // 3 of 4
+    let m2 = LockstepMeter::new();
+    m2.record(false);
+    for _ in 0..1000 { m2.record(true); }
+    assert_eq!(m2.match_ratio(), 1.0, "old mismatch rolls out of the 1000-window");
 }
