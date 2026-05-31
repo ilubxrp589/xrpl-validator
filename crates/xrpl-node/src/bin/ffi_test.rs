@@ -62,7 +62,7 @@ async fn main() {
         // Comma-separated list of RPC endpoints for failover. First URL is primary.
         let rpc_urls: Vec<String> = std::env::var("XRPL_RPC_URLS")
             .or_else(|_| std::env::var("XRPL_RPC_URL"))
-            .unwrap_or_else(|_| "http://10.0.0.39:5005".to_string())
+            .unwrap_or_else(|_| "http://127.0.0.1:5005".to_string())
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
