@@ -743,6 +743,11 @@ pub struct LedgerHeader {
     /// The ledger's transaction-tree root (Merkle commitment to the exact tx set).
     /// Used by the tx-set completeness gate to detect incomplete RPC pulls.
     pub transaction_hash: [u8; 32],
+    /// VALAUDIT lockstep M1: remaining inputs to compute_ledger_hash.
+    pub close_time: u32,
+    pub close_resolution: u8,
+    pub close_flags: u8,
+    pub ledger_hash: [u8; 32],
 }
 
 async fn fetch_ledger_metadata(
@@ -784,7 +789,14 @@ async fn fetch_ledger_metadata(
             }
         })
         .unwrap_or([0u8; 32]);
-    let header = LedgerHeader { parent_hash, parent_close_time, total_drops, transaction_hash };
+    let close_time = ledger["close_time"].as_u64().unwrap_or(0) as u32;
+    let close_resolution = ledger["close_time_resolution"].as_u64().unwrap_or(0) as u8;
+    let close_flags = ledger["close_flags"].as_u64().unwrap_or(0) as u8;
+    let ledger_hash = ledger["ledger_hash"].as_str()
+        .and_then(|s| hex::decode(s).ok())
+        .and_then(|b| if b.len() == 32 { let mut a = [0u8; 32]; a.copy_from_slice(&b); Some(a) } else { None })
+        .unwrap_or([0u8; 32]);
+    let header = LedgerHeader { parent_hash, parent_close_time, total_drops, transaction_hash, close_time, close_resolution, close_flags, ledger_hash };
 
     // Sort by TransactionIndex (execution order) — array order can differ!
     let mut sorted_txs: Vec<serde_json::Value> = txs.iter().cloned().collect();
