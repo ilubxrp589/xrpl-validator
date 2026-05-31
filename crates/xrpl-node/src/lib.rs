@@ -23,6 +23,7 @@ pub mod engine;
 pub mod history;
 pub mod incremental_sync;
 pub mod ledger_close;
+pub mod lockstep;
 pub mod error;
 pub mod mempool;
 pub mod node;
