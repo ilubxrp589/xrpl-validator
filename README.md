@@ -210,4 +210,4 @@ AMD Ryzen with SHA-NI hardware acceleration is expected to reduce hash computati
 
 ## License
 
-Proprietary -- see [LICENSE](LICENSE)
+Released under the [MIT License](LICENSE).
