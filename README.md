@@ -1,5 +1,7 @@
 # XRPL Rust Validator
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A from-scratch XRP Ledger validator node written in Rust. Independently computes and verifies state hashes against network consensus every ledger — achieving **28,500+ consecutive matches** with zero mismatches on mainnet.
 
 This is a fully independent implementation — no code from rippled. The validator maintains its own state tree (18.7M+ objects), computes SHA-512Half Merkle hashes, signs validations, and relays them to the network.
@@ -210,4 +212,6 @@ AMD Ryzen with SHA-NI hardware acceleration is expected to reduce hash computati
 
 ## License
 
-Proprietary -- see [LICENSE](LICENSE)
+Released under the [MIT License](LICENSE).
+
+The optional `ffi` feature links against [libxrpl](https://github.com/XRPLF/rippled) (rippled's transaction engine), which is licensed under the permissive [ISC License](https://github.com/XRPLF/rippled/blob/develop/LICENSE.md) — compatible with MIT. This repository contains no rippled source code; rippled is © its respective authors.

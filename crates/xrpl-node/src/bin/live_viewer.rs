@@ -580,7 +580,7 @@ async fn main() {
     let ffi_verifier = {
         let rpc_urls: Vec<String> = std::env::var("XRPL_RPC_URLS")
             .or_else(|_| std::env::var("XRPL_RPC_URL"))
-            .unwrap_or_else(|_| "http://10.0.0.39:5005".to_string())
+            .unwrap_or_else(|_| "http://127.0.0.1:5005".to_string())
             .split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
         eprintln!("[ffi] initializing FfiVerifier with {} RPC endpoint(s)", rpc_urls.len());
         Arc::new(xrpl_node::ffi_verifier::FfiVerifier::new(rpc_urls))
@@ -657,12 +657,14 @@ async fn main() {
                     }
 
                     // Get current validated ledger from rippled
+                    let rpc_url = std::env::var("XRPL_RPC_URL")
+                        .unwrap_or_else(|_| "http://127.0.0.1:5005".to_string());
                     let client = reqwest::Client::builder()
                         .timeout(Duration::from_secs(10))
                         .build()
                         .unwrap_or_default();
                     let current_seq: u32 = match client
-                        .post("http://10.0.0.39:5005")
+                        .post(rpc_url.as_str())
                         .json(&serde_json::json!({"method":"ledger","params":[{"ledger_index":"validated"}]}))
                         .send()
                         .await
@@ -701,7 +703,7 @@ async fn main() {
                     // Get latest validated ledger (backfill may have advanced past current_seq)
                     let ws_start: u32 = {
                         let c = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap_or_default();
-                        match c.post("http://10.0.0.39:5005")
+                        match c.post(rpc_url.as_str())
                             .json(&serde_json::json!({"method":"ledger","params":[{"ledger_index":"validated"}]}))
                             .send().await {
                             Ok(r) => r.json::<serde_json::Value>().await.ok()
@@ -793,9 +795,11 @@ async fn main() {
             .timeout(Duration::from_secs(10))
             .build()
             .expect("reqwest client builder failed");
+        let rpc_url = std::env::var("XRPL_RPC_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:5005".to_string());
         loop {
             if let Ok(resp) = client
-                .post("http://10.0.0.39:5005")
+                .post(rpc_url.as_str())
                 .json(&serde_json::json!({
                     "method": "ledger",
                     "params": [{"ledger_index": "validated"}]
