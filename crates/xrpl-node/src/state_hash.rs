@@ -314,6 +314,11 @@ pub struct StateHashComputer {
     /// Bumped by the live_viewer signing path when network's ledger_hash
     /// arrives blank. Surfaces in /metrics + /api/state-hash.
     pub validations_skipped_zero_hash: Arc<AtomicU64>,
+    /// VALAUDIT Phase 5 (va-05): rolling window (last 1000) of ledger_hash
+    /// verification results — `true` = our independently-computed ledger_hash
+    /// matched the network's. Feeds the `xrpl_validator_ledger_hash_match_ratio`
+    /// gauge; the phase-5 7-day watch exit criterion is this window at 100%.
+    pub ledger_hash_window: Arc<Mutex<std::collections::VecDeque<bool>>>,
 }
 
 impl StateHashComputer {
@@ -332,6 +337,7 @@ impl StateHashComputer {
             wallet_history: Arc::new(Mutex::new(Vec::with_capacity(300))),
             validations_skipped_not_ready: Arc::new(AtomicU64::new(0)),
             validations_skipped_zero_hash: Arc::new(AtomicU64::new(0)),
+            ledger_hash_window: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(1000))),
         }
     }
 
@@ -649,6 +655,30 @@ impl StateHashComputer {
         self.consecutive_matches.load(Ordering::Acquire) >= 3
     }
 
+    /// VALAUDIT Phase 5 (va-05): record one ledger_hash verification result into
+    /// the rolling 1000-ledger window. `matched` = our independently-computed
+    /// ledger_hash equalled the network-reported one.
+    pub fn record_ledger_hash_result(&self, matched: bool) {
+        let mut w = self.ledger_hash_window.lock();
+        if w.len() >= 1000 {
+            w.pop_front();
+        }
+        w.push_back(matched);
+    }
+
+    /// VALAUDIT Phase 5 (va-05): fraction of the last ≤1000 signed ledgers whose
+    /// independently-computed ledger_hash matched the network's. Returns 1.0 when
+    /// the window is empty (no divergence observed yet). The phase-5 7-day watch
+    /// exit criterion is this == 1.0.
+    pub fn ledger_hash_match_ratio(&self) -> f64 {
+        let w = self.ledger_hash_window.lock();
+        if w.is_empty() {
+            return 1.0;
+        }
+        let matched = w.iter().filter(|&&m| m).count();
+        matched as f64 / w.len() as f64
+    }
+
     pub fn current_hash(&self) -> Option<Hash256> {
         let guard = self.hasher.lock();
         if guard.is_some() {
@@ -852,6 +882,46 @@ pub fn compute_ledger_hash(
     let mut result = [0u8; 32];
     result.copy_from_slice(&full[..32]);
     Hash256(result)
+}
+
+/// VALAUDIT Phase 5 (va-05): independently verify a closed ledger before signing.
+///
+/// Recomputes the full `ledger_hash` from the network-reported header fields plus
+/// OUR independently-computed `account_hash`, and compares it to the
+/// network-reported `ledger_hash`. Returns `Some(our_hash)` to sign on a match —
+/// the validator signs its OWN computed hash, so the signature is proof that this
+/// node independently verified THAT ledger — or `None` on divergence, in which
+/// case the caller must refuse to sign and emit a `ValidationSkipped` with reason
+/// `ledger_hash_mismatch`.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_ledger_for_signing(
+    ledger_seq: u32,
+    total_drops: u64,
+    parent_hash: &[u8; 32],
+    tx_hash: &[u8; 32],
+    account_hash: &[u8; 32],
+    parent_close_time: u32,
+    close_time: u32,
+    close_resolution: u8,
+    close_flags: u8,
+    network_hash: &[u8; 32],
+) -> Option<[u8; 32]> {
+    let our = compute_ledger_hash(
+        ledger_seq,
+        total_drops,
+        parent_hash,
+        tx_hash,
+        account_hash,
+        parent_close_time,
+        close_time,
+        close_resolution,
+        close_flags,
+    );
+    if our.0 == *network_hash {
+        Some(our.0)
+    } else {
+        None
+    }
 }
 
 /// Compute a transaction tree hash from a list of transaction hashes.

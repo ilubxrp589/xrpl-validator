@@ -963,9 +963,21 @@ async fn main() {
     let mut round_raw_txs: Vec<(xrpl_core::types::Hash256, Vec<u8>)> = Vec::new();
     tokio::spawn(async move {
         let mut rx = engine_rx;
+        // VALAUDIT Phase 5 (va-05): RPC client for fetching closed-ledger headers
+        // from local rippled in the signing path (to recompute the ledger_hash).
+        let sign_rpc_url = std::env::var("XRPL_RPC_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:5005".to_string());
+        let sign_rpc_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
         loop {
             match rx.recv().await {
                 Ok(event) => {
+                    // VALAUDIT Phase 5 (va-05): scope the engine guard in a block so
+                    // it is lexically dropped before the async signing path's RPC
+                    // fetch below (a parking_lot guard can't be held across `.await`).
+                    {
                     let mut state = engine.lock();
 
                     // Track ledger sequence changes (new round)
@@ -1125,6 +1137,9 @@ async fn main() {
                         }
                     }
 
+                    } // VALAUDIT Phase 5 (va-05): end engine-lock scope — `state`
+                      // guard released here, before the async RPC fetch below.
+
                     // Trigger consensus on CLOSING events
                     if event.msg_type == "StatusChange" && event.detail.contains("CLOSING") {
                         if let Some(seq) = event.ledger_seq {
@@ -1197,8 +1212,78 @@ async fn main() {
                                     });
                                     continue;
                                 }
-                                let hash_source = "VERIFIED";
-                                let ledger_hash_bytes = network_hash_bytes;
+                                // VALAUDIT Phase 5 (va-05) — Signing Gate, hard form.
+                                // Phase 3 above proved our account_hash matched the
+                                // network's for 3+ ledgers. Now recompute the FULL
+                                // ledger_hash from the header fields + OUR account_hash
+                                // and sign it only if it equals the network's — so the
+                                // signature proves independent verification of THIS
+                                // ledger. Refuse on any divergence (or missing data).
+                                let our_account_hash = match state_hash_for_close.current_hash() {
+                                    Some(h) => h,
+                                    None => {
+                                        eprintln!("[validator] Declining to sign #{seq}: no locally-computed account_hash");
+                                        let _ = val_sse.send(MessageEvent {
+                                            seq: 0, time: 0.0,
+                                            msg_type: "ValidationSkipped".into(),
+                                            detail: "no local account_hash".into(),
+                                            ledger_seq: Some(seq),
+                                            ledger_hash: None, peers: None, validator: None, tx_info: None,
+                                        });
+                                        continue;
+                                    }
+                                };
+                                let close_hdr = match fetch_close_header(&sign_rpc_client, &sign_rpc_url, seq).await {
+                                    Some(h) => h,
+                                    None => {
+                                        eprintln!("[validator] Declining to sign #{seq}: could not fetch ledger header for independent verification");
+                                        let _ = val_sse.send(MessageEvent {
+                                            seq: 0, time: 0.0,
+                                            msg_type: "ValidationSkipped".into(),
+                                            detail: "ledger header fetch failed".into(),
+                                            ledger_seq: Some(seq),
+                                            ledger_hash: None, peers: None, validator: None, tx_info: None,
+                                        });
+                                        continue;
+                                    }
+                                };
+                                let ledger_hash_bytes = match xrpl_node::state_hash::verify_ledger_for_signing(
+                                    seq,
+                                    close_hdr.total_drops,
+                                    &close_hdr.parent_hash,
+                                    &close_hdr.tx_hash,
+                                    &our_account_hash.0,
+                                    close_hdr.parent_close_time,
+                                    close_hdr.close_time,
+                                    close_hdr.close_resolution,
+                                    close_hdr.close_flags,
+                                    &network_hash_bytes,
+                                ) {
+                                    Some(our_hash) => {
+                                        state_hash_for_close.record_ledger_hash_result(true);
+                                        our_hash
+                                    }
+                                    None => {
+                                        state_hash_for_close.record_ledger_hash_result(false);
+                                        let ours = xrpl_node::state_hash::compute_ledger_hash(
+                                            seq, close_hdr.total_drops, &close_hdr.parent_hash,
+                                            &close_hdr.tx_hash, &our_account_hash.0, close_hdr.parent_close_time,
+                                            close_hdr.close_time, close_hdr.close_resolution, close_hdr.close_flags,
+                                        );
+                                        eprintln!("[SEV-1] [validator] Declining to sign #{seq}: ledger_hash MISMATCH ours={} network={}",
+                                            hex::encode(&ours.0[..8]), hex::encode(&network_hash_bytes[..8]));
+                                        let _ = val_sse.send(MessageEvent {
+                                            seq: 0, time: 0.0,
+                                            msg_type: "ValidationSkipped".into(),
+                                            detail: format!("ledger_hash_mismatch ours={} network={}",
+                                                hex::encode(&ours.0[..8]), hex::encode(&network_hash_bytes[..8])),
+                                            ledger_seq: Some(seq),
+                                            ledger_hash: None, peers: None, validator: None, tx_info: None,
+                                        });
+                                        continue;
+                                    }
+                                };
+                                let hash_source = "INDEPENDENT";
 
                                 // Gate passed (ready_to_sign && non-zero hash) — proceed.
                                 {
@@ -1360,6 +1445,7 @@ async fn main() {
                             .load(std::sync::atomic::Ordering::Relaxed),
                         validations_skipped_zero_hash: prom_hash.validations_skipped_zero_hash
                             .load(std::sync::atomic::Ordering::Relaxed),
+                        ledger_hash_match_ratio: prom_hash.ledger_hash_match_ratio(),
                     };
                     let body = xrpl_node::rpc::metrics::render_prometheus(&snap);
                     (
@@ -2219,4 +2305,57 @@ async fn sse_handler(
         }
     };
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// VALAUDIT Phase 5 (va-05): closed-ledger header fields needed to independently
+/// recompute a ledger_hash. `account_hash` is intentionally excluded — the signing
+/// path substitutes OUR independently-computed account_hash.
+struct CloseHeader {
+    parent_hash: [u8; 32],
+    tx_hash: [u8; 32],
+    parent_close_time: u32,
+    close_time: u32,
+    close_resolution: u8,
+    close_flags: u8,
+    total_drops: u64,
+}
+
+/// Fetch a closed ledger's header from local rippled (no transactions) and parse
+/// the fields needed to recompute its ledger_hash. Returns `None` on any RPC or
+/// parse failure — the caller then refuses to sign (fail-closed).
+async fn fetch_close_header(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    seq: u32,
+) -> Option<CloseHeader> {
+    let resp = client
+        .post(rpc_url)
+        .json(&serde_json::json!({
+            "method": "ledger",
+            "params": [{"ledger_index": seq, "transactions": false, "expand": false, "binary": false}]
+        }))
+        .send()
+        .await
+        .ok()?;
+    let body: serde_json::Value = resp.json().await.ok()?;
+    let l = &body["result"]["ledger"];
+    let h32 = |v: &serde_json::Value| -> Option<[u8; 32]> {
+        let b = hex::decode(v.as_str()?).ok()?;
+        if b.len() == 32 {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&b);
+            Some(a)
+        } else {
+            None
+        }
+    };
+    Some(CloseHeader {
+        parent_hash: h32(&l["parent_hash"])?,
+        tx_hash: h32(&l["transaction_hash"])?,
+        parent_close_time: l["parent_close_time"].as_u64()? as u32,
+        close_time: l["close_time"].as_u64()? as u32,
+        close_resolution: l["close_time_resolution"].as_u64()? as u8,
+        close_flags: l["close_flags"].as_u64().unwrap_or(0) as u8,
+        total_drops: l["total_coins"].as_str()?.parse().ok()?,
+    })
 }

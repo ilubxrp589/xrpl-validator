@@ -55,6 +55,9 @@ pub struct ValidatorMetricsSnapshot {
     /// VALAUDIT Phase 3 (va-03) signing-gate skip counters.
     pub validations_skipped_not_ready: u64,
     pub validations_skipped_zero_hash: u64,
+    /// VALAUDIT Phase 5 (va-05): rolling match ratio of our independently-computed
+    /// ledger_hash vs the network's (last ≤1000 signed ledgers). 1.0 = full agreement.
+    pub ledger_hash_match_ratio: f64,
 }
 
 /// Render full validator metrics in Prometheus text exposition format.
@@ -121,6 +124,10 @@ pub fn render_prometheus(snap: &ValidatorMetricsSnapshot) -> String {
          xrpl_validator_validations_skipped_total{{reason=\"not_ready\"}} {}\n\
          xrpl_validator_validations_skipped_total{{reason=\"zero_hash\"}} {}\n\
          \n\
+         # HELP xrpl_validator_ledger_hash_match_ratio Fraction of recent signed ledgers whose locally-computed ledger_hash matched the network (va-05)\n\
+         # TYPE xrpl_validator_ledger_hash_match_ratio gauge\n\
+         xrpl_validator_ledger_hash_match_ratio {:.6}\n\
+         \n\
          # HELP xrpl_validator_info Validator identity and version info\n\
          # TYPE xrpl_validator_info gauge\n\
          xrpl_validator_info{{version=\"0.1.0\",implementation=\"rust\",domain=\"{domain}\"}} 1\n",
@@ -139,6 +146,7 @@ pub fn render_prometheus(snap: &ValidatorMetricsSnapshot) -> String {
         snap.total_txs,
         snap.validations_skipped_not_ready,
         snap.validations_skipped_zero_hash,
+        snap.ledger_hash_match_ratio,
         domain = domain,
     )
 }
@@ -165,6 +173,7 @@ mod tests {
             total_txs: 100000,
             validations_skipped_not_ready: 3,
             validations_skipped_zero_hash: 0,
+            ledger_hash_match_ratio: 1.0,
         };
         let output = render_prometheus(&snap);
         assert!(output.contains("xrpl_validator_uptime_seconds 3600"));
@@ -174,6 +183,7 @@ mod tests {
         assert!(output.contains("xrpl_validator_state_objects 18750000"));
         assert!(output.contains("xrpl_validator_ready_to_sign 1"));
         assert!(output.contains("xrpl_validator_info{"));
+        assert!(output.contains("xrpl_validator_ledger_hash_match_ratio 1.000000"));
         assert!(output.contains("# TYPE xrpl_validator_total_matches counter"));
     }
 }
