@@ -455,6 +455,35 @@ async fn main() {
     // Live engine — opens RocksDB and applies transactions to real state
     // (created early so peer connections can serve ledger data)
     let rocks_db_path = xrpl_node::paths::state_rocks_path();
+
+    // Reaudit 2026-06-10 finding F5: crash-consistency gate. A clean shutdown writes
+    // clean_shutdown.marker; boot consumes it. Marker present => prior shutdown was
+    // clean and state.rocks is consistent. Marker absent while state.rocks exists =>
+    // unclean shutdown (OOM/SIGKILL/power) => state may be torn => refuse to start
+    // (no auto-recovery by design). Operator wipes+resyncs, or sets XRPL_FORCE_START=1.
+    {
+        let marker_path = xrpl_node::paths::clean_shutdown_marker_path();
+        let rocks_exists = std::path::Path::new(&rocks_db_path)
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+        let marker_exists = std::path::Path::new(&marker_path).exists();
+        let force_start = std::env::var("XRPL_FORCE_START").map(|v| v == "1").unwrap_or(false);
+        use xrpl_node::startup::StartupIntegrity::*;
+        match xrpl_node::startup::assess_startup_integrity(rocks_exists, marker_exists, force_start) {
+            FreshStart => eprintln!("[validator] startup integrity (F5): no prior state — will bulk-sync"),
+            CleanResume => eprintln!("[validator] startup integrity (F5): clean prior shutdown — resuming"),
+            ForcedResume => eprintln!("[validator] startup integrity (F5): WARNING — unclean prior shutdown, XRPL_FORCE_START=1 set — resuming on possibly-torn state.rocks"),
+            UncleanRefuse => {
+                eprintln!("[validator] FATAL (reaudit F5): previous shutdown was unclean (no clean_shutdown.marker) but state.rocks exists — it may be torn (the hasher rebuilds from inconsistent state → account_hash strikes → halt). Wipe state.rocks + markers and bulk-resync per the runbook, or set XRPL_FORCE_START=1 to resume deliberately.");
+                std::process::exit(1);
+            }
+        }
+        // Consume the marker: until the next clean shutdown rewrites it, its absence
+        // means this session did not exit cleanly.
+        let _ = std::fs::remove_file(&marker_path);
+    }
+
     let live_engine: Arc<Mutex<Option<xrpl_node::engine::LiveEngine>>> = Arc::new(Mutex::new(
         match xrpl_node::engine::LiveEngine::open(std::path::Path::new(&rocks_db_path)) {
             Ok(e) => {
@@ -598,7 +627,13 @@ async fn main() {
             sigterm.recv().await;
             eprintln!("[shutdown] SIGTERM received — saving leaf cache...");
             shc.save_cache();
-            eprintln!("[shutdown] Cache saved. Exiting.");
+            // Reaudit F5: record a clean shutdown so the next boot knows state.rocks
+            // is consistent and may be resumed (rather than treated as torn).
+            let marker = xrpl_node::paths::clean_shutdown_marker_path();
+            match std::fs::write(&marker, "clean") {
+                Ok(()) => eprintln!("[shutdown] Cache saved, clean-shutdown marker written. Exiting."),
+                Err(e) => eprintln!("[shutdown] Cache saved, but FAILED to write clean-shutdown marker ({e}) — next boot will treat this as unclean. Exiting."),
+            }
             std::process::exit(0);
         });
     }

@@ -16,6 +16,7 @@
 
 pub mod bulk_sync;
 pub mod rippled_client;
+pub mod startup;
 pub mod config;
 pub mod consensus;
 pub mod consensus_engine;

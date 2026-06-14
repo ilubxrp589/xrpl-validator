@@ -55,6 +55,14 @@ pub fn sync_complete_marker_path() -> String {
     format!("{}/sync_complete.marker", sync_dir())
 }
 
+/// Sentinel written on a clean (SIGTERM) shutdown and consumed on boot
+/// (reaudit 2026-06-10 finding F5). Present at boot => previous shutdown was
+/// clean and state.rocks is consistent. Absent while state.rocks exists =>
+/// unclean shutdown (OOM/SIGKILL/power) => state may be torn => refuse to start.
+pub fn clean_shutdown_marker_path() -> String {
+    format!("{}/clean_shutdown.marker", sync_dir())
+}
+
 /// Validator's signing key file (Ed25519 seed in hex). Honors
 /// `XRPL_SEED_PATH` if set.
 pub fn seed_path() -> String {
