@@ -14,7 +14,7 @@
 /// XRPL flag ledgers (where amendment voting/activation is tallied) occur every
 /// 256 sequences. Refresh the active amendment set on each one.
 pub fn is_flag_ledger(seq: u32) -> bool {
-    seq != 0 && seq % 256 == 0
+    seq != 0 && seq.is_multiple_of(256)
 }
 
 /// Difference between the current active amendment set and a freshly fetched one.
