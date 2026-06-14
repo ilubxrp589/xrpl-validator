@@ -179,6 +179,10 @@ async fn main() {
                         total_drops,
                         Some(dlog.as_ref()),
                         None, // no snapshot — sidecar uses pure RPC path
+                        None, // silent_divergence_log
+                        None, // expected_outcomes
+                        None, // mutation_divergence_log
+                        None, // expected_mutations
                     );
                 });
             }
