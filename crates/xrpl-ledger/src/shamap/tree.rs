@@ -233,9 +233,14 @@ fn delete_from_mut(
             // and walking down single-child inners leads to a leaf, promote
             // that leaf all the way up to this position.
             // Prevents inner→inner→...→leaf chains from forming after multiple deletes.
-            fn find_sole_leaf(n: &SHAMapNode) -> Option<(Hash256, Hash256)> {
+            fn find_sole_leaf(n: &SHAMapNode) -> Option<LeafNode> {
                 match n {
-                    SHAMapNode::Leaf(l) => Some((*l.key(), l.hash())),
+                    // Clone the ACTUAL leaf so its data (not just its hash) is
+                    // preserved when promoted up the collapsed chain. Reconstructing
+                    // it hash-only (the old bug, reaudit F4) zeroed the data of the
+                    // surviving sibling in State trees while keeping the hash —
+                    // invisible to the signing path, corrupting lookups.
+                    SHAMapNode::Leaf(l) => Some(l.clone()),
                     SHAMapNode::Inner(i) => {
                         if i.child_count() == 1 {
                             if let Some(idx) = i.only_child_index() {
@@ -248,8 +253,8 @@ fn delete_from_mut(
             }
             if let SHAMapNode::Inner(ref i) = node {
                 if i.child_count() == 1 {
-                    if let Some((key, hash)) = find_sole_leaf(node) {
-                        *node = SHAMapNode::Leaf(LeafNode::new_hash_only(key, hash));
+                    if let Some(leaf) = find_sole_leaf(node) {
+                        *node = SHAMapNode::Leaf(leaf);
                     }
                 }
             }
@@ -444,6 +449,30 @@ mod tests {
         assert_eq!(tree.len(), 1);
         assert_eq!(tree.lookup(&Hash256(k1)), None);
         assert_eq!(tree.lookup(&Hash256(k2)), Some(&[2][..]));
+    }
+
+    #[test]
+    fn delete_collapse_through_multiple_inners_preserves_data() {
+        // k1 and k2 share the first nibble (0x1) and split at the second, so the
+        // tree is root -> inner -> {leaf k1, leaf k2}. Deleting k2 forces a
+        // multi-level structural collapse (inner -> root); the surviving leaf's
+        // DATA must survive every promotion, not just its hash.
+        let mut tree = SHAMap::new(TreeType::State);
+        let mut k1 = [0u8; 32]; k1[0] = 0x11;
+        let mut k2 = [0u8; 32]; k2[0] = 0x12;
+
+        tree.insert(Hash256(k1), vec![1]).unwrap();
+        tree.insert(Hash256(k2), vec![2]).unwrap();
+        tree.delete(&Hash256(k2)).unwrap();
+
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree.lookup(&Hash256(k2)), None);
+        assert_eq!(tree.lookup(&Hash256(k1)), Some(&[1][..]));
+
+        // After collapse the tree must be identical to one built with only k1.
+        let mut fresh = SHAMap::new(TreeType::State);
+        fresh.insert(Hash256(k1), vec![1]).unwrap();
+        assert_eq!(tree.root_hash(), fresh.root_hash());
     }
 
     #[test]
