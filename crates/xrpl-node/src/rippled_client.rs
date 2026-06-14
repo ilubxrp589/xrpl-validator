@@ -174,3 +174,95 @@ impl RippledClient {
         self.active_ws.store(0, Ordering::Relaxed);
     }
 }
+
+/// Reaudit 2026-06-10 finding F7 — guard against silently verifying mainnet state
+/// against the PUBLIC fallback clusters.
+///
+/// A signing validator must source ledger state from a trusted (local/private)
+/// rippled. On a host with no local node (e.g. m3060) an unset primary override
+/// lets the failover chain reach `xrplcluster.com` / `s1.ripple.com` — a
+/// consensus-divergence source AND a violation of the never-hammer-public-RPCs
+/// rule. Returns `Err` (caller refuses to start) when this node signs, neither
+/// override is set, and the escape hatch is off.
+///
+/// `allow_default_endpoints` is the `XRPL_ALLOW_DEFAULT_ENDPOINTS=1` opt-out for
+/// legitimate localhost runs (e.g. dev on .39 where localhost:5005 is a real node).
+pub fn check_signing_endpoints(
+    signing_enabled: bool,
+    rpc_override: Option<&str>,
+    ws_override: Option<&str>,
+    allow_default_endpoints: bool,
+) -> Result<(), String> {
+    if !signing_enabled || allow_default_endpoints {
+        return Ok(());
+    }
+    let mut missing: Vec<&str> = Vec::new();
+    if rpc_override.is_none() {
+        missing.push("XRPL_RPC_URL");
+    }
+    if ws_override.is_none() {
+        missing.push("XRPL_WS_URL");
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "signing validator started without {missing} set — the endpoint failover \
+         chain would reach PUBLIC clusters ({public}), a consensus-divergence source \
+         that also violates the never-hammer-public-RPCs rule. Set {missing} to a \
+         trusted rippled, or set XRPL_ALLOW_DEFAULT_ENDPOINTS=1 to allow defaults \
+         (dev/localhost only).",
+        missing = missing.join(" and "),
+        public = ENDPOINTS[1],
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_signing_node_allows_default_endpoints() {
+        // Observer / dev nodes don't sign, so falling back to public clusters is fine.
+        assert!(check_signing_endpoints(false, None, None, false).is_ok());
+    }
+
+    #[test]
+    fn signing_with_both_overrides_is_ok() {
+        assert!(check_signing_endpoints(
+            true,
+            Some("http://10.0.0.39:5005"),
+            Some("ws://10.0.0.39:6006"),
+            false,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn signing_without_rpc_override_is_refused() {
+        let err = check_signing_endpoints(true, None, Some("ws://10.0.0.39:6006"), false)
+            .unwrap_err();
+        assert!(err.contains("XRPL_RPC_URL"), "should name the missing RPC var: {err}");
+        assert!(!err.contains("XRPL_WS_URL"), "must not flag WS when it is set: {err}");
+    }
+
+    #[test]
+    fn signing_without_ws_override_is_refused() {
+        let err = check_signing_endpoints(true, Some("http://10.0.0.39:5005"), None, false)
+            .unwrap_err();
+        assert!(err.contains("XRPL_WS_URL"), "should name the missing WS var: {err}");
+        assert!(!err.contains("XRPL_RPC_URL"), "must not flag RPC when it is set: {err}");
+    }
+
+    #[test]
+    fn signing_without_either_override_names_both() {
+        let err = check_signing_endpoints(true, None, None, false).unwrap_err();
+        assert!(err.contains("XRPL_RPC_URL") && err.contains("XRPL_WS_URL"), "{err}");
+    }
+
+    #[test]
+    fn explicit_opt_in_allows_default_endpoints_even_when_signing() {
+        // XRPL_ALLOW_DEFAULT_ENDPOINTS=1 escape hatch for dev/localhost runs.
+        assert!(check_signing_endpoints(true, None, None, true).is_ok());
+    }
+}

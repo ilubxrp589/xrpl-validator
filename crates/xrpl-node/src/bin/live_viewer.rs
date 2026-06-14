@@ -260,6 +260,34 @@ async fn main() {
     // Init rustls crypto provider
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    // Reaudit 2026-06-10 finding F7: refuse to start a signing validator that would
+    // silently verify mainnet state against PUBLIC RPC clusters. live_viewer always
+    // signs (persistent seed + validation broadcast below), so require the trusted
+    // endpoint overrides unless explicitly opted out for dev/localhost.
+    {
+        let rpc_override = std::env::var("XRPL_RPC_URL").ok();
+        let ws_override = std::env::var("XRPL_WS_URL").ok();
+        let allow_default = std::env::var("XRPL_ALLOW_DEFAULT_ENDPOINTS")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        match xrpl_node::rippled_client::check_signing_endpoints(
+            true,
+            rpc_override.as_deref(),
+            ws_override.as_deref(),
+            allow_default,
+        ) {
+            Ok(()) => eprintln!(
+                "[validator] endpoint safety (F7): OK (RPC={}, WS={})",
+                if rpc_override.is_some() { "override" } else { "default" },
+                if ws_override.is_some() { "override" } else { "default" },
+            ),
+            Err(msg) => {
+                eprintln!("[validator] FATAL (reaudit F7): {msg}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let (tx, _) = broadcast::channel::<MessageEvent>(10000);
     let tx2 = tx.clone();
 
