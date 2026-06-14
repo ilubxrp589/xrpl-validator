@@ -14,6 +14,7 @@
 //! - **Follower** — sync ledger state, serve RPC, no consensus
 //! - **Validator** — full consensus participation with validation signing
 
+pub mod amendments;
 pub mod bulk_sync;
 pub mod rippled_client;
 pub mod startup;

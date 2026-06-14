@@ -43,7 +43,11 @@ use crate::ffi_engine::{
 pub struct FfiVerifier {
     stats: SharedFfiStats,
     rpc_urls: Vec<String>,
-    amendments: Vec<[u8; 32]>,
+    /// Active mainnet amendments. Behind a lock so the flag-ledger refresh
+    /// (reaudit F6/va-07) can swap in a new set mid-run without blocking readers.
+    amendments: Arc<parking_lot::RwLock<Vec<[u8; 32]>>>,
+    /// True while a background amendment refresh is in flight (coalesces refreshes).
+    refresh_in_flight: Arc<std::sync::atomic::AtomicBool>,
     divergence_log: Arc<DivergenceLog>,
     /// Separate log for `tec*`/`tesSUCCESS` divergences — cases the main
     /// `divergence_log` skips because libxrpl returned a "claimed" or
@@ -74,11 +78,58 @@ impl FfiVerifier {
         Self {
             stats: new_stats(),
             rpc_urls,
-            amendments,
+            amendments: Arc::new(parking_lot::RwLock::new(amendments)),
+            refresh_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             divergence_log: Arc::new(DivergenceLog::new()),
             silent_divergence_log: Arc::new(DivergenceLog::with_path(silent_path)),
             mutation_divergence_log: Arc::new(DivergenceLog::with_path(mutation_path)),
         }
+    }
+
+    /// Reaudit F6/va-07: on each flag ledger, re-fetch the active mainnet amendment
+    /// set in the background and swap it in if it changed. Non-blocking — the fetch
+    /// (which can take ~40s on rippled overload) runs on a dedicated thread so it
+    /// never stalls per-ledger verification; at most one refresh runs at a time.
+    ///
+    /// SCOPING: this rescues amendments already compiled into the linked libxrpl
+    /// that reach majority and activate mid-run. Amendments introduced in a newer
+    /// rippled still require the rebuild — runtime IDs cannot supply engine semantics.
+    pub fn maybe_refresh_amendments(&self, ledger_seq: u32) {
+        use std::sync::atomic::Ordering;
+        if !crate::amendments::is_flag_ledger(ledger_seq) {
+            return;
+        }
+        // Coalesce: if a refresh is already running, skip this flag ledger.
+        if self.refresh_in_flight.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let amendments = Arc::clone(&self.amendments);
+        let in_flight = Arc::clone(&self.refresh_in_flight);
+        let rpc_url = self.rpc_urls[0].clone();
+        std::thread::spawn(move || {
+            let fetched = fetch_mainnet_amendments(&rpc_url);
+            if !fetched.is_empty() {
+                let delta = {
+                    let current = amendments.read();
+                    crate::amendments::diff_amendment_sets(&current, &fetched)
+                };
+                if !delta.is_empty() {
+                    eprintln!(
+                        "[ffi-amendments] FLAG LEDGER {ledger_seq}: active set changed — {} added, {} removed (swapping live set)",
+                        delta.added.len(),
+                        delta.removed.len(),
+                    );
+                    for a in &delta.added {
+                        eprintln!("[ffi-amendments]   + {}", hex::encode_upper(a));
+                    }
+                    for a in &delta.removed {
+                        eprintln!("[ffi-amendments]   - {}", hex::encode_upper(a));
+                    }
+                    *amendments.write() = fetched;
+                }
+            }
+            in_flight.store(false, Ordering::Release);
+        });
     }
 
     /// Apply and verify every tx in a ledger, in `TransactionIndex` order,
@@ -98,12 +149,14 @@ impl FfiVerifier {
         expected_outcomes: Option<&std::collections::HashMap<String, String>>,
         expected_mutations: Option<&std::collections::HashMap<String, Vec<(String, u8)>>>,
     ) -> LedgerOverlay {
+        self.maybe_refresh_amendments(ledger_seq);
+        let amendments = self.amendments.read().clone();
         apply_ledger_in_order(
             &self.stats,
             sorted_tx_blobs,
             ledger_seq,
             &self.rpc_urls,
-            &self.amendments,
+            &amendments,
             parent_hash,
             parent_close_time,
             total_drops,
@@ -132,12 +185,14 @@ impl FfiVerifier {
         expected_outcomes: Option<&std::collections::HashMap<String, String>>,
         expected_mutations: Option<&std::collections::HashMap<String, Vec<(String, u8)>>>,
     ) -> LedgerOverlay {
+        self.maybe_refresh_amendments(ledger_seq);
+        let amendments = self.amendments.read().clone();
         apply_ledger_in_order(
             &self.stats,
             sorted_tx_blobs,
             ledger_seq,
             &self.rpc_urls,
-            &self.amendments,
+            &amendments,
             parent_hash,
             parent_close_time,
             total_drops,
