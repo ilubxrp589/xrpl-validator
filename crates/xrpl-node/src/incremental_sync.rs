@@ -5,6 +5,16 @@
 //! then fetches each changed object in binary and writes it to RocksDB.
 //! This keeps the local state tree in sync with the network without
 //! re-downloading all ~30M objects.
+//!
+//! INVARIANT (reaudit 2026-06-10, finding F2): every write to state.rocks MUST be
+//! paired with a `StateHashComputer` update. A historical background full-DB sweep
+//! (`start_sweep`/`fetch_batch`, removed here) violated this — it `db.put` each key
+//! at a single pinned ledger without touching the hasher, regressing freshly-synced
+//! keys to stale values while the in-memory hasher kept the live value. The rot was
+//! invisible until the next restart rebuilt the hasher from rocks → wrong
+//! account_hash → 3 strikes → halt. Do not reintroduce bulk writes without hasher
+//! pairing. See `sync_ledger`, `repair_failed_keys`, and the ws-sync
+//! write-after-verify path for the correct pattern.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -68,157 +78,6 @@ impl IncrementalSyncer {
             last_synced: Arc::new(AtomicU32::new(0)),
             repair_queue: Arc::new(Mutex::new(Vec::new())),
         }
-    }
-
-    /// Background sweep: iterate ALL RocksDB keys and re-fetch each one at the
-    /// current validated ledger. This fixes the franken-state from bulk sync
-    /// (where different keys were downloaded at different ledger versions).
-    /// Progress is persisted to disk so restarts resume where they left off.
-    pub fn start_sweep(&self, db: Arc<rocksdb::DB>, data_dir: &str) {
-        let cursor_path = std::path::PathBuf::from(data_dir).join("sweep_cursor.bin");
-        let done_path = std::path::PathBuf::from(data_dir).join("sweep_done");
-
-        // If sweep already completed, skip entirely
-        if done_path.exists() {
-            eprintln!("[sweep] Already completed (marker exists). Skipping.");
-            return;
-        }
-
-        // Load resume cursor if it exists
-        let resume_key: Option<Vec<u8>> = std::fs::read(&cursor_path).ok().filter(|k| k.len() == 32);
-        if let Some(ref k) = resume_key {
-            eprintln!("[sweep] Resuming from cursor {}", hex::encode(k));
-        }
-
-        let stats = self.stats.clone();
-
-        // Count total keys first
-        let total: u64 = db.property_value("rocksdb.estimate-num-keys")
-            .ok().flatten()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-
-        {
-            let mut s = stats.lock();
-            s.sweep.running = true;
-            s.sweep.total_keys = total;
-        }
-
-        eprintln!("[sweep] Starting background sweep of ~{total} keys...");
-
-        let cursor_path_clone = cursor_path.clone();
-        let done_path_clone = done_path.clone();
-
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("sweep runtime");
-
-            rt.block_on(async move {
-                let client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(8))
-                    .build()
-                    .expect("sweep client");
-
-                let endpoints = [
-                    rpc_endpoint(),
-                    rpc_endpoint(),
-                    rpc_endpoint(),
-                ];
-
-                let pinned_seq: u32 = match client.post(endpoints[0])
-                    .json(&serde_json::json!({"method":"ledger","params":[{"ledger_index":"validated"}]}))
-                    .send().await
-                    .and_then(|r| Ok(r))
-                {
-                    Ok(resp) => {
-                        if let Ok(body) = resp.json::<serde_json::Value>().await {
-                            body["result"]["ledger_index"].as_u64()
-                                .or_else(|| body["result"]["ledger"]["ledger_index"].as_u64())
-                                .unwrap_or(0) as u32
-                        } else { 0 }
-                    }
-                    Err(_) => 0,
-                };
-                if pinned_seq == 0 {
-                    eprintln!("[sweep] FATAL: could not fetch validated ledger seq — aborting sweep");
-                    let mut s = stats.lock();
-                    s.sweep.running = false;
-                    return;
-                }
-                eprintln!("[sweep] Pinning all fetches to ledger #{pinned_seq}");
-
-                let mut swept: u64 = 0;
-                let mut updated: u64 = 0;
-                let start = std::time::Instant::now();
-                let mut batch_keys: Vec<Vec<u8>> = Vec::new();
-                let mut last_key: Option<Vec<u8>> = None;
-
-                let iter = if let Some(ref cursor) = resume_key {
-                    db.iterator(rocksdb::IteratorMode::From(cursor, rocksdb::Direction::Forward))
-                } else {
-                    db.iterator(rocksdb::IteratorMode::Start)
-                };
-
-                for item in iter {
-                    let (key, _val) = match item {
-                        Ok(kv) => kv,
-                        Err(_) => continue,
-                    };
-                    if key.len() != 32 { continue; }
-                    last_key = Some(key.to_vec());
-                    batch_keys.push(key.to_vec());
-
-                    if batch_keys.len() >= 250 {
-                        let fetched = fetch_batch(
-                            &client, &endpoints, &batch_keys, &db, pinned_seq,
-                        ).await;
-                        swept += batch_keys.len() as u64;
-                        updated += fetched;
-                        batch_keys.clear();
-
-                        if swept % 10000 == 0 {
-                            if let Some(ref lk) = last_key {
-                                let _ = std::fs::write(&cursor_path_clone, lk);
-                            }
-                            let elapsed = start.elapsed().as_secs_f64();
-                            let rate = swept as f64 / elapsed;
-                            let remaining = if rate > 0.0 {
-                                (total.saturating_sub(swept)) as f64 / rate
-                            } else { 0.0 };
-                            eprintln!(
-                                "[sweep] {swept}/{total} ({:.1}%) — {updated} updated — {rate:.0}/s — ~{:.0}min left",
-                                swept as f64 / total as f64 * 100.0,
-                                remaining / 60.0,
-                            );
-                            let mut s = stats.lock();
-                            s.sweep.swept = swept;
-                            s.sweep.updated = updated;
-                            s.sweep.rate = rate;
-                        }
-                    }
-                }
-
-                if !batch_keys.is_empty() {
-                    let fetched = fetch_batch(&client, &endpoints, &batch_keys, &db, pinned_seq).await;
-                    swept += batch_keys.len() as u64;
-                    updated += fetched;
-                }
-
-                let elapsed = start.elapsed().as_secs_f64();
-                eprintln!("[sweep] DONE — {swept} keys swept, {updated} updated in {:.0}s", elapsed);
-
-                let _ = std::fs::write(&done_path_clone, format!("{swept} keys, {updated} updated"));
-                let _ = std::fs::remove_file(&cursor_path_clone);
-
-                let mut s = stats.lock();
-                s.sweep.swept = swept;
-                s.sweep.updated = updated;
-                s.sweep.running = false;
-                s.sweep.rate = swept as f64 / elapsed;
-            });
-        });
     }
 
     /// Sync all state changes from ledger `seq` into `db`, then update the SHAMap.
@@ -1065,56 +924,4 @@ async fn repair_failed_keys(
         }
     }
     repaired
-}
-
-/// Fetch a batch of keys from RPC in parallel and write fresh binary to RocksDB.
-async fn fetch_batch(
-    client: &reqwest::Client,
-    endpoints: &[&str],
-    keys: &[Vec<u8>],
-    db: &Arc<rocksdb::DB>,
-    pinned_seq: u32,
-) -> u64 {
-    let mut handles = Vec::new();
-    for (i, key) in keys.iter().enumerate() {
-        let client = client.clone();
-        let index_hex = hex::encode(key);
-        let endpoint = endpoints[i % endpoints.len()].to_string();
-        handles.push(tokio::spawn(async move {
-            let resp = client
-                .post(&endpoint)
-                .json(&serde_json::json!({
-                    "method": "ledger_entry",
-                    "params": [{"index": index_hex, "binary": true, "ledger_index": pinned_seq}]
-                }))
-                .send()
-                .await;
-            match resp {
-                Ok(r) => {
-                    if let Ok(body) = r.json::<serde_json::Value>().await {
-                        if let Some(data_hex) = body["result"]["node_binary"].as_str() {
-                            if let Ok(data) = hex::decode(data_hex) {
-                                return Some((index_hex, data));
-                            }
-                        }
-                    }
-                    None
-                }
-                Err(_) => None,
-            }
-        }));
-    }
-
-    let mut updated = 0u64;
-    for handle in handles {
-        if let Ok(Some((index_hex, data))) = handle.await {
-            if let Ok(key_bytes) = hex::decode(&index_hex) {
-                if key_bytes.len() == 32 {
-                    let _ = db.put(&key_bytes, &data);
-                    updated += 1;
-                }
-            }
-        }
-    }
-    updated
 }
