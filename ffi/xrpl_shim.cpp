@@ -1,6 +1,6 @@
-// xrpl_shim.cpp — C ABI over rippled 3.1.2's xrpl::apply / preflight path.
+// xrpl_shim.cpp — C ABI over rippled 3.1.3's xrpl::apply / preflight path.
 //
-// Namespace note: rippled 3.1.2 uses `namespace ripple`. Our helpers
+// Namespace note: rippled 3.1.3 uses `namespace ripple`. Our helpers
 // (MinimalApp, MutationCollector, CallbackReadView) live in the same
 // namespace for ADL friendliness and so we don't need an alias.
 
@@ -30,7 +30,7 @@
 #include <unordered_set>
 
 namespace {
-constexpr const char *SHIM_VERSION = "0.2.0";  // bumped for 3.1.2 Application port
+constexpr const char *SHIM_VERSION = "0.2.0";  // 3.1.3 Application port (bump to 0.3.0 at the 3.2.0 shim port)
 }
 
 struct XrplEngine {
