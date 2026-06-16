@@ -70,7 +70,7 @@ public:
     //     non-pure with no-op defaults, so we no longer override them. ===
 
     // === digest — pure virtual in 3.2.0; SHAMap-leaf hash, unused by single-tx apply ===
-    std::optional<digest_type> digest(key_type const& key) const override;
+    std::optional<uint256> digest(key_type const& key) const override;
 
     // === Iteration — THROWS (not needed for single-tx apply) ===
     std::unique_ptr<SlesType::iter_base> slesBegin() const override;

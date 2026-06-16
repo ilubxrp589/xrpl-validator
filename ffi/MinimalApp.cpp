@@ -2,9 +2,9 @@
 
 #include "MinimalApp.h"
 
-#include <xrpld/app/misc/HashRouter.h>
-#include <xrpld/app/misc/LoadFeeTrack.h>
-#include <xrpld/app/ledger/Ledger.h>
+#include <xrpl/core/HashRouter.h>
+#include <xrpl/server/LoadFeeTrack.h>
+#include <xrpl/ledger/Ledger.h>
 #include <xrpl/basics/chrono.h>
 
 #include <stdexcept>
