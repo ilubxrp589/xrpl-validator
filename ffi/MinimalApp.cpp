@@ -15,6 +15,7 @@ MinimalApp::MinimalApp(std::uint32_t networkID)
     : config_(std::make_unique<Config>())
 {
     config_->networkId = networkID;  // drives rules / fee calc in the apply path
+    networkIDService_ = std::make_unique<NetworkIDServiceImpl>(config_->networkId);
 }
 
 // --- Application throw-stubs ---
@@ -38,7 +39,6 @@ STUB(TimeKeeper&, getTimeKeeper)
 STUB(JobQueue&, getJobQueue)
 STUB(NodeCache&, getTempNodeCache)
 STUB(CachedSLEs&, getCachedSLEs)
-STUB(NetworkIDService&, getNetworkIDService)
 STUB(AmendmentTable&, getAmendmentTable)
 STUB(HashRouter&, getHashRouter)
 STUB(LoadFeeTrack&, getFeeTrack)

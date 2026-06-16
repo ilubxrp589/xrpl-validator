@@ -14,6 +14,8 @@
 
 #include <xrpld/app/main/Application.h>
 #include <xrpld/core/Config.h>
+#include <xrpl/core/NetworkIDService.h>
+#include <xrpld/core/NetworkIDServiceImpl.h>
 #include <xrpl/beast/utility/Journal.h>
 
 #include <chrono>
@@ -56,6 +58,8 @@ public:
     Application& getApp() override { return *this; }
     beast::Journal getJournal(std::string const&) override { return beast::Journal{beast::Journal::getNullSink()}; }
     std::optional<uint256> const& getTrapTxID() const override { return trapTxID_; }
+    // Real: 3.2.0 preflight routes the tx NetworkID check through this service.
+    NetworkIDService& getNetworkIDService() override { return *networkIDService_; }
 
     // ===== ServiceRegistry — throw-stubs =====
     CollectorManager& getCollectorManager() override;
@@ -64,7 +68,6 @@ public:
     JobQueue& getJobQueue() override;
     NodeCache& getTempNodeCache() override;
     CachedSLEs& getCachedSLEs() override;
-    NetworkIDService& getNetworkIDService() override;
     AmendmentTable& getAmendmentTable() override;
     HashRouter& getHashRouter() override;
     LoadFeeTrack& getFeeTrack() override;
@@ -103,6 +106,7 @@ public:
 
 private:
     std::unique_ptr<Config> config_;
+    std::unique_ptr<NetworkIDService> networkIDService_;
     MutexType masterMutex_;
     std::optional<uint256> trapTxID_;
 };
