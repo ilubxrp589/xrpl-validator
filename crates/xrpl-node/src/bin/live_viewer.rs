@@ -1539,6 +1539,7 @@ async fn main() {
                         validations_skipped_zero_hash: prom_hash.validations_skipped_zero_hash
                             .load(std::sync::atomic::Ordering::Relaxed),
                         ledger_hash_match_ratio: prom_hash.ledger_hash_match_ratio(),
+                        lockstep_shadow_match_ratio: xrpl_node::ws_sync::lockstep_meter().match_ratio(),
                     };
                     let body = xrpl_node::rpc::metrics::render_prometheus(&snap);
                     (

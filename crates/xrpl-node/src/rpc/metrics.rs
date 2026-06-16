@@ -58,6 +58,9 @@ pub struct ValidatorMetricsSnapshot {
     /// VALAUDIT Phase 5 (va-05): rolling match ratio of our independently-computed
     /// ledger_hash vs the network's (last ≤1000 signed ledgers). 1.0 = full agreement.
     pub ledger_hash_match_ratio: f64,
+    /// VALAUDIT lockstep M1: rolling shadow match ratio of our recomputed ledger_hash
+    /// (RPC-ordered) vs the network's, last ≤1000 ledgers. 1.0 = full agreement.
+    pub lockstep_shadow_match_ratio: f64,
 }
 
 /// Render full validator metrics in Prometheus text exposition format.
@@ -128,6 +131,10 @@ pub fn render_prometheus(snap: &ValidatorMetricsSnapshot) -> String {
          # TYPE xrpl_validator_ledger_hash_match_ratio gauge\n\
          xrpl_validator_ledger_hash_match_ratio {:.6}\n\
          \n\
+         # HELP xrpl_lockstep_shadow_match_ratio Shadow lockstep ledger_hash match ratio, RPC-ordered (va-05 M1)\n\
+         # TYPE xrpl_lockstep_shadow_match_ratio gauge\n\
+         xrpl_lockstep_shadow_match_ratio {:.6}\n\
+         \n\
          # HELP xrpl_validator_info Validator identity and version info\n\
          # TYPE xrpl_validator_info gauge\n\
          xrpl_validator_info{{version=\"0.1.0\",implementation=\"rust\",domain=\"{domain}\"}} 1\n",
@@ -147,6 +154,7 @@ pub fn render_prometheus(snap: &ValidatorMetricsSnapshot) -> String {
         snap.validations_skipped_not_ready,
         snap.validations_skipped_zero_hash,
         snap.ledger_hash_match_ratio,
+        snap.lockstep_shadow_match_ratio,
         domain = domain,
     )
 }
@@ -174,6 +182,7 @@ mod tests {
             validations_skipped_not_ready: 3,
             validations_skipped_zero_hash: 0,
             ledger_hash_match_ratio: 1.0,
+            lockstep_shadow_match_ratio: 1.0,
         };
         let output = render_prometheus(&snap);
         assert!(output.contains("xrpl_validator_uptime_seconds 3600"));
@@ -184,6 +193,7 @@ mod tests {
         assert!(output.contains("xrpl_validator_ready_to_sign 1"));
         assert!(output.contains("xrpl_validator_info{"));
         assert!(output.contains("xrpl_validator_ledger_hash_match_ratio 1.000000"));
+        assert!(output.contains("xrpl_lockstep_shadow_match_ratio 1.000000"));
         assert!(output.contains("# TYPE xrpl_validator_total_matches counter"));
     }
 }
