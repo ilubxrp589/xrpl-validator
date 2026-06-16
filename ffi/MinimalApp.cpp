@@ -9,7 +9,7 @@
 
 #include <stdexcept>
 
-namespace ripple {
+namespace xrpl {
 
 Application::Application() : beast::PropertyStream::Source("app") {}
 
@@ -157,4 +157,4 @@ int MinimalApp::fdRequired() const
     throw std::runtime_error("MinimalApp::fdRequired — not implemented");
 }
 
-}  // namespace ripple
+}  // namespace xrpl

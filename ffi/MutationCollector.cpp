@@ -2,7 +2,7 @@
 
 #include "MutationCollector.h"
 
-namespace ripple {
+namespace xrpl {
 
 static std::vector<uint8_t> serialize_sle(SLE const& sle) {
     Serializer s;
@@ -57,4 +57,4 @@ void MutationCollector::rawTxInsert(
     tx_mutations_.push_back(std::move(tm));
 }
 
-}  // namespace ripple
+}  // namespace xrpl

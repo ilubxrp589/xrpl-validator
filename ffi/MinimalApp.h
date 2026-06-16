@@ -1,4 +1,4 @@
-// MinimalApp.h — minimum ripple::Application needed to call apply()/preflight().
+// MinimalApp.h — minimum xrpl::Application needed to call apply()/preflight().
 //
 // Built against rippled 3.1.3 stable (Application.h). Implements only the
 // methods the tx apply path actually touches. Everything else throws.
@@ -13,7 +13,7 @@
 //   trapTxID()         — always returns empty optional
 //
 // Stubbed (throws std::runtime_error if called):
-//   Everything else on ripple::Application.
+//   Everything else on xrpl::Application.
 //
 // The getAmendmentTable() and getOPs() stubs are only reachable via the Change
 // transaction handler (pseudo-transactions — EnableAmendment / SetFee /
@@ -36,9 +36,9 @@
 #include <mutex>
 #include <optional>
 
-namespace ripple {
+namespace xrpl {
 
-/** Minimum viable Application for running ripple::apply() in a standalone
+/** Minimum viable Application for running xrpl::apply() in a standalone
  *  replay context. Owns real Config / Logs / HashRouter / LoadFeeTrack
  *  instances, stubs everything else. OrderBookDB is used directly (concrete
  *  class in 3.1.3, no virtuals) — never calling setup() keeps it empty. */
@@ -130,4 +130,4 @@ private:
     std::recursive_mutex masterMutex_;
 };
 
-}  // namespace ripple
+}  // namespace xrpl

@@ -1,6 +1,6 @@
 // xrpl_shim.cpp — C ABI over rippled 3.1.3's xrpl::apply / preflight path.
 //
-// Namespace note: rippled 3.1.3 uses `namespace ripple`. Our helpers
+// Namespace note: rippled 3.1.3 uses `namespace xrpl`. Our helpers
 // (MinimalApp, MutationCollector, CallbackReadView) live in the same
 // namespace for ADL friendliness and so we don't need an alias.
 
@@ -46,7 +46,7 @@ struct XrplApplyResult {
     bool applied;
     std::string ter_name;
     std::string last_fatal;
-    ripple::MutationCollector collector;
+    xrpl::MutationCollector collector;
 };
 
 // Journal sink that captures error-and-above messages into a std::string.
@@ -74,7 +74,7 @@ const char *xrpl_shim_version(void) {
 }
 
 const char *xrpl_rippled_version(void) {
-    static std::string v = ripple::BuildInfo::getVersionString();
+    static std::string v = xrpl::BuildInfo::getVersionString();
     return v.c_str();
 }
 
@@ -145,14 +145,14 @@ bool xrpl_tx_parse(
     uint8_t out_hash[32],
     char *out_type_name, size_t type_name_buf_len) {
     try {
-        ripple::SerialIter sit(tx_bytes, tx_len);
-        ripple::STTx tx(sit);
+        xrpl::SerialIter sit(tx_bytes, tx_len);
+        xrpl::STTx tx(sit);
 
         auto const id = tx.getTransactionID();
         std::memcpy(out_hash, id.data(), 32);
 
-        ripple::TxType type = tx.getTxnType();
-        auto const *item = ripple::TxFormats::getInstance().findByType(type);
+        xrpl::TxType type = tx.getTxnType();
+        auto const *item = xrpl::TxFormats::getInstance().findByType(type);
         std::string name = item ? item->getName() : "Unknown";
 
         if (out_type_name && type_name_buf_len > 0) {
@@ -177,35 +177,35 @@ int32_t xrpl_preflight(
     uint32_t network_id,
     char *out_ter_name, size_t ter_name_buf_len) {
     try {
-        ripple::SerialIter sit(tx_bytes, tx_len);
-        ripple::STTx tx(sit);
+        xrpl::SerialIter sit(tx_bytes, tx_len);
+        xrpl::STTx tx(sit);
 
-        std::unordered_set<ripple::uint256, beast::uhash<>> presets;
+        std::unordered_set<xrpl::uint256, beast::uhash<>> presets;
         if (amendments_bytes && amendments_len > 0 && amendments_len % 32 == 0) {
             size_t n = amendments_len / 32;
             for (size_t i = 0; i < n; i++) {
-                ripple::uint256 feature;
+                xrpl::uint256 feature;
                 std::memcpy(feature.data(), amendments_bytes + i * 32, 32);
                 presets.insert(feature);
             }
         }
-        ripple::Rules rules(presets);
+        xrpl::Rules rules(presets);
 
-        ripple::MinimalApp app(network_id);
+        xrpl::MinimalApp app(network_id);
         beast::Journal journal(beast::Journal::getNullSink());
 
-        auto result = ripple::preflight(
+        auto result = xrpl::preflight(
             app,
             rules,
             tx,
-            static_cast<ripple::ApplyFlags>(apply_flags),
+            static_cast<xrpl::ApplyFlags>(apply_flags),
             journal);
 
-        ripple::TER ter = result.ter;
+        xrpl::TER ter = result.ter;
         int32_t ter_code = TERtoInt(ter);
 
         if (out_ter_name && ter_name_buf_len > 0) {
-            std::string name = ripple::transToken(ter);
+            std::string name = xrpl::transToken(ter);
             size_t copy_len = std::min(name.size(), ter_name_buf_len - 1);
             std::memcpy(out_ter_name, name.data(), copy_len);
             out_ter_name[copy_len] = '\0';
@@ -243,21 +243,21 @@ int32_t xrpl_apply(
     bool *out_applied) {
     if (out_applied) *out_applied = false;
     try {
-        ripple::SerialIter sit(tx_bytes, tx_len);
-        ripple::STTx tx(sit);
+        xrpl::SerialIter sit(tx_bytes, tx_len);
+        xrpl::STTx tx(sit);
 
-        std::unordered_set<ripple::uint256, beast::uhash<>> presets;
+        std::unordered_set<xrpl::uint256, beast::uhash<>> presets;
         if (amendments_bytes && amendments_len > 0 && amendments_len % 32 == 0) {
             size_t n = amendments_len / 32;
             for (size_t i = 0; i < n; i++) {
-                ripple::uint256 feature;
+                xrpl::uint256 feature;
                 std::memcpy(feature.data(), amendments_bytes + i * 32, 32);
                 presets.insert(feature);
             }
         }
-        ripple::Rules rules(presets);
+        xrpl::Rules rules(presets);
 
-        ripple::LedgerHeader header;
+        xrpl::LedgerHeader header;
         // header represents the target ledger we're applying tx INTO. With
         // the closed-ledger OpenView ctor (no seq+1 increment), view.seq()
         // returns header.seq directly. libxrpl uses view.seq() to set new
@@ -279,19 +279,19 @@ int32_t xrpl_apply(
         // separately need to set header.parentCloseTime — OpenView discards
         // base.parentCloseTime — but we set both for diagnostic readers that
         // might inspect the LedgerHeader directly.
-        header.closeTime = ripple::NetClock::time_point(ripple::NetClock::duration(parent_close_time));
-        header.parentCloseTime = ripple::NetClock::time_point(ripple::NetClock::duration(parent_close_time));
+        header.closeTime = xrpl::NetClock::time_point(xrpl::NetClock::duration(parent_close_time));
+        header.parentCloseTime = xrpl::NetClock::time_point(xrpl::NetClock::duration(parent_close_time));
         std::memcpy(header.parentHash.data(), parent_hash, 32);
-        header.drops = ripple::XRPAmount(static_cast<std::int64_t>(total_drops));
-        header.closeTimeResolution = ripple::NetClock::duration(10);
+        header.drops = xrpl::XRPAmount(static_cast<std::int64_t>(total_drops));
+        header.closeTimeResolution = xrpl::NetClock::duration(10);
 
-        ripple::Fees fees;
-        fees.base = ripple::XRPAmount(static_cast<std::int64_t>(base_fee_drops));
-        fees.reserve = ripple::XRPAmount(static_cast<std::int64_t>(reserve_drops));
-        fees.increment = ripple::XRPAmount(static_cast<std::int64_t>(increment_drops));
+        xrpl::Fees fees;
+        fees.base = xrpl::XRPAmount(static_cast<std::int64_t>(base_fee_drops));
+        fees.reserve = xrpl::XRPAmount(static_cast<std::int64_t>(reserve_drops));
+        fees.increment = xrpl::XRPAmount(static_cast<std::int64_t>(increment_drops));
 
-        ripple::SleLookupCallback cpp_lookup =
-            [lookup_fn, lookup_user_data](ripple::uint256 const& key, uint8_t const** out_data, size_t* out_len) -> bool {
+        xrpl::SleLookupCallback cpp_lookup =
+            [lookup_fn, lookup_user_data](xrpl::uint256 const& key, uint8_t const** out_data, size_t* out_len) -> bool {
                 return lookup_fn(lookup_user_data, key.data(), out_data, out_len);
             };
 
@@ -301,19 +301,19 @@ int32_t xrpl_apply(
         // ctor inherits that, gating meta-build on `if (!to.open() ...)` (line 127).
         // Meta-build runs threadItem + threadOwners, which add issuer/counterparty
         // AccountRoot mutations our open-ledger path was silently dropping.
-        auto read_view = std::make_shared<ripple::CallbackReadView>(
+        auto read_view = std::make_shared<xrpl::CallbackReadView>(
             header, rules, fees, /*open=*/false, cpp_lookup);
 
-        ripple::OpenView open_view(read_view.get(), read_view);
+        xrpl::OpenView open_view(read_view.get(), read_view);
 
-        ripple::MinimalApp app(network_id);
+        xrpl::MinimalApp app(network_id);
         beast::Journal journal(beast::Journal::getNullSink());
 
-        auto result = ripple::apply(
+        auto result = xrpl::apply(
             app,
             open_view,
             tx,
-            static_cast<ripple::ApplyFlags>(apply_flags),
+            static_cast<xrpl::ApplyFlags>(apply_flags),
             journal);
 
         if (out_applied) *out_applied = result.applied;
@@ -321,7 +321,7 @@ int32_t xrpl_apply(
         int32_t ter_code = TERtoInt(result.ter);
 
         if (out_ter_name && ter_name_buf_len > 0) {
-            std::string name = ripple::transToken(result.ter);
+            std::string name = xrpl::transToken(result.ter);
             size_t copy_len = std::min(name.size(), ter_name_buf_len - 1);
             std::memcpy(out_ter_name, name.data(), copy_len);
             out_ter_name[copy_len] = '\0';
@@ -359,21 +359,21 @@ XrplApplyResult *xrpl_apply_with_mutations(
     void *succ_user_data) {
     auto *result = new XrplApplyResult{};
     try {
-        ripple::SerialIter sit(tx_bytes, tx_len);
-        ripple::STTx tx(sit);
+        xrpl::SerialIter sit(tx_bytes, tx_len);
+        xrpl::STTx tx(sit);
 
-        std::unordered_set<ripple::uint256, beast::uhash<>> presets;
+        std::unordered_set<xrpl::uint256, beast::uhash<>> presets;
         if (amendments_bytes && amendments_len > 0 && amendments_len % 32 == 0) {
             size_t n = amendments_len / 32;
             for (size_t i = 0; i < n; i++) {
-                ripple::uint256 feature;
+                xrpl::uint256 feature;
                 std::memcpy(feature.data(), amendments_bytes + i * 32, 32);
                 presets.insert(feature);
             }
         }
-        ripple::Rules rules(presets);
+        xrpl::Rules rules(presets);
 
-        ripple::LedgerHeader header;
+        xrpl::LedgerHeader header;
         // header represents the target ledger we're applying tx INTO. With
         // the closed-ledger OpenView ctor (no seq+1 increment), view.seq()
         // returns header.seq directly. libxrpl uses view.seq() to set new
@@ -395,25 +395,25 @@ XrplApplyResult *xrpl_apply_with_mutations(
         // separately need to set header.parentCloseTime — OpenView discards
         // base.parentCloseTime — but we set both for diagnostic readers that
         // might inspect the LedgerHeader directly.
-        header.closeTime = ripple::NetClock::time_point(ripple::NetClock::duration(parent_close_time));
-        header.parentCloseTime = ripple::NetClock::time_point(ripple::NetClock::duration(parent_close_time));
+        header.closeTime = xrpl::NetClock::time_point(xrpl::NetClock::duration(parent_close_time));
+        header.parentCloseTime = xrpl::NetClock::time_point(xrpl::NetClock::duration(parent_close_time));
         std::memcpy(header.parentHash.data(), parent_hash, 32);
-        header.drops = ripple::XRPAmount(static_cast<std::int64_t>(total_drops));
-        header.closeTimeResolution = ripple::NetClock::duration(10);
+        header.drops = xrpl::XRPAmount(static_cast<std::int64_t>(total_drops));
+        header.closeTimeResolution = xrpl::NetClock::duration(10);
 
-        ripple::Fees fees;
-        fees.base = ripple::XRPAmount(static_cast<std::int64_t>(base_fee_drops));
-        fees.reserve = ripple::XRPAmount(static_cast<std::int64_t>(reserve_drops));
-        fees.increment = ripple::XRPAmount(static_cast<std::int64_t>(increment_drops));
+        xrpl::Fees fees;
+        fees.base = xrpl::XRPAmount(static_cast<std::int64_t>(base_fee_drops));
+        fees.reserve = xrpl::XRPAmount(static_cast<std::int64_t>(reserve_drops));
+        fees.increment = xrpl::XRPAmount(static_cast<std::int64_t>(increment_drops));
 
-        ripple::SleLookupCallback cpp_lookup =
-            [lookup_fn, lookup_user_data](ripple::uint256 const& key, uint8_t const** out_data, size_t* out_len) -> bool {
+        xrpl::SleLookupCallback cpp_lookup =
+            [lookup_fn, lookup_user_data](xrpl::uint256 const& key, uint8_t const** out_data, size_t* out_len) -> bool {
                 return lookup_fn(lookup_user_data, key.data(), out_data, out_len);
             };
 
-        ripple::SleSuccCallback cpp_succ;
+        xrpl::SleSuccCallback cpp_succ;
         if (succ_fn) {
-            cpp_succ = [succ_fn, succ_user_data](ripple::uint256 const& key, ripple::uint256 const* last, ripple::uint256& out) -> bool {
+            cpp_succ = [succ_fn, succ_user_data](xrpl::uint256 const& key, xrpl::uint256 const* last, xrpl::uint256& out) -> bool {
                 return succ_fn(succ_user_data, key.data(), last ? last->data() : nullptr, out.data());
             };
         }
@@ -424,21 +424,21 @@ XrplApplyResult *xrpl_apply_with_mutations(
         // threadOwners populate items_ with issuer/counterparty AccountRoot
         // entries that our MutationCollector then receives via the outer
         // apply(RawView&) flush below.
-        auto read_view = std::make_shared<ripple::CallbackReadView>(
+        auto read_view = std::make_shared<xrpl::CallbackReadView>(
             header, rules, fees, /*open=*/false, cpp_lookup, cpp_succ);
-        ripple::OpenView open_view(read_view.get(), read_view);
+        xrpl::OpenView open_view(read_view.get(), read_view);
 
-        ripple::MinimalApp app(network_id);
+        xrpl::MinimalApp app(network_id);
         CapturingSink capturing_sink(result->last_fatal);
         beast::Journal journal(capturing_sink);
 
-        auto apply_result = ripple::apply(
+        auto apply_result = xrpl::apply(
             app, open_view, tx,
-            static_cast<ripple::ApplyFlags>(apply_flags), journal);
+            static_cast<xrpl::ApplyFlags>(apply_flags), journal);
 
         result->ter = TERtoInt(apply_result.ter);
         result->applied = apply_result.applied;
-        result->ter_name = ripple::transToken(apply_result.ter);
+        result->ter_name = xrpl::transToken(apply_result.ter);
 
         open_view.apply(result->collector);
 
@@ -462,32 +462,32 @@ bool xrpl_test_callback_read(
     const uint8_t *sle_bytes,
     size_t sle_len) {
     try {
-        std::unordered_set<ripple::uint256, beast::uhash<>> presets;
-        ripple::Rules rules(presets);
+        std::unordered_set<xrpl::uint256, beast::uhash<>> presets;
+        xrpl::Rules rules(presets);
 
-        ripple::LedgerHeader header;
+        xrpl::LedgerHeader header;
         header.seq = 0;
-        header.closeTimeResolution = ripple::NetClock::duration(10);
+        header.closeTimeResolution = xrpl::NetClock::duration(10);
 
-        ripple::Fees fees;
-        fees.base = ripple::XRPAmount(static_cast<std::int64_t>(10));
-        fees.reserve = ripple::XRPAmount(static_cast<std::int64_t>(1'000'000));
-        fees.increment = ripple::XRPAmount(static_cast<std::int64_t>(200'000));
+        xrpl::Fees fees;
+        fees.base = xrpl::XRPAmount(static_cast<std::int64_t>(10));
+        fees.reserve = xrpl::XRPAmount(static_cast<std::int64_t>(1'000'000));
+        fees.increment = xrpl::XRPAmount(static_cast<std::int64_t>(200'000));
 
-        ripple::SleLookupCallback cpp_lookup =
-            [sle_bytes, sle_len](ripple::uint256 const&, uint8_t const** out_data, size_t* out_len) -> bool {
+        xrpl::SleLookupCallback cpp_lookup =
+            [sle_bytes, sle_len](xrpl::uint256 const&, uint8_t const** out_data, size_t* out_len) -> bool {
                 if (!sle_bytes || sle_len == 0) return false;
                 *out_data = sle_bytes;
                 *out_len = sle_len;
                 return true;
             };
-        ripple::SleSuccCallback cpp_succ;  // null — read path doesn't need succ
+        xrpl::SleSuccCallback cpp_succ;  // null — read path doesn't need succ
 
-        ripple::CallbackReadView view(header, rules, fees, /*open=*/true, cpp_lookup, cpp_succ);
+        xrpl::CallbackReadView view(header, rules, fees, /*open=*/true, cpp_lookup, cpp_succ);
 
-        ripple::uint256 k;
+        xrpl::uint256 k;
         std::memcpy(k.data(), key, 32);
-        ripple::Keylet keylet{static_cast<ripple::LedgerEntryType>(keylet_type), k};
+        xrpl::Keylet keylet{static_cast<xrpl::LedgerEntryType>(keylet_type), k};
 
         return view.read(keylet) != nullptr;
     } catch (...) {

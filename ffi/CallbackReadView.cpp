@@ -7,7 +7,7 @@
 
 #include <stdexcept>
 
-namespace ripple {
+namespace xrpl {
 
 CallbackReadView::CallbackReadView(
     LedgerHeader const& header,
@@ -115,4 +115,4 @@ CallbackReadView::txsEnd() const
     throw std::runtime_error("CallbackReadView::txsEnd — not implemented");
 }
 
-}  // namespace ripple
+}  // namespace xrpl
