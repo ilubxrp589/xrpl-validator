@@ -11,6 +11,20 @@ namespace xrpl {
 // (ServiceRegistry — the other base — is default-constructed).
 Application::Application() : beast::PropertyStream::Source("app") {}
 
+// 3.2.0 made OrderBookDB a pure-virtual interface (the concrete OrderBookDBImpl
+// needs a full ServiceRegistry we don't have). Single-tx apply crosses offers
+// against the ledger View's book-directory SLEs, not this in-memory cache, so a
+// no-op impl is hash-safe; we only need getOrderBookDB() to return a valid ref.
+class NoopOrderBookDB : public OrderBookDB
+{
+public:
+    void setup(std::shared_ptr<ReadView const> const&) override {}
+    void addOrderBook(Book const&) override {}
+    std::vector<Book> getBooksByTakerPays(Asset const&, std::optional<Domain> const&) override { return {}; }
+    int getBookSize(Asset const&, std::optional<Domain> const&) override { return 0; }
+    bool isBookToXRP(Asset const&, std::optional<Domain> const&) override { return false; }
+};
+
 MinimalApp::MinimalApp(std::uint32_t networkID)
     : config_(std::make_unique<Config>())
     , logs_(std::make_unique<Logs>(beast::Severity::Fatal))
@@ -26,7 +40,7 @@ MinimalApp::MinimalApp(std::uint32_t networkID)
     auto const setup = setup_HashRouter(*config_);
     hashRouter_ = std::make_unique<HashRouter>(setup, stopwatch());
     feeTrack_ = std::make_unique<LoadFeeTrack>(nullJournal_);
-    orderBookDB_ = std::make_unique<OrderBookDB>(*this);
+    orderBookDB_ = std::make_unique<NoopOrderBookDB>();
 }
 
 // --- Application throw-stubs ---
