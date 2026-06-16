@@ -39,44 +39,27 @@ fn amendment_hash(name: &str) -> Hash256 {
     Hash256(result)
 }
 
-/// Known XRPL amendments we support — vote YES on flag ledgers.
-/// This list includes all enabled mainnet amendments as of 2026-03.
+/// Amendments this validator supports — listed in the Amendments field of our
+/// validation on flag ledgers. Regenerated from rippled 3.2.0's
+/// `include/xrpl/protocol/detail/features.macro` (the `Supported::Yes` set) on
+/// 2026-06-15 for the 3.2.0 port: drops amendments 3.2.0 retired into baseline,
+/// adds the new 3.2.0 amendments, and excludes `Supported::No` placeholders
+/// (MPTokensV2, Batch, PermissionDelegationV1_1, DynamicMPT, fixBatchInnerSigs) that
+/// 3.2.0 declares but does not yet implement. Regenerate at each upgrade (PORT-3.2.0.md).
 pub fn supported_amendments() -> Vec<Hash256> {
-    // All currently enabled + voting amendments on XRPL mainnet
     let names = [
-        "MultiSign", "TrustSetAuth", "FeeEscalation",
-        "PayChan", "CryptoConditions", "TickSize",
-        "fix1368", "Escrow", "CryptoConditionsSuite",
-        "fix1373", "EnforceInvariants", "FlowCross",
-        "SortedDirectories", "fix1201", "fix1512",
-        "fix1513", "fix1523", "fix1528",
-        "DepositAuth", "Checks", "fix1571",
-        "fix1543", "fix1623", "DepositPreauth",
-        "fix1515", "fix1578", "MultiSignReserve",
-        "fixTakerDryOfferRemoval", "fixMasterKeyAsRegularKey",
-        "fixCheckThreading", "fixPayChanRecipientOwnerDir",
-        "DeletableAccounts", "fixQualityUpperBound",
-        "RequireFullyCanonicalSig", "fix1781",
-        "HardenedValidations", "fixAmendmentMajorityCalc",
-        "NegativeUNL", "TicketBatch", "FlowSortStrands",
-        "fixSTAmountCanonicalize", "fixRmSmallIncreasedQOffers",
-        "CheckCashMakesTrustLine", "ExpandedSignerList",
-        "NonFungibleTokensV1_1", "fixTrustLinesToSelf",
-        "fixRemoveNFTokenAutoTrustLine", "ImmediateOfferKilled",
-        "DisallowIncoming", "XRPFees", "fixUniversalNumber",
-        "fixNonFungibleTokensV1_2", "fixNFTokenRemint",
-        "fixReducedOffersV1", "Clawback",
-        "AMM", "XChainBridge",
-        "fixDisallowIncomingV1", "DID",
-        "fixFillOrKill", "fixNFTokenReserve",
-        "fixInnerObjTemplate", "fixAMMOverflowOffer",
-        "PriceOracle", "fixEmptyDID",
-        "fixXChainRewardRounding", "fixPreviousTxnID",
-        "fixAMMv1_1", "NFTokenMintOffer",
-        "DeepFreeze", "PermissionedDomains",
-        "Credentials", "AMMClawback",
-        "fixReducedOffersV2", "fixEnforceNFTokenTrustline",
-        "fixInnerObjTemplate2",
+        "fixCleanup3_2_0", "fixCleanup3_1_3", "LendingProtocol", "fixDirectoryLimit",
+        "fixIncludeKeyletFields", "fixTokenEscrowV1", "fixPriceOracleOrder", "fixMPTDeliveredAmount",
+        "fixAMMClawbackRounding", "TokenEscrow", "fixEnforceNFTokenTrustlineV2", "fixAMMv1_3",
+        "PermissionedDEX", "SingleAssetVault", "fixPayChanCancelAfter", "fixInvalidTxFlags",
+        "fixFrozenLPTokenTransfer", "DeepFreeze", "PermissionedDomains", "DynamicNFT",
+        "Credentials", "AMMClawback", "fixAMMv1_2", "MPTokensV1",
+        "fixNFTokenPageLinks", "fixInnerObjTemplate2", "fixEnforceNFTokenTrustline", "fixReducedOffersV2",
+        "NFTokenMintOffer", "fixAMMv1_1", "fixPreviousTxnID", "fixXChainRewardRounding",
+        "fixEmptyDID", "PriceOracle", "fixAMMOverflowOffer", "fixInnerObjTemplate",
+        "fixNFTokenReserve", "fixFillOrKill", "DID", "fixDisallowIncomingV1",
+        "XChainBridge", "AMM", "Clawback", "fixUniversalNumber",
+        "XRPFees", "fixRemoveNFTokenAutoTrustLine",
     ];
     names.iter().map(|n| amendment_hash(n)).collect()
 }
