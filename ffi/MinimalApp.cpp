@@ -37,8 +37,11 @@ MinimalApp::MinimalApp(std::uint32_t networkID)
     //   HashRouter   — dedup/relay TTLs (default Setup; doesn't affect apply correctness)
     //   LoadFeeTrack — fee escalation (null journal; default => base-fee scaling)
     //   OrderBookDB  — offer crossing
-    auto const setup = setup_HashRouter(*config_);
-    hashRouter_ = std::make_unique<HashRouter>(setup, stopwatch());
+    // 3.2.0's setup_HashRouter lives in xrpld (the daemon), not libxrpl. A default
+    // Setup is fine here: its fields are only dedup/relay TTLs, irrelevant to the
+    // deterministic result of a single-tx apply.
+    HashRouter::Setup const hrSetup{};
+    hashRouter_ = std::make_unique<HashRouter>(hrSetup, stopwatch());
     feeTrack_ = std::make_unique<LoadFeeTrack>(nullJournal_);
     orderBookDB_ = std::make_unique<NoopOrderBookDB>();
 }
