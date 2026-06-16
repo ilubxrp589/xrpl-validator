@@ -13,9 +13,9 @@
 #pragma once
 
 #include <xrpld/app/main/Application.h>
-#include <xrpld/app/misc/HashRouter.h>
-#include <xrpld/app/misc/LoadFeeTrack.h>
-#include <xrpld/app/ledger/OrderBookDB.h>
+#include <xrpl/core/HashRouter.h>
+#include <xrpl/server/LoadFeeTrack.h>
+#include <xrpl/ledger/OrderBookDB.h>
 #include <xrpld/core/Config.h>
 #include <xrpl/core/NetworkIDService.h>
 #include <xrpld/core/NetworkIDServiceImpl.h>
