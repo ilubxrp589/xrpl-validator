@@ -50,7 +50,7 @@ public:
     ~CallbackReadView() override = default;
 
     // === Header / metadata ===
-    LedgerInfo const& info() const override { return header_; }
+    LedgerHeader const& header() const override { return header_; }
     bool open() const override { return open_; }
     Fees const& fees() const override { return fees_; }
     Rules const& rules() const override { return rules_; }
@@ -66,22 +66,18 @@ public:
     bool txExists(key_type const& key) const override;
     tx_type txRead(key_type const& key) const override;
 
-    // === Balance hook (not typically overridden for apply) ===
-    STAmount balanceHook(
-        AccountID const& account,
-        AccountID const& issuer,
-        STAmount const& amount) const override { return amount; }
+    // === Hooks: 3.2.0's balanceHookIOU/MPT/SelfIssueMPT + ownerCountHook are all
+    //     non-pure with no-op defaults, so we no longer override them. ===
 
-    std::uint32_t ownerCountHook(
-        AccountID const& /*account*/,
-        std::uint32_t count) const override { return count; }
+    // === digest — pure virtual in 3.2.0; SHAMap-leaf hash, unused by single-tx apply ===
+    std::optional<digest_type> digest(key_type const& key) const override;
 
     // === Iteration — THROWS (not needed for single-tx apply) ===
-    std::unique_ptr<sles_type::iter_base> slesBegin() const override;
-    std::unique_ptr<sles_type::iter_base> slesEnd() const override;
-    std::unique_ptr<sles_type::iter_base> slesUpperBound(key_type const& key) const override;
-    std::unique_ptr<txs_type::iter_base> txsBegin() const override;
-    std::unique_ptr<txs_type::iter_base> txsEnd() const override;
+    std::unique_ptr<SlesType::iter_base> slesBegin() const override;
+    std::unique_ptr<SlesType::iter_base> slesEnd() const override;
+    std::unique_ptr<SlesType::iter_base> slesUpperBound(key_type const& key) const override;
+    std::unique_ptr<TxsType::iter_base> txsBegin() const override;
+    std::unique_ptr<TxsType::iter_base> txsEnd() const override;
 
 private:
     LedgerHeader header_;

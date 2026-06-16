@@ -85,34 +85,41 @@ CallbackReadView::txRead(key_type const& /*key*/) const
     throw std::runtime_error("CallbackReadView::txRead — not implemented");
 }
 
-std::unique_ptr<ReadView::sles_type::iter_base>
+std::unique_ptr<ReadView::SlesType::iter_base>
 CallbackReadView::slesBegin() const
 {
     throw std::runtime_error("CallbackReadView::slesBegin — not implemented");
 }
 
-std::unique_ptr<ReadView::sles_type::iter_base>
+std::unique_ptr<ReadView::SlesType::iter_base>
 CallbackReadView::slesEnd() const
 {
     throw std::runtime_error("CallbackReadView::slesEnd — not implemented");
 }
 
-std::unique_ptr<ReadView::sles_type::iter_base>
+std::unique_ptr<ReadView::SlesType::iter_base>
 CallbackReadView::slesUpperBound(key_type const& /*key*/) const
 {
     throw std::runtime_error("CallbackReadView::slesUpperBound — not implemented");
 }
 
-std::unique_ptr<ReadView::txs_type::iter_base>
+std::unique_ptr<ReadView::TxsType::iter_base>
 CallbackReadView::txsBegin() const
 {
     throw std::runtime_error("CallbackReadView::txsBegin — not implemented");
 }
 
-std::unique_ptr<ReadView::txs_type::iter_base>
+std::unique_ptr<ReadView::TxsType::iter_base>
 CallbackReadView::txsEnd() const
 {
     throw std::runtime_error("CallbackReadView::txsEnd — not implemented");
+}
+
+std::optional<ReadView::digest_type>
+CallbackReadView::digest(key_type const& /*key*/) const
+{
+    // SHAMap-leaf digest; not used by the single-tx apply path (like the iterators).
+    throw std::runtime_error("CallbackReadView::digest — not implemented");
 }
 
 }  // namespace xrpl
