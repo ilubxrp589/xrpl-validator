@@ -53,9 +53,9 @@ struct XrplApplyResult {
 class CapturingSink : public beast::Journal::Sink {
 public:
     CapturingSink(std::string& dest)
-        : beast::Journal::Sink(beast::Severity::kFatal, false), dest_(dest) {}
+        : beast::Journal::Sink(beast::Severity::Fatal, false), dest_(dest) {}
     void write(beast::Severity level, std::string const& text) override {
-        if (static_cast<int>(level) >= static_cast<int>(beast::Severity::kError)) {
+        if (static_cast<int>(level) >= static_cast<int>(beast::Severity::Error)) {
             if (!dest_.empty()) dest_.append(" | ");
             dest_.append(text);
         }
