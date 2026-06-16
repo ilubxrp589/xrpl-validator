@@ -20,10 +20,13 @@ use tokio_util::codec::{Decoder, Encoder};
 use super::message::PeerMessage;
 use crate::NodeError;
 
-/// Maximum allowed message size (4 MB). rippled's practical limit for most
-/// message types is ~4 MB. The previous 16 MB was unnecessarily large and
-/// could allow memory exhaustion via oversized frames.
-const MAX_MESSAGE_SIZE: u32 = 4 * 1024 * 1024;
+/// Maximum allowed message size (64 MiB) — matches rippled's protocol ceiling
+/// `kMaximumMessageSize = megabytes(64)` (overlay/Message.h) and the 26-bit
+/// payload-size header field (2^26 = 64 MiB). 3.2.0 peers legitimately send bulk
+/// frames (ledger data / large tx sets) well above the old 4 MB cap, which
+/// silently dropped ~60 MB messages from many peers. This also bounds the zlib
+/// decompression output, so a compressed frame can't inflate past it either.
+const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024;
 
 /// Bit mask for compression flag in the type code.
 const COMPRESSION_FLAG: u16 = 1 << 15;
@@ -216,13 +219,27 @@ mod tests {
         let mut codec = MessageCodec;
         let mut buf = BytesMut::new();
 
-        // Claim payload is 20 MB
-        buf.put_u32(20 * 1024 * 1024);
+        // Claim payload is 65 MiB — just above the 64 MiB protocol cap.
+        buf.put_u32(65 * 1024 * 1024);
         buf.put_u16(3); // type: Ping
         buf.put_slice(&[0u8; 100]);
 
         let result = codec.decode(&mut buf);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn accepts_message_within_new_cap() {
+        // A frame larger than the OLD 4 MB cap but within rippled's 64 MiB cap
+        // must NOT be rejected as oversized — it's the class of bulk message
+        // 3.2.0 peers actually send. With only a partial frame buffered, decode
+        // returns Ok(None) (awaiting more bytes), never the "too large" error.
+        let mut codec = MessageCodec;
+        let mut buf = BytesMut::new();
+        buf.put_u32(5 * 1024 * 1024); // 5 MiB: > old 4 MiB cap, < new 64 MiB cap
+        buf.put_u16(3);
+        buf.put_slice(&[0u8; 100]);
+        assert!(codec.decode(&mut buf).unwrap().is_none());
     }
 
     #[test]
