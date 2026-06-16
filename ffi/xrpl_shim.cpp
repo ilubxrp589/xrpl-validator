@@ -19,8 +19,8 @@
 #include <xrpl/protocol/XRPAmount.h>
 #include <xrpl/protocol/Fees.h>
 #include <xrpl/ledger/OpenView.h>
-#include <xrpld/app/tx/apply.h>
-#include <xrpld/app/tx/applySteps.h>
+#include <xrpl/tx/apply.h>
+#include <xrpl/tx/applySteps.h>
 #include <xrpl/beast/utility/Journal.h>
 
 #include <cstdio>

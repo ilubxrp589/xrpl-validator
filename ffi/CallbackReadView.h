@@ -69,9 +69,6 @@ public:
     // === Hooks: 3.2.0's balanceHookIOU/MPT/SelfIssueMPT + ownerCountHook are all
     //     non-pure with no-op defaults, so we no longer override them. ===
 
-    // === digest — pure virtual in 3.2.0; SHAMap-leaf hash, unused by single-tx apply ===
-    std::optional<uint256> digest(key_type const& key) const override;
-
     // === Iteration — THROWS (not needed for single-tx apply) ===
     std::unique_ptr<SlesType::iter_base> slesBegin() const override;
     std::unique_ptr<SlesType::iter_base> slesEnd() const override;

@@ -115,11 +115,4 @@ CallbackReadView::txsEnd() const
     throw std::runtime_error("CallbackReadView::txsEnd — not implemented");
 }
 
-std::optional<uint256>
-CallbackReadView::digest(key_type const& /*key*/) const
-{
-    // SHAMap-leaf digest; not used by the single-tx apply path (like the iterators).
-    throw std::runtime_error("CallbackReadView::digest — not implemented");
-}
-
 }  // namespace xrpl
