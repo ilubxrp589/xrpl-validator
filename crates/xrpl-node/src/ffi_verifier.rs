@@ -207,17 +207,20 @@ impl FfiVerifier {
 
     /// Compute shadow state hash using a PRE-CAPTURED hasher snapshot.
     /// The snapshot must be taken BEFORE process_ledger writes to the real hasher.
+    /// Returns our computed state root (`Some([u8; 32])`), or `None` if the hasher
+    /// isn't built yet. Match/mismatch vs `network_hash` is still tracked in stats;
+    /// the returned root lets the lockstep shadow recompute the full ledger_hash.
     pub fn check_shadow_hash(
         &self,
         hasher_snapshot: Box<dyn std::any::Any + Send>,
         overlay: &LedgerOverlay,
         network_hash: &str,
-    ) -> bool {
+    ) -> Option<[u8; 32]> {
         let shadow = match crate::state_hash::StateHashComputer::shadow_hash_from_snapshot(
             hasher_snapshot, overlay,
         ) {
             Some(h) => h,
-            None => return false,
+            None => return None,
         };
         let ours = hex::encode(shadow.0).to_uppercase();
         let net = network_hash.to_uppercase();
@@ -250,7 +253,7 @@ impl FfiVerifier {
         s.shadow_hash_last = ours;
         s.shadow_hash_last_network = net;
         s.shadow_hash_last_matched = matched;
-        matched
+        Some(shadow.0)
     }
 
     fn log_shadow_mismatch(&self, seq: u32, ours: &str, network: &str, overlay_keys: usize) {

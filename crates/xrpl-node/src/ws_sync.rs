@@ -18,6 +18,15 @@ use xrpl_core::types::Hash256;
 use xrpl_ledger::shamap::hash::{sha512_half_prefixed, HASH_PREFIX_LEAF_NODE};
 use crate::rippled_client::RippledClient;
 
+/// Process-wide lockstep shadow match meter (VALAUDIT M1). Records, per ledger,
+/// whether our independently-recomputed `ledger_hash` matched the network's;
+/// read by the `xrpl_lockstep_shadow_match_ratio` gauge. Lazily initialized so
+/// it's available in the non-ffi build too (ratio 1.0 until the first record).
+pub fn lockstep_meter() -> &'static crate::lockstep::LockstepMeter {
+    static METER: std::sync::OnceLock<crate::lockstep::LockstepMeter> = std::sync::OnceLock::new();
+    METER.get_or_init(crate::lockstep::LockstepMeter::new)
+}
+
 /// Halt-on-mismatch: how many consecutive ws-sync MISMATCH ledgers we
 /// tolerate before SIGTERM-ing the process. The previous behaviour was
 /// "log and move on" forever, which produced 263-ledger cascades of
@@ -83,6 +92,9 @@ pub async fn start_ws_sync(
 
     #[cfg(feature = "ffi")]
     let stage3_cfg = crate::stage3::Stage3Config::from_env();
+    // VALAUDIT lockstep M1: env-gated shadow ledger_hash recomputation (no signing impact).
+    #[cfg(feature = "ffi")]
+    let lockstep_shadow = std::env::var("XRPL_LOCKSTEP_SHADOW").map(|v| v == "1").unwrap_or(false);
     #[cfg(feature = "ffi")]
     eprintln!(
         "[stage3] start_ws_sync reached: Stage3Config.enabled={} XRPL_FFI_STAGE3={:?}",
@@ -425,9 +437,28 @@ pub async fn start_ws_sync(
                                         );
                                         if shadow_ok && !shadow_ah.is_empty() && !shadow_overlay.is_empty() {
                                             if let Some(hs) = hasher_snap {
-                                                let matched = v.check_shadow_hash(hs, &shadow_overlay, &shadow_ah);
+                                                let our_root = v.check_shadow_hash(hs, &shadow_overlay, &shadow_ah);
+                                                let matched = our_root
+                                                    .map(hex::encode_upper)
+                                                    .is_some_and(|h| h.eq_ignore_ascii_case(&shadow_ah));
                                                 if !matched {
                                                     dump_overlay_diff(seq, &overlay, &shadow_overlay);
+                                                }
+                                                // VALAUDIT lockstep M1 (shadow-only): recompute the full
+                                                // ledger_hash from our state root + header, compare to network.
+                                                if lockstep_shadow {
+                                                    if let Some(our_acct) = our_root {
+                                                        let out = crate::lockstep::evaluate_ledger(
+                                                            seq, hdr.total_drops, &hdr.parent_hash, &hdr.transaction_hash,
+                                                            &our_acct, hdr.parent_close_time, hdr.close_time,
+                                                            hdr.close_resolution, hdr.close_flags, &hdr.ledger_hash,
+                                                        );
+                                                        lockstep_meter().record(out.matched);
+                                                        if !out.matched {
+                                                            eprintln!("[lockstep] #{seq} MISMATCH ours={} network={}",
+                                                                hex::encode(&out.our_ledger_hash[..8]), hex::encode(&hdr.ledger_hash[..8]));
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -445,9 +476,28 @@ pub async fn start_ws_sync(
                                         );
                                         if shadow_ok && !shadow_ah.is_empty() && !shadow_overlay.is_empty() {
                                             if let Some(hs) = hasher_snap {
-                                                let matched = v.check_shadow_hash(hs, &shadow_overlay, &shadow_ah);
+                                                let our_root = v.check_shadow_hash(hs, &shadow_overlay, &shadow_ah);
+                                                let matched = our_root
+                                                    .map(hex::encode_upper)
+                                                    .is_some_and(|h| h.eq_ignore_ascii_case(&shadow_ah));
                                                 if !matched {
                                                     dump_overlay_diff(seq, &overlay, &shadow_overlay);
+                                                }
+                                                // VALAUDIT lockstep M1 (shadow-only): recompute the full
+                                                // ledger_hash from our state root + header, compare to network.
+                                                if lockstep_shadow {
+                                                    if let Some(our_acct) = our_root {
+                                                        let out = crate::lockstep::evaluate_ledger(
+                                                            seq, hdr.total_drops, &hdr.parent_hash, &hdr.transaction_hash,
+                                                            &our_acct, hdr.parent_close_time, hdr.close_time,
+                                                            hdr.close_resolution, hdr.close_flags, &hdr.ledger_hash,
+                                                        );
+                                                        lockstep_meter().record(out.matched);
+                                                        if !out.matched {
+                                                            eprintln!("[lockstep] #{seq} MISMATCH ours={} network={}",
+                                                                hex::encode(&out.our_ledger_hash[..8]), hex::encode(&hdr.ledger_hash[..8]));
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
