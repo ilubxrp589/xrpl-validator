@@ -53,14 +53,14 @@ struct XrplApplyResult {
 class CapturingSink : public beast::Journal::Sink {
 public:
     CapturingSink(std::string& dest)
-        : beast::Journal::Sink(beast::severities::kFatal, false), dest_(dest) {}
-    void write(beast::severities::Severity level, std::string const& text) override {
-        if (level >= beast::severities::kError) {
+        : beast::Journal::Sink(beast::Severity::kFatal, false), dest_(dest) {}
+    void write(beast::Severity level, std::string const& text) override {
+        if (static_cast<int>(level) >= static_cast<int>(beast::Severity::kError)) {
             if (!dest_.empty()) dest_.append(" | ");
             dest_.append(text);
         }
     }
-    void writeAlways(beast::severities::Severity level, std::string const& text) override {
+    void writeAlways(beast::Severity level, std::string const& text) override {
         write(level, text);
     }
 private:
@@ -180,7 +180,7 @@ int32_t xrpl_preflight(
         xrpl::SerialIter sit(tx_bytes, tx_len);
         xrpl::STTx tx(sit);
 
-        std::unordered_set<xrpl::uint256, beast::uhash<>> presets;
+        std::unordered_set<xrpl::uint256, beast::Uhash<>> presets;
         if (amendments_bytes && amendments_len > 0 && amendments_len % 32 == 0) {
             size_t n = amendments_len / 32;
             for (size_t i = 0; i < n; i++) {
@@ -246,7 +246,7 @@ int32_t xrpl_apply(
         xrpl::SerialIter sit(tx_bytes, tx_len);
         xrpl::STTx tx(sit);
 
-        std::unordered_set<xrpl::uint256, beast::uhash<>> presets;
+        std::unordered_set<xrpl::uint256, beast::Uhash<>> presets;
         if (amendments_bytes && amendments_len > 0 && amendments_len % 32 == 0) {
             size_t n = amendments_len / 32;
             for (size_t i = 0; i < n; i++) {
@@ -362,7 +362,7 @@ XrplApplyResult *xrpl_apply_with_mutations(
         xrpl::SerialIter sit(tx_bytes, tx_len);
         xrpl::STTx tx(sit);
 
-        std::unordered_set<xrpl::uint256, beast::uhash<>> presets;
+        std::unordered_set<xrpl::uint256, beast::Uhash<>> presets;
         if (amendments_bytes && amendments_len > 0 && amendments_len % 32 == 0) {
             size_t n = amendments_len / 32;
             for (size_t i = 0; i < n; i++) {
@@ -462,7 +462,7 @@ bool xrpl_test_callback_read(
     const uint8_t *sle_bytes,
     size_t sle_len) {
     try {
-        std::unordered_set<xrpl::uint256, beast::uhash<>> presets;
+        std::unordered_set<xrpl::uint256, beast::Uhash<>> presets;
         xrpl::Rules rules(presets);
 
         xrpl::LedgerHeader header;

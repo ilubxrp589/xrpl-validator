@@ -1,16 +1,20 @@
 // MinimalApp.h — minimum xrpl::Application needed to call apply()/preflight().
 //
-// rippled 3.2.0 slimmed Application to 16 pure virtuals (mostly lifecycle plus a
-// few accessors); the heavy service accessors (overlay / validators / hashRouter /
-// ledgerMaster / openLedger / timeKeeper / logs / journal / ...) are no longer part
-// of the interface. We implement config() for real (it carries the network id used
-// by rules/fees) and the trivial getMasterMutex()/checkSigs()/getNumberOfThreads();
-// everything else is a stub that throws (unreached by the single-tx apply path).
+// rippled 3.2.0 consolidated the service accessors into a ServiceRegistry base
+// (46 pure virtuals) and slimmed Application proper to 16. MinimalApp implements
+// all of them: config() is real (carries the network id used by rules/fees); a few
+// infra accessors are made safe so apply-path logging/lifecycle calls don't throw
+// (getJournal -> null journal, isStopping -> false, getApp -> *this, getTrapTxID ->
+// empty); everything else is a throw-stub (unreached by the single-tx apply path —
+// if any IS reached, the shadow hash-match window surfaces it loudly and we make it
+// real then, the way the <=3.1.x shim made getHashRouter/getFeeTrack/getOrderBookDB
+// real).
 
 #pragma once
 
 #include <xrpld/app/main/Application.h>
 #include <xrpld/core/Config.h>
+#include <xrpl/beast/utility/Journal.h>
 
 #include <chrono>
 #include <cstddef>
@@ -29,14 +33,12 @@ public:
     explicit MinimalApp(std::uint32_t networkID = 0);
     ~MinimalApp() override = default;
 
-    // === Real implementations ===
+    // ===== Application (16 pure virtuals) =====
     Config& config() override { return *config_; }
     MutexType& getMasterMutex() override { return masterMutex_; }
     bool checkSigs() const override { return true; }
     void checkSigs(bool) override {}
     std::size_t getNumberOfThreads() const override { return 1; }
-
-    // === Stubs — throw if reached (not used by single-tx apply/preflight) ===
     bool setup(boost::program_options::variables_map const&) override;
     void start(bool) override;
     void run() override;
@@ -49,9 +51,60 @@ public:
     int fdRequired() const override;
     LedgerIndex getMaxDisallowedLedger() override;
 
+    // ===== ServiceRegistry — infra kept safe (apply path may touch) =====
+    bool isStopping() const override { return false; }
+    Application& getApp() override { return *this; }
+    beast::Journal getJournal(std::string const&) override { return beast::Journal{beast::Journal::getNullSink()}; }
+    std::optional<uint256> const& getTrapTxID() const override { return trapTxID_; }
+
+    // ===== ServiceRegistry — throw-stubs =====
+    CollectorManager& getCollectorManager() override;
+    Family& getNodeFamily() override;
+    TimeKeeper& getTimeKeeper() override;
+    JobQueue& getJobQueue() override;
+    NodeCache& getTempNodeCache() override;
+    CachedSLEs& getCachedSLEs() override;
+    NetworkIDService& getNetworkIDService() override;
+    AmendmentTable& getAmendmentTable() override;
+    HashRouter& getHashRouter() override;
+    LoadFeeTrack& getFeeTrack() override;
+    LoadManager& getLoadManager() override;
+    RCLValidations& getValidations() override;
+    ValidatorList& getValidators() override;
+    ValidatorSite& getValidatorSites() override;
+    ManifestCache& getValidatorManifests() override;
+    ManifestCache& getPublisherManifests() override;
+    Overlay& getOverlay() override;
+    Cluster& getCluster() override;
+    PeerReservationTable& getPeerReservations() override;
+    Resource::Manager& getResourceManager() override;
+    NodeStore::Database& getNodeStore() override;
+    SHAMapStore& getSHAMapStore() override;
+    RelationalDatabase& getRelationalDatabase() override;
+    InboundLedgers& getInboundLedgers() override;
+    InboundTransactions& getInboundTransactions() override;
+    TaggedCache<uint256, AcceptedLedger>& getAcceptedLedgerCache() override;
+    LedgerMaster& getLedgerMaster() override;
+    LedgerCleaner& getLedgerCleaner() override;
+    LedgerReplayer& getLedgerReplayer() override;
+    PendingSaves& getPendingSaves() override;
+    OpenLedger& getOpenLedger() override;
+    OpenLedger const& getOpenLedger() const override;
+    NetworkOPs& getOPs() override;
+    OrderBookDB& getOrderBookDB() override;
+    TransactionMaster& getMasterTransaction() override;
+    TxQ& getTxQ() override;
+    PathRequestManager& getPathRequestManager() override;
+    ServerHandler& getServerHandler() override;
+    perf::PerfLog& getPerfLog() override;
+    Logs& getLogs() override;
+    boost::asio::io_context& getIOContext() override;
+    DatabaseCon& getWalletDB() override;
+
 private:
     std::unique_ptr<Config> config_;
     MutexType masterMutex_;
+    std::optional<uint256> trapTxID_;
 };
 
 }  // namespace xrpl
