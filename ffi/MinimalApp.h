@@ -13,9 +13,14 @@
 #pragma once
 
 #include <xrpld/app/main/Application.h>
+#include <xrpld/app/misc/HashRouter.h>
+#include <xrpld/app/misc/LoadFeeTrack.h>
+#include <xrpld/app/ledger/OrderBookDB.h>
 #include <xrpld/core/Config.h>
 #include <xrpl/core/NetworkIDService.h>
 #include <xrpld/core/NetworkIDServiceImpl.h>
+#include <xrpl/basics/Log.h>
+#include <xrpl/basics/chrono.h>
 #include <xrpl/beast/utility/Journal.h>
 
 #include <chrono>
@@ -60,6 +65,11 @@ public:
     std::optional<uint256> const& getTrapTxID() const override { return trapTxID_; }
     // Real: 3.2.0 preflight routes the tx NetworkID check through this service.
     NetworkIDService& getNetworkIDService() override { return *networkIDService_; }
+    // Real: the apply()/preflight() chain reaches these (matches the <=3.1.x shim).
+    HashRouter& getHashRouter() override { return *hashRouter_; }
+    LoadFeeTrack& getFeeTrack() override { return *feeTrack_; }
+    OrderBookDB& getOrderBookDB() override { return *orderBookDB_; }
+    Logs& getLogs() override { return *logs_; }
 
     // ===== ServiceRegistry — throw-stubs =====
     CollectorManager& getCollectorManager() override;
@@ -69,8 +79,6 @@ public:
     NodeCache& getTempNodeCache() override;
     CachedSLEs& getCachedSLEs() override;
     AmendmentTable& getAmendmentTable() override;
-    HashRouter& getHashRouter() override;
-    LoadFeeTrack& getFeeTrack() override;
     LoadManager& getLoadManager() override;
     RCLValidations& getValidations() override;
     ValidatorList& getValidators() override;
@@ -94,19 +102,22 @@ public:
     OpenLedger& getOpenLedger() override;
     OpenLedger const& getOpenLedger() const override;
     NetworkOPs& getOPs() override;
-    OrderBookDB& getOrderBookDB() override;
     TransactionMaster& getMasterTransaction() override;
     TxQ& getTxQ() override;
     PathRequestManager& getPathRequestManager() override;
     ServerHandler& getServerHandler() override;
     perf::PerfLog& getPerfLog() override;
-    Logs& getLogs() override;
     boost::asio::io_context& getIOContext() override;
     DatabaseCon& getWalletDB() override;
 
 private:
     std::unique_ptr<Config> config_;
+    std::unique_ptr<Logs> logs_;
+    beast::Journal nullJournal_;
     std::unique_ptr<NetworkIDService> networkIDService_;
+    std::unique_ptr<HashRouter> hashRouter_;
+    std::unique_ptr<LoadFeeTrack> feeTrack_;
+    std::unique_ptr<OrderBookDB> orderBookDB_;
     MutexType masterMutex_;
     std::optional<uint256> trapTxID_;
 };

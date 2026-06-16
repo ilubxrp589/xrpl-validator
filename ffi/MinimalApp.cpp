@@ -13,9 +13,20 @@ Application::Application() : beast::PropertyStream::Source("app") {}
 
 MinimalApp::MinimalApp(std::uint32_t networkID)
     : config_(std::make_unique<Config>())
+    , logs_(std::make_unique<Logs>(beast::Severity::Fatal))
+    , nullJournal_(beast::Journal::getNullSink())
 {
     config_->networkId = networkID;  // drives rules / fee calc in the apply path
     networkIDService_ = std::make_unique<NetworkIDServiceImpl>(config_->networkId);
+
+    // Real services the apply()/preflight() chain reaches (matches the <=3.1.x shim):
+    //   HashRouter   — dedup/relay TTLs (default Setup; doesn't affect apply correctness)
+    //   LoadFeeTrack — fee escalation (null journal; default => base-fee scaling)
+    //   OrderBookDB  — offer crossing
+    auto const setup = setup_HashRouter(*config_);
+    hashRouter_ = std::make_unique<HashRouter>(setup, stopwatch());
+    feeTrack_ = std::make_unique<LoadFeeTrack>(nullJournal_);
+    orderBookDB_ = std::make_unique<OrderBookDB>(*this);
 }
 
 // --- Application throw-stubs ---
@@ -40,8 +51,6 @@ STUB(JobQueue&, getJobQueue)
 STUB(NodeCache&, getTempNodeCache)
 STUB(CachedSLEs&, getCachedSLEs)
 STUB(AmendmentTable&, getAmendmentTable)
-STUB(HashRouter&, getHashRouter)
-STUB(LoadFeeTrack&, getFeeTrack)
 STUB(LoadManager&, getLoadManager)
 STUB(RCLValidations&, getValidations)
 STUB(ValidatorList&, getValidators)
@@ -63,13 +72,11 @@ STUB(LedgerReplayer&, getLedgerReplayer)
 STUB(PendingSaves&, getPendingSaves)
 STUB(OpenLedger&, getOpenLedger)
 STUB(NetworkOPs&, getOPs)
-STUB(OrderBookDB&, getOrderBookDB)
 STUB(TransactionMaster&, getMasterTransaction)
 STUB(TxQ&, getTxQ)
 STUB(PathRequestManager&, getPathRequestManager)
 STUB(ServerHandler&, getServerHandler)
 STUB(perf::PerfLog&, getPerfLog)
-STUB(Logs&, getLogs)
 STUB(boost::asio::io_context&, getIOContext)
 STUB(DatabaseCon&, getWalletDB)
 #undef STUB
