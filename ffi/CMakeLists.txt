@@ -39,19 +39,12 @@ find_package(Snappy REQUIRED)
 find_package(BZip2 REQUIRED)
 find_package(ZLIB REQUIRED)
 
-# ed25519 and secp256k1 are built from rippled's external/ subdirectories,
-# not conan packages. Import the pre-built .a files from the rippled build tree.
-add_library(ed25519_lib STATIC IMPORTED)
-set_target_properties(ed25519_lib PROPERTIES
-    IMPORTED_LOCATION ${RIPPLED_BUILD_DIR}/external/ed25519-donna/libed25519.a
-    INTERFACE_INCLUDE_DIRECTORIES ${RIPPLED_SRC_DIR}/external/ed25519-donna
-)
-
-add_library(secp256k1_lib STATIC IMPORTED)
-set_target_properties(secp256k1_lib PROPERTIES
-    IMPORTED_LOCATION ${RIPPLED_BUILD_DIR}/external/secp256k1/lib/libsecp256k1.a
-    INTERFACE_INCLUDE_DIRECTORIES ${RIPPLED_SRC_DIR}/external/secp256k1/include
-)
+# ed25519 and secp256k1 became conan packages in rippled 3.2.0 (they were
+# external/ source builds in <=3.1.x). Resolve them via the conan-generated
+# configs already on CMAKE_PREFIX_PATH — targets ed25519::ed25519 /
+# secp256k1::secp256k1, matching rippled 3.2.0's own cmake/XrplCore.cmake.
+find_package(ed25519 REQUIRED)
+find_package(secp256k1 REQUIRED)
 
 # xrpld sources needed by the apply()/preflight() path.
 # We include the tx engine and its direct dependencies, excluding
@@ -125,8 +118,8 @@ target_link_options(xrpl_shim PUBLIC -Wl,--gc-sections)
 target_link_libraries(xrpl_shim PUBLIC
     ${RIPPLED_BUILD_DIR}/libxrpl.a
     ${RIPPLED_BUILD_DIR}/libxrpl.libpb.a
-    ed25519_lib
-    secp256k1_lib
+    ed25519::ed25519
+    secp256k1::secp256k1
     boost::boost
     openssl::openssl
     protobuf::libprotobuf

@@ -29,13 +29,9 @@ fn main() {
     println!("cargo:rustc-link-lib=static=xrpl");
     println!("cargo:rustc-link-lib=static=xrpl.libpb");
 
-    // ed25519 and secp256k1 are built from rippled's external/ subdirs
-    let ed25519_dir = rippled_build.join("external/ed25519-donna");
-    let secp256k1_dir = rippled_build.join("external/secp256k1/lib");
-    println!("cargo:rustc-link-search=native={}", ed25519_dir.display());
-    println!("cargo:rustc-link-search=native={}", secp256k1_dir.display());
-    println!("cargo:rustc-link-lib=static=ed25519");
-    println!("cargo:rustc-link-lib=static=secp256k1");
+    // ed25519 and secp256k1 became conan packages in rippled 3.2.0 (were
+    // external/ source builds before); collect_conan_libs() below resolves them
+    // from the conan generators, so no manual ed25519/secp256k1 link lines here.
 
     // Conan-provided deps. Paths are inside the conan cache. We extract them
     // from the conan-generated cmake data file at build time.
