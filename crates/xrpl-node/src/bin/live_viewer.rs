@@ -1810,9 +1810,10 @@ async fn main() {
     // If a submit endpoint is ever added, it MUST require authentication (API key or mTLS).
     // Binding to 0.0.0.0 is acceptable for read-only status since Caddy fronts this
     // on the public side with its own access controls.
-    let addr = "0.0.0.0:3777";
+    let port = std::env::var("FFI_PORT").ok().and_then(|p| p.parse::<u16>().ok()).unwrap_or(3777);
+    let addr = format!("0.0.0.0:{port}");
     eprintln!("[web] Listening on http://{addr}");
-    let listener = tokio::net::TcpListener::bind(addr).await.expect("failed to bind port 3777");
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("[web] Server error: {e}");
     }
