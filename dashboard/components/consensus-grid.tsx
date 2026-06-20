@@ -40,9 +40,9 @@ export function ConsensusGrid() {
   const { data } = useValidatorData();
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
 
-  const agreementCount = data?.consensus.monitor.agreement.count ?? 0;
+  const agreementCount = data?.consensus.monitor?.agreement?.count ?? 0;
   const unlSize = data?.consensus.unl_size ?? CHIP_COUNT;
-  const totalProposals = data?.consensus.monitor.total_proposals ?? 0;
+  const totalProposals = data?.consensus.monitor?.total_proposals ?? 0;
   const phase = data?.consensus.phase ?? '—';
 
   // Per-chip agreement data (stable across renders)

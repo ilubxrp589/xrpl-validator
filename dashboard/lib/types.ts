@@ -94,11 +94,12 @@ export interface EngineData {
 
 export interface ConsensusMonitor {
   total_proposals: number;
+  /** null when the consensus monitor isn't tracking agreement (e.g. tracked_validators=0). */
   agreement: {
     count: number;
     hash: string;
     pct: number;
-  };
+  } | null;
 }
 
 export interface ConsensusData {

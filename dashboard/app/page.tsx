@@ -6,6 +6,7 @@ import { Navbar } from '@/components/navbar';
 import { HeroBanner } from '@/components/hero-banner';
 import { NodeResources } from '@/components/node-resources';
 import { MetricsGrid } from '@/components/metrics-grid';
+import { CopilotPanel } from '@/components/copilot-panel';
 import { Speedometer } from '@/components/speedometer';
 import { DisagreementHistory } from '@/components/disagreement-history';
 import { TxFeed } from '@/components/tx-feed';
@@ -25,6 +26,7 @@ export default function Home() {
           <main className="flex-1 max-w-7xl mx-auto w-full px-4 sm:px-6 py-6 space-y-4">
             <HeroBanner />
             <NodeResources />
+            <CopilotPanel />
             <MetricsGrid />
 
             {/* Speedometer + Disagreements side by side, compact */}

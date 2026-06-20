@@ -83,6 +83,14 @@ export function ValidatorProvider({ children }: { children: ReactNode }) {
       ])) as [EngineData, ConsensusData, StateHashStatus];
       const peers = peerRes?.ok ? await peerRes.json() : null;
 
+      // engine.ledger_seq (top-level) can freeze; the FFI verifier's
+      // round_ledger_seq is the live edge-tracking value. Normalize so the whole
+      // UI (hero ledger #, navbar, disagreement fallback) and the live/stale
+      // detection below all reflect the real current ledger.
+      if (engine?.ffi_verifier?.round_ledger_seq) {
+        engine.ledger_seq = engine.ffi_verifier.round_ledger_seq;
+      }
+
       const now = Date.now();
       const newSeq = engine.ledger_seq || 0;
 
