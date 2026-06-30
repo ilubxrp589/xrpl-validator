@@ -606,7 +606,7 @@ impl<'a> SleProvider for OverlayedDbProvider<'a> {
     }
 
     fn succ(&self, key: &[u8; 32], last: Option<&[u8; 32]>) -> Option<[u8; 32]> {
-        // Returns the smallest key strictly greater than `key` (and <= `last` if set)
+        // Returns the smallest key strictly greater than `key` (and strictly < `last` if set — exclusive, per rippled's open interval)
         // that exists in the EFFECTIVE post-overlay state. Considers both:
         //   1. snapshot keys (pre-ledger), unless overlay-tombstoned
         //   2. overlay-inserted/-modified keys (this-ledger mutations)
@@ -632,7 +632,11 @@ impl<'a> SleProvider for OverlayedDbProvider<'a> {
             if k.len() != 32 { continue; }
             if k.as_ref() <= key.as_slice() { continue; }
             if let Some(last_key) = last {
-                if k.as_ref() > last_key.as_slice() { break; }
+                // Open interval (key, last): a key == last must NOT be returned, so
+                // break as soon as we reach it (not just once we pass it). Matches
+                // rippled's ReadView::succ contract (NFTokenHelpers locates a mint's
+                // page via succ(first, nftpageMax(owner).next())).
+                if k.as_ref() >= last_key.as_slice() { break; }
             }
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&k);
@@ -643,14 +647,14 @@ impl<'a> SleProvider for OverlayedDbProvider<'a> {
         }
 
         // Overlay candidate: smallest overlay key with Some(_) value that is
-        // strictly > `key` (and <= `last` if set). This catches SLEs inserted
+        // strictly > `key` (and strictly < `last` if set — exclusive, per rippled's open interval). This catches SLEs inserted
         // or modified in the current ledger that are NOT in the snapshot.
         let overlay_cand: Option<[u8; 32]> = overlay
             .iter()
             .filter(|(_, v)| v.is_some())
             .map(|(k, _)| *k)
             .filter(|k| k.as_slice() > key.as_slice())
-            .filter(|k| last.map_or(true, |lk| k.as_slice() <= lk.as_slice()))
+            .filter(|k| last.map_or(true, |lk| k.as_slice() < lk.as_slice()))
             .min();
 
         match (snapshot_cand, overlay_cand) {
@@ -2380,6 +2384,63 @@ mod tests {
         // Bound: succ(0x10, last=0x30) → 0x25 (insert is in window).
         assert_eq!(provider.succ(&k(0x10), Some(&k(0x30))), Some(k(0x25)),
             "succ with last=0x30 should still find the overlay-inserted 0x25");
+    }
+
+    /// rippled's `ReadView::succ` contract is the OPEN interval (key, last): a key
+    /// exactly equal to `last` must NOT be returned. This is dormant for owner-dir /
+    /// order-book walks (whose `last` sentinel never coincides with a live key) but
+    /// is load-bearing for NFTokenMint — rippled locates a mint's target page via
+    /// `succ(first, nftpageMax(owner).next())`, so an inclusive bound can surface the
+    /// *next account's* page → "NFT found in incorrect page" (tecINVARIANT_FAILED).
+    /// Regression for the 2026-06-30 prod halt at ledger #105284279.
+    #[test]
+    fn overlay_succ_upper_bound_is_exclusive() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use parking_lot::Mutex;
+
+        let rpc = RpcProvider::new("http://127.0.0.1:1".to_string(), 0);
+
+        // --- a snapshot key sitting exactly on the bound must be excluded ---
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let db = Arc::new(rocksdb::DB::open_default(tmp.path()).unwrap());
+            for b in [0x20u8, 0x40] {
+                db.put(k(b), b"snap").unwrap();
+            }
+            let snap = OwnedSnapshot::new(db);
+            let overlay = Mutex::new(HashMap::new());
+            let provider = OverlayedDbProvider::new(&overlay, &snap, &rpc);
+
+            // 0x20 == last → excluded (was Some(0x20) under the inclusive bug).
+            assert_eq!(provider.succ(&k(0x10), Some(&k(0x20))), None,
+                "snapshot key == last must be excluded (open interval)");
+            // 0x40 == last and is the only candidate → None (was Some(0x40)).
+            assert_eq!(provider.succ(&k(0x20), Some(&k(0x40))), None,
+                "snapshot key == last must be excluded when it's the sole candidate");
+            // a key strictly inside (key, last) is still returned.
+            assert_eq!(provider.succ(&k(0x10), Some(&k(0x21))), Some(k(0x20)),
+                "keys strictly less than last are still returned");
+        }
+
+        // --- an overlay-inserted key sitting exactly on the bound must be excluded ---
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let db = Arc::new(rocksdb::DB::open_default(tmp.path()).unwrap());
+            db.put(k(0x40), b"snap").unwrap();
+            let snap = OwnedSnapshot::new(db);
+            let mut m: HashMap<[u8; 32], Option<Vec<u8>>> = HashMap::new();
+            m.insert(k(0x30), Some(b"ins".to_vec()));
+            let overlay = Mutex::new(m);
+            let provider = OverlayedDbProvider::new(&overlay, &snap, &rpc);
+
+            // overlay 0x30 == last → excluded (was Some(0x30) under the inclusive bug).
+            assert_eq!(provider.succ(&k(0x10), Some(&k(0x30))), None,
+                "overlay key == last must be excluded (open interval)");
+            // overlay 0x30 strictly inside (0x10, 0x31) is still returned.
+            assert_eq!(provider.succ(&k(0x10), Some(&k(0x31))), Some(k(0x30)),
+                "overlay key strictly less than last is still returned");
+        }
     }
 
     /// `parse_missing_index_from_fatal` extracts the 32-byte missing SLE key
