@@ -37,7 +37,8 @@ pub type SleLookupFn = unsafe extern "C" fn(
 
 /// Succ callback: called by C++ for directory traversal (finding the next key
 /// strictly greater than `key`). If `last_key` is non-null, only return keys
-/// <= last_key. Writes successor into `out_succ_key[32]`, returns true if found.
+/// strictly < last_key — rippled's ReadView::succ is the OPEN interval
+/// (key, last). Writes successor into `out_succ_key[32]`, returns true if found.
 pub type SuccFn = unsafe extern "C" fn(
     user_data: *mut c_void,
     key: *const u8,       // [u8; 32]
@@ -299,7 +300,8 @@ impl ApplyOutcome {
 pub trait SleProvider {
     fn read(&self, key: &[u8; 32]) -> Option<&[u8]>;
     /// Find the next key strictly greater than `key`. If `last` is Some,
-    /// only return keys <= last. Used for directory traversal.
+    /// only return keys strictly < last (open interval (key, last), matching
+    /// rippled's ReadView::succ). Used for directory traversal.
     fn succ(&self, _key: &[u8; 32], _last: Option<&[u8; 32]>) -> Option<[u8; 32]> {
         None // default: no traversal support
     }
