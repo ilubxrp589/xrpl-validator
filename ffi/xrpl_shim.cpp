@@ -30,7 +30,7 @@
 #include <unordered_set>
 
 namespace {
-constexpr const char *SHIM_VERSION = "0.2.0";  // 3.1.3 Application port (bump to 0.3.0 at the 3.2.0 shim port)
+constexpr const char *SHIM_VERSION = "0.3.0";  // 3.2.0 Application/ServiceRegistry port (conan ed25519/secp256k1, xrpl namespace, MinimalApp 62 virtuals)
 }
 
 struct XrplEngine {
