@@ -9,6 +9,7 @@ pub mod amendment_vote;
 pub mod close_time;
 pub mod fee_vote;
 pub mod proposal;
+pub mod sig_verify;
 pub mod state;
 pub mod threshold;
 pub mod unl;

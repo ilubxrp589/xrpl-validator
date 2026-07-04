@@ -1541,7 +1541,8 @@ async fn main() {
                         ledger_hash_match_ratio: prom_hash.ledger_hash_match_ratio(),
                         lockstep_shadow_match_ratio: xrpl_node::ws_sync::lockstep_meter().match_ratio(),
                     };
-                    let body = xrpl_node::rpc::metrics::render_prometheus(&snap);
+                    let mut body = xrpl_node::rpc::metrics::render_prometheus(&snap);
+                    body.push_str(&xrpl_node::consensus::sig_verify::metrics_text());
                     (
                         axum::http::StatusCode::OK,
                         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
@@ -2004,16 +2005,57 @@ async fn run_peer_connection(
                         }
                     }
 
-                    // Publish peer proposals to consensus engine channel
+                    // Publish peer proposals to consensus engine channel. S1 (SECURITY 7.4):
+                    // verify the ECDSA signature over rippled's proposal signing hash first —
+                    // observe-mode counts every outcome; XRPL_SIG_ENFORCE=1 drops failures.
                     if let PeerMessage::ProposeSet(p) = &msg {
                         if !p.node_pub_key.is_empty() {
-                            let _ = proposal_tx.send(PeerProposal {
-                                validator_key: p.node_pub_key.clone(),
-                                propose_seq: p.propose_seq,
-                                current_tx_hash: p.current_tx_hash.clone(),
-                                close_time: p.close_time,
-                                previous_ledger: p.previousledger.clone(),
-                            });
+                            use xrpl_node::consensus::sig_verify::{self, SigOutcome};
+                            let outcome = sig_verify::verify_proposal(
+                                &p.node_pub_key,
+                                &p.signature,
+                                p.propose_seq,
+                                p.close_time,
+                                &p.previousledger,
+                                &p.current_tx_hash,
+                            );
+                            if outcome == SigOutcome::Invalid {
+                                let (_, fails, _) = sig_verify::PROPOSAL_SIG.snapshot();
+                                if fails <= 3 || fails.is_multiple_of(500) {
+                                    eprintln!(
+                                        "[sig-verify] proposal signature FAILED (fail #{fails}, enforce={}) key={}…",
+                                        sig_verify::enforce(),
+                                        hex::encode(&p.node_pub_key[..p.node_pub_key.len().min(6)])
+                                    );
+                                }
+                            }
+                            if outcome != SigOutcome::Invalid || !sig_verify::enforce() {
+                                let _ = proposal_tx.send(PeerProposal {
+                                    validator_key: p.node_pub_key.clone(),
+                                    propose_seq: p.propose_seq,
+                                    current_tx_hash: p.current_tx_hash.clone(),
+                                    close_time: p.close_time,
+                                    previous_ledger: p.previousledger.clone(),
+                                });
+                            }
+                        }
+                    }
+
+                    // S2 (SECURITY 7.3): verify incoming validation signatures. Observe-mode
+                    // counters only for now — nothing downstream consumes validations for
+                    // decisions yet; when the ValidationCollector / lockstep M2 starts gating on
+                    // them, the XRPL_SIG_ENFORCE drop moves to that consumer.
+                    if let PeerMessage::Validation(v) = &msg {
+                        use xrpl_node::consensus::sig_verify::{self, SigOutcome};
+                        let outcome = sig_verify::verify_validation_blob(&v.validation);
+                        if outcome == SigOutcome::Invalid {
+                            let (_, fails, _) = sig_verify::VALIDATION_SIG.snapshot();
+                            if fails <= 3 || fails.is_multiple_of(500) {
+                                eprintln!(
+                                    "[sig-verify] validation signature FAILED (fail #{fails}, {}B blob)",
+                                    v.validation.len()
+                                );
+                            }
                         }
                     }
 
