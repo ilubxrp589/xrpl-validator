@@ -249,8 +249,10 @@ pub async fn start_ws_sync(
                                     acc_deleted.clear();
                                     acc_tx_count = 0;
                                 } else {
-                                    // Ledger too old — skip rest of batch, let next ledgerClosed catch up
-                                    eprintln!("[ws-sync] Metadata #{process_seq} FAILED — breaking batch");
+                                    // Metadata unavailable — break the batch WITHOUT
+                                    // advancing (see !meta_ok below): the next
+                                    // ledgerClosed re-drives this same seq.
+                                    eprintln!("[ws-sync] Metadata #{process_seq} FAILED — holding position, will retry");
                                     break;
                                 }
                             }
@@ -517,9 +519,12 @@ pub async fn start_ws_sync(
                     #[cfg(not(feature = "ffi"))]
                     let _ = (&ffi_verifier, &ledger_header);
                     if !meta_ok {
-                        // Break the entire batch — let the next ledgerClosed event
-                        // trigger skip-ahead if we're too far behind
-                        last_processed = process_seq;
+                        // Break the entire batch WITHOUT advancing past this seq —
+                        // the next ledgerClosed event re-drives it. Skipping a
+                        // ledger whose delta never landed permanently diverges
+                        // state.rocks and guarantees halt-on-mismatch (2026-07-10
+                        // halt: #105500328 aborted+skipped → 3 strikes by #105500331).
+                        last_processed = process_seq.saturating_sub(1);
                         break;
                     }
 
@@ -580,7 +585,9 @@ pub async fn start_ws_sync(
                                     if gate == TxGate::Enforce {
                                         // Re-drive like meta_ok==false: break the batch, do
                                         // NOT advance process_seq, do NOT bump MISMATCH_STREAK.
-                                        last_processed = process_seq;
+                                        // (last_processed = process_seq would SKIP this ledger —
+                                        // the batch resumes at last_processed + 1.)
+                                        last_processed = process_seq.saturating_sub(1);
                                         break;
                                     }
                                 }
@@ -601,11 +608,22 @@ pub async fn start_ws_sync(
                         &watchdog_live_edge,
                     ).await;
 
-                    last_processed = process_seq;
-                    if result {
-                        // SECURITY(5.3): Use Release ordering so Acquire loads see this
-                        last_synced.store(process_seq, Ordering::Release);
+                    if !result {
+                        // process_ledger did not land this ledger (aborted fetch,
+                        // DB write failure, or a rolled-back MISMATCH). HOLD
+                        // position and re-drive the SAME seq on the next
+                        // ledgerClosed/reconnect — never advance past a ledger that
+                        // isn't cleanly applied: every later hash would mismatch on
+                        // the missing delta and the validator halts (2026-07-10,
+                        // #105500328). MISMATCH_STREAK still halts a deterministic
+                        // divergence, now after 3 attempts at ONE ledger instead of
+                        // a 3-ledger cascade on progressively corrupted state.
+                        last_processed = process_seq.saturating_sub(1);
+                        break;
                     }
+                    last_processed = process_seq;
+                    // SECURITY(5.3): Use Release ordering so Acquire loads see this
+                    last_synced.store(process_seq, Ordering::Release);
                 } // end for process_seq
 
                 // Watchdog: compare last_processed against the independently-polled
