@@ -748,6 +748,15 @@ pub struct FfiStats {
     pub live_apply_ter_counts: std::collections::BTreeMap<String, u64>,
     /// Divergence breakdown: "{tx_type}/{ter_name}" → count
     pub live_diverged_by_type: std::collections::BTreeMap<String, u64>,
+    /// Whole-ledger verifies skipped by the pre-state era sentinel: the state
+    /// we were about to verify against already contained this ledger's
+    /// effects (held/re-driven ledger whose earlier write survived — the
+    /// 2026-07-15 #105612802 incident) or was missing prior ledgers.
+    /// Replaying would produce a meaningless tef*/ter* storm recorded as
+    /// false divergences, so the verify is skipped and counted here instead.
+    pub verify_skipped_era: u64,
+    /// Last era-skip detail: "L{seq} acct_seq={a} tx_seq={t} ({direction})".
+    pub verify_skipped_era_last: String,
     /// Silent divergences: our shim returned tesSUCCESS or tec*, but the
     /// network's recorded TransactionResult differed. Total across all
     /// tx_type/our_ter/net_ter combos.
@@ -1217,6 +1226,35 @@ pub fn scan_sequence_in_account_root(data: &[u8]) -> Option<u32> {
     None
 }
 
+/// Extract the Sequence field from a serialized transaction blob.
+/// Walks the canonical UInt-field prefix — TransactionType (0x12), then any
+/// of NetworkID (0x21) / Flags (0x22) / SourceTag (0x23) — until sfSequence
+/// (0x24). Returns None on any unexpected field or truncation; callers treat
+/// that as "sentinel unavailable", never as an error. Ticket-based txs carry
+/// Sequence == 0 (present but zero) — callers skip those for era checks.
+pub fn scan_sequence_in_tx(tx: &[u8]) -> Option<u32> {
+    let mut i = 0usize;
+    while i < tx.len() {
+        match tx[i] {
+            0x12 => i += 3,               // TransactionType: u16
+            0x21 | 0x22 | 0x23 => i += 5, // NetworkID / Flags / SourceTag: u32
+            0x24 => {
+                if i + 5 > tx.len() {
+                    return None;
+                }
+                return Some(u32::from_be_bytes([
+                    tx[i + 1],
+                    tx[i + 2],
+                    tx[i + 3],
+                    tx[i + 4],
+                ]));
+            }
+            _ => return None, // unexpected field before Sequence — inconclusive
+        }
+    }
+    None
+}
+
 /// Parse the missing-SLE key out of a `tefBAD_LEDGER` fatal message from
 /// libxrpl's `DeleteAccount` path. Looks for the literal
 /// `"has index to object that is missing: "` marker followed by 64 hex chars.
@@ -1464,6 +1502,47 @@ pub fn apply_ledger_in_order(
     expected_mutations: Option<&std::collections::HashMap<String, Vec<(String, u8)>>>,
 ) -> LedgerOverlay {
     let fallback = RpcProvider::with_endpoints(rpc_urls.to_vec(), ledger_seq.saturating_sub(1));
+
+    // Era sentinel (2026-07-15, #105612802): if the pre-state we're about to
+    // verify against already contains this ledger's effects (a held/re-driven
+    // ledger whose earlier write survived) — or is missing prior ledgers —
+    // replaying produces a meaningless tef*/ter* storm that lands in the
+    // divergence log as false positives. Check the first Sequence-bearing tx:
+    // at a true pre-ledger boundary its sender's AccountRoot.Sequence equals
+    // the tx's Sequence (a ledger never includes a seq-based tx otherwise).
+    // On mismatch: skip the whole verify, log ONE loud line, count it in
+    // stats — and write nothing to the divergence logs.
+    for tx_bytes in txs_in_order {
+        let Some(tx_seq) = scan_sequence_in_tx(tx_bytes) else { continue };
+        if tx_seq == 0 {
+            continue; // ticket-based tx: carries no era signal
+        }
+        let Some(sender_key) = extract_sender_account_root_key(tx_bytes) else { continue };
+        let acct_bytes: Option<Vec<u8>> = match db_snapshot {
+            Some(snap) => snap.get(&sender_key).ok().flatten(),
+            None => fallback.read(&sender_key).map(|b| b.to_vec()),
+        };
+        let Some(acct_seq) = acct_bytes.as_deref().and_then(scan_sequence_in_account_root) else {
+            break; // sender unreadable — sentinel inconclusive, proceed unguarded
+        };
+        if acct_seq != tx_seq {
+            let dir = if acct_seq > tx_seq {
+                "state already past this ledger"
+            } else {
+                "state behind this ledger"
+            };
+            eprintln!(
+                "[ffi] #{ledger_seq}: PRE-STATE ERA MISMATCH (sender seq={acct_seq} vs tx seq={tx_seq}) — {dir}; verify skipped, no divergences logged"
+            );
+            let mut s = stats.lock();
+            s.verify_skipped_era += 1;
+            s.verify_skipped_era_last =
+                format!("L{ledger_seq} acct_seq={acct_seq} tx_seq={tx_seq} ({dir})");
+            return LedgerOverlay::new();
+        }
+        break; // first seq-bearing tx checked clean — era OK, proceed
+    }
+
     let overlay: parking_lot::Mutex<std::collections::HashMap<[u8; 32], Option<Vec<u8>>>> =
         parking_lot::Mutex::new(std::collections::HashMap::new());
     let ledger = LedgerInfo {
