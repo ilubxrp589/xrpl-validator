@@ -330,3 +330,499 @@ fn layered_none_when_both_views_empty() {
     let got = layered_succ(fake_rpc(vec![]), |_| false, None, &k(0x20), None);
     assert_eq!(got, None);
 }
+
+/// Offline tests for the no-op-Modified filter on the mutation-divergence
+/// comparison path (`ffi_engine::{capture_pre_state_for_modified,
+/// build_ours_mutation_set}`) — the same standalone-RPC apply lane the succ
+/// tests above cover, hence hosted in this (always-run, offline) binary.
+///
+/// rippled's meta-builder skips entries whose post bytes equal the pre bytes
+/// (ApplyStateTable.cpp:155 — `*curNode == *origNode`) while libxrpl still
+/// calls rawReplace, so our MutationCollector records a Modified whose bytes
+/// equal the pre-state. The compared set must drop exactly those — and ONLY
+/// those: a Modified whose pre-state can't be resolved is kept (a
+/// false-positive divergence beats a silently wrong filter), and
+/// Created/Deleted are never no-ops. Pre-state resolution mirrors the SAME
+/// layered chain the apply used: overlay slot first (a tombstone never falls
+/// through — the base still holds the stale pre-ledger version), then the
+/// base lookup (RocksDB snapshot on the DB path, era-pinned RPC fallback on
+/// the standalone path).
+#[cfg(feature = "ffi")]
+mod noop_modified_filter {
+    use std::collections::HashMap;
+    use xrpl_node::ffi_engine::{build_ours_mutation_set, capture_pre_state_for_modified};
+
+    fn sle(kind: xrpl_ffi::MutationKind, key_byte: u8, data: &[u8]) -> xrpl_ffi::SleMutation {
+        xrpl_ffi::SleMutation {
+            key: [key_byte; 32],
+            kind,
+            data: data.to_vec(),
+        }
+    }
+
+    /// F1 core: a Modified whose post bytes equal the captured pre bytes is
+    /// a no-op — rippled's meta omits it, so the compared set must drop it.
+    /// Changed Modifieds and Created/Deleted always stay.
+    #[test]
+    fn noop_modified_dropped_from_comparison_set() {
+        let muts = vec![
+            sle(xrpl_ffi::MutationKind::Modified, 0xAA, b"same-bytes"),
+            sle(xrpl_ffi::MutationKind::Modified, 0xBB, b"post-bytes"),
+            sle(xrpl_ffi::MutationKind::Created, 0xCC, b"same-bytes"),
+            sle(xrpl_ffi::MutationKind::Deleted, 0xDD, b""),
+        ];
+        let mut pre = HashMap::new();
+        pre.insert([0xAA; 32], b"same-bytes".to_vec()); // no-op
+        pre.insert([0xBB; 32], b"pre-bytes".to_vec()); // real change
+        let set = build_ours_mutation_set(&muts, &pre);
+        assert!(
+            !set.contains(&(hex::encode_upper([0xAA; 32]), 1u8)),
+            "no-op Modified must be dropped"
+        );
+        assert!(
+            set.contains(&(hex::encode_upper([0xBB; 32]), 1u8)),
+            "changed Modified must stay"
+        );
+        assert!(
+            set.contains(&(hex::encode_upper([0xCC; 32]), 0u8)),
+            "Created is never a no-op"
+        );
+        assert!(
+            set.contains(&(hex::encode_upper([0xDD; 32]), 2u8)),
+            "Deleted is never a no-op"
+        );
+        assert_eq!(set.len(), 3);
+    }
+
+    /// Invariant guard: a Modified with NO captured pre-state must be kept
+    /// (false-positive divergence beats a silently wrong filter).
+    #[test]
+    fn modified_without_prestate_kept_in_comparison_set() {
+        let muts = vec![sle(xrpl_ffi::MutationKind::Modified, 0xEE, b"bytes")];
+        let pre = HashMap::new();
+        let set = build_ours_mutation_set(&muts, &pre);
+        assert!(set.contains(&(hex::encode_upper([0xEE; 32]), 1u8)));
+    }
+
+    /// A Created whose bytes coincidentally equal some captured pre-state
+    /// must never be filtered — only Modified can be a no-op.
+    #[test]
+    fn created_with_matching_prestate_still_kept() {
+        let muts = vec![sle(xrpl_ffi::MutationKind::Created, 0xAF, b"same")];
+        let mut pre = HashMap::new();
+        pre.insert([0xAF; 32], b"same".to_vec());
+        let set = build_ours_mutation_set(&muts, &pre);
+        assert!(set.contains(&(hex::encode_upper([0xAF; 32]), 0u8)));
+    }
+
+    /// F1 regression (RPC path): a key first touched by THIS tx has no
+    /// overlay slot — pre-state must come from the base lookup (era-pinned
+    /// RPC on the standalone path). Before the fix the base was `None`
+    /// there, the no-op survived filtering, and every affected Payment
+    /// reported the "+1 ModifiedNode" phantom (ours=4 net=3).
+    #[test]
+    fn capture_prestate_consults_base_on_overlay_miss() {
+        let muts = vec![sle(xrpl_ffi::MutationKind::Modified, 0xAA, b"same-bytes")];
+        let overlay: HashMap<[u8; 32], Option<Vec<u8>>> = HashMap::new();
+        let pre = capture_pre_state_for_modified(&muts, &overlay, |key| {
+            assert_eq!(key, &[0xAA; 32]);
+            Some(b"same-bytes".to_vec())
+        });
+        assert_eq!(
+            pre.get(&[0xAA; 32]).map(Vec::as_slice),
+            Some(&b"same-bytes"[..])
+        );
+        // End-to-end: with the captured pre-state the no-op drops out.
+        let set = build_ours_mutation_set(&muts, &pre);
+        assert!(
+            set.is_empty(),
+            "no-op Modified must vanish from the compared set"
+        );
+    }
+
+    /// An overlay hit (an earlier tx in this ledger wrote the key) shadows
+    /// the base — the base lookup must not run at all.
+    #[test]
+    fn capture_prestate_overlay_hit_shadows_base() {
+        let muts = vec![sle(xrpl_ffi::MutationKind::Modified, 0xAB, b"post")];
+        let mut overlay: HashMap<[u8; 32], Option<Vec<u8>>> = HashMap::new();
+        overlay.insert([0xAB; 32], Some(b"overlay-pre".to_vec()));
+        let pre = capture_pre_state_for_modified(&muts, &overlay, |_| {
+            panic!("base must not be consulted on overlay hit")
+        });
+        assert_eq!(
+            pre.get(&[0xAB; 32]).map(Vec::as_slice),
+            Some(&b"overlay-pre"[..])
+        );
+    }
+
+    /// A tombstone (key deleted earlier this ledger) must NOT fall through
+    /// to the base — the base still holds the stale pre-ledger version. The
+    /// key stays uncaptured, so the comparison keeps the node.
+    #[test]
+    fn capture_prestate_tombstone_never_falls_through() {
+        let muts = vec![sle(xrpl_ffi::MutationKind::Modified, 0xAC, b"post")];
+        let mut overlay: HashMap<[u8; 32], Option<Vec<u8>>> = HashMap::new();
+        overlay.insert([0xAC; 32], None); // tombstone
+        let pre = capture_pre_state_for_modified(&muts, &overlay, |_| {
+            panic!("base must not be consulted past a tombstone")
+        });
+        assert!(pre.is_empty());
+    }
+
+    /// Created/Deleted mutations are never no-ops — capture must skip them
+    /// without touching the base (no wasted era-pinned RPC reads).
+    #[test]
+    fn capture_prestate_skips_created_and_deleted() {
+        let muts = vec![
+            sle(xrpl_ffi::MutationKind::Created, 0xAD, b"new"),
+            sle(xrpl_ffi::MutationKind::Deleted, 0xAE, b""),
+        ];
+        let overlay: HashMap<[u8; 32], Option<Vec<u8>>> = HashMap::new();
+        let pre = capture_pre_state_for_modified(&muts, &overlay, |_| {
+            panic!("base must not be consulted for Created/Deleted")
+        });
+        assert!(pre.is_empty());
+    }
+
+    /// The same key Modified twice in one tx's mutation list must resolve
+    /// its pre-state exactly once (first occurrence wins) — one base read,
+    /// not two.
+    #[test]
+    fn capture_prestate_dedupes_repeated_keys() {
+        let muts = vec![
+            sle(xrpl_ffi::MutationKind::Modified, 0xBA, b"post-1"),
+            sle(xrpl_ffi::MutationKind::Modified, 0xBA, b"post-2"),
+        ];
+        let overlay: HashMap<[u8; 32], Option<Vec<u8>>> = HashMap::new();
+        let calls = std::cell::Cell::new(0u32);
+        let pre = capture_pre_state_for_modified(&muts, &overlay, |_| {
+            calls.set(calls.get() + 1);
+            Some(b"pre".to_vec())
+        });
+        assert_eq!(calls.get(), 1, "base consulted exactly once per key");
+        assert_eq!(pre.len(), 1);
+    }
+}
+
+/// Offline tests for the NFTokenPage prefetch that backs `RpcProvider::succ`
+/// on the standalone-RPC path (F2). rippled locates a token's page with
+/// `succ(nftpage(min(owner), tokenID), nftpage_max(owner).next())`: the start
+/// key is derived from the token ID (not a real object, so Clio rejects it as
+/// a ledger_data marker) and the bound is EXCLUSIVE and can equal the next
+/// account's first page.
+mod nft_page_prefetch {
+    use serde_json::json;
+    use std::collections::BTreeSet;
+    use xrpl_node::nft_pages::{
+        collect_owner_pages, interval_within_owner, nftpage_max, nftpage_max_next, nftpage_min,
+        owner_of_page_key, parse_account_objects_pages, parse_nft_page_owners, succ_from_pages,
+        NftSuccAnswer, OwnerNftPages,
+    };
+
+    /// An owner AccountID whose 20 bytes are all `byte`.
+    fn owner(byte: u8) -> [u8; 20] {
+        [byte; 20]
+    }
+
+    /// A page key in `owner`'s range with page-tag low byte `tag`.
+    fn page(o: &[u8; 20], tag: u8) -> [u8; 32] {
+        let mut k = nftpage_min(o);
+        k[31] = tag;
+        k
+    }
+
+    fn pages_of(o: &[u8; 20], tags: &[u8], complete: bool) -> OwnerNftPages {
+        OwnerNftPages {
+            owner: *o,
+            pages: tags.iter().map(|t| page(o, *t)).collect::<BTreeSet<_>>(),
+            complete,
+        }
+    }
+
+    #[test]
+    fn nftpage_keylets_are_owner_prefixed() {
+        let o = owner(0xAB);
+        assert_eq!(&nftpage_min(&o)[..20], &o[..], "min keeps the owner prefix");
+        assert_eq!(&nftpage_min(&o)[20..], &[0u8; 12][..], "min zeroes the page tag");
+        assert_eq!(&nftpage_max(&o)[..20], &o[..], "max keeps the owner prefix");
+        assert_eq!(&nftpage_max(&o)[20..], &[0xFFu8; 12][..], "max fills the page tag");
+        assert_eq!(owner_of_page_key(&page(&o, 7)), o, "owner recovered from a page key");
+    }
+
+    /// The exclusive bound rippled passes is nftpage_max(owner).next(), which
+    /// is the NEXT account's nftpage_min — a real key whenever that account
+    /// owns pages. This is the 6893bbe lesson in keylet form.
+    #[test]
+    fn max_next_is_the_next_owners_min() {
+        let o = owner(0x10);
+        let mut next_owner = o;
+        next_owner[19] = 0x11;
+        assert_eq!(
+            nftpage_max_next(&o),
+            Some(nftpage_min(&next_owner)),
+            "max.next() rolls into the next account's first page key"
+        );
+        assert!(
+            nftpage_max_next(&owner(0xFF)).is_none(),
+            "all-ones owner sits at the top of the keyspace — no next bound"
+        );
+    }
+
+    /// The bound is EXCLUSIVE: the next owner's first page must never be
+    /// surfaced as this owner's page. An inclusive bound here is exactly the
+    /// "NFT found in incorrect page" invariant failure.
+    #[test]
+    fn succ_never_returns_the_next_owners_page() {
+        let o = owner(0x10);
+        let bound = nftpage_max_next(&o).expect("bound exists");
+        // This owner has NO pages; the next owner's first page IS `bound`.
+        let set = pages_of(&o, &[], true);
+        assert_eq!(
+            succ_from_pages(&set, &nftpage_min(&o), Some(&bound)),
+            NftSuccAnswer::NoneAuthoritative,
+            "an empty owner must answer None, not the next owner's page at the bound"
+        );
+        // And with a page present, the in-range page wins and the bound is
+        // still excluded.
+        let set = pages_of(&o, &[0x40], true);
+        assert_eq!(
+            succ_from_pages(&set, &nftpage_min(&o), Some(&bound)),
+            NftSuccAnswer::Found(page(&o, 0x40))
+        );
+    }
+
+    #[test]
+    fn succ_is_the_open_interval_within_the_owner() {
+        let o = owner(0x22);
+        let set = pages_of(&o, &[0x10, 0x20, 0x30], true);
+        let bound = nftpage_max_next(&o).expect("bound exists");
+        // Strictly greater than key.
+        assert_eq!(
+            succ_from_pages(&set, &page(&o, 0x10), Some(&bound)),
+            NftSuccAnswer::Found(page(&o, 0x20)),
+            "key itself is excluded — succ is strictly greater"
+        );
+        // Strictly less than last.
+        assert_eq!(
+            succ_from_pages(&set, &page(&o, 0x10), Some(&page(&o, 0x20))),
+            NftSuccAnswer::NoneAuthoritative,
+            "last is excluded — 0x20 must not be returned when it IS the bound"
+        );
+        assert_eq!(
+            succ_from_pages(&set, &page(&o, 0x10), Some(&page(&o, 0x21))),
+            NftSuccAnswer::Found(page(&o, 0x20)),
+            "0x20 is returned once the bound moves strictly above it"
+        );
+        // The lowest page wins from below — succ is the SMALLEST candidate
+        // in the interval, not merely any of them.
+        assert_eq!(
+            succ_from_pages(&set, &page(&o, 0x00), Some(&bound)),
+            NftSuccAnswer::Found(page(&o, 0x10)),
+            "succ returns the smallest qualifying page"
+        );
+    }
+
+    /// An owner with no pages at all is a legitimate COMPLETE view: answering
+    /// authoritative None is what lets a first-ever mint place its page.
+    #[test]
+    fn empty_page_set_is_authoritative_when_complete() {
+        let o = owner(0x33);
+        let bound = nftpage_max_next(&o).expect("bound exists");
+        assert_eq!(
+            succ_from_pages(&pages_of(&o, &[], true), &nftpage_min(&o), Some(&bound)),
+            NftSuccAnswer::NoneAuthoritative
+        );
+        assert_eq!(
+            succ_from_pages(&pages_of(&o, &[], false), &nftpage_min(&o), Some(&bound)),
+            NftSuccAnswer::Unknown,
+            "a truncated prefetch must never claim 'no page' — fall back to the walk"
+        );
+    }
+
+    /// Probes that are not provably confined to the owner's page range must
+    /// fall through to the walk rather than be answered from a set that only
+    /// covers that owner.
+    #[test]
+    fn probes_outside_the_owner_range_are_unknown() {
+        let o = owner(0x44);
+        let set = pages_of(&o, &[0x10], true);
+        assert_eq!(
+            succ_from_pages(&set, &page(&o, 0x20), None),
+            NftSuccAnswer::Unknown,
+            "unbounded probe can run past the owner's range — not answerable here"
+        );
+        let mut far = nftpage_min(&owner(0x99));
+        far[31] = 1;
+        assert_eq!(
+            succ_from_pages(&set, &page(&o, 0x20), Some(&far)),
+            NftSuccAnswer::Unknown,
+            "bound above the owner's range — not answerable here"
+        );
+        assert!(!interval_within_owner(&o, &nftpage_min(&owner(0x45)), Some(&far)));
+        assert!(interval_within_owner(
+            &o,
+            &nftpage_min(&o),
+            Some(&nftpage_max_next(&o).unwrap())
+        ));
+        // The all-ones owner has no bound above it, so any probe is confined.
+        assert!(interval_within_owner(&owner(0xFF), &nftpage_min(&owner(0xFF)), None));
+    }
+
+    #[test]
+    fn parses_account_objects_pages_and_marker() {
+        let o = owner(0x55);
+        let body = json!({"result": {"account_objects": [
+            {"LedgerEntryType": "NFTokenPage", "index": hex::encode_upper(page(&o, 0x01))},
+            {"LedgerEntryType": "RippleState", "index": hex::encode_upper([0xEEu8; 32])},
+            {"LedgerEntryType": "NFTokenPage", "index": hex::encode_upper(page(&o, 0x02))},
+        ], "marker": "abc"}});
+        let (keys, marker) = parse_account_objects_pages(&body).expect("parses");
+        assert_eq!(keys, vec![page(&o, 0x01), page(&o, 0x02)], "non-page entries ignored");
+        assert_eq!(marker, Some(json!("abc")));
+
+        let no_marker = json!({"result": {"account_objects": []}});
+        assert_eq!(parse_account_objects_pages(&no_marker).unwrap(), (vec![], None));
+    }
+
+    /// A dropped page could make succ return a WRONG key — malformed input
+    /// must fail the fetch, never silently shrink the set.
+    #[test]
+    fn malformed_account_objects_are_rejected() {
+        assert!(parse_account_objects_pages(&json!({"result": {"error": "actNotFound"}})).is_err());
+        assert!(parse_account_objects_pages(&json!({"result": {}})).is_err());
+        assert!(parse_account_objects_pages(
+            &json!({"result": {"account_objects": [{"LedgerEntryType": "NFTokenPage"}]}})
+        )
+        .is_err());
+        assert!(parse_account_objects_pages(&json!({"result": {"account_objects": [
+            {"LedgerEntryType": "NFTokenPage", "index": "AABB"}
+        ]}}))
+        .is_err());
+    }
+
+    #[test]
+    fn collect_owner_pages_follows_markers_then_completes() {
+        let o = owner(0x66);
+        let mut calls = 0;
+        let set = collect_owner_pages(
+            |marker| {
+                calls += 1;
+                match calls {
+                    1 => {
+                        assert!(marker.is_none(), "first fetch is unmarked");
+                        Some((vec![page(&o, 0x01)], Some(json!("m1"))))
+                    }
+                    _ => {
+                        assert_eq!(marker, Some(&json!("m1")), "marker threaded through");
+                        Some((vec![page(&o, 0x02)], None))
+                    }
+                }
+            },
+            &o,
+            8,
+        )
+        .expect("collects");
+        assert_eq!(calls, 2);
+        assert!(set.complete, "marker-less final page means a complete view");
+        assert_eq!(
+            set.pages.iter().copied().collect::<Vec<_>>(),
+            vec![page(&o, 0x01), page(&o, 0x02)]
+        );
+    }
+
+    #[test]
+    fn collect_owner_pages_fails_closed() {
+        let o = owner(0x77);
+        // A failed fetch must yield no set at all: a partial set marked
+        // complete would be a silently wrong authoritative answer.
+        assert!(collect_owner_pages(|_| None, &o, 8).is_none(), "fetch failure means no set");
+        // Exhausting the page budget with a marker pending leaves a prefix.
+        let set = collect_owner_pages(|_| Some((vec![page(&o, 0x01)], Some(json!("m")))), &o, 2)
+            .expect("returns a prefix");
+        assert!(!set.complete, "marker still pending at the cap — not authoritative");
+    }
+
+    // ---- tx owner extraction -------------------------------------------
+
+    /// Serialize a minimal tx: TransactionType `tt` plus the given
+    /// (field_code, account) AccountID (type 8) fields, in canonical order.
+    fn nft_tx(tt: u16, accounts: &[(u8, [u8; 20])]) -> Vec<u8> {
+        let mut out = vec![0x12]; // UInt16 / TransactionType (1,2)
+        out.extend_from_slice(&tt.to_be_bytes());
+        for (field, id) in accounts {
+            out.push(0x80 | field); // AccountID (type 8) / field
+            out.push(20); // VL length
+            out.extend_from_slice(id);
+        }
+        out
+    }
+
+    #[test]
+    fn extracts_owners_from_nft_txs() {
+        // NFTokenMint (25) with Account + Issuer.
+        let account = owner(0xA1);
+        let issuer = owner(0xB2);
+        assert_eq!(
+            parse_nft_page_owners(&nft_tx(25, &[(1, account), (4, issuer)])),
+            vec![account, issuer],
+            "mint names the minter and the issuer"
+        );
+        // NFTokenCreateOffer (27) buy offer: Owner holds the token.
+        let holder = owner(0xC3);
+        assert_eq!(
+            parse_nft_page_owners(&nft_tx(27, &[(1, account), (2, holder)])),
+            vec![account, holder],
+            "create-offer names the token's owner"
+        );
+        for tt in [26u16, 28, 29] {
+            assert_eq!(
+                parse_nft_page_owners(&nft_tx(tt, &[(1, account)])),
+                vec![account],
+                "tt {tt} is an NFT page-walking type"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_non_nft_txs_and_junk() {
+        let account = owner(0xA1);
+        for tt in [0u16, 7, 20, 24, 30] {
+            assert!(
+                parse_nft_page_owners(&nft_tx(tt, &[(1, account)])).is_empty(),
+                "tt {tt} does not walk NFT pages — no prefetch"
+            );
+        }
+        assert!(parse_nft_page_owners(&[]).is_empty(), "empty blob");
+        assert!(parse_nft_page_owners(&[0x12, 0x00]).is_empty(), "truncated tt");
+        // Zero account is a placeholder, never a page owner.
+        assert!(
+            parse_nft_page_owners(&nft_tx(25, &[(1, [0u8; 20])])).is_empty(),
+            "zero account dropped"
+        );
+    }
+
+    /// The scan must cross VL fields (SigningPubKey/TxnSignature), STArrays
+    /// (Memos) and every fixed-width type to reach the AccountID region —
+    /// dropping out early would silently skip the prefetch.
+    #[test]
+    fn crosses_full_canonical_field_order() {
+        let account = owner(0xA1);
+        let mut tx = vec![0x12, 0x00, 0x19]; // TransactionType = 25 (NFTokenMint)
+        tx.extend_from_slice(&[0x22, 0x00, 0x00, 0x00, 0x08]); // UInt32 Flags
+        tx.extend_from_slice(&[0x20, 0x2A, 0x00, 0x00, 0x00, 0x05]); // UInt32 (2,42)
+        tx.extend_from_slice(&[0x50, 0x14]); // Hash256 (5,20)
+        tx.extend_from_slice(&[0u8; 32]);
+        tx.push(0x61); // Amount (6,1) XRP
+        tx.extend_from_slice(&[0x40, 0, 0, 0, 0, 0, 0, 10]);
+        tx.extend_from_slice(&[0x73, 0x02, 0xAA, 0xBB]); // VL SigningPubKey (7,3)
+        tx.extend_from_slice(&[0x80 | 1, 20]); // AccountID Account (8,1)
+        tx.extend_from_slice(&account);
+        tx.extend_from_slice(&[0xF9, 0xEA, 0xE1, 0xF1]); // Memos: [ {} ]
+        assert_eq!(
+            parse_nft_page_owners(&tx),
+            vec![account],
+            "Account found after fixed-width, VL and STArray fields"
+        );
+    }
+}

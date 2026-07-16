@@ -9,9 +9,10 @@
 //! (otherwise it answers `markerDoesNotExist`). A cold `ledger_data` walk
 //! seeded with the book base therefore cannot serve the first probe of a
 //! book. Instead, the apply loop prefetches the books a tx can cross —
-//! OfferCreates and cross-currency Payments (SendMax issue ≠ Amount issue;
-//! explicit Paths are NOT scanned) — via the `book_offers` RPC (pinned to
-//! the pre-ledger index): every returned offer carries its `BookDirectory`
+//! OfferCreates and cross-currency Payments (SendMax issue ≠ Amount issue,
+//! plus every conversion hop implied by an explicit Paths field — see
+//! `payment_path_books`) — via the `book_offers` RPC (pinned to the
+//! pre-ledger index): every returned offer carries its `BookDirectory`
 //! key, which is exactly the set of directory keys `succ` must surface for
 //! that book's quality range.
 //!
@@ -182,14 +183,278 @@ pub fn parse_offer_create(tx: &[u8]) -> Option<OfferBooks> {
 ///
 /// Returns `None` for same-issue payments and payments without SendMax:
 /// those ripple directly and touch a book only through an explicit Paths
-/// field, which this scan does not cover (a skipped prefetch just leaves
-/// succ() on its pre-existing fallback — never wrong, only cold).
+/// field, which `payment_path_books` covers separately (a skipped prefetch
+/// just leaves succ() on its pre-existing fallback — never wrong, only
+/// cold).
 pub fn parse_payment_books(tx: &[u8]) -> Option<OfferBooks> {
     let (amount, send_max) = scan_two_amounts(tx, 0, 1, 9)?;
     if amount == send_max {
         return None;
     }
     Some(OfferBooks { taker_pays: amount, taker_gets: send_max })
+}
+
+/// One element of an STPath: any subset of {account, currency, issuer}
+/// per the STPathElement type bits (0x01 / 0x10 / 0x20).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PathStep {
+    pub account: Option<[u8; 20]>,
+    pub currency: Option<[u8; 20]>,
+    pub issuer: Option<[u8; 20]>,
+}
+
+/// The Paths-relevant fields of a Payment tx.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaymentPaths {
+    pub amount: Issue,
+    pub send_max: Option<Issue>,
+    pub paths: Vec<Vec<PathStep>>,
+}
+
+/// Decode a variable-length length prefix. Returns (payload_len,
+/// prefix_bytes_consumed).
+fn read_vl(data: &[u8], pos: usize) -> Option<(usize, usize)> {
+    let b1 = *data.get(pos)? as usize;
+    if b1 <= 192 {
+        Some((b1, 1))
+    } else if b1 <= 240 {
+        let b2 = *data.get(pos + 1)? as usize;
+        Some((193 + (b1 - 193) * 256 + b2, 2))
+    } else if b1 <= 254 {
+        let b2 = *data.get(pos + 1)? as usize;
+        let b3 = *data.get(pos + 2)? as usize;
+        Some((12481 + (b1 - 241) * 65536 + b2 * 256 + b3, 3))
+    } else {
+        None
+    }
+}
+
+/// Skip one serialized field VALUE of the given type, returning the
+/// position just past it. `None` on truncation or an unknown type — the
+/// caller must abandon the scan (never guess at field boundaries).
+fn skip_value(data: &[u8], pos: usize, type_code: u8) -> Option<usize> {
+    let end = match type_code {
+        1 => pos + 2,
+        2 => pos + 4,
+        3 => pos + 8,
+        4 => pos + 16,
+        5 => pos + 32,
+        6 => {
+            let b = *data.get(pos)?;
+            // 0x80 → 48-byte IOU; 0x20 (without 0x80) → 33-byte MPT
+            // amount; else 8-byte XRP.
+            pos + if b & 0x80 != 0 {
+                48
+            } else if b & 0x20 != 0 {
+                33
+            } else {
+                8
+            }
+        }
+        7 | 8 | 19 => {
+            let (len, consumed) = read_vl(data, pos)?;
+            pos + consumed + len
+        }
+        14 => return skip_object(data, pos),
+        15 => return skip_array(data, pos),
+        16 => pos + 1,
+        17 => pos + 20,
+        _ => return None,
+    };
+    if end > data.len() {
+        None
+    } else {
+        Some(end)
+    }
+}
+
+/// Skip STObject contents up to and including the ObjectEndMarker (0xE1).
+fn skip_object(data: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        let (type_code, field_code, header_len) = read_field_header(data, pos)?;
+        pos += header_len;
+        if type_code == 14 && field_code == 1 {
+            return Some(pos); // ObjectEndMarker
+        }
+        pos = skip_value(data, pos, type_code)?;
+    }
+}
+
+/// Skip STArray contents up to and including the ArrayEndMarker (0xF1).
+/// Each element is an object-typed field whose contents run to 0xE1.
+fn skip_array(data: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        let (type_code, field_code, header_len) = read_field_header(data, pos)?;
+        pos += header_len;
+        if type_code == 15 && field_code == 1 {
+            return Some(pos); // ArrayEndMarker
+        }
+        if type_code != 14 {
+            return None;
+        }
+        pos = skip_object(data, pos)?;
+    }
+}
+
+/// Read a 20-byte chunk at `*pos`, advancing it.
+fn take20(data: &[u8], pos: &mut usize) -> Option<[u8; 20]> {
+    let bytes = data.get(*pos..*pos + 20)?;
+    let mut out = [0u8; 20];
+    out.copy_from_slice(bytes);
+    *pos += 20;
+    Some(out)
+}
+
+/// Parse a serialized PathSet body: steps with STPathElement type bits
+/// (0x01 account, 0x10 currency, 0x20 issuer; fields appear in that
+/// order), 0xFF between paths, 0x00 terminates the set.
+fn parse_path_set(data: &[u8], mut pos: usize) -> Option<Vec<Vec<PathStep>>> {
+    let mut paths = Vec::new();
+    let mut cur: Vec<PathStep> = Vec::new();
+    loop {
+        let flags = *data.get(pos)?;
+        pos += 1;
+        match flags {
+            0x00 => {
+                if !cur.is_empty() {
+                    paths.push(cur);
+                }
+                return Some(paths);
+            }
+            0xFF => paths.push(std::mem::take(&mut cur)),
+            _ => {
+                if flags & !0x31 != 0 {
+                    return None; // unknown step-type bits
+                }
+                let mut step = PathStep::default();
+                if flags & 0x01 != 0 {
+                    step.account = Some(take20(data, &mut pos)?);
+                }
+                if flags & 0x10 != 0 {
+                    step.currency = Some(take20(data, &mut pos)?);
+                }
+                if flags & 0x20 != 0 {
+                    step.issuer = Some(take20(data, &mut pos)?);
+                }
+                cur.push(step);
+            }
+        }
+    }
+}
+
+/// Scan a binary tx blob; if it is a Payment WITH an explicit Paths field,
+/// return Amount/SendMax issues plus the decoded paths. Unlike
+/// `scan_two_amounts` this walker crosses the VL region (SigningPubKey,
+/// TxnSignature, Account, Destination) and any STArray (Memos, Signers) to
+/// reach PathSet (type 18) — canonical field order puts it after every
+/// other Payment field. `None` for non-Payments, path-less payments, or
+/// anything malformed (the caller simply skips path prefetch then).
+pub fn parse_payment_paths(tx: &[u8]) -> Option<PaymentPaths> {
+    let mut pos = 0usize;
+    let mut tt_is_payment = false;
+    let mut amount: Option<Issue> = None;
+    let mut send_max: Option<Issue> = None;
+    while pos < tx.len() {
+        let (type_code, field_code, header_len) = read_field_header(tx, pos)?;
+        pos += header_len;
+        match (type_code, field_code) {
+            (1, 2) => {
+                let bytes = tx.get(pos..pos + 2)?;
+                if u16::from_be_bytes([bytes[0], bytes[1]]) != 0 {
+                    return None; // not a Payment
+                }
+                tt_is_payment = true;
+                pos += 2;
+            }
+            (6, 1) | (6, 9) => {
+                let end = skip_value(tx, pos, 6)?;
+                let issue = parse_amount_issue(&tx[pos..end]);
+                if field_code == 1 {
+                    amount = issue;
+                } else {
+                    send_max = issue;
+                }
+                pos = end;
+            }
+            (18, 1) => {
+                if !tt_is_payment {
+                    return None;
+                }
+                let paths = parse_path_set(tx, pos)?;
+                return Some(PaymentPaths { amount: amount?, send_max, paths });
+            }
+            _ => pos = skip_value(tx, pos, type_code)?,
+        }
+    }
+    None
+}
+
+/// Push the (from, to) conversion book plus its reverse orientation
+/// (cheap insurance, mirroring `crossing_books`), deduped.
+fn push_conversion(out: &mut Vec<(Issue, Issue)>, from: &Issue, to: &Issue) {
+    for pair in [(from.clone(), to.clone()), (to.clone(), from.clone())] {
+        if !out.contains(&pair) {
+            out.push(pair);
+        }
+    }
+}
+
+/// The (in, out) books a pathed Payment's strands can consume. For each
+/// path, walk the issue sequence: source asset (SendMax, else Amount) →
+/// each path step → delivered asset (Amount, the implied terminal step).
+/// A step with currency/issuer bits that changes the running issue is a
+/// book step: converting X into Y consumes offers with TakerPays == X /
+/// TakerGets == Y, i.e. book {in: X, out: Y}. An account-only step ripples
+/// (no book) but re-issues the running IOU through that account, which
+/// matters for any later hop's book keylet. Issuer defaulting for
+/// currency-only steps is heuristic (explicit issuer, else step account,
+/// else previous issuer) — a wrong guess only prefetches a book nobody
+/// probes, leaving succ() on its fallback exactly as before.
+pub fn path_conversion_books(
+    amount: &Issue,
+    send_max: Option<&Issue>,
+    paths: &[Vec<PathStep>],
+) -> Vec<(Issue, Issue)> {
+    let source = send_max.unwrap_or(amount).clone();
+    let mut out = Vec::new();
+    for path in paths {
+        let mut cur = source.clone();
+        for step in path {
+            let next = if let Some(c) = step.currency {
+                if c == [0u8; 20] {
+                    Issue::xrp()
+                } else {
+                    let issuer = step.issuer.or(step.account).unwrap_or(cur.issuer);
+                    Issue::iou(c, issuer)
+                }
+            } else if cur.is_xrp() {
+                cur.clone()
+            } else if let Some(who) = step.issuer.or(step.account) {
+                Issue::iou(cur.currency, who)
+            } else {
+                cur.clone()
+            };
+            // Book step ⇔ no account bit (the spec makes account exclusive
+            // with currency/issuer; issuer-only elements are books too).
+            if step.account.is_none() && next != cur {
+                push_conversion(&mut out, &cur, &next);
+            }
+            cur = next;
+        }
+        if cur != *amount {
+            push_conversion(&mut out, &cur, amount);
+        }
+    }
+    out
+}
+
+/// Convenience: the path-implied books of a tx blob, or empty when it is
+/// not a pathed Payment (or is malformed — prefetch is best-effort).
+pub fn payment_path_books(tx: &[u8]) -> Vec<(Issue, Issue)> {
+    match parse_payment_paths(tx) {
+        Some(p) => path_conversion_books(&p.amount, p.send_max.as_ref(), &p.paths),
+        None => Vec::new(),
+    }
 }
 
 /// rippled's `getBookBase(Book{in, out})`: sha512-half of

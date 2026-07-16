@@ -150,10 +150,21 @@ pub struct RpcProvider {
     /// probes inside these quality ranges from here — a cold `ledger_data`
     /// walk cannot serve them against Clio endpoints (see offer_books docs).
     book_dirs: parking_lot::Mutex<Vec<crate::offer_books::BookDirs>>,
+    /// NFTokenPage sets prefetched via `account_objects` (pre-ledger view),
+    /// keyed by owner. succ() answers owner-prefixed page probes from here —
+    /// a cold `ledger_data` walk cannot serve them (see nft_pages docs).
+    nft_pages: parking_lot::Mutex<Vec<crate::nft_pages::OwnerNftPages>>,
 }
 
 /// Page size requested from `book_offers` during book prefetch.
 const BOOK_OFFERS_PAGE_LIMIT: usize = 100;
+/// Page size requested from `account_objects` during NFT-page prefetch. An
+/// NFTokenPage holds up to 32 tokens, so this covers ~6400 tokens in one
+/// round trip — every real owner lands in a single page.
+const ACCOUNT_OBJECTS_PAGE_LIMIT: usize = 200;
+/// Marker-resumption cap for the NFT-page prefetch (safety net against a
+/// marker loop; see `collect_owner_pages`).
+const NFT_PAGE_MAX_PAGES: usize = 8;
 /// A book is only marked `complete` when the offer count is safely below
 /// any plausible server-side clamp of our requested limit (Clio clamps
 /// out-of-range limits instead of erroring, so `count < requested` alone
@@ -183,6 +194,7 @@ impl RpcProvider {
             miss_keys: parking_lot::Mutex::new(Vec::new()),
             next_url_idx: std::sync::atomic::AtomicUsize::new(0),
             book_dirs: parking_lot::Mutex::new(Vec::new()),
+            nft_pages: parking_lot::Mutex::new(Vec::new()),
         }
     }
 }
@@ -420,18 +432,24 @@ impl RpcProvider {
     /// Seed the succ() book view for one tx: if it is an OfferCreate or a
     /// cross-currency Payment (SendMax issue ≠ Amount issue), fetch every
     /// book it can cross (both direct orientations plus XRP-bridged legs)
-    /// at the pinned pre-ledger index. Idempotent per book base. A fetch
-    /// failure stores nothing — succ() then falls back to the `ledger_data`
-    /// walk, i.e. behaves exactly as before this feature.
+    /// at the pinned pre-ledger index; a pathed Payment additionally gets
+    /// the books of every conversion hop along its Paths (a multi-step
+    /// strand consumes offers in EACH hop's book, not just the direct
+    /// SendMax→Amount pair). Idempotent per book base. A fetch failure
+    /// stores nothing — succ() then falls back to the `ledger_data` walk,
+    /// i.e. behaves exactly as before this feature.
     pub fn prefetch_offer_books_for_tx(&self, tx_bytes: &[u8]) {
-        let Some(books) = crate::offer_books::parse_offer_create(tx_bytes)
+        let mut pairs = Vec::new();
+        if let Some(books) = crate::offer_books::parse_offer_create(tx_bytes)
             .or_else(|| crate::offer_books::parse_payment_books(tx_bytes))
-        else {
-            return;
-        };
-        for (book_in, book_out) in
-            crate::offer_books::crossing_books(&books.taker_pays, &books.taker_gets)
         {
+            pairs.extend(crate::offer_books::crossing_books(
+                &books.taker_pays,
+                &books.taker_gets,
+            ));
+        }
+        pairs.extend(crate::offer_books::payment_path_books(tx_bytes));
+        for (book_in, book_out) in pairs {
             let base = crate::offer_books::book_base(&book_in, &book_out);
             if self.book_dirs.lock().iter().any(|b| b.base == base) {
                 continue;
@@ -442,6 +460,102 @@ impl RpcProvider {
                     dirs: dirs.into_iter().collect(),
                     complete: count < BOOK_OFFERS_COMPLETE_BELOW,
                 });
+            }
+        }
+    }
+
+    /// Fetch one `account_objects` page of NFTokenPages for `owner` at the
+    /// pinned PRE-ledger index (era pinning — never "validated"/"current").
+    /// Same retry/rotation/backoff idiom as `read_with_outcome`. Returns
+    /// `None` only when all retries are exhausted.
+    fn fetch_account_nft_pages(
+        &self,
+        owner: &[u8; 20],
+        marker: Option<&serde_json::Value>,
+    ) -> Option<(Vec<[u8; 32]>, Option<serde_json::Value>)> {
+        use std::sync::atomic::Ordering;
+        let mut backoff_ms: u64 = 10;
+        let mut url_idx = self.next_url_idx.load(Ordering::Relaxed) % self.rpc_urls.len();
+        for attempt in 0..6 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                backoff_ms *= 2;
+                url_idx = (url_idx + 1) % self.rpc_urls.len();
+            }
+            let mut params = serde_json::json!({
+                "account": crate::offer_books::encode_account_id(owner),
+                "type": "nft_page",
+                "ledger_index": self.ledger_index,
+                "limit": ACCOUNT_OBJECTS_PAGE_LIMIT,
+            });
+            if let Some(m) = marker {
+                params["marker"] = m.clone();
+            }
+            let resp = match self
+                .client
+                .post(&self.rpc_urls[url_idx])
+                .json(&serde_json::json!({
+                    "method": "account_objects",
+                    "params": [params]
+                }))
+                .send()
+            {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let body_text = match resp.text() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let tt = body_text.trim();
+            if tt.starts_with("Server is overloaded")
+                || tt.starts_with("Server too busy")
+                || tt.contains("service unavailable")
+            {
+                continue;
+            }
+            let body: serde_json::Value = match serde_json::from_str(&body_text) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            match crate::nft_pages::parse_account_objects_pages(&body) {
+                Ok(res) => {
+                    self.next_url_idx.store(url_idx, Ordering::Relaxed);
+                    return Some(res);
+                }
+                // Body-level error (overloaded, lgrNotFound on a pruned
+                // endpoint, malformed page) — rotate and retry. `actNotFound`
+                // also lands here: an account that does not exist at the
+                // pinned ledger has no pages, but treating that as an
+                // authoritative empty set on a possibly-pruned endpoint
+                // risks a silently wrong succ, so we store nothing and let
+                // the walk decide.
+                Err(_) => continue,
+            }
+        }
+        None
+    }
+
+    /// Seed the succ() NFT-page view for one tx: if it is an NFToken tx,
+    /// fetch the NFTokenPage set of every account it names (see
+    /// `nft_pages::parse_nft_page_owners`) at the pinned pre-ledger index.
+    /// rippled locates a token's page with `succ(first, nftpage_max(owner)
+    /// .next())`, whose start key is derived from the token ID and so is not
+    /// a real ledger key — Clio rejects it as a `ledger_data` marker, and
+    /// the book prefetch never sees NFT pages. Idempotent per owner. A fetch
+    /// failure stores nothing — succ() then falls back to the `ledger_data`
+    /// walk, i.e. behaves exactly as before this feature.
+    pub fn prefetch_nft_pages_for_tx(&self, tx_bytes: &[u8]) {
+        for owner in crate::nft_pages::parse_nft_page_owners(tx_bytes) {
+            if self.nft_pages.lock().iter().any(|p| p.owner == owner) {
+                continue;
+            }
+            if let Some(set) = crate::nft_pages::collect_owner_pages(
+                |marker| self.fetch_account_nft_pages(&owner, marker),
+                &owner,
+                NFT_PAGE_MAX_PAGES,
+            ) {
+                self.nft_pages.lock().push(set);
             }
         }
     }
@@ -487,6 +601,31 @@ impl SleProvider for RpcProvider {
                         // as a ledger_data marker.
                         walk_from = book.dirs.range(..=*key).next_back().copied();
                     }
+                }
+            }
+        }
+        // 1b. Prefetched NFTokenPage view. rippled probes an owner's pages
+        //     with succ(nftpage(min(owner), tokenID), nftpage_max(owner)
+        //     .next()) — the start key is derived from the token ID and so
+        //     is almost never a real object, which Clio rejects as a
+        //     ledger_data marker; and the book view above never holds NFT
+        //     pages. Only probes provably confined to the owner's page range
+        //     are answered here (see nft_pages::interval_within_owner) —
+        //     anything wider falls through to the walk.
+        {
+            let owner = crate::nft_pages::owner_of_page_key(key);
+            let sets = self.nft_pages.lock();
+            if let Some(set) = sets.iter().find(|p| p.owner == owner) {
+                match crate::nft_pages::succ_from_pages(set, key, last) {
+                    crate::nft_pages::NftSuccAnswer::Found(k) => {
+                        self.hits.fetch_add(1, Ordering::Relaxed);
+                        return Some(k);
+                    }
+                    crate::nft_pages::NftSuccAnswer::NoneAuthoritative => {
+                        self.misses.fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    }
+                    crate::nft_pages::NftSuccAnswer::Unknown => {}
                 }
             }
         }
@@ -1754,6 +1893,75 @@ pub fn process_live_tx(stats: &SharedFfiStats, tx_bytes: &[u8], ledger_seq: u32)
 pub type LedgerOverlay = std::collections::HashMap<[u8; 32], Option<Vec<u8>>>;
 
 
+/// Resolve the pre-apply bytes for each Modified mutation through the SAME
+/// layered chain the apply used: the overlay slot first (a tombstone means
+/// the entry was deleted earlier in this ledger — never fall through past
+/// it), then the pre-ledger base via `base_lookup` (RocksDB snapshot on the
+/// DB path, era-pinned RPC fallback on the standalone path). Keys whose
+/// pre-state can't be resolved are absent from the result — the comparison
+/// then keeps the node (a false-positive divergence beats a silently wrong
+/// filter). Created/Deleted mutations are never captured: they cannot be
+/// no-ops.
+pub fn capture_pre_state_for_modified(
+    mutations: &[xrpl_ffi::SleMutation],
+    overlay: &std::collections::HashMap<[u8; 32], Option<Vec<u8>>>,
+    base_lookup: impl Fn(&[u8; 32]) -> Option<Vec<u8>>,
+) -> std::collections::HashMap<[u8; 32], Vec<u8>> {
+    let mut pre_state: std::collections::HashMap<[u8; 32], Vec<u8>> =
+        std::collections::HashMap::new();
+    for m in mutations {
+        if !matches!(m.kind, xrpl_ffi::MutationKind::Modified)
+            || pre_state.contains_key(&m.key)
+        {
+            continue;
+        }
+        let pre = match overlay.get(&m.key) {
+            // Overlay slot exists: use it verbatim. A tombstone (None) means
+            // the entry was deleted earlier this ledger — the base still has
+            // the stale pre-ledger version, so it must NOT be consulted.
+            Some(slot) => slot.clone(),
+            None => base_lookup(&m.key),
+        };
+        if let Some(bytes) = pre {
+            pre_state.insert(m.key, bytes);
+        }
+    }
+    pre_state
+}
+
+pub fn mutation_kind_byte(k: &xrpl_ffi::MutationKind) -> u8 {
+    match k {
+        xrpl_ffi::MutationKind::Created => 0,
+        xrpl_ffi::MutationKind::Modified => 1,
+        xrpl_ffi::MutationKind::Deleted => 2,
+    }
+}
+
+/// Build the comparison set of (key-hex, kind-byte) from our mutations,
+/// dropping no-op Modifieds: rippled's meta-build skips entries whose post
+/// bytes equal the pre bytes (ApplyStateTable.cpp:155 — `*curNode ==
+/// *origNode`) while libxrpl still emits them via rawReplace. Only this
+/// diagnostic set is filtered — `outcome.mutations` and overlay threading
+/// are untouched. A Modified with no captured pre-state is kept.
+pub fn build_ours_mutation_set(
+    mutations: &[xrpl_ffi::SleMutation],
+    pre_state_for_modified: &std::collections::HashMap<[u8; 32], Vec<u8>>,
+) -> std::collections::HashSet<(String, u8)> {
+    mutations
+        .iter()
+        .filter(|m| {
+            if !matches!(m.kind, xrpl_ffi::MutationKind::Modified) {
+                return true;
+            }
+            match pre_state_for_modified.get(&m.key) {
+                Some(pre_bytes) => pre_bytes != &m.data, // keep iff actually changed
+                None => true, // no pre-state captured → can't tell, keep it
+            }
+        })
+        .map(|m| (hex::encode_upper(m.key), mutation_kind_byte(&m.kind)))
+        .collect()
+}
+
 pub fn apply_ledger_in_order(
     stats: &SharedFfiStats,
     txs_in_order: &[Vec<u8>],
@@ -1860,6 +2068,10 @@ pub fn apply_ledger_in_order(
         // RocksDB and needs none of this.
         if db_snapshot.is_none() {
             fallback.prefetch_offer_books_for_tx(tx_bytes);
+            // Same story for NFToken txs: the page walk's probe key is
+            // derived from the token ID and is not a real ledger object, so
+            // the cold walk cannot start (see RpcProvider::succ).
+            fallback.prefetch_nft_pages_for_tx(tx_bytes);
         }
         // Parse to get tx_type + hash (for diagnostic buckets)
         let (tx_type, tx_hash) = xrpl_ffi::parse_tx(tx_bytes)
@@ -1953,24 +2165,19 @@ pub fn apply_ledger_in_order(
             std::collections::HashMap::new();
         if expected_mutations.is_some() && should_thread {
             let ov = overlay.lock();
-            for m in &outcome.mutations {
-                if matches!(m.kind, xrpl_ffi::MutationKind::Modified)
-                    && !pre_state_for_modified.contains_key(&m.key)
-                {
-                    let pre = if let Some(entry) = ov.get(&m.key) {
-                        entry.clone()
-                    } else if let Some(snap) = db_snapshot {
-                        snap.get(&m.key).ok().flatten()
-                    } else {
-                        None
-                    };
-                    if let Some(bytes) = pre {
-                        pre_state_for_modified.insert(m.key, bytes);
-                    }
-                    // If neither overlay nor snapshot has it, we can't detect a
-                    // no-op; treat as a real divergence (false positive — rare).
-                }
-            }
+            pre_state_for_modified = capture_pre_state_for_modified(
+                &outcome.mutations,
+                &ov,
+                |k| match db_snapshot {
+                    Some(snap) => snap.get(k).ok().flatten(),
+                    // Standalone RPC path: era-pinned pre-ledger read through
+                    // the same fallback the apply's LayeredProvider used. A
+                    // key first touched by THIS tx has no overlay slot, and
+                    // without this read its no-op Modified can't be detected
+                    // — the exact "+1 ModifiedNode" phantom (F1).
+                    None => fallback.read(k).map(|b| b.to_vec()),
+                },
+            );
         }
         let prior_overlay_size;
         let mut post_overlay_size;
@@ -2271,32 +2478,13 @@ pub fn apply_ledger_in_order(
             if same_ter && (outcome.ter_name == "tesSUCCESS" || outcome.ter_name.starts_with("tec")) {
                 if let Some(net_muts) = mut_map.get(&tx_hash) {
                     use std::collections::HashSet;
-                    let kind_byte = |k: &xrpl_ffi::MutationKind| -> u8 {
-                        match k {
-                            xrpl_ffi::MutationKind::Created => 0,
-                            xrpl_ffi::MutationKind::Modified => 1,
-                            xrpl_ffi::MutationKind::Deleted => 2,
-                        }
-                    };
-                    // Filter out no-op Modifieds: rippled's meta-build skips
-                    // these (ApplyStateTable.cpp:155 — `(*curNode == *origNode)`),
-                    // but libxrpl still emits them via rawReplace. Comparing
-                    // them as "extra in ours" produces ~150/min phantom
-                    // divergences on Payment-heavy workloads. Honesty preserved
-                    // because outcome.mutations itself is unchanged — only the
-                    // diagnostic set is filtered.
-                    let ours_set: HashSet<(String, u8)> = outcome.mutations.iter()
-                        .filter(|m| {
-                            if !matches!(m.kind, xrpl_ffi::MutationKind::Modified) {
-                                return true;
-                            }
-                            match pre_state_for_modified.get(&m.key) {
-                                Some(pre_bytes) => pre_bytes != &m.data, // keep iff actually changed
-                                None => true, // no pre-state captured → can't tell, keep it
-                            }
-                        })
-                        .map(|m| (hex::encode_upper(m.key), kind_byte(&m.kind)))
-                        .collect();
+                    // No-op Modifieds are dropped from the compared set (see
+                    // build_ours_mutation_set) — rippled's meta-build skips
+                    // them, libxrpl still emits them via rawReplace. Honesty
+                    // preserved because outcome.mutations itself is unchanged
+                    // — only the diagnostic set is filtered.
+                    let ours_set: HashSet<(String, u8)> =
+                        build_ours_mutation_set(&outcome.mutations, &pre_state_for_modified);
                     let net_set: HashSet<(String, u8)> = net_muts.iter().cloned().collect();
                     if ours_set != net_set {
                         let kind_label = |b: u8| match b { 0 => "C", 1 => "M", 2 => "D", _ => "?" };
