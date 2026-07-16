@@ -420,18 +420,24 @@ impl RpcProvider {
     /// Seed the succ() book view for one tx: if it is an OfferCreate or a
     /// cross-currency Payment (SendMax issue ≠ Amount issue), fetch every
     /// book it can cross (both direct orientations plus XRP-bridged legs)
-    /// at the pinned pre-ledger index. Idempotent per book base. A fetch
-    /// failure stores nothing — succ() then falls back to the `ledger_data`
-    /// walk, i.e. behaves exactly as before this feature.
+    /// at the pinned pre-ledger index; a pathed Payment additionally gets
+    /// the books of every conversion hop along its Paths (a multi-step
+    /// strand consumes offers in EACH hop's book, not just the direct
+    /// SendMax→Amount pair). Idempotent per book base. A fetch failure
+    /// stores nothing — succ() then falls back to the `ledger_data` walk,
+    /// i.e. behaves exactly as before this feature.
     pub fn prefetch_offer_books_for_tx(&self, tx_bytes: &[u8]) {
-        let Some(books) = crate::offer_books::parse_offer_create(tx_bytes)
+        let mut pairs = Vec::new();
+        if let Some(books) = crate::offer_books::parse_offer_create(tx_bytes)
             .or_else(|| crate::offer_books::parse_payment_books(tx_bytes))
-        else {
-            return;
-        };
-        for (book_in, book_out) in
-            crate::offer_books::crossing_books(&books.taker_pays, &books.taker_gets)
         {
+            pairs.extend(crate::offer_books::crossing_books(
+                &books.taker_pays,
+                &books.taker_gets,
+            ));
+        }
+        pairs.extend(crate::offer_books::payment_path_books(tx_bytes));
+        for (book_in, book_out) in pairs {
             let base = crate::offer_books::book_base(&book_in, &book_out);
             if self.book_dirs.lock().iter().any(|b| b.base == base) {
                 continue;

@@ -15,12 +15,14 @@
 use serde_json::json;
 use xrpl_node::offer_books::{
     book_base, crossing_books, encode_account_id, in_book_range, issue_to_params,
-    parse_book_offers_dirs, parse_offer_create, parse_payment_books, succ_from_book, BookDirs,
-    BookSuccAnswer, Issue,
+    parse_book_offers_dirs, parse_offer_create, parse_payment_books, parse_payment_paths,
+    path_conversion_books, payment_path_books, succ_from_book, BookDirs, BookSuccAnswer, Issue,
+    PathStep,
 };
 
-/// Same ledger data file the (read-only) oracle test uses.
+/// Same ledger data files the (read-only) oracle tests use.
 const LEDGER_BLOBS_TSV: &str = include_str!("data/l103515367_blobs.txt");
+const L105091578_BLOBS_TSV: &str = include_str!("data/l105091578_blobs.txt");
 
 /// The book DirectoryNode BF6C928F's crossing deleted on mainnet — its
 /// first 24 bytes are the crossed book's base prefix, its low 8 bytes the
@@ -46,8 +48,8 @@ fn hex20(s: &str) -> [u8; 20] {
     a
 }
 
-fn blob(idx: u32) -> Vec<u8> {
-    for line in LEDGER_BLOBS_TSV.lines().filter(|l| !l.is_empty()) {
+fn blob_from(tsv: &str, idx: u32) -> Vec<u8> {
+    for line in tsv.lines().filter(|l| !l.is_empty()) {
         let mut parts = line.splitn(2, '\t');
         let i: u32 = parts.next().unwrap().parse().unwrap();
         if i == idx {
@@ -55,6 +57,10 @@ fn blob(idx: u32) -> Vec<u8> {
         }
     }
     panic!("tx index {idx} not found in data file");
+}
+
+fn blob(idx: u32) -> Vec<u8> {
+    blob_from(LEDGER_BLOBS_TSV, idx)
 }
 
 fn rlusd() -> Issue {
@@ -377,4 +383,225 @@ fn succ_from_book_empty_complete_book_is_none() {
         succ_from_book(&b, &b.base, None),
         BookSuccAnswer::NoneAuthoritative
     );
+}
+
+// ---- parse_payment_paths / path_conversion_books / payment_path_books ----
+//
+// Real vectors: the F3 cross-currency Payments of mainnet ledger 105091578
+// whose meta under-emits without per-hop book prefetch (ours=6/7 net=8).
+
+/// USDC as issued by rHqE…: the intermediate hop of both F3 payments.
+const USDC_CURRENCY_HEX: &str = "5553444300000000000000000000000000000000";
+const USDC_ISSUER_HEX: &str = "ACF3278B42F2ACC71989C99661DAB9AF8C081981";
+
+fn usdc() -> Issue {
+    Issue::iou(hex20(USDC_CURRENCY_HEX), hex20(USDC_ISSUER_HEX))
+}
+
+/// The book bases a pathed payment's prefetch covers.
+fn path_book_bases(tx: &[u8]) -> Vec<[u8; 32]> {
+    payment_path_books(tx).iter().map(|(i, o)| book_base(i, o)).collect()
+}
+
+#[test]
+fn pathed_payment_rlusd_to_xrp_via_usdc() {
+    // l105091578 idx 1: SendMax RLUSD, Amount XRP, Paths [[USDC@ACF3…]].
+    // The strand is RLUSD→USDC→XRP: two books, neither of which is the
+    // direct RLUSD↔XRP pair the SendMax/Amount prefetch already covers.
+    let tx = blob_from(L105091578_BLOBS_TSV, 1);
+    let p = parse_payment_paths(&tx).expect("pathed Payment must parse");
+    assert_eq!(p.amount, Issue::xrp(), "Amount is XRP");
+    assert_eq!(p.send_max, Some(rlusd()), "SendMax is RLUSD");
+    assert_eq!(
+        p.paths,
+        vec![vec![PathStep {
+            account: None,
+            currency: Some(hex20(USDC_CURRENCY_HEX)),
+            issuer: Some(hex20(USDC_ISSUER_HEX)),
+        }]],
+        "one path, one currency+issuer step (USDC)"
+    );
+    let bases = path_book_bases(&tx);
+    assert!(
+        bases.contains(&book_base(&rlusd(), &usdc())),
+        "hop 1 book {{in: RLUSD, out: USDC}} must be prefetched"
+    );
+    assert!(
+        bases.contains(&book_base(&usdc(), &Issue::xrp())),
+        "implied terminal book {{in: USDC, out: XRP}} must be prefetched"
+    );
+}
+
+#[test]
+fn pathed_payment_xrp_to_usdc_via_rlusd() {
+    // l105091578 idx 2: SendMax XRP, Amount USDC, Paths [[RLUSD@E5E9…]] —
+    // the mirror-image strand XRP→RLUSD→USDC.
+    let tx = blob_from(L105091578_BLOBS_TSV, 2);
+    let p = parse_payment_paths(&tx).expect("pathed Payment must parse");
+    assert_eq!(p.amount, usdc());
+    assert_eq!(p.send_max, Some(Issue::xrp()));
+    let bases = path_book_bases(&tx);
+    assert!(bases.contains(&book_base(&Issue::xrp(), &rlusd())));
+    assert!(bases.contains(&book_base(&rlusd(), &usdc())));
+}
+
+/// Assemble a synthetic Payment blob from parts (canonical field order).
+fn synth_payment(amount: &[u8], send_max: Option<&[u8]>, tail: &[u8]) -> Vec<u8> {
+    let mut tx = vec![0x12, 0x00, 0x00]; // TransactionType = Payment
+    tx.push(0x61); // Amount (6,1)
+    tx.extend_from_slice(amount);
+    if let Some(sm) = send_max {
+        tx.push(0x69); // SendMax (6,9)
+        tx.extend_from_slice(sm);
+    }
+    tx.extend_from_slice(tail);
+    tx
+}
+
+fn iou_amount_bytes(issue: &Issue) -> Vec<u8> {
+    let mut v = vec![0xD4, 0x83, 0x8D, 0x7E, 0xA4, 0xC6, 0x80, 0x00];
+    v.extend_from_slice(&issue.currency);
+    v.extend_from_slice(&issue.issuer);
+    v
+}
+
+const XRP_AMOUNT_BYTES: [u8; 8] = [0x40, 0, 0, 0, 0, 0, 0, 0x64];
+
+#[test]
+fn path_scan_crosses_vl_fields_memos_and_long_vl() {
+    // Account + Destination (VL AccountIDs), then a Memos STArray whose
+    // MemoData is 300 bytes (two-byte VL form), THEN the PathSet — the
+    // scan must skip all of it without desyncing.
+    let mut tail = Vec::new();
+    tail.extend_from_slice(&[0x81, 0x14]); // Account (8,1), VL 20
+    tail.extend_from_slice(&[0x11; 20]);
+    tail.extend_from_slice(&[0x83, 0x14]); // Destination (8,3), VL 20
+    tail.extend_from_slice(&[0x22; 20]);
+    tail.push(0xF9); // Memos (15,9)
+    tail.push(0xEA); // Memo object (14,10)
+    tail.extend_from_slice(&[0x7D, 0xC1, 0x6B]); // MemoData (7,13), VL=300
+    tail.extend_from_slice(&[0xAB; 300]);
+    tail.push(0xE1); // ObjectEndMarker
+    tail.push(0xF1); // ArrayEndMarker
+    tail.extend_from_slice(&[0x01, 0x12]); // Paths (18,1)
+    tail.push(0x30); // step: currency + issuer
+    tail.extend_from_slice(&rlusd().currency);
+    tail.extend_from_slice(&rlusd().issuer);
+    tail.push(0x00); // end of PathSet
+    let tx = synth_payment(
+        &iou_amount_bytes(&usdc()),
+        Some(&XRP_AMOUNT_BYTES),
+        &tail,
+    );
+    let p = parse_payment_paths(&tx).expect("must reach Paths across VL/array fields");
+    assert_eq!(p.paths, vec![vec![PathStep {
+        account: None,
+        currency: Some(rlusd().currency),
+        issuer: Some(rlusd().issuer),
+    }]]);
+    // XRP→RLUSD→USDC: both hop books present.
+    let bases = path_book_bases(&tx);
+    assert!(bases.contains(&book_base(&Issue::xrp(), &rlusd())));
+    assert!(bases.contains(&book_base(&rlusd(), &usdc())));
+}
+
+#[test]
+fn path_set_multiple_paths_and_xrp_step() {
+    // Two paths split by 0xFF: one via RLUSD, one via an explicit XRP step
+    // (all-zero currency, no issuer) — books from BOTH must be covered.
+    let mut tail = Vec::new();
+    tail.extend_from_slice(&[0x01, 0x12]);
+    tail.push(0x30);
+    tail.extend_from_slice(&rlusd().currency);
+    tail.extend_from_slice(&rlusd().issuer);
+    tail.push(0xFF); // next path
+    tail.push(0x10); // currency-only step: XRP
+    tail.extend_from_slice(&[0u8; 20]);
+    tail.push(0x00);
+    let tx = synth_payment(
+        &iou_amount_bytes(&usdc()),
+        Some(&iou_amount_bytes(&bear())),
+        &tail,
+    );
+    let p = parse_payment_paths(&tx).expect("parses");
+    assert_eq!(p.paths.len(), 2);
+    let bases = path_book_bases(&tx);
+    // Path 1: BEAR→RLUSD→USDC.
+    assert!(bases.contains(&book_base(&bear(), &rlusd())));
+    assert!(bases.contains(&book_base(&rlusd(), &usdc())));
+    // Path 2: BEAR→XRP→USDC (explicit XRP bridge).
+    assert!(bases.contains(&book_base(&bear(), &Issue::xrp())));
+    assert!(bases.contains(&book_base(&Issue::xrp(), &usdc())));
+}
+
+#[test]
+fn account_step_reissues_without_a_book() {
+    // XRP → RLUSD@E (book), then ripple through account F (no book, but
+    // the running issue becomes RLUSD@F), then implied terminal to
+    // USDC@ACF3: the terminal book must key on the REISSUED RLUSD@F.
+    let e = rlusd();
+    let f = Issue::iou(e.currency, [0xF0; 20]);
+    let path = vec![vec![
+        PathStep { account: None, currency: Some(e.currency), issuer: Some(e.issuer) },
+        PathStep { account: Some(f.issuer), currency: None, issuer: None },
+    ]];
+    let books = path_conversion_books(&usdc(), Some(&Issue::xrp()), &path);
+    assert!(books.contains(&(Issue::xrp(), e.clone())), "hop 1 book");
+    assert!(
+        books.contains(&(f.clone(), usdc())),
+        "terminal book must use the account-step reissued RLUSD@F"
+    );
+    assert!(
+        !books.contains(&(e.clone(), f.clone())),
+        "an account step ripples — it is not a book"
+    );
+}
+
+#[test]
+fn issuer_only_step_is_a_book() {
+    // USD@A → USD@B via an issuer-only element: same currency, different
+    // issuer — that IS an order book in rippled's strand semantics.
+    let a = Issue::iou([0x05; 20], [0x0A; 20]);
+    let b = Issue::iou([0x05; 20], [0x0B; 20]);
+    let path = vec![vec![PathStep {
+        account: None,
+        currency: None,
+        issuer: Some(b.issuer),
+    }]];
+    let books = path_conversion_books(&b, Some(&a), &path);
+    assert!(books.contains(&(a.clone(), b.clone())));
+    // Terminal already reached (cur == amount): exactly the one conversion
+    // (both orientations).
+    assert_eq!(books.len(), 2);
+}
+
+#[test]
+fn path_books_empty_for_pathless_and_non_payments() {
+    // l103515367 idx 4: cross-currency Payment WITHOUT Paths.
+    assert!(payment_path_books(&blob(4)).is_empty());
+    // idx 19: OfferCreate (has no PathSet; also must not parse as Payment).
+    assert!(payment_path_books(&blob(19)).is_empty());
+    assert!(parse_payment_paths(&blob(19)).is_none());
+    // Degenerate inputs.
+    assert!(payment_path_books(&[]).is_empty());
+    assert!(payment_path_books(&[0x12, 0x00]).is_empty());
+}
+
+#[test]
+fn malformed_path_set_yields_no_books() {
+    // PathSet header, then a currency+issuer step truncated after 10 bytes.
+    let mut tail = vec![0x01, 0x12, 0x30];
+    tail.extend_from_slice(&[0x77; 10]);
+    let tx = synth_payment(&XRP_AMOUNT_BYTES, Some(&iou_amount_bytes(&bear())), &tail);
+    assert!(parse_payment_paths(&tx).is_none());
+    assert!(payment_path_books(&tx).is_empty());
+    // Unknown step-type bits must abandon the scan, not guess.
+    let mut tail = vec![0x01, 0x12, 0x42];
+    tail.extend_from_slice(&[0x77; 40]);
+    let tx = synth_payment(&XRP_AMOUNT_BYTES, Some(&iou_amount_bytes(&bear())), &tail);
+    assert!(parse_payment_paths(&tx).is_none());
+    // A PathSet that never terminates (no 0x00) is malformed too.
+    let tail = vec![0x01, 0x12];
+    let tx = synth_payment(&XRP_AMOUNT_BYTES, Some(&iou_amount_bytes(&bear())), &tail);
+    assert!(parse_payment_paths(&tx).is_none());
 }
