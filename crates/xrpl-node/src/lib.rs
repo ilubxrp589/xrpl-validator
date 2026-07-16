@@ -29,6 +29,7 @@ pub mod lockstep;
 pub mod error;
 pub mod mempool;
 pub mod node;
+pub mod offer_books;
 pub mod overlay;
 pub mod paths;
 pub mod peer;

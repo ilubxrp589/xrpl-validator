@@ -11,8 +11,11 @@
 //! The network side lives in `ffi_engine::RpcProvider` (feature = "ffi");
 //! everything here is bytes/json in → candidate out so it is unit-testable
 //! offline. The walk uses rippled's `ledger_data` RPC: marker-based
-//! resumption is ">= position", so the caller seeds the marker with `key`
-//! itself and this module filters for strictly-greater client-side.
+//! resumption is ">= position" and this module filters for strictly-greater
+//! client-side. The CALLER chooses the starting marker: `key` itself on
+//! endpoints that accept arbitrary markers (rippled), or the closest
+//! known-EXISTING key <= `key` on Clio-style endpoints, which reject any
+//! marker that is not a real ledger-object key (`markerDoesNotExist`).
 
 /// One parsed `ledger_data` page: the state keys it contained (ledger order,
 /// i.e. ascending) and the resumption marker, if any.
@@ -82,19 +85,22 @@ pub fn page_exhausts_bound(keys: &[[u8; 32]], last: Option<&[u8; 32]>) -> bool {
 /// provably done. `fetch_page` maps a marker value to a parsed page (`None`
 /// = fetch failed after retries — abort with no answer, never guess).
 ///
-/// The first request seeds the marker with `key` itself: rippled resumes at
-/// the first state key >= marker, so the successor is almost always on the
-/// very first page. `max_pages` is a safety cap against marker loops.
+/// The first request uses `start_marker`, chosen by the caller (see module
+/// doc): it must denote a resume position <= the true successor, since the
+/// server resumes at the first state key >= marker. The strictly-greater
+/// filter against `key` and the exclusive `last` bound are applied here
+/// regardless. `max_pages` is a safety cap against marker loops.
 pub fn walk_pages_for_succ<F>(
     mut fetch_page: F,
     key: &[u8; 32],
     last: Option<&[u8; 32]>,
     max_pages: usize,
+    start_marker: serde_json::Value,
 ) -> Option<[u8; 32]>
 where
     F: FnMut(&serde_json::Value) -> Option<LedgerDataPage>,
 {
-    let mut marker = serde_json::Value::String(hex::encode_upper(key));
+    let mut marker = start_marker;
     for _ in 0..max_pages {
         let page = fetch_page(&marker)?;
         if let Some(cand) = select_succ_candidate(&page.keys, key, last) {

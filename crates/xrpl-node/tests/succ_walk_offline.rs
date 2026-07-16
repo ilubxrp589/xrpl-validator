@@ -125,7 +125,7 @@ fn exhausts_bound_once_page_reaches_last() {
 // ---- walk_pages_for_succ ----
 
 #[test]
-fn walk_seeds_marker_with_key_and_finds_on_first_page() {
+fn walk_starts_from_caller_chosen_marker_and_finds_on_first_page() {
     let mut seen_markers: Vec<serde_json::Value> = Vec::new();
     let got = walk_pages_for_succ(
         |marker| {
@@ -135,13 +135,29 @@ fn walk_seeds_marker_with_key_and_finds_on_first_page() {
         &k(0x20),
         None,
         8,
+        json!(hexk(0x20)),
     );
     assert_eq!(got, Some(k(0x30)));
     assert_eq!(
         seen_markers,
         vec![json!(hexk(0x20))],
-        "first fetch must seed marker = key"
+        "first fetch must use the caller's start marker verbatim"
     );
+}
+
+#[test]
+fn walk_resumed_below_key_still_filters_strictly_greater() {
+    // Clio-style resumption: the caller seeds an EXISTING key below `key`
+    // (e.g. the largest prefetched book dir <= key). Keys <= key coming
+    // back from that earlier resume point must be filtered out.
+    let got = walk_pages_for_succ(
+        |_| Some(parse_ledger_data_page(&page_body(&[0x10, 0x20, 0x30], None)).unwrap()),
+        &k(0x20),
+        None,
+        8,
+        json!(hexk(0x10)),
+    );
+    assert_eq!(got, Some(k(0x30)));
 }
 
 #[test]
@@ -162,6 +178,7 @@ fn walk_follows_marker_to_next_page() {
         &k(0x20),
         None,
         8,
+        json!(hexk(0x20)),
     );
     assert_eq!(got, Some(k(0x50)));
     assert_eq!(calls, 2);
@@ -182,6 +199,7 @@ fn walk_stops_at_exclusive_bound_without_following_marker() {
         &k(0x20),
         Some(&k(0x30)),
         8,
+        json!(hexk(0x20)),
     );
     assert_eq!(got, None);
     assert_eq!(calls, 1, "must not follow the marker past the bound");
@@ -194,13 +212,14 @@ fn walk_ends_when_no_marker_and_no_candidate() {
         &k(0x20),
         None,
         8,
+        json!(hexk(0x20)),
     );
     assert_eq!(got, None);
 }
 
 #[test]
 fn walk_aborts_on_fetch_failure() {
-    let got = walk_pages_for_succ(|_| None, &k(0x20), None, 8);
+    let got = walk_pages_for_succ(|_| None, &k(0x20), None, 8, json!(hexk(0x20)));
     assert_eq!(got, None);
 }
 
@@ -216,6 +235,7 @@ fn walk_respects_max_pages_cap() {
         &k(0x20),
         None,
         3,
+        json!(hexk(0x20)),
     );
     assert_eq!(got, None);
     assert_eq!(calls, 3);
