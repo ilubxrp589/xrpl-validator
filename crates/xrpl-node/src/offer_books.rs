@@ -8,10 +8,12 @@
 //! marker that is an EXISTING ledger-object key at the requested ledger
 //! (otherwise it answers `markerDoesNotExist`). A cold `ledger_data` walk
 //! seeded with the book base therefore cannot serve the first probe of a
-//! book. Instead, the apply loop prefetches the books an OfferCreate can
-//! cross via the `book_offers` RPC (pinned to the pre-ledger index): every
-//! returned offer carries its `BookDirectory` key, which is exactly the set
-//! of directory keys `succ` must surface for that book's quality range.
+//! book. Instead, the apply loop prefetches the books a tx can cross —
+//! OfferCreates and cross-currency Payments (SendMax issue ≠ Amount issue;
+//! explicit Paths are NOT scanned) — via the `book_offers` RPC (pinned to
+//! the pre-ledger index): every returned offer carries its `BookDirectory`
+//! key, which is exactly the set of directory keys `succ` must surface for
+//! that book's quality range.
 //!
 //! Everything here is bytes/json in → data out, so it is unit-testable
 //! offline; the HTTP side lives in `ffi_engine::RpcProvider`.
@@ -95,19 +97,25 @@ fn parse_amount_issue(bytes: &[u8]) -> Option<Issue> {
     }
 }
 
-/// Scan a binary tx blob; if it is an OfferCreate, return its TakerPays /
-/// TakerGets issues. Returns `None` for any other tx type or on malformed
-/// input — the caller simply skips book prefetch then.
+/// Scan a binary tx blob for TransactionType == `want_tt` and the issues of
+/// the two Amount fields `field_a` / `field_b`. Returns `None` for any other
+/// tx type, on malformed input, or when either amount is absent — the caller
+/// simply skips book prefetch then.
 ///
 /// The scan relies on canonical field order (sorted by type code, then field
-/// code): TransactionType (UInt16, 1/2) and the Amounts (6/4 TakerPays,
-/// 6/5 TakerGets) all precede the first VL-encoded field (type 7+), so only
-/// fixed-width types ever need skipping.
-pub fn parse_offer_create(tx: &[u8]) -> Option<OfferBooks> {
+/// code): TransactionType (UInt16, 1/2) and every Amount (type 6) precede the
+/// first VL-encoded field (type 7+), so only fixed-width types ever need
+/// skipping.
+fn scan_two_amounts(
+    tx: &[u8],
+    want_tt: u16,
+    field_a: u8,
+    field_b: u8,
+) -> Option<(Issue, Issue)> {
     let mut pos = 0usize;
-    let mut is_offer_create = false;
-    let mut pays: Option<Issue> = None;
-    let mut gets: Option<Issue> = None;
+    let mut tt_matched = false;
+    let mut a: Option<Issue> = None;
+    let mut b: Option<Issue> = None;
     while pos < tx.len() {
         let (type_code, field_code, header_len) = read_field_header(tx, pos)?;
         pos += header_len;
@@ -138,24 +146,50 @@ pub fn parse_offer_create(tx: &[u8]) -> Option<OfferBooks> {
         match (type_code, field_code) {
             (1, 2) => {
                 let tt = u16::from_be_bytes([tx[pos], tx[pos + 1]]);
-                if tt != 7 {
-                    return None; // not OfferCreate
+                if tt != want_tt {
+                    return None;
                 }
-                is_offer_create = true;
+                tt_matched = true;
             }
-            (6, 4) => pays = parse_amount_issue(&tx[pos..pos + value_len]),
-            (6, 5) => gets = parse_amount_issue(&tx[pos..pos + value_len]),
+            (6, f) if f == field_a => a = parse_amount_issue(&tx[pos..pos + value_len]),
+            (6, f) if f == field_b => b = parse_amount_issue(&tx[pos..pos + value_len]),
             _ => {}
         }
         pos += value_len;
-        if pays.is_some() && gets.is_some() {
+        if a.is_some() && b.is_some() {
             break;
         }
     }
-    if !is_offer_create {
+    if !tt_matched {
         return None;
     }
-    Some(OfferBooks { taker_pays: pays?, taker_gets: gets? })
+    Some((a?, b?))
+}
+
+/// Scan a binary tx blob; if it is an OfferCreate, return its TakerPays /
+/// TakerGets issues.
+pub fn parse_offer_create(tx: &[u8]) -> Option<OfferBooks> {
+    let (pays, gets) = scan_two_amounts(tx, 7, 4, 5)?;
+    Some(OfferBooks { taker_pays: pays, taker_gets: gets })
+}
+
+/// Scan a binary tx blob; if it is a Payment whose source asset (SendMax,
+/// 6/9) differs from its delivered asset (Amount, 6/1), return the
+/// equivalent OfferCreate view: converting S into D consumes offers with
+/// TakerPays == S / TakerGets == D — exactly what OfferCreate(TakerPays: D,
+/// TakerGets: S) crosses, so `crossing_books` applies verbatim (both direct
+/// orientations plus the XRP-bridged legs).
+///
+/// Returns `None` for same-issue payments and payments without SendMax:
+/// those ripple directly and touch a book only through an explicit Paths
+/// field, which this scan does not cover (a skipped prefetch just leaves
+/// succ() on its pre-existing fallback — never wrong, only cold).
+pub fn parse_payment_books(tx: &[u8]) -> Option<OfferBooks> {
+    let (amount, send_max) = scan_two_amounts(tx, 0, 1, 9)?;
+    if amount == send_max {
+        return None;
+    }
+    Some(OfferBooks { taker_pays: amount, taker_gets: send_max })
 }
 
 /// rippled's `getBookBase(Book{in, out})`: sha512-half of

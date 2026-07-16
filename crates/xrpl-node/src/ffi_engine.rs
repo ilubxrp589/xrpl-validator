@@ -417,13 +417,16 @@ impl RpcProvider {
         None
     }
 
-    /// Seed the succ() book view for one tx: if it is an OfferCreate, fetch
-    /// every book it can cross (both direct orientations plus XRP-bridged
-    /// legs) at the pinned pre-ledger index. Idempotent per book base. A
-    /// fetch failure stores nothing — succ() then falls back to the
-    /// `ledger_data` walk, i.e. behaves exactly as before this feature.
+    /// Seed the succ() book view for one tx: if it is an OfferCreate or a
+    /// cross-currency Payment (SendMax issue ≠ Amount issue), fetch every
+    /// book it can cross (both direct orientations plus XRP-bridged legs)
+    /// at the pinned pre-ledger index. Idempotent per book base. A fetch
+    /// failure stores nothing — succ() then falls back to the `ledger_data`
+    /// walk, i.e. behaves exactly as before this feature.
     pub fn prefetch_offer_books_for_tx(&self, tx_bytes: &[u8]) {
-        let Some(books) = crate::offer_books::parse_offer_create(tx_bytes) else {
+        let Some(books) = crate::offer_books::parse_offer_create(tx_bytes)
+            .or_else(|| crate::offer_books::parse_payment_books(tx_bytes))
+        else {
             return;
         };
         for (book_in, book_out) in
@@ -1850,10 +1853,11 @@ pub fn apply_ledger_in_order(
     for tx_bytes in txs_in_order {
         tx_num += 1;
         // No-snapshot (standalone RPC) path: seed succ()'s book view before
-        // applying. OfferCreate crossing probes the book's quality range via
-        // succ(bookBase, bookEnd), which the RPC provider can only answer
-        // from a book_offers prefetch (see RpcProvider::succ). The snapshot
-        // path answers succ from RocksDB and needs none of this.
+        // applying. OfferCreate crossing and cross-currency Payment flow
+        // both probe the book's quality range via succ(bookBase, bookEnd),
+        // which the RPC provider can only answer from a book_offers prefetch
+        // (see RpcProvider::succ). The snapshot path answers succ from
+        // RocksDB and needs none of this.
         if db_snapshot.is_none() {
             fallback.prefetch_offer_books_for_tx(tx_bytes);
         }

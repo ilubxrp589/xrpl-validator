@@ -15,7 +15,8 @@
 use serde_json::json;
 use xrpl_node::offer_books::{
     book_base, crossing_books, encode_account_id, in_book_range, issue_to_params,
-    parse_book_offers_dirs, parse_offer_create, succ_from_book, BookDirs, BookSuccAnswer, Issue,
+    parse_book_offers_dirs, parse_offer_create, parse_payment_books, succ_from_book, BookDirs,
+    BookSuccAnswer, Issue,
 };
 
 /// Same ledger data file the (read-only) oracle test uses.
@@ -78,6 +79,93 @@ fn parse_rejects_non_offer_create() {
     assert!(parse_offer_create(&[0x12, 0x00]).is_none());
     // OfferCreate type but truncated before the amounts.
     assert!(parse_offer_create(&[0x12, 0x00, 0x07, 0x64, 0xD4]).is_none());
+}
+
+// ---- parse_payment_books ----
+
+/// Tx idx 4 of ledger 103515367: a self-payment converting XRP (SendMax)
+/// into BEAR (Amount) — pure book crossing, no trust-line path.
+const BEAR_CURRENCY_HEX: &str = "4245415200000000000000000000000000000000";
+const BEAR_ISSUER_HEX: &str = "708481E67A7828B24F8345AD162CCB40FCCB53B7";
+
+fn bear() -> Issue {
+    Issue::iou(hex20(BEAR_CURRENCY_HEX), hex20(BEAR_ISSUER_HEX))
+}
+
+#[test]
+fn payment_books_xrp_to_iou_conversion() {
+    let books = parse_payment_books(&blob(4)).expect("tx 4 is a cross-currency Payment");
+    // Source asset (SendMax) becomes taker_gets, delivered asset (Amount)
+    // becomes taker_pays — the OfferCreate the conversion is equivalent to.
+    assert_eq!(books.taker_gets, Issue::xrp(), "SendMax is XRP");
+    assert_eq!(books.taker_pays, bear(), "Amount is BEAR IOU");
+    // The consumed offers give BEAR and want XRP → book {in: XRP, out: BEAR}
+    // must be in the prefetch list crossing_books derives.
+    let target = book_base(&Issue::xrp(), &bear());
+    let bases: Vec<[u8; 32]> = crossing_books(&books.taker_pays, &books.taker_gets)
+        .iter()
+        .map(|(i, o)| book_base(i, o))
+        .collect();
+    assert!(bases.contains(&target), "prefetch must cover book {{in: XRP, out: BEAR}}");
+}
+
+#[test]
+fn payment_books_iou_to_xrp_conversion() {
+    // Tx idx 20: SendMax "666" IOU, Amount XRP (partial payment w/ DeliverMin
+    // — neither flag changes the books). DeliverMin (6,10) must be skipped
+    // without confusing the scan.
+    let books = parse_payment_books(&blob(20)).expect("tx 20 is a cross-currency Payment");
+    let sixsixsix = Issue::iou(
+        hex20("0000000000000000000000003636360000000000"),
+        hex20("2AF38C752F7FE95F6B308589C4A2A026014A16CB"),
+    );
+    assert_eq!(books.taker_gets, sixsixsix, "SendMax is the 666 IOU");
+    assert_eq!(books.taker_pays, Issue::xrp(), "Amount is XRP");
+    // One side XRP → two book orientations, no bridge legs.
+    assert_eq!(crossing_books(&books.taker_pays, &books.taker_gets).len(), 2);
+}
+
+#[test]
+fn payment_books_none_without_sendmax() {
+    // Tx idx 54: IOU Amount (TAZZ) but no SendMax — direct rippling; books
+    // are only reachable via explicit Paths, which the scan does not cover.
+    assert!(parse_payment_books(&blob(54)).is_none());
+    // Tx idx 57: plain XRP→XRP payment (with a Memo after the fixed fields).
+    assert!(parse_payment_books(&blob(57)).is_none());
+}
+
+#[test]
+fn payment_books_none_when_same_issue() {
+    // Synthetic Payment with SendMax == Amount (same currency+issuer): a
+    // same-issue "conversion" crosses no book.
+    let mut iou48 = vec![0xD4u8; 8]; // value bytes, high bit set → IOU form
+    iou48.extend_from_slice(&[9u8; 20]); // currency
+    iou48.extend_from_slice(&[7u8; 20]); // issuer
+    let mut tx = vec![0x12, 0x00, 0x00]; // TransactionType = Payment
+    tx.push(0x61); // Amount (6,1)
+    tx.extend_from_slice(&iou48);
+    tx.push(0x69); // SendMax (6,9)
+    tx.extend_from_slice(&iou48);
+    assert!(parse_payment_books(&tx).is_none());
+    // Same for the degenerate XRP→XRP-with-SendMax shape.
+    let mut tx = vec![0x12, 0x00, 0x00];
+    tx.push(0x61);
+    tx.extend_from_slice(&[0x40, 0, 0, 0, 0, 0, 0, 0x64]);
+    tx.push(0x69);
+    tx.extend_from_slice(&[0x40, 0, 0, 0, 0, 0, 0, 0x64]);
+    assert!(parse_payment_books(&tx).is_none());
+}
+
+#[test]
+fn payment_books_rejects_non_payment_and_malformed() {
+    // OfferCreate must not parse as a payment (and vice versa — tx 4 is a
+    // Payment, so parse_offer_create must reject it).
+    assert!(parse_payment_books(&blob(19)).is_none());
+    assert!(parse_offer_create(&blob(4)).is_none());
+    assert!(parse_payment_books(&[]).is_none());
+    assert!(parse_payment_books(&[0x12, 0x00]).is_none());
+    // Payment type but truncated inside the Amount field.
+    assert!(parse_payment_books(&[0x12, 0x00, 0x00, 0x61, 0xD4]).is_none());
 }
 
 // ---- book_base / crossing_books: the mainnet ground-truth vector ----
