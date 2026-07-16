@@ -273,6 +273,71 @@ impl RpcProvider {
         }
         RpcReadOutcome::Exhausted(last_err)
     }
+
+    /// Fetch + parse one `ledger_data` page at the provider's pinned
+    /// PRE-ledger index (era pinning — never "validated"/"current").
+    /// Same retry/rotation/backoff idiom as `read_with_outcome`: up to 6
+    /// attempts, rotating endpoints, exponential backoff. Returns `None`
+    /// only when all retries are exhausted — the walk treats that as
+    /// "lookup failed", never as "no successor".
+    fn fetch_ledger_data_page(
+        &self,
+        marker: &serde_json::Value,
+    ) -> Option<crate::succ_walk::LedgerDataPage> {
+        use std::sync::atomic::Ordering;
+        let mut backoff_ms: u64 = 10;
+        let mut url_idx = self.next_url_idx.load(Ordering::Relaxed) % self.rpc_urls.len();
+        for attempt in 0..6 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                backoff_ms *= 2;
+                url_idx = (url_idx + 1) % self.rpc_urls.len();
+            }
+            let rpc_url = &self.rpc_urls[url_idx];
+            let resp = match self
+                .client
+                .post(rpc_url)
+                .json(&serde_json::json!({
+                    "method": "ledger_data",
+                    "params": [{
+                        "ledger_index": self.ledger_index,
+                        "binary": true,
+                        "limit": 32,
+                        "marker": marker
+                    }]
+                }))
+                .send()
+            {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let body_text = match resp.text() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let tt = body_text.trim();
+            if tt.starts_with("Server is overloaded")
+                || tt.starts_with("Server too busy")
+                || tt.contains("service unavailable")
+            {
+                continue;
+            }
+            let body: serde_json::Value = match serde_json::from_str(&body_text) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            match crate::succ_walk::parse_ledger_data_page(&body) {
+                Ok(page) => {
+                    self.next_url_idx.store(url_idx, Ordering::Relaxed);
+                    return Some(page);
+                }
+                // Body-level error (overloaded, lgrNotFound on a pruned
+                // endpoint, malformed page) — rotate and retry.
+                Err(_) => continue,
+            }
+        }
+        None
+    }
 }
 
 impl SleProvider for RpcProvider {
@@ -280,6 +345,34 @@ impl SleProvider for RpcProvider {
         match self.read_with_outcome(key) {
             RpcReadOutcome::Hit(bytes) => Some(bytes),
             RpcReadOutcome::EntryNotFound | RpcReadOutcome::Exhausted(_) => None,
+        }
+    }
+
+    fn succ(&self, key: &[u8; 32], last: Option<&[u8; 32]>) -> Option<[u8; 32]> {
+        use std::sync::atomic::Ordering;
+        // RPC directory walk via `ledger_data`: marker resumption is
+        // ">= position", so seed the marker with `key` itself; the
+        // strictly-greater filter and the exclusive `last` bound (open
+        // interval, per rippled's ReadView::succ) are applied client-side
+        // in succ_walk, which is offline-unit-tested.
+        let got = crate::succ_walk::walk_pages_for_succ(
+            |marker| self.fetch_ledger_data_page(marker),
+            key,
+            last,
+            8,
+        );
+        // Activity accounting mirrors read(): an answered walk is a hit, a
+        // walk that ends without a successor (legit end-of-window or fetch
+        // exhaustion) counts as a miss, like entryNotFound does for read().
+        match got {
+            Some(k) => {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                Some(k)
+            }
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
         }
     }
 }
@@ -712,6 +805,37 @@ impl<'a> SleProvider for LayeredProvider<'a> {
         }
         // Fallback to RPC
         self.fallback.read(key)
+    }
+
+    fn succ(&self, key: &[u8; 32], last: Option<&[u8; 32]>) -> Option<[u8; 32]> {
+        // Two candidate streams, exactly like OverlayedDbProvider::succ does
+        // with snapshot+overlay. Snapshot the overlay's view up front so the
+        // RPC walk below runs without holding the lock:
+        //   - tombstoned keys: deleted this ledger, must NOT be resurrected
+        //     by the RPC view (which still has the pre-ledger version);
+        //   - overlay candidate: smallest live overlay key strictly inside
+        //     the open interval (key, last).
+        let (tombstones, overlay_cand) = {
+            let overlay = self.overlay.lock();
+            let tombstones: std::collections::HashSet<[u8; 32]> = overlay
+                .iter()
+                .filter(|(_, v)| v.is_none())
+                .map(|(k, _)| *k)
+                .collect();
+            let overlay_cand = crate::succ_walk::overlay_succ_candidate(
+                overlay.iter().filter(|(_, v)| v.is_some()).map(|(k, _)| k),
+                key,
+                last,
+            );
+            (tombstones, overlay_cand)
+        };
+        crate::succ_walk::layered_succ(
+            |probe, l| self.fallback.succ(probe, l),
+            |c| tombstones.contains(c),
+            overlay_cand,
+            key,
+            last,
+        )
     }
 }
 
@@ -1199,9 +1323,11 @@ impl Default for DivergenceLog {
 /// field code 0x68 followed by an 8-byte STAmount in native-XRP form. The
 /// high byte of that 8-byte block has the layout:
 ///
-///     bit 7 (0x80) = 0 → native XRP (clear) / 1 → IOU
-///     bit 6 (0x40) = 1 → positive       / 0 → negative
-///     bits 5..0    = top 6 bits of the 62-bit drops value
+/// ```text
+/// bit 7 (0x80) = 0 → native XRP (clear) / 1 → IOU
+/// bit 6 (0x40) = 1 → positive       / 0 → negative
+/// bits 5..0    = top 6 bits of the 62-bit drops value
+/// ```
 ///
 /// Fees are always native and positive, so the high byte is `0x40 | (top6)`.
 /// The 2-byte pattern `[0x68, 0x4_]` (where the second byte's top two bits
