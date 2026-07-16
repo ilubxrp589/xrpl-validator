@@ -146,7 +146,19 @@ pub struct RpcProvider {
     pub miss_keys: parking_lot::Mutex<Vec<String>>,
     /// Next endpoint index to try first (round-robin on failover).
     next_url_idx: std::sync::atomic::AtomicUsize,
+    /// Books prefetched via `book_offers` (pre-ledger view). succ() answers
+    /// probes inside these quality ranges from here — a cold `ledger_data`
+    /// walk cannot serve them against Clio endpoints (see offer_books docs).
+    book_dirs: parking_lot::Mutex<Vec<crate::offer_books::BookDirs>>,
 }
+
+/// Page size requested from `book_offers` during book prefetch.
+const BOOK_OFFERS_PAGE_LIMIT: usize = 100;
+/// A book is only marked `complete` when the offer count is safely below
+/// any plausible server-side clamp of our requested limit (Clio clamps
+/// out-of-range limits instead of erroring, so `count < requested` alone
+/// could mislabel a truncated page as complete).
+const BOOK_OFFERS_COMPLETE_BELOW: usize = 50;
 
 impl RpcProvider {
     /// Single-endpoint constructor (backwards compatible).
@@ -170,6 +182,7 @@ impl RpcProvider {
             misses: std::sync::atomic::AtomicU64::new(0),
             miss_keys: parking_lot::Mutex::new(Vec::new()),
             next_url_idx: std::sync::atomic::AtomicUsize::new(0),
+            book_dirs: parking_lot::Mutex::new(Vec::new()),
         }
     }
 }
@@ -273,6 +286,165 @@ impl RpcProvider {
         }
         RpcReadOutcome::Exhausted(last_err)
     }
+
+    /// Fetch + parse one `ledger_data` page at the provider's pinned
+    /// PRE-ledger index (era pinning — never "validated"/"current").
+    /// Same retry/rotation/backoff idiom as `read_with_outcome`: up to 6
+    /// attempts, rotating endpoints, exponential backoff. Returns `None`
+    /// only when all retries are exhausted — the walk treats that as
+    /// "lookup failed", never as "no successor".
+    fn fetch_ledger_data_page(
+        &self,
+        marker: &serde_json::Value,
+    ) -> Option<crate::succ_walk::LedgerDataPage> {
+        use std::sync::atomic::Ordering;
+        let mut backoff_ms: u64 = 10;
+        let mut url_idx = self.next_url_idx.load(Ordering::Relaxed) % self.rpc_urls.len();
+        for attempt in 0..6 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                backoff_ms *= 2;
+                url_idx = (url_idx + 1) % self.rpc_urls.len();
+            }
+            let rpc_url = &self.rpc_urls[url_idx];
+            let resp = match self
+                .client
+                .post(rpc_url)
+                .json(&serde_json::json!({
+                    "method": "ledger_data",
+                    "params": [{
+                        "ledger_index": self.ledger_index,
+                        "binary": true,
+                        "limit": 32,
+                        "marker": marker
+                    }]
+                }))
+                .send()
+            {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let body_text = match resp.text() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let tt = body_text.trim();
+            if tt.starts_with("Server is overloaded")
+                || tt.starts_with("Server too busy")
+                || tt.contains("service unavailable")
+            {
+                continue;
+            }
+            let body: serde_json::Value = match serde_json::from_str(&body_text) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            match crate::succ_walk::parse_ledger_data_page(&body) {
+                Ok(page) => {
+                    self.next_url_idx.store(url_idx, Ordering::Relaxed);
+                    return Some(page);
+                }
+                // Body-level error (overloaded, lgrNotFound on a pruned
+                // endpoint, malformed page) — rotate and retry.
+                Err(_) => continue,
+            }
+        }
+        None
+    }
+
+    /// Fetch one book's offers at the pinned PRE-ledger index and distill
+    /// the set of BookDirectory keys. Same retry/rotation/backoff idiom as
+    /// `read_with_outcome`. Returns (sorted deduped dirs, raw offer count),
+    /// or `None` when all retries are exhausted.
+    fn fetch_book_offers(
+        &self,
+        book_in: &crate::offer_books::Issue,
+        book_out: &crate::offer_books::Issue,
+    ) -> Option<(Vec<[u8; 32]>, usize)> {
+        use std::sync::atomic::Ordering;
+        let mut backoff_ms: u64 = 10;
+        let mut url_idx = self.next_url_idx.load(Ordering::Relaxed) % self.rpc_urls.len();
+        for attempt in 0..6 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                backoff_ms *= 2;
+                url_idx = (url_idx + 1) % self.rpc_urls.len();
+            }
+            let rpc_url = &self.rpc_urls[url_idx];
+            let resp = match self
+                .client
+                .post(rpc_url)
+                .json(&serde_json::json!({
+                    "method": "book_offers",
+                    "params": [{
+                        // Book {in, out}: its offers have TakerPays.issue ==
+                        // in and TakerGets.issue == out, which is exactly
+                        // how book_offers names its request sides.
+                        "taker_pays": crate::offer_books::issue_to_params(book_in),
+                        "taker_gets": crate::offer_books::issue_to_params(book_out),
+                        "ledger_index": self.ledger_index,
+                        "limit": BOOK_OFFERS_PAGE_LIMIT
+                    }]
+                }))
+                .send()
+            {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let body_text = match resp.text() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let tt = body_text.trim();
+            if tt.starts_with("Server is overloaded")
+                || tt.starts_with("Server too busy")
+                || tt.contains("service unavailable")
+            {
+                continue;
+            }
+            let body: serde_json::Value = match serde_json::from_str(&body_text) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            match crate::offer_books::parse_book_offers_dirs(&body) {
+                Ok(res) => {
+                    self.next_url_idx.store(url_idx, Ordering::Relaxed);
+                    return Some(res);
+                }
+                Err(_) => continue,
+            }
+        }
+        None
+    }
+
+    /// Seed the succ() book view for one tx: if it is an OfferCreate or a
+    /// cross-currency Payment (SendMax issue ≠ Amount issue), fetch every
+    /// book it can cross (both direct orientations plus XRP-bridged legs)
+    /// at the pinned pre-ledger index. Idempotent per book base. A fetch
+    /// failure stores nothing — succ() then falls back to the `ledger_data`
+    /// walk, i.e. behaves exactly as before this feature.
+    pub fn prefetch_offer_books_for_tx(&self, tx_bytes: &[u8]) {
+        let Some(books) = crate::offer_books::parse_offer_create(tx_bytes)
+            .or_else(|| crate::offer_books::parse_payment_books(tx_bytes))
+        else {
+            return;
+        };
+        for (book_in, book_out) in
+            crate::offer_books::crossing_books(&books.taker_pays, &books.taker_gets)
+        {
+            let base = crate::offer_books::book_base(&book_in, &book_out);
+            if self.book_dirs.lock().iter().any(|b| b.base == base) {
+                continue;
+            }
+            if let Some((dirs, count)) = self.fetch_book_offers(&book_in, &book_out) {
+                self.book_dirs.lock().push(crate::offer_books::BookDirs {
+                    base,
+                    dirs: dirs.into_iter().collect(),
+                    complete: count < BOOK_OFFERS_COMPLETE_BELOW,
+                });
+            }
+        }
+    }
 }
 
 impl SleProvider for RpcProvider {
@@ -280,6 +452,70 @@ impl SleProvider for RpcProvider {
         match self.read_with_outcome(key) {
             RpcReadOutcome::Hit(bytes) => Some(bytes),
             RpcReadOutcome::EntryNotFound | RpcReadOutcome::Exhausted(_) => None,
+        }
+    }
+
+    fn succ(&self, key: &[u8; 32], last: Option<&[u8; 32]>) -> Option<[u8; 32]> {
+        use std::sync::atomic::Ordering;
+        // 1. Prefetched book_offers view. A book base never exists as a
+        //    ledger object (its low 64 quality bits are zeroed), and Clio-
+        //    backed endpoints reject any ledger_data marker that is not an
+        //    existing key at the pinned ledger (markerDoesNotExist) — so the
+        //    cold walk below can never serve the FIRST probe of an offer
+        //    book. apply_ledger_in_order prefetches the books each
+        //    OfferCreate can cross; those ranges are answered here.
+        let mut walk_from: Option<[u8; 32]> = None;
+        {
+            let books = self.book_dirs.lock();
+            if let Some(book) = books
+                .iter()
+                .find(|b| crate::offer_books::in_book_range(&b.base, key))
+            {
+                match crate::offer_books::succ_from_book(book, key, last) {
+                    crate::offer_books::BookSuccAnswer::Found(k) => {
+                        self.hits.fetch_add(1, Ordering::Relaxed);
+                        return Some(k);
+                    }
+                    crate::offer_books::BookSuccAnswer::NoneAuthoritative => {
+                        self.misses.fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    }
+                    crate::offer_books::BookSuccAnswer::Unknown => {
+                        // Truncated prefetch and the probe is past every
+                        // known dir. Resume the walk from the largest known
+                        // dir <= key — an EXISTING key, which Clio accepts
+                        // as a ledger_data marker.
+                        walk_from = book.dirs.range(..=*key).next_back().copied();
+                    }
+                }
+            }
+        }
+        // 2. RPC directory walk via `ledger_data`: marker resumption is
+        //    ">= position". Start from the closest known-existing key when
+        //    we have one (Clio-safe), else from `key` itself (accepted by
+        //    plain rippled). The strictly-greater filter and the exclusive
+        //    `last` bound (open interval, per rippled's ReadView::succ) are
+        //    applied client-side in succ_walk, which is offline-unit-tested.
+        let start = walk_from.unwrap_or(*key);
+        let got = crate::succ_walk::walk_pages_for_succ(
+            |marker| self.fetch_ledger_data_page(marker),
+            key,
+            last,
+            8,
+            serde_json::Value::String(hex::encode_upper(start)),
+        );
+        // Activity accounting mirrors read(): an answered walk is a hit, a
+        // walk that ends without a successor (legit end-of-window or fetch
+        // exhaustion) counts as a miss, like entryNotFound does for read().
+        match got {
+            Some(k) => {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                Some(k)
+            }
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
         }
     }
 }
@@ -712,6 +948,37 @@ impl<'a> SleProvider for LayeredProvider<'a> {
         }
         // Fallback to RPC
         self.fallback.read(key)
+    }
+
+    fn succ(&self, key: &[u8; 32], last: Option<&[u8; 32]>) -> Option<[u8; 32]> {
+        // Two candidate streams, exactly like OverlayedDbProvider::succ does
+        // with snapshot+overlay. Snapshot the overlay's view up front so the
+        // RPC walk below runs without holding the lock:
+        //   - tombstoned keys: deleted this ledger, must NOT be resurrected
+        //     by the RPC view (which still has the pre-ledger version);
+        //   - overlay candidate: smallest live overlay key strictly inside
+        //     the open interval (key, last).
+        let (tombstones, overlay_cand) = {
+            let overlay = self.overlay.lock();
+            let tombstones: std::collections::HashSet<[u8; 32]> = overlay
+                .iter()
+                .filter(|(_, v)| v.is_none())
+                .map(|(k, _)| *k)
+                .collect();
+            let overlay_cand = crate::succ_walk::overlay_succ_candidate(
+                overlay.iter().filter(|(_, v)| v.is_some()).map(|(k, _)| k),
+                key,
+                last,
+            );
+            (tombstones, overlay_cand)
+        };
+        crate::succ_walk::layered_succ(
+            |probe, l| self.fallback.succ(probe, l),
+            |c| tombstones.contains(c),
+            overlay_cand,
+            key,
+            last,
+        )
     }
 }
 
@@ -1199,9 +1466,11 @@ impl Default for DivergenceLog {
 /// field code 0x68 followed by an 8-byte STAmount in native-XRP form. The
 /// high byte of that 8-byte block has the layout:
 ///
-///     bit 7 (0x80) = 0 → native XRP (clear) / 1 → IOU
-///     bit 6 (0x40) = 1 → positive       / 0 → negative
-///     bits 5..0    = top 6 bits of the 62-bit drops value
+/// ```text
+/// bit 7 (0x80) = 0 → native XRP (clear) / 1 → IOU
+/// bit 6 (0x40) = 1 → positive       / 0 → negative
+/// bits 5..0    = top 6 bits of the 62-bit drops value
+/// ```
 ///
 /// Fees are always native and positive, so the high byte is `0x40 | (top6)`.
 /// The 2-byte pattern `[0x68, 0x4_]` (where the second byte's top two bits
@@ -1583,6 +1852,15 @@ pub fn apply_ledger_in_order(
     );
     for tx_bytes in txs_in_order {
         tx_num += 1;
+        // No-snapshot (standalone RPC) path: seed succ()'s book view before
+        // applying. OfferCreate crossing and cross-currency Payment flow
+        // both probe the book's quality range via succ(bookBase, bookEnd),
+        // which the RPC provider can only answer from a book_offers prefetch
+        // (see RpcProvider::succ). The snapshot path answers succ from
+        // RocksDB and needs none of this.
+        if db_snapshot.is_none() {
+            fallback.prefetch_offer_books_for_tx(tx_bytes);
+        }
         // Parse to get tx_type + hash (for diagnostic buckets)
         let (tx_type, tx_hash) = xrpl_ffi::parse_tx(tx_bytes)
             .map(|p| (p.tx_type, hex::encode_upper(p.hash)))
