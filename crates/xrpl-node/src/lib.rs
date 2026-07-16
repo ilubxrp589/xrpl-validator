@@ -28,6 +28,7 @@ pub mod ledger_close;
 pub mod lockstep;
 pub mod error;
 pub mod mempool;
+pub mod nft_pages;
 pub mod node;
 pub mod offer_books;
 pub mod overlay;

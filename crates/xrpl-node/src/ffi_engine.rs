@@ -150,10 +150,21 @@ pub struct RpcProvider {
     /// probes inside these quality ranges from here — a cold `ledger_data`
     /// walk cannot serve them against Clio endpoints (see offer_books docs).
     book_dirs: parking_lot::Mutex<Vec<crate::offer_books::BookDirs>>,
+    /// NFTokenPage sets prefetched via `account_objects` (pre-ledger view),
+    /// keyed by owner. succ() answers owner-prefixed page probes from here —
+    /// a cold `ledger_data` walk cannot serve them (see nft_pages docs).
+    nft_pages: parking_lot::Mutex<Vec<crate::nft_pages::OwnerNftPages>>,
 }
 
 /// Page size requested from `book_offers` during book prefetch.
 const BOOK_OFFERS_PAGE_LIMIT: usize = 100;
+/// Page size requested from `account_objects` during NFT-page prefetch. An
+/// NFTokenPage holds up to 32 tokens, so this covers ~6400 tokens in one
+/// round trip — every real owner lands in a single page.
+const ACCOUNT_OBJECTS_PAGE_LIMIT: usize = 200;
+/// Marker-resumption cap for the NFT-page prefetch (safety net against a
+/// marker loop; see `collect_owner_pages`).
+const NFT_PAGE_MAX_PAGES: usize = 8;
 /// A book is only marked `complete` when the offer count is safely below
 /// any plausible server-side clamp of our requested limit (Clio clamps
 /// out-of-range limits instead of erroring, so `count < requested` alone
@@ -183,6 +194,7 @@ impl RpcProvider {
             miss_keys: parking_lot::Mutex::new(Vec::new()),
             next_url_idx: std::sync::atomic::AtomicUsize::new(0),
             book_dirs: parking_lot::Mutex::new(Vec::new()),
+            nft_pages: parking_lot::Mutex::new(Vec::new()),
         }
     }
 }
@@ -451,6 +463,102 @@ impl RpcProvider {
             }
         }
     }
+
+    /// Fetch one `account_objects` page of NFTokenPages for `owner` at the
+    /// pinned PRE-ledger index (era pinning — never "validated"/"current").
+    /// Same retry/rotation/backoff idiom as `read_with_outcome`. Returns
+    /// `None` only when all retries are exhausted.
+    fn fetch_account_nft_pages(
+        &self,
+        owner: &[u8; 20],
+        marker: Option<&serde_json::Value>,
+    ) -> Option<(Vec<[u8; 32]>, Option<serde_json::Value>)> {
+        use std::sync::atomic::Ordering;
+        let mut backoff_ms: u64 = 10;
+        let mut url_idx = self.next_url_idx.load(Ordering::Relaxed) % self.rpc_urls.len();
+        for attempt in 0..6 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                backoff_ms *= 2;
+                url_idx = (url_idx + 1) % self.rpc_urls.len();
+            }
+            let mut params = serde_json::json!({
+                "account": crate::offer_books::encode_account_id(owner),
+                "type": "nft_page",
+                "ledger_index": self.ledger_index,
+                "limit": ACCOUNT_OBJECTS_PAGE_LIMIT,
+            });
+            if let Some(m) = marker {
+                params["marker"] = m.clone();
+            }
+            let resp = match self
+                .client
+                .post(&self.rpc_urls[url_idx])
+                .json(&serde_json::json!({
+                    "method": "account_objects",
+                    "params": [params]
+                }))
+                .send()
+            {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let body_text = match resp.text() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let tt = body_text.trim();
+            if tt.starts_with("Server is overloaded")
+                || tt.starts_with("Server too busy")
+                || tt.contains("service unavailable")
+            {
+                continue;
+            }
+            let body: serde_json::Value = match serde_json::from_str(&body_text) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            match crate::nft_pages::parse_account_objects_pages(&body) {
+                Ok(res) => {
+                    self.next_url_idx.store(url_idx, Ordering::Relaxed);
+                    return Some(res);
+                }
+                // Body-level error (overloaded, lgrNotFound on a pruned
+                // endpoint, malformed page) — rotate and retry. `actNotFound`
+                // also lands here: an account that does not exist at the
+                // pinned ledger has no pages, but treating that as an
+                // authoritative empty set on a possibly-pruned endpoint
+                // risks a silently wrong succ, so we store nothing and let
+                // the walk decide.
+                Err(_) => continue,
+            }
+        }
+        None
+    }
+
+    /// Seed the succ() NFT-page view for one tx: if it is an NFToken tx,
+    /// fetch the NFTokenPage set of every account it names (see
+    /// `nft_pages::parse_nft_page_owners`) at the pinned pre-ledger index.
+    /// rippled locates a token's page with `succ(first, nftpage_max(owner)
+    /// .next())`, whose start key is derived from the token ID and so is not
+    /// a real ledger key — Clio rejects it as a `ledger_data` marker, and
+    /// the book prefetch never sees NFT pages. Idempotent per owner. A fetch
+    /// failure stores nothing — succ() then falls back to the `ledger_data`
+    /// walk, i.e. behaves exactly as before this feature.
+    pub fn prefetch_nft_pages_for_tx(&self, tx_bytes: &[u8]) {
+        for owner in crate::nft_pages::parse_nft_page_owners(tx_bytes) {
+            if self.nft_pages.lock().iter().any(|p| p.owner == owner) {
+                continue;
+            }
+            if let Some(set) = crate::nft_pages::collect_owner_pages(
+                |marker| self.fetch_account_nft_pages(&owner, marker),
+                &owner,
+                NFT_PAGE_MAX_PAGES,
+            ) {
+                self.nft_pages.lock().push(set);
+            }
+        }
+    }
 }
 
 impl SleProvider for RpcProvider {
@@ -493,6 +601,31 @@ impl SleProvider for RpcProvider {
                         // as a ledger_data marker.
                         walk_from = book.dirs.range(..=*key).next_back().copied();
                     }
+                }
+            }
+        }
+        // 1b. Prefetched NFTokenPage view. rippled probes an owner's pages
+        //     with succ(nftpage(min(owner), tokenID), nftpage_max(owner)
+        //     .next()) — the start key is derived from the token ID and so
+        //     is almost never a real object, which Clio rejects as a
+        //     ledger_data marker; and the book view above never holds NFT
+        //     pages. Only probes provably confined to the owner's page range
+        //     are answered here (see nft_pages::interval_within_owner) —
+        //     anything wider falls through to the walk.
+        {
+            let owner = crate::nft_pages::owner_of_page_key(key);
+            let sets = self.nft_pages.lock();
+            if let Some(set) = sets.iter().find(|p| p.owner == owner) {
+                match crate::nft_pages::succ_from_pages(set, key, last) {
+                    crate::nft_pages::NftSuccAnswer::Found(k) => {
+                        self.hits.fetch_add(1, Ordering::Relaxed);
+                        return Some(k);
+                    }
+                    crate::nft_pages::NftSuccAnswer::NoneAuthoritative => {
+                        self.misses.fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    }
+                    crate::nft_pages::NftSuccAnswer::Unknown => {}
                 }
             }
         }
@@ -1935,6 +2068,10 @@ pub fn apply_ledger_in_order(
         // RocksDB and needs none of this.
         if db_snapshot.is_none() {
             fallback.prefetch_offer_books_for_tx(tx_bytes);
+            // Same story for NFToken txs: the page walk's probe key is
+            // derived from the token ID and is not a real ledger object, so
+            // the cold walk cannot start (see RpcProvider::succ).
+            fallback.prefetch_nft_pages_for_tx(tx_bytes);
         }
         // Parse to get tx_type + hash (for diagnostic buckets)
         let (tx_type, tx_hash) = xrpl_ffi::parse_tx(tx_bytes)
