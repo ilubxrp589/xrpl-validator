@@ -1754,6 +1754,75 @@ pub fn process_live_tx(stats: &SharedFfiStats, tx_bytes: &[u8], ledger_seq: u32)
 pub type LedgerOverlay = std::collections::HashMap<[u8; 32], Option<Vec<u8>>>;
 
 
+/// Resolve the pre-apply bytes for each Modified mutation through the SAME
+/// layered chain the apply used: the overlay slot first (a tombstone means
+/// the entry was deleted earlier in this ledger — never fall through past
+/// it), then the pre-ledger base via `base_lookup` (RocksDB snapshot on the
+/// DB path, era-pinned RPC fallback on the standalone path). Keys whose
+/// pre-state can't be resolved are absent from the result — the comparison
+/// then keeps the node (a false-positive divergence beats a silently wrong
+/// filter). Created/Deleted mutations are never captured: they cannot be
+/// no-ops.
+pub fn capture_pre_state_for_modified(
+    mutations: &[xrpl_ffi::SleMutation],
+    overlay: &std::collections::HashMap<[u8; 32], Option<Vec<u8>>>,
+    base_lookup: impl Fn(&[u8; 32]) -> Option<Vec<u8>>,
+) -> std::collections::HashMap<[u8; 32], Vec<u8>> {
+    let mut pre_state: std::collections::HashMap<[u8; 32], Vec<u8>> =
+        std::collections::HashMap::new();
+    for m in mutations {
+        if !matches!(m.kind, xrpl_ffi::MutationKind::Modified)
+            || pre_state.contains_key(&m.key)
+        {
+            continue;
+        }
+        let pre = match overlay.get(&m.key) {
+            // Overlay slot exists: use it verbatim. A tombstone (None) means
+            // the entry was deleted earlier this ledger — the base still has
+            // the stale pre-ledger version, so it must NOT be consulted.
+            Some(slot) => slot.clone(),
+            None => base_lookup(&m.key),
+        };
+        if let Some(bytes) = pre {
+            pre_state.insert(m.key, bytes);
+        }
+    }
+    pre_state
+}
+
+pub fn mutation_kind_byte(k: &xrpl_ffi::MutationKind) -> u8 {
+    match k {
+        xrpl_ffi::MutationKind::Created => 0,
+        xrpl_ffi::MutationKind::Modified => 1,
+        xrpl_ffi::MutationKind::Deleted => 2,
+    }
+}
+
+/// Build the comparison set of (key-hex, kind-byte) from our mutations,
+/// dropping no-op Modifieds: rippled's meta-build skips entries whose post
+/// bytes equal the pre bytes (ApplyStateTable.cpp:155 — `*curNode ==
+/// *origNode`) while libxrpl still emits them via rawReplace. Only this
+/// diagnostic set is filtered — `outcome.mutations` and overlay threading
+/// are untouched. A Modified with no captured pre-state is kept.
+pub fn build_ours_mutation_set(
+    mutations: &[xrpl_ffi::SleMutation],
+    pre_state_for_modified: &std::collections::HashMap<[u8; 32], Vec<u8>>,
+) -> std::collections::HashSet<(String, u8)> {
+    mutations
+        .iter()
+        .filter(|m| {
+            if !matches!(m.kind, xrpl_ffi::MutationKind::Modified) {
+                return true;
+            }
+            match pre_state_for_modified.get(&m.key) {
+                Some(pre_bytes) => pre_bytes != &m.data, // keep iff actually changed
+                None => true, // no pre-state captured → can't tell, keep it
+            }
+        })
+        .map(|m| (hex::encode_upper(m.key), mutation_kind_byte(&m.kind)))
+        .collect()
+}
+
 pub fn apply_ledger_in_order(
     stats: &SharedFfiStats,
     txs_in_order: &[Vec<u8>],
@@ -1953,24 +2022,19 @@ pub fn apply_ledger_in_order(
             std::collections::HashMap::new();
         if expected_mutations.is_some() && should_thread {
             let ov = overlay.lock();
-            for m in &outcome.mutations {
-                if matches!(m.kind, xrpl_ffi::MutationKind::Modified)
-                    && !pre_state_for_modified.contains_key(&m.key)
-                {
-                    let pre = if let Some(entry) = ov.get(&m.key) {
-                        entry.clone()
-                    } else if let Some(snap) = db_snapshot {
-                        snap.get(&m.key).ok().flatten()
-                    } else {
-                        None
-                    };
-                    if let Some(bytes) = pre {
-                        pre_state_for_modified.insert(m.key, bytes);
-                    }
-                    // If neither overlay nor snapshot has it, we can't detect a
-                    // no-op; treat as a real divergence (false positive — rare).
-                }
-            }
+            pre_state_for_modified = capture_pre_state_for_modified(
+                &outcome.mutations,
+                &ov,
+                |k| match db_snapshot {
+                    Some(snap) => snap.get(k).ok().flatten(),
+                    // Standalone RPC path: era-pinned pre-ledger read through
+                    // the same fallback the apply's LayeredProvider used. A
+                    // key first touched by THIS tx has no overlay slot, and
+                    // without this read its no-op Modified can't be detected
+                    // — the exact "+1 ModifiedNode" phantom (F1).
+                    None => fallback.read(k).map(|b| b.to_vec()),
+                },
+            );
         }
         let prior_overlay_size;
         let mut post_overlay_size;
@@ -2271,32 +2335,13 @@ pub fn apply_ledger_in_order(
             if same_ter && (outcome.ter_name == "tesSUCCESS" || outcome.ter_name.starts_with("tec")) {
                 if let Some(net_muts) = mut_map.get(&tx_hash) {
                     use std::collections::HashSet;
-                    let kind_byte = |k: &xrpl_ffi::MutationKind| -> u8 {
-                        match k {
-                            xrpl_ffi::MutationKind::Created => 0,
-                            xrpl_ffi::MutationKind::Modified => 1,
-                            xrpl_ffi::MutationKind::Deleted => 2,
-                        }
-                    };
-                    // Filter out no-op Modifieds: rippled's meta-build skips
-                    // these (ApplyStateTable.cpp:155 — `(*curNode == *origNode)`),
-                    // but libxrpl still emits them via rawReplace. Comparing
-                    // them as "extra in ours" produces ~150/min phantom
-                    // divergences on Payment-heavy workloads. Honesty preserved
-                    // because outcome.mutations itself is unchanged — only the
-                    // diagnostic set is filtered.
-                    let ours_set: HashSet<(String, u8)> = outcome.mutations.iter()
-                        .filter(|m| {
-                            if !matches!(m.kind, xrpl_ffi::MutationKind::Modified) {
-                                return true;
-                            }
-                            match pre_state_for_modified.get(&m.key) {
-                                Some(pre_bytes) => pre_bytes != &m.data, // keep iff actually changed
-                                None => true, // no pre-state captured → can't tell, keep it
-                            }
-                        })
-                        .map(|m| (hex::encode_upper(m.key), kind_byte(&m.kind)))
-                        .collect();
+                    // No-op Modifieds are dropped from the compared set (see
+                    // build_ours_mutation_set) — rippled's meta-build skips
+                    // them, libxrpl still emits them via rawReplace. Honesty
+                    // preserved because outcome.mutations itself is unchanged
+                    // — only the diagnostic set is filtered.
+                    let ours_set: HashSet<(String, u8)> =
+                        build_ours_mutation_set(&outcome.mutations, &pre_state_for_modified);
                     let net_set: HashSet<(String, u8)> = net_muts.iter().cloned().collect();
                     if ours_set != net_set {
                         let kind_label = |b: u8| match b { 0 => "C", 1 => "M", 2 => "D", _ => "?" };

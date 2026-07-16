@@ -330,3 +330,177 @@ fn layered_none_when_both_views_empty() {
     let got = layered_succ(fake_rpc(vec![]), |_| false, None, &k(0x20), None);
     assert_eq!(got, None);
 }
+
+/// Offline tests for the no-op-Modified filter on the mutation-divergence
+/// comparison path (`ffi_engine::{capture_pre_state_for_modified,
+/// build_ours_mutation_set}`) — the same standalone-RPC apply lane the succ
+/// tests above cover, hence hosted in this (always-run, offline) binary.
+///
+/// rippled's meta-builder skips entries whose post bytes equal the pre bytes
+/// (ApplyStateTable.cpp:155 — `*curNode == *origNode`) while libxrpl still
+/// calls rawReplace, so our MutationCollector records a Modified whose bytes
+/// equal the pre-state. The compared set must drop exactly those — and ONLY
+/// those: a Modified whose pre-state can't be resolved is kept (a
+/// false-positive divergence beats a silently wrong filter), and
+/// Created/Deleted are never no-ops. Pre-state resolution mirrors the SAME
+/// layered chain the apply used: overlay slot first (a tombstone never falls
+/// through — the base still holds the stale pre-ledger version), then the
+/// base lookup (RocksDB snapshot on the DB path, era-pinned RPC fallback on
+/// the standalone path).
+#[cfg(feature = "ffi")]
+mod noop_modified_filter {
+    use std::collections::HashMap;
+    use xrpl_node::ffi_engine::{build_ours_mutation_set, capture_pre_state_for_modified};
+
+    fn sle(kind: xrpl_ffi::MutationKind, key_byte: u8, data: &[u8]) -> xrpl_ffi::SleMutation {
+        xrpl_ffi::SleMutation {
+            key: [key_byte; 32],
+            kind,
+            data: data.to_vec(),
+        }
+    }
+
+    /// F1 core: a Modified whose post bytes equal the captured pre bytes is
+    /// a no-op — rippled's meta omits it, so the compared set must drop it.
+    /// Changed Modifieds and Created/Deleted always stay.
+    #[test]
+    fn noop_modified_dropped_from_comparison_set() {
+        let muts = vec![
+            sle(xrpl_ffi::MutationKind::Modified, 0xAA, b"same-bytes"),
+            sle(xrpl_ffi::MutationKind::Modified, 0xBB, b"post-bytes"),
+            sle(xrpl_ffi::MutationKind::Created, 0xCC, b"same-bytes"),
+            sle(xrpl_ffi::MutationKind::Deleted, 0xDD, b""),
+        ];
+        let mut pre = HashMap::new();
+        pre.insert([0xAA; 32], b"same-bytes".to_vec()); // no-op
+        pre.insert([0xBB; 32], b"pre-bytes".to_vec()); // real change
+        let set = build_ours_mutation_set(&muts, &pre);
+        assert!(
+            !set.contains(&(hex::encode_upper([0xAA; 32]), 1u8)),
+            "no-op Modified must be dropped"
+        );
+        assert!(
+            set.contains(&(hex::encode_upper([0xBB; 32]), 1u8)),
+            "changed Modified must stay"
+        );
+        assert!(
+            set.contains(&(hex::encode_upper([0xCC; 32]), 0u8)),
+            "Created is never a no-op"
+        );
+        assert!(
+            set.contains(&(hex::encode_upper([0xDD; 32]), 2u8)),
+            "Deleted is never a no-op"
+        );
+        assert_eq!(set.len(), 3);
+    }
+
+    /// Invariant guard: a Modified with NO captured pre-state must be kept
+    /// (false-positive divergence beats a silently wrong filter).
+    #[test]
+    fn modified_without_prestate_kept_in_comparison_set() {
+        let muts = vec![sle(xrpl_ffi::MutationKind::Modified, 0xEE, b"bytes")];
+        let pre = HashMap::new();
+        let set = build_ours_mutation_set(&muts, &pre);
+        assert!(set.contains(&(hex::encode_upper([0xEE; 32]), 1u8)));
+    }
+
+    /// A Created whose bytes coincidentally equal some captured pre-state
+    /// must never be filtered — only Modified can be a no-op.
+    #[test]
+    fn created_with_matching_prestate_still_kept() {
+        let muts = vec![sle(xrpl_ffi::MutationKind::Created, 0xAF, b"same")];
+        let mut pre = HashMap::new();
+        pre.insert([0xAF; 32], b"same".to_vec());
+        let set = build_ours_mutation_set(&muts, &pre);
+        assert!(set.contains(&(hex::encode_upper([0xAF; 32]), 0u8)));
+    }
+
+    /// F1 regression (RPC path): a key first touched by THIS tx has no
+    /// overlay slot — pre-state must come from the base lookup (era-pinned
+    /// RPC on the standalone path). Before the fix the base was `None`
+    /// there, the no-op survived filtering, and every affected Payment
+    /// reported the "+1 ModifiedNode" phantom (ours=4 net=3).
+    #[test]
+    fn capture_prestate_consults_base_on_overlay_miss() {
+        let muts = vec![sle(xrpl_ffi::MutationKind::Modified, 0xAA, b"same-bytes")];
+        let overlay: HashMap<[u8; 32], Option<Vec<u8>>> = HashMap::new();
+        let pre = capture_pre_state_for_modified(&muts, &overlay, |key| {
+            assert_eq!(key, &[0xAA; 32]);
+            Some(b"same-bytes".to_vec())
+        });
+        assert_eq!(
+            pre.get(&[0xAA; 32]).map(Vec::as_slice),
+            Some(&b"same-bytes"[..])
+        );
+        // End-to-end: with the captured pre-state the no-op drops out.
+        let set = build_ours_mutation_set(&muts, &pre);
+        assert!(
+            set.is_empty(),
+            "no-op Modified must vanish from the compared set"
+        );
+    }
+
+    /// An overlay hit (an earlier tx in this ledger wrote the key) shadows
+    /// the base — the base lookup must not run at all.
+    #[test]
+    fn capture_prestate_overlay_hit_shadows_base() {
+        let muts = vec![sle(xrpl_ffi::MutationKind::Modified, 0xAB, b"post")];
+        let mut overlay: HashMap<[u8; 32], Option<Vec<u8>>> = HashMap::new();
+        overlay.insert([0xAB; 32], Some(b"overlay-pre".to_vec()));
+        let pre = capture_pre_state_for_modified(&muts, &overlay, |_| {
+            panic!("base must not be consulted on overlay hit")
+        });
+        assert_eq!(
+            pre.get(&[0xAB; 32]).map(Vec::as_slice),
+            Some(&b"overlay-pre"[..])
+        );
+    }
+
+    /// A tombstone (key deleted earlier this ledger) must NOT fall through
+    /// to the base — the base still holds the stale pre-ledger version. The
+    /// key stays uncaptured, so the comparison keeps the node.
+    #[test]
+    fn capture_prestate_tombstone_never_falls_through() {
+        let muts = vec![sle(xrpl_ffi::MutationKind::Modified, 0xAC, b"post")];
+        let mut overlay: HashMap<[u8; 32], Option<Vec<u8>>> = HashMap::new();
+        overlay.insert([0xAC; 32], None); // tombstone
+        let pre = capture_pre_state_for_modified(&muts, &overlay, |_| {
+            panic!("base must not be consulted past a tombstone")
+        });
+        assert!(pre.is_empty());
+    }
+
+    /// Created/Deleted mutations are never no-ops — capture must skip them
+    /// without touching the base (no wasted era-pinned RPC reads).
+    #[test]
+    fn capture_prestate_skips_created_and_deleted() {
+        let muts = vec![
+            sle(xrpl_ffi::MutationKind::Created, 0xAD, b"new"),
+            sle(xrpl_ffi::MutationKind::Deleted, 0xAE, b""),
+        ];
+        let overlay: HashMap<[u8; 32], Option<Vec<u8>>> = HashMap::new();
+        let pre = capture_pre_state_for_modified(&muts, &overlay, |_| {
+            panic!("base must not be consulted for Created/Deleted")
+        });
+        assert!(pre.is_empty());
+    }
+
+    /// The same key Modified twice in one tx's mutation list must resolve
+    /// its pre-state exactly once (first occurrence wins) — one base read,
+    /// not two.
+    #[test]
+    fn capture_prestate_dedupes_repeated_keys() {
+        let muts = vec![
+            sle(xrpl_ffi::MutationKind::Modified, 0xBA, b"post-1"),
+            sle(xrpl_ffi::MutationKind::Modified, 0xBA, b"post-2"),
+        ];
+        let overlay: HashMap<[u8; 32], Option<Vec<u8>>> = HashMap::new();
+        let calls = std::cell::Cell::new(0u32);
+        let pre = capture_pre_state_for_modified(&muts, &overlay, |_| {
+            calls.set(calls.get() + 1);
+            Some(b"pre".to_vec())
+        });
+        assert_eq!(calls.get(), 1, "base consulted exactly once per key");
+        assert_eq!(pre.len(), 1);
+    }
+}
