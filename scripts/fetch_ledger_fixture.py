@@ -54,6 +54,29 @@ def is_pseudo(blob_hex):
         return False
 
 
+def net_params(url):
+    """Network-specific apply parameters (drops) from server_state; mainnet
+    defaults on any failure. Lets fixtures from testnet/devnet replay with the
+    right network_id, fees and reserves."""
+    try:
+        req = urllib.request.Request(
+            url, data=json.dumps({"method": "server_state", "params": [{}]}).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            st = json.loads(r.read())["result"]["state"]
+        vl = st.get("validated_ledger", {})
+        return {
+            "network_id": int(st.get("network_id", 0)),
+            "base_fee_drops": int(vl.get("base_fee", 10)),
+            "reserve_drops": int(vl.get("reserve_base", 1_000_000)),
+            "increment_drops": int(vl.get("reserve_inc", 200_000)),
+        }
+    except Exception as e:
+        print(f"  (net_params fallback to mainnet defaults: {e})")
+        return {"network_id": 0, "base_fee_drops": 10,
+                "reserve_drops": 1_000_000, "increment_drops": 200_000}
+
+
 def fetch_one(url, seq, outdir):
     binres = rpc(url, "ledger", {"ledger_index": seq, "transactions": True,
                                  "expand": True, "binary": True})
@@ -68,6 +91,7 @@ def fetch_one(url, seq, outdir):
         "parent_close_time": int(parent["ledger"]["close_time"]),
         "total_drops": int(lg["total_coins"]),
     }
+    header.update(net_params(url))
 
     rows = []
     for tx in binres["ledger"]["transactions"]:

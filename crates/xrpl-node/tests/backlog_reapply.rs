@@ -149,3 +149,8 @@ backlog_test!(l105091578_replays_with_full_parity, 105091578);
 backlog_test!(l105091579_replays_with_full_parity, 105091579);
 backlog_test!(l105284279_replays_with_full_parity, 105284279);
 backlog_test!(l105284280_replays_with_full_parity, 105284280);
+
+// Scout find 2026-07-17: NFTokenAcceptOffer silent TER (tecNO_PERMISSION vs
+// mainnet tesSUCCESS) — caught by the nightly parity scout minutes after the
+// ledger closed. Armed as a fixer mission same day.
+backlog_test!(l105663160_replays_with_full_parity, 105663160);
