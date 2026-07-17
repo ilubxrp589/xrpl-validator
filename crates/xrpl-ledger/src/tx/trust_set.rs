@@ -151,6 +151,10 @@ impl Transactor for TrustSetTransactor {
             });
             sandbox.write(line_key, serde_json::to_vec(&line_obj).expect("serializing valid JSON Value"));
 
+            // A new RippleState is inserted into BOTH parties' owner directories.
+            crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &line_key);
+            crate::ledger::directory::owner_dir_insert(sandbox, &issuer, &line_key);
+
             // Increment OwnerCount for both accounts
             for id in [&tx.account, &issuer] {
                 let acct_key = keylet::account_root_key(id);
