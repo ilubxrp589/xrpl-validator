@@ -1962,6 +1962,31 @@ pub fn build_ours_mutation_set(
         .collect()
 }
 
+/// Network-specific apply parameters. Defaults are mainnet; testnet/devnet
+/// fixtures carry their own values (captured by fetch_ledger_fixture.py from
+/// `server_state`) so parity probes replay under the right rules — built for
+/// pre-training the replay lane on amendment traffic (e.g. LendingProtocol)
+/// before mainnet activation.
+pub struct NetParams {
+    pub network_id: u32,
+    pub base_fee_drops: u64,
+    pub reserve_drops: u64,
+    pub increment_drops: u64,
+}
+
+impl Default for NetParams {
+    fn default() -> Self {
+        Self {
+            network_id: 0,
+            base_fee_drops: 10,
+            reserve_drops: 1_000_000,  // Mainnet: 1 XRP
+            increment_drops: 200_000,  // Mainnet: 0.2 XRP
+        }
+    }
+}
+
+/// Mainnet-parameter wrapper — every existing caller keeps this signature.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_ledger_in_order(
     stats: &SharedFfiStats,
     txs_in_order: &[Vec<u8>],
@@ -1977,6 +2002,32 @@ pub fn apply_ledger_in_order(
     expected_outcomes: Option<&std::collections::HashMap<String, String>>,
     mutation_divergence_log: Option<&DivergenceLog>,
     expected_mutations: Option<&std::collections::HashMap<String, Vec<(String, u8)>>>,
+) -> LedgerOverlay {
+    apply_ledger_in_order_with_net(
+        stats, txs_in_order, ledger_seq, rpc_urls, amendments, parent_hash,
+        parent_close_time, total_drops, divergence_log, db_snapshot,
+        silent_divergence_log, expected_outcomes, mutation_divergence_log,
+        expected_mutations, &NetParams::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn apply_ledger_in_order_with_net(
+    stats: &SharedFfiStats,
+    txs_in_order: &[Vec<u8>],
+    ledger_seq: u32,
+    rpc_urls: &[String],
+    amendments: &[[u8; 32]],
+    parent_hash: [u8; 32],
+    parent_close_time: u32,
+    total_drops: u64,
+    divergence_log: Option<&DivergenceLog>,
+    db_snapshot: Option<&OwnedSnapshot>,
+    silent_divergence_log: Option<&DivergenceLog>,
+    expected_outcomes: Option<&std::collections::HashMap<String, String>>,
+    mutation_divergence_log: Option<&DivergenceLog>,
+    expected_mutations: Option<&std::collections::HashMap<String, Vec<(String, u8)>>>,
+    net: &NetParams,
 ) -> LedgerOverlay {
     let fallback = RpcProvider::with_endpoints(rpc_urls.to_vec(), ledger_seq.saturating_sub(1));
 
@@ -2027,9 +2078,9 @@ pub fn apply_ledger_in_order(
         parent_close_time,
         total_drops,
         parent_hash,
-        base_fee_drops: 10,
-        reserve_drops: 1_000_000,   // Mainnet: 1 XRP
-        increment_drops: 200_000,   // Mainnet: 0.2 XRP
+        base_fee_drops: net.base_fee_drops,
+        reserve_drops: net.reserve_drops,
+        increment_drops: net.increment_drops,
     };
 
     // Reset per-round stats for this ledger
@@ -2083,7 +2134,7 @@ pub fn apply_ledger_in_order(
         let outcome_opt = if let Some(snap) = db_snapshot {
             let provider = OverlayedDbProvider::new(&overlay, snap, &fallback)
                 .with_rpc_consult_budget(&ledger_rpc_budget);
-            let r = xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, 0);
+            let r = xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, net.network_id);
             // Accumulate provider counters into stats
             use std::sync::atomic::Ordering;
             let h = provider.db_hits.load(Ordering::Relaxed);
@@ -2134,7 +2185,7 @@ pub fn apply_ledger_in_order(
             r
         } else {
             let provider = LayeredProvider::new(&overlay, &fallback);
-            xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, 0)
+            xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, net.network_id)
         };
         let mut outcome = match outcome_opt {
             Some(o) => o,
@@ -2260,10 +2311,10 @@ pub fn apply_ledger_in_order(
                 let retry_opt = if let Some(snap) = db_snapshot {
                     let provider = OverlayedDbProvider::new(&overlay, snap, &fallback)
                         .with_rpc_consult_budget(&ledger_rpc_budget);
-                    xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, 0)
+                    xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, net.network_id)
                 } else {
                     let provider = LayeredProvider::new(&overlay, &fallback);
-                    xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, 0)
+                    xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, net.network_id)
                 };
                 let retry = match retry_opt {
                     Some(r) => r,

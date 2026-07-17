@@ -16,7 +16,9 @@
 
 use std::collections::HashMap;
 
-use xrpl_node::ffi_engine::{apply_ledger_in_order, fetch_mainnet_amendments, new_stats};
+use xrpl_node::ffi_engine::{
+    apply_ledger_in_order_with_net, fetch_mainnet_amendments, new_stats, NetParams,
+};
 
 const DEFAULT_RPC: &str = "https://s2.ripple.com:51234";
 
@@ -96,6 +98,19 @@ fn run() -> i32 {
         eprintln!("expected json bad parent_hash");
         return 2;
     };
+    // network params travel with the fixture (testnet/devnet pre-training);
+    // absent fields = mainnet defaults
+    let dflt = NetParams::default();
+    let net = NetParams {
+        network_id: hdr["network_id"].as_u64().unwrap_or(dflt.network_id as u64) as u32,
+        base_fee_drops: hdr["base_fee_drops"].as_u64().unwrap_or(dflt.base_fee_drops),
+        reserve_drops: hdr["reserve_drops"].as_u64().unwrap_or(dflt.reserve_drops),
+        increment_drops: hdr["increment_drops"].as_u64().unwrap_or(dflt.increment_drops),
+    };
+    if net.network_id != 0 {
+        println!("(non-mainnet fixture: network_id={} reserve={} inc={} fee={})",
+                 net.network_id, net.reserve_drops, net.increment_drops, net.base_fee_drops);
+    }
 
     let mut expected_outcomes: HashMap<String, String> = HashMap::new();
     let mut expected_mutations: HashMap<String, Vec<(String, u8)>> = HashMap::new();
@@ -131,7 +146,7 @@ fn run() -> i32 {
 
     let stats = new_stats();
     let rpc_urls = vec![rpc_url];
-    let _overlay = apply_ledger_in_order(
+    let _overlay = apply_ledger_in_order_with_net(
         &stats,
         &txs,
         seq,
@@ -146,6 +161,7 @@ fn run() -> i32 {
         Some(&expected_outcomes),
         None,
         Some(&expected_mutations),
+        &net,
     );
 
     let s = stats.lock();
