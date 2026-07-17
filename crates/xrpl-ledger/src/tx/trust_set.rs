@@ -21,16 +21,24 @@ use crate::ledger::transactor::{Transactor, TxFields, TxResult};
 pub struct TrustSetTransactor;
 
 impl TrustSetTransactor {
+    /// Decode an account id from a tx-field string. Mainnet JSON encodes the
+    /// LimitAmount issuer as a base58 classic address (`r…`); the engine's own
+    /// internal state uses 20-byte hex. Accept both so real transactions parse.
+    fn decode_issuer(s: &str) -> Option<[u8; 20]> {
+        if let Ok(bytes) = hex::decode(s) {
+            if bytes.len() == 20 {
+                let mut a = [0u8; 20];
+                a.copy_from_slice(&bytes);
+                return Some(a);
+            }
+        }
+        xrpl_core::types::AccountId::from_address(s).ok().map(|a| a.0)
+    }
+
     fn extract_limit_amount(tx: &TxFields) -> Option<(&str, [u8; 20])> {
         let limit = tx.fields.get("LimitAmount")?;
         let currency = limit.get("currency")?.as_str()?;
-        let issuer_hex = limit.get("issuer")?.as_str()?;
-        let issuer_bytes = hex::decode(issuer_hex).ok()?;
-        if issuer_bytes.len() != 20 {
-            return None;
-        }
-        let mut issuer = [0u8; 20];
-        issuer.copy_from_slice(&issuer_bytes);
+        let issuer = Self::decode_issuer(limit.get("issuer")?.as_str()?)?;
         Some((currency, issuer))
     }
 
@@ -193,6 +201,18 @@ mod tests {
             state.state_map.insert(key, serde_json::to_vec(&acct).unwrap()).unwrap();
         }
         state
+    }
+
+    #[test]
+    fn decode_issuer_accepts_hex_and_base58() {
+        let id = [0x0Au8; 20];
+        // internal-state convention: 20-byte hex
+        assert_eq!(TrustSetTransactor::decode_issuer(&hex::encode(id)), Some(id));
+        // mainnet JSON convention: base58 classic address
+        let addr = xrpl_core::types::AccountId(id).to_address();
+        assert_eq!(TrustSetTransactor::decode_issuer(&addr), Some(id));
+        // junk decodes to nothing (not a panic, not a wrong id)
+        assert_eq!(TrustSetTransactor::decode_issuer("not-an-address"), None);
     }
 
     #[test]
