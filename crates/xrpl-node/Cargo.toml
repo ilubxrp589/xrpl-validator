@@ -72,3 +72,8 @@ prost-build = "0.13"
 serde_json = { workspace = true }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 tempfile = "3"
+
+[[bin]]
+name = "parity_probe"
+path = "src/bin/parity_probe.rs"
+required-features = ["ffi"]
