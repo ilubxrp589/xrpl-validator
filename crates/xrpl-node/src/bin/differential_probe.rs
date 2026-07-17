@@ -102,6 +102,45 @@ fn load_account(state: &mut LedgerState, url: &str, addr: &str, ledger_index: u3
     let _ = state.state_map.insert(key, serde_json::to_vec(&obj).unwrap_or_default());
 }
 
+/// Recursively rewrite any base58 classic-address string (`r…`) to 20-byte hex,
+/// so a rippled-JSON ledger object matches the native engine's account-field
+/// convention (hex). Conservative: only touches strings that decode to a valid
+/// 25-byte account payload.
+fn hexify_addresses(v: &mut Value) {
+    match v {
+        Value::String(s) => {
+            if s.starts_with('r') && s.len() >= 25 && s.len() <= 40 {
+                if let Some(id) = decode_address(s) {
+                    *v = json!(hex::encode(id));
+                }
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(hexify_addresses),
+        Value::Object(m) => m.values_mut().for_each(hexify_addresses),
+        _ => {}
+    }
+}
+
+/// Load a ledger object (RippleState, Offer, Check, NFTokenOffer, DirectoryNode,
+/// …) that existed at `ledger_index` by its 64-hex ledger index, transcoded to
+/// the native account-hex convention. Objects created mid-ledger return
+/// entryNotFound and are skipped (native creates them via forward threading).
+/// This is what lets native SEE the pre-state a tx references instead of
+/// phantom-creating it (2026-07-17: the map was pessimistic without it).
+fn load_object(state: &mut LedgerState, url: &str, index_hex: &str, ledger_index: u32) {
+    let Ok(kb) = hex::decode(index_hex) else { return };
+    if kb.len() != 32 {
+        return;
+    }
+    let Some(res) = rpc(url, "ledger_entry",
+        json!({"index": index_hex, "ledger_index": ledger_index})) else { return };
+    let Some(mut node) = res.get("node").cloned() else { return }; // entryNotFound → no node
+    hexify_addresses(&mut node);
+    let mut k = [0u8; 32];
+    k.copy_from_slice(&kb);
+    let _ = state.state_map.insert(Hash256(k), serde_json::to_vec(&node).unwrap_or_default());
+}
+
 fn build_txfields(txjson: &Value) -> Option<TxFields> {
     let account = decode_address(txjson["Account"].as_str()?)?;
     let tx_type = txjson["TransactionType"].as_str()?.to_string();
@@ -296,6 +335,22 @@ fn run() -> i32 {
             }
         }
     }
+    // Load the pre-state of every object each tx MODIFIED or DELETED (existed at
+    // seq-1). Created(0) nodes didn't exist yet — native creates them. This
+    // stops native phantom-creating objects it couldn't see.
+    let mut obj_seen: HashSet<String> = HashSet::new();
+    for h in &order {
+        for node in txmap[h]["nodes"].as_array().into_iter().flatten() {
+            let (Some(key), Some(kind)) = (node[0].as_str(), node[1].as_u64()) else { continue };
+            if kind == 0 {
+                continue; // Created mid-ledger — not pre-state
+            }
+            if obj_seen.insert(key.to_string()) {
+                load_object(&mut state, &rpc_url, key, seq - 1);
+            }
+        }
+    }
+    eprintln!("Loaded {} pre-state objects.", obj_seen.len());
 
     // Per-tx native replay + compare to mainnet.
     let mut agg: HashMap<String, TypeAgg> = HashMap::new();
