@@ -80,7 +80,7 @@ fn new_page(owner: &[u8; 20], root_key: &Hash256, entry: &str, prev: u64) -> ser
 /// root is absent, a fresh single-page directory is created.
 pub fn owner_dir_insert(sandbox: &mut Sandbox, owner: &[u8; 20], object_key: &Hash256) {
     let root_key = keylet::owner_dir_key(owner);
-    let entry = hex::encode(object_key.0);
+    let entry = hex::encode_upper(object_key.0);
 
     let Some(mut root) = read_dir(sandbox, &root_key) else {
         // No directory yet — create the root page.
@@ -109,7 +109,7 @@ pub fn owner_dir_insert(sandbox: &mut Sandbox, owner: &[u8; 20], object_key: &Ha
     if !full {
         // Append to the last page (Modified). If last IS root, this writes root.
         if let Some(arr) = last.get_mut("Indexes").and_then(|v| v.as_array_mut()) {
-            if !arr.iter().any(|x| x.as_str() == Some(entry.as_str())) {
+            if !arr.iter().any(|x| x.as_str().is_some_and(|s| s.eq_ignore_ascii_case(&entry))) {
                 arr.push(serde_json::Value::String(entry));
             }
         }
@@ -147,13 +147,13 @@ fn try_remove_at(sandbox: &mut Sandbox, root_key: &Hash256, num: u64, entry: &st
     let has = page
         .get("Indexes")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().any(|x| x.as_str() == Some(entry)))
+        .map(|a| a.iter().any(|x| x.as_str().is_some_and(|s| s.eq_ignore_ascii_case(entry))))
         .unwrap_or(false);
     if !has {
         return false;
     }
     if let Some(arr) = page.get_mut("Indexes").and_then(|v| v.as_array_mut()) {
-        arr.retain(|x| x.as_str() != Some(entry));
+        arr.retain(|x| !x.as_str().is_some_and(|s| s.eq_ignore_ascii_case(entry)));
     }
     let empty = page
         .get("Indexes")
@@ -172,6 +172,26 @@ fn try_remove_at(sandbox: &mut Sandbox, root_key: &Hash256, num: u64, entry: &st
     let prev = page.get("IndexPrevious").map(page_num).unwrap_or(0);
     let next = page.get("IndexNext").map(page_num).unwrap_or(0);
     sandbox.delete(cur_key);
+    if prev == 0 && next == 0 {
+        // That was the only non-root page. If the root holds no entries of its
+        // own the whole directory dies with it (rippled cascades the delete);
+        // otherwise the root just drops its links.
+        if let Some(mut root) = read_dir(sandbox, root_key) {
+            let root_empty = root
+                .get("Indexes")
+                .and_then(|v| v.as_array())
+                .map(|a| a.is_empty())
+                .unwrap_or(true);
+            if root_empty {
+                sandbox.delete(*root_key);
+            } else {
+                root["IndexNext"] = serde_json::json!(0);
+                root["IndexPrevious"] = serde_json::json!(0);
+                sandbox.write(*root_key, serde_json::to_vec(&root).unwrap_or_default());
+            }
+        }
+        return true;
+    }
     let prev_key = page_key(root_key, prev);
     if let Some(mut pp) = read_dir(sandbox, &prev_key) {
         pp["IndexNext"] = serde_json::json!(next);
@@ -194,45 +214,56 @@ fn try_remove_at(sandbox: &mut Sandbox, root_key: &Hash256, num: u64, entry: &st
     true
 }
 
-/// Remove `object_key` from `owner`'s owner directory. rippled never walks the
-/// chain for removal: every object stores its page number (OwnerNode, or
-/// LowNode/HighNode on a RippleState) and `dirRemove` jumps straight to that
-/// page — pass it as `hint`. Falls back to a chain walk from the root when the
-/// hint is absent or stale (e.g. lines created natively without hint fields).
-/// No-op if the directory or entry is absent.
-pub fn owner_dir_remove(
+/// Remove `object_key` from the directory rooted at `root_key` (owner dir OR
+/// order-book quality dir — same page mechanics). rippled never walks the
+/// chain for removal: every object stores its page number (OwnerNode/BookNode,
+/// or LowNode/HighNode on a RippleState) and `dirRemove` jumps straight to
+/// that page — pass it as `hint`. The hint path does not require the root page
+/// to be present (for book dirs the hinted page often IS the root). Falls back
+/// to last-page-then-chain-walk from the root when the hint is absent or
+/// stale. No-op if the entry cannot be found.
+pub fn dir_remove(
     sandbox: &mut Sandbox,
-    owner: &[u8; 20],
+    root_key: &Hash256,
     object_key: &Hash256,
     hint: Option<u64>,
 ) {
-    let root_key = keylet::owner_dir_key(owner);
-    let entry = hex::encode(object_key.0);
-    let Some(root) = read_dir(sandbox, &root_key) else { return };
+    let entry = hex::encode_upper(object_key.0);
     if let Some(h) = hint {
-        if try_remove_at(sandbox, &root_key, h, &entry) {
+        if try_remove_at(sandbox, root_key, h, &entry) {
             return;
         }
     }
+    let Some(root) = read_dir(sandbox, root_key) else { return };
     // No (valid) hint: try the LAST page first — root's back-pointer. Inserts
     // always append there, so entries added earlier in the same ledger (the
     // create→delete farm pattern) are found without traversing the chain.
     let last = root.get("IndexPrevious").map(page_num).unwrap_or(0);
-    if last != 0 && hint != Some(last) && try_remove_at(sandbox, &root_key, last, &entry) {
+    if last != 0 && hint != Some(last) && try_remove_at(sandbox, root_key, last, &entry) {
         return;
     }
     let mut cur = 0u64;
     for _ in 0..100_000 {
-        if try_remove_at(sandbox, &root_key, cur, &entry) {
+        if try_remove_at(sandbox, root_key, cur, &entry) {
             return;
         }
-        let Some(page) = read_dir(sandbox, &page_key(&root_key, cur)) else { return };
+        let Some(page) = read_dir(sandbox, &page_key(root_key, cur)) else { return };
         let next = page.get("IndexNext").map(page_num).unwrap_or(0);
         if next == 0 {
             return;
         }
         cur = next;
     }
+}
+
+/// Remove `object_key` from `owner`'s owner directory. See [`dir_remove`].
+pub fn owner_dir_remove(
+    sandbox: &mut Sandbox,
+    owner: &[u8; 20],
+    object_key: &Hash256,
+    hint: Option<u64>,
+) {
+    dir_remove(sandbox, &keylet::owner_dir_key(owner), object_key, hint)
 }
 
 #[cfg(test)]
@@ -273,8 +304,8 @@ mod tests {
         assert_eq!(dir["LedgerEntryType"], "DirectoryNode");
         let idx = dir["Indexes"].as_array().unwrap();
         assert_eq!(idx.len(), 2);
-        assert_eq!(idx[0].as_str().unwrap(), hex::encode(obj_a.0));
-        assert_eq!(idx[1].as_str().unwrap(), hex::encode(obj_b.0));
+        assert_eq!(idx[0].as_str().unwrap(), hex::encode_upper(obj_a.0));
+        assert_eq!(idx[1].as_str().unwrap(), hex::encode_upper(obj_b.0));
     }
 
     #[test]

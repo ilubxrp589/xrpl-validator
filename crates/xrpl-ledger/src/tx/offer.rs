@@ -364,8 +364,33 @@ impl Transactor for OfferCancelTransactor {
 
         let offer_key = keylet::offer_key(&tx.account, offer_seq);
 
-        if sandbox.exists(&offer_key) {
+        if let Some(data) = sandbox.read(&offer_key) {
+            // Pull the offer's directory hints before deleting it: OwnerNode
+            // (page in the owner's dir), BookDirectory (root key of the order
+            // book's quality dir) and BookNode (page within it). rippled's
+            // offerDelete unlinks both directories via these hints.
+            let offer: Option<serde_json::Value> = serde_json::from_slice(&data).ok();
+            let hint = |v: Option<&serde_json::Value>| {
+                v.and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| u64::from_str_radix(s, 16).ok()))
+                })
+            };
+            let owner_node = offer.as_ref().and_then(|o| hint(o.get("OwnerNode")));
+            let book_node = offer.as_ref().and_then(|o| hint(o.get("BookNode")));
+            let book_dir = offer
+                .as_ref()
+                .and_then(|o| o.get("BookDirectory"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| hex::decode(s).ok())
+                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                .map(xrpl_core::types::Hash256);
+
             sandbox.delete(offer_key);
+            crate::ledger::directory::owner_dir_remove(sandbox, &tx.account, &offer_key, owner_node);
+            if let Some(bd) = book_dir {
+                crate::ledger::directory::dir_remove(sandbox, &bd, &offer_key, book_node);
+            }
 
             // Decrement OwnerCount
             let acct_key = keylet::account_root_key(&tx.account);

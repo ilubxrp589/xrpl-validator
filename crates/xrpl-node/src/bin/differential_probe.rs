@@ -191,6 +191,15 @@ fn native_read_keys(txj: &Value) -> Vec<String> {
             }
         }
     }
+    if txj["TransactionType"].as_str() == Some("OfferCancel") {
+        if let (Some(acct), Some(seq)) = (
+            txj["Account"].as_str().and_then(decode_address),
+            txj.get("OfferSequence").and_then(|v| v.as_u64()),
+        ) {
+            keys.push(hex::encode_upper(keylet::offer_key(&acct, seq as u32).0));
+            keys.push(hex::encode_upper(keylet::owner_dir_key(&acct).0));
+        }
+    }
     keys
 }
 
