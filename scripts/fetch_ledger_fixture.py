@@ -126,7 +126,19 @@ def fetch_one(url, seq, outdir):
                 continue
             li = inner.get("LedgerIndex")
             if li:
-                nodes.append([li.upper(), kind])
+                # Third element: mainnet's post-state for the node (NewFields
+                # for creates, FinalFields for modifies; None for deletes) plus
+                # the entry type — lets the harness ORACLE-THREAD state between
+                # txs so one transactor's gap can't contaminate the next tx's
+                # measurement.
+                post = None
+                if kind != 2:
+                    post = dict(inner.get("NewFields") or inner.get("FinalFields") or {})
+                    if post is not None and "LedgerEntryType" not in post:
+                        let = inner.get("LedgerEntryType")
+                        if let:
+                            post["LedgerEntryType"] = let
+                nodes.append([li.upper(), kind, post])
         txs[h] = {"ter": ter, "nodes": nodes}
         fields = {k: v for k, v in tx.items() if k not in ("metaData", "meta", "hash")}
         tx_json[h] = fields

@@ -194,6 +194,36 @@ fn native_read_keys(txj: &Value) -> Vec<String> {
     keys
 }
 
+/// Load the directory pages a TrustSet's line removal touches. Never walks the
+/// chain (gateway issuers have thousands of pages — a full-chain fetch is
+/// thousands of sequential RPCs): reads the line's LowNode/HighNode page
+/// hints — rippled's own no-walk design — and loads just those pages. The dir
+/// ROOT pages are already loaded via `native_read_keys`.
+fn load_trustline_hint_pages(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
+    if txj["TransactionType"].as_str() != Some("TrustSet") {
+        return;
+    }
+    let (Some(a), Some(la)) = (txj["Account"].as_str(), txj.get("LimitAmount")) else { return };
+    let (Some(i), Some(c)) = (la["issuer"].as_str(), la["currency"].as_str()) else { return };
+    let Some(res) = rpc(url, "ledger_entry", json!({
+        "ripple_state": {"accounts": [a, i], "currency": c},
+        "ledger_index": ledger_index
+    })) else { return };
+    let Some(node) = res.get("node") else { return };
+    let hint = |v: Option<&Value>| {
+        v.and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| u64::from_str_radix(s, 16).ok())))
+            .unwrap_or(0)
+    };
+    let (Some(acct), Some(issuer)) = (decode_address(a), decode_issuer(i)) else { return };
+    let (low, high) = if acct < issuer { (acct, issuer) } else { (issuer, acct) };
+    for (owner, n) in [(low, hint(node.get("LowNode"))), (high, hint(node.get("HighNode")))] {
+        if n != 0 {
+            let root = keylet::owner_dir_key(&owner);
+            load_object(state, url, &hex::encode_upper(keylet::dir_page_key(&root, n).0), ledger_index);
+        }
+    }
+}
+
 fn build_txfields(txjson: &Value) -> Option<TxFields> {
     let account = decode_address(txjson["Account"].as_str()?)?;
     let tx_type = txjson["TransactionType"].as_str()?.to_string();
@@ -415,6 +445,7 @@ fn run() -> i32 {
                 load_object(&mut state, &rpc_url, &key_hex, seq - 1);
             }
         }
+        load_trustline_hint_pages(&mut state, &rpc_url, txj, seq - 1);
     }
     eprintln!("Loaded {} pre-state objects.", obj_seen.len());
 
@@ -452,8 +483,46 @@ fn run() -> i32 {
 
         let (our_ter, mods) = native_apply_one(&state, &txf);
         let our_mut = native_mutset(&state, &mods);
-        // thread forward
+        // ORACLE THREADING: after committing native's mods (which keeps
+        // directory Indexes continuity — meta FinalFields OMIT the Indexes
+        // array), overlay mainnet's actual post-state (meta NewFields /
+        // FinalFields from the fixture) MERGED over the current bytes:
+        // oracle wins per-field, fields the meta doesn't carry survive.
+        // Plain-replace would wipe no-op-touched nodes (whose meta has no
+        // FinalFields at all) down to empty shells. This bounds cascade
+        // contamination: every field the meta records is corrected to truth
+        // before the next tx.
         let _ = apply_modifications(&mut state, mods);
+        if let Some(nodes) = net["nodes"].as_array() {
+            let mut overlay: HashMap<Hash256, SandboxEntry> = HashMap::new();
+            for n in nodes {
+                let (Some(key), Some(kind)) = (n[0].as_str(), n[1].as_u64()) else { continue };
+                let Ok(kb) = hex::decode(key) else { continue };
+                if kb.len() != 32 { continue; }
+                let mut k = [0u8; 32];
+                k.copy_from_slice(&kb);
+                let hk = Hash256(k);
+                if kind == 2 {
+                    overlay.insert(hk, SandboxEntry::Deleted);
+                    continue;
+                }
+                let Some(post) = n.get(2).filter(|v| v.is_object()) else { continue };
+                let mut post = post.clone();
+                hexify_addresses(&mut post);
+                let mut base: Value = state.state_map.lookup(&hk)
+                    .and_then(|b| serde_json::from_slice(b).ok())
+                    .unwrap_or_else(|| json!({}));
+                if let (Some(bo), Some(po)) = (base.as_object_mut(), post.as_object()) {
+                    for (fk, fv) in po {
+                        bo.insert(fk.clone(), fv.clone());
+                    }
+                }
+                if let Ok(bytes) = serde_json::to_vec(&base) {
+                    overlay.insert(hk, SandboxEntry::Modified(bytes));
+                }
+            }
+            let _ = apply_modifications(&mut state, overlay);
+        }
 
         e.attempted += 1;
         let ter_ok = our_ter == net_ter;

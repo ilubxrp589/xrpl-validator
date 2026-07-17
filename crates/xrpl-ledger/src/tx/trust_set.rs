@@ -118,10 +118,145 @@ impl Transactor for TrustSetTransactor {
                 if let Some(qout) = tx.fields.get("QualityOut") {
                     line["QualityOut"] = qout.clone();
                 }
-                sandbox.write(line_key, serde_json::to_vec(&line).expect("serializing valid JSON Value"));
+
+                // Apply the tx's tf-flags to the SENDER's side of the line
+                // (tfSetNoRipple/tfClearNoRipple/tfSetFreeze/tfClearFreeze)
+                // BEFORE the default-state test below — rippled evaluates
+                // deletability on the post-flag state.
+                {
+                    const TF_SET_NO_RIPPLE: u64 = 0x0002_0000;
+                    const TF_CLEAR_NO_RIPPLE: u64 = 0x0004_0000;
+                    const TF_SET_FREEZE: u64 = 0x0010_0000;
+                    const TF_CLEAR_FREEZE: u64 = 0x0020_0000;
+                    let txf = tx.fields.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let sender_low = tx.account < issuer;
+                    let (no_ripple_bit, freeze_bit) = if sender_low {
+                        (0x0010_0000u64, 0x0040_0000u64) // lsfLowNoRipple, lsfLowFreeze
+                    } else {
+                        (0x0020_0000u64, 0x0080_0000u64) // lsfHighNoRipple, lsfHighFreeze
+                    };
+                    let mut lf = line["Flags"].as_u64().unwrap_or(0);
+                    if txf & TF_SET_NO_RIPPLE != 0 {
+                        lf |= no_ripple_bit;
+                    } else if txf & TF_CLEAR_NO_RIPPLE != 0 {
+                        lf &= !no_ripple_bit;
+                    }
+                    if txf & TF_SET_FREEZE != 0 {
+                        lf |= freeze_bit;
+                    } else if txf & TF_CLEAR_FREEZE != 0 {
+                        lf &= !freeze_bit;
+                    }
+                    line["Flags"] = serde_json::Value::Number(lf.into());
+                }
+
+                // Default-line deletion (mirrors rippled SetTrust): after the
+                // limit update, each side keeps the line only if it still has
+                // an *interest* — a limit, a balance in its favor, quality
+                // settings, freeze, auth, or a NoRipple state differing from
+                // its account default. A side's default NoRipple is SET iff
+                // its account lacks lsfDefaultRipple, so "non-default" is the
+                // elegant `noRipple == defaultRipple`. No interest on either
+                // side + zero balance → delete the RippleState, unlink it from
+                // both owners' directories (via the line's LowNode/HighNode
+                // page hints, rippled's no-walk design), and decrement
+                // OwnerCount for each side whose reserve flag was set.
+                const LSF_LOW_RESERVE: u64 = 0x0001_0000;
+                const LSF_HIGH_RESERVE: u64 = 0x0002_0000;
+                const LSF_LOW_AUTH: u64 = 0x0004_0000;
+                const LSF_HIGH_AUTH: u64 = 0x0008_0000;
+                const LSF_LOW_NO_RIPPLE: u64 = 0x0010_0000;
+                const LSF_HIGH_NO_RIPPLE: u64 = 0x0020_0000;
+                const LSF_LOW_FREEZE: u64 = 0x0040_0000;
+                const LSF_HIGH_FREEZE: u64 = 0x0080_0000;
+                const LSF_DEFAULT_RIPPLE: u64 = 0x0080_0000; // AccountRoot flag
+
+                let flags = line["Flags"].as_u64().unwrap_or(0);
+                let bal = line["Balance"]["value"].as_str().unwrap_or("0");
+                let bal_zero = bal == "0" || bal == "-0";
+                let bal_pos = !bal_zero && !bal.starts_with('-');
+                let bal_neg = !bal_zero && bal.starts_with('-');
+                let limit_zero = |side: &str| line[side]["value"].as_str().unwrap_or("0") == "0";
+                let quality = |f: &str| line.get(f).and_then(|v| v.as_u64()).unwrap_or(0) != 0;
+                let (low_id, high_id) = if tx.account < issuer {
+                    (tx.account, issuer)
+                } else {
+                    (issuer, tx.account)
+                };
+                let default_ripple = |data: Option<&[u8]>| {
+                    data.and_then(|d| serde_json::from_slice::<serde_json::Value>(d).ok())
+                        .map(|a| a["Flags"].as_u64().unwrap_or(0) & LSF_DEFAULT_RIPPLE != 0)
+                        .unwrap_or(false)
+                };
+                let low_root = sandbox.read(&keylet::account_root_key(&low_id));
+                let high_root = sandbox.read(&keylet::account_root_key(&high_id));
+                let low_dr = default_ripple(low_root.as_deref());
+                let high_dr = default_ripple(high_root.as_deref());
+                let low_interest = !limit_zero("LowLimit")
+                    || bal_pos
+                    || quality("LowQualityIn")
+                    || quality("LowQualityOut")
+                    || ((flags & LSF_LOW_NO_RIPPLE != 0) == low_dr)
+                    || flags & (LSF_LOW_FREEZE | LSF_LOW_AUTH) != 0;
+                let high_interest = !limit_zero("HighLimit")
+                    || bal_neg
+                    || quality("HighQualityIn")
+                    || quality("HighQualityOut")
+                    || ((flags & LSF_HIGH_NO_RIPPLE != 0) == high_dr)
+                    || flags & (LSF_HIGH_FREEZE | LSF_HIGH_AUTH) != 0;
+
+                if bal_zero && !low_interest && !high_interest {
+                    let hint = |v: &serde_json::Value| -> Option<u64> {
+                        v.as_u64()
+                            .or_else(|| v.as_str().and_then(|s| u64::from_str_radix(s, 16).ok()))
+                    };
+                    let low_hint = hint(&line["LowNode"]);
+                    let high_hint = hint(&line["HighNode"]);
+                    sandbox.delete(line_key);
+                    crate::ledger::directory::owner_dir_remove(sandbox, &low_id, &line_key, low_hint);
+                    crate::ledger::directory::owner_dir_remove(sandbox, &high_id, &line_key, high_hint);
+                    // rippled touches BOTH AccountRoots at trustDelete (the
+                    // reserve payer's OwnerCount decrements; the other side is
+                    // a no-op Modified that rippled still records in the meta).
+                    // Mirror the create path's convention (which bumps both):
+                    // decrement both, keeping the pair self-consistent and the
+                    // key-set identical to mainnet's.
+                    for id in [low_id, high_id] {
+                        let acct_key = keylet::account_root_key(&id);
+                        if let Some(data) = sandbox.read(&acct_key) {
+                            if let Ok(mut acct) = serde_json::from_slice::<serde_json::Value>(&data) {
+                                let c = acct["OwnerCount"].as_u64().unwrap_or(0);
+                                acct["OwnerCount"] = serde_json::Value::Number(c.saturating_sub(1).into());
+                                sandbox.write(acct_key, serde_json::to_vec(&acct).expect("valid JSON"));
+                            }
+                        }
+                    }
+                } else {
+                    sandbox.write(line_key, serde_json::to_vec(&line).expect("serializing valid JSON Value"));
+                }
             }
         } else {
-            // Create new trust line
+            // Create new trust line. Creation flags per rippled trustCreate:
+            // the creator's side gets its reserve bit; its NoRipple bit follows
+            // the tx's tfSetNoRipple/tfClearNoRipple, defaulting to SET when
+            // the creator's account lacks lsfDefaultRipple.
+            let creation_flags = {
+                let sender_low = tx.account < issuer;
+                let reserve_bit: u64 = if sender_low { 0x0001_0000 } else { 0x0002_0000 };
+                let no_ripple_bit: u64 = if sender_low { 0x0010_0000 } else { 0x0020_0000 };
+                let txf = tx.fields.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0);
+                let creator_default_ripple = sandbox
+                    .read(&keylet::account_root_key(&tx.account))
+                    .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+                    .map(|a| a["Flags"].as_u64().unwrap_or(0) & 0x0080_0000 != 0)
+                    .unwrap_or(false);
+                let mut f = reserve_bit;
+                if txf & 0x0002_0000 != 0 {
+                    f |= no_ripple_bit; // tfSetNoRipple
+                } else if txf & 0x0004_0000 == 0 && !creator_default_ripple {
+                    f |= no_ripple_bit; // default NoRipple (no tfClearNoRipple)
+                }
+                f
+            };
             let line_obj = serde_json::json!({
                 "LedgerEntryType": "RippleState",
                 "Balance": {
@@ -147,7 +282,7 @@ impl Transactor for TrustSetTransactor {
                         "0".to_string()
                     }
                 },
-                "Flags": 0,
+                "Flags": creation_flags,
             });
             sandbox.write(line_key, serde_json::to_vec(&line_obj).expect("serializing valid JSON Value"));
 
