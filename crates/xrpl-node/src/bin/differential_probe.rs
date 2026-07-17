@@ -387,7 +387,7 @@ fn run() -> i32 {
 
     let total_attempted: u32 = agg.values().map(|a| a.attempted).sum();
     let total_matched: u32 = agg.values().map(|a| a.matched).sum();
-    println!("SUMMARY: {total_matched}/{total_attempted} attempted txs MATCH mainnet (native engine)");
+    eprintln!("SUMMARY: {total_matched}/{total_attempted} attempted txs MATCH mainnet (native engine)");
     if total_attempted == 0 {
         return 2;
     }
