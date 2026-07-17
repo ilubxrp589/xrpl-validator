@@ -49,6 +49,14 @@ fn encode_asset_to_buf(buf: &mut Vec<u8>, asset: &serde_json::Value) {
         let currency_str = asset.get("currency").and_then(|c| c.as_str()).unwrap_or("");
         let issuer_str = asset.get("issuer").and_then(|i| i.as_str()).unwrap_or("");
 
+        // XRP asset is encoded even inside an object as all zeros (the currency
+        // code "XRP" is the zero currency, NOT the ASCII bytes X/R/P). Mainnet
+        // sends XRP as {"currency":"XRP"} with no issuer.
+        if currency_str == "XRP" && issuer_str.is_empty() {
+            buf.extend_from_slice(&[0u8; 40]);
+            return;
+        }
+
         // Currency code: 3-char ISO -> 20 bytes (zeros + 3 chars at offset 12)
         let mut currency = [0u8; 20];
         if currency_str.len() == 3 {
@@ -62,10 +70,12 @@ fn encode_asset_to_buf(buf: &mut Vec<u8>, asset: &serde_json::Value) {
         }
         buf.extend_from_slice(&currency);
 
-        // Issuer: hex or base58 -> 20 bytes
+        // Issuer: hex (internal) OR base58 classic address (mainnet JSON).
         let mut issuer = [0u8; 20];
         if let Ok(bytes) = hex::decode(issuer_str) {
             if bytes.len() == 20 { issuer.copy_from_slice(&bytes); }
+        } else if let Ok(id) = xrpl_core::types::AccountId::from_address(issuer_str) {
+            issuer = id.0;
         }
         buf.extend_from_slice(&issuer);
     } else {

@@ -353,14 +353,19 @@ impl Transactor for NFTokenAcceptOfferTransactor {
             "NFTokenBuyOffer"
         };
 
-        // NFTokenSellOffer/NFTokenBuyOffer is the offer object's ledger index —
-        // a 32-byte hex string — NOT an {Account, Sequence} pair.
-        let offer_key = match tx.fields[offer_field].as_str()
-            .and_then(|s| xrpl_core::types::Hash256::from_hex(s).ok())
-        {
-            Some(k) => k,
+        let offer_ref = &tx.fields[offer_field];
+
+        // The offer reference contains {Account, Sequence} to locate the offer object
+        let offer_owner = match offer_ref.get("Account").and_then(|v| decode_account_id(v)) {
+            Some(id) => id,
             None => return TxResult::Malformed,
         };
+        let offer_seq = match offer_ref.get("Sequence").and_then(|v| v.as_u64()) {
+            Some(s) => s as u32,
+            None => return TxResult::Malformed,
+        };
+
+        let offer_key = nft_offer_key(&offer_owner, offer_seq);
 
         // Read the offer
         let offer_data = match sandbox.read(&offer_key) {
@@ -370,11 +375,6 @@ impl Transactor for NFTokenAcceptOfferTransactor {
         let offer: serde_json::Value = match serde_json::from_slice(&offer_data) {
             Ok(v) => v,
             Err(_) => return TxResult::Malformed,
-        };
-        // The offer owner comes from the offer object itself.
-        let offer_owner = match offer.get("Owner").and_then(|v| decode_account_id(v)) {
-            Some(id) => id,
-            None => return TxResult::Malformed,
         };
 
         // Bug 2: Self-accept check — you cannot accept your own offer.
