@@ -141,6 +141,59 @@ fn load_object(state: &mut LedgerState, url: &str, index_hex: &str, ledger_index
     let _ = state.state_map.insert(Hash256(k), serde_json::to_vec(&node).unwrap_or_default());
 }
 
+/// 20-byte currency code from a JSON currency string (3-char ISO or 40-hex).
+fn currency_code(iso: &str) -> [u8; 20] {
+    let mut code = [0u8; 20];
+    if iso.len() == 3 {
+        code[12..15].copy_from_slice(iso.as_bytes());
+    } else if iso.len() == 40 {
+        if let Ok(b) = hex::decode(iso) {
+            if b.len() == 20 {
+                code.copy_from_slice(&b);
+            }
+        }
+    }
+    code
+}
+
+fn decode_issuer(s: &str) -> Option<[u8; 20]> {
+    if s.starts_with('r') {
+        decode_address(s)
+    } else {
+        let b = hex::decode(s).ok()?;
+        (b.len() == 20).then(|| {
+            let mut a = [0u8; 20];
+            a.copy_from_slice(&b);
+            a
+        })
+    }
+}
+
+/// Keys the native transactor will READ that may be absent from affected-nodes
+/// (mainnet didn't modify them). Loading these prevents phantom-creates and
+/// gives the directory walk its root pages. Returned as upper-hex strings.
+/// Transactor-specific; extend as more types are hardened.
+fn native_read_keys(txj: &Value) -> Vec<String> {
+    let mut keys = Vec::new();
+    if txj["TransactionType"].as_str() == Some("TrustSet") {
+        if let (Some(acct), Some(limit)) = (
+            txj["Account"].as_str().and_then(decode_address),
+            txj.get("LimitAmount"),
+        ) {
+            if let (Some(issuer), Some(cur)) = (
+                limit.get("issuer").and_then(|v| v.as_str()).and_then(decode_issuer),
+                limit.get("currency").and_then(|v| v.as_str()),
+            ) {
+                let currency = currency_code(cur);
+                keys.push(hex::encode_upper(keylet::ripple_state_key(&acct, &issuer, &currency).0));
+                keys.push(hex::encode_upper(keylet::owner_dir_key(&acct).0));
+                keys.push(hex::encode_upper(keylet::owner_dir_key(&issuer).0));
+            }
+        }
+    }
+    keys
+}
+
 fn build_txfields(txjson: &Value) -> Option<TxFields> {
     let account = decode_address(txjson["Account"].as_str()?)?;
     let tx_type = txjson["TransactionType"].as_str()?.to_string();
@@ -347,6 +400,19 @@ fn run() -> i32 {
             }
             if obj_seen.insert(key.to_string()) {
                 load_object(&mut state, &rpc_url, key, seq - 1);
+            }
+        }
+    }
+    // Also load the pre-state of objects native READS but mainnet may not have
+    // MODIFIED (so they're absent from affected-nodes) — e.g. a TrustSet on an
+    // already-existing line that mainnet no-op'd, or a directory ROOT page
+    // native must walk. Without these, native phantom-creates them. Keys are
+    // computed from the tx (transactor-specific read-set).
+    for h in &order {
+        let Some(txj) = txjson_map.get(h) else { continue };
+        for key_hex in native_read_keys(txj) {
+            if obj_seen.insert(key_hex.clone()) {
+                load_object(&mut state, &rpc_url, &key_hex, seq - 1);
             }
         }
     }
