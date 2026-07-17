@@ -106,6 +106,8 @@ def fetch_one(url, seq, outdir):
     rows.sort()
 
     txs = {}
+    tx_json = {}       # hash -> tx fields (metaData stripped) for the native leg
+    ordered_hashes = []  # (TransactionIndex, hash) for canonical native-apply order
     for tx in jres["ledger"]["transactions"]:
         h = tx.get("hash", "").upper()
         md = tx.get("metaData") or tx.get("meta") or {}
@@ -126,6 +128,12 @@ def fetch_one(url, seq, outdir):
             if li:
                 nodes.append([li.upper(), kind])
         txs[h] = {"ter": ter, "nodes": nodes}
+        fields = {k: v for k, v in tx.items() if k not in ("metaData", "meta", "hash")}
+        tx_json[h] = fields
+        ordered_hashes.append((md.get("TransactionIndex", 0), h))
+
+    ordered_hashes.sort(key=lambda x: x[0])
+    tx_order = [h for _, h in ordered_hashes]
 
     blobs_path = f"{outdir}/l{seq}_blobs.txt"
     with open(blobs_path, "w") as f:
@@ -133,8 +141,9 @@ def fetch_one(url, seq, outdir):
             f.write(f"{idx}\t{blob}\n")
     exp_path = f"{outdir}/l{seq}_expected.json"
     with open(exp_path, "w") as f:
-        json.dump({"header": header, "txs": txs}, f, indent=0, sort_keys=True)
-    print(f"#{seq}: {len(rows)} txs -> {blobs_path}, {len(txs)} expected -> {exp_path} "
+        json.dump({"header": header, "txs": txs, "tx_json": tx_json, "tx_order": tx_order},
+                  f, indent=0, sort_keys=True)
+    print(f"#{seq}: {len(rows)} txs -> {blobs_path}, {len(txs)} expected + {len(tx_json)} tx_json -> {exp_path} "
           f"(parent {header['parent_hash'][:12]}…, pct {header['parent_close_time']})")
 
 

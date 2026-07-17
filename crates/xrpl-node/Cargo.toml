@@ -77,3 +77,8 @@ tempfile = "3"
 name = "parity_probe"
 path = "src/bin/parity_probe.rs"
 required-features = ["ffi"]
+
+[[bin]]
+name = "differential_probe"
+path = "src/bin/differential_probe.rs"
+required-features = ["ffi"]

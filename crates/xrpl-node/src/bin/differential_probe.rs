@@ -1,0 +1,395 @@
+//! differential_probe — measure the NATIVE Rust transactor engine against
+//! mainnet truth (the FFI/libxrpl path already matches, verified separately by
+//! `parity_probe` + the backlog gates).
+//!
+//! For a fixture ledger it replays every tx through the native engine
+//! (`xrpl_ledger::tx::dispatch` transactors), builds each tx's (TER, mutation
+//! key-set) exactly the way the FFI compare does — `(hex_upper(key), C/M/D
+//! byte)` with no-op-Modified filtering — and compares to the mainnet-recorded
+//! TER + AffectedNodes in the fixture. Emits a per-tx verdict and a per-type
+//! conformance aggregate.
+//!
+//! This is a MEASUREMENT instrument. It changes no native logic, merges
+//! nothing, and never touches the live validator. The native path is a
+//! documented reference implementation; this tells us, first-hand, how far it
+//! stands from parity — the input to deciding the fully-Rust roadmap.
+//!
+//! Usage: differential_probe <blobs.txt> <expected.json> [--rpc URL] [--json]
+//! Exit: 0 all attempted txs MATCH, 1 some DIVERGE, 2 fixture/setup error.
+
+#![cfg(feature = "ffi")]
+
+use std::collections::{HashMap, HashSet};
+
+use serde_json::{json, Value};
+use xrpl_core::types::Hash256;
+use xrpl_ledger::ledger::header::LedgerHeader;
+use xrpl_ledger::ledger::keylet;
+use xrpl_ledger::ledger::sandbox::{apply_modifications, Sandbox, SandboxEntry};
+use xrpl_ledger::ledger::state::LedgerState;
+use xrpl_ledger::ledger::transactor::{apply_common, TxFields, TxResult};
+use xrpl_ledger::tx::dispatch::get_transactor;
+
+const DEFAULT_RPC: &str = "https://s2.ripple.com:51234";
+
+/// Fee-only stub transactors (misc.rs `stub_transactor!`): wired but do_apply
+/// makes zero type-specific state changes. Reported as SKIP-STUB so the map is
+/// honest rather than showing them as ordinary logic divergences.
+const STUB_TYPES: &[&str] = &[
+    "TicketCreate", "OracleSet", "OracleDelete", "DIDSet", "DIDDelete",
+    "XChainCreateBridge", "XChainCreateClaimID", "XChainCommit", "XChainClaim",
+    "XChainModifyBridge", "XChainAccountCreateCommit", "XChainAddClaimAttestation",
+    "XChainAddAccountCreateAttestation", "PermissionedDomainSet",
+    "PermissionedDomainDelete", "AMMClawback", "MPTokenIssuanceCreate",
+    "MPTokenIssuanceDestroy", "MPTokenIssuanceSet", "MPTokenAuthorize",
+];
+
+/// Account-valued tx fields the native transactors expect as 20-byte hex.
+const ACCOUNT_FIELDS: &[&str] = &["Destination", "Owner", "Authorize", "Unauthorize", "RegularKey"];
+
+fn decode_address(addr: &str) -> Option<[u8; 20]> {
+    const ALPHABET: &[u8] = b"rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz";
+    let mut n: Vec<u8> = vec![0];
+    for ch in addr.bytes() {
+        let carry = ALPHABET.iter().position(|&c| c == ch)?;
+        let mut c = carry;
+        for byte in n.iter_mut().rev() {
+            c += (*byte as usize) * 58;
+            *byte = (c & 0xFF) as u8;
+            c >>= 8;
+        }
+        while c > 0 {
+            n.insert(0, (c & 0xFF) as u8);
+            c >>= 8;
+        }
+    }
+    let leading = addr.bytes().take_while(|&b| b == b'r').count();
+    let mut result = vec![0u8; leading];
+    result.extend_from_slice(&n);
+    if result.len() < 25 {
+        return None;
+    }
+    let mut id = [0u8; 20];
+    id.copy_from_slice(&result[1..21]);
+    Some(id)
+}
+
+fn rpc(url: &str, method: &str, params: Value) -> Option<Value> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .ok()?;
+    let body = client
+        .post(url)
+        .json(&json!({"method": method, "params": [params]}))
+        .send()
+        .ok()?
+        .json::<Value>()
+        .ok()?;
+    Some(body["result"].clone())
+}
+
+/// Fetch an AccountRoot at `ledger_index` and store it as native JSON (Account
+/// field converted to hex; other fields preserved for transactor fidelity).
+fn load_account(state: &mut LedgerState, url: &str, addr: &str, ledger_index: u32) {
+    let Some(id) = decode_address(addr) else { return };
+    let Some(res) = rpc(url, "account_info",
+        json!({"account": addr, "ledger_index": ledger_index})) else { return };
+    let Some(data) = res.get("account_data") else { return };
+    let mut obj = data.clone();
+    obj["Account"] = json!(hex::encode(id));
+    let key = keylet::account_root_key(&id);
+    let _ = state.state_map.insert(key, serde_json::to_vec(&obj).unwrap_or_default());
+}
+
+fn build_txfields(txjson: &Value) -> Option<TxFields> {
+    let account = decode_address(txjson["Account"].as_str()?)?;
+    let tx_type = txjson["TransactionType"].as_str()?.to_string();
+    let fee = txjson["Fee"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let sequence = txjson["Sequence"].as_u64().unwrap_or(0) as u32;
+    let ticket_seq = txjson.get("TicketSequence").and_then(|v| v.as_u64()).map(|v| v as u32);
+    let last_ledger_seq = txjson.get("LastLedgerSequence").and_then(|v| v.as_u64()).map(|v| v as u32);
+    let mut fields = txjson.clone();
+    for k in ACCOUNT_FIELDS {
+        if let Some(a) = fields.get(*k).and_then(|v| v.as_str()) {
+            if a.starts_with('r') {
+                if let Some(id) = decode_address(a) {
+                    fields[*k] = json!(hex::encode(id));
+                }
+            }
+        }
+    }
+    Some(TxFields { account, tx_type, fee, sequence, ticket_seq, last_ledger_seq, fields })
+}
+
+/// Native per-tx apply, mirroring `apply.rs::apply_transaction_set`'s per-tx
+/// branching exactly, but RETURNING (ter_string, mods) instead of committing —
+/// so the harness can build the per-tx mutation set. Caller threads the mods
+/// forward via `apply_modifications`.
+fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<Hash256, SandboxEntry>) {
+    let transactor = match get_transactor(&tx.tx_type) {
+        Some(t) => t,
+        None => {
+            let mut sb = Sandbox::new(state);
+            let r = apply_common(tx, &mut sb);
+            if r.is_success() {
+                return (TxResult::Unsupported.code_str().to_string(), sb.into_modifications());
+            }
+            return (r.code_str().to_string(), HashMap::new());
+        }
+    };
+    // Phase 1: preflight
+    let preflight = transactor.preflight(tx);
+    if !preflight.is_success() {
+        if preflight.is_claimed() {
+            let mut sb = Sandbox::new(state);
+            let common = apply_common(tx, &mut sb);
+            if common.is_success() {
+                return (preflight.code_str().to_string(), sb.into_modifications());
+            }
+            return (common.code_str().to_string(), HashMap::new());
+        }
+        return (preflight.code_str().to_string(), HashMap::new());
+    }
+    // Phase 2+3+4: preclaim → common → do_apply
+    let mut sb = Sandbox::new(state);
+    let preclaim = transactor.preclaim(tx, &sb);
+    if !preclaim.is_success() && !preclaim.is_claimed() {
+        return (preclaim.code_str().to_string(), HashMap::new());
+    }
+    if !preclaim.is_success() {
+        let common = apply_common(tx, &mut sb);
+        if common.is_success() {
+            return (preclaim.code_str().to_string(), sb.into_modifications());
+        }
+        return (common.code_str().to_string(), HashMap::new());
+    }
+    let common = apply_common(tx, &mut sb);
+    if !common.is_success() {
+        return (common.code_str().to_string(), HashMap::new());
+    }
+    let snap = sb.snapshot();
+    let applied = transactor.do_apply(tx, &mut sb);
+    if applied.is_success() {
+        (TxResult::Success.code_str().to_string(), sb.into_modifications())
+    } else if applied.is_claimed() {
+        sb.restore_snapshot(snap);
+        (applied.code_str().to_string(), sb.into_modifications())
+    } else {
+        (applied.code_str().to_string(), HashMap::new())
+    }
+}
+
+/// (hex_upper key, kind byte) set with no-op-Modified filtering (semantic JSON
+/// compare of pre vs post), matching the FFI leg's `build_ours_mutation_set`.
+fn native_mutset(
+    state: &LedgerState,
+    mods: &HashMap<Hash256, SandboxEntry>,
+) -> HashSet<(String, u8)> {
+    let mut set = HashSet::new();
+    for (key, entry) in mods {
+        let (kind, is_mod, new_bytes): (u8, bool, Option<&Vec<u8>>) = match entry {
+            SandboxEntry::Created(d) => (0, false, Some(d)),
+            SandboxEntry::Modified(d) => (1, true, Some(d)),
+            SandboxEntry::Deleted => (2, false, None),
+        };
+        if is_mod {
+            // drop no-op modifies (post == pre, semantically) — rippled meta omits them
+            if let (Some(new), Some(old)) = (new_bytes, state.state_map.lookup(key)) {
+                let pn: Option<Value> = serde_json::from_slice(new).ok();
+                let po: Option<Value> = serde_json::from_slice(old).ok();
+                if pn.is_some() && pn == po {
+                    continue;
+                }
+            }
+        }
+        set.insert((hex::encode_upper(key.0), kind));
+    }
+    set
+}
+
+struct TypeAgg {
+    attempted: u32,
+    matched: u32,
+    diverge_ter: u32,
+    diverge_mut: u32,
+    skip_stub: u32,
+    skip_unsupported: u32,
+}
+impl TypeAgg {
+    fn new() -> Self {
+        Self { attempted: 0, matched: 0, diverge_ter: 0, diverge_mut: 0, skip_stub: 0, skip_unsupported: 0 }
+    }
+}
+
+fn main() {
+    std::process::exit(run());
+}
+
+fn run() -> i32 {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 3 {
+        eprintln!("usage: differential_probe <blobs.txt> <expected.json> [--rpc URL] [--json]");
+        return 2;
+    }
+    let rpc_url = args.iter().position(|a| a == "--rpc")
+        .and_then(|i| args.get(i + 1).cloned())
+        .unwrap_or_else(|| DEFAULT_RPC.to_string());
+    let want_json = args.iter().any(|a| a == "--json");
+
+    let expected_json = match std::fs::read_to_string(&args[2]) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("expected file: {e}"); return 2; }
+    };
+    let exp: Value = match serde_json::from_str(&expected_json) {
+        Ok(v) => v,
+        Err(e) => { eprintln!("expected json parse: {e}"); return 2; }
+    };
+    let hdr = &exp["header"];
+    let seq = match hdr["ledger_seq"].as_u64() {
+        Some(s) => s as u32,
+        None => { eprintln!("missing ledger_seq"); return 2; }
+    };
+    let txmap = match exp["txs"].as_object() {
+        Some(m) => m,
+        None => { eprintln!("missing txs"); return 2; }
+    };
+    // per-tx JSON form (added by fetch_ledger_fixture.py); required for native leg
+    let txjson_map = exp["tx_json"].as_object();
+    if txjson_map.is_none() {
+        eprintln!("fixture lacks 'tx_json' — re-mint with the updated fetch_ledger_fixture.py");
+        return 2;
+    }
+    let txjson_map = txjson_map.unwrap();
+
+    // canonical order by TransactionIndex-equivalent: the tx_json carries "meta"?
+    // simplest deterministic order — sort by the tx json's "Sequence" is wrong across
+    // accounts; use the order in tx_json_order if present, else the map iteration is
+    // non-deterministic. fetch_ledger_fixture.py emits tx_order (hashes in ledger order).
+    let order: Vec<String> = exp["tx_order"].as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_else(|| txjson_map.keys().cloned().collect());
+
+    // Build native base state at seq-1 from account_info of every involved account.
+    let header = LedgerHeader {
+        sequence: seq.saturating_sub(1),
+        total_coins: hdr["total_drops"].as_u64().unwrap_or(100_000_000_000_000_000),
+        parent_hash: Hash256([0; 32]),
+        transaction_hash: Hash256([0; 32]),
+        account_hash: Hash256([0; 32]),
+        parent_close_time: hdr["parent_close_time"].as_u64().unwrap_or(0) as u32,
+        close_time: hdr["parent_close_time"].as_u64().unwrap_or(0) as u32,
+        close_time_resolution: 10,
+        close_flags: 0,
+    };
+    let mut state = LedgerState::new_unverified(header);
+
+    eprintln!("Loading involved accounts at #{} …", seq - 1);
+    let mut seen: HashSet<String> = HashSet::new();
+    for h in &order {
+        let Some(txj) = txjson_map.get(h) else { continue };
+        for k in std::iter::once("Account").chain(ACCOUNT_FIELDS.iter().copied()) {
+            if let Some(a) = txj.get(k).and_then(|v| v.as_str()) {
+                if a.starts_with('r') && seen.insert(a.to_string()) {
+                    load_account(&mut state, &rpc_url, a, seq - 1);
+                }
+            }
+        }
+    }
+
+    // Per-tx native replay + compare to mainnet.
+    let mut agg: HashMap<String, TypeAgg> = HashMap::new();
+    let mut per_tx: Vec<Value> = Vec::new();
+    let mut any_diverge = false;
+
+    for h in &order {
+        let Some(txj) = txjson_map.get(h) else { continue };
+        let tx_type = txj["TransactionType"].as_str().unwrap_or("?").to_string();
+        let net = &txmap[h];
+        let net_ter = net["ter"].as_str().unwrap_or("?").to_string();
+        let net_mut: HashSet<(String, u8)> = net["nodes"].as_array()
+            .map(|a| a.iter().filter_map(|n| Some((n[0].as_str()?.to_string(), n[1].as_u64()? as u8))).collect())
+            .unwrap_or_default();
+
+        let e = agg.entry(tx_type.clone()).or_insert_with(TypeAgg::new);
+
+        if get_transactor(&tx_type).is_none() {
+            e.skip_unsupported += 1;
+            per_tx.push(json!({"hash": h, "type": tx_type, "verdict": "SKIP-UNSUPPORTED"}));
+            continue;
+        }
+        if STUB_TYPES.contains(&tx_type.as_str()) {
+            e.skip_stub += 1;
+            per_tx.push(json!({"hash": h, "type": tx_type, "verdict": "SKIP-STUB"}));
+            continue;
+        }
+        let Some(txf) = build_txfields(txj) else {
+            e.skip_unsupported += 1;
+            per_tx.push(json!({"hash": h, "type": tx_type, "verdict": "SKIP-PARSE"}));
+            continue;
+        };
+
+        let (our_ter, mods) = native_apply_one(&state, &txf);
+        let our_mut = native_mutset(&state, &mods);
+        // thread forward
+        let _ = apply_modifications(&mut state, mods);
+
+        e.attempted += 1;
+        let ter_ok = our_ter == net_ter;
+        let mut_ok = our_mut == net_mut;
+        let verdict = if ter_ok && mut_ok {
+            e.matched += 1; "MATCH"
+        } else if !ter_ok {
+            e.diverge_ter += 1; any_diverge = true; "DIVERGE-TER"
+        } else {
+            e.diverge_mut += 1; any_diverge = true; "DIVERGE-MUT"
+        };
+        let missing: Vec<String> = net_mut.difference(&our_mut)
+            .map(|(k, b)| format!("{}:{}", &k[..k.len().min(12)], b)).take(8).collect();
+        let extra: Vec<String> = our_mut.difference(&net_mut)
+            .map(|(k, b)| format!("{}:{}", &k[..k.len().min(12)], b)).take(8).collect();
+        per_tx.push(json!({
+            "hash": h, "type": tx_type, "verdict": verdict,
+            "our_ter": our_ter, "net_ter": net_ter,
+            "our_muts": our_mut.len(), "net_muts": net_mut.len(),
+            "missing_in_ours": missing, "extra_in_ours": extra,
+        }));
+    }
+
+    // Report
+    if want_json {
+        let types: Vec<Value> = agg.iter().map(|(t, a)| json!({
+            "type": t, "attempted": a.attempted, "matched": a.matched,
+            "diverge_ter": a.diverge_ter, "diverge_mut": a.diverge_mut,
+            "skip_stub": a.skip_stub, "skip_unsupported": a.skip_unsupported,
+        })).collect();
+        println!("{}", json!({"ledger_seq": seq, "per_type": types, "per_tx": per_tx}));
+    } else {
+        println!("\n=== native conformance for #{seq} ===");
+        let mut names: Vec<&String> = agg.keys().collect();
+        names.sort();
+        for t in names {
+            let a = &agg[t];
+            println!("  {:<22} attempted={:<3} MATCH={:<3} DIVERGE-TER={:<3} DIVERGE-MUT={:<3} stub={:<3} unsup={}",
+                t, a.attempted, a.matched, a.diverge_ter, a.diverge_mut, a.skip_stub, a.skip_unsupported);
+        }
+        println!("  --- per-tx divergences ---");
+        for r in &per_tx {
+            let v = r["verdict"].as_str().unwrap_or("");
+            if v.starts_with("DIVERGE") {
+                println!("  {} {} {}   our_ter={} net_ter={} our_muts={} net_muts={} missing={:?} extra={:?}",
+                    v, r["type"].as_str().unwrap_or(""), &r["hash"].as_str().unwrap_or("")[..12],
+                    r["our_ter"].as_str().unwrap_or(""), r["net_ter"].as_str().unwrap_or(""),
+                    r["our_muts"], r["net_muts"], r["missing_in_ours"], r["extra_in_ours"]);
+            }
+        }
+    }
+
+    let total_attempted: u32 = agg.values().map(|a| a.attempted).sum();
+    let total_matched: u32 = agg.values().map(|a| a.matched).sum();
+    println!("SUMMARY: {total_matched}/{total_attempted} attempted txs MATCH mainnet (native engine)");
+    if total_attempted == 0 {
+        return 2;
+    }
+    if any_diverge { 1 } else { 0 }
+}
