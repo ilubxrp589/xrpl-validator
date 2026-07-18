@@ -546,7 +546,29 @@ impl RpcProvider {
     /// failure stores nothing — succ() then falls back to the `ledger_data`
     /// walk, i.e. behaves exactly as before this feature.
     pub fn prefetch_nft_pages_for_tx(&self, tx_bytes: &[u8]) {
-        for owner in crate::nft_pages::parse_nft_page_owners(tx_bytes) {
+        let mut owners = crate::nft_pages::parse_nft_page_owners(tx_bytes);
+        // Second stage, NFTokenAcceptOffer only: the tx names the offer(s) by
+        // index and nothing else, so the account whose pages the apply path
+        // actually walks — the offer's sfOwner — is reachable only THROUGH the
+        // offer object. An offer index is its own ledger key, so read it here
+        // (pinned to the pre-ledger index like every other read) and fold the
+        // owners it names into the same prefetch. Missing/other-typed keys
+        // contribute nothing: absent stays absent.
+        for offer_key in crate::nft_pages::parse_nft_offer_refs(tx_bytes) {
+            let sle = match self.read_with_outcome(&offer_key) {
+                RpcReadOutcome::Hit(bytes) => bytes.to_vec(),
+                // entryNotFound: the offer genuinely is not there (rippled will
+                // return tecOBJECT_NOT_FOUND on its own). Exhausted: unknown —
+                // seeding nothing leaves succ on its pre-existing fallback.
+                RpcReadOutcome::EntryNotFound | RpcReadOutcome::Exhausted(_) => continue,
+            };
+            for owner in crate::nft_pages::parse_nftoffer_owners(&sle) {
+                if !owners.contains(&owner) {
+                    owners.push(owner);
+                }
+            }
+        }
+        for owner in owners {
             if self.nft_pages.lock().iter().any(|p| p.owner == owner) {
                 continue;
             }

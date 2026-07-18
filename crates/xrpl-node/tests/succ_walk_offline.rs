@@ -516,8 +516,8 @@ mod nft_page_prefetch {
     use std::collections::BTreeSet;
     use xrpl_node::nft_pages::{
         collect_owner_pages, interval_within_owner, nftpage_max, nftpage_max_next, nftpage_min,
-        owner_of_page_key, parse_account_objects_pages, parse_nft_page_owners, succ_from_pages,
-        NftSuccAnswer, OwnerNftPages,
+        owner_of_page_key, parse_account_objects_pages, parse_nft_offer_refs, parse_nft_page_owners,
+        parse_nftoffer_owners, succ_from_pages, NftSuccAnswer, OwnerNftPages,
     };
 
     /// An owner AccountID whose 20 bytes are all `byte`.
@@ -823,6 +823,156 @@ mod nft_page_prefetch {
             parse_nft_page_owners(&tx),
             vec![account],
             "Account found after fixed-width, VL and STArray fields"
+        );
+    }
+
+    // ---- accept-offer second stage --------------------------------------
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    /// Serialize a minimal NFTokenAcceptOffer: TransactionType 29 plus the
+    /// given (field_code, index) Hash256 (type 5) fields. Field codes 28/29
+    /// exceed the 4-bit nibble, so they take the two-byte header form.
+    fn accept_tx(refs: &[(u8, [u8; 32])]) -> Vec<u8> {
+        let mut out = vec![0x12, 0x00, 0x1D];
+        for (field, id) in refs {
+            out.push(0x50); // Hash256, field code in the next byte
+            out.push(*field);
+            out.extend_from_slice(id);
+        }
+        out
+    }
+
+    /// Serialize a minimal NFTokenOffer SLE: LedgerEntryType 0x0037 plus the
+    /// given (field_code, account) AccountID fields.
+    fn offer_sle(let_code: u16, accounts: &[(u8, [u8; 20])]) -> Vec<u8> {
+        let mut out = vec![0x11]; // UInt16 / LedgerEntryType (1,1)
+        out.extend_from_slice(&let_code.to_be_bytes());
+        for (field, id) in accounts {
+            out.push(0x80 | field);
+            out.push(20);
+            out.extend_from_slice(id);
+        }
+        out
+    }
+
+    fn idx(byte: u8) -> [u8; 32] {
+        [byte; 32]
+    }
+
+    /// The mission fixture: mainnet #105663160 tx 5CCAAE13…, an unbrokered
+    /// sell-offer accept. It names ONE account (the acceptor) and reaches the
+    /// seller only through sfNFTokenSellOffer — the exact shape that left the
+    /// seller's pages invisible and tripped tecNO_PERMISSION.
+    #[test]
+    fn extracts_sell_offer_ref_from_mainnet_accept_blob() {
+        let tx = unhex(
+            "12001D230606B5832404CF77B0201B064C4ACA501D9F45612FCDB9A2742F51786E\
+             D6E6F5474F89E918A7C9950F45197E00766FA85E68400000000000000C732102C1\
+             D03B002DB355ADACC0B332AFB71FC7F6A74C94BE8D315919E2894E9F3FED4A7446\
+             304402202229D0CD968AD72F4A05DB46090E0381D2385703A68C19435A753B7ED4\
+             D6508402206B22E1E8FFF271322BE6A9DF0E9DD420C8A3F7DAD45AC145D1EB3FD9\
+             C2A9CE828114505BAC84B255340C73750E990A8634D5D2E609E8F9EA7D14436C61\
+             696D204E4654202D207872702E63616665E1F1"
+                .replace(['\n', ' ', '\\'], "")
+                .as_str(),
+        );
+        assert_eq!(
+            parse_nft_offer_refs(&tx),
+            vec![<[u8; 32]>::try_from(unhex(
+                "9F45612FCDB9A2742F51786ED6E6F5474F89E918A7C9950F45197E00766FA85E"
+            ))
+            .unwrap()],
+            "sfNFTokenSellOffer recovered across SourceTag/Sequence/Fee/VL sig/Memos"
+        );
+        // Stage one still sees only the acceptor — hence the need for stage two.
+        assert_eq!(
+            parse_nft_page_owners(&tx),
+            vec![<[u8; 20]>::try_from(unhex("505BAC84B255340C73750E990A8634D5D2E609E8")).unwrap()],
+            "the tx names the acceptor and nobody else"
+        );
+    }
+
+    #[test]
+    fn brokered_accept_yields_both_legs() {
+        let buy = idx(0xB1);
+        let sell = idx(0x5E);
+        assert_eq!(
+            parse_nft_offer_refs(&accept_tx(&[(28, buy), (29, sell)])),
+            vec![buy, sell],
+            "brokered mode pairs a buy and a sell offer; both owners need pages"
+        );
+    }
+
+    #[test]
+    fn offer_refs_ignore_other_tx_types_and_junk() {
+        let sell = idx(0x5E);
+        // Only NFTokenAcceptOffer (29) carries these fields.
+        for tt in [25u16, 26, 27, 28, 0, 30] {
+            let mut tx = vec![0x12];
+            tx.extend_from_slice(&tt.to_be_bytes());
+            tx.extend_from_slice(&[0x50, 29]);
+            tx.extend_from_slice(&sell);
+            assert!(
+                parse_nft_offer_refs(&tx).is_empty(),
+                "tt {tt} must not trigger an offer read"
+            );
+        }
+        assert!(parse_nft_offer_refs(&[]).is_empty(), "empty blob");
+        assert!(
+            parse_nft_offer_refs(&[0x12, 0x00, 0x1D, 0x50, 29, 0xAA]).is_empty(),
+            "truncated Hash256 — abandon rather than guess"
+        );
+        assert!(
+            parse_nft_offer_refs(&accept_tx(&[(29, [0u8; 32])])).is_empty(),
+            "zero index is not a real offer; never probe for it"
+        );
+        // A Hash256 in some other field is not an offer reference.
+        assert!(
+            parse_nft_offer_refs(&accept_tx(&[(20, idx(0x77))])).is_empty(),
+            "field 20 (PreviousTxnID) is not an offer handle"
+        );
+    }
+
+    #[test]
+    fn offer_sle_yields_owner_and_destination() {
+        let seller = owner(0xD1);
+        let broker = owner(0xD2);
+        assert_eq!(
+            parse_nftoffer_owners(&offer_sle(0x0037, &[(2, seller), (3, broker)])),
+            vec![seller, broker],
+            "sfOwner is the account findToken walks; sfDestination may be a broker"
+        );
+        assert_eq!(
+            parse_nftoffer_owners(&offer_sle(0x0037, &[(2, seller)])),
+            vec![seller],
+            "an unrestricted offer names only its owner"
+        );
+    }
+
+    #[test]
+    fn non_offer_objects_contribute_no_owners() {
+        let acct = owner(0xD1);
+        // 0x0071 = ltOffer, 0x0061 = ltAccountRoot, 0x0050 = ltNFTokenPage.
+        for lt in [0x0071u16, 0x0061, 0x0050] {
+            assert!(
+                parse_nftoffer_owners(&offer_sle(lt, &[(2, acct)])).is_empty(),
+                "LedgerEntryType {lt:#06x} is not an NFTokenOffer — no owner harvested"
+            );
+        }
+        assert!(parse_nftoffer_owners(&[]).is_empty(), "absent object stays absent");
+        assert!(
+            parse_nftoffer_owners(&[0x11, 0x00]).is_empty(),
+            "truncated LedgerEntryType"
+        );
+        assert!(
+            parse_nftoffer_owners(&offer_sle(0x0037, &[(2, [0u8; 20])])).is_empty(),
+            "zero account dropped"
         );
     }
 }
