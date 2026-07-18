@@ -41,9 +41,9 @@ fn nftoken_object_key(account: &[u8; 20], taxon: u32, sequence: u32) -> xrpl_cor
 /// Compute a deterministic key for an NFToken offer.
 /// Reuses the offer keylet space but with a different discriminator.
 fn nft_offer_key(account: &[u8; 20], sequence: u32) -> xrpl_core::types::Hash256 {
-    // Use the standard offer_key — NFT offers in our simplified model
-    // share the offer space but that's fine since account+sequence is unique.
-    keylet::offer_key(account, sequence)
+    // NFT offers live in their own keyspace (0x0071 'q'), NOT the DEX offer
+    // space — mainnet-verified against #105666725.
+    keylet::nft_offer_key(account, sequence)
 }
 
 /// Helper: read an account, increment OwnerCount, write back.
@@ -308,6 +308,29 @@ impl Transactor for NFTokenCreateOfferTransactor {
 
         sandbox.write(offer_key, serde_json::to_vec(&offer_obj).unwrap());
         increment_owner_count(&tx.account, sandbox);
+
+        // The offer is inserted into the creator's owner directory AND the
+        // token's buy/sell offer directory (rooted on the NFTokenID keylet,
+        // created on first offer for that token+side).
+        crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &offer_key);
+        if let Some(nft_id) = tx.fields.get("NFTokenID").and_then(|v| v.as_str())
+            .and_then(|s| hex::decode(s).ok())
+            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+        {
+            let nft_id = xrpl_core::types::Hash256(nft_id);
+            let dir_root = if is_sell {
+                keylet::nft_sell_offers_key(&nft_id)
+            } else {
+                keylet::nft_buy_offers_key(&nft_id)
+            };
+            crate::ledger::directory::dir_insert(sandbox, &dir_root, None, &offer_key);
+        }
+        // Mainnet meta also touches the Destination's AccountRoot (no-op
+        // Modified) when the offer names one. OwnerCount bump = the
+        // key-granularity touch convention (value fidelity deferred).
+        if let Some(dest) = tx.fields.get("Destination").and_then(decode_account_id) {
+            increment_owner_count(&dest, sandbox);
+        }
 
         TxResult::Success
     }

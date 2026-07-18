@@ -143,6 +143,35 @@ pub fn check_key(account_id: &[u8; 20], sequence: u32) -> Hash256 {
     sha512_half(&buf)
 }
 
+/// Compute the state tree key for an NFTokenOffer.
+/// `key = SHA512Half(0x0071 || account_id || sequence_be32)` — namespace 'q',
+/// distinct from DEX offers ('o'). Mainnet-verified against #105666725.
+pub fn nft_offer_key(account_id: &[u8; 20], sequence: u32) -> Hash256 {
+    let mut buf = [0u8; 26];
+    buf[..2].copy_from_slice(&[0x00, 0x71]);
+    buf[2..22].copy_from_slice(account_id);
+    buf[22..26].copy_from_slice(&sequence.to_be_bytes());
+    sha512_half(&buf)
+}
+
+/// Root key of the buy-offer directory for a token:
+/// `SHA512Half(0x0068 || NFTokenID)` (namespace 'h'). Mainnet-verified.
+pub fn nft_buy_offers_key(nft_id: &Hash256) -> Hash256 {
+    let mut buf = [0u8; 34];
+    buf[..2].copy_from_slice(&[0x00, 0x68]);
+    buf[2..34].copy_from_slice(&nft_id.0);
+    sha512_half(&buf)
+}
+
+/// Root key of the sell-offer directory for a token:
+/// `SHA512Half(0x0069 || NFTokenID)` (namespace 'i').
+pub fn nft_sell_offers_key(nft_id: &Hash256) -> Hash256 {
+    let mut buf = [0u8; 34];
+    buf[..2].copy_from_slice(&[0x00, 0x69]);
+    buf[2..34].copy_from_slice(&nft_id.0);
+    sha512_half(&buf)
+}
+
 /// Compute the state tree key for a DepositPreauth.
 /// `key = SHA512Half(0x0070 || account_id || authorized_id)`
 pub fn deposit_preauth_key(account_id: &[u8; 20], authorized: &[u8; 20]) -> Hash256 {

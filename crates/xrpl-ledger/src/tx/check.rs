@@ -115,13 +115,21 @@ impl Transactor for CheckCreateTransactor {
         });
         sandbox.write(check_key, serde_json::to_vec(&check_obj).unwrap());
 
-        // Increment OwnerCount on sender
-        let acct_key = keylet::account_root_key(&tx.account);
-        if let Some(data) = sandbox.read(&acct_key) {
-            if let Ok(mut acct) = serde_json::from_slice::<serde_json::Value>(&data) {
-                let count = acct["OwnerCount"].as_u64().unwrap_or(0);
-                acct["OwnerCount"] = serde_json::Value::Number((count + 1).into());
-                sandbox.write(acct_key, serde_json::to_vec(&acct).unwrap());
+        // A Check is inserted into BOTH the sender's and the destination's
+        // owner directories (rippled dirInsert both sides), and mainnet's meta
+        // touches the destination's AccountRoot as well (no-op Modified).
+        // OwnerCount bump on both mirrors the TrustSet create convention —
+        // key-set-correct; value fidelity (sender-only reserve) deferred.
+        crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &check_key);
+        crate::ledger::directory::owner_dir_insert(sandbox, &dest, &check_key);
+        for id in [&tx.account, &dest] {
+            let acct_key = keylet::account_root_key(id);
+            if let Some(data) = sandbox.read(&acct_key) {
+                if let Ok(mut acct) = serde_json::from_slice::<serde_json::Value>(&data) {
+                    let count = acct["OwnerCount"].as_u64().unwrap_or(0);
+                    acct["OwnerCount"] = serde_json::Value::Number((count + 1).into());
+                    sandbox.write(acct_key, serde_json::to_vec(&acct).unwrap());
+                }
             }
         }
 

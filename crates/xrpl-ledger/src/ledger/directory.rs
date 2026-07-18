@@ -58,28 +58,38 @@ fn read_dir(sandbox: &Sandbox, key: &Hash256) -> Option<serde_json::Value> {
         .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
 }
 
-fn new_page(owner: &[u8; 20], root_key: &Hash256, entry: &str, prev: u64) -> serde_json::Value {
-    serde_json::json!({
+fn new_page(owner: Option<&[u8; 20]>, root_key: &Hash256, entry: &str, prev: u64) -> serde_json::Value {
+    let mut page = serde_json::json!({
         "LedgerEntryType": "DirectoryNode",
         "Flags": 0,
-        "Owner": hex::encode(owner),
         "RootIndex": hex::encode(root_key.0),
         "Indexes": [entry],
         "IndexPrevious": prev,
         "IndexNext": 0,
-    })
+    });
+    if let Some(o) = owner {
+        page["Owner"] = serde_json::Value::String(hex::encode(o));
+    }
+    page
 }
 
-/// Insert `object_key` into `owner`'s owner directory, walking the page chain
+/// Insert `object_key` into the directory rooted at `root_key` (owner dir OR an
+/// NFT buy/sell offer dir — same page mechanics), walking the page chain
 /// (rippled appends to the last page, spilling to a new page when full). Touches
 /// exactly the pages mainnet does: append → the last page (Modified); overflow →
 /// the last page (Modified) + root (Modified) + a new page (Created).
 ///
 /// Requires the directory ROOT page to be present in the pre-state so the walk
 /// can start (the differential harness loads it via `native_read_keys`). If the
-/// root is absent, a fresh single-page directory is created.
-pub fn owner_dir_insert(sandbox: &mut Sandbox, owner: &[u8; 20], object_key: &Hash256) {
-    let root_key = keylet::owner_dir_key(owner);
+/// root is absent, a fresh single-page directory is created. `owner` only
+/// shapes new-page content (token dirs carry no Owner field).
+pub fn dir_insert(
+    sandbox: &mut Sandbox,
+    root_key: &Hash256,
+    owner: Option<&[u8; 20]>,
+    object_key: &Hash256,
+) {
+    let root_key = *root_key;
     let entry = hex::encode_upper(object_key.0);
 
     let Some(mut root) = read_dir(sandbox, &root_key) else {
@@ -135,6 +145,11 @@ pub fn owner_dir_insert(sandbox: &mut Sandbox, owner: &[u8; 20], object_key: &Ha
         root["IndexPrevious"] = serde_json::json!(new_num);
         sandbox.write(root_key, serde_json::to_vec(&root).unwrap_or_default());
     }
+}
+
+/// Insert `object_key` into `owner`'s owner directory. See [`dir_insert`].
+pub fn owner_dir_insert(sandbox: &mut Sandbox, owner: &[u8; 20], object_key: &Hash256) {
+    dir_insert(sandbox, &keylet::owner_dir_key(owner), Some(owner), object_key)
 }
 
 /// Try to remove `entry` from page `num` of the directory rooted at `root_key`.

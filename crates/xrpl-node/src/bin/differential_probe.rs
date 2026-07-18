@@ -200,6 +200,33 @@ fn native_read_keys(txj: &Value) -> Vec<String> {
             keys.push(hex::encode_upper(keylet::owner_dir_key(&acct).0));
         }
     }
+    if txj["TransactionType"].as_str() == Some("CheckCreate") {
+        if let (Some(acct), Some(dest)) = (
+            txj["Account"].as_str().and_then(decode_address),
+            txj.get("Destination").and_then(|v| v.as_str()).and_then(decode_address),
+        ) {
+            keys.push(hex::encode_upper(keylet::owner_dir_key(&acct).0));
+            keys.push(hex::encode_upper(keylet::owner_dir_key(&dest).0));
+        }
+    }
+    if txj["TransactionType"].as_str() == Some("NFTokenCreateOffer") {
+        if let Some(acct) = txj["Account"].as_str().and_then(decode_address) {
+            keys.push(hex::encode_upper(keylet::owner_dir_key(&acct).0));
+        }
+        if let Some(nft_id) = txj.get("NFTokenID").and_then(|v| v.as_str())
+            .and_then(|s| hex::decode(s).ok())
+            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+        {
+            let nft_id = Hash256(nft_id);
+            let sell = txj.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & 1 != 0;
+            let root = if sell {
+                keylet::nft_sell_offers_key(&nft_id)
+            } else {
+                keylet::nft_buy_offers_key(&nft_id)
+            };
+            keys.push(hex::encode_upper(root.0));
+        }
+    }
     keys
 }
 
