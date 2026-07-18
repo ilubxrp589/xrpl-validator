@@ -301,9 +301,12 @@ fn is_nft_tx_type(tt: u16) -> bool {
 ///
 /// Over-collecting is safe and deliberate: an account with no pages costs
 /// one `account_objects` call and yields an authoritative empty set. Under-
-/// collecting silently drops us back to the cold walk. `NFTokenAcceptOffer`
-/// is the known gap — the token owner lives in the referenced offer object,
-/// not in the tx — so it is covered only when the tx names the owner.
+/// collecting silently drops us back to the cold walk.
+///
+/// `NFTokenAcceptOffer` names NO token owner: it references the offer(s) by
+/// index only, so this returns just the acceptor. The seller/buyer behind
+/// those offers is recovered in a second stage — see
+/// `parse_nft_offer_refs` + `parse_nftoffer_owners`.
 ///
 /// Returns empty for non-NFT tx types and for anything malformed; prefetch
 /// is best-effort and a skipped prefetch is exactly the pre-existing
@@ -346,6 +349,114 @@ fn parse_nft_page_owners_inner(tx: &[u8]) -> Option<Vec<[u8; 20]>> {
         pos = skip_value(tx, pos, type_code)?;
     }
     if !tt_matched {
+        return None;
+    }
+    Some(owners)
+}
+
+/// `sfNFTokenBuyOffer` (Hash256, field 28) and `sfNFTokenSellOffer`
+/// (Hash256, field 29) of an `NFTokenAcceptOffer`, in that order.
+///
+/// These are the ONLY handle the tx carries on the accounts whose NFT pages
+/// the apply path walks. rippled's `NFTokenAcceptOffer::preclaim` reads each
+/// referenced `NFTokenOffer`, then calls `nft::findToken(view, offer[sfOwner],
+/// offer[sfNFTokenID])` to prove the seller still holds the token — a page
+/// walk over an owner the tx never names. With that owner's pages invisible,
+/// `findToken` legitimately comes up empty and the guard fires
+/// `tecNO_PERMISSION` against a half-visible world, even though the offer
+/// object itself reads back fine (a direct `read`, not a `succ` probe).
+///
+/// An offer index IS its ledger key: `keylet::nftoffer(id)` is `{ltNFTokenOffer,
+/// id}`, so no derivation is needed — the caller reads these keys directly.
+///
+/// Empty for every other tx type and for anything malformed; a skipped
+/// prefetch is the pre-existing (cold, never wrong) behaviour. Brokered mode
+/// carries BOTH fields and both are returned — the token moves seller→buyer
+/// and each leg's owner needs its pages.
+pub fn parse_nft_offer_refs(tx: &[u8]) -> Vec<[u8; 32]> {
+    parse_nft_offer_refs_inner(tx).unwrap_or_default()
+}
+
+fn parse_nft_offer_refs_inner(tx: &[u8]) -> Option<Vec<[u8; 32]>> {
+    let mut pos = 0usize;
+    let mut tt_matched = false;
+    let mut refs: Vec<[u8; 32]> = Vec::new();
+    while pos < tx.len() {
+        let (type_code, field_code, header_len) = read_field_header(tx, pos)?;
+        pos += header_len;
+        if type_code == 1 && field_code == 2 {
+            let bytes = tx.get(pos..pos + 2)?;
+            // 29 = NFTokenAcceptOffer. No other tx type carries these fields.
+            if u16::from_be_bytes([bytes[0], bytes[1]]) != 29 {
+                return None;
+            }
+            tt_matched = true;
+            pos += 2;
+            continue;
+        }
+        if type_code == 5 && (field_code == 28 || field_code == 29) {
+            let bytes = tx.get(pos..pos + 32)?;
+            let mut id = [0u8; 32];
+            id.copy_from_slice(bytes);
+            // The zero index is not a real offer; never probe for it.
+            if id != [0u8; 32] && !refs.contains(&id) {
+                refs.push(id);
+            }
+        }
+        pos = skip_value(tx, pos, type_code)?;
+    }
+    if !tt_matched {
+        return None;
+    }
+    Some(refs)
+}
+
+/// Every AccountID an `NFTokenOffer` SLE names — `sfOwner` (the side that
+/// holds the token for a sell offer, or wants it for a buy offer) and
+/// `sfDestination` (a broker or a restricted counterparty).
+///
+/// Guarded on `sfLedgerEntryType == 0x0037` (`ltNFTokenOffer`) so a key that
+/// resolves to some other object — or to nothing — contributes no owners
+/// rather than a garbage AccountID that would waste an `account_objects`
+/// round trip. Over-collecting within a real offer stays safe for the same
+/// reason as `parse_nft_page_owners`: a page-less account yields an
+/// authoritative empty set.
+pub fn parse_nftoffer_owners(sle: &[u8]) -> Vec<[u8; 20]> {
+    parse_nftoffer_owners_inner(sle).unwrap_or_default()
+}
+
+fn parse_nftoffer_owners_inner(sle: &[u8]) -> Option<Vec<[u8; 20]>> {
+    let mut pos = 0usize;
+    let mut is_offer = false;
+    let mut owners: Vec<[u8; 20]> = Vec::new();
+    while pos < sle.len() {
+        let (type_code, field_code, header_len) = read_field_header(sle, pos)?;
+        pos += header_len;
+        if type_code == 1 && field_code == 1 {
+            let bytes = sle.get(pos..pos + 2)?;
+            if u16::from_be_bytes([bytes[0], bytes[1]]) != 0x0037 {
+                return None;
+            }
+            is_offer = true;
+            pos += 2;
+            continue;
+        }
+        if type_code == 8 {
+            let (len, consumed) = read_vl(sle, pos)?;
+            if len == 20 {
+                let bytes = sle.get(pos + consumed..pos + consumed + 20)?;
+                let mut id = [0u8; 20];
+                id.copy_from_slice(bytes);
+                if id != [0u8; 20] && !owners.contains(&id) {
+                    owners.push(id);
+                }
+            }
+            pos += consumed + len;
+            continue;
+        }
+        pos = skip_value(sle, pos, type_code)?;
+    }
+    if !is_offer {
         return None;
     }
     Some(owners)
