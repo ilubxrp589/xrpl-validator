@@ -196,6 +196,29 @@ pub fn apply_common(tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
             None => return TxResult::Malformed,
         };
         acct["Sequence"] = serde_json::Value::Number(next_seq.into());
+    } else {
+        // Consuming a Ticket (rippled SeqProxy consumption): delete the Ticket
+        // object, unlink it from the owner directory via its OwnerNode hint,
+        // and decrement OwnerCount + TicketCount. Mainnet-verified shape
+        // (#105663160 ticketed cancels): Ticket Deleted + its dir page
+        // Modified + AccountRoot {Balance, OwnerCount, TicketCount}.
+        let tk = keylet::ticket_key(&tx.account, tx.ticket_seq.unwrap_or(0));
+        if let Some(td) = sandbox.read(&tk) {
+            let hint = serde_json::from_slice::<serde_json::Value>(&td)
+                .ok()
+                .and_then(|t| {
+                    t.get("OwnerNode").and_then(|v| {
+                        v.as_u64()
+                            .or_else(|| v.as_str().and_then(|s| u64::from_str_radix(s, 16).ok()))
+                    })
+                });
+            sandbox.delete(tk);
+            crate::ledger::directory::owner_dir_remove(sandbox, &tx.account, &tk, hint);
+            let oc = acct["OwnerCount"].as_u64().unwrap_or(0);
+            acct["OwnerCount"] = serde_json::Value::Number(oc.saturating_sub(1).into());
+            let tc = acct["TicketCount"].as_u64().unwrap_or(0);
+            acct["TicketCount"] = serde_json::Value::Number(tc.saturating_sub(1).into());
+        }
     }
 
     // Write back

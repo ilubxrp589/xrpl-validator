@@ -143,6 +143,17 @@ pub fn check_key(account_id: &[u8; 20], sequence: u32) -> Hash256 {
     sha512_half(&buf)
 }
 
+/// Compute the state tree key for a Ticket.
+/// `key = SHA512Half(0x0054 || account_id || ticket_sequence_be32)` — 'T'.
+/// Mainnet-verified against #105663160's ticketed cancels.
+pub fn ticket_key(account_id: &[u8; 20], ticket_seq: u32) -> Hash256 {
+    let mut buf = [0u8; 26];
+    buf[..2].copy_from_slice(&[0x00, 0x54]);
+    buf[2..22].copy_from_slice(account_id);
+    buf[22..26].copy_from_slice(&ticket_seq.to_be_bytes());
+    sha512_half(&buf)
+}
+
 /// Compute the state tree key for an NFTokenOffer.
 /// `key = SHA512Half(0x0071 || account_id || sequence_be32)` — namespace 'q',
 /// distinct from DEX offers ('o'). Mainnet-verified against #105666725.

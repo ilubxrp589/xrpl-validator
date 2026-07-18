@@ -3188,15 +3188,33 @@
 "nodes": [
 [
 "5CBA71CDAA7587DFB428C3DA470F8F1A183F568D035844B77CD9347F09B7856B",
-1
+1,
+{
+"Account": "r5FaJQWQ8SD14Q7pVuPqVZsBPfkgofhSs",
+"Balance": "409946898",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 49,
+"Sequence": 101285550,
+"TicketCount": 40
+}
 ],
 [
 "802F5BFF19AEADBCAFE1B78D964C77F5A34846FBDE1F43BE194315DECACF130A",
-2
+2,
+null
 ],
 [
 "AABC0190290AC1ACCAB6179A75CFC6262F1FC50EAC7ABBA0ADFE6B0FF37F7653",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "900",
+"IndexPrevious": "2a2",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "r5FaJQWQ8SD14Q7pVuPqVZsBPfkgofhSs",
+"RootIndex": "1E2AC4CBA83B0775994F930C364C8B5A4CA9B80216CAFC5DA9CEA3AF61E030FF"
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -3205,7 +3223,16 @@
 "nodes": [
 [
 "648F878026B385EE546DE24CA1B5F4775F87603BCCCBD9AA8E4E9C605E265671",
-1
+1,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"Balance": "13998912",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 10,
+"Sequence": 104005467,
+"TicketCount": 10
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -3214,7 +3241,16 @@
 "nodes": [
 [
 "A961DEC00B34D9BE47A82FD23C72C1C550CC562F722E82BE797B06C2AC7BF5EC",
-1
+1,
+{
+"Account": "rtLMG8Qc4wDjqrdBz3vVhbXwu7PG4N3RQ",
+"Balance": "24038937",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 20,
+"Sequence": 102163559,
+"TicketCount": 20
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -3223,15 +3259,33 @@
 "nodes": [
 [
 "3510D1B98F5F1F6B26A05871857CCD69EA2D13DC730A3162BE5DC2BCC94D2ACB",
-2
+2,
+null
 ],
 [
 "723995B979D579FF40FB38B689E94C505D6147055AD3824F8018DD05BBEC20CD",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "19",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rJg42tap9FMTQdjZqeZYvjsrgTunZ4r3co",
+"RootIndex": "709289EDEADDB1AE7E4684809FDBC4360E73F9B565F2ABEE192ADBAE64C2D754"
+}
 ],
 [
 "CBC8D43D4E6B21A8D250A202016AE1504FBFCAEA6E98EB50C3769C1976C84135",
-1
+1,
+{
+"Account": "rJg42tap9FMTQdjZqeZYvjsrgTunZ4r3co",
+"Balance": "14030910",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 15,
+"Sequence": 100115296,
+"TicketCount": 15
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -3240,7 +3294,16 @@
 "nodes": [
 [
 "03DCC82D0D5A395C65D997CE35BF56318E89C61869562ED081721DA5B4D6B2B8",
-1
+1,
+{
+"Account": "rhehuzGheCFoAUxvjRea58P6Rrf1GJzn9G",
+"Balance": "409502913",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 31,
+"Sequence": 101283979,
+"TicketCount": 31
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -3249,7 +3312,16 @@
 "nodes": [
 [
 "B82567EE35193438A70DF51376980FF2D5E5122E58FEDA72384284A79E35F27B",
-1
+1,
+{
+"Account": "rUeGuHYuWeaPgvNPWCudG2t6PXHd6PZQL5",
+"Balance": "114000182",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 45,
+"Sequence": 104000494,
+"TicketCount": 45
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -3258,7 +3330,16 @@
 "nodes": [
 [
 "7BFECAC6437F5BDF066A13DC77A6A10D52705192E04BDF2E15C1F46A8346D0EB",
-1
+1,
+{
+"Account": "rnBMq5qMmapAASbkTcghKxfH3bctuTm5E9",
+"Balance": "13998062",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 17,
+"Sequence": 104020303,
+"TicketCount": 17
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -3267,7 +3348,16 @@
 "nodes": [
 [
 "FD672B5E610DBDD96C30A85B651D6AEC852D2E8BD9CAF1B070A73B19DF780E19",
-1
+1,
+{
+"Account": "rwigBPN9DWpgnNZJLdH4EW9h5NegiJZgsd",
+"Balance": "13999816",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 20,
+"Sequence": 99831728,
+"TicketCount": 20
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -3276,11 +3366,29 @@
 "nodes": [
 [
 "2FE0DA0C7455A2BA88842141F7BAEDF9C1114BA2E3011941D942AAC284682D39",
-1
+1,
+{
+"Account": "rKJsuQcu4j75zPy7rwhMtWohagxzBZnTqy",
+"Balance": "9964672",
+"FirstNFTokenSequence": 105648576,
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"MintedNFTokens": 7,
+"OwnerCount": 5,
+"Sequence": 105650014
+}
 ],
 [
 "8882E0F800E1D2B059D52B1A27310620DAA446A1437E081A21AC30896675F9C5",
-1
+1,
+{
+"Account": "rJPPTuwzuM2duJ7dDEqoTQGAqPTFeFY4GQ",
+"Balance": "5144438455",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 0,
+"Sequence": 96682075
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -3289,27 +3397,63 @@
 "nodes": [
 [
 "1371BCEED87E4C5C53C442854276A5ABB5D41F635AB7C4475A2103E40CD75A6E",
-2
+2,
+null
 ],
 [
 "1371BCEED87E4C5C53C442854276A5ABB5D41F635AB7C4475A2103E4DABCB323",
-0
+0,
+{
+"ExchangeRate": "5a2103e4dabcb323",
+"LedgerEntryType": "DirectoryNode",
+"RootIndex": "1371BCEED87E4C5C53C442854276A5ABB5D41F635AB7C4475A2103E4DABCB323",
+"TakerGetsCurrency": "5553444300000000000000000000000000000000",
+"TakerGetsIssuer": "06AA7798F7A8FA6914CC1E82C556E5B0A0CCB9E3"
+}
 ],
 [
 "1ED8DDFD80F275CB1CE7F18BB9D906655DE8029805D8B95FB9020B30425821EB",
-1
+1,
+{
+"Account": "rBTwLga3i2gz3doX6Gva3MgEV8ZCD8jjah",
+"Balance": "249283211797",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 19,
+"Sequence": 262948133
+}
 ],
 [
 "66C53333869B2245205F097AE1E621F8FEB51D1EF39A62C9056AEC88F3E33139",
-2
+2,
+null
 ],
 [
 "8F57377AFD8C6A567D72FFE38FD11A45FF0F94A5F799D5F5DF26EA30803B3CAE",
-0
+0,
+{
+"Account": "rBTwLga3i2gz3doX6Gva3MgEV8ZCD8jjah",
+"BookDirectory": "1371BCEED87E4C5C53C442854276A5ABB5D41F635AB7C4475A2103E4DABCB323",
+"LedgerEntryType": "Offer",
+"OwnerNode": "1",
+"Sequence": 262948132,
+"TakerGets": {
+"currency": "5553444300000000000000000000000000000000",
+"issuer": "rcEGREd8NmkKRE8GE424sksyt1tJVFZwu",
+"value": "1076083.9"
+},
+"TakerPays": "1000000000000"
+}
 ],
 [
 "965F3CFB4ED7BF2C62BF6578649B7AA22FDA96FF7EE7BB943EA1AED0CC2E050E",
-1
+1,
+{
+"Flags": 0,
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rBTwLga3i2gz3doX6Gva3MgEV8ZCD8jjah",
+"RootIndex": "0A2600D85F8309FE7F75A490C19613F1CE0C37483B856DB69B8140154C2335F3"
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -3318,7 +3462,16 @@
 "nodes": [
 [
 "49019F93407A7023A8A1419F366948E2728BBC9F14F5862DFE347CD50B2A3AE4",
-1
+1,
+{
+"Account": "rGgNuC3J2NVym5RHJw9kK1pPB6tFt5CdRc",
+"Balance": "13999932",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 21,
+"Sequence": 99828810,
+"TicketCount": 21
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -3327,179 +3480,450 @@
 "nodes": [
 [
 "002274F181F6E60C6317E86697CC6CAFD9CEF1ACD1421C0D9B88A91D1055739F",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908109
+}
 ],
 [
 "0EF47C59B86B8ED3791229597D2EF79E9F7C0284D5FBB46A220F588B70D1808E",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908101
+}
 ],
 [
 "136573CB7990A6AFDC6AF11F651FB3BC04533EB4907FEC32DD41CC01FCCBCF86",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908106
+}
 ],
 [
 "18DD0DE7D771AD74F70D77519C9A6B27C5DFE23A265791C0B928A7FEDF8C09A1",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908098
+}
 ],
 [
 "19456547555351F534B192933553829CD658945CA7E7014C91593CB5C61A41A8",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908083
+}
 ],
 [
 "1CFB8F8EF435179E65FD8D72D41040BF856D60347A1353519138A2994EAEA6C4",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908097
+}
 ],
 [
 "24337AF053FF6155D3C908EE3BC11C79259D60764A9DA347F2B84A4710B14B78",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908102
+}
 ],
 [
 "251B30C8FDEFF033568726659BB242F7B763F2CAC994A346E71D32D3BE9558E7",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908104
+}
 ],
 [
 "288F6D1BA95CDEA94A90F1BD4BA4232EC8ECDA089F99D99A2BFB8101C39EE567",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "3a",
+"TicketSequence": 99908116
+}
 ],
 [
 "28E261EEE43FB2E3FD094D2A14C9B79F816155E7431A8D803559BF085941D904",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908093
+}
 ],
 [
 "2EB297E9055CB1A8F77FBC87E6218BA769F03D48539070E35A19A90964D63E98",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "3a",
+"TicketSequence": 99908117
+}
 ],
 [
 "3405276C7C610F7AF47065C31D56E5B2A74BF292D743EEAE764AA19C12659A0D",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "3a",
+"IndexPrevious": "14",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"RootIndex": "ACBC61203A14E106FD12869B0714CF01C2ADFB39064C6B32081105291E4E6808"
+}
 ],
 [
 "411D320D6E11F307E12D8FB7CC169EB4F4866A47A5FBA7D6DD649C394D908BB2",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908095
+}
 ],
 [
 "4214A18D6F09930561056121DFA2980D956E169763279B72C4547FBD8B01B354",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908082
+}
 ],
 [
 "489538E5D7CF8F984A26B8C4931A2A24853597B4CB3D8B4615C40CCACDAEFCB2",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908107
+}
 ],
 [
 "4AEE9B45718F9C7ED84E064579260F46BBFD70D0B65B3DB9EAA7023F39E39EB3",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "3a",
+"TicketSequence": 99908110
+}
 ],
 [
 "4BF89E2CC1A37EFAB65D278A45CC1A795596F3C5AD5114182F8A133700DF1EF1",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908091
+}
 ],
 [
 "50DD81F043360A9A5746C6F0E34AC77B4C91C668758E9C97F0987F409FF6FE4C",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "3a",
+"TicketSequence": 99908115
+}
 ],
 [
 "51B0D48D850D6B2EDD816BC6E45438CCA7804CFE3C2FF7791601ED959BDB560A",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908088
+}
 ],
 [
 "581F7C7B76E1CFCC7F380751F9743FC1E0A2F85012B8DF01F23C513ED0A2972C",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "3a",
+"TicketSequence": 99908114
+}
 ],
 [
 "5B37BA73653123600B3E7E228B2ED0FB81C1B7912337D95031760813F5BD2676",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908108
+}
 ],
 [
 "5BD48323163EF69BA904FD92A6FE19CF11F88A9861706D0AFC95FA11C257ECDE",
-0
+0,
+{
+"IndexPrevious": "39",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"RootIndex": "ACBC61203A14E106FD12869B0714CF01C2ADFB39064C6B32081105291E4E6808"
+}
 ],
 [
 "711DBAD565DFF9B3A9F7E1357E5DB80B711CAF79E8FCB13E677AEB3AA8EDE9E2",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908096
+}
 ],
 [
 "74193086E270499B6166D343BFC08F6AB86007E50F23F0351EE166D849C42481",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "3a",
+"TicketSequence": 99908111
+}
 ],
 [
 "7906F4919796584446510A7FD1C91C7A6BDD972E5697BE91C985E425D1A82F09",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908105
+}
 ],
 [
 "7B55213ED5C06FCE7E82F2972FDAF512CB8F550D642BA7DD694BE44B4F8B238D",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908085
+}
 ],
 [
 "7C91419BD7B6ACC31BDCBF2F191301D657196C7EB8B0E4ACEAC1511B6D80ABF3",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908086
+}
 ],
 [
 "81793347BBC685962E6445BCDD6B4902A6332376CC3159D03A353864404F4792",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908087
+}
 ],
 [
 "882594BD76639E62B463B75E26F8475CC178BDB68310459C358456223288711E",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908094
+}
 ],
 [
 "89AA7BB209884A7784B5F8F9CCEB26F0F68E26E0C8C966F25438E7FA71C632CF",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908092
+}
 ],
 [
 "8D650EF99D934F29FCEA5F989EB62F3AD7D76BEA6CD835D7B574F91655C1CD8C",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "3a",
+"TicketSequence": 99908121
+}
 ],
 [
 "9816A1D7121DE7CCE6B7075BB544F28162E8559DC09009AB27E06F66CF8C4363",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908103
+}
 ],
 [
 "99BDCA390059B408E54D281F24B3EE0798CEAAF015D50AF00E45A28E829EC0E5",
-1
+1,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"Balance": "13998200",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 50,
+"Sequence": 99908122,
+"TicketCount": 50
+}
 ],
 [
 "A5DD62022C1C9DB89FD9B7773806CEE06D6721D2307D6A37BBE58703C7C18636",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908084
+}
 ],
 [
 "ACBC61203A14E106FD12869B0714CF01C2ADFB39064C6B32081105291E4E6808",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "11",
+"IndexPrevious": "3a",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"RootIndex": "ACBC61203A14E106FD12869B0714CF01C2ADFB39064C6B32081105291E4E6808"
+}
 ],
 [
 "B8F69E11E8F8E170A4A2957C186A63B3F8EF1F421B3CF736FEBF627C1CEDB910",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "3a",
+"TicketSequence": 99908118
+}
 ],
 [
 "C35055F4FCE132518BD6A0863CF1DBA7CFCEB95E6123DC63E5DBB31F2EE7EC5D",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "3a",
+"TicketSequence": 99908112
+}
 ],
 [
 "C38875E2F0A1FCFE73FF38E2F6ACA1B6D848DE8D9C8979802AA60137A54148AE",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "3a",
+"TicketSequence": 99908113
+}
 ],
 [
 "CB3B54525734F81A9340CC5158858382F085A28B8CB223EB520B9B28769572DC",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908100
+}
 ],
 [
 "CBEAB73AA69A66F9D8D0E5DC324544C5339AEA7A19A355944032DE2F4C61ACBB",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "3a",
+"TicketSequence": 99908119
+}
 ],
 [
 "D8D73081B783C3143FE8BB916B2C68B206FE481F2EF4707809EEA53599359A24",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908089
+}
 ],
 [
 "E72C459B80B2DA1CA17843597CCE46DA73A00DA02F3CCEB4236005D1838B0544",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908090
+}
 ],
 [
 "EDD183DEDF46D1F70AA5FBEA3C64B229E5E416970B62C28336102729FF06E352",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "3a",
+"TicketSequence": 99908120
+}
 ],
 [
 "FA5D53D8F70EAC2D2722F0E8E724E115AF6EFAB52FF54BEA0286AA57C1DA26D4",
-0
+0,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "39",
+"TicketSequence": 99908099
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -3508,15 +3932,32 @@
 "nodes": [
 [
 "49AC8C4604017742707B7797202CEACE7F9C83A52454759AFD64E5B3565D32ED",
-1
+1,
+{
+"Flags": 0,
+"IndexPrevious": "3",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rV9gn4pFY5N4jqPsHSsiQeHESxNUFY3nV",
+"RootIndex": "09E3454708553E8593BA9BF80EBDB5EB22ACD2B21465147C891C1DE67C4DA1D2"
+}
 ],
 [
 "CB21A4466FD48E705BB304051551F480C2EC6B081218A2692240EE2A2509F4FA",
-2
+2,
+null
 ],
 [
 "CC7AB6D90F01BC63C18ABDE48234A4E97A9EA947D0655924E73C6EF7FD0D06FC",
-1
+1,
+{
+"Account": "rV9gn4pFY5N4jqPsHSsiQeHESxNUFY3nV",
+"Balance": "14118688",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 39,
+"Sequence": 104017341,
+"TicketCount": 39
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -3525,27 +3966,63 @@
 "nodes": [
 [
 "1ED8DDFD80F275CB1CE7F18BB9D906655DE8029805D8B95FB9020B30425821EB",
-1
+1,
+{
+"Account": "rBTwLga3i2gz3doX6Gva3MgEV8ZCD8jjah",
+"Balance": "249283211817",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 19,
+"Sequence": 262948131
+}
 ],
 [
 "882990397FEB23F129466E68C77404B8151A8ECC821C9BB9DE0A2BBFF88D0C19",
-2
+2,
+null
 ],
 [
 "965F3CFB4ED7BF2C62BF6578649B7AA22FDA96FF7EE7BB943EA1AED0CC2E050E",
-1
+1,
+{
+"Flags": 0,
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rBTwLga3i2gz3doX6Gva3MgEV8ZCD8jjah",
+"RootIndex": "0A2600D85F8309FE7F75A490C19613F1CE0C37483B856DB69B8140154C2335F3"
+}
 ],
 [
 "B4E34B1DF24D71392CBC79B80C00E40670A17030A37A46C9A1B233EBF488F2DF",
-0
+0,
+{
+"Account": "rBTwLga3i2gz3doX6Gva3MgEV8ZCD8jjah",
+"BookDirectory": "F0B9A528CE25FE77C51C38040A7FEC016C2C841E74C1418D5A20CA34991AD190",
+"LedgerEntryType": "Offer",
+"OwnerNode": "1",
+"Sequence": 262948130,
+"TakerGets": {
+"currency": "USD",
+"issuer": "rhub8VRN55s94qWKDv6jmDy1pUykJzF3wq",
+"value": "1083479.2"
+},
+"TakerPays": "1000000000000"
+}
 ],
 [
 "F0B9A528CE25FE77C51C38040A7FEC016C2C841E74C1418D5A20CA34991AD190",
-0
+0,
+{
+"ExchangeRate": "5a20ca34991ad190",
+"LedgerEntryType": "DirectoryNode",
+"RootIndex": "F0B9A528CE25FE77C51C38040A7FEC016C2C841E74C1418D5A20CA34991AD190",
+"TakerGetsCurrency": "0000000000000000000000005553440000000000",
+"TakerGetsIssuer": "2ADB0B3959D60A6E6991F729E1918B7163925230"
+}
 ],
 [
 "F0B9A528CE25FE77C51C38040A7FEC016C2C841E74C1418D5A20CA3596F9346A",
-2
+2,
+null
 ]
 ],
 "ter": "tesSUCCESS"
@@ -3554,15 +4031,33 @@
 "nodes": [
 [
 "142AE2ED5591A6A50660C908015BE28F95EF917FD1296AD5B92466E79B4D9BE2",
-2
+2,
+null
 ],
 [
 "3405276C7C610F7AF47065C31D56E5B2A74BF292D743EEAE764AA19C12659A0D",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "14",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"RootIndex": "ACBC61203A14E106FD12869B0714CF01C2ADFB39064C6B32081105291E4E6808"
+}
 ],
 [
 "99BDCA390059B408E54D281F24B3EE0798CEAAF015D50AF00E45A28E829EC0E5",
-1
+1,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"Balance": "13998230",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 10,
+"Sequence": 99908079,
+"TicketCount": 10
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -3571,7 +4066,16 @@
 "nodes": [
 [
 "CBC8D43D4E6B21A8D250A202016AE1504FBFCAEA6E98EB50C3769C1976C84135",
-1
+1,
+{
+"Account": "rJg42tap9FMTQdjZqeZYvjsrgTunZ4r3co",
+"Balance": "14030930",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 16,
+"Sequence": 100115295,
+"TicketCount": 16
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -3580,7 +4084,15 @@
 "nodes": [
 [
 "F77A1B028C41AC1983C8DB3695F276EB531AF7C9C8908695E1357A9444F60A2C",
-1
+1,
+{
+"Account": "rpqJ2fsoeCYZ8Ftf7YCaRdx8ULaoyVvTmL",
+"Balance": "2161642",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 10,
+"Sequence": 94027381
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -3589,11 +4101,27 @@
 "nodes": [
 [
 "8EB322D489D5899DE90DD1F9A1F5CC541D3261B4BE25279F6F018FDF6D5C20C8",
-1
+1,
+{
+"Account": "rJGb4etn9GSwNHYVu7dNMbdiVgzqxaTSUG",
+"Balance": "193781659",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 1,
+"Sequence": 86622820
+}
 ],
 [
 "8FDEA8FB637D94ECFC863AF374F302F099745ADD050420CB8FF55BE3E5D567D4",
-1
+1,
+{
+"Account": "ra3nZF5nqfaWAFiajXh97AHw9rSNQg9hjC",
+"Balance": "395858597",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 13,
+"Sequence": 92477839
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -3602,7 +4130,16 @@
 "nodes": [
 [
 "E21CDA5E58137BC5C4A08461604AF8C6DBCA824CA5648CFE86432101B0A3B766",
-1
+1,
+{
+"Account": "rnJ1hb5qF36Nwdhvzpa8quMos4FtYRzrMq",
+"Balance": "32041972",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 69,
+"Sequence": 95620750,
+"TicketCount": 17
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -3611,7 +4148,16 @@
 "nodes": [
 [
 "DFB55DE47511B116439003E8203D6BC98FD9ABCBBEADC11FA6C9FB39F232280B",
-1
+1,
+{
+"Account": "rKNRrawfVS59C3tN1bBiUWc5wZQAfUPh7z",
+"Balance": "14026275",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 15,
+"Sequence": 104018046,
+"TicketCount": 15
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -3620,15 +4166,33 @@
 "nodes": [
 [
 "38B20A04D569D4B56E747E4EA15DF41CFFC698C3BA602CD547A1E7DACADCFBE7",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "a",
+"IndexPrevious": "8",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rLF2oRBVSscD3s49rZwh3vCY1BJYySK4hj",
+"RootIndex": "FD7C46273DEDF47BDD789CA01D5766C81E3908C69952777B0937A8DCC1F4457E"
+}
 ],
 [
 "48F8278676432A63F256C7A4BA9775AB59FA9702E26FEFF60902FDA823E3CA2A",
-1
+1,
+{
+"Account": "rLF2oRBVSscD3s49rZwh3vCY1BJYySK4hj",
+"Balance": "13998006",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 23,
+"Sequence": 104021239,
+"TicketCount": 23
+}
 ],
 [
 "79D3AC20C3CEF1FE84B42589CCDD6674EF58EF489A38C767D84ACFED00EC06C6",
-2
+2,
+null
 ]
 ],
 "ter": "tecKILLED"
@@ -3637,15 +4201,33 @@
 "nodes": [
 [
 "35A8A51804C801DD75305C4C476B1D8472EF35AA3948B65048F1A7E58ED0630F",
-2
+2,
+null
 ],
 [
 "CCEB69CC87156C8C898C01F11B27AFD58A1773B06A015367A344AF10F0623EC1",
-1
+1,
+{
+"Account": "rpWRUueYU5z92iKZyT8CAavebUC8b3BCwf",
+"Balance": "13998706",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 15,
+"Sequence": 104000461,
+"TicketCount": 15
+}
 ],
 [
 "E1CFF6A26FF8EA421341A89CCED6F6AA04D834FED6B9CDCF0CDBF48A0814A4C2",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rpWRUueYU5z92iKZyT8CAavebUC8b3BCwf",
+"RootIndex": "CA9E73AF640EA58835480FC2312FA738B08AA58302FDCECDC13472905617E352"
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -3654,7 +4236,15 @@
 "nodes": [
 [
 "B71DBB1083A1C5CD51C007530C5E8D62A1FB2B24574D9BB16D1BAD895A021AE7",
-1
+1,
+{
+"Account": "rLbWXbGeLRPjWTiZyvvZnawPYkUhf2vcxm",
+"Balance": "1299950",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 1,
+"Sequence": 105202019
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -3663,7 +4253,16 @@
 "nodes": [
 [
 "CBC8D43D4E6B21A8D250A202016AE1504FBFCAEA6E98EB50C3769C1976C84135",
-1
+1,
+{
+"Account": "rJg42tap9FMTQdjZqeZYvjsrgTunZ4r3co",
+"Balance": "14030920",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 16,
+"Sequence": 100115296,
+"TicketCount": 16
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -3672,7 +4271,16 @@
 "nodes": [
 [
 "BA0E26B7A712FD7C3B2D6306BD6041B0782436B93F1C7346A2187BAE2A08A8A3",
-1
+1,
+{
+"Account": "r3oKq23fV6HxnUgEWV9epzf1hPhi5Be7nA",
+"Balance": "13999842",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 11,
+"Sequence": 104001818,
+"TicketCount": 11
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -3681,31 +4289,97 @@
 "nodes": [
 [
 "1B7F0DD36E9BD75BA723FC983172F391B1DCE1FDAF813595F29BE92E76AD3C29",
-2
+2,
+null
 ],
 [
 "39AA5E1A390B26A30DFC5776C9F5E15BAC2D86C23C4FF1CF28C16CFE7DD7E55B",
-1
+1,
+{
+"Flags": 0,
+"LedgerEntryType": "DirectoryNode",
+"Owner": "r9QCg3thXBUrn4eZpyBVdL6rCM2FvQiMdJ",
+"RootIndex": "39AA5E1A390B26A30DFC5776C9F5E15BAC2D86C23C4FF1CF28C16CFE7DD7E55B"
+}
 ],
 [
 "60595453A48FF2EA32B512C4BD2FFEFCDA18F8396E9CEBA723A13F45C2CE5AA2",
-1
+1,
+{
+"Account": "r9QCg3thXBUrn4eZpyBVdL6rCM2FvQiMdJ",
+"Balance": "14199988",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 1,
+"Sequence": 98757120
+}
 ],
 [
 "860F5FD104089E3C3ED85940539889E0135693C89042D2875A0D71552F19ABC8",
-2
+2,
+null
 ],
 [
 "A2F06E138575F0DC4367A56A34B4D997D1E76B714313F71B8D0E791FD4FDB7D0",
-1
+1,
+{
+"Balance": {
+"currency": "54415A5A00000000000000000000000000000000",
+"issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji",
+"value": "38.32859565646529"
+},
+"Flags": 1114112,
+"HighLimit": {
+"currency": "54415A5A00000000000000000000000000000000",
+"issuer": "rDyzRLTk4eqYMJ86esHK5HPs1QHTJzjXwC",
+"value": "0"
+},
+"HighNode": "14",
+"LedgerEntryType": "RippleState",
+"LowLimit": {
+"currency": "54415A5A00000000000000000000000000000000",
+"issuer": "r9QCg3thXBUrn4eZpyBVdL6rCM2FvQiMdJ",
+"value": "1000000000"
+},
+"LowNode": "0"
+}
 ],
 [
 "D3A14C2B96E0C8C08A91981A2B3E5551FDCE426996D27CDC27E679DF652A3B15",
-1
+1,
+{
+"Balance": {
+"currency": "54415A5A00000000000000000000000000000000",
+"issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji",
+"value": "22.05450880937311"
+},
+"Flags": 1114112,
+"HighLimit": {
+"currency": "54415A5A00000000000000000000000000000000",
+"issuer": "rDyzRLTk4eqYMJ86esHK5HPs1QHTJzjXwC",
+"value": "0"
+},
+"HighNode": "14",
+"LedgerEntryType": "RippleState",
+"LowLimit": {
+"currency": "54415A5A00000000000000000000000000000000",
+"issuer": "r3Hd1v4VTg8YJJ2WUkAy3XV1NA9pdDRXoW",
+"value": "1000000000"
+},
+"LowNode": "0"
+}
 ],
 [
 "D9AEEB7F9B02536AD8120567CEA9DB35A66FC05662527A46BC8FD6F6E10EAE1B",
-1
+1,
+{
+"Account": "r3Hd1v4VTg8YJJ2WUkAy3XV1NA9pdDRXoW",
+"Balance": "21066941",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 1,
+"Sequence": 98758271
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -3714,7 +4388,16 @@
 "nodes": [
 [
 "EBFD2155DE7A0A591F4F608B667DCFBF001C87AFD0E98723420860DC9DDA628A",
-1
+1,
+{
+"Account": "rXX42PPpTh9KYMesTG1zf6BdXMAXYiF29",
+"Balance": "409993906",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 34,
+"Sequence": 101283166,
+"TicketCount": 34
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -3723,15 +4406,33 @@
 "nodes": [
 [
 "3F1F0AC537C72EBE70F4957E77B9B4E137197F32D1E0195BA2AF0D1497E322B4",
-2
+2,
+null
 ],
 [
 "45B6170E70903458470EF8B586F00B452FF660A0C9416955138015E90633D855",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rKNRrawfVS59C3tN1bBiUWc5wZQAfUPh7z",
+"RootIndex": "D880CFF95381C608AA11FD19B71B02DF018407C5EAC8A1DF35B92B73C308222E"
+}
 ],
 [
 "DFB55DE47511B116439003E8203D6BC98FD9ABCBBEADC11FA6C9FB39F232280B",
-1
+1,
+{
+"Account": "rKNRrawfVS59C3tN1bBiUWc5wZQAfUPh7z",
+"Balance": "14026265",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 14,
+"Sequence": 104018046,
+"TicketCount": 14
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -3740,27 +4441,63 @@
 "nodes": [
 [
 "1ED8DDFD80F275CB1CE7F18BB9D906655DE8029805D8B95FB9020B30425821EB",
-1
+1,
+{
+"Account": "rBTwLga3i2gz3doX6Gva3MgEV8ZCD8jjah",
+"Balance": "249283211837",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 19,
+"Sequence": 262948129
+}
 ],
 [
 "3CE845E352C0B12F5A07A28E5F9D5BE3AACD4FEAA5D0B2732691D0BAC2B5FB72",
-0
+0,
+{
+"Account": "rBTwLga3i2gz3doX6Gva3MgEV8ZCD8jjah",
+"BookDirectory": "4627DFFCFF8B5A265EDBD8AE8C14A52325DBFEDAF4F5C32E5A2137727D9160DD",
+"LedgerEntryType": "Offer",
+"OwnerNode": "1",
+"Sequence": 262948128,
+"TakerGets": {
+"currency": "USD",
+"issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
+"value": "1069560"
+},
+"TakerPays": "1000000000000"
+}
 ],
 [
 "4627DFFCFF8B5A265EDBD8AE8C14A52325DBFEDAF4F5C32E5A2137727D9160DD",
-0
+0,
+{
+"ExchangeRate": "5a2137727d9160dd",
+"LedgerEntryType": "DirectoryNode",
+"RootIndex": "4627DFFCFF8B5A265EDBD8AE8C14A52325DBFEDAF4F5C32E5A2137727D9160DD",
+"TakerGetsCurrency": "0000000000000000000000005553440000000000",
+"TakerGetsIssuer": "0A20B3C85F482532A9578DBB3950B85CA06594D1"
+}
 ],
 [
 "4627DFFCFF8B5A265EDBD8AE8C14A52325DBFEDAF4F5C32E5A213786D8005C4C",
-2
+2,
+null
 ],
 [
 "789078E89CABEF469BEF0ECD12EBB95BD19664E6F204E32A158127E6712F5428",
-2
+2,
+null
 ],
 [
 "965F3CFB4ED7BF2C62BF6578649B7AA22FDA96FF7EE7BB943EA1AED0CC2E050E",
-1
+1,
+{
+"Flags": 0,
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rBTwLga3i2gz3doX6Gva3MgEV8ZCD8jjah",
+"RootIndex": "0A2600D85F8309FE7F75A490C19613F1CE0C37483B856DB69B8140154C2335F3"
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -3769,15 +4506,33 @@
 "nodes": [
 [
 "16E0A4888F753797CB526A3B1E62C324E02410B0EAE3F684C2F62E1CB865C2C0",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "660",
+"IndexPrevious": "8",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rGpYbhGeQZTia8VWc4yKQ882H2rxYDiJti",
+"RootIndex": "545BD3415E49C3E06AA17F3C865A07430A3D47FF97567E2C62BB8DB36F1E7ACE"
+}
 ],
 [
 "31DBB3B198D0C05A58DE85A277C0FBB597063C6FEC4F82124E2644E02D749FB1",
-2
+2,
+null
 ],
 [
 "5D55FB6178DA51C3750E6C8CC20CFE3D90F8A2AD20A3CED39BBAB8B22D628B5B",
-1
+1,
+{
+"Account": "rGpYbhGeQZTia8VWc4yKQ882H2rxYDiJti",
+"Balance": "409705929",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 60,
+"Sequence": 101285490,
+"TicketCount": 59
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -3786,15 +4541,33 @@
 "nodes": [
 [
 "33A00840EF26EB4988535A6105323DF7973E866FF49940DBFAE15D7F10008568",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "c",
+"IndexPrevious": "a",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rKYineK91kKQM5EuntTcyeGKoEdgi1qbHd",
+"RootIndex": "DFE947B698ED1312BBD4CD4B410E2232BA5FBF409B898C930A3EFA791B334510"
+}
 ],
 [
 "6F997121D07CD80A1492CB2DD9FBE30C6007C6242F6F48BBD8BFD9B281A06865",
-1
+1,
+{
+"Account": "rKYineK91kKQM5EuntTcyeGKoEdgi1qbHd",
+"Balance": "14000412",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 21,
+"Sequence": 103999566,
+"TicketCount": 21
+}
 ],
 [
 "74F26D0157045440B4F5B2FD24C283CFA6EBE0A2B2C77D1DBE54545827F2AD87",
-2
+2,
+null
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -3803,7 +4576,16 @@
 "nodes": [
 [
 "EAF7F01BB98FD796FB6EDDCA2912BFC598FF5B8AD8D6E025C185FF984B792DD8",
-1
+1,
+{
+"Account": "rDf5rV5izb5wTEFmFnJ5j48Vcjt7SrkFkv",
+"Balance": "13999968",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 25,
+"Sequence": 104020213,
+"TicketCount": 25
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -3812,7 +4594,16 @@
 "nodes": [
 [
 "8E9BC8DFD47616ECE960C153DC8A491EAD8EEF9C1FE59B69ECF0EFA98EA9F3DF",
-1
+1,
+{
+"Account": "rNT1FNDEgQdXRrMVgiSxpgHFubMfkqoXap",
+"Balance": "14000456",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 28,
+"Sequence": 104018667,
+"TicketCount": 28
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -3821,7 +4612,16 @@
 "nodes": [
 [
 "48F8278676432A63F256C7A4BA9775AB59FA9702E26FEFF60902FDA823E3CA2A",
-1
+1,
+{
+"Account": "rLF2oRBVSscD3s49rZwh3vCY1BJYySK4hj",
+"Balance": "13997996",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 23,
+"Sequence": 104021240,
+"TicketCount": 23
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -3830,15 +4630,33 @@
 "nodes": [
 [
 "55EC29C19AFB5B7FDD0238AF56C1D1576AB4C98660E76BA566E8FCF19C5C4496",
-2
+2,
+null
 ],
 [
 "A004F3644EE4FC2D6190ACE6A112035F69C67132DE015C8D3ECD66594AA0F2CA",
-1
+1,
+{
+"Account": "rmBdbQFdwTHAC1a98X6SA5BaXzfUcPwe7",
+"Balance": "13989896",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 17,
+"Sequence": 100162760,
+"TicketCount": 17
+}
 ],
 [
 "C3F3E05711C08AAC6C8DDD644DF276B92AA349B5DADFF578861F586991AC0C5A",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "5",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rmBdbQFdwTHAC1a98X6SA5BaXzfUcPwe7",
+"RootIndex": "6C417A36E6612D91B66B1C24DB743853D7D3F2685C93A9C9394C7738B2CAA9E7"
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -3847,7 +4665,16 @@
 "nodes": [
 [
 "62C1D28E84D214D182519A4BD4A732F260E6EDE954BFC0029DD99EEDED0811BE",
-1
+1,
+{
+"Account": "rKAip1utYtL6hB64SGYnpacvaGn4tvkWm7",
+"Balance": "13999666",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 36,
+"Sequence": 103999792,
+"TicketCount": 36
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -3856,7 +4683,16 @@
 "nodes": [
 [
 "4FD746B531F2E29E961CFCB2D87ABC1AC6B72774D31687BECF51D3CE178AF555",
-1
+1,
+{
+"Account": "r4bekoL2G5FncDHvZvBzx6kYPXG5xHotBC",
+"Balance": "13997772",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 38,
+"Sequence": 104029717,
+"TicketCount": 37
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -3865,19 +4701,55 @@
 "nodes": [
 [
 "09C872595C351E3694CC06A6C62846AC15C3AEF91AEAF546A66C5F0AB76D6D5F",
-1
+1,
+{
+"Account": "rm9oxnf2QRUckx5YDVYHMCN1stbu1ngjW",
+"Balance": "276397118615",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 30,
+"Sequence": 108911798
+}
 ],
 [
 "29958A9E8FDB4462AB486E269C735F52ADDAEDF354F9F40E4F03E1D2B3706000",
-0
+0,
+{
+"ExchangeRate": "4f03e1d2b3706000",
+"LedgerEntryType": "DirectoryNode",
+"RootIndex": "29958A9E8FDB4462AB486E269C735F52ADDAEDF354F9F40E4F03E1D2B3706000",
+"TakerPaysCurrency": "5553444300000000000000000000000000000000",
+"TakerPaysIssuer": "ACF3278B42F2ACC71989C99661DAB9AF8C081981"
+}
 ],
 [
 "74C1E5E653ECB8BA256EBC641293AD8966F319FA02F4A70228F9755023124F58",
-0
+0,
+{
+"Account": "rm9oxnf2QRUckx5YDVYHMCN1stbu1ngjW",
+"BookDirectory": "29958A9E8FDB4462AB486E269C735F52ADDAEDF354F9F40E4F03E1D2B3706000",
+"Flags": 131072,
+"LedgerEntryType": "Offer",
+"OwnerNode": "1",
+"Sequence": 108911797,
+"TakerGets": "45826657120",
+"TakerPays": {
+"currency": "5553444300000000000000000000000000000000",
+"issuer": "rGm7WCVp9gb4jZHWTEtGUr4dd74z2XuWhE",
+"value": "50075.7047681664"
+}
+}
 ],
 [
 "E2A34357E7D414BF7CC521C63ED97B5DBCB805C08D7C071C783598D260042619",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rm9oxnf2QRUckx5YDVYHMCN1stbu1ngjW",
+"RootIndex": "01685F55136D823D00F43997D33D50BA5B715D6E1B75C2ECB1C3BC01C03DA5DB"
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -3886,31 +4758,80 @@
 "nodes": [
 [
 "3767FB8A60BA46EDFA55E3F676B8026370955AD958AA7137B57EB42DE3F9BC34",
-2
+2,
+null
 ],
 [
 "58590B6E70CDF4ABFC36D6AF0287538D86E7FA30E4C9B2806ED84E941FAFF929",
-0
+0,
+{
+"Account": "rGV6cXKWcjQhCXoffHoRN6jn9QEUqg4wWm",
+"BookDirectory": "AAB29FD34DF2C06D4898503CD4F05649E7E4C0203E3EA1B8510AF71083EF3104",
+"LedgerEntryType": "Offer",
+"OwnerNode": "12b51",
+"Sequence": 100034254,
+"TakerGets": "2884872",
+"TakerPays": {
+"currency": "XPM",
+"issuer": "rXPMxBeefHGxx2K7g5qmmWq3gFsgawkoa",
+"value": "890.38691489"
+}
+}
 ],
 [
 "73018C991D02F0D0C405C037E41DDD1EF4BC563BFE139307345A8430F8ADB78A",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "12b51",
+"IndexPrevious": "12b41",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rGV6cXKWcjQhCXoffHoRN6jn9QEUqg4wWm",
+"RootIndex": "E534FAE15FF11081836D349397AC21398D7AA98FE9422A29774DE98E3B82A2DD"
+}
 ],
 [
 "9DBA900B7CC8957E52BD6E05CA6B11FCD40CFF9FA398E01B6F39545BC820A425",
-1
+1,
+{
+"Flags": 0,
+"IndexPrevious": "12b50",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rGV6cXKWcjQhCXoffHoRN6jn9QEUqg4wWm",
+"RootIndex": "E534FAE15FF11081836D349397AC21398D7AA98FE9422A29774DE98E3B82A2DD"
+}
 ],
 [
 "AAB29FD34DF2C06D4898503CD4F05649E7E4C0203E3EA1B8510AF71083EF3104",
-1
+1,
+{
+"ExchangeRate": "510af71083ef3104",
+"Flags": 0,
+"LedgerEntryType": "DirectoryNode",
+"RootIndex": "AAB29FD34DF2C06D4898503CD4F05649E7E4C0203E3EA1B8510AF71083EF3104",
+"TakerGetsCurrency": "0000000000000000000000000000000000000000",
+"TakerGetsIssuer": "0000000000000000000000000000000000000000",
+"TakerPaysCurrency": "00000000000000000000000058504D0000000000",
+"TakerPaysIssuer": "05BF25234D58ED48A3E44BB7F3D39AA7834A2905"
+}
 ],
 [
 "BE6CF3F052FF4DCA3E959567D0ABEF8185481B6ED1A3B46E3D4EA8EDBD889048",
-1
+1,
+{
+"Account": "rGV6cXKWcjQhCXoffHoRN6jn9QEUqg4wWm",
+"Balance": "274404569",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 81,
+"Sequence": 100034275,
+"TicketCount": 26
+}
 ],
 [
 "C362B6DD289983BC5C3719CD61C935120A32F3C4FA34ABA510E6FA763B07BBCD",
-2
+2,
+null
 ]
 ],
 "ter": "tesSUCCESS"
@@ -3919,7 +4840,16 @@
 "nodes": [
 [
 "8E3BCA7F02C60AA5C2E521729E5FC6F08CD72B123E57C817776A5ED07C334A98",
-1
+1,
+{
+"Account": "r1LPCUhq7Z69zFCSW8N1nBjz5qYV24y2K",
+"Balance": "409974063",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 48,
+"Sequence": 101283644,
+"TicketCount": 48
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -3928,7 +4858,16 @@
 "nodes": [
 [
 "CC7AB6D90F01BC63C18ABDE48234A4E97A9EA947D0655924E73C6EF7FD0D06FC",
-1
+1,
+{
+"Account": "rV9gn4pFY5N4jqPsHSsiQeHESxNUFY3nV",
+"Balance": "14118678",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 39,
+"Sequence": 104017342,
+"TicketCount": 39
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -3937,15 +4876,33 @@
 "nodes": [
 [
 "7746498103924AA260AA2F6514B91B77A61FD24C7F9C9F036C6006E830D22E2E",
-2
+2,
+null
 ],
 [
 "8E3BCA7F02C60AA5C2E521729E5FC6F08CD72B123E57C817776A5ED07C334A98",
-1
+1,
+{
+"Account": "r1LPCUhq7Z69zFCSW8N1nBjz5qYV24y2K",
+"Balance": "409974073",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 48,
+"Sequence": 101283643,
+"TicketCount": 48
+}
 ],
 [
 "99E0AC14327DBD42FAE186E7F497375BEF479A691CFB2E93143887E646579877",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "65f",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "r1LPCUhq7Z69zFCSW8N1nBjz5qYV24y2K",
+"RootIndex": "7C80928C8F641BB2C31F64B3BC35DD2FAE51A917D5A5383971CA9E4258425D55"
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -3954,7 +4911,16 @@
 "nodes": [
 [
 "62C1D28E84D214D182519A4BD4A732F260E6EDE954BFC0029DD99EEDED0811BE",
-1
+1,
+{
+"Account": "rKAip1utYtL6hB64SGYnpacvaGn4tvkWm7",
+"Balance": "13999676",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 36,
+"Sequence": 103999791,
+"TicketCount": 36
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -3963,7 +4929,16 @@
 "nodes": [
 [
 "BA0E26B7A712FD7C3B2D6306BD6041B0782436B93F1C7346A2187BAE2A08A8A3",
-1
+1,
+{
+"Account": "r3oKq23fV6HxnUgEWV9epzf1hPhi5Be7nA",
+"Balance": "13999852",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 11,
+"Sequence": 104001817,
+"TicketCount": 11
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -3972,7 +4947,16 @@
 "nodes": [
 [
 "D528DA33DC8FAAAAC7A31179F61987DE01E2E624FE7EA8CE12EA8F361E1DC792",
-1
+1,
+{
+"Account": "rTWaZ8yXyDZXU8x6CUxEB3CF9wEUSJf5w",
+"Balance": "13984172",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 13,
+"Sequence": 100157170,
+"TicketCount": 13
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -3981,15 +4965,33 @@
 "nodes": [
 [
 "23F6E30C693EEE6E45269E9B2DFDFE85B91B55C03A2C253AC76EB1319C292BD3",
-1
+1,
+{
+"Account": "rv2A6mKaBkSnQwycYBwX41Z7cp7qon7UQ",
+"Balance": "13993606",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 29,
+"Sequence": 99827898,
+"TicketCount": 29
+}
 ],
 [
 "4788E92D297B089CAA4271FF96DD6CF4E707522CC12B9445985E61D43011BF55",
-2
+2,
+null
 ],
 [
 "54479D809FF6BCF0C1D5B7ED8F9D01A8D58D8D99916B6331E89C2EC201FD70A9",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "10",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rv2A6mKaBkSnQwycYBwX41Z7cp7qon7UQ",
+"RootIndex": "81868FDEF2B0733F56CE19209B12848F3B184C71CD72BCC17EEE24AA185C8B58"
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -3998,15 +5000,33 @@
 "nodes": [
 [
 "1890A60C0FFED5F0D3532C6997885282193BE47FA1B75AE654425FA5F57B697A",
-2
+2,
+null
 ],
 [
 "93ABD8292A43A4AD65F2BB8B8E7D5F7FB5B249CFC5ACBBF2A217F5EE094010C2",
-1
+1,
+{
+"Account": "rGV95kjT5Tqu8S3XDQ2CTYNo51RMGCaWnm",
+"Balance": "14000012",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 33,
+"Sequence": 104018008,
+"TicketCount": 33
+}
 ],
 [
 "A1649B820FD285EAD36819F50C03988A8229478CFEC8072A7EB8890DF2F4E83D",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "7",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rGV95kjT5Tqu8S3XDQ2CTYNo51RMGCaWnm",
+"RootIndex": "B1BDFCB041872EED3222BFE32D33457FCCA6F0F2A61799DB4C9D368968F010AF"
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -4015,7 +5035,16 @@
 "nodes": [
 [
 "E032473A2D554A1D6A6DC452B9BC2FD91CDE4C87EDEC32B9ACDBA8C982358FFF",
-1
+1,
+{
+"Account": "rdGzD9oHEUJkiWxiuVA4UnB9f4kF7giQn",
+"Balance": "20794885",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 14,
+"Sequence": 102977894,
+"TicketCount": 14
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -4024,11 +5053,27 @@
 "nodes": [
 [
 "32CC7D5F026163A313EF59E0A610D136F9D66DFE6B5F7C926C68790C384F1C4C",
-1
+1,
+{
+"Account": "rnJrjec2vrTJAAQUTMTjj7U6xdXrk9N4mT",
+"Balance": "37399054050368",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 1,
+"Sequence": 99881300
+}
 ],
 [
 "59EDFBD7E3AA8EF84600C7AABD24DBC8229C19A1FF956C83D6B04390CF7C7E34",
-1
+1,
+{
+"Account": "rNxp4h8apvRis6mJf9Sh8C6iRxfrDWN7AV",
+"Balance": "5900545048",
+"Flags": 131072,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 1,
+"Sequence": 77396093
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -4037,19 +5082,54 @@
 "nodes": [
 [
 "09C872595C351E3694CC06A6C62846AC15C3AEF91AEAF546A66C5F0AB76D6D5F",
-1
+1,
+{
+"Account": "rm9oxnf2QRUckx5YDVYHMCN1stbu1ngjW",
+"Balance": "276397118630",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 29,
+"Sequence": 108911797
+}
 ],
 [
 "0EF2003868643D0549EA83958118D978ADFB69748FD943948F6E7DAEC920CB7A",
-0
+0,
+{
+"Account": "rm9oxnf2QRUckx5YDVYHMCN1stbu1ngjW",
+"BookDirectory": "DA8B8197B2CA44ABA26AA783BE3A91C1EE6DD829D9E300155A209C6E2CF8B9EC",
+"LedgerEntryType": "Offer",
+"OwnerNode": "1",
+"Sequence": 108911796,
+"TakerGets": {
+"currency": "5553444300000000000000000000000000000000",
+"issuer": "rGm7WCVp9gb4jZHWTEtGUr4dd74z2XuWhE",
+"value": "39939.5814331998"
+},
+"TakerPays": "36661325690"
+}
 ],
 [
 "DA8B8197B2CA44ABA26AA783BE3A91C1EE6DD829D9E300155A209C6E2CF8B9EC",
-0
+0,
+{
+"ExchangeRate": "5a209c6e2cf8b9ec",
+"LedgerEntryType": "DirectoryNode",
+"RootIndex": "DA8B8197B2CA44ABA26AA783BE3A91C1EE6DD829D9E300155A209C6E2CF8B9EC",
+"TakerGetsCurrency": "5553444300000000000000000000000000000000",
+"TakerGetsIssuer": "ACF3278B42F2ACC71989C99661DAB9AF8C081981"
+}
 ],
 [
 "E2A34357E7D414BF7CC521C63ED97B5DBCB805C08D7C071C783598D260042619",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rm9oxnf2QRUckx5YDVYHMCN1stbu1ngjW",
+"RootIndex": "01685F55136D823D00F43997D33D50BA5B715D6E1B75C2ECB1C3BC01C03DA5DB"
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -4058,19 +5138,78 @@
 "nodes": [
 [
 "112E2D6804E4D00084BE7438CCE533E4EE809785DA0FA9022897862926B4A483",
-1
+1,
+{
+"AMMID": "17F751F6F290D00894C3B770259AACDBEA63B5370E6AC460610C2A90D80CB528",
+"Account": "rPVpp3sfpYHavt9ZZSdAGhetjaYSHGzKqR",
+"Balance": "345654971",
+"Flags": 26214400,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 1,
+"Sequence": 105220891
+}
 ],
 [
 "83C42963999BF7D8BA30E787CD47B3949DB82D877B8A0D4EB28A2BFCA84F3725",
-1
+1,
+{
+"Account": "raJUJQ2zei3WMB36jJoCd8Q1q4u43vEggu",
+"Balance": "28751111",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 2,
+"Sequence": 102940102
+}
 ],
 [
 "A6878A3EA4F953A36A0CC99279176A43234E3863AEB7CD8CE81868AF3C2178F9",
-1
+1,
+{
+"Balance": {
+"currency": "KVL",
+"issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji",
+"value": "-42266.45799873221"
+},
+"Flags": 16908288,
+"HighLimit": {
+"currency": "KVL",
+"issuer": "rPVpp3sfpYHavt9ZZSdAGhetjaYSHGzKqR",
+"value": "0"
+},
+"HighNode": "0",
+"LedgerEntryType": "RippleState",
+"LowLimit": {
+"currency": "KVL",
+"issuer": "rPDjqYypN8c4uBxy7btf5W63eMrEDeyezw",
+"value": "0"
+},
+"LowNode": "0"
+}
 ],
 [
 "BA39AC2B15A08C5F48E469E4BDBBAAB2968FA102AA2E2CEB7B186C838E73D9E9",
-1
+1,
+{
+"Balance": {
+"currency": "KVL",
+"issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji",
+"value": "10249.93669922182"
+},
+"Flags": 1114112,
+"HighLimit": {
+"currency": "KVL",
+"issuer": "rPDjqYypN8c4uBxy7btf5W63eMrEDeyezw",
+"value": "0"
+},
+"HighNode": "0",
+"LedgerEntryType": "RippleState",
+"LowLimit": {
+"currency": "KVL",
+"issuer": "raJUJQ2zei3WMB36jJoCd8Q1q4u43vEggu",
+"value": "1000000.49252927"
+},
+"LowNode": "0"
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -4079,15 +5218,32 @@
 "nodes": [
 [
 "8393C1ACAEAAC899AAF2A5AA51D2A8BDB137889D22F793A6614CE8D20B9AB830",
-1
+1,
+{
+"Flags": 0,
+"IndexPrevious": "483",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rcW5UAA5i1Ay8LupY873YUx4RMy3VJ1pT",
+"RootIndex": "F08B4E5E83158DC931F3E6275D8FCFB0AA373FA989C11F2AA041F89B2A4E8A65"
+}
 ],
 [
 "97660E69110495D951C5FE8FD00A04C907AA3A6F7E14561348ABB3B16B1AE358",
-2
+2,
+null
 ],
 [
 "F891580EDDBAA25187816E8A20843E21832642616032D880F760C47D7DA42E9D",
-1
+1,
+{
+"Account": "rcW5UAA5i1Ay8LupY873YUx4RMy3VJ1pT",
+"Balance": "409388045",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 16,
+"Sequence": 101282913,
+"TicketCount": 15
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -4096,23 +5252,50 @@
 "nodes": [
 [
 "09E3454708553E8593BA9BF80EBDB5EB22ACD2B21465147C891C1DE67C4DA1D2",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "3",
+"IndexPrevious": "3",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rV9gn4pFY5N4jqPsHSsiQeHESxNUFY3nV",
+"RootIndex": "09E3454708553E8593BA9BF80EBDB5EB22ACD2B21465147C891C1DE67C4DA1D2"
+}
 ],
 [
 "49AC8C4604017742707B7797202CEACE7F9C83A52454759AFD64E5B3565D32ED",
-2
+2,
+null
 ],
 [
 "A6E11528D4C653A3156331D4AE4967A9695C1B1630FF439C8E32AA1058B05A3E",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rV9gn4pFY5N4jqPsHSsiQeHESxNUFY3nV",
+"RootIndex": "09E3454708553E8593BA9BF80EBDB5EB22ACD2B21465147C891C1DE67C4DA1D2"
+}
 ],
 [
 "B72D545CD9B3BE01B90871961BD2D81200F64C070D7E6AFB04314DC8F382D19B",
-2
+2,
+null
 ],
 [
 "CC7AB6D90F01BC63C18ABDE48234A4E97A9EA947D0655924E73C6EF7FD0D06FC",
-1
+1,
+{
+"Account": "rV9gn4pFY5N4jqPsHSsiQeHESxNUFY3nV",
+"Balance": "14118658",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 38,
+"Sequence": 104017343,
+"TicketCount": 38
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -4121,7 +5304,16 @@
 "nodes": [
 [
 "6F997121D07CD80A1492CB2DD9FBE30C6007C6242F6F48BBD8BFD9B281A06865",
-1
+1,
+{
+"Account": "rKYineK91kKQM5EuntTcyeGKoEdgi1qbHd",
+"Balance": "14000432",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 22,
+"Sequence": 103999565,
+"TicketCount": 22
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -4130,7 +5322,16 @@
 "nodes": [
 [
 "54F498C513C2310A4AEFB3973CE01932A9EC3384D541A0297E096A84351F866D",
-1
+1,
+{
+"Account": "rEfFcvUUe3Cgxostr1EUjwJzTdFvCnjxdL",
+"Balance": "14001082",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 19,
+"Sequence": 99784948,
+"TicketCount": 19
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -4139,7 +5340,16 @@
 "nodes": [
 [
 "54F498C513C2310A4AEFB3973CE01932A9EC3384D541A0297E096A84351F866D",
-1
+1,
+{
+"Account": "rEfFcvUUe3Cgxostr1EUjwJzTdFvCnjxdL",
+"Balance": "14001072",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 19,
+"Sequence": 99784949,
+"TicketCount": 19
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -4148,7 +5358,16 @@
 "nodes": [
 [
 "DFB55DE47511B116439003E8203D6BC98FD9ABCBBEADC11FA6C9FB39F232280B",
-1
+1,
+{
+"Account": "rKNRrawfVS59C3tN1bBiUWc5wZQAfUPh7z",
+"Balance": "14026285",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 15,
+"Sequence": 104018045,
+"TicketCount": 15
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -4157,15 +5376,32 @@
 "nodes": [
 [
 "AD5031E39EC163AE7009996D8B7A300CC040FF4D036753F057CCAD2BE8D86746",
-1
+1,
+{
+"Flags": 0,
+"IndexPrevious": "1e",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rUeGuHYuWeaPgvNPWCudG2t6PXHd6PZQL5",
+"RootIndex": "2A748C3B582F3D032CFEC0A08D7E65BB6D3BCFBB1994BDBA55048B61BE846167"
+}
 ],
 [
 "B82567EE35193438A70DF51376980FF2D5E5122E58FEDA72384284A79E35F27B",
-1
+1,
+{
+"Account": "rUeGuHYuWeaPgvNPWCudG2t6PXHd6PZQL5",
+"Balance": "114000202",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 45,
+"Sequence": 104000492,
+"TicketCount": 45
+}
 ],
 [
 "C36A426FDA3655B9B38F3E8F4E4E88FF9E032D964E9BE0E6710B957BE447AE9F",
-2
+2,
+null
 ]
 ],
 "ter": "tecKILLED"
@@ -4174,7 +5410,16 @@
 "nodes": [
 [
 "281C57178C4215AE2D7CDBC7DC8C9A3500465665BF180DC8F7C126830F603181",
-1
+1,
+{
+"Account": "rUJ9JP1bYpZ9NABCy9WQUknYD4RBY2aHmc",
+"Balance": "14151335",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 17,
+"Sequence": 104019036,
+"TicketCount": 17
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -4183,7 +5428,16 @@
 "nodes": [
 [
 "F891580EDDBAA25187816E8A20843E21832642616032D880F760C47D7DA42E9D",
-1
+1,
+{
+"Account": "rcW5UAA5i1Ay8LupY873YUx4RMy3VJ1pT",
+"Balance": "409388035",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 16,
+"Sequence": 101282914,
+"TicketCount": 15
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -4192,15 +5446,33 @@
 "nodes": [
 [
 "4FD746B531F2E29E961CFCB2D87ABC1AC6B72774D31687BECF51D3CE178AF555",
-1
+1,
+{
+"Account": "r4bekoL2G5FncDHvZvBzx6kYPXG5xHotBC",
+"Balance": "13997792",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 38,
+"Sequence": 104029715,
+"TicketCount": 37
+}
 ],
 [
 "A4F9D4EA2E351B248A9265F193E5B71B362C87DB7425E3B718918B1B54F98C08",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "10",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "r4bekoL2G5FncDHvZvBzx6kYPXG5xHotBC",
+"RootIndex": "0F65A83DB38573C5F7500888C659E1E53B3F3B0C65B8C278A44F98203FED16BA"
+}
 ],
 [
 "C0528CDE6FB9385099E24EEDD0ED00C8A6B2BD6E6DFC423AB615DDF8EDA422D2",
-2
+2,
+null
 ]
 ],
 "ter": "tecKILLED"
@@ -4209,11 +5481,27 @@
 "nodes": [
 [
 "7AAE29C13007FA030A9934B994E13FBE6AECF0DAC47BC7ECC83E0D0595D837E6",
-1
+1,
+{
+"Account": "rRrEy5iFMpLyMKoDionotcuP4pnt7m6X4",
+"Balance": "19878802",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 1,
+"Sequence": 102551068
+}
 ],
 [
 "9A5005B443589EC9A5B519E5CD8213EE1935F6BDC2E72EB19DE98774FE00142E",
-1
+1,
+{
+"Account": "rJMvspZMb1FRHmy8d3RP2eVGPjRmfKXh6e",
+"Balance": "15843030",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 1,
+"Sequence": 102406681
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -4222,7 +5510,16 @@
 "nodes": [
 [
 "A38C709CB4A378B201C07488919B37827AADD11CE528C69E9A7B35F04A747F00",
-1
+1,
+{
+"Account": "rHEJANpTJV4gzhVZhqgxmZ31M7o9tXh4oC",
+"Balance": "14000032",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 17,
+"Sequence": 104000388,
+"TicketCount": 17
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -4231,15 +5528,33 @@
 "nodes": [
 [
 "281C57178C4215AE2D7CDBC7DC8C9A3500465665BF180DC8F7C126830F603181",
-1
+1,
+{
+"Account": "rUJ9JP1bYpZ9NABCy9WQUknYD4RBY2aHmc",
+"Balance": "14151345",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 17,
+"Sequence": 104019035,
+"TicketCount": 17
+}
 ],
 [
 "47A9CAC92C4F03DE4D33E5B27D15A80DF9075D0D5A99278A071E53237412EAE8",
-2
+2,
+null
 ],
 [
 "7E7A74D87C2DADF09FA8C4CC8AA8F69E4234082166BB441BE6AC9A12719C02D6",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "2",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rUJ9JP1bYpZ9NABCy9WQUknYD4RBY2aHmc",
+"RootIndex": "C7808D6ED47F26DEB6632F342F298395E06E7CB4A09D5593BF4A0B696DD71019"
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -4248,15 +5563,32 @@
 "nodes": [
 [
 "5215F2DE4471700A9669232FDCC66DCBF7DB9D76BDF38EFE594FEF0AF9F6C38F",
-2
+2,
+null
 ],
 [
 "B69B968C1A16116D42251747C292578F843DD37941F4E17F114A4012946C62CD",
-1
+1,
+{
+"Flags": 0,
+"IndexPrevious": "8",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rPxrFexWD1M5Zdjisrjd7AtZwbt8GgsAtq",
+"RootIndex": "5FA4F748D72AF6CCBAD997D9CE50A459842E2AA1FBA7B6017E6EBC052D63E2A9"
+}
 ],
 [
 "FB5950357101AD3A77E539E231AE85FA1AE7942798AE5EC1E12059041CE17802",
-1
+1,
+{
+"Account": "rPxrFexWD1M5Zdjisrjd7AtZwbt8GgsAtq",
+"Balance": "13999196",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 39,
+"Sequence": 104020224,
+"TicketCount": 39
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -4265,15 +5597,33 @@
 "nodes": [
 [
 "4CDB58FF89FF9DE0A136FC559A58F030540935DD8E2558350BDEC66E0393C577",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "10",
+"IndexPrevious": "1",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rcM75s3cJXspn77CGV1Ga7BTbomWejcUF",
+"RootIndex": "4331B15A8E1ACA73325E44EC7D586081E5B84A9DDFAAAC274E8A235E587537C1"
+}
 ],
 [
 "6A792215838ACCC03B9F563AB634071B637432BD997D689C843F4FA3B0705CCB",
-2
+2,
+null
 ],
 [
 "CDB38FAF3FC2A6D0514614C62DA58717A4A57A83ED6042A6264118EFD4B53417",
-1
+1,
+{
+"Account": "rcM75s3cJXspn77CGV1Ga7BTbomWejcUF",
+"Balance": "13993586",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 20,
+"Sequence": 100159645,
+"TicketCount": 20
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -4282,7 +5632,16 @@
 "nodes": [
 [
 "7BFECAC6437F5BDF066A13DC77A6A10D52705192E04BDF2E15C1F46A8346D0EB",
-1
+1,
+{
+"Account": "rnBMq5qMmapAASbkTcghKxfH3bctuTm5E9",
+"Balance": "13998072",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 17,
+"Sequence": 104020302,
+"TicketCount": 17
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -4291,15 +5650,33 @@
 "nodes": [
 [
 "1A8025FB51639A6DC324635DDCD1E931BB3335B6143792811645371BBB420C54",
-2
+2,
+null
 ],
 [
 "62C1D28E84D214D182519A4BD4A732F260E6EDE954BFC0029DD99EEDED0811BE",
-1
+1,
+{
+"Account": "rKAip1utYtL6hB64SGYnpacvaGn4tvkWm7",
+"Balance": "13999686",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 36,
+"Sequence": 103999790,
+"TicketCount": 36
+}
 ],
 [
 "F06F0C8E7B7F7D0AA1180DCE6181E7EB8F439B0446CE6817151C0B8A6B02527B",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rKAip1utYtL6hB64SGYnpacvaGn4tvkWm7",
+"RootIndex": "F75E634A99F0CE811FFC03D55C7FA9FD8A001256D24F21F546365F3BA18F8DCB"
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -4308,23 +5685,56 @@
 "nodes": [
 [
 "31F3E349B7DCD8BA24BE9FA8D41F6EE043FFFDF242ACAD1050E7F3F3CBBF819E",
-0
+0,
+{
+"Flags": 1,
+"LedgerEntryType": "DirectoryNode",
+"NFTokenID": "000813889DD78527B443CAD0D53D3E6BF5C745562914FF05EE6C637C0647A8E1",
+"RootIndex": "31F3E349B7DCD8BA24BE9FA8D41F6EE043FFFDF242ACAD1050E7F3F3CBBF819E"
+}
 ],
 [
 "587E28972F3B63D2260C0671E59593EE6C4D27AB857D1AF230F5CAA959BB3EAC",
-1
+1,
+{
+"LedgerEntryType": "AccountRoot"
+}
 ],
 [
 "6557E0E953C841E4F06135CE9FBB6765D3E92302846CA3CE7F7DA71692FEBD89",
-1
+1,
+{
+"Account": "rMTaAGVd77vAbzDv8qhoMgnZR1T5R3w6Wq",
+"Balance": "937887720",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 461,
+"Sequence": 103822301
+}
 ],
 [
 "78D657425729E9E23965F3C5A06C8D9FFFF618CE5B5265B1FCA64A52DCFA41FF",
-1
+1,
+{
+"Flags": 0,
+"IndexPrevious": "2524",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rMTaAGVd77vAbzDv8qhoMgnZR1T5R3w6Wq",
+"RootIndex": "0B42748AFBC575F10C132083022B647DA53D92B964A037557BD24A23A6F97C11"
+}
 ],
 [
 "B90E2BE19DBFE140D81CEED2893CB0415055DC8DB14115B97ED85FC6BC56CDA1",
-0
+0,
+{
+"Amount": "8750000",
+"Destination": "rpx9JThQ2y37FaGeeJP7PXDUVEXY3PHZSC",
+"Expiration": 837647475,
+"LedgerEntryType": "NFTokenOffer",
+"NFTokenID": "000813889DD78527B443CAD0D53D3E6BF5C745562914FF05EE6C637C0647A8E1",
+"Owner": "rMTaAGVd77vAbzDv8qhoMgnZR1T5R3w6Wq",
+"OwnerNode": "2525"
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -4333,7 +5743,16 @@
 "nodes": [
 [
 "E2A9665A06E0D151C23C1AD9A1FDEBCB8A9833CAC3E688019B9158EA285BDE3B",
-1
+1,
+{
+"Account": "r9d8RhfTnjnYTfVJjVoKG6diUWa14hDi4e",
+"Balance": "13996666",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 26,
+"Sequence": 104020925,
+"TicketCount": 26
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -4342,27 +5761,66 @@
 "nodes": [
 [
 "1A343953392172544935F4FDE9048B1A3A4B1C01B6B54CC77C5578E49F21CB20",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rD8VchnJEJ5AEYEQzFW5KHQMemwi6HvzjV",
+"RootIndex": "1A343953392172544935F4FDE9048B1A3A4B1C01B6B54CC77C5578E49F21CB20"
+}
 ],
 [
 "479626DBA78BC7D4D6B81AF8914E06B225B2F00E8B9E2E30D3E6D7405E5E1597",
-1
+1,
+{
+"Account": "rD8VchnJEJ5AEYEQzFW5KHQMemwi6HvzjV",
+"Balance": "20862708",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 14,
+"Sequence": 102921660,
+"TicketCount": 9
+}
 ],
 [
 "BCC39DB1C14DCC3EDB9B96422B38AE14DB38C1F925111BC0B5CA13179D42BD2A",
-0
+0,
+{
+"Account": "rD8VchnJEJ5AEYEQzFW5KHQMemwi6HvzjV",
+"BookDirectory": "CFEC8953D22B1B50F20F46ECBCD51990A26BDB71951ED8265A209E927DEB7035",
+"Expiration": 837633199,
+"LedgerEntryType": "Offer",
+"Sequence": 102921659,
+"TakerGets": {
+"currency": "524C555344000000000000000000000000000000",
+"issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",
+"value": "74.594532"
+},
+"TakerPays": "68489352"
+}
 ],
 [
 "CFEC8953D22B1B50F20F46ECBCD51990A26BDB71951ED8265A209E927DEB7035",
-0
+0,
+{
+"ExchangeRate": "5a209e927deb7035",
+"LedgerEntryType": "DirectoryNode",
+"RootIndex": "CFEC8953D22B1B50F20F46ECBCD51990A26BDB71951ED8265A209E927DEB7035",
+"TakerGetsCurrency": "524C555344000000000000000000000000000000",
+"TakerGetsIssuer": "E5E961C6A025C9404AA7B662DD1DF975BE75D13E"
+}
 ],
 [
 "CFEC8953D22B1B50F20F46ECBCD51990A26BDB71951ED8265A20A1DC155A10AC",
-2
+2,
+null
 ],
 [
 "D80077C5D8B2EACF4092C766042941483D1F7C1C4002C4FAB4B4FF256BB57B79",
-2
+2,
+null
 ]
 ],
 "ter": "tesSUCCESS"
@@ -4371,15 +5829,33 @@
 "nodes": [
 [
 "554D2E7BB7AC0C6D3EEA64A3510B6285A1A1BA00C040D2CC988D54A6F9B26623",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "4",
+"IndexPrevious": "1",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "r9d8RhfTnjnYTfVJjVoKG6diUWa14hDi4e",
+"RootIndex": "36A1D9BC15CF7B6D3311A219280CA00D52E94B5FA1890F27CC53E93D5F47C0ED"
+}
 ],
 [
 "7E1BD9E3BF6BC8F64EF377B5C526E9C3A8C867AE7BE256E2ABC9A10BEA3AA4A7",
-2
+2,
+null
 ],
 [
 "E2A9665A06E0D151C23C1AD9A1FDEBCB8A9833CAC3E688019B9158EA285BDE3B",
-1
+1,
+{
+"Account": "r9d8RhfTnjnYTfVJjVoKG6diUWa14hDi4e",
+"Balance": "13996676",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 26,
+"Sequence": 104020924,
+"TicketCount": 26
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -4388,19 +5864,55 @@
 "nodes": [
 [
 "007CBEB7BED4F4FBA70297A56070AF7E53F6C2D0B731ED3ED9BC9F559D9B2080",
-0
+0,
+{
+"Account": "rLtCVnojydtQy7GYGTmDegkM15hLX8VuZk",
+"BookDirectory": "29958A9E8FDB4462AB486E269C735F52ADDAEDF354F9F40E4F03E2884F0FD800",
+"Flags": 131072,
+"LedgerEntryType": "Offer",
+"OwnerNode": "36d",
+"Sequence": 105386086,
+"TakerGets": "980200000",
+"TakerPays": {
+"currency": "5553444300000000000000000000000000000000",
+"issuer": "rGm7WCVp9gb4jZHWTEtGUr4dd74z2XuWhE",
+"value": "1071.8487"
+}
+}
 ],
 [
 "29958A9E8FDB4462AB486E269C735F52ADDAEDF354F9F40E4F03E2884F0FD800",
-0
+0,
+{
+"ExchangeRate": "4f03e2884f0fd800",
+"LedgerEntryType": "DirectoryNode",
+"RootIndex": "29958A9E8FDB4462AB486E269C735F52ADDAEDF354F9F40E4F03E2884F0FD800",
+"TakerPaysCurrency": "5553444300000000000000000000000000000000",
+"TakerPaysIssuer": "ACF3278B42F2ACC71989C99661DAB9AF8C081981"
+}
 ],
 [
 "87C75567B48DBFE9253FD0DB66C8AB3AA49DD387AFF77F29C8EB079C384C91D9",
-1
+1,
+{
+"Flags": 0,
+"IndexPrevious": "34a",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rLtCVnojydtQy7GYGTmDegkM15hLX8VuZk",
+"RootIndex": "8990C549FB6FB57435AA4E427D1C60E50CDA6CCA952A321A574C042B2DBCB819"
+}
 ],
 [
 "93EC3E9E3B757DB9F3810E763594409EE7AB789D1E5261AD04209B0B93F00D3C",
-1
+1,
+{
+"Account": "rLtCVnojydtQy7GYGTmDegkM15hLX8VuZk",
+"Balance": "268581540525",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 56,
+"Sequence": 105386087
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -4409,15 +5921,33 @@
 "nodes": [
 [
 "3F74BA8C630B279C2F4817B015B25CE4D2CE0D8F9FD6C9064D7B144412846F84",
-2
+2,
+null
 ],
 [
 "7BFECAC6437F5BDF066A13DC77A6A10D52705192E04BDF2E15C1F46A8346D0EB",
-1
+1,
+{
+"Account": "rnBMq5qMmapAASbkTcghKxfH3bctuTm5E9",
+"Balance": "13998082",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 17,
+"Sequence": 104020301,
+"TicketCount": 17
+}
 ],
 [
 "8F0C286366F9FE8C2107FFF972BD8BE1E1974A8CA76C05319326F78A4F404738",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rnBMq5qMmapAASbkTcghKxfH3bctuTm5E9",
+"RootIndex": "782C84994402B8CE92BCE010E09AC0299B0A64315151B9D980D2009869A497D9"
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -4426,11 +5956,186 @@
 "nodes": [
 [
 "ABA6AB20AC3371293497432D5FF3BE0113D3346993E36110E0105B6BFA670931",
-1
+1,
+{
+"Account": "rLfgoMintj3KBcs4s2XKtquvDwEte2kYfJ",
+"Balance": "112620079",
+"BurnedNFTokens": 2086,
+"FirstNFTokenSequence": 76817157,
+"Flags": 1048576,
+"LedgerEntryType": "AccountRoot",
+"MintedNFTokens": 6156,
+"NFTokenMinter": "rJAFQ2d6mUTgHHtLogPx5BB5NRT97ASFDy",
+"OwnerCount": 28,
+"RegularKey": "rUi3o9XGQqVrXQtQftGx5CrJsbQ4ezu2PP",
+"Sequence": 76818440
+}
 ],
 [
 "D1AE1BC312BEF9C68233FB0C8CF6A338F7C227BEF7C227BE8B3A7689049438CE",
-1
+1,
+{
+"Flags": 0,
+"LedgerEntryType": "NFTokenPage",
+"NFTokens": [
+{
+"NFToken": {
+"NFTokenID": "00081D4C8837F61EECD09529A18F8E8A3D63CF6E3473ACCEEB4C047500001E21"
+}
+},
+{
+"NFToken": {
+"NFTokenID": "00081AF40D4A90D7492F17F3797E3F128B2E146346891A6CFEFC2D0B00000139",
+"URI": "697066733A2F2F62616679626569637270666662746A346C37686D6C6D657766337A64346E3379666A643273687834747065786E356261757935736A6A70706433342F6D657461646174612E6A736F6E"
+}
+},
+{
+"NFToken": {
+"NFTokenID": "0008C35053F8BBBE64EDB10F9DBE5D5E442510FE80C61DA711F0C1A304D70107",
+"URI": "68747470733A2F2F617277656176652E6E65742F744F5177483333446F32537642486D62416476614F31636934544E696F44464D5468704D7A6B4D796879342F33382E6A736F6E"
+}
+},
+{
+"NFToken": {
+"NFTokenID": "0008C35053F8BBBE64EDB10F9DBE5D5E442510FE80C61DA728D692A204D70108",
+"URI": "68747470733A2F2F617277656176652E6E65742F744F5177483333446F32537642486D62416476614F31636934544E696F44464D5468704D7A6B4D796879342F37382E6A736F6E"
+}
+},
+{
+"NFToken": {
+"NFTokenID": "0008C35053F8BBBE64EDB10F9DBE5D5E442510FE80C61DA73FBC63A504D70109",
+"URI": "68747470733A2F2F617277656176652E6E65742F744F5177483333446F32537642486D62416476614F31636934544E696F44464D5468704D7A6B4D796879342F3135372E6A736F6E"
+}
+},
+{
+"NFToken": {
+"NFTokenID": "00081F400489E3ABBC03C44F8A0F0ADC21456B79DC114395BE50B4CF00000833",
+"URI": "68747470733A2F2F617277656176652E6E65742F5255695332586E66536758766C4C4A6763616234354B77566D4F4B482D3635775F7042597144536F4E5F6F2F353233392E6A736F6E"
+}
+},
+{
+"NFToken": {
+"NFTokenID": "00191B58D1AE1BC312BEF9C68233FB0C8CF6A338F7C227BE01AAED7204943AF7",
+"URI": "68747470733A2F2F6C66676F2E622D63646E2E6E65742F4C46474F2F3736372F3736375F312E6A736F6E"
+}
+},
+{
+"NFToken": {
+"NFTokenID": "00091B58D1AE1BC312BEF9C68233FB0C8CF6A338F7C227BE01D78C83049438C8",
+"URI": "68747470733A2F2F6C66676F2E622D63646E2E6E65742F4C46474F2F3234322F3234325F312E6A736F6E"
+}
+},
+{
+"NFToken": {
+"NFTokenID": "00191B58D1AE1BC312BEF9C68233FB0C8CF6A338F7C227BE05CAF66704943AEC",
+"URI": "68747470733A2F2F6C66676F2E622D63646E2E6E65742F4C46474F2F343032342F343032345F302E6A736F6E"
+}
+},
+{
+"NFToken": {
+"NFTokenID": "00191B58D1AE1BC312BEF9C68233FB0C8CF6A338F7C227BE1890BA7304943AF8",
+"URI": "68747470733A2F2F6C66676F2E622D63646E2E6E65742F4C46474F2F3735302F3735305F312E6A736F6E"
+}
+},
+{
+"NFToken": {
+"NFTokenID": "00191B58D1AE1BC312BEF9C68233FB0C8CF6A338F7C227BE1CB0C76804943AED",
+"URI": "68747470733A2F2F6C66676F2E622D63646E2E6E65742F4C46474F2F343032352F343032355F302E6A736F6E"
+}
+},
+{
+"NFToken": {
+"NFTokenID": "00191B58D1AE1BC312BEF9C68233FB0C8CF6A338F7C227BE2D30D3BC04943AC1",
+"URI": "68747470733A2F2F6C66676F2E622D63646E2E6E65742F4C46474F2F333938362F333938365F302E6A736F6E"
+}
+},
+{
+"NFToken": {
+"NFTokenID": "00091B58D1AE1BC312BEF9C68233FB0C8CF6A338F7C227BE2EF37BF60000087B",
+"URI": "697066733A2F2F62616679626569687A6C6B7A7178353276706370697A617361696A70646B787A687070717073693566376E657872656D36746F6D706D6872707A652F313836322E6A736F6E"
+}
+},
+{
+"NFToken": {
+"NFTokenID": "00191B58D1AE1BC312BEF9C68233FB0C8CF6A338F7C227BE3150DCB104943AB6",
+"URI": "68747470733A2F2F6C66676F2E622D63646E2E6E65742F4C46474F2F333937352F333937355F302E6A736F6E"
+}
+},
+{
+"NFToken": {
+"NFTokenID": "00191B58D1AE1BC312BEF9C68233FB0C8CF6A338F7C227BE3396946904943AEE",
+"URI": "68747470733A2F2F6C66676F2E622D63646E2E6E65742F4C46474F2F343032362F343032365F302E6A736F6E"
+}
+},
+{
+"NFToken": {
+"NFTokenID": "00191B58D1AE1BC312BEF9C68233FB0C8CF6A338F7C227BE37B6919E04943AE3",
+"URI": "68747470733A2F2F6C66676F2E622D63646E2E6E65742F4C46474F2F343031352F343031355F302E6A736F6E"
+}
+},
+{
+"NFToken": {
+"NFTokenID": "00191B58D1AE1BC312BEF9C68233FB0C8CF6A338F7C227BE3E1C524B04943B10",
+"URI": "68747470733A2F2F6C66676F2E622D63646E2E6E65742F4C46474F2F343035382F343035385F302E6A736F6E"
+}
+},
+{
+"NFToken": {
+"NFTokenID": "00191B58D1AE1BC312BEF9C68233FB0C8CF6A338F7C227BE4E9C6E9F04943AE4",
+"URI": "68747470733A2F2F6C66676F2E622D63646E2E6E65742F4C46474F2F343031362F343031365F302E6A736F6E"
+}
+},
+{
+"NFToken": {
+"NFTokenID": "00191B58D1AE1BC312BEF9C68233FB0C8CF6A338F7C227BE5F1C7AB304943AB8",
+"URI": "68747470733A2F2F6C66676F2E622D63646E2E6E65742F4C46474F2F333937372F333937375F302E6A736F6E"
+}
+},
+{
+"NFToken": {
+"NFTokenID": "00191B58D1AE1BC312BEF9C68233FB0C8CF6A338F7C227BE65823F6004943AE5",
+"URI": "68747470733A2F2F6C66676F2E622D63646E2E6E65742F4C46474F2F343031372F343031375F302E6A736F6E"
+}
+},
+{
+"NFToken": {
+"NFTokenID": "00091B58D1AE1BC312BEF9C68233FB0C8CF6A338F7C227BE74549988049438CD",
+"URI": "68747470733A2F2F6C66676F2E622D63646E2E6E65742F4C46474F2F313733352F313733355F352E6A736F6E"
+}
+},
+{
+"NFToken": {
+"NFTokenID": "00191B58D1AE1BC312BEF9C68233FB0C8CF6A338F7C227BE76024BB404943AB9",
+"URI": "68747470733A2F2F6C66676F2E622D63646E2E6E65742F4C46474F2F333937382F333937385F302E6A736F6E"
+}
+},
+{
+"NFToken": {
+"NFTokenID": "00091B58D1AE1BC312BEF9C68233FB0C8CF6A338F7C227BE77C4F3EE00000873",
+"URI": "697066733A2F2F62616679626569687A6C6B7A7178353276706370697A617361696A70646B787A687070717073693566376E657872656D36746F6D706D6872707A652F313237312E6A736F6E"
+}
+},
+{
+"NFToken": {
+"NFTokenID": "00191B58D1AE1BC312BEF9C68233FB0C8CF6A338F7C227BE7848036C04943AF1",
+"URI": "68747470733A2F2F6C66676F2E622D63646E2E6E65742F4C46474F2F343032392F343032395F302E6A736F6E"
+}
+},
+{
+"NFToken": {
+"NFTokenID": "00091B58D1AE1BC312BEF9C68233FB0C8CF6A338F7C227BE7AF3B4F500000E7A",
+"URI": "697066733A2F2F62616679626569676C78357972746A6332676570326169677A7064697035747A64716232786478357877646C7A3774356B6E63356B676A76646D792F333437352E6A736F6E"
+}
+},
+{
+"NFToken": {
+"NFTokenID": "00191B58D1AE1BC312BEF9C68233FB0C8CF6A338F7C227BE8088099604943ADB",
+"URI": "68747470733A2F2F6C66676F2E622D63646E2E6E65742F4C46474F2F343030372F343030375F302E6A736F6E"
+}
+}
+],
+"NextPageMin": "D1AE1BC312BEF9C68233FB0C8CF6A338F7C227BEFFFFFFFFFFFFFFFFFFFFFFFF"
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -4439,15 +6144,33 @@
 "nodes": [
 [
 "2390B05FFD9F437948F0BB79EB7DDB64E9B6CDF5186EF74B148171ADF98D5BAB",
-2
+2,
+null
 ],
 [
 "93ABD8292A43A4AD65F2BB8B8E7D5F7FB5B249CFC5ACBBF2A217F5EE094010C2",
-1
+1,
+{
+"Account": "rGV95kjT5Tqu8S3XDQ2CTYNo51RMGCaWnm",
+"Balance": "13999982",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 32,
+"Sequence": 104018010,
+"TicketCount": 32
+}
 ],
 [
 "A1649B820FD285EAD36819F50C03988A8229478CFEC8072A7EB8890DF2F4E83D",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "7",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rGV95kjT5Tqu8S3XDQ2CTYNo51RMGCaWnm",
+"RootIndex": "B1BDFCB041872EED3222BFE32D33457FCCA6F0F2A61799DB4C9D368968F010AF"
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -4456,7 +6179,16 @@
 "nodes": [
 [
 "CDB38FAF3FC2A6D0514614C62DA58717A4A57A83ED6042A6264118EFD4B53417",
-1
+1,
+{
+"Account": "rcM75s3cJXspn77CGV1Ga7BTbomWejcUF",
+"Balance": "13993576",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 20,
+"Sequence": 100159646,
+"TicketCount": 20
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -4465,7 +6197,16 @@
 "nodes": [
 [
 "5F109781A45479EADAA8779349409E1E8BF4E55677B9F8ECEC92ADB84C578898",
-1
+1,
+{
+"Account": "rG5Ugapwm2Jvz34aFfTyCzPkTmWV67DRHb",
+"Balance": "13996156",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 15,
+"Sequence": 104000349,
+"TicketCount": 15
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -4474,15 +6215,33 @@
 "nodes": [
 [
 "49019F93407A7023A8A1419F366948E2728BBC9F14F5862DFE347CD50B2A3AE4",
-1
+1,
+{
+"Account": "rGgNuC3J2NVym5RHJw9kK1pPB6tFt5CdRc",
+"Balance": "13999942",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 21,
+"Sequence": 99828809,
+"TicketCount": 21
+}
 ],
 [
 "9D8660B0B7B0E95CA0CABCEA0EA2BED174DAAE90B6B5B0EBD958B553181AA8DA",
-2
+2,
+null
 ],
 [
 "C201F27144E5C6CF4DD2D823ADB78AE9E6E1EBEDF8E3C60BFC02AA93F260D2E6",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "5",
+"IndexPrevious": "1",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rGgNuC3J2NVym5RHJw9kK1pPB6tFt5CdRc",
+"RootIndex": "354176EBC42E5B03269E0F2A3F7E683C3C5B11EA9AB8B1FBF6F483B2308BD260"
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -4491,7 +6250,16 @@
 "nodes": [
 [
 "99BDCA390059B408E54D281F24B3EE0798CEAAF015D50AF00E45A28E829EC0E5",
-1
+1,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"Balance": "13998220",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 10,
+"Sequence": 99908080,
+"TicketCount": 10
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -4500,7 +6268,16 @@
 "nodes": [
 [
 "93ABD8292A43A4AD65F2BB8B8E7D5F7FB5B249CFC5ACBBF2A217F5EE094010C2",
-1
+1,
+{
+"Account": "rGV95kjT5Tqu8S3XDQ2CTYNo51RMGCaWnm",
+"Balance": "14000002",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 33,
+"Sequence": 104018009,
+"TicketCount": 33
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -4509,31 +6286,87 @@
 "nodes": [
 [
 "10F41069DF7F0D8003EC9B451C8F2E9DD14C4E0B78360EC88621B7F80230812C",
-1
+1,
+{
+"Flags": 0,
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rPDjqYypN8c4uBxy7btf5W63eMrEDeyezw",
+"RootIndex": "10F41069DF7F0D8003EC9B451C8F2E9DD14C4E0B78360EC88621B7F80230812C"
+}
 ],
 [
 "112E2D6804E4D00084BE7438CCE533E4EE809785DA0FA9022897862926B4A483",
-1
+1,
+{
+"AMMID": "17F751F6F290D00894C3B770259AACDBEA63B5370E6AC460610C2A90D80CB528",
+"Account": "rPVpp3sfpYHavt9ZZSdAGhetjaYSHGzKqR",
+"Balance": "338771096",
+"Flags": 26214400,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 1,
+"Sequence": 105220891
+}
 ],
 [
 "29813022CC568CD5960E1B94386D26874ED00A559BFF923BDCAA7E31B2A8E359",
-2
+2,
+null
 ],
 [
 "78AB4F3C837738DA13CC9CEE20F653F3E288808CC43618F6E0F31FFCB5E6B212",
-1
+1,
+{
+"Account": "rBe9aGHVMFDWgfTMqech3bgWYND1BhhziW",
+"Balance": "409075741",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 69,
+"Sequence": 101285040,
+"TicketCount": 68
+}
 ],
 [
 "8E51B525F93B949C54C50DFEE43BB611263A7DAC8DB0EA66B62D0F441B08B83E",
-1
+1,
+{
+"Flags": 0,
+"IndexPrevious": "79d",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rBe9aGHVMFDWgfTMqech3bgWYND1BhhziW",
+"RootIndex": "06EC6BB85F015650AF02A9EA9FD5BD8E5A6231C0F268C2716CDF43440C17D3A9"
+}
 ],
 [
 "9AC259C1FBD8FD79336FD6DAE9C69466E3C8E9238D188C9254F876602FFDE4E3",
-1
+1,
+{
+"LedgerEntryType": "AccountRoot"
+}
 ],
 [
 "A6878A3EA4F953A36A0CC99279176A43234E3863AEB7CD8CE81868AF3C2178F9",
-1
+1,
+{
+"Balance": {
+"currency": "KVL",
+"issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji",
+"value": "-43129.63413641409"
+},
+"Flags": 16908288,
+"HighLimit": {
+"currency": "KVL",
+"issuer": "rPVpp3sfpYHavt9ZZSdAGhetjaYSHGzKqR",
+"value": "0"
+},
+"HighNode": "0",
+"LedgerEntryType": "RippleState",
+"LowLimit": {
+"currency": "KVL",
+"issuer": "rPDjqYypN8c4uBxy7btf5W63eMrEDeyezw",
+"value": "0"
+},
+"LowNode": "0"
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -4542,7 +6375,16 @@
 "nodes": [
 [
 "10C6DCF73F6F51EF02651A5A49309652293FD7B3BF8F91C1735CC7941FCAE9DE",
-1
+1,
+{
+"Account": "rSSMYf7Qae4MUvVyjAT7wSHXwAqRLd3B9",
+"Balance": "409996169",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 17,
+"Sequence": 101283258,
+"TicketCount": 17
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -4551,15 +6393,33 @@
 "nodes": [
 [
 "39174F07AE5F1FEEEA639CBE98446934316E518E8F89EE738FF847D768D52C9E",
-2
+2,
+null
 ],
 [
 "CCEB69CC87156C8C898C01F11B27AFD58A1773B06A015367A344AF10F0623EC1",
-1
+1,
+{
+"Account": "rpWRUueYU5z92iKZyT8CAavebUC8b3BCwf",
+"Balance": "13998676",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 14,
+"Sequence": 104000463,
+"TicketCount": 14
+}
 ],
 [
 "E1CFF6A26FF8EA421341A89CCED6F6AA04D834FED6B9CDCF0CDBF48A0814A4C2",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rpWRUueYU5z92iKZyT8CAavebUC8b3BCwf",
+"RootIndex": "CA9E73AF640EA58835480FC2312FA738B08AA58302FDCECDC13472905617E352"
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -4568,7 +6428,16 @@
 "nodes": [
 [
 "E21CDA5E58137BC5C4A08461604AF8C6DBCA824CA5648CFE86432101B0A3B766",
-1
+1,
+{
+"Account": "rnJ1hb5qF36Nwdhvzpa8quMos4FtYRzrMq",
+"Balance": "32042212",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 69,
+"Sequence": 95620747,
+"TicketCount": 17
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -4577,11 +6446,27 @@
 "nodes": [
 [
 "86EF06D5CDCDF79C42072BC0A8B1192EA290D8AA4C002EAF874081F291217E80",
-1
+1,
+{
+"Account": "rBNFYYfddmaZpW8CeS3b5f6d1tjNC8Vrv4",
+"Balance": "5873433",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 1,
+"Sequence": 101901161
+}
 ],
 [
 "A35ABC230E9526F0A29B6EBF28D31D188C24592DE48931C88FF4C8B037B6D294",
-1
+1,
+{
+"Account": "rh2KjU8BBX7oXifLhYGXxHU3hXZvxQNq43",
+"Balance": "2902014",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 0,
+"Sequence": 104975135
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -4590,15 +6475,32 @@
 "nodes": [
 [
 "11E6BCA309964D5A5AED41B283A488BC75D17DBD5681A52AC27C9134C446028F",
-2
+2,
+null
 ],
 [
 "648F878026B385EE546DE24CA1B5F4775F87603BCCCBD9AA8E4E9C605E265671",
-1
+1,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"Balance": "13998922",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 10,
+"Sequence": 104005466,
+"TicketCount": 10
+}
 ],
 [
 "FE76741767A219844377058C14E248B8DB8504A486B2E00633ED5F6DF1364900",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"RootIndex": "9CE3C9EB332EDF261C62DFA85635DC92852F370B26397020A30F93D64D103E9C"
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -4607,23 +6509,61 @@
 "nodes": [
 [
 "1ED8DDFD80F275CB1CE7F18BB9D906655DE8029805D8B95FB9020B30425821EB",
-1
+1,
+{
+"Account": "rBTwLga3i2gz3doX6Gva3MgEV8ZCD8jjah",
+"Balance": "249283211827",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 19,
+"Sequence": 262948130
+}
 ],
 [
 "965F3CFB4ED7BF2C62BF6578649B7AA22FDA96FF7EE7BB943EA1AED0CC2E050E",
-1
+1,
+{
+"Flags": 0,
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rBTwLga3i2gz3doX6Gva3MgEV8ZCD8jjah",
+"RootIndex": "0A2600D85F8309FE7F75A490C19613F1CE0C37483B856DB69B8140154C2335F3"
+}
 ],
 [
 "C031E93666FBEA6159115DFAF854E97FE0BD9DA5C99974CE749CACC45AD426BA",
-0
+0,
+{
+"Account": "rBTwLga3i2gz3doX6Gva3MgEV8ZCD8jjah",
+"BookDirectory": "DFA3B6DDAB58C7E8E5D944E736DA4B7046C30E4F460FD9DE4F03F423E8FC1800",
+"LedgerEntryType": "Offer",
+"OwnerNode": "1",
+"Sequence": 262948129,
+"TakerGets": "249183000000",
+"TakerPays": {
+"currency": "USD",
+"issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
+"value": "277305.79338"
+}
+}
 ],
 [
 "DFA3B6DDAB58C7E8E5D944E736DA4B7046C30E4F460FD9DE4F03F423E8FC1800",
-1
+1,
+{
+"ExchangeRate": "4f03f423e8fc1800",
+"Flags": 0,
+"LedgerEntryType": "DirectoryNode",
+"RootIndex": "DFA3B6DDAB58C7E8E5D944E736DA4B7046C30E4F460FD9DE4F03F423E8FC1800",
+"TakerGetsCurrency": "0000000000000000000000000000000000000000",
+"TakerGetsIssuer": "0000000000000000000000000000000000000000",
+"TakerPaysCurrency": "0000000000000000000000005553440000000000",
+"TakerPaysIssuer": "0A20B3C85F482532A9578DBB3950B85CA06594D1"
+}
 ],
 [
 "F15FE196B8EC9188B47ED0F49292CF302D48C60B8EF033B1DDB3A7ECE271E05C",
-2
+2,
+null
 ]
 ],
 "ter": "tesSUCCESS"
@@ -4632,15 +6572,32 @@
 "nodes": [
 [
 "1E49E1D4D1009A1B94F31AD5954E2483684B88A0FF2827779836167F67C25BD2",
-2
+2,
+null
 ],
 [
 "2073683187C9842892BAD411305B71909D320D98805C2EBFCADBDCDD252EA982",
-1
+1,
+{
+"Flags": 0,
+"IndexPrevious": "14",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rsiTX1Z59Nm7nbCRy86w1L5FKvz23dRVVo",
+"RootIndex": "08D22C03B45CC4B51B601BBE4DCF7AE9ACF44483CCB2199ED981BE0B119ABE7C"
+}
 ],
 [
 "7973DC8F41925C8672CEB8FE03E90C171745CF1D14216C45EC793BE18D86FED4",
-1
+1,
+{
+"Account": "rsiTX1Z59Nm7nbCRy86w1L5FKvz23dRVVo",
+"Balance": "14035463",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 42,
+"Sequence": 99871860,
+"TicketCount": 41
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -4649,15 +6606,33 @@
 "nodes": [
 [
 "28DED1850A71F78C0F036DB62496C351AEFB10F7834968B8D09367B686E72092",
-2
+2,
+null
 ],
 [
 "4ABCA9D5583F7E80D9E40731D9815C8342655A5D6211BEF01B639785F420CAE0",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rG5Ugapwm2Jvz34aFfTyCzPkTmWV67DRHb",
+"RootIndex": "52BDA1D0D4A51A655AB8E1CC3B702B3BADCD1E0B061D1B8F8D5309D03876454E"
+}
 ],
 [
 "5F109781A45479EADAA8779349409E1E8BF4E55677B9F8ECEC92ADB84C578898",
-1
+1,
+{
+"Account": "rG5Ugapwm2Jvz34aFfTyCzPkTmWV67DRHb",
+"Balance": "13996176",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 15,
+"Sequence": 104000347,
+"TicketCount": 15
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -4666,7 +6641,16 @@
 "nodes": [
 [
 "8E9BC8DFD47616ECE960C153DC8A491EAD8EEF9C1FE59B69ECF0EFA98EA9F3DF",
-1
+1,
+{
+"Account": "rNT1FNDEgQdXRrMVgiSxpgHFubMfkqoXap",
+"Balance": "14000446",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 28,
+"Sequence": 104018668,
+"TicketCount": 28
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -4675,15 +6659,33 @@
 "nodes": [
 [
 "2DB20E7B1C1D61593116928D65643B591102E829193D14B30439ABC5C4DA9C89",
-2
+2,
+null
 ],
 [
 "7CDBD50EFDE40C005980E6682DD0478521D3B32A94B05EF8741861D2A3E45CE6",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "r3oKq23fV6HxnUgEWV9epzf1hPhi5Be7nA",
+"RootIndex": "F53BB712948491428A6E496C352FA06F4776CA026B83D8F64761C34D4A6E506E"
+}
 ],
 [
 "BA0E26B7A712FD7C3B2D6306BD6041B0782436B93F1C7346A2187BAE2A08A8A3",
-1
+1,
+{
+"Account": "r3oKq23fV6HxnUgEWV9epzf1hPhi5Be7nA",
+"Balance": "13999832",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 10,
+"Sequence": 104001818,
+"TicketCount": 10
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -4692,11 +6694,27 @@
 "nodes": [
 [
 "7F5EC892FF8513DDFFEE0CC35831D834C760675E4FB304CB72EE647DEE8751B9",
-1
+1,
+{
+"Account": "raR6NgnK4T6QLuuaf71zNCoFxPoTnQe34p",
+"Balance": "27272656375",
+"Flags": 131072,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 0,
+"Sequence": 92371867
+}
 ],
 [
 "CF1B55828F3B5DD0C806F2C93B6F5D5C9EDC2E89BE196F9BC8FBE1ED2DA6FA81",
-1
+1,
+{
+"Account": "rL9GcrQTs2BC47PkDs1Y8dgjBBfwwabEHZ",
+"Balance": "314848491746",
+"Flags": 131072,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 0,
+"Sequence": 104539759
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -4705,7 +6723,16 @@
 "nodes": [
 [
 "E21CDA5E58137BC5C4A08461604AF8C6DBCA824CA5648CFE86432101B0A3B766",
-1
+1,
+{
+"Account": "rnJ1hb5qF36Nwdhvzpa8quMos4FtYRzrMq",
+"Balance": "32041892",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 69,
+"Sequence": 95620751,
+"TicketCount": 17
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -4714,7 +6741,16 @@
 "nodes": [
 [
 "A004F3644EE4FC2D6190ACE6A112035F69C67132DE015C8D3ECD66594AA0F2CA",
-1
+1,
+{
+"Account": "rmBdbQFdwTHAC1a98X6SA5BaXzfUcPwe7",
+"Balance": "13989886",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 17,
+"Sequence": 100162761,
+"TicketCount": 17
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -4723,15 +6759,33 @@
 "nodes": [
 [
 "03DCC82D0D5A395C65D997CE35BF56318E89C61869562ED081721DA5B4D6B2B8",
-1
+1,
+{
+"Account": "rhehuzGheCFoAUxvjRea58P6Rrf1GJzn9G",
+"Balance": "409502923",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 31,
+"Sequence": 101283978,
+"TicketCount": 31
+}
 ],
 [
 "069423F49CE291DCD97362E7023DA55399D84F41C197094288A01178532297AE",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "65f",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rhehuzGheCFoAUxvjRea58P6Rrf1GJzn9G",
+"RootIndex": "C76B095CA5DEBD1CBCA018355CF83CCD61707F908B8B1E94A7D4B621AFF256E5"
+}
 ],
 [
 "293583D5DF2DA0B1F92FBF887785A764C509C2383CFC6DF5B31FC02873246D3E",
-2
+2,
+null
 ]
 ],
 "ter": "tecKILLED"
@@ -4740,27 +6794,63 @@
 "nodes": [
 [
 "0A168580AAA99293F3A5F6CFACF57990332BF886F90558F94CB55692AC8C9314",
-0
+0,
+{
+"Account": "rBTwLga3i2gz3doX6Gva3MgEV8ZCD8jjah",
+"BookDirectory": "799BECD7CA247A0647749B9C316898DD239A2C414C27A19C5A20EBFE585496CA",
+"LedgerEntryType": "Offer",
+"OwnerNode": "1",
+"Sequence": 262948133,
+"TakerGets": {
+"currency": "5553445400000000000000000000000000000000",
+"issuer": "rcvxE9PS9YBwxtGg1qNeewV6ZB3wGubZq",
+"value": "1079135.5"
+},
+"TakerPays": "1000000000000"
+}
 ],
 [
 "1ED8DDFD80F275CB1CE7F18BB9D906655DE8029805D8B95FB9020B30425821EB",
-1
+1,
+{
+"Account": "rBTwLga3i2gz3doX6Gva3MgEV8ZCD8jjah",
+"Balance": "249283211787",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 19,
+"Sequence": 262948134
+}
 ],
 [
 "799BECD7CA247A0647749B9C316898DD239A2C414C27A19C5A20EBFDBEC7D68C",
-2
+2,
+null
 ],
 [
 "799BECD7CA247A0647749B9C316898DD239A2C414C27A19C5A20EBFE585496CA",
-0
+0,
+{
+"ExchangeRate": "5a20ebfe585496ca",
+"LedgerEntryType": "DirectoryNode",
+"RootIndex": "799BECD7CA247A0647749B9C316898DD239A2C414C27A19C5A20EBFE585496CA",
+"TakerGetsCurrency": "5553445400000000000000000000000000000000",
+"TakerGetsIssuer": "06CB988E900D81BAE9217E6FE6B60CD2DDA12767"
+}
 ],
 [
 "965F3CFB4ED7BF2C62BF6578649B7AA22FDA96FF7EE7BB943EA1AED0CC2E050E",
-1
+1,
+{
+"Flags": 0,
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rBTwLga3i2gz3doX6Gva3MgEV8ZCD8jjah",
+"RootIndex": "0A2600D85F8309FE7F75A490C19613F1CE0C37483B856DB69B8140154C2335F3"
+}
 ],
 [
 "A245D33F26B78284D5510D079CEFAB647C6B96596E83A55E0AB24B8BBCC20BBB",
-2
+2,
+null
 ]
 ],
 "ter": "tesSUCCESS"
@@ -4769,7 +6859,16 @@
 "nodes": [
 [
 "724D355A89CE55EE7BD35543D0F9E2BE32AB9F2CE58B04D73F6CAACE1CB76675",
-1
+1,
+{
+"Account": "rHVx8hFzZbbWQkSntBy596cJ8kWUWSGihx",
+"Balance": "13999296",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 38,
+"Sequence": 104000549,
+"TicketCount": 38
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -4778,7 +6877,16 @@
 "nodes": [
 [
 "5F109781A45479EADAA8779349409E1E8BF4E55677B9F8ECEC92ADB84C578898",
-1
+1,
+{
+"Account": "rG5Ugapwm2Jvz34aFfTyCzPkTmWV67DRHb",
+"Balance": "13996166",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 15,
+"Sequence": 104000348,
+"TicketCount": 15
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -4787,7 +6895,16 @@
 "nodes": [
 [
 "648F878026B385EE546DE24CA1B5F4775F87603BCCCBD9AA8E4E9C605E265671",
-1
+1,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"Balance": "13998902",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 10,
+"Sequence": 104005468,
+"TicketCount": 10
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -4796,31 +6913,73 @@
 "nodes": [
 [
 "1D2BF06DC5EBAA17C54FEB03B4E10B29AA6717B044DC7D3411C5A36982D851DC",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rByxx8wgAQC7JXS1Wvm3tVEXJYSk3UxyG3",
+"RootIndex": "1D2BF06DC5EBAA17C54FEB03B4E10B29AA6717B044DC7D3411C5A36982D851DC"
+}
 ],
 [
 "42E5966254EE0054E2AE6ECAD3514EBCEBC9DE1939920BC37380F00207BC627E",
-2
+2,
+null
 ],
 [
 "6EFDCD3A70A37854DC16C5401C67CFF30600AC42A05D56A07FC3CEDFF8288C1B",
-1
+1,
+{
+"Account": "rByxx8wgAQC7JXS1Wvm3tVEXJYSk3UxyG3",
+"Balance": "17583997",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 31,
+"Sequence": 94003429
+}
 ],
 [
 "AD5031E39EC163AE7009996D8B7A300CC040FF4D036753F057CCAD2BE8D86746",
-1
+1,
+{
+"Flags": 0,
+"IndexPrevious": "1e",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rUeGuHYuWeaPgvNPWCudG2t6PXHd6PZQL5",
+"RootIndex": "2A748C3B582F3D032CFEC0A08D7E65BB6D3BCFBB1994BDBA55048B61BE846167"
+}
 ],
 [
 "B82567EE35193438A70DF51376980FF2D5E5122E58FEDA72384284A79E35F27B",
-1
+1,
+{
+"Account": "rUeGuHYuWeaPgvNPWCudG2t6PXHd6PZQL5",
+"Balance": "114000212",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 46,
+"Sequence": 104000492,
+"TicketCount": 46
+}
 ],
 [
 "EBA8B99250A492369EEA721A500233F142E322CB3F129C0EA76DDAB396BA2A02",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "1f",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rUeGuHYuWeaPgvNPWCudG2t6PXHd6PZQL5",
+"RootIndex": "2A748C3B582F3D032CFEC0A08D7E65BB6D3BCFBB1994BDBA55048B61BE846167"
+}
 ],
 [
 "F0428491C766D761C61A36C5408C515C9821BCCF1FB50B54F3741485321A61F0",
-2
+2,
+null
 ]
 ],
 "ter": "tesSUCCESS"
@@ -4829,15 +6988,33 @@
 "nodes": [
 [
 "4B09A94A3EC2BD6431BF548173C60C355D89B24C94B17E82BC0A44972DEC794D",
-2
+2,
+null
 ],
 [
 "AD3500B988616FA9AD05724FB4905CA175E561717A90989E4149C2F8E67F9589",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "65a",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rXX42PPpTh9KYMesTG1zf6BdXMAXYiF29",
+"RootIndex": "FD92A476CCF0A97DD8B5A379ADAA5AD48EBF8D05FA5A0C0FF571E9A8B6E785C8"
+}
 ],
 [
 "EBFD2155DE7A0A591F4F608B667DCFBF001C87AFD0E98723420860DC9DDA628A",
-1
+1,
+{
+"Account": "rXX42PPpTh9KYMesTG1zf6BdXMAXYiF29",
+"Balance": "409993916",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 34,
+"Sequence": 101283165,
+"TicketCount": 34
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -4846,15 +7023,33 @@
 "nodes": [
 [
 "23F6E30C693EEE6E45269E9B2DFDFE85B91B55C03A2C253AC76EB1319C292BD3",
-1
+1,
+{
+"Account": "rv2A6mKaBkSnQwycYBwX41Z7cp7qon7UQ",
+"Balance": "13993636",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 30,
+"Sequence": 99827896,
+"TicketCount": 30
+}
 ],
 [
 "54479D809FF6BCF0C1D5B7ED8F9D01A8D58D8D99916B6331E89C2EC201FD70A9",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "10",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rv2A6mKaBkSnQwycYBwX41Z7cp7qon7UQ",
+"RootIndex": "81868FDEF2B0733F56CE19209B12848F3B184C71CD72BCC17EEE24AA185C8B58"
+}
 ],
 [
 "58057F401D99AF272A5E4736A343037A4E81037A9CB49F93DBFBBD270354171B",
-2
+2,
+null
 ]
 ],
 "ter": "tecKILLED"
@@ -4863,7 +7058,16 @@
 "nodes": [
 [
 "CC7AB6D90F01BC63C18ABDE48234A4E97A9EA947D0655924E73C6EF7FD0D06FC",
-1
+1,
+{
+"Account": "rV9gn4pFY5N4jqPsHSsiQeHESxNUFY3nV",
+"Balance": "14118668",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 39,
+"Sequence": 104017343,
+"TicketCount": 39
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -4872,7 +7076,16 @@
 "nodes": [
 [
 "281C57178C4215AE2D7CDBC7DC8C9A3500465665BF180DC8F7C126830F603181",
-1
+1,
+{
+"Account": "rUJ9JP1bYpZ9NABCy9WQUknYD4RBY2aHmc",
+"Balance": "14151325",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 17,
+"Sequence": 104019037,
+"TicketCount": 17
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -4881,7 +7094,16 @@
 "nodes": [
 [
 "F07AFFF4300E114FA867D09EB99B9CC59D1763C995981A744871FA8244DD2D66",
-1
+1,
+{
+"Account": "rMiyThqhMNx5wcGZ7313dVpTRh8T1Yd5Ew",
+"Balance": "409440014",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 13,
+"Sequence": 101284275,
+"TicketCount": 13
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -4890,27 +7112,63 @@
 "nodes": [
 [
 "1ED8DDFD80F275CB1CE7F18BB9D906655DE8029805D8B95FB9020B30425821EB",
-1
+1,
+{
+"Account": "rBTwLga3i2gz3doX6Gva3MgEV8ZCD8jjah",
+"Balance": "249283211807",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 19,
+"Sequence": 262948132
+}
 ],
 [
 "20F8D1ED366770E02AB5370016F287409722B52AE017D559C219C6ADEB303F0E",
-0
+0,
+{
+"Account": "rBTwLga3i2gz3doX6Gva3MgEV8ZCD8jjah",
+"BookDirectory": "8B81F1A13122D9B1CCE5BBE1CAA63B9CBBB27CE674159E8C5A2137727D9160DD",
+"LedgerEntryType": "Offer",
+"OwnerNode": "1",
+"Sequence": 262948131,
+"TakerGets": {
+"currency": "USD",
+"issuer": "rKiCet8SdvWxPXnAgYarFUXMh1zCPz432Y",
+"value": "1069560"
+},
+"TakerPays": "1000000000000"
+}
 ],
 [
 "8B81F1A13122D9B1CCE5BBE1CAA63B9CBBB27CE674159E8C5A2137727D9160DD",
-0
+0,
+{
+"ExchangeRate": "5a2137727d9160dd",
+"LedgerEntryType": "DirectoryNode",
+"RootIndex": "8B81F1A13122D9B1CCE5BBE1CAA63B9CBBB27CE674159E8C5A2137727D9160DD",
+"TakerGetsCurrency": "0000000000000000000000005553440000000000",
+"TakerGetsIssuer": "CED6E99370D5C00EF4EBF72567DA99F5661BFB3A"
+}
 ],
 [
 "8B81F1A13122D9B1CCE5BBE1CAA63B9CBBB27CE674159E8C5A213786D8005C4C",
-2
+2,
+null
 ],
 [
 "965F3CFB4ED7BF2C62BF6578649B7AA22FDA96FF7EE7BB943EA1AED0CC2E050E",
-1
+1,
+{
+"Flags": 0,
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rBTwLga3i2gz3doX6Gva3MgEV8ZCD8jjah",
+"RootIndex": "0A2600D85F8309FE7F75A490C19613F1CE0C37483B856DB69B8140154C2335F3"
+}
 ],
 [
 "E9C4E577732C5FF1F046AC3EE63E8B9448BB4BA14E1E3C74E369AC5A9A3A67D3",
-2
+2,
+null
 ]
 ],
 "ter": "tesSUCCESS"
@@ -4919,15 +7177,33 @@
 "nodes": [
 [
 "3405276C7C610F7AF47065C31D56E5B2A74BF292D743EEAE764AA19C12659A0D",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "3a",
+"IndexPrevious": "14",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"RootIndex": "ACBC61203A14E106FD12869B0714CF01C2ADFB39064C6B32081105291E4E6808"
+}
 ],
 [
 "3A06FAB20C52DA0038D1486B2279D6F937A6229F824BD078E4F009C01B50F61F",
-2
+2,
+null
 ],
 [
 "99BDCA390059B408E54D281F24B3EE0798CEAAF015D50AF00E45A28E829EC0E5",
-1
+1,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"Balance": "13998190",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 49,
+"Sequence": 99908122,
+"TicketCount": 49
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -4936,7 +7212,16 @@
 "nodes": [
 [
 "5CBA71CDAA7587DFB428C3DA470F8F1A183F568D035844B77CD9347F09B7856B",
-1
+1,
+{
+"Account": "r5FaJQWQ8SD14Q7pVuPqVZsBPfkgofhSs",
+"Balance": "409946888",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 49,
+"Sequence": 101285551,
+"TicketCount": 40
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -4945,7 +7230,16 @@
 "nodes": [
 [
 "B9D58D468231FCF2BECA34C115636A5D09D7C1123E7C2C7B12A0BC983D8C5182",
-1
+1,
+{
+"Account": "rKqFKx255NSU2mzX2K4SNtCgKTMBaS7uBn",
+"Balance": "409995722",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 25,
+"Sequence": 100443887,
+"TicketCount": 24
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -4954,11 +7248,27 @@
 "nodes": [
 [
 "38EDA33EB564190519CE39E829A9643F4E3855E4533BE2CABC6A57BD77846AA0",
-1
+1,
+{
+"Account": "rEiq1iAcpzP8WLjezP9MzAQEJ7jqKMLFSA",
+"Balance": "10832498417352",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 1,
+"Sequence": 66592377
+}
 ],
 [
 "43000F3A06267991E22D4680E528A474DE7E8735D42E7E6DE8A60135B1DD50F8",
-1
+1,
+{
+"Account": "rnqZnvzoJjdg7n1P9pmumJ7FQ5wxNH3gYC",
+"Balance": "4391144599533",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 0,
+"Sequence": 1197266
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -4967,7 +7277,16 @@
 "nodes": [
 [
 "99BDCA390059B408E54D281F24B3EE0798CEAAF015D50AF00E45A28E829EC0E5",
-1
+1,
+{
+"Account": "r1111148LRYpN2dRgHGbctVbTZCnGTSdF",
+"Balance": "13998210",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 10,
+"Sequence": 99908081,
+"TicketCount": 10
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -4976,15 +7295,33 @@
 "nodes": [
 [
 "54F498C513C2310A4AEFB3973CE01932A9EC3384D541A0297E096A84351F866D",
-1
+1,
+{
+"Account": "rEfFcvUUe3Cgxostr1EUjwJzTdFvCnjxdL",
+"Balance": "14001092",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 19,
+"Sequence": 99784947,
+"TicketCount": 19
+}
 ],
 [
 "5A0A49C5597BF4CA2CBF4DD6B6154196923A33BD361D26A41E4A89201F949352",
-2
+2,
+null
 ],
 [
 "A836B57CCADCC798458405C233C3B503CF0891C8366C2DDDB1CF63519E1B7600",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "3",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rEfFcvUUe3Cgxostr1EUjwJzTdFvCnjxdL",
+"RootIndex": "BFFF24AD0FF6837499A71414D5FDA80725004BF8D2E9D0B9BB5D4DFEEF2E6804"
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -4993,19 +7330,55 @@
 "nodes": [
 [
 "19DA952AFD2A81DDAED2B27247C273E8211677A0E2B81CD4606AA108FFB06D8B",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "32",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rU8QEjAbNbXDnBR7kx9TLPXsAEng3axsz4",
+"RootIndex": "0DDA6D2AC17DD3EBE6D1B12501AD57C43BDF3094EFA1CD561B5BE6CD45EBDE93"
+}
 ],
 [
 "71452F5E61981D2E69D9D837D28D83CF1D289A9D744371A8C116B862F2EB50F7",
-0
+0,
+{
+"Account": "rU8QEjAbNbXDnBR7kx9TLPXsAEng3axsz4",
+"BookDirectory": "CFEC8953D22B1B50F20F46ECBCD51990A26BDB71951ED8265A209666FD2FB356",
+"LedgerEntryType": "Offer",
+"OwnerNode": "51",
+"Sequence": 99145352,
+"TakerGets": {
+"currency": "524C555344000000000000000000000000000000",
+"issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",
+"value": "6"
+},
+"TakerPays": "5503541"
+}
 ],
 [
 "CFEC8953D22B1B50F20F46ECBCD51990A26BDB71951ED8265A209666FD2FB356",
-0
+0,
+{
+"ExchangeRate": "5a209666fd2fb356",
+"LedgerEntryType": "DirectoryNode",
+"RootIndex": "CFEC8953D22B1B50F20F46ECBCD51990A26BDB71951ED8265A209666FD2FB356",
+"TakerGetsCurrency": "524C555344000000000000000000000000000000",
+"TakerGetsIssuer": "E5E961C6A025C9404AA7B662DD1DF975BE75D13E"
+}
 ],
 [
 "DF3E7DF03966025A39DA70FCDA0822FA4D54F21A546942B2EB94A4DF2F319CB3",
-1
+1,
+{
+"Account": "rU8QEjAbNbXDnBR7kx9TLPXsAEng3axsz4",
+"Balance": "1113402891",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 14,
+"Sequence": 99145353
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -5014,27 +7387,64 @@
 "nodes": [
 [
 "0D4D8F21CD73DF1206FD77902CC85651FFA6501E13594BEC981DA6F44655B729",
-0
+0,
+{
+"Account": "rUqqN1KKvLSknssUXrLX48vtnNdpvaqsZ7",
+"BookDirectory": "49789A0B460DC77A2CED9349C432AEA97352345BA3C7313A5A04EF2FDCCE65F6",
+"LedgerEntryType": "Offer",
+"Sequence": 40612777,
+"TakerGets": {
+"currency": "CNY",
+"issuer": "rKiCet8SdvWxPXnAgYarFUXMh1zCPz432Y",
+"value": "720000.0700000001"
+},
+"TakerPays": "100000000000"
+}
 ],
 [
 "1BBEACDDD4D74F0AC4548C926F22916D6B00C59C24FFC036D6D66F0456A3A947",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rUqqN1KKvLSknssUXrLX48vtnNdpvaqsZ7",
+"RootIndex": "1BBEACDDD4D74F0AC4548C926F22916D6B00C59C24FFC036D6D66F0456A3A947"
+}
 ],
 [
 "378BE4D004D7467F0513BBC2630E05CFC8188EFD874E821F4FDFFAA6F97D1005",
-2
+2,
+null
 ],
 [
 "47AA01718D2EEC8C55C99463B8BA8BC4E1EDD346737FE9AC9A715B10653E7326",
-1
+1,
+{
+"Account": "rUqqN1KKvLSknssUXrLX48vtnNdpvaqsZ7",
+"Balance": "92479599",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 2,
+"Sequence": 40612778
+}
 ],
 [
 "49789A0B460DC77A2CED9349C432AEA97352345BA3C7313A5A04EF2FDCCE65F6",
-0
+0,
+{
+"ExchangeRate": "5a04ef2fdcce65f6",
+"LedgerEntryType": "DirectoryNode",
+"RootIndex": "49789A0B460DC77A2CED9349C432AEA97352345BA3C7313A5A04EF2FDCCE65F6",
+"TakerGetsCurrency": "000000000000000000000000434E590000000000",
+"TakerGetsIssuer": "CED6E99370D5C00EF4EBF72567DA99F5661BFB3A"
+}
 ],
 [
 "49789A0B460DC77A2CED9349C432AEA97352345BA3C7313A5A04EF2FE3B4762E",
-2
+2,
+null
 ]
 ],
 "ter": "tesSUCCESS"
@@ -5043,7 +7453,16 @@
 "nodes": [
 [
 "49019F93407A7023A8A1419F366948E2728BBC9F14F5862DFE347CD50B2A3AE4",
-1
+1,
+{
+"Account": "rGgNuC3J2NVym5RHJw9kK1pPB6tFt5CdRc",
+"Balance": "13999922",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 21,
+"Sequence": 99828811,
+"TicketCount": 21
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -5052,7 +7471,16 @@
 "nodes": [
 [
 "23F6E30C693EEE6E45269E9B2DFDFE85B91B55C03A2C253AC76EB1319C292BD3",
-1
+1,
+{
+"Account": "rv2A6mKaBkSnQwycYBwX41Z7cp7qon7UQ",
+"Balance": "13993626",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 30,
+"Sequence": 99827897,
+"TicketCount": 30
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -5061,7 +7489,16 @@
 "nodes": [
 [
 "724D355A89CE55EE7BD35543D0F9E2BE32AB9F2CE58B04D73F6CAACE1CB76675",
-1
+1,
+{
+"Account": "rHVx8hFzZbbWQkSntBy596cJ8kWUWSGihx",
+"Balance": "13999286",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 38,
+"Sequence": 104000550,
+"TicketCount": 38
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -5070,15 +7507,33 @@
 "nodes": [
 [
 "281C57178C4215AE2D7CDBC7DC8C9A3500465665BF180DC8F7C126830F603181",
-1
+1,
+{
+"Account": "rUJ9JP1bYpZ9NABCy9WQUknYD4RBY2aHmc",
+"Balance": "14151315",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 16,
+"Sequence": 104019037,
+"TicketCount": 16
+}
 ],
 [
 "50860303E97BFC502CEFF7DD446B1B7F682A720B28D77ABF4E8ED9CE57EBD68A",
-2
+2,
+null
 ],
 [
 "7E7A74D87C2DADF09FA8C4CC8AA8F69E4234082166BB441BE6AC9A12719C02D6",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "2",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rUJ9JP1bYpZ9NABCy9WQUknYD4RBY2aHmc",
+"RootIndex": "C7808D6ED47F26DEB6632F342F298395E06E7CB4A09D5593BF4A0B696DD71019"
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -5087,15 +7542,33 @@
 "nodes": [
 [
 "23E25A7557A5F93710F3D0035B8EFA3E05E816760C08D2BFDE17736917F789FE",
-2
+2,
+null
 ],
 [
 "4ABCA9D5583F7E80D9E40731D9815C8342655A5D6211BEF01B639785F420CAE0",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rG5Ugapwm2Jvz34aFfTyCzPkTmWV67DRHb",
+"RootIndex": "52BDA1D0D4A51A655AB8E1CC3B702B3BADCD1E0B061D1B8F8D5309D03876454E"
+}
 ],
 [
 "5F109781A45479EADAA8779349409E1E8BF4E55677B9F8ECEC92ADB84C578898",
-1
+1,
+{
+"Account": "rG5Ugapwm2Jvz34aFfTyCzPkTmWV67DRHb",
+"Balance": "13996146",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 14,
+"Sequence": 104000349,
+"TicketCount": 14
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -5104,15 +7577,33 @@
 "nodes": [
 [
 "313E63B3B2A2B3DC63A8F8A1FF124DA4E30B99BCC258D56BE18F24CDAB5DCDF7",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rHVx8hFzZbbWQkSntBy596cJ8kWUWSGihx",
+"RootIndex": "D4F8883050E92A220B1434922565C55C4A50022BF5B8B52C94FC646560F8FE2B"
+}
 ],
 [
 "5C567B1E66150250FE2D754B37238A0EE009235CE0CD2CFCD28D657E231A0C29",
-2
+2,
+null
 ],
 [
 "724D355A89CE55EE7BD35543D0F9E2BE32AB9F2CE58B04D73F6CAACE1CB76675",
-1
+1,
+{
+"Account": "rHVx8hFzZbbWQkSntBy596cJ8kWUWSGihx",
+"Balance": "13999276",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 37,
+"Sequence": 104000550,
+"TicketCount": 37
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -5121,7 +7612,16 @@
 "nodes": [
 [
 "93ABD8292A43A4AD65F2BB8B8E7D5F7FB5B249CFC5ACBBF2A217F5EE094010C2",
-1
+1,
+{
+"Account": "rGV95kjT5Tqu8S3XDQ2CTYNo51RMGCaWnm",
+"Balance": "13999992",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 33,
+"Sequence": 104018010,
+"TicketCount": 33
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -5130,15 +7630,33 @@
 "nodes": [
 [
 "313E63B3B2A2B3DC63A8F8A1FF124DA4E30B99BCC258D56BE18F24CDAB5DCDF7",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rHVx8hFzZbbWQkSntBy596cJ8kWUWSGihx",
+"RootIndex": "D4F8883050E92A220B1434922565C55C4A50022BF5B8B52C94FC646560F8FE2B"
+}
 ],
 [
 "724D355A89CE55EE7BD35543D0F9E2BE32AB9F2CE58B04D73F6CAACE1CB76675",
-1
+1,
+{
+"Account": "rHVx8hFzZbbWQkSntBy596cJ8kWUWSGihx",
+"Balance": "13999306",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 38,
+"Sequence": 104000548,
+"TicketCount": 38
+}
 ],
 [
 "83CD49AC076373507FC61C9ED1C7B1EFCF2C2BAF0B0382C345EE04977C42F95C",
-2
+2,
+null
 ]
 ],
 "ter": "tecKILLED"
@@ -5147,179 +7665,449 @@
 "nodes": [
 [
 "0E18F23D91960A4BB2D37D44FD6FF5166D3CBE0C14419D65877555D6D3ABADC4",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005492
+}
 ],
 [
 "136CD371F43D93A20CEB41F6A836A941CA584B058EC14F99D4107021F837F89F",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "2",
+"TicketSequence": 104005499
+}
 ],
 [
 "1F7C720BD382BE6560DB6C31D61867A427FA5D9CF0C4BA6A676FA5BAC62650DA",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005476
+}
 ],
 [
 "22D41F81208ACC87935A2E75B479E55B24F2D591AA122429D59D295A4389C866",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005473
+}
 ],
 [
 "23D3CC5A577DA2A8E8139B269D3D1E760DB5F15BBB66ACA6DFADB6CD9A1EAE16",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005480
+}
 ],
 [
 "26FB5BB1D3DED1BC7DCEEFBDB00E4D07F836CC3207EAE213CC06D32A2047658A",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005495
+}
 ],
 [
 "29D2E80EE5D315978630BF9D91EDEEB2B9F02FBBAF2B7D80CCE641E2C13A04C9",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005475
+}
 ],
 [
 "30C115A2926B8C477777D8470816E5889663F8E97796920F10AE2C62C7FC2C6F",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "2",
+"TicketSequence": 104005508
+}
 ],
 [
 "398D18EC9C1C230A9885F4BCF29DE6DEEDD14A837947D861EE05C610D0C09CC9",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "2",
+"TicketSequence": 104005502
+}
 ],
 [
 "3A021A9D5E10A44D283F9953B38821780433ACF139651572AF3256BC30EBDEE7",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005490
+}
 ],
 [
 "415398879E24B1EB40EB2FCD2FDAD013FE24CBD9BE229B6E1DB20CCD5DC696F3",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005469
+}
 ],
 [
 "53F740DC05080751454D29EAD8640A2E517BAFD3D4A79CF2E44A44A0A5448605",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "2",
+"TicketSequence": 104005498
+}
 ],
 [
 "540ACB443B9F03E3186BA81D1655CFD0F11D16B7B33CB29844644D1F223A5846",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005483
+}
 ],
 [
 "5E3E91740501DEC193A13E709126156173CC25CA535E5FACC9280913A3D1F21F",
-0
+0,
+{
+"IndexPrevious": "1",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"RootIndex": "9CE3C9EB332EDF261C62DFA85635DC92852F370B26397020A30F93D64D103E9C"
+}
 ],
 [
 "63DF142DAC3FCDCD27CEB8138A8F2044B76D0B2DEDBFE0B55FBCEE5B0D4B694C",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "2",
+"TicketSequence": 104005505
+}
 ],
 [
 "648F878026B385EE546DE24CA1B5F4775F87603BCCCBD9AA8E4E9C605E265671",
-1
+1,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"Balance": "13998892",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 50,
+"Sequence": 104005509,
+"TicketCount": 50
+}
 ],
 [
 "66CDF3024B55A2CF633EBC29752012C866FAAEB5E3D6480EC3BA68FF6C08FD7D",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005470
+}
 ],
 [
 "6EFF294E73397EBA4A2467E963E83C731AF0D8DF9E99A30B810E2F1F77DB32E1",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005479
+}
 ],
 [
 "74958074818AE1B353567DC7E2662935B17E79D1597B9942DD51AE765A37816D",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005487
+}
 ],
 [
 "8007FEBA4F7C599106457941A6679F180DE39C9D88574FC62310986D70F74042",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "2",
+"TicketSequence": 104005507
+}
 ],
 [
 "8122CEFC38E220DD6B480266FFECE82262792277363E0B95F877700432979A98",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "2",
+"TicketSequence": 104005504
+}
 ],
 [
 "8151D03289CDAA9673A7FD89B6E094F1962907A070A1BF559055C15551362412",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "2",
+"TicketSequence": 104005503
+}
 ],
 [
 "833240FCAC2033A056A2B3B502852BE6EA7B60A831D898F7B27D37403F07438A",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005474
+}
 ],
 [
 "975D2C8E12D44008C1EFABA001FA6FA3F9647623E8AE14018E2EB3FBC4BCEA56",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005491
+}
 ],
 [
 "9C7DD9E619FCB3255CEFA34944AB48134A1428D252AA2A3C6BAB5F0B9C115494",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005497
+}
 ],
 [
 "9CE3C9EB332EDF261C62DFA85635DC92852F370B26397020A30F93D64D103E9C",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "1",
+"IndexPrevious": "2",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"RootIndex": "9CE3C9EB332EDF261C62DFA85635DC92852F370B26397020A30F93D64D103E9C"
+}
 ],
 [
 "A9C21B6532450B38697C33CE9212F40F55F72BF1424099C67A200A8EACD42A01",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "2",
+"TicketSequence": 104005501
+}
 ],
 [
 "AE1944971222ED4ABD64E07F9A9C4E76A96547FA85E4022E4F83E0A668EDE72E",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005478
+}
 ],
 [
 "B3910F8E6E1B61054701C35F3A9FC74BBA8B9A110A6E9B7E106FC1569D8DDC41",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005481
+}
 ],
 [
 "BF009B51665DCC839E934B8D8C0DE8992F7787A3CD9688E11EC8455758436181",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005496
+}
 ],
 [
 "C3E2EAF4F5815701466CA0372E943E50FEE506716D5786AF7B55450CC2FF978B",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005471
+}
 ],
 [
 "C5FA4180EAB8B6D327AA6626C4DAF0E1AD6A9A6EE601BEAA0BBFF817AAE657F4",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005472
+}
 ],
 [
 "C96BAEA5B693E9092ED12EDB9F66C0B9DB902FCCFAE1CAA0A5933E4C4230437B",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005486
+}
 ],
 [
 "C997C3EE25AD75F3CF4CFE1F7306207942D652A95B203F5A9ACE821B589CCBA0",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "2",
+"TicketSequence": 104005500
+}
 ],
 [
 "D13BD138A8E99250B754C58C9AAC2BEF81724AFA597B1649404CEF8D0A4D05E2",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005477
+}
 ],
 [
 "D2FEDB49D0D735DE0F0C503F1AFEC7886BB9555B178300FFEBED5D6E11083295",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005489
+}
 ],
 [
 "DD884214E0B153A0445BB60A018E607793B0F47EB68EDC21423C978B57C297B8",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005488
+}
 ],
 [
 "E0442C7DAA529E1EACB10821D3907DED9DA7B5F426E988B569327875775630AF",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005482
+}
 ],
 [
 "E2268FCCB0BA50AE4FB4E111DF0B5ECED76233BEB865B1FD1F517DEBB1B41E17",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005494
+}
 ],
 [
 "E3B7B6375512810FA49D032E91DEB19A699ED92AB2F7674C264146782FA3A80D",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005485
+}
 ],
 [
 "E6EFEE2A79CD770A7ED2211CFF30FBEC6F9B0F45CDAF085F13AA04CCAC6DE494",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005493
+}
 ],
 [
 "E9D73907E15600F05D3042C30321A173BF362976D43AE6AFAB477F4BD119C1D7",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "1",
+"TicketSequence": 104005484
+}
 ],
 [
 "FCAF188F4D9F747C801B8F9654BBC123434EBD24A47A9E8CD959EFFF27FF2C9F",
-0
+0,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"LedgerEntryType": "Ticket",
+"OwnerNode": "2",
+"TicketSequence": 104005506
+}
 ],
 [
 "FE76741767A219844377058C14E248B8DB8504A486B2E00633ED5F6DF1364900",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "2",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"RootIndex": "9CE3C9EB332EDF261C62DFA85635DC92852F370B26397020A30F93D64D103E9C"
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -5328,27 +8116,66 @@
 "nodes": [
 [
 "27F5A71D428F0E138DD9DBCB2541D7946CDE858C7924CD89E93C0353A87BD0DD",
-2
+2,
+null
 ],
 [
 "A46F22FC7914CED181AE63F501B59582A0C8564697124324C095A29914CFB34F",
-1
+1,
+{
+"Account": "rLDyWWMiW6sQQGEz76s9vTYbWHBf6XuR2Y",
+"Balance": "9685621",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 8,
+"Sequence": 103000586,
+"TicketCount": 3
+}
 ],
 [
 "B287BC19CDB0DEE110A47999608AFBB07D1F45E07E43F5B167C3865890CD4D08",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rLDyWWMiW6sQQGEz76s9vTYbWHBf6XuR2Y",
+"RootIndex": "B287BC19CDB0DEE110A47999608AFBB07D1F45E07E43F5B167C3865890CD4D08"
+}
 ],
 [
 "CF441AB052421504E4186D2536273BCFE09B4A0B219E9BB9C087C591061DDC3C",
-0
+0,
+{
+"Account": "rLDyWWMiW6sQQGEz76s9vTYbWHBf6XuR2Y",
+"BookDirectory": "CFEC8953D22B1B50F20F46ECBCD51990A26BDB71951ED8265A209E927DDF6541",
+"Expiration": 837633199,
+"LedgerEntryType": "Offer",
+"Sequence": 103000585,
+"TakerGets": {
+"currency": "524C555344000000000000000000000000000000",
+"issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",
+"value": "84.835992"
+},
+"TakerPays": "77892601"
+}
 ],
 [
 "CFEC8953D22B1B50F20F46ECBCD51990A26BDB71951ED8265A209E927DDF6541",
-0
+0,
+{
+"ExchangeRate": "5a209e927ddf6541",
+"LedgerEntryType": "DirectoryNode",
+"RootIndex": "CFEC8953D22B1B50F20F46ECBCD51990A26BDB71951ED8265A209E927DDF6541",
+"TakerGetsCurrency": "524C555344000000000000000000000000000000",
+"TakerGetsIssuer": "E5E961C6A025C9404AA7B662DD1DF975BE75D13E"
+}
 ],
 [
 "CFEC8953D22B1B50F20F46ECBCD51990A26BDB71951ED8265A20A1DC161A4960",
-2
+2,
+null
 ]
 ],
 "ter": "tesSUCCESS"
@@ -5357,7 +8184,16 @@
 "nodes": [
 [
 "48F8278676432A63F256C7A4BA9775AB59FA9702E26FEFF60902FDA823E3CA2A",
-1
+1,
+{
+"Account": "rLF2oRBVSscD3s49rZwh3vCY1BJYySK4hj",
+"Balance": "13997986",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 23,
+"Sequence": 104021241,
+"TicketCount": 23
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -5366,15 +8202,33 @@
 "nodes": [
 [
 "3F4CE9FD7F0AAA8F1B490212D268470FBA398F449A9D083D658F945C3D71BEEF",
-2
+2,
+null
 ],
 [
 "7BFECAC6437F5BDF066A13DC77A6A10D52705192E04BDF2E15C1F46A8346D0EB",
-1
+1,
+{
+"Account": "rnBMq5qMmapAASbkTcghKxfH3bctuTm5E9",
+"Balance": "13998052",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 16,
+"Sequence": 104020303,
+"TicketCount": 16
+}
 ],
 [
 "8F0C286366F9FE8C2107FFF972BD8BE1E1974A8CA76C05319326F78A4F404738",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rnBMq5qMmapAASbkTcghKxfH3bctuTm5E9",
+"RootIndex": "782C84994402B8CE92BCE010E09AC0299B0A64315151B9D980D2009869A497D9"
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -5383,15 +8237,32 @@
 "nodes": [
 [
 "7E53E5244F94B3C9180BCC40108FE6DE072341BD76B65AEE2B9E477956A154F8",
-2
+2,
+null
 ],
 [
 "ED8D9A3BA9E8C182551DBCB1CA308F78021668CD7C6AFDF5893098D1575AAB8A",
-1
+1,
+{
+"Flags": 0,
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rMiyThqhMNx5wcGZ7313dVpTRh8T1Yd5Ew",
+"RootIndex": "AC26C99674201BCFB7E404CBA8587EAC9B30855600C9F71E785D1AEEB68417A3"
+}
 ],
 [
 "F07AFFF4300E114FA867D09EB99B9CC59D1763C995981A744871FA8244DD2D66",
-1
+1,
+{
+"Account": "rMiyThqhMNx5wcGZ7313dVpTRh8T1Yd5Ew",
+"Balance": "409440024",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 13,
+"Sequence": 101284274,
+"TicketCount": 13
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -5400,15 +8271,33 @@
 "nodes": [
 [
 "49019F93407A7023A8A1419F366948E2728BBC9F14F5862DFE347CD50B2A3AE4",
-1
+1,
+{
+"Account": "rGgNuC3J2NVym5RHJw9kK1pPB6tFt5CdRc",
+"Balance": "13999912",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 20,
+"Sequence": 99828811,
+"TicketCount": 20
+}
 ],
 [
 "813CAD270ADB5D0DD342D45F9D9B979B3953DCB0BF3FE12FF0B212DB930780E4",
-2
+2,
+null
 ],
 [
 "C201F27144E5C6CF4DD2D823ADB78AE9E6E1EBEDF8E3C60BFC02AA93F260D2E6",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "5",
+"IndexPrevious": "1",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rGgNuC3J2NVym5RHJw9kK1pPB6tFt5CdRc",
+"RootIndex": "354176EBC42E5B03269E0F2A3F7E683C3C5B11EA9AB8B1FBF6F483B2308BD260"
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -5417,7 +8306,16 @@
 "nodes": [
 [
 "E2A9665A06E0D151C23C1AD9A1FDEBCB8A9833CAC3E688019B9158EA285BDE3B",
-1
+1,
+{
+"Account": "r9d8RhfTnjnYTfVJjVoKG6diUWa14hDi4e",
+"Balance": "13996656",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 26,
+"Sequence": 104020926,
+"TicketCount": 26
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -5426,15 +8324,33 @@
 "nodes": [
 [
 "700B81A1F05FD463AB198E4869980704D8C66A5FBE95D5B03A5938C51AA468DF",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rDf5rV5izb5wTEFmFnJ5j48Vcjt7SrkFkv",
+"RootIndex": "BD02BB0179EF2ADC2B817FCD3E48780D34C7553DA81A5B9E0C954E686F23DB50"
+}
 ],
 [
 "A66BAF43D48314A5B0E0DF3FBCF69083621CA171C6E58B91B1E38117DBCF80CB",
-2
+2,
+null
 ],
 [
 "EAF7F01BB98FD796FB6EDDCA2912BFC598FF5B8AD8D6E025C185FF984B792DD8",
-1
+1,
+{
+"Account": "rDf5rV5izb5wTEFmFnJ5j48Vcjt7SrkFkv",
+"Balance": "13999958",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 24,
+"Sequence": 104020213,
+"TicketCount": 24
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -5443,7 +8359,16 @@
 "nodes": [
 [
 "0DD1E734EE5F577CDEB4A9F17FD234CFB55C6C7A56B593001117DB0A00F0A864",
-1
+1,
+{
+"Account": "rnpg6xj9tJjogPy4TedXAQCauxgcPMcqcn",
+"Balance": "409732272",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 27,
+"Sequence": 101283578,
+"TicketCount": 27
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -5452,7 +8377,16 @@
 "nodes": [
 [
 "CDB38FAF3FC2A6D0514614C62DA58717A4A57A83ED6042A6264118EFD4B53417",
-1
+1,
+{
+"Account": "rcM75s3cJXspn77CGV1Ga7BTbomWejcUF",
+"Balance": "13993566",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 20,
+"Sequence": 100159647,
+"TicketCount": 20
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -5461,15 +8395,33 @@
 "nodes": [
 [
 "2F80E17F3CF87A10CE12CDBFD3BFE93A1BD60F6FB42AB7D34515B1B832BB2E81",
-2
+2,
+null
 ],
 [
 "930A4718766B94D319E01EBA03C938B1208DA1A4F9A912C75E30651F97234E97",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "11",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rTWaZ8yXyDZXU8x6CUxEB3CF9wEUSJf5w",
+"RootIndex": "3A73241752E5E276E72455A12C72DFCCA8244E18EBA2BB2887DF6E4E443D6C71"
+}
 ],
 [
 "D528DA33DC8FAAAAC7A31179F61987DE01E2E624FE7EA8CE12EA8F361E1DC792",
-1
+1,
+{
+"Account": "rTWaZ8yXyDZXU8x6CUxEB3CF9wEUSJf5w",
+"Balance": "13984152",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 12,
+"Sequence": 100157171,
+"TicketCount": 12
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -5478,15 +8430,33 @@
 "nodes": [
 [
 "32F7E1B6FC9C6B576BB5F70A4DDD1CAA80DFE261C9A0240A9E30CBCE80318925",
-2
+2,
+null
 ],
 [
 "930A4718766B94D319E01EBA03C938B1208DA1A4F9A912C75E30651F97234E97",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "11",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rTWaZ8yXyDZXU8x6CUxEB3CF9wEUSJf5w",
+"RootIndex": "3A73241752E5E276E72455A12C72DFCCA8244E18EBA2BB2887DF6E4E443D6C71"
+}
 ],
 [
 "D528DA33DC8FAAAAC7A31179F61987DE01E2E624FE7EA8CE12EA8F361E1DC792",
-1
+1,
+{
+"Account": "rTWaZ8yXyDZXU8x6CUxEB3CF9wEUSJf5w",
+"Balance": "13984182",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 13,
+"Sequence": 100157169,
+"TicketCount": 13
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -5495,7 +8465,16 @@
 "nodes": [
 [
 "23F6E30C693EEE6E45269E9B2DFDFE85B91B55C03A2C253AC76EB1319C292BD3",
-1
+1,
+{
+"Account": "rv2A6mKaBkSnQwycYBwX41Z7cp7qon7UQ",
+"Balance": "13993616",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 30,
+"Sequence": 99827898,
+"TicketCount": 30
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -5504,23 +8483,49 @@
 "nodes": [
 [
 "10C6DCF73F6F51EF02651A5A49309652293FD7B3BF8F91C1735CC7941FCAE9DE",
-1
+1,
+{
+"Account": "rSSMYf7Qae4MUvVyjAT7wSHXwAqRLd3B9",
+"Balance": "409996179",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 17,
+"Sequence": 101283257,
+"TicketCount": 17
+}
 ],
 [
 "574697388B8B75B09AB180D404515A72F0824F309AB447B37FA6F0CB490101BB",
-1
+1,
+{
+"Flags": 0,
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rSSMYf7Qae4MUvVyjAT7wSHXwAqRLd3B9",
+"RootIndex": "DE90BA6DDFC3734C1687A84152C35BA2BB331DDA28B97FEAD4C46F8C76EB070E"
+}
 ],
 [
 "652F68555D5E2CE4B6EB51123DA0AA2CEA232C81D13C4837CF2B2520652C574B",
-2
+2,
+null
 ],
 [
 "6B59E97BFB3E4FF55767292787B8F8CB4BE87E72D53F31B47DE7186BEF843189",
-2
+2,
+null
 ],
 [
 "DE90BA6DDFC3734C1687A84152C35BA2BB331DDA28B97FEAD4C46F8C76EB070E",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "65d",
+"IndexPrevious": "65d",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rSSMYf7Qae4MUvVyjAT7wSHXwAqRLd3B9",
+"RootIndex": "DE90BA6DDFC3734C1687A84152C35BA2BB331DDA28B97FEAD4C46F8C76EB070E"
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -5529,15 +8534,32 @@
 "nodes": [
 [
 "2073683187C9842892BAD411305B71909D320D98805C2EBFCADBDCDD252EA982",
-1
+1,
+{
+"Flags": 0,
+"IndexPrevious": "14",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rsiTX1Z59Nm7nbCRy86w1L5FKvz23dRVVo",
+"RootIndex": "08D22C03B45CC4B51B601BBE4DCF7AE9ACF44483CCB2199ED981BE0B119ABE7C"
+}
 ],
 [
 "7973DC8F41925C8672CEB8FE03E90C171745CF1D14216C45EC793BE18D86FED4",
-1
+1,
+{
+"Account": "rsiTX1Z59Nm7nbCRy86w1L5FKvz23dRVVo",
+"Balance": "14035433",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 41,
+"Sequence": 99871862,
+"TicketCount": 40
+}
 ],
 [
 "D1F22996A6B3B93F05D4856276470113847075AED7A6A2B2688C9BC5746AEAFB",
-2
+2,
+null
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -5546,15 +8568,33 @@
 "nodes": [
 [
 "554D2E7BB7AC0C6D3EEA64A3510B6285A1A1BA00C040D2CC988D54A6F9B26623",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "4",
+"IndexPrevious": "1",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "r9d8RhfTnjnYTfVJjVoKG6diUWa14hDi4e",
+"RootIndex": "36A1D9BC15CF7B6D3311A219280CA00D52E94B5FA1890F27CC53E93D5F47C0ED"
+}
 ],
 [
 "7FD0F587883F3D16A1DF1C07D509CAA2D0A58C986E3054C2F5C24398FA5C19F5",
-2
+2,
+null
 ],
 [
 "E2A9665A06E0D151C23C1AD9A1FDEBCB8A9833CAC3E688019B9158EA285BDE3B",
-1
+1,
+{
+"Account": "r9d8RhfTnjnYTfVJjVoKG6diUWa14hDi4e",
+"Balance": "13996646",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 25,
+"Sequence": 104020926,
+"TicketCount": 25
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -5563,15 +8603,33 @@
 "nodes": [
 [
 "33A00840EF26EB4988535A6105323DF7973E866FF49940DBFAE15D7F10008568",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "c",
+"IndexPrevious": "a",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rKYineK91kKQM5EuntTcyeGKoEdgi1qbHd",
+"RootIndex": "DFE947B698ED1312BBD4CD4B410E2232BA5FBF409B898C930A3EFA791B334510"
+}
 ],
 [
 "6F997121D07CD80A1492CB2DD9FBE30C6007C6242F6F48BBD8BFD9B281A06865",
-1
+1,
+{
+"Account": "rKYineK91kKQM5EuntTcyeGKoEdgi1qbHd",
+"Balance": "14000442",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 22,
+"Sequence": 103999564,
+"TicketCount": 22
+}
 ],
 [
 "7B673C44F9B5219BB6247D83C821C75381393C37B4875592CA688A583B992CEF",
-2
+2,
+null
 ]
 ],
 "ter": "tecKILLED"
@@ -5580,15 +8638,33 @@
 "nodes": [
 [
 "414C6BDFCB977354C1CBADB49AC1464A9DCDBCA76EB28D8AC563F7DAC83A75E9",
-2
+2,
+null
 ],
 [
 "45B6170E70903458470EF8B586F00B452FF660A0C9416955138015E90633D855",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rKNRrawfVS59C3tN1bBiUWc5wZQAfUPh7z",
+"RootIndex": "D880CFF95381C608AA11FD19B71B02DF018407C5EAC8A1DF35B92B73C308222E"
+}
 ],
 [
 "DFB55DE47511B116439003E8203D6BC98FD9ABCBBEADC11FA6C9FB39F232280B",
-1
+1,
+{
+"Account": "rKNRrawfVS59C3tN1bBiUWc5wZQAfUPh7z",
+"Balance": "14026295",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 15,
+"Sequence": 104018044,
+"TicketCount": 15
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -5597,15 +8673,33 @@
 "nodes": [
 [
 "62C1D28E84D214D182519A4BD4A732F260E6EDE954BFC0029DD99EEDED0811BE",
-1
+1,
+{
+"Account": "rKAip1utYtL6hB64SGYnpacvaGn4tvkWm7",
+"Balance": "13999656",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 35,
+"Sequence": 103999792,
+"TicketCount": 35
+}
 ],
 [
 "B20E2CA9AB9407D51DBCC3AF6047B3585B9B4AD27C3CAD0FBF3CF237556A8E43",
-2
+2,
+null
 ],
 [
 "F06F0C8E7B7F7D0AA1180DCE6181E7EB8F439B0446CE6817151C0B8A6B02527B",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rKAip1utYtL6hB64SGYnpacvaGn4tvkWm7",
+"RootIndex": "F75E634A99F0CE811FFC03D55C7FA9FD8A001256D24F21F546365F3BA18F8DCB"
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -5614,7 +8708,16 @@
 "nodes": [
 [
 "E21CDA5E58137BC5C4A08461604AF8C6DBCA824CA5648CFE86432101B0A3B766",
-1
+1,
+{
+"Account": "rnJ1hb5qF36Nwdhvzpa8quMos4FtYRzrMq",
+"Balance": "32042052",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 69,
+"Sequence": 95620749,
+"TicketCount": 17
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -5623,15 +8726,33 @@
 "nodes": [
 [
 "0DD1E734EE5F577CDEB4A9F17FD234CFB55C6C7A56B593001117DB0A00F0A864",
-1
+1,
+{
+"Account": "rnpg6xj9tJjogPy4TedXAQCauxgcPMcqcn",
+"Balance": "409732282",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 27,
+"Sequence": 101283577,
+"TicketCount": 27
+}
 ],
 [
 "C49026C5FD48FAC19DB83C2948A62B19AD4A5575BD10907A09A809A6C5EAD8EC",
-2
+2,
+null
 ],
 [
 "DEEA1D143689982B3BB182744453B8F43A1A257CD1EED0630E52363AED903A01",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "659",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rnpg6xj9tJjogPy4TedXAQCauxgcPMcqcn",
+"RootIndex": "35B5B895E4705A209110068666F793262B85EA5020874FA89B5BB8E7161E774D"
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -5640,7 +8761,16 @@
 "nodes": [
 [
 "D528DA33DC8FAAAAC7A31179F61987DE01E2E624FE7EA8CE12EA8F361E1DC792",
-1
+1,
+{
+"Account": "rTWaZ8yXyDZXU8x6CUxEB3CF9wEUSJf5w",
+"Balance": "13984162",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 13,
+"Sequence": 100157171,
+"TicketCount": 13
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -5649,7 +8779,16 @@
 "nodes": [
 [
 "FB5950357101AD3A77E539E231AE85FA1AE7942798AE5EC1E12059041CE17802",
-1
+1,
+{
+"Account": "rPxrFexWD1M5Zdjisrjd7AtZwbt8GgsAtq",
+"Balance": "13999186",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 39,
+"Sequence": 104020225,
+"TicketCount": 39
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -5658,15 +8797,32 @@
 "nodes": [
 [
 "75D3AC0753427DD98A42EC19640682F350194E2B1F489B58D19CB0B551DFF170",
-2
+2,
+null
 ],
 [
 "F92CE44A923BD0B4B567FD934C0EED35872ED3D13F339009661856D41A22447A",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rwigBPN9DWpgnNZJLdH4EW9h5NegiJZgsd",
+"RootIndex": "4052328E970F6258EFD6E2D4839C5EAE604972B1986E9028C87065F410193024"
+}
 ],
 [
 "FD672B5E610DBDD96C30A85B651D6AEC852D2E8BD9CAF1B070A73B19DF780E19",
-1
+1,
+{
+"Account": "rwigBPN9DWpgnNZJLdH4EW9h5NegiJZgsd",
+"Balance": "13999796",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 19,
+"Sequence": 99831729,
+"TicketCount": 19
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -5675,15 +8831,32 @@
 "nodes": [
 [
 "160C2184D1263283D2E7E1DC0CF77176241A5C22FC2E056806239269B05BF003",
-2
+2,
+null
 ],
 [
 "648F878026B385EE546DE24CA1B5F4775F87603BCCCBD9AA8E4E9C605E265671",
-1
+1,
+{
+"Account": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"Balance": "13998882",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 49,
+"Sequence": 104005509,
+"TicketCount": 49
+}
 ],
 [
 "FE76741767A219844377058C14E248B8DB8504A486B2E00633ED5F6DF1364900",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "2",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rhDryH4Ertir4KTb1Uey5n4upxN1jfwMUX",
+"RootIndex": "9CE3C9EB332EDF261C62DFA85635DC92852F370B26397020A30F93D64D103E9C"
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -5692,7 +8865,16 @@
 "nodes": [
 [
 "E21CDA5E58137BC5C4A08461604AF8C6DBCA824CA5648CFE86432101B0A3B766",
-1
+1,
+{
+"Account": "rnJ1hb5qF36Nwdhvzpa8quMos4FtYRzrMq",
+"Balance": "32042292",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 69,
+"Sequence": 95620746,
+"TicketCount": 17
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -5701,7 +8883,16 @@
 "nodes": [
 [
 "A004F3644EE4FC2D6190ACE6A112035F69C67132DE015C8D3ECD66594AA0F2CA",
-1
+1,
+{
+"Account": "rmBdbQFdwTHAC1a98X6SA5BaXzfUcPwe7",
+"Balance": "13989876",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 17,
+"Sequence": 100162762,
+"TicketCount": 17
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -5710,39 +8901,123 @@
 "nodes": [
 [
 "10F41069DF7F0D8003EC9B451C8F2E9DD14C4E0B78360EC88621B7F80230812C",
-1
+1,
+{
+"Flags": 0,
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rPDjqYypN8c4uBxy7btf5W63eMrEDeyezw",
+"RootIndex": "10F41069DF7F0D8003EC9B451C8F2E9DD14C4E0B78360EC88621B7F80230812C"
+}
 ],
 [
 "112E2D6804E4D00084BE7438CCE533E4EE809785DA0FA9022897862926B4A483",
-1
+1,
+{
+"AMMID": "17F751F6F290D00894C3B770259AACDBEA63B5370E6AC460610C2A90D80CB528",
+"Account": "rPVpp3sfpYHavt9ZZSdAGhetjaYSHGzKqR",
+"Balance": "343654971",
+"Flags": 26214400,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 1,
+"Sequence": 105220891
+}
 ],
 [
 "1D5ECB192F62A9AC669DC88217F4C95B62F31A2B7BCE56CDD04E916745D9D576",
-2
+2,
+null
 ],
 [
 "29813022CC568CD5960E1B94386D26874ED00A559BFF923BDCAA7E31B2A8E359",
-0
+0,
+{
+"Balance": {
+"currency": "KVL",
+"issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji",
+"value": "863.17613768188"
+},
+"Flags": 1114112,
+"HighLimit": {
+"currency": "KVL",
+"issuer": "rPDjqYypN8c4uBxy7btf5W63eMrEDeyezw",
+"value": "0"
+},
+"LedgerEntryType": "RippleState",
+"LowLimit": {
+"currency": "KVL",
+"issuer": "rBe9aGHVMFDWgfTMqech3bgWYND1BhhziW",
+"value": "0"
+},
+"LowNode": "79e"
+}
 ],
 [
 "37F049664C372AE2FA66F6201EAA0A3F84ECEE5B4EF10643D96D55E5C52EAEFE",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "79d",
+"IndexPrevious": "73a",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rBe9aGHVMFDWgfTMqech3bgWYND1BhhziW",
+"RootIndex": "06EC6BB85F015650AF02A9EA9FD5BD8E5A6231C0F268C2716CDF43440C17D3A9"
+}
 ],
 [
 "78AB4F3C837738DA13CC9CEE20F653F3E288808CC43618F6E0F31FFCB5E6B212",
-1
+1,
+{
+"Account": "rBe9aGHVMFDWgfTMqech3bgWYND1BhhziW",
+"Balance": "402191876",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 70,
+"Sequence": 101285039,
+"TicketCount": 68
+}
 ],
 [
 "8E51B525F93B949C54C50DFEE43BB611263A7DAC8DB0EA66B62D0F441B08B83E",
-1
+1,
+{
+"Flags": 0,
+"IndexPrevious": "79d",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rBe9aGHVMFDWgfTMqech3bgWYND1BhhziW",
+"RootIndex": "06EC6BB85F015650AF02A9EA9FD5BD8E5A6231C0F268C2716CDF43440C17D3A9"
+}
 ],
 [
 "9AC259C1FBD8FD79336FD6DAE9C69466E3C8E9238D188C9254F876602FFDE4E3",
-1
+1,
+{
+"LedgerEntryType": "AccountRoot"
+}
 ],
 [
 "A6878A3EA4F953A36A0CC99279176A43234E3863AEB7CD8CE81868AF3C2178F9",
-1
+1,
+{
+"Balance": {
+"currency": "KVL",
+"issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji",
+"value": "-42511.21002770102"
+},
+"Flags": 16908288,
+"HighLimit": {
+"currency": "KVL",
+"issuer": "rPVpp3sfpYHavt9ZZSdAGhetjaYSHGzKqR",
+"value": "0"
+},
+"HighNode": "0",
+"LedgerEntryType": "RippleState",
+"LowLimit": {
+"currency": "KVL",
+"issuer": "rPDjqYypN8c4uBxy7btf5W63eMrEDeyezw",
+"value": "0"
+},
+"LowNode": "0"
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -5751,19 +9026,52 @@
 "nodes": [
 [
 "2D9F71A4A640025A4C3908E2955702EF7ABC2C88135FAB989184F8997D23B155",
-1
+1,
+{
+"Flags": 0,
+"LedgerEntryType": "DirectoryNode",
+"Owner": "r3gNScTTi6sN6WbQuoJq3aau8LiinkgGvf",
+"RootIndex": "2D9F71A4A640025A4C3908E2955702EF7ABC2C88135FAB989184F8997D23B155"
+}
 ],
 [
 "3D4E277AEE3D0658BBA1EE7DCE9D3F329CD4CE1D690C97ADF941B9BEBDFD04A4",
-1
+1,
+{
+"Account": "r3gNScTTi6sN6WbQuoJq3aau8LiinkgGvf",
+"Balance": "85468379",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 2,
+"Sequence": 105020670
+}
 ],
 [
 "AF7B18610F467FBE16142AC430A1F23B91565AD2DCB7506614165E18646A8F56",
-0
+0,
+{
+"Account": "r3gNScTTi6sN6WbQuoJq3aau8LiinkgGvf",
+"BookDirectory": "CFEC8953D22B1B50F20F46ECBCD51990A26BDB71951ED8265A209D6C637B0893",
+"LedgerEntryType": "Offer",
+"Sequence": 105020669,
+"TakerGets": {
+"currency": "524C555344000000000000000000000000000000",
+"issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",
+"value": "3.80860160347218"
+},
+"TakerPays": "3496406"
+}
 ],
 [
 "CFEC8953D22B1B50F20F46ECBCD51990A26BDB71951ED8265A209D6C637B0893",
-0
+0,
+{
+"ExchangeRate": "5a209d6c637b0893",
+"LedgerEntryType": "DirectoryNode",
+"RootIndex": "CFEC8953D22B1B50F20F46ECBCD51990A26BDB71951ED8265A209D6C637B0893",
+"TakerGetsCurrency": "524C555344000000000000000000000000000000",
+"TakerGetsIssuer": "E5E961C6A025C9404AA7B662DD1DF975BE75D13E"
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -5772,7 +9080,16 @@
 "nodes": [
 [
 "5D55FB6178DA51C3750E6C8CC20CFE3D90F8A2AD20A3CED39BBAB8B22D628B5B",
-1
+1,
+{
+"Account": "rGpYbhGeQZTia8VWc4yKQ882H2rxYDiJti",
+"Balance": "409705919",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 60,
+"Sequence": 101285491,
+"TicketCount": 59
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -5781,15 +9098,33 @@
 "nodes": [
 [
 "2D2BD5ED79FE6DA42C73565FA104D26F59E754AC9EC714D3E69572ADDB63659D",
-2
+2,
+null
 ],
 [
 "7CDBD50EFDE40C005980E6682DD0478521D3B32A94B05EF8741861D2A3E45CE6",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "r3oKq23fV6HxnUgEWV9epzf1hPhi5Be7nA",
+"RootIndex": "F53BB712948491428A6E496C352FA06F4776CA026B83D8F64761C34D4A6E506E"
+}
 ],
 [
 "BA0E26B7A712FD7C3B2D6306BD6041B0782436B93F1C7346A2187BAE2A08A8A3",
-1
+1,
+{
+"Account": "r3oKq23fV6HxnUgEWV9epzf1hPhi5Be7nA",
+"Balance": "13999862",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 11,
+"Sequence": 104001816,
+"TicketCount": 11
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -5798,7 +9133,16 @@
 "nodes": [
 [
 "E21CDA5E58137BC5C4A08461604AF8C6DBCA824CA5648CFE86432101B0A3B766",
-1
+1,
+{
+"Account": "rnJ1hb5qF36Nwdhvzpa8quMos4FtYRzrMq",
+"Balance": "32042132",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 69,
+"Sequence": 95620748,
+"TicketCount": 17
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -5807,15 +9151,33 @@
 "nodes": [
 [
 "4EE991D0DAF890642ECAAD49162D6A569134AA650A6211CE47D321E6F4D41FDB",
-2
+2,
+null
 ],
 [
 "A38C709CB4A378B201C07488919B37827AADD11CE528C69E9A7B35F04A747F00",
-1
+1,
+{
+"Account": "rHEJANpTJV4gzhVZhqgxmZ31M7o9tXh4oC",
+"Balance": "14000052",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 17,
+"Sequence": 104000386,
+"TicketCount": 17
+}
 ],
 [
 "FC664CE9447AFB49512A9C0E690B744FF3717FE367C5F5AFD43E6B049456F6C7",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rHEJANpTJV4gzhVZhqgxmZ31M7o9tXh4oC",
+"RootIndex": "7AC577E0125969FAE1E7BEB456422D592B10E57078471CFA1C5AD917C237DFBB"
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -5824,15 +9186,33 @@
 "nodes": [
 [
 "4FD746B531F2E29E961CFCB2D87ABC1AC6B72774D31687BECF51D3CE178AF555",
-1
+1,
+{
+"Account": "r4bekoL2G5FncDHvZvBzx6kYPXG5xHotBC",
+"Balance": "13997762",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 37,
+"Sequence": 104029717,
+"TicketCount": 36
+}
 ],
 [
 "A4F9D4EA2E351B248A9265F193E5B71B362C87DB7425E3B718918B1B54F98C08",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "10",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "r4bekoL2G5FncDHvZvBzx6kYPXG5xHotBC",
+"RootIndex": "0F65A83DB38573C5F7500888C659E1E53B3F3B0C65B8C278A44F98203FED16BA"
+}
 ],
 [
 "BFC3604B6F166BFD65ED948262EF87EAAB73F8684D8571CBABA044A69783E66C",
-2
+2,
+null
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -5841,15 +9221,32 @@
 "nodes": [
 [
 "71ED641458AFF22B93DCE95CA2FF9F7EAA961FC848CAF9926F34C0EB9BC792F5",
-2
+2,
+null
 ],
 [
 "F92CE44A923BD0B4B567FD934C0EED35872ED3D13F339009661856D41A22447A",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rwigBPN9DWpgnNZJLdH4EW9h5NegiJZgsd",
+"RootIndex": "4052328E970F6258EFD6E2D4839C5EAE604972B1986E9028C87065F410193024"
+}
 ],
 [
 "FD672B5E610DBDD96C30A85B651D6AEC852D2E8BD9CAF1B070A73B19DF780E19",
-1
+1,
+{
+"Account": "rwigBPN9DWpgnNZJLdH4EW9h5NegiJZgsd",
+"Balance": "13999826",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 20,
+"Sequence": 99831727,
+"TicketCount": 20
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -5858,15 +9255,33 @@
 "nodes": [
 [
 "2AD7F1BC8D91C85F27CC3B38002FEF55876632004B6801545D95552708F148C2",
-2
+2,
+null
 ],
 [
 "723995B979D579FF40FB38B689E94C505D6147055AD3824F8018DD05BBEC20CD",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "19",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rJg42tap9FMTQdjZqeZYvjsrgTunZ4r3co",
+"RootIndex": "709289EDEADDB1AE7E4684809FDBC4360E73F9B565F2ABEE192ADBAE64C2D754"
+}
 ],
 [
 "CBC8D43D4E6B21A8D250A202016AE1504FBFCAEA6E98EB50C3769C1976C84135",
-1
+1,
+{
+"Account": "rJg42tap9FMTQdjZqeZYvjsrgTunZ4r3co",
+"Balance": "14030940",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 16,
+"Sequence": 100115294,
+"TicketCount": 16
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -5875,15 +9290,33 @@
 "nodes": [
 [
 "54F498C513C2310A4AEFB3973CE01932A9EC3384D541A0297E096A84351F866D",
-1
+1,
+{
+"Account": "rEfFcvUUe3Cgxostr1EUjwJzTdFvCnjxdL",
+"Balance": "14001062",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 18,
+"Sequence": 99784949,
+"TicketCount": 18
+}
 ],
 [
 "683DBDDC0AAAC4566983B7596947644EF324B5E29EA9D177BE5FDBA14BE738B4",
-2
+2,
+null
 ],
 [
 "A836B57CCADCC798458405C233C3B503CF0891C8366C2DDDB1CF63519E1B7600",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "3",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rEfFcvUUe3Cgxostr1EUjwJzTdFvCnjxdL",
+"RootIndex": "BFFF24AD0FF6837499A71414D5FDA80725004BF8D2E9D0B9BB5D4DFEEF2E6804"
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -5892,15 +9325,33 @@
 "nodes": [
 [
 "4CDB58FF89FF9DE0A136FC559A58F030540935DD8E2558350BDEC66E0393C577",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "10",
+"IndexPrevious": "1",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rcM75s3cJXspn77CGV1Ga7BTbomWejcUF",
+"RootIndex": "4331B15A8E1ACA73325E44EC7D586081E5B84A9DDFAAAC274E8A235E587537C1"
+}
 ],
 [
 "54566B6171402C341C2604C809A1BB4DBA2B397E801522CAF7978786918E31EE",
-2
+2,
+null
 ],
 [
 "CDB38FAF3FC2A6D0514614C62DA58717A4A57A83ED6042A6264118EFD4B53417",
-1
+1,
+{
+"Account": "rcM75s3cJXspn77CGV1Ga7BTbomWejcUF",
+"Balance": "13993556",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 19,
+"Sequence": 100159647,
+"TicketCount": 19
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -5909,15 +9360,33 @@
 "nodes": [
 [
 "700B81A1F05FD463AB198E4869980704D8C66A5FBE95D5B03A5938C51AA468DF",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rDf5rV5izb5wTEFmFnJ5j48Vcjt7SrkFkv",
+"RootIndex": "BD02BB0179EF2ADC2B817FCD3E48780D34C7553DA81A5B9E0C954E686F23DB50"
+}
 ],
 [
 "A7ADB45421860A7C64B36C0802EBE017CD53C257D158D91873328593F4B90582",
-2
+2,
+null
 ],
 [
 "EAF7F01BB98FD796FB6EDDCA2912BFC598FF5B8AD8D6E025C185FF984B792DD8",
-1
+1,
+{
+"Account": "rDf5rV5izb5wTEFmFnJ5j48Vcjt7SrkFkv",
+"Balance": "13999988",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 25,
+"Sequence": 104020211,
+"TicketCount": 25
+}
 ]
 ],
 "ter": "tecKILLED"
@@ -5926,7 +9395,16 @@
 "nodes": [
 [
 "4FD746B531F2E29E961CFCB2D87ABC1AC6B72774D31687BECF51D3CE178AF555",
-1
+1,
+{
+"Account": "r4bekoL2G5FncDHvZvBzx6kYPXG5xHotBC",
+"Balance": "13997782",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 38,
+"Sequence": 104029716,
+"TicketCount": 37
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -5935,15 +9413,33 @@
 "nodes": [
 [
 "38B20A04D569D4B56E747E4EA15DF41CFFC698C3BA602CD547A1E7DACADCFBE7",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "a",
+"IndexPrevious": "8",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rLF2oRBVSscD3s49rZwh3vCY1BJYySK4hj",
+"RootIndex": "FD7C46273DEDF47BDD789CA01D5766C81E3908C69952777B0937A8DCC1F4457E"
+}
 ],
 [
 "48F8278676432A63F256C7A4BA9775AB59FA9702E26FEFF60902FDA823E3CA2A",
-1
+1,
+{
+"Account": "rLF2oRBVSscD3s49rZwh3vCY1BJYySK4hj",
+"Balance": "13997976",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 22,
+"Sequence": 104021241,
+"TicketCount": 22
+}
 ],
 [
 "7554E83E7416E41CF430DC2C68126592243D263180AAED1429F6C5C4853E340D",
-2
+2,
+null
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -5952,7 +9448,16 @@
 "nodes": [
 [
 "FB5950357101AD3A77E539E231AE85FA1AE7942798AE5EC1E12059041CE17802",
-1
+1,
+{
+"Account": "rPxrFexWD1M5Zdjisrjd7AtZwbt8GgsAtq",
+"Balance": "13999176",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 39,
+"Sequence": 104020226,
+"TicketCount": 39
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -5961,11 +9466,27 @@
 "nodes": [
 [
 "68872997EDC8F430B4454ADB1E53A50E0A932EA6DFC641A495B635DD03661E02",
-1
+1,
+{
+"Account": "rwLCaBLPKcE55pjgmEicUYTtXHr8VawD9Z",
+"Balance": "14580913",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 0,
+"Sequence": 99984213
+}
 ],
 [
 "F68C3B5FD15F2522A2719F22154A8201648DF5E4A57687E77C6B66DBAC5AD3D6",
-1
+1,
+{
+"Account": "rfCBMBBmJ8h1VFkd4WKpjaYxHqEqwofgJY",
+"Balance": "389400004",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 0,
+"Sequence": 105596620
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -5974,7 +9495,16 @@
 "nodes": [
 [
 "A38C709CB4A378B201C07488919B37827AADD11CE528C69E9A7B35F04A747F00",
-1
+1,
+{
+"Account": "rHEJANpTJV4gzhVZhqgxmZ31M7o9tXh4oC",
+"Balance": "14000042",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 17,
+"Sequence": 104000387,
+"TicketCount": 17
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -5983,15 +9513,33 @@
 "nodes": [
 [
 "B9D58D468231FCF2BECA34C115636A5D09D7C1123E7C2C7B12A0BC983D8C5182",
-1
+1,
+{
+"Account": "rKqFKx255NSU2mzX2K4SNtCgKTMBaS7uBn",
+"Balance": "409995732",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 25,
+"Sequence": 100443886,
+"TicketCount": 24
+}
 ],
 [
 "C913F026F237CDE7AFA24B765241E001A06281EF1208FB65A309FFD95070C455",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "1503",
+"IndexPrevious": "ea5",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rKqFKx255NSU2mzX2K4SNtCgKTMBaS7uBn",
+"RootIndex": "23E9BE169EA57A273D43E9875EF6D324E5AF1D419CA18E0E7A1917EA988CB5AC"
+}
 ],
 [
 "E0089EECD5C4274D0F965A20C847F4AC6C665F077767AEEEFB6FC0557DFB3B2A",
-2
+2,
+null
 ]
 ],
 "ter": "tecKILLED"
@@ -6000,23 +9548,51 @@
 "nodes": [
 [
 "52D327582D4C521D99A5642D823E0528BFBC3044563B1EF124777FCDDFF20158",
-1
+1,
+{
+"Flags": 0,
+"IndexPrevious": "1",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rMF1qeWANF9HWsqvaxn4fYtqpD3eNBQnaH",
+"RootIndex": "FD26FD66647F0205AB4B7812CBD1DBE0BD1C069F24C9703007DFF5D4378E6178"
+}
 ],
 [
 "587E28972F3B63D2260C0671E59593EE6C4D27AB857D1AF230F5CAA959BB3EAC",
-1
+1,
+{
+"Account": "rpx9JThQ2y37FaGeeJP7PXDUVEXY3PHZSC",
+"Balance": "941275252",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 0,
+"Sequence": 76599909
+}
 ],
 [
 "6528255EAF0DE2064D08731AFF16C9FD618452672B96FB7B2EFEAC8233DD65D3",
-2
+2,
+null
 ],
 [
 "8BDD45FF3620AC9D46481D0D167797FC5B4A105B6ADDFD08D79A7FEBF2F0BE75",
-1
+1,
+{
+"Account": "rMF1qeWANF9HWsqvaxn4fYtqpD3eNBQnaH",
+"Balance": "614520345",
+"BurnedNFTokens": 1,
+"FirstNFTokenSequence": 93081092,
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"MintedNFTokens": 2,
+"OwnerCount": 44,
+"Sequence": 93081145
+}
 ],
 [
 "F2E59E3B449CEC738E2966355148395E0EA1AC9A1A574F3AA5F651BA0AB29A2E",
-2
+2,
+null
 ]
 ],
 "ter": "tesSUCCESS"
@@ -6025,7 +9601,16 @@
 "nodes": [
 [
 "B82567EE35193438A70DF51376980FF2D5E5122E58FEDA72384284A79E35F27B",
-1
+1,
+{
+"Account": "rUeGuHYuWeaPgvNPWCudG2t6PXHd6PZQL5",
+"Balance": "114000192",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 45,
+"Sequence": 104000493,
+"TicketCount": 45
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -6034,23 +9619,50 @@
 "nodes": [
 [
 "5FA4F748D72AF6CCBAD997D9CE50A459842E2AA1FBA7B6017E6EBC052D63E2A9",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "8",
+"IndexPrevious": "8",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rPxrFexWD1M5Zdjisrjd7AtZwbt8GgsAtq",
+"RootIndex": "5FA4F748D72AF6CCBAD997D9CE50A459842E2AA1FBA7B6017E6EBC052D63E2A9"
+}
 ],
 [
 "887FF0F3B07FF870D30194025FD225B16629FB69E645527B1016C9DD867B4C10",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rPxrFexWD1M5Zdjisrjd7AtZwbt8GgsAtq",
+"RootIndex": "5FA4F748D72AF6CCBAD997D9CE50A459842E2AA1FBA7B6017E6EBC052D63E2A9"
+}
 ],
 [
 "A8C2F4F357573F6107375A55655AACADD1ECCE34845B82677261297CBBFD18B2",
-2
+2,
+null
 ],
 [
 "B69B968C1A16116D42251747C292578F843DD37941F4E17F114A4012946C62CD",
-2
+2,
+null
 ],
 [
 "FB5950357101AD3A77E539E231AE85FA1AE7942798AE5EC1E12059041CE17802",
-1
+1,
+{
+"Account": "rPxrFexWD1M5Zdjisrjd7AtZwbt8GgsAtq",
+"Balance": "13999166",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 38,
+"Sequence": 104020226,
+"TicketCount": 38
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -6059,7 +9671,16 @@
 "nodes": [
 [
 "7973DC8F41925C8672CEB8FE03E90C171745CF1D14216C45EC793BE18D86FED4",
-1
+1,
+{
+"Account": "rsiTX1Z59Nm7nbCRy86w1L5FKvz23dRVVo",
+"Balance": "14035443",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 42,
+"Sequence": 99871862,
+"TicketCount": 41
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -6068,7 +9689,16 @@
 "nodes": [
 [
 "CCEB69CC87156C8C898C01F11B27AFD58A1773B06A015367A344AF10F0623EC1",
-1
+1,
+{
+"Account": "rpWRUueYU5z92iKZyT8CAavebUC8b3BCwf",
+"Balance": "13998696",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 15,
+"Sequence": 104000462,
+"TicketCount": 15
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -6077,15 +9707,33 @@
 "nodes": [
 [
 "5A2C81BF31EA2630F020CC356FB8A5D507BDB041DCC56ED52DD61F8F2EE654C2",
-2
+2,
+null
 ],
 [
 "A004F3644EE4FC2D6190ACE6A112035F69C67132DE015C8D3ECD66594AA0F2CA",
-1
+1,
+{
+"Account": "rmBdbQFdwTHAC1a98X6SA5BaXzfUcPwe7",
+"Balance": "13989866",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 16,
+"Sequence": 100162762,
+"TicketCount": 16
+}
 ],
 [
 "C3F3E05711C08AAC6C8DDD644DF276B92AA349B5DADFF578861F586991AC0C5A",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "5",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rmBdbQFdwTHAC1a98X6SA5BaXzfUcPwe7",
+"RootIndex": "6C417A36E6612D91B66B1C24DB743853D7D3F2685C93A9C9394C7738B2CAA9E7"
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -6094,15 +9742,32 @@
 "nodes": [
 [
 "3032E6530D39F754697FB15CE3C8C8F319AD8AA80A5FB120BAB0482DF63D0877",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "2",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rNT1FNDEgQdXRrMVgiSxpgHFubMfkqoXap",
+"RootIndex": "0E9B784489D6ECD534A0958223C49F7C6055F87A106384D4A61862192869C65B"
+}
 ],
 [
 "8E9BC8DFD47616ECE960C153DC8A491EAD8EEF9C1FE59B69ECF0EFA98EA9F3DF",
-1
+1,
+{
+"Account": "rNT1FNDEgQdXRrMVgiSxpgHFubMfkqoXap",
+"Balance": "14000436",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 27,
+"Sequence": 104018668,
+"TicketCount": 27
+}
 ],
 [
 "A5D6D4A785B6F7FFD466EF4953E350D4EC45AEBFA18571B29DFC6CA60F17C65E",
-2
+2,
+null
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -6111,7 +9776,16 @@
 "nodes": [
 [
 "EAF7F01BB98FD796FB6EDDCA2912BFC598FF5B8AD8D6E025C185FF984B792DD8",
-1
+1,
+{
+"Account": "rDf5rV5izb5wTEFmFnJ5j48Vcjt7SrkFkv",
+"Balance": "13999978",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 25,
+"Sequence": 104020212,
+"TicketCount": 25
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -6120,7 +9794,16 @@
 "nodes": [
 [
 "6F997121D07CD80A1492CB2DD9FBE30C6007C6242F6F48BBD8BFD9B281A06865",
-1
+1,
+{
+"Account": "rKYineK91kKQM5EuntTcyeGKoEdgi1qbHd",
+"Balance": "14000422",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 22,
+"Sequence": 103999566,
+"TicketCount": 22
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -6129,7 +9812,16 @@
 "nodes": [
 [
 "CCEB69CC87156C8C898C01F11B27AFD58A1773B06A015367A344AF10F0623EC1",
-1
+1,
+{
+"Account": "rpWRUueYU5z92iKZyT8CAavebUC8b3BCwf",
+"Balance": "13998686",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 15,
+"Sequence": 104000463,
+"TicketCount": 15
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -6138,15 +9830,33 @@
 "nodes": [
 [
 "4F646F6AF421E8F8221EDC2D7E1CFC7E3718546CB43BDE6B35E9C6CDCCDA90AA",
-2
+2,
+null
 ],
 [
 "A38C709CB4A378B201C07488919B37827AADD11CE528C69E9A7B35F04A747F00",
-1
+1,
+{
+"Account": "rHEJANpTJV4gzhVZhqgxmZ31M7o9tXh4oC",
+"Balance": "14000022",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 16,
+"Sequence": 104000388,
+"TicketCount": 16
+}
 ],
 [
 "FC664CE9447AFB49512A9C0E690B744FF3717FE367C5F5AFD43E6B049456F6C7",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "0",
+"IndexPrevious": "0",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rHEJANpTJV4gzhVZhqgxmZ31M7o9tXh4oC",
+"RootIndex": "7AC577E0125969FAE1E7BEB456422D592B10E57078471CFA1C5AD917C237DFBB"
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -6155,15 +9865,32 @@
 "nodes": [
 [
 "3032E6530D39F754697FB15CE3C8C8F319AD8AA80A5FB120BAB0482DF63D0877",
-1
+1,
+{
+"Flags": 0,
+"IndexNext": "2",
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rNT1FNDEgQdXRrMVgiSxpgHFubMfkqoXap",
+"RootIndex": "0E9B784489D6ECD534A0958223C49F7C6055F87A106384D4A61862192869C65B"
+}
 ],
 [
 "8E9BC8DFD47616ECE960C153DC8A491EAD8EEF9C1FE59B69ECF0EFA98EA9F3DF",
-1
+1,
+{
+"Account": "rNT1FNDEgQdXRrMVgiSxpgHFubMfkqoXap",
+"Balance": "14000466",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 28,
+"Sequence": 104018666,
+"TicketCount": 28
+}
 ],
 [
 "C0DDF73CAB39C22B1F9FF4C6535518E32253B20431BB4039F895305D54815846",
-2
+2,
+null
 ]
 ],
 "ter": "tecKILLED"
@@ -6172,11 +9899,27 @@
 "nodes": [
 [
 "38EDA33EB564190519CE39E829A9643F4E3855E4533BE2CABC6A57BD77846AA0",
-1
+1,
+{
+"Account": "rEiq1iAcpzP8WLjezP9MzAQEJ7jqKMLFSA",
+"Balance": "10832575342649",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 1,
+"Sequence": 66592376
+}
 ],
 [
 "BE7F7A3E6CF16CF7A52EB89C45D31F5EDE9BF9EF32B84435988C3A0E8473DB10",
-1
+1,
+{
+"Account": "rBadHTPHCN8LqYXJsws6ooPBWGS2KsTC9o",
+"Balance": "22154462",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 0,
+"Sequence": 99021945
+}
 ]
 ],
 "ter": "tesSUCCESS"
@@ -6185,7 +9928,16 @@
 "nodes": [
 [
 "7973DC8F41925C8672CEB8FE03E90C171745CF1D14216C45EC793BE18D86FED4",
-1
+1,
+{
+"Account": "rsiTX1Z59Nm7nbCRy86w1L5FKvz23dRVVo",
+"Balance": "14035453",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 42,
+"Sequence": 99871861,
+"TicketCount": 41
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -6194,7 +9946,16 @@
 "nodes": [
 [
 "FD672B5E610DBDD96C30A85B651D6AEC852D2E8BD9CAF1B070A73B19DF780E19",
-1
+1,
+{
+"Account": "rwigBPN9DWpgnNZJLdH4EW9h5NegiJZgsd",
+"Balance": "13999806",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 20,
+"Sequence": 99831729,
+"TicketCount": 20
+}
 ]
 ],
 "ter": "tecPATH_DRY"
@@ -6203,7 +9964,16 @@
 "nodes": [
 [
 "E21CDA5E58137BC5C4A08461604AF8C6DBCA824CA5648CFE86432101B0A3B766",
-1
+1,
+{
+"Account": "rnJ1hb5qF36Nwdhvzpa8quMos4FtYRzrMq",
+"Balance": "32041812",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 69,
+"Sequence": 95620752,
+"TicketCount": 17
+}
 ]
 ],
 "ter": "tecPATH_PARTIAL"
@@ -6212,19 +9982,52 @@
 "nodes": [
 [
 "02D8376A9F3DB76524532DBFB6F030A05694B3C1556F8D503C552BA7646299D0",
-0
+0,
+{
+"Account": "rBbW6idAiqYJzUuk76FYqr347Pbx9oW5jh",
+"BookDirectory": "8E07F9BB4D0B67248392DAED972407F3FFE1DF73B91FAABF5707AC53D1FEBB6D",
+"LedgerEntryType": "Offer",
+"Sequence": 98832703,
+"TakerGets": {
+"currency": "4C494F4E53000000000000000000000000000000",
+"issuer": "rGHtf1GTfXEXSPxmZfnQrUMGUpajYqAuzS",
+"value": "11185.11"
+},
+"TakerPays": "2415761"
+}
 ],
 [
 "8E07F9BB4D0B67248392DAED972407F3FFE1DF73B91FAABF5707AC53D1FEBB6D",
-0
+0,
+{
+"ExchangeRate": "5707ac53d1febb6d",
+"LedgerEntryType": "DirectoryNode",
+"RootIndex": "8E07F9BB4D0B67248392DAED972407F3FFE1DF73B91FAABF5707AC53D1FEBB6D",
+"TakerGetsCurrency": "4C494F4E53000000000000000000000000000000",
+"TakerGetsIssuer": "A7BB36B062F46ABDE151791873231D83EEC223C2"
+}
 ],
 [
 "C16596D03A5FFAA5F19C67816967D253CAFE24DE6E095675F8E43A38C9CAE9A4",
-1
+1,
+{
+"Account": "rBbW6idAiqYJzUuk76FYqr347Pbx9oW5jh",
+"Balance": "19158622",
+"Flags": 0,
+"LedgerEntryType": "AccountRoot",
+"OwnerCount": 2,
+"Sequence": 98832704
+}
 ],
 [
 "DE12B4D30912E7DEAB829D997A607089561FCDB1446CA9198A5176D46B1C180C",
-1
+1,
+{
+"Flags": 0,
+"LedgerEntryType": "DirectoryNode",
+"Owner": "rBbW6idAiqYJzUuk76FYqr347Pbx9oW5jh",
+"RootIndex": "DE12B4D30912E7DEAB829D997A607089561FCDB1446CA9198A5176D46B1C180C"
+}
 ]
 ],
 "ter": "tesSUCCESS"
