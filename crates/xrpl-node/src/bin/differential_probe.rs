@@ -225,6 +225,14 @@ fn native_read_keys(txj: &Value) -> Vec<String> {
             keys.push(hex::encode_upper(keylet::owner_dir_key(&d).0));
         }
     }
+    if txj["TransactionType"].as_str() == Some("CheckCash") {
+        if let Some(cid) = txj.get("CheckID").and_then(|v| v.as_str()) {
+            keys.push(cid.to_uppercase());
+        }
+        if let Some(acct) = txj["Account"].as_str().and_then(decode_address) {
+            keys.push(hex::encode_upper(keylet::owner_dir_key(&acct).0));
+        }
+    }
     if txj["TransactionType"].as_str() == Some("CheckCreate") {
         if let (Some(acct), Some(dest)) = (
             txj["Account"].as_str().and_then(decode_address),

@@ -211,70 +211,37 @@ impl Transactor for CheckCashTransactor {
             None => return TxResult::Malformed,
         };
 
-        // Parse the cash amount
-        let amount = match tx.fields.get("Amount").and_then(|a| parse_drops(a)) {
-            Some(a) => a,
-            None => return TxResult::Malformed,
+        // Cash via the shared transfer engine (XRP or IOU). The check's
+        // SendMax fixes the currency; the tx Amount is the requested delivery.
+        // Writer shortfall fails the rippled way: tecPATH_PARTIAL, fee-only.
+        use crate::tx::offer as ox;
+        let sm_json = check.get("SendMax").cloned().unwrap_or_default();
+        let amt_json = tx.fields.get("Amount")
+            .or(tx.fields.get("DeliverMin"))
+            .cloned()
+            .unwrap_or_else(|| sm_json.clone());
+        let (Some(leg), Some(want)) = (ox::leg_of(&sm_json), crate::ledger::keylet::amount_mant_exp(&amt_json)) else {
+            return TxResult::Malformed;
         };
-
-        // Check SendMax — the amount cashed cannot exceed SendMax
-        if let Some(send_max_drops) = check.get("SendMax").and_then(|s| parse_drops(s)) {
-            if amount > send_max_drops {
-                return TxResult::Unfunded;
-            }
+        let cap = crate::ledger::keylet::amount_mant_exp(&sm_json).unwrap_or(want);
+        if ox::me_cmp(want, cap).is_gt() {
+            return TxResult::PathPartial; // asking beyond the check's SendMax
         }
-
-        // Deduct from creator's balance
-        let creator_key = keylet::account_root_key(&creator);
-        let creator_data = match sandbox.read(&creator_key) {
-            Some(d) => d,
-            None => return TxResult::NoAccount,
-        };
-        let mut creator_acct: serde_json::Value = match serde_json::from_slice(&creator_data) {
-            Ok(v) => v,
-            Err(_) => return TxResult::Malformed,
-        };
-
-        let creator_balance = creator_acct["Balance"]
-            .as_str()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-
-        if creator_balance < amount {
-            return TxResult::Unfunded;
+        let avail = if creator == leg.issuer { want } else { ox::available(sandbox, &creator, &leg) };
+        if ox::me_cmp(avail, want).is_lt() {
+            return TxResult::PathPartial; // writer cannot cover — fee-only
         }
+        ox::move_leg(sandbox, &creator, &tx.account, &leg, want);
 
-        creator_acct["Balance"] =
-            serde_json::Value::String((creator_balance - amount).to_string());
-
-        // Decrement creator's OwnerCount
-        let owner_count = creator_acct["OwnerCount"].as_u64().unwrap_or(0);
-        if owner_count > 0 {
-            creator_acct["OwnerCount"] =
-                serde_json::Value::Number((owner_count - 1).into());
-        }
-        sandbox.write(creator_key, serde_json::to_vec(&creator_acct).unwrap());
-
-        // Credit destination (casher) — fail if destination account can't be read
-        let dest_key = keylet::account_root_key(&tx.account);
-        let dest_data = match sandbox.read(&dest_key) {
-            Some(d) => d,
-            None => return TxResult::Malformed,
-        };
-        let mut dest_acct: serde_json::Value = match serde_json::from_slice(&dest_data) {
-            Ok(v) => v,
-            Err(_) => return TxResult::Malformed,
-        };
-        let dest_balance = dest_acct["Balance"]
-            .as_str()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        dest_acct["Balance"] =
-            serde_json::Value::String((dest_balance + amount).to_string());
-        sandbox.write(dest_key, serde_json::to_vec(&dest_acct).unwrap());
-
-        // Delete the Check object
+        // Delete the Check and unlink it from BOTH owner directories
+        // (writer via OwnerNode, casher/destination via DestinationNode).
+        let owner_hint = check.get("OwnerNode").map(|v| ox::dirnum(v));
+        let dest_hint = check.get("DestinationNode").map(|v| ox::dirnum(v));
         sandbox.delete(check_key);
+        crate::ledger::directory::owner_dir_remove(sandbox, &creator, &check_key, owner_hint);
+        crate::ledger::directory::owner_dir_remove(sandbox, &tx.account, &check_key, dest_hint);
+        ox::owner_count_add(sandbox, &creator, -1);
+        ox::owner_count_add(sandbox, &tx.account, -1);
 
         TxResult::Success
     }
@@ -574,7 +541,7 @@ mod tests {
             }),
         };
 
-        assert_eq!(CheckCashTransactor.do_apply(&cash_tx, &mut sandbox), TxResult::Unfunded);
+        assert_eq!(CheckCashTransactor.do_apply(&cash_tx, &mut sandbox), TxResult::PathPartial);
 
         // Check should still exist
         assert!(sandbox.exists(&check_key));
