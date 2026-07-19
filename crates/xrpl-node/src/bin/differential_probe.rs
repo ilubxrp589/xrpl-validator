@@ -245,6 +245,18 @@ fn native_read_keys(txj: &Value) -> Vec<String> {
                 let base = keylet::book_base(&pc, &gc, &pi, &gi);
                 keys.push(hex::encode_upper(keylet::book_dir_key(&base, q).0));
             }
+            // The taker's gets-side trust line decides fundedness for IOU
+            // sales — mainnet never touches it on a pure placement, so it
+            // must be loaded explicitly or available() starves.
+            if let (Some(acct), Some(gobj)) = (txj["Account"].as_str().and_then(decode_address), g.as_object()) {
+                if let (Some(gi2), Some(gcs)) = (
+                    gobj.get("issuer").and_then(|v| v.as_str()).and_then(decode_issuer),
+                    gobj.get("currency").and_then(|v| v.as_str()),
+                ) {
+                    let currency = currency_code(gcs);
+                    keys.push(hex::encode_upper(keylet::ripple_state_key(&acct, &gi2, &currency).0));
+                }
+            }
         }
     }
     if txj["TransactionType"].as_str() == Some("NFTokenCreateOffer") {

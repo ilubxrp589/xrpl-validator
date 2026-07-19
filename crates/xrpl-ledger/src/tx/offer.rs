@@ -566,6 +566,15 @@ impl Transactor for OfferCreateTransactor {
         let ioc = flags & 0x0002_0000 != 0;
         let fok = flags & 0x0004_0000 != 0;
 
+        // Cancel-and-replace: an OfferSequence names a prior offer to cancel
+        // before crossing/placing (rippled does this first, unconditionally).
+        if let Some(old_seq) = tx.fields.get("OfferSequence").and_then(|v| v.as_u64()) {
+            let old_key = keylet::offer_key(&tx.account, old_seq as u32);
+            if let Some(old) = json_at(sandbox, &old_key) {
+                delete_maker_offer(sandbox, &old_key, &old, &tx.account);
+            }
+        }
+
         let snap = sandbox.snapshot();
 
         // Cross against the inverse book while the maker's rate is within the
