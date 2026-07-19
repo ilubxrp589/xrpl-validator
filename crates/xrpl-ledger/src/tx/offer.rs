@@ -50,7 +50,7 @@ fn parse_amount(val: &serde_json::Value) -> Option<Amount> {
 
 /// 20-byte currency code of an amount (XRP = zeros; 3-char ASCII at bytes
 /// 12..15; 40-hex verbatim).
-fn amount_currency20(v: &serde_json::Value) -> Option<[u8; 20]> {
+pub(crate) fn amount_currency20(v: &serde_json::Value) -> Option<[u8; 20]> {
     match v {
         serde_json::Value::String(_) => Some([0u8; 20]), // XRP
         serde_json::Value::Object(o) => {
@@ -75,7 +75,7 @@ fn amount_currency20(v: &serde_json::Value) -> Option<[u8; 20]> {
 }
 
 /// 20-byte issuer of an amount (XRP = account-zero; hex or base58 r-address).
-fn amount_issuer20(v: &serde_json::Value) -> Option<[u8; 20]> {
+pub(crate) fn amount_issuer20(v: &serde_json::Value) -> Option<[u8; 20]> {
     match v {
         serde_json::Value::String(_) => Some([0u8; 20]),
         serde_json::Value::Object(o) => {
@@ -130,19 +130,19 @@ impl Amount {
 const XRP_RESERVE_BASE: u128 = 1_000_000;
 const XRP_RESERVE_INC: u128 = 200_000;
 
-type Me = (u128, i32);
+pub(crate) type Me = (u128, i32);
 
-struct Leg {
-    xrp: bool,
-    cur: [u8; 20],
-    issuer: [u8; 20],
+pub(crate) struct Leg {
+    pub(crate) xrp: bool,
+    pub(crate) cur: [u8; 20],
+    pub(crate) issuer: [u8; 20],
 }
 
-fn leg_of(v: &serde_json::Value) -> Option<Leg> {
+pub(crate) fn leg_of(v: &serde_json::Value) -> Option<Leg> {
     Some(Leg { xrp: v.is_string(), cur: amount_currency20(v)?, issuer: amount_issuer20(v)? })
 }
 
-fn decode20(s: &str) -> Option<[u8; 20]> {
+pub(crate) fn decode20(s: &str) -> Option<[u8; 20]> {
     if let Ok(b) = hex::decode(s) {
         if b.len() == 20 {
             return <[u8; 20]>::try_from(b.as_slice()).ok();
@@ -151,7 +151,7 @@ fn decode20(s: &str) -> Option<[u8; 20]> {
     xrpl_core::types::AccountId::from_address(s).ok().map(|a| a.0)
 }
 
-fn me_rescale(a: Me, e: i32, ceil: bool) -> u128 {
+pub(crate) fn me_rescale(a: Me, e: i32, ceil: bool) -> u128 {
     if a.1 >= e {
         let d = (a.1 - e).min(38) as u32;
         a.0.saturating_mul(10u128.saturating_pow(d))
@@ -161,21 +161,21 @@ fn me_rescale(a: Me, e: i32, ceil: bool) -> u128 {
     }
 }
 
-fn me_cmp(a: Me, b: Me) -> std::cmp::Ordering {
+pub(crate) fn me_cmp(a: Me, b: Me) -> std::cmp::Ordering {
     let e = a.1.min(b.1);
     me_rescale(a, e, false).cmp(&me_rescale(b, e, false))
 }
 
-fn me_is_zero(a: Me) -> bool {
+pub(crate) fn me_is_zero(a: Me) -> bool {
     a.0 == 0
 }
 
-fn me_sub(a: Me, b: Me) -> Me {
+pub(crate) fn me_sub(a: Me, b: Me) -> Me {
     let e = a.1.min(b.1);
     (me_rescale(a, e, false).saturating_sub(me_rescale(b, e, false)), e)
 }
 
-fn me_norm(mut a: Me) -> Me {
+pub(crate) fn me_norm(mut a: Me) -> Me {
     while a.0 >= 100_000_000_000_000_000_000 {
         a.0 /= 10;
         a.1 += 1;
@@ -184,7 +184,7 @@ fn me_norm(mut a: Me) -> Me {
 }
 
 /// a*b/c with directed rounding (mantissas kept ≤ ~1e20 so the product fits).
-fn me_muldiv(a: Me, b: Me, c: Me, ceil: bool) -> Me {
+pub(crate) fn me_muldiv(a: Me, b: Me, c: Me, ceil: bool) -> Me {
     if c.0 == 0 {
         return (0, 0);
     }
@@ -194,7 +194,7 @@ fn me_muldiv(a: Me, b: Me, c: Me, ceil: bool) -> Me {
     me_norm((m, a.1 + b.1 - c.1))
 }
 
-fn me_to_value_string(a: Me) -> String {
+pub(crate) fn me_to_value_string(a: Me) -> String {
     if a.0 == 0 {
         return "0".into();
     }
@@ -217,7 +217,7 @@ fn me_to_value_string(a: Me) -> String {
 }
 
 /// Remainder amount in the same JSON shape as the original tx field.
-fn me_amount_json(orig: &serde_json::Value, a: Me) -> serde_json::Value {
+pub(crate) fn me_amount_json(orig: &serde_json::Value, a: Me) -> serde_json::Value {
     match orig {
         serde_json::Value::String(_) => {
             serde_json::Value::String(me_rescale(a, 0, false).to_string())
@@ -231,15 +231,15 @@ fn me_amount_json(orig: &serde_json::Value, a: Me) -> serde_json::Value {
     }
 }
 
-fn json_at(sandbox: &Sandbox, key: &xrpl_core::types::Hash256) -> Option<serde_json::Value> {
+pub(crate) fn json_at(sandbox: &Sandbox, key: &xrpl_core::types::Hash256) -> Option<serde_json::Value> {
     sandbox.read(key).and_then(|d| serde_json::from_slice(&d).ok())
 }
 
-fn put_json(sandbox: &mut Sandbox, key: xrpl_core::types::Hash256, v: &serde_json::Value) {
+pub(crate) fn put_json(sandbox: &mut Sandbox, key: xrpl_core::types::Hash256, v: &serde_json::Value) {
     sandbox.write(key, serde_json::to_vec(v).unwrap_or_default());
 }
 
-fn dirnum(v: &serde_json::Value) -> u64 {
+pub(crate) fn dirnum(v: &serde_json::Value) -> u64 {
     if let Some(n) = v.as_u64() {
         return n;
     }
@@ -250,7 +250,7 @@ fn dirnum(v: &serde_json::Value) -> u64 {
 }
 
 /// Signed (negative, magnitude) of an amount value string.
-fn signed_value(v: &serde_json::Value) -> (bool, Me) {
+pub(crate) fn signed_value(v: &serde_json::Value) -> (bool, Me) {
     let s = match v {
         serde_json::Value::Object(o) => o.get("value").and_then(|x| x.as_str()).unwrap_or("0"),
         serde_json::Value::String(s) => s.as_str(),
@@ -262,7 +262,7 @@ fn signed_value(v: &serde_json::Value) -> (bool, Me) {
     (neg && me.0 > 0, me)
 }
 
-fn signed_add(aneg: bool, a: Me, bneg: bool, b: Me) -> (bool, Me) {
+pub(crate) fn signed_add(aneg: bool, a: Me, bneg: bool, b: Me) -> (bool, Me) {
     if aneg == bneg {
         let e = a.1.min(b.1);
         return (aneg, (me_rescale(a, e, false) + me_rescale(b, e, false), e));
@@ -274,7 +274,7 @@ fn signed_add(aneg: bool, a: Me, bneg: bool, b: Me) -> (bool, Me) {
     }
 }
 
-fn owner_count_add(sandbox: &mut Sandbox, id: &[u8; 20], delta: i64) {
+pub(crate) fn owner_count_add(sandbox: &mut Sandbox, id: &[u8; 20], delta: i64) {
     let key = keylet::account_root_key(id);
     if let Some(mut a) = json_at(sandbox, &key) {
         let c = a["OwnerCount"].as_u64().unwrap_or(0) as i64;
@@ -284,7 +284,7 @@ fn owner_count_add(sandbox: &mut Sandbox, id: &[u8; 20], delta: i64) {
 }
 
 /// How much of `leg` the account can actually deliver.
-fn available(sandbox: &Sandbox, id: &[u8; 20], leg: &Leg) -> Me {
+pub(crate) fn available(sandbox: &Sandbox, id: &[u8; 20], leg: &Leg) -> Me {
     if leg.xrp {
         let key = keylet::account_root_key(id);
         let Some(a) = json_at(sandbox, &key) else { return (0, 0) };
@@ -310,7 +310,7 @@ fn available(sandbox: &Sandbox, id: &[u8; 20], leg: &Leg) -> Me {
 
 /// Adjust one party's side of an IOU movement (line balance ±amt), creating
 /// the line if the receiver has none (rippled offer-crossing behavior).
-fn line_adjust(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, amt: Me, receiving: bool) {
+pub(crate) fn line_adjust(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, amt: Me, receiving: bool) {
     if party == &leg.issuer {
         return;
     }
@@ -350,7 +350,7 @@ fn line_adjust(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, amt: Me, rece
 }
 
 /// Move `amt` of `leg` from one account to another.
-fn move_leg(sandbox: &mut Sandbox, from: &[u8; 20], to: &[u8; 20], leg: &Leg, amt: Me) {
+pub(crate) fn move_leg(sandbox: &mut Sandbox, from: &[u8; 20], to: &[u8; 20], leg: &Leg, amt: Me) {
     if me_is_zero(amt) {
         return;
     }
@@ -373,7 +373,7 @@ fn move_leg(sandbox: &mut Sandbox, from: &[u8; 20], to: &[u8; 20], leg: &Leg, am
 
 /// Fully remove a maker offer: object + owner-dir entry + book-dir entry +
 /// maker OwnerCount.
-fn delete_maker_offer(
+pub(crate) fn delete_maker_offer(
     sandbox: &mut Sandbox,
     okey: &xrpl_core::types::Hash256,
     offer: &serde_json::Value,
@@ -399,7 +399,7 @@ fn delete_maker_offer(
 
 /// Walk the inverse book from best quality and cross while the maker's rate is
 /// within `threshold`. Returns (remaining pays, remaining gets, crossed count).
-fn cross_engine(
+pub(crate) fn cross_engine(
     taker: &[u8; 20],
     mut rem_pays: Me,
     mut rem_gets: Me,

@@ -87,18 +87,22 @@ impl Transactor for PaymentTransactor {
             return TxResult::Malformed;
         }
 
-        // Amount must be present and valid XRP drops
-        let amount = match Self::amount_drops(tx) {
-            Some(a) => a,
-            None => {
-                // Could be an IOU — return unsupported for now
-                return TxResult::Unsupported;
+        // Amount: XRP drops or an IOU object.
+        match Self::amount_drops(tx) {
+            Some(amount) => {
+                if amount == 0 || amount > 100_000_000_000_000_000 {
+                    return TxResult::BadAmount;
+                }
             }
-        };
-
-        // Amount must be positive and <= 100 billion XRP in drops
-        if amount == 0 || amount > 100_000_000_000_000_000 {
-            return TxResult::BadAmount;
+            None => {
+                // IOU delivery — validated by the engine in do_apply.
+                let ok = tx.fields.get("Amount")
+                    .and_then(crate::ledger::keylet::amount_mant_exp)
+                    .is_some_and(|(m, _)| m > 0);
+                if !ok {
+                    return TxResult::BadAmount;
+                }
+            }
         }
 
         // Can't send to yourself (rippled allows it but it's a no-op)
@@ -149,17 +153,22 @@ impl Transactor for PaymentTransactor {
             }
         }
 
-        // Check balance >= amount + fee
-        let balance = acct["Balance"]
-            .as_str()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-
-        let amount = Self::amount_drops(tx).unwrap_or(0);
-        let total_needed = amount.saturating_add(tx.fee);
-
-        if balance < total_needed {
-            return TxResult::UnfundedPayment;
+        // Funding check applies only to a DIRECT full-delivery XRP payment.
+        // Cross-currency (SendMax) buys the XRP via paths, and tfPartial
+        // delivers what liquidity affords — both resolved in do_apply.
+        let partial = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & 0x0002_0000 != 0;
+        let pure_xrp = tx.fields.get("SendMax").is_none()
+            && tx.fields.get("Paths").is_none()
+            && tx.fields.get("Amount").map(|a| a.is_string()).unwrap_or(false);
+        if pure_xrp && !partial {
+            let balance = acct["Balance"]
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            let amount = Self::amount_drops(tx).unwrap_or(0);
+            if balance < amount.saturating_add(tx.fee) {
+                return TxResult::UnfundedPayment;
+            }
         }
 
         // If destination doesn't exist, amount must meet reserve
@@ -170,6 +179,7 @@ impl Transactor for PaymentTransactor {
         let dest_key = keylet::account_root_key(&dest);
         if !sandbox.exists(&dest_key) {
             let reserve = Self::reserve_base(sandbox);
+            let amount = Self::amount_drops(tx).unwrap_or(0);
             if amount < reserve {
                 return TxResult::NoDstInsufXrp;
             }
@@ -178,15 +188,37 @@ impl Transactor for PaymentTransactor {
         TxResult::Success
     }
 
-    /// val-062: Apply XRP direct payment state changes.
+    /// val-062: Apply payment state changes — direct XRP, direct IOU, or
+    /// cross-currency via the order books (the crossing engine).
     fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
-        let amount = match Self::amount_drops(tx) {
-            Some(a) => a,
-            None => return TxResult::Unsupported,
-        };
-
         let dest_id = match Self::destination(tx) {
             Some(d) => d,
+            None => return TxResult::Malformed,
+        };
+        let amt_json = tx.fields.get("Amount").cloned().unwrap_or_default();
+        let sendmax = tx.fields.get("SendMax").cloned();
+        let partial = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & 0x0002_0000 != 0;
+        let cross_currency = match (&sendmax, amt_json.is_string()) {
+            (Some(sm), true) => !sm.is_string(),
+            (Some(sm), false) => {
+                sm.is_string()
+                    || sm.get("currency").and_then(|v| v.as_str())
+                        != amt_json.get("currency").and_then(|v| v.as_str())
+                    || sm.get("issuer").and_then(|v| v.as_str())
+                        != amt_json.get("issuer").and_then(|v| v.as_str())
+            }
+            (None, _) => false,
+        } || tx.fields.get("Paths").is_some();
+
+        if cross_currency {
+            return self.apply_path_payment(tx, sandbox, &amt_json, sendmax.as_ref(), &dest_id, partial);
+        }
+        if !amt_json.is_string() {
+            return self.apply_iou_direct(tx, sandbox, &amt_json, &dest_id, partial);
+        }
+
+        let amount = match Self::amount_drops(tx) {
+            Some(a) => a,
             None => return TxResult::Malformed,
         };
 
@@ -253,6 +285,92 @@ impl Transactor for PaymentTransactor {
             sandbox.write(dest_key, serde_json::to_vec(&new_account).expect("serializing valid JSON Value"));
         }
 
+        TxResult::Success
+    }
+}
+
+impl PaymentTransactor {
+    /// Direct same-currency IOU transfer over trust lines. Key-set faithful:
+    /// sender/receiver lines adjust (receiver line created when absent),
+    /// issuer-side legs settle implicitly. Insufficient holdings fail the
+    /// rippled way: nothing delivered -> tecPATH_DRY, partial short-fall
+    /// without tfPartialPayment -> tecPATH_PARTIAL (both fee-only).
+    fn apply_iou_direct(
+        &self,
+        tx: &TxFields,
+        sandbox: &mut Sandbox,
+        amt_json: &serde_json::Value,
+        dest: &[u8; 20],
+        partial: bool,
+    ) -> TxResult {
+        use crate::tx::offer as ox;
+        let (Some(leg), Some(want)) = (ox::leg_of(amt_json), crate::ledger::keylet::amount_mant_exp(amt_json)) else {
+            return TxResult::Malformed;
+        };
+        let avail = if tx.account == leg.issuer {
+            want // issuers mint their own IOU
+        } else {
+            ox::available(sandbox, &tx.account, &leg)
+        };
+        if ox::me_is_zero(avail) {
+            return TxResult::PathDry;
+        }
+        let deliver = if ox::me_cmp(avail, want).is_lt() {
+            if !partial {
+                return TxResult::PathPartial;
+            }
+            avail
+        } else {
+            want
+        };
+        ox::move_leg(sandbox, &tx.account, dest, &leg, deliver);
+        TxResult::Success
+    }
+
+    /// Cross-currency delivery: spend the SendMax side across the order book
+    /// to acquire the Amount side (the offer-crossing engine with payment
+    /// semantics), then hand the acquisition to the destination. Arb-style
+    /// self-payments (Account == Destination) skip the final hop.
+    fn apply_path_payment(
+        &self,
+        tx: &TxFields,
+        sandbox: &mut Sandbox,
+        amt_json: &serde_json::Value,
+        sendmax: Option<&serde_json::Value>,
+        dest: &[u8; 20],
+        partial: bool,
+    ) -> TxResult {
+        use crate::tx::offer as ox;
+        let Some(sm_json) = sendmax else {
+            // Paths without SendMax: spend the Amount currency itself.
+            return self.apply_iou_direct(tx, sandbox, amt_json, dest, partial);
+        };
+        let (Some(want_leg), Some(want0)) = (ox::leg_of(amt_json), crate::ledger::keylet::amount_mant_exp(amt_json)) else {
+            return TxResult::Malformed;
+        };
+        let (Some(spend_leg), Some(spend0)) = (ox::leg_of(sm_json), crate::ledger::keylet::amount_mant_exp(sm_json)) else {
+            return TxResult::Malformed;
+        };
+        let snap = sandbox.snapshot();
+        // Limit price = the full SendMax per full Amount; walk while makers
+        // are at or better. Identical shape to an OfferCreate paying `Amount`,
+        // getting `SendMax`.
+        let threshold = crate::ledger::keylet::offer_quality(sm_json, amt_json).unwrap_or(u64::MAX);
+        let (rem_want, _rem_spend, _crossed) = ox::cross_engine(
+            &tx.account, want0, spend0, &want_leg, &spend_leg, threshold, sandbox,
+        );
+        let delivered = ox::me_sub(want0, rem_want);
+        if ox::me_is_zero(delivered) {
+            sandbox.restore_snapshot(snap);
+            return TxResult::PathDry;
+        }
+        if !partial && !ox::me_is_zero(rem_want) {
+            sandbox.restore_snapshot(snap);
+            return TxResult::PathPartial;
+        }
+        if dest != &tx.account {
+            ox::move_leg(sandbox, &tx.account, dest, &want_leg, delivered);
+        }
         TxResult::Success
     }
 }

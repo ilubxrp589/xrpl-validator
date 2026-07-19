@@ -200,6 +200,31 @@ fn native_read_keys(txj: &Value) -> Vec<String> {
             keys.push(hex::encode_upper(keylet::owner_dir_key(&acct).0));
         }
     }
+    if txj["TransactionType"].as_str() == Some("Payment") {
+        let acct = txj["Account"].as_str().and_then(decode_address);
+        let dest = txj.get("Destination").and_then(|v| v.as_str()).and_then(decode_address);
+        let mut line_for = |who: Option<[u8; 20]>, amt: Option<&Value>, keys: &mut Vec<String>| {
+            let (Some(w), Some(a)) = (who, amt) else { return };
+            let (Some(iss), Some(cur)) = (
+                a.get("issuer").and_then(|v| v.as_str()).and_then(decode_issuer),
+                a.get("currency").and_then(|v| v.as_str()),
+            ) else { return };
+            let c = currency_code(cur);
+            keys.push(hex::encode_upper(keylet::ripple_state_key(&w, &iss, &c).0));
+            keys.push(hex::encode_upper(keylet::owner_dir_key(&iss).0));
+        };
+        let amt = txj.get("Amount");
+        let sm = txj.get("SendMax");
+        line_for(acct, amt, &mut keys);
+        line_for(dest, amt, &mut keys);
+        line_for(acct, sm, &mut keys);
+        if let Some(a) = acct {
+            keys.push(hex::encode_upper(keylet::owner_dir_key(&a).0));
+        }
+        if let Some(d) = dest {
+            keys.push(hex::encode_upper(keylet::owner_dir_key(&d).0));
+        }
+    }
     if txj["TransactionType"].as_str() == Some("CheckCreate") {
         if let (Some(acct), Some(dest)) = (
             txj["Account"].as_str().and_then(decode_address),

@@ -53,6 +53,8 @@ pub enum TxResult {
     InsufReserveOffer,
     /// Offer is unfunded at apply time.
     UnfundedOffer,
+    /// Path delivered something but less than required (no partial flag).
+    PathPartial,
 
     // tem — malformed, not applied at all
     /// Transaction is malformed.
@@ -116,6 +118,7 @@ impl TxResult {
             TxResult::Killed => "tecKILLED",
             TxResult::InsufReserveOffer => "tecINSUF_RESERVE_OFFER",
             TxResult::UnfundedOffer => "tecUNFUNDED_OFFER",
+            TxResult::PathPartial => "tecPATH_PARTIAL",
             TxResult::Malformed => "temMALFORMED",
             TxResult::BadFee => "temBAD_FEE",
             TxResult::BadAmount => "temBAD_AMOUNT",
