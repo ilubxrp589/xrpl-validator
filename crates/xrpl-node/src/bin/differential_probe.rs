@@ -209,6 +209,44 @@ fn native_read_keys(txj: &Value) -> Vec<String> {
             keys.push(hex::encode_upper(keylet::owner_dir_key(&dest).0));
         }
     }
+    if txj["TransactionType"].as_str() == Some("OfferCreate") {
+        if let Some(acct) = txj["Account"].as_str().and_then(decode_address) {
+            keys.push(hex::encode_upper(keylet::owner_dir_key(&acct).0));
+        }
+        let cur20 = |v: &Value| -> Option<[u8; 20]> {
+            match v {
+                Value::String(_) => Some([0u8; 20]),
+                Value::Object(o) => {
+                    let c = o.get("currency")?.as_str()?;
+                    if c == "XRP" { return Some([0u8; 20]); }
+                    if c.len() == 40 {
+                        return <[u8; 20]>::try_from(hex::decode(c).ok()?.as_slice()).ok();
+                    }
+                    let cb = c.as_bytes();
+                    if cb.is_empty() || cb.len() > 8 { return None; }
+                    let mut b = [0u8; 20];
+                    b[12..12 + cb.len()].copy_from_slice(cb);
+                    Some(b)
+                }
+                _ => None,
+            }
+        };
+        let iss20 = |v: &Value| -> Option<[u8; 20]> {
+            match v {
+                Value::String(_) => Some([0u8; 20]),
+                Value::Object(o) => decode_issuer(o.get("issuer")?.as_str()?),
+                _ => None,
+            }
+        };
+        if let (Some(p), Some(g)) = (txj.get("TakerPays"), txj.get("TakerGets")) {
+            if let (Some(q), Some(pc), Some(gc), Some(pi), Some(gi)) = (
+                keylet::offer_quality(p, g), cur20(p), cur20(g), iss20(p), iss20(g),
+            ) {
+                let base = keylet::book_base(&pc, &gc, &pi, &gi);
+                keys.push(hex::encode_upper(keylet::book_dir_key(&base, q).0));
+            }
+        }
+    }
     if txj["TransactionType"].as_str() == Some("NFTokenCreateOffer") {
         if let Some(acct) = txj["Account"].as_str().and_then(decode_address) {
             keys.push(hex::encode_upper(keylet::owner_dir_key(&acct).0));

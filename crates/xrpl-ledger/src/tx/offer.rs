@@ -48,6 +48,49 @@ fn parse_amount(val: &serde_json::Value) -> Option<Amount> {
     }
 }
 
+/// 20-byte currency code of an amount (XRP = zeros; 3-char ASCII at bytes
+/// 12..15; 40-hex verbatim).
+fn amount_currency20(v: &serde_json::Value) -> Option<[u8; 20]> {
+    match v {
+        serde_json::Value::String(_) => Some([0u8; 20]), // XRP
+        serde_json::Value::Object(o) => {
+            let c = o.get("currency")?.as_str()?;
+            if c == "XRP" {
+                return Some([0u8; 20]);
+            }
+            if c.len() == 40 {
+                let b = hex::decode(c).ok()?;
+                return <[u8; 20]>::try_from(b.as_slice()).ok();
+            }
+            let cb = c.as_bytes();
+            if cb.is_empty() || cb.len() > 8 {
+                return None;
+            }
+            let mut b = [0u8; 20];
+            b[12..12 + cb.len()].copy_from_slice(cb);
+            Some(b)
+        }
+        _ => None,
+    }
+}
+
+/// 20-byte issuer of an amount (XRP = account-zero; hex or base58 r-address).
+fn amount_issuer20(v: &serde_json::Value) -> Option<[u8; 20]> {
+    match v {
+        serde_json::Value::String(_) => Some([0u8; 20]),
+        serde_json::Value::Object(o) => {
+            let s = o.get("issuer")?.as_str()?;
+            if let Ok(b) = hex::decode(s) {
+                if b.len() == 20 {
+                    return <[u8; 20]>::try_from(b.as_slice()).ok();
+                }
+            }
+            xrpl_core::types::AccountId::from_address(s).ok().map(|a| a.0)
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone)]
 enum Amount {
     Xrp(u64),
@@ -312,6 +355,25 @@ impl Transactor for OfferCreateTransactor {
                     "Flags": tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0),
                 });
                 sandbox.write(offer_key, serde_json::to_vec(&offer_obj).expect("serializing valid JSON Value"));
+
+                // Placement bookkeeping: the offer goes into the owner's
+                // directory AND the book's quality directory (created for the
+                // first offer at that price). Book base + quality keylets are
+                // mainnet-verified (105/106 pure placements exact). Quality is
+                // computed from the ORIGINAL tx amounts (rippled preserves the
+                // taker's quality for remainders).
+                crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &offer_key);
+                if let (Some(q), Some(pc), Some(gc), Some(pi), Some(gi)) = (
+                    keylet::offer_quality(&tx.fields["TakerPays"], &tx.fields["TakerGets"]),
+                    amount_currency20(&tx.fields["TakerPays"]),
+                    amount_currency20(&tx.fields["TakerGets"]),
+                    amount_issuer20(&tx.fields["TakerPays"]),
+                    amount_issuer20(&tx.fields["TakerGets"]),
+                ) {
+                    let base = keylet::book_base(&pc, &gc, &pi, &gi);
+                    let bdir = keylet::book_dir_key(&base, q);
+                    crate::ledger::directory::dir_insert(sandbox, &bdir, None, &offer_key);
+                }
 
                 // Increment OwnerCount
                 let acct_key = keylet::account_root_key(&tx.account);

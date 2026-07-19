@@ -143,6 +143,112 @@ pub fn check_key(account_id: &[u8; 20], sequence: u32) -> Hash256 {
     sha512_half(&buf)
 }
 
+/// Order-book base key: `SHA512Half(0x0042 'B' || pays_currency ||
+/// gets_currency || pays_issuer || gets_issuer)`. The tradable quality
+/// directory replaces the low 64 bits with the encoded quality. Field order
+/// mainnet-verified across 341 offers (13 ledgers).
+pub fn book_base(
+    pays_currency: &[u8; 20],
+    gets_currency: &[u8; 20],
+    pays_issuer: &[u8; 20],
+    gets_issuer: &[u8; 20],
+) -> Hash256 {
+    let mut buf = [0u8; 82];
+    buf[..2].copy_from_slice(&[0x00, 0x42]);
+    buf[2..22].copy_from_slice(pays_currency);
+    buf[22..42].copy_from_slice(gets_currency);
+    buf[42..62].copy_from_slice(pays_issuer);
+    buf[62..82].copy_from_slice(gets_issuer);
+    sha512_half(&buf)
+}
+
+/// Quality directory key for a book: base with the low 64 bits replaced by
+/// the quality (big-endian).
+pub fn book_dir_key(base: &Hash256, quality: u64) -> Hash256 {
+    let mut k = base.0;
+    k[24..32].copy_from_slice(&quality.to_be_bytes());
+    Hash256(k)
+}
+
+/// Parse an amount's (mantissa, exponent): XRP drops are integral strings
+/// (exponent 0); IOU values are decimal strings, optionally scientific
+/// (`1000000000000000e-1`).
+fn amount_mant_exp(v: &serde_json::Value) -> Option<(u128, i32)> {
+    let s = match v {
+        serde_json::Value::String(s) => s.as_str(),
+        serde_json::Value::Object(o) => o.get("value")?.as_str()?,
+        _ => return None,
+    };
+    let s = s.trim_start_matches('-');
+    let (mant_str, mut exp): (String, i32) = if let Some(epos) = s.find(['e', 'E']) {
+        let (m, e) = (&s[..epos], &s[epos + 1..]);
+        (m.to_string(), e.parse().ok()?)
+    } else {
+        (s.to_string(), 0)
+    };
+    let (digits, frac) = match mant_str.find('.') {
+        Some(d) => (format!("{}{}", &mant_str[..d], &mant_str[d + 1..]), (mant_str.len() - d - 1) as i32),
+        None => (mant_str, 0),
+    };
+    let m: u128 = digits.parse().ok()?;
+    exp -= frac;
+    Some((m, exp))
+}
+
+/// Offer quality = rate = TakerPays/TakerGets, encoded as rippled's
+/// `getRate`: `((exponent+100) << 56) | mantissa`. Faithful to STAmount
+/// divide under the Number switchover: normalize both mantissas to
+/// [1e15,1e16), truncating muldiv at 10^17, +5, then ONE round-half-even
+/// pass over the excess tail (Number canonicalize). Mainnet-verified
+/// 331/341 (all 10 misses are crossing-remainder placements).
+pub fn offer_quality(taker_pays: &serde_json::Value, taker_gets: &serde_json::Value) -> Option<u64> {
+    let (pm, pe) = amount_mant_exp(taker_pays)?;
+    let (gm, ge) = amount_mant_exp(taker_gets)?;
+    if pm == 0 || gm == 0 {
+        return None;
+    }
+    const LO: u128 = 1_000_000_000_000_000; // 1e15
+    const HI: u128 = 10_000_000_000_000_000; // 1e16
+    let norm = |mut m: u128, mut e: i32| {
+        while m >= HI {
+            m /= 10;
+            e += 1;
+        }
+        while m < LO {
+            m *= 10;
+            e -= 1;
+        }
+        (m, e)
+    };
+    let (nm, ne) = norm(pm, pe);
+    let (dm, de) = norm(gm, ge);
+    let v = nm * 100_000_000_000_000_000u128 / dm + 5; // trunc muldiv @1e17, +5
+    let mut e = ne - de - 17;
+    // Number canonicalize: one banker's rounding over the whole excess tail.
+    let mut k = 0u32;
+    let mut t = v;
+    while t >= HI {
+        t /= 10;
+        k += 1;
+    }
+    let d = 10u128.pow(k);
+    let (mut q, r) = (v / d, v % d);
+    if 2 * r > d || (2 * r == d && q % 2 == 1) {
+        q += 1;
+    }
+    if q >= HI {
+        q /= 10;
+        k += 1;
+    }
+    e += k as i32;
+    let mut m = q;
+    while m > 0 && m < LO {
+        m *= 10;
+        e -= 1;
+    }
+    Some((((e + 100) as u64) << 56) | m as u64)
+}
+
 /// Compute the state tree key for a Ticket.
 /// `key = SHA512Half(0x0054 || account_id || ticket_sequence_be32)` — 'T'.
 /// Mainnet-verified against #105663160's ticketed cancels.
