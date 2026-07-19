@@ -52,6 +52,23 @@ impl<'a> Sandbox<'a> {
         }
     }
 
+    /// Keys beginning with `prefix` as visible through this sandbox: base
+    /// state keys plus keys written here, minus deletions. Sorted ascending.
+    pub fn keys_with_prefix(&self, prefix: &[u8]) -> Vec<Hash256> {
+        let mut keys = self.base.state_map.keys_with_prefix(prefix);
+        for (k, e) in &self.modifications {
+            if k.0.len() >= prefix.len() && &k.0[..prefix.len()] == prefix {
+                if !matches!(e, SandboxEntry::Deleted) {
+                    keys.push(*k);
+                }
+            }
+        }
+        keys.sort_by(|a, b| a.0.cmp(&b.0));
+        keys.dedup();
+        keys.retain(|k| !matches!(self.modifications.get(k), Some(SandboxEntry::Deleted)));
+        keys
+    }
+
     /// Read an object by key. Checks modifications first, then falls through to base.
     /// Returns `None` if the object doesn't exist or was deleted.
     pub fn read(&self, key: &Hash256) -> Option<Vec<u8>> {

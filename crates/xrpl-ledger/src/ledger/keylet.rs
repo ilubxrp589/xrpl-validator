@@ -173,7 +173,7 @@ pub fn book_dir_key(base: &Hash256, quality: u64) -> Hash256 {
 /// Parse an amount's (mantissa, exponent): XRP drops are integral strings
 /// (exponent 0); IOU values are decimal strings, optionally scientific
 /// (`1000000000000000e-1`).
-fn amount_mant_exp(v: &serde_json::Value) -> Option<(u128, i32)> {
+pub fn amount_mant_exp(v: &serde_json::Value) -> Option<(u128, i32)> {
     let s = match v {
         serde_json::Value::String(s) => s.as_str(),
         serde_json::Value::Object(o) => o.get("value")?.as_str()?,

@@ -47,6 +47,12 @@ pub enum TxResult {
     NoPermission,
     /// Object not found.
     NoEntry,
+    /// IoC/FoK offer crossed nothing (or FoK not fully filled).
+    Killed,
+    /// Placement would exceed the owner reserve.
+    InsufReserveOffer,
+    /// Offer is unfunded at apply time.
+    UnfundedOffer,
 
     // tem — malformed, not applied at all
     /// Transaction is malformed.
@@ -107,6 +113,9 @@ impl TxResult {
             TxResult::Unfunded => "tecUNFUNDED",
             TxResult::NoPermission => "tecNO_PERMISSION",
             TxResult::NoEntry => "tecNO_ENTRY",
+            TxResult::Killed => "tecKILLED",
+            TxResult::InsufReserveOffer => "tecINSUF_RESERVE_OFFER",
+            TxResult::UnfundedOffer => "tecUNFUNDED_OFFER",
             TxResult::Malformed => "temMALFORMED",
             TxResult::BadFee => "temBAD_FEE",
             TxResult::BadAmount => "temBAD_AMOUNT",
