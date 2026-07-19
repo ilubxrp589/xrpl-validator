@@ -343,6 +343,76 @@ fn load_trustline_hint_pages(state: &mut LedgerState, url: &str, txj: &Value, le
     }
 }
 
+/// Load the order book a cross-currency Payment crosses. Mainnet meta only
+/// shows CONSUMED liquidity — the book a failed (or partially-filling) payment
+/// walked is invisible, so native read tecPATH_DRY where mainnet delivered.
+/// `book_offers` at `ledger_index` is used purely for KEY DISCOVERY (offer
+/// indexes, their directory pages, the makers); every object then loads
+/// through `ledger_entry` like the rest of the pre-state. `books_seen` dedups
+/// per (pays, gets) pair — pre-state is all at seq-1, so one fetch per book
+/// per ledger suffices.
+fn load_payment_books(
+    state: &mut LedgerState,
+    url: &str,
+    txj: &Value,
+    ledger_index: u32,
+    books_seen: &mut HashSet<String>,
+) {
+    if txj["TransactionType"].as_str() != Some("Payment") {
+        return;
+    }
+    let Some(sm) = txj.get("SendMax") else { return };
+    let amt = &txj["Amount"];
+    let spec = |v: &Value| -> Option<Value> {
+        match v {
+            Value::String(_) => Some(json!({"currency": "XRP"})),
+            Value::Object(o) => Some(json!({
+                "currency": o.get("currency")?.clone(),
+                "issuer": o.get("issuer")?.clone(),
+            })),
+            _ => None,
+        }
+    };
+    let (Some(pays_spec), Some(gets_spec)) = (spec(sm), spec(amt)) else { return };
+    if pays_spec == gets_spec {
+        return;
+    }
+    let book_id = format!("{pays_spec}|{gets_spec}");
+    if !books_seen.insert(book_id) {
+        return;
+    }
+    let Some(res) = rpc(url, "book_offers", json!({
+        "taker_pays": pays_spec,
+        "taker_gets": gets_spec,
+        "limit": 10,
+        "ledger_index": ledger_index,
+    })) else { return };
+    let Some(offers) = res.get("offers").and_then(|v| v.as_array()) else { return };
+    for off in offers.iter().take(10) {
+        if let Some(idx) = off.get("index").and_then(|v| v.as_str()) {
+            load_object(state, url, idx, ledger_index);
+        }
+        if let Some(bd) = off.get("BookDirectory").and_then(|v| v.as_str()) {
+            load_object(state, url, bd, ledger_index);
+        }
+        // Maker funding: available() reads the maker's AccountRoot (XRP
+        // sales) or gets-side trust line (IOU sales) — neither appears in a
+        // walked-past meta.
+        let Some(maker) = off.get("Account").and_then(|v| v.as_str()) else { continue };
+        load_account(state, url, maker, ledger_index);
+        if let Some(g) = off.get("TakerGets").and_then(|v| v.as_object()) {
+            if let (Some(mid), Some(gi), Some(gc)) = (
+                decode_address(maker),
+                g.get("issuer").and_then(|v| v.as_str()).and_then(decode_issuer),
+                g.get("currency").and_then(|v| v.as_str()),
+            ) {
+                let key = keylet::ripple_state_key(&mid, &gi, &currency_code(gc));
+                load_object(state, url, &hex::encode_upper(key.0), ledger_index);
+            }
+        }
+    }
+}
+
 fn build_txfields(txjson: &Value) -> Option<TxFields> {
     let account = decode_address(txjson["Account"].as_str()?)?;
     let tx_type = txjson["TransactionType"].as_str()?.to_string();
@@ -557,6 +627,7 @@ fn run() -> i32 {
     // already-existing line that mainnet no-op'd, or a directory ROOT page
     // native must walk. Without these, native phantom-creates them. Keys are
     // computed from the tx (transactor-specific read-set).
+    let mut books_seen: HashSet<String> = HashSet::new();
     for h in &order {
         let Some(txj) = txjson_map.get(h) else { continue };
         for key_hex in native_read_keys(txj) {
@@ -565,6 +636,7 @@ fn run() -> i32 {
             }
         }
         load_trustline_hint_pages(&mut state, &rpc_url, txj, seq - 1);
+        load_payment_books(&mut state, &rpc_url, txj, seq - 1, &mut books_seen);
     }
     eprintln!("Loaded {} pre-state objects.", obj_seen.len());
 

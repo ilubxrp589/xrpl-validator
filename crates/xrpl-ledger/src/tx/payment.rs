@@ -352,10 +352,18 @@ impl PaymentTransactor {
             return TxResult::Malformed;
         };
         let snap = sandbox.snapshot();
-        // Limit price = the full SendMax per full Amount; walk while makers
-        // are at or better. Identical shape to an OfferCreate paying `Amount`,
-        // getting `SendMax`.
-        let threshold = crate::ledger::keylet::offer_quality(sm_json, amt_json).unwrap_or(u64::MAX);
+        // rippled only imposes the SendMax/Amount ratio as a per-offer quality
+        // bound when tfLimitQuality is set. Otherwise the book is walked
+        // best-first under the aggregate bounds alone (spend ≤ SendMax,
+        // deliver ≤ Amount) — arb-style payments use a sentinel-max Amount
+        // whose implied ratio would read every book as dry.
+        let limit_quality =
+            tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & 0x0004_0000 != 0;
+        let threshold = if limit_quality {
+            crate::ledger::keylet::offer_quality(sm_json, amt_json).unwrap_or(u64::MAX)
+        } else {
+            u64::MAX
+        };
         let (rem_want, _rem_spend, _crossed) = ox::cross_engine(
             &tx.account, want0, spend0, &want_leg, &spend_leg, threshold, sandbox,
         );
@@ -367,6 +375,20 @@ impl PaymentTransactor {
         if !partial && !ox::me_is_zero(rem_want) {
             sandbox.restore_snapshot(snap);
             return TxResult::PathPartial;
+        }
+        // With tfPartialPayment, DeliverMin is the delivery floor: falling
+        // short fails fee-only with tecPATH_PARTIAL.
+        if partial {
+            if let Some(dm) = tx
+                .fields
+                .get("DeliverMin")
+                .and_then(crate::ledger::keylet::amount_mant_exp)
+            {
+                if ox::me_cmp(delivered, dm).is_lt() {
+                    sandbox.restore_snapshot(snap);
+                    return TxResult::PathPartial;
+                }
+            }
         }
         if dest != &tx.account {
             ox::move_leg(sandbox, &tx.account, dest, &want_leg, delivered);
@@ -648,5 +670,99 @@ mod tests {
         };
 
         apply_modifications(&mut state, mods).unwrap();
+    }
+
+    /// Seed a book where `issuer` (as maker) sells 5 USD for 5 XRP, then
+    /// return (state, taker, issuer).
+    fn state_with_usd_book() -> (LedgerState, [u8; 20], [u8; 20]) {
+        let taker = [0x01u8; 20];
+        let issuer = [0x03u8; 20];
+        let mut state = make_state();
+        add_account(&mut state, &taker, 50_000_000, 1);
+        add_account(&mut state, &issuer, 50_000_000, 1);
+
+        let mut sandbox = Sandbox::new(&state);
+        let offer_tx = TxFields {
+            account: issuer,
+            tx_type: "OfferCreate".to_string(),
+            fee: 12,
+            sequence: 2,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerPays": "5000000",
+                "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "5"},
+            }),
+        };
+        assert_eq!(
+            crate::tx::offer::OfferCreateTransactor.do_apply(&offer_tx, &mut sandbox),
+            TxResult::Success
+        );
+        let mods = sandbox.into_modifications();
+        apply_modifications(&mut state, mods).unwrap();
+        (state, taker, issuer)
+    }
+
+    /// Arb-style conversion: sentinel-max Amount + tfPartialPayment must
+    /// deliver whatever SendMax buys off the book (rippled imposes no
+    /// SendMax/Amount quality bound without tfLimitQuality).
+    #[test]
+    fn path_payment_partial_sentinel_amount_delivers() {
+        let (state, taker, issuer) = state_with_usd_book();
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: taker,
+            tx_type: "Payment".to_string(),
+            fee: 12,
+            sequence: 2,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Destination": hex::encode(taker),
+                "Amount": {"currency": "USD", "issuer": hex::encode(issuer), "value": "1000000000"},
+                "SendMax": "5000000",
+                "Flags": 131072u64,
+            }),
+        };
+        assert_eq!(PaymentTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+        // Taker spent the 5 XRP on the book.
+        assert_eq!(read_balance(&sandbox, &taker), 45_000_000);
+        // Taker now holds the acquired USD on a trust line.
+        let cur = crate::tx::offer::amount_currency20(
+            &serde_json::json!({"currency": "USD", "issuer": hex::encode(issuer), "value": "1"}),
+        )
+        .unwrap();
+        assert!(sandbox.exists(&keylet::ripple_state_key(&taker, &issuer, &cur)));
+    }
+
+    /// DeliverMin above what the book can produce: fee-only tecPATH_PARTIAL,
+    /// not tecPATH_DRY, and no state mutation survives.
+    #[test]
+    fn path_payment_deliver_min_short_fails_partial() {
+        let (state, taker, issuer) = state_with_usd_book();
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: taker,
+            tx_type: "Payment".to_string(),
+            fee: 12,
+            sequence: 2,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Destination": hex::encode(taker),
+                "Amount": {"currency": "USD", "issuer": hex::encode(issuer), "value": "1000000000"},
+                "SendMax": "5000000",
+                "DeliverMin": {"currency": "USD", "issuer": hex::encode(issuer), "value": "10"},
+                "Flags": 131072u64,
+            }),
+        };
+        assert_eq!(PaymentTransactor.do_apply(&tx, &mut sandbox), TxResult::PathPartial);
+        // Rolled back: XRP untouched, no trust line created.
+        assert_eq!(read_balance(&sandbox, &taker), 50_000_000);
+        let cur = crate::tx::offer::amount_currency20(
+            &serde_json::json!({"currency": "USD", "issuer": hex::encode(issuer), "value": "1"}),
+        )
+        .unwrap();
+        assert!(!sandbox.exists(&keylet::ripple_state_key(&taker, &issuer, &cur)));
     }
 }
