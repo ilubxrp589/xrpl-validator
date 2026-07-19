@@ -92,6 +92,10 @@ impl TxResult {
             | TxResult::Unfunded
             | TxResult::NoPermission
             | TxResult::NoEntry
+            | TxResult::Killed
+            | TxResult::InsufReserveOffer
+            | TxResult::UnfundedOffer
+            | TxResult::PathPartial
             | TxResult::Unsupported => true,
             // tem/tef: not claimed
             _ => false,
