@@ -316,6 +316,13 @@ pub(crate) fn line_adjust(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, am
     }
     let lkey = keylet::ripple_state_key(party, &leg.issuer, &leg.cur);
     let party_low = party < &leg.issuer;
+    // rippled flag layout (per side of the line).
+    const LOW_RESERVE: u64 = 0x0001_0000;
+    const HIGH_RESERVE: u64 = 0x0002_0000;
+    const LOW_NO_RIPPLE: u64 = 0x0010_0000;
+    const HIGH_NO_RIPPLE: u64 = 0x0020_0000;
+    const LOW_FREEZE: u64 = 0x0040_0000;
+    const HIGH_FREEZE: u64 = 0x0080_0000;
     if let Some(mut line) = json_at(sandbox, &lkey) {
         let (lneg, lbal) = signed_value(&line["Balance"]);
         // party's holding: low holds when balance positive, high when negative
@@ -327,25 +334,77 @@ pub(crate) fn line_adjust(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, am
         let (wneg, wmag) = if party_low { (nneg, nmag) } else { (!nneg, nmag) };
         let sign = if wneg && wmag.0 > 0 { "-" } else { "" };
         line["Balance"]["value"] = serde_json::Value::String(format!("{}{}", sign, me_to_value_string(wmag)));
+
+        // rippled rippleCreditIOU: a line the SENDER just spent from positive
+        // down to zero-or-below reverts to its default state — release their
+        // reserve, clear their reserve flag, and delete the line outright
+        // once the counterparty holds no reserve on it either. Guarded the
+        // rippled way: their side must be unfrozen, NoRipple-vs-DefaultRipple
+        // divergent, with a zero limit and zero quality settings.
+        let spent_out = !receiving && pmag.0 > 0 && nmag.0 == 0;
+        if spent_out {
+            let flags = line["Flags"].as_u64().unwrap_or(0);
+            let (my_reserve, my_no_ripple, my_freeze, my_limit, their_reserve) = if party_low {
+                (LOW_RESERVE, LOW_NO_RIPPLE, LOW_FREEZE, "LowLimit", HIGH_RESERVE)
+            } else {
+                (HIGH_RESERVE, HIGH_NO_RIPPLE, HIGH_FREEZE, "HighLimit", LOW_RESERVE)
+            };
+            let limit_zero = line[my_limit]["value"].as_str().map(|v| v == "0").unwrap_or(true);
+            let default_ripple = json_at(sandbox, &keylet::account_root_key(party))
+                .and_then(|a| a["Flags"].as_u64())
+                .map(|f| f & 0x0080_0000 != 0)
+                .unwrap_or(false);
+            let quality_zero = line.get("LowQualityIn").is_none()
+                && line.get("LowQualityOut").is_none()
+                && line.get("HighQualityIn").is_none()
+                && line.get("HighQualityOut").is_none();
+            if flags & my_reserve != 0
+                && (flags & my_no_ripple != 0) != default_ripple
+                && flags & my_freeze == 0
+                && limit_zero
+                && quality_zero
+            {
+                owner_count_add(sandbox, party, -1);
+                line["Flags"] = serde_json::Value::from(flags & !my_reserve);
+                if flags & their_reserve == 0 {
+                    // Default on both sides: the line stops existing.
+                    sandbox.delete(lkey);
+                    crate::ledger::directory::owner_dir_remove(sandbox, party, &lkey, None);
+                    crate::ledger::directory::owner_dir_remove(sandbox, &leg.issuer, &lkey, None);
+                    return;
+                }
+            }
+        }
         put_json(sandbox, lkey, &line);
     } else if receiving {
         let (lo, hi) = if party_low { (party, &leg.issuer) } else { (&leg.issuer, party) };
         let bal_neg = !party_low; // holding sits on the party's side
         let sign = if bal_neg { "-" } else { "" };
         let cur_str = hex::encode_upper(leg.cur);
+        // rippled trustCreate: the RECEIVER carries the reserve, and their
+        // side gets NoRipple unless their account has DefaultRipple set.
+        let default_ripple = json_at(sandbox, &keylet::account_root_key(party))
+            .and_then(|a| a["Flags"].as_u64())
+            .map(|f| f & 0x0080_0000 != 0)
+            .unwrap_or(false);
+        let mut flags = if party_low { LOW_RESERVE } else { HIGH_RESERVE };
+        if !default_ripple {
+            flags |= if party_low { LOW_NO_RIPPLE } else { HIGH_NO_RIPPLE };
+        }
         let line = serde_json::json!({
             "LedgerEntryType": "RippleState",
-            "Flags": if party_low { 0x0001_0000u64 } else { 0x0002_0000u64 },
+            "Flags": flags,
             "Balance": {"currency": cur_str, "issuer": "0000000000000000000000000000000000000000",
                          "value": format!("{}{}", sign, me_to_value_string(amt))},
             "LowLimit": {"currency": cur_str, "issuer": hex::encode(lo), "value": "0"},
             "HighLimit": {"currency": cur_str, "issuer": hex::encode(hi), "value": "0"},
         });
         put_json(sandbox, lkey, &line);
+        // The line joins BOTH owner directories, but only the receiver pays
+        // the reserve — the issuer's OwnerCount is untouched.
         crate::ledger::directory::owner_dir_insert(sandbox, party, &lkey);
         crate::ledger::directory::owner_dir_insert(sandbox, &leg.issuer, &lkey);
         owner_count_add(sandbox, party, 1);
-        owner_count_add(sandbox, &leg.issuer, 1);
     }
 }
 
@@ -1089,6 +1148,97 @@ mod tests {
         // IOC offer should NOT be placed on the book (no crossing happened)
         let offer_key = keylet::offer_key(&acct, 5);
         assert!(!sandbox.exists(&offer_key));
+    }
+
+    /// Build a state with `holder` and `issuer` accounts (no trust line).
+    fn state_for_line(holder: &[u8; 20], issuer: &[u8; 20]) -> crate::ledger::state::LedgerState {
+        let mut state = make_state_with_account(holder, 50_000_000);
+        let iss = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": hex::encode(issuer),
+            "Balance": "50000000",
+            "Sequence": 1,
+            "OwnerCount": 0,
+        });
+        state
+            .state_map
+            .insert(keylet::account_root_key(issuer), serde_json::to_vec(&iss).unwrap())
+            .unwrap();
+        state
+    }
+
+    fn owner_count(sandbox: &Sandbox, id: &[u8; 20]) -> u64 {
+        json_at(sandbox, &keylet::account_root_key(id))
+            .and_then(|a| a["OwnerCount"].as_u64())
+            .unwrap_or(0)
+    }
+
+    /// rippled's trustCreate charges the reserve to the RECEIVER only: the
+    /// line joins both owner directories, but just one OwnerCount moves. The
+    /// receiver's side also gets NoRipple (their account lacks DefaultRipple).
+    #[test]
+    fn line_creation_charges_only_the_receiver() {
+        let holder = [0x01u8; 20];
+        let issuer = [0x02u8; 20];
+        let state = state_for_line(&holder, &issuer);
+        let mut sandbox = Sandbox::new(&state);
+        let leg = Leg { xrp: false, cur: *b"USD\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", issuer };
+
+        line_adjust(&mut sandbox, &holder, &leg, (5, 0), true);
+
+        let line = json_at(&sandbox, &keylet::ripple_state_key(&holder, &issuer, &leg.cur))
+            .expect("line created");
+        let flags = line["Flags"].as_u64().unwrap();
+        let holder_low = holder < issuer;
+        let (reserve, no_ripple) = if holder_low {
+            (0x0001_0000, 0x0010_0000)
+        } else {
+            (0x0002_0000, 0x0020_0000)
+        };
+        assert_eq!(flags & reserve, reserve, "receiver reserve flag");
+        assert_eq!(flags & no_ripple, no_ripple, "receiver NoRipple flag");
+        assert_eq!(owner_count(&sandbox, &holder), 1);
+        assert_eq!(owner_count(&sandbox, &issuer), 0, "issuer pays no reserve");
+    }
+
+    /// Mainnet tx 0A207078B3A4… (ledger 105666725): a line spent back to
+    /// exactly zero returns to its default state and rippled DELETES it,
+    /// releasing the holder's reserve and unlinking both owner directories.
+    #[test]
+    fn line_spent_to_zero_is_deleted() {
+        let holder = [0x01u8; 20];
+        let issuer = [0x02u8; 20];
+        let state = state_for_line(&holder, &issuer);
+        let mut sandbox = Sandbox::new(&state);
+        let leg = Leg { xrp: false, cur: *b"USD\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", issuer };
+        let lkey = keylet::ripple_state_key(&holder, &issuer, &leg.cur);
+
+        line_adjust(&mut sandbox, &holder, &leg, (5, 0), true);
+        assert!(sandbox.exists(&lkey));
+        assert_eq!(owner_count(&sandbox, &holder), 1);
+
+        // Spend every unit back out.
+        line_adjust(&mut sandbox, &holder, &leg, (5, 0), false);
+
+        assert!(!sandbox.exists(&lkey), "default line deleted at zero balance");
+        assert_eq!(owner_count(&sandbox, &holder), 0, "reserve released");
+    }
+
+    /// A line spent only PART of the way down survives untouched.
+    #[test]
+    fn line_partially_spent_survives() {
+        let holder = [0x01u8; 20];
+        let issuer = [0x02u8; 20];
+        let state = state_for_line(&holder, &issuer);
+        let mut sandbox = Sandbox::new(&state);
+        let leg = Leg { xrp: false, cur: *b"USD\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", issuer };
+        let lkey = keylet::ripple_state_key(&holder, &issuer, &leg.cur);
+
+        line_adjust(&mut sandbox, &holder, &leg, (5, 0), true);
+        line_adjust(&mut sandbox, &holder, &leg, (2, 0), false);
+
+        assert!(sandbox.exists(&lkey));
+        assert_eq!(owner_count(&sandbox, &holder), 1);
     }
 
     /// Mainnet tx 9870DA80… (ledger 105091579): the STX issuer publishes

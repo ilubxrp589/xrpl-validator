@@ -713,8 +713,41 @@ fn run() -> i32 {
         let tx_type = txj["TransactionType"].as_str().unwrap_or("?").to_string();
         let net = &txmap[h];
         let net_ter = net["ter"].as_str().unwrap_or("?").to_string();
+        // Mainnet's meta lists nodes rippled merely TOUCHED — a ModifiedNode
+        // carrying neither FinalFields nor PreviousFields, only a refreshed
+        // PreviousTxnID (e.g. an issuer AccountRoot peeked during
+        // trustCreate). They record no state delta, and native does not model
+        // PreviousTxnID, so they are dropped here — symmetric with the
+        // no-op-Modified filtering `native_mutset` already applies to OUR
+        // side. Matching them would require an engine to bump a field rippled
+        // does not bump.
+        // Keys mainnet merely TOUCHED: a ModifiedNode carrying neither
+        // FinalFields nor PreviousFields, only a refreshed PreviousTxnID
+        // (e.g. an issuer AccountRoot peeked during trustCreate). They record
+        // no state delta and native does not model PreviousTxnID, so the key
+        // is excluded from BOTH sides — dropping it from mainnet's set alone
+        // would turn a legitimate native write into a phantom "extra".
+        let touched_only: HashSet<String> = net["nodes"].as_array()
+            .map(|a| {
+                a.iter()
+                    .filter(|n| n[1].as_u64() == Some(1))
+                    .filter(|n| {
+                        !n.get(2)
+                            .and_then(|f| f.as_object())
+                            .map(|o| o.keys().any(|k| k != "LedgerEntryType"))
+                            .unwrap_or(false)
+                    })
+                    .filter_map(|n| n[0].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
         let net_mut: HashSet<(String, u8)> = net["nodes"].as_array()
-            .map(|a| a.iter().filter_map(|n| Some((n[0].as_str()?.to_string(), n[1].as_u64()? as u8))).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|n| Some((n[0].as_str()?.to_string(), n[1].as_u64()? as u8)))
+                    .filter(|(k, _)| !touched_only.contains(k))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let e = agg.entry(tx_type.clone()).or_insert_with(TypeAgg::new);
@@ -736,7 +769,10 @@ fn run() -> i32 {
         };
 
         let (our_ter, mods) = native_apply_one(&state, &txf);
-        let our_mut = native_mutset(&state, &mods);
+        let our_mut: HashSet<(String, u8)> = native_mutset(&state, &mods)
+            .into_iter()
+            .filter(|(k, _)| !touched_only.contains(k))
+            .collect();
         // DX_DUMP=<hash prefix>: print the VALUES this tx wrote. The mutation
         // set compares keys only, so a value-level divergence (an offer
         // residual, a line balance) is otherwise invisible — quality is the
