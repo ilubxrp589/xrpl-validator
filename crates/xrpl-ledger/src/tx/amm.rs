@@ -25,22 +25,19 @@ use crate::shamap::hash::sha512_half;
 /// AMM key = SHA512Half(0x0041 || issue1_currency(20) || issue1_issuer(20) || issue2_currency(20) || issue2_issuer(20))
 /// For XRP, issuer is all zeros and currency is all zeros.
 fn amm_key(tx: &TxFields) -> Option<[u8; 32]> {
-    // We need Asset and Asset2 from the fields
-    // For simplicity, hash the tx account + "AMM" as a deterministic key
-    // since full asset pair extraction from JSON is complex
     let asset1 = tx.fields.get("Asset")?;
     let asset2 = tx.fields.get("Asset2")?;
-
-    let mut data = Vec::with_capacity(82);
-    data.extend_from_slice(&[0x00, 0x41]); // AMM space key
-
-    // Encode asset1
-    encode_asset_to_buf(&mut data, asset1);
-    // Encode asset2
-    encode_asset_to_buf(&mut data, asset2);
-
-    let hash = sha512_half(&data);
-    Some(hash.0)
+    // rippled keylet::amm orders the issues and serializes account-first —
+    // delegate to the verified keylet implementation.
+    let mut b1 = Vec::with_capacity(40);
+    encode_asset_to_buf(&mut b1, asset1);
+    let mut b2 = Vec::with_capacity(40);
+    encode_asset_to_buf(&mut b2, asset2);
+    let (c1, i1): ([u8; 20], [u8; 20]) =
+        (b1[..20].try_into().ok()?, b1[20..40].try_into().ok()?);
+    let (c2, i2): ([u8; 20], [u8; 20]) =
+        (b2[..20].try_into().ok()?, b2[20..40].try_into().ok()?);
+    Some(crate::ledger::keylet::amm_key(&c1, &i1, &c2, &i2).0)
 }
 
 fn encode_asset_to_buf(buf: &mut Vec<u8>, asset: &serde_json::Value) {
@@ -139,12 +136,20 @@ impl Transactor for AMMCreateTransactor {
             })
         };
 
-        // Compute AMM key
-        let mut data = Vec::with_capacity(82);
-        data.extend_from_slice(&[0x00, 0x41]);
-        encode_asset_to_buf(&mut data, &asset1);
-        encode_asset_to_buf(&mut data, &asset2);
-        let amm_hash = sha512_half(&data);
+        // Compute AMM key (rippled keylet::amm: ordered issues, account-first)
+        let mut b1 = Vec::with_capacity(40);
+        encode_asset_to_buf(&mut b1, &asset1);
+        let mut b2 = Vec::with_capacity(40);
+        encode_asset_to_buf(&mut b2, &asset2);
+        let (Ok(c1), Ok(i1), Ok(c2), Ok(i2)) = (
+            <[u8; 20]>::try_from(&b1[..20]),
+            <[u8; 20]>::try_from(&b1[20..40]),
+            <[u8; 20]>::try_from(&b2[..20]),
+            <[u8; 20]>::try_from(&b2[20..40]),
+        ) else {
+            return TxResult::Malformed;
+        };
+        let amm_hash = crate::ledger::keylet::amm_key(&c1, &i1, &c2, &i2);
 
         // Bug 4: Check for duplicate AMM
         if sandbox.exists(&amm_hash) {

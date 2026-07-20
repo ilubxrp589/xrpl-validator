@@ -358,11 +358,17 @@ fn load_payment_books(
     ledger_index: u32,
     books_seen: &mut HashSet<String>,
 ) {
-    if txj["TransactionType"].as_str() != Some("Payment") {
-        return;
-    }
-    let Some(sm) = txj.get("SendMax") else { return };
-    let amt = &txj["Amount"];
+    // Payment: spend SendMax to deliver Amount. OfferCreate: spend TakerGets
+    // to acquire TakerPays — same crossed book, same AMM pair.
+    let (spend, want) = match txj["TransactionType"].as_str() {
+        Some("Payment") => {
+            let Some(sm) = txj.get("SendMax") else { return };
+            (sm, &txj["Amount"])
+        }
+        Some("OfferCreate") => (&txj["TakerGets"], &txj["TakerPays"]),
+        _ => return,
+    };
+    let (sm, amt) = (spend, want);
     let spec = |v: &Value| -> Option<Value> {
         match v {
             Value::String(_) => Some(json!({"currency": "XRP"})),
@@ -380,6 +386,35 @@ fn load_payment_books(
     let book_id = format!("{pays_spec}|{gets_spec}");
     if !books_seen.insert(book_id) {
         return;
+    }
+    // AMM pre-state for the pair: the AMM object, its account, and its asset
+    // holdings (trust lines) — none of which appear in the meta of a payment
+    // that mainnet filled from the pool but native replays as dry.
+    if let Some(res) = rpc(url, "ledger_entry", json!({
+        "amm": {"asset": pays_spec, "asset2": gets_spec},
+        "ledger_index": ledger_index,
+    })) {
+        if let Some(idx) = res.get("index").and_then(|v| v.as_str()) {
+            load_object(state, url, idx, ledger_index);
+        }
+        if let Some(node) = res.get("node") {
+            if let Some(amm_acct) = node.get("Account").and_then(|v| v.as_str()) {
+                load_account(state, url, amm_acct, ledger_index);
+                if let Some(aid) = decode_address(amm_acct) {
+                    for side in [&pays_spec, &gets_spec] {
+                        if let (Some(cur), Some(iss)) = (
+                            side.get("currency").and_then(|v| v.as_str()),
+                            side.get("issuer").and_then(|v| v.as_str()).and_then(decode_issuer),
+                        ) {
+                            if cur != "XRP" {
+                                let key = keylet::ripple_state_key(&aid, &iss, &currency_code(cur));
+                                load_object(state, url, &hex::encode_upper(key.0), ledger_index);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     let Some(res) = rpc(url, "book_offers", json!({
         "taker_pays": pays_spec,

@@ -351,6 +351,15 @@ impl PaymentTransactor {
         let (Some(spend_leg), Some(spend0)) = (ox::leg_of(sm_json), crate::ledger::keylet::amount_mant_exp(sm_json)) else {
             return TxResult::Malformed;
         };
+        // The strand's input is bounded by what the sender actually holds of
+        // the SendMax asset (issuer mints freely; XRP is balance-minus-
+        // reserve; IOU is the trust-line holding). A sender with nothing to
+        // spend is a dry path regardless of book or AMM depth.
+        let spend_avail = ox::available(sandbox, &tx.account, &spend_leg);
+        if ox::me_is_zero(spend_avail) {
+            return TxResult::PathDry;
+        }
+        let spend0 = if ox::me_cmp(spend_avail, spend0).is_lt() { spend_avail } else { spend0 };
         let snap = sandbox.snapshot();
         // rippled only imposes the SendMax/Amount ratio as a per-offer quality
         // bound when tfLimitQuality is set. Otherwise the book is walked
@@ -733,6 +742,61 @@ mod tests {
         )
         .unwrap();
         assert!(sandbox.exists(&keylet::ripple_state_key(&taker, &issuer, &cur)));
+    }
+
+    /// A sender holding NONE of the SendMax currency is a dry strand no
+    /// matter how deep the book is: fee-only tecPATH_DRY (mainnet arb bots
+    /// hit this constantly — SendMax in a currency they hold zero of).
+    #[test]
+    fn path_payment_unfunded_sendmax_is_dry() {
+        let taker = [0x01u8; 20];
+        let issuer = [0x02u8; 20];
+        let maker = [0x04u8; 20];
+        let mut state = make_state();
+        add_account(&mut state, &taker, 50_000_000, 1);
+        add_account(&mut state, &maker, 50_000_000, 1);
+
+        // Maker sells 5 XRP for 5 USD — plenty of liquidity for the taker.
+        let mut sandbox = Sandbox::new(&state);
+        let offer_tx = TxFields {
+            account: maker,
+            tx_type: "OfferCreate".to_string(),
+            fee: 12,
+            sequence: 2,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "5"},
+                "TakerGets": "5000000",
+            }),
+        };
+        assert_eq!(
+            crate::tx::offer::OfferCreateTransactor.do_apply(&offer_tx, &mut sandbox),
+            TxResult::Success
+        );
+        let mods = sandbox.into_modifications();
+        apply_modifications(&mut state, mods).unwrap();
+
+        // Taker spends USD they do not hold (no trust line at all).
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: taker,
+            tx_type: "Payment".to_string(),
+            fee: 12,
+            sequence: 2,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Destination": hex::encode(taker),
+                "Amount": "100000000000000000",
+                "SendMax": {"currency": "USD", "issuer": hex::encode(issuer), "value": "5"},
+                "Flags": 131072u64,
+            }),
+        };
+        assert_eq!(PaymentTransactor.do_apply(&tx, &mut sandbox), TxResult::PathDry);
+        // Fee-only: taker's XRP untouched, maker's offer untouched.
+        assert_eq!(read_balance(&sandbox, &taker), 50_000_000);
+        assert!(sandbox.exists(&keylet::offer_key(&maker, 2)));
     }
 
     /// DeliverMin above what the book can produce: fee-only tecPATH_PARTIAL,

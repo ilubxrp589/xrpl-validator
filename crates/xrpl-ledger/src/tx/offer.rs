@@ -412,10 +412,26 @@ pub(crate) fn cross_engine(
     if threshold == 0 {
         return (rem_pays, rem_gets, crossed);
     }
+    // AMM for the pair competes with the book at every quality level
+    // (rippled BookStep + AMMLiquidity).
+    let amm = crate::tx::amm_swap::discover(sandbox, gets_leg, pays_leg, taker);
     let inv_base = keylet::book_base(&gets_leg.cur, &pays_leg.cur, &gets_leg.issuer, &pays_leg.issuer);
     let dirs = sandbox.keys_with_prefix(&inv_base.0[..24]);
     'dirs: for dk in dirs {
         let q = u64::from_be_bytes(dk.0[24..32].try_into().unwrap_or_default());
+        // AMM turn: consume pool liquidity while its spot quality strictly
+        // beats this book level (anchored so the book resumes at `q`).
+        if let Some(a) = &amm {
+            let (rp, rg, used) = crate::tx::amm_swap::consume(
+                sandbox, a, taker, rem_pays, rem_gets, pays_leg, gets_leg, threshold, Some(q),
+            );
+            rem_pays = rp;
+            rem_gets = rg;
+            crossed += used as u32;
+            if me_is_zero(rem_pays) || me_is_zero(rem_gets) {
+                break 'dirs;
+            }
+        }
         if q > threshold {
             break;
         }
@@ -500,6 +516,17 @@ pub(crate) fn cross_engine(
                 break;
             }
             page_key_h = keylet::dir_page_key(&dk, next);
+        }
+    }
+    // Final AMM turn once the book is exhausted (maxOffer sizing).
+    if let Some(a) = &amm {
+        if !me_is_zero(rem_pays) && !me_is_zero(rem_gets) {
+            let (rp, rg, used) = crate::tx::amm_swap::consume(
+                sandbox, a, taker, rem_pays, rem_gets, pays_leg, gets_leg, threshold, None,
+            );
+            rem_pays = rp;
+            rem_gets = rg;
+            crossed += used as u32;
         }
     }
     (rem_pays, rem_gets, crossed)

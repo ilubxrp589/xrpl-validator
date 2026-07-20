@@ -4,6 +4,7 @@
 
 pub mod account;
 pub mod amm;
+pub mod amm_swap;
 pub mod check;
 pub mod credential;
 pub mod dispatch;

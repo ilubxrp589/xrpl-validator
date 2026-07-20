@@ -76,6 +76,24 @@ pub fn ripple_state_key(
     sha512_half(&buf)
 }
 
+/// Compute the state tree key for an AMM instance keyed by its asset pair.
+/// rippled `keylet::amm`: issues ordered by (currency, account), serialized
+/// ACCOUNT-FIRST: `SHA512Half(0x0041 || min.account || min.currency ||
+/// max.account || max.currency)`. XRP is all-zero currency and account.
+/// Verified against mainnet AMMID 6DAA4FDF… (XRP/LEDGEND pool).
+pub fn amm_key(cur_a: &[u8; 20], iss_a: &[u8; 20], cur_b: &[u8; 20], iss_b: &[u8; 20]) -> Hash256 {
+    let a = (cur_a, iss_a);
+    let b = (cur_b, iss_b);
+    let (min, max) = if a <= b { (a, b) } else { (b, a) };
+    let mut buf = [0u8; 82];
+    buf[..2].copy_from_slice(&[0x00, 0x41]); // 'A'
+    buf[2..22].copy_from_slice(min.1);
+    buf[22..42].copy_from_slice(min.0);
+    buf[42..62].copy_from_slice(max.1);
+    buf[62..82].copy_from_slice(max.0);
+    sha512_half(&buf)
+}
+
 /// Compute the state tree key for an owner directory root.
 /// `key = SHA512Half(0x004F || account_id)`
 pub fn owner_dir_key(account_id: &[u8; 20]) -> Hash256 {
