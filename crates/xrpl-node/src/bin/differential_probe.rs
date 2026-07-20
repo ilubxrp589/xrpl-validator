@@ -448,6 +448,22 @@ fn load_payment_books(
     }
 }
 
+/// Recursively collect every `"issuer": "r…"` value in a transaction.
+fn collect_issuers(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::Object(m) => {
+            if let Some(i) = m.get("issuer").and_then(|x| x.as_str()) {
+                if i.starts_with('r') {
+                    out.push(i.to_string());
+                }
+            }
+            m.values().for_each(|x| collect_issuers(x, out));
+        }
+        Value::Array(a) => a.iter().for_each(|x| collect_issuers(x, out)),
+        _ => {}
+    }
+}
+
 fn build_txfields(txjson: &Value) -> Option<TxFields> {
     let account = decode_address(txjson["Account"].as_str()?)?;
     let tx_type = txjson["TransactionType"].as_str()?.to_string();
@@ -641,6 +657,18 @@ fn run() -> i32 {
                 }
             }
         }
+        // Every ISSUER named anywhere in the tx (Amount/SendMax/TakerPays/
+        // TakerGets/LimitAmount/Asset…). Their AccountRoots carry TickSize
+        // and TransferRate, which change offer placement and payment
+        // amounts — and a mainnet meta never modifies them, so the oracle
+        // cannot correct their absence.
+        let mut issuers: Vec<String> = Vec::new();
+        collect_issuers(txj, &mut issuers);
+        for a in issuers {
+            if seen.insert(a.clone()) {
+                load_account(&mut state, &rpc_url, &a, seq - 1);
+            }
+        }
     }
     // Load the pre-state of every object each tx MODIFIED or DELETED (existed at
     // seq-1). Created(0) nodes didn't exist yet — native creates them. This
@@ -709,6 +737,29 @@ fn run() -> i32 {
 
         let (our_ter, mods) = native_apply_one(&state, &txf);
         let our_mut = native_mutset(&state, &mods);
+        // DX_DUMP=<hash prefix>: print the VALUES this tx wrote. The mutation
+        // set compares keys only, so a value-level divergence (an offer
+        // residual, a line balance) is otherwise invisible — quality is the
+        // only value that leaks into a key, via the book page.
+        if let Ok(want) = std::env::var("DX_DUMP") {
+            if !want.is_empty() && h.starts_with(&want) {
+                eprintln!("=== DX_DUMP {h} ({tx_type}) our_ter={our_ter}");
+                let mut ks: Vec<_> = mods.iter().collect();
+                ks.sort_by_key(|(k, _)| hex::encode_upper(k.0));
+                for (k, ent) in ks {
+                    let (kind, bytes) = match ent {
+                        SandboxEntry::Created(b) => ("CREATED", Some(b)),
+                        SandboxEntry::Modified(b) => ("MODIFIED", Some(b)),
+                        SandboxEntry::Deleted => ("DELETED", None),
+                    };
+                    let body = bytes
+                        .and_then(|b| serde_json::from_slice::<Value>(b).ok())
+                        .map(|v| serde_json::to_string(&v).unwrap_or_default())
+                        .unwrap_or_default();
+                    eprintln!("  {} {kind} {}", hex::encode_upper(k.0), &body[..body.len().min(420)]);
+                }
+            }
+        }
         // ORACLE THREADING: after committing native's mods (which keeps
         // directory Indexes continuity — meta FinalFields OMIT the Indexes
         // array), overlay mainnet's actual post-state (meta NewFields /
@@ -760,10 +811,13 @@ fn run() -> i32 {
         } else {
             e.diverge_mut += 1; any_diverge = true; "DIVERGE-MUT"
         };
+        // FULL keys: book directory pages of one book share a 48-hex prefix
+        // (book_base || quality), so a truncated key cannot distinguish a
+        // page-quality shift from a delete/create of the same page.
         let missing: Vec<String> = net_mut.difference(&our_mut)
-            .map(|(k, b)| format!("{}:{}", &k[..k.len().min(12)], b)).take(8).collect();
+            .map(|(k, b)| format!("{k}:{b}")).take(8).collect();
         let extra: Vec<String> = our_mut.difference(&net_mut)
-            .map(|(k, b)| format!("{}:{}", &k[..k.len().min(12)], b)).take(8).collect();
+            .map(|(k, b)| format!("{k}:{b}")).take(8).collect();
         per_tx.push(json!({
             "hash": h, "type": tx_type, "verdict": verdict,
             "our_ter": our_ter, "net_ter": net_ter,

@@ -397,6 +397,167 @@ pub(crate) fn delete_maker_offer(
     owner_count_add(sandbox, maker, -1);
 }
 
+/// The issuer-published TickSize governing a pair: the smaller of the two
+/// issuers' TickSize fields (XRP has none). 16 means "no tick rounding"
+/// (rippled's Quality::maxTickSize).
+pub(crate) fn tick_size_for(sandbox: &Sandbox, a: &Leg, b: &Leg) -> u32 {
+    let mut ts = 16u32;
+    for leg in [a, b] {
+        if leg.xrp {
+            continue;
+        }
+        if let Some(acct) = json_at(sandbox, &keylet::account_root_key(&leg.issuer)) {
+            if let Some(t) = acct.get("TickSize").and_then(|v| v.as_u64()) {
+                if t > 0 {
+                    ts = ts.min(t as u32);
+                }
+            }
+        }
+    }
+    ts
+}
+
+/// rippled Quality::round(digits): round the rate mantissa UP to `digits`
+/// significant decimal digits.
+fn quality_round_up(rate: u64, digits: u32) -> u64 {
+    if digits >= 16 {
+        return rate;
+    }
+    let modulus = 10u64.pow(16 - digits);
+    let exp = rate >> 56;
+    let man = rate & 0x00FF_FFFF_FFFF_FFFF;
+    let man = man + modulus - 1;
+    let man = man - (man % modulus);
+    (exp << 56) | man
+}
+
+/// Normalize a mantissa into rippled's STAmount range [1e15, 1e16).
+fn norm16(x: Me) -> Me {
+    let (mut m, mut e) = x;
+    if m == 0 {
+        return (0, 0);
+    }
+    while m >= 10_000_000_000_000_000 {
+        m /= 10;
+        e += 1;
+    }
+    while m < 1_000_000_000_000_000 {
+        m *= 10;
+        e -= 1;
+    }
+    (m, e)
+}
+
+/// rippled `divide(num, den, issue)`: muldiv @1e17 + 5, then canonicalize —
+/// which for XRP converts to drops under Number's to-nearest rounding.
+fn st_divide(num: Me, den: Me, xrp: bool) -> Me {
+    if num.0 == 0 || den.0 == 0 {
+        return (0, 0);
+    }
+    let (nm, ne) = norm16(num);
+    let (dm, de) = norm16(den);
+    let v = nm * 100_000_000_000_000_000u128 / dm + 5;
+    let out = (v, ne - de - 17);
+    if xrp {
+        (me_rescale_nearest(out), 0)
+    } else {
+        norm16(out)
+    }
+}
+
+/// rippled `multiply(v1, v2, issue)`: mantissa product scaled by 1e14 with
+/// the +7 half-adjust, then canonicalize (to-nearest for XRP).
+fn st_multiply(a: Me, b: Me, xrp: bool) -> Me {
+    if a.0 == 0 || b.0 == 0 {
+        return (0, 0);
+    }
+    let (am, ae) = norm16(a);
+    let (bm, be) = norm16(b);
+    let v = am * bm / 100_000_000_000_000u128 + 7;
+    let out = (v, ae + be + 14);
+    if xrp {
+        (me_rescale_nearest(out), 0)
+    } else {
+        norm16(out)
+    }
+}
+
+/// rippled `getRate(pays, gets)` on raw mantissa/exponent pairs — the same
+/// algorithm as `keylet::offer_quality`, without the JSON round-trip.
+fn rate_of_me(pays: Me, gets: Me) -> Option<u64> {
+    if pays.0 == 0 || gets.0 == 0 {
+        return None;
+    }
+    let (nm, ne) = norm16(pays);
+    let (dm, de) = norm16(gets);
+    let v = nm * 100_000_000_000_000_000u128 / dm + 5;
+    let mut e = ne - de - 17;
+    let mut k = 0u32;
+    let mut t = v;
+    while t >= 10_000_000_000_000_000 {
+        t /= 10;
+        k += 1;
+    }
+    let d = 10u128.pow(k);
+    let (mut q, r) = (v / d, v % d);
+    let twice = r * 2;
+    if twice > d || (twice == d && q & 1 == 1) {
+        q += 1;
+    }
+    e += k as i32;
+    if q >= 10_000_000_000_000_000 {
+        q /= 10;
+        e += 1;
+    }
+    Some((((e + 100) as u64) << 56) | q as u64)
+}
+
+/// Scale a mantissa/exponent to an integer drop count, rounding to nearest
+/// (rippled's `XRPAmount{Number}` conversion under the default round mode).
+fn me_rescale_nearest(x: Me) -> u128 {
+    let (m, e) = x;
+    if m == 0 {
+        return 0;
+    }
+    if e >= 0 {
+        return m * 10u128.pow(e.unsigned_abs().min(30));
+    }
+    let shift = e.unsigned_abs().min(39);
+    let d = 10u128.pow(shift);
+    let q = m / d;
+    let r = m % d;
+    let twice = r.saturating_mul(2);
+    if twice > d || (twice == d && q & 1 == 1) {
+        q + 1
+    } else {
+        q
+    }
+}
+
+/// Apply issuer tick-size rounding to a requested offer, exactly as
+/// rippled's CreateOffer does BEFORE crossing: round the rate up to the
+/// tick, then re-derive the side that isn't held exact — TakerPays for a
+/// tfSell offer, TakerGets otherwise.
+pub(crate) fn apply_tick_size(pays: Me, gets: Me, sell: bool, tick: u32, pays_xrp: bool, gets_xrp: bool) -> (Me, Me) {
+    if tick >= 16 {
+        return (pays, gets);
+    }
+    let Some(rate) = rate_of_me(pays, gets) else {
+        return (pays, gets);
+    };
+    let rounded = quality_round_up(rate, tick);
+    let rate_me = ((rounded & 0x00FF_FFFF_FFFF_FFFF) as u128, ((rounded >> 56) as i32) - 100);
+    if sell {
+        // Hold TakerGets, re-derive TakerPays = TakerGets × rate.
+        let p = st_multiply(gets, rate_me, pays_xrp);
+        if p.0 == 0 { (pays, gets) } else { (p, gets) }
+    } else {
+        // Hold TakerPays, re-derive TakerGets = TakerPays ÷ rate.
+        let g = st_divide(pays, rate_me, gets_xrp);
+        if g.0 == 0 { (pays, gets) } else { (pays, g) }
+    }
+}
+
 /// Walk the inverse book from best quality and cross while the maker's rate is
 /// within `threshold`. Returns (remaining pays, remaining gets, crossed count).
 pub(crate) fn cross_engine(
@@ -604,9 +765,19 @@ impl Transactor for OfferCreateTransactor {
 
         let snap = sandbox.snapshot();
 
+        // Issuer tick size rounds the requested rate up to N significant
+        // digits and re-derives the non-exact side — BEFORE crossing, so the
+        // crossing and the placed remainder both use the rounded amounts
+        // (rippled CreateOffer::applyGuts).
+        let tick = tick_size_for(sandbox, &pays_leg, &gets_leg);
+        let (tp0, tg0) = apply_tick_size(tp0, tg0, sell, tick, pays_leg.xrp, gets_leg.xrp);
+        if tp0.0 == 0 || tg0.0 == 0 {
+            return TxResult::Success; // rounded to nothing: fee-only
+        }
+
         // Cross against the inverse book while the maker's rate is within the
         // taker's limit price (threshold = quality with the sides swapped).
-        let threshold = keylet::offer_quality(&tg_json, &tp_json).unwrap_or(0);
+        let threshold = rate_of_me(tg0, tp0).unwrap_or(0);
         let (rem_pays, rem_gets, crossed) =
             cross_engine(&tx.account, tp0, tg0, &pays_leg, &gets_leg, threshold, sandbox);
 
@@ -656,7 +827,11 @@ impl Transactor for OfferCreateTransactor {
         });
         sandbox.write(offer_key, serde_json::to_vec(&offer_obj).expect("serializing valid JSON Value"));
         crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &offer_key);
-        if let Some(q) = keylet::offer_quality(&tp_json, &tg_json) {
+        // Book quality comes from the offer as REQUESTED (after tick
+        // rounding), not from the residual: rippled keeps a partially
+        // crossed offer at its original price (uRate is computed before
+        // crossing).
+        if let Some(q) = rate_of_me(tp0, tg0) {
             let base = keylet::book_base(&pays_leg.cur, &gets_leg.cur, &pays_leg.issuer, &gets_leg.issuer);
             let bdir = keylet::book_dir_key(&base, q);
             crate::ledger::directory::dir_insert(sandbox, &bdir, None, &offer_key);
@@ -893,5 +1068,53 @@ mod tests {
         // IOC offer should NOT be placed on the book (no crossing happened)
         let offer_key = keylet::offer_key(&acct, 5);
         assert!(!sandbox.exists(&offer_key));
+    }
+
+    /// Mainnet tx 9870DA80… (ledger 105091579): the STX issuer publishes
+    /// TickSize 6, so rippled rounds the offer rate UP to 6 significant
+    /// digits and re-derives the non-exact side before placing. The tx asks
+    /// to sell 8539920 drops for 813087.72688567 STX; mainnet stored an
+    /// offer of 8539914 drops at book quality 5321D3536A38DBA4.
+    #[test]
+    fn offer_placement_honors_issuer_tick_size() {
+        let acct = [0x01u8; 20];
+        let issuer = [0x02u8; 20];
+        let mut state = make_state_with_account(&acct, 500_000_000);
+        // Issuer account publishing TickSize 6.
+        let iss_acct = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": hex::encode(issuer),
+            "Balance": "50000000",
+            "Sequence": 1,
+            "OwnerCount": 0,
+            "TickSize": 6,
+        });
+        state
+            .state_map
+            .insert(keylet::account_root_key(&issuer), serde_json::to_vec(&iss_acct).unwrap())
+            .unwrap();
+
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: acct,
+            tx_type: "OfferCreate".to_string(),
+            fee: 12,
+            sequence: 5,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerPays": {"currency": "STX", "issuer": hex::encode(issuer), "value": "813087.72688567"},
+                "TakerGets": "8539920",
+            }),
+        };
+        assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+
+        let placed = json_at(&sandbox, &keylet::offer_key(&acct, 5)).expect("offer placed");
+        assert_eq!(placed["TakerGets"].as_str(), Some("8539914"));
+        assert_eq!(placed["TakerPays"]["value"].as_str(), Some("813087.72688567"));
+
+        // ...and it lands in the book page for the tick-rounded quality.
+        let q = keylet::offer_quality(&placed["TakerPays"], &placed["TakerGets"]).unwrap();
+        assert_eq!(format!("{q:016x}"), "5321d3536a38dba4");
     }
 }
