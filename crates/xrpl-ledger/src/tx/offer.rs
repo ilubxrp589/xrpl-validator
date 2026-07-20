@@ -866,6 +866,15 @@ impl Transactor for OfferCreateTransactor {
             return TxResult::Success; // rounded to nothing: fee-only
         }
 
+        // Taker funding: the offer can only sell what the account actually
+        // holds of the TakerGets asset (issuers mint freely; XRP is balance
+        // minus reserve; IOU is the trust-line holding). Holding none is an
+        // unfunded offer — fee-only, nothing crossed or placed — no matter
+        // how willing a counterparty is (rippled CreateOffer accountFunds).
+        if me_is_zero(available(sandbox, &tx.account, &gets_leg)) {
+            return TxResult::UnfundedOffer;
+        }
+
         // Cross against the inverse book while the maker's rate is within the
         // taker's limit price (threshold = quality with the sides swapped).
         let threshold = rate_of_me(tg0, tp0).unwrap_or(0);
@@ -1142,7 +1151,21 @@ mod tests {
     #[test]
     fn immediate_or_cancel_no_place() {
         let acct = [0x01u8; 20];
-        let state = make_state_with_account(&acct, 50_000_000);
+        let issuer = [0x02u8; 20];
+        let mut state = make_state_with_account(&acct, 50_000_000);
+        // Fund the taker's TakerGets (10 USD) so the offer is not rejected as
+        // unfunded before the IoC-crosses-nothing path is even reached.
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+        let (lo, hi) = if acct < issuer { (acct, issuer) } else { (issuer, acct) };
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+            "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000",
+                        "value": if acct < issuer { "10" } else { "-10" }},
+            "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000"},
+            "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000"},
+        });
+        state.state_map.insert(keylet::ripple_state_key(&acct, &issuer, &cur), serde_json::to_vec(&line).unwrap()).unwrap();
 
         let mut sandbox = Sandbox::new(&state);
         let tx = TxFields {
@@ -1165,6 +1188,69 @@ mod tests {
         // IOC offer should NOT be placed on the book (no crossing happened)
         let offer_key = keylet::offer_key(&acct, 5);
         assert!(!sandbox.exists(&offer_key));
+    }
+
+    /// Mainnet tx 8A70D6556E… (ledger 105035380): a tfSell FoK offering to
+    /// sell an IOU the account holds NONE of is unfunded — rippled returns
+    /// tecUNFUNDED_OFFER (fee-only) without crossing anything, even though a
+    /// willing maker exists. The taker's funding of the TakerGets asset caps
+    /// the crossing; zero holdings means nothing to sell.
+    #[test]
+    fn sell_offer_unfunded_when_taker_holds_none() {
+        let taker = [0x01u8; 20];
+        let maker = [0x04u8; 20];
+        let issuer = [0x02u8; 20];
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+
+        let mut state = make_state_with_account(&taker, 50_000_000);
+        for id in [&maker, &issuer] {
+            let a = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": hex::encode(id),
+                "Balance": "50000000", "Sequence": 1, "OwnerCount": 0,
+            });
+            state.state_map.insert(keylet::account_root_key(id), serde_json::to_vec(&a).unwrap()).unwrap();
+        }
+        // Maker holds 100 USD and offers to buy it back for XRP — a willing
+        // counterparty, so any spurious crossing would show up.
+        let mkey = keylet::ripple_state_key(&maker, &issuer, &cur);
+        let (lo, hi) = if maker < issuer { (maker, issuer) } else { (issuer, maker) };
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+            "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000",
+                        "value": if maker < issuer { "100" } else { "-100" }},
+            "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000"},
+            "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000"},
+        });
+        state.state_map.insert(mkey, serde_json::to_vec(&line).unwrap()).unwrap();
+        let mut sandbox = Sandbox::new(&state);
+        let maker_offer = TxFields {
+            account: maker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
+                "TakerGets": "10000000",
+            }),
+        };
+        assert_eq!(OfferCreateTransactor.do_apply(&maker_offer, &mut sandbox), TxResult::Success);
+        let mods = sandbox.into_modifications();
+        apply_modifications(&mut state, mods).unwrap();
+
+        // Taker holds NO USD but tries to sell 50 USD for XRP, tfSell + FoK.
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: taker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "50"},
+                "TakerPays": "1000000",
+                "Flags": 0x000C_0000u64,
+            }),
+        };
+        assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::UnfundedOffer);
+        // Nothing crossed: maker's offer and taker's XRP untouched.
+        assert!(sandbox.exists(&keylet::offer_key(&maker, 2)));
+        assert_eq!(read_balance(&sandbox, &taker), 50_000_000);
     }
 
     /// tfSell means "sell the ENTIRE TakerGets, even if that acquires more
