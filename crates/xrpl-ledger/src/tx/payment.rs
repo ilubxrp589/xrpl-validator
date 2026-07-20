@@ -373,8 +373,12 @@ impl PaymentTransactor {
         } else {
             u64::MAX
         };
-        let (rem_want, _rem_spend, _crossed) = ox::cross_engine(
-            &tx.account, want0, spend0, &want_leg, &spend_leg, threshold, sandbox,
+        // The strand's output belongs to the DESTINATION: crediting the
+        // sender first and forwarding would materialize an intermediate
+        // trust line rippled never creates (and when the destination is the
+        // issuer, the IOU is redeemed, not held).
+        let (rem_want, _rem_spend, _crossed) = ox::cross_engine_to(
+            &tx.account, dest, want0, spend0, &want_leg, &spend_leg, threshold, sandbox,
         );
         let delivered = ox::me_sub(want0, rem_want);
         if ox::me_is_zero(delivered) {
@@ -398,9 +402,6 @@ impl PaymentTransactor {
                     return TxResult::PathPartial;
                 }
             }
-        }
-        if dest != &tx.account {
-            ox::move_leg(sandbox, &tx.account, dest, &want_leg, delivered);
         }
         TxResult::Success
     }
@@ -742,6 +743,85 @@ mod tests {
         )
         .unwrap();
         assert!(sandbox.exists(&keylet::ripple_state_key(&taker, &issuer, &cur)));
+    }
+
+    /// Mainnet tx AAA6EB389D3A… (ledger 105035381): when the Destination IS
+    /// the issuer of the delivered currency, the strand's output goes
+    /// straight there and the IOU is redeemed — rippled never materializes a
+    /// trust line for the sender in between. We used to route through the
+    /// sender, leaving a zero-balance line (plus its directory pages and
+    /// OwnerCount bumps) that mainnet's meta has no trace of.
+    #[test]
+    fn path_payment_to_issuer_creates_no_sender_line() {
+        let taker = [0x01u8; 20];
+        let issuer = [0x02u8; 20];
+        let maker = [0x04u8; 20];
+        let mut state = make_state();
+        add_account(&mut state, &taker, 50_000_000, 1);
+        add_account(&mut state, &maker, 50_000_000, 1);
+        add_account(&mut state, &issuer, 50_000_000, 1);
+
+        // Maker holds USD and sells 5 USD for 5 XRP.
+        let cur = crate::tx::offer::amount_currency20(
+            &serde_json::json!({"currency": "USD", "issuer": hex::encode(issuer), "value": "1"}),
+        )
+        .unwrap();
+        let mkey = keylet::ripple_state_key(&maker, &issuer, &cur);
+        let (lo, hi) = if maker < issuer { (maker, issuer) } else { (issuer, maker) };
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Flags": 0x0001_0000u64,
+            "Balance": {"currency": hex::encode_upper(cur),
+                        "issuer": "0000000000000000000000000000000000000000",
+                        "value": if maker < issuer { "100" } else { "-100" }},
+            "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "0"},
+            "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "0"},
+        });
+        state.state_map.insert(mkey, serde_json::to_vec(&line).unwrap()).unwrap();
+
+        let mut sandbox = Sandbox::new(&state);
+        let offer_tx = TxFields {
+            account: maker,
+            tx_type: "OfferCreate".to_string(),
+            fee: 12,
+            sequence: 2,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerPays": "5000000",
+                "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "5"},
+            }),
+        };
+        assert_eq!(
+            crate::tx::offer::OfferCreateTransactor.do_apply(&offer_tx, &mut sandbox),
+            TxResult::Success
+        );
+        let mods = sandbox.into_modifications();
+        apply_modifications(&mut state, mods).unwrap();
+
+        // Pay USD to the ISSUER, sourcing it from the book with XRP.
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: taker,
+            tx_type: "Payment".to_string(),
+            fee: 12,
+            sequence: 2,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Destination": hex::encode(issuer),
+                "Amount": {"currency": "USD", "issuer": hex::encode(issuer), "value": "1000000000"},
+                "SendMax": "5000000",
+                "Flags": 131072u64,
+            }),
+        };
+        assert_eq!(PaymentTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+
+        // No trust line for the sender: the IOU never rests with them.
+        assert!(!sandbox.exists(&keylet::ripple_state_key(&taker, &issuer, &cur)));
+        // The maker's holding fell — that IS the redemption.
+        let ml = crate::tx::offer::json_at(&sandbox, &mkey).expect("maker line");
+        assert_ne!(ml["Balance"]["value"].as_str(), Some("100"));
     }
 
     /// A sender holding NONE of the SendMax currency is a dry strand no

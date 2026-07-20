@@ -487,6 +487,7 @@ pub(crate) fn consume(
     sandbox: &mut Sandbox,
     amm: &Amm,
     taker: &[u8; 20],
+    beneficiary: &[u8; 20],
     rem_pays: Me,
     rem_gets: Me,
     pays_leg: &Leg,
@@ -582,7 +583,7 @@ pub(crate) fn consume(
         return (rem_pays, rem_gets, false);
     }
     ox::move_leg(sandbox, taker, &amm.account, gets_leg, take_in);
-    ox::move_leg(sandbox, &amm.account, taker, pays_leg, take_out);
+    ox::move_leg(sandbox, &amm.account, beneficiary, pays_leg, take_out);
     (
         ox::me_sub(rem_pays, take_out),
         ox::me_sub(rem_gets, take_in),

@@ -560,8 +560,16 @@ pub(crate) fn apply_tick_size(pays: Me, gets: Me, sell: bool, tick: u32, pays_xr
 
 /// Walk the inverse book from best quality and cross while the maker's rate is
 /// within `threshold`. Returns (remaining pays, remaining gets, crossed count).
-pub(crate) fn cross_engine(
+///
+/// `taker` funds the gets side and owns any self-crossed offers; the acquired
+/// pays side is credited to `beneficiary`. For OfferCreate they are the same
+/// account, but a Payment's strand output belongs to the DESTINATION — routing
+/// it through the sender would materialize an intermediate trust line that
+/// rippled never creates (and, when the destination is the issuer, the IOU is
+/// redeemed rather than held).
+pub(crate) fn cross_engine_to(
     taker: &[u8; 20],
+    beneficiary: &[u8; 20],
     mut rem_pays: Me,
     mut rem_gets: Me,
     pays_leg: &Leg,
@@ -584,7 +592,7 @@ pub(crate) fn cross_engine(
         // beats this book level (anchored so the book resumes at `q`).
         if let Some(a) = &amm {
             let (rp, rg, used) = crate::tx::amm_swap::consume(
-                sandbox, a, taker, rem_pays, rem_gets, pays_leg, gets_leg, threshold, Some(q),
+                sandbox, a, taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, Some(q),
             );
             rem_pays = rp;
             rem_gets = rg;
@@ -654,7 +662,7 @@ pub(crate) fn cross_engine(
                         break 'dirs;
                     }
                 }
-                move_leg(sandbox, &maker, taker, pays_leg, give);
+                move_leg(sandbox, &maker, beneficiary, pays_leg, give);
                 move_leg(sandbox, taker, &maker, gets_leg, pay);
                 rem_pays = me_sub(rem_pays, give);
                 rem_gets = me_sub(rem_gets, pay);
@@ -683,7 +691,7 @@ pub(crate) fn cross_engine(
     if let Some(a) = &amm {
         if !me_is_zero(rem_pays) && !me_is_zero(rem_gets) {
             let (rp, rg, used) = crate::tx::amm_swap::consume(
-                sandbox, a, taker, rem_pays, rem_gets, pays_leg, gets_leg, threshold, None,
+                sandbox, a, taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, None,
             );
             rem_pays = rp;
             rem_gets = rg;
@@ -691,6 +699,19 @@ pub(crate) fn cross_engine(
         }
     }
     (rem_pays, rem_gets, crossed)
+}
+
+/// Cross with the taker as its own beneficiary (OfferCreate semantics).
+pub(crate) fn cross_engine(
+    taker: &[u8; 20],
+    rem_pays: Me,
+    rem_gets: Me,
+    pays_leg: &Leg,
+    gets_leg: &Leg,
+    threshold: u64,
+    sandbox: &mut Sandbox,
+) -> (Me, Me, u32) {
+    cross_engine_to(taker, taker, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sandbox)
 }
 
 pub struct OfferCreateTransactor;
