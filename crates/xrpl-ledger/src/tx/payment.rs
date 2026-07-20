@@ -378,7 +378,7 @@ impl PaymentTransactor {
         // trust line rippled never creates (and when the destination is the
         // issuer, the IOU is redeemed, not held).
         let (rem_want, _rem_spend, _crossed) = ox::cross_engine_to(
-            &tx.account, dest, want0, spend0, &want_leg, &spend_leg, threshold, sandbox,
+            &tx.account, dest, want0, spend0, &want_leg, &spend_leg, threshold, false, sandbox,
         );
         let delivered = ox::me_sub(want0, rem_want);
         if ox::me_is_zero(delivered) {

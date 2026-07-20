@@ -626,6 +626,10 @@ pub(crate) fn apply_tick_size(pays: Me, gets: Me, sell: bool, tick: u32, pays_xr
 /// it through the sender would materialize an intermediate trust line that
 /// rippled never creates (and, when the destination is the issuer, the IOU is
 /// redeemed rather than held).
+/// `sell` selects tfSell semantics: the taker sells the ENTIRE gets side
+/// (`rem_gets`), accepting more of the pays side than requested. The binding
+/// constraint becomes `rem_gets` alone — `rem_pays` (the minimum to acquire)
+/// stops bounding each fill and no longer terminates the walk once reached.
 pub(crate) fn cross_engine_to(
     taker: &[u8; 20],
     beneficiary: &[u8; 20],
@@ -634,12 +638,16 @@ pub(crate) fn cross_engine_to(
     pays_leg: &Leg,
     gets_leg: &Leg,
     threshold: u64,
+    sell: bool,
     sandbox: &mut Sandbox,
 ) -> (Me, Me, u32) {
     let mut crossed = 0u32;
     if threshold == 0 {
         return (rem_pays, rem_gets, crossed);
     }
+    // Strand is exhausted when the gets side is spent (always) or, for a
+    // buy, when the wanted pays side is fully acquired.
+    let done = |rp: Me, rg: Me| me_is_zero(rg) || (!sell && me_is_zero(rp));
     // AMM for the pair competes with the book at every quality level
     // (rippled BookStep + AMMLiquidity).
     let amm = crate::tx::amm_swap::discover(sandbox, gets_leg, pays_leg, taker);
@@ -651,12 +659,12 @@ pub(crate) fn cross_engine_to(
         // beats this book level (anchored so the book resumes at `q`).
         if let Some(a) = &amm {
             let (rp, rg, used) = crate::tx::amm_swap::consume(
-                sandbox, a, taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, Some(q),
+                sandbox, a, taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell, Some(q),
             );
             rem_pays = rp;
             rem_gets = rg;
             crossed += used as u32;
-            if me_is_zero(rem_pays) || me_is_zero(rem_gets) {
+            if done(rem_pays, rem_gets) {
                 break 'dirs;
             }
         }
@@ -703,7 +711,9 @@ pub(crate) fn cross_engine_to(
                     continue;
                 }
                 let m_gives = if me_cmp(funded, m_gives0).is_lt() { funded } else { m_gives0 };
-                let mut give = if me_cmp(rem_pays, m_gives).is_lt() { rem_pays } else { m_gives };
+                // A sell takes the whole maker offer (bounded only by rem_gets
+                // below); a buy stops at the wanted rem_pays.
+                let mut give = if !sell && me_cmp(rem_pays, m_gives).is_lt() { rem_pays } else { m_gives };
                 if pays_leg.xrp {
                     give = (me_rescale(give, 0, false), 0);
                 }
@@ -735,7 +745,7 @@ pub(crate) fn cross_engine_to(
                     off2["TakerPays"] = me_amount_json(&offer["TakerPays"], me_sub(m_wants0, pay));
                     put_json(sandbox, okey, &off2);
                 }
-                if me_is_zero(rem_pays) || me_is_zero(rem_gets) {
+                if done(rem_pays, rem_gets) {
                     break 'dirs;
                 }
             }
@@ -748,9 +758,9 @@ pub(crate) fn cross_engine_to(
     }
     // Final AMM turn once the book is exhausted (maxOffer sizing).
     if let Some(a) = &amm {
-        if !me_is_zero(rem_pays) && !me_is_zero(rem_gets) {
+        if !done(rem_pays, rem_gets) {
             let (rp, rg, used) = crate::tx::amm_swap::consume(
-                sandbox, a, taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, None,
+                sandbox, a, taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell, None,
             );
             rem_pays = rp;
             rem_gets = rg;
@@ -768,9 +778,10 @@ pub(crate) fn cross_engine(
     pays_leg: &Leg,
     gets_leg: &Leg,
     threshold: u64,
+    sell: bool,
     sandbox: &mut Sandbox,
 ) -> (Me, Me, u32) {
-    cross_engine_to(taker, taker, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sandbox)
+    cross_engine_to(taker, taker, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell, sandbox)
 }
 
 pub struct OfferCreateTransactor;
@@ -859,7 +870,7 @@ impl Transactor for OfferCreateTransactor {
         // taker's limit price (threshold = quality with the sides swapped).
         let threshold = rate_of_me(tg0, tp0).unwrap_or(0);
         let (rem_pays, rem_gets, crossed) =
-            cross_engine(&tx.account, tp0, tg0, &pays_leg, &gets_leg, threshold, sandbox);
+            cross_engine(&tx.account, tp0, tg0, &pays_leg, &gets_leg, threshold, sell, sandbox);
 
         let filled = if sell { me_is_zero(rem_gets) } else { me_is_zero(rem_pays) };
         if fok && !filled {
@@ -1003,9 +1014,15 @@ impl Transactor for OfferCancelTransactor {
 mod tests {
     use super::*;
     use crate::ledger::header::LedgerHeader;
-    use crate::ledger::sandbox::Sandbox;
+    use crate::ledger::sandbox::{apply_modifications, Sandbox};
     use crate::ledger::state::LedgerState;
     use xrpl_core::types::Hash256;
+
+    fn read_balance(sandbox: &Sandbox, id: &[u8; 20]) -> u64 {
+        json_at(sandbox, &keylet::account_root_key(id))
+            .and_then(|a| a["Balance"].as_str().and_then(|s| s.parse().ok()))
+            .unwrap_or(0)
+    }
 
     fn make_state_with_account(id: &[u8; 20], balance: u64) -> LedgerState {
         let header = LedgerHeader {
@@ -1148,6 +1165,76 @@ mod tests {
         // IOC offer should NOT be placed on the book (no crossing happened)
         let offer_key = keylet::offer_key(&acct, 5);
         assert!(!sandbox.exists(&offer_key));
+    }
+
+    /// tfSell means "sell the ENTIRE TakerGets, even if that acquires more
+    /// than TakerPays." A FillOrKill sell against a maker offering a better
+    /// rate than the taker's minimum must consume the whole TakerGets (taking
+    /// the surplus), not stop once TakerPays is reached — otherwise the
+    /// unsold remainder fails the fill check and the offer is wrongly killed.
+    #[test]
+    fn fill_or_kill_sell_takes_surplus_over_taker_pays() {
+        let taker = [0x01u8; 20];
+        let maker = [0x04u8; 20];
+        let issuer = [0x02u8; 20];
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+
+        let mut state = make_state_with_account(&taker, 50_000_000);
+        for id in [&maker, &issuer] {
+            let a = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": hex::encode(id),
+                "Balance": "50000000", "Sequence": 1, "OwnerCount": 0,
+            });
+            state.state_map.insert(keylet::account_root_key(id), serde_json::to_vec(&a).unwrap()).unwrap();
+        }
+        // Maker holds 100 USD.
+        let mkey = keylet::ripple_state_key(&maker, &issuer, &cur);
+        let (lo, hi) = if maker < issuer { (maker, issuer) } else { (issuer, maker) };
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+            "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000",
+                        "value": if maker < issuer { "100" } else { "-100" }},
+            "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000"},
+            "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000"},
+        });
+        state.state_map.insert(mkey, serde_json::to_vec(&line).unwrap()).unwrap();
+
+        // Maker sells 100 USD for 10 XRP (10 USD per XRP — very generous).
+        let mut sandbox = Sandbox::new(&state);
+        let maker_offer = TxFields {
+            account: maker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerPays": "10000000",
+                "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
+            }),
+        };
+        assert_eq!(OfferCreateTransactor.do_apply(&maker_offer, &mut sandbox), TxResult::Success);
+        assert!(sandbox.exists(&keylet::offer_key(&maker, 2)), "maker offer placed");
+        let mods = sandbox.into_modifications();
+        apply_modifications(&mut state, mods).unwrap();
+        assert!(json_at(&Sandbox::new(&state), &keylet::offer_key(&maker, 2)).is_some(), "maker offer persisted");
+
+        // Taker: tfSell + tfFillOrKill, sell 10 XRP for at least 5 USD.
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: taker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerGets": "10000000",
+                "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "5"},
+                "Flags": 0x000C_0000u64, // tfSell | tfFillOrKill
+            }),
+        };
+        assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+
+        // Taker sold all 10 XRP and acquired ~100 USD — far above TakerPays 5.
+        assert_eq!(read_balance(&sandbox, &taker), 40_000_000);
+        let tkey = keylet::ripple_state_key(&taker, &issuer, &cur);
+        let tl = json_at(&sandbox, &tkey).expect("taker USD line");
+        let (_neg, mag) = signed_value(&tl["Balance"]);
+        assert!(me_cmp(mag, (50, 0)).is_gt(), "acquired well over TakerPays 5, got {mag:?}");
     }
 
     /// Build a state with `holder` and `issuer` accounts (no trust line).

@@ -493,6 +493,7 @@ pub(crate) fn consume(
     pays_leg: &Leg,
     gets_leg: &Leg,
     threshold: u64,
+    sell: bool,
     clob: Option<u64>,
 ) -> (Me, Me, bool) {
     if ox::me_is_zero(rem_pays) || ox::me_is_zero(rem_gets) {
@@ -546,8 +547,10 @@ pub(crate) fn consume(
         return (rem_pays, rem_gets, false);
     };
     // Single-path limit semantics: the binding limit is re-swapped directly
-    // against the pool (AMMOffer::limitOut / limitIn).
-    if n_cmp(take_out, rem_pays) == Ordering::Greater {
+    // against the pool (AMMOffer::limitOut / limitIn). For a tfSell offer the
+    // pays side (rem_pays) is only a minimum, not a cap — the taker takes the
+    // surplus — so only rem_gets bounds the fill.
+    if !sell && n_cmp(take_out, rem_pays) == Ordering::Greater {
         take_out = rem_pays;
         match swap_asset_out(pool_in, pool_out, take_out, amm.tfee, gets_leg.xrp) {
             Some(i) => take_in = i,
