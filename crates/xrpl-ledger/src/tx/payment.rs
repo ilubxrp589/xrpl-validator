@@ -36,6 +36,46 @@ impl PaymentTransactor {
         Some(arr)
     }
 
+    /// Intermediate book-hop legs from the FIRST path. `Some(vec![])` means
+    /// no usable hops; `None` means the path uses account elements (rippling)
+    /// we can't model — the caller falls back to the single-book cross.
+    fn path_hops(tx: &TxFields) -> Option<Vec<crate::tx::offer::Leg>> {
+        let els = tx
+            .fields
+            .get("Paths")
+            .and_then(|p| p.as_array())
+            .and_then(|paths| paths.first())
+            .and_then(|p| p.as_array());
+        let Some(els) = els else { return Some(Vec::new()) };
+        let mut legs = Vec::new();
+        for el in els {
+            let t = el.get("type").and_then(|v| v.as_u64()).unwrap_or(0);
+            if t & 0x01 != 0 {
+                return None; // account hop (rippling): not modeled
+            }
+            let cur = el.get("currency").and_then(|v| v.as_str())?;
+            if cur == "XRP" {
+                legs.push(crate::tx::offer::Leg { xrp: true, cur: [0u8; 20], issuer: [0u8; 20] });
+                continue;
+            }
+            let mut c20 = [0u8; 20];
+            if cur.len() == 40 {
+                let b = hex::decode(cur).ok()?;
+                c20.copy_from_slice(&b);
+            } else if cur.len() == 3 {
+                c20[12..15].copy_from_slice(cur.as_bytes());
+            } else {
+                return None;
+            }
+            let iss = el
+                .get("issuer")
+                .and_then(|v| v.as_str())
+                .and_then(crate::tx::offer::decode20)?;
+            legs.push(crate::tx::offer::Leg { xrp: false, cur: c20, issuer: iss });
+        }
+        Some(legs)
+    }
+
     /// Extract the Amount in drops from the transaction fields.
     /// Amount can be a string (XRP drops) or an object (IOU — not handled here).
     fn amount_drops(tx: &TxFields) -> Option<u64> {
@@ -65,7 +105,10 @@ impl PaymentTransactor {
             }
         }
         // Default: 10 XRP (changed from 1 XRP in 2024)
-        10_000_000
+        // Mainnet base reserve since the 2024 vote — the old 10 XRP default
+        // turned real account-creates into phantom tecNO_DST_INSUF_XRP
+        // (#105284279 7423D8FA).
+        1_000_000
     }
 }
 
@@ -384,19 +427,52 @@ impl PaymentTransactor {
         } else {
             u64::MAX
         };
+        // Multi-hop strands: the FIRST path's elements name the intermediate
+        // currencies — one book per adjacent pair. Account elements
+        // (rippling) are not modeled; those fall back to the single-book
+        // cross. Intermediate acquisitions ride "in flight" through the
+        // SENDER: each hop credits the sender and the next debits the exact
+        // same amount, so the net-zero line drops out of the mutation set —
+        // matching rippled, which never materializes it.
+        let hops = Self::path_hops(tx);
         // The strand's output belongs to the DESTINATION: crediting the
         // sender first and forwarding would materialize an intermediate
         // trust line rippled never creates (and when the destination is the
         // issuer, the IOU is redeemed, not held).
-        let (rem_want, _rem_spend, _crossed) = ox::cross_engine_to(
-            &tx.account, dest, want0, spend0, &want_leg, &spend_leg, threshold, false, sandbox,
-        );
-        let delivered = ox::me_sub(want0, rem_want);
+        let delivered = if let Some(hops) = hops.as_ref().filter(|h| !h.is_empty()) {
+            let chain: Vec<&ox::Leg> = std::iter::once(&spend_leg)
+                .chain(hops.iter())
+                .chain(std::iter::once(&want_leg))
+                .collect();
+            let mut carry = spend0;
+            let n = chain.len() - 1;
+            for i in 0..n {
+                let last = i + 1 == n;
+                let benef = if last { dest } else { &tx.account };
+                // Intermediate hops SELL the whole carry; the last hop buys
+                // up to the Amount cap.
+                let want_cap = if last { want0 } else { (9_990_000_000_000_000, 60) };
+                let (rw, _rs, _c) = ox::cross_engine_to(
+                    &tx.account, benef, want_cap, carry, chain[i + 1], chain[i],
+                    threshold, !last, None, sandbox,
+                );
+                carry = ox::me_sub(want_cap, rw);
+                if ox::me_is_zero(carry) {
+                    break; // hop dried: nothing delivered
+                }
+            }
+            carry
+        } else {
+            let (rem_want, _rem_spend, _crossed) = ox::cross_engine_to(
+                &tx.account, dest, want0, spend0, &want_leg, &spend_leg, threshold, false, None, sandbox,
+            );
+            ox::me_sub(want0, rem_want)
+        };
         if ox::me_is_zero(delivered) {
             sandbox.restore_snapshot(snap);
             return TxResult::PathDry;
         }
-        if !partial && !ox::me_is_zero(rem_want) {
+        if !partial && ox::me_cmp(delivered, want0).is_lt() {
             sandbox.restore_snapshot(snap);
             return TxResult::PathPartial;
         }

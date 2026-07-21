@@ -180,6 +180,26 @@ pub fn book_base(
     sha512_half(&buf)
 }
 
+/// Permissioned-DEX (XLS-80) order-book base: the open-book preimage with the
+/// 32-byte DomainID appended. Mainnet-verified against #105666804's
+/// domain-scoped EUROP/XRP offer (B7D9F3DB).
+pub fn book_base_domain(
+    pays_currency: &[u8; 20],
+    gets_currency: &[u8; 20],
+    pays_issuer: &[u8; 20],
+    gets_issuer: &[u8; 20],
+    domain: &Hash256,
+) -> Hash256 {
+    let mut buf = [0u8; 114];
+    buf[..2].copy_from_slice(&[0x00, 0x42]);
+    buf[2..22].copy_from_slice(pays_currency);
+    buf[22..42].copy_from_slice(gets_currency);
+    buf[42..62].copy_from_slice(pays_issuer);
+    buf[62..82].copy_from_slice(gets_issuer);
+    buf[82..114].copy_from_slice(&domain.0);
+    sha512_half(&buf)
+}
+
 /// Quality directory key for a book: base with the low 64 bits replaced by
 /// the quality (big-endian).
 pub fn book_dir_key(base: &Hash256, quality: u64) -> Hash256 {
@@ -317,6 +337,20 @@ pub fn nft_sell_offers_key(nft_id: &Hash256) -> Hash256 {
     buf[..2].copy_from_slice(&[0x00, 0x69]);
     buf[2..34].copy_from_slice(&nft_id.0);
     sha512_half(&buf)
+}
+
+/// AMM LP-token currency code (XLS-30): `0x03 ++ SHA512(minCur ‖ maxCur)[0..19]`.
+/// Mainnet-verified against #105666725's XRP/SPY pool (03DF681D…).
+pub fn amm_lpt_currency(cur_a: &[u8; 20], cur_b: &[u8; 20]) -> [u8; 20] {
+    let (lo, hi) = if cur_a <= cur_b { (cur_a, cur_b) } else { (cur_b, cur_a) };
+    let mut buf = [0u8; 40];
+    buf[..20].copy_from_slice(lo);
+    buf[20..].copy_from_slice(hi);
+    let h = sha512_half(&buf);
+    let mut c = [0u8; 20];
+    c[0] = 0x03;
+    c[1..20].copy_from_slice(&h.0[..19]);
+    c
 }
 
 /// Compute the state tree key for a DepositPreauth.

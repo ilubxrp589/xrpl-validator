@@ -402,7 +402,18 @@ fn native_read_keys(txj: &Value) -> Vec<String> {
             if let (Some(q), Some(pc), Some(gc), Some(pi), Some(gi)) = (
                 keylet::offer_quality(p, g), cur20(p), cur20(g), iss20(p), iss20(g),
             ) {
-                let base = keylet::book_base(&pc, &gc, &pi, &gi);
+                let domain = txj.get("DomainID").and_then(|v| v.as_str())
+                    .and_then(|s| hex::decode(s).ok())
+                    .filter(|b| b.len() == 32)
+                    .map(|b| {
+                        let mut d = [0u8; 32];
+                        d.copy_from_slice(&b);
+                        Hash256(d)
+                    });
+                let base = match &domain {
+                    Some(d) => keylet::book_base_domain(&pc, &gc, &pi, &gi, d),
+                    None => keylet::book_base(&pc, &gc, &pi, &gi),
+                };
                 keys.push(hex::encode_upper(keylet::book_dir_key(&base, q).0));
             }
             // The taker's gets-side trust line decides fundedness for IOU
@@ -485,17 +496,9 @@ fn load_payment_books(
     ledger_index: u32,
     books_seen: &mut HashSet<String>,
 ) {
-    // Payment: spend SendMax to deliver Amount. OfferCreate: spend TakerGets
-    // to acquire TakerPays — same crossed book, same AMM pair.
-    let (spend, want) = match txj["TransactionType"].as_str() {
-        Some("Payment") => {
-            let Some(sm) = txj.get("SendMax") else { return };
-            (sm, &txj["Amount"])
-        }
-        Some("OfferCreate") => (&txj["TakerGets"], &txj["TakerPays"]),
-        _ => return,
-    };
-    let (sm, amt) = (spend, want);
+    // Payment: spend SendMax to deliver Amount — possibly through the FIRST
+    // path's intermediate currencies (multi-hop strand: one book per adjacent
+    // pair). OfferCreate: spend TakerGets to acquire TakerPays.
     let spec = |v: &Value| -> Option<Value> {
         match v {
             Value::String(_) => Some(json!({"currency": "XRP"})),
@@ -506,7 +509,48 @@ fn load_payment_books(
             _ => None,
         }
     };
-    let (Some(pays_spec), Some(gets_spec)) = (spec(sm), spec(amt)) else { return };
+    let mut chain: Vec<Value> = Vec::new();
+    match txj["TransactionType"].as_str() {
+        Some("Payment") => {
+            let Some(sm) = txj.get("SendMax") else { return };
+            let (Some(s), Some(w)) = (spec(sm), spec(&txj["Amount"])) else { return };
+            chain.push(s);
+            for el in txj["Paths"].as_array()
+                .and_then(|p| p.first())
+                .and_then(|p| p.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let Some(cur) = el.get("currency") else { continue };
+                if cur == "XRP" {
+                    chain.push(json!({"currency": "XRP"}));
+                } else if let Some(iss) = el.get("issuer") {
+                    chain.push(json!({"currency": cur.clone(), "issuer": iss.clone()}));
+                }
+            }
+            chain.push(w);
+        }
+        Some("OfferCreate") => {
+            let (Some(s), Some(w)) = (spec(&txj["TakerGets"]), spec(&txj["TakerPays"])) else { return };
+            chain.push(s);
+            chain.push(w);
+        }
+        _ => return,
+    }
+    for pair in chain.windows(2) {
+        load_book_pair(state, url, &pair[0], &pair[1], ledger_index, books_seen);
+    }
+}
+
+fn load_book_pair(
+    state: &mut LedgerState,
+    url: &str,
+    pays_spec: &Value,
+    gets_spec: &Value,
+    ledger_index: u32,
+    books_seen: &mut HashSet<String>,
+) {
+    let (pays_spec, gets_spec) = (pays_spec.clone(), gets_spec.clone());
     if pays_spec == gets_spec {
         return;
     }
@@ -546,11 +590,11 @@ fn load_payment_books(
     let Some(res) = rpc(url, "book_offers", json!({
         "taker_pays": pays_spec,
         "taker_gets": gets_spec,
-        "limit": 10,
+        "limit": 50,
         "ledger_index": ledger_index,
     })) else { return };
     let Some(offers) = res.get("offers").and_then(|v| v.as_array()) else { return };
-    for off in offers.iter().take(10) {
+    for off in offers.iter().take(50) {
         if let Some(idx) = off.get("index").and_then(|v| v.as_str()) {
             load_object(state, url, idx, ledger_index);
         }
@@ -828,6 +872,12 @@ fn run() -> i32 {
         load_trustline_hint_pages(&mut state, &rpc_url, txj, seq - 1);
         load_payment_books(&mut state, &rpc_url, txj, seq - 1, &mut books_seen);
         load_nft_pages_for_tx(&mut state, &rpc_url, txj, seq - 1);
+    }
+    // FeeSettings (fixed key): reserve checks read it; mainnet meta never
+    // carries it.
+    let fee_key = hex::encode_upper(keylet::fee_settings_key().0);
+    if obj_seen.insert(fee_key.clone()) {
+        load_object(&mut state, &rpc_url, &fee_key, seq - 1);
     }
     eprintln!("Loaded {} pre-state objects.", obj_seen.len());
 

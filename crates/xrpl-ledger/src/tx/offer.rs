@@ -23,6 +23,7 @@
 use crate::ledger::keylet;
 use crate::ledger::sandbox::Sandbox;
 use crate::ledger::transactor::{Transactor, TxFields, TxResult};
+use xrpl_core::types::Hash256;
 
 /// Parse an Amount field — returns (drops, is_xrp).
 /// XRP amounts are strings of drops. IOU amounts are objects with currency/issuer/value.
@@ -507,37 +508,72 @@ fn norm16(x: Me) -> Me {
     (m, e)
 }
 
-/// rippled `divide(num, den, issue)`: muldiv @1e17 + 5, then canonicalize —
-/// which for XRP converts to drops under Number's to-nearest rounding.
+/// `num/den` rounded half-even to 16 significant digits — Number's real
+/// rounding, with the division remainder folded into the tie comparison.
+/// The legacy `+5`/`+7` half-adjust tricks approximate this under
+/// TRUNCATING canonicalize; mixing them with a nearest pass double-rounds
+/// (0EAE58BB fixed / 42071037 broken taught this the hard way).
+fn div_nearest_16(num: u128, den: u128, e: i32) -> Me {
+    if num == 0 || den == 0 {
+        return (0, 0);
+    }
+    let q = num / den;
+    let r = num % den;
+    let mut k = 0u32;
+    let mut t = q;
+    while t >= 10_000_000_000_000_000 {
+        t /= 10;
+        k += 1;
+    }
+    let d = 10u128.pow(k);
+    let (mut m, rr) = (q / d, q % d);
+    // Discarded tail = rr + r/den (in ulps of the kept mantissa) vs d/2.
+    let lhs = 2 * (rr * den + r);
+    let rhs = d * den;
+    if lhs > rhs || (lhs == rhs && m & 1 == 1) {
+        m += 1;
+    }
+    let mut e = e + k as i32;
+    if m >= 10_000_000_000_000_000 {
+        m /= 10;
+        e += 1;
+    }
+    while m > 0 && m < 1_000_000_000_000_000 {
+        m *= 10;
+        e -= 1;
+    }
+    (m, e)
+}
+
+/// rippled `divide(num, den, issue)` under Number semantics: exact quotient
+/// rounded half-even at 16 digits (drops for XRP).
 fn st_divide(num: Me, den: Me, xrp: bool) -> Me {
     if num.0 == 0 || den.0 == 0 {
         return (0, 0);
     }
     let (nm, ne) = norm16(num);
     let (dm, de) = norm16(den);
-    let v = nm * 100_000_000_000_000_000u128 / dm + 5;
-    let out = (v, ne - de - 17);
     if xrp {
-        (me_rescale_nearest(out), 0)
+        let v = nm * 100_000_000_000_000_000u128 / dm + 5;
+        (me_rescale_nearest((v, ne - de - 17)), 0)
     } else {
-        norm16(out)
+        div_nearest_16(nm * 100_000_000_000_000_000u128, dm, ne - de - 17)
     }
 }
 
-/// rippled `multiply(v1, v2, issue)`: mantissa product scaled by 1e14 with
-/// the +7 half-adjust, then canonicalize (to-nearest for XRP).
+/// rippled `multiply(v1, v2, issue)` under Number semantics: exact product
+/// rounded half-even at 16 digits (drops for XRP).
 fn st_multiply(a: Me, b: Me, xrp: bool) -> Me {
     if a.0 == 0 || b.0 == 0 {
         return (0, 0);
     }
     let (am, ae) = norm16(a);
     let (bm, be) = norm16(b);
-    let v = am * bm / 100_000_000_000_000u128 + 7;
-    let out = (v, ae + be + 14);
     if xrp {
-        (me_rescale_nearest(out), 0)
+        let v = am * bm / 100_000_000_000_000u128 + 7;
+        (me_rescale_nearest((v, ae + be + 14)), 0)
     } else {
-        norm16(out)
+        div_nearest_16(am * bm, 1, ae + be)
     }
 }
 
@@ -639,6 +675,7 @@ pub(crate) fn cross_engine_to(
     gets_leg: &Leg,
     threshold: u64,
     sell: bool,
+    domain: Option<&Hash256>,
     sandbox: &mut Sandbox,
 ) -> (Me, Me, u32) {
     let mut crossed = 0u32;
@@ -651,7 +688,10 @@ pub(crate) fn cross_engine_to(
     // AMM for the pair competes with the book at every quality level
     // (rippled BookStep + AMMLiquidity).
     let amm = crate::tx::amm_swap::discover(sandbox, gets_leg, pays_leg, taker);
-    let inv_base = keylet::book_base(&gets_leg.cur, &pays_leg.cur, &gets_leg.issuer, &pays_leg.issuer);
+    let inv_base = match domain {
+        Some(d) => keylet::book_base_domain(&gets_leg.cur, &pays_leg.cur, &gets_leg.issuer, &pays_leg.issuer, d),
+        None => keylet::book_base(&gets_leg.cur, &pays_leg.cur, &gets_leg.issuer, &pays_leg.issuer),
+    };
     let dirs = sandbox.keys_with_prefix(&inv_base.0[..24]);
     'dirs: for dk in dirs {
         let q = u64::from_be_bytes(dk.0[24..32].try_into().unwrap_or_default());
@@ -779,9 +819,10 @@ pub(crate) fn cross_engine(
     gets_leg: &Leg,
     threshold: u64,
     sell: bool,
+    domain: Option<&Hash256>,
     sandbox: &mut Sandbox,
 ) -> (Me, Me, u32) {
-    cross_engine_to(taker, taker, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell, sandbox)
+    cross_engine_to(taker, taker, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell, domain, sandbox)
 }
 
 pub struct OfferCreateTransactor;
@@ -869,11 +910,25 @@ impl Transactor for OfferCreateTransactor {
             return TxResult::UnfundedOffer;
         }
 
+        // A DomainID (XLS-80) scopes both crossing and placement to the
+        // domain's book.
+        let domain: Option<Hash256> = tx
+            .fields
+            .get("DomainID")
+            .and_then(|v| v.as_str())
+            .and_then(|s| hex::decode(s).ok())
+            .filter(|b| b.len() == 32)
+            .map(|b| {
+                let mut d = [0u8; 32];
+                d.copy_from_slice(&b);
+                Hash256(d)
+            });
+
         // Cross against the inverse book while the maker's rate is within the
         // taker's limit price (threshold = quality with the sides swapped).
         let threshold = rate_of_me(tg0, tp0).unwrap_or(0);
         let (rem_pays, rem_gets, crossed) =
-            cross_engine(&tx.account, tp0, tg0, &pays_leg, &gets_leg, threshold, sell, sandbox);
+            cross_engine(&tx.account, tp0, tg0, &pays_leg, &gets_leg, threshold, sell, domain.as_ref(), sandbox);
 
         let filled = if sell { me_is_zero(rem_gets) } else { me_is_zero(rem_pays) };
         if fok && !filled {
@@ -926,7 +981,10 @@ impl Transactor for OfferCreateTransactor {
         // crossed offer at its original price (uRate is computed before
         // crossing).
         if let Some(q) = rate_of_me(tp0, tg0) {
-            let base = keylet::book_base(&pays_leg.cur, &gets_leg.cur, &pays_leg.issuer, &gets_leg.issuer);
+            let base = match &domain {
+                Some(d) => keylet::book_base_domain(&pays_leg.cur, &gets_leg.cur, &pays_leg.issuer, &gets_leg.issuer, d),
+                None => keylet::book_base(&pays_leg.cur, &gets_leg.cur, &pays_leg.issuer, &gets_leg.issuer),
+            };
             let bdir = keylet::book_dir_key(&base, q);
             crate::ledger::directory::dir_insert(sandbox, &bdir, None, &offer_key);
         }
