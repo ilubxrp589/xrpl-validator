@@ -782,6 +782,20 @@ mod nft_page_prefetch {
                 "tt {tt} is an NFT page-walking type"
             );
         }
+        // NFTokenModify (61, XLS-46) locates the token on the owner's pages
+        // to rewrite its URI. When the acting Account is not the token owner
+        // (issuer-driven modify) sfOwner (field 4) names the holder, and both
+        // accounts' pages must be prefetched.
+        assert_eq!(
+            parse_nft_page_owners(&nft_tx(61, &[(1, account)])),
+            vec![account],
+            "NFTokenModify names the token owner via Account"
+        );
+        assert_eq!(
+            parse_nft_page_owners(&nft_tx(61, &[(1, account), (4, holder)])),
+            vec![account, holder],
+            "issuer-driven NFTokenModify names the holder via Owner"
+        );
     }
 
     #[test]
@@ -895,6 +909,34 @@ mod nft_page_prefetch {
             parse_nft_page_owners(&tx),
             vec![<[u8; 20]>::try_from(unhex("505BAC84B255340C73750E990A8634D5D2E609E8")).unwrap()],
             "the tx names the acceptor and nobody else"
+        );
+    }
+
+    /// A real NFTokenModify (tt 61) from mainnet L105740164 — one of the three
+    /// txs that replayed `tecNO_ENTRY` against mainnet's `tesSUCCESS` because
+    /// the owner's NFTokenPage set was never prefetched. `findToken` walks the
+    /// Account's pages, so the prefetch must name that account. The tx carries
+    /// no sfOwner (the acting account IS the owner), so the sole page owner is
+    /// the `8114` Account, which also matches the issuer embedded in the
+    /// NFTokenID (bytes 4..24).
+    #[test]
+    fn extracts_owner_from_mainnet_nftokenmodify_blob() {
+        let tx = unhex(
+            "12003D2200000000239B641EF32400000000201B064D77FA202906082F985A001813\
+             8858DFB58EBE866100FEDB2013D123744243658B7DBF6F7BBC0608231F6840000000\
+             0000000C7321EDAADA07AFC62B58F408A89A6CA23B5C749108CEE6E077BD214549F9\
+             AA25C675B47440302EC39EE3C6FA044AF856913E53C04D48480CD7E25A67D099116A\
+             65B02481F0346ADC0838338C880D360FFD5B33BE342F9E25249DD242C006BFE5C926\
+             F23D057542697066733A2F2F6261666B7265696871757267706571776F6361616769\
+             736A78733562707570746A33713469666671683273676F65676E6B7A347061376271\
+             627634811458DFB58EBE866100FEDB2013D123744243658B7D"
+                .replace(['\n', ' ', '\\'], "")
+                .as_str(),
+        );
+        assert_eq!(
+            parse_nft_page_owners(&tx),
+            vec![<[u8; 20]>::try_from(unhex("58DFB58EBE866100FEDB2013D123744243658B7D")).unwrap()],
+            "NFTokenModify's owner page-walk account is prefetched (was tecNO_ENTRY)"
         );
     }
 
