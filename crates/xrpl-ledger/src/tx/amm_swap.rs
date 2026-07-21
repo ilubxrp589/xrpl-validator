@@ -481,6 +481,111 @@ fn holds(sandbox: &Sandbox, acct: &[u8; 20], leg: &Leg) -> Me {
     }
 }
 
+/// One MULTI-PATH AMM turn (rippled generateFibSeqOffer): with more than one
+/// strand (every IOU↔IOU crossing bridges), the pool competes as a CLOB-like
+/// offer sized by the Fibonacci sequence off the pool balances at the START
+/// of the crossing. The slice's AVERAGE quality (spot + slippage + fee) is
+/// what competes with the books — the razor margin that decides
+/// pool-vs-bridge (#105666830 A8830CA4). Fills proportionally, capped by the
+/// taker's remainders.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn consume_fib(
+    sandbox: &mut Sandbox,
+    amm: &Amm,
+    taker: &[u8; 20],
+    beneficiary: &[u8; 20],
+    rem_pays: Me,
+    rem_gets: Me,
+    pays_leg: &Leg,
+    gets_leg: &Leg,
+    threshold: u64,
+    sell: bool,
+    init: (Me, Me),
+    iters: u32,
+    best_book: Option<Me>,
+) -> (Me, Me, bool) {
+    if ox::me_is_zero(rem_pays) || ox::me_is_zero(rem_gets) {
+        return (rem_pays, rem_gets, false);
+    }
+    let pool_in = holds(sandbox, &amm.account, gets_leg);
+    let pool_out = holds(sandbox, &amm.account, pays_leg);
+    if pool_in.0 == 0 || pool_out.0 == 0 {
+        return (rem_pays, rem_gets, false);
+    }
+    const FIB: [u32; 16] = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597];
+    let pct: Me = (2_500_000_000_000_000, -19); // kInitialFibSeqPct = 5/20000
+    let base_in = to_amount(n_mul(init.0, pct, Rnd::Up), gets_leg.xrp, Rnd::Up);
+    if base_in.0 == 0 {
+        return (rem_pays, rem_gets, false);
+    }
+    let (mut s_in, mut s_out);
+    if iters == 0 {
+        s_in = base_in;
+        s_out = swap_asset_in(init.0, init.1, s_in, amm.tfee, pays_leg.xrp);
+    } else {
+        let out0 = swap_asset_in(init.0, init.1, base_in, amm.tfee, pays_leg.xrp);
+        let idx = (iters as usize - 1).min(FIB.len() - 1);
+        s_out = to_amount(
+            n_mul(out0, ((FIB[idx] as u128) * LO, -15), Rnd::Down),
+            pays_leg.xrp,
+            Rnd::Down,
+        );
+        if s_out.0 == 0 || n_cmp(s_out, pool_out) != Ordering::Less {
+            return (rem_pays, rem_gets, false);
+        }
+        match swap_asset_out(pool_in, pool_out, s_out, amm.tfee, gets_leg.xrp) {
+            Some(i) => s_in = i,
+            None => return (rem_pays, rem_gets, false),
+        }
+    }
+    if s_in.0 == 0 || s_out.0 == 0 {
+        return (rem_pays, rem_gets, false);
+    }
+    let q = rate_of_me_pair(s_in, s_out);
+    if std::env::var("DX_AMM").is_ok() {
+        eprintln!("DX_AMM fib iter={iters} q={q:?} best_book={best_book:?} thr={threshold:x} slice=({s_in:?},{s_out:?})");
+    }
+    // Strictly better than the best book offer, and within the taker limit.
+    if let Some(bb) = best_book {
+        if n_cmp(q, bb) != Ordering::Less {
+            return (rem_pays, rem_gets, false);
+        }
+    }
+    if threshold != u64::MAX && n_cmp(q, decode_rate(threshold)) == Ordering::Greater {
+        return (rem_pays, rem_gets, false);
+    }
+    // CLOB-like proportional consumption against the remainders.
+    let mut take_in = s_in;
+    let mut take_out = s_out;
+    if !sell && n_cmp(take_out, rem_pays) == Ordering::Greater {
+        take_in = to_amount(ox::me_muldiv(rem_pays, s_in, s_out, true), gets_leg.xrp, Rnd::Up);
+        take_out = rem_pays;
+    }
+    if n_cmp(take_in, rem_gets) == Ordering::Greater {
+        take_out = to_amount(ox::me_muldiv(rem_gets, s_out, s_in, false), pays_leg.xrp, Rnd::Down);
+        take_in = rem_gets;
+    }
+    if take_in.0 == 0 || take_out.0 == 0 {
+        return (rem_pays, rem_gets, false);
+    }
+    ox::move_leg(sandbox, taker, &amm.account, gets_leg, take_in);
+    ox::move_leg(sandbox, &amm.account, beneficiary, pays_leg, take_out);
+    (
+        ox::me_sub(rem_pays, take_out),
+        ox::me_sub(rem_gets, take_in),
+        true,
+    )
+}
+
+/// Pool balances (in = what the taker pays in, out = what they receive) for
+/// the fib base — captured at crossing start.
+pub(crate) fn pool_balances(sandbox: &Sandbox, amm: &Amm, pays_leg: &Leg, gets_leg: &Leg) -> (Me, Me) {
+    (
+        holds(sandbox, &amm.account, gets_leg),
+        holds(sandbox, &amm.account, pays_leg),
+    )
+}
+
 /// One AMM turn inside the crossing walk. `clob` is the next book
 /// directory's getRate quality (None once the book is exhausted);
 /// `threshold` is the taker's limit rate (u64::MAX = unlimited). Consumes

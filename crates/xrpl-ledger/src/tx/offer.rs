@@ -825,12 +825,20 @@ fn cross_bridged(
     let la = book_offer_ladder(sandbox, &base_a, 128);
     let lb = book_offer_ladder(sandbox, &base_b, 128);
     if la.is_empty() || lb.is_empty() {
+        if std::env::var("DX_BRIDGE").is_ok() {
+            eprintln!("DX_BRIDGE bail la={} lb={} base_a={} base_b={}",
+                la.len(), lb.len(), hex::encode_upper(&base_a.0[..12]), hex::encode_upper(&base_b.0[..12]));
+        }
         return None; // no bridge: caller runs the direct walk
     }
     let ld = book_offer_ladder(sandbox, inv_base, 128);
     let thr = (threshold != u64::MAX).then(|| rate_me(threshold));
     let (mut di, mut ai, mut bi) = (0usize, 0usize, 0usize);
     let mut crossed = 0u32;
+    // IOU↔IOU crossings are always multi-strand on mainnet, so the pool
+    // competes with FIB-sequence offers off its starting balances.
+    let amm_init = amm.as_ref().map(|a| crate::tx::amm_swap::pool_balances(sandbox, a, pays_leg, gets_leg));
+    let mut amm_iters = 0u32;
     let done = |rp: Me, rg: Me| me_is_zero(rg) || (!sell && me_is_zero(rp));
     for _ in 0..512 {
         if done(rem_pays, rem_gets) {
@@ -852,24 +860,27 @@ fn cross_bridged(
             _ => None,
         };
         // AMM turn: the direct-pair pool competes with the best BOOK rate
-        // (direct or bridged) at every step, anchored the same way the plain
-        // walk anchors it to the next directory level.
-        if let Some(a) = amm {
+        // via multi-path FIB slices (its AVERAGE quality incl. slippage/fee).
+        if let (Some(a), Some(init)) = (amm, &amm_init) {
             let best_book = match (dq, bq) {
                 (Some(d), Some(b)) => Some(if me_cmp(d, b).is_le() { d } else { b }),
                 (Some(d), None) => Some(d),
                 (None, Some(b)) => Some(b),
                 (None, None) => None,
             };
-            let clob = best_book.map(|(m, e)| (((e + 100) as u64) << 56) | m as u64);
-            let (rp, rg, used) = crate::tx::amm_swap::consume(
+            let (rp, rg, used) = crate::tx::amm_swap::consume_fib(
                 sandbox, a, taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg,
-                threshold, sell, clob,
+                threshold, sell, *init, amm_iters, best_book,
             );
             rem_pays = rp;
             rem_gets = rg;
             if used {
+                amm_iters += 1;
                 crossed += 1;
+                if done(rem_pays, rem_gets) {
+                    break;
+                }
+                continue;
             }
             if done(rem_pays, rem_gets) {
                 break;
