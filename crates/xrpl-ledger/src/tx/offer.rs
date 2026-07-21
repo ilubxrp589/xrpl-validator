@@ -806,20 +806,14 @@ impl Transactor for OfferCreateTransactor {
             return TxResult::NoAccount;
         }
 
-        // Check sender has enough balance for what they're selling (XRP side)
-        let taker_gets = parse_amount(&tx.fields["TakerGets"]);
-        if let Some(Amount::Xrp(drops)) = &taker_gets {
-            if let Some(data) = sandbox.read(&acct_key) {
-                if let Ok(acct) = serde_json::from_slice::<serde_json::Value>(&data) {
-                    let balance = acct["Balance"]
-                        .as_str()
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(0);
-                    // Need balance for gets + fee + reserve
-                    if balance < *drops + tx.fee {
-                        return TxResult::Unfunded;
-                    }
-                }
+        // rippled CreateOffer::preclaim: an offer is unfunded when
+        // accountFunds(TakerGets) <= 0 — for XRP that is balance minus
+        // reserve, NOT the full sell amount (partially funded offers still
+        // cross). Returns tecUNFUNDED_OFFER, not the generic tecUNFUNDED.
+        // IOU-side funding is enforced by available() in do_apply.
+        if let Some(leg) = leg_of(&tx.fields["TakerGets"]) {
+            if me_is_zero(available(sandbox, &tx.account, &leg)) {
+                return TxResult::UnfundedOffer;
             }
         }
 
@@ -1188,6 +1182,38 @@ mod tests {
         // IOC offer should NOT be placed on the book (no crossing happened)
         let offer_key = keylet::offer_key(&acct, 5);
         assert!(!sandbox.exists(&offer_key));
+    }
+
+    /// Mainnet tx A2AED79309E6… (ledger 105035380): a tfSell FoK selling XRP
+    /// from an account whose balance sits BELOW its reserve (available <= 0)
+    /// is tecUNFUNDED_OFFER, not tecUNFUNDED — rippled's accountFunds for a
+    /// native sell is balance-minus-reserve.
+    #[test]
+    fn xrp_sell_below_reserve_is_unfunded_offer() {
+        let taker = [0x01u8; 20];
+        let issuer = [0x02u8; 20];
+        // Balance 725_581 with OwnerCount 1 → reserve 1_200_000 → available < 0.
+        let mut state = make_state_with_account(&taker, 725_581);
+        {
+            let key = keylet::account_root_key(&taker);
+            let mut a = json_at(&Sandbox::new(&state), &key).unwrap();
+            a["OwnerCount"] = serde_json::json!(1);
+            state.state_map.insert(key, serde_json::to_vec(&a).unwrap()).unwrap();
+        }
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: taker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 5,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerGets": "468801653",
+                "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "5"},
+                "Flags": 0x000C_0000u64,
+            }),
+        };
+        // The probe runs preclaim first — it must agree on tecUNFUNDED_OFFER,
+        // not the generic tecUNFUNDED.
+        assert_eq!(OfferCreateTransactor.preclaim(&tx, &sandbox), TxResult::UnfundedOffer);
+        assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::UnfundedOffer);
     }
 
     /// Mainnet tx 8A70D6556E… (ledger 105035380): a tfSell FoK offering to
