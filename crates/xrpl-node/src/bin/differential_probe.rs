@@ -619,6 +619,46 @@ fn load_book_pair(
     }
 }
 
+/// AMM Deposit/Withdraw pre-state: the pool account's owner-directory ROOT
+/// (the dir walk starts there; meta only carries the touched page) plus the
+/// depositor's dir root and both parties' account roots.
+fn load_amm_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
+    let tt = txj["TransactionType"].as_str();
+    if !matches!(tt, Some("AMMDeposit") | Some("AMMWithdraw") | Some("AMMCreate")) {
+        return;
+    }
+    if let Some(acct) = txj["Account"].as_str().and_then(decode_address) {
+        let k = hex::encode_upper(keylet::owner_dir_key(&acct).0);
+        load_object(state, url, &k, ledger_index);
+    }
+    if tt == Some("AMMCreate") {
+        // No pool exists yet — the creator's and asset issuers' dir roots are
+        // the walk anchors for the new trust lines.
+        for f in ["Amount", "Amount2"] {
+            if let Some(iss) = txj.get(f)
+                .and_then(|v| v.get("issuer"))
+                .and_then(|v| v.as_str())
+                .and_then(decode_issuer)
+            {
+                let k = hex::encode_upper(keylet::owner_dir_key(&iss).0);
+                load_object(state, url, &k, ledger_index);
+            }
+        }
+        return;
+    }
+    let (Some(a1), Some(a2)) = (txj.get("Asset"), txj.get("Asset2")) else { return };
+    let Some(res) = rpc(url, "ledger_entry", json!({
+        "amm": {"asset": a1, "asset2": a2},
+        "ledger_index": ledger_index,
+    })) else { return };
+    let Some(amm_acct) = res["node"]["Account"].as_str() else { return };
+    load_account(state, url, amm_acct, ledger_index);
+    if let Some(aid) = decode_address(amm_acct) {
+        let k = hex::encode_upper(keylet::owner_dir_key(&aid).0);
+        load_object(state, url, &k, ledger_index);
+    }
+}
+
 /// Recursively collect every `"issuer": "r…"` value in a transaction.
 fn collect_issuers(v: &Value, out: &mut Vec<String>) {
     match v {
@@ -804,10 +844,17 @@ fn run() -> i32 {
         .unwrap_or_else(|| txjson_map.keys().cloned().collect());
 
     // Build native base state at seq-1 from account_info of every involved account.
+    // parent_hash feeds the AMMCreate account derivation (ripesha over
+    // sha512half(prefix ‖ parentHash ‖ ammKeylet)).
+    let parent_hash = hdr["parent_hash"].as_str()
+        .and_then(|s| hex::decode(s).ok())
+        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+        .map(Hash256)
+        .unwrap_or(Hash256([0; 32]));
     let header = LedgerHeader {
         sequence: seq.saturating_sub(1),
         total_coins: hdr["total_drops"].as_u64().unwrap_or(100_000_000_000_000_000),
-        parent_hash: Hash256([0; 32]),
+        parent_hash,
         transaction_hash: Hash256([0; 32]),
         account_hash: Hash256([0; 32]),
         parent_close_time: hdr["parent_close_time"].as_u64().unwrap_or(0) as u32,
@@ -872,6 +919,7 @@ fn run() -> i32 {
         load_trustline_hint_pages(&mut state, &rpc_url, txj, seq - 1);
         load_payment_books(&mut state, &rpc_url, txj, seq - 1, &mut books_seen);
         load_nft_pages_for_tx(&mut state, &rpc_url, txj, seq - 1);
+        load_amm_prestate(&mut state, &rpc_url, txj, seq - 1);
     }
     // FeeSettings (fixed key): reserve checks read it; mainnet meta never
     // carries it.

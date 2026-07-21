@@ -156,47 +156,123 @@ impl Transactor for AMMCreateTransactor {
             return TxResult::NoPermission;
         }
 
-        // Deduct XRP amount from sender if Amount is XRP, track initial pool balance
-        let mut initial_pool: u64 = 0;
-        if let Some(drops_str) = amount1.as_str() {
-            if let Ok(drops) = drops_str.parse::<u64>() {
-                if !deduct_xrp(sandbox, &tx.account, drops) {
-                    return TxResult::UnfundedPayment;
+        use crate::tx::offer as ox;
+        // The AMM operating account is derived ripesha-style from the PARENT
+        // ledger hash and the AMM keylet (rippled ammAccountID, prefix 0;
+        // higher prefixes only on address collision). Mainnet-verified
+        // against #105666951 (rNgZoYRTk…).
+        let parent = sandbox.base().header.parent_hash;
+        let mut pre = [0u8; 66];
+        pre[2..34].copy_from_slice(&parent.0);
+        pre[34..66].copy_from_slice(&amm_hash.0);
+        let seed = crate::shamap::hash::sha512_half(&pre);
+        let amm_acct = xrpl_core::crypto::signing::public_key_to_account_id(&seed.0);
+        let amm_acct_key = keylet::account_root_key(&amm_acct);
+
+        // AMM AccountRoot: lsfDisableMaster | lsfDepositAuth | lsfDefaultRipple.
+        let amm_root = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": hex::encode(amm_acct),
+            "Balance": "0",
+            "Sequence": sandbox.base().header.sequence,
+            "OwnerCount": 0,
+            "Flags": 0x0110_0000u64 | 0x0080_0000,
+            "AMMID": hex::encode_upper(amm_hash.0),
+        });
+        sandbox.write(amm_acct_key, serde_json::to_vec(&amm_root).unwrap_or_default());
+
+        // Fund the pool: both amounts creator → AMM account (XRP moves the
+        // Balance, IOUs create the AMM's trust lines + directory entries).
+        for v in [amount1, amount2] {
+            if let (Some(leg), Some(amt)) = (ox::leg_of(v), keylet::amount_mant_exp(v)) {
+                if amt.0 > 0 {
+                    ox::move_leg(sandbox, &tx.account, &amm_acct, &leg, amt);
                 }
-                initial_pool += drops;
             }
         }
-        if let Some(drops_str) = amount2.as_str() {
-            if let Ok(drops) = drops_str.parse::<u64>() {
-                if !deduct_xrp(sandbox, &tx.account, drops) {
-                    return TxResult::UnfundedPayment;
-                }
-                initial_pool += drops;
-            }
-        }
+
+        // Mint the creator's LP tokens (magnitude is value-level only).
+        let lpt = keylet::amm_lpt_currency(&c1, &c2);
+        let lp_leg = crate::tx::offer::Leg { xrp: false, cur: lpt, issuer: amm_acct };
+        let minted: crate::tx::offer::Me = (1_000_000_000_000_000, -8);
+        ox::move_leg(sandbox, &amm_acct, &tx.account, &lp_leg, minted);
 
         // Create AMM ledger entry
         let amm_obj = serde_json::json!({
             "LedgerEntryType": "AMM",
-            "Account": hex::encode(tx.account),
+            "Account": hex::encode(amm_acct),
             "Asset": asset1,
             "Asset2": asset2,
-            "PoolBalance": initial_pool.to_string(),
             "LPTokenBalance": {
-                "currency": "LPT",
-                "issuer": hex::encode(tx.account),
-                "value": "0"
+                "currency": hex::encode_upper(lpt),
+                "issuer": hex::encode(amm_acct),
+                "value": ox::me_to_value_string(minted),
             },
             "TradingFee": tx.fields.get("TradingFee").and_then(|f| f.as_u64()).unwrap_or(0),
+            "AuctionSlot": {},
             "VoteSlots": [],
         });
         sandbox.write(amm_hash, serde_json::to_vec(&amm_obj).unwrap());
 
-        // Increment OwnerCount
-        increment_owner_count(sandbox, &tx.account);
-
         TxResult::Success
     }
+}
+
+/// 20-byte currency from an Asset spec (`{"currency": "XRP" | ISO | hex40}`).
+fn asset_currency20(v: &serde_json::Value) -> [u8; 20] {
+    let mut c = [0u8; 20];
+    let Some(s) = v.get("currency").and_then(|x| x.as_str()) else { return c };
+    if s == "XRP" {
+        return c;
+    }
+    if s.len() == 40 {
+        if let Ok(b) = hex::decode(s) {
+            c.copy_from_slice(&b);
+        }
+    } else if s.len() == 3 {
+        c[12..15].copy_from_slice(s.as_bytes());
+    }
+    c
+}
+
+/// Resolve the AMM object key, its operating account, and the LP-token leg
+/// (0x03-currency issued by the AMM account) for a Deposit/Withdraw.
+fn amm_ctx(
+    tx: &TxFields,
+    sandbox: &Sandbox,
+) -> Option<(xrpl_core::types::Hash256, [u8; 20], crate::tx::offer::Leg)> {
+    let key = amm_key_from_asset_fields(tx)?;
+    let obj: serde_json::Value = serde_json::from_slice(&sandbox.read(&key)?).ok()?;
+    let acct_hex = obj.get("Account").and_then(|v| v.as_str())?;
+    let acct_b = hex::decode(acct_hex).ok()?;
+    let acct = <[u8; 20]>::try_from(acct_b.as_slice()).ok()?;
+    let cur_a = asset_currency20(tx.fields.get("Asset")?);
+    let cur_b = asset_currency20(tx.fields.get("Asset2")?);
+    let lpt = keylet::amm_lpt_currency(&cur_a, &cur_b);
+    Some((key, acct, crate::tx::offer::Leg { xrp: false, cur: lpt, issuer: acct }))
+}
+
+/// Adjust the AMM object's LPTokenBalance value (magnitude only — parity
+/// compares keys; the oracle corrects the number downstream).
+fn bump_lp_balance(
+    sandbox: &mut Sandbox,
+    amm_key: &xrpl_core::types::Hash256,
+    delta: crate::tx::offer::Me,
+    add: bool,
+) {
+    use crate::tx::offer as ox;
+    let Some(mut obj) = ox::json_at(sandbox, amm_key) else { return };
+    let cur = obj["LPTokenBalance"]
+        .as_object()
+        .and_then(|o| o.get("value"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| keylet::amount_mant_exp(&serde_json::Value::String(s.to_string())))
+        .unwrap_or((0, 0));
+    let (neg, mag) = ox::signed_add(false, cur, !add, delta);
+    let sign = if neg && mag.0 > 0 { "-" } else { "" };
+    obj["LPTokenBalance"]["value"] =
+        serde_json::Value::String(format!("{}{}", sign, ox::me_to_value_string(mag)));
+    ox::put_json(sandbox, *amm_key, &obj);
 }
 
 // ─── AMMDeposit ───
@@ -227,33 +303,32 @@ impl Transactor for AMMDepositTransactor {
     }
 
     fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
-        let amm_key = match amm_key_from_asset_fields(tx) {
-            Some(k) => k,
-            None => return TxResult::Malformed,
+        use crate::tx::offer as ox;
+        let Some((amm_key, amm_acct, lp_leg)) = amm_ctx(tx, sandbox) else {
+            return TxResult::NoEntry;
         };
-
-        // Deduct deposited amounts from sender
-        if let Some(amount) = tx.fields.get("Amount") {
-            if let Some(drops_str) = amount.as_str() {
-                if let Ok(drops) = drops_str.parse::<u64>() {
-                    if !deduct_xrp(sandbox, &tx.account, drops) {
-                        return TxResult::UnfundedPayment;
+        // Move the deposited side(s) depositor → AMM account (XRP or IOU
+        // lines — move_leg handles both).
+        for f in ["Amount", "Amount2"] {
+            if let Some(v) = tx.fields.get(f) {
+                if let (Some(leg), Some(amt)) = (ox::leg_of(v), keylet::amount_mant_exp(v)) {
+                    if amt.0 > 0 {
+                        ox::move_leg(sandbox, &tx.account, &amm_acct, &leg, amt);
                     }
-                    // Bug 7: Update AMM pool balance
-                    update_amm_pool_balance(sandbox, &amm_key, drops, true);
                 }
             }
         }
-        if let Some(amount2) = tx.fields.get("Amount2") {
-            if let Some(drops_str) = amount2.as_str() {
-                if let Ok(drops) = drops_str.parse::<u64>() {
-                    if !deduct_xrp(sandbox, &tx.account, drops) {
-                        return TxResult::UnfundedPayment;
-                    }
-                    update_amm_pool_balance(sandbox, &amm_key, drops, true);
-                }
-            }
-        }
+        // Mint LP tokens to the depositor. The magnitude is oracle-corrected
+        // downstream; the LINE key (depositor ↔ AMM account, 0x03-currency)
+        // is what parity needs.
+        let minted = tx
+            .fields
+            .get("LPTokenOut")
+            .and_then(keylet::amount_mant_exp)
+            .filter(|m| m.0 > 0)
+            .unwrap_or((1_000_000_000_000_000, -8));
+        ox::move_leg(sandbox, &amm_acct, &tx.account, &lp_leg, minted);
+        bump_lp_balance(sandbox, &amm_key, minted, true);
         TxResult::Success
     }
 }
@@ -285,33 +360,29 @@ impl Transactor for AMMWithdrawTransactor {
     }
 
     fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
-        let amm_key = match amm_key_from_asset_fields(tx) {
-            Some(k) => k,
-            None => return TxResult::Malformed,
+        use crate::tx::offer as ox;
+        let Some((amm_key, amm_acct, lp_leg)) = amm_ctx(tx, sandbox) else {
+            return TxResult::NoEntry;
         };
-
-        // Credit withdrawn amounts to sender
-        if let Some(amount) = tx.fields.get("Amount") {
-            if let Some(drops_str) = amount.as_str() {
-                if let Ok(drops) = drops_str.parse::<u64>() {
-                    // Bug 7: Verify AMM pool has sufficient funds before crediting
-                    if !update_amm_pool_balance(sandbox, &amm_key, drops, false) {
-                        return TxResult::Unfunded;
+        // Move the withdrawn side(s) AMM account → withdrawer.
+        for f in ["Amount", "Amount2"] {
+            if let Some(v) = tx.fields.get(f) {
+                if let (Some(leg), Some(amt)) = (ox::leg_of(v), keylet::amount_mant_exp(v)) {
+                    if amt.0 > 0 {
+                        ox::move_leg(sandbox, &amm_acct, &tx.account, &leg, amt);
                     }
-                    credit_xrp(sandbox, &tx.account, drops);
                 }
             }
         }
-        if let Some(amount2) = tx.fields.get("Amount2") {
-            if let Some(drops_str) = amount2.as_str() {
-                if let Ok(drops) = drops_str.parse::<u64>() {
-                    if !update_amm_pool_balance(sandbox, &amm_key, drops, false) {
-                        return TxResult::Unfunded;
-                    }
-                    credit_xrp(sandbox, &tx.account, drops);
-                }
-            }
-        }
+        // Burn the withdrawer's LP tokens (magnitude oracle-corrected).
+        let burned = tx
+            .fields
+            .get("LPTokenIn")
+            .and_then(keylet::amount_mant_exp)
+            .filter(|m| m.0 > 0)
+            .unwrap_or((1_000_000_000_000_000, -8));
+        ox::move_leg(sandbox, &tx.account, &amm_acct, &lp_leg, burned);
+        bump_lp_balance(sandbox, &amm_key, burned, false);
         TxResult::Success
     }
 }
