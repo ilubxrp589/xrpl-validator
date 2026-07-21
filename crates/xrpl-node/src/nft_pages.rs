@@ -290,9 +290,14 @@ fn skip_path_set(data: &[u8], mut pos: usize) -> Option<usize> {
 /// TransactionTypes whose apply path walks an account's NFT pages.
 /// NFTokenMint (25) inserts a token; NFTokenBurn (26) removes one;
 /// NFTokenCreateOffer (27) / NFTokenCancelOffer (28) / NFTokenAcceptOffer
-/// (29) locate one to validate or transfer it.
+/// (29) locate one to validate or transfer it. NFTokenModify (61, XLS-46
+/// DynamicNFT) locates the token to rewrite its mutable URI: rippled's
+/// `NFTokenModify::preclaim` calls `nft::findToken(view, owner, nftokenID)`
+/// — the same owner page-walk — so its owner needs the same prefetch, or
+/// `findToken` misses a page mainnet found and the tx spuriously fails
+/// `tecNO_ENTRY` where mainnet recorded `tesSUCCESS`.
 fn is_nft_tx_type(tt: u16) -> bool {
-    (25..=29).contains(&tt)
+    (25..=29).contains(&tt) || tt == 61
 }
 
 /// The accounts whose NFT pages a tx blob may walk: every AccountID-typed
