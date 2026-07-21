@@ -101,6 +101,12 @@ impl<'a> Sandbox<'a> {
     }
 
     /// Mark an object as deleted.
+    /// Drop any modification recorded for `key`, reverting reads to the base
+    /// state — for in-flight intermediates that must leave no trace.
+    pub fn forget(&mut self, key: &Hash256) {
+        self.modifications.remove(key);
+    }
+
     pub fn delete(&mut self, key: Hash256) {
         self.modifications.insert(key, SandboxEntry::Deleted);
     }

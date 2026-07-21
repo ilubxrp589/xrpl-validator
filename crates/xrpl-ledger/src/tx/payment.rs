@@ -47,11 +47,22 @@ impl PaymentTransactor {
             .and_then(|paths| paths.first())
             .and_then(|p| p.as_array());
         let Some(els) = els else { return Some(Vec::new()) };
-        let mut legs = Vec::new();
+        let mut legs: Vec<crate::tx::offer::Leg> = Vec::new();
         for el in els {
             let t = el.get("type").and_then(|v| v.as_u64()).unwrap_or(0);
             if t & 0x01 != 0 {
-                return None; // account hop (rippling): not modeled
+                // An account hop through the ISSUER of the preceding hop's
+                // currency is a no-op re-anchor (the value already lives on
+                // that issuer's books) — skip it. True rippling through a
+                // third party is not modeled.
+                let acct = el
+                    .get("account")
+                    .and_then(|v| v.as_str())
+                    .and_then(crate::tx::offer::decode20);
+                match (acct, legs.last()) {
+                    (Some(a), Some(prev)) if !prev.xrp && a == prev.issuer => continue,
+                    _ => return None,
+                }
             }
             let cur = el.get("currency").and_then(|v| v.as_str())?;
             if cur == "XRP" {
@@ -465,10 +476,49 @@ impl PaymentTransactor {
         // trust line rippled never creates (and when the destination is the
         // issuer, the IOU is redeemed, not held).
         let delivered = if let Some(hops) = hops.as_ref().filter(|h| !h.is_empty()) {
-            let chain: Vec<&ox::Leg> = std::iter::once(&spend_leg)
+            let mut chain: Vec<&ox::Leg> = std::iter::once(&spend_leg)
                 .chain(hops.iter())
                 .chain(std::iter::once(&want_leg))
                 .collect();
+            // A path may name an endpoint currency as a "hop" (e.g. deliver
+            // RLUSD via [RLUSD-book, issuer]): same-leg neighbours are a
+            // zero-length book — collapse them.
+            chain.dedup_by(|a, b| a.xrp == b.xrp && a.cur == b.cur && a.issuer == b.issuer);
+            // Intermediate value is IN FLIGHT: rippled never rests it on the
+            // sender's trust lines. Snapshot those lines and restore them
+            // byte-exact after the chain — net-zero routing can leave 1-ulp
+            // dust (or a phantom created line) that the no-op filter keeps.
+            let same = |a: &ox::Leg, b: &ox::Leg| a.xrp == b.xrp && a.cur == b.cur && a.issuer == b.issuer;
+            // Capture, for each in-flight line, the line itself AND the
+            // directory pages a mid-chain line-creation would touch (both
+            // owners' dir roots + their last pages) — creating and then
+            // forgetting the line must leave no dir droppings either.
+            let mut inflight: Vec<_> = Vec::new();
+            for l in hops.iter().filter(|l| !l.xrp && !same(l, &want_leg) && !same(l, &spend_leg)) {
+                let lk = keylet::ripple_state_key(&tx.account, &l.issuer, &l.cur);
+                let line_pre = sandbox.read(&lk);
+                let absent = line_pre.is_none();
+                inflight.push((lk, line_pre));
+                if !absent {
+                    continue; // pre-existing line: no creation, no dir droppings
+                }
+                for owner in [&tx.account, &l.issuer] {
+                    let root = keylet::owner_dir_key(owner);
+                    let pre = sandbox.read(&root);
+                    if let Some(bytes) = &pre {
+                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) {
+                            let last = v.get("IndexPrevious").and_then(|p| {
+                                p.as_u64().or_else(|| p.as_str().and_then(|s| u64::from_str_radix(s, 16).ok()))
+                            }).unwrap_or(0);
+                            if last != 0 {
+                                let pk = keylet::dir_page_key(&root, last);
+                                inflight.push((pk, sandbox.read(&pk)));
+                            }
+                        }
+                    }
+                    inflight.push((root, pre));
+                }
+            }
             let mut carry = spend0;
             let n = chain.len() - 1;
             for i in 0..n {
@@ -484,6 +534,12 @@ impl PaymentTransactor {
                 carry = ox::me_sub(want_cap, rw);
                 if ox::me_is_zero(carry) {
                     break; // hop dried: nothing delivered
+                }
+            }
+            for (k, pre) in inflight {
+                match pre {
+                    Some(bytes) => sandbox.write(k, bytes),
+                    None => sandbox.forget(&k),
                 }
             }
             carry
