@@ -824,7 +824,19 @@ fn cross_bridged(
     let base_b = keylet::book_base(&zero, &pays_leg.cur, &zero, &pays_leg.issuer);
     let la = book_offer_ladder(sandbox, &base_a, 128);
     let lb = book_offer_ladder(sandbox, &base_b, 128);
-    if la.is_empty() || lb.is_empty() {
+    // Per-leg AMM liquidity: each bridge leg is a BookStep of its own pair.
+    let amm_a = crate::tx::amm_swap::discover(sandbox, gets_leg, &xrp_leg, taker);
+    let amm_b = crate::tx::amm_swap::discover(sandbox, &xrp_leg, pays_leg, taker);
+    let amm_a_init = amm_a
+        .as_ref()
+        .map(|a| crate::tx::amm_swap::pool_balances(sandbox, a, &xrp_leg, gets_leg))
+        .unwrap_or(((0, 0), (0, 0)));
+    let amm_b_init = amm_b
+        .as_ref()
+        .map(|a| crate::tx::amm_swap::pool_balances(sandbox, a, pays_leg, &xrp_leg))
+        .unwrap_or(((0, 0), (0, 0)));
+    let (mut amm_a_iters, mut amm_b_iters) = (0u32, 0u32);
+    if (la.is_empty() && amm_a.is_none()) || (lb.is_empty() && amm_b.is_none()) {
         if std::env::var("DX_BRIDGE").is_ok() {
             eprintln!("DX_BRIDGE bail la={} lb={} base_a={} base_b={}",
                 la.len(), lb.len(), hex::encode_upper(&base_a.0[..12]), hex::encode_upper(&base_b.0[..12]));
@@ -847,16 +859,38 @@ fn cross_bridged(
         // PEEK both sources (no mutation) to pick the better rate within the
         // threshold; only the chosen source is then walked with mutation, so
         // dead-offer cleanup happens exactly where rippled's walk reaches.
+        // Each BRIDGE LEG is a BookStep of its own pair, so its book head
+        // competes with that pair's pool (fib slice) — #105666830's XAH leg
+        // filled from the XAH/XRP pool on mainnet.
         let dpeek = live_head(sandbox, &ld, &mut di, taker, pays_leg, false);
         let apeek = live_head(sandbox, &la, &mut ai, taker, &xrp_leg, false);
         let bpeek = live_head(sandbox, &lb, &mut bi, taker, pays_leg, false);
+        let a_fib = amm_a.as_ref().and_then(|am| {
+            crate::tx::amm_swap::fib_slice(sandbox, am, amm_a_init, amm_a_iters, &xrp_leg, gets_leg)
+                .map(|s| (crate::tx::amm_swap::slice_rate(s.0, s.1), s))
+        });
+        let b_fib = amm_b.as_ref().and_then(|am| {
+            crate::tx::amm_swap::fib_slice(sandbox, am, amm_b_init, amm_b_iters, pays_leg, &xrp_leg)
+                .map(|s| (crate::tx::amm_swap::slice_rate(s.0, s.1), s))
+        });
+        let qa_book = apeek.as_ref().map(|(q, ..)| rate_me(*q));
+        let qb_book = bpeek.as_ref().map(|(q, ..)| rate_me(*q));
+        // The pool wins a leg only when STRICTLY better than the book head.
+        let a_use_amm = match (&a_fib, qa_book) {
+            (Some((qf, _)), Some(qb)) => me_cmp(*qf, qb).is_lt(),
+            (Some(_), None) => true,
+            _ => false,
+        };
+        let b_use_amm = match (&b_fib, qb_book) {
+            (Some((qf, _)), Some(qb)) => me_cmp(*qf, qb).is_lt(),
+            (Some(_), None) => true,
+            _ => false,
+        };
+        let qa = if a_use_amm { a_fib.as_ref().map(|(q, _)| *q) } else { qa_book };
+        let qb = if b_use_amm { b_fib.as_ref().map(|(q, _)| *q) } else { qb_book };
         let dq = dpeek.as_ref().map(|(q, ..)| rate_me(*q));
-        let bq = match (&apeek, &bpeek) {
-            (Some((qa, ..)), Some((qb, ..))) => {
-                let (am, ae) = rate_me(*qa);
-                let (bm, be) = rate_me(*qb);
-                Some(norm16((am * bm, ae + be)))
-            }
+        let bq = match (qa, qb) {
+            (Some((am, ae)), Some((bm, be))) => Some(norm16((am * bm, ae + be))),
             _ => None,
         };
         // AMM turn: the direct-pair pool competes with the best BOOK rate
@@ -923,43 +957,88 @@ fn cross_bridged(
             rem_gets = me_sub(rem_gets, pay);
             crossed += 1;
         } else {
-            let Some((_, akey, aoffer, amaker, a_gives0, a_wants0)) =
-                live_head(sandbox, &la, &mut ai, taker, &xrp_leg, true)
-            else { break };
-            let Some((_, bkey, boffer, bmaker, b_gives0, b_wants0)) =
-                live_head(sandbox, &lb, &mut bi, taker, pays_leg, true)
-            else { break };
-            // XRP slice through the bridge: bounded by A's funded XRP, B's
-            // XRP appetite, our rem_gets (via A's rate) and rem_pays (via
-            // B's rate, buy mode).
-            let a_funded = available(sandbox, &amaker, &xrp_leg);
-            let a_gives = if me_cmp(a_funded, a_gives0).is_lt() { a_funded } else { a_gives0 };
-            let mut xrp = if me_cmp(a_gives, b_wants0).is_lt() { a_gives } else { b_wants0 };
-            let mut gets_in = me_muldiv(xrp, a_wants0, a_gives0, true);
+            // Resolve each leg's source: book maker offer or that pair's
+            // pool fib slice. A-side capacity/rate in (XRP-out, gets-in),
+            // B-side in (pays-out, XRP-in).
+            let a_book = if a_use_amm {
+                None
+            } else {
+                match live_head(sandbox, &la, &mut ai, taker, &xrp_leg, true) {
+                    Some(h) => Some(h),
+                    None => break,
+                }
+            };
+            let b_book = if b_use_amm {
+                None
+            } else {
+                match live_head(sandbox, &lb, &mut bi, taker, pays_leg, true) {
+                    Some(h) => Some(h),
+                    None => break,
+                }
+            };
+            // (xrp capacity, gets per that xrp) for leg A.
+            let (a_cap_xrp, a_in_full, a_out_full) = match (&a_book, &a_fib) {
+                (Some((_, _, _, amaker, a_gives0, a_wants0)), _) => {
+                    let funded = available(sandbox, amaker, &xrp_leg);
+                    let a_gives = if me_cmp(funded, *a_gives0).is_lt() { funded } else { *a_gives0 };
+                    (a_gives, *a_wants0, *a_gives0)
+                }
+                (None, Some((_, (s_in, s_out)))) => (*s_out, *s_in, *s_out),
+                (None, None) => break,
+            };
+            let (b_cap_xrp, b_in_full, b_out_full) = match (&b_book, &b_fib) {
+                (Some((_, _, _, _, b_gives0, b_wants0)), _) => (*b_wants0, *b_wants0, *b_gives0),
+                (None, Some((_, (s_in, s_out)))) => (*s_in, *s_in, *s_out),
+                (None, None) => break,
+            };
+            let mut xrp = if me_cmp(a_cap_xrp, b_cap_xrp).is_lt() { a_cap_xrp } else { b_cap_xrp };
+            let mut gets_in = me_muldiv(xrp, a_in_full, a_out_full, true);
             if me_cmp(gets_in, rem_gets).is_gt() {
                 gets_in = rem_gets;
-                xrp = me_muldiv(gets_in, a_gives0, a_wants0, false);
+                xrp = me_muldiv(gets_in, a_out_full, a_in_full, false);
             }
-            let mut pays_out = me_muldiv(xrp, b_gives0, b_wants0, false);
+            let mut pays_out = me_muldiv(xrp, b_out_full, b_in_full, false);
             if !sell && me_cmp(pays_out, rem_pays).is_gt() {
                 pays_out = rem_pays;
-                xrp = me_muldiv(pays_out, b_wants0, b_gives0, true);
-                gets_in = me_muldiv(xrp, a_wants0, a_gives0, true);
+                xrp = me_muldiv(pays_out, b_in_full, b_out_full, true);
+                gets_in = me_muldiv(xrp, a_in_full, a_out_full, true);
             }
             let xrp = (me_rescale(xrp, 0, false), 0);
             if std::env::var("DX_BRIDGE").is_ok() {
-                eprintln!("DX_BRIDGE slice xrp={xrp:?} gets_in={gets_in:?} pays_out={pays_out:?} a=({a_gives0:?},{a_wants0:?}) b=({b_gives0:?},{b_wants0:?}) rem_g={rem_gets:?} rem_p={rem_pays:?}");
+                eprintln!("DX_BRIDGE slice xrp={xrp:?} gets_in={gets_in:?} pays_out={pays_out:?} a_amm={a_use_amm} b_amm={b_use_amm} rem_g={rem_gets:?} rem_p={rem_pays:?}");
             }
             if me_is_zero(xrp) || me_is_zero(gets_in) || me_is_zero(pays_out) {
                 break;
             }
             // Leg A: taker sells gets for XRP (XRP rides in-flight via the
             // taker and nets out of their mutation set).
-            settle_fill(sandbox, &akey, &aoffer, &amaker, taker, taker,
-                        &xrp_leg, gets_leg, xrp, gets_in, a_gives0, a_wants0);
+            match (&a_book, &a_fib) {
+                (Some((_, akey, aoffer, amaker, a_gives0, a_wants0)), _) => {
+                    settle_fill(sandbox, akey, aoffer, amaker, taker, taker,
+                                &xrp_leg, gets_leg, xrp, gets_in, *a_gives0, *a_wants0);
+                }
+                (None, Some(_)) => {
+                    crate::tx::amm_swap::apply_slice(
+                        sandbox, amm_a.as_ref().unwrap(), taker, taker, &xrp_leg, gets_leg, gets_in, xrp,
+                    );
+                    amm_a_iters += 1;
+                }
+                _ => break,
+            }
             // Leg B: taker sells that XRP for the pays side.
-            settle_fill(sandbox, &bkey, &boffer, &bmaker, taker, beneficiary,
-                        pays_leg, &xrp_leg, pays_out, xrp, b_gives0, b_wants0);
+            match (&b_book, &b_fib) {
+                (Some((_, bkey, boffer, bmaker, b_gives0, b_wants0)), _) => {
+                    settle_fill(sandbox, bkey, boffer, bmaker, taker, beneficiary,
+                                pays_leg, &xrp_leg, pays_out, xrp, *b_gives0, *b_wants0);
+                }
+                (None, Some(_)) => {
+                    crate::tx::amm_swap::apply_slice(
+                        sandbox, amm_b.as_ref().unwrap(), taker, beneficiary, pays_leg, &xrp_leg, xrp, pays_out,
+                    );
+                    amm_b_iters += 1;
+                }
+                _ => break,
+            }
             rem_gets = me_sub(rem_gets, gets_in);
             rem_pays = me_sub(rem_pays, pays_out);
             crossed += 1;

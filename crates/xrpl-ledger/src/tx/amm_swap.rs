@@ -507,40 +507,9 @@ pub(crate) fn consume_fib(
     if ox::me_is_zero(rem_pays) || ox::me_is_zero(rem_gets) {
         return (rem_pays, rem_gets, false);
     }
-    let pool_in = holds(sandbox, &amm.account, gets_leg);
-    let pool_out = holds(sandbox, &amm.account, pays_leg);
-    if pool_in.0 == 0 || pool_out.0 == 0 {
+    let Some((s_in, s_out)) = fib_slice(sandbox, amm, init, iters, pays_leg, gets_leg) else {
         return (rem_pays, rem_gets, false);
-    }
-    const FIB: [u32; 16] = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597];
-    let pct: Me = (2_500_000_000_000_000, -19); // kInitialFibSeqPct = 5/20000
-    let base_in = to_amount(n_mul(init.0, pct, Rnd::Up), gets_leg.xrp, Rnd::Up);
-    if base_in.0 == 0 {
-        return (rem_pays, rem_gets, false);
-    }
-    let (mut s_in, mut s_out);
-    if iters == 0 {
-        s_in = base_in;
-        s_out = swap_asset_in(init.0, init.1, s_in, amm.tfee, pays_leg.xrp);
-    } else {
-        let out0 = swap_asset_in(init.0, init.1, base_in, amm.tfee, pays_leg.xrp);
-        let idx = (iters as usize - 1).min(FIB.len() - 1);
-        s_out = to_amount(
-            n_mul(out0, ((FIB[idx] as u128) * LO, -15), Rnd::Down),
-            pays_leg.xrp,
-            Rnd::Down,
-        );
-        if s_out.0 == 0 || n_cmp(s_out, pool_out) != Ordering::Less {
-            return (rem_pays, rem_gets, false);
-        }
-        match swap_asset_out(pool_in, pool_out, s_out, amm.tfee, gets_leg.xrp) {
-            Some(i) => s_in = i,
-            None => return (rem_pays, rem_gets, false),
-        }
-    }
-    if s_in.0 == 0 || s_out.0 == 0 {
-        return (rem_pays, rem_gets, false);
-    }
+    };
     let q = rate_of_me_pair(s_in, s_out);
     if std::env::var("DX_AMM").is_ok() {
         eprintln!("DX_AMM fib iter={iters} q={q:?} best_book={best_book:?} thr={threshold:x} slice=({s_in:?},{s_out:?})");
@@ -584,6 +553,71 @@ pub(crate) fn pool_balances(sandbox: &Sandbox, amm: &Amm, pays_leg: &Leg, gets_l
         holds(sandbox, &amm.account, gets_leg),
         holds(sandbox, &amm.account, pays_leg),
     )
+}
+
+/// The current fib-sequence slice (in, out) for a pool, without applying it.
+pub(crate) fn fib_slice(
+    sandbox: &Sandbox,
+    amm: &Amm,
+    init: (Me, Me),
+    iters: u32,
+    pays_leg: &Leg,
+    gets_leg: &Leg,
+) -> Option<(Me, Me)> {
+    let pool_in = holds(sandbox, &amm.account, gets_leg);
+    let pool_out = holds(sandbox, &amm.account, pays_leg);
+    if pool_in.0 == 0 || pool_out.0 == 0 || init.0.0 == 0 || init.1.0 == 0 {
+        return None;
+    }
+    const FIB: [u32; 16] = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597];
+    let pct: Me = (2_500_000_000_000_000, -19); // kInitialFibSeqPct = 5/20000
+    let base_in = to_amount(n_mul(init.0, pct, Rnd::Up), gets_leg.xrp, Rnd::Up);
+    if base_in.0 == 0 {
+        return None;
+    }
+    let (s_in, s_out);
+    if iters == 0 {
+        s_in = base_in;
+        s_out = swap_asset_in(init.0, init.1, s_in, amm.tfee, pays_leg.xrp);
+    } else {
+        let out0 = swap_asset_in(init.0, init.1, base_in, amm.tfee, pays_leg.xrp);
+        let idx = (iters as usize - 1).min(FIB.len() - 1);
+        s_out = to_amount(
+            n_mul(out0, ((FIB[idx] as u128) * LO, -15), Rnd::Down),
+            pays_leg.xrp,
+            Rnd::Down,
+        );
+        if s_out.0 == 0 || n_cmp(s_out, pool_out) != Ordering::Less {
+            return None;
+        }
+        match swap_asset_out(pool_in, pool_out, s_out, amm.tfee, gets_leg.xrp) {
+            Some(i) => s_in = i,
+            None => return None,
+        }
+    }
+    (s_in.0 > 0 && s_out.0 > 0).then_some((s_in, s_out))
+}
+
+/// Average rate (in per out) of a fill — public face of the Quality compare.
+pub(crate) fn slice_rate(inp: Me, out: Me) -> Me {
+    rate_of_me_pair(inp, out)
+}
+
+/// Move a slice through the pool: taker pays `take_in` of gets, receives
+/// `take_out` of pays.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_slice(
+    sandbox: &mut Sandbox,
+    amm: &Amm,
+    taker: &[u8; 20],
+    beneficiary: &[u8; 20],
+    pays_leg: &Leg,
+    gets_leg: &Leg,
+    take_in: Me,
+    take_out: Me,
+) {
+    ox::move_leg(sandbox, taker, &amm.account, gets_leg, take_in);
+    ox::move_leg(sandbox, &amm.account, beneficiary, pays_leg, take_out);
 }
 
 /// One AMM turn inside the crossing walk. `clob` is the next book
