@@ -238,6 +238,11 @@ fn decode_rate(q: u64) -> Me {
 /// rippled getRate (STAmount divide): truncating muldiv @1e17, +5, then one
 /// banker's-rounding pass over the excess tail — identical to
 /// `keylet::offer_quality` but on Me inputs. rate = pays/gets = in/out.
+/// The fill's rate (in per out) as a Number — rippled Quality{out, in}.
+fn rate_of_me_pair(inp: Me, out: Me) -> Me {
+    n_div(inp, out, Rnd::Near)
+}
+
 fn rate_of(pays: Me, gets: Me) -> u64 {
     if pays.0 == 0 || gets.0 == 0 {
         return 0;
@@ -569,25 +574,60 @@ pub(crate) fn consume(
         take_in = rem_gets;
         take_out = swap_asset_in(pool_in, pool_out, take_in, amm.tfee, pays_leg.xrp);
     }
-    // The taker's limit rate caps the average quality: in ≤ O·r − I/(1−fee)
-    // (the QualityFunction bound / nTakerPaysConstraint).
-    if threshold != u64::MAX {
-        let r = decode_rate(threshold);
-        let omf = n_sub(N_ONE, fee_n(amm.tfee), Rnd::Near);
-        let cap = n_sub(
-            n_mul(pool_out, r, Rnd::Near),
-            n_div(pool_in, omf, Rnd::Near),
-            Rnd::Near,
-        );
-        if cap.0 == 0 {
+    // Taker limit handling (rippled StrandFlow limitOut + post-check): the
+    // requested OUT is trimmed via the pool's QualityFunction so the fill's
+    // average quality equals the limit — outFromAvgQ computed under global
+    // Upward rounding with m/b built at Near — then the achieved quality is
+    // re-checked, forgiving only a 1e-7 relative round-off on trimmed
+    // requests. Directed roundings decide the boundary (#105035381:
+    // DDFDD49B killed at 6 ppm over, 2C4DF181 filled inside).
+    if threshold != u64::MAX && n_cmp(rate_of_me_pair(take_in, take_out), decode_rate(threshold)) == Ordering::Greater {
+        let thr_me = decode_rate(threshold);
+        let cfee = n_sub(N_ONE, fee_n(amm.tfee), Rnd::Near);
+        let m = n_div(cfee, pool_in, Rnd::Near);
+        let b = n_div(n_mul(pool_out, cfee, Rnd::Near), pool_in, Rnd::Near);
+        // out = (1/rate − b)/(−m), signed-Upward per op: 1/rate rounds up;
+        // the negative difference rounds toward zero (magnitude down); the
+        // positive quotient rounds up.
+        let r1 = n_div(N_ONE, thr_me, Rnd::Up);
+        let num = n_sub(b, r1, Rnd::Down);
+        if num.0 == 0 {
             return (rem_pays, rem_gets, false);
         }
-        if n_cmp(take_in, cap) == Ordering::Greater {
-            take_in = to_amount(cap, gets_leg.xrp, Rnd::Down);
-            if take_in.0 == 0 {
+        let mut out_req = n_div(num, m, Rnd::Up);
+        let mut adjusted = true;
+        if !sell && n_cmp(out_req, rem_pays) != Ordering::Less {
+            out_req = rem_pays;
+            adjusted = false;
+        }
+        let out_amt = to_amount(out_req, pays_leg.xrp, Rnd::Near);
+        if out_amt.0 == 0 {
+            return (rem_pays, rem_gets, false);
+        }
+        let Some(in_req) = swap_asset_out(pool_in, pool_out, out_amt, amm.tfee, gets_leg.xrp) else {
+            return (rem_pays, rem_gets, false);
+        };
+        take_in = in_req;
+        take_out = out_amt;
+        if n_cmp(take_in, rem_gets) == Ordering::Greater {
+            take_in = rem_gets;
+            take_out = swap_asset_in(pool_in, pool_out, take_in, amm.tfee, pays_leg.xrp);
+            adjusted = false;
+        }
+        if take_in.0 == 0 || take_out.0 == 0 {
+            return (rem_pays, rem_gets, false);
+        }
+        let q = rate_of_me_pair(take_in, take_out);
+        if n_cmp(q, thr_me) == Ordering::Greater {
+            // Achieved quality below the limit: tolerate only trimmed
+            // requests within 1e-7 relative distance.
+            let dist = n_div(n_sub(q, thr_me, Rnd::Near), thr_me, Rnd::Near);
+            if !adjusted || n_cmp(dist, (LO, -22)) != Ordering::Less {
+                if std::env::var("DX_AMM").is_ok() {
+                    eprintln!("DX_AMM limit reject q={q:?} thr={thr_me:?} adjusted={adjusted}");
+                }
                 return (rem_pays, rem_gets, false);
             }
-            take_out = swap_asset_in(pool_in, pool_out, take_in, amm.tfee, pays_leg.xrp);
         }
     }
     if take_in.0 == 0 || take_out.0 == 0 {
