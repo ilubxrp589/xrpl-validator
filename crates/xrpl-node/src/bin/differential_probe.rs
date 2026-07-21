@@ -539,6 +539,12 @@ fn load_payment_books(
     }
     for pair in chain.windows(2) {
         load_book_pair(state, url, &pair[0], &pair[1], ledger_index, books_seen);
+        // IOU↔IOU pairs can autobridge through XRP — preload both bridge books.
+        let xrp = json!({"currency": "XRP"});
+        if pair[0] != xrp && pair[1] != xrp {
+            load_book_pair(state, url, &pair[0], &xrp, ledger_index, books_seen);
+            load_book_pair(state, url, &xrp, &pair[1], ledger_index, books_seen);
+        }
     }
 }
 

@@ -653,6 +653,268 @@ pub(crate) fn apply_tick_size(pays: Me, gets: Me, sell: bool, tick: u32, pays_xr
     }
 }
 
+/// Quality-ordered (rate, offer key) ladder of a book — every resting offer,
+/// best first, capped.
+fn book_offer_ladder(sandbox: &Sandbox, base: &Hash256, cap: usize) -> Vec<(u64, Hash256)> {
+    let mut out = Vec::new();
+    for dk in sandbox.keys_with_prefix(&base.0[..24]) {
+        let q = u64::from_be_bytes(dk.0[24..32].try_into().unwrap_or_default());
+        let mut page_key = dk;
+        for _ in 0..10_000 {
+            let Some(page) = json_at(sandbox, &page_key) else { break };
+            for ent in page.get("Indexes").and_then(|v| v.as_array()).into_iter().flatten() {
+                if let Some(k) = ent.as_str().and_then(|s| hex::decode(s).ok())
+                    .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                {
+                    out.push((q, Hash256(k)));
+                    if out.len() >= cap {
+                        return out;
+                    }
+                }
+            }
+            let next = page.get("IndexNext").map(dirnum).unwrap_or(0);
+            if next == 0 {
+                break;
+            }
+            page_key = keylet::dir_page_key(&dk, next);
+        }
+    }
+    out
+}
+
+/// Decode a u64-encoded rate into (mantissa, exponent).
+fn rate_me(q: u64) -> Me {
+    ((q & 0x00FF_FFFF_FFFF_FFFF) as u128, ((q >> 56) as i32) - 100)
+}
+
+/// First ladder entry whose offer still exists, is an Offer, is non-empty,
+/// and is funded. With `mutate`, dead offers encountered on the way are
+/// deleted exactly like the direct walk does — but ONLY when their funding
+/// state is actually KNOWN (a maker whose root/line was never loaded is
+/// skipped, not condemned; phantom deletions poisoned the first bridge
+/// attempt). Without `mutate`, this is a pure peek: nothing is touched and
+/// the caller's index is not advanced.
+fn live_head(
+    sandbox: &mut Sandbox,
+    ladder: &[(u64, Hash256)],
+    start: &mut usize,
+    taker: &[u8; 20],
+    maker_pays_leg: &Leg,
+    mutate: bool,
+) -> Option<(u64, Hash256, serde_json::Value, [u8; 20], Me, Me)> {
+    let mut i = *start;
+    let result = loop {
+        if i >= ladder.len() {
+            break None;
+        }
+        let (q, okey) = ladder[i];
+        let Some(offer) = json_at(sandbox, &okey) else { i += 1; continue };
+        if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
+            i += 1;
+            continue;
+        }
+        let Some(maker) = offer.get("Account").and_then(|v| v.as_str()).and_then(decode20) else {
+            i += 1;
+            continue;
+        };
+        if &maker == taker {
+            if mutate {
+                delete_maker_offer(sandbox, &okey, &offer, &maker);
+            }
+            i += 1;
+            continue;
+        }
+        let (Some(gives), Some(wants)) = (
+            offer.get("TakerGets").and_then(keylet::amount_mant_exp),
+            offer.get("TakerPays").and_then(keylet::amount_mant_exp),
+        ) else {
+            i += 1;
+            continue;
+        };
+        // Funding is only judgeable when the backing object is in state.
+        let funding_known = if maker_pays_leg.xrp {
+            json_at(sandbox, &keylet::account_root_key(&maker)).is_some()
+        } else {
+            maker == maker_pays_leg.issuer
+                || json_at(sandbox, &keylet::ripple_state_key(&maker, &maker_pays_leg.issuer, &maker_pays_leg.cur)).is_some()
+        };
+        if !funding_known {
+            i += 1;
+            continue;
+        }
+        if gives.0 == 0 || wants.0 == 0 || me_is_zero(available(sandbox, &maker, maker_pays_leg)) {
+            if mutate {
+                delete_maker_offer(sandbox, &okey, &offer, &maker);
+            }
+            i += 1;
+            continue;
+        }
+        break Some((q, okey, offer, maker, gives, wants));
+    };
+    if mutate {
+        *start = i;
+    }
+    result
+}
+
+/// Consume `give` of the maker's gives / `pay` of their wants against one
+/// offer: move both legs and update or delete the offer object.
+#[allow(clippy::too_many_arguments)]
+fn settle_fill(
+    sandbox: &mut Sandbox,
+    okey: &Hash256,
+    offer: &serde_json::Value,
+    maker: &[u8; 20],
+    from_taker: &[u8; 20],
+    to_beneficiary: &[u8; 20],
+    pays_leg: &Leg,
+    gets_leg: &Leg,
+    give: Me,
+    pay: Me,
+    gives0: Me,
+    wants0: Me,
+) {
+    move_leg(sandbox, maker, to_beneficiary, pays_leg, give);
+    move_leg(sandbox, from_taker, maker, gets_leg, pay);
+    let funded = available(sandbox, maker, pays_leg);
+    let consumed = me_cmp(give, gives0).is_ge() || me_is_zero(funded);
+    if consumed {
+        delete_maker_offer(sandbox, okey, offer, maker);
+    } else {
+        let mut off2 = offer.clone();
+        off2["TakerGets"] = me_amount_json(&offer["TakerGets"], me_sub(gives0, give));
+        off2["TakerPays"] = me_amount_json(&offer["TakerPays"], me_sub(wants0, pay));
+        put_json(sandbox, *okey, &off2);
+    }
+}
+
+/// IOU↔IOU crossing with XRP autobridging (rippled FlowCross): at every step
+/// the DIRECT book competes with the two-book XRP bridge; the better maker
+/// rate is consumed one offer (or one bridge slice) at a time. Engaged only
+/// when both bridge books have depth — otherwise the plain direct walk runs.
+#[allow(clippy::too_many_arguments)]
+fn cross_bridged(
+    taker: &[u8; 20],
+    beneficiary: &[u8; 20],
+    mut rem_pays: Me,
+    mut rem_gets: Me,
+    pays_leg: &Leg,
+    gets_leg: &Leg,
+    threshold: u64,
+    sell: bool,
+    inv_base: &Hash256,
+    sandbox: &mut Sandbox,
+) -> Option<(Me, Me, u32)> {
+    let xrp_leg = Leg { xrp: true, cur: [0u8; 20], issuer: [0u8; 20] };
+    let zero = [0u8; 20];
+    // Leg A: spend our gets, acquire XRP. Leg B: spend XRP, acquire our pays.
+    let base_a = keylet::book_base(&gets_leg.cur, &zero, &gets_leg.issuer, &zero);
+    let base_b = keylet::book_base(&zero, &pays_leg.cur, &zero, &pays_leg.issuer);
+    let la = book_offer_ladder(sandbox, &base_a, 128);
+    let lb = book_offer_ladder(sandbox, &base_b, 128);
+    if la.is_empty() || lb.is_empty() {
+        return None; // no bridge: caller runs the direct walk
+    }
+    let ld = book_offer_ladder(sandbox, inv_base, 128);
+    let thr = (threshold != u64::MAX).then(|| rate_me(threshold));
+    let (mut di, mut ai, mut bi) = (0usize, 0usize, 0usize);
+    let mut crossed = 0u32;
+    let done = |rp: Me, rg: Me| me_is_zero(rg) || (!sell && me_is_zero(rp));
+    for _ in 0..512 {
+        if done(rem_pays, rem_gets) {
+            break;
+        }
+        // PEEK both sources (no mutation) to pick the better rate within the
+        // threshold; only the chosen source is then walked with mutation, so
+        // dead-offer cleanup happens exactly where rippled's walk reaches.
+        let dpeek = live_head(sandbox, &ld, &mut di, taker, pays_leg, false);
+        let apeek = live_head(sandbox, &la, &mut ai, taker, &xrp_leg, false);
+        let bpeek = live_head(sandbox, &lb, &mut bi, taker, pays_leg, false);
+        let dq = dpeek.as_ref().map(|(q, ..)| rate_me(*q));
+        let bq = match (&apeek, &bpeek) {
+            (Some((qa, ..)), Some((qb, ..))) => {
+                let (am, ae) = rate_me(*qa);
+                let (bm, be) = rate_me(*qb);
+                Some(norm16((am * bm, ae + be)))
+            }
+            _ => None,
+        };
+        // Pick the better (lower pays-per-gets) source within the threshold.
+        let use_direct = match (dq, bq) {
+            (Some(d), Some(b)) => me_cmp(d, b).is_le(),
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        let spot = if use_direct { dq.unwrap() } else { bq.unwrap() };
+        if let Some(t) = thr {
+            if me_cmp(spot, t).is_gt() {
+                break;
+            }
+        }
+        if use_direct {
+            let Some((_, okey, offer, maker, gives0, wants0)) =
+                live_head(sandbox, &ld, &mut di, taker, pays_leg, true)
+            else { break };
+            let funded = available(sandbox, &maker, pays_leg);
+            let m_gives = if me_cmp(funded, gives0).is_lt() { funded } else { gives0 };
+            let mut give = if !sell && me_cmp(rem_pays, m_gives).is_lt() { rem_pays } else { m_gives };
+            let mut pay = me_muldiv(give, wants0, gives0, true);
+            if me_cmp(pay, rem_gets).is_gt() {
+                pay = rem_gets;
+                give = me_muldiv(pay, gives0, wants0, false);
+                if me_is_zero(give) {
+                    break;
+                }
+            }
+            settle_fill(sandbox, &okey, &offer, &maker, taker, beneficiary,
+                        pays_leg, gets_leg, give, pay, gives0, wants0);
+            rem_pays = me_sub(rem_pays, give);
+            rem_gets = me_sub(rem_gets, pay);
+            crossed += 1;
+        } else {
+            let Some((_, akey, aoffer, amaker, a_gives0, a_wants0)) =
+                live_head(sandbox, &la, &mut ai, taker, &xrp_leg, true)
+            else { break };
+            let Some((_, bkey, boffer, bmaker, b_gives0, b_wants0)) =
+                live_head(sandbox, &lb, &mut bi, taker, pays_leg, true)
+            else { break };
+            // XRP slice through the bridge: bounded by A's funded XRP, B's
+            // XRP appetite, our rem_gets (via A's rate) and rem_pays (via
+            // B's rate, buy mode).
+            let a_funded = available(sandbox, &amaker, &xrp_leg);
+            let a_gives = if me_cmp(a_funded, a_gives0).is_lt() { a_funded } else { a_gives0 };
+            let mut xrp = if me_cmp(a_gives, b_wants0).is_lt() { a_gives } else { b_wants0 };
+            let mut gets_in = me_muldiv(xrp, a_wants0, a_gives0, true);
+            if me_cmp(gets_in, rem_gets).is_gt() {
+                gets_in = rem_gets;
+                xrp = me_muldiv(gets_in, a_gives0, a_wants0, false);
+            }
+            let mut pays_out = me_muldiv(xrp, b_gives0, b_wants0, false);
+            if !sell && me_cmp(pays_out, rem_pays).is_gt() {
+                pays_out = rem_pays;
+                xrp = me_muldiv(pays_out, b_wants0, b_gives0, true);
+                gets_in = me_muldiv(xrp, a_wants0, a_gives0, true);
+            }
+            let xrp = (me_rescale(xrp, 0, false), 0);
+            if me_is_zero(xrp) || me_is_zero(gets_in) || me_is_zero(pays_out) {
+                break;
+            }
+            // Leg A: taker sells gets for XRP (XRP rides in-flight via the
+            // taker and nets out of their mutation set).
+            settle_fill(sandbox, &akey, &aoffer, &amaker, taker, taker,
+                        &xrp_leg, gets_leg, xrp, gets_in, a_gives0, a_wants0);
+            // Leg B: taker sells that XRP for the pays side.
+            settle_fill(sandbox, &bkey, &boffer, &bmaker, taker, beneficiary,
+                        pays_leg, &xrp_leg, pays_out, xrp, b_gives0, b_wants0);
+            rem_gets = me_sub(rem_gets, gets_in);
+            rem_pays = me_sub(rem_pays, pays_out);
+            crossed += 1;
+        }
+    }
+    Some((rem_pays, rem_gets, crossed))
+}
+
 /// Walk the inverse book from best quality and cross while the maker's rate is
 /// within `threshold`. Returns (remaining pays, remaining gets, crossed count).
 ///
@@ -692,6 +954,15 @@ pub(crate) fn cross_engine_to(
         Some(d) => keylet::book_base_domain(&gets_leg.cur, &pays_leg.cur, &gets_leg.issuer, &pays_leg.issuer, d),
         None => keylet::book_base(&gets_leg.cur, &pays_leg.cur, &gets_leg.issuer, &pays_leg.issuer),
     };
+    // IOU↔IOU pairs autobridge through XRP (open books only; AMM pairs keep
+    // the anchored walk below).
+    if !pays_leg.xrp && !gets_leg.xrp && amm.is_none() && domain.is_none() {
+        if let Some(r) = cross_bridged(
+            taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell, &inv_base, sandbox,
+        ) {
+            return r;
+        }
+    }
     let dirs = sandbox.keys_with_prefix(&inv_base.0[..24]);
     'dirs: for dk in dirs {
         let q = u64::from_be_bytes(dk.0[24..32].try_into().unwrap_or_default());

@@ -110,6 +110,26 @@ impl PaymentTransactor {
         // (#105284279 7423D8FA).
         1_000_000
     }
+
+    /// Per-owned-object reserve increment from FeeSettings.
+    fn reserve_inc(sandbox: &Sandbox) -> u64 {
+        let fee_key = keylet::fee_settings_key();
+        if let Some(data) = sandbox.read(&fee_key) {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&data) {
+                if let Some(r) = v.get("ReserveIncrement").and_then(|r| r.as_u64()) {
+                    return r;
+                }
+                if let Some(r) = v
+                    .get("ReserveIncrementDrops")
+                    .and_then(|r| r.as_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    return r;
+                }
+            }
+        }
+        200_000
+    }
 }
 
 impl Transactor for PaymentTransactor {
@@ -209,7 +229,12 @@ impl Transactor for PaymentTransactor {
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0);
             let amount = Self::amount_drops(tx).unwrap_or(0);
-            if balance < amount.saturating_add(tx.fee) {
+            // rippled: mPriorBalance < amount + accountReserve(OwnerCount) —
+            // the sender's reserve is untouchable (#105035381 D21350B6).
+            let oc = acct["OwnerCount"].as_u64().unwrap_or(0);
+            let reserve = Self::reserve_base(sandbox)
+                .saturating_add(Self::reserve_inc(sandbox).saturating_mul(oc));
+            if balance < amount.saturating_add(reserve) {
                 return TxResult::UnfundedPayment;
             }
         }
