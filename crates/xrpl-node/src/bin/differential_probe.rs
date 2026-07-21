@@ -36,7 +36,7 @@ const DEFAULT_RPC: &str = "https://s2.ripple.com:51234";
 /// makes zero type-specific state changes. Reported as SKIP-STUB so the map is
 /// honest rather than showing them as ordinary logic divergences.
 const STUB_TYPES: &[&str] = &[
-    "TicketCreate", "OracleSet", "OracleDelete", "DIDSet", "DIDDelete",
+    "DIDSet", "DIDDelete",
     "XChainCreateBridge", "XChainCreateClaimID", "XChainCommit", "XChainClaim",
     "XChainModifyBridge", "XChainAccountCreateCommit", "XChainAddClaimAttestation",
     "XChainAddAccountCreateAttestation", "PermissionedDomainSet",
@@ -267,6 +267,20 @@ fn native_read_keys(txj: &Value) -> Vec<String> {
         }
         if let Some(d) = dest {
             keys.push(hex::encode_upper(keylet::owner_dir_key(&d).0));
+        }
+    }
+    if txj["TransactionType"].as_str() == Some("TicketCreate") {
+        if let Some(acct) = txj["Account"].as_str().and_then(decode_address) {
+            keys.push(hex::encode_upper(keylet::owner_dir_key(&acct).0));
+        }
+    }
+    if matches!(txj["TransactionType"].as_str(), Some("OracleSet") | Some("OracleDelete")) {
+        if let (Some(acct), Some(doc)) = (
+            txj["Account"].as_str().and_then(decode_address),
+            txj.get("OracleDocumentID").and_then(|v| v.as_u64()),
+        ) {
+            keys.push(hex::encode_upper(keylet::oracle_key(&acct, doc as u32).0));
+            keys.push(hex::encode_upper(keylet::owner_dir_key(&acct).0));
         }
     }
     if txj["TransactionType"].as_str() == Some("CheckCash") {

@@ -29,13 +29,15 @@ use super::escrow::{EscrowCancelTransactor, EscrowCreateTransactor, EscrowFinish
 use super::misc::{
     AMMClawbackTransactor, ClawbackTransactor, DIDDeleteTransactor, DIDSetTransactor,
     DepositPreauthTransactor, MPTokenAuthorizeTransactor, MPTokenIssuanceCreateTransactor,
-    MPTokenIssuanceDestroyTransactor, MPTokenIssuanceSetTransactor, OracleDeleteTransactor,
-    OracleSetTransactor, PermissionedDomainDeleteTransactor, PermissionedDomainSetTransactor,
-    SetRegularKeyTransactor, SignerListSetTransactor, TicketCreateTransactor,
+    MPTokenIssuanceDestroyTransactor, MPTokenIssuanceSetTransactor,
+    PermissionedDomainDeleteTransactor, PermissionedDomainSetTransactor,
+    SetRegularKeyTransactor, SignerListSetTransactor,
     XChainAccountCreateCommitTransactor, XChainAddAccountCreateAttestationTransactor,
     XChainAddClaimAttestationTransactor, XChainClaimTransactor, XChainCommitTransactor,
     XChainCreateBridgeTransactor, XChainCreateClaimIDTransactor, XChainModifyBridgeTransactor,
 };
+use super::oracle::{OracleDeleteTransactor, OracleSetTransactor};
+use super::ticket::TicketCreateTransactor;
 use super::nftoken::{
     NFTokenAcceptOfferTransactor, NFTokenBurnTransactor, NFTokenCancelOfferTransactor,
     NFTokenCreateOfferTransactor, NFTokenMintTransactor,

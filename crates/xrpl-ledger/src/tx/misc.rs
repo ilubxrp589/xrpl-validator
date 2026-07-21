@@ -437,9 +437,6 @@ macro_rules! stub_transactor {
     };
 }
 
-stub_transactor!(TicketCreateTransactor, "TicketCreate");
-stub_transactor!(OracleSetTransactor, "OracleSet");
-stub_transactor!(OracleDeleteTransactor, "OracleDelete");
 stub_transactor!(DIDSetTransactor, "DIDSet");
 stub_transactor!(DIDDeleteTransactor, "DIDDelete");
 stub_transactor!(XChainCreateBridgeTransactor, "XChainCreateBridge");

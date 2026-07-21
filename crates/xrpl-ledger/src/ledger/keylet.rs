@@ -278,6 +278,18 @@ pub fn ticket_key(account_id: &[u8; 20], ticket_seq: u32) -> Hash256 {
     sha512_half(&buf)
 }
 
+/// Compute the state tree key for a price Oracle (XLS-47).
+/// `key = SHA512Half(0x0052 || account_id || document_id_be32)` — 'R'.
+/// Mainnet-verified against #105091578's Band Protocol oracle update
+/// (rsNvoAZ9… doc 1 → D463D13A…).
+pub fn oracle_key(account_id: &[u8; 20], document_id: u32) -> Hash256 {
+    let mut buf = [0u8; 26];
+    buf[..2].copy_from_slice(&[0x00, 0x52]);
+    buf[2..22].copy_from_slice(account_id);
+    buf[22..26].copy_from_slice(&document_id.to_be_bytes());
+    sha512_half(&buf)
+}
+
 /// Compute the state tree key for an NFTokenOffer.
 /// `key = SHA512Half(0x0071 || account_id || sequence_be32)` — namespace 'q',
 /// distinct from DEX offers ('o'). Mainnet-verified against #105666725.

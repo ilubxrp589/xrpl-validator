@@ -12,6 +12,8 @@ pub mod escrow;
 pub mod misc;
 pub mod nftoken;
 pub mod offer;
+pub mod oracle;
 pub mod pay_channel;
 pub mod payment;
+pub mod ticket;
 pub mod trust_set;

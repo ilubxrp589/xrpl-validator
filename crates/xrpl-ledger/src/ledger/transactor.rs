@@ -55,6 +55,10 @@ pub enum TxResult {
     UnfundedOffer,
     /// Path delivered something but less than required (no partial flag).
     PathPartial,
+    /// Destination requires a DestinationTag and the tx has none.
+    DstTagNeeded,
+    /// Directory is full (e.g. > 250 outstanding tickets).
+    DirFull,
 
     // tem — malformed, not applied at all
     /// Transaction is malformed.
@@ -96,6 +100,8 @@ impl TxResult {
             | TxResult::InsufReserveOffer
             | TxResult::UnfundedOffer
             | TxResult::PathPartial
+            | TxResult::DstTagNeeded
+            | TxResult::DirFull
             | TxResult::Unsupported => true,
             // tem/tef: not claimed
             _ => false,
@@ -123,6 +129,8 @@ impl TxResult {
             TxResult::InsufReserveOffer => "tecINSUF_RESERVE_OFFER",
             TxResult::UnfundedOffer => "tecUNFUNDED_OFFER",
             TxResult::PathPartial => "tecPATH_PARTIAL",
+            TxResult::DstTagNeeded => "tecDST_TAG_NEEDED",
+            TxResult::DirFull => "tecDIR_FULL",
             TxResult::Malformed => "temMALFORMED",
             TxResult::BadFee => "temBAD_FEE",
             TxResult::BadAmount => "temBAD_AMOUNT",

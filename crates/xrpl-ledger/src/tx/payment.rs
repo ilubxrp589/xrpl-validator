@@ -183,6 +183,17 @@ impl Transactor for PaymentTransactor {
             if amount < reserve {
                 return TxResult::NoDstInsufXrp;
             }
+        } else if tx.fields.get("DestinationTag").is_none() {
+            // lsfRequireDestTag on the destination rejects untagged payments.
+            let requires_tag = sandbox
+                .read(&dest_key)
+                .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+                .and_then(|a| a["Flags"].as_u64())
+                .map(|f| f & 0x0002_0000 != 0)
+                .unwrap_or(false);
+            if requires_tag {
+                return TxResult::DstTagNeeded;
+            }
         }
 
         TxResult::Success
