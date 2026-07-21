@@ -74,7 +74,39 @@ fn decode_address(addr: &str) -> Option<[u8; 20]> {
     Some(id)
 }
 
+/// Transparent disk cache for RPC results. Every query targets a fixed
+/// historical `ledger_index`, so responses are immutable across runs — the
+/// bottleneck is round-trip latency, not compute. Cache dir defaults to
+/// ~/loop/dxcache and is overridable via DX_CACHE (empty string disables).
+fn cache_dir() -> Option<std::path::PathBuf> {
+    match std::env::var("DX_CACHE") {
+        Ok(s) if s.is_empty() => None,
+        Ok(s) => Some(std::path::PathBuf::from(s)),
+        Err(_) => {
+            let home = std::env::var("HOME").ok()?;
+            Some(std::path::PathBuf::from(home).join("loop/dxcache"))
+        }
+    }
+}
+
+fn cache_key(method: &str, params: &Value) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    method.hash(&mut h);
+    serde_json::to_string(params).unwrap_or_default().hash(&mut h);
+    format!("{method}-{:016x}", h.finish())
+}
+
 fn rpc(url: &str, method: &str, params: Value) -> Option<Value> {
+    let dir = cache_dir();
+    let path = dir.as_ref().map(|d| d.join(cache_key(method, &params)));
+    if let Some(p) = &path {
+        if let Ok(bytes) = std::fs::read(p) {
+            if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+                return Some(v);
+            }
+        }
+    }
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
@@ -86,7 +118,19 @@ fn rpc(url: &str, method: &str, params: Value) -> Option<Value> {
         .ok()?
         .json::<Value>()
         .ok()?;
-    Some(body["result"].clone())
+    let result = body["result"].clone();
+    // Only cache successful lookups — an error/None must not be pinned, so a
+    // transient failure doesn't poison every future run for that key.
+    if let (Some(p), Some(dir)) = (&path, &dir) {
+        let err = result.get("error").is_some();
+        if !err && !result.is_null() {
+            let _ = std::fs::create_dir_all(dir);
+            if let Ok(bytes) = serde_json::to_vec(&result) {
+                let _ = std::fs::write(p, bytes);
+            }
+        }
+    }
+    Some(result)
 }
 
 /// Fetch an AccountRoot at `ledger_index` and store it as native JSON (Account
