@@ -954,8 +954,11 @@ mod nft_page_prefetch {
     #[test]
     fn offer_refs_ignore_other_tx_types_and_junk() {
         let sell = idx(0x5E);
-        // Only NFTokenAcceptOffer (29) carries these fields.
-        for tt in [25u16, 26, 27, 28, 0, 30] {
+        // Only NFTokenAcceptOffer (29) carries these fields. tt 61
+        // (NFTokenModify) is included: it now matches `is_nft_tx_type` for the
+        // stage-one page prefetch, but the stage-two reader is guarded
+        // independently on tt == 29 and must stay inert for it.
+        for tt in [25u16, 26, 27, 28, 61, 0, 30] {
             let mut tx = vec![0x12];
             tx.extend_from_slice(&tt.to_be_bytes());
             tx.extend_from_slice(&[0x50, 29]);
@@ -1064,6 +1067,47 @@ mod nft_page_prefetch {
                 "{name} stage-one owners unchanged by the accept-offer work"
             );
         }
+    }
+
+    /// g2 non-regression fence for the NFTokenModify (tt 61) prefetch this
+    /// mission added. `is_nft_tx_type` gained tt 61 so stage one names the
+    /// modify account's pages — but stage two (`parse_nft_offer_refs`) is
+    /// guarded independently on tt == 29, so tt 61 must issue NO offer read.
+    /// Were that isolation to break, L105663160's NFTokenAcceptOffer replay
+    /// (gate g2) would gain a phantom `read` and its byte-parity would fail.
+    /// The tx-type guard rejects tt 61 BEFORE any field matches, so even a
+    /// Hash256 sitting in the sfNFTokenBuyOffer field code (28) stays inert.
+    #[test]
+    fn nftokenmodify_prefetch_is_isolated_from_stage_two() {
+        let account = owner(0xA1);
+        let token = idx(0x61);
+        // A realistic NFTokenModify: NFTokenID (Hash256 f10), URI (VL), Account.
+        let mut modify = vec![0x12, 0x00, 0x3D]; // TransactionType = 61
+        modify.push(0x5A); // Hash256 f10 (sfNFTokenID-shaped)
+        modify.extend_from_slice(&token);
+        modify.extend_from_slice(&[0x75, 0x03, b'i', b'p', b'f']); // VL URI (7,5)
+        modify.extend_from_slice(&[0x81, 20]); // AccountID Account (8,1)
+        modify.extend_from_slice(&account);
+        assert!(
+            parse_nft_offer_refs(&modify).is_empty(),
+            "NFTokenModify issues no offer read — stage two stays tt==29 only"
+        );
+        // Even a Hash256 in the sfNFTokenBuyOffer field code (28) is inert:
+        // the tx-type guard rejects tt 61 before that field can be harvested.
+        let mut modify_with_28 = vec![0x12, 0x00, 0x3D];
+        modify_with_28.extend_from_slice(&[0x50, 28]);
+        modify_with_28.extend_from_slice(&idx(0xBB));
+        assert!(
+            parse_nft_offer_refs(&modify_with_28).is_empty(),
+            "tt 61 never harvests offer handles even in field 28"
+        );
+        // And stage one still names the acting account for the page walk — the
+        // whole point of the fix — so the isolation costs no page prefetch.
+        assert_eq!(
+            parse_nft_page_owners(&modify),
+            vec![account],
+            "stage-one prefetch still names the modify account's pages"
+        );
     }
 
     // ---- the mission fixture, end to end ---------------------------------
