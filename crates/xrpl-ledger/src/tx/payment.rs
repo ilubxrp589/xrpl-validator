@@ -652,10 +652,10 @@ mod tests {
         let dest = [0x02u8; 20];
         let mut state = make_state();
         add_account(&mut state, &sender, 50_000_000, 1);
-        // dest doesn't exist, sending 1 XRP but reserve is 10 XRP
+        // dest doesn't exist; 0.5 XRP is below the 1 XRP base reserve
 
         let sandbox = Sandbox::new(&state);
-        let tx = payment_tx(sender, dest, 1_000_000, 12, 1);
+        let tx = payment_tx(sender, dest, 500_000, 12, 1);
         assert_eq!(PaymentTransactor.preclaim(&tx, &sandbox), TxResult::NoDstInsufXrp);
     }
 
@@ -752,7 +752,7 @@ mod tests {
         add_account(&mut state, &sender, 100_000_000, 1);
 
         let mut sandbox = Sandbox::new(&state);
-        let tx = payment_tx(sender, dest, 5_000_000, 12, 1); // 5 XRP < 10 XRP reserve
+        let tx = payment_tx(sender, dest, 500_000, 12, 1); // 0.5 XRP < 1 XRP reserve
 
         let result = PaymentTransactor.do_apply(&tx, &mut sandbox);
         assert_eq!(result, TxResult::NoDstInsufXrp);

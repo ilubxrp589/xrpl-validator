@@ -190,9 +190,20 @@ pub(crate) fn me_muldiv(a: Me, b: Me, c: Me, ceil: bool) -> Me {
         return (0, 0);
     }
     let (a, b, c) = (me_norm(a), me_norm(b), me_norm(c));
-    let num = a.0.saturating_mul(b.0);
+    let mut num = a.0.saturating_mul(b.0);
+    let mut e = a.1 + b.1 - c.1;
+    // Keep ~16 significant digits in the quotient: mixed-scale operands
+    // (XRP drops against 1e-11-exponent IOU mantissas) otherwise truncate
+    // to zero (bridge slice sizing found this the hard way).
+    while num != 0
+        && num < c.0.saturating_mul(1_000_000_000_000_000)
+        && num < u128::MAX / 10
+    {
+        num = num.saturating_mul(10);
+        e -= 1;
+    }
     let m = if ceil { num.div_ceil(c.0) } else { num / c.0 };
-    me_norm((m, a.1 + b.1 - c.1))
+    me_norm((m, e))
 }
 
 pub(crate) fn me_to_value_string(a: Me) -> String {
@@ -803,6 +814,7 @@ fn cross_bridged(
     threshold: u64,
     sell: bool,
     inv_base: &Hash256,
+    amm: &Option<crate::tx::amm_swap::Amm>,
     sandbox: &mut Sandbox,
 ) -> Option<(Me, Me, u32)> {
     let xrp_leg = Leg { xrp: true, cur: [0u8; 20], issuer: [0u8; 20] };
@@ -839,6 +851,30 @@ fn cross_bridged(
             }
             _ => None,
         };
+        // AMM turn: the direct-pair pool competes with the best BOOK rate
+        // (direct or bridged) at every step, anchored the same way the plain
+        // walk anchors it to the next directory level.
+        if let Some(a) = amm {
+            let best_book = match (dq, bq) {
+                (Some(d), Some(b)) => Some(if me_cmp(d, b).is_le() { d } else { b }),
+                (Some(d), None) => Some(d),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            let clob = best_book.map(|(m, e)| (((e + 100) as u64) << 56) | m as u64);
+            let (rp, rg, used) = crate::tx::amm_swap::consume(
+                sandbox, a, taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg,
+                threshold, sell, clob,
+            );
+            rem_pays = rp;
+            rem_gets = rg;
+            if used {
+                crossed += 1;
+            }
+            if done(rem_pays, rem_gets) {
+                break;
+            }
+        }
         // Pick the better (lower pays-per-gets) source within the threshold.
         let use_direct = match (dq, bq) {
             (Some(d), Some(b)) => me_cmp(d, b).is_le(),
@@ -847,6 +883,9 @@ fn cross_bridged(
             (None, None) => break,
         };
         let spot = if use_direct { dq.unwrap() } else { bq.unwrap() };
+        if std::env::var("DX_BRIDGE").is_ok() {
+            eprintln!("DX_BRIDGE dq={dq:?} bq={bq:?} thr={thr:?} use_direct={use_direct} di={di} ai={ai} bi={bi} ld={} la={} lb={}", ld.len(), la.len(), lb.len());
+        }
         if let Some(t) = thr {
             if me_cmp(spot, t).is_gt() {
                 break;
@@ -897,6 +936,9 @@ fn cross_bridged(
                 gets_in = me_muldiv(xrp, a_wants0, a_gives0, true);
             }
             let xrp = (me_rescale(xrp, 0, false), 0);
+            if std::env::var("DX_BRIDGE").is_ok() {
+                eprintln!("DX_BRIDGE slice xrp={xrp:?} gets_in={gets_in:?} pays_out={pays_out:?} a=({a_gives0:?},{a_wants0:?}) b=({b_gives0:?},{b_wants0:?}) rem_g={rem_gets:?} rem_p={rem_pays:?}");
+            }
             if me_is_zero(xrp) || me_is_zero(gets_in) || me_is_zero(pays_out) {
                 break;
             }
@@ -954,11 +996,11 @@ pub(crate) fn cross_engine_to(
         Some(d) => keylet::book_base_domain(&gets_leg.cur, &pays_leg.cur, &gets_leg.issuer, &pays_leg.issuer, d),
         None => keylet::book_base(&gets_leg.cur, &pays_leg.cur, &gets_leg.issuer, &pays_leg.issuer),
     };
-    // IOU↔IOU pairs autobridge through XRP (open books only; AMM pairs keep
-    // the anchored walk below).
-    if !pays_leg.xrp && !gets_leg.xrp && amm.is_none() && domain.is_none() {
+    // IOU↔IOU pairs autobridge through XRP (open books; the direct-pair AMM
+    // competes inside the controller).
+    if !pays_leg.xrp && !gets_leg.xrp && domain.is_none() {
         if let Some(r) = cross_bridged(
-            taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell, &inv_base, sandbox,
+            taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell, &inv_base, &amm, sandbox,
         ) {
             return r;
         }

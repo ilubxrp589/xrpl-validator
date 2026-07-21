@@ -506,7 +506,15 @@ pub(crate) fn consume(
     if pool_in.0 == 0 || pool_out.0 == 0 {
         return (rem_pays, rem_gets, false);
     }
-    let spot = rate_of(pool_in, pool_out); // Quality{balances}: rate = in/out
+    // Spot-price quality embeds the trading fee: paying dIn yields
+    // dOut = dIn·(1−f)·out/in, so rate = in / (out·(1−f)) — the feeless
+    // ratio admitted fills rippled rejects at the boundary (#105035381
+    // DDFDD49B killed vs 2C4DF181 filled, same pool).
+    let omf_spot = n_sub(N_ONE, fee_n(amm.tfee), Rnd::Near);
+    let spot = rate_of(pool_in, n_mul(pool_out, omf_spot, Rnd::Near));
+    if std::env::var("DX_AMM").is_ok() {
+        eprintln!("DX_AMM spot={spot:x} thr={threshold:x} clob={clob:?} tfee={} pool_in={pool_in:?} pool_out={pool_out:?}", amm.tfee);
+    }
     if spot == 0 || spot > threshold {
         return (rem_pays, rem_gets, false);
     }
