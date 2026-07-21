@@ -40,7 +40,7 @@ use super::oracle::{OracleDeleteTransactor, OracleSetTransactor};
 use super::ticket::TicketCreateTransactor;
 use super::nftoken::{
     NFTokenAcceptOfferTransactor, NFTokenBurnTransactor, NFTokenCancelOfferTransactor,
-    NFTokenCreateOfferTransactor, NFTokenMintTransactor,
+    NFTokenCreateOfferTransactor, NFTokenMintTransactor, NFTokenModifyTransactor,
 };
 use super::offer::{OfferCancelTransactor, OfferCreateTransactor};
 use super::pay_channel::{
@@ -74,6 +74,7 @@ pub fn get_transactor(tx_type: &str) -> Option<Box<dyn Transactor>> {
         "NFTokenCreateOffer" => Some(Box::new(NFTokenCreateOfferTransactor)),
         "NFTokenAcceptOffer" => Some(Box::new(NFTokenAcceptOfferTransactor)),
         "NFTokenCancelOffer" => Some(Box::new(NFTokenCancelOfferTransactor)),
+        "NFTokenModify" => Some(Box::new(NFTokenModifyTransactor)),
         "SetRegularKey" => Some(Box::new(SetRegularKeyTransactor)),
         "SignerListSet" => Some(Box::new(SignerListSetTransactor)),
         "DepositPreauth" => Some(Box::new(DepositPreauthTransactor)),

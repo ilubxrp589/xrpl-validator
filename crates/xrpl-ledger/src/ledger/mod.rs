@@ -10,6 +10,7 @@ pub mod close;
 pub mod directory;
 pub mod header;
 pub mod keylet;
+pub mod nftpage;
 pub mod objects;
 pub mod sandbox;
 pub mod state;

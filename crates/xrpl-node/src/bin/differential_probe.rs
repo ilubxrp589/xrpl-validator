@@ -185,6 +185,75 @@ fn load_object(state: &mut LedgerState, url: &str, index_hex: &str, ledger_index
     let _ = state.state_map.insert(Hash256(k), serde_json::to_vec(&node).unwrap_or_default());
 }
 
+/// Load an account's full NFTokenPage chain at `ledger_index` via
+/// account_objects — the native page-walk (max page → PreviousPageMin) needs
+/// every page present, and mainnet meta only carries the pages a tx touched.
+fn load_nft_pages(state: &mut LedgerState, url: &str, addr: &str, ledger_index: u32) {
+    let mut marker: Option<Value> = None;
+    // Mint farms run to hundreds of pages (752 seen on an xrp.cafe claim
+    // account) — paginate until the marker runs dry.
+    for _ in 0..60 {
+        let mut params = json!({"account": addr, "ledger_index": ledger_index,
+               "type": "nft_page", "limit": 400});
+        if let Some(m) = &marker {
+            params["marker"] = m.clone();
+        }
+        let Some(res) = rpc(url, "account_objects", params) else { return };
+        for obj in res["account_objects"].as_array().into_iter().flatten() {
+            let Some(idx) = obj["index"].as_str() else { continue };
+            let Ok(kb) = hex::decode(idx) else { continue };
+            if kb.len() != 32 { continue; }
+            let mut node = obj.clone();
+            hexify_addresses(&mut node);
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&kb);
+            let _ = state.state_map.insert(Hash256(k), serde_json::to_vec(&node).unwrap_or_default());
+        }
+        marker = res.get("marker").filter(|m| !m.is_null()).cloned();
+        if marker.is_none() {
+            return;
+        }
+    }
+}
+
+/// NFT-page pre-state for the tx types that walk pages: mint/modify/burn need
+/// the owner's chain; accept needs both parties' — the counterparty is only
+/// discoverable through the offer SLE, fetched here (cached) pre-hexify so
+/// its Owner is still base58 for account_objects.
+fn load_nft_pages_for_tx(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
+    match txj["TransactionType"].as_str() {
+        Some("NFTokenMint") => {
+            if let Some(a) = txj["Account"].as_str() {
+                load_nft_pages(state, url, a, ledger_index);
+            }
+            if let Some(i) = txj.get("Issuer").and_then(|v| v.as_str()) {
+                load_nft_pages(state, url, i, ledger_index);
+            }
+        }
+        Some("NFTokenModify") | Some("NFTokenBurn") => {
+            let owner = txj.get("Owner").and_then(|v| v.as_str())
+                .or_else(|| txj["Account"].as_str());
+            if let Some(o) = owner {
+                load_nft_pages(state, url, o, ledger_index);
+            }
+        }
+        Some("NFTokenAcceptOffer") => {
+            if let Some(a) = txj["Account"].as_str() {
+                load_nft_pages(state, url, a, ledger_index);
+            }
+            for f in ["NFTokenSellOffer", "NFTokenBuyOffer"] {
+                let Some(idx) = txj.get(f).and_then(|v| v.as_str()) else { continue };
+                let Some(res) = rpc(url, "ledger_entry",
+                    json!({"index": idx, "ledger_index": ledger_index})) else { continue };
+                if let Some(owner) = res["node"]["Owner"].as_str() {
+                    load_nft_pages(state, url, owner, ledger_index);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// 20-byte currency code from a JSON currency string (3-char ISO or 40-hex).
 fn currency_code(iso: &str) -> [u8; 20] {
     let mut code = [0u8; 20];
@@ -758,6 +827,7 @@ fn run() -> i32 {
         }
         load_trustline_hint_pages(&mut state, &rpc_url, txj, seq - 1);
         load_payment_books(&mut state, &rpc_url, txj, seq - 1, &mut books_seen);
+        load_nft_pages_for_tx(&mut state, &rpc_url, txj, seq - 1);
     }
     eprintln!("Loaded {} pre-state objects.", obj_seen.len());
 

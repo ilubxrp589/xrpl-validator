@@ -1,50 +1,21 @@
-//! NFToken transaction types — Mint, Burn, CreateOffer, AcceptOffer, CancelOffer.
+//! NFToken transactors — Mint, Burn, CreateOffer, AcceptOffer, CancelOffer,
+//! Modify — on the real NFTokenPage model (`ledger::nftpage`).
 //!
-//! Simplified implementations: create/delete NFToken entries and NFT offers,
-//! transfer token ownership on accept.
-//!
-//! # DEAD CODE WARNING
-//!
-//! This module is **not called** by the live validator. Production transaction
-//! application is delegated to rippled's C++ engine via FFI — see
-//! `crates/xrpl-ffi/src/lib.rs` and `crates/xrpl-node/src/ffi_engine.rs`.
-//!
-//! This code is retained as a reference implementation / learning artifact.
-//! Tests in this module prove the code works in isolation; they do NOT prove
-//! the validator is correct.
-//!
-//! If you are adding a new amendment or tx type: add it to the FFI path,
-//! not here. See `ffi/ARCHITECTURE.md` for the architectural decision record.
+//! rippled reference: `NFTokenMint.cpp`, `NFTokenAcceptOffer.cpp`,
+//! `NFTokenUtils.cpp`. NFTokenID composition (32 bytes):
+//! `flags_be16 ‖ transfer_fee_be16 ‖ issuer_20 ‖ (taxon ^ scramble)_be32 ‖
+//! token_seq_be32`, where `scramble = 384160001 * token_seq + 2459`
+//! (wrapping) and `token_seq = FirstNFTokenSequence + MintedNFTokens` on the
+//! issuer's AccountRoot. Offers are referenced by ledger index (Hash256), and
+//! each offer lives in BOTH its owner's directory and the token's buy/sell
+//! offer directory.
 
+use crate::ledger::directory::{dir_insert, dir_remove, owner_dir_insert, owner_dir_remove};
 use crate::ledger::keylet;
+use crate::ledger::nftpage;
 use crate::ledger::sandbox::Sandbox;
 use crate::ledger::transactor::{Transactor, TxFields, TxResult};
-use crate::shamap::hash::sha512_half;
-
-/// Compute a deterministic key for an NFToken object.
-/// `key = SHA512Half(0x0050 || account_id || taxon_be32 || sequence_be32)`
-///
-/// This is a simplified key — real rippled uses NFTokenPage paging.
-/// We use the base nftoken_page_key XOR'd with a hash of (taxon, sequence)
-/// so each token gets a unique key under the owner's page space.
-fn nftoken_object_key(account: &[u8; 20], taxon: u32, sequence: u32) -> xrpl_core::types::Hash256 {
-    let mut buf = [0u8; 30];
-    // space 'P' for NFTokenPage
-    buf[0] = 0x00;
-    buf[1] = 0x50;
-    buf[2..22].copy_from_slice(account);
-    buf[22..26].copy_from_slice(&taxon.to_be_bytes());
-    buf[26..30].copy_from_slice(&sequence.to_be_bytes());
-    sha512_half(&buf)
-}
-
-/// Compute a deterministic key for an NFToken offer.
-/// Reuses the offer keylet space but with a different discriminator.
-fn nft_offer_key(account: &[u8; 20], sequence: u32) -> xrpl_core::types::Hash256 {
-    // NFT offers live in their own keyspace (0x0071 'q'), NOT the DEX offer
-    // space — mainnet-verified against #105666725.
-    keylet::nft_offer_key(account, sequence)
-}
+use xrpl_core::types::Hash256;
 
 /// Helper: read an account, increment OwnerCount, write back.
 fn increment_owner_count(account: &[u8; 20], sandbox: &mut Sandbox) {
@@ -84,11 +55,45 @@ fn decode_account_id(val: &serde_json::Value) -> Option<[u8; 20]> {
     Some(arr)
 }
 
+/// Decode a 64-hex Hash256 field (NFTokenID, offer index).
+fn hash256_from(val: &serde_json::Value) -> Option<Hash256> {
+    let b = hex::decode(val.as_str()?).ok()?;
+    (b.len() == 32).then(|| {
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&b);
+        Hash256(k)
+    })
+}
+
+/// Directory page hint from an SLE field (UInt64 as number or hex string).
+fn node_hint(v: Option<&serde_json::Value>) -> Option<u64> {
+    let v = v?;
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| u64::from_str_radix(s, 16).ok()))
+}
+
+/// Adjust an account's XRP Balance by `delta` drops (negative = debit).
+fn adjust_xrp(sandbox: &mut Sandbox, account: &[u8; 20], delta: i128) {
+    if delta == 0 {
+        return;
+    }
+    let key = keylet::account_root_key(account);
+    if let Some(d) = sandbox.read(&key) {
+        if let Ok(mut a) = serde_json::from_slice::<serde_json::Value>(&d) {
+            let bal = a["Balance"]
+                .as_str()
+                .and_then(|s| s.parse::<i128>().ok())
+                .unwrap_or(0);
+            a["Balance"] = serde_json::Value::String((bal + delta).max(0).to_string());
+            sandbox.write(key, serde_json::to_vec(&a).unwrap_or_default());
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // NFTokenMint
 // ---------------------------------------------------------------------------
 
-/// NFTokenMint transactor — create an NFToken entry in state.
 pub struct NFTokenMintTransactor;
 
 impl Transactor for NFTokenMintTransactor {
@@ -99,7 +104,6 @@ impl Transactor for NFTokenMintTransactor {
         if tx.fee == 0 {
             return TxResult::BadFee;
         }
-        // NFTokenTaxon is required
         if tx.fields.get("NFTokenTaxon").is_none() {
             return TxResult::Malformed;
         }
@@ -119,39 +123,66 @@ impl Transactor for NFTokenMintTransactor {
             Some(t) => t as u32,
             None => return TxResult::Malformed,
         };
+        let issuer = tx
+            .fields
+            .get("Issuer")
+            .and_then(decode_account_id)
+            .unwrap_or(tx.account);
 
-        let seq = if tx.uses_ticket() {
-            tx.ticket_seq.unwrap_or(0)
-        } else {
-            tx.sequence
+        // token_seq comes off the ISSUER's account root.
+        let issuer_key = keylet::account_root_key(&issuer);
+        let Some(idata) = sandbox.read(&issuer_key) else {
+            return TxResult::NoAccount;
         };
-
-        let token_key = nftoken_object_key(&tx.account, taxon, seq);
-
-        let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
-        let uri = tx.fields.get("URI").cloned().unwrap_or(serde_json::Value::Null);
-        let transfer_fee = tx.fields.get("TransferFee").and_then(|f| f.as_u64()).unwrap_or(0);
-
-        // Determine the issuer — may be the sender or an explicit Issuer field
-        let issuer_hex = if let Some(issuer_val) = tx.fields.get("Issuer") {
-            issuer_val.as_str().unwrap_or(&hex::encode(tx.account)).to_string()
-        } else {
-            hex::encode(tx.account)
+        let Ok(mut iacct) = serde_json::from_slice::<serde_json::Value>(&idata) else {
+            return TxResult::Malformed;
         };
+        let minted = iacct["MintedNFTokens"].as_u64().unwrap_or(0) as u32;
+        let first = iacct["FirstNFTokenSequence"]
+            .as_u64()
+            .map(|v| v as u32)
+            .unwrap_or_else(|| iacct["Sequence"].as_u64().unwrap_or(0) as u32);
+        let token_seq = first.wrapping_add(minted);
 
-        let token_obj = serde_json::json!({
-            "LedgerEntryType": "NFToken",
-            "Owner": hex::encode(tx.account),
-            "Issuer": issuer_hex,
-            "NFTokenTaxon": taxon,
-            "Sequence": seq,
-            "Flags": flags,
-            "URI": uri,
-            "TransferFee": transfer_fee,
-        });
+        let scramble = 384_160_001u32.wrapping_mul(token_seq).wrapping_add(2459);
+        let flags16 = (tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & 0xFFFF) as u16;
+        let fee16 = tx
+            .fields
+            .get("TransferFee")
+            .and_then(|f| f.as_u64())
+            .unwrap_or(0) as u16;
 
-        sandbox.write(token_key, serde_json::to_vec(&token_obj).unwrap());
-        increment_owner_count(&tx.account, sandbox);
+        let mut id = [0u8; 32];
+        id[0..2].copy_from_slice(&flags16.to_be_bytes());
+        id[2..4].copy_from_slice(&fee16.to_be_bytes());
+        id[4..24].copy_from_slice(&issuer);
+        id[24..28].copy_from_slice(&(taxon ^ scramble).to_be_bytes());
+        id[28..32].copy_from_slice(&token_seq.to_be_bytes());
+
+        let mut token = serde_json::json!({ "NFTokenID": hex::encode_upper(id) });
+        if let Some(uri) = tx.fields.get("URI") {
+            token["URI"] = uri.clone();
+        }
+        let created = nftpage::page_insert(
+            sandbox,
+            &tx.account,
+            serde_json::json!({ "NFToken": token }),
+        );
+        if created {
+            increment_owner_count(&tx.account, sandbox);
+        }
+
+        // Re-read: the OwnerCount bump above may have rewritten the same root.
+        if let Some(d) = sandbox.read(&issuer_key) {
+            if let Ok(a) = serde_json::from_slice::<serde_json::Value>(&d) {
+                iacct = a;
+            }
+        }
+        iacct["MintedNFTokens"] = serde_json::json!(minted as u64 + 1);
+        if iacct.get("FirstNFTokenSequence").is_none() {
+            iacct["FirstNFTokenSequence"] = serde_json::json!(first);
+        }
+        sandbox.write(issuer_key, serde_json::to_vec(&iacct).unwrap_or_default());
 
         TxResult::Success
     }
@@ -161,7 +192,6 @@ impl Transactor for NFTokenMintTransactor {
 // NFTokenBurn
 // ---------------------------------------------------------------------------
 
-/// NFTokenBurn transactor — delete an NFToken from state.
 pub struct NFTokenBurnTransactor;
 
 impl Transactor for NFTokenBurnTransactor {
@@ -172,7 +202,6 @@ impl Transactor for NFTokenBurnTransactor {
         if tx.fee == 0 {
             return TxResult::BadFee;
         }
-        // NFTokenID is required
         if tx.fields.get("NFTokenID").is_none() {
             return TxResult::Malformed;
         }
@@ -188,53 +217,31 @@ impl Transactor for NFTokenBurnTransactor {
     }
 
     fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
-        // In our simplified model, the NFTokenID encodes taxon + sequence
-        // so we can reconstruct the key. We expect NFTokenID to be a JSON
-        // object with {taxon, sequence} or alternatively {owner, taxon, sequence}.
-        let nft_id = &tx.fields["NFTokenID"];
-
-        let owner = if let Some(owner_val) = nft_id.get("Owner") {
-            match decode_account_id(owner_val) {
-                Some(id) => id,
-                None => return TxResult::Malformed,
-            }
-        } else {
-            tx.account
+        let Some(id) = tx.fields.get("NFTokenID").and_then(hash256_from) else {
+            return TxResult::Malformed;
         };
+        let owner = tx
+            .fields
+            .get("Owner")
+            .and_then(decode_account_id)
+            .unwrap_or(tx.account);
 
-        let taxon = match nft_id.get("Taxon").and_then(|v| v.as_u64()) {
-            Some(t) => t as u32,
-            None => return TxResult::Malformed,
-        };
-        let sequence = match nft_id.get("Sequence").and_then(|v| v.as_u64()) {
-            Some(s) => s as u32,
-            None => return TxResult::Malformed,
-        };
-
-        let token_key = nftoken_object_key(&owner, taxon, sequence);
-
-        if !sandbox.exists(&token_key) {
+        let Some(removal) = nftpage::page_remove(sandbox, &owner, &id) else {
             return TxResult::NoEntry;
+        };
+        if removal.page_deleted {
+            decrement_owner_count(&owner, sandbox);
         }
 
-        // Verify the sender has the right to burn (must be owner or issuer with lsfBurnable)
-        if let Some(data) = sandbox.read(&token_key) {
-            if let Ok(token) = serde_json::from_slice::<serde_json::Value>(&data) {
-                let token_owner_hex = token["Owner"].as_str().unwrap_or("");
-                let sender_hex = hex::encode(tx.account);
-                if token_owner_hex != sender_hex {
-                    // Check if sender is the issuer with burn flag (0x0001 = lsfBurnable)
-                    let issuer_hex = token["Issuer"].as_str().unwrap_or("");
-                    let flags = token["Flags"].as_u64().unwrap_or(0);
-                    if issuer_hex != sender_hex || flags & 0x0001 == 0 {
-                        return TxResult::NoPermission;
-                    }
-                }
+        let issuer = nftpage::issuer_of(&id);
+        let issuer_key = keylet::account_root_key(&issuer);
+        if let Some(d) = sandbox.read(&issuer_key) {
+            if let Ok(mut a) = serde_json::from_slice::<serde_json::Value>(&d) {
+                let burned = a["BurnedNFTokens"].as_u64().unwrap_or(0);
+                a["BurnedNFTokens"] = serde_json::json!(burned + 1);
+                sandbox.write(issuer_key, serde_json::to_vec(&a).unwrap_or_default());
             }
         }
-
-        sandbox.delete(token_key);
-        decrement_owner_count(&owner, sandbox);
 
         TxResult::Success
     }
@@ -244,7 +251,6 @@ impl Transactor for NFTokenBurnTransactor {
 // NFTokenCreateOffer
 // ---------------------------------------------------------------------------
 
-/// NFTokenCreateOffer transactor — create an offer to buy or sell an NFToken.
 pub struct NFTokenCreateOfferTransactor;
 
 impl Transactor for NFTokenCreateOfferTransactor {
@@ -255,11 +261,7 @@ impl Transactor for NFTokenCreateOfferTransactor {
         if tx.fee == 0 {
             return TxResult::BadFee;
         }
-        // NFTokenID and Amount are required
-        if tx.fields.get("NFTokenID").is_none() {
-            return TxResult::Malformed;
-        }
-        if tx.fields.get("Amount").is_none() {
+        if tx.fields.get("NFTokenID").is_none() || tx.fields.get("Amount").is_none() {
             return TxResult::Malformed;
         }
         TxResult::Success
@@ -279,29 +281,21 @@ impl Transactor for NFTokenCreateOfferTransactor {
         } else {
             tx.sequence
         };
-
-        let offer_key = nft_offer_key(&tx.account, seq);
-
+        let offer_key = keylet::nft_offer_key(&tx.account, seq);
         let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
-        // tfSellNFToken = 0x00000001
-        let is_sell = flags & 0x00000001 != 0;
+        let is_sell = flags & 0x0000_0001 != 0;
 
         let mut offer_obj = serde_json::json!({
             "LedgerEntryType": "NFTokenOffer",
             "Owner": hex::encode(tx.account),
             "NFTokenID": tx.fields["NFTokenID"].clone(),
             "Amount": tx.fields["Amount"].clone(),
-            "Flags": flags,
-            "Sequence": seq,
-            "IsSell": is_sell,
+            "Flags": flags & 0xFFFF,
+            "OwnerNode": 0,
         });
-
-        // Optional: Destination (restrict who can accept the offer)
         if let Some(dest) = tx.fields.get("Destination") {
             offer_obj["Destination"] = dest.clone();
         }
-
-        // Optional: Expiration
         if let Some(exp) = tx.fields.get("Expiration") {
             offer_obj["Expiration"] = exp.clone();
         }
@@ -309,21 +303,14 @@ impl Transactor for NFTokenCreateOfferTransactor {
         sandbox.write(offer_key, serde_json::to_vec(&offer_obj).unwrap());
         increment_owner_count(&tx.account, sandbox);
 
-        // The offer is inserted into the creator's owner directory AND the
-        // token's buy/sell offer directory (rooted on the NFTokenID keylet,
-        // created on first offer for that token+side).
-        crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &offer_key);
-        if let Some(nft_id) = tx.fields.get("NFTokenID").and_then(|v| v.as_str())
-            .and_then(|s| hex::decode(s).ok())
-            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
-        {
-            let nft_id = xrpl_core::types::Hash256(nft_id);
+        owner_dir_insert(sandbox, &tx.account, &offer_key);
+        if let Some(nft_id) = tx.fields.get("NFTokenID").and_then(hash256_from) {
             let dir_root = if is_sell {
                 keylet::nft_sell_offers_key(&nft_id)
             } else {
                 keylet::nft_buy_offers_key(&nft_id)
             };
-            crate::ledger::directory::dir_insert(sandbox, &dir_root, None, &offer_key);
+            dir_insert(sandbox, &dir_root, None, &offer_key);
         }
         // Mainnet meta also touches the Destination's AccountRoot (no-op
         // Modified) when the offer names one. OwnerCount bump = the
@@ -340,8 +327,89 @@ impl Transactor for NFTokenCreateOfferTransactor {
 // NFTokenAcceptOffer
 // ---------------------------------------------------------------------------
 
-/// NFTokenAcceptOffer transactor — accept an NFT offer, transferring the token.
 pub struct NFTokenAcceptOfferTransactor;
+
+struct OfferSle {
+    key: Hash256,
+    owner: [u8; 20],
+    nft_id: Hash256,
+    is_sell: bool,
+    amount: serde_json::Value,
+    owner_node: Option<u64>,
+    offer_node: Option<u64>,
+    destination: Option<[u8; 20]>,
+}
+
+fn read_offer(sandbox: &Sandbox, key: Hash256) -> Option<OfferSle> {
+    let data = sandbox.read(&key)?;
+    let o: serde_json::Value = serde_json::from_slice(&data).ok()?;
+    Some(OfferSle {
+        key,
+        owner: decode_account_id(&o["Owner"])?,
+        nft_id: hash256_from(&o["NFTokenID"])?,
+        is_sell: o["Flags"].as_u64().unwrap_or(0) & 1 != 0,
+        amount: o["Amount"].clone(),
+        owner_node: node_hint(o.get("OwnerNode")),
+        offer_node: node_hint(o.get("NFTokenOfferNode")),
+        destination: o.get("Destination").and_then(decode_account_id),
+    })
+}
+
+/// Delete an NFT offer: object + owner-dir entry + token buy/sell-dir entry +
+/// the owner's reserve unit.
+fn delete_offer(sandbox: &mut Sandbox, offer: &OfferSle) {
+    sandbox.delete(offer.key);
+    owner_dir_remove(sandbox, &offer.owner, &offer.key, offer.owner_node);
+    let dir_root = if offer.is_sell {
+        keylet::nft_sell_offers_key(&offer.nft_id)
+    } else {
+        keylet::nft_buy_offers_key(&offer.nft_id)
+    };
+    dir_remove(sandbox, &dir_root, &offer.key, offer.offer_node);
+    decrement_owner_count(&offer.owner, sandbox);
+}
+
+/// Move `drops` from buyer to seller, carving the NFTokenID-embedded transfer
+/// fee (1/100000 units) out for the issuer when the seller isn't the issuer.
+fn pay_xrp_with_transfer_fee(
+    sandbox: &mut Sandbox,
+    buyer: &[u8; 20],
+    seller: &[u8; 20],
+    nft_id: &Hash256,
+    drops: u64,
+) {
+    let fee_units = u16::from_be_bytes([nft_id.0[2], nft_id.0[3]]) as u128;
+    let issuer = nftpage::issuer_of(nft_id);
+    let mut to_issuer = 0u128;
+    if fee_units > 0 && issuer != *seller {
+        to_issuer = (drops as u128) * fee_units / 100_000;
+    }
+    adjust_xrp(sandbox, buyer, -(drops as i128));
+    adjust_xrp(sandbox, seller, drops as i128 - to_issuer as i128);
+    if to_issuer > 0 {
+        adjust_xrp(sandbox, &issuer, to_issuer as i128);
+    }
+}
+
+/// Move the token from seller's pages to buyer's, carrying URI along, and
+/// settle the reserve deltas from page churn.
+fn transfer_token(
+    sandbox: &mut Sandbox,
+    seller: &[u8; 20],
+    buyer: &[u8; 20],
+    nft_id: &Hash256,
+) -> TxResult {
+    let Some(removal) = nftpage::page_remove(sandbox, seller, nft_id) else {
+        return TxResult::NoEntry;
+    };
+    if removal.page_deleted {
+        decrement_owner_count(seller, sandbox);
+    }
+    if nftpage::page_insert(sandbox, buyer, removal.entry) {
+        increment_owner_count(buyer, sandbox);
+    }
+    TxResult::Success
+}
 
 impl Transactor for NFTokenAcceptOfferTransactor {
     fn preflight(&self, tx: &TxFields) -> TxResult {
@@ -351,7 +419,6 @@ impl Transactor for NFTokenAcceptOfferTransactor {
         if tx.fee == 0 {
             return TxResult::BadFee;
         }
-        // Must have at least one of NFTokenSellOffer or NFTokenBuyOffer
         if tx.fields.get("NFTokenSellOffer").is_none()
             && tx.fields.get("NFTokenBuyOffer").is_none()
         {
@@ -369,113 +436,86 @@ impl Transactor for NFTokenAcceptOfferTransactor {
     }
 
     fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
-        // Determine which offer to accept (sell offer has priority in brokered mode)
-        let offer_field = if tx.fields.get("NFTokenSellOffer").is_some() {
-            "NFTokenSellOffer"
-        } else {
-            "NFTokenBuyOffer"
-        };
+        let sell_ref = tx.fields.get("NFTokenSellOffer").and_then(hash256_from);
+        let buy_ref = tx.fields.get("NFTokenBuyOffer").and_then(hash256_from);
 
-        let offer_ref = &tx.fields[offer_field];
+        // Brokered mode: both offers named; tx.account is the broker.
+        if let (Some(sk), Some(bk)) = (sell_ref, buy_ref) {
+            let (Some(sell), Some(buy)) = (read_offer(sandbox, sk), read_offer(sandbox, bk))
+            else {
+                return TxResult::NoEntry;
+            };
+            let seller = sell.owner;
+            let buyer = buy.owner;
+            // Broker keeps the buy/sell spread; an explicit BrokerFee is the
+            // broker's cut, the rest of the buy amount goes to the seller.
+            if let Some(drops) = buy.amount.as_str().and_then(|s| s.parse::<u64>().ok()) {
+                let broker_fee = tx
+                    .fields
+                    .get("NFTokenBrokerFee")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let to_seller = drops.saturating_sub(broker_fee);
+                adjust_xrp(sandbox, &buyer, -(drops as i128));
+                if broker_fee > 0 {
+                    adjust_xrp(sandbox, &tx.account, broker_fee as i128);
+                }
+                pay_settle_seller(sandbox, &seller, &sell.nft_id, to_seller);
+            }
+            let moved = transfer_token(sandbox, &seller, &buyer, &sell.nft_id);
+            if moved != TxResult::Success {
+                return moved;
+            }
+            delete_offer(sandbox, &sell);
+            delete_offer(sandbox, &buy);
+            return TxResult::Success;
+        }
 
-        // The offer reference contains {Account, Sequence} to locate the offer object
-        let offer_owner = match offer_ref.get("Account").and_then(|v| decode_account_id(v)) {
-            Some(id) => id,
-            None => return TxResult::Malformed,
+        // Direct mode.
+        let Some(offer) = sell_ref.or(buy_ref).and_then(|k| read_offer(sandbox, k)) else {
+            return TxResult::NoEntry;
         };
-        let offer_seq = match offer_ref.get("Sequence").and_then(|v| v.as_u64()) {
-            Some(s) => s as u32,
-            None => return TxResult::Malformed,
-        };
-
-        let offer_key = nft_offer_key(&offer_owner, offer_seq);
-
-        // Read the offer
-        let offer_data = match sandbox.read(&offer_key) {
-            Some(d) => d,
-            None => return TxResult::NoEntry,
-        };
-        let offer: serde_json::Value = match serde_json::from_slice(&offer_data) {
-            Ok(v) => v,
-            Err(_) => return TxResult::Malformed,
-        };
-
-        // Bug 2: Self-accept check — you cannot accept your own offer.
-        // For sell offers, the offer owner is the seller; tx.account must not be the seller.
-        // For buy offers, the offer owner is the buyer; tx.account must not be the buyer.
-        let is_sell = offer["IsSell"].as_bool().unwrap_or(false);
-        if is_sell && tx.account == offer_owner {
-            // Seller trying to accept their own sell offer
+        if offer.owner == tx.account {
             return TxResult::NoPermission;
         }
-        if !is_sell && tx.account == offer_owner {
-            // Buyer trying to accept their own buy offer
-            return TxResult::NoPermission;
-        }
-
-        // Get the NFTokenID from the offer to locate the token
-        let nft_id = &offer["NFTokenID"];
-        let token_owner_id = if let Some(owner_val) = nft_id.get("Owner") {
-            match decode_account_id(owner_val) {
-                Some(id) => id,
-                None => return TxResult::Malformed,
+        if let Some(dest) = offer.destination {
+            if dest != tx.account {
+                return TxResult::NoPermission;
             }
+        }
+        let (seller, buyer) = if offer.is_sell {
+            (offer.owner, tx.account)
         } else {
-            // If no Owner in NFTokenID, the offer owner is the token owner (sell)
-            // or the tx sender is buying (buy offer)
-            if is_sell { offer_owner } else { tx.account }
+            (tx.account, offer.owner)
         };
-
-        let taxon = match nft_id.get("Taxon").and_then(|v| v.as_u64()) {
-            Some(t) => t as u32,
-            None => return TxResult::Malformed,
-        };
-        let token_seq = match nft_id.get("Sequence").and_then(|v| v.as_u64()) {
-            Some(s) => s as u32,
-            None => return TxResult::Malformed,
-        };
-
-        let old_token_key = nftoken_object_key(&token_owner_id, taxon, token_seq);
-
-        // Read the token
-        let token_data = match sandbox.read(&old_token_key) {
-            Some(d) => d,
-            None => return TxResult::NoEntry,
-        };
-        let mut token: serde_json::Value = match serde_json::from_slice(&token_data) {
-            Ok(v) => v,
-            Err(_) => return TxResult::Malformed,
-        };
-
-        // Determine new owner: if sell offer, buyer is tx.account; if buy offer, seller accepts
-        let new_owner = if is_sell { tx.account } else { offer_owner };
-
-        // Transfer: update the Owner field
-        let old_owner_hex = token["Owner"].as_str().unwrap_or("").to_string();
-        token["Owner"] = serde_json::Value::String(hex::encode(new_owner));
-
-        // Bug 7: Recompute key for new owner, delete old key, write at new key.
-        // The nftoken_object_key is derived from the owner, so transferring
-        // ownership requires moving the entry to the new owner's key space.
-        let new_token_key = nftoken_object_key(&new_owner, taxon, token_seq);
-        sandbox.delete(old_token_key);
-        sandbox.write(new_token_key, serde_json::to_vec(&token).unwrap());
-
-        // Adjust OwnerCount: decrement old owner, increment new owner
-        if let Ok(old_bytes) = hex::decode(&old_owner_hex) {
-            if old_bytes.len() == 20 {
-                let mut old_id = [0u8; 20];
-                old_id.copy_from_slice(&old_bytes);
-                decrement_owner_count(&old_id, sandbox);
+        if let Some(drops) = offer.amount.as_str().and_then(|s| s.parse::<u64>().ok()) {
+            if drops > 0 {
+                pay_xrp_with_transfer_fee(sandbox, &buyer, &seller, &offer.nft_id, drops);
             }
         }
-        increment_owner_count(&new_owner, sandbox);
-
-        // Delete the offer
-        sandbox.delete(offer_key);
-        decrement_owner_count(&offer_owner, sandbox);
-
+        // IOU-priced offers: value movement over trust lines is not modeled
+        // yet — the token/offer mutations below still land on the right keys.
+        let moved = transfer_token(sandbox, &seller, &buyer, &offer.nft_id);
+        if moved != TxResult::Success {
+            return moved;
+        }
+        delete_offer(sandbox, &offer);
         TxResult::Success
+    }
+}
+
+/// Credit the seller with `drops`, carving the transfer fee for the issuer.
+fn pay_settle_seller(sandbox: &mut Sandbox, seller: &[u8; 20], nft_id: &Hash256, drops: u64) {
+    let fee_units = u16::from_be_bytes([nft_id.0[2], nft_id.0[3]]) as u128;
+    let issuer = nftpage::issuer_of(nft_id);
+    let mut to_issuer = 0u128;
+    if fee_units > 0 && issuer != *seller {
+        to_issuer = (drops as u128) * fee_units / 100_000;
+    }
+    adjust_xrp(sandbox, seller, drops as i128 - to_issuer as i128);
+    if to_issuer > 0 {
+        adjust_xrp(sandbox, &issuer, to_issuer as i128);
     }
 }
 
@@ -483,7 +523,6 @@ impl Transactor for NFTokenAcceptOfferTransactor {
 // NFTokenCancelOffer
 // ---------------------------------------------------------------------------
 
-/// NFTokenCancelOffer transactor — cancel (delete) one or more NFT offers.
 pub struct NFTokenCancelOfferTransactor;
 
 impl Transactor for NFTokenCancelOfferTransactor {
@@ -494,7 +533,6 @@ impl Transactor for NFTokenCancelOfferTransactor {
         if tx.fee == 0 {
             return TxResult::BadFee;
         }
-        // NFTokenOffers array is required
         if tx.fields.get("NFTokenOffers").is_none() {
             return TxResult::Malformed;
         }
@@ -514,42 +552,74 @@ impl Transactor for NFTokenCancelOfferTransactor {
             Some(arr) => arr.clone(),
             None => return TxResult::Malformed,
         };
-
+        // NFTokenOffers entries are ledger indexes (Hash256), and the canceler
+        // need not own them (owner, destination, or expiry all authorize) —
+        // the reserve refund lands on each OFFER's owner.
         for offer_ref in &offers {
-            let offer_owner = match offer_ref.get("Account").and_then(|v| decode_account_id(v)) {
-                Some(id) => id,
-                None => continue, // skip malformed entries
-            };
-            let offer_seq = match offer_ref.get("Sequence").and_then(|v| v.as_u64()) {
-                Some(s) => s as u32,
-                None => continue,
-            };
+            let Some(key) = hash256_from(offer_ref) else { continue };
+            let Some(offer) = read_offer(sandbox, key) else { continue };
+            delete_offer(sandbox, &offer);
+        }
+        TxResult::Success
+    }
+}
 
-            let offer_key = nft_offer_key(&offer_owner, offer_seq);
+// ---------------------------------------------------------------------------
+// NFTokenModify (XLS-46, tt 61)
+// ---------------------------------------------------------------------------
 
-            if sandbox.exists(&offer_key) {
-                // Verify the sender has permission to cancel:
-                // - Owner of the offer, OR
-                // - The offer has expired, OR
-                // - The NFToken's owner (for sell offers)
-                // Simplified: only the offer owner can cancel.
-                if let Some(data) = sandbox.read(&offer_key) {
-                    if let Ok(offer) = serde_json::from_slice::<serde_json::Value>(&data) {
-                        let owner_hex = offer["Owner"].as_str().unwrap_or("");
-                        let sender_hex = hex::encode(tx.account);
-                        if owner_hex != sender_hex {
-                            // In full rippled, other parties can cancel expired offers.
-                            // Simplified: skip offers we don't own.
-                            continue;
+pub struct NFTokenModifyTransactor;
+
+impl Transactor for NFTokenModifyTransactor {
+    fn preflight(&self, tx: &TxFields) -> TxResult {
+        if tx.tx_type != "NFTokenModify" {
+            return TxResult::Malformed;
+        }
+        if tx.fee == 0 {
+            return TxResult::BadFee;
+        }
+        if tx.fields.get("NFTokenID").is_none() {
+            return TxResult::Malformed;
+        }
+        TxResult::Success
+    }
+
+    fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        let acct_key = keylet::account_root_key(&tx.account);
+        if !sandbox.exists(&acct_key) {
+            return TxResult::NoAccount;
+        }
+        TxResult::Success
+    }
+
+    fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        let Some(id) = tx.fields.get("NFTokenID").and_then(hash256_from) else {
+            return TxResult::Malformed;
+        };
+        let owner = tx
+            .fields
+            .get("Owner")
+            .and_then(decode_account_id)
+            .unwrap_or(tx.account);
+
+        let Some((page_key, mut page)) = nftpage::locate_token(sandbox, &owner, &id) else {
+            return TxResult::NoEntry;
+        };
+        let id_hex = hex::encode_upper(id.0);
+        if let Some(arr) = page.get_mut("NFTokens").and_then(|v| v.as_array_mut()) {
+            for e in arr.iter_mut() {
+                if e["NFToken"]["NFTokenID"].as_str().unwrap_or("").eq_ignore_ascii_case(&id_hex) {
+                    match tx.fields.get("URI") {
+                        Some(uri) => e["NFToken"]["URI"] = uri.clone(),
+                        None => {
+                            e["NFToken"].as_object_mut().map(|o| o.remove("URI"));
                         }
                     }
+                    break;
                 }
-
-                sandbox.delete(offer_key);
-                decrement_owner_count(&offer_owner, sandbox);
             }
         }
-
+        sandbox.write(page_key, serde_json::to_vec(&page).unwrap_or_default());
         TxResult::Success
     }
 }
@@ -558,9 +628,7 @@ impl Transactor for NFTokenCancelOfferTransactor {
 mod tests {
     use super::*;
     use crate::ledger::header::LedgerHeader;
-    use crate::ledger::sandbox::Sandbox;
     use crate::ledger::state::LedgerState;
-    use xrpl_core::types::Hash256;
 
     fn make_state(accounts: &[([u8; 20], u64)]) -> LedgerState {
         let header = LedgerHeader {
@@ -580,268 +648,164 @@ mod tests {
                 "LedgerEntryType": "AccountRoot",
                 "Account": hex::encode(id),
                 "Balance": balance.to_string(),
-                "Sequence": 1,
+                "Sequence": 7,
                 "OwnerCount": 0,
+                "Flags": 0,
             });
-            let key = keylet::account_root_key(id);
-            state.state_map.insert(key, serde_json::to_vec(&acct).unwrap()).unwrap();
+            state.state_map.insert(
+                keylet::account_root_key(id),
+                serde_json::to_vec(&acct).unwrap(),
+            );
         }
         state
     }
 
-    fn read_owner_count(sandbox: &Sandbox, id: &[u8; 20]) -> u64 {
-        let key = keylet::account_root_key(id);
-        let data = sandbox.read(&key).expect("account not found");
-        let v: serde_json::Value = serde_json::from_slice(&data).unwrap();
-        v["OwnerCount"].as_u64().unwrap_or(0)
+    fn mint_tx(account: [u8; 20], taxon: u32) -> TxFields {
+        TxFields {
+            account,
+            tx_type: "NFTokenMint".into(),
+            fee: 10,
+            sequence: 7,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({ "NFTokenTaxon": taxon, "Flags": 8 }),
+        }
+    }
+
+    fn page_tokens(sb: &Sandbox, owner: &[u8; 20]) -> Vec<String> {
+        sb.read(&nftpage::max_page_key(owner))
+            .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+            .and_then(|p| {
+                p["NFTokens"].as_array().map(|a| {
+                    a.iter()
+                        .filter_map(|e| e["NFToken"]["NFTokenID"].as_str().map(str::to_string))
+                        .collect()
+                })
+            })
+            .unwrap_or_default()
     }
 
     #[test]
-    fn mint_creates_nftoken() {
-        let alice = [0x01u8; 20];
-        let state = make_state(&[(alice, 50_000_000)]);
-
-        let mut sandbox = Sandbox::new(&state);
-        let tx = TxFields {
-            account: alice,
-            tx_type: "NFTokenMint".to_string(),
-            fee: 12,
-            sequence: 1,
-            ticket_seq: None,
-            last_ledger_seq: None,
-            fields: serde_json::json!({
-                "NFTokenTaxon": 0,
-                "URI": "ipfs://abc123",
-            }),
-        };
-
-        assert_eq!(NFTokenMintTransactor.preflight(&tx), TxResult::Success);
-        assert_eq!(NFTokenMintTransactor.preclaim(&tx, &sandbox), TxResult::Success);
-        assert_eq!(NFTokenMintTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
-
-        // Token should exist
-        let token_key = nftoken_object_key(&alice, 0, 1);
-        assert!(sandbox.exists(&token_key));
-        assert_eq!(read_owner_count(&sandbox, &alice), 1);
+    fn mint_places_token_on_max_page() {
+        let minter = [0x11u8; 20];
+        let state = make_state(&[(minter, 1_000_000_000)]);
+        let mut sb = Sandbox::new(&state);
+        let tr = NFTokenMintTransactor;
+        assert_eq!(tr.do_apply(&mint_tx(minter, 5), &mut sb), TxResult::Success);
+        let toks = page_tokens(&sb, &minter);
+        assert_eq!(toks.len(), 1);
+        // Issuer bytes 4..24 of the id are the minter.
+        assert_eq!(&toks[0][8..48], hex::encode_upper(minter).as_str());
+        let acct: serde_json::Value =
+            serde_json::from_slice(&sb.read(&keylet::account_root_key(&minter)).unwrap()).unwrap();
+        assert_eq!(acct["MintedNFTokens"], 1);
+        assert_eq!(acct["OwnerCount"], 1); // the new page
     }
 
     #[test]
-    fn mint_preflight_rejects_missing_taxon() {
-        let alice = [0x01u8; 20];
-        let tx = TxFields {
-            account: alice,
-            tx_type: "NFTokenMint".to_string(),
+    fn accept_sell_offer_moves_token_and_funds() {
+        let seller = [0x21u8; 20];
+        let buyer = [0x22u8; 20];
+        let state = make_state(&[(seller, 1_000_000_000), (buyer, 1_000_000_000)]);
+        let mut sb = Sandbox::new(&state);
+
+        // Mint to the seller, then hand-build a sell offer SLE for 500 drops.
+        NFTokenMintTransactor.do_apply(&mint_tx(seller, 1), &mut sb);
+        let id_hex = page_tokens(&sb, &seller)[0].clone();
+        let offer_key = keylet::nft_offer_key(&seller, 99);
+        let offer = serde_json::json!({
+            "LedgerEntryType": "NFTokenOffer",
+            "Owner": hex::encode(seller),
+            "NFTokenID": id_hex,
+            "Amount": "500",
+            "Flags": 1,
+        });
+        sb.write(offer_key, serde_json::to_vec(&offer).unwrap());
+
+        let accept = TxFields {
+            account: buyer,
+            tx_type: "NFTokenAcceptOffer".into(),
             fee: 12,
-            sequence: 1,
+            sequence: 7,
             ticket_seq: None,
             last_ledger_seq: None,
-            fields: serde_json::json!({}),
+            fields: serde_json::json!({
+                "NFTokenSellOffer": hex::encode_upper(offer_key.0),
+            }),
         };
-        assert_eq!(NFTokenMintTransactor.preflight(&tx), TxResult::Malformed);
+        assert_eq!(
+            NFTokenAcceptOfferTransactor.do_apply(&accept, &mut sb),
+            TxResult::Success
+        );
+        assert!(page_tokens(&sb, &seller).is_empty());
+        assert_eq!(page_tokens(&sb, &buyer).len(), 1);
+        assert!(sb.read(&offer_key).is_none());
+        let sacct: serde_json::Value =
+            serde_json::from_slice(&sb.read(&keylet::account_root_key(&seller)).unwrap()).unwrap();
+        assert_eq!(sacct["Balance"], "1000000500");
     }
 
     #[test]
-    fn burn_deletes_nftoken() {
-        let alice = [0x01u8; 20];
-        let state = make_state(&[(alice, 50_000_000)]);
+    fn cancel_offer_by_index_refunds_owner_reserve() {
+        let owner = [0x31u8; 20];
+        let canceler = [0x32u8; 20];
+        let state = make_state(&[(owner, 1_000_000_000), (canceler, 1_000_000_000)]);
+        let mut sb = Sandbox::new(&state);
+        let offer_key = keylet::nft_offer_key(&owner, 5);
+        let offer = serde_json::json!({
+            "LedgerEntryType": "NFTokenOffer",
+            "Owner": hex::encode(owner),
+            "NFTokenID": hex::encode_upper([0xABu8; 32]),
+            "Amount": "1",
+            "Flags": 1,
+        });
+        sb.write(offer_key, serde_json::to_vec(&offer).unwrap());
+        increment_owner_count(&owner, &mut sb);
 
-        let mut sandbox = Sandbox::new(&state);
-
-        // First mint
-        let mint_tx = TxFields {
-            account: alice,
-            tx_type: "NFTokenMint".to_string(),
-            fee: 12,
-            sequence: 1,
-            ticket_seq: None,
-            last_ledger_seq: None,
-            fields: serde_json::json!({"NFTokenTaxon": 42}),
-        };
-        NFTokenMintTransactor.do_apply(&mint_tx, &mut sandbox);
-        assert_eq!(read_owner_count(&sandbox, &alice), 1);
-
-        // Then burn
-        let burn_tx = TxFields {
-            account: alice,
-            tx_type: "NFTokenBurn".to_string(),
-            fee: 12,
-            sequence: 2,
+        let cancel = TxFields {
+            account: canceler,
+            tx_type: "NFTokenCancelOffer".into(),
+            fee: 30,
+            sequence: 7,
             ticket_seq: None,
             last_ledger_seq: None,
             fields: serde_json::json!({
-                "NFTokenID": {"Taxon": 42, "Sequence": 1},
+                "NFTokenOffers": [hex::encode_upper(offer_key.0)],
             }),
         };
-
-        assert_eq!(NFTokenBurnTransactor.preflight(&burn_tx), TxResult::Success);
-        assert_eq!(NFTokenBurnTransactor.do_apply(&burn_tx, &mut sandbox), TxResult::Success);
-
-        let token_key = nftoken_object_key(&alice, 42, 1);
-        assert!(!sandbox.exists(&token_key));
-        assert_eq!(read_owner_count(&sandbox, &alice), 0);
+        assert_eq!(
+            NFTokenCancelOfferTransactor.do_apply(&cancel, &mut sb),
+            TxResult::Success
+        );
+        assert!(sb.read(&offer_key).is_none());
+        let oacct: serde_json::Value =
+            serde_json::from_slice(&sb.read(&keylet::account_root_key(&owner)).unwrap()).unwrap();
+        assert_eq!(oacct["OwnerCount"], 0);
     }
 
     #[test]
-    fn burn_nonexistent_token_fails() {
-        let alice = [0x01u8; 20];
-        let state = make_state(&[(alice, 50_000_000)]);
+    fn modify_updates_uri_in_place() {
+        let owner = [0x41u8; 20];
+        let state = make_state(&[(owner, 1_000_000_000)]);
+        let mut sb = Sandbox::new(&state);
+        NFTokenMintTransactor.do_apply(&mint_tx(owner, 2), &mut sb);
+        let id_hex = page_tokens(&sb, &owner)[0].clone();
 
-        let mut sandbox = Sandbox::new(&state);
-        let tx = TxFields {
-            account: alice,
-            tx_type: "NFTokenBurn".to_string(),
-            fee: 12,
-            sequence: 1,
+        let modify = TxFields {
+            account: owner,
+            tx_type: "NFTokenModify".into(),
+            fee: 15,
+            sequence: 8,
             ticket_seq: None,
             last_ledger_seq: None,
-            fields: serde_json::json!({
-                "NFTokenID": {"Taxon": 99, "Sequence": 1},
-            }),
+            fields: serde_json::json!({ "NFTokenID": id_hex, "URI": "697066733A2F2F78" }),
         };
-        assert_eq!(NFTokenBurnTransactor.do_apply(&tx, &mut sandbox), TxResult::NoEntry);
-    }
-
-    #[test]
-    fn create_offer_and_cancel() {
-        let alice = [0x01u8; 20];
-        let state = make_state(&[(alice, 50_000_000)]);
-
-        let mut sandbox = Sandbox::new(&state);
-
-        // Create offer
-        let create_tx = TxFields {
-            account: alice,
-            tx_type: "NFTokenCreateOffer".to_string(),
-            fee: 12,
-            sequence: 5,
-            ticket_seq: None,
-            last_ledger_seq: None,
-            fields: serde_json::json!({
-                "NFTokenID": {"Taxon": 0, "Sequence": 1},
-                "Amount": "10000000",
-                "Flags": 1, // tfSellNFToken
-            }),
-        };
-
-        assert_eq!(NFTokenCreateOfferTransactor.preflight(&create_tx), TxResult::Success);
-        assert_eq!(NFTokenCreateOfferTransactor.do_apply(&create_tx, &mut sandbox), TxResult::Success);
-
-        let offer_key = nft_offer_key(&alice, 5);
-        assert!(sandbox.exists(&offer_key));
-        assert_eq!(read_owner_count(&sandbox, &alice), 1);
-
-        // Cancel offer
-        let cancel_tx = TxFields {
-            account: alice,
-            tx_type: "NFTokenCancelOffer".to_string(),
-            fee: 12,
-            sequence: 6,
-            ticket_seq: None,
-            last_ledger_seq: None,
-            fields: serde_json::json!({
-                "NFTokenOffers": [
-                    {"Account": hex::encode(alice), "Sequence": 5}
-                ]
-            }),
-        };
-
-        assert_eq!(NFTokenCancelOfferTransactor.preflight(&cancel_tx), TxResult::Success);
-        assert_eq!(NFTokenCancelOfferTransactor.do_apply(&cancel_tx, &mut sandbox), TxResult::Success);
-
-        assert!(!sandbox.exists(&offer_key));
-        assert_eq!(read_owner_count(&sandbox, &alice), 0);
-    }
-
-    #[test]
-    fn accept_sell_offer_transfers_token() {
-        let alice = [0x01u8; 20];
-        let bob = [0x02u8; 20];
-        let state = make_state(&[(alice, 50_000_000), (bob, 50_000_000)]);
-
-        let mut sandbox = Sandbox::new(&state);
-
-        // Alice mints a token
-        let mint_tx = TxFields {
-            account: alice,
-            tx_type: "NFTokenMint".to_string(),
-            fee: 12,
-            sequence: 1,
-            ticket_seq: None,
-            last_ledger_seq: None,
-            fields: serde_json::json!({"NFTokenTaxon": 10}),
-        };
-        NFTokenMintTransactor.do_apply(&mint_tx, &mut sandbox);
-
-        // Alice creates a sell offer
-        let offer_tx = TxFields {
-            account: alice,
-            tx_type: "NFTokenCreateOffer".to_string(),
-            fee: 12,
-            sequence: 2,
-            ticket_seq: None,
-            last_ledger_seq: None,
-            fields: serde_json::json!({
-                "NFTokenID": {"Owner": hex::encode(alice), "Taxon": 10, "Sequence": 1},
-                "Amount": "5000000",
-                "Flags": 1, // tfSellNFToken
-            }),
-        };
-        NFTokenCreateOfferTransactor.do_apply(&offer_tx, &mut sandbox);
-
-        // Bob accepts the sell offer
-        let accept_tx = TxFields {
-            account: bob,
-            tx_type: "NFTokenAcceptOffer".to_string(),
-            fee: 12,
-            sequence: 1,
-            ticket_seq: None,
-            last_ledger_seq: None,
-            fields: serde_json::json!({
-                "NFTokenSellOffer": {
-                    "Account": hex::encode(alice),
-                    "Sequence": 2
-                }
-            }),
-        };
-
-        assert_eq!(NFTokenAcceptOfferTransactor.preflight(&accept_tx), TxResult::Success);
-        assert_eq!(NFTokenAcceptOfferTransactor.preclaim(&accept_tx, &sandbox), TxResult::Success);
-        assert_eq!(NFTokenAcceptOfferTransactor.do_apply(&accept_tx, &mut sandbox), TxResult::Success);
-
-        // Token should now be at Bob's key (recomputed for new owner)
-        let old_token_key = nftoken_object_key(&alice, 10, 1);
-        assert!(!sandbox.exists(&old_token_key), "old key should be deleted after transfer");
-
-        let new_token_key = nftoken_object_key(&bob, 10, 1);
-        let token_data = sandbox.read(&new_token_key).unwrap();
-        let token: serde_json::Value = serde_json::from_slice(&token_data).unwrap();
-        assert_eq!(token["Owner"].as_str().unwrap(), hex::encode(bob));
-
-        // Offer should be deleted
-        let offer_key = nft_offer_key(&alice, 2);
-        assert!(!sandbox.exists(&offer_key));
-    }
-
-    #[test]
-    fn accept_nonexistent_offer_fails() {
-        let bob = [0x02u8; 20];
-        let state = make_state(&[(bob, 50_000_000)]);
-
-        let mut sandbox = Sandbox::new(&state);
-        let tx = TxFields {
-            account: bob,
-            tx_type: "NFTokenAcceptOffer".to_string(),
-            fee: 12,
-            sequence: 1,
-            ticket_seq: None,
-            last_ledger_seq: None,
-            fields: serde_json::json!({
-                "NFTokenSellOffer": {
-                    "Account": hex::encode([0xFFu8; 20]),
-                    "Sequence": 99
-                }
-            }),
-        };
-        assert_eq!(NFTokenAcceptOfferTransactor.do_apply(&tx, &mut sandbox), TxResult::NoEntry);
+        assert_eq!(
+            NFTokenModifyTransactor.do_apply(&modify, &mut sb),
+            TxResult::Success
+        );
+        let page: serde_json::Value =
+            serde_json::from_slice(&sb.read(&nftpage::max_page_key(&owner)).unwrap()).unwrap();
+        assert_eq!(page["NFTokens"][0]["NFToken"]["URI"], "697066733A2F2F78");
     }
 }
