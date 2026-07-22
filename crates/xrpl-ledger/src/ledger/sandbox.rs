@@ -108,7 +108,17 @@ impl<'a> Sandbox<'a> {
     }
 
     pub fn delete(&mut self, key: Hash256) {
-        self.modifications.insert(key, SandboxEntry::Deleted);
+        // An entry CREATED in this same apply and then deleted nets to
+        // nothing — rippled's meta never carries a create-then-delete node
+        // (e.g. an intermediate trust line auto-created and fully consumed in
+        // one payment strand). Only a base-existing entry yields a Deleted.
+        if matches!(self.modifications.get(&key), Some(SandboxEntry::Created(_)))
+            && self.base.state_map.lookup(&key).is_none()
+        {
+            self.modifications.remove(&key);
+        } else {
+            self.modifications.insert(key, SandboxEntry::Deleted);
+        }
     }
 
     /// Check if a key exists (in modifications or base, and not deleted).

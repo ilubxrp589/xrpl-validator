@@ -772,6 +772,10 @@ pub(crate) fn consume(
     if take_in.0 == 0 || take_out.0 == 0 {
         return (rem_pays, rem_gets, false);
     }
+    if std::env::var("DX_AMM").is_ok() {
+        eprintln!("DX_AMM CONSUMED acct={} take_in={take_in:?} take_out={take_out:?} spot={spot:x} thr={threshold:x} clob={clob:?}",
+            hex::encode(amm.account));
+    }
     ox::move_leg(sandbox, taker, &amm.account, gets_leg, take_in);
     ox::move_leg(sandbox, &amm.account, beneficiary, pays_leg, take_out);
     (

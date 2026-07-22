@@ -272,6 +272,26 @@ impl Transactor for NFTokenCreateOfferTransactor {
         if !sandbox.exists(&acct_key) {
             return TxResult::NoAccount;
         }
+        // rippled NFTokenCreateOffer::preclaim — the token must EXIST in the
+        // relevant owner's pages, else tecNO_ENTRY. Owner is the offer's
+        // seller: the tx account for a sell offer (tfSellNFToken), the sfOwner
+        // field for a buy offer. (#105757083 1B7B0C8A: a stale buy offer for
+        // a token no longer on its owner.)
+        let Some(id) = tx.fields.get("NFTokenID").and_then(hash256_from) else {
+            return TxResult::Malformed;
+        };
+        let is_sell = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & 0x0000_0001 != 0;
+        let token_owner = if is_sell {
+            tx.account
+        } else {
+            match tx.fields.get("Owner").and_then(decode_account_id) {
+                Some(o) => o,
+                None => return TxResult::Malformed,
+            }
+        };
+        if nftpage::locate_token(sandbox, &token_owner, &id).is_none() {
+            return TxResult::NoEntry;
+        }
         TxResult::Success
     }
 

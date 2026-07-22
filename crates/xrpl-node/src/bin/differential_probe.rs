@@ -230,7 +230,9 @@ fn load_nft_pages_for_tx(state: &mut LedgerState, url: &str, txj: &Value, ledger
                 load_nft_pages(state, url, i, ledger_index);
             }
         }
-        Some("NFTokenModify") | Some("NFTokenBurn") => {
+        Some("NFTokenModify") | Some("NFTokenBurn") | Some("NFTokenCreateOffer") => {
+            // The seller (sfOwner, or the account for a sell offer) must own
+            // the token — preclaim walks their pages for the existence check.
             let owner = txj.get("Owner").and_then(|v| v.as_str())
                 .or_else(|| txj["Account"].as_str());
             if let Some(o) = owner {
