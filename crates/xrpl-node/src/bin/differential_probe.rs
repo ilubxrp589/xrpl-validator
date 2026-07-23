@@ -665,6 +665,26 @@ fn load_amm_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_ind
         let k = hex::encode_upper(keylet::owner_dir_key(&aid).0);
         load_object(state, url, &k, ledger_index);
     }
+    // The AMM ledger object itself — needed so preclaim can read the pool and
+    // run the reserve/funds check (else a Deposit/Withdraw whose pool no other
+    // tx in the ledger touched falls through to a phantom tecNO_ENTRY, #105783986).
+    if let Some(idx) = res["node"]["index"].as_str() {
+        load_object(state, url, idx, ledger_index);
+    }
+    // The depositor's LPToken trust line, so the reserve check knows whether
+    // this is a first-time deposit (ownerCountAdj = 1) or a repeat LP (0).
+    if let (Some(dep), Some(amm_id), Some(lp_cur)) = (
+        txj["Account"].as_str().and_then(decode_address),
+        decode_address(amm_acct),
+        res["node"]["LPTokenBalance"]["currency"].as_str(),
+    ) {
+        if let Ok(cb) = hex::decode(lp_cur) {
+            if let Ok(cur) = <[u8; 20]>::try_from(cb.as_slice()) {
+                let lk = hex::encode_upper(keylet::ripple_state_key(&dep, &amm_id, &cur).0);
+                load_object(state, url, &lk, ledger_index);
+            }
+        }
+    }
 }
 
 /// Recursively collect every `"issuer": "r…"` value in a transaction.

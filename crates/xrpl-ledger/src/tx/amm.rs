@@ -307,6 +307,35 @@ impl Transactor for AMMDepositTransactor {
         let Some((amm_key, amm_acct, lp_leg)) = amm_ctx(tx, sandbox) else {
             return TxResult::NoEntry;
         };
+
+        // rippled AMMDeposit apply-side reserve guard (AMMDeposit.cpp): a
+        // depositor who holds ZERO LPTokens is about to open (or fund) an
+        // LPToken trust line, so it must keep XRP above accountReserve(oc + 1).
+        // Note this keys off the LP *balance*, not line existence — a line that
+        // already exists with a zero balance (a prior full withdraw) still
+        // counts as holding none, so the +1 reserve still applies (#105770848,
+        // #105783986: bal 2529949 <= reserve(8) 2600000 → tecINSUF_RESERVE_LINE
+        // even though the zero-balance LP line is present). Runs in do_apply on
+        // the post-fee balance, exactly as rippled does; the claimed tec rolls
+        // back to just the fee mutation (net_muts=1).
+        let lp_line = keylet::ripple_state_key(&tx.account, &amm_acct, &lp_leg.cur);
+        let lp_balance_zero = match sandbox.read(&lp_line) {
+            None => true,
+            Some(d) => serde_json::from_slice::<serde_json::Value>(&d)
+                .ok()
+                .and_then(|l| l["Balance"]["value"].as_str().map(|s| s == "0" || s == "-0"))
+                .unwrap_or(true),
+        };
+        if lp_balance_zero {
+            if let Some(acct) = ox::json_at(sandbox, &keylet::account_root_key(&tx.account)) {
+                let oc = acct["OwnerCount"].as_u64().unwrap_or(0);
+                let bal = acct["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                if bal <= crate::ledger::fees::account_reserve(sandbox, oc + 1) {
+                    return TxResult::InsufReserveLine;
+                }
+            }
+        }
+
         // Move the deposited side(s) depositor → AMM account (XRP or IOU
         // lines — move_leg handles both).
         for f in ["Amount", "Amount2"] {
@@ -787,5 +816,76 @@ mod tests {
         let data = sandbox.read(&key).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&data).unwrap();
         assert_eq!(v["Balance"].as_str().unwrap(), "65000000");
+    }
+
+    #[test]
+    fn amm_deposit_reserve_guard() {
+        // rippled AMMDeposit apply-side reserve check (#105770848/#105783986):
+        // a depositor holding ZERO LPTokens must keep XRP above
+        // accountReserve(ownerCount + 1) or the deposit fails
+        // tecINSUF_RESERVE_LINE — the LPToken line it would open costs reserve.
+        let alice = [0x01u8; 20];
+        let usd_issuer = [0x02u8; 20];
+        let state = make_state(&alice, 100_000_000);
+        let mut sandbox = Sandbox::new(&state);
+
+        // Alice funds an XRP/USD pool; she ends up holding the LPTokens.
+        let create_tx = TxFields {
+            account: alice,
+            tx_type: "AMMCreate".to_string(),
+            fee: 12,
+            sequence: 1,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Amount": "30000000",
+                "Amount2": {"currency": "USD", "issuer": hex::encode(usd_issuer), "value": "100"},
+                "TradingFee": 500,
+            }),
+        };
+        assert_eq!(AMMCreateTransactor.do_apply(&create_tx, &mut sandbox), TxResult::Success);
+
+        let deposit = |acct: [u8; 20]| TxFields {
+            account: acct,
+            tx_type: "AMMDeposit".to_string(),
+            fee: 12,
+            sequence: 1,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Asset": {"currency": "XRP"},
+                "Asset2": {"currency": "USD", "issuer": hex::encode(usd_issuer)},
+                "Amount": "500000",
+            }),
+        };
+        let put_acct = |sb: &mut Sandbox, id: &[u8; 20], bal: &str| {
+            sb.write(
+                keylet::account_root_key(id),
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "AccountRoot",
+                    "Account": hex::encode(id),
+                    "Balance": bal,
+                    "Sequence": 1,
+                    "OwnerCount": 0,
+                }))
+                .unwrap(),
+            );
+        };
+
+        // Broke depositor, no LPTokens: 1 XRP <= accountReserve(1) = 1.2 XRP → fail.
+        let broke = [0x03u8; 20];
+        put_acct(&mut sandbox, &broke, "1000000");
+        assert_eq!(
+            AMMDepositTransactor.do_apply(&deposit(broke), &mut sandbox),
+            TxResult::InsufReserveLine
+        );
+
+        // Funded depositor, no LPTokens: well above reserve → deposit proceeds.
+        let rich = [0x04u8; 20];
+        put_acct(&mut sandbox, &rich, "100000000");
+        assert_eq!(
+            AMMDepositTransactor.do_apply(&deposit(rich), &mut sandbox),
+            TxResult::Success
+        );
     }
 }
