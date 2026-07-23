@@ -59,6 +59,15 @@ pub enum TxResult {
     DstTagNeeded,
     /// Directory is full (e.g. > 250 outstanding tickets).
     DirFull,
+    /// Creating the owned object(s) would breach the account's owner reserve.
+    InsufficientReserve,
+    /// Modifying a trust line into a reserved state, but the owner can't afford
+    /// the incremental reserve.
+    InsufReserveLine,
+    /// Creating a trust line, but the owner can't afford the incremental reserve.
+    NoLineInsufReserve,
+    /// Setting a non-existent trust line to defaults — nothing to do.
+    NoLineRedundant,
 
     // tem — malformed, not applied at all
     /// Transaction is malformed.
@@ -102,6 +111,10 @@ impl TxResult {
             | TxResult::PathPartial
             | TxResult::DstTagNeeded
             | TxResult::DirFull
+            | TxResult::InsufficientReserve
+            | TxResult::InsufReserveLine
+            | TxResult::NoLineInsufReserve
+            | TxResult::NoLineRedundant
             | TxResult::Unsupported => true,
             // tem/tef: not claimed
             _ => false,
@@ -131,6 +144,10 @@ impl TxResult {
             TxResult::PathPartial => "tecPATH_PARTIAL",
             TxResult::DstTagNeeded => "tecDST_TAG_NEEDED",
             TxResult::DirFull => "tecDIR_FULL",
+            TxResult::InsufficientReserve => "tecINSUFFICIENT_RESERVE",
+            TxResult::InsufReserveLine => "tecINSUF_RESERVE_LINE",
+            TxResult::NoLineInsufReserve => "tecNO_LINE_INSUF_RESERVE",
+            TxResult::NoLineRedundant => "tecNO_LINE_REDUNDANT",
             TxResult::Malformed => "temMALFORMED",
             TxResult::BadFee => "temBAD_FEE",
             TxResult::BadAmount => "temBAD_AMOUNT",

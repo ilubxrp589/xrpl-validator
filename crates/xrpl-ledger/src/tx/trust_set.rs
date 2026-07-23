@@ -42,6 +42,106 @@ impl TrustSetTransactor {
         Some((currency, issuer))
     }
 
+    /// Whether the sender's side of the (post-tx) trust line holds an
+    /// *interest* — a non-default flag/quality/limit/balance that obliges the
+    /// sender to reserve for the line. Faithful port of rippled SetTrust's
+    /// `bLowReserveSet`/`bHighReserveSet` for the sender's side only (the sole
+    /// side whose reserve rippled can newly charge, and thus the only side that
+    /// drives `bReserveIncrease`). Reserve enforcement keys off THIS, not off a
+    /// naive "limit != 0" — e.g. #105765230 clears NoRipple with limit 0 yet
+    /// still triggers `tecINSUF_RESERVE_LINE` because a cleared NoRipple differs
+    /// from a non-DefaultRipple account's default.
+    ///
+    /// Returns `(reserve_set, currently_reserved)` for the sender's side.
+    fn sender_reserve_state(
+        tx: &TxFields,
+        sandbox: &Sandbox,
+        line: &serde_json::Value,
+        issuer: &[u8; 20],
+    ) -> (bool, bool) {
+        const LSF_LOW_RESERVE: u64 = 0x0001_0000;
+        const LSF_HIGH_RESERVE: u64 = 0x0002_0000;
+        const LSF_LOW_NO_RIPPLE: u64 = 0x0010_0000;
+        const LSF_HIGH_NO_RIPPLE: u64 = 0x0020_0000;
+        const LSF_LOW_FREEZE: u64 = 0x0040_0000;
+        const LSF_HIGH_FREEZE: u64 = 0x0080_0000;
+        const LSF_DEFAULT_RIPPLE: u64 = 0x0080_0000; // AccountRoot flag
+        const TF_SET_NO_RIPPLE: u64 = 0x0002_0000;
+        const TF_CLEAR_NO_RIPPLE: u64 = 0x0004_0000;
+        const TF_SET_FREEZE: u64 = 0x0010_0000;
+        const TF_CLEAR_FREEZE: u64 = 0x0020_0000;
+        const QUALITY_ONE: u64 = 1_000_000_000;
+
+        let sender_low = &tx.account < issuer;
+        let (no_ripple_bit, freeze_bit, reserve_bit, q_in_field, q_out_field) = if sender_low {
+            (LSF_LOW_NO_RIPPLE, LSF_LOW_FREEZE, LSF_LOW_RESERVE, "LowQualityIn", "LowQualityOut")
+        } else {
+            (LSF_HIGH_NO_RIPPLE, LSF_HIGH_FREEZE, LSF_HIGH_RESERVE, "HighQualityIn", "HighQualityOut")
+        };
+
+        let flags_in = line["Flags"].as_u64().unwrap_or(0);
+        let txf = tx.fields.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0);
+
+        // Low-account balance sign (line Balance is stored low-perspective).
+        let bal = line["Balance"]["value"].as_str().unwrap_or("0");
+        let bal_zero = bal == "0" || bal == "-0";
+        let bal_neg = !bal_zero && bal.starts_with('-');
+        let bal_pos = !bal_zero && !bal_neg;
+        // Sender's balance is in-favor when the low-side balance leans their way.
+        let sender_balance_positive = if sender_low { bal_pos } else { bal_neg };
+        // "Cannot set noRipple on a negative balance" gate.
+        let sender_balance_nonneg = if sender_low { !bal_neg } else { !bal_pos };
+
+        // Post-tx NoRipple state for the sender's side.
+        let mut no_ripple_set = flags_in & no_ripple_bit != 0;
+        if txf & TF_SET_NO_RIPPLE != 0 && txf & TF_CLEAR_NO_RIPPLE == 0 {
+            if sender_balance_nonneg {
+                no_ripple_set = true;
+            }
+        } else if txf & TF_CLEAR_NO_RIPPLE != 0 && txf & TF_SET_NO_RIPPLE == 0 {
+            no_ripple_set = false;
+        }
+
+        // Post-tx freeze state (simple set/clear, matching do_apply).
+        let mut freeze_set = flags_in & freeze_bit != 0;
+        if txf & TF_SET_FREEZE != 0 && txf & TF_CLEAR_FREEZE == 0 {
+            freeze_set = true;
+        } else if txf & TF_CLEAR_FREEZE != 0 && txf & TF_SET_FREEZE == 0 {
+            freeze_set = false;
+        }
+
+        // Post-tx quality on the sender's side (tx value if setting, else line).
+        let norm_quality = |q: u64| if q == QUALITY_ONE { 0 } else { q };
+        let q_in = match tx.fields.get("QualityIn").and_then(|v| v.as_u64()) {
+            Some(q) => norm_quality(q),
+            None => norm_quality(line.get(q_in_field).and_then(|v| v.as_u64()).unwrap_or(0)),
+        };
+        let q_out = match tx.fields.get("QualityOut").and_then(|v| v.as_u64()) {
+            Some(q) => norm_quality(q),
+            None => norm_quality(line.get(q_out_field).and_then(|v| v.as_u64()).unwrap_or(0)),
+        };
+
+        // Sender's new limit (the tx sets the sender's side to LimitAmount).
+        let new_limit = tx.fields["LimitAmount"]["value"].as_str().unwrap_or("0");
+        let limit_nonzero = new_limit != "0";
+
+        // Sender account's DefaultRipple flag.
+        let sender_default_ripple = sandbox
+            .read(&keylet::account_root_key(&tx.account))
+            .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+            .map(|a| a["Flags"].as_u64().unwrap_or(0) & LSF_DEFAULT_RIPPLE != 0)
+            .unwrap_or(false);
+
+        let reserve_set = q_in != 0
+            || q_out != 0
+            || ((!no_ripple_set) != sender_default_ripple)
+            || freeze_set
+            || limit_nonzero
+            || sender_balance_positive;
+        let currently_reserved = flags_in & reserve_bit != 0;
+        (reserve_set, currently_reserved)
+    }
+
     /// Build the 20-byte currency code from a 3-char ISO code.
     fn currency_code(iso: &str) -> [u8; 20] {
         let mut code = [0u8; 20];
@@ -84,9 +184,68 @@ impl Transactor for TrustSetTransactor {
 
     fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
         let acct_key = keylet::account_root_key(&tx.account);
-        if !sandbox.exists(&acct_key) {
+        let Some(data) = sandbox.read(&acct_key) else {
             return TxResult::NoAccount;
+        };
+        let Ok(acct) = serde_json::from_slice::<serde_json::Value>(&data) else {
+            return TxResult::Malformed;
+        };
+
+        let Some((currency_str, issuer)) = Self::extract_limit_amount(tx) else {
+            return TxResult::Malformed;
+        };
+
+        // Owner reserve required to gain a trust line. rippled SetTrust:
+        // reserve is NOT enforced until the account owns >= 2 objects — the
+        // gateway-funding carve-out — otherwise accountReserve(ownerCount + 1).
+        let oc = acct["OwnerCount"].as_u64().unwrap_or(0);
+        let reserve_create = if oc < 2 {
+            0
+        } else {
+            crate::ledger::fees::account_reserve(sandbox, oc + 1)
+        };
+        // preclaim runs before apply_common deducts the fee → this IS
+        // rippled's preFeeBalance_.
+        let balance = acct["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+
+        let currency = Self::currency_code(currency_str);
+        let line_key = keylet::ripple_state_key(&tx.account, &issuer, &currency);
+
+        if let Some(line_data) = sandbox.read(&line_key) {
+            // Existing line: charge the sender only when this tx flips their
+            // side from unreserved to reserved (bReserveIncrease) and they
+            // cannot cover the incremental reserve → tecINSUF_RESERVE_LINE
+            // (#105765230, #105765676, #105779597, #105795073, #105796649).
+            if let Ok(line) = serde_json::from_slice::<serde_json::Value>(&line_data) {
+                let (reserve_set, currently_reserved) =
+                    Self::sender_reserve_state(tx, sandbox, &line, &issuer);
+                let reserve_increase = reserve_set && !currently_reserved;
+                if reserve_increase && balance < reserve_create {
+                    return TxResult::InsufReserveLine;
+                }
+            }
+        } else {
+            // New line. rippled orders these two checks: the redundant guard
+            // fires BEFORE the reserve guard, so replicate that order.
+            const QUALITY_ONE: u64 = 1_000_000_000;
+            const TF_SETF_AUTH: u64 = 0x0001_0000;
+            let txf = tx.fields.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0);
+            let limit_zero = tx.fields["LimitAmount"]["value"].as_str().unwrap_or("0") == "0";
+            let q_in = tx.fields.get("QualityIn").and_then(|v| v.as_u64());
+            let q_out = tx.fields.get("QualityOut").and_then(|v| v.as_u64());
+            let setting_q_in = matches!(q_in, Some(q) if q != 0 && q != QUALITY_ONE);
+            let setting_q_out = matches!(q_out, Some(q) if q != 0 && q != QUALITY_ONE);
+            let set_auth = txf & TF_SETF_AUTH != 0;
+            if limit_zero && !setting_q_in && !setting_q_out && !set_auth {
+                // Setting a non-existent line to defaults changes nothing
+                // (#105765676 DD72D291).
+                return TxResult::NoLineRedundant;
+            }
+            if balance < reserve_create {
+                return TxResult::NoLineInsufReserve;
+            }
         }
+
         TxResult::Success
     }
 

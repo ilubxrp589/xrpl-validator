@@ -47,8 +47,20 @@ impl Transactor for TicketCreateTransactor {
         };
         // An account may hold at most 250 outstanding tickets (tecDIR_FULL).
         let have = acct["TicketCount"].as_u64().unwrap_or(0);
-        if have + ticket_count(tx).unwrap_or(0) > 250 {
+        let count = ticket_count(tx).unwrap_or(0);
+        if have + count > 250 {
             return TxResult::DirFull;
+        }
+        // Each ticket is an owned object and costs an incremental owner reserve.
+        // rippled CreateTicket::doApply: preFeeBalance_ <
+        // accountReserve(ownerCount + ticketCount) → tecINSUFFICIENT_RESERVE.
+        // preclaim runs before apply_common deducts the fee, so the sandbox
+        // balance here IS preFeeBalance_ (#105762093 B03E3974, #105779059).
+        let balance = acct["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        let oc = acct["OwnerCount"].as_u64().unwrap_or(0);
+        let reserve = crate::ledger::fees::account_reserve(sandbox, oc + count);
+        if balance < reserve {
+            return TxResult::InsufficientReserve;
         }
         TxResult::Success
     }

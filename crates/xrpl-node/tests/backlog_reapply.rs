@@ -154,3 +154,20 @@ backlog_test!(l105284280_replays_with_full_parity, 105284280);
 // mainnet tesSUCCESS) — caught by the nightly parity scout minutes after the
 // ledger closed. Armed as a fixer mission same day.
 backlog_test!(l105663160_replays_with_full_parity, 105663160);
+
+// Scout find 2026-07-23: owner-reserve enforcement on object creation. The
+// native engine minted Tickets without checking the account could afford the
+// incremental owner reserve, so it returned tesSUCCESS where mainnet returned
+// tecINSUFFICIENT_RESERVE. Fixed by a FeeSettings-driven preclaim reserve guard
+// (rippled CreateTicket::doApply). #105762093 replays 6 such TicketCreates and
+// is fully FFI-parity clean.
+//
+// NOTE: the matching TrustSet-reserve fixtures (l105765230, l105765676) are
+// committed to tests/data/ and gated by the *native* differential corpus
+// (differential_probe), NOT here: the FFI/LayeredProvider backlog path has a
+// pre-existing seq-1 hydration gap on one unrelated NFTokenAcceptOffer in each
+// ledger (offer-index-only inputs need the two-stage owner resolve the backlog
+// provider doesn't do; ours=tecNO_PERMISSION vs net=tesSUCCESS — the
+// hydration-hunter's domain), so they cannot assert full FFI parity. The native
+// engine (with two-stage NFT prefetch) replays both at 0 divergence.
+backlog_test!(l105762093_replays_with_full_parity, 105762093);
