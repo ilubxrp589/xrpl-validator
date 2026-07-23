@@ -397,6 +397,20 @@ impl PaymentTransactor {
         let (Some(leg), Some(want)) = (ox::leg_of(amt_json), crate::ledger::keylet::amount_mant_exp(amt_json)) else {
             return TxResult::Malformed;
         };
+        // rippled delivers an IOU to the destination by rippling through the
+        // issuer, which credits the destination's EXISTING trust line — a
+        // payment never opens a trust line for the receiver. If the
+        // destination neither issues the currency nor already trusts the
+        // issuer, there is no line to credit and the strand is dry (#105797892
+        // 41D13D: dest holds no BXE line → mainnet tecPATH_DRY; we phantom-
+        // created the line and over-delivered). The sender's own line is
+        // handled by available() above; only the receiving side needs a line.
+        if dest != &leg.issuer {
+            let dest_line = keylet::ripple_state_key(dest, &leg.issuer, &leg.cur);
+            if !sandbox.exists(&dest_line) {
+                return TxResult::PathDry;
+            }
+        }
         let avail = if tx.account == leg.issuer {
             want // issuers mint their own IOU
         } else {
@@ -911,6 +925,69 @@ mod tests {
         )
         .unwrap();
         assert!(sandbox.exists(&keylet::ripple_state_key(&taker, &issuer, &cur)));
+    }
+
+    /// A direct IOU payment can only be delivered to a destination that
+    /// already trusts the issuer — rippled never opens the receiver's trust
+    /// line. No line ⇒ tecPATH_DRY, not a phantom-created line + delivery
+    /// (mainnet #105797892 41D13D: dest held no BXE line).
+    #[test]
+    fn direct_iou_payment_requires_destination_line() {
+        let sender = [0x01u8; 20];
+        let issuer = [0x02u8; 20];
+        let dest_noline = [0x03u8; 20];
+        let dest_trusts = [0x05u8; 20];
+        let mut state = make_state();
+        add_account(&mut state, &sender, 50_000_000, 1);
+        add_account(&mut state, &issuer, 50_000_000, 1);
+        add_account(&mut state, &dest_noline, 50_000_000, 1);
+        add_account(&mut state, &dest_trusts, 50_000_000, 1);
+
+        let cur = crate::tx::offer::amount_currency20(
+            &serde_json::json!({"currency": "USD", "issuer": hex::encode(issuer), "value": "1"}),
+        )
+        .unwrap();
+        // Insert a trust line `a`↔issuer with `a` holding +value USD.
+        let add_line = |state: &mut LedgerState, a: &[u8; 20], value: &str| {
+            let key = keylet::ripple_state_key(a, &issuer, &cur);
+            let (lo, hi) = if a < &issuer { (*a, issuer) } else { (issuer, *a) };
+            let low_bal = if a < &issuer { value.to_string() } else { format!("-{value}") };
+            let line = serde_json::json!({
+                "LedgerEntryType": "RippleState",
+                "Flags": 0x0001_0000u64,
+                "Balance": {"currency": hex::encode_upper(cur),
+                            "issuer": "0000000000000000000000000000000000000000",
+                            "value": low_bal},
+                "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000000"},
+                "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000000"},
+            });
+            state.state_map.insert(key, serde_json::to_vec(&line).unwrap()).unwrap();
+        };
+        // Sender holds 100 USD to spend; only dest_trusts has a USD line.
+        add_line(&mut state, &sender, "100");
+        add_line(&mut state, &dest_trusts, "0");
+
+        let pay = |dest: [u8; 20]| TxFields {
+            account: sender,
+            tx_type: "Payment".to_string(),
+            fee: 12,
+            sequence: 1,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Destination": hex::encode(dest),
+                "Amount": {"currency": "USD", "issuer": hex::encode(issuer), "value": "25"},
+            }),
+        };
+
+        // Destination without a USD line: dry, and no line phantom-created.
+        let mut sb = Sandbox::new(&state);
+        assert_eq!(PaymentTransactor.do_apply(&pay(dest_noline), &mut sb), TxResult::PathDry);
+        assert!(!sb.exists(&keylet::ripple_state_key(&dest_noline, &issuer, &cur)));
+
+        // Destination that already trusts the issuer: delivered.
+        let mut sb2 = Sandbox::new(&state);
+        assert_eq!(PaymentTransactor.do_apply(&pay(dest_trusts), &mut sb2), TxResult::Success);
     }
 
     /// Mainnet tx AAA6EB389D3A… (ledger 105035381): when the Destination IS
