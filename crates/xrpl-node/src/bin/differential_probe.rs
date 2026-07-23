@@ -1022,6 +1022,11 @@ fn run() -> i32 {
             continue;
         };
 
+        // Engine traces (DX_AMM, DX_BRIDGE) are emitted deep in the ledger
+        // crate with no tx context; this marks which tx they belong to.
+        if std::env::var("DX_AMM").is_ok() || std::env::var("DX_BRIDGE").is_ok() {
+            eprintln!("DX_TX {h} {tx_type}");
+        }
         let (our_ter, mods) = native_apply_one(&state, &txf);
         let our_mut: HashSet<(String, u8)> = native_mutset(&state, &mods)
             .into_iter()

@@ -803,6 +803,8 @@ fn settle_fill(
 /// the DIRECT book competes with the two-book XRP bridge; the better maker
 /// rate is consumed one offer (or one bridge slice) at a time. Engaged only
 /// when both bridge books have depth — otherwise the plain direct walk runs.
+/// Reaching here means two strands, i.e. rippled's `AMMContext::multiPath` is
+/// true, which is why the pool competes with Fibonacci slices below.
 #[allow(clippy::too_many_arguments)]
 fn cross_bridged(
     taker: &[u8; 20],
@@ -847,8 +849,10 @@ fn cross_bridged(
     let thr = (threshold != u64::MAX).then(|| rate_me(threshold));
     let (mut di, mut ai, mut bi) = (0usize, 0usize, 0usize);
     let mut crossed = 0u32;
-    // IOU↔IOU crossings are always multi-strand on mainnet, so the pool
-    // competes with FIB-sequence offers off its starting balances.
+    // Offer crossing is always multi-strand (direct + XRP bridge), so the pool
+    // competes with FIB-sequence offers off its starting balances. Single-
+    // strand walks never reach here — they size the AMM through
+    // `amm_swap::consume` on the direct walk instead.
     let amm_init = amm.as_ref().map(|a| crate::tx::amm_swap::pool_balances(sandbox, a, pays_leg, gets_leg));
     let mut amm_iters = 0u32;
     let done = |rp: Me, rg: Me| me_is_zero(rg) || (!sell && me_is_zero(rp));
@@ -902,6 +906,9 @@ fn cross_bridged(
                 (None, Some(b)) => Some(b),
                 (None, None) => None,
             };
+            if std::env::var("DX_AMM").is_ok() {
+                eprintln!("DX_AMM site=bridged best_book={best_book:?}");
+            }
             let (rp, rg, used) = crate::tx::amm_swap::consume_fib(
                 sandbox, a, taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg,
                 threshold, sell, *init, amm_iters, best_book,
@@ -1060,6 +1067,24 @@ fn cross_bridged(
 /// (`rem_gets`), accepting more of the pays side than requested. The binding
 /// constraint becomes `rem_gets` alone — `rem_pays` (the minimum to acquire)
 /// stops bounding each fill and no longer terminates the walk once reached.
+/// `offer_crossing` distinguishes rippled's FlowCross from Flow, and decides
+/// BOTH structural questions at once:
+///
+///  * **Autobridging.** Only offer crossing synthesizes the XRP bridge
+///    (`flow()` builds the direct and bridged strands itself). A payment's
+///    strands come from its explicit Paths plus the default path, so a
+///    payment reaches a book only where its path names one — it never routes
+///    through an XRP leg the transaction did not ask for.
+///  * **The AMM offer generator** (`AMMContext::multiPath`, set from the
+///    strand count at `Flow.cpp:106` `setMultiPath(strands.size() > 1)`).
+///    Bridged crossing is two strands, so the pool competes with Fibonacci
+///    slices; every other walk is single-strand and sizes the AMM by
+///    `changeSpotPriceQuality`/`maxOffer` instead. That correspondence is
+///    exact here: `cross_bridged` runs iff multiPath would be true.
+///
+/// The one case this does not model is a payment carrying two or more
+/// explicit Paths, which rippled would treat as multi-path; we walk only the
+/// first path, so such a payment stays on the single-strand generator.
 pub(crate) fn cross_engine_to(
     taker: &[u8; 20],
     beneficiary: &[u8; 20],
@@ -1069,6 +1094,7 @@ pub(crate) fn cross_engine_to(
     gets_leg: &Leg,
     threshold: u64,
     sell: bool,
+    offer_crossing: bool,
     domain: Option<&Hash256>,
     sandbox: &mut Sandbox,
 ) -> (Me, Me, u32) {
@@ -1088,9 +1114,10 @@ pub(crate) fn cross_engine_to(
     };
     // IOU↔IOU pairs autobridge through XRP (open books; the direct-pair AMM
     // competes inside the controller).
-    if !pays_leg.xrp && !gets_leg.xrp && domain.is_none() {
+    if offer_crossing && !pays_leg.xrp && !gets_leg.xrp && domain.is_none() {
         if let Some(r) = cross_bridged(
-            taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell, &inv_base, &amm, sandbox,
+            taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell,
+            &inv_base, &amm, sandbox,
         ) {
             return r;
         }
@@ -1101,6 +1128,9 @@ pub(crate) fn cross_engine_to(
         // AMM turn: consume pool liquidity while its spot quality strictly
         // beats this book level (anchored so the book resumes at `q`).
         if let Some(a) = &amm {
+            if std::env::var("DX_AMM").is_ok() {
+                eprintln!("DX_AMM site=direct-walk q={q:x}");
+            }
             let (rp, rg, used) = crate::tx::amm_swap::consume(
                 sandbox, a, taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell, Some(q),
             );
@@ -1202,6 +1232,9 @@ pub(crate) fn cross_engine_to(
     // Final AMM turn once the book is exhausted (maxOffer sizing).
     if let Some(a) = &amm {
         if !done(rem_pays, rem_gets) {
+            if std::env::var("DX_AMM").is_ok() {
+                eprintln!("DX_AMM site=direct-tail");
+            }
             let (rp, rg, used) = crate::tx::amm_swap::consume(
                 sandbox, a, taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell, None,
             );
@@ -1225,7 +1258,9 @@ pub(crate) fn cross_engine(
     domain: Option<&Hash256>,
     sandbox: &mut Sandbox,
 ) -> (Me, Me, u32) {
-    cross_engine_to(taker, taker, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell, domain, sandbox)
+    // FlowCross always builds both the direct and the XRP-bridged strand, so
+    // offer crossing is multi-path by construction.
+    cross_engine_to(taker, taker, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell, true, domain, sandbox)
 }
 
 pub struct OfferCreateTransactor;
