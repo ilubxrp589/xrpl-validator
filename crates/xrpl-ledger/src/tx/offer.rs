@@ -1106,8 +1106,17 @@ pub(crate) fn cross_engine_to(
     // buy, when the wanted pays side is fully acquired.
     let done = |rp: Me, rg: Me| me_is_zero(rg) || (!sell && me_is_zero(rp));
     // AMM for the pair competes with the book at every quality level
-    // (rippled BookStep + AMMLiquidity).
-    let amm = crate::tx::amm_swap::discover(sandbox, gets_leg, pays_leg, taker);
+    // (rippled BookStep + AMMLiquidity) — EXCEPT in a permissioned-domain
+    // book, which no pool participates in: `BookStep::tryAMM` returns early
+    // on `book_.domain` ("amm doesn't support domain yet", BookStep.cpp:820).
+    // A domain offer therefore crosses domain offers only, and rests in full
+    // when none match, however good the pool's price looks (#105761560
+    // C9948B9C crossed 1.238909 XRP against the EUROP pool where mainnet
+    // moved no value at all).
+    let amm = match domain {
+        Some(_) => None,
+        None => crate::tx::amm_swap::discover(sandbox, gets_leg, pays_leg, taker),
+    };
     let inv_base = match domain {
         Some(d) => keylet::book_base_domain(&gets_leg.cur, &pays_leg.cur, &gets_leg.issuer, &pays_leg.issuer, d),
         None => keylet::book_base(&gets_leg.cur, &pays_leg.cur, &gets_leg.issuer, &pays_leg.issuer),
