@@ -24,26 +24,32 @@ use crate::shamap::hash::sha512_half;
 /// `key = SHA512Half(0x0044 || subject_account || issuer_account || credential_type_hash)`
 ///
 /// Space key 0x0044 ('D') is used for credentials (simplified — not in rippled mainline yet).
+/// rippled `keylet::credential` = indexHash(LedgerNameSpace::Credential,
+/// subject, issuer, credType): ONE flat hash over the namespace and the three
+/// fields, with credType as its RAW bytes. Hashing the type separately, or
+/// hashing the hex TEXT of the type, both yield a key that can never match a
+/// credential the network created — so a duplicate would go unnoticed.
 fn credential_key(subject: &[u8; 20], issuer: &[u8; 20], credential_type: &[u8]) -> xrpl_core::types::Hash256 {
-    let type_hash = sha512_half(credential_type);
-    let mut buf = Vec::with_capacity(2 + 20 + 20 + 32);
-    buf.extend_from_slice(&[0x00, 0x44]); // 'D' space
+    let mut buf = Vec::with_capacity(2 + 20 + 20 + credential_type.len());
+    buf.extend_from_slice(&[0x00, 0x44]); // 'D'
     buf.extend_from_slice(subject);
     buf.extend_from_slice(issuer);
-    buf.extend_from_slice(&type_hash.0);
+    buf.extend_from_slice(credential_type);
     sha512_half(&buf)
 }
 
-/// Helper: decode a 20-byte hex account ID from a JSON value.
+/// CredentialType travels as hex text in our tx JSON; the keylet wants the
+/// bytes it encodes.
+fn cred_type_bytes(s: &str) -> Vec<u8> {
+    hex::decode(s).unwrap_or_else(|_| s.as_bytes().to_vec())
+}
+
+/// Decode an account ID that may arrive as 20-byte hex OR as a base58
+/// r-address. Subject and Issuer are not among the fields callers normalise to
+/// hex, so a hex-only decoder rejected every real CredentialCreate as
+/// malformed before it could reach the duplicate check.
 fn decode_account_id(val: &serde_json::Value) -> Option<[u8; 20]> {
-    let hex_str = val.as_str()?;
-    let bytes = hex::decode(hex_str).ok()?;
-    if bytes.len() != 20 {
-        return None;
-    }
-    let mut arr = [0u8; 20];
-    arr.copy_from_slice(&bytes);
-    Some(arr)
+    crate::tx::offer::decode20(val.as_str()?)
 }
 
 // ---------------------------------------------------------------------------
@@ -72,14 +78,10 @@ impl Transactor for CredentialCreateTransactor {
         if tx.fields.get("CredentialType").is_none() {
             return TxResult::Malformed;
         }
-        // Bug 16: Issuer (tx.account) cannot issue a credential to themselves
-        if let Some(subject_val) = tx.fields.get("Subject") {
-            if let Some(hex_str) = subject_val.as_str() {
-                if hex_str == hex::encode(tx.account) {
-                    return TxResult::Malformed;
-                }
-            }
-        }
+        // Self-issuance is legal: CredentialCreate::preflight checks only
+        // Subject presence and the URI/CredentialType sizes, with no
+        // subject != account rule. #105784451 8AA123A9 issues to itself and
+        // mainnet reaches preclaim, returning tecDUPLICATE.
         TxResult::Success
     }
 
@@ -102,11 +104,11 @@ impl Transactor for CredentialCreateTransactor {
             None => return TxResult::Malformed,
         };
 
-        let cred_key = credential_key(&subject, &tx.account, cred_type_str.as_bytes());
+        let cred_key = credential_key(&subject, &tx.account, &cred_type_bytes(cred_type_str));
 
         // Check if credential already exists
         if sandbox.exists(&cred_key) {
-            return TxResult::NoPermission; // duplicate credential
+            return TxResult::Duplicate;
         }
 
         let mut cred_obj = serde_json::json!({
@@ -193,7 +195,7 @@ impl Transactor for CredentialDeleteTransactor {
             None => return TxResult::Malformed,
         };
 
-        let cred_key = credential_key(&subject, &issuer, cred_type_str.as_bytes());
+        let cred_key = credential_key(&subject, &issuer, &cred_type_bytes(cred_type_str));
 
         if !sandbox.exists(&cred_key) {
             return TxResult::NoEntry;
@@ -268,7 +270,7 @@ impl Transactor for CredentialAcceptTransactor {
             None => return TxResult::Malformed,
         };
 
-        let cred_key = credential_key(&subject, &issuer, cred_type_str.as_bytes());
+        let cred_key = credential_key(&subject, &issuer, &cred_type_bytes(cred_type_str));
 
         let cred_data = match sandbox.read(&cred_key) {
             Some(d) => d,
@@ -566,7 +568,8 @@ mod tests {
         };
 
         assert_eq!(CredentialCreateTransactor.do_apply(&create_tx, &mut sandbox), TxResult::Success);
-        // Second create with same params should fail
-        assert_eq!(CredentialCreateTransactor.do_apply(&create_tx, &mut sandbox), TxResult::NoPermission);
+        // Second create with same params is tecDUPLICATE, the code rippled's
+        // preclaim returns when the credential keylet already exists.
+        assert_eq!(CredentialCreateTransactor.do_apply(&create_tx, &mut sandbox), TxResult::Duplicate);
     }
 }

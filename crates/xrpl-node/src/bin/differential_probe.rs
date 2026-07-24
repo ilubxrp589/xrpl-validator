@@ -290,6 +290,46 @@ fn decode_issuer(s: &str) -> Option<[u8; 20]> {
 /// Transactor-specific; extend as more types are hardened.
 fn native_read_keys(txj: &Value) -> Vec<String> {
     let mut keys = Vec::new();
+    // Credential transactors read keylet::credential(subject, issuer, type)
+    // before doing anything. When the answer is "it already exists" the
+    // transaction is fee-only, so the object never appears in mainnet's
+    // affected-nodes and would go unhydrated — native would then see no
+    // duplicate and create one (#105784451 8AA123A9, #105784776 07452ED7,
+    // both tecDUPLICATE on mainnet).
+    if matches!(
+        txj["TransactionType"].as_str(),
+        Some("CredentialCreate") | Some("CredentialAccept") | Some("CredentialDelete")
+    ) {
+        // Whichever party the transaction does not name is the sender:
+        // CredentialCreate carries Subject and issues as Account, while
+        // CredentialAccept carries Issuer and is accepted by the Subject.
+        let account = txj["Account"].as_str().and_then(decode_address);
+        let issuer = txj
+            .get("Issuer")
+            .and_then(|v| v.as_str())
+            .and_then(decode_address)
+            .or(account);
+        let subject = txj
+            .get("Subject")
+            .and_then(|v| v.as_str())
+            .and_then(decode_address)
+            .or(account);
+        if let (Some(subject), Some(issuer), Some(ct)) = (
+            subject,
+            issuer,
+            txj.get("CredentialType").and_then(|v| v.as_str()),
+        ) {
+            let ct_bytes = hex::decode(ct).unwrap_or_else(|_| ct.as_bytes().to_vec());
+            let mut buf = Vec::with_capacity(2 + 20 + 20 + ct_bytes.len());
+            buf.extend_from_slice(&[0x00, 0x44]); // LedgerNameSpace::Credential
+            buf.extend_from_slice(&subject);
+            buf.extend_from_slice(&issuer);
+            buf.extend_from_slice(&ct_bytes);
+            keys.push(hex::encode_upper(
+                xrpl_ledger::shamap::hash::sha512_half(&buf).0,
+            ));
+        }
+    }
     if txj["TransactionType"].as_str() == Some("TrustSet") {
         if let (Some(acct), Some(limit)) = (
             txj["Account"].as_str().and_then(decode_address),
