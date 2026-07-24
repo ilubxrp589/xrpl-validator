@@ -381,8 +381,8 @@ pub(crate) fn line_adjust(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, am
                 if flags & their_reserve == 0 {
                     // Default on both sides: the line stops existing.
                     sandbox.delete(lkey);
-                    crate::ledger::directory::owner_dir_remove(sandbox, party, &lkey, None);
-                    crate::ledger::directory::owner_dir_remove(sandbox, &leg.issuer, &lkey, None);
+                    crate::ledger::directory::owner_dir_remove(sandbox, party, &lkey, None, false);
+                    crate::ledger::directory::owner_dir_remove(sandbox, &leg.issuer, &lkey, None, false);
                     return;
                 }
             }
@@ -455,7 +455,7 @@ pub(crate) fn delete_maker_offer(
     let book_hint = offer.get("BookNode").map(dirnum);
     let _ = hint;
     sandbox.delete(*okey);
-    crate::ledger::directory::owner_dir_remove(sandbox, maker, okey, owner_hint);
+    crate::ledger::directory::owner_dir_remove(sandbox, maker, okey, owner_hint, false);
     if let Some(bd) = offer
         .get("BookDirectory")
         .and_then(|v| v.as_str())
@@ -463,7 +463,7 @@ pub(crate) fn delete_maker_offer(
         .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
         .map(xrpl_core::types::Hash256)
     {
-        crate::ledger::directory::dir_remove(sandbox, &bd, okey, book_hint);
+        crate::ledger::directory::dir_remove(sandbox, &bd, okey, book_hint, false);
     }
     owner_count_add(sandbox, maker, -1);
 }
@@ -1585,9 +1585,9 @@ impl Transactor for OfferCancelTransactor {
                 .map(xrpl_core::types::Hash256);
 
             sandbox.delete(offer_key);
-            crate::ledger::directory::owner_dir_remove(sandbox, &tx.account, &offer_key, owner_node);
+            crate::ledger::directory::owner_dir_remove(sandbox, &tx.account, &offer_key, owner_node, false);
             if let Some(bd) = book_dir {
-                crate::ledger::directory::dir_remove(sandbox, &bd, &offer_key, book_node);
+                crate::ledger::directory::dir_remove(sandbox, &bd, &offer_key, book_node, false);
             }
 
             // Decrement OwnerCount

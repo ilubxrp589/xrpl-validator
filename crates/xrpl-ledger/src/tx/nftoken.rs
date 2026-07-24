@@ -379,13 +379,13 @@ fn read_offer(sandbox: &Sandbox, key: Hash256) -> Option<OfferSle> {
 /// the owner's reserve unit.
 fn delete_offer(sandbox: &mut Sandbox, offer: &OfferSle) {
     sandbox.delete(offer.key);
-    owner_dir_remove(sandbox, &offer.owner, &offer.key, offer.owner_node);
+    owner_dir_remove(sandbox, &offer.owner, &offer.key, offer.owner_node, false);
     let dir_root = if offer.is_sell {
         keylet::nft_sell_offers_key(&offer.nft_id)
     } else {
         keylet::nft_buy_offers_key(&offer.nft_id)
     };
-    dir_remove(sandbox, &dir_root, &offer.key, offer.offer_node);
+    dir_remove(sandbox, &dir_root, &offer.key, offer.offer_node, false);
     decrement_owner_count(&offer.owner, sandbox);
 }
 

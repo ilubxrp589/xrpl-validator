@@ -273,7 +273,7 @@ pub fn apply_common(tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
                     })
                 });
             sandbox.delete(tk);
-            crate::ledger::directory::owner_dir_remove(sandbox, &tx.account, &tk, hint);
+            crate::ledger::directory::owner_dir_remove(sandbox, &tx.account, &tk, hint, true);
             let oc = acct["OwnerCount"].as_u64().unwrap_or(0);
             acct["OwnerCount"] = serde_json::Value::Number(oc.saturating_sub(1).into());
             let tc = acct["TicketCount"].as_u64().unwrap_or(0);

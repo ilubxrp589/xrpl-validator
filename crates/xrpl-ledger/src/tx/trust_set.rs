@@ -371,8 +371,8 @@ impl Transactor for TrustSetTransactor {
                     let low_hint = hint(&line["LowNode"]);
                     let high_hint = hint(&line["HighNode"]);
                     sandbox.delete(line_key);
-                    crate::ledger::directory::owner_dir_remove(sandbox, &low_id, &line_key, low_hint);
-                    crate::ledger::directory::owner_dir_remove(sandbox, &high_id, &line_key, high_hint);
+                    crate::ledger::directory::owner_dir_remove(sandbox, &low_id, &line_key, low_hint, false);
+                    crate::ledger::directory::owner_dir_remove(sandbox, &high_id, &line_key, high_hint, false);
                     // rippled touches BOTH AccountRoots at trustDelete (the
                     // reserve payer's OwnerCount decrements; the other side is
                     // a no-op Modified that rippled still records in the meta).

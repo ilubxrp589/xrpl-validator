@@ -197,7 +197,7 @@ impl Transactor for OracleDeleteTransactor {
                 .or_else(|| v.as_str().and_then(|s| u64::from_str_radix(s, 16).ok()))
         });
         sandbox.delete(key);
-        owner_dir_remove(sandbox, &tx.account, &key, hint);
+        owner_dir_remove(sandbox, &tx.account, &key, hint, true);
         bump_owner_count(sandbox, &tx.account, -units);
         TxResult::Success
     }

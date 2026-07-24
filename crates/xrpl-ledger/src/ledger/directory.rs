@@ -156,7 +156,13 @@ pub fn owner_dir_insert(sandbox: &mut Sandbox, owner: &[u8; 20], object_key: &Ha
 /// Returns true iff the entry was found (and removed) there. Handles page
 /// emptying: root-only directory → delete root; empty non-root page → delete +
 /// relink neighbours + fix root back-pointer.
-fn try_remove_at(sandbox: &mut Sandbox, root_key: &Hash256, num: u64, entry: &str) -> bool {
+fn try_remove_at(
+    sandbox: &mut Sandbox,
+    root_key: &Hash256,
+    num: u64,
+    entry: &str,
+    keep_root: bool,
+) -> bool {
     let cur_key = page_key(root_key, num);
     let Some(mut page) = read_dir(sandbox, &cur_key) else { return false };
     let has = page
@@ -176,7 +182,13 @@ fn try_remove_at(sandbox: &mut Sandbox, root_key: &Hash256, num: u64, entry: &st
         .map(|a| a.is_empty())
         .unwrap_or(true);
     if !empty || num == 0 {
-        if empty && num == 0 && page.get("IndexNext").map(page_num).unwrap_or(0) == 0 {
+        // An emptied ROOT page is only deleted when the caller did not ask to
+        // keep it: "the root page will not be deleted even if it is empty,
+        // unless keepRoot is not set and the directory is empty"
+        // (ApplyView.h dirRemove doc; ApplyView.cpp:324 `if (keepRoot) return`).
+        // With keep_root the page stays as a Modified empty directory.
+        if empty && num == 0 && !keep_root && page.get("IndexNext").map(page_num).unwrap_or(0) == 0
+        {
             sandbox.delete(*root_key); // only page, now empty → delete directory
         } else {
             sandbox.write(cur_key, serde_json::to_vec(&page).unwrap_or_default());
@@ -197,7 +209,7 @@ fn try_remove_at(sandbox: &mut Sandbox, root_key: &Hash256, num: u64, entry: &st
                 .and_then(|v| v.as_array())
                 .map(|a| a.is_empty())
                 .unwrap_or(true);
-            if root_empty {
+            if root_empty && !keep_root {
                 sandbox.delete(*root_key);
             } else {
                 root["IndexNext"] = serde_json::json!(0);
@@ -242,10 +254,11 @@ pub fn dir_remove(
     root_key: &Hash256,
     object_key: &Hash256,
     hint: Option<u64>,
+    keep_root: bool,
 ) {
     let entry = hex::encode_upper(object_key.0);
     if let Some(h) = hint {
-        if try_remove_at(sandbox, root_key, h, &entry) {
+        if try_remove_at(sandbox, root_key, h, &entry, keep_root) {
             return;
         }
     }
@@ -254,12 +267,12 @@ pub fn dir_remove(
     // always append there, so entries added earlier in the same ledger (the
     // create→delete farm pattern) are found without traversing the chain.
     let last = root.get("IndexPrevious").map(page_num).unwrap_or(0);
-    if last != 0 && hint != Some(last) && try_remove_at(sandbox, root_key, last, &entry) {
+    if last != 0 && hint != Some(last) && try_remove_at(sandbox, root_key, last, &entry, keep_root) {
         return;
     }
     let mut cur = 0u64;
     for _ in 0..100_000 {
-        if try_remove_at(sandbox, root_key, cur, &entry) {
+        if try_remove_at(sandbox, root_key, cur, &entry, keep_root) {
             return;
         }
         let Some(page) = read_dir(sandbox, &page_key(root_key, cur)) else { return };
@@ -277,8 +290,9 @@ pub fn owner_dir_remove(
     owner: &[u8; 20],
     object_key: &Hash256,
     hint: Option<u64>,
+    keep_root: bool,
 ) {
-    dir_remove(sandbox, &keylet::owner_dir_key(owner), object_key, hint)
+    dir_remove(sandbox, &keylet::owner_dir_key(owner), object_key, hint, keep_root)
 }
 
 #[cfg(test)]
@@ -333,7 +347,34 @@ mod tests {
         let mut sb = Sandbox::new(&state);
         owner_dir_insert(&mut sb, &owner, &obj);
         assert!(sb.read(&dir_key).is_some());
-        owner_dir_remove(&mut sb, &owner, &obj, None);
+        owner_dir_remove(&mut sb, &owner, &obj, None, false);
         assert!(sb.read(&dir_key).is_none()); // empty → deleted
+    }
+
+    /// The mirror of the above: with `keep_root` the emptied root page survives
+    /// as a Modified empty directory rather than being deleted — "the root page
+    /// will not be deleted even if it is empty, unless keepRoot is not set"
+    /// (ApplyView.h dirRemove doc). CheckCancel, CheckCash, OracleDelete and
+    /// Ticket consumption all pass true; offers, NFT offers and trust lines
+    /// pass false. Mainnet #105797946 emits the emptied dir root as Modified
+    /// (`:1`); deleting it (`:2`) diverged on six transactions.
+    #[test]
+    fn remove_keeps_empty_root_when_asked() {
+        let state = empty_state();
+        let owner = [0x23u8; 20];
+        let obj = Hash256([0xDDu8; 32]);
+        let dir_key = keylet::owner_dir_key(&owner);
+
+        let mut sb = Sandbox::new(&state);
+        owner_dir_insert(&mut sb, &owner, &obj);
+        owner_dir_remove(&mut sb, &owner, &obj, None, true);
+
+        let page = sb.read(&dir_key).expect("root page must survive keep_root");
+        let page: serde_json::Value = serde_json::from_slice(&page).unwrap();
+        assert_eq!(
+            page.get("Indexes").and_then(|v| v.as_array()).map(|a| a.len()),
+            Some(0),
+            "root should remain, emptied"
+        );
     }
 }
