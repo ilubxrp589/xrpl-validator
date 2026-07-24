@@ -243,8 +243,8 @@ impl Transactor for CheckCashTransactor {
         let owner_hint = check.get("OwnerNode").map(|v| ox::dirnum(v));
         let dest_hint = check.get("DestinationNode").map(|v| ox::dirnum(v));
         sandbox.delete(check_key);
-        crate::ledger::directory::owner_dir_remove(sandbox, &creator, &check_key, owner_hint);
-        crate::ledger::directory::owner_dir_remove(sandbox, &tx.account, &check_key, dest_hint);
+        crate::ledger::directory::owner_dir_remove(sandbox, &creator, &check_key, owner_hint, true);
+        crate::ledger::directory::owner_dir_remove(sandbox, &tx.account, &check_key, dest_hint, true);
         ox::owner_count_add(sandbox, &creator, -1);
         ox::owner_count_add(sandbox, &tx.account, -1);
 
@@ -329,6 +329,31 @@ impl Transactor for CheckCancelTransactor {
                     sandbox.write(creator_key, serde_json::to_vec(&acct).unwrap());
                 }
             }
+        }
+
+        // A Check is linked into TWO owner directories — the writer's (via
+        // OwnerNode) and the destination's (via DestinationNode) — so
+        // cancelling must unlink both, each through its stored page hint.
+        // Only the destination link is conditional: rippled skips it when the
+        // check is written to self, which it "shouldn't be"
+        // (CheckCancel.cpp:71-93). The reserve is the writer's alone, so only
+        // the writer's OwnerCount moves (adjustOwnerCount(sleSrc, -1), line 97)
+        // — the destination's AccountRoot appears in the metadata only when it
+        // is also the account paying the fee.
+        use crate::tx::offer as ox;
+        let owner_hint = check.get("OwnerNode").map(|v| ox::dirnum(v));
+        let dest_hint = check.get("DestinationNode").map(|v| ox::dirnum(v));
+        if let (Some(creator_id), Some(dest_id)) = (creator, dest) {
+            if creator_id != dest_id {
+                crate::ledger::directory::owner_dir_remove(
+                    sandbox, &dest_id, &check_key, dest_hint, true,
+                );
+            }
+        }
+        if let Some(creator_id) = creator {
+            crate::ledger::directory::owner_dir_remove(
+                sandbox, &creator_id, &check_key, owner_hint, true,
+            );
         }
 
         // Delete the Check
@@ -504,6 +529,57 @@ mod tests {
         // Balances unchanged (no fund transfer)
         assert_eq!(read_field_u64(&sandbox, &sender, "Balance"), 50_000_000);
         assert_eq!(read_field_u64(&sandbox, &dest, "Balance"), 10_000_000);
+    }
+
+    /// Mainnet #105797946 (AD75E19EE0AC, 4B8AF3399363, 0AD4F6597D90): a Check
+    /// is linked into BOTH the writer's and the destination's owner directory,
+    /// so CheckCancel must unlink both — rippled CheckCancel.cpp:71-93 issues
+    /// one dirRemove per directory. We deleted the object and adjusted the
+    /// reserve but left two dangling directory entries, emitting 2 mutations
+    /// where mainnet emits 4.
+    #[test]
+    fn check_cancel_unlinks_both_owner_directories() {
+        let sender = [0x01u8; 20];
+        let dest = [0x02u8; 20];
+        let state = make_state_with_accounts(&[(&sender, 50_000_000), (&dest, 10_000_000)]);
+        let mut sandbox = Sandbox::new(&state);
+
+        let create_tx = TxFields {
+            account: sender, tx_type: "CheckCreate".to_string(), fee: 12, sequence: 1,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Destination": hex::encode(dest),
+                "SendMax": "5000000",
+            }),
+        };
+        assert_eq!(CheckCreateTransactor.do_apply(&create_tx, &mut sandbox), TxResult::Success);
+
+        let check_key = keylet::check_key(&sender, 1);
+        let entry = hex::encode_upper(check_key.0);
+        let listed = |sandbox: &Sandbox, owner: &[u8; 20]| -> bool {
+            let root = keylet::owner_dir_key(owner);
+            sandbox
+                .read(&root)
+                .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+                .and_then(|p| p.get("Indexes").and_then(|v| v.as_array()).cloned())
+                .is_some_and(|a| a.iter().any(|x| x.as_str() == Some(entry.as_str())))
+        };
+        // CheckCreate links the check into both directories.
+        assert!(listed(&sandbox, &sender), "writer's dir should list the check");
+        assert!(listed(&sandbox, &dest), "destination's dir should list the check");
+
+        let cancel_tx = TxFields {
+            account: sender, tx_type: "CheckCancel".to_string(), fee: 12, sequence: 2,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({ "CheckID": hex::encode(check_key.0) }),
+        };
+        assert_eq!(CheckCancelTransactor.do_apply(&cancel_tx, &mut sandbox), TxResult::Success);
+
+        assert!(!sandbox.exists(&check_key));
+        assert!(!listed(&sandbox, &sender), "writer's dir still lists a cancelled check");
+        assert!(!listed(&sandbox, &dest), "destination's dir still lists a cancelled check");
+        // The reserve is the writer's alone (adjustOwnerCount(sleSrc, -1)).
+        assert_eq!(read_field_u64(&sandbox, &sender, "OwnerCount"), 0);
     }
 
     #[test]
