@@ -1431,10 +1431,28 @@ impl Transactor for OfferCreateTransactor {
         // removableOffers to the cancel sandbox as well, so the cleanup
         // survives a kill that rolls every fill back (OfferCreate.cpp:460).
         let mut stale: Vec<Hash256> = Vec::new();
-        let (rem_pays, rem_gets, crossed) = cross_engine(
-            &tx.account, tp0, tg0, &pays_leg, &gets_leg, threshold, sell, domain.as_ref(), sandbox,
-            &mut stale,
+        // Crossing spends only what the account actually HOLDS, which can be
+        // far less than TakerGets: rippled clamps the crossing input to
+        // accountFunds (XRP balance minus reserve) — "Don't send more than our
+        // balance", OfferCreate.cpp:399-401 — while TakerGets still bounds
+        // what may REST. The threshold above is computed from the unclamped
+        // amounts, as rippled builds it before the clamp (OfferCreate.cpp:392).
+        let avail = available(sandbox, &tx.account, &gets_leg);
+        let underfunded = me_cmp(avail, tg0) == std::cmp::Ordering::Less;
+        let tg_cross = if underfunded { avail } else { tg0 };
+        let (rem_pays, rem_gets_cross, crossed) = cross_engine(
+            &tx.account, tp0, tg_cross, &pays_leg, &gets_leg, threshold, sell, domain.as_ref(),
+            sandbox, &mut stale,
         );
+        // Re-express the leftover against the ORIGINAL TakerGets: only the
+        // funded part could be spent, but the whole unspent remainder rests.
+        // Left exactly as returned when the clamp did not bite, so the fully
+        // funded path keeps its value rather than re-deriving it.
+        let rem_gets = if underfunded {
+            me_norm(me_sub(tg0, me_sub(tg_cross, rem_gets_cross)))
+        } else {
+            rem_gets_cross
+        };
         // Re-run the stale removals after a rollback restores them.
         let reap = |sandbox: &mut Sandbox, stale: &[Hash256]| {
             for okey in stale {
@@ -1853,6 +1871,81 @@ mod tests {
         // Nothing crossed: maker's offer and taker's XRP untouched.
         assert!(sandbox.exists(&keylet::offer_key(&maker, 2)));
         assert_eq!(read_balance(&sandbox, &taker), 50_000_000);
+    }
+
+    /// Mainnet tx 1C8E3BF4C2B2… (ledger 105802230): a FillOrKill offering 50
+    /// XRP from an account holding ~14 XRP against a 36-object reserve — only
+    /// ~5.8 XRP is actually spendable. rippled clamps the crossing input to
+    /// accountFunds ("Don't send more than our balance", OfferCreate.cpp:399
+    /// -401), so the offer cannot fully fill and is killed. TakerGets bounds
+    /// what may REST, never what may be spent: crossing the full 50 XRP would
+    /// spend money the account does not have, and on mainnet the DeepTide it
+    /// wrongly acquired was then sold on by two later Payments in the same
+    /// ledger that mainnet returned tecPATH_DRY.
+    #[test]
+    fn fill_or_kill_killed_when_taker_cannot_fund_taker_gets() {
+        let taker = [0x01u8; 20];
+        let maker = [0x04u8; 20];
+        let issuer = [0x02u8; 20];
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+
+        // 14 XRP with OwnerCount 36 → reserve 8.2 XRP → only 5.8 XRP spendable.
+        let mut state = make_state_with_account(&taker, 14_000_000);
+        {
+            let key = keylet::account_root_key(&taker);
+            let mut a = json_at(&Sandbox::new(&state), &key).unwrap();
+            a["OwnerCount"] = serde_json::json!(36);
+            state.state_map.insert(key, serde_json::to_vec(&a).unwrap()).unwrap();
+        }
+        for id in [&maker, &issuer] {
+            let a = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": hex::encode(id),
+                "Balance": "50000000", "Sequence": 1, "OwnerCount": 0,
+            });
+            state.state_map.insert(keylet::account_root_key(id), serde_json::to_vec(&a).unwrap()).unwrap();
+        }
+        // Maker holds 100 USD and rests an offer selling all of it for 50 XRP.
+        let mkey = keylet::ripple_state_key(&maker, &issuer, &cur);
+        let (lo, hi) = if maker < issuer { (maker, issuer) } else { (issuer, maker) };
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+            "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000",
+                        "value": if maker < issuer { "100" } else { "-100" }},
+            "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000"},
+            "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000"},
+        });
+        state.state_map.insert(mkey, serde_json::to_vec(&line).unwrap()).unwrap();
+        let mut sandbox = Sandbox::new(&state);
+        let maker_offer = TxFields {
+            account: maker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerPays": "50000000",
+                "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
+            }),
+        };
+        assert_eq!(OfferCreateTransactor.do_apply(&maker_offer, &mut sandbox), TxResult::Success);
+        let mods = sandbox.into_modifications();
+        apply_modifications(&mut state, mods).unwrap();
+
+        // Taker wants the whole 100 USD for 50 XRP — priced exactly at the
+        // maker's rate, so only full funding could fill it.
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: taker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerGets": "50000000",
+                "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
+                "Flags": 0x0004_0000u64,
+            }),
+        };
+        assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Killed);
+        // Killed rolls everything back: the maker's offer survives untouched
+        // and the taker keeps every drop.
+        assert!(sandbox.exists(&keylet::offer_key(&maker, 2)));
+        assert_eq!(read_balance(&sandbox, &taker), 14_000_000);
     }
 
     /// tfSell means "sell the ENTIRE TakerGets, even if that acquires more
