@@ -91,9 +91,6 @@ impl Transactor for AccountDeleteTransactor {
         if tx.tx_type != "AccountDelete" {
             return TxResult::Malformed;
         }
-        if tx.fee < 2_000_000 {
-            return TxResult::BadFee;
-        }
         if tx.fields.get("Destination").is_none() {
             return TxResult::Malformed;
         }
@@ -101,6 +98,16 @@ impl Transactor for AccountDeleteTransactor {
     }
 
     fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        // "The fee required for AccountDelete is one owner reserve"
+        // (AccountDelete::calculateBaseFee -> calculateOwnerReserveFee). That
+        // is read from the ledger's fee settings, not fixed: the 2024 vote cut
+        // the increment from 2 XRP to 0.2, so a hardcoded 2_000_000 rejects
+        // every present-day AccountDelete (#105764469 2A99D114 pays exactly
+        // the 200000-drop increment — mainnet tesSUCCESS, we said temBAD_FEE).
+        // Needs the view, so it belongs here rather than in preflight.
+        if tx.fee < crate::ledger::fees::reserve_inc(sandbox) {
+            return TxResult::BadFee;
+        }
         let acct_key = keylet::account_root_key(&tx.account);
         let data = match sandbox.read(&acct_key) {
             Some(d) => d,
