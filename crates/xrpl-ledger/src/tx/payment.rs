@@ -87,6 +87,19 @@ impl PaymentTransactor {
         Some(legs)
     }
 
+    /// The issuer's TransferRate, QUALITY_ONE-relative (1e9 = no fee).
+    /// `None` for XRP, for an issuer that charges nothing, or when the issuer
+    /// account is not hydrated.
+    fn transfer_rate(sandbox: &Sandbox, leg: &crate::tx::offer::Leg) -> Option<u64> {
+        if leg.xrp {
+            return None;
+        }
+        let root = keylet::account_root_key(&leg.issuer);
+        let acct: serde_json::Value = serde_json::from_slice(&sandbox.read(&root)?).ok()?;
+        let rate = acct.get("TransferRate")?.as_u64()?;
+        (rate > 1_000_000_000).then_some(rate)
+    }
+
     /// Extract the Amount in drops from the transaction fields.
     /// Amount can be a string (XRP drops) or an object (IOU — not handled here).
     fn amount_drops(tx: &TxFields) -> Option<u64> {
@@ -419,15 +432,59 @@ impl PaymentTransactor {
         if ox::me_is_zero(avail) {
             return TxResult::PathDry;
         }
-        let deliver = if ox::me_cmp(avail, want).is_lt() {
-            if !partial {
-                return TxResult::PathPartial;
-            }
-            avail
+        // Rippling from one holder to another goes through the issuer, which
+        // charges its TransferRate: the sender parts with `spend` and the
+        // destination is credited `spend / rate` (DirectStep.cpp:646,765).
+        // The fee applies only between two non-issuers — issuing and
+        // redeeming are free.
+        //
+        // With no SendMax, rippled caps the source at the Amount itself
+        // (Payment::doApply's maxSourceAmount defaults to saDstAmount reissued
+        // by the sender), so a fee-charging issuer makes the full Amount
+        // unreachable and the payment is short by exactly the fee unless
+        // tfPartialPayment is set — the standing "SendMax must be
+        // Amount × rate" rule. #105772509 FA24C351 and #105784451 B1C3696D
+        // are both this: 2.59929213683045/1.06 and 28.2780133567269/1.06 fall
+        // under their Amounts, which is mainnet's tecPATH_PARTIAL.
+        let rate = if tx.account == leg.issuer || dest == &leg.issuer {
+            None
         } else {
-            want
+            Self::transfer_rate(sandbox, &leg)
         };
-        ox::move_leg(sandbox, &tx.account, dest, &leg, deliver);
+        // Source cap: SendMax when given (same currency, or we would not be on
+        // this path), else the Amount itself. Paying a fee-charging issuer in
+        // full requires SendMax = Amount × rate, and that must still work.
+        let cap = tx
+            .fields
+            .get("SendMax")
+            .and_then(crate::ledger::keylet::amount_mant_exp)
+            .unwrap_or(want);
+        // What the sender must part with to land `want` on the destination.
+        let need = match rate {
+            Some(r) => ox::me_muldiv(want, (r as u128, 0), (1_000_000_000, 0), true),
+            None => want,
+        };
+        let spend = [avail, cap, need]
+            .into_iter()
+            .reduce(|a, b| if ox::me_cmp(a, b).is_lt() { a } else { b })
+            .unwrap_or(want);
+        let deliver = match rate {
+            Some(r) => ox::me_muldiv(spend, (1_000_000_000, 0), (r as u128, 0), false),
+            None => spend,
+        };
+        if ox::me_is_zero(deliver) {
+            return TxResult::PathDry;
+        }
+        if ox::me_cmp(deliver, want).is_lt() && !partial {
+            return TxResult::PathPartial;
+        }
+        match rate {
+            None => ox::move_leg(sandbox, &tx.account, dest, &leg, deliver),
+            Some(_) => {
+                ox::line_adjust(sandbox, &tx.account, &leg, spend, false);
+                ox::line_adjust(sandbox, dest, &leg, deliver, true);
+            }
+        }
         TxResult::Success
     }
 
@@ -505,6 +562,21 @@ impl PaymentTransactor {
         // same amount, so the net-zero line drops out of the mutation set —
         // matching rippled, which never materializes it.
         let hops = Self::path_hops(tx);
+        // The delivered IOU is re-issued to the destination by the strand's
+        // last step, which charges the issuer's TransferRate (see below), so
+        // the books must be worked for `Amount × rate` GROSS for the
+        // destination to net `Amount`. Targeting `Amount` gross instead would
+        // leave every fee-charging delivery short by the fee — #105776250
+        // 184CFAEA delivers inside a 0.1% DeliverMin band against a 1.002
+        // issuer, and mainnet fills it.
+        let want_rate = match Self::transfer_rate(sandbox, &want_leg) {
+            Some(r) if dest != &want_leg.issuer => Some(r),
+            _ => None,
+        };
+        let want_gross = match want_rate {
+            Some(r) => ox::me_muldiv(want0, (r as u128, 0), (1_000_000_000, 0), true),
+            None => want0,
+        };
         // The strand's output belongs to the DESTINATION: crediting the
         // sender first and forwarding would materialize an intermediate
         // trust line rippled never creates (and when the destination is the
@@ -560,7 +632,7 @@ impl PaymentTransactor {
                 let benef = if last { dest } else { &tx.account };
                 // Intermediate hops SELL the whole carry; the last hop buys
                 // up to the Amount cap.
-                let want_cap = if last { want0 } else { (9_990_000_000_000_000, 60) };
+                let want_cap = if last { want_gross } else { (9_990_000_000_000_000, 60) };
                 let (rw, _rs, _c) = ox::cross_engine_to(
                     &tx.account, benef, want_cap, carry, chain[i + 1], chain[i],
                     threshold, !last, false, None, sandbox,
@@ -579,10 +651,32 @@ impl PaymentTransactor {
             carry
         } else {
             let (rem_want, _rem_spend, _crossed) = ox::cross_engine_to(
-                &tx.account, dest, want0, spend0, &want_leg, &spend_leg, threshold, false,
+                &tx.account, dest, want_gross, spend0, &want_leg, &spend_leg, threshold, false,
                 false, None, sandbox,
             );
-            ox::me_sub(want0, rem_want)
+            ox::me_sub(want_gross, rem_want)
+        };
+        // The strand's last step redeems the delivered IOU from whoever gave
+        // it up and re-issues it to the destination, and that step charges the
+        // issuer's TransferRate: `DirectStepI::qualitiesSrcIssues` sets
+        // srcQOut = transferRate(issuer) whenever the previous step redeems
+        // (DirectStep.cpp:765), which for a payment is always — BookStep
+        // reports DebtDirection::Redeems while ownerPaysTransferFee is false
+        // (BookStep.cpp:146). The destination receives out/rate
+        // (DirectStep.cpp:646) and the fee is destroyed rather than paid to
+        // anyone, so only the receiving line is trimmed.
+        //
+        // #105775455 58FEFF8C: the CHIT issuer charges 1.9, so the
+        // 1292441.5236935 our crossing pulled out of the pool is really
+        // 680232.38 delivered — under the transaction's DeliverMin of
+        // 804373.673120612, which is exactly mainnet's tecPATH_PARTIAL.
+        let delivered = match want_rate {
+            Some(rate) => {
+                let net = ox::me_muldiv(delivered, (1_000_000_000, 0), (rate as u128, 0), false);
+                ox::line_adjust(sandbox, dest, &want_leg, ox::me_sub(delivered, net), false);
+                net
+            }
+            None => delivered,
         };
         if ox::me_is_zero(delivered) {
             sandbox.restore_snapshot(snap);
