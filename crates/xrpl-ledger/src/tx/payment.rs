@@ -298,6 +298,19 @@ impl Transactor for PaymentTransactor {
             Some(d) => d,
             None => return TxResult::Malformed,
         };
+        // A pseudo-account (AMM, Vault, LoanBroker) cannot receive an ordinary
+        // Payment — value enters it only through its own transaction type.
+        // rippled: `isPseudoAccount(sleDst) => tecNO_PERMISSION` (Payment.cpp
+        // :635), where a pseudo-account is any AccountRoot carrying a
+        // designator field (sfAMMID / sfVaultID / sfLoanBrokerID). Applies to
+        // every payment variant, so it is checked once here before branching.
+        // #105741244 BF560571 pays XPM straight to an AMM account (AMMID set)
+        // — mainnet tecNO_PERMISSION, we delivered.
+        if let Some(dst) = crate::tx::offer::json_at(sandbox, &keylet::account_root_key(&dest_id)) {
+            if ["AMMID", "VaultID", "LoanBrokerID"].iter().any(|f| dst.get(f).is_some()) {
+                return TxResult::NoPermission;
+            }
+        }
         let amt_json = tx.fields.get("Amount").cloned().unwrap_or_default();
         let sendmax = tx.fields.get("SendMax").cloned();
         let partial = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & 0x0002_0000 != 0;
