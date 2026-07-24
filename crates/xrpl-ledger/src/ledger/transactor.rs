@@ -57,6 +57,11 @@ pub enum TxResult {
     PathPartial,
     /// Destination requires a DestinationTag and the tx has none.
     DstTagNeeded,
+    /// Resulting array exceeds its ledger-object maximum (e.g. an oracle's
+    /// merged PriceDataSeries over ten entries).
+    ArrayTooLarge,
+    /// The object this transaction would create already exists.
+    Duplicate,
     /// Directory is full (e.g. > 250 outstanding tickets).
     DirFull,
     /// Creating the owned object(s) would breach the account's owner reserve.
@@ -110,6 +115,8 @@ impl TxResult {
             | TxResult::UnfundedOffer
             | TxResult::PathPartial
             | TxResult::DstTagNeeded
+            | TxResult::ArrayTooLarge
+            | TxResult::Duplicate
             | TxResult::DirFull
             | TxResult::InsufficientReserve
             | TxResult::InsufReserveLine
@@ -143,6 +150,8 @@ impl TxResult {
             TxResult::UnfundedOffer => "tecUNFUNDED_OFFER",
             TxResult::PathPartial => "tecPATH_PARTIAL",
             TxResult::DstTagNeeded => "tecDST_TAG_NEEDED",
+            TxResult::ArrayTooLarge => "tecARRAY_TOO_LARGE",
+            TxResult::Duplicate => "tecDUPLICATE",
             TxResult::DirFull => "tecDIR_FULL",
             TxResult::InsufficientReserve => "tecINSUFFICIENT_RESERVE",
             TxResult::InsufReserveLine => "tecINSUF_RESERVE_LINE",

@@ -107,8 +107,17 @@ impl Transactor for OracleSetTransactor {
                     series.push(item.clone());
                 }
             }
-            if series.is_empty() || series.len() > 10 {
+            if series.is_empty() {
                 return TxResult::Malformed;
+            }
+            // Overflowing the ten-entry limit by MERGING is a tec, not a tem:
+            // the transaction is well formed and only the resulting object is
+            // too big, so the fee is claimed (OracleSet.cpp:168
+            // tecARRAY_TOO_LARGE). temARRAY_TOO_LARGE is the separate
+            // preflight check on the transaction's own array (line 46).
+            // #105792173 F2572F55 submits ten entries that merge past the cap.
+            if series.len() > 10 {
+                return TxResult::ArrayTooLarge;
             }
             oracle["PriceDataSeries"] = serde_json::Value::Array(series);
             for f in ["LastUpdateTime", "Provider", "AssetClass", "URI"] {
