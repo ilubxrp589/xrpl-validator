@@ -455,6 +455,26 @@ impl PaymentTransactor {
         let (Some(spend_leg), Some(spend0)) = (ox::leg_of(sm_json), crate::ledger::keylet::amount_mant_exp(sm_json)) else {
             return TxResult::Malformed;
         };
+        // Same rule as the direct case above, and it holds however the value
+        // is acquired: every strand ends by rippling the delivered IOU from
+        // its issuer to the destination, and that final step is a
+        // DirectStepI whose `check` opens with "Since this is a payment a
+        // trust line must be present" — no line ⇒ terNO_LINE (DirectStep.cpp
+        // :423). Because every strand shares that last step, one missing line
+        // invalidates all of them, and a flow with no strands is tecPATH_DRY.
+        //
+        // Crossing a book or an AMM does NOT earn the destination a line:
+        // that is offer crossing, a different step class, which is why a
+        // taker gets a new line but a payer never does (#105794129 B405DAF6:
+        // self-conversion arb XRP→BIT→JUST1 where the sender held no JUST1
+        // line — mainnet tecPATH_DRY, fee only, while we crossed two pools
+        // and delivered).
+        if !want_leg.xrp && dest != &want_leg.issuer {
+            let dest_line = keylet::ripple_state_key(dest, &want_leg.issuer, &want_leg.cur);
+            if !sandbox.exists(&dest_line) {
+                return TxResult::PathDry;
+            }
+        }
         // The strand's input is bounded by what the sender actually holds of
         // the SendMax asset (issuer mints freely; XRP is balance-minus-
         // reserve; IOU is the trust-line holding). A sender with nothing to
@@ -867,12 +887,38 @@ mod tests {
 
     /// Seed a book where `issuer` (as maker) sells 5 USD for 5 XRP, then
     /// return (state, taker, issuer).
+    ///
+    /// The taker is given an empty USD line: a payment can only deliver an
+    /// IOU into a line that already exists (DirectStep.cpp:423), so without
+    /// one every payment below would be tecPATH_DRY before reaching the
+    /// behaviour under test. Crossing the book as an OfferCreate would open
+    /// the line; paying does not.
     fn state_with_usd_book() -> (LedgerState, [u8; 20], [u8; 20]) {
         let taker = [0x01u8; 20];
         let issuer = [0x03u8; 20];
         let mut state = make_state();
         add_account(&mut state, &taker, 50_000_000, 1);
         add_account(&mut state, &issuer, 50_000_000, 1);
+        {
+            let cur = crate::tx::offer::amount_currency20(
+                &serde_json::json!({"currency": "USD", "issuer": hex::encode(issuer), "value": "1"}),
+            )
+            .unwrap();
+            let (lo, hi) = if taker < issuer { (taker, issuer) } else { (issuer, taker) };
+            let line = serde_json::json!({
+                "LedgerEntryType": "RippleState",
+                "Flags": 0x0001_0000u64,
+                "Balance": {"currency": hex::encode_upper(cur),
+                            "issuer": "0000000000000000000000000000000000000000",
+                            "value": "0"},
+                "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000000"},
+                "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000000"},
+            });
+            state
+                .state_map
+                .insert(keylet::ripple_state_key(&taker, &issuer, &cur), serde_json::to_vec(&line).unwrap())
+                .unwrap();
+        }
 
         let mut sandbox = Sandbox::new(&state);
         let offer_tx = TxFields {
@@ -920,12 +966,14 @@ mod tests {
         assert_eq!(PaymentTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
         // Taker spent the 5 XRP on the book.
         assert_eq!(read_balance(&sandbox, &taker), 45_000_000);
-        // Taker now holds the acquired USD on a trust line.
+        // Taker now holds the acquired USD on its (pre-existing) line.
         let cur = crate::tx::offer::amount_currency20(
             &serde_json::json!({"currency": "USD", "issuer": hex::encode(issuer), "value": "1"}),
         )
         .unwrap();
-        assert!(sandbox.exists(&keylet::ripple_state_key(&taker, &issuer, &cur)));
+        let line = sandbox.read(&keylet::ripple_state_key(&taker, &issuer, &cur)).unwrap();
+        let line: serde_json::Value = serde_json::from_slice(&line).unwrap();
+        assert_ne!(line["Balance"]["value"].as_str().unwrap(), "0");
     }
 
     /// A direct IOU payment can only be delivered to a destination that
@@ -1147,12 +1195,14 @@ mod tests {
             }),
         };
         assert_eq!(PaymentTransactor.do_apply(&tx, &mut sandbox), TxResult::PathPartial);
-        // Rolled back: XRP untouched, no trust line created.
+        // Rolled back: XRP untouched, and the taker's line still holds nothing.
         assert_eq!(read_balance(&sandbox, &taker), 50_000_000);
         let cur = crate::tx::offer::amount_currency20(
             &serde_json::json!({"currency": "USD", "issuer": hex::encode(issuer), "value": "1"}),
         )
         .unwrap();
-        assert!(!sandbox.exists(&keylet::ripple_state_key(&taker, &issuer, &cur)));
+        let line = sandbox.read(&keylet::ripple_state_key(&taker, &issuer, &cur)).unwrap();
+        let line: serde_json::Value = serde_json::from_slice(&line).unwrap();
+        assert_eq!(line["Balance"]["value"].as_str().unwrap(), "0");
     }
 }
