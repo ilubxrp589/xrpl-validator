@@ -1150,6 +1150,9 @@ pub(crate) fn cross_engine_to(
                 break 'dirs;
             }
         }
+        if std::env::var("DX_BOOK").is_ok() {
+            eprintln!("DX_BOOK dir q={q:016x} threshold={threshold:016x} cross={}", q <= threshold);
+        }
         if q > threshold {
             break;
         }
