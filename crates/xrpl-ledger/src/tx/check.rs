@@ -157,8 +157,13 @@ impl Transactor for CheckCashTransactor {
         if tx.fields.get("CheckID").is_none() {
             return TxResult::Malformed;
         }
-        // Must specify Amount (how much to cash)
-        if tx.fields.get("Amount").is_none() {
+        // EXACTLY ONE of Amount / DeliverMin (CheckCash.cpp:57
+        // `bool(optAmount) == bool(optDeliverMin) => temMALFORMED`): Amount is
+        // a fixed cash-out, DeliverMin a floor for a partial cash-out.
+        // Requiring Amount alone rejected every DeliverMin check
+        // (#105798519 8FBBA125 cashes with DeliverMin only — mainnet
+        // tesSUCCESS, 8 mutations, we said temMALFORMED).
+        if tx.fields.get("Amount").is_some() == tx.fields.get("DeliverMin").is_some() {
             return TxResult::Malformed;
         }
         TxResult::Success
