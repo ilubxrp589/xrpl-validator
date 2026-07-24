@@ -160,7 +160,15 @@ pub fn apply_transaction_set(
                         // tec from do_apply — rollback to just apply_common
                         // modifications (fee deduction + sequence increment).
                         // do_apply's partial state changes are discarded.
-                        sandbox.restore_snapshot(common_snapshot);
+                        //
+                        // tecKILLED is the exception: OfferCreate rolls its own
+                        // fills back and then deliberately re-applies the
+                        // stale-offer cleanup, which rippled keeps by running
+                        // removableOffers against the cancel sandbox as well
+                        // (OfferCreate.cpp:460). Restoring here would drop it.
+                        if apply_result != TxResult::Killed {
+                            sandbox.restore_snapshot(common_snapshot);
+                        }
                         let mods = sandbox.into_modifications();
                         apply_modifications(&mut new_state, mods)?;
                         (apply_result, tx.fee)

@@ -712,6 +712,7 @@ fn live_head(
     taker: &[u8; 20],
     maker_pays_leg: &Leg,
     mutate: bool,
+    stale: &mut Vec<Hash256>,
 ) -> Option<(u64, Hash256, serde_json::Value, [u8; 20], Me, Me)> {
     let mut i = *start;
     let result = loop {
@@ -731,6 +732,7 @@ fn live_head(
         if &maker == taker {
             if mutate {
                 delete_maker_offer(sandbox, &okey, &offer, &maker);
+                stale.push(okey);
             }
             i += 1;
             continue;
@@ -756,6 +758,7 @@ fn live_head(
         if gives.0 == 0 || wants.0 == 0 || me_is_zero(available(sandbox, &maker, maker_pays_leg)) {
             if mutate {
                 delete_maker_offer(sandbox, &okey, &offer, &maker);
+                stale.push(okey);
             }
             i += 1;
             continue;
@@ -818,6 +821,7 @@ fn cross_bridged(
     inv_base: &Hash256,
     amm: &Option<crate::tx::amm_swap::Amm>,
     sandbox: &mut Sandbox,
+    stale: &mut Vec<Hash256>,
 ) -> Option<(Me, Me, u32)> {
     let xrp_leg = Leg { xrp: true, cur: [0u8; 20], issuer: [0u8; 20] };
     let zero = [0u8; 20];
@@ -866,9 +870,9 @@ fn cross_bridged(
         // Each BRIDGE LEG is a BookStep of its own pair, so its book head
         // competes with that pair's pool (fib slice) — #105666830's XAH leg
         // filled from the XAH/XRP pool on mainnet.
-        let dpeek = live_head(sandbox, &ld, &mut di, taker, pays_leg, false);
-        let apeek = live_head(sandbox, &la, &mut ai, taker, &xrp_leg, false);
-        let bpeek = live_head(sandbox, &lb, &mut bi, taker, pays_leg, false);
+        let dpeek = live_head(sandbox, &ld, &mut di, taker, pays_leg, false, stale);
+        let apeek = live_head(sandbox, &la, &mut ai, taker, &xrp_leg, false, stale);
+        let bpeek = live_head(sandbox, &lb, &mut bi, taker, pays_leg, false, stale);
         let a_fib = amm_a.as_ref().and_then(|am| {
             crate::tx::amm_swap::fib_slice(sandbox, am, amm_a_init, amm_a_iters, &xrp_leg, gets_leg)
                 .map(|s| (crate::tx::amm_swap::slice_rate(s.0, s.1), s))
@@ -945,7 +949,7 @@ fn cross_bridged(
         }
         if use_direct {
             let Some((_, okey, offer, maker, gives0, wants0)) =
-                live_head(sandbox, &ld, &mut di, taker, pays_leg, true)
+                live_head(sandbox, &ld, &mut di, taker, pays_leg, true, stale)
             else { break };
             let funded = available(sandbox, &maker, pays_leg);
             let m_gives = if me_cmp(funded, gives0).is_lt() { funded } else { gives0 };
@@ -970,7 +974,7 @@ fn cross_bridged(
             let a_book = if a_use_amm {
                 None
             } else {
-                match live_head(sandbox, &la, &mut ai, taker, &xrp_leg, true) {
+                match live_head(sandbox, &la, &mut ai, taker, &xrp_leg, true, stale) {
                     Some(h) => Some(h),
                     None => break,
                 }
@@ -978,7 +982,7 @@ fn cross_bridged(
             let b_book = if b_use_amm {
                 None
             } else {
-                match live_head(sandbox, &lb, &mut bi, taker, pays_leg, true) {
+                match live_head(sandbox, &lb, &mut bi, taker, pays_leg, true, stale) {
                     Some(h) => Some(h),
                     None => break,
                 }
@@ -1097,6 +1101,7 @@ pub(crate) fn cross_engine_to(
     offer_crossing: bool,
     domain: Option<&Hash256>,
     sandbox: &mut Sandbox,
+    stale: &mut Vec<Hash256>,
 ) -> (Me, Me, u32) {
     let mut crossed = 0u32;
     if threshold == 0 {
@@ -1126,7 +1131,7 @@ pub(crate) fn cross_engine_to(
     if offer_crossing && !pays_leg.xrp && !gets_leg.xrp && domain.is_none() {
         if let Some(r) = cross_bridged(
             taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell,
-            &inv_base, &amm, sandbox,
+            &inv_base, &amm, sandbox, stale,
         ) {
             return r;
         }
@@ -1179,7 +1184,22 @@ pub(crate) fn cross_engine_to(
                 if &maker == taker {
                     // Self-crossing: rippled cancels the older own offer.
                     delete_maker_offer(sandbox, &okey, &offer, &maker);
+                    stale.push(okey);
                     continue;
+                }
+                // Expired offers are never crossed — the stream collects them
+                // as removable and they are deleted (`hasExpired`: expiry is
+                // reached once parentCloseTime >= Expiration, so the base
+                // ledger's close time is the one to test).
+                // #105776250 CD408C1D crosses a book whose head expired 17s
+                // before the parent closed; mainnet deletes it and kills the
+                // offer, we consumed it.
+                if let Some(exp) = offer.get("Expiration").and_then(|v| v.as_u64()) {
+                    if exp != 0 && sandbox.base().header.close_time as u64 >= exp {
+                        delete_maker_offer(sandbox, &okey, &offer, &maker);
+                        stale.push(okey);
+                        continue;
+                    }
                 }
                 let (Some(m_gives0), Some(m_wants0)) = (
                     offer.get("TakerGets").and_then(keylet::amount_mant_exp),
@@ -1187,12 +1207,14 @@ pub(crate) fn cross_engine_to(
                 ) else { continue };
                 if m_gives0.0 == 0 || m_wants0.0 == 0 {
                     delete_maker_offer(sandbox, &okey, &offer, &maker);
+                    stale.push(okey);
                     continue;
                 }
                 let funded = available(sandbox, &maker, pays_leg);
                 if me_is_zero(funded) {
                     // Unfunded offers found during the walk are removed.
                     delete_maker_offer(sandbox, &okey, &offer, &maker);
+                    stale.push(okey);
                     continue;
                 }
                 let m_gives = if me_cmp(funded, m_gives0).is_lt() { funded } else { m_gives0 };
@@ -1214,6 +1236,32 @@ pub(crate) fn cross_engine_to(
                     }
                     if me_is_zero(give) {
                         break 'dirs;
+                    }
+                }
+                // The book gate above compares ENCODED qualities, where the
+                // taker's limit and a maker can tie at 16 digits while the
+                // maker is really a hair worse. What actually decides it is
+                // the quality the fill ACHIEVES: once the fill is clamped to
+                // the taker's remaining input and the output floored to whole
+                // drops, the realised rate can land well outside the limit.
+                // rippled re-checks exactly that and drops the whole path,
+                // forgiving only a 1e-7 relative round-off (StrandFlow.h:698
+                // "Path rejected by limitQuality").
+                //
+                // #105780948 101AD681: an IoC offer ties with the book head at
+                // 0x5503BD5CE357AF28, but it is 2.1e-9 XMusic short of buying
+                // the full 4621775 drops, so the fill floors to 4621774 and
+                // realises 2.16e-7 worse than its limit. Mainnet crosses
+                // nothing and returns tecKILLED; we filled it.
+                if threshold != u64::MAX && !me_is_zero(give) && !me_is_zero(pay) {
+                    if let Some(ach) = rate_of_me(pay, give) {
+                        if ach > threshold {
+                            let (a, t) = (rate_me(ach), rate_me(threshold));
+                            let excess = me_muldiv(me_sub(a, t), (10_000_000, 0), (1, 0), false);
+                            if me_cmp(excess, t).is_ge() {
+                                break 'dirs;
+                            }
+                        }
                     }
                 }
                 move_leg(sandbox, &maker, beneficiary, pays_leg, give);
@@ -1269,10 +1317,11 @@ pub(crate) fn cross_engine(
     sell: bool,
     domain: Option<&Hash256>,
     sandbox: &mut Sandbox,
+    stale: &mut Vec<Hash256>,
 ) -> (Me, Me, u32) {
     // FlowCross always builds both the direct and the XRP-bridged strand, so
     // offer crossing is multi-path by construction.
-    cross_engine_to(taker, taker, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell, true, domain, sandbox)
+    cross_engine_to(taker, taker, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell, true, domain, sandbox, stale)
 }
 
 pub struct OfferCreateTransactor;
@@ -1377,18 +1426,37 @@ impl Transactor for OfferCreateTransactor {
         // Cross against the inverse book while the maker's rate is within the
         // taker's limit price (threshold = quality with the sides swapped).
         let threshold = rate_of_me(tg0, tp0).unwrap_or(0);
-        let (rem_pays, rem_gets, crossed) =
-            cross_engine(&tx.account, tp0, tg0, &pays_leg, &gets_leg, threshold, sell, domain.as_ref(), sandbox);
+        // Offers the walk removes as STALE — expired, unfunded, empty or the
+        // taker's own — are not part of the crossing: rippled applies its
+        // removableOffers to the cancel sandbox as well, so the cleanup
+        // survives a kill that rolls every fill back (OfferCreate.cpp:460).
+        let mut stale: Vec<Hash256> = Vec::new();
+        let (rem_pays, rem_gets, crossed) = cross_engine(
+            &tx.account, tp0, tg0, &pays_leg, &gets_leg, threshold, sell, domain.as_ref(), sandbox,
+            &mut stale,
+        );
+        // Re-run the stale removals after a rollback restores them.
+        let reap = |sandbox: &mut Sandbox, stale: &[Hash256]| {
+            for okey in stale {
+                let Some(off) = json_at(sandbox, okey) else { continue };
+                let Some(maker) = off.get("Account").and_then(|v| v.as_str()).and_then(decode20)
+                else { continue };
+                delete_maker_offer(sandbox, okey, &off, &maker);
+            }
+        };
 
         let filled = if sell { me_is_zero(rem_gets) } else { me_is_zero(rem_pays) };
         if fok && !filled {
-            // FillOrKill not fully filled: nothing survives but the fee.
+            // FillOrKill not fully filled: nothing survives but the fee and
+            // the stale-offer cleanup.
             sandbox.restore_snapshot(snap);
+            reap(sandbox, &stale);
             return TxResult::Killed;
         }
         if ioc {
             if crossed == 0 {
                 sandbox.restore_snapshot(snap);
+                reap(sandbox, &stale);
                 return TxResult::Killed;
             }
             return TxResult::Success; // keep fills, never place

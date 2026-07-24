@@ -814,7 +814,11 @@ fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<Hash
     if applied.is_success() {
         (TxResult::Success.code_str().to_string(), sb.into_modifications())
     } else if applied.is_claimed() {
-        sb.restore_snapshot(snap);
+        // See apply.rs: tecKILLED carries OfferCreate's stale-offer cleanup,
+        // which the transactor has already rolled its fills back around.
+        if applied != TxResult::Killed {
+            sb.restore_snapshot(snap);
+        }
         (applied.code_str().to_string(), sb.into_modifications())
     } else {
         (applied.code_str().to_string(), HashMap::new())
