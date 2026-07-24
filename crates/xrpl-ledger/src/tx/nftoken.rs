@@ -463,7 +463,9 @@ impl Transactor for NFTokenAcceptOfferTransactor {
         if let (Some(sk), Some(bk)) = (sell_ref, buy_ref) {
             let (Some(sell), Some(buy)) = (read_offer(sandbox, sk), read_offer(sandbox, bk))
             else {
-                return TxResult::NoEntry;
+                // A named NFT offer that isn't there is tecOBJECT_NOT_FOUND,
+                // not tecNO_ENTRY (NFTokenAcceptOffer::preclaim's checkOffer).
+                return TxResult::ObjectNotFound;
             };
             let seller = sell.owner;
             let buyer = buy.owner;
@@ -494,7 +496,9 @@ impl Transactor for NFTokenAcceptOfferTransactor {
 
         // Direct mode.
         let Some(offer) = sell_ref.or(buy_ref).and_then(|k| read_offer(sandbox, k)) else {
-            return TxResult::NoEntry;
+            // #105786567 63597143: the offer was already gone, and mainnet
+            // reports tecOBJECT_NOT_FOUND for it.
+            return TxResult::ObjectNotFound;
         };
         if offer.owner == tx.account {
             return TxResult::NoPermission;

@@ -393,6 +393,20 @@ impl Transactor for AMMWithdrawTransactor {
         let Some((amm_key, amm_acct, lp_leg)) = amm_ctx(tx, sandbox) else {
             return TxResult::NoEntry;
         };
+        // A pool cannot pay out more of an asset than it holds:
+        // AMMWithdraw::preclaim's checkAmount rejects amount > balance with
+        // tecAMM_BALANCE before anything moves (AMMWithdraw.cpp:232).
+        // #105763689 740D41D6 asks for 50950 drops from a pool holding 43921.
+        for f in ["Amount", "Amount2"] {
+            if let Some(v) = tx.fields.get(f) {
+                if let (Some(leg), Some(amt)) = (ox::leg_of(v), keylet::amount_mant_exp(v)) {
+                    let held = crate::tx::amm_swap::holds(sandbox, &amm_acct, &leg);
+                    if ox::me_cmp(amt, held).is_gt() {
+                        return TxResult::AmmBalance;
+                    }
+                }
+            }
+        }
         // Move the withdrawn side(s) AMM account → withdrawer.
         for f in ["Amount", "Amount2"] {
             if let Some(v) = tx.fields.get(f) {

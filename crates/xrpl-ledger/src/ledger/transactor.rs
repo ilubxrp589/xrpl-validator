@@ -62,6 +62,12 @@ pub enum TxResult {
     ArrayTooLarge,
     /// The object this transaction would create already exists.
     Duplicate,
+    /// A referenced object does not exist (NFT offers use this rather than
+    /// the older tecNO_ENTRY).
+    ObjectNotFound,
+    /// An AMM pool cannot cover the requested amount, or the account holds no
+    /// LP tokens in it.
+    AmmBalance,
     /// Directory is full (e.g. > 250 outstanding tickets).
     DirFull,
     /// Creating the owned object(s) would breach the account's owner reserve.
@@ -117,6 +123,8 @@ impl TxResult {
             | TxResult::DstTagNeeded
             | TxResult::ArrayTooLarge
             | TxResult::Duplicate
+            | TxResult::ObjectNotFound
+            | TxResult::AmmBalance
             | TxResult::DirFull
             | TxResult::InsufficientReserve
             | TxResult::InsufReserveLine
@@ -152,6 +160,8 @@ impl TxResult {
             TxResult::DstTagNeeded => "tecDST_TAG_NEEDED",
             TxResult::ArrayTooLarge => "tecARRAY_TOO_LARGE",
             TxResult::Duplicate => "tecDUPLICATE",
+            TxResult::ObjectNotFound => "tecOBJECT_NOT_FOUND",
+            TxResult::AmmBalance => "tecAMM_BALANCE",
             TxResult::DirFull => "tecDIR_FULL",
             TxResult::InsufficientReserve => "tecINSUFFICIENT_RESERVE",
             TxResult::InsufReserveLine => "tecINSUF_RESERVE_LINE",

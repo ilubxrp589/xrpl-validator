@@ -461,7 +461,7 @@ pub(crate) fn discover(sandbox: &Sandbox, spend: &Leg, want: &Leg, taker: &[u8; 
 /// Pool balance of `leg` held by the AMM account (rippled ammAccountHolds:
 /// full XRP balance with NO reserve subtraction; signed line balance toward
 /// the account for IOU).
-fn holds(sandbox: &Sandbox, acct: &[u8; 20], leg: &Leg) -> Me {
+pub(crate) fn holds(sandbox: &Sandbox, acct: &[u8; 20], leg: &Leg) -> Me {
     if leg.xrp {
         let key = keylet::account_root_key(acct);
         let Some(a) = ox::json_at(sandbox, &key) else { return (0, 0) };
