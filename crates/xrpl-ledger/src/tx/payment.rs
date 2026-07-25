@@ -545,6 +545,26 @@ impl PaymentTransactor {
                 return TxResult::PathDry;
             }
         }
+        // rippled DirectStepI::maxPaymentFlow (DirectStep.cpp:476-488): the
+        // strand's last step delivers the IOU issuer→dest, and it can move at
+        // most creditLimit(dest,issuer) − heldByDest. A destination already at
+        // or over its trust limit therefore receives NOTHING, and since every
+        // strand ends in that same step the whole flow is dry (#105740164
+        // B7C6328C: the arb bot's JUST1 line is limit 0 while it already holds
+        // 1.000383, so mainnet delivers zero — tecPATH_DRY, fee only — where we
+        // crossed two AMM pools and over-delivered 39131 JUST1). A destination
+        // merely near its limit caps the fill instead of blocking it.
+        let recv_cap = ox::dest_receivable(sandbox, dest, &want_leg);
+        if matches!(&recv_cap, Some(c) if ox::me_is_zero(*c)) {
+            return TxResult::PathDry;
+        }
+        // Drive the strand toward the smaller of the requested Amount and the
+        // destination's remaining capacity; `want0` is kept for the "delivered
+        // the full Amount?" partial check further down.
+        let want_target = match &recv_cap {
+            Some(c) if ox::me_cmp(*c, want0).is_lt() => *c,
+            _ => want0,
+        };
         // The strand's input is bounded by what the sender actually holds of
         // the SendMax asset (issuer mints freely; XRP is balance-minus-
         // reserve; IOU is the trust-line holding). A sender with nothing to
@@ -587,8 +607,8 @@ impl PaymentTransactor {
             _ => None,
         };
         let want_gross = match want_rate {
-            Some(r) => ox::me_muldiv(want0, (r as u128, 0), (1_000_000_000, 0), true),
-            None => want0,
+            Some(r) => ox::me_muldiv(want_target, (r as u128, 0), (1_000_000_000, 0), true),
+            None => want_target,
         };
         // The strand's output belongs to the DESTINATION: crediting the
         // sender first and forwarding would materialize an intermediate
@@ -1081,6 +1101,95 @@ mod tests {
         let line = sandbox.read(&keylet::ripple_state_key(&taker, &issuer, &cur)).unwrap();
         let line: serde_json::Value = serde_json::from_slice(&line).unwrap();
         assert_ne!(line["Balance"]["value"].as_str().unwrap(), "0");
+    }
+
+    /// rippled `DirectStepI::maxPaymentFlow` (DirectStep.cpp:487): a
+    /// destination already holding at or above its trust limit for the
+    /// delivered currency can receive NOTHING, so a cross-currency payment
+    /// that would otherwise cross the book to fill it is tecPATH_DRY, fee only
+    /// — mainnet #105740164 B7C6328C, the arb bot whose JUST1 line is limit 0
+    /// while already holding 1.000383. Raising that same line's limit lets the
+    /// identical payment deliver, proving the book liquidity was present and it
+    /// is the trust ceiling — not a dry book — that blocks the fill.
+    #[test]
+    fn path_payment_dry_when_destination_at_trust_limit() {
+        let taker = [0x01u8; 20];
+        let issuer = [0x03u8; 20];
+        assert!(taker < issuer, "taker must be the LOW account so LowLimit is its limit");
+
+        // A USD book (issuer sells 5 USD for 5 XRP) plus a taker USD line that
+        // already holds 1 USD, its own limit set to `taker_limit`.
+        let build = |taker_limit: &str| -> LedgerState {
+            let mut state = make_state();
+            add_account(&mut state, &taker, 50_000_000, 1);
+            add_account(&mut state, &issuer, 50_000_000, 1);
+            let cur = crate::tx::offer::amount_currency20(
+                &serde_json::json!({"currency": "USD", "issuer": hex::encode(issuer), "value": "1"}),
+            )
+            .unwrap();
+            let line = serde_json::json!({
+                "LedgerEntryType": "RippleState",
+                "Flags": 0x0001_0000u64,
+                "Balance": {"currency": hex::encode_upper(cur),
+                            "issuer": "0000000000000000000000000000000000000000",
+                            "value": "1"},
+                "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(taker), "value": taker_limit},
+                "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(issuer), "value": "1000000"},
+            });
+            state
+                .state_map
+                .insert(keylet::ripple_state_key(&taker, &issuer, &cur), serde_json::to_vec(&line).unwrap())
+                .unwrap();
+            let mut sandbox = Sandbox::new(&state);
+            let offer_tx = TxFields {
+                account: issuer,
+                tx_type: "OfferCreate".to_string(),
+                fee: 12,
+                sequence: 2,
+                ticket_seq: None,
+                last_ledger_seq: None,
+                fields: serde_json::json!({
+                    "TakerPays": "5000000",
+                    "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "5"},
+                }),
+            };
+            assert_eq!(
+                crate::tx::offer::OfferCreateTransactor.do_apply(&offer_tx, &mut sandbox),
+                TxResult::Success
+            );
+            let mods = sandbox.into_modifications();
+            apply_modifications(&mut state, mods).unwrap();
+            state
+        };
+
+        let pay = TxFields {
+            account: taker,
+            tx_type: "Payment".to_string(),
+            fee: 12,
+            sequence: 2,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Destination": hex::encode(taker),
+                "Amount": {"currency": "USD", "issuer": hex::encode(issuer), "value": "1000000000"},
+                "SendMax": "5000000",
+                "Flags": 131072u64, // tfPartialPayment
+            }),
+        };
+
+        // Limit 0 while already holding 1 USD ⇒ receives nothing ⇒ dry, and the
+        // sender spends none of its XRP (do_apply mutates nothing).
+        let s_capped = build("0");
+        let mut sb = Sandbox::new(&s_capped);
+        assert_eq!(PaymentTransactor.do_apply(&pay, &mut sb), TxResult::PathDry);
+        assert_eq!(read_balance(&sb, &taker), 50_000_000);
+
+        // Same book, same payment, generous limit ⇒ the book fills it and the
+        // sender spends its 5 XRP.
+        let s_open = build("1000000");
+        let mut sb2 = Sandbox::new(&s_open);
+        assert_eq!(PaymentTransactor.do_apply(&pay, &mut sb2), TxResult::Success);
+        assert_eq!(read_balance(&sb2, &taker), 45_000_000);
     }
 
     /// A direct IOU payment can only be delivered to a destination that

@@ -320,6 +320,44 @@ pub(crate) fn available(sandbox: &Sandbox, id: &[u8; 20], leg: &Leg) -> Me {
     }
 }
 
+/// The most a payment can land on `dest`'s trust line for `leg` — rippled
+/// `DirectStepI::maxPaymentFlow` (DirectStep.cpp:476-488), the ceiling the
+/// strand's final issuer→dest step imposes. When `dest` already holds the IOU
+/// (balance ≥ 0) the room is `creditLimit(dest,issuer) − held`: a destination
+/// at or over its own trust limit can receive NOTHING and the whole strand is
+/// dry (every strand shares that last step). When `dest` instead owes the
+/// issuer (negative balance) it may receive up to what it owes — the Redeems
+/// branch (:483). Returns `None` when there is no such ceiling: XRP, or
+/// `dest == issuer` (the issuer redeems its own IOU without limit), or no line
+/// yet (a missing line is the caller's own dry guard, not a zero cap). A
+/// returned zero means the destination can receive nothing ⇒ `tecPATH_DRY`.
+pub(crate) fn dest_receivable(sandbox: &Sandbox, dest: &[u8; 20], leg: &Leg) -> Option<Me> {
+    if leg.xrp || dest == &leg.issuer {
+        return None;
+    }
+    let lkey = keylet::ripple_state_key(dest, &leg.issuer, &leg.cur);
+    let line = json_at(sandbox, &lkey)?;
+    // Balance is stored from the LOW account's view (positive ⇒ high owes low
+    // ⇒ low holds), so `dest` holds when it is low with a positive balance or
+    // high with a negative one — the same test `available()` uses above.
+    let (bneg, bmag) = signed_value(&line["Balance"]);
+    let dest_low = dest < &leg.issuer;
+    let dest_holds = if dest_low { !bneg } else { bneg };
+    if !dest_holds && bmag.0 > 0 {
+        // Negative balance: dest owes the issuer and may redeem up to that.
+        return Some(bmag);
+    }
+    // Non-negative balance: ceiling is the trust limit minus what is held.
+    let held = if dest_holds { bmag } else { (0, 0) };
+    let limit_field = if dest_low { "LowLimit" } else { "HighLimit" };
+    let limit = keylet::amount_mant_exp(&line[limit_field]).unwrap_or((0, 0));
+    if me_cmp(limit, held).is_gt() {
+        Some(me_sub(limit, held))
+    } else {
+        Some((0, 0))
+    }
+}
+
 /// Adjust one party's side of an IOU movement (line balance ±amt), creating
 /// the line if the receiver has none (rippled offer-crossing behavior).
 pub(crate) fn line_adjust(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, amt: Me, receiving: bool) {
