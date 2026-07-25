@@ -407,6 +407,57 @@ impl Transactor for AMMWithdrawTransactor {
                 }
             }
         }
+        // tfWithdrawAll: redeem the LP's ENTIRE position — both pool assets out
+        // in proportion to their LPToken share, ALL their LPTokens burned, and
+        // the LPToken trust line torn down (deleted, dropped from BOTH owner
+        // directories, a reserve released on each side). rippled AMMWithdraw
+        // apply-side under tfWithdrawAll. #105787513 EDD6BA97 / #105796380
+        // 2437575D: mainnet emits eight nodes; we emitted three (a fixed default
+        // burn, no asset payout, the LP line only Modified to zero not deleted).
+        if tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & 0x0002_0000 != 0 {
+            let lp_key = keylet::ripple_state_key(&tx.account, &amm_acct, &lp_leg.cur);
+            let Some(lp_line) = ox::json_at(sandbox, &lp_key) else { return TxResult::Success };
+            let (_neg, lp_bal) = ox::signed_value(&lp_line["Balance"]);
+            if lp_bal.0 == 0 {
+                return TxResult::Success;
+            }
+            let total_lp = ox::json_at(sandbox, &amm_key)
+                .and_then(|o| o["LPTokenBalance"]["value"].as_str().map(str::to_string))
+                .and_then(|s| keylet::amount_mant_exp(&serde_json::Value::String(s)))
+                .unwrap_or(lp_bal);
+            // Both assets out, proportional to the redeemed LPToken share.
+            let asset_leg = |v: &serde_json::Value| -> Option<ox::Leg> {
+                if v.get("currency").and_then(|c| c.as_str()) == Some("XRP") {
+                    return Some(ox::Leg { xrp: true, cur: [0u8; 20], issuer: [0u8; 20] });
+                }
+                let mut amt = v.clone();
+                amt["value"] = serde_json::json!("0");
+                ox::leg_of(&amt)
+            };
+            for f in ["Asset", "Asset2"] {
+                let Some(v) = tx.fields.get(f) else { continue };
+                let Some(leg) = asset_leg(v) else { continue };
+                let pool = crate::tx::amm_swap::holds(sandbox, &amm_acct, &leg);
+                let share = ox::me_muldiv(pool, lp_bal, total_lp, false);
+                if share.0 > 0 {
+                    ox::move_leg(sandbox, &amm_acct, &tx.account, &leg, share);
+                }
+            }
+            // Tear down the LPToken trust line on both sides (the AMM side is the
+            // issuer, so move_leg would not touch it — do it explicitly).
+            let w_low = tx.account < amm_acct;
+            let node = |field: &str| {
+                lp_line.get(field).and_then(|v| v.as_str()).and_then(|s| u64::from_str_radix(s, 16).ok())
+            };
+            let (w_node, a_node) = if w_low { ("LowNode", "HighNode") } else { ("HighNode", "LowNode") };
+            sandbox.delete(lp_key);
+            crate::ledger::directory::owner_dir_remove(sandbox, &tx.account, &lp_key, node(w_node), false);
+            crate::ledger::directory::owner_dir_remove(sandbox, &amm_acct, &lp_key, node(a_node), false);
+            ox::owner_count_add(sandbox, &tx.account, -1);
+            ox::owner_count_add(sandbox, &amm_acct, -1);
+            bump_lp_balance(sandbox, &amm_key, lp_bal, false);
+            return TxResult::Success;
+        }
         // Move the withdrawn side(s) AMM account → withdrawer.
         for f in ["Amount", "Amount2"] {
             if let Some(v) = tx.fields.get(f) {
@@ -830,6 +881,68 @@ mod tests {
         let data = sandbox.read(&key).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&data).unwrap();
         assert_eq!(v["Balance"].as_str().unwrap(), "65000000");
+    }
+
+    /// tfWithdrawAll redeems the LP's whole position and TEARS DOWN the LPToken
+    /// trust line — deleted, not left Modified at zero. rippled AMMWithdraw
+    /// apply-side under tfWithdrawAll; mainnet #105787513 / #105796380 emit the
+    /// LP line as Deleted (:2), we used to Modify it (:1) and skip the payout.
+    #[test]
+    fn amm_withdraw_all_tears_down_lp_line() {
+        let alice = [0x01u8; 20];
+        let usd_issuer = [0x02u8; 20];
+        let state = make_state(&alice, 100_000_000);
+        let mut sandbox = Sandbox::new(&state);
+
+        let create_tx = TxFields {
+            account: alice, tx_type: "AMMCreate".to_string(), fee: 12, sequence: 1,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Amount": "30000000",
+                "Amount2": {"currency": "USD", "issuer": hex::encode(usd_issuer), "value": "100"},
+                "TradingFee": 500,
+            }),
+        };
+        assert_eq!(AMMCreateTransactor.do_apply(&create_tx, &mut sandbox), TxResult::Success);
+
+        // A second deposit lifts her LPToken balance above the fixed default the
+        // old partial path burns, so only a real full-balance burn empties the
+        // line — otherwise the test would pass even without the branch.
+        let dep = TxFields {
+            account: alice, tx_type: "AMMDeposit".to_string(), fee: 12, sequence: 2,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Asset": {"currency": "XRP"},
+                "Asset2": {"currency": "USD", "issuer": hex::encode(usd_issuer)},
+                "Amount": "10000000",
+            }),
+        };
+        assert_eq!(AMMDepositTransactor.do_apply(&dep, &mut sandbox), TxResult::Success);
+
+        let wd_all = TxFields {
+            account: alice, tx_type: "AMMWithdraw".to_string(), fee: 12, sequence: 3,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Asset": {"currency": "XRP"},
+                "Asset2": {"currency": "USD", "issuer": hex::encode(usd_issuer)},
+                "Flags": 0x0002_0000u64, // tfWithdrawAll
+            }),
+        };
+        // Alice's LPToken trust line (she holds all the pool's LPTokens).
+        let amm_key = amm_key_from_asset_fields(&wd_all).unwrap();
+        let amm_obj: serde_json::Value = serde_json::from_slice(&sandbox.read(&amm_key).unwrap()).unwrap();
+        let amm_acct = <[u8; 20]>::try_from(
+            hex::decode(amm_obj["Account"].as_str().unwrap()).unwrap().as_slice(),
+        ).unwrap();
+        let lp_cur = keylet::amm_lpt_currency(
+            &asset_currency20(&wd_all.fields["Asset"]),
+            &asset_currency20(&wd_all.fields["Asset2"]),
+        );
+        let lp_line = keylet::ripple_state_key(&alice, &amm_acct, &lp_cur);
+        assert!(sandbox.exists(&lp_line), "alice holds the LPToken line after create");
+
+        assert_eq!(AMMWithdrawTransactor.do_apply(&wd_all, &mut sandbox), TxResult::Success);
+        assert!(!sandbox.exists(&lp_line), "tfWithdrawAll deletes the LPToken trust line");
     }
 
     #[test]
