@@ -1258,7 +1258,19 @@ pub(crate) fn cross_engine_to(
                 let m_gives = if me_cmp(funded, m_gives0).is_lt() { funded } else { m_gives0 };
                 // A sell takes the whole maker offer (bounded only by rem_gets
                 // below); a buy stops at the wanted rem_pays.
-                let mut give = if !sell && me_cmp(rem_pays, m_gives).is_lt() { rem_pays } else { m_gives };
+                let buy_bound = !sell && me_cmp(rem_pays, m_gives).is_lt();
+                let mut give = if buy_bound { rem_pays } else { m_gives };
+                // Track whether the TAKER's own side bounds this fill. The
+                // achieved-quality re-check below only rejects (IoC/FoK style)
+                // when it does — a taker whose partial buy or gets-side clamp
+                // floors the output worse than its limit. A maker that is simply
+                // UNDERFUNDED at the book quality is crossed to its funded amount
+                // and the taker rests the remainder; rippled does not re-reject
+                // that, so the ≤1e-7 round-up on `pay` must not strand the whole
+                // offer (#105672435 B409D45C: best maker 499CA86D is funded only
+                // 22.283542 of 22.928591 at the taker's EXACT limit q=0x5a091beb…
+                // — we rested full, mainnet crossed it and rested 0.645).
+                let mut taker_clamped = buy_bound;
                 if pays_leg.xrp {
                     give = (me_rescale(give, 0, false), 0);
                 }
@@ -1268,6 +1280,7 @@ pub(crate) fn cross_engine_to(
                 }
                 if me_cmp(pay, rem_gets).is_gt() {
                     pay = rem_gets;
+                    taker_clamped = true;
                     give = me_muldiv(pay, m_gives0, m_wants0, false);
                     if pays_leg.xrp {
                         give = (me_rescale(give, 0, false), 0);
@@ -1291,7 +1304,7 @@ pub(crate) fn cross_engine_to(
                 // the full 4621775 drops, so the fill floors to 4621774 and
                 // realises 2.16e-7 worse than its limit. Mainnet crosses
                 // nothing and returns tecKILLED; we filled it.
-                if threshold != u64::MAX && !me_is_zero(give) && !me_is_zero(pay) {
+                if taker_clamped && threshold != u64::MAX && !me_is_zero(give) && !me_is_zero(pay) {
                     if let Some(ach) = rate_of_me(pay, give) {
                         if ach > threshold {
                             let (a, t) = (rate_me(ach), rate_me(threshold));
@@ -1984,6 +1997,78 @@ mod tests {
         // and the taker keeps every drop.
         assert!(sandbox.exists(&keylet::offer_key(&maker, 2)));
         assert_eq!(read_balance(&sandbox, &taker), 14_000_000);
+    }
+
+    /// A PLAIN offer crossing an UNDERFUNDED maker at exactly the taker's limit
+    /// quality must cross the maker to its funded amount and rest the remainder,
+    /// not strand the whole offer. The section-1 achieved-quality break — meant
+    /// for the #105780948 IoC tecKILLED, where the TAKER's side clamps the fill
+    /// short — also fired here: the ≤1e-7 round-up on `pay` for the small
+    /// maker-funds-clamped fill tips just past the 1e-7 forgiveness, so we broke
+    /// and rested the whole offer. Mainnet #105672435 B409D45C crosses maker
+    /// 499CA86D (funded 22.283542 of 22.928591 at the taker's exact q).
+    #[test]
+    fn plain_offer_crosses_underfunded_maker_at_equal_quality() {
+        let taker = [0x01u8; 20];
+        let maker = [0x04u8; 20];
+        let issuer = [0x02u8; 20];
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"666");
+
+        let mut state = make_state_with_account(&taker, 50_000_000);
+        for id in [&maker, &issuer] {
+            let a = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": hex::encode(id),
+                "Balance": "50000000", "Sequence": 1, "OwnerCount": 0,
+            });
+            state.state_map.insert(keylet::account_root_key(id), serde_json::to_vec(&a).unwrap()).unwrap();
+        }
+        let mkey = keylet::ripple_state_key(&maker, &issuer, &cur);
+        let (lo, hi) = if maker < issuer { (maker, issuer) } else { (issuer, maker) };
+        let mline = |bal: &str| serde_json::json!({
+            "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+            "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000",
+                        "value": if maker < issuer { bal.to_string() } else { format!("-{bal}") }},
+            "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000000"},
+            "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000000"},
+        });
+        // Maker holds 100 666 and rests a full-size sell: 22.928591 for 5878826
+        // drops (q = the taker's exact limit below).
+        state.state_map.insert(mkey, serde_json::to_vec(&mline("100")).unwrap()).unwrap();
+        let mut sandbox = Sandbox::new(&state);
+        let maker_offer = TxFields {
+            account: maker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerPays": "5878826",
+                "TakerGets": {"currency": "666", "issuer": hex::encode(issuer), "value": "22.928591"},
+            }),
+        };
+        assert_eq!(OfferCreateTransactor.do_apply(&maker_offer, &mut sandbox), TxResult::Success);
+        let mods = sandbox.into_modifications();
+        apply_modifications(&mut state, mods).unwrap();
+        assert!(json_at(&Sandbox::new(&state), &keylet::offer_key(&maker, 2)).is_some());
+        // Maker then spends most of its 666 elsewhere: the resting offer is now
+        // underfunded — only 22.283542 backs the 22.928591 it still advertises.
+        state.state_map.insert(mkey, serde_json::to_vec(&mline("22.283542")).unwrap()).unwrap();
+
+        // Taker (PLAIN, Flags 0): buy 22.928591 666 for 5878826 drops.
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: taker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerGets": "5878826",
+                "TakerPays": {"currency": "666", "issuer": hex::encode(issuer), "value": "22.928591"},
+            }),
+        };
+        assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+        // The maker's funds are exhausted so its offer is consumed, and the taker
+        // spent XRP acquiring the 666. Without the gate the achieved-quality
+        // break stranded the whole crossing: the maker offer survived and the
+        // taker spent only its fee.
+        assert!(!sandbox.exists(&keylet::offer_key(&maker, 2)), "underfunded maker crossed to exhaustion");
+        assert!(read_balance(&sandbox, &taker) < 49_000_000, "taker spent XRP crossing the maker");
     }
 
     /// tfSell means "sell the ENTIRE TakerGets, even if that acquires more
