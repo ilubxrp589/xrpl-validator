@@ -1248,6 +1248,24 @@ pub(crate) fn cross_engine_to(
                     stale.push(okey);
                     continue;
                 }
+                // rippled re-checks the maker's ACTUAL quality against the
+                // taker's limit, not just the quantized book-dir level it rests
+                // in: an offer can sit in a page that ties the threshold while
+                // its exact getRate is one ULP worse, and rippled leaves such an
+                // offer untouched. #105787531 BB6660FA rests in dir
+                // 5A090CC3291B2B61 (== threshold) but its 5211839/20.46019077105154
+                // rate encodes to 2547307138198370, one over the threshold's
+                // ...369 — mainnet never crosses it; we did (10v4). This is NOT
+                // the fill's achieved rate (that check is below) but the maker
+                // offer's own advertised rate. The equal-quality maker of
+                // #105672435 (rate == threshold) still crosses.
+                if threshold != u64::MAX {
+                    if let Some(mq) = rate_of_me(m_wants0, m_gives0) {
+                        if mq > threshold {
+                            continue;
+                        }
+                    }
+                }
                 let funded = available(sandbox, &maker, pays_leg);
                 if me_is_zero(funded) {
                     // Unfunded offers found during the walk are removed.
