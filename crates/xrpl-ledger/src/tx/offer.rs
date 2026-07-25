@@ -1494,7 +1494,19 @@ impl Transactor for OfferCreateTransactor {
 
         // Cross against the inverse book while the maker's rate is within the
         // taker's limit price (threshold = quality with the sides swapped).
-        let threshold = rate_of_me(tg0, tp0).unwrap_or(0);
+        let mut threshold = rate_of_me(tg0, tp0).unwrap_or(0);
+        // tfPassive: a passive offer crosses only STRICTLY better makers and
+        // rests behind equal-quality ones instead of consuming them (rippled
+        // OfferCreate.cpp:396 `++threshold`). Our rate encoding is inverted
+        // (lower = better) and monotone in the u64, so tighten by one ULP: an
+        // equal-quality maker then ties the pre-decrement value and fails the
+        // `q <= threshold` / maker-rate gates, while strictly-better makers keep
+        // crossing. #105807256 (tfSell|tfPassive) rests where we consumed the
+        // equal-priced makers (12v4); #105803327 (tfPassive) crossed too much
+        // (10v8).
+        if flags & 0x0001_0000 != 0 && threshold > 0 {
+            threshold -= 1;
+        }
         // Offers the walk removes as STALE — expired, unfunded, empty or the
         // taker's own — are not part of the crossing: rippled applies its
         // removableOffers to the cancel sandbox as well, so the cleanup
@@ -2087,6 +2099,79 @@ mod tests {
         // taker spent only its fee.
         assert!(!sandbox.exists(&keylet::offer_key(&maker, 2)), "underfunded maker crossed to exhaustion");
         assert!(read_balance(&sandbox, &taker) < 49_000_000, "taker spent XRP crossing the maker");
+    }
+
+    /// tfPassive: a passive offer does NOT consume makers at its own quality —
+    /// it rests behind them, crossing only strictly-better offers (rippled
+    /// OfferCreate.cpp:396 `++threshold`). An identical NON-passive offer
+    /// crosses the same maker. #105807256 / #105803327 over-mutated by
+    /// consuming the equal-priced makers a passive offer must leave alone.
+    #[test]
+    fn passive_offer_rests_behind_equal_quality_maker() {
+        let taker = [0x01u8; 20];
+        let maker = [0x04u8; 20];
+        let issuer = [0x02u8; 20];
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+
+        // Maker holds 100 USD and rests: sell 100 USD for 50 XRP (rate 500000
+        // drops/USD, exact). The taker below buys at that same exact rate.
+        let base = || -> LedgerState {
+            let mut state = make_state_with_account(&taker, 200_000_000);
+            for id in [&maker, &issuer] {
+                let a = serde_json::json!({
+                    "LedgerEntryType": "AccountRoot", "Account": hex::encode(id),
+                    "Balance": "50000000", "Sequence": 1, "OwnerCount": 0,
+                });
+                state.state_map.insert(keylet::account_root_key(id), serde_json::to_vec(&a).unwrap()).unwrap();
+            }
+            let mkey = keylet::ripple_state_key(&maker, &issuer, &cur);
+            let (lo, hi) = if maker < issuer { (maker, issuer) } else { (issuer, maker) };
+            let line = serde_json::json!({
+                "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+                "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000",
+                            "value": if maker < issuer { "100" } else { "-100" }},
+                "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000"},
+                "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000"},
+            });
+            state.state_map.insert(mkey, serde_json::to_vec(&line).unwrap()).unwrap();
+            let mut sandbox = Sandbox::new(&state);
+            let maker_offer = TxFields {
+                account: maker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
+                ticket_seq: None, last_ledger_seq: None,
+                fields: serde_json::json!({
+                    "TakerPays": "50000000",
+                    "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
+                }),
+            };
+            assert_eq!(OfferCreateTransactor.do_apply(&maker_offer, &mut sandbox), TxResult::Success);
+            let mods = sandbox.into_modifications();
+            apply_modifications(&mut state, mods).unwrap();
+            state
+        };
+        let taker_tx = |flags: u64| TxFields {
+            account: taker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerGets": "50000000",
+                "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
+                "Flags": flags,
+            }),
+        };
+
+        // Non-passive at the maker's exact rate: crosses and consumes it.
+        let st = base();
+        let mut sb = Sandbox::new(&st);
+        assert_eq!(OfferCreateTransactor.do_apply(&taker_tx(0), &mut sb), TxResult::Success);
+        assert!(!sb.exists(&keylet::offer_key(&maker, 2)), "non-passive crosses the equal-quality maker");
+        assert!(read_balance(&sb, &taker) < 199_000_000, "non-passive spent XRP");
+
+        // Passive (tfPassive): rests behind the equal-quality maker, untouched.
+        let stp = base();
+        let mut sbp = Sandbox::new(&stp);
+        assert_eq!(OfferCreateTransactor.do_apply(&taker_tx(0x0001_0000), &mut sbp), TxResult::Success);
+        assert!(sbp.exists(&keylet::offer_key(&maker, 2)), "passive rests behind the equal maker");
+        assert_eq!(read_balance(&sbp, &taker), 200_000_000, "passive consumed nothing");
     }
 
     /// tfSell means "sell the ENTIRE TakerGets, even if that acquires more
