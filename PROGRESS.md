@@ -12,7 +12,8 @@ shouldn't be here.
 
 ## Known issues — in flight (as of 2026-04-21)
 
-A third-party audit of this repo delivered **1 SEV-1** and **4 SEV-2**
+A security review of this repo — conducted with the **Fable 5 model (AI)** —
+delivered **1 SEV-1** and **4 SEV-2**
 findings that remain open. Those are being addressed through the VALAUDIT
 integration track (10 phases; Phase 1 + 2 complete).
 
@@ -34,7 +35,7 @@ Non-security items, safe to detail:
 | `state.rocks` completeness gap — some owner-dir-referenced SLEs missing after bulk_sync | Narrow retry fix shipped (commit `6dd8f22`); proactive sweeper pending |
 | `LayeredProvider::succ()` + `RpcProvider::succ()` return `None` (test-only path; production `OverlayedDbProvider` has working succ as of commit `69bc726`) | Separate card; needs RPC directory-walk helper |
 
-Full audit text is on offline media. Once each fix ships, the relevant
+Full review notes are on offline media. Once each fix ships, the relevant
 finding will get a line-level writeup at disclosure time alongside the
 commit that closes it.
 
@@ -42,7 +43,7 @@ commit that closes it.
 
 ## 2026-04-21 — VALAUDIT Phase 2 + two production bug fixes
 
-Spent the day on the audit integration track (Phase 2) and two bugs that
+Spent the day on the security-review remediation track (Phase 2) and two bugs that
 surfaced during the 24-hour watch after Phase 1's deploy.
 
 - **Phase 2: release-safety test guard** (commit `cbda593`) — CI test
@@ -82,8 +83,8 @@ such thing as a safe no-wipe restart." Third re-violation on record.
 
 ## 2026-04-19 — VALAUDIT Phase 1 + succ() root-cause fix
 
-Audit integration started. A third-party audit flagged the validator's
-public README as claiming "no code from rippled" while the actual
+Security-review remediation started. The Fable 5 (AI) review flagged the
+validator's public README as claiming "no code from rippled" while the actual
 architecture is hybrid Rust + libxrpl via FFI shim. Also surfaced
 several correctness findings.
 
@@ -105,7 +106,7 @@ several correctness findings.
   `terPRE_SEQ` for downstream txs from the same account. The fix wires
   a real `succ_fn` callback through Rust → C FFI → libxrpl's
   `CallbackReadView`; the Rust side walks the RocksDB snapshot. Root
-  cause of 66 of the pre-audit divergences. (The 2026-04-21
+  cause of 66 of the pre-review divergences. (The 2026-04-21
   `OverlayedDbProvider::succ()` fix closes the overlay-consultation
   gap this commit didn't cover.)
 
@@ -211,9 +212,9 @@ signed state. Enabled systematic divergence hunting.
 - **VALAUDIT Phase 3** — gate signing on independent verification.
   Queued once the current 20k-ledger watch (for commits `69bc726` +
   `6dd8f22`) completes cleanly. ~2h code + 7-day mainnet watch.
-- Phases 4-10 then follow the audit roadmap — seed hygiene, independent
+- Phases 4-10 then follow the review roadmap — seed hygiene, independent
   ledger_hash signing, UNL signature verification, dynamic amendments,
   forensic divergence bundles, master/signing key split, README + docs
   rewrite.
 
-Audit roadmap estimates 3-4 months for all 10 phases. We're a few days in.
+Review roadmap estimates 3-4 months for all 10 phases. We're a few days in.
