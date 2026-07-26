@@ -19,16 +19,14 @@ use crate::ledger::keylet;
 use crate::ledger::sandbox::Sandbox;
 use crate::ledger::transactor::{Transactor, TxFields, TxResult};
 
-/// Helper: decode a 20-byte hex account ID from a JSON value.
+/// Helper: decode a 20-byte account ID from a JSON value.
+///
+/// Accepts 40-char hex (as the probe emits for hex-normalised ACCOUNT_FIELDS)
+/// and base58 r-addresses. Clawback's holder is the nested `Amount.issuer`,
+/// which the probe never hex-normalises -- decoding it hex-only returned None
+/// and wrongly rejected the tx as Malformed.
 fn decode_account_id(val: &serde_json::Value) -> Option<[u8; 20]> {
-    let hex_str = val.as_str()?;
-    let bytes = hex::decode(hex_str).ok()?;
-    if bytes.len() != 20 {
-        return None;
-    }
-    let mut arr = [0u8; 20];
-    arr.copy_from_slice(&bytes);
-    Some(arr)
+    crate::tx::offer::decode20(val.as_str()?)
 }
 
 // ---------------------------------------------------------------------------
@@ -725,6 +723,61 @@ mod tests {
         let line: serde_json::Value = serde_json::from_slice(&data).unwrap();
         let balance: f64 = line["Balance"]["value"].as_str().unwrap().parse().unwrap();
         assert!((balance - (-70.0)).abs() < 0.001);
+    }
+
+    #[test]
+    fn clawback_decodes_base58_holder_issuer() {
+        // The probe never hex-normalises the nested Amount.issuer, so Clawback
+        // sees the holder as a base58 r-address. A hex-only decode returned
+        // None -> Malformed, wrongly dropping a tx mainnet applies (a spurious
+        // reject is consensus-relevant). offer::decode20 handles base58.
+        let issuer = [0x01u8; 20];
+        let holder_addr = "rNR6vtb85KWJyTs86mcHB2UqNVwgnaBGRF";
+        let holder =
+            crate::tx::offer::decode20(holder_addr).expect("base58 holder must decode");
+        let state = make_state(&[(issuer, 50_000_000), (holder, 50_000_000)]);
+        let mut sandbox = Sandbox::new(&state);
+
+        let currency_code = {
+            let mut code = [0u8; 20];
+            code[12] = b'U';
+            code[13] = b'S';
+            code[14] = b'D';
+            code
+        };
+        let line_key = keylet::ripple_state_key(&issuer, &holder, &currency_code);
+        let (low, high) = if issuer < holder {
+            (hex::encode(issuer), hex::encode(holder))
+        } else {
+            (hex::encode(holder), hex::encode(issuer))
+        };
+        let bal = if issuer < holder { "-100" } else { "100" };
+        let line_obj = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": {"currency": "USD", "issuer": "0000000000000000000000000000000000000000", "value": bal},
+            "LowLimit": {"currency": "USD", "issuer": low, "value": "0"},
+            "HighLimit": {"currency": "USD", "issuer": high, "value": "1000"},
+            "Flags": 0,
+        });
+        sandbox.write(line_key, serde_json::to_vec(&line_obj).unwrap());
+
+        let tx = TxFields {
+            account: issuer,
+            tx_type: "Clawback".to_string(),
+            fee: 12,
+            sequence: 1,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            // base58 issuer, exactly as the probe feeds it.
+            fields: serde_json::json!({
+                "Amount": { "currency": "USD", "issuer": holder_addr, "value": "30" }
+            }),
+        };
+        // Was Malformed before the fix (base58 holder failed the hex-only decode).
+        assert_eq!(
+            ClawbackTransactor.do_apply(&tx, &mut sandbox),
+            TxResult::Success
+        );
     }
 
     #[test]
