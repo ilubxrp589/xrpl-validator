@@ -43,16 +43,15 @@ fn decrement_owner_count(account: &[u8; 20], sandbox: &mut Sandbox) {
     }
 }
 
-/// Helper: decode a 20-byte hex account ID from a JSON string field.
+/// Helper: decode a 20-byte account ID from a JSON string field.
+///
+/// Accepts both 40-char hex (as the probe emits for hex-normalised fields) and
+/// a base58 r-address. The `Issuer` field on an authorised-minter mint is NOT
+/// in the probe's hex-normalisation set, so it arrives base58 — decoding it
+/// hex-only silently fell back to the minter, crediting MintedNFTokens to the
+/// wrong account and embedding the wrong issuer in the NFTokenID.
 fn decode_account_id(val: &serde_json::Value) -> Option<[u8; 20]> {
-    let hex_str = val.as_str()?;
-    let bytes = hex::decode(hex_str).ok()?;
-    if bytes.len() != 20 {
-        return None;
-    }
-    let mut arr = [0u8; 20];
-    arr.copy_from_slice(&bytes);
-    Some(arr)
+    crate::tx::offer::decode20(val.as_str()?)
 }
 
 /// Decode a 64-hex Hash256 field (NFTokenID, offer index).
@@ -707,6 +706,53 @@ mod tests {
                 })
             })
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn decode20_resolves_base58_issuer() {
+        // The probe does NOT hex-normalise the Issuer field, so the engine sees
+        // a raw base58 r-address. decode20 must resolve it (else it silently
+        // falls back to the minter).
+        let got = crate::tx::offer::decode20("rNR6vtb85KWJyTs86mcHB2UqNVwgnaBGRF");
+        assert!(got.is_some(), "base58 Issuer must decode, got None");
+    }
+
+    #[test]
+    fn mint_with_issuer_field_credits_issuer_not_minter() {
+        // Authorised-minter mint (fixtures 105803446 / 105762114): Account is the
+        // minter, Issuer is the account on whose behalf the token is minted. The
+        // NFTokenID must embed the ISSUER, and MintedNFTokens must bump on the
+        // ISSUER — while the token still lands in the MINTER's pages.
+        let minter = [0x11u8; 20];
+        let issuer = crate::tx::offer::decode20("rNR6vtb85KWJyTs86mcHB2UqNVwgnaBGRF")
+            .expect("issuer base58 must decode");
+        let state = make_state(&[(minter, 1_000_000_000), (issuer, 1_000_000_000)]);
+        let mut sb = Sandbox::new(&state);
+        let mut tx = mint_tx(minter, 5);
+        tx.fields["Issuer"] = serde_json::json!("rNR6vtb85KWJyTs86mcHB2UqNVwgnaBGRF");
+        assert_eq!(
+            NFTokenMintTransactor.do_apply(&tx, &mut sb),
+            TxResult::Success
+        );
+        // MintedNFTokens lands on the ISSUER.
+        let iacct: serde_json::Value =
+            serde_json::from_slice(&sb.read(&keylet::account_root_key(&issuer)).unwrap()).unwrap();
+        assert_eq!(iacct["MintedNFTokens"], 1, "issuer must be credited the mint");
+        // The minter must NOT be credited a MintedNFTokens count.
+        let macct: serde_json::Value =
+            serde_json::from_slice(&sb.read(&keylet::account_root_key(&minter)).unwrap()).unwrap();
+        assert!(
+            macct.get("MintedNFTokens").is_none(),
+            "minter must not be credited MintedNFTokens"
+        );
+        // The token lands in the MINTER's pages, issued-by the ISSUER.
+        let toks = page_tokens(&sb, &minter);
+        assert_eq!(toks.len(), 1, "token lives in the minter's page");
+        assert_eq!(
+            &toks[0][8..48],
+            hex::encode_upper(issuer).as_str(),
+            "NFTokenID issuer bytes must be the Issuer field, not the minter"
+        );
     }
 
     #[test]
