@@ -401,6 +401,18 @@ fn native_read_keys(txj: &Value) -> Vec<String> {
         if let Some(acct) = txj["Account"].as_str().and_then(decode_address) {
             keys.push(hex::encode_upper(keylet::owner_dir_key(&acct).0));
         }
+        // The cashed IOU's issuer co-owns the new trust line, so its owner
+        // directory root must be loaded too — otherwise the append invents a
+        // fresh directory (load_owner_dir_tail then loads its last page).
+        for f in ["DeliverMin", "Amount"] {
+            if let Some(iss) = txj.get(f)
+                .and_then(|a| a.get("issuer"))
+                .and_then(|v| v.as_str())
+                .and_then(decode_issuer)
+            {
+                keys.push(hex::encode_upper(keylet::owner_dir_key(&iss).0));
+            }
+        }
     }
     if txj["TransactionType"].as_str() == Some("CheckCreate") {
         if let (Some(acct), Some(dest)) = (
@@ -519,6 +531,45 @@ fn load_trustline_hint_pages(state: &mut LedgerState, url: &str, txj: &Value, le
         if n != 0 {
             let root = keylet::owner_dir_key(&owner);
             load_object(state, url, &hex::encode_upper(keylet::dir_page_key(&root, n).0), ledger_index);
+        }
+    }
+}
+
+/// Load the LAST page of an owner directory about to receive a new object. A tx
+/// that merely appends a trust line lands it on the dir's last page
+/// (root.IndexPrevious), which the meta never carries — without it dir_insert
+/// cannot see the existing (multi-page) directory and invents a fresh root. The
+/// dir ROOTS are already loaded via native_read_keys. #105798519 CheckCash
+/// 8FBBA125: the cashed SAM line appends to the SAM issuer's 58-page dir (root
+/// D2215EC9, last page BA1033D3); mainnet Modifies BA1033D3, we Created D2215EC9.
+fn load_owner_dir_tail(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
+    let mut owners: Vec<[u8; 20]> = Vec::new();
+    if txj["TransactionType"].as_str() == Some("CheckCash") {
+        if let Some(a) = txj["Account"].as_str().and_then(decode_address) {
+            owners.push(a);
+        }
+        for f in ["DeliverMin", "Amount"] {
+            if let Some(iss) = txj.get(f)
+                .and_then(|a| a.get("issuer"))
+                .and_then(|v| v.as_str())
+                .and_then(decode_issuer)
+            {
+                owners.push(iss);
+            }
+        }
+    }
+    for owner in owners {
+        let root = keylet::owner_dir_key(&owner);
+        let last = state.state_map.lookup(&root).and_then(|b| {
+            serde_json::from_slice::<Value>(b).ok().and_then(|v| {
+                v.get("IndexPrevious").and_then(|p| {
+                    p.as_u64().or_else(|| p.as_str().and_then(|s| u64::from_str_radix(s, 16).ok()))
+                })
+            })
+        });
+        if let Some(n) = last.filter(|n| *n != 0) {
+            let pk = hex::encode_upper(keylet::dir_page_key(&root, n).0);
+            load_object(state, url, &pk, ledger_index);
         }
     }
 }
@@ -989,6 +1040,7 @@ fn run() -> i32 {
             }
         }
         load_trustline_hint_pages(&mut state, &rpc_url, txj, seq - 1);
+        load_owner_dir_tail(&mut state, &rpc_url, txj, seq - 1);
         load_payment_books(&mut state, &rpc_url, txj, seq - 1, &mut books_seen);
         load_nft_pages_for_tx(&mut state, &rpc_url, txj, seq - 1);
         load_amm_prestate(&mut state, &rpc_url, txj, seq - 1);
