@@ -10,13 +10,22 @@
 //! Reference implementation only — the live validator applies via the FFI
 //! (rippled) path. This exists so the native engine can reach mainnet parity.
 //!
-//! ## Scope (2026-07-17, first slice)
-//! Handles the **single root page** case (accounts with ≤ 32 owned objects,
-//! the large majority). Multi-page directories — where objects spill onto
-//! `dir_page_key(root, n)` pages with `IndexNext`/`IndexPrevious` links, and
-//! page splitting on overflow — are NOT yet handled; an object for a >32-object
-//! account will be placed on the root page here, diverging from mainnet's
-//! actual page. That is the remaining owner-directory work.
+//! ## Scope (rewritten 2026-07-27 — the old note was stale)
+//! Multi-page directories ARE handled: [`dir_insert`] follows the root's
+//! `IndexPrevious` back-pointer to the tail page, appends there while it has
+//! room, and on overflow writes a fresh `dir_page_key(root, n)` page with the
+//! `IndexNext`/`IndexPrevious` relinking rippled does. [`dir_remove`] takes
+//! `keep_root` to match rippled's `dirRemove` (ApplyView.cpp:279-331): the
+//! page is erased-from and `update()`d — hence Modified — before an emptied
+//! root is considered for deletion at all.
+//!
+//! The live constraint is **hydration, not paging**. These functions only see
+//! what the caller loaded, so appending into a >32-object directory whose tail
+//! page was never fetched invents a fresh root instead of Modifying the real
+//! page (#105798519 CheckCash: the SAM issuer's 58-page dir, root D2215EC9,
+//! tail BA1033D3). `differential_probe::load_owner_dir_tail` fetches that tail
+//! for the already-loaded roots — currently wired for CheckCash only; extend
+//! it for any transactor that appends into another account's directory.
 //!
 //! The differential gate compares mutation (key, kind) SETS, not DirectoryNode
 //! byte content, so the `Indexes` array need only be *present*, not
