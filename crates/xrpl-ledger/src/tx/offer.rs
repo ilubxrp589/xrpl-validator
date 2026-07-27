@@ -809,6 +809,110 @@ fn live_head(
     result
 }
 
+/// Advance one book level to its first crossable offer, deleting the dead
+/// ones ahead of it, and report whether such an offer remains.
+///
+/// rippled steps the offer stream BEFORE it consults the pool
+/// (`BookStep::forEachOffer`, BookStep.cpp:835 `if (offers.step())` …
+/// `tryAMM(offers.tip().quality())`), and `OfferStream::step` reaps every
+/// dead offer it advances past — missing, expired, empty, frozen, unfunded —
+/// into `permToRemove`, which the step returns whether or not anything
+/// crossed (BookStep.cpp:852). Two consequences we were missing: dead offers
+/// are removed even when no value moves, and the pool's `clobQuality` is the
+/// first LIVE offer's quality, not the first book level's.
+///
+/// The reap set here is a subset of what the page walk in `cross_engine_to`
+/// already deletes on reaching an offer, so a level the walk fully enters
+/// behaves exactly as before; what changes is the levels it never enters —
+/// the pool satisfying the whole fill at the first level, or a level past the
+/// taker's limit. A self-owned offer stops the scan instead of being
+/// cancelled: `step` has no owner==taker case (self-crossing belongs to offer
+/// crossing, not to a payment's book step), so the page walk keeps that job.
+///
+/// #105795716 5CDFDC74: the XRP→RPLS book's only level held one offer that
+/// had expired 1h50m before the parent closed. Mainnet reaped it — offer and
+/// its emptied book page Deleted, the maker's root and owner dir Modified,
+/// and **no RippleState**, so nothing crossed — then filled from the pool.
+/// We anchored the pool to that dead level, filled the whole 39549 drops from
+/// it, and broke out before ever reading the page (8 muts vs 12).
+///
+/// Funding is judged only when the maker's backing object is in state; an
+/// unhydrated maker is treated as live rather than condemned, as in
+/// `live_head` (phantom deletions poisoned the first bridge attempt).
+fn reap_to_live_head(
+    sandbox: &mut Sandbox,
+    dk: &Hash256,
+    taker: &[u8; 20],
+    pays_leg: &Leg,
+    stale: &mut Vec<Hash256>,
+) -> bool {
+    let mut page_key_h = *dk;
+    for _ in 0..10_000 {
+        // An unreadable page is unknown, not empty: claiming the level dead
+        // would suppress the pool's anchor on evidence we do not have. Report
+        // it live and leave the level exactly as it behaved before.
+        let Some(page) = json_at(sandbox, &page_key_h) else { return true };
+        let entries: Vec<String> = page
+            .get("Indexes")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        for ent in entries {
+            let Some(okey) = hex::decode(&ent)
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                .map(xrpl_core::types::Hash256)
+            else { continue };
+            let Some(offer) = json_at(sandbox, &okey) else { continue };
+            if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
+                continue;
+            }
+            let Some(maker) = offer.get("Account").and_then(|v| v.as_str()).and_then(decode20)
+            else { continue };
+            if &maker == taker {
+                return true;
+            }
+            // `hasExpired`: the BASE ledger's close time is the test, exactly
+            // as in the page walk below (View.cpp:48, and BookStep.cpp:705
+            // builds the stream with `sb.parentCloseTime()`).
+            if let Some(exp) = offer.get("Expiration").and_then(|v| v.as_u64()) {
+                if exp != 0 && sandbox.base().header.close_time as u64 >= exp {
+                    delete_maker_offer(sandbox, &okey, &offer, &maker);
+                    stale.push(okey);
+                    continue;
+                }
+            }
+            let (Some(m_gives0), Some(m_wants0)) = (
+                offer.get("TakerGets").and_then(keylet::amount_mant_exp),
+                offer.get("TakerPays").and_then(keylet::amount_mant_exp),
+            ) else { continue };
+            if m_gives0.0 == 0 || m_wants0.0 == 0 {
+                delete_maker_offer(sandbox, &okey, &offer, &maker);
+                stale.push(okey);
+                continue;
+            }
+            let funding_known = if pays_leg.xrp {
+                json_at(sandbox, &keylet::account_root_key(&maker)).is_some()
+            } else {
+                maker == pays_leg.issuer
+                    || json_at(sandbox, &keylet::ripple_state_key(&maker, &pays_leg.issuer, &pays_leg.cur)).is_some()
+            };
+            if funding_known && me_is_zero(available(sandbox, &maker, pays_leg)) {
+                delete_maker_offer(sandbox, &okey, &offer, &maker);
+                stale.push(okey);
+                continue;
+            }
+            return true;
+        }
+        let next = page.get("IndexNext").map(dirnum).unwrap_or(0);
+        if next == 0 {
+            return false;
+        }
+        page_key_h = keylet::dir_page_key(dk, next);
+    }
+    false
+}
+
 /// Consume `give` of the maker's gives / `pay` of their wants against one
 /// offer: move both legs and update or delete the offer object.
 #[allow(clippy::too_many_arguments)]
@@ -1177,6 +1281,28 @@ pub(crate) fn cross_engine_to(
     let dirs = sandbox.keys_with_prefix(&inv_base.0[..24]);
     'dirs: for dk in dirs {
         let q = u64::from_be_bytes(dk.0[24..32].try_into().unwrap_or_default());
+        // Step the offer stream to this level's first LIVE offer before the
+        // pool is consulted, reaping the dead ones passed on the way. A level
+        // with nothing live never happened as far as the crossing is
+        // concerned: it lends no `clobQuality`, so the stream keeps stepping
+        // and the pool anchors on the next live level (or, past the last one,
+        // on the unanchored tail turn below).
+        //
+        // Only within the taker's limit, though. An OFFER-CROSSING strand
+        // whose best possible quality is already worse than `limitQuality` is
+        // dropped before `flow()` is ever called (StrandFlow.h:669-673
+        // `qualityUpperBound(sb, *strand) < *limitQuality => continue`, and
+        // the same filter in `activateNext`, StrandFlow.h:465), so no stream
+        // is built and nothing is reaped — the removals on line 675 are
+        // collected from a flow that RAN, "even if the strand fails".
+        // #105795013 428E0550 sells RLUSD priced above the whole book: mainnet
+        // rests it in 4 nodes and leaves the expired E39542EC alone, for
+        // rfPBiFvFeBQ's own later 612F4E95 to clear. A payment carries no
+        // `limitQuality` and so no such gate — `threshold` is u64::MAX there
+        // and this reads as always-reap, which is what #105795716 needs.
+        if q <= threshold && !reap_to_live_head(sandbox, &dk, taker, pays_leg, stale) {
+            continue;
+        }
         // AMM turn: consume pool liquidity while its spot quality strictly
         // beats this book level (anchored so the book resumes at `q`).
         if let Some(a) = &amm {
@@ -2381,5 +2507,144 @@ mod tests {
         // ...and it lands in the book page for the tick-rounded quality.
         let q = keylet::offer_quality(&placed["TakerPays"], &placed["TakerGets"]).unwrap();
         assert_eq!(format!("{q:016x}"), "5321d3536a38dba4");
+    }
+
+    /// A book level holding nothing but a dead offer, with a pool that can
+    /// satisfy the whole fill on its own.
+    ///
+    /// Returns `(state, taker, maker, legs)`: the maker rests 100 USD for
+    /// 100 XRP and that offer has expired, while the XRP/USD pool is deep and
+    /// priced far better, so the pool alone covers the taker's 1 XRP.
+    fn state_with_expired_head_and_pool(
+    ) -> (LedgerState, [u8; 20], [u8; 20], Leg, Leg) {
+        let taker = [0x01u8; 20];
+        let maker = [0x04u8; 20];
+        let issuer = [0x02u8; 20];
+        let pool = [0x05u8; 20];
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+
+        let mut state = make_state_with_account(&taker, 50_000_000);
+        for id in [&maker, &issuer, &pool] {
+            let a = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": hex::encode(id),
+                "Balance": "500000000", "Sequence": 1, "OwnerCount": 0,
+            });
+            state.state_map.insert(keylet::account_root_key(id), serde_json::to_vec(&a).unwrap()).unwrap();
+        }
+        let line = |who: &[u8; 20], bal: &str| {
+            let (lo, hi) = if who < &issuer { (*who, issuer) } else { (issuer, *who) };
+            serde_json::json!({
+                "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+                "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000",
+                            "value": if who < &issuer { bal.to_string() } else { format!("-{bal}") }},
+                "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "10000000"},
+                "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "10000000"},
+            })
+        };
+        for (who, bal) in [(&maker, "100"), (&pool, "1000")] {
+            state
+                .state_map
+                .insert(keylet::ripple_state_key(who, &issuer, &cur), serde_json::to_vec(&line(who, bal)).unwrap())
+                .unwrap();
+        }
+
+        // The maker rests 100 USD for 100 XRP — the book's only level.
+        let mut sandbox = Sandbox::new(&state);
+        let maker_offer = TxFields {
+            account: maker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerPays": "100000000",
+                "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
+            }),
+        };
+        assert_eq!(OfferCreateTransactor.do_apply(&maker_offer, &mut sandbox), TxResult::Success);
+        let mods = sandbox.into_modifications();
+        apply_modifications(&mut state, mods).unwrap();
+
+        // It expired before the base ledger closed (close_time 10).
+        let okey = keylet::offer_key(&maker, 2);
+        {
+            let mut o = json_at(&Sandbox::new(&state), &okey).expect("maker offer");
+            o["Expiration"] = serde_json::json!(5);
+            state.state_map.insert(okey, serde_json::to_vec(&o).unwrap()).unwrap();
+        }
+
+        // A 500 XRP / 1000 USD pool, priced far inside the dead level.
+        let xrp_leg = leg_of(&serde_json::json!("1")).unwrap();
+        let usd_leg = leg_of(&serde_json::json!({
+            "currency": "USD", "issuer": hex::encode(issuer), "value": "1"
+        }))
+        .unwrap();
+        let amm = serde_json::json!({
+            "LedgerEntryType": "AMM", "Account": hex::encode(pool), "TradingFee": 0,
+        });
+        let akey = keylet::amm_key(&xrp_leg.cur, &xrp_leg.issuer, &usd_leg.cur, &usd_leg.issuer);
+        state.state_map.insert(akey, serde_json::to_vec(&amm).unwrap()).unwrap();
+
+        (state, taker, maker, usd_leg, xrp_leg)
+    }
+
+    /// rippled steps the offer stream BEFORE it consults the pool, and every
+    /// dead offer stepped past is removed whether or not anything crossed
+    /// (`BookStep::forEachOffer` BookStep.cpp:835-852, `OfferStream::step`
+    /// OfferStream.cpp:192). We consulted the pool first and broke out the
+    /// moment it satisfied the fill, so a level whose page we never read kept
+    /// its dead offers. #105795716 5CDFDC74: the XRP→RPLS book's only level
+    /// held an offer that expired 1h50m before the parent closed; mainnet
+    /// reaped it — offer and emptied book page Deleted, maker's root and owner
+    /// dir Modified, and no RippleState, so nothing crossed — then filled from
+    /// the pool (8 muts vs 12).
+    #[test]
+    fn dead_book_level_is_reaped_even_when_the_pool_fills_everything() {
+        let (state, taker, maker, usd_leg, xrp_leg) = state_with_expired_head_and_pool();
+        let okey = keylet::offer_key(&maker, 2);
+        let mut sandbox = Sandbox::new(&state);
+        assert!(sandbox.exists(&okey), "the expired offer starts on the book");
+
+        let mut stale = Vec::new();
+        // Payment semantics: no limitQuality, so the pool is free to fill it all.
+        let (rp, rg, _crossed) = cross_engine_to(
+            &taker, &taker, (1_000_000_000_000_000, -15), (1_000_000, 0), &usd_leg, &xrp_leg,
+            u64::MAX, false, false, None, &mut sandbox, &mut stale,
+        );
+
+        assert!(!sandbox.exists(&okey), "the expired offer must be reaped");
+        assert!(stale.contains(&okey), "and reported as removed for the cancel view");
+        // The reap is bookkeeping, not a crossing: the maker's reserve is
+        // released but it never sold anything, so its USD is untouched.
+        let mroot = json_at(&sandbox, &keylet::account_root_key(&maker)).unwrap();
+        assert_eq!(mroot["OwnerCount"].as_u64().unwrap(), 0);
+        assert!(me_cmp(available(&mut sandbox, &maker, &usd_leg), (100_000_000_000_000_000, -15)).is_eq());
+        // The pool alone delivered the full 1 USD — which is why the page was
+        // never read and the dead offer used to survive.
+        assert!(me_is_zero(rp), "the pool covered the whole USD request");
+        assert!(me_cmp(rg, (1_000_000, 0)).is_lt(), "and was paid for in XRP");
+    }
+
+    /// ...but ONLY when the crossing actually opens the book. An offer-crossing
+    /// strand whose best possible quality is worse than the taker's limit is
+    /// dropped before `flow()` runs (StrandFlow.h:669-673), so no stream is
+    /// built and nothing is reaped. #105795013 428E0550 sells RLUSD priced
+    /// above the entire book: mainnet rests it in 4 nodes and leaves the
+    /// expired E39542EC for its owner's own later 612F4E95 to clear. Reaping
+    /// it here moved 4 mutations into the wrong transaction.
+    #[test]
+    fn dead_offer_survives_a_taker_priced_past_the_whole_book() {
+        let (state, taker, maker, usd_leg, xrp_leg) = state_with_expired_head_and_pool();
+        let okey = keylet::offer_key(&maker, 2);
+        let mut sandbox = Sandbox::new(&state);
+
+        let mut stale = Vec::new();
+        // `threshold` 1 is better than any real book level, so every level is
+        // past the limit and the strand never runs.
+        cross_engine_to(
+            &taker, &taker, (1_000_000_000_000_000, -15), (1_000_000, 0), &usd_leg, &xrp_leg,
+            1, true, true, None, &mut sandbox, &mut stale,
+        );
+
+        assert!(sandbox.exists(&okey), "an unopened book must not be reaped");
+        assert!(stale.is_empty());
     }
 }
