@@ -839,11 +839,132 @@ fn live_head(
 /// Funding is judged only when the maker's backing object is in state; an
 /// unhydrated maker is treated as live rather than condemned, as in
 /// `live_head` (phantom deletions poisoned the first bridge attempt).
+/// `shouldRmSmallIncreasedQOffer` (OfferStream.cpp:136), applied by `step`
+/// immediately after the unfunded test (OfferStream.cpp:302): an offer backed
+/// by so little owner funding that the fill it could actually make floors away
+/// — or lands at a strictly worse quality than it advertises — is REMOVED
+/// rather than crossed for nothing.
+///
+/// #105778999 6B2A11B3: three offers each selling 5,907,469.49 POSAA for
+/// 343.742177 XRP whose owners held 0.0028–0.0103 POSAA. Clamped to owner
+/// funds the input is ~0.36 drops, which floors to zero, so mainnet deleted
+/// all three — `OwnerCount` decremented, not one balance moved.
+fn is_dust_offer(
+    sandbox: &mut Sandbox,
+    maker: &[u8; 20],
+    m_wants0: Me,
+    m_gives0: Me,
+    pays_leg: &Leg,
+    gets_leg: &Leg,
+) -> bool {
+    // "If `TakerGets` is XRP, the worst this offer's quality can change is to
+    // about 10^-81 `TakerPays` and 1 drop `TakerGets`. This will be remarkably
+    // good quality for any realistic asset, so these offers don't need this
+    // extra check."
+    if pays_leg.xrp {
+        return false;
+    }
+    // Both sides IOU: only when `TakerPays` < `TakerGets`.
+    if !gets_leg.xrp && me_cmp(m_wants0, m_gives0).is_ge() {
+        return false;
+    }
+    let funds = available(sandbox, maker, pays_leg);
+    // `ceilOutStrict(ofrAmts, ownerFunds, roundUp=false)` — note the rounding
+    // is DOWN here, unlike the crossing walk's `pay`, which is what makes a
+    // dust-backed fill vanish instead of costing a drop.
+    let (eff_in, eff_out) = if maker != &pays_leg.issuer && me_cmp(funds, m_gives0).is_lt() {
+        let mut i = me_muldiv(funds, m_wants0, m_gives0, false);
+        if gets_leg.xrp {
+            i = (me_rescale(i, 0, false), 0);
+        }
+        (i, funds)
+    } else {
+        (m_wants0, m_gives0)
+    };
+    if me_is_zero(eff_in) || me_is_zero(eff_out) {
+        return true;
+    }
+    // `effectiveAmounts.in > TTakerPays::minPositiveAmount()` — above the
+    // smallest representable input the quality cannot have shifted enough to
+    // matter. For an IOU input that bound is ~1e-81, so only the zero case
+    // above ever fires there.
+    if !gets_leg.xrp || me_cmp(eff_in, (1, 0)).is_gt() {
+        return false;
+    }
+    // `effectiveQuality < offer_.quality()` — our rates are inverted, so a
+    // strictly WORSE effective quality is a strictly GREATER rate.
+    match (rate_of_me(eff_in, eff_out), rate_of_me(m_wants0, m_gives0)) {
+        (Some(e), Some(o)) => e > o,
+        _ => false,
+    }
+}
+
+/// The dead tests `OfferStream::step` applies to one offer, in its order
+/// (OfferStream.cpp:192): expired, either amount zero, owner unfunded. Returns
+/// whether the offer was reaped; `false` means the stream stops here.
+///
+/// An offer the stream cannot judge is left alone rather than condemned — an
+/// unhydrated maker reads as unfunded and phantom deletions poisoned the first
+/// bridge attempt. A self-owned offer likewise stops the scan: `step` has no
+/// owner==taker case, so cancelling one belongs to offer crossing, not here.
+/// Deep-frozen and out-of-domain, the two remaining `permRmOffer` conditions,
+/// are unmodelled here exactly as they are in the crossing walk.
+fn reap_if_dead(
+    sandbox: &mut Sandbox,
+    okey: &Hash256,
+    offer: &serde_json::Value,
+    maker: &[u8; 20],
+    taker: &[u8; 20],
+    pays_leg: &Leg,
+    gets_leg: &Leg,
+    stale: &mut Vec<Hash256>,
+) -> bool {
+    if maker == taker {
+        return false;
+    }
+    // `hasExpired`: the BASE ledger's close time is the test (View.cpp:48, and
+    // BookStep.cpp:705 builds the stream with `sb.parentCloseTime()`).
+    if let Some(exp) = offer.get("Expiration").and_then(|v| v.as_u64()) {
+        if exp != 0 && sandbox.base().header.close_time as u64 >= exp {
+            delete_maker_offer(sandbox, okey, offer, maker);
+            stale.push(*okey);
+            return true;
+        }
+    }
+    let (Some(m_gives0), Some(m_wants0)) = (
+        offer.get("TakerGets").and_then(keylet::amount_mant_exp),
+        offer.get("TakerPays").and_then(keylet::amount_mant_exp),
+    ) else { return false };
+    if m_gives0.0 == 0 || m_wants0.0 == 0 {
+        delete_maker_offer(sandbox, okey, offer, maker);
+        stale.push(*okey);
+        return true;
+    }
+    let funding_known = if pays_leg.xrp {
+        json_at(sandbox, &keylet::account_root_key(maker)).is_some()
+    } else {
+        maker == &pays_leg.issuer
+            || json_at(sandbox, &keylet::ripple_state_key(maker, &pays_leg.issuer, &pays_leg.cur)).is_some()
+    };
+    if funding_known && me_is_zero(available(sandbox, maker, pays_leg)) {
+        delete_maker_offer(sandbox, okey, offer, maker);
+        stale.push(*okey);
+        return true;
+    }
+    if funding_known && is_dust_offer(sandbox, maker, m_wants0, m_gives0, pays_leg, gets_leg) {
+        delete_maker_offer(sandbox, okey, offer, maker);
+        stale.push(*okey);
+        return true;
+    }
+    false
+}
+
 fn reap_to_live_head(
     sandbox: &mut Sandbox,
     dk: &Hash256,
     taker: &[u8; 20],
     pays_leg: &Leg,
+    gets_leg: &Leg,
     stale: &mut Vec<Hash256>,
 ) -> bool {
     let mut page_key_h = *dk;
@@ -869,40 +990,9 @@ fn reap_to_live_head(
             }
             let Some(maker) = offer.get("Account").and_then(|v| v.as_str()).and_then(decode20)
             else { continue };
-            if &maker == taker {
+            if !reap_if_dead(sandbox, &okey, &offer, &maker, taker, pays_leg, gets_leg, stale) {
                 return true;
             }
-            // `hasExpired`: the BASE ledger's close time is the test, exactly
-            // as in the page walk below (View.cpp:48, and BookStep.cpp:705
-            // builds the stream with `sb.parentCloseTime()`).
-            if let Some(exp) = offer.get("Expiration").and_then(|v| v.as_u64()) {
-                if exp != 0 && sandbox.base().header.close_time as u64 >= exp {
-                    delete_maker_offer(sandbox, &okey, &offer, &maker);
-                    stale.push(okey);
-                    continue;
-                }
-            }
-            let (Some(m_gives0), Some(m_wants0)) = (
-                offer.get("TakerGets").and_then(keylet::amount_mant_exp),
-                offer.get("TakerPays").and_then(keylet::amount_mant_exp),
-            ) else { continue };
-            if m_gives0.0 == 0 || m_wants0.0 == 0 {
-                delete_maker_offer(sandbox, &okey, &offer, &maker);
-                stale.push(okey);
-                continue;
-            }
-            let funding_known = if pays_leg.xrp {
-                json_at(sandbox, &keylet::account_root_key(&maker)).is_some()
-            } else {
-                maker == pays_leg.issuer
-                    || json_at(sandbox, &keylet::ripple_state_key(&maker, &pays_leg.issuer, &pays_leg.cur)).is_some()
-            };
-            if funding_known && me_is_zero(available(sandbox, &maker, pays_leg)) {
-                delete_maker_offer(sandbox, &okey, &offer, &maker);
-                stale.push(okey);
-                continue;
-            }
-            return true;
         }
         let next = page.get("IndexNext").map(dirnum).unwrap_or(0);
         if next == 0 {
@@ -1300,7 +1390,7 @@ pub(crate) fn cross_engine_to(
         // rfPBiFvFeBQ's own later 612F4E95 to clear. A payment carries no
         // `limitQuality` and so no such gate — `threshold` is u64::MAX there
         // and this reads as always-reap, which is what #105795716 needs.
-        if q <= threshold && !reap_to_live_head(sandbox, &dk, taker, pays_leg, stale) {
+        if q <= threshold && !reap_to_live_head(sandbox, &dk, taker, pays_leg, gets_leg, stale) {
             continue;
         }
         // AMM turn: consume pool liquidity while its spot quality strictly
@@ -1326,8 +1416,15 @@ pub(crate) fn cross_engine_to(
             break;
         }
         let mut page_key_h = dk;
+        // Set once the fill is satisfied but rippled would still have stepped
+        // the stream: from here the walk only reaps, and stops at the first
+        // live offer. See the `done` branch at the end of the maker loop.
+        let mut trailing = false;
         for _ in 0..10_000 {
             let Some(page) = json_at(sandbox, &page_key_h) else { break };
+            if std::env::var("DX_WALK").is_ok() {
+                eprintln!("DX_WALK page={} json={}", hex::encode(page_key_h.0), page);
+            }
             let entries: Vec<String> = page
                 .get("Indexes")
                 .and_then(|v| v.as_array())
@@ -1339,12 +1436,27 @@ pub(crate) fn cross_engine_to(
                     .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
                     .map(xrpl_core::types::Hash256)
                 else { continue };
+                if std::env::var("DX_WALK").is_ok() {
+                    let o = json_at(sandbox, &okey);
+                    eprintln!(
+                        "DX_WALK entry={} loaded={} type={:?}",
+                        &ent[..16],
+                        o.is_some(),
+                        o.as_ref().and_then(|v| v.get("LedgerEntryType").and_then(|t| t.as_str())).unwrap_or("-"),
+                    );
+                }
                 let Some(offer) = json_at(sandbox, &okey) else { continue };
                 if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
                     continue;
                 }
                 let Some(maker) = offer.get("Account").and_then(|v| v.as_str()).and_then(decode20)
                 else { continue };
+                if trailing {
+                    if reap_if_dead(sandbox, &okey, &offer, &maker, taker, pays_leg, gets_leg, stale) {
+                        continue;
+                    }
+                    break 'dirs;
+                }
                 if &maker == taker {
                     // Self-crossing: rippled cancels the older own offer.
                     delete_maker_offer(sandbox, &okey, &offer, &maker);
@@ -1393,8 +1505,22 @@ pub(crate) fn cross_engine_to(
                     }
                 }
                 let funded = available(sandbox, &maker, pays_leg);
+                if std::env::var("DX_WALK").is_ok() {
+                    eprintln!(
+                        "DX_WALK maker={} okey={} gives0={m_gives0:?} wants0={m_wants0:?} funded={funded:?} rem_pays={rem_pays:?} rem_gets={rem_gets:?}",
+                        hex::encode(maker),
+                        hex::encode(okey.0),
+                    );
+                }
                 if me_is_zero(funded) {
                     // Unfunded offers found during the walk are removed.
+                    delete_maker_offer(sandbox, &okey, &offer, &maker);
+                    stale.push(okey);
+                    continue;
+                }
+                // `step` applies the tiny-offer test to every offer it reaches,
+                // not just the ones ahead of the head (OfferStream.cpp:302).
+                if is_dust_offer(sandbox, &maker, m_wants0, m_gives0, pays_leg, gets_leg) {
                     delete_maker_offer(sandbox, &okey, &offer, &maker);
                     stale.push(okey);
                     continue;
@@ -1474,7 +1600,32 @@ pub(crate) fn cross_engine_to(
                     put_json(sandbox, okey, &off2);
                 }
                 if done(rem_pays, rem_gets) {
-                    break 'dirs;
+                    // rippled does not stop at a satisfied fill. Its reverse
+                    // pass returns TRUE from the offer callback whenever the
+                    // step's output fits inside what is still wanted —
+                    // "return true b/c even if the payment is satisfied, we
+                    // need to consume the offer" (BookStep.cpp:1036) — so
+                    // `while (offers.step())` runs once more and reaps the
+                    // dead offers sitting behind the one just consumed.
+                    // Only the `limitStepOut` branch, where the offer had to
+                    // be trimmed to the REMAINING OUTPUT, returns
+                    // `offer.fullyConsumed()` (BookStep.cpp:1062) and ends the
+                    // walk — that is exactly our `buy_bound` fill.
+                    //
+                    // #105778999 6B2A11B3: a tfPartialPayment with a sentinel
+                    // Amount, so nothing ever trims to remaining output. We
+                    // spent all 140 XRP against the page's first offer
+                    // (FFF5869C, the only funded one) and stopped; mainnet
+                    // consumed the same offer for the same value, stepped, and
+                    // reaped the three unfunded spam offers behind it —
+                    // 3 offers Deleted, 2 maker roots + 2 owner dirs + the
+                    // book page Modified, and no RippleState among them.
+                    // 5v15 with those 8 missing and nothing extra.
+                    if buy_bound {
+                        break 'dirs;
+                    }
+                    trailing = true;
+                    continue;
                 }
             }
             let next = page.get("IndexNext").map(dirnum).unwrap_or(0);
@@ -1482,6 +1633,9 @@ pub(crate) fn cross_engine_to(
                 break;
             }
             page_key_h = keylet::dir_page_key(&dk, next);
+        }
+        if trailing {
+            break 'dirs;
         }
     }
     // Final AMM turn once the book is exhausted (maxOffer sizing).
@@ -2646,5 +2800,120 @@ mod tests {
 
         assert!(sandbox.exists(&okey), "an unopened book must not be reaped");
         assert!(stale.is_empty());
+    }
+
+    /// One book level holding two identical offers — 100 USD for 100 XRP —
+    /// from two makers, funded as given, `first` resting first.
+    fn state_with_two_offers(
+        first_usd: &str,
+        second_usd: &str,
+        expire_second: bool,
+    ) -> (LedgerState, [u8; 20], [u8; 20], [u8; 20], Leg, Leg) {
+        let taker = [0x01u8; 20];
+        let m1 = [0x04u8; 20];
+        let m2 = [0x06u8; 20];
+        let issuer = [0x02u8; 20];
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+
+        let mut state = make_state_with_account(&taker, 500_000_000);
+        for id in [&m1, &m2, &issuer] {
+            let a = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": hex::encode(id),
+                "Balance": "500000000", "Sequence": 1, "OwnerCount": 0,
+            });
+            state.state_map.insert(keylet::account_root_key(id), serde_json::to_vec(&a).unwrap()).unwrap();
+        }
+        for (who, bal) in [(&m1, first_usd), (&m2, second_usd)] {
+            let (lo, hi) = if who < &issuer { (*who, issuer) } else { (issuer, *who) };
+            let line = serde_json::json!({
+                "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+                "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000",
+                            "value": if who < &issuer { bal.to_string() } else { format!("-{bal}") }},
+                "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000000"},
+                "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000000"},
+            });
+            state.state_map.insert(keylet::ripple_state_key(who, &issuer, &cur), serde_json::to_vec(&line).unwrap()).unwrap();
+        }
+        // Same price ⇒ same quality ⇒ both land on the one book page, m1 first.
+        for who in [&m1, &m2] {
+            let mut sandbox = Sandbox::new(&state);
+            let tx = TxFields {
+                account: *who, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
+                ticket_seq: None, last_ledger_seq: None,
+                fields: serde_json::json!({
+                    "TakerPays": "100000000",
+                    "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
+                }),
+            };
+            assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+            let mods = sandbox.into_modifications();
+            apply_modifications(&mut state, mods).unwrap();
+        }
+        if expire_second {
+            let okey = keylet::offer_key(&m2, 2);
+            let mut o = json_at(&Sandbox::new(&state), &okey).expect("second offer");
+            o["Expiration"] = serde_json::json!(5);
+            state.state_map.insert(okey, serde_json::to_vec(&o).unwrap()).unwrap();
+        }
+        let xrp_leg = leg_of(&serde_json::json!("1")).unwrap();
+        let usd_leg = leg_of(&serde_json::json!({
+            "currency": "USD", "issuer": hex::encode(issuer), "value": "1"
+        }))
+        .unwrap();
+        (state, taker, m1, m2, usd_leg, xrp_leg)
+    }
+
+    /// A satisfied fill does not end the walk. rippled's reverse pass returns
+    /// true from the offer callback whenever the step's output fits inside what
+    /// is still wanted — "return true b/c even if the payment is satisfied, we
+    /// need to consume the offer" (BookStep.cpp:1036) — so `offers.step()` runs
+    /// again and reaps the dead offers behind the one just consumed. We stopped
+    /// the instant the taker's input was spent. #105778999 6B2A11B3 crossed its
+    /// 140 XRP against the page's one funded offer exactly as mainnet did, then
+    /// left mainnet's three reaped spam offers untouched (5v15).
+    #[test]
+    fn a_satisfied_fill_still_reaps_the_offers_behind_it() {
+        let (state, taker, m1, m2, usd_leg, xrp_leg) = state_with_two_offers("100", "100", true);
+        let (live, dead) = (keylet::offer_key(&m1, 2), keylet::offer_key(&m2, 2));
+        let mut sandbox = Sandbox::new(&state);
+
+        let mut stale = Vec::new();
+        // 10 XRP to spend against a sentinel want, so the fill is bounded by
+        // the taker's INPUT — never trimmed to the remaining output.
+        let (_rp, rg, _c) = cross_engine_to(
+            &taker, &taker, (1_000_000_000_000_000, -8), (10_000_000, 0), &usd_leg, &xrp_leg,
+            u64::MAX, false, false, None, &mut sandbox, &mut stale,
+        );
+
+        assert!(me_is_zero(rg), "the 10 XRP is spent");
+        assert!(sandbox.exists(&live), "the funded maker is only part-filled");
+        assert!(!sandbox.exists(&dead), "the expired offer behind it must be reaped");
+        assert!(stale.contains(&dead));
+    }
+
+    /// `shouldRmSmallIncreasedQOffer` (OfferStream.cpp:136, applied at :302):
+    /// an offer whose owner-funds-limited fill floors away is removed, not
+    /// crossed. #105778999's three deleted offers each sold 5,907,469.49 POSAA
+    /// for 343.742177 XRP on 0.0028–0.0103 POSAA of backing — ~0.36 drops of
+    /// input, which floors to zero. Mainnet deleted them and moved no balance;
+    /// we saw a non-zero balance, called them funded, and crossed for a drop.
+    #[test]
+    fn a_dust_funded_offer_is_reaped_rather_than_crossed() {
+        let (state, taker, m1, _m2, usd_leg, xrp_leg) =
+            state_with_two_offers("0.0000001", "100", false);
+        let dusty = keylet::offer_key(&m1, 2);
+        let mut sandbox = Sandbox::new(&state);
+        let before = read_balance(&sandbox, &m1);
+
+        let mut stale = Vec::new();
+        cross_engine_to(
+            &taker, &taker, (1_000_000_000_000_000, -8), (10_000_000, 0), &usd_leg, &xrp_leg,
+            u64::MAX, false, false, None, &mut sandbox, &mut stale,
+        );
+
+        assert!(!sandbox.exists(&dusty), "a dust-backed offer must be reaped");
+        assert!(stale.contains(&dusty));
+        assert_eq!(read_balance(&sandbox, &m1), before, "and never crossed for value");
     }
 }
