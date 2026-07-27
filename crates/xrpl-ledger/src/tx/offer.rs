@@ -1369,8 +1369,20 @@ pub(crate) fn cross_engine_to(
         }
     }
     let dirs = sandbox.keys_with_prefix(&inv_base.0[..24]);
+    // Set once the fill is satisfied but rippled would still have stepped the
+    // stream. The stream spans the whole BOOK, not one level: `step` carries no
+    // quality test, so it keeps reaping across levels until it reaches a live
+    // offer, and only then does `execOffer`'s `checkQualityThreshold` end the
+    // walk. See the `done` branch at the end of the maker loop.
+    let mut trailing = false;
     'dirs: for dk in dirs {
         let q = u64::from_be_bytes(dk.0[24..32].try_into().unwrap_or_default());
+        if trailing {
+            if reap_to_live_head(sandbox, &dk, taker, pays_leg, gets_leg, stale) {
+                break 'dirs;
+            }
+            continue;
+        }
         // Step the offer stream to this level's first LIVE offer before the
         // pool is consulted, reaping the dead ones passed on the way. A level
         // with nothing live never happened as far as the crossing is
@@ -1416,10 +1428,6 @@ pub(crate) fn cross_engine_to(
             break;
         }
         let mut page_key_h = dk;
-        // Set once the fill is satisfied but rippled would still have stepped
-        // the stream: from here the walk only reaps, and stops at the first
-        // live offer. See the `done` branch at the end of the maker loop.
-        let mut trailing = false;
         for _ in 0..10_000 {
             let Some(page) = json_at(sandbox, &page_key_h) else { break };
             if std::env::var("DX_WALK").is_ok() {
@@ -1633,9 +1641,6 @@ pub(crate) fn cross_engine_to(
                 break;
             }
             page_key_h = keylet::dir_page_key(&dk, next);
-        }
-        if trailing {
-            break 'dirs;
         }
     }
     // Final AMM turn once the book is exhausted (maxOffer sizing).
@@ -2808,6 +2813,7 @@ mod tests {
         first_usd: &str,
         second_usd: &str,
         expire_second: bool,
+        second_pays: &str,
     ) -> (LedgerState, [u8; 20], [u8; 20], [u8; 20], Leg, Leg) {
         let taker = [0x01u8; 20];
         let m1 = [0x04u8; 20];
@@ -2835,14 +2841,15 @@ mod tests {
             });
             state.state_map.insert(keylet::ripple_state_key(who, &issuer, &cur), serde_json::to_vec(&line).unwrap()).unwrap();
         }
-        // Same price ⇒ same quality ⇒ both land on the one book page, m1 first.
-        for who in [&m1, &m2] {
+        // Equal `TakerPays` ⇒ equal quality ⇒ one shared book page, m1 first;
+        // a larger `second_pays` puts m2 on its own, worse level instead.
+        for (who, pays) in [(&m1, "100000000"), (&m2, second_pays)] {
             let mut sandbox = Sandbox::new(&state);
             let tx = TxFields {
                 account: *who, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
                 ticket_seq: None, last_ledger_seq: None,
                 fields: serde_json::json!({
-                    "TakerPays": "100000000",
+                    "TakerPays": pays,
                     "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
                 }),
             };
@@ -2874,7 +2881,7 @@ mod tests {
     /// left mainnet's three reaped spam offers untouched (5v15).
     #[test]
     fn a_satisfied_fill_still_reaps_the_offers_behind_it() {
-        let (state, taker, m1, m2, usd_leg, xrp_leg) = state_with_two_offers("100", "100", true);
+        let (state, taker, m1, m2, usd_leg, xrp_leg) = state_with_two_offers("100", "100", true, "100000000");
         let (live, dead) = (keylet::offer_key(&m1, 2), keylet::offer_key(&m2, 2));
         let mut sandbox = Sandbox::new(&state);
 
@@ -2901,7 +2908,7 @@ mod tests {
     #[test]
     fn a_dust_funded_offer_is_reaped_rather_than_crossed() {
         let (state, taker, m1, _m2, usd_leg, xrp_leg) =
-            state_with_two_offers("0.0000001", "100", false);
+            state_with_two_offers("0.0000001", "100", false, "100000000");
         let dusty = keylet::offer_key(&m1, 2);
         let mut sandbox = Sandbox::new(&state);
         let before = read_balance(&sandbox, &m1);
@@ -2915,5 +2922,40 @@ mod tests {
         assert!(!sandbox.exists(&dusty), "a dust-backed offer must be reaped");
         assert!(stale.contains(&dusty));
         assert_eq!(read_balance(&sandbox, &m1), before, "and never crossed for value");
+    }
+
+    /// The trailing step follows the stream across BOOK LEVELS, not just to the
+    /// end of the level it was crossing on. `OfferStream::step` carries no
+    /// quality test at all — it keeps reaping until it reaches a live offer,
+    /// and only then does `execOffer`'s `checkQualityThreshold` end the walk
+    /// (BookStep.cpp:851). #105798806 10465EB9: we crossed the one live offer
+    /// on level 4f03f3de…, then stopped; mainnet went on to reap rfPBiFvFeBQ's
+    /// 8CFBD89A on the NEXT level (4f03f3f5…), expired 28s before the parent
+    /// closed — offer and its emptied page Deleted, owner dir and root
+    /// Modified. 5v9, those exact four missing and nothing extra.
+    #[test]
+    fn the_trailing_step_crosses_book_levels() {
+        // m2 wants 110 XRP for the same 100 USD, so it rests on its own,
+        // strictly worse level — and it has expired.
+        let (state, taker, m1, m2, usd_leg, xrp_leg) =
+            state_with_two_offers("100", "100", true, "110000000");
+        let (live, dead) = (keylet::offer_key(&m1, 2), keylet::offer_key(&m2, 2));
+        let mut sandbox = Sandbox::new(&state);
+        let level = |k: &Hash256| {
+            let o = json_at(&sandbox, k).unwrap();
+            keylet::offer_quality(&o["TakerPays"], &o["TakerGets"]).unwrap()
+        };
+        assert_ne!(level(&live), level(&dead), "the two offers must rest on different book levels");
+
+        let mut stale = Vec::new();
+        let (_rp, rg, _c) = cross_engine_to(
+            &taker, &taker, (1_000_000_000_000_000, -8), (10_000_000, 0), &usd_leg, &xrp_leg,
+            u64::MAX, false, false, None, &mut sandbox, &mut stale,
+        );
+
+        assert!(me_is_zero(rg), "the 10 XRP is spent on the first level");
+        assert!(sandbox.exists(&live), "the funded maker is only part-filled");
+        assert!(!sandbox.exists(&dead), "the expired offer one level down must be reaped");
+        assert!(stale.contains(&dead));
     }
 }
