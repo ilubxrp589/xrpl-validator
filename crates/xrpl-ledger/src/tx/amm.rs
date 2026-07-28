@@ -290,6 +290,7 @@ impl Transactor for AMMDepositTransactor {
     }
 
     fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        use crate::tx::offer as ox;
         let acct_key = keylet::account_root_key(&tx.account);
         if !sandbox.exists(&acct_key) { return TxResult::NoAccount; }
         // Check AMM exists
@@ -298,6 +299,48 @@ impl Transactor for AMMDepositTransactor {
                 if !sandbox.exists(&key) { return TxResult::NoEntry; }
             }
             None => return TxResult::Malformed,
+        }
+        // The depositor must be able to FUND an XRP side, and rippled measures
+        // that against the reserve it will owe AFTER the deposit: `xrpLiquid`
+        // is taken with the owner count bumped by one when the depositor has no
+        // LPToken line yet, because the deposit is about to open one
+        // (AMMDeposit.cpp:230-244 `balance`). Falling short is tecUNFUNDED_AMM
+        // when that line already exists and tecINSUF_RESERVE_LINE when it does
+        // not — the shortfall is a missing reserve, not missing funds.
+        //
+        // This is a different rule from the reserve guard in do_apply below,
+        // which only asks whether the depositor clears the reserve at all.
+        // #105893158 85C32164 deposits 446527 drops holding 5646527 at
+        // OwnerCount 21: the reserve guard passes (liquid 246527 > 0) but the
+        // deposit needs 446527, and with no LP line mainnet claims the fee and
+        // returns tecINSUF_RESERVE_LINE.
+        if let Some((_, amm_acct, lp_leg)) = amm_ctx(tx, sandbox) {
+            let lp_line_exists =
+                sandbox.exists(&keylet::ripple_state_key(&tx.account, &amm_acct, &lp_leg.cur));
+            let adj = u64::from(!lp_line_exists);
+            for f in ["Amount", "Amount2"] {
+                let Some(v) = tx.fields.get(f) else { continue };
+                let (Some(leg), Some(amt)) = (ox::leg_of(v), keylet::amount_mant_exp(v)) else {
+                    continue;
+                };
+                if !leg.xrp || amt.0 == 0 {
+                    continue;
+                }
+                let Some(acct) = ox::json_at(sandbox, &acct_key) else { continue };
+                let oc = acct["OwnerCount"].as_u64().unwrap_or(0);
+                let bal = acct["Balance"].as_str().and_then(|s| s.parse::<u128>().ok()).unwrap_or(0);
+                let liquid = bal.saturating_sub(
+                    crate::ledger::fees::account_reserve(sandbox, oc + adj) as u128,
+                );
+                let want = ox::me_rescale(amt, 0, false);
+                if liquid < want {
+                    return if lp_line_exists {
+                        TxResult::UnfundedAmm
+                    } else {
+                        TxResult::InsufReserveLine
+                    };
+                }
+            }
         }
         TxResult::Success
     }
@@ -743,6 +786,101 @@ mod tests {
         let key = keylet::account_root_key(id);
         state.state_map.insert(key, serde_json::to_vec(&acct).unwrap()).unwrap();
         state
+    }
+
+    /// An XRP side of an AMM deposit has to be FUNDABLE, and rippled measures
+    /// that against the reserve the depositor will owe afterwards: `xrpLiquid`
+    /// with the owner count bumped by one when there is no LPToken line yet,
+    /// because the deposit is about to open one (AMMDeposit.cpp:230-244). Short
+    /// of it is tecUNFUNDED_AMM when that line exists and tecINSUF_RESERVE_LINE
+    /// when it does not. #105893158 85C32164 deposits 446527 drops holding
+    /// 5646527 at OwnerCount 21 — the separate reserve guard passes (liquid
+    /// 246527 > 0) but the deposit needs 446527, and mainnet claims the fee.
+    #[test]
+    fn an_amm_deposit_must_fund_its_xrp_side_after_reserve() {
+        let depositor = [0x01u8; 20];
+        let issuer = [0x02u8; 20];
+        let amm_acct = [0x05u8; 20];
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"PLX");
+
+        // 5.646527 XRP at OwnerCount 21 ⇒ reserve(22) = 5.4 XRP ⇒ 0.246527 liquid.
+        let mut state = make_state(&depositor, 5_646_527);
+        {
+            let k = keylet::account_root_key(&depositor);
+            let mut a: serde_json::Value =
+                serde_json::from_slice(&Sandbox::new(&state).read(&k).unwrap()).unwrap();
+            a["OwnerCount"] = serde_json::json!(21);
+            state.state_map.insert(k, serde_json::to_vec(&a).unwrap()).unwrap();
+        }
+        for id in [&issuer, &amm_acct] {
+            let a = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": hex::encode(id),
+                "Balance": "500000000", "Sequence": 1, "OwnerCount": 0,
+            });
+            state.state_map.insert(keylet::account_root_key(id), serde_json::to_vec(&a).unwrap()).unwrap();
+        }
+        let xrp_leg = crate::tx::offer::leg_of(&serde_json::json!("1")).unwrap();
+        let plx = serde_json::json!({"currency": "PLX", "issuer": hex::encode(issuer), "value": "1"});
+        let plx_leg = crate::tx::offer::leg_of(&plx).unwrap();
+        let amm = serde_json::json!({
+            "LedgerEntryType": "AMM", "Account": hex::encode(amm_acct), "TradingFee": 0,
+        });
+        let akey = keylet::amm_key(&plx_leg.cur, &plx_leg.issuer, &xrp_leg.cur, &xrp_leg.issuer);
+        state.state_map.insert(akey, serde_json::to_vec(&amm).unwrap()).unwrap();
+
+        let tx = TxFields {
+            account: depositor,
+            tx_type: "AMMDeposit".to_string(),
+            fee: 12,
+            sequence: 5,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Asset": {"currency": "PLX", "issuer": hex::encode(issuer)},
+                "Asset2": {"currency": "XRP"},
+                "Amount": {"currency": "PLX", "issuer": hex::encode(issuer), "value": "3651.65"},
+                "Amount2": "446527",
+                "Flags": 1_048_576u64,
+            }),
+        };
+        // 446527 drops wanted, only 246527 liquid once the new LP line's
+        // reserve is counted, and no LP line exists yet.
+        assert_eq!(
+            AMMDepositTransactor.preclaim(&tx, &Sandbox::new(&state)),
+            TxResult::InsufReserveLine,
+        );
+
+        // Same shortfall, but with the LPToken line already present the
+        // shortfall is funds rather than reserve.
+        let lp_cur = amm_ctx(&tx, &Sandbox::new(&state)).expect("amm ctx").2.cur;
+        let (lo, hi) = if depositor < amm_acct { (depositor, amm_acct) } else { (amm_acct, depositor) };
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+            "Balance": {"currency": hex::encode_upper(lp_cur),
+                        "issuer": "0000000000000000000000000000000000000000", "value": "0"},
+            "LowLimit": {"currency": hex::encode_upper(lp_cur), "issuer": hex::encode(lo), "value": "1000000"},
+            "HighLimit": {"currency": hex::encode_upper(lp_cur), "issuer": hex::encode(hi), "value": "1000000"},
+        });
+        state
+            .state_map
+            .insert(keylet::ripple_state_key(&depositor, &amm_acct, &lp_cur), serde_json::to_vec(&line).unwrap())
+            .unwrap();
+        // With the line present the reserve drops to 5.2 XRP, leaving exactly
+        // 446527 liquid — and rippled's test is `>=`, so THIS deposit now just
+        // fits. Ask for more than that to reach the other branch.
+        assert_eq!(
+            AMMDepositTransactor.preclaim(&tx, &Sandbox::new(&state)),
+            TxResult::Success,
+            "the freed reserve increment makes exactly this deposit fundable",
+        );
+        let mut bigger = tx.clone();
+        bigger.fields["Amount2"] = serde_json::json!("600000");
+        assert_eq!(
+            AMMDepositTransactor.preclaim(&bigger, &Sandbox::new(&state)),
+            TxResult::UnfundedAmm,
+            "short with the line already there is funds, not reserve",
+        );
     }
 
     #[test]

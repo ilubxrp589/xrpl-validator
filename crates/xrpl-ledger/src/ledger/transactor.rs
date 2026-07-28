@@ -75,6 +75,8 @@ pub enum TxResult {
     /// Modifying a trust line into a reserved state, but the owner can't afford
     /// the incremental reserve.
     InsufReserveLine,
+    /// Depositing into an AMM more than the depositor can actually fund.
+    UnfundedAmm,
     /// Creating a trust line, but the owner can't afford the incremental reserve.
     NoLineInsufReserve,
     /// Setting a non-existent trust line to defaults — nothing to do.
@@ -128,6 +130,7 @@ impl TxResult {
             | TxResult::DirFull
             | TxResult::InsufficientReserve
             | TxResult::InsufReserveLine
+            | TxResult::UnfundedAmm
             | TxResult::NoLineInsufReserve
             | TxResult::NoLineRedundant
             | TxResult::Unsupported => true,
@@ -165,6 +168,7 @@ impl TxResult {
             TxResult::DirFull => "tecDIR_FULL",
             TxResult::InsufficientReserve => "tecINSUFFICIENT_RESERVE",
             TxResult::InsufReserveLine => "tecINSUF_RESERVE_LINE",
+            TxResult::UnfundedAmm => "tecUNFUNDED_AMM",
             TxResult::NoLineInsufReserve => "tecNO_LINE_INSUF_RESERVE",
             TxResult::NoLineRedundant => "tecNO_LINE_REDUNDANT",
             TxResult::Malformed => "temMALFORMED",
