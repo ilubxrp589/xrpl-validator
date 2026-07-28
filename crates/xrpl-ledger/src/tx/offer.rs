@@ -307,8 +307,28 @@ pub(crate) fn available(sandbox: &Sandbox, id: &[u8; 20], leg: &Leg) -> Me {
     } else if id == &leg.issuer {
         (u128::MAX / 4, 20) // issuers deliver their own IOU without limit
     } else {
+        // rippled reads spendable IOU through `accountHolds` with
+        // `fhZERO_IF_FROZEN`, so a FROZEN holder has no funds at all, however
+        // large the balance. `isFrozen` (RippleStateHelpers.cpp:127) is the
+        // issuer's GLOBAL freeze, or the ISSUER's side of the line —
+        // `(issuer > account) ? lsfHighFreeze : lsfLowFreeze`.
+        //
+        // #105878507 475EA928 and ten siblings: rLiq73yy holds 5811047220.15868
+        // ARK and offers to sell it, but rBWfabv7 has frozen that line, so
+        // mainnet claims the fee and returns tecUNFUNDED_OFFER (1 mutation)
+        // while we crossed and placed (4). Reading the balance alone is what
+        // let a frozen holder trade.
+        if let Some(iss) = json_at(sandbox, &keylet::account_root_key(&leg.issuer)) {
+            if iss["Flags"].as_u64().unwrap_or(0) & 0x0040_0000 != 0 {
+                return (0, 0); // lsfGlobalFreeze
+            }
+        }
         let lkey = keylet::ripple_state_key(id, &leg.issuer, &leg.cur);
         let Some(line) = json_at(sandbox, &lkey) else { return (0, 0) };
+        let issuer_freeze = if &leg.issuer > id { 0x0080_0000 } else { 0x0040_0000 };
+        if line["Flags"].as_u64().unwrap_or(0) & issuer_freeze != 0 {
+            return (0, 0);
+        }
         let (neg, bal) = signed_value(&line["Balance"]);
         let holds = if id < &leg.issuer { !neg } else { neg }; // positive toward the party?
         // Balance is from the LOW account's perspective: positive = high owes
@@ -2777,6 +2797,54 @@ mod tests {
         // ...and it lands in the book page for the tick-rounded quality.
         let q = keylet::offer_quality(&placed["TakerPays"], &placed["TakerGets"]).unwrap();
         assert_eq!(format!("{q:016x}"), "5321d3536a38dba4");
+    }
+
+    /// A holder whose line the ISSUER has frozen can sell nothing, however
+    /// large the balance: rippled reads spendable IOU through `accountHolds`
+    /// with `fhZERO_IF_FROZEN`, and `isFrozen` (RippleStateHelpers.cpp:127) is
+    /// the issuer's global freeze OR the issuer's side of the line —
+    /// `(issuer > account) ? lsfHighFreeze : lsfLowFreeze`.
+    ///
+    /// #105878507 475EA928 and ten siblings across six ledgers: rLiq73yy holds
+    /// 5811047220.15868 ARK and offers to sell it, but rBWfabv7 froze the line.
+    /// Mainnet claims the fee and returns tecUNFUNDED_OFFER (1 mutation); we
+    /// read the balance alone, crossed, and placed (4).
+    #[test]
+    fn a_frozen_holder_cannot_fund_an_offer() {
+        let acct = [0x01u8; 20];
+        let issuer = [0x02u8; 20];
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+
+        let mut state = make_state_with_account(&acct, 500_000_000);
+        let iss = serde_json::json!({
+            "LedgerEntryType": "AccountRoot", "Account": hex::encode(issuer),
+            "Balance": "50000000", "Sequence": 1, "OwnerCount": 0,
+        });
+        state.state_map.insert(keylet::account_root_key(&issuer), serde_json::to_vec(&iss).unwrap()).unwrap();
+        // issuer (0x02..) > acct (0x01..) ⇒ the issuer is the HIGH side, so its
+        // freeze flag is lsfHighFreeze. 100 USD held, and every drop frozen.
+        let (lo, hi) = (acct, issuer);
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64 | 0x0080_0000u64,
+            "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000",
+                        "value": "100"},
+            "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000"},
+            "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000"},
+        });
+        state.state_map.insert(keylet::ripple_state_key(&acct, &issuer, &cur), serde_json::to_vec(&line).unwrap()).unwrap();
+
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: acct, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 5,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerPays": "1000000",
+                "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "10"},
+            }),
+        };
+        assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::UnfundedOffer);
+        assert!(!sandbox.exists(&keylet::offer_key(&acct, 5)), "and nothing is placed");
     }
 
     /// A bridged pass cannot stop at the pool: off the default path rippled's
