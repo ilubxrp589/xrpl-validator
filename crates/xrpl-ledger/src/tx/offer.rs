@@ -1222,6 +1222,41 @@ fn cross_bridged(
                 break;
             }
         }
+        // A bridged pass cannot stop at the pool. Off the default path
+        // `BookOfferCrossingStep::checkQualityThreshold` (BookStep.cpp:~470,
+        // `!defaultPath_ || quality >= qualityThreshold_`) is disabled, so
+        // after consuming the AMM offer the step keeps stepping into that
+        // leg's CLOB, and StrandFlow judges the pass AS A WHOLE — rejecting
+        // and DISCARDING it entirely when the average quality misses
+        // limitQuality (StrandFlow.h:700-705). No `limitOut` trim rescues it:
+        // that needs a single active strand (:644) and offer crossing always
+        // has two. A fib slice is 0.025% of the pool, so any request
+        // materially larger than one slice is dominated by that CLOB
+        // continuation — the bridge is usable only when its BOOK composition
+        // also clears the limit.
+        //
+        // #105807256 84FD7DC8 sells 3105.662739 BBRL for RLUSD. Leg A's pool
+        // (20.898474 XRP / 116.0000692564219 BBRL, fee 1%) quotes 5.60671
+        // BBRL/XRP while leg A's BOOK starts at 399.996 — 71x worse. We took
+        // six pool slices and crossed 8 objects; mainnet rested all 4 nodes.
+        //
+        // ⚠ This is a MODEL of the pass, not a port of it. The faithful form
+        // accumulates a whole pass and rejects on its AVERAGE quality; this
+        // asks only whether the CLOB the pass would be dragged into clears the
+        // limit, and so ignores how much the pool slice improves that average.
+        // The two agree whenever the request is large relative to one slice,
+        // which is every case in the corpus and both sweeps. They can differ
+        // when a request is comparable to a single slice — the pool could then
+        // carry the pass on its own and rippled would cross where we rest. No
+        // such ledger is known; if one turns up, that is the case to build the
+        // real accumulate-and-average pass around, not a reason to widen this.
+        if !use_direct {
+            if let (Some(a), Some(b), Some(t)) = (qa_book, qb_book, thr) {
+                if me_cmp(norm16((a.0 * b.0, a.1 + b.1)), t).is_gt() {
+                    break;
+                }
+            }
+        }
         if use_direct {
             let Some((_, okey, offer, maker, gives0, wants0)) =
                 live_head(sandbox, &ld, &mut di, taker, pays_leg, true, stale)
@@ -2742,6 +2777,101 @@ mod tests {
         // ...and it lands in the book page for the tick-rounded quality.
         let q = keylet::offer_quality(&placed["TakerPays"], &placed["TakerGets"]).unwrap();
         assert_eq!(format!("{q:016x}"), "5321d3536a38dba4");
+    }
+
+    /// A bridged pass cannot stop at the pool: off the default path rippled's
+    /// per-offer quality gate is disabled, so the step keeps stepping into the
+    /// leg's CLOB and StrandFlow judges the pass as a whole. Here leg A's pool
+    /// is 100x better than leg A's book, and the pool slice is a fraction of
+    /// the request — so mainnet's pass would be dominated by that book and
+    /// rejected outright. #105807256 84FD7DC8 is the live case: it rests in
+    /// 4 nodes while we crossed 8 objects off six pool slices.
+    #[test]
+    fn a_bridged_pass_needs_its_book_composition_within_the_limit() {
+        let taker = [0x01u8; 20];
+        let mk_a = [0x04u8; 20];
+        let mk_b = [0x05u8; 20];
+        let iss_a = [0x02u8; 20];
+        let iss_b = [0x03u8; 20];
+        let pool = [0x06u8; 20];
+        let (mut ca, mut cb) = ([0u8; 20], [0u8; 20]);
+        ca[12..15].copy_from_slice(b"AAA");
+        cb[12..15].copy_from_slice(b"BBB");
+
+        let mut state = make_state_with_account(&taker, 500_000_000);
+        for id in [&mk_a, &mk_b, &iss_a, &iss_b, &pool] {
+            let a = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": hex::encode(id),
+                "Balance": "500000000", "Sequence": 1, "OwnerCount": 0,
+            });
+            state.state_map.insert(keylet::account_root_key(id), serde_json::to_vec(&a).unwrap()).unwrap();
+        }
+        let mut line = |who: &[u8; 20], iss: &[u8; 20], cur: &[u8; 20], bal: &str| {
+            let (lo, hi) = if who < iss { (*who, *iss) } else { (*iss, *who) };
+            let v = serde_json::json!({
+                "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+                "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000",
+                            "value": if who < iss { bal.to_string() } else { format!("-{bal}") }},
+                "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000000"},
+                "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000000"},
+            });
+            state.state_map.insert(keylet::ripple_state_key(who, iss, cur), serde_json::to_vec(&v).unwrap()).unwrap();
+        };
+        line(&taker, &iss_a, &ca, "1000");   // the taker's AAA to sell
+        line(&mk_b, &iss_b, &cb, "1000");    // leg B maker's BBB
+        line(&pool, &iss_a, &ca, "100");     // leg A pool: 100 AAA / 100 XRP
+
+        // Leg A pool at 1 AAA per XRP — 100x better than leg A's book below.
+        let amm = serde_json::json!({
+            "LedgerEntryType": "AMM", "Account": hex::encode(pool), "TradingFee": 0,
+        });
+        let xrp_leg = leg_of(&serde_json::json!("1")).unwrap();
+        let a_leg = leg_of(&serde_json::json!({"currency":"AAA","issuer":hex::encode(iss_a),"value":"1"})).unwrap();
+        let akey = keylet::amm_key(&xrp_leg.cur, &xrp_leg.issuer, &a_leg.cur, &a_leg.issuer);
+        state.state_map.insert(akey, serde_json::to_vec(&amm).unwrap()).unwrap();
+
+        // Leg A book: 1 XRP for 100 AAA. Leg B book: 100 BBB for 1 XRP.
+        for (who, pays, gets) in [
+            (mk_a, serde_json::json!({"currency":"AAA","issuer":hex::encode(iss_a),"value":"100"}), serde_json::json!("1000000")),
+            (mk_b, serde_json::json!("1000000"), serde_json::json!({"currency":"BBB","issuer":hex::encode(iss_b),"value":"100"})),
+        ] {
+            let mut sandbox = Sandbox::new(&state);
+            let tx = TxFields {
+                account: who, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
+                ticket_seq: None, last_ledger_seq: None,
+                fields: serde_json::json!({"TakerPays": pays, "TakerGets": gets}),
+            };
+            assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+            let mods = sandbox.into_modifications();
+            apply_modifications(&mut state, mods).unwrap();
+        }
+
+        // Sell 10 AAA for 100 BBB — limit 0.1 AAA/BBB. Bridged via the pool
+        // that is 0.01; via the two BOOKS it is 1.0, ten times past the limit.
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: taker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 9,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerGets": {"currency": "AAA", "issuer": hex::encode(iss_a), "value": "10"},
+                "TakerPays": {"currency": "BBB", "issuer": hex::encode(iss_b), "value": "100"},
+            }),
+        };
+        assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+
+        // Nothing crossed: both makers untouched and the offer rests in full.
+        assert_eq!(
+            json_at(&sandbox, &keylet::offer_key(&mk_a, 2)).unwrap()["TakerGets"].as_str(),
+            Some("1000000"),
+            "leg A's book maker must be untouched",
+        );
+        assert_eq!(
+            json_at(&sandbox, &keylet::offer_key(&mk_b, 2)).unwrap()["TakerGets"]["value"].as_str(),
+            Some("100"),
+            "leg B's book maker must be untouched",
+        );
+        let rested = json_at(&sandbox, &keylet::offer_key(&taker, 9)).expect("offer rests");
+        assert_eq!(rested["TakerGets"]["value"].as_str(), Some("10"), "and rests in full");
     }
 
     /// Mainnet tx 9BA91A9E… (ledger 105777146): the WETH issuer publishes
