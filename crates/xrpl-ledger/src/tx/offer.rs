@@ -627,33 +627,11 @@ fn st_multiply(a: Me, b: Me, xrp: bool) -> Me {
 }
 
 /// rippled `getRate(pays, gets)` on raw mantissa/exponent pairs — the same
-/// algorithm as `keylet::offer_quality`, without the JSON round-trip.
+/// algorithm as `keylet::offer_quality`, without the JSON round-trip. Both
+/// now share one implementation, so the book level an offer is PLACED on and
+/// the level it is read back from can never disagree.
 fn rate_of_me(pays: Me, gets: Me) -> Option<u64> {
-    if pays.0 == 0 || gets.0 == 0 {
-        return None;
-    }
-    let (nm, ne) = norm16(pays);
-    let (dm, de) = norm16(gets);
-    let v = nm * 100_000_000_000_000_000u128 / dm + 5;
-    let mut e = ne - de - 17;
-    let mut k = 0u32;
-    let mut t = v;
-    while t >= 10_000_000_000_000_000 {
-        t /= 10;
-        k += 1;
-    }
-    let d = 10u128.pow(k);
-    let (mut q, r) = (v / d, v % d);
-    let twice = r * 2;
-    if twice > d || (twice == d && q & 1 == 1) {
-        q += 1;
-    }
-    e += k as i32;
-    if q >= 10_000_000_000_000_000 {
-        q /= 10;
-        e += 1;
-    }
-    Some((((e + 100) as u64) << 56) | q as u64)
+    keylet::rate_encode(pays.0, pays.1, gets.0, gets.1)
 }
 
 /// Scale a mantissa/exponent to an integer drop count, rounding to nearest
@@ -691,14 +669,79 @@ pub(crate) fn apply_tick_size(pays: Me, gets: Me, sell: bool, tick: u32, pays_xr
     };
     let rounded = quality_round_up(rate, tick);
     let rate_me = ((rounded & 0x00FF_FFFF_FFFF_FFFF) as u128, ((rounded >> 56) as i32) - 100);
+    // ⚠ The two sides round DIFFERENTLY, and mainnet pins each of them:
+    //
+    // * The DIVIDE side takes rippled's STAmount `divide` — truncating muldiv
+    //   at 10^17 then `+5`. #105777146 sells 0.00059094 WETH (issuer TickSize
+    //   6) for 1 XRP and mainnet stored TakerGets 0.0005909397123305481, one
+    //   ulp ABOVE the half-even result, which is what makes its rate encode to
+    //   `…ABFB5800`. Using the fill-path divide gave `…5480` and rested the
+    //   offer a level off at `…ABFB5801` (4v4, the ledger's sole divergence).
+    // * The MULTIPLY side keeps Number's exact half-even (`st_multiply`).
+    //   #105667130 `42071037` and #105761560 `DE32DB155A71` are both tfSell
+    //   WETH offers whose stored book level is `…E000`; the `+7` STAmount form
+    //   puts them at `…E001`. These are the same two ledgers `0EAE58BB` /
+    //   `42071037` taught the half-even lesson on originally.
+    //
+    // Do not "unify" these on one rule — it has now been tried in both
+    // directions and each choice breaks the other side's mainnet cases.
     if sell {
         // Hold TakerGets, re-derive TakerPays = TakerGets × rate.
         let p = st_multiply(gets, rate_me, pays_xrp);
         if p.0 == 0 { (pays, gets) } else { (p, gets) }
     } else {
         // Hold TakerPays, re-derive TakerGets = TakerPays ÷ rate.
-        let g = st_divide(pays, rate_me, gets_xrp);
+        let g = stamount_divide(pays, rate_me, gets_xrp);
         if g.0 == 0 { (pays, gets) } else { (pays, g) }
+    }
+}
+
+/// Fold a raw muldiv result down to 16 significant digits, half-even over the
+/// discarded tail — rippled's STAmount canonicalize.
+fn fold16(v: u128, e0: i32) -> Me {
+    const LO: u128 = 1_000_000_000_000_000;
+    const HI: u128 = 10_000_000_000_000_000;
+    if v == 0 {
+        return (0, 0);
+    }
+    let mut k = 0u32;
+    let mut t = v;
+    while t >= HI {
+        t /= 10;
+        k += 1;
+    }
+    let d = 10u128.pow(k);
+    let (mut m, r) = (v / d, v % d);
+    if 2 * r > d || (2 * r == d && m & 1 == 1) {
+        m += 1;
+    }
+    let mut e = e0 + k as i32;
+    if m >= HI {
+        m /= 10;
+        e += 1;
+    }
+    while m > 0 && m < LO {
+        m *= 10;
+        e -= 1;
+    }
+    (m, e)
+}
+
+/// rippled `STAmount divide(num, den, asset)`: truncating muldiv at 10^17,
+/// `+5`, canonicalize. Distinct from [`st_divide`], which implements Number's
+/// exact half-even for the flow/fill path — see [`keylet::rate_encode`].
+fn stamount_divide(num: Me, den: Me, xrp: bool) -> Me {
+    if num.0 == 0 || den.0 == 0 {
+        return (0, 0);
+    }
+    let (nm, ne) = norm16(num);
+    let (dm, de) = norm16(den);
+    let v = nm * 100_000_000_000_000_000u128 / dm + 5;
+    let e = ne - de - 17;
+    if xrp {
+        (me_rescale_nearest((v, e)), 0)
+    } else {
+        fold16(v, e)
     }
 }
 
@@ -2699,6 +2742,55 @@ mod tests {
         // ...and it lands in the book page for the tick-rounded quality.
         let q = keylet::offer_quality(&placed["TakerPays"], &placed["TakerGets"]).unwrap();
         assert_eq!(format!("{q:016x}"), "5321d3536a38dba4");
+    }
+
+    /// Mainnet tx 9BA91A9E… (ledger 105777146): the WETH issuer publishes
+    /// TickSize 6, so the rate rounds up to 6 significant digits and the
+    /// non-exact side is re-derived. rippled re-derives with the STAmount
+    /// `divide` — truncating muldiv at 10^17 then `+5` — NOT the Number-exact
+    /// half-even the fill path uses, and the two disagree in the last digit.
+    /// Mainnet stored TakerGets 0.0005909397123305481, one ulp ABOVE the
+    /// half-even result, which is what makes the rate encode to `…ABFB5800`.
+    /// With the fill-path divide we derived `…480` and rested the offer one
+    /// book level off at `…ABFB5801` — the ledger's sole divergence (4v4).
+    #[test]
+    fn tick_rounding_re_derives_with_the_stamount_divide() {
+        let acct = [0x01u8; 20];
+        let issuer = [0x02u8; 20];
+        let mut cur = [0u8; 20];
+        cur[12..16].copy_from_slice(b"WETH");
+
+        let mut state = make_state_with_account(&acct, 500_000_000);
+        let iss_acct = serde_json::json!({
+            "LedgerEntryType": "AccountRoot", "Account": hex::encode(issuer),
+            "Balance": "50000000", "Sequence": 1, "OwnerCount": 0, "TickSize": 6,
+        });
+        state.state_map.insert(keylet::account_root_key(&issuer), serde_json::to_vec(&iss_acct).unwrap()).unwrap();
+        let (lo, hi) = if acct < issuer { (acct, issuer) } else { (issuer, acct) };
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+            "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000",
+                        "value": if acct < issuer { "1" } else { "-1" }},
+            "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000"},
+            "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000"},
+        });
+        state.state_map.insert(keylet::ripple_state_key(&acct, &issuer, &cur), serde_json::to_vec(&line).unwrap()).unwrap();
+
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: acct, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 5,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerPays": "1000000",
+                "TakerGets": {"currency": "WETH", "issuer": hex::encode(issuer), "value": "0.00059094"},
+            }),
+        };
+        assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+
+        let placed = json_at(&sandbox, &keylet::offer_key(&acct, 5)).expect("offer placed");
+        assert_eq!(placed["TakerGets"]["value"].as_str(), Some("0.0005909397123305481"));
+        let q = keylet::offer_quality(&placed["TakerPays"], &placed["TakerGets"]).unwrap();
+        assert_eq!(format!("{q:016X}"), "5E060310ABFB5800");
     }
 
     /// A book level holding nothing but a dead offer, with a pool that can

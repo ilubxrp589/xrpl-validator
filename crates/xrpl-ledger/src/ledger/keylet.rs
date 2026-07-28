@@ -233,16 +233,25 @@ pub fn amount_mant_exp(v: &serde_json::Value) -> Option<(u128, i32)> {
     Some((m, exp))
 }
 
-/// Offer quality = rate = TakerPays/TakerGets, encoded as rippled's
-/// `getRate`: `((exponent+100) << 56) | mantissa`. Faithful to STAmount
-/// divide under the Number switchover: normalize both mantissas to
-/// [1e15,1e16), truncating muldiv at 10^17, +5, then ONE round-half-even
-/// pass over the excess tail (Number canonicalize). Mainnet-verified
-/// 331/341 (all 10 misses are crossing-remainder placements).
-pub fn offer_quality(taker_pays: &serde_json::Value, taker_gets: &serde_json::Value) -> Option<u64> {
-    let (pm, pe) = amount_mant_exp(taker_pays)?;
-    let (gm, ge) = amount_mant_exp(taker_gets)?;
-    if pm == 0 || gm == 0 {
+/// Encode `pays/gets` as rippled's `getRate`: `((exponent+100) << 56) |
+/// mantissa`, i.e. `divide(in, out)` canonicalized.
+///
+/// Faithful to rippled's `STAmount divide` — the LEGACY muldiv, not the
+/// Number-exact rounding the fill path uses. Normalize both mantissas to
+/// [1e15,1e16), truncating muldiv at 10^17, `+5`, then ONE round-half-even
+/// pass over the excess tail (canonicalize).
+///
+/// ⚠ The `+5` is NOT a fudge to be "cleaned up" into exact half-even
+/// rounding. Two mainnet cases pin it from both sides: #105091579's
+/// tick-rounded placement needs `…DBA4`, which only `+5` produces, while exact
+/// half-even gives `…DBA3`; #105777146 needs `…5800`, which `+5` also
+/// produces from mainnet's own stored amounts. rippled genuinely has two
+/// divides — this one for `divide`/`multiply`/`getRate`, and Number's
+/// half-even for flow arithmetic (`offer::div_nearest_16`). Mixing them is
+/// what `0EAE58BB`/`42071037` punished on the fill path, and using the fill
+/// rule here is what put #105777146 one ULP off its book level.
+pub fn rate_encode(pays_m: u128, pays_e: i32, gets_m: u128, gets_e: i32) -> Option<u64> {
+    if pays_m == 0 || gets_m == 0 {
         return None;
     }
     const LO: u128 = 1_000_000_000_000_000; // 1e15
@@ -258,11 +267,10 @@ pub fn offer_quality(taker_pays: &serde_json::Value, taker_gets: &serde_json::Va
         }
         (m, e)
     };
-    let (nm, ne) = norm(pm, pe);
-    let (dm, de) = norm(gm, ge);
+    let (nm, ne) = norm(pays_m, pays_e);
+    let (dm, de) = norm(gets_m, gets_e);
     let v = nm * 100_000_000_000_000_000u128 / dm + 5; // trunc muldiv @1e17, +5
     let mut e = ne - de - 17;
-    // Number canonicalize: one banker's rounding over the whole excess tail.
     let mut k = 0u32;
     let mut t = v;
     while t >= HI {
@@ -270,21 +278,30 @@ pub fn offer_quality(taker_pays: &serde_json::Value, taker_gets: &serde_json::Va
         k += 1;
     }
     let d = 10u128.pow(k);
-    let (mut q, r) = (v / d, v % d);
-    if 2 * r > d || (2 * r == d && q % 2 == 1) {
-        q += 1;
-    }
-    if q >= HI {
-        q /= 10;
-        k += 1;
+    let (mut m, r) = (v / d, v % d);
+    if 2 * r > d || (2 * r == d && m & 1 == 1) {
+        m += 1;
     }
     e += k as i32;
-    let mut m = q;
+    if m >= HI {
+        m /= 10;
+        e += 1;
+    }
     while m > 0 && m < LO {
         m *= 10;
         e -= 1;
     }
+    if m == 0 {
+        return None;
+    }
     Some((((e + 100) as u64) << 56) | m as u64)
+}
+
+/// Offer quality = rate = TakerPays/TakerGets. See [`rate_encode`].
+pub fn offer_quality(taker_pays: &serde_json::Value, taker_gets: &serde_json::Value) -> Option<u64> {
+    let (pm, pe) = amount_mant_exp(taker_pays)?;
+    let (gm, ge) = amount_mant_exp(taker_gets)?;
+    rate_encode(pm, pe, gm, ge)
 }
 
 /// Compute the state tree key for a Ticket.
