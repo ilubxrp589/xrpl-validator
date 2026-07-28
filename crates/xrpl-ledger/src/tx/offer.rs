@@ -1864,6 +1864,39 @@ impl Transactor for OfferCreateTransactor {
             }
         }
 
+        // "If offer crossing exhausted the account's funds don't create the
+        // offer" (OfferCreate.cpp:479-484): rippled clears the residual rather
+        // than resting something the account cannot begin to fund. The result
+        // stays tesSUCCESS; only the offer is dropped. This is the companion
+        // to the pre-crossing `accountFunds` clamp above (`1de6d87`) — that one
+        // bounds what may be SPENT, this one bounds what may REST.
+        //
+        // The test is on the CLAMPED input: `rem_gets_cross` is what survives
+        // of `accountFunds`, so exhausting it means the crossing consumed
+        // everything the account had. Reading the account again here instead
+        // would be ambiguous, because deleting a self-crossed offer has already
+        // released a 0.2 XRP reserve increment by this point.
+        //
+        // #105803327 09DA2A02, a tfPassive buy of 9.905704 RLUSD for 11.013387
+        // XRP: the account held 10.937718 XRP at OwnerCount 8, so it could
+        // spend 8337706 drops, and the whole amount would have cost 8921861.
+        // It spent every spendable drop and landed on exactly 2600000 — its
+        // 1 + 8×0.2 XRP reserve. Mainnet placed nothing; we rested an offer
+        // plus its book page it never had (10v8, both extra, nothing missing —
+        // our crossing itself is byte-identical to mainnet's).
+        if std::env::var("DX_PLACE").is_ok() {
+            let a = json_at(sandbox, &keylet::account_root_key(&tx.account));
+            eprintln!(
+                "DX_PLACE crossed={crossed} rem_pays={rem_pays:?} rem_gets={rem_gets:?} avail={:?} bal={:?} oc={:?}",
+                available(sandbox, &tx.account, &gets_leg),
+                a.as_ref().map(|x| x["Balance"].clone()),
+                a.as_ref().map(|x| x["OwnerCount"].clone()),
+            );
+        }
+        if underfunded && me_is_zero(rem_gets_cross) {
+            return TxResult::Success;
+        }
+
         // Place the remainder at the taker's ORIGINAL quality (rippled
         // preserves the price for partial fills).
         let seq = if tx.uses_ticket() { tx.ticket_seq.unwrap_or(0) } else { tx.sequence };
@@ -2922,6 +2955,76 @@ mod tests {
         assert!(!sandbox.exists(&dusty), "a dust-backed offer must be reaped");
         assert!(stale.contains(&dusty));
         assert_eq!(read_balance(&sandbox, &m1), before, "and never crossed for value");
+    }
+
+    /// "If offer crossing exhausted the account's funds don't create the offer"
+    /// (OfferCreate.cpp:479-484). A crossing clamped to `accountFunds` that
+    /// spends every drop leaves a residual the account cannot begin to fund,
+    /// and rippled drops it rather than resting it — tesSUCCESS, no offer.
+    /// #105803327 09DA2A02: 10.937718 XRP at OwnerCount 8 could spend 8337706
+    /// drops against a 8921861-drop ask; it spent all of them, landed on its
+    /// exact 2600000 reserve, and mainnet placed nothing while we rested an
+    /// offer and a book page (10v8, both extra).
+    #[test]
+    fn a_crossing_that_exhausts_the_account_places_no_remainder() {
+        let taker = [0x01u8; 20];
+        let maker = [0x04u8; 20];
+        let issuer = [0x02u8; 20];
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+
+        // 5 XRP at OwnerCount 0 ⇒ 1 XRP reserve ⇒ 4 XRP spendable.
+        let mut state = make_state_with_account(&taker, 5_000_000);
+        for id in [&maker, &issuer] {
+            let a = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": hex::encode(id),
+                "Balance": "500000000", "Sequence": 1, "OwnerCount": 0,
+            });
+            state.state_map.insert(keylet::account_root_key(id), serde_json::to_vec(&a).unwrap()).unwrap();
+        }
+        let (lo, hi) = if maker < issuer { (maker, issuer) } else { (issuer, maker) };
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+            "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000",
+                        "value": if maker < issuer { "100" } else { "-100" }},
+            "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000000"},
+            "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000000"},
+        });
+        state.state_map.insert(keylet::ripple_state_key(&maker, &issuer, &cur), serde_json::to_vec(&line).unwrap()).unwrap();
+
+        // Maker sells 100 USD at 0.5 XRP each — better than the taker's limit.
+        let mut sandbox = Sandbox::new(&state);
+        let maker_offer = TxFields {
+            account: maker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerPays": "50000000",
+                "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
+            }),
+        };
+        assert_eq!(OfferCreateTransactor.do_apply(&maker_offer, &mut sandbox), TxResult::Success);
+        let mods = sandbox.into_modifications();
+        apply_modifications(&mut state, mods).unwrap();
+
+        // Taker asks for 9 USD and offers 5 XRP, but can only spend 4 — which
+        // buys 8 USD at the maker's price. The 1 USD it still wants is the
+        // residual that must NOT be placed.
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: taker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 7,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerGets": "5000000",
+                "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "9"},
+            }),
+        };
+        assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+
+        assert_eq!(read_balance(&sandbox, &taker), 1_000_000, "every spendable drop is gone");
+        assert!(
+            !sandbox.exists(&keylet::offer_key(&taker, 7)),
+            "an exhausted account rests no remainder",
+        );
     }
 
     /// The trailing step follows the stream across BOOK LEVELS, not just to the
