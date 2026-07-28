@@ -75,15 +75,38 @@ impl Transactor for CheckCreateTransactor {
         if !sandbox.exists(&acct_key) {
             return TxResult::NoAccount;
         }
-        // Destination must be a valid account
-        if let Some(dest) = tx.fields.get("Destination").and_then(|d| parse_account_id(d)) {
-            let dest_key = keylet::account_root_key(&dest);
-            if !sandbox.exists(&dest_key) {
-                return TxResult::NoDst;
-            }
-        } else {
+        let Some(dest) = tx.fields.get("Destination").and_then(|d| parse_account_id(d)) else {
             return TxResult::Malformed;
+        };
+        // Destination must be a valid account
+        let Some(dst) = sandbox
+            .read(&keylet::account_root_key(&dest))
+            .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+        else {
+            return TxResult::NoDst;
+        };
+        // The rest of rippled's CheckCreate::preclaim, in its order: a
+        // destination may refuse checks outright, may be a pseudo-account, or
+        // may insist on a tag.
+        let dflags = dst["Flags"].as_u64().unwrap_or(0);
+        if dflags & 0x0800_0000 != 0 {
+            return TxResult::NoPermission; // lsfDisallowIncomingCheck
         }
+        // Pseudo-accounts cannot cash checks — same designator fields as the
+        // Payment rule (`3a718aa`): sfAMMID / sfVaultID / sfLoanBrokerID.
+        if ["AMMID", "VaultID", "LoanBrokerID"].iter().any(|f| dst.get(f).is_some()) {
+            return TxResult::NoPermission;
+        }
+        // #105846674 F6CC9A594B17: a VRTY airdrop check to rnabZzjg, whose
+        // flags 0x120000 carry lsfRequireDestTag, with no DestinationTag on the
+        // transaction. Mainnet claims the fee in one mutation; we created the
+        // Check and both directory entries in seven.
+        if dflags & 0x0002_0000 != 0 && tx.fields.get("DestinationTag").is_none() {
+            return TxResult::DstTagNeeded; // lsfRequireDestTag
+        }
+        // NOT modelled: the non-native SendMax freeze block (global freeze, and
+        // either party's line frozen by the issuer → tecFROZEN) and the
+        // Expiration → tecEXPIRED check. No failing ledger for either yet.
         TxResult::Success
     }
 
@@ -412,6 +435,59 @@ mod tests {
             .and_then(|s| s.parse::<u64>().ok())
             .or_else(|| v[field].as_u64())
             .unwrap_or(0)
+    }
+
+    /// rippled's CheckCreate::preclaim refuses a check whose destination has
+    /// set `lsfRequireDestTag` (0x00020000) when the transaction carries no
+    /// DestinationTag. #105846674 F6CC9A594B17: a VRTY airdrop check to
+    /// rnabZzjg (flags 0x120000, no tag on the tx) — mainnet claims the fee in
+    /// one mutation, we created the Check and both dir entries in seven.
+    #[test]
+    fn a_check_needs_a_tag_when_the_destination_requires_one() {
+        let acct = [0x01u8; 20];
+        let dest = [0x02u8; 20];
+        let mut state = make_state_with_accounts(&[(&acct, 500_000_000), (&dest, 500_000_000)]);
+
+        let mut fields = serde_json::json!({
+            "Destination": hex::encode(dest),
+            "SendMax": "1000000",
+        });
+        let mut tx = TxFields {
+            account: acct,
+            tx_type: "CheckCreate".into(),
+            fee: 12,
+            sequence: 5,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: fields.clone(),
+        };
+        assert_eq!(
+            CheckCreateTransactor.preclaim(&tx, &Sandbox::new(&state)),
+            TxResult::Success,
+            "an untagged check to an ordinary destination stands",
+        );
+
+        // The destination now requires a tag — nothing else changes.
+        let dkey = keylet::account_root_key(&dest);
+        let mut d: serde_json::Value =
+            serde_json::from_slice(&Sandbox::new(&state).read(&dkey).unwrap()).unwrap();
+        d["Flags"] = serde_json::json!(0x0002_0000u64);
+        state.state_map.insert(dkey, serde_json::to_vec(&d).unwrap()).unwrap();
+
+        assert_eq!(
+            CheckCreateTransactor.preclaim(&tx, &Sandbox::new(&state)),
+            TxResult::DstTagNeeded,
+            "but not without a DestinationTag",
+        );
+
+        // Supplying the tag makes it good again.
+        fields["DestinationTag"] = serde_json::json!(12345u64);
+        tx.fields = fields;
+        assert_eq!(
+            CheckCreateTransactor.preclaim(&tx, &Sandbox::new(&state)),
+            TxResult::Success,
+            "a tagged check satisfies the requirement",
+        );
     }
 
     #[test]
