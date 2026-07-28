@@ -472,10 +472,33 @@ impl PaymentTransactor {
             .get("SendMax")
             .and_then(crate::ledger::keylet::amount_mant_exp)
             .unwrap_or(want);
-        // What the sender must part with to land `want` on the destination.
+        // The final issuer→dest step is capped at what the destination can
+        // still receive — `creditLimit(dst,issuer) − heldByDst`, floored at
+        // zero (DirectStepI::maxPaymentFlow, DirectStep.cpp:487). A
+        // destination already at or over its own trust limit receives nothing,
+        // so the strand is dry. `apply_path_payment` has carried this cap since
+        // `04a1586`; that commit documented the direct route as the same rule
+        // "in principle" and left it alone for want of a failing ledger. These
+        // are those ledgers.
+        //
+        // #105828788 6D342FDE and #105896643 D3FEA91C send JUST1 to
+        // destinations holding 1.002263 and 1.040687 against a limit of 0.
+        // #105855167 3F56723B sends YZZUF to a DEFAULT-STATE line — limit 0,
+        // balance 0 — which `account_lines` does not report at all; only
+        // `ledger_entry` by index shows it, which is why the existing
+        // "destination must have a line" guard passes and we delivered. All
+        // three are 3v1: mainnet claims the fee alone.
+        let target = match ox::dest_receivable(sandbox, dest, &leg) {
+            Some(r) if ox::me_cmp(r, want).is_lt() => r,
+            _ => want,
+        };
+        if ox::me_is_zero(target) {
+            return TxResult::PathDry;
+        }
+        // What the sender must part with to land `target` on the destination.
         let need = match rate {
-            Some(r) => ox::me_muldiv(want, (r as u128, 0), (1_000_000_000, 0), true),
-            None => want,
+            Some(r) => ox::me_muldiv(target, (r as u128, 0), (1_000_000_000, 0), true),
+            None => target,
         };
         let spend = [avail, cap, need]
             .into_iter()
@@ -1020,6 +1043,77 @@ mod tests {
     /// one every payment below would be tecPATH_DRY before reaching the
     /// behaviour under test. Crossing the book as an OfferCreate would open
     /// the line; paying does not.
+    /// A payment's final issuer→dest step is capped at what the destination can
+    /// still receive — `creditLimit(dst,issuer) − heldByDst` floored at zero
+    /// (DirectStepI::maxPaymentFlow, DirectStep.cpp:487) — so a destination at
+    /// or over its own trust limit receives nothing and the strand is dry.
+    /// `apply_path_payment` has had this since `04a1586`; the direct route had
+    /// not. #105828788 6D342FDE / #105896643 D3FEA91C pay JUST1 to holders of
+    /// 1.002263 and 1.040687 against a limit of 0; #105855167 3F56723B pays
+    /// YZZUF into a default-state line, limit 0 and balance 0.
+    #[test]
+    fn a_direct_iou_payment_is_dry_when_the_destination_cannot_receive() {
+        let sender = [0x01u8; 20];
+        let dest = [0x02u8; 20];
+        let issuer = [0x03u8; 20];
+        let cur = crate::tx::offer::amount_currency20(
+            &serde_json::json!({"currency": "USD", "issuer": hex::encode(issuer), "value": "1"}),
+        )
+        .unwrap();
+
+        let mut state = make_state();
+        for id in [&sender, &dest, &issuer] {
+            add_account(&mut state, id, 50_000_000, 1);
+        }
+        let mut put_line = |state: &mut LedgerState, who: &[u8; 20], bal: &str, limit: &str| {
+            let (lo, hi) = if who < &issuer { (*who, issuer) } else { (issuer, *who) };
+            // `limit` is the holder's own side; the issuer never extends credit.
+            let (lo_lim, hi_lim) = if who < &issuer { (limit, "0") } else { ("0", limit) };
+            let line = serde_json::json!({
+                "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+                "Balance": {"currency": hex::encode_upper(cur),
+                            "issuer": "0000000000000000000000000000000000000000",
+                            "value": if who < &issuer { bal.to_string() } else { format!("-{bal}") }},
+                "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": lo_lim},
+                "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": hi_lim},
+            });
+            state
+                .state_map
+                .insert(keylet::ripple_state_key(who, &issuer, &cur), serde_json::to_vec(&line).unwrap())
+                .unwrap();
+        };
+        put_line(&mut state, &sender, "100", "1000000");
+        // Destination trusts the issuer for NOTHING — the default-state line
+        // that `account_lines` does not even report.
+        put_line(&mut state, &dest, "0", "0");
+
+        let tx = TxFields {
+            account: sender,
+            tx_type: "Payment".to_string(),
+            fee: 12,
+            sequence: 1,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Destination": hex::encode(dest),
+                "Amount": {"currency": "USD", "issuer": hex::encode(issuer), "value": "1"},
+            }),
+        };
+        assert_eq!(
+            PaymentTransactor.do_apply(&tx, &mut Sandbox::new(&state)),
+            TxResult::PathDry,
+            "a destination that can receive nothing makes the strand dry",
+        );
+
+        // Raise only the destination's limit — the same payment now lands.
+        put_line(&mut state, &dest, "0", "1000000");
+        assert_eq!(
+            PaymentTransactor.do_apply(&tx, &mut Sandbox::new(&state)),
+            TxResult::Success,
+            "and room on the line is all that was missing",
+        );
+    }
+
     fn state_with_usd_book() -> (LedgerState, [u8; 20], [u8; 20]) {
         let taker = [0x01u8; 20];
         let issuer = [0x03u8; 20];
