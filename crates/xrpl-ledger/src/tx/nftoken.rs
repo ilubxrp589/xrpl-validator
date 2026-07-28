@@ -17,6 +17,15 @@ use crate::ledger::sandbox::Sandbox;
 use crate::ledger::transactor::{Transactor, TxFields, TxResult};
 use xrpl_core::types::Hash256;
 
+/// Whether an account carries `lsfDisallowIncomingNFTokenOffer` (0x04000000),
+/// the opt-out from receiving NFT offers. `None` when the account does not
+/// exist, which the caller distinguishes from a plain "no".
+fn disallows_incoming_nft_offer(sandbox: &Sandbox, id: &[u8; 20]) -> Option<bool> {
+    let data = sandbox.read(&keylet::account_root_key(id))?;
+    let acct: serde_json::Value = serde_json::from_slice(&data).ok()?;
+    Some(acct["Flags"].as_u64().unwrap_or(0) & 0x0400_0000 != 0)
+}
+
 /// Helper: read an account, increment OwnerCount, write back.
 fn increment_owner_count(account: &[u8; 20], sandbox: &mut Sandbox) {
     let acct_key = keylet::account_root_key(account);
@@ -290,6 +299,33 @@ impl Transactor for NFTokenCreateOfferTransactor {
         };
         if nftpage::locate_token(sandbox, &token_owner, &id).is_none() {
             return TxResult::NoEntry;
+        }
+        // An account can opt out of receiving NFT offers, and rippled's shared
+        // `tokenOfferCreatePreclaim` (NFTokenHelpers.cpp:824) honours that for
+        // BOTH accounts an offer names: a `Destination` must exist (tecNO_DST)
+        // and neither it nor the token's `Owner` may carry
+        // `lsfDisallowIncomingNFTokenOffer` — either one is tecNO_PERMISSION.
+        //
+        // #105846674 5C367CC0 and #105875898 19B473AE/677DB175 are buy offers
+        // for tokens whose owners set exactly that flag (rnrLUbYH 0x2d0a0000,
+        // rD9Po2Jz 0x04000000). Mainnet claims the fee in one mutation; we
+        // created the offer in five. The `Owner`-side check is the one those
+        // three pin; the `Destination` side is the same two lines of rippled.
+        //
+        // rippled's `tecNO_TARGET` for a missing owner is unreachable here:
+        // `findToken` above already fails such a transaction with tecNO_ENTRY,
+        // exactly as it does in rippled's own ordering.
+        if let Some(dest) = tx.fields.get("Destination").and_then(decode_account_id) {
+            match disallows_incoming_nft_offer(sandbox, &dest) {
+                None => return TxResult::NoDst,
+                Some(true) => return TxResult::NoPermission,
+                Some(false) => {}
+            }
+        }
+        if let Some(owner) = tx.fields.get("Owner").and_then(decode_account_id) {
+            if disallows_incoming_nft_offer(sandbox, &owner) == Some(true) {
+                return TxResult::NoPermission;
+            }
         }
         TxResult::Success
     }
@@ -706,6 +742,53 @@ mod tests {
                 })
             })
             .unwrap_or_default()
+    }
+
+    /// An account can opt out of receiving NFT offers with
+    /// `lsfDisallowIncomingNFTokenOffer`, and rippled's shared
+    /// `tokenOfferCreatePreclaim` (NFTokenHelpers.cpp:824) refuses a buy offer
+    /// naming such an owner with tecNO_PERMISSION. #105846674 5C367CC0 and
+    /// #105875898 19B473AE/677DB175 are exactly that: mainnet claims the fee
+    /// in one mutation, we created the offer in five.
+    #[test]
+    fn a_buy_offer_is_refused_when_the_owner_disallows_incoming_nft_offers() {
+        let owner = [0x01u8; 20];
+        let buyer = [0x02u8; 20];
+        let state = make_state(&[(owner, 500_000_000), (buyer, 500_000_000)]);
+        let mut sb = Sandbox::new(&state);
+        assert_eq!(NFTokenMintTransactor.do_apply(&mint_tx(owner, 0), &mut sb), TxResult::Success);
+        let id = page_tokens(&sb, &owner).first().expect("token minted").clone();
+
+        let tx = TxFields {
+            account: buyer,
+            tx_type: "NFTokenCreateOffer".into(),
+            fee: 12,
+            sequence: 3,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({
+                "NFTokenID": id, "Amount": "1000000",
+                "Owner": hex::encode(owner), "Flags": 0,
+            }),
+        };
+        // Nothing else about the offer changes — only the owner's opt-out.
+        assert_eq!(
+            NFTokenCreateOfferTransactor.preclaim(&tx, &sb),
+            TxResult::Success,
+            "a buy offer against a willing owner stands",
+        );
+
+        let akey = keylet::account_root_key(&owner);
+        let mut acct: serde_json::Value =
+            serde_json::from_slice(&sb.read(&akey).unwrap()).unwrap();
+        acct["Flags"] = serde_json::json!(0x0400_0000u64);
+        sb.write(akey, serde_json::to_vec(&acct).unwrap());
+
+        assert_eq!(
+            NFTokenCreateOfferTransactor.preclaim(&tx, &sb),
+            TxResult::NoPermission,
+            "but not once that owner disallows incoming NFT offers",
+        );
     }
 
     #[test]
