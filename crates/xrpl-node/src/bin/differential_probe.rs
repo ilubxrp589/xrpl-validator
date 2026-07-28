@@ -394,6 +394,28 @@ fn native_read_keys(txj: &Value) -> Vec<String> {
             keys.push(hex::encode_upper(keylet::owner_dir_key(&acct).0));
         }
     }
+    if txj["TransactionType"].as_str() == Some("EscrowCreate") {
+        // An escrow is listed in the sender's owner directory, the
+        // destination's, and — for an IOU — the ISSUER's. Every one of those
+        // roots has to be present or the append invents a fresh directory
+        // (load_owner_dir_tail then fetches the tail page). #105823810
+        // 6AB38288 escrows STSH whose issuer has a MULTI-PAGE owner dir:
+        // without it we Created root D95F419E where mainnet Modified page
+        // FC62D551. Same shape as the CheckCash gap fixed in 7eb0dca.
+        for f in ["Account", "Destination"] {
+            if let Some(a) = txj[f].as_str().and_then(decode_address) {
+                keys.push(hex::encode_upper(keylet::owner_dir_key(&a).0));
+            }
+        }
+        if let Some(iss) = txj
+            .get("Amount")
+            .and_then(|a| a.get("issuer"))
+            .and_then(|v| v.as_str())
+            .and_then(decode_issuer)
+        {
+            keys.push(hex::encode_upper(keylet::owner_dir_key(&iss).0));
+        }
+    }
     if txj["TransactionType"].as_str() == Some("CheckCash") {
         if let Some(cid) = txj.get("CheckID").and_then(|v| v.as_str()) {
             keys.push(cid.to_uppercase());
@@ -544,6 +566,21 @@ fn load_trustline_hint_pages(state: &mut LedgerState, url: &str, txj: &Value, le
 /// D2215EC9, last page BA1033D3); mainnet Modifies BA1033D3, we Created D2215EC9.
 fn load_owner_dir_tail(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
     let mut owners: Vec<[u8; 20]> = Vec::new();
+    if txj["TransactionType"].as_str() == Some("EscrowCreate") {
+        for f in ["Account", "Destination"] {
+            if let Some(a) = txj[f].as_str().and_then(decode_address) {
+                owners.push(a);
+            }
+        }
+        if let Some(iss) = txj
+            .get("Amount")
+            .and_then(|a| a.get("issuer"))
+            .and_then(|v| v.as_str())
+            .and_then(decode_issuer)
+        {
+            owners.push(iss);
+        }
+    }
     if txj["TransactionType"].as_str() == Some("CheckCash") {
         if let Some(a) = txj["Account"].as_str().and_then(decode_address) {
             owners.push(a);

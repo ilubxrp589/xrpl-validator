@@ -81,6 +81,25 @@ impl EscrowCreateTransactor {
     fn destination(tx: &TxFields) -> Option<[u8; 20]> {
         parse_account_id(tx.fields.get("Destination")?)
     }
+
+    /// The escrowed Amount as an IOU `(leg, value)` when it is not XRP.
+    ///
+    /// Token escrow (`featureTokenEscrow`) lets an Escrow hold an issued
+    /// currency; the value is locked OFF the sender's trust line rather than
+    /// deducted from its XRP. #105823810 6AB38288 escrows 3750000 STSH and we
+    /// rejected it temBAD_AMOUNT, where mainnet built the escrow in 7 nodes.
+    fn iou_amount(tx: &TxFields) -> Option<(crate::tx::offer::Leg, (u128, i32))> {
+        let amt = tx.fields.get("Amount")?;
+        if !amt.is_object() {
+            return None;
+        }
+        let leg = crate::tx::offer::leg_of(amt)?;
+        if leg.xrp {
+            return None;
+        }
+        let v = keylet::amount_mant_exp(amt)?;
+        (v.0 != 0).then_some((leg, v))
+    }
 }
 
 impl Transactor for EscrowCreateTransactor {
@@ -93,13 +112,15 @@ impl Transactor for EscrowCreateTransactor {
             return TxResult::BadFee;
         }
 
-        // Amount must be present and valid XRP drops
-        let amount = match Self::amount_drops(tx) {
-            Some(a) => a,
-            None => return TxResult::BadAmount,
-        };
-        if amount == 0 || amount > 100_000_000_000_000_000 {
-            return TxResult::BadAmount;
+        // Amount is XRP drops, or — under token escrow — an issued currency.
+        if Self::iou_amount(tx).is_none() {
+            let amount = match Self::amount_drops(tx) {
+                Some(a) => a,
+                None => return TxResult::BadAmount,
+            };
+            if amount == 0 || amount > 100_000_000_000_000_000 {
+                return TxResult::BadAmount;
+            }
         }
 
         // Destination must be present and valid
@@ -129,6 +150,19 @@ impl Transactor for EscrowCreateTransactor {
             Err(_) => return TxResult::Malformed,
         };
 
+        // A token escrow locks the issued currency off the sender's trust
+        // line, so its XRP only has to cover the fee.
+        if let Some((leg, want)) = Self::iou_amount(tx) {
+            let held = crate::tx::offer::available(sandbox, &tx.account, &leg);
+            if crate::tx::offer::me_cmp(held, want).is_lt() {
+                return TxResult::UnfundedPayment;
+            }
+            if balance_of(&acct) < tx.fee {
+                return TxResult::UnfundedPayment;
+            }
+            return TxResult::Success;
+        }
+
         // Check balance >= amount + fee
         let balance = balance_of(&acct);
         let amount = Self::amount_drops(tx).unwrap_or(0);
@@ -142,9 +176,11 @@ impl Transactor for EscrowCreateTransactor {
 
     /// val-072: Apply — deduct amount, create Escrow object, increment OwnerCount.
     fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
-        let amount = match Self::amount_drops(tx) {
-            Some(a) => a,
-            None => return TxResult::BadAmount,
+        let iou = Self::iou_amount(tx);
+        let amount = match (&iou, Self::amount_drops(tx)) {
+            (Some(_), _) => 0, // token escrow moves no XRP
+            (None, Some(a)) => a,
+            (None, None) => return TxResult::BadAmount,
         };
         let dest_id = match Self::destination(tx) {
             Some(d) => d,
@@ -163,10 +199,12 @@ impl Transactor for EscrowCreateTransactor {
         };
 
         let sender_balance = balance_of(&sender);
-        if sender_balance < amount {
-            return TxResult::UnfundedPayment;
+        if iou.is_none() {
+            if sender_balance < amount {
+                return TxResult::UnfundedPayment;
+            }
+            sender["Balance"] = serde_json::Value::String((sender_balance - amount).to_string());
         }
-        sender["Balance"] = serde_json::Value::String((sender_balance - amount).to_string());
 
         let oc = owner_count_of(&sender);
         sender["OwnerCount"] = serde_json::Value::Number((oc + 1).into());
@@ -180,7 +218,10 @@ impl Transactor for EscrowCreateTransactor {
             "LedgerEntryType": "Escrow",
             "Account": hex::encode(tx.account),
             "Destination": hex::encode(dest_id),
-            "Amount": amount.to_string(),
+            "Amount": match &iou {
+                Some(_) => tx.fields["Amount"].clone(),
+                None => serde_json::Value::String(amount.to_string()),
+            },
             "OwnerNode": "0",
         });
 
@@ -196,6 +237,34 @@ impl Transactor for EscrowCreateTransactor {
         }
 
         sandbox.write(escrow_key, serde_json::to_vec(&escrow).expect("serializing valid JSON Value"));
+
+        // An escrow is listed in every directory that needs to find it
+        // (EscrowCreate.cpp doApply): always the sender's; the destination's
+        // unless it is a self-send; and, for an IOU, the ISSUER's — "added to
+        // the issuer's owner directory to help track the total locked
+        // balance". This module previously kept no directory entries at all,
+        // which stayed invisible only because no sampled ledger carried escrow
+        // traffic until #105823810.
+        crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &escrow_key);
+        if dest_id != tx.account {
+            crate::ledger::directory::owner_dir_insert(sandbox, &dest_id, &escrow_key);
+            // Mainnet's meta carries the destination's AccountRoot as a no-op
+            // Modified, the same touch CheckCreate already reproduces.
+            let dkey = keylet::account_root_key(&dest_id);
+            if let Some(d) = sandbox.read(&dkey) {
+                sandbox.write(dkey, d);
+            }
+        }
+        if let Some((leg, want)) = iou {
+            if leg.issuer != tx.account && leg.issuer != dest_id {
+                crate::ledger::directory::owner_dir_insert(sandbox, &leg.issuer, &escrow_key);
+            }
+            // Lock the tokens: they leave the sender's line and are held by the
+            // escrow object itself, so no counterparty is credited
+            // (`escrowLockApplyHelper`). #105823810's sender goes from holding
+            // 92500000 STSH to 88750000 — exactly the escrowed 3750000.
+            crate::tx::offer::line_adjust(sandbox, &tx.account, &leg, want, false);
+        }
 
         TxResult::Success
     }
@@ -547,6 +616,85 @@ mod tests {
     // -----------------------------------------------------------------------
     // EscrowCreate tests
     // -----------------------------------------------------------------------
+
+    /// Token escrow: a non-XRP Amount is legal, the value is locked OFF the
+    /// sender's trust line rather than deducted from its XRP, and the escrow is
+    /// listed in THREE owner directories — sender, destination and issuer
+    /// ("added to the issuer's owner directory to help track the total locked
+    /// balance", EscrowCreate.cpp doApply). #105823810 6AB38288 escrows
+    /// 3750000 STSH: we returned temBAD_AMOUNT and applied nothing, where
+    /// mainnet built it in 7 nodes.
+    #[test]
+    fn a_token_escrow_locks_the_line_and_lists_three_directories() {
+        let sender = [0x01u8; 20];
+        let dest = [0x02u8; 20];
+        let issuer = [0x03u8; 20];
+        let cur = crate::tx::offer::amount_currency20(
+            &serde_json::json!({"currency": "STS", "issuer": hex::encode(issuer), "value": "1"}),
+        )
+        .unwrap();
+
+        let mut state = make_state();
+        for id in [&sender, &dest, &issuer] {
+            add_account(&mut state, id, 50_000_000, 1);
+        }
+        let (lo, hi) = if sender < issuer { (sender, issuer) } else { (issuer, sender) };
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+            "Balance": {"currency": hex::encode_upper(cur),
+                        "issuer": "0000000000000000000000000000000000000000",
+                        "value": if sender < issuer { "100" } else { "-100" }},
+            "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000000"},
+            "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000000"},
+        });
+        let lkey = keylet::ripple_state_key(&sender, &issuer, &cur);
+        state.state_map.insert(lkey, serde_json::to_vec(&line).unwrap()).unwrap();
+
+        let tx = TxFields {
+            account: sender,
+            tx_type: "EscrowCreate".to_string(),
+            fee: 12,
+            sequence: 5,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Destination": hex::encode(dest),
+                "Amount": {"currency": "STS", "issuer": hex::encode(issuer), "value": "30"},
+                "FinishAfter": 900,
+            }),
+        };
+        let mut sandbox = Sandbox::new(&state);
+        assert_eq!(EscrowCreateTransactor.preflight(&tx), TxResult::Success, "an IOU Amount is legal");
+        assert_eq!(EscrowCreateTransactor.preclaim(&tx, &sandbox), TxResult::Success);
+        assert_eq!(EscrowCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+
+        let ekey = keylet::escrow_key(&sender, 5);
+        let esc: serde_json::Value =
+            serde_json::from_slice(&sandbox.read(&ekey).expect("escrow created")).unwrap();
+        assert_eq!(esc["Amount"]["value"].as_str(), Some("30"), "the IOU amount is kept verbatim");
+
+        // The tokens left the sender's line and no counterparty was credited.
+        let held = crate::tx::offer::available(
+            &sandbox,
+            &sender,
+            &crate::tx::offer::leg_of(&tx.fields["Amount"]).unwrap(),
+        );
+        assert!(
+            crate::tx::offer::me_cmp(held, (70_000_000_000_000_000u128, -15)).is_eq(),
+            "100 held minus 30 escrowed leaves 70, got {held:?}",
+        );
+
+        // Sender, destination AND issuer all list the escrow.
+        for (who, label) in [(&sender, "sender"), (&dest, "destination"), (&issuer, "issuer")] {
+            let root = keylet::owner_dir_key(who);
+            let dir: serde_json::Value =
+                serde_json::from_slice(&sandbox.read(&root).unwrap_or_else(|| panic!("{label} dir"))).unwrap();
+            let listed = dir["Indexes"].as_array().map(|a| {
+                a.iter().any(|e| e.as_str() == Some(&hex::encode_upper(ekey.0)))
+            });
+            assert_eq!(listed, Some(true), "{label}'s owner directory must list the escrow");
+        }
+    }
 
     #[test]
     fn escrow_create_full_pipeline() {
