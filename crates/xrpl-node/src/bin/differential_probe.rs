@@ -89,9 +89,24 @@ fn cache_dir() -> Option<std::path::PathBuf> {
     }
 }
 
-fn cache_key(method: &str, params: &Value) -> String {
+/// Cache key for one RPC lookup.
+///
+/// ⚠ The SERVER is part of the key. One cache directory is shared by every
+/// probe run on the box, and they do not all talk to the same node: the
+/// nightly scout hydrates from our own .39 (`runner.sh diff <seq>
+/// http://10.0.0.39:5005`) while re-probes of older finds must use s2, whose
+/// ~17k-ledger window .39 has long since rolled past. Keying on
+/// method+params alone let one server's answers be served for the other's
+/// question, and for PAGINATED calls that is corrupting rather than merely
+/// stale: `account_objects` markers are issued BY a server and meaningless to
+/// another, so a .39 marker replayed against s2 (Clio) returns nothing and the
+/// walk stops early. #105838164 lost 358 of a seller's 758 NFT pages that way
+/// and reported a phantom NFTokenAcceptOffer tecNO_ENTRY; with the server in
+/// the key the same ledger is 49/49 clean.
+fn cache_key(url: &str, method: &str, params: &Value) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
+    url.hash(&mut h);
     method.hash(&mut h);
     serde_json::to_string(params).unwrap_or_default().hash(&mut h);
     format!("{method}-{:016x}", h.finish())
@@ -99,7 +114,7 @@ fn cache_key(method: &str, params: &Value) -> String {
 
 fn rpc(url: &str, method: &str, params: Value) -> Option<Value> {
     let dir = cache_dir();
-    let path = dir.as_ref().map(|d| d.join(cache_key(method, &params)));
+    let path = dir.as_ref().map(|d| d.join(cache_key(url, method, &params)));
     if let Some(p) = &path {
         if let Ok(bytes) = std::fs::read(p) {
             if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
@@ -1290,4 +1305,33 @@ fn run() -> i32 {
         return 2;
     }
     if any_diverge { 1 } else { 0 }
+}
+
+#[cfg(test)]
+mod cache_key_tests {
+    use super::cache_key;
+    use serde_json::json;
+
+    /// The RPC server must be part of the cache key. One dxcache directory is
+    /// shared by every probe run on the box and they do not all talk to the
+    /// same node — the scout hydrates from .39, re-probes of older finds must
+    /// use s2. Serving one server's answer for the other's question corrupts
+    /// PAGINATED calls in particular, because `account_objects` markers are
+    /// issued by a server and meaningless to another.
+    #[test]
+    fn cache_key_separates_servers() {
+        let params = json!({"account": "rAAA", "ledger_index": 1, "type": "nft_page"});
+        assert_ne!(
+            cache_key("https://s2.ripple.com:51234", "account_objects", &params),
+            cache_key("http://10.0.0.39:5005", "account_objects", &params),
+            "two servers must not share a cache entry",
+        );
+        // Same server, different marker, still distinct.
+        let mut p2 = params.clone();
+        p2["marker"] = json!("abc");
+        assert_ne!(
+            cache_key("https://s2.ripple.com:51234", "account_objects", &params),
+            cache_key("https://s2.ripple.com:51234", "account_objects", &p2),
+        );
+    }
 }
