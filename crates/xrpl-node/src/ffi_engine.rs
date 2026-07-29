@@ -2388,6 +2388,35 @@ pub fn apply_ledger_in_order_with_net(
                 );
             }
         }
+        // tefPAST_SEQ diagnostics — the mirror of terPRE_SEQ: the sender's
+        // sequence reads AHEAD of the transaction instead of behind. This arm
+        // was counted in live_diverged_by_type but emitted NOTHING, so 35 of
+        // them accumulated with zero lines in an 859MB log and could not even
+        // be dated. Diagnostic ONLY: unlike terPRE_SEQ we must not inject a
+        // fresh AccountRoot, because re-reading moves the sequence further
+        // ahead and would deepen the divergence rather than repair it.
+        //
+        // tx_set_len is logged on both arms because a tx set whose length does
+        // not match the ledger is the known upstream cause: 2026-07-29 saw
+        // #105923660 verified against 91 transactions when both .39 and s2
+        // report 49, with the header transaction_hash zeroed.
+        if outcome.ter_name == "tefPAST_SEQ" {
+            if let Some(key) = extract_sender_account_root_key(tx_bytes) {
+                let ov_seq = {
+                    let ov = overlay.lock();
+                    ov.get(&key).and_then(|v| v.as_ref()).and_then(|d| scan_sequence_in_account_root(d))
+                };
+                let snap_seq = db_snapshot.and_then(|s| s.get(&key).ok().flatten()).and_then(|d| scan_sequence_in_account_root(&d));
+                let rpc_seq = {
+                    let r = RpcProvider::with_endpoints(rpc_urls.to_vec(), ledger_seq);
+                    r.read(&key).and_then(|d| scan_sequence_in_account_root(d))
+                };
+                eprintln!(
+                    "[ffi-diag] tefPAST_SEQ #{ledger_seq} tx{tx_num} {tx_type} mutations={} overlay_seq={:?} snapshot_seq={:?} rpc_seq={:?} tx_set_len={}",
+                    outcome.mutations.len(), ov_seq, snap_seq, rpc_seq, txs_in_order.len()
+                );
+            }
+        }
         // terPRE_SEQ recovery: sender's sequence in overlay is stale because
         // a prior tx from the same sender had a failure path that didn't
         // thread mutations correctly. Fetch their AccountRoot at the CURRENT
@@ -2408,8 +2437,8 @@ pub fn apply_ledger_in_order_with_net(
                     r.read(&key).and_then(|d| scan_sequence_in_account_root(d))
                 };
                 eprintln!(
-                    "[ffi-diag] terPRE_SEQ #{ledger_seq} tx{tx_num} {tx_type} mutations={} overlay_seq={:?} snapshot_seq={:?} rpc_seq={:?}",
-                    outcome.mutations.len(), ov_seq, snap_seq, rpc_seq
+                    "[ffi-diag] terPRE_SEQ #{ledger_seq} tx{tx_num} {tx_type} mutations={} overlay_seq={:?} snapshot_seq={:?} rpc_seq={:?} tx_set_len={}",
+                    outcome.mutations.len(), ov_seq, snap_seq, rpc_seq, txs_in_order.len()
                 );
                 // Try current ledger first, then ledger-1
                 let mut recovered = false;
