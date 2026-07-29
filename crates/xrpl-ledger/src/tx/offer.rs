@@ -1798,6 +1798,20 @@ impl Transactor for OfferCreateTransactor {
             return TxResult::NoAccount;
         }
 
+        // rippled CreateOffer::preclaim (OfferCreate.cpp:224-229) tests the
+        // expiry BEFORE the funding check — "it saves us a call to
+        // checkAcceptAsset and possible false negative" — and applyGuts
+        // repeats it at :653. hasExpired is `parentCloseTime() >= Expiration`
+        // (View.cpp:48-54); the base ledger's close time IS the parent close
+        // time of the ledger being replayed.
+        // #105887283 17075103474C: Expiration 838475074, parent close
+        // 838475151 — mainnet tecEXPIRED, we fell through to the reserve test.
+        if let Some(exp) = tx.fields.get("Expiration").and_then(|v| v.as_u64()) {
+            if sandbox.base().header.close_time as u64 >= exp {
+                return TxResult::Expired;
+            }
+        }
+
         // rippled CreateOffer::preclaim: an offer is unfunded when
         // accountFunds(TakerGets) <= 0 — for XRP that is balance minus
         // reserve, NOT the full sell amount (partially funded offers still
@@ -1956,7 +1970,19 @@ impl Transactor for OfferCreateTransactor {
             if let Some(a) = json_at(sandbox, &acct_key) {
                 let bal: u128 = a["Balance"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
                 let oc = a["OwnerCount"].as_u64().unwrap_or(0) as u128;
-                if bal < XRP_RESERVE_BASE + XRP_RESERVE_INC * (oc + 1) {
+                // rippled compares `preFeeBalance_` — the balance as of BEFORE
+                // this transaction's fee was taken (OfferCreate.cpp:834-841).
+                // `do_apply` runs after apply_common has already deducted it,
+                // so add it back; otherwise the account reads short by exactly
+                // one fee at the boundary.
+                // #105845719 90E12EF294C9: post-fee 2799988 vs reserve 2800000
+                // (12 drops, one fee) — mainnet places the offer, and the same
+                // account's later OfferCreate at index 46 in that ledger *does*
+                // get tecINSUF_RESERVE_OFFER, so this is a genuine off-by-fee
+                // rather than a wrong reserve.
+                if bal + (tx.fee as u128) // pre-fee balance
+                    < XRP_RESERVE_BASE + XRP_RESERVE_INC * (oc + 1)
+                {
                     return TxResult::InsufReserveOffer;
                 }
             }
@@ -3350,5 +3376,122 @@ mod tests {
         assert!(sandbox.exists(&live), "the funded maker is only part-filled");
         assert!(!sandbox.exists(&dead), "the expired offer one level down must be reaped");
         assert!(stale.contains(&dead));
+    }
+
+    /// Build a state whose `who` sells USD for XRP: an AccountRoot at the
+    /// given balance/OwnerCount plus a funded trust line, and an empty book.
+    fn state_selling_usd(who: &[u8; 20], issuer: &[u8; 20], balance: u64, owner_count: u64)
+        -> (LedgerState, [u8; 20])
+    {
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+        let mut state = make_state_with_account(who, balance);
+        let a = serde_json::json!({
+            "LedgerEntryType": "AccountRoot", "Account": hex::encode(who),
+            "Balance": balance.to_string(), "Sequence": 1, "OwnerCount": owner_count,
+        });
+        state.state_map.insert(keylet::account_root_key(who), serde_json::to_vec(&a).unwrap()).unwrap();
+
+        let iss = serde_json::json!({
+            "LedgerEntryType": "AccountRoot", "Account": hex::encode(issuer),
+            "Balance": "500000000", "Sequence": 1, "OwnerCount": 0,
+        });
+        state.state_map.insert(keylet::account_root_key(issuer), serde_json::to_vec(&iss).unwrap()).unwrap();
+
+        let (lo, hi) = if who < issuer { (*who, *issuer) } else { (*issuer, *who) };
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+            "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000",
+                        "value": if who < issuer { "100" } else { "-100" }},
+            "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000000"},
+            "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000000"},
+        });
+        state.state_map.insert(keylet::ripple_state_key(who, issuer, &cur), serde_json::to_vec(&line).unwrap()).unwrap();
+        (state, cur)
+    }
+
+    fn sell_usd_tx(who: &[u8; 20], issuer: &[u8; 20], seq: u32, expiration: Option<u64>) -> TxFields {
+        let mut fields = serde_json::json!({
+            "TakerPays": "5000000",
+            "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "10"},
+        });
+        if let Some(e) = expiration {
+            fields["Expiration"] = serde_json::json!(e);
+        }
+        TxFields {
+            account: *who, tx_type: "OfferCreate".to_string(), fee: 12, sequence: seq,
+            ticket_seq: None, last_ledger_seq: None, fields,
+        }
+    }
+
+    /// rippled tests the owner reserve against `preFeeBalance_` — the balance
+    /// as of BEFORE this transaction's fee (OfferCreate.cpp:834-841) — while
+    /// our check runs in `do_apply`, after the fee is already gone. At the
+    /// boundary that is an off-by-one-fee rejection.
+    ///
+    /// #105845719 90E12EF294C9 (rMWVf1qJsgHgEd1Tuy378Zs53noKh4BujK): post-fee
+    /// balance 2799988, OwnerCount 8, reserve(9) 2800000 — short by exactly the
+    /// 12-drop fee. Mainnet placed the offer (4 nodes). That the same account's
+    /// LATER OfferCreate in that ledger (index 46) really does earn
+    /// tecINSUF_RESERVE_OFFER is what proves the reserve itself is right and
+    /// only the pre/post-fee basis was wrong.
+    #[test]
+    fn the_owner_reserve_is_tested_against_the_pre_fee_balance() {
+        let who = [0x01u8; 20];
+        let issuer = [0x02u8; 20];
+
+        // Exactly the mainnet arithmetic: reserve(8 + 1) = 2_800_000, and the
+        // post-fee balance lands one fee below it.
+        let reserve = XRP_RESERVE_BASE + XRP_RESERVE_INC * 9;
+        assert_eq!(reserve, 2_800_000);
+        let (state, _) = state_selling_usd(&who, &issuer, reserve as u64 - 12, 8);
+
+        let mut sandbox = Sandbox::new(&state);
+        let tx = sell_usd_tx(&who, &issuer, 7, None);
+        assert_eq!(
+            OfferCreateTransactor.do_apply(&tx, &mut sandbox),
+            TxResult::Success,
+            "pre-fee the account is exactly at reserve, so the offer rests",
+        );
+        assert!(sandbox.exists(&keylet::offer_key(&who, 7)));
+
+        // One drop lower and even the pre-fee balance is short — the gate still
+        // bites, so this is a shifted boundary and not a removed one.
+        let (state, _) = state_selling_usd(&who, &issuer, reserve as u64 - 13, 8);
+        let mut sandbox = Sandbox::new(&state);
+        assert_eq!(
+            OfferCreateTransactor.do_apply(&sell_usd_tx(&who, &issuer, 7, None), &mut sandbox),
+            TxResult::InsufReserveOffer,
+        );
+    }
+
+    /// `CreateOffer::preclaim` rejects an already-expired offer before it ever
+    /// looks at funding (OfferCreate.cpp:224-229), and `hasExpired` is
+    /// `parentCloseTime() >= exp` — inclusive (View.cpp:48-54).
+    ///
+    /// #105887283 17075103474C: Expiration 838475074 against a parent close of
+    /// 838475151, so mainnet returned tecEXPIRED with no state touched; we ran
+    /// on to the reserve check and answered tecINSUF_RESERVE_OFFER.
+    #[test]
+    fn an_offer_expiring_at_or_before_the_parent_close_is_dead_on_arrival() {
+        let who = [0x01u8; 20];
+        let issuer = [0x02u8; 20];
+        // make_state_with_account closes the base ledger at 10, which is the
+        // parent close time of the ledger being replayed.
+        let (state, _) = state_selling_usd(&who, &issuer, 100_000_000, 0);
+        let sandbox = Sandbox::new(&state);
+
+        for exp in [9u64, 10] {
+            assert_eq!(
+                OfferCreateTransactor.preclaim(&sell_usd_tx(&who, &issuer, 7, Some(exp)), &sandbox),
+                TxResult::Expired,
+                "Expiration {exp} is at or before the parent close of 10",
+            );
+        }
+        assert_eq!(
+            OfferCreateTransactor.preclaim(&sell_usd_tx(&who, &issuer, 7, Some(11)), &sandbox),
+            TxResult::Success,
+            "one tick past the parent close is still live",
+        );
     }
 }

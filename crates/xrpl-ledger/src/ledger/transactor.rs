@@ -53,6 +53,10 @@ pub enum TxResult {
     InsufReserveOffer,
     /// Offer is unfunded at apply time.
     UnfundedOffer,
+    /// The transaction carries an `Expiration` that the parent close time has
+    /// already reached. rippled: `hasExpired(view, exp)` is
+    /// `parentCloseTime() >= exp` (View.cpp:48-54).
+    Expired,
     /// Path delivered something but less than required (no partial flag).
     PathPartial,
     /// Destination requires a DestinationTag and the tx has none.
@@ -121,6 +125,7 @@ impl TxResult {
             | TxResult::Killed
             | TxResult::InsufReserveOffer
             | TxResult::UnfundedOffer
+            | TxResult::Expired
             | TxResult::PathPartial
             | TxResult::DstTagNeeded
             | TxResult::ArrayTooLarge
@@ -159,6 +164,7 @@ impl TxResult {
             TxResult::Killed => "tecKILLED",
             TxResult::InsufReserveOffer => "tecINSUF_RESERVE_OFFER",
             TxResult::UnfundedOffer => "tecUNFUNDED_OFFER",
+            TxResult::Expired => "tecEXPIRED",
             TxResult::PathPartial => "tecPATH_PARTIAL",
             TxResult::DstTagNeeded => "tecDST_TAG_NEEDED",
             TxResult::ArrayTooLarge => "tecARRAY_TOO_LARGE",
