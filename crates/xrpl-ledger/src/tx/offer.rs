@@ -438,9 +438,39 @@ pub(crate) fn line_adjust(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, am
                 line["Flags"] = serde_json::Value::from(flags & !my_reserve);
                 if flags & their_reserve == 0 {
                     // Default on both sides: the line stops existing.
+                    //
+                    // Both removals need the line's LowNode/HighNode page hint,
+                    // exactly as TrustSet's trustDelete passes them. Without a
+                    // hint owner_dir_remove cannot locate the entry in a
+                    // MULTI-page directory, and the side that silently fails is
+                    // always the issuer's — a counterparty on one trust line has
+                    // a single-page directory, while an IOU issuer holding
+                    // thousands of lines does not.
+                    //
+                    // 8 Payments diverged on exactly this, each missing exactly
+                    // one Modified DirectoryNode and nothing else: six in
+                    // #105854147 all missing 6ABA617A (owner rU5wZyCbZ2, the
+                    // HIYO issuer) while the sender's own dir EE79B4E5 came out
+                    // right, plus #105843539 BB9651ABA1B6 and #105872154
+                    // D217CCCAE1E3 against their own issuers.
+                    let hint = |v: &serde_json::Value| -> Option<u64> {
+                        v.as_u64()
+                            .or_else(|| v.as_str().and_then(|s| u64::from_str_radix(s, 16).ok()))
+                    };
+                    let (party_node, issuer_node) = if party_low {
+                        (hint(&line["LowNode"]), hint(&line["HighNode"]))
+                    } else {
+                        (hint(&line["HighNode"]), hint(&line["LowNode"]))
+                    };
                     sandbox.delete(lkey);
-                    crate::ledger::directory::owner_dir_remove(sandbox, party, &lkey, None, false);
-                    crate::ledger::directory::owner_dir_remove(sandbox, &leg.issuer, &lkey, None, false);
+                    crate::ledger::directory::owner_dir_remove(sandbox, party, &lkey, party_node, false);
+                    crate::ledger::directory::owner_dir_remove(
+                        sandbox,
+                        &leg.issuer,
+                        &lkey,
+                        issuer_node,
+                        false,
+                    );
                     return;
                 }
             }
@@ -3492,6 +3522,106 @@ mod tests {
             OfferCreateTransactor.preclaim(&sell_usd_tx(&who, &issuer, 7, Some(11)), &sandbox),
             TxResult::Success,
             "one tick past the parent close is still live",
+        );
+    }
+
+    /// A trust line torn down mid-payment must leave BOTH owner directories,
+    /// and both removals need the line's LowNode/HighNode page hint — exactly
+    /// as TrustSet's trustDelete passes them.
+    ///
+    /// `dir_remove` returns immediately when the directory ROOT is not in the
+    /// sandbox (directory.rs:274). The probe hydrates the page mainnet's meta
+    /// names, not the whole chain, so for a big IOU issuer the named page is
+    /// present while the root is not — and a hintless removal silently no-ops
+    /// on precisely the issuer's side. A counterparty with one trust line has a
+    /// single-page directory and never shows the bug.
+    ///
+    /// 8 Payments diverged on this, each missing exactly one Modified
+    /// DirectoryNode and nothing else: six in #105854147 all missing 6ABA617A
+    /// (owner rU5wZyCbZ2, the HIYO issuer) while the sender's own dir came out
+    /// right, plus #105843539 BB9651ABA1B6 and #105872154 D217CCCAE1E3.
+    #[test]
+    fn a_line_deleted_mid_payment_leaves_the_issuers_page_too() {
+        let party = [0x01u8; 20];
+        let issuer = [0x02u8; 20];
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+
+        let mut state = make_state_with_account(&party, 100_000_000);
+        let iss = serde_json::json!({
+            "LedgerEntryType": "AccountRoot", "Account": hex::encode(issuer),
+            "Balance": "100000000", "Sequence": 1, "OwnerCount": 9,
+        });
+        state.state_map.insert(keylet::account_root_key(&issuer), serde_json::to_vec(&iss).unwrap()).unwrap();
+
+        // The party holds 5 USD and is about to spend all of it. Their side
+        // carries the reserve; the issuer's side does not, so the line reverts
+        // to default on both sides and is deleted.
+        let party_low = party < issuer;
+        let line_key = keylet::ripple_state_key(&party, &issuer, &cur);
+        let (lo, hi) = if party_low { (party, issuer) } else { (issuer, party) };
+        let (reserve, no_ripple) = if party_low {
+            (0x0001_0000u64, 0x0010_0000u64)
+        } else {
+            (0x0002_0000u64, 0x0020_0000u64)
+        };
+        // The line lives on PAGE 7 of the issuer's directory, page 0 of the
+        // party's — the asymmetry the bug turns on.
+        let (low_node, high_node) = if party_low { (0u64, 7u64) } else { (7u64, 0u64) };
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Flags": reserve | no_ripple,
+            "Balance": {"currency": hex::encode_upper(cur),
+                        "issuer": "0000000000000000000000000000000000000000",
+                        "value": if party_low { "5" } else { "-5" }},
+            "LowLimit":  {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo),
+                          "value": if party_low { "0" } else { "0" }},
+            "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi),
+                          "value": "0"},
+            "LowNode": low_node,
+            "HighNode": high_node,
+        });
+        state.state_map.insert(line_key, serde_json::to_vec(&line).unwrap()).unwrap();
+
+        // The issuer's directory: page 7 is hydrated and holds the line; the
+        // ROOT is deliberately absent, mirroring what the probe actually loads.
+        let iss_root = keylet::owner_dir_key(&issuer);
+        let iss_page7 = keylet::dir_page_key(&iss_root, 7);
+        let page7 = serde_json::json!({
+            "LedgerEntryType": "DirectoryNode",
+            "Owner": hex::encode(issuer),
+            "RootIndex": hex::encode_upper(iss_root.0),
+            // A second, unrelated line keeps the page non-empty, so removal
+            // leaves it Modified rather than Deleted — what mainnet shows for
+            // an issuer holding thousands of lines.
+            "Indexes": [hex::encode_upper(line_key.0), hex::encode_upper([0xEEu8; 32])],
+        });
+        state.state_map.insert(iss_page7, serde_json::to_vec(&page7).unwrap()).unwrap();
+        assert!(
+            state.state_map.lookup(&iss_root).is_none(),
+            "the issuer's dir ROOT is intentionally unhydrated — that is the bug's precondition",
+        );
+
+        // The party's own single-page directory, root present.
+        let mut sandbox = Sandbox::new(&state);
+        crate::ledger::directory::owner_dir_insert(&mut sandbox, &party, &line_key);
+
+        // Spend the whole 5 USD away: the line reverts to default and is deleted.
+        let leg = Leg { xrp: false, cur, issuer };
+        line_adjust(&mut sandbox, &party, &leg, (5_000_000_000_000_000, -15), false);
+
+        assert!(!sandbox.exists(&line_key), "the emptied line is deleted");
+        let page: serde_json::Value =
+            serde_json::from_slice(&sandbox.read(&iss_page7).expect("issuer page 7 still exists")).unwrap();
+        let idx = page["Indexes"].as_array().expect("page keeps its Indexes");
+        assert_eq!(
+            idx.len(), 1,
+            "the hint must reach the issuer's page 7 — hintless, dir_remove bails on the absent root",
+        );
+        assert_eq!(
+            idx[0].as_str().unwrap(),
+            hex::encode_upper([0xEEu8; 32]),
+            "the deleted line is gone; the unrelated one stays",
         );
     }
 }
