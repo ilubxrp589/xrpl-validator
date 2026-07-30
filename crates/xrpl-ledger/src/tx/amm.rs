@@ -405,6 +405,43 @@ impl Transactor for AMMDepositTransactor {
     }
 }
 
+/// Pay out BOTH pool assets in proportion to `tokens / total_lp`.
+///
+/// rippled's `equalWithdrawTokens` (AMMWithdraw.cpp:790-850):
+///     frac            = tokensAdj / lptAMMBalance
+///     amountWithdraw  = getRoundedAsset(amountBalance,  frac, IsDeposit::No)
+///     amount2Withdraw = getRoundedAsset(amount2Balance, frac, IsDeposit::No)
+/// IsDeposit::No rounds DOWN, which is what `me_muldiv(.., false)` does.
+///
+/// Shared by the tfWithdrawAll path (tokens = the LP's whole balance) and the
+/// tfLPToken path (tokens = the requested LPTokenIn).
+fn payout_proportional(
+    sandbox: &mut Sandbox,
+    tx: &TxFields,
+    amm_acct: &[u8; 20],
+    tokens: (u128, i32),
+    total_lp: (u128, i32),
+) {
+    use crate::tx::offer as ox;
+    let asset_leg = |v: &serde_json::Value| -> Option<ox::Leg> {
+        if v.get("currency").and_then(|c| c.as_str()) == Some("XRP") {
+            return Some(ox::Leg { xrp: true, cur: [0u8; 20], issuer: [0u8; 20] });
+        }
+        let mut amt = v.clone();
+        amt["value"] = serde_json::json!("0");
+        ox::leg_of(&amt)
+    };
+    for f in ["Asset", "Asset2"] {
+        let Some(v) = tx.fields.get(f) else { continue };
+        let Some(leg) = asset_leg(v) else { continue };
+        let pool = crate::tx::amm_swap::holds(sandbox, amm_acct, &leg);
+        let share = ox::me_muldiv(pool, tokens, total_lp, false);
+        if share.0 > 0 {
+            ox::move_leg(sandbox, amm_acct, &tx.account, &leg, share);
+        }
+    }
+}
+
 // ─── AMMWithdraw ───
 
 pub struct AMMWithdrawTransactor;
@@ -469,23 +506,7 @@ impl Transactor for AMMWithdrawTransactor {
                 .and_then(|s| keylet::amount_mant_exp(&serde_json::Value::String(s)))
                 .unwrap_or(lp_bal);
             // Both assets out, proportional to the redeemed LPToken share.
-            let asset_leg = |v: &serde_json::Value| -> Option<ox::Leg> {
-                if v.get("currency").and_then(|c| c.as_str()) == Some("XRP") {
-                    return Some(ox::Leg { xrp: true, cur: [0u8; 20], issuer: [0u8; 20] });
-                }
-                let mut amt = v.clone();
-                amt["value"] = serde_json::json!("0");
-                ox::leg_of(&amt)
-            };
-            for f in ["Asset", "Asset2"] {
-                let Some(v) = tx.fields.get(f) else { continue };
-                let Some(leg) = asset_leg(v) else { continue };
-                let pool = crate::tx::amm_swap::holds(sandbox, &amm_acct, &leg);
-                let share = ox::me_muldiv(pool, lp_bal, total_lp, false);
-                if share.0 > 0 {
-                    ox::move_leg(sandbox, &amm_acct, &tx.account, &leg, share);
-                }
-            }
+            payout_proportional(sandbox, tx, &amm_acct, lp_bal, total_lp);
             // Tear down the LPToken trust line on both sides (the AMM side is the
             // issuer, so move_leg would not touch it — do it explicitly).
             let w_low = tx.account < amm_acct;
@@ -501,6 +522,36 @@ impl Transactor for AMMWithdrawTransactor {
             bump_lp_balance(sandbox, &amm_key, lp_bal, false);
             return TxResult::Success;
         }
+        // tfLPToken (0x00010000): the LP names only how many LPTokens to redeem
+        // and receives BOTH pool assets in proportion — there is no Amount /
+        // Amount2 on the transaction at all. rippled's equalWithdrawTokens
+        // (AMMWithdraw.cpp:790-850) pays out amountBalance*frac and
+        // amount2Balance*frac where frac = LPTokenIn / lptAMMBalance.
+        //
+        // We only ever moved Amount/Amount2, found neither, and so paid out
+        // nothing while still burning the tokens. #105880685 F2CCA2BD6FA4,
+        // #105840045 41110275D9B7 (same XRP/FARM pool) and #105877543
+        // 331E54E698CA: all our_muts=5 vs net_muts=8, the three missing nodes
+        // being the two RippleStates and the AccountRoot the payout touches.
+        //
+        // Not modelled: rippled returns tecAMM_FAILED when either side rounds
+        // to zero, and treats LPTokenIn == lptAMMBalance as a full withdrawal.
+        // Neither is exercised by a known case; left with the other deferred
+        // AMM rounding question rather than guessed at.
+        let lp_token_in = tx.fields.get("LPTokenIn").and_then(keylet::amount_mant_exp);
+        let has_explicit_amount =
+            tx.fields.get("Amount").is_some() || tx.fields.get("Amount2").is_some();
+        if let Some(tokens) = lp_token_in.filter(|t| t.0 > 0) {
+            if !has_explicit_amount {
+                if let Some(total_lp) = ox::json_at(sandbox, &amm_key)
+                    .and_then(|o| o["LPTokenBalance"]["value"].as_str().map(str::to_string))
+                    .and_then(|s| keylet::amount_mant_exp(&serde_json::Value::String(s)))
+                {
+                    payout_proportional(sandbox, tx, &amm_acct, tokens, total_lp);
+                }
+            }
+        }
+
         // Move the withdrawn side(s) AMM account → withdrawer.
         for f in ["Amount", "Amount2"] {
             if let Some(v) = tx.fields.get(f) {
@@ -1081,6 +1132,92 @@ mod tests {
 
         assert_eq!(AMMWithdrawTransactor.do_apply(&wd_all, &mut sandbox), TxResult::Success);
         assert!(!sandbox.exists(&lp_line), "tfWithdrawAll deletes the LPToken trust line");
+    }
+
+    /// XRP drops on an account root, 0 when absent.
+    fn xrp_drops(sb: &Sandbox, who: &[u8; 20]) -> u128 {
+        sb.read(&keylet::account_root_key(who))
+            .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+            .and_then(|a| a["Balance"].as_str().and_then(|v| v.parse::<u128>().ok()))
+            .unwrap_or(0)
+    }
+
+    /// tfLPToken: the LP names only how many LPTokens to redeem and receives
+    /// BOTH pool assets in proportion — the transaction carries no Amount or
+    /// Amount2 at all. rippled's `equalWithdrawTokens` (AMMWithdraw.cpp:790-850)
+    /// pays out amountBalance*frac and amount2Balance*frac where
+    /// frac = LPTokenIn / lptAMMBalance.
+    ///
+    /// We only ever moved Amount/Amount2, found neither, and paid out nothing
+    /// while still burning the tokens. #105880685 F2CCA2BD6FA4, #105840045
+    /// 41110275D9B7 (same XRP/FARM pool) and #105877543 331E54E698CA — all
+    /// our_muts=5 vs net_muts=8, the three missing nodes being exactly the two
+    /// RippleStates and the AccountRoot a payout touches.
+    #[test]
+    fn amm_withdraw_by_lp_tokens_pays_out_both_assets() {
+        let alice = [0x01u8; 20];
+        let usd_issuer = [0x02u8; 20];
+        let state = make_state(&alice, 200_000_000);
+        let mut sandbox = Sandbox::new(&state);
+
+        let create_tx = TxFields {
+            account: alice, tx_type: "AMMCreate".to_string(), fee: 12, sequence: 1,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Amount": "40000000",
+                "Amount2": {"currency": "USD", "issuer": hex::encode(usd_issuer), "value": "100"},
+                "TradingFee": 500,
+            }),
+        };
+        assert_eq!(AMMCreateTransactor.do_apply(&create_tx, &mut sandbox), TxResult::Success);
+
+        let wd = TxFields {
+            account: alice, tx_type: "AMMWithdraw".to_string(), fee: 12, sequence: 2,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Asset": {"currency": "XRP"},
+                "Asset2": {"currency": "USD", "issuer": hex::encode(usd_issuer)},
+                "Flags": 0x0001_0000u64, // tfLPToken — note: no Amount/Amount2
+            }),
+        };
+        let amm_key = amm_key_from_asset_fields(&wd).unwrap();
+        let amm_obj: serde_json::Value = serde_json::from_slice(&sandbox.read(&amm_key).unwrap()).unwrap();
+        let amm_acct = <[u8; 20]>::try_from(
+            hex::decode(amm_obj["Account"].as_str().unwrap()).unwrap().as_slice(),
+        ).unwrap();
+        let total_lp = amm_obj["LPTokenBalance"]["value"].as_str().unwrap().to_string();
+
+        // Redeem a quarter of the outstanding LPTokens.
+        let quarter = total_lp.parse::<f64>().unwrap() / 4.0;
+        let mut wd = wd;
+        wd.fields["LPTokenIn"] = serde_json::json!({
+            "currency": hex::encode_upper(keylet::amm_lpt_currency(
+                &asset_currency20(&wd.fields["Asset"]),
+                &asset_currency20(&wd.fields["Asset2"]),
+            )),
+            "issuer": hex::encode(amm_acct),
+            "value": format!("{quarter}"),
+        });
+
+        let xrp_before = xrp_drops(&sandbox, &alice);
+        let pool_xrp_before = xrp_drops(&sandbox, &amm_acct);
+        assert_eq!(AMMWithdrawTransactor.do_apply(&wd, &mut sandbox), TxResult::Success);
+        let xrp_after = xrp_drops(&sandbox, &alice);
+        let pool_xrp_after = xrp_drops(&sandbox, &amm_acct);
+
+        assert!(
+            xrp_after > xrp_before,
+            "redeeming LPTokens must pay XRP out to the LP (before={xrp_before} after={xrp_after})",
+        );
+        assert!(
+            pool_xrp_after < pool_xrp_before,
+            "and the pool's XRP must fall by the same withdrawal",
+        );
+        assert_eq!(
+            xrp_after - xrp_before,
+            pool_xrp_before - pool_xrp_after,
+            "XRP is conserved between pool and LP",
+        );
     }
 
     #[test]
