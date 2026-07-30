@@ -1301,9 +1301,31 @@ fn cross_bridged(
         // such ledger is known; if one turns up, that is the case to build the
         // real accumulate-and-average pass around, not a reason to widen this.
         if !use_direct {
-            if let (Some(a), Some(b), Some(t)) = (qa_book, qb_book, thr) {
-                if me_cmp(norm16((a.0 * b.0, a.1 + b.1)), t).is_gt() {
-                    break;
+            if let Some(t) = thr {
+                match (qa_book, qb_book) {
+                    (Some(a), Some(b)) => {
+                        if me_cmp(norm16((a.0 * b.0, a.1 + b.1)), t).is_gt() {
+                            break;
+                        }
+                    }
+                    // A leg with NO book at all cannot compose a passing
+                    // quality, so the pass is unusable — not merely ungated.
+                    // Written as `if let (Some(a), Some(b), Some(t))` the whole
+                    // check was SKIPPED when a leg's book was empty, and the
+                    // bridge then crossed on that leg's pool alone. But the
+                    // reasoning above applies with more force, not less: off
+                    // the default path the step keeps going into that leg's
+                    // CLOB and StrandFlow judges the pass as a whole — with no
+                    // CLOB behind the pool there is nothing for it to clear.
+                    //
+                    // All 8 cases are Flags=65536 exactly (tfPassive), buy
+                    // side, IOU<->IOU with no XRP leg, so every one is bridged.
+                    // #105813899 44E799C6FF9B: lb=0, bq=1889698131091803e-12
+                    // just inside thr=1890192915687964e-12, so one AMM slice
+                    // crossed (b_amm=true) and the next iteration broke — 7
+                    // extra mutations, nothing missing, where mainnet moved no
+                    // value at all and merely rested the offer.
+                    _ => break,
                 }
             }
         }
@@ -2993,6 +3015,111 @@ mod tests {
             json_at(&sandbox, &keylet::offer_key(&mk_b, 2)).unwrap()["TakerGets"]["value"].as_str(),
             Some("100"),
             "leg B's book maker must be untouched",
+        );
+        let rested = json_at(&sandbox, &keylet::offer_key(&taker, 9)).expect("offer rests");
+        assert_eq!(rested["TakerGets"]["value"].as_str(), Some("10"), "and rests in full");
+    }
+
+    /// A bridge leg with a POOL but NO BOOK cannot carry the pass at all.
+    ///
+    /// The composition gate was written `if let (Some(a), Some(b), Some(t)) =
+    /// (qa_book, qb_book, thr)`, so an empty leg book made `qb_book` None, the
+    /// pattern failed, and the gate was SKIPPED — the bridge then crossed on
+    /// that leg's pool alone. The reasoning above applies with more force, not
+    /// less: off the default path the step keeps going into that leg's CLOB and
+    /// StrandFlow judges the pass as a whole, so with no CLOB behind the pool
+    /// there is nothing for it to clear.
+    ///
+    /// All 8 cases in the fresh batch were Flags=65536 exactly (tfPassive),
+    /// buy side, IOU<->IOU with no XRP leg — every one bridged. #105813899
+    /// 44E799C6FF9B: lb=0, bq=1889698131091803e-12 just inside
+    /// thr=1890192915687964e-12, so one AMM slice crossed and the next
+    /// iteration broke — 7 extra mutations, nothing missing, where mainnet
+    /// moved no value and simply rested the offer.
+    #[test]
+    fn a_bridge_leg_with_a_pool_but_no_book_carries_nothing() {
+        let taker = [0x01u8; 20];
+        let mk_a = [0x04u8; 20];
+        let pool_b = [0x07u8; 20];
+        let iss_a = [0x02u8; 20];
+        let iss_b = [0x03u8; 20];
+        let (mut ca, mut cb) = ([0u8; 20], [0u8; 20]);
+        ca[12..15].copy_from_slice(b"AAA");
+        cb[12..15].copy_from_slice(b"BBB");
+
+        let mut state = make_state_with_account(&taker, 500_000_000);
+        for (id, bal) in [(&mk_a, "500000000"), (&iss_a, "500000000"),
+                          (&iss_b, "500000000"), (&pool_b, "100000000")] {
+            let a = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": hex::encode(id),
+                "Balance": bal, "Sequence": 1, "OwnerCount": 0,
+            });
+            state.state_map.insert(keylet::account_root_key(id), serde_json::to_vec(&a).unwrap()).unwrap();
+        }
+        let mut line = |who: &[u8; 20], iss: &[u8; 20], cur: &[u8; 20], bal: &str| {
+            let (lo, hi) = if who < iss { (*who, *iss) } else { (*iss, *who) };
+            let v = serde_json::json!({
+                "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+                "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000",
+                            "value": if who < iss { bal.to_string() } else { format!("-{bal}") }},
+                "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000000"},
+                "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000000"},
+            });
+            state.state_map.insert(keylet::ripple_state_key(who, iss, cur), serde_json::to_vec(&v).unwrap()).unwrap();
+        };
+        line(&taker, &iss_a, &ca, "1000");     // the taker's AAA to sell
+        line(&mk_a, &iss_a, &ca, "0");         // leg A maker can receive AAA
+        line(&pool_b, &iss_b, &cb, "10000");   // leg B pool: 100 XRP / 10000 BBB
+
+        // Leg B pool at 0.01 XRP per BBB. There is deliberately NO leg B book.
+        let amm = serde_json::json!({
+            "LedgerEntryType": "AMM", "Account": hex::encode(pool_b), "TradingFee": 0,
+        });
+        let xrp_leg = leg_of(&serde_json::json!("1")).unwrap();
+        let b_leg = leg_of(&serde_json::json!({"currency":"BBB","issuer":hex::encode(iss_b),"value":"1"})).unwrap();
+        let bkey = keylet::amm_key(&xrp_leg.cur, &xrp_leg.issuer, &b_leg.cur, &b_leg.issuer);
+        state.state_map.insert(bkey, serde_json::to_vec(&amm).unwrap()).unwrap();
+
+        // Leg A book only: 1 XRP for 1 AAA.
+        {
+            let mut sandbox = Sandbox::new(&state);
+            let tx = TxFields {
+                account: mk_a, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
+                ticket_seq: None, last_ledger_seq: None,
+                fields: serde_json::json!({
+                    "TakerPays": {"currency":"AAA","issuer":hex::encode(iss_a),"value":"1"},
+                    "TakerGets": "1000000",
+                }),
+            };
+            assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+            let mods = sandbox.into_modifications();
+            apply_modifications(&mut state, mods).unwrap();
+        }
+
+        let pool_xrp_before = read_balance(&Sandbox::new(&state), &pool_b);
+
+        // Sell 10 AAA for 100 BBB — limit 0.1 AAA/BBB. Composed through leg A's
+        // book (1 AAA/XRP) and leg B's POOL (0.01 XRP/BBB) that is 0.01, well
+        // inside the limit — so without the gate the pass crosses.
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: taker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 9,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerGets": {"currency": "AAA", "issuer": hex::encode(iss_a), "value": "10"},
+                "TakerPays": {"currency": "BBB", "issuer": hex::encode(iss_b), "value": "100"},
+            }),
+        };
+        assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+
+        assert_eq!(
+            read_balance(&sandbox, &pool_b), pool_xrp_before,
+            "the pool behind an empty leg book must not be touched",
+        );
+        assert_eq!(
+            json_at(&sandbox, &keylet::offer_key(&mk_a, 2)).unwrap()["TakerGets"].as_str(),
+            Some("1000000"),
+            "leg A's book maker must be untouched",
         );
         let rested = json_at(&sandbox, &keylet::offer_key(&taker, 9)).expect("offer rests");
         assert_eq!(rested["TakerGets"]["value"].as_str(), Some("10"), "and rests in full");
