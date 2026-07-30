@@ -27,6 +27,18 @@ fn disallows_incoming_nft_offer(sandbox: &Sandbox, id: &[u8; 20]) -> Option<bool
 }
 
 /// Helper: read an account, increment OwnerCount, write back.
+/// tfSellNFToken — the only flag a mint-created offer may carry.
+const TF_SELL_NFTOKEN: u64 = 0x0000_0001;
+
+/// Current OwnerCount on an account root, 0 when absent.
+fn owner_count_of(sandbox: &Sandbox, account: &[u8; 20]) -> u64 {
+    sandbox
+        .read(&keylet::account_root_key(account))
+        .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+        .and_then(|a| a["OwnerCount"].as_u64())
+        .unwrap_or(0)
+}
+
 fn increment_owner_count(account: &[u8; 20], sandbox: &mut Sandbox) {
     let acct_key = keylet::account_root_key(account);
     if let Some(data) = sandbox.read(&acct_key) {
@@ -96,6 +108,67 @@ fn adjust_xrp(sandbox: &mut Sandbox, account: &[u8; 20], delta: i128) {
             sandbox.write(key, serde_json::to_vec(&a).unwrap_or_default());
         }
     }
+}
+
+/// Create an NFTokenOffer and thread it into both directories.
+///
+/// rippled factors this out as `nft::tokenOfferCreateApply` and calls it from
+/// BOTH NFTokenCreateOffer and NFTokenMint (NFTokenMint.cpp:312-330). A mint
+/// that carries `Amount` mints the token AND rests a sell offer in one
+/// transaction — the featureNFTokenMintOffer path — and rippled is explicit
+/// that the offer is always a SELL: "we pass tfSellNFToken as the transaction
+/// flags because a Mint is only allowed to create a sell offer."
+///
+/// `flags` is the value stored on the offer object; callers pass the
+/// transaction's flags for CreateOffer and tfSellNFToken for Mint.
+#[allow(clippy::too_many_arguments)]
+fn token_offer_create_apply(
+    sandbox: &mut Sandbox,
+    account: &[u8; 20],
+    seq: u32,
+    nftoken_id: &serde_json::Value,
+    amount: &serde_json::Value,
+    destination: Option<&serde_json::Value>,
+    expiration: Option<&serde_json::Value>,
+    flags: u64,
+) -> Hash256 {
+    let offer_key = keylet::nft_offer_key(account, seq);
+    let is_sell = flags & 0x0000_0001 != 0;
+
+    let mut offer_obj = serde_json::json!({
+        "LedgerEntryType": "NFTokenOffer",
+        "Owner": hex::encode(account),
+        "NFTokenID": nftoken_id.clone(),
+        "Amount": amount.clone(),
+        "Flags": flags & 0xFFFF,
+        "OwnerNode": 0,
+    });
+    if let Some(dest) = destination {
+        offer_obj["Destination"] = dest.clone();
+    }
+    if let Some(exp) = expiration {
+        offer_obj["Expiration"] = exp.clone();
+    }
+
+    sandbox.write(offer_key, serde_json::to_vec(&offer_obj).unwrap());
+    increment_owner_count(account, sandbox);
+
+    owner_dir_insert(sandbox, account, &offer_key);
+    if let Some(nft_id) = hash256_from(nftoken_id) {
+        let dir_root = if is_sell {
+            keylet::nft_sell_offers_key(&nft_id)
+        } else {
+            keylet::nft_buy_offers_key(&nft_id)
+        };
+        dir_insert(sandbox, &dir_root, None, &offer_key);
+    }
+    // Mainnet meta also touches the Destination's AccountRoot (no-op
+    // Modified) when the offer names one. OwnerCount bump = the
+    // key-granularity touch convention (value fidelity deferred).
+    if let Some(dest) = destination.and_then(decode_account_id) {
+        increment_owner_count(&dest, sandbox);
+    }
+    offer_key
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +264,56 @@ impl Transactor for NFTokenMintTransactor {
             iacct["FirstNFTokenSequence"] = serde_json::json!(first);
         }
         sandbox.write(issuer_key, serde_json::to_vec(&iacct).unwrap_or_default());
+
+        // featureNFTokenMintOffer: a mint carrying `Amount` also rests a sell
+        // offer for the token it just created (NFTokenMint.cpp:312-330), via
+        // the same code NFTokenCreateOffer uses. Always a SELL — rippled passes
+        // tfSellNFToken because "a Mint is only allowed to create a sell offer"
+        // — so the transaction's own flags (which carry mint flags like
+        // tfTransferable) must NOT be forwarded onto the offer.
+        //
+        // We minted the token but never created the offer, losing exactly three
+        // mutations every time: the NFTokenOffer, its new sell-offer directory
+        // page, and the owner directory it threads into. 11 cases in the fresh
+        // batch, all identically our_muts=5 vs net_muts=8 with nothing extra —
+        // e.g. #105815415 D44804DCF372, which carries Amount 0, a Destination
+        // and an Expiration.
+        let owner_count_before = owner_count_of(sandbox, &tx.account);
+        if let Some(amount) = tx.fields.get("Amount") {
+            let seq = if tx.uses_ticket() {
+                tx.ticket_seq.unwrap_or(0)
+            } else {
+                tx.sequence
+            };
+            token_offer_create_apply(
+                sandbox,
+                &tx.account,
+                seq,
+                &serde_json::json!(hex::encode_upper(id)),
+                amount,
+                tx.fields.get("Destination"),
+                tx.fields.get("Expiration"),
+                TF_SELL_NFTOKEN,
+            );
+        }
+
+        // rippled re-checks the reserve only when the owner count actually
+        // moved, "so NFTs can be added to the page without requiring the
+        // reserve each time", and compares accountReserve(ownerCountAfter) —
+        // NOT +1 — against preFeeBalance_. do_apply runs post-fee, so the fee
+        // is added back for the same reason as OfferCreate's reserve gate.
+        let owner_count_after = owner_count_of(sandbox, &tx.account);
+        if owner_count_after > owner_count_before {
+            let acct_key = keylet::account_root_key(&tx.account);
+            if let Some(d) = sandbox.read(&acct_key) {
+                if let Ok(a) = serde_json::from_slice::<serde_json::Value>(&d) {
+                    let bal: u64 = a["Balance"].as_str().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    if bal + tx.fee < crate::ledger::fees::account_reserve(sandbox, owner_count_after) {
+                        return TxResult::InsufficientReserve;
+                    }
+                }
+            }
+        }
 
         TxResult::Success
     }
@@ -336,43 +459,16 @@ impl Transactor for NFTokenCreateOfferTransactor {
         } else {
             tx.sequence
         };
-        let offer_key = keylet::nft_offer_key(&tx.account, seq);
-        let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
-        let is_sell = flags & 0x0000_0001 != 0;
-
-        let mut offer_obj = serde_json::json!({
-            "LedgerEntryType": "NFTokenOffer",
-            "Owner": hex::encode(tx.account),
-            "NFTokenID": tx.fields["NFTokenID"].clone(),
-            "Amount": tx.fields["Amount"].clone(),
-            "Flags": flags & 0xFFFF,
-            "OwnerNode": 0,
-        });
-        if let Some(dest) = tx.fields.get("Destination") {
-            offer_obj["Destination"] = dest.clone();
-        }
-        if let Some(exp) = tx.fields.get("Expiration") {
-            offer_obj["Expiration"] = exp.clone();
-        }
-
-        sandbox.write(offer_key, serde_json::to_vec(&offer_obj).unwrap());
-        increment_owner_count(&tx.account, sandbox);
-
-        owner_dir_insert(sandbox, &tx.account, &offer_key);
-        if let Some(nft_id) = tx.fields.get("NFTokenID").and_then(hash256_from) {
-            let dir_root = if is_sell {
-                keylet::nft_sell_offers_key(&nft_id)
-            } else {
-                keylet::nft_buy_offers_key(&nft_id)
-            };
-            dir_insert(sandbox, &dir_root, None, &offer_key);
-        }
-        // Mainnet meta also touches the Destination's AccountRoot (no-op
-        // Modified) when the offer names one. OwnerCount bump = the
-        // key-granularity touch convention (value fidelity deferred).
-        if let Some(dest) = tx.fields.get("Destination").and_then(decode_account_id) {
-            increment_owner_count(&dest, sandbox);
-        }
+        token_offer_create_apply(
+            sandbox,
+            &tx.account,
+            seq,
+            &tx.fields["NFTokenID"],
+            &tx.fields["Amount"],
+            tx.fields.get("Destination"),
+            tx.fields.get("Expiration"),
+            tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0),
+        );
 
         TxResult::Success
     }
@@ -960,5 +1056,73 @@ mod tests {
         let page: serde_json::Value =
             serde_json::from_slice(&sb.read(&nftpage::max_page_key(&owner)).unwrap()).unwrap();
         assert_eq!(page["NFTokens"][0]["NFToken"]["URI"], "697066733A2F2F78");
+    }
+
+    /// A mint carrying `Amount` mints the token AND rests a sell offer, via the
+    /// same code NFTokenCreateOffer uses (NFTokenMint.cpp:312-330 —
+    /// featureNFTokenMintOffer). The offer is ALWAYS a sell: rippled passes
+    /// tfSellNFToken because "a Mint is only allowed to create a sell offer",
+    /// so the transaction's own flags must not leak onto it.
+    ///
+    /// We minted but never created the offer, losing exactly three mutations —
+    /// the NFTokenOffer, its sell-offer directory page, and the owner
+    /// directory. 11 cases in the fresh batch, every one our_muts=5 vs
+    /// net_muts=8 with nothing extra; #105815415 D44804DCF372 is the specimen,
+    /// carrying Amount 0, a Destination and an Expiration.
+    #[test]
+    fn a_mint_carrying_an_amount_also_rests_a_sell_offer() {
+        let minter = [0x01u8; 20];
+        let dest = [0x03u8; 20];
+        let mut state = make_state(&[(minter, 100_000_000), (dest, 100_000_000)]);
+        let mut sb = Sandbox::new(&mut state);
+
+        let mut tx = mint_tx(minter, 1);
+        tx.fields["Amount"] = serde_json::json!("0");
+        tx.fields["Destination"] = serde_json::json!(hex::encode(dest));
+        tx.fields["Expiration"] = serde_json::json!(839_410_071u64);
+
+        assert_eq!(NFTokenMintTransactor.do_apply(&tx, &mut sb), TxResult::Success);
+
+        let offer_key = keylet::nft_offer_key(&minter, 7);
+        let raw = sb.read(&offer_key).expect("the mint must rest an offer");
+        let offer: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+
+        assert_eq!(offer["LedgerEntryType"], "NFTokenOffer");
+        assert_eq!(offer["Owner"], hex::encode(minter));
+        assert_eq!(offer["Amount"], "0");
+        assert_eq!(offer["Destination"], hex::encode(dest));
+        assert_eq!(offer["Expiration"], 839_410_071u64);
+        assert_eq!(
+            offer["Flags"], TF_SELL_NFTOKEN,
+            "always a sell offer — the mint's own flags (here tfTransferable=8) must not leak",
+        );
+
+        // The token it names must be the one just minted, and the offer must be
+        // threaded into the SELL directory for that token, not the buy side.
+        let minted = page_tokens(&sb, &minter);
+        assert_eq!(minted.len(), 1);
+        assert_eq!(offer["NFTokenID"], minted[0]);
+        let nft_id = hash256_from(&offer["NFTokenID"]).unwrap();
+        assert!(
+            sb.exists(&keylet::nft_sell_offers_key(&nft_id)),
+            "sell-offer directory page is one of the three missing mutations",
+        );
+        assert!(!sb.exists(&keylet::nft_buy_offers_key(&nft_id)));
+    }
+
+    /// The control: a plain mint with no `Amount` rests nothing. Without this
+    /// the test above would pass on an implementation that created an offer
+    /// unconditionally, which would break every ordinary mint.
+    #[test]
+    fn a_mint_without_an_amount_rests_no_offer() {
+        let minter = [0x01u8; 20];
+        let mut state = make_state(&[(minter, 100_000_000)]);
+        let mut sb = Sandbox::new(&mut state);
+
+        assert_eq!(
+            NFTokenMintTransactor.do_apply(&mint_tx(minter, 1), &mut sb),
+            TxResult::Success,
+        );
+        assert!(!sb.exists(&keylet::nft_offer_key(&minter, 7)));
     }
 }

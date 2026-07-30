@@ -345,6 +345,20 @@ fn native_read_keys(txj: &Value) -> Vec<String> {
             ));
         }
     }
+    // Both rest an NFTokenOffer in the sender's owner directory — a mint only
+    // when it carries `Amount` (featureNFTokenMintOffer), CreateOffer always.
+    // The dir ROOT has to be here for load_owner_dir_tail to read its
+    // IndexPrevious and pull the tail page; without the root the tail lookup
+    // silently no-ops and native invents a fresh root. #105815415 D44804DCF372:
+    // mainnet Modifies rKqqb5QZ's tail 215726948B, we Created root 8329A644.
+    if matches!(
+        txj["TransactionType"].as_str(),
+        Some("NFTokenCreateOffer") | Some("NFTokenMint")
+    ) {
+        if let Some(acct) = txj["Account"].as_str().and_then(decode_address) {
+            keys.push(hex::encode_upper(keylet::owner_dir_key(&acct).0));
+        }
+    }
     if txj["TransactionType"].as_str() == Some("TrustSet") {
         if let (Some(acct), Some(limit)) = (
             txj["Account"].as_str().and_then(decode_address),
@@ -594,6 +608,19 @@ fn load_owner_dir_tail(state: &mut LedgerState, url: &str, txj: &Value, ledger_i
             .and_then(decode_issuer)
         {
             owners.push(iss);
+        }
+    }
+    // A mint carrying `Amount` rests a sell offer (featureNFTokenMintOffer),
+    // and NFTokenCreateOffer always rests one — both append to the owner's
+    // directory. #105815415 D44804DCF372: rKqqb5QZ is a prolific minter whose
+    // owner dir is multi-page (root 8329A644, IndexNext aee9 / IndexPrevious
+    // d2eb); mainnet Modifies the tail 215726948B, we Created the root.
+    if matches!(
+        txj["TransactionType"].as_str(),
+        Some("NFTokenCreateOffer") | Some("NFTokenMint")
+    ) {
+        if let Some(a) = txj["Account"].as_str().and_then(decode_address) {
+            owners.push(a);
         }
     }
     if txj["TransactionType"].as_str() == Some("CheckCash") {
