@@ -163,13 +163,31 @@ impl Transactor for CredentialDeleteTransactor {
         if tx.fee == 0 {
             return TxResult::BadFee;
         }
-        // Subject, Issuer, and CredentialType are required to locate the credential
-        if tx.fields.get("Subject").is_none()
-            || tx.fields.get("Issuer").is_none()
-            || tx.fields.get("CredentialType").is_none()
-        {
+        // rippled needs at least ONE of Subject/Issuer, not both
+        // (CredentialDelete.cpp preflight): whichever is absent defaults to the
+        // sending Account in preclaim. Requiring both rejected every real
+        // self-issued delete as malformed.
+        //
+        // #105909624 87483CD4BCF1, #105911834 E246CD9AE20F and #105912291
+        // DD6078118B99 all carry Subject + CredentialType and NO Issuer — the
+        // sender IS the issuer. Mainnet answers tecNO_ENTRY (the credential is
+        // simply gone); we answered temMALFORMED and never reached preclaim.
+        if tx.fields.get("Subject").is_none() && tx.fields.get("Issuer").is_none() {
             return TxResult::Malformed;
         }
+        // CredentialType must be present, non-empty and <= 64 bytes
+        // (kMaxCredentialTypeLength, Protocol.h:221).
+        match tx.fields.get("CredentialType").and_then(|v| v.as_str()) {
+            None => return TxResult::Malformed,
+            Some(ct) => {
+                let n = cred_type_bytes(ct).len();
+                if n == 0 || n > 64 {
+                    return TxResult::Malformed;
+                }
+            }
+        }
+        // Not modelled: rippled's temINVALID_ACCOUNT_ID for a zeroed Subject or
+        // Issuer — we have no such TxResult and no case exercises it.
         TxResult::Success
     }
 
@@ -178,18 +196,41 @@ impl Transactor for CredentialDeleteTransactor {
         if !sandbox.exists(&acct_key) {
             return TxResult::NoAccount;
         }
+        // rippled CredentialDelete::preclaim resolves the pair with
+        // `value_or(account)` and answers tecNO_ENTRY when the credential is
+        // absent — BEFORE any permission test.
+        let subject = tx
+            .fields
+            .get("Subject")
+            .and_then(decode_account_id)
+            .unwrap_or(tx.account);
+        let issuer = tx
+            .fields
+            .get("Issuer")
+            .and_then(decode_account_id)
+            .unwrap_or(tx.account);
+        let Some(ct) = tx.fields.get("CredentialType").and_then(|v| v.as_str()) else {
+            return TxResult::Malformed;
+        };
+        if !sandbox.exists(&credential_key(&subject, &issuer, &cred_type_bytes(ct))) {
+            return TxResult::NoEntry;
+        }
         TxResult::Success
     }
 
     fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
-        let subject = match tx.fields.get("Subject").and_then(|v| decode_account_id(v)) {
-            Some(id) => id,
-            None => return TxResult::Malformed,
-        };
-        let issuer = match tx.fields.get("Issuer").and_then(|v| decode_account_id(v)) {
-            Some(id) => id,
-            None => return TxResult::Malformed,
-        };
+        // Same `value_or(account)` defaulting as preclaim — an absent Subject
+        // or Issuer means the sender fills that role, it is not malformed.
+        let subject = tx
+            .fields
+            .get("Subject")
+            .and_then(decode_account_id)
+            .unwrap_or(tx.account);
+        let issuer = tx
+            .fields
+            .get("Issuer")
+            .and_then(decode_account_id)
+            .unwrap_or(tx.account);
         let cred_type_str = match tx.fields.get("CredentialType").and_then(|v| v.as_str()) {
             Some(s) => s,
             None => return TxResult::Malformed,
@@ -224,6 +265,91 @@ impl Transactor for CredentialDeleteTransactor {
         }
 
         TxResult::Success
+    }
+}
+
+#[cfg(test)]
+mod delete_tests {
+    use super::*;
+    use crate::ledger::header::LedgerHeader;
+    use crate::ledger::state::LedgerState;
+    use xrpl_core::types::Hash256;
+
+    fn state_with(id: &[u8; 20]) -> LedgerState {
+        let header = LedgerHeader {
+            sequence: 100, total_coins: 100_000_000_000_000_000,
+            parent_hash: Hash256([0; 32]), transaction_hash: Hash256([0; 32]),
+            account_hash: Hash256([0; 32]), parent_close_time: 0,
+            close_time: 10, close_time_resolution: 10, close_flags: 0,
+        };
+        let mut st = LedgerState::new_unverified(header);
+        let a = serde_json::json!({
+            "LedgerEntryType": "AccountRoot", "Account": hex::encode(id),
+            "Balance": "100000000", "Sequence": 1, "OwnerCount": 0,
+        });
+        st.state_map.insert(keylet::account_root_key(id), serde_json::to_vec(&a).unwrap()).unwrap();
+        st
+    }
+
+    fn del_tx(account: [u8; 20], subject: Option<[u8; 20]>, issuer: Option<[u8; 20]>) -> TxFields {
+        let mut f = serde_json::json!({ "CredentialType": "4142" });
+        if let Some(s) = subject { f["Subject"] = serde_json::json!(hex::encode(s)); }
+        if let Some(i) = issuer { f["Issuer"] = serde_json::json!(hex::encode(i)); }
+        TxFields {
+            account, tx_type: "CredentialDelete".to_string(), fee: 12, sequence: 7,
+            ticket_seq: None, last_ledger_seq: None, fields: f,
+        }
+    }
+
+    /// rippled needs at least ONE of Subject/Issuer, not both — whichever is
+    /// absent defaults to the sending Account (CredentialDelete.cpp preflight
+    /// and preclaim's `value_or(account)`). Requiring both rejected every real
+    /// self-issued delete as malformed before preclaim could answer.
+    ///
+    /// #105909624 87483CD4BCF1, #105911834 E246CD9AE20F, #105912291
+    /// DD6078118B99: Subject + CredentialType, NO Issuer. Mainnet tecNO_ENTRY,
+    /// we said temMALFORMED.
+    #[test]
+    fn a_delete_naming_only_a_subject_reaches_preclaim() {
+        let account = [0x01u8; 20];
+        let subject = [0x03u8; 20];
+        let st = state_with(&account);
+        let sb = Sandbox::new(&st);
+
+        // Subject only — the sender is the issuer. Must pass preflight and then
+        // answer tecNO_ENTRY, not temMALFORMED.
+        let tx = del_tx(account, Some(subject), None);
+        assert_eq!(CredentialDeleteTransactor.preflight(&tx), TxResult::Success);
+        assert_eq!(CredentialDeleteTransactor.preclaim(&tx, &sb), TxResult::NoEntry);
+
+        // Issuer only — mirror case, the sender is the subject.
+        let tx = del_tx(account, None, Some(subject));
+        assert_eq!(CredentialDeleteTransactor.preflight(&tx), TxResult::Success);
+        assert_eq!(CredentialDeleteTransactor.preclaim(&tx, &sb), TxResult::NoEntry);
+
+        // NEITHER — genuinely malformed, still rejected.
+        let tx = del_tx(account, None, None);
+        assert_eq!(CredentialDeleteTransactor.preflight(&tx), TxResult::Malformed);
+    }
+
+    /// CredentialType must be present, non-empty and <= 64 bytes
+    /// (kMaxCredentialTypeLength, Protocol.h:221).
+    #[test]
+    fn credential_type_size_is_bounded() {
+        let account = [0x01u8; 20];
+        let subject = [0x03u8; 20];
+
+        let mut tx = del_tx(account, Some(subject), None);
+        tx.fields["CredentialType"] = serde_json::json!("");
+        assert_eq!(CredentialDeleteTransactor.preflight(&tx), TxResult::Malformed, "empty");
+
+        let mut tx = del_tx(account, Some(subject), None);
+        tx.fields["CredentialType"] = serde_json::json!("41".repeat(64));
+        assert_eq!(CredentialDeleteTransactor.preflight(&tx), TxResult::Success, "64 bytes is the limit");
+
+        let mut tx = del_tx(account, Some(subject), None);
+        tx.fields["CredentialType"] = serde_json::json!("41".repeat(65));
+        assert_eq!(CredentialDeleteTransactor.preflight(&tx), TxResult::Malformed, "65 bytes is over");
     }
 }
 
