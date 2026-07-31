@@ -303,6 +303,73 @@ pub(crate) fn swap_asset_out(pool_in: Me, pool_out: Me, asset_out: Me, tfee: u16
 /// changeSpotPriceQuality (post-fixAMMv1_1): the offer (in, out) that moves
 /// the pool spot quality down to `target` (getRate in/out). None when the
 /// fee makes it ungeneratable.
+/// LP tokens burned by a SINGLE-ASSET withdrawal of `withdraw` from a pool
+/// holding `balance` of that asset, against `total_lp` outstanding.
+///
+/// rippled `lpTokensIn` (AMMHelpers.cpp), documented at
+/// `AMMWithdraw::singleWithdraw` as `t = T*(c - sqrt(c^2 - 4R))/2`:
+///     fr   = withdraw / balance
+///     f1   = fee fraction
+///     c    = fr*f1 + 2 - f1
+///     frac = (c - sqrt(c^2 - 4*fr)) / 2
+///     t    = lptAMMBalance * frac        — rounded UP under fixAMMv1_3
+///                                          ("maximize tokens in")
+/// Asset paid out when `lp_tokens` are redeemed against a single side of the
+/// pool — rippled `ammAssetOut` (AMMHelpers.cpp), equation 8:
+///     t1   = lpTokens / lptAMMBalance
+///     frac = (t1^2 - t1*(2 - f)) / (t1*f - 1)
+///     out  = assetBalance * frac      — rounded DOWN ("minimize withdraw")
+///
+/// Both numerator and denominator are NEGATIVE for t1 < 1 (t1^2 < t1*(2-f), and
+/// t1*f < 1), so we work with magnitudes: our Me is unsigned and n_sub would
+/// underflow on the signed form.
+pub(crate) fn amm_asset_out(
+    asset_balance: Me,
+    total_lp: Me,
+    lp_tokens: Me,
+    tfee: u16,
+    xrp: bool,
+) -> Option<Me> {
+    if total_lp.0 == 0 || asset_balance.0 == 0 || lp_tokens.0 == 0 {
+        return None;
+    }
+    let f = fee_n(tfee);
+    let t1 = n_div(lp_tokens, total_lp, Rnd::Near);
+    // |numerator| = t1*(2 - f) - t1^2
+    let num = n_sub(
+        n_mul(t1, n_sub(N_TWO, f, Rnd::Near), Rnd::Near),
+        n_mul(t1, t1, Rnd::Near),
+        Rnd::Near,
+    );
+    // |denominator| = 1 - t1*f
+    let den = n_sub(N_ONE, n_mul(t1, f, Rnd::Near), Rnd::Near);
+    if den.0 == 0 || num.0 == 0 {
+        return None;
+    }
+    let frac = n_div(num, den, Rnd::Near);
+    let out = n_mul(asset_balance, frac, Rnd::Down);
+    Some(to_amount(out, xrp, Rnd::Down))
+}
+
+pub(crate) fn lp_tokens_in(balance: Me, withdraw: Me, total_lp: Me, tfee: u16) -> Option<Me> {
+    if balance.0 == 0 || total_lp.0 == 0 || withdraw.0 == 0 {
+        return None;
+    }
+    let fr = n_div(withdraw, balance, Rnd::Near);
+    let f1 = fee_n(tfee);
+    let c = n_sub(n_add(n_mul(fr, f1, Rnd::Near), N_TWO, Rnd::Near), f1, Rnd::Near);
+    let c2 = n_mul(c, c, Rnd::Near);
+    let four_fr = n_mul(N_FOUR, fr, Rnd::Near);
+    if n_cmp(c2, four_fr) == Ordering::Less {
+        return None;
+    }
+    let frac = n_div(n_sub(c, n_sqrt(n_sub(c2, four_fr, Rnd::Near)), Rnd::Near), N_TWO, Rnd::Near);
+    if frac.0 == 0 {
+        return None;
+    }
+    Some(n_mul(total_lp, frac, Rnd::Up))
+}
+
 fn anchored_offer(
     pool_in: Me,
     pool_out: Me,

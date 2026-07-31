@@ -405,6 +405,31 @@ impl Transactor for AMMDepositTransactor {
     }
 }
 
+/// Tear down an emptied LPToken trust line: delete it, drop it from BOTH owner
+/// directories, and release the reserve on each side.
+///
+/// The AMM side is the ISSUER of the LPToken, so `move_leg` never touches it —
+/// the teardown has to be explicit. rippled gets this for free because burning
+/// the tokens runs the ordinary trust-line delete, which fires the moment the
+/// balance reaches zero and both sides are default.
+fn tear_down_lp_line(
+    sandbox: &mut Sandbox,
+    who: &[u8; 20],
+    amm_acct: &[u8; 20],
+    lp_key: xrpl_core::types::Hash256,
+    lp_line: &serde_json::Value,
+) {
+    let node = |field: &str| {
+        lp_line.get(field).and_then(|v| v.as_str()).and_then(|s| u64::from_str_radix(s, 16).ok())
+    };
+    let (w_node, a_node) = if who < amm_acct { ("LowNode", "HighNode") } else { ("HighNode", "LowNode") };
+    sandbox.delete(lp_key);
+    crate::ledger::directory::owner_dir_remove(sandbox, who, &lp_key, node(w_node), false);
+    crate::ledger::directory::owner_dir_remove(sandbox, amm_acct, &lp_key, node(a_node), false);
+    crate::tx::offer::owner_count_add(sandbox, who, -1);
+    crate::tx::offer::owner_count_add(sandbox, amm_acct, -1);
+}
+
 /// Pay out BOTH pool assets in proportion to `tokens / total_lp`.
 ///
 /// rippled's `equalWithdrawTokens` (AMMWithdraw.cpp:790-850):
@@ -494,7 +519,17 @@ impl Transactor for AMMWithdrawTransactor {
         // apply-side under tfWithdrawAll. #105787513 EDD6BA97 / #105796380
         // 2437575D: mainnet emits eight nodes; we emitted three (a fixed default
         // burn, no asset payout, the LP line only Modified to zero not deleted).
-        if tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & 0x0002_0000 != 0 {
+        // rippled's isWithdrawAll covers BOTH tfWithdrawAll (0x00020000) and
+        // tfOneAssetWithdrawAll (0x00040000) — AMMWithdraw.cpp:1133-1138. We
+        // only checked the first. #105929166 39E145693A80 carries Flags 262144
+        // = tfOneAssetWithdrawAll, which I first misread as tfSingleAsset
+        // (0x00080000). Under it the `Amount` is a MINIMUM, not the size of the
+        // withdrawal: the LP burns their ENTIRE token balance and takes it out
+        // in that one asset, which is why mainnet Deletes the LP line.
+        const TF_WITHDRAW_ALL: u64 = 0x0002_0000;
+        const TF_ONE_ASSET_WITHDRAW_ALL: u64 = 0x0004_0000;
+        let wd_flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+        if wd_flags & (TF_WITHDRAW_ALL | TF_ONE_ASSET_WITHDRAW_ALL) != 0 {
             let lp_key = keylet::ripple_state_key(&tx.account, &amm_acct, &lp_leg.cur);
             let Some(lp_line) = ox::json_at(sandbox, &lp_key) else { return TxResult::Success };
             let (_neg, lp_bal) = ox::signed_value(&lp_line["Balance"]);
@@ -505,20 +540,30 @@ impl Transactor for AMMWithdrawTransactor {
                 .and_then(|o| o["LPTokenBalance"]["value"].as_str().map(str::to_string))
                 .and_then(|s| keylet::amount_mant_exp(&serde_json::Value::String(s)))
                 .unwrap_or(lp_bal);
-            // Both assets out, proportional to the redeemed LPToken share.
-            payout_proportional(sandbox, tx, &amm_acct, lp_bal, total_lp);
-            // Tear down the LPToken trust line on both sides (the AMM side is the
-            // issuer, so move_leg would not touch it — do it explicitly).
-            let w_low = tx.account < amm_acct;
-            let node = |field: &str| {
-                lp_line.get(field).and_then(|v| v.as_str()).and_then(|s| u64::from_str_radix(s, 16).ok())
-            };
-            let (w_node, a_node) = if w_low { ("LowNode", "HighNode") } else { ("HighNode", "LowNode") };
-            sandbox.delete(lp_key);
-            crate::ledger::directory::owner_dir_remove(sandbox, &tx.account, &lp_key, node(w_node), false);
-            crate::ledger::directory::owner_dir_remove(sandbox, &amm_acct, &lp_key, node(a_node), false);
-            ox::owner_count_add(sandbox, &tx.account, -1);
-            ox::owner_count_add(sandbox, &amm_acct, -1);
+            if wd_flags & TF_ONE_ASSET_WITHDRAW_ALL != 0 {
+                // ONE asset out, sized by rippled's ammAssetOut against the
+                // LP's whole token balance. `Amount` names the side (its value
+                // is only a floor).
+                if let Some(v) = tx.fields.get("Amount") {
+                    if let Some(leg) = ox::leg_of(v) {
+                        let bal = crate::tx::amm_swap::holds(sandbox, &amm_acct, &leg);
+                        let tfee = ox::json_at(sandbox, &amm_key)
+                            .and_then(|o| o["TradingFee"].as_u64())
+                            .unwrap_or(0) as u16;
+                        if let Some(out) =
+                            crate::tx::amm_swap::amm_asset_out(bal, total_lp, lp_bal, tfee, leg.xrp)
+                        {
+                            if out.0 > 0 {
+                                ox::move_leg(sandbox, &amm_acct, &tx.account, &leg, out);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Both assets out, proportional to the redeemed LPToken share.
+                payout_proportional(sandbox, tx, &amm_acct, lp_bal, total_lp);
+            }
+            tear_down_lp_line(sandbox, &tx.account, &amm_acct, lp_key, &lp_line);
             bump_lp_balance(sandbox, &amm_key, lp_bal, false);
             return TxResult::Success;
         }
@@ -552,6 +597,27 @@ impl Transactor for AMMWithdrawTransactor {
             }
         }
 
+        // tfSingleAsset withdrawals name an Amount and NO LPTokenIn: the LP
+        // tokens burned are DERIVED from what is taken out, and the pool
+        // balance that derivation needs is the one BEFORE the payout below.
+        let single_asset_burn = if tx.fields.get("LPTokenIn").is_none() {
+            (|| {
+                let v = tx.fields.get("Amount")?;
+                let leg = ox::leg_of(v)?;
+                let withdraw = keylet::amount_mant_exp(v)?;
+                let balance = crate::tx::amm_swap::holds(sandbox, &amm_acct, &leg);
+                let total_lp = ox::json_at(sandbox, &amm_key)
+                    .and_then(|o| o["LPTokenBalance"]["value"].as_str().map(str::to_string))
+                    .and_then(|t| keylet::amount_mant_exp(&serde_json::Value::String(t)))?;
+                let tfee = ox::json_at(sandbox, &amm_key)
+                    .and_then(|o| o["TradingFee"].as_u64())
+                    .unwrap_or(0) as u16;
+                crate::tx::amm_swap::lp_tokens_in(balance, withdraw, total_lp, tfee)
+            })()
+        } else {
+            None
+        };
+
         // Move the withdrawn side(s) AMM account → withdrawer.
         for f in ["Amount", "Amount2"] {
             if let Some(v) = tx.fields.get(f) {
@@ -562,15 +628,40 @@ impl Transactor for AMMWithdrawTransactor {
                 }
             }
         }
-        // Burn the withdrawer's LP tokens (magnitude oracle-corrected).
+        // Burn the withdrawer's LP tokens. LPTokenIn when named; otherwise the
+        // single-asset derivation above. The old fallback here was a FIXED
+        // placeholder (1e7 tokens) that bore no relation to the withdrawal —
+        // #105929166 39E145693A80 is tfSingleAsset taking 353,745,926 drops,
+        // which consumed the LP's ENTIRE position on mainnet (the LP line is
+        // Deleted); we burned the placeholder and left the line at a nonzero
+        // balance.
         let burned = tx
             .fields
             .get("LPTokenIn")
             .and_then(keylet::amount_mant_exp)
             .filter(|m| m.0 > 0)
+            .or(single_asset_burn)
             .unwrap_or((1_000_000_000_000_000, -8));
         ox::move_leg(sandbox, &tx.account, &amm_acct, &lp_leg, burned);
         bump_lp_balance(sandbox, &amm_key, burned, false);
+
+        // A burn that empties the LP's position TEARS THE LINE DOWN — it is not
+        // left sitting at zero. rippled gets this from the ordinary trust-line
+        // delete that runs when the tokens are burned; we have to do it
+        // explicitly because the AMM is the LPToken's issuer and `move_leg`
+        // never touches the issuer side.
+        //
+        // #105929166 39E145693A80 and #105922945 15FAEA4CC56D: mainnet DELETES
+        // the LP line (`:2`) and Modifies both owner directories; we emitted it
+        // Modified (`:1`) and left the directories alone — the same key showing
+        // up as missing-Deleted and extra-Modified is the whole signature.
+        let lp_key = keylet::ripple_state_key(&tx.account, &amm_acct, &lp_leg.cur);
+        if let Some(line) = ox::json_at(sandbox, &lp_key) {
+            let (_neg, mag) = ox::signed_value(&line["Balance"]);
+            if mag.0 == 0 {
+                tear_down_lp_line(sandbox, &tx.account, &amm_acct, lp_key, &line);
+            }
+        }
         TxResult::Success
     }
 }
@@ -1140,6 +1231,72 @@ mod tests {
             .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
             .and_then(|a| a["Balance"].as_str().and_then(|v| v.parse::<u128>().ok()))
             .unwrap_or(0)
+    }
+
+    /// rippled's isWithdrawAll covers BOTH tfWithdrawAll (0x00020000) and
+    /// tfOneAssetWithdrawAll (0x00040000) — AMMWithdraw.cpp:1133-1138. Under
+    /// the latter the `Amount` is a MINIMUM, not the size of the withdrawal:
+    /// the LP burns their ENTIRE token balance and takes it out in that ONE
+    /// asset, sized by ammAssetOut.
+    ///
+    /// #105929166 39E145693A80 and #105922945 15FAEA4CC56D: mainnet DELETES the
+    /// LP trust line (`:2`) and Modifies both owner directories; we emitted it
+    /// Modified (`:1`) with a residual balance and left the directories alone.
+    /// The same key appearing as missing-Deleted AND extra-Modified is the
+    /// whole signature. Flags 262144 is easy to misread as tfSingleAsset —
+    /// that is 0x00080000, a different transaction entirely.
+    #[test]
+    fn one_asset_withdraw_all_empties_the_position() {
+        let alice = [0x01u8; 20];
+        let usd_issuer = [0x02u8; 20];
+        let state = make_state(&alice, 200_000_000);
+        let mut sandbox = Sandbox::new(&state);
+
+        let create_tx = TxFields {
+            account: alice, tx_type: "AMMCreate".to_string(), fee: 12, sequence: 1,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Amount": "40000000",
+                "Amount2": {"currency": "USD", "issuer": hex::encode(usd_issuer), "value": "100"},
+                "TradingFee": 236,
+            }),
+        };
+        assert_eq!(AMMCreateTransactor.do_apply(&create_tx, &mut sandbox), TxResult::Success);
+
+        let wd = TxFields {
+            account: alice, tx_type: "AMMWithdraw".to_string(), fee: 12, sequence: 2,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Asset": {"currency": "XRP"},
+                "Asset2": {"currency": "USD", "issuer": hex::encode(usd_issuer)},
+                // Amount names the side and acts as a FLOOR, not the size.
+                "Amount": "1",
+                "Flags": 0x0004_0000u64, // tfOneAssetWithdrawAll
+            }),
+        };
+        let amm_key = amm_key_from_asset_fields(&wd).unwrap();
+        let amm_obj: serde_json::Value = serde_json::from_slice(&sandbox.read(&amm_key).unwrap()).unwrap();
+        let amm_acct = <[u8; 20]>::try_from(
+            hex::decode(amm_obj["Account"].as_str().unwrap()).unwrap().as_slice(),
+        ).unwrap();
+        let lp_cur = keylet::amm_lpt_currency(
+            &asset_currency20(&wd.fields["Asset"]),
+            &asset_currency20(&wd.fields["Asset2"]),
+        );
+        let lp_line = keylet::ripple_state_key(&alice, &amm_acct, &lp_cur);
+        assert!(sandbox.exists(&lp_line), "alice holds the LPToken line after create");
+
+        let xrp_before = xrp_drops(&sandbox, &alice);
+        assert_eq!(AMMWithdrawTransactor.do_apply(&wd, &mut sandbox), TxResult::Success);
+
+        assert!(
+            !sandbox.exists(&lp_line),
+            "tfOneAssetWithdrawAll empties the position, so the LPToken line is torn down",
+        );
+        assert!(
+            xrp_drops(&sandbox, &alice) > xrp_before,
+            "and the named side is paid out",
+        );
     }
 
     /// tfLPToken: the LP names only how many LPTokens to redeem and receives
