@@ -361,6 +361,35 @@ pub(crate) fn dest_receivable(sandbox: &Sandbox, dest: &[u8; 20], leg: &Leg) -> 
     // ⇒ low holds), so `dest` holds when it is low with a positive balance or
     // high with a negative one — the same test `available()` uses above.
     let (bneg, bmag) = signed_value(&line["Balance"]);
+    // An issuer with lsfRequireAuth cannot put its IOU into a line that lacks
+    // the ISSUER-side auth flag while that line is still EMPTY — all three
+    // conditions together (DirectStep.cpp:430-437, DirectIPaymentStep::check).
+    // An existing balance is grandfathered. This runs at STRAND CONSTRUCTION,
+    // so a failing strand is never built and the payment has no path at all:
+    // tecPATH_DRY, not a short fill.
+    //
+    // 6 payments in the fresh batch answered tesSUCCESS where mainnet said
+    // tecPATH_DRY — e.g. #105933892 845CB9790984, all self-payments converting
+    // XRP to RUBY under tfPartialPayment with no Paths. The XRP/RUBY book is
+    // empty; the liquidity we found was the XRP/RUBY AMM (644 XRP). Issuer
+    // rG71TpU2 sets lsfRequireAuth and the senders' RUBY lines are
+    // unauthorized with balance 0, so mainnet has no usable strand at all.
+    const LSF_REQUIRE_AUTH: u64 = 0x0004_0000; // AccountRoot
+    const LSF_LOW_AUTH: u64 = 0x0004_0000;     // RippleState
+    const LSF_HIGH_AUTH: u64 = 0x0008_0000;    // RippleState
+    if bmag.0 == 0 {
+        let issuer_requires_auth = json_at(sandbox, &keylet::account_root_key(&leg.issuer))
+            .and_then(|a| a["Flags"].as_u64())
+            .is_some_and(|f| f & LSF_REQUIRE_AUTH != 0);
+        if issuer_requires_auth {
+            // rippled: authField = (issuer > dest) ? lsfHighAuth : lsfLowAuth —
+            // the flag sits on the ISSUER's side of the line.
+            let auth_bit = if &leg.issuer < dest { LSF_LOW_AUTH } else { LSF_HIGH_AUTH };
+            if line["Flags"].as_u64().unwrap_or(0) & auth_bit == 0 {
+                return Some((0, 0));
+            }
+        }
+    }
     let dest_low = dest < &leg.issuer;
     let dest_holds = if dest_low { !bneg } else { bneg };
     if !dest_holds && bmag.0 > 0 {
@@ -3798,6 +3827,77 @@ mod tests {
             idx[0].as_str().unwrap(),
             hex::encode_upper([0xEEu8; 32]),
             "the deleted line is gone; the unrelated one stays",
+        );
+    }
+
+    /// An issuer with lsfRequireAuth cannot put its IOU into a line that lacks
+    /// the ISSUER-side auth flag while that line is still EMPTY — all three
+    /// conditions at once (DirectStep.cpp:430-437). An existing balance is
+    /// grandfathered. Because the test runs at strand construction, a failure
+    /// means the payment has NO path: tecPATH_DRY, not a short fill.
+    ///
+    /// 6 payments in the fresh batch answered tesSUCCESS where mainnet said
+    /// tecPATH_DRY — #105933892 845CB9790984 and friends, self-payments
+    /// converting XRP to RUBY under tfPartialPayment with no Paths. The
+    /// XRP/RUBY book is EMPTY; the liquidity we found was the XRP/RUBY AMM
+    /// (644 XRP). Issuer rG71TpU2 sets lsfRequireAuth and the senders' RUBY
+    /// lines are unauthorized with balance 0.
+    #[test]
+    fn an_unauthorized_empty_line_can_receive_nothing() {
+        let dest = [0x01u8; 20];
+        let issuer = [0x02u8; 20];
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+        let leg = Leg { xrp: false, cur, issuer };
+        let dest_low = dest < issuer;
+        let (lo, hi) = if dest_low { (dest, issuer) } else { (issuer, dest) };
+        // The auth flag lives on the ISSUER's side of the line.
+        let issuer_auth_bit: u64 = if issuer < dest { 0x0004_0000 } else { 0x0008_0000 };
+
+        let build = |issuer_flags: u64, line_flags: u64, balance: &str| -> LedgerState {
+            let mut state = make_state_with_account(&dest, 100_000_000);
+            let iss = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": hex::encode(issuer),
+                "Balance": "100000000", "Sequence": 1, "OwnerCount": 0,
+                "Flags": issuer_flags,
+            });
+            state.state_map.insert(keylet::account_root_key(&issuer), serde_json::to_vec(&iss).unwrap()).unwrap();
+            let line = serde_json::json!({
+                "LedgerEntryType": "RippleState", "Flags": line_flags,
+                "Balance": {"currency": hex::encode_upper(cur),
+                            "issuer": "0000000000000000000000000000000000000000",
+                            "value": if dest_low { balance.to_string() } else { format!("-{balance}") }},
+                "LowLimit":  {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000000"},
+                "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000000"},
+            });
+            state.state_map.insert(keylet::ripple_state_key(&dest, &issuer, &cur), serde_json::to_vec(&line).unwrap()).unwrap();
+            state
+        };
+        let recv = |st: &LedgerState| dest_receivable(&Sandbox::new(st), &dest, &leg);
+
+        // RequireAuth + unauthorized + empty  ⇒ receives NOTHING.
+        let st = build(0x0004_0000, 0, "0");
+        assert_eq!(recv(&st), Some((0, 0)), "unauthorized empty line under RequireAuth");
+
+        // Authorized ⇒ normal capacity.
+        let st = build(0x0004_0000, issuer_auth_bit, "0");
+        assert!(
+            recv(&st).is_none_or(|r| r.0 > 0),
+            "an authorized line receives normally",
+        );
+
+        // Unauthorized but NON-EMPTY ⇒ grandfathered, still receives.
+        let st = build(0x0004_0000, 0, "5");
+        assert!(
+            recv(&st).is_none_or(|r| r.0 > 0),
+            "an existing balance is grandfathered — rippled tests Balance == 0",
+        );
+
+        // Issuer does NOT require auth ⇒ the flag is irrelevant.
+        let st = build(0, 0, "0");
+        assert!(
+            recv(&st).is_none_or(|r| r.0 > 0),
+            "no RequireAuth on the issuer means no auth gate",
         );
     }
 }
