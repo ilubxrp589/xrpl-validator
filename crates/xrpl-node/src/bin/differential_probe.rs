@@ -478,6 +478,25 @@ fn native_read_keys(txj: &Value) -> Vec<String> {
         if let Some(acct) = txj["Account"].as_str().and_then(decode_address) {
             keys.push(hex::encode_upper(keylet::owner_dir_key(&acct).0));
         }
+        // The ISSUERS' owner dirs too, not just the account's. A crossing that
+        // hands the taker an IOU for the first time creates a trust line, which
+        // is inserted into BOTH sides' directories — and an IOU issuer's is
+        // enormous. #105920238 483655735D99, #105923760 D62C0C4874E8 and
+        // #105936921 8D89EF468CFB (three different ledgers) all Created the
+        // SAME root 72D151A0 — rMxCKbED, the RLUSD issuer, whose directory runs
+        // to IndexPrevious 0xe92, i.e. 3730 pages — where mainnet Modified a
+        // tail page. A key that is constant across unrelated ledgers is always
+        // this: our view of a multi-page directory, never engine arithmetic.
+        for f in ["TakerPays", "TakerGets"] {
+            if let Some(iss) = txj
+                .get(f)
+                .and_then(|a| a.get("issuer"))
+                .and_then(|v| v.as_str())
+                .and_then(decode_issuer)
+            {
+                keys.push(hex::encode_upper(keylet::owner_dir_key(&iss).0));
+            }
+        }
         let cur20 = |v: &Value| -> Option<[u8; 20]> {
             match v {
                 Value::String(_) => Some([0u8; 20]),
@@ -608,6 +627,25 @@ fn load_owner_dir_tail(state: &mut LedgerState, url: &str, txj: &Value, ledger_i
             .and_then(decode_issuer)
         {
             owners.push(iss);
+        }
+    }
+    // A crossing OfferCreate can hand the taker an IOU it has never held,
+    // creating a trust line that appends to the ISSUER's owner directory —
+    // which for a real issuer is thousands of pages long. Only the tail page
+    // (root.IndexPrevious) receives it, and the meta never carries that page.
+    if txj["TransactionType"].as_str() == Some("OfferCreate") {
+        if let Some(a) = txj["Account"].as_str().and_then(decode_address) {
+            owners.push(a);
+        }
+        for f in ["TakerPays", "TakerGets"] {
+            if let Some(iss) = txj
+                .get(f)
+                .and_then(|a| a.get("issuer"))
+                .and_then(|v| v.as_str())
+                .and_then(decode_issuer)
+            {
+                owners.push(iss);
+            }
         }
     }
     // A mint carrying `Amount` rests a sell offer (featureNFTokenMintOffer),
