@@ -1850,20 +1850,6 @@ impl Transactor for OfferCreateTransactor {
             return TxResult::NoAccount;
         }
 
-        // rippled CreateOffer::preclaim (OfferCreate.cpp:224-229) tests the
-        // expiry BEFORE the funding check — "it saves us a call to
-        // checkAcceptAsset and possible false negative" — and applyGuts
-        // repeats it at :653. hasExpired is `parentCloseTime() >= Expiration`
-        // (View.cpp:48-54); the base ledger's close time IS the parent close
-        // time of the ledger being replayed.
-        // #105887283 17075103474C: Expiration 838475074, parent close
-        // 838475151 — mainnet tecEXPIRED, we fell through to the reserve test.
-        if let Some(exp) = tx.fields.get("Expiration").and_then(|v| v.as_u64()) {
-            if sandbox.base().header.close_time as u64 >= exp {
-                return TxResult::Expired;
-            }
-        }
-
         // rippled CreateOffer::preclaim: an offer is unfunded when
         // accountFunds(TakerGets) <= 0 — for XRP that is balance minus
         // reserve, NOT the full sell amount (partially funded offers still
@@ -1872,6 +1858,29 @@ impl Transactor for OfferCreateTransactor {
         if let Some(leg) = leg_of(&tx.fields["TakerGets"]) {
             if me_is_zero(available(sandbox, &tx.account, &leg)) {
                 return TxResult::UnfundedOffer;
+            }
+        }
+
+        // Expiry is checked AFTER funding. rippled's OfferCreate::preclaim
+        // (:171) runs terNO_ACCOUNT -> checkGlobalFrozen x2 -> accountFunds ->
+        // tecUNFUNDED_OFFER -> temBAD_SEQUENCE -> hasExpired -> tecEXPIRED ->
+        // checkAcceptAsset, so an offer that is BOTH expired and unfunded
+        // answers tecUNFUNDED_OFFER.
+        //
+        // d753d7a placed this first, reading OfferCreate.cpp:224-229's "it
+        // saves us a call to checkAcceptAsset and possible false negative" as
+        // "before funding". It is not — checkAcceptAsset comes AFTER funding,
+        // so that comment only places the expiry check ahead of checkAcceptAsset.
+        // #105950082 000702037C38 and C79FCB34C1B7 are both expired AND
+        // unfunded: mainnet says tecUNFUNDED_OFFER, we said tecEXPIRED.
+        //
+        // hasExpired is inclusive, `parentCloseTime() >= Expiration`
+        // (View.cpp:48-54); the base ledger's close time IS the parent close
+        // time of the ledger being replayed. #105887283 17075103474C:
+        // Expiration 838475074 against parent close 838475151.
+        if let Some(exp) = tx.fields.get("Expiration").and_then(|v| v.as_u64()) {
+            if sandbox.base().header.close_time as u64 >= exp {
+                return TxResult::Expired;
             }
         }
 
@@ -3619,6 +3628,46 @@ mod tests {
         assert_eq!(
             OfferCreateTransactor.do_apply(&sell_usd_tx(&who, &issuer, 7, None), &mut sandbox),
             TxResult::InsufReserveOffer,
+        );
+    }
+
+    /// Funding outranks expiry. rippled's OfferCreate::preclaim (:171) runs
+    /// accountFunds -> tecUNFUNDED_OFFER BEFORE hasExpired -> tecEXPIRED, so an
+    /// offer that is both unfunded AND expired answers tecUNFUNDED_OFFER.
+    ///
+    /// d753d7a had this backwards, reading OfferCreate.cpp:224-229's "it saves
+    /// us a call to checkAcceptAsset and possible false negative" as "before
+    /// funding" — but checkAcceptAsset comes after funding, so that comment
+    /// only orders expiry ahead of checkAcceptAsset. #105950082 000702037C38
+    /// and C79FCB34C1B7 are both expired and unfunded; mainnet says
+    /// tecUNFUNDED_OFFER and we said tecEXPIRED.
+    #[test]
+    fn an_unfunded_expired_offer_answers_unfunded_not_expired() {
+        let who = [0x01u8; 20];
+        let issuer = [0x02u8; 20];
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+
+        // Funded but expired -> tecEXPIRED (the control).
+        let (state, _) = state_selling_usd(&who, &issuer, 100_000_000, 0);
+        assert_eq!(
+            OfferCreateTransactor.preclaim(&sell_usd_tx(&who, &issuer, 7, Some(9)), &Sandbox::new(&state)),
+            TxResult::Expired,
+            "funded and expired is still tecEXPIRED",
+        );
+
+        // Same transaction, but the USD line is empty: funding is checked first.
+        let (mut state, _) = state_selling_usd(&who, &issuer, 100_000_000, 0);
+        let key = keylet::ripple_state_key(&who, &issuer, &cur);
+        let mut line: serde_json::Value =
+            serde_json::from_slice(&state.state_map.lookup(&key).unwrap().to_vec()).unwrap();
+        line["Balance"]["value"] = serde_json::json!("0");
+        state.state_map.insert(key, serde_json::to_vec(&line).unwrap()).unwrap();
+
+        assert_eq!(
+            OfferCreateTransactor.preclaim(&sell_usd_tx(&who, &issuer, 7, Some(9)), &Sandbox::new(&state)),
+            TxResult::UnfundedOffer,
+            "unfunded outranks expired — rippled checks accountFunds first",
         );
     }
 
