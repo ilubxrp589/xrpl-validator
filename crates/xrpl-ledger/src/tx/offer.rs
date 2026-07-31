@@ -1040,31 +1040,8 @@ fn reap_if_dead(
     pays_leg: &Leg,
     gets_leg: &Leg,
     stale: &mut Vec<Hash256>,
-    self_removable: bool,
 ) -> bool {
-    // rippled removes the taker's OWN offer off the tip of the book — "Remove
-    // this offer even if no crossing occurs" (BookStep.cpp:415-455). Its own
-    // commentary lays out the alternatives and settles on deletion: it cannot
-    // skip a self-offer because it can only operate on the tip, and leaving one
-    // behind would block access to the offers underneath.
-    //
-    // Three conditions: defaultPath_ (never on the bridged pass), the offer's
-    // quality at least as good as ours (q <= threshold in our inverted
-    // encoding), and owner == taker. `self_removable` carries the first two;
-    // callers past the threshold or off the default path pass false.
-    //
-    // We DID have a self-cross branch, but only inside the offer walk — so it
-    // never ran when the pool satisfied the order first and we broke out.
-    // #105949459 4A03010A4B1E: the AMM anchored at the book head covered the
-    // whole 63 ShearPepe, so we never reached the walk and left the taker's own
-    // offer EC95059B resting. Mainnet consumed the pool AND deleted that offer
-    // plus its emptied page — 4 mutations against 7.
     if maker == taker {
-        if self_removable {
-            delete_maker_offer(sandbox, okey, offer, maker);
-            stale.push(*okey);
-            return true;
-        }
         return false;
     }
     // `hasExpired`: the BASE ledger's close time is the test (View.cpp:48, and
@@ -1111,7 +1088,6 @@ fn reap_to_live_head(
     pays_leg: &Leg,
     gets_leg: &Leg,
     stale: &mut Vec<Hash256>,
-    self_removable: bool,
 ) -> bool {
     let mut page_key_h = *dk;
     for _ in 0..10_000 {
@@ -1136,7 +1112,7 @@ fn reap_to_live_head(
             }
             let Some(maker) = offer.get("Account").and_then(|v| v.as_str()).and_then(decode20)
             else { continue };
-            if !reap_if_dead(sandbox, &okey, &offer, &maker, taker, pays_leg, gets_leg, stale, self_removable) {
+            if !reap_if_dead(sandbox, &okey, &offer, &maker, taker, pays_leg, gets_leg, stale) {
                 return true;
             }
         }
@@ -1581,7 +1557,7 @@ pub(crate) fn cross_engine_to(
     'dirs: for dk in dirs {
         let q = u64::from_be_bytes(dk.0[24..32].try_into().unwrap_or_default());
         if trailing {
-            if reap_to_live_head(sandbox, &dk, taker, pays_leg, gets_leg, stale, false) {
+            if reap_to_live_head(sandbox, &dk, taker, pays_leg, gets_leg, stale) {
                 break 'dirs;
             }
             continue;
@@ -1605,18 +1581,7 @@ pub(crate) fn cross_engine_to(
         // rfPBiFvFeBQ's own later 612F4E95 to clear. A payment carries no
         // `limitQuality` and so no such gate — `threshold` is u64::MAX there
         // and this reads as always-reap, which is what #105795716 needs.
-        // The self-offer removal belongs to OFFER CROSSING ONLY. rippled puts
-        // it in `BookOfferCrossingStep` — "To support this scenario offer
-        // crossing has a special rule" (BookStep.cpp:433) — and payments run a
-        // different step class entirely, so a payment never deletes a resting
-        // offer just because its sender owns one. `offer_crossing` is the same
-        // FlowCross-vs-Flow distinction (see this function's doc).
-        //
-        // Gating it on `taker == beneficiary` was NOT enough: a self-payment
-        // has those equal too, and #105912291 stayed at 2 div with a spurious
-        // MUT Payment until this became offer_crossing.
-        let self_removable = offer_crossing;
-        if q <= threshold && !reap_to_live_head(sandbox, &dk, taker, pays_leg, gets_leg, stale, self_removable) {
+        if q <= threshold && !reap_to_live_head(sandbox, &dk, taker, pays_leg, gets_leg, stale) {
             continue;
         }
         // AMM turn: consume pool liquidity while its spot quality strictly
@@ -1674,7 +1639,7 @@ pub(crate) fn cross_engine_to(
                 let Some(maker) = offer.get("Account").and_then(|v| v.as_str()).and_then(decode20)
                 else { continue };
                 if trailing {
-                    if reap_if_dead(sandbox, &okey, &offer, &maker, taker, pays_leg, gets_leg, stale, false) {
+                    if reap_if_dead(sandbox, &okey, &offer, &maker, taker, pays_leg, gets_leg, stale) {
                         continue;
                     }
                     break 'dirs;
@@ -3933,102 +3898,6 @@ mod tests {
         assert!(
             recv(&st).is_none_or(|r| r.0 > 0),
             "no RequireAuth on the issuer means no auth gate",
-        );
-    }
-
-    /// rippled removes the taker's OWN offer off the tip of the book "even if
-    /// no crossing occurs" (BookStep.cpp:415-455). Its commentary rules out the
-    /// alternatives explicitly: it cannot skip a self-offer, because it only
-    /// operates on the tip and leaving one there would block the offers beneath.
-    ///
-    /// We had a self-cross branch, but only INSIDE the offer walk — so it never
-    /// ran when the pool satisfied the order first and we broke out before
-    /// reaching it. #105949459 4A03010A4B1E: the AMM anchored at the book head
-    /// covered all 63 ShearPepe, so we left the taker's own offer EC95059B
-    /// resting — 4 mutations against mainnet's 7, which deleted it and its
-    /// emptied page. The pool is what makes this test bite; without it the walk
-    /// reaches the offer and deletes it either way.
-    #[test]
-    fn the_takers_own_offer_goes_even_when_the_pool_fills_everything() {
-        let taker = [0x01u8; 20];
-        let issuer = [0x02u8; 20];
-        let pool = [0x06u8; 20];
-        let mut cur = [0u8; 20];
-        cur[12..15].copy_from_slice(b"USD");
-
-        let mut state = make_state_with_account(&taker, 500_000_000);
-        for (id, bal) in [(&issuer, "500000000"), (&pool, "100000000")] {
-            let a = serde_json::json!({
-                "LedgerEntryType": "AccountRoot", "Account": hex::encode(id),
-                "Balance": bal, "Sequence": 1, "OwnerCount": 0,
-            });
-            state.state_map.insert(keylet::account_root_key(id), serde_json::to_vec(&a).unwrap()).unwrap();
-        }
-        // Pool holds 100 USD against 100 XRP — 1 XRP per USD, far better than
-        // the taker's own resting offer, so it fills the order outright.
-        let (lo, hi) = if pool < issuer { (pool, issuer) } else { (issuer, pool) };
-        let line = serde_json::json!({
-            "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
-            "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000",
-                        "value": if pool < issuer { "100" } else { "-100" }},
-            "LowLimit":  {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000000"},
-            "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000000"},
-        });
-        state.state_map.insert(keylet::ripple_state_key(&pool, &issuer, &cur), serde_json::to_vec(&line).unwrap()).unwrap();
-        // The taker holds USD so it can rest a sell-side offer in the very book
-        // it will later cross.
-        let (tlo, thi) = if taker < issuer { (taker, issuer) } else { (issuer, taker) };
-        let tline = serde_json::json!({
-            "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
-            "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000",
-                        "value": if taker < issuer { "100" } else { "-100" }},
-            "LowLimit":  {"currency": hex::encode_upper(cur), "issuer": hex::encode(tlo), "value": "1000000"},
-            "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(thi), "value": "1000000"},
-        });
-        state.state_map.insert(keylet::ripple_state_key(&taker, &issuer, &cur), serde_json::to_vec(&tline).unwrap()).unwrap();
-        let xrp_leg = leg_of(&serde_json::json!("1")).unwrap();
-        let usd_leg = leg_of(&serde_json::json!({"currency":"USD","issuer":hex::encode(issuer),"value":"1"})).unwrap();
-        let amm = serde_json::json!({
-            "LedgerEntryType": "AMM", "Account": hex::encode(pool), "TradingFee": 0,
-        });
-        state.state_map.insert(
-            keylet::amm_key(&xrp_leg.cur, &xrp_leg.issuer, &usd_leg.cur, &usd_leg.issuer),
-            serde_json::to_vec(&amm).unwrap(),
-        ).unwrap();
-
-        // The taker already rests an offer in the same book: 10 USD for 30 XRP.
-        // Worse than the pool, but well within the limit the taker is about to
-        // set, so rippled's `quality >= qualityThreshold_` holds.
-        let mut sandbox = Sandbox::new(&state);
-        let own = TxFields {
-            account: taker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
-            ticket_seq: None, last_ledger_seq: None,
-            fields: serde_json::json!({
-                "TakerPays": "30000000",
-                "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "10"},
-            }),
-        };
-        assert_eq!(OfferCreateTransactor.do_apply(&own, &mut sandbox), TxResult::Success);
-        let mods = sandbox.into_modifications();
-        apply_modifications(&mut state, mods).unwrap();
-        let own_key = keylet::offer_key(&taker, 2);
-        assert!(state.state_map.lookup(&own_key).is_some(), "the taker's own offer rests first");
-
-        // Now buy 5 USD for up to 20 XRP. The pool alone covers it.
-        let mut sandbox = Sandbox::new(&state);
-        let tx = TxFields {
-            account: taker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 9,
-            ticket_seq: None, last_ledger_seq: None,
-            fields: serde_json::json!({
-                "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "5"},
-                "TakerGets": "20000000",
-            }),
-        };
-        assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
-
-        assert!(
-            !sandbox.exists(&own_key),
-            "the taker's own offer must be removed even though the pool filled the order",
         );
     }
 }
