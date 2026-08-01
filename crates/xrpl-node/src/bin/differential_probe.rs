@@ -408,6 +408,41 @@ fn native_read_keys(txj: &Value) -> Vec<String> {
         if let Some(d) = dest {
             keys.push(hex::encode_upper(keylet::owner_dir_key(&d).0));
         }
+        // PATH HOPS. We hydrated only the Amount and SendMax currencies, never
+        // the intermediate ones named in `Paths` — so a payment that ripples
+        // through a third currency saw no trust line for that hop, ran
+        // trustCreate for a line that already exists, and invented a directory
+        // page to hold it.
+        //
+        // #105831615 D58D4A73BA32 pays itself PHNIX from XRP via a BTC hop
+        // (rBitcoiN). Mainnet's 6 nodes are ALL Modified — no CreatedNode at
+        // all — while we Created 26F61E51, a DirectoryNode whose single entry
+        // is the sender's existing BTC line 506D09E5. The same phantom key
+        // turned up in four payments across three ledgers, which is what marked
+        // it as a harness gap rather than engine arithmetic.
+        if let Some(paths) = txj.get("Paths").and_then(|v| v.as_array()) {
+            for path in paths.iter().filter_map(|p| p.as_array()) {
+                for step in path {
+                    let Some(iss) = step
+                        .get("issuer")
+                        .and_then(|v| v.as_str())
+                        .and_then(decode_issuer)
+                    else { continue };
+                    keys.push(hex::encode_upper(keylet::owner_dir_key(&iss).0));
+                    let Some(cur) = step.get("currency").and_then(|v| v.as_str()) else { continue };
+                    let c = currency_code(cur);
+                    // The hop can be held by either end of the payment, and by
+                    // an account the step names outright.
+                    for who in [acct, dest, step.get("account").and_then(|v| v.as_str()).and_then(decode_address)]
+                        .into_iter()
+                        .flatten()
+                    {
+                        keys.push(hex::encode_upper(keylet::ripple_state_key(&who, &iss, &c).0));
+                        keys.push(hex::encode_upper(keylet::owner_dir_key(&who).0));
+                    }
+                }
+            }
+        }
     }
     if txj["TransactionType"].as_str() == Some("TicketCreate") {
         if let Some(acct) = txj["Account"].as_str().and_then(decode_address) {
