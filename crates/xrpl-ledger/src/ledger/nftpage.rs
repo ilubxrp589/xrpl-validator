@@ -97,6 +97,125 @@ pub fn find_page(sandbox: &Sandbox, owner: &[u8; 20], id: &Hash256) -> Option<Ha
 /// Insert a token entry (`{"NFToken": {"NFTokenID": …, "URI"?: …}}`) into the
 /// owner's pages, keeping NFTokens sorted by id. Returns true if a fresh page
 /// was created (the caller owes an OwnerCount bump).
+/// rippled `compareTokens`: order by the LOW 96 BITS first, and only fall back
+/// to the whole 256-bit ID when those tie. Pages are keyed on the low 96 bits,
+/// so this is what keeps "equivalent" tokens adjacent — plain whole-ID ordering
+/// would interleave them and break the split rule below.
+fn compare_tokens(a: &Hash256, b: &Hash256) -> std::cmp::Ordering {
+    low96(a).cmp(&low96(b)).then_with(|| a.0.cmp(&b.0))
+}
+
+fn entry_hash(entry: &serde_json::Value) -> Option<Hash256> {
+    let b = hex::decode(entry_id(entry)).ok()?;
+    <[u8; 32]>::try_from(b.as_slice()).ok().map(Hash256)
+}
+
+/// 256-bit increment — rippled's `uint256::next()`.
+fn next_id(id: &Hash256) -> Hash256 {
+    let mut out = id.0;
+    for byte in out.iter_mut().rev() {
+        let (v, carry) = byte.overflowing_add(1);
+        *byte = v;
+        if !carry {
+            break;
+        }
+    }
+    Hash256(out)
+}
+
+/// Split a FULL page and place `entry`, mirroring rippled `getPageForToken`.
+///
+/// The first part of the page moves to a NEW page keyed below it; the remainder
+/// stays. The split point is NOT the midpoint: it rounds forward past any run
+/// of tokens sharing the middle token's low-96 bits, because "all equivalent
+/// NFTs must be kept on the same page", so the split may be lopsided.
+///
+/// Returns true when a page was created (the caller owes OwnerCount +1).
+fn split_and_insert(
+    sandbox: &mut Sandbox,
+    owner: &[u8; 20],
+    cp_key: &Hash256,
+    cp: &mut serde_json::Value,
+    entry: serde_json::Value,
+    id: &Hash256,
+) -> bool {
+    let mut narr: Vec<serde_json::Value> =
+        cp["NFTokens"].as_array().cloned().unwrap_or_default();
+    if narr.len() != PAGE_MAX {
+        return false;
+    }
+    let half = PAGE_MAX / 2;
+    let Some(mid) = entry_hash(&narr[half - 1]) else { return false };
+    let cmp = low96(&mid);
+
+    // First entry at or past the midpoint whose low-96 differs from cmp.
+    let mut split = narr[half..]
+        .iter()
+        .position(|o| entry_hash(o).map(|h| low96(&h) != cmp).unwrap_or(true))
+        .map(|i| i + half);
+    // All equivalent from the middle onwards — look from the front instead.
+    if split.is_none() {
+        split = narr
+            .iter()
+            .position(|o| entry_hash(o).map(|h| low96(&h) == cmp).unwrap_or(false));
+    }
+    let Some(mut split) = split else { return false };
+
+    if split == 0 {
+        // The whole page is one equivalence class.
+        match low96(id).cmp(&cmp) {
+            std::cmp::Ordering::Equal => return false, // cannot be stored
+            std::cmp::Ordering::Greater => split = narr.len(), // keep all, new token goes alone
+            std::cmp::Ordering::Less => {}             // move all, new token goes alone
+        }
+    }
+
+    let carr: Vec<serde_json::Value> = narr.split_off(split);
+
+    // "The low 96-bits of an NFT ID must be strictly less than the low 96-bits
+    // of the enclosing page's index", so a full lower half is keyed one above
+    // its largest token.
+    let token_for_new_page = if narr.len() == PAGE_MAX {
+        let Some(last) = entry_hash(&narr[PAGE_MAX - 1]) else { return false };
+        next_id(&last)
+    } else {
+        let Some(first) = carr.first().and_then(entry_hash) else { return false };
+        first
+    };
+    let np_key = page_key(owner, &low96(&token_for_new_page));
+
+    let mut np = serde_json::json!({
+        "LedgerEntryType": "NFTokenPage",
+        "Flags": 0,
+        "NFTokens": narr,
+        "NextPageMin": hex::encode_upper(cp_key.0),
+    });
+    if let Some(ppm) = parse_page_ref(cp.get("PreviousPageMin")) {
+        np["PreviousPageMin"] = serde_json::json!(hex::encode_upper(ppm.0));
+        if let Some(mut p3) = read_page(sandbox, &ppm) {
+            p3["NextPageMin"] = serde_json::json!(hex::encode_upper(np_key.0));
+            sandbox.write(ppm, serde_json::to_vec(&p3).unwrap_or_default());
+        }
+    }
+    cp["NFTokens"] = serde_json::Value::Array(carr);
+    cp["PreviousPageMin"] = serde_json::json!(hex::encode_upper(np_key.0));
+
+    // The new token lands in whichever page now covers its key.
+    let target_is_new = page_key(owner, &low96(id)).0 < np_key.0;
+    let sink: &mut serde_json::Value = if target_is_new { &mut np } else { &mut *cp };
+    if let Some(arr) = sink.get_mut("NFTokens").and_then(|v| v.as_array_mut()) {
+        arr.push(entry);
+        arr.sort_by(|x, y| match (entry_hash(x), entry_hash(y)) {
+            (Some(a), Some(b)) => compare_tokens(&a, &b),
+            _ => std::cmp::Ordering::Equal,
+        });
+    }
+
+    sandbox.write(np_key, serde_json::to_vec(&np).unwrap_or_default());
+    sandbox.write(*cp_key, serde_json::to_vec(cp).unwrap_or_default());
+    true
+}
+
 pub fn page_insert(sandbox: &mut Sandbox, owner: &[u8; 20], entry: serde_json::Value) -> bool {
     let id_hex = entry_id(&entry);
     let Ok(idb) = hex::decode(&id_hex) else { return false };
@@ -112,10 +231,22 @@ pub fn page_insert(sandbox: &mut Sandbox, owner: &[u8; 20], entry: serde_json::V
             let arr = page
                 .get_mut("NFTokens")
                 .and_then(|v| v.as_array_mut());
+            let full = arr.as_ref().map(|a| a.len() >= PAGE_MAX).unwrap_or(false);
+            if full {
+                // rippled getPageForToken: a full page is SPLIT before the
+                // insert. #105818293 012140AAC3A0 mints into rKqqb5QZ's full
+                // page, so mainnet Creates a new page and Modifies the
+                // predecessor's link — 10 nodes to our 8, and we quietly grew
+                // the page to 33 tokens.
+                return split_and_insert(sandbox, owner, &pk, &mut page, entry, &id);
+            }
             if let Some(arr) = arr {
                 let pos = arr
                     .iter()
-                    .position(|e| entry_id(e) > id_hex)
+                    .position(|e| match entry_hash(e) {
+                        Some(h) => compare_tokens(&h, &id) == std::cmp::Ordering::Greater,
+                        None => false,
+                    })
                     .unwrap_or(arr.len());
                 arr.insert(pos, entry);
                 sandbox.write(pk, serde_json::to_vec(&page).unwrap_or_default());
@@ -386,6 +517,51 @@ mod tests {
             survivor.get("PreviousPageMin").is_none(),
             "p1 had no previous, so p2's link is dropped",
         );
+    }
+
+    /// A FULL page is SPLIT before an insert — rippled `getPageForToken`. The
+    /// first part moves to a NEW page keyed below it; the rest stays put, and
+    /// the predecessor's NextPageMin is relinked.
+    ///
+    /// #105818293 012140AAC3A0 mints into rKqqb5QZ's full page: mainnet Creates
+    /// a page and Modifies the neighbour (10 nodes to our 8) while we silently
+    /// grew the page to 33 tokens — over kDirMaxTokensPerPage.
+    #[test]
+    fn a_full_page_splits_on_insert() {
+        let owner = [0x03u8; 20];
+        let max_key = max_page_key(&owner);
+
+        // 32 tokens with DISTINCT low-96 bits, so the split lands mid-page.
+        let full: Vec<serde_json::Value> = (0..PAGE_MAX as u8).map(|n| tok(n + 1, 0)).collect();
+        let page = serde_json::json!({
+            "LedgerEntryType": "NFTokenPage",
+            "NFTokens": full,
+        });
+        let mut state = empty_state();
+        state.state_map.insert(max_key, serde_json::to_vec(&page).unwrap()).unwrap();
+
+        let mut sb = Sandbox::new(&state);
+        // Low-96 above every existing token, so it belongs in the surviving page.
+        let created = page_insert(&mut sb, &owner, tok(0xF0, 0));
+        assert!(created, "a split creates a page, so the caller owes OwnerCount +1");
+
+        let survivor: serde_json::Value =
+            serde_json::from_slice(&sb.read(&max_key).expect("max page survives")).unwrap();
+        let np_key = parse_page_ref(survivor.get("PreviousPageMin"))
+            .expect("the survivor points back at the new page");
+        let np: serde_json::Value =
+            serde_json::from_slice(&sb.read(&np_key).expect("new page exists")).unwrap();
+
+        let n_new = np["NFTokens"].as_array().unwrap().len();
+        let n_old = survivor["NFTokens"].as_array().unwrap().len();
+        assert_eq!(n_new + n_old, PAGE_MAX + 1, "all 33 tokens are still held");
+        assert!(n_new <= PAGE_MAX && n_old <= PAGE_MAX, "neither page exceeds the limit");
+        assert_eq!(
+            parse_page_ref(np.get("NextPageMin")),
+            Some(max_key),
+            "the new page links forward to the page it split from",
+        );
+        assert!(np_key.0 < max_key.0, "the new page is keyed BELOW the one it split from");
     }
 
     /// The mirror: when the pages would not fit together, nothing merges.
