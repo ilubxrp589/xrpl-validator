@@ -274,6 +274,50 @@ pub(crate) fn signed_value(v: &serde_json::Value) -> (bool, Me) {
     (neg && me.0 > 0, me)
 }
 
+/// Signed add with rippled's STAmount alignment.
+///
+/// `STAmount operator+` brings both operands to the LARGER exponent by integer
+/// division:
+///     while (ov1 < ov2) { vv1 /= 10; ++ov1; }
+///     while (ov2 < ov1) { vv2 /= 10; ++ov2; }
+/// so an addend too small to affect the other simply becomes ZERO and the
+/// balance is unchanged. `signed_add` aligns to the SMALLER exponent instead,
+/// keeping precision u128 can hold but a real IOU cannot.
+///
+/// #105840045 3F942A682131 pays 0.000001 ZERPS between accounts holding
+/// 137,330,862,022.1269 and 254,893,727,053.43. rippled truncates the addend to
+/// zero, both balances are untouched, and its meta is ONE node — the sender's
+/// AccountRoot for the fee — still tesSUCCESS. We moved the value and invented
+/// two Modified nodes.
+pub(crate) fn stamount_signed_add(aneg: bool, a: Me, bneg: bool, b: Me) -> (bool, Me) {
+    if b.0 == 0 {
+        return (aneg, a);
+    }
+    if a.0 == 0 {
+        return (bneg, b);
+    }
+    // Canonicalise to STAmount's 16-digit mantissa BEFORE aligning. rippled
+    // keeps every IOU in that form, so its exponent is always tied to the
+    // magnitude; our Me can hold un-normalised pairs like (1, 6), and aligning
+    // to such an exponent would truncate precision rippled retains. Skipping
+    // this step zeroed legitimate movements: batch2 #105933892 D0BDF094CE78
+    // went from clean to missing a Modified line, and #105949459 from 1
+    // divergence to 3.
+    let a = norm16(a);
+    let b = norm16(b);
+    let e = a.1.max(b.1);
+    let a2: Me = (me_rescale(a, e, false), e);
+    let b2: Me = (me_rescale(b, e, false), e);
+    if aneg == bneg {
+        return (aneg, (a2.0 + b2.0, e));
+    }
+    match me_cmp(a2, b2) {
+        std::cmp::Ordering::Equal => (false, (0, 0)),
+        std::cmp::Ordering::Greater => (aneg, me_sub(a2, b2)),
+        std::cmp::Ordering::Less => (bneg, me_sub(b2, a2)),
+    }
+}
+
 pub(crate) fn signed_add(aneg: bool, a: Me, bneg: bool, b: Me) -> (bool, Me) {
     if aneg == bneg {
         let e = a.1.min(b.1);
@@ -423,16 +467,37 @@ pub(crate) fn line_adjust(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, am
     const LOW_FREEZE: u64 = 0x0040_0000;
     const HIGH_FREEZE: u64 = 0x0080_0000;
     if let Some(mut line) = json_at(sandbox, &lkey) {
+        // Snapshot so an arithmetically-inert update writes NOTHING. IOU values
+        // carry ~16 significant digits, so adding a tiny amount to a large
+        // balance rounds straight back to the stored mantissa — rippled then
+        // emits no node for that line at all.
+        //
+        // #105840045 3F942A682131 pays 0.000001 ZERPS between accounts holding
+        // 137,330,862,022.1269 and 254,893,727,053.43. Neither balance can
+        // represent the change, so mainnet's meta is ONE node — the sender's
+        // AccountRoot for the fee — and the result is still tesSUCCESS. We
+        // wrote both lines and invented two Modified nodes (3C38BC1E, AEFF2748).
+        let line_before = line.clone();
         let (lneg, lbal) = signed_value(&line["Balance"]);
+        // Compare the balance NUMERICALLY, not as JSON text: mainnet serialises
+        // this line as "1373308620221269e-4" while me_to_value_string writes
+        // "137330862022.1269". Same value, different string — a text comparison
+        // would call every inert update a change.
+        let balance_before = (lneg && lbal.0 > 0, lbal);
         // party's holding: low holds when balance positive, high when negative
         let (hneg, h) = if party_low { (lneg, lbal) } else { (!lneg && lbal.0 > 0, lbal) };
         let hneg = if party_low { lneg } else { !lneg && lbal.0 > 0 };
         let _ = (hneg, h);
         let (pneg, pmag) = if party_low { (lneg, lbal) } else { (!lneg, lbal) };
-        let (nneg, nmag) = signed_add(pneg && pmag.0 > 0, pmag, !receiving, amt);
+        let (nneg, nmag) = stamount_signed_add(pneg && pmag.0 > 0, pmag, !receiving, amt);
         let (wneg, wmag) = if party_low { (nneg, nmag) } else { (!nneg, nmag) };
         let sign = if wneg && wmag.0 > 0 { "-" } else { "" };
-        line["Balance"]["value"] = serde_json::Value::String(format!("{}{}", sign, me_to_value_string(wmag)));
+        let moved = (wneg && wmag.0 > 0) != (lneg && lbal.0 > 0)
+            || me_cmp(wmag, lbal) != std::cmp::Ordering::Equal;
+        if moved {
+            line["Balance"]["value"] =
+                serde_json::Value::String(format!("{}{}", sign, me_to_value_string(wmag)));
+        }
 
         // rippled rippleCreditIOU: a line the SENDER just spent from positive
         // down to zero-or-below reverts to its default state — release their
@@ -504,7 +569,12 @@ pub(crate) fn line_adjust(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, am
                 }
             }
         }
-        put_json(sandbox, lkey, &line);
+        let balance_after = (wneg && wmag.0 > 0, wmag);
+        let balance_moved = balance_after.0 != balance_before.0
+            || me_cmp(balance_after.1, balance_before.1) != std::cmp::Ordering::Equal;
+        if balance_moved || line != line_before {
+            put_json(sandbox, lkey, &line);
+        }
     } else if receiving {
         let (lo, hi) = if party_low { (party, &leg.issuer) } else { (&leg.issuer, party) };
         let bal_neg = !party_low; // holding sits on the party's side
@@ -3899,5 +3969,58 @@ mod tests {
             recv(&st).is_none_or(|r| r.0 > 0),
             "no RequireAuth on the issuer means no auth gate",
         );
+    }
+
+    /// An arithmetically-inert IOU move writes NOTHING. Values carry ~16
+    /// significant digits, so adding a tiny amount to a large balance rounds
+    /// back to the stored mantissa — and rippled emits no node for that line.
+    ///
+    /// #105840045 3F942A682131 pays 0.000001 ZERPS between accounts holding
+    /// 137,330,862,022.1269 and 254,893,727,053.43. Neither can represent the
+    /// change, so mainnet's meta is ONE node — the sender's AccountRoot for the
+    /// fee — and the result is still tesSUCCESS. We wrote both lines and
+    /// invented two Modified nodes.
+    #[test]
+    fn an_inert_iou_move_writes_no_node() {
+        let party = [0x01u8; 20];
+        let issuer = [0x02u8; 20];
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+        let leg = Leg { xrp: false, cur, issuer };
+
+        let party_low = party < issuer;
+        let (lo, hi) = if party_low { (party, issuer) } else { (issuer, party) };
+        let big = "137330862022.1269";
+        let mut state = make_state_with_account(&party, 100_000_000);
+        let iss = serde_json::json!({
+            "LedgerEntryType": "AccountRoot", "Account": hex::encode(issuer),
+            "Balance": "100000000", "Sequence": 1, "OwnerCount": 0,
+        });
+        state.state_map.insert(keylet::account_root_key(&issuer), serde_json::to_vec(&iss).unwrap()).unwrap();
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+            "Balance": {"currency": hex::encode_upper(cur),
+                        "issuer": "0000000000000000000000000000000000000000",
+                        "value": if party_low { big.to_string() } else { format!("-{big}") }},
+            "LowLimit":  {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000000000000"},
+            "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000000000000"},
+        });
+        let lkey = keylet::ripple_state_key(&party, &issuer, &cur);
+        state.state_map.insert(lkey, serde_json::to_vec(&line).unwrap()).unwrap();
+
+        // Spend 0.000001 — 18 significant digits away, so it cannot land.
+        let mut sandbox = Sandbox::new(&state);
+        line_adjust(&mut sandbox, &party, &leg, (1_000_000_000_000_000, -21), false);
+        let mods = sandbox.into_modifications();
+        assert!(
+            !mods.contains_key(&lkey),
+            "a balance that cannot change must not be written at all",
+        );
+
+        // Control: a move the balance CAN represent still writes.
+        let mut sandbox = Sandbox::new(&state);
+        line_adjust(&mut sandbox, &party, &leg, (1_000_000_000_000_000, -12), false);
+        let mods = sandbox.into_modifications();
+        assert!(mods.contains_key(&lkey), "a representable move still writes");
     }
 }
