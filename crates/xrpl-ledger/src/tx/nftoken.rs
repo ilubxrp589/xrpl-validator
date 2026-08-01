@@ -360,7 +360,9 @@ impl Transactor for NFTokenBurnTransactor {
         let Some(removal) = nftpage::page_remove(sandbox, &owner, &id) else {
             return TxResult::NoEntry;
         };
-        if removal.page_deleted {
+        // Each page that disappears — emptied or consolidated away — releases
+        // one reserve (rippled adjustOwnerCount by the merge count).
+        for _ in 0..(u32::from(removal.page_deleted) + removal.pages_merged) {
             decrement_owner_count(&owner, sandbox);
         }
 
@@ -553,7 +555,7 @@ fn transfer_token(
     let Some(removal) = nftpage::page_remove(sandbox, seller, nft_id) else {
         return TxResult::NoEntry;
     };
-    if removal.page_deleted {
+    for _ in 0..(u32::from(removal.page_deleted) + removal.pages_merged) {
         decrement_owner_count(seller, sandbox);
     }
     if nftpage::page_insert(sandbox, buyer, removal.entry) {

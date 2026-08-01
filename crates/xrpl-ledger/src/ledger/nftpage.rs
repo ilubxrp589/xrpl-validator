@@ -137,11 +137,66 @@ pub fn page_insert(sandbox: &mut Sandbox, owner: &[u8; 20], entry: serde_json::V
 }
 
 /// Result of removing a token from an owner's pages.
+/// Merge NFToken page `p1` into `p2` when their tokens fit in one page.
+///
+/// rippled `mergePages` (NFTokenHelpers.cpp): requires `p1 < p2`, `p1.next ==
+/// p2` and `p2.prev == p1`. Returns false — no merge — when
+/// `p1.len + p2.len > kDirMaxTokensPerPage`, "since it only makes sense to do
+/// this if it would mean that one of them can be deleted as a result". The
+/// SURVIVOR is p2: the merged token list is written there, p1's predecessor is
+/// relinked to p2, and p1 is erased.
+fn merge_pages(sandbox: &mut Sandbox, p1_key: &Hash256, p2_key: &Hash256) -> bool {
+    if p1_key.0 >= p2_key.0 {
+        return false;
+    }
+    let (Some(p1), Some(mut p2)) = (read_page(sandbox, p1_key), read_page(sandbox, p2_key)) else {
+        return false;
+    };
+    // Links must agree, exactly as rippled asserts before merging.
+    if parse_page_ref(p1.get("NextPageMin")) != Some(*p2_key)
+        || parse_page_ref(p2.get("PreviousPageMin")) != Some(*p1_key)
+    {
+        return false;
+    }
+    let empty: Vec<serde_json::Value> = Vec::new();
+    let a1 = p1["NFTokens"].as_array().cloned().unwrap_or_else(|| empty.clone());
+    let a2 = p2["NFTokens"].as_array().cloned().unwrap_or(empty);
+    if a1.len() + a2.len() > PAGE_MAX {
+        return false;
+    }
+    let mut merged: Vec<serde_json::Value> = a1.into_iter().chain(a2).collect();
+    // Pages keep their tokens ordered by NFTokenID; hex is fixed width and
+    // uppercase, so lexicographic order is byte order.
+    merged.sort_by(|x, y| entry_id(x).cmp(&entry_id(y)));
+    p2["NFTokens"] = serde_json::Value::Array(merged);
+
+    // Relink: p2 inherits p1's previous, and that page points at p2.
+    match parse_page_ref(p1.get("PreviousPageMin")) {
+        Some(p0k) => {
+            p2["PreviousPageMin"] = serde_json::json!(hex::encode_upper(p0k.0));
+            if let Some(mut p0) = read_page(sandbox, &p0k) {
+                p0["NextPageMin"] = serde_json::json!(hex::encode_upper(p2_key.0));
+                sandbox.write(p0k, serde_json::to_vec(&p0).unwrap_or_default());
+            }
+        }
+        None => {
+            if let Some(o) = p2.as_object_mut() {
+                o.remove("PreviousPageMin");
+            }
+        }
+    }
+    sandbox.write(*p2_key, serde_json::to_vec(&p2).unwrap_or_default());
+    sandbox.delete(*p1_key);
+    true
+}
+
 pub struct PageRemoval {
     /// The removed entry, URI and all — reinsert it to transfer the token.
     pub entry: serde_json::Value,
     /// True if the page emptied and was deleted (caller owes OwnerCount -1).
     pub page_deleted: bool,
+    /// Pages consolidated away after the removal (caller owes OwnerCount -N).
+    pub pages_merged: u32,
 }
 
 /// Remove the token `id` from the owner's pages, searching the chain by
@@ -172,7 +227,29 @@ pub fn page_remove(sandbox: &mut Sandbox, owner: &[u8; 20], id: &Hash256) -> Opt
         let empty = page["NFTokens"].as_array().map(|a| a.is_empty()).unwrap_or(true);
         if !empty {
             sandbox.write(cur, serde_json::to_vec(&page).unwrap_or_default());
-            return Some(PageRemoval { entry: removed, page_deleted: false });
+            // A page that merely SHRANK still has to be consolidated with its
+            // neighbours — rippled removeToken: "The current page isn't empty.
+            // Update it and then try to consolidate pages. Note that this
+            // consolidation attempt may actually merge three pages into one!"
+            //
+            // #105952436 41292DD9E9B4: the seller's chain is 228A/233D/243B and
+            // the sold token lived in 243B. Losing it let 233D merge into 243B,
+            // so mainnet Deletes 233D and Modifies 228A (relinked) — 9 nodes to
+            // our 7. We removed the token and stopped.
+            let prev = parse_page_ref(page.get("PreviousPageMin"));
+            let next = parse_page_ref(page.get("NextPageMin"));
+            let mut pages_merged = 0u32;
+            if let Some(pk) = prev {
+                if merge_pages(sandbox, &pk, &cur) {
+                    pages_merged += 1;
+                }
+            }
+            if let Some(nk) = next {
+                if merge_pages(sandbox, &cur, &nk) {
+                    pages_merged += 1;
+                }
+            }
+            return Some(PageRemoval { entry: removed, page_deleted: false, pages_merged });
         }
         // Page emptied — delete it and relink neighbours.
         let prev = parse_page_ref(page.get("PreviousPageMin"));
@@ -200,7 +277,7 @@ pub fn page_remove(sandbox: &mut Sandbox, owner: &[u8; 20], id: &Hash256) -> Opt
                 sandbox.write(nk, serde_json::to_vec(&np).unwrap_or_default());
             }
         }
-        return Some(PageRemoval { entry: removed, page_deleted: true });
+        return Some(PageRemoval { entry: removed, page_deleted: true, pages_merged: 0 });
     }
     None
 }
@@ -226,4 +303,120 @@ pub fn locate_token(
         cur = parse_page_ref(page.get("PreviousPageMin"))?;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ledger::header::LedgerHeader;
+    use crate::ledger::state::LedgerState;
+
+    fn empty_state() -> LedgerState {
+        LedgerState::new_unverified(LedgerHeader {
+            sequence: 100,
+            total_coins: 100_000_000_000_000_000,
+            parent_hash: Hash256([0; 32]),
+            transaction_hash: Hash256([0; 32]),
+            account_hash: Hash256([0; 32]),
+            parent_close_time: 0,
+            close_time: 10,
+            close_time_resolution: 10,
+            close_flags: 0,
+        })
+    }
+
+    /// Token whose low-96 bits are `lo` repeated — keeps ordering obvious.
+    fn tok(lo: u8, n: u8) -> serde_json::Value {
+        let mut id = [0u8; 32];
+        id[20] = lo;
+        id[31] = n;
+        serde_json::json!({ "NFToken": { "NFTokenID": hex::encode_upper(id) } })
+    }
+
+    /// A page that merely SHRANK is still consolidated with its neighbours.
+    /// rippled removeToken: "The current page isn't empty. Update it and then
+    /// try to consolidate pages." mergePages refuses when the two together
+    /// exceed kDirMaxTokensPerPage, "since it only makes sense to do this if it
+    /// would mean that one of them can be deleted as a result".
+    ///
+    /// #105952436 41292DD9E9B4: the seller's chain is 228A/233D/243B and the
+    /// sold token lived in 243B. Losing it let 233D merge into 243B, so mainnet
+    /// Deletes 233D and Modifies 228A — 9 nodes to our 7.
+    #[test]
+    fn a_shrunken_page_consolidates_with_its_neighbour() {
+        let owner = [0x01u8; 20];
+        let p1_key = page_key(&owner, &[0x50u8; 12]);
+        let p2_key = max_page_key(&owner);
+
+        // 5 + 28 = 33 > 32, so no merge is possible yet.
+        let p1 = serde_json::json!({
+            "LedgerEntryType": "NFTokenPage",
+            "NFTokens": (0..5).map(|n| tok(0x10, n)).collect::<Vec<_>>(),
+            "NextPageMin": hex::encode_upper(p2_key.0),
+        });
+        let p2 = serde_json::json!({
+            "LedgerEntryType": "NFTokenPage",
+            "NFTokens": (0..28).map(|n| tok(0x90, n)).collect::<Vec<_>>(),
+            "PreviousPageMin": hex::encode_upper(p1_key.0),
+        });
+        let mut state = empty_state();
+        state.state_map.insert(p1_key, serde_json::to_vec(&p1).unwrap()).unwrap();
+        state.state_map.insert(p2_key, serde_json::to_vec(&p2).unwrap()).unwrap();
+
+        // Remove one token from p2: 5 + 27 = 32, exactly the limit, so p1 folds
+        // into p2 and is erased.
+        let mut sb = Sandbox::new(&state);
+        let victim = tok(0x90, 3);
+        let vid = victim["NFToken"]["NFTokenID"].as_str().unwrap();
+        let id = Hash256(<[u8; 32]>::try_from(hex::decode(vid).unwrap().as_slice()).unwrap());
+
+        let removal = page_remove(&mut sb, &owner, &id).expect("token removed");
+        assert!(!removal.page_deleted, "p2 still holds tokens");
+        assert_eq!(removal.pages_merged, 1, "p1 must be consolidated away");
+        assert!(!sb.exists(&p1_key), "the merged-away page is erased");
+
+        let survivor: serde_json::Value =
+            serde_json::from_slice(&sb.read(&p2_key).expect("p2 survives")).unwrap();
+        assert_eq!(
+            survivor["NFTokens"].as_array().map(|a| a.len()),
+            Some(32),
+            "p2 carries both pages' tokens",
+        );
+        assert!(
+            survivor.get("PreviousPageMin").is_none(),
+            "p1 had no previous, so p2's link is dropped",
+        );
+    }
+
+    /// The mirror: when the pages would not fit together, nothing merges.
+    #[test]
+    fn pages_that_do_not_fit_are_left_alone() {
+        let owner = [0x02u8; 20];
+        let p1_key = page_key(&owner, &[0x50u8; 12]);
+        let p2_key = max_page_key(&owner);
+
+        // 6 + 28 = 34; removing one leaves 33, still over the 32 limit.
+        let p1 = serde_json::json!({
+            "LedgerEntryType": "NFTokenPage",
+            "NFTokens": (0..6).map(|n| tok(0x10, n)).collect::<Vec<_>>(),
+            "NextPageMin": hex::encode_upper(p2_key.0),
+        });
+        let p2 = serde_json::json!({
+            "LedgerEntryType": "NFTokenPage",
+            "NFTokens": (0..28).map(|n| tok(0x90, n)).collect::<Vec<_>>(),
+            "PreviousPageMin": hex::encode_upper(p1_key.0),
+        });
+        let mut state = empty_state();
+        state.state_map.insert(p1_key, serde_json::to_vec(&p1).unwrap()).unwrap();
+        state.state_map.insert(p2_key, serde_json::to_vec(&p2).unwrap()).unwrap();
+
+        let mut sb = Sandbox::new(&state);
+        let victim = tok(0x90, 3);
+        let vid = victim["NFToken"]["NFTokenID"].as_str().unwrap();
+        let id = Hash256(<[u8; 32]>::try_from(hex::decode(vid).unwrap().as_slice()).unwrap());
+
+        let removal = page_remove(&mut sb, &owner, &id).expect("token removed");
+        assert_eq!(removal.pages_merged, 0, "33 tokens do not fit in one page");
+        assert!(sb.exists(&p1_key), "both pages survive");
+    }
 }
