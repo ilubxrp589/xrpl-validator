@@ -691,7 +691,7 @@ impl PaymentTransactor {
                 let want_cap = if last { want_gross } else { (9_990_000_000_000_000, 60) };
                 let (rw, _rs, _c) = ox::cross_engine_to(
                     &tx.account, benef, want_cap, carry, chain[i + 1], chain[i],
-                    threshold, !last, false, None, sandbox, &mut Vec::new(),
+                    threshold, threshold, !last, false, None, sandbox, &mut Vec::new(),
                 );
                 carry = ox::me_sub(want_cap, rw);
                 if ox::me_is_zero(carry) {
@@ -707,7 +707,7 @@ impl PaymentTransactor {
             carry
         } else {
             let (rem_want, _rem_spend, _crossed) = ox::cross_engine_to(
-                &tx.account, dest, want_gross, spend0, &want_leg, &spend_leg, threshold, false,
+                &tx.account, dest, want_gross, spend0, &want_leg, &spend_leg, threshold, threshold, false,
                 false, None, sandbox, &mut Vec::new(),
             );
             ox::me_sub(want_gross, rem_want)

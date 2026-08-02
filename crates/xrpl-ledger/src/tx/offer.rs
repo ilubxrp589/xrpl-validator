@@ -658,6 +658,18 @@ pub(crate) fn delete_maker_offer(
 /// The issuer-published TickSize governing a pair: the smaller of the two
 /// issuers' TickSize fields (XRP has none). 16 means "no tick rounding"
 /// (rippled's Quality::maxTickSize).
+/// The issuer's TransferRate, QUALITY_ONE-relative (1e9 = no fee). `None` for
+/// XRP, for an issuer that charges nothing, or when the issuer account is not
+/// hydrated.
+pub(crate) fn transfer_rate(sandbox: &Sandbox, leg: &Leg) -> Option<u64> {
+    if leg.xrp {
+        return None;
+    }
+    let acct = json_at(sandbox, &keylet::account_root_key(&leg.issuer))?;
+    let rate = acct.get("TransferRate")?.as_u64()?;
+    (rate > 1_000_000_000).then_some(rate)
+}
+
 pub(crate) fn tick_size_for(sandbox: &Sandbox, a: &Leg, b: &Leg) -> u32 {
     let mut ts = 16u32;
     for leg in [a, b] {
@@ -1233,6 +1245,58 @@ fn settle_fill(
 /// Reaching here means two strands, i.e. rippled's `AMMContext::multiPath` is
 /// true, which is why the pool competes with Fibonacci slices below.
 #[allow(clippy::too_many_arguments)]
+/// Delete the taker's OWN offers off the tip of the book instead of crossing
+/// them — rippled `limitSelfCrossQuality`, BookStep.cpp:415-455, whose own
+/// commentary explains the choice: "We could skip over the self offer in the
+/// book and only cross offers that are not our own. This would make a lot of
+/// sense, but we don't do it. Part of the rationale is that we can only operate
+/// on the tip of the order book. We can't leave an offer behind -- it would sit
+/// on the tip and block access to other offers." Removal is unconditional on
+/// any fill: "Remove this offer even if no crossing occurs."
+///
+/// Three conditions, all required (BookStep.cpp:443):
+///   a. `defaultPath_` — the DIRECT strand only, never the autobridged one;
+///   b. `offer.quality() >= qualityThreshold_` — inside the taker's limit;
+///   c. `strandSrc == strandDst == offer.owner()` — offer crossing, and ours.
+///
+/// (b) is the condition both earlier attempts at this omitted, and it is doing
+/// real work: it is met here only because the taker's limit is priced off the
+/// transfer-rate-inflated `sendMax`. At rate 1.0 nothing qualifies.
+///
+/// The check lives in `execOffer`, which `forEachOffer` reaches only when
+/// `tryAMM` did NOT exhaust the strand (BookStep.cpp:855-865 — `if
+/// (tryAMM(offers.tip().quality())) { do { execOffer(offers.tip()) } while
+/// (offers.step()); }`). The pool therefore gets its turn FIRST, and an order
+/// the pool fills on its own removes nothing at all. Call sites must preserve
+/// that order.
+fn reap_self_offers_at_head(
+    sandbox: &mut Sandbox,
+    ladder: &[(u64, Hash256)],
+    start: usize,
+    taker: &[u8; 20],
+    threshold: u64,
+    stale: &mut Vec<Hash256>,
+) {
+    for &(q, okey) in ladder.iter().skip(start) {
+        if q > threshold {
+            return;
+        }
+        let Some(offer) = json_at(sandbox, &okey) else { continue };
+        if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
+            continue;
+        }
+        let Some(maker) = offer.get("Account").and_then(|v| v.as_str()).and_then(decode20)
+        else { continue };
+        // Stops at the first offer that is not ours: rippled removes only what
+        // sits AT the tip, then crosses whatever it uncovers.
+        if &maker != taker {
+            return;
+        }
+        delete_maker_offer(sandbox, &okey, &offer, &maker);
+        stale.push(okey);
+    }
+}
+
 fn cross_bridged(
     taker: &[u8; 20],
     beneficiary: &[u8; 20],
@@ -1241,6 +1305,8 @@ fn cross_bridged(
     pays_leg: &Leg,
     gets_leg: &Leg,
     threshold: u64,
+    // rippled's true `limitQuality` (transfer-rate inflated): self-cross gate only.
+    threshold_self: u64,
     sell: bool,
     inv_base: &Hash256,
     amm: &Option<crate::tx::amm_swap::Amm>,
@@ -1354,6 +1420,23 @@ fn cross_bridged(
             if done(rem_pays, rem_gets) {
                 break;
             }
+        }
+        // The DIRECT strand is always built in offer crossing — "Always invoke
+        // flow() with the default path", OfferCreate.cpp:376 — so its BookStep
+        // runs whether or not the bridge turns out to be the better source this
+        // iteration, and its `execOffer` clears our own offers off the tip
+        // before any crossing decision is taken. The peeks above skip
+        // self-offers silently, which is right for PRICING (a removed offer
+        // never trades) but leaves them sitting in the ledger.
+        //
+        // #105922825 E2EB1A413C5E: the taker's own 5767DC43 is the tip at
+        // 1898.22 RLUSD/ETH, just inside its own 1898.02 limit; the bridge won
+        // the iteration, so we priced past it and deleted nothing. Mainnet
+        // removes it and its now-empty book page and crosses no value at all.
+        // The direct walk in `cross_engine_to` already does this inline, after
+        // its own AMM turn.
+        if taker == beneficiary {
+            reap_self_offers_at_head(sandbox, &ld, di, taker, threshold_self, stale);
         }
         // Pick the better (lower pays-per-gets) source within the threshold.
         let use_direct = match (dq, bq) {
@@ -1578,6 +1661,8 @@ pub(crate) fn cross_engine_to(
     pays_leg: &Leg,
     gets_leg: &Leg,
     threshold: u64,
+    // rippled's true `limitQuality` (transfer-rate inflated): self-cross gate only.
+    threshold_self: u64,
     sell: bool,
     offer_crossing: bool,
     domain: Option<&Hash256>,
@@ -1611,8 +1696,8 @@ pub(crate) fn cross_engine_to(
     // competes inside the controller).
     if offer_crossing && !pays_leg.xrp && !gets_leg.xrp && domain.is_none() {
         if let Some(r) = cross_bridged(
-            taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell,
-            &inv_base, &amm, sandbox, stale,
+            taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, threshold_self,
+            sell, &inv_base, &amm, sandbox, stale,
         ) {
             return r;
         }
@@ -1917,6 +2002,7 @@ pub(crate) fn cross_engine(
     pays_leg: &Leg,
     gets_leg: &Leg,
     threshold: u64,
+    threshold_self: u64,
     sell: bool,
     domain: Option<&Hash256>,
     sandbox: &mut Sandbox,
@@ -1924,7 +2010,7 @@ pub(crate) fn cross_engine(
 ) -> (Me, Me, u32) {
     // FlowCross always builds both the direct and the XRP-bridged strand, so
     // offer crossing is multi-path by construction.
-    cross_engine_to(taker, taker, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell, true, domain, sandbox, stale)
+    cross_engine_to(taker, taker, rem_pays, rem_gets, pays_leg, gets_leg, threshold, threshold_self, sell, true, domain, sandbox, stale)
 }
 
 pub struct OfferCreateTransactor;
@@ -2051,7 +2137,36 @@ impl Transactor for OfferCreateTransactor {
 
         // Cross against the inverse book while the maker's rate is within the
         // taker's limit price (threshold = quality with the sides swapped).
+        //
         let mut threshold = rate_of_me(tg0, tp0).unwrap_or(0);
+        // rippled's `limitQuality` is NOT priced off TakerGets: when the gateway
+        // of the side we SPEND charges a transfer fee it takes its cut "without
+        // any special consent from the offer taker", so the input is scaled up
+        // by the rate and the limit priced off that — `sendMax =
+        // multiplyRound(takerAmount.in, gatewayXferRate, ..., /*roundUp*/ true)`
+        // then `Quality threshold{takerAmount.out, sendMax}`, OfferCreate.cpp
+        // :345-364, "Payment flow code compares quality after the transfer rate
+        // is included". A fee makes the taker's limit MORE permissive.
+        //
+        // We carry it as a SECOND value read only by the self-cross gate, not
+        // as the crossing limit. Substituting it wholesale regressed two
+        // ledgers, both by over-consuming the POOL rather than the book:
+        // #105933892 141D8C8F796B (7 muts vs mainnet's 4, three extra Modified,
+        // book `cross=false` throughout) and #105954798 6283AA245088. rippled
+        // sizes an AMM offer against `lobQuality` and gates it afterwards
+        // (BookStep.cpp:845-851, 479-486), where `amm_swap::consume` sizes
+        // AGAINST the limit it is handed — an approximation its own comment
+        // already flags as "a MODEL of the pass, not a port". Widening that
+        // input therefore buys extra pool liquidity rather than reach up the
+        // book. Feeding the book gates the inflated value is the correct next
+        // step, but it belongs with the AMM sizing work, not here.
+        let send_max = match transfer_rate(sandbox, &gets_leg) {
+            Some(r) if tx.account != gets_leg.issuer => {
+                me_muldiv(tg0, (r as u128, 0), (1_000_000_000, 0), true)
+            }
+            _ => tg0,
+        };
+        let mut threshold_self = rate_of_me(send_max, tp0).unwrap_or(0);
         // tfPassive: a passive offer crosses only STRICTLY better makers and
         // rests behind equal-quality ones instead of consuming them (rippled
         // OfferCreate.cpp:396 `++threshold`). Our rate encoding is inverted
@@ -2061,8 +2176,9 @@ impl Transactor for OfferCreateTransactor {
         // crossing. #105807256 (tfSell|tfPassive) rests where we consumed the
         // equal-priced makers (12v4); #105803327 (tfPassive) crossed too much
         // (10v8).
-        if flags & 0x0001_0000 != 0 && threshold > 0 {
-            threshold -= 1;
+        if flags & 0x0001_0000 != 0 {
+            threshold = threshold.saturating_sub(1);
+            threshold_self = threshold_self.saturating_sub(1);
         }
         // Offers the walk removes as STALE — expired, unfunded, empty or the
         // taker's own — are not part of the crossing: rippled applies its
@@ -2079,7 +2195,7 @@ impl Transactor for OfferCreateTransactor {
         let underfunded = me_cmp(avail, tg0) == std::cmp::Ordering::Less;
         let tg_cross = if underfunded { avail } else { tg0 };
         let (rem_pays, rem_gets_cross, crossed) = cross_engine(
-            &tx.account, tp0, tg_cross, &pays_leg, &gets_leg, threshold, sell, domain.as_ref(),
+            &tx.account, tp0, tg_cross, &pays_leg, &gets_leg, threshold, threshold_self, sell, domain.as_ref(),
             sandbox, &mut stale,
         );
         // Re-express the leftover against the ORIGINAL TakerGets: only the
@@ -3380,8 +3496,7 @@ mod tests {
         // Payment semantics: no limitQuality, so the pool is free to fill it all.
         let (rp, rg, _crossed) = cross_engine_to(
             &taker, &taker, (1_000_000_000_000_000, -15), (1_000_000, 0), &usd_leg, &xrp_leg,
-            u64::MAX, false, false, None, &mut sandbox, &mut stale,
-        );
+            u64::MAX, u64::MAX, false, false, None, &mut sandbox, &mut stale,);
 
         assert!(!sandbox.exists(&okey), "the expired offer must be reaped");
         assert!(stale.contains(&okey), "and reported as removed for the cancel view");
@@ -3414,8 +3529,7 @@ mod tests {
         // past the limit and the strand never runs.
         cross_engine_to(
             &taker, &taker, (1_000_000_000_000_000, -15), (1_000_000, 0), &usd_leg, &xrp_leg,
-            1, true, true, None, &mut sandbox, &mut stale,
-        );
+            1, 1, true, true, None, &mut sandbox, &mut stale,);
 
         assert!(sandbox.exists(&okey), "an unopened book must not be reaped");
         assert!(stale.is_empty());
@@ -3423,6 +3537,111 @@ mod tests {
 
     /// One book level holding two identical offers — 100 USD for 100 XRP —
     /// from two makers, funded as given, `first` resting first.
+    /// Build a book holding two offers owned by `taker` (the better one first)
+    /// and, optionally, a BETTER one owned by someone else ahead of both.
+    fn state_with_own_offers(foreign_head: bool) -> (LedgerState, [u8; 20], Vec<(u64, Hash256)>) {
+        let taker = [0x01u8; 20];
+        let other = [0x04u8; 20];
+        let issuer = [0x02u8; 20];
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+
+        let mut state = make_state_with_account(&taker, 500_000_000);
+        for id in [&other, &issuer] {
+            let a = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": hex::encode(id),
+                "Balance": "500000000", "Sequence": 1, "OwnerCount": 0,
+            });
+            state.state_map.insert(keylet::account_root_key(id), serde_json::to_vec(&a).unwrap()).unwrap();
+        }
+        for who in [&taker, &other] {
+            let (lo, hi) = if who < &issuer { (*who, issuer) } else { (issuer, *who) };
+            let line = serde_json::json!({
+                "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+                "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000",
+                            "value": if who < &issuer { "1000".to_string() } else { "-1000".to_string() }},
+                "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000000"},
+                "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000000"},
+            });
+            state.state_map.insert(keylet::ripple_state_key(who, &issuer, &cur), serde_json::to_vec(&line).unwrap()).unwrap();
+        }
+        // All on the SAME side of the book (give USD, want XRP), so none of
+        // them cross each other; a bigger TakerPays is a worse level.
+        let mut plan: Vec<([u8; 20], u32, &str)> = vec![(taker, 2, "100000000"), (taker, 3, "200000000")];
+        if foreign_head {
+            plan.insert(0, (other, 2, "50000000"));
+        }
+        let mut keys: Vec<(u64, Hash256)> = Vec::new();
+        for (who, seq, pays) in plan {
+            let mut sandbox = Sandbox::new(&state);
+            let tx = TxFields {
+                account: who, tx_type: "OfferCreate".to_string(), fee: 12, sequence: seq,
+                ticket_seq: None, last_ledger_seq: None,
+                fields: serde_json::json!({
+                    "TakerPays": pays,
+                    "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
+                }),
+            };
+            assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+            let mods = sandbox.into_modifications();
+            apply_modifications(&mut state, mods).unwrap();
+            let okey = keylet::offer_key(&who, seq);
+            let o = json_at(&Sandbox::new(&state), &okey).expect("offer written");
+            // The engine does not stamp BookDirectory into the offer it rests,
+            // so derive the level the same way it does when inserting.
+            let tp = keylet::amount_mant_exp(&o["TakerPays"]).unwrap();
+            let tg = keylet::amount_mant_exp(&o["TakerGets"]).unwrap();
+            keys.push((rate_of_me(tp, tg).unwrap(), okey));
+        }
+        keys.sort_by_key(|(q, _)| *q);
+        (state, taker, keys)
+    }
+
+    /// rippled DELETES our own offers off the book tip rather than crossing
+    /// them (BookStep.cpp:415-455) — but only those inside the taker's limit:
+    /// `offer.quality() >= qualityThreshold_`. That gate is the whole difficulty
+    /// here. Two earlier attempts removed self-offers unconditionally; each
+    /// closed #105949459 and broke #105808080, netting zero, because they also
+    /// removed offers priced outside the limit.
+    #[test]
+    fn a_self_offer_is_removed_at_the_tip_only_within_the_limit() {
+        let (state, taker, keys) = state_with_own_offers(false);
+        let mut sb = Sandbox::new(&state);
+        assert_eq!(keys.len(), 2);
+        let mut stale = Vec::new();
+
+        // Threshold admits the tip only — the second, worse level is outside it.
+        reap_self_offers_at_head(&mut sb, &keys, 0, &taker, keys[0].0, &mut stale);
+        assert!(json_at(&sb, &keys[0].1).is_none(), "the tip is ours and inside the limit: removed");
+        assert!(
+            json_at(&sb, &keys[1].1).is_some(),
+            "the next level is ours too but priced OUTSIDE the limit — rippled leaves it",
+        );
+        assert_eq!(stale, vec![keys[0].1]);
+
+        // Widen the limit to cover both and the second one goes as well.
+        let mut sb = Sandbox::new(&state);
+        let mut stale = Vec::new();
+        reap_self_offers_at_head(&mut sb, &keys, 0, &taker, keys[1].0, &mut stale);
+        assert_eq!(stale.len(), 2, "both levels inside the limit are removed");
+    }
+
+    /// Removal operates on the TIP only. A stranger's offer ahead of ours ends
+    /// the walk: rippled crosses that one normally and never reaches ours.
+    #[test]
+    fn a_foreign_offer_at_the_tip_ends_self_offer_removal() {
+        let (state, taker, keys) = state_with_own_offers(true);
+        let mut sb = Sandbox::new(&state);
+        assert_eq!(keys.len(), 3);
+        let mut stale = Vec::new();
+        // Threshold wide enough to admit every level.
+        reap_self_offers_at_head(&mut sb, &keys, 0, &taker, keys[2].0, &mut stale);
+        assert!(stale.is_empty(), "the tip belongs to someone else, so nothing is removed");
+        for (_, k) in &keys {
+            assert!(json_at(&sb, k).is_some());
+        }
+    }
+
     fn state_with_two_offers(
         first_usd: &str,
         second_usd: &str,
@@ -3504,8 +3723,7 @@ mod tests {
         // the taker's INPUT — never trimmed to the remaining output.
         let (_rp, rg, _c) = cross_engine_to(
             &taker, &taker, (1_000_000_000_000_000, -8), (10_000_000, 0), &usd_leg, &xrp_leg,
-            u64::MAX, false, false, None, &mut sandbox, &mut stale,
-        );
+            u64::MAX, u64::MAX, false, false, None, &mut sandbox, &mut stale,);
 
         assert!(me_is_zero(rg), "the 10 XRP is spent");
         assert!(sandbox.exists(&live), "the funded maker is only part-filled");
@@ -3530,8 +3748,7 @@ mod tests {
         let mut stale = Vec::new();
         cross_engine_to(
             &taker, &taker, (1_000_000_000_000_000, -8), (10_000_000, 0), &usd_leg, &xrp_leg,
-            u64::MAX, false, false, None, &mut sandbox, &mut stale,
-        );
+            u64::MAX, u64::MAX, false, false, None, &mut sandbox, &mut stale,);
 
         assert!(!sandbox.exists(&dusty), "a dust-backed offer must be reaped");
         assert!(stale.contains(&dusty));
@@ -3634,8 +3851,7 @@ mod tests {
         let mut stale = Vec::new();
         let (_rp, rg, _c) = cross_engine_to(
             &taker, &taker, (1_000_000_000_000_000, -8), (10_000_000, 0), &usd_leg, &xrp_leg,
-            u64::MAX, false, false, None, &mut sandbox, &mut stale,
-        );
+            u64::MAX, u64::MAX, false, false, None, &mut sandbox, &mut stale,);
 
         assert!(me_is_zero(rg), "the 10 XRP is spent on the first level");
         assert!(sandbox.exists(&live), "the funded maker is only part-filled");
