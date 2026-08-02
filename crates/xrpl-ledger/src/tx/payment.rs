@@ -87,6 +87,31 @@ impl PaymentTransactor {
         Some(legs)
     }
 
+    /// The account's SIGNED balance on `leg`, from its own perspective
+    /// (negative = it owes the issuer). `None` when there is nothing to read a
+    /// delta from: the account issues the currency itself, or holds no line.
+    fn leg_signed_balance(
+        sandbox: &Sandbox,
+        id: &[u8; 20],
+        leg: &crate::tx::offer::Leg,
+    ) -> Option<(bool, crate::tx::offer::Me)> {
+        use crate::tx::offer as ox;
+        if leg.xrp {
+            let a = ox::json_at(sandbox, &keylet::account_root_key(id))?;
+            let bal: u128 = a["Balance"].as_str().and_then(|s| s.parse().ok())?;
+            return Some((false, (bal, 0)));
+        }
+        if id == &leg.issuer {
+            return None;
+        }
+        let line = ox::json_at(sandbox, &keylet::ripple_state_key(id, &leg.issuer, &leg.cur))?;
+        let (neg, bal) = ox::signed_value(&line["Balance"]);
+        // Balance is written from the LOW account's perspective.
+        let party_low = id < &leg.issuer;
+        let party_holds = if party_low { !neg } else { neg };
+        Some((!party_holds, bal))
+    }
+
     /// The issuer's TransferRate, QUALITY_ONE-relative (1e9 = no fee).
     /// `None` for XRP, for an issuer that charges nothing, or when the issuer
     /// account is not hydrated.
@@ -637,6 +662,10 @@ impl PaymentTransactor {
         // sender first and forwarding would materialize an intermediate
         // trust line rippled never creates (and when the destination is the
         // issuer, the IOU is redeemed, not held).
+        if std::env::var("DX_PAY").is_ok() {
+            eprintln!("DX_PAY hops={:?} spend0={spend0:?} want_gross={want_gross:?} partial={partial}",
+                hops.as_ref().map(|h| h.iter().map(|l| if l.xrp { "XRP".to_string() } else { hex::encode_upper(&l.cur[12..15]) }).collect::<Vec<_>>()));
+        }
         let delivered = if let Some(hops) = hops.as_ref().filter(|h| !h.is_empty()) {
             let mut chain: Vec<&ox::Leg> = std::iter::once(&spend_leg)
                 .chain(hops.iter())
@@ -689,11 +718,50 @@ impl PaymentTransactor {
                 // Intermediate hops SELL the whole carry; the last hop buys
                 // up to the Amount cap.
                 let want_cap = if last { want_gross } else { (9_990_000_000_000_000, 60) };
+                // An intermediate hop has no real ceiling, and the sentinel that
+                // stands in for one CANNOT be recovered by subtraction. Rescaling
+                // (9.99e15, 60) down to a fill's exponent overflows u128 and
+                // `me_rescale` saturates, so every fill resets the running
+                // remainder to u128::MAX and erases the ones before it: the final
+                // `want_cap - rw` yields only the LAST fill's contribution, at
+                // whatever exponent that fill happened to use. No sentinel fixes
+                // this — 16 significant digits cannot represent 1e76 minus 2.3.
+                //
+                // #105912291 2AE3693EF556 is a circular tfPartialPayment,
+                // 1 XRP -> RLUSD -> DMNDBR back to self. Hop 0 returned
+                // rw = u128::MAX - 2309435512000000 at exponent -17, so the
+                // carry read as 0.0231 RLUSD where 2.309 had actually been
+                // bought — exactly 100x short. Hop 1 then delivered 71366
+                // DMNDBR against a DeliverMin of 3226580 and we failed
+                // tecPATH_PARTIAL where mainnet delivers in full.
+                //
+                // Read what the hop actually bought instead. Intermediate value
+                // rests on the account's own line for the duration (that is what
+                // `inflight` above snapshots and restores), so the delta on that
+                // line IS the carry, at its own exponent and free of any cap.
+                let out_leg = chain[i + 1];
+                let before = (!last)
+                    .then(|| Self::leg_signed_balance(sandbox, &tx.account, out_leg))
+                    .flatten();
                 let (rw, _rs, _c) = ox::cross_engine_to(
                     &tx.account, benef, want_cap, carry, chain[i + 1], chain[i],
                     threshold, threshold, !last, false, None, sandbox, &mut Vec::new(),
                 );
-                carry = ox::me_sub(want_cap, rw);
+                carry = match (before, Self::leg_signed_balance(sandbox, &tx.account, out_leg)) {
+                    (Some((bneg, b)), Some((aneg, a))) => {
+                        // delta = after - before; a fall in balance buys nothing.
+                        let (dneg, d) = ox::signed_add(aneg, a, !bneg, b);
+                        if dneg { (0, 0) } else { d }
+                    }
+                    // The account issues the hop currency (no line to read), or
+                    // this is the LAST hop, whose cap is the real `want_gross`
+                    // and small enough to subtract exactly.
+                    _ => ox::me_sub(want_cap, rw),
+                };
+                if std::env::var("DX_PAY").is_ok() {
+                    let nm = |l: &ox::Leg| if l.xrp { "XRP".to_string() } else { format!("{}/{}", hex::encode_upper(&l.cur[12..15]), hex::encode(&l.issuer[..4])) };
+                    eprintln!("DX_PAY hop {i}/{n} {} -> {} want_cap={want_cap:?} rw={rw:?} carry={carry:?}", nm(chain[i]), nm(chain[i+1]));
+                }
                 if ox::me_is_zero(carry) {
                     break; // hop dried: nothing delivered
                 }

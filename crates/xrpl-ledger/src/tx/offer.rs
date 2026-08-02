@@ -3642,6 +3642,40 @@ mod tests {
         }
     }
 
+    /// An "unbounded" want-cap CANNOT be recovered by subtraction, so nothing
+    /// may account for a multi-fill total that way. `me_rescale` saturates
+    /// (`saturating_mul`), and a sentinel that huge saturates on every fill
+    /// whose exponent is smaller — which resets the running remainder to
+    /// u128::MAX and ERASES the fills before it. Sixteen significant digits
+    /// cannot represent 1e76 minus 2.3; no choice of sentinel fixes it.
+    ///
+    /// This is why `PaymentTransactor` measures an intermediate hop's carry as
+    /// the balance delta on the account's own line instead. #105912291
+    /// 2AE3693EF556, a circular 1 XRP -> RLUSD -> DMNDBR partial payment, read
+    /// its first hop as 0.0231 RLUSD when 2.309 had been bought — the last
+    /// fill's mantissa at the last fill's exponent — and failed
+    /// tecPATH_PARTIAL where mainnet delivers in full.
+    #[test]
+    fn an_unbounded_want_cap_cannot_be_recovered_by_subtraction() {
+        const CAP: Me = (9_990_000_000_000_000, 60);
+
+        // ONE fill round-trips, which is what makes the bug survivable in
+        // simple cases and invisible in single-hop tests.
+        let one = me_sub(CAP, (2_309_435_512_000_000, -15));
+        assert_eq!(me_sub(CAP, one), (2_309_435_512_000_000, -15));
+
+        // A SECOND fill at a smaller exponent re-saturates and erases the first.
+        let two = me_sub(one, (1_062_984_355_120_000, -17));
+        assert_eq!(
+            me_sub(CAP, two),
+            (1_062_984_355_120_000, -17),
+            "recovers only the LAST fill — the 2.309e-15 before it is gone",
+        );
+
+        // The saturation itself, stated plainly.
+        assert_eq!(me_rescale(CAP, -15, false), u128::MAX);
+    }
+
     fn state_with_two_offers(
         first_usd: &str,
         second_usd: &str,
