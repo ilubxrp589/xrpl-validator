@@ -315,6 +315,15 @@ fn native_read_keys(txj: &Value) -> Vec<String> {
         txj["TransactionType"].as_str(),
         Some("CredentialCreate") | Some("CredentialAccept") | Some("CredentialDelete")
     ) {
+        // The credential joins BOTH owner directories, so both roots must be
+        // present for dir_insert to find the real chain instead of inventing a
+        // root. #105909285 68872086F0B4 lands on a TAIL page of the issuer's
+        // multi-page dir (1D0093BB, IndexPrevious 3).
+        for f in ["Account", "Subject", "Issuer"] {
+            if let Some(a) = txj.get(f).and_then(|v| v.as_str()).and_then(decode_address) {
+                keys.push(hex::encode_upper(keylet::owner_dir_key(&a).0));
+            }
+        }
         // Whichever party the transaction does not name is the sender:
         // CredentialCreate carries Subject and issues as Account, while
         // CredentialAccept carries Issuer and is accepted by the Subject.
@@ -662,6 +671,18 @@ fn load_owner_dir_tail(state: &mut LedgerState, url: &str, txj: &Value, ledger_i
             .and_then(decode_issuer)
         {
             owners.push(iss);
+        }
+    }
+    // Credentials append to BOTH parties' owner directories, and an issuer's
+    // can be many pages long — only the tail receives the insert.
+    if matches!(
+        txj["TransactionType"].as_str(),
+        Some("CredentialCreate") | Some("CredentialAccept") | Some("CredentialDelete")
+    ) {
+        for f in ["Account", "Subject", "Issuer"] {
+            if let Some(a) = txj.get(f).and_then(|v| v.as_str()).and_then(decode_address) {
+                owners.push(a);
+            }
         }
     }
     // A crossing OfferCreate can hand the taker an IOU it has never held,

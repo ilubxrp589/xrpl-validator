@@ -130,6 +130,27 @@ impl Transactor for CredentialCreateTransactor {
             cred_obj["Expiration"] = exp.clone();
         }
 
+        // The credential joins BOTH owner directories but is owned only by the
+        // issuer — rippled CredentialCreate.cpp:147-174: "Added to both dirs,
+        // owned only by issuer. CredentialAccept will transfer ownership to
+        // subject." So the issuer's dirInsert is unconditional and carries the
+        // single adjustOwnerCount(+1); the subject's insert adds no reserve.
+        //
+        // A SELF-issued credential (subject == account) skips the subject
+        // insert entirely and is marked lsfAccepted instead.
+        //
+        // We wrote the credential and bumped OwnerCount but touched neither
+        // directory. #105909285 68872086F0B4 issues to rPnDmSuS: mainnet
+        // Modifies the subject's dir root 6F370348 AND a tail page of the
+        // issuer's multi-page dir (1D0093BB) — 4 nodes to our 2.
+        const LSF_ACCEPTED: u64 = 0x0001_0000;
+        crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &cred_key);
+        if subject == tx.account {
+            cred_obj["Flags"] = serde_json::json!(LSF_ACCEPTED);
+            cred_obj["Accepted"] = serde_json::json!(true);
+        } else {
+            crate::ledger::directory::owner_dir_insert(sandbox, &subject, &cred_key);
+        }
         sandbox.write(cred_key, serde_json::to_vec(&cred_obj).unwrap());
 
         // Increment OwnerCount for the issuer
@@ -299,6 +320,59 @@ mod delete_tests {
             account, tx_type: "CredentialDelete".to_string(), fee: 12, sequence: 7,
             ticket_seq: None, last_ledger_seq: None, fields: f,
         }
+    }
+
+    /// A credential joins BOTH owner directories but is owned only by the
+    /// issuer — rippled CredentialCreate.cpp:147-174: "Added to both dirs,
+    /// owned only by issuer. CredentialAccept will transfer ownership to
+    /// subject." The issuer's dirInsert carries the single
+    /// adjustOwnerCount(+1); the subject's adds no reserve. A SELF-issued
+    /// credential skips the subject insert and is marked lsfAccepted.
+    ///
+    /// We wrote the credential and bumped OwnerCount but touched neither
+    /// directory. #105909285 68872086F0B4: mainnet Modifies the subject's dir
+    /// root AND a tail page of the issuer's multi-page dir — 4 nodes to our 2.
+    #[test]
+    fn a_credential_joins_both_owner_directories() {
+        let issuer = [0x01u8; 20];
+        let subject = [0x03u8; 20];
+        let st = state_with(&issuer);
+        let mut sb = Sandbox::new(&st);
+
+        let tx = TxFields {
+            account: issuer, tx_type: "CredentialCreate".to_string(), fee: 12, sequence: 4,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Subject": hex::encode(subject),
+                "CredentialType": "4142",
+            }),
+        };
+        assert_eq!(CredentialCreateTransactor.do_apply(&tx, &mut sb), TxResult::Success);
+
+        let cred_key = credential_key(&subject, &issuer, &cred_type_bytes("4142"));
+        assert!(sb.exists(&cred_key), "the credential is written");
+        assert!(
+            sb.exists(&keylet::owner_dir_key(&issuer)),
+            "the ISSUER's owner directory receives it",
+        );
+        assert!(
+            sb.exists(&keylet::owner_dir_key(&subject)),
+            "and so does the SUBJECT's",
+        );
+
+        // Self-issued: no subject insert, marked accepted instead.
+        let st = state_with(&issuer);
+        let mut sb = Sandbox::new(&st);
+        let mut tx = tx;
+        tx.fields["Subject"] = serde_json::json!(hex::encode(issuer));
+        assert_eq!(CredentialCreateTransactor.do_apply(&tx, &mut sb), TxResult::Success);
+        let self_key = credential_key(&issuer, &issuer, &cred_type_bytes("4142"));
+        let cred: serde_json::Value =
+            serde_json::from_slice(&sb.read(&self_key).expect("self-issued credential")).unwrap();
+        assert_eq!(
+            cred["Flags"].as_u64(), Some(0x0001_0000),
+            "a self-issued credential is lsfAccepted on creation",
+        );
     }
 
     /// rippled needs at least ONE of Subject/Issuer, not both — whichever is
