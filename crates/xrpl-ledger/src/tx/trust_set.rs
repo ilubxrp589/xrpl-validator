@@ -289,12 +289,26 @@ impl Transactor for TrustSetTransactor {
                     const TF_CLEAR_FREEZE: u64 = 0x0020_0000;
                     let txf = tx.fields.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0);
                     let sender_low = tx.account < issuer;
-                    let (no_ripple_bit, freeze_bit) = if sender_low {
-                        (0x0010_0000u64, 0x0040_0000u64) // lsfLowNoRipple, lsfLowFreeze
+                    const TF_SETF_AUTH: u64 = 0x0001_0000;
+                    let (no_ripple_bit, freeze_bit, auth_bit) = if sender_low {
+                        (0x0010_0000u64, 0x0040_0000u64, 0x0004_0000u64) // low: NoRipple, Freeze, Auth
                     } else {
-                        (0x0020_0000u64, 0x0080_0000u64) // lsfHighNoRipple, lsfHighFreeze
+                        (0x0020_0000u64, 0x0080_0000u64, 0x0008_0000u64) // high: NoRipple, Freeze, Auth
                     };
                     let mut lf = line["Flags"].as_u64().unwrap_or(0);
+                    // tfSetfAuth authorises the counterparty to hold the
+                    // sender's IOU: `uFlagsOut |= (bHigh ? lsfHighAuth :
+                    // lsfLowAuth)` (TrustSet.cpp:553-556). There is deliberately
+                    // no clear — authorisation is one-way in XRPL.
+                    //
+                    // We honoured tfSetfAuth in preclaim's redundancy test but
+                    // never APPLIED it, so a TrustSet whose only effect is the
+                    // auth bit left the line untouched. #105814446 E4C89E28625D
+                    // sets it on an existing CAPYS line; mainnet Modifies
+                    // D65919CA, we emitted 3 nodes to its 4.
+                    if txf & TF_SETF_AUTH != 0 {
+                        lf |= auth_bit;
+                    }
                     if txf & TF_SET_NO_RIPPLE != 0 {
                         lf |= no_ripple_bit;
                     } else if txf & TF_CLEAR_NO_RIPPLE != 0 {
@@ -544,5 +558,54 @@ mod tests {
         let currency = TrustSetTransactor::currency_code("USD");
         let line_key = keylet::ripple_state_key(&alice, &issuer, &currency);
         assert!(sandbox.exists(&line_key));
+    }
+
+    /// tfSetfAuth authorises the counterparty to hold the sender's IOU —
+    /// `uFlagsOut |= (bHigh ? lsfHighAuth : lsfLowAuth)` (TrustSet.cpp:553-556).
+    /// There is deliberately no clear: authorisation is one-way in XRPL.
+    ///
+    /// We honoured the flag in preclaim's redundancy test but never APPLIED it,
+    /// so a TrustSet whose only effect is the auth bit left the line untouched.
+    /// #105814446 E4C89E28625D sets it on an existing CAPYS line — mainnet
+    /// Modifies D65919CA, we emitted 3 nodes to its 4.
+    #[test]
+    fn set_auth_marks_the_senders_side_of_the_line() {
+        let sender = [0x05u8; 20];
+        let issuer = [0x02u8; 20];
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+        let sender_low = sender < issuer;
+        let auth_bit: u64 = if sender_low { 0x0004_0000 } else { 0x0008_0000 };
+        let (lo, hi) = if sender_low { (sender, issuer) } else { (issuer, sender) };
+
+        let mut state = make_state(&[(sender, 100_000_000), (issuer, 100_000_000)]);
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            // pre-existing reserve + NoRipple on the other side, no auth yet
+            "Flags": 0x0011_0000u64,
+            "Balance": {"currency": hex::encode_upper(cur),
+                        "issuer": "0000000000000000000000000000000000000000", "value": "0"},
+            "LowLimit":  {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000"},
+            "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000"},
+        });
+        let line_key = keylet::ripple_state_key(&sender, &issuer, &cur);
+        state.state_map.insert(line_key, serde_json::to_vec(&line).unwrap()).unwrap();
+
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: sender, tx_type: "TrustSet".to_string(), fee: 12, sequence: 3,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "LimitAmount": {"currency": "USD", "issuer": hex::encode(issuer), "value": "1000"},
+                "Flags": 0x0001_0000u64, // tfSetfAuth
+            }),
+        };
+        assert_eq!(TrustSetTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+
+        let after: serde_json::Value =
+            serde_json::from_slice(&sandbox.read(&line_key).expect("line survives")).unwrap();
+        let f = after["Flags"].as_u64().unwrap();
+        assert!(f & auth_bit != 0, "tfSetfAuth must set the sender's auth bit");
+        assert_eq!(f & 0x0011_0000, 0x0011_0000, "existing flags are preserved");
     }
 }
