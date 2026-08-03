@@ -666,7 +666,15 @@ impl PaymentTransactor {
             eprintln!("DX_PAY hops={:?} spend0={spend0:?} want_gross={want_gross:?} partial={partial}",
                 hops.as_ref().map(|h| h.iter().map(|l| if l.xrp { "XRP".to_string() } else { hex::encode_upper(&l.cur[12..15]) }).collect::<Vec<_>>()));
         }
-        let delivered = if let Some(hops) = hops.as_ref().filter(|h| !h.is_empty()) {
+        // One code path for both shapes. With no usable hops the chain is just
+        // [spend, want] and the walk below runs exactly one hop against
+        // `want_gross` — which is precisely what the separate direct branch
+        // used to do. Unifying them is the groundwork for iterating STRANDS:
+        // rippled always builds the default path alongside the ones named in
+        // Paths and splits the delivery across them (StrandFlow.h:682-805).
+        let no_hops: Vec<ox::Leg> = Vec::new();
+        let hops = hops.as_ref().filter(|h| !h.is_empty()).unwrap_or(&no_hops);
+        let delivered = {
             let mut chain: Vec<&ox::Leg> = std::iter::once(&spend_leg)
                 .chain(hops.iter())
                 .chain(std::iter::once(&want_leg))
@@ -675,6 +683,11 @@ impl PaymentTransactor {
             // RLUSD via [RLUSD-book, issuer]): same-leg neighbours are a
             // zero-length book — collapse them.
             chain.dedup_by(|a, b| a.xrp == b.xrp && a.cur == b.cur && a.issuer == b.issuer);
+            // ...but a same-currency send/receive must still walk one book
+            // rather than collapse to nothing.
+            if chain.len() < 2 {
+                chain = vec![&spend_leg, &want_leg];
+            }
             // Intermediate value is IN FLIGHT: rippled never rests it on the
             // sender's trust lines. Snapshot those lines and restore them
             // byte-exact after the chain — net-zero routing can leave 1-ulp
@@ -773,12 +786,6 @@ impl PaymentTransactor {
                 }
             }
             carry
-        } else {
-            let (rem_want, _rem_spend, _crossed) = ox::cross_engine_to(
-                &tx.account, dest, want_gross, spend0, &want_leg, &spend_leg, threshold, threshold, false,
-                false, None, sandbox, &mut Vec::new(),
-            );
-            ox::me_sub(want_gross, rem_want)
         };
         // The strand's last step redeems the delivered IOU from whoever gave
         // it up and re-issues it to the destination, and that step charges the
