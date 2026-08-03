@@ -275,6 +275,109 @@ fn bump_lp_balance(
     ox::put_json(sandbox, *amm_key, &obj);
 }
 
+
+use crate::tx::offer as ox;
+
+/// rippled `multiply(balance, frac, rm)` — the exact product rounded to 16
+/// significant digits in ONE direction (`Number::upward` / `downward`), as
+/// opposed to `st_multiply`'s half-even. XRP is integral, so it rounds to whole
+/// drops instead.
+fn mul_directed(a: ox::Me, b: ox::Me, up: bool, xrp: bool) -> ox::Me {
+    if a.0 == 0 || b.0 == 0 {
+        return (0, 0);
+    }
+    let (am, ae) = ox::norm16(a);
+    let (bm, be) = ox::norm16(b);
+    // Both mantissas are < 1e16, so the product is < 1e32 and fits a u128.
+    let prod = am * bm;
+    let e = ae + be;
+    if xrp {
+        if e >= 0 {
+            return (prod.saturating_mul(10u128.saturating_pow(e.min(38) as u32)), 0);
+        }
+        let d = 10u128.saturating_pow(((-e).min(38)) as u32);
+        let (q, r) = (prod / d, prod % d);
+        return (if up && r != 0 { q + 1 } else { q }, 0);
+    }
+    let mut k = 0u32;
+    let mut t = prod;
+    while t >= 10_000_000_000_000_000 {
+        t /= 10;
+        k += 1;
+    }
+    let d = 10u128.pow(k);
+    let (q, r) = (prod / d, prod % d);
+    let m = if up && r != 0 { q + 1 } else { q };
+    ox::norm16((m, e + k as i32))
+}
+
+/// rippled `adjustLPTokens(lptAMMBalance, lpTokens, IsDeposit::Yes)` —
+/// `(lptAMMBalance + lpTokens) - lptAMMBalance` with rounding forced DOWNWARD,
+/// which quantises the token count to what is actually representable once it
+/// joins the pool balance (AMMHelpers.cpp:173-184).
+fn adjust_lp_tokens(lpt_balance: ox::Me, tokens: ox::Me) -> ox::Me {
+    let (_, sum) = ox::stamount_signed_add(false, lpt_balance, false, tokens);
+    let (neg, adj) = ox::stamount_signed_add(false, sum, true, lpt_balance);
+    if neg { (0, 0) } else { adj }
+}
+
+/// rippled `AMMDeposit::equalDepositLimit` (AMMDeposit.cpp:721-787), the
+/// tfTwoAsset path. Both Amount and Amount2 are MAXIMA, not the amounts
+/// deposited: the pool ratio decides one side from the other.
+///
+///   frac      = amount / amountBalance                      (Number, 16 digits)
+///   tokensAdj = adjustLPTokens(lpt, multiply(lpt, frac, DOWNWARD))
+///   frac      = tokensAdj / lpt                             (adjustFracByTokens)
+///   amt2Dep   = multiply(amount2Balance, frac, UPWARD)
+///   if amt2Dep <= amount2      -> deposit (amount, amt2Dep)
+///   ...otherwise repeat led by amount2, and if THAT overshoots amount too,
+///   the transaction fails with tecAMM_FAILED.
+///
+/// The rounding directions are not incidental — LP tokens minimize on deposit
+/// and assets maximize, "to ensure AMM invariant sqrt(poolAsset1 * poolAsset2)
+/// >= LPTokensBalance" (AMMHelpers.h:651-668). Nor is the 16-digit
+/// quantisation of `frac` itself: `Number` IS a 16-digit type, and computing
+/// frac exactly instead lands #105869720 878CD973C64F exactly ON the boundary
+/// and admits it. rippled needs 3.235503279094233 QQ1 where the transaction
+/// offered 3.235503279094231 (2 ulp short), and 10000001 drops where it
+/// offered 10000000 (1 drop short), so BOTH directions miss.
+///
+/// Returns the (Amount, Amount2) actually to be moved, or None for
+/// tecAMM_FAILED.
+fn equal_deposit_limit(
+    amount_balance: ox::Me,
+    amount2_balance: ox::Me,
+    lpt_balance: ox::Me,
+    amount: ox::Me,
+    amount2: ox::Me,
+    amount_xrp: bool,
+    amount2_xrp: bool,
+) -> Option<(ox::Me, ox::Me)> {
+    if amount_balance.0 == 0 || amount2_balance.0 == 0 || lpt_balance.0 == 0 {
+        return None;
+    }
+    let led = |num: ox::Me, den: ox::Me, out_balance: ox::Me, out_xrp: bool| -> Option<ox::Me> {
+        let frac = ox::st_divide(num, den, false);
+        let tokens = adjust_lp_tokens(lpt_balance, mul_directed(lpt_balance, frac, false, false));
+        if tokens.0 == 0 {
+            return None;
+        }
+        let frac = ox::st_divide(tokens, lpt_balance, false);
+        Some(mul_directed(out_balance, frac, true, out_xrp))
+    };
+    if let Some(a2) = led(amount, amount_balance, amount2_balance, amount2_xrp) {
+        if ox::me_cmp(a2, amount2).is_le() {
+            return Some((amount, a2));
+        }
+    }
+    if let Some(a1) = led(amount2, amount2_balance, amount_balance, amount_xrp) {
+        if ox::me_cmp(a1, amount).is_le() {
+            return Some((a1, amount2));
+        }
+    }
+    None
+}
+
 // ─── AMMDeposit ───
 
 pub struct AMMDepositTransactor;
@@ -379,11 +482,53 @@ impl Transactor for AMMDepositTransactor {
             }
         }
 
+        // tfTwoAsset: Amount and Amount2 are MAXIMA, not the amounts deposited.
+        // rippled derives one side from the other at the pool's ratio and fails
+        // the whole transaction when NEITHER derivation fits inside what was
+        // offered — see `equal_deposit_limit`. We moved both maxima verbatim and
+        // never failed, so #105869720 878CD973C64F returned tesSUCCESS against
+        // mainnet's tecAMM_FAILED.
+        const TF_TWO_ASSET: u64 = 0x0010_0000;
+        let mut sized: Option<(ox::Me, ox::Me)> = None;
+        if tx.fields.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & TF_TWO_ASSET != 0 {
+            if let (Some(av), Some(bv)) = (tx.fields.get("Amount"), tx.fields.get("Amount2")) {
+                if let (Some(aleg), Some(amt), Some(bleg), Some(amt2)) = (
+                    ox::leg_of(av),
+                    keylet::amount_mant_exp(av),
+                    ox::leg_of(bv),
+                    keylet::amount_mant_exp(bv),
+                ) {
+                    let lpt = ox::json_at(sandbox, &amm_key)
+                        .and_then(|o| o["LPTokenBalance"]["value"].as_str().map(str::to_string))
+                        .and_then(|t| keylet::amount_mant_exp(&serde_json::Value::String(t)));
+                    if let Some(lpt) = lpt {
+                        match equal_deposit_limit(
+                            crate::tx::amm_swap::holds(sandbox, &amm_acct, &aleg),
+                            crate::tx::amm_swap::holds(sandbox, &amm_acct, &bleg),
+                            lpt,
+                            amt,
+                            amt2,
+                            aleg.xrp,
+                            bleg.xrp,
+                        ) {
+                            Some(pair) => sized = Some(pair),
+                            None => return TxResult::AmmFailed,
+                        }
+                    }
+                }
+            }
+        }
+
         // Move the deposited side(s) depositor → AMM account (XRP or IOU
         // lines — move_leg handles both).
-        for f in ["Amount", "Amount2"] {
-            if let Some(v) = tx.fields.get(f) {
-                if let (Some(leg), Some(amt)) = (ox::leg_of(v), keylet::amount_mant_exp(v)) {
+        for (i, f) in ["Amount", "Amount2"].iter().enumerate() {
+            if let Some(v) = tx.fields.get(*f) {
+                if let (Some(leg), Some(amt0)) = (ox::leg_of(v), keylet::amount_mant_exp(v)) {
+                    let amt = match sized {
+                        Some((a, _)) if i == 0 => a,
+                        Some((_, b)) => b,
+                        None => amt0,
+                    };
                     if amt.0 > 0 {
                         ox::move_leg(sandbox, &tx.account, &amm_acct, &leg, amt);
                     }
@@ -938,6 +1083,41 @@ mod tests {
     /// when it does not. #105893158 85C32164 deposits 446527 drops holding
     /// 5646527 at OwnerCount 21 — the separate reserve guard passes (liquid
     /// 246527 > 0) but the deposit needs 446527, and mainnet claims the fee.
+    /// A tfTwoAsset deposit whose BOTH directions overshoot is tecAMM_FAILED —
+    /// rippled `equalDepositLimit` (AMMDeposit.cpp:721-787). #105869720
+    /// 878CD973C64F against the XRP/QQ1 pool: 7326949 drops / 2.37063675152562
+    /// QQ1 / 4167.465608078962 LP, offering 10 XRP and 3.235503279094231 QQ1.
+    ///
+    /// The margin is ONE ulp, which is what makes this a real test of the
+    /// rounding rather than of the algorithm: assets round UP on deposit and LP
+    /// tokens DOWN, and `frac` is itself quantised to 16 digits because Number
+    /// IS a 16-digit type. Compute frac exactly instead and the XRP-led
+    /// direction lands precisely ON 3.235503279094231 and is admitted — which
+    /// is exactly the tesSUCCESS we used to return.
+    #[test]
+    fn a_two_asset_deposit_that_overshoots_both_ways_fails() {
+        let amount_balance = (7_326_949u128, 0i32); // drops
+        let amount2_balance = (237_063_675_152_562u128, -14);
+        let lpt_balance = (4_167_465_608_078_962u128, -12);
+
+        assert_eq!(
+            equal_deposit_limit(
+                amount_balance, amount2_balance, lpt_balance,
+                (10_000_000, 0), (3_235_503_279_094_231, -15), true, false,
+            ),
+            None,
+            "XRP-led needs 3.235503279094233 QQ1 and QQ1-led needs 10000001 drops",
+        );
+
+        // One more drop of headroom on the XRP side and the QQ1-led direction
+        // fits, so the deposit goes through at the pool's ratio.
+        let ok = equal_deposit_limit(
+            amount_balance, amount2_balance, lpt_balance,
+            (10_000_001, 0), (3_235_503_279_094_231, -15), true, false,
+        );
+        assert_eq!(ok, Some(((10_000_001, 0), (3_235_503_279_094_231, -15))));
+    }
+
     #[test]
     fn an_amm_deposit_must_fund_its_xrp_side_after_reserve() {
         let depositor = [0x01u8; 20];

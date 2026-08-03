@@ -81,6 +81,10 @@ pub enum TxResult {
     InsufReserveLine,
     /// Depositing into an AMM more than the depositor can actually fund.
     UnfundedAmm,
+    /// An AMM operation whose amounts cannot satisfy the pool's constraints —
+    /// notably a two-asset deposit where NEITHER side's proportional partner
+    /// fits inside what the transaction offered.
+    AmmFailed,
     /// Creating a trust line, but the owner can't afford the incremental reserve.
     NoLineInsufReserve,
     /// Setting a non-existent trust line to defaults — nothing to do.
@@ -136,6 +140,7 @@ impl TxResult {
             | TxResult::InsufficientReserve
             | TxResult::InsufReserveLine
             | TxResult::UnfundedAmm
+            | TxResult::AmmFailed
             | TxResult::NoLineInsufReserve
             | TxResult::NoLineRedundant
             | TxResult::Unsupported => true,
@@ -175,6 +180,7 @@ impl TxResult {
             TxResult::InsufficientReserve => "tecINSUFFICIENT_RESERVE",
             TxResult::InsufReserveLine => "tecINSUF_RESERVE_LINE",
             TxResult::UnfundedAmm => "tecUNFUNDED_AMM",
+            TxResult::AmmFailed => "tecAMM_FAILED",
             TxResult::NoLineInsufReserve => "tecNO_LINE_INSUF_RESERVE",
             TxResult::NoLineRedundant => "tecNO_LINE_REDUNDANT",
             TxResult::Malformed => "temMALFORMED",

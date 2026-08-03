@@ -702,7 +702,7 @@ fn quality_round_up(rate: u64, digits: u32) -> u64 {
 }
 
 /// Normalize a mantissa into rippled's STAmount range [1e15, 1e16).
-fn norm16(x: Me) -> Me {
+pub(crate) fn norm16(x: Me) -> Me {
     let (mut m, mut e) = x;
     if m == 0 {
         return (0, 0);
@@ -757,7 +757,7 @@ fn div_nearest_16(num: u128, den: u128, e: i32) -> Me {
 
 /// rippled `divide(num, den, issue)` under Number semantics: exact quotient
 /// rounded half-even at 16 digits (drops for XRP).
-fn st_divide(num: Me, den: Me, xrp: bool) -> Me {
+pub(crate) fn st_divide(num: Me, den: Me, xrp: bool) -> Me {
     if num.0 == 0 || den.0 == 0 {
         return (0, 0);
     }
