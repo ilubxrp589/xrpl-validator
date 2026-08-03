@@ -1665,6 +1665,13 @@ pub(crate) fn cross_engine_to(
     threshold_self: u64,
     sell: bool,
     offer_crossing: bool,
+    // Stop after the first book level that moves value — one PASS, in rippled's
+    // sense. `flow()` runs a strand for a single quality level per BookStep and
+    // then re-enters, which is what lets the outer strand loop interleave two
+    // strands by marginal quality instead of draining the better one first
+    // (StrandFlow.h:682-805). Only the multi-strand payment loop asks for this;
+    // every other caller walks the whole book as before.
+    single_pass: bool,
     domain: Option<&Hash256>,
     sandbox: &mut Sandbox,
     stale: &mut Vec<Hash256>,
@@ -1710,6 +1717,7 @@ pub(crate) fn cross_engine_to(
     // walk. See the `done` branch at the end of the maker loop.
     let mut trailing = false;
     'dirs: for dk in dirs {
+        let (level_pays_in, level_gets_in) = (rem_pays, rem_gets);
         let q = u64::from_be_bytes(dk.0[24..32].try_into().unwrap_or_default());
         if trailing {
             if reap_to_live_head(sandbox, &dk, taker, pays_leg, gets_leg, stale) {
@@ -1976,6 +1984,9 @@ pub(crate) fn cross_engine_to(
             }
             page_key_h = keylet::dir_page_key(&dk, next);
         }
+        if single_pass && (rem_pays != level_pays_in || rem_gets != level_gets_in) {
+            return (rem_pays, rem_gets, crossed);
+        }
     }
     // Final AMM turn once the book is exhausted (maxOffer sizing).
     if let Some(a) = &amm {
@@ -2010,7 +2021,7 @@ pub(crate) fn cross_engine(
 ) -> (Me, Me, u32) {
     // FlowCross always builds both the direct and the XRP-bridged strand, so
     // offer crossing is multi-path by construction.
-    cross_engine_to(taker, taker, rem_pays, rem_gets, pays_leg, gets_leg, threshold, threshold_self, sell, true, domain, sandbox, stale)
+    cross_engine_to(taker, taker, rem_pays, rem_gets, pays_leg, gets_leg, threshold, threshold_self, sell, true, false, domain, sandbox, stale)
 }
 
 pub struct OfferCreateTransactor;
@@ -3496,7 +3507,7 @@ mod tests {
         // Payment semantics: no limitQuality, so the pool is free to fill it all.
         let (rp, rg, _crossed) = cross_engine_to(
             &taker, &taker, (1_000_000_000_000_000, -15), (1_000_000, 0), &usd_leg, &xrp_leg,
-            u64::MAX, u64::MAX, false, false, None, &mut sandbox, &mut stale,);
+            u64::MAX, u64::MAX, false, false, false, None, &mut sandbox, &mut stale,);
 
         assert!(!sandbox.exists(&okey), "the expired offer must be reaped");
         assert!(stale.contains(&okey), "and reported as removed for the cancel view");
@@ -3529,7 +3540,7 @@ mod tests {
         // past the limit and the strand never runs.
         cross_engine_to(
             &taker, &taker, (1_000_000_000_000_000, -15), (1_000_000, 0), &usd_leg, &xrp_leg,
-            1, 1, true, true, None, &mut sandbox, &mut stale,);
+            1, 1, true, true, false, None, &mut sandbox, &mut stale,);
 
         assert!(sandbox.exists(&okey), "an unopened book must not be reaped");
         assert!(stale.is_empty());
@@ -3757,7 +3768,7 @@ mod tests {
         // the taker's INPUT — never trimmed to the remaining output.
         let (_rp, rg, _c) = cross_engine_to(
             &taker, &taker, (1_000_000_000_000_000, -8), (10_000_000, 0), &usd_leg, &xrp_leg,
-            u64::MAX, u64::MAX, false, false, None, &mut sandbox, &mut stale,);
+            u64::MAX, u64::MAX, false, false, false, None, &mut sandbox, &mut stale,);
 
         assert!(me_is_zero(rg), "the 10 XRP is spent");
         assert!(sandbox.exists(&live), "the funded maker is only part-filled");
@@ -3782,7 +3793,7 @@ mod tests {
         let mut stale = Vec::new();
         cross_engine_to(
             &taker, &taker, (1_000_000_000_000_000, -8), (10_000_000, 0), &usd_leg, &xrp_leg,
-            u64::MAX, u64::MAX, false, false, None, &mut sandbox, &mut stale,);
+            u64::MAX, u64::MAX, false, false, false, None, &mut sandbox, &mut stale,);
 
         assert!(!sandbox.exists(&dusty), "a dust-backed offer must be reaped");
         assert!(stale.contains(&dusty));
@@ -3885,7 +3896,7 @@ mod tests {
         let mut stale = Vec::new();
         let (_rp, rg, _c) = cross_engine_to(
             &taker, &taker, (1_000_000_000_000_000, -8), (10_000_000, 0), &usd_leg, &xrp_leg,
-            u64::MAX, u64::MAX, false, false, None, &mut sandbox, &mut stale,);
+            u64::MAX, u64::MAX, false, false, false, None, &mut sandbox, &mut stale,);
 
         assert!(me_is_zero(rg), "the 10 XRP is spent on the first level");
         assert!(sandbox.exists(&live), "the funded maker is only part-filled");

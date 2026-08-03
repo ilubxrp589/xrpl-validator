@@ -112,6 +112,123 @@ impl PaymentTransactor {
         Some((!party_holds, bal))
     }
 
+    /// Flow ONE pass of `chain` and report (spent on the first leg, delivered
+    /// on the last). With `single_pass` this is rippled's per-strand `flow()`:
+    /// a single quality level per book step, so the caller can re-evaluate
+    /// which strand is now best (StrandFlow.h:682-805).
+    ///
+    /// Intermediate value is IN FLIGHT — rippled never rests it on the sender's
+    /// trust lines. The lines the chain passes through, and the directory pages
+    /// a mid-chain line-creation would touch, are snapshotted and restored
+    /// byte-exact: creating and then forgetting a line must leave no dir
+    /// droppings, and net-zero routing can otherwise leave 1-ulp dust that the
+    /// no-op filter keeps.
+    #[allow(clippy::too_many_arguments)]
+    fn strand_pass(
+        tx: &TxFields,
+        dest: &[u8; 20],
+        chain: &[&crate::tx::offer::Leg],
+        avail_in: crate::tx::offer::Me,
+        want_out: crate::tx::offer::Me,
+        threshold: u64,
+        single_pass: bool,
+        sandbox: &mut Sandbox,
+    ) -> (crate::tx::offer::Me, crate::tx::offer::Me) {
+        use crate::tx::offer as ox;
+        let n = chain.len().saturating_sub(1);
+        if n == 0 {
+            return ((0, 0), (0, 0));
+        }
+        let (spend_leg, want_leg) = (chain[0], chain[n]);
+        let same = |a: &ox::Leg, b: &ox::Leg| a.xrp == b.xrp && a.cur == b.cur && a.issuer == b.issuer;
+        let mut inflight: Vec<_> = Vec::new();
+        for l in chain[1..n]
+            .iter()
+            .filter(|l| !l.xrp && !same(l, want_leg) && !same(l, spend_leg))
+        {
+            let lk = keylet::ripple_state_key(&tx.account, &l.issuer, &l.cur);
+            let line_pre = sandbox.read(&lk);
+            let absent = line_pre.is_none();
+            inflight.push((lk, line_pre));
+            if !absent {
+                continue; // pre-existing line: no creation, no dir droppings
+            }
+            for owner in [&tx.account, &l.issuer] {
+                let root = keylet::owner_dir_key(owner);
+                let pre = sandbox.read(&root);
+                if let Some(bytes) = &pre {
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) {
+                        let last = v
+                            .get("IndexPrevious")
+                            .and_then(|p| {
+                                p.as_u64().or_else(|| p.as_str().and_then(|s| u64::from_str_radix(s, 16).ok()))
+                            })
+                            .unwrap_or(0);
+                        if last != 0 {
+                            let pk = keylet::dir_page_key(&root, last);
+                            inflight.push((pk, sandbox.read(&pk)));
+                        }
+                    }
+                }
+                inflight.push((root, pre));
+            }
+        }
+        let spend_before = Self::leg_signed_balance(sandbox, &tx.account, spend_leg);
+        let mut carry = avail_in;
+        for i in 0..n {
+            let last = i + 1 == n;
+            let benef = if last { dest } else { &tx.account };
+            // Intermediate hops SELL the whole carry; the last hop buys up to
+            // the Amount cap.
+            let want_cap = if last { want_out } else { (9_990_000_000_000_000, 60) };
+            // That sentinel cannot be recovered by subtraction — me_rescale
+            // saturates, so each fill re-pins the remainder at u128::MAX and
+            // erases the ones before it, leaving only the LAST fill at the LAST
+            // fill's exponent. Measure the balance delta on the in-flight line
+            // instead; see the commit that introduced this.
+            let out_leg = chain[i + 1];
+            let before = (!last)
+                .then(|| Self::leg_signed_balance(sandbox, &tx.account, out_leg))
+                .flatten();
+            let (rw, _rs, _c) = ox::cross_engine_to(
+                &tx.account, benef, want_cap, carry, chain[i + 1], chain[i],
+                threshold, threshold, !last, false, single_pass, None, sandbox, &mut Vec::new(),
+            );
+            carry = match (before, Self::leg_signed_balance(sandbox, &tx.account, out_leg)) {
+                (Some((bneg, b)), Some((aneg, a))) => {
+                    // delta = after - before; a fall in balance buys nothing.
+                    let (dneg, d) = ox::signed_add(aneg, a, !bneg, b);
+                    if dneg { (0, 0) } else { d }
+                }
+                // The account issues the hop currency (no line to read), or this
+                // is the LAST hop, whose cap is the real want_out and small
+                // enough to subtract exactly.
+                _ => ox::me_sub(want_cap, rw),
+            };
+            if std::env::var("DX_PAY").is_ok() {
+                let nm = |l: &ox::Leg| if l.xrp { "XRP".to_string() } else { format!("{}/{}", hex::encode_upper(&l.cur[12..15]), hex::encode(&l.issuer[..4])) };
+                eprintln!("DX_PAY hop {i}/{n} {} -> {} want_cap={want_cap:?} rw={rw:?} carry={carry:?}", nm(chain[i]), nm(chain[i + 1]));
+            }
+            if ox::me_is_zero(carry) {
+                break; // hop dried: nothing delivered
+            }
+        }
+        for (k, pre) in inflight {
+            match pre {
+                Some(bytes) => sandbox.write(k, bytes),
+                None => sandbox.forget(&k),
+            }
+        }
+        let spent = match (spend_before, Self::leg_signed_balance(sandbox, &tx.account, spend_leg)) {
+            (Some((bneg, b)), Some((aneg, a))) => {
+                let (dneg, d) = ox::signed_add(bneg, b, !aneg, a); // before - after
+                if dneg { (0, 0) } else { d }
+            }
+            _ => (0, 0),
+        };
+        (spent, carry)
+    }
+
     /// The issuer's TransferRate, QUALITY_ONE-relative (1e9 = no fee).
     /// `None` for XRP, for an issuer that charges nothing, or when the issuer
     /// account is not hydrated.
@@ -674,119 +791,104 @@ impl PaymentTransactor {
         // Paths and splits the delivery across them (StrandFlow.h:682-805).
         let no_hops: Vec<ox::Leg> = Vec::new();
         let hops = hops.as_ref().filter(|h| !h.is_empty()).unwrap_or(&no_hops);
-        let delivered = {
-            let mut chain: Vec<&ox::Leg> = std::iter::once(&spend_leg)
-                .chain(hops.iter())
-                .chain(std::iter::once(&want_leg))
-                .collect();
-            // A path may name an endpoint currency as a "hop" (e.g. deliver
-            // RLUSD via [RLUSD-book, issuer]): same-leg neighbours are a
-            // zero-length book — collapse them.
-            chain.dedup_by(|a, b| a.xrp == b.xrp && a.cur == b.cur && a.issuer == b.issuer);
-            // ...but a same-currency send/receive must still walk one book
-            // rather than collapse to nothing.
-            if chain.len() < 2 {
-                chain = vec![&spend_leg, &want_leg];
+        // rippled ALWAYS builds the DEFAULT path alongside the ones named in
+        // Paths (unless tfNoRippleDirect) and splits the delivery across the
+        // strands, applying the best-quality PASS each round and re-evaluating
+        // (StrandFlow.h:682-805). We ran the specified chain alone.
+        //
+        // #105912291 2AE3693EF556, a circular tfPartialPayment of 1 XRP into
+        // DMNDBR via an RLUSD hop: mainnet takes 484095 drops through the
+        // direct XRP->DMNDBR path and 515894 through XRP->RLUSD->DMNDBR,
+        // summing to the full 3244389.84805814 for 999989 of the 1000000
+        // SendMax, and fills Offer 3A3053B3 only PARTIALLY. Pushing everything
+        // down the RLUSD strand consumed that offer outright plus a second one
+        // and still landed 0.3% short.
+        //
+        // The rounds must be per-PASS, not per-strand: with no limitQuality a
+        // payment strand would otherwise drain the whole SendMax on whichever
+        // strand happens to be better and the other would never run at all.
+        // That is what `single_pass` buys — one quality level per book step,
+        // matching what one `flow()` call does for a strand.
+        const TF_NO_RIPPLE_DIRECT: u64 = 0x0001_0000;
+        let mut chain: Vec<&ox::Leg> = std::iter::once(&spend_leg)
+            .chain(hops.iter())
+            .chain(std::iter::once(&want_leg))
+            .collect();
+        // A path may name an endpoint currency as a "hop" (e.g. deliver RLUSD
+        // via [RLUSD-book, issuer]): same-leg neighbours are a zero-length book
+        // — collapse them...
+        chain.dedup_by(|a, b| a.xrp == b.xrp && a.cur == b.cur && a.issuer == b.issuer);
+        // ...but a same-currency send/receive must still walk one book rather
+        // than collapse to nothing.
+        if chain.len() < 2 {
+            chain = vec![&spend_leg, &want_leg];
+        }
+        let no_direct =
+            tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & TF_NO_RIPPLE_DIRECT != 0;
+        let mut strands: Vec<Vec<&ox::Leg>> = Vec::new();
+        if !no_direct && chain.len() > 2 {
+            strands.push(vec![&spend_leg, &want_leg]);
+        }
+        strands.push(chain);
+        // One strand is the old behaviour exactly: walk the whole book in a
+        // single call, no trial run, no second round that can find anything.
+        let multi = strands.len() > 1;
+
+        let mut rem_in = spend0;
+        let mut rem_out = want_gross;
+        let mut delivered: ox::Me = (0, 0);
+        // A single strand runs ONCE, walking the whole book exactly as before —
+        // rounds exist to interleave strands, and re-entering a lone strand
+        // would just keep taking further slices of a large tfPartialPayment
+        // Amount that one call already sized correctly.
+        let rounds = if multi { 32 } else { 1 };
+        for _round in 0..rounds {
+            if ox::me_is_zero(rem_out) || ox::me_is_zero(rem_in) {
+                break;
             }
-            // Intermediate value is IN FLIGHT: rippled never rests it on the
-            // sender's trust lines. Snapshot those lines and restore them
-            // byte-exact after the chain — net-zero routing can leave 1-ulp
-            // dust (or a phantom created line) that the no-op filter keeps.
-            let same = |a: &ox::Leg, b: &ox::Leg| a.xrp == b.xrp && a.cur == b.cur && a.issuer == b.issuer;
-            // Capture, for each in-flight line, the line itself AND the
-            // directory pages a mid-chain line-creation would touch (both
-            // owners' dir roots + their last pages) — creating and then
-            // forgetting the line must leave no dir droppings either.
-            let mut inflight: Vec<_> = Vec::new();
-            for l in hops.iter().filter(|l| !l.xrp && !same(l, &want_leg) && !same(l, &spend_leg)) {
-                let lk = keylet::ripple_state_key(&tx.account, &l.issuer, &l.cur);
-                let line_pre = sandbox.read(&lk);
-                let absent = line_pre.is_none();
-                inflight.push((lk, line_pre));
-                if !absent {
-                    continue; // pre-existing line: no creation, no dir droppings
-                }
-                for owner in [&tx.account, &l.issuer] {
-                    let root = keylet::owner_dir_key(owner);
-                    let pre = sandbox.read(&root);
-                    if let Some(bytes) = &pre {
-                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) {
-                            let last = v.get("IndexPrevious").and_then(|p| {
-                                p.as_u64().or_else(|| p.as_str().and_then(|s| u64::from_str_radix(s, 16).ok()))
-                            }).unwrap_or(0);
-                            if last != 0 {
-                                let pk = keylet::dir_page_key(&root, last);
-                                inflight.push((pk, sandbox.read(&pk)));
-                            }
-                        }
+            let pick = if multi {
+                // Trial each strand in a snapshot and keep the best quality —
+                // lowest spent-per-delivered.
+                let mut best: Option<(usize, ox::Me)> = None;
+                for i in 0..strands.len() {
+                    let snap = sandbox.snapshot();
+                    let (sin, sout) =
+                        Self::strand_pass(tx, dest, &strands[i], rem_in, rem_out, threshold, true, sandbox);
+                    sandbox.restore_snapshot(snap);
+                    if ox::me_is_zero(sout) {
+                        continue;
                     }
-                    inflight.push((root, pre));
-                }
-            }
-            let mut carry = spend0;
-            let n = chain.len() - 1;
-            for i in 0..n {
-                let last = i + 1 == n;
-                let benef = if last { dest } else { &tx.account };
-                // Intermediate hops SELL the whole carry; the last hop buys
-                // up to the Amount cap.
-                let want_cap = if last { want_gross } else { (9_990_000_000_000_000, 60) };
-                // An intermediate hop has no real ceiling, and the sentinel that
-                // stands in for one CANNOT be recovered by subtraction. Rescaling
-                // (9.99e15, 60) down to a fill's exponent overflows u128 and
-                // `me_rescale` saturates, so every fill resets the running
-                // remainder to u128::MAX and erases the ones before it: the final
-                // `want_cap - rw` yields only the LAST fill's contribution, at
-                // whatever exponent that fill happened to use. No sentinel fixes
-                // this — 16 significant digits cannot represent 1e76 minus 2.3.
-                //
-                // #105912291 2AE3693EF556 is a circular tfPartialPayment,
-                // 1 XRP -> RLUSD -> DMNDBR back to self. Hop 0 returned
-                // rw = u128::MAX - 2309435512000000 at exponent -17, so the
-                // carry read as 0.0231 RLUSD where 2.309 had actually been
-                // bought — exactly 100x short. Hop 1 then delivered 71366
-                // DMNDBR against a DeliverMin of 3226580 and we failed
-                // tecPATH_PARTIAL where mainnet delivers in full.
-                //
-                // Read what the hop actually bought instead. Intermediate value
-                // rests on the account's own line for the duration (that is what
-                // `inflight` above snapshots and restores), so the delta on that
-                // line IS the carry, at its own exponent and free of any cap.
-                let out_leg = chain[i + 1];
-                let before = (!last)
-                    .then(|| Self::leg_signed_balance(sandbox, &tx.account, out_leg))
-                    .flatten();
-                let (rw, _rs, _c) = ox::cross_engine_to(
-                    &tx.account, benef, want_cap, carry, chain[i + 1], chain[i],
-                    threshold, threshold, !last, false, None, sandbox, &mut Vec::new(),
-                );
-                carry = match (before, Self::leg_signed_balance(sandbox, &tx.account, out_leg)) {
-                    (Some((bneg, b)), Some((aneg, a))) => {
-                        // delta = after - before; a fall in balance buys nothing.
-                        let (dneg, d) = ox::signed_add(aneg, a, !bneg, b);
-                        if dneg { (0, 0) } else { d }
+                    let q = ox::me_muldiv(sin, (1_000_000_000_000_000, -15), sout, false);
+                    if best.is_none_or(|(_, bq)| ox::me_cmp(q, bq).is_lt()) {
+                        best = Some((i, q));
                     }
-                    // The account issues the hop currency (no line to read), or
-                    // this is the LAST hop, whose cap is the real `want_gross`
-                    // and small enough to subtract exactly.
-                    _ => ox::me_sub(want_cap, rw),
-                };
-                if std::env::var("DX_PAY").is_ok() {
-                    let nm = |l: &ox::Leg| if l.xrp { "XRP".to_string() } else { format!("{}/{}", hex::encode_upper(&l.cur[12..15]), hex::encode(&l.issuer[..4])) };
-                    eprintln!("DX_PAY hop {i}/{n} {} -> {} want_cap={want_cap:?} rw={rw:?} carry={carry:?}", nm(chain[i]), nm(chain[i+1]));
                 }
-                if ox::me_is_zero(carry) {
-                    break; // hop dried: nothing delivered
+                match best {
+                    Some((i, _)) => i,
+                    None => break,
                 }
+            } else {
+                0
+            };
+            let (sin, sout) =
+                Self::strand_pass(tx, dest, &strands[pick], rem_in, rem_out, threshold, multi, sandbox);
+            if ox::me_is_zero(sout) {
+                break;
             }
-            for (k, pre) in inflight {
-                match pre {
-                    Some(bytes) => sandbox.write(k, bytes),
-                    None => sandbox.forget(&k),
-                }
+            rem_in = ox::me_sub(rem_in, sin);
+            rem_out = ox::me_sub(rem_out, sout);
+            delivered = ox::signed_add(false, delivered, false, sout).1;
+            // Spend is unmeasurable when the sender ISSUES the currency it is
+            // spending — there is no line to difference. `rem_in` would then
+            // never fall and the loop would keep buying against a SendMax it
+            // cannot account for, so stop after this round instead.
+            if ox::me_is_zero(sin) {
+                break;
             }
-            carry
-        };
+            if std::env::var("DX_PAY").is_ok() {
+                eprintln!("DX_PAY round strand={pick} spent={sin:?} got={sout:?} rem_in={rem_in:?} rem_out={rem_out:?}");
+            }
+        }
         // The strand's last step redeems the delivered IOU from whoever gave
         // it up and re-issues it to the destination, and that step charges the
         // issuer's TransferRate: `DirectStepI::qualitiesSrcIssues` sets
