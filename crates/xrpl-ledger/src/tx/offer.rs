@@ -1976,14 +1976,32 @@ pub(crate) fn cross_engine_to(
                 // the full 4621775 drops, so the fill floors to 4621774 and
                 // realises 2.16e-7 worse than its limit. Mainnet crosses
                 // nothing and returns tecKILLED; we filled it.
-                if taker_clamped && threshold != u64::MAX && !me_is_zero(give) && !me_is_zero(pay) {
+                // rippled judges the pass it actually flowed and discards it
+                // outright when the realised quality misses the limit:
+                //
+                //   if (limitQuality && q < *limitQuality &&
+                //       (!adjustedRemOut ||
+                //        !withinRelativeDistance(q, *limitQuality, Number(1,-7))))
+                //
+                // StrandFlow.h:700-706. The 1e-7 forgiveness applies ONLY when
+                // `limitOut()` had already REDUCED the requested output to hit
+                // the limit (`adjustedRemOut`, :643-651); otherwise the
+                // comparison is exact. Observed on #105945386 7EF34E79F13A,
+                // where rippled prices the whole 46.96292384379671 -> 535677
+                // fill and throws the pass away over ONE unit —
+                //   Path rejected by limitQuality
+                //     limit: 5773374545669852371  path q: 5773374545669852372
+                // then rests exactly that remainder.
+                //
+                // This used to run only on taker-clamped fills, because the
+                // input ceil overcharged an owner-limited fill by a drop and
+                // the check then stranded #105672435 B409D45C. With the input
+                // rounding following rev/fwd correctly that overcharge is gone,
+                // so the check can be what rippled's is: always, and exact.
+                if threshold != u64::MAX && !me_is_zero(give) && !me_is_zero(pay) {
                     if let Some(ach) = rate_of_me(pay, give) {
                         if ach > threshold {
-                            let (a, t) = (rate_me(ach), rate_me(threshold));
-                            let excess = me_muldiv(me_sub(a, t), (10_000_000, 0), (1, 0), false);
-                            if me_cmp(excess, t).is_ge() {
-                                break 'dirs;
-                            }
+                            break 'dirs;
                         }
                     }
                 }
