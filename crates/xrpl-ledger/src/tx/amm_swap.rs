@@ -613,6 +613,27 @@ pub(crate) fn consume_fib(
     )
 }
 
+/// The pool's FEELESS spot quality — rippled's OPTIMISTIC strand
+/// `qualityUpperBound`, which decides only whether a strand is worth
+/// activating at all (StrandFlow.h:696-699 `qualityUpperBound(sb, *strand) <
+/// *limitQuality => continue`). Execution uses the fee-inclusive spot in
+/// `consume`; this is the best the pool could conceivably do, and being an
+/// upper bound it must NOT charge the fee.
+///
+/// The distinction has teeth: it is the difference between a strand that runs
+/// and reaps dead offers on its way down the book, and one rippled never
+/// builds at all.
+pub(crate) fn spot_upper_bound(sandbox: &Sandbox, amm: &Amm, pays_leg: &Leg, gets_leg: &Leg) -> u64 {
+    let (pool_in, pool_out) = pool_balances(sandbox, amm, pays_leg, gets_leg);
+    if pool_in.0 == 0 || pool_out.0 == 0 {
+        return u64::MAX;
+    }
+    match rate_of(pool_in, pool_out) {
+        0 => u64::MAX,
+        r => r,
+    }
+}
+
 /// Pool balances (in = what the taker pays in, out = what they receive) for
 /// the fib base — captured at crossing start.
 pub(crate) fn pool_balances(sandbox: &Sandbox, amm: &Amm, pays_leg: &Leg, gets_leg: &Leg) -> (Me, Me) {
@@ -864,6 +885,40 @@ mod tests {
         let digits = format!("{int}{frac}");
         let m: u128 = digits.trim_start_matches('0').parse().unwrap();
         n_norm((m, -(frac.len() as i32)))
+    }
+
+    /// The strand-activation bound must NOT charge the trading fee. rippled
+    /// filters strands on an OPTIMISTIC `qualityUpperBound` — the best the
+    /// strand could conceivably do — and only then does execution apply the
+    /// fee. Charging it in the bound makes a strand look unusable that rippled
+    /// still builds, and a strand that is never built reaps nothing.
+    ///
+    /// #105922825 851508DADF49 lives entirely in that gap: pool
+    /// 2005007.508042841 RLUSD / 1869858318641 drops at TradingFee 208, against
+    /// a limit of 1.0723 RLUSD per 1e6 drops. Feeless the pool is INSIDE the
+    /// limit; with the 0.208% fee applied it is outside it. Mainnet builds the
+    /// strand and reaps the expired book tip; charging the fee here would not.
+    #[test]
+    fn the_strand_activation_bound_does_not_charge_the_fee() {
+        let pool_in = me("2005007.508042841");
+        let pool_out = (1_869_858_318_641u128, 0i32);
+        let limit = rate_of(me("1.0723"), (1_000_000, 0));
+
+        let feeless = rate_of(pool_in, pool_out);
+        let with_fee = rate_of(
+            pool_in,
+            n_mul(pool_out, n_sub(N_ONE, fee_n(208), Rnd::Near), Rnd::Near),
+        );
+
+        assert!(feeless < with_fee, "the fee can only make the pool look worse");
+        assert!(
+            feeless <= limit,
+            "feeless {feeless:x} is inside the limit {limit:x} — rippled builds the strand",
+        );
+        assert!(
+            with_fee > limit,
+            "fee-inclusive {with_fee:x} is outside it — which is why nothing crosses",
+        );
     }
 
     /// Mainnet tx 4ED3F03D… (ledger 105035380): LEDGEND→XRP self-arb,

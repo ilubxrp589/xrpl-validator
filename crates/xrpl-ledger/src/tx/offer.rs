@@ -1744,7 +1744,27 @@ pub(crate) fn cross_engine_to(
         // rfPBiFvFeBQ's own later 612F4E95 to clear. A payment carries no
         // `limitQuality` and so no such gate — `threshold` is u64::MAX there
         // and this reads as always-reap, which is what #105795716 needs.
-        if q <= threshold && !reap_to_live_head(sandbox, &dk, taker, pays_leg, gets_leg, stale) {
+        // ...or when the POOL alone is what activates the strand. rippled
+        // filters strands on an optimistic `qualityUpperBound`, and for a book
+        // with an AMM that bound is the pool's FEELESS spot — so a strand whose
+        // every book level is worse than the limit still gets built, its offer
+        // stream still steps, and the dead offers it steps past are still
+        // reaped, even though the fee then makes the pool's real offer miss the
+        // limit and nothing crosses at all.
+        //
+        // #105922825 851508DADF49 sells 1.0723 RLUSD for 1 XRP. EVERY offer in
+        // the XRP/RLUSD book is worse than its 1.0723e-6 limit — the tip
+        // ED7B21F8 is 1.073114e-6 — so on the book alone the strand is skipped
+        // and nothing is touched, which is what we did. But the pool's feeless
+        // spot is 1.07227e-6, inside the limit by a hair, so mainnet builds the
+        // strand, reaps the tip (expired at 838611910 against a parent close of
+        // 838611912) together with its now-empty book page, and rests the offer
+        // in full: 8 nodes to our 4.
+        let strand_active = q <= threshold
+            || amm.as_ref().is_some_and(|a| {
+                crate::tx::amm_swap::spot_upper_bound(sandbox, a, pays_leg, gets_leg) <= threshold
+            });
+        if strand_active && !reap_to_live_head(sandbox, &dk, taker, pays_leg, gets_leg, stale) {
             continue;
         }
         // AMM turn: consume pool liquidity while its spot quality strictly
