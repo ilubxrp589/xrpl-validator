@@ -2446,6 +2446,23 @@ pub fn apply_ledger_in_order_with_net(
         }
         let _ = (overlay_hits, prior_overlay_size);
 
+        // XRPL_FFI_TRACE_TX=<hash prefix>, with XRPL_FFI_TRACE set on the shim,
+        // dumps everything libxrpl narrated while applying that transaction:
+        // which strands it built, which offers its stream stepped past, what
+        // each AMM offer was anchored on, and which gate rejected what. That is
+        // the ground truth for the crossing-path divergences — the source says
+        // what rippled CAN do, this says what it DID.
+        if let Ok(want) = std::env::var("XRPL_FFI_TRACE_TX") {
+            if !want.is_empty() && tx_hash.starts_with(&want) {
+                eprintln!(
+                    "=== FFI_TRACE {tx_hash} {tx_type}/{} ({} mutations) ===\n{}",
+                    outcome.ter_name,
+                    outcome.mutations.len(),
+                    outcome.last_fatal.replace(" | ", "\n"),
+                );
+            }
+        }
+
         let mut s = stats.lock();
         s.live_apply_attempted += 1;
         // Categorize: tesSUCCESS → ok, tec* → claimed (rippled agreed), else → diverged
