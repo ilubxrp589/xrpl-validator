@@ -112,6 +112,141 @@ impl PaymentTransactor {
         Some((!party_holds, bal))
     }
 
+    /// Give `account` a large balance on `leg` so a REVERSE-pass trial can ask
+    /// "how much of this would the next hop need?" — mid-chain the account
+    /// holds none of the intermediate currency yet, and the reverse pass is
+    /// hypothetical by nature. Only ever called inside a snapshot that is
+    /// rolled back. Returns what was granted.
+    fn fund_for_trial(
+        sandbox: &mut Sandbox,
+        account: &[u8; 20],
+        leg: &crate::tx::offer::Leg,
+        grant: u128,
+    ) -> crate::tx::offer::Me {
+        use crate::tx::offer as ox;
+        // XRP hops need funding too — a path may ripple THROUGH XRP
+        // (A -> XRP -> B), and leaving those unfunded made the trial consume
+        // nothing, the requirement compute to zero, and the whole strand die.
+        // That is what regressed #105091578's three payments to tecPATH_PARTIAL
+        // fee-only against mainnet's 8 mutations.
+        if leg.xrp {
+            let key = keylet::account_root_key(account);
+            let Some(mut root) = ox::json_at(sandbox, &key) else {
+                return (0, 0);
+            };
+            root["Balance"] = serde_json::json!(grant.to_string());
+            ox::put_json(sandbox, key, &root);
+            return (grant, 0);
+        }
+        let big = grant.to_string();
+        let BIG: &str = &big;
+        let key = keylet::ripple_state_key(account, &leg.issuer, &leg.cur);
+        let low = account < &leg.issuer;
+        let cur = hex::encode_upper(leg.cur);
+        let value = if low { BIG.to_string() } else { format!("-{BIG}") };
+        let balance = serde_json::json!({
+            "currency": cur, "issuer": "0000000000000000000000000000000000000000", "value": value,
+        });
+        match ox::json_at(sandbox, &key) {
+            // Keep an existing line's settings; only the balance is synthetic.
+            Some(mut line) => {
+                line["Balance"] = balance;
+                ox::put_json(sandbox, key, &line);
+            }
+            None => {
+                let (lo, hi) = if low { (*account, leg.issuer) } else { (leg.issuer, *account) };
+                let line = serde_json::json!({
+                    "LedgerEntryType": "RippleState",
+                    "Flags": 0u64,
+                    "Balance": balance,
+                    "LowLimit": {"currency": cur, "issuer": hex::encode(lo), "value": BIG},
+                    "HighLimit": {"currency": cur, "issuer": hex::encode(hi), "value": BIG},
+                });
+                sandbox.write(key, serde_json::to_vec(&line).expect("serializing valid JSON Value"));
+            }
+        }
+        (grant, 0)
+    }
+
+    /// rippled flows a strand in TWO passes: a REVERSE pass walking back from
+    /// the requested output to work out how much input each step needs, then a
+    /// FORWARD pass bounded by what is actually available (StrandFlow.h
+    /// `flow<>`). Ours was forward-only, so an intermediate hop sold its WHOLE
+    /// carry rather than buying only what the hop after it could use.
+    ///
+    /// #105912291 2AE3693EF556: its RLUSD hop consumed Offer 3A3053B3 entire —
+    /// all 1.03989 RLUSD — where mainnet takes 0.548387106688172 and leaves the
+    /// rest resting, because that is all the DMNDBR leg needed. It is the same
+    /// reason mainnet spends 999989 of the 1000000 SendMax instead of all of it.
+    ///
+    /// Returns `need[i]` = the output hop `i` must produce. The last entry is
+    /// the caller's `want_out`; each earlier one is what the hop after it turned
+    /// out to consume. A zero means that hop found no liquidity at all.
+    #[allow(clippy::too_many_arguments)]
+    fn reverse_requirements(
+        tx: &TxFields,
+        chain: &[&crate::tx::offer::Leg],
+        want_out: crate::tx::offer::Me,
+        threshold: u64,
+        sandbox: &mut Sandbox,
+    ) -> Vec<crate::tx::offer::Me> {
+        use crate::tx::offer as ox;
+        let n = chain.len() - 1;
+        let mut need = vec![(0u128, 0i32); n];
+        need[n - 1] = want_out;
+        for i in (1..n).rev() {
+            let (in_leg, out_leg) = (chain[i], chain[i + 1]);
+            // The grant must be modest. A balance is only 16 significant
+            // digits, so funding 1e15 and differencing it destroys everything
+            // below the integer: consuming 2.27264565429365 of it leaves
+            // 999999999999997.73, which rounds to ...998, and the requirement
+            // reads back as a flat 2. That is what regressed #105091578's three
+            // payments — hop 0 was told to buy 2 RLUSD where 2.27 was needed,
+            // delivered 1.99976 against a DeliverMin of 2.26128, and failed
+            // tecPATH_PARTIAL.
+            //
+            // So start small and escalate only while the trial is INPUT-bound
+            // (it could not produce all of need[i]). Each step is 1e6, which
+            // keeps the delta within six orders of the grant and so leaves ~10
+            // significant digits intact.
+            let mut consumed = (0u128, 0i32);
+            for grant in [1_000_000u128, 1_000_000_000_000, 1_000_000_000_000_000_000] {
+                let snap = sandbox.snapshot();
+                let granted = Self::fund_for_trial(sandbox, &tx.account, in_leg, grant);
+                let before = Self::leg_signed_balance(sandbox, &tx.account, in_leg);
+                let (rw, _, _) = ox::cross_engine_to(
+                    &tx.account, &tx.account, need[i], granted, out_leg, in_leg,
+                    threshold, threshold, false, false, false, None, sandbox, &mut Vec::new(),
+                );
+                consumed = match (before, Self::leg_signed_balance(sandbox, &tx.account, in_leg)) {
+                    (Some((bneg, b)), Some((aneg, a))) => {
+                        let (dneg, d) = ox::signed_add(bneg, b, !aneg, a); // before - after
+                        if dneg { (0, 0) } else { d }
+                    }
+                    _ => (0, 0),
+                };
+                sandbox.restore_snapshot(snap);
+                // The full requirement came out, so the grant was not the
+                // binding constraint and `consumed` is the real answer.
+                if ox::me_is_zero(rw) {
+                    break;
+                }
+            }
+            // A requirement we could not MEASURE is not a requirement of zero.
+            // The account may issue the hop currency itself (no line to
+            // difference), or the trial may have been unable to fund it. Fall
+            // back to the old unbounded cap there so the hop behaves exactly as
+            // it did before the reverse pass existed, rather than reporting the
+            // strand dry.
+            need[i - 1] = if ox::me_is_zero(consumed) {
+                (9_990_000_000_000_000, 60)
+            } else {
+                consumed
+            };
+        }
+        need
+    }
+
     /// Flow ONE pass of `chain` and report (spent on the first leg, delivered
     /// on the last). With `single_pass` this is rippled's per-strand `flow()`:
     /// a single quality level per book step, so the caller can re-evaluate
@@ -173,26 +308,29 @@ impl PaymentTransactor {
                 inflight.push((root, pre));
             }
         }
+        // REVERSE pass first: size each hop to what the one after it needs.
+        let need = Self::reverse_requirements(tx, chain, want_out, threshold, sandbox);
         let spend_before = Self::leg_signed_balance(sandbox, &tx.account, spend_leg);
         let mut carry = avail_in;
         for i in 0..n {
             let last = i + 1 == n;
             let benef = if last { dest } else { &tx.account };
-            // Intermediate hops SELL the whole carry; the last hop buys up to
-            // the Amount cap.
-            let want_cap = if last { want_out } else { (9_990_000_000_000_000, 60) };
-            // That sentinel cannot be recovered by subtraction — me_rescale
-            // saturates, so each fill re-pins the remainder at u128::MAX and
-            // erases the ones before it, leaving only the LAST fill at the LAST
-            // fill's exponent. Measure the balance delta on the in-flight line
-            // instead; see the commit that introduced this.
+            // Each hop buys exactly what the next one needs — no more, which is
+            // what leaves a partially-filled offer behind instead of consuming
+            // it whole. An intermediate hop that the reverse pass found no
+            // liquidity for cannot feed the rest of the chain.
+            let want_cap = need[i];
+            // The carry is still measured as a balance delta rather than by
+            // subtracting from the cap: me_rescale saturates, so a cap far above
+            // the fill sizes loses the subtraction entirely (each fill re-pins
+            // the remainder at u128::MAX and erases the ones before it).
             let out_leg = chain[i + 1];
             let before = (!last)
                 .then(|| Self::leg_signed_balance(sandbox, &tx.account, out_leg))
                 .flatten();
             let (rw, _rs, _c) = ox::cross_engine_to(
                 &tx.account, benef, want_cap, carry, chain[i + 1], chain[i],
-                threshold, threshold, !last, false, single_pass, None, sandbox, &mut Vec::new(),
+                threshold, threshold, false, false, single_pass, None, sandbox, &mut Vec::new(),
             );
             carry = match (before, Self::leg_signed_balance(sandbox, &tx.account, out_leg)) {
                 (Some((bneg, b)), Some((aneg, a))) => {
