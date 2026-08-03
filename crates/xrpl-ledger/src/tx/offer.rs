@@ -1716,6 +1716,9 @@ pub(crate) fn cross_engine_to(
     // offer, and only then does `execOffer`'s `checkQualityThreshold` end the
     // walk. See the `done` branch at the end of the maker loop.
     let mut trailing = false;
+    // The first level always anchors the pool: rippled's single `tryAMM` fires
+    // on the first live tip whatever it is, self-offer included.
+    let mut prev_level_crossed = true;
     'dirs: for dk in dirs {
         let (level_pays_in, level_gets_in) = (rem_pays, rem_gets);
         let q = u64::from_be_bytes(dk.0[24..32].try_into().unwrap_or_default());
@@ -1769,7 +1772,23 @@ pub(crate) fn cross_engine_to(
         }
         // AMM turn: consume pool liquidity while its spot quality strictly
         // beats this book level (anchored so the book resumes at `q`).
-        if let Some(a) = &amm {
+        //
+        // ONE turn per PASS, not per level. rippled calls `tryAMM` exactly once
+        // per `forEachOffer`, anchored on the first live tip
+        // (BookStep.cpp:855-865), and a pass ends only when an offer is really
+        // CONSUMED — the strand then re-runs and the pool gets another turn. An
+        // offer merely REMOVED never ends the pass: `limitSelfCrossQuality`
+        // returns before anything is consumed and the walk keeps stepping
+        // inside the same `forEachOffer`, with no second `tryAMM`.
+        //
+        // #105945386 7EF34E79F13A: the two levels ahead of the pool hold
+        // nothing but the taker's OWN offers, so re-anchoring on each of them
+        // took three slices (182925 + 113464 + 422213 drops) that bought the
+        // order outright. rippled takes ONE slice of 182925 and then flows the
+        // remaining 535677 as a single pass costing 46.96292384379671 SPEPE —
+        // one unit past its own limit — which the achieved-quality check then
+        // rejects, leaving exactly that remainder to rest.
+        if let Some(a) = amm.as_ref().filter(|_| prev_level_crossed) {
             if std::env::var("DX_AMM").is_ok() {
                 eprintln!("DX_AMM site=direct-walk q={q:x}");
             }
@@ -1783,6 +1802,9 @@ pub(crate) fn cross_engine_to(
                 break 'dirs;
             }
         }
+        // Set when this level CONSUMES an offer, which is what ends a pass and
+        // earns the pool its next turn. Removals leave it false.
+        let mut level_crossed = false;
         if std::env::var("DX_BOOK").is_ok() {
             eprintln!("DX_BOOK dir q={q:016x} threshold={threshold:016x} cross={}", q <= threshold);
         }
@@ -2001,7 +2023,16 @@ pub(crate) fn cross_engine_to(
                 if threshold != u64::MAX && !me_is_zero(give) && !me_is_zero(pay) {
                     if let Some(ach) = rate_of_me(pay, give) {
                         if ach > threshold {
-                            break 'dirs;
+                            // A rejected pass ends the crossing outright —
+                            // rippled logs "All strands dry" and its Total flow
+                            // is whatever the ACCEPTED passes delivered. Falling
+                            // through to the unanchored tail turn instead lets
+                            // the pool supply the very amount the book was just
+                            // refused, at a better rate, which is how
+                            // #105945386 still bought its remainder (46.91474
+                            // SPEPE for the same 535677 drops) after the check
+                            // had correctly rejected 46.96292384379671.
+                            return (rem_pays, rem_gets, crossed);
                         }
                     }
                 }
@@ -2010,6 +2041,7 @@ pub(crate) fn cross_engine_to(
                 rem_pays = me_sub(rem_pays, give);
                 rem_gets = me_sub(rem_gets, pay);
                 crossed += 1;
+                level_crossed = true;
                 let consumed = me_cmp(give, m_gives0).is_ge() || me_cmp(give, funded).is_ge();
                 if consumed {
                     delete_maker_offer(sandbox, &okey, &offer, &maker);
@@ -2057,6 +2089,7 @@ pub(crate) fn cross_engine_to(
         if single_pass && (rem_pays != level_pays_in || rem_gets != level_gets_in) {
             return (rem_pays, rem_gets, crossed);
         }
+        prev_level_crossed = level_crossed;
     }
     // Final AMM turn once the book is exhausted (maxOffer sizing).
     if let Some(a) = &amm {
