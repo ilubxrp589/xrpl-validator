@@ -1916,7 +1916,39 @@ pub(crate) fn cross_engine_to(
                 }
                 let mut pay = me_muldiv(give, m_wants0, m_gives0, true);
                 if gets_leg.xrp {
-                    pay = (me_rescale(pay, 0, true), 0);
+                    // Whole drops FLOOR, they do not ceil. Observed twice in
+                    // libxrpl's own trace (XRPL_FFI_TRACE):
+                    //
+                    //   #105672435 B409D45C — maker 499CA86D funded 22.283542
+                    //   of 22.928591 against TakerPays 5878826. Exact input is
+                    //   5713437.2575…; rippled charges `New flow iter: 0
+                    //   5713437 22.283542`. Ceiling to 5713438 makes the fill's
+                    //   ACHIEVED quality worse than the taker's limit, which is
+                    //   what forced the achieved-quality re-check below to be
+                    //   narrowed to taker-clamped fills to avoid stranding it.
+                    //
+                    //   #105814446 2162E284EAB3 — the same drop. Our carry
+                    //   23.19788237285018 already equals mainnet's total from
+                    //   the first two offers exactly, but we spend the whole
+                    //   3061631 SendMax getting there while rippled has ONE
+                    //   drop left, which it spends on offer D9D7D788 for
+                    //   3e-13 CNY (TakerPays 60930000 -> 60929999) to land the
+                    //   full Amount. We stopped 3.1e-13 short.
+                    //
+                    // The direction follows WHICH SIDE bounds the fill, which
+                    // is rippled's rev/fwd split. When the taker's remaining
+                    // want bounds it, the input is computed FROM that output
+                    // (`rev`) and must round UP so the taker pays enough — that
+                    // is how the CNY dust fill costs a whole drop for 3e-13.
+                    // When the MAKER's funding bounds it, the output is what is
+                    // fixed and the input follows it (`fwd`), rounding DOWN —
+                    // B409D45C's 5713437.2575 becomes 5713437, not 5713438.
+                    //
+                    // Rounding up in both directions overcharges the
+                    // owner-limited fill by a drop, and that drop is
+                    // load-bearing: it is the difference between reaching the
+                    // last offer and stopping short of it.
+                    pay = (me_rescale(pay, 0, buy_bound), 0);
                 }
                 if me_cmp(pay, rem_gets).is_gt() {
                     pay = rem_gets;
