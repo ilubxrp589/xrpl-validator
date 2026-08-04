@@ -1482,6 +1482,24 @@ fn cross_bridged(
                 (None, None) => None,
             }
         };
+        if std::env::var("DX_BRIDGE").is_ok() {
+            let hk = |p: &Option<(u64, Hash256, serde_json::Value, [u8; 20], Me, Me)>| {
+                p.as_ref().map(|(_, k, ..)| hex::encode_upper(&k.0[..6])).unwrap_or_else(|| "-".to_string())
+            };
+            let raw_a = la.get(ai).map(|(q, _)| rate_me(*q));
+            let raw_b = lb.get(bi).map(|(q, _)| rate_me(*q));
+            let rk = |l: &[(u64, Hash256)], i: usize| {
+                l.get(i).map(|(_, k)| hex::encode_upper(&k.0[..6])).unwrap_or_else(|| "-".to_string())
+            };
+            eprintln!(
+                "DX_HEADS d={} a={} b={} qa_book={qa_book:?} qb_book={qb_book:?} qa={qa:?} qb={qb:?} a_amm={a_use_amm} b_amm={b_use_amm}",
+                hk(&dpeek), hk(&apeek), hk(&bpeek)
+            );
+            eprintln!(
+                "DX_RAWHEADS a={} b={} raw_a={raw_a:?} raw_b={raw_b:?} ai={ai} bi={bi} la={} lb={}",
+                rk(&la, ai), rk(&lb, bi), la.len(), lb.len()
+            );
+        }
         // AMM turn: the direct-pair pool competes with the best BOOK rate
         // via multi-path FIB slices (its AVERAGE quality incl. slippage/fee).
         if let (Some(a), Some(init)) = (amm, &amm_init) {
