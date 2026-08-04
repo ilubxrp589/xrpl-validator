@@ -1109,23 +1109,41 @@ fn is_dust_offer(
 ///
 /// An offer the stream cannot judge is left alone rather than condemned — an
 /// unhydrated maker reads as unfunded and phantom deletions poisoned the first
-/// bridge attempt. A self-owned offer likewise stops the scan: `step` has no
-/// owner==taker case, so cancelling one belongs to offer crossing, not here.
-/// Deep-frozen and out-of-domain, the two remaining `permRmOffer` conditions,
-/// are unmodelled here exactly as they are in the crossing walk.
+/// bridge attempt. Deep-frozen and out-of-domain, the two remaining
+/// `permRmOffer` conditions, are unmodelled here exactly as they are in the
+/// crossing walk.
+///
+/// A SELF-OWNED offer is judged by these tests like any other. `step` has no
+/// owner==taker case — every condition it applies reads `offer_.owner()` and
+/// none compares it to the taker — so a self-owned offer that is DEAD is
+/// reaped here; only a LIVE one stops the scan, because cancelling that is
+/// offer crossing's `limitSelfCrossQuality`, not the stream's job. This
+/// function used to bail on `maker == taker` before any test, which inverted
+/// that reading: it took "step has no owner==taker case" as grounds to skip
+/// self-owned offers entirely, when it is grounds to treat them normally.
+///
+/// #105949459 4A03010A4B1E: `rKkBNf2d` buys 63 ShearPepe while holding NONE,
+/// and its own `EC95059B` (seq 93095690) sits at the head of that very book
+/// promising to sell 63 it does not have. The pool fills the whole 708735
+/// drops, so the walk never enters the page, and the bail then stopped the
+/// level scan from reaping it — 4 mutations against 7, the missing three being
+/// exactly that offer, its emptied book page `079C9589`, and the owner
+/// directory `7B6745CD`. rippled logs `Removing unfunded offer EC95059B…`.
+///
+/// ⚠ Unmodelled: rippled separates "found unfunded" from "became unfunded"
+/// (OfferStream.cpp, `originalFunds == *ownerFunds_`) and only the former is a
+/// `permRmOffer`. This runs before the level's AMM turn, so current funds are
+/// still the pristine funds and the distinction cannot bite here; a reap sited
+/// after a fill would need it.
 fn reap_if_dead(
     sandbox: &mut Sandbox,
     okey: &Hash256,
     offer: &serde_json::Value,
     maker: &[u8; 20],
-    taker: &[u8; 20],
     pays_leg: &Leg,
     gets_leg: &Leg,
     stale: &mut Vec<Hash256>,
 ) -> bool {
-    if maker == taker {
-        return false;
-    }
     // `hasExpired`: the BASE ledger's close time is the test (View.cpp:48, and
     // BookStep.cpp:705 builds the stream with `sb.parentCloseTime()`).
     if let Some(exp) = offer.get("Expiration").and_then(|v| v.as_u64()) {
@@ -1166,7 +1184,6 @@ fn reap_if_dead(
 fn reap_to_live_head(
     sandbox: &mut Sandbox,
     dk: &Hash256,
-    taker: &[u8; 20],
     pays_leg: &Leg,
     gets_leg: &Leg,
     stale: &mut Vec<Hash256>,
@@ -1194,7 +1211,7 @@ fn reap_to_live_head(
             }
             let Some(maker) = offer.get("Account").and_then(|v| v.as_str()).and_then(decode20)
             else { continue };
-            if !reap_if_dead(sandbox, &okey, &offer, &maker, taker, pays_leg, gets_leg, stale) {
+            if !reap_if_dead(sandbox, &okey, &offer, &maker, pays_leg, gets_leg, stale) {
                 return true;
             }
         }
@@ -1620,12 +1637,25 @@ fn cross_bridged(
         //   multi  — `generateFibSeqOffer`, priced at the POOL's own quality,
         //            so `BookStep::tip` returns the pool whenever it beats the
         //            LOB tip;
-        //   single — `changeSpotPriceQuality` matched to the LOB tip
-        //            (`BookOfferCrossingStep::qualityThreshold` returns
-        //            lobQuality, BookStep.cpp:475-480), whose quality EQUALS
-        //            the LOB's, so `tip`'s `ammOffer->quality() > lobQuality`
-        //            is false and the strand falls back to its BOOK. With one
-        //            strand left the pool cannot lift the strand at all.
+        //   single — `changeSpotPriceQuality` matched to the LOB tip, whose
+        //            quality EQUALS the LOB's, so `tip`'s
+        //            `ammOffer->quality() > lobQuality` is false and the
+        //            strand falls back to its BOOK.
+        //
+        // There is a second single-path branch, and it does NOT change the
+        // outcome: `BookOfferCrossingStep::qualityThreshold` (BookStep.cpp:
+        // 475-480) returns lobQuality only while
+        // `qualityThreshold_ <= lobQuality`; when the taker's limit BEATS the
+        // leg's book it returns nullopt and `getAMMOffer` yields `maxOffer`
+        // instead. But `maxOffer` drives ~99% of the pool's output side out,
+        // so its AVERAGE quality is ~100x worse than spot and it loses `tip`'s
+        // comparison to any live book. Measured on #105940336 leg B (pool
+        // rQBeAgh, 103807148357 drops / 1.745915504076971 BTC):
+        //     spot      1.681884e-11 BTC/drop
+        //     fib slice 1.681144e-11   (0.025% of the pool)
+        //     maxOffer  1.681564e-13   (99% of pool BTC out, 100.0x worse)
+        // ⚠ Compute these, do not eyeball: the trace mixes drops and XRP and
+        // this exact figure has now been misread by 100x three times.
         // A strand whose `qualityUpperBound` misses limitQuality is dropped
         // from the candidate set — silently, `continue` with no log line, in
         // both `activateNext` and the strand loop (StrandFlow.h:667-673).
@@ -1892,7 +1922,7 @@ pub(crate) fn cross_engine_to(
         let (level_pays_in, level_gets_in) = (rem_pays, rem_gets);
         let q = u64::from_be_bytes(dk.0[24..32].try_into().unwrap_or_default());
         if trailing {
-            if reap_to_live_head(sandbox, &dk, taker, pays_leg, gets_leg, stale) {
+            if reap_to_live_head(sandbox, &dk, pays_leg, gets_leg, stale) {
                 break 'dirs;
             }
             continue;
@@ -1936,7 +1966,7 @@ pub(crate) fn cross_engine_to(
             || amm.as_ref().is_some_and(|a| {
                 crate::tx::amm_swap::spot_upper_bound(sandbox, a, pays_leg, gets_leg) <= threshold
             });
-        if strand_active && !reap_to_live_head(sandbox, &dk, taker, pays_leg, gets_leg, stale) {
+        if strand_active && !reap_to_live_head(sandbox, &dk, pays_leg, gets_leg, stale) {
             continue;
         }
         // AMM turn: consume pool liquidity while its spot quality strictly
@@ -2013,7 +2043,7 @@ pub(crate) fn cross_engine_to(
                 let Some(maker) = offer.get("Account").and_then(|v| v.as_str()).and_then(decode20)
                 else { continue };
                 if trailing {
-                    if reap_if_dead(sandbox, &okey, &offer, &maker, taker, pays_leg, gets_leg, stale) {
+                    if reap_if_dead(sandbox, &okey, &offer, &maker, pays_leg, gets_leg, stale) {
                         continue;
                     }
                     break 'dirs;
@@ -3931,6 +3961,98 @@ mod tests {
 
         assert!(sandbox.exists(&okey), "an unopened book must not be reaped");
         assert!(stale.is_empty());
+    }
+
+    /// The dead tests apply to the taker's OWN offer too. `OfferStream::step`
+    /// has no owner==taker case — every condition reads `offer_.owner()` and
+    /// none compares it to the taker — so a self-owned offer that is UNFUNDED
+    /// is reaped exactly like a stranger's. Only a LIVE self-owned offer stops
+    /// the scan, because cancelling that is offer crossing's job.
+    ///
+    /// #105949459 4A03010A4B1E: `rKkBNf2d` buys 63 ShearPepe holding NONE, and
+    /// its own `EC95059B` heads that book promising 63 it does not have. The
+    /// pool filled all 708735 drops so the page was never read, and the
+    /// `maker == taker` bail then stopped the level scan from reaping it —
+    /// 4 mutations against 7. rippled logs `Removing unfunded offer EC95059B…`.
+    #[test]
+    fn the_takers_own_unfunded_offer_is_reaped_when_the_pool_fills_everything() {
+        let taker = [0x01u8; 20];
+        let issuer = [0x02u8; 20];
+        let pool = [0x05u8; 20];
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+
+        let mut state = make_state_with_account(&taker, 50_000_000);
+        for id in [&issuer, &pool] {
+            let a = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": hex::encode(id),
+                "Balance": "500000000", "Sequence": 1, "OwnerCount": 0,
+            });
+            state.state_map.insert(keylet::account_root_key(id), serde_json::to_vec(&a).unwrap()).unwrap();
+        }
+        let line = |who: &[u8; 20], bal: &str| {
+            let (lo, hi) = if who < &issuer { (*who, issuer) } else { (issuer, *who) };
+            serde_json::json!({
+                "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+                "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000",
+                            "value": if who < &issuer { bal.to_string() } else { format!("-{bal}") }},
+                "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "10000000"},
+                "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "10000000"},
+            })
+        };
+        for (who, bal) in [(&taker, "100"), (&pool, "1000")] {
+            state
+                .state_map
+                .insert(keylet::ripple_state_key(who, &issuer, &cur), serde_json::to_vec(&line(who, bal)).unwrap())
+                .unwrap();
+        }
+
+        // The TAKER rests 100 USD for 100 XRP — the book's only level. It has
+        // to be funded to be placed at all (`tecUNFUNDED_OFFER`), so the USD
+        // goes afterwards, exactly as it does on chain when the account sells
+        // its holding and leaves the offer standing.
+        let mut sandbox = Sandbox::new(&state);
+        let own = TxFields {
+            account: taker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerPays": "100000000",
+                "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
+            }),
+        };
+        assert_eq!(OfferCreateTransactor.do_apply(&own, &mut sandbox), TxResult::Success);
+        let mods = sandbox.into_modifications();
+        apply_modifications(&mut state, mods).unwrap();
+        state
+            .state_map
+            .insert(keylet::ripple_state_key(&taker, &issuer, &cur), serde_json::to_vec(&line(&taker, "0")).unwrap())
+            .unwrap();
+
+        // A 500 XRP / 1000 USD pool, priced far inside that level.
+        let xrp_leg = leg_of(&serde_json::json!("1")).unwrap();
+        let usd_leg = leg_of(&serde_json::json!({
+            "currency": "USD", "issuer": hex::encode(issuer), "value": "1"
+        }))
+        .unwrap();
+        let amm = serde_json::json!({
+            "LedgerEntryType": "AMM", "Account": hex::encode(pool), "TradingFee": 0,
+        });
+        let akey = keylet::amm_key(&xrp_leg.cur, &xrp_leg.issuer, &usd_leg.cur, &usd_leg.issuer);
+        state.state_map.insert(akey, serde_json::to_vec(&amm).unwrap()).unwrap();
+
+        let okey = keylet::offer_key(&taker, 2);
+        let mut sandbox = Sandbox::new(&state);
+        assert!(sandbox.exists(&okey), "the taker's own offer starts on the book");
+        assert!(me_is_zero(available(&mut sandbox, &taker, &usd_leg)), "and is unfunded");
+
+        let mut stale = Vec::new();
+        let (rp, _rg, _crossed) = cross_engine_to(
+            &taker, &taker, (1_000_000_000_000_000, -15), (1_000_000, 0), &usd_leg, &xrp_leg,
+            u64::MAX, u64::MAX, false, false, false, None, &mut sandbox, &mut stale,);
+
+        assert!(!sandbox.exists(&okey), "the taker's own unfunded offer must be reaped");
+        assert!(stale.contains(&okey), "and reported as removed for the cancel view");
+        assert!(me_is_zero(rp), "the pool covered the whole USD request");
     }
 
     /// One book level holding two identical offers — 100 USD for 100 XRP —
