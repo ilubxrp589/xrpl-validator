@@ -1371,6 +1371,17 @@ fn cross_bridged(
             crate::tx::amm_swap::fib_slice(sandbox, am, amm_b_init, amm_b_iters, pays_leg, &xrp_leg)
                 .map(|s| (crate::tx::amm_swap::slice_rate(s.0, s.1), s))
         });
+        // A BOOK offer competing with a POOL is not worth its face quality: in
+        // offer crossing `ownerPaysTransferFee_` is true, so the offer OWNER
+        // pays the output issuer's TransferRate and the taker receives that
+        // much less (BookStep.cpp:737-739). An AMM offer pays no such fee.
+        // Only a leg whose OUTPUT carries an issuer is affected — leg A pays
+        // out XRP and is never discounted.
+        let out_rate = transfer_rate(sandbox, pays_leg);
+        let discount = |q: Me| match out_rate {
+            Some(r) => me_muldiv(q, (r as u128, 0), (1_000_000_000, 0), true),
+            None => q,
+        };
         let qa_book = apeek.as_ref().map(|(q, ..)| rate_me(*q));
         let qb_book = bpeek.as_ref().map(|(q, ..)| rate_me(*q));
         // The pool wins a leg only when STRICTLY better than the book head.
@@ -1380,10 +1391,44 @@ fn cross_bridged(
             _ => false,
         };
         let b_use_amm = match (&b_fib, qb_book) {
-            (Some((qf, _)), Some(qb)) => me_cmp(*qf, qb).is_lt(),
+            (Some((qf, _)), Some(qb)) => me_cmp(*qf, discount(qb)).is_lt(),
             (Some(_), None) => true,
             _ => false,
         };
+    // An AMM leg does NOT price linearly. `b_out_full/b_in_full` is the ratio of
+    // that leg's fib SLICE — on #105912454 leg B the slice is ~26.1M drops while
+    // the pass moves 1M — so scaling it down linearly under-delivers and every
+    // quality computed from it comes out pessimistic. Reprice the actual amount
+    // through the pool instead, which is what rippled's AMMOffer does on
+    // execution (swapAssetIn / swapAssetOut), reserving the slice purely for
+    // sizing.
+    let reprice_b = |xrp: Me, lin: Me, sandbox: &Sandbox| -> Me {
+        match (b_use_amm, amm_b.as_ref()) {
+            (true, Some(am)) => {
+                let (pin, pout) = crate::tx::amm_swap::pool_balances(sandbox, am, pays_leg, &xrp_leg);
+                if pin.0 == 0 || pout.0 == 0 {
+                    return lin;
+                }
+                crate::tx::amm_swap::swap_asset_in(pin, pout, xrp, am.tfee, pays_leg.xrp)
+            }
+            _ => lin,
+        }
+    };
+    let reprice_a = |xrp: Me, lin: Me, sandbox: &Sandbox| -> Me {
+        match (a_use_amm, amm_a.as_ref()) {
+            (true, Some(am)) => {
+                let (pin, pout) = crate::tx::amm_swap::pool_balances(sandbox, am, &xrp_leg, gets_leg);
+                if pin.0 == 0 || pout.0 == 0 {
+                    return lin;
+                }
+                match crate::tx::amm_swap::swap_asset_out(pin, pout, xrp, am.tfee, gets_leg.xrp) {
+                    Some(v) if v.0 != 0 => v,
+                    _ => lin,
+                }
+            }
+            _ => lin,
+        }
+    };
         let qa = if a_use_amm { a_fib.as_ref().map(|(q, _)| *q) } else { qa_book };
         let qb = if b_use_amm { b_fib.as_ref().map(|(q, _)| *q) } else { qb_book };
         let dq = dpeek.as_ref().map(|(q, ..)| rate_me(*q));
@@ -1438,22 +1483,83 @@ fn cross_bridged(
         if taker == beneficiary {
             reap_self_offers_at_head(sandbox, &ld, di, taker, threshold_self, stale);
         }
-        // Pick the better (lower pays-per-gets) source within the threshold.
-        let use_direct = match (dq, bq) {
-            (Some(d), Some(b)) => me_cmp(d, b).is_le(),
+        // Choose on what each candidate REALISES, not on its marginal rate.
+        // A source's marginal quality prices that source's own slice; the pass
+        // moves a different (usually much smaller) amount and prices better.
+        // rippled flows EACH strand's actual pass and keeps the best by the
+        // quality it realised (StrandFlow `flow()` per strand + BestStrand).
+        //
+        // #105912454 FE592890B233: marginal dq 63857.53 beats marginal bq
+        // 63862.85, so we took the DIRECT strand, whose fill is worse than the
+        // 63856.19 limit and gets rejected — crossing nothing. rippled takes
+        // the BRIDGE, realising 63847.50, inside the limit. The bridge's
+        // realised rate beats its marginal one because leg B's fib slice is
+        // ~26.1M drops while the pass moves only 1M.
+        //
+        // Both estimates come from the non-mutating peeks, mirroring the sizing
+        // the execution branches do, so those branches stay untouched.
+        let est_direct = dpeek.as_ref().and_then(|(_, _, _, maker, gives0, wants0)| {
+            let funded = available(sandbox, maker, pays_leg);
+            let m_gives = if me_cmp(funded, *gives0).is_lt() { funded } else { *gives0 };
+            let mut give = if !sell && me_cmp(rem_pays, m_gives).is_lt() { rem_pays } else { m_gives };
+            let mut pay = me_muldiv(give, *wants0, *gives0, true);
+            if me_cmp(pay, rem_gets).is_gt() {
+                pay = rem_gets;
+                give = me_muldiv(pay, *gives0, *wants0, false);
+            }
+            if me_is_zero(give) || me_is_zero(pay) { return None; }
+            rate_of_me(pay, give)
+        });
+        let est_bridge = (|| {
+            let (a_cap, a_in_f, a_out_f) = if a_use_amm {
+                let (_, (s_in, s_out)) = a_fib.as_ref()?;
+                (*s_out, *s_in, *s_out)
+            } else {
+                let (_, _, _, am, ag, aw) = apeek.as_ref()?;
+                let funded = available(sandbox, am, &xrp_leg);
+                let cap = if me_cmp(funded, *ag).is_lt() { funded } else { *ag };
+                (cap, *aw, *ag)
+            };
+            let (b_cap, b_in_f, b_out_f) = if b_use_amm {
+                let (_, (s_in, s_out)) = b_fib.as_ref()?;
+                (*s_in, *s_in, *s_out)
+            } else {
+                let (_, _, _, _, bg, bw) = bpeek.as_ref()?;
+                (*bw, *bw, *bg)
+            };
+            let mut xrp = if me_cmp(a_cap, b_cap).is_lt() { a_cap } else { b_cap };
+            let mut gets_in = me_muldiv(xrp, a_in_f, a_out_f, true);
+            if me_cmp(gets_in, rem_gets).is_gt() {
+                gets_in = rem_gets;
+                xrp = me_muldiv(gets_in, a_out_f, a_in_f, false);
+            }
+            let mut pays_out = reprice_b(xrp, me_muldiv(xrp, b_out_f, b_in_f, false), sandbox);
+            if !sell && me_cmp(pays_out, rem_pays).is_gt() {
+                pays_out = rem_pays;
+                xrp = me_muldiv(pays_out, b_in_f, b_out_f, true);
+                gets_in = reprice_a(xrp, me_muldiv(xrp, a_in_f, a_out_f, true), sandbox);
+            }
+            if me_is_zero(gets_in) || me_is_zero(pays_out) { return None; }
+            rate_of_me(gets_in, pays_out)
+        })();
+        // Discard a candidate whose realised quality misses the limit outright,
+        // then take the better of what is left.
+        let ok = |q: Option<u64>| q.filter(|v| threshold == u64::MAX || *v <= threshold);
+        let (ed, eb) = (ok(est_direct), ok(est_bridge));
+        let use_direct = match (ed, eb) {
+            (Some(d), Some(b)) => d <= b,
             (Some(_), None) => true,
             (None, Some(_)) => false,
             (None, None) => break,
         };
-        let spot = if use_direct { dq.unwrap() } else { bq.unwrap() };
+        if std::env::var("DX_BRIDGE").is_ok() {
+            eprintln!("DX_EST direct={est_direct:?} bridge={est_bridge:?} thr={threshold} use_direct={use_direct}");
+        }
         if std::env::var("DX_BRIDGE").is_ok() {
             eprintln!("DX_BRIDGE dq={dq:?} bq={bq:?} thr={thr:?} use_direct={use_direct} di={di} ai={ai} bi={bi} ld={} la={} lb={}", ld.len(), la.len(), lb.len());
         }
-        if let Some(t) = thr {
-            if me_cmp(spot, t).is_gt() {
-                break;
-            }
-        }
+        // No marginal bail: the realised estimates above already gated this
+        // iteration, and the judge below checks what it actually moved.
         // A bridged pass cannot stop at the pool. Off the default path
         // `BookOfferCrossingStep::checkQualityThreshold` (BookStep.cpp:~470,
         // `!defaultPath_ || quality >= qualityThreshold_`) is disabled, so
@@ -1572,11 +1678,11 @@ fn cross_bridged(
                 gets_in = rem_gets;
                 xrp = me_muldiv(gets_in, a_out_full, a_in_full, false);
             }
-            let mut pays_out = me_muldiv(xrp, b_out_full, b_in_full, false);
+            let mut pays_out = reprice_b(xrp, me_muldiv(xrp, b_out_full, b_in_full, false), sandbox);
             if !sell && me_cmp(pays_out, rem_pays).is_gt() {
                 pays_out = rem_pays;
                 xrp = me_muldiv(pays_out, b_in_full, b_out_full, true);
-                gets_in = me_muldiv(xrp, a_in_full, a_out_full, true);
+                gets_in = reprice_a(xrp, me_muldiv(xrp, a_in_full, a_out_full, true), sandbox);
             }
             let xrp = (me_rescale(xrp, 0, false), 0);
             if std::env::var("DX_BRIDGE").is_ok() {
