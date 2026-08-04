@@ -1436,6 +1436,35 @@ fn cross_bridged(
             (Some((am, ae)), Some((bm, be))) => Some(norm16((am * bm, ae + be))),
             _ => None,
         };
+        // The DIRECT strand's ADMISSION quality — a different question from
+        // `dq`, and it must not reuse it. `BookStep::tip` reads the raw book
+        // through `BookTip`, which applies NO owner filter, so an offer of the
+        // TAKER's own still prices the strand for admission; self-offers are
+        // dropped later, inside `forEachOffer`'s `limitSelfCrossQuality`. `dq`
+        // comes from `live_head`, which skips them — right for pricing what we
+        // can actually trade, wrong here.
+        //
+        // The ladder entry deliberately keeps pricing this strand after
+        // `reap_self_offers_at_head` has deleted the offer: removals are
+        // collected as `ofrsToRm` and applied only once the whole flow is
+        // done, so within it every strand is still judged against the
+        // unmodified view. #105930662 turns on this — rippled takes a SECOND
+        // fib slice, which it could not if the reap dropped the direct strand
+        // and with it multi-path, and the pass instead ends where the bridge's
+        // own composition falls outside the limit.
+        let d_tip = {
+            let book = ld.get(di).map(|(q, _)| rate_me(*q));
+            let pool = amm.as_ref().zip(amm_init.as_ref()).and_then(|(a, init)| {
+                crate::tx::amm_swap::fib_slice(sandbox, a, *init, amm_iters, pays_leg, gets_leg)
+                    .map(|s| crate::tx::amm_swap::slice_rate(s.0, s.1))
+            });
+            match (book, pool) {
+                (Some(b), Some(p)) => Some(if me_cmp(p, b).is_lt() { p } else { b }),
+                (Some(b), None) => Some(b),
+                (None, Some(p)) => Some(p),
+                (None, None) => None,
+            }
+        };
         // AMM turn: the direct-pair pool competes with the best BOOK rate
         // via multi-path FIB slices (its AVERAGE quality incl. slippage/fee).
         if let (Some(a), Some(init)) = (amm, &amm_init) {
@@ -1578,42 +1607,76 @@ fn cross_bridged(
         // BBRL/XRP while leg A's BOOK starts at 399.996 — 71x worse. We took
         // six pool slices and crossed 8 objects; mainnet rested all 4 nodes.
         //
-        // ⚠ This is a MODEL of the pass, not a port of it. The faithful form
-        // accumulates a whole pass and rejects on its AVERAGE quality; this
-        // asks only whether the CLOB the pass would be dragged into clears the
-        // limit, and so ignores how much the pool slice improves that average.
-        // The two agree whenever the request is large relative to one slice,
-        // which is every case in the corpus and both sweeps. They can differ
-        // when a request is comparable to a single slice — the pool could then
-        // carry the pass on its own and rippled would cross where we rest. No
-        // such ledger is known; if one turns up, that is the case to build the
-        // real accumulate-and-average pass around, not a reason to widen this.
+        // ⚠ The book-only composition this gate used to test was a MODEL of
+        // that pass. Traced 2026-08-04 on #105930662 40FB322EC16C, the model's
+        // premise is false: rippled never steps into leg A's CLOB there, and
+        // the real rule is narrower and observable.
+        //
+        // A bridged leg's POOL may price the strand only while MORE THAN ONE
+        // strand is still a candidate. `AMMContext::multiPath()` is
+        // `activeStrands.size() > 1` (StrandFlow.h:640), re-evaluated every
+        // iteration, and it selects which offer `AMMLiquidity::getOffer` hands
+        // back (AMMLiquidity.cpp):
+        //   multi  — `generateFibSeqOffer`, priced at the POOL's own quality,
+        //            so `BookStep::tip` returns the pool whenever it beats the
+        //            LOB tip;
+        //   single — `changeSpotPriceQuality` matched to the LOB tip
+        //            (`BookOfferCrossingStep::qualityThreshold` returns
+        //            lobQuality, BookStep.cpp:475-480), whose quality EQUALS
+        //            the LOB's, so `tip`'s `ammOffer->quality() > lobQuality`
+        //            is false and the strand falls back to its BOOK. With one
+        //            strand left the pool cannot lift the strand at all.
+        // A strand whose `qualityUpperBound` misses limitQuality is dropped
+        // from the candidate set — silently, `continue` with no log line, in
+        // both `activateNext` and the strand loop (StrandFlow.h:667-673).
+        //
+        // #105930662 40FB322EC16C is the case that pins this. The taker's OWN
+        // offer 991CFC15 is the direct book's tip at 5.1422 BBRL/RLUSD, just
+        // inside its own 5.14324 limit, so the direct strand stays a candidate,
+        // two strands stay active, and leg A's pool — 72x better than its book
+        // — prices the bridge as a fib slice. rippled crosses two slices
+        // (0.05836943136803854 BBRL for 0.01135940238 RLUSD) and we crossed
+        // nothing: 6 mutations against 13, all 7 missing ones Modified.
+        //
+        // #105807256 84FD7DC8 is the mirror and stays rejected: its direct book
+        // tip 5.11260 misses the 5.11221 limit, so the direct strand is dropped
+        // at admission, one strand remains, leg A's pool is throttled to its
+        // book — 71x worse — and the bridge is dropped too. Mainnet moves no
+        // value and rests all 4 nodes. Its trace is the proof: no `New flow
+        // iter` line at all, straight to `All strands dry`.
         if !use_direct {
             if let Some(t) = thr {
-                match (qa_book, qb_book) {
-                    (Some(a), Some(b)) => {
-                        if me_cmp(norm16((a.0 * b.0, a.1 + b.1)), t).is_gt() {
-                            break;
-                        }
+                let within = |q: Option<Me>| q.is_some_and(|v| me_cmp(v, t).is_le());
+                // `activateNext` runs BEFORE `setMultiPath`, so it filters
+                // against the PREVIOUS iteration's flag — true on entry, from
+                // `Flow.cpp:106`'s `strands.size() > 1`. Both candidates are
+                // therefore judged with the pool in play, and the count that
+                // survives is what `setMultiPath` then sees.
+                let multi = (within(d_tip) as u8) + (within(bq) as u8) > 1;
+                // Single path: the pool is matched to the book, so the book's
+                // composition IS the strand's quality. A leg with no book at
+                // all then composes nothing — off the default path the step
+                // keeps going into that leg's CLOB and StrandFlow judges the
+                // pass as a whole, and with no CLOB behind the pool there is
+                // nothing for it to clear.
+                //
+                // All 8 protected cases are Flags=65536 exactly (tfPassive),
+                // buy side, IOU<->IOU with no XRP leg, so every one is bridged.
+                // #105813899 44E799C6FF9B: lb=0, and its direct tip 1.895174
+                // misses thr 1.890193, so it is single-path and breaks here.
+                let admit = if multi {
+                    bq
+                } else {
+                    match (qa_book, qb_book) {
+                        (Some(a), Some(b)) => Some(norm16((a.0 * b.0, a.1 + b.1))),
+                        _ => None,
                     }
-                    // A leg with NO book at all cannot compose a passing
-                    // quality, so the pass is unusable — not merely ungated.
-                    // Written as `if let (Some(a), Some(b), Some(t))` the whole
-                    // check was SKIPPED when a leg's book was empty, and the
-                    // bridge then crossed on that leg's pool alone. But the
-                    // reasoning above applies with more force, not less: off
-                    // the default path the step keeps going into that leg's
-                    // CLOB and StrandFlow judges the pass as a whole — with no
-                    // CLOB behind the pool there is nothing for it to clear.
-                    //
-                    // All 8 cases are Flags=65536 exactly (tfPassive), buy
-                    // side, IOU<->IOU with no XRP leg, so every one is bridged.
-                    // #105813899 44E799C6FF9B: lb=0, bq=1889698131091803e-12
-                    // just inside thr=1890192915687964e-12, so one AMM slice
-                    // crossed (b_amm=true) and the next iteration broke — 7
-                    // extra mutations, nothing missing, where mainnet moved no
-                    // value at all and merely rested the offer.
-                    _ => break,
+                };
+                if std::env::var("DX_BRIDGE").is_ok() {
+                    eprintln!("DX_ADMIT d_tip={d_tip:?} multi={multi} admit={admit:?} thr={t:?}");
+                }
+                if !within(admit) {
+                    break;
                 }
             }
         }
@@ -3462,6 +3525,121 @@ mod tests {
         );
         let rested = json_at(&sandbox, &keylet::offer_key(&taker, 9)).expect("offer rests");
         assert_eq!(rested["TakerGets"]["value"].as_str(), Some("10"), "and rests in full");
+    }
+
+    /// The taker's OWN resting offer keeps a second strand alive, and that is
+    /// what lets a bridge leg's POOL price the pass.
+    ///
+    /// `AMMContext::multiPath()` is `activeStrands.size() > 1`
+    /// (StrandFlow.h:640) and it decides what `AMMLiquidity::getOffer` returns:
+    /// with two strands a FIB slice at the pool's own quality, with one a
+    /// `changeSpotPriceQuality` offer matched to the book's, which `tip` then
+    /// discards in favour of the book. `BookTip` applies no owner filter, so an
+    /// offer of the taker's own still prices the direct strand for admission
+    /// even though it will be removed rather than crossed.
+    ///
+    /// Same books and pool as the test above, whose only difference is that
+    /// there the direct strand does not exist — so the composition gate must
+    /// come out the other way here. #105930662 40FB322EC16C is the live case:
+    /// the taker's own 991CFC15 tips the direct book at 5.1422 BBRL/RLUSD
+    /// inside its own 5.14324 limit, leg A's pool is 72x better than leg A's
+    /// book, and mainnet crosses two fib slices where we crossed nothing —
+    /// 6 mutations against 13, all 7 missing ones Modified.
+    #[test]
+    fn a_takers_own_offer_keeps_the_second_strand_and_the_pool_prices_the_bridge() {
+        let taker = [0x01u8; 20];
+        let mk_a = [0x04u8; 20];
+        let mk_b = [0x05u8; 20];
+        let iss_a = [0x02u8; 20];
+        let iss_b = [0x03u8; 20];
+        let pool = [0x06u8; 20];
+        let (mut ca, mut cb) = ([0u8; 20], [0u8; 20]);
+        ca[12..15].copy_from_slice(b"AAA");
+        cb[12..15].copy_from_slice(b"BBB");
+
+        let mut state = make_state_with_account(&taker, 500_000_000);
+        for id in [&mk_a, &mk_b, &iss_a, &iss_b, &pool] {
+            let a = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": hex::encode(id),
+                "Balance": "500000000", "Sequence": 1, "OwnerCount": 0,
+            });
+            state.state_map.insert(keylet::account_root_key(id), serde_json::to_vec(&a).unwrap()).unwrap();
+        }
+        let mut line = |who: &[u8; 20], iss: &[u8; 20], cur: &[u8; 20], bal: &str| {
+            let (lo, hi) = if who < iss { (*who, *iss) } else { (*iss, *who) };
+            let v = serde_json::json!({
+                "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+                "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000",
+                            "value": if who < iss { bal.to_string() } else { format!("-{bal}") }},
+                "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000000"},
+                "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000000"},
+            });
+            state.state_map.insert(keylet::ripple_state_key(who, iss, cur), serde_json::to_vec(&v).unwrap()).unwrap();
+        };
+        line(&taker, &iss_a, &ca, "1000");   // the taker's AAA to sell
+        line(&taker, &iss_b, &cb, "1000");   // and the BBB its own resting offer sells
+        line(&mk_b, &iss_b, &cb, "1000");    // leg B maker's BBB
+        line(&pool, &iss_a, &ca, "100");     // leg A pool: 100 AAA / 100 XRP
+
+        // Leg A pool at 1 AAA per XRP — 100x better than leg A's book below.
+        let amm = serde_json::json!({
+            "LedgerEntryType": "AMM", "Account": hex::encode(pool), "TradingFee": 0,
+        });
+        let xrp_leg = leg_of(&serde_json::json!("1")).unwrap();
+        let a_leg = leg_of(&serde_json::json!({"currency":"AAA","issuer":hex::encode(iss_a),"value":"1"})).unwrap();
+        let akey = keylet::amm_key(&xrp_leg.cur, &xrp_leg.issuer, &a_leg.cur, &a_leg.issuer);
+        state.state_map.insert(akey, serde_json::to_vec(&amm).unwrap()).unwrap();
+
+        // Leg A book: 1 XRP for 100 AAA. Leg B book: 100 BBB for 1 XRP. Then
+        // the TAKER's own offer on the direct AAA/BBB book, asking 9 AAA for
+        // 100 BBB — 0.09, just inside the 0.1 limit the crossing tx sets, so it
+        // tips the direct strand inside the limit and keeps it a candidate.
+        for (who, seq, pays, gets) in [
+            (mk_a, 2u32, serde_json::json!({"currency":"AAA","issuer":hex::encode(iss_a),"value":"100"}), serde_json::json!("1000000")),
+            (mk_b, 2, serde_json::json!("1000000"), serde_json::json!({"currency":"BBB","issuer":hex::encode(iss_b),"value":"100"})),
+            (taker, 3, serde_json::json!({"currency":"AAA","issuer":hex::encode(iss_a),"value":"9"}),
+                       serde_json::json!({"currency":"BBB","issuer":hex::encode(iss_b),"value":"100"})),
+        ] {
+            let mut sandbox = Sandbox::new(&state);
+            let tx = TxFields {
+                account: who, tx_type: "OfferCreate".to_string(), fee: 12, sequence: seq,
+                ticket_seq: None, last_ledger_seq: None,
+                fields: serde_json::json!({"TakerPays": pays, "TakerGets": gets}),
+            };
+            assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+            let mods = sandbox.into_modifications();
+            apply_modifications(&mut state, mods).unwrap();
+        }
+        // Sell 10 AAA for 100 BBB — limit 0.1 AAA/BBB. Bridged via the pool
+        // that is 0.01; via the two BOOKS it is 1.0, ten times past the limit.
+        let mut sandbox = Sandbox::new(&state);
+        assert!(json_at(&sandbox, &keylet::offer_key(&taker, 3)).is_some(),
+                "the taker's own offer must be resting on the direct book");
+        let tx = TxFields {
+            account: taker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 9,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerGets": {"currency": "AAA", "issuer": hex::encode(iss_a), "value": "10"},
+                "TakerPays": {"currency": "BBB", "issuer": hex::encode(iss_b), "value": "100"},
+            }),
+        };
+        assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+
+        // The POOL carried leg A, so leg A's book maker is never touched while
+        // leg B's is consumed. Book-only admission crosses neither.
+        assert_eq!(
+            json_at(&sandbox, &keylet::offer_key(&mk_a, 2)).unwrap()["TakerGets"].as_str(),
+            Some("1000000"),
+            "leg A's book maker must be untouched — the pool priced that leg",
+        );
+        assert!(
+            json_at(&sandbox, &keylet::offer_key(&mk_b, 2)).is_none(),
+            "leg B's book maker must be consumed by the bridged pass",
+        );
+        assert!(
+            json_at(&sandbox, &keylet::offer_key(&taker, 3)).is_none(),
+            "and the taker's own offer is removed, not crossed",
+        );
     }
 
     /// A bridge leg with a POOL but NO BOOK cannot carry the pass at all.
