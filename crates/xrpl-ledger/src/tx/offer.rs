@@ -185,6 +185,42 @@ pub(crate) fn me_norm(mut a: Me) -> Me {
 }
 
 /// a*b/c with directed rounding (mantissas kept ≤ ~1e20 so the product fits).
+/// `a * b` rounded UP to 16 significant digits — rippled's
+/// `mulRound(a, b, asset, roundUp=true)`, which is how `Quality::ceil_out`
+/// prices an out-limited fill (`result.in = mulRound(limit, quality.rate(),
+/// …)`, Quality.cpp `ceilOutImpl`).
+///
+/// `norm16` cannot serve: it TRUNCATES the mantissa, and the discarded digits
+/// are exactly what decides the achieved-quality judge. The drop must be a
+/// single division so the round-up is applied once — dropping digits one at a
+/// time and carrying each non-zero remainder over-rounds by up to a digit.
+pub(crate) fn mul_round16_up(a: Me, b: Me) -> Me {
+    let (a, b) = (me_norm(a), me_norm(b));
+    if a.0 == 0 || b.0 == 0 {
+        return (0, 0);
+    }
+    let mut m = a.0.saturating_mul(b.0);
+    let mut e = a.1 + b.1;
+    let mut div: u128 = 1;
+    while m / div >= 10_000_000_000_000_000 {
+        div *= 10;
+        e += 1;
+    }
+    if div > 1 {
+        let (q, r) = (m / div, m % div);
+        m = if r != 0 { q + 1 } else { q };
+        if m >= 10_000_000_000_000_000 {
+            m /= 10;
+            e += 1;
+        }
+    }
+    while m < 1_000_000_000_000_000 {
+        m *= 10;
+        e -= 1;
+    }
+    (m, e)
+}
+
 pub(crate) fn me_muldiv(a: Me, b: Me, c: Me, ceil: bool) -> Me {
     if c.0 == 0 {
         return (0, 0);
@@ -2196,7 +2232,29 @@ pub(crate) fn cross_engine_to(
                 if pays_leg.xrp {
                     give = (me_rescale(give, 0, false), 0);
                 }
-                let mut pay = me_muldiv(give, m_wants0, m_gives0, true);
+                // Price the fill through the offer's ENCODED quality, not its
+                // raw TakerPays/TakerGets ratio. `Quality::ceil_out` is
+                //   result.in = mulRound(limit, quality.rate(), asset, roundUp)
+                // (Quality.cpp ceilOutImpl, and `ceil_out` always passes
+                // roundUp=true), and `quality.rate()` is the 16-digit rate the
+                // BookDirectory encodes — which is what `q` already carries.
+                //
+                // The two differ in the last digit, and that digit decides
+                // whether the achieved-quality judge below fires.
+                // #105924683 E7399DA36A79: maker 3B4AD7E0 is 709289 drops for
+                // 61 SPEPE, and the fill takes 418487 drops.
+                //   raw 418487*61/709289 = 35.9905581504859091…, ceil ->
+                //                          35.99055815048591  <- what we had
+                //   encoded rate 0.00008600161570248517 (ceil of the raw
+                //     ratio's …51647…, and the value `book_offers` reports)
+                //   mulRound(418487, rate, up) = 35.99055815048592 <- rippled
+                // One ulp, and it is load-bearing: at …591 the achieved rate
+                // TIES the taker's limit and the pass is kept; at …592 it is
+                // 3 units worse and rippled discards the whole pass —
+                //   Path rejected by limitQuality
+                //     limit: 5773207684604483397  path q: 5773207684604483400
+                // then rests the remainder. We crossed it: 9 muts against 7.
+                let mut pay = mul_round16_up(give, rate_me(q));
                 if gets_leg.xrp {
                     // Whole drops FLOOR, they do not ceil. Observed twice in
                     // libxrpl's own trace (XRPL_FFI_TRACE):
@@ -2281,6 +2339,11 @@ pub(crate) fn cross_engine_to(
                 // rounding following rev/fwd correctly that overcharge is gone,
                 // so the check can be what rippled's is: always, and exact.
                 if threshold != u64::MAX && !me_is_zero(give) && !me_is_zero(pay) {
+                    if std::env::var("DX_JUDGE").is_ok() {
+                        eprintln!("DX_JUDGE give={give:?} pay={pay:?} ach={:?} thr={threshold} reject={}",
+                            rate_of_me(pay, give),
+                            rate_of_me(pay, give).is_some_and(|a| a > threshold));
+                    }
                     if let Some(ach) = rate_of_me(pay, give) {
                         if ach > threshold {
                             // A rejected pass ends the crossing outright —
@@ -3730,6 +3793,104 @@ mod tests {
         assert!(
             json_at(&sandbox, &keylet::offer_key(&taker, 3)).is_none(),
             "and the taker's own offer is removed, not crossed",
+        );
+    }
+
+    /// An out-limited fill is priced through the offer's ENCODED quality, and
+    /// the last digit of that decides whether the pass survives.
+    ///
+    /// `Quality::ceil_out` is `result.in = mulRound(limit, quality.rate(),
+    /// asset, roundUp)` with roundUp always true (Quality.cpp `ceilOutImpl`),
+    /// so a partial take is priced off the 16-digit BookDirectory rate, NOT off
+    /// the offer's raw TakerPays/TakerGets ratio. The two differ in the last
+    /// digit whenever the raw ratio needs more than 16 digits.
+    ///
+    /// Here maker2 ties the taker's limit exactly (both 61 USD / 709289 drops),
+    /// maker1 fills the first 290802 drops more cheaply, and the remaining
+    /// 418487 drops are taken from maker2:
+    ///   raw 418487*61/709289 = 35.9905581504859091…, ceil -> 35.99055815048591
+    ///   mulRound(418487, encoded 0.00008600161570248517, up)
+    ///                                                 -> 35.99055815048592
+    /// At …591 the achieved rate ties the limit and the fill is kept; at …592
+    /// it is 3 units worse and the whole pass is discarded, so maker2 must be
+    /// left untouched and the remainder rested.
+    ///
+    /// #105924683 E7399DA36A79 is the live case, same numbers: rippled logs
+    ///   Path rejected by limitQuality
+    ///     limit: 5773207684604483397  path q: 5773207684604483400
+    /// and rests. We crossed it — 9 mutations against 7.
+    #[test]
+    fn an_out_limited_fill_is_priced_through_the_offers_encoded_quality() {
+        let taker = [0x01u8; 20];
+        let mk1 = [0x04u8; 20];
+        let mk2 = [0x05u8; 20];
+        let issuer = [0x02u8; 20];
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+
+        let mut state = make_state_with_account(&taker, 500_000_000);
+        for id in [&mk1, &mk2, &issuer] {
+            let a = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": hex::encode(id),
+                "Balance": "500000000", "Sequence": 1, "OwnerCount": 0,
+            });
+            state.state_map.insert(keylet::account_root_key(id), serde_json::to_vec(&a).unwrap()).unwrap();
+        }
+        let mut line = |who: &[u8; 20], bal: &str| {
+            let (lo, hi) = if who < &issuer { (*who, issuer) } else { (issuer, *who) };
+            let v = serde_json::json!({
+                "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+                "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000",
+                            "value": if who < &issuer { bal.to_string() } else { format!("-{bal}") }},
+                "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000000"},
+                "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000000"},
+            });
+            state.state_map.insert(keylet::ripple_state_key(who, &issuer, &cur), serde_json::to_vec(&v).unwrap()).unwrap();
+        };
+        line(&taker, "1000");
+        line(&mk1, "0");
+        line(&mk2, "0");
+
+        // mk1 is strictly cheaper and clears first; mk2 ties the taker's limit.
+        for (who, gets, pays) in [
+            (mk1, "290802", "25"),
+            (mk2, "709289", "61"),
+        ] {
+            let mut sandbox = Sandbox::new(&state);
+            let tx = TxFields {
+                account: who, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
+                ticket_seq: None, last_ledger_seq: None,
+                fields: serde_json::json!({
+                    "TakerGets": gets,
+                    "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": pays},
+                }),
+            };
+            assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+            let mods = sandbox.into_modifications();
+            apply_modifications(&mut state, mods).unwrap();
+        }
+
+        // Buy 709289 drops for 61 USD — the same ratio mk2 rests at.
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: taker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 9,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "61"},
+                "TakerPays": "709289",
+            }),
+        };
+        assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+
+        assert!(
+            json_at(&sandbox, &keylet::offer_key(&mk1, 2)).is_none(),
+            "the cheaper maker must be fully consumed",
+        );
+        assert_eq!(
+            json_at(&sandbox, &keylet::offer_key(&mk2, 2)).unwrap()["TakerGets"].as_str(),
+            Some("709289"),
+            "the tying maker must be UNTOUCHED — its fill prices 3 units past \
+             the limit and rippled discards the whole pass",
         );
     }
 
