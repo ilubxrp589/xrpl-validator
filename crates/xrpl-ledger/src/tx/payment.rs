@@ -1010,6 +1010,9 @@ impl PaymentTransactor {
             };
             let (sin, sout) =
                 Self::strand_pass(tx, dest, &strands[pick], rem_in, rem_out, threshold, multi, sandbox);
+            if std::env::var("DX_PAY").is_ok() {
+                eprintln!("DX_PAY round={_round} strand={pick} sin={sin:?} sout={sout:?} rem_in={rem_in:?} rem_out={rem_out:?} multi={multi}");
+            }
             if ox::me_is_zero(sout) {
                 break;
             }
