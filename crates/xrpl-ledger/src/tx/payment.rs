@@ -188,6 +188,13 @@ impl PaymentTransactor {
         chain: &[&crate::tx::offer::Leg],
         want_out: crate::tx::offer::Me,
         threshold: u64,
+        // The flow's AMM fib state. The reverse pass MUST see it: a pool sized
+        // by `maxOffer` answers the whole requested output in one go, so the
+        // hop before it is told to buy enough to feed all of that. Under
+        // multiPath the pool offers ONE slice, and the requirement collapses to
+        // what that slice needs. Trials clone it — a sizing probe must not
+        // advance the flow-wide counter.
+        amm_fib: Option<&crate::tx::offer::AmmFib>,
         sandbox: &mut Sandbox,
     ) -> Vec<crate::tx::offer::Me> {
         use crate::tx::offer as ox;
@@ -214,9 +221,11 @@ impl PaymentTransactor {
                 let snap = sandbox.snapshot();
                 let granted = Self::fund_for_trial(sandbox, &tx.account, in_leg, grant);
                 let before = Self::leg_signed_balance(sandbox, &tx.account, in_leg);
+                let mut trial_fib = amm_fib.cloned();
                 let (rw, _, _) = ox::cross_engine_to(
                     &tx.account, &tx.account, need[i], granted, out_leg, in_leg,
-                    threshold, threshold, false, false, false, None, sandbox, &mut Vec::new(),
+                    threshold, threshold, false, false, false, trial_fib.as_mut(), None,
+                    sandbox, &mut Vec::new(),
                 );
                 consumed = match (before, Self::leg_signed_balance(sandbox, &tx.account, in_leg)) {
                     (Some((bneg, b)), Some((aneg, a))) => {
@@ -226,9 +235,20 @@ impl PaymentTransactor {
                     _ => (0, 0),
                 };
                 sandbox.restore_snapshot(snap);
-                // The full requirement came out, so the grant was not the
-                // binding constraint and `consumed` is the real answer.
-                if ox::me_is_zero(rw) {
+                // Stop as soon as the GRANT was not the binding constraint —
+                // either the full requirement came out, or the trial left some
+                // of what it was given unspent, which means liquidity bound it
+                // and `consumed` is the real answer.
+                //
+                // Escalating on `rw != 0` alone is wrong once the pool is
+                // sized by fib slices: one slice can never answer the whole
+                // requirement, so every grant "fails", the loop runs to 1e18,
+                // and differencing a 1e18 balance at 16 significant digits
+                // destroys the measurement. #105912291 2AE3693EF556 read back
+                // a want_cap of 9.99e75 that way and fell through to the
+                // unbounded cap, so hop 0 bought the whole book level (978268
+                // drops) to feed a hop that only needed 15508.
+                if ox::me_is_zero(rw) || ox::me_cmp(consumed, granted).is_lt() {
                     break;
                 }
             }
@@ -267,6 +287,7 @@ impl PaymentTransactor {
         want_out: crate::tx::offer::Me,
         threshold: u64,
         single_pass: bool,
+        mut amm_fib: Option<&mut crate::tx::offer::AmmFib>,
         sandbox: &mut Sandbox,
     ) -> (crate::tx::offer::Me, crate::tx::offer::Me) {
         use crate::tx::offer as ox;
@@ -309,7 +330,7 @@ impl PaymentTransactor {
             }
         }
         // REVERSE pass first: size each hop to what the one after it needs.
-        let need = Self::reverse_requirements(tx, chain, want_out, threshold, sandbox);
+        let need = Self::reverse_requirements(tx, chain, want_out, threshold, amm_fib.as_deref(), sandbox);
         let spend_before = Self::leg_signed_balance(sandbox, &tx.account, spend_leg);
         let mut carry = avail_in;
         for i in 0..n {
@@ -330,7 +351,8 @@ impl PaymentTransactor {
                 .flatten();
             let (rw, _rs, _c) = ox::cross_engine_to(
                 &tx.account, benef, want_cap, carry, chain[i + 1], chain[i],
-                threshold, threshold, false, false, single_pass, None, sandbox, &mut Vec::new(),
+                threshold, threshold, false, false, single_pass, amm_fib.as_deref_mut(), None,
+                sandbox, &mut Vec::new(),
             );
             carry = match (before, Self::leg_signed_balance(sandbox, &tx.account, out_leg)) {
                 (Some((bneg, b)), Some((aneg, a))) => {
@@ -975,6 +997,26 @@ impl PaymentTransactor {
         let mut rem_in = spend0;
         let mut rem_out = want_gross;
         let mut delivered: ox::Me = (0, 0);
+        // rippled's AMMContext, alive for the whole flow: `multiPath()` is
+        // `activeStrands.size() > 1`, so a pool offers FIB SLICES rather than
+        // `maxOffer` exactly when we run more than one strand, and the counter
+        // advances per iteration that consumed AMM liquidity. Carrying it
+        // across rounds is the point — restart it each round and every slice
+        // would be the base one, where rippled's grow 1,1,2,3,5,8,13.
+        let mut amm_fib = ox::AmmFib::default();
+        // `setMultiPath(activeStrands.size() > 1)` is re-evaluated EVERY
+        // iteration (StrandFlow.h:640), and a strand that flowed nothing is
+        // not pushed back into `next_` — so a payment whose second strand is
+        // dry runs multiPath only until that shows, then sizes the pool by
+        // `maxOffer` again. Seeded from `strands.size() > 1` exactly as
+        // `Flow.cpp:106` does, and re-read from the trials below, which is the
+        // same activateNext-then-setMultiPath ordering the bridged walk uses.
+        //
+        // #105795073 1F30308A4AD1 is why this cannot just be `multi`: its
+        // direct SSH->EUR strand carries nothing, so slicing a lone live
+        // strand delivered under DeliverMin and turned a tesSUCCESS into
+        // tecPATH_PARTIAL.
+        let mut multi_now = multi;
         // A single strand runs ONCE, walking the whole book exactly as before —
         // rounds exist to interleave strands, and re-entering a lone strand
         // would just keep taking further slices of a large tfPartialPayment
@@ -988,19 +1030,29 @@ impl PaymentTransactor {
                 // Trial each strand in a snapshot and keep the best quality —
                 // lowest spent-per-delivered.
                 let mut best: Option<(usize, ox::Me)> = None;
+                let mut live = 0usize;
                 for i in 0..strands.len() {
                     let snap = sandbox.snapshot();
-                    let (sin, sout) =
-                        Self::strand_pass(tx, dest, &strands[i], rem_in, rem_out, threshold, true, sandbox);
+                    let mut trial_fib = amm_fib.clone();
+                    let (sin, sout) = Self::strand_pass(
+                        tx, dest, &strands[i], rem_in, rem_out, threshold, true,
+                        multi_now.then(|| &mut trial_fib), sandbox,
+                    );
                     sandbox.restore_snapshot(snap);
                     if ox::me_is_zero(sout) {
                         continue;
                     }
+                    live += 1;
                     let q = ox::me_muldiv(sin, (1_000_000_000_000_000, -15), sout, false);
+                    if std::env::var("DX_PAY").is_ok() {
+                        eprintln!("DX_PAY   trial strand={i} sin={sin:?} sout={sout:?} q={q:?}");
+                    }
                     if best.is_none_or(|(_, bq)| ox::me_cmp(q, bq).is_lt()) {
                         best = Some((i, q));
                     }
                 }
+                // What survived the trials IS the active-strand count.
+                multi_now = live > 1;
                 match best {
                     Some((i, _)) => i,
                     None => break,
@@ -1008,8 +1060,10 @@ impl PaymentTransactor {
             } else {
                 0
             };
-            let (sin, sout) =
-                Self::strand_pass(tx, dest, &strands[pick], rem_in, rem_out, threshold, multi, sandbox);
+            let (sin, sout) = Self::strand_pass(
+                tx, dest, &strands[pick], rem_in, rem_out, threshold, multi,
+                multi_now.then(|| &mut amm_fib), sandbox,
+            );
             if std::env::var("DX_PAY").is_ok() {
                 eprintln!("DX_PAY round={_round} strand={pick} sin={sin:?} sout={sout:?} rem_in={rem_in:?} rem_out={rem_out:?} multi={multi}");
             }
@@ -1479,6 +1533,125 @@ mod tests {
         let mods = sandbox.into_modifications();
         apply_modifications(&mut state, mods).unwrap();
         (state, taker, issuer)
+    }
+
+    /// A multi-strand payment slices its pools instead of draining one strand.
+    ///
+    /// `AMMContext::multiPath()` is `activeStrands.size() > 1`, and under it
+    /// `AMMLiquidity::getOffer` hands back a FIB SLICE off the pool's initial
+    /// balances rather than `maxOffer` — so one iteration of a strand moves a
+    /// slice, not the whole request, and `flow()` re-picks the best strand for
+    /// the next one (StrandFlow.h:682-805). The counter is flow-wide and the
+    /// slices grow 1,1,2,3,5,8,13.
+    ///
+    /// Here the AAA strand is cheaper to begin with, so it wins the early
+    /// rounds; its pool is shallow, so as the slices grow it prices itself out
+    /// and the direct XRP->BBB pool takes over. Sized by `maxOffer` instead,
+    /// the AAA strand answers the WHOLE request in one pass and the direct
+    /// pool is never touched at all — which is exactly what
+    /// #105912291 2AE3693EF556 did: everything down one strand, consuming
+    /// Offer 3A3053B3 outright (mainnet only Modifies it) and spilling into a
+    /// second offer, for 10 mutations against 9.
+    #[test]
+    fn a_multi_strand_payment_slices_its_pools_across_both_strands() {
+        let src = [0x01u8; 20];
+        let dst = [0x08u8; 20];
+        let iss = [0x02u8; 20];
+        let mkr = [0x04u8; 20];
+        let p_dir = [0x06u8; 20]; // XRP  / BBB
+        let p_via = [0x07u8; 20]; // AAA / BBB
+        let (mut ca, mut cb) = ([0u8; 20], [0u8; 20]);
+        ca[12..15].copy_from_slice(b"AAA");
+        cb[12..15].copy_from_slice(b"BBB");
+
+        let mut state = make_state();
+        add_account(&mut state, &src, 50_000_000, 1);
+        for id in [&dst, &iss, &mkr, &p_via] {
+            add_account(&mut state, id, 50_000_000, 1);
+        }
+        add_account(&mut state, &p_dir, 1_100_000, 1); // the direct pool's XRP side
+        let mut line = |state: &mut LedgerState, who: &[u8; 20], cur: &[u8; 20], bal: &str| {
+            let (lo, hi) = if who < &iss { (*who, iss) } else { (iss, *who) };
+            let v = serde_json::json!({
+                "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+                "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000",
+                            "value": if who < &iss { bal.to_string() } else { format!("-{bal}") }},
+                "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "100000000"},
+                "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "100000000"},
+            });
+            state.state_map.insert(keylet::ripple_state_key(who, &iss, cur), serde_json::to_vec(&v).unwrap()).unwrap();
+        };
+        line(&mut state, &mkr, &ca, "10000");   // the maker's AAA to sell
+        line(&mut state, &p_via, &ca, "1000");  // AAA/BBB pool, 1000 / 1000
+        line(&mut state, &p_via, &cb, "1000");
+        line(&mut state, &p_dir, &cb, "1000");  // XRP/BBB pool, 1.1 XRP / 1000
+        line(&mut state, &dst, &cb, "0");       // the destination's BBB line
+
+        let xrp_leg = crate::tx::offer::leg_of(&serde_json::json!("1")).unwrap();
+        let a_leg = crate::tx::offer::leg_of(
+            &serde_json::json!({"currency":"AAA","issuer":hex::encode(iss),"value":"1"})).unwrap();
+        let b_leg = crate::tx::offer::leg_of(
+            &serde_json::json!({"currency":"BBB","issuer":hex::encode(iss),"value":"1"})).unwrap();
+        for (acct, l, r) in [(p_dir, &xrp_leg, &b_leg), (p_via, &a_leg, &b_leg)] {
+            let amm = serde_json::json!({
+                "LedgerEntryType": "AMM", "Account": hex::encode(acct), "TradingFee": 0,
+            });
+            let k = keylet::amm_key(&l.cur, &l.issuer, &r.cur, &r.issuer);
+            state.state_map.insert(k, serde_json::to_vec(&amm).unwrap()).unwrap();
+        }
+
+        // The XRP->AAA book: 10000 AAA at 1000 drops each.
+        let mut sandbox = Sandbox::new(&state);
+        let mk = TxFields {
+            account: mkr, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerPays": "10000000",
+                "TakerGets": {"currency": "AAA", "issuer": hex::encode(iss), "value": "10000"},
+            }),
+        };
+        assert_eq!(crate::tx::offer::OfferCreateTransactor.do_apply(&mk, &mut sandbox), TxResult::Success);
+        let mods = sandbox.into_modifications();
+        apply_modifications(&mut state, mods).unwrap();
+
+        let dir_before = read_bbb(&Sandbox::new(&state), &p_dir, &cb);
+
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: src, tx_type: "Payment".to_string(), fee: 12, sequence: 2,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Destination": hex::encode(dst),
+                "Amount": {"currency": "BBB", "issuer": hex::encode(iss), "value": "300"},
+                "SendMax": "1000000",
+                "Flags": 131072u64, // tfPartialPayment
+                "Paths": [[{"type": 48, "currency": "AAA", "issuer": hex::encode(iss)}]],
+            }),
+        };
+        assert_eq!(PaymentTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+
+        let dir_after = read_bbb(&sandbox, &p_dir, &cb);
+        // Sized by fib slices the strands interleave and the direct pool gives
+        // up ~130 BBB across the rounds it wins. Sized by `maxOffer` the AAA
+        // strand answers the whole 300 in ONE pass and the direct pool only
+        // ever sees a 2e-10 dust remainder, so the bar is a magnitude, not a
+        // mere inequality.
+        assert!(
+            dir_before - dir_after > 1.0,
+            "the direct pool must CARRY part of the payment, not just mop up \
+             dust: {dir_before} -> {dir_after}",
+        );
+    }
+
+    /// The absolute BBB a pool account holds.
+    fn read_bbb(sandbox: &Sandbox, who: &[u8; 20], cur: &[u8; 20]) -> f64 {
+        let iss = [0x02u8; 20];
+        sandbox
+            .read(&keylet::ripple_state_key(who, &iss, cur))
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v["Balance"]["value"].as_str().and_then(|t| t.parse::<f64>().ok()))
+            .map(f64::abs)
+            .unwrap_or(0.0)
     }
 
     /// Arb-style conversion: sentinel-max Amount + tfPartialPayment must

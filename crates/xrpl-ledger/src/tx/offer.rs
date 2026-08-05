@@ -194,6 +194,22 @@ pub(crate) fn me_norm(mut a: Me) -> Me {
 /// are exactly what decides the achieved-quality judge. The drop must be a
 /// single division so the round-up is applied once — dropping digits one at a
 /// time and carrying each non-zero remainder over-rounds by up to a digit.
+/// rippled's `AMMContext` for one flow. `ammIters_` is FLOW-wide — it counts
+/// iterations that consumed AMM liquidity, not per pool — while each
+/// `AMMLiquidity` captures its own `initialBalances_` the first time it is
+/// used and sizes every later fib slice against those, not against the
+/// balances as they move (AMMLiquidity.cpp `generateFibSeqOffer`).
+///
+/// Only a MULTI-STRAND payment needs this. `AMMContext::multiPath()` is
+/// `activeStrands.size() > 1`, and with one strand rippled sizes the pool by
+/// `maxOffer` instead — which is exactly what `amm_swap::consume` already
+/// does, so single-strand callers pass None and are untouched.
+#[derive(Clone, Default, Debug)]
+pub(crate) struct AmmFib {
+    pub(crate) iters: u32,
+    pub(crate) init: std::collections::BTreeMap<[u8; 20], (Me, Me)>,
+}
+
 pub(crate) fn mul_round16_up(a: Me, b: Me) -> Me {
     let (a, b) = (me_norm(a), me_norm(b));
     if a.0 == 0 || b.0 == 0 {
@@ -1968,6 +1984,8 @@ pub(crate) fn cross_engine_to(
     // (StrandFlow.h:682-805). Only the multi-strand payment loop asks for this;
     // every other caller walks the whole book as before.
     single_pass: bool,
+    // Flow-wide AMM fib state; Some only for a multi-strand payment.
+    mut amm_fib: Option<&mut AmmFib>,
     domain: Option<&Hash256>,
     sandbox: &mut Sandbox,
     stale: &mut Vec<Hash256>,
@@ -2088,8 +2106,9 @@ pub(crate) fn cross_engine_to(
             if std::env::var("DX_AMM").is_ok() {
                 eprintln!("DX_AMM site=direct-walk q={q:x}");
             }
-            let (rp, rg, used) = crate::tx::amm_swap::consume(
-                sandbox, a, taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell, Some(q),
+            let (rp, rg, used) = amm_turn(
+                amm_fib.as_deref_mut(), sandbox, a, taker, beneficiary, rem_pays, rem_gets,
+                pays_leg, gets_leg, threshold, sell, Some(q),
             );
             rem_pays = rp;
             rem_gets = rg;
@@ -2420,8 +2439,9 @@ pub(crate) fn cross_engine_to(
             if std::env::var("DX_AMM").is_ok() {
                 eprintln!("DX_AMM site=direct-tail");
             }
-            let (rp, rg, used) = crate::tx::amm_swap::consume(
-                sandbox, a, taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell, None,
+            let (rp, rg, used) = amm_turn(
+                amm_fib.as_deref_mut(), sandbox, a, taker, beneficiary, rem_pays, rem_gets,
+                pays_leg, gets_leg, threshold, sell, None,
             );
             rem_pays = rp;
             rem_gets = rg;
@@ -2429,6 +2449,49 @@ pub(crate) fn cross_engine_to(
         }
     }
     (rem_pays, rem_gets, crossed)
+}
+
+/// One AMM turn. With no fib state this is the single-path `maxOffer` sizing
+/// `consume` has always done. With fib state — a multi-strand payment, where
+/// rippled's `multiPath()` is true — the pool offers ONE fib slice off its
+/// initial balances and the flow-wide counter advances only when the slice is
+/// actually taken, mirroring `ammContext.update()`.
+#[allow(clippy::too_many_arguments)]
+fn amm_turn(
+    fib: Option<&mut AmmFib>,
+    sandbox: &mut Sandbox,
+    a: &crate::tx::amm_swap::Amm,
+    taker: &[u8; 20],
+    beneficiary: &[u8; 20],
+    rem_pays: Me,
+    rem_gets: Me,
+    pays_leg: &Leg,
+    gets_leg: &Leg,
+    threshold: u64,
+    sell: bool,
+    clob: Option<u64>,
+) -> (Me, Me, bool) {
+    let Some(f) = fib else {
+        return crate::tx::amm_swap::consume(
+            sandbox, a, taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell, clob,
+        );
+    };
+    let init = match f.init.get(&a.account) {
+        Some(v) => *v,
+        None => {
+            let v = crate::tx::amm_swap::pool_balances(sandbox, a, pays_leg, gets_leg);
+            f.init.insert(a.account, v);
+            v
+        }
+    };
+    let r = crate::tx::amm_swap::consume_fib(
+        sandbox, a, taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell,
+        init, f.iters, clob.map(rate_me),
+    );
+    if r.2 {
+        f.iters += 1;
+    }
+    r
 }
 
 /// Cross with the taker as its own beneficiary (OfferCreate semantics).
@@ -2447,7 +2510,7 @@ pub(crate) fn cross_engine(
 ) -> (Me, Me, u32) {
     // FlowCross always builds both the direct and the XRP-bridged strand, so
     // offer crossing is multi-path by construction.
-    cross_engine_to(taker, taker, rem_pays, rem_gets, pays_leg, gets_leg, threshold, threshold_self, sell, true, false, domain, sandbox, stale)
+    cross_engine_to(taker, taker, rem_pays, rem_gets, pays_leg, gets_leg, threshold, threshold_self, sell, true, false, None, domain, sandbox, stale)
 }
 
 pub struct OfferCreateTransactor;
@@ -4255,7 +4318,7 @@ mod tests {
         // Payment semantics: no limitQuality, so the pool is free to fill it all.
         let (rp, rg, _crossed) = cross_engine_to(
             &taker, &taker, (1_000_000_000_000_000, -15), (1_000_000, 0), &usd_leg, &xrp_leg,
-            u64::MAX, u64::MAX, false, false, false, None, &mut sandbox, &mut stale,);
+            u64::MAX, u64::MAX, false, false, false, None, None, &mut sandbox, &mut stale,);
 
         assert!(!sandbox.exists(&okey), "the expired offer must be reaped");
         assert!(stale.contains(&okey), "and reported as removed for the cancel view");
@@ -4288,7 +4351,7 @@ mod tests {
         // past the limit and the strand never runs.
         cross_engine_to(
             &taker, &taker, (1_000_000_000_000_000, -15), (1_000_000, 0), &usd_leg, &xrp_leg,
-            1, 1, true, true, false, None, &mut sandbox, &mut stale,);
+            1, 1, true, true, false, None, None, &mut sandbox, &mut stale,);
 
         assert!(sandbox.exists(&okey), "an unopened book must not be reaped");
         assert!(stale.is_empty());
@@ -4379,7 +4442,7 @@ mod tests {
         let mut stale = Vec::new();
         let (rp, _rg, _crossed) = cross_engine_to(
             &taker, &taker, (1_000_000_000_000_000, -15), (1_000_000, 0), &usd_leg, &xrp_leg,
-            u64::MAX, u64::MAX, false, false, false, None, &mut sandbox, &mut stale,);
+            u64::MAX, u64::MAX, false, false, false, None, None, &mut sandbox, &mut stale,);
 
         assert!(!sandbox.exists(&okey), "the taker's own unfunded offer must be reaped");
         assert!(stale.contains(&okey), "and reported as removed for the cancel view");
@@ -4608,7 +4671,7 @@ mod tests {
         // the taker's INPUT — never trimmed to the remaining output.
         let (_rp, rg, _c) = cross_engine_to(
             &taker, &taker, (1_000_000_000_000_000, -8), (10_000_000, 0), &usd_leg, &xrp_leg,
-            u64::MAX, u64::MAX, false, false, false, None, &mut sandbox, &mut stale,);
+            u64::MAX, u64::MAX, false, false, false, None, None, &mut sandbox, &mut stale,);
 
         assert!(me_is_zero(rg), "the 10 XRP is spent");
         assert!(sandbox.exists(&live), "the funded maker is only part-filled");
@@ -4633,7 +4696,7 @@ mod tests {
         let mut stale = Vec::new();
         cross_engine_to(
             &taker, &taker, (1_000_000_000_000_000, -8), (10_000_000, 0), &usd_leg, &xrp_leg,
-            u64::MAX, u64::MAX, false, false, false, None, &mut sandbox, &mut stale,);
+            u64::MAX, u64::MAX, false, false, false, None, None, &mut sandbox, &mut stale,);
 
         assert!(!sandbox.exists(&dusty), "a dust-backed offer must be reaped");
         assert!(stale.contains(&dusty));
@@ -4736,7 +4799,7 @@ mod tests {
         let mut stale = Vec::new();
         let (_rp, rg, _c) = cross_engine_to(
             &taker, &taker, (1_000_000_000_000_000, -8), (10_000_000, 0), &usd_leg, &xrp_leg,
-            u64::MAX, u64::MAX, false, false, false, None, &mut sandbox, &mut stale,);
+            u64::MAX, u64::MAX, false, false, false, None, None, &mut sandbox, &mut stale,);
 
         assert!(me_is_zero(rg), "the 10 XRP is spent on the first level");
         assert!(sandbox.exists(&live), "the funded maker is only part-filled");
