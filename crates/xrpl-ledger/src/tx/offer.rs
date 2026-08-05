@@ -1401,6 +1401,17 @@ fn cross_bridged(
         };
         let qa_book = apeek.as_ref().map(|(q, ..)| rate_me(*q));
         let qb_book = bpeek.as_ref().map(|(q, ..)| rate_me(*q));
+        // Each leg pool's SPOT quality — `Quality{balances}`, the comparison
+        // quality `maxOffer` hands `tip`. Raw in/out off CURRENT balances, no
+        // trading fee: `Quality{balances}` applies none.
+        let spot_of = |am: Option<&crate::tx::amm_swap::Amm>, out_leg: &Leg, in_leg: &Leg, sandbox: &mut Sandbox| -> Option<Me> {
+            let a = am?;
+            let (pin, pout) = crate::tx::amm_swap::pool_balances(sandbox, a, out_leg, in_leg);
+            if pin.0 == 0 || pout.0 == 0 { return None; }
+            Some(me_muldiv(pin, (1u128, 0i32), pout, true))
+        };
+        let spot_a = spot_of(amm_a.as_ref(), &xrp_leg, gets_leg, sandbox);
+        let spot_b = spot_of(amm_b.as_ref(), pays_leg, &xrp_leg, sandbox);
         // The pool wins a leg only when STRICTLY better than the book head.
         let a_use_amm = match (&a_fib, qa_book) {
             (Some((qf, _)), Some(qb)) => me_cmp(*qf, qb).is_lt(),
@@ -1660,20 +1671,36 @@ fn cross_bridged(
         //            `ammOffer->quality() > lobQuality` is false and the
         //            strand falls back to its BOOK.
         //
-        // There is a second single-path branch, and it does NOT change the
-        // outcome: `BookOfferCrossingStep::qualityThreshold` (BookStep.cpp:
-        // 475-480) returns lobQuality only while
-        // `qualityThreshold_ <= lobQuality`; when the taker's limit BEATS the
-        // leg's book it returns nullopt and `getAMMOffer` yields `maxOffer`
-        // instead. But `maxOffer` drives ~99% of the pool's output side out,
-        // so its AVERAGE quality is ~100x worse than spot and it loses `tip`'s
-        // comparison to any live book. Measured on #105940336 leg B (pool
-        // rQBeAgh, 103807148357 drops / 1.745915504076971 BTC):
-        //     spot      1.681884e-11 BTC/drop
-        //     fib slice 1.681144e-11   (0.025% of the pool)
-        //     maxOffer  1.681564e-13   (99% of pool BTC out, 100.0x worse)
-        // ⚠ Compute these, do not eyeball: the trace mixes drops and XRP and
-        // this exact figure has now been misread by 100x three times.
+        // The second single-path branch, which DOES lift the strand — but at
+        // the pool's SPOT quality, not at any amount it would actually trade.
+        // `BookOfferCrossingStep::qualityThreshold` (BookStep.cpp:475-480)
+        // returns lobQuality only while `qualityThreshold_ <= lobQuality`; when
+        // the taker's limit BEATS the leg's book it returns nullopt, and
+        // `getAMMOffer(view, nullopt)` yields `maxOffer` — whose AMMOffer is
+        // built `AMMOffer(*this, amounts, balances, Quality{balances})`
+        // (AMMLiquidity.cpp maxOffer). **Its quality() is the pool's SPOT
+        // quality**, while its AMOUNTS drain ~99% of the pool's output side.
+        // `tip` compares on quality(), so the pool wins whenever spot beats the
+        // book, and being an Amm tip its transfer fee is WAIVED where a Clob
+        // tip pays the output issuer's rate (BookStep::qualityUpperBound).
+        //
+        // ⚠ An AMM offer's COMPARISON quality and its EXECUTION rate are
+        // different quantities and this gate wants the first. Measured on
+        // #105940336 leg B (pool rQBeAgh, 103807148357 drops /
+        // 1.745915504076971 BTC):
+        //     spot / quality()   1.681884e-11 BTC/drop   <- what `tip` compares
+        //     fib slice          1.681144e-11   (0.025% of the pool)
+        //     maxOffer AVERAGE   1.681564e-13   (99% of pool BTC out, 100x)
+        // Reading that 100x average as the comparison quality is what made this
+        // ledger look unexplainable; the figure itself has been misread by 100x
+        // three separate times. Compute, never eyeball.
+        //
+        // The pool contributes nothing when spot is no better than the book:
+        // `getOffer` bails "higher clob quality" on
+        // `spotPriceQ <= clobQuality` BEFORE either branch. That is why
+        // #105807256 84FD7DC8 stays rejected — its leg B pool is worse than its
+        // book, so the strand reads book-only either way.
+        //
         // A strand whose `qualityUpperBound` misses limitQuality is dropped
         // from the candidate set — silently, `continue` with no log line, in
         // both `activateNext` and the strand loop (StrandFlow.h:667-673).
@@ -1712,10 +1739,26 @@ fn cross_bridged(
                 // buy side, IOU<->IOU with no XRP leg, so every one is bridged.
                 // #105813899 44E799C6FF9B: lb=0, and its direct tip 1.895174
                 // misses thr 1.890193, so it is single-path and breaks here.
+                // Single path: each leg's tip is its BOOK, unless the taker's
+                // limit beats that book — then `qualityThreshold` is nullopt,
+                // `maxOffer` is generated, and its quality() is the pool SPOT.
+                // rippled compares the tx-level limit against a LEG's quality
+                // directly (`qualityThreshold_ > lobQuality`), which is
+                // dimensionally odd but is what the code does; in me-space
+                // (in-per-out, smaller is better) that is `thr < leg_book`.
+                let single_tip = |book: Option<Me>, spot: Option<Me>| -> Option<Me> {
+                    let b = book?;
+                    match spot {
+                        // `spotPriceQ <= clobQuality` bails "higher clob
+                        // quality" first, so the pool must be STRICTLY better.
+                        Some(s) if me_cmp(t, b).is_lt() && me_cmp(s, b).is_lt() => Some(s),
+                        _ => Some(b),
+                    }
+                };
                 let admit = if multi {
                     bq
                 } else {
-                    match (qa_book, qb_book) {
+                    match (single_tip(qa_book, spot_a), single_tip(qb_book, spot_b)) {
                         (Some(a), Some(b)) => Some(norm16((a.0 * b.0, a.1 + b.1))),
                         _ => None,
                     }
@@ -3688,6 +3731,115 @@ mod tests {
             json_at(&sandbox, &keylet::offer_key(&taker, 3)).is_none(),
             "and the taker's own offer is removed, not crossed",
         );
+    }
+
+    /// A single-path leg is priced by its pool's SPOT quality when the taker's
+    /// limit beats that leg's book.
+    ///
+    /// `BookOfferCrossingStep::qualityThreshold` returns nullopt in that case
+    /// (BookStep.cpp:475-480), so `getAMMOffer(view, nullopt)` yields
+    /// `maxOffer` — built `AMMOffer(*this, amounts, balances, Quality{balances})`
+    /// (AMMLiquidity.cpp), whose **quality() is the pool SPOT** even though its
+    /// amounts drain ~99% of the pool. `tip` compares on quality(), so the pool
+    /// wins whenever spot beats the book.
+    ///
+    /// Here leg B's pool is 9800 drops/BBB against a 10000 drops/BBB book. Via
+    /// the books the bridge composes to 1.0 AAA/BBB and misses the taker's
+    /// 0.995 limit; via leg B's spot it composes to 0.98 and clears it. There
+    /// is no direct book, so only one strand is ever a candidate — this is the
+    /// single-path branch, not the multiPath one.
+    ///
+    /// #105940336 CA2C624ED031 is the live case: leg B (XRP->BTC, pool
+    /// rQBeAgh) spot 1.681884e-11 BTC/drop beats its book's 1.679720e-11, and
+    /// rippled admits the strand at 63928.92 against a 63958.12 limit where the
+    /// book composition is 64011.27. We rested: 6 mutations against 10.
+    #[test]
+    fn a_single_path_leg_is_priced_by_its_pools_spot_quality() {
+        let taker = [0x01u8; 20];
+        let mk_a = [0x04u8; 20];
+        let mk_b = [0x05u8; 20];
+        let iss_a = [0x02u8; 20];
+        let iss_b = [0x03u8; 20];
+        let pool_b = [0x07u8; 20];
+        let (mut ca, mut cb) = ([0u8; 20], [0u8; 20]);
+        ca[12..15].copy_from_slice(b"AAA");
+        cb[12..15].copy_from_slice(b"BBB");
+
+        let mut state = make_state_with_account(&taker, 500_000_000);
+        for (id, bal) in [(&mk_a, "500000000"), (&mk_b, "500000000"), (&iss_a, "500000000"),
+                          (&iss_b, "500000000"), (&pool_b, "98000000")] {
+            let a = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": hex::encode(id),
+                "Balance": bal, "Sequence": 1, "OwnerCount": 0,
+            });
+            state.state_map.insert(keylet::account_root_key(id), serde_json::to_vec(&a).unwrap()).unwrap();
+        }
+        let mut line = |who: &[u8; 20], iss: &[u8; 20], cur: &[u8; 20], bal: &str| {
+            let (lo, hi) = if who < iss { (*who, *iss) } else { (*iss, *who) };
+            let v = serde_json::json!({
+                "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+                "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000",
+                            "value": if who < iss { bal.to_string() } else { format!("-{bal}") }},
+                "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000000"},
+                "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000000"},
+            });
+            state.state_map.insert(keylet::ripple_state_key(who, iss, cur), serde_json::to_vec(&v).unwrap()).unwrap();
+        };
+        line(&taker, &iss_a, &ca, "1000");    // the taker's AAA to sell
+        line(&mk_b, &iss_b, &cb, "1000");     // leg B book maker's BBB
+        line(&pool_b, &iss_b, &cb, "10000");  // leg B pool: 98 XRP / 10000 BBB
+
+        // Leg B pool spot = 98000000/10000 = 9800 drops per BBB, strictly
+        // better than the 10000 its book head asks.
+        let amm = serde_json::json!({
+            "LedgerEntryType": "AMM", "Account": hex::encode(pool_b), "TradingFee": 0,
+        });
+        let xrp_leg = leg_of(&serde_json::json!("1")).unwrap();
+        let b_leg = leg_of(&serde_json::json!({"currency":"BBB","issuer":hex::encode(iss_b),"value":"1"})).unwrap();
+        let akey = keylet::amm_key(&xrp_leg.cur, &xrp_leg.issuer, &b_leg.cur, &b_leg.issuer);
+        state.state_map.insert(akey, serde_json::to_vec(&amm).unwrap()).unwrap();
+
+        // Leg A book: 1 XRP for 100 AAA. Leg B book: 100 BBB for 1 XRP.
+        // No direct AAA/BBB book at all, so only one strand is ever a candidate.
+        for (who, pays, gets) in [
+            (mk_a, serde_json::json!({"currency":"AAA","issuer":hex::encode(iss_a),"value":"100"}), serde_json::json!("1000000")),
+            (mk_b, serde_json::json!("1000000"), serde_json::json!({"currency":"BBB","issuer":hex::encode(iss_b),"value":"100"})),
+        ] {
+            let mut sandbox = Sandbox::new(&state);
+            let tx = TxFields {
+                account: who, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
+                ticket_seq: None, last_ledger_seq: None,
+                fields: serde_json::json!({"TakerPays": pays, "TakerGets": gets}),
+            };
+            assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+            let mods = sandbox.into_modifications();
+            apply_modifications(&mut state, mods).unwrap();
+        }
+
+        // Sell 99.5 AAA for 100 BBB — limit 0.995 AAA/BBB. Book composition is
+        // 1.0 and misses it; leg B's spot composition is 0.98 and clears it.
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: taker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 9,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerGets": {"currency": "AAA", "issuer": hex::encode(iss_a), "value": "99.5"},
+                "TakerPays": {"currency": "BBB", "issuer": hex::encode(iss_b), "value": "100"},
+            }),
+        };
+        assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+
+        // Leg A's book is the only source on that leg, so it must be consumed;
+        // book-only admission crosses nothing at all and rests the lot.
+        let a_left = json_at(&sandbox, &keylet::offer_key(&mk_a, 2))
+            .and_then(|o| o["TakerGets"].as_str().map(|s| s.to_string()));
+        assert_ne!(
+            a_left.as_deref(), Some("1000000"),
+            "leg A's book maker must be crossed — the strand was admitted on leg B's spot",
+        );
+        let rested = json_at(&sandbox, &keylet::offer_key(&taker, 9));
+        let gets_left = rested.as_ref().and_then(|o| o["TakerGets"]["value"].as_str());
+        assert_ne!(gets_left, Some("99.5"), "and the taker's offer cannot rest in full");
     }
 
     /// A bridge leg with a POOL but NO BOOK cannot carry the pass at all.
