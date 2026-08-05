@@ -454,6 +454,12 @@ XrplApplyResult *xrpl_apply_with_mutations(
         xrpl::MinimalApp app(network_id);
         CapturingSink capturing_sink(result->last_fatal);
         beast::Journal journal(capturing_sink);
+        // Payments reach flow() through RippleCalc, which pulls its journal
+        // from the registry rather than from ctx_.journal — see
+        // MinimalApp::getJournal. Without this every flow() log on the payment
+        // path is dropped and XRPL_FFI_TRACE of a Payment comes back empty
+        // while an OfferCreate traces fine.
+        app.setTraceSink(&capturing_sink);
 
         auto apply_result = xrpl::apply(
             app, open_view, tx,
