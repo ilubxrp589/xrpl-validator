@@ -1812,21 +1812,29 @@ fn cross_bridged(
                 );
             }
         }
-        // Discard a candidate whose realised quality misses the limit outright,
-        // then take the better of what is left.
-        let ok = |q: Option<u64>| q.filter(|v| threshold == u64::MAX || *v <= threshold);
-        let (ed, eb) = (ok(est_direct), ok(est_bridge));
-        let use_direct = match (ed, eb) {
-            (Some(d), Some(b)) => d <= b,
-            (Some(_), None) => true,
-            (None, Some(_)) => false,
+        // Candidate set and ORDER, per `ActiveStrands::activateNext`: sort by
+        // `qualityUpperBound`, BEST FIRST, and drop any strand whose upper
+        // bound misses `limitQuality`. Not by estimated realised quality —
+        // rippled never ranks strands on what they realise, it ranks on the
+        // bound and then lets the pass prove itself (see the loop below).
+        let ub_ok = |q: Option<Me>| q.filter(|v| thr.is_none_or(|t| me_cmp(*v, t).is_le()));
+        let order: &[bool] = match (ub_ok(d_tip), ub_ok(bq_ub)) {
+            (Some(d), Some(b)) => {
+                if me_cmp(d, b).is_le() {
+                    &[true, false]
+                } else {
+                    &[false, true]
+                }
+            }
+            (Some(_), None) => &[true],
+            (None, Some(_)) => &[false],
+            // Every candidate's upper bound misses the limit: rippled drops
+            // them all and the flow ends — "All strands dry".
             (None, None) => break,
         };
         if std::env::var("DX_BRIDGE").is_ok() {
-            eprintln!("DX_EST direct={est_direct:?} bridge={est_bridge:?} thr={threshold} use_direct={use_direct}");
-        }
-        if std::env::var("DX_BRIDGE").is_ok() {
-            eprintln!("DX_BRIDGE dq={dq:?} bq={bq:?} thr={thr:?} use_direct={use_direct} di={di} ai={ai} bi={bi} ld={} la={} lb={}", ld.len(), la.len(), lb.len());
+            eprintln!("DX_EST direct={est_direct:?} bridge={est_bridge:?} thr={threshold} order={order:?}");
+            eprintln!("DX_BRIDGE dq={dq:?} bq={bq:?} bq_ub={bq_ub:?} thr={thr:?} order={order:?} di={di} ai={ai} bi={bi} ld={} la={} lb={}", ld.len(), la.len(), lb.len());
         }
         // No marginal bail: the realised estimates above already gated this
         // iteration, and the judge below checks what it actually moved.
@@ -1914,169 +1922,212 @@ fn cross_bridged(
         // book — 71x worse — and the bridge is dropped too. Mainnet moves no
         // value and rests all 4 nodes. Its trace is the proof: no `New flow
         // iter` line at all, straight to `All strands dry`.
-        if !use_direct {
-            if let Some(t) = thr {
-                let within = |q: Option<Me>| q.is_some_and(|v| me_cmp(v, t).is_le());
-                // `activateNext` runs BEFORE `setMultiPath`, so it filters
-                // against the PREVIOUS iteration's flag — true on entry, from
-                // `Flow.cpp:106`'s `strands.size() > 1`. Both candidates are
-                // therefore judged with the pool in play, and the count that
-                // survives is what `setMultiPath` then sees.
-                let multi = (within(d_tip) as u8) + (within(bq_ub) as u8) > 1;
-                // Single path: the pool is matched to the book, so the book's
-                // composition IS the strand's quality. A leg with no book at
-                // all then composes nothing — off the default path the step
-                // keeps going into that leg's CLOB and StrandFlow judges the
-                // pass as a whole, and with no CLOB behind the pool there is
-                // nothing for it to clear.
-                //
-                // All 8 protected cases are Flags=65536 exactly (tfPassive),
-                // buy side, IOU<->IOU with no XRP leg, so every one is bridged.
-                // #105813899 44E799C6FF9B: lb=0, and its direct tip 1.895174
-                // misses thr 1.890193, so it is single-path and breaks here.
-                // Single path: each leg's tip is its BOOK, unless the taker's
-                // limit beats that book — then `qualityThreshold` is nullopt,
-                // `maxOffer` is generated, and its quality() is the pool SPOT.
-                // rippled compares the tx-level limit against a LEG's quality
-                // directly (`qualityThreshold_ > lobQuality`), which is
-                // dimensionally odd but is what the code does; in me-space
-                // (in-per-out, smaller is better) that is `thr < leg_book`.
-                let single_tip = |book: Option<Me>, spot: Option<Me>| -> Option<Me> {
-                    let b = book?;
-                    match spot {
-                        // `spotPriceQ <= clobQuality` bails "higher clob
-                        // quality" first, so the pool must be STRICTLY better.
-                        Some(s) if me_cmp(t, b).is_lt() && me_cmp(s, b).is_lt() => Some(s),
-                        _ => Some(b),
+        // Walk the candidates in UPPER-BOUND order, taking the FIRST whose
+        // realised fill survives the judge. rippled rejects a pass with
+        // `continue` — which advances to the NEXT strand, not out of the loop
+        // (StrandFlow.h:670-731) — so the judge and the fall-through are ONE
+        // mechanism. Building the judge alone is what failed twice before: it
+        // rejects the leading candidate and then crosses nothing.
+        let mut filled = false;
+        for &want_direct in order {
+            let snap = sandbox.snapshot();
+            let (rp0, rg0, cr0, di0, ai0, bi0, it0) =
+                (rem_pays, rem_gets, crossed, di, ai, bi, amm_iters);
+            amm_used = false;
+            // (in, out) of this candidate's fill, in the same orientation as
+            // `est_direct`/`est_bridge`: gets-side in, pays-side out.
+            let mut fill: Option<(Me, Me)> = None;
+            'attempt: {
+            if !want_direct {
+                if let Some(t) = thr {
+                    let within = |q: Option<Me>| q.is_some_and(|v| me_cmp(v, t).is_le());
+                    // `activateNext` runs BEFORE `setMultiPath`, so it filters
+                    // against the PREVIOUS iteration's flag — true on entry, from
+                    // `Flow.cpp:106`'s `strands.size() > 1`. Both candidates are
+                    // therefore judged with the pool in play, and the count that
+                    // survives is what `setMultiPath` then sees.
+                    let multi = (within(d_tip) as u8) + (within(bq_ub) as u8) > 1;
+                    // Single path: the pool is matched to the book, so the book's
+                    // composition IS the strand's quality. A leg with no book at
+                    // all then composes nothing — off the default path the step
+                    // keeps going into that leg's CLOB and StrandFlow judges the
+                    // pass as a whole, and with no CLOB behind the pool there is
+                    // nothing for it to clear.
+                    //
+                    // All 8 protected cases are Flags=65536 exactly (tfPassive),
+                    // buy side, IOU<->IOU with no XRP leg, so every one is bridged.
+                    // #105813899 44E799C6FF9B: lb=0, and its direct tip 1.895174
+                    // misses thr 1.890193, so it is single-path and breaks here.
+                    // Single path: each leg's tip is its BOOK, unless the taker's
+                    // limit beats that book — then `qualityThreshold` is nullopt,
+                    // `maxOffer` is generated, and its quality() is the pool SPOT.
+                    // rippled compares the tx-level limit against a LEG's quality
+                    // directly (`qualityThreshold_ > lobQuality`), which is
+                    // dimensionally odd but is what the code does; in me-space
+                    // (in-per-out, smaller is better) that is `thr < leg_book`.
+                    let single_tip = |book: Option<Me>, spot: Option<Me>| -> Option<Me> {
+                        let b = book?;
+                        match spot {
+                            // `spotPriceQ <= clobQuality` bails "higher clob
+                            // quality" first, so the pool must be STRICTLY better.
+                            Some(s) if me_cmp(t, b).is_lt() && me_cmp(s, b).is_lt() => Some(s),
+                            _ => Some(b),
+                        }
+                    };
+                    let admit = if multi {
+                        bq
+                    } else {
+                        match (single_tip(qa_book, spot_a), single_tip(qb_book, spot_b)) {
+                            (Some(a), Some(b)) => Some(norm16((a.0 * b.0, a.1 + b.1))),
+                            _ => None,
+                        }
+                    };
+                    if std::env::var("DX_BRIDGE").is_ok() {
+                        eprintln!("DX_ADMIT d_tip={d_tip:?} multi={multi} admit={admit:?} thr={t:?}");
                     }
-                };
-                let admit = if multi {
-                    bq
+                    if !within(admit) {
+                        break 'attempt;
+                    }
+                }
+            }
+            if want_direct {
+                let Some((_, okey, offer, maker, gives0, wants0)) =
+                    live_head(sandbox, &ld, &mut di, taker, pays_leg, true, stale)
+                else { break 'attempt };
+                let funded = available(sandbox, &maker, pays_leg);
+                let m_gives = if me_cmp(funded, gives0).is_lt() { funded } else { gives0 };
+                let mut give = if !sell && me_cmp(rem_pays, m_gives).is_lt() { rem_pays } else { m_gives };
+                let mut pay = me_muldiv(give, wants0, gives0, true);
+                if me_cmp(pay, rem_gets).is_gt() {
+                    pay = rem_gets;
+                    give = me_muldiv(pay, gives0, wants0, false);
+                    if me_is_zero(give) {
+                        break 'attempt;
+                    }
+                }
+                settle_fill(sandbox, &okey, &offer, &maker, taker, beneficiary,
+                            pays_leg, gets_leg, give, pay, gives0, wants0);
+                rem_pays = me_sub(rem_pays, give);
+                rem_gets = me_sub(rem_gets, pay);
+                crossed += 1;
+                fill = Some((pay, give));
+            } else {
+                // Resolve each leg's source: book maker offer or that pair's
+                // pool fib slice. A-side capacity/rate in (XRP-out, gets-in),
+                // B-side in (pays-out, XRP-in).
+                let a_book = if a_use_amm {
+                    None
                 } else {
-                    match (single_tip(qa_book, spot_a), single_tip(qb_book, spot_b)) {
-                        (Some(a), Some(b)) => Some(norm16((a.0 * b.0, a.1 + b.1))),
-                        _ => None,
+                    match live_head(sandbox, &la, &mut ai, taker, &xrp_leg, true, stale) {
+                        Some(h) => Some(h),
+                        None => break 'attempt,
                     }
                 };
+                let b_book = if b_use_amm {
+                    None
+                } else {
+                    match live_head(sandbox, &lb, &mut bi, taker, pays_leg, true, stale) {
+                        Some(h) => Some(h),
+                        None => break 'attempt,
+                    }
+                };
+                // (xrp capacity, gets per that xrp) for leg A.
+                let (a_cap_xrp, a_in_full, a_out_full) = match (&a_book, &a_fib) {
+                    (Some((_, _, _, amaker, a_gives0, a_wants0)), _) => {
+                        let funded = available(sandbox, amaker, &xrp_leg);
+                        let a_gives = if me_cmp(funded, *a_gives0).is_lt() { funded } else { *a_gives0 };
+                        (a_gives, *a_wants0, *a_gives0)
+                    }
+                    (None, Some((_, (s_in, s_out)))) => (*s_out, *s_in, *s_out),
+                    (None, None) => break 'attempt,
+                };
+                let (b_cap_xrp, b_in_full, b_out_full) = match (&b_book, &b_fib) {
+                    (Some((_, _, _, _, b_gives0, b_wants0)), _) => (*b_wants0, *b_wants0, *b_gives0),
+                    (None, Some((_, (s_in, s_out)))) => (*s_in, *s_in, *s_out),
+                    (None, None) => break 'attempt,
+                };
+                let mut xrp = if me_cmp(a_cap_xrp, b_cap_xrp).is_lt() { a_cap_xrp } else { b_cap_xrp };
+                let mut gets_in = me_muldiv(xrp, a_in_full, a_out_full, true);
+                if me_cmp(gets_in, rem_gets).is_gt() {
+                    gets_in = rem_gets;
+                    xrp = me_muldiv(gets_in, a_out_full, a_in_full, false);
+                }
+                let mut pays_out = reprice_b(xrp, me_muldiv(xrp, b_out_full, b_in_full, false), sandbox);
+                if !sell && me_cmp(pays_out, rem_pays).is_gt() {
+                    pays_out = rem_pays;
+                    xrp = me_muldiv(pays_out, b_in_full, b_out_full, true);
+                    gets_in = reprice_a(xrp, me_muldiv(xrp, a_in_full, a_out_full, true), sandbox);
+                }
+                let xrp = (me_rescale(xrp, 0, false), 0);
                 if std::env::var("DX_BRIDGE").is_ok() {
-                    eprintln!("DX_ADMIT d_tip={d_tip:?} multi={multi} admit={admit:?} thr={t:?}");
+                    eprintln!("DX_BRIDGE slice xrp={xrp:?} gets_in={gets_in:?} pays_out={pays_out:?} a_amm={a_use_amm} b_amm={b_use_amm} rem_g={rem_gets:?} rem_p={rem_pays:?}");
                 }
-                if !within(admit) {
-                    break;
+                if me_is_zero(xrp) || me_is_zero(gets_in) || me_is_zero(pays_out) {
+                    break 'attempt;
+                }
+                // Leg A: taker sells gets for XRP (XRP rides in-flight via the
+                // taker and nets out of their mutation set).
+                match (&a_book, &a_fib) {
+                    (Some((_, akey, aoffer, amaker, a_gives0, a_wants0)), _) => {
+                        settle_fill(sandbox, akey, aoffer, amaker, taker, taker,
+                                    &xrp_leg, gets_leg, xrp, gets_in, *a_gives0, *a_wants0);
+                    }
+                    (None, Some(_)) => {
+                        crate::tx::amm_swap::apply_slice(
+                            sandbox, amm_a.as_ref().unwrap(), taker, taker, &xrp_leg, gets_leg, gets_in, xrp,
+                        );
+                        amm_used = true;
+                    }
+                    _ => break 'attempt,
+                }
+                // Leg B: taker sells that XRP for the pays side.
+                match (&b_book, &b_fib) {
+                    (Some((_, bkey, boffer, bmaker, b_gives0, b_wants0)), _) => {
+                        settle_fill(sandbox, bkey, boffer, bmaker, taker, beneficiary,
+                                    pays_leg, &xrp_leg, pays_out, xrp, *b_gives0, *b_wants0);
+                    }
+                    (None, Some(_)) => {
+                        crate::tx::amm_swap::apply_slice(
+                            sandbox, amm_b.as_ref().unwrap(), taker, beneficiary, pays_leg, &xrp_leg, xrp, pays_out,
+                        );
+                        amm_used = true;
+                    }
+                    _ => break 'attempt,
+                }
+                rem_gets = me_sub(rem_gets, gets_in);
+                rem_pays = me_sub(rem_pays, pays_out);
+                crossed += 1;
+                fill = Some((gets_in, pays_out));
+                // One bump per ITERATION, however many of the two legs the pools
+                // carried — `ammContext.update()` is `if (ammUsed_) ++ammIters_`.
+                if amm_used {
+                    amm_iters += 1;
                 }
             }
-        }
-        if use_direct {
-            let Some((_, okey, offer, maker, gives0, wants0)) =
-                live_head(sandbox, &ld, &mut di, taker, pays_leg, true, stale)
-            else { break };
-            let funded = available(sandbox, &maker, pays_leg);
-            let m_gives = if me_cmp(funded, gives0).is_lt() { funded } else { gives0 };
-            let mut give = if !sell && me_cmp(rem_pays, m_gives).is_lt() { rem_pays } else { m_gives };
-            let mut pay = me_muldiv(give, wants0, gives0, true);
-            if me_cmp(pay, rem_gets).is_gt() {
-                pay = rem_gets;
-                give = me_muldiv(pay, gives0, wants0, false);
-                if me_is_zero(give) {
-                    break;
-                }
             }
-            settle_fill(sandbox, &okey, &offer, &maker, taker, beneficiary,
-                        pays_leg, gets_leg, give, pay, gives0, wants0);
-            rem_pays = me_sub(rem_pays, give);
-            rem_gets = me_sub(rem_gets, pay);
-            crossed += 1;
-        } else {
-            // Resolve each leg's source: book maker offer or that pair's
-            // pool fib slice. A-side capacity/rate in (XRP-out, gets-in),
-            // B-side in (pays-out, XRP-in).
-            let a_book = if a_use_amm {
-                None
-            } else {
-                match live_head(sandbox, &la, &mut ai, taker, &xrp_leg, true, stale) {
-                    Some(h) => Some(h),
-                    None => break,
+            // The judge — `q < limitQuality` rejects the pass outright.
+            let accepted = match fill {
+                None => false,
+                Some((gin, pout)) => {
+                    threshold == u64::MAX
+                        || rate_of_me(gin, pout).is_some_and(|q| q <= threshold)
                 }
             };
-            let b_book = if b_use_amm {
-                None
-            } else {
-                match live_head(sandbox, &lb, &mut bi, taker, pays_leg, true, stale) {
-                    Some(h) => Some(h),
-                    None => break,
-                }
-            };
-            // (xrp capacity, gets per that xrp) for leg A.
-            let (a_cap_xrp, a_in_full, a_out_full) = match (&a_book, &a_fib) {
-                (Some((_, _, _, amaker, a_gives0, a_wants0)), _) => {
-                    let funded = available(sandbox, amaker, &xrp_leg);
-                    let a_gives = if me_cmp(funded, *a_gives0).is_lt() { funded } else { *a_gives0 };
-                    (a_gives, *a_wants0, *a_gives0)
-                }
-                (None, Some((_, (s_in, s_out)))) => (*s_out, *s_in, *s_out),
-                (None, None) => break,
-            };
-            let (b_cap_xrp, b_in_full, b_out_full) = match (&b_book, &b_fib) {
-                (Some((_, _, _, _, b_gives0, b_wants0)), _) => (*b_wants0, *b_wants0, *b_gives0),
-                (None, Some((_, (s_in, s_out)))) => (*s_in, *s_in, *s_out),
-                (None, None) => break,
-            };
-            let mut xrp = if me_cmp(a_cap_xrp, b_cap_xrp).is_lt() { a_cap_xrp } else { b_cap_xrp };
-            let mut gets_in = me_muldiv(xrp, a_in_full, a_out_full, true);
-            if me_cmp(gets_in, rem_gets).is_gt() {
-                gets_in = rem_gets;
-                xrp = me_muldiv(gets_in, a_out_full, a_in_full, false);
-            }
-            let mut pays_out = reprice_b(xrp, me_muldiv(xrp, b_out_full, b_in_full, false), sandbox);
-            if !sell && me_cmp(pays_out, rem_pays).is_gt() {
-                pays_out = rem_pays;
-                xrp = me_muldiv(pays_out, b_in_full, b_out_full, true);
-                gets_in = reprice_a(xrp, me_muldiv(xrp, a_in_full, a_out_full, true), sandbox);
-            }
-            let xrp = (me_rescale(xrp, 0, false), 0);
             if std::env::var("DX_BRIDGE").is_ok() {
-                eprintln!("DX_BRIDGE slice xrp={xrp:?} gets_in={gets_in:?} pays_out={pays_out:?} a_amm={a_use_amm} b_amm={b_use_amm} rem_g={rem_gets:?} rem_p={rem_pays:?}");
+                eprintln!("DX_CAND want_direct={want_direct} fill={fill:?} accepted={accepted}");
             }
-            if me_is_zero(xrp) || me_is_zero(gets_in) || me_is_zero(pays_out) {
+            if accepted {
+                filled = true;
                 break;
             }
-            // Leg A: taker sells gets for XRP (XRP rides in-flight via the
-            // taker and nets out of their mutation set).
-            match (&a_book, &a_fib) {
-                (Some((_, akey, aoffer, amaker, a_gives0, a_wants0)), _) => {
-                    settle_fill(sandbox, akey, aoffer, amaker, taker, taker,
-                                &xrp_leg, gets_leg, xrp, gets_in, *a_gives0, *a_wants0);
-                }
-                (None, Some(_)) => {
-                    crate::tx::amm_swap::apply_slice(
-                        sandbox, amm_a.as_ref().unwrap(), taker, taker, &xrp_leg, gets_leg, gets_in, xrp,
-                    );
-                    amm_used = true;
-                }
-                _ => break,
-            }
-            // Leg B: taker sells that XRP for the pays side.
-            match (&b_book, &b_fib) {
-                (Some((_, bkey, boffer, bmaker, b_gives0, b_wants0)), _) => {
-                    settle_fill(sandbox, bkey, boffer, bmaker, taker, beneficiary,
-                                pays_leg, &xrp_leg, pays_out, xrp, *b_gives0, *b_wants0);
-                }
-                (None, Some(_)) => {
-                    crate::tx::amm_swap::apply_slice(
-                        sandbox, amm_b.as_ref().unwrap(), taker, beneficiary, pays_leg, &xrp_leg, xrp, pays_out,
-                    );
-                    amm_used = true;
-                }
-                _ => break,
-            }
-            rem_gets = me_sub(rem_gets, gets_in);
-            rem_pays = me_sub(rem_pays, pays_out);
-            crossed += 1;
-            // One bump per ITERATION, however many of the two legs the pools
-            // carried — `ammContext.update()` is `if (ammUsed_) ++ammIters_`.
-            if amm_used {
-                amm_iters += 1;
-            }
+            // Rejected: undo this candidate and try the next one.
+            sandbox.restore_snapshot(snap);
+            rem_pays = rp0; rem_gets = rg0; crossed = cr0;
+            di = di0; ai = ai0; bi = bi0; amm_iters = it0;
+            amm_used = false;
+        }
+        if !filled {
+            break;
         }
     }
     Some((rem_pays, rem_gets, crossed))
