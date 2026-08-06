@@ -335,8 +335,6 @@ impl Transactor for TrustSetTransactor {
                 // OwnerCount for each side whose reserve flag was set.
                 const LSF_LOW_RESERVE: u64 = 0x0001_0000;
                 const LSF_HIGH_RESERVE: u64 = 0x0002_0000;
-                const LSF_LOW_AUTH: u64 = 0x0004_0000;
-                const LSF_HIGH_AUTH: u64 = 0x0008_0000;
                 const LSF_LOW_NO_RIPPLE: u64 = 0x0010_0000;
                 const LSF_HIGH_NO_RIPPLE: u64 = 0x0020_0000;
                 const LSF_LOW_FREEZE: u64 = 0x0040_0000;
@@ -364,18 +362,25 @@ impl Transactor for TrustSetTransactor {
                 let high_root = sandbox.read(&keylet::account_root_key(&high_id));
                 let low_dr = default_ripple(low_root.as_deref());
                 let high_dr = default_ripple(high_root.as_deref());
+                // ⚠ AUTH IS NOT AN INTEREST. rippled's bLowReserveSet /
+                // bHighReserveSet (SetTrust.cpp:611-620) are exactly quality-in,
+                // quality-out, NoRipple-vs-DefaultRipple, freeze, limit and
+                // balance. There is no lsfLowAuth/lsfHighAuth term. We had one,
+                // so a single authorisation bit pinned a line open forever:
+                // #106110230 4893BD092441 zeroed the low limit on a line
+                // carrying lsfHighAuth and mainnet deleted it while we Modified.
                 let low_interest = !limit_zero("LowLimit")
                     || bal_pos
                     || quality("LowQualityIn")
                     || quality("LowQualityOut")
                     || ((flags & LSF_LOW_NO_RIPPLE != 0) == low_dr)
-                    || flags & (LSF_LOW_FREEZE | LSF_LOW_AUTH) != 0;
+                    || flags & LSF_LOW_FREEZE != 0;
                 let high_interest = !limit_zero("HighLimit")
                     || bal_neg
                     || quality("HighQualityIn")
                     || quality("HighQualityOut")
                     || ((flags & LSF_HIGH_NO_RIPPLE != 0) == high_dr)
-                    || flags & (LSF_HIGH_FREEZE | LSF_HIGH_AUTH) != 0;
+                    || flags & LSF_HIGH_FREEZE != 0;
 
                 if bal_zero && !low_interest && !high_interest {
                     let hint = |v: &serde_json::Value| -> Option<u64> {
@@ -387,13 +392,18 @@ impl Transactor for TrustSetTransactor {
                     sandbox.delete(line_key);
                     crate::ledger::directory::owner_dir_remove(sandbox, &low_id, &line_key, low_hint, false);
                     crate::ledger::directory::owner_dir_remove(sandbox, &high_id, &line_key, high_hint, false);
-                    // rippled touches BOTH AccountRoots at trustDelete (the
-                    // reserve payer's OwnerCount decrements; the other side is
-                    // a no-op Modified that rippled still records in the meta).
-                    // Mirror the create path's convention (which bumps both):
-                    // decrement both, keeping the pair self-consistent and the
-                    // key-set identical to mainnet's.
-                    for id in [low_id, high_id] {
+                    // `trustDelete` (View.cpp) adjusts NO OwnerCount — it only
+                    // unlinks both directories and erases the line. Every
+                    // OwnerCount move comes from rippled's reserve-clear blocks
+                    // (SetTrust.cpp:645-665), which fire for a side only if that
+                    // side's reserve bit was actually SET. Decrementing both
+                    // sides was wrong in general and underflows an issuer that
+                    // never paid a reserve: on #106110230 the high side sits at
+                    // OwnerCount 0 and mainnet leaves it there.
+                    for (id, reserve_bit) in [(low_id, LSF_LOW_RESERVE), (high_id, LSF_HIGH_RESERVE)] {
+                        if flags & reserve_bit == 0 {
+                            continue;
+                        }
                         let acct_key = keylet::account_root_key(&id);
                         if let Some(data) = sandbox.read(&acct_key) {
                             if let Ok(mut acct) = serde_json::from_slice::<serde_json::Value>(&data) {
@@ -607,5 +617,106 @@ mod tests {
         let f = after["Flags"].as_u64().unwrap();
         assert!(f & auth_bit != 0, "tfSetfAuth must set the sender's auth bit");
         assert_eq!(f & 0x0011_0000, 0x0011_0000, "existing flags are preserved");
+    }
+
+    /// The shape of mainnet #106110230 `4893BD092441`: the low side zeroes its
+    /// limit on a line that carries `lsfHighAuth`, and mainnet DELETES it.
+    ///
+    /// low  = sender, no lsfDefaultRipple, OwnerCount 17, holds lsfLowReserve
+    /// high = issuer, HAS lsfDefaultRipple, OwnerCount 0,  no reserve bit
+    /// line = lsfLowReserve | lsfHighAuth | lsfLowNoRipple, balance 0
+    fn line_106110230() -> (LedgerState, [u8; 20], [u8; 20], [u8; 20], Hash256) {
+        let sender = [0x01u8; 20]; // low
+        let issuer = [0x02u8; 20]; // high
+        assert!(sender < issuer, "sender must be the low side");
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+
+        let mut state = make_state(&[]);
+        for (id, flags, owner_count) in [(sender, 0u64, 17u64), (issuer, 0x0080_0000u64, 0u64)] {
+            let acct = serde_json::json!({
+                "LedgerEntryType": "AccountRoot",
+                "Account": hex::encode(id),
+                "Balance": "100000000",
+                "Sequence": 1,
+                "Flags": flags,
+                "OwnerCount": owner_count,
+            });
+            let key = keylet::account_root_key(&id);
+            state.state_map.insert(key, serde_json::to_vec(&acct).unwrap()).unwrap();
+        }
+
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            // lsfLowReserve | lsfHighAuth | lsfLowNoRipple — mainnet's 0x190000
+            "Flags": 0x0019_0000u64,
+            "Balance": {"currency": hex::encode_upper(cur),
+                        "issuer": "0000000000000000000000000000000000000000", "value": "0"},
+            "LowLimit":  {"currency": hex::encode_upper(cur), "issuer": hex::encode(sender), "value": "45000000"},
+            "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(issuer), "value": "0"},
+            "LowNode": "7",
+            "HighNode": "a",
+        });
+        let line_key = keylet::ripple_state_key(&sender, &issuer, &cur);
+        state.state_map.insert(line_key, serde_json::to_vec(&line).unwrap()).unwrap();
+        (state, sender, issuer, cur, line_key)
+    }
+
+    fn zero_the_limit(sender: [u8; 20], issuer: [u8; 20]) -> TxFields {
+        TxFields {
+            account: sender,
+            tx_type: "TrustSet".to_string(),
+            fee: 12,
+            sequence: 3,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({
+                "LimitAmount": {"currency": "USD", "issuer": hex::encode(issuer), "value": "0"},
+                "Flags": 0x0022_0000u64, // tfSetNoRipple | tfClearFreeze
+            }),
+        }
+    }
+
+    /// rippled's `bLowReserveSet`/`bHighReserveSet` (SetTrust.cpp:611-620) are
+    /// quality, NoRipple-vs-DefaultRipple, freeze, limit and balance — there is
+    /// NO auth term. We had one, so a single `lsfHighAuth` pinned a line open
+    /// that mainnet deletes. Authorisation is not an interest in the line.
+    #[test]
+    fn an_authorised_line_with_no_other_interest_is_still_deleted() {
+        let (state, sender, issuer, _cur, line_key) = line_106110230();
+        let mut sandbox = Sandbox::new(&state);
+        let tx = zero_the_limit(sender, issuer);
+        assert_eq!(TrustSetTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+        assert!(
+            !sandbox.exists(&line_key),
+            "lsfHighAuth alone must not keep a zero-balance, zero-limit line alive"
+        );
+    }
+
+    /// `trustDelete` (View.cpp) does NOT touch OwnerCount at all — it only
+    /// unlinks both directories and erases. Every OwnerCount move comes from
+    /// rippled's reserve set/clear blocks, which fire only for a side whose
+    /// `lsfLowReserve`/`lsfHighReserve` bit was actually set. We decremented
+    /// BOTH sides unconditionally, which underflows an issuer sitting at 0.
+    #[test]
+    fn deleting_a_line_only_decrements_the_side_that_held_the_reserve() {
+        let (state, sender, issuer, _cur, line_key) = line_106110230();
+        let mut sandbox = Sandbox::new(&state);
+        let tx = zero_the_limit(sender, issuer);
+        assert_eq!(TrustSetTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+        assert!(!sandbox.exists(&line_key), "precondition: the line is deleted");
+
+        let owner_count = |id: &[u8; 20]| -> u64 {
+            let d = sandbox.read(&keylet::account_root_key(id)).expect("account survives");
+            serde_json::from_slice::<serde_json::Value>(&d).unwrap()["OwnerCount"]
+                .as_u64()
+                .unwrap()
+        };
+        assert_eq!(owner_count(&sender), 16, "the reserve holder pays back its reserve");
+        assert_eq!(
+            owner_count(&issuer),
+            0,
+            "the side with no reserve bit is untouched — mainnet leaves it at 0"
+        );
     }
 }
