@@ -136,6 +136,21 @@ pub enum RpcReadOutcome<'a> {
 ///
 /// Supports a list of RPC endpoints for failover. On "Server is overloaded"
 /// or network errors, rotates to the next endpoint before retrying.
+/// Reads that exhausted every retry on every endpoint — a NETWORK failure, not
+/// a "this object does not exist". The two are indistinguishable downstream:
+/// `SleProvider::read` collapses `EntryNotFound | Exhausted` to `None`, so a
+/// dropped fetch silently becomes an absent object, the replay proceeds against
+/// an incomplete pre-state, and the probe reports a perfectly plausible
+/// DIVERGENT. Process-global because the providers are built deep inside the
+/// apply path and the verdict is printed far outside it.
+///
+/// #106099077, 2026-08-06: the scout filed `tecPATH_DRY vs tesSUCCESS` on two
+/// circular-arb Payments and a triage note blaming the offer-book directory
+/// walk. Re-running the same fixture on the same binary — against .39 AND
+/// against the same s2 the scout used — came back CLEAN both times. A dropped
+/// fetch had emptied the book. Nothing was wrong with the engine.
+pub static RPC_EXHAUSTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub struct RpcProvider {
     client: reqwest::blocking::Client,
     rpc_urls: Vec<String>,
@@ -291,6 +306,7 @@ impl RpcProvider {
             }
         }
         // All retries exhausted
+        RPC_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
         self.misses.fetch_add(1, Ordering::Relaxed);
         let mut mk = self.miss_keys.lock();
         if mk.len() < 20 {

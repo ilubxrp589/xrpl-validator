@@ -182,6 +182,20 @@ fn run() -> i32 {
         println!("    [muta] {x}");
     }
 
+    // A dropped fetch is not a divergence. `SleProvider::read` cannot tell
+    // "exhausted every retry" from "this object does not exist", so an
+    // incomplete pre-state replays into a plausible-looking DIVERGENT — which
+    // is how #106099077 was filed as a path-engine bug that did not exist.
+    // Say so loudly and return a code the scout maps to "error", never to
+    // "divergent".
+    let exhausted = xrpl_node::ffi_engine::RPC_EXHAUSTED.load(std::sync::atomic::Ordering::Relaxed);
+    if exhausted > 0 {
+        println!(
+            "PROBE: HYDRATION-FAILED ({exhausted} read(s) exhausted every retry) \
+             — verdict withheld, the pre-state is incomplete"
+        );
+        return 3;
+    }
     let attempted_all = s.live_apply_attempted as usize == txs.len();
     let clean = s.live_apply_diverged == 0
         && s.live_apply_silent_diverged == 0

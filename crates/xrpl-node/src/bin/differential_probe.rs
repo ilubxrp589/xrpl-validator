@@ -112,6 +112,15 @@ fn cache_key(url: &str, method: &str, params: &Value) -> String {
     format!("{method}-{:016x}", h.finish())
 }
 
+/// Fetches that failed on the NETWORK, as opposed to objects that genuinely do
+/// not exist. Every caller treats `None` as "absent", so without this a dropped
+/// fetch becomes an incomplete pre-state and then a plausible-looking
+/// divergence — and these results feed `loop/rate.py`, the honest score.
+/// See the same fix on the FFI leg (`ffi_engine::RPC_EXHAUSTED`), prompted by
+/// #106099077 where a phantom `tecPATH_DRY` came with a triage note blaming the
+/// offer-book walk; the fixture replayed CLEAN on re-run.
+static RPC_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn rpc(url: &str, method: &str, params: Value) -> Option<Value> {
     let dir = cache_dir();
     let path = dir.as_ref().map(|d| d.join(cache_key(url, method, &params)));
@@ -122,17 +131,42 @@ fn rpc(url: &str, method: &str, params: Value) -> Option<Value> {
             }
         }
     }
-    let client = reqwest::blocking::Client::builder()
+    let client = match reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
-        .ok()?;
-    let body = client
-        .post(url)
-        .json(&json!({"method": method, "params": [params]}))
-        .send()
-        .ok()?
-        .json::<Value>()
-        .ok()?;
+    {
+        Ok(c) => c,
+        Err(_) => {
+            RPC_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+    };
+    // Retry a transient failure before giving up. `None` from this function is
+    // indistinguishable downstream from "the object is not there" — every
+    // caller does `else { return }` — so one dropped fetch silently hydrates an
+    // incomplete pre-state and the replay then diverges for real-looking
+    // reasons. `entryNotFound` does NOT come through here: rippled answers it
+    // with a result carrying an `error` field, so it returns Some.
+    let mut body = None;
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(250 * attempt));
+        }
+        if let Ok(resp) = client
+            .post(url)
+            .json(&json!({"method": method, "params": [params]}))
+            .send()
+        {
+            if let Ok(v) = resp.json::<Value>() {
+                body = Some(v);
+                break;
+            }
+        }
+    }
+    let Some(body) = body else {
+        RPC_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    };
     let result = body["result"].clone();
     // Only cache successful lookups — an error/None must not be pinned, so a
     // transient failure doesn't poison every future run for that key.
@@ -1490,6 +1524,14 @@ fn run() -> i32 {
     eprintln!("SUMMARY: {total_matched}/{total_attempted} attempted txs MATCH mainnet (native engine)");
     if total_attempted == 0 {
         return 2;
+    }
+    let failed = RPC_FAILED.load(std::sync::atomic::Ordering::Relaxed);
+    if failed > 0 {
+        eprintln!(
+            "PROBE: HYDRATION-FAILED ({failed} fetch(es) failed after retries) \
+             — verdict withheld, the pre-state is incomplete"
+        );
+        return 3;
     }
     if any_diverge { 1 } else { 0 }
 }
