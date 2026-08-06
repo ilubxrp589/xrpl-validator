@@ -1044,6 +1044,24 @@ fn live_head(
         } else {
             maker == maker_pays_leg.issuer
                 || json_at(sandbox, &keylet::ripple_state_key(&maker, &maker_pays_leg.issuer, &maker_pays_leg.cur)).is_some()
+            // ...or whose ACCOUNT ROOT we hold. A maker we have hydrated but
+            // that has NO trust line for the currency it is selling holds ZERO
+            // of it — absence IS the answer, not a gap in what we loaded. The
+            // guard exists so an UNHYDRATED maker is never condemned; a maker
+            // whose root is in hand plainly was hydrated.
+            //
+            // #106096771 69A1FF138D85: rDaQRnUv rests three STSH offers
+            // (F8068209, 7E1CCB88, 8EBA0006) across three quality levels and
+            // holds no STSH trust line AT ALL — `ledger_entry` says
+            // entryNotFound on mainnet itself. rippled logs `Removing unfunded
+            // offer` for each; we read "cannot judge" and left all three, plus
+            // their emptied book pages: 8 mutations against 16. The same book
+            // costs the Payment 9EBC82AB5041 two more.
+            //
+            // Safe now that a dropped fetch aborts the verdict (cae6b85): the
+            // only way a real line goes missing is a hydration failure, and
+            // that no longer reaches a divergence verdict.
+                || json_at(sandbox, &keylet::account_root_key(&maker)).is_some()
         };
         if !funding_known {
             i += 1;
@@ -1219,6 +1237,9 @@ fn reap_if_dead(
     } else {
         maker == &pays_leg.issuer
             || json_at(sandbox, &keylet::ripple_state_key(maker, &pays_leg.issuer, &pays_leg.cur)).is_some()
+            // See `live_head` above: a hydrated maker with no line for what it
+            // sells holds zero of it, and absence is the answer.
+            || json_at(sandbox, &keylet::account_root_key(maker)).is_some()
     };
     if funding_known && me_is_zero(available(sandbox, maker, pays_leg)) {
         delete_maker_offer(sandbox, okey, offer, maker);
@@ -4116,6 +4137,128 @@ mod tests {
         let rested = json_at(&sandbox, &keylet::offer_key(&taker, 9));
         let gets_left = rested.as_ref().and_then(|o| o["TakerGets"]["value"].as_str());
         assert_ne!(gets_left, Some("99.5"), "and the taker's offer cannot rest in full");
+    }
+
+    /// A maker with NO trust line for what it is selling holds ZERO of it, and
+    /// its offer must be reaped.
+    ///
+    /// `reap_if_dead` refuses to condemn a maker whose funding it cannot see —
+    /// an unhydrated maker reading as unfunded caused phantom deletions once
+    /// already. But a maker whose ACCOUNT ROOT we hold plainly WAS hydrated,
+    /// so a missing trust line for the sold currency is the answer, not a gap.
+    ///
+    /// #106096771 69A1FF138D85: rDaQRnUv rests three STSH offers across three
+    /// quality levels and has no STSH trust line at all — `ledger_entry`
+    /// returns entryNotFound on mainnet itself. rippled logs `Removing unfunded
+    /// offer` for each; we read "cannot judge" and left all three plus their
+    /// emptied book pages, 8 mutations against 16. The same book cost the
+    /// Payment 9EBC82AB5041 two more, and one fix closed both.
+    #[test]
+    fn a_maker_with_no_line_for_what_it_sells_is_reaped() {
+        let taker = [0x01u8; 20];
+        let mkr = [0x04u8; 20];
+        let issuer = [0x02u8; 20];
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+
+        let mut state = make_state_with_account(&taker, 500_000_000);
+        for id in [&mkr, &issuer] {
+            let a = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": hex::encode(id),
+                "Balance": "500000000", "Sequence": 1, "OwnerCount": 0,
+            });
+            state.state_map.insert(keylet::account_root_key(id), serde_json::to_vec(&a).unwrap()).unwrap();
+        }
+        let line = |who: &[u8; 20], bal: &str| {
+            let (lo, hi) = if who < &issuer { (*who, issuer) } else { (issuer, *who) };
+            serde_json::json!({
+                "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+                "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000",
+                            "value": if who < &issuer { bal.to_string() } else { format!("-{bal}") }},
+                "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000000"},
+                "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000000"},
+            })
+        };
+        // The TAKER has a USD line to receive on. The MAKER has none at all —
+        // its AccountRoot is present, so this is absence, not ignorance.
+        state
+            .state_map
+            .insert(keylet::ripple_state_key(&taker, &issuer, &cur), serde_json::to_vec(&line(&taker, "0")).unwrap())
+            .unwrap();
+
+        // Place the maker's offer while it still has the USD to back it, then
+        // take the line away — on chain the account simply never had one.
+        state
+            .state_map
+            .insert(keylet::ripple_state_key(&mkr, &issuer, &cur), serde_json::to_vec(&line(&mkr, "100")).unwrap())
+            .unwrap();
+        let mut sandbox = Sandbox::new(&state);
+        let mk = TxFields {
+            account: mkr, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                // 1e6 drops per USD — WORSE than the taker's 9e5 limit below,
+                // so the crossing walk never enters this level.
+                "TakerPays": "100000000",
+                "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
+            }),
+        };
+        assert_eq!(OfferCreateTransactor.do_apply(&mk, &mut sandbox), TxResult::Success);
+        let mods = sandbox.into_modifications();
+        apply_modifications(&mut state, mods).unwrap();
+        state.state_map.delete(&keylet::ripple_state_key(&mkr, &issuer, &cur)).unwrap();
+
+        // A 500 XRP / 1000 USD pool, priced inside the taker's limit, so the
+        // strand is built and the level scan runs.
+        let pool = [0x06u8; 20];
+        let a = serde_json::json!({
+            "LedgerEntryType": "AccountRoot", "Account": hex::encode(pool),
+            "Balance": "500000000", "Sequence": 1, "OwnerCount": 0,
+        });
+        state.state_map.insert(keylet::account_root_key(&pool), serde_json::to_vec(&a).unwrap()).unwrap();
+        state
+            .state_map
+            .insert(keylet::ripple_state_key(&pool, &issuer, &cur), serde_json::to_vec(&line(&pool, "1000")).unwrap())
+            .unwrap();
+        let xrp_leg = leg_of(&serde_json::json!("1")).unwrap();
+        let usd_leg = leg_of(&serde_json::json!({
+            "currency": "USD", "issuer": hex::encode(issuer), "value": "1"
+        }))
+        .unwrap();
+        let amm = serde_json::json!({
+            "LedgerEntryType": "AMM", "Account": hex::encode(pool), "TradingFee": 0,
+        });
+        let akey = keylet::amm_key(&xrp_leg.cur, &xrp_leg.issuer, &usd_leg.cur, &usd_leg.issuer);
+        state.state_map.insert(akey, serde_json::to_vec(&amm).unwrap()).unwrap();
+
+        let okey = keylet::offer_key(&mkr, 2);
+        let mut sandbox = Sandbox::new(&state);
+        assert!(sandbox.exists(&okey), "the maker's offer starts on the book");
+        assert!(
+            json_at(&sandbox, &keylet::ripple_state_key(&mkr, &issuer, &cur)).is_none(),
+            "and the maker has no line for the USD it sells",
+        );
+
+        // Cross PAST the maker's level: it asks 1e6 drops/USD and the taker
+        // will pay only 0.9e6, so the crossing walk never reaches it and
+        // cannot delete it on the way through. Only the level scan can, and
+        // the scan runs at all because the POOL (0.5e6 drops/USD) keeps the
+        // strand inside the limit — the #105922825 shape.
+        let tx = TxFields {
+            account: taker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 9,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerGets": "90000000",
+                "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
+            }),
+        };
+        assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+
+        assert!(
+            !sandbox.exists(&okey),
+            "an offer backed by no line at all must be reaped, even on a level \
+             the crossing never enters",
+        );
     }
 
     /// A bridge leg with a POOL but NO BOOK cannot carry the pass at all.
