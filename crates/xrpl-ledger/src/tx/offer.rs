@@ -2334,7 +2334,37 @@ pub(crate) fn cross_engine_to(
                 if me_cmp(pay, rem_gets).is_gt() {
                     pay = rem_gets;
                     taker_clamped = true;
-                    give = me_muldiv(pay, m_gives0, m_wants0, false);
+                    // The IN-limited mirror of the out-limited pricing above.
+                    // `Quality::ceil_in` is
+                    //   result.out = divRound(limit, quality.rate(), asset, roundUp)
+                    // with roundUp always true (Quality.cpp `ceilInImpl`;
+                    // `ceil_in` passes /* roundUp */ true) — the input divided
+                    // by the offer's ENCODED 16-digit rate, rounded UP, not the
+                    // raw TakerGets/TakerPays ratio rounded down.
+                    //
+                    // Left on the raw ratio by 9426fbe for want of a failing
+                    // ledger; #105843839 02A79DBAD8BD is it. That payment
+                    // ripples RLUSD -> CNY -> USD -> XRP and every hop is
+                    // liquidity-bound, so every hop takes this branch and each
+                    // one landed an ulp short:
+                    //   hop 0  rippled 193.0651944        ours 193.0651944000001
+                    //   hop 1  rippled 28.55994           ours 28.55993999999999
+                    //   hop 2  rippled 25940000 drops     ours 25939999
+                    // One drop at the end, and it is the difference between
+                    // consuming offer 7C982E04 outright (mainnet Deletes it)
+                    // and leaving it resting: 11 mutations against 13.
+                    //
+                    // ⚠ KNOWN GAP, no failing ledger: this rounds up to 16
+                    // SIGNIFICANT DIGITS and the XRP rescale below then FLOORS
+                    // to whole drops, where rippled's `divRound` with an XRP
+                    // asset rounds up to whole DROPS directly. #105843839 is
+                    // unaffected — its 16-digit ceil already crosses the drop
+                    // boundary — but a fill landing at e.g. 348830.16 drops
+                    // gives 348830 here and 348831 in rippled. Do not "fix" it
+                    // on inference: the floor direction in this branch is
+                    // calibrated by d6f7589 against #105672435 B409D45C and
+                    // #105814446 2162E284EAB3.
+                    give = me_muldiv(pay, (1u128, 0i32), rate_me(q), true);
                     if pays_leg.xrp {
                         give = (me_rescale(give, 0, false), 0);
                     }
