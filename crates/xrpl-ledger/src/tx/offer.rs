@@ -1554,6 +1554,40 @@ fn cross_bridged(
             (Some((am, ae)), Some((bm, be))) => Some(norm16((am * bm, ae + be))),
             _ => None,
         };
+        // The bridged strand's UPPER BOUND — a different quantity from `bq`,
+        // and it must not reuse it.
+        //
+        // rippled: "It is important that `qualityUpperBound` is an upper bound
+        // on the quality (it is used to ignore strands whose quality cannot
+        // meet a minimum threshold). When calculating quality assume no fee is
+        // charged, or the estimate will no longer be an upper bound."
+        // `adjustQualityWithFees` (BookStep.cpp) therefore returns `ofrQ`
+        // UNCHANGED for a CLOB tip and for a multi-path AMM, and even in the
+        // single-path AMM case charges only `trIn` — `trOut` is hardcoded to
+        // parity because "AMM doesn't pay the transfer fee on the out amount".
+        //
+        // `discount()` above is right for CHOOSING book-vs-pool, because at
+        // EXECUTION `ownerPaysTransferFee_` really does make a book offer
+        // deliver that much less. It is wrong for ADMISSION, where charging it
+        // makes the estimate pessimistic and stops being a bound at all.
+        //
+        // Measured on #105912454 FE592890B233 against rippled's own FLOWDBG:
+        //     rippled ub strand 1  63800.63315852392
+        //     ours    bq           63862.84779828923   (discount flipped legB
+        //                                               to the pool)
+        //     ours    bq_ub        63800.63315852392   <- raw book, matches
+        // so we read "no candidate clears the limit" where rippled kept a live
+        // bridge strand. `bq` prices; `bq_ub` admits.
+        let b_use_amm_ub = match (&b_fib, qb_book) {
+            (Some((qf, _)), Some(qbk)) => me_cmp(*qf, qbk).is_lt(),
+            (Some(_), None) => true,
+            _ => false,
+        };
+        let qb_ub = if b_use_amm_ub { b_fib.as_ref().map(|(q, _)| *q) } else { qb_book };
+        let bq_ub = match (qa, qb_ub) {
+            (Some((am, ae)), Some((bm, be))) => Some(norm16((am * bm, ae + be))),
+            _ => None,
+        };
         // The DIRECT strand's ADMISSION quality — a different question from
         // `dq`, and it must not reuse it. `BookStep::tip` reads the raw book
         // through `BookTip`, which applies NO owner filter, so an offer of the
@@ -1750,10 +1784,10 @@ fn cross_bridged(
             let within_t = |q: Option<Me>| q.is_some_and(|v| thr.is_none_or(|t| me_cmp(v, t).is_le()));
             let within_e = |q: Option<u64>| q.is_some_and(|v| threshold == u64::MAX || v <= threshold);
             // rippled's candidate set + order (upper bound), vs ours (estimate).
-            let (ub_d, ub_b) = (within_t(d_tip), within_t(bq));
+            let (ub_d, ub_b) = (within_t(d_tip), within_t(bq_ub));
             let (es_d, es_b) = (within_e(est_direct), within_e(est_bridge));
             let pick_ub = match (ub_d, ub_b) {
-                (true, true) => match (d_tip, bq) {
+                (true, true) => match (d_tip, bq_ub) {
                     (Some(d), Some(b)) => Some(me_cmp(d, b).is_le()),
                     _ => None,
                 },
@@ -1773,7 +1807,7 @@ fn cross_bridged(
             if pick_ub != pick_est {
                 eprintln!(
                     "DX_SEL MISMATCH pick_ub={pick_ub:?} pick_est={pick_est:?} \
-                     d_tip={d_tip:?} bq={bq:?} est_direct={est_direct:?} \
+                     d_tip={d_tip:?} bq_ub={bq_ub:?} bq={bq:?} est_direct={est_direct:?} \
                      est_bridge={est_bridge:?} thr={thr:?} threshold={threshold}"
                 );
             }
@@ -1888,7 +1922,7 @@ fn cross_bridged(
                 // `Flow.cpp:106`'s `strands.size() > 1`. Both candidates are
                 // therefore judged with the pool in play, and the count that
                 // survives is what `setMultiPath` then sees.
-                let multi = (within(d_tip) as u8) + (within(bq) as u8) > 1;
+                let multi = (within(d_tip) as u8) + (within(bq_ub) as u8) > 1;
                 // Single path: the pool is matched to the book, so the book's
                 // composition IS the strand's quality. A leg with no book at
                 // all then composes nothing — off the default path the step
