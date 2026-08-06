@@ -741,8 +741,34 @@ fn load_owner_dir_tail(state: &mut LedgerState, url: &str, txj: &Value, ledger_i
             })
         });
         if let Some(n) = last.filter(|n| *n != 0) {
-            let pk = hex::encode_upper(keylet::dir_page_key(&root, n).0);
-            load_object(state, url, &pk, ledger_index);
+            let tail = keylet::dir_page_key(&root, n);
+            load_object(state, url, &hex::encode_upper(tail.0), ledger_index);
+            // ...and the page BEFORE the tail. If this tx empties the tail it
+            // is DELETED (`ApplyView::dirRemove` erases any empty non-root
+            // page and relinks), and the following insert lands on whatever is
+            // the tail THEN. Unknown, we invent it — losing however many
+            // entries it really holds.
+            //
+            // #105886344 E430B7E92B22: rGV6cX cancels its own offer, the only
+            // entry on tail page 0x12f2e (890F7D4B), and rests a new one.
+            // rippled erases 0x12f2e, finds page 0x12f2d (828BB495) FULL at 32
+            // entries, and so allocates 0x12f2e again — the same key, which
+            // the state table folds into a plain Modify. We had never loaded
+            // 0x12f2d, so we appended into a phantom empty page and emitted it
+            // Created, plus a Deleted tail and a Modified root: 9 mutations
+            // against 7. `parity_probe` stays CLEAN throughout because libxrpl
+            // reads through a callback view and just fetches the page.
+            let prev = state.state_map.lookup(&tail).and_then(|b| {
+                serde_json::from_slice::<Value>(b).ok().and_then(|v| {
+                    v.get("IndexPrevious").and_then(|p| {
+                        p.as_u64().or_else(|| p.as_str().and_then(|s| u64::from_str_radix(s, 16).ok()))
+                    })
+                })
+            });
+            if let Some(m) = prev.filter(|m| *m != 0 && *m != n) {
+                let pk = hex::encode_upper(keylet::dir_page_key(&root, m).0);
+                load_object(state, url, &pk, ledger_index);
+            }
         }
     }
 }
@@ -1049,6 +1075,44 @@ fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<Hash
     }
 }
 
+/// Canonicalise the u64 directory/node POINTER fields before a semantic
+/// compare. XRPL JSON renders them as HEX STRINGS (`"IndexNext":"12f2e"`)
+/// while our writers emit plain numbers (`77614`) — the same value spelled two
+/// ways, and a spelling is not a mutation.
+///
+/// #105886344 E430B7E92B22: rippled erases the emptied owner-dir tail page and
+/// re-creates it (`ApplyStateTable.cpp:153` drops any ModifiedNode whose
+/// content equals the original, so the neighbours it relinked and restored
+/// vanish from the meta). We relink and restore the same way, but wrote
+/// `IndexNext` back as a number where the pre-state held a hex string, so the
+/// no-op filter did not fire and we emitted the previous page and the root as
+/// spurious Modifies.
+///
+/// Readers already tolerate both forms (`dirnum` parses either), so this is
+/// purely about comparing like with like.
+fn canon_ptrs(v: &mut Value) {
+    const PTRS: [&str; 7] = [
+        "IndexNext",
+        "IndexPrevious",
+        "OwnerNode",
+        "BookNode",
+        "HighNode",
+        "LowNode",
+        "DestinationNode",
+    ];
+    let Some(obj) = v.as_object_mut() else { return };
+    for k in PTRS {
+        if let Some(f) = obj.get_mut(k) {
+            let n = f
+                .as_u64()
+                .or_else(|| f.as_str().and_then(|s| u64::from_str_radix(s, 16).ok()));
+            if let Some(n) = n {
+                *f = Value::from(n);
+            }
+        }
+    }
+}
+
 /// (hex_upper key, kind byte) set with no-op-Modified filtering (semantic JSON
 /// compare of pre vs post), matching the FFI leg's `build_ours_mutation_set`.
 fn native_mutset(
@@ -1065,8 +1129,10 @@ fn native_mutset(
         if is_mod {
             // drop no-op modifies (post == pre, semantically) — rippled meta omits them
             if let (Some(new), Some(old)) = (new_bytes, state.state_map.lookup(key)) {
-                let pn: Option<Value> = serde_json::from_slice(new).ok();
-                let po: Option<Value> = serde_json::from_slice(old).ok();
+                let mut pn: Option<Value> = serde_json::from_slice(new).ok();
+                let mut po: Option<Value> = serde_json::from_slice(old).ok();
+                pn.as_mut().map(canon_ptrs);
+                po.as_mut().map(canon_ptrs);
                 if pn.is_some() && pn == po {
                     continue;
                 }
