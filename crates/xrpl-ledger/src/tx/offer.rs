@@ -1400,7 +1400,20 @@ fn cross_bridged(
         .as_ref()
         .map(|a| crate::tx::amm_swap::pool_balances(sandbox, a, pays_leg, &xrp_leg))
         .unwrap_or(((0, 0), (0, 0)));
-    let (mut amm_a_iters, mut amm_b_iters) = (0u32, 0u32);
+    // rippled keeps ONE `ammIters_` for the whole flow (AMMContext), not one
+    // per pool, and `ammContext.update()` bumps it once per ITERATION in which
+    // any AMM was used. Every pool's fib slice is therefore indexed by the
+    // SAME counter — consuming the direct pair's pool grows the BRIDGE legs'
+    // slices too, which is what makes a bridged strand's quality decay as the
+    // crossing proceeds.
+    //
+    // #105876680 26AF14542086: rippled's bridge upper bound goes 73.44102575
+    // -> 73.44102375 -> 73.4592084 across the three iterations while its leg A
+    // slice doubles (1124.099/13860373 -> 2248.755/27720746). Ours stayed at
+    // 73.44102575 because leg A had its own counter that never moved — the
+    // direct pool was doing the crossing — so on iteration 2 the bridge looked
+    // BETTER than the pool and we abandoned the pool for it: 10 mutations
+    // against 5, all five extra.
     if (la.is_empty() && amm_a.is_none()) || (lb.is_empty() && amm_b.is_none()) {
         if std::env::var("DX_BRIDGE").is_ok() {
             eprintln!("DX_BRIDGE bail la={} lb={} base_a={} base_b={}",
@@ -1418,11 +1431,15 @@ fn cross_bridged(
     // `amm_swap::consume` on the direct walk instead.
     let amm_init = amm.as_ref().map(|a| crate::tx::amm_swap::pool_balances(sandbox, a, pays_leg, gets_leg));
     let mut amm_iters = 0u32;
+    // Set when any pool moved value this iteration; folded into `amm_iters`
+    // at the end of the pass, mirroring `ammContext.update()`.
+    let mut amm_used;
     let done = |rp: Me, rg: Me| me_is_zero(rg) || (!sell && me_is_zero(rp));
     for _ in 0..512 {
         if done(rem_pays, rem_gets) {
             break;
         }
+        amm_used = false;
         // PEEK both sources (no mutation) to pick the better rate within the
         // threshold; only the chosen source is then walked with mutation, so
         // dead-offer cleanup happens exactly where rippled's walk reaches.
@@ -1433,11 +1450,11 @@ fn cross_bridged(
         let apeek = live_head(sandbox, &la, &mut ai, taker, &xrp_leg, false, stale);
         let bpeek = live_head(sandbox, &lb, &mut bi, taker, pays_leg, false, stale);
         let a_fib = amm_a.as_ref().and_then(|am| {
-            crate::tx::amm_swap::fib_slice(sandbox, am, amm_a_init, amm_a_iters, &xrp_leg, gets_leg)
+            crate::tx::amm_swap::fib_slice(sandbox, am, amm_a_init, amm_iters, &xrp_leg, gets_leg)
                 .map(|s| (crate::tx::amm_swap::slice_rate(s.0, s.1), s))
         });
         let b_fib = amm_b.as_ref().and_then(|am| {
-            crate::tx::amm_swap::fib_slice(sandbox, am, amm_b_init, amm_b_iters, pays_leg, &xrp_leg)
+            crate::tx::amm_swap::fib_slice(sandbox, am, amm_b_init, amm_iters, pays_leg, &xrp_leg)
                 .map(|s| (crate::tx::amm_swap::slice_rate(s.0, s.1), s))
         });
         // A BOOK offer competing with a POOL is not worth its face quality: in
@@ -1908,7 +1925,7 @@ fn cross_bridged(
                     crate::tx::amm_swap::apply_slice(
                         sandbox, amm_a.as_ref().unwrap(), taker, taker, &xrp_leg, gets_leg, gets_in, xrp,
                     );
-                    amm_a_iters += 1;
+                    amm_used = true;
                 }
                 _ => break,
             }
@@ -1922,13 +1939,18 @@ fn cross_bridged(
                     crate::tx::amm_swap::apply_slice(
                         sandbox, amm_b.as_ref().unwrap(), taker, beneficiary, pays_leg, &xrp_leg, xrp, pays_out,
                     );
-                    amm_b_iters += 1;
+                    amm_used = true;
                 }
                 _ => break,
             }
             rem_gets = me_sub(rem_gets, gets_in);
             rem_pays = me_sub(rem_pays, pays_out);
             crossed += 1;
+            // One bump per ITERATION, however many of the two legs the pools
+            // carried — `ammContext.update()` is `if (ammUsed_) ++ammIters_`.
+            if amm_used {
+                amm_iters += 1;
+            }
         }
     }
     Some((rem_pays, rem_gets, crossed))
