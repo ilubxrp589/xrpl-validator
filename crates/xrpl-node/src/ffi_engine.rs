@@ -53,6 +53,23 @@ impl<'a> SleProvider for RocksDbProvider<'a> {
 /// Retries up to 10 times with exponential backoff to handle rippled overload
 /// at startup — a ledger with 0 amendments would cause massive divergence.
 pub fn fetch_mainnet_amendments(rpc_url: &str) -> Vec<[u8; 32]> {
+    fetch_mainnet_amendments_at(rpc_url, "validated")
+}
+
+/// Fetch the amendments active AS OF a given ledger.
+///
+/// ⚠ Replaying a historical fixture under `"validated"` replays it under
+/// TODAY'S rules. #105663160 (17 July) is the specimen: exactly one amendment,
+/// `fixCleanup3_2_0`, activated between that ledger and 2026-08-07, and under
+/// it libxrpl returned `NFTokenAcceptOffer tecNO_PERMISSION` where mainnet
+/// recorded `tesSUCCESS` — so the ORACLE was wrong while our native engine was
+/// 65/65 correct. A false oracle verdict is worse than no verdict: the whole
+/// workflow reads "parity CLEAN => our engine is wrong, parity DIRTY => harness
+/// bug", and this silently poisons the second arm on every old fixture.
+///
+/// `fetch_mainnet_amendments` keeps `"validated"` because its production
+/// caller (`ffi_verifier`) really does run at the live tip.
+pub fn fetch_mainnet_amendments_at(rpc_url: &str, ledger_index: &str) -> Vec<[u8; 32]> {
     let client = match reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -73,7 +90,7 @@ pub fn fetch_mainnet_amendments(rpc_url: &str) -> Vec<[u8; 32]> {
                 "method": "ledger_entry",
                 "params": [{
                     "index": "7DB0788C020F02780A673DC74757F23823FA3014C1866E72CC4CD8B226CD6EF4",
-                    "ledger_index": "validated",
+                    "ledger_index": ledger_index,
                     "binary": false
                 }]
             }))

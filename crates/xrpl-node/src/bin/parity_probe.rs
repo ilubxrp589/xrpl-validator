@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 
 use xrpl_node::ffi_engine::{
-    apply_ledger_in_order_with_net, fetch_mainnet_amendments, new_stats, NetParams,
+    apply_ledger_in_order_with_net, fetch_mainnet_amendments_at, new_stats, NetParams,
 };
 
 const DEFAULT_RPC: &str = "https://s2.ripple.com:51234";
@@ -140,8 +140,12 @@ fn run() -> i32 {
         eprintln!("fixture has no txs");
         return 2;
     }
-    println!("Fetching mainnet amendments from {rpc_url}…");
-    let amendments = fetch_mainnet_amendments(&rpc_url);
+    // Amendments AS OF the fixture's pre-state ledger, not "validated" — the
+    // oracle must replay under the rules that were in force then. See
+    // `fetch_mainnet_amendments_at`.
+    let amd_index = (seq - 1).to_string();
+    println!("Fetching mainnet amendments at #{amd_index} from {rpc_url}…");
+    let amendments = fetch_mainnet_amendments_at(&rpc_url, &amd_index);
     println!("Probing {} txs of #{seq} for mainnet parity…", txs.len());
 
     let stats = new_stats();
