@@ -1933,6 +1933,7 @@ fn cross_bridged(
             let snap = sandbox.snapshot();
             let (rp0, rg0, cr0, di0, ai0, bi0, it0) =
                 (rem_pays, rem_gets, crossed, di, ai, bi, amm_iters);
+            let st0 = stale.len();
             amm_used = false;
             // (in, out) of this candidate's fill, in the same orientation as
             // `est_direct`/`est_bridge`: gets-side in, pays-side out.
@@ -2120,8 +2121,71 @@ fn cross_bridged(
                 filled = true;
                 break;
             }
-            // Rejected: undo this candidate and try the next one.
+            // DX_RM — hunt the known `ofrsToRm` deviation.
+            //
+            // rippled banks a failed strand's offer removals: `setUnion(ofrsToRm,
+            // f.ofrsToRm)` runs BEFORE the `!f.success` check, commented "rm bad
+            // offers even if the strand fails" (StrandFlow.h:695-699). Our
+            // rollback undoes them, resurrecting an offer rippled would have
+            // deleted. Report any attempt whose rejection discards a removal, so
+            // a ledger that distinguishes the two can be found by measurement.
+            if std::env::var("DX_RM").is_ok() {
+                use crate::ledger::sandbox::SandboxEntry;
+                let after = sandbox.snapshot();
+                let dropped: Vec<String> = after
+                    .iter()
+                    .filter(|(k, v)| {
+                        matches!(v, SandboxEntry::Deleted)
+                            && !matches!(snap.get(*k), Some(SandboxEntry::Deleted))
+                    })
+                    .map(|(k, _)| hex::encode_upper(&k.0[..8]))
+                    .collect();
+                // ★ The sharp signal. `live_head(mutate)` deletes the TAKER'S
+                // OWN offers as it walks (rippled's `limitSelfCrossQuality`)
+                // and records them in `stale` — which is a plain Vec OUTSIDE
+                // the sandbox, so the rollback undoes the DELETION while the
+                // key stays marked stale. The offer is resurrected in the
+                // ledger and never revisited. Deletions with `had_fill=true`
+                // are mostly offers the fill CONSUMED, which rippled discards
+                // too (it drops the failed strand's sandbox and carries out
+                // only `ofrsToRm`), so they are not the deviation.
+                if stale.len() > st0 {
+                    eprintln!(
+                        "DX_RM STALE-RESURRECTED want_direct={want_direct} had_fill={} \
+reaped={} deleted={}",
+                        fill.is_some(),
+                        stale.len() - st0,
+                        dropped.len()
+                    );
+                } else if !dropped.is_empty() {
+                    eprintln!(
+                        "DX_RM ROLLBACK-DROPS-REMOVAL want_direct={want_direct} \
+had_fill={} n={} keys={:?}",
+                        fill.is_some(),
+                        dropped.len(),
+                        dropped
+                    );
+                }
+            }
+            // Rejected: undo this candidate and try the next one — but the
+            // REMOVALS STAY. rippled banks a failed strand's offer removals:
+            // `setUnion(ofrsToRm, f.ofrsToRm)` runs BEFORE the `!f.success`
+            // check, "rm bad offers even if the strand fails"
+            // (StrandFlow.h:695-699). This file already re-applies `stale`
+            // after the tx-level FillOrKill/IOC rollbacks for exactly that
+            // reason; the candidate rollback has to do the same or a
+            // self-offer that `live_head` reaped comes back in the ledger
+            // while its key stays marked stale — deleted from our bookkeeping,
+            // alive in the state, and never revisited.
             sandbox.restore_snapshot(snap);
+            for okey in &stale[st0..] {
+                let Some(off) = json_at(sandbox, okey) else { continue };
+                let Some(mk) = off.get("Account").and_then(|v| v.as_str()).and_then(decode20)
+                else {
+                    continue;
+                };
+                delete_maker_offer(sandbox, okey, &off, &mk);
+            }
             rem_pays = rp0; rem_gets = rg0; crossed = cr0;
             di = di0; ai = ai0; bi = bi0; amm_iters = it0;
             amm_used = false;
