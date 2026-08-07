@@ -1588,6 +1588,56 @@ fn cross_bridged(
             (Some((am, ae)), Some((bm, be))) => Some(norm16((am * bm, ae + be))),
             _ => None,
         };
+        // DX_ULP — is the admission decided by the last digit of the composed
+        // upper bound?
+        //
+        // `norm16` TRUNCATES the product to 16 significant digits. On
+        // #105912454 that gives …641 where rippled's `ub strand 1` is …642 —
+        // exactly one ulp, and `mul_round16_up` reproduces rippled's value.
+        // In me-space (in-per-out) SMALLER is better and `within` admits on
+        // `q <= thr`, so truncating makes our bound one ulp MORE OPTIMISTIC:
+        // the risk is ADMITTING a strand rippled drops, not dropping one.
+        // (The 005ad9a commit note stated that backwards.)
+        //
+        // Whether rippled systematically rounds this composition up is ONE
+        // data point, not a rule — so this detector is direction-agnostic: it
+        // fires only where the two roundings give DIFFERENT admission
+        // verdicts, i.e. where a ledger could actually decide the question.
+        // Nothing is changed on inference; the floor is calibrated by d6f7589.
+        if std::env::var("DX_ULP").is_ok() {
+            if let (Some((am, ae)), Some((bm, be)), Some(t)) = (qa, qb_ub, thr) {
+                let trunc = norm16((am * bm, ae + be));
+                let up = mul_round16_up((am, ae), (bm, be));
+                if me_cmp(trunc, t).is_le() != me_cmp(up, t).is_le() {
+                    eprintln!(
+                        "DX_ULP ADMISSION-DECIDED-BY-LAST-DIGIT trunc={trunc:?} up={up:?} \
+thr={t:?} admits_trunc={} admits_up={}",
+                        me_cmp(trunc, t).is_le(),
+                        me_cmp(up, t).is_le()
+                    );
+                } else if trunc.1 == t.1 {
+                    // Near-miss telemetry. A bare "no ledger decides it" is
+                    // weak — it cannot distinguish "close, we got lucky" from
+                    // "nowhere near". Report the distance to the limit in ulps
+                    // of the 16-digit mantissa so the closest approach across a
+                    // sweep is a real number.
+                    // `DX_ULP=<n>` caps the report at n ulps; any other value
+                    // reports every one. Calibration: on #105912454 the bound
+                    // sits 3.81e12 ulps from the limit — 0.06% away — so a cap
+                    // of a few thousand reports NOTHING and reads as a false
+                    // all-clear. Pick the cap from that scale, not from the
+                    // size of the rounding error being chased.
+                    let ulps = (trunc.0 as i128 - t.0 as i128).abs();
+                    let cap = std::env::var("DX_ULP")
+                        .ok()
+                        .and_then(|v| v.parse::<i128>().ok())
+                        .unwrap_or(i128::MAX);
+                    if ulps <= cap {
+                        eprintln!("DX_ULP NEAR ulps={ulps} trunc={trunc:?} thr={t:?}");
+                    }
+                }
+            }
+        }
         // The DIRECT strand's ADMISSION quality — a different question from
         // `dq`, and it must not reuse it. `BookStep::tip` reads the raw book
         // through `BookTip`, which applies NO owner filter, so an offer of the
@@ -3196,6 +3246,40 @@ impl Transactor for OfferCancelTransactor {
         }
 
         TxResult::Success
+    }
+}
+
+#[cfg(test)]
+mod ulp_tests {
+    use super::*;
+
+    /// Proves the DX_ULP detector CAN fire, so a silent sweep means "no ledger
+    /// decides it" rather than "the detector is mis-wired".
+    ///
+    /// `norm16` truncates a 16-significant-digit product; `mul_round16_up`
+    /// rounds it up. Where the product has a remainder the two differ by one
+    /// ulp, and any threshold placed strictly between them admits under one
+    /// and rejects under the other — which is exactly the condition the
+    /// detector tests.
+    #[test]
+    fn a_truncated_composition_and_a_rounded_one_can_straddle_the_limit() {
+        // Two mantissas whose product needs truncating (remainder non-zero).
+        let a: Me = (1_234_567_890_123_457, 0);
+        let b: Me = (9_876_543_210_987_653, 0);
+        let trunc = norm16((a.0 * b.0, a.1 + b.1));
+        let up = mul_round16_up(a, b);
+        assert_ne!(trunc, up, "the product must actually need rounding");
+        assert_eq!(
+            me_cmp(trunc, up),
+            std::cmp::Ordering::Less,
+            "truncation is the more OPTIMISTIC bound in me-space (smaller is better)"
+        );
+        // A limit sitting exactly on the truncated value: `within` admits on
+        // `q <= thr`, so the truncated bound is admitted and the rounded one
+        // is not. That verdict split is what DX_ULP reports.
+        let thr = trunc;
+        assert!(me_cmp(trunc, thr).is_le(), "truncated bound is admitted");
+        assert!(!me_cmp(up, thr).is_le(), "rounded-up bound is dropped");
     }
 }
 
