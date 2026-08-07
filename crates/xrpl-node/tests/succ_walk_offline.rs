@@ -826,3 +826,56 @@ mod nft_page_prefetch {
         );
     }
 }
+
+// === NFTokenAcceptOffer names its counterparty by HASH, not by AccountID ===
+
+/// Real mainnet bytes from #105663160 `5CCAAE138F560F07`, the specimen that
+/// exposed the prefetch gap.
+///
+/// The seller's NFTokenPages are what `nft::findToken` searches, but the
+/// seller appears NOWHERE in the transaction — the accept names its offer by
+/// hash (`50 1D` = UINT256 nth 29 = sfNFTokenSellOffer). Deriving prefetch
+/// owners from the tx alone therefore never reaches the seller, and libxrpl
+/// returned `tecNO_PERMISSION` ("the seller must own the token") on a token
+/// the seller demonstrably owned (13 444 NFTs confirmed against mainnet).
+const TX_5CCAAE13: &str = "12001D230606B5832404CF77B0201B064C4ACA501D9F45612FCDB9A2742F51786ED6E6F5474F89E918A7C9950F45197E00766FA85E68400000000000000C732102C1D03B002DB355ADACC0B332AFB71FC7F6A74C94BE8D315919E2894E9F3FED4A7446304402202229D0CD968AD72F4A05DB46090E0381D2385703A68C19435A753B7ED4D6508402206B22E1E8FFF271322BE6A9DF0E9DD420C8A3F7DAD45AC145D1EB3FD9C2A9CE828114505BAC84B255340C73750E990A8634D5D2E609E8F9EA7D14436C61696D204E4654202D207872702E63616665E1F1";
+const OFFER_9F456: &str = "110037220000000125064C4A9A2A31FF7D8634000000000000D1BE3C000000000000000055593442BF177C5A2DC0869133ABD05BF57889879449935B0119F4D179CE3D6B1F5A00082710BCC0C9C1943CA2858FA00B8FBCEABEFE32013833C07A3E62062CE2B26140000000000000008214CEAECC5B87EA043BD98E1B4FE8663AC59D5C35188314505BAC84B255340C73750E990A8634D5D2E609E8";
+
+const ACCEPTOR: [u8; 20] = [
+    0x50, 0x5B, 0xAC, 0x84, 0xB2, 0x55, 0x34, 0x0C, 0x73, 0x75, 0x0E, 0x99, 0x0A, 0x86, 0x34, 0xD5,
+    0xD2, 0xE6, 0x09, 0xE8,
+];
+const SELLER: [u8; 20] = [
+    0xCE, 0xAE, 0xCC, 0x5B, 0x87, 0xEA, 0x04, 0x3B, 0xD9, 0x8E, 0x1B, 0x4F, 0xE8, 0x66, 0x3A, 0xC5,
+    0x9D, 0x5C, 0x35, 0x18,
+];
+
+#[test]
+fn an_accept_offer_names_its_seller_only_by_offer_hash() {
+    let tx = hex::decode(TX_5CCAAE13).expect("tx hex");
+    // The gap itself: the tx yields the acceptor and NOT the seller.
+    let owners = xrpl_node::nft_pages::parse_nft_page_owners(&tx);
+    assert!(owners.contains(&ACCEPTOR), "the tx names its own Account");
+    assert!(
+        !owners.contains(&SELLER),
+        "the seller is NOT in the tx — this is why prefetch missed it"
+    );
+}
+
+#[test]
+fn the_offer_hash_resolves_to_the_seller_whose_pages_must_be_prefetched() {
+    let tx = hex::decode(TX_5CCAAE13).expect("tx hex");
+    let hashes = xrpl_node::nft_pages::parse_nft_offer_hashes(&tx);
+    assert_eq!(hashes.len(), 1, "one sfNFTokenSellOffer");
+    assert_eq!(
+        hex::encode_upper(hashes[0]),
+        "9F45612FCDB9A2742F51786ED6E6F5474F89E918A7C9950F45197E00766FA85E"
+    );
+
+    // Reading that offer yields sfOwner — the seller — which is what closes
+    // the gap. sfDestination (the acceptor) must NOT be taken instead.
+    let offer = hex::decode(OFFER_9F456).expect("offer hex");
+    let owner = xrpl_node::nft_pages::parse_sle_owner(&offer).expect("sfOwner present");
+    assert_eq!(owner, SELLER, "sfOwner is the seller");
+    assert_ne!(owner, ACCEPTOR, "must not pick up sfDestination");
+}

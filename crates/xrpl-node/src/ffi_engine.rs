@@ -59,13 +59,20 @@ pub fn fetch_mainnet_amendments(rpc_url: &str) -> Vec<[u8; 32]> {
 /// Fetch the amendments active AS OF a given ledger.
 ///
 /// ⚠ Replaying a historical fixture under `"validated"` replays it under
-/// TODAY'S rules. #105663160 (17 July) is the specimen: exactly one amendment,
-/// `fixCleanup3_2_0`, activated between that ledger and 2026-08-07, and under
-/// it libxrpl returned `NFTokenAcceptOffer tecNO_PERMISSION` where mainnet
-/// recorded `tesSUCCESS` — so the ORACLE was wrong while our native engine was
-/// 65/65 correct. A false oracle verdict is worse than no verdict: the whole
-/// workflow reads "parity CLEAN => our engine is wrong, parity DIRTY => harness
-/// bug", and this silently poisons the second arm on every old fixture.
+/// TODAY'S rules, which is wrong on its own terms: a false oracle verdict is
+/// worse than no verdict, since the whole workflow reads "parity CLEAN => our
+/// engine is wrong, parity DIRTY => harness bug".
+///
+/// ⛔ CORRECTION. The commit that added this (`a191b79`) blamed #105663160's
+/// `NFTokenAcceptOffer tecNO_PERMISSION` on `fixCleanup3_2_0` — the one
+/// amendment activated since. THAT WAS WRONG, and so was the follow-on claim
+/// that "the oracle is a different rippled version than the ledger". Fetching
+/// amendments as-of the ledger did NOT change that divergence. The real cause
+/// is ours: `prefetch_nft_pages_for_tx` derives owners from the TX BYTES, and
+/// an NFTokenAcceptOffer names the offer by HASH — the seller appears only
+/// inside the NFTokenOffer object — so the seller's NFTokenPages are never
+/// prefetched and `nft::findToken` cannot locate a token that exists. See
+/// `prefetch_nft_pages_for_tx`.
 ///
 /// `fetch_mainnet_amendments` keeps `"validated"` because its production
 /// caller (`ffi_verifier`) really does run at the live tip.
@@ -578,8 +585,45 @@ impl RpcProvider {
     /// the book prefetch never sees NFT pages. Idempotent per owner. A fetch
     /// failure stores nothing — succ() then falls back to the `ledger_data`
     /// walk, i.e. behaves exactly as before this feature.
+    ///
+    /// ⚠ KNOWN GAP, specimen #105663160 `5CCAAE138F560F07`. Owners come from
+    /// the TX BYTES only. An `NFTokenAcceptOffer` names its offer by HASH, so
+    /// the SELLER — whose pages `nft::findToken` must search — never appears
+    /// in the tx and is never prefetched. Verified: the blob carries the
+    /// acceptor's AccountID and not the seller's. libxrpl then returns
+    /// `tecNO_PERMISSION` ("the seller must own the token") on a token the
+    /// seller demonstrably owns, while our native engine, which pre-hydrates
+    /// in bulk, is 65/65 correct.
+    /// FIXED below by resolving the offer hashes to their `sfOwner`.
+    /// ⚠ The page BUDGET was never a contributing cause, despite first
+    /// appearances: `NFT_PAGE_MAX_PAGES` counts RPC FETCHES, each returning up
+    /// to `ACCOUNT_OBJECTS_PAGE_LIMIT` (200) page keys, so 8 covers 1600 pages
+    /// ≈ 51k NFTs. This seller's ~420 pages need ~3 fetches. Counting pages as
+    /// though they were fetches makes 8 look far too small; they are not the
+    /// same unit.
+    /// ⚠ `ffi_verifier` (the LIVE validator) uses this same prefetch, so this
+    /// was a plausible source of the FFI shadow divergences treated as noise.
     pub fn prefetch_nft_pages_for_tx(&self, tx_bytes: &[u8]) {
-        for owner in crate::nft_pages::parse_nft_page_owners(tx_bytes) {
+        let mut owners = crate::nft_pages::parse_nft_page_owners(tx_bytes);
+        // Resolve the counterparty. An NFTokenAcceptOffer names its offer by
+        // HASH, so the offer's `sfOwner` — the account whose pages
+        // `nft::findToken` searches — is reachable only by reading the
+        // NFTokenOffer object. Without this the seller is never prefetched.
+        for h in crate::nft_pages::parse_nft_offer_hashes(tx_bytes) {
+            let owner = match self.read_with_outcome(&h) {
+                RpcReadOutcome::Hit(bytes) => crate::nft_pages::parse_sle_owner(bytes),
+                // A missing or undelivered offer is not our problem here: the
+                // transactor will reach its own conclusion. Only skip the
+                // prefetch.
+                RpcReadOutcome::EntryNotFound | RpcReadOutcome::Exhausted(_) => None,
+            };
+            if let Some(id) = owner {
+                if !owners.contains(&id) {
+                    owners.push(id);
+                }
+            }
+        }
+        for owner in owners {
             if self.nft_pages.lock().iter().any(|p| p.owner == owner) {
                 continue;
             }

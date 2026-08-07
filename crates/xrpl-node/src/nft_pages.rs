@@ -308,6 +308,78 @@ fn is_nft_tx_type(tt: u16) -> bool {
 /// Returns empty for non-NFT tx types and for anything malformed; prefetch
 /// is best-effort and a skipped prefetch is exactly the pre-existing
 /// behaviour (cold, never wrong).
+/// The NFTokenOffer hashes an `NFTokenAcceptOffer` names: `sfNFTokenBuyOffer`
+/// (UINT256 nth 28) and `sfNFTokenSellOffer` (UINT256 nth 29).
+///
+/// These are the ONLY route to the counterparty. An accept names its offer by
+/// HASH, so the seller — whose NFTokenPages `nft::findToken` must search —
+/// never appears in the transaction. Specimen #105663160 `5CCAAE138F560F07`:
+/// the blob carries the acceptor's AccountID and not the seller's, so the
+/// seller's pages went unprefetched and libxrpl returned `tecNO_PERMISSION`
+/// ("the seller must own the token") on a token the seller demonstrably owned.
+pub fn parse_nft_offer_hashes(tx: &[u8]) -> Vec<[u8; 32]> {
+    parse_nft_offer_hashes_inner(tx).unwrap_or_default()
+}
+
+fn parse_nft_offer_hashes_inner(tx: &[u8]) -> Option<Vec<[u8; 32]>> {
+    let mut pos = 0usize;
+    let mut tt_matched = false;
+    let mut out: Vec<[u8; 32]> = Vec::new();
+    while pos < tx.len() {
+        let (type_code, field_code, header_len) = read_field_header(tx, pos)?;
+        pos += header_len;
+        if type_code == 1 && field_code == 2 {
+            let bytes = tx.get(pos..pos + 2)?;
+            if !is_nft_tx_type(u16::from_be_bytes([bytes[0], bytes[1]])) {
+                return None;
+            }
+            tt_matched = true;
+            pos += 2;
+            continue;
+        }
+        if type_code == 5 && (field_code == 28 || field_code == 29) {
+            let bytes = tx.get(pos..pos + 32)?;
+            let mut h = [0u8; 32];
+            h.copy_from_slice(bytes);
+            if !out.contains(&h) {
+                out.push(h);
+            }
+        }
+        pos = skip_value(tx, pos, type_code)?;
+    }
+    if !tt_matched {
+        return None;
+    }
+    Some(out)
+}
+
+/// `sfOwner` (ACCOUNT nth 2) of a serialized ledger object.
+///
+/// Deliberately NOT `parse_nft_page_owners`: that one gates on a
+/// TransactionType field, which a ledger entry does not have, and would take
+/// every AccountID including `sfDestination`. Here only the offer's owner —
+/// the account whose pages must be searched — is wanted.
+pub fn parse_sle_owner(sle: &[u8]) -> Option<[u8; 20]> {
+    let mut pos = 0usize;
+    while pos < sle.len() {
+        let (type_code, field_code, header_len) = read_field_header(sle, pos)?;
+        pos += header_len;
+        if type_code == 8 {
+            let (len, consumed) = read_vl(sle, pos)?;
+            if type_code == 8 && field_code == 2 && len == 20 {
+                let bytes = sle.get(pos + consumed..pos + consumed + 20)?;
+                let mut id = [0u8; 20];
+                id.copy_from_slice(bytes);
+                return Some(id);
+            }
+            pos += consumed + len;
+            continue;
+        }
+        pos = skip_value(sle, pos, type_code)?;
+    }
+    None
+}
+
 pub fn parse_nft_page_owners(tx: &[u8]) -> Vec<[u8; 20]> {
     parse_nft_page_owners_inner(tx).unwrap_or_default()
 }
