@@ -2436,8 +2436,23 @@ pub(crate) fn cross_engine_to(
                     }
                     break 'dirs;
                 }
-                if &maker == taker {
+                if offer_crossing && &maker == taker {
                     // Self-crossing: rippled cancels the older own offer.
+                    //
+                    // ⚠ OFFER CROSSING ONLY. A PAYMENT consumes the payer's own
+                    // offer like anyone else's: `BookPaymentStep::
+                    // limitSelfCrossQuality` is `{ return false; }` under the
+                    // comment "Never limit self cross quality on a payment"
+                    // (BookStep.cpp:295-308); the removal lives solely in
+                    // `BookOfferCrossingStep`.
+                    //
+                    // #106137720 `F2C989D4843A`: a circular-arb Payment
+                    // (Account == Destination) sells CNY for XRP with
+                    // tfPartialPayment. The CNY→XRP book holds exactly ONE
+                    // offer and the payer owns it — 960 852 drops against a
+                    // DeliverMin of 1 937 153 — so mainnet crosses it, falls
+                    // short and returns tecPATH_PARTIAL. Cancelling it
+                    // unconditionally emptied the book and gave tecPATH_DRY.
                     delete_maker_offer(sandbox, &okey, &offer, &maker);
                     stale.push(okey);
                     continue;
@@ -4826,6 +4841,102 @@ mod tests {
     /// pool filled all 708735 drops so the page was never read, and the
     /// `maker == taker` bail then stopped the level scan from reaping it —
     /// 4 mutations against 7. rippled logs `Removing unfunded offer EC95059B…`.
+    /// A PAYMENT consumes the payer's own offer; only OFFER CROSSING cancels
+    /// it. rippled says so outright — `BookPaymentStep::limitSelfCrossQuality`
+    /// is `{ return false; }` under the comment "Never limit self cross
+    /// quality on a payment" (BookStep.cpp:295-308), while the removal lives
+    /// only in `BookOfferCrossingStep`.
+    ///
+    /// #106137720 `F2C989D4843A`: a circular-arb Payment (Account ==
+    /// Destination) sells CNY for XRP with tfPartialPayment. The CNY→XRP book
+    /// holds exactly ONE offer and the payer owns it, worth 960 852 drops
+    /// against a DeliverMin of 1 937 153 — so mainnet crosses it, falls short,
+    /// and returns tecPATH_PARTIAL. We cancelled the offer unconditionally,
+    /// found the book empty, and returned tecPATH_DRY.
+    fn self_offer_book(
+    ) -> (LedgerState, [u8; 20], [u8; 20], Leg, Leg, Hash256) {
+        let taker = [0x01u8; 20];
+        let issuer = [0x02u8; 20];
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+
+        let mut state = make_state_with_account(&taker, 500_000_000);
+        let a = serde_json::json!({
+            "LedgerEntryType": "AccountRoot", "Account": hex::encode(issuer),
+            "Balance": "500000000", "Sequence": 1, "OwnerCount": 0,
+        });
+        state.state_map.insert(keylet::account_root_key(&issuer), serde_json::to_vec(&a).unwrap()).unwrap();
+        let (lo, hi) = if taker < issuer { (taker, issuer) } else { (issuer, taker) };
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+            "Balance": {"currency": hex::encode_upper(cur),
+                        "issuer": "0000000000000000000000000000000000000000",
+                        "value": if taker < issuer { "100".to_string() } else { "-100".to_string() }},
+            "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "10000000"},
+            "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "10000000"},
+        });
+        state.state_map
+            .insert(keylet::ripple_state_key(&taker, &issuer, &cur), serde_json::to_vec(&line).unwrap())
+            .unwrap();
+
+        // The payer rests the book's ONLY level: 100 XRP offered for 100 USD.
+        // Far larger than the request below, so a crossing leaves it standing.
+        let mut sandbox = Sandbox::new(&state);
+        let own = TxFields {
+            account: taker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerGets": "100000000",
+                "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
+            }),
+        };
+        assert_eq!(OfferCreateTransactor.do_apply(&own, &mut sandbox), TxResult::Success);
+        let mods = sandbox.into_modifications();
+        apply_modifications(&mut state, mods).unwrap();
+
+        let xrp_leg = leg_of(&serde_json::json!("1")).unwrap();
+        let usd_leg = leg_of(&serde_json::json!({
+            "currency": "USD", "issuer": hex::encode(issuer), "value": "1"
+        }))
+        .unwrap();
+        let okey = keylet::offer_key(&taker, 2);
+        (state, taker, issuer, usd_leg, xrp_leg, okey)
+    }
+
+    #[test]
+    fn a_payment_crosses_the_payers_own_offer() {
+        let (state, taker, _issuer, usd_leg, xrp_leg, okey) = self_offer_book();
+        let mut sandbox = Sandbox::new(&state);
+        assert!(sandbox.exists(&okey), "the payer's own offer is the book");
+
+        let mut stale = Vec::new();
+        // offer_crossing = false → payment semantics.
+        let (rp, _rg, crossed) = cross_engine_to(
+            &taker, &taker, (1_000_000, 0), (1_000_000_000_000_000, -15), &xrp_leg, &usd_leg,
+            u64::MAX, u64::MAX, false, false, false, None, None, &mut sandbox, &mut stale,
+        );
+        assert!(crossed > 0, "a payment must CROSS the payer's own offer, not skip it");
+        assert!(me_is_zero(rp), "and deliver the requested XRP");
+        assert!(sandbox.exists(&okey), "the offer is consumed, not cancelled");
+        assert!(!stale.contains(&okey), "and never reported as removed");
+    }
+
+    #[test]
+    fn offer_crossing_cancels_the_takers_own_offer_instead() {
+        let (state, taker, _issuer, usd_leg, xrp_leg, okey) = self_offer_book();
+        let mut sandbox = Sandbox::new(&state);
+        let mut stale = Vec::new();
+        // offer_crossing = true → the older own offer is cancelled.
+        let (rp, _rg, crossed) = cross_engine_to(
+            &taker, &taker, (1_000_000, 0), (1_000_000_000_000_000, -15), &xrp_leg, &usd_leg,
+            u64::MAX, u64::MAX, false, true, false, None, None, &mut sandbox, &mut stale,
+        );
+        assert_eq!(crossed, 0, "nothing crosses: the only level was the taker's own");
+        assert!(!me_is_zero(rp), "so the request goes unfilled");
+        assert!(!sandbox.exists(&okey), "the own offer is cancelled");
+        assert!(stale.contains(&okey), "and reported as removed");
+    }
+
     #[test]
     fn the_takers_own_unfunded_offer_is_reaped_when_the_pool_fills_everything() {
         let taker = [0x01u8; 20];
