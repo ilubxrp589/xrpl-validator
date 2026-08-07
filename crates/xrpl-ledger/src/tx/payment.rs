@@ -542,29 +542,6 @@ impl Transactor for PaymentTransactor {
             }
         }
 
-        // Funding check applies only to a DIRECT full-delivery XRP payment.
-        // Cross-currency (SendMax) buys the XRP via paths, and tfPartial
-        // delivers what liquidity affords — both resolved in do_apply.
-        let partial = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & 0x0002_0000 != 0;
-        let pure_xrp = tx.fields.get("SendMax").is_none()
-            && tx.fields.get("Paths").is_none()
-            && tx.fields.get("Amount").map(|a| a.is_string()).unwrap_or(false);
-        if pure_xrp && !partial {
-            let balance = acct["Balance"]
-                .as_str()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
-            let amount = Self::amount_drops(tx).unwrap_or(0);
-            // rippled: mPriorBalance < amount + accountReserve(OwnerCount) —
-            // the sender's reserve is untouchable (#105035381 D21350B6).
-            let oc = acct["OwnerCount"].as_u64().unwrap_or(0);
-            let reserve = Self::reserve_base(sandbox)
-                .saturating_add(Self::reserve_inc(sandbox).saturating_mul(oc));
-            if balance < amount.saturating_add(reserve) {
-                return TxResult::UnfundedPayment;
-            }
-        }
-
         // If destination doesn't exist, amount must meet reserve
         let dest = match Self::destination(tx) {
             Some(d) => d,
@@ -587,6 +564,38 @@ impl Transactor for PaymentTransactor {
                 .unwrap_or(false);
             if requires_tag {
                 return TxResult::DstTagNeeded;
+            }
+        }
+
+        // Funding LAST. rippled decides every DESTINATION question in
+        // `Payment::preclaim` — tecNO_DST (337), tecNO_DST_INSUF_XRP (360),
+        // tecDST_TAG_NEEDED (372) — and only reaches the funding guard in
+        // `doApply` (627). Running funding first inverts that, and a ledger
+        // where BOTH hold then gets the wrong code: #106136429 `6FF692D40C4F`
+        // pays an lsfRequireDestTag destination with no tag while short by
+        // exactly 20 drops. Mainnet says tecDST_TAG_NEEDED; we said
+        // tecUNFUNDED_PAYMENT.
+        //
+        // Applies only to a DIRECT full-delivery XRP payment. Cross-currency
+        // (SendMax) buys the XRP via paths, and tfPartial delivers what
+        // liquidity affords — both resolved in do_apply.
+        let partial = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & 0x0002_0000 != 0;
+        let pure_xrp = tx.fields.get("SendMax").is_none()
+            && tx.fields.get("Paths").is_none()
+            && tx.fields.get("Amount").map(|a| a.is_string()).unwrap_or(false);
+        if pure_xrp && !partial {
+            let balance = acct["Balance"]
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            let amount = Self::amount_drops(tx).unwrap_or(0);
+            // rippled: mPriorBalance < amount + accountReserve(OwnerCount) —
+            // the sender's reserve is untouchable (#105035381 D21350B6).
+            let oc = acct["OwnerCount"].as_u64().unwrap_or(0);
+            let reserve = Self::reserve_base(sandbox)
+                .saturating_add(Self::reserve_inc(sandbox).saturating_mul(oc));
+            if balance < amount.saturating_add(reserve) {
+                return TxResult::UnfundedPayment;
             }
         }
 
@@ -1166,6 +1175,54 @@ mod tests {
         });
         let key = keylet::account_root_key(id);
         state.state_map.insert(key, serde_json::to_vec(&acct).unwrap()).unwrap();
+    }
+
+    /// Mainnet #106136429 `6FF692D40C4F`: destination carries
+    /// `lsfRequireDestTag`, the payment has no `DestinationTag`, AND the
+    /// sender is short by 20 drops — both conditions genuinely hold, so the
+    /// ledger only distinguishes the two by CHECK ORDER.
+    ///
+    /// rippled settles it in `Payment::preclaim`: tecNO_DST (337),
+    /// tecNO_DST_INSUF_XRP (360), tecDST_TAG_NEEDED (372) — while the funding
+    /// check is in `doApply` (627). Every destination check precedes funding.
+    /// Ours ran the funding check first and returned tecUNFUNDED_PAYMENT.
+    #[test]
+    fn a_destination_requiring_a_tag_is_rejected_before_the_sender_is_checked_for_funds() {
+        let alice = [0x01u8; 20];
+        let bob = [0x02u8; 20];
+        let mut state = make_state();
+        // The real shape: amount + reserve is one fee more than the balance.
+        let amount = 2_537_243u64;
+        add_account(&mut state, &alice, amount + 1_000_000 - 20, 1);
+        add_account(&mut state, &bob, 425_153_027_195, 1);
+        // lsfRequireDestTag on the destination.
+        {
+            let key = keylet::account_root_key(&bob);
+            let mut acct: serde_json::Value =
+                serde_json::from_slice(&state.state_map.lookup(&key).unwrap().to_vec()).unwrap();
+            acct["Flags"] = serde_json::Value::Number(0x0002_0000u64.into());
+            state.state_map.insert(key, serde_json::to_vec(&acct).unwrap()).unwrap();
+        }
+
+        let sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: alice,
+            tx_type: "Payment".to_string(),
+            fee: 20,
+            sequence: 1,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Destination": hex::encode(bob),
+                "Amount": amount.to_string(),
+                "Flags": 0u64,
+            }),
+        };
+        assert_eq!(
+            PaymentTransactor.preclaim(&tx, &sandbox),
+            TxResult::DstTagNeeded,
+            "the destination check comes first; funding is doApply's job"
+        );
     }
 
     fn read_balance(sandbox: &Sandbox, id: &[u8; 20]) -> u64 {
