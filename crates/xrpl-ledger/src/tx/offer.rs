@@ -1791,77 +1791,36 @@ thr={t:?} admits_trunc={} admits_up={}",
             if me_is_zero(gets_in) || me_is_zero(pays_out) { return None; }
             rate_of_me(gets_in, pays_out)
         })();
-        // DX_SEL — measure where our selection model and rippled's disagree.
+        // ⛔ DX_SEL REMOVED 2026-08-07 — it had served its purpose and become
+        // a trap. It compared rippled's upper-bound model against our
+        // then-current estimate-based one; since `03c2cb9` the engine SELECTS
+        // by that upper-bound model (see `order` below), so the detector was
+        // comparing an abandoned model against the live one and reporting
+        // "mismatches" that described nothing. `DX_CAND` (under `DX_BRIDGE`)
+        // covers the useful ground: each candidate's realised fill and the
+        // judge's verdict.
         //
-        // rippled does NOT keep the best strand by realised quality (the note
-        // below and StrandFlow's `BestStrand` type name both say so and both
-        // are wrong; `BestStrand` holds the strand that was PICKED, not the
-        // winner of a contest). `ActiveStrands::activateNext` sorts candidates
-        // by `qualityUpperBound`, best first, and DROPS any whose upper bound
-        // misses limitQuality; the strand loop then walks that order, flows
-        // each candidate's real pass, and on `Path rejected by limitQuality`
-        // does `continue` — falling through to the NEXT candidate — taking the
-        // FIRST survivor and `break`ing (StrandFlow.h:670-731).
+        // What it established, still true and worth keeping:
         //
-        // So: ORDERED BY UPPER BOUND, SELECTED BY FIRST-TO-SURVIVE. We instead
-        // filter and rank on an ESTIMATE of realised quality.
+        // rippled does NOT keep the best strand by realised quality — the
+        // `BestStrand` type name says so and is misleading; it holds the
+        // strand that was PICKED, not the winner of a contest.
+        // `ActiveStrands::activateNext` sorts candidates by
+        // `qualityUpperBound`, best first, and DROPS any whose bound misses
+        // limitQuality; the loop walks that order and on `Path rejected by
+        // limitQuality` does `continue` — falling through to the NEXT
+        // candidate — taking the FIRST survivor (StrandFlow.h:670-731).
         //
-        // ⚠ MEASURED 2026-08-06, and the answer was NOT a selection defect.
-        // Swept all 124 staged fixtures: exactly 2 mismatches (#105912454,
-        // #105930662), both in batch2, both CLEAN today. Tracing #105912454
-        // against rippled's own FLOWDBG upper bounds settled what they are:
+        // Measured against rippled's own FLOWDBG bounds on #105912454:
         //
-        //     rippled  ub strand 0 (direct) 63857.53              limit 63856.194
+        //     rippled  ub strand 0 (direct) 63857.53          limit 63856.194
         //     rippled  ub strand 1 (bridge) 63800.63315852392
-        //     ours     d_tip                63857.53   <- EXACT match
-        //     ours     bq                   63862.84779828923  <- WRONG QUANTITY
+        //     ours     d_tip                63857.53            <- EXACT match
+        //     ours     bq                   63862.84779828923   <- WRONG quantity
         //
-        // `d_tip` IS faithful to `qualityUpperBound`. `bq` is not: rippled's
-        // bridge upper bound is the UNDISCOUNTED book composition — our
-        // PRE-transfer-rate-discount value 6380063315852391, to the last ulp
-        // (see [[reference-amm-slice-sizing-open]], where that discount is
-        // recorded as attempted-and-reverted). Ours is ~0.1% pessimistic, so
-        // we read "no candidate clears the limit" where rippled had a live
-        // bridge strand and crossed a sliver.
-        //
-        // => The actionable gap is the BRIDGE STRAND'S UPPER BOUND, not the
-        // judge and not the selection rule. rippled uses qualityUpperBound
-        // ONLY to order/filter candidates and to admit; pricing comes from
-        // flowing the pass. `bq` here does BOTH jobs, which is the conflation.
-        // Exact expected values to build against, from the trace:
-        // #105912454 iter 0 -> 63800.63315852392, iter 1 -> 63818.05402872642.
-        if std::env::var("DX_SEL").is_ok() {
-            let within_t = |q: Option<Me>| q.is_some_and(|v| thr.is_none_or(|t| me_cmp(v, t).is_le()));
-            let within_e = |q: Option<u64>| q.is_some_and(|v| threshold == u64::MAX || v <= threshold);
-            // rippled's candidate set + order (upper bound), vs ours (estimate).
-            let (ub_d, ub_b) = (within_t(d_tip), within_t(bq_ub));
-            let (es_d, es_b) = (within_e(est_direct), within_e(est_bridge));
-            let pick_ub = match (ub_d, ub_b) {
-                (true, true) => match (d_tip, bq_ub) {
-                    (Some(d), Some(b)) => Some(me_cmp(d, b).is_le()),
-                    _ => None,
-                },
-                (true, false) => Some(true),
-                (false, true) => Some(false),
-                (false, false) => None,
-            };
-            let pick_est = match (es_d, es_b) {
-                (true, true) => match (est_direct, est_bridge) {
-                    (Some(d), Some(b)) => Some(d <= b),
-                    _ => None,
-                },
-                (true, false) => Some(true),
-                (false, true) => Some(false),
-                (false, false) => None,
-            };
-            if pick_ub != pick_est {
-                eprintln!(
-                    "DX_SEL MISMATCH pick_ub={pick_ub:?} pick_est={pick_est:?} \
-                     d_tip={d_tip:?} bq_ub={bq_ub:?} bq={bq:?} est_direct={est_direct:?} \
-                     est_bridge={est_bridge:?} thr={thr:?} threshold={threshold}"
-                );
-            }
-        }
+        // `d_tip` is faithful to `qualityUpperBound`; `bq` was not, because it
+        // carried the output-transfer discount. Hence `bq_ub` (`005ad9a`):
+        // `bq` prices, `bq_ub` admits.
         // Candidate set and ORDER, per `ActiveStrands::activateNext`: sort by
         // `qualityUpperBound`, BEST FIRST, and drop any strand whose upper
         // bound misses `limitQuality`. Not by estimated realised quality —
