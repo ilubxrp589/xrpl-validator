@@ -1532,6 +1532,39 @@ fn cross_bridged(
             _ => lin,
         }
     };
+    // The INVERSES of reprice_a/reprice_b. `AMMOffer::limitIn`/`limitOut` run
+    // the conservation function in BOTH directions for a single-path pool, so
+    // backing `xrp` out of a clamped leg amount must also go through the pool.
+    // Doing that step linearly at the offer's average ratio is what still broke
+    // #105940336 after the forward repricing was fixed: at `maxOffer` the
+    // average is ~100x off spot, so the reverse map produced an absurd `xrp`.
+    let unreprice_b = |pays_out: Me, lin: Me, sandbox: &Sandbox| -> Me {
+        match (b_use_amm, amm_b.as_ref()) {
+            (true, Some(am)) => {
+                let (pin, pout) = crate::tx::amm_swap::pool_balances(sandbox, am, pays_leg, &xrp_leg);
+                if pin.0 == 0 || pout.0 == 0 {
+                    return lin;
+                }
+                crate::tx::amm_swap::swap_asset_out(pin, pout, pays_out, am.tfee, xrp_leg.xrp)
+                    .filter(|v| v.0 != 0)
+                    .unwrap_or(lin)
+            }
+            _ => lin,
+        }
+    };
+    let unreprice_a = |gets_in: Me, lin: Me, sandbox: &Sandbox| -> Me {
+        match (a_use_amm, amm_a.as_ref()) {
+            (true, Some(am)) => {
+                let (pin, pout) = crate::tx::amm_swap::pool_balances(sandbox, am, &xrp_leg, gets_leg);
+                if pin.0 == 0 || pout.0 == 0 {
+                    return lin;
+                }
+                let v = crate::tx::amm_swap::swap_asset_in(pin, pout, gets_in, am.tfee, xrp_leg.xrp);
+                if v.0 == 0 { lin } else { v }
+            }
+            _ => lin,
+        }
+    };
     let reprice_a = |xrp: Me, lin: Me, sandbox: &Sandbox| -> Me {
         match (a_use_amm, amm_a.as_ref()) {
             (true, Some(am)) => {
@@ -1931,6 +1964,31 @@ thr={t:?} admits_trunc={} admits_up={}",
         // book — 71x worse — and the bridge is dropped too. Mainnet moves no
         // value and rests all 4 nodes. Its trace is the proof: no `New flow
         // iter` line at all, straight to `All strands dry`.
+        // rippled evaluates `setMultiPath(activeStrands.size() > 1)` AFTER
+        // `activateNext` filtered the candidates, and `AMMLiquidity::getOffer`
+        // picks the slice SHAPE from it.
+        let multi_now = match thr {
+            Some(t) => {
+                let w = |q: Option<Me>| q.is_some_and(|v| me_cmp(v, t).is_le());
+                (w(d_tip) as u8) + (w(bq_ub) as u8) > 1
+            }
+            // No limitQuality (a payment): rippled enters with multiPath =
+            // `strands.size() > 1`, which a bridged payment satisfies.
+            None => true,
+        };
+        // SINGLE PATH takes `maxOffer`, not a fib slice. The UPPER BOUND above
+        // keeps the fib slice deliberately — `activateNext` runs BEFORE
+        // `setMultiPath`, and one tx traces both shapes: `created 5458/XRP` for
+        // the bound, `created 2183017500/XRP` for the pass.
+        let slice_of = |amm: &Option<crate::tx::amm_swap::Amm>, out_leg: &Leg, in_leg: &Leg,
+                        sandbox: &Sandbox|
+         -> Option<(Me, (Me, Me))> {
+            let am = amm.as_ref()?;
+            let s = crate::tx::amm_swap::max_offer(sandbox, am, out_leg, in_leg)?;
+            Some((crate::tx::amm_swap::slice_rate(s.0, s.1), s))
+        };
+        let a_fill = if multi_now { a_fib } else { slice_of(&amm_a, &xrp_leg, gets_leg, sandbox) };
+        let b_fill = if multi_now { b_fib } else { slice_of(&amm_b, pays_leg, &xrp_leg, sandbox) };
         // Walk the candidates in UPPER-BOUND order, taking the FIRST whose
         // realised fill survives the judge. rippled rejects a pass with
         // `continue` — which advances to the NEXT strand, not out of the loop
@@ -1956,7 +2014,8 @@ thr={t:?} admits_trunc={} admits_up={}",
                     // `Flow.cpp:106`'s `strands.size() > 1`. Both candidates are
                     // therefore judged with the pool in play, and the count that
                     // survives is what `setMultiPath` then sees.
-                    let multi = (within(d_tip) as u8) + (within(bq_ub) as u8) > 1;
+                    let multi = multi_now;
+                let _ = &within;
                     // Single path: the pool is matched to the book, so the book's
                     // composition IS the strand's quality. A leg with no book at
                     // all then composes nothing — off the default path the step
@@ -2042,7 +2101,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                     }
                 };
                 // (xrp capacity, gets per that xrp) for leg A.
-                let (a_cap_xrp, a_in_full, a_out_full) = match (&a_book, &a_fib) {
+                let (a_cap_xrp, a_in_full, a_out_full) = match (&a_book, &a_fill) {
                     (Some((_, _, _, amaker, a_gives0, a_wants0)), _) => {
                         let funded = available(sandbox, amaker, &xrp_leg);
                         let a_gives = if me_cmp(funded, *a_gives0).is_lt() { funded } else { *a_gives0 };
@@ -2051,21 +2110,33 @@ thr={t:?} admits_trunc={} admits_up={}",
                     (None, Some((_, (s_in, s_out)))) => (*s_out, *s_in, *s_out),
                     (None, None) => break 'attempt,
                 };
-                let (b_cap_xrp, b_in_full, b_out_full) = match (&b_book, &b_fib) {
+                let (b_cap_xrp, b_in_full, b_out_full) = match (&b_book, &b_fill) {
                     (Some((_, _, _, _, b_gives0, b_wants0)), _) => (*b_wants0, *b_wants0, *b_gives0),
                     (None, Some((_, (s_in, s_out)))) => (*s_in, *s_in, *s_out),
                     (None, None) => break 'attempt,
                 };
                 let mut xrp = if me_cmp(a_cap_xrp, b_cap_xrp).is_lt() { a_cap_xrp } else { b_cap_xrp };
-                let mut gets_in = me_muldiv(xrp, a_in_full, a_out_full, true);
+                // `AMMOffer::limitOut` — for a SINGLE-PATH pool the clamped
+                // fill is re-priced through the conservation function,
+                // `{swapAssetOut(balances_, limit, fee), limit}`, NOT scaled by
+                // the offer's average quality ("The offer quality is increased
+                // in this case, but it doesn't matter since there is only one
+                // path", AMMOffer.cpp:82-101). `reprice_a` IS that swap.
+                //
+                // Scaling linearly is harmless for a fib slice, whose average
+                // is near spot, and catastrophic for `maxOffer`, whose average
+                // is ~100x worse: it inflates `gets_in` until the pass misses
+                // the limit and the judge discards it. That is exactly what
+                // regressed #105940336 the first time maxOffer was wired in.
+                let mut gets_in = reprice_a(xrp, me_muldiv(xrp, a_in_full, a_out_full, true), sandbox);
                 if me_cmp(gets_in, rem_gets).is_gt() {
                     gets_in = rem_gets;
-                    xrp = me_muldiv(gets_in, a_out_full, a_in_full, false);
+                    xrp = unreprice_a(gets_in, me_muldiv(gets_in, a_out_full, a_in_full, false), sandbox);
                 }
                 let mut pays_out = reprice_b(xrp, me_muldiv(xrp, b_out_full, b_in_full, false), sandbox);
                 if !sell && me_cmp(pays_out, rem_pays).is_gt() {
                     pays_out = rem_pays;
-                    xrp = me_muldiv(pays_out, b_in_full, b_out_full, true);
+                    xrp = unreprice_b(pays_out, me_muldiv(pays_out, b_in_full, b_out_full, true), sandbox);
                     gets_in = reprice_a(xrp, me_muldiv(xrp, a_in_full, a_out_full, true), sandbox);
                 }
                 let xrp = (me_rescale(xrp, 0, false), 0);
@@ -2077,7 +2148,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 }
                 // Leg A: taker sells gets for XRP (XRP rides in-flight via the
                 // taker and nets out of their mutation set).
-                match (&a_book, &a_fib) {
+                match (&a_book, &a_fill) {
                     (Some((_, akey, aoffer, amaker, a_gives0, a_wants0)), _) => {
                         settle_fill(sandbox, akey, aoffer, amaker, taker, taker,
                                     &xrp_leg, gets_leg, xrp, gets_in, *a_gives0, *a_wants0);
@@ -2091,7 +2162,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                     _ => break 'attempt,
                 }
                 // Leg B: taker sells that XRP for the pays side.
-                match (&b_book, &b_fib) {
+                match (&b_book, &b_fill) {
                     (Some((_, bkey, boffer, bmaker, b_gives0, b_wants0)), _) => {
                         settle_fill(sandbox, bkey, boffer, bmaker, taker, beneficiary,
                                     pays_leg, &xrp_leg, pays_out, xrp, *b_gives0, *b_wants0);
