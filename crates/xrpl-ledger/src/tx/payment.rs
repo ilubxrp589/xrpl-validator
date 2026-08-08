@@ -182,12 +182,20 @@ impl PaymentTransactor {
     /// Returns `need[i]` = the output hop `i` must produce. The last entry is
     /// the caller's `want_out`; each earlier one is what the hop after it turned
     /// out to consume. A zero means that hop found no liquidity at all.
+    ///
+    /// `single_pass` MUST be whatever the forward pass will run with. rippled's
+    /// rev and fwd passes are two halves of ONE `flow()` call, so a step's `rev`
+    /// reports the input for the output that step can actually produce in THIS
+    /// pass — not for the whole request. Measuring a whole-book fill and handing
+    /// it to a one-level pass sizes the hop before it for output the chain will
+    /// never carry; see the divergence note on the call site.
     #[allow(clippy::too_many_arguments)]
     fn reverse_requirements(
         tx: &TxFields,
         chain: &[&crate::tx::offer::Leg],
         want_out: crate::tx::offer::Me,
         threshold: u64,
+        single_pass: bool,
         // The flow's AMM fib state. The reverse pass MUST see it: a pool sized
         // by `maxOffer` answers the whole requested output in one go, so the
         // hop before it is told to buy enough to feed all of that. Under
@@ -224,7 +232,7 @@ impl PaymentTransactor {
                 let mut trial_fib = amm_fib.cloned();
                 let (rw, _, _) = ox::cross_engine_to(
                     &tx.account, &tx.account, need[i], granted, out_leg, in_leg,
-                    threshold, threshold, false, false, false, trial_fib.as_mut(), None,
+                    threshold, threshold, false, false, single_pass, trial_fib.as_mut(), None,
                     sandbox, &mut Vec::new(),
                 );
                 consumed = match (before, Self::leg_signed_balance(sandbox, &tx.account, in_leg)) {
@@ -329,8 +337,19 @@ impl PaymentTransactor {
                 inflight.push((root, pre));
             }
         }
-        // REVERSE pass first: size each hop to what the one after it needs.
-        let need = Self::reverse_requirements(tx, chain, want_out, threshold, amm_fib.as_deref(), sandbox);
+        // REVERSE pass first: size each hop to what the one after it needs IN
+        // THIS PASS. #106143011 5D327F343A54 is what the mode mismatch costs:
+        // measuring with the whole book while applying one level per pass told
+        // hop 0 (SPY->XRP) to buy 17.623187 XRP — the whole 18.00944 RLUSD
+        // request — where hop 1 (XRP->RLUSD) tops out at 1.04447 RLUSD per pass
+        // and so absorbs 1.021751 XRP. It bought all of it, exhausting the 100
+        // SPY SendMax in ONE round and stranding ~16 XRP in the intermediate;
+        // rippled spends 5.790416745276017 SPY for that same first 1.04447 and
+        // comes back five more times. Both engines end up spending the whole
+        // SendMax — the divergence was never overspending per se, it was
+        // spending it all at once and losing the five passes that follow.
+        let need =
+            Self::reverse_requirements(tx, chain, want_out, threshold, single_pass, amm_fib.as_deref(), sandbox);
         let spend_before = Self::leg_signed_balance(sandbox, &tx.account, spend_leg);
         let mut carry = avail_in;
         for i in 0..n {
