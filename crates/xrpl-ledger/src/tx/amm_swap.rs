@@ -708,6 +708,76 @@ pub(crate) fn fib_slice(
 /// and 115.121893423695 * 0.99 = 113.970674489458 exactly, swapAssetOut of
 /// which is 2 183 017 500. #106134431's BTC pool matches the same way
 /// (1.692470077908021 * 0.99 = 1.675545377128941).
+/// rippled's `QualityFunction` — a strand's AVERAGE quality as a function of
+/// its output: `1/q(out) = m*out + b`, where `q` is expressed as OUT PER IN.
+///
+/// A CLOB step is constant (`m = 0`); an AMM step degrades linearly as more is
+/// taken, which is the whole point — it lets `limitOut` solve for the output
+/// that lands the strand exactly ON the taker's quality limit instead of
+/// taking the maximum and then discarding the pass (StrandFlow.h:345-395,
+/// QualityFunction.cpp).
+///
+/// ⚠ `m` is NEVER positive in any shape rippled builds — 0 for a CLOB,
+/// `-cfee/in` for an AMM, and `combine` preserves that — so the MAGNITUDE is
+/// tracked here. `Me`'s mantissa is unsigned.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct QualityFn {
+    /// `b`: the value at `out = 0` — the strand's best (spot) quality, out per in.
+    pub(crate) b: Me,
+    /// `|m|`: how fast that quality decays per unit of output.
+    pub(crate) mneg: Me,
+}
+
+impl QualityFn {
+    /// `QualityFunction(quality, CLOBLikeTag)` — `m = 0`, `b = 1/rate`.
+    pub(crate) fn clob(rate: Me) -> Option<Self> {
+        (rate.0 != 0).then(|| Self { b: n_div(N_ONE, rate, Rnd::Near), mneg: (0, 0) })
+    }
+
+    /// `QualityFunction(amounts, tfee, AMMTag)` — `m = -cfee/in`,
+    /// `b = out * cfee / in`, with `cfee = feeMult(tfee) = 1 - tfee/100000`.
+    pub(crate) fn amm(pool_in: Me, pool_out: Me, tfee: u16) -> Option<Self> {
+        if pool_in.0 == 0 || pool_out.0 == 0 {
+            return None;
+        }
+        let cfee = n_sub(N_ONE, fee_n(tfee), Rnd::Near);
+        Some(Self {
+            b: n_div(n_mul(pool_out, cfee, Rnd::Near), pool_in, Rnd::Near),
+            mneg: n_div(cfee, pool_in, Rnd::Near),
+        })
+    }
+
+    /// `combine`: `m_ += b_ * qf.m_;  b_ *= qf.b_;` — steps in strand order,
+    /// source first.
+    pub(crate) fn combine(&mut self, next: &QualityFn) {
+        self.mneg = n_add(self.mneg, n_mul(self.b, next.mneg, Rnd::Near), Rnd::Near);
+        self.b = n_mul(self.b, next.b, Rnd::Near);
+    }
+
+    /// `outFromAvgQ`: solve `m*out + b = 1/limit` for `out`, i.e.
+    /// `out = (1/limit - b) / m`. Both sides are negated here so the unsigned
+    /// form is `(b - 1/limit) / |m|`.
+    ///
+    /// `None` when the function is CONSTANT (no AMM in the strand — nothing to
+    /// solve) or when `out <= 0` (the strand's best quality already misses the
+    /// limit, so no output size can rescue it). rippled returns `remainingOut`
+    /// unchanged in both cases, which also leaves `adjustedRemOut` false.
+    ///
+    /// rippled evaluates the whole expression under
+    /// `Number::RoundingMode::Upward`.
+    pub(crate) fn out_from_avg_q(&self, limit_rate: Me) -> Option<Me> {
+        if self.mneg.0 == 0 || limit_rate.0 == 0 {
+            return None;
+        }
+        let inv = n_div(N_ONE, limit_rate, Rnd::Up);
+        if n_cmp(self.b, inv) != Ordering::Greater {
+            return None;
+        }
+        let out = n_div(n_sub(self.b, inv, Rnd::Up), self.mneg, Rnd::Up);
+        (out.0 != 0).then_some(out)
+    }
+}
+
 /// ⚠ NOT WIRED IN YET, deliberately — see the note on `max_offer_amounts`.
 #[allow(dead_code)]
 pub(crate) fn max_offer(
@@ -967,6 +1037,76 @@ mod tests {
         let digits = format!("{int}{frac}");
         let m: u128 = digits.trim_start_matches('0').parse().unwrap();
         n_norm((m, -(frac.len() as i32)))
+    }
+
+    /// `QualityFn` must reproduce rippled's `QualityFunction` algebra, and the
+    /// solved output must ROUND-TRIP: feeding it back through `m*out + b` has
+    /// to land on `1/limit`. That check needs no external number and catches a
+    /// sign or unit error immediately.
+    #[test]
+    fn a_solved_output_lands_exactly_on_the_limit() {
+        // #106134431's leg B pool: 107 107 916 717 drops / 1.692470077908021
+        // BTC, trading fee 0.
+        let pool_in = (107_107_916_717u128, 0i32);
+        let pool_out = me("1.692470077908021");
+        let amm = QualityFn::amm(pool_in, pool_out, 0).expect("pool is live");
+        assert_eq!(amm.b, n_div(pool_out, pool_in, Rnd::Near), "b = out/in at fee 0");
+        assert_eq!(amm.mneg, n_div(N_ONE, pool_in, Rnd::Near), "|m| = 1/in at fee 0");
+
+        // Leg A is a CLOB at 0.00000102695147247967 RLUSD per drop.
+        let clob = QualityFn::clob(me("0.00000102695147247967")).expect("live book");
+        assert_eq!(clob.mneg, (0, 0), "a CLOB step is constant");
+
+        // Strand order: source first (leg A), then leg B.
+        let mut qf = clob;
+        qf.combine(&amm);
+        assert!(qf.mneg.0 != 0, "the composed function is NOT constant");
+
+        let limit = me("65044.98739782016");
+        let out = qf.out_from_avg_q(limit).expect("spot beats the limit, so a cap exists");
+
+        // ROUND TRIP: 1/q(out) = b - |m|*out must equal 1/limit.
+        let back = n_sub(qf.b, n_mul(qf.mneg, out, Rnd::Near), Rnd::Near);
+        let inv = n_div(N_ONE, limit, Rnd::Near);
+        let (bm, be) = (n_norm(back), n_norm(inv));
+        let rel = if bm.1 == be.1 {
+            (bm.0 as i128 - be.0 as i128).unsigned_abs()
+        } else {
+            u128::MAX
+        };
+        assert!(rel <= 4, "round-trip lands on 1/limit (within {rel} ulp)");
+
+        // And against an independent reference (40-digit Decimal, same algebra):
+        // (b - 1/limit)/|m| = 0.001415360439672 BTC.
+        let want = me("0.001415360439672");
+        let ratio = n_div(out, want, Rnd::Near);
+        assert!(
+            n_cmp(ratio, me("0.999999")) == Ordering::Greater
+                && n_cmp(ratio, me("1.000001")) == Ordering::Less,
+            "cap {out:?} must match the reference 0.001415360439672 BTC",
+        );
+    }
+
+    /// A strand with no AMM has a CONSTANT quality function, so there is
+    /// nothing to solve — rippled returns `remainingOut` unchanged, leaving
+    /// `adjustedRemOut` false. Getting this wrong would silently enable the
+    /// 1e-7 judge tolerance on pure-CLOB strands.
+    #[test]
+    fn a_pure_clob_strand_has_no_solution() {
+        let mut qf = QualityFn::clob(me("0.5")).expect("live");
+        qf.combine(&QualityFn::clob(me("2")).expect("live"));
+        assert_eq!(qf.mneg, (0, 0), "still constant after combining two CLOBs");
+        assert_eq!(qf.out_from_avg_q(me("1")), None, "nothing to solve");
+    }
+
+    /// When the strand's BEST quality already misses the limit, no output size
+    /// rescues it: `out <= 0` -> None.
+    #[test]
+    fn a_strand_whose_spot_misses_the_limit_has_no_positive_solution() {
+        let amm = QualityFn::amm((1_000_000u128, 0i32), me("1"), 0).expect("live");
+        // spot = 1e-6 out per in; a limit demanding 1e-3 out per in is
+        // unreachable (rate = 1000 in per out).
+        assert_eq!(amm.out_from_avg_q(me("1000")), None);
     }
 
     /// `max_offer` must reproduce rippled's `AMMLiquidity::maxOffer` exactly.

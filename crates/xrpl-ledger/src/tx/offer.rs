@@ -1989,6 +1989,66 @@ thr={t:?} admits_trunc={} admits_up={}",
         };
         let a_fill = if multi_now { a_fib } else { slice_of(&amm_a, &xrp_leg, gets_leg, sandbox) };
         let b_fill = if multi_now { b_fib } else { slice_of(&amm_b, pays_leg, &xrp_leg, sandbox) };
+        // `limitOut` — SIZE THE PASS TO THE LIMIT instead of taking the
+        // maximum and then discarding it (StrandFlow.h:345-395; call site at
+        // :655, "Limit only if one strand and limitQuality").
+        //
+        // A CLOB step's average quality is constant; an AMM's degrades
+        // linearly in the output taken. Composing the strand's
+        // `QualityFunction` and solving `outFromAvgQ(limitQuality)` gives the
+        // output whose AVERAGE quality lands exactly on the taker's limit.
+        // Without it `maxOffer` has no cap and we spend nearly the whole
+        // request: on #106134431 our 3rd pass was 1905.22 RLUSD against
+        // rippled's 20.53, so its realised quality missed and the judge threw
+        // the pass away — we rested one offer short of mainnet.
+        //
+        // Only for a SINGLE active strand: with two, sizing one to the limit
+        // would misstate the other's share.
+        let strand_qf = |sandbox: &Sandbox| -> Option<crate::tx::amm_swap::QualityFn> {
+            use crate::tx::amm_swap::{pool_balances, QualityFn};
+            let leg = |use_amm: bool, amm: &Option<crate::tx::amm_swap::Amm>,
+                       book: Option<Me>, out_leg: &Leg, in_leg: &Leg| -> Option<QualityFn> {
+                if use_amm {
+                    let am = amm.as_ref()?;
+                    let (pin, pout) = pool_balances(sandbox, am, out_leg, in_leg);
+                    QualityFn::amm(pin, pout, am.tfee)
+                } else {
+                    QualityFn::clob(book?)
+                }
+            };
+            // Strand order is source-first: leg A (gets -> XRP), then leg B.
+            let mut qf = leg(a_use_amm, &amm_a, qa_book, &xrp_leg, gets_leg)?;
+            qf.combine(&leg(b_use_amm, &amm_b, qb_book, pays_leg, &xrp_leg)?);
+            Some(qf)
+        };
+        // `remainingOut` for this pass: a tfSell offer is not bounded by the
+        // pays side (rippled sets `deliver` to the max amount); everything
+        // else is.
+        let rem_out = (!sell).then_some(rem_pays);
+        let limited = if multi_now {
+            None
+        } else {
+            thr.and_then(|t| strand_qf(sandbox).and_then(|q| q.out_from_avg_q(t)))
+        };
+        // `std::min(out, remainingOut)`, plus "a tiny difference could be due
+        // to the round off": within 1e-9 relative rippled keeps `remainingOut`
+        // so `adjustedRemOut` stays FALSE.
+        let (out_cap, adjusted) = match (limited, rem_out) {
+            (Some(l), Some(r)) => {
+                if me_cmp(l, r).is_ge()
+                    || me_is_zero(me_muldiv(me_sub(r, l), (1_000_000_000, 0), r, false))
+                {
+                    (Some(r), false)
+                } else {
+                    (Some(l), true)
+                }
+            }
+            (Some(l), None) => (Some(l), true),
+            (None, r) => (r, false),
+        };
+        if std::env::var("DX_BRIDGE").is_ok() {
+            eprintln!("DX_LIMITOUT limited={limited:?} rem_out={rem_out:?} cap={out_cap:?} adjusted={adjusted}");
+        }
         // Walk the candidates in UPPER-BOUND order, taking the FIRST whose
         // realised fill survives the judge. rippled rejects a pass with
         // `continue` — which advances to the NEXT strand, not out of the loop
@@ -2134,10 +2194,14 @@ thr={t:?} admits_trunc={} admits_up={}",
                     xrp = unreprice_a(gets_in, me_muldiv(gets_in, a_out_full, a_in_full, false), sandbox);
                 }
                 let mut pays_out = reprice_b(xrp, me_muldiv(xrp, b_out_full, b_in_full, false), sandbox);
-                if !sell && me_cmp(pays_out, rem_pays).is_gt() {
-                    pays_out = rem_pays;
-                    xrp = unreprice_b(pays_out, me_muldiv(pays_out, b_in_full, b_out_full, true), sandbox);
-                    gets_in = reprice_a(xrp, me_muldiv(xrp, a_in_full, a_out_full, true), sandbox);
+                // Clamp on the limitOut-adjusted cap. For a tfSell offer
+                // `rem_pays` is not a bound, but the limit-sized cap is.
+                if let Some(cap) = out_cap {
+                    if me_cmp(pays_out, cap).is_gt() {
+                        pays_out = cap;
+                        xrp = unreprice_b(pays_out, me_muldiv(pays_out, b_in_full, b_out_full, true), sandbox);
+                        gets_in = reprice_a(xrp, me_muldiv(xrp, a_in_full, a_out_full, true), sandbox);
+                    }
                 }
                 let xrp = (me_rescale(xrp, 0, false), 0);
                 if std::env::var("DX_BRIDGE").is_ok() {
@@ -2187,11 +2251,36 @@ thr={t:?} admits_trunc={} admits_up={}",
             }
             }
             // The judge — `q < limitQuality` rejects the pass outright.
+            // rippled rejects when `q < limitQuality` UNLESS `limitOut`
+            // actually reduced the output and the miss is within 1e-7
+            // relative — "limitOut() finds output to generate exact requested
+            // limitQuality. But the actual limit quality might be slightly off
+            // due to the round off" (StrandFlow.h:712-720). The tolerance is
+            // GATED on `adjustedRemOut`: an unadjusted pass is judged exactly,
+            // which is what keeps #106137477 resting on its 1.3e-5 miss.
             let accepted = match fill {
                 None => false,
                 Some((gin, pout)) => {
                     threshold == u64::MAX
-                        || rate_of_me(gin, pout).is_some_and(|q| q <= threshold)
+                        || rate_of_me(gin, pout).is_some_and(|q| {
+                            q <= threshold
+                                || (adjusted && {
+                                    // `withinRelativeDistance(q, limitQuality, 1e-7)`
+                                    // (AMMHelpers.h:112-121):
+                                    //   ((min.rate() - max.rate()) / min.rate()) < dist
+                                    // A HIGHER Quality is better while `rate()` is its
+                                    // inverse, so `min` quality is the LARGER rate — the
+                                    // worse one, which here is the realised `q`. The
+                                    // denominator is therefore the larger rate, not the
+                                    // threshold, and the comparison is STRICTLY less.
+                                    let (a, b) = (rate_me(q), rate_me(threshold));
+                                    me_cmp(
+                                        me_muldiv(me_sub(a, b), (10_000_000, 0), a, false),
+                                        (1, 0),
+                                    )
+                                    .is_lt()
+                                })
+                        })
                 }
             };
             if std::env::var("DX_BRIDGE").is_ok() {
