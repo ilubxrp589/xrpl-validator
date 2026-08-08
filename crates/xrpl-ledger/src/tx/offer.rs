@@ -2821,6 +2821,31 @@ pub(crate) fn cross_engine_to(
                     // #105814446 2162E284EAB3.
                     give = me_muldiv(pay, (1u128, 0i32), rate_me(q), true);
                     if pays_leg.xrp {
+                        // ⛔ FLIPPING THIS TO CEIL WAS TRIED 2026-08-08 AND
+                        // REVERTED — and this time it was MEASURED, not
+                        // inferred, so the warning above is now backed by data.
+                        //
+                        // The motive looked strong: DX_VALCHECK found the
+                        // residual offer's TakerPays exactly ONE DROP HIGH on
+                        // twelve fixtures (70135729 vs 70135728, 9233546767 vs
+                        // 9233546766, 8770441575 vs 8770441574, and nine more),
+                        // which is precisely what a fill one drop short leaves
+                        // behind. `Quality::ceil_in` really is `divRound(…,
+                        // asset, roundUp=true)`.
+                        //
+                        // It regresses anyway, on TWO independent signals:
+                        //   • #105284280 dropped 78/78 -> 77/78 — a KEY-level
+                        //     regression, the strongest evidence this repo has.
+                        //   • #105091578 went from 0 value hits to TWENTY-ONE,
+                        //     on a ledger that was previously perfect.
+                        // Trading twelve one-drop residuals for twenty-one
+                        // fresh divergences plus a broken match is not a fix.
+                        //
+                        // So the twelve are NOT this site, or the direction is
+                        // conditional the way the `pay` rescale above is
+                        // (`buy_bound` — which side bounds the fill). Whoever
+                        // picks this up next: find which of the twelve reach
+                        // THIS branch at all before touching the rounding again.
                         give = (me_rescale(give, 0, false), 0);
                     }
                     if me_is_zero(give) {

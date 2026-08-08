@@ -461,6 +461,7 @@ impl Transactor for NFTokenCreateOfferTransactor {
         } else {
             tx.sequence
         };
+        let owner_count_before = owner_count_of(sandbox, &tx.account);
         token_offer_create_apply(
             sandbox,
             &tx.account,
@@ -471,6 +472,35 @@ impl Transactor for NFTokenCreateOfferTransactor {
             tx.fields.get("Expiration"),
             tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0),
         );
+
+        // An NFTokenOffer is an owned object, so it costs a reserve unit — and
+        // this transactor never charged for it. Same gate NFTokenMint uses
+        // above: compare accountReserve(ownerCountAfter) against the PRE-fee
+        // balance, do_apply running post-fee.
+        //
+        // #106154459 A55AD53EEFA2: `rN7JYEJHfj3Rm4ktX5CTGTPwPEs2G8aD9y` sits at
+        // OwnerCount 1418 with 284637037 drops. One more object needs
+        // 1000000 + 1419*200000 = 284800000 — it is 162963 short, so mainnet
+        // takes the fee and stops (tecINSUFFICIENT_RESERVE, ONE node: the
+        // AccountRoot). We created the offer and both directory pages and
+        // returned tesSUCCESS: 5 mutations against 1, all EXTRA.
+        //
+        // ⚠ Placed here rather than in preclaim to match the calibrated
+        // NFTokenMint form. If a specimen ever turns up that fails BOTH this
+        // and a preclaim-stage check, the ORDER will decide the code — that is
+        // the same trap 5626357/b569fa9 walked into for destination checks.
+        let owner_count_after = owner_count_of(sandbox, &tx.account);
+        if owner_count_after > owner_count_before {
+            let acct_key = keylet::account_root_key(&tx.account);
+            if let Some(d) = sandbox.read(&acct_key) {
+                if let Ok(a) = serde_json::from_slice::<serde_json::Value>(&d) {
+                    let bal: u64 = a["Balance"].as_str().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    if bal + tx.fee < crate::ledger::fees::account_reserve(sandbox, owner_count_after) {
+                        return TxResult::InsufficientReserve;
+                    }
+                }
+            }
+        }
 
         TxResult::Success
     }
