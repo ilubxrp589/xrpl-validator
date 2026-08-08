@@ -1424,6 +1424,66 @@ fn run() -> i32 {
                 }
             }
         }
+        // DX_VALCHECK=<rel-tol|1>: compare the VALUES we wrote against
+        // mainnet's FinalFields, for every node BOTH sides mutated.
+        //
+        // The mutation set compares KEYS ONLY, so a value violation is
+        // invisible to it however severe. #106146362 75511674AD58 wrote a book
+        // maker's trust line to -0.35248615830377 — a non-issuer minting the
+        // currency it was selling — and the probe reported that as nothing more
+        // than "5 missing nodes". The keys it DID emit were all correct.
+        //
+        // Opt-in, and it changes no verdict: this reports, it does not judge.
+        // The engine has been calibrated against key-level matching throughout,
+        // so switching the verdict to values would surface an unknown backlog
+        // all at once. Measure the backlog first.
+        if let Ok(spec) = std::env::var("DX_VALCHECK") {
+            let tol: f64 = if spec == "1" { 1e-12 } else { spec.parse().unwrap_or(1e-12) };
+            // Magnitude of an amount that may be drops (string) or an IOU
+            // (object). Sign is kept: a trust line's balance carries the whole
+            // point of this check in its sign.
+            fn amt(v: &Value) -> Option<f64> {
+                match v {
+                    Value::String(s) => s.parse::<f64>().ok(),
+                    Value::Object(_) => v["value"].as_str().and_then(|s| s.parse::<f64>().ok()),
+                    _ => None,
+                }
+            }
+            let mut net_fields: HashMap<String, &Value> = HashMap::new();
+            if let Some(nodes) = net["nodes"].as_array() {
+                for n in nodes {
+                    if let (Some(k), Some(f)) = (n[0].as_str(), n.get(2)) {
+                        if f.is_object() {
+                            net_fields.insert(k.to_string(), f);
+                        }
+                    }
+                }
+            }
+            for (k, ent) in mods.iter() {
+                let bytes = match ent {
+                    SandboxEntry::Created(b) | SandboxEntry::Modified(b) => b,
+                    SandboxEntry::Deleted => continue,
+                };
+                let key = hex::encode_upper(k.0);
+                let Some(nf) = net_fields.get(&key).copied() else { continue };
+                let Ok(ours) = serde_json::from_slice::<Value>(bytes) else { continue };
+                let kind = ours.get("LedgerEntryType").and_then(|v| v.as_str()).unwrap_or("");
+                // Only the value-bearing fields. Pointers and flags are already
+                // covered by the key-level compare and by `canon_ptrs`.
+                let fields: &[&str] = match kind {
+                    "RippleState" | "AccountRoot" => &["Balance"],
+                    "Offer" => &["TakerGets", "TakerPays"],
+                    _ => continue,
+                };
+                for f in fields {
+                    let (Some(a), Some(b)) = (amt(&ours[*f]), amt(&nf[*f])) else { continue };
+                    let scale = a.abs().max(b.abs()).max(1e-30);
+                    if (a - b).abs() / scale > tol {
+                        eprintln!("DX_VALCHECK {h} {tx_type} {key} {kind}.{f} ours={a} net={b}");
+                    }
+                }
+            }
+        }
         // ORACLE THREADING: after committing native's mods (which keeps
         // directory Indexes continuity — meta FinalFields OMIT the Indexes
         // array), overlay mainnet's actual post-state (meta NewFields /
