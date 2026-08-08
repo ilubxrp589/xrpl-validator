@@ -686,6 +686,88 @@ pub(crate) fn fib_slice(
     (s_in.0 > 0 && s_out.0 > 0).then_some((s_in, s_out))
 }
 
+/// rippled's `AMMLiquidity::maxOffer` — the SINGLE-PATH slice.
+///
+/// `getOffer` picks the shape by `ammContext_.multiPath()`:
+///   * multi-path  -> `generateFibSeqOffer` (our `fib_slice`)
+///   * single path, no clobQuality -> `maxOffer`
+///   * single path, with clobQuality -> `changeSpotPriceQuality`
+///
+/// `maxOffer` takes 99% of the pool's OUT side and asks `swapAssetOut` what
+/// that costs, so its AMOUNTS are enormous while its comparison `quality()`
+/// stays the pool SPOT (`Quality{balances}`). rippled then lets BookStep clamp
+/// the actual fill; the point is that ONE pass is priced and judged, not a
+/// sequence of small slices each judged on its own.
+///
+///     out = floor(balances.out * 0.99)          (maxOut, RoundingMode::Downward)
+///     in  = swapAssetOut(balances, out, fee)
+///
+/// Verified against the FFI trace on 2026-08-07. #106137477, pool 21 830 175
+/// drops / 115.121893423695 BBRL at fee 1000:
+///     `getOffer, created 2183017500/XRP 113.970674489458/BBRL`
+/// and 115.121893423695 * 0.99 = 113.970674489458 exactly, swapAssetOut of
+/// which is 2 183 017 500. #106134431's BTC pool matches the same way
+/// (1.692470077908021 * 0.99 = 1.675545377128941).
+/// ⚠ NOT WIRED IN YET, deliberately — see the note on `max_offer_amounts`.
+#[allow(dead_code)]
+pub(crate) fn max_offer(
+    sandbox: &Sandbox,
+    amm: &Amm,
+    pays_leg: &Leg,
+    gets_leg: &Leg,
+) -> Option<(Me, Me)> {
+    let pool_in = holds(sandbox, &amm.account, gets_leg);
+    let pool_out = holds(sandbox, &amm.account, pays_leg);
+    max_offer_amounts(pool_in, pool_out, amm.tfee, pays_leg.xrp, gets_leg.xrp)
+}
+
+/// The pure arithmetic of `max_offer`, split out so it can be pinned directly
+/// against the traced `getOffer, created …` amounts without a sandbox.
+///
+/// ⚠ **Verified but NOT WIRED IN.** Substituting this for the fib slice in
+/// `cross_bridged`'s single-path fill is correct for #106137477 (rippled
+/// prices ONE maxOffer-shaped pass and rejects it whole, where our four small
+/// slices each squeak inside the limit) but it REGRESSES #105940336
+/// `CA2C624ED031`, a live case where mainnet crosses: the bigger pass lands
+/// outside the limit and our judge kills it, so we rest where mainnet fills.
+/// `a_single_path_leg_is_priced_by_its_pools_spot_quality` catches it.
+///
+/// The missing half is how BookStep CLAMPS the pass — rippled's maxOffer is
+/// enormous and the actual fill is bounded by the request and the quality
+/// threshold, then RE-PRICED through `swapAssetIn`/`swapAssetOut` at the size
+/// actually taken. Sizing alone, without that clamp, moves the number the
+/// wrong way on a calibrated case — exactly the "needs both halves" this
+/// area's history warns about. Left here because the arithmetic is settled and
+/// trace-exact; the clamp is the next piece.
+#[allow(dead_code)]
+pub(crate) fn max_offer_amounts(
+    pool_in: Me,
+    pool_out: Me,
+    tfee: u16,
+    out_xrp: bool,
+    in_xrp: bool,
+) -> Option<(Me, Me)> {
+    if pool_in.0 == 0 || pool_out.0 == 0 {
+        return None;
+    }
+    // maxOut: `Number const res = out * Number{99,-2};` then
+    // `toAmount<T>(asset, res, RoundingMode::Downward)`.
+    //
+    // ⚠ The two roundings are NOT the same one. The MULTIPLY happens in
+    // Number's own precision under its default nearest mode; `Downward`
+    // governs only the later conversion to the amount type. Doing the multiply
+    // downward too costs one ulp — #106134431's BTC pool
+    // (1.692470077908021 * 0.99) truncates to …128940 where rippled traces
+    // …128941. #106137477's BBRL pool is insensitive (its tail is an exact
+    // half), so ONE specimen alone would not have caught this.
+    let out = to_amount(n_mul(pool_out, (9_900_000_000_000_000, -16), Rnd::Near), out_xrp, Rnd::Down);
+    if out.0 == 0 || n_cmp(out, pool_out) != Ordering::Less {
+        return None;
+    }
+    let inp = swap_asset_out(pool_in, pool_out, out, tfee, in_xrp)?;
+    (inp.0 > 0).then_some((inp, out))
+}
+
 /// Average rate (in per out) of a fill — public face of the Quality compare.
 pub(crate) fn slice_rate(inp: Me, out: Me) -> Me {
     rate_of_me_pair(inp, out)
@@ -885,6 +967,41 @@ mod tests {
         let digits = format!("{int}{frac}");
         let m: u128 = digits.trim_start_matches('0').parse().unwrap();
         n_norm((m, -(frac.len() as i32)))
+    }
+
+    /// `max_offer` must reproduce rippled's `AMMLiquidity::maxOffer` exactly.
+    ///
+    /// Both amounts come from the FFI trace of 2026-08-07, not from working the
+    /// formula backwards:
+    ///   #106137477 pool 21 830 175 drops / 115.121893423695 BBRL, fee 1000 ->
+    ///     `getOffer, created 2183017500/XRP 113.970674489458/BBRL`
+    ///   #106134431 pool 107 107 916 717 drops / 1.692470077908021 BTC, fee 0 ->
+    ///     `getOffer, created 10605698837763/XRP 1.675545377128941/BTC`
+    /// In both the pool's IN side is XRP and the OUT side an IOU.
+    #[test]
+    fn max_offer_matches_rippleds_traced_amounts() {
+        // #106137477 — BBRL pool, 1% trading fee.
+        let (inp, out) = max_offer_amounts(
+            (21_830_175u128, 0i32),
+            me("115.121893423695"),
+            1000,
+            /*out_xrp=*/ false,
+            /*in_xrp=*/ true,
+        )
+        .expect("maxOffer exists");
+        assert_eq!(out, me("113.970674489458"), "maxOut is 99% of the out side");
+        assert_eq!(inp, (2_183_017_500u128, 0i32), "in is swapAssetOut of that");
+
+        // #106134431 — BTC pool, no trading fee.
+        let (inp2, out2) = max_offer_amounts(
+            (107_107_916_717u128, 0i32),
+            me("1.692470077908021"),
+            0,
+            false,
+            true,
+        )
+        .expect("maxOffer exists");
+        assert_eq!(out2, me("1.675545377128941"), "99% of the BTC side");
     }
 
     /// The strand-activation bound must NOT charge the trading fee. rippled
