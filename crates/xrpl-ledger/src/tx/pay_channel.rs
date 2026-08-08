@@ -95,11 +95,27 @@ impl Transactor for PaymentChannelCreateTransactor {
             }
         }
 
-        // Destination must exist
+        // Destination must exist, and may insist on a tag.
+        // `PaymentChannelCreate::preclaim` (:96-104): tecNO_DST, then
+        // lsfDisallowIncomingPayChan -> tecNO_PERMISSION, then
+        // lsfRequireDestTag with no DestinationTag -> tecDST_TAG_NEEDED.
+        // Found by grepping every transactor that emits tecDST_TAG_NEEDED
+        // after #106143718 showed EscrowCreate missing it: rippled has the
+        // check in SEVEN transactors and we had it in two.
+        // ⚠ No failing ledger pins THIS one — it is here because rippled's
+        // condition is unambiguous and identical to the form already proven
+        // in `check.rs`.
         if let Some(dest) = tx.fields.get("Destination").and_then(|d| parse_account_id(d)) {
             let dest_key = keylet::account_root_key(&dest);
-            if !sandbox.exists(&dest_key) {
+            let Some(dst) = sandbox
+                .read(&dest_key)
+                .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+            else {
                 return TxResult::NoDst;
+            };
+            let dflags = dst["Flags"].as_u64().unwrap_or(0);
+            if dflags & 0x0002_0000 != 0 && tx.fields.get("DestinationTag").is_none() {
+                return TxResult::DstTagNeeded; // lsfRequireDestTag
             }
         } else {
             return TxResult::Malformed;

@@ -172,6 +172,15 @@ impl Transactor for AccountDeleteTransactor {
             Ok(v) => v,
             Err(_) => return TxResult::Malformed,
         };
+        // `AccountDelete::preclaim` (:229-235): tecNO_DST, then
+        // lsfRequireDestTag with no DestinationTag -> tecDST_TAG_NEEDED.
+        // Same sweep as pay_channel above; no failing ledger pins this one
+        // either, but rippled's condition is unambiguous.
+        if dest["Flags"].as_u64().unwrap_or(0) & 0x0002_0000 != 0
+            && tx.fields.get("DestinationTag").is_none()
+        {
+            return TxResult::DstTagNeeded; // lsfRequireDestTag
+        }
 
         let dest_balance = dest["Balance"]
             .as_str()

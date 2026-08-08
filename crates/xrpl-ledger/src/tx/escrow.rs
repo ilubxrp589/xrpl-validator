@@ -150,9 +150,38 @@ impl Transactor for EscrowCreateTransactor {
             Err(_) => return TxResult::Malformed,
         };
 
+        // rippled checks the destination in TWO places and the order differs
+        // by AMOUNT TYPE. `EscrowCreate::preclaim` requires it to exist
+        // (tecNO_DST, EscrowCreate.cpp:344-346). `doApply` then does the
+        // reserve and — ONLY for an XRP amount, `if (isXRP(amount))` — the
+        // funding test (tecUNFUNDED), and only after that the tag test
+        // (tecDST_TAG_NEEDED, :450-457). A TOKEN escrow therefore reaches the
+        // tag test having had NO funding test at all.
+        //
+        // #106143718 `A3A1944D0A83` escrows 3160 XRPL (an IOU) to a
+        // destination carrying lsfRequireDestTag with no DestinationTag.
+        // Mainnet claims the fee with tecDST_TAG_NEEDED; we returned
+        // tecUNFUNDED_PAYMENT from our own token-holding test, which rippled
+        // does not perform at this point.
+        let Some(dest_id) = Self::destination(tx) else {
+            return TxResult::Malformed;
+        };
+        let Some(dst) = sandbox
+            .read(&keylet::account_root_key(&dest_id))
+            .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+        else {
+            return TxResult::NoDst;
+        };
+        let needs_tag = dst["Flags"].as_u64().unwrap_or(0) & 0x0002_0000 != 0
+            && tx.fields.get("DestinationTag").is_none();
+
         // A token escrow locks the issued currency off the sender's trust
         // line, so its XRP only has to cover the fee.
         if let Some((leg, want)) = Self::iou_amount(tx) {
+            // No funding test precedes the tag test for a token escrow.
+            if needs_tag {
+                return TxResult::DstTagNeeded;
+            }
             let held = crate::tx::offer::available(sandbox, &tx.account, &leg);
             if crate::tx::offer::me_cmp(held, want).is_lt() {
                 return TxResult::UnfundedPayment;
@@ -169,6 +198,10 @@ impl Transactor for EscrowCreateTransactor {
         let total_needed = amount.saturating_add(tx.fee);
         if balance < total_needed {
             return TxResult::UnfundedPayment;
+        }
+        // XRP escrow: the funding test comes FIRST, then the tag test.
+        if needs_tag {
+            return TxResult::DstTagNeeded;
         }
 
         TxResult::Success
@@ -785,6 +818,12 @@ mod tests {
         let bob = [0x02u8; 20];
         let mut state = make_state();
         add_account(&mut state, &alice, 1_000_000, 1); // only 1 XRP
+        // The DESTINATION has to exist for this to be a funding test at all:
+        // `EscrowCreate::preclaim` reads it and returns tecNO_DST before any
+        // funding is considered (EscrowCreate.cpp:344-346). Without bob here
+        // the case asserted UnfundedPayment while rippled would say tecNO_DST,
+        // and it only passed because we had no destination check.
+        add_account(&mut state, &bob, 50_000_000, 1);
 
         let tx = TxFields {
             account: alice,

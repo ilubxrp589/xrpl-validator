@@ -549,6 +549,20 @@ impl Transactor for PaymentTransactor {
         };
         let dest_key = keylet::account_root_key(&dest);
         if !sandbox.exists(&dest_key) {
+            // rippled tests the AMOUNT TYPE first: a non-XRP payment cannot
+            // create an account at all, so it is tecNO_DST whatever its size
+            // (Payment.cpp:331-338). Only a NATIVE amount falls through to the
+            // reserve test (:351). `amount_drops` yields 0 for an IOU, so
+            // testing the reserve first turned every such payment into
+            // tecNO_DST_INSUF_XRP — #106143187 `FB93CF580435`.
+            if !tx.fields.get("Amount").map(|a| a.is_string()).unwrap_or(false) {
+                return TxResult::NoDst;
+            }
+            // ⚠ NOT modelled: `telNO_DST_PARTIAL` for a tfPartialPayment to a
+            // nonexistent account (:340-349). That is a `tel` code — NOT
+            // claimed, so the transaction would not appear in the ledger at
+            // all — and no failing ledger pins it. Adding it is a different
+            // class of change from this one.
             let reserve = Self::reserve_base(sandbox);
             let amount = Self::amount_drops(tx).unwrap_or(0);
             if amount < reserve {
