@@ -3306,6 +3306,41 @@ impl Transactor for OfferCreateTransactor {
 
         // Place the remainder at the taker's ORIGINAL quality (rippled
         // preserves the price for partial fills).
+        //
+        // ...and that has to hold for the AMOUNTS, not just the book page.
+        // Subtracting the fill actually delivered degrades the residual's price
+        // whenever the crossing filled BETTER than the offer's own quality —
+        // which is the normal case, since a taker crosses at the book's price,
+        // not at its own limit. The residual would then offer takers a better
+        // deal than its owner ever signed, sitting on a page (below, from
+        // `tp0`/`tg0`) whose quality its own ratio contradicts.
+        //
+        // rippled charges the offer at ITS OWN quality: the gets side falls by
+        // `paid * tg0/tp0`, not by the currency actually handed over.
+        // #105945386 7EF34E79F13A — 63 ShearPepe for 718602 drops, filled
+        // 182925 drops off the pool for 16.01209440508811 SPepe. We rested
+        // 63 - 16.01209440508811 = 46.98790559491189; mainnet rests
+        // 535677 * 63/718602 = 46.96292384379671, and 63 - 182925*63/718602 is
+        // the same number. Verified 16-digit exact on #105912454 FE592890B233
+        // too (1913.346495384532 vs our 1913.34664).
+        //
+        // Clamp only when our subtraction went the WRONG way: #105930662
+        // 40FB322EC16C's residual already comes out at or above its original
+        // quality and mainnet leaves it alone, so re-deriving unconditionally
+        // would move a case that is right today.
+        //
+        // ⚠ INVISIBLE TO THE GATE: the book page key is built from tp0/tg0, so
+        // a residual with the wrong amounts still lands on the correct page and
+        // every mutation-set leg stays green. This was found with DX_VALCHECK
+        // and its regression evidence is a value sweep, not a key sweep.
+        let rem_gets = {
+            let derived = me_muldiv(rem_pays, tg0, tp0, true);
+            if !me_is_zero(derived) && me_cmp(derived, rem_gets).is_lt() {
+                derived
+            } else {
+                rem_gets
+            }
+        };
         let seq = if tx.uses_ticket() { tx.ticket_seq.unwrap_or(0) } else { tx.sequence };
         let offer_key = keylet::offer_key(&tx.account, seq);
         let offer_obj = serde_json::json!({
