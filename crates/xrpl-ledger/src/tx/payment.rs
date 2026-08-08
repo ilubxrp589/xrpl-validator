@@ -121,9 +121,13 @@ impl PaymentTransactor {
         sandbox: &mut Sandbox,
         account: &[u8; 20],
         leg: &crate::tx::offer::Leg,
-        grant: u128,
+        grant: crate::tx::offer::Me,
     ) -> crate::tx::offer::Me {
         use crate::tx::offer as ox;
+        // The LIMITS must stay enormous however small the grant is: they bound
+        // what the trial may acquire, and sizing them to the grant would cap the
+        // very measurement we are taking.
+        const LIMIT: &str = "9999999999999999000000000000000000000000";
         // XRP hops need funding too — a path may ripple THROUGH XRP
         // (A -> XRP -> B), and leaving those unfunded made the trial consume
         // nothing, the requirement compute to zero, and the whole strand die.
@@ -134,11 +138,14 @@ impl PaymentTransactor {
             let Some(mut root) = ox::json_at(sandbox, &key) else {
                 return (0, 0);
             };
-            root["Balance"] = serde_json::json!(grant.to_string());
+            // Drops are integral, so an XRP grant is exact at any scale; round
+            // UP so a sub-drop grant still funds something rather than zero.
+            let drops = ox::me_rescale(grant, 0, true);
+            root["Balance"] = serde_json::json!(drops.to_string());
             ox::put_json(sandbox, key, &root);
-            return (grant, 0);
+            return (drops, 0);
         }
-        let big = grant.to_string();
+        let big = ox::me_to_value_string(grant);
         let BIG: &str = &big;
         let key = keylet::ripple_state_key(account, &leg.issuer, &leg.cur);
         let low = account < &leg.issuer;
@@ -159,13 +166,49 @@ impl PaymentTransactor {
                     "LedgerEntryType": "RippleState",
                     "Flags": 0u64,
                     "Balance": balance,
-                    "LowLimit": {"currency": cur, "issuer": hex::encode(lo), "value": BIG},
-                    "HighLimit": {"currency": cur, "issuer": hex::encode(hi), "value": BIG},
+                    "LowLimit": {"currency": cur, "issuer": hex::encode(lo), "value": LIMIT},
+                    "HighLimit": {"currency": cur, "issuer": hex::encode(hi), "value": LIMIT},
                 });
                 sandbox.write(key, serde_json::to_vec(&line).expect("serializing valid JSON Value"));
             }
         }
-        (grant, 0)
+        grant
+    }
+
+    /// One reverse-pass trial: fund `in_leg` with `grant`, ask the hop for
+    /// `want`, and report `(consumed, granted, remaining_want)`. Always leaves
+    /// the sandbox exactly as it found it.
+    #[allow(clippy::too_many_arguments)]
+    fn measure_hop(
+        tx: &TxFields,
+        in_leg: &crate::tx::offer::Leg,
+        out_leg: &crate::tx::offer::Leg,
+        want: crate::tx::offer::Me,
+        grant: crate::tx::offer::Me,
+        threshold: u64,
+        single_pass: bool,
+        amm_fib: Option<&crate::tx::offer::AmmFib>,
+        sandbox: &mut Sandbox,
+    ) -> (crate::tx::offer::Me, crate::tx::offer::Me, crate::tx::offer::Me) {
+        use crate::tx::offer as ox;
+        let snap = sandbox.snapshot();
+        let granted = Self::fund_for_trial(sandbox, &tx.account, in_leg, grant);
+        let before = Self::leg_signed_balance(sandbox, &tx.account, in_leg);
+        let mut trial_fib = amm_fib.cloned();
+        let (rw, _, _) = ox::cross_engine_to(
+            &tx.account, &tx.account, want, granted, out_leg, in_leg,
+            threshold, threshold, false, false, single_pass, trial_fib.as_mut(), None,
+            sandbox, &mut Vec::new(),
+        );
+        let consumed = match (before, Self::leg_signed_balance(sandbox, &tx.account, in_leg)) {
+            (Some((bneg, b)), Some((aneg, a))) => {
+                let (dneg, d) = ox::signed_add(bneg, b, !aneg, a); // before - after
+                if dneg { (0, 0) } else { d }
+            }
+            _ => (0, 0),
+        };
+        sandbox.restore_snapshot(snap);
+        (consumed, granted, rw)
     }
 
     /// rippled flows a strand in TWO passes: a REVERSE pass walking back from
@@ -225,24 +268,11 @@ impl PaymentTransactor {
             // keeps the delta within six orders of the grant and so leaves ~10
             // significant digits intact.
             let mut consumed = (0u128, 0i32);
-            for grant in [1_000_000u128, 1_000_000_000_000, 1_000_000_000_000_000_000] {
-                let snap = sandbox.snapshot();
-                let granted = Self::fund_for_trial(sandbox, &tx.account, in_leg, grant);
-                let before = Self::leg_signed_balance(sandbox, &tx.account, in_leg);
-                let mut trial_fib = amm_fib.cloned();
-                let (rw, _, _) = ox::cross_engine_to(
-                    &tx.account, &tx.account, need[i], granted, out_leg, in_leg,
-                    threshold, threshold, false, false, single_pass, trial_fib.as_mut(), None,
-                    sandbox, &mut Vec::new(),
+            for grant in [(1u128, 6i32), (1, 12), (1, 18)] {
+                let (c, granted, rw) = Self::measure_hop(
+                    tx, in_leg, out_leg, need[i], grant, threshold, single_pass, amm_fib, sandbox,
                 );
-                consumed = match (before, Self::leg_signed_balance(sandbox, &tx.account, in_leg)) {
-                    (Some((bneg, b)), Some((aneg, a))) => {
-                        let (dneg, d) = ox::signed_add(bneg, b, !aneg, a); // before - after
-                        if dneg { (0, 0) } else { d }
-                    }
-                    _ => (0, 0),
-                };
-                sandbox.restore_snapshot(snap);
+                consumed = c;
                 // Stop as soon as the GRANT was not the binding constraint —
                 // either the full requirement came out, or the trial left some
                 // of what it was given unspent, which means liquidity bound it
@@ -258,6 +288,31 @@ impl PaymentTransactor {
                 // drops) to feed a hop that only needed 15508.
                 if ox::me_is_zero(rw) || ox::me_cmp(consumed, granted).is_lt() {
                     break;
+                }
+            }
+            // The ladder's smallest rung is 1e6, which is many orders above a
+            // small requirement, and a balance carries only 16 SIGNIFICANT
+            // digits — so `consumed` comes back QUANTISED. #106148286
+            // 4EFC975484E1, a 4-leg mXRP->BitX->BTC->CORE chain of pools: the
+            // BTC hop measured (352, -9) = 3.52e-7 where the true figure is
+            // ~3.5228e-7. THREE significant digits. The hop before it then
+            // bought ~0.1% too little BitX and the chain delivered
+            // 2.299039039859 CORE against a DeliverMin of 2.300190679602067 —
+            // tecPATH_PARTIAL where mainnet does the whole 2.302493172774841 in
+            // ONE flow iteration.
+            //
+            // So re-measure once against a grant sized to the estimate, which
+            // puts the difference back inside the mantissa. Keep the refined
+            // figure only if that grant was NOT the binding constraint;
+            // otherwise the estimate was low and the ladder's answer stands.
+            // 8x is headroom for a quantised estimate that rounded DOWN.
+            if !ox::me_is_zero(consumed) {
+                let grant = ox::me_muldiv(consumed, (8, 0), (1, 0), true);
+                let (refined, granted, _) = Self::measure_hop(
+                    tx, in_leg, out_leg, need[i], grant, threshold, single_pass, amm_fib, sandbox,
+                );
+                if !ox::me_is_zero(refined) && ox::me_cmp(refined, granted).is_lt() {
+                    consumed = refined;
                 }
             }
             // A requirement we could not MEASURE is not a requirement of zero.
