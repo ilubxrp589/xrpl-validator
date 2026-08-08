@@ -2203,6 +2203,36 @@ thr={t:?} admits_trunc={} admits_up={}",
                         gets_in = reprice_a(xrp, me_muldiv(xrp, a_in_full, a_out_full, true), sandbox);
                     }
                 }
+                // A leg-B book maker can only deliver what it HOLDS. Leg A has
+                // clamped its maker to `available()` since the bridge was
+                // built (`a_gives` above); leg B took the offer's whole
+                // TakerPays as capacity and never consulted the maker at all —
+                // `live_head` tests funding only for ZERO, so an underfunded
+                // maker passed straight through at full size.
+                //
+                // #106146362 75511674AD58: `rwnJpjMn18m7xd` holds
+                // 0.64751384169623 RLUSD and rests TWO offers against it —
+                // F5B677B8C8 for 9.328507 and 66B29DEB for 12.735909. We drove
+                // the whole 1 RLUSD through F5B677B8C8 and wrote its owner's
+                // trust line to **-0.35248615830377**: a non-issuer minting
+                // 0.35 RLUSD it never had. rippled's iteration 0 delivers
+                // exactly 0.64751384169623 — the balance to the last digit.
+                //
+                // Clamping here rather than in `b_cap_xrp` above lands the fill
+                // ON the funded amount instead of on whatever the XRP-side
+                // conversion rounds to, and it reuses the same re-derivation
+                // the `out_cap` clamp does. The loop then re-enters, `live_head`
+                // finds the maker at zero and reaps BOTH offers — which is
+                // rippled's `Removing became unfunded offer 66B29DEB` — and
+                // walks on to the next maker's offer for the remainder.
+                if let Some((_, _, _, bmaker, _, _)) = &b_book {
+                    let funded = available(sandbox, bmaker, pays_leg);
+                    if me_cmp(pays_out, funded).is_gt() {
+                        pays_out = funded;
+                        xrp = unreprice_b(pays_out, me_muldiv(pays_out, b_in_full, b_out_full, true), sandbox);
+                        gets_in = reprice_a(xrp, me_muldiv(xrp, a_in_full, a_out_full, true), sandbox);
+                    }
+                }
                 let xrp = (me_rescale(xrp, 0, false), 0);
                 if std::env::var("DX_BRIDGE").is_ok() {
                     eprintln!("DX_BRIDGE slice xrp={xrp:?} gets_in={gets_in:?} pays_out={pays_out:?} a_amm={a_use_amm} b_amm={b_use_amm} rem_g={rem_gets:?} rem_p={rem_pays:?}");
@@ -4715,6 +4745,109 @@ mod tests {
     /// thr=1890192915687964e-12, so one AMM slice crossed and the next
     /// iteration broke — 7 extra mutations, nothing missing, where mainnet
     /// moved no value and simply rested the offer.
+    /// A leg-B book maker can only deliver what it HOLDS.
+    ///
+    /// Leg A has clamped its maker to `available()` since the bridge was built;
+    /// leg B took the offer's whole TakerPays as capacity and never consulted
+    /// the maker, because `live_head` tests funding only for ZERO. An
+    /// underfunded maker therefore passed straight through at full size and its
+    /// trust line went NEGATIVE — a non-issuer minting the currency.
+    ///
+    /// #106146362 75511674AD58 is the live case: `rwnJpjMn18m7xd` holds
+    /// 0.64751384169623 RLUSD and rests TWO offers against it (9.328507 and
+    /// 12.735909). We drove a whole 1 RLUSD through the first and wrote that
+    /// line to -0.35248615830377; rippled delivers exactly the balance, then
+    /// logs `Removing became unfunded offer` for the second and walks on.
+    ///
+    /// ★ The differential probe compares mutation KEYS, so it reported this as
+    /// "5 missing nodes" — the minting itself was invisible to it. That is why
+    /// this assertion is on the VALUE.
+    #[test]
+    fn a_bridge_leg_b_maker_cannot_deliver_more_than_it_holds() {
+        let taker = [0x01u8; 20];
+        let iss_a = [0x02u8; 20];
+        let iss_b = [0x03u8; 20];
+        let mk_a = [0x04u8; 20];
+        let mk_b = [0x05u8; 20];
+        let (mut ca, mut cb) = ([0u8; 20], [0u8; 20]);
+        ca[12..15].copy_from_slice(b"AAA");
+        cb[12..15].copy_from_slice(b"BBB");
+
+        let mut state = make_state_with_account(&taker, 500_000_000);
+        for id in [&iss_a, &iss_b, &mk_a, &mk_b] {
+            let a = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": hex::encode(id),
+                "Balance": "500000000", "Sequence": 1, "OwnerCount": 0,
+            });
+            state.state_map.insert(keylet::account_root_key(id), serde_json::to_vec(&a).unwrap()).unwrap();
+        }
+        let mut line = |who: &[u8; 20], iss: &[u8; 20], cur: &[u8; 20], bal: &str| {
+            let (lo, hi) = if who < iss { (*who, *iss) } else { (*iss, *who) };
+            let v = serde_json::json!({
+                "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+                "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000",
+                            "value": if who < iss { bal.to_string() } else { format!("-{bal}") }},
+                "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000000"},
+                "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000000"},
+            });
+            state.state_map.insert(keylet::ripple_state_key(who, iss, cur), serde_json::to_vec(&v).unwrap()).unwrap();
+        };
+        line(&taker, &iss_a, &ca, "1000"); // the taker's AAA to sell
+        line(&taker, &iss_b, &cb, "0");    // and where it receives BBB
+        line(&mk_a, &iss_a, &ca, "0");     // leg A maker can receive AAA
+        // ★ leg B's maker rests an offer for 10 BBB while holding only 3.
+        line(&mk_b, &iss_b, &cb, "3");
+
+        // Leg A: mk_a gives 10 XRP for 5 AAA. Leg B: mk_b gives 10 BBB for
+        // 5 XRP. Composed that is 0.25 AAA/BBB, well inside the taker's limit
+        // of 2, so nothing here is decided by the quality judge.
+        for (who, seq, pays, gets) in [
+            (mk_a, 2u32, serde_json::json!({"currency":"AAA","issuer":hex::encode(iss_a),"value":"5"}),
+                        serde_json::json!("10000000")),
+            (mk_b, 2u32, serde_json::json!("5000000"),
+                        serde_json::json!({"currency":"BBB","issuer":hex::encode(iss_b),"value":"10"})),
+        ] {
+            let mut sandbox = Sandbox::new(&state);
+            let tx = TxFields {
+                account: who, tx_type: "OfferCreate".to_string(), fee: 12, sequence: seq,
+                ticket_seq: None, last_ledger_seq: None,
+                fields: serde_json::json!({"TakerPays": pays, "TakerGets": gets}),
+            };
+            assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+            let mods = sandbox.into_modifications();
+            apply_modifications(&mut state, mods).unwrap();
+        }
+
+        // Sell 10 AAA for 5 BBB. Leg B can only fund 3 of those 5.
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: taker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 9,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "TakerGets": {"currency": "AAA", "issuer": hex::encode(iss_a), "value": "10"},
+                "TakerPays": {"currency": "BBB", "issuer": hex::encode(iss_b), "value": "5"},
+            }),
+        };
+        assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+
+        let bal = |sb: &Sandbox, who: &[u8; 20], iss: &[u8; 20], cur: &[u8; 20]| -> f64 {
+            json_at(sb, &keylet::ripple_state_key(who, iss, cur))
+                .and_then(|v| v["Balance"]["value"].as_str().and_then(|s| s.parse::<f64>().ok()))
+                .unwrap_or(0.0)
+                .abs()
+        };
+        let maker_left = bal(&sandbox, &mk_b, &iss_b, &cb);
+        let taker_got = bal(&sandbox, &taker, &iss_b, &cb);
+        assert!(
+            maker_left < 1e-9,
+            "the leg B maker must be drained to zero, never past it: {maker_left}",
+        );
+        assert!(
+            taker_got <= 3.0 + 1e-9,
+            "the taker cannot receive more BBB than the maker held (3): got {taker_got}",
+        );
+    }
+
     #[test]
     fn a_bridge_leg_with_a_pool_but_no_book_carries_nothing() {
         let taker = [0x01u8; 20];
