@@ -961,7 +961,33 @@ impl PaymentTransactor {
         // SENDER: each hop credits the sender and the next debits the exact
         // same amount, so the net-zero line drops out of the mutation set —
         // matching rippled, which never materializes it.
+        const TF_NO_RIPPLE_DIRECT: u64 = 0x0001_0000;
+        let no_direct =
+            tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & TF_NO_RIPPLE_DIRECT != 0;
         let hops = Self::path_hops(tx);
+        // `path_hops` returns None for a path we cannot model — an account
+        // element that ripples through a THIRD PARTY rather than re-anchoring on
+        // the previous leg's issuer. The fallback below then treats None exactly
+        // like "no Paths at all" and walks the single default book.
+        //
+        // That is a harmless under-approximation while the default path is in
+        // play, because rippled builds it alongside the named ones anyway. Under
+        // tfNoRippleDirect it is not: the flag SUPPRESSES the default path, so
+        // the strands named in Paths are the only ones that exist, and falling
+        // back substitutes precisely the strand the flag forbids.
+        //
+        // #106146562 C56D61917E4B: circular tfPartialPayment|tfNoRippleDirect,
+        // SendMax 348.6072850702524 RPR for 816316 drops, Paths naming two
+        // account hops that hold NO RPR line at all (`account_lines` at
+        // #106146561 against the issuer returns nothing for either). Mainnet is
+        // tecPATH_DRY, fee only. We ignored the path, crossed the RPR->XRP book
+        // against an offer created earlier in the SAME ledger, and returned
+        // tesSUCCESS with 3 extra nodes — all belonging to a maker the path
+        // never names.
+        if no_direct && hops.is_none() {
+            sandbox.restore_snapshot(snap);
+            return TxResult::PathDry;
+        }
         // The delivered IOU is re-issued to the destination by the strand's
         // last step, which charges the issuer's TransferRate (see below), so
         // the books must be worked for `Amount × rate` GROSS for the
@@ -1011,7 +1037,6 @@ impl PaymentTransactor {
         // strand happens to be better and the other would never run at all.
         // That is what `single_pass` buys — one quality level per book step,
         // matching what one `flow()` call does for a strand.
-        const TF_NO_RIPPLE_DIRECT: u64 = 0x0001_0000;
         let mut chain: Vec<&ox::Leg> = std::iter::once(&spend_leg)
             .chain(hops.iter())
             .chain(std::iter::once(&want_leg))
@@ -1025,8 +1050,6 @@ impl PaymentTransactor {
         if chain.len() < 2 {
             chain = vec![&spend_leg, &want_leg];
         }
-        let no_direct =
-            tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & TF_NO_RIPPLE_DIRECT != 0;
         let mut strands: Vec<Vec<&ox::Leg>> = Vec::new();
         if !no_direct && chain.len() > 2 {
             strands.push(vec![&spend_leg, &want_leg]);
