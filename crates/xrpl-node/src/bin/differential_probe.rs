@@ -835,41 +835,61 @@ fn load_payment_books(
             _ => None,
         }
     };
-    let mut chain: Vec<Value> = Vec::new();
+    // ONE CHAIN PER NAMED PATH. This built its chain from `paths.first()`
+    // alone, mirroring the engine's own old limitation — so once the engine
+    // started flowing a strand per path, every strand past the first replayed
+    // against a pre-state that had no book and no POOL for its hops, and read
+    // as dry no matter what the engine did.
+    //
+    // #106156904 341030105165: SendMax 7.203546 USDT for 0.095 SOL over six
+    // paths. Mainnet routes path 2, USDT->XRPS->SOL, and both hops are AMM
+    // POOLS (rLxvTCgtXMdA fee 204, rK7EaS5bTdZc fee 402) — which is why its
+    // meta carries seven RippleStates and not one Offer. Neither pool was
+    // hydrated, `amm_swap::discover` returned None, and DX_AMM printed nothing
+    // at all for the transaction.
+    let mut chains: Vec<Vec<Value>> = Vec::new();
     match txj["TransactionType"].as_str() {
         Some("Payment") => {
             let Some(sm) = txj.get("SendMax") else { return };
             let (Some(s), Some(w)) = (spec(sm), spec(&txj["Amount"])) else { return };
-            chain.push(s);
-            for el in txj["Paths"].as_array()
-                .and_then(|p| p.first())
-                .and_then(|p| p.as_array())
-                .into_iter()
-                .flatten()
-            {
-                let Some(cur) = el.get("currency") else { continue };
-                if cur == "XRP" {
-                    chain.push(json!({"currency": "XRP"}));
-                } else if let Some(iss) = el.get("issuer") {
-                    chain.push(json!({"currency": cur.clone(), "issuer": iss.clone()}));
+            let paths = txj["Paths"].as_array().filter(|p| !p.is_empty());
+            match paths {
+                Some(ps) => {
+                    for p in ps.iter().filter_map(|p| p.as_array()) {
+                        let mut chain = vec![s.clone()];
+                        for el in p {
+                            let Some(cur) = el.get("currency") else { continue };
+                            if cur == "XRP" {
+                                chain.push(json!({"currency": "XRP"}));
+                            } else if let Some(iss) = el.get("issuer") {
+                                chain.push(json!({"currency": cur.clone(), "issuer": iss.clone()}));
+                            }
+                        }
+                        chain.push(w.clone());
+                        chains.push(chain);
+                    }
                 }
+                None => chains.push(vec![s, w]),
             }
-            chain.push(w);
         }
         Some("OfferCreate") => {
             let (Some(s), Some(w)) = (spec(&txj["TakerGets"]), spec(&txj["TakerPays"])) else { return };
-            chain.push(s);
-            chain.push(w);
+            chains.push(vec![s, w]);
         }
         _ => return,
     }
-    for pair in chain.windows(2) {
-        load_book_pair(state, url, &pair[0], &pair[1], ledger_index, books_seen);
-        // IOU↔IOU pairs can autobridge through XRP — preload both bridge books.
-        let xrp = json!({"currency": "XRP"});
-        if pair[0] != xrp && pair[1] != xrp {
-            load_book_pair(state, url, &pair[0], &xrp, ledger_index, books_seen);
-            load_book_pair(state, url, &xrp, &pair[1], ledger_index, books_seen);
+    // `books_seen` dedups across chains, so paths that share a hop pair — and
+    // they usually do, every one of #106156904's six ends in SOL — cost one
+    // load between them, not one each.
+    for chain in &chains {
+        for pair in chain.windows(2) {
+            load_book_pair(state, url, &pair[0], &pair[1], ledger_index, books_seen);
+            // IOU↔IOU pairs can autobridge through XRP — preload both bridge books.
+            let xrp = json!({"currency": "XRP"});
+            if pair[0] != xrp && pair[1] != xrp {
+                load_book_pair(state, url, &pair[0], &xrp, ledger_index, books_seen);
+                load_book_pair(state, url, &xrp, &pair[1], ledger_index, books_seen);
+            }
         }
     }
 }

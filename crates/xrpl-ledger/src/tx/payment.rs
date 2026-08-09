@@ -36,17 +36,34 @@ impl PaymentTransactor {
         Some(arr)
     }
 
-    /// Intermediate book-hop legs from the FIRST path. `Some(vec![])` means
-    /// no usable hops; `None` means the path uses account elements (rippling)
-    /// we can't model — the caller falls back to the single-book cross.
-    fn path_hops(tx: &TxFields) -> Option<Vec<crate::tx::offer::Leg>> {
-        let els = tx
-            .fields
-            .get("Paths")
-            .and_then(|p| p.as_array())
-            .and_then(|paths| paths.first())
-            .and_then(|p| p.as_array());
-        let Some(els) = els else { return Some(Vec::new()) };
+    /// Every path in `Paths` we can model, in order, as its intermediate
+    /// book-hop legs — plus how many paths the transaction actually carried, so
+    /// the caller can tell "no paths" from "paths we could model none of".
+    ///
+    /// rippled builds a STRAND PER PATH and flows them together
+    /// (`Flow.cpp`/`toStrands`); we took `paths.first()` and nothing else.
+    /// #106156904 341030105165 is what that cost: SendMax 7.203546 USDT for
+    /// 0.095 SOL over SIX paths — `[SOL]`, `[XRP,SOL]`, `[XRPS,SOL]`,
+    /// `[XAG,SOL]`, `[XRPS,XAG,SOL]`, `[XAG,XRPS,SOL]`. Path 0 is the direct
+    /// USDT→SOL book and it is dry, so we returned tecPATH_DRY with one
+    /// mutation while mainnet routed path 2 (USDT→XRPS→SOL) for seven.
+    fn path_chains(tx: &TxFields) -> (Vec<Vec<crate::tx::offer::Leg>>, usize) {
+        let Some(paths) = tx.fields.get("Paths").and_then(|p| p.as_array()) else {
+            // No `Paths` at all: one empty chain, i.e. the plain direct cross.
+            return (vec![Vec::new()], 0);
+        };
+        let chains = paths
+            .iter()
+            .filter_map(|p| p.as_array())
+            .filter_map(|els| Self::path_legs(els))
+            .collect();
+        (chains, paths.len())
+    }
+
+    /// Intermediate book-hop legs for ONE path. `Some(vec![])` means no usable
+    /// hops; `None` means the path uses account elements (rippling through a
+    /// third party) we can't model, and that path is dropped.
+    fn path_legs(els: &[serde_json::Value]) -> Option<Vec<crate::tx::offer::Leg>> {
         let mut legs: Vec<crate::tx::offer::Leg> = Vec::new();
         for el in els {
             let t = el.get("type").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -358,6 +375,22 @@ impl PaymentTransactor {
         if n == 0 {
             return ((0, 0), (0, 0));
         }
+        // tfLimitQuality's threshold is the PAYMENT's — SendMax per Amount. On a
+        // one-hop chain that IS the hop's own pair, and gating it is right. On a
+        // multi-hop chain it is a different unit per hop, and comparing them is
+        // a category error.
+        //
+        // #106156904 341030105165: SendMax 7.203546 USDT for 0.095 SOL sets the
+        // limit at 75.83 USDT/SOL. Mainnet routes USDT→XRPS→SOL, whose second
+        // hop prices at 319630 XRPS per SOL — we gated that against 75.83 and
+        // it lost by 4215x, so EVERY chain's last hop into SOL carried zero and
+        // the payment read tecPATH_DRY. The pool was there; the ruler was wrong.
+        //
+        // rippled never gates a payment's BookStep on limitQuality. It carries
+        // the limit at STRAND level and judges the pass end-to-end
+        // ("Path rejected by limitQuality", StrandFlow.h:698) — which the round
+        // loop in `apply_path_payment` now does.
+        let hop_thr = if n > 1 { u64::MAX } else { threshold };
         let (spend_leg, want_leg) = (chain[0], chain[n]);
         let same = |a: &ox::Leg, b: &ox::Leg| a.xrp == b.xrp && a.cur == b.cur && a.issuer == b.issuer;
         let mut inflight: Vec<_> = Vec::new();
@@ -404,7 +437,7 @@ impl PaymentTransactor {
         // SendMax — the divergence was never overspending per se, it was
         // spending it all at once and losing the five passes that follow.
         let need =
-            Self::reverse_requirements(tx, chain, want_out, threshold, single_pass, amm_fib.as_deref(), sandbox);
+            Self::reverse_requirements(tx, chain, want_out, hop_thr, single_pass, amm_fib.as_deref(), sandbox);
         let spend_before = Self::leg_signed_balance(sandbox, &tx.account, spend_leg);
         let mut carry = avail_in;
         for i in 0..n {
@@ -425,7 +458,7 @@ impl PaymentTransactor {
                 .flatten();
             let (rw, _rs, _c) = ox::cross_engine_to(
                 &tx.account, benef, want_cap, carry, chain[i + 1], chain[i],
-                threshold, threshold, false, false, single_pass, amm_fib.as_deref_mut(), None,
+                hop_thr, hop_thr, false, false, single_pass, amm_fib.as_deref_mut(), None,
                 sandbox, &mut Vec::new(),
             );
             carry = match (before, Self::leg_signed_balance(sandbox, &tx.account, out_leg)) {
@@ -1019,11 +1052,12 @@ impl PaymentTransactor {
         const TF_NO_RIPPLE_DIRECT: u64 = 0x0001_0000;
         let no_direct =
             tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & TF_NO_RIPPLE_DIRECT != 0;
-        let hops = Self::path_hops(tx);
-        // `path_hops` returns None for a path we cannot model — an account
+        let (path_chains, named_paths) = Self::path_chains(tx);
+        // `path_legs` drops a path we cannot model — an account
         // element that ripples through a THIRD PARTY rather than re-anchoring on
-        // the previous leg's issuer. The fallback below then treats None exactly
-        // like "no Paths at all" and walks the single default book.
+        // the previous leg's issuer. With every named path dropped the fallback
+        // below behaves exactly like "no Paths at all" and walks the single
+        // default book.
         //
         // That is a harmless under-approximation while the default path is in
         // play, because rippled builds it alongside the named ones anyway. Under
@@ -1039,7 +1073,7 @@ impl PaymentTransactor {
         // against an offer created earlier in the SAME ledger, and returned
         // tesSUCCESS with 3 extra nodes — all belonging to a maker the path
         // never names.
-        if no_direct && hops.is_none() {
+        if no_direct && named_paths > 0 && path_chains.is_empty() {
             sandbox.restore_snapshot(snap);
             return TxResult::PathDry;
         }
@@ -1063,8 +1097,14 @@ impl PaymentTransactor {
         // trust line rippled never creates (and when the destination is the
         // issuer, the IOU is redeemed, not held).
         if std::env::var("DX_PAY").is_ok() {
-            eprintln!("DX_PAY hops={:?} spend0={spend0:?} want_gross={want_gross:?} partial={partial}",
-                hops.as_ref().map(|h| h.iter().map(|l| if l.xrp { "XRP".to_string() } else { hex::encode_upper(&l.cur[12..15]) }).collect::<Vec<_>>()));
+            let shape = |c: &Vec<ox::Leg>| {
+                c.iter()
+                    .map(|l| if l.xrp { "XRP".to_string() } else { hex::encode_upper(&l.cur[12..15]) })
+                    .collect::<Vec<_>>()
+                    .join(">")
+            };
+            eprintln!("DX_PAY named={named_paths} modelled={:?} spend0={spend0:?} want_gross={want_gross:?} partial={partial}",
+                path_chains.iter().map(shape).collect::<Vec<_>>());
         }
         // One code path for both shapes. With no usable hops the chain is just
         // [spend, want] and the walk below runs exactly one hop against
@@ -1072,8 +1112,6 @@ impl PaymentTransactor {
         // used to do. Unifying them is the groundwork for iterating STRANDS:
         // rippled always builds the default path alongside the ones named in
         // Paths and splits the delivery across them (StrandFlow.h:682-805).
-        let no_hops: Vec<ox::Leg> = Vec::new();
-        let hops = hops.as_ref().filter(|h| !h.is_empty()).unwrap_or(&no_hops);
         // rippled ALWAYS builds the DEFAULT path alongside the ones named in
         // Paths (unless tfNoRippleDirect) and splits the delivery across the
         // strands, applying the best-quality PASS each round and re-evaluating
@@ -1092,28 +1130,59 @@ impl PaymentTransactor {
         // strand happens to be better and the other would never run at all.
         // That is what `single_pass` buys — one quality level per book step,
         // matching what one `flow()` call does for a strand.
-        let mut chain: Vec<&ox::Leg> = std::iter::once(&spend_leg)
-            .chain(hops.iter())
-            .chain(std::iter::once(&want_leg))
-            .collect();
-        // A path may name an endpoint currency as a "hop" (e.g. deliver RLUSD
-        // via [RLUSD-book, issuer]): same-leg neighbours are a zero-length book
-        // — collapse them...
-        chain.dedup_by(|a, b| a.xrp == b.xrp && a.cur == b.cur && a.issuer == b.issuer);
-        // ...but a same-currency send/receive must still walk one book rather
-        // than collapse to nothing.
-        if chain.len() < 2 {
-            chain = vec![&spend_leg, &want_leg];
-        }
+        // ONE STRAND PER NAMED PATH, in `Paths` order — rippled's `toStrands`
+        // builds a strand for each and `flow()` runs them together. We used to
+        // build exactly one, from `paths.first()`.
+        let same = |a: &ox::Leg, b: &ox::Leg| a.xrp == b.xrp && a.cur == b.cur && a.issuer == b.issuer;
         let mut strands: Vec<Vec<&ox::Leg>> = Vec::new();
-        if !no_direct && chain.len() > 2 {
+        let mut have_direct = false;
+        for hops in &path_chains {
+            let mut chain: Vec<&ox::Leg> = std::iter::once(&spend_leg)
+                .chain(hops.iter())
+                .chain(std::iter::once(&want_leg))
+                .collect();
+            // A path may name an endpoint currency as a "hop" (e.g. deliver
+            // RLUSD via [RLUSD-book, issuer]): same-leg neighbours are a
+            // zero-length book — collapse them...
+            chain.dedup_by(|a, b| a.xrp == b.xrp && a.cur == b.cur && a.issuer == b.issuer);
+            // ...but a same-currency send/receive must still walk one book
+            // rather than collapse to nothing.
+            if chain.len() < 2 {
+                chain = vec![&spend_leg, &want_leg];
+            }
+            // A named path that collapses to [spend, want] IS the default path,
+            // so the block below must not add it a second time. #106156904's
+            // path 0 is exactly that: a bare [SOL] element on a USDT->SOL
+            // payment.
+            if chain.len() == 2 {
+                have_direct = true;
+            }
+            // Two named paths can also collapse onto each other once the
+            // endpoint dedup above runs. Flowing the same chain twice would let
+            // it compete with itself in the round-robin and double-count its
+            // liquidity.
+            let dup = strands
+                .iter()
+                .any(|s| s.len() == chain.len() && s.iter().zip(&chain).all(|(a, b)| same(a, b)));
+            if !dup {
+                strands.push(chain);
+            }
+        }
+        if !no_direct && !have_direct {
+            strands.insert(0, vec![&spend_leg, &want_leg]);
+        }
+        // Every named path was unmodellable and the default is suppressed —
+        // guarded above for tfNoRippleDirect, so this is the no-Paths shape.
+        if strands.is_empty() {
             strands.push(vec![&spend_leg, &want_leg]);
         }
-        strands.push(chain);
         // One strand is the old behaviour exactly: walk the whole book in a
         // single call, no trial run, no second round that can find anything.
         let multi = strands.len() > 1;
 
+        // The payment-wide limitQuality as an Me, for the strand judge below.
+        // `None` when tfLimitQuality is unset, which is the common case.
+        let thr_me = (threshold != u64::MAX).then(|| ox::rate_me(threshold));
         let mut rem_in = spend0;
         let mut rem_out = want_gross;
         let mut delivered: ox::Me = (0, 0);
@@ -1180,6 +1249,7 @@ impl PaymentTransactor {
             } else {
                 0
             };
+            let round_snap = sandbox.snapshot();
             let (sin, sout) = Self::strand_pass(
                 tx, dest, &strands[pick], rem_in, rem_out, threshold, multi,
                 multi_now.then(|| &mut amm_fib), sandbox,
@@ -1188,7 +1258,24 @@ impl PaymentTransactor {
                 eprintln!("DX_PAY round={_round} strand={pick} sin={sin:?} sout={sout:?} rem_in={rem_in:?} rem_out={rem_out:?} multi={multi}");
             }
             if ox::me_is_zero(sout) {
+                sandbox.restore_snapshot(round_snap);
                 break;
+            }
+            // tfLimitQuality at STRAND level, where rippled keeps it. The hops
+            // are no longer gated individually (see `hop_thr` in `strand_pass`
+            // — their units are not the payment's), so the limit is enforced on
+            // what the pass REALISED end to end, and a pass that misses it is
+            // rolled back whole. That is rippled's "Path rejected by
+            // limitQuality" (StrandFlow.h:698).
+            if let Some(t) = thr_me {
+                let q = ox::me_muldiv(sin, (1_000_000_000_000_000, -15), sout, false);
+                if ox::me_cmp(q, t).is_gt() {
+                    if std::env::var("DX_PAY").is_ok() {
+                        eprintln!("DX_PAY   strand={pick} REJECTED by limitQuality q={q:?} thr={t:?}");
+                    }
+                    sandbox.restore_snapshot(round_snap);
+                    break;
+                }
             }
             rem_in = ox::me_sub(rem_in, sin);
             rem_out = ox::me_sub(rem_out, sout);

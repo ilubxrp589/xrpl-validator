@@ -988,7 +988,7 @@ fn book_offer_ladder(sandbox: &Sandbox, base: &Hash256, cap: usize) -> Vec<(u64,
 }
 
 /// Decode a u64-encoded rate into (mantissa, exponent).
-fn rate_me(q: u64) -> Me {
+pub(crate) fn rate_me(q: u64) -> Me {
     ((q & 0x00FF_FFFF_FFFF_FFFF) as u128, ((q >> 56) as i32) - 100)
 }
 
