@@ -114,6 +114,9 @@ fn run() -> i32 {
 
     let mut expected_outcomes: HashMap<String, String> = HashMap::new();
     let mut expected_mutations: HashMap<String, Vec<(String, u8)>> = HashMap::new();
+    // Mainnet's FinalFields per node, for DX_VALCHECK on the oracle leg. The
+    // mutation map above deliberately drops them — it only ever compared keys.
+    let mut expected_fields: HashMap<String, HashMap<String, serde_json::Value>> = HashMap::new();
     let Some(txmap) = exp["txs"].as_object() else {
         eprintln!("expected json missing txs");
         return 2;
@@ -132,6 +135,19 @@ fn run() -> i32 {
             .unwrap_or_default();
         if !nodes.is_empty() {
             expected_mutations.insert(hash.clone(), nodes);
+        }
+        if let Some(arr) = v["nodes"].as_array() {
+            let f: HashMap<String, serde_json::Value> = arr
+                .iter()
+                .filter_map(|n| {
+                    let k = n[0].as_str()?.to_string();
+                    let fields = n.get(2)?;
+                    fields.is_object().then(|| (k, fields.clone()))
+                })
+                .collect();
+            if !f.is_empty() {
+                expected_fields.insert(hash.clone(), f);
+            }
         }
     }
 
@@ -165,6 +181,7 @@ fn run() -> i32 {
         Some(&expected_outcomes),
         None,
         Some(&expected_mutations),
+        Some(&expected_fields),
         &net,
     );
 

@@ -56,7 +56,7 @@ pub struct OfferBooks {
 /// Read a serialized field header. Returns (type_code, field_code,
 /// bytes_consumed). Mirrors `engine::read_field_header` (kept local so this
 /// module stays self-contained and offline-testable).
-fn read_field_header(data: &[u8], pos: usize) -> Option<(u8, u8, usize)> {
+pub(crate) fn read_field_header(data: &[u8], pos: usize) -> Option<(u8, u8, usize)> {
     if pos >= data.len() {
         return None;
     }

@@ -2020,6 +2020,72 @@ pub fn mutation_kind_byte(k: &xrpl_ffi::MutationKind) -> u8 {
 /// *origNode`) while libxrpl still emits them via rawReplace. Only this
 /// diagnostic set is filtered — `outcome.mutations` and overlay threading
 /// are untouched. A Modified with no captured pre-state is kept.
+/// One serialized AMOUNT field body as a signed decimal.
+///
+/// XRP is 8 bytes, bit 63 clear, bit 62 the sign. An IOU is 48 bytes: bit 63
+/// set, bit 62 the sign, bits 54-61 the exponent offset by 97, bits 0-53 the
+/// mantissa. Zero is the canonical 0x8000000000000000 and falls out as 0.0.
+fn amount_value(b: &[u8]) -> Option<f64> {
+    match b.len() {
+        8 => {
+            let raw = u64::from_be_bytes(b.try_into().ok()?);
+            let drops = (raw & 0x3FFF_FFFF_FFFF_FFFF) as f64;
+            Some(if raw & 0x4000_0000_0000_0000 != 0 { drops } else { -drops })
+        }
+        48 => {
+            let raw = u64::from_be_bytes(b[..8].try_into().ok()?);
+            if raw & 0x8000_0000_0000_0000 == 0 {
+                return None;
+            }
+            let mant = (raw & 0x003F_FFFF_FFFF_FFFF) as f64;
+            if mant == 0.0 {
+                return Some(0.0);
+            }
+            let exp = ((raw >> 54) & 0xFF) as i32 - 97;
+            let sign = if raw & 0x4000_0000_0000_0000 != 0 { 1.0 } else { -1.0 };
+            Some(sign * mant * 10f64.powi(exp))
+        }
+        _ => None,
+    }
+}
+
+/// Every AMOUNT field in a serialized SLE, as (field code, value).
+///
+/// Canonical field order sorts by type code, so every type-6 field precedes
+/// the first VL-encoded one (type >= 7) — which means a walk that skips only
+/// the fixed-width types ahead of it reads ALL of them and can stop dead at
+/// the first VL field. `offer_books::scan_two_amounts` leans on the same
+/// property. Field codes that matter here: 2 Balance, 4 TakerPays, 5 TakerGets.
+fn sle_amounts(sle: &[u8]) -> Vec<(u8, f64)> {
+    use crate::offer_books::read_field_header;
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos < sle.len() {
+        let Some((ty, field, hl)) = read_field_header(sle, pos) else { break };
+        pos += hl;
+        match ty {
+            1 => pos += 2,
+            2 => pos += 4,
+            3 => pos += 8,
+            4 => pos += 16,
+            5 => pos += 32,
+            6 => {
+                let len = if pos < sle.len() && sle[pos] & 0x80 == 0 { 8 } else { 48 };
+                if pos + len > sle.len() {
+                    break;
+                }
+                if let Some(v) = amount_value(&sle[pos..pos + len]) {
+                    out.push((field, v));
+                }
+                pos += len;
+            }
+            // type >= 7 is VL-encoded and every amount is already behind us.
+            _ => break,
+        }
+    }
+    out
+}
+
 pub fn build_ours_mutation_set(
     mutations: &[xrpl_ffi::SleMutation],
     pre_state_for_modified: &std::collections::HashMap<[u8; 32], Vec<u8>>,
@@ -2084,7 +2150,7 @@ pub fn apply_ledger_in_order(
         stats, txs_in_order, ledger_seq, rpc_urls, amendments, parent_hash,
         parent_close_time, total_drops, divergence_log, db_snapshot,
         silent_divergence_log, expected_outcomes, mutation_divergence_log,
-        expected_mutations, &NetParams::default(),
+        expected_mutations, None, &NetParams::default(),
     )
 }
 
@@ -2104,6 +2170,11 @@ pub fn apply_ledger_in_order_with_net(
     expected_outcomes: Option<&std::collections::HashMap<String, String>>,
     mutation_divergence_log: Option<&DivergenceLog>,
     expected_mutations: Option<&std::collections::HashMap<String, Vec<(String, u8)>>>,
+    // DX_VALCHECK for the ORACLE leg: tx hash -> node key -> mainnet FinalFields.
+    // Lets the value comparison run against what libxrpl itself produced, which
+    // is the only way to tell an engine defect from a pre-state one at value
+    // level. `None` everywhere except parity_probe.
+    expected_fields: Option<&std::collections::HashMap<String, std::collections::HashMap<String, serde_json::Value>>>,
     net: &NetParams,
 ) -> LedgerOverlay {
     let fallback = RpcProvider::with_endpoints(rpc_urls.to_vec(), ledger_seq.saturating_sub(1));
@@ -2615,6 +2686,57 @@ pub fn apply_ledger_in_order_with_net(
         // affected nodes (cross-account paths, ticket count, etc.). Only run
         // when our outcome was tesSUCCESS or tec* AND network's TER matches
         // ours (otherwise the silent/regular checks above already flagged it).
+        // DX_VALCHECK ON THE ORACLE. The mutation check below compares KEYS,
+        // and so does the whole parity verdict — a `PROBE: CLEAN` says libxrpl
+        // touched the same objects mainnet did, never that it wrote the same
+        // NUMBERS. #105945386 7EF34E79F13A is 36/36 CLEAN with its rested offer
+        // 0.025 ShearPepe off, and the native probe's own DX_VALCHECK could not
+        // say whose fault that was, because it had nothing to compare libxrpl
+        // against.
+        //
+        // This closes that: it reads the AMOUNTS out of the SLEs libxrpl
+        // ACTUALLY PRODUCED and diffs them against mainnet's FinalFields. The
+        // oracle rule finally works at value level —
+        //   libxrpl == mainnet, we differ  ⇒ OUR ENGINE
+        //   libxrpl != mainnet             ⇒ pre-state / harness / version
+        // which is the verdict every one of the 175 value hits is waiting on.
+        if let (Ok(spec), Some(fmap)) = (std::env::var("DX_VALCHECK"), expected_fields) {
+            let tol: f64 = if spec == "1" { 1e-12 } else { spec.parse().unwrap_or(1e-12) };
+            if let Some(nodes) = fmap.get(&tx_hash) {
+                let amt = |v: &serde_json::Value| -> Option<f64> {
+                    match v {
+                        serde_json::Value::String(t) => t.parse::<f64>().ok(),
+                        serde_json::Value::Object(_) => {
+                            v["value"].as_str().and_then(|t| t.parse::<f64>().ok())
+                        }
+                        _ => None,
+                    }
+                };
+                for m in outcome.mutations.iter() {
+                    if matches!(m.kind, xrpl_ffi::MutationKind::Deleted) {
+                        continue;
+                    }
+                    let key = hex::encode_upper(m.key);
+                    let Some(nf) = nodes.get(&key) else { continue };
+                    for (code, ours) in sle_amounts(&m.data) {
+                        let name = match code {
+                            2 => "Balance",
+                            4 => "TakerPays",
+                            5 => "TakerGets",
+                            _ => continue,
+                        };
+                        let Some(net_v) = amt(&nf[name]) else { continue };
+                        let scale = ours.abs().max(net_v.abs()).max(1e-30);
+                        if (ours - net_v).abs() / scale > tol {
+                            eprintln!(
+                                "FFI_VALCHECK {} {} {} {} libxrpl={} net={}",
+                                tx_hash, tx_type, key, name, ours, net_v
+                            );
+                        }
+                    }
+                }
+            }
+        }
         if let Some(mut_map) = expected_mutations {
             let same_ter = expected_outcomes
                 .and_then(|m| m.get(&tx_hash))
