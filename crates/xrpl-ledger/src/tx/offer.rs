@@ -988,6 +988,36 @@ fn book_offer_ladder(sandbox: &Sandbox, base: &Hash256, cap: usize) -> Vec<(u64,
 }
 
 /// Decode a u64-encoded rate into (mantissa, exponent).
+/// The best quality ONE hop can offer, in-per-out — the book head competing
+/// with the pool's current slice, and NOT a function of how much the pass will
+/// move. That independence is the whole point: it is the per-step
+/// `qualityUpperBound` that `ActiveStrands::activateNext` ranks strands on.
+///
+/// Same formula as `d_tip` in `cross_bridged`, which matched rippled's own
+/// FLOWDBG `ub strand` value exactly on #105912454.
+pub(crate) fn hop_tip(
+    sandbox: &Sandbox,
+    taker: &[u8; 20],
+    in_leg: &Leg,
+    out_leg: &Leg,
+    amm_iters: u32,
+) -> Option<Me> {
+    let base = keylet::book_base(&in_leg.cur, &out_leg.cur, &in_leg.issuer, &out_leg.issuer);
+    let book = book_offer_ladder(sandbox, &base, 1).first().map(|(q, _)| rate_me(*q));
+    let pool = crate::tx::amm_swap::discover(sandbox, in_leg, out_leg, taker).and_then(|a| {
+        let init = crate::tx::amm_swap::pool_balances(sandbox, &a, out_leg, in_leg);
+        crate::tx::amm_swap::fib_slice(sandbox, &a, init, amm_iters, out_leg, in_leg)
+            .map(|s| crate::tx::amm_swap::slice_rate(s.0, s.1))
+    });
+    match (book, pool) {
+        (Some(b), Some(p)) => Some(if me_cmp(p, b).is_lt() { p } else { b }),
+        (Some(b), None) => Some(b),
+        (None, Some(p)) => Some(p),
+        (None, None) => None,
+    }
+}
+
+/// Decode a u64-encoded rate into (mantissa, exponent).
 pub(crate) fn rate_me(q: u64) -> Me {
     ((q & 0x00FF_FFFF_FFFF_FFFF) as u128, ((q >> 56) as i32) - 100)
 }

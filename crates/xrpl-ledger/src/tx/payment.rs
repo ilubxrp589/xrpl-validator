@@ -192,6 +192,30 @@ impl PaymentTransactor {
         grant
     }
 
+    /// A strand's `qualityUpperBound`: the composition of each hop's best
+    /// available quality, in-per-out. Optimistic and INDEPENDENT OF SIZE, which
+    /// is exactly why rippled ranks on it — a realised fill moves as a strand's
+    /// own pools drain and its fib slice grows, so ranking on that re-orders
+    /// candidates for a reason that has nothing to do with which is better.
+    ///
+    /// `None` when any hop has neither book nor pool: a chain is only as live
+    /// as its deadest link.
+    fn strand_upper_bound(
+        sandbox: &Sandbox,
+        taker: &[u8; 20],
+        chain: &[&crate::tx::offer::Leg],
+        amm_iters: u32,
+    ) -> Option<crate::tx::offer::Me> {
+        use crate::tx::offer as ox;
+        const ONE: ox::Me = (1_000_000_000_000_000, -15);
+        let mut acc: ox::Me = ONE;
+        for w in chain.windows(2) {
+            let tip = ox::hop_tip(sandbox, taker, w[0], w[1], amm_iters)?;
+            acc = ox::me_muldiv(acc, tip, ONE, false);
+        }
+        Some(acc)
+    }
+
     /// One reverse-pass trial: fund `in_leg` with `grant`, ask the hop for
     /// `want`, and report `(consumed, granted, remaining_want)`. Always leaves
     /// the sandbox exactly as it found it.
@@ -1215,67 +1239,82 @@ impl PaymentTransactor {
             if ox::me_is_zero(rem_out) || ox::me_is_zero(rem_in) {
                 break;
             }
-            let pick = if multi {
-                // Trial each strand in a snapshot and keep the best quality —
-                // lowest spent-per-delivered.
-                let mut best: Option<(usize, ox::Me)> = None;
-                let mut live = 0usize;
-                for i in 0..strands.len() {
-                    let snap = sandbox.snapshot();
-                    let mut trial_fib = amm_fib.clone();
-                    let (sin, sout) = Self::strand_pass(
-                        tx, dest, &strands[i], rem_in, rem_out, threshold, true,
-                        multi_now.then(|| &mut trial_fib), sandbox,
-                    );
-                    sandbox.restore_snapshot(snap);
-                    if ox::me_is_zero(sout) {
+            // ORDER BY UPPER BOUND, SELECT BY FIRST-TO-SURVIVE — rippled's
+            // `ActiveStrands::activateNext` sorts candidates by
+            // `qualityUpperBound` best-first and DROPS any whose bound misses
+            // limitQuality; the loop then flows them in that order and takes
+            // the first whose pass is not rejected (StrandFlow.h:670-731).
+            //
+            // This used to rank on the REALISED quality of a trial pass, the
+            // model `03c2cb9` already refuted for offer crossing — and it fails
+            // the same way here, because a realised fill depends on SIZE. On
+            // #106156904 the strand actually being used degrades as its own
+            // pools drain and its fib slice grows (75.380 -> 75.478 -> 75.712)
+            // while an untouched rival barely moves (75.591 -> 75.610 ->
+            // 75.666), so round 2 switched strands and we ended up delivering
+            // across two where mainnet used one: 12 mutations against 7. Every
+            // one of those trials was still INSIDE the 75.827 limit — nothing
+            // was rejected, we simply re-ranked on a quantity that moves for
+            // the wrong reason. An upper bound does not.
+            let order: Vec<usize> = if multi {
+                let mut c: Vec<(usize, ox::Me)> = (0..strands.len())
+                    .filter_map(|i| {
+                        Self::strand_upper_bound(sandbox, &tx.account, &strands[i], amm_fib.iters)
+                            .filter(|ub| thr_me.is_none_or(|t| ox::me_cmp(*ub, t).is_le()))
+                            .map(|ub| (i, ub))
+                    })
+                    .collect();
+                c.sort_by(|a, b| ox::me_cmp(a.1, b.1));
+                if std::env::var("DX_PAY").is_ok() {
+                    eprintln!("DX_PAY   round={_round} order={:?}", c);
+                }
+                c.into_iter().map(|(i, _)| i).collect()
+            } else {
+                vec![0]
+            };
+            // The candidates that CLEAR the bound are the active strands, which
+            // is what `setMultiPath(activeStrands.size() > 1)` reads.
+            multi_now = order.len() > 1;
+            let mut applied: Option<(usize, ox::Me, ox::Me)> = None;
+            for &i in &order {
+                let try_snap = sandbox.snapshot();
+                let mut try_fib = amm_fib.clone();
+                let (sin, sout) = Self::strand_pass(
+                    tx, dest, &strands[i], rem_in, rem_out, threshold, multi,
+                    multi_now.then(|| &mut try_fib), sandbox,
+                );
+                if std::env::var("DX_PAY").is_ok() {
+                    eprintln!("DX_PAY   try round={_round} strand={i} sin={sin:?} sout={sout:?}");
+                }
+                if ox::me_is_zero(sout) {
+                    sandbox.restore_snapshot(try_snap);
+                    continue;
+                }
+                // tfLimitQuality at STRAND level, where rippled keeps it. The
+                // hops are no longer gated individually (see `hop_thr` in
+                // `strand_pass` — their units are not the payment's), so the
+                // limit is enforced on what the pass REALISED end to end. A
+                // pass that misses it is rolled back and the next candidate
+                // tried: rippled's "Path rejected by limitQuality" does
+                // `continue`, not `break` (StrandFlow.h:698).
+                if let Some(t) = thr_me {
+                    let q = ox::me_muldiv(sin, (1_000_000_000_000_000, -15), sout, false);
+                    if ox::me_cmp(q, t).is_gt() {
+                        if std::env::var("DX_PAY").is_ok() {
+                            eprintln!("DX_PAY   strand={i} REJECTED by limitQuality q={q:?} thr={t:?}");
+                        }
+                        sandbox.restore_snapshot(try_snap);
                         continue;
                     }
-                    live += 1;
-                    let q = ox::me_muldiv(sin, (1_000_000_000_000_000, -15), sout, false);
-                    if std::env::var("DX_PAY").is_ok() {
-                        eprintln!("DX_PAY   trial strand={i} sin={sin:?} sout={sout:?} q={q:?}");
-                    }
-                    if best.is_none_or(|(_, bq)| ox::me_cmp(q, bq).is_lt()) {
-                        best = Some((i, q));
-                    }
                 }
-                // What survived the trials IS the active-strand count.
-                multi_now = live > 1;
-                match best {
-                    Some((i, _)) => i,
-                    None => break,
-                }
-            } else {
-                0
-            };
-            let round_snap = sandbox.snapshot();
-            let (sin, sout) = Self::strand_pass(
-                tx, dest, &strands[pick], rem_in, rem_out, threshold, multi,
-                multi_now.then(|| &mut amm_fib), sandbox,
-            );
-            if std::env::var("DX_PAY").is_ok() {
-                eprintln!("DX_PAY round={_round} strand={pick} sin={sin:?} sout={sout:?} rem_in={rem_in:?} rem_out={rem_out:?} multi={multi}");
-            }
-            if ox::me_is_zero(sout) {
-                sandbox.restore_snapshot(round_snap);
+                amm_fib = try_fib;
+                applied = Some((i, sin, sout));
                 break;
             }
-            // tfLimitQuality at STRAND level, where rippled keeps it. The hops
-            // are no longer gated individually (see `hop_thr` in `strand_pass`
-            // — their units are not the payment's), so the limit is enforced on
-            // what the pass REALISED end to end, and a pass that misses it is
-            // rolled back whole. That is rippled's "Path rejected by
-            // limitQuality" (StrandFlow.h:698).
-            if let Some(t) = thr_me {
-                let q = ox::me_muldiv(sin, (1_000_000_000_000_000, -15), sout, false);
-                if ox::me_cmp(q, t).is_gt() {
-                    if std::env::var("DX_PAY").is_ok() {
-                        eprintln!("DX_PAY   strand={pick} REJECTED by limitQuality q={q:?} thr={t:?}");
-                    }
-                    sandbox.restore_snapshot(round_snap);
-                    break;
-                }
+            let Some((pick, sin, sout)) = applied else { break };
+            let _ = pick;
+            if std::env::var("DX_PAY").is_ok() {
+                eprintln!("DX_PAY round={_round} strand={pick} sin={sin:?} sout={sout:?} rem_in={rem_in:?} rem_out={rem_out:?} multi={multi}");
             }
             rem_in = ox::me_sub(rem_in, sin);
             rem_out = ox::me_sub(rem_out, sout);
