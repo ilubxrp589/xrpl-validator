@@ -308,6 +308,64 @@ impl Transactor for EscrowCreateTransactor {
 // ===========================================================================
 
 /// EscrowFinish transactor — releases locked XRP to the destination.
+/// The escrowed Amount off the ESCROW OBJECT as an IOU `(leg, value)`.
+///
+/// `EscrowCreate::iou_amount` reads the TRANSACTION, which is no use to Finish
+/// and Cancel — those carry only `Owner` + `OfferSequence`, so the amount has
+/// to come from the ledger entry. Both of them parsed `Amount` as
+/// `as_str().parse::<u64>()` and fell back to `unwrap_or(0)`, which is how a
+/// token escrow silently released NOTHING.
+fn escrow_iou(escrow: &serde_json::Value) -> Option<(crate::tx::offer::Leg, (u128, i32))> {
+    let amt = escrow.get("Amount")?;
+    if !amt.is_object() {
+        return None;
+    }
+    let leg = crate::tx::offer::leg_of(amt)?;
+    if leg.xrp {
+        return None;
+    }
+    let v = keylet::amount_mant_exp(amt)?;
+    (v.0 != 0).then_some((leg, v))
+}
+
+/// Unlink an escrow from every directory `EscrowCreate` filed it in, and touch
+/// the destination the way creation does. The mirror of the three
+/// `owner_dir_insert` calls there: always the owner's, the destination's unless
+/// self-sent, and — for a token escrow — the ISSUER's.
+///
+/// A real token escrow carries all three hints, e.g. #106179351's
+/// `E7CFE233788C`: `OwnerNode "7"`, `DestinationNode "0"`, `IssuerNode "92"`.
+/// Neither Finish nor Cancel removed ANY directory entry before this.
+fn escrow_dir_teardown(
+    sandbox: &mut Sandbox,
+    escrow: &serde_json::Value,
+    escrow_key: &xrpl_core::types::Hash256,
+    owner_id: &[u8; 20],
+) {
+    use crate::ledger::directory::owner_dir_remove;
+    let dirnum = |k: &str| escrow.get(k).map(crate::tx::offer::dirnum);
+    owner_dir_remove(sandbox, owner_id, escrow_key, dirnum("OwnerNode"), true);
+
+    let dest_id = escrow.get("Destination").and_then(parse_account_id);
+    if let Some(d) = dest_id {
+        if d != *owner_id {
+            owner_dir_remove(sandbox, &d, escrow_key, dirnum("DestinationNode"), true);
+            // Creation records the destination's AccountRoot as a no-op
+            // Modified; the cancel/finish meta carries it too — #106179351's
+            // third AccountRoot is exactly this, with no FinalFields at all.
+            let dkey = keylet::account_root_key(&d);
+            if let Some(b) = sandbox.read(&dkey) {
+                sandbox.write(dkey, b);
+            }
+        }
+    }
+    if let Some((leg, _)) = escrow_iou(escrow) {
+        if leg.issuer != *owner_id && Some(leg.issuer) != dest_id {
+            owner_dir_remove(sandbox, &leg.issuer, escrow_key, dirnum("IssuerNode"), true);
+        }
+    }
+}
+
 pub struct EscrowFinishTransactor;
 
 impl EscrowFinishTransactor {
@@ -432,6 +490,14 @@ impl Transactor for EscrowFinishTransactor {
         dest["Balance"] = serde_json::Value::String(new_dest_balance.to_string());
         sandbox.write(dest_key, serde_json::to_vec(&dest).expect("serializing valid JSON Value"));
 
+        // A TOKEN escrow RELEASES the issued currency to the destination. Same
+        // hole Cancel had: `Amount` is an object, so the XRP credit above adds
+        // 0 drops and the tokens simply never arrived. `EscrowCreate` locked
+        // them off the sender's line and nothing ever gave them back.
+        if let Some((leg, want)) = escrow_iou(&escrow) {
+            crate::tx::offer::line_adjust(sandbox, &dest_id, &leg, want, true);
+        }
+
         // --- Delete the Escrow object ---
         sandbox.delete(esc_key);
 
@@ -449,6 +515,8 @@ impl Transactor for EscrowFinishTransactor {
         let oc = owner_count_of(&owner_acct);
         owner_acct["OwnerCount"] = serde_json::Value::Number(oc.saturating_sub(1).into());
         sandbox.write(owner_key, serde_json::to_vec(&owner_acct).expect("serializing valid JSON Value"));
+
+        escrow_dir_teardown(sandbox, &escrow, &esc_key, &owner_id);
 
         TxResult::Success
     }
@@ -574,8 +642,20 @@ impl Transactor for EscrowCancelTransactor {
 
         sandbox.write(owner_key, serde_json::to_vec(&owner_acct).expect("serializing valid JSON Value"));
 
-        // --- Delete the Escrow object ---
+        // A TOKEN escrow returns the issued currency to the sender's line —
+        // the mirror of the `line_adjust(.., false)` that `EscrowCreate` used
+        // to lock it. The XRP credit above is a no-op for one of these, since
+        // `Amount` is an object and parses to 0 drops.
+        //
+        // #106179351: EscrowCancel attempted=192, MATCH=0, every one of them
+        // this shape. We returned nothing and unlinked nothing.
+        if let Some((leg, want)) = escrow_iou(&escrow) {
+            crate::tx::offer::line_adjust(sandbox, &owner_id, &leg, want, true);
+        }
+
+        // --- Delete the Escrow object and unlink it everywhere ---
         sandbox.delete(esc_key);
+        escrow_dir_teardown(sandbox, &escrow, &esc_key, &owner_id);
 
         TxResult::Success
     }
