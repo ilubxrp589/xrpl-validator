@@ -291,8 +291,20 @@ fn skip_path_set(data: &[u8], mut pos: usize) -> Option<usize> {
 /// NFTokenMint (25) inserts a token; NFTokenBurn (26) removes one;
 /// NFTokenCreateOffer (27) / NFTokenCancelOffer (28) / NFTokenAcceptOffer
 /// (29) locate one to validate or transfer it.
+///
+/// **NFTokenModify (XLS-46, tt 61) does too, and the contiguous range missed
+/// it** — it postdates the others, so `25..=29` silently excluded a tx type
+/// whose whole job is to find a token and rewrite its URI.
+///
+/// #105765676 is the specimen, and it is the ONLY ledger in all four corpora
+/// where the ORACLE diverges while our engine matches: libxrpl returns
+/// `tecNO_ENTRY` on `E7A764F078C019F6` where mainnet has `tesSUCCESS`, because
+/// `nft::findToken` was searching a page set that had never been fetched.
+/// Textbook "we did not load it is not it is not there" — and worth noting the
+/// inverted shape is what exposed it, since a DIRTY oracle on a CLEAN engine
+/// can only be the harness.
 fn is_nft_tx_type(tt: u16) -> bool {
-    (25..=29).contains(&tt)
+    (25..=29).contains(&tt) || tt == 61
 }
 
 /// The accounts whose NFT pages a tx blob may walk: every AccountID-typed
