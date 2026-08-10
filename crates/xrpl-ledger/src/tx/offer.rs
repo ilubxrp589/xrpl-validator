@@ -2263,7 +2263,19 @@ thr={t:?} admits_trunc={} admits_up={}",
                         gets_in = reprice_a(xrp, me_muldiv(xrp, a_in_full, a_out_full, true), sandbox);
                     }
                 }
-                let xrp = (me_rescale(xrp, 0, false), 0);
+                // DX_XRP: the bridged mid-leg is XRP and has to land on whole
+                // drops. Every value-divergent BRIDGED crossing found so far
+                // carries the same ±1-drop footprint, so measure whether this
+                // truncation is the one throwing it away — before touching it.
+                if std::env::var("DX_XRP").is_ok() {
+                    let trunc = (me_rescale(xrp, 0, false), 0);
+                    let up = (me_rescale(xrp, 0, true), 0);
+                    eprintln!(
+                        "DX_XRP xrp_exact={xrp:?} trunc={trunc:?} ceil={up:?} fractional={}",
+                        me_cmp(trunc, up).is_lt(),
+                    );
+                }
+                let xrp = (me_rescale(xrp, 0, true), 0);
                 if std::env::var("DX_BRIDGE").is_ok() {
                     eprintln!("DX_BRIDGE slice xrp={xrp:?} gets_in={gets_in:?} pays_out={pays_out:?} a_amm={a_use_amm} b_amm={b_use_amm} rem_g={rem_gets:?} rem_p={rem_pays:?}");
                 }
