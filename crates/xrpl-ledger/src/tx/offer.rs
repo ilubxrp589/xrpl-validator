@@ -2850,6 +2850,18 @@ pub(crate) fn cross_engine_to(
                     // calibrated by d6f7589 against #105672435 B409D45C and
                     // #105814446 2162E284EAB3.
                     give = me_muldiv(pay, (1u128, 0i32), rate_me(q), true);
+                    // DX_CLAMP: does a given fill actually REACH this branch?
+                    // The 2026-08-08 ceil attempt assumed the twelve one-drop
+                    // residuals came from here and regressed two calibrated
+                    // ledgers. Establish it before touching the rounding again.
+                    if std::env::var("DX_CLAMP").is_ok() {
+                        let after = if pays_leg.xrp { (me_rescale(give, 0, false), 0) } else { give };
+                        eprintln!(
+                            "DX_CLAMP q={q:016x} pay={pay:?} give_exact={give:?} give_after={after:?} xrp_in={} lost={}",
+                            pays_leg.xrp,
+                            pays_leg.xrp && me_cmp(after, give).is_lt(),
+                        );
+                    }
                     if pays_leg.xrp {
                         // ⛔ FLIPPING THIS TO CEIL WAS TRIED 2026-08-08 AND
                         // REVERTED — and this time it was MEASURED, not
