@@ -357,16 +357,36 @@ pub(crate) fn stamount_signed_add(aneg: bool, a: Me, bneg: bool, b: Me) -> (bool
     // divergence to 3.
     let a = norm16(a);
     let b = norm16(b);
-    let e = a.1.max(b.1);
-    let a2: Me = (me_rescale(a, e, false), e);
-    let b2: Me = (me_rescale(b, e, false), e);
-    if aneg == bneg {
-        return (aneg, (a2.0 + b2.0, e));
+    // rippled adds IOUs through `Number` (STAmount.cpp:391, IOUAmount.cpp:142,
+    // both gated on `getSTNumberSwitchover()` — fixUniversalNumber, long since
+    // enabled): the operands are aligned with a GUARD DIGIT plus a sticky bit
+    // and the exact result is rounded HALF-EVEN back to 16 digits.
+    //
+    // Aligning to the larger exponent and dropping the tail is the LEGACY
+    // branch immediately below that switchover (`mantissa_ /= 10` in a loop),
+    // and it lands one ulp low whenever the discarded tail reaches half.
+    // #106143011's pool ran 2000892.236615386 + 100.153148870651: the exact
+    // sum is 2000992.389764256|651, so mainnet stores ...257 and we stored
+    // ...256. One ulp on the pool balance re-prices every later AMM slice —
+    // it walked into `changeSpotPriceQuality`, moved the generated offer just
+    // inside the target quality where rippled's lands just outside, and gave
+    // us a 6th AMM turn rippled never takes.
+    let e = a.1.min(b.1);
+    if (a.1.max(b.1) - e) as u32 > 22 {
+        // The smaller operand sits more than a full mantissa below the larger:
+        // under half an ulp, so it can only ever be sticky.
+        return if a.1 > b.1 { (aneg, a) } else { (bneg, b) };
     }
-    match me_cmp(a2, b2) {
+    let av = a.0 * 10u128.pow((a.1 - e) as u32);
+    let bv = b.0 * 10u128.pow((b.1 - e) as u32);
+    use crate::tx::amm_swap::{round16, Rnd};
+    if aneg == bneg {
+        return (aneg, round16(av + bv, e, false, Rnd::Near));
+    }
+    match av.cmp(&bv) {
         std::cmp::Ordering::Equal => (false, (0, 0)),
-        std::cmp::Ordering::Greater => (aneg, me_sub(a2, b2)),
-        std::cmp::Ordering::Less => (bneg, me_sub(b2, a2)),
+        std::cmp::Ordering::Greater => (aneg, round16(av - bv, e, false, Rnd::Near)),
+        std::cmp::Ordering::Less => (bneg, round16(bv - av, e, false, Rnd::Near)),
     }
 }
 
@@ -3587,6 +3607,44 @@ mod tests {
     use crate::ledger::sandbox::{apply_modifications, Sandbox};
     use crate::ledger::state::LedgerState;
     use xrpl_core::types::Hash256;
+
+    /// IOU addition rounds the EXACT sum half-even to 16 digits (rippled's
+    /// `Number`), it does not truncate the smaller operand's tail.
+    ///
+    /// The pool of #106143011 at its third AMM turn, taken from mainnet's own
+    /// trace: 2000892.236615386 + 100.153148870651 is exactly
+    /// 2000992.389764256|651, so the stored value is ...257. Truncating gives
+    /// ...256, one ulp low, which re-prices every later slice off that pool.
+    #[test]
+    fn iou_addition_rounds_half_even_not_truncated() {
+        let (neg, sum) = stamount_signed_add(
+            false,
+            (2_000_892_236_615_386, -9),
+            false,
+            (1_001_531_488_706_510, -13),
+        );
+        assert!(!neg);
+        assert_eq!(norm16(sum), (2_000_992_389_764_257, -9));
+
+        // A tail below half still rounds down, and the half-even tie breaks to
+        // the even mantissa rather than always up.
+        let (_, down) =
+            stamount_signed_add(false, (2_000_892_236_615_386, -9), false, (1_000_000_000_000_000, -13));
+        assert_eq!(norm16(down), (2_000_992_236_615_386, -9));
+        let (_, tie) = stamount_signed_add(false, (1_000_000_000_000_001, -15), false, (5, -16));
+        assert_eq!(norm16(tie), (1_000_000_000_000_002, -15));
+        let (_, tie_even) = stamount_signed_add(false, (1_000_000_000_000_002, -15), false, (5, -16));
+        assert_eq!(norm16(tie_even), (1_000_000_000_000_002, -15));
+
+        // Opposite signs subtract, and a negligible operand leaves the larger
+        // untouched instead of overflowing the alignment.
+        let (neg, diff) =
+            stamount_signed_add(false, (1_000_000_000_000_000, -15), true, (2_000_000_000_000_000, -15));
+        assert!(neg);
+        assert_eq!(norm16(diff), (1_000_000_000_000_000, -15));
+        let (_, tiny) = stamount_signed_add(false, (1_234_567_890_123_456, 0), false, (1, -40));
+        assert_eq!(norm16(tiny), (1_234_567_890_123_456, 0));
+    }
 
     fn read_balance(sandbox: &Sandbox, id: &[u8; 20]) -> u64 {
         json_at(sandbox, &keylet::account_root_key(id))

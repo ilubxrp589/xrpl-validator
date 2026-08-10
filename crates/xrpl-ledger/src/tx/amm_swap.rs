@@ -25,7 +25,7 @@ const N_TWO: Me = (2 * LO, -15);
 const N_FOUR: Me = (4 * LO, -15);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Rnd {
+pub(crate) enum Rnd {
     Down,
     Up,
     Near,
@@ -34,7 +34,7 @@ enum Rnd {
 /// Correctly round an unnormalized positive (mantissa, exponent) to 16
 /// significant digits. `sticky` marks value already shifted off (the true
 /// value lies strictly between the mantissa and its successor).
-fn round16(m: u128, e: i32, sticky: bool, rnd: Rnd) -> Me {
+pub(crate) fn round16(m: u128, e: i32, sticky: bool, rnd: Rnd) -> Me {
     if m == 0 {
         return (0, 0);
     }
@@ -370,7 +370,41 @@ pub(crate) fn lp_tokens_in(balance: Me, withdraw: Me, total_lp: Me, tfee: u16) -
     Some(n_mul(total_lp, frac, Rnd::Up))
 }
 
+/// `changeSpotPriceQuality` — the generated offer, or None when it cannot
+/// actually reach `target`.
+///
+/// The generators below mirror rippled's two `getAMMOfferStart*` helpers,
+/// including their single `reduceOffer` retry. What rippled then does, and we
+/// did not, is CHECK the retry (AMMHelpers.h:385): an offer that still misses
+/// the target quality is rejected outright — strictly, with no round-off
+/// tolerance and no smaller fallback slice. The book tip that produced it is
+/// simply skipped and the next one anchors the pool instead.
+///
+/// #106143011 4607B92B is the case that pins it. Against the RLUSD/XRP pool
+/// rippled's 4th turn logs `changeSpotPriceQuality failed: ... 2.364604055435306
+/// 2151512` and moves on to the next tip for a single 112.4170315686629 slice;
+/// we took the rejected 2.3646 crumb AND a reduced 107.6832 after it, then
+/// overshot again on a 6th turn rippled never reaches. The offer is worse than
+/// its target by 3.3e-10 — the check has to be exact to see that, which is why
+/// it only became reachable once IOU addition stopped truncating
+/// (`stamount_signed_add`); a one-ulp-low pool balance had been putting the
+/// same offer just INSIDE the target.
 fn anchored_offer(
+    pool_in: Me,
+    pool_out: Me,
+    in_xrp: bool,
+    out_xrp: bool,
+    target: u64,
+    tfee: u16,
+) -> Option<(Me, Me)> {
+    let (i, o) = anchored_offer_generate(pool_in, pool_out, in_xrp, out_xrp, target, tfee)?;
+    if rate_of(i, o) > target {
+        return None;
+    }
+    Some((i, o))
+}
+
+fn anchored_offer_generate(
     pool_in: Me,
     pool_out: Me,
     in_xrp: bool,
@@ -699,8 +733,10 @@ pub(crate) fn fib_slice(
 /// the actual fill; the point is that ONE pass is priced and judged, not a
 /// sequence of small slices each judged on its own.
 ///
-///     out = floor(balances.out * 0.99)          (maxOut, RoundingMode::Downward)
-///     in  = swapAssetOut(balances, out, fee)
+/// ```text
+/// out = floor(balances.out * 0.99)          (maxOut, RoundingMode::Downward)
+/// in  = swapAssetOut(balances, out, fee)
+/// ```
 ///
 /// Verified against the FFI trace on 2026-08-07. #106137477, pool 21 830 175
 /// drops / 115.121893423695 BBRL at fee 1000:
