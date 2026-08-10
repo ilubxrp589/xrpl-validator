@@ -1053,6 +1053,32 @@ impl PaymentTransactor {
             return TxResult::PathDry;
         }
         let spend0 = if ox::me_cmp(spend_avail, spend0).is_lt() { spend_avail } else { spend0 };
+        // INPUT-side TransferRate. A payment sets `ownerPaysTransferFee_ =
+        // false`, so `trIn = transferRate(book_.in.account)` — the SENDER pays
+        // `amount × rate` and the counterparty receives `amount`
+        // (BookStep.cpp:737-739). `apply_iou_direct` has always done this for
+        // the same-currency case; the crossing path only ever charged the
+        // OUTPUT issuer (`want_rate`) and let the input through free.
+        //
+        // #105663160 C100D2BF306FD484 is the proof, and it is exact. A circular
+        // tfPartialPayment, SendMax 10059 SGB (issuer rctArjqVvTHi,
+        // TransferRate 1003000000) for XRP, one AMM counterparty:
+        //   mainnet  sender −10059.000   pool +10028.913   (10059/1.003)
+        //   ours     sender −10029.051   pool +10029.051   (no fee at all)
+        // 30.087 SGB that mainnet destroys and we never charged.
+        //
+        // So SendMax is a GROSS cap: what can actually reach counterparties is
+        // `SendMax / rate`, and the sender's holding is a gross bound too —
+        // dividing the min of the two covers both.
+        let spend_rate = if tx.account == spend_leg.issuer {
+            None
+        } else {
+            Self::transfer_rate(sandbox, &spend_leg)
+        };
+        let spend0 = match spend_rate {
+            Some(r) => ox::me_muldiv(spend0, (1_000_000_000, 0), (r as u128, 0), false),
+            None => spend0,
+        };
         let snap = sandbox.snapshot();
         // rippled only imposes the SendMax/Amount ratio as a per-offer quality
         // bound when tfLimitQuality is set. Otherwise the book is walked
@@ -1344,6 +1370,16 @@ impl PaymentTransactor {
         // 1292441.5236935 our crossing pulled out of the pool is really
         // 680232.38 delivered — under the transaction's DeliverMin of
         // 804373.673120612, which is exactly mainnet's tecPATH_PARTIAL.
+        // Charge the input fee on what actually moved. The rounds credited
+        // counterparties the NET; the sender parts with net × rate, and the
+        // difference is destroyed exactly as the output-side fee below is.
+        if let Some(r) = spend_rate {
+            let net_spent = ox::me_sub(spend0, rem_in);
+            if !ox::me_is_zero(net_spent) {
+                let gross = ox::me_muldiv(net_spent, (r as u128, 0), (1_000_000_000, 0), true);
+                ox::line_adjust(sandbox, &tx.account, &spend_leg, ox::me_sub(gross, net_spent), false);
+            }
+        }
         let delivered = match want_rate {
             Some(rate) => {
                 let net = ox::me_muldiv(delivered, (1_000_000_000, 0), (rate as u128, 0), false);
