@@ -2276,6 +2276,25 @@ thr={t:?} admits_trunc={} admits_up={}",
                     );
                 }
                 let xrp = (me_rescale(xrp, 0, true), 0);
+                // ...and REPRICE leg A for it. `gets_in` above was computed
+                // from the FRACTIONAL xrp; rounding the mid-leg up to whole
+                // drops without redoing that leaves leg A buying a whole drop
+                // and paying for a fraction less of one.
+                //
+                // That stale price is the entire residual left after the ceil
+                // landed. On #105663160 893234589E652228 the leg A offer
+                // A8B6AE1A99 is 14939.63236543909 XAH for 210947609 drops, so
+                // 277768 drops cost 19.67195467422096 XAH — mainnet's number.
+                // We wrote 19.67191855819117, which is what 277767.49 drops
+                // cost. All four bridged residuals are exactly this, short by
+                // 0.51, 0.65, 0.71 and 0.98 drops' worth: the fraction the
+                // rescale rounded away.
+                let gets_in = {
+                    let repriced = reprice_a(xrp, me_muldiv(xrp, a_in_full, a_out_full, true), sandbox);
+                    // The earlier clamp to `rem_gets` still binds — a sub-drop
+                    // reprice must not push the pass past what the taker has.
+                    if me_cmp(repriced, rem_gets).is_gt() { rem_gets } else { repriced }
+                };
                 if std::env::var("DX_BRIDGE").is_ok() {
                     eprintln!("DX_BRIDGE slice xrp={xrp:?} gets_in={gets_in:?} pays_out={pays_out:?} a_amm={a_use_amm} b_amm={b_use_amm} rem_g={rem_gets:?} rem_p={rem_pays:?}");
                 }
