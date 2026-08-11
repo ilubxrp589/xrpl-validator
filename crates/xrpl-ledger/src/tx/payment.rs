@@ -308,6 +308,11 @@ impl PaymentTransactor {
             // (it could not produce all of need[i]). Each step is 1e6, which
             // keeps the delta within six orders of the grant and so leaves ~10
             // significant digits intact.
+            // The hop before this one must deliver enough to cover this hop's
+            // input transfer fee as well as its book cost — see `strand_pass`.
+            let in_rate = (!in_leg.xrp && tx.account != in_leg.issuer)
+                .then(|| Self::transfer_rate(sandbox, in_leg))
+                .flatten();
             let mut consumed = (0u128, 0i32);
             for grant in [(1u128, 6i32), (1, 12), (1, 18)] {
                 let (c, granted, rw) = Self::measure_hop(
@@ -365,7 +370,12 @@ impl PaymentTransactor {
             need[i - 1] = if ox::me_is_zero(consumed) {
                 (9_990_000_000_000_000, 60)
             } else {
-                consumed
+                // GROSS: the previous hop must buy the fee too, or the chain
+                // arrives short by exactly the issuer's rate.
+                match in_rate {
+                    Some(r) => ox::me_muldiv(consumed, (r as u128, 0), (1_000_000_000, 0), true),
+                    None => consumed,
+                }
             };
         }
         need
@@ -480,11 +490,50 @@ impl PaymentTransactor {
             let before = (!last)
                 .then(|| Self::leg_signed_balance(sandbox, &tx.account, out_leg))
                 .flatten();
+            // In a PAYMENT `ownerPaysTransferFee_` is false, so each book step
+            // charges the issuer of the currency going IN:
+            //   stpAmt.in = mulRatio(ofrAmt.in, trIn, QUALITY_ONE, roundUp)
+            // (BookStep.cpp:770, trIn = transferRate(book_.in.account)). To hand
+            // a maker `x`, the payer parts with `x * rate` and the difference is
+            // destroyed. Hop 0's input is `spend_leg`, already charged once via
+            // `spend_rate`, so only the INTERMEDIATES are handled here.
+            //
+            // #105924683 B3AA3ACC is the specimen: a circular
+            // tfPartialPayment, XRP -> SGB -> PLX -> Teddy, where SGB's
+            // issuer rctArjqVvTHi charges 0.3%. PLX and Teddy charge nothing —
+            // which is exactly why their metadata pairs balance and the SGB
+            // leg's does not. Uncharged, the whole chain runs 0.296% rich:
+            // rippled delivers 630071.89620606 Teddy for the full 145152-drop
+            // SendMax, we delivered 631939.64099203 for the same input.
+            let hop_rate = (i > 0 && !chain[i].xrp && tx.account != chain[i].issuer)
+                .then(|| Self::transfer_rate(sandbox, chain[i]))
+                .flatten();
+            let in_before = hop_rate
+                .and_then(|_| Self::leg_signed_balance(sandbox, &tx.account, chain[i]));
+            // Only `carry / rate` can actually reach a maker.
+            let avail = match hop_rate {
+                Some(r) => ox::me_muldiv(carry, (1_000_000_000, 0), (r as u128, 0), false),
+                None => carry,
+            };
             let (rw, _rs, _c) = ox::cross_engine_to(
-                &tx.account, benef, want_cap, carry, chain[i + 1], chain[i],
+                &tx.account, benef, want_cap, avail, chain[i + 1], chain[i],
                 hop_thr, hop_thr, false, false, single_pass, amm_fib.as_deref_mut(), None,
                 sandbox, &mut Vec::new(),
             );
+            // Charge the fee on what the hop REALLY consumed, not on the whole
+            // carry — an unspent remainder was never handed to anyone.
+            if let (Some(r), Some((bneg, b))) = (hop_rate, in_before) {
+                if let Some((aneg, a)) = Self::leg_signed_balance(sandbox, &tx.account, chain[i]) {
+                    let (uneg, used) = ox::signed_add(bneg, b, !aneg, a); // before - after
+                    if !uneg && !ox::me_is_zero(used) {
+                        let gross = ox::me_muldiv(used, (r as u128, 0), (1_000_000_000, 0), true);
+                        let fee = ox::me_sub(gross, used);
+                        if !ox::me_is_zero(fee) {
+                            ox::line_adjust(sandbox, &tx.account, chain[i], fee, false);
+                        }
+                    }
+                }
+            }
             carry = match (before, Self::leg_signed_balance(sandbox, &tx.account, out_leg)) {
                 (Some((bneg, b)), Some((aneg, a))) => {
                     // delta = after - before; a fall in balance buys nothing.
