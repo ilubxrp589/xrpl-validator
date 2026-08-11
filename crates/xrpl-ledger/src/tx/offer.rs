@@ -1455,6 +1455,30 @@ fn cross_bridged(
 ) -> Option<(Me, Me, u32)> {
     let xrp_leg = Leg { xrp: true, cur: [0u8; 20], issuer: [0u8; 20] };
     let zero = [0u8; 20];
+    // Leg A's input issuer charges its TransferRate because the taker is
+    // REDEEMING the IOU it spends: `trIn = redeems(prevStepDir) ? rate(book_.in,
+    // strandDst_) : parity` (BookStep.cpp:352), applied as
+    // `stpAmt.in = mulRatio(ofrAmt.in, ofrInRate, QUALITY_ONE, roundUp)` (:770).
+    // The MAKER receives `gets_in`; the TAKER parts with `gets_in * rate` and
+    // the issuer DESTROYS the difference. `None` when the taker issues the
+    // currency itself — issuing is free.
+    //
+    // ⚠ This changes NOTHING about sizing, and must not. Measured on
+    // #105887283 4A13D048, our slices already match rippled's to the last
+    // digit once its `in` is read as GROSS:
+    //     ours 0.005771047782      x1.0015 = 0.005779704353673   = rippled
+    //     ours 0.0034269515228004  x1.0015 = 0.003432091950084601 = rippled
+    // and TakerGets bounds the NET, which is why rippled's total in
+    // (0.009211796303757601) legitimately EXCEEDS TakerGets (0.0092).
+    // Three earlier attempts divided a budget by this rate instead — the
+    // direct walk, the call site, and `net_cap` on both bridged clamps. All
+    // three re-sized fills that were already correct and all three regressed,
+    // #105887283 as far as 87/88 at KEY level. The missing piece was only ever
+    // the taker's debit.
+    let fee_rate = match transfer_rate(sandbox, gets_leg) {
+        Some(r) if taker != &gets_leg.issuer => Some(r),
+        _ => None,
+    };
     // Leg A: spend our gets, acquire XRP. Leg B: spend XRP, acquire our pays.
     let base_a = keylet::book_base(&gets_leg.cur, &zero, &gets_leg.issuer, &zero);
     let base_b = keylet::book_base(&zero, &pays_leg.cur, &zero, &pays_leg.issuer);
@@ -2186,6 +2210,18 @@ thr={t:?} admits_trunc={} admits_up={}",
                 }
                 settle_fill(sandbox, &okey, &offer, &maker, taker, beneficiary,
                             pays_leg, gets_leg, give, pay, gives0, wants0);
+                // Same input transfer fee as leg A — this is the DIRECT head
+                // competing inside the bridge, and it spends the taker's gets
+                // side too. #105954798 D5887FD7 needs both: it takes one
+                // bridged slice and the rest through here, so charging only
+                // leg A moved it 4.25e-5 -> 4.18e-5 and no further.
+                if let Some(r) = fee_rate {
+                    let gross = me_muldiv(pay, (r as u128, 0), (1_000_000_000, 0), true);
+                    let fee = me_sub(gross, pay);
+                    if !me_is_zero(fee) {
+                        line_adjust(sandbox, taker, gets_leg, fee, false);
+                    }
+                }
                 rem_pays = me_sub(rem_pays, give);
                 rem_gets = me_sub(rem_gets, pay);
                 crossed += 1;
@@ -2335,6 +2371,15 @@ thr={t:?} admits_trunc={} admits_up={}",
                         amm_used = true;
                     }
                     _ => break 'attempt,
+                }
+                // The taker pays the input transfer fee on top of what leg A's
+                // maker received; the issuer destroys it.
+                if let Some(r) = fee_rate {
+                    let gross = me_muldiv(gets_in, (r as u128, 0), (1_000_000_000, 0), true);
+                    let fee = me_sub(gross, gets_in);
+                    if !me_is_zero(fee) {
+                        line_adjust(sandbox, taker, gets_leg, fee, false);
+                    }
                 }
                 // Leg B: taker sells that XRP for the pays side.
                 match (&b_book, &b_fill) {
