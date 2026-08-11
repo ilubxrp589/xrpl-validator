@@ -274,6 +274,32 @@ pub(crate) fn lp_tokens_out(balance: Me, deposit: Me, lpt: Me, tfee: u16) -> Me 
     n_mul(lpt, n_div(num, n_add(N_ONE, c, Rnd::Near), Rnd::Near), Rnd::Down)
 }
 
+/// rippled `adjustLPTokens` (AMMHelpers.cpp), reached from `adjustLPTokensOut`
+/// (AMMDeposit.cpp:623) on EVERY deposit path once fixAMMv1_3 is enabled:
+///
+/// ```text
+/// (lptAMMBalance + tokens) - lptAMMBalance      both ops Downward
+/// ```
+///
+/// "Force rounding downward to ensure adjusted tokens are less or equal to
+/// requested tokens." The round trip quantizes the mint to the POOL BALANCE's
+/// ulp, which is coarser than the token amount's own precision whenever the
+/// pool is large.
+///
+/// ⚠ Do not go looking for this in `adjustAmountsByLPTokens` — that one RETURNS
+/// EARLY under fixAMMv1_3, because the adjustment moved out to each call site.
+///
+/// #105666725 `4FAE75AC` is the specimen: Equation 3 yields 32.98772104121774
+/// against a pool of 22752296.08014551 whose 16-digit ulp is 1e-8, so mainnet
+/// credits exactly **32.98772104** and the LP trust line it creates stores that
+/// — not the raw root.
+pub(crate) fn adjust_lp_tokens_out(lpt: Me, tokens: Me) -> Me {
+    if lpt.0 == 0 || tokens.0 == 0 {
+        return tokens;
+    }
+    n_sub(n_add(lpt, tokens, Rnd::Down), lpt, Rnd::Down)
+}
+
 fn to_amount(x: Me, xrp: bool, rnd: Rnd) -> Me {
     if x.0 == 0 {
         return (0, 0);
@@ -1180,6 +1206,19 @@ mod tests {
         assert!(lp_tokens_out(me("1000"), me("100"), me("500"), 0).0 > 0);
         assert_eq!(lp_tokens_out(me("1000"), (0, 0), me("500"), 250), (0, 0));
         assert_eq!(lp_tokens_out(me("1000"), me("100"), (0, 0), 250), (0, 0));
+        // fixAMMv1_3 then quantizes the mint to the POOL's ulp: #105666725
+        // 4FAE75AC's pool is 22752296.08014551 (ulp 1e-8), so Equation 3's
+        // 32.98772104121774 is credited as exactly 32.98772104.
+        assert_eq!(
+            crate::tx::offer::me_to_value_string(adjust_lp_tokens_out(
+                me("22752296.08014551"),
+                me("32.98772104121774")
+            )),
+            "32.98772104"
+        );
+        // A pool small enough to represent the whole amount leaves it alone.
+        assert_eq!(adjust_lp_tokens_out(me("10"), me("1.5")), me("1.5"));
+
         // Charging a fee mints strictly fewer tokens for the same deposit.
         let free = lp_tokens_out(me("1000"), me("100"), me("500"), 0);
         let charged = lp_tokens_out(me("1000"), me("100"), me("500"), 1000);

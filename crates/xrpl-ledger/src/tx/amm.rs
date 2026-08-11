@@ -582,6 +582,8 @@ impl Transactor for AMMDepositTransactor {
                 ))?;
                 let tfee = obj["TradingFee"].as_u64().unwrap_or(0) as u16;
                 let t = crate::tx::amm_swap::lp_tokens_out(pool_pre, amt, lpt, tfee);
+                // fixAMMv1_3 quantizes the mint to the pool balance's ulp.
+                let t = crate::tx::amm_swap::adjust_lp_tokens_out(lpt, t);
                 (t.0 > 0).then_some(t)
             })
             .unwrap_or((1_000_000_000_000_000, -8));
