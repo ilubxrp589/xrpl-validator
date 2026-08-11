@@ -323,10 +323,11 @@ fn mul_directed(a: ox::Me, b: ox::Me, up: bool, xrp: bool) -> ox::Me {
 /// `(lptAMMBalance + lpTokens) - lptAMMBalance` with rounding forced DOWNWARD,
 /// which quantises the token count to what is actually representable once it
 /// joins the pool balance (AMMHelpers.cpp:173-184).
+/// `adjustLPTokens` — see `amm_swap::adjust_lp_tokens`. rippled forces
+/// DOWNWARD on both steps (`SaveNumberRoundMode`); this used to route through
+/// `stamount_signed_add`, which is half-even, and so could land a ulp high.
 fn adjust_lp_tokens(lpt_balance: ox::Me, tokens: ox::Me) -> ox::Me {
-    let (_, sum) = ox::stamount_signed_add(false, lpt_balance, false, tokens);
-    let (neg, adj) = ox::stamount_signed_add(false, sum, true, lpt_balance);
-    if neg { (0, 0) } else { adj }
+    crate::tx::amm_swap::adjust_lp_tokens(lpt_balance, tokens, true)
 }
 
 /// rippled `AMMDeposit::equalDepositLimit` (AMMDeposit.cpp:721-787), the
@@ -360,27 +361,82 @@ fn equal_deposit_limit(
     amount2: ox::Me,
     amount_xrp: bool,
     amount2_xrp: bool,
-) -> Option<(ox::Me, ox::Me)> {
+) -> Option<(ox::Me, ox::Me, ox::Me)> {
     if amount_balance.0 == 0 || amount2_balance.0 == 0 || lpt_balance.0 == 0 {
         return None;
     }
-    let led = |num: ox::Me, den: ox::Me, out_balance: ox::Me, out_xrp: bool| -> Option<ox::Me> {
+    let led = |num: ox::Me, den: ox::Me, out_balance: ox::Me, out_xrp: bool|
+     -> Option<(ox::Me, ox::Me)> {
         let frac = ox::st_divide(num, den, false);
         let tokens = adjust_lp_tokens(lpt_balance, mul_directed(lpt_balance, frac, false, false));
         if tokens.0 == 0 {
             return None;
         }
         let frac = ox::st_divide(tokens, lpt_balance, false);
-        Some(mul_directed(out_balance, frac, true, out_xrp))
+        Some((mul_directed(out_balance, frac, true, out_xrp), tokens))
     };
-    if let Some(a2) = led(amount, amount_balance, amount2_balance, amount2_xrp) {
+    if let Some((a2, t)) = led(amount, amount_balance, amount2_balance, amount2_xrp) {
         if ox::me_cmp(a2, amount2).is_le() {
-            return Some((amount, a2));
+            return Some((amount, a2, t));
         }
     }
-    if let Some(a1) = led(amount2, amount2_balance, amount_balance, amount_xrp) {
+    if let Some((a1, t)) = led(amount2, amount2_balance, amount_balance, amount_xrp) {
         if ox::me_cmp(a1, amount).is_le() {
-            return Some((a1, amount2));
+            return Some((a1, amount2, t));
+        }
+    }
+    None
+}
+
+/// rippled `AMMWithdraw::equalWithdrawLimit` (AMMWithdraw.cpp:899), the
+/// tfTwoAsset path — the MIRROR of `equal_deposit_limit`, and the rounding
+/// mirrors with it:
+///
+///   frac      = amount / amountBalance
+///   tokensAdj = adjustLPTokens(lpt, multiply(lpt, frac, UPWARD), IsDeposit::No)
+///   frac      = tokensAdj / lpt
+///   amt2Out   = multiply(amount2Balance, frac, DOWNWARD)
+///   if amt2Out <= amount2   -> withdraw (amount, amt2Out)
+///   else re-lead from amount2 and require the derived side to fit.
+///
+/// LP tokens round UP on a withdrawal and assets DOWN — the opposite of a
+/// deposit, both directions chosen to hold `sqrt(a*b) >= LPTokensBalance`
+/// (`getLPTokenRounding`/`getAssetRounding`, AMMHelpers.h:595-612).
+#[allow(clippy::too_many_arguments)]
+fn equal_withdraw_limit(
+    amount_balance: ox::Me,
+    amount2_balance: ox::Me,
+    lpt_balance: ox::Me,
+    amount: ox::Me,
+    amount2: ox::Me,
+    amount_xrp: bool,
+    amount2_xrp: bool,
+) -> Option<(ox::Me, ox::Me, ox::Me)> {
+    if amount_balance.0 == 0 || amount2_balance.0 == 0 || lpt_balance.0 == 0 {
+        return None;
+    }
+    let led = |num: ox::Me, den: ox::Me, out_balance: ox::Me, out_xrp: bool|
+     -> Option<(ox::Me, ox::Me)> {
+        let frac = ox::st_divide(num, den, false);
+        let tokens = crate::tx::amm_swap::adjust_lp_tokens(
+            lpt_balance,
+            mul_directed(lpt_balance, frac, true, false),
+            false,
+        );
+        if tokens.0 == 0 {
+            return None;
+        }
+        let frac = ox::st_divide(tokens, lpt_balance, false);
+        Some((mul_directed(out_balance, frac, false, out_xrp), tokens))
+    };
+    if let Some((a2, t)) = led(amount, amount_balance, amount2_balance, amount2_xrp) {
+        if ox::me_cmp(a2, amount2).is_le() {
+            return Some((amount, a2, t));
+        }
+    }
+    if let Some((a1, t)) = led(amount2, amount2_balance, amount_balance, amount_xrp) {
+        if ox::me_cmp(a1, amount).is_le() {
+            return Some((a1, amount2, t));
         }
     }
     None
@@ -497,7 +553,7 @@ impl Transactor for AMMDepositTransactor {
         // never failed, so #105869720 878CD973C64F returned tesSUCCESS against
         // mainnet's tecAMM_FAILED.
         const TF_TWO_ASSET: u64 = 0x0010_0000;
-        let mut sized: Option<(ox::Me, ox::Me)> = None;
+        let mut sized: Option<(ox::Me, ox::Me, ox::Me)> = None;
         if tx.fields.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & TF_TWO_ASSET != 0 {
             if let (Some(av), Some(bv)) = (tx.fields.get("Amount"), tx.fields.get("Amount2")) {
                 if let (Some(aleg), Some(amt), Some(bleg), Some(amt2)) = (
@@ -519,7 +575,7 @@ impl Transactor for AMMDepositTransactor {
                             aleg.xrp,
                             bleg.xrp,
                         ) {
-                            Some(pair) => sized = Some(pair),
+                            Some(triple) => sized = Some(triple),
                             None => return TxResult::AmmFailed,
                         }
                     }
@@ -550,8 +606,8 @@ impl Transactor for AMMDepositTransactor {
             if let Some(v) = tx.fields.get(*f) {
                 if let (Some(leg), Some(amt0)) = (ox::leg_of(v), keylet::amount_mant_exp(v)) {
                     let amt = match sized {
-                        Some((a, _)) if i == 0 => a,
-                        Some((_, b)) => b,
+                        Some((a, _, _)) if i == 0 => a,
+                        Some((_, b, _)) => b,
                         None => amt0,
                     };
                     if amt.0 > 0 {
@@ -574,6 +630,7 @@ impl Transactor for AMMDepositTransactor {
             .get("LPTokenOut")
             .and_then(keylet::amount_mant_exp)
             .filter(|m| m.0 > 0)
+            .or_else(|| sized.map(|(_, _, t)| t).filter(|t| t.0 > 0))
             .or_else(|| {
                 let (pool_pre, amt) = single_pre?;
                 let obj = ox::json_at(sandbox, &amm_key)?;
@@ -806,10 +863,73 @@ impl Transactor for AMMWithdrawTransactor {
             None
         };
 
+        let pool_lpt = |sandbox: &Sandbox| -> Option<ox::Me> {
+            let o = ox::json_at(sandbox, &amm_key)?;
+            keylet::amount_mant_exp(&serde_json::Value::String(
+                o["LPTokenBalance"]["value"].as_str()?.to_string(),
+            ))
+        };
+        // tfTwoAsset: Amount/Amount2 are MAXIMA and the pool ratio picks the
+        // pair — moving them verbatim withdraws whatever was asked for.
+        const TF_TWO_ASSET_W: u64 = 0x0010_0000;
+        let wd_sized: Option<(ox::Me, ox::Me, ox::Me)> = if wd_flags & TF_TWO_ASSET_W != 0 {
+            (|| {
+                let (av, bv) = (tx.fields.get("Amount")?, tx.fields.get("Amount2")?);
+                let (aleg, amt) = (ox::leg_of(av)?, keylet::amount_mant_exp(av)?);
+                let (bleg, amt2) = (ox::leg_of(bv)?, keylet::amount_mant_exp(bv)?);
+                equal_withdraw_limit(
+                    crate::tx::amm_swap::holds(sandbox, &amm_acct, &aleg),
+                    crate::tx::amm_swap::holds(sandbox, &amm_acct, &bleg),
+                    pool_lpt(sandbox)?,
+                    amt,
+                    amt2,
+                    aleg.xrp,
+                    bleg.xrp,
+                )
+            })()
+        } else {
+            None
+        };
+        // tfOneAssetLPToken: LPTokenIn is what is burned and the AMOUNT is
+        // DERIVED from it via `ammAssetOut` (`Amount` is only a minimum) —
+        // rippled `singleWithdrawTokens` (AMMWithdraw.cpp:1020).
+        let one_asset: Option<(ox::Me, ox::Me)> = if wd_sized.is_none() {
+            (|| {
+                let lp_in = tx
+                    .fields
+                    .get("LPTokenIn")
+                    .and_then(keylet::amount_mant_exp)
+                    .filter(|m| m.0 > 0)?;
+                let v = tx.fields.get("Amount")?;
+                let leg = ox::leg_of(v)?;
+                let lpt = pool_lpt(sandbox)?;
+                let tfee = ox::json_at(sandbox, &amm_key)
+                    .and_then(|o| o["TradingFee"].as_u64())
+                    .unwrap_or(0) as u16;
+                let tokens = crate::tx::amm_swap::adjust_lp_tokens(lpt, lp_in, false);
+                let out = crate::tx::amm_swap::amm_asset_out(
+                    crate::tx::amm_swap::holds(sandbox, &amm_acct, &leg),
+                    lpt,
+                    tokens,
+                    tfee,
+                    leg.xrp,
+                )?;
+                Some((out, tokens))
+            })()
+        } else {
+            None
+        };
+
         // Move the withdrawn side(s) AMM account → withdrawer.
-        for f in ["Amount", "Amount2"] {
-            if let Some(v) = tx.fields.get(f) {
-                if let (Some(leg), Some(amt)) = (ox::leg_of(v), keylet::amount_mant_exp(v)) {
+        for (i, f) in ["Amount", "Amount2"].iter().enumerate() {
+            if let Some(v) = tx.fields.get(*f) {
+                if let (Some(leg), Some(amt0)) = (ox::leg_of(v), keylet::amount_mant_exp(v)) {
+                    let amt = match (wd_sized, one_asset) {
+                        (Some((a, _, _)), _) if i == 0 => a,
+                        (Some((_, b, _)), _) => b,
+                        (None, Some((a, _))) if i == 0 => a,
+                        _ => amt0,
+                    };
                     if amt.0 > 0 {
                         ox::move_leg(sandbox, &amm_acct, &tx.account, &leg, amt);
                     }
@@ -823,11 +943,15 @@ impl Transactor for AMMWithdrawTransactor {
         // which consumed the LP's ENTIRE position on mainnet (the LP line is
         // Deleted); we burned the placeholder and left the line at a nonzero
         // balance.
-        let burned = tx
-            .fields
-            .get("LPTokenIn")
-            .and_then(keylet::amount_mant_exp)
-            .filter(|m| m.0 > 0)
+        let burned = wd_sized
+            .map(|(_, _, t)| t)
+            .or(one_asset.map(|(_, t)| t))
+            .or_else(|| {
+                tx.fields
+                    .get("LPTokenIn")
+                    .and_then(keylet::amount_mant_exp)
+                    .filter(|m| m.0 > 0)
+            })
             .or(single_asset_burn)
             .unwrap_or((1_000_000_000_000_000, -8));
         ox::move_leg(sandbox, &tx.account, &amm_acct, &lp_leg, burned);
@@ -1158,7 +1282,24 @@ mod tests {
             amount_balance, amount2_balance, lpt_balance,
             (10_000_001, 0), (3_235_503_279_094_231, -15), true, false,
         );
-        assert_eq!(ok, Some(((10_000_001, 0), (3_235_503_279_094_231, -15))));
+        let (a1, a2, tokens) = ok.expect("QQ1-led direction fits");
+        assert_eq!((a1, a2), ((10_000_001, 0), (3_235_503_279_094_231, -15)));
+        // The tokens the sizing already derived are what gets MINTED — they used
+        // to be computed, discarded, and replaced by a 1e7 placeholder.
+        // The minted tokens carry the deposit's own fraction of the pool. (This
+        // deposit is 136% of the XRP side, so the mint exceeding the outstanding
+        // supply is correct, not a bug.)
+        let f = |m: ox::Me| ox::me_to_value_string(m).parse::<f64>().unwrap();
+        let share = f(tokens) / f(lpt_balance);
+        let want = f(a2) / f(amount2_balance);
+        // This is the QQ1-LED direction, so the fraction is set by the QQ1 side
+        // and the XRP side is derived from it — rounded UP, which is why it does
+        // not reproduce the fraction to the last digit.
+        assert!(
+            (share - want).abs() / want < 1e-9,
+            "minted share {share} should track the deposit fraction {want}"
+        );
+        assert!(f(a1) / f(amount_balance) >= share);
     }
 
     #[test]

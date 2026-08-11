@@ -293,11 +293,26 @@ pub(crate) fn lp_tokens_out(balance: Me, deposit: Me, lpt: Me, tfee: u16) -> Me 
 /// against a pool of 22752296.08014551 whose 16-digit ulp is 1e-8, so mainnet
 /// credits exactly **32.98772104** and the LP trust line it creates stores that
 /// — not the raw root.
-pub(crate) fn adjust_lp_tokens_out(lpt: Me, tokens: Me) -> Me {
+pub(crate) fn adjust_lp_tokens(lpt: Me, tokens: Me, deposit: bool) -> Me {
     if lpt.0 == 0 || tokens.0 == 0 {
         return tokens;
     }
-    n_sub(n_add(lpt, tokens, Rnd::Down), lpt, Rnd::Down)
+    if deposit {
+        return n_sub(n_add(lpt, tokens, Rnd::Down), lpt, Rnd::Down);
+    }
+    // Withdraw is `(tokens - lptAMMBalance) + lptAMMBalance`, and that
+    // intermediate is NEGATIVE. Downward means toward -inf, so it rounds the
+    // intermediate's MAGNITUDE UP and the positive result back DOWN — which is
+    // not what feeding both steps through an unsigned `n_sub` would do.
+    match n_cmp(tokens, lpt) {
+        Ordering::Less => n_sub(lpt, n_sub(lpt, tokens, Rnd::Up), Rnd::Down),
+        _ => tokens,
+    }
+}
+
+/// Deposit-direction shorthand.
+pub(crate) fn adjust_lp_tokens_out(lpt: Me, tokens: Me) -> Me {
+    adjust_lp_tokens(lpt, tokens, true)
 }
 
 fn to_amount(x: Me, xrp: bool, rnd: Rnd) -> Me {
