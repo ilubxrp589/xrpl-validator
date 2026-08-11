@@ -599,16 +599,39 @@ impl Transactor for AMMDepositTransactor {
         } else {
             None
         };
+        // A single-asset deposit pays what the ADJUSTED tokens are worth, not
+        // what was asked for — so this must be derived BEFORE anything moves.
+        let single_adj: Option<(ox::Me, ox::Me)> = single_pre.and_then(|(pool_pre, amt)| {
+            let obj = ox::json_at(sandbox, &amm_key)?;
+            let lpt = keylet::amount_mant_exp(&serde_json::Value::String(
+                obj["LPTokenBalance"]["value"].as_str()?.to_string(),
+            ))?;
+            let tfee = obj["TradingFee"].as_u64().unwrap_or(0) as u16;
+            let xrp = tx.fields.get("Amount").and_then(ox::leg_of).map(|l| l.xrp)?;
+            let t0 = crate::tx::amm_swap::adjust_lp_tokens(
+                lpt,
+                crate::tx::amm_swap::lp_tokens_out(pool_pre, amt, lpt, tfee),
+                true,
+            );
+            if t0.0 == 0 {
+                return None;
+            }
+            let (tokens, deposited) = crate::tx::amm_swap::adjust_asset_in_by_tokens(
+                pool_pre, amt, lpt, t0, tfee, xrp,
+            );
+            (tokens.0 > 0 && deposited.0 > 0).then_some((deposited, tokens))
+        });
 
         // Move the deposited side(s) depositor → AMM account (XRP or IOU
         // lines — move_leg handles both).
         for (i, f) in ["Amount", "Amount2"].iter().enumerate() {
             if let Some(v) = tx.fields.get(*f) {
                 if let (Some(leg), Some(amt0)) = (ox::leg_of(v), keylet::amount_mant_exp(v)) {
-                    let amt = match sized {
-                        Some((a, _, _)) if i == 0 => a,
-                        Some((_, b, _)) => b,
-                        None => amt0,
+                    let amt = match (sized, single_adj) {
+                        (Some((a, _, _)), _) if i == 0 => a,
+                        (Some((_, b, _)), _) => b,
+                        (None, Some((a, _))) if i == 0 => a,
+                        _ => amt0,
                     };
                     if amt.0 > 0 {
                         ox::move_leg(sandbox, &tx.account, &amm_acct, &leg, amt);
@@ -631,18 +654,7 @@ impl Transactor for AMMDepositTransactor {
             .and_then(keylet::amount_mant_exp)
             .filter(|m| m.0 > 0)
             .or_else(|| sized.map(|(_, _, t)| t).filter(|t| t.0 > 0))
-            .or_else(|| {
-                let (pool_pre, amt) = single_pre?;
-                let obj = ox::json_at(sandbox, &amm_key)?;
-                let lpt = keylet::amount_mant_exp(&serde_json::Value::String(
-                    obj["LPTokenBalance"]["value"].as_str()?.to_string(),
-                ))?;
-                let tfee = obj["TradingFee"].as_u64().unwrap_or(0) as u16;
-                let t = crate::tx::amm_swap::lp_tokens_out(pool_pre, amt, lpt, tfee);
-                // fixAMMv1_3 quantizes the mint to the pool balance's ulp.
-                let t = crate::tx::amm_swap::adjust_lp_tokens_out(lpt, t);
-                (t.0 > 0).then_some(t)
-            })
+            .or_else(|| single_adj.map(|(_, t)| t))
             .unwrap_or((1_000_000_000_000_000, -8));
         ox::move_leg(sandbox, &amm_acct, &tx.account, &lp_leg, minted);
         bump_lp_balance(sandbox, &amm_key, minted, true);

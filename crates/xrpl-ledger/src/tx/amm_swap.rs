@@ -274,6 +274,131 @@ pub(crate) fn lp_tokens_out(balance: Me, deposit: Me, lpt: Me, tfee: u16) -> Me 
     n_mul(lpt, n_div(num, n_add(N_ONE, c, Rnd::Near), Rnd::Near), Rnd::Down)
 }
 
+/// rippled `ammAssetIn` (AMMHelpers.cpp, "Equation 4") — the single-asset
+/// deposit that mints exactly `lp_tokens`, i.e. Equation 3 solved for the
+/// asset:
+///
+/// ```text
+/// f1 = 1 - tfee/100000,  f2 = (1 - tfee/200000)/f1
+/// t1 = lp_tokens/lpt,  t2 = 1 + t1,  d = f2 - t1/t2
+/// a  = 1/t2^2,  b = 2d/t2 - 1/f1,  c = d^2 - f2^2
+/// frac = (-b + sqrt(b^2 - 4ac)) / (2a)          (solveQuadraticEq)
+/// in   = multiply(balance, frac, UPWARD)        ("maximize deposit")
+/// ```
+///
+/// ⚠ `c` is NEGATIVE in every real regime (d < f2), so `-4ac` ADDS to the
+/// discriminant; `b` is positive, so the root is `sqrt(D) - b` — a cancellation
+/// of two ~1.0 values down to ~3e-4. rippled cancels identically, so mirroring
+/// it is the point; do not "improve" it algebraically.
+/// Signs are tracked explicitly because `Me` is unsigned.
+pub(crate) fn amm_asset_in(balance: Me, lpt: Me, lp_tokens: Me, tfee: u16, xrp: bool) -> Option<Me> {
+    if balance.0 == 0 || lpt.0 == 0 || lp_tokens.0 == 0 {
+        return None;
+    }
+    let f1 = n_sub(N_ONE, fee_n(tfee), Rnd::Near);
+    if f1.0 == 0 {
+        return None;
+    }
+    let f2 = n_div(n_sub(N_ONE, fee_half_n(tfee), Rnd::Near), f1, Rnd::Near);
+    let t1 = n_div(lp_tokens, lpt, Rnd::Near);
+    let t2 = n_add(N_ONE, t1, Rnd::Near);
+    let t1t2 = n_div(t1, t2, Rnd::Near);
+    let (d, d_neg) = match n_cmp(f2, t1t2) {
+        Ordering::Less => (n_sub(t1t2, f2, Rnd::Near), true),
+        _ => (n_sub(f2, t1t2, Rnd::Near), false),
+    };
+    let a = n_div(N_ONE, n_mul(t2, t2, Rnd::Near), Rnd::Near);
+    if a.0 == 0 {
+        return None;
+    }
+    // b = 2d/t2 - 1/f1
+    let lhs = n_div(n_mul(N_TWO, d, Rnd::Near), t2, Rnd::Near);
+    let rhs = n_div(N_ONE, f1, Rnd::Near);
+    let (b, b_neg) = if d_neg {
+        (n_add(lhs, rhs, Rnd::Near), true)
+    } else {
+        match n_cmp(lhs, rhs) {
+            Ordering::Less => (n_sub(rhs, lhs, Rnd::Near), true),
+            _ => (n_sub(lhs, rhs, Rnd::Near), false),
+        }
+    };
+    // c = d^2 - f2^2
+    let (d2, f22) = (n_mul(d, d, Rnd::Near), n_mul(f2, f2, Rnd::Near));
+    let (c, c_neg) = match n_cmp(d2, f22) {
+        Ordering::Less => (n_sub(f22, d2, Rnd::Near), true),
+        _ => (n_sub(d2, f22, Rnd::Near), false),
+    };
+    // D = b^2 - 4ac
+    let b2 = n_mul(b, b, Rnd::Near);
+    let four_ac = n_mul(n_mul(N_FOUR, a, Rnd::Near), c, Rnd::Near);
+    let disc = if c_neg {
+        n_add(b2, four_ac, Rnd::Near)
+    } else if n_cmp(b2, four_ac) == Ordering::Less {
+        return None;
+    } else {
+        n_sub(b2, four_ac, Rnd::Near)
+    };
+    let root = n_sqrt(disc);
+    let num = if b_neg {
+        n_add(root, b, Rnd::Near)
+    } else if n_cmp(root, b) != Ordering::Greater {
+        return None;
+    } else {
+        n_sub(root, b, Rnd::Near)
+    };
+    let frac = n_div(num, n_mul(N_TWO, a, Rnd::Near), Rnd::Near);
+    if frac.0 == 0 {
+        return None;
+    }
+    Some(to_amount(n_mul(balance, frac, Rnd::Up), xrp, Rnd::Up))
+}
+
+/// rippled `adjustAssetInByTokens` (AMMHelpers.cpp) — a single-asset deposit
+/// pays what the ADJUSTED tokens are actually worth, not what was asked for.
+///
+/// `ammAssetIn` rounds the asset UP, so it can land ABOVE the requested amount;
+/// rippled's comment is literally "Rounding didn't work the right way". It then
+/// pulls the request down by the overshoot, re-derives the tokens from that
+/// smaller amount, and re-prices — returning `min(amount, assetAdj)`.
+///
+/// #105813899 `2C8C37F9` is the specimen: 396118 drops requested, mainnet
+/// deposits **396117** and mints for that, which is why its LP credit is
+/// 0.0651047 lower than a mint priced on the full 396118.
+pub(crate) fn adjust_asset_in_by_tokens(
+    balance: Me,
+    amount: Me,
+    lpt: Me,
+    tokens: Me,
+    tfee: u16,
+    xrp: bool,
+) -> (Me, Me) {
+    let Some(mut asset_adj) = amm_asset_in(balance, lpt, tokens, tfee, xrp) else {
+        return (tokens, amount);
+    };
+    let mut tokens_adj = tokens;
+    if n_cmp(asset_adj, amount) == Ordering::Greater {
+        let over = n_sub(asset_adj, amount, Rnd::Near);
+        let adj_amount = n_sub(amount, over, Rnd::Near);
+        if adj_amount.0 == 0 {
+            return (tokens, amount);
+        }
+        let t = adjust_lp_tokens(lpt, lp_tokens_out(balance, adj_amount, lpt, tfee), true);
+        if t.0 == 0 {
+            return (tokens, amount);
+        }
+        tokens_adj = t;
+        match amm_asset_in(balance, lpt, tokens_adj, tfee, xrp) {
+            Some(v) => asset_adj = v,
+            None => return (tokens, amount),
+        }
+    }
+    let deposited = match n_cmp(amount, asset_adj) {
+        Ordering::Less => amount,
+        _ => asset_adj,
+    };
+    (tokens_adj, deposited)
+}
+
 /// rippled `adjustLPTokens` (AMMHelpers.cpp), reached from `adjustLPTokensOut`
 /// (AMMDeposit.cpp:623) on EVERY deposit path once fixAMMv1_3 is enabled:
 ///
