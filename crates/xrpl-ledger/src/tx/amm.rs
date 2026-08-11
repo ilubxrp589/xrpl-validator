@@ -191,10 +191,18 @@ impl Transactor for AMMCreateTransactor {
             }
         }
 
-        // Mint the creator's LP tokens (magnitude is value-level only).
+        // Mint the creator's LP tokens: `ammLPTokens` = sqrt(Amount * Amount2),
+        // XRP counted in DROPS. This was a hardcoded 1e7 placeholder, which
+        // every later deposit and withdrawal on the pool then inherited — 23 of
+        // the 83 value divergences at gate 46, and the largest by magnitude
+        // (#105666951 minted 10000000 against mainnet's 31622.77660168379).
         let lpt = keylet::amm_lpt_currency(&c1, &c2);
         let lp_leg = crate::tx::offer::Leg { xrp: false, cur: lpt, issuer: amm_acct };
-        let minted: crate::tx::offer::Me = (1_000_000_000_000_000, -8);
+        let minted: crate::tx::offer::Me =
+            match (keylet::amount_mant_exp(amount1), keylet::amount_mant_exp(amount2)) {
+                (Some(a), Some(b)) => crate::tx::amm_swap::amm_lp_tokens(a, b),
+                _ => (0, 0),
+            };
         ox::move_leg(sandbox, &amm_acct, &tx.account, &lp_leg, minted);
 
         // Create AMM ledger entry
@@ -519,6 +527,23 @@ impl Transactor for AMMDepositTransactor {
             }
         }
 
+        // `lpTokensOut` prices the deposit against the pool as it stood BEFORE
+        // the assets landed, so capture that side here — below the move it is
+        // already inflated by the deposit itself.
+        const TF_SINGLE_ASSET: u64 = 0x0008_0000;
+        let single_pre = if tx.fields.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0)
+            & TF_SINGLE_ASSET
+            != 0
+        {
+            tx.fields.get("Amount").and_then(|v| {
+                let leg = ox::leg_of(v)?;
+                let amt = keylet::amount_mant_exp(v)?;
+                Some((crate::tx::amm_swap::holds(sandbox, &amm_acct, &leg), amt))
+            })
+        } else {
+            None
+        };
+
         // Move the deposited side(s) depositor → AMM account (XRP or IOU
         // lines — move_leg handles both).
         for (i, f) in ["Amount", "Amount2"].iter().enumerate() {
@@ -535,14 +560,30 @@ impl Transactor for AMMDepositTransactor {
                 }
             }
         }
-        // Mint LP tokens to the depositor. The magnitude is oracle-corrected
-        // downstream; the LINE key (depositor ↔ AMM account, 0x03-currency)
-        // is what parity needs.
+        // Mint LP tokens to the depositor: an explicit `LPTokenOut` when the
+        // sender named one, else `lpTokensOut` (Equation 3) for a single-asset
+        // deposit.
+        //
+        // ⚠ The remaining modes — two-asset without LPTokenOut, tfOneAssetLPToken
+        // — still fall back to the 1e7 PLACEHOLDER this used to use
+        // unconditionally. That is deliberate: the line KEY is what the
+        // key-level gate needs, and the magnitude shows up under DX_VALCHECK
+        // until each mode's formula lands.
         let minted = tx
             .fields
             .get("LPTokenOut")
             .and_then(keylet::amount_mant_exp)
             .filter(|m| m.0 > 0)
+            .or_else(|| {
+                let (pool_pre, amt) = single_pre?;
+                let obj = ox::json_at(sandbox, &amm_key)?;
+                let lpt = keylet::amount_mant_exp(&serde_json::Value::String(
+                    obj["LPTokenBalance"]["value"].as_str()?.to_string(),
+                ))?;
+                let tfee = obj["TradingFee"].as_u64().unwrap_or(0) as u16;
+                let t = crate::tx::amm_swap::lp_tokens_out(pool_pre, amt, lpt, tfee);
+                (t.0 > 0).then_some(t)
+            })
             .unwrap_or((1_000_000_000_000_000, -8));
         ox::move_leg(sandbox, &amm_acct, &tx.account, &lp_leg, minted);
         bump_lp_balance(sandbox, &amm_key, minted, true);

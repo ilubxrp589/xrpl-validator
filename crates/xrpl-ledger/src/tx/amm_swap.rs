@@ -182,6 +182,24 @@ fn isqrt(n: u128) -> u128 {
 
 /// Correctly rounded (to nearest) square root.
 fn n_sqrt(x: Me) -> Me {
+    n_sqrt_rnd(x, Rnd::Near)
+}
+
+/// rippled `ammLPTokens` (AMMHelpers.cpp): what a pool of (`a`, `b`) is worth
+/// in LP tokens — `root2(a * b)`, upholding the AMM invariant
+/// `sqrt(asset1 * asset2) >= LPTokensBalance`. fixAMMv1_3 runs the WHOLE
+/// computation under `RoundingMode::Downward` (a `NumberRoundModeGuard` over
+/// both the product and the root), so the invariant can never be broken by a
+/// rounding-up.
+///
+/// ⚠ **XRP counts in DROPS here.** #105666951 `07DC0E81` pairs 100 XRC with
+/// `"10000000"` drops and mainnet mints `sqrt(100 * 10000000) = sqrt(1e9) =
+/// 31622.77660168379` — reading that side as 10 XRP gives 31.6, off by 1000x.
+pub(crate) fn amm_lp_tokens(a: Me, b: Me) -> Me {
+    n_sqrt_rnd(n_mul(a, b, Rnd::Down), Rnd::Down)
+}
+
+fn n_sqrt_rnd(x: Me, rnd: Rnd) -> Me {
     if x.0 == 0 {
         return (0, 0);
     }
@@ -190,8 +208,9 @@ fn n_sqrt(x: Me) -> Me {
     let s: i32 = if (e - 16).rem_euclid(2) == 0 { 16 } else { 15 };
     let big = m * 10u128.pow(s as u32);
     let mut r = isqrt(big);
-    // nearest: round up when the remainder passes the (r+1/2)² midpoint
-    if big - r * r > r {
+    // nearest: round up when the remainder passes the (r+1/2)² midpoint.
+    // Downward keeps the floor, so the root never exceeds the true value.
+    if rnd == Rnd::Near && big - r * r > r {
         r += 1;
     }
     let mut e2 = (e - s) / 2;
@@ -199,7 +218,7 @@ fn n_sqrt(x: Me) -> Me {
         r /= 10;
         e2 += 1;
     }
-    round16(r, e2, false, Rnd::Near)
+    round16(r, e2, false, rnd)
 }
 
 /// tfee basis points → fee fraction (exact in decimal, mode-independent).
@@ -208,6 +227,51 @@ fn fee_n(tfee: u16) -> Me {
         return (0, 0);
     }
     n_norm((tfee as u128, -5))
+}
+
+/// `feeMultHalf` — half the trading fee is charged on a single-asset deposit,
+/// because only the half that crosses the pool pays it.
+fn fee_half_n(tfee: u16) -> Me {
+    n_div(fee_n(tfee), N_TWO, Rnd::Near)
+}
+
+/// rippled `lpTokensOut` (AMMHelpers.cpp, "Equation 3") — the LP tokens minted
+/// by a SINGLE-ASSET deposit of `deposit` into a pool holding `balance` of that
+/// asset, against `lpt` outstanding:
+///
+/// ```text
+/// f1 = 1 - tfee/100000
+/// f2 = (1 - tfee/200000) / f1
+/// r  = deposit / balance
+/// c  = sqrt(f2^2 + r/f1) - f2
+/// t  = lpt * (r - c) / (1 + c)
+/// ```
+///
+/// Only the final multiply is directed — fixAMMv1_3 does it Downward, commented
+/// "minimize tokens out"; every intermediate runs at the ambient ToNearest.
+/// ⚠ The doc comment ABOVE the function in rippled writes the root as
+/// `sqrt(f2**2 - b/(B*f1))`; the CODE adds. Trust the code — with a minus the
+/// root goes imaginary for any real deposit.
+///
+/// Pinned to mainnet #105719563 `98A6B1C4`: 4435 PLX into a 1793413.846406219
+/// pool at fee 250 against 152935.7034799657 LPT mints 188.7469143481687.
+pub(crate) fn lp_tokens_out(balance: Me, deposit: Me, lpt: Me, tfee: u16) -> Me {
+    if balance.0 == 0 || deposit.0 == 0 || lpt.0 == 0 {
+        return (0, 0);
+    }
+    let f1 = n_sub(N_ONE, fee_n(tfee), Rnd::Near);
+    if f1.0 == 0 {
+        return (0, 0);
+    }
+    let f2 = n_div(n_sub(N_ONE, fee_half_n(tfee), Rnd::Near), f1, Rnd::Near);
+    let r = n_div(deposit, balance, Rnd::Near);
+    let under = n_add(n_mul(f2, f2, Rnd::Near), n_div(r, f1, Rnd::Near), Rnd::Near);
+    let c = n_sub(n_sqrt(under), f2, Rnd::Near);
+    let num = n_sub(r, c, Rnd::Near);
+    if num.0 == 0 {
+        return (0, 0);
+    }
+    n_mul(lpt, n_div(num, n_add(N_ONE, c, Rnd::Near), Rnd::Near), Rnd::Down)
 }
 
 fn to_amount(x: Me, xrp: bool, rnd: Rnd) -> Me {
@@ -1064,6 +1128,63 @@ pub(crate) fn consume(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ammLPTokens` = sqrt(a*b), rounded DOWNWARD, with XRP in DROPS.
+    ///
+    /// Pinned to mainnet #105666951 `07DC0E81`: 100 XRC against "10000000"
+    /// drops mints exactly 31622.77660168379. Reading the XRP side as 10 gives
+    /// 31.6 — a 1000x error the placeholder was hiding.
+    #[test]
+    fn amm_lp_tokens_matches_mainnets_initial_mint() {
+        let minted = amm_lp_tokens((100, 0), (10_000_000, 0));
+        assert_eq!(crate::tx::offer::me_to_value_string(minted), "31622.77660168379");
+
+        // Downward, never up: sqrt(2) must truncate at 16 digits, and a perfect
+        // square must not drift off its exact root.
+        assert_eq!(
+            crate::tx::offer::me_to_value_string(amm_lp_tokens((2, 0), (1, 0))),
+            "1.414213562373095"
+        );
+        assert_eq!(crate::tx::offer::me_to_value_string(amm_lp_tokens((4, 0), (4, 0))), "4");
+        assert_eq!(amm_lp_tokens((0, 0), (10, 0)), (0, 0));
+    }
+
+    /// Equation 3 against #105719563 `98A6B1C4`'s pool: 4435 PLX into
+    /// 1793413.846406219 at fee 250, against 152935.7034799657 LPT.
+    ///
+    /// ⚠ Asserted with a TOLERANCE, deliberately. `c = sqrt(f2^2 + r/f1) - f2`
+    /// subtracts two ~1.0012 values to get ~0.00124, so ~3 digits die in the
+    /// cancellation and the last few digits of the result depend on the
+    /// mantissa width — and rippled's `Number` has three configurable scales
+    /// (Small 16-digit, LargeLegacy/Large 19-digit) where our `Me` only ever
+    /// models 16. Pinning an exact string here would assert our own rounding,
+    /// not rippled's. Exactness is judged where it is observable: DX_VALCHECK
+    /// on the stored LPTokenBalance and LP trust line.
+    #[test]
+    fn single_asset_deposit_mints_mainnets_lp_tokens() {
+        let minted = lp_tokens_out(
+            me("1793413.846406219"),
+            me("4435"),
+            me("152935.7034799657"),
+            250,
+        );
+        let got: f64 = crate::tx::offer::me_to_value_string(minted).parse().unwrap();
+        let exact = 188.746914348168_72_f64; // 50-digit reference of Equation 3
+        assert!(
+            ((got - exact) / exact).abs() < 1e-11,
+            "Equation 3 gave {got}, expected ≈{exact}"
+        );
+
+        // Shape guards: a fee-free pool still mints, and nothing is minted for
+        // a zero deposit or against a pool with no tokens outstanding.
+        assert!(lp_tokens_out(me("1000"), me("100"), me("500"), 0).0 > 0);
+        assert_eq!(lp_tokens_out(me("1000"), (0, 0), me("500"), 250), (0, 0));
+        assert_eq!(lp_tokens_out(me("1000"), me("100"), (0, 0), 250), (0, 0));
+        // Charging a fee mints strictly fewer tokens for the same deposit.
+        let free = lp_tokens_out(me("1000"), me("100"), me("500"), 0);
+        let charged = lp_tokens_out(me("1000"), me("100"), me("500"), 1000);
+        assert!(n_cmp(charged, free) == Ordering::Less);
+    }
 
     fn me(s: &str) -> Me {
         let (int, frac) = match s.split_once('.') {
