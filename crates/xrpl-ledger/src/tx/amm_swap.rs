@@ -447,7 +447,29 @@ fn to_amount(x: Me, xrp: bool, rnd: Rnd) -> Me {
     if !xrp {
         return n_norm(x);
     }
-    (ox::me_rescale(x, 0, rnd == Rnd::Up), 0)
+    match rnd {
+        Rnd::Up => (ox::me_rescale(x, 0, true), 0),
+        Rnd::Down => (ox::me_rescale(x, 0, false), 0),
+        // `rnd == Rnd::Up` alone silently FLOORED a nearest request. Only the
+        // `limitOut` branch of `consume` asks for Near — every other call site
+        // states Up or Down — so this is the one place it ever mattered, and
+        // there it decides a whole drop.
+        //
+        // #105843839 C1F9FB1F: limitOut solves to 261170.9076568765 drops.
+        // Floored that is 261170; mainnet takes 261171 and its 6 metadata hits
+        // are all that single drop — two conserved pairs (taker/pool in AUDD
+        // and in XRP) plus the rested offer reflecting them.
+        //
+        // ⚠ 261171 is very slightly WORSE than the taker's limit (7.4e-10
+        // relative). rippled keeps it because `limitOut` actually reduced the
+        // output, which arms the `adjustedRemOut` 1e-7 forgiveness — the
+        // tolerance and this rounding are one mechanism, not two.
+        Rnd::Near => {
+            let t = ox::me_rescale(x, -1, false); // floor(x * 10)
+            let (q, d) = (t / 10, t % 10);
+            (if d >= 5 { q + 1 } else { q }, 0)
+        }
+    }
 }
 
 /// getRate-encode a rate value: ((exp+100)<<56) | mantissa∈[1e15,1e16).
