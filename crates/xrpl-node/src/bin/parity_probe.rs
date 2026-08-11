@@ -20,7 +20,6 @@ use xrpl_node::ffi_engine::{
     apply_ledger_in_order_with_net, fetch_mainnet_amendments_at, new_stats, NetParams,
 };
 
-const DEFAULT_RPC: &str = "https://s2.ripple.com:51234";
 
 fn hex_to_array32(s: &str) -> Option<[u8; 32]> {
     let v = hex::decode(s).ok()?;
@@ -56,11 +55,12 @@ fn run() -> i32 {
         eprintln!("usage: parity_probe <blobs.txt> <expected.json> [--rpc URL]");
         return 2;
     }
-    let rpc_url = args
+    // `--rpc` states a PREFERENCE, not a pin: the node is chosen per LEDGER
+    // below, because our LAN validator rolls fixtures out of its window.
+    let rpc_pref = args
         .iter()
         .position(|a| a == "--rpc")
-        .and_then(|i| args.get(i + 1).cloned())
-        .unwrap_or_else(|| DEFAULT_RPC.to_string());
+        .and_then(|i| args.get(i + 1).cloned());
 
     let blobs_tsv = match std::fs::read_to_string(&args[1]) {
         Ok(s) => s,
@@ -94,6 +94,8 @@ fn run() -> i32 {
         return 2;
     };
     let seq = seq as u32;
+    // Every hydration targets seq-1, so the node is chosen once, per run.
+    let rpc_url = xrpl_node::rpc_select::select_rpc(rpc_pref, seq - 1);
     let Some(parent_hash) = hdr["parent_hash"].as_str().and_then(hex_to_array32) else {
         eprintln!("expected json bad parent_hash");
         return 2;

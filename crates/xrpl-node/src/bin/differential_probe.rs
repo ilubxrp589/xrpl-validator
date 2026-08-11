@@ -30,7 +30,6 @@ use xrpl_ledger::ledger::state::LedgerState;
 use xrpl_ledger::ledger::transactor::{apply_common, TxFields, TxResult};
 use xrpl_ledger::tx::dispatch::get_transactor;
 
-const DEFAULT_RPC: &str = "https://s2.ripple.com:51234";
 
 /// Fee-only stub transactors (misc.rs `stub_transactor!`): wired but do_apply
 /// makes zero type-specific state changes. Reported as SKIP-STUB so the map is
@@ -1221,9 +1220,10 @@ fn run() -> i32 {
         eprintln!("usage: differential_probe <blobs.txt> <expected.json> [--rpc URL] [--json]");
         return 2;
     }
-    let rpc_url = args.iter().position(|a| a == "--rpc")
-        .and_then(|i| args.get(i + 1).cloned())
-        .unwrap_or_else(|| DEFAULT_RPC.to_string());
+    // `--rpc` states a PREFERENCE, not a pin: `select_rpc` below falls back to
+    // s2 for any ledger the preferred node has already rolled past.
+    let rpc_pref = args.iter().position(|a| a == "--rpc")
+        .and_then(|i| args.get(i + 1).cloned());
     let want_json = args.iter().any(|a| a == "--json");
 
     let expected_json = match std::fs::read_to_string(&args[2]) {
@@ -1239,6 +1239,8 @@ fn run() -> i32 {
         Some(s) => s as u32,
         None => { eprintln!("missing ledger_seq"); return 2; }
     };
+    // Every hydration targets seq-1, so the node is chosen once, per run.
+    let rpc_url = xrpl_node::rpc_select::select_rpc(rpc_pref, seq - 1);
     let txmap = match exp["txs"].as_object() {
         Some(m) => m,
         None => { eprintln!("missing txs"); return 2; }
