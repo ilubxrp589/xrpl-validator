@@ -2831,7 +2831,30 @@ pub(crate) fn cross_engine_to(
                 //   Path rejected by limitQuality
                 //     limit: 5773207684604483397  path q: 5773207684604483400
                 // then rests the remainder. We crossed it: 9 muts against 7.
-                let mut pay = mul_round16_up(give, rate_me(q));
+                // A fill that takes the WHOLE offer transfers the offer's own
+                // amounts verbatim — rippled starts every fill from
+                // `auto ofrAmt = offer.amount()` (BookStep.cpp:769) and only
+                // re-prices through the quality when a limit actually BINDS
+                // (`limitStepIn`/`limitStepOut`, :635-679, both guarded by
+                // `if (limit < stpAmt.…)`).
+                //
+                // Pricing an unbound fill through the BookDirectory rate instead
+                // is wrong whenever an offer's own ratio has drifted from the
+                // page it sits on, and it drifts as soon as the offer is
+                // partially consumed. #105828322 17A866423C61, maker 8101994315B3
+                // offering 179.501643 RLUSD for 164467776 drops:
+                //   own ratio 916246.6329068642 -> 164467776   <- mainnet
+                //   page rate 916246.7164381367 -> 164467790.99 -> 164467790
+                // 14 drops overpaid on a fully-consumed offer. rippled uses that
+                // same page rate for strand ADMISSION — its FLOWDBG prints
+                // `strandQ 916246.7164381367` — which is why the quality is
+                // right and the payment is not.
+                let full_offer = !buy_bound && me_cmp(funded, m_gives0).is_ge();
+                let mut pay = if full_offer {
+                    m_wants0
+                } else {
+                    mul_round16_up(give, rate_me(q))
+                };
                 if gets_leg.xrp {
                     // Whole drops FLOOR, they do not ceil. Observed twice in
                     // libxrpl's own trace (XRPL_FFI_TRACE):
