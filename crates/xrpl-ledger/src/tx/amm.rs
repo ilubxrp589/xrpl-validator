@@ -717,7 +717,17 @@ fn payout_proportional(
         let Some(v) = tx.fields.get(f) else { continue };
         let Some(leg) = asset_leg(v) else { continue };
         let pool = crate::tx::amm_swap::holds(sandbox, amm_acct, &leg);
-        let share = ox::me_muldiv(pool, tokens, total_lp, false);
+        // TWO separate 16-digit steps, not a fused muldiv. rippled's
+        // `equalWithdrawTokens` computes `frac = tokens / lptAMMBalance` and
+        // then `getRoundedAsset(balance, frac, IsDeposit::No)` =
+        // `multiply(balance, frac, Downward)`, so `frac` is rounded to 16
+        // digits BEFORE it multiplies. A fused muldiv keeps the intermediate
+        // exact — more accurate than rippled, and therefore wrong.
+        //
+        // #105796380 2437575D (tfWithdrawAll) is the specimen: the withdrawer's
+        // Jocker line lands …890599 against mainnet's …890600, one ulp.
+        let frac = ox::st_divide(tokens, total_lp, false);
+        let share = mul_directed(pool, frac, false, leg.xrp);
         if share.0 > 0 {
             ox::move_leg(sandbox, amm_acct, &tx.account, &leg, share);
         }
