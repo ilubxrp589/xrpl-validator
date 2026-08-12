@@ -106,8 +106,24 @@ fn n_div(a: Me, b: Me, rnd: Rnd) -> Me {
     let b = n_norm(b);
     let num = a.0 * 100_000_000_000_000_000u128; // ×1e17 ≤ 1e33, fits u128
     let q = num / b.0;
-    let r = num % b.0;
-    round16(q, a.1 - b.1 - 17, r != 0, rnd)
+    // ⚠ The division REMAINDER IS DISCARDED, not carried as a sticky bit.
+    // `Number::operator/=` scales by 10^17 and integer-divides exactly as this
+    // does, but for the SMALL (16-digit) mantissa scale — the one mainnet runs,
+    // see the amendment check in [the resume memo] — it takes `zm = numerator /
+    // dm` and leaves `dropped = false`. Stages 2 and 3, which would recover the
+    // remainder and feed it to the Guard, are gated on
+    // `range.scale != MantissaScale::Small` and never execute. Only the digits
+    // dropped while normalising into range reach the rounding.
+    //
+    // Feeding the remainder in instead rounds UP on quotients rippled leaves
+    // alone. Caught by instrumenting `swapAssetOut` in the FFI shim on
+    // #105916476 5F89F8E5: identical inputs, and rippled reports
+    //   numerator=502924504664754.8 denom=5960396041 ratio=84377.69926784548
+    // where the exact quotient is 84377.699267845480404… — its 17-digit
+    // quotient is 84377699267845480, normalising drops one '0' with NO sticky,
+    // so Upward does not increment. We produced …549 and the whole swap came
+    // out 1.0045e-11 high.
+    round16(q, a.1 - b.1 - 17, false, rnd)
 }
 
 fn n_add(a: Me, b: Me, rnd: Rnd) -> Me {
