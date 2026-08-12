@@ -370,12 +370,26 @@ impl PaymentTransactor {
             need[i - 1] = if ox::me_is_zero(consumed) {
                 (9_990_000_000_000_000, 60)
             } else {
-                // GROSS: the previous hop must buy the fee too, or the chain
-                // arrives short by exactly the issuer's rate.
-                match in_rate {
-                    Some(r) => ox::me_muldiv(consumed, (r as u128, 0), (1_000_000_000, 0), true),
-                    None => consumed,
-                }
+                // `consumed` is ALREADY GROSS. `measure_hop` grants a balance
+                // and differences it, and the walk debits the input transfer
+                // fee per fill (`offer.rs`, BookStep.cpp:770) — so the fee is
+                // inside the measurement. Multiplying by the rate here charged
+                // it a SECOND time and the rate compounded.
+                //
+                // #105795329 ED4F899F is the specimen, exact:
+                //   hop 1 consumes 220.1943150207048 USD (rPFLkx, 1:1 -> RWA)
+                //   walk debits    x1.001 = 220.41450933573  <- mainnet's gross
+                //   this grossed   x1.001 = 220.63492384506
+                //   excess 220.1943150207048 x 0.001001 = 0.22041450933
+                // which is exactly the gap on the AMM's USD line, with the
+                // 193872-drop conserved pair on the two AccountRoots being the
+                // same excess priced back through the XRP/USD pool.
+                //
+                // ⚠ The fee is charged in ONE place — the walk. Everything here
+                // only SIZES (`avail = carry / rate`, `spend0 / rate`). Adding
+                // a debit here because a chain "arrives short" recreates this.
+                let _ = in_rate;
+                consumed
             };
         }
         need
@@ -498,6 +512,24 @@ impl PaymentTransactor {
             // destroyed. Hop 0's input is `spend_leg`, already charged once via
             // `spend_rate`, so only the INTERMEDIATES are handled here.
             //
+            // ⚠ The DEBIT now belongs to the walk (`offer.rs` charges it per
+            // fill, which is where rippled charges it). Only the SIZING stays
+            // here: `avail = carry / rate` is what can actually reach a maker.
+            // Charging it in both places compounds the rate — #105795329
+            // ED4F899F is the specimen, and its arithmetic is exact:
+            //   hop 1 consumes  220.1943150207048 USD (rPFLkx, 1:1 -> RWA)
+            //   walk debits     x 1.001            = 220.41450933573
+            //   this site then  x 1.001 again      = 220.63492384506
+            //   excess          220.1943150207048 x 0.001001 = 0.22041450933
+            // which is EXACTLY the gap DX_VALCHECK reported on the AMM's USD
+            // line, and the 193872-drop pair on the two AccountRoots is the
+            // same excess priced back through the XRP/USD pool.
+            //
+            // Found by applying the habit to this very comment block: it and
+            // `offer.rs`'s both state the rule, and neither knew the other
+            // existed. `measure_hop` differences a BALANCE, so the walk's debit
+            // was already inside `consumed` before the reverse pass grossed it.
+            //
             // #105924683 B3AA3ACC is the specimen: a circular
             // tfPartialPayment, XRP -> SGB -> PLX -> Teddy, where SGB's
             // issuer rctArjqVvTHi charges 0.3%. PLX and Teddy charge nothing —
@@ -520,20 +552,14 @@ impl PaymentTransactor {
                 hop_thr, hop_thr, false, false, single_pass, amm_fib.as_deref_mut(), None,
                 sandbox, &mut Vec::new(),
             );
-            // Charge the fee on what the hop REALLY consumed, not on the whole
-            // carry — an unspent remainder was never handed to anyone.
-            if let (Some(r), Some((bneg, b))) = (hop_rate, in_before) {
-                if let Some((aneg, a)) = Self::leg_signed_balance(sandbox, &tx.account, chain[i]) {
-                    let (uneg, used) = ox::signed_add(bneg, b, !aneg, a); // before - after
-                    if !uneg && !ox::me_is_zero(used) {
-                        let gross = ox::me_muldiv(used, (r as u128, 0), (1_000_000_000, 0), true);
-                        let fee = ox::me_sub(gross, used);
-                        if !ox::me_is_zero(fee) {
-                            ox::line_adjust(sandbox, &tx.account, chain[i], fee, false);
-                        }
-                    }
-                }
-            }
+            // The walk has already debited the fee per fill. Nothing to add.
+            //
+            // Measured INERT on #105091578, #105923760 and #105795329 — the
+            // hit sets are byte-identical with and without it, because an
+            // intermediate rides "in flight" through the sender and usually has
+            // no line to difference (`in_before` is None). It is removed on
+            // PRINCIPLE, not on evidence: the walk is the single owner.
+            let _ = in_before;
             carry = match (before, Self::leg_signed_balance(sandbox, &tx.account, out_leg)) {
                 (Some((bneg, b)), Some((aneg, a))) => {
                     // delta = after - before; a fall in balance buys nothing.
