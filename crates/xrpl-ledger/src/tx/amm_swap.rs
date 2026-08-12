@@ -415,6 +415,52 @@ pub(crate) fn adjust_asset_in_by_tokens(
     (tokens_adj, deposited)
 }
 
+/// rippled `adjustAssetOutByTokens` (AMMHelpers.cpp) — the withdraw mirror of
+/// `adjust_asset_in_by_tokens`. A single-asset withdrawal pays what the
+/// ADJUSTED tokens are worth, not what was asked for.
+///
+/// `ammAssetOut` rounds the asset DOWN, but the retry still exists for the case
+/// where it lands ABOVE the request: pull the request down by the overshoot,
+/// re-derive the tokens from that smaller amount, re-price, and return
+/// `min(amount, assetAdj)`.
+pub(crate) fn adjust_asset_out_by_tokens(
+    balance: Me,
+    amount: Me,
+    lpt: Me,
+    tokens: Me,
+    tfee: u16,
+    xrp: bool,
+) -> (Me, Me) {
+    let Some(mut asset_adj) = amm_asset_out(balance, lpt, tokens, tfee, xrp) else {
+        return (tokens, amount);
+    };
+    let mut tokens_adj = tokens;
+    if n_cmp(asset_adj, amount) == Ordering::Greater {
+        let over = n_sub(asset_adj, amount, Rnd::Near);
+        let adj_amount = n_sub(amount, over, Rnd::Near);
+        if adj_amount.0 == 0 {
+            return (tokens, amount);
+        }
+        let Some(t) = lp_tokens_in(balance, adj_amount, lpt, tfee) else {
+            return (tokens, amount);
+        };
+        let t = adjust_lp_tokens(lpt, t, false);
+        if t.0 == 0 {
+            return (tokens, amount);
+        }
+        tokens_adj = t;
+        match amm_asset_out(balance, lpt, tokens_adj, tfee, xrp) {
+            Some(v) => asset_adj = v,
+            None => return (tokens, amount),
+        }
+    }
+    let out = match n_cmp(amount, asset_adj) {
+        Ordering::Less => amount,
+        _ => asset_adj,
+    };
+    (tokens_adj, out)
+}
+
 /// rippled `adjustLPTokens` (AMMHelpers.cpp), reached from `adjustLPTokensOut`
 /// (AMMDeposit.cpp:623) on EVERY deposit path once fixAMMv1_3 is enabled:
 ///

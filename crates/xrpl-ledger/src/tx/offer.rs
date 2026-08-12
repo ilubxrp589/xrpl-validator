@@ -809,9 +809,23 @@ fn div_nearest_16(num: u128, den: u128, e: i32) -> Me {
     }
     let d = 10u128.pow(k);
     let (mut m, rr) = (q / d, q % d);
-    // Discarded tail = rr + r/den (in ulps of the kept mantissa) vs d/2.
-    let lhs = 2 * (rr * den + r);
-    let rhs = d * den;
+    // ⚠ The division REMAINDER IS DISCARDED, not folded into the tie.
+    // `Number::operator/=` at the SMALL 16-digit scale — the one mainnet runs —
+    // takes `zm = numerator / dm` and leaves `dropped = false`; Stages 2 and 3,
+    // which would recover the remainder for the Guard, are gated on
+    // `range.scale != MantissaScale::Small` and never execute. Only the digits
+    // shed while normalising into range reach the rounding.
+    //
+    // This is the same defect `e7183b3` fixed in `amm_swap::n_div`, in the
+    // sibling primitive — which is why that commit moved Payment and
+    // OfferCreate but left all 11 AMM hits untouched: `st_divide` is used ONLY
+    // by the AMM deposit/withdraw sizing.
+    //
+    // ⚠ Inert for the multiply caller below, which passes den = 1 so r is
+    // always 0 and the comparison is unchanged.
+    let _ = r;
+    let lhs = 2 * rr;
+    let rhs = d;
     if lhs > rhs || (lhs == rhs && m & 1 == 1) {
         m += 1;
     }

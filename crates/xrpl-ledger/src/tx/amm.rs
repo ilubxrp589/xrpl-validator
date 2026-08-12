@@ -869,7 +869,27 @@ impl Transactor for AMMWithdrawTransactor {
                 let tfee = ox::json_at(sandbox, &amm_key)
                     .and_then(|o| o["TradingFee"].as_u64())
                     .unwrap_or(0) as u16;
-                crate::tx::amm_swap::lp_tokens_in(balance, withdraw, total_lp, tfee)
+                // `singleWithdraw` (AMMWithdraw.cpp:969) does NOT burn what
+                // `lpTokensIn` returns, nor pay out the requested `Amount`:
+                //   tokens = adjustLPTokensIn(lpt, lpTokensIn(...), withdrawAll)
+                //   (tokensAdj, amountAdj) = adjustAssetOutByTokens(...)
+                // and it withdraws `amountAdj`, burning `tokensAdj`. The
+                // adjustment quantises the burn to the POOL BALANCE's ulp,
+                // which is why mainnet's LP line lands on a coarse grid where
+                // ours carried full 16-digit precision — #105816437 AC7713F9
+                // stores 97379042.34212 against our 97379042.34211386.
+                //
+                // tfWithdrawAll skips the adjustment (`isWithdrawAll`), and it
+                // returns earlier, so this path never sees it.
+                let t0 = crate::tx::amm_swap::lp_tokens_in(balance, withdraw, total_lp, tfee)?;
+                let t0 = crate::tx::amm_swap::adjust_lp_tokens(total_lp, t0, false);
+                if t0.0 == 0 {
+                    return None;
+                }
+                let (tokens, out) = crate::tx::amm_swap::adjust_asset_out_by_tokens(
+                    balance, withdraw, total_lp, t0, tfee, leg.xrp,
+                );
+                (tokens.0 > 0 && out.0 > 0).then_some((out, tokens))
             })()
         } else {
             None
@@ -936,10 +956,12 @@ impl Transactor for AMMWithdrawTransactor {
         for (i, f) in ["Amount", "Amount2"].iter().enumerate() {
             if let Some(v) = tx.fields.get(*f) {
                 if let (Some(leg), Some(amt0)) = (ox::leg_of(v), keylet::amount_mant_exp(v)) {
-                    let amt = match (wd_sized, one_asset) {
-                        (Some((a, _, _)), _) if i == 0 => a,
-                        (Some((_, b, _)), _) => b,
-                        (None, Some((a, _))) if i == 0 => a,
+                    let amt = match (wd_sized, one_asset, single_asset_burn) {
+                        (Some((a, _, _)), _, _) if i == 0 => a,
+                        (Some((_, b, _)), _, _) => b,
+                        (None, Some((a, _)), _) if i == 0 => a,
+                        // tfSingleAsset pays what the ADJUSTED tokens are worth.
+                        (None, None, Some((a, _))) if i == 0 => a,
                         _ => amt0,
                     };
                     if amt.0 > 0 {
@@ -964,7 +986,7 @@ impl Transactor for AMMWithdrawTransactor {
                     .and_then(keylet::amount_mant_exp)
                     .filter(|m| m.0 > 0)
             })
-            .or(single_asset_burn)
+            .or(single_asset_burn.map(|(_, t)| t))
             .unwrap_or((1_000_000_000_000_000, -8));
         ox::move_leg(sandbox, &tx.account, &amm_acct, &lp_leg, burned);
         bump_lp_balance(sandbox, &amm_key, burned, false);
