@@ -2064,6 +2064,37 @@ thr={t:?} admits_trunc={} admits_up={}",
             // `strands.size() > 1`, which a bridged payment satisfies.
             None => true,
         };
+        // ⚠ Under multiPath, a clamped POOL fill is priced at the OFFER'S
+        // QUALITY, not re-swapped through the conservation function:
+        //     if (ammLiquidity_.multiPath())
+        //         return quality().ceilOutStrict(offerAmount, limit, roundUp);
+        //     return {swapAssetOut(balances_, limit, tradingFee()), limit};
+        // (AMMOffer::limitOut, AMMOffer.cpp; `limitIn` branches the same way).
+        // The comment on `unreprice_a` below already said the conservation
+        // function runs "for a SINGLE-PATH pool" — the gate was just never
+        // applied, so we repriced through the pool on every path.
+        //
+        // #105802230 EF1642A9 is the specimen: tfIoC, 1000 XAH for 3 RLUSD,
+        // autobridged with leg A on a pool and TWO active strands, so
+        // `multiPath` is true. rippled's leg-A offer is
+        // 1092.406235156812 XAH / 13576137 XRP, and taking 2720349 drops at
+        // that offer's own quality is
+        //     2720349 * 1092.406235156812 / 13576137 = 218.8933574699931
+        // to the digit — its `Total flow: in`. Re-swapping the same 2720349
+        // through the pool gives 218.8500354154254, which is 0.0433220545677
+        // cheaper and is what we charged.
+        let rp_a = |xrp: Me, lin: Me, sandbox: &Sandbox| -> Me {
+            if multi_now { lin } else { reprice_a(xrp, lin, sandbox) }
+        };
+        let rp_b = |xrp: Me, lin: Me, sandbox: &Sandbox| -> Me {
+            if multi_now { lin } else { reprice_b(xrp, lin, sandbox) }
+        };
+        let urp_a = |gets_in: Me, lin: Me, sandbox: &Sandbox| -> Me {
+            if multi_now { lin } else { unreprice_a(gets_in, lin, sandbox) }
+        };
+        let urp_b = |pays_out: Me, lin: Me, sandbox: &Sandbox| -> Me {
+            if multi_now { lin } else { unreprice_b(pays_out, lin, sandbox) }
+        };
         // SINGLE PATH takes `maxOffer`, not a fib slice. The UPPER BOUND above
         // keeps the fib slice deliberately — `activateNext` runs BEFORE
         // `setMultiPath`, and one tx traces both shapes: `created 5458/XRP` for
@@ -2288,19 +2319,19 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // is ~100x worse: it inflates `gets_in` until the pass misses
                 // the limit and the judge discards it. That is exactly what
                 // regressed #105940336 the first time maxOffer was wired in.
-                let mut gets_in = reprice_a(xrp, me_muldiv(xrp, a_in_full, a_out_full, true), sandbox);
+                let mut gets_in = rp_a(xrp, me_muldiv(xrp, a_in_full, a_out_full, true), sandbox);
                 if me_cmp(gets_in, rem_gets).is_gt() {
                     gets_in = rem_gets;
-                    xrp = unreprice_a(gets_in, me_muldiv(gets_in, a_out_full, a_in_full, false), sandbox);
+                    xrp = urp_a(gets_in, me_muldiv(gets_in, a_out_full, a_in_full, false), sandbox);
                 }
-                let mut pays_out = reprice_b(xrp, me_muldiv(xrp, b_out_full, b_in_full, false), sandbox);
+                let mut pays_out = rp_b(xrp, me_muldiv(xrp, b_out_full, b_in_full, false), sandbox);
                 // Clamp on the limitOut-adjusted cap. For a tfSell offer
                 // `rem_pays` is not a bound, but the limit-sized cap is.
                 if let Some(cap) = out_cap {
                     if me_cmp(pays_out, cap).is_gt() {
                         pays_out = cap;
-                        xrp = unreprice_b(pays_out, me_muldiv(pays_out, b_in_full, b_out_full, true), sandbox);
-                        gets_in = reprice_a(xrp, me_muldiv(xrp, a_in_full, a_out_full, true), sandbox);
+                        xrp = urp_b(pays_out, me_muldiv(pays_out, b_in_full, b_out_full, true), sandbox);
+                        gets_in = rp_a(xrp, me_muldiv(xrp, a_in_full, a_out_full, true), sandbox);
                     }
                 }
                 // A leg-B book maker can only deliver what it HOLDS. Leg A has
@@ -2329,8 +2360,8 @@ thr={t:?} admits_trunc={} admits_up={}",
                     let funded = available(sandbox, bmaker, pays_leg);
                     if me_cmp(pays_out, funded).is_gt() {
                         pays_out = funded;
-                        xrp = unreprice_b(pays_out, me_muldiv(pays_out, b_in_full, b_out_full, true), sandbox);
-                        gets_in = reprice_a(xrp, me_muldiv(xrp, a_in_full, a_out_full, true), sandbox);
+                        xrp = urp_b(pays_out, me_muldiv(pays_out, b_in_full, b_out_full, true), sandbox);
+                        gets_in = rp_a(xrp, me_muldiv(xrp, a_in_full, a_out_full, true), sandbox);
                     }
                 }
                 // DX_XRP: the bridged mid-leg is XRP and has to land on whole
@@ -2360,7 +2391,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // 0.51, 0.65, 0.71 and 0.98 drops' worth: the fraction the
                 // rescale rounded away.
                 let gets_in = {
-                    let repriced = reprice_a(xrp, me_muldiv(xrp, a_in_full, a_out_full, true), sandbox);
+                    let repriced = rp_a(xrp, me_muldiv(xrp, a_in_full, a_out_full, true), sandbox);
                     // The earlier clamp to `rem_gets` still binds — a sub-drop
                     // reprice must not push the pass past what the taker has.
                     if me_cmp(repriced, rem_gets).is_gt() { rem_gets } else { repriced }
