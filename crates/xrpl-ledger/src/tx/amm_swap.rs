@@ -216,25 +216,61 @@ pub(crate) fn amm_lp_tokens(a: Me, b: Me) -> Me {
 }
 
 fn n_sqrt_rnd(x: Me, rnd: Rnd) -> Me {
+    // rippled's `root2` is a NEWTON ITERATION CARRIED OUT IN 16-DIGIT `Number`
+    // ARITHMETIC (Number.cpp), not a correctly-rounded square root:
+    //
+    //   e = exponent + mantissaLog + 1, forced EVEN;  f = x / 10^e  (in [0.01,1))
+    //   r = ((-60*f + 144)*f + 18) / 105            <- quadratic curve fit
+    //   do { rm2 = rm1; rm1 = r; r = (r + f/r)/2; }
+    //   while (r != rm1 && r != rm2);               <- fixed point OR 2-cycle
+    //   return r * 10^(e/2)
+    //
+    // Every step rounds to 16 digits, so the fixed point sits a few ulps off
+    // the true root. Computing an exact integer sqrt instead is MORE accurate
+    // and therefore wrong for parity — the same "mirror it, do not improve it"
+    // as the division remainder in `n_div`.
+    //
+    // ⚠ The iteration runs at the AMBIENT rounding mode, which the caller's
+    // guard sets — `ammLPTokens` wraps root2 in Downward, `changeSpotPriceQuality`
+    // in ToNearest — so `rnd` is threaded through every internal op, not just
+    // applied at the end.
+    //
+    // Found by instrumenting `ammAssetIn` in the FFI shim on #105828322: every
+    // input matched rippled to the digit (a, b, c all identical) and only
+    // `frac` diverged — 0.002958463466754434 against 0.002958463466754935 —
+    // which localised it to `solveQuadraticEq`'s root2.
     if x.0 == 0 {
         return (0, 0);
     }
-    let (m, e) = n_norm(x);
-    // Scale mantissa into [1e30,1e32) keeping the remaining exponent even.
-    let s: i32 = if (e - 16).rem_euclid(2) == 0 { 16 } else { 15 };
-    let big = m * 10u128.pow(s as u32);
-    let mut r = isqrt(big);
-    // nearest: round up when the remainder passes the (r+1/2)² midpoint.
-    // Downward keeps the floor, so the root never exceeds the true value.
-    if rnd == Rnd::Near && big - r * r > r {
-        r += 1;
+    let f0 = n_norm(x);
+    let mut e = f0.1 + 16; // exponent + mantissaLog(15) + 1
+    if e % 2 != 0 {
+        e += 1;
     }
-    let mut e2 = (e - s) / 2;
-    if r >= HI {
-        r /= 10;
-        e2 += 1;
+    let f: Me = (f0.0, f0.1 - e);
+    // ((-60 f + 144) f + 18) / 105
+    let u = n_sub((144, 0), n_mul((60, 0), f, rnd), rnd);
+    let v = n_add(n_mul(u, f, rnd), (18, 0), rnd);
+    let mut r = n_div(v, (105, 0), rnd);
+    if r.0 == 0 {
+        return (0, 0);
     }
-    round16(r, e2, false, rnd)
+    let (mut rm1, mut rm2): (Me, Me) = ((0, 0), (0, 0));
+    // The C++ loop is do/while, and its guard is `r != rm1 && r != rm2` — it
+    // halts on a fixed point OR on a two-cycle (the "bouncing" its comment
+    // names). The bound is a safety net; it converges in a handful of steps.
+    for _ in 0..64 {
+        rm2 = rm1;
+        rm1 = r;
+        r = n_div(n_add(r, n_div(f, r, rnd), rnd), N_TWO, rnd);
+        if r.0 == 0 {
+            return (0, 0);
+        }
+        if n_cmp(r, rm1) == Ordering::Equal || n_cmp(r, rm2) == Ordering::Equal {
+            break;
+        }
+    }
+    (r.0, r.1 + e / 2)
 }
 
 /// tfee basis points → fee fraction (exact in decimal, mode-independent).
