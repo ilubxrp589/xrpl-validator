@@ -2307,19 +2307,74 @@ thr={t:?} admits_trunc={} admits_up={}",
                     }
                 };
                 // (xrp capacity, gets per that xrp) for leg A.
-                let (a_cap_xrp, a_in_full, a_out_full) = match (&a_book, &a_fill) {
-                    (Some((_, _, _, amaker, a_gives0, a_wants0)), _) => {
+                //
+                // `a_qbook` / `b_qbook` are the offers' filed BookDirectory
+                // rates, carried alongside the amounts so a PARTIAL fill can be
+                // priced the way rippled prices it — see `a_price` below.
+                let (a_cap_xrp, a_in_full, a_out_full, a_qbook) = match (&a_book, &a_fill) {
+                    (Some((q, _, _, amaker, a_gives0, a_wants0)), _) => {
                         let funded = available(sandbox, amaker, &xrp_leg);
                         let a_gives = if me_cmp(funded, *a_gives0).is_lt() { funded } else { *a_gives0 };
-                        (a_gives, *a_wants0, *a_gives0)
+                        // Whole-offer only when the maker can actually fund it;
+                        // a funding-limited head is a partial fill.
+                        let whole = me_cmp(funded, *a_gives0).is_ge().then_some(*a_gives0);
+                        (a_gives, *a_wants0, *a_gives0, Some((*q, whole)))
                     }
-                    (None, Some((_, (s_in, s_out)))) => (*s_out, *s_in, *s_out),
+                    (None, Some((_, (s_in, s_out)))) => (*s_out, *s_in, *s_out, None),
                     (None, None) => break 'attempt,
                 };
-                let (b_cap_xrp, b_in_full, b_out_full) = match (&b_book, &b_fill) {
-                    (Some((_, _, _, _, b_gives0, b_wants0)), _) => (*b_wants0, *b_wants0, *b_gives0),
-                    (None, Some((_, (s_in, s_out)))) => (*s_in, *s_in, *s_out),
+                let (b_cap_xrp, b_in_full, b_out_full, b_qbook) = match (&b_book, &b_fill) {
+                    (Some((q, _, _, _, b_gives0, b_wants0)), _) => {
+                        (*b_wants0, *b_wants0, *b_gives0, Some((*q, Some(*b_wants0))))
+                    }
+                    (None, Some((_, (s_in, s_out)))) => (*s_in, *s_in, *s_out, None),
                     (None, None) => break 'attempt,
+                };
+                // rippled prices a PARTIAL fill at the offer's filed
+                // BookDirectory quality, NOT at its current TakerPays/TakerGets
+                // ratio — the two drift apart once an offer has been partially
+                // consumed and its residual re-rounded. The DIRECT walk has
+                // done this since `full_offer` above; the bridge did not.
+                //
+                // #105770848 F1880BA0 is the specimen, and it is exact. A tfSell
+                // OfferCreate bridging XAH -> XRP -> RLUSD; leg A's maker offer
+                // 67747F4E is partially consumed, so its own ratio has drifted
+                // from the rate it is filed under:
+                //   book rate 7.401924500370096e-5 x 881703 = 65.26299037749815  <- mainnet
+                //   own ratio 7.40192434033347e-5  x 881703 = 65.26298896645042  <- ours
+                // 1.411048e-6 XAH, which DX_VALCHECK reports as a conserved pair
+                // on the two XAH trust lines plus the same figure left on the
+                // maker's TakerPays.
+                //
+                // The book rate is only a 16-digit mantissa, so it cannot be
+                // recovered from the amounts — it has to be read off the page.
+                let a_price = |xrp: Me| -> Me {
+                    match a_qbook {
+                        Some((q, whole)) if whole.is_none_or(|w| me_cmp(xrp, w).is_lt()) => {
+                            mul_round16_up(xrp, rate_me(q))
+                        }
+                        _ => me_muldiv(xrp, a_in_full, a_out_full, true),
+                    }
+                };
+                let a_unprice = |gets: Me| -> Me {
+                    match a_qbook {
+                        Some((q, _)) => me_muldiv(gets, (1u128, 0i32), rate_me(q), false),
+                        None => me_muldiv(gets, a_out_full, a_in_full, false),
+                    }
+                };
+                let b_price = |xrp: Me| -> Me {
+                    match b_qbook {
+                        Some((q, whole)) if whole.is_none_or(|w| me_cmp(xrp, w).is_lt()) => {
+                            me_muldiv(xrp, (1u128, 0i32), rate_me(q), false)
+                        }
+                        _ => me_muldiv(xrp, b_out_full, b_in_full, false),
+                    }
+                };
+                let b_unprice = |pays: Me| -> Me {
+                    match b_qbook {
+                        Some((q, _)) => mul_round16_up(pays, rate_me(q)),
+                        None => me_muldiv(pays, b_in_full, b_out_full, true),
+                    }
                 };
                 let mut xrp = if me_cmp(a_cap_xrp, b_cap_xrp).is_lt() { a_cap_xrp } else { b_cap_xrp };
                 // `AMMOffer::limitOut` — for a SINGLE-PATH pool the clamped
@@ -2334,19 +2389,19 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // is ~100x worse: it inflates `gets_in` until the pass misses
                 // the limit and the judge discards it. That is exactly what
                 // regressed #105940336 the first time maxOffer was wired in.
-                let mut gets_in = rp_a(xrp, me_muldiv(xrp, a_in_full, a_out_full, true), sandbox);
+                let mut gets_in = rp_a(xrp, a_price(xrp), sandbox);
                 if me_cmp(gets_in, rem_gets).is_gt() {
                     gets_in = rem_gets;
-                    xrp = urp_a(gets_in, me_muldiv(gets_in, a_out_full, a_in_full, false), sandbox);
+                    xrp = urp_a(gets_in, a_unprice(gets_in), sandbox);
                 }
-                let mut pays_out = rp_b(xrp, me_muldiv(xrp, b_out_full, b_in_full, false), sandbox);
+                let mut pays_out = rp_b(xrp, b_price(xrp), sandbox);
                 // Clamp on the limitOut-adjusted cap. For a tfSell offer
                 // `rem_pays` is not a bound, but the limit-sized cap is.
                 if let Some(cap) = out_cap {
                     if me_cmp(pays_out, cap).is_gt() {
                         pays_out = cap;
-                        xrp = urp_b(pays_out, me_muldiv(pays_out, b_in_full, b_out_full, true), sandbox);
-                        gets_in = rp_a(xrp, me_muldiv(xrp, a_in_full, a_out_full, true), sandbox);
+                        xrp = urp_b(pays_out, b_unprice(pays_out), sandbox);
+                        gets_in = rp_a(xrp, a_price(xrp), sandbox);
                     }
                 }
                 // A leg-B book maker can only deliver what it HOLDS. Leg A has
@@ -2375,8 +2430,8 @@ thr={t:?} admits_trunc={} admits_up={}",
                     let funded = available(sandbox, bmaker, pays_leg);
                     if me_cmp(pays_out, funded).is_gt() {
                         pays_out = funded;
-                        xrp = urp_b(pays_out, me_muldiv(pays_out, b_in_full, b_out_full, true), sandbox);
-                        gets_in = rp_a(xrp, me_muldiv(xrp, a_in_full, a_out_full, true), sandbox);
+                        xrp = urp_b(pays_out, b_unprice(pays_out), sandbox);
+                        gets_in = rp_a(xrp, a_price(xrp), sandbox);
                     }
                 }
                 // DX_XRP: the bridged mid-leg is XRP and has to land on whole
@@ -2406,7 +2461,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // 0.51, 0.65, 0.71 and 0.98 drops' worth: the fraction the
                 // rescale rounded away.
                 let gets_in = {
-                    let repriced = rp_a(xrp, me_muldiv(xrp, a_in_full, a_out_full, true), sandbox);
+                    let repriced = rp_a(xrp, a_price(xrp), sandbox);
                     // The earlier clamp to `rem_gets` still binds — a sub-drop
                     // reprice must not push the pass past what the taker has.
                     if me_cmp(repriced, rem_gets).is_gt() { rem_gets } else { repriced }
