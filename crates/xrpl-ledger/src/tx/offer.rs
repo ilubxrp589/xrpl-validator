@@ -3087,6 +3087,33 @@ pub(crate) fn cross_engine_to(
                 }
                 move_leg(sandbox, &maker, beneficiary, pays_leg, give);
                 move_leg(sandbox, taker, &maker, gets_leg, pay);
+                // The taker pays the INPUT issuer's rate on top of what the
+                // maker receives, and the issuer destroys the difference:
+                //   trIn = redeems(prevStepDir) ? rate(book_.in, strandDst_) : parity
+                //   stpAmt.in = mulRatio(ofrAmt.in, ofrInRate, QUALITY_ONE, roundUp)
+                // (BookStep.cpp:352, :770). Same rule `94a028e` applied to the
+                // bridged walk, on the DIRECT walk.
+                //
+                // ⚠ ADDITIVE ONLY — sizing is untouched, and must be. Three
+                // attempts on 2026-08-11 divided a budget by this rate instead
+                // (call site, direct walk, both bridged clamps) and every one
+                // re-sized fills that were already correct; one regressed
+                // #105887283 to 87/88 at KEY level. TakerGets bounds the NET.
+                //
+                // #105877543 435A9AEB is the specimen this walk was missing
+                // when the earlier attempt was reverted for want of one: a
+                // tfSell|tfIoC selling 446 SOLO direct to XRP, issuer rate
+                // 1.0001. Mainnet debits the taker 446.0446 and credits the
+                // maker 446; we debited 446 flat, leaving the taker 0.0446 rich.
+                if let Some(r) = transfer_rate(sandbox, gets_leg)
+                    .filter(|_| taker != &gets_leg.issuer && maker != gets_leg.issuer)
+                {
+                    let gross = me_muldiv(pay, (r as u128, 0), (1_000_000_000, 0), true);
+                    let fee = me_sub(gross, pay);
+                    if !me_is_zero(fee) {
+                        line_adjust(sandbox, taker, gets_leg, fee, false);
+                    }
+                }
                 rem_pays = me_sub(rem_pays, give);
                 rem_gets = me_sub(rem_gets, pay);
                 crossed += 1;
