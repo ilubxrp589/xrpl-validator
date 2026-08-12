@@ -3521,6 +3521,22 @@ impl Transactor for OfferCreateTransactor {
         // and its regression evidence is a value sweep, not a key sweep.
         let rem_gets = {
             let derived = me_muldiv(rem_pays, tg0, tp0, true);
+            // `me_muldiv`'s round-up is at 16 SIGNIFICANT DIGITS. On an XRP leg
+            // the value still has to become whole drops, and truncating there
+            // throws the round-up away — rippled's `divRound` with an XRP asset
+            // rounds up to whole DROPS directly. offer.rs already carried this
+            // as a KNOWN GAP with no failing ledger; #105672435 B409D45C is it.
+            //
+            // Its fill is exactly right (DX_JUDGE `pay=(5713437)`, mainnet's
+            // `New flow iter 0: 5713437`) — only the RESIDUAL was a drop out:
+            //   exact          165388.7424863568808
+            //   16-digit ceil  165388.7424863569 -> floor to drops -> 165388  ours
+            //   ceil to drops                                        165389   mainnet
+            let derived = if gets_leg.xrp && !me_is_zero(derived) {
+                (me_rescale(derived, 0, true), 0)
+            } else {
+                derived
+            };
             if !me_is_zero(derived) && me_cmp(derived, rem_gets).is_lt() {
                 derived
             } else {
