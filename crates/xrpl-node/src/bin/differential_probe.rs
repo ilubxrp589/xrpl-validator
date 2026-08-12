@@ -1459,16 +1459,91 @@ fn run() -> i32 {
         // The engine has been calibrated against key-level matching throughout,
         // so switching the verdict to values would surface an unknown backlog
         // all at once. Measure the backlog first.
-        if let Ok(spec) = std::env::var("DX_VALCHECK") {
-            let tol: f64 = if spec == "1" { 1e-12 } else { spec.parse().unwrap_or(1e-12) };
-            // Magnitude of an amount that may be drops (string) or an IOU
-            // (object). Sign is kept: a trust line's balance carries the whole
-            // point of this check in its sign.
-            fn amt(v: &Value) -> Option<f64> {
+        if std::env::var("DX_VALCHECK").is_ok() {
+            // EXACT, because the target is BYTE PARITY. A validator serialises
+            // the stored decimal into the SLE and hashes it: one digit apart is
+            // a different state hash and a diverged node, however small the
+            // number. There is no economically-negligible difference here.
+            //
+            // This replaced an f64 comparison against a 1e-12 tolerance, which
+            // could not certify that. Measured 2026-08-11 on ten ledgers the
+            // census called CLEAN: tightening to 1e-18 surfaced three real
+            // 1-ulp differences it had been hiding (e.g. 0.1141930002244327 vs
+            // ...26). And f64 cannot go tighter — a 16-digit IOU mantissa sits
+            // at its 2.2e-16 noise floor, and above 2^53 drops it is blind
+            // outright: `9007199254740993 == 9007199254740992` in f64, so a
+            // one-drop error on a >9e9 XRP balance was structurally invisible.
+            //
+            // `DX_VALCHECK_MIN=<rel>` still filters by relative size, for
+            // triage only — it never widens what counts as a difference.
+            let triage: Option<f64> =
+                std::env::var("DX_VALCHECK_MIN").ok().and_then(|s| s.parse().ok());
+            /// The stored value as an exact canonical (negative, mantissa,
+            /// exponent), trailing zeros stripped so mainnet's
+            /// "1373308620221269e-4" and our "137330862022.1269" — the same
+            /// number, different serialisations — compare EQUAL.
+            fn canon(v: &Value) -> Option<(bool, u128, i32)> {
+                let s = match v {
+                    Value::String(s) => s.as_str(),
+                    Value::Object(_) => v.get("value")?.as_str()?,
+                    _ => return None,
+                };
+                let s = s.trim();
+                let (neg, s) = match s.strip_prefix('-') {
+                    Some(r) => (true, r),
+                    None => (false, s.strip_prefix('+').unwrap_or(s)),
+                };
+                let (mant_str, exp10) = match s.find(['e', 'E']) {
+                    Some(i) => (&s[..i], s[i + 1..].parse::<i32>().ok()?),
+                    None => (s, 0),
+                };
+                let (int_part, frac) = match mant_str.find('.') {
+                    Some(i) => (&mant_str[..i], &mant_str[i + 1..]),
+                    None => (mant_str, ""),
+                };
+                let digits = format!("{int_part}{frac}");
+                if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                let mut mant: u128 = digits.parse().ok()?;
+                if mant == 0 {
+                    return Some((false, 0, 0));
+                }
+                let mut exp = exp10 - frac.len() as i32;
+                // Canonicalise to STAmount precision. An IOU mantissa is
+                // EXACTLY 16 significant digits, so that is the form the SLE
+                // serialises and the state hash covers — comparing raw JSON
+                // instead reports differences the ledger cannot even represent.
+                //
+                // Our sandbox carries `Me` values wider than that: measured
+                // 2026-08-11, five of six raw-string differences on
+                // supposedly-clean ledgers were ours holding 17-20 digits
+                // where mainnet holds 16, e.g. 1908.0660169997755673 against
+                // 1908.066016999776 — the SAME STAmount. Only
+                // 0.1141930002244327 vs ...26 was a real one-ulp difference.
+                const HI: u128 = 10_000_000_000_000_000; // 1e16
+                while mant >= HI {
+                    let (q, r) = (mant / 10, mant % 10);
+                    // half-even, matching Number's default rounding
+                    mant = if r > 5 || (r == 5 && q % 2 == 1) { q + 1 } else { q };
+                    exp += 1;
+                }
+                while mant % 10 == 0 && mant > 0 {
+                    mant /= 10;
+                    exp += 1;
+                }
+                if mant == 0 {
+                    return Some((false, 0, 0));
+                }
+                Some((neg, mant, exp))
+            }
+            fn shown(v: &Value) -> String {
                 match v {
-                    Value::String(s) => s.parse::<f64>().ok(),
-                    Value::Object(_) => v["value"].as_str().and_then(|s| s.parse::<f64>().ok()),
-                    _ => None,
+                    Value::String(s) => s.clone(),
+                    Value::Object(_) => {
+                        v.get("value").and_then(|x| x.as_str()).unwrap_or("?").to_string()
+                    }
+                    _ => "?".to_string(),
                 }
             }
             let mut net_fields: HashMap<String, &Value> = HashMap::new();
@@ -1498,11 +1573,27 @@ fn run() -> i32 {
                     _ => continue,
                 };
                 for f in fields {
-                    let (Some(a), Some(b)) = (amt(&ours[*f]), amt(&nf[*f])) else { continue };
-                    let scale = a.abs().max(b.abs()).max(1e-30);
-                    if (a - b).abs() / scale > tol {
-                        eprintln!("DX_VALCHECK {h} {tx_type} {key} {kind}.{f} ours={a} net={b}");
+                    let (Some(a), Some(b)) = (canon(&ours[*f]), canon(&nf[*f])) else { continue };
+                    if a == b {
+                        continue;
                     }
+                    if let Some(min) = triage {
+                        // Relative size, computed only to FILTER the report.
+                        let val = |(n, m, e): (bool, u128, i32)| {
+                            let x = m as f64 * 10f64.powi(e);
+                            if n { -x } else { x }
+                        };
+                        let (x, y) = (val(a), val(b));
+                        let scale = x.abs().max(y.abs()).max(1e-30);
+                        if (x - y).abs() / scale < min {
+                            continue;
+                        }
+                    }
+                    eprintln!(
+                        "DX_VALCHECK {h} {tx_type} {key} {kind}.{f} ours={} net={}",
+                        shown(&ours[*f]),
+                        shown(nf.get(*f).unwrap_or(&Value::Null))
+                    );
                 }
             }
         }
