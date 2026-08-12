@@ -1361,6 +1361,21 @@ fn reap_to_live_head(
     false
 }
 
+/// A maker offer's remaining side after a fill, as an STAmount.
+///
+/// `TOffer::consume` subtracts through STAmount, so the result is rounded back
+/// to 16 significant digits (half-even, via `Number` under fixUniversalNumber).
+/// `me_sub` is EXACT — it keeps every digit of the difference — so whenever
+/// `gives0 - give` needs more than 16 digits we stored precision the ledger
+/// cannot hold and rippled does not have.
+///
+/// Same family as the fused-vs-stepwise arithmetic elsewhere: `Number`'s
+/// operations are implementations, not ideal maths, and being more precise than
+/// rippled is a defect.
+fn offer_residual(a: Me, b: Me) -> Me {
+    stamount_signed_add(false, a, true, b).1
+}
+
 /// Consume `give` of the maker's gives / `pay` of their wants against one
 /// offer: move both legs and update or delete the offer object.
 #[allow(clippy::too_many_arguments)]
@@ -1386,8 +1401,8 @@ fn settle_fill(
         delete_maker_offer(sandbox, okey, offer, maker);
     } else {
         let mut off2 = offer.clone();
-        off2["TakerGets"] = me_amount_json(&offer["TakerGets"], me_sub(gives0, give));
-        off2["TakerPays"] = me_amount_json(&offer["TakerPays"], me_sub(wants0, pay));
+        off2["TakerGets"] = me_amount_json(&offer["TakerGets"], offer_residual(gives0, give));
+        off2["TakerPays"] = me_amount_json(&offer["TakerPays"], offer_residual(wants0, pay));
         put_json(sandbox, *okey, &off2);
     }
 }
@@ -3154,8 +3169,8 @@ pub(crate) fn cross_engine_to(
                     delete_maker_offer(sandbox, &okey, &offer, &maker);
                 } else {
                     let mut off2 = offer.clone();
-                    off2["TakerGets"] = me_amount_json(&offer["TakerGets"], me_sub(m_gives0, give));
-                    off2["TakerPays"] = me_amount_json(&offer["TakerPays"], me_sub(m_wants0, pay));
+                    off2["TakerGets"] = me_amount_json(&offer["TakerGets"], offer_residual(m_gives0, give));
+                    off2["TakerPays"] = me_amount_json(&offer["TakerPays"], offer_residual(m_wants0, pay));
                     put_json(sandbox, okey, &off2);
                 }
                 if done(rem_pays, rem_gets) {
