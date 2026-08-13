@@ -564,7 +564,39 @@ impl PaymentTransactor {
                 (Some((bneg, b)), Some((aneg, a))) => {
                     // delta = after - before; a fall in balance buys nothing.
                     let (dneg, d) = ox::signed_add(aneg, a, !bneg, b);
-                    if dneg { (0, 0) } else { d }
+                    let d = if dneg { (0, 0) } else { d };
+                    // `want_cap - rw` measures the SAME quantity at FULL
+                    // precision. Differencing a BALANCE cannot: the sum is 16
+                    // significant digits, so whatever the sender already holds
+                    // of the intermediate eats the low end of the addend.
+                    //
+                    // #105866303 836CC353, a 3-AMM chain PHNIX -> PLX -> BXE ->
+                    // BITX. Hop 0 met its requirement in full (`rw` = 0) yet
+                    // the delta read four digits short:
+                    //   requirement  81.8718026793484
+                    //   measured     81.8718026793
+                    // and the shortfall compounds down the chain, leaving the
+                    // destination 5.4e-17 under an Amount it must hit exactly.
+                    //
+                    // GUARDED, not swapped. The delta is here because
+                    // `me_rescale` saturates against the unbounded sentinel cap
+                    // and the subtraction collapses. So take the precise form
+                    // only where the two AGREE — they measure one quantity and
+                    // should differ solely in the digits the balance dropped.
+                    let from_cap = ox::me_sub(want_cap, rw);
+                    let agree = !ox::me_is_zero(d)
+                        && !ox::me_is_zero(from_cap)
+                        && {
+                            let (hi, lo) = if ox::me_cmp(from_cap, d).is_gt() {
+                                (from_cap, d)
+                            } else {
+                                (d, from_cap)
+                            };
+                            let diff = ox::me_sub(hi, lo);
+                            ox::me_cmp(ox::me_muldiv(diff, (1_000_000_000, 0), (1, 0), false), hi)
+                                .is_lt()
+                        };
+                    if agree { from_cap } else { d }
                 }
                 // The account issues the hop currency (no line to read), or this
                 // is the LAST hop, whose cap is the real want_out and small
