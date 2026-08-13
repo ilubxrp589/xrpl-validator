@@ -3154,7 +3154,24 @@ pub(crate) fn cross_engine_to(
                     // on inference: the floor direction in this branch is
                     // calibrated by d6f7589 against #105672435 B409D45C and
                     // #105814446 2162E284EAB3.
-                    give = me_muldiv(pay, (1u128, 0i32), rate_me(q), true);
+                    // ROUNDS DOWN. This is the INPUT-LIMITED branch, and it is
+                    // BookStep.cpp:653 verbatim — not inference:
+                    //   ofrAmt = offer.limitIn(ofrAmt, inLmt, /* roundUp */ false);
+                    // with rippled's own rationale above it: "we can prevent
+                    // order book blocking by (strictly) rounding down the
+                    // ceil_in() result. By rounding down we guarantee that the
+                    // quality of an offer left in the ledger is as good or
+                    // better than the quality of the containing order book
+                    // page. This adjustment changes transaction outcomes, so
+                    // it must be made under an amendment."
+                    //
+                    // #105795073 1F30308A is the specimen: STX -> XRP (one AMM
+                    // slice) -> EVR against a 1.002 issuer. 18899558 drops at
+                    // the filed rate is 239.835773801400255.., and the EVR the
+                    // taker receives decides the destination's credit:
+                    //   floor 239.8357738014002 /1.002 -> 239.3570596820361  <- mainnet
+                    //   ceil  239.8357738014003 /1.002 -> 239.3570596820362  <- ours
+                    give = me_muldiv(pay, (1u128, 0i32), rate_me(q), false);
                     // DX_CLAMP: does a given fill actually REACH this branch?
                     // The 2026-08-08 ceil attempt assumed the twelve one-drop
                     // residuals came from here and regressed two calibrated
