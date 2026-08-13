@@ -211,24 +211,49 @@ pub(crate) struct AmmFib {
 }
 
 pub(crate) fn mul_round16_up(a: Me, b: Me) -> Me {
-    let (a, b) = (me_norm(a), me_norm(b));
+    // rippled's `mulRound(v1, v2, asset, roundUp = true)` — STAmount.cpp
+    // `mulRoundImpl<canonicalizeRound, DontAffectNumberRoundMode>` (:1705).
+    // It IS a round-up, but a LOSSY one, and the loss is the point:
+    //
+    //   amount = muldivRound(m1, m2, 1e14, 1e14 - 1);   // ceil -> 17-18 digits
+    //   canonicalizeRound(false, amount, offset, true): // :1477
+    //       while (value > 10 * kMaxValue) { value /= 10; ++offset; }  // TRUNCATE to 17
+    //       value += 9; value /= 10; ++offset;                         // ceil on digit 17
+    //
+    // So everything below the 17th digit is DISCARDED before the ceiling is
+    // applied. Rounding up on the full remainder — what we did — is the
+    // `canonicalizeRoundStrict` behaviour, which rippled reserves for
+    // `mulRoundStrict` (:1711) and does NOT use here. rippled's own comment at
+    // :1511 names the difference: the original "ignored low order bits that
+    // could influence rounding decisions".
+    //
+    // Being stricter than rippled is a defect, same as being more precise: our
+    // partial fills came out ONE ULP high whenever digit 17 was 0 and something
+    // below it was not, which is the 1-lsd class — 8 offer residuals all
+    // exactly one low, each with its trust line paired against it.
+    //
+    // ⚠ The `MightSaveRound(TowardsZero)` on the STAmount construction is NOT
+    // the rounding; it only stops `Number` rounding a SECOND time. Reading it
+    // as "mulRound truncates" is wrong, and
+    // `an_out_limited_fill_is_priced_through_the_offers_encoded_quality`
+    // (anchored to rippled's own `limitQuality` log for #105924683) catches it.
+    let (a, b) = (norm16(a), norm16(b));
     if a.0 == 0 || b.0 == 0 {
         return (0, 0);
     }
-    let mut m = a.0.saturating_mul(b.0);
-    let mut e = a.1 + b.1;
-    let mut div: u128 = 1;
-    while m / div >= 10_000_000_000_000_000 {
-        div *= 10;
-        e += 1;
-    }
-    if div > 1 {
-        let (q, r) = (m / div, m % div);
-        m = if r != 0 { q + 1 } else { q };
-        if m >= 10_000_000_000_000_000 {
+    const TEN14: u128 = 100_000_000_000_000;
+    const MAXV: u128 = 9_999_999_999_999_999;
+    // 16-digit mantissas => product < 1e32, well inside u128.
+    let prod = a.0 * b.0;
+    let mut m = prod / TEN14 + u128::from(prod % TEN14 != 0);
+    let mut e = a.1 + b.1 + 14;
+    if m > MAXV {
+        while m > 10 * MAXV {
             m /= 10;
             e += 1;
         }
+        m = (m + 9) / 10;
+        e += 1;
     }
     while m < 1_000_000_000_000_000 {
         m *= 10;
@@ -3662,7 +3687,35 @@ impl Transactor for OfferCreateTransactor {
         // every mutation-set leg stays green. This was found with DX_VALCHECK
         // and its regression evidence is a value sweep, not a key sweep.
         let rem_gets = {
-            let derived = me_muldiv(rem_pays, tg0, tp0, true);
+            // Priced at the offer's ENCODED ratio, not its raw one. rippled
+            // reprices the rested remainder through `Quality::rate()`, which is
+            // `getRate(TakerGets, TakerPays)` — a 16-DIGIT value — and the last
+            // digit of that decides the last digit of the residual.
+            //
+            // #105924683 E7399DA3 is the specimen and it is exact. 61 ShaPepe
+            // for 709289 drops; an AMM takes 290802 drops for 25.0046017186344,
+            // leaving 418487 drops to rest:
+            //   raw     418487 * 61/709289          = 35.9905581504859091..
+            //                                   ceil = 35.99055815048591  <- ours
+            //   encoded 418487 * 0.00008600161570248517
+            //                                        = 35.99055815048592  <- mainnet
+            // Note the remainder is NOT (original - consumed): that would rest
+            // 61 - 25.0046017186344 = 35.9953982813656. rippled reprices.
+            //
+            // ⚠ ONLY when the offer actually crossed. An UNCROSSED offer rests
+            // exactly as submitted — repricing `tp0` through the encoded ratio
+            // reconstructs `tg0` a hair low and writes 5907469.489999999 for
+            // 5907469.49, or 4.999999999999999 for 5. That regressed four
+            // ledgers (105778999, 105843839, 105091578, 105847200) before the
+            // guard went in, all of them offers nothing had touched.
+            let derived = if me_cmp(rem_pays, tp0).is_lt() {
+                match rate_of_me(tg0, tp0) {
+                    Some(q) => mul_round16_up(rem_pays, rate_me(q)),
+                    None => me_muldiv(rem_pays, tg0, tp0, true),
+                }
+            } else {
+                me_muldiv(rem_pays, tg0, tp0, true)
+            };
             // `me_muldiv`'s round-up is at 16 SIGNIFICANT DIGITS. On an XRP leg
             // the value still has to become whole drops, and truncating there
             // throws the round-up away — rippled's `divRound` with an XRP asset
