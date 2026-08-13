@@ -3740,10 +3740,22 @@ impl Transactor for OfferCreateTransactor {
         // the same number. Verified 16-digit exact on #105912454 FE592890B233
         // too (1913.346495384532 vs our 1913.34664).
         //
-        // Clamp only when our subtraction went the WRONG way: #105930662
-        // 40FB322EC16C's residual already comes out at or above its original
-        // quality and mainnet leaves it alone, so re-deriving unconditionally
-        // would move a case that is right today.
+        // Re-derived in BOTH directions. The one-way clamp here was a
+        // workaround for #105930662 40FB322EC16C while the reprice still used
+        // the RAW ratio; `070ca31` fixed the rate itself and that ledger is
+        // byte-exact now, so the direction guard only suppressed the reprice
+        // where it needed to move the residual UP.
+        //
+        // #105843839 C1F9FB1F is what it was hiding, and it is the only
+        // remaining hit whose stored value is ILLEGAL rather than merely wrong:
+        // an OfferCreate crossing an AMM (rDL7HrRz, no Offer SLE) sells
+        // 0.410952568532 AUDD, and falling through to `rem_gets` stored the
+        // exact subtraction —
+        //   7157.9408748 - 0.410952568532 = 7157.5299222314683491
+        // TWENTY significant digits, which an IOU STAmount cannot hold at all,
+        // against mainnet's repriced 7157.5299222315. `derived` is 16 digits by
+        // construction, so using it fixes the value and the representation at
+        // once.
         //
         // ⚠ INVISIBLE TO THE GATE: the book page key is built from tp0/tg0, so
         // a residual with the wrong amounts still lands on the correct page and
@@ -3795,11 +3807,7 @@ impl Transactor for OfferCreateTransactor {
             } else {
                 derived
             };
-            if !me_is_zero(derived) && me_cmp(derived, rem_gets).is_lt() {
-                derived
-            } else {
-                rem_gets
-            }
+            if me_is_zero(derived) { rem_gets } else { derived }
         };
         let seq = if tx.uses_ticket() { tx.ticket_seq.unwrap_or(0) } else { tx.sequence };
         let offer_key = keylet::offer_key(&tx.account, seq);
