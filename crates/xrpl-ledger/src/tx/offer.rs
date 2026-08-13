@@ -380,8 +380,16 @@ pub(crate) fn stamount_signed_add(aneg: bool, a: Me, bneg: bool, b: Me) -> (bool
     // this step zeroed legitimate movements: batch2 #105933892 D0BDF094CE78
     // went from clean to missing a Modified line, and #105949459 from 1
     // divergence to 3.
-    let a = norm16(a);
-    let b = norm16(b);
+    // ROUNDED to 16 digits, not truncated. An STAmount operand is ALREADY
+    // canonical in rippled — it was rounded when it was produced — so reducing
+    // an over-precise operand by truncation drops exactly the digit that
+    // decides the result. DX_TRUNC caught it naming its own caller:
+    //   DX_TRUNC norm16 10899215705147927 e-7 -> 1089921570514792 (dropped 7/10)
+    //      1: stamount_signed_add   2: offer_residual
+    // a 7 discarded where half-even must carry.
+    use crate::tx::amm_swap::{round16, Rnd};
+    let a = round16(a.0, a.1, false, Rnd::Near);
+    let b = round16(b.0, b.1, false, Rnd::Near);
     // rippled adds IOUs through `Number` (STAmount.cpp:391, IOUAmount.cpp:142,
     // both gated on `getSTNumberSwitchover()` — fixUniversalNumber, long since
     // enabled): the operands are aligned with a GUARD DIGIT plus a sticky bit
@@ -404,7 +412,6 @@ pub(crate) fn stamount_signed_add(aneg: bool, a: Me, bneg: bool, b: Me) -> (bool
     }
     let av = a.0 * 10u128.pow((a.1 - e) as u32);
     let bv = b.0 * 10u128.pow((b.1 - e) as u32);
-    use crate::tx::amm_swap::{round16, Rnd};
     if aneg == bneg {
         return (aneg, round16(av + bv, e, false, Rnd::Near));
     }
@@ -803,6 +810,26 @@ pub(crate) fn norm16(x: Me) -> Me {
     let (mut m, mut e) = x;
     if m == 0 {
         return (0, 0);
+    }
+    // DX_TRUNC: report every reduction that DISCARDS a nonzero remainder, with
+    // a backtrace naming the caller. An STAmount holds 16 digits, so a value
+    // carrying more has to be reduced — the only question is whether rippled
+    // rounds it or we truncate it, and this says WHERE we decided.
+    static DX_TRUNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if m >= 10_000_000_000_000_000 && *DX_TRUNC.get_or_init(|| std::env::var("DX_TRUNC").is_ok()) {
+        let (mut t, mut dropped) = (m, 0u128);
+        let mut scale: u128 = 1;
+        while t >= 10_000_000_000_000_000 {
+            dropped += (t % 10) * scale;
+            scale *= 10;
+            t /= 10;
+        }
+        if dropped != 0 {
+            eprintln!(
+                "DX_TRUNC norm16 {m} e{e} -> {t} (dropped {dropped}/{scale})\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
     }
     while m >= 10_000_000_000_000_000 {
         m /= 10;
@@ -2307,6 +2334,25 @@ thr={t:?} admits_trunc={} admits_up={}",
                         line_adjust(sandbox, taker, gets_leg, fee, false);
                     }
                 }
+                // The taker's RUNNING remainder is an STAmount in rippled, so it
+                // re-rounds to 16 digits at EVERY subtraction. `me_sub` is
+                // exact, so ours accumulates precision rippled never has and
+                // then loses it all at once, truncated, in the final fill.
+                //
+                // #105923760 3C6A5F07 is the specimen and it replays exactly.
+                // A tfPassive 185722760 drops for 199.7244 RLUSD, nine makers;
+                // the sixth fill is 0.499999223256619, which pushes the
+                // remainder to EIGHTEEN digits:
+                //   199.7244 -7.430635 -16.884494 -1.016862 -0.500628 -2.041095
+                //     -0.499999223256619 -> 171.350686776743381
+                //                        -> STAmount 171.3506867767434
+                //     -1.051875          -> 170.2988117767434
+                //     -1.489338          -> 168.8094737767434   <- mainnet
+                // Ours held 168.809473776743381 and `norm16` TRUNCATED it to
+                // 168.8094737767433, leaving the maker's TakerGets one high.
+                //
+                // Same defect as `offer_residual` (4556384), one level up: that
+                // fixed what we STORE, this fixes what we CARRY.
                 rem_pays = me_sub(rem_pays, give);
                 rem_gets = me_sub(rem_gets, pay);
                 crossed += 1;
