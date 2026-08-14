@@ -1240,9 +1240,12 @@ pub(crate) fn apply_slice(
     pays_leg: &Leg,
     gets_leg: &Leg,
     take_in: Me,
+    // What the taker parts with for `take_in` — the pool receives the net and
+    // the input issuer destroys the difference. See `ox::move_leg_gross`.
+    take_in_gross: Me,
     take_out: Me,
 ) {
-    ox::move_leg(sandbox, taker, &amm.account, gets_leg, take_in);
+    ox::move_leg_gross(sandbox, taker, &amm.account, gets_leg, take_in, take_in_gross);
     ox::move_leg(sandbox, &amm.account, beneficiary, pays_leg, take_out);
 }
 

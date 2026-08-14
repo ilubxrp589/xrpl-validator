@@ -761,6 +761,52 @@ pub(crate) fn line_adjust(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, am
     }
 }
 
+/// Move `net` of `leg` to the receiver while the sender parts with `gross` —
+/// rippled's `rippleSend` (View.cpp), which is ONE credit per party:
+///
+///   saActual = saAmount + saTransitFee;
+///   rippleCredit(issuer, receiver, saAmount);   // receiver gets the NET
+///   rippleCredit(sender, issuer, saActual);     // sender pays the GROSS
+///
+/// Debiting the net and then adjusting the fee is TWO roundings of the sender's
+/// line where rippled has one, and a balance re-rounds to 16 digits at every
+/// touch. #105954798 D5887FD7 is the ledger that cares: the direct head inside
+/// its bridge moves 0.02788127288328903 BTC net / 0.02792309479261397 gross
+/// against a 0.15% issuer, and the taker's own line lands
+///   net then fee   0.3458715267976857 -> 0.3179902539143967 -> …0050718  <- ours
+///   gross, once    0.3458715267976857 ------------------------> …0050717  <- mainnet
+/// Same family as `4556384` and `44c20d9`: hold no more intermediate precision
+/// than the ledger does, and touch a balance as many times as rippled does — no
+/// more.
+pub(crate) fn move_leg_gross(
+    sandbox: &mut Sandbox,
+    from: &[u8; 20],
+    to: &[u8; 20],
+    leg: &Leg,
+    net: Me,
+    gross: Me,
+) {
+    if me_cmp(gross, net) == std::cmp::Ordering::Equal {
+        move_leg(sandbox, from, to, leg, net);
+        return;
+    }
+    if !me_is_zero(gross) {
+        line_adjust(sandbox, from, leg, gross, false);
+    }
+    if !me_is_zero(net) {
+        line_adjust(sandbox, to, leg, net, true);
+    }
+}
+
+/// The gross an input transfer rate makes the taker part with for `net`.
+/// `mulRatio(ofrAmt.in, ofrInRate, QUALITY_ONE, roundUp)` — BookStep.cpp:770.
+pub(crate) fn gross_in(fee_rate: Option<u64>, net: Me) -> Me {
+    match fee_rate {
+        Some(r) => me_muldiv(net, (r as u128, 0), (1_000_000_000, 0), true),
+        None => net,
+    }
+}
+
 /// Move `amt` of `leg` from one account to another.
 pub(crate) fn move_leg(sandbox: &mut Sandbox, from: &[u8; 20], to: &[u8; 20], leg: &Leg, amt: Me) {
     if me_is_zero(amt) {
@@ -1492,11 +1538,15 @@ fn settle_fill(
     gets_leg: &Leg,
     give: Me,
     pay: Me,
+    // What the TAKER parts with on the gets leg — `pay` plus the input
+    // issuer's transfer fee, which the issuer destroys. Equal to `pay` where
+    // no rate applies. See `move_leg_gross`.
+    pay_gross: Me,
     gives0: Me,
     wants0: Me,
 ) {
     move_leg(sandbox, maker, to_beneficiary, pays_leg, give);
-    move_leg(sandbox, from_taker, maker, gets_leg, pay);
+    move_leg_gross(sandbox, from_taker, maker, gets_leg, pay, pay_gross);
     let funded = available(sandbox, maker, pays_leg);
     let consumed = me_cmp(give, gives0).is_ge() || me_is_zero(funded);
     if consumed {
@@ -2404,20 +2454,16 @@ thr={t:?} admits_trunc={} admits_up={}",
                         break 'attempt;
                     }
                 }
-                settle_fill(sandbox, &okey, &offer, &maker, taker, beneficiary,
-                            pays_leg, gets_leg, give, pay, gives0, wants0);
                 // Same input transfer fee as leg A — this is the DIRECT head
                 // competing inside the bridge, and it spends the taker's gets
                 // side too. #105954798 D5887FD7 needs both: it takes one
                 // bridged slice and the rest through here, so charging only
                 // leg A moved it 4.25e-5 -> 4.18e-5 and no further.
-                if let Some(r) = fee_rate {
-                    let gross = me_muldiv(pay, (r as u128, 0), (1_000_000_000, 0), true);
-                    let fee = me_sub(gross, pay);
-                    if !me_is_zero(fee) {
-                        line_adjust(sandbox, taker, gets_leg, fee, false);
-                    }
-                }
+                //
+                // Charged as ONE debit of the gross, not a net debit plus a fee
+                // adjustment — `move_leg_gross` has the arithmetic.
+                settle_fill(sandbox, &okey, &offer, &maker, taker, beneficiary,
+                            pays_leg, gets_leg, give, pay, gross_in(fee_rate, pay), gives0, wants0);
                 // The taker's RUNNING remainder is an STAmount in rippled, so it
                 // re-rounds to 16 digits at EVERY subtraction. `me_sub` is
                 // exact, so ours accumulates precision rippled never has and
@@ -2628,38 +2674,34 @@ thr={t:?} admits_trunc={} admits_up={}",
                     break 'attempt;
                 }
                 // Leg A: taker sells gets for XRP (XRP rides in-flight via the
-                // taker and nets out of their mutation set).
+                // taker and nets out of their mutation set). The taker pays the
+                // input transfer fee on top of what leg A's maker received and
+                // the issuer destroys it — as ONE debit of the gross, per
+                // `move_leg_gross`.
+                let a_gross = gross_in(fee_rate, gets_in);
                 match (&a_book, &a_fill) {
                     (Some((_, akey, aoffer, amaker, a_gives0, a_wants0)), _) => {
                         settle_fill(sandbox, akey, aoffer, amaker, taker, taker,
-                                    &xrp_leg, gets_leg, xrp, gets_in, *a_gives0, *a_wants0);
+                                    &xrp_leg, gets_leg, xrp, gets_in, a_gross, *a_gives0, *a_wants0);
                     }
                     (None, Some(_)) => {
                         crate::tx::amm_swap::apply_slice(
-                            sandbox, amm_a.as_ref().unwrap(), taker, taker, &xrp_leg, gets_leg, gets_in, xrp,
+                            sandbox, amm_a.as_ref().unwrap(), taker, taker, &xrp_leg, gets_leg, gets_in, a_gross, xrp,
                         );
                         amm_used = true;
                     }
                     _ => break 'attempt,
                 }
-                // The taker pays the input transfer fee on top of what leg A's
-                // maker received; the issuer destroys it.
-                if let Some(r) = fee_rate {
-                    let gross = me_muldiv(gets_in, (r as u128, 0), (1_000_000_000, 0), true);
-                    let fee = me_sub(gross, gets_in);
-                    if !me_is_zero(fee) {
-                        line_adjust(sandbox, taker, gets_leg, fee, false);
-                    }
-                }
-                // Leg B: taker sells that XRP for the pays side.
+                // Leg B: taker sells that XRP for the pays side. Its input is
+                // the XRP middle, which carries no issuer rate.
                 match (&b_book, &b_fill) {
                     (Some((_, bkey, boffer, bmaker, b_gives0, b_wants0)), _) => {
                         settle_fill(sandbox, bkey, boffer, bmaker, taker, beneficiary,
-                                    pays_leg, &xrp_leg, pays_out, xrp, *b_gives0, *b_wants0);
+                                    pays_leg, &xrp_leg, pays_out, xrp, xrp, *b_gives0, *b_wants0);
                     }
                     (None, Some(_)) => {
                         crate::tx::amm_swap::apply_slice(
-                            sandbox, amm_b.as_ref().unwrap(), taker, beneficiary, pays_leg, &xrp_leg, xrp, pays_out,
+                            sandbox, amm_b.as_ref().unwrap(), taker, beneficiary, pays_leg, &xrp_leg, xrp, xrp, pays_out,
                         );
                         amm_used = true;
                     }
@@ -3406,7 +3448,6 @@ pub(crate) fn cross_engine_to(
                     }
                 }
                 move_leg(sandbox, &maker, beneficiary, pays_leg, give);
-                move_leg(sandbox, taker, &maker, gets_leg, pay);
                 // The taker pays the INPUT issuer's rate on top of what the
                 // maker receives, and the issuer destroys the difference:
                 //   trIn = redeems(prevStepDir) ? rate(book_.in, strandDst_) : parity
@@ -3425,14 +3466,13 @@ pub(crate) fn cross_engine_to(
                 // tfSell|tfIoC selling 446 SOLO direct to XRP, issuer rate
                 // 1.0001. Mainnet debits the taker 446.0446 and credits the
                 // maker 446; we debited 446 flat, leaving the taker 0.0446 rich.
-                if let Some(r) = transfer_rate(sandbox, gets_leg)
-                    .filter(|_| taker != &gets_leg.issuer && maker != gets_leg.issuer)
+                //
+                // Charged as ONE debit of the gross rather than a net debit
+                // followed by a fee adjustment — see `move_leg_gross`.
                 {
-                    let gross = me_muldiv(pay, (r as u128, 0), (1_000_000_000, 0), true);
-                    let fee = me_sub(gross, pay);
-                    if !me_is_zero(fee) {
-                        line_adjust(sandbox, taker, gets_leg, fee, false);
-                    }
+                    let r = transfer_rate(sandbox, gets_leg)
+                        .filter(|_| taker != &gets_leg.issuer && maker != gets_leg.issuer);
+                    move_leg_gross(sandbox, taker, &maker, gets_leg, pay, gross_in(r, pay));
                 }
                 rem_pays = me_sub(rem_pays, give);
                 rem_gets = me_sub(rem_gets, pay);
