@@ -2306,16 +2306,50 @@ thr={t:?} admits_trunc={} admits_up={}",
                 }
             }
             if want_direct {
-                let Some((_, okey, offer, maker, gives0, wants0)) =
+                let Some((q, okey, offer, maker, gives0, wants0)) =
                     live_head(sandbox, &ld, &mut di, taker, pays_leg, true, stale)
                 else { break 'attempt };
                 let funded = available(sandbox, &maker, pays_leg);
                 let m_gives = if me_cmp(funded, gives0).is_lt() { funded } else { gives0 };
+                // PRICE A PARTIAL FILL AT THE FILED RATE — the rule `e2a9c99`
+                // gave the two bridge legs, which this third fill site inside
+                // the same function never got. An offer carries two rates: the
+                // one it is FILED under (low 64 bits of `BookDirectory`, a
+                // 16-digit mantissa fixed at creation, which `live_head` hands
+                // back as element 0 and this site used to discard) and its
+                // current `TakerPays / TakerGets`, which drifts every time a
+                // residual is re-rounded. rippled prices a PARTIAL fill at the
+                // filed rate and a FULL one at the amounts.
+                //
+                // #105796380 A449F15D, a tfIoC selling RLUSD for BBRL against
+                // maker offer 1C91F38A (1050.174129632103 BBRL for
+                // 205.7501154775216 RLUSD, filed at 0.19592). The taker's line
+                // runs out at 125.383911425968 RLUSD, so the fill is
+                // INPUT-limited and the output is re-derived:
+                //   filed  125.383911425968 / 0.19592            = 639.9750481113107  <- mainnet
+                //   own    x 1050.174129632103/205.7501154775216 = 639.9750481113108  <- ours
+                // one last place, reported twice — on the maker's BBRL line and
+                // on the TakerGets it leaves behind.
+                //
+                // `whole` is None when the maker cannot fund the offer outright,
+                // because a funding-limited head is a partial fill however much
+                // of it trades.
+                let whole = me_cmp(funded, gives0).is_ge().then_some(gives0);
+                let price = |g: Me| -> Me {
+                    if whole.is_none_or(|w| me_cmp(g, w).is_lt()) {
+                        mul_round16_up(g, rate_me(q))
+                    } else {
+                        me_muldiv(g, wants0, gives0, true)
+                    }
+                };
                 let mut give = if !sell && me_cmp(rem_pays, m_gives).is_lt() { rem_pays } else { m_gives };
-                let mut pay = me_muldiv(give, wants0, gives0, true);
+                let mut pay = price(give);
                 if me_cmp(pay, rem_gets).is_gt() {
                     pay = rem_gets;
-                    give = me_muldiv(pay, gives0, wants0, false);
+                    // The clamp IS the partial case, so this always prices off
+                    // the page — `a_unprice` takes the filed rate unconditionally
+                    // for the same reason.
+                    give = me_muldiv(pay, (1u128, 0i32), rate_me(q), false);
                     if me_is_zero(give) {
                         break 'attempt;
                     }
