@@ -262,6 +262,56 @@ pub(crate) fn mul_round16_up(a: Me, b: Me) -> Me {
     (m, e)
 }
 
+/// `mulRoundStrict(a, b, XRP, round_up)` — `a * b` as whole DROPS.
+///
+/// `TOffer::limitOut` does not call `mulRound`: "It turns out that the ceil_out
+/// implementation has some slop in it, which ceil_out_strict removes"
+/// (Offer.h:200-202). For an IOU result the two canonicalisers are byte
+/// identical — `canonicalizeRoundStrict`'s non-integral branch is a verbatim
+/// copy of `canonicalizeRound`'s — which is why `mul_round16_up` is right
+/// everywhere else. For an INTEGRAL (XRP) result they diverge, and only the
+/// strict form keeps the digits that decide a whole drop
+/// (STAmount.cpp:1477 vs :1516). After dividing down to offset −1:
+///
+///   canonicalizeRound        value += 9;                                  value /= 10;
+///   canonicalizeRoundStrict  value += (hadRemainder && roundUp) ? 10 : 9; value /= 10;
+///
+/// With `roundUp` that `10` makes it a true CEILING of the exact product,
+/// while the legacy form discards everything below a TENTH OF A DROP before
+/// the carry can happen.
+///
+/// #105924683 7CB7E834 is one drop of difference and it decides a payment:
+/// 20.17908820997 RLUSD at the filed 921429.6903074811 is
+/// 18593611.000000000249 drops. The legacy form drops the `…249` and yields
+/// 18593611 — exactly the SendMax remaining — so the fill looks affordable and
+/// we hand over the full 20.17908820997. rippled ceilings to 18593612, finds
+/// it cannot afford that, and re-derives the output from the 18593611 it does
+/// have: `New flow iter (iter, in, out): 3 18593611 20.17908820996999`.
+fn mul_round_drops_strict(a: Me, b: Me, round_up: bool) -> u128 {
+    let (a, b) = (norm16(a), norm16(b));
+    if a.0 == 0 || b.0 == 0 {
+        return 0;
+    }
+    const TEN14: u128 = 100_000_000_000_000;
+    // `muldiv_round(m1, m2, tenTo14, tenTo14m1)` — a ceiling division.
+    let prod = a.0 * b.0;
+    let mut m = prod / TEN14 + u128::from(prod % TEN14 != 0);
+    let mut e = a.1 + b.1 + 14;
+    if e < 0 {
+        let mut had_remainder = false;
+        while e < -1 {
+            let nv = m / 10;
+            had_remainder |= m != nv * 10;
+            m = nv;
+            e += 1;
+        }
+        m += if had_remainder && round_up { 10 } else { 9 };
+        m /= 10;
+        e += 1;
+    }
+    m.saturating_mul(10u128.saturating_pow(e.clamp(0, 38) as u32))
+}
+
 pub(crate) fn me_muldiv(a: Me, b: Me, c: Me, ceil: bool) -> Me {
     if c.0 == 0 {
         return (0, 0);
@@ -3174,7 +3224,33 @@ pub(crate) fn cross_engine_to(
                     // owner-limited fill by a drop, and that drop is
                     // load-bearing: it is the difference between reaching the
                     // last offer and stopping short of it.
-                    pay = (me_rescale(pay, 0, buy_bound), 0);
+                    // ...and when the TAKER's remaining want bounds the fill,
+                    // that is `limitOut`, which goes through `ceilOutStrict`
+                    // rather than `ceilOut` — so the drops come from the STRICT
+                    // canonicaliser on the exact product, not from ceiling an
+                    // already-16-digit-rounded value. The two disagree by one
+                    // drop whenever the product's tail sits below a tenth of a
+                    // drop, and #105924683 7CB7E834 is that drop.
+                    //
+                    // The maker-funding-limited branch keeps the legacy form:
+                    // its direction is calibrated by #105672435 B409D45C and
+                    // #105814446 2162E284EAB3, and the strict rule would round
+                    // B409D45C's 5713437.2575 up to 5713438 where mainnet
+                    // charges 5713437.
+                    pay = if buy_bound {
+                        (mul_round_drops_strict(give, rate_me(q), true), 0)
+                    } else {
+                        (me_rescale(pay, 0, buy_bound), 0)
+                    };
+                }
+                // DX_PRICE: what the out-limited pricing actually produced,
+                // printed BEFORE the clamp test so a fill that does not reach
+                // the clamp still says why.
+                if std::env::var("DX_CLAMP").is_ok() {
+                    eprintln!(
+                        "DX_PRICE q={q:016x} give={give:?} full_offer={full_offer} buy_bound={buy_bound} sell={sell} pay={pay:?} rem_gets={rem_gets:?} gets_xrp={}",
+                        gets_leg.xrp
+                    );
                 }
                 if me_cmp(pay, rem_gets).is_gt() {
                     pay = rem_gets;
