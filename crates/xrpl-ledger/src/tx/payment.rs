@@ -532,6 +532,9 @@ impl PaymentTransactor {
         let need =
             Self::reverse_requirements(tx, chain, want_out, hop_thr, single_pass, amm_fib.as_deref(), sandbox);
         let spend_before = Self::leg_signed_balance(sandbox, &tx.account, spend_leg);
+        // What hop 0's walk says it consumed, kept for the spend measurement at
+        // the bottom of this function.
+        let mut spent_precise: Option<crate::tx::offer::Me> = None;
         let mut carry = avail_in;
         for i in 0..n {
             let last = i + 1 == n;
@@ -592,11 +595,19 @@ impl PaymentTransactor {
                 Some(r) => ox::me_muldiv(carry, (1_000_000_000, 0), (r as u128, 0), false),
                 None => carry,
             };
-            let (rw, _rs, _c) = ox::cross_engine_to(
+            let (rw, rs, _c) = ox::cross_engine_to(
                 &tx.account, benef, want_cap, avail, chain[i + 1], chain[i],
                 hop_thr, hop_thr, false, false, single_pass, amm_fib.as_deref_mut(), None,
                 sandbox, &mut Vec::new(),
             );
+            // Hop 0's input IS the spend leg — `hop_rate` is gated on `i > 0`,
+            // so `avail` there is still `avail_in` untouched — and `rs` is the
+            // part of it the pass did not spend. The difference is the same
+            // quantity the balance delta at the bottom measures, at the walk's
+            // own precision rather than the line's.
+            if i == 0 {
+                spent_precise = Some(ox::me_sub(avail, rs));
+            }
             // The walk has already debited the fee per fill. Nothing to add.
             //
             // Measured INERT on #105091578, #105923760 and #105795329 — the
@@ -662,11 +673,47 @@ impl PaymentTransactor {
                 None => sandbox.forget(&k),
             }
         }
+        // ASK THE WALK what it spent; do not DIFFERENCE the sender's balance.
+        // The same defect `44c20d9` fixed for a hop's carry and `45a7092` for
+        // the reverse pass sat here too: a balance holds 16 significant digits
+        // TOTAL, so whatever the sender already holds of the spend currency eats
+        // the low end of the addend.
+        //
+        // #105831615 8A754FA3, a circular tfPartialPayment spending its whole
+        // 339.4046619328438 PLX SendMax into one AMM. The sender holds
+        // 280487.9366802742 PLX, whose last place is 1e-10, so before − after
+        // reads 339.4046619328 — three digits gone — and 4.38e-11 of the
+        // SendMax looks unspent. With one round per strand nothing ever reads
+        // that residue, which is why the transaction is byte-exact today; give
+        // the strand a second iteration and it buys another 1.1e-11 of the
+        // Amount, putting the pool's two lines and the destination's 1 lsd off
+        // mainnet. rippled has no such residue: `flow()` subtracts the strand's
+        // OWN reported `in` from `remainingIn`, so a SendMax-limited pass ends
+        // the loop outright.
+        //
+        // GUARDED like both predecessors, and for a reason `1f31546` names:
+        // `rs` tracks the NET the walk moved while the balance ALSO lost the
+        // per-fill input transfer fee (offer.rs:3297), so on a fee-bearing spend
+        // leg the two measure different things and the delta is the honest one.
         let spent = match (spend_before, Self::leg_signed_balance(sandbox, &tx.account, spend_leg)) {
             (Some((bneg, b)), Some((aneg, a))) => {
                 let (dneg, d) = ox::signed_add(bneg, b, !aneg, a); // before - after
-                if dneg { (0, 0) } else { d }
+                let d = if dneg { (0, 0) } else { d };
+                let agree = |p: ox::Me| {
+                    !ox::me_is_zero(d) && !ox::me_is_zero(p) && {
+                        let (hi, lo) = if ox::me_cmp(p, d).is_gt() { (p, d) } else { (d, p) };
+                        let diff = ox::me_sub(hi, lo);
+                        ox::me_cmp(ox::me_muldiv(diff, (1_000_000_000, 0), (1, 0), false), hi).is_lt()
+                    }
+                };
+                match spent_precise.filter(|p| agree(*p)) {
+                    Some(p) => p,
+                    None => d,
+                }
             }
+            // The sender ISSUES what it is spending, so there is no line to
+            // difference and no measurement at all — the round loop stops on a
+            // zero spend rather than guessing. Left as it was.
             _ => (0, 0),
         };
         (spent, carry)
