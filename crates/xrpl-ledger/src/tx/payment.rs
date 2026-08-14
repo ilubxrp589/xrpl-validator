@@ -1514,8 +1514,25 @@ impl PaymentTransactor {
             for &i in &order {
                 let try_snap = sandbox.snapshot();
                 let mut try_fib = amm_fib.clone();
+                // EVERY strand runs ONE PASS, lone or not — the third and last
+                // part of the iteration model, and the same `if multi` gate the
+                // rounds carried. A pass ends when an offer is CONSUMED and
+                // `flow()` re-enters the strand; without that a single-strand
+                // payment walks the whole book in one call and MERGES what
+                // rippled does in separate iterations.
+                //
+                // #105795329 ED4F899F is the specimen and it is exact. rippled:
+                //   iter 0  66625978 -> 75.87773718335664
+                //   iter 1  45860000 -> 52.22817182817183
+                //   iter 2  81002057 -> 92.0884060091763
+                // We matched iter 0 and then took the CLOB offer AND the next
+                // AMM slice in one round (sin 126862057 = 45860000 + 81002057).
+                // The maker's RWA line is debited once per iteration and
+                // re-rounds at 1e-10 each time, so THREE debits land on
+                // 808582.0813613431 and any two-way split lands on …432 —
+                // the count is the whole difference.
                 let (sin, sout) = Self::strand_pass(
-                    tx, dest, &strands[i], rem_in, rem_out, threshold, multi,
+                    tx, dest, &strands[i], rem_in, rem_out, threshold, true,
                     multi_now.then(|| &mut try_fib), sandbox,
                 );
                 if std::env::var("DX_PAY").is_ok() {
