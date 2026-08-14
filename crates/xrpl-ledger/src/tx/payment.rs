@@ -263,6 +263,25 @@ impl PaymentTransactor {
                 // AGREE to 1e-9, since they measure one quantity and should
                 // differ solely in the digits the balance dropped.
                 let precise = ox::me_sub(granted, rem_in);
+                // ...GROSSED UP first. `rem_in` tracks only the NET the walk
+                // moved; the input transfer fee is debited SEPARATELY by
+                // `line_adjust`, so on a fee-bearing hop `precise` is the net
+                // and `d` is the gross and the two differ by the WHOLE FEE —
+                // 1e-3 for a 1.001 issuer, a thousand times the 1e-9 threshold
+                // below. The guard then rejected the precise value on exactly
+                // the hops that needed it, silently disabling this fix.
+                //
+                // #105795329 ED4F899F: the USD leg needs
+                // 220.1943150207048 x 1.001 = 220.4145093357255048 and the
+                // differenced balance reported 220.414509335726 — the 16th
+                // digit gone, which is the 5.6e-13 that made a capped round
+                // fall short of its requirement.
+                let precise = match Self::transfer_rate(sandbox, in_leg)
+                    .filter(|_| tx.account != in_leg.issuer)
+                {
+                    Some(r) => ox::me_muldiv(precise, (r as u128, 0), (1_000_000_000, 0), true),
+                    None => precise,
+                };
                 let agree = !ox::me_is_zero(d)
                     && !ox::me_is_zero(precise)
                     && {
