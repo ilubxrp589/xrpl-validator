@@ -236,7 +236,7 @@ impl PaymentTransactor {
         let granted = Self::fund_for_trial(sandbox, &tx.account, in_leg, grant);
         let before = Self::leg_signed_balance(sandbox, &tx.account, in_leg);
         let mut trial_fib = amm_fib.cloned();
-        let (rw, _, _) = ox::cross_engine_to(
+        let (rw, rem_in, _) = ox::cross_engine_to(
             &tx.account, &tx.account, want, granted, out_leg, in_leg,
             threshold, threshold, false, false, single_pass, trial_fib.as_mut(), None,
             sandbox, &mut Vec::new(),
@@ -244,7 +244,33 @@ impl PaymentTransactor {
         let consumed = match (before, Self::leg_signed_balance(sandbox, &tx.account, in_leg)) {
             (Some((bneg, b)), Some((aneg, a))) => {
                 let (dneg, d) = ox::signed_add(bneg, b, !aneg, a); // before - after
-                if dneg { (0, 0) } else { d }
+                let d = if dneg { (0, 0) } else { d };
+                // `granted - rem_in` is the SAME quantity at full precision, and
+                // the walk already handed it back — this function was throwing
+                // it away and differencing a granted BALANCE instead, which is
+                // 16 significant digits TOTAL, so the grant itself eats the low
+                // end of the answer.
+                //
+                // Same defect as `44c20d9`, one level up: that fixed the
+                // FORWARD carry, this is the REVERSE pass that sizes it.
+                // #105831615 3304A306: the trial consumed 29.12649465384142 and
+                // this reported 29.1264946538414 — one digit — so `want_cap`
+                // went into the forward pass already short and the hop after it
+                // delivered 362674.25930709 against mainnet's 362674.259307105.
+                // The reverse pass had mainnet's exact number and lost it here.
+                //
+                // GUARDED exactly like `44c20d9`: taken only where the two
+                // AGREE to 1e-9, since they measure one quantity and should
+                // differ solely in the digits the balance dropped.
+                let precise = ox::me_sub(granted, rem_in);
+                let agree = !ox::me_is_zero(d)
+                    && !ox::me_is_zero(precise)
+                    && {
+                        let (hi, lo) = if ox::me_cmp(precise, d).is_gt() { (precise, d) } else { (d, precise) };
+                        let diff = ox::me_sub(hi, lo);
+                        ox::me_cmp(ox::me_muldiv(diff, (1_000_000_000, 0), (1, 0), false), hi).is_lt()
+                    };
+                if agree { precise } else { d }
             }
             _ => (0, 0),
         };
