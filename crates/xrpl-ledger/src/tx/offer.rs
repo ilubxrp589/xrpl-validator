@@ -2890,6 +2890,27 @@ pub(crate) fn cross_engine_to(
             if done(rem_pays, rem_gets) {
                 break 'dirs;
             }
+            // ONE AMM CONSUMPTION PER PAYMENT-ENGINE ITERATION. "At any payment
+            // engine iteration, AMM offer can only be consumed once"
+            // (BookStep.cpp:818) — so when a payment wants more pool liquidity
+            // than one AMM offer gives, rippled ENDS the pass and `flow()`
+            // re-enters the strand for the next one. Each iteration writes the
+            // maker's residual, so N iterations are N roundings; taking fib
+            // slices inside a single pass rounds once and lands elsewhere.
+            //
+            // #105795329 ED4F899F is the specimen: two rounds of 220.414... and
+            // 144.460... spend 193488035 drops + 10 fee, which is mainnet's
+            // spend to the drop, and the transaction goes 4 hits to 1.
+            //
+            // PAYMENTS ONLY. The boundary is only meaningful because
+            // `apply_path_payment`'s round loop re-enters the strand with what
+            // is left, exactly as `flow()`'s driver does. FlowCross has no such
+            // loop, so returning here would abandon the rest of the book rather
+            // than come back to it — measured, and it moves the XRP side of an
+            // offer-crossing pass that is byte-exact today.
+            if used && !offer_crossing {
+                return (rem_pays, rem_gets, crossed);
+            }
         }
         // Set when this level CONSUMES an offer, which is what ends a pass and
         // earns the pool its next turn. Removals leave it false.

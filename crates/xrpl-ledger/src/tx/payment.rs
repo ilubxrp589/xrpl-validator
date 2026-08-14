@@ -1455,11 +1455,21 @@ impl PaymentTransactor {
         // strand delivered under DeliverMin and turned a tesSUCCESS into
         // tecPATH_PARTIAL.
         let mut multi_now = multi;
-        // A single strand runs ONCE, walking the whole book exactly as before —
-        // rounds exist to interleave strands, and re-entering a lone strand
-        // would just keep taking further slices of a large tfPartialPayment
-        // Amount that one call already sized correctly.
-        let rounds = if multi { 32 } else { 1 };
+        // EVERY strand re-enters, lone or not. This used to be `if multi`,
+        // justified by "one call already sized it correctly" — which the AMM
+        // once-per-iteration boundary in `cross_engine_to` FALSIFIES: a single
+        // strand now returns as soon as it has taken one AMM offer, so the
+        // rounds are what fetch the rest of the liquidity rather than a way to
+        // interleave rivals. rippled's driver makes no distinction either — it
+        // loops `while (remainingOut > 0 && *remainingIn > 0)` over whatever
+        // `activateNext` yields, one strand or five (StrandFlow.h:610-700).
+        //
+        // The loop is bounded by its own remainders, so a pass that leaves
+        // nothing to do exits on the first check. #105831615 8A754FA3 is why
+        // that has to be exact: measure its spend by differencing a balance and
+        // 4.38e-11 of the SendMax reads unspent, which buys a whole extra
+        // round — see `8d8d2e6`.
+        let rounds = 32;
         for _round in 0..rounds {
             if ox::me_is_zero(rem_out) || ox::me_is_zero(rem_in) {
                 break;
