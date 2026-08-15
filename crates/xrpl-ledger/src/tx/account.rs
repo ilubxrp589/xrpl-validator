@@ -190,6 +190,40 @@ impl Transactor for AccountDeleteTransactor {
             serde_json::Value::String(dest_balance.checked_add(balance).unwrap_or(u64::MAX).to_string());
         sandbox.write(dest_key, serde_json::to_vec(&dest).unwrap());
 
+        // The owner DIRECTORY goes too. rippled walks it deleting each owned
+        // object and then removes the directory ITSELF, before erasing the
+        // account (AccountDelete.cpp):
+        //     Keylet const ownerDirKeylet{keylet::ownerDir(accountID_)};
+        //     …
+        //     if (view().exists(ownerDirKeylet) && !view().emptyDirDelete(ownerDirKeylet))
+        //     view().update(dst);
+        //     view().erase(src);
+        //
+        // An account at OwnerCount 0 still OWNS an empty root page — the count
+        // tracks reserved objects, not the directory that held them — and that
+        // page is a ledger object mainnet removes. #106295546 4568277964F6 is
+        // exactly that and nothing else: 3 nodes to our 2, the missing one
+        // being the directory F2EAB202… whose RootIndex is itself.
+        //
+        // Guarded on emptiness because that is what `emptyDirDelete` means;
+        // preclaim already requires OwnerCount == 0, so a non-empty directory
+        // here would be a state we do not understand and must not silently
+        // discard.
+        let dir_key = keylet::owner_dir_key(&tx.account);
+        if let Some(d) = sandbox.read(&dir_key) {
+            let empty = serde_json::from_slice::<serde_json::Value>(&d)
+                .ok()
+                .map(|v| {
+                    v.get("Indexes")
+                        .and_then(|i| i.as_array())
+                        .is_none_or(|a| a.is_empty())
+                })
+                .unwrap_or(false);
+            if empty {
+                sandbox.delete(dir_key);
+            }
+        }
+
         // Delete the account
         sandbox.delete(acct_key);
 
