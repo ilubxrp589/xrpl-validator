@@ -523,6 +523,29 @@ struct OfferSle {
     destination: Option<[u8; 20]>,
 }
 
+/// `accountFunds(view, payer, needed, ...) < needed` for an XRP-priced NFT
+/// offer. For XRP that resolves to `accountHolds`, i.e. the balance less the
+/// account's reserve at its current OwnerCount.
+///
+/// ⚠ IOU-priced offers return FALSE — not "funded", but "not judged here".
+/// `do_apply` still does not move value over trust lines for them (see its own
+/// note), so inventing a funds verdict would swap one wrong result code for
+/// another. When IOU settlement lands, this is the first thing to revisit.
+fn nft_funds_short(sandbox: &Sandbox, payer: &[u8; 20], amount: &serde_json::Value) -> bool {
+    let Some(needed) = amount.as_str().and_then(|s| s.parse::<u64>().ok()) else {
+        return false;
+    };
+    let Some(d) = sandbox.read(&keylet::account_root_key(payer)) else {
+        return false;
+    };
+    let Ok(a) = serde_json::from_slice::<serde_json::Value>(&d) else {
+        return false;
+    };
+    let bal: u64 = a["Balance"].as_str().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let reserve = crate::ledger::fees::account_reserve(sandbox, owner_count_of(sandbox, payer));
+    bal.saturating_sub(reserve) < needed
+}
+
 fn read_offer(sandbox: &Sandbox, key: Hash256) -> Option<OfferSle> {
     let data = sandbox.read(&key)?;
     let o: serde_json::Value = serde_json::from_slice(&data).ok()?;
@@ -614,6 +637,51 @@ impl Transactor for NFTokenAcceptOfferTransactor {
         let acct_key = keylet::account_root_key(&tx.account);
         if !sandbox.exists(&acct_key) {
             return TxResult::NoAccount;
+        }
+        // rippled's `checkOffer` (NFTokenAcceptOffer.cpp): a named offer that is
+        // the zero hash, or that is not in the ledger, is tecOBJECT_NOT_FOUND —
+        // and that verdict is reached BEFORE any of the checks below.
+        let read = |field: &str| -> Result<Option<OfferSle>, TxResult> {
+            let Some(v) = tx.fields.get(field) else { return Ok(None) };
+            match hash256_from(v) {
+                Some(k) if k.0 != [0u8; 32] => match read_offer(sandbox, k) {
+                    Some(o) => Ok(Some(o)),
+                    None => Err(TxResult::ObjectNotFound),
+                },
+                _ => Err(TxResult::ObjectNotFound),
+            }
+        };
+        let bo = match read("NFTokenBuyOffer") {
+            Ok(o) => o,
+            Err(e) => return e,
+        };
+        let so = match read("NFTokenSellOffer") {
+            Ok(o) => o,
+            Err(e) => return e,
+        };
+        // "The account offering to buy must have funds":
+        //   accountFunds(view, (*bo)[sfOwner], needed, ...) < needed
+        //     -> tecINSUFFICIENT_FUNDS
+        // The payer is the BUY OFFER'S OWNER, not the submitter — in brokered
+        // mode the broker never funds the purchase, which is why checking the
+        // submitter there "doesn't make sense, causes an unnecessary tec", in
+        // rippled's own words. With only a sell offer the payer IS the
+        // submitter, and rippled skips that check entirely when a buy offer is
+        // also present (`if (!bo)`).
+        //
+        // #106295345 A197E2D3 is the specimen: a brokered accept where the buy
+        // offer's owner rHoGeyNk holds 6087454 drops against an OwnerCount of 8
+        // — a 2600000 reserve — so 3487454 spendable against a 5069291 offer.
+        // Mainnet claims the fee and stops; we had no funds check at all.
+        if let Some(b) = &bo {
+            if nft_funds_short(sandbox, &b.owner, &b.amount) {
+                return TxResult::InsufficientFunds;
+            }
+        }
+        if let Some(s) = &so {
+            if bo.is_none() && nft_funds_short(sandbox, &tx.account, &s.amount) {
+                return TxResult::InsufficientFunds;
+            }
         }
         TxResult::Success
     }

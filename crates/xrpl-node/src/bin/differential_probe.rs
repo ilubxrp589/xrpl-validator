@@ -297,6 +297,13 @@ fn load_nft_pages_for_tx(state: &mut LedgerState, url: &str, txj: &Value, ledger
                     json!({"index": idx, "ledger_index": ledger_index})) else { continue };
                 if let Some(owner) = res["node"]["Owner"].as_str() {
                     load_nft_pages(state, url, owner, ledger_index);
+                    // ...and the owner's ACCOUNT ROOT. The offer's owner is not
+                    // named anywhere in the transaction, so the involved-account
+                    // loader never sees it — yet `NFTokenAcceptOffer::preclaim`
+                    // weighs `accountFunds(bo.Owner)` against the offer, and a
+                    // balance nobody loaded reads as "no opinion". That is how
+                    // the funds check silently did nothing on first attempt.
+                    load_account(state, url, owner, ledger_index);
                 }
             }
         }
@@ -338,6 +345,25 @@ fn decode_issuer(s: &str) -> Option<[u8; 20]> {
 /// Transactor-specific; extend as more types are hardened.
 fn native_read_keys(txj: &Value) -> Vec<String> {
     let mut keys = Vec::new();
+    // NFTokenAcceptOffer names its offers by INDEX, and the same trap the
+    // credential block below describes applies with full force: a `tec` that
+    // claims nothing but the fee MODIFIES neither offer, so the
+    // modified/deleted loader hydrates neither, and the engine is asked to
+    // judge a transaction whose offers it cannot see. It can only answer
+    // tecOBJECT_NOT_FOUND.
+    //
+    // #106295345 A197E2D3 and six siblings across the 2026-08-14 fresh sweep
+    // were all this blind spot — mainnet tecINSUFFICIENT_FUNDS against our
+    // tecOBJECT_NOT_FOUND — and no engine change could have fixed them while
+    // the offers were absent from the sandbox. They were 7 of the 13
+    // divergences in that sweep, the single largest cluster.
+    if txj["TransactionType"].as_str() == Some("NFTokenAcceptOffer") {
+        for f in ["NFTokenBuyOffer", "NFTokenSellOffer"] {
+            if let Some(idx) = txj.get(f).and_then(|v| v.as_str()) {
+                keys.push(idx.to_ascii_uppercase());
+            }
+        }
+    }
     // Credential transactors read keylet::credential(subject, issuer, type)
     // before doing anything. When the answer is "it already exists" the
     // transaction is fee-only, so the object never appears in mainnet's

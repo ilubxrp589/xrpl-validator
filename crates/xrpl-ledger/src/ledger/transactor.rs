@@ -69,6 +69,10 @@ pub enum TxResult {
     /// A referenced object does not exist (NFT offers use this rather than
     /// the older tecNO_ENTRY).
     ObjectNotFound,
+    /// The account that must pay for an NFT offer cannot cover it.
+    /// `NFTokenAcceptOffer::preclaim` compares `accountFunds(offer owner)`
+    /// against the offer's own Amount.
+    InsufficientFunds,
     /// An AMM pool cannot cover the requested amount, or the account holds no
     /// LP tokens in it.
     AmmBalance,
@@ -135,6 +139,7 @@ impl TxResult {
             | TxResult::ArrayTooLarge
             | TxResult::Duplicate
             | TxResult::ObjectNotFound
+            | TxResult::InsufficientFunds
             | TxResult::AmmBalance
             | TxResult::DirFull
             | TxResult::InsufficientReserve
@@ -175,6 +180,7 @@ impl TxResult {
             TxResult::ArrayTooLarge => "tecARRAY_TOO_LARGE",
             TxResult::Duplicate => "tecDUPLICATE",
             TxResult::ObjectNotFound => "tecOBJECT_NOT_FOUND",
+            TxResult::InsufficientFunds => "tecINSUFFICIENT_FUNDS",
             TxResult::AmmBalance => "tecAMM_BALANCE",
             TxResult::DirFull => "tecDIR_FULL",
             TxResult::InsufficientReserve => "tecINSUFFICIENT_RESERVE",
