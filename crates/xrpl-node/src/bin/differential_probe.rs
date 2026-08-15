@@ -281,9 +281,28 @@ fn load_nft_pages_for_tx(state: &mut LedgerState, url: &str, txj: &Value, ledger
         Some("NFTokenModify") | Some("NFTokenBurn") | Some("NFTokenCreateOffer") => {
             // The seller (sfOwner, or the account for a sell offer) must own
             // the token — preclaim walks their pages for the existence check.
-            let owner = txj.get("Owner").and_then(|v| v.as_str())
-                .or_else(|| txj["Account"].as_str());
-            if let Some(o) = owner {
+            //
+            // ...and the CREATOR too, which `Owner`-or-`Account` skipped. On a
+            // BUY offer `Owner` is the token's current holder and `Account` is
+            // the party who will RECEIVE the token, so it is the creator's page
+            // chain that the later accept needs. The accept cannot recover it
+            // either: an offer CREATED in this same ledger does not exist at
+            // seq-1, so the `ledger_entry` lookup that normally discovers the
+            // counterparty finds nothing and silently loads no pages.
+            //
+            // #106297794 4EF69B14: tx 41 is the buy offer from
+            // rhtijaf8wXPM (10 pages), tx 56 the brokered accept. With neither
+            // path loading them, `find_page` could not read the max page,
+            // `page_insert` fell through to "no pages yet" and CREATED one —
+            // mainnet Modifies the existing 81E4939BB07D… page instead. Same
+            // result and the same mutation count, one key apart.
+            let mut loaded: Vec<&str> = Vec::new();
+            for f in ["Owner", "Account"] {
+                let Some(o) = txj.get(f).and_then(|v| v.as_str()) else { continue };
+                if loaded.contains(&o) {
+                    continue;
+                }
+                loaded.push(o);
                 load_nft_pages(state, url, o, ledger_index);
             }
         }

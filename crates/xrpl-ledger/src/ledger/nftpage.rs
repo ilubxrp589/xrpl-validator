@@ -255,6 +255,18 @@ pub fn page_insert(sandbox: &mut Sandbox, owner: &[u8; 20], entry: serde_json::V
         }
     }
     // No pages yet — create the owner's max page.
+    //
+    // DX_NFT: this branch is also where a page-placement divergence lands, so
+    // say WHY it was reached — a missing max page (hydration) and a failed
+    // backward walk (engine) look identical from the outside.
+    if std::env::var("DX_NFT").is_ok() {
+        eprintln!(
+            "DX_NFT page_insert CREATES max owner={} id={id_hex} max_present={} find_page={:?}",
+            hex::encode(owner),
+            read_page(sandbox, &max_page_key(owner)).is_some(),
+            find_page(sandbox, owner, &id).map(|k| hex::encode_upper(k.0)),
+        );
+    }
     let page = serde_json::json!({
         "LedgerEntryType": "NFTokenPage",
         "Flags": 0,
