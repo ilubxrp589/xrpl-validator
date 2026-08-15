@@ -364,6 +364,23 @@ fn decode_issuer(s: &str) -> Option<[u8; 20]> {
 /// Transactor-specific; extend as more types are hardened.
 fn native_read_keys(txj: &Value) -> Vec<String> {
     let mut keys = Vec::new();
+    // A Payment to an lsfDepositAuth destination is refused unless a
+    // DepositPreauth(dst, src) object exists — and that object is READ, never
+    // written, so a payment it ALLOWS touches it in no metadata and the
+    // modified/deleted loader never fetches it.
+    //
+    // ⚠ This is the vacuous-check trap INVERTED, and the dangerous direction:
+    // an unhydrated preauth does not silently disable the gate, it makes the
+    // gate FIRE on a payment mainnet allows. Hydrate it with the check, never
+    // after.
+    if txj["TransactionType"].as_str() == Some("Payment") {
+        if let (Some(src), Some(dst)) = (
+            txj["Account"].as_str().and_then(decode_address),
+            txj["Destination"].as_str().and_then(decode_address),
+        ) {
+            keys.push(hex::encode_upper(keylet::deposit_preauth_key(&dst, &src).0));
+        }
+    }
     // NFTokenAcceptOffer names its offers by INDEX, and the same trap the
     // credential block below describes applies with full force: a `tec` that
     // claims nothing but the fee MODIFIES neither offer, so the

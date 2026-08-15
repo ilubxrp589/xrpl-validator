@@ -981,6 +981,46 @@ impl Transactor for PaymentTransactor {
             (None, _) => false,
         } || tx.fields.get("Paths").is_some();
 
+        // DEPOSIT AUTHORIZATION. An account carrying lsfDepositAuth accepts a
+        // payment only from ITSELF or from a sender it has preauthorized
+        // (CredentialHelpers.cpp `verifyDepositPreauth`):
+        //     if (sleDst->isFlag(lsfDepositAuth) && src != dst
+        //         && !view.exists(keylet::depositPreauth(dst, src)))
+        //         return tecNO_PERMISSION;
+        //
+        // rippled applies it UNCONDITIONALLY on the "ripple" route —
+        // `(hasPaths || sendMax || !dstAmount.native())`, Payment.cpp:451-464 —
+        // and on a direct XRP payment only when the amount or the destination's
+        // balance exceeds the BASE RESERVE (Payment.cpp:661-668). That
+        // carve-out is deliberate and rippled explains it: without it an
+        // account that sets the flag and then spends all its XRP "would be
+        // unable to acquire more XRP required to pay fees", i.e. wedged.
+        //
+        // #106309898 03B98013: 0.000074 RPR to radN7hxK9, whose Flags are
+        // exactly lsfDepositAuth (0x01000000) and nothing else. Mainnet claims
+        // the fee and stops; we had no such check at all and delivered — 3
+        // mutations against mainnet's 1. Succeeding where mainnet REFUSES moves
+        // value mainnet never moved, which is why this outranked the rest of
+        // the batch.
+        if let Some(dst) = crate::tx::offer::json_at(sandbox, &keylet::account_root_key(&dest_id)) {
+            if dst["Flags"].as_u64().unwrap_or(0) & 0x0100_0000 != 0 && dest_id != tx.account {
+                let ripple = cross_currency || !amt_json.is_string() || sendmax.is_some();
+                let gated = ripple || {
+                    let reserve = crate::ledger::fees::reserve_base(sandbox);
+                    let dst_bal =
+                        dst["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                    Self::amount_drops(tx).unwrap_or(0) > reserve || dst_bal > reserve
+                };
+                if gated
+                    && sandbox
+                        .read(&keylet::deposit_preauth_key(&dest_id, &tx.account))
+                        .is_none()
+                {
+                    return TxResult::NoPermission;
+                }
+            }
+        }
+
         if cross_currency {
             return self.apply_path_payment(tx, sandbox, &amt_json, sendmax.as_ref(), &dest_id, partial);
         }
