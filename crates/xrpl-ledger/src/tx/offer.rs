@@ -3305,6 +3305,31 @@ pub(crate) fn cross_engine_to(
                         (me_rescale(pay, 0, buy_bound), 0)
                     };
                 }
+                // CLAMP IN — `ceilOutImpl` ends with exactly this, and it is a
+                // named step in rippled's source, not a rounding artefact:
+                //     Amounts result(MulRoundFunc(limit, quality.rate(), …), limit);
+                //     // Clamp in
+                //     if (result.in > amount.in)
+                //         result.in = amount.in;
+                // (Quality.cpp). An out-limited fill is priced through the
+                // offer's QUALITY, and the filed 16-digit rate can price the
+                // taker's slightly-smaller `out` at MORE input than the whole
+                // offer asks for. The taker can never be charged more than the
+                // offer's own TakerPays.
+                //
+                // #106297387 2B053E4F: hop 0 needs 1537.679915688961 XLM of an
+                // offer holding 1537.679915688963 for 244393959 drops.
+                //   own ratio  x 158936.82196564192 -> 244393958.99999968 -> 244393959
+                //   filed rate x 158936.8226130111  -> 244393959.99544    -> 244393960
+                // We charged the filed-rate ceiling; rippled clamps to 244393959,
+                // which is the whole TakerPays — so the residual pays side is
+                // ZERO and the offer dies. That one clamp is BOTH divergences:
+                // a conserved 1-drop overpay (maker +1, sender −1) and the
+                // offer surviving as Modified where mainnet Deletes it, taking
+                // its book page D58F81E8 and owner-dir entry 171D3DDD with it.
+                if buy_bound && me_cmp(pay, m_wants0).is_gt() {
+                    pay = m_wants0;
+                }
                 // DX_PRICE: what the out-limited pricing actually produced,
                 // printed BEFORE the clamp test so a fill that does not reach
                 // the clamp still says why.
@@ -3498,13 +3523,25 @@ pub(crate) fn cross_engine_to(
                 rem_gets = me_sub(rem_gets, pay);
                 crossed += 1;
                 level_crossed = true;
-                let consumed = me_cmp(give, m_gives0).is_ge() || me_cmp(give, funded).is_ge();
+                // `TOffer::fully_consumed()` is `amount().in == 0 || amount().out
+                // == 0` — EITHER side, not just the gets side we were testing.
+                // An out-limited fill clamped to the offer's whole TakerPays
+                // drives the pays residual to zero while a dust remainder still
+                // sits on the gets side, and rippled removes that offer.
+                // #106297387 2B053E4F leaves TakerGets 2e-12 against TakerPays
+                // 0, and mainnet Deletes it.
+                let res_gets = offer_residual(m_gives0, give);
+                let res_pays = offer_residual(m_wants0, pay);
+                let consumed = me_cmp(give, m_gives0).is_ge()
+                    || me_cmp(give, funded).is_ge()
+                    || me_is_zero(res_gets)
+                    || me_is_zero(res_pays);
                 if consumed {
                     delete_maker_offer(sandbox, &okey, &offer, &maker);
                 } else {
                     let mut off2 = offer.clone();
-                    off2["TakerGets"] = me_amount_json(&offer["TakerGets"], offer_residual(m_gives0, give));
-                    off2["TakerPays"] = me_amount_json(&offer["TakerPays"], offer_residual(m_wants0, pay));
+                    off2["TakerGets"] = me_amount_json(&offer["TakerGets"], res_gets);
+                    off2["TakerPays"] = me_amount_json(&offer["TakerPays"], res_pays);
                     put_json(sandbox, okey, &off2);
                 }
                 if done(rem_pays, rem_gets) {
