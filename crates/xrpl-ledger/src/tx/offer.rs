@@ -3002,7 +3002,27 @@ pub(crate) fn cross_engine_to(
         // remaining 535677 as a single pass costing 46.96292384379671 SPEPE —
         // one unit past its own limit — which the achieved-quality check then
         // rejects, leaving exactly that remainder to rest.
-        if let Some(a) = amm.as_ref().filter(|_| prev_level_crossed) {
+        //
+        // ...AND ONLY ON A LEVEL THE TAKER COULD ACTUALLY TRADE. `tryAMM` is
+        // handed `offers.tip().quality()`, and a tip beyond the limit is not a
+        // tip the stream ever reaches — rippled then calls it with NO clob
+        // quality at all, which is `maxOffer`, and `limitOut` trims that to the
+        // limit instead. Anchoring to an unreachable level sizes the slice off
+        // a price the taker rejected.
+        //
+        // #106295504 E9F363D7 (and #106297489 3BEC441E, the same market maker
+        // hours later): tfSell|tfPassive, 1250 XRP for 16.604535 SOL, so a
+        // limit of 75280230.658627. The book's tip is 75323299.971751 — WORSE —
+        // and the XRP/SOL pool sits between them at 75152490.428151. rippled
+        // builds maxOffer, trims it, flows 133055 drops realising
+        // 75280687.18924356, misses its own limit by 6.06e-6 (past the 1e-7
+        // forgiveness) and REJECTS the pass: `Total flow: in: 0 out: 0`, the
+        // offer rests whole. Anchored to that unreachable tip we sized 128056
+        // drops instead, whose realised quality CLEARS the limit — so we
+        // crossed a pool mainnet never touched, three extra mutations.
+        // The break below then falls through to the unanchored tail turn, which
+        // is exactly the call rippled makes.
+        if let Some(a) = amm.as_ref().filter(|_| prev_level_crossed && q <= threshold) {
             if std::env::var("DX_AMM").is_ok() {
                 eprintln!("DX_AMM site=direct-walk q={q:x}");
             }
