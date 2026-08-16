@@ -62,14 +62,14 @@ fn make_leaf(tx_blob: &[u8], meta_blob: &[u8]) -> ([u8; 32], [u8; 32]) {
 
 /// SHAMap branch for `key` at `depth`: high nibble of byte `depth/2` when depth is
 /// even, low nibble when odd (rippled `SHAMapNodeID::selectBranch`).
-fn nibble(key: &[u8; 32], depth: usize) -> usize {
+pub(super) fn nibble(key: &[u8; 32], depth: usize) -> usize {
     let byte = key[depth / 2];
     (if depth & 1 == 0 { byte >> 4 } else { byte & 0x0f }) as usize
 }
 
 /// Hash of the SHAMap node covering `items` at `depth`. The root (depth 0) is always
 /// an inner node; a single item at depth > 0 collapses to its leaf hash.
-fn node_hash(items: &[([u8; 32], [u8; 32])], depth: usize) -> [u8; 32] {
+pub(super) fn node_hash(items: &[([u8; 32], [u8; 32])], depth: usize) -> [u8; 32] {
     if items.len() == 1 && depth > 0 {
         return items[0].1;
     }

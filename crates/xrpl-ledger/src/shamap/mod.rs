@@ -13,6 +13,7 @@ pub mod hash;
 pub mod node;
 pub mod sync;
 pub mod tree;
+pub mod tx_set;
 pub mod tx_tree;
 
 pub use tree::{SHAMap, TreeType};

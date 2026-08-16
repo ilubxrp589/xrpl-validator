@@ -2,26 +2,25 @@
 
 use std::collections::HashSet;
 
-use xrpl_core::crypto::signing::sha512_half;
 use xrpl_core::types::Hash256;
 
-/// Compute the hash of a transaction set for a proposal.
+use xrpl_ledger::shamap::tx_set::compute_tx_set_root;
+
+/// The hash a proposal commits its transaction set to.
 ///
-/// Sort tx hashes lexicographically, concatenate, SHA512-half.
+/// This is the root of the `tnTRANSACTION_NM` SHAMap — see
+/// [`xrpl_ledger::shamap::tx_set`] for the leaf rule and its source.
+///
+/// ⚠ It was a PLACEHOLDER until 2026-08-16: sort the ids, concatenate, hash
+/// once. That is not a SHAMap and shares none of its structure, so every
+/// proposal we generated named a set hash no peer could agree with — harmless
+/// only because nothing consumed it yet. The three properties its tests
+/// asserted (empty is zero, order-independent, membership matters) are all
+/// TRUE of the real function too, which is exactly why passing tests did not
+/// reveal that the value was wrong. Properties constrain; they do not identify.
 pub fn compute_tx_set_hash(txs: &HashSet<Hash256>) -> Hash256 {
-    if txs.is_empty() {
-        return Hash256([0; 32]);
-    }
-
-    let mut sorted: Vec<&Hash256> = txs.iter().collect();
-    sorted.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut data = Vec::with_capacity(sorted.len() * 32);
-    for h in sorted {
-        data.extend_from_slice(&h.0);
-    }
-
-    Hash256(sha512_half(&data))
+    let ids: Vec<Hash256> = txs.iter().copied().collect();
+    compute_tx_set_root(&ids)
 }
 
 /// A consensus proposal.
