@@ -1076,6 +1076,30 @@ fn load_amm_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_ind
     if let Some(idx) = res["node"]["index"].as_str() {
         load_object(state, url, idx, ledger_index);
     }
+    // The POOL's own trust line for each non-XRP asset. `load_account` above
+    // gives the AMM's AccountRoot — its XRP side only — so an IOU pool balance
+    // read as ZERO, and `checkAmount` then rejects any withdrawal of it with
+    // tecAMM_BALANCE before the LP checks are ever reached. A fee-only `tec`
+    // touches neither line, so the modified/deleted loader never fetches them.
+    // #106308202 4D96E855 is that: mainnet tecAMM_INVALID_TOKENS, ours
+    // tecAMM_BALANCE — the right family of refusal for entirely the wrong
+    // reason.
+    if let Some(amm_id) = decode_address(amm_acct) {
+        for f in ["Asset", "Asset2"] {
+            let Some(a) = txj.get(f) else { continue };
+            let (Some(cur), Some(iss)) = (
+                a.get("currency").and_then(|v| v.as_str()),
+                a.get("issuer").and_then(|v| v.as_str()).and_then(decode_issuer),
+            ) else { continue };
+            if cur == "XRP" {
+                continue;
+            }
+            let k = hex::encode_upper(
+                keylet::ripple_state_key(&amm_id, &iss, &currency_code(cur)).0,
+            );
+            load_object(state, url, &k, ledger_index);
+        }
+    }
     // The depositor's LPToken trust line, so the reserve check knows whether
     // this is a first-time deposit (ownerCountAdj = 1) or a repeat LP (0).
     if let (Some(dep), Some(amm_id), Some(lp_cur)) = (

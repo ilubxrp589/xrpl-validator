@@ -779,6 +779,27 @@ impl Transactor for AMMWithdrawTransactor {
                 }
             }
         }
+        // Then the LP position, in rippled's order and with rippled's split
+        // (AMMWithdraw.cpp:272-288):
+        //     if (lpTokens <= beast::kZero)              return tecAMM_BALANCE;
+        //     if (*lpTokensWithdraw > lpTokens)          return tecAMM_INVALID_TOKENS;
+        // Holding NONE is a balance failure; holding SOME BUT TOO FEW is an
+        // invalid-tokens one, and the two are different result codes.
+        //
+        // #106308202 4D96E855: tfOneAssetLPToken burning 100000 LP against a
+        // position of 40000, so mainnet answers tecAMM_INVALID_TOKENS. We had
+        // no LP check at all and answered tecAMM_BALANCE — from the POOL check
+        // above, because the pool's HONEY line was unhydrated and read as zero,
+        // so `Amount 1 > 0` tripped first. Right code by luck, wrong reason.
+        let lp_held = crate::tx::amm_swap::holds(sandbox, &tx.account, &lp_leg);
+        if ox::me_is_zero(lp_held) {
+            return TxResult::AmmBalance;
+        }
+        if let Some(want) = tx.fields.get("LPTokenIn").and_then(keylet::amount_mant_exp) {
+            if ox::me_cmp(want, lp_held).is_gt() {
+                return TxResult::AmmInvalidTokens;
+            }
+        }
         // tfWithdrawAll: redeem the LP's ENTIRE position — both pool assets out
         // in proportion to their LPToken share, ALL their LPTokens burned, and
         // the LPToken trust line torn down (deleted, dropped from BOTH owner
