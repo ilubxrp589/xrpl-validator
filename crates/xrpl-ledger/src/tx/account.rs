@@ -124,6 +124,64 @@ impl Transactor for AccountDeleteTransactor {
             return TxResult::NoPermission;
         }
 
+        // ...and OwnerCount ZERO IS NOT THE SAME AS OWNING NOTHING. rippled
+        // walks the owner DIRECTORY and refuses on any entry whose type has no
+        // `nonObligationDeleter` (AccountDelete.cpp):
+        //     if (dirIsEmpty(ctx.view, ownerDirKeylet)) return tesSUCCESS;
+        //     do {
+        //         auto sleItem = ctx.view.read(keylet::child(dirEntry));
+        //         if (nonObligationDeleter(nodeType) == nullptr)
+        //             return tecHAS_OBLIGATIONS;
+        //     } while (cdirNext(...));
+        // Deletable: Offer, SignerList, Ticket, DepositPreauth, NFTokenOffer,
+        // DID, Oracle, Credential, Delegate. Everything else is an obligation.
+        //
+        // #106322004 77C5E61D: the account holds OwnerCount 0 and one ESCROW.
+        // An escrow that names this account as DESTINATION is linked into its
+        // directory but does NOT raise its OwnerCount — the reserve sits with
+        // the escrow's creator. So the count says "owns nothing" while the
+        // directory says otherwise, and mainnet refuses. We deleted the account
+        // and paid its balance away: 2 mutations against mainnet's 1, and an
+        // account destroyed that mainnet keeps.
+        const DELETABLE: [&str; 9] = [
+            "Offer", "SignerList", "Ticket", "DepositPreauth", "NFTokenOffer",
+            "DID", "Oracle", "Credential", "Delegate",
+        ];
+        let dir_root = keylet::owner_dir_key(&tx.account);
+        let mut page_key = dir_root;
+        for _ in 0..1000 {
+            let Some(page) = sandbox
+                .read(&page_key)
+                .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+            else { break };
+            for idx in page.get("Indexes").and_then(|v| v.as_array()).into_iter().flatten() {
+                let Some(k) = idx.as_str().and_then(|s| {
+                    hex::decode(s).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                }) else { continue };
+                let kind = sandbox
+                    .read(&xrpl_core::types::Hash256(k))
+                    .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+                    .and_then(|o| o.get("LedgerEntryType").and_then(|t| t.as_str()).map(str::to_string));
+                match kind {
+                    // Unreadable means unhydrated, not absent — refusing on it
+                    // would invent obligations. Anything we CAN read decides.
+                    None => continue,
+                    Some(t) if DELETABLE.contains(&t.as_str()) => continue,
+                    Some(_) => return TxResult::HasObligations,
+                }
+            }
+            let next = page
+                .get("IndexNext")
+                .and_then(|v| {
+                    v.as_u64().or_else(|| v.as_str().and_then(|s| u64::from_str_radix(s, 16).ok()))
+                })
+                .unwrap_or(0);
+            if next == 0 {
+                break;
+            }
+            page_key = keylet::dir_page_key(&dir_root, next);
+        }
+
         // Account sequence + 256 must be <= current ledger sequence
         let acct_seq = acct["Sequence"].as_u64().unwrap_or(0) as u32;
         let ledger_seq = sandbox.base().header.sequence;

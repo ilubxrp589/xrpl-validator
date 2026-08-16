@@ -76,6 +76,13 @@ pub enum TxResult {
     /// An AMM pool cannot cover the requested amount, or the account holds no
     /// LP tokens in it.
     AmmBalance,
+    /// The account still owns something it cannot abandon, so it cannot be
+    /// deleted. `AccountDelete::preclaim` walks the owner DIRECTORY and refuses
+    /// on any entry whose type has no `nonObligationDeleter` — an Escrow, a
+    /// PayChannel, a Check, a trust line, an NFT page. NOT an OwnerCount test:
+    /// an escrow named to this account as DESTINATION sits in its directory
+    /// while leaving OwnerCount at zero.
+    HasObligations,
     /// The LP tokens offered exceed what the account actually holds.
     /// `AMMWithdraw::preclaim` splits this from `tecAMM_BALANCE`: holding NONE
     /// is a balance failure, holding SOME BUT TOO FEW is an invalid-tokens one.
@@ -146,6 +153,7 @@ impl TxResult {
             | TxResult::InsufficientFunds
             | TxResult::AmmBalance
             | TxResult::AmmInvalidTokens
+            | TxResult::HasObligations
             | TxResult::DirFull
             | TxResult::InsufficientReserve
             | TxResult::InsufReserveLine
@@ -188,6 +196,7 @@ impl TxResult {
             TxResult::InsufficientFunds => "tecINSUFFICIENT_FUNDS",
             TxResult::AmmBalance => "tecAMM_BALANCE",
             TxResult::AmmInvalidTokens => "tecAMM_INVALID_TOKENS",
+            TxResult::HasObligations => "tecHAS_OBLIGATIONS",
             TxResult::DirFull => "tecDIR_FULL",
             TxResult::InsufficientReserve => "tecINSUFFICIENT_RESERVE",
             TxResult::InsufReserveLine => "tecINSUF_RESERVE_LINE",

@@ -751,7 +751,49 @@ fn load_trustline_hint_pages(state: &mut LedgerState, url: &str, txj: &Value, le
 /// dir ROOTS are already loaded via native_read_keys. #105798519 CheckCash
 /// 8FBBA125: the cashed SAM line appends to the SAM issuer's 58-page dir (root
 /// D2215EC9, last page BA1033D3); mainnet Modifies BA1033D3, we Created D2215EC9.
+/// The whole owner-directory CHAIN plus every object it lists.
+///
+/// `AccountDelete::preclaim` decides tecHAS_OBLIGATIONS by walking the
+/// directory and reading each entry's LedgerEntryType — and a refusal touches
+/// NOTHING, so neither the pages nor the objects appear in mainnet's metadata
+/// and the modified/deleted loader fetches none of them. #106322004 77C5E61D
+/// is that: OwnerCount 0 with one Escrow, invisible to us, so we deleted an
+/// account mainnet keeps.
+fn load_owner_dir_chain(state: &mut LedgerState, url: &str, owner: &[u8; 20], ledger_index: u32) {
+    let root = keylet::owner_dir_key(owner);
+    let mut key = root;
+    for _ in 0..64 {
+        let idx_hex = hex::encode_upper(key.0);
+        let Some(res) = rpc(url, "ledger_entry",
+            json!({"index": idx_hex, "ledger_index": ledger_index})) else { return };
+        let Some(node) = res.get("node") else { return };
+        let mut page = node.clone();
+        hexify_addresses(&mut page);
+        let _ = state.state_map.insert(key, serde_json::to_vec(&page).unwrap_or_default());
+        for i in node["Indexes"].as_array().into_iter().flatten() {
+            if let Some(s) = i.as_str() {
+                load_object(state, url, s, ledger_index);
+            }
+        }
+        let next = node
+            .get("IndexNext")
+            .and_then(|v| {
+                v.as_u64().or_else(|| v.as_str().and_then(|s| u64::from_str_radix(s, 16).ok()))
+            })
+            .unwrap_or(0);
+        if next == 0 {
+            return;
+        }
+        key = keylet::dir_page_key(&root, next);
+    }
+}
+
 fn load_owner_dir_tail(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
+    if txj["TransactionType"].as_str() == Some("AccountDelete") {
+        if let Some(a) = txj["Account"].as_str().and_then(decode_address) {
+            load_owner_dir_chain(state, url, &a, ledger_index);
+        }
+    }
     let mut owners: Vec<[u8; 20]> = Vec::new();
     if txj["TransactionType"].as_str() == Some("EscrowCreate") {
         for f in ["Account", "Destination"] {
