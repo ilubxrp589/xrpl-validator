@@ -376,6 +376,26 @@ impl Transactor for NFTokenBurnTransactor {
             }
         }
 
+        // A burn also takes the token's OUTSTANDING OFFERS with it — otherwise
+        // they are left pointing at an NFT that no longer exists. `NFTokenBurn::
+        // doApply` deletes up to 500 in total, SELL directory first:
+        //
+        //     std::size_t const deletedSellOffers = nft::removeTokenOffersWithLimit(
+        //         view(), keylet::nftSells(id), kMaxDeletableTokenOfferEntries);
+        //     if (kMaxDeletableTokenOfferEntries > deletedSellOffers)
+        //         nft::removeTokenOffersWithLimit(view(), keylet::nftBuys(id),
+        //             kMaxDeletableTokenOfferEntries - deletedSellOffers);
+        //
+        // rippled's own comment gives the reason for the ordering: sell offers
+        // are the smaller set, so clearing them first is what empties the sell
+        // directory within the budget.
+        //
+        // #106322254 674FD021 and #106323904 AB1D285C, the same shape in two
+        // ledgers: each leaves one sell offer alive (50000000 drops, flags=1),
+        // its now-empty sell directory undeleted, and the owner directory
+        // unmodified — 3 mutations against mainnet's 6.
+        burn_token_offers(sandbox, &id);
+
         TxResult::Success
     }
 }
@@ -544,6 +564,52 @@ fn nft_funds_short(sandbox: &Sandbox, payer: &[u8; 20], amount: &serde_json::Val
     let bal: u64 = a["Balance"].as_str().and_then(|v| v.parse().ok()).unwrap_or(0);
     let reserve = crate::ledger::fees::account_reserve(sandbox, owner_count_of(sandbox, payer));
     bal.saturating_sub(reserve) < needed
+}
+
+/// Delete the burned token's outstanding offers — SELL directory first, then
+/// BUY with what is left of the 500 budget (`NFTokenBurn::doApply`).
+///
+/// Keys are collected per directory BEFORE deleting any of them: `delete_offer`
+/// relinks and can drop the very pages the walk is standing on.
+fn burn_token_offers(sandbox: &mut Sandbox, id: &Hash256) {
+    const MAX_DELETABLE: usize = 500;
+    let mut budget = MAX_DELETABLE;
+    for root in [keylet::nft_sell_offers_key(id), keylet::nft_buy_offers_key(id)] {
+        if budget == 0 {
+            return;
+        }
+        let mut keys: Vec<Hash256> = Vec::new();
+        let mut page_key = root;
+        for _ in 0..1000 {
+            let Some(page) = sandbox
+                .read(&page_key)
+                .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+            else { break };
+            for e in page.get("Indexes").and_then(|v| v.as_array()).into_iter().flatten() {
+                if let Some(k) = e
+                    .as_str()
+                    .and_then(|s| hex::decode(s).ok())
+                    .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                {
+                    keys.push(Hash256(k));
+                }
+            }
+            let next = page.get("IndexNext").map(crate::tx::offer::dirnum).unwrap_or(0);
+            if next == 0 {
+                break;
+            }
+            page_key = keylet::dir_page_key(&root, next);
+        }
+        for k in keys {
+            if budget == 0 {
+                return;
+            }
+            if let Some(off) = read_offer(sandbox, k) {
+                delete_offer(sandbox, &off);
+                budget -= 1;
+            }
+        }
+    }
 }
 
 fn read_offer(sandbox: &Sandbox, key: Hash256) -> Option<OfferSle> {
