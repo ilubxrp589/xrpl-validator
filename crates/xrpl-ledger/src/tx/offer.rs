@@ -3868,7 +3868,39 @@ impl Transactor for OfferCreateTransactor {
             }
         };
 
-        let filled = if sell { me_is_zero(rem_gets) } else { me_is_zero(rem_pays) };
+        if std::env::var("DX_FOK").is_ok() {
+            eprintln!(
+                "DX_FOK crossed={crossed} underfunded={underfunded} avail_after={:?} rem_pays={rem_pays:?} rem_gets={rem_gets:?} rem_gets_cross={rem_gets_cross:?} tg_cross={tg_cross:?} fok={fok} sell={sell}",
+                available(sandbox, &tx.account, &gets_leg),
+            );
+        }
+        // A tfSell offer is complete when its INPUT is spent, and the taker's
+        // FUNDING bounds that input — so judge the sell side against the funded
+        // budget (`rem_gets_cross`), not against the original TakerGets that
+        // `rem_gets` was re-expanded to just above.
+        //
+        // rippled calls `flow(..., partialPayment = !tfFillOrKill, ...)`, so a
+        // FillOrKill offer either completes or moves nothing. For a BUY the
+        // completion test is the OUT side — TakerPays must be delivered in full
+        // — and for a SELL it is the IN side. When crossing exhausts the
+        // account, `flowCross` clears BOTH sides of the remainder ("If offer
+        // crossing exhausted the account's funds don't create the offer") and
+        // `placeOffer.in == 0` then reads as "Offer fully crossed!", returning
+        // tesSUCCESS BEFORE FillOrKill is considered (OfferCreate.cpp).
+        //
+        // #106310137 shows both halves in one ledger, which is what pins the
+        // distinction: three plain-FoK offers at indexes 5, 6 and 8 are KILLED
+        // by mainnet, while `2441A597` at index 30 — the only one carrying
+        // tfSell — SUCCEEDS. It sells 911939809 drops, its entire spendable
+        // balance, for 178632521.62303 ATM, and our own fill already matched
+        // that to the digit; only the completion test disagreed.
+        //
+        // ⚠ An earlier attempt generalised this to "crossing drained the taker
+        // ⇒ fully crossed" for EVERY offer. Measured 447/449 -> 441/449 and was
+        // reverted: it let those three plain-FoK offers succeed, and the
+        // liquidity they wrongly consumed then starved this very transaction,
+        // which is why the target stayed tecKILLED and the fix looked inert.
+        let filled = if sell { me_is_zero(rem_gets_cross) } else { me_is_zero(rem_pays) };
         if fok && !filled {
             // FillOrKill not fully filled: nothing survives but the fee and
             // the stale-offer cleanup.
