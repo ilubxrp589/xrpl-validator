@@ -312,6 +312,48 @@ fn mul_round_drops_strict(a: Me, b: Me, round_up: bool) -> u128 {
     m.saturating_mul(10u128.saturating_pow(e.clamp(0, 38) as u32))
 }
 
+/// `mulRound(a, b, XRP, roundUp)` — `a * b` as whole DROPS, the NON-strict way.
+///
+/// The mirror of `mul_round_drops_strict`, and the distinction is which rippled
+/// call site you are modelling. `TOffer::limitOut` uses `ceilOutStrict` and gets
+/// a true ceiling; `flowCross`'s residual uses plain `mulRound`
+///     afterCross.in = mulRound(afterCross.out, rate, takerAmount.in.asset(), true);
+/// which lands in `canonicalizeRound`, whose INTEGRAL branch IGNORES `roundUp`
+/// entirely and reads (STAmount.cpp:1477):
+///     while (offset < -1) { value /= 10; ++offset; ++loops; }
+///     value += (loops >= 2) ? 9 : 10;   // add before last divide
+///     value /= 10;
+/// So it ceils at a TENTH OF A DROP: everything below 0.1 drop is discarded
+/// before the carry. That "slop" is not a defect to be corrected here — it IS
+/// the behaviour, and a plain ceiling cannot reproduce it.
+///
+/// Two mainnet residuals pin it, and no single rounding direction satisfies
+/// both:
+///   #106308202 6B6D7EFC  283956.0452856067 -> 283956  (0.045 discarded)
+///   #105672435 B409D45C  165388.7424863569 -> 165389  (0.7 carries)
+fn mul_round_drops(a: Me, b: Me) -> u128 {
+    let (a, b) = (norm16(a), norm16(b));
+    if a.0 == 0 || b.0 == 0 {
+        return 0;
+    }
+    const TEN14: u128 = 100_000_000_000_000;
+    let prod = a.0 * b.0;
+    let mut m = prod / TEN14 + u128::from(prod % TEN14 != 0);
+    let mut e = a.1 + b.1 + 14;
+    if e < 0 {
+        let mut loops = 0;
+        while e < -1 {
+            m /= 10;
+            e += 1;
+            loops += 1;
+        }
+        m += if loops >= 2 { 9 } else { 10 };
+        m /= 10;
+        e += 1;
+    }
+    m.saturating_mul(10u128.saturating_pow(e.clamp(0, 38) as u32))
+}
+
 pub(crate) fn me_muldiv(a: Me, b: Me, c: Me, ceil: bool) -> Me {
     if c.0 == 0 {
         return (0, 0);
@@ -4045,6 +4087,12 @@ impl Transactor for OfferCreateTransactor {
             // guard went in, all of them offers nothing had touched.
             let derived = if me_cmp(rem_pays, tp0).is_lt() {
                 match rate_of_me(tg0, tp0) {
+                    // An XRP gets side is an INTEGRAL asset, so rippled's
+                    // `mulRound` canonicalises to whole drops itself — ceiling
+                    // at a tenth of a drop — rather than producing a 16-digit
+                    // value for a separate rescale to round again. See
+                    // `mul_round_drops`.
+                    Some(q) if gets_leg.xrp => (mul_round_drops(rem_pays, rate_me(q)), 0),
                     Some(q) => mul_round16_up(rem_pays, rate_me(q)),
                     None => me_muldiv(rem_pays, tg0, tp0, true),
                 }
