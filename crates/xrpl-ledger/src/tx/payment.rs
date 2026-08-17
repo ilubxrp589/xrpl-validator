@@ -104,6 +104,48 @@ impl PaymentTransactor {
         Some(legs)
     }
 
+    /// True when a chain's LAST transition is a rippling step BETWEEN TWO
+    /// GATEWAYS rather than an order book, which makes the path unmodellable.
+    ///
+    /// `toStrand` appends a terminal book for the delivered asset only when the
+    /// CURRENCY changes (PaySteps.cpp:220-233); its own comment is explicit —
+    /// "for offer crossing (only) we do use an offer book even if all that is
+    /// changing is the Issue.account". A PAYMENT whose last hop already holds
+    /// the delivered currency under a DIFFERENT issuer therefore gets no book
+    /// at all: the delivery issuer enters `normPath` as an ACCOUNT element, and
+    /// the offer->account transition emits
+    /// `DirectStepI(hopIssuer -> deliverIssuer)` (PaySteps.cpp:379-388), which
+    /// requires a trust line between those two gateways. Missing it, toStrand
+    /// returns terNO_LINE, the path is dropped, and Payment maps the leftover
+    /// ter to tecPATH_DRY.
+    ///
+    /// #106336831 619718E8 is the specimen: SendMax 50000 drops for
+    /// 0.0511423423316901 USD.rhub8 over the one path `[USD/rvYAfWj]`. The two
+    /// issuers hold no mutual line, so rippled logs "DirectStepI: No credit
+    /// line" and refuses. We crossed a USD.rvYAfWj/USD.rhub8 BOOK instead and
+    /// delivered — moving value mainnet never moved. The sender's newly funded
+    /// USD line then let the NEXT transaction (1858CEDF, sequence +1) spend a
+    /// balance it never had, so one rule accounts for both divergences.
+    ///
+    /// Only the TERMINAL transition is account-mediated. Between two explicit
+    /// path elements rippled builds `make_BookStepII` even when just the issuer
+    /// changes (both are offer elements), so intermediate same-currency hops
+    /// stay books and are left alone.
+    ///
+    /// The rippling step itself is deliberately not modelled: with a mutual
+    /// line the value crosses 1:1 under the gateway's transfer rate and the
+    /// receiving line's limit, never at a book price. Dropping the path refuses
+    /// rather than inventing liquidity. A specimen where mainnet DELIVERS
+    /// across an inter-gateway line is what would justify building the step.
+    fn terminal_is_ripple_step(chain: &[&crate::tx::offer::Leg]) -> bool {
+        let n = chain.len();
+        if n < 2 {
+            return false;
+        }
+        let (a, b) = (chain[n - 2], chain[n - 1]);
+        !a.xrp && !b.xrp && a.cur == b.cur && a.issuer != b.issuer
+    }
+
     /// The account's SIGNED balance on `leg`, from its own perspective
     /// (negative = it owes the issuer). `None` when there is nothing to read a
     /// delta from: the account issues the currency itself, or holds no line.
@@ -1439,6 +1481,17 @@ impl PaymentTransactor {
             if chain.len() < 2 {
                 chain = vec![&spend_leg, &want_leg];
             }
+            // The delivered currency already in hand under another issuer is a
+            // gateway-to-gateway ripple, not a book — rippled drops the path.
+            if Self::terminal_is_ripple_step(&chain) {
+                if std::env::var("DX_PAY").is_ok() {
+                    eprintln!(
+                        "DX_PAY terminal ripple step {} -> {}: path dropped (needs inter-gateway line)",
+                        hex::encode_upper(chain[chain.len() - 2].issuer),
+                        hex::encode_upper(chain[chain.len() - 1].issuer));
+                }
+                continue;
+            }
             // A named path that collapses to [spend, want] IS the default path,
             // so the block below must not add it a second time. #106156904's
             // path 0 is exactly that: a bare [SOL] element on a USDT->SOL
@@ -1457,12 +1510,25 @@ impl PaymentTransactor {
                 strands.push(chain);
             }
         }
-        if !no_direct && !have_direct {
+        // The default path is subject to the same rule: sending one gateway's
+        // IOU and delivering another's is `src -> sendMaxIssuer ->
+        // deliverIssuer -> dst`, three DirectStepIs, and the middle one needs
+        // the inter-gateway line just the same.
+        let direct_viable = !Self::terminal_is_ripple_step(&[&spend_leg, &want_leg]);
+        if !no_direct && !have_direct && direct_viable {
             strands.insert(0, vec![&spend_leg, &want_leg]);
         }
         // Every named path was unmodellable and the default is suppressed —
         // guarded above for tfNoRippleDirect, so this is the no-Paths shape.
         if strands.is_empty() {
+            // Nothing left to fall back ON: either the flag forbids the default
+            // path or the default path is itself the gateway ripple we just
+            // refused. Substituting it would reinstate exactly the strand
+            // rippled proved does not exist.
+            if (no_direct && named_paths > 0) || !direct_viable {
+                sandbox.restore_snapshot(snap);
+                return TxResult::PathDry;
+            }
             strands.push(vec![&spend_leg, &want_leg]);
         }
         // One strand is the old behaviour exactly: walk the whole book in a
@@ -2292,6 +2358,49 @@ mod tests {
     /// while already holding 1.000383. Raising that same line's limit lets the
     /// identical payment deliver, proving the book liquidity was present and it
     /// is the trust ceiling — not a dry book — that blocks the fill.
+    /// A payment delivering a currency the last hop already holds under a
+    /// DIFFERENT issuer gets no terminal book from `toStrand` — it gets
+    /// `DirectStepI(hopIssuer -> deliverIssuer)`, a ripple between the two
+    /// gateways (PaySteps.cpp:220-233, 379-388). Only the TERMINAL transition
+    /// is account-mediated; an issuer-only change between two explicit path
+    /// elements is still `make_BookStepII`.
+    #[test]
+    fn terminal_issuer_change_is_a_gateway_ripple_not_a_book() {
+        let usd = crate::tx::offer::amount_currency20(
+            &serde_json::json!({"currency": "USD", "issuer": hex::encode([0x03u8; 20]), "value": "1"}),
+        )
+        .unwrap();
+        let eur = crate::tx::offer::amount_currency20(
+            &serde_json::json!({"currency": "EUR", "issuer": hex::encode([0x03u8; 20]), "value": "1"}),
+        )
+        .unwrap();
+        let iou = |cur: [u8; 20], issuer: u8| crate::tx::offer::Leg {
+            xrp: false,
+            cur,
+            issuer: [issuer; 20],
+        };
+        let xrp = crate::tx::offer::Leg { xrp: true, cur: [0u8; 20], issuer: [0u8; 20] };
+
+        // #106336831 619718E8's shape: XRP -> USD.gwA -> USD.gwB. The last
+        // transition changes only the issuer, so rippled needs a line BETWEEN
+        // the gateways and drops the path without one.
+        let (a, b) = (iou(usd, 0x0a), iou(usd, 0x0b));
+        assert!(PaymentTransactor::terminal_is_ripple_step(&[&xrp, &a, &b]));
+        // Two-leg default path, same rule: src -> sendMaxIssuer ->
+        // deliverIssuer -> dst is three direct steps, not a book.
+        assert!(PaymentTransactor::terminal_is_ripple_step(&[&a, &b]));
+
+        // A real currency change terminates in a book — leave it alone.
+        let e = iou(eur, 0x0b);
+        assert!(!PaymentTransactor::terminal_is_ripple_step(&[&xrp, &a, &e]));
+        // ...as does anything crossing to or from XRP.
+        assert!(!PaymentTransactor::terminal_is_ripple_step(&[&a, &xrp]));
+        assert!(!PaymentTransactor::terminal_is_ripple_step(&[&xrp, &a]));
+        // An issuer-only change in the MIDDLE stays a book: both ends are
+        // offer elements there, so only the final pair is inspected.
+        assert!(!PaymentTransactor::terminal_is_ripple_step(&[&a, &b, &e]));
+    }
+
     #[test]
     fn path_payment_dry_when_destination_at_trust_limit() {
         let taker = [0x01u8; 20];
