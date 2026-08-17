@@ -2139,7 +2139,7 @@ thr={t:?} admits_trunc={} admits_up={}",
         // `qualityUpperBound`, best first, and DROPS any whose bound misses
         // limitQuality; the loop walks that order and on `Path rejected by
         // limitQuality` does `continue` — falling through to the NEXT
-        // candidate — taking the FIRST survivor (StrandFlow.h:670-731).
+        // candidate — taking the FIRST survivor (StrandFlow.h:647-722).
         //
         // Measured against rippled's own FLOWDBG bounds on #105912454:
         //
@@ -2183,8 +2183,8 @@ thr={t:?} admits_trunc={} admits_up={}",
         // after consuming the AMM offer the step keeps stepping into that
         // leg's CLOB, and StrandFlow judges the pass AS A WHOLE — rejecting
         // and DISCARDING it entirely when the average quality misses
-        // limitQuality (StrandFlow.h:700-705). No `limitOut` trim rescues it:
-        // that needs a single active strand (:644) and offer crossing always
+        // limitQuality (StrandFlow.h:717-722). No `limitOut` trim rescues it:
+        // that needs a single active strand (:657) and offer crossing always
         // has two. A fib slice is 0.025% of the pool, so any request
         // materially larger than one slice is dominated by that CLOB
         // continuation — the bridge is usable only when its BOOK composition
@@ -2202,7 +2202,7 @@ thr={t:?} admits_trunc={} admits_up={}",
         //
         // A bridged leg's POOL may price the strand only while MORE THAN ONE
         // strand is still a candidate. `AMMContext::multiPath()` is
-        // `activeStrands.size() > 1` (StrandFlow.h:640), re-evaluated every
+        // `activeStrands.size() > 1` (StrandFlow.h:649), re-evaluated every
         // iteration, and it selects which offer `AMMLiquidity::getOffer` hands
         // back (AMMLiquidity.cpp):
         //   multi  — `generateFibSeqOffer`, priced at the POOL's own quality,
@@ -2245,7 +2245,7 @@ thr={t:?} admits_trunc={} admits_up={}",
         //
         // A strand whose `qualityUpperBound` misses limitQuality is dropped
         // from the candidate set — silently, `continue` with no log line, in
-        // both `activateNext` and the strand loop (StrandFlow.h:667-673).
+        // both `activateNext` and the strand loop (StrandFlow.h:682-690).
         //
         // #105930662 40FB322EC16C is the case that pins this. The taker's OWN
         // offer 991CFC15 is the direct book's tip at 5.1422 BBRL/RLUSD, just
@@ -2318,7 +2318,7 @@ thr={t:?} admits_trunc={} admits_up={}",
         let a_fill = if multi_now { a_fib } else { slice_of(&amm_a, &xrp_leg, gets_leg, sandbox) };
         let b_fill = if multi_now { b_fib } else { slice_of(&amm_b, pays_leg, &xrp_leg, sandbox) };
         // `limitOut` — SIZE THE PASS TO THE LIMIT instead of taking the
-        // maximum and then discarding it (StrandFlow.h:345-395; call site at
+        // maximum and then discarding it (StrandFlow.h:357; call site at
         // :655, "Limit only if one strand and limitQuality").
         //
         // A CLOB step's average quality is constant; an AMM's degrades
@@ -2380,7 +2380,7 @@ thr={t:?} admits_trunc={} admits_up={}",
         // Walk the candidates in UPPER-BOUND order, taking the FIRST whose
         // realised fill survives the judge. rippled rejects a pass with
         // `continue` — which advances to the NEXT strand, not out of the loop
-        // (StrandFlow.h:670-731) — so the judge and the fall-through are ONE
+        // (StrandFlow.h:647-722) — so the judge and the fall-through are ONE
         // mechanism. Building the judge alone is what failed twice before: it
         // rejects the leading candidate and then crosses nothing.
         let mut filled = false;
@@ -2765,7 +2765,7 @@ thr={t:?} admits_trunc={} admits_up={}",
             // actually reduced the output and the miss is within 1e-7
             // relative — "limitOut() finds output to generate exact requested
             // limitQuality. But the actual limit quality might be slightly off
-            // due to the round off" (StrandFlow.h:712-720). The tolerance is
+            // due to the round off" (StrandFlow.h:714-718). The tolerance is
             // GATED on `adjustedRemOut`: an unadjusted pass is judged exactly,
             // which is what keeps #106137477 resting on its 1.3e-5 miss.
             let accepted = match fill {
@@ -2804,7 +2804,7 @@ thr={t:?} admits_trunc={} admits_up={}",
             //
             // rippled banks a failed strand's offer removals: `setUnion(ofrsToRm,
             // f.ofrsToRm)` runs BEFORE the `!f.success` check, commented "rm bad
-            // offers even if the strand fails" (StrandFlow.h:695-699). Our
+            // offers even if the strand fails" (StrandFlow.h:717-722). Our
             // rollback undoes them, resurrecting an offer rippled would have
             // deleted. Report any attempt whose rejection discards a removal, so
             // a ledger that distinguishes the two can be found by measurement.
@@ -2850,7 +2850,7 @@ had_fill={} n={} keys={:?}",
             // REMOVALS STAY. rippled banks a failed strand's offer removals:
             // `setUnion(ofrsToRm, f.ofrsToRm)` runs BEFORE the `!f.success`
             // check, "rm bad offers even if the strand fails"
-            // (StrandFlow.h:695-699). This file already re-applies `stale`
+            // (StrandFlow.h:717-722). This file already re-applies `stale`
             // after the tx-level FillOrKill/IOC rollbacks for exactly that
             // reason; the candidate rollback has to do the same or a
             // self-offer that `live_head` reaped comes back in the ledger
@@ -2923,7 +2923,7 @@ pub(crate) fn cross_engine_to(
     // sense. `flow()` runs a strand for a single quality level per BookStep and
     // then re-enters, which is what lets the outer strand loop interleave two
     // strands by marginal quality instead of draining the better one first
-    // (StrandFlow.h:682-805). Only the multi-strand payment loop asks for this;
+    // (StrandFlow.h:640-756). Only the multi-strand payment loop asks for this;
     // every other caller walks the whole book as before.
     single_pass: bool,
     // Flow-wide AMM fib state; Some only for a multi-strand payment.
@@ -2933,6 +2933,31 @@ pub(crate) fn cross_engine_to(
     stale: &mut Vec<Hash256>,
 ) -> (Me, Me, u32) {
     let mut crossed = 0u32;
+    // rippled judges a flow ITERATION on the quality it ACTUALLY REALISED, not
+    // on the filed rates of the offers it took, and a pass that misses
+    // `limitQuality` is thrown away WHOLE — "Path rejected by limitQuality"
+    // (StrandFlow.h:720) leaves the strand dry and `Total flow: in: 0 out: 0`.
+    // Every offer we take already passed the per-offer `q <= threshold` gate on
+    // its FILED rate; what the filed rate cannot see is the taker's transfer fee
+    // and the flooring of an integral output, both of which land on the
+    // funding-limited tail of the pass.
+    //
+    // #106347648 622A7DD2 (an IoC repeating every ledger from one bot): the
+    // maker is filed at 923.617 drops/SGB against a 920.20 limit, so it crosses
+    // — but the taker's whole 0.5156870490053416 SGB buys only 474 drops once
+    // the 1.003 gateway takes its cut and the drops floor, realising 919.16 and
+    // missing. rippled crosses NOTHING and returns tecKILLED with one mutation;
+    // we kept the fill, and IoC's `crossed == 0` test then read it as a success.
+    //
+    // ⚠ APPROXIMATION: rippled would keep earlier ITERATIONS and reject only
+    // the failing one, where we judge the walk's aggregate. The two agree
+    // whenever the pass is a single iteration, which is the shape that fails —
+    // an aggregate can only miss when the funding-limited tail dominates it,
+    // since every other fill is filed at or better than the limit. A specimen
+    // where mainnet keeps an early fill and drops a later one is what would
+    // justify carrying per-iteration state through the walk.
+    let cross_snap = offer_crossing.then(|| sandbox.snapshot());
+    let (entry_pays, entry_gets) = (rem_pays, rem_gets);
     if threshold == 0 {
         return (rem_pays, rem_gets, crossed);
     }
@@ -2993,10 +3018,10 @@ pub(crate) fn cross_engine_to(
         //
         // Only within the taker's limit, though. An OFFER-CROSSING strand
         // whose best possible quality is already worse than `limitQuality` is
-        // dropped before `flow()` is ever called (StrandFlow.h:669-673
+        // dropped before `flow()` is ever called (StrandFlow.h:682-690
         // `qualityUpperBound(sb, *strand) < *limitQuality => continue`, and
         // the same filter in `activateNext`, StrandFlow.h:465), so no stream
-        // is built and nothing is reaped — the removals on line 675 are
+        // is built and nothing is reaped — the removals on line 694 are
         // collected from a flow that RAN, "even if the strand fails".
         // #105795013 428E0550 sells RLUSD priced above the whole book: mainnet
         // rests it in 4 nodes and leaves the expired E39542EC alone, for
@@ -3483,7 +3508,7 @@ pub(crate) fn cross_engine_to(
                 // the taker's remaining input and the output floored to whole
                 // drops, the realised rate can land well outside the limit.
                 // rippled re-checks exactly that and drops the whole path,
-                // forgiving only a 1e-7 relative round-off (StrandFlow.h:698
+                // forgiving only a 1e-7 relative round-off (StrandFlow.h:720
                 // "Path rejected by limitQuality").
                 //
                 // #105780948 101AD681: an IoC offer ties with the book head at
@@ -3498,7 +3523,7 @@ pub(crate) fn cross_engine_to(
                 //       (!adjustedRemOut ||
                 //        !withinRelativeDistance(q, *limitQuality, Number(1,-7))))
                 //
-                // StrandFlow.h:700-706. The 1e-7 forgiveness applies ONLY when
+                // StrandFlow.h:717-722. The 1e-7 forgiveness applies ONLY when
                 // `limitOut()` had already REDUCED the requested output to hit
                 // the limit (`adjustedRemOut`, :643-651); otherwise the
                 // comparison is exact. Observed on #105945386 7EF34E79F13A,
@@ -3639,6 +3664,64 @@ pub(crate) fn cross_engine_to(
             rem_pays = rp;
             rem_gets = rg;
             crossed += used as u32;
+        }
+    }
+    // The judge. Realised quality is measured on the NET spent, against the NET
+    // threshold — rippled measures the GROSS against a transfer-rate inflated
+    // `limitQuality` (OfferCreate.cpp:378-392), and since both sides scale by
+    // the same rate the comparison is identical. That is also why substituting
+    // the inflated limit as our crossing threshold was wrong: it inflates one
+    // side of a comparison whose other side is net.
+    if let Some(snap) = cross_snap {
+        let spent = me_sub(entry_gets, rem_gets);
+        let got = me_sub(entry_pays, rem_pays);
+        // A miss inside 1e-7 relative is FORGIVEN, exactly as the bridged judge
+        // forgives it: "limitOut() finds output to generate exact requested
+        // limitQuality. But the actual limit quality might be slightly off due
+        // to the round off" (StrandFlow.h:718), compared through
+        // `withinRelativeDistance` (AMMHelpers.h:112-121) against the LARGER
+        // rate — the worse one, which is the realised `q`.
+        //
+        // ⚠ Judging exactly cost four transactions and six value hits at v104:
+        // #105035381 2C4DF181 is a tfSell whose pass misses by 1.66e-8 and which
+        // mainnet FILLS; we killed it (3 muts against 6). #105717461, #105798519
+        // and #105843839 are the same marginal shape. The specimen this judge
+        // exists for misses by 4.1e-3 — five orders out — so the tolerance costs
+        // it nothing.
+        //
+        // rippled gates the forgiveness on `limitOut` having actually reduced
+        // the output, which the aggregate has no way to know. Applying it
+        // unconditionally is the looser reading; the nearest specimen either way
+        // is #106137477, resting on a 1.3e-5 miss that stays rejected regardless.
+        let missed = crossed > 0
+            && threshold != u64::MAX
+            && !me_is_zero(got)
+            && rate_of_me(spent, got).is_some_and(|q| {
+                q > threshold && {
+                    let (a, b) = (rate_me(q), rate_me(threshold));
+                    !me_cmp(me_muldiv(me_sub(a, b), (10_000_000, 0), a, false), (1, 0)).is_lt()
+                }
+            });
+        if missed {
+            if std::env::var("DX_FOK").is_ok() {
+                eprintln!(
+                    "DX_PASS rejected by limitQuality: spent={spent:?} got={got:?} q={:?} threshold={threshold:016x}",
+                    rate_of_me(spent, got));
+            }
+            sandbox.restore_snapshot(snap);
+            // A rejected pass still leaves the stale-offer cleanup standing —
+            // rippled applies its `removableOffers` to the cancel sandbox too
+            // (OfferCreate.cpp:460), so the reap must survive the rollback that
+            // just restored them.
+            for okey in stale.iter() {
+                let Some(off) = json_at(sandbox, okey) else { continue };
+                let Some(maker) = off.get("Account").and_then(|v| v.as_str()).and_then(decode20)
+                else {
+                    continue;
+                };
+                delete_maker_offer(sandbox, okey, &off, &maker);
+            }
+            return (entry_pays, entry_gets, 0);
         }
     }
     (rem_pays, rem_gets, crossed)
@@ -3853,10 +3936,12 @@ impl Transactor for OfferCreateTransactor {
         // input therefore buys extra pool liquidity rather than reach up the
         // book. Feeding the book gates the inflated value is the correct next
         // step, but it belongs with the AMM sizing work, not here.
-        let send_max = match transfer_rate(sandbox, &gets_leg) {
-            Some(r) if tx.account != gets_leg.issuer => {
-                me_muldiv(tg0, (r as u128, 0), (1_000_000_000, 0), true)
-            }
+        let xfer_in = match transfer_rate(sandbox, &gets_leg) {
+            Some(r) if tx.account != gets_leg.issuer => Some(r),
+            _ => None,
+        };
+        let send_max = match xfer_in {
+            Some(r) => me_muldiv(tg0, (r as u128, 0), (1_000_000_000, 0), true),
             _ => tg0,
         };
         let mut threshold_self = rate_of_me(send_max, tp0).unwrap_or(0);
@@ -3884,9 +3969,37 @@ impl Transactor for OfferCreateTransactor {
         // balance", OfferCreate.cpp:399-401 — while TakerGets still bounds
         // what may REST. The threshold above is computed from the unclamped
         // amounts, as rippled builds it before the clamp (OfferCreate.cpp:392).
+        //
+        // ⚠ The balance bounds the GROSS, not the net. rippled clamps `sendMax`
+        // — already transfer-rate inflated at this point — so the comparison is
+        // `TakerGets x rate > balance` and the surviving budget is a GROSS one
+        // the flow then divides down. `accountFunds` is what the taker parts
+        // with; the maker receives that over the rate, because the gateway
+        // "takes its cut without any special consent from the offer taker".
+        // Clamping the NET to the raw balance instead makes the taker part with
+        // `balance x rate` — more of the currency than it holds — and buys the
+        // fee's worth of extra output.
+        //
+        // #106347648 622A7DD2 is the specimen (and the same pair repeats every
+        // ledger from a bot): 0.5156870490053416 SGB held against a 1.003
+        // issuer, selling for 4762 drops. rippled sends the whole balance as
+        // GROSS, the maker receives 0.514144615159862 and pays 474 drops. We
+        // fed 0.5156870490053416 as the net and took 476.
+        //
+        // ⚠⚠ This is NOT the division the 2026-08-11 attempts made and the note
+        // above forbids. TakerGets bounds the NET and is still untouched; only
+        // the BALANCE, which bounds the gross, is divided down.
         let avail = available(sandbox, &tx.account, &gets_leg);
-        let underfunded = me_cmp(avail, tg0) == std::cmp::Ordering::Less;
-        let tg_cross = if underfunded { avail } else { tg0 };
+        let underfunded = me_cmp(avail, send_max) == std::cmp::Ordering::Less;
+        let tg_cross = if underfunded {
+            // Round DOWN: the taker must not part with more than it holds.
+            match xfer_in {
+                Some(r) => me_muldiv(avail, (1_000_000_000, 0), (r as u128, 0), false),
+                _ => avail,
+            }
+        } else {
+            tg0
+        };
         let (rem_pays, rem_gets_cross, crossed) = cross_engine(
             &tx.account, tp0, tg_cross, &pays_leg, &gets_leg, threshold, threshold_self, sell, domain.as_ref(),
             sandbox, &mut stale,
@@ -5138,7 +5251,7 @@ mod tests {
     /// what lets a bridge leg's POOL price the pass.
     ///
     /// `AMMContext::multiPath()` is `activeStrands.size() > 1`
-    /// (StrandFlow.h:640) and it decides what `AMMLiquidity::getOffer` returns:
+    /// (StrandFlow.h:649) and it decides what `AMMLiquidity::getOffer` returns:
     /// with two strands a FIB slice at the pool's own quality, with one a
     /// `changeSpotPriceQuality` offer matched to the book's, which `tip` then
     /// discards in favour of the book. `BookTip` applies no owner filter, so an
@@ -5950,7 +6063,7 @@ mod tests {
 
     /// ...but ONLY when the crossing actually opens the book. An offer-crossing
     /// strand whose best possible quality is worse than the taker's limit is
-    /// dropped before `flow()` runs (StrandFlow.h:669-673), so no stream is
+    /// dropped before `flow()` runs (StrandFlow.h:682-690), so no stream is
     /// built and nothing is reaped. #105795013 428E0550 sells RLUSD priced
     /// above the entire book: mainnet rests it in 4 nodes and leaves the
     /// expired E39542EC for its owner's own later 612F4E95 to clear. Reaping
