@@ -485,7 +485,7 @@ impl PaymentTransactor {
     /// Flow ONE pass of `chain` and report (spent on the first leg, delivered
     /// on the last). With `single_pass` this is rippled's per-strand `flow()`:
     /// a single quality level per book step, so the caller can re-evaluate
-    /// which strand is now best (StrandFlow.h:682-805).
+    /// which strand is now best (StrandFlow.h:640-756).
     ///
     /// Intermediate value is IN FLIGHT — rippled never rests it on the sender's
     /// trust lines. The lines the chain passes through, and the directory pages
@@ -523,7 +523,7 @@ impl PaymentTransactor {
         //
         // rippled never gates a payment's BookStep on limitQuality. It carries
         // the limit at STRAND level and judges the pass end-to-end
-        // ("Path rejected by limitQuality", StrandFlow.h:698) — which the round
+        // ("Path rejected by limitQuality", StrandFlow.h:720) — which the round
         // loop in `apply_path_payment` now does.
         let hop_thr = if n > 1 { u64::MAX } else { threshold };
         let (spend_leg, want_leg) = (chain[0], chain[n]);
@@ -1442,11 +1442,11 @@ impl PaymentTransactor {
         // `want_gross` — which is precisely what the separate direct branch
         // used to do. Unifying them is the groundwork for iterating STRANDS:
         // rippled always builds the default path alongside the ones named in
-        // Paths and splits the delivery across them (StrandFlow.h:682-805).
+        // Paths and splits the delivery across them (StrandFlow.h:640-756).
         // rippled ALWAYS builds the DEFAULT path alongside the ones named in
         // Paths (unless tfNoRippleDirect) and splits the delivery across the
         // strands, applying the best-quality PASS each round and re-evaluating
-        // (StrandFlow.h:682-805). We ran the specified chain alone.
+        // (StrandFlow.h:640-756). We ran the specified chain alone.
         //
         // #105912291 2AE3693EF556, a circular tfPartialPayment of 1 XRP into
         // DMNDBR via an RLUSD hop: mainnet takes 484095 drops through the
@@ -1549,7 +1549,7 @@ impl PaymentTransactor {
         // would be the base one, where rippled's grow 1,1,2,3,5,8,13.
         let mut amm_fib = ox::AmmFib::default();
         // `setMultiPath(activeStrands.size() > 1)` is re-evaluated EVERY
-        // iteration (StrandFlow.h:640), and a strand that flowed nothing is
+        // iteration (StrandFlow.h:649), and a strand that flowed nothing is
         // not pushed back into `next_` — so a payment whose second strand is
         // dry runs multiPath only until that shows, then sizes the pool by
         // `maxOffer` again. Seeded from `strands.size() > 1` exactly as
@@ -1568,7 +1568,7 @@ impl PaymentTransactor {
         // rounds are what fetch the rest of the liquidity rather than a way to
         // interleave rivals. rippled's driver makes no distinction either — it
         // loops `while (remainingOut > 0 && *remainingIn > 0)` over whatever
-        // `activateNext` yields, one strand or five (StrandFlow.h:610-700).
+        // `activateNext` yields, one strand or five (StrandFlow.h:630-730).
         //
         // The loop is bounded by its own remainders, so a pass that leaves
         // nothing to do exits on the first check. #105831615 8A754FA3 is why
@@ -1584,7 +1584,7 @@ impl PaymentTransactor {
             // `ActiveStrands::activateNext` sorts candidates by
             // `qualityUpperBound` best-first and DROPS any whose bound misses
             // limitQuality; the loop then flows them in that order and takes
-            // the first whose pass is not rejected (StrandFlow.h:670-731).
+            // the first whose pass is not rejected (StrandFlow.h:647-722).
             //
             // This used to rank on the REALISED quality of a trial pass, the
             // model `03c2cb9` already refuted for offer crossing — and it fails
@@ -1654,7 +1654,7 @@ impl PaymentTransactor {
                 // limit is enforced on what the pass REALISED end to end. A
                 // pass that misses it is rolled back and the next candidate
                 // tried: rippled's "Path rejected by limitQuality" does
-                // `continue`, not `break` (StrandFlow.h:698).
+                // `continue`, not `break` (StrandFlow.h:720).
                 if let Some(t) = thr_me {
                     let q = ox::me_muldiv(sin, (1_000_000_000_000_000, -15), sout, false);
                     if ox::me_cmp(q, t).is_gt() {
@@ -2203,7 +2203,7 @@ mod tests {
     /// `AMMLiquidity::getOffer` hands back a FIB SLICE off the pool's initial
     /// balances rather than `maxOffer` — so one iteration of a strand moves a
     /// slice, not the whole request, and `flow()` re-picks the best strand for
-    /// the next one (StrandFlow.h:682-805). The counter is flow-wide and the
+    /// the next one (StrandFlow.h:640-756). The counter is flow-wide and the
     /// slices grow 1,1,2,3,5,8,13.
     ///
     /// Here the AAA strand is cheaper to begin with, so it wins the early

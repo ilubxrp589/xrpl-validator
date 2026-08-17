@@ -999,7 +999,7 @@ pub(crate) fn consume_fib(
 
 /// The pool's FEELESS spot quality — rippled's OPTIMISTIC strand
 /// `qualityUpperBound`, which decides only whether a strand is worth
-/// activating at all (StrandFlow.h:696-699 `qualityUpperBound(sb, *strand) <
+/// activating at all (StrandFlow.h:717-722 `qualityUpperBound(sb, *strand) <
 /// *limitQuality => continue`). Execution uses the fee-inclusive spot in
 /// `consume`; this is the best the pool could conceivably do, and being an
 /// upper bound it must NOT charge the fee.
@@ -1100,7 +1100,7 @@ pub(crate) fn fib_slice(
 /// A CLOB step is constant (`m = 0`); an AMM step degrades linearly as more is
 /// taken, which is the whole point — it lets `limitOut` solve for the output
 /// that lands the strand exactly ON the taker's quality limit instead of
-/// taking the maximum and then discarding the pass (StrandFlow.h:345-395,
+/// taking the maximum and then discarding the pass (StrandFlow.h:357,
 /// QualityFunction.cpp).
 ///
 /// ⚠ `m` is NEVER positive in any shape rippled builds — 0 for a CLOB,
