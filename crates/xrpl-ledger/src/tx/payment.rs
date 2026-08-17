@@ -108,13 +108,13 @@ impl PaymentTransactor {
     /// GATEWAYS rather than an order book, which makes the path unmodellable.
     ///
     /// `toStrand` appends a terminal book for the delivered asset only when the
-    /// CURRENCY changes (PaySteps.cpp:220-233); its own comment is explicit —
+    /// CURRENCY changes (libxrpl/tx/paths/PaySteps.cpp:289-300); its own comment
     /// "for offer crossing (only) we do use an offer book even if all that is
     /// changing is the Issue.account". A PAYMENT whose last hop already holds
     /// the delivered currency under a DIFFERENT issuer therefore gets no book
     /// at all: the delivery issuer enters `normPath` as an ACCOUNT element, and
     /// the offer->account transition emits
-    /// `DirectStepI(hopIssuer -> deliverIssuer)` (PaySteps.cpp:379-388), which
+    /// `DirectStepI(hopIssuer -> deliverIssuer)` (PaySteps.cpp:477), which
     /// requires a trust line between those two gateways. Missing it, toStrand
     /// returns terNO_LINE, the path is dropped, and Payment maps the leftover
     /// ter to tecPATH_DRY.
@@ -2361,7 +2361,7 @@ mod tests {
     /// A payment delivering a currency the last hop already holds under a
     /// DIFFERENT issuer gets no terminal book from `toStrand` — it gets
     /// `DirectStepI(hopIssuer -> deliverIssuer)`, a ripple between the two
-    /// gateways (PaySteps.cpp:220-233, 379-388). Only the TERMINAL transition
+    /// gateways (PaySteps.cpp:289-300, :477). Only the TERMINAL transition
     /// is account-mediated; an issuer-only change between two explicit path
     /// elements is still `make_BookStepII`.
     #[test]
