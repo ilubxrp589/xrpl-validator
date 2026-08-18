@@ -739,6 +739,30 @@ impl Transactor for NFTokenAcceptOfferTransactor {
         // offer's owner rHoGeyNk holds 6087454 drops against an OwnerCount of 8
         // — a 2600000 reserve — so 3487454 spendable against a 5069291 offer.
         // Mainnet claims the fee and stops; we had no funds check at all.
+        // IN BROKERED MODE, EITHER OFFER'S `Destination` MUST BE THE BROKER.
+        // rippled tests BOTH, in preclaim, before the broker-fee arithmetic:
+        //     if (auto const dest = bo->at(~sfDestination); dest && *dest != ctx.tx[sfAccount])
+        //         return tecNO_PERMISSION;              // and the same for so
+        // (NFTokenAcceptOffer.cpp:115-126). A Destination names who may ACCEPT
+        // the offer, and in brokered mode that is the broker submitting the
+        // transaction — not the counterparty.
+        //
+        // We read only ONE offer to check this — `sell_ref.or(buy_ref)` in
+        // do_apply — so with both offers named we tested the SELL side and
+        // never looked at the BUY side at all.
+        //
+        // #106368924 53DA72C2: the sell offer's Destination IS the broker
+        // rpZqTPC8 (fine), while the buy offer names rDeizxSRo6JH — someone
+        // else entirely. Mainnet claims the fee with tecNO_PERMISSION; we
+        // brokered the sale, moved the token and paid out 5074492 drops plus a
+        // 508-drop broker fee. 7 mutations against 1.
+        if let (Some(b), Some(sl)) = (&bo, &so) {
+            for d in [b.destination, sl.destination].into_iter().flatten() {
+                if d != tx.account {
+                    return TxResult::NoPermission;
+                }
+            }
+        }
         if let Some(b) = &bo {
             if nft_funds_short(sandbox, &b.owner, &b.amount) {
                 return TxResult::InsufficientFunds;
