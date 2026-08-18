@@ -2723,6 +2723,10 @@ thr={t:?} admits_trunc={} admits_up={}",
                 let a_gross = gross_in(fee_rate, gets_in);
                 match (&a_book, &a_fill) {
                     (Some((_, akey, aoffer, amaker, a_gives0, a_wants0)), _) => {
+                        if std::env::var("DX_WALK").is_ok() {
+                            eprintln!("DX_FILL legA book okey={} maker={} in={gets_in:?} out={xrp:?} gives0={a_gives0:?} wants0={a_wants0:?}",
+                                hex::encode(akey.0), hex::encode(amaker));
+                        }
                         settle_fill(sandbox, akey, aoffer, amaker, taker, taker,
                                     &xrp_leg, gets_leg, xrp, gets_in, a_gross, *a_gives0, *a_wants0);
                     }
@@ -2738,6 +2742,14 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // the XRP middle, which carries no issuer rate.
                 match (&b_book, &b_fill) {
                     (Some((_, bkey, boffer, bmaker, b_gives0, b_wants0)), _) => {
+                        // ONE offer per leg per ITERATION. rippled's BookStep
+                        // walks as many offers as the step needs and DELETES
+                        // each as it is exhausted; a divergence in walk DEPTH
+                        // shows up here as "we modify what mainnet deletes".
+                        if std::env::var("DX_WALK").is_ok() {
+                            eprintln!("DX_FILL legB book okey={} maker={} in={xrp:?} out={pays_out:?} gives0={b_gives0:?} wants0={b_wants0:?}",
+                                hex::encode(bkey.0), hex::encode(bmaker));
+                        }
                         settle_fill(sandbox, bkey, boffer, bmaker, taker, beneficiary,
                                     pays_leg, &xrp_leg, pays_out, xrp, xrp, *b_gives0, *b_wants0);
                     }
@@ -3610,6 +3622,17 @@ pub(crate) fn cross_engine_to(
                     off2["TakerGets"] = me_amount_json(&offer["TakerGets"], res_gets);
                     off2["TakerPays"] = me_amount_json(&offer["TakerPays"], res_pays);
                     put_json(sandbox, okey, &off2);
+                }
+                // What the walk actually TOOK from this offer. `DX_WALK` above
+                // prints each offer as ENCOUNTERED; this prints the fill, which
+                // is what a divergence in walk DEPTH turns on — "deleted here,
+                // modified there" is the boundary offer where two walks part.
+                if std::env::var("DX_WALK").is_ok() {
+                    eprintln!(
+                        "DX_FILL okey={} maker={} give={give:?} pay={pay:?} gives0={m_gives0:?} wants0={m_wants0:?} funded={funded:?} consumed={consumed} rem_pays={rem_pays:?} rem_gets={rem_gets:?}",
+                        hex::encode(okey.0),
+                        hex::encode(maker),
+                    );
                 }
                 if done(rem_pays, rem_gets) {
                     // rippled does not stop at a satisfied fill. Its reverse

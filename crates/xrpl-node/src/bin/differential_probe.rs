@@ -1779,10 +1779,15 @@ fn run() -> i32 {
         // FULL keys: book directory pages of one book share a 48-hex prefix
         // (book_base || quality), so a truncated key cannot distinguish a
         // page-quality shift from a delete/create of the same page.
+        // The cap is a DISPLAY limit, and at 8 it SATURATES — #106348756 reports
+        // "missing: 8" for a 16-node gap, which reads as a count and is not one.
+        // DX_KEYS raises it for an investigation; the default keeps gate output
+        // byte-identical.
+        let kcap: usize = std::env::var("DX_KEYS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
         let missing: Vec<String> = net_mut.difference(&our_mut)
-            .map(|(k, b)| format!("{k}:{b}")).take(8).collect();
+            .map(|(k, b)| format!("{k}:{b}")).take(kcap).collect();
         let extra: Vec<String> = our_mut.difference(&net_mut)
-            .map(|(k, b)| format!("{k}:{b}")).take(8).collect();
+            .map(|(k, b)| format!("{k}:{b}")).take(kcap).collect();
         per_tx.push(json!({
             "hash": h, "type": tx_type, "verdict": verdict,
             "our_ter": our_ter, "net_ter": net_ter,
