@@ -251,9 +251,38 @@ impl PaymentTransactor {
         use crate::tx::offer as ox;
         const ONE: ox::Me = (1_000_000_000_000_000, -15);
         let mut acc: ox::Me = ONE;
-        for w in chain.windows(2) {
+        for (i, w) in chain.windows(2).enumerate() {
             let tip = ox::hop_tip(sandbox, taker, w[0], w[1], amm_iters)?;
             acc = ox::me_muldiv(acc, tip, ONE, false);
+            // THE INTERMEDIATE GATEWAY'S CUT IS PART OF THE BOUND. A payment
+            // book step composes its quality with `trIn` — the transfer rate of
+            // the book's IN currency when the previous step redeems —
+            // `adjustQualityWithFees` (BookStep.cpp:338-360), and that feeds
+            // `qualityUpperBound`. Offer crossing deliberately WAIVES it ("assume
+            // no fee is charged, or the estimate will no longer be an upper
+            // bound", BookStep.cpp:519-524); a payment does not.
+            //
+            // The walk already charges exactly this (the `hop_rate` below), so
+            // omitting it here made the RANKING disagree with the fills — a
+            // strand was ordered by a quality it could never realise.
+            //
+            // #106341834 F8F02C7C: a six-path circular tfLimitQuality payment,
+            // 631.89 XLM for 99.477 USD. XAG's issuer charges 1.001, so strand 5
+            // (XLM>XAG>XRPS>USD) is really 6.333349113135157 and we bounded it at
+            // 6.327022091044109 — exactly 1.001 too good, which put it AHEAD of
+            // strand 0 at 6.329113924050633. rippled ranks strand 0 first and it
+            // alone covers the whole delivery in ONE iteration; we flowed strand
+            // 5 first and then strand 0, touching 8 objects mainnet never did
+            // (16 muts against 6) — the XAG and XRPS lines and an XRPS/USD maker.
+            //
+            // ⚠ It also decides ADMISSION, not just order: rippled drops a strand
+            // whose bound misses `limitQuality`, and a bound that is too good
+            // admits strands the transaction's own price forbids.
+            if i > 0 && !w[0].xrp && taker != &w[0].issuer {
+                if let Some(r) = Self::transfer_rate(sandbox, w[0]) {
+                    acc = ox::me_muldiv(acc, (r as u128, 0), (1_000_000_000, 0), false);
+                }
+            }
         }
         Some(acc)
     }
