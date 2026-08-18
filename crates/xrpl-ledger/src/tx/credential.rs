@@ -271,18 +271,72 @@ impl Transactor for CredentialDeleteTransactor {
             return TxResult::NoPermission;
         }
 
+        // A CREDENTIAL SITS IN **TWO** OWNER DIRECTORIES, and which party pays
+        // its reserve depends on whether it has been ACCEPTED. `deleteSLE`
+        // (CredentialHelpers.cpp:74-124):
+        //     delSLE(issuer,  sfIssuerNode,  !accepted || (subject == issuer));
+        //     if (subject != issuer)
+        //         delSLE(subject, sfSubjectNode, accepted);
+        //     view.erase(sleCredential);
+        // where delSLE does `dirRemove(ownerDir(account), page, key, false)` and
+        // adjusts that account's OwnerCount by -1 only when it is the OWNER.
+        //
+        // We deleted the object and decremented the ISSUER unconditionally —
+        // no directory unlinking at all, and the wrong party once accepted.
+        // The reserve MOVES to the subject on acceptance, so an accepted
+        // credential must charge the subject, not the issuer.
+        //
+        // #105898053 F6EB8CFF: 2 mutations against mainnet's 6 — the credential
+        // and one more DELETE (an emptied page), three DirectoryNode
+        // modifications and one AccountRoot.
+        //
+        // `sfIssuerNode`/`sfSubjectNode` are the stored page hints; passing them
+        // is what lets the removal find the right page instead of walking.
+        let cred = sandbox
+            .read(&cred_key)
+            .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok());
+        let hint = |c: &serde_json::Value, f: &str| -> Option<u64> {
+            match c.get(f) {
+                Some(serde_json::Value::String(h)) => u64::from_str_radix(h, 16).ok(),
+                Some(serde_json::Value::Number(n)) => n.as_u64(),
+                _ => None,
+            }
+        };
+        let accepted = cred
+            .as_ref()
+            .map(|c| c["Flags"].as_u64().unwrap_or(0) & 0x0001_0000 != 0)
+            .unwrap_or(false);
+
         sandbox.delete(cred_key);
 
-        // Decrement OwnerCount for the issuer
-        let issuer_acct_key = keylet::account_root_key(&issuer);
-        if let Some(data) = sandbox.read(&issuer_acct_key) {
-            if let Ok(mut acct) = serde_json::from_slice::<serde_json::Value>(&data) {
-                let count = acct["OwnerCount"].as_u64().unwrap_or(0);
-                if count > 0 {
-                    acct["OwnerCount"] = serde_json::Value::Number((count - 1).into());
-                }
-                sandbox.write(issuer_acct_key, serde_json::to_vec(&acct).unwrap());
+        if let Some(c) = &cred {
+            let ih = hint(c, "IssuerNode");
+            crate::ledger::directory::owner_dir_remove(sandbox, &issuer, &cred_key, ih, false);
+            if subject != issuer {
+                let sh = hint(c, "SubjectNode");
+                crate::ledger::directory::owner_dir_remove(sandbox, &subject, &cred_key, sh, false);
             }
+        }
+
+        // The reserve follows acceptance: the issuer carries an UNACCEPTED
+        // credential (and a self-issued one), the subject carries an accepted one.
+        let mut charge = |who: &[u8; 20]| {
+            let k = keylet::account_root_key(who);
+            if let Some(data) = sandbox.read(&k) {
+                if let Ok(mut acct) = serde_json::from_slice::<serde_json::Value>(&data) {
+                    let count = acct["OwnerCount"].as_u64().unwrap_or(0);
+                    if count > 0 {
+                        acct["OwnerCount"] = serde_json::Value::Number((count - 1).into());
+                    }
+                    sandbox.write(k, serde_json::to_vec(&acct).unwrap_or_default());
+                }
+            }
+        };
+        if !accepted || subject == issuer {
+            charge(&issuer);
+        }
+        if accepted && subject != issuer {
+            charge(&subject);
         }
 
         TxResult::Success
