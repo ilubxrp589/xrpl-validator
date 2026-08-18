@@ -1285,6 +1285,36 @@ fn live_head(
             i += 1;
             continue;
         }
+        // EXPIRED OFFERS ARE NEVER CROSSED. `hasExpired` is inclusive against
+        // the BASE ledger's close time (View.cpp:48; BookStep.cpp builds the
+        // stream with `sb.parentCloseTime()`), and rippled's stream collects
+        // them as removable — "Removing expired offer".
+        //
+        // The DIRECT walk has tested this since #105776250 and
+        // `reap_to_live_head` tests it too; `live_head` — which is what the
+        // BRIDGED walk steps with — did not. A rule at one call site and not
+        // its sibling, again.
+        //
+        // #106348756 2763653C: the leg-B book head at iteration 3 is
+        // rLDyWWMiW6sQ's 0CCFCEC1, funded with 14.545506 RLUSD and EXPIRED.
+        // rippled removes it (with rD8VchnJEJ5A, rBtVeRQ8NWUj, rwnJpjMn18m7)
+        // and walks on to rURtT5MM at a worse rate — 533196 drops for the
+        // remaining 0.533553078068178. We crossed the expired offer instead and
+        // paid 533119, taking the same output from liquidity that does not
+        // exist. 43 mutations against 59.
+        //
+        // ⚠ Funding is NOT the discriminator here: every expired offer above is
+        // well funded. An offer can be live, funded and still uncrossable.
+        if let Some(exp) = offer.get("Expiration").and_then(|v| v.as_u64()) {
+            if exp != 0 && sandbox.base().header.close_time as u64 >= exp {
+                if mutate {
+                    delete_maker_offer(sandbox, &okey, &offer, &maker);
+                    stale.push(okey);
+                }
+                i += 1;
+                continue;
+            }
+        }
         let (Some(gives), Some(wants)) = (
             offer.get("TakerGets").and_then(keylet::amount_mant_exp),
             offer.get("TakerPays").and_then(keylet::amount_mant_exp),
@@ -2671,6 +2701,14 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // walks on to the next maker's offer for the remainder.
                 if let Some((_, _, _, bmaker, _, _)) = &b_book {
                     let funded = available(sandbox, bmaker, pays_leg);
+                    // What the leg-B head can ACTUALLY deliver at this moment.
+                    // The walk's DEPTH turns on this: a head that is
+                    // funding-limited forces the step onward to the next offer,
+                    // and mid-ledger balances are not the pre-state balances.
+                    if std::env::var("DX_WALK").is_ok() {
+                        eprintln!("DX_BFUND maker={} funded={funded:?} want={pays_out:?} clamped={}",
+                            hex::encode(bmaker), me_cmp(pays_out, funded).is_gt());
+                    }
                     if me_cmp(pays_out, funded).is_gt() {
                         pays_out = funded;
                         xrp = urp_b(pays_out, b_unprice(pays_out), sandbox);
