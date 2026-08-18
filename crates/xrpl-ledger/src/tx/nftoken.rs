@@ -934,6 +934,48 @@ impl Transactor for NFTokenModifyTransactor {
         if !sandbox.exists(&acct_key) {
             return TxResult::NoAccount;
         }
+        // WHO MAY MODIFY AN NFT. `NFTokenModify::preclaim`, after the
+        // existence test (NFTokenModify.cpp):
+        //   if ((getFlags(id) & kFlagMutable) == 0)          -> tecNO_PERMISSION
+        //   if (issuer != account) { minter = issuer's sfNFTokenMinter;
+        //                            if (minter != account) -> tecNO_PERMISSION }
+        // Both the mutability AND the authorisation live in the NFTokenID
+        // itself — flags in bytes 0..2, ISSUER in bytes 4..24 — so neither is a
+        // transaction field, and neither was checked here at all.
+        //
+        // #106374615 / #106377813 / #106374147 are one bot retrying the same
+        // modify. NFTokenID 00182710CE07D0D9…: flags 0x0018, so lsfMutable IS
+        // set and that gate passes — but the issuer is
+        // rK8PZ2r6dSYRJUv5686wc2aesXe2zaLRXZ while the submitter is
+        // rLGHuf125sJV9d6g2hcK2HzKrDH2j45dPQ, and the issuer's `NFTokenMinter`
+        // is rKqqb5QZXVAL3VqXJL6obfRGeHou1DtyBV — a THIRD account. Mainnet
+        // claims the fee with tecNO_PERMISSION; we rewrote the URI (2 muts v 1).
+        let id_hex = tx.fields.get("NFTokenID").and_then(|v| v.as_str()).unwrap_or("");
+        if id_hex.len() == 64 {
+            if let Ok(flags) = u16::from_str_radix(&id_hex[0..4], 16) {
+                if flags & 0x0010 == 0 {
+                    return TxResult::NoPermission; // not lsfMutable
+                }
+            }
+            if let Some(issuer) = decode_account_id(&serde_json::json!(&id_hex[8..48])) {
+                if issuer != tx.account {
+                    // ⚠ Only condemn an issuer we can actually READ. An
+                    // unhydrated AccountRoot would make this fire on EVERY
+                    // cross-issuer modify — the inverse of the usual trap, where
+                    // a missing object makes a check vacuous. The probe hydrates
+                    // it from the NFTokenID for exactly this reason.
+                    if let Some(sle) = sandbox
+                        .read(&keylet::account_root_key(&issuer))
+                        .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+                    {
+                        let minter = sle.get("NFTokenMinter").and_then(decode_account_id);
+                        if minter != Some(tx.account) {
+                            return TxResult::NoPermission;
+                        }
+                    }
+                }
+            }
+        }
         TxResult::Success
     }
 

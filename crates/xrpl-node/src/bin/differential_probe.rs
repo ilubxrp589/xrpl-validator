@@ -279,6 +279,25 @@ fn load_nft_pages_for_tx(state: &mut LedgerState, url: &str, txj: &Value, ledger
             }
         }
         Some("NFTokenModify") | Some("NFTokenBurn") | Some("NFTokenCreateOffer") => {
+            // The ISSUER's AccountRoot, for `NFTokenModify`'s authorisation
+            // check: it reads the issuer's `sfNFTokenMinter`, and the issuer is
+            // encoded in the NFTokenID (bytes 4..24) rather than named as a
+            // transaction field — so the involved-account loader never sees it.
+            // Without this the minter test reads nothing and passes everything.
+            // #106374615 is the specimen (issuer rK8PZ2r6…, minter rKqqb5QZ…,
+            // submitter rLGHuf12… — three different accounts).
+            if let Some(idh) = txj.get("NFTokenID").and_then(|v| v.as_str()) {
+                if idh.len() == 64 {
+                    if let Ok(ib) = hex::decode(&idh[8..48]) {
+                        if ib.len() == 20 {
+                            let mut id = [0u8; 20];
+                            id.copy_from_slice(&ib);
+                            let k = keylet::account_root_key(&id);
+                            load_object(state, url, &hex::encode_upper(k.0), ledger_index);
+                        }
+                    }
+                }
+            }
             // The seller (sfOwner, or the account for a sell offer) must own
             // the token — preclaim walks their pages for the existence check.
             //
