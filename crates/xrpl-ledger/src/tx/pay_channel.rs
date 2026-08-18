@@ -114,8 +114,34 @@ impl Transactor for PaymentChannelCreateTransactor {
                 return TxResult::NoDst;
             };
             let dflags = dst["Flags"].as_u64().unwrap_or(0);
+            // The flag test the comment above has always CLAIMED and the code
+            // never made: a destination may refuse paychans outright, and that
+            // ruling comes BEFORE the tag test
+            // (PaymentChannelCreate.cpp:99-101).
+            if dflags & 0x1000_0000 != 0 {
+                return TxResult::NoPermission; // lsfDisallowIncomingPayChan
+            }
             if dflags & 0x0002_0000 != 0 && tx.fields.get("DestinationTag").is_none() {
                 return TxResult::DstTagNeeded; // lsfRequireDestTag
+            }
+            // A PSEUDO-ACCOUNT cannot receive a payment channel — same three
+            // discriminators as everywhere else (`sfAMMID`, `sfVaultID`,
+            // `sfLoanBrokerID`; AccountRootHelpers.cpp:194-208), and likewise
+            // NOT amendment-gated because every write to those fields is.
+            //
+            // ⚠ ORDER DIFFERS FROM CheckCreate. There the pseudo test sits
+            // BEFORE the tag test (CheckCreate.cpp:93-98); here it sits AFTER
+            // it (PaymentChannelCreate.cpp:103-113). A pseudo-account
+            // destination that also carries lsfRequireDestTag therefore yields
+            // tecNO_PERMISSION for a Check and tecDST_TAG_NEEDED for a
+            // PayChannel. Copying one transactor's order into the other is the
+            // easy way to be wrong here.
+            //
+            // ⚠ No failing ledger pins this — it is the sibling of the escrow
+            // rule (`8e48764`), written because rippled applies `isPseudoAccount`
+            // in five places and we had implemented two.
+            if ["AMMID", "VaultID", "LoanBrokerID"].iter().any(|f| dst.get(f).is_some()) {
+                return TxResult::NoPermission;
             }
         } else {
             return TxResult::Malformed;
@@ -486,6 +512,78 @@ mod tests {
             .and_then(|s| s.parse::<u64>().ok())
             .or_else(|| v[field].as_u64())
             .unwrap_or(0)
+    }
+
+    /// A destination may refuse payment channels outright, and a pseudo-account
+    /// can never receive one (PaymentChannelCreate.cpp:99-113).
+    ///
+    /// ⚠ The ORDER differs from CheckCreate: there the pseudo test precedes the
+    /// tag test, here it follows it. The third case pins that — a pseudo-account
+    /// that ALSO requires a tag yields tecDST_TAG_NEEDED for a PayChannel, where
+    /// a Check would yield tecNO_PERMISSION.
+    #[test]
+    fn pay_channel_create_refused_by_flag_and_by_pseudo_account() {
+        let sender = [0x01u8; 20];
+        let dest = [0x02u8; 20];
+        let tx = TxFields {
+            account: sender,
+            tx_type: "PaymentChannelCreate".to_string(),
+            fee: 12,
+            sequence: 1,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Destination": hex::encode(dest),
+                "Amount": "10000000",
+            }),
+        };
+        let build = |mutate: &dyn Fn(&mut serde_json::Value)| {
+            let state = make_state_with_accounts(&[(&sender, 50_000_000), (&dest, 10_000_000)]);
+            let dkey = keylet::account_root_key(&dest);
+            let mut acct: serde_json::Value =
+                serde_json::from_slice(state.state_map.lookup(&dkey).unwrap()).unwrap();
+            mutate(&mut acct);
+            let mut state = state;
+            state.state_map.insert(dkey, serde_json::to_vec(&acct).unwrap()).unwrap();
+            state
+        };
+
+        // Control: an ordinary destination still accepts a channel.
+        let plain = build(&|_| {});
+        assert_eq!(
+            PaymentChannelCreateTransactor.preclaim(&tx, &Sandbox::new(&plain)),
+            TxResult::Success,
+            "an ordinary destination must still accept a payment channel"
+        );
+
+        // lsfDisallowIncomingPayChan (0x10000000).
+        let refuses = build(&|a| a["Flags"] = serde_json::json!(0x1000_0000u64));
+        assert_eq!(
+            PaymentChannelCreateTransactor.preclaim(&tx, &Sandbox::new(&refuses)),
+            TxResult::NoPermission,
+            "lsfDisallowIncomingPayChan must refuse the channel"
+        );
+
+        // Each pseudo-account discriminator alone is enough.
+        for f in ["AMMID", "VaultID", "LoanBrokerID"] {
+            let pseudo = build(&|a| a[f] = serde_json::json!(hex::encode_upper([0xABu8; 32])));
+            assert_eq!(
+                PaymentChannelCreateTransactor.preclaim(&tx, &Sandbox::new(&pseudo)),
+                TxResult::NoPermission,
+                "a destination carrying {f} is a pseudo-account and cannot receive a channel"
+            );
+        }
+
+        // ORDER: the tag test runs FIRST here, unlike CheckCreate.
+        let both = build(&|a| {
+            a["Flags"] = serde_json::json!(0x0002_0000u64);
+            a["AMMID"] = serde_json::json!(hex::encode_upper([0xABu8; 32]));
+        });
+        assert_eq!(
+            PaymentChannelCreateTransactor.preclaim(&tx, &Sandbox::new(&both)),
+            TxResult::DstTagNeeded,
+            "lsfRequireDestTag outranks the pseudo-account test for a PayChannel"
+        );
     }
 
     #[test]
