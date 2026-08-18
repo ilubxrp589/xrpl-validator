@@ -1437,6 +1437,43 @@ impl PaymentTransactor {
             sandbox.restore_snapshot(snap);
             return TxResult::PathDry;
         }
+        // NO-RIPPLE BLOCKS THE STEP OUT OF A BOOK. A `DirectStepI` that
+        // immediately follows a BOOK step is refused when the SOURCE side of
+        // its trust line carries NoRipple (DirectStep.cpp:440-445):
+        //     if (ctx.prevStep->bookStepBook())
+        //         if (sleLine->isFlag((src_ > dst_) ? lsfHighNoRipple : lsfLowNoRipple))
+        //             return terNO_RIPPLE;
+        // Delivering an IOU bought on a book means exactly that shape — book,
+        // then issuer -> destination — so the flag on the ISSUER's side of the
+        // destination's line decides whether ANY strand can deliver at all.
+        // It is a property of the delivery, not of a particular path, which is
+        // why it is tested once here rather than per strand.
+        //
+        // #105985066 F205D076: a circular tfPartialPayment, SendMax 2 XRP for
+        // DTCC and NO Paths. The DTCC line carries NoRipple on BOTH sides and
+        // the issuer is the LOW account, so rippled logs `toStep failed: -90`
+        // (terNO_RIPPLE), "failed to add default path", and returns tecPATH_DRY
+        // with nothing attempted. We crossed the XRP/DTCC book, came up under
+        // DeliverMin and reported tecPATH_PARTIAL — the right refusal for the
+        // wrong reason, off liquidity that was never reachable.
+        //
+        // ⚠ Only the TERMINAL delivery is modelled here. rippled applies the
+        // same rule to any direct step following a book mid-strand; we do not
+        // materialise those, so there is nothing else to test yet.
+        if !want_leg.xrp && dest != &want_leg.issuer && !(spend_leg.xrp == want_leg.xrp && spend_leg.cur == want_leg.cur && spend_leg.issuer == want_leg.issuer) {
+            let lk = keylet::ripple_state_key(&want_leg.issuer, dest, &want_leg.cur);
+            if let Some(line) = ox::json_at(sandbox, &lk) {
+                let flags = line["Flags"].as_u64().unwrap_or(0);
+                // The SOURCE of that step is the ISSUER: low side if its id
+                // sorts first, high side otherwise.
+                let issuer_low = &want_leg.issuer < dest;
+                let bit = if issuer_low { 0x0010_0000 } else { 0x0020_0000 };
+                if flags & bit != 0 {
+                    sandbox.restore_snapshot(snap);
+                    return TxResult::PathDry;
+                }
+            }
+        }
         // The delivered IOU is re-issued to the destination by the strand's
         // last step, which charges the issuer's TransferRate (see below), so
         // the books must be worked for `Amount × rate` GROSS for the
