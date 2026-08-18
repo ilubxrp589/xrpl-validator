@@ -255,7 +255,26 @@ impl Transactor for CheckCashTransactor {
         if ox::me_cmp(want, cap).is_gt() {
             return TxResult::PathPartial; // asking beyond the check's SendMax
         }
-        let avail = if creator == leg.issuer { want } else { ox::available(sandbox, &creator, &leg) };
+        let mut avail = if creator == leg.issuer { want } else { ox::available(sandbox, &creator, &leg) };
+        // CASHING THE CHECK RELEASES THE CHECK'S OWN RESERVE, and that reserve
+        // counts toward the payment. rippled says so twice:
+        //     if (value.native())
+        //         availableFunds += XRPAmount{ctx.view.fees().increment};
+        //   "src will have one reserve's worth of additional XRP once the check
+        //    is cashed, since the check's reserve will no longer be required"
+        //   (CheckCash.cpp:175-181), and doApply spends it through
+        //   `xrpLiquid(psb, srcId, -1, viewJ)` — "Hence the -1" (:333-339).
+        // XRP ONLY: the test is `value.native()`, since an IOU check's reserve
+        // is not what funds the transfer.
+        //
+        // #106375426 0932105B: the writer holds 60741227 drops at OwnerCount 49,
+        // so a full 10800000 reserve leaves 49941227 against a 50000000 cash —
+        // short by 58773. Release the check's own 200000 and it clears with
+        // 141227 to spare. Mainnet succeeds in 7 nodes; we claimed the fee with
+        // tecPATH_PARTIAL in 3.
+        if leg.xrp && creator != leg.issuer {
+            avail = (avail.0.saturating_add(ox::XRP_RESERVE_INC), avail.1);
+        }
         if ox::me_cmp(avail, want).is_lt() {
             return TxResult::PathPartial; // writer cannot cover — fee-only
         }

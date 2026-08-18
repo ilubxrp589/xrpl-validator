@@ -129,7 +129,7 @@ impl Amount {
 
 /// Mainnet owner reserve (drops): base 1 XRP + 0.2 XRP per owned object.
 const XRP_RESERVE_BASE: u128 = 1_000_000;
-const XRP_RESERVE_INC: u128 = 200_000;
+pub(crate) const XRP_RESERVE_INC: u128 = 200_000;
 
 pub(crate) type Me = (u128, i32);
 
