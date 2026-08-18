@@ -172,6 +172,33 @@ impl Transactor for EscrowCreateTransactor {
         else {
             return TxResult::NoDst;
         };
+        // A PSEUDO-ACCOUNT CANNOT RECEIVE AN ESCROW. rippled tests this
+        // immediately after the tecNO_DST read and BEFORE the token helper and
+        // the tag test (EscrowCreate.cpp:350-352), so it outranks every other
+        // reason this transaction could fail — and it is deliberately NOT
+        // amendment-gated, because every write to a discriminator field is.
+        //
+        // `isPseudoAccount` is "an AccountRoot carrying any field marked
+        // `kSmdPseudoAccount`" (AccountRootHelpers.cpp:194-208). The SOTemplate
+        // marks exactly three: `sfAMMID`, `sfVaultID`, `sfLoanBrokerID`
+        // (sfields.macro:180, :203, :206). An AMM's own account is the one that
+        // turns up on mainnet.
+        //
+        // #106331706 is FOUR EscrowCreates from one sender at consecutive
+        // sequences, and this single rule accounts for all four. Two name AMM
+        // accounts as Destination and mainnet refuses them fee-only (83398EAD
+        // seq …659, 17D6DD3C seq …663); we created the escrows. The other two
+        // then diverged on MUTATION COUNT in OPPOSITE directions — 3B106F32
+        // 10 v 6 and 42CB3ACF 6 v 10, four objects shared between the extra and
+        // missing lists — because the escrows we wrongly created consumed
+        // owner-directory slots, so each later escrow landed on a different
+        // PAGE than mainnet's. Two of the shared objects are DirectoryNodes
+        // mid-chain (`idx=2/13`, `2/6`), which is what page placement depends
+        // on. ⇒ a mut-count pair erring in both directions and sharing keys is
+        // one misplacement, not two bugs.
+        if ["AMMID", "VaultID", "LoanBrokerID"].iter().any(|f| dst.get(*f).is_some()) {
+            return TxResult::NoPermission;
+        }
         let needs_tag = dst["Flags"].as_u64().unwrap_or(0) & 0x0002_0000 != 0
             && tx.fields.get("DestinationTag").is_none();
 
@@ -737,6 +764,63 @@ mod tests {
     /// balance", EscrowCreate.cpp doApply). #105823810 6AB38288 escrows
     /// 3750000 STSH: we returned temBAD_AMOUNT and applied nothing, where
     /// mainnet built it in 7 nodes.
+    /// A pseudo-account cannot receive an escrow: rippled refuses fee-only with
+    /// tecNO_PERMISSION before the token helper or the tag test ever run
+    /// (EscrowCreate.cpp:350-352). The discriminators are `AMMID`, `VaultID`
+    /// and `LoanBrokerID` (sfields.macro:180, :203, :206) — an AMM's own
+    /// account is the mainnet case, #106331706 83398EAD and 17D6DD3C.
+    #[test]
+    fn an_escrow_to_a_pseudo_account_is_refused() {
+        let sender = [0x01u8; 20];
+        let dest = [0x02u8; 20];
+
+        let build = |disc: Option<&str>| {
+            let mut state = make_state();
+            add_account(&mut state, &sender, 50_000_000, 1);
+            add_account(&mut state, &dest, 50_000_000, 1);
+            if let Some(f) = disc {
+                let dkey = keylet::account_root_key(&dest);
+                let mut acct: serde_json::Value =
+                    serde_json::from_slice(state.state_map.lookup(&dkey).unwrap()).unwrap();
+                acct[f] = serde_json::json!(hex::encode_upper([0xABu8; 32]));
+                state.state_map.insert(dkey, serde_json::to_vec(&acct).unwrap()).unwrap();
+            }
+            state
+        };
+        let tx = TxFields {
+            account: sender,
+            tx_type: "EscrowCreate".to_string(),
+            fee: 12,
+            sequence: 5,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Destination": hex::encode(dest),
+                "Amount": "1000000",
+                "FinishAfter": 900,
+            }),
+        };
+
+        // An ordinary destination is fine — this is the control, and it is what
+        // proves the refusal below is the discriminator and not the fixture.
+        let plain = build(None);
+        assert_eq!(
+            EscrowCreateTransactor.preclaim(&tx, &Sandbox::new(&plain)),
+            TxResult::Success,
+            "an ordinary destination must still accept an escrow"
+        );
+
+        // Each discriminator alone is enough, and it outranks everything after.
+        for f in ["AMMID", "VaultID", "LoanBrokerID"] {
+            let state = build(Some(f));
+            assert_eq!(
+                EscrowCreateTransactor.preclaim(&tx, &Sandbox::new(&state)),
+                TxResult::NoPermission,
+                "a destination carrying {f} is a pseudo-account and cannot receive an escrow"
+            );
+        }
+    }
+
     #[test]
     fn a_token_escrow_locks_the_line_and_lists_three_directories() {
         let sender = [0x01u8; 20];
