@@ -1339,7 +1339,13 @@ fn live_head(
     start: &mut usize,
     taker: &[u8; 20],
     maker_pays_leg: &Leg,
-    mutate: bool,
+    // Self-offers and DEAD offers (expired/unfunded) are removed under
+    // separate flags: a stream-step reaps dead offers it passes even in a
+    // PEEK once the strand is running (#106093637 1BE79D4A), but a peeked
+    // SELF-offer must stay — strands are priced against the unmodified view
+    // and removals apply only when execution steps onto them (#105930662).
+    mutate_self: bool,
+    mutate_dead: bool,
     stale: &mut Vec<Hash256>,
 ) -> Option<(u64, Hash256, serde_json::Value, [u8; 20], Me, Me)> {
     let mut i = *start;
@@ -1358,7 +1364,7 @@ fn live_head(
             continue;
         };
         if &maker == taker {
-            if mutate {
+            if mutate_self {
                 delete_maker_offer(sandbox, &okey, &offer, &maker);
                 stale.push(okey);
             }
@@ -1387,7 +1393,7 @@ fn live_head(
         // well funded. An offer can be live, funded and still uncrossable.
         if let Some(exp) = offer.get("Expiration").and_then(|v| v.as_u64()) {
             if exp != 0 && sandbox.base().header.close_time as u64 >= exp {
-                if mutate {
+                if mutate_dead {
                     delete_maker_offer(sandbox, &okey, &offer, &maker);
                     stale.push(okey);
                 }
@@ -1432,7 +1438,7 @@ fn live_head(
             continue;
         }
         if gives.0 == 0 || wants.0 == 0 || me_is_zero(available(sandbox, &maker, maker_pays_leg)) {
-            if mutate {
+            if mutate_dead {
                 delete_maker_offer(sandbox, &okey, &offer, &maker);
                 stale.push(okey);
             }
@@ -1441,7 +1447,10 @@ fn live_head(
         }
         break Some((q, okey, offer, maker, gives, wants));
     };
-    if mutate {
+    // Only the true mutation-walk persists the cursor: a reaping PEEK must
+    // not advance it past skipped self-offers — `d_tip` prices the strand
+    // from the ladder at this index, and moving it re-decides multiPath.
+    if mutate_self {
         *start = i;
     }
     result
@@ -1898,9 +1907,20 @@ fn cross_bridged(
         // Each BRIDGE LEG is a BookStep of its own pair, so its book head
         // competes with that pair's pool (fib slice) — #105666830's XAH leg
         // filled from the XAH/XRP pool on mainnet.
-        let dpeek = live_head(sandbox, &ld, &mut di, taker, pays_leg, false, stale);
-        let apeek = live_head(sandbox, &la, &mut ai, taker, &xrp_leg, false, stale);
-        let bpeek = live_head(sandbox, &lb, &mut bi, taker, pays_leg, false, stale);
+        // Once the crossing has EXECUTED a fill, the strand is definitely
+        // built and every subsequent stream-step removes the dead offers it
+        // passes — rippled reaps them even in an iteration whose liquidity
+        // then comes from the AMM. #106093637 1BE79D4A: iter 0 crosses the
+        // legB head (rD8V, funded 0.59584264555), iter 1's stream steps over
+        // the EXPIRED rsqztuzpo (exp 839271795 ≤ parent close 839271841) and
+        // removes it — offer, book page, owner dir and OwnerCount — while
+        // the 0.404 fill itself comes from the pool. Our peeks skipped it
+        // silently. Before any fill the peeks stay non-mutating: a strand
+        // that is never built reaps nothing (#105795013-analog).
+        let peek_rm = crossed > 0;
+        let dpeek = live_head(sandbox, &ld, &mut di, taker, pays_leg, false, peek_rm, stale);
+        let apeek = live_head(sandbox, &la, &mut ai, taker, &xrp_leg, false, peek_rm, stale);
+        let bpeek = live_head(sandbox, &lb, &mut bi, taker, pays_leg, false, peek_rm, stale);
         let a_fib = amm_a.as_ref().and_then(|am| {
             crate::tx::amm_swap::fib_slice(sandbox, am, amm_a_init, amm_iters, &xrp_leg, gets_leg)
                 .map(|s| (crate::tx::amm_swap::slice_rate(s.0, s.1), s))
@@ -2593,6 +2613,18 @@ thr={t:?} admits_trunc={} admits_up={}",
                     // directly (`qualityThreshold_ > lobQuality`), which is
                     // dimensionally odd but is what the code does; in me-space
                     // (in-per-out, smaller is better) that is `thr < leg_book`.
+                    //
+                    // ⚠ KNOWN GAP (#106093637 BDB95F8A, parked): in the ANCHORED
+                    // case rippled's admission also prices a pool-better leg at
+                    // the feeless spot (`ub strand 1` 64717.04 = tip 1.06832e-6 ×
+                    // spot 6.05785e10 — admitted, fills 12.03 through the
+                    // rURtT5MM clip). Loosening ONLY the admission re-broke
+                    // #105807256 84FD7DC8's protection: rippled then EXECUTES the
+                    // pool capped at the ANCHORED SLICE and continues into the
+                    // leg's CLOB, judging the pass whole — our leg execution is
+                    // pool-only and unbounded, so admitting fills what mainnet
+                    // rests. Fixing it needs the anchored-slice cap + CLOB
+                    // continuation per leg — one build, both sites together.
                     let single_tip = |book: Option<Me>, spot: Option<Me>| -> Option<Me> {
                         let b = book?;
                         match spot {
@@ -2620,7 +2652,7 @@ thr={t:?} admits_trunc={} admits_up={}",
             }
             if want_direct {
                 let Some((q, okey, offer, maker, gives0, wants0)) =
-                    live_head(sandbox, &ld, &mut di, taker, pays_leg, true, stale)
+                    live_head(sandbox, &ld, &mut di, taker, pays_leg, true, true, stale)
                 else { break 'attempt };
                 let funded = available(sandbox, &maker, pays_leg);
                 let m_gives = if me_cmp(funded, gives0).is_lt() { funded } else { gives0 };
@@ -2707,7 +2739,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 let a_book = if a_use_amm {
                     None
                 } else {
-                    match live_head(sandbox, &la, &mut ai, taker, &xrp_leg, true, stale) {
+                    match live_head(sandbox, &la, &mut ai, taker, &xrp_leg, true, true, stale) {
                         Some(h) => Some(h),
                         None => break 'attempt,
                     }
@@ -2715,7 +2747,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 let b_book = if b_use_amm {
                     None
                 } else {
-                    match live_head(sandbox, &lb, &mut bi, taker, pays_leg, true, stale) {
+                    match live_head(sandbox, &lb, &mut bi, taker, pays_leg, true, true, stale) {
                         Some(h) => Some(h),
                         None => break 'attempt,
                     }
