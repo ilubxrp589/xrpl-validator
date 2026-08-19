@@ -1,6 +1,6 @@
 # DirectStepI — rippling through accounts, composed with book steps
 
-Status: STAGE 1 SHIPPED (2026-08-19, gate dstep1 at baseline); stage 2 pending. Target: the 7-specimen `Payment
+Status: COMPLETE (2026-08-19). Stage 1 gate dstep1, stage 2 gates dstep2b/c, all at baseline; the whole tecPATH_DRY-v-tesSUCCESS family plus the no-Paths default-direct shape are clean. Target: the 7-specimen `Payment
 tecPATH_DRY-v-tesSUCCESS` family — 106102038 `5B97B89E`, 106206499
 `3B4F9C9AEF`, 106311829 `9684A861` + `D2EB36BA`, 106373989 `8CAD0435`,
 106374244 `7511A01A` (+ the doc's earlier 106146562-class refusals, which
@@ -171,3 +171,21 @@ beyond what the round loop does today.
   net target for direct passes, delivered (gross, books) /
   delivered_direct (net). A direct strand both spends and delivers with
   fees already inside; every book-shaped pre/post adjustment must skip it.
+
+## 7. Stage-2 findings
+
+- **The engagement gate is the load-bearing rule**: a mixed strand may
+  engage only for a path whose OWN elements ripple through an account.
+  Implied head/tail hops exist on every strand and are what the classic
+  spend_rate/want_rate bookkeeping already represents. Without the gate,
+  every IOU payment built a duplicate competing strand: 180 census hits,
+  a false tecPATH_PARTIAL (#105709221), three extra offers (#105795329).
+  The census — not the TER sweeps — surfaced it.
+- **Run-adjacent joints restore per-hop, book-book joints at the end.**
+  On a circular payment the tail run's real delivery and the in-flight
+  fiction share one line object; an end-restore erased both
+  (#106374244's missing destination line).
+- **The default path of a same-currency cross-issuer payment is a pure
+  direct strand** and is now built (gated to exactly the shape the
+  classic pipeline refuses); its own checks decide, terNO_LINE refusals
+  (#106336831) preserved, deliveries (#106065267) flow.

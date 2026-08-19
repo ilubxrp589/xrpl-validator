@@ -1034,7 +1034,20 @@ fn load_payment_books(
                 ) {
                     if c1 == c2 {
                         let cur20 = currency_code(&c1);
-                        for p in txj["Paths"].as_array().into_iter().flatten().filter_map(|p| p.as_array()) {
+                        // The DEFAULT strand's account sequence too (els = []):
+                        // a no-Paths same-currency payment rests entirely on
+                        // the mutual lines of src/[issuers]/dst, and a
+                        // fee-only refusal's meta names none of them.
+                        let empty: Vec<Value> = Vec::new();
+                        let default_and_named = std::iter::once(empty.as_slice()).chain(
+                            txj["Paths"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|p| p.as_array())
+                                .map(|v| v.as_slice()),
+                        );
+                        for p in default_and_named {
                             let Some(seq) = xrpl_ledger::tx::direct_step::pure_account_sequence(
                                 &src, &dst, &di, &smi, p,
                             ) else {

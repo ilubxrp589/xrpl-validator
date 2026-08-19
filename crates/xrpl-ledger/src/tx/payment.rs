@@ -1955,6 +1955,28 @@ impl PaymentTransactor {
                 strands.push(chain);
             }
         }
+        // …and since stage 1, that default IS BUILDABLE: the same-currency
+        // cross-issuer default strand is pure DirectStepI hops
+        // (src → [issuers] → dst, no book anywhere), and rippled decides it
+        // by the strand's own checks — terNO_LINE refuses, a mutual line
+        // delivers. #106065267 98C5B11E: 1700 ZAR, src-issue → dst-issue,
+        // NO Paths; mainnet moves the one mutual line (2 mutations) where
+        // `terminal_is_ripple_step` used to refuse the shape wholesale.
+        // Gated to EXACTLY the shape the classic pipeline refuses, so
+        // nothing is modeled twice.
+        if !no_direct && Self::terminal_is_ripple_step(&[&spend_leg, &want_leg]) {
+            if let Some(seq) = crate::tx::direct_step::pure_account_sequence(
+                &tx.account, dest, &want_leg.issuer, &spend_leg.issuer, &[],
+            ) {
+                if let Some(hops) =
+                    crate::tx::direct_step::build_direct_strand(sandbox, &seq, &want_leg.cur)
+                {
+                    if !hops.is_empty() && !dstrands.contains(&hops) {
+                        dstrands.push(hops);
+                    }
+                }
+            }
+        }
         // The default path is subject to the same rule: sending one gateway's
         // IOU and delivering another's is `src -> sendMaxIssuer ->
         // deliverIssuer -> dst`, three DirectStepIs, and the middle one needs
