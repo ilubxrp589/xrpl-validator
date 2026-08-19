@@ -276,6 +276,12 @@ fn load_nft_pages_for_tx(state: &mut LedgerState, url: &str, txj: &Value, ledger
             }
             if let Some(i) = txj.get("Issuer").and_then(|v| v.as_str()) {
                 load_nft_pages(state, url, i, ledger_index);
+                // ...and the issuer's ACCOUNT ROOT, which carries the
+                // `NFTokenMinter` that authorises minting on their behalf.
+                // Pages are not enough, and the issuer is not the submitter, so
+                // the involved-account loader never fetches it. 26 sweep
+                // specimens turned on this one object.
+                load_account(state, url, i, ledger_index);
             }
         }
         Some("NFTokenCancelOffer") => {

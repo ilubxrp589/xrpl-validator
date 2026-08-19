@@ -196,6 +196,69 @@ impl Transactor for NFTokenMintTransactor {
         if !sandbox.exists(&acct_key) {
             return TxResult::NoAccount;
         }
+        // MINTING FOR SOMEONE ELSE NEEDS THEIR AUTHORISATION.
+        //     if (auto issuer = ctx.tx[~sfIssuer]) {
+        //         auto const sle = ctx.view.read(keylet::account(*issuer));
+        //         if (!sle) return tecNO_ISSUER;
+        //         if (auto const minter = (*sle)[~sfNFTokenMinter]; minter != ctx.tx[sfAccount])
+        //             return tecNO_PERMISSION;
+        //     }
+        //     (NFTokenMint.cpp preclaim)
+        // We checked only the SUBMITTER's account here and left the issuer to
+        // do_apply, which returned NoAccount — a **tef** — when it could not
+        // read the issuer's root. That is the wrong CLASS as well as the wrong
+        // code: tef claims no fee, so we produced ZERO mutations against
+        // mainnet's one.
+        //
+        // 26 specimens in the historical sweep share this exact shape, e.g.
+        // #106278193: rBFaAJtb mints with Issuer rfaafF5H, and rfaafF5H's
+        // `NFTokenMinter` is not rBFaAJtb — mainnet claims the fee with
+        // tecNO_PERMISSION.
+        //
+        // ⚠ Load-bearing hydration, as with NFTokenModify (`39df833`): the
+        // issuer's AccountRoot is not the submitter's, so nothing else fetches
+        // it. Absent it we must NOT condemn — an unreadable issuer yields
+        // tecNO_ISSUER, exactly as rippled does, rather than a silent pass.
+        if let Some(issuer) = tx.fields.get("Issuer").and_then(decode_account_id) {
+            if issuer != tx.account {
+                let Some(sle) = sandbox
+                    .read(&keylet::account_root_key(&issuer))
+                    .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+                else {
+                    return TxResult::NoIssuer;
+                };
+                if sle.get("NFTokenMinter").and_then(decode_account_id) != Some(tx.account) {
+                    return TxResult::NoPermission;
+                }
+            }
+        }
+        // A MINT CARRYING `Amount` ALSO CREATES A SELL OFFER, and inherits that
+        // transaction's validation: `NFTokenMint::preclaim` hands off to
+        //     nft::tokenOfferCreatePreclaim(...)
+        // which refuses a destination that has switched incoming NFT offers off:
+        //     if (sleDst->isFlag(lsfDisallowIncomingNFTokenOffer))
+        //         return tecNO_PERMISSION;      (NFTokenHelpers.cpp:885-892)
+        //
+        // This is the rule behind ALL 26 mint specimens in the sweep, e.g.
+        // #106278193: destination r4Wyoz7t carries Flags 0x04000000. The
+        // authorised-minter check above passes legitimately there — rfaafF5H's
+        // `NFTokenMinter` really is the submitter — so the refusal comes
+        // entirely from the offer half of the transaction.
+        //
+        // ⚠ A transaction that is TWO operations inherits BOTH sets of rules.
+        // Reading NFTokenMint's own preclaim in isolation shows nothing.
+        if tx.fields.get("Amount").is_some() {
+            if let Some(dest) = tx.fields.get("Destination").and_then(decode_account_id) {
+                if let Some(d) = sandbox
+                    .read(&keylet::account_root_key(&dest))
+                    .and_then(|v| serde_json::from_slice::<serde_json::Value>(&v).ok())
+                {
+                    if d["Flags"].as_u64().unwrap_or(0) & 0x0400_0000 != 0 {
+                        return TxResult::NoPermission; // lsfDisallowIncomingNFTokenOffer
+                    }
+                }
+            }
+        }
         TxResult::Success
     }
 

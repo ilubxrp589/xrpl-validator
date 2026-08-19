@@ -45,6 +45,7 @@ pub enum TxResult {
     Unfunded,
     /// No permission for this operation.
     NoPermission,
+    NoIssuer,
     /// Object not found.
     NoEntry,
     /// IoC/FoK offer crossed nothing (or FoK not fully filled).
@@ -140,6 +141,7 @@ impl TxResult {
             | TxResult::PathDry
             | TxResult::Unfunded
             | TxResult::NoPermission
+            | TxResult::NoIssuer
             | TxResult::NoEntry
             | TxResult::Killed
             | TxResult::InsufReserveOffer
@@ -183,6 +185,7 @@ impl TxResult {
             TxResult::PathDry => "tecPATH_DRY",
             TxResult::Unfunded => "tecUNFUNDED",
             TxResult::NoPermission => "tecNO_PERMISSION",
+            TxResult::NoIssuer => "tecNO_ISSUER",
             TxResult::NoEntry => "tecNO_ENTRY",
             TxResult::Killed => "tecKILLED",
             TxResult::InsufReserveOffer => "tecINSUF_RESERVE_OFFER",
