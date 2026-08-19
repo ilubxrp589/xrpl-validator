@@ -874,6 +874,37 @@ pub(crate) fn move_leg(sandbox: &mut Sandbox, from: &[u8; 20], to: &[u8; 20], le
 
 /// Fully remove a maker offer: object + owner-dir entry + book-dir entry +
 /// maker OwnerCount.
+
+/// During a flow, offer deletions are DEFERRED — rippled queues crossed
+/// offers as removable (OfferCreate.cpp:460) and stale ones in `ofrsToRm`
+/// (applied between iterations, StrandFlow.h:694), so within the walk the
+/// owner's OwnerCount, hence reserve, keeps its PRE-WALK value for every
+/// funding check. Our sandbox deletes inline, freeing one owner-reserve
+/// unit per deletion; this pins the reserve to the OwnerCount at the
+/// maker's FIRST funding peek instead.
+/// #106093264 60F15308: after the first full fill, rippled prices the next
+/// offer's funding at OwnerCount 23 (2060885); our inline delete said 22
+/// (2260885) — and each subsequent reap re-inflated the pot, so the walk
+/// milked six extra 200000-clips mainnet never took.
+fn walk_available(
+    sandbox: &Sandbox,
+    maker: &[u8; 20],
+    pays_leg: &Leg,
+    oc0: Option<&mut std::collections::HashMap<[u8; 20], u64>>,
+) -> Me {
+    let Some(oc0) = oc0 else { return available(sandbox, maker, pays_leg) };
+    if !pays_leg.xrp {
+        return available(sandbox, maker, pays_leg);
+    }
+    let key = keylet::account_root_key(maker);
+    let Some(a) = json_at(sandbox, &key) else { return (0, 0) };
+    let bal: u128 = a["Balance"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let cur = a["OwnerCount"].as_u64().unwrap_or(0);
+    let oc = *oc0.entry(*maker).or_insert(cur);
+    let reserve = XRP_RESERVE_BASE + XRP_RESERVE_INC * oc as u128;
+    (bal.saturating_sub(reserve), 0)
+}
+
 pub(crate) fn delete_maker_offer(
     sandbox: &mut Sandbox,
     okey: &xrpl_core::types::Hash256,
@@ -1545,6 +1576,7 @@ fn reap_if_dead(
     maker: &[u8; 20],
     pays_leg: &Leg,
     gets_leg: &Leg,
+    oc0: Option<&mut std::collections::HashMap<[u8; 20], u64>>,
     stale: &mut Vec<Hash256>,
 ) -> bool {
     // `hasExpired`: the BASE ledger's close time is the test (View.cpp:48, and
@@ -1565,6 +1597,16 @@ fn reap_if_dead(
         stale.push(*okey);
         return true;
     }
+    if std::env::var("DX_RM").is_ok() {
+        eprintln!(
+            "DX_RM peek maker={} gives0={m_gives0:?} avail={:?} acct={}",
+            hex::encode(maker),
+            available(sandbox, maker, pays_leg),
+            json_at(sandbox, &keylet::account_root_key(maker))
+                .map(|a| format!("bal={:?} oc={:?}", a.get("Balance"), a.get("OwnerCount")))
+                .unwrap_or_default(),
+        );
+    }
     let funding_known = if pays_leg.xrp {
         json_at(sandbox, &keylet::account_root_key(maker)).is_some()
     } else {
@@ -1574,7 +1616,7 @@ fn reap_if_dead(
             // sells holds zero of it, and absence is the answer.
             || json_at(sandbox, &keylet::account_root_key(maker)).is_some()
     };
-    if funding_known && me_is_zero(available(sandbox, maker, pays_leg)) {
+    if funding_known && me_is_zero(walk_available(sandbox, maker, pays_leg, oc0)) {
         delete_maker_offer(sandbox, okey, offer, maker);
         stale.push(*okey);
         return true;
@@ -1592,6 +1634,7 @@ fn reap_to_live_head(
     dk: &Hash256,
     pays_leg: &Leg,
     gets_leg: &Leg,
+    mut oc0: Option<&mut std::collections::HashMap<[u8; 20], u64>>,
     stale: &mut Vec<Hash256>,
 ) -> bool {
     let mut page_key_h = *dk;
@@ -1617,7 +1660,7 @@ fn reap_to_live_head(
             }
             let Some(maker) = offer.get("Account").and_then(|v| v.as_str()).and_then(decode20)
             else { continue };
-            if !reap_if_dead(sandbox, &okey, &offer, &maker, pays_leg, gets_leg, stale) {
+            if !reap_if_dead(sandbox, &okey, &offer, &maker, pays_leg, gets_leg, oc0.as_deref_mut(), stale) {
                 return true;
             }
         }
@@ -3172,6 +3215,11 @@ pub(crate) fn cross_engine_to(
     // stepped past the self-offer applied its removal — the tail then really
     // is unanchored).
     let mut self_anchor_q: Option<u64> = None;
+    // Reserve pinning: every funding check inside the walk prices a maker's
+    // reserve at the OwnerCount of its FIRST peek — rippled's deletions are
+    // deferred past the walk and never free reserve units mid-flow
+    // (walk_available).
+    let mut oc0: std::collections::HashMap<[u8; 20], u64> = Default::default();
     // TRUE once any level activated the strand (tip or pool within the
     // limit) — the moment rippled would have BUILT the offer stream.
     let mut stream_ran = false;
@@ -3179,7 +3227,7 @@ pub(crate) fn cross_engine_to(
         let (level_pays_in, level_gets_in) = (rem_pays, rem_gets);
         let q = u64::from_be_bytes(dk.0[24..32].try_into().unwrap_or_default());
         if trailing {
-            if reap_to_live_head(sandbox, &dk, pays_leg, gets_leg, stale) {
+            if reap_to_live_head(sandbox, &dk, pays_leg, gets_leg, Some(&mut oc0), stale) {
                 break 'dirs;
             }
             continue;
@@ -3224,7 +3272,7 @@ pub(crate) fn cross_engine_to(
                 crate::tx::amm_swap::spot_upper_bound(sandbox, a, pays_leg, gets_leg) <= threshold
             });
         stream_ran = stream_ran || strand_active;
-        if strand_active && !reap_to_live_head(sandbox, &dk, pays_leg, gets_leg, stale) {
+        if strand_active && !reap_to_live_head(sandbox, &dk, pays_leg, gets_leg, Some(&mut oc0), stale) {
             continue;
         }
         // AMM turn: consume pool liquidity while its spot quality strictly
@@ -3319,7 +3367,7 @@ pub(crate) fn cross_engine_to(
             // built reaps nothing — #105795013 rests in 4 nodes and leaves
             // the expired E39542EC alone.
             if stream_ran {
-                if reap_to_live_head(sandbox, &dk, pays_leg, gets_leg, stale) {
+                if reap_to_live_head(sandbox, &dk, pays_leg, gets_leg, Some(&mut oc0), stale) {
                     break 'dirs;
                 }
                 continue;
@@ -3359,7 +3407,7 @@ pub(crate) fn cross_engine_to(
                 let Some(maker) = offer.get("Account").and_then(|v| v.as_str()).and_then(decode20)
                 else { continue };
                 if trailing {
-                    if reap_if_dead(sandbox, &okey, &offer, &maker, pays_leg, gets_leg, stale) {
+                    if reap_if_dead(sandbox, &okey, &offer, &maker, pays_leg, gets_leg, Some(&mut oc0), stale) {
                         continue;
                     }
                     break 'dirs;
@@ -3429,7 +3477,7 @@ pub(crate) fn cross_engine_to(
                         }
                     }
                 }
-                let funded = available(sandbox, &maker, pays_leg);
+                let funded = walk_available(sandbox, &maker, pays_leg, Some(&mut oc0));
                 if std::env::var("DX_WALK").is_ok() {
                     eprintln!(
                         "DX_WALK maker={} okey={} gives0={m_gives0:?} wants0={m_wants0:?} funded={funded:?} rem_pays={rem_pays:?} rem_gets={rem_gets:?}",
