@@ -1068,6 +1068,61 @@ fn st_multiply(a: Me, b: Me, xrp: bool) -> Me {
 /// algorithm as `keylet::offer_quality`, without the JSON round-trip. Both
 /// now share one implementation, so the book level an offer is PLACED on and
 /// the level it is read back from can never disagree.
+
+/// Offer crossing judges a pass at its quality COMPOSED with the OUT
+/// issuer's transfer rate: `BookOfferCrossingStep::getQualityFunc` builds
+/// the CLOB quality function with `WaiveTransferFee::No`, so "Path
+/// rejected by limitQuality" fires on filed × trOut while
+/// `qualityUpperBound` (admission) deliberately waives the fee. Same rule,
+/// in the walk's encoding: judge the RAW realised quality against the
+/// threshold tightened by the rate. AMM fills waive (OfferType::Amm at
+/// BookStep.cpp:580), and so does a bridge leg-B offer owned by the taker
+/// (getOfrOutRate's prev-is-book exemption, :497-508). rate(out, strandDst)
+/// is parity when the taker IS the issuer.
+///
+/// #106067994 C966717C pins it: a tfPassive RLUSD→BTC.Bitstamp offer whose
+/// bridged strand BOUNDS at 63986.14 (admitted against limit 64036.19) and
+/// then flows an iteration judged at 63986 × 1.002 ≈ 64108 — rejected,
+/// "Total flow: in: 0 out: 0", the offer rests whole. We accepted the same
+/// fills judged raw: 39 mutations against mainnet's 8. The instrumented
+/// oracle showed NO offer ever executes — the rejection is at sizing time,
+/// which per-fill judging before any mutation reproduces.
+pub(crate) fn crossing_judge_threshold(
+    sandbox: &Sandbox,
+    pays_leg: &Leg,
+    gets_leg: &Leg,
+    taker: &[u8; 20],
+    threshold: u64,
+) -> u64 {
+    if threshold == 0 || threshold == u64::MAX {
+        return threshold;
+    }
+    let mut t = rate_me(threshold);
+    let mut changed = false;
+    // trOut — the OUT (TakerPays) issuer's rate; parity when the taker IS
+    // that issuer.
+    if !pays_leg.xrp && taker != &pays_leg.issuer {
+        if let Some(r) = transfer_rate(sandbox, pays_leg) {
+            t = me_muldiv(t, (1_000_000_000, 0), (r as u128, 0), false);
+            changed = true;
+        }
+    }
+    // trIn does NOT tighten. rippled charges the IN issuer's rate on the
+    // taker's gross spend AND looses the crossing's limitQuality by the
+    // same rate — the two cancel in the judge, so composing it here
+    // over-rejects. The gate proved it: the IoC canary #105887283
+    // 4A13D048 (SGB 1.003 on the gets side) went 8v17 the moment the
+    // gets-side factor landed — a pass mainnet accepts, rejected by a fee
+    // that was already in both sides of rippled's comparison. The
+    // remaining gets-side family (#106067286 169BB0B7 et al) rests on
+    // realised-sizing margins of 1e-7..1e-3, not on this fee.
+    let _ = gets_leg;
+    if !changed {
+        return threshold;
+    }
+    rate_of_me(t, (1, 0)).unwrap_or(threshold)
+}
+
 fn rate_of_me(pays: Me, gets: Me) -> Option<u64> {
     keylet::rate_encode(pays.0, pays.1, gets.0, gets.1)
 }
@@ -1707,6 +1762,9 @@ fn cross_bridged(
     sandbox: &mut Sandbox,
     stale: &mut Vec<Hash256>,
 ) -> Option<(Me, Me, u32)> {
+    // Fee-composed judge threshold for CLOB leg-B fills (AMM and
+    // taker-owned leg-B offers waive) — crossing_judge_threshold.
+    let thr_judge = crossing_judge_threshold(sandbox, pays_leg, gets_leg, taker, threshold);
     let xrp_leg = Leg { xrp: true, cur: [0u8; 20], issuer: [0u8; 20] };
     let zero = [0u8; 20];
     // Leg A's input issuer charges its TransferRate because the taker is
@@ -2423,6 +2481,7 @@ thr={t:?} admits_trunc={} admits_up={}",
             amm_used = false;
             // (in, out) of this candidate's fill, in the same orientation as
             // `est_direct`/`est_bridge`: gets-side in, pays-side out.
+            let mut fee_judged = false;
             let mut fill: Option<(Me, Me)> = None;
             'attempt: {
             if !want_direct {
@@ -2789,6 +2848,9 @@ thr={t:?} admits_trunc={} admits_up={}",
                             eprintln!("DX_FILL legB book okey={} maker={} in={xrp:?} out={pays_out:?} gives0={b_gives0:?} wants0={b_wants0:?}",
                                 hex::encode(bkey.0), hex::encode(bmaker));
                         }
+                        if bmaker != taker {
+                            fee_judged = true;
+                        }
                         settle_fill(sandbox, bkey, boffer, bmaker, taker, beneficiary,
                                     pays_leg, &xrp_leg, pays_out, xrp, xrp, *b_gives0, *b_wants0);
                     }
@@ -2819,12 +2881,13 @@ thr={t:?} admits_trunc={} admits_up={}",
             // due to the round off" (StrandFlow.h:714-718). The tolerance is
             // GATED on `adjustedRemOut`: an unadjusted pass is judged exactly,
             // which is what keeps #106137477 resting on its 1.3e-5 miss.
+            let jthr = if fee_judged { thr_judge } else { threshold };
             let accepted = match fill {
                 None => false,
                 Some((gin, pout)) => {
-                    threshold == u64::MAX
+                    jthr == u64::MAX
                         || rate_of_me(gin, pout).is_some_and(|q| {
-                            q <= threshold
+                            q <= jthr
                                 || (adjusted && {
                                     // `withinRelativeDistance(q, limitQuality, 1e-7)`
                                     // (AMMHelpers.h:112-121):
@@ -2834,7 +2897,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                                     // worse one, which here is the realised `q`. The
                                     // denominator is therefore the larger rate, not the
                                     // threshold, and the comparison is STRICTLY less.
-                                    let (a, b) = (rate_me(q), rate_me(threshold));
+                                    let (a, b) = (rate_me(q), rate_me(jthr));
                                     me_cmp(
                                         me_muldiv(me_sub(a, b), (10_000_000, 0), a, false),
                                         (1, 0),
@@ -3008,6 +3071,13 @@ pub(crate) fn cross_engine_to(
     // where mainnet keeps an early fill and drops a later one is what would
     // justify carrying per-iteration state through the walk.
     let cross_snap = offer_crossing.then(|| sandbox.snapshot());
+    // The fee-composed judge threshold for CLOB fills of a crossing (see
+    // crossing_judge_threshold). Payments and AMM turns keep the raw one.
+    let thr_judge = if offer_crossing {
+        crossing_judge_threshold(sandbox, pays_leg, gets_leg, taker, threshold)
+    } else {
+        threshold
+    };
     let (entry_pays, entry_gets) = (rem_pays, rem_gets);
     if threshold == 0 {
         return (rem_pays, rem_gets, crossed);
@@ -3589,14 +3659,14 @@ pub(crate) fn cross_engine_to(
                 // the check then stranded #105672435 B409D45C. With the input
                 // rounding following rev/fwd correctly that overcharge is gone,
                 // so the check can be what rippled's is: always, and exact.
-                if threshold != u64::MAX && !me_is_zero(give) && !me_is_zero(pay) {
+                if thr_judge != u64::MAX && !me_is_zero(give) && !me_is_zero(pay) {
                     if std::env::var("DX_JUDGE").is_ok() {
-                        eprintln!("DX_JUDGE give={give:?} pay={pay:?} ach={:?} thr={threshold} reject={}",
+                        eprintln!("DX_JUDGE give={give:?} pay={pay:?} ach={:?} thr={thr_judge} reject={}",
                             rate_of_me(pay, give),
-                            rate_of_me(pay, give).is_some_and(|a| a > threshold));
+                            rate_of_me(pay, give).is_some_and(|a| a > thr_judge));
                     }
                     if let Some(ach) = rate_of_me(pay, give) {
-                        if ach > threshold {
+                        if ach > thr_judge {
                             // A rejected pass ends the crossing outright —
                             // rippled logs "All strands dry" and its Total flow
                             // is whatever the ACCEPTED passes delivered. Falling
