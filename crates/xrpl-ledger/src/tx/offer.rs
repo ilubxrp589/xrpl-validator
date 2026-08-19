@@ -133,10 +133,11 @@ pub(crate) const XRP_RESERVE_INC: u128 = 200_000;
 
 pub(crate) type Me = (u128, i32);
 
-pub(crate) struct Leg {
-    pub(crate) xrp: bool,
-    pub(crate) cur: [u8; 20],
-    pub(crate) issuer: [u8; 20],
+#[derive(Clone, Debug, PartialEq)]
+pub struct Leg {
+    pub xrp: bool,
+    pub cur: [u8; 20],
+    pub issuer: [u8; 20],
 }
 
 pub(crate) fn leg_of(v: &serde_json::Value) -> Option<Leg> {

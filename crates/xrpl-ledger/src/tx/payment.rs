@@ -287,6 +287,74 @@ impl PaymentTransactor {
         Some(acc)
     }
 
+
+    /// Reverse-size ONE book hop: the input `consumed` for a target `want`
+    /// out, via the grant ladder + refine — extracted verbatim from
+    /// `reverse_requirements` so the mixed-strand walker sizes its book
+    /// segments with the SAME calibrated instrument. Zero = unmeasurable.
+    #[allow(clippy::too_many_arguments)]
+    fn size_book_hop(
+        tx: &TxFields,
+        in_leg: &crate::tx::offer::Leg,
+        out_leg: &crate::tx::offer::Leg,
+        want: crate::tx::offer::Me,
+        threshold: u64,
+        single_pass: bool,
+        amm_fib: Option<&crate::tx::offer::AmmFib>,
+        sandbox: &mut Sandbox,
+    ) -> crate::tx::offer::Me {
+        use crate::tx::offer as ox;
+            let mut consumed = (0u128, 0i32);
+            for grant in [(1u128, 6i32), (1, 12), (1, 18)] {
+                let (c, granted, rw) = Self::measure_hop(
+                    tx, in_leg, out_leg, want, grant, threshold, single_pass, amm_fib, sandbox,
+                );
+                consumed = c;
+                // Stop as soon as the GRANT was not the binding constraint —
+                // either the full requirement came out, or the trial left some
+                // of what it was given unspent, which means liquidity bound it
+                // and `consumed` is the real answer.
+                //
+                // Escalating on `rw != 0` alone is wrong once the pool is
+                // sized by fib slices: one slice can never answer the whole
+                // requirement, so every grant "fails", the loop runs to 1e18,
+                // and differencing a 1e18 balance at 16 significant digits
+                // destroys the measurement. #105912291 2AE3693EF556 read back
+                // a want_cap of 9.99e75 that way and fell through to the
+                // unbounded cap, so hop 0 bought the whole book level (978268
+                // drops) to feed a hop that only needed 15508.
+                if ox::me_is_zero(rw) || ox::me_cmp(consumed, granted).is_lt() {
+                    break;
+                }
+            }
+            // The ladder's smallest rung is 1e6, which is many orders above a
+            // small requirement, and a balance carries only 16 SIGNIFICANT
+            // digits — so `consumed` comes back QUANTISED. #106148286
+            // 4EFC975484E1, a 4-leg mXRP->BitX->BTC->CORE chain of pools: the
+            // BTC hop measured (352, -9) = 3.52e-7 where the true figure is
+            // ~3.5228e-7. THREE significant digits. The hop before it then
+            // bought ~0.1% too little BitX and the chain delivered
+            // 2.299039039859 CORE against a DeliverMin of 2.300190679602067 —
+            // tecPATH_PARTIAL where mainnet does the whole 2.302493172774841 in
+            // ONE flow iteration.
+            //
+            // So re-measure once against a grant sized to the estimate, which
+            // puts the difference back inside the mantissa. Keep the refined
+            // figure only if that grant was NOT the binding constraint;
+            // otherwise the estimate was low and the ladder's answer stands.
+            // 8x is headroom for a quantised estimate that rounded DOWN.
+            if !ox::me_is_zero(consumed) {
+                let grant = ox::me_muldiv(consumed, (8, 0), (1, 0), true);
+                let (refined, granted, _) = Self::measure_hop(
+                    tx, in_leg, out_leg, want, grant, threshold, single_pass, amm_fib, sandbox,
+                );
+                if !ox::me_is_zero(refined) && ox::me_cmp(refined, granted).is_lt() {
+                    consumed = refined;
+                }
+            }
+        consumed
+    }
+
     /// One reverse-pass trial: fund `in_leg` with `grant`, ask the hop for
     /// `want`, and report `(consumed, granted, remaining_want)`. Always leaves
     /// the sandbox exactly as it found it.
@@ -429,54 +497,8 @@ impl PaymentTransactor {
             let in_rate = (!in_leg.xrp && tx.account != in_leg.issuer)
                 .then(|| Self::transfer_rate(sandbox, in_leg))
                 .flatten();
-            let mut consumed = (0u128, 0i32);
-            for grant in [(1u128, 6i32), (1, 12), (1, 18)] {
-                let (c, granted, rw) = Self::measure_hop(
-                    tx, in_leg, out_leg, need[i], grant, threshold, single_pass, amm_fib, sandbox,
-                );
-                consumed = c;
-                // Stop as soon as the GRANT was not the binding constraint —
-                // either the full requirement came out, or the trial left some
-                // of what it was given unspent, which means liquidity bound it
-                // and `consumed` is the real answer.
-                //
-                // Escalating on `rw != 0` alone is wrong once the pool is
-                // sized by fib slices: one slice can never answer the whole
-                // requirement, so every grant "fails", the loop runs to 1e18,
-                // and differencing a 1e18 balance at 16 significant digits
-                // destroys the measurement. #105912291 2AE3693EF556 read back
-                // a want_cap of 9.99e75 that way and fell through to the
-                // unbounded cap, so hop 0 bought the whole book level (978268
-                // drops) to feed a hop that only needed 15508.
-                if ox::me_is_zero(rw) || ox::me_cmp(consumed, granted).is_lt() {
-                    break;
-                }
-            }
-            // The ladder's smallest rung is 1e6, which is many orders above a
-            // small requirement, and a balance carries only 16 SIGNIFICANT
-            // digits — so `consumed` comes back QUANTISED. #106148286
-            // 4EFC975484E1, a 4-leg mXRP->BitX->BTC->CORE chain of pools: the
-            // BTC hop measured (352, -9) = 3.52e-7 where the true figure is
-            // ~3.5228e-7. THREE significant digits. The hop before it then
-            // bought ~0.1% too little BitX and the chain delivered
-            // 2.299039039859 CORE against a DeliverMin of 2.300190679602067 —
-            // tecPATH_PARTIAL where mainnet does the whole 2.302493172774841 in
-            // ONE flow iteration.
-            //
-            // So re-measure once against a grant sized to the estimate, which
-            // puts the difference back inside the mantissa. Keep the refined
-            // figure only if that grant was NOT the binding constraint;
-            // otherwise the estimate was low and the ladder's answer stands.
-            // 8x is headroom for a quantised estimate that rounded DOWN.
-            if !ox::me_is_zero(consumed) {
-                let grant = ox::me_muldiv(consumed, (8, 0), (1, 0), true);
-                let (refined, granted, _) = Self::measure_hop(
-                    tx, in_leg, out_leg, need[i], grant, threshold, single_pass, amm_fib, sandbox,
-                );
-                if !ox::me_is_zero(refined) && ox::me_cmp(refined, granted).is_lt() {
-                    consumed = refined;
-                }
-            }
+            let consumed =
+                Self::size_book_hop(tx, in_leg, out_leg, need[i], threshold, single_pass, amm_fib, sandbox);
             // A requirement we could not MEASURE is not a requirement of zero.
             // The account may issue the hop currency itself (no line to
             // difference), or the trial may have been unable to fund it. Fall
@@ -509,6 +531,271 @@ impl PaymentTransactor {
             };
         }
         need
+    }
+
+
+    /// Quality upper bound of a MIXED strand, composing each book hop's
+    /// `hop_tip` (with the intermediate gateway's trIn, exactly as
+    /// `strand_upper_bound` does) and each run's srcQOut/dstQIn product.
+    fn mixed_upper_bound(
+        sandbox: &Sandbox,
+        taker: &[u8; 20],
+        segs: &[crate::tx::direct_step::SegLayout],
+        amm_iters: u32,
+    ) -> Option<crate::tx::offer::Me> {
+        use crate::tx::direct_step as ds;
+        use crate::tx::offer as ox;
+        const ONE: ox::Me = (1_000_000_000_000_000, -15);
+        let mut acc: ox::Me = ONE;
+        let mut first_book = true;
+        for seg in segs {
+            match seg {
+                ds::SegLayout::Run(hops) => {
+                    acc = ox::me_muldiv(acc, ds::run_upper_bound(sandbox, hops), ONE, false);
+                }
+                ds::SegLayout::Book { from, to } => {
+                    let tip = ox::hop_tip(sandbox, taker, from, to, amm_iters)?;
+                    acc = ox::me_muldiv(acc, tip, ONE, false);
+                    if !first_book && !from.xrp && taker != &from.issuer {
+                        if let Some(r) = Self::transfer_rate(sandbox, from) {
+                            acc = ox::me_muldiv(acc, (r as u128, 0), (1_000_000_000, 0), false);
+                        }
+                    }
+                    first_book = false;
+                }
+            }
+        }
+        Some(acc)
+    }
+
+    /// One PASS over a MIXED strand — direct runs composed with book hops
+    /// (docs/DIRECTSTEP-DESIGN.md stage 2). Reverse sizing right-to-left
+    /// (books via `size_book_hop`, runs via `run_rev`), then a forward pass
+    /// that flows value left-to-right: book hops run `cross_engine_to` with
+    /// the value carried IN FLIGHT through the sender exactly as the classic
+    /// chains do — a run-fed book is FICTION-FUNDED first and every joint
+    /// line of the sender is snapshot-restored at the end, so only the run
+    /// mutations and the makers' remain. The metas pin that shape:
+    /// #106311829 9684A861 has NO sender line at rhub8; the book's output
+    /// enters the run at the GATEWAY.
+    ///
+    /// `rem_in` is GROSS when the strand HEAD is a run (fees live inside
+    /// the hops), the classic net-of-spend-rate value when it is a book.
+    /// `rem_out` is the NET target when the TAIL is a run, the classic
+    /// grossed target when it is a book.
+    #[allow(clippy::too_many_arguments)]
+    fn mixed_strand_pass(
+        tx: &TxFields,
+        dest: &[u8; 20],
+        segs: &[crate::tx::direct_step::SegLayout],
+        rem_in: crate::tx::offer::Me,
+        rem_out: crate::tx::offer::Me,
+        single_pass: bool,
+        mut amm_fib: Option<&mut crate::tx::offer::AmmFib>,
+        sandbox: &mut Sandbox,
+    ) -> (crate::tx::offer::Me, crate::tx::offer::Me) {
+        use crate::tx::direct_step as ds;
+        use crate::tx::offer as ox;
+        let n = segs.len();
+        if n == 0 || ox::me_is_zero(rem_in) || ox::me_is_zero(rem_out) {
+            return ((0, 0), (0, 0));
+        }
+        // Multi-hop: the payment-wide limitQuality is judged by the caller
+        // on the pass end-to-end; hops run ungated (`hop_thr` — see
+        // strand_pass).
+        let thr = u64::MAX;
+        // ---- the sender's joint lines. Book-book joints keep the classic
+        // in-flight discipline (captured now, restored at the END). A line
+        // ADJACENT TO A RUN is restored IMMEDIATELY after the book hop that
+        // used it, and never at the end — on a circular payment the tail
+        // run's REAL delivery and the fiction ride the SAME line object,
+        // and an end-restore erased the delivery with the fiction
+        // (#106374244's missing destination-line mutation, 8v9).
+        type Snap = (xrpl_core::types::Hash256, Option<Vec<u8>>);
+        let capture_leg = |sandbox: &mut Sandbox, leg: &ox::Leg| -> Vec<Snap> {
+            let mut group: Vec<Snap> = Vec::new();
+            if leg.xrp || tx.account == leg.issuer {
+                return group;
+            }
+            let lk = keylet::ripple_state_key(&tx.account, &leg.issuer, &leg.cur);
+            let line_pre = sandbox.read(&lk);
+            let absent = line_pre.is_none();
+            group.push((lk, line_pre));
+            if absent {
+                for owner in [&tx.account, &leg.issuer] {
+                    let root = keylet::owner_dir_key(owner);
+                    let pre = sandbox.read(&root);
+                    if let Some(bytes) = &pre {
+                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) {
+                            let last = v
+                                .get("IndexPrevious")
+                                .and_then(|pv| {
+                                    pv.as_u64().or_else(|| {
+                                        pv.as_str().and_then(|x| u64::from_str_radix(x, 16).ok())
+                                    })
+                                })
+                                .unwrap_or(0);
+                            if last != 0 {
+                                let pk = keylet::dir_page_key(&root, last);
+                                group.push((pk, sandbox.read(&pk)));
+                            }
+                        }
+                    }
+                    group.push((root, pre));
+                }
+            }
+            group
+        };
+        let restore = |sandbox: &mut Sandbox, group: &[Snap]| {
+            for (k, pre) in group.iter().rev() {
+                match pre {
+                    Some(b) => sandbox.write(*k, b.clone()),
+                    None => sandbox.forget(k),
+                }
+            }
+        };
+        // End-restored: joints not adjacent to any run.
+        let mut inflight: Vec<Snap> = Vec::new();
+        for (i, seg) in segs.iter().enumerate() {
+            let ds::SegLayout::Book { from, to } = seg else { continue };
+            let fed_by_run = i > 0 && matches!(segs[i - 1], ds::SegLayout::Run(_));
+            let feeds_run = i + 1 < n && matches!(segs[i + 1], ds::SegLayout::Run(_));
+            if !fed_by_run {
+                let mut g = capture_leg(sandbox, from);
+                inflight.append(&mut g);
+            }
+            if !feeds_run && i + 1 < n {
+                let mut g = capture_leg(sandbox, to);
+                inflight.append(&mut g);
+            }
+        }
+        // ---- REVERSE: what each segment needs at its input for the tail
+        // to emit rem_out. Books via the calibrated ladder (reads only —
+        // measure_hop snapshots), runs via run_rev (reads only).
+        let mut out_target = vec![(0u128, 0i32); n];
+        let mut plans: Vec<Option<Vec<ox::Me>>> = vec![None; n];
+        let mut need = rem_out;
+        for i in (0..n).rev() {
+            out_target[i] = need;
+            match &segs[i] {
+                ds::SegLayout::Run(hops) => {
+                    let Some((nin, plan)) = ds::run_rev(sandbox, hops, need) else {
+                        return ((0, 0), (0, 0));
+                    };
+                    plans[i] = Some(plan);
+                    need = nin;
+                }
+                ds::SegLayout::Book { from, to } => {
+                    let consumed = Self::size_book_hop(
+                        tx, from, to, need, thr, single_pass, amm_fib.as_deref(), sandbox,
+                    );
+                    need = if ox::me_is_zero(consumed) {
+                        (9_990_000_000_000_000, 60) // unmeasurable: unbounded cap
+                    } else {
+                        consumed
+                    };
+                }
+            }
+        }
+        // ---- FORWARD from min(reverse ask, the remaining budget).
+        let mut carry = if ox::me_cmp(need, rem_in).is_gt() { rem_in } else { need };
+        let mut sin: ox::Me = (0, 0);
+        let mut sout: ox::Me = (0, 0);
+        for i in 0..n {
+            let last = i + 1 == n;
+            match &segs[i] {
+                ds::SegLayout::Run(hops) => {
+                    let plan = plans[i].as_ref().expect("rev planned every run");
+                    let (spent, out) = ds::run_fwd(sandbox, hops, carry, plan);
+                    if ox::me_is_zero(out) {
+                        restore(sandbox, &inflight);
+                        return ((0, 0), (0, 0));
+                    }
+                    if i == 0 {
+                        sin = spent;
+                    }
+                    carry = out;
+                    if last {
+                        sout = out; // run-tail delivers NET into dst's line
+                    }
+                }
+                ds::SegLayout::Book { from, to } => {
+                    let benef = if last { dest } else { &tx.account };
+                    let fed_by_run = i > 0 && matches!(segs[i - 1], ds::SegLayout::Run(_));
+                    // Intermediate input transfer rate: the walk debits the
+                    // fee per fill; sizing divides what can reach a maker
+                    // (see strand_pass's hop_rate block).
+                    let hop_rate = (i > 0 && !from.xrp && tx.account != from.issuer)
+                        .then(|| Self::transfer_rate(sandbox, from))
+                        .flatten();
+                    let avail = match hop_rate {
+                        Some(r) => ox::me_muldiv(carry, (1_000_000_000, 0), (r as u128, 0), false),
+                        None => carry,
+                    };
+                    let feeds_run =
+                        i + 1 < n && matches!(segs[i + 1], ds::SegLayout::Run(_));
+                    let from_group =
+                        fed_by_run.then(|| capture_leg(sandbox, from)).unwrap_or_default();
+                    let to_group =
+                        feeds_run.then(|| capture_leg(sandbox, to)).unwrap_or_default();
+                    if fed_by_run {
+                        // Fiction: the run's output "rides through the
+                        // sender" for the walk's funding checks; restored
+                        // the moment this hop is done.
+                        Self::fund_for_trial(sandbox, &tx.account, from, avail);
+                    }
+                    let before = (!last)
+                        .then(|| Self::leg_signed_balance(sandbox, &tx.account, to))
+                        .flatten();
+                    let (rw, rs, _c) = ox::cross_engine_to(
+                        &tx.account, benef, out_target[i], avail, to, from, thr, thr, false,
+                        false, single_pass, amm_fib.as_deref_mut(), None, sandbox,
+                        &mut Vec::new(),
+                    );
+                    if i == 0 {
+                        sin = ox::me_sub(avail, rs);
+                    }
+                    let produced = ox::me_sub(out_target[i], rw);
+                    if ox::me_is_zero(produced) {
+                        restore(sandbox, &from_group);
+                        restore(sandbox, &to_group);
+                        restore(sandbox, &inflight);
+                        return ((0, 0), (0, 0));
+                    }
+                    if last {
+                        sout = produced;
+                    } else {
+                        // The carry to the next segment: the balance delta
+                        // where measurable, the full-precision walk figure
+                        // where they agree (strand_pass's calibration).
+                        carry = match (
+                            before,
+                            Self::leg_signed_balance(sandbox, &tx.account, to),
+                        ) {
+                            (Some((bneg, b)), Some((aneg, a))) => {
+                                let (dneg, d) = ox::signed_add(aneg, a, !bneg, b);
+                                let d = if dneg { (0, 0) } else { d };
+                                let close = {
+                                    let (gneg, gap) =
+                                        ox::signed_add(false, produced, true, d);
+                                    let _ = gneg;
+                                    ox::me_cmp(gap, ox::me_muldiv(produced, (1, 9), (1, 0), true))
+                                        .is_le()
+                                };
+                                if close { produced } else { d }
+                            }
+                            _ => produced,
+                        };
+                    }
+                    // Run-adjacent joints come clean NOW, before the next
+                    // run writes the same lines for real.
+                    restore(sandbox, &from_group);
+                    restore(sandbox, &to_group);
+                }
+            }
+        }
+        restore(sandbox, &inflight);
+        (sin, sout)
     }
 
     /// Flow ONE pass of `chain` and report (spent on the first leg, delivered
@@ -1467,6 +1754,44 @@ impl PaymentTransactor {
                 }
             }
         }
+        // MIXED paths — direct runs composed with book hops (design stage
+        // 2). `mixed_layout` yields None for pure shapes, so there is no
+        // overlap with either the leg pipeline or the pure-direct strands;
+        // `check_mixed_strand` drops a strand exactly where rippled's
+        // construction checks drop the path.
+        let mut mstrands: Vec<Vec<crate::tx::direct_step::SegLayout>> = Vec::new();
+        for path in tx
+            .fields
+            .get("Paths")
+            .and_then(|p| p.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.as_array())
+        {
+            let Some(segs) = crate::tx::direct_step::mixed_layout(
+                &tx.account, dest, &spend_leg, &want_leg, path,
+            ) else {
+                continue;
+            };
+            let ok = crate::tx::direct_step::check_mixed_strand(sandbox, &segs);
+            if std::env::var("DX_PAY").is_ok() {
+                let shape: Vec<String> = segs
+                    .iter()
+                    .map(|g| match g {
+                        crate::tx::direct_step::SegLayout::Run(h) => format!("Run({})", h.len()),
+                        crate::tx::direct_step::SegLayout::Book { from, to } => format!(
+                            "Book({}>{})",
+                            if from.xrp { "XRP".into() } else { hex::encode(&from.cur[12..15]) },
+                            if to.xrp { "XRP".into() } else { hex::encode(&to.cur[12..15]) },
+                        ),
+                    })
+                    .collect();
+                eprintln!("DX_PAY mixed shape={shape:?} ok={ok}");
+            }
+            if ok && !mstrands.contains(&segs) {
+                mstrands.push(segs);
+            }
+        }
         // `path_legs` drops a path we cannot model — an account
         // element that ripples through a THIRD PARTY rather than re-anchoring on
         // the previous leg's issuer. With every named path dropped the fallback
@@ -1487,7 +1812,7 @@ impl PaymentTransactor {
         // against an offer created earlier in the SAME ledger, and returned
         // tesSUCCESS with 3 extra nodes — all belonging to a maker the path
         // never names.
-        if no_direct && named_paths > 0 && path_chains.is_empty() && dstrands.is_empty() {
+        if no_direct && named_paths > 0 && path_chains.is_empty() && dstrands.is_empty() && mstrands.is_empty() {
             sandbox.restore_snapshot(snap);
             return TxResult::PathDry;
         }
@@ -1641,8 +1966,8 @@ impl PaymentTransactor {
         // Every named path was unmodellable and the default is suppressed —
         // guarded above for tfNoRippleDirect, so this is the no-Paths shape.
         // A live DIRECT strand is a modeled path: nothing to fall back on.
-        if strands.is_empty() && !dstrands.is_empty() {
-            // flow runs on the direct strands alone
+        if strands.is_empty() && (!dstrands.is_empty() || !mstrands.is_empty()) {
+            // flow runs on the direct/mixed strands alone
         } else if strands.is_empty() {
             // Nothing left to fall back ON: either the flag forbids the default
             // path or the default path is itself the gateway ripple we just
@@ -1657,7 +1982,8 @@ impl PaymentTransactor {
         // One strand is the old behaviour exactly: walk the whole book in a
         // single call, no trial run, no second round that can find anything.
         let n_books = strands.len();
-        let total_strands = n_books + dstrands.len();
+        let n_direct = dstrands.len();
+        let total_strands = n_books + n_direct + mstrands.len();
         let multi = total_strands > 1;
 
         // The payment-wide limitQuality as an Me, for the strand judge below.
@@ -1740,8 +2066,12 @@ impl PaymentTransactor {
                     .filter_map(|i| {
                         if i < n_books {
                             Self::strand_upper_bound(sandbox, &tx.account, &strands[i], amm_fib.iters)
-                        } else {
+                        } else if i < n_books + n_direct {
                             crate::tx::direct_step::direct_upper_bound(sandbox, &dstrands[i - n_books])
+                        } else {
+                            Self::mixed_upper_bound(
+                                sandbox, &tx.account, &mstrands[i - n_books - n_direct], amm_fib.iters,
+                            )
                         }
                         .filter(|ub| thr_me.is_none_or(|t| ox::me_cmp(*ub, t).is_le()))
                         .map(|ub| (i, ub))
@@ -1758,7 +2088,7 @@ impl PaymentTransactor {
             // The candidates that CLEAR the bound are the active strands, which
             // is what `setMultiPath(activeStrands.size() > 1)` reads.
             multi_now = order.len() > 1;
-            let mut applied: Option<(usize, ox::Me, ox::Me, bool)> = None;
+            let mut applied: Option<(usize, ox::Me, ox::Me, bool, bool)> = None;
             for &i in &order {
                 let try_snap = sandbox.snapshot();
                 let mut try_fib = amm_fib.clone();
@@ -1779,23 +2109,35 @@ impl PaymentTransactor {
                 // re-rounds at 1e-10 each time, so THREE debits land on
                 // 808582.0813613431 and any two-way split lands on …432 —
                 // the count is the whole difference.
-                let (sin, sout, sin_gross) = if i < n_books {
+                let net_rem_out = match want_rate {
+                    Some(r) => ox::me_muldiv(rem_out, (1_000_000_000, 0), (r as u128, 0), false),
+                    None => rem_out,
+                };
+                let (sin, sout, in_gross, out_net) = if i < n_books {
                     let (a, b) = Self::strand_pass(
                         tx, dest, &strands[i], rem_in, rem_out, threshold, true,
                         multi_now.then(|| &mut try_fib), sandbox,
                     );
-                    (a, b, false)
-                } else {
+                    (a, b, false, false)
+                } else if i < n_books + n_direct {
                     // The direct strand's tail nets the destination — its
-                    // target is the NET remainder.
-                    let net_rem_out = match want_rate {
-                        Some(r) => ox::me_muldiv(rem_out, (1_000_000_000, 0), (r as u128, 0), false),
-                        None => rem_out,
-                    };
+                    // target is the NET remainder; its head spends GROSS.
                     let (a, b) = crate::tx::direct_step::direct_strand_pass(
                         sandbox, &dstrands[i - n_books], rem_in_gross, net_rem_out,
                     );
-                    (a, b, true)
+                    (a, b, true, true)
+                } else {
+                    use crate::tx::direct_step::SegLayout;
+                    let segs = &mstrands[i - n_books - n_direct];
+                    let head_run = matches!(segs.first(), Some(SegLayout::Run(_)));
+                    let tail_run = matches!(segs.last(), Some(SegLayout::Run(_)));
+                    let m_in = if head_run { rem_in_gross } else { rem_in };
+                    let m_out = if tail_run { net_rem_out } else { rem_out };
+                    let (a, b) = Self::mixed_strand_pass(
+                        tx, dest, segs, m_in, m_out, true,
+                        multi_now.then(|| &mut try_fib), sandbox,
+                    );
+                    (a, b, head_run, tail_run)
                 };
                 if std::env::var("DX_PAY").is_ok() {
                     eprintln!("DX_PAY   try round={_round} strand={i} sin={sin:?} sout={sout:?}");
@@ -1822,10 +2164,10 @@ impl PaymentTransactor {
                     }
                 }
                 amm_fib = try_fib;
-                applied = Some((i, sin, sout, sin_gross));
+                applied = Some((i, sin, sout, in_gross, out_net));
                 break;
             }
-            let Some((pick, sin, sout, sin_gross)) = applied else { break };
+            let Some((pick, sin, sout, in_gross, out_net)) = applied else { break };
             let _ = pick;
             if std::env::var("DX_PAY").is_ok() {
                 eprintln!("DX_PAY round={_round} strand={pick} sin={sin:?} sout={sout:?} rem_in={rem_in:?} rem_out={rem_out:?} multi={multi}");
@@ -1836,7 +2178,7 @@ impl PaymentTransactor {
             // net × rate, ceil — the sender-parts-with side always rounds
             // against the sender).
             let rate = spend_rate.map(|r| r as u128);
-            if sin_gross {
+            if in_gross {
                 rem_in_gross = ox::me_sub(rem_in_gross, sin);
                 let net = match rate {
                     Some(r) => ox::me_muldiv(sin, (1_000_000_000, 0), (r, 0), false),
@@ -1851,7 +2193,7 @@ impl PaymentTransactor {
                 };
                 rem_in_gross = ox::me_sub(rem_in_gross, gross);
             }
-            if sin_gross {
+            if out_net {
                 // sout is NET: the shared gross remainder falls by its
                 // gross equivalent, and the delivery lands in the net pot.
                 let gross_out = match want_rate {

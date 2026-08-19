@@ -362,50 +362,56 @@ fn mul_ratio(amt: ox::Me, num: u128, den: u128, round_up: bool) -> ox::Me {
     (low, e)
 }
 
-/// One PASS over a pure-direct strand: reverse plan right-to-left
-/// (DirectStep.cpp:503-568), forward application left-to-right (:617-700)
-/// capped by the reverse plan (`setCacheLimiting`), mutations per hop.
-/// Returns (spent at the head, delivered at the tail).
-pub(crate) fn direct_strand_pass(
-    sandbox: &mut Sandbox,
+/// Reverse plan for a run: what must enter hop 0 for the tail to emit
+/// `need_out`, and each hop's planned srcToDst (DirectStep.cpp:503-568).
+/// `None` when any hop is dry. Reads only.
+pub(crate) fn run_rev(
+    sandbox: &Sandbox,
     hops: &[DirectHop],
-    rem_in: ox::Me,
-    rem_out: ox::Me,
-) -> (ox::Me, ox::Me) {
+    need_out: ox::Me,
+) -> Option<(ox::Me, Vec<ox::Me>)> {
     let n = hops.len();
-    if n == 0 || ox::me_is_zero(rem_in) || ox::me_is_zero(rem_out) {
-        return ((0, 0), (0, 0));
+    if n == 0 || ox::me_is_zero(need_out) {
+        return None;
     }
-    // ---- reverse: how much must each hop carry for the tail to emit
-    // rem_out? All reads, no writes — rippled's rev-pass writes land on a
-    // sandbox the fwd pass rebuilds anyway, and within one strand no two
-    // hops share a line (the loop dedup guarantees it), so the plan is
-    // identical.
-    let mut rev_src_to_dst = vec![(0u128, 0i32); n];
-    let mut need = rem_out;
+    let mut plan = vec![(0u128, 0i32); n];
+    let mut need = need_out;
     for i in (0..n).rev() {
         let (src_q_out, dst_q_in) = hop_qualities(sandbox, hops, i, i + 1 == n);
         let max = max_src_to_dst(sandbox, &hops[i]);
         if ox::me_is_zero(max) {
-            return ((0, 0), (0, 0)); // dry — rippled: "DirectStepI::rev: dry"
+            return None; // dry — rippled: "DirectStepI::rev: dry"
         }
         let mut src_to_dst = mul_ratio(need, QUALITY_ONE, dst_q_in, true);
         if ox::me_cmp(src_to_dst, max).is_gt() {
             src_to_dst = max; // limiting node
         }
-        rev_src_to_dst[i] = src_to_dst;
+        plan[i] = src_to_dst;
         need = mul_ratio(src_to_dst, src_q_out, QUALITY_ONE, true);
     }
-    // ---- forward from min(reverse head requirement, what remains of the
-    // SendMax): flow() runs the fwd pass whenever maxIn caps the reverse
-    // answer (StrandFlow.h), and the fwd never exceeds the reverse plan.
-    let mut carry = if ox::me_cmp(need, rem_in).is_gt() { rem_in } else { need };
-    let spent = carry;
+    Some((need, plan))
+}
+
+/// Forward pass with writes: flow `in_amt` left-to-right, capped by the
+/// reverse `plan` and the live maxes (DirectStep.cpp:617-700 +
+/// setCacheLimiting). Returns (spent at the head, delivered at the tail).
+pub(crate) fn run_fwd(
+    sandbox: &mut Sandbox,
+    hops: &[DirectHop],
+    in_amt: ox::Me,
+    plan: &[ox::Me],
+) -> (ox::Me, ox::Me) {
+    let n = hops.len();
+    if n == 0 || ox::me_is_zero(in_amt) {
+        return ((0, 0), (0, 0));
+    }
+    let spent = in_amt;
+    let mut carry = in_amt;
     for (i, hop) in hops.iter().enumerate() {
         let (src_q_out, dst_q_in) = hop_qualities(sandbox, hops, i, i + 1 == n);
         let mut src_to_dst = mul_ratio(carry, QUALITY_ONE, src_q_out, false);
-        if ox::me_cmp(src_to_dst, rev_src_to_dst[i]).is_gt() {
-            src_to_dst = rev_src_to_dst[i];
+        if ox::me_cmp(src_to_dst, plan[i]).is_gt() {
+            src_to_dst = plan[i];
         }
         let max = max_src_to_dst(sandbox, hop);
         if ox::me_cmp(src_to_dst, max).is_gt() {
@@ -418,6 +424,24 @@ pub(crate) fn direct_strand_pass(
         carry = mul_ratio(src_to_dst, dst_q_in, QUALITY_ONE, false);
     }
     (spent, carry)
+}
+
+/// One PASS over a pure-direct strand: reverse plan, then forward from
+/// min(reverse ask, remaining SendMax), mutations per hop.
+pub(crate) fn direct_strand_pass(
+    sandbox: &mut Sandbox,
+    hops: &[DirectHop],
+    rem_in: ox::Me,
+    rem_out: ox::Me,
+) -> (ox::Me, ox::Me) {
+    if ox::me_is_zero(rem_in) || ox::me_is_zero(rem_out) {
+        return ((0, 0), (0, 0));
+    }
+    let Some((need, plan)) = run_rev(sandbox, hops, rem_out) else {
+        return ((0, 0), (0, 0));
+    };
+    let head = if ox::me_cmp(need, rem_in).is_gt() { rem_in } else { need };
+    run_fwd(sandbox, hops, head, &plan)
 }
 
 /// The strand's quality upper bound as an in-per-out rate (for the round
@@ -591,5 +615,310 @@ mod tests {
             direct_strand_pass(&mut sb2, &hops, (1672194676077876, -17), (1667193096787513, -17));
         assert_eq!(sin2, (1672194676077876, -17));
         assert_eq!(sout2, (1667193096787513, -17), "forward rounds DOWN through 1.003");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2 — mixed strands: direct runs composed with book hops
+// ---------------------------------------------------------------------------
+
+/// One segment of a mixed strand.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SegLayout {
+    Run(Vec<DirectHop>),
+    Book { from: ox::Leg, to: ox::Leg },
+}
+
+/// toStrand's normalization for a MIXED path — account elements become
+/// DirectHop runs, currency/issuer elements become book hops, `curAsset`
+/// re-anchoring exactly as PaySteps.cpp:380-505 does it. Check-free and
+/// sandbox-free: the PROBE calls this to learn what to hydrate, the engine
+/// wraps it with the construction checks — one normalizer, no drift.
+///
+/// The metas pinned the re-anchor question: #106311829 D2EB36BA's consumed
+/// offer TakerPays USD.rvYAfWj — the book AFTER an account run is keyed by
+/// the run's LAST account, and those accounts are real gateways.
+///
+/// Tail rule: a strand whose value ends in a RUN materializes the terminal
+/// deliver-issuer→destination hops (stage 1's shape, fees inside); one that
+/// ends in a BOOK stops there — the round loop's want_rate model owns that
+/// delivery, as it always has for book chains.
+pub fn mixed_layout(
+    src: &[u8; 20],
+    dst: &[u8; 20],
+    spend_leg: &ox::Leg,
+    want_leg: &ox::Leg,
+    els: &[serde_json::Value],
+) -> Option<Vec<SegLayout>> {
+    let mut segs: Vec<SegLayout> = Vec::new();
+    let mut run: Vec<DirectHop> = Vec::new();
+    let mut cur = spend_leg.clone();
+    if !cur.xrp {
+        cur.issuer = *src;
+    }
+    // pos = Some(account) when the value sits at an account, None when it
+    // is a book's output in flight.
+    let mut pos: Option<[u8; 20]> = Some(*src);
+
+    let first_el_acct = els
+        .first()
+        .filter(|e| e.get("type").and_then(|v| v.as_u64()).unwrap_or(0) == 0x01)
+        .and_then(|e| e.get("account"))
+        .and_then(|v| v.as_str())
+        .and_then(ox::decode20);
+    if !spend_leg.xrp
+        && spend_leg.issuer != *src
+        && first_el_acct.as_ref() != Some(&spend_leg.issuer)
+    {
+        run.push(DirectHop { src: *src, dst: spend_leg.issuer, cur: cur.cur });
+        cur.issuer = spend_leg.issuer;
+        pos = Some(spend_leg.issuer);
+    }
+
+    // Only a path whose OWN elements ripple through an account belongs to
+    // the mixed pipeline — implied head/tail hops (SendMax issuer, deliver
+    // issuer, destination) exist on EVERY strand and are what the classic
+    // model's spend_rate/want_rate bookkeeping already represents. Without
+    // this gate every IOU payment built a duplicate competing strand next
+    // to its classic chain: the dstep2 gate's 180 census hits, #105709221's
+    // false tecPATH_PARTIAL and #105795329's three extra offers were all
+    // one path flowing TWICE.
+    let mut real_run = false;
+    for el in els {
+        let t = el.get("type").and_then(|v| v.as_u64()).unwrap_or(0);
+        match t {
+            0x01 => {
+                let a = el.get("account").and_then(|v| v.as_str()).and_then(ox::decode20)?;
+                if cur.xrp {
+                    return None; // XRP cannot ripple through accounts
+                }
+                match pos {
+                    Some(p) => {
+                        if p != a {
+                            run.push(DirectHop { src: p, dst: a, cur: cur.cur });
+                            real_run = true;
+                        }
+                    }
+                    None => {
+                        // offer→account: the implied issuer→account hop,
+                        // unless the account IS the current issuer (a pure
+                        // re-anchor, PaySteps.cpp:458-486).
+                        if cur.issuer != a {
+                            run.push(DirectHop { src: cur.issuer, dst: a, cur: cur.cur });
+                            real_run = true;
+                        }
+                    }
+                }
+                cur.issuer = a;
+                pos = Some(a);
+            }
+            0x10 | 0x20 | 0x30 => {
+                let has_cur = t & 0x10 != 0;
+                let has_iss = t & 0x20 != 0;
+                let to = if has_cur {
+                    let c = el.get("currency").and_then(|v| v.as_str())?;
+                    if c == "XRP" {
+                        ox::Leg { xrp: true, cur: [0u8; 20], issuer: [0u8; 20] }
+                    } else {
+                        let mut c20 = [0u8; 20];
+                        if c.len() == 40 {
+                            c20.copy_from_slice(&hex::decode(c).ok()?);
+                        } else if c.len() == 3 {
+                            c20[12..15].copy_from_slice(c.as_bytes());
+                        } else {
+                            return None;
+                        }
+                        let iss = if has_iss {
+                            el.get("issuer").and_then(|v| v.as_str()).and_then(ox::decode20)?
+                        } else {
+                            cur.issuer
+                        };
+                        ox::Leg { xrp: false, cur: c20, issuer: iss }
+                    }
+                } else {
+                    // issuer-only element: same currency, new issuer.
+                    let iss = el.get("issuer").and_then(|v| v.as_str()).and_then(ox::decode20)?;
+                    ox::Leg { xrp: cur.xrp, cur: cur.cur, issuer: iss }
+                };
+                if !run.is_empty() {
+                    segs.push(SegLayout::Run(std::mem::take(&mut run)));
+                }
+                segs.push(SegLayout::Book { from: cur.clone(), to: to.clone() });
+                cur = to;
+                pos = None;
+            }
+            _ => return None, // MPT and malformed types
+        }
+    }
+
+    // Terminal book when the currency still differs from the delivery
+    // (PaySteps.cpp:291-302 — payments compare CURRENCY only).
+    if cur.xrp != want_leg.xrp || cur.cur != want_leg.cur {
+        if !run.is_empty() {
+            segs.push(SegLayout::Run(std::mem::take(&mut run)));
+        }
+        segs.push(SegLayout::Book { from: cur.clone(), to: want_leg.clone() });
+        cur = want_leg.clone();
+        pos = None;
+    }
+
+    // Run-tail: carry the value to the deliver issuer and the destination,
+    // fees inside (stage 1's shape). Book-tail: stop — the round loop's
+    // want_rate model delivers.
+    if let Some(mut p) = pos {
+        if cur.xrp {
+            return None;
+        }
+        if p != want_leg.issuer && *dst != want_leg.issuer {
+            run.push(DirectHop { src: p, dst: want_leg.issuer, cur: cur.cur });
+            p = want_leg.issuer;
+        }
+        if p != *dst {
+            run.push(DirectHop { src: p, dst: *dst, cur: cur.cur });
+        }
+    }
+    if !run.is_empty() {
+        segs.push(SegLayout::Run(run));
+    }
+
+    // A MIXED strand has at least one of each; pure shapes belong to the
+    // existing pipelines (all-book → leg chains, all-run → stage 1).
+    let books = segs.iter().filter(|s| matches!(s, SegLayout::Book { .. })).count();
+    (books > 0 && real_run).then_some(segs)
+}
+
+/// Engine-side validation of a mixed layout: every run hop passes the
+/// DirectIPaymentStep::check battery, including the NoRipple-after-book
+/// rule for the first hop of a post-book run (DirectStep.cpp:440-445), and
+/// the strand-wide loop dedup. `None` drops the strand — the same
+/// path-drop plumbing as everywhere else.
+pub(crate) fn check_mixed_strand(sandbox: &Sandbox, segs: &[SegLayout]) -> bool {
+    const LSF_REQUIRE_AUTH: u64 = 0x0004_0000;
+    const LOW_AUTH: u64 = 0x0004_0000;
+    const HIGH_AUTH: u64 = 0x0008_0000;
+    let mut seen_src: Vec<[u8; 20]> = Vec::new();
+    let mut seen_dst: Vec<[u8; 20]> = Vec::new();
+    let mut prev_was_book = false;
+    for seg in segs {
+        match seg {
+            SegLayout::Book { .. } => prev_was_book = true,
+            SegLayout::Run(hops) => {
+                for (i, hop) in hops.iter().enumerate() {
+                    if seen_src.contains(&hop.src) || seen_dst.contains(&hop.dst) {
+                        return false; // temBAD_PATH_LOOP
+                    }
+                    seen_src.push(hop.src);
+                    seen_dst.push(hop.dst);
+                    let lkey = keylet::ripple_state_key(&hop.src, &hop.dst, &hop.cur);
+                    let Some(line) = ox::json_at(sandbox, &lkey) else {
+                        if std::env::var("DX_PAY").is_ok() {
+                            eprintln!(
+                                "DX_PAY mixed drop: NO LINE {}~{}",
+                                hex::encode(&hop.src[..4]),
+                                hex::encode(&hop.dst[..4])
+                            );
+                        }
+                        return false; // terNO_LINE
+                    };
+                    // The step OUT of a book refuses when the source side of
+                    // its line carries NoRipple.
+                    if i == 0 && prev_was_book {
+                        let bit = if hop.src > hop.dst { 0x0020_0000 } else { 0x0010_0000 };
+                        if line["Flags"].as_u64().unwrap_or(0) & bit != 0 {
+                            if std::env::var("DX_PAY").is_ok() {
+                                eprintln!(
+                                    "DX_PAY mixed drop: NO RIPPLE after book {}",
+                                    hex::encode(&hop.src[..4])
+                                );
+                            }
+                            return false; // terNO_RIPPLE
+                        }
+                    }
+                    let src_requires_auth =
+                        ox::json_at(sandbox, &keylet::account_root_key(&hop.src))
+                            .map(|a| a["Flags"].as_u64().unwrap_or(0) & LSF_REQUIRE_AUTH != 0)
+                            .unwrap_or(false);
+                    if src_requires_auth {
+                        let auth_bit = if hop.src > hop.dst { HIGH_AUTH } else { LOW_AUTH };
+                        let authed = line["Flags"].as_u64().unwrap_or(0) & auth_bit != 0;
+                        let zero = ox::signed_value(&line["Balance"]).1 .0 == 0;
+                        if !authed && zero {
+                            return false; // terNO_AUTH
+                        }
+                    }
+                    if !src_redeems(sandbox, hop) && ox::me_is_zero(max_src_to_dst(sandbox, hop)) {
+                        if std::env::var("DX_PAY").is_ok() {
+                            eprintln!(
+                                "DX_PAY mixed drop: DRY {}~{}",
+                                hex::encode(&hop.src[..4]),
+                                hex::encode(&hop.dst[..4])
+                            );
+                        }
+                        return false; // the maxPaymentFlow == 0 precheck
+                    }
+                }
+                prev_was_book = false;
+            }
+        }
+    }
+    true
+}
+
+/// The quality bound contribution of one run (in-per-out, ≥ 1 with default
+/// lines): the product of every hop's srcQOut over dstQIn.
+pub(crate) fn run_upper_bound(sandbox: &Sandbox, hops: &[DirectHop]) -> ox::Me {
+    let n = hops.len();
+    let mut ub: ox::Me = (1_000_000_000_000_000, -15);
+    for i in 0..n {
+        let (src_q_out, dst_q_in) = hop_qualities(sandbox, hops, i, i + 1 == n);
+        ub = ox::me_muldiv(ub, (src_q_out, 0), (dst_q_in, 0), true);
+    }
+    ub
+}
+
+/// Base58check r-address for a 20-byte account id — the probe's RPC params
+/// (`ledger_entry amm`, `book_offers`) take addresses, and mixed-strand
+/// book legs carry re-anchored issuers that exist nowhere in the tx JSON
+/// as strings.
+pub fn encode_address(id: &[u8; 20]) -> String {
+    use sha2::{Digest, Sha256};
+    const ALPHABET: &[u8] = b"rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz";
+    let mut payload = Vec::with_capacity(25);
+    payload.push(0u8); // account-id type prefix
+    payload.extend_from_slice(id);
+    let check = Sha256::digest(Sha256::digest(&payload));
+    payload.extend_from_slice(&check[..4]);
+    // big-number base58
+    let mut digits: Vec<u8> = vec![0];
+    for byte in &payload {
+        let mut carry = *byte as u32;
+        for d in digits.iter_mut() {
+            carry += (*d as u32) << 8;
+            *d = (carry % 58) as u8;
+            carry /= 58;
+        }
+        while carry > 0 {
+            digits.push((carry % 58) as u8);
+            carry /= 58;
+        }
+    }
+    for byte in &payload {
+        if *byte == 0 {
+            digits.push(0);
+        } else {
+            break;
+        }
+    }
+    digits.iter().rev().map(|d| ALPHABET[*d as usize] as char).collect()
+}
+
+#[cfg(test)]
+mod addr_tests {
+    #[test]
+    fn encode_matches_known_address() {
+        // rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B (Bitstamp) — a fixed vector.
+        let id = hex::decode("0A20B3C85F482532A9578DBB3950B85CA06594D1").unwrap();
+        let id: [u8; 20] = id.as_slice().try_into().unwrap();
+        assert_eq!(super::encode_address(&id), "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B");
     }
 }

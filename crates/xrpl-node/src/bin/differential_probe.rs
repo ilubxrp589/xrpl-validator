@@ -1055,6 +1055,74 @@ fn load_payment_books(
                     }
                 }
             }
+            // MIXED paths (runs + books): hydrate every run hop's mutual
+            // line and both accounts, and push each book hop's spec pair
+            // into `chains` so the book/AMM loader below fetches the
+            // RE-ANCHORED books — the ones the runs walk the value into
+            // (#106311829: the real crossed book is USD.rvYAfWj, an issuer
+            // that appears nowhere in the tx as a currency element's
+            // issuer). Same normalizer as the engine.
+            {
+                use xrpl_ledger::tx::direct_step as ds;
+                let leg_of_spec = |v: &Value| -> Option<xrpl_ledger::tx::offer::Leg> {
+                    match v {
+                        Value::String(_) => Some(xrpl_ledger::tx::offer::Leg {
+                            xrp: true, cur: [0u8; 20], issuer: [0u8; 20],
+                        }),
+                        Value::Object(o) => {
+                            let c = o.get("currency")?.as_str()?;
+                            let iss = o.get("issuer")?.as_str().and_then(decode_address)?;
+                            Some(xrpl_ledger::tx::offer::Leg {
+                                xrp: false, cur: currency_code(c), issuer: iss,
+                            })
+                        }
+                        _ => None,
+                    }
+                };
+                let spec_of_leg = |l: &xrpl_ledger::tx::offer::Leg| -> Value {
+                    if l.xrp {
+                        json!({"currency": "XRP"})
+                    } else {
+                        let c = std::str::from_utf8(&l.cur[12..15])
+                            .ok()
+                            .filter(|s| s.chars().all(|ch| ch.is_ascii_alphanumeric()) && l.cur[..12] == [0u8; 12] && l.cur[15..] == [0u8; 5])
+                            .map(str::to_string)
+                            .unwrap_or_else(|| hex::encode_upper(l.cur));
+                        json!({"currency": c, "issuer": ds::encode_address(&l.issuer)})
+                    }
+                };
+                if let (Some(src), Some(dst), Some(sl), Some(wl)) = (
+                    txj["Account"].as_str().and_then(decode_address),
+                    txj["Destination"].as_str().and_then(decode_address),
+                    leg_of_spec(sm),
+                    leg_of_spec(&txj["Amount"]),
+                ) {
+                    for p in txj["Paths"].as_array().into_iter().flatten().filter_map(|p| p.as_array()) {
+                        let Some(segs) = ds::mixed_layout(&src, &dst, &sl, &wl, p) else {
+                            continue;
+                        };
+                        for seg in &segs {
+                            match seg {
+                                ds::SegLayout::Run(hops) => {
+                                    for h in hops {
+                                        for a in [&h.src, &h.dst] {
+                                            let k = hex::encode_upper(keylet::account_root_key(a).0);
+                                            load_object(&mut *state, url, &k, ledger_index);
+                                        }
+                                        let k = hex::encode_upper(
+                                            keylet::ripple_state_key(&h.src, &h.dst, &h.cur).0,
+                                        );
+                                        load_object(&mut *state, url, &k, ledger_index);
+                                    }
+                                }
+                                ds::SegLayout::Book { from, to } => {
+                                    chains.push(vec![spec_of_leg(from), spec_of_leg(to)]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             let paths = txj["Paths"].as_array().filter(|p| !p.is_empty());
             match paths {
                 Some(ps) => {
