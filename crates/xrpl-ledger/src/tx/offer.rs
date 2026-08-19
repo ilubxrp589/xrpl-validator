@@ -1094,33 +1094,26 @@ pub(crate) fn crossing_judge_threshold(
     taker: &[u8; 20],
     threshold: u64,
 ) -> u64 {
-    if threshold == 0 || threshold == u64::MAX {
-        return threshold;
-    }
-    let mut t = rate_me(threshold);
-    let mut changed = false;
-    // trOut — the OUT (TakerPays) issuer's rate; parity when the taker IS
-    // that issuer.
-    if !pays_leg.xrp && taker != &pays_leg.issuer {
-        if let Some(r) = transfer_rate(sandbox, pays_leg) {
-            t = me_muldiv(t, (1_000_000_000, 0), (r as u128, 0), false);
-            changed = true;
-        }
-    }
-    // trIn does NOT tighten. rippled charges the IN issuer's rate on the
-    // taker's gross spend AND looses the crossing's limitQuality by the
-    // same rate — the two cancel in the judge, so composing it here
-    // over-rejects. The gate proved it: the IoC canary #105887283
-    // 4A13D048 (SGB 1.003 on the gets side) went 8v17 the moment the
-    // gets-side factor landed — a pass mainnet accepts, rejected by a fee
-    // that was already in both sides of rippled's comparison. The
-    // remaining gets-side family (#106067286 169BB0B7 et al) rests on
-    // realised-sizing margins of 1e-7..1e-3, not on this fee.
-    let _ = gets_leg;
-    if !changed {
-        return threshold;
-    }
-    rate_of_me(t, (1, 0)).unwrap_or(threshold)
+    // NEITHER side's transfer rate composes into the judge. The trOut
+    // factor briefly lived here (`0d4ce0f`) on the strength of C966717C —
+    // which the unbounded-AMM rule has since re-explained: those fills
+    // never happen at all, so the judge never sees them. What the factor
+    // actually did was false-reject legitimate fills: #106225714 8ED637DD
+    // buys USD.Bitstamp through a CLOB tip at 971817.3 against a limit of
+    // 971914.49 — the MAKER pays the 1.0015 fee on top (`ownerGives`
+    // 3091.368 vs `stpOut` 3086.738), the step amounts rippled judges are
+    // fee-free, and mainnet fills; the composed threshold 970457 rejected
+    // it into tecKILLED. trIn cancels for the reason below; trOut never
+    // belonged: `New flow iter` in/out are STEP amounts, and the owner's
+    // fee rides OUTSIDE them.
+    //
+    // trIn: rippled charges the IN issuer's rate on the taker's gross
+    // spend AND looses the crossing's limitQuality by the same rate — the
+    // two cancel in the judge. The gate proved it: the IoC canary
+    // #105887283 4A13D048 (SGB 1.003 on the gets side) went 8v17 the
+    // moment the gets-side factor landed.
+    let _ = (sandbox, pays_leg, gets_leg, taker);
+    threshold
 }
 
 fn rate_of_me(pays: Me, gets: Me) -> Option<u64> {
@@ -3166,6 +3159,19 @@ pub(crate) fn cross_engine_to(
     // The first level always anchors the pool: rippled's single `tryAMM` fires
     // on the first live tip whatever it is, self-offer included.
     let mut prev_level_crossed = true;
+    // A self-offer SKIPPED without consumption stays the tip of rippled's book
+    // until an EXECUTING pass steps onto it (`limitSelfCrossQuality` removes it
+    // then; removals apply between flow iterations, StrandFlow.h:694). Every
+    // later pass therefore re-anchors tryAMM on ITS quality — even a pass that
+    // then finds nothing and goes dry. #106010546 7E746D30: the 11536 tip is
+    // the taker's own; iter 1 anchors the pool there, the pool's moved spot is
+    // worse, the next offer (11585.9) fails the 11563.2 threshold, the strand
+    // is DRY and 0.5888785811 rests. Our tail turn ran unanchored (maxOffer)
+    // and swept the pool instead. Remember the first skipped self-offer's
+    // level; a later CLOB consumption clears it (a delivering pass that
+    // stepped past the self-offer applied its removal — the tail then really
+    // is unanchored).
+    let mut self_anchor_q: Option<u64> = None;
     'dirs: for dk in dirs {
         let (level_pays_in, level_gets_in) = (rem_pays, rem_gets);
         let q = u64::from_be_bytes(dk.0[24..32].try_into().unwrap_or_default());
@@ -3357,6 +3363,9 @@ pub(crate) fn cross_engine_to(
                     // unconditionally emptied the book and gave tecPATH_DRY.
                     delete_maker_offer(sandbox, &okey, &offer, &maker);
                     stale.push(okey);
+                    if self_anchor_q.is_none() {
+                        self_anchor_q = Some(q);
+                    }
                     continue;
                 }
                 // Expired offers are never crossed — the stream collects them
@@ -3756,6 +3765,7 @@ pub(crate) fn cross_engine_to(
                 rem_gets = me_sub(rem_gets, pay);
                 crossed += 1;
                 level_crossed = true;
+                self_anchor_q = None;
                 // `TOffer::fully_consumed()` is `amount().in == 0 || amount().out
                 // == 0` — EITHER side, not just the gets side we were testing.
                 // An out-limited fill clamped to the offer's whole TakerPays
@@ -3836,7 +3846,11 @@ pub(crate) fn cross_engine_to(
             }
             let (rp, rg, used) = amm_turn(
                 amm_fib.as_deref_mut(), sandbox, a, taker, beneficiary, rem_pays, rem_gets,
-                pays_leg, gets_leg, threshold, sell, None,
+                pays_leg, gets_leg, threshold, sell,
+                // A remembered self-offer within the limit is still the tip
+                // rippled's tail pass anchors on (see self_anchor_q above);
+                // beyond the limit rippled anchors nothing (#106295504).
+                self_anchor_q.filter(|qs| *qs <= threshold),
             );
             rem_pays = rp;
             rem_gets = rg;
