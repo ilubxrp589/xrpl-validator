@@ -445,6 +445,26 @@ pub fn path_conversion_books(
             push_conversion(&mut out, &cur, amount);
         }
     }
+    // THE DEFAULT PATH'S OWN BOOK. rippled builds the default strand ALONGSIDE
+    // every named path unless tfNoRippleDirect, so `source -> amount` is a book
+    // the payment can consume even when `Paths` routes somewhere else entirely.
+    // Deriving books per-path missed it, and a book that is never prefetched
+    // reads as EMPTY: `strand_upper_bound` returns None for a chain with no book
+    // or pool, the default strand never enters the round ordering, and its
+    // liquidity is silently invisible.
+    //
+    // #105973456 E2DBEAA1: a circular tfPartialPayment routing FUZZY > XRP > EVR
+    // by `Paths`, with no tfNoRippleDirect. Mainnet ALSO fills from the direct
+    // FUZZY/EVR book — maker rNomEcvKP4E5dA, whose FUZZY and EVR lines are the
+    // exact two nodes we were missing (8 mutations against 10). Our own
+    // DX_PAY showed `order=[(1, …)]`: strand 0 built, then dropped for want of a
+    // book that was never fetched.
+    //
+    // Cheap when unused: prefetching a book nobody probes costs one lookup, the
+    // same tolerance this function already takes for its issuer heuristic.
+    if source != *amount {
+        push_conversion(&mut out, &source, amount);
+    }
     out
 }
 

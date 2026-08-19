@@ -889,6 +889,53 @@ impl Transactor for NFTokenCancelOfferTransactor {
         if !sandbox.exists(&acct_key) {
             return TxResult::NoAccount;
         }
+        // ONE UNCANCELLABLE OFFER FAILS THE WHOLE TRANSACTION.
+        // `NFTokenCancelOffer::preclaim` is a `find_if` over sfNFTokenOffers
+        // returning tecNO_PERMISSION on the FIRST id the submitter may not
+        // cancel. An id is cancellable when: it is absent (assumed already
+        // consumed), or it has EXPIRED (anyone may cancel), or the submitter is
+        // the offer's Owner, or the submitter is its Destination. Anything else
+        // — including an id that resolves to a non-NFTokenOffer — is refused.
+        //
+        // The comment in do_apply named the three authorisations ("owner,
+        // destination, or expiry all authorize") and nothing ever checked that
+        // ONE OF THEM HOLDS; we deleted whatever we could read.
+        //
+        // #106029108 F48C0E1D: rpZqTPC8 cancels AF7F9FBF, owned by rP4pHjuJ and
+        // destined for rpx9JThQ — neither is the submitter — with Expiration
+        // 839103987 against a parent close of 839022091, so it is NOT expired.
+        // Mainnet claims the fee with tecNO_PERMISSION; we returned tesSUCCESS.
+        // Identical mutation sets, 1 v 1 — only the result code was wrong.
+        let close = sandbox.base().header.close_time as u64;
+        if let Some(offers) = tx.fields.get("NFTokenOffers").and_then(|v| v.as_array()) {
+            for oref in offers {
+                let Some(key) = hash256_from(oref) else { continue };
+                // ⚠ An id we cannot READ is skipped, exactly as rippled skips a
+                // missing one — but that makes hydration load-bearing: without
+                // the offer object this check passes everything. The probe
+                // fetches each NFTokenOffers id for precisely this reason.
+                let Some(o) = sandbox
+                    .read(&key)
+                    .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+                else {
+                    continue;
+                };
+                if o.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("NFTokenOffer") {
+                    return TxResult::NoPermission;
+                }
+                let expired = o
+                    .get("Expiration")
+                    .and_then(|v| v.as_u64())
+                    .is_some_and(|e| e != 0 && close >= e);
+                if expired
+                    || o.get("Owner").and_then(decode_account_id) == Some(tx.account)
+                    || o.get("Destination").and_then(decode_account_id) == Some(tx.account)
+                {
+                    continue;
+                }
+                return TxResult::NoPermission;
+            }
+        }
         TxResult::Success
     }
 

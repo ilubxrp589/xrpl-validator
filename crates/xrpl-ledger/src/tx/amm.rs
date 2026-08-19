@@ -703,7 +703,7 @@ fn payout_proportional(
     amm_acct: &[u8; 20],
     tokens: (u128, i32),
     total_lp: (u128, i32),
-) {
+) -> bool {
     use crate::tx::offer as ox;
     let asset_leg = |v: &serde_json::Value| -> Option<ox::Leg> {
         if v.get("currency").and_then(|c| c.as_str()) == Some("XRP") {
@@ -713,6 +713,23 @@ fn payout_proportional(
         amt["value"] = serde_json::json!("0");
         ox::leg_of(&amt)
     };
+    // BOTH SIDES ARE COMPUTED BEFORE EITHER MOVES. rippled refuses an equal
+    // withdrawal outright when a side rounds away:
+    //     // ... the requested amount of LP tokens is likely too small and
+    //     // results in one-sided pool withdrawal due to round off. Fail so
+    //     // the user withdraws more tokens.
+    //     if (amountWithdraw == beast::kZero || amount2Withdraw == beast::kZero)
+    //         return {tecAMM_FAILED, ...};                (AMMWithdraw.cpp:840-845)
+    // Skipping the zero side and paying the other is exactly the one-sided
+    // withdrawal that check exists to prevent, so the sides must be known
+    // before anything is written.
+    //
+    // #106014913 5788637E (tfWithdrawAll): 0.000001 LP against a supply of
+    // 1471789206.03 is a fraction of 6.794e-16, so the XRP side of a
+    // 34347264193-drop pool comes to 0.000023 drops — ZERO — while the XRG side
+    // is 4.781e-08. Mainnet claims the fee with tecAMM_FAILED; we paid out the
+    // XRG side alone in 8 mutations.
+    let mut shares: Vec<(ox::Leg, (u128, i32))> = Vec::new();
     for f in ["Asset", "Asset2"] {
         let Some(v) = tx.fields.get(f) else { continue };
         let Some(leg) = asset_leg(v) else { continue };
@@ -728,10 +745,16 @@ fn payout_proportional(
         // Jocker line lands …890599 against mainnet's …890600, one ulp.
         let frac = ox::st_divide(tokens, total_lp, false);
         let share = mul_directed(pool, frac, false, leg.xrp);
-        if share.0 > 0 {
-            ox::move_leg(sandbox, amm_acct, &tx.account, &leg, share);
-        }
+        shares.push((leg, share));
     }
+    // A side that rounded to zero fails the whole withdrawal — nothing written.
+    if shares.iter().any(|(_, sh)| sh.0 == 0) {
+        return false;
+    }
+    for (leg, share) in shares {
+        ox::move_leg(sandbox, amm_acct, &tx.account, &leg, share);
+    }
+    true
 }
 
 // ─── AMMWithdraw ───
@@ -762,6 +785,10 @@ impl Transactor for AMMWithdrawTransactor {
 
     fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
         use crate::tx::offer as ox;
+        // Taken up front so a refusal discovered mid-payout leaves nothing
+        // behind: tecAMM_FAILED on a rounded-away side is decided after the
+        // one-asset branch may already have moved value.
+        let snap = sandbox.snapshot();
         let Some((amm_key, amm_acct, lp_leg)) = amm_ctx(tx, sandbox) else {
             return TxResult::NoEntry;
         };
@@ -849,7 +876,10 @@ impl Transactor for AMMWithdrawTransactor {
                 }
             } else {
                 // Both assets out, proportional to the redeemed LPToken share.
-                payout_proportional(sandbox, tx, &amm_acct, lp_bal, total_lp);
+                if !payout_proportional(sandbox, tx, &amm_acct, lp_bal, total_lp) {
+                    sandbox.restore_snapshot(snap);
+                    return TxResult::AmmFailed;
+                }
             }
             tear_down_lp_line(sandbox, &tx.account, &amm_acct, lp_key, &lp_line);
             bump_lp_balance(sandbox, &amm_key, lp_bal, false);
@@ -880,7 +910,10 @@ impl Transactor for AMMWithdrawTransactor {
                     .and_then(|o| o["LPTokenBalance"]["value"].as_str().map(str::to_string))
                     .and_then(|s| keylet::amount_mant_exp(&serde_json::Value::String(s)))
                 {
-                    payout_proportional(sandbox, tx, &amm_acct, tokens, total_lp);
+                    if !payout_proportional(sandbox, tx, &amm_acct, tokens, total_lp) {
+                        sandbox.restore_snapshot(snap);
+                        return TxResult::AmmFailed;
+                    }
                 }
             }
         }

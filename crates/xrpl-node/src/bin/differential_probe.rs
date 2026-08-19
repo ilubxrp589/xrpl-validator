@@ -278,6 +278,17 @@ fn load_nft_pages_for_tx(state: &mut LedgerState, url: &str, txj: &Value, ledger
                 load_nft_pages(state, url, i, ledger_index);
             }
         }
+        Some("NFTokenCancelOffer") => {
+            // Every id in sfNFTokenOffers: preclaim reads each to decide whether
+            // the submitter may cancel it (owner / destination / expired), and
+            // an id it cannot read is SKIPPED — so an unhydrated offer makes the
+            // permission check pass everything. #106029108 is the specimen.
+            if let Some(ids) = txj.get("NFTokenOffers").and_then(|v| v.as_array()) {
+                for id in ids.iter().filter_map(|v| v.as_str()) {
+                    load_object(state, url, id, ledger_index);
+                }
+            }
+        }
         Some("NFTokenModify") | Some("NFTokenBurn") | Some("NFTokenCreateOffer") => {
             // The ISSUER's AccountRoot, for `NFTokenModify`'s authorisation
             // check: it reads the issuer's `sfNFTokenMinter`, and the issuer is
@@ -989,6 +1000,27 @@ fn load_payment_books(
                         }
                         chain.push(w.clone());
                         chains.push(chain);
+                    }
+                    // ...AND THE DEFAULT PATH. rippled builds the default
+                    // strand ALONGSIDE every named path unless tfNoRippleDirect
+                    // (0x00010000), so `SendMax -> Amount` is a book the
+                    // payment can consume even when `Paths` routes elsewhere.
+                    // Deriving chains from `Paths` alone missed it, and an
+                    // unfetched book reads as EMPTY rather than as unknown:
+                    // `strand_upper_bound` returns None for a chain with no book
+                    // or pool, so the default strand is dropped from the round
+                    // ordering and its liquidity is silently invisible.
+                    //
+                    // #105973456 E2DBEAA1: a circular tfPartialPayment routing
+                    // FUZZY > XRP > EVR by Paths, no tfNoRippleDirect. Mainnet
+                    // ALSO fills from the direct FUZZY/EVR book — maker
+                    // rNomEcvKP4E5dA, whose FUZZY and EVR lines are exactly the
+                    // two nodes we were missing (8 mutations against 10). Our
+                    // DX_PAY showed `order=[(1, …)]`: the strand was built and
+                    // then dropped for want of a book nobody fetched.
+                    let no_direct = txj["Flags"].as_u64().unwrap_or(0) & 0x0001_0000 != 0;
+                    if !no_direct {
+                        chains.push(vec![s.clone(), w.clone()]);
                     }
                 }
                 None => chains.push(vec![s, w]),
