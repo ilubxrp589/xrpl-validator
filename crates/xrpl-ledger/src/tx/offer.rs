@@ -3172,6 +3172,9 @@ pub(crate) fn cross_engine_to(
     // stepped past the self-offer applied its removal — the tail then really
     // is unanchored).
     let mut self_anchor_q: Option<u64> = None;
+    // TRUE once any level activated the strand (tip or pool within the
+    // limit) — the moment rippled would have BUILT the offer stream.
+    let mut stream_ran = false;
     'dirs: for dk in dirs {
         let (level_pays_in, level_gets_in) = (rem_pays, rem_gets);
         let q = u64::from_be_bytes(dk.0[24..32].try_into().unwrap_or_default());
@@ -3220,6 +3223,7 @@ pub(crate) fn cross_engine_to(
             || amm.as_ref().is_some_and(|a| {
                 crate::tx::amm_swap::spot_upper_bound(sandbox, a, pays_leg, gets_leg) <= threshold
             });
+        stream_ran = stream_ran || strand_active;
         if strand_active && !reap_to_live_head(sandbox, &dk, pays_leg, gets_leg, stale) {
             continue;
         }
@@ -3304,6 +3308,22 @@ pub(crate) fn cross_engine_to(
             eprintln!("DX_BOOK dir q={q:016x} threshold={threshold:016x} cross={}", q <= threshold);
         }
         if q > threshold {
+            // rippled's offer stream has no quality gate for STEPPING: once
+            // the strand was BUILT, rev keeps stepping past DEAD offers on
+            // levels beyond the limit — reaping them — until a LIVE offer
+            // stops it (`checkQualityThreshold` ends the walk at execution,
+            // not at step). #106091383 6DCDD907: after the 1914.82 RLUSD
+            // fill, mainnet reaps the expired offers on the beyond-limit
+            // 4F03CA62 level (3 deletions + the owner root we were missing)
+            // before the live beyond-limit tip ends the walk. A strand never
+            // built reaps nothing — #105795013 rests in 4 nodes and leaves
+            // the expired E39542EC alone.
+            if stream_ran {
+                if reap_to_live_head(sandbox, &dk, pays_leg, gets_leg, stale) {
+                    break 'dirs;
+                }
+                continue;
+            }
             break;
         }
         let mut page_key_h = dk;
