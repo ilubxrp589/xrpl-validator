@@ -1182,6 +1182,48 @@ fn load_amm_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_ind
                 load_object(state, url, &k, ledger_index);
             }
         }
+        // "No pool exists yet" is exactly what preclaim must be able to
+        // DISPROVE: a pair that already has a pool refuses with
+        // tecDUPLICATE (#106118993 D98E76D5), and a fee-only meta never
+        // names the standing pool. Ask for it; absence is the normal case.
+        let asset_of = |v: &Value| -> Value {
+            if v.is_string() {
+                json!({"currency": "XRP"})
+            } else {
+                json!({"currency": v.get("currency").cloned().unwrap_or(Value::Null),
+                       "issuer": v.get("issuer").cloned().unwrap_or(Value::Null)})
+            }
+        };
+        if let (Some(a1), Some(a2)) = (txj.get("Amount"), txj.get("Amount2")) {
+            if let Some(res) = rpc(url, "ledger_entry", json!({
+                "amm": {"asset": asset_of(a1), "asset2": asset_of(a2)},
+                "ledger_index": ledger_index,
+            })) {
+                if let Some(idx) = res["node"]["index"].as_str() {
+                    let idx = idx.to_string();
+                    load_object(state, url, &idx, ledger_index);
+                }
+            }
+        }
+        // The creator's own trust line for each IOU side: the funds check
+        // reads it, and a fee-only refusal touches nothing (#106071927
+        // 3CCED155 — same lesson as the escrow and deposit lines).
+        if let Some(who) = txj["Account"].as_str().and_then(decode_address) {
+            for f in ["Amount", "Amount2"] {
+                let Some(a) = txj.get(f) else { continue };
+                let (Some(cur), Some(iss)) = (
+                    a.get("currency").and_then(|v| v.as_str()),
+                    a.get("issuer").and_then(|v| v.as_str()).and_then(decode_issuer),
+                ) else { continue };
+                if cur == "XRP" {
+                    continue;
+                }
+                let k = hex::encode_upper(
+                    keylet::ripple_state_key(&who, &iss, &currency_code(cur)).0,
+                );
+                load_object(state, url, &k, ledger_index);
+            }
+        }
         return;
     }
     let (Some(a1), Some(a2)) = (txj.get("Asset"), txj.get("Asset2")) else { return };

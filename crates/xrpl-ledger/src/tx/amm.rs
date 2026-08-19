@@ -106,8 +106,76 @@ impl Transactor for AMMCreateTransactor {
     }
 
     fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        use crate::tx::offer as ox;
         let acct_key = keylet::account_root_key(&tx.account);
         if !sandbox.exists(&acct_key) { return TxResult::NoAccount; }
+        // AMMCreate::preclaim, in rippled's order (AMMCreate.cpp:100-186).
+        let (Some(a1), Some(a2)) = (tx.fields.get("Amount"), tx.fields.get("Amount2")) else {
+            return TxResult::Malformed;
+        };
+        let (Some(l1), Some(l2)) = (ox::leg_of(a1), ox::leg_of(a2)) else {
+            return TxResult::Malformed;
+        };
+        // 1. A pool for this pair already exists — tecDUPLICATE (:101-106).
+        //    The probe hydrates the existing pool for AMMCreate exactly so
+        //    this is decidable; absence (fresh pair) is the normal case.
+        //    #106118993 D98E76D5 recreates XRP/USD rvYAfWj5 — mainnet says
+        //    tecDUPLICATE where we answered tecNO_PERMISSION.
+        let pool = keylet::amm_key(&l1.cur, &l1.issuer, &l2.cur, &l2.issuer);
+        if sandbox.exists(&pool) {
+            return TxResult::Duplicate;
+        }
+        let Some(acct) = ox::json_at(sandbox, &acct_key) else {
+            return TxResult::NoAccount;
+        };
+        let bal: u128 =
+            acct["Balance"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let oc = acct["OwnerCount"].as_u64().unwrap_or(0);
+        // 2. The creator must clear the reserve WITH the LPToken line it is
+        //    about to open: xrpLiquid(account, +1) ≤ 0 is
+        //    tecINSUF_RESERVE_LINE (:150-157). Preclaim runs pre-fee, which
+        //    IS rippled's view of it.
+        let liquid = bal
+            .saturating_sub(crate::ledger::fees::account_reserve(sandbox, oc + 1) as u128);
+        if liquid == 0 {
+            return TxResult::InsufReserveLine;
+        }
+        // 3. Funds (:159-175): the XRP side against that same liquid; an IOU
+        //    side via accountFunds under ZeroIfFrozen — offer::available's
+        //    exact semantics (ZeroIfUnauthorized is not modeled; require-auth
+        //    issuers do not appear on the corpora). Falling short is
+        //    tecUNFUNDED_AMM. #106071927 3CCED155: a DRGN/BURN create whose
+        //    creator cannot fund a side — we built the whole pool, 10
+        //    mutations against mainnet's fee.
+        for (v, leg) in [(a1, &l1), (a2, &l2)] {
+            let Some(amt) = keylet::amount_mant_exp(v) else { continue };
+            if amt.0 == 0 {
+                continue;
+            }
+            let short = if leg.xrp {
+                liquid < ox::me_rescale(amt, 0, false)
+            } else {
+                ox::me_cmp(ox::available(sandbox, &tx.account, leg), amt).is_lt()
+            };
+            if short {
+                return TxResult::UnfundedAmm;
+            }
+        }
+        // 4. Neither side may itself be an LP token: an issuer whose
+        //    AccountRoot carries AMMID refuses with tecAMM_INVALID_TOKENS
+        //    (:177-186). Only a READABLE issuer condemns (collect_issuers
+        //    hydrates every named issuer).
+        for leg in [&l1, &l2] {
+            if leg.xrp {
+                continue;
+            }
+            if ox::json_at(sandbox, &keylet::account_root_key(&leg.issuer))
+                .map(|r| r.get("AMMID").is_some())
+                .unwrap_or(false)
+            {
+                return TxResult::AmmInvalidTokens;
+            }
+        }
         TxResult::Success
     }
 
