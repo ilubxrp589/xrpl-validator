@@ -3252,6 +3252,9 @@ pub(crate) fn cross_engine_to(
     // deferred past the walk and never free reserve units mid-flow
     // (walk_available).
     let mut oc0: std::collections::HashMap<[u8; 20], u64> = Default::default();
+    // The first beyond-threshold level the walk stopped at — the residual
+    // raw tip rippled's next pass would anchor tryAMM on (see the tail turn).
+    let mut residual_q: Option<u64> = None;
     // TRUE once any level activated the strand (tip or pool within the
     // limit) — the moment rippled would have BUILT the offer stream.
     let mut stream_ran = false;
@@ -3388,6 +3391,9 @@ pub(crate) fn cross_engine_to(
             eprintln!("DX_BOOK dir q={q:016x} threshold={threshold:016x} cross={}", q <= threshold);
         }
         if q > threshold {
+            if residual_q.is_none() {
+                residual_q = Some(q);
+            }
             // rippled's offer stream has no quality gate for STEPPING: once
             // the strand was BUILT, rev keeps stepping past DEAD offers on
             // levels beyond the limit — reaping them — until a LIVE offer
@@ -3941,18 +3947,27 @@ pub(crate) fn cross_engine_to(
     // Final AMM turn once the book is exhausted (maxOffer sizing).
     if let Some(a) = &amm {
         // For a CROSSING with no remembered anchor, the strand must first be
-        // ADMITTED: `qualityUpperBound` of an AMM-bearing strand is the
-        // anchored-at-limit slice's quality grossed by trIn, and a miss drops
-        // the strand before it ever flows (see amm_swap::tail_admission,
-        // #106225714 0FE0E3C5). Payments carry no limitQuality and skip this.
+        // ADMITTED. rippled's next pass anchors tryAMM on the residual raw
+        // tip; when that tip sits WITHIN the inflated limitQuality
+        // (`threshold_self`), the anchored AMM offer's quality IS the tip,
+        // and grossed by trIn it misses the limit exactly because the tip is
+        // beyond the NET threshold — which is why the walk stopped there.
+        // #106225714 0FE0E3C5: tip 1.02905e-6 ∈ (net 1.0290100e-6, gross
+        // 1.0305435e-6] → `ub strand 0 = 1.030594e-6`, `admitted false`,
+        // the remainder rests. A tip beyond even the INFLATED limit — or no
+        // tip at all — is the maxOffer branch: ub = spot × trIn, which is
+        // the same comparison consume()'s fee-inclusive spot gate makes
+        // (#106211626 D322E925 fills exactly there; #106295504's receipt is
+        // the same branch). The interval is empty without a gets-side
+        // transfer rate, so unrated crossings are untouched. Payments carry
+        // no limitQuality and skip this.
         let tail_admitted = !(offer_crossing
             && threshold_self != 0
             && threshold_self != u64::MAX
             && self_anchor_q.is_none())
-            || {
-                let gr = transfer_rate(sandbox, gets_leg)
-                    .filter(|_| !gets_leg.xrp && taker != &gets_leg.issuer);
-                crate::tx::amm_swap::tail_admission(sandbox, a, pays_leg, gets_leg, threshold_self, gr)
+            || match residual_q {
+                Some(q) => !(q > threshold && q <= threshold_self),
+                None => true,
             };
         if tail_admitted && !done(rem_pays, rem_gets) {
             if std::env::var("DX_AMM").is_ok() {
