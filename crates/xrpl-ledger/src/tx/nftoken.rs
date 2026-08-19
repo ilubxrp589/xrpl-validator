@@ -742,6 +742,37 @@ fn transfer_token(
     }
     if nftpage::page_insert(sandbox, buyer, removal.entry) {
         increment_owner_count(buyer, sandbox);
+        // fixNFTokenReserve (NFTokenAcceptOffer.cpp:378-399, transferNFToken):
+        // when the insert had to CREATE a page, the buyer must hold the
+        // reserve for it, judged on the balance AS IT STANDS — post-fee,
+        // post-price — against accountReserve(ownerCountAfter). Deliberately
+        // NOT the pre-fee form the Mint/CreateOffer gates use: rippled's own
+        // comment rules out `preFeeBalance_` here "because NFT is sold for a
+        // price", accepting that "the reserve requirement is a few drops
+        // higher".
+        //
+        // #106055317 9982EA5D calibrates it: buyer rfwYSmo7 holds 1798921
+        // drops at OwnerCount 3 and accepts a FREE sell offer (Amount "0",
+        // Destination = buyer). The new page lifts the count to 4, reserve
+        // 1000000 + 4*200000 = 1800000, balance post-fee 1798911 — 1089
+        // drops short — so mainnet takes the fee and the token stays with
+        // the seller. We moved it: 6 mutations against 1. Eight specimens,
+        // one bot family.
+        //
+        // An unreadable buyer AccountRoot must NOT condemn (the inverted
+        // hydration trap): only a parsed Balance is judged. rippled reads
+        // the same SLE it just inserted into, so absence there is
+        // tecINTERNAL, unreachable with sound hydration.
+        let count_after = owner_count_of(sandbox, buyer);
+        let bal = sandbox
+            .read(&keylet::account_root_key(buyer))
+            .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+            .and_then(|a| a["Balance"].as_str().and_then(|v| v.parse::<u64>().ok()));
+        if let Some(bal) = bal {
+            if bal < crate::ledger::fees::account_reserve(sandbox, count_after) {
+                return TxResult::InsufficientReserve;
+            }
+        }
     }
     TxResult::Success
 }
@@ -853,6 +884,14 @@ impl Transactor for NFTokenAcceptOfferTransactor {
             };
             let seller = sell.owner;
             let buyer = buy.owner;
+            // rippled deletes BOTH offers first (doApply, before any payout
+            // or the token move): by the time transferNFToken judges the
+            // buyer's reserve, the buyer's own buy offer no longer counts
+            // against them. Deleting after the check would judge
+            // reserve(count + 1) — one unit (200000 drops) too strict. The
+            // final state is order-independent; only the check's inputs care.
+            delete_offer(sandbox, &sell);
+            delete_offer(sandbox, &buy);
             // Broker keeps the buy/sell spread; an explicit BrokerFee is the
             // broker's cut, the rest of the buy amount goes to the seller.
             if let Some(drops) = buy.amount.as_str().and_then(|s| s.parse::<u64>().ok()) {
@@ -869,13 +908,7 @@ impl Transactor for NFTokenAcceptOfferTransactor {
                 }
                 pay_settle_seller(sandbox, &seller, &sell.nft_id, to_seller);
             }
-            let moved = transfer_token(sandbox, &seller, &buyer, &sell.nft_id);
-            if moved != TxResult::Success {
-                return moved;
-            }
-            delete_offer(sandbox, &sell);
-            delete_offer(sandbox, &buy);
-            return TxResult::Success;
+            return transfer_token(sandbox, &seller, &buyer, &sell.nft_id);
         }
 
         // Direct mode.
@@ -897,19 +930,18 @@ impl Transactor for NFTokenAcceptOfferTransactor {
         } else {
             (tx.account, offer.owner)
         };
+        // Offer deleted FIRST — same order as rippled's doApply (see the
+        // brokered arm's note): a buy-offer accept must not count the
+        // buyer's own offer toward the reserve judged in transfer_token.
+        delete_offer(sandbox, &offer);
         if let Some(drops) = offer.amount.as_str().and_then(|s| s.parse::<u64>().ok()) {
             if drops > 0 {
                 pay_xrp_with_transfer_fee(sandbox, &buyer, &seller, &offer.nft_id, drops);
             }
         }
         // IOU-priced offers: value movement over trust lines is not modeled
-        // yet — the token/offer mutations below still land on the right keys.
-        let moved = transfer_token(sandbox, &seller, &buyer, &offer.nft_id);
-        if moved != TxResult::Success {
-            return moved;
-        }
-        delete_offer(sandbox, &offer);
-        TxResult::Success
+        // yet — the token/offer mutations still land on the right keys.
+        transfer_token(sandbox, &seller, &buyer, &offer.nft_id)
     }
 }
 
