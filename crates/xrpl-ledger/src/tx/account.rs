@@ -118,13 +118,18 @@ impl Transactor for AccountDeleteTransactor {
             Err(_) => return TxResult::Malformed,
         };
 
-        // Must have OwnerCount == 0
-        let owner_count = acct["OwnerCount"].as_u64().unwrap_or(0);
-        if owner_count > 0 {
-            return TxResult::NoPermission;
-        }
-
-        // ...and OwnerCount ZERO IS NOT THE SAME AS OWNING NOTHING. rippled
+        // OwnerCount ZERO IS NOT THE SAME AS OWNING NOTHING — and owning
+        // SOMETHING is not the same as an obligation. rippled has NO
+        // OwnerCount rule here at all: the directory walk below decides, and
+        // an obligation answers tecHAS_OBLIGATIONS whatever the count says.
+        // #106066467 248BF6E3: rhokiAcW holds obligations at a nonzero count;
+        // mainnet says HAS_OBLIGATIONS, the old count-first gate said
+        // NO_PERMISSION — right refusal, wrong code, from a rule rippled
+        // never had. The count-gate survives only BELOW the walk, as the
+        // stand-in for the doApply deleter we don't model yet (rippled
+        // deletes an all-deletable directory along with the account).
+        //
+        // rippled
         // walks the owner DIRECTORY and refuses on any entry whose type has no
         // `nonObligationDeleter` (AccountDelete.cpp):
         //     if (dirIsEmpty(ctx.view, ownerDirKeylet)) return tesSUCCESS;
@@ -180,6 +185,16 @@ impl Transactor for AccountDeleteTransactor {
                 break;
             }
             page_key = keylet::dir_page_key(&dir_root, next);
+        }
+
+        // All-deletable (or unreadable) directory at a nonzero count: rippled
+        // would delete those objects with the account (nonObligationDeleter);
+        // we do not model that deleter yet, so keep the old refusal rather
+        // than destroy objects wrongly. The obligation case above no longer
+        // reaches this.
+        let owner_count = acct["OwnerCount"].as_u64().unwrap_or(0);
+        if owner_count > 0 {
+            return TxResult::NoPermission;
         }
 
         // Account sequence + 256 must be <= current ledger sequence
