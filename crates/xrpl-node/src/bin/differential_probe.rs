@@ -1540,6 +1540,23 @@ fn run() -> i32 {
         for a in issuers {
             if seen.insert(a.clone()) {
                 load_account(&mut state, &rpc_url, &a, seq - 1);
+                // An issuer that turns out to be an AMM pseudo-account drags
+                // its pool object in too: TrustSet's destination rules need
+                // the AMM's LPTokenBalance (currency + emptiness) to judge a
+                // new line toward it, and a fee-only refusal's meta touches
+                // neither object. #106250239 2BC6AFA8 is a PLHINX line
+                // opened at a pool account.
+                if let Some(id) = decode_address(&a) {
+                    let root = Sandbox::new(&state)
+                        .read(&keylet::account_root_key(&id))
+                        .and_then(|d| serde_json::from_slice::<Value>(&d).ok());
+                    if let Some(ammid) =
+                        root.as_ref().and_then(|r| r.get("AMMID")).and_then(|v| v.as_str())
+                    {
+                        let ammid = ammid.to_string();
+                        load_object(&mut state, &rpc_url, &ammid, seq - 1);
+                    }
+                }
             }
         }
     }

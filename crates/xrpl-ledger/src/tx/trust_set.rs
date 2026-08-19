@@ -195,6 +195,76 @@ impl Transactor for TrustSetTransactor {
             return TxResult::Malformed;
         };
 
+        // Destination rules (TrustSet.cpp:220-278), in rippled's order —
+        // both run in preclaim, before any reserve arithmetic. The line's
+        // counterparty is the LimitAmount's issuer, whose AccountRoot is
+        // hydrated for every tx (collect_issuers), so a readable destination
+        // gates the checks and absence skips them.
+        {
+            let currency = Self::currency_code(currency_str);
+            let dst_key = keylet::account_root_key(&issuer);
+            if let Some(dst) = sandbox
+                .read(&dst_key)
+                .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+            {
+                let line_exists =
+                    sandbox.exists(&keylet::ripple_state_key(&tx.account, &issuer, &currency));
+                // lsfDisallowIncomingTrustline, softened by
+                // fixDisallowIncomingV1: an EXISTING line may still be
+                // adjusted; only a NEW one is refused (:220-236).
+                if dst["Flags"].as_u64().unwrap_or(0) & 0x2000_0000 != 0 && !line_exists {
+                    return TxResult::NoPermission;
+                }
+                // Pseudo-account destinations (:238-278). An AMM accepts a
+                // NEW line only for its own LP token on a non-empty pool;
+                // Vault/LoanBroker accept none.
+                //
+                // #106250239 2BC6AFA8: a bot (memo "OWNER_OVERRIDE") opens a
+                // 1e9 PLHINX line toward rn8dw362…, which carries AMMID — a
+                // pool account. PLHINX is not the pool's LP token, so
+                // mainnet takes the fee and refuses; we created the line
+                // (5 mutations against 1).
+                if !line_exists {
+                    if let Some(ammid) = dst.get("AMMID").and_then(|v| v.as_str()) {
+                        let amm_key = hex::decode(ammid)
+                            .ok()
+                            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                            .map(xrpl_core::types::Hash256);
+                        let amm = amm_key.and_then(|k| {
+                            sandbox
+                                .read(&k)
+                                .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+                        });
+                        if let Some(amm) = amm {
+                            if matches!(
+                                amm["LPTokenBalance"]["value"].as_str(),
+                                Some("0") | Some("-0")
+                            ) {
+                                return TxResult::AmmEmpty;
+                            }
+                            let lp_cur = amm["LPTokenBalance"]["currency"]
+                                .as_str()
+                                .and_then(|c| hex::decode(c).ok());
+                            if lp_cur.as_deref() != Some(&currency[..]) {
+                                return TxResult::NoPermission;
+                            }
+                        } else if currency[0] != 0x03 {
+                            // Unhydrated pool: an exact LP comparison is
+                            // impossible, but a currency without the 0x03 LP
+                            // prefix can never be any AMM's LP token. (An
+                            // empty pool would say tecAMM_EMPTY instead —
+                            // undecidable here; the probe hydrates the AMM
+                            // object for issuers carrying AMMID, so this
+                            // fallback covers only stale fixtures.)
+                            return TxResult::NoPermission;
+                        }
+                    } else if dst.get("VaultID").is_some() || dst.get("LoanBrokerID").is_some() {
+                        return TxResult::NoPermission;
+                    }
+                }
+            }
+        }
+
         // Owner reserve required to gain a trust line. rippled SetTrust:
         // reserve is NOT enforced until the account owns >= 2 objects — the
         // gateway-funding carve-out — otherwise accountReserve(ownerCount + 1).
