@@ -91,6 +91,9 @@ pub enum TxResult {
     /// The pool's LPTokenBalance is zero — an emptied AMM awaiting deletion
     /// refuses votes/deposits-without-tfTwoAssetIfEmpty with tecAMM_EMPTY.
     AmmEmpty,
+    /// OracleSet's LastUpdateTime is below the ripple epoch, outside the
+    /// ±300s window around the last close, or not newer than the stored one.
+    InvalidUpdateTime,
     /// Directory is full (e.g. > 250 outstanding tickets).
     DirFull,
     /// Creating the owned object(s) would breach the account's owner reserve.
@@ -159,6 +162,7 @@ impl TxResult {
             | TxResult::AmmBalance
             | TxResult::AmmInvalidTokens
             | TxResult::AmmEmpty
+            | TxResult::InvalidUpdateTime
             | TxResult::HasObligations
             | TxResult::DirFull
             | TxResult::InsufficientReserve
@@ -204,6 +208,7 @@ impl TxResult {
             TxResult::AmmBalance => "tecAMM_BALANCE",
             TxResult::AmmInvalidTokens => "tecAMM_INVALID_TOKENS",
             TxResult::AmmEmpty => "tecAMM_EMPTY",
+            TxResult::InvalidUpdateTime => "tecINVALID_UPDATE_TIME",
             TxResult::HasObligations => "tecHAS_OBLIGATIONS",
             TxResult::DirFull => "tecDIR_FULL",
             TxResult::InsufficientReserve => "tecINSUFFICIENT_RESERVE",

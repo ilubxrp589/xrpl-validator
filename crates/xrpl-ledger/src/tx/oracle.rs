@@ -74,6 +74,50 @@ impl Transactor for OracleSetTransactor {
         if !sandbox.exists(&k) {
             return TxResult::NoAccount;
         }
+        // OracleSet::preclaim time rules (OracleSet.cpp:68-81, :128-130), in
+        // rippled's order. LastUpdateTime is UNIX epoch in the tx but the
+        // ledger clock is RIPPLE epoch, hence the 946684800 offset.
+        //   1. below the epoch offset → tecINVALID_UPDATE_TIME
+        //   2. outside closeTime ± kMaxLastUpdateTimeDelta (300s) →
+        //      tecINVALID_UPDATE_TIME. The harness header's close_time IS the
+        //      parent's close ("the last closed ledger", rippled's comment).
+        //      rippled bails tecINTERNAL when closeTime < 300 — unreachable
+        //      on a real ledger — so a degenerate header skips the window.
+        //   3. updating an EXISTING oracle, the new time must be STRICTLY
+        //      newer than the stored one. Absent SLE = the create path — no
+        //      staleness to judge — so absence skips, never condemns.
+        //
+        // The specimens are one bot (rsNvoAZ9, doc 1) resubmitting the same
+        // update: #106122429 45AEB189 carries LastUpdateTime equal to the
+        // stored value (rule 3; its −283s sits inside the window), while
+        // #106323095 0D01197E and #106323126 0B3AE2F8 repeat a value 365s
+        // and 485s behind close, so rule 2 takes them first — same verdict.
+        const EPOCH_OFFSET: u64 = 946_684_800;
+        const MAX_DELTA: u64 = 300;
+        let Some(lut) = tx.fields.get("LastUpdateTime").and_then(|v| v.as_u64()) else {
+            return TxResult::Malformed;
+        };
+        if lut < EPOCH_OFFSET {
+            return TxResult::InvalidUpdateTime;
+        }
+        let lut_ripple = lut - EPOCH_OFFSET;
+        let close = sandbox.base().close_time() as u64;
+        if close >= MAX_DELTA
+            && (lut_ripple < close - MAX_DELTA || lut_ripple > close + MAX_DELTA)
+        {
+            return TxResult::InvalidUpdateTime;
+        }
+        if let Some(id) = doc_id(tx) {
+            if let Some(d) = sandbox.read(&keylet::oracle_key(&tx.account, id)) {
+                if let Ok(sle) = serde_json::from_slice::<serde_json::Value>(&d) {
+                    if let Some(stored) = sle.get("LastUpdateTime").and_then(|v| v.as_u64()) {
+                        if lut <= stored {
+                            return TxResult::InvalidUpdateTime;
+                        }
+                    }
+                }
+            }
+        }
         TxResult::Success
     }
 
