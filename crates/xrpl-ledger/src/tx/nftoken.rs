@@ -307,6 +307,14 @@ impl Transactor for NFTokenMintTransactor {
         if let Some(uri) = tx.fields.get("URI") {
             token["URI"] = uri.clone();
         }
+        // rippled snapshots ownerCountBefore at doApply entry
+        // (NFTokenMint.cpp:281-282), BEFORE insertToken — so the tail reserve
+        // gate covers the new NFTokenPage as well as the optional sell offer.
+        // Snapshotting after the page insert (as this used to) makes a
+        // page-creating mint with no Amount invisible to the gate:
+        // #106058568 CD70A6A6 and #106100514 6250D5ED, the same
+        // reserve-starved bot family as the AcceptOffer cluster.
+        let owner_count_before = owner_count_of(sandbox, &tx.account);
         let created = nftpage::page_insert(
             sandbox,
             &tx.account,
@@ -341,7 +349,6 @@ impl Transactor for NFTokenMintTransactor {
         // batch, all identically our_muts=5 vs net_muts=8 with nothing extra —
         // e.g. #105815415 D44804DCF372, which carries Amount 0, a Destination
         // and an Expiration.
-        let owner_count_before = owner_count_of(sandbox, &tx.account);
         if let Some(amount) = tx.fields.get("Amount") {
             let seq = if tx.uses_ticket() {
                 tx.ticket_seq.unwrap_or(0)
