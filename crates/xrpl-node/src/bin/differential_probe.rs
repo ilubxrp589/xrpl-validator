@@ -618,6 +618,26 @@ fn native_read_keys(txj: &Value) -> Vec<String> {
             .and_then(decode_issuer)
         {
             keys.push(hex::encode_upper(keylet::owner_dir_key(&iss).0));
+            // The SENDER's and DESTINATION's trust lines for the escrowed
+            // IOU: escrowCreatePreclaimHelper reads both (tecNO_LINE, the
+            // frozen tests, and the funds test), and a fee-only refusal's
+            // meta touches neither. Without this the sender's 1e9 holding
+            // read as NOTHING and the engine answered tecUNFUNDED_PAYMENT
+            // where mainnet's refusal was the doApply time rule
+            // (#106261496 C9BB730F and 13 siblings).
+            if let Some(cur) = txj
+                .get("Amount")
+                .and_then(|a| a.get("currency"))
+                .and_then(|v| v.as_str())
+            {
+                for f in ["Account", "Destination"] {
+                    if let Some(who) = txj[f].as_str().and_then(decode_address) {
+                        keys.push(hex::encode_upper(
+                            keylet::ripple_state_key(&who, &iss, &currency_code(cur)).0,
+                        ));
+                    }
+                }
+            }
         }
     }
     if txj["TransactionType"].as_str() == Some("CheckCash") {

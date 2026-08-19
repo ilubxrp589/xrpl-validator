@@ -203,15 +203,93 @@ impl Transactor for EscrowCreateTransactor {
             && tx.fields.get("DestinationTag").is_none();
 
         // A token escrow locks the issued currency off the sender's trust
-        // line, so its XRP only has to cover the fee.
+        // line, so its XRP only has to cover the fee. The rules here are
+        // `escrowCreatePreclaimHelper<Issue>` (EscrowCreate.cpp:189-257), in
+        // rippled's order — and ALL of them run in preclaim, before the
+        // doApply-stage time and tag tests below.
         if let Some((leg, want)) = Self::iou_amount(tx) {
-            // No funding test precedes the tag test for a token escrow.
+            use crate::tx::offer as ox;
+            // The issuer cannot escrow its own IOU (:199-201).
+            if leg.issuer == tx.account {
+                return TxResult::NoPermission;
+            }
+            // The issuer must have opted into trust-line locking (:203-208).
+            // Its AccountRoot is hydrated for every tx (collect_issuers), so
+            // a readable issuer gates the rest; absence skips the helper
+            // rather than inventing tecNO_ISSUER out of a fixture gap.
+            if let Some(iss) = ox::json_at(sandbox, &keylet::account_root_key(&leg.issuer)) {
+                let iss_flags = iss["Flags"].as_u64().unwrap_or(0);
+                if iss_flags & 0x4000_0000 == 0 {
+                    // lsfAllowTrustLineLocking
+                    return TxResult::NoPermission;
+                }
+                // The sender must have a line at all (:210-213).
+                let lkey = keylet::ripple_state_key(&tx.account, &leg.issuer, &leg.cur);
+                let Some(line) = ox::json_at(sandbox, &lkey) else {
+                    return TxResult::NoLine;
+                };
+                // Frozen sender or destination is tecFROZEN (:233-238):
+                // the issuer's global freeze, or the ISSUER's side of that
+                // party's line. The destination needs no line — only a
+                // present-and-frozen one condemns. (requireAuth :225-230 and
+                // the canAdd precision test :252-254 are not modeled — no
+                // specimen, and neither state occurs on the corpora's
+                // tokens.)
+                let issuer_side = |who: &[u8; 20]| -> u64 {
+                    if &leg.issuer > who { 0x0080_0000 } else { 0x0040_0000 }
+                };
+                let frozen = |who: &[u8; 20]| -> bool {
+                    if iss_flags & 0x0040_0000 != 0 {
+                        return true; // lsfGlobalFreeze
+                    }
+                    ox::json_at(sandbox, &keylet::ripple_state_key(who, &leg.issuer, &leg.cur))
+                        .map(|l| l["Flags"].as_u64().unwrap_or(0) & issuer_side(who) != 0)
+                        .unwrap_or(false)
+                };
+                if frozen(&tx.account) || frozen(&dest_id) {
+                    return TxResult::Frozen;
+                }
+                // Funds under IgnoreFreeze (:240-250): non-positive holdings
+                // or holdings short of the amount are tecINSUFFICIENT_FUNDS —
+                // NOT tecUNFUNDED_PAYMENT, which this path used to answer
+                // (and answered wrongly even for FUNDED senders whenever the
+                // line was missing from the sandbox; the probe hydrates it
+                // now).
+                let (neg, bal) = ox::signed_value(&line["Balance"]);
+                let party_holds = if tx.account < leg.issuer { !neg } else { neg };
+                if !(party_holds && bal.0 > 0)
+                    || ox::me_cmp(bal, want) == std::cmp::Ordering::Less
+                {
+                    return TxResult::InsufficientFunds;
+                }
+            }
+        }
+
+        // doApply's FIRST act (EscrowCreate.cpp:422-428): a CancelAfter or
+        // FinishAfter already at-or-before the parent close time is
+        // tecNO_PERMISSION — `after(closeTime, mark)` is strictly `>`
+        // (View.cpp:559-562), and the harness header's close_time IS the
+        // parent's close. It outranks the XRP funding test and the tag test,
+        // both later in doApply.
+        //
+        // The 14-specimen burst (#106261496/582/583, e.g. C9BB730F) is one
+        // bot creating escrows with near-immediate FinishAfter and losing
+        // the race — parent close 63-92s past BOTH marks, senders fully
+        // funded (1e9 held against 3438 wanted). #617051F3 pins the order:
+        // its destination also demands a tag, and mainnet still answers
+        // NO_PERMISSION.
+        let close = sandbox.base().close_time() as u64;
+        for f in ["CancelAfter", "FinishAfter"] {
+            if let Some(mark) = tx.fields.get(f).and_then(|v| v.as_u64()) {
+                if close > mark {
+                    return TxResult::NoPermission;
+                }
+            }
+        }
+
+        if Self::iou_amount(tx).is_some() {
             if needs_tag {
                 return TxResult::DstTagNeeded;
-            }
-            let held = crate::tx::offer::available(sandbox, &tx.account, &leg);
-            if crate::tx::offer::me_cmp(held, want).is_lt() {
-                return TxResult::UnfundedPayment;
             }
             if balance_of(&acct) < tx.fee {
                 return TxResult::UnfundedPayment;
@@ -834,6 +912,16 @@ mod tests {
         let mut state = make_state();
         for id in [&sender, &dest, &issuer] {
             add_account(&mut state, id, 50_000_000, 1);
+        }
+        // A lockable token's issuer carries lsfAllowTrustLineLocking — the
+        // preclaim now enforces it (tecNO_PERMISSION otherwise), so the
+        // fixture must model what mainnet's escrowable issuers actually set.
+        {
+            let ikey = keylet::account_root_key(&issuer);
+            let mut ia: serde_json::Value =
+                serde_json::from_slice(&Sandbox::new(&state).read(&ikey).unwrap()).unwrap();
+            ia["Flags"] = serde_json::json!(0x4000_0000u64);
+            state.state_map.insert(ikey, serde_json::to_vec(&ia).unwrap()).unwrap();
         }
         let (lo, hi) = if sender < issuer { (sender, issuer) } else { (issuer, sender) };
         let line = serde_json::json!({

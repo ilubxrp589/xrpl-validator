@@ -94,6 +94,12 @@ pub enum TxResult {
     /// OracleSet's LastUpdateTime is below the ripple epoch, outside the
     /// ±300s window around the last close, or not newer than the stored one.
     InvalidUpdateTime,
+    /// The sender has no trust line at all for the IOU it is escrowing
+    /// (escrowCreatePreclaimHelper<Issue>) — tecNO_LINE.
+    NoLine,
+    /// The issuer froze the sender's or destination's line (or everything) —
+    /// tecFROZEN.
+    Frozen,
     /// Directory is full (e.g. > 250 outstanding tickets).
     DirFull,
     /// Creating the owned object(s) would breach the account's owner reserve.
@@ -163,6 +169,8 @@ impl TxResult {
             | TxResult::AmmInvalidTokens
             | TxResult::AmmEmpty
             | TxResult::InvalidUpdateTime
+            | TxResult::NoLine
+            | TxResult::Frozen
             | TxResult::HasObligations
             | TxResult::DirFull
             | TxResult::InsufficientReserve
@@ -209,6 +217,8 @@ impl TxResult {
             TxResult::AmmInvalidTokens => "tecAMM_INVALID_TOKENS",
             TxResult::AmmEmpty => "tecAMM_EMPTY",
             TxResult::InvalidUpdateTime => "tecINVALID_UPDATE_TIME",
+            TxResult::NoLine => "tecNO_LINE",
+            TxResult::Frozen => "tecFROZEN",
             TxResult::HasObligations => "tecHAS_OBLIGATIONS",
             TxResult::DirFull => "tecDIR_FULL",
             TxResult::InsufficientReserve => "tecINSUFFICIENT_RESERVE",
