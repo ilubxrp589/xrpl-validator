@@ -1007,7 +1007,14 @@ pub(crate) fn consume_fib(
     iters: u32,
     best_book: Option<Me>,
 ) -> (Me, Me, bool) {
-    if ox::me_is_zero(rem_pays) || ox::me_is_zero(rem_gets) {
+    // tfSell: the pays side is only a MINIMUM — once met it saturates to
+    // zero while the sell keeps spending rem_gets. rippled's sell flow keeps
+    // taking pool liquidity for the remaining IN; #106250947 46FC6146
+    // (tfSell|IoC, 500 XRP): iter 3 is a pure anchored pool slice
+    // (7434953 → 809868.177 PHNIX) taken AFTER the filed TakerPays was
+    // covered — bailing here made the walk consume the 2044FBA6/9D836CDD
+    // CLOB offers mainnet never touches.
+    if ox::me_is_zero(rem_gets) || (!sell && ox::me_is_zero(rem_pays)) {
         return (rem_pays, rem_gets, false);
     }
     let Some((s_in, s_out)) = fib_slice(sandbox, amm, init, iters, pays_leg, gets_leg) else {
@@ -1321,7 +1328,14 @@ pub(crate) fn consume(
     sell: bool,
     clob: Option<u64>,
 ) -> (Me, Me, bool) {
-    if ox::me_is_zero(rem_pays) || ox::me_is_zero(rem_gets) {
+    // tfSell: the pays side is only a MINIMUM — once met it saturates to
+    // zero while the sell keeps spending rem_gets. rippled's sell flow keeps
+    // taking pool liquidity for the remaining IN; #106250947 46FC6146
+    // (tfSell|IoC, 500 XRP): iter 3 is a pure anchored pool slice
+    // (7434953 → 809868.177 PHNIX) taken AFTER the filed TakerPays was
+    // covered — bailing here made the walk consume the 2044FBA6/9D836CDD
+    // CLOB offers mainnet never touches.
+    if ox::me_is_zero(rem_gets) || (!sell && ox::me_is_zero(rem_pays)) {
         return (rem_pays, rem_gets, false);
     }
     // pool.in = what the taker pays into the pool (spend = gets_leg);
