@@ -1186,6 +1186,40 @@ impl Transactor for AMMVoteTransactor {
     fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
         let acct_key = keylet::account_root_key(&tx.account);
         if !sandbox.exists(&acct_key) { return TxResult::NoAccount; }
+        // AMMVote::preclaim (AMMVote.cpp:59-77), in rippled's order: an
+        // EMPTY pool (LPTokenBalance zero) refuses with tecAMM_EMPTY, then a
+        // voter holding NO LP tokens with tecAMM_INVALID_TOKENS — "AMM Vote:
+        // account is not LP." Judged by `ammLPHolds`, where a missing line
+        // holds nothing; all four specimens are `ammLPHolds: no SLE`
+        // (#106072851 2B47FAF6 and siblings — bots voting on pools they
+        // never joined). A frozen LP line also reads as zero there, but an
+        // AMM account never sets freeze flags, so only the missing/zero
+        // cases are modeled.
+        //
+        // The AMM OBJECT gates the whole check: an unhydrated pool skips it,
+        // never condemns — rippled's missing-AMM verdict is terNO_AMM, a
+        // retry code no validated ledger carries. The probe hydrates the
+        // pool and the voter's LP line for AMMVote (load_amm_prestate), the
+        // AMMDeposit lesson: the check and its hydration land together.
+        if let Some((amm_key, _amm_acct, lp_leg)) = amm_ctx(tx, sandbox) {
+            if let Some(obj) = crate::tx::offer::json_at(sandbox, &amm_key) {
+                if matches!(obj["LPTokenBalance"]["value"].as_str(), Some("0") | Some("-0")) {
+                    return TxResult::AmmEmpty;
+                }
+            }
+            let lkey = keylet::ripple_state_key(&tx.account, &lp_leg.issuer, &lp_leg.cur);
+            let holds = crate::tx::offer::json_at(sandbox, &lkey)
+                .map(|l| {
+                    let (neg, bal) = crate::tx::offer::signed_value(&l["Balance"]);
+                    // Balance from the LOW account's perspective.
+                    let party_holds = if tx.account < lp_leg.issuer { !neg } else { neg };
+                    party_holds && bal.0 > 0
+                })
+                .unwrap_or(false);
+            if !holds {
+                return TxResult::AmmInvalidTokens;
+            }
+        }
         TxResult::Success
     }
 
@@ -1672,6 +1706,66 @@ mod tests {
         };
         assert_eq!(AMMVoteTransactor.preflight(&vote_tx), TxResult::Success);
         assert_eq!(AMMVoteTransactor.do_apply(&vote_tx, &mut sandbox), TxResult::Success);
+    }
+
+    /// #106072851 2B47FAF6 and three siblings: a bot votes on a pool it never
+    /// joined. rippled's preclaim (AMMVote.cpp:59-77) answers tecAMM_EMPTY
+    /// for an emptied pool and tecAMM_INVALID_TOKENS for a voter with no LP
+    /// tokens — "AMM Vote: account is not LP."
+    #[test]
+    fn amm_vote_requires_lp_tokens() {
+        let voter = [0x01u8; 20];
+        let issuer = [0x02u8; 20];
+        let amm_acct = [0x05u8; 20];
+        let mut state = make_state(&voter, 100_000_000);
+        let tx = TxFields {
+            account: voter,
+            tx_type: "AMMVote".to_string(),
+            fee: 12,
+            sequence: 2,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Asset": {"currency": "XRP"},
+                "Asset2": {"currency": "USD", "issuer": hex::encode(issuer)},
+                "TradingFee": 300,
+            }),
+        };
+        let akey = amm_key_from_asset_fields(&tx).unwrap();
+        let amm = |lpt: &str| {
+            serde_json::json!({
+                "LedgerEntryType": "AMM", "Account": hex::encode(amm_acct),
+                "LPTokenBalance": {"value": lpt}, "TradingFee": 0,
+            })
+        };
+        state.state_map.insert(akey, serde_json::to_vec(&amm("1000")).unwrap()).unwrap();
+
+        // No LP line at all: not an LP.
+        assert_eq!(
+            AMMVoteTransactor.preclaim(&tx, &Sandbox::new(&state)),
+            TxResult::AmmInvalidTokens,
+        );
+
+        // Holding LP tokens: allowed. Voter [0x01] is LOW against the AMM
+        // account [0x05], so a positive Balance is held by the voter.
+        let (_, aacct, lp_leg) = amm_ctx(&tx, &Sandbox::new(&state)).expect("amm ctx");
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+            "Balance": {"currency": hex::encode_upper(lp_leg.cur),
+                        "issuer": "0000000000000000000000000000000000000000", "value": "5"},
+        });
+        state
+            .state_map
+            .insert(
+                keylet::ripple_state_key(&voter, &aacct, &lp_leg.cur),
+                serde_json::to_vec(&line).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(AMMVoteTransactor.preclaim(&tx, &Sandbox::new(&state)), TxResult::Success);
+
+        // An emptied pool refuses BEFORE the holds check, even for an LP.
+        state.state_map.insert(akey, serde_json::to_vec(&amm("0")).unwrap()).unwrap();
+        assert_eq!(AMMVoteTransactor.preclaim(&tx, &Sandbox::new(&state)), TxResult::AmmEmpty);
     }
 
     #[test]

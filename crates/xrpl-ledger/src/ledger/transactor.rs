@@ -88,6 +88,9 @@ pub enum TxResult {
     /// `AMMWithdraw::preclaim` splits this from `tecAMM_BALANCE`: holding NONE
     /// is a balance failure, holding SOME BUT TOO FEW is an invalid-tokens one.
     AmmInvalidTokens,
+    /// The pool's LPTokenBalance is zero — an emptied AMM awaiting deletion
+    /// refuses votes/deposits-without-tfTwoAssetIfEmpty with tecAMM_EMPTY.
+    AmmEmpty,
     /// Directory is full (e.g. > 250 outstanding tickets).
     DirFull,
     /// Creating the owned object(s) would breach the account's owner reserve.
@@ -155,6 +158,7 @@ impl TxResult {
             | TxResult::InsufficientFunds
             | TxResult::AmmBalance
             | TxResult::AmmInvalidTokens
+            | TxResult::AmmEmpty
             | TxResult::HasObligations
             | TxResult::DirFull
             | TxResult::InsufficientReserve
@@ -199,6 +203,7 @@ impl TxResult {
             TxResult::InsufficientFunds => "tecINSUFFICIENT_FUNDS",
             TxResult::AmmBalance => "tecAMM_BALANCE",
             TxResult::AmmInvalidTokens => "tecAMM_INVALID_TOKENS",
+            TxResult::AmmEmpty => "tecAMM_EMPTY",
             TxResult::HasObligations => "tecHAS_OBLIGATIONS",
             TxResult::DirFull => "tecDIR_FULL",
             TxResult::InsufficientReserve => "tecINSUFFICIENT_RESERVE",

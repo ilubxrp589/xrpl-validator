@@ -1131,12 +1131,18 @@ fn load_book_pair(
     }
 }
 
-/// AMM Deposit/Withdraw pre-state: the pool account's owner-directory ROOT
-/// (the dir walk starts there; meta only carries the touched page) plus the
-/// depositor's dir root and both parties' account roots.
+/// AMM Deposit/Withdraw/Vote pre-state: the pool account's owner-directory
+/// ROOT (the dir walk starts there; meta only carries the touched page) plus
+/// the depositor's dir root and both parties' account roots. For AMMVote the
+/// load matters even though a vote moves nothing: the not-an-LP refusal
+/// (tecAMM_INVALID_TOKENS) reads the pool object and the voter's LPToken
+/// line, and a fee-only tec touches neither, so no other loader fetches them.
 fn load_amm_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
     let tt = txj["TransactionType"].as_str();
-    if !matches!(tt, Some("AMMDeposit") | Some("AMMWithdraw") | Some("AMMCreate")) {
+    if !matches!(
+        tt,
+        Some("AMMDeposit") | Some("AMMWithdraw") | Some("AMMCreate") | Some("AMMVote")
+    ) {
         return;
     }
     if let Some(acct) = txj["Account"].as_str().and_then(decode_address) {
