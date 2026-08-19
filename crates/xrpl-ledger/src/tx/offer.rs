@@ -1799,6 +1799,15 @@ fn cross_bridged(
     // Per-leg AMM liquidity: each bridge leg is a BookStep of its own pair.
     let amm_a = crate::tx::amm_swap::discover(sandbox, gets_leg, &xrp_leg, taker);
     let amm_b = crate::tx::amm_swap::discover(sandbox, &xrp_leg, pays_leg, taker);
+    if std::env::var("DX_BRIDGE").is_ok() {
+        let ka = keylet::amm_key(&gets_leg.cur, &gets_leg.issuer, &xrp_leg.cur, &xrp_leg.issuer);
+        let kb = keylet::amm_key(&xrp_leg.cur, &xrp_leg.issuer, &pays_leg.cur, &pays_leg.issuer);
+        eprintln!(
+            "DX_BRIDGE ammdisc a={} a_key={} a_in_sb={} b={} b_key={} b_in_sb={}",
+            amm_a.is_some(), hex::encode(&ka.0[..8]), sandbox.exists(&ka),
+            amm_b.is_some(), hex::encode(&kb.0[..8]), sandbox.exists(&kb),
+        );
+    }
     let amm_a_init = amm_a
         .as_ref()
         .map(|a| crate::tx::amm_swap::pool_balances(sandbox, a, &xrp_leg, gets_leg))
@@ -1899,6 +1908,28 @@ fn cross_bridged(
             (Some(_), None) => true,
             _ => false,
         };
+        // fixAMMv1_1 `qualityThreshold` override (BookStep.cpp:461, 475-481):
+        // in SINGLE-path crossing, when the strand's limitQuality is BETTER
+        // than a leg's LOB tip — a unit-blind Quality compare, so on bridge
+        // legs it contrasts cross-pair rates and drops-inflation decides — the
+        // AMM is not anchored to the tip: `getAMMOffer(nullopt)` emits the
+        // unbounded curve-priced maxOffer, and `checkQualityThreshold` prunes
+        // every CLOB offer by the same compare, so the pool is that leg's ONLY
+        // liquidity. C966717C legB receipt: `TRYAMM lob=59555359684 thr=none`
+        // — the better-priced 59555 CLOB tip never executes; the pool prices
+        // 0.02981 BTC at 1809.549786 XRP and the realised 64107.6 misses
+        // limit 64036.19, resting the offer. `qualityThreshold_` is rippled's
+        // TRUE limitQuality — our transfer-rate-inflated `threshold_self`.
+        // Single-path only ("Multi-path AMM offers work the same as LOB
+        // offers"), so the forcing is applied after `multi_now` is known;
+        // admission (ub) and candidate selection stay tip-based, exactly as
+        // rippled's `qualityUpperBound` does.
+        let a_unb_raw = amm_a.is_some()
+            && threshold_self != 0
+            && apeek.as_ref().is_some_and(|(q, ..)| threshold_self < *q);
+        let b_unb_raw = amm_b.is_some()
+            && threshold_self != 0
+            && bpeek.as_ref().is_some_and(|(q, ..)| threshold_self < *q);
     // An AMM leg does NOT price linearly. `b_out_full/b_in_full` is the ratio of
     // that leg's fib SLICE — on #105912454 leg B the slice is ~26.1M drops while
     // the pass moves 1M — so scaling it down linearly under-delivers and every
@@ -1906,8 +1937,8 @@ fn cross_bridged(
     // through the pool instead, which is what rippled's AMMOffer does on
     // execution (swapAssetIn / swapAssetOut), reserving the slice purely for
     // sizing.
-    let reprice_b = |xrp: Me, lin: Me, sandbox: &Sandbox| -> Me {
-        match (b_use_amm, amm_b.as_ref()) {
+    let reprice_b = |use_amm: bool, xrp: Me, lin: Me, sandbox: &Sandbox| -> Me {
+        match (use_amm, amm_b.as_ref()) {
             (true, Some(am)) => {
                 let (pin, pout) = crate::tx::amm_swap::pool_balances(sandbox, am, pays_leg, &xrp_leg);
                 if pin.0 == 0 || pout.0 == 0 {
@@ -1924,8 +1955,8 @@ fn cross_bridged(
     // Doing that step linearly at the offer's average ratio is what still broke
     // #105940336 after the forward repricing was fixed: at `maxOffer` the
     // average is ~100x off spot, so the reverse map produced an absurd `xrp`.
-    let unreprice_b = |pays_out: Me, lin: Me, sandbox: &Sandbox| -> Me {
-        match (b_use_amm, amm_b.as_ref()) {
+    let unreprice_b = |use_amm: bool, pays_out: Me, lin: Me, sandbox: &Sandbox| -> Me {
+        match (use_amm, amm_b.as_ref()) {
             (true, Some(am)) => {
                 let (pin, pout) = crate::tx::amm_swap::pool_balances(sandbox, am, pays_leg, &xrp_leg);
                 if pin.0 == 0 || pout.0 == 0 {
@@ -1938,8 +1969,8 @@ fn cross_bridged(
             _ => lin,
         }
     };
-    let unreprice_a = |gets_in: Me, lin: Me, sandbox: &Sandbox| -> Me {
-        match (a_use_amm, amm_a.as_ref()) {
+    let unreprice_a = |use_amm: bool, gets_in: Me, lin: Me, sandbox: &Sandbox| -> Me {
+        match (use_amm, amm_a.as_ref()) {
             (true, Some(am)) => {
                 let (pin, pout) = crate::tx::amm_swap::pool_balances(sandbox, am, &xrp_leg, gets_leg);
                 if pin.0 == 0 || pout.0 == 0 {
@@ -1951,8 +1982,8 @@ fn cross_bridged(
             _ => lin,
         }
     };
-    let reprice_a = |xrp: Me, lin: Me, sandbox: &Sandbox| -> Me {
-        match (a_use_amm, amm_a.as_ref()) {
+    let reprice_a = |use_amm: bool, xrp: Me, lin: Me, sandbox: &Sandbox| -> Me {
+        match (use_amm, amm_a.as_ref()) {
             (true, Some(am)) => {
                 let (pin, pout) = crate::tx::amm_swap::pool_balances(sandbox, am, &xrp_leg, gets_leg);
                 if pin.0 == 0 || pout.0 == 0 {
@@ -2201,11 +2232,11 @@ thr={t:?} admits_trunc={} admits_up={}",
                 gets_in = rem_gets;
                 xrp = me_muldiv(gets_in, a_out_f, a_in_f, false);
             }
-            let mut pays_out = reprice_b(xrp, me_muldiv(xrp, b_out_f, b_in_f, false), sandbox);
+            let mut pays_out = reprice_b(b_use_amm, xrp, me_muldiv(xrp, b_out_f, b_in_f, false), sandbox);
             if !sell && me_cmp(pays_out, rem_pays).is_gt() {
                 pays_out = rem_pays;
                 xrp = me_muldiv(pays_out, b_in_f, b_out_f, true);
-                gets_in = reprice_a(xrp, me_muldiv(xrp, a_in_f, a_out_f, true), sandbox);
+                gets_in = reprice_a(a_use_amm, xrp, me_muldiv(xrp, a_in_f, a_out_f, true), sandbox);
             }
             if me_is_zero(gets_in) || me_is_zero(pays_out) { return None; }
             rate_of_me(gets_in, pays_out)
@@ -2353,7 +2384,17 @@ thr={t:?} admits_trunc={} admits_up={}",
         // rippled evaluates `setMultiPath(activeStrands.size() > 1)` AFTER
         // `activateNext` filtered the candidates, and `AMMLiquidity::getOffer`
         // picks the slice SHAPE from it.
-        let multi_now = match thr {
+        // Admission compares fee-free upper bounds against rippled's TRUE
+        // limitQuality — the transfer-rate-INFLATED `threshold_self`, not the
+        // net `threshold` the realised-side gates use (there trIn's grossing
+        // cancels the inflation; at admission nothing grosses, so the
+        // inflated limit is what admits fee-bearing strands). 4A13D048
+        // (l105887283, BTC.Bitstamp 1.0015): direct-tip 1.5271e-5 admits
+        // against 1.5288e-5 but fails the net 1.5265e-5 — rippled's receipt
+        // is `activeStrands 2 multiPath true`, AMM anchored, CLOB fills.
+        let thr_admit = (threshold_self != 0 && threshold_self != u64::MAX)
+            .then(|| rate_me(threshold_self));
+        let multi_now = match thr_admit {
             Some(t) => {
                 let w = |q: Option<Me>| q.is_some_and(|v| me_cmp(v, t).is_le());
                 (w(d_tip) as u8) + (w(bq_ub) as u8) > 1
@@ -2362,6 +2403,10 @@ thr={t:?} admits_trunc={} admits_up={}",
             // `strands.size() > 1`, which a bridged payment satisfies.
             None => true,
         };
+        // The qualityThreshold override is single-path only: force the pool
+        // leg now that multiPath is known (see a_unb_raw above).
+        let a_use_amm = a_use_amm || (!multi_now && a_unb_raw);
+        let b_use_amm = b_use_amm || (!multi_now && b_unb_raw);
         // ⚠ Under multiPath, a clamped POOL fill is priced at the OFFER'S
         // QUALITY, not re-swapped through the conservation function:
         //     if (ammLiquidity_.multiPath())
@@ -2382,16 +2427,16 @@ thr={t:?} admits_trunc={} admits_up={}",
         // through the pool gives 218.8500354154254, which is 0.0433220545677
         // cheaper and is what we charged.
         let rp_a = |xrp: Me, lin: Me, sandbox: &Sandbox| -> Me {
-            if multi_now { lin } else { reprice_a(xrp, lin, sandbox) }
+            if multi_now { lin } else { reprice_a(a_use_amm, xrp, lin, sandbox) }
         };
         let rp_b = |xrp: Me, lin: Me, sandbox: &Sandbox| -> Me {
-            if multi_now { lin } else { reprice_b(xrp, lin, sandbox) }
+            if multi_now { lin } else { reprice_b(b_use_amm, xrp, lin, sandbox) }
         };
         let urp_a = |gets_in: Me, lin: Me, sandbox: &Sandbox| -> Me {
-            if multi_now { lin } else { unreprice_a(gets_in, lin, sandbox) }
+            if multi_now { lin } else { unreprice_a(a_use_amm, gets_in, lin, sandbox) }
         };
         let urp_b = |pays_out: Me, lin: Me, sandbox: &Sandbox| -> Me {
-            if multi_now { lin } else { unreprice_b(pays_out, lin, sandbox) }
+            if multi_now { lin } else { unreprice_b(b_use_amm, pays_out, lin, sandbox) }
         };
         // SINGLE PATH takes `maxOffer`, not a fib slice. The UPPER BOUND above
         // keeps the fib slice deliberately — `activateNext` runs BEFORE
