@@ -1108,6 +1108,37 @@ impl Transactor for AMMWithdrawTransactor {
             None
         };
 
+        // rippled's withdraw() core judges the ACTUAL burn against the LP's
+        // position for EVERY mode (AMMWithdraw.cpp:515-520): tokens that
+        // exceed the holding — or adjust away to nothing — are
+        // tecAMM_INVALID_TOKENS. The explicit-LPTokenIn form was already
+        // judged above; the amount-driven modes DERIVE their burn and must
+        // face the same judge. #106363879 55335BB9: tfSingleAsset taking
+        // 538.5 XRP derives a burn of 396924.53 LP against 369936.01 held —
+        // rippled's trace prints exactly that triple ("failed to withdraw,
+        // invalid LP tokens"). #106290427 CCD6E831 is the tfTwoAsset twin.
+        let derived_burn =
+            wd_sized.map(|(_, _, t)| t).or(single_asset_burn.map(|(_, t)| t));
+        if let Some(t) = derived_burn {
+            if t.0 == 0 || ox::me_cmp(t, lp_held).is_gt() {
+                sandbox.restore_snapshot(snap);
+                return TxResult::AmmInvalidTokens;
+            }
+        }
+        // tfOneAssetLPToken: the Amount is a MINIMUM — a burn whose worth
+        // comes up short of it is tecAMM_FAILED (singleWithdrawTokens,
+        // AMMWithdraw.cpp:1020ff, judged BEFORE the withdraw() core).
+        // #106049416 3E802DB7: 3M LP buys less XDP than the 2452869.94
+        // floor, so mainnet takes the fee and stops.
+        if let Some((out, _)) = one_asset {
+            if let Some(minimum) = tx.fields.get("Amount").and_then(keylet::amount_mant_exp) {
+                if ox::me_cmp(out, minimum).is_lt() {
+                    sandbox.restore_snapshot(snap);
+                    return TxResult::AmmFailed;
+                }
+            }
+        }
+
         // Move the withdrawn side(s) AMM account → withdrawer.
         for (i, f) in ["Amount", "Amount2"].iter().enumerate() {
             if let Some(v) = tx.fields.get(*f) {
