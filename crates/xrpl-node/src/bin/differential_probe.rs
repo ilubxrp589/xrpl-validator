@@ -1199,6 +1199,32 @@ fn load_amm_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_ind
             load_object(state, url, &k, ledger_index);
         }
     }
+    // The DEPOSITOR's own trust line for each non-XRP deposited amount. The
+    // engine's funds test (rippled's `balance`/`checkBalance` lambda) reads
+    // it, and a line the sandbox lacks reads as HOLDING NOTHING — so a funded
+    // depositor gets condemned with tecUNFUNDED_AMM before the verdict
+    // mainnet actually reached. #105869720 878CD973 (tecAMM_FAILED) and
+    // #105893158 85C32164 (tecINSUF_RESERVE_LINE) both regressed exactly that
+    // way when the check landed without this loader: their old code paths
+    // returned before ever touching the line, so nothing else fetches it.
+    // Same lesson as the pool lines above: widen what the engine reads,
+    // widen what the probe hydrates — in ONE change.
+    if let Some(dep) = txj["Account"].as_str().and_then(decode_address) {
+        for f in ["Amount", "Amount2"] {
+            let Some(a) = txj.get(f) else { continue };
+            let (Some(cur), Some(iss)) = (
+                a.get("currency").and_then(|v| v.as_str()),
+                a.get("issuer").and_then(|v| v.as_str()).and_then(decode_issuer),
+            ) else { continue };
+            if cur == "XRP" {
+                continue;
+            }
+            let k = hex::encode_upper(
+                keylet::ripple_state_key(&dep, &iss, &currency_code(cur)).0,
+            );
+            load_object(state, url, &k, ledger_index);
+        }
+    }
     // The depositor's LPToken trust line, so the reserve check knows whether
     // this is a first-time deposit (ownerCountAdj = 1) or a repeat LP (0).
     if let (Some(dep), Some(amm_id), Some(lp_cur)) = (

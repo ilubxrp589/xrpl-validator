@@ -444,6 +444,63 @@ fn equal_withdraw_limit(
 
 // ─── AMMDeposit ───
 
+/// One leg of rippled's AMMDeposit funds test — the `balance` lambda in
+/// preclaim (AMMDeposit.cpp:230-252) and `checkBalance` in deposit()
+/// (AMMDeposit.cpp:514-538) share this shape. XRP is judged as `xrpLiquid`
+/// with the owner count bumped by one when the depositor has NO LPToken line
+/// yet (the deposit is about to create it); an IOU as `accountFunds` under
+/// IgnoreFreeze — the raw signed line balance, the leg's issuer never short,
+/// a missing line holding nothing. Freeze is deliberately NOT consulted:
+/// rippled refuses frozen assets elsewhere (the AMMClawback preclaim check),
+/// not in this lambda — zeroing frozen holdings here would swap rippled's
+/// freeze verdict for a wrong tecUNFUNDED_AMM.
+fn deposit_leg_funded(
+    sandbox: &Sandbox,
+    who: &[u8; 20],
+    leg: &crate::tx::offer::Leg,
+    amt: crate::tx::offer::Me,
+    amm_acct: &[u8; 20],
+    lp_cur: &[u8; 20],
+) -> bool {
+    use crate::tx::offer as ox;
+    let dbg = std::env::var("DX_AMMFUND").is_ok();
+    if leg.xrp {
+        let Some(acct) = ox::json_at(sandbox, &keylet::account_root_key(who)) else {
+            return true; // unreadable depositor: never condemn on absence
+        };
+        let oc = acct["OwnerCount"].as_u64().unwrap_or(0);
+        let bal = acct["Balance"].as_str().and_then(|s| s.parse::<u128>().ok()).unwrap_or(0);
+        let lp_line = keylet::ripple_state_key(who, amm_acct, lp_cur);
+        let adj = u64::from(!sandbox.exists(&lp_line));
+        let liquid =
+            bal.saturating_sub(crate::ledger::fees::account_reserve(sandbox, oc + adj) as u128);
+        let want = ox::me_rescale(amt, 0, false);
+        if dbg {
+            eprintln!("DX_AMMFUND xrp bal={bal} oc={oc} adj={adj} liquid={liquid} want={want}");
+        }
+        liquid >= want
+    } else if who == &leg.issuer {
+        true // the issuer funds its own IOU without limit
+    } else {
+        let Some(line) =
+            ox::json_at(sandbox, &keylet::ripple_state_key(who, &leg.issuer, &leg.cur))
+        else {
+            if dbg {
+                eprintln!("DX_AMMFUND iou NO-LINE want={amt:?}");
+            }
+            return false; // no line, nothing held
+        };
+        let (neg, bal) = ox::signed_value(&line["Balance"]);
+        // Balance is stored from the LOW account's perspective.
+        let party_holds = if who < &leg.issuer { !neg } else { neg };
+        let ok = party_holds && bal.0 > 0 && ox::me_cmp(bal, amt) != std::cmp::Ordering::Less;
+        if dbg {
+            eprintln!("DX_AMMFUND iou holds={party_holds} bal={bal:?} want={amt:?} ok={ok}");
+        }
+        ok
+    }
+}
+
 pub struct AMMDepositTransactor;
 
 impl Transactor for AMMDepositTransactor {
@@ -490,7 +547,19 @@ impl Transactor for AMMDepositTransactor {
                 let (Some(leg), Some(amt)) = (ox::leg_of(v), keylet::amount_mant_exp(v)) else {
                     continue;
                 };
-                if !leg.xrp || amt.0 == 0 {
+                if amt.0 == 0 {
+                    continue;
+                }
+                if !leg.xrp {
+                    // The IOU arm of the same `balance` lambda
+                    // (AMMDeposit.cpp:245-252): accountFunds under
+                    // IgnoreFreeze must cover the STATED amount, else
+                    // tecUNFUNDED_AMM — no INSUF_RESERVE_LINE split on this
+                    // side, that verdict is the XRP branch's alone.
+                    if !deposit_leg_funded(sandbox, &tx.account, &leg, amt, &amm_acct, &lp_leg.cur)
+                    {
+                        return TxResult::UnfundedAmm;
+                    }
                     continue;
                 }
                 let Some(acct) = ox::json_at(sandbox, &acct_key) else { continue };
@@ -634,6 +703,29 @@ impl Transactor for AMMDepositTransactor {
                         _ => amt0,
                     };
                     if amt.0 > 0 {
+                        // rippled re-checks each ACTUAL amount right before
+                        // sending it (`checkBalance`, AMMDeposit.cpp:514-538
+                        // — check, send, check, send; both branches verdict
+                        // tecUNFUNDED_AMM). Preclaim passed the STATED
+                        // amounts on the PRE-fee balance; by now the fee is
+                        // gone and the amounts are the derived actuals.
+                        //
+                        // #106120152 8574794F calibrates it: stated XRP
+                        // 14432011 equals the pre-fee liquid EXACTLY
+                        // (15832011 − reserve(2) 1400000), so preclaim
+                        // passes by zero margin; post-fee liquid 14431999
+                        // is 12 drops short of the actual and mainnet
+                        // refuses. Five specimens, all this shape.
+                        if !deposit_leg_funded(
+                            sandbox,
+                            &tx.account,
+                            &leg,
+                            amt,
+                            &amm_acct,
+                            &lp_leg.cur,
+                        ) {
+                            return TxResult::UnfundedAmm;
+                        }
                         ox::move_leg(sandbox, &tx.account, &amm_acct, &leg, amt);
                     }
                 }
@@ -1432,6 +1524,30 @@ mod tests {
         });
         let akey = keylet::amm_key(&plx_leg.cur, &plx_leg.issuer, &xrp_leg.cur, &xrp_leg.issuer);
         state.state_map.insert(akey, serde_json::to_vec(&amm).unwrap()).unwrap();
+
+        // The depositor must actually HOLD the PLX side: the preclaim now
+        // judges the IOU leg too (the balance lambda's other arm), and with
+        // no line at all rippled answers tecUNFUNDED_AMM on Amount before
+        // ever reaching the XRP branch this test is about. The mainnet
+        // specimen's depositor held its PLX; model that. Depositor [0x01] is
+        // the LOW side against issuer [0x02], so a positive Balance is held
+        // by the depositor.
+        {
+            let plx_line = serde_json::json!({
+                "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+                "Balance": {"currency": hex::encode_upper(plx_leg.cur),
+                            "issuer": "0000000000000000000000000000000000000000", "value": "5000"},
+                "LowLimit": {"currency": hex::encode_upper(plx_leg.cur), "issuer": hex::encode(depositor), "value": "1000000"},
+                "HighLimit": {"currency": hex::encode_upper(plx_leg.cur), "issuer": hex::encode(issuer), "value": "0"},
+            });
+            state
+                .state_map
+                .insert(
+                    keylet::ripple_state_key(&depositor, &issuer, &plx_leg.cur),
+                    serde_json::to_vec(&plx_line).unwrap(),
+                )
+                .unwrap();
+        }
 
         let tx = TxFields {
             account: depositor,
