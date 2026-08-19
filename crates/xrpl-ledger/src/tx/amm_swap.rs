@@ -912,6 +912,58 @@ pub(crate) fn discover(sandbox: &Sandbox, spend: &Leg, want: &Leg, taker: &[u8; 
 /// Pool balance of `leg` held by the AMM account (rippled ammAccountHolds:
 /// full XRP balance with NO reserve subtraction; signed line balance toward
 /// the account for IOU).
+/// BookOfferCrossingStep::qualityUpperBound for an AMM-bearing strand with no
+/// better CLOB tip: the bound is the quality of the slice anchored AT the
+/// limit (`qualityThreshold_`, the transfer-rate-inflated limitQuality),
+/// GROSSED by trIn — the book step charges the IN issuer's rate on the
+/// taker's spend (`getOfrInRate`), so the strand-level quality carries it
+/// even though the pool itself sees net amounts. If that bound misses the
+/// limit, `activateNext` drops the strand and the pool never fills the tail.
+///
+/// #106225714 0FE0E3C5 (sell USD.Bitstamp, limit 1.0305435e-6): iter 1's ub
+/// receipt is `changeSpotPriceQuality succeeded: … 5693578978996306944 220
+/// 2.828078429588094 2748242` — the slice anchored ≈ at the limit, net avg
+/// 1.029050e-6, ×1.0015 trIn = 1.030594e-6 > limit → `admitted false`,
+/// `All strands dry`, mainnet rests the remainder. Our unanchored tail
+/// (maxOffer + limitOut, avg sized exactly to the limit) filled 2.62105 USD
+/// the strand was never allowed to flow.
+///
+/// `gross_in_rate` = the gets-side issuer's TransferRate when the taker is
+/// not that issuer (else None). Permissive on generation failure — the spot
+/// gate inside `consume` still governs.
+pub(crate) fn tail_admission(
+    sandbox: &Sandbox,
+    amm: &Amm,
+    pays_leg: &Leg,
+    gets_leg: &Leg,
+    thr_self: u64,
+    gross_in_rate: Option<u64>,
+) -> bool {
+    let pool_in = holds(sandbox, &amm.account, gets_leg);
+    let pool_out = holds(sandbox, &amm.account, pays_leg);
+    if pool_in.0 == 0 || pool_out.0 == 0 {
+        return true;
+    }
+    let Some((si, so)) =
+        anchored_offer(pool_in, pool_out, gets_leg.xrp, pays_leg.xrp, thr_self, amm.tfee)
+    else {
+        return true;
+    };
+    let q = rate_of(si, so);
+    let qg = match gross_in_rate {
+        Some(r) => {
+            let m = ox::me_muldiv(ox::rate_me(q), (r as u128, 0), (1_000_000_000, 0), true);
+            crate::ledger::keylet::rate_encode(m.0, m.1, 1, 0).unwrap_or(q)
+        }
+        None => q,
+    };
+    let admit = qg <= thr_self;
+    if std::env::var("DX_AMM").is_ok() {
+        eprintln!("DX_AMM tail_admission slice=({si:?},{so:?}) q={q:x} qg={qg:x} thr_self={thr_self:x} admit={admit}");
+    }
+    admit
+}
+
 pub(crate) fn holds(sandbox: &Sandbox, acct: &[u8; 20], leg: &Leg) -> Me {
     if leg.xrp {
         let key = keylet::account_root_key(acct);

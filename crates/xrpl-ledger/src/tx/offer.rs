@@ -3840,7 +3840,21 @@ pub(crate) fn cross_engine_to(
     }
     // Final AMM turn once the book is exhausted (maxOffer sizing).
     if let Some(a) = &amm {
-        if !done(rem_pays, rem_gets) {
+        // For a CROSSING with no remembered anchor, the strand must first be
+        // ADMITTED: `qualityUpperBound` of an AMM-bearing strand is the
+        // anchored-at-limit slice's quality grossed by trIn, and a miss drops
+        // the strand before it ever flows (see amm_swap::tail_admission,
+        // #106225714 0FE0E3C5). Payments carry no limitQuality and skip this.
+        let tail_admitted = !(offer_crossing
+            && threshold_self != 0
+            && threshold_self != u64::MAX
+            && self_anchor_q.is_none())
+            || {
+                let gr = transfer_rate(sandbox, gets_leg)
+                    .filter(|_| !gets_leg.xrp && taker != &gets_leg.issuer);
+                crate::tx::amm_swap::tail_admission(sandbox, a, pays_leg, gets_leg, threshold_self, gr)
+            };
+        if tail_admitted && !done(rem_pays, rem_gets) {
             if std::env::var("DX_AMM").is_ok() {
                 eprintln!("DX_AMM site=direct-tail");
             }
