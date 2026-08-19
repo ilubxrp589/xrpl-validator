@@ -7,6 +7,7 @@ pub mod amm;
 pub mod amm_swap;
 pub mod check;
 pub mod credential;
+pub mod direct_step;
 pub mod dispatch;
 pub mod escrow;
 pub mod misc;

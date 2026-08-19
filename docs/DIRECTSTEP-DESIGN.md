@@ -1,6 +1,6 @@
 # DirectStepI — rippling through accounts, composed with book steps
 
-Status: DESIGN (2026-08-19). Target: the 7-specimen `Payment
+Status: STAGE 1 SHIPPED (2026-08-19, gate dstep1 at baseline); stage 2 pending. Target: the 7-specimen `Payment
 tecPATH_DRY-v-tesSUCCESS` family — 106102038 `5B97B89E`, 106206499
 `3B4F9C9AEF`, 106311829 `9684A861` + `D2EB36BA`, 106373989 `8CAD0435`,
 106374244 `7511A01A` (+ the doc's earlier 106146562-class refusals, which
@@ -124,7 +124,8 @@ its hydration must not drift**). The probe loads, per strand: every
 DirectHop's mutual line + both AccountRoots (TransferRate), plus the book
 prefetches it already does.
 
-**Stage 1 — pure-direct strands** (clears 106102038, 106373989):
+**Stage 1 — pure-direct strands** (SHIPPED — cleared 106102038 126/126 and
+106373989 417/417):
 a self-contained executor for strands with no Book hops: rev right-to-left
 sizing per §2, fwd left-to-right, `direct_ripple_credit` per step, wired
 into the existing round loop (partial payments, DeliverMin, delivered
@@ -155,3 +156,18 @@ beyond what the round loop does today.
 - *Behavioral widening*: strands that used to be dropped now execute. The
   gates + a 60-ledger fresh-rate batch after stage 2 are the guard; any
   new refusing-direction divergence is a stage-2 stop-the-line.
+
+## 6. Stage-1 findings that bind stage 2
+
+- `mulRatio` is NOT exact-ceil: quotient at ≤19 digits, residue tracked,
+  HALF-EVEN normalize to 16, then +1 ulp iff roundUp AND residue. The port
+  (`direct_step::mul_ratio`) reproduces both traced charges digit-exact;
+  exact-ceil is one ulp short. Stage 2's book/direct joints must use it.
+- The dry precheck is operationally `maxPaymentFlow == 0` — a redeeming
+  source is never dry. The first port asked whether DST held anything and
+  condemned every holder→gateway hop; symmetric test-fixture limits masked
+  it. Real gateways extend no limit back.
+- The round loop's units: rem_in (net) / rem_in_gross, rem_out (gross) /
+  net target for direct passes, delivered (gross, books) /
+  delivered_direct (net). A direct strand both spends and delivers with
+  fees already inside; every book-shaped pre/post adjustment must skip it.

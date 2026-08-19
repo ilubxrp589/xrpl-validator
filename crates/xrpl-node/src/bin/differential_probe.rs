@@ -1011,6 +1011,50 @@ fn load_payment_books(
         Some("Payment") => {
             let Some(sm) = txj.get("SendMax") else { return };
             let (Some(s), Some(w)) = (spec(sm), spec(&txj["Amount"])) else { return };
+            // PURE-ACCOUNT paths (rippling): the engine's DirectStepI hops
+            // read every MUTUAL line along the account sequence plus each
+            // account's TransferRate, and a fee-only refusal's meta touches
+            // none of them. The sequence is computed by the SAME normalizer
+            // the engine uses (direct_step::pure_account_sequence), so the
+            // check and its hydration cannot drift.
+            {
+                let iou_iss = |v: &Value| -> Option<[u8; 20]> {
+                    v.get("issuer").and_then(|i| i.as_str()).and_then(decode_address)
+                };
+                let iou_cur = |v: &Value| -> Option<String> {
+                    v.get("currency").and_then(|c| c.as_str()).map(str::to_string)
+                };
+                if let (Some(src), Some(dst), Some(smi), Some(di), Some(c1), Some(c2)) = (
+                    txj["Account"].as_str().and_then(decode_address),
+                    txj["Destination"].as_str().and_then(decode_address),
+                    iou_iss(sm),
+                    iou_iss(&txj["Amount"]),
+                    iou_cur(sm),
+                    iou_cur(&txj["Amount"]),
+                ) {
+                    if c1 == c2 {
+                        let cur20 = currency_code(&c1);
+                        for p in txj["Paths"].as_array().into_iter().flatten().filter_map(|p| p.as_array()) {
+                            let Some(seq) = xrpl_ledger::tx::direct_step::pure_account_sequence(
+                                &src, &dst, &di, &smi, p,
+                            ) else {
+                                continue;
+                            };
+                            for a in &seq {
+                                // By ledger index — no base58 round-trip.
+                                let k = hex::encode_upper(keylet::account_root_key(a).0);
+                                load_object(&mut *state, url, &k, ledger_index);
+                            }
+                            for wpair in seq.windows(2) {
+                                let k = hex::encode_upper(
+                                    keylet::ripple_state_key(&wpair[0], &wpair[1], &cur20).0,
+                                );
+                                load_object(&mut *state, url, &k, ledger_index);
+                            }
+                        }
+                    }
+                }
+            }
             let paths = txj["Paths"].as_array().filter(|p| !p.is_empty());
             match paths {
                 Some(ps) => {

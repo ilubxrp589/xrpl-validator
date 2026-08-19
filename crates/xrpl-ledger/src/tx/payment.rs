@@ -1385,6 +1385,11 @@ impl PaymentTransactor {
         } else {
             Self::transfer_rate(sandbox, &spend_leg)
         };
+        // Direct strands charge the input rate INSIDE the strand (a hop's
+        // srcQOut, DirectStep.cpp:764-765), so they spend GROSS — dividing
+        // their remainder here would double-charge. Books spend NET (the
+        // walk debits per fill). Both remainders are tracked below.
+        let spend0_gross = spend0;
         let spend0 = match spend_rate {
             Some(r) => ox::me_muldiv(spend0, (1_000_000_000, 0), (r as u128, 0), false),
             None => spend0,
@@ -1413,6 +1418,55 @@ impl PaymentTransactor {
         let no_direct =
             tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & TF_NO_RIPPLE_DIRECT != 0;
         let (path_chains, named_paths) = Self::path_chains(tx);
+        // PURE-ACCOUNT paths — rippling through accounts with no book hop.
+        // `path_legs` has always dropped these (they are invisible to
+        // `path_chains`); each now becomes a strand of DirectStepI hops
+        // (docs/DIRECTSTEP-DESIGN.md stage 1). Only possible when both ends
+        // are the SAME IOU currency: an account element can re-anchor the
+        // issuer but never change the currency, and toStrand inserts a book
+        // the moment the currency differs. Construction-time checks
+        // (terNO_LINE, terNO_AUTH, the dry precheck, the loop dedup) drop a
+        // strand exactly where rippled drops the path.
+        //
+        // #106102038 5B97B89E: CNY through one gateway — src and dst both
+        // hold rKiCet lines, two hops, three mutations. #106373989
+        // 8CAD0435: USDC.rGm7 → USDC.rcEG over four hops, where rcEG's
+        // 1.003 TransferRate is charged inside the strand — which is the
+        // whole reason its SendMax runs 0.3% over its Amount.
+        let mut dstrands: Vec<Vec<crate::tx::direct_step::DirectHop>> = Vec::new();
+        if !spend_leg.xrp && !want_leg.xrp && spend_leg.cur == want_leg.cur {
+            for path in tx
+                .fields
+                .get("Paths")
+                .and_then(|p| p.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|p| p.as_array())
+            {
+                let Some(seq) = crate::tx::direct_step::pure_account_sequence(
+                    &tx.account,
+                    dest,
+                    &want_leg.issuer,
+                    &spend_leg.issuer,
+                    path,
+                ) else {
+                    continue;
+                };
+                let built = crate::tx::direct_step::build_direct_strand(sandbox, &seq, &want_leg.cur);
+                if std::env::var("DX_PAY").is_ok() {
+                    eprintln!(
+                        "DX_PAY direct seq={:?} built={}",
+                        seq.iter().map(|a| hex::encode(&a[..4])).collect::<Vec<_>>(),
+                        built.as_ref().map(|h| h.len() as i64).unwrap_or(-1),
+                    );
+                }
+                if let Some(hops) = built {
+                    if !hops.is_empty() && !dstrands.contains(&hops) {
+                        dstrands.push(hops);
+                    }
+                }
+            }
+        }
         // `path_legs` drops a path we cannot model — an account
         // element that ripples through a THIRD PARTY rather than re-anchoring on
         // the previous leg's issuer. With every named path dropped the fallback
@@ -1433,7 +1487,7 @@ impl PaymentTransactor {
         // against an offer created earlier in the SAME ledger, and returned
         // tesSUCCESS with 3 extra nodes — all belonging to a maker the path
         // never names.
-        if no_direct && named_paths > 0 && path_chains.is_empty() {
+        if no_direct && named_paths > 0 && path_chains.is_empty() && dstrands.is_empty() {
             sandbox.restore_snapshot(snap);
             return TxResult::PathDry;
         }
@@ -1586,7 +1640,10 @@ impl PaymentTransactor {
         }
         // Every named path was unmodellable and the default is suppressed —
         // guarded above for tfNoRippleDirect, so this is the no-Paths shape.
-        if strands.is_empty() {
+        // A live DIRECT strand is a modeled path: nothing to fall back on.
+        if strands.is_empty() && !dstrands.is_empty() {
+            // flow runs on the direct strands alone
+        } else if strands.is_empty() {
             // Nothing left to fall back ON: either the flag forbids the default
             // path or the default path is itself the gateway ripple we just
             // refused. Substituting it would reinstate exactly the strand
@@ -1599,14 +1656,29 @@ impl PaymentTransactor {
         }
         // One strand is the old behaviour exactly: walk the whole book in a
         // single call, no trial run, no second round that can find anything.
-        let multi = strands.len() > 1;
+        let n_books = strands.len();
+        let total_strands = n_books + dstrands.len();
+        let multi = total_strands > 1;
 
         // The payment-wide limitQuality as an Me, for the strand judge below.
         // `None` when tfLimitQuality is unset, which is the common case.
         let thr_me = (threshold != u64::MAX).then(|| ox::rate_me(threshold));
         let mut rem_in = spend0;
+        // The gross twin, spent by DIRECT strands (their hop qualities carry
+        // the input rate); the two stay consistent through the conversions
+        // at the bottom of the round loop.
+        let mut rem_in_gross = spend0_gross;
         let mut rem_out = want_gross;
         let mut delivered: ox::Me = (0, 0);
+        // NET deliveries from DIRECT strands. A book walk credits the
+        // destination GROSS and the post-loop trim carves the issuer's fee
+        // off; a direct strand's last hop credits exactly NET (its srcQOut
+        // charged the fee one hop earlier and destroyed it), so its
+        // deliveries must neither chase the grossed target nor suffer the
+        // trim. #106373989: the 1.003 gross-up asked the strand for more
+        // than its own SendMax could ever deliver and turned a full
+        // delivery into tecPATH_PARTIAL.
+        let mut delivered_direct: ox::Me = (0, 0);
         // rippled's AMMContext, alive for the whole flow: `multiPath()` is
         // `activeStrands.size() > 1`, so a pool offers FIB SLICES rather than
         // `maxOffer` exactly when we run more than one strand, and the counter
@@ -1664,11 +1736,15 @@ impl PaymentTransactor {
             // was rejected, we simply re-ranked on a quantity that moves for
             // the wrong reason. An upper bound does not.
             let order: Vec<usize> = if multi {
-                let mut c: Vec<(usize, ox::Me)> = (0..strands.len())
+                let mut c: Vec<(usize, ox::Me)> = (0..total_strands)
                     .filter_map(|i| {
-                        Self::strand_upper_bound(sandbox, &tx.account, &strands[i], amm_fib.iters)
-                            .filter(|ub| thr_me.is_none_or(|t| ox::me_cmp(*ub, t).is_le()))
-                            .map(|ub| (i, ub))
+                        if i < n_books {
+                            Self::strand_upper_bound(sandbox, &tx.account, &strands[i], amm_fib.iters)
+                        } else {
+                            crate::tx::direct_step::direct_upper_bound(sandbox, &dstrands[i - n_books])
+                        }
+                        .filter(|ub| thr_me.is_none_or(|t| ox::me_cmp(*ub, t).is_le()))
+                        .map(|ub| (i, ub))
                     })
                     .collect();
                 c.sort_by(|a, b| ox::me_cmp(a.1, b.1));
@@ -1682,7 +1758,7 @@ impl PaymentTransactor {
             // The candidates that CLEAR the bound are the active strands, which
             // is what `setMultiPath(activeStrands.size() > 1)` reads.
             multi_now = order.len() > 1;
-            let mut applied: Option<(usize, ox::Me, ox::Me)> = None;
+            let mut applied: Option<(usize, ox::Me, ox::Me, bool)> = None;
             for &i in &order {
                 let try_snap = sandbox.snapshot();
                 let mut try_fib = amm_fib.clone();
@@ -1703,10 +1779,24 @@ impl PaymentTransactor {
                 // re-rounds at 1e-10 each time, so THREE debits land on
                 // 808582.0813613431 and any two-way split lands on …432 —
                 // the count is the whole difference.
-                let (sin, sout) = Self::strand_pass(
-                    tx, dest, &strands[i], rem_in, rem_out, threshold, true,
-                    multi_now.then(|| &mut try_fib), sandbox,
-                );
+                let (sin, sout, sin_gross) = if i < n_books {
+                    let (a, b) = Self::strand_pass(
+                        tx, dest, &strands[i], rem_in, rem_out, threshold, true,
+                        multi_now.then(|| &mut try_fib), sandbox,
+                    );
+                    (a, b, false)
+                } else {
+                    // The direct strand's tail nets the destination — its
+                    // target is the NET remainder.
+                    let net_rem_out = match want_rate {
+                        Some(r) => ox::me_muldiv(rem_out, (1_000_000_000, 0), (r as u128, 0), false),
+                        None => rem_out,
+                    };
+                    let (a, b) = crate::tx::direct_step::direct_strand_pass(
+                        sandbox, &dstrands[i - n_books], rem_in_gross, net_rem_out,
+                    );
+                    (a, b, true)
+                };
                 if std::env::var("DX_PAY").is_ok() {
                     eprintln!("DX_PAY   try round={_round} strand={i} sin={sin:?} sout={sout:?}");
                 }
@@ -1732,17 +1822,48 @@ impl PaymentTransactor {
                     }
                 }
                 amm_fib = try_fib;
-                applied = Some((i, sin, sout));
+                applied = Some((i, sin, sout, sin_gross));
                 break;
             }
-            let Some((pick, sin, sout)) = applied else { break };
+            let Some((pick, sin, sout, sin_gross)) = applied else { break };
             let _ = pick;
             if std::env::var("DX_PAY").is_ok() {
                 eprintln!("DX_PAY round={_round} strand={pick} sin={sin:?} sout={sout:?} rem_in={rem_in:?} rem_out={rem_out:?} multi={multi}");
             }
-            rem_in = ox::me_sub(rem_in, sin);
-            rem_out = ox::me_sub(rem_out, sout);
-            delivered = ox::signed_add(false, delivered, false, sout).1;
+            // Keep BOTH remainders honest whichever kind spent: a direct
+            // strand's sin is GROSS, a book strand's is NET, and the input
+            // rate converts between them (net = gross / rate, floor; gross =
+            // net × rate, ceil — the sender-parts-with side always rounds
+            // against the sender).
+            let rate = spend_rate.map(|r| r as u128);
+            if sin_gross {
+                rem_in_gross = ox::me_sub(rem_in_gross, sin);
+                let net = match rate {
+                    Some(r) => ox::me_muldiv(sin, (1_000_000_000, 0), (r, 0), false),
+                    None => sin,
+                };
+                rem_in = ox::me_sub(rem_in, net);
+            } else {
+                rem_in = ox::me_sub(rem_in, sin);
+                let gross = match rate {
+                    Some(r) => ox::me_muldiv(sin, (r, 0), (1_000_000_000, 0), true),
+                    None => sin,
+                };
+                rem_in_gross = ox::me_sub(rem_in_gross, gross);
+            }
+            if sin_gross {
+                // sout is NET: the shared gross remainder falls by its
+                // gross equivalent, and the delivery lands in the net pot.
+                let gross_out = match want_rate {
+                    Some(r) => ox::me_muldiv(sout, (r as u128, 0), (1_000_000_000, 0), true),
+                    None => sout,
+                };
+                rem_out = ox::me_sub(rem_out, gross_out);
+                delivered_direct = ox::signed_add(false, delivered_direct, false, sout).1;
+            } else {
+                rem_out = ox::me_sub(rem_out, sout);
+                delivered = ox::signed_add(false, delivered, false, sout).1;
+            }
             // Spend is unmeasurable when the sender ISSUES the currency it is
             // spending — there is no line to difference. `rem_in` would then
             // never fall and the loop would keep buying against a SendMax it
@@ -1779,13 +1900,15 @@ impl PaymentTransactor {
             }
         }
         let delivered = match want_rate {
-            Some(rate) => {
+            Some(rate) if !ox::me_is_zero(delivered) => {
                 let net = ox::me_muldiv(delivered, (1_000_000_000, 0), (rate as u128, 0), false);
                 ox::line_adjust(sandbox, dest, &want_leg, ox::me_sub(delivered, net), false);
                 net
             }
-            None => delivered,
+            _ => delivered,
         };
+        // Direct-strand deliveries are already net — no trim, no division.
+        let delivered = ox::signed_add(false, delivered, false, delivered_direct).1;
         if ox::me_is_zero(delivered) {
             sandbox.restore_snapshot(snap);
             return TxResult::PathDry;
