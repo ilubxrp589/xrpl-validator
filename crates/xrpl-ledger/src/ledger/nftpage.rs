@@ -85,7 +85,16 @@ pub fn find_page(sandbox: &Sandbox, owner: &[u8; 20], id: &Hash256) -> Option<Ha
         };
         let mut prev_bound = [0u8; 12];
         prev_bound.copy_from_slice(&prev.0[20..32]);
-        if prev_bound >= t && read_page(sandbox, &prev).is_some() {
+        // STRICTLY greater: "The low 96-bits of NFT ID must be strictly
+        // less than the low 96-bits of the enclosing page's index"
+        // (NFTokenHelpers.cpp:180-184), and getPageForToken looks for the
+        // first page with a key strictly greater than nftpage(base, id).
+        // A page whose bound EQUALS the token's low96 cannot hold it — the
+        // token belongs one page later. The inclusive walk sent #106008702
+        // 0740822A's token (low96 == the BAE35151… boundary, a returning
+        // token whose id once DEFINED that split) into the 21-slot page,
+        // skipping the FULL E6061704… page mainnet splits (7v9).
+        if prev_bound > t && read_page(sandbox, &prev).is_some() {
             candidate = prev;
         } else {
             break;
@@ -232,6 +241,14 @@ pub fn page_insert(sandbox: &mut Sandbox, owner: &[u8; 20], entry: serde_json::V
                 .get_mut("NFTokens")
                 .and_then(|v| v.as_array_mut());
             let full = arr.as_ref().map(|a| a.len() >= PAGE_MAX).unwrap_or(false);
+            if std::env::var("DX_NFT").is_ok() {
+                eprintln!(
+                    "DX_NFT insert owner={} id={} page={} len={:?} full={full}",
+                    hex::encode(owner), id_hex,
+                    hex::encode_upper(&pk.0[20..]),
+                    arr.as_ref().map(|a| a.len()),
+                );
+            }
             if full {
                 // rippled getPageForToken: a full page is SPLIT before the
                 // insert. #105818293 012140AAC3A0 mints into rKqqb5QZ's full

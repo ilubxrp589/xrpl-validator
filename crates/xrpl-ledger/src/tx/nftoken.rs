@@ -891,6 +891,13 @@ impl Transactor for NFTokenAcceptOfferTransactor {
             };
             let seller = sell.owner;
             let buyer = buy.owner;
+            // "The seller must own the token" (NFTokenAcceptOffer.cpp:229):
+            // a stale offer whose owner no longer holds the NFToken is
+            // tecNO_PERMISSION — not the tecNO_ENTRY our transfer_token
+            // surfaced later.
+            if nftpage::locate_token(sandbox, &seller, &sell.nft_id).is_none() {
+                return TxResult::NoPermission;
+            }
             // rippled deletes BOTH offers first (doApply, before any payout
             // or the token move): by the time transferNFToken judges the
             // buyer's reserve, the buyer's own buy offer no longer counts
@@ -914,6 +921,13 @@ impl Transactor for NFTokenAcceptOfferTransactor {
                     adjust_xrp(sandbox, &tx.account, broker_fee as i128);
                 }
                 pay_settle_seller(sandbox, &seller, &sell.nft_id, to_seller);
+            } else {
+                // IOU-priced brokered sale: same shape over trust lines.
+                let bf = tx.fields.get("NFTokenBrokerFee");
+                pay_iou_with_transfer_fee(
+                    sandbox, &buyer, &seller, &sell.nft_id, &buy.amount,
+                    bf.map(|f| (&tx.account, f)),
+                );
             }
             return transfer_token(sandbox, &seller, &buyer, &sell.nft_id);
         }
@@ -937,6 +951,15 @@ impl Transactor for NFTokenAcceptOfferTransactor {
         } else {
             (tx.account, offer.owner)
         };
+        // Ownership precondition, rippled's order (NFTokenAcceptOffer.cpp:170,
+        // :229): accepting a SELL offer requires the OFFER OWNER to still
+        // hold the token; accepting a BUY offer requires the ACCEPTOR to.
+        // Either miss is tecNO_PERMISSION — #106333939 2FEB03EC accepts a
+        // stale sell offer (rpApJk4e no longer holds 00081B58…0100) and
+        // mainnet claims the fee with NO_PERMISSION where we said NO_ENTRY.
+        if nftpage::locate_token(sandbox, &seller, &offer.nft_id).is_none() {
+            return TxResult::NoPermission;
+        }
         // Offer deleted FIRST — same order as rippled's doApply (see the
         // brokered arm's note): a buy-offer accept must not count the
         // buyer's own offer toward the reserve judged in transfer_token.
@@ -945,11 +968,65 @@ impl Transactor for NFTokenAcceptOfferTransactor {
             if drops > 0 {
                 pay_xrp_with_transfer_fee(sandbox, &buyer, &seller, &offer.nft_id, drops);
             }
+        } else {
+            pay_iou_with_transfer_fee(sandbox, &buyer, &seller, &offer.nft_id, &offer.amount, None);
         }
-        // IOU-priced offers: value movement over trust lines is not modeled
-        // yet — the token/offer mutations still land on the right keys.
         transfer_token(sandbox, &seller, &buyer, &offer.nft_id)
     }
+}
+
+/// IOU-priced settlement: buyer's line down by the full amount, the NFT
+/// issuer's line up by the transfer-fee cut (fee_units/100000, floor),
+/// the seller's line up by the rest — all against the CURRENCY issuer,
+/// exactly the three RippleStates rippled's accountSend chain writes.
+/// #106047462 990F1EBD: 950000 HADA at fee 2500 → 23750 to the NFT
+/// issuer, 926250 to the seller; we had left all three lines untouched
+/// ("value movement over trust lines is not modeled yet", 7v10).
+/// `line_adjust` no-ops when a party IS the currency issuer, matching
+/// redeem/issue semantics.
+fn pay_iou_with_transfer_fee(
+    sandbox: &mut Sandbox,
+    buyer: &[u8; 20],
+    seller: &[u8; 20],
+    nft_id: &Hash256,
+    amount_json: &serde_json::Value,
+    broker: Option<(&[u8; 20], &serde_json::Value)>,
+) -> bool {
+    use crate::tx::offer as ox;
+    let (Some(leg), Some(value)) = (
+        ox::leg_of(amount_json),
+        crate::ledger::keylet::amount_mant_exp(amount_json),
+    ) else {
+        return false;
+    };
+    if leg.xrp || value.0 == 0 {
+        return false;
+    }
+    let broker_cut = broker
+        .and_then(|(_, fee)| crate::ledger::keylet::amount_mant_exp(fee))
+        .unwrap_or((0, 0));
+    // Seller's side is what remains after the broker's cut; the NFT
+    // transfer fee is carved from THAT (rippled brokered mode pays the
+    // broker first and `pay()`s the remainder, which carves the cut).
+    let seller_side = ox::me_sub(value, broker_cut);
+    let fee_units = u16::from_be_bytes([nft_id.0[2], nft_id.0[3]]) as u128;
+    let nft_issuer = nftpage::issuer_of(nft_id);
+    let nft_cut = if fee_units > 0 && nft_issuer != *seller {
+        ox::me_muldiv(seller_side, (fee_units, 0), (100_000, 0), false)
+    } else {
+        (0, 0)
+    };
+    ox::line_adjust(sandbox, buyer, &leg, value, false);
+    if let Some((br, _)) = broker {
+        if broker_cut.0 > 0 {
+            ox::line_adjust(sandbox, br, &leg, broker_cut, true);
+        }
+    }
+    if nft_cut.0 > 0 {
+        ox::line_adjust(sandbox, &nft_issuer, &leg, nft_cut, true);
+    }
+    ox::line_adjust(sandbox, seller, &leg, ox::me_sub(seller_side, nft_cut), true);
+    true
 }
 
 /// Credit the seller with `drops`, carving the transfer fee for the issuer.
