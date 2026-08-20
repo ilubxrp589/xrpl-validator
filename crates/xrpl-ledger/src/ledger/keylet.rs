@@ -155,11 +155,14 @@ pub fn escrow_key(account_id: &[u8; 20], sequence: u32) -> Hash256 {
 
 /// Compute the state tree key for a PayChannel.
 /// `key = SHA512Half(0x0078 || account_id || sequence_be32)`
-pub fn pay_channel_key(account_id: &[u8; 20], sequence: u32) -> Hash256 {
-    let mut buf = [0u8; 26];
+/// `keylet::payChan` hashes SOURCE || DESTINATION || seq — omitting the
+/// destination produced a key no rippled node would ever read.
+pub fn pay_channel_key(account_id: &[u8; 20], dest_id: &[u8; 20], sequence: u32) -> Hash256 {
+    let mut buf = [0u8; 46];
     buf[..2].copy_from_slice(&SPACE_PAY_CHANNEL);
     buf[2..22].copy_from_slice(account_id);
-    buf[22..26].copy_from_slice(&sequence.to_be_bytes());
+    buf[22..42].copy_from_slice(dest_id);
+    buf[42..46].copy_from_slice(&sequence.to_be_bytes());
     sha512_half(&buf)
 }
 
@@ -516,7 +519,7 @@ mod tests {
         let seq = 42u32;
         // Same account+sequence but different space keys → different results
         let ek = escrow_key(&acct, seq);
-        let pk = pay_channel_key(&acct, seq);
+        let pk = pay_channel_key(&acct, &[0x66u8; 20], seq);
         let ck = check_key(&acct, seq);
         assert_ne!(ek, pk);
         assert_ne!(ek, ck);

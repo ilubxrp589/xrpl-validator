@@ -48,6 +48,10 @@ pub enum TxResult {
     NoIssuer,
     /// Object not found.
     NoEntry,
+    /// The named target object does not exist (PaymentChannelClaim's missing
+    /// channel is tecNO_TARGET where PaymentChannelFund's is tecNO_ENTRY —
+    /// rippled keeps the two codes distinct per transactor).
+    NoTarget,
     /// IoC/FoK offer crossed nothing (or FoK not fully filled).
     Killed,
     /// Placement would exceed the owner reserve.
@@ -155,6 +159,7 @@ impl TxResult {
             | TxResult::NoPermission
             | TxResult::NoIssuer
             | TxResult::NoEntry
+            | TxResult::NoTarget
             | TxResult::Killed
             | TxResult::InsufReserveOffer
             | TxResult::UnfundedOffer
@@ -203,6 +208,7 @@ impl TxResult {
             TxResult::NoPermission => "tecNO_PERMISSION",
             TxResult::NoIssuer => "tecNO_ISSUER",
             TxResult::NoEntry => "tecNO_ENTRY",
+            TxResult::NoTarget => "tecNO_TARGET",
             TxResult::Killed => "tecKILLED",
             TxResult::InsufReserveOffer => "tecINSUF_RESERVE_OFFER",
             TxResult::UnfundedOffer => "tecUNFUNDED_OFFER",

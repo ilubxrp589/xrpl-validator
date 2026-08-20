@@ -1486,6 +1486,42 @@ fn load_offer_cancel_prestate(state: &mut LedgerState, url: &str, txj: &Value, l
     }
 }
 
+/// PayChannel pre-state: hydration is meta-driven, and a Fund/Claim's meta
+/// never touches the channel DESTINATION's AccountRoot — but the engine's
+/// dst-exists check (tecNO_DST) reads it. Gate 'paychan' caught the miss:
+/// B169CB4A (105949459) funded a channel whose dst root was simply unloaded,
+/// so we refused with tecNO_DST where mainnet funded. Load the channel, both
+/// parties' roots, both owner-dir roots, and the OwnerNode/DestinationNode
+/// hint pages (the close path unlinks through them).
+fn load_paychan_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
+    let tt = txj["TransactionType"].as_str();
+    if !matches!(tt, Some("PaymentChannelClaim") | Some("PaymentChannelFund")) {
+        return;
+    }
+    let Some(chan) = txj["Channel"].as_str() else { return };
+    load_object(state, url, chan, ledger_index);
+    let Some(res) = rpc(url, "ledger_entry",
+        json!({"index": chan, "ledger_index": ledger_index})) else { return };
+    let Some(node) = res.get("node") else { return };
+    for (acct_field, hint_field) in [("Account", "OwnerNode"), ("Destination", "DestinationNode")] {
+        let Some(acct) = node.get(acct_field).and_then(|v| v.as_str()).and_then(decode_address)
+        else {
+            continue;
+        };
+        let akey = keylet::account_root_key(&acct);
+        load_object(state, url, &hex::encode_upper(akey.0), ledger_index);
+        let droot = keylet::owner_dir_key(&acct);
+        load_object(state, url, &hex::encode_upper(droot.0), ledger_index);
+        if let Some(hint) = node.get(hint_field).and_then(|v| v.as_str())
+            .and_then(|h| u64::from_str_radix(h, 16).ok())
+            .filter(|h| *h != 0)
+        {
+            let pk = keylet::dir_page_key(&droot, hint);
+            load_object(state, url, &hex::encode_upper(pk.0), ledger_index);
+        }
+    }
+}
+
 /// AMM Deposit/Withdraw/Vote pre-state: the pool account's owner-directory
 /// ROOT (the dir walk starts there; meta only carries the touched page) plus
 /// the depositor's dir root and both parties' account roots. For AMMVote the
@@ -2031,6 +2067,7 @@ fn run() -> i32 {
         load_nft_pages_for_tx(&mut state, &rpc_url, txj, seq - 1);
         load_amm_prestate(&mut state, &rpc_url, txj, seq - 1);
         load_offer_cancel_prestate(&mut state, &rpc_url, txj, seq - 1);
+        load_paychan_prestate(&mut state, &rpc_url, txj, seq - 1);
     }
     // FeeSettings (fixed key): reserve checks read it; mainnet meta never
     // carries it.
