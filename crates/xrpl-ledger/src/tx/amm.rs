@@ -871,6 +871,64 @@ fn tear_down_lp_line(
     crate::tx::offer::owner_count_add(sandbox, amm_acct, -1);
 }
 
+/// `deleteAMMAccount` — the last LP's withdrawal leaves LPTokenBalance at
+/// zero and the whole AMM is dismantled: every pool asset trust line is
+/// deleted UNCONDITIONALLY (`deleteAMMTrustLine` — reserve-side OwnerCounts
+/// adjusted per the line's lsfLow/HighReserve flags, rippled trustDelete's
+/// rule), the AMM object leaves the pool's owner directory, and the pool
+/// AccountRoot itself is erased. An XRP pool side has no line to remove; the
+/// pool's XRP disposition on deletion is unmodeled (no specimen — 419A5D2C
+/// is IOU/IOU).
+fn delete_amm(
+    sandbox: &mut Sandbox,
+    amm_key: &xrpl_core::types::Hash256,
+    amm_acct: &[u8; 20],
+    tx: &TxFields,
+) {
+    use crate::tx::offer as ox;
+    let leg_of_asset = |v: Option<&serde_json::Value>| -> Option<ox::Leg> {
+        let v = v?;
+        if v.get("currency").and_then(|c| c.as_str()) == Some("XRP") {
+            return Some(ox::Leg { xrp: true, cur: [0u8; 20], issuer: [0u8; 20] });
+        }
+        let mut amt = v.clone();
+        amt["value"] = serde_json::json!("0");
+        ox::leg_of(&amt)
+    };
+    for f in ["Asset", "Asset2"] {
+        let Some(leg) = leg_of_asset(tx.fields.get(f)) else { continue };
+        if leg.xrp {
+            continue;
+        }
+        let lkey = keylet::ripple_state_key(amm_acct, &leg.issuer, &leg.cur);
+        let Some(line) = ox::json_at(sandbox, &lkey) else { continue };
+        let flags = line["Flags"].as_u64().unwrap_or(0);
+        let node = |field: &str| {
+            line.get(field).and_then(|v| v.as_str()).and_then(|s| u64::from_str_radix(s, 16).ok())
+        };
+        let (low, high) = if amm_acct < &leg.issuer {
+            (amm_acct, &leg.issuer)
+        } else {
+            (&leg.issuer, amm_acct)
+        };
+        sandbox.delete(lkey);
+        crate::ledger::directory::owner_dir_remove(sandbox, low, &lkey, node("LowNode"), false);
+        crate::ledger::directory::owner_dir_remove(sandbox, high, &lkey, node("HighNode"), false);
+        if flags & 0x0001_0000 != 0 {
+            crate::tx::offer::owner_count_add(sandbox, low, -1); // lsfLowReserve
+        }
+        if flags & 0x0002_0000 != 0 {
+            crate::tx::offer::owner_count_add(sandbox, high, -1); // lsfHighReserve
+        }
+    }
+    let amm_hint = ox::json_at(sandbox, amm_key)
+        .and_then(|o| o.get("OwnerNode").and_then(|v| v.as_str()).map(str::to_string))
+        .and_then(|s| u64::from_str_radix(&s, 16).ok());
+    sandbox.delete(*amm_key);
+    crate::ledger::directory::owner_dir_remove(sandbox, amm_acct, amm_key, amm_hint, false);
+    sandbox.delete(keylet::account_root_key(amm_acct));
+}
+
 /// Pay out BOTH pool assets in proportion to `tokens / total_lp`.
 ///
 /// rippled's `equalWithdrawTokens` (AMMWithdraw.cpp:790-850):
@@ -1067,6 +1125,20 @@ impl Transactor for AMMWithdrawTransactor {
             }
             tear_down_lp_line(sandbox, &tx.account, &amm_acct, lp_key, &lp_line);
             bump_lp_balance(sandbox, &amm_key, lp_bal, false);
+            // LAST LP OUT — the AMM dies with the withdrawal. rippled runs
+            // deleteAMMAccountIfEmpty once LPTokenBalance hits zero:
+            // `deleteAMMTrustLine` removes every pool line UNCONDITIONALLY
+            // (the survive-at-zero rule above is for ORDINARY withdrawals),
+            // then the AMM object and the pool ACCOUNT itself go. #106430239
+            // 419A5D2C (tfWithdrawAll by the only LP): mainnet deletes the two
+            // pool asset lines and the AMM object where we left them
+            // zeroed-Modified — 12v12 with three ops flipped 1→2.
+            let lpt_zero = ox::json_at(sandbox, &amm_key)
+                .and_then(|o| o["LPTokenBalance"]["value"].as_str().map(|v| v == "0"))
+                .unwrap_or(false);
+            if lpt_zero {
+                delete_amm(sandbox, &amm_key, &amm_acct, tx);
+            }
             return TxResult::Success;
         }
         // tfLPToken (0x00010000): the LP names only how many LPTokens to redeem
