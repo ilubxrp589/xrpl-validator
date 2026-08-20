@@ -1807,11 +1807,66 @@ fn run() -> i32 {
                     .collect()
             })
             .unwrap_or_default();
+        // ...and the OTHER threading shape: a ModifiedNode carrying FULL
+        // FinalFields but null PreviousFields — rippled fills PreviousFields
+        // only when a field actually changed, so FinalFields == the base
+        // object means the write was a threading refresh (threadOwners:
+        // trustDelete threads BOTH owners' roots; #106065267 F9E4D516 redeems
+        // EXP to its issuer, the zeroed line is deleted, and the ISSUER's
+        // AccountRoot appears Modified with every field identical to the
+        // parent ledger — only PreviousTxnID moved). The fixture format keeps
+        // FinalFields, so nullness of PreviousFields is lost; equality
+        // against the base recovers it exactly. Symmetric with
+        // native_mutset's no-op-Modified filtering on OUR side.
+        let thread_touched: HashSet<String> = net["nodes"].as_array()
+            .map(|a| {
+                a.iter()
+                    .filter(|n| n[1].as_u64() == Some(1))
+                    .filter_map(|n| {
+                        let k = n[0].as_str()?;
+                        let exp = n.get(2)?.clone();
+                        let kb: [u8; 32] =
+                            hex::decode(k).ok().and_then(|b| b.as_slice().try_into().ok())?;
+                        let old = state.state_map.lookup(&Hash256(kb))?;
+                        let mut po: Value = serde_json::from_slice(&old).ok()?;
+                        let mut pe = exp;
+                        canon_ptrs(&mut po);
+                        canon_ptrs(&mut pe);
+                        // fixture FinalFields carry base58 addresses; the
+                        // engine stores hex — same rewrite hydration applies.
+                        hexify_addresses(&mut pe);
+                        hexify_addresses(&mut po);
+                        let strip = |v: &Value| -> Option<serde_json::Map<String, Value>> {
+                            Some(
+                                v.as_object()?
+                                    .iter()
+                                    .filter(|(k, _)| {
+                                        !k.starts_with("PreviousTxn") && k.as_str() != "index"
+                                    })
+                                    .map(|(k, v)| (k.clone(), v.clone()))
+                                    .collect(),
+                            )
+                        };
+                        let (se, so) = (strip(&pe)?, strip(&po)?);
+                        if std::env::var("DX_THREAD").is_ok() && se != so {
+                            let d: Vec<String> = se.iter()
+                                .filter(|(fk, fv)| so.get(*fk) != Some(*fv))
+                                .map(|(fk, fv)| format!("{fk}: exp={fv} base={:?}", so.get(fk)))
+                                .chain(so.keys().filter(|fk| !se.contains_key(*fk))
+                                    .map(|fk| format!("{fk}: only-in-base")))
+                                .collect();
+                            eprintln!("DX_THREAD {} differs: {:?}", &k[..16], d);
+                        }
+                        (se == so).then(|| k.to_string())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let net_mut: HashSet<(String, u8)> = net["nodes"].as_array()
             .map(|a| {
                 a.iter()
                     .filter_map(|n| Some((n[0].as_str()?.to_string(), n[1].as_u64()? as u8)))
-                    .filter(|(k, _)| !touched_only.contains(k))
+                    .filter(|(k, b)| !touched_only.contains(k) && !(*b == 1 && thread_touched.contains(k)))
                     .collect()
             })
             .unwrap_or_default();
