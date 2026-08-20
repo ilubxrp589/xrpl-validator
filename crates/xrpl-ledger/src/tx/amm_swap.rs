@@ -1236,6 +1236,42 @@ pub(crate) fn slice_rate(inp: Me, out: Me) -> Me {
     rate_of_me_pair(inp, out)
 }
 
+/// `AMMLiquidity::getOffer` for a SINGLE-PATH leg that still has a live CLOB
+/// tip (the anchored case — #106093637 BDB95F8A): the pool participates only
+/// when its fee-adjusted SPOT is strictly better than the tip and beyond the
+/// 1e-7 relative distance, and the offer it emits is ANCHORED at the tip
+/// (`changeSpotPriceQuality`), falling back to maxOffer under fixAMMv1_2 when
+/// the anchored form fails but maxOffer still beats the tip. The gates are
+/// the same three `consume` applies before its own anchored turn — this is
+/// that logic with the mutation left out, for the bridged walk's leg fills.
+pub(crate) fn anchored_slice(
+    sandbox: &Sandbox,
+    amm: &Amm,
+    pays_leg: &Leg,
+    gets_leg: &Leg,
+    clob: u64,
+) -> Option<(Me, Me)> {
+    let pool_in = holds(sandbox, &amm.account, gets_leg);
+    let pool_out = holds(sandbox, &amm.account, pays_leg);
+    if pool_in.0 == 0 || pool_out.0 == 0 {
+        return None;
+    }
+    let omf_spot = n_sub(N_ONE, fee_n(amm.tfee), Rnd::Near);
+    let spot = rate_of(pool_in, n_mul(pool_out, omf_spot, Rnd::Near));
+    if spot == 0 || spot >= clob {
+        return None;
+    }
+    let (rs, rb) = (decode_rate(spot), decode_rate(clob));
+    let dist = n_div(n_sub(rb, rs, Rnd::Near), rb, Rnd::Near);
+    if n_cmp(dist, (LO, -22)) == Ordering::Less {
+        return None; // within 1e-7 of the book — the pool stands aside
+    }
+    anchored_offer(pool_in, pool_out, gets_leg.xrp, pays_leg.xrp, clob, amm.tfee).or_else(|| {
+        max_offer_amounts(pool_in, pool_out, amm.tfee, pays_leg.xrp, gets_leg.xrp)
+            .filter(|(i, o)| rate_of(*i, *o) < clob)
+    })
+}
+
 /// Move a slice through the pool: taker pays `take_in` of gets, receives
 /// `take_out` of pays.
 #[allow(clippy::too_many_arguments)]

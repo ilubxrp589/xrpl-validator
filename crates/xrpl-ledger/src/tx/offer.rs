@@ -1904,6 +1904,12 @@ fn cross_bridged(
     // at the end of the pass, mirroring `ammContext.update()`.
     let mut amm_used;
     let done = |rp: Me, rg: Me| me_is_zero(rg) || (!sell && me_is_zero(rp));
+    // `AMMContext::multiPath()` as the ADMISSION sees it: `activateNext` runs
+    // BEFORE `setMultiPath`, so each iteration's `qualityUpperBound` prices
+    // its AMM contributions under the PREVIOUS iteration's flag — true on
+    // entry (Flow.cpp:106, `strands.size() > 1`). The round's own `multi_now`
+    // (computed after admission, below) becomes next round's flag.
+    let mut multi_prev = true;
     for _ in 0..512 {
         if done(rem_pays, rem_gets) {
             break;
@@ -2097,8 +2103,33 @@ fn cross_bridged(
             (Some(_), None) => true,
             _ => false,
         };
-        let qb_ub = if b_use_amm_ub { b_fib.as_ref().map(|(q, _)| *q) } else { qb_book };
-        let bq_ub = match (qa, qb_ub) {
+        // A leg's ub contribution under the PREVIOUS iteration's multiPath
+        // flag. Multi: the fib offer's own quality (as before). SINGLE-path,
+        // the anchored-case admission (#106093637 BDB95F8A): with the
+        // qualityThreshold override (unb — the taker's limit beats the leg's
+        // book) `getAMMOffer(nullopt)` emits maxOffer, whose quality() is the
+        // pool's feeless SPOT — `ub strand 1` 64717.04 = tip 1.06832e-6 ×
+        // spot 6.05785e10 in the FLOWDBG receipt — and likewise with no book
+        // at all; the pool only participates when spot strictly beats the
+        // book (`getOffer` bails "higher clob quality"). WITHOUT the
+        // override the anchored offer's quality EQUALS the book's, so the
+        // strand admits at its BOOK. (`adjustQualityWithFees` would charge
+        // trIn on a single-path AMM tip; every specimen's in-asset is
+        // rate-free, so that factor is not modeled — noted, not forgotten.)
+        let single_ub = |spot: Option<Me>, book: Option<Me>, unb: bool| -> Option<Me> {
+            match (spot, book) {
+                (Some(s), Some(bk)) if unb && me_cmp(s, bk).is_lt() => Some(s),
+                (Some(s), None) => Some(s),
+                (_, bk) => bk,
+            }
+        };
+        let qa_ub = if multi_prev { qa } else { single_ub(spot_a, qa_book, a_unb_raw) };
+        let qb_ub = if multi_prev {
+            if b_use_amm_ub { b_fib.as_ref().map(|(q, _)| *q) } else { qb_book }
+        } else {
+            single_ub(spot_b, qb_book, b_unb_raw)
+        };
+        let bq_ub = match (qa_ub, qb_ub) {
             (Some((am, ae)), Some((bm, be))) => Some(norm16((am * bm, ae + be))),
             _ => None,
         };
@@ -2119,7 +2150,7 @@ fn cross_bridged(
         // verdicts, i.e. where a ledger could actually decide the question.
         // Nothing is changed on inference; the floor is calibrated by d6f7589.
         if std::env::var("DX_ULP").is_ok() {
-            if let (Some((am, ae)), Some((bm, be)), Some(t)) = (qa, qb_ub, thr) {
+            if let (Some((am, ae)), Some((bm, be)), Some(t)) = (qa_ub, qb_ub, thr) {
                 let trunc = norm16((am * bm, ae + be));
                 let up = mul_round16_up((am, ae), (bm, be));
                 if me_cmp(trunc, t).is_le() != me_cmp(up, t).is_le() {
@@ -2467,6 +2498,7 @@ thr={t:?} admits_trunc={} admits_up={}",
             // `strands.size() > 1`, which a bridged payment satisfies.
             None => true,
         };
+        multi_prev = multi_now;
         // The qualityThreshold override is single-path only: force the pool
         // leg now that multiPath is known (see a_unb_raw above).
         let a_use_amm = a_use_amm || (!multi_now && a_unb_raw);
@@ -2506,15 +2538,38 @@ thr={t:?} admits_trunc={} admits_up={}",
         // keeps the fib slice deliberately — `activateNext` runs BEFORE
         // `setMultiPath`, and one tx traces both shapes: `created 5458/XRP` for
         // the bound, `created 2183017500/XRP` for the pass.
+        // Single-path leg fills follow rippled's tryAMM decision tree
+        // (BookStep.cpp:461-481): threshold better than the leg's tip ⇒
+        // `getAMMOffer(nullopt)` = unbounded maxOffer, the leg's ONLY
+        // liquidity (a_unb_raw — the C966717C case); a live tip WITHOUT the
+        // override ⇒ the offer is ANCHORED at the tip, and once consumed the
+        // next round's strictly-better head test fails and the walk CONTINUES
+        // into that leg's CLOB (#106093637 BDB95F8A: mainnet takes the pool
+        // slice then the rURtT5MM clip; maxOffer here fed the whole fill
+        // through the pool and rested what mainnet crossed); no tip at all ⇒
+        // maxOffer.
         let slice_of = |amm: &Option<crate::tx::amm_swap::Amm>, out_leg: &Leg, in_leg: &Leg,
-                        sandbox: &Sandbox|
+                        tip: Option<u64>, unb: bool, sandbox: &Sandbox|
          -> Option<(Me, (Me, Me))> {
             let am = amm.as_ref()?;
-            let s = crate::tx::amm_swap::max_offer(sandbox, am, out_leg, in_leg)?;
+            let s = match (tip, unb) {
+                (Some(qb), false) => {
+                    crate::tx::amm_swap::anchored_slice(sandbox, am, out_leg, in_leg, qb)?
+                }
+                _ => crate::tx::amm_swap::max_offer(sandbox, am, out_leg, in_leg)?,
+            };
             Some((crate::tx::amm_swap::slice_rate(s.0, s.1), s))
         };
-        let a_fill = if multi_now { a_fib } else { slice_of(&amm_a, &xrp_leg, gets_leg, sandbox) };
-        let b_fill = if multi_now { b_fib } else { slice_of(&amm_b, pays_leg, &xrp_leg, sandbox) };
+        let a_fill = if multi_now {
+            a_fib
+        } else {
+            slice_of(&amm_a, &xrp_leg, gets_leg, apeek.as_ref().map(|(q, ..)| *q), a_unb_raw, sandbox)
+        };
+        let b_fill = if multi_now {
+            b_fib
+        } else {
+            slice_of(&amm_b, pays_leg, &xrp_leg, bpeek.as_ref().map(|(q, ..)| *q), b_unb_raw, sandbox)
+        };
         // `limitOut` — SIZE THE PASS TO THE LIMIT instead of taking the
         // maximum and then discarding it (StrandFlow.h:357; call site at
         // :655, "Limit only if one strand and limitQuality").
