@@ -324,9 +324,22 @@ impl Transactor for ClawbackTransactor {
         if tx.fee == 0 {
             return TxResult::BadFee;
         }
-        // Amount is required (IOU amount to claw back)
-        if tx.fields.get("Amount").is_none() {
+        // Amount is required (IOU or MPT amount to claw back)
+        let Some(amount) = tx.fields.get("Amount") else {
             return TxResult::Malformed;
+        };
+        // MPT arm (Clawback.cpp preflightHelper<MPTIssue>): Holder required,
+        // may not be the issuer itself, value positive within the signed cap.
+        if let Some((_, v)) = crate::tx::mpt::parse_mpt_amount(amount) {
+            let Some(holder) = tx.fields.get("Holder").and_then(|h| decode_account_id(h)) else {
+                return TxResult::Malformed;
+            };
+            if holder == tx.account {
+                return TxResult::Malformed;
+            }
+            if v == 0 || v > crate::tx::mpt::MAX_MPT_AMOUNT {
+                return TxResult::BadAmount;
+            }
         }
         TxResult::Success
     }
@@ -344,6 +357,80 @@ impl Transactor for ClawbackTransactor {
             Some(a) => a,
             None => return TxResult::Malformed,
         };
+
+        // MPT arm (Clawback.cpp preclaimHelper<MPTIssue> + applyHelper).
+        // rippled's preclaim order decides the code: missing issuance or
+        // missing holder MPToken → tecOBJECT_NOT_FOUND; no lsfMPTCanClawback
+        // or wrong issuer → tecNO_PERMISSION; a holder whose spendable
+        // balance is zero → tecINSUFFICIENT_FUNDS (3EC225FD, l106259185 —
+        // the tx still consumes its Ticket, which is all its meta shows).
+        // Unported, no specimen: tecPSEUDO_ACCOUNT / tecAMM_ACCOUNT holders.
+        if let Some((mptid, value)) = crate::tx::mpt::parse_mpt_amount(amount) {
+            let holder = match tx.fields.get("Holder").and_then(|h| decode_account_id(h)) {
+                Some(h) => h,
+                None => return TxResult::Malformed,
+            };
+            if !sandbox.exists(&keylet::account_root_key(&holder)) {
+                return TxResult::NoAccount;
+            }
+            let issuance_key = keylet::mpt_issuance_key(&mptid);
+            let Some(mut issuance) = sandbox
+                .read(&issuance_key)
+                .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+            else {
+                return TxResult::ObjectNotFound;
+            };
+            let iflags = issuance.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+            if iflags & crate::tx::mpt::LSF_MPT_CAN_CLAWBACK == 0 {
+                return TxResult::NoPermission;
+            }
+            let issuer_ok = issuance
+                .get("Issuer")
+                .and_then(|v| v.as_str())
+                .and_then(crate::tx::offer::decode20)
+                .map(|i| i == tx.account)
+                .unwrap_or(false);
+            if !issuer_ok {
+                return TxResult::NoPermission;
+            }
+            let token_key = keylet::mptoken_key(&issuance_key, &holder);
+            let Some(mut token) = sandbox
+                .read(&token_key)
+                .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+            else {
+                return TxResult::ObjectNotFound;
+            };
+            let spendable = token
+                .get("MPTAmount")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            if spendable == 0 {
+                return TxResult::InsufficientFunds;
+            }
+            // Claw min(spendable, amount): holder MPTAmount down (zero is
+            // omitted — SoeDefault), issuance OutstandingAmount down
+            // (SoeRequired — "0" stays written).
+            let claw = spendable.min(value);
+            let rest = spendable - claw;
+            if rest == 0 {
+                if let Some(o) = token.as_object_mut() {
+                    o.remove("MPTAmount");
+                }
+            } else {
+                token["MPTAmount"] = serde_json::Value::String(rest.to_string());
+            }
+            sandbox.write(token_key, serde_json::to_vec(&token).unwrap_or_default());
+            let outstanding = issuance
+                .get("OutstandingAmount")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            issuance["OutstandingAmount"] =
+                serde_json::Value::String(outstanding.saturating_sub(claw).to_string());
+            sandbox.write(issuance_key, serde_json::to_vec(&issuance).unwrap_or_default());
+            return TxResult::Success;
+        }
 
         // Amount must be an IOU object: {currency, issuer, value}
         let currency_str = match amount.get("currency").and_then(|c| c.as_str()) {

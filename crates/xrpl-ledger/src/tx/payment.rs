@@ -1172,14 +1172,54 @@ impl Transactor for PaymentTransactor {
                 }
             }
             None => {
-                // IOU delivery — validated by the engine in do_apply.
-                let ok = tx.fields.get("Amount")
-                    .and_then(crate::ledger::keylet::amount_mant_exp)
-                    .is_some_and(|(m, _)| m > 0);
-                if !ok {
-                    return TxResult::BadAmount;
+                if let Some((mid, v)) =
+                    tx.fields.get("Amount").and_then(crate::tx::mpt::parse_mpt_amount)
+                {
+                    // MPT delivery, MPTokensV1 (Payment.cpp:119-233): value
+                    // positive and within the signed-64 cap; Paths are
+                    // malformed outright; SendMax must be the SAME issuance.
+                    // The tfLimitQuality/tfNoRippleDirect refusals share the
+                    // XRP-direct tem codes upstream — no specimen pins their
+                    // exact strings, so they are refused as plain Malformed.
+                    if v == 0 || v > crate::tx::mpt::MAX_MPT_AMOUNT {
+                        return TxResult::BadAmount;
+                    }
+                    if tx.fields.get("Paths").is_some() {
+                        return TxResult::Malformed;
+                    }
+                    if let Some(sm) = tx.fields.get("SendMax") {
+                        match crate::tx::mpt::parse_mpt_amount(sm) {
+                            Some((sid, sv)) if sid == mid => {
+                                if sv == 0 || sv > crate::tx::mpt::MAX_MPT_AMOUNT {
+                                    return TxResult::BadAmount;
+                                }
+                            }
+                            _ => return TxResult::Malformed,
+                        }
+                    }
+                    // tfNoRippleDirect (0x10000) | tfLimitQuality (0x40000):
+                    // both meaningless for a V1 MPT payment and refused.
+                    let fl = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+                    if fl & 0x0005_0000 != 0 {
+                        return TxResult::Malformed;
+                    }
+                } else {
+                    // IOU delivery — validated by the engine in do_apply.
+                    let ok = tx.fields.get("Amount")
+                        .and_then(crate::ledger::keylet::amount_mant_exp)
+                        .is_some_and(|(m, _)| m > 0);
+                    if !ok {
+                        return TxResult::BadAmount;
+                    }
                 }
             }
+        }
+        // A SendMax naming an MPT under a non-MPT Amount is malformed
+        // (Payment.cpp:146-147).
+        if tx.fields.get("Amount").and_then(crate::tx::mpt::parse_mpt_amount).is_none()
+            && tx.fields.get("SendMax").and_then(crate::tx::mpt::parse_mpt_amount).is_some()
+        {
+            return TxResult::Malformed;
         }
 
         // Can't send to yourself (rippled allows it but it's a no-op)
@@ -1327,6 +1367,14 @@ impl Transactor for PaymentTransactor {
         let amt_json = tx.fields.get("Amount").cloned().unwrap_or_default();
         let sendmax = tx.fields.get("SendMax").cloned();
         let partial = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & 0x0002_0000 != 0;
+        // MPT delivery: V1 never reaches the flow engine — Payment.cpp:449
+        // requires `!isDstMPT || mpTokensV2` for the ripple route, so the
+        // whole payment is the direct arm in tx::mpt. Deposit auth is applied
+        // UNCONDITIONALLY inside it (:533), unlike the reserve-gated XRP form
+        // below, which is why this dispatch sits before that block.
+        if let Some((mptid, value)) = crate::tx::mpt::parse_mpt_amount(&amt_json) {
+            return crate::tx::mpt::apply_mpt_payment(tx, sandbox, &dest_id, mptid, value, partial);
+        }
         let cross_currency = match (&sendmax, amt_json.is_string()) {
             (Some(sm), true) => !sm.is_string(),
             (Some(sm), false) => {

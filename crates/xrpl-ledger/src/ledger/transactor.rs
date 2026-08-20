@@ -121,6 +121,13 @@ pub enum TxResult {
     NoLineInsufReserve,
     /// Setting a non-existent trust line to defaults — nothing to do.
     NoLineRedundant,
+    /// The party lacks authorization for the asset — an MPT holder without an
+    /// MPToken (or unauthorized under lsfMPTRequireAuth), or a third-party
+    /// transfer of an MPT without lsfMPTCanTransfer.
+    NoAuth,
+    /// The MPT is locked — globally (issuance lsfMPTLocked) or individually
+    /// (either holder's MPToken lsfMPTLocked) — for a holder→holder payment.
+    Locked,
 
     // tem — malformed, not applied at all
     /// Transaction is malformed.
@@ -184,6 +191,8 @@ impl TxResult {
             | TxResult::AmmFailed
             | TxResult::NoLineInsufReserve
             | TxResult::NoLineRedundant
+            | TxResult::NoAuth
+            | TxResult::Locked
             | TxResult::Unsupported => true,
             // tem/tef: not claimed
             _ => false,
@@ -233,6 +242,8 @@ impl TxResult {
             TxResult::AmmFailed => "tecAMM_FAILED",
             TxResult::NoLineInsufReserve => "tecNO_LINE_INSUF_RESERVE",
             TxResult::NoLineRedundant => "tecNO_LINE_REDUNDANT",
+            TxResult::NoAuth => "tecNO_AUTH",
+            TxResult::Locked => "tecLOCKED",
             TxResult::Malformed => "temMALFORMED",
             TxResult::BadFee => "temBAD_FEE",
             TxResult::BadAmount => "temBAD_AMOUNT",

@@ -1486,6 +1486,40 @@ fn load_offer_cancel_prestate(state: &mut LedgerState, url: &str, txj: &Value, l
     }
 }
 
+/// MPT pre-state: an MPT amount names an issuance, and the engine reads the
+/// MPTokenIssuance object plus each endpoint's MPToken — none of which a
+/// fee-only tec meta ever carries (3EC225FD's tecINSUFFICIENT_FUNDS needs
+/// the holder's zero-balance MPToken to exist to be REACHED). Loads for
+/// Payment (Amount) and Clawback (Amount + Holder).
+fn load_mpt_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
+    let mpt_id = |v: &Value| -> Option<[u8; 24]> {
+        let bytes = hex::decode(v.get("mpt_issuance_id")?.as_str()?).ok()?;
+        bytes.as_slice().try_into().ok()
+    };
+    let Some(id) = txj.get("Amount").and_then(|a| mpt_id(a)) else { return };
+    let ikey = keylet::mpt_issuance_key(&id);
+    load_object(state, url, &hex::encode_upper(ikey.0), ledger_index);
+    let mut parties: Vec<[u8; 20]> = Vec::new();
+    if let Some(a) = txj["Account"].as_str().and_then(decode_address) {
+        parties.push(a);
+    }
+    for f in ["Destination", "Holder"] {
+        if let Some(a) = txj[f].as_str().and_then(decode_address) {
+            parties.push(a);
+        }
+    }
+    for p in parties {
+        let tkey = keylet::mptoken_key(&ikey, &p);
+        load_object(state, url, &hex::encode_upper(tkey.0), ledger_index);
+        load_object(
+            state,
+            url,
+            &hex::encode_upper(keylet::account_root_key(&p).0),
+            ledger_index,
+        );
+    }
+}
+
 /// PayChannel pre-state: hydration is meta-driven, and a Fund/Claim's meta
 /// never touches the channel DESTINATION's AccountRoot — but the engine's
 /// dst-exists check (tecNO_DST) reads it. Gate 'paychan' caught the miss:
@@ -2068,6 +2102,7 @@ fn run() -> i32 {
         load_amm_prestate(&mut state, &rpc_url, txj, seq - 1);
         load_offer_cancel_prestate(&mut state, &rpc_url, txj, seq - 1);
         load_paychan_prestate(&mut state, &rpc_url, txj, seq - 1);
+        load_mpt_prestate(&mut state, &rpc_url, txj, seq - 1);
     }
     // FeeSettings (fixed key): reserve checks read it; mainnet meta never
     // carries it.

@@ -11,6 +11,7 @@ pub mod direct_step;
 pub mod dispatch;
 pub mod escrow;
 pub mod misc;
+pub mod mpt;
 pub mod nftoken;
 pub mod offer;
 pub mod oracle;

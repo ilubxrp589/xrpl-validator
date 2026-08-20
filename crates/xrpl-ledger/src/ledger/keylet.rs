@@ -166,6 +166,26 @@ pub fn pay_channel_key(account_id: &[u8; 20], dest_id: &[u8; 20], sequence: u32)
     sha512_half(&buf)
 }
 
+/// MPTokenIssuance key: `SHA512Half(0x007E ('~') || MPTID)` where MPTID is
+/// the 24-byte sequence_be32 || issuer concatenation carried verbatim in
+/// `mpt_issuance_id` amount JSON (Indexes.cpp keylet::mptIssuance).
+pub fn mpt_issuance_key(mptid: &[u8; 24]) -> Hash256 {
+    let mut buf = [0u8; 26];
+    buf[..2].copy_from_slice(&[0x00, 0x7E]);
+    buf[2..26].copy_from_slice(mptid);
+    sha512_half(&buf)
+}
+
+/// MPToken key: `SHA512Half(0x0074 ('t') || issuance_key || holder)`
+/// (Indexes.cpp keylet::mptoken — keyed by the issuance's KEY, not its ID).
+pub fn mptoken_key(issuance_key: &Hash256, holder: &[u8; 20]) -> Hash256 {
+    let mut buf = [0u8; 54];
+    buf[..2].copy_from_slice(&[0x00, 0x74]);
+    buf[2..34].copy_from_slice(&issuance_key.0);
+    buf[34..54].copy_from_slice(holder);
+    sha512_half(&buf)
+}
+
 /// Compute the state tree key for a Check.
 /// `key = SHA512Half(0x0043 || account_id || sequence_be32)`
 pub fn check_key(account_id: &[u8; 20], sequence: u32) -> Hash256 {
