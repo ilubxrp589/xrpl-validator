@@ -932,6 +932,42 @@ pub(crate) fn holds(sandbox: &Sandbox, acct: &[u8; 20], leg: &Leg) -> Me {
     }
 }
 
+/// The pool balance as OFFER GENERATION sees it — rippled's
+/// `AMMLiquidity::fetchBalances` reads through `ammHolds(...,
+/// FreezeHandling::fhZERO_IF_FROZEN)`, so a frozen side reports ZERO and
+/// `getOffer`'s "frozen accounts" guard (AMMLiquidity.cpp:165-170) emits no
+/// offer at all. Frozen = the issuer's lsfGlobalFreeze, or the ISSUER's side
+/// of the POOL's own trust line carrying its freeze bit. (DeepFreeze bits are
+/// not modeled — no specimen.) The scout's 2026-08-20 restock family
+/// (F3BD86FA et al., four ledgers of one arb bot) is exactly this: the
+/// BITx/REGARD leg's pool has a frozen side, rippled's book step goes dry
+/// (`TRYAMM lob=none ammOffer=0` after "frozen accounts"), tecPATH_DRY —
+/// while our unfrozen read synthesized the liquidity and delivered.
+///
+/// AMMDeposit/Withdraw keep using raw `holds`: rippled fetches those with
+/// their own FreezeHandling (withdraw ignores freeze by design).
+pub(crate) fn holds_for_offer(sandbox: &Sandbox, acct: &[u8; 20], leg: &Leg) -> Me {
+    if !leg.xrp {
+        let gf = ox::json_at(sandbox, &keylet::account_root_key(&leg.issuer))
+            .and_then(|a| a["Flags"].as_u64())
+            .map(|f| f & 0x0040_0000 != 0)
+            .unwrap_or(false);
+        if gf {
+            return (0, 0);
+        }
+        let issuer_side_bit =
+            if &leg.issuer > acct { 0x0080_0000u64 } else { 0x0040_0000u64 };
+        let frozen = ox::json_at(sandbox, &keylet::ripple_state_key(acct, &leg.issuer, &leg.cur))
+            .and_then(|l| l["Flags"].as_u64())
+            .map(|f| f & issuer_side_bit != 0)
+            .unwrap_or(false);
+        if frozen {
+            return (0, 0);
+        }
+    }
+    holds(sandbox, acct, leg)
+}
+
 /// One MULTI-PATH AMM turn (rippled generateFibSeqOffer): with more than one
 /// strand (every IOU↔IOU crossing bridges), the pool competes as a CLOB-like
 /// offer sized by the Fibonacci sequence off the pool balances at the START
@@ -1029,8 +1065,8 @@ pub(crate) fn spot_upper_bound(sandbox: &Sandbox, amm: &Amm, pays_leg: &Leg, get
 /// the fib base — captured at crossing start.
 pub(crate) fn pool_balances(sandbox: &Sandbox, amm: &Amm, pays_leg: &Leg, gets_leg: &Leg) -> (Me, Me) {
     (
-        holds(sandbox, &amm.account, gets_leg),
-        holds(sandbox, &amm.account, pays_leg),
+        holds_for_offer(sandbox, &amm.account, gets_leg),
+        holds_for_offer(sandbox, &amm.account, pays_leg),
     )
 }
 
@@ -1043,8 +1079,8 @@ pub(crate) fn fib_slice(
     pays_leg: &Leg,
     gets_leg: &Leg,
 ) -> Option<(Me, Me)> {
-    let pool_in = holds(sandbox, &amm.account, gets_leg);
-    let pool_out = holds(sandbox, &amm.account, pays_leg);
+    let pool_in = holds_for_offer(sandbox, &amm.account, gets_leg);
+    let pool_out = holds_for_offer(sandbox, &amm.account, pays_leg);
     if pool_in.0 == 0 || pool_out.0 == 0 || init.0.0 == 0 || init.1.0 == 0 {
         return None;
     }
@@ -1179,8 +1215,8 @@ pub(crate) fn max_offer(
     pays_leg: &Leg,
     gets_leg: &Leg,
 ) -> Option<(Me, Me)> {
-    let pool_in = holds(sandbox, &amm.account, gets_leg);
-    let pool_out = holds(sandbox, &amm.account, pays_leg);
+    let pool_in = holds_for_offer(sandbox, &amm.account, gets_leg);
+    let pool_out = holds_for_offer(sandbox, &amm.account, pays_leg);
     max_offer_amounts(pool_in, pool_out, amm.tfee, pays_leg.xrp, gets_leg.xrp)
 }
 
@@ -1251,8 +1287,8 @@ pub(crate) fn anchored_slice(
     gets_leg: &Leg,
     clob: u64,
 ) -> Option<(Me, Me)> {
-    let pool_in = holds(sandbox, &amm.account, gets_leg);
-    let pool_out = holds(sandbox, &amm.account, pays_leg);
+    let pool_in = holds_for_offer(sandbox, &amm.account, gets_leg);
+    let pool_out = holds_for_offer(sandbox, &amm.account, pays_leg);
     if pool_in.0 == 0 || pool_out.0 == 0 {
         return None;
     }
@@ -1324,8 +1360,8 @@ pub(crate) fn consume(
     }
     // pool.in = what the taker pays into the pool (spend = gets_leg);
     // pool.out = what the taker receives (want = pays_leg)
-    let pool_in = holds(sandbox, &amm.account, gets_leg);
-    let pool_out = holds(sandbox, &amm.account, pays_leg);
+    let pool_in = holds_for_offer(sandbox, &amm.account, gets_leg);
+    let pool_out = holds_for_offer(sandbox, &amm.account, pays_leg);
     if pool_in.0 == 0 || pool_out.0 == 0 {
         return (rem_pays, rem_gets, false);
     }
