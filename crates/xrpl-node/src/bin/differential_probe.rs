@@ -130,12 +130,17 @@ fn rpc(url: &str, method: &str, params: Value) -> Option<Value> {
             }
         }
     }
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => {
+    // One shared client: building one per call defeated connection reuse,
+    // so every live call paid TCP (and TLS, on the fallback) setup.
+    static CLIENT: std::sync::OnceLock<Option<reqwest::blocking::Client>> = std::sync::OnceLock::new();
+    let client = match CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .ok()
+    }) {
+        Some(c) => c.clone(),
+        None => {
             RPC_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return None;
         }
@@ -186,11 +191,24 @@ fn rpc(url: &str, method: &str, params: Value) -> Option<Value> {
             }
         }
     }
-    // Only cache successful lookups — an error/None must not be pinned, so a
-    // transient failure doesn't poison every future run for that key.
+    // Cache successful lookups AND the two DETERMINISTIC negatives: for a
+    // fixed ledger_index, `entryNotFound` and `actNotFound` are as immutable
+    // as any answer — the object simply is not in that ledger. Leaving them
+    // uncached made every loader miss a LIVE round-trip on every run: a
+    // fully warm single-fixture probe measured 77s wall / 8s CPU — 90%
+    // network wait — and the gates inherited it (52-min flowdrv2).
+    // `lgrNotFound` stays uncached: it depends on the server's history
+    // window (and on whether XRPL_PROBE_FALLBACK was set), not the ledger.
+    // Other errors stay uncached so a transient failure can't poison the
+    // key.
     if let (Some(p), Some(dir)) = (&path, &dir) {
-        let err = result.get("error").is_some();
-        if !err && !result.is_null() {
+        let err_name = result.get("error").and_then(|e| e.as_str());
+        let cacheable = match err_name {
+            None => !result.is_null(),
+            Some("entryNotFound") | Some("actNotFound") => true,
+            Some(_) => false,
+        };
+        if cacheable {
             let _ = std::fs::create_dir_all(dir);
             if let Ok(bytes) = serde_json::to_vec(&result) {
                 let _ = std::fs::write(p, bytes);
