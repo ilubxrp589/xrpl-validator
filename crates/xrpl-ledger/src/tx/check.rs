@@ -255,6 +255,30 @@ impl Transactor for CheckCashTransactor {
         if ox::me_cmp(want, cap).is_gt() {
             return TxResult::PathPartial; // asking beyond the check's SendMax
         }
+        // Cashing an IOU into a line the CASHER doesn't have first requires
+        // the reserve for creating it: `checkReserve` fires BEFORE the flow —
+        // "Trust line does not exist. Insufficient reserve to create line."
+        // ⇒ tecNO_LINE_INSUF_RESERVE (CheckCash.cpp:391-401, preFeeBalance
+        // vs accountReserve(ownerCount + 1)). #106233366 E7419B07: we fell
+        // through to the writer-funds check and said tecPATH_PARTIAL.
+        if !leg.xrp && tx.account != leg.issuer {
+            let line_key = crate::ledger::keylet::ripple_state_key(&tx.account, &leg.issuer, &leg.cur);
+            if !sandbox.exists(&line_key) {
+                let acct_key = crate::ledger::keylet::account_root_key(&tx.account);
+                if let Some(a) = sandbox
+                    .read(&acct_key)
+                    .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+                {
+                    let oc = a["OwnerCount"].as_u64().unwrap_or(0);
+                    let bal = a["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                    // do_apply runs post-fee; rippled compares preFeeBalance_.
+                    let pre_fee = bal.saturating_add(tx.fee);
+                    if pre_fee < crate::ledger::fees::account_reserve(sandbox, oc + 1) {
+                        return TxResult::NoLineInsufReserve;
+                    }
+                }
+            }
+        }
         let mut avail = if creator == leg.issuer { want } else { ox::available(sandbox, &creator, &leg) };
         // CASHING THE CHECK RELEASES THE CHECK'S OWN RESERVE, and that reserve
         // counts toward the payment. rippled says so twice:

@@ -541,6 +541,26 @@ impl Transactor for CredentialAcceptTransactor {
             return TxResult::NoPermission;
         }
 
+        // Expired credentials are deleted even though the accept fails —
+        // rippled checkExpired against parentCloseTime, then deleteSLE and
+        // tecEXPIRED (CredentialAccept.cpp:110-117).
+        if let Some(exp) = cred.get("Expiration").and_then(|v| v.as_u64()) {
+            if exp != 0 && sandbox.base().header.close_time as u64 >= exp {
+                let issuer_hint = cred.get("IssuerNode").and_then(|v| v.as_str())
+                    .and_then(|h| u64::from_str_radix(h, 16).ok());
+                let subject_hint = cred.get("SubjectNode").and_then(|v| v.as_str())
+                    .and_then(|h| u64::from_str_radix(h, 16).ok());
+                sandbox.delete(cred_key);
+                crate::ledger::directory::owner_dir_remove(sandbox, &issuer, &cred_key, issuer_hint, false);
+                if subject != issuer {
+                    crate::ledger::directory::owner_dir_remove(sandbox, &subject, &cred_key, subject_hint, false);
+                }
+                // Unaccepted: the ISSUER still owns the reserve.
+                crate::tx::offer::owner_count_add(sandbox, &issuer, -1);
+                return TxResult::Expired;
+            }
+        }
+
         // Mark as accepted
         cred["Accepted"] = serde_json::Value::Bool(true);
 
@@ -549,6 +569,16 @@ impl Transactor for CredentialAcceptTransactor {
         cred["Flags"] = serde_json::Value::Number((flags | 0x00010000).into());
 
         sandbox.write(cred_key, serde_json::to_vec(&cred).unwrap());
+
+        // THE RESERVE MOVES: on acceptance the credential's owner changes
+        // from issuer to subject — adjustOwnerCount(issuer, -1) then
+        // (subject, +1), CredentialAccept.cpp:122-123. #106065037 11709731:
+        // mainnet Modifies the issuer r9avT7NU's root (OwnerCount -1); we
+        // left it untouched (2v3).
+        if issuer != subject {
+            crate::tx::offer::owner_count_add(sandbox, &issuer, -1);
+            crate::tx::offer::owner_count_add(sandbox, &subject, 1);
+        }
 
         TxResult::Success
     }

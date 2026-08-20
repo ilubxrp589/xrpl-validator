@@ -484,6 +484,32 @@ impl Transactor for TrustSetTransactor {
                         }
                     }
                 } else {
+                    // BOTH sides' reserve flags are recomputed on EVERY
+                    // TrustSet that leaves the line standing
+                    // (SetTrust.cpp:536-585): a side with interest and no
+                    // reserve bit gains it (+1 OwnerCount); a reserved side
+                    // with no interest loses it (−1). The interest terms
+                    // above ARE rippled's bLow/HighReserveSet. This catches
+                    // historical drift too — #106162505 4D758025 zeroes the
+                    // holder's DRIPPY limit and mainnet charges the ISSUER
+                    // rwprJf1 (+1, OwnerCount 66→67) because its side's
+                    // NoRipple state disagrees with its DefaultRipple; we
+                    // left the issuer's root untouched (2v3).
+                    let mut lf = flags;
+                    for (interest, id, bit) in [
+                        (low_interest, low_id, LSF_LOW_RESERVE),
+                        (high_interest, high_id, LSF_HIGH_RESERVE),
+                    ] {
+                        let reserved = flags & bit != 0;
+                        if interest && !reserved {
+                            lf |= bit;
+                            crate::tx::offer::owner_count_add(sandbox, &id, 1);
+                        } else if !interest && reserved {
+                            lf &= !bit;
+                            crate::tx::offer::owner_count_add(sandbox, &id, -1);
+                        }
+                    }
+                    line["Flags"] = serde_json::Value::Number(lf.into());
                     sandbox.write(line_key, serde_json::to_vec(&line).expect("serializing valid JSON Value"));
                 }
             }

@@ -134,22 +134,27 @@ impl Transactor for SignerListSetTransactor {
         };
 
         let acct_key = keylet::account_root_key(&tx.account);
-
-        // Use a deterministic key for the signer list: same space as owner dir
-        // but with a special marker. Simplified: hash(account + "SignerList").
-        let signer_list_key = {
-            use crate::shamap::hash::sha512_half;
-            let mut buf = Vec::with_capacity(30);
-            buf.extend_from_slice(&[0x00, 0x53]); // 'S' for SignerList
-            buf.extend_from_slice(&tx.account);
-            sha512_half(&buf)
-        };
+        // The REAL keylet (rippled keylet::signers): 0x0053 || account || u32 0.
+        // The previous fabricated key (no trailing SignerListID) pointed at a
+        // key mainnet never touches — #106069820 C9DBE048 deletes a list and
+        // we probed sandbox.exists at the wrong key, did nothing, fee-only
+        // 1v3 (mainnet deletes the SignerList AND its owner-dir entry).
+        let signer_list_key = keylet::signers_key(&tx.account);
 
         if quorum == 0 {
             // Quorum of 0 means delete the signer list
-            if sandbox.exists(&signer_list_key) {
+            if let Some(data) = sandbox.read(&signer_list_key) {
+                let node_hint = serde_json::from_slice::<serde_json::Value>(&data)
+                    .ok()
+                    .and_then(|l| {
+                        l.get("OwnerNode")
+                            .and_then(|v| v.as_str())
+                            .and_then(|h| u64::from_str_radix(h, 16).ok())
+                    });
                 sandbox.delete(signer_list_key);
-                // Decrement OwnerCount
+                crate::ledger::directory::owner_dir_remove(
+                    sandbox, &tx.account, &signer_list_key, node_hint, false,
+                );
                 if let Some(data) = sandbox.read(&acct_key) {
                     if let Ok(mut acct) = serde_json::from_slice::<serde_json::Value>(&data) {
                         let count = acct["OwnerCount"].as_u64().unwrap_or(0);
@@ -167,17 +172,22 @@ impl Transactor for SignerListSetTransactor {
 
             let already_exists = sandbox.exists(&signer_list_key);
 
+            // Mainnet shape: SignerListID 0 and lsfOneOwnerCount (65536,
+            // featureMultiSignReserve — every list charges ONE owner unit).
             let signer_list_obj = serde_json::json!({
                 "LedgerEntryType": "SignerList",
+                "Flags": 65536,
                 "SignerQuorum": quorum,
                 "SignerEntries": signers,
+                "SignerListID": 0,
                 "OwnerNode": "0",
             });
 
             sandbox.write(signer_list_key, serde_json::to_vec(&signer_list_obj).unwrap());
 
-            // Increment OwnerCount only if this is a new signer list
+            // Increment OwnerCount + owner-dir entry only for a NEW list
             if !already_exists {
+                crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &signer_list_key);
                 if let Some(data) = sandbox.read(&acct_key) {
                     if let Ok(mut acct) = serde_json::from_slice::<serde_json::Value>(&data) {
                         let count = acct["OwnerCount"].as_u64().unwrap_or(0);

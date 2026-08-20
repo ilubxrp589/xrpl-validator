@@ -103,6 +103,18 @@ pub fn owner_dir_key(account_id: &[u8; 20]) -> Hash256 {
     sha512_half(&buf)
 }
 
+/// SignerList key: `SHA512Half(0x0053 || account || u32 0)` — rippled
+/// `keylet::signers(account)` hashes a trailing SignerListID of ZERO
+/// (Indexes.cpp `indexHash(LedgerNameSpace::SIGNER_LIST, account, 0u32)`).
+/// Omitting it lands on a key mainnet never touches.
+pub fn signers_key(account_id: &[u8; 20]) -> Hash256 {
+    let mut buf = [0u8; 26];
+    buf[..2].copy_from_slice(&[0x00, 0x53]);
+    buf[2..22].copy_from_slice(account_id);
+    // trailing u32 SignerListID = 0, big-endian
+    sha512_half(&buf)
+}
+
 /// Compute the state tree key for a directory page.
 /// `key = SHA512Half(0x0064 || root_index || page_number_be64)`
 pub fn dir_page_key(root_index: &Hash256, page: u64) -> Hash256 {
