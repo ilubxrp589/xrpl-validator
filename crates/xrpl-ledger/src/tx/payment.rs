@@ -81,20 +81,43 @@ impl PaymentTransactor {
                     _ => return None,
                 }
             }
-            let cur = el.get("currency").and_then(|v| v.as_str())?;
-            if cur == "XRP" {
-                legs.push(crate::tx::offer::Leg { xrp: true, cur: [0u8; 20], issuer: [0u8; 20] });
-                continue;
-            }
-            let mut c20 = [0u8; 20];
-            if cur.len() == 40 {
-                let b = hex::decode(cur).ok()?;
-                c20.copy_from_slice(&b);
-            } else if cur.len() == 3 {
-                c20[12..15].copy_from_slice(cur.as_bytes());
-            } else {
-                return None;
-            }
+            let c20 = match el.get("currency").and_then(|v| v.as_str()) {
+                Some("XRP") => {
+                    legs.push(crate::tx::offer::Leg {
+                        xrp: true,
+                        cur: [0u8; 20],
+                        issuer: [0u8; 20],
+                    });
+                    continue;
+                }
+                Some(cur) => {
+                    let mut c20 = [0u8; 20];
+                    if cur.len() == 40 {
+                        let b = hex::decode(cur).ok()?;
+                        c20.copy_from_slice(&b);
+                    } else if cur.len() == 3 {
+                        c20[12..15].copy_from_slice(cur.as_bytes());
+                    } else {
+                        return None;
+                    }
+                    c20
+                }
+                // ISSUER-ONLY element (type 0x20 without 0x10): the running
+                // currency carries over and only the issuer changes; toStrand's
+                // pairwise emission then builds the SAME-CURRENCY cross-issuer
+                // book. #106425462 CF3FFF81: `{issuer: rhub8, type: 32}`
+                // between the rvYA and rhub8 account hops makes a
+                // USD.rvYA→USD.rhub8 book step that mainnet fills — dropping
+                // the path here refused with tecPATH_DRY. An issuer change
+                // with no preceding IOU leg stays unmodeled (drop).
+                None => {
+                    let prev = legs.last()?;
+                    if prev.xrp {
+                        return None;
+                    }
+                    prev.cur
+                }
+            };
             let iss = el
                 .get("issuer")
                 .and_then(|v| v.as_str())

@@ -1179,11 +1179,35 @@ fn load_payment_books(
                     for p in ps.iter().filter_map(|p| p.as_array()) {
                         let mut chain = vec![s.clone()];
                         for el in p {
-                            let Some(cur) = el.get("currency") else { continue };
-                            if cur == "XRP" {
-                                chain.push(json!({"currency": "XRP"}));
-                            } else if let Some(iss) = el.get("issuer") {
-                                chain.push(json!({"currency": cur.clone(), "issuer": iss.clone()}));
+                            match el.get("currency") {
+                                Some(cur) if cur == "XRP" => {
+                                    chain.push(json!({"currency": "XRP"}));
+                                }
+                                Some(cur) => {
+                                    if let Some(iss) = el.get("issuer") {
+                                        chain.push(
+                                            json!({"currency": cur.clone(), "issuer": iss.clone()}),
+                                        );
+                                    }
+                                }
+                                // ISSUER-ONLY element (type 32): the running
+                                // currency carries over — the engine now builds
+                                // the same-currency cross-issuer book for it,
+                                // and skipping it here left that book (and its
+                                // pool) unhydrated, reading as EMPTY: CF3FFF81
+                                // stayed tecPATH_DRY after the engine fix
+                                // because the USD.rvYA→USD.rhub8 book never
+                                // loaded.
+                                None => {
+                                    let prev_cur = chain
+                                        .last()
+                                        .and_then(|c| c.get("currency"))
+                                        .filter(|c| c.as_str() != Some("XRP"))
+                                        .cloned();
+                                    if let (Some(iss), Some(pc)) = (el.get("issuer"), prev_cur) {
+                                        chain.push(json!({"currency": pc, "issuer": iss.clone()}));
+                                    }
+                                }
                             }
                         }
                         chain.push(w.clone());
