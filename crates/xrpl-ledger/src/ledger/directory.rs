@@ -103,6 +103,13 @@ pub fn dir_insert(
 
     let Some(mut root) = read_dir(sandbox, &root_key) else {
         // No directory yet — create the root page.
+        if std::env::var("DX_DIR").is_ok() {
+            eprintln!(
+                "DX_DIR CREATE-ROOT root={} raw_present={}",
+                hex::encode_upper(root_key.0),
+                sandbox.exists(&root_key),
+            );
+        }
         sandbox.write(
             root_key,
             serde_json::to_vec(&new_page(owner, &root_key, &entry, 0)).unwrap_or_default(),

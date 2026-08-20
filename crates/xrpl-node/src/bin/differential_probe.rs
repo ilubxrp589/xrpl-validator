@@ -1463,8 +1463,26 @@ fn load_amm_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_ind
         return;
     }
     if let Some(acct) = txj["Account"].as_str().and_then(decode_address) {
-        let k = hex::encode_upper(keylet::owner_dir_key(&acct).0);
+        let droot = keylet::owner_dir_key(&acct);
+        let k = hex::encode_upper(droot.0);
         load_object(state, url, &k, ledger_index);
+        // A withdraw that pays an asset the LP holds no line for CREATES the
+        // line, and dirAdd appends its entry to the directory's TAIL page
+        // (the root's IndexPrevious). With only the root hydrated we re-
+        // created the root instead: #106131297 4FD1D57A modified rJf7VZxB's
+        // tail page 733BF5D7 on mainnet while we invented a fresh root
+        // (9v9, one swap).
+        if let Some(res) = rpc(url, "ledger_entry",
+            json!({"index": &k, "ledger_index": ledger_index})) {
+            if let Some(prev) = res.get("node").and_then(|n| n.get("IndexPrevious"))
+                .and_then(|v| v.as_str())
+                .and_then(|h| u64::from_str_radix(h, 16).ok())
+                .filter(|p| *p != 0)
+            {
+                let pk = keylet::dir_page_key(&droot, prev);
+                load_object(state, url, &hex::encode_upper(pk.0), ledger_index);
+            }
+        }
     }
     if tt == Some("AMMCreate") {
         // No pool exists yet — the creator's and asset issuers' dir roots are
@@ -1524,6 +1542,31 @@ fn load_amm_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_ind
         return;
     }
     let (Some(a1), Some(a2)) = (txj.get("Asset"), txj.get("Asset2")) else { return };
+    // A payout that CREATES a trust line dirAdds into BOTH parties'
+    // directories — and the counterparty of an asset line is the asset's
+    // ISSUER, whose directory can run to hundreds of pages. #106131297
+    // 4FD1D57A: the LP held no OAR line; mainnet appends the new line to
+    // OAR-issuer rJf7VZxB's TAIL page 733BF5D7 — we, with the issuer's dir
+    // unhydrated, invented a fresh root. Load each issuer's root + tail.
+    for a in [a1, a2] {
+        let Some(iss) = a.get("issuer").and_then(|v| v.as_str()).and_then(decode_address) else {
+            continue;
+        };
+        let droot = keylet::owner_dir_key(&iss);
+        let k = hex::encode_upper(droot.0);
+        load_object(state, url, &k, ledger_index);
+        if let Some(dres) = rpc(url, "ledger_entry",
+            json!({"index": &k, "ledger_index": ledger_index})) {
+            if let Some(prev) = dres.get("node").and_then(|n| n.get("IndexPrevious"))
+                .and_then(|v| v.as_str())
+                .and_then(|h| u64::from_str_radix(h, 16).ok())
+                .filter(|p| *p != 0)
+            {
+                let pk = keylet::dir_page_key(&droot, prev);
+                load_object(state, url, &hex::encode_upper(pk.0), ledger_index);
+            }
+        }
+    }
     let Some(res) = rpc(url, "ledger_entry", json!({
         "amm": {"asset": a1, "asset2": a2},
         "ledger_index": ledger_index,
@@ -1531,8 +1574,25 @@ fn load_amm_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_ind
     let Some(amm_acct) = res["node"]["Account"].as_str() else { return };
     load_account(state, url, amm_acct, ledger_index);
     if let Some(aid) = decode_address(amm_acct) {
-        let k = hex::encode_upper(keylet::owner_dir_key(&aid).0);
+        let adroot = keylet::owner_dir_key(&aid);
+        let k = hex::encode_upper(adroot.0);
         load_object(state, url, &k, ledger_index);
+        // …and the pool dir's TAIL page: a withdraw that CREATES a trust
+        // line dirAdds into the LAST page of BOTH owners' directories, and
+        // an AMM's directory runs to hundreds of pages. #106131297
+        // 4FD1D57A: mainnet appends to the pool's tail 733BF5D7; with only
+        // the root absent-or-bare we re-created the root instead.
+        if let Some(dres) = rpc(url, "ledger_entry",
+            json!({"index": &k, "ledger_index": ledger_index})) {
+            if let Some(prev) = dres.get("node").and_then(|n| n.get("IndexPrevious"))
+                .and_then(|v| v.as_str())
+                .and_then(|h| u64::from_str_radix(h, 16).ok())
+                .filter(|p| *p != 0)
+            {
+                let pk = keylet::dir_page_key(&adroot, prev);
+                load_object(state, url, &hex::encode_upper(pk.0), ledger_index);
+            }
+        }
     }
     // The AMM ledger object itself — needed so preclaim can read the pool and
     // run the reserve/funds check (else a Deposit/Withdraw whose pool no other

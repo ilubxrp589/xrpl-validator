@@ -836,6 +836,30 @@ fn tear_down_lp_line(
     lp_key: xrpl_core::types::Hash256,
     lp_line: &serde_json::Value,
 ) {
+    // …and ONLY when the LP's side is in default state. A plain withdraw
+    // burns via redeemIOU — the ORDINARY line machinery — and trustDelete's
+    // conditions apply: the LP-side limit must be zero and no quality
+    // settings present, else the zeroed line SURVIVES as Modified.
+    // (`deleteAMMTrustLine`, which deletes unconditionally, runs only when
+    // the AMM itself is deleted.) #106024169 430F1F12: rKHB6QGL set a
+    // 10000000 limit on its LPToken line; mainnet zeroes and keeps it —
+    // we deleted it plus the whole directory cascade, 8v5.
+    let (my_limit, my_q_in, my_q_out) = if who < amm_acct {
+        ("LowLimit", "LowQualityIn", "LowQualityOut")
+    } else {
+        ("HighLimit", "HighQualityIn", "HighQualityOut")
+    };
+    let limit_zero = lp_line[my_limit]["value"].as_str().map(|v| v == "0").unwrap_or(true);
+    let quality_zero = lp_line.get(my_q_in).is_none() && lp_line.get(my_q_out).is_none();
+    if !(limit_zero && quality_zero) {
+        // Zero the balance in place; the line stays.
+        let mut line = lp_line.clone();
+        if let Some(b) = line.get_mut("Balance") {
+            b["value"] = serde_json::Value::String("0".to_string());
+        }
+        sandbox.write(lp_key, serde_json::to_vec(&line).unwrap_or_default());
+        return;
+    }
     let node = |field: &str| {
         lp_line.get(field).and_then(|v| v.as_str()).and_then(|s| u64::from_str_radix(s, 16).ok())
     };
