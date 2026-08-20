@@ -1448,6 +1448,44 @@ fn load_book_pair(
     }
 }
 
+/// OfferCancel pre-state: the canceled offer object, its BookDirectory page
+/// (the quality level it rests on) and the owner-dir hint page. NOTHING else
+/// hydrates a book an OfferCancel touches — payments and OfferCreates load
+/// books by SPEC, and a cancel names only (account, seq). #106030993
+/// D63363BB: the pre-existing page CE26A7EB…EFF7 held the canceled offer;
+/// unhydrated, a same-rate placement earlier in the ledger re-created the
+/// page WITHOUT the old entry, the cancel's removal no-opped, and mainnet's
+/// page deletion went missing (5v6).
+fn load_offer_cancel_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
+    if txj["TransactionType"].as_str() != Some("OfferCancel") {
+        return;
+    }
+    let (Some(acct), Some(seq)) = (
+        txj["Account"].as_str().and_then(decode_address),
+        txj["OfferSequence"].as_u64(),
+    ) else {
+        return;
+    };
+    let okey = keylet::offer_key(&acct, seq as u32);
+    let khex = hex::encode_upper(okey.0);
+    load_object(state, url, &khex, ledger_index);
+    let Some(res) = rpc(url, "ledger_entry",
+        json!({"index": &khex, "ledger_index": ledger_index})) else { return };
+    let Some(node) = res.get("node") else { return };
+    if let Some(bd) = node.get("BookDirectory").and_then(|v| v.as_str()) {
+        load_object(state, url, bd, ledger_index);
+    }
+    let droot = keylet::owner_dir_key(&acct);
+    load_object(state, url, &hex::encode_upper(droot.0), ledger_index);
+    if let Some(hint) = node.get("OwnerNode").and_then(|v| v.as_str())
+        .and_then(|h| u64::from_str_radix(h, 16).ok())
+        .filter(|h| *h != 0)
+    {
+        let pk = keylet::dir_page_key(&droot, hint);
+        load_object(state, url, &hex::encode_upper(pk.0), ledger_index);
+    }
+}
+
 /// AMM Deposit/Withdraw/Vote pre-state: the pool account's owner-directory
 /// ROOT (the dir walk starts there; meta only carries the touched page) plus
 /// the depositor's dir root and both parties' account roots. For AMMVote the
@@ -1992,6 +2030,7 @@ fn run() -> i32 {
         load_payment_books(&mut state, &rpc_url, txj, seq - 1, &mut books_seen);
         load_nft_pages_for_tx(&mut state, &rpc_url, txj, seq - 1);
         load_amm_prestate(&mut state, &rpc_url, txj, seq - 1);
+        load_offer_cancel_prestate(&mut state, &rpc_url, txj, seq - 1);
     }
     // FeeSettings (fixed key): reserve checks read it; mainnet meta never
     // carries it.

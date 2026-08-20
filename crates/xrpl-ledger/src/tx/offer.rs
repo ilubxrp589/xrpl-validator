@@ -4585,28 +4585,43 @@ impl Transactor for OfferCreateTransactor {
         };
         let seq = if tx.uses_ticket() { tx.ticket_seq.unwrap_or(0) } else { tx.sequence };
         let offer_key = keylet::offer_key(&tx.account, seq);
-        let offer_obj = serde_json::json!({
+        let owner_node = crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &offer_key);
+        let mut offer_obj = serde_json::json!({
             "LedgerEntryType": "Offer",
             "Account": hex::encode(tx.account),
             "Sequence": seq,
             "TakerPays": me_amount_json(&tp_json, rem_pays),
             "TakerGets": me_amount_json(&tg_json, rem_gets),
             "Flags": flags,
+            "OwnerNode": format!("{owner_node:x}"),
         });
-        sandbox.write(offer_key, serde_json::to_vec(&offer_obj).expect("serializing valid JSON Value"));
-        crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &offer_key);
         // Book quality comes from the offer as REQUESTED (after tick
         // rounding), not from the residual: rippled keeps a partially
         // crossed offer at its original price (uRate is computed before
         // crossing).
+        //
+        // The directory hints MUST be stored on the offer itself: a later
+        // OfferCancel (or crossing reap) reads BookDirectory off the object to
+        // unlink the book page. A hydrated offer carries them from mainnet;
+        // one WE placed only has what we write here — omitting them left the
+        // book page undeleted when a same-ledger cancel followed (D63363BB).
         if let Some(q) = rate_of_me(tp0, tg0) {
             let base = match &domain {
                 Some(d) => keylet::book_base_domain(&pays_leg.cur, &gets_leg.cur, &pays_leg.issuer, &gets_leg.issuer, d),
                 None => keylet::book_base(&pays_leg.cur, &gets_leg.cur, &pays_leg.issuer, &gets_leg.issuer),
             };
             let bdir = keylet::book_dir_key(&base, q);
-            crate::ledger::directory::dir_insert(sandbox, &bdir, None, &offer_key);
+            let book_node = crate::ledger::directory::dir_insert(sandbox, &bdir, None, &offer_key);
+            offer_obj["BookDirectory"] = serde_json::Value::String(hex::encode_upper(bdir.0));
+            offer_obj["BookNode"] = serde_json::Value::String(format!("{book_node:x}"));
         }
+        if let Some(e) = tx.fields.get("Expiration") {
+            offer_obj["Expiration"] = e.clone();
+        }
+        if let Some(d) = &domain {
+            offer_obj["DomainID"] = serde_json::Value::String(hex::encode_upper(d.0));
+        }
+        sandbox.write(offer_key, serde_json::to_vec(&offer_obj).expect("serializing valid JSON Value"));
         owner_count_add(sandbox, &tx.account, 1);
         TxResult::Success
     }

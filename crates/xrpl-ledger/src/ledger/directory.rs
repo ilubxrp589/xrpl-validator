@@ -92,12 +92,14 @@ fn new_page(owner: Option<&[u8; 20]>, root_key: &Hash256, entry: &str, prev: u64
 /// can start (the differential harness loads it via `native_read_keys`). If the
 /// root is absent, a fresh single-page directory is created. `owner` only
 /// shapes new-page content (token dirs carry no Owner field).
+/// Returns the page number the entry landed in — rippled's dirAdd result,
+/// which the caller stores back on the object as its OwnerNode/BookNode hint.
 pub fn dir_insert(
     sandbox: &mut Sandbox,
     root_key: &Hash256,
     owner: Option<&[u8; 20]>,
     object_key: &Hash256,
-) {
+) -> u64 {
     let root_key = *root_key;
     let entry = hex::encode_upper(object_key.0);
 
@@ -114,7 +116,7 @@ pub fn dir_insert(
             root_key,
             serde_json::to_vec(&new_page(owner, &root_key, &entry, 0)).unwrap_or_default(),
         );
-        return;
+        return 0;
     };
 
     // Walk to the last page via the root's back-pointer.
@@ -140,7 +142,7 @@ pub fn dir_insert(
             }
         }
         sandbox.write(last_key, serde_json::to_vec(&last).unwrap_or_default());
-        return;
+        return last_num;
     }
 
     // Last page full — create a new page and relink.
@@ -161,10 +163,11 @@ pub fn dir_insert(
         root["IndexPrevious"] = serde_json::json!(new_num);
         sandbox.write(root_key, serde_json::to_vec(&root).unwrap_or_default());
     }
+    new_num
 }
 
 /// Insert `object_key` into `owner`'s owner directory. See [`dir_insert`].
-pub fn owner_dir_insert(sandbox: &mut Sandbox, owner: &[u8; 20], object_key: &Hash256) {
+pub fn owner_dir_insert(sandbox: &mut Sandbox, owner: &[u8; 20], object_key: &Hash256) -> u64 {
     dir_insert(sandbox, &keylet::owner_dir_key(owner), Some(owner), object_key)
 }
 
