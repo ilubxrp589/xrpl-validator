@@ -2244,7 +2244,7 @@ thr={t:?} admits_trunc={} admits_up={}",
             }
             let (rp, rg, used) = crate::tx::amm_swap::consume_fib(
                 sandbox, a, taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg,
-                threshold, sell, *init, amm_iters, best_book,
+                threshold, sell, *init, amm_iters, best_book, None,
             );
             rem_pays = rp;
             rem_gets = rg;
@@ -3247,6 +3247,15 @@ pub(crate) fn cross_engine_to(
     // where mainnet keeps an early fill and drops a later one is what would
     // justify carrying per-iteration state through the walk.
     let cross_snap = offer_crossing.then(|| sandbox.snapshot());
+    // Payment-mode AMM in-fee (see amm_swap::consume_fib): the strand pays
+    // the in-issuer's rate ON TOP of the pool's input (rippled rdrIn — the
+    // previous step redeems). Never in crossing; never when the taker IS the
+    // in issuer.
+    let pay_in_rate = if offer_crossing {
+        None
+    } else {
+        transfer_rate(sandbox, gets_leg).filter(|_| taker != &gets_leg.issuer)
+    };
     // The fee-composed judge threshold for CLOB fills of a crossing (see
     // crossing_judge_threshold). Payments and AMM turns keep the raw one.
     let thr_judge = if offer_crossing {
@@ -3417,7 +3426,7 @@ pub(crate) fn cross_engine_to(
             }
             let (rp, rg, used) = amm_turn(
                 amm_fib.as_deref_mut(), sandbox, a, taker, beneficiary, rem_pays, rem_gets,
-                pays_leg, gets_leg, threshold, sell, Some(q),
+                pays_leg, gets_leg, threshold, sell, Some(q), pay_in_rate,
             );
             rem_pays = rp;
             rem_gets = rg;
@@ -4068,6 +4077,7 @@ pub(crate) fn cross_engine_to(
                 // rippled's tail pass anchors on (see self_anchor_q above);
                 // beyond the limit rippled anchors nothing (#106295504).
                 self_anchor_q.filter(|qs| *qs <= threshold),
+                pay_in_rate,
             );
             rem_pays = rp;
             rem_gets = rg;
@@ -4154,6 +4164,8 @@ fn amm_turn(
     threshold: u64,
     sell: bool,
     clob: Option<u64>,
+    // Payment-mode IN-side transfer rate (see consume_fib). Crossing = None.
+    in_gross_rate: Option<u64>,
 ) -> (Me, Me, bool) {
     let Some(f) = fib else {
         return crate::tx::amm_swap::consume(
@@ -4170,7 +4182,7 @@ fn amm_turn(
     };
     let r = crate::tx::amm_swap::consume_fib(
         sandbox, a, taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell,
-        init, f.iters, clob.map(rate_me),
+        init, f.iters, clob.map(rate_me), in_gross_rate,
     );
     if r.2 {
         f.used = true;

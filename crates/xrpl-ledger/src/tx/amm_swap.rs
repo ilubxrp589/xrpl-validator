@@ -990,6 +990,16 @@ pub(crate) fn consume_fib(
     init: (Me, Me),
     iters: u32,
     best_book: Option<Me>,
+    // PAYMENT-mode IN-side transfer rate (rippled rdrIn: the previous step
+    // redeems, so the strand pays the in-issuer's rate ON TOP of the pool's
+    // input — BookStep stpIn = mulRatio(ofrIn, rdrIn, QUALITY_ONE, UP)).
+    // 6BC6ACF9's trace, exact: the strand parts with 9.931638943875375 FLR
+    // (= 9.901933144442048 × 1.003 gross) while hop-1's pool receives the
+    // 9.901933 net. The gross debit is what reverse_requirements MEASURES,
+    // so the hop before is sized to produce it. CROSSING passes None ("An
+    // AMM offer pays no such fee" — BookStep.cpp:737-739, the discount
+    // calibration).
+    in_gross_rate: Option<u64>,
 ) -> (Me, Me, bool) {
     // tfSell: the pays side is only a MINIMUM — once met it saturates to
     // zero while the sell keeps spending rem_gets. rippled's sell flow keeps
@@ -1017,7 +1027,10 @@ pub(crate) fn consume_fib(
     if threshold != u64::MAX && n_cmp(q, decode_rate(threshold)) == Ordering::Greater {
         return (rem_pays, rem_gets, false);
     }
-    // CLOB-like proportional consumption against the remainders.
+    // CLOB-like proportional consumption against the remainders. `rem_gets`
+    // is the walk's NET input budget (the strand's sizing already reserved
+    // the in-fee — `avail = carry / rate`); the taker's DEBIT is the gross,
+    // exactly as the book fill does it (offer.rs move_leg_gross site).
     let mut take_in = s_in;
     let mut take_out = s_out;
     if !sell && n_cmp(take_out, rem_pays) == Ordering::Greater {
@@ -1031,7 +1044,14 @@ pub(crate) fn consume_fib(
     if take_in.0 == 0 || take_out.0 == 0 {
         return (rem_pays, rem_gets, false);
     }
-    ox::move_leg(sandbox, taker, &amm.account, gets_leg, take_in);
+    ox::move_leg_gross(
+        sandbox,
+        taker,
+        &amm.account,
+        gets_leg,
+        take_in,
+        ox::gross_in(in_gross_rate, take_in),
+    );
     ox::move_leg(sandbox, &amm.account, beneficiary, pays_leg, take_out);
     (
         ox::me_sub(rem_pays, take_out),
