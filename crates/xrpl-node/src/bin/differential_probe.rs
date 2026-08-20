@@ -166,7 +166,26 @@ fn rpc(url: &str, method: &str, params: Value) -> Option<Value> {
         RPC_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return None;
     };
-    let result = body["result"].clone();
+    let mut result = body["result"].clone();
+    // XRPL_PROBE_FALLBACK=<url>: a PRE-WINDOW ledger answers `lgrNotFound` on
+    // the primary (.39's online_delete floor moves forward); retry those on a
+    // full-history server. Spot-probe tool only — gates leave it unset (public
+    // infra is slow, rate-limited, and a gate must not depend on it).
+    if result.get("error").and_then(|e| e.as_str()) == Some("lgrNotFound") {
+        if let Ok(fb) = std::env::var("XRPL_PROBE_FALLBACK") {
+            if !fb.is_empty() && fb != url {
+                if let Ok(resp) = client
+                    .post(&fb)
+                    .json(&json!({"method": method, "params": [params]}))
+                    .send()
+                {
+                    if let Ok(v) = resp.json::<Value>() {
+                        result = v["result"].clone();
+                    }
+                }
+            }
+        }
+    }
     // Only cache successful lookups — an error/None must not be pinned, so a
     // transient failure doesn't poison every future run for that key.
     if let (Some(p), Some(dir)) = (&path, &dir) {
@@ -1251,12 +1270,67 @@ fn load_book_pair(
         "ledger_index": ledger_index,
     })) else { return };
     let Some(offers) = res.get("offers").and_then(|v| v.as_array()) else { return };
+    let mut pages_seen: HashSet<String> = HashSet::new();
     for off in offers.iter().take(50) {
         if let Some(idx) = off.get("index").and_then(|v| v.as_str()) {
             load_object(state, url, idx, ledger_index);
         }
         if let Some(bd) = off.get("BookDirectory").and_then(|v| v.as_str()) {
             load_object(state, url, bd, ledger_index);
+            // `book_offers` OMITS fully-unfunded offers, but the page's
+            // Indexes still carry them and the walk's stream REAPS them on
+            // contact (offer deleted, page freed, owner root modified).
+            // #106030404 50E1F824: rGodbj1's zero-USDC offer sits FIRST on
+            // the tip's page; mainnet deletes it during tip-finding, and
+            // with the object unhydrated our walk skipped it silently
+            // (7v11). Load every entry on each touched page — plus the
+            // maker funding available() needs to JUDGE it dead.
+            if pages_seen.insert(bd.to_string()) {
+                if let Some(pres) = rpc(url, "ledger_entry",
+                    json!({"index": bd, "ledger_index": ledger_index})) {
+                    let entries: Vec<String> = pres
+                        .get("node")
+                        .and_then(|n| n.get("Indexes"))
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()
+                        })
+                        .unwrap_or_default();
+                    for ent in entries.iter().take(24) {
+                        let Some(ores) = rpc(url, "ledger_entry",
+                            json!({"index": ent, "ledger_index": ledger_index})) else { continue };
+                        let Some(onode) = ores.get("node") else { continue };
+                        load_object(state, url, ent, ledger_index);
+                        let Some(mk) = onode.get("Account").and_then(|v| v.as_str()) else { continue };
+                        load_account(state, url, mk, ledger_index);
+                        if let Some(g) = onode.get("TakerGets").and_then(|v| v.as_object()) {
+                            if let (Some(mid), Some(gi), Some(gc)) = (
+                                decode_address(mk),
+                                g.get("issuer").and_then(|v| v.as_str()).and_then(decode_issuer),
+                                g.get("currency").and_then(|v| v.as_str()),
+                            ) {
+                                let key = keylet::ripple_state_key(&mid, &gi, &currency_code(gc));
+                                load_object(state, url, &hex::encode_upper(key.0), ledger_index);
+                            }
+                        }
+                            // The reap's third write: the maker's OWNER
+                            // DIRECTORY page (delete_maker_offer removes the
+                            // entry) — invisible unless hydrated. Root page plus
+                            // the OwnerNode-hinted page for multi-page dirs.
+                            if let Some(mid) = decode_address(mk) {
+                                let droot = keylet::owner_dir_key(&mid);
+                                load_object(state, url, &hex::encode_upper(droot.0), ledger_index);
+                                if let Some(hint) = onode.get("OwnerNode").and_then(|v| v.as_str())
+                                    .and_then(|h| u64::from_str_radix(h, 16).ok())
+                                    .filter(|h| *h != 0)
+                                {
+                                    let dpk = keylet::dir_page_key(&droot, hint);
+                                    load_object(state, url, &hex::encode_upper(dpk.0), ledger_index);
+                                }
+                            }
+                    }
+                }
+            }
         }
         // Maker funding: available() reads the maker's AccountRoot (XRP
         // sales) or gets-side trust line (IOU sales) — neither appears in a
@@ -1271,6 +1345,86 @@ fn load_book_pair(
             ) {
                 let key = keylet::ripple_state_key(&mid, &gi, &currency_code(gc));
                 load_object(state, url, &hex::encode_upper(key.0), ledger_index);
+            }
+        }
+    }
+    // A level whose EVERY offer is unfunded never appears in `book_offers` at
+    // all — no offer names its page, and the stream-reaps rippled performs on
+    // it (offer + page deleted, owner root modified) are invisible to a
+    // sandbox that never loaded them. #106030404 50E1F824: rGodbj1's
+    // zero-funded level sits one rate behind the fully-consumed tip; mainnet
+    // trims-and-consumes the tip, keeps stepping (BookStep.cpp:1062 returns
+    // fullyConsumed), and reaps it. Enumerate the book's pages PAST the best
+    // known one with a seeded `ledger_data` marker (the marker must be an
+    // EXISTING key — the tip's own page is) and hydrate what the walk could
+    // step onto.
+    let mut best_bd: Option<String> = None;
+    for off in offers.iter().take(50) {
+        if let Some(bd) = off.get("BookDirectory").and_then(|v| v.as_str()) {
+            if best_bd.as_deref().map_or(true, |b| bd < b) {
+                best_bd = Some(bd.to_string());
+            }
+        }
+    }
+    if let Some(bd0) = best_bd {
+        let base24 = bd0[..48].to_string();
+        if let Some(res) = rpc(url, "ledger_data", json!({
+            "ledger_index": ledger_index,
+            "marker": bd0,
+            "limit": 24,
+            "binary": false,
+        })) {
+            for e in res.get("state").and_then(|v| v.as_array()).map(|a| a.as_slice()).unwrap_or(&[]) {
+                let Some(idx) = e.get("index").and_then(|v| v.as_str()) else { continue };
+                if !idx.starts_with(&base24) {
+                    break; // key order: past the book's range
+                }
+                if e.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("DirectoryNode") {
+                    continue;
+                }
+                let Ok(kb) = hex::decode(idx) else { continue };
+                let Ok(karr) = <[u8; 32]>::try_from(kb.as_slice()) else { continue };
+                let mut node = e.clone();
+                hexify_addresses(&mut node);
+                let _ = state.state_map.insert(Hash256(karr), serde_json::to_vec(&node).unwrap_or_default());
+                let entries: Vec<String> = e
+                    .get("Indexes")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
+                for ent in entries.iter().take(24) {
+                    let Some(ores) = rpc(url, "ledger_entry",
+                        json!({"index": ent, "ledger_index": ledger_index})) else { continue };
+                    let Some(onode) = ores.get("node") else { continue };
+                    load_object(state, url, ent, ledger_index);
+                    let Some(mk) = onode.get("Account").and_then(|v| v.as_str()) else { continue };
+                    load_account(state, url, mk, ledger_index);
+                    if let Some(g) = onode.get("TakerGets").and_then(|v| v.as_object()) {
+                        if let (Some(mid), Some(gi), Some(gc)) = (
+                            decode_address(mk),
+                            g.get("issuer").and_then(|v| v.as_str()).and_then(decode_issuer),
+                            g.get("currency").and_then(|v| v.as_str()),
+                        ) {
+                            let key = keylet::ripple_state_key(&mid, &gi, &currency_code(gc));
+                            load_object(state, url, &hex::encode_upper(key.0), ledger_index);
+                        }
+                    }
+                        // The reap's third write: the maker's OWNER
+                        // DIRECTORY page (delete_maker_offer removes the
+                        // entry) — invisible unless hydrated. Root page plus
+                        // the OwnerNode-hinted page for multi-page dirs.
+                        if let Some(mid) = decode_address(mk) {
+                            let droot = keylet::owner_dir_key(&mid);
+                            load_object(state, url, &hex::encode_upper(droot.0), ledger_index);
+                            if let Some(hint) = onode.get("OwnerNode").and_then(|v| v.as_str())
+                                .and_then(|h| u64::from_str_radix(h, 16).ok())
+                                .filter(|h| *h != 0)
+                            {
+                                let dpk = keylet::dir_page_key(&droot, hint);
+                                load_object(state, url, &hex::encode_upper(dpk.0), ledger_index);
+                            }
+                        }
+                }
             }
         }
     }

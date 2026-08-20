@@ -208,6 +208,14 @@ pub(crate) fn me_norm(mut a: Me) -> Me {
 #[derive(Clone, Default, Debug)]
 pub(crate) struct AmmFib {
     pub(crate) iters: u32,
+    // Set when a pool moved value during the CURRENT pass; the round loop
+    // folds it into `iters` once per WINNING round — rippled's
+    // `ammContext.update()` counts an AMM iteration once per driver
+    // iteration, however many pools the strand touched. Incrementing per
+    // consumption ran the fib at double pace on two-pool strands:
+    // #106360400 E133BD25's slices went ×1,2,5,13 where rippled's go
+    // ×1,1,2,3,5,8,13 (FLOWDRIVER-DESIGN §5.1).
+    pub(crate) used: bool,
     pub(crate) init: std::collections::BTreeMap<[u8; 20], (Me, Me)>,
 }
 
@@ -3926,7 +3934,17 @@ pub(crate) fn cross_engine_to(
                     // 3 offers Deleted, 2 maker roots + 2 owner dirs + the
                     // book page Modified, and no RippleState among them.
                     // 5v15 with those 8 missing and nothing extra.
-                    if buy_bound {
+                    // …and `offer.fullyConsumed()` is that branch's CONTINUE
+                    // flag: a fill trimmed to the remaining output that ALSO
+                    // exhausts the offer keeps the stream stepping — mainnet
+                    // reaps the dead level behind it. #106030404 50E1F824:
+                    // the tip covers the full 28.59217928509999 want with its
+                    // whole 26366653-drop side (consumed), and rippled steps
+                    // on to reap rGodbj1's zero-funded offer one level back
+                    // (offer + page deleted, root + dir modified, 7v11 for
+                    // us). Only a trimmed fill that leaves the offer alive
+                    // ends the walk here.
+                    if buy_bound && !consumed {
                         break 'dirs;
                     }
                     trailing = true;
@@ -3940,9 +3958,24 @@ pub(crate) fn cross_engine_to(
             page_key_h = keylet::dir_page_key(&dk, next);
         }
         if single_pass && (rem_pays != level_pays_in || rem_gets != level_gets_in) {
-            return (rem_pays, rem_gets, crossed);
+            // The pass is over — but rippled's stream keeps stepping and
+            // REAPS the dead offers it lands on before it stops
+            // (BookStep.cpp:1062 returns fullyConsumed; #106030404 50E1F824:
+            // the level behind the consumed tip holds only rGodbj1's
+            // zero-funded offer, and mainnet deletes offer + page and
+            // modifies root + owner dir within the SAME iteration). Sweep in
+            // trailing mode — the 'dirs trailing branch reaps to the first
+            // LIVE offer and breaks — then return below, before the tail AMM
+            // turn (a single pass must not take pool liquidity the level
+            // boundary already excluded).
+            trailing = true;
+            continue;
         }
         prev_level_crossed = level_crossed;
+    }
+    // A single pass whose level boundary tripped exits before the tail turn.
+    if single_pass && trailing {
+        return (rem_pays, rem_gets, crossed);
     }
     // Final AMM turn once the book is exhausted (maxOffer sizing).
     if let Some(a) = &amm {
@@ -4085,7 +4118,7 @@ fn amm_turn(
         init, f.iters, clob.map(rate_me),
     );
     if r.2 {
-        f.iters += 1;
+        f.used = true;
     }
     r
 }

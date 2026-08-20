@@ -2186,6 +2186,12 @@ impl PaymentTransactor {
                     }
                 }
                 amm_fib = try_fib;
+                // ammContext.update(): one fib iteration per WINNING round
+                // that used any pool (AMMContext.h; FLOWDRIVER-DESIGN §5.1).
+                if amm_fib.used {
+                    amm_fib.iters += 1;
+                    amm_fib.used = false;
+                }
                 applied = Some((i, sin, sout, in_gross, out_net));
                 break;
             }
@@ -2275,7 +2281,14 @@ impl PaymentTransactor {
         let delivered = ox::signed_add(false, delivered, false, delivered_direct).1;
         if ox::me_is_zero(delivered) {
             sandbox.restore_snapshot(snap);
-            return TxResult::PathDry;
+            // The DRIVER's ending (StrandFlow.h:800-840): a flow that moved
+            // nothing is tecPATH_PARTIAL unless tfPartialPayment is set —
+            // tecPATH_DRY needs `partialPayment && actualOut == 0`.
+            // #106071067 C98FD7C2: rippled's own trace is "All strands dry.
+            // Total flow: in: 0 out: 0" and mainnet returns tecPATH_PARTIAL;
+            // we said DRY. (Pre-loop refusals — no line, no strands — keep
+            // their calibrated DRY: rippled fails those before the driver.)
+            return if partial { TxResult::PathDry } else { TxResult::PathPartial };
         }
         if !partial && ox::me_cmp(delivered, want0).is_lt() {
             sandbox.restore_snapshot(snap);
