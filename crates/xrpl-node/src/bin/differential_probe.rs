@@ -1410,16 +1410,38 @@ fn load_book_pair(
     }
     if let Some(bd0) = best_bd {
         let base24 = bd0[..48].to_string();
-        if let Some(res) = rpc(url, "ledger_data", json!({
-            "ledger_index": ledger_index,
-            "marker": bd0,
-            "limit": 24,
-            "binary": false,
-        })) {
-            for e in res.get("state").and_then(|v| v.as_array()).map(|a| a.as_slice()).unwrap_or(&[]) {
+        // Follow ledger_data markers until the key order leaves the book —
+        // a single 24-row call missed #106433073 462DE605: the RLUSD/XRP
+        // book is bot-deep and the crossed page sat 50 LEVELS past the
+        // parent tip, so the walk saw clob=None and tecKILLED an IoC
+        // mainnet fills. Capped at 400 pages; the cap is LOGGED, never
+        // silent.
+        let mut marker = serde_json::Value::String(bd0);
+        let mut pages_done = 0usize;
+        // Per-book budget for OFFER hydration beyond the first 24 pages: a
+        // page object rides the ledger_data batch for free, but each offer
+        // costs ledger_entry + maker root + line + dir (~4 RPC). The first
+        // deepbook gate ran unbudgeted and crawled (~65s/fixture cold).
+        let mut deep_offer_budget: i32 = 256;
+        'sweep: while pages_done < 400 {
+            let Some(res) = rpc(url, "ledger_data", json!({
+                "ledger_index": ledger_index,
+                "marker": marker,
+                "limit": 96,
+                "binary": false,
+            })) else { break };
+            let batch = res.get("state").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            if batch.is_empty() {
+                break;
+            }
+            for e in &batch {
                 let Some(idx) = e.get("index").and_then(|v| v.as_str()) else { continue };
                 if !idx.starts_with(&base24) {
-                    break; // key order: past the book's range
+                    break 'sweep; // key order: past the book's range
+                }
+                pages_done += 1;
+                if pages_done >= 400 {
+                    eprintln!("HYDRATE-CAP book {base24} truncated at 400 pages");
                 }
                 if e.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("DirectoryNode") {
                     continue;
@@ -1435,10 +1457,31 @@ fn load_book_pair(
                     .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
                     .unwrap_or_default();
                 for ent in entries.iter().take(24) {
+                    if pages_done > 24 {
+                        if deep_offer_budget <= 0 {
+                            if deep_offer_budget == 0 {
+                                eprintln!("HYDRATE-CAP book {base24} deep-offer budget spent");
+                                deep_offer_budget = -1;
+                            }
+                            continue;
+                        }
+                        deep_offer_budget -= 1;
+                    }
                     let Some(ores) = rpc(url, "ledger_entry",
                         json!({"index": ent, "ledger_index": ledger_index})) else { continue };
                     let Some(onode) = ores.get("node") else { continue };
-                    load_object(state, url, ent, ledger_index);
+                    // Insert directly — load_object would re-fetch the same
+                    // entry a second time.
+                    if let Ok(okb) = hex::decode(ent) {
+                        if let Ok(okarr) = <[u8; 32]>::try_from(okb.as_slice()) {
+                            let mut on = onode.clone();
+                            hexify_addresses(&mut on);
+                            let _ = state.state_map.insert(
+                                Hash256(okarr),
+                                serde_json::to_vec(&on).unwrap_or_default(),
+                            );
+                        }
+                    }
                     let Some(mk) = onode.get("Account").and_then(|v| v.as_str()) else { continue };
                     load_account(state, url, mk, ledger_index);
                     if let Some(g) = onode.get("TakerGets").and_then(|v| v.as_object()) {
@@ -1467,6 +1510,10 @@ fn load_book_pair(
                             }
                         }
                 }
+            }
+            match res.get("marker") {
+                Some(m) => marker = m.clone(),
+                None => break,
             }
         }
     }
