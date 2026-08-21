@@ -15,6 +15,7 @@ pub mod nftpage;
 pub mod objects;
 pub mod sandbox;
 pub mod state;
+pub mod threading;
 pub mod transactor;
 
 pub use header::LedgerHeader;

@@ -2159,6 +2159,9 @@ fn run() -> i32 {
     // native must walk. Without these, native phantom-creates them. Keys are
     // computed from the tx (transactor-specific read-set).
     let mut books_seen: HashSet<String> = HashSet::new();
+    // DX_THREADCHECK: every key still live that any tx materially wrote —
+    // verified against the true post-state after the loop.
+    let mut thread_touched_keys: HashSet<Hash256> = HashSet::new();
     for h in &order {
         let Some(txj) = txjson_map.get(h) else { continue };
         for key_hex in native_read_keys(txj) {
@@ -2308,7 +2311,27 @@ fn run() -> i32 {
         if std::env::var("DX_AMM").is_ok() || std::env::var("DX_BRIDGE").is_ok() {
             eprintln!("DX_TX {h} {tx_type}");
         }
-        let (our_ter, mods) = native_apply_one(&state, &txf);
+        let (our_ter, mut mods) = native_apply_one(&state, &txf);
+        // Thread every materially-changed write with this tx's hash + the
+        // ledger seq (rippled ApplyStateTable). The meta's FinalFields never
+        // carry PreviousTxn*, so the per-tx compares are unaffected and the
+        // truth-overlay below preserves the stamps; DX_THREADCHECK verifies
+        // them against the real post-state at fixture end.
+        xrpl_ledger::ledger::threading::stamp_threading(
+            &mut mods,
+            &|k| state.state_map.lookup(k).map(|b| b.to_vec()),
+            h,
+            seq as u32,
+        );
+        if std::env::var("DX_THREADCHECK").is_ok() {
+            for (k, ent) in mods.iter() {
+                if !matches!(ent, SandboxEntry::Deleted) {
+                    thread_touched_keys.insert(*k);
+                } else {
+                    thread_touched_keys.remove(k);
+                }
+            }
+        }
         let our_mut: HashSet<(String, u8)> = native_mutset(&state, &mods)
             .into_iter()
             .filter(|(k, _)| !touched_only.contains(k))
@@ -2568,6 +2591,35 @@ fn run() -> i32 {
         println!("{}", json!({"ledger_seq": seq, "per_type": types, "per_tx": per_tx}));
     } else {
         println!("\n=== native conformance for #{seq} ===");
+        if std::env::var("DX_THREADCHECK").is_ok() {
+            // Compare our stamped threading against the REAL post-state at
+            // this ledger — the fixture metas cannot carry it, ledger_entry
+            // can. Objects overwritten by later txs hold the LAST stamp, the
+            // same object the state hash serializes.
+            let (mut checked, mut mismatch) = (0u32, 0u32);
+            for k in &thread_touched_keys {
+                let Some(bytes) = state.state_map.lookup(k) else { continue };
+                let Ok(ours) = serde_json::from_slice::<Value>(&bytes) else { continue };
+                let (Some(oid), Some(oseq)) = (
+                    ours.get("PreviousTxnID").and_then(|v| v.as_str()),
+                    ours.get("PreviousTxnLgrSeq").and_then(|v| v.as_u64()),
+                ) else { continue };
+                let khex = hex::encode_upper(k.0);
+                let Some(res) = rpc(&rpc_url, "ledger_entry",
+                    json!({"index": &khex, "ledger_index": seq})) else { continue };
+                let Some(node) = res.get("node") else { continue };
+                let (nid, nseq) = (
+                    node.get("PreviousTxnID").and_then(|v| v.as_str()).unwrap_or(""),
+                    node.get("PreviousTxnLgrSeq").and_then(|v| v.as_u64()).unwrap_or(0),
+                );
+                checked += 1;
+                if !oid.eq_ignore_ascii_case(nid) || oseq != nseq {
+                    mismatch += 1;
+                    println!("THREADCHECK-MISMATCH {khex} ours=({oid},{oseq}) net=({nid},{nseq})");
+                }
+            }
+            println!("THREADCHECK checked={checked} mismatch={mismatch}");
+        }
         let mut names: Vec<&String> = agg.keys().collect();
         names.sort();
         for t in names {
