@@ -532,8 +532,6 @@ macro_rules! stub_transactor {
     };
 }
 
-stub_transactor!(DIDSetTransactor, "DIDSet");
-stub_transactor!(DIDDeleteTransactor, "DIDDelete");
 stub_transactor!(XChainCreateBridgeTransactor, "XChainCreateBridge");
 stub_transactor!(XChainCreateClaimIDTransactor, "XChainCreateClaimID");
 stub_transactor!(XChainCommitTransactor, "XChainCommit");
@@ -542,9 +540,6 @@ stub_transactor!(XChainModifyBridgeTransactor, "XChainModifyBridge");
 stub_transactor!(XChainAccountCreateCommitTransactor, "XChainAccountCreateCommit");
 stub_transactor!(XChainAddClaimAttestationTransactor, "XChainAddClaimAttestation");
 stub_transactor!(XChainAddAccountCreateAttestationTransactor, "XChainAddAccountCreateAttestation");
-stub_transactor!(PermissionedDomainSetTransactor, "PermissionedDomainSet");
-stub_transactor!(PermissionedDomainDeleteTransactor, "PermissionedDomainDelete");
-stub_transactor!(AMMClawbackTransactor, "AMMClawback");
 
 #[cfg(test)]
 mod tests {
@@ -895,5 +890,276 @@ mod tests {
             }),
         };
         assert_eq!(ClawbackTransactor.do_apply(&tx, &mut sandbox), TxResult::NoEntry);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DID — DIDSet / DIDDelete (DIDSet.cpp / DIDDelete.cpp; ⚠ no mainnet
+// specimen in any fixture window — blind source port, the scout is the
+// verifier when one lands).
+// ---------------------------------------------------------------------------
+
+/// Shared create tail (DIDSet.cpp addSLE): reserve on the CURRENT (post-fee)
+/// balance, insert, owner-dir link, OwnerCount+1.
+fn add_owned_object(
+    sandbox: &mut Sandbox,
+    owner: &[u8; 20],
+    key: xrpl_core::types::Hash256,
+    mut obj: serde_json::Value,
+) -> TxResult {
+    let acct_key = keylet::account_root_key(owner);
+    let Some(acct) = crate::tx::offer::json_at(sandbox, &acct_key) else {
+        return TxResult::NoAccount;
+    };
+    let balance = acct["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let oc = acct["OwnerCount"].as_u64().unwrap_or(0);
+    if balance < crate::ledger::fees::account_reserve(sandbox, oc + 1) {
+        return TxResult::InsufficientReserve;
+    }
+    let node = crate::ledger::directory::owner_dir_insert(sandbox, owner, &key);
+    obj["OwnerNode"] = serde_json::Value::String(format!("{node:x}"));
+    sandbox.write(key, serde_json::to_vec(&obj).unwrap_or_default());
+    crate::tx::offer::owner_count_add(sandbox, owner, 1);
+    TxResult::Success
+}
+
+/// Shared delete tail (DIDDelete.cpp deleteSLE): dir unlink (keep_root),
+/// OwnerCount-1, erase. tecNO_ENTRY when the object is absent.
+fn delete_owned_object(
+    sandbox: &mut Sandbox,
+    owner: &[u8; 20],
+    key: xrpl_core::types::Hash256,
+) -> TxResult {
+    let Some(obj) = crate::tx::offer::json_at(sandbox, &key) else {
+        return TxResult::NoEntry;
+    };
+    let hint = obj
+        .get("OwnerNode")
+        .and_then(|v| v.as_str())
+        .and_then(|h| u64::from_str_radix(h, 16).ok());
+    crate::ledger::directory::owner_dir_remove(sandbox, owner, &key, hint, true);
+    crate::tx::offer::owner_count_add(sandbox, owner, -1);
+    sandbox.delete(key);
+    TxResult::Success
+}
+
+pub struct DIDSetTransactor;
+
+impl Transactor for DIDSetTransactor {
+    fn preflight(&self, tx: &TxFields) -> TxResult {
+        if tx.tx_type != "DIDSet" {
+            return TxResult::Malformed;
+        }
+        if tx.fee == 0 {
+            return TxResult::BadFee;
+        }
+        // At least one of the three payload fields must appear (preflight
+        // temEMPTY_DID is a tem; the tec arm is handled in do_apply).
+        if ["URI", "DIDDocument", "Data"].iter().all(|f| tx.fields.get(f).is_none()) {
+            return TxResult::Malformed;
+        }
+        TxResult::Success
+    }
+
+    fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        if !sandbox.exists(&keylet::account_root_key(&tx.account)) {
+            return TxResult::NoAccount;
+        }
+        TxResult::Success
+    }
+
+    fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        let key = keylet::did_key(&tx.account);
+        let update = |obj: &mut serde_json::Value| {
+            for f in ["URI", "DIDDocument", "Data"] {
+                if let Some(v) = tx.fields.get(f).and_then(|v| v.as_str()) {
+                    if v.is_empty() {
+                        obj.as_object_mut().map(|o| o.remove(f));
+                    } else {
+                        obj[f] = serde_json::Value::String(v.to_string());
+                    }
+                }
+            }
+        };
+        if let Some(mut did) = crate::tx::offer::json_at(sandbox, &key) {
+            update(&mut did);
+            if ["URI", "DIDDocument", "Data"].iter().all(|f| did.get(f).is_none()) {
+                return TxResult::EmptyDid;
+            }
+            sandbox.write(key, serde_json::to_vec(&did).unwrap_or_default());
+            return TxResult::Success;
+        }
+        let mut did = serde_json::json!({
+            "LedgerEntryType": "DID",
+            "Account": hex::encode(tx.account),
+        });
+        update(&mut did);
+        if ["URI", "DIDDocument", "Data"].iter().all(|f| did.get(f).is_none()) {
+            return TxResult::EmptyDid; // fixEmptyDID
+        }
+        add_owned_object(sandbox, &tx.account, key, did)
+    }
+}
+
+pub struct DIDDeleteTransactor;
+
+impl Transactor for DIDDeleteTransactor {
+    fn preflight(&self, tx: &TxFields) -> TxResult {
+        if tx.tx_type != "DIDDelete" {
+            return TxResult::Malformed;
+        }
+        if tx.fee == 0 {
+            return TxResult::BadFee;
+        }
+        TxResult::Success
+    }
+
+    fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        if !sandbox.exists(&keylet::account_root_key(&tx.account)) {
+            return TxResult::NoAccount;
+        }
+        TxResult::Success
+    }
+
+    fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        delete_owned_object(sandbox, &tx.account, keylet::did_key(&tx.account))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PermissionedDomain — Set / Delete (⚠ blind source port, no specimen).
+// ---------------------------------------------------------------------------
+
+pub struct PermissionedDomainSetTransactor;
+
+impl Transactor for PermissionedDomainSetTransactor {
+    fn preflight(&self, tx: &TxFields) -> TxResult {
+        if tx.tx_type != "PermissionedDomainSet" {
+            return TxResult::Malformed;
+        }
+        if tx.fee == 0 {
+            return TxResult::BadFee;
+        }
+        if tx.fields.get("AcceptedCredentials").and_then(|v| v.as_array()).map(|a| a.is_empty()).unwrap_or(true) {
+            return TxResult::Malformed;
+        }
+        TxResult::Success
+    }
+
+    fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        if !sandbox.exists(&keylet::account_root_key(&tx.account)) {
+            return TxResult::NoAccount;
+        }
+        TxResult::Success
+    }
+
+    fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        // credentials::makeSorted orders by (issuer, credential type).
+        let mut creds: Vec<serde_json::Value> = tx
+            .fields
+            .get("AcceptedCredentials")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        creds.sort_by_key(|c| {
+            let inner = c.get("Credential").unwrap_or(c);
+            (
+                inner
+                    .get("Issuer")
+                    .and_then(|v| v.as_str())
+                    .and_then(crate::tx::offer::decode20)
+                    .unwrap_or([0u8; 20]),
+                inner
+                    .get("CredentialType")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_uppercase(),
+            )
+        });
+        let sorted = serde_json::Value::Array(creds);
+
+        if let Some(domain_hex) = tx.fields.get("DomainID").and_then(|v| v.as_str()) {
+            // Modify: replace the credential list on the existing domain.
+            let Ok(kb) = hex::decode(domain_hex) else { return TxResult::Malformed };
+            let Ok(karr) = <[u8; 32]>::try_from(kb.as_slice()) else {
+                return TxResult::Malformed;
+            };
+            let key = xrpl_core::types::Hash256(karr);
+            let Some(mut pd) = crate::tx::offer::json_at(sandbox, &key) else {
+                // preclaim in rippled: missing domain -> tecNO_ENTRY
+                return TxResult::NoEntry;
+            };
+            let owner_ok = pd
+                .get("Owner")
+                .and_then(|v| v.as_str())
+                .and_then(crate::tx::offer::decode20)
+                .map(|o| o == tx.account)
+                .unwrap_or(false);
+            if !owner_ok {
+                return TxResult::NoPermission;
+            }
+            pd["AcceptedCredentials"] = sorted;
+            sandbox.write(key, serde_json::to_vec(&pd).unwrap_or_default());
+            return TxResult::Success;
+        }
+        let seq = if tx.uses_ticket() { tx.ticket_seq.unwrap_or(0) } else { tx.sequence };
+        let key = keylet::permissioned_domain_key(&tx.account, seq);
+        let pd = serde_json::json!({
+            "LedgerEntryType": "PermissionedDomain",
+            "Owner": hex::encode(tx.account),
+            "Sequence": seq,
+            "AcceptedCredentials": sorted,
+        });
+        add_owned_object(sandbox, &tx.account, key, pd)
+    }
+}
+
+pub struct PermissionedDomainDeleteTransactor;
+
+impl Transactor for PermissionedDomainDeleteTransactor {
+    fn preflight(&self, tx: &TxFields) -> TxResult {
+        if tx.tx_type != "PermissionedDomainDelete" {
+            return TxResult::Malformed;
+        }
+        if tx.fee == 0 {
+            return TxResult::BadFee;
+        }
+        if tx.fields.get("DomainID").is_none() {
+            return TxResult::Malformed;
+        }
+        TxResult::Success
+    }
+
+    fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        if !sandbox.exists(&keylet::account_root_key(&tx.account)) {
+            return TxResult::NoAccount;
+        }
+        TxResult::Success
+    }
+
+    fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        let Some(kb) = tx
+            .fields
+            .get("DomainID")
+            .and_then(|v| v.as_str())
+            .and_then(|s| hex::decode(s).ok())
+        else {
+            return TxResult::Malformed;
+        };
+        let Ok(karr) = <[u8; 32]>::try_from(kb.as_slice()) else { return TxResult::Malformed };
+        let key = xrpl_core::types::Hash256(karr);
+        let Some(pd) = crate::tx::offer::json_at(sandbox, &key) else {
+            return TxResult::NoEntry;
+        };
+        let owner_ok = pd
+            .get("Owner")
+            .and_then(|v| v.as_str())
+            .and_then(crate::tx::offer::decode20)
+            .map(|o| o == tx.account)
+            .unwrap_or(false);
+        if !owner_ok {
+            return TxResult::NoPermission;
+        }
+        delete_owned_object(sandbox, &tx.account, key)
     }
 }

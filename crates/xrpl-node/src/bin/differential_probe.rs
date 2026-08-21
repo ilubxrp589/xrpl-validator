@@ -35,11 +35,9 @@ use xrpl_ledger::tx::dispatch::get_transactor;
 /// makes zero type-specific state changes. Reported as SKIP-STUB so the map is
 /// honest rather than showing them as ordinary logic divergences.
 const STUB_TYPES: &[&str] = &[
-    "DIDSet", "DIDDelete",
     "XChainCreateBridge", "XChainCreateClaimID", "XChainCommit", "XChainClaim",
     "XChainModifyBridge", "XChainAccountCreateCommit", "XChainAddClaimAttestation",
-    "XChainAddAccountCreateAttestation", "PermissionedDomainSet",
-    "PermissionedDomainDelete", "AMMClawback",
+    "XChainAddAccountCreateAttestation",
 ];
 
 /// Account-valued tx fields the native transactors expect as 20-byte hex.

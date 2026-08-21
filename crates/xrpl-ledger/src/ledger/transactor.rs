@@ -128,6 +128,8 @@ pub enum TxResult {
     /// The MPT is locked — globally (issuance lsfMPTLocked) or individually
     /// (either holder's MPToken lsfMPTLocked) — for a holder→holder payment.
     Locked,
+    /// A DIDSet whose result would carry none of URI/DIDDocument/Data.
+    EmptyDid,
 
     // tem — malformed, not applied at all
     /// Transaction is malformed.
@@ -193,6 +195,7 @@ impl TxResult {
             | TxResult::NoLineRedundant
             | TxResult::NoAuth
             | TxResult::Locked
+            | TxResult::EmptyDid
             | TxResult::Unsupported => true,
             // tem/tef: not claimed
             _ => false,
@@ -244,6 +247,7 @@ impl TxResult {
             TxResult::NoLineRedundant => "tecNO_LINE_REDUNDANT",
             TxResult::NoAuth => "tecNO_AUTH",
             TxResult::Locked => "tecLOCKED",
+            TxResult::EmptyDid => "tecEMPTY_DID",
             TxResult::Malformed => "temMALFORMED",
             TxResult::BadFee => "temBAD_FEE",
             TxResult::BadAmount => "temBAD_AMOUNT",

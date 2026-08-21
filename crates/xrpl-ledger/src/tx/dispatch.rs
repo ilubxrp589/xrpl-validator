@@ -30,8 +30,9 @@ use super::mpt::{
     MPTokenAuthorizeTransactor, MPTokenIssuanceCreateTransactor,
     MPTokenIssuanceDestroyTransactor, MPTokenIssuanceSetTransactor,
 };
+use super::amm::AMMClawbackTransactor;
 use super::misc::{
-    AMMClawbackTransactor, ClawbackTransactor, DIDDeleteTransactor, DIDSetTransactor,
+    ClawbackTransactor, DIDDeleteTransactor, DIDSetTransactor,
     DepositPreauthTransactor,
     PermissionedDomainDeleteTransactor, PermissionedDomainSetTransactor,
     SetRegularKeyTransactor, SignerListSetTransactor,

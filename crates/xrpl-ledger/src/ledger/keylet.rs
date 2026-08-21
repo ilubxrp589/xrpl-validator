@@ -166,6 +166,23 @@ pub fn pay_channel_key(account_id: &[u8; 20], dest_id: &[u8; 20], sequence: u32)
     sha512_half(&buf)
 }
 
+/// DID key: `SHA512Half(0x0049 ('I') || account)` — one DID per account.
+pub fn did_key(account_id: &[u8; 20]) -> Hash256 {
+    let mut buf = [0u8; 22];
+    buf[..2].copy_from_slice(&[0x00, 0x49]);
+    buf[2..22].copy_from_slice(account_id);
+    sha512_half(&buf)
+}
+
+/// PermissionedDomain key: `SHA512Half(0x006D ('m') || account || seq_be32)`.
+pub fn permissioned_domain_key(account_id: &[u8; 20], sequence: u32) -> Hash256 {
+    let mut buf = [0u8; 26];
+    buf[..2].copy_from_slice(&[0x00, 0x6D]);
+    buf[2..22].copy_from_slice(account_id);
+    buf[22..26].copy_from_slice(&sequence.to_be_bytes());
+    sha512_half(&buf)
+}
+
 /// MPTokenIssuance key: `SHA512Half(0x007E ('~') || MPTID)` where MPTID is
 /// the 24-byte sequence_be32 || issuer concatenation carried verbatim in
 /// `mpt_issuance_id` amount JSON (Indexes.cpp keylet::mptIssuance).
