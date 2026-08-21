@@ -1995,12 +1995,21 @@ fn native_mutset(
             SandboxEntry::Deleted => (2, false, None),
         };
         if is_mod {
-            // drop no-op modifies (post == pre, semantically) — rippled meta omits them
+            // drop no-op modifies (post == pre, semantically) — rippled meta
+            // omits them. Threading is stripped on BOTH sides: a
+            // threadOwners refresh (PreviousTxn*-only Modified) filters out
+            // of OUR set exactly as the expected-side thread filter drops
+            // mainnet's, while the STATE keeps the stamp for DX_THREADCHECK.
             if let (Some(new), Some(old)) = (new_bytes, state.state_map.lookup(key)) {
                 let mut pn: Option<Value> = serde_json::from_slice(new).ok();
                 let mut po: Option<Value> = serde_json::from_slice(old).ok();
-                pn.as_mut().map(canon_ptrs);
-                po.as_mut().map(canon_ptrs);
+                for v in [pn.as_mut(), po.as_mut()].into_iter().flatten() {
+                    canon_ptrs(v);
+                    if let Some(o) = v.as_object_mut() {
+                        o.remove("PreviousTxnID");
+                        o.remove("PreviousTxnLgrSeq");
+                    }
+                }
                 if pn.is_some() && pn == po {
                     continue;
                 }

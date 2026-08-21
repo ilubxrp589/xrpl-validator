@@ -97,4 +97,87 @@ pub fn stamp_threading(
         v["PreviousTxnLgrSeq"] = serde_json::Value::Number(ledger_seq.into());
         *bytes = serde_json::to_vec(&v).unwrap_or_default();
     }
+
+    // `threadOwners` (ApplyStateTable.cpp:640-668): every CREATED or DELETED
+    // node also threads the transaction to its owner accounts' roots — both
+    // limit issuers for a RippleState, else sfAccount and sfDestination when
+    // present, nothing for an AccountRoot. Those roots become the meta's
+    // pure-threading ModifiedNodes (the FinalFields==pre refreshes the
+    // expected-side filter drops). #106124864 E969E24F: EscrowCreate
+    // EB5DF108 threads the escrow DESTINATION's root — an account the
+    // transaction itself never writes.
+    let mut owners: Vec<[u8; 20]> = Vec::new();
+    let mut collect = |v: &serde_json::Value| {
+        let ty = v.get("LedgerEntryType").and_then(|t| t.as_str()).unwrap_or("");
+        match ty {
+            "AccountRoot" => {}
+            "RippleState" => {
+                for side in ["LowLimit", "HighLimit"] {
+                    if let Some(a) = v
+                        .get(side)
+                        .and_then(|l| l.get("issuer"))
+                        .and_then(|i| i.as_str())
+                        .and_then(crate::tx::offer::decode20)
+                    {
+                        owners.push(a);
+                    }
+                }
+            }
+            _ => {
+                for f in ["Account", "Destination"] {
+                    if let Some(a) =
+                        v.get(f).and_then(|x| x.as_str()).and_then(crate::tx::offer::decode20)
+                    {
+                        owners.push(a);
+                    }
+                }
+            }
+        }
+    };
+    for (k, ent) in mods.iter() {
+        match ent {
+            SandboxEntry::Created(b) => {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(b) {
+                    collect(&v);
+                }
+            }
+            SandboxEntry::Deleted => {
+                if let Some(pb) = pre(k) {
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&pb) {
+                        collect(&v);
+                    }
+                }
+            }
+            SandboxEntry::Modified(_) => {}
+        }
+    }
+    owners.sort_unstable();
+    owners.dedup();
+    for acct in owners {
+        let rk = super::keylet::account_root_key(&acct);
+        let stamped = |b: &[u8]| -> Option<Vec<u8>> {
+            let mut v = serde_json::from_slice::<serde_json::Value>(b).ok()?;
+            v["PreviousTxnID"] = serde_json::Value::String(hash_upper.clone());
+            v["PreviousTxnLgrSeq"] = serde_json::Value::Number(ledger_seq.into());
+            serde_json::to_vec(&v).ok()
+        };
+        match mods.get_mut(&rk) {
+            Some(SandboxEntry::Deleted) => {} // just deleted — rippled warns and skips
+            Some(SandboxEntry::Created(b)) | Some(SandboxEntry::Modified(b)) => {
+                // Already written this tx — thread unconditionally (a
+                // threadOwners hit is threaded even when the write itself
+                // was a content-equal write-back).
+                if let Some(nb) = stamped(b) {
+                    *b = nb;
+                }
+            }
+            None => {
+                if let Some(pb) = pre(&rk) {
+                    if let Some(nb) = stamped(&pb) {
+                        mods.insert(rk, SandboxEntry::Modified(nb));
+                    }
+                }
+            }
+        }
+    }
 }
