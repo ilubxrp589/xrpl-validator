@@ -1944,6 +1944,66 @@ fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<Hash
     }
 }
 
+/// Re-spell engine-internal JSON into the canonical forms the binary codec
+/// demands, changing NO values: u64 fields to full-width hex (accepting
+/// numbers, unpadded hex, and — for the MPT amount family, which rippled
+/// renders base-10 — decimal strings); 40-hex account ids to base58.
+fn canon_for_encode(v: &mut Value) {
+    const U64_HEX: &[&str] = &[
+        "OwnerNode", "BookNode", "LowNode", "HighNode", "DestinationNode",
+        "IndexNext", "IndexPrevious", "XChainClaimID", "XChainAccountCreateCount",
+        "XChainAccountClaimCount", "ReferenceCount",
+    ];
+    const U64_DEC: &[&str] = &["MaximumAmount", "OutstandingAmount", "MPTAmount", "LockedAmount"];
+    const ACCTS: &[&str] = &[
+        "Account", "Owner", "Destination", "Issuer", "RegularKey", "Authorize",
+        "Unauthorize", "NFTokenMinter", "Holder", "OtherChainSource",
+        "AttestationSignerAccount", "AttestationRewardAccount", "LockingChainDoor",
+        "IssuingChainDoor", "issuer",
+    ];
+    match v {
+        Value::Array(a) => {
+            for e in a {
+                canon_for_encode(e);
+            }
+        }
+        Value::Object(o) => {
+            for (name, val) in o.iter_mut() {
+                if U64_HEX.contains(&name.as_str()) {
+                    let n = val.as_u64().or_else(|| {
+                        val.as_str().and_then(|s| u64::from_str_radix(s, 16).ok())
+                    });
+                    if let Some(n) = n {
+                        *val = Value::String(format!("{n:016X}"));
+                    }
+                } else if U64_DEC.contains(&name.as_str()) {
+                    let n = val
+                        .as_u64()
+                        .or_else(|| val.as_str().and_then(|s| s.parse::<u64>().ok()));
+                    if let Some(n) = n {
+                        *val = Value::String(format!("{n:016X}"));
+                    }
+                } else if ACCTS.contains(&name.as_str()) {
+                    if let Some(s) = val.as_str() {
+                        if s.len() == 40 {
+                            if let Ok(b) = hex::decode(s) {
+                                if let Ok(arr) = <[u8; 20]>::try_from(b.as_slice()) {
+                                    *val = Value::String(
+                                        xrpl_core::AccountId::from_bytes(arr).to_address(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    canon_for_encode(val);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Canonicalise the u64 directory/node POINTER fields before a semantic
 /// compare. XRPL JSON renders them as HEX STRINGS (`"IndexNext":"12f2e"`)
 /// while our writers emit plain numbers (`77614`) — the same value spelled two
@@ -2333,7 +2393,7 @@ fn run() -> i32 {
             h,
             seq as u32,
         );
-        if std::env::var("DX_THREADCHECK").is_ok() {
+        if std::env::var("DX_THREADCHECK").is_ok() || std::env::var("DX_BYTECHECK").is_ok() {
             for (k, ent) in mods.iter() {
                 if !matches!(ent, SandboxEntry::Deleted) {
                     thread_touched_keys.insert(*k);
@@ -2629,6 +2689,55 @@ fn run() -> i32 {
                 }
             }
             println!("THREADCHECK checked={checked} mismatch={mismatch}");
+        }
+        if std::env::var("DX_BYTECHECK").is_ok() {
+            // BYTE census: serialize every surviving touched node through the
+            // canonical codec and compare against the real post-state blob
+            // (`ledger_entry binary=true`). The prep pass re-SPELLS values the
+            // engine stores in tolerated-but-noncanonical JSON forms (numeric
+            // dir pointers, unpadded/decimal u64s, hex account ids) without
+            // changing any value — so a mismatch here is REAL drift: a wrong
+            // value, a missing or extra field, a wrong flag.
+            let (mut checked, mut mismatch, mut encfail) = (0u32, 0u32, 0u32);
+            for k in &thread_touched_keys {
+                let Some(bytes) = state.state_map.lookup(k) else { continue };
+                let Ok(mut ours) = serde_json::from_slice::<Value>(&bytes) else { continue };
+                canon_for_encode(&mut ours);
+                let khex = hex::encode_upper(k.0);
+                let Some(res) = rpc(&rpc_url, "ledger_entry",
+                    json!({"index": &khex, "ledger_index": seq, "binary": true})) else { continue };
+                let Some(net_hex) = res.get("node_binary").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let Ok(net) = hex::decode(net_hex) else { continue };
+                checked += 1;
+                match xrpl_core::codec::encode::encode_transaction_json(&ours, false) {
+                    Err(e) => {
+                        encfail += 1;
+                        println!("BYTECHECK-ENCODE-FAIL {khex} {e:?}");
+                    }
+                    Ok(enc) => {
+                        if enc != net {
+                            mismatch += 1;
+                            let ofs = enc
+                                .iter()
+                                .zip(net.iter())
+                                .position(|(a, b)| a != b)
+                                .unwrap_or_else(|| enc.len().min(net.len()));
+                            let ctx = |b: &[u8]| {
+                                let lo = ofs.saturating_sub(8);
+                                let hi = (ofs + 24).min(b.len());
+                                hex::encode_upper(&b[lo.min(b.len())..hi])
+                            };
+                            println!(
+                                "BYTECHECK-MISMATCH {khex} ofs={ofs} ours_len={} net_len={} ours=..{} net=..{}",
+                                enc.len(), net.len(), ctx(&enc), ctx(&net)
+                            );
+                        }
+                    }
+                }
+            }
+            println!("BYTECHECK checked={checked} mismatch={mismatch} encfail={encfail}");
         }
         let mut names: Vec<&String> = agg.keys().collect();
         names.sort();
