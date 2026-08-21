@@ -26,10 +26,13 @@ use super::credential::{
     CredentialAcceptTransactor, CredentialCreateTransactor, CredentialDeleteTransactor,
 };
 use super::escrow::{EscrowCancelTransactor, EscrowCreateTransactor, EscrowFinishTransactor};
+use super::mpt::{
+    MPTokenAuthorizeTransactor, MPTokenIssuanceCreateTransactor,
+    MPTokenIssuanceDestroyTransactor, MPTokenIssuanceSetTransactor,
+};
 use super::misc::{
     AMMClawbackTransactor, ClawbackTransactor, DIDDeleteTransactor, DIDSetTransactor,
-    DepositPreauthTransactor, MPTokenAuthorizeTransactor, MPTokenIssuanceCreateTransactor,
-    MPTokenIssuanceDestroyTransactor, MPTokenIssuanceSetTransactor,
+    DepositPreauthTransactor,
     PermissionedDomainDeleteTransactor, PermissionedDomainSetTransactor,
     SetRegularKeyTransactor, SignerListSetTransactor,
     XChainAccountCreateCommitTransactor, XChainAddAccountCreateAttestationTransactor,

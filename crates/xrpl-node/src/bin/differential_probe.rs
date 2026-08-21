@@ -39,8 +39,7 @@ const STUB_TYPES: &[&str] = &[
     "XChainCreateBridge", "XChainCreateClaimID", "XChainCommit", "XChainClaim",
     "XChainModifyBridge", "XChainAccountCreateCommit", "XChainAddClaimAttestation",
     "XChainAddAccountCreateAttestation", "PermissionedDomainSet",
-    "PermissionedDomainDelete", "AMMClawback", "MPTokenIssuanceCreate",
-    "MPTokenIssuanceDestroy", "MPTokenIssuanceSet", "MPTokenAuthorize",
+    "PermissionedDomainDelete", "AMMClawback",
 ];
 
 /// Account-valued tx fields the native transactors expect as 20-byte hex.
@@ -1567,7 +1566,13 @@ fn load_mpt_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_ind
         let bytes = hex::decode(v.get("mpt_issuance_id")?.as_str()?).ok()?;
         bytes.as_slice().try_into().ok()
     };
-    let Some(id) = txj.get("Amount").and_then(|a| mpt_id(a)) else { return };
+    // Amount-embedded id (Payment/Clawback) or the lifecycle txs' top-level
+    // MPTokenIssuanceID (Destroy/Set/Authorize).
+    let top_id = || -> Option<[u8; 24]> {
+        let bytes = hex::decode(txj.get("MPTokenIssuanceID")?.as_str()?).ok()?;
+        bytes.as_slice().try_into().ok()
+    };
+    let Some(id) = txj.get("Amount").and_then(|a| mpt_id(a)).or_else(top_id) else { return };
     let ikey = keylet::mpt_issuance_key(&id);
     load_object(state, url, &hex::encode_upper(ikey.0), ledger_index);
     let mut parties: Vec<[u8; 20]> = Vec::new();

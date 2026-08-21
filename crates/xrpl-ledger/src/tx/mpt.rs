@@ -280,3 +280,407 @@ pub fn apply_mpt_payment(
         other => other,
     }
 }
+
+// ---------------------------------------------------------------------------
+// MPT issuance lifecycle — MPTokenIssuanceCreate / Destroy / Set, and
+// MPTokenAuthorize. Previously fee-only stubs (probe STUB_TYPES).
+// Sources: MPTokenIssuanceCreate.cpp::create, MPTokenIssuanceDestroy.cpp,
+// MPTokenIssuanceSet.cpp, MPTokenHelpers.cpp::authorizeMPToken (all 3.2.1).
+// ---------------------------------------------------------------------------
+
+use crate::ledger::transactor::Transactor;
+
+fn issuance_id_of(tx: &TxFields) -> Option<[u8; 24]> {
+    let s = tx.fields.get("MPTokenIssuanceID")?.as_str()?;
+    hex::decode(s).ok()?.as_slice().try_into().ok()
+}
+
+fn read_json(sandbox: &Sandbox, k: &Hash256) -> Option<serde_json::Value> {
+    sandbox.read(k).and_then(|d| serde_json::from_slice(&d).ok())
+}
+
+/// Pre-fee balance (do_apply runs after apply_common): rippled's
+/// `priorBalance_` — the same convention CheckCash calibrated.
+fn prior_balance(sandbox: &Sandbox, tx: &TxFields) -> u64 {
+    read_json(sandbox, &keylet::account_root_key(&tx.account))
+        .and_then(|a| a["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()))
+        .unwrap_or(0)
+        .saturating_add(tx.fee)
+}
+
+fn owner_count(sandbox: &Sandbox, acct: &[u8; 20]) -> u64 {
+    read_json(sandbox, &keylet::account_root_key(acct))
+        .and_then(|a| a["OwnerCount"].as_u64())
+        .unwrap_or(0)
+}
+
+/// MPTokenIssuanceCreate — mint a new issuance object under the creator.
+pub struct MPTokenIssuanceCreateTransactor;
+
+impl Transactor for MPTokenIssuanceCreateTransactor {
+    fn preflight(&self, tx: &TxFields) -> TxResult {
+        if tx.tx_type != "MPTokenIssuanceCreate" {
+            return TxResult::Malformed;
+        }
+        if tx.fee == 0 {
+            return TxResult::BadFee;
+        }
+        // A NON-ZERO TransferFee demands tfMPTCanTransfer; the cap is 50000.
+        // A8A08D3E (l105864866) carries an explicit "TransferFee": 0 with no
+        // CanTransfer flag and mainnet accepts it — the flag requirement is
+        // `fee > 0` only (MPTokenIssuanceCreate.cpp preflight). Further tem
+        // checks (metadata length, DomainID rules) unported — no specimen.
+        let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+        if let Some(f) = tx.fields.get("TransferFee").and_then(|v| v.as_u64()) {
+            if f > 50_000 || (f > 0 && flags & LSF_MPT_CAN_TRANSFER == 0) {
+                return TxResult::Malformed;
+            }
+        }
+        TxResult::Success
+    }
+
+    fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        if !sandbox.exists(&keylet::account_root_key(&tx.account)) {
+            return TxResult::NoAccount;
+        }
+        TxResult::Success
+    }
+
+    fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        let oc = owner_count(sandbox, &tx.account);
+        if prior_balance(sandbox, tx) < crate::ledger::fees::account_reserve(sandbox, oc + 1) {
+            return TxResult::InsufficientReserve;
+        }
+        // makeMptID(seq, account): seq_be32 || account — the tx's seq value
+        // (ticket seq when ticketed), same rule as offer/check keylets.
+        let seq = if tx.uses_ticket() { tx.ticket_seq.unwrap_or(0) } else { tx.sequence };
+        let mut mptid = [0u8; 24];
+        mptid[..4].copy_from_slice(&seq.to_be_bytes());
+        mptid[4..].copy_from_slice(&tx.account);
+        let ikey = keylet::mpt_issuance_key(&mptid);
+        let node = crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &ikey);
+        let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & !0x8000_0000;
+        let mut obj = serde_json::json!({
+            "LedgerEntryType": "MPTokenIssuance",
+            "Flags": flags,
+            "Issuer": hex::encode(tx.account),
+            "OutstandingAmount": "0",
+            "OwnerNode": format!("{node:x}"),
+            "Sequence": seq,
+        });
+        // Optional passthroughs, in the ledger's own spellings: MaximumAmount
+        // is a UInt64 amount-family field (decimal STRING — the l106134471
+        // issuance shows "1000000"); AssetScale/TransferFee are numbers;
+        // metadata/domain are hex strings.
+        if let Some(m) = tx.fields.get("MaximumAmount") {
+            obj["MaximumAmount"] = m.clone();
+        }
+        // AssetScale/TransferFee/MutableFlags are soeDEFAULT on the ledger
+        // object: an explicit zero in the tx (A8A08D3E carries both) is
+        // serialized AWAY by rippled — the stored object omits the field.
+        for f in ["AssetScale", "TransferFee", "MutableFlags"] {
+            match tx.fields.get(f).and_then(|v| v.as_u64()) {
+                Some(v) if v > 0 => obj[f] = serde_json::Value::Number(v.into()),
+                _ => {}
+            }
+        }
+        for f in ["MPTokenMetadata", "DomainID"] {
+            match tx.fields.get(f).and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => obj[f] = serde_json::Value::String(s.to_string()),
+                _ => {}
+            }
+        }
+        sandbox.write(ikey, serde_json::to_vec(&obj).unwrap_or_default());
+        crate::tx::offer::owner_count_add(sandbox, &tx.account, 1);
+        TxResult::Success
+    }
+}
+
+/// MPTokenIssuanceDestroy — the issuer retires an empty issuance.
+pub struct MPTokenIssuanceDestroyTransactor;
+
+impl Transactor for MPTokenIssuanceDestroyTransactor {
+    fn preflight(&self, tx: &TxFields) -> TxResult {
+        if tx.tx_type != "MPTokenIssuanceDestroy" {
+            return TxResult::Malformed;
+        }
+        if tx.fee == 0 {
+            return TxResult::BadFee;
+        }
+        if tx.fields.get("MPTokenIssuanceID").is_none() {
+            return TxResult::Malformed;
+        }
+        TxResult::Success
+    }
+
+    fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        if !sandbox.exists(&keylet::account_root_key(&tx.account)) {
+            return TxResult::NoAccount;
+        }
+        TxResult::Success
+    }
+
+    fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        let Some(id) = issuance_id_of(tx) else { return TxResult::Malformed };
+        let ikey = keylet::mpt_issuance_key(&id);
+        let Some(iss) = read_json(sandbox, &ikey) else { return TxResult::ObjectNotFound };
+        let issuer_ok = iss
+            .get("Issuer")
+            .and_then(|v| v.as_str())
+            .and_then(crate::tx::offer::decode20)
+            .map(|i| i == tx.account)
+            .unwrap_or(false);
+        if !issuer_ok {
+            return TxResult::NoPermission;
+        }
+        if dec_field(&iss, "OutstandingAmount") != 0 || dec_field(&iss, "LockedAmount") != 0 {
+            return TxResult::HasObligations;
+        }
+        let hint = iss
+            .get("OwnerNode")
+            .and_then(|v| v.as_str())
+            .and_then(|s| u64::from_str_radix(s, 16).ok());
+        sandbox.delete(ikey);
+        crate::ledger::directory::owner_dir_remove(sandbox, &tx.account, &ikey, hint, false);
+        crate::tx::offer::owner_count_add(sandbox, &tx.account, -1);
+        TxResult::Success
+    }
+}
+
+/// MPTokenAuthorize — a holder opts in/out of an MPT (creating or deleting
+/// their MPToken), or the issuer flips lsfMPTAuthorized on a holder's.
+pub struct MPTokenAuthorizeTransactor;
+
+const TF_MPT_UNAUTHORIZE: u64 = 0x0000_0001;
+
+impl Transactor for MPTokenAuthorizeTransactor {
+    fn preflight(&self, tx: &TxFields) -> TxResult {
+        if tx.tx_type != "MPTokenAuthorize" {
+            return TxResult::Malformed;
+        }
+        if tx.fee == 0 {
+            return TxResult::BadFee;
+        }
+        if tx.fields.get("MPTokenIssuanceID").is_none() {
+            return TxResult::Malformed;
+        }
+        TxResult::Success
+    }
+
+    fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        if !sandbox.exists(&keylet::account_root_key(&tx.account)) {
+            return TxResult::NoAccount;
+        }
+        TxResult::Success
+    }
+
+    fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        let Some(id) = issuance_id_of(tx) else { return TxResult::Malformed };
+        let ikey = keylet::mpt_issuance_key(&id);
+        let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+        let holder = tx
+            .fields
+            .get("Holder")
+            .and_then(|h| h.as_str())
+            .and_then(crate::tx::offer::decode20);
+
+        let Some(holder_id) = holder else {
+            // HOLDER-side (tx account is the holder).
+            let tkey = keylet::mptoken_key(&ikey, &tx.account);
+            if flags & TF_MPT_UNAUTHORIZE != 0 {
+                // Delete own empty MPToken.
+                let Some(tok) = read_json(sandbox, &tkey) else {
+                    return TxResult::ObjectNotFound;
+                };
+                if dec_field(&tok, "MPTAmount") != 0 || dec_field(&tok, "LockedAmount") != 0 {
+                    return TxResult::HasObligations;
+                }
+                let hint = tok
+                    .get("OwnerNode")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| u64::from_str_radix(s, 16).ok());
+                sandbox.delete(tkey);
+                crate::ledger::directory::owner_dir_remove(
+                    sandbox, &tx.account, &tkey, hint, false,
+                );
+                crate::tx::offer::owner_count_add(sandbox, &tx.account, -1);
+                return TxResult::Success;
+            }
+            // Create own MPToken (opt in).
+            let Some(iss) = read_json(sandbox, &ikey) else { return TxResult::ObjectNotFound };
+            let is_issuer = iss
+                .get("Issuer")
+                .and_then(|v| v.as_str())
+                .and_then(crate::tx::offer::decode20)
+                .map(|i| i == tx.account)
+                .unwrap_or(false);
+            if is_issuer {
+                return TxResult::NoPermission;
+            }
+            if sandbox.exists(&tkey) {
+                return TxResult::Duplicate;
+            }
+            // Trust-line-style reserve: the first two owned items are free
+            // (authorizeMPToken: uOwnerCount < 2 ⇒ zero reserve required).
+            let oc = owner_count(sandbox, &tx.account);
+            let need = if oc < 2 {
+                0
+            } else {
+                crate::ledger::fees::account_reserve(sandbox, oc + 1)
+            };
+            if prior_balance(sandbox, tx) < need {
+                return TxResult::InsufficientReserve;
+            }
+            let node = crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &tkey);
+            let obj = serde_json::json!({
+                "LedgerEntryType": "MPToken",
+                "Account": hex::encode(tx.account),
+                "MPTokenIssuanceID": hex::encode_upper(id),
+                "Flags": 0,
+                "OwnerNode": format!("{node:x}"),
+            });
+            sandbox.write(tkey, serde_json::to_vec(&obj).unwrap_or_default());
+            crate::tx::offer::owner_count_add(sandbox, &tx.account, 1);
+            return TxResult::Success;
+        };
+
+        // ISSUER-side (allowlisting): flip lsfMPTAuthorized on the holder's
+        // MPToken. Requires the issuance to enforce lsfMPTRequireAuth.
+        if !sandbox.exists(&keylet::account_root_key(&holder_id)) {
+            return TxResult::NoDst;
+        }
+        let Some(iss) = read_json(sandbox, &ikey) else { return TxResult::ObjectNotFound };
+        let is_issuer = iss
+            .get("Issuer")
+            .and_then(|v| v.as_str())
+            .and_then(crate::tx::offer::decode20)
+            .map(|i| i == tx.account)
+            .unwrap_or(false);
+        if !is_issuer {
+            return TxResult::NoPermission;
+        }
+        if iss.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & LSF_MPT_REQUIRE_AUTH == 0 {
+            return TxResult::NoAuth;
+        }
+        let tkey = keylet::mptoken_key(&ikey, &holder_id);
+        let Some(mut tok) = read_json(sandbox, &tkey) else { return TxResult::ObjectNotFound };
+        if let Some(root) = read_json(sandbox, &keylet::account_root_key(&holder_id)) {
+            if ["AMMID", "VaultID", "LoanBrokerID"].iter().any(|f| root.get(f).is_some()) {
+                return TxResult::NoPermission; // pseudo-accounts are implicitly authorized
+            }
+        }
+        let fin = tok.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+        let fout = if flags & TF_MPT_UNAUTHORIZE != 0 {
+            fin & !LSF_MPT_AUTHORIZED
+        } else {
+            fin | LSF_MPT_AUTHORIZED
+        };
+        tok["Flags"] = serde_json::Value::Number(fout.into());
+        sandbox.write(tkey, serde_json::to_vec(&tok).unwrap_or_default());
+        TxResult::Success
+    }
+}
+
+/// MPTokenIssuanceSet — issuer locks/unlocks the issuance (or one holder's
+/// MPToken) and adjusts mutable metadata. The DynamicMPT MutableFlags
+/// mutation arms are unported (no specimen; the tmf constants would be
+/// guesses) — lock/unlock, TransferFee and MPTokenMetadata updates are.
+pub struct MPTokenIssuanceSetTransactor;
+
+const TF_MPT_LOCK: u64 = 0x0000_0001;
+const TF_MPT_UNLOCK: u64 = 0x0000_0002;
+pub const LSF_MPT_CAN_LOCK: u64 = 0x0000_0002;
+
+impl Transactor for MPTokenIssuanceSetTransactor {
+    fn preflight(&self, tx: &TxFields) -> TxResult {
+        if tx.tx_type != "MPTokenIssuanceSet" {
+            return TxResult::Malformed;
+        }
+        if tx.fee == 0 {
+            return TxResult::BadFee;
+        }
+        if tx.fields.get("MPTokenIssuanceID").is_none() {
+            return TxResult::Malformed;
+        }
+        let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+        if flags & TF_MPT_LOCK != 0 && flags & TF_MPT_UNLOCK != 0 {
+            return TxResult::Malformed;
+        }
+        TxResult::Success
+    }
+
+    fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        if !sandbox.exists(&keylet::account_root_key(&tx.account)) {
+            return TxResult::NoAccount;
+        }
+        TxResult::Success
+    }
+
+    fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        let Some(id) = issuance_id_of(tx) else { return TxResult::Malformed };
+        let ikey = keylet::mpt_issuance_key(&id);
+        let Some(iss) = read_json(sandbox, &ikey) else { return TxResult::ObjectNotFound };
+        let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+        let iflags = iss.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+        if iflags & LSF_MPT_CAN_LOCK == 0 && flags & (TF_MPT_LOCK | TF_MPT_UNLOCK) != 0 {
+            return TxResult::NoPermission;
+        }
+        let is_issuer = iss
+            .get("Issuer")
+            .and_then(|v| v.as_str())
+            .and_then(crate::tx::offer::decode20)
+            .map(|i| i == tx.account)
+            .unwrap_or(false);
+        if !is_issuer {
+            return TxResult::NoPermission;
+        }
+        let holder = tx
+            .fields
+            .get("Holder")
+            .and_then(|h| h.as_str())
+            .and_then(crate::tx::offer::decode20);
+        let (target_key, mut target) = match holder {
+            Some(hid) => {
+                if !sandbox.exists(&keylet::account_root_key(&hid)) {
+                    return TxResult::NoDst;
+                }
+                let tk = keylet::mptoken_key(&ikey, &hid);
+                let Some(t) = read_json(sandbox, &tk) else {
+                    return TxResult::ObjectNotFound;
+                };
+                (tk, t)
+            }
+            None => (ikey, iss),
+        };
+        let fin = target.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+        let mut fout = fin;
+        if flags & TF_MPT_LOCK != 0 {
+            fout |= LSF_MPT_LOCKED;
+        } else if flags & TF_MPT_UNLOCK != 0 {
+            fout &= !LSF_MPT_LOCKED;
+        }
+        if fout != fin {
+            target["Flags"] = serde_json::Value::Number(fout.into());
+        }
+        // TransferFee / MPTokenMetadata / DomainID follow soeDEFAULT-style
+        // updates on the ISSUANCE only: zero/empty removes, non-zero sets.
+        if holder.is_none() {
+            if let Some(f) = tx.fields.get("TransferFee").and_then(|v| v.as_u64()) {
+                if f == 0 {
+                    target.as_object_mut().map(|o| o.remove("TransferFee"));
+                } else {
+                    target["TransferFee"] = serde_json::Value::Number(f.into());
+                }
+            }
+            if let Some(m) = tx.fields.get("MPTokenMetadata").and_then(|v| v.as_str()) {
+                if m.is_empty() {
+                    target.as_object_mut().map(|o| o.remove("MPTokenMetadata"));
+                } else {
+                    target["MPTokenMetadata"] = serde_json::Value::String(m.to_string());
+                }
+            }
+        }
+        sandbox.write(target_key, serde_json::to_vec(&target).unwrap_or_default());
+        TxResult::Success
+    }
+}

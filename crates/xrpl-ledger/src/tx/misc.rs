@@ -545,10 +545,6 @@ stub_transactor!(XChainAddAccountCreateAttestationTransactor, "XChainAddAccountC
 stub_transactor!(PermissionedDomainSetTransactor, "PermissionedDomainSet");
 stub_transactor!(PermissionedDomainDeleteTransactor, "PermissionedDomainDelete");
 stub_transactor!(AMMClawbackTransactor, "AMMClawback");
-stub_transactor!(MPTokenIssuanceCreateTransactor, "MPTokenIssuanceCreate");
-stub_transactor!(MPTokenIssuanceDestroyTransactor, "MPTokenIssuanceDestroy");
-stub_transactor!(MPTokenIssuanceSetTransactor, "MPTokenIssuanceSet");
-stub_transactor!(MPTokenAuthorizeTransactor, "MPTokenAuthorize");
 
 #[cfg(test)]
 mod tests {
