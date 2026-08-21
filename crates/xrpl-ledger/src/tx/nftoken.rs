@@ -141,7 +141,6 @@ fn token_offer_create_apply(
         "NFTokenID": nftoken_id.clone(),
         "Amount": amount.clone(),
         "Flags": flags & 0xFFFF,
-        "OwnerNode": 0,
     });
     if let Some(dest) = destination {
         offer_obj["Destination"] = dest.clone();
@@ -150,24 +149,25 @@ fn token_offer_create_apply(
         offer_obj["Expiration"] = exp.clone();
     }
 
-    sandbox.write(offer_key, serde_json::to_vec(&offer_obj).unwrap());
     increment_owner_count(account, sandbox);
 
-    owner_dir_insert(sandbox, account, &offer_key);
+    let owner_node = owner_dir_insert(sandbox, account, &offer_key);
+    offer_obj["OwnerNode"] = serde_json::Value::String(format!("{owner_node:x}"));
     if let Some(nft_id) = hash256_from(nftoken_id) {
         let dir_root = if is_sell {
             keylet::nft_sell_offers_key(&nft_id)
         } else {
             keylet::nft_buy_offers_key(&nft_id)
         };
-        dir_insert(sandbox, &dir_root, None, &offer_key);
+        // sfNFTokenOfferNode is SoeRequired on the offer — present even at
+        // zero (byte census: net carries 3C 0000000000000000 we omitted).
+        let tok_node = dir_insert(sandbox, &dir_root, None, &offer_key);
+        offer_obj["NFTokenOfferNode"] = serde_json::Value::String(format!("{tok_node:x}"));
     }
-    // Mainnet meta also touches the Destination's AccountRoot (no-op
-    // Modified) when the offer names one. OwnerCount bump = the
-    // key-granularity touch convention (value fidelity deferred).
-    if let Some(dest) = destination.and_then(decode_account_id) {
-        increment_owner_count(&dest, sandbox);
-    }
+    sandbox.write(offer_key, serde_json::to_vec(&offer_obj).unwrap());
+    // The Destination-root touch the meta shows is a threadOwners hit (the
+    // created offer names sfDestination) — the old fake OwnerCount bump here
+    // CORRUPTED the destination's count and is gone.
     offer_key
 }
 

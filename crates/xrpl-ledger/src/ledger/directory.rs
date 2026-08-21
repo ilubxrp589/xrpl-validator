@@ -67,17 +67,46 @@ fn read_dir(sandbox: &Sandbox, key: &Hash256) -> Option<serde_json::Value> {
         .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
 }
 
-fn new_page(owner: Option<&[u8; 20]>, root_key: &Hash256, entry: &str, prev: u64) -> serde_json::Value {
+
+/// Write a page link canonically. Two byte-census receipts define the rule:
+/// fresh pages OMIT zero links entirely, but a directory that GREW and shrank
+/// back keeps explicit "0" links (C34D557F's root shows "IndexNext":"0" on
+/// mainnet after its pages emptied). So zero is PRESENCE-PRESERVING: set 0
+/// only where the field already exists, never introduce it.
+fn set_link(page: &mut serde_json::Value, field: &str, num: u64) {
+    if num == 0 {
+        if page.get(field).is_some() {
+            page[field] = serde_json::json!(0);
+        }
+    } else {
+        page[field] = serde_json::json!(num);
+    }
+}
+
+fn new_page(
+    owner: Option<&[u8; 20]>,
+    root_key: &Hash256,
+    entry: &str,
+    prev: u64,
+    extra: Option<&serde_json::Value>,
+) -> serde_json::Value {
     let mut page = serde_json::json!({
         "LedgerEntryType": "DirectoryNode",
         "Flags": 0,
         "RootIndex": hex::encode(root_key.0),
         "Indexes": [entry],
-        "IndexPrevious": prev,
-        "IndexNext": 0,
     });
+    set_link(&mut page, "IndexPrevious", prev);
     if let Some(o) = owner {
         page["Owner"] = serde_json::Value::String(hex::encode(o));
+    }
+    // Book pages carry their rate and pair (ExchangeRate + the four
+    // TakerPays/Gets Currency/Issuer Hash160s) — canonical fields the byte
+    // census found missing from every fresh page we minted.
+    if let Some(serde_json::Value::Object(m)) = extra {
+        for (k, v) in m {
+            page[k] = v.clone();
+        }
     }
     page
 }
@@ -100,6 +129,22 @@ pub fn dir_insert(
     owner: Option<&[u8; 20]>,
     object_key: &Hash256,
 ) -> u64 {
+    dir_insert_with(sandbox, root_key, owner, object_key, None, false)
+}
+
+/// [`dir_insert`] with extra canonical fields for any FRESH page this insert
+/// mints (book pages: ExchangeRate + the TakerPays/Gets pair).
+pub fn dir_insert_with(
+    sandbox: &mut Sandbox,
+    root_key: &Hash256,
+    owner: Option<&[u8; 20]>,
+    object_key: &Hash256,
+    extra: Option<&serde_json::Value>,
+    // rippled keeps BOOK pages in insertion order (offer fairness) and every
+    // other directory SORTED ascending — C34D557F's owner page on mainnet
+    // holds its five entries sorted where ours held insert order.
+    append: bool,
+) -> u64 {
     let root_key = *root_key;
     let entry = hex::encode_upper(object_key.0);
 
@@ -114,7 +159,7 @@ pub fn dir_insert(
         }
         sandbox.write(
             root_key,
-            serde_json::to_vec(&new_page(owner, &root_key, &entry, 0)).unwrap_or_default(),
+            serde_json::to_vec(&new_page(owner, &root_key, &entry, 0, extra)).unwrap_or_default(),
         );
         return 0;
     };
@@ -138,7 +183,17 @@ pub fn dir_insert(
         // Append to the last page (Modified). If last IS root, this writes root.
         if let Some(arr) = last.get_mut("Indexes").and_then(|v| v.as_array_mut()) {
             if !arr.iter().any(|x| x.as_str().is_some_and(|s| s.eq_ignore_ascii_case(&entry))) {
-                arr.push(serde_json::Value::String(entry));
+                if append {
+                    arr.push(serde_json::Value::String(entry));
+                } else {
+                    let pos = arr
+                        .iter()
+                        .position(|x| {
+                            x.as_str().is_some_and(|s| s.to_uppercase() > entry)
+                        })
+                        .unwrap_or(arr.len());
+                    arr.insert(pos, serde_json::Value::String(entry));
+                }
             }
         }
         sandbox.write(last_key, serde_json::to_vec(&last).unwrap_or_default());
@@ -150,17 +205,17 @@ pub fn dir_insert(
     let new_key = keylet::dir_page_key(&root_key, new_num);
     sandbox.write(
         new_key,
-        serde_json::to_vec(&new_page(owner, &root_key, &entry, last_num)).unwrap_or_default(),
+        serde_json::to_vec(&new_page(owner, &root_key, &entry, last_num, extra)).unwrap_or_default(),
     );
     if last_num == 0 {
         // Root was the last page: set both links on the single root object.
-        root["IndexNext"] = serde_json::json!(new_num);
-        root["IndexPrevious"] = serde_json::json!(new_num);
+        set_link(&mut root, "IndexNext", new_num);
+        set_link(&mut root, "IndexPrevious", new_num);
         sandbox.write(root_key, serde_json::to_vec(&root).unwrap_or_default());
     } else {
-        last["IndexNext"] = serde_json::json!(new_num);
+        set_link(&mut last, "IndexNext", new_num);
         sandbox.write(last_key, serde_json::to_vec(&last).unwrap_or_default());
-        root["IndexPrevious"] = serde_json::json!(new_num);
+        set_link(&mut root, "IndexPrevious", new_num);
         sandbox.write(root_key, serde_json::to_vec(&root).unwrap_or_default());
     }
     new_num
@@ -231,8 +286,8 @@ fn try_remove_at(
             if root_empty && !keep_root {
                 sandbox.delete(*root_key);
             } else {
-                root["IndexNext"] = serde_json::json!(0);
-                root["IndexPrevious"] = serde_json::json!(0);
+                set_link(&mut root, "IndexNext", 0);
+                set_link(&mut root, "IndexPrevious", 0);
                 sandbox.write(*root_key, serde_json::to_vec(&root).unwrap_or_default());
             }
         }
@@ -240,20 +295,20 @@ fn try_remove_at(
     }
     let prev_key = page_key(root_key, prev);
     if let Some(mut pp) = read_dir(sandbox, &prev_key) {
-        pp["IndexNext"] = serde_json::json!(next);
+        set_link(&mut pp, "IndexNext", next);
         sandbox.write(prev_key, serde_json::to_vec(&pp).unwrap_or_default());
     }
     if next != 0 {
         let nk = page_key(root_key, next);
         if let Some(mut np) = read_dir(sandbox, &nk) {
-            np["IndexPrevious"] = serde_json::json!(prev);
+            set_link(&mut np, "IndexPrevious", prev);
             sandbox.write(nk, serde_json::to_vec(&np).unwrap_or_default());
         }
     }
     // If this was the last page, fix root's back-pointer.
     if let Some(mut root) = read_dir(sandbox, root_key) {
         if root.get("IndexPrevious").map(page_num).unwrap_or(0) == num {
-            root["IndexPrevious"] = serde_json::json!(prev);
+            set_link(&mut root, "IndexPrevious", prev);
             sandbox.write(*root_key, serde_json::to_vec(&root).unwrap_or_default());
         }
     }

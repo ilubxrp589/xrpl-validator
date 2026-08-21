@@ -1952,7 +1952,8 @@ fn canon_for_encode(v: &mut Value) {
     const U64_HEX: &[&str] = &[
         "OwnerNode", "BookNode", "LowNode", "HighNode", "DestinationNode",
         "IndexNext", "IndexPrevious", "XChainClaimID", "XChainAccountCreateCount",
-        "XChainAccountClaimCount", "ReferenceCount",
+        "XChainAccountClaimCount", "ReferenceCount", "NFTokenOfferNode", "IssuerNode",
+        "AssetPrice",
     ];
     const U64_DEC: &[&str] = &["MaximumAmount", "OutstandingAmount", "MPTAmount", "LockedAmount"];
     const ACCTS: &[&str] = &[
@@ -2711,6 +2712,15 @@ fn run() -> i32 {
                 };
                 let Ok(net) = hex::decode(net_hex) else { continue };
                 checked += 1;
+                if let Ok(want) = std::env::var("DX_BYTEDUMP") {
+                    if !want.is_empty() && khex.starts_with(&want.to_uppercase()) {
+                        println!("BYTEDUMP-OURS {khex} {}", serde_json::to_string(&ours).unwrap_or_default());
+                        if let Some(nj) = rpc(&rpc_url, "ledger_entry",
+                            json!({"index": &khex, "ledger_index": seq})).and_then(|r| r.get("node").cloned()) {
+                            println!("BYTEDUMP-NET  {khex} {}", serde_json::to_string(&nj).unwrap_or_default());
+                        }
+                    }
+                }
                 match xrpl_core::codec::encode::encode_transaction_json(&ours, false) {
                     Err(e) => {
                         encfail += 1;
@@ -2729,8 +2739,12 @@ fn run() -> i32 {
                                 let hi = (ofs + 24).min(b.len());
                                 hex::encode_upper(&b[lo.min(b.len())..hi])
                             };
+                            let ty = ours
+                                .get("LedgerEntryType")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?");
                             println!(
-                                "BYTECHECK-MISMATCH {khex} ofs={ofs} ours_len={} net_len={} ours=..{} net=..{}",
+                                "BYTECHECK-MISMATCH {khex} ty={ty} ofs={ofs} ours_len={} net_len={} ours=..{} net=..{}",
                                 enc.len(), net.len(), ctx(&enc), ctx(&net)
                             );
                         }

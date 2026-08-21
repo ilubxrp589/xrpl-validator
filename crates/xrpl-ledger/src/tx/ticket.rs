@@ -86,14 +86,15 @@ impl Transactor for TicketCreateTransactor {
 
         for n in first..first.saturating_add(count) {
             let tk = keylet::ticket_key(&tx.account, n);
-            let ticket = serde_json::json!({
+            let mut ticket = serde_json::json!({
                 "LedgerEntryType": "Ticket",
                 "Account": hex::encode(tx.account),
                 "TicketSequence": n,
-                "OwnerNode": 0,
+                "Flags": 0,
             });
+            let node = owner_dir_insert(sandbox, &tx.account, &tk);
+            ticket["OwnerNode"] = serde_json::Value::String(format!("{node:x}"));
             sandbox.write(tk, serde_json::to_vec(&ticket).unwrap_or_default());
-            owner_dir_insert(sandbox, &tx.account, &tk);
         }
 
         acct["Sequence"] = serde_json::json!(first.saturating_add(count));

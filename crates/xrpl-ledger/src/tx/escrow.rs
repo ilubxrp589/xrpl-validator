@@ -354,48 +354,41 @@ impl Transactor for EscrowCreateTransactor {
 
         let mut escrow = serde_json::json!({
             "LedgerEntryType": "Escrow",
+            "Flags": 0,
             "Account": hex::encode(tx.account),
             "Destination": hex::encode(dest_id),
             "Amount": match &iou {
                 Some(_) => tx.fields["Amount"].clone(),
                 None => serde_json::Value::String(amount.to_string()),
             },
-            "OwnerNode": "0",
         });
 
         // Optional fields
-        if let Some(v) = tx.fields.get("FinishAfter") {
-            escrow["FinishAfter"] = v.clone();
+        for f in ["FinishAfter", "CancelAfter", "Condition", "SourceTag", "DestinationTag"] {
+            if let Some(v) = tx.fields.get(f) {
+                escrow[f] = v.clone();
+            }
         }
-        if let Some(v) = tx.fields.get("CancelAfter") {
-            escrow["CancelAfter"] = v.clone();
-        }
-        if let Some(v) = tx.fields.get("Condition") {
-            escrow["Condition"] = v.clone();
-        }
-
-        sandbox.write(escrow_key, serde_json::to_vec(&escrow).expect("serializing valid JSON Value"));
 
         // An escrow is listed in every directory that needs to find it
         // (EscrowCreate.cpp doApply): always the sender's; the destination's
         // unless it is a self-send; and, for an IOU, the ISSUER's — "added to
         // the issuer's owner directory to help track the total locked
-        // balance". This module previously kept no directory entries at all,
-        // which stayed invisible only because no sampled ledger carried escrow
-        // traffic until #105823810.
-        crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &escrow_key);
+        // balance". The object stores each hint (byte census: our Escrow
+        // lacked Flags AND DestinationNode — 14 bytes short of mainnet's
+        // blob). The destination-root touch in the meta is threadOwners.
+        let owner_node =
+            crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &escrow_key);
+        escrow["OwnerNode"] = serde_json::Value::String(format!("{owner_node:x}"));
         if dest_id != tx.account {
-            crate::ledger::directory::owner_dir_insert(sandbox, &dest_id, &escrow_key);
-            // Mainnet's meta carries the destination's AccountRoot as a no-op
-            // Modified, the same touch CheckCreate already reproduces.
-            let dkey = keylet::account_root_key(&dest_id);
-            if let Some(d) = sandbox.read(&dkey) {
-                sandbox.write(dkey, d);
-            }
+            let dn = crate::ledger::directory::owner_dir_insert(sandbox, &dest_id, &escrow_key);
+            escrow["DestinationNode"] = serde_json::Value::String(format!("{dn:x}"));
         }
         if let Some((leg, want)) = iou {
             if leg.issuer != tx.account && leg.issuer != dest_id {
-                crate::ledger::directory::owner_dir_insert(sandbox, &leg.issuer, &escrow_key);
+                let inode =
+                    crate::ledger::directory::owner_dir_insert(sandbox, &leg.issuer, &escrow_key);
+                escrow["IssuerNode"] = serde_json::Value::String(format!("{inode:x}"));
             }
             // Lock the tokens: they leave the sender's line and are held by the
             // escrow object itself, so no counterparty is credited
@@ -403,6 +396,7 @@ impl Transactor for EscrowCreateTransactor {
             // 92500000 STSH to 88750000 — exactly the escrowed 3750000.
             crate::tx::offer::line_adjust(sandbox, &tx.account, &leg, want, false);
         }
+        sandbox.write(escrow_key, serde_json::to_vec(&escrow).expect("serializing valid JSON Value"));
 
         TxResult::Success
     }

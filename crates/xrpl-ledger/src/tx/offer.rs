@@ -795,7 +795,7 @@ pub(crate) fn line_adjust(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, am
         if !default_ripple {
             flags |= if party_low { LOW_NO_RIPPLE } else { HIGH_NO_RIPPLE };
         }
-        let line = serde_json::json!({
+        let mut line = serde_json::json!({
             "LedgerEntryType": "RippleState",
             "Flags": flags,
             "Balance": {"currency": cur_str, "issuer": "0000000000000000000000000000000000000000",
@@ -803,11 +803,16 @@ pub(crate) fn line_adjust(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, am
             "LowLimit": {"currency": cur_str, "issuer": hex::encode(lo), "value": "0"},
             "HighLimit": {"currency": cur_str, "issuer": hex::encode(hi), "value": "0"},
         });
-        put_json(sandbox, lkey, &line);
         // The line joins BOTH owner directories, but only the receiver pays
-        // the reserve — the issuer's OwnerCount is untouched.
-        crate::ledger::directory::owner_dir_insert(sandbox, party, &lkey);
-        crate::ledger::directory::owner_dir_insert(sandbox, &leg.issuer, &lkey);
+        // the reserve — the issuer's OwnerCount is untouched. Both dir hints
+        // are SoeRequired on the line (byte census: ours lacked LowNode).
+        let party_node = crate::ledger::directory::owner_dir_insert(sandbox, party, &lkey);
+        let issuer_node = crate::ledger::directory::owner_dir_insert(sandbox, &leg.issuer, &lkey);
+        let (lo_node, hi_node) =
+            if party_low { (party_node, issuer_node) } else { (issuer_node, party_node) };
+        line["LowNode"] = serde_json::Value::String(format!("{lo_node:x}"));
+        line["HighNode"] = serde_json::Value::String(format!("{hi_node:x}"));
+        put_json(sandbox, lkey, &line);
         owner_count_add(sandbox, party, 1);
     }
 }
@@ -4653,13 +4658,19 @@ impl Transactor for OfferCreateTransactor {
         let seq = if tx.uses_ticket() { tx.ticket_seq.unwrap_or(0) } else { tx.sequence };
         let offer_key = keylet::offer_key(&tx.account, seq);
         let owner_node = crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &offer_key);
+        // The STORED flags are the lsf bits, not the tx's tf bits: tfPassive
+        // (0x00010000) → lsfPassive (0x00010000) but tfSell (0x00080000) →
+        // lsfSell (0x00020000), and tfUniversal/IoC/FoK never persist (byte
+        // census: we stored 0x80000 and even 0x80000000 where mainnet has
+        // 0x20000 / 0).
+        let lsf_flags = (flags & 0x0001_0000) | if flags & 0x0008_0000 != 0 { 0x0002_0000 } else { 0 };
         let mut offer_obj = serde_json::json!({
             "LedgerEntryType": "Offer",
             "Account": hex::encode(tx.account),
             "Sequence": seq,
             "TakerPays": me_amount_json(&tp_json, rem_pays),
             "TakerGets": me_amount_json(&tg_json, rem_gets),
-            "Flags": flags,
+            "Flags": lsf_flags,
             "OwnerNode": format!("{owner_node:x}"),
         });
         // Book quality comes from the offer as REQUESTED (after tick
@@ -4678,7 +4689,19 @@ impl Transactor for OfferCreateTransactor {
                 None => keylet::book_base(&pays_leg.cur, &gets_leg.cur, &pays_leg.issuer, &gets_leg.issuer),
             };
             let bdir = keylet::book_dir_key(&base, q);
-            let book_node = crate::ledger::directory::dir_insert(sandbox, &bdir, None, &offer_key);
+            // Fresh book pages carry the canonical pair fields + rate (byte
+            // census: every page we minted lacked them; hydrated pages have
+            // them from mainnet).
+            let book_extra = serde_json::json!({
+                "ExchangeRate": format!("{:016x}", u64::from_be_bytes(bdir.0[24..32].try_into().unwrap_or([0u8;8]))),
+                "TakerPaysCurrency": hex::encode(pays_leg.cur),
+                "TakerPaysIssuer": hex::encode(pays_leg.issuer),
+                "TakerGetsCurrency": hex::encode(gets_leg.cur),
+                "TakerGetsIssuer": hex::encode(gets_leg.issuer),
+            });
+            let book_node = crate::ledger::directory::dir_insert_with(
+                sandbox, &bdir, None, &offer_key, Some(&book_extra), true,
+            );
             offer_obj["BookDirectory"] = serde_json::Value::String(hex::encode_upper(bdir.0));
             offer_obj["BookNode"] = serde_json::Value::String(format!("{book_node:x}"));
         }

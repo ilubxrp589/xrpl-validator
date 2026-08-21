@@ -563,23 +563,31 @@ impl Transactor for TrustSetTransactor {
                 },
                 "Flags": creation_flags,
             });
+            let mut line_obj = line_obj;
+
+            // A new RippleState is inserted into BOTH parties' owner
+            // directories, and the line stores both hints (SoeRequired —
+            // the byte census flagged our missing LowNode on 56557F05's
+            // fresh line).
+            let setter_node =
+                crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &line_key);
+            let issuer_node =
+                crate::ledger::directory::owner_dir_insert(sandbox, &issuer, &line_key);
+            let (lo_node, hi_node) = if tx.account < issuer {
+                (setter_node, issuer_node)
+            } else {
+                (issuer_node, setter_node)
+            };
+            line_obj["LowNode"] = serde_json::Value::String(format!("{lo_node:x}"));
+            line_obj["HighNode"] = serde_json::Value::String(format!("{hi_node:x}"));
             sandbox.write(line_key, serde_json::to_vec(&line_obj).expect("serializing valid JSON Value"));
 
-            // A new RippleState is inserted into BOTH parties' owner directories.
-            crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &line_key);
-            crate::ledger::directory::owner_dir_insert(sandbox, &issuer, &line_key);
-
-            // Increment OwnerCount for both accounts
-            for id in [&tx.account, &issuer] {
-                let acct_key = keylet::account_root_key(id);
-                if let Some(data) = sandbox.read(&acct_key) {
-                    if let Ok(mut acct) = serde_json::from_slice::<serde_json::Value>(&data) {
-                        let count = acct["OwnerCount"].as_u64().unwrap_or(0);
-                        acct["OwnerCount"] = serde_json::Value::Number((count + 1).into());
-                        sandbox.write(acct_key, serde_json::to_vec(&acct).expect("serializing valid JSON Value"));
-                    }
-                }
-            }
+            // rippled's trustCreate charges ONLY the creator
+            // (adjustOwnerCount(sleAccount, +1)); the peer's count is
+            // untouched however its side is flagged. Charging both was the
+            // byte census's OwnerCount 14-vs-13 on rGm7 (56557F05) —
+            // invisible to the key-level gates, which never compare counts.
+            crate::tx::offer::owner_count_add(sandbox, &tx.account, 1);
         }
 
         TxResult::Success

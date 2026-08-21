@@ -128,33 +128,31 @@ impl Transactor for CheckCreateTransactor {
         };
         let check_key = keylet::check_key(&tx.account, seq);
 
-        // Create the Check ledger object
-        let check_obj = serde_json::json!({
+        // Create the Check ledger object — canonical shape: Flags always,
+        // both dir hints, optional passthroughs. Only the WRITER pays the
+        // reserve (byte census: the old both-sides bump left r6zw at
+        // OwnerCount 45 where mainnet has 44 — the dest-root touch in the
+        // meta is a threadOwners refresh, not a count change).
+        let mut check_obj = serde_json::json!({
             "LedgerEntryType": "Check",
+            "Flags": 0,
             "Account": hex::encode(tx.account),
             "Destination": hex::encode(dest),
             "SendMax": send_max,
             "Sequence": seq,
         });
-        sandbox.write(check_key, serde_json::to_vec(&check_obj).unwrap());
-
-        // A Check is inserted into BOTH the sender's and the destination's
-        // owner directories (rippled dirInsert both sides), and mainnet's meta
-        // touches the destination's AccountRoot as well (no-op Modified).
-        // OwnerCount bump on both mirrors the TrustSet create convention —
-        // key-set-correct; value fidelity (sender-only reserve) deferred.
-        crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &check_key);
-        crate::ledger::directory::owner_dir_insert(sandbox, &dest, &check_key);
-        for id in [&tx.account, &dest] {
-            let acct_key = keylet::account_root_key(id);
-            if let Some(data) = sandbox.read(&acct_key) {
-                if let Ok(mut acct) = serde_json::from_slice::<serde_json::Value>(&data) {
-                    let count = acct["OwnerCount"].as_u64().unwrap_or(0);
-                    acct["OwnerCount"] = serde_json::Value::Number((count + 1).into());
-                    sandbox.write(acct_key, serde_json::to_vec(&acct).unwrap());
-                }
+        for f in ["Expiration", "DestinationTag", "SourceTag", "InvoiceID"] {
+            if let Some(v) = tx.fields.get(f) {
+                check_obj[f] = v.clone();
             }
         }
+        let owner_node =
+            crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &check_key);
+        let dest_node = crate::ledger::directory::owner_dir_insert(sandbox, &dest, &check_key);
+        check_obj["OwnerNode"] = serde_json::Value::String(format!("{owner_node:x}"));
+        check_obj["DestinationNode"] = serde_json::Value::String(format!("{dest_node:x}"));
+        sandbox.write(check_key, serde_json::to_vec(&check_obj).unwrap());
+        crate::tx::offer::owner_count_add(sandbox, &tx.account, 1);
 
         TxResult::Success
     }
@@ -311,8 +309,8 @@ impl Transactor for CheckCashTransactor {
         sandbox.delete(check_key);
         crate::ledger::directory::owner_dir_remove(sandbox, &creator, &check_key, owner_hint, true);
         crate::ledger::directory::owner_dir_remove(sandbox, &tx.account, &check_key, dest_hint, true);
+        // Only the check WRITER ever paid the reserve.
         ox::owner_count_add(sandbox, &creator, -1);
-        ox::owner_count_add(sandbox, &tx.account, -1);
 
         TxResult::Success
     }

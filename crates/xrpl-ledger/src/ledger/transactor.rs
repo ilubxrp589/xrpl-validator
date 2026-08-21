@@ -393,8 +393,16 @@ pub fn apply_common(tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
             crate::ledger::directory::owner_dir_remove(sandbox, &tx.account, &tk, hint, true);
             let oc = acct["OwnerCount"].as_u64().unwrap_or(0);
             acct["OwnerCount"] = serde_json::Value::Number(oc.saturating_sub(1).into());
-            let tc = acct["TicketCount"].as_u64().unwrap_or(0);
-            acct["TicketCount"] = serde_json::Value::Number(tc.saturating_sub(1).into());
+            // sfTicketCount is soeOPTIONAL: at zero the field is REMOVED,
+            // not stored as 0 (byte census: net omits, we kept 2028 00000000).
+            let tc = acct["TicketCount"].as_u64().unwrap_or(0).saturating_sub(1);
+            if tc == 0 {
+                if let Some(o) = acct.as_object_mut() {
+                    o.remove("TicketCount");
+                }
+            } else {
+                acct["TicketCount"] = serde_json::Value::Number(tc.into());
+            }
         }
     }
 
