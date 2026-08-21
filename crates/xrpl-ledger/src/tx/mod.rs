@@ -19,3 +19,4 @@ pub mod pay_channel;
 pub mod payment;
 pub mod ticket;
 pub mod trust_set;
+pub mod xchain;

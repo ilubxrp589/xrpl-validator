@@ -31,14 +31,16 @@ use super::mpt::{
     MPTokenIssuanceDestroyTransactor, MPTokenIssuanceSetTransactor,
 };
 use super::amm::AMMClawbackTransactor;
+use super::xchain::{
+    XChainAccountCreateCommitTransactor, XChainAddAccountCreateAttestationTransactor,
+    XChainAddClaimAttestationTransactor, XChainClaimTransactor, XChainCommitTransactor,
+    XChainCreateBridgeTransactor, XChainCreateClaimIDTransactor, XChainModifyBridgeTransactor,
+};
 use super::misc::{
     ClawbackTransactor, DIDDeleteTransactor, DIDSetTransactor,
     DepositPreauthTransactor,
     PermissionedDomainDeleteTransactor, PermissionedDomainSetTransactor,
     SetRegularKeyTransactor, SignerListSetTransactor,
-    XChainAccountCreateCommitTransactor, XChainAddAccountCreateAttestationTransactor,
-    XChainAddClaimAttestationTransactor, XChainClaimTransactor, XChainCommitTransactor,
-    XChainCreateBridgeTransactor, XChainCreateClaimIDTransactor, XChainModifyBridgeTransactor,
 };
 use super::oracle::{OracleDeleteTransactor, OracleSetTransactor};
 use super::ticket::TicketCreateTransactor;

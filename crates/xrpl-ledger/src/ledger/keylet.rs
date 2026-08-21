@@ -166,6 +166,40 @@ pub fn pay_channel_key(account_id: &[u8; 20], dest_id: &[u8; 20], sequence: u32)
     sha512_half(&buf)
 }
 
+/// Bridge key: `SHA512Half(0x0048 ('H') || door || issue.currency)` — the
+/// door account and THAT chain side's currency (Indexes.cpp keylet::bridge).
+pub fn bridge_key(door: &[u8; 20], currency: &[u8; 20]) -> Hash256 {
+    let mut buf = [0u8; 42];
+    buf[..2].copy_from_slice(&[0x00, 0x48]);
+    buf[2..22].copy_from_slice(door);
+    buf[22..42].copy_from_slice(currency);
+    sha512_half(&buf)
+}
+
+/// XChainOwnedClaimID / XChainOwnedCreateAccountClaimID keys: namespace 'Q'
+/// (0x51) / 'K' (0x4B) || lockingDoor || lockingIssue || issuingDoor ||
+/// issuingIssue || seq_be64, an Issue serializing as currency(20)||account(20)
+/// (zeros for XRP).
+pub fn xchain_claim_id_key(
+    space: u8,
+    locking_door: &[u8; 20],
+    locking_issue: (&[u8; 20], &[u8; 20]),
+    issuing_door: &[u8; 20],
+    issuing_issue: (&[u8; 20], &[u8; 20]),
+    seq: u64,
+) -> Hash256 {
+    let mut buf = Vec::with_capacity(2 + 20 * 6 + 8);
+    buf.extend_from_slice(&[0x00, space]);
+    buf.extend_from_slice(locking_door);
+    buf.extend_from_slice(locking_issue.0);
+    buf.extend_from_slice(locking_issue.1);
+    buf.extend_from_slice(issuing_door);
+    buf.extend_from_slice(issuing_issue.0);
+    buf.extend_from_slice(issuing_issue.1);
+    buf.extend_from_slice(&seq.to_be_bytes());
+    sha512_half(&buf)
+}
+
 /// DID key: `SHA512Half(0x0049 ('I') || account)` — one DID per account.
 pub fn did_key(account_id: &[u8; 20]) -> Hash256 {
     let mut buf = [0u8; 22];

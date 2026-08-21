@@ -532,14 +532,6 @@ macro_rules! stub_transactor {
     };
 }
 
-stub_transactor!(XChainCreateBridgeTransactor, "XChainCreateBridge");
-stub_transactor!(XChainCreateClaimIDTransactor, "XChainCreateClaimID");
-stub_transactor!(XChainCommitTransactor, "XChainCommit");
-stub_transactor!(XChainClaimTransactor, "XChainClaim");
-stub_transactor!(XChainModifyBridgeTransactor, "XChainModifyBridge");
-stub_transactor!(XChainAccountCreateCommitTransactor, "XChainAccountCreateCommit");
-stub_transactor!(XChainAddClaimAttestationTransactor, "XChainAddClaimAttestation");
-stub_transactor!(XChainAddAccountCreateAttestationTransactor, "XChainAddAccountCreateAttestation");
 
 #[cfg(test)]
 mod tests {

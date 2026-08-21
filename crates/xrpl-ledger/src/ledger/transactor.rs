@@ -130,6 +130,24 @@ pub enum TxResult {
     Locked,
     /// A DIDSet whose result would carry none of URI/DIDDocument/Data.
     EmptyDid,
+    /// XChain: the tx account is the bridge door itself.
+    XChainSelfCommit,
+    /// XChain: the committed asset is not the bridge's chain-side issue.
+    XChainBadTransferIssue,
+    /// XChain: SignatureReward differs from the bridge's.
+    XChainRewardMismatch,
+    /// XChain: the referenced claim id does not exist.
+    XChainNoClaimId,
+    /// XChain: no submitted attestation is signed by a door signer.
+    XChainProofUnknownKey,
+    /// XChain: attestation's sending account differs from the claim's.
+    XChainSendingAccountMismatch,
+    /// XChain: attestation names the wrong destination chain.
+    XChainWrongChain,
+    /// XChain: an explicit claim without an attested quorum.
+    XChainClaimNoQuorum,
+    /// XChain: the door account has no signer list to attest against.
+    XChainNoSignersList,
 
     // tem — malformed, not applied at all
     /// Transaction is malformed.
@@ -196,6 +214,15 @@ impl TxResult {
             | TxResult::NoAuth
             | TxResult::Locked
             | TxResult::EmptyDid
+            | TxResult::XChainSelfCommit
+            | TxResult::XChainBadTransferIssue
+            | TxResult::XChainRewardMismatch
+            | TxResult::XChainNoClaimId
+            | TxResult::XChainProofUnknownKey
+            | TxResult::XChainSendingAccountMismatch
+            | TxResult::XChainWrongChain
+            | TxResult::XChainClaimNoQuorum
+            | TxResult::XChainNoSignersList
             | TxResult::Unsupported => true,
             // tem/tef: not claimed
             _ => false,
@@ -248,6 +275,15 @@ impl TxResult {
             TxResult::NoAuth => "tecNO_AUTH",
             TxResult::Locked => "tecLOCKED",
             TxResult::EmptyDid => "tecEMPTY_DID",
+            TxResult::XChainSelfCommit => "tecXCHAIN_SELF_COMMIT",
+            TxResult::XChainBadTransferIssue => "tecXCHAIN_BAD_TRANSFER_ISSUE",
+            TxResult::XChainRewardMismatch => "tecXCHAIN_REWARD_MISMATCH",
+            TxResult::XChainNoClaimId => "tecXCHAIN_NO_CLAIM_ID",
+            TxResult::XChainProofUnknownKey => "tecXCHAIN_PROOF_UNKNOWN_KEY",
+            TxResult::XChainSendingAccountMismatch => "tecXCHAIN_SENDING_ACCOUNT_MISMATCH",
+            TxResult::XChainWrongChain => "tecXCHAIN_WRONG_CHAIN",
+            TxResult::XChainClaimNoQuorum => "tecXCHAIN_CLAIM_NO_QUORUM",
+            TxResult::XChainNoSignersList => "tecXCHAIN_NO_SIGNERS_LIST",
             TxResult::Malformed => "temMALFORMED",
             TxResult::BadFee => "temBAD_FEE",
             TxResult::BadAmount => "temBAD_AMOUNT",
