@@ -3152,14 +3152,29 @@ had_fill={} n={} keys={:?}",
             // while its key stays marked stale — deleted from our bookkeeping,
             // alive in the state, and never revisited.
             sandbox.restore_snapshot(snap);
-            for okey in &stale[st0..] {
-                let Some(off) = json_at(sandbox, okey) else { continue };
+            // Re-apply the failed candidate's DEAD-offer reaps (rippled banks
+            // ofrsToRm even when the strand fails) — but NOT its SELF-cross
+            // deletions: limitSelfCrossQuality removes the taker's own offers
+            // INSIDE the strand's sandbox, so they roll back with it.
+            // #106453801: 2D468DC2's rejected bridge leg had reaped the
+            // taker's own A20C602E; mainnet still holds it until EA6D14A1
+            // places on that book ten txs later and self-crosses it there —
+            // our banked reap mis-attributed the deletion (8v6 + 4v6 mirror).
+            // Skipped keys leave `stale` so the later tx can revisit them.
+            let mut keep = Vec::new();
+            for okey in stale.drain(st0..) {
+                let Some(off) = json_at(sandbox, &okey) else { continue };
                 let Some(mk) = off.get("Account").and_then(|v| v.as_str()).and_then(decode20)
                 else {
                     continue;
                 };
-                delete_maker_offer(sandbox, okey, &off, &mk);
+                if mk == *taker {
+                    continue; // self-cross deletion — resurrects with the rollback
+                }
+                delete_maker_offer(sandbox, &okey, &off, &mk);
+                keep.push(okey);
             }
+            stale.extend(keep);
             rem_pays = rp0; rem_gets = rg0; crossed = cr0;
             di = di0; ai = ai0; bi = bi0; amm_iters = it0;
             amm_used = false;
