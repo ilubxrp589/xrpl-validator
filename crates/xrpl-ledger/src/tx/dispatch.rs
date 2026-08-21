@@ -42,6 +42,7 @@ use super::misc::{
     PermissionedDomainDeleteTransactor, PermissionedDomainSetTransactor,
     SetRegularKeyTransactor, SignerListSetTransactor,
 };
+use super::pseudo::{EnableAmendmentTransactor, SetFeeTransactor, UNLModifyTransactor};
 use super::oracle::{OracleDeleteTransactor, OracleSetTransactor};
 use super::ticket::TicketCreateTransactor;
 use super::nftoken::{
@@ -58,6 +59,12 @@ use crate::ledger::transactor::Transactor;
 
 /// Get the Transactor for a given transaction type string.
 /// Returns None for unsupported types.
+/// Pseudo-transactions: consensus-injected, no Account/Fee/Sequence — the
+/// driver skips fee & sequence handling (apply_common) entirely.
+pub fn is_pseudo(tx_type: &str) -> bool {
+    matches!(tx_type, "UNLModify" | "SetFee" | "EnableAmendment")
+}
+
 pub fn get_transactor(tx_type: &str) -> Option<Box<dyn Transactor>> {
     match tx_type {
         "Payment" => Some(Box::new(PaymentTransactor)),
@@ -114,6 +121,9 @@ pub fn get_transactor(tx_type: &str) -> Option<Box<dyn Transactor>> {
         "MPTokenIssuanceDestroy" => Some(Box::new(MPTokenIssuanceDestroyTransactor)),
         "MPTokenIssuanceSet" => Some(Box::new(MPTokenIssuanceSetTransactor)),
         "MPTokenAuthorize" => Some(Box::new(MPTokenAuthorizeTransactor)),
+        "UNLModify" => Some(Box::new(UNLModifyTransactor)),
+        "SetFee" => Some(Box::new(SetFeeTransactor)),
+        "EnableAmendment" => Some(Box::new(EnableAmendmentTransactor)),
         _ => None,
     }
 }

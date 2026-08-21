@@ -17,6 +17,7 @@ pub mod offer;
 pub mod oracle;
 pub mod pay_channel;
 pub mod payment;
+pub mod pseudo;
 pub mod ticket;
 pub mod trust_set;
 pub mod xchain;

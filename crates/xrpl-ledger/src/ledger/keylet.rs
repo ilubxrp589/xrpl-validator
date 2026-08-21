@@ -131,8 +131,11 @@ pub fn skip_list_key() -> Hash256 {
     sha512_half(&SPACE_SKIP_LIST)
 }
 
-/// Compute the state tree key for the FeeSettings singleton.
-/// `key = SHA512Half(0x0065)`
+/// NegativeUNL singleton: `SHA512Half(0x004E ('N'))`.
+pub fn negative_unl_key() -> Hash256 {
+    sha512_half(&[0x00, 0x4E])
+}
+
 pub fn fee_settings_key() -> Hash256 {
     sha512_half(&SPACE_FEE)
 }

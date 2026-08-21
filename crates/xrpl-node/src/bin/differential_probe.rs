@@ -1863,7 +1863,11 @@ fn collect_issuers(v: &Value, out: &mut Vec<String>) {
 }
 
 fn build_txfields(txjson: &Value) -> Option<TxFields> {
-    let account = decode_address(txjson["Account"].as_str()?)?;
+    // Pseudo-transactions carry Account: "" and Fee: "0" — the zero account.
+    let account = match txjson["Account"].as_str()? {
+        "" => [0u8; 20],
+        a => decode_address(a)?,
+    };
     let tx_type = txjson["TransactionType"].as_str()?.to_string();
     let fee = txjson["Fee"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
     let sequence = txjson["Sequence"].as_u64().unwrap_or(0) as u32;
@@ -1898,6 +1902,22 @@ fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<Hash
             return (r.code_str().to_string(), HashMap::new());
         }
     };
+    // Pseudo-transactions (UNLModify/SetFee/EnableAmendment): consensus
+    // injects them with no Account, no Fee, no Sequence — rippled's Change
+    // transactor overrides the fee/sequence machinery away, so skip
+    // preclaim/apply_common entirely (there is no account to charge).
+    if xrpl_ledger::tx::dispatch::is_pseudo(&tx.tx_type) {
+        let pf = transactor.preflight(tx);
+        if !pf.is_success() {
+            return (pf.code_str().to_string(), HashMap::new());
+        }
+        let mut sb = Sandbox::new(state);
+        let applied = transactor.do_apply(tx, &mut sb);
+        if applied.is_success() {
+            return (TxResult::Success.code_str().to_string(), sb.into_modifications());
+        }
+        return (applied.code_str().to_string(), HashMap::new());
+    }
     // Phase 1: preflight
     let preflight = transactor.preflight(tx);
     if !preflight.is_success() {
@@ -2249,11 +2269,39 @@ fn run() -> i32 {
         load_paychan_prestate(&mut state, &rpc_url, txj, seq - 1);
         load_mpt_prestate(&mut state, &rpc_url, txj, seq - 1);
     }
+    // FLAG-LEDGER OPEN: rotate the NegativeUNL pending fields into
+    // DisabledValidators before any transaction applies — a ledger-level
+    // action outside every tx meta (Ledger::updateNegativeUNL).
+    if seq % 256 == 0 {
+        let nk = keylet::negative_unl_key();
+        let khex = hex::encode_upper(nk.0);
+        if obj_seen.insert(khex.clone()) {
+            load_object(&mut state, &rpc_url, &khex, seq - 1);
+        }
+        if let Some(bytes) = state.state_map.lookup(&nk).map(|b| b.to_vec()) {
+            match xrpl_ledger::tx::pseudo::rotate_negative_unl(&bytes, seq as u32) {
+                Some(Some(nb)) => {
+                    let _ = state.state_map.insert(nk, nb);
+                }
+                Some(None) => {
+                    let _ = state.state_map.delete(&nk);
+                }
+                None => {}
+            }
+        }
+    }
     // FeeSettings (fixed key): reserve checks read it; mainnet meta never
-    // carries it.
-    let fee_key = hex::encode_upper(keylet::fee_settings_key().0);
-    if obj_seen.insert(fee_key.clone()) {
-        load_object(&mut state, &rpc_url, &fee_key, seq - 1);
+    // carries it. The NegativeUNL and Amendments singletons ride along for
+    // the flag-ledger pseudo-transactions.
+    for k in [
+        keylet::fee_settings_key(),
+        keylet::negative_unl_key(),
+        keylet::amendments_key(),
+    ] {
+        let khex = hex::encode_upper(k.0);
+        if obj_seen.insert(khex.clone()) {
+            load_object(&mut state, &rpc_url, &khex, seq - 1);
+        }
     }
     eprintln!("Loaded {} pre-state objects.", obj_seen.len());
 

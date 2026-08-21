@@ -166,6 +166,8 @@ pub enum TxResult {
     MaxLedger,
     /// Account not found.
     NoAccount,
+    /// Pseudo-transaction internal failure (tefFAILURE).
+    Failure,
 
     // Unsupported transaction type — deduct fee but skip apply
     Unsupported,
@@ -291,6 +293,7 @@ impl TxResult {
             TxResult::PastSeq => "tefPAST_SEQ",
             TxResult::MaxLedger => "tefMAX_LEDGER",
             TxResult::NoAccount => "tefNO_ACCOUNT",
+            TxResult::Failure => "tefFAILURE",
             TxResult::Unsupported => "tecUNSUPPORTED",
         }
     }
