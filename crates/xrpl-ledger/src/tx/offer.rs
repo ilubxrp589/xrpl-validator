@@ -337,6 +337,46 @@ fn mul_round_drops_strict(a: Me, b: Me, round_up: bool) -> u128 {
 /// the behaviour, and a plain ceiling cannot reproduce it.
 ///
 /// Two mainnet residuals pin it, and no single rounding direction satisfies
+/// rippled `divRoundStrict(num, rate, xrpAsset, roundUp = false)` — the
+/// tfSell residual's TakerPays: numerator x 1e17 / rate, FLOOR at every
+/// stage, canonicalized straight to whole drops (STAmount.cpp divRoundImpl
+/// with the strict canonicalize, which for round-down is plain truncation).
+fn div_round_drops_strict_floor(a: Me, rate: Me) -> u128 {
+    let (a, r) = (norm16(a), norm16(rate));
+    if a.0 == 0 || r.0 == 0 {
+        return 0;
+    }
+    const TEN17: u128 = 100_000_000_000_000_000;
+    let mut m = a.0.saturating_mul(TEN17) / r.0;
+    let mut e = a.1 - r.1 - 17;
+    while e < 0 && m > 0 {
+        m /= 10;
+        e += 1;
+    }
+    while e > 0 {
+        m = m.saturating_mul(10);
+        e -= 1;
+    }
+    m
+}
+
+/// rippled `divRoundStrict(num, rate, iouAsset, roundUp = false)` — 16-digit
+/// floor of the quotient.
+fn div_round16_down(a: Me, rate: Me) -> Me {
+    let (a, r) = (norm16(a), norm16(rate));
+    if a.0 == 0 || r.0 == 0 {
+        return (0, 0);
+    }
+    const TEN17: u128 = 100_000_000_000_000_000;
+    let mut m = a.0.saturating_mul(TEN17) / r.0;
+    let mut e = a.1 - r.1 - 17;
+    while m >= 10_000_000_000_000_000 {
+        m /= 10;
+        e += 1;
+    }
+    (m, e)
+}
+
 /// both:
 ///   #106308202 6B6D7EFC  283956.0452856067 -> 283956  (0.045 discarded)
 ///   #105672435 B409D45C  165388.7424863569 -> 165389  (0.7 carries)
@@ -4619,7 +4659,33 @@ impl Transactor for OfferCreateTransactor {
         // a residual with the wrong amounts still lands on the correct page and
         // every mutation-set leg stays green. This was found with DX_VALCHECK
         // and its regression evidence is a value sweep, not a key sweep.
-        let rem_gets = {
+        // tfSell rests the SUBTRACTED in-side and REPRICES the out-side —
+        // OfferCreate.cpp:491-521: afterCross.in = takerGets − the crossed
+        // NET (gateway fee divided back out), a 16-digit STAmount result,
+        // then afterCross.out = divRoundStrict(afterCross.in, rate, out,
+        // roundUp=false). The buy branch below is the mirror (E7399DA3).
+        // #106455038 75F01CB4 (full-ledger replay): 28.729093 LTC minus the
+        // pool's 0.0439975579446888 net rests 28.68509544205531 (16-digit
+        // truncation of the exact 28.6850954420553112), repriced pays
+        // 1058491178 drops.
+        let (rem_pays, rem_gets) = if sell {
+            if me_cmp(rem_gets, tg0).is_lt() && !me_is_zero(rem_gets) {
+                let g16 = norm16(rem_gets);
+                let p = match rate_of_me(tg0, tp0) {
+                    Some(q) if pays_leg.xrp => (div_round_drops_strict_floor(g16, rate_me(q)), 0),
+                    Some(q) => div_round16_down(g16, rate_me(q)),
+                    None => me_muldiv(g16, tp0, tg0, false),
+                };
+                (p, g16)
+            } else {
+                (rem_pays, rem_gets)
+            }
+        } else {
+            (rem_pays, rem_gets)
+        };
+        let rem_gets = if sell {
+            rem_gets
+        } else {
             // Priced at the offer's ENCODED ratio, not its raw one. rippled
             // reprices the rested remainder through `Quality::rate()`, which is
             // `getRate(TakerGets, TakerPays)` — a 16-DIGIT value — and the last
