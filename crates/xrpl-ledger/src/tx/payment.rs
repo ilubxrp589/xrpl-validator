@@ -359,6 +359,9 @@ impl PaymentTransactor {
                 let (c, granted, rw) = Self::measure_hop(
                     tx, in_leg, out_leg, want, grant, threshold, single_pass, amm_fib, sandbox,
                 );
+                if std::env::var("DX_SIZE").is_ok() {
+                    eprintln!("DX_SIZE rung grant={grant:?} want={want:?} consumed={c:?} granted={granted:?} rw={rw:?}");
+                }
                 consumed = c;
                 // Stop as soon as the GRANT was not the binding constraint —
                 // either the full requirement came out, or the trial left some
@@ -395,9 +398,13 @@ impl PaymentTransactor {
             // 8x is headroom for a quantised estimate that rounded DOWN.
             if !ox::me_is_zero(consumed) {
                 let grant = ox::me_muldiv(consumed, (8, 0), (1, 0), true);
-                let (refined, granted, _) = Self::measure_hop(
+                let (refined, granted, rw2) = Self::measure_hop(
                     tx, in_leg, out_leg, want, grant, threshold, single_pass, amm_fib, sandbox,
                 );
+                if std::env::var("DX_SIZE").is_ok() {
+                    eprintln!("DX_SIZE refine grant={grant:?} want={want:?} refined={refined:?} granted={granted:?} rw={rw2:?} keep={}",
+                        !ox::me_is_zero(refined) && ox::me_cmp(refined, granted).is_lt());
+                }
                 if !ox::me_is_zero(refined) && ox::me_cmp(refined, granted).is_lt() {
                     consumed = refined;
                 }
@@ -468,9 +475,20 @@ impl PaymentTransactor {
                 let precise = match Self::transfer_rate(sandbox, in_leg)
                     .filter(|_| tx.account != in_leg.issuer)
                 {
-                    Some(r) => ox::me_muldiv(precise, (r as u128, 0), (1_000_000_000, 0), true),
+                    Some(r) => ox::mul_ratio(precise, r as u128, 1_000_000_000, true),
                     None => precise,
                 };
+                // A fill BELOW the granted line's 16-digit ulp is invisible
+                // to the balance difference — the line never moves and `d`
+                // reads ZERO for a real (tiny) fill. The walk's own
+                // accounting (`granted − rem_in`) is the only measurement
+                // there, and reporting zero instead tells the ladder the hop
+                // has NO liquidity at all: l106267220 round 5's tip offer
+                // was ground down to (2 drops, 1e-16); the trial consumed
+                // it, `d` read 0, size_book_hop fell to the unbounded
+                // sentinel, and the pass bought 653.86 for 2 drops —
+                // tecPATH_PARTIAL where mainnet's own iteration simply
+                // takes the dust and continues next round.
                 let agree = !ox::me_is_zero(d)
                     && !ox::me_is_zero(precise)
                     && {
@@ -478,7 +496,13 @@ impl PaymentTransactor {
                         let diff = ox::me_sub(hi, lo);
                         ox::me_cmp(ox::me_muldiv(diff, (1_000_000_000, 0), (1, 0), false), hi).is_lt()
                     };
-                if agree { precise } else { d }
+                if ox::me_is_zero(d) && !ox::me_is_zero(precise) {
+                    precise
+                } else if agree {
+                    precise
+                } else {
+                    d
+                }
             }
             _ => (0, 0),
         };
@@ -1139,9 +1163,25 @@ impl PaymentTransactor {
                         ox::me_cmp(ox::me_muldiv(diff, (1_000_000_000, 0), (1, 0), false), hi).is_lt()
                     }
                 };
-                match spent_precise.filter(|p| agree(*p)) {
-                    Some(p) => p,
-                    None => d,
+                // A spend below the line's 16-digit ulp is invisible to the
+                // balance difference — d reads ZERO for a real (tiny) spend,
+                // the round loop's zero-sin break then kills the flow, and
+                // every later round starves. rippled never faces this: its
+                // remainder falls by the STAmount spend itself (1e-16 is
+                // representable). Trust the walk's own figure when the
+                // balance is blind. l106267220 F328A94C round 5: the dust
+                // round spends ~5e-22 for its 2 drops; with d=0 the loop
+                // broke and rounds 6+ (the real 26794) never ran.
+                if ox::me_is_zero(d) {
+                    match spent_precise.filter(|p| !ox::me_is_zero(*p)) {
+                        Some(p) => p,
+                        None => d,
+                    }
+                } else {
+                    match spent_precise.filter(|p| agree(*p)) {
+                        Some(p) => p,
+                        None => d,
+                    }
                 }
             }
             // The sender ISSUES what it is spending, so there is no line to

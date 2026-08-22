@@ -172,6 +172,46 @@ pub(crate) fn me_is_zero(a: Me) -> bool {
     a.0 == 0
 }
 
+/// STAmount-faithful RUNNING-REMAINDER subtraction. rippled's walk
+/// remainders are STAmounts: every subtraction re-rounds to 16 significant
+/// digits (Number half-even), so a subtrahend below the minuend's 16-digit
+/// window VANISHES and the remainder stays canonical. Our exact me kept the
+/// full difference — l106267220 round 5 (the mulRatio-campaign cliff):
+/// a 2-drop residual offer priced at 1e-16 turned the trial's 1e6 grant
+/// into a 22-DIGIT mantissa; every later comparison rescaled into
+/// saturation, the walk stalled after the dust, the balance-diff measured
+/// ZERO (the 1e-16 sits below the granted line's ulp), and size_book_hop's
+/// ladder read "no liquidity" — the unbounded sentinel then bought 653.86
+/// for 2 drops and the payment failed tecPATH_PARTIAL.
+///
+/// Kept EXACT while the difference fits 17 digits — the regime every
+/// calibrated specimen lives in (e.g. #105923760's final-fill truncation,
+/// #105831615's 4.38e-11 round accounting) — and normalized half-even to
+/// 16 only when operand misalignment (≥2 orders past the STAmount window)
+/// would mint an 18+-digit mantissa.
+pub(crate) fn me_sub16(a: Me, b: Me) -> Me {
+    let r = me_sub(a, b);
+    let mut digits = 0u32;
+    let mut x = r.0;
+    while x > 0 {
+        x /= 10;
+        digits += 1;
+    }
+    if digits < 18 {
+        return r;
+    }
+    let over = digits - 16;
+    let p = 10u128.pow(over);
+    let q = r.0 / p;
+    let rem = r.0 % p;
+    let m = match (2 * rem).cmp(&p) {
+        std::cmp::Ordering::Greater => q + 1,
+        std::cmp::Ordering::Equal => q + (q & 1),
+        std::cmp::Ordering::Less => q,
+    };
+    (m, r.1 + over as i32)
+}
+
 pub(crate) fn me_sub(a: Me, b: Me) -> Me {
     let e = a.1.min(b.1);
     (me_rescale(a, e, false).saturating_sub(me_rescale(b, e, false)), e)
