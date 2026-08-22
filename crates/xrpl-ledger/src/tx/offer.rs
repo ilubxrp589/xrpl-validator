@@ -3546,6 +3546,59 @@ pub(crate) fn cross_engine_to(
     // Strand is exhausted when the gets side is spent (always) or, for a
     // buy, when the wanted pays side is fully acquired.
     let done = |rp: Me, rg: Me| me_is_zero(rg) || (!sell && me_is_zero(rp));
+    // rippled settles the TAKER once per PASS, not per fill. In the forward
+    // pass the leading DirectStep debits the taker Σ stpAmt.in — the sum
+    // BookStep accumulated with per-offer STAmount adds (`result.in +=
+    // stpAmt.in`) — and the closing DirectStep credits Σ out the same way.
+    // Only the MAKERS are settled per offer (consumeOffer's two
+    // `offer.send`s, BookStep.cpp:900-915). Storing the taker's line at
+    // every fill instead rounds it to 16 digits N times, and the
+    // intermediate roundings do not cancel.
+    //
+    // #106455075 28881BD5 (full-ledger replay) is the specimen: three fills
+    // 3.30620463597954 + 3.30620463597954 + 4356.73862306011 (each fill
+    // sized byte-exactly — DX_FILL traced). The aggregated debit is
+    // 4363.351032332069 and mainnet's taker line lands 3490.843917749044;
+    // per-fill stores shave a .46 tail at TWO intermediates and come out one
+    // ulp low. XRP legs stay per-fill: whole drops cannot round.
+    //
+    // AMM slices inside THIS walk fold into the same accumulator (threaded
+    // into `consume`/`consume_fib`): a mixed AMM+CLOB pass is still one
+    // debit in rippled. #106455040 0F821DBF is the proof by regression —
+    // three CLOB fills + one pool slice; aggregating only the CLOB side
+    // makes TWO stores where mainnet's single debit 3338.173228234692
+    // needs none, and lands two ulp off. The bridged controller settles per
+    // ROUND (each round is a pass) and keeps passing None.
+    //
+    // .0 = pays_leg, taker receives; .1 = gets_leg GROSS, taker parts with.
+    //
+    // The settlement boundary is the flow ITERATION = ONE QUALITY LEVEL
+    // (or one AMM slice): a BookStep execution stops at the level edge so
+    // the pass's marginal quality is well-defined, and `flow()` re-enters
+    // for the next level — which is the same fact the `single_pass` comment
+    // above records for strand interleaving. Fills at one level therefore
+    // share a single taker debit; a new level (or a pool turn, which only
+    // happens at level heads) closes the group.
+    //
+    // Calibrated by exhaustive partition search over four specimens (the
+    // full-walk and per-slice-boundary schemes each fix some and break
+    // others; per-level satisfies all):
+    //   #106455075 28881BD5  CC|C    (same-level pair aggregates)
+    //   #106455040 0F821DBF  C|C|C|X (three levels, tail slice)
+    //   #106455036 1D61A047  C|X|C|X
+    //   #106455038 136FE701  X|C|X   (anchored slice, fill, tail slice)
+    let mut taker_accs: (Me, Me) = ((0, 0), (0, 0));
+    let mut acc_level: Option<u64> = None;
+    macro_rules! settle_taker {
+        () => {
+            if !me_is_zero(taker_accs.0) {
+                line_adjust(sandbox, beneficiary, pays_leg, taker_accs.0, true);
+            }
+            if !me_is_zero(taker_accs.1) {
+                line_adjust(sandbox, taker, gets_leg, taker_accs.1, false);
+            }
+        };
+    }
     // AMM for the pair competes with the book at every quality level
     // (rippled BookStep + AMMLiquidity) — EXCEPT in a permissioned-domain
     // book, which no pool participates in: `BookStep::tryAMM` returns early
@@ -3700,6 +3753,12 @@ pub(crate) fn cross_engine_to(
             if std::env::var("DX_AMM").is_ok() {
                 eprintln!("DX_AMM site=direct-walk q={q:x}");
             }
+            // A turn happens at a level head: close the open level's debit
+            // (harmless when the turn declines — the level was ending
+            // anyway). The slice itself settles per-slice inside consume.
+            settle_taker!();
+            taker_accs = ((0, 0), (0, 0));
+            acc_level = None;
             let (rp, rg, used) = amm_turn(
                 amm_fib.as_deref_mut(), sandbox, a, taker, beneficiary, rem_pays, rem_gets,
                 pays_leg, gets_leg, threshold, sell, Some(q), pay_in_rate,
@@ -3729,6 +3788,7 @@ pub(crate) fn cross_engine_to(
             // than come back to it — measured, and it moves the XRP side of an
             // offer-crossing pass that is byte-exact today.
             if used && !offer_crossing {
+                settle_taker!();
                 return (rem_pays, rem_gets, crossed);
             }
         }
@@ -4196,11 +4256,29 @@ pub(crate) fn cross_engine_to(
                             // #105945386 still bought its remainder (46.91474
                             // SPEPE for the same 535677 drops) after the check
                             // had correctly rejected 46.96292384379671.
+                            settle_taker!();
                             return (rem_pays, rem_gets, crossed);
                         }
                     }
                 }
-                move_leg(sandbox, &maker, beneficiary, pays_leg, give);
+                // A fill at a NEW quality level ends the previous iteration:
+                // settle its taker debit before this level starts
+                // accumulating (see the boundary note at `taker_accs`).
+                if acc_level != Some(q) {
+                    settle_taker!();
+                    taker_accs = ((0, 0), (0, 0));
+                    acc_level = Some(q);
+                }
+                // Maker debited per fill; the taker's credit accumulates for
+                // the per-level settlement (see `taker_accs` above). The
+                // IOU split is exactly `move_leg`'s own two `line_adjust`s
+                // pulled apart in time.
+                if pays_leg.xrp {
+                    move_leg(sandbox, &maker, beneficiary, pays_leg, give);
+                } else {
+                    line_adjust(sandbox, &maker, pays_leg, give, false);
+                    taker_accs.0 = stamount_signed_add(false, taker_accs.0, false, give).1;
+                }
                 // The taker pays the INPUT issuer's rate on top of what the
                 // maker receives, and the issuer destroys the difference:
                 //   trIn = redeems(prevStepDir) ? rate(book_.in, strandDst_) : parity
@@ -4225,7 +4303,17 @@ pub(crate) fn cross_engine_to(
                 {
                     let r = transfer_rate(sandbox, gets_leg)
                         .filter(|_| taker != &gets_leg.issuer && maker != gets_leg.issuer);
-                    move_leg_gross(sandbox, taker, &maker, gets_leg, pay, gross_in(r, pay));
+                    if gets_leg.xrp {
+                        move_leg_gross(sandbox, taker, &maker, gets_leg, pay, gross_in(r, pay));
+                    } else {
+                        // Maker credited the NET per fill; the taker's GROSS
+                        // debit accumulates (rippled grosses per offer —
+                        // `stpAmt.in = mulRatio(ofrAmt.in, trIn, …)` — and
+                        // sums the grossed values).
+                        line_adjust(sandbox, &maker, gets_leg, pay, true);
+                        taker_accs.1 =
+                            stamount_signed_add(false, taker_accs.1, false, gross_in(r, pay)).1;
+                    }
                 }
                 rem_pays = me_sub(rem_pays, give);
                 rem_gets = me_sub(rem_gets, pay);
@@ -4327,6 +4415,7 @@ pub(crate) fn cross_engine_to(
     }
     // A single pass whose level boundary tripped exits before the tail turn.
     if single_pass && trailing {
+        settle_taker!();
         return (rem_pays, rem_gets, crossed);
     }
     // Final AMM turn once the book is exhausted (maxOffer sizing).
@@ -4358,6 +4447,11 @@ pub(crate) fn cross_engine_to(
             if std::env::var("DX_AMM").is_ok() {
                 eprintln!("DX_AMM site=direct-tail");
             }
+            // Tail turn = past the last level: close the open group first
+            // (see the level-boundary note at `taker_accs`).
+            settle_taker!();
+            taker_accs = ((0, 0), (0, 0));
+            acc_level = None;
             let (rp, rg, used) = amm_turn(
                 amm_fib.as_deref_mut(), sandbox, a, taker, beneficiary, rem_pays, rem_gets,
                 pays_leg, gets_leg, threshold, sell,
@@ -4430,6 +4524,9 @@ pub(crate) fn cross_engine_to(
             return (entry_pays, entry_gets, 0);
         }
     }
+    // Per-pass taker settlement — AFTER the judge: a rolled-back pass never
+    // sees these writes (the snapshot restore above returns without them).
+    settle_taker!();
     (rem_pays, rem_gets, crossed)
 }
 

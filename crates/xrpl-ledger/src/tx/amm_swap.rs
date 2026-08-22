@@ -1044,15 +1044,17 @@ pub(crate) fn consume_fib(
     if take_in.0 == 0 || take_out.0 == 0 {
         return (rem_pays, rem_gets, false);
     }
-    ox::move_leg_gross(
+    settle_slice(
         sandbox,
         taker,
+        beneficiary,
         &amm.account,
+        pays_leg,
         gets_leg,
         take_in,
         ox::gross_in(in_gross_rate, take_in),
+        take_out,
     );
-    ox::move_leg(sandbox, &amm.account, beneficiary, pays_leg, take_out);
     (
         ox::me_sub(rem_pays, take_out),
         ox::me_sub(rem_gets, take_in),
@@ -1328,6 +1330,27 @@ pub(crate) fn anchored_slice(
     })
 }
 
+/// Settle one pool slice: the pool AND the taker, immediately. A slice is
+/// its own flow iteration — "at any payment engine iteration, AMM offer can
+/// only be consumed once" (BookStep.cpp:818) — so unlike the CLOB fills of
+/// a level (offer.rs `cross_engine_to`'s per-level accumulator) its taker
+/// debit never merges with neighbours. #106455038 136FE701 and #106455036
+/// 1D61A047 calibrate that boundary from both sides.
+fn settle_slice(
+    sandbox: &mut Sandbox,
+    taker: &[u8; 20],
+    beneficiary: &[u8; 20],
+    amm_account: &[u8; 20],
+    pays_leg: &Leg,
+    gets_leg: &Leg,
+    take_in: Me,
+    take_in_gross: Me,
+    take_out: Me,
+) {
+    ox::move_leg_gross(sandbox, taker, amm_account, gets_leg, take_in, take_in_gross);
+    ox::move_leg(sandbox, amm_account, beneficiary, pays_leg, take_out);
+}
+
 /// Move a slice through the pool: taker pays `take_in` of gets, receives
 /// `take_out` of pays.
 #[allow(clippy::too_many_arguments)]
@@ -1546,15 +1569,17 @@ pub(crate) fn consume(
         eprintln!("DX_AMM CONSUMED acct={} take_in={take_in:?} take_out={take_out:?} spot={spot:x} thr={threshold:x} clob={clob:?}",
             hex::encode(amm.account));
     }
-    ox::move_leg_gross(
+    settle_slice(
         sandbox,
         taker,
+        beneficiary,
         &amm.account,
+        pays_leg,
         gets_leg,
         take_in,
         ox::gross_in(in_gross_rate, take_in),
+        take_out,
     );
-    ox::move_leg(sandbox, &amm.account, beneficiary, pays_leg, take_out);
     (
         ox::me_sub(rem_pays, take_out),
         ox::me_sub(rem_gets, take_in),
