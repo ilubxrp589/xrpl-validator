@@ -367,6 +367,17 @@ pub fn apply_common(tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
     // Deduct fee
     acct["Balance"] = serde_json::Value::String((balance - tx.fee).to_string());
 
+    // Transactor::apply — an account that carries sfAccountTxnID (armed via
+    // asfAccountTxnID) gets it rewritten to the CURRENT tx's hash on every
+    // transaction it sends. #106455036 E7C799A8 via the full-ledger replay:
+    // rogue…'s second payment of the ledger must leave ITS hash, not the
+    // prior ledger's.
+    if acct.get("AccountTxnID").is_some() {
+        if let Some(h) = tx.fields.get("hash").and_then(|v| v.as_str()) {
+            acct["AccountTxnID"] = serde_json::Value::String(h.to_uppercase());
+        }
+    }
+
     // Increment sequence only for non-ticket transactions.
     // Ticket-based txs (Sequence=0, TicketSequence present) don't touch the account sequence.
     if !tx.uses_ticket() {

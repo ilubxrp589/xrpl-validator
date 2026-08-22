@@ -1367,6 +1367,11 @@ pub(crate) fn consume(
     threshold: u64,
     sell: bool,
     clob: Option<u64>,
+    // Payment-mode IN-side transfer rate (BookStep.cpp:770 rdrIn), exactly
+    // as consume_fib charges it. The single-path tail consume was moving the
+    // NET — #106455036 9D7FB3B1's 3-pool chain lost rcEGRE's 1.003 between
+    // pool1 and pool2 (found by the full-ledger replay).
+    in_gross_rate: Option<u64>,
 ) -> (Me, Me, bool) {
     // tfSell: the pays side is only a MINIMUM — once met it saturates to
     // zero while the sell keeps spending rem_gets. rippled's sell flow keeps
@@ -1511,7 +1516,14 @@ pub(crate) fn consume(
         eprintln!("DX_AMM CONSUMED acct={} take_in={take_in:?} take_out={take_out:?} spot={spot:x} thr={threshold:x} clob={clob:?}",
             hex::encode(amm.account));
     }
-    ox::move_leg(sandbox, taker, &amm.account, gets_leg, take_in);
+    ox::move_leg_gross(
+        sandbox,
+        taker,
+        &amm.account,
+        gets_leg,
+        take_in,
+        ox::gross_in(in_gross_rate, take_in),
+    );
     ox::move_leg(sandbox, &amm.account, beneficiary, pays_leg, take_out);
     (
         ox::me_sub(rem_pays, take_out),

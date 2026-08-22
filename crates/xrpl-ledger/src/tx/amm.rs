@@ -242,7 +242,8 @@ impl Transactor for AMMCreateTransactor {
             "LedgerEntryType": "AccountRoot",
             "Account": hex::encode(amm_acct),
             "Balance": "0",
-            "Sequence": sandbox.base().header.sequence,
+            // view.seq() is the ledger BEING BUILT — parent + 1.
+            "Sequence": sandbox.base().header.sequence + 1,
             "OwnerCount": 0,
             "Flags": 0x0110_0000u64 | 0x0080_0000,
             "AMMID": hex::encode_upper(amm_hash.0),

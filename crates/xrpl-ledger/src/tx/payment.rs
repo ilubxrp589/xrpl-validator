@@ -52,10 +52,29 @@ impl PaymentTransactor {
             // No `Paths` at all: one empty chain, i.e. the plain direct cross.
             return (vec![Vec::new()], 0);
         };
+        // The spend currency (SendMax else Amount) seeds a LEADING
+        // issuer-only element — toStrand's running asset starts there.
+        let spend_cur: Option<[u8; 20]> = tx
+            .fields
+            .get("SendMax")
+            .or_else(|| tx.fields.get("Amount"))
+            .and_then(|a| a.get("currency"))
+            .and_then(|c| c.as_str())
+            .and_then(|c| {
+                let mut c20 = [0u8; 20];
+                if c.len() == 40 {
+                    c20.copy_from_slice(&hex::decode(c).ok()?);
+                } else if c.len() == 3 && c != "XRP" {
+                    c20[12..15].copy_from_slice(c.as_bytes());
+                } else {
+                    return None;
+                }
+                Some(c20)
+            });
         let chains = paths
             .iter()
             .filter_map(|p| p.as_array())
-            .filter_map(|els| Self::path_legs(els))
+            .filter_map(|els| Self::path_legs(els, spend_cur))
             .collect();
         (chains, paths.len())
     }
@@ -63,7 +82,10 @@ impl PaymentTransactor {
     /// Intermediate book-hop legs for ONE path. `Some(vec![])` means no usable
     /// hops; `None` means the path uses account elements (rippling through a
     /// third party) we can't model, and that path is dropped.
-    fn path_legs(els: &[serde_json::Value]) -> Option<Vec<crate::tx::offer::Leg>> {
+    fn path_legs(
+        els: &[serde_json::Value],
+        spend_cur: Option<[u8; 20]>,
+    ) -> Option<Vec<crate::tx::offer::Leg>> {
         let mut legs: Vec<crate::tx::offer::Leg> = Vec::new();
         for el in els {
             let t = el.get("type").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -110,13 +132,18 @@ impl PaymentTransactor {
                 // USD.rvYA→USD.rhub8 book step that mainnet fills — dropping
                 // the path here refused with tecPATH_DRY. An issuer change
                 // with no preceding IOU leg stays unmodeled (drop).
-                None => {
-                    let prev = legs.last()?;
-                    if prev.xrp {
-                        return None;
-                    }
-                    prev.cur
-                }
+                None => match legs.last() {
+                    Some(prev) if !prev.xrp => prev.cur,
+                    Some(_) => return None,
+                    // LEADING issuer-only element: the running currency is
+                    // the SPEND currency — toStrand's normalization walks
+                    // src → SendMax issuer first, and the pairwise emission
+                    // then builds the same-currency cross-issuer book from
+                    // the spend issue. #106455036 9D7FB3B1: USDC.rGm7 →
+                    // USDC.rcEGRE through an AMM whose pool pairs the two
+                    // issuers, found only by the full-ledger replay.
+                    None => spend_cur?,
+                },
             };
             let iss = el
                 .get("issuer")
@@ -1514,11 +1541,14 @@ impl Transactor for PaymentTransactor {
                 return TxResult::NoDstInsufXrp;
             }
 
+            // DeletableAccounts: a fresh account starts at the CREATING
+            // ledger's sequence (Change.cpp/View — view.seq()), not 1.
+            // #106455036 859EE0EE via the full-ledger replay.
             let new_account = serde_json::json!({
                 "LedgerEntryType": "AccountRoot",
                 "Account": hex::encode(dest_id),
                 "Balance": amount.to_string(),
-                "Sequence": 1,
+                "Sequence": sandbox.base().header.sequence + 1,
                 "OwnerCount": 0,
                 "Flags": 0,
             });
@@ -1884,6 +1914,9 @@ impl PaymentTransactor {
         // tesSUCCESS with 3 extra nodes — all belonging to a maker the path
         // never names.
         if no_direct && named_paths > 0 && path_chains.is_empty() && dstrands.is_empty() && mstrands.is_empty() {
+            if std::env::var("DX_PAY").is_ok() {
+                eprintln!("DX_PAY DRY-EXIT no_direct-all-empty named={named_paths}");
+            }
             sandbox.restore_snapshot(snap);
             return TxResult::PathDry;
         }
@@ -1919,6 +1952,9 @@ impl PaymentTransactor {
                 let issuer_low = &want_leg.issuer < dest;
                 let bit = if issuer_low { 0x0010_0000 } else { 0x0020_0000 };
                 if flags & bit != 0 {
+                    if std::env::var("DX_PAY").is_ok() {
+                        eprintln!("DX_PAY DRY-EXIT dest-line-noripple");
+                    }
                     sandbox.restore_snapshot(snap);
                     return TxResult::PathDry;
                 }
@@ -2652,7 +2688,10 @@ mod tests {
         let dest_data = state.state_map.lookup(&dest_key).expect("dest account should exist");
         let dest_obj: serde_json::Value = serde_json::from_slice(dest_data).unwrap();
         assert_eq!(dest_obj["LedgerEntryType"], "AccountRoot");
-        assert_eq!(dest_obj["Sequence"], 1);
+        // DeletableAccounts: a fresh account's Sequence = the creating
+        // ledger's sequence (header is the PARENT, so +1).
+        let expect_seq = state.header.sequence + 1;
+        assert_eq!(dest_obj["Sequence"], expect_seq);
         assert_eq!(dest_obj["Balance"].as_str().unwrap(), "20000000");
     }
 

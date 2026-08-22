@@ -3267,15 +3267,17 @@ pub(crate) fn cross_engine_to(
     // where mainnet keeps an early fill and drops a later one is what would
     // justify carrying per-iteration state through the walk.
     let cross_snap = offer_crossing.then(|| sandbox.snapshot());
-    // Payment-mode AMM in-fee (see amm_swap::consume_fib): the strand pays
-    // the in-issuer's rate ON TOP of the pool's input (rippled rdrIn — the
-    // previous step redeems). Never in crossing; never when the taker IS the
-    // in issuer.
-    let pay_in_rate = if offer_crossing {
-        None
-    } else {
-        transfer_rate(sandbox, gets_leg).filter(|_| taker != &gets_leg.issuer)
-    };
+    // AMM in-fee (see amm_swap::consume_fib): the strand pays the
+    // in-issuer's rate ON TOP of the pool's input (rippled BookStep trIn =
+    // redeems(prevStepDir) ? rate(book.in) : parity, BookStep.cpp:697).
+    // The implied first hop src → SendMax-issuer REDEEMS, so this applies
+    // in CROSSINGS too — the old "never in crossing" arm mismatched the
+    // CLOB fill sites, which already charge it (#105877543). #106455037
+    // 564C4C30 (full-ledger replay): sell 0.00328 BTC.rvYA into the
+    // XRP/BTC pool — mainnet debits the taker exactly 1.0015x the pool's
+    // receipt. Waived only when the taker IS the in-issuer (then the
+    // implied hop doesn't exist and the book is the strand's first step).
+    let pay_in_rate = transfer_rate(sandbox, gets_leg).filter(|_| taker != &gets_leg.issuer);
     // The fee-composed judge threshold for CLOB fills of a crossing (see
     // crossing_judge_threshold). Payments and AMM turns keep the raw one.
     let thr_judge = if offer_crossing {
@@ -4190,6 +4192,7 @@ fn amm_turn(
     let Some(f) = fib else {
         return crate::tx::amm_swap::consume(
             sandbox, a, taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell, clob,
+            in_gross_rate,
         );
     };
     let init = match f.init.get(&a.account) {
@@ -4707,13 +4710,18 @@ impl Transactor for OfferCreateTransactor {
             // Fresh book pages carry the canonical pair fields + rate (byte
             // census: every page we minted lacked them; hydrated pages have
             // them from mainnet).
-            let book_extra = serde_json::json!({
+            let mut book_extra = serde_json::json!({
                 "ExchangeRate": format!("{:016x}", u64::from_be_bytes(bdir.0[24..32].try_into().unwrap_or([0u8;8]))),
                 "TakerPaysCurrency": hex::encode(pays_leg.cur),
                 "TakerPaysIssuer": hex::encode(pays_leg.issuer),
                 "TakerGetsCurrency": hex::encode(gets_leg.cur),
                 "TakerGetsIssuer": hex::encode(gets_leg.issuer),
             });
+            // Permissioned books: fresh pages carry the scoping DomainID too
+            // (#106455036 52F5AD01… via the full-ledger replay).
+            if let Some(d) = &domain {
+                book_extra["DomainID"] = serde_json::Value::String(hex::encode_upper(d.0));
+            }
             let book_node = crate::ledger::directory::dir_insert_with(
                 sandbox, &bdir, None, &offer_key, Some(&book_extra), true,
             );
