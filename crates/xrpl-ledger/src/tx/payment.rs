@@ -944,6 +944,31 @@ impl PaymentTransactor {
         // the bottom of this function.
         let mut spent_precise: Option<crate::tx::offer::Me> = None;
         let mut carry = avail_in;
+        // rippled's implied first step (src → SendMax-issuer DirectStep) is
+        // fund-limited by the LIVE line balance on every flow iteration. The
+        // line re-rounds to 16 digits at each fill write while our remainder
+        // accounting is exact, so after enough fills the exact budget can
+        // exceed what the line actually holds by a few ulp — and a payment
+        // that drains the line must land on EXACTLY zero the way mainnet's
+        // does. #106455038 D0326D05 (full-ledger replay): rapido's RLUSD
+        // line drains to 0 on mainnet; the exact-remainder budget overdrew
+        // it to -6e-13. The clamp compares in NET terms (the walk debits
+        // gross = net x rate, so the line's gross capacity divides down).
+        if !spend_leg.xrp && tx.account != spend_leg.issuer {
+            if let Some((neg, live)) = Self::leg_signed_balance(sandbox, &tx.account, spend_leg) {
+                if neg {
+                    carry = (0, 0);
+                } else {
+                    let live_net = match Self::transfer_rate(sandbox, spend_leg) {
+                        Some(r) => ox::me_muldiv(live, (1_000_000_000, 0), (r as u128, 0), false),
+                        None => live,
+                    };
+                    if ox::me_cmp(live_net, carry).is_lt() {
+                        carry = live_net;
+                    }
+                }
+            }
+        }
         for i in 0..n {
             let last = i + 1 == n;
             let benef = if last { dest } else { &tx.account };
@@ -2366,16 +2391,17 @@ impl PaymentTransactor {
         // 1292441.5236935 our crossing pulled out of the pool is really
         // 680232.38 delivered — under the transaction's DeliverMin of
         // 804373.673120612, which is exactly mainnet's tecPATH_PARTIAL.
-        // Charge the input fee on what actually moved. The rounds credited
-        // counterparties the NET; the sender parts with net × rate, and the
-        // difference is destroyed exactly as the output-side fee below is.
-        if let Some(r) = spend_rate {
-            let net_spent = ox::me_sub(spend0, rem_in);
-            if !ox::me_is_zero(net_spent) {
-                let gross = ox::me_muldiv(net_spent, (r as u128, 0), (1_000_000_000, 0), true);
-                ox::line_adjust(sandbox, &tx.account, &spend_leg, ox::me_sub(gross, net_spent), false);
-            }
-        }
+        //
+        // ⚠ The input fee is NOT charged here any more. The WALK owns it —
+        // every fill site debits the sender the GROSS directly (CLOB
+        // move_leg_gross, AMM consume/consume_fib in_gross_rate, DirectHop
+        // rates inside the strand), so a settlement top-up here charged the
+        // rate a SECOND time. #106455038 6FC71FB6 (full-ledger replay) is
+        // the exact specimen: two strands hand their pools 17.8207228111
+        // USDT net, mainnet debits the sender 17.8385435339 = net x 1.001
+        // (the Usdt gateway's rate, once), and this site made it
+        // net x 1.001^2 = 17.8563820774. The rem_in bookkeeping above stays
+        // in NET terms — only the LINE top-up was the double.
         let delivered = match want_rate {
             Some(rate) if !ox::me_is_zero(delivered) => {
                 let net = ox::me_muldiv(delivered, (1_000_000_000, 0), (rate as u128, 0), false);

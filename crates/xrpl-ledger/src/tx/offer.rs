@@ -271,6 +271,33 @@ pub(crate) fn mul_round16_up(a: Me, b: Me) -> Me {
     (m, e)
 }
 
+/// `mulRound(a, b, iouAsset, roundUp = false)` — the floor sibling of
+/// `mul_round16_up`: product floored at the 14-shift, canonicalized by pure
+/// truncation (no ceil step). `TOffer::limitOut(…, roundUp=false)` lands
+/// here when a maker's FUNDS bound the fill (BookStep.cpp:779-793) — the in
+/// side of a funds-limited partial rounds DOWN, "so that the quality of an
+/// offer left in the ledger is as good or better than its book page".
+pub(crate) fn mul_round16_down(a: Me, b: Me) -> Me {
+    let (a, b) = (norm16(a), norm16(b));
+    if a.0 == 0 || b.0 == 0 {
+        return (0, 0);
+    }
+    const TEN14: u128 = 100_000_000_000_000;
+    const MAXV: u128 = 9_999_999_999_999_999;
+    let prod = a.0 * b.0;
+    let mut m = prod / TEN14;
+    let mut e = a.1 + b.1 + 14;
+    while m > MAXV {
+        m /= 10;
+        e += 1;
+    }
+    while m > 0 && m < 1_000_000_000_000_000 {
+        m *= 10;
+        e -= 1;
+    }
+    (m, e)
+}
+
 /// `mulRoundStrict(a, b, XRP, round_up)` — `a * b` as whole DROPS.
 ///
 /// `TOffer::limitOut` does not call `mulRound`: "It turns out that the ceil_out
@@ -838,7 +865,10 @@ pub(crate) fn line_adjust(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, am
         let mut line = serde_json::json!({
             "LedgerEntryType": "RippleState",
             "Flags": flags,
-            "Balance": {"currency": cur_str, "issuer": "0000000000000000000000000000000000000000",
+            // Balance issuer = noAccount()/ACCOUNT_ONE (View.cpp
+            // trustCreate) — the zero account is one nibble wrong on the
+            // wire (#106455039 A72B9486).
+            "Balance": {"currency": cur_str, "issuer": "0000000000000000000000000000000000000001",
                          "value": format!("{}{}", sign, me_to_value_string(amt))},
             "LowLimit": {"currency": cur_str, "issuer": hex::encode(lo), "value": "0"},
             "HighLimit": {"currency": cur_str, "issuer": hex::encode(hi), "value": "0"},
@@ -3732,8 +3762,20 @@ pub(crate) fn cross_engine_to(
                 let full_offer = !buy_bound && me_cmp(funded, m_gives0).is_ge();
                 let mut pay = if full_offer {
                     m_wants0
-                } else {
+                } else if buy_bound {
+                    // Taker-out-limited partial: limitStepOut →
+                    // offer.limitOut(…, roundUp = TRUE) (BookStep.cpp:675),
+                    // the lossy ceil calibrated on #105924683.
                     mul_round16_up(give, rate_me(q))
+                } else {
+                    // Maker-FUNDS-limited partial: the funds clamp calls
+                    // offer.limitOut(…, roundUp = FALSE) (BookStep.cpp:790)
+                    // — the in rounds DOWN. #106455040 530B9F6E via the
+                    // full-ledger replay: maker rQ3fNyLjb's XRP runs out at
+                    // 998199991 drops and mainnet prices the CNY in at
+                    // 9441.640416087924 (floor of …92422…), one ulp under
+                    // our ceil.
+                    mul_round16_down(give, rate_me(q))
                 };
                 if gets_leg.xrp {
                     // Whole drops FLOOR, they do not ceil. Observed twice in

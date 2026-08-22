@@ -649,6 +649,21 @@ fn run() -> i32 {
                 ter_mismatch += 1;
             }
             for (k, ent) in mods {
+                // DX_WATCH=<hex key prefix>: print the node's Balance after
+                // every tx that writes it (uppercase hex prefix match).
+                if let Ok(w) = std::env::var("DX_WATCH") {
+                    if !w.is_empty() && hex::encode_upper(k.0).starts_with(&w.to_uppercase()) {
+                        let bal = match &ent {
+                            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => {
+                                serde_json::from_slice::<Value>(b)
+                                    .ok()
+                                    .map(|v| v["Balance"].clone())
+                            }
+                            SandboxEntry::Deleted => None,
+                        };
+                        eprintln!("DX_WATCH {h} {tx_type} -> {:?}", bal);
+                    }
+                }
                 match ent {
                     SandboxEntry::Created(b) | SandboxEntry::Modified(b) => {
                         let _ = state.state_map.insert(k, b);

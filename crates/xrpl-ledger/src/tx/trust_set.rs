@@ -538,9 +538,14 @@ impl Transactor for TrustSetTransactor {
             };
             let line_obj = serde_json::json!({
                 "LedgerEntryType": "RippleState",
+                // A line Balance's issuer is noAccount() — ACCOUNT_ONE
+                // (rrrrrrrrrrrrrrrrrrrrBZbvji), not the zero account
+                // (View.cpp trustCreate). #106455039 A72B9486 via the
+                // full-ledger replay: one nibble, invisible to every
+                // meta gate.
                 "Balance": {
                     "currency": currency_str,
-                    "issuer": "0000000000000000000000000000000000000000",
+                    "issuer": "0000000000000000000000000000000000000001",
                     "value": "0"
                 },
                 "LowLimit": {
