@@ -1951,6 +1951,8 @@ fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<Hash
     let snap = sb.snapshot();
     let applied = transactor.do_apply(tx, &mut sb);
     if applied.is_success() {
+        // Success-only (Transactor.cpp:660; tec rolls the stamp back).
+        xrpl_ledger::ledger::transactor::stamp_account_txn_id(tx, &mut sb);
         (TxResult::Success.code_str().to_string(), sb.into_modifications())
     } else if applied.is_claimed() {
         // See apply.rs: tecKILLED carries OfferCreate's stale-offer cleanup,

@@ -339,6 +339,29 @@ pub trait Transactor {
 
 /// Deduct fee from sender and increment sequence.
 /// This runs for EVERY successfully-claimed transaction.
+/// Transactor.cpp:660 — an account carrying sfAccountTxnID (armed via
+/// asfAccountTxnID) gets it rewritten to the CURRENT tx's hash — but the
+/// stamp sits in `apply()` and a tec result ROLLS THE VIEW BACK to fee +
+/// sequence only, discarding it. Call this from the SUCCESS arm only.
+/// #106455052 BFF40FB0 (full-ledger replay): rapido's two #52 payments are
+/// tecPATH_PARTIAL / tecPATH_DRY, and mainnet's final AccountTxnID is
+/// still #51's C428A7A6 while PreviousTxnID threads to the tec fee write.
+/// (#106455036 E7C799A8 calibrated the success side: the second payment of
+/// the ledger leaves ITS hash.)
+pub fn stamp_account_txn_id(tx: &TxFields, sandbox: &mut Sandbox) {
+    let key = keylet::account_root_key(&tx.account);
+    let Some(data) = sandbox.read(&key) else { return };
+    let Ok(mut acct) = serde_json::from_slice::<serde_json::Value>(&data) else { return };
+    if acct.get("AccountTxnID").is_none() {
+        return;
+    }
+    let Some(h) = tx.fields.get("hash").and_then(|v| v.as_str()) else { return };
+    acct["AccountTxnID"] = serde_json::Value::String(h.to_uppercase());
+    if let Ok(bytes) = serde_json::to_vec(&acct) {
+        sandbox.write(key, bytes);
+    }
+}
+
 pub fn apply_common(tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
     let acct_key = keylet::account_root_key(&tx.account);
 
@@ -367,16 +390,6 @@ pub fn apply_common(tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
     // Deduct fee
     acct["Balance"] = serde_json::Value::String((balance - tx.fee).to_string());
 
-    // Transactor::apply — an account that carries sfAccountTxnID (armed via
-    // asfAccountTxnID) gets it rewritten to the CURRENT tx's hash on every
-    // transaction it sends. #106455036 E7C799A8 via the full-ledger replay:
-    // rogue…'s second payment of the ledger must leave ITS hash, not the
-    // prior ledger's.
-    if acct.get("AccountTxnID").is_some() {
-        if let Some(h) = tx.fields.get("hash").and_then(|v| v.as_str()) {
-            acct["AccountTxnID"] = serde_json::Value::String(h.to_uppercase());
-        }
-    }
 
     // Increment sequence only for non-ticket transactions.
     // Ticket-based txs (Sequence=0, TicketSequence present) don't touch the account sequence.

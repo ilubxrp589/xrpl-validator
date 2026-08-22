@@ -2457,7 +2457,15 @@ impl PaymentTransactor {
         // in NET terms — only the LINE top-up was the double.
         let delivered = match want_rate {
             Some(rate) if !ox::me_is_zero(delivered) => {
-                let net = ox::me_muldiv(delivered, (1_000_000_000, 0), (rate as u128, 0), false);
+                // rippled DirectStep.cpp:646 — the destination receives
+                // out/rate via mulRatio(…, roundUp = false), whose real
+                // rounding is half-even NEAREST (no bump on round-down for
+                // a positive amount; IOUAmount.cpp:182). The exact floor
+                // sat one ulp low whenever the dropped fraction was above
+                // one half: #106455062 AF6A3460 (full-ledger replay) —
+                // 4369.93132409 SOLO gross over the 1.0001 issuer must
+                // deliver …652540, floor said …652539.
+                let net = ox::mul_ratio(delivered, 1_000_000_000, rate as u128, false);
                 ox::line_adjust(sandbox, dest, &want_leg, ox::me_sub(delivered, net), false);
                 net
             }

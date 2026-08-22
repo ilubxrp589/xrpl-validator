@@ -153,6 +153,9 @@ pub fn apply_transaction_set(
 
                     let apply_result = transactor.do_apply(tx, &mut sandbox);
                     if apply_result.is_success() {
+                        // Success-only (Transactor.cpp:660; a tec rolls the
+                        // stamp back with the rest of doApply's writes).
+                        super::transactor::stamp_account_txn_id(tx, &mut sandbox);
                         let mods = sandbox.into_modifications();
                         apply_modifications(&mut new_state, mods)?;
                         (TxResult::Success, tx.fee)
