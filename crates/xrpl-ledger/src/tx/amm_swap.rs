@@ -1372,6 +1372,18 @@ pub(crate) fn consume(
     // NET — #106455036 9D7FB3B1's 3-pool chain lost rcEGRE's 1.003 between
     // pool1 and pool2 (found by the full-ledger replay).
     in_gross_rate: Option<u64>,
+    // rippled single-path LIMIT anchoring: when one strand remains and the
+    // taker's limitQuality is better than the LOB tip, `qualityThreshold`
+    // returns nullopt (BookStep.cpp:474-481), getOffer falls to maxOffer,
+    // and the strand's `limitOut` sizes the fill by the AMM's LINEARISED
+    // average-quality function (StrandFlow.h:680, QualityFunction AMMTag +
+    // outFromAvgQ): 1/q(out) = b + m·out with m = −f/poolIn and
+    // b = poolOut·f/poolIn, so out = (1/thr − b)/m, re-swapped through the
+    // real curve for the in (AMMOffer::limitOut). #106455041 098271FA: the
+    // CNY/XLM pool fills 29.9838423467 → 22.3648193416 at EXACTLY the
+    // taker's 1.34067 limit; the exact-curve anchored slice lands 1e-4
+    // small.
+    limit_anchor: bool,
 ) -> (Me, Me, bool) {
     // tfSell: the pays side is only a MINIMUM — once met it saturates to
     // zero while the sell keeps spending rem_gets. rippled's sell flow keeps
@@ -1427,7 +1439,25 @@ pub(crate) fn consume(
         }
         swap_asset_out(pool_in, pool_out, out, amm.tfee, gets_leg.xrp).map(|i| (i, out))
     };
-    let offer = if let Some(qb) = clob {
+    let offer = if limit_anchor && threshold != u64::MAX {
+        // out = (1/thr − b)/m = poolOut − poolIn/(f·thr); in = swapAssetOut.
+        (|| {
+            let thr_n = decode_rate(threshold);
+            let denom = n_mul(omf_spot, thr_n, Rnd::Near);
+            if denom.0 == 0 {
+                return None;
+            }
+            let sub = n_div(pool_in, denom, Rnd::Near);
+            if n_cmp(sub, pool_out) != Ordering::Less {
+                return None;
+            }
+            let out = to_amount(n_sub(pool_out, sub, Rnd::Near), pays_leg.xrp, Rnd::Down);
+            if out.0 == 0 || n_cmp(out, pool_out) != Ordering::Less {
+                return None;
+            }
+            swap_asset_out(pool_in, pool_out, out, amm.tfee, gets_leg.xrp).map(|i| (i, out))
+        })()
+    } else if let Some(qb) = clob {
         anchored_offer(pool_in, pool_out, gets_leg.xrp, pays_leg.xrp, qb, amm.tfee).or_else(|| {
             // fixAMMv1_2: fall back to maxOffer when it still beats the book
             max_offer().filter(|(i, o)| rate_of(*i, *o) < qb)

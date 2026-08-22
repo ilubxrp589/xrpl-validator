@@ -2305,22 +2305,61 @@ thr={t:?} admits_trunc={} admits_up={}",
                 rk(&la, ai), rk(&lb, bi), la.len(), lb.len()
             );
         }
-        // AMM turn: the direct-pair pool competes with the best BOOK rate
-        // via multi-path FIB slices (its AVERAGE quality incl. slippage/fee).
+        // AMM turn: the direct-pair pool competes with the best BOOK rate.
+        // Under MULTI-path it offers FIB slices; a SINGLE-path round anchors
+        // instead — rippled re-arbitrates every driver iteration
+        // (`activateNext` drops strands whose upper bound misses the limit,
+        // then `setMultiPath(activeStrands.size() > 1)`, StrandFlow.h:672-674),
+        // and single-path `qualityThreshold` returns nullopt whenever the
+        // LIMIT is better than the LOB tip (BookStep.cpp:474-481: "The limit
+        // out value generates the maximum AMM offer in this case, which
+        // matches the quality threshold"), with the lone strand's `limitOut`
+        // solving `outFromAvgQ(limitQuality)` (StrandFlow.h:680-686). For the
+        // pool that IS a slice anchored AT THE LIMIT; a LOB tip inside the
+        // limit anchors at the tip as usual.
+        //
+        // #106455041 098271FA (full-ledger replay): CNY→XLM, limit 1.34067,
+        // bridge upper bound outside it → single-path from rippled's first
+        // iteration. Mainnet's CNY/XLM pool fills 29.9838423467 →
+        // 22.3648193416 — realized EXACTLY 1.34067 — while our fib slice
+        // (q 1.3406974) was refused every round and the pool never crossed.
+        // `multi_prev` carries last round's active-strand verdict, so the
+        // anchored arm engages one round after the dust CLOB fill drops the
+        // tip past the limit — same fills, same final state.
         if let (Some(a), Some(init)) = (amm, &amm_init) {
-            let best_book = match (dq, bq) {
-                (Some(d), Some(b)) => Some(if me_cmp(d, b).is_le() { d } else { b }),
-                (Some(d), None) => Some(d),
-                (None, Some(b)) => Some(b),
-                (None, None) => None,
+            let (rp, rg, used) = if !multi_prev && threshold != u64::MAX {
+                // Anchor from the LIVE direct head (dpeek skips consumed and
+                // self offers) — `ld[di]` lags one fill behind and anchored
+                // round 2 at the already-consumed dust offer's rate, which
+                // sat BELOW the pool's spot and refused the slice.
+                let (anchor_clob, limit_anchor) = match dpeek.as_ref().map(|(q, ..)| *q) {
+                    Some(t) if t <= threshold => (Some(t), false),
+                    _ => (None, true),
+                };
+                if std::env::var("DX_AMM").is_ok() {
+                    eprintln!(
+                        "DX_AMM site=bridged-single anchor={anchor_clob:?} limit_anchor={limit_anchor} thr={threshold:x}"
+                    );
+                }
+                crate::tx::amm_swap::consume(
+                    sandbox, a, taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg,
+                    threshold, sell, anchor_clob, None, limit_anchor,
+                )
+            } else {
+                let best_book = match (dq, bq) {
+                    (Some(d), Some(b)) => Some(if me_cmp(d, b).is_le() { d } else { b }),
+                    (Some(d), None) => Some(d),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                if std::env::var("DX_AMM").is_ok() {
+                    eprintln!("DX_AMM site=bridged best_book={best_book:?}");
+                }
+                crate::tx::amm_swap::consume_fib(
+                    sandbox, a, taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg,
+                    threshold, sell, *init, amm_iters, best_book, None,
+                )
             };
-            if std::env::var("DX_AMM").is_ok() {
-                eprintln!("DX_AMM site=bridged best_book={best_book:?}");
-            }
-            let (rp, rg, used) = crate::tx::amm_swap::consume_fib(
-                sandbox, a, taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg,
-                threshold, sell, *init, amm_iters, best_book, None,
-            );
             rem_pays = rp;
             rem_gets = rg;
             if used {
@@ -4274,7 +4313,7 @@ fn amm_turn(
     let Some(f) = fib else {
         return crate::tx::amm_swap::consume(
             sandbox, a, taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell, clob,
-            in_gross_rate,
+            in_gross_rate, false,
         );
     };
     let init = match f.init.get(&a.account) {

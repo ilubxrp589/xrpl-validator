@@ -2045,6 +2045,19 @@ impl PaymentTransactor {
         let mut strands: Vec<Vec<&ox::Leg>> = Vec::new();
         let mut have_direct = false;
         for hops in &path_chains {
+            // Whether the path's LAST explicit element already IS the
+            // delivered issue. Then the cross-issuer transition into it was
+            // an explicit OFFER-class element and toStrand builds a real
+            // same-currency BOOK (toStep: issuer-only e2 → makeBookStepIi;
+            // #106455036's lesson) — the inter-gateway drop below is only
+            // for the IMPLIED delivery, where normalization appends the
+            // issuer as an ACCOUNT element and the transition needs a
+            // gateway-to-gateway line. #106455042 42AD7C62: […, USD/rKiCet,
+            // issuer-only(32) rvYA] delivers USD.rvYA across the
+            // USD.rKiCet/USD.rvYA book mainnet actually crosses; the
+            // calibrated drop specimen 619718E8 names only USD/rvYA and
+            // delivers USD.rhub8 — still dropped.
+            let names_delivery = hops.last().is_some_and(|h| same(h, &want_leg));
             let mut chain: Vec<&ox::Leg> = std::iter::once(&spend_leg)
                 .chain(hops.iter())
                 .chain(std::iter::once(&want_leg))
@@ -2060,7 +2073,7 @@ impl PaymentTransactor {
             }
             // The delivered currency already in hand under another issuer is a
             // gateway-to-gateway ripple, not a book — rippled drops the path.
-            if Self::terminal_is_ripple_step(&chain) {
+            if !names_delivery && Self::terminal_is_ripple_step(&chain) {
                 if std::env::var("DX_PAY").is_ok() {
                     eprintln!(
                         "DX_PAY terminal ripple step {} -> {}: path dropped (needs inter-gateway line)",
