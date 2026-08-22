@@ -161,7 +161,21 @@ fn token_offer_create_apply(
         };
         // sfNFTokenOfferNode is SoeRequired on the offer — present even at
         // zero (byte census: net carries 3C 0000000000000000 we omitted).
-        let tok_node = dir_insert(sandbox, &dir_root, None, &offer_key);
+        // Fresh pages of the token's offer directory carry the buy/sell
+        // marker + the token id (NFTokenHelpers.cpp:960 describe callback;
+        // #106455035 full-ledger replay caught the bare pages).
+        let tok_extra = serde_json::json!({
+            "Flags": if is_sell { 0x0000_0002u32 } else { 0x0000_0001u32 },
+            "NFTokenID": nftoken_id.clone(),
+        });
+        let tok_node = crate::ledger::directory::dir_insert_with(
+            sandbox,
+            &dir_root,
+            None,
+            &offer_key,
+            Some(&tok_extra),
+            false,
+        );
         offer_obj["NFTokenOfferNode"] = serde_json::Value::String(format!("{tok_node:x}"));
     }
     sandbox.write(offer_key, serde_json::to_vec(&offer_obj).unwrap());
