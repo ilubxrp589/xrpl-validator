@@ -924,8 +924,97 @@ pub(crate) fn move_leg_gross(
     }
 }
 
+/// rippled `mulRatio(IOUAmount, num, den, roundUp)` — IOUAmount.cpp:182.
+/// NOT a plain ceiling. The 128-bit product/quotient is scaled to ~18-19
+/// digits (roomToGrow), the IOUAmount ctor then NORMALIZES to 16 digits at
+/// Number's half-even NEAREST, and only THEN a remainder bumps the rounded
+/// mantissa by one ulp (roundUp && positive). Net effect for a positive
+/// amount: nearest16(exact) + 1 when inexact — which exceeds a true ceil
+/// whenever the discarded fraction is above one half.
+///
+/// #106455044 32DD7192 (full-ledger replay, shim-traced): net
+/// 0.02184144723105913 x 1.003 = ...230.739 exact; our exact ceil said
+/// ...231, rippled's LIMITSTEPOUT prints stpIn=0.02190697157275232.
+pub(crate) fn mul_ratio(a: Me, num: u128, den: u128, round_up: bool) -> Me {
+    let (m, e) = norm16(a);
+    if m == 0 || num == 0 {
+        return (0, 0);
+    }
+    let prod = m * num;
+    let mut low = prod / den;
+    let mut rem = prod % den;
+    let mut exp = e;
+    let ceil_log10 = |v: u128| -> i32 {
+        let mut d = 0i32;
+        let mut x = 1u128;
+        while x < v {
+            x = x.saturating_mul(10);
+            d += 1;
+        }
+        d
+    };
+    if rem != 0 {
+        let room = 18 - ceil_log10(low);
+        if room > 0 {
+            let p = 10u128.pow(room as u32);
+            low *= p;
+            rem *= p;
+            exp -= room;
+            low += rem / den;
+            rem %= den;
+        }
+    }
+    let mut has_rem = rem != 0;
+    let shrink = ceil_log10(low) - 18;
+    if shrink > 0 {
+        let p = 10u128.pow(shrink as u32);
+        let sav = low;
+        low /= p;
+        exp += shrink;
+        has_rem |= sav != low * p;
+    }
+    // IOUAmount(low, exp) normalization: reduce to 16 digits at half-even.
+    let (mut nm, mut ne) = (low, exp);
+    while nm >= 10_000_000_000_000_000 {
+        let over = ceil_log10(nm) - 16;
+        let p = 10u128.pow(over.max(1) as u32);
+        let q = nm / p;
+        let r = nm % p;
+        nm = match (2 * r).cmp(&p) {
+            std::cmp::Ordering::Greater => q + 1,
+            std::cmp::Ordering::Equal => q + (q & 1),
+            std::cmp::Ordering::Less => q,
+        };
+        ne += over.max(1);
+        // The ctor's own rounding loss does NOT feed the roundUp bump —
+        // rippled computes hasRem BEFORE `IOUAmount result(...)` and never
+        // folds the normalize remainder in.
+    }
+    if has_rem && round_up {
+        nm += 1;
+        if nm >= 10_000_000_000_000_000 {
+            nm /= 10;
+            ne += 1;
+        }
+    }
+    while nm != 0 && nm < 1_000_000_000_000_000 {
+        nm *= 10;
+        ne -= 1;
+    }
+    (nm, ne)
+}
+
 /// The gross an input transfer rate makes the taker part with for `net`.
 /// `mulRatio(ofrAmt.in, ofrInRate, QUALITY_ONE, roundUp)` — BookStep.cpp:770.
+///
+/// ⚠ Still the exact ceil, NOT `mul_ratio` above. Rerouting this through
+/// the faithful mulRatio (nearest + bump) regressed #106455042/43's
+/// funding-bound drains: rippled's first DirectStep is GROSS-PRIMARY when
+/// the line binds (srcToDst = the whole line, net derived by division), so
+/// its debit lands on exactly zero however mulRatio rounds — our net-first
+/// fills only drain exactly under the ceil. The one-ulp #106455044
+/// 32DD7192 site needs the mulRatio semantics wired together WITH
+/// gross-primary funding, one campaign, not piecemeal.
 pub(crate) fn gross_in(fee_rate: Option<u64>, net: Me) -> Me {
     match fee_rate {
         Some(r) => me_muldiv(net, (r as u128, 0), (1_000_000_000, 0), true),
@@ -2305,6 +2394,31 @@ thr={t:?} admits_trunc={} admits_up={}",
                 rk(&la, ai), rk(&lb, bi), la.len(), lb.len()
             );
         }
+        // rippled evaluates `activateNext` (drop strands whose upper bound
+        // misses limitQuality) and `setMultiPath(active > 1)` BEFORE the
+        // iteration's strand passes — so the FIRST pass already runs
+        // single-path when the bridge is out. Carrying last round's verdict
+        // (`multi_prev`) made round 1 consume a FIB slice where rippled's
+        // iteration 0 anchors at the LOB: #106455042 446DCA57's oracle trace
+        // reads "FLOWDBG iter 0 activeStrands 1 multiPath false" with bridge
+        // ub 1.351643746978908 (== our bq_ub to the ulp) against
+        // limitQuality 1.3436715, and ONE anchored slice
+        // 197.6261655980808 → 147.15278879855 at exactly the 1.343 tip.
+        // `multi_prev` still shapes the UPPER-BOUND composition at the round
+        // top — rippled's qualityUpperBound reads the PREVIOUS iteration's
+        // ammContext there, the same one-round lag.
+        let thr_admit = (threshold_self != 0 && threshold_self != u64::MAX)
+            .then(|| rate_me(threshold_self));
+        let multi_now = match thr_admit {
+            Some(t) => {
+                let w = |q: Option<Me>| q.is_some_and(|v| me_cmp(v, t).is_le());
+                (w(d_tip) as u8) + (w(bq_ub) as u8) > 1
+            }
+            // No limitQuality (a payment): rippled enters with multiPath =
+            // `strands.size() > 1`, which a bridged payment satisfies.
+            None => true,
+        };
+        multi_prev = multi_now;
         // AMM turn: the direct-pair pool competes with the best BOOK rate.
         // Under MULTI-path it offers FIB slices; a SINGLE-path round anchors
         // instead — rippled re-arbitrates every driver iteration
@@ -2327,7 +2441,7 @@ thr={t:?} admits_trunc={} admits_up={}",
         // anchored arm engages one round after the dust CLOB fill drops the
         // tip past the limit — same fills, same final state.
         if let (Some(a), Some(init)) = (amm, &amm_init) {
-            let (rp, rg, used) = if !multi_prev && threshold != u64::MAX {
+            let (rp, rg, used) = if !multi_now && threshold != u64::MAX {
                 // Anchor from the LIVE direct head (dpeek skips consumed and
                 // self offers) — `ld[di]` lags one fill behind and anchored
                 // round 2 at the already-consumed dust offer's rate, which
@@ -2601,18 +2715,9 @@ thr={t:?} admits_trunc={} admits_up={}",
         // (l105887283, BTC.Bitstamp 1.0015): direct-tip 1.5271e-5 admits
         // against 1.5288e-5 but fails the net 1.5265e-5 — rippled's receipt
         // is `activeStrands 2 multiPath true`, AMM anchored, CLOB fills.
-        let thr_admit = (threshold_self != 0 && threshold_self != u64::MAX)
-            .then(|| rate_me(threshold_self));
-        let multi_now = match thr_admit {
-            Some(t) => {
-                let w = |q: Option<Me>| q.is_some_and(|v| me_cmp(v, t).is_le());
-                (w(d_tip) as u8) + (w(bq_ub) as u8) > 1
-            }
-            // No limitQuality (a payment): rippled enters with multiPath =
-            // `strands.size() > 1`, which a bridged payment satisfies.
-            None => true,
-        };
-        multi_prev = multi_now;
+        // (multi_now is computed ABOVE the AMM turn now — rippled evaluates
+        // activateNext + setMultiPath BEFORE the strand passes of the same
+        // iteration, StrandFlow.h:672-674.)
         // The qualityThreshold override is single-path only: force the pool
         // leg now that multiPath is known (see a_unb_raw above).
         let a_use_amm = a_use_amm || (!multi_now && a_unb_raw);
