@@ -1231,7 +1231,26 @@ impl PaymentTransactor {
                             ox::me_cmp(ox::me_muldiv(diff, (1_000_000_000, 0), (1, 0), false), hi)
                                 .is_lt()
                         };
-                    if agree { from_cap } else { d }
+                    if ox::me_is_zero(d) && !ox::me_is_zero(from_cap) {
+                        // A zero delta with nonzero walk-accounting means the
+                        // DELTA is blind, not the hop dry — the measure_hop G1
+                        // precedent, with a new face: a SELF-FILL round-trips
+                        // the sender's line (maker debit + taker credit
+                        // cancel), so the delta is structurally zero however
+                        // much value flowed. #106455106 E71A9888: the bot buys
+                        // 0.000203 BTC from its OWN resting RLUSD/BTC offer —
+                        // four writes, net zero — and reporting carry 0 dried
+                        // the chain into tecPATH_DRY where mainnet fills
+                        // 10879958 drops and rolls back under DeliverMin as
+                        // tecPATH_PARTIAL. rippled never differences balances
+                        // here: the steps hand amounts DIRECTLY down the
+                        // strand, which is what `from_cap` reproduces.
+                        from_cap
+                    } else if agree {
+                        from_cap
+                    } else {
+                        d
+                    }
                 }
                 // The account issues the hop currency (no line to read), or this
                 // is the LAST hop, whose cap is the real want_out and small
@@ -1240,7 +1259,11 @@ impl PaymentTransactor {
             };
             if std::env::var("DX_PAY").is_ok() {
                 let nm = |l: &ox::Leg| if l.xrp { "XRP".to_string() } else { format!("{}/{}", hex::encode_upper(&l.cur[12..15]), hex::encode(&l.issuer[..4])) };
-                eprintln!("DX_PAY hop {i}/{n} {} -> {} want_cap={want_cap:?} rw={rw:?} carry={carry:?}", nm(chain[i]), nm(chain[i + 1]));
+                eprintln!(
+                    "DX_PAY hop {i}/{n} {} -> {} want_cap={want_cap:?} rw={rw:?} carry={carry:?} before={before:?} after={:?}",
+                    nm(chain[i]), nm(chain[i + 1]),
+                    Self::leg_signed_balance(sandbox, &tx.account, out_leg),
+                );
             }
             if ox::me_is_zero(carry) {
                 break; // hop dried: nothing delivered
