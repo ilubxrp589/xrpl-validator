@@ -5003,7 +5003,20 @@ impl Transactor for OfferCreateTransactor {
         // 1058491178 drops.
         let (rem_pays, rem_gets) = if sell {
             if me_cmp(rem_gets, tg0).is_lt() && !me_is_zero(rem_gets) {
-                let g16 = norm16(rem_gets);
+                // HALF-EVEN, not truncation: rippled's afterCross.in is an
+                // STAmount SUBTRACTION (takerGets − the crossed in), and
+                // Number normalizes to 16 digits at to-nearest. #106455088
+                // F2E338D5: 19.314637 − 0.0017358593779919 leaves …62200|81,
+                // which nearest carries to 19.31290114062201 (mainnet's
+                // rested TakerGets) and truncation dropped to …200. The
+                // #106455038 75F01CB4 calibration (tail .12) rounds down
+                // under both rules and never discriminated.
+                let g16 = crate::tx::amm_swap::round16(
+                    rem_gets.0,
+                    rem_gets.1,
+                    false,
+                    crate::tx::amm_swap::Rnd::Near,
+                );
                 let p = match rate_of_me(tg0, tp0) {
                     Some(q) if pays_leg.xrp => (div_round_drops_strict_floor(g16, rate_me(q)), 0),
                     Some(q) => div_round16_down(g16, rate_me(q)),
