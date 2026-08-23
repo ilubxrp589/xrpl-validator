@@ -2049,8 +2049,19 @@ impl PaymentTransactor {
             Some(r) if dest != &want_leg.issuer => Some(r),
             _ => None,
         };
+        // mulRatio, NOT exact ceil: rippled sizes this in DirectStepI's rev
+        // quality math (IOUAmount mulRatio — nearest-16 + bump only on a
+        // pre-normalize remainder). The two rounders split BOTH ways and both
+        // directions are specimen-pinned on #106455100:
+        //   0E7D8887 (XAG 1.001): 67057.3053491705 × 1.001 = …96705|0 — the
+        //     quotient is EXACT, so no bump: rippled …967, ceil said …968,
+        //     and netting the wrong gross put the dest line one ulp high.
+        //   0E04203B (1.002 tail): 1.571350128058821 × 1.002 = …93864|2 —
+        //     inexact, nearest …939 THEN bump: rippled …940 (shim STEPREV
+        //     receipt), ceil said …939, and the whole rev chain ran one ulp
+        //     low (…180/…286 for mainnet's …181/…287) — the E1FA line's ulp.
         let want_gross = match want_rate {
-            Some(r) => ox::me_muldiv(want_target, (r as u128, 0), (1_000_000_000, 0), true),
+            Some(r) => ox::mul_ratio(want_target, r as u128, 1_000_000_000, true),
             None => want_target,
         };
         // The strand's output belongs to the DESTINATION: crediting the
@@ -2225,6 +2236,34 @@ impl PaymentTransactor {
         // than its own SendMax could ever deliver and turned a full
         // delivery into tecPATH_PARTIAL.
         let mut delivered_direct: ox::Me = (0, 0);
+        // rippled's driver never carries a RUNNING remainder. Every winning
+        // pass lands in a sorted multiset and each iteration re-derives
+        //   remainingOut = outReq  − sum(savedOuts)
+        //   remainingIn  = sendMax − sum(savedIns)
+        // (StrandFlow.h:639-642 flat_multiset, :762-766; the final
+        // actualIn/actualOut at :801-802 are the same sums). `sum` folds the
+        // set ASCENDING with one half-even 16-digit add per element, and the
+        // subtraction rounds the same way — so from the THIRD round on the
+        // request derives from the ROUNDED TOTAL, not from a rounded chain
+        // of differences (two-round strands cannot tell the forms apart).
+        // #105795329 ED4F899F is the receipt (FFI trace, three CLOB/AMM
+        // rounds): rippled's iter-2 outReq is 220.1943150207048 −
+        // n16(75.87773718335664 ⊕ 52.2281718281718x) = 92.0884060091763,
+        // where the running chain says …637/…638 — and only the totals form
+        // lands the destination's line on mainnet's …048. Every larger line
+        // absorbs the ulp in its own rounding, which is why the census saw
+        // exactly one key.
+        let mut saved_ins: Vec<ox::Me> = Vec::new();
+        let mut saved_outs: Vec<ox::Me> = Vec::new();
+        fn strand_rem(req: ox::Me, saved: &mut Vec<ox::Me>) -> ox::Me {
+            saved.sort_by(|a, b| ox::me_cmp(*a, *b));
+            let mut tot: ox::Me = (0, 0);
+            for s in saved.iter() {
+                tot = ox::stamount_signed_add(false, tot, false, *s).1;
+            }
+            let (neg, mag) = ox::stamount_signed_add(false, req, true, tot);
+            if neg { (0, 0) } else { mag }
+        }
         // rippled's AMMContext, alive for the whole flow: `multiPath()` is
         // `activeStrands.size() > 1`, so a pool offers FIB SLICES rather than
         // `maxOffer` exactly when we run more than one strand, and the counter
@@ -2402,34 +2441,55 @@ impl PaymentTransactor {
             // strand's sin is GROSS, a book strand's is NET, and the input
             // rate converts between them (net = gross / rate, floor; gross =
             // net × rate, ceil — the sender-parts-with side always rounds
-            // against the sender).
+            // against the sender). The multiset entries live in the REQUEST
+            // units (savedIns in SendMax units, savedOuts in outReq units),
+            // and the remainders re-derive from the totals — see `strand_rem`
+            // at the declarations above for the rippled receipts.
             let rate = spend_rate.map(|r| r as u128);
-            if in_gross {
-                rem_in_gross = ox::me_sub(rem_in_gross, sin);
-                let net = match rate {
-                    Some(r) => ox::me_muldiv(sin, (1_000_000_000, 0), (r, 0), false),
-                    None => sin,
-                };
-                rem_in = ox::me_sub(rem_in, net);
+            let in_saved = if in_gross {
+                sin
             } else {
-                rem_in = ox::me_sub(rem_in, sin);
-                let gross = match rate {
+                match rate {
                     Some(r) => ox::me_muldiv(sin, (r, 0), (1_000_000_000, 0), true),
                     None => sin,
+                }
+            };
+            saved_ins.push(in_saved);
+            rem_in_gross = strand_rem(spend0_gross, &mut saved_ins);
+            if rate.is_none() {
+                // No spend rate: net IS gross — rippled's own remainder.
+                rem_in = rem_in_gross;
+            } else {
+                // ⚠ SPEND-RATE PAYMENTS KEEP THE EXACT NET REMAINDER. rippled
+                // carries ONE gross remainder and re-nets it per iteration;
+                // our net twin is a running subtraction calibrated by
+                // #105795329's sibling spend-rate payment (1.001 issuer —
+                // rounding it moved the maker's line one ulp).
+                let net = if in_gross {
+                    match rate {
+                        Some(r) => ox::me_muldiv(sin, (1_000_000_000, 0), (r, 0), false),
+                        None => sin,
+                    }
+                } else {
+                    sin
                 };
-                rem_in_gross = ox::me_sub(rem_in_gross, gross);
+                rem_in = ox::me_sub(rem_in, net);
             }
-            if out_net {
-                // sout is NET: the shared gross remainder falls by its
-                // gross equivalent, and the delivery lands in the net pot.
-                let gross_out = match want_rate {
+            let out_saved = if out_net {
+                // sout is NET: the shared gross pot counts its gross
+                // equivalent, and the delivery lands in the net pot.
+                match want_rate {
                     Some(r) => ox::me_muldiv(sout, (r as u128, 0), (1_000_000_000, 0), true),
                     None => sout,
-                };
-                rem_out = ox::me_sub(rem_out, gross_out);
+                }
+            } else {
+                sout
+            };
+            saved_outs.push(out_saved);
+            rem_out = strand_rem(want_gross, &mut saved_outs);
+            if out_net {
                 delivered_direct = ox::signed_add(false, delivered_direct, false, sout).1;
             } else {
-                rem_out = ox::me_sub(rem_out, sout);
                 delivered = ox::signed_add(false, delivered, false, sout).1;
             }
             // Spend is unmeasurable when the sender ISSUES the currency it is
@@ -2470,15 +2530,29 @@ impl PaymentTransactor {
         // in NET terms — only the LINE top-up was the double.
         let delivered = match want_rate {
             Some(rate) if !ox::me_is_zero(delivered) => {
-                // rippled DirectStep.cpp:646 — the destination receives
-                // out/rate via mulRatio(…, roundUp = false), whose real
-                // rounding is half-even NEAREST (no bump on round-down for
-                // a positive amount; IOUAmount.cpp:182). The exact floor
-                // sat one ulp low whenever the dropped fraction was above
-                // one half: #106455062 AF6A3460 (full-ledger replay) —
+                // rippled's fwd DirectStep never round-trips gross→net: it
+                // REUSES the rev cache (DirectStep.cpp:492 — the same cache
+                // the debt-direction fix drinks from), so when fwd hands the
+                // step exactly the in the rev sized, the destination is
+                // credited the rev's srcToDst — the NET target — verbatim.
+                // #106455063 69530872: Amount 2.212844833396933 × 1.002 =
+                // …726866 → mulRatio-up …728 (rippled's own rev in, shim
+                // STEPREV receipt); dividing …728 back lands …934, one ulp
+                // over the Amount, and the dest line read …063 for mainnet's
+                // …062. Full delivery of the sized gross = the cache hit.
+                //
+                // A PARTIAL delivery misses the cache and rippled recomputes
+                // out/rate via mulRatio(…, roundUp = false) — half-even
+                // NEAREST, no bump (IOUAmount.cpp:182). The exact floor sat
+                // one ulp low whenever the dropped fraction was above one
+                // half: #106455062 AF6A3460 (full-ledger replay) —
                 // 4369.93132409 SOLO gross over the 1.0001 issuer must
                 // deliver …652540, floor said …652539.
-                let net = ox::mul_ratio(delivered, 1_000_000_000, rate as u128, false);
+                let net = if ox::me_cmp(delivered, want_gross) == std::cmp::Ordering::Equal {
+                    want_target
+                } else {
+                    ox::mul_ratio(delivered, 1_000_000_000, rate as u128, false)
+                };
                 ox::line_adjust(sandbox, dest, &want_leg, ox::me_sub(delivered, net), false);
                 net
             }

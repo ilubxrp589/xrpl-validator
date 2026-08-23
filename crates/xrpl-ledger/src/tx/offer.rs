@@ -802,6 +802,23 @@ pub(crate) fn line_adjust(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, am
         let _ = (hneg, h);
         let (pneg, pmag) = if party_low { (lneg, lbal) } else { (!lneg, lbal) };
         let (nneg, nmag) = stamount_signed_add(pneg && pmag.0 > 0, pmag, !receiving, amt);
+        // DX_LINEADJ=<key prefix|1>: print every balance adjustment landing on
+        // a matching RippleState — the credit-granularity receipt for the
+        // 1-ulp census class (each flush is one half-even 16-digit add, so the
+        // SEQUENCE of flushes decides the final ulp, invisible in any total).
+        if let Ok(want) = std::env::var("DX_LINEADJ") {
+            let kh = hex::encode_upper(lkey.0);
+            if want == "1" || kh.starts_with(&want) {
+                eprintln!(
+                    "DX_LINEADJ {kh} party={} recv={receiving} amt={amt:?} prev={}{:?} new={}{:?}",
+                    hex::encode(party),
+                    if pneg && pmag.0 > 0 { "-" } else { "+" },
+                    pmag,
+                    if nneg && nmag.0 > 0 { "-" } else { "+" },
+                    nmag,
+                );
+            }
+        }
         let (wneg, wmag) = if party_low { (nneg, nmag) } else { (!nneg, nmag) };
         let sign = if wneg && wmag.0 > 0 { "-" } else { "" };
         let moved = (wneg && wmag.0 > 0) != (lneg && lbal.0 > 0)
