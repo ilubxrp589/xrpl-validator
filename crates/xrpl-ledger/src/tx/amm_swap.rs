@@ -984,6 +984,10 @@ pub(crate) fn consume_fib(
     // See `settle_slice`: Some ⇒ the beneficiary is the strand destination
     // of a rate-bearing want leg and receives NET per the rev-cache rule.
     benef_net: Option<(u64, Me, Me)>,
+    // Remaining GROSS in-cap (the walk's `gets_gross_cap` minus what it has
+    // already debited): a slice that exhausts rem_gets debits this VERBATIM
+    // — rippled's in-limited gross-primary rule (#106455039 A08513AF).
+    in_gross_cap: Option<Me>,
     rem_pays: Me,
     rem_gets: Me,
     pays_leg: &Leg,
@@ -1055,7 +1059,12 @@ pub(crate) fn consume_fib(
         pays_leg,
         gets_leg,
         take_in,
-        ox::gross_in(in_gross_rate, take_in),
+        match in_gross_cap {
+            // The slice that exhausts the walk's net avail is gross-primary:
+            // the remaining cap verbatim (see the param note).
+            Some(cap) if n_cmp(take_in, rem_gets) != Ordering::Less => cap,
+            _ => ox::gross_in(in_gross_rate, take_in),
+        },
         take_out,
         benef_net,
     );
@@ -1408,6 +1417,10 @@ pub(crate) fn consume(
     // See `settle_slice`: Some ⇒ the beneficiary is the strand destination
     // of a rate-bearing want leg and receives NET per the rev-cache rule.
     benef_net: Option<(u64, Me, Me)>,
+    // Remaining GROSS in-cap (the walk's `gets_gross_cap` minus what it has
+    // already debited): a slice that exhausts rem_gets debits this VERBATIM
+    // — rippled's in-limited gross-primary rule (#106455039 A08513AF).
+    in_gross_cap: Option<Me>,
     rem_pays: Me,
     rem_gets: Me,
     pays_leg: &Leg,
@@ -1602,7 +1615,12 @@ pub(crate) fn consume(
         pays_leg,
         gets_leg,
         take_in,
-        ox::gross_in(in_gross_rate, take_in),
+        match in_gross_cap {
+            // The slice that exhausts the walk's net avail is gross-primary:
+            // the remaining cap verbatim (see the param note).
+            Some(cap) if n_cmp(take_in, rem_gets) != Ordering::Less => cap,
+            _ => ox::gross_in(in_gross_rate, take_in),
+        },
         take_out,
         benef_net,
     );

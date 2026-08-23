@@ -1074,7 +1074,15 @@ pub(crate) fn mul_ratio(a: Me, num: u128, den: u128, round_up: bool) -> Me {
 /// gross-primary funding, one campaign, not piecemeal.
 pub(crate) fn gross_in(fee_rate: Option<u64>, net: Me) -> Me {
     match fee_rate {
-        Some(r) => me_muldiv(net, (r as u128, 0), (1_000_000_000, 0), true),
+        // rippled mulRatio (BookStep.cpp:770 stpIn = mulRatio(ofrIn, trIn,
+        // QUALITY_ONE, roundUp=true)) — nearest-16 + bump on a pre-normalize
+        // remainder, NOT exact ceil. #106455107 7844199C pins it: net
+        // 0.01536809504818859 × 1.003 = …315|577 → nearest …316 → bump …317
+        // (the mainnet spend-line debit); the ceil said …316 and left the
+        // dust remainder one ulp high. The funding-bound drains that the
+        // ceil's floor-sizing identity used to protect are covered by the
+        // spend-side gross-primary rule in the walk (gets_gross).
+        Some(r) => mul_ratio(net, r as u128, 1_000_000_000, true),
         None => net,
     }
 }
@@ -2532,7 +2540,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                     );
                 }
                 crate::tx::amm_swap::consume(
-                    sandbox, a, taker, beneficiary, None, rem_pays, rem_gets, pays_leg, gets_leg,
+                    sandbox, a, taker, beneficiary, None, None, rem_pays, rem_gets, pays_leg, gets_leg,
                     threshold, sell, anchor_clob, None, limit_anchor,
                 )
             } else {
@@ -2546,7 +2554,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                     eprintln!("DX_AMM site=bridged best_book={best_book:?}");
                 }
                 crate::tx::amm_swap::consume_fib(
-                    sandbox, a, taker, beneficiary, None, rem_pays, rem_gets, pays_leg, gets_leg,
+                    sandbox, a, taker, beneficiary, None, None, rem_pays, rem_gets, pays_leg, gets_leg,
                     threshold, sell, *init, amm_iters, best_book, None,
                 )
             };
@@ -3527,7 +3535,7 @@ pub(crate) fn cross_engine_to(
 ) -> (Me, Me, u32) {
     cross_engine_to_net(
         taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, threshold_self,
-        sell, offer_crossing, single_pass, amm_fib, domain, None, sandbox, stale,
+        sell, offer_crossing, single_pass, amm_fib, domain, None, None, sandbox, stale,
     )
 }
 
@@ -3562,10 +3570,21 @@ pub(crate) fn cross_engine_to_net(
     // Meaningful only for single_pass walks (one settlement per call — the
     // per-iteration shape); every other caller passes None via the wrapper.
     benef_net: Option<(u64, Me)>,
+    // The walk's GROSS in-cap (the sender-side line or SendMax bound, in
+    // gross units). rippled's in-limited fills are GROSS-PRIMARY — the offer
+    // that exhausts remainingIn takes stpIn = the remaining cap VERBATIM and
+    // derives the net by division (limitStepIn; the LIMITSTEPIN receipts) —
+    // so a balance-bound drain lands the spend line on exactly zero however
+    // mulRatio rounds the earlier fills. #106455039 A08513AF is the receipt:
+    // a full-balance GBP dump that mainnet drains to 0 and the per-fill
+    // mulRatio sum left at 1e-16. Some ⇒ the fill/slice that exhausts
+    // rem_gets debits cap − (gross already spent) instead of gross_in.
+    gets_gross_cap: Option<Me>,
     sandbox: &mut Sandbox,
     stale: &mut Vec<Hash256>,
 ) -> (Me, Me, u32) {
     let ask0 = rem_pays;
+    let mut in_gross_spent: Me = (0, 0);
     let mut crossed = 0u32;
     // rippled judges a flow ITERATION on the quality it ACTUALLY REALISED, not
     // on the filed rates of the offers it took, and a pass that misses
@@ -3851,9 +3870,20 @@ pub(crate) fn cross_engine_to_net(
             acc_level = None;
             let (rp, rg, used) = amm_turn(
                 amm_fib.as_deref_mut(), sandbox, a, taker, beneficiary,
-                benef_net.map(|(r, na)| (r, na, ask0)), rem_pays, rem_gets,
+                benef_net.map(|(r, na)| (r, na, ask0)),
+                gets_gross_cap.map(|c| me_sub(c, in_gross_spent)), rem_pays, rem_gets,
                 pays_leg, gets_leg, threshold, sell, Some(q), pay_in_rate,
             );
+            if used {
+                // Mirror of the slice settlement's own gross (settle_slice):
+                // exhausting rem_gets takes the remaining cap, else gross_in.
+                let slice_net = me_sub(rem_gets, rg);
+                let g = match gets_gross_cap {
+                    Some(cap) if me_is_zero(rg) => me_sub(cap, in_gross_spent),
+                    _ => gross_in(pay_in_rate, slice_net),
+                };
+                in_gross_spent = stamount_signed_add(false, in_gross_spent, false, g).1;
+            }
             rem_pays = rp;
             rem_gets = rg;
             crossed += used as u32;
@@ -4400,10 +4430,18 @@ pub(crate) fn cross_engine_to_net(
                         // Maker credited the NET per fill; the taker's GROSS
                         // debit accumulates (rippled grosses per offer —
                         // `stpAmt.in = mulRatio(ofrAmt.in, trIn, …)` — and
-                        // sums the grossed values).
+                        // sums the grossed values). The fill that EXHAUSTS the
+                        // walk's net avail is gross-primary: it takes the
+                        // remaining gross cap verbatim (see `gets_gross_cap`).
+                        let g = match gets_gross_cap {
+                            Some(cap) if !me_cmp(pay, rem_gets).is_lt() => {
+                                me_sub(cap, in_gross_spent)
+                            }
+                            _ => gross_in(r, pay),
+                        };
+                        in_gross_spent = stamount_signed_add(false, in_gross_spent, false, g).1;
                         line_adjust(sandbox, &maker, gets_leg, pay, true);
-                        taker_accs.1 =
-                            stamount_signed_add(false, taker_accs.1, false, gross_in(r, pay)).1;
+                        taker_accs.1 = stamount_signed_add(false, taker_accs.1, false, g).1;
                     }
                 }
                 rem_pays = me_sub(rem_pays, give);
@@ -4545,7 +4583,8 @@ pub(crate) fn cross_engine_to_net(
             acc_level = None;
             let (rp, rg, used) = amm_turn(
                 amm_fib.as_deref_mut(), sandbox, a, taker, beneficiary,
-                benef_net.map(|(r, na)| (r, na, ask0)), rem_pays, rem_gets,
+                benef_net.map(|(r, na)| (r, na, ask0)),
+                gets_gross_cap.map(|c| me_sub(c, in_gross_spent)), rem_pays, rem_gets,
                 pays_leg, gets_leg, threshold, sell,
                 // A remembered self-offer within the limit is still the tip
                 // rippled's tail pass anchors on (see self_anchor_q above);
@@ -4553,6 +4592,14 @@ pub(crate) fn cross_engine_to_net(
                 self_anchor_q.filter(|qs| *qs <= threshold),
                 pay_in_rate,
             );
+            if used {
+                let slice_net = me_sub(rem_gets, rg);
+                let g = match gets_gross_cap {
+                    Some(cap) if me_is_zero(rg) => me_sub(cap, in_gross_spent),
+                    _ => gross_in(pay_in_rate, slice_net),
+                };
+                in_gross_spent = stamount_signed_add(false, in_gross_spent, false, g).1;
+            }
             rem_pays = rp;
             rem_gets = rg;
             crossed += used as u32;
@@ -4636,6 +4683,9 @@ fn amm_turn(
     beneficiary: &[u8; 20],
     // See `settle_slice`: the strand-tail net-credit rule.
     benef_net: Option<(u64, Me, Me)>,
+    // Remaining GROSS in-cap (see `gets_gross_cap` on the walk): a slice
+    // that exhausts rem_gets debits this verbatim.
+    in_gross_cap: Option<Me>,
     rem_pays: Me,
     rem_gets: Me,
     pays_leg: &Leg,
@@ -4648,7 +4698,7 @@ fn amm_turn(
 ) -> (Me, Me, bool) {
     let Some(f) = fib else {
         return crate::tx::amm_swap::consume(
-            sandbox, a, taker, beneficiary, benef_net, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell, clob,
+            sandbox, a, taker, beneficiary, benef_net, in_gross_cap, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell, clob,
             in_gross_rate, false,
         );
     };
@@ -4661,7 +4711,7 @@ fn amm_turn(
         }
     };
     let r = crate::tx::amm_swap::consume_fib(
-        sandbox, a, taker, beneficiary, benef_net, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell,
+        sandbox, a, taker, beneficiary, benef_net, in_gross_cap, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell,
         init, f.iters, clob.map(rate_me), in_gross_rate,
     );
     if r.2 {

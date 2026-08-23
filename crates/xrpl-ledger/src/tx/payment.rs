@@ -1011,6 +1011,9 @@ impl PaymentTransactor {
         // beneficiary settlement credits the destination NET, per the fwd
         // rev-cache rule — see `benef_net` on `cross_engine_to_net`.
         want_net: Option<(u64, crate::tx::offer::Me)>,
+        // The round's remaining GROSS spend cap: hop 0's fill that exhausts
+        // the net avail debits it verbatim — see `gets_gross_cap`.
+        spend_gross: Option<crate::tx::offer::Me>,
         threshold: u64,
         single_pass: bool,
         mut amm_fib: Option<&mut crate::tx::offer::AmmFib>,
@@ -1177,6 +1180,7 @@ impl PaymentTransactor {
                 &tx.account, benef, want_cap, avail, chain[i + 1], chain[i],
                 hop_thr, hop_thr, false, false, single_pass, amm_fib.as_deref_mut(), None,
                 if last { want_net } else { None },
+                if i == 0 { spend_gross } else { None },
                 sandbox, &mut Vec::new(),
             );
             // Hop 0's input IS the spend leg — `hop_rate` is gated on `i > 0`,
@@ -2560,7 +2564,8 @@ impl PaymentTransactor {
                 let (sin, sout, in_gross, out_net) = if i < n_books {
                     let (a, b) = Self::strand_pass(
                         tx, dest, &strands[i], rem_in, ask_gross,
-                        want_rate.map(|r| (r, ask_net)), threshold, true,
+                        want_rate.map(|r| (r, ask_net)),
+                        spend_rate.map(|_| rem_in_gross), threshold, true,
                         multi_now.then(|| &mut try_fib), sandbox,
                     );
                     (a, b, false, false)
@@ -2667,7 +2672,17 @@ impl PaymentTransactor {
                 sin
             } else {
                 match rate {
-                    Some(r) => ox::me_muldiv(sin, (r, 0), (1_000_000_000, 0), true),
+                    Some(r) => {
+                        if ox::me_cmp(sin, rem_in) == std::cmp::Ordering::Equal {
+                            // The walk drained its whole net ask, so its
+                            // debits summed to the GROSS cap verbatim
+                            // (the gross-primary rule) — record that, not a
+                            // re-grossing of the net.
+                            rem_in_gross
+                        } else {
+                            ox::mul_ratio(sin, r, 1_000_000_000, true)
+                        }
+                    }
                     None => sin,
                 }
             };
