@@ -622,10 +622,11 @@ impl PaymentTransactor {
         const ONE: ox::Me = (1_000_000_000_000_000, -15);
         let mut acc: ox::Me = ONE;
         let mut first_book = true;
-        for seg in segs {
+        for (si, seg) in segs.iter().enumerate() {
             match seg {
                 ds::SegLayout::Run(hops) => {
-                    acc = ox::me_muldiv(acc, ds::run_upper_bound(sandbox, hops), ONE, false);
+                    let after_book = si > 0 && matches!(segs[si - 1], ds::SegLayout::Book { .. });
+                    acc = ox::me_muldiv(acc, ds::run_upper_bound(sandbox, hops, after_book), ONE, false);
                 }
                 ds::SegLayout::Book { from, to } => {
                     let tip = ox::hop_tip(sandbox, taker, from, to, amm_iters)?;
@@ -753,7 +754,11 @@ impl PaymentTransactor {
             out_target[i] = need;
             match &segs[i] {
                 ds::SegLayout::Run(hops) => {
-                    let Some((nin, plan)) = ds::run_rev(sandbox, hops, need) else {
+                    // A book before the run redeems into it (OwnerPaysFee is
+                    // dormant), so hop 0 charges its issuer's rate — see
+                    // `hop_qualities`. #106455079 B1017CAA.
+                    let after_book = i > 0 && matches!(segs[i - 1], ds::SegLayout::Book { .. });
+                    let Some((nin, plan)) = ds::run_rev(sandbox, hops, need, after_book) else {
                         return ((0, 0), (0, 0));
                     };
                     plans[i] = Some(plan);
@@ -780,7 +785,8 @@ impl PaymentTransactor {
             match &segs[i] {
                 ds::SegLayout::Run(hops) => {
                     let plan = plans[i].as_ref().expect("rev planned every run");
-                    let (spent, out) = ds::run_fwd(sandbox, hops, carry, plan);
+                    let after_book = i > 0 && matches!(segs[i - 1], ds::SegLayout::Book { .. });
+                    let (spent, out) = ds::run_fwd(sandbox, hops, carry, plan, after_book);
                     if ox::me_is_zero(out) {
                         restore(sandbox, &inflight);
                         return ((0, 0), (0, 0));

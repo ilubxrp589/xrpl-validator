@@ -234,17 +234,32 @@ pub(crate) fn build_direct_strand(
 /// (srcQOut, dstQIn). The transfer rate is charged exactly when the source
 /// ISSUES and the step before it REDEEMS — the traced 1.002 (rhub8) and
 /// 1.003 (rcEG) charges.
+///
+/// `prev_book` — a BOOK segment precedes this run (mixed strand). A book's
+/// debtDirection is Redeems whenever `ownerPaysTransferFee` is off
+/// (BookStep.cpp:146), and OwnerPaysFee is a dormant amendment, so on
+/// mainnet a book ALWAYS redeems into the run: hop 0's issuer charges its
+/// transfer rate exactly as if an interior redeeming hop stood before it.
+/// #106455079 B1017CAA is the specimen: XRP →(BTC/XRP pool)→ BTC.rvYA →
+/// rNyMZc → rchGBx; sizing hop 0 at parity buys the pool slice 1.0015 too
+/// small and under-spends the sender 19,262 drops. A book's lineQualityIn
+/// is the base Step's QUALITY_ONE (Steps.h:153).
 fn hop_qualities(
     sandbox: &Sandbox,
     hops: &[DirectHop],
     i: usize,
     is_last: bool,
+    prev_book: bool,
 ) -> (u128, u128) {
     let hop = &hops[i];
     if src_redeems(sandbox, hop) {
         // qualitiesSrcRedeems: no previous step ⇒ (1, 1); otherwise the
-        // larger of the previous hop's lineQualityIn and our own QualityOut.
+        // larger of the previous step's lineQualityIn and our own QualityOut.
         if i == 0 {
+            if prev_book {
+                let own_qout = line_quality(sandbox, hop, false);
+                return (own_qout.max(QUALITY_ONE), QUALITY_ONE);
+            }
             return (QUALITY_ONE, QUALITY_ONE);
         }
         let prev_qin = line_quality(sandbox, &hops[i - 1], true);
@@ -252,8 +267,9 @@ fn hop_qualities(
         (prev_qin.max(own_qout), QUALITY_ONE)
     } else {
         // qualitiesSrcIssues: a strand-head issuer charges nothing (prev
-        // defaults to Issues).
-        let prev_redeems = i > 0 && src_redeems(sandbox, &hops[i - 1]);
+        // defaults to Issues); a book before the run redeems (above).
+        let prev_redeems =
+            if i == 0 { prev_book } else { src_redeems(sandbox, &hops[i - 1]) };
         let src_q_out = if prev_redeems { transfer_rate_of(sandbox, &hop.src) } else { QUALITY_ONE };
         let mut dst_q_in = line_quality(sandbox, hop, true);
         if is_last && dst_q_in > QUALITY_ONE {
@@ -369,6 +385,7 @@ pub(crate) fn run_rev(
     sandbox: &Sandbox,
     hops: &[DirectHop],
     need_out: ox::Me,
+    prev_book: bool,
 ) -> Option<(ox::Me, Vec<ox::Me>)> {
     let n = hops.len();
     if n == 0 || ox::me_is_zero(need_out) {
@@ -377,7 +394,7 @@ pub(crate) fn run_rev(
     let mut plan = vec![(0u128, 0i32); n];
     let mut need = need_out;
     for i in (0..n).rev() {
-        let (src_q_out, dst_q_in) = hop_qualities(sandbox, hops, i, i + 1 == n);
+        let (src_q_out, dst_q_in) = hop_qualities(sandbox, hops, i, i + 1 == n, prev_book);
         let max = max_src_to_dst(sandbox, &hops[i]);
         if ox::me_is_zero(max) {
             return None; // dry — rippled: "DirectStepI::rev: dry"
@@ -400,6 +417,7 @@ pub(crate) fn run_fwd(
     hops: &[DirectHop],
     in_amt: ox::Me,
     plan: &[ox::Me],
+    prev_book: bool,
 ) -> (ox::Me, ox::Me) {
     let n = hops.len();
     if n == 0 || ox::me_is_zero(in_amt) {
@@ -408,7 +426,7 @@ pub(crate) fn run_fwd(
     let spent = in_amt;
     let mut carry = in_amt;
     for (i, hop) in hops.iter().enumerate() {
-        let (src_q_out, dst_q_in) = hop_qualities(sandbox, hops, i, i + 1 == n);
+        let (src_q_out, dst_q_in) = hop_qualities(sandbox, hops, i, i + 1 == n, prev_book);
         let mut src_to_dst = mul_ratio(carry, QUALITY_ONE, src_q_out, false);
         if ox::me_cmp(src_to_dst, plan[i]).is_gt() {
             src_to_dst = plan[i];
@@ -437,11 +455,11 @@ pub(crate) fn direct_strand_pass(
     if ox::me_is_zero(rem_in) || ox::me_is_zero(rem_out) {
         return ((0, 0), (0, 0));
     }
-    let Some((need, plan)) = run_rev(sandbox, hops, rem_out) else {
+    let Some((need, plan)) = run_rev(sandbox, hops, rem_out, false) else {
         return ((0, 0), (0, 0));
     };
     let head = if ox::me_cmp(need, rem_in).is_gt() { rem_in } else { need };
-    run_fwd(sandbox, hops, head, &plan)
+    run_fwd(sandbox, hops, head, &plan, false)
 }
 
 /// The strand's quality upper bound as an in-per-out rate (for the round
@@ -455,7 +473,7 @@ pub(crate) fn direct_upper_bound(sandbox: &Sandbox, hops: &[DirectHop]) -> Optio
     let one = (QUALITY_ONE, 0i32);
     let mut ub: ox::Me = (1, 0);
     for i in 0..n {
-        let (src_q_out, dst_q_in) = hop_qualities(sandbox, hops, i, i + 1 == n);
+        let (src_q_out, dst_q_in) = hop_qualities(sandbox, hops, i, i + 1 == n, false);
         ub = ox::me_muldiv(ub, (src_q_out, 0), (dst_q_in, 0), true);
     }
     let _ = one;
@@ -866,11 +884,11 @@ pub(crate) fn check_mixed_strand(sandbox: &Sandbox, segs: &[SegLayout]) -> bool 
 
 /// The quality bound contribution of one run (in-per-out, ≥ 1 with default
 /// lines): the product of every hop's srcQOut over dstQIn.
-pub(crate) fn run_upper_bound(sandbox: &Sandbox, hops: &[DirectHop]) -> ox::Me {
+pub(crate) fn run_upper_bound(sandbox: &Sandbox, hops: &[DirectHop], prev_book: bool) -> ox::Me {
     let n = hops.len();
     let mut ub: ox::Me = (1_000_000_000_000_000, -15);
     for i in 0..n {
-        let (src_q_out, dst_q_in) = hop_qualities(sandbox, hops, i, i + 1 == n);
+        let (src_q_out, dst_q_in) = hop_qualities(sandbox, hops, i, i + 1 == n, prev_book);
         ub = ox::me_muldiv(ub, (src_q_out, 0), (dst_q_in, 0), true);
     }
     ub
