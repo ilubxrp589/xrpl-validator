@@ -4673,16 +4673,26 @@ impl Transactor for OfferCreateTransactor {
         let ioc = flags & 0x0002_0000 != 0;
         let fok = flags & 0x0004_0000 != 0;
 
+        // The kill-path snapshot is taken BEFORE the cancel-and-replace: the
+        // cancellation is transactional state like any other, and a tec
+        // discards it. #106455085 6BCE59E0/32206C22 (full-ledger replay,
+        // ticketed IoCs with OfferSequence): both tecKILLED, and mainnet's
+        // meta keeps the old offers (105193242/105193222) alive — only the
+        // walk's stale-offer reap survives a kill (OfferCreate.cpp:460), not
+        // the cancel. With the snapshot after the cancel, the Killed arm's
+        // restore preserved the deletion and we reaped two resting offers,
+        // their book pages, and the maker's OwnerCount.
+        let snap = sandbox.snapshot();
+
         // Cancel-and-replace: an OfferSequence names a prior offer to cancel
-        // before crossing/placing (rippled does this first, unconditionally).
+        // before crossing/placing (rippled does this first, unconditionally —
+        // but inside the region a tec rolls back, see above).
         if let Some(old_seq) = tx.fields.get("OfferSequence").and_then(|v| v.as_u64()) {
             let old_key = keylet::offer_key(&tx.account, old_seq as u32);
             if let Some(old) = json_at(sandbox, &old_key) {
                 delete_maker_offer(sandbox, &old_key, &old, &tx.account);
             }
         }
-
-        let snap = sandbox.snapshot();
 
         // Issuer tick size rounds the requested rate up to N significant
         // digits and re-derives the non-exact side — BEFORE crossing, so the

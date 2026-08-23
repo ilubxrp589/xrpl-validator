@@ -657,9 +657,18 @@ fn run() -> i32 {
                     if !w.is_empty() && hex::encode_upper(k.0).starts_with(&w.to_uppercase()) {
                         let bal = match &ent {
                             SandboxEntry::Created(b) | SandboxEntry::Modified(b) => {
-                                serde_json::from_slice::<Value>(b)
-                                    .ok()
-                                    .map(|v| v["Balance"].clone())
+                                serde_json::from_slice::<Value>(b).ok().map(|v| {
+                                    // Balance for lines/roots; the two amount
+                                    // sides for offers.
+                                    if v["Balance"].is_null() {
+                                        serde_json::json!({
+                                            "TakerGets": v["TakerGets"].clone(),
+                                            "TakerPays": v["TakerPays"].clone(),
+                                        })
+                                    } else {
+                                        v["Balance"].clone()
+                                    }
+                                })
                             }
                             SandboxEntry::Deleted => None,
                         };
