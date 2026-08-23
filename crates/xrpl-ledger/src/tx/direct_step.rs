@@ -135,6 +135,19 @@ fn src_redeems(sandbox: &Sandbox, hop: &DirectHop) -> bool {
              Some((false, m)) if m.0 > 0)
 }
 
+/// Each hop's debt direction, read ONCE from the current (pre-flow) state.
+/// rippled stamps `cache_->srcDebtDir` in the REV pass and `debtDirection`
+/// RETURNS THE CACHE in the forward direction (DirectStep.cpp:492-499) —
+/// so a fwd hop's fee decision sees the balances as they stood BEFORE the
+/// pass moved anything. Re-probing live state instead loses the fee
+/// exactly when a hop drains its line: #106455081 D2A4F725 spends its
+/// whole 3.56084675020209e-6 BTC.rvYA holding at hop 0, the live re-probe
+/// then reads hop 0 as Issues, and hop 1's 1.0015 redeem-charge vanishes
+/// (delivered 193862 drops where mainnet nets 193574).
+fn hop_dirs(sandbox: &Sandbox, hops: &[DirectHop]) -> Vec<bool> {
+    hops.iter().map(|h| src_redeems(sandbox, h)).collect()
+}
+
 /// maxSrcToDst (DirectStep.cpp:476-490): what src can still push to dst.
 /// Redeeming ⇒ the holding itself; issuing ⇒ dst's limit minus what dst
 /// already holds.
@@ -247,12 +260,13 @@ pub(crate) fn build_direct_strand(
 fn hop_qualities(
     sandbox: &Sandbox,
     hops: &[DirectHop],
+    dirs: &[bool],
     i: usize,
     is_last: bool,
     prev_book: bool,
 ) -> (u128, u128) {
     let hop = &hops[i];
-    if src_redeems(sandbox, hop) {
+    if dirs[i] {
         // qualitiesSrcRedeems: no previous step ⇒ (1, 1); otherwise the
         // larger of the previous step's lineQualityIn and our own QualityOut.
         if i == 0 {
@@ -268,8 +282,7 @@ fn hop_qualities(
     } else {
         // qualitiesSrcIssues: a strand-head issuer charges nothing (prev
         // defaults to Issues); a book before the run redeems (above).
-        let prev_redeems =
-            if i == 0 { prev_book } else { src_redeems(sandbox, &hops[i - 1]) };
+        let prev_redeems = if i == 0 { prev_book } else { dirs[i - 1] };
         let src_q_out = if prev_redeems { transfer_rate_of(sandbox, &hop.src) } else { QUALITY_ONE };
         let mut dst_q_in = line_quality(sandbox, hop, true);
         if is_last && dst_q_in > QUALITY_ONE {
@@ -386,15 +399,19 @@ pub(crate) fn run_rev(
     hops: &[DirectHop],
     need_out: ox::Me,
     prev_book: bool,
-) -> Option<(ox::Me, Vec<ox::Me>)> {
+) -> Option<(ox::Me, Vec<ox::Me>, Vec<bool>)> {
     let n = hops.len();
     if n == 0 || ox::me_is_zero(need_out) {
         return None;
     }
+    // Debt directions stamped ONCE at rev time (see `hop_dirs`); the fwd
+    // pass reuses them exactly as rippled's fwd `debtDirection` returns the
+    // rev-stamped cache.
+    let dirs = hop_dirs(sandbox, hops);
     let mut plan = vec![(0u128, 0i32); n];
     let mut need = need_out;
     for i in (0..n).rev() {
-        let (src_q_out, dst_q_in) = hop_qualities(sandbox, hops, i, i + 1 == n, prev_book);
+        let (src_q_out, dst_q_in) = hop_qualities(sandbox, hops, &dirs, i, i + 1 == n, prev_book);
         let max = max_src_to_dst(sandbox, &hops[i]);
         if ox::me_is_zero(max) {
             return None; // dry — rippled: "DirectStepI::rev: dry"
@@ -406,7 +423,7 @@ pub(crate) fn run_rev(
         plan[i] = src_to_dst;
         need = mul_ratio(src_to_dst, src_q_out, QUALITY_ONE, true);
     }
-    Some((need, plan))
+    Some((need, plan, dirs))
 }
 
 /// Forward pass with writes: flow `in_amt` left-to-right, capped by the
@@ -417,6 +434,7 @@ pub(crate) fn run_fwd(
     hops: &[DirectHop],
     in_amt: ox::Me,
     plan: &[ox::Me],
+    dirs: &[bool],
     prev_book: bool,
 ) -> (ox::Me, ox::Me) {
     let n = hops.len();
@@ -426,7 +444,7 @@ pub(crate) fn run_fwd(
     let spent = in_amt;
     let mut carry = in_amt;
     for (i, hop) in hops.iter().enumerate() {
-        let (src_q_out, dst_q_in) = hop_qualities(sandbox, hops, i, i + 1 == n, prev_book);
+        let (src_q_out, dst_q_in) = hop_qualities(sandbox, hops, dirs, i, i + 1 == n, prev_book);
         let mut src_to_dst = mul_ratio(carry, QUALITY_ONE, src_q_out, false);
         if ox::me_cmp(src_to_dst, plan[i]).is_gt() {
             src_to_dst = plan[i];
@@ -455,11 +473,11 @@ pub(crate) fn direct_strand_pass(
     if ox::me_is_zero(rem_in) || ox::me_is_zero(rem_out) {
         return ((0, 0), (0, 0));
     }
-    let Some((need, plan)) = run_rev(sandbox, hops, rem_out, false) else {
+    let Some((need, plan, dirs)) = run_rev(sandbox, hops, rem_out, false) else {
         return ((0, 0), (0, 0));
     };
     let head = if ox::me_cmp(need, rem_in).is_gt() { rem_in } else { need };
-    run_fwd(sandbox, hops, head, &plan, false)
+    run_fwd(sandbox, hops, head, &plan, &dirs, false)
 }
 
 /// The strand's quality upper bound as an in-per-out rate (for the round
@@ -472,8 +490,9 @@ pub(crate) fn direct_upper_bound(sandbox: &Sandbox, hops: &[DirectHop]) -> Optio
     }
     let one = (QUALITY_ONE, 0i32);
     let mut ub: ox::Me = (1, 0);
+    let dirs = hop_dirs(sandbox, hops);
     for i in 0..n {
-        let (src_q_out, dst_q_in) = hop_qualities(sandbox, hops, i, i + 1 == n, false);
+        let (src_q_out, dst_q_in) = hop_qualities(sandbox, hops, &dirs, i, i + 1 == n, false);
         ub = ox::me_muldiv(ub, (src_q_out, 0), (dst_q_in, 0), true);
     }
     let _ = one;
@@ -887,8 +906,9 @@ pub(crate) fn check_mixed_strand(sandbox: &Sandbox, segs: &[SegLayout]) -> bool 
 pub(crate) fn run_upper_bound(sandbox: &Sandbox, hops: &[DirectHop], prev_book: bool) -> ox::Me {
     let n = hops.len();
     let mut ub: ox::Me = (1_000_000_000_000_000, -15);
+    let dirs = hop_dirs(sandbox, hops);
     for i in 0..n {
-        let (src_q_out, dst_q_in) = hop_qualities(sandbox, hops, i, i + 1 == n, prev_book);
+        let (src_q_out, dst_q_in) = hop_qualities(sandbox, hops, &dirs, i, i + 1 == n, prev_book);
         ub = ox::me_muldiv(ub, (src_q_out, 0), (dst_q_in, 0), true);
     }
     ub

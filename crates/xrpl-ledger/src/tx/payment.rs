@@ -748,7 +748,7 @@ impl PaymentTransactor {
         // to emit rem_out. Books via the calibrated ladder (reads only —
         // measure_hop snapshots), runs via run_rev (reads only).
         let mut out_target = vec![(0u128, 0i32); n];
-        let mut plans: Vec<Option<Vec<ox::Me>>> = vec![None; n];
+        let mut plans: Vec<Option<(Vec<ox::Me>, Vec<bool>)>> = vec![None; n];
         let mut need = rem_out;
         for i in (0..n).rev() {
             out_target[i] = need;
@@ -758,10 +758,11 @@ impl PaymentTransactor {
                     // dormant), so hop 0 charges its issuer's rate — see
                     // `hop_qualities`. #106455079 B1017CAA.
                     let after_book = i > 0 && matches!(segs[i - 1], ds::SegLayout::Book { .. });
-                    let Some((nin, plan)) = ds::run_rev(sandbox, hops, need, after_book) else {
+                    let Some((nin, plan, dirs)) = ds::run_rev(sandbox, hops, need, after_book)
+                    else {
                         return ((0, 0), (0, 0));
                     };
-                    plans[i] = Some(plan);
+                    plans[i] = Some((plan, dirs));
                     need = nin;
                 }
                 ds::SegLayout::Book { from, to } => {
@@ -780,13 +781,19 @@ impl PaymentTransactor {
         let mut carry = if ox::me_cmp(need, rem_in).is_gt() { rem_in } else { need };
         let mut sin: ox::Me = (0, 0);
         let mut sout: ox::Me = (0, 0);
+        if std::env::var("DX_MIX").is_ok() {
+            eprintln!("DX_MIX fwd start carry={carry:?} need={need:?} rem_in={rem_in:?} rem_out={rem_out:?}");
+        }
         for i in 0..n {
             let last = i + 1 == n;
+            if std::env::var("DX_MIX").is_ok() {
+                eprintln!("DX_MIX seg={i} carry={carry:?}");
+            }
             match &segs[i] {
                 ds::SegLayout::Run(hops) => {
-                    let plan = plans[i].as_ref().expect("rev planned every run");
+                    let (plan, dirs) = plans[i].as_ref().expect("rev planned every run");
                     let after_book = i > 0 && matches!(segs[i - 1], ds::SegLayout::Book { .. });
-                    let (spent, out) = ds::run_fwd(sandbox, hops, carry, plan, after_book);
+                    let (spent, out) = ds::run_fwd(sandbox, hops, carry, plan, dirs, after_book);
                     if ox::me_is_zero(out) {
                         restore(sandbox, &inflight);
                         return ((0, 0), (0, 0));
