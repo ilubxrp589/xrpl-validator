@@ -1550,6 +1550,25 @@ pub(crate) fn hop_tip(
     }
 }
 
+/// The hop's candidates SPLIT: the live CLOB tip rate and the AMM with its
+/// current frozen-aware pool balances — the raw inputs `limitOut`'s quality
+/// function needs (`hop_tip` folds them into one rate; the QF cannot use
+/// that fold because only the AMM contributes a non-constant term).
+pub(crate) fn hop_tip_parts(
+    sandbox: &Sandbox,
+    taker: &[u8; 20],
+    in_leg: &Leg,
+    out_leg: &Leg,
+) -> (Option<Me>, Option<(crate::tx::amm_swap::Amm, Me, Me)>) {
+    let base = keylet::book_base(&in_leg.cur, &out_leg.cur, &in_leg.issuer, &out_leg.issuer);
+    let lob = book_offer_ladder(sandbox, &base, 1).first().map(|(q, _)| rate_me(*q));
+    let amm = crate::tx::amm_swap::discover(sandbox, in_leg, out_leg, taker).map(|a| {
+        let (pin, pout) = crate::tx::amm_swap::pool_balances(sandbox, &a, out_leg, in_leg);
+        (a, pin, pout)
+    });
+    (lob, amm)
+}
+
 /// Decode a u64-encoded rate into (mantissa, exponent).
 pub(crate) fn rate_me(q: u64) -> Me {
     ((q & 0x00FF_FFFF_FFFF_FFFF) as u128, ((q >> 56) as i32) - 100)
@@ -2513,7 +2532,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                     );
                 }
                 crate::tx::amm_swap::consume(
-                    sandbox, a, taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg,
+                    sandbox, a, taker, beneficiary, None, rem_pays, rem_gets, pays_leg, gets_leg,
                     threshold, sell, anchor_clob, None, limit_anchor,
                 )
             } else {
@@ -2527,7 +2546,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                     eprintln!("DX_AMM site=bridged best_book={best_book:?}");
                 }
                 crate::tx::amm_swap::consume_fib(
-                    sandbox, a, taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg,
+                    sandbox, a, taker, beneficiary, None, rem_pays, rem_gets, pays_leg, gets_leg,
                     threshold, sell, *init, amm_iters, best_book, None,
                 )
             };
@@ -3488,7 +3507,31 @@ had_fill={} n={} keys={:?}",
 /// The one case this does not model is a payment carrying two or more
 /// explicit Paths, which rippled would treat as multi-path; we walk only the
 /// first path, so such a payment stays on the single-strand generator.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cross_engine_to(
+    taker: &[u8; 20],
+    beneficiary: &[u8; 20],
+    rem_pays: Me,
+    rem_gets: Me,
+    pays_leg: &Leg,
+    gets_leg: &Leg,
+    threshold: u64,
+    threshold_self: u64,
+    sell: bool,
+    offer_crossing: bool,
+    single_pass: bool,
+    amm_fib: Option<&mut AmmFib>,
+    domain: Option<&Hash256>,
+    sandbox: &mut Sandbox,
+    stale: &mut Vec<Hash256>,
+) -> (Me, Me, u32) {
+    cross_engine_to_net(
+        taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, threshold_self,
+        sell, offer_crossing, single_pass, amm_fib, domain, None, sandbox, stale,
+    )
+}
+
+pub(crate) fn cross_engine_to_net(
     taker: &[u8; 20],
     beneficiary: &[u8; 20],
     mut rem_pays: Me,
@@ -3510,9 +3553,19 @@ pub(crate) fn cross_engine_to(
     // Flow-wide AMM fib state; Some only for a multi-strand payment.
     mut amm_fib: Option<&mut AmmFib>,
     domain: Option<&Hash256>,
+    // The strand's WANT-side issuer rate and the NET the rev pass sized this
+    // walk for. rippled's fwd DirectStep credits the destination the rev
+    // cache's srcToDst — NET, once per iteration — and only a partial fill
+    // recomputes out/rate (DirectStep.cpp:492 cache; :646 mulRatio nearest).
+    // Some ⇒ the beneficiary settlement converts: full delivery of the ask =
+    // the cache hit, credited `net_ask` verbatim; anything less divides.
+    // Meaningful only for single_pass walks (one settlement per call — the
+    // per-iteration shape); every other caller passes None via the wrapper.
+    benef_net: Option<(u64, Me)>,
     sandbox: &mut Sandbox,
     stale: &mut Vec<Hash256>,
 ) -> (Me, Me, u32) {
+    let ask0 = rem_pays;
     let mut crossed = 0u32;
     // rippled judges a flow ITERATION on the quality it ACTUALLY REALISED, not
     // on the filed rates of the offers it took, and a pass that misses
@@ -3609,7 +3662,27 @@ pub(crate) fn cross_engine_to(
     macro_rules! settle_taker {
         () => {
             if !me_is_zero(taker_accs.0) {
-                line_adjust(sandbox, beneficiary, pays_leg, taker_accs.0, true);
+                if std::env::var("DX_SETTLE").is_ok() {
+                    eprintln!(
+                        "DX_SETTLE pot={:?} ask0={ask0:?} benef_net={benef_net:?} single={single_pass}",
+                        taker_accs.0
+                    );
+                }
+                // See `benef_net` at the signature: the destination of a
+                // rate-bearing want leg receives NET — the rev-sized net on a
+                // full delivery of the ask (the fwd cache hit), out/rate at
+                // mulRatio-nearest otherwise.
+                let credit = match benef_net {
+                    Some((rate, net_ask)) => {
+                        if me_cmp(taker_accs.0, ask0) == std::cmp::Ordering::Equal {
+                            net_ask
+                        } else {
+                            mul_ratio(taker_accs.0, 1_000_000_000, rate as u128, false)
+                        }
+                    }
+                    None => taker_accs.0,
+                };
+                line_adjust(sandbox, beneficiary, pays_leg, credit, true);
             }
             if !me_is_zero(taker_accs.1) {
                 line_adjust(sandbox, taker, gets_leg, taker_accs.1, false);
@@ -3777,7 +3850,8 @@ pub(crate) fn cross_engine_to(
             taker_accs = ((0, 0), (0, 0));
             acc_level = None;
             let (rp, rg, used) = amm_turn(
-                amm_fib.as_deref_mut(), sandbox, a, taker, beneficiary, rem_pays, rem_gets,
+                amm_fib.as_deref_mut(), sandbox, a, taker, beneficiary,
+                benef_net.map(|(r, na)| (r, na, ask0)), rem_pays, rem_gets,
                 pays_leg, gets_leg, threshold, sell, Some(q), pay_in_rate,
             );
             rem_pays = rp;
@@ -4470,7 +4544,8 @@ pub(crate) fn cross_engine_to(
             taker_accs = ((0, 0), (0, 0));
             acc_level = None;
             let (rp, rg, used) = amm_turn(
-                amm_fib.as_deref_mut(), sandbox, a, taker, beneficiary, rem_pays, rem_gets,
+                amm_fib.as_deref_mut(), sandbox, a, taker, beneficiary,
+                benef_net.map(|(r, na)| (r, na, ask0)), rem_pays, rem_gets,
                 pays_leg, gets_leg, threshold, sell,
                 // A remembered self-offer within the limit is still the tip
                 // rippled's tail pass anchors on (see self_anchor_q above);
@@ -4559,6 +4634,8 @@ fn amm_turn(
     a: &crate::tx::amm_swap::Amm,
     taker: &[u8; 20],
     beneficiary: &[u8; 20],
+    // See `settle_slice`: the strand-tail net-credit rule.
+    benef_net: Option<(u64, Me, Me)>,
     rem_pays: Me,
     rem_gets: Me,
     pays_leg: &Leg,
@@ -4571,7 +4648,7 @@ fn amm_turn(
 ) -> (Me, Me, bool) {
     let Some(f) = fib else {
         return crate::tx::amm_swap::consume(
-            sandbox, a, taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell, clob,
+            sandbox, a, taker, beneficiary, benef_net, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell, clob,
             in_gross_rate, false,
         );
     };
@@ -4584,7 +4661,7 @@ fn amm_turn(
         }
     };
     let r = crate::tx::amm_swap::consume_fib(
-        sandbox, a, taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell,
+        sandbox, a, taker, beneficiary, benef_net, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell,
         init, f.iters, clob.map(rate_me), in_gross_rate,
     );
     if r.2 {

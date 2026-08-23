@@ -89,7 +89,7 @@ fn n_cmp(a: Me, b: Me) -> Ordering {
     }
 }
 
-fn n_mul(a: Me, b: Me, rnd: Rnd) -> Me {
+pub(crate) fn n_mul(a: Me, b: Me, rnd: Rnd) -> Me {
     if a.0 == 0 || b.0 == 0 {
         return (0, 0);
     }
@@ -98,7 +98,7 @@ fn n_mul(a: Me, b: Me, rnd: Rnd) -> Me {
     round16(a.0 * b.0, a.1 + b.1, false, rnd)
 }
 
-fn n_div(a: Me, b: Me, rnd: Rnd) -> Me {
+pub(crate) fn n_div(a: Me, b: Me, rnd: Rnd) -> Me {
     if a.0 == 0 || b.0 == 0 {
         return (0, 0);
     }
@@ -126,7 +126,7 @@ fn n_div(a: Me, b: Me, rnd: Rnd) -> Me {
     round16(q, a.1 - b.1 - 17, false, rnd)
 }
 
-fn n_add(a: Me, b: Me, rnd: Rnd) -> Me {
+pub(crate) fn n_add(a: Me, b: Me, rnd: Rnd) -> Me {
     if a.0 == 0 {
         return n_norm(b);
     }
@@ -146,7 +146,7 @@ fn n_add(a: Me, b: Me, rnd: Rnd) -> Me {
 }
 
 /// a − b, clamped to zero when b ≥ a (callers treat zero as "nothing left").
-fn n_sub(a: Me, b: Me, rnd: Rnd) -> Me {
+pub(crate) fn n_sub(a: Me, b: Me, rnd: Rnd) -> Me {
     if b.0 == 0 {
         return n_norm(a);
     }
@@ -274,7 +274,7 @@ fn n_sqrt_rnd(x: Me, rnd: Rnd) -> Me {
 }
 
 /// tfee basis points → fee fraction (exact in decimal, mode-independent).
-fn fee_n(tfee: u16) -> Me {
+pub(crate) fn fee_n(tfee: u16) -> Me {
     if tfee == 0 {
         return (0, 0);
     }
@@ -981,6 +981,9 @@ pub(crate) fn consume_fib(
     amm: &Amm,
     taker: &[u8; 20],
     beneficiary: &[u8; 20],
+    // See `settle_slice`: Some ⇒ the beneficiary is the strand destination
+    // of a rate-bearing want leg and receives NET per the rev-cache rule.
+    benef_net: Option<(u64, Me, Me)>,
     rem_pays: Me,
     rem_gets: Me,
     pays_leg: &Leg,
@@ -1054,6 +1057,7 @@ pub(crate) fn consume_fib(
         take_in,
         ox::gross_in(in_gross_rate, take_in),
         take_out,
+        benef_net,
     );
     (
         ox::me_sub(rem_pays, take_out),
@@ -1346,9 +1350,27 @@ fn settle_slice(
     take_in: Me,
     take_in_gross: Me,
     take_out: Me,
+    // (want rate, rev-sized net ask, the walk's gross ask): a strand-tail
+    // slice credits the DESTINATION NET, per the fwd rev-cache rule — the
+    // pool still parts with the gross and the issuer destroys the
+    // difference (`move_leg_gross`, the same shape as the input fee). See
+    // `benef_net` on `cross_engine_to_net`; #106455063 69530872 and
+    // #106455100 0E7D8887 are the specimens — single-slice full deliveries
+    // whose destination lines carried the whole ×rate gross.
+    benef_net: Option<(u64, Me, Me)>,
 ) {
     ox::move_leg_gross(sandbox, taker, amm_account, gets_leg, take_in, take_in_gross);
-    ox::move_leg(sandbox, amm_account, beneficiary, pays_leg, take_out);
+    match benef_net {
+        Some((rate, net_ask, ask0)) => {
+            let net = if ox::me_cmp(take_out, ask0) == std::cmp::Ordering::Equal {
+                net_ask
+            } else {
+                ox::mul_ratio(take_out, 1_000_000_000, rate as u128, false)
+            };
+            ox::move_leg_gross(sandbox, amm_account, beneficiary, pays_leg, net, take_out);
+        }
+        None => ox::move_leg(sandbox, amm_account, beneficiary, pays_leg, take_out),
+    }
 }
 
 /// Move a slice through the pool: taker pays `take_in` of gets, receives
@@ -1383,6 +1405,9 @@ pub(crate) fn consume(
     amm: &Amm,
     taker: &[u8; 20],
     beneficiary: &[u8; 20],
+    // See `settle_slice`: Some ⇒ the beneficiary is the strand destination
+    // of a rate-bearing want leg and receives NET per the rev-cache rule.
+    benef_net: Option<(u64, Me, Me)>,
     rem_pays: Me,
     rem_gets: Me,
     pays_leg: &Leg,
@@ -1579,6 +1604,7 @@ pub(crate) fn consume(
         take_in,
         ox::gross_in(in_gross_rate, take_in),
         take_out,
+        benef_net,
     );
     (
         ox::me_sub(rem_pays, take_out),

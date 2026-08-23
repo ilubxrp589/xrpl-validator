@@ -337,6 +337,110 @@ impl PaymentTransactor {
         Some(acc)
     }
 
+    /// The strand's composed average-quality function — rippled's
+    /// `QualityFunction` (QualityFunction.cpp): q(out) = b − m·out, with `m`
+    /// kept here as a POSITIVE magnitude (rippled stores it negative).
+    /// CLOB-like steps are constant (b = 1/rate); a single-path AMM tip
+    /// contributes the pool curve from its CURRENT frozen-aware balances and
+    /// the taker's effective fee (the AMMTag ctor: m = cfee/pool.in,
+    /// b = pool.out·cfee/pool.in). `fold` is rippled's combine —
+    /// `m += b·m'; b *= b'` — one half-even Number op each. The gateway trIn
+    /// consts and the tail issuer rate sit exactly where the steps put them
+    /// (BookPaymentStep::adjustQualityWithFees composes trIn when the prev
+    /// step redeems; the last DirectStep's srcQOut is the want_rate). The
+    /// AMM-vs-CLOB tip pick mirrors TRYAMM: fee-adjusted spot at-or-better
+    /// than the tip, or the fixAMMv1_1 branch where the LIMIT beats the tip
+    /// (then the pool emits and the tip never executes). None = a hop with
+    /// no liquidity at all — no trim; the pass will answer dry itself.
+    fn strand_quality_fn(
+        sandbox: &Sandbox,
+        taker: &[u8; 20],
+        chain: &[&crate::tx::offer::Leg],
+        want_rate: Option<u64>,
+        thr: crate::tx::offer::Me,
+    ) -> Option<(crate::tx::offer::Me, crate::tx::offer::Me)> {
+        use crate::tx::amm_swap as am;
+        use crate::tx::offer as ox;
+        const ONE: ox::Me = (1_000_000_000_000_000, -15);
+        fn fold(m: &mut ox::Me, b: &mut ox::Me, qm: ox::Me, qb: ox::Me) {
+            if !ox::me_is_zero(qm) {
+                *m = am::n_add(*m, am::n_mul(*b, qm, am::Rnd::Near), am::Rnd::Near);
+            }
+            *b = am::n_mul(*b, qb, am::Rnd::Near);
+        }
+        let mut m: ox::Me = (0, 0);
+        let mut b: ox::Me = ONE;
+        for (i, w) in chain.windows(2).enumerate() {
+            if i > 0 && !w[0].xrp && taker != &w[0].issuer {
+                if let Some(r) = Self::transfer_rate(sandbox, w[0]) {
+                    fold(&mut m, &mut b, (0, 0), am::n_div(ONE, (r as u128, -9), am::Rnd::Near));
+                }
+            }
+            let (lob, amm) = ox::hop_tip_parts(sandbox, taker, w[0], w[1]);
+            let mut took_amm = false;
+            if let Some((a, pin, pout)) = amm {
+                if !ox::me_is_zero(pin) && !ox::me_is_zero(pout) {
+                    let cfee = am::n_sub(ONE, am::fee_n(a.tfee), am::Rnd::Near);
+                    let use_amm = match lob {
+                        None => true,
+                        Some(t) => {
+                            let sp = am::n_div(
+                                am::n_div(pin, pout, am::Rnd::Near),
+                                cfee,
+                                am::Rnd::Near,
+                            );
+                            ox::me_cmp(sp, t).is_le() || ox::me_cmp(thr, t).is_lt()
+                        }
+                    };
+                    if use_amm {
+                        let qm = am::n_div(cfee, pin, am::Rnd::Near);
+                        let qb =
+                            am::n_div(am::n_mul(pout, cfee, am::Rnd::Near), pin, am::Rnd::Near);
+                        fold(&mut m, &mut b, qm, qb);
+                        took_amm = true;
+                    }
+                }
+            }
+            if !took_amm {
+                match lob {
+                    Some(t) => fold(&mut m, &mut b, (0, 0), am::n_div(ONE, t, am::Rnd::Near)),
+                    None => return None,
+                }
+            }
+        }
+        if let Some(r) = want_rate {
+            fold(&mut m, &mut b, (0, 0), am::n_div(ONE, (r as u128, -9), am::Rnd::Near));
+        }
+        Some((m, b))
+    }
+
+    /// rippled `limitOut` (StrandFlow.h:363-420): with ONE active strand and
+    /// tfLimitQuality, the iteration's ask becomes the out at which the
+    /// strand's AVERAGE quality equals the limit ("reducing the output
+    /// increases quality of AMM steps"). `outFromAvgQ` runs every op in
+    /// Number's Upward mode — with our positive-magnitude m that is
+    /// out = (b − 1/thr)/m, the inversion and the final division rounding
+    /// away from zero and the subtraction toward it (Upward on rippled's
+    /// negative intermediate). A constant strand (no AMM term) never trims.
+    fn strand_limit_out(
+        m: crate::tx::offer::Me,
+        b: crate::tx::offer::Me,
+        thr: crate::tx::offer::Me,
+    ) -> Option<crate::tx::offer::Me> {
+        use crate::tx::amm_swap as am;
+        use crate::tx::offer as ox;
+        const ONE: ox::Me = (1_000_000_000_000_000, -15);
+        if ox::me_is_zero(m) {
+            return None;
+        }
+        let invq = am::n_div(ONE, thr, am::Rnd::Up);
+        if ox::me_cmp(b, invq).is_le() {
+            return None;
+        }
+        let diff = am::n_sub(b, invq, am::Rnd::Down);
+        let out = am::n_div(diff, m, am::Rnd::Up);
+        (!ox::me_is_zero(out)).then_some(out)
+    }
 
     /// Reverse-size ONE book hop: the input `consumed` for a target `want`
     /// out, via the grant ladder + refine — extracted verbatim from
@@ -903,6 +1007,10 @@ impl PaymentTransactor {
         chain: &[&crate::tx::offer::Leg],
         avail_in: crate::tx::offer::Me,
         want_out: crate::tx::offer::Me,
+        // (want-issuer rate, NET this round was sized for): the last hop's
+        // beneficiary settlement credits the destination NET, per the fwd
+        // rev-cache rule — see `benef_net` on `cross_engine_to_net`.
+        want_net: Option<(u64, crate::tx::offer::Me)>,
         threshold: u64,
         single_pass: bool,
         mut amm_fib: Option<&mut crate::tx::offer::AmmFib>,
@@ -1065,9 +1173,10 @@ impl PaymentTransactor {
                 Some(r) => ox::me_muldiv(carry, (1_000_000_000, 0), (r as u128, 0), false),
                 None => carry,
             };
-            let (rw, rs, _c) = ox::cross_engine_to(
+            let (rw, rs, _c) = ox::cross_engine_to_net(
                 &tx.account, benef, want_cap, avail, chain[i + 1], chain[i],
                 hop_thr, hop_thr, false, false, single_pass, amm_fib.as_deref_mut(), None,
+                if last { want_net } else { None },
                 sandbox, &mut Vec::new(),
             );
             // Hop 0's input IS the spend leg — `hop_rate` is gated on `i > 0`,
@@ -2255,15 +2364,31 @@ impl PaymentTransactor {
         // exactly one key.
         let mut saved_ins: Vec<ox::Me> = Vec::new();
         let mut saved_outs: Vec<ox::Me> = Vec::new();
-        fn strand_rem(req: ox::Me, saved: &mut Vec<ox::Me>) -> ox::Me {
+        fn strand_sum(saved: &mut Vec<ox::Me>) -> ox::Me {
             saved.sort_by(|a, b| ox::me_cmp(*a, *b));
             let mut tot: ox::Me = (0, 0);
             for s in saved.iter() {
                 tot = ox::stamount_signed_add(false, tot, false, *s).1;
             }
+            tot
+        }
+        fn strand_rem(req: ox::Me, saved: &mut Vec<ox::Me>) -> ox::Me {
+            let tot = strand_sum(saved);
             let (neg, mag) = ox::stamount_signed_add(false, req, true, tot);
             if neg { (0, 0) } else { mag }
         }
+        // The NET mirror of rippled's driver units. Its savedOuts live in
+        // outReq units — NET of the want-issuer rate — whatever the strand
+        // kind, and remainingOut derives from them; our gross pot drives the
+        // sizing machinery, this twin drives the destination credits, the
+        // limitQuality judge, and the delivered figure. #106453302 BFC61DEF
+        // pins both faces at once: the destination line is the CHRONOLOGICAL
+        // chain of per-iteration net credits (…+n0+n1+n2 → …264) while
+        // DeliveredAmount is the SORTED-ascending fold of the same set
+        // (actualOut, StrandFlow.h:801 → …263).
+        let mut rem_out_net = want_target;
+        let mut saved_outs_net: Vec<ox::Me> = Vec::new();
+        let mut book_net: Vec<ox::Me> = Vec::new();
         // rippled's AMMContext, alive for the whole flow: `multiPath()` is
         // `activeStrands.size() > 1`, so a pool offers FIB SLICES rather than
         // `maxOffer` exactly when we run more than one strand, and the counter
@@ -2347,6 +2472,43 @@ impl PaymentTransactor {
             // The candidates that CLEAR the bound are the active strands, which
             // is what `setMultiPath(activeStrands.size() > 1)` reads.
             multi_now = order.len() > 1;
+            // rippled trims the round's ask when ONE strand is active and
+            // tfLimitQuality is set: `limitOut` solves the strand's composed
+            // quality function for the out at which the AVERAGE quality lands
+            // exactly on the limit (StrandFlow.h:676-686 "Limit only if one
+            // strand"). #106453302 BFC61DEF is the receipt: iter 2's ask is
+            // 0.000169…, not the raw 0.139… remainder — asking for the
+            // remainder made us take 402660 drops of a level rippled takes
+            // 296796 of, and then ACCEPT the 36188322-drop pass rippled
+            // rejects. The trimmed flag also gates the 1e-7 judge forgiveness
+            // below, exactly as `adjustedRemOut` does at StrandFlow.h:739-741.
+            let mut adjusted_ask = false;
+            let mut ask_gross = rem_out;
+            let mut ask_net = rem_out_net;
+            if let Some(t) = thr_me {
+                if order.len() == 1 && order[0] < n_books {
+                    if let Some((qm, qb)) = Self::strand_quality_fn(
+                        sandbox, &tx.account, &strands[order[0]], want_rate, t,
+                    ) {
+                        if let Some(lim_net) = Self::strand_limit_out(qm, qb, t) {
+                            let lim_gross = match want_rate {
+                                Some(r) => ox::mul_ratio(lim_net, r as u128, 1_000_000_000, true),
+                                None => lim_net,
+                            };
+                            if ox::me_cmp(lim_gross, rem_out).is_lt() {
+                                ask_gross = lim_gross;
+                                ask_net = lim_net;
+                                adjusted_ask = true;
+                                if std::env::var("DX_PAY").is_ok() {
+                                    eprintln!(
+                                        "DX_PAY   round={_round} limitOut trim ask={ask_gross:?} (net {lim_net:?}) m={qm:?} b={qb:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             let mut applied: Option<(usize, ox::Me, ox::Me, bool, bool)> = None;
             for &i in &order {
                 let try_snap = sandbox.snapshot();
@@ -2374,7 +2536,8 @@ impl PaymentTransactor {
                 };
                 let (sin, sout, in_gross, out_net) = if i < n_books {
                     let (a, b) = Self::strand_pass(
-                        tx, dest, &strands[i], rem_in, rem_out, threshold, true,
+                        tx, dest, &strands[i], rem_in, ask_gross,
+                        want_rate.map(|r| (r, ask_net)), threshold, true,
                         multi_now.then(|| &mut try_fib), sandbox,
                     );
                     (a, b, false, false)
@@ -2413,13 +2576,44 @@ impl PaymentTransactor {
                 // tried: rippled's "Path rejected by limitQuality" does
                 // `continue`, not `break` (StrandFlow.h:720).
                 if let Some(t) = thr_me {
-                    let q = ox::me_muldiv(sin, (1_000_000_000_000_000, -15), sout, false);
-                    if ox::me_cmp(q, t).is_gt() {
-                        if std::env::var("DX_PAY").is_ok() {
-                            eprintln!("DX_PAY   strand={i} REJECTED by limitQuality q={q:?} thr={t:?}");
+                    // rippled judges `Quality(f.out, f.in)` — the NET result
+                    // (its driver accounts NET; a book strand's sout here is
+                    // GROSS of want_rate, and dividing by the gross reads the
+                    // quality one fee too good: #106453302 BFC61DEF accepted
+                    // the 36188322-drop pass rippled rejects at 1756…>limit).
+                    // A miss is FORGIVEN inside 1e-7 relative ONLY when the
+                    // ask was limitOut-trimmed (`adjustedRemOut`,
+                    // StrandFlow.h:735-742) — the trim aims at the limit
+                    // exactly, so round-off may land a hair past it.
+                    let net_sout = match want_rate {
+                        Some(r) if !out_net => {
+                            if ox::me_cmp(sout, ask_gross) == std::cmp::Ordering::Equal {
+                                ask_net
+                            } else {
+                                ox::mul_ratio(sout, 1_000_000_000, r as u128, false)
+                            }
                         }
-                        sandbox.restore_snapshot(try_snap);
-                        continue;
+                        _ => sout,
+                    };
+                    let q = ox::me_muldiv(sin, (1_000_000_000_000_000, -15), net_sout, false);
+                    if ox::me_cmp(q, t).is_gt() {
+                        let forgiven = adjusted_ask && {
+                            let diff = ox::me_sub(q, t);
+                            ox::me_cmp(
+                                ox::me_muldiv(diff, (10_000_000, 0), (1, 0), false),
+                                t,
+                            )
+                            .is_lt()
+                        };
+                        if !forgiven {
+                            if std::env::var("DX_PAY").is_ok() {
+                                eprintln!(
+                                    "DX_PAY   strand={i} REJECTED by limitQuality q={q:?} thr={t:?}"
+                                );
+                            }
+                            sandbox.restore_snapshot(try_snap);
+                            continue;
+                        }
                     }
                 }
                 amm_fib = try_fib;
@@ -2487,8 +2681,33 @@ impl PaymentTransactor {
             };
             saved_outs.push(out_saved);
             rem_out = strand_rem(want_gross, &mut saved_outs);
+            // The net twin (see the declarations): the same cache rule the
+            // walk's beneficiary settlement applied decides the entry.
+            let net_r = if out_net {
+                sout
+            } else {
+                match want_rate {
+                    Some(r) => {
+                        if pick < n_books
+                            && ox::me_cmp(sout, ask_gross) == std::cmp::Ordering::Equal
+                        {
+                            ask_net
+                        } else {
+                            ox::mul_ratio(sout, 1_000_000_000, r as u128, false)
+                        }
+                    }
+                    None => sout,
+                }
+            };
+            saved_outs_net.push(net_r);
+            rem_out_net = strand_rem(want_target, &mut saved_outs_net);
             if out_net {
                 delivered_direct = ox::signed_add(false, delivered_direct, false, sout).1;
+            } else if want_rate.is_some() && pick < n_books {
+                // The walk already credited the destination `net_r` (the
+                // benef_net settlement); the tx-level figure folds SORTED
+                // post-loop — rippled's actualOut.
+                book_net.push(net_r);
             } else {
                 delivered = ox::signed_add(false, delivered, false, sout).1;
             }
@@ -2558,6 +2777,12 @@ impl PaymentTransactor {
             }
             _ => delivered,
         };
+        // Book rounds under a want rate already credited the destination NET
+        // per iteration; their tx-level total is the SORTED-ascending fold —
+        // rippled's actualOut (StrandFlow.h:801). #106453302: the fold gives
+        // DeliveredAmount …263 while the line's chronological chain reads
+        // …264 — both are mainnet's numbers, from the same set.
+        let delivered = ox::signed_add(false, delivered, false, strand_sum(&mut book_net)).1;
         // Direct-strand deliveries are already net — no trim, no division.
         let delivered = ox::signed_add(false, delivered, false, delivered_direct).1;
         if ox::me_is_zero(delivered) {
