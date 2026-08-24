@@ -2877,6 +2877,17 @@ impl PaymentTransactor {
         let delivered = ox::signed_add(false, delivered, false, strand_sum(&mut book_net)).1;
         // Direct-strand deliveries are already net — no trim, no division.
         let delivered = ox::signed_add(false, delivered, false, delivered_direct).1;
+        // …and the FINAL figure is rippled's actualOut VERBATIM: the sorted
+        // 16-digit fold over the whole savedOuts mirror, never an
+        // exact-width sum. #106455221 34F37CD0 (no-partial, two strands,
+        // four iterations): the exact chain lands 80.905362410300298 —
+        // 2e-15 short of the 80.9053624103003 Amount (round 2 an ulp low,
+        // round 3 the 16-digit remainder) — and the !partial judge read
+        // tecPATH_PARTIAL where mainnet's fold hits the Amount exactly and
+        // delivers. The pots above still feed the mixed trim; only the
+        // judged/delivered figure is the fold.
+        let _ = delivered;
+        let delivered = strand_sum(&mut saved_outs_net);
         if ox::me_is_zero(delivered) {
             sandbox.restore_snapshot(snap);
             // The DRIVER's ending (StrandFlow.h:800-840): a flow that moved
