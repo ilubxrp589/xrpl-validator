@@ -3928,6 +3928,108 @@ pub(crate) fn cross_engine_to_net(
             if residual_q.is_none() {
                 residual_q = Some(q);
             }
+            // OFFER CROSSING steps PAST the strict threshold. In the stream
+            // loop `limitSelfCrossQuality` runs BEFORE `checkQualityThreshold`
+            // (BookStep.cpp:729/770) and both gate on the TRUE limitQuality
+            // (`qualityThreshold_`, transfer-rate inflated) — so a level
+            // between the strict and inflated thresholds is still VISITED:
+            // dead offers are reaped by `step()` on the way and the taker's
+            // own offers are perm-removed — "Remove this offer even if no
+            // crossing occurs" (BookStep.cpp:441-443). The first LIVE foreign
+            // offer ends the walk: its fill would flunk the strand limit and
+            // the pass rejects, but a flow that RAN keeps its removals
+            // (StrandFlow.h:694).
+            //
+            // #106455225 8F42D06D: the taker's opposite-side offer from
+            // #106455221 rests ONE level beyond strict (dir rate +0.102%,
+            // inside the BTC issuer's TransferRate inflation); mainnet
+            // deletes offer + book page without trading and rests the new
+            // offer. Our strict page gate broke here and left both behind.
+            //
+            // ⚠ ONLY IF THE STRAND IS ADMITTED: a strand whose quality
+            // upper bound misses limitQuality is skipped before flow ever
+            // runs — no fills, NO REMOVALS (StrandFlow.h:682-690).
+            // #106455051 C925148B is the counter-specimen: same bot, same
+            // book, self offer at the TIP inside the same band — mainnet
+            // keeps offer and page, oracle: `admitted false / All strands
+            // dry`.
+            //
+            // The ub's composition is ASYMMETRIC (adjustQualityWithFees,
+            // BookStep.cpp:513-545): a CLOB tip enters RAW — "assume no
+            // fee is charged, or the estimate will no longer be an upper
+            // bound" — while a single-path AMM synthetic (made only when
+            // the fee-inclusive spot beats the tip, `AMMLiquidity::
+            // getOffer` else "higher clob quality") composes trIn. Both
+            // oracle receipts, three ledgers apart on the same book:
+            //   #225 8F42D06D: pool declines, ub = tip RAW 1.8709e-11
+            //     ≤ limit 1.87179e-11 → admitted, self offer removed;
+            //   #051 C925148B: synthetic 1.84732e-11 × 1.0015 =
+            //     1.85010e-11 > limit 1.84916e-11 → refused, kept.
+            // The raw-spot bound cannot decide #051 (spot×trIn passes,
+            // synthetic×trIn fails) — the tip-anchored synthetic itself
+            // is required, which is exactly `anchored_slice`.
+            if offer_crossing && threshold_self != 0
+                && threshold_self != u64::MAX && q <= threshold_self
+                && match amm.as_ref().and_then(|a| {
+                    crate::tx::amm_swap::anchored_slice(sandbox, a, pays_leg, gets_leg, q)
+                }) {
+                    Some((si, so)) => rate_of_me(gross_in(pay_in_rate, si), so)
+                        .is_some_and(|ub| ub != 0 && ub <= threshold_self),
+                    None => true,
+                }
+            {
+                let mut page_key_h = dk;
+                for _ in 0..10_000 {
+                    let Some(page) = json_at(sandbox, &page_key_h) else { break };
+                    let entries: Vec<String> = page
+                        .get("Indexes")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()
+                        })
+                        .unwrap_or_default();
+                    for ent in entries {
+                        let Some(okey) = hex::decode(&ent)
+                            .ok()
+                            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                            .map(xrpl_core::types::Hash256)
+                        else { continue };
+                        let Some(offer) = json_at(sandbox, &okey) else { continue };
+                        if offer.get("LedgerEntryType").and_then(|v| v.as_str())
+                            != Some("Offer")
+                        {
+                            continue;
+                        }
+                        let Some(maker) =
+                            offer.get("Account").and_then(|v| v.as_str()).and_then(decode20)
+                        else { continue };
+                        if &maker == taker {
+                            if std::env::var("DX_WALK").is_ok() {
+                                eprintln!(
+                                    "DX_WALK selfreap q={q:016x} okey={}",
+                                    hex::encode(okey.0)
+                                );
+                            }
+                            delete_maker_offer(sandbox, &okey, &offer, &maker);
+                            stale.push(okey);
+                            continue;
+                        }
+                        if reap_if_dead(
+                            sandbox, &okey, &offer, &maker, pays_leg, gets_leg,
+                            Some(&mut oc0), stale,
+                        ) {
+                            continue;
+                        }
+                        break 'dirs;
+                    }
+                    let next = page.get("IndexNext").map(dirnum).unwrap_or(0);
+                    if next == 0 {
+                        break;
+                    }
+                    page_key_h = keylet::dir_page_key(&dk, next);
+                }
+                continue;
+            }
             // rippled's offer stream has no quality gate for STEPPING: once
             // the strand was BUILT, rev keeps stepping past DEAD offers on
             // levels beyond the limit — reaping them — until a LIVE offer
