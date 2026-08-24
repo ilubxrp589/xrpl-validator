@@ -325,9 +325,19 @@ fn merge_pages(sandbox: &mut Sandbox, p1_key: &Hash256, p2_key: &Hash256) -> boo
         return false;
     }
     let mut merged: Vec<serde_json::Value> = a1.into_iter().chain(a2).collect();
-    // Pages keep their tokens ordered by NFTokenID; hex is fixed width and
-    // uppercase, so lexicographic order is byte order.
-    merged.sort_by(|x, y| entry_id(x).cmp(&entry_id(y)));
+    // Two adjacent pages are each a `compare_tokens`-ordered run with p1's
+    // low-96 bound below p2's, so the concatenation is ALREADY ordered —
+    // rippled's merge moves the arrays together and never re-sorts. Sorting
+    // by the whole-ID hex here (as this once did) REORDERS across the seam
+    // whenever whole-ID order disagrees with low-96 order: #106455111
+    // D9C28F93's consolidation pulled 00081388… (small ID, HIGH low 96)
+    // ahead of seven 00082710… tokens whose low-96s sort first, and the
+    // page landed a whole token off mainnet — REPLAY-only, invisible to
+    // every per-tx leg. Sort defensively, but by the module's one rule.
+    merged.sort_by(|x, y| match (entry_hash(x), entry_hash(y)) {
+        (Some(a), Some(b)) => compare_tokens(&a, &b),
+        _ => std::cmp::Ordering::Equal,
+    });
     p2["NFTokens"] = serde_json::Value::Array(merged);
 
     // Relink: p2 inherits p1's previous, and that page points at p2.
