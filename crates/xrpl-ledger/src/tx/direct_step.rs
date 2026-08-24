@@ -423,6 +423,9 @@ pub(crate) fn run_rev(
         plan[i] = src_to_dst;
         need = mul_ratio(src_to_dst, src_q_out, QUALITY_ONE, true);
     }
+    if std::env::var("DX_RUN").is_ok() {
+        eprintln!("DX_RUN rev need_out={need_out:?} -> in={need:?} plan={plan:?} dirs={dirs:?} prev_book={prev_book}");
+    }
     Some((need, plan, dirs))
 }
 
@@ -445,6 +448,7 @@ pub(crate) fn run_fwd(
     let mut carry = in_amt;
     for (i, hop) in hops.iter().enumerate() {
         let (src_q_out, dst_q_in) = hop_qualities(sandbox, hops, dirs, i, i + 1 == n, prev_book);
+        let carry_pre = carry;
         let mut src_to_dst = mul_ratio(carry, QUALITY_ONE, src_q_out, false);
         if ox::me_cmp(src_to_dst, plan[i]).is_gt() {
             src_to_dst = plan[i];
@@ -458,6 +462,12 @@ pub(crate) fn run_fwd(
         }
         direct_ripple_credit(sandbox, hop, src_to_dst);
         carry = mul_ratio(src_to_dst, dst_q_in, QUALITY_ONE, false);
+        if std::env::var("DX_RUN").is_ok() {
+            eprintln!(
+                "DX_RUN fwd hop={i} carry_in={carry_pre:?} sq={src_q_out} dq={dst_q_in} s2d={src_to_dst:?} plan_i={:?} out_carry={carry:?}",
+                plan[i]
+            );
+        }
     }
     (spent, carry)
 }

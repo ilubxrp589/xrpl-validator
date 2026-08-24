@@ -2570,10 +2570,17 @@ impl PaymentTransactor {
                 // re-rounds at 1e-10 each time, so THREE debits land on
                 // 808582.0813613431 and any two-way split lands on …432 —
                 // the count is the whole difference.
-                let net_rem_out = match want_rate {
-                    Some(r) => ox::me_muldiv(rem_out, (1_000_000_000, 0), (r as u128, 0), false),
-                    None => rem_out,
-                };
+                // The NET ask is `ask_net` — the want_target-chained twin the
+                // totals machinery keeps (rippled's driver holds remainingOut
+                // in NET units). DIVIDING the gross pot back can NEVER
+                // recover it: want_gross was rounded UP past Amount × rate,
+                // so gross/rate sits above the Amount and ANY rounding of the
+                // division lands high. #106455116 F04EF64E: want_gross
+                // …2710 / 1.0015 = 2588523229458522.2 — the tail run was
+                // asked for …22 (Amount is …21), ran its whole rev/fwd one
+                // ulp high, and BOTH the intermediary's line (…50 v …49) and
+                // the destination (…22 v …21) came out over. rippled's rev
+                // starts from remainingOut = …21 verbatim.
                 let (sin, sout, in_gross, out_net) = if i < n_books {
                     let (a, b) = Self::strand_pass(
                         tx, dest, &strands[i], rem_in, ask_gross,
@@ -2586,7 +2593,7 @@ impl PaymentTransactor {
                     // The direct strand's tail nets the destination — its
                     // target is the NET remainder; its head spends GROSS.
                     let (a, b) = crate::tx::direct_step::direct_strand_pass(
-                        sandbox, &dstrands[i - n_books], rem_in_gross, net_rem_out,
+                        sandbox, &dstrands[i - n_books], rem_in_gross, ask_net,
                     );
                     (a, b, true, true)
                 } else {
@@ -2595,7 +2602,7 @@ impl PaymentTransactor {
                     let head_run = matches!(segs.first(), Some(SegLayout::Run(_)));
                     let tail_run = matches!(segs.last(), Some(SegLayout::Run(_)));
                     let m_in = if head_run { rem_in_gross } else { rem_in };
-                    let m_out = if tail_run { net_rem_out } else { rem_out };
+                    let m_out = if tail_run { ask_net } else { rem_out };
                     let (a, b) = Self::mixed_strand_pass(
                         tx, dest, segs, m_in, m_out, true,
                         multi_now.then(|| &mut try_fib), sandbox,
