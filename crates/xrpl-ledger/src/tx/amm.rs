@@ -868,8 +868,15 @@ fn tear_down_lp_line(
     sandbox.delete(lp_key);
     crate::ledger::directory::owner_dir_remove(sandbox, who, &lp_key, node(w_node), false);
     crate::ledger::directory::owner_dir_remove(sandbox, amm_acct, &lp_key, node(a_node), false);
+    // ONLY the holder's count falls. The pool is the LP token's ISSUER and
+    // never pays reserve on these lines — rippled's deleteAMMTrustLine
+    // adjusts the NON-AMM side alone (AMMUtils), the trustCreate rule
+    // ("charge the CREATOR only") seen from the teardown end. #106455156
+    // 713DEF80 (full LP redemption): mainnet threads the pool root
+    // untouched at OwnerCount 1 and takes the holder 80 → 79; decrementing
+    // the pool here wrote its root to 0 — the replay's ledger-end diff was
+    // the only instrument that saw it (OwnerCount has no valcheck field).
     crate::tx::offer::owner_count_add(sandbox, who, -1);
-    crate::tx::offer::owner_count_add(sandbox, amm_acct, -1);
 }
 
 /// `deleteAMMAccount` — the last LP's withdrawal leaves LPTokenBalance at
