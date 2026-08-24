@@ -3605,6 +3605,29 @@ pub(crate) fn cross_engine_to_net(
         );
     }
     let mut crossed = 0u32;
+    // rippled's flowCross runs through flow(): ONE quality level (or one AMM
+    // slice) per iteration — the stream's level-change check breaks the pass
+    // (BookStep.cpp:720-724) — and each iteration re-derives remainingOut as
+    // outReq − the sorted ascending 16-digit fold of savedOuts
+    // (StrandFlow.h:639-642), never a full-width running subtraction. Over a
+    // 40-level walk the running form drifts: #106455246 5BEBD5DB's last fill
+    // asks 322.94295330646129 where rippled's fold-derived remainder is
+    // …64600 to the digit ("New flow iter 39: 220679892 322.94295330646"),
+    // and the partially-consumed maker's residual splits 13 ulp. CROSSINGS
+    // ONLY: single_pass callers run one level and their drivers (payment.rs)
+    // already keep StrandFlow's totals.
+    let fold_rem = offer_crossing && !single_pass;
+    let out_req0 = rem_pays;
+    let mut saved_level_outs: Vec<Me> = Vec::new();
+    let mut level_out_acc: Me = (0, 0);
+    fn fold16(v: &mut Vec<Me>) -> Me {
+        v.sort_by(|a, b| me_cmp(*a, *b));
+        let mut t: Me = (0, 0);
+        for e in v.iter() {
+            t = stamount_signed_add(false, t, false, *e).1;
+        }
+        t
+    }
     // rippled judges a flow ITERATION on the quality it ACTUALLY REALISED, not
     // on the filed rates of the offers it took, and a pass that misses
     // `limitQuality` is thrown away WHOLE — "Path rejected by limitQuality"
@@ -3903,7 +3926,22 @@ pub(crate) fn cross_engine_to_net(
                 };
                 in_gross_spent = stamount_signed_add(false, in_gross_spent, false, g).1;
             }
-            rem_pays = rp;
+            // An AMM slice is its own flow iteration (BookStep.cpp:818):
+            // bank the pending level entry, then the slice's out, and
+            // re-derive from the fold.
+            if fold_rem && used {
+                if !me_is_zero(level_out_acc) {
+                    saved_level_outs.push(level_out_acc);
+                    level_out_acc = (0, 0);
+                }
+                let slice_out = me_sub(rem_pays, rp);
+                if !me_is_zero(slice_out) {
+                    saved_level_outs.push(slice_out);
+                }
+                rem_pays = me_sub(out_req0, fold16(&mut saved_level_outs));
+            } else {
+                rem_pays = rp;
+            }
             rem_gets = rg;
             crossed += used as u32;
             if done(rem_pays, rem_gets) {
@@ -4567,6 +4605,11 @@ pub(crate) fn cross_engine_to_net(
                 }
                 rem_pays = me_sub(rem_pays, give);
                 rem_gets = me_sub(rem_gets, pay);
+                if fold_rem {
+                    // The iteration's actualOut accumulates STAmount-style
+                    // (one 16-digit add per fill on the level).
+                    level_out_acc = stamount_signed_add(false, level_out_acc, false, give).1;
+                }
                 crossed += 1;
                 level_crossed = true;
                 self_anchor_q = None;
@@ -4661,6 +4704,13 @@ pub(crate) fn cross_engine_to_net(
             trailing = true;
             continue;
         }
+        // Level boundary = iteration boundary: bank the level's actualOut and
+        // re-derive the remainder from the fold (StrandFlow.h:639-642).
+        if fold_rem && !me_is_zero(level_out_acc) {
+            saved_level_outs.push(level_out_acc);
+            level_out_acc = (0, 0);
+            rem_pays = me_sub(out_req0, fold16(&mut saved_level_outs));
+        }
         prev_level_crossed = level_crossed;
     }
     // A single pass whose level boundary tripped exits before the tail turn.
@@ -4721,7 +4771,20 @@ pub(crate) fn cross_engine_to_net(
                 };
                 in_gross_spent = stamount_signed_add(false, in_gross_spent, false, g).1;
             }
-            rem_pays = rp;
+            // Tail slice = its own iteration too (see the level-head turn).
+            if fold_rem && used {
+                if !me_is_zero(level_out_acc) {
+                    saved_level_outs.push(level_out_acc);
+                    level_out_acc = (0, 0);
+                }
+                let slice_out = me_sub(rem_pays, rp);
+                if !me_is_zero(slice_out) {
+                    saved_level_outs.push(slice_out);
+                }
+                rem_pays = me_sub(out_req0, fold16(&mut saved_level_outs));
+            } else {
+                rem_pays = rp;
+            }
             rem_gets = rg;
             crossed += used as u32;
         }
