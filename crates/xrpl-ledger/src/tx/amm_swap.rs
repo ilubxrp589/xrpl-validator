@@ -1040,12 +1040,34 @@ pub(crate) fn consume_fib(
     // exactly as the book fill does it (offer.rs move_leg_gross site).
     let mut take_in = s_in;
     let mut take_out = s_out;
+    // A PARTIAL take of a fib slice prices through the slice's ENCODED
+    // 16-digit quality, exactly like any other offer (BookStep limitStepOut
+    // ceil_in = mulRound(out, quality.rate(), up); limitStepIn divides the
+    // same rate down) — NOT through the raw s_in/s_out ratio. The E7399DA3
+    // lesson, on the AMM's synthetic offer: the two differ in the last
+    // digits. #106455151 52F632B8 iters 3-4 (multipath fib, PHNIX pools):
+    // the raw ratio priced …563024/…214407 where rippled's encoded-rate
+    // ceiling says …563027/…214409 — 5e-9 of PHNIX across the two partial
+    // slices, the sender's line remainder the only visible key (rippled's
+    // shim shows NO SWAPOUT for the partial: it never re-curves, it prices
+    // the generated offer linearly).
+    // The ENCODED quality rounds the rate UP at 16 digits — against the
+    // taker — exactly as the E7399DA3 receipt showed for a dir-encoded rate
+    // ("the encoded rate is the CEIL of the raw ratio"). #106455151 iter 3
+    // arbitrated all three forms with exact arithmetic: nearest-rate ceiling
+    // gives …405, the raw ratio …407, and only the CEIL-16 rate's ceiling
+    // lands rippled's …409 (iter 4's ratio rounds identically either way).
+    let q_px = n_div(s_in, s_out, Rnd::Up);
     if !sell && n_cmp(take_out, rem_pays) == Ordering::Greater {
-        take_in = to_amount(ox::me_muldiv(rem_pays, s_in, s_out, true), gets_leg.xrp, Rnd::Up);
+        take_in = to_amount(ox::mul_round16_up(rem_pays, q_px), gets_leg.xrp, Rnd::Up);
         take_out = rem_pays;
     }
     if n_cmp(take_in, rem_gets) == Ordering::Greater {
-        take_out = to_amount(ox::me_muldiv(rem_gets, s_out, s_in, false), pays_leg.xrp, Rnd::Down);
+        take_out = to_amount(
+            ox::me_muldiv(rem_gets, (1_000_000_000_000_000, -15), q_px, false),
+            pays_leg.xrp,
+            Rnd::Down,
+        );
         take_in = rem_gets;
     }
     if take_in.0 == 0 || take_out.0 == 0 {
