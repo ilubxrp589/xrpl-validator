@@ -1215,6 +1215,49 @@ impl PaymentTransactor {
             if i == 0 {
                 spent_precise = Some(ox::me_sub(avail, rs));
             }
+            // rippled's fwd BookStep swallows its WHOLE input. When the want
+            // is met (rw == 0) with input left over — the carry overshoot
+            // from an upstream AMM's rounded-up out — the excess still goes
+            // through this hop's pool: the pool receives it and pays the
+            // curve's crumbs. At the LAST hop nobody downstream is credited
+            // (the delivery clamps at the want; the issuer nets the
+            // difference); a MID hop's crumbs join the taker's line and ride
+            // the next carry. #106455266 CF7BAB85: pool 2's OAR line lands
+            // +29.71809727 (the full upstream product) and its PLX line
+            // pays 70.7902709126 while the dst is credited the 70.790270910…
+            // Amount exactly — both VALCHECK deltas are exactly this flush.
+            // IOU-only and unrated (the specimen's shape); rated or XRP legs
+            // log and skip until a specimen calibrates them.
+            if !ox::me_is_zero(rs) && ox::me_is_zero(rw) && hop_rate.is_none() && i > 0 {
+                let tiny =
+                    ox::me_cmp(ox::me_muldiv(rs, (1_000_000_000, 0), (1, 0), false), avail)
+                        .is_lt();
+                if tiny {
+                    if !chain[i].xrp && !chain[i + 1].xrp {
+                        if let Some(a) = crate::tx::amm_swap::discover(
+                            sandbox, chain[i], chain[i + 1], &tx.account,
+                        ) {
+                            let (pin, pout) = crate::tx::amm_swap::pool_balances(
+                                sandbox, &a, chain[i + 1], chain[i],
+                            );
+                            let fo = crate::tx::amm_swap::swap_asset_in(
+                                pin, pout, rs, a.tfee, chain[i + 1].xrp,
+                            );
+                            ox::line_adjust(sandbox, &tx.account, chain[i], rs, false);
+                            ox::line_adjust(sandbox, &a.account, chain[i], rs, true);
+                            ox::line_adjust(sandbox, &a.account, chain[i + 1], fo, false);
+                            if !last {
+                                ox::line_adjust(sandbox, &tx.account, chain[i + 1], fo, true);
+                            }
+                            if std::env::var("DX_PAY").is_ok() {
+                                eprintln!("DX_PAY hop {i} FLUSH rs={rs:?} out={fo:?} last={last}");
+                            }
+                        }
+                    } else if std::env::var("DX_PAY").is_ok() {
+                        eprintln!("DX_PAY hop {i} FLUSH-SKIP xrp-leg rs={rs:?}");
+                    }
+                }
+            }
             // The walk has already debited the fee per fill. Nothing to add.
             //
             // Measured INERT on #105091578, #105923760 and #105795329 — the
@@ -1275,7 +1318,33 @@ impl PaymentTransactor {
                         // strand, which is what `from_cap` reproduces.
                         from_cap
                     } else if agree {
-                        from_cap
+                        // Same quantity, two readings. When the DELTA is the
+                        // LARGER one the producer genuinely overshot — an
+                        // upstream AMM's out rounds UP (fixAMMRounding) and
+                        // rippled's fwd hands the WHOLE product to the next
+                        // step. #106455266 CF7BAB85: pool 1 emits
+                        // 29.71809727 OAR against a rev want of
+                        // …26921203; pool 2 receives the full figure
+                        // (its OAR line lands +29.71809727 on mainnet).
+                        // The smaller-delta direction stays from_cap —
+                        // #105866303's truncation calibration.
+                        // Same quantity, two readings. The delta is EXACT only when
+                        // the pre-balance was ZERO — nothing to eat digits — and
+                        // there a LARGER delta is the producer's genuine round-up
+                        // (an AMM's out, fixAMMRounding), which rippled's fwd
+                        // hands WHOLE to the next step. #106455266 CF7BAB85:
+                        // before=0, pool 1 emits 29.71809727 OAR against a rev
+                        // want of …26921203 and pool 2 receives the full figure.
+                        // With a NONZERO pre-balance the 16-digit sum rounds the
+                        // tail EITHER way and a larger delta is noise, not
+                        // product: #106455088 823AC88D read +3.74e-16 off a 3.3
+                        // balance and the flush pushed the phantom through the
+                        // pool — from_cap stands there (#105866303's calibration).
+                        if ox::me_is_zero(b) && ox::me_cmp(d, from_cap).is_gt() {
+                            d
+                        } else {
+                            from_cap
+                        }
                     } else {
                         d
                     }
