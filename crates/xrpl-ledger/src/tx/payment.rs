@@ -2588,7 +2588,21 @@ impl PaymentTransactor {
                         spend_rate.map(|_| rem_in_gross), threshold, true,
                         multi_now.then(|| &mut try_fib), sandbox,
                     );
-                    (a, b, false, false)
+                    // A book strand's sin is GROSS: the spent chooser
+                    // (`1f31546`) deliberately trusts the balance DELTA on a
+                    // fee-bearing spend leg, and the line loses net + fee.
+                    // Classifying it net over-drained BOTH twins — rem_in by
+                    // the fee per round, saved_ins by re-grossing a gross —
+                    // and the next round's pool slice came up exactly one
+                    // fee short. #106455119 EFFA952F: round-0 sin
+                    // 1339.4425643283 (rippled's stpIn verbatim) was
+                    // subtracted from the 4005.98 NET pot, the round-1 cap
+                    // fell to 2674.54, and the AMM slice delivered 14015687
+                    // of mainnet's 14031742 — 16055 drops short. (The
+                    // blind-dust branch returns the walk's net instead; at
+                    // ~5e-22 against a 16-digit pot the unit slip is
+                    // sub-representable either way.)
+                    (a, b, true, false)
                 } else if i < n_books + n_direct {
                     // The direct strand's tail nets the destination — its
                     // target is the NET remainder; its head spends GROSS.
