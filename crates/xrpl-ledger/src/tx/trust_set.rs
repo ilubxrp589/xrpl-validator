@@ -514,25 +514,40 @@ impl Transactor for TrustSetTransactor {
                 }
             }
         } else {
-            // Create new trust line. Creation flags per rippled trustCreate:
-            // the creator's side gets its reserve bit; its NoRipple bit follows
-            // the tx's tfSetNoRipple/tfClearNoRipple, defaulting to SET when
-            // the creator's account lacks lsfDefaultRipple.
+            // Create new trust line. Creation flags per rippled trustCreate
+            // (RippleStateHelpers.cpp:258-283): the creator's side gets its
+            // reserve bit, and its NoRipple bit comes ONLY from the tx —
+            // `bNoRipple = tfSetNoRipple && !tfClearNoRipple` — there is NO
+            // DefaultRipple defaulting on the creator's own side. The PEER's
+            // side gets NoRipple when the PEER lacks lsfDefaultRipple: "The
+            // other side's default is no rippling" (:277-281).
+            //
+            // #106455241 BD3CFFCF (Flags=0, plain bot TrustSet): our old
+            // creator-side defaulting arm minted lsfLowNoRipple where
+            // mainnet writes 0x10000 alone — invisible to every per-tx leg
+            // (the mut compare is (key, kind) only; Flags are checked
+            // nowhere but the replay's byte diff), and masked for months
+            // because wallets send tfSetNoRipple explicitly.
             let creation_flags = {
                 let sender_low = tx.account < issuer;
+                let (my_nr, peer_nr): (u64, u64) = if sender_low {
+                    (0x0010_0000, 0x0020_0000)
+                } else {
+                    (0x0020_0000, 0x0010_0000)
+                };
                 let reserve_bit: u64 = if sender_low { 0x0001_0000 } else { 0x0002_0000 };
-                let no_ripple_bit: u64 = if sender_low { 0x0010_0000 } else { 0x0020_0000 };
                 let txf = tx.fields.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0);
-                let creator_default_ripple = sandbox
-                    .read(&keylet::account_root_key(&tx.account))
+                let peer_default_ripple = sandbox
+                    .read(&keylet::account_root_key(&issuer))
                     .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
                     .map(|a| a["Flags"].as_u64().unwrap_or(0) & 0x0080_0000 != 0)
                     .unwrap_or(false);
                 let mut f = reserve_bit;
-                if txf & 0x0002_0000 != 0 {
-                    f |= no_ripple_bit; // tfSetNoRipple
-                } else if txf & 0x0004_0000 == 0 && !creator_default_ripple {
-                    f |= no_ripple_bit; // default NoRipple (no tfClearNoRipple)
+                if txf & 0x0002_0000 != 0 && txf & 0x0004_0000 == 0 {
+                    f |= my_nr; // tfSetNoRipple && !tfClearNoRipple
+                }
+                if !peer_default_ripple {
+                    f |= peer_nr;
                 }
                 f
             };

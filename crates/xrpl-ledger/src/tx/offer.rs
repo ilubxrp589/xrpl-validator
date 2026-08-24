@@ -909,15 +909,29 @@ pub(crate) fn line_adjust(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, am
         let bal_neg = !party_low; // holding sits on the party's side
         let sign = if bal_neg { "-" } else { "" };
         let cur_str = hex::encode_upper(leg.cur);
-        // rippled trustCreate: the RECEIVER carries the reserve, and their
-        // side gets NoRipple unless their account has DefaultRipple set.
+        // rippled rippleCredit's create: the RECEIVER carries the reserve,
+        // and their side gets NoRipple unless their account has
+        // DefaultRipple set (`noRipple = !receiverAccount->isFlag(
+        // lsfDefaultRipple)`, RippleStateHelpers.cpp:458). trustCreate then
+        // ALSO stamps the PEER's side when the peer — the issuer here —
+        // lacks DefaultRipple: "The other side's default is no rippling"
+        // (:277-281). Typical issuers carry DefaultRipple, which kept the
+        // missing peer arm invisible; ported with the #106455241 TrustSet
+        // sibling.
         let default_ripple = json_at(sandbox, &keylet::account_root_key(party))
+            .and_then(|a| a["Flags"].as_u64())
+            .map(|f| f & 0x0080_0000 != 0)
+            .unwrap_or(false);
+        let peer_default_ripple = json_at(sandbox, &keylet::account_root_key(&leg.issuer))
             .and_then(|a| a["Flags"].as_u64())
             .map(|f| f & 0x0080_0000 != 0)
             .unwrap_or(false);
         let mut flags = if party_low { LOW_RESERVE } else { HIGH_RESERVE };
         if !default_ripple {
             flags |= if party_low { LOW_NO_RIPPLE } else { HIGH_NO_RIPPLE };
+        }
+        if !peer_default_ripple {
+            flags |= if party_low { HIGH_NO_RIPPLE } else { LOW_NO_RIPPLE };
         }
         let mut line = serde_json::json!({
             "LedgerEntryType": "RippleState",
