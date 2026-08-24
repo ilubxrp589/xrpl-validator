@@ -3601,7 +3601,7 @@ pub(crate) fn cross_engine_to_net(
     let mut in_gross_spent: Me = (0, 0);
     if std::env::var("DX_ENTRY").is_ok() {
         eprintln!(
-            "DX_ENTRY rem_pays={rem_pays:?} rem_gets={rem_gets:?} benef_net={benef_net:?} gets_gross_cap={gets_gross_cap:?} single={single_pass}"
+            "DX_ENTRY rem_pays={rem_pays:?} rem_gets={rem_gets:?} benef_net={benef_net:?} gets_gross_cap={gets_gross_cap:?} single={single_pass} thr={threshold:016x} thr_self={threshold_self:016x}"
         );
     }
     let mut crossed = 0u32;
@@ -3617,6 +3617,10 @@ pub(crate) fn cross_engine_to_net(
     // ONLY: single_pass callers run one level and their drivers (payment.rs)
     // already keep StrandFlow's totals.
     let fold_rem = offer_crossing && !single_pass;
+    // Per-iteration strand-admission verdict for the beyond-strict self-reap
+    // sweep: None = not yet judged this iteration; re-judged only after a
+    // fill or slice starts a new iteration (see the sweep arm).
+    let mut sweep_admitted: Option<bool> = None;
     let out_req0 = rem_pays;
     let mut saved_level_outs: Vec<Me> = Vec::new();
     let mut level_out_acc: Me = (0, 0);
@@ -3942,6 +3946,9 @@ pub(crate) fn cross_engine_to_net(
             } else {
                 rem_pays = rp;
             }
+            if used {
+                sweep_admitted = None;
+            }
             rem_gets = rg;
             crossed += used as u32;
             if done(rem_pays, rem_gets) {
@@ -4020,15 +4027,29 @@ pub(crate) fn cross_engine_to_net(
             // The raw-spot bound cannot decide #051 (spot×trIn passes,
             // synthetic×trIn fails) — the tip-anchored synthetic itself
             // is required, which is exactly `anchored_slice`.
+            // Admission is judged ONCE PER ITERATION, at the iteration's
+            // tip — and a self-removal with no offer yet attempted RESETS
+            // the stream's level anchor (`if (!offerAttempted) ofrQ =
+            // std::nullopt`, BookStep.cpp:441-448), so consecutive
+            // self-offer levels all ride the FIRST level's admission with
+            // no re-judging in between. #106455252 3F75D634: two self
+            // offers at 1.86775e-11 and 1.86899e-11 — the pool peek at the
+            // second level would refuse (our old per-level re-admission
+            // kept the second offer), but rippled removes BOTH inside
+            // iteration 0, admitted once at the q1 tip ("FLOWDBG iter 0 …
+            // admitted true", then All strands dry). The verdict is
+            // re-judged only after a fill or slice — a new iteration.
             if offer_crossing && threshold_self != 0
                 && threshold_self != u64::MAX && q <= threshold_self
-                && match amm.as_ref().and_then(|a| {
-                    crate::tx::amm_swap::anchored_slice(sandbox, a, pays_leg, gets_leg, q)
-                }) {
-                    Some((si, so)) => rate_of_me(gross_in(pay_in_rate, si), so)
-                        .is_some_and(|ub| ub != 0 && ub <= threshold_self),
-                    None => true,
-                }
+                && *sweep_admitted.get_or_insert_with(|| {
+                    match amm.as_ref().and_then(|a| {
+                        crate::tx::amm_swap::anchored_slice(sandbox, a, pays_leg, gets_leg, q)
+                    }) {
+                        Some((si, so)) => rate_of_me(gross_in(pay_in_rate, si), so)
+                            .is_some_and(|ub| ub != 0 && ub <= threshold_self),
+                        None => true,
+                    }
+                })
             {
                 let mut page_key_h = dk;
                 for _ in 0..10_000 {
@@ -4613,6 +4634,7 @@ pub(crate) fn cross_engine_to_net(
                 crossed += 1;
                 level_crossed = true;
                 self_anchor_q = None;
+                sweep_admitted = None;
                 // `TOffer::fully_consumed()` is `amount().in == 0 || amount().out
                 // == 0` — EITHER side, not just the gets side we were testing.
                 // An out-limited fill clamped to the offer's whole TakerPays
@@ -4784,6 +4806,9 @@ pub(crate) fn cross_engine_to_net(
                 rem_pays = me_sub(out_req0, fold16(&mut saved_level_outs));
             } else {
                 rem_pays = rp;
+            }
+            if used {
+                sweep_admitted = None;
             }
             rem_gets = rg;
             crossed += used as u32;
