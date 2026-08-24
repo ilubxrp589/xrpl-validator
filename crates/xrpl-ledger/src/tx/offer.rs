@@ -5067,8 +5067,19 @@ impl Transactor for OfferCreateTransactor {
         } else {
             tg0
         };
-        let (rem_pays, rem_gets_cross, crossed) = cross_engine(
-            &tx.account, tp0, tg_cross, &pays_leg, &gets_leg, threshold, threshold_self, sell, domain.as_ref(),
+        // The surviving budget is a GROSS one — thread it as the walk's
+        // gross cap so an exhausting fill or slice debits `cap − spent`
+        // VERBATIM (the a12ffd5 gross-primary rule; rippled's clamped
+        // sendMax IS the crossing's remaining-in). Without it the drain
+        // round-trips balance/rate×rate and overshoots by an ulp:
+        // #106455229 7D1380A7 sells its whole 1.58026353300976e-5 BTC line
+        // through the pool — mainnet lands canonical zero, the re-gross
+        // left +1e-20. Underfunded+rated only: the unclamped path grosses
+        // the same product on both sides and never splits.
+        let gross_cap = if underfunded { xfer_in.map(|_| avail) } else { None };
+        let (rem_pays, rem_gets_cross, crossed) = cross_engine_to_net(
+            &tx.account, &tx.account, tp0, tg_cross, &pays_leg, &gets_leg, threshold,
+            threshold_self, sell, true, false, None, domain.as_ref(), None, gross_cap,
             sandbox, &mut stale,
         );
         // Re-express the leftover against the ORIGINAL TakerGets: only the

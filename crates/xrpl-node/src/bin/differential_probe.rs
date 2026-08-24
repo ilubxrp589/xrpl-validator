@@ -1417,8 +1417,15 @@ fn load_book_pair(
         // page object rides the ledger_data batch for free, but each offer
         // costs ledger_entry + maker root + line + dir (~4 RPC). The first
         // deepbook gate ran unbudgeted and crawled (~65s/fixture cold).
-        let mut deep_offer_budget: i32 = 256;
-        'sweep: while pages_done < 400 {
+        //
+        // DX_DEEPBOOK=1 lifts both caps for one-off full-state reproduction
+        // of replay-only divergences (#106455229: the dusting path lived
+        // past the budget, so the capped probe was clean BY LUCK). Gates
+        // never set it — default behavior is identical.
+        let deep = std::env::var("DX_DEEPBOOK").is_ok();
+        let page_cap: usize = if deep { 100_000 } else { 400 };
+        let mut deep_offer_budget: i32 = if deep { i32::MAX } else { 256 };
+        'sweep: while pages_done < page_cap {
             let Some(res) = rpc(url, "ledger_data", json!({
                 "ledger_index": ledger_index,
                 "marker": marker,
@@ -1435,8 +1442,8 @@ fn load_book_pair(
                     break 'sweep; // key order: past the book's range
                 }
                 pages_done += 1;
-                if pages_done >= 400 {
-                    eprintln!("HYDRATE-CAP book {base24} truncated at 400 pages");
+                if pages_done >= page_cap {
+                    eprintln!("HYDRATE-CAP book {base24} truncated at {page_cap} pages");
                 }
                 if e.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("DirectoryNode") {
                     continue;
@@ -2432,7 +2439,27 @@ fn run() -> i32 {
         if std::env::var("DX_AMM").is_ok() || std::env::var("DX_BRIDGE").is_ok() {
             eprintln!("DX_TX {h} {tx_type}");
         }
+        // Same per-tx receipt arming as state_replay: DX_REPLAY_TX prefix +
+        // DX_REPLAY_SET list — receipts for ONE tx out of a whole fixture.
+        let dx_armed = std::env::var("DX_REPLAY_TX")
+            .map(|p| !p.is_empty() && h.starts_with(&p.to_uppercase()))
+            .unwrap_or(false);
+        if dx_armed {
+            eprintln!("DX_REPLAY armed for {h} {tx_type}");
+            if let Ok(list) = std::env::var("DX_REPLAY_SET") {
+                for v in list.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+                    std::env::set_var(v, "1");
+                }
+            }
+        }
         let (our_ter, mut mods) = native_apply_one(&state, &txf);
+        if dx_armed {
+            if let Ok(list) = std::env::var("DX_REPLAY_SET") {
+                for v in list.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+                    std::env::remove_var(v);
+                }
+            }
+        }
         // Thread every materially-changed write with this tx's hash + the
         // ledger seq (rippled ApplyStateTable). The meta's FinalFields never
         // carry PreviousTxn*, so the per-tx compares are unaffected and the

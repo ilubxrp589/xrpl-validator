@@ -639,7 +639,32 @@ fn run() -> i32 {
                 fatal_skip += 1;
                 continue;
             };
+            // DX_REPLAY_TX=<hash prefix> + DX_REPLAY_SET=<comma list of DX
+            // vars>: arm the listed receipt envs for exactly the matching
+            // tx — the only way to get engine receipts out of a 200-ledger
+            // replay without drowning in every other tx's output. The apply
+            // loop is single-threaded, so set/remove around the one call is
+            // sound. (#106455229 7D1380A7: a replay-only ulp overdrain no
+            // per-tx leg reproduces.)
+            let dx_armed = std::env::var("DX_REPLAY_TX")
+                .map(|p| !p.is_empty() && h.starts_with(&p.to_uppercase()))
+                .unwrap_or(false);
+            if dx_armed {
+                eprintln!("DX_REPLAY armed for {h} {tx_type}");
+                if let Ok(list) = std::env::var("DX_REPLAY_SET") {
+                    for v in list.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+                        std::env::set_var(v, "1");
+                    }
+                }
+            }
             let (our_ter, mut mods) = native_apply_one(&state, &txf);
+            if dx_armed {
+                if let Ok(list) = std::env::var("DX_REPLAY_SET") {
+                    for v in list.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+                        std::env::remove_var(v);
+                    }
+                }
+            }
             xrpl_ledger::ledger::threading::stamp_threading(
                 &mut mods,
                 &|k| state.state_map.lookup(k).map(|b| b.to_vec()),
@@ -703,6 +728,26 @@ fn run() -> i32 {
                                 match pos {
                                     Ok(i) => entries[i].1 = leaf,
                                     Err(i) => entries.insert(i, (*k, leaf)),
+                                }
+                                // Re-store the node as decode(encode(json)) —
+                                // the same pipeline hydration uses. rippled's
+                                // persisted state is CANONICAL: an STAmount
+                                // never carries more than 16 digits into the
+                                // next ledger, while our sandbox JSON can (the
+                                // serialized bytes round; the JSON keeps the
+                                // tail, and it compounds across ledgers).
+                                // #106455229 7D1380A7: a full-balance drain
+                                // against a carried wide balance left sub-ulp
+                                // dust where mainnet writes canonical zero —
+                                // per-tx probes hydrate canonical values and
+                                // were structurally blind to it.
+                                if let Ok(mut cj) =
+                                    xrpl_core::codec::decode::decode_transaction_binary(&blob)
+                                {
+                                    hexify_addresses(&mut cj);
+                                    if let Ok(cb) = serde_json::to_vec(&cj) {
+                                        let _ = state.state_map.insert(*k, cb);
+                                    }
                                 }
                             }
                             Err(e) => {
