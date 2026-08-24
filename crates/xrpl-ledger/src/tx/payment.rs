@@ -1171,9 +1171,22 @@ impl PaymentTransactor {
                 .flatten();
             let in_before = hop_rate
                 .and_then(|_| Self::leg_signed_balance(sandbox, &tx.account, chain[i]));
-            // Only `carry / rate` can actually reach a maker.
+            // Only `carry / rate` can actually reach a maker — and rippled
+            // nets it at mulRatio-NEAREST, not floor (DirectStepI fwd:
+            // srcToDst = mulRatio(in, QUALITY_ONE, srcQOut, false); the
+            // LIMITSTEPIN receipts show the same division inside BookStep).
+            // #106455110 16A9323B is the specimen: EUR carry
+            // 3.767434803767796 / 1.002 has quotient …155|688 — nearest
+            // …156 (rippled's iteration-0 fill), floor said …155, and the
+            // one-ulp-low fill left maker offer F732F237's TakerPays
+            // residual at …800 for mainnet's …801 (the maker's big EUR line
+            // absorbed the twin ulp). The floor was the calibrated partner
+            // of the old exact-ceil gross_in; the mulRatio + gross-primary
+            // pair (a12ffd5) is the partner nearest belongs to — an
+            // in-limited fill debits the gross cap verbatim, so a nearest
+            // net can never overdraw the carry.
             let avail = match hop_rate {
-                Some(r) => ox::me_muldiv(carry, (1_000_000_000, 0), (r as u128, 0), false),
+                Some(r) => ox::mul_ratio(carry, 1_000_000_000, r as u128, false),
                 None => carry,
             };
             let (rw, rs, _c) = ox::cross_engine_to_net(
