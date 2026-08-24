@@ -1107,8 +1107,19 @@ impl PaymentTransactor {
                 if neg {
                     carry = (0, 0);
                 } else {
+                    // mulRatio-NEAREST like every other net division — the
+                    // FOURTH floor of this family (hop-joint e4c1581, spend0,
+                    // now the live-line clamp). #106455142 C0442CB5: the
+                    // sender's 2.500399999999944 UNI line nets over 1.001 to
+                    // quotient …041|958 — rippled's DirectStepI (and our own
+                    // spend0 one screen up) say …042; this floor said …041,
+                    // the clamp shaved the walk's budget one ulp under, and
+                    // the maker offer's residual read …959 for mainnet's
+                    // …958. The D0326D05 drain protection is unchanged — the
+                    // clamp still fires when the line is short; only its ulp
+                    // now matches rippled's.
                     let live_net = match Self::transfer_rate(sandbox, spend_leg) {
-                        Some(r) => ox::me_muldiv(live, (1_000_000_000, 0), (r as u128, 0), false),
+                        Some(r) => ox::mul_ratio(live, 1_000_000_000, r as u128, false),
                         None => live,
                     };
                     if ox::me_cmp(live_net, carry).is_lt() {
@@ -2005,8 +2016,17 @@ impl PaymentTransactor {
         // their remainder here would double-charge. Books spend NET (the
         // walk debits per fill). Both remainders are tracked below.
         let spend0_gross = spend0;
+        // mulRatio-NEAREST, not floor — the spend-side twin of the hop-joint
+        // fix (e4c1581), deferred then for want of a specimen. #106455142
+        // C0442CB5 is it: a sender-line drain nets the whole 2.500399999999944
+        // UNI balance through the 1.001 issuer; the quotient is …041|958 —
+        // rippled's DirectStepI nets it to …042 (nearest), the floor said
+        // …041, and the maker's offer residual (wants0 − net) landed …959
+        // for mainnet's …958. The gross side is untouched — the drain still
+        // debits the balance verbatim (gross-primary), only the NET the
+        // maker sees carried the floor's ulp.
         let spend0 = match spend_rate {
-            Some(r) => ox::me_muldiv(spend0, (1_000_000_000, 0), (r as u128, 0), false),
+            Some(r) => ox::mul_ratio(spend0, 1_000_000_000, r as u128, false),
             None => spend0,
         };
         let snap = sandbox.snapshot();

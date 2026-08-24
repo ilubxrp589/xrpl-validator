@@ -3585,6 +3585,11 @@ pub(crate) fn cross_engine_to_net(
 ) -> (Me, Me, u32) {
     let ask0 = rem_pays;
     let mut in_gross_spent: Me = (0, 0);
+    if std::env::var("DX_ENTRY").is_ok() {
+        eprintln!(
+            "DX_ENTRY rem_pays={rem_pays:?} rem_gets={rem_gets:?} benef_net={benef_net:?} gets_gross_cap={gets_gross_cap:?} single={single_pass}"
+        );
+    }
     let mut crossed = 0u32;
     // rippled judges a flow ITERATION on the quality it ACTUALLY REALISED, not
     // on the filed rates of the offers it took, and a pass that misses
