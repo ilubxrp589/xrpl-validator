@@ -301,7 +301,7 @@ impl PaymentTransactor {
         use crate::tx::offer as ox;
         const ONE: ox::Me = (1_000_000_000_000_000, -15);
         let mut acc: ox::Me = ONE;
-        for (i, w) in chain.windows(2).enumerate() {
+        for w in chain.windows(2) {
             let tip = ox::hop_tip(sandbox, taker, w[0], w[1], amm_iters)?;
             acc = ox::me_muldiv(acc, tip, ONE, false);
             // THE INTERMEDIATE GATEWAY'S CUT IS PART OF THE BOUND. A payment
@@ -328,8 +328,52 @@ impl PaymentTransactor {
             // ⚠ It also decides ADMISSION, not just order: rippled drops a strand
             // whose bound misses `limitQuality`, and a bound that is too good
             // admits strands the transaction's own price forbids.
-            if i > 0 && !w[0].xrp && taker != &w[0].issuer {
-                if let Some(r) = Self::transfer_rate(sandbox, w[0]) {
+            //
+            // ⚠ INCLUDING HOP 0: the FIRST book step's prev is the sender's
+            // DirectI, which REDEEMS the spend IOU, so its trIn composes into
+            // the bound too. #106455274 13296833 (24.29 USDT → 5.92M PEPE,
+            // six strands): every ub ran exactly ×1.002 (the USDT gateway)
+            // too good — the ORDER survived (uniform factor) but strands 1
+            // and 5 slipped past limitQuality 4.10227e-6 where rippled
+            // refuses them (4.1101/4.1049e-6), turning rippled's single-path
+            // anchored fill (activeStrands 1, multiPath false, ONE iteration)
+            // into our three fib-sliced rounds with different intermediate
+            // fills. The walk still charges the rate itself — this is only
+            // the estimate.
+            if !w[0].xrp && taker != &w[0].issuer {
+                let tr = Self::transfer_rate(sandbox, w[0]);
+                if std::env::var("DX_UB").is_ok() {
+                    eprintln!(
+                        "DX_UB trin in={} iss={} r={tr:?}",
+                        hex::encode(&w[0].cur[..4]),
+                        hex::encode(&w[0].issuer[..4]),
+                    );
+                }
+                if let Some(r) = tr {
+                    acc = ox::me_muldiv(acc, (r as u128, 0), (1_000_000_000, 0), false);
+                }
+            } else if std::env::var("DX_UB").is_ok() {
+                eprintln!(
+                    "DX_UB trin SKIP in={} xrp={} self_issue={}",
+                    hex::encode(&w[0].cur[..4]),
+                    w[0].xrp,
+                    taker == &w[0].issuer,
+                );
+            }
+        }
+        // The strand's FINAL DirectI — the issuer delivering the dst IOU —
+        // ISSUES, and an issuing direct step's quality is srcQOut =
+        // transferRate(src) (DirectStepI::qualityUpperBound via
+        // qualitiesSrcIssues; DirectStep.cpp:804-819). #106455274 13296833:
+        // every strand ran a uniform ×1.001 too good after the hop-0 trIn
+        // fix — PEPE's issuer rate on the delivery hop, NOT any book trOut
+        // (all book tips there pick the AMM and waive). #106455107's XRP
+        // destination composes nothing, which is what broke every
+        // book-trOut reading of the same numbers. The issuer-as-dst waiver
+        // uses the taker as the dst proxy (circular paths).
+        if let Some(dst_leg) = chain.last() {
+            if !dst_leg.xrp && taker != &dst_leg.issuer {
+                if let Some(r) = Self::transfer_rate(sandbox, dst_leg) {
                     acc = ox::me_muldiv(acc, (r as u128, 0), (1_000_000_000, 0), false);
                 }
             }
