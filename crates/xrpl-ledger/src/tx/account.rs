@@ -53,13 +53,54 @@ impl Transactor for AccountSetTransactor {
             Err(_) => return TxResult::Malformed,
         };
 
+        // asf → lsf per rippled SetAccount: the asf NUMBERS are not bit
+        // positions. #106455275 56049FD1 (SetFlag 13, DisallowIncomingCheck):
+        // mainnet stamps lsf 0x08000000 where the old `1 << 13` wrote 0x2000
+        // — invisible to every per-tx leg (mut compare is (key,kind), flags
+        // compared nowhere) and dormant for 240 replay ledgers because
+        // flag-setting AccountSets are rare. Constants verbatim from
+        // LedgerFormats.h:128-142 / TxFlags asf table :408-425. asf 5 and 10
+        // manage FIELD PRESENCE, not bits; unmapped values under 32 are
+        // rippled's silent no-op, not an error.
+        fn asf_lsf(flag: u64) -> Option<u64> {
+            Some(match flag {
+                1 => 0x0002_0000,  // asfRequireDest → lsfRequireDestTag
+                2 => 0x0004_0000,  // asfRequireAuth
+                3 => 0x0008_0000,  // asfDisallowXRP
+                4 => 0x0010_0000,  // asfDisableMaster
+                6 => 0x0020_0000,  // asfNoFreeze
+                7 => 0x0040_0000,  // asfGlobalFreeze
+                8 => 0x0080_0000,  // asfDefaultRipple
+                9 => 0x0100_0000,  // asfDepositAuth
+                12 => 0x0400_0000, // asfDisallowIncomingNFTokenOffer
+                13 => 0x0800_0000, // asfDisallowIncomingCheck
+                14 => 0x1000_0000, // asfDisallowIncomingPayChan
+                15 => 0x2000_0000, // asfDisallowIncomingTrustline
+                16 => 0x8000_0000, // asfAllowTrustLineClawback
+                17 => 0x4000_0000, // asfAllowTrustLineLocking
+                _ => return None,  // 5 AccountTxnID, 10 NFTokenMinter, 11 reserved
+            })
+        }
+
         // Apply SetFlag
         if let Some(flag) = tx.fields.get("SetFlag").and_then(|f| f.as_u64()) {
             if flag >= 32 {
                 return TxResult::Malformed;
             }
-            let current = acct["Flags"].as_u64().unwrap_or(0);
-            acct["Flags"] = serde_json::Value::Number((current | (1u64 << flag)).into());
+            if let Some(bit) = asf_lsf(flag) {
+                let current = acct["Flags"].as_u64().unwrap_or(0);
+                acct["Flags"] = serde_json::Value::Number((current | bit).into());
+            } else if flag == 5 && acct.get("AccountTxnID").is_none() {
+                // asfAccountTxnID: make the field present (zero hash);
+                // apply_common then rewrites it with each tx hash.
+                acct["AccountTxnID"] =
+                    serde_json::Value::String("0".repeat(64));
+            } else if flag == 10 {
+                // asfAuthorizedNFTokenMinter: the minter comes with the tx.
+                if let Some(m) = tx.fields.get("NFTokenMinter") {
+                    acct["NFTokenMinter"] = m.clone();
+                }
+            }
         }
 
         // Apply ClearFlag
@@ -67,8 +108,18 @@ impl Transactor for AccountSetTransactor {
             if flag >= 32 {
                 return TxResult::Malformed;
             }
-            let current = acct["Flags"].as_u64().unwrap_or(0);
-            acct["Flags"] = serde_json::Value::Number((current & !(1u64 << flag)).into());
+            if let Some(bit) = asf_lsf(flag) {
+                let current = acct["Flags"].as_u64().unwrap_or(0);
+                acct["Flags"] = serde_json::Value::Number((current & !bit).into());
+            } else if flag == 5 {
+                if let Some(o) = acct.as_object_mut() {
+                    o.remove("AccountTxnID");
+                }
+            } else if flag == 10 {
+                if let Some(o) = acct.as_object_mut() {
+                    o.remove("NFTokenMinter");
+                }
+            }
         }
 
         // Apply optional fields
@@ -359,7 +410,8 @@ mod tests {
         let key = keylet::account_root_key(&acct);
         let data = sandbox.read(&key).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&data).unwrap();
-        assert_eq!(v["Flags"].as_u64().unwrap() & (1 << 8), 1 << 8);
+        // asfDefaultRipple → lsfDefaultRipple 0x00800000, not 1 << 8.
+        assert_eq!(v["Flags"].as_u64().unwrap() & 0x0080_0000, 0x0080_0000);
     }
 
     #[test]
