@@ -2516,6 +2516,11 @@ thr={t:?} admits_trunc={} admits_up={}",
             // `strands.size() > 1`, which a bridged payment satisfies.
             None => true,
         };
+        // The iteration-ENTRY multiPath — rippled's getOffer sees strands
+        // BUILT (>1) for iteration 0 and the PREVIOUS iteration's active
+        // count after (#106455293's FFI_GETOFFER: multiPath=1 iters=0 while
+        // the same round's activeStrands ends 0).
+        let mp_entry = multi_prev;
         multi_prev = multi_now;
         // AMM turn: the direct-pair pool competes with the best BOOK rate.
         // Under MULTI-path it offers FIB slices; a SINGLE-path round anchors
@@ -2548,15 +2553,64 @@ thr={t:?} admits_trunc={} admits_up={}",
                     Some(t) if t <= threshold => (Some(t), false),
                     _ => (None, true),
                 };
+                // ADMISSION precedes limitOut, and the pool leg's admission
+                // quality is CONTEXT-DEPENDENT (FFI_GETOFFER receipts,
+                // AMMLiquidity.cpp):
+                //  - multiPath context (strands built > 1 — rippled sets it
+                //    BEFORE iteration 0): getOffer emits the FIB slice and
+                //    the ub is `Quality{amounts}` — the slice's AVERAGE.
+                //    #106455293 4BC56D5F: fib avg 1.350266180729305 >
+                //    limitQuality 1.35 → activeStrands 0 → the offer PLACES
+                //    (our limit-anchored consume had filled 2.48 XLM).
+                //  - single-path (the driver collapsed to one active
+                //    strand): the no-clob/override branch emits maxOffer,
+                //    whose constructed quality is `Quality{balances}` — the
+                //    RAW SPOT (:150-152), NOT the amounts' average.
+                //    #106455041 098271FA iter 1: ub 1.336342189754254 =
+                //    spot ≤ 1.34067 → admitted → the limitOut-trimmed fill
+                //    realizes the limit exactly.
+                // `multi_prev` is our carry of rippled's iteration-entry
+                // multiPath (the 4ee4288 calibration).
+                let pool_admitted = if limit_anchor {
+                    let thr_me = rate_me(threshold);
+                    if mp_entry {
+                        match crate::tx::amm_swap::fib_slice(
+                            sandbox, a, *init, amm_iters, pays_leg, gets_leg,
+                        ) {
+                            Some((fi, fo)) => {
+                                let q = crate::tx::amm_swap::slice_rate(fi, fo);
+                                let within_limit = !me_cmp(q, thr_me).is_gt();
+                                // getOffer's own gate: a fib slice not
+                                // strictly better than the CLOB tip is
+                                // withheld (Quality{amounts} < clobQuality).
+                                let beats_tip = match dpeek.as_ref().map(|(t, ..)| *t) {
+                                    Some(t) => me_cmp(q, rate_me(t)).is_lt(),
+                                    None => true,
+                                };
+                                within_limit && beats_tip
+                            }
+                            None => false,
+                        }
+                    } else {
+                        crate::tx::amm_swap::spot_upper_bound(sandbox, a, pays_leg, gets_leg)
+                            <= threshold
+                    }
+                } else {
+                    true
+                };
                 if std::env::var("DX_AMM").is_ok() {
                     eprintln!(
-                        "DX_AMM site=bridged-single anchor={anchor_clob:?} limit_anchor={limit_anchor} thr={threshold:x}"
+                        "DX_AMM site=bridged-single anchor={anchor_clob:?} limit_anchor={limit_anchor} admitted={pool_admitted} mp={mp_entry} iters={amm_iters} thr={threshold:x}"
                     );
                 }
+                if !pool_admitted {
+                    (rem_pays, rem_gets, false)
+                } else {
                 crate::tx::amm_swap::consume(
                     sandbox, a, taker, beneficiary, None, None, rem_pays, rem_gets, pays_leg, gets_leg,
                     threshold, sell, anchor_clob, None, limit_anchor,
                 )
+                }
             } else {
                 let best_book = match (dq, bq) {
                     (Some(d), Some(b)) => Some(if me_cmp(d, b).is_le() { d } else { b }),
