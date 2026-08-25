@@ -511,7 +511,8 @@ impl Transactor for EscrowFinishTransactor {
         let esc_key = keylet::escrow_key(&owner_id, offer_seq);
 
         if !sandbox.exists(&esc_key) {
-            return TxResult::NoEntry;
+            // rippled Escrow: a missing escrow is tecNO_TARGET, not tecNO_ENTRY
+            return TxResult::NoTarget;
         }
 
         TxResult::Success
@@ -532,7 +533,7 @@ impl Transactor for EscrowFinishTransactor {
         let esc_key = keylet::escrow_key(&owner_id, offer_seq);
         let esc_data = match sandbox.read(&esc_key) {
             Some(d) => d,
-            None => return TxResult::NoEntry,
+            None => return TxResult::NoTarget,
         };
         let escrow: serde_json::Value = match serde_json::from_slice(&esc_data) {
             Ok(v) => v,
@@ -672,7 +673,8 @@ impl Transactor for EscrowCancelTransactor {
         let esc_key = keylet::escrow_key(&owner_id, offer_seq);
 
         if !sandbox.exists(&esc_key) {
-            return TxResult::NoEntry;
+            // rippled Escrow: a missing escrow is tecNO_TARGET, not tecNO_ENTRY
+            return TxResult::NoTarget;
         }
 
         TxResult::Success
@@ -693,7 +695,7 @@ impl Transactor for EscrowCancelTransactor {
         let esc_key = keylet::escrow_key(&owner_id, offer_seq);
         let esc_data = match sandbox.read(&esc_key) {
             Some(d) => d,
-            None => return TxResult::NoEntry,
+            None => return TxResult::NoTarget,
         };
         let escrow: serde_json::Value = match serde_json::from_slice(&esc_data) {
             Ok(v) => v,
@@ -1194,7 +1196,7 @@ mod tests {
         let sandbox = Sandbox::new(&state);
         assert_eq!(
             EscrowFinishTransactor.preclaim(&tx, &sandbox),
-            TxResult::NoEntry
+            TxResult::NoTarget
         );
     }
 
