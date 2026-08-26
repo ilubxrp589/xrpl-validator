@@ -878,6 +878,27 @@ async fn fetch_ledger_tx_blobs(rpc: &RippledClient, seq: u32) -> Vec<Vec<u8>> {
         Ok(b) => b,
         Err(_) => return Vec::new(),
     };
+    // FOREIGN-RESPONSE GUARD (2026-08-26): the shadow-verify leg once applied a
+    // neighboring ledger's whole tx set — the RPC (via lgrNotFound failover)
+    // answered with a ledger other than the one requested, its metas didn't
+    // parse, every sort key degraded to u32::MAX, and the blobs fed libxrpl in
+    // txid order (739 phantom seq-divergences across 6 burst ledgers). The
+    // contract now: the response must BE closed ledger `seq`, and every real
+    // tx's meta must yield a TransactionIndex — otherwise the whole fetch is
+    // discarded and the shadow check is skipped for this ledger (the
+    // documented degraded mode; never feed libxrpl an unverified set).
+    let lgr = &body["result"]["ledger"];
+    let got_seq = lgr["ledger_index"]
+        .as_u64()
+        .or_else(|| lgr["ledger_index"].as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or(0);
+    if got_seq != seq as u64 || lgr["closed"].as_bool() == Some(false) {
+        eprintln!(
+            "[ws-sync] tx_blobs #{seq}: response is ledger {got_seq} (closed={}) — discarding foreign fetch",
+            lgr["closed"]
+        );
+        return Vec::new();
+    }
     let empty = Vec::new();
     let txs = body["result"]["ledger"]["transactions"].as_array().unwrap_or(&empty);
     // Pair each blob with its TransactionIndex extracted from the meta blob.
@@ -894,7 +915,7 @@ async fn fetch_ledger_tx_blobs(rpc: &RippledClient, seq: u32) -> Vec<Vec<u8>> {
             let tt = u16::from_be_bytes([bytes[1], bytes[2]]);
             if PSEUDO_TX_TYPES.contains(&tt) { continue; }
         }
-        let meta_hex = tx["meta"].as_str().unwrap_or("");
+        let meta_hex = tx["meta"].as_str().or_else(|| tx["metaData"].as_str()).unwrap_or("");
         let idx = if meta_hex.len() >= 12 {
             let meta_bytes = hex::decode(&meta_hex[..12]).unwrap_or_default();
             if meta_bytes.len() >= 6 && meta_bytes[0] == 0x20 && meta_bytes[1] == 0x1C {
@@ -905,6 +926,13 @@ async fn fetch_ledger_tx_blobs(rpc: &RippledClient, seq: u32) -> Vec<Vec<u8>> {
         } else {
             u32::MAX
         };
+        if idx == u32::MAX {
+            // No parseable TransactionIndex ⇒ not a closed-ledger meta (open or
+            // foreign ledger). One bad meta invalidates the whole set — the sort
+            // would silently degrade to array order. Discard; shadow check skips.
+            eprintln!("[ws-sync] tx_blobs #{seq}: meta without leading sfTransactionIndex — discarding fetch");
+            return Vec::new();
+        }
         ordered.push((idx, bytes));
     }
     ordered.sort_by_key(|(i, _)| *i);
