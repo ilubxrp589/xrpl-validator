@@ -381,12 +381,16 @@ pub async fn start_ws_sync(
                                                             "binary": true
                                                         })).await {
                                                             Ok(b) => {
-                                                                if let Some(s) = b["result"]["node_binary"].as_str() {
-                                                                    classified = Some(Some(s.to_string()));
-                                                                    break;
-                                                                } else if b["result"]["error"].as_str() == Some("entryNotFound") {
-                                                                    classified = Some(None);
-                                                                    break;
+                                                                // Never classify from a non-validated view
+                                                                // (desynced upstream — 2026-08-26 halt).
+                                                                if b["result"]["validated"].as_bool() == Some(true) {
+                                                                    if let Some(s) = b["result"]["node_binary"].as_str() {
+                                                                        classified = Some(Some(s.to_string()));
+                                                                        break;
+                                                                    } else if b["result"]["error"].as_str() == Some("entryNotFound") {
+                                                                        classified = Some(None);
+                                                                        break;
+                                                                    }
                                                                 }
                                                             }
                                                             Err(_) => {}
@@ -806,6 +810,13 @@ async fn fetch_ledger_metadata(
     tx_count: &mut u32,
 ) -> Result<(Vec<serde_json::Value>, LedgerHeader, i64), String> {
     let body = rpc.call("ledger", serde_json::json!({"ledger_index": seq, "transactions": true, "expand": true, "binary": false})).await?;
+    // Trust gate (2026-08-26 halt): a desynced upstream answers with
+    // non-validated views; writing state from one costs a wipe+resync.
+    // Err here lands in the existing retry/break-batch machinery, so ws-sync
+    // HOLDS POSITION until the upstream is validated again.
+    if body["result"]["validated"].as_bool() != Some(true) {
+        return Err(format!("ledger {seq} response not validated (upstream desynced?)"));
+    }
     let ledger = &body["result"]["ledger"];
     let txs = ledger["transactions"].as_array()
         .ok_or("no transactions")?;
@@ -887,15 +898,21 @@ async fn fetch_ledger_tx_blobs(rpc: &RippledClient, seq: u32) -> Vec<Vec<u8>> {
     // tx's meta must yield a TransactionIndex — otherwise the whole fetch is
     // discarded and the shadow check is skipped for this ledger (the
     // documented degraded mode; never feed libxrpl an unverified set).
-    let lgr = &body["result"]["ledger"];
-    let got_seq = lgr["ledger_index"]
+    // NB: rippled puts ledger_index at result level (result.ledger.ledger_index
+    // is absent in binary mode — the first cut of this guard read the wrong
+    // location and discarded every fetch). Require BOTH the right sequence and
+    // validated=true: a desynced upstream serves non-validated views.
+    let res = &body["result"];
+    let got_seq = res["ledger_index"]
         .as_u64()
-        .or_else(|| lgr["ledger_index"].as_str().and_then(|s| s.parse().ok()))
+        .or_else(|| res["ledger_index"].as_str().and_then(|s| s.parse().ok()))
+        .or_else(|| res["ledger"]["ledger_index"].as_u64())
+        .or_else(|| res["ledger"]["ledger_index"].as_str().and_then(|s| s.parse().ok()))
         .unwrap_or(0);
-    if got_seq != seq as u64 || lgr["closed"].as_bool() == Some(false) {
+    if got_seq != seq as u64 || res["validated"].as_bool() != Some(true) {
         eprintln!(
-            "[ws-sync] tx_blobs #{seq}: response is ledger {got_seq} (closed={}) — discarding foreign fetch",
-            lgr["closed"]
+            "[ws-sync] tx_blobs #{seq}: response is ledger {got_seq} (validated={}) — discarding foreign fetch",
+            res["validated"]
         );
         return Vec::new();
     }
@@ -1063,17 +1080,20 @@ async fn process_ledger(
                     .send().await;
                 if let Ok(r) = resp {
                     if let Ok(body) = r.json::<serde_json::Value>().await {
-                        if let Some(data_hex) = body["result"]["node_binary"].as_str() {
-                            if let Ok(data) = hex::decode(data_hex) {
-                                fetched_data.push((k, data));
+                        // Trust gate: only validated views (2026-08-26 halt).
+                        if body["result"]["validated"].as_bool() == Some(true) {
+                            if let Some(data_hex) = body["result"]["node_binary"].as_str() {
+                                if let Ok(data) = hex::decode(data_hex) {
+                                    fetched_data.push((k, data));
+                                    got = true;
+                                    break;
+                                }
+                            }
+                            if body["result"]["error"].as_str() == Some("entryNotFound") {
+                                fetched_data.push((k, Vec::new()));
                                 got = true;
                                 break;
                             }
-                        }
-                        if body["result"]["error"].as_str() == Some("entryNotFound") {
-                            fetched_data.push((k, Vec::new()));
-                            got = true;
-                            break;
                         }
                     }
                 }
@@ -1111,7 +1131,11 @@ async fn process_ledger(
                     if let Ok(r) = resp {
                         if let Ok(body) = r.json::<serde_json::Value>().await {
                             let resp_seq = body["result"]["ledger_index"].as_u64().unwrap_or(0) as u32;
-                            if resp_seq != 0 && resp_seq != seq {
+                            if (resp_seq != 0 && resp_seq != seq)
+                                || body["result"]["validated"].as_bool() != Some(true)
+                            {
+                                // wrong ledger OR non-validated view (desynced
+                                // upstream, 2026-08-26 halt) — retry, then fail
                                 if attempt < 2 { continue; }
                                 return None;
                             }
@@ -1314,6 +1338,11 @@ async fn process_ledger(
                                 .send().await;
                             if let Ok(r) = resp {
                                 if let Ok(body) = r.json::<serde_json::Value>().await {
+                                    // Trust gate: only validated views (2026-08-26 halt).
+                                    if body["result"]["validated"].as_bool() != Some(true) {
+                                        retry_ok = false;
+                                        break;
+                                    }
                                     if let Some(data_hex) = body["result"]["node_binary"].as_str() {
                                         if let (Ok(data), Ok(kb)) = (hex::decode(data_hex), hex::decode(index_hex)) {
                                             if kb.len() == 32 {
