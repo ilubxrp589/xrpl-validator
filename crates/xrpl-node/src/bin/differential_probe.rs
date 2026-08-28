@@ -1411,7 +1411,16 @@ fn load_book_pair(
         // parent tip, so the walk saw clob=None and tecKILLED an IoC
         // mainnet fills. Capped at 400 pages; the cap is LOGGED, never
         // silent.
-        let mut marker = serde_json::Value::String(bd0);
+        // Seed at the BOOK BASE, not the best book_offers page: book_offers
+        // hides EXPIRED offers exactly like unfunded ones, and when the
+        // expired level is the TIP it sorts BEFORE every visible page — a
+        // forward walk seeded at best_bd can never reach it. #106586388
+        // CE78DA6B: two expired 20-XRP offers at the book tip; mainnet reaps
+        // both on encounter, our sandbox never loaded them (5v9 muts, engine
+        // innocent). The old "marker must be an EXISTING key" constraint is
+        // FALSE on xrpld 3.3.0 — a synthetic base24+zeros marker seeks fine.
+        let _ = bd0;
+        let mut marker = serde_json::Value::String(format!("{base24}0000000000000000"));
         let mut pages_done = 0usize;
         // Per-book budget for OFFER hydration beyond the first 24 pages: a
         // page object rides the ledger_data batch for free, but each offer
@@ -1452,6 +1461,9 @@ fn load_book_pair(
                 let Ok(karr) = <[u8; 32]>::try_from(kb.as_slice()) else { continue };
                 let mut node = e.clone();
                 hexify_addresses(&mut node);
+                if std::env::var("DX_RM").is_ok() {
+                    eprintln!("DX_BOOKWALK page {} entries={}", &idx[48..], e.get("Indexes").and_then(|v| v.as_array()).map_or(0, |a| a.len()));
+                }
                 let _ = state.state_map.insert(Hash256(karr), serde_json::to_vec(&node).unwrap_or_default());
                 let entries: Vec<String> = e
                     .get("Indexes")
@@ -1469,8 +1481,15 @@ fn load_book_pair(
                         }
                         deep_offer_budget -= 1;
                     }
-                    let Some(ores) = rpc(url, "ledger_entry",
-                        json!({"index": ent, "ledger_index": ledger_index})) else { continue };
+                    let ores_opt = rpc(url, "ledger_entry",
+                        json!({"index": ent, "ledger_index": ledger_index}));
+                    if std::env::var("DX_RM").is_ok() {
+                        eprintln!("DX_BOOKWALK offer {} fetched={} node={}",
+                            &ent[..16],
+                            ores_opt.is_some(),
+                            ores_opt.as_ref().and_then(|o| o.get("node")).is_some());
+                    }
+                    let Some(ores) = ores_opt else { continue };
                     let Some(onode) = ores.get("node") else { continue };
                     // Insert directly — load_object would re-fetch the same
                     // entry a second time.

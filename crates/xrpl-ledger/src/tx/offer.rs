@@ -1517,6 +1517,15 @@ fn stamount_divide(num: Me, den: Me, xrp: bool) -> Me {
 /// best first, capped.
 fn book_offer_ladder(sandbox: &Sandbox, base: &Hash256, cap: usize) -> Vec<(u64, Hash256)> {
     let mut out = Vec::new();
+    if std::env::var("DX_RM").is_ok() {
+        let pages: Vec<String> = sandbox
+            .keys_with_prefix(&base.0[..24])
+            .into_iter()
+            .take(4)
+            .map(|k| hex::encode(&k.0[24..32]))
+            .collect();
+        eprintln!("DX_LADDER base={} cap={cap} first_pages={pages:?}", hex::encode(&base.0[..12]));
+    }
     for dk in sandbox.keys_with_prefix(&base.0[..24]) {
         let q = u64::from_be_bytes(dk.0[24..32].try_into().unwrap_or_default());
         let mut page_key = dk;
@@ -1878,7 +1887,9 @@ fn reap_if_dead(
     }
     if std::env::var("DX_RM").is_ok() {
         eprintln!(
-            "DX_RM peek maker={} gives0={m_gives0:?} avail={:?} acct={}",
+            "DX_RM peek exp={:?} base_close={} maker={} gives0={m_gives0:?} avail={:?} acct={}",
+            offer.get("Expiration"),
+            sandbox.base().header.close_time,
             hex::encode(maker),
             available(sandbox, maker, pays_leg),
             json_at(sandbox, &keylet::account_root_key(maker))
@@ -1917,6 +1928,13 @@ fn reap_to_live_head(
     stale: &mut Vec<Hash256>,
 ) -> bool {
     let mut page_key_h = *dk;
+    if std::env::var("DX_RM").is_ok() {
+        eprintln!(
+            "DX_REAPWALK enter level={} page_readable={}",
+            hex::encode(&dk.0[24..32]),
+            json_at(sandbox, dk).is_some()
+        );
+    }
     for _ in 0..10_000 {
         // An unreadable page is unknown, not empty: claiming the level dead
         // would suppress the pool's anchor on evidence we do not have. Report
@@ -1933,7 +1951,11 @@ fn reap_to_live_head(
                 .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
                 .map(xrpl_core::types::Hash256)
             else { continue };
-            let Some(offer) = json_at(sandbox, &okey) else { continue };
+            let offer_opt = json_at(sandbox, &okey);
+            if std::env::var("DX_RM").is_ok() {
+                eprintln!("DX_REAPWALK ent={} resolved={}", &ent[..16], offer_opt.is_some());
+            }
+            let Some(offer) = offer_opt else { continue };
             if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
                 continue;
             }
@@ -3835,6 +3857,10 @@ pub(crate) fn cross_engine_to_net(
         }
     }
     let dirs = sandbox.keys_with_prefix(&inv_base.0[..24]);
+    if std::env::var("DX_RM").is_ok() {
+        let first: Vec<String> = dirs.iter().take(4).map(|k| hex::encode(&k.0[24..32])).collect();
+        eprintln!("DX_DIRS base={} n={} first={first:?}", hex::encode(&inv_base.0[..12]), dirs.len());
+    }
     // Set once the fill is satisfied but rippled would still have stepped the
     // stream. The stream spans the whole BOOK, not one level: `step` carries no
     // quality test, so it keeps reaping across levels until it reaches a live
@@ -3871,7 +3897,26 @@ pub(crate) fn cross_engine_to_net(
     'dirs: for dk in dirs {
         let (level_pays_in, level_gets_in) = (rem_pays, rem_gets);
         let q = u64::from_be_bytes(dk.0[24..32].try_into().unwrap_or_default());
+        if std::env::var("DX_RM").is_ok() {
+            eprintln!(
+                "DX_LEVEL q={:016x} trailing={} thr={:016x} rem_pays={:?}",
+                q, trailing, threshold, rem_pays
+            );
+        }
         if trailing {
+            // SELL crossing: the rev stream trial-consumes live in-limit
+            // offers and keeps stepping — reaping dead ones — until the first
+            // beyond-limit level; a live head does NOT end the walk, the
+            // threshold does. (Dead offers BEHIND a live one on the SAME
+            // level are not reached here — no specimen yet; rippled's trial
+            // would step past them too.)
+            if offer_crossing && sell {
+                if q > threshold {
+                    break 'dirs;
+                }
+                let _ = reap_to_live_head(sandbox, &dk, pays_leg, gets_leg, Some(&mut oc0), stale);
+                continue;
+            }
             if reap_to_live_head(sandbox, &dk, pays_leg, gets_leg, Some(&mut oc0), stale) {
                 break 'dirs;
             }
@@ -4006,6 +4051,12 @@ pub(crate) fn cross_engine_to_net(
             rem_gets = rg;
             crossed += used as u32;
             if done(rem_pays, rem_gets) {
+                // The sell-trailing sweep (see the done branch below) applies
+                // to an AMM-completed fill the same way.
+                if offer_crossing && sell {
+                    trailing = true;
+                    continue;
+                }
                 break 'dirs;
             }
             // ONE AMM CONSUMPTION PER PAYMENT-ENGINE ITERATION. "At any payment
@@ -4209,6 +4260,15 @@ pub(crate) fn cross_engine_to_net(
                 else { continue };
                 if trailing {
                     if reap_if_dead(sandbox, &okey, &offer, &maker, pays_leg, gets_leg, Some(&mut oc0), stale) {
+                        continue;
+                    }
+                    // SELL crossing: the rev trial-consumes an in-limit LIVE
+                    // offer and steps on (reaping the dead behind it) — only
+                    // a beyond-limit live offer ends the walk, at execution's
+                    // quality check. #106586388 CE78DA6B: the second live
+                    // 20-XRP offer on the tip page must not end the stream
+                    // before the expired level behind it is reaped.
+                    if offer_crossing && sell && q <= threshold {
                         continue;
                     }
                     break 'dirs;
@@ -4554,6 +4614,14 @@ pub(crate) fn cross_engine_to_net(
                         give = (me_rescale(give, 0, false), 0);
                     }
                     if me_is_zero(give) {
+                        // A SELL crossing's exhausted spend ends the FILL,
+                        // not the STREAM — rippled's rev keeps stepping the
+                        // in-limit book and reaps the dead offers it lands
+                        // on (#106586388 CE78DA6B). Trail instead of break.
+                        if offer_crossing && sell {
+                            trailing = true;
+                            continue 'dirs;
+                        }
                         break 'dirs;
                     }
                 }
@@ -4753,7 +4821,17 @@ pub(crate) fn cross_engine_to_net(
                     // (offer + page deleted, root + dir modified, 7v11 for
                     // us). Only a trimmed fill that leaves the offer alive
                     // ends the walk here.
-                    if buy_bound && !consumed {
+                    // …except a SELL crossing: rippled sizes tfSell with an
+                    // unbounded-out sentinel, so the REV stream trial-walks
+                    // the whole in-limit book — past the just-trimmed live
+                    // offer — and the dead offers it steps onto are permRm'd
+                    // even though only the fwd fill's trades persist.
+                    // #106586388 CE78DA6B: the fill trims tip F16CD9AE, the
+                    // rev trial-consumes two live 20-XRP offers whole, and
+                    // reaps the expired pair on the level behind them (FFI
+                    // trace: "Removing expired offer" ×2 BEFORE "New flow
+                    // iter 0"). 5v9 for us until the sell-trailing sweep.
+                    if buy_bound && !consumed && !(offer_crossing && sell) {
                         break 'dirs;
                     }
                     trailing = true;
