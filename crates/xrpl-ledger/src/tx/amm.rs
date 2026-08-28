@@ -1441,32 +1441,124 @@ impl Transactor for AMMVoteTransactor {
     }
 
     fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
-        // Update AMM's VoteSlots with this account's fee vote
-        if let Some(key) = amm_key_from_asset_fields(tx) {
-            if let Some(data) = sandbox.read(&key) {
-                if let Ok(mut amm) = serde_json::from_slice::<serde_json::Value>(&data) {
-                    let fee = tx.fields.get("TradingFee").and_then(|f| f.as_u64()).unwrap_or(0);
-                    let vote = serde_json::json!({
-                        "Account": hex::encode(tx.account),
-                        "TradingFee": fee,
-                    });
-
-                    // Add/replace vote in VoteSlots
-                    let slots = amm.get_mut("VoteSlots")
-                        .and_then(|s| s.as_array_mut());
-                    if let Some(slots) = slots {
-                        // Remove existing vote from this account
-                        let acct_hex = hex::encode(tx.account);
-                        slots.retain(|v| v.get("Account").and_then(|a| a.as_str()) != Some(&acct_hex));
-                        slots.push(vote);
-                        // Limit to 8 vote slots (rippled maximum)
-                        if slots.len() > 8 { slots.remove(0); }
-                    }
-
-                    sandbox.write(key, serde_json::to_vec(&amm).unwrap());
+        // rippled AMMVote::applyVote. Entries are WRAPPED ({"VoteEntry": {…}})
+        // and carry VoteWeight = lpTokens × 100000 / lptAMMBalance; EVERY
+        // retained entry's weight is recomputed from its holder's CURRENT LP
+        // balance (zero-weight entries drop); with 8 slots the lowest-weight
+        // entry is evicted only when the new vote outweighs it (else
+        // tecAMM_FAILED); the pool's TradingFee becomes the weight-averaged
+        // fee of the surviving entries, Number-nearest. The old stub wrote
+        // FLAT weightless entries — the codec rightly refused to encode them
+        // and fresh-window replays cascaded from the dropped write. First
+        // specimen: #106589344 D7B6AED8 (XRP/NCR).
+        let Some((amm_key, amm_acct, lp_leg)) = amm_ctx(tx, sandbox) else {
+            return TxResult::Success;
+        };
+        let Some(mut amm) = crate::tx::offer::json_at(sandbox, &amm_key) else {
+            return TxResult::Success;
+        };
+        let Some(lpt_amm) = amm
+            .get("LPTokenBalance")
+            .and_then(keylet::amount_mant_exp)
+        else {
+            return TxResult::Success;
+        };
+        if lpt_amm.0 == 0 {
+            return TxResult::AmmEmpty;
+        }
+        // Holder-side LP balance as (mant, exp).
+        let lp_of = |sandbox: &Sandbox, acct: &[u8; 20]| -> crate::tx::offer::Me {
+            let lkey = keylet::ripple_state_key(acct, &lp_leg.issuer, &lp_leg.cur);
+            match crate::tx::offer::json_at(sandbox, &lkey) {
+                Some(l) => {
+                    let (neg, bal) = crate::tx::offer::signed_value(&l["Balance"]);
+                    let holds = if *acct < lp_leg.issuer { !neg } else { neg };
+                    if holds { bal } else { (0, 0) }
                 }
+                None => (0, 0),
+            }
+        };
+        // VoteWeight = lp × 100000 / lptAMM, exact i128, Number half-even.
+        let weight_of = |lp: crate::tx::offer::Me| -> u64 {
+            if lp.0 == 0 {
+                return 0;
+            }
+            let (mut num, mut den) = (lp.0 as i128 * 100_000, lpt_amm.0 as i128);
+            let mut d = lp.1 - lpt_amm.1;
+            while d > 0 {
+                num *= 10;
+                d -= 1;
+            }
+            while d < 0 {
+                den *= 10;
+                d += 1;
+            }
+            let q = num / den;
+            let r = num % den;
+            let q = if 2 * r > den || (2 * r == den && q % 2 == 1) { q + 1 } else { q };
+            q as u64
+        };
+        let voter_hex = hex::encode(tx.account);
+        let new_fee = tx.fields.get("TradingFee").and_then(|f| f.as_u64()).unwrap_or(0);
+        let new_weight = weight_of(lp_of(sandbox, &tx.account));
+
+        let existing: Vec<serde_json::Value> = amm
+            .get("VoteSlots")
+            .and_then(|s| s.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut updated: Vec<(String, u64, u64)> = Vec::new(); // (acct_hex, fee, weight)
+        for e in &existing {
+            let Some(ve) = e.get("VoteEntry") else { continue };
+            let Some(acct) = ve.get("Account").and_then(|a| a.as_str()) else { continue };
+            if acct.eq_ignore_ascii_case(&voter_hex) {
+                continue; // the voter's old entry is replaced below
+            }
+            let Some(aid) = crate::tx::offer::decode20(acct) else { continue };
+            let w = weight_of(lp_of(sandbox, &aid));
+            if w == 0 {
+                continue; // holder sold out — entry drops
+            }
+            let fee = ve.get("TradingFee").and_then(|f| f.as_u64()).unwrap_or(0);
+            updated.push((acct.to_string(), fee, w));
+        }
+        if updated.len() < 8 {
+            updated.push((voter_hex, new_fee, new_weight));
+        } else {
+            let (mi, &(_, _, mw)) = updated
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, _, w))| *w)
+                .map(|(i, t)| (i, t))
+                .unwrap();
+            if mw < new_weight {
+                updated[mi] = (voter_hex, new_fee, new_weight);
+            } else {
+                return TxResult::AmmFailed;
             }
         }
+        // TradingFee = Σ(fee·w) / Σw, Number half-even to integer.
+        let num: i128 = updated.iter().map(|(_, f, w)| *f as i128 * *w as i128).sum();
+        let den: i128 = updated.iter().map(|(_, _, w)| *w as i128).sum();
+        let fee_avg = if den == 0 {
+            0
+        } else {
+            let q = num / den;
+            let r = num % den;
+            if 2 * r > den || (2 * r == den && q % 2 == 1) { q + 1 } else { q }
+        } as u64;
+
+        amm["VoteSlots"] = serde_json::Value::Array(
+            updated
+                .iter()
+                .map(|(a, f, w)| {
+                    serde_json::json!({"VoteEntry": {"Account": a, "TradingFee": f, "VoteWeight": w}})
+                })
+                .collect(),
+        );
+        amm["TradingFee"] = serde_json::json!(fee_avg);
+        let _ = amm_acct;
+        crate::tx::offer::put_json(sandbox, amm_key, &amm);
         TxResult::Success
     }
 }
