@@ -188,7 +188,16 @@ fn rpc(url: &str, method: &str, params: Value) -> Option<Value> {
     // the primary (.39's online_delete floor moves forward); retry those on a
     // full-history server. Spot-probe tool only — gates leave it unset (public
     // infra is slow, rate-limited, and a gate must not depend on it).
-    if result.get("error").and_then(|e| e.as_str()) == Some("lgrNotFound") {
+    // `internal` belongs with lgrNotFound: rippled MASKS the not-in-window
+    // answer for non-admin clients — .39 tells an admin curl lgrNotFound and
+    // tells m3060 `internal` for the same account_info@106275594 (and public
+    // s2 says `internal` where Clio-backed xrplcluster serves the data). The
+    // lgrNotFound-only trigger meant the fallback NEVER fired from the gates,
+    // which is the whole 18-fixture "deterministic" hist residue.
+    if matches!(
+        result.get("error").and_then(|e| e.as_str()),
+        Some("lgrNotFound") | Some("internal")
+    ) {
         if let Ok(fb) = std::env::var("XRPL_PROBE_FALLBACK") {
             if !fb.is_empty() && fb != url {
                 // Public full-history infra sheds load under fleet pressure: a
@@ -228,6 +237,12 @@ fn rpc(url: &str, method: &str, params: Value) -> Option<Value> {
                 }
             }
         }
+    }
+    if dxlog {
+        // Live-call outcome, fallback or not — the receipt that showed the
+        // fallback never firing while .39 demonstrably answers lgrNotFound.
+        let err = result.get("error").and_then(|e| e.as_str()).unwrap_or("-");
+        eprintln!("DX_RPCLOG {method} {} LIVE-> err={err}", brief());
     }
     // Cache successful lookups AND the two DETERMINISTIC negatives: for a
     // fixed ledger_index, `entryNotFound` and `actNotFound` are as immutable
