@@ -679,7 +679,11 @@ fn run() -> i32 {
                 // DX_WATCH=<hex key prefix>: print the node's Balance after
                 // every tx that writes it (uppercase hex prefix match).
                 if let Ok(w) = std::env::var("DX_WATCH") {
-                    if !w.is_empty() && hex::encode_upper(k.0).starts_with(&w.to_uppercase()) {
+                    // Comma list of uppercase hex key prefixes.
+                    if w.split(',').any(|p| {
+                        let p = p.trim();
+                        !p.is_empty() && hex::encode_upper(k.0).starts_with(&p.to_uppercase())
+                    }) {
                         let bal = match &ent {
                             SandboxEntry::Created(b) | SandboxEntry::Modified(b) => {
                                 serde_json::from_slice::<Value>(b).ok().map(|v| {

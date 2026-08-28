@@ -725,6 +725,58 @@ fn delete_offer(sandbox: &mut Sandbox, offer: &OfferSle) {
     decrement_owner_count(&offer.owner, sandbox);
 }
 
+/// `n/d` rounded half-even — Number's to_nearest with the FULL remainder in
+/// the tie (multiply semantics; contrast `div_nearest_16`'s small-scale
+/// divide, which discards it).
+fn div_half_even(n: u128, d: u128) -> u128 {
+    let q = n / d;
+    let r = n % d;
+    match (r * 2).cmp(&d) {
+        std::cmp::Ordering::Greater => q + 1,
+        std::cmp::Ordering::Less => q,
+        std::cmp::Ordering::Equal => q + (q & 1),
+    }
+}
+
+/// The NFT transfer-fee cut of an XRP price, rippled's arithmetic exactly:
+/// `multiply(amount, nft::transferFeeAsRate(fee))` (NFTokenAcceptOffer.cpp
+/// :420/:540) runs the Number pipeline — asAmount(rate) is NON-native, so
+/// the native×native fast path never applies. Two roundings, both
+/// round-half-even: the full product reduced to Number's 16 significant
+/// digits, then the STAmount-native conversion at the integer-drop
+/// boundary. The /100000 itself is pure exponent arithmetic, exact.
+///
+/// #106589567 FB2873680731 calibrates it: brokered sale, seller side
+/// 40417398 drops at fee 3000 → 1212521.94 → mainnet pays the issuer
+/// 1212522 (nearest), floor paid 1212521 — one drop against two account
+/// roots, invisible to the probe's key-set compare, cascading the replay's
+/// account_hash from ledger 241 of the window on.
+fn nft_royalty_drops(drops: u64, fee_units: u128) -> u128 {
+    if fee_units == 0 {
+        return 0;
+    }
+    let p = drops as u128 * fee_units; // exact: ≤ 1e17 × 5e4
+    // Stage 1: Number multiply rounds the product mantissa to 16 significant
+    // digits half-even; the shed power of ten stays as exponent.
+    let mut k = 0u32;
+    let mut t = p;
+    while t >= 10_000_000_000_000_000 {
+        t /= 10;
+        k += 1;
+    }
+    let (mut m, mut k) = if k > 0 { (div_half_even(p, 10u128.pow(k)), k) } else { (p, 0) };
+    if m >= 10_000_000_000_000_000 {
+        m /= 10; // rounding carried to 1e16 exactly — one exact shift
+        k += 1;
+    }
+    // Stage 2: value = m·10^k / 10^5 to integer drops, half-even.
+    if k >= 5 {
+        m * 10u128.pow(k - 5)
+    } else {
+        div_half_even(m, 10u128.pow(5 - k))
+    }
+}
+
 /// Move `drops` from buyer to seller, carving the NFTokenID-embedded transfer
 /// fee (1/100000 units) out for the issuer when the seller isn't the issuer.
 fn pay_xrp_with_transfer_fee(
@@ -738,7 +790,7 @@ fn pay_xrp_with_transfer_fee(
     let issuer = nftpage::issuer_of(nft_id);
     let mut to_issuer = 0u128;
     if fee_units > 0 && issuer != *seller {
-        to_issuer = (drops as u128) * fee_units / 100_000;
+        to_issuer = nft_royalty_drops(drops, fee_units);
     }
     adjust_xrp(sandbox, buyer, -(drops as i128));
     adjust_xrp(sandbox, seller, drops as i128 - to_issuer as i128);
@@ -1026,7 +1078,25 @@ fn pay_iou_with_transfer_fee(
     let fee_units = u16::from_be_bytes([nft_id.0[2], nft_id.0[3]]) as u128;
     let nft_issuer = nftpage::issuer_of(nft_id);
     let nft_cut = if fee_units > 0 && nft_issuer != *seller {
-        ox::me_muldiv(seller_side, (fee_units, 0), (100_000, 0), false)
+        // Same rippled call as the XRP flavor — multiply(amount, rate), the
+        // Number pipeline: ONE half-even reduction of the FULL product to 16
+        // significant digits; the /100000 is exponent arithmetic, exact.
+        // me_muldiv(…, false) truncated instead — invisible on the exact
+        // #106047462 HADA specimen (950000×2500/100000 has no remainder).
+        let (m, e) = seller_side;
+        let p = m * fee_units; // ≤ 1e16 × 5e4, exact
+        let mut t = p;
+        let mut k = 0i32;
+        while t >= 10_000_000_000_000_000 {
+            t /= 10;
+            k += 1;
+        }
+        let mut m2 = if k > 0 { div_half_even(p, 10u128.pow(k as u32)) } else { p };
+        if m2 >= 10_000_000_000_000_000 {
+            m2 /= 10; // rounding carried to exactly 1e16 — exact shift
+            k += 1;
+        }
+        ox::norm16((m2, e + k - 5))
     } else {
         (0, 0)
     };
@@ -1049,7 +1119,7 @@ fn pay_settle_seller(sandbox: &mut Sandbox, seller: &[u8; 20], nft_id: &Hash256,
     let issuer = nftpage::issuer_of(nft_id);
     let mut to_issuer = 0u128;
     if fee_units > 0 && issuer != *seller {
-        to_issuer = (drops as u128) * fee_units / 100_000;
+        to_issuer = nft_royalty_drops(drops, fee_units);
     }
     adjust_xrp(sandbox, seller, drops as i128 - to_issuer as i128);
     if to_issuer > 0 {
