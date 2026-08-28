@@ -1393,6 +1393,25 @@ fn load_book_pair(
                                 load_object(state, url, &hex::encode_upper(key.0), ledger_index);
                             }
                         }
+                        // The auth reap's reads: `require_auth_known` judges a
+                        // maker by its TakerPays-side line (the asset it
+                        // RECEIVES) plus that leg's issuer root. Nothing else
+                        // needs either, so an unhydrated line reads as
+                        // tecNO_LINE where mainnet holds an authorized line
+                        // (l106588526 FCFDBF76048F: 4 phantom reap writes).
+                        if let Some(p) = onode.get("TakerPays").and_then(|v| v.as_object()) {
+                            if let Some(pi) = p.get("issuer").and_then(|v| v.as_str()) {
+                                load_account(state, url, pi, ledger_index);
+                                if let (Some(mid), Some(pid), Some(pc)) = (
+                                    decode_address(mk),
+                                    decode_issuer(pi),
+                                    p.get("currency").and_then(|v| v.as_str()),
+                                ) {
+                                    let key = keylet::ripple_state_key(&mid, &pid, &currency_code(pc));
+                                    load_object(state, url, &hex::encode_upper(key.0), ledger_index);
+                                }
+                            }
+                        }
                             // The reap's third write: the maker's OWNER
                             // DIRECTORY page (delete_maker_offer removes the
                             // entry) — invisible unless hydrated. Root page plus
@@ -1425,6 +1444,21 @@ fn load_book_pair(
             ) {
                 let key = keylet::ripple_state_key(&mid, &gi, &currency_code(gc));
                 load_object(state, url, &hex::encode_upper(key.0), ledger_index);
+            }
+        }
+        // See the level-scan twin above: the auth reap reads the maker's
+        // TakerPays-side line and that issuer's root.
+        if let Some(p) = off.get("TakerPays").and_then(|v| v.as_object()) {
+            if let Some(pi) = p.get("issuer").and_then(|v| v.as_str()) {
+                load_account(state, url, pi, ledger_index);
+                if let (Some(mid), Some(pid), Some(pc)) = (
+                    decode_address(maker),
+                    decode_issuer(pi),
+                    p.get("currency").and_then(|v| v.as_str()),
+                ) {
+                    let key = keylet::ripple_state_key(&mid, &pid, &currency_code(pc));
+                    load_object(state, url, &hex::encode_upper(key.0), ledger_index);
+                }
             }
         }
     }
@@ -1575,6 +1609,21 @@ fn load_book_pair(
                         ) {
                             let key = keylet::ripple_state_key(&mid, &gi, &currency_code(gc));
                             load_object(state, url, &hex::encode_upper(key.0), ledger_index);
+                        }
+                    }
+                    // See the level-scan twin above: the auth reap reads the
+                    // maker's TakerPays-side line and that issuer's root.
+                    if let Some(p) = onode.get("TakerPays").and_then(|v| v.as_object()) {
+                        if let Some(pi) = p.get("issuer").and_then(|v| v.as_str()) {
+                            load_account(state, url, pi, ledger_index);
+                            if let (Some(mid), Some(pid), Some(pc)) = (
+                                decode_address(mk),
+                                decode_issuer(pi),
+                                p.get("currency").and_then(|v| v.as_str()),
+                            ) {
+                                let key = keylet::ripple_state_key(&mid, &pid, &currency_code(pc));
+                                load_object(state, url, &hex::encode_upper(key.0), ledger_index);
+                            }
                         }
                     }
                         // The reap's third write: the maker's OWNER

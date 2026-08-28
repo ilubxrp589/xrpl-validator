@@ -879,6 +879,14 @@ pub(crate) fn discover(sandbox: &Sandbox, spend: &Leg, want: &Leg, taker: &[u8; 
         return None;
     }
     let account = obj.get("Account").and_then(|v| v.as_str()).and_then(hex20)?;
+    // BookStep.cpp:755 applies `requireAuth(book.in, owner)` to the POOL
+    // account like any other offer owner: a pool unauthorized for the asset
+    // flowing INTO it yields no synthetic at any size — the strand it anchors
+    // prices and executes as if the AMM were not there (#106588526, "Strand
+    // found dry in rev" with the synthetic built and never yielded).
+    if ox::require_auth_known(sandbox, spend, &account) == Some(false) {
+        return None;
+    }
     let mut tfee = obj.get("TradingFee").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
     if let Some(slot) = obj.get("AuctionSlot") {
         let expires = slot.get("Expiration").and_then(|v| v.as_u64()).unwrap_or(0);

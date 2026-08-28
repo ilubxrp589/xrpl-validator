@@ -763,6 +763,46 @@ pub(crate) fn dest_receivable(sandbox: &Sandbox, dest: &[u8; 20], leg: &Leg) -> 
     }
 }
 
+/// `requireAuth(view, issue, account)` — RippleStateHelpers.cpp:556 — as the
+/// BOOK walk needs it: may `owner` hold `leg` at all? XRP and the issuer
+/// itself always may. Under the issuer's lsfRequireAuth the line must carry
+/// the ISSUER-side auth flag (issuer low ⇒ lsfLowAuth, else lsfHighAuth —
+/// the 0x40000/0x80000 RippleState bits, NOT the 0x10000/0x20000 reserve
+/// bits), and a MISSING line is tecNO_LINE. There is NO balance grandfather
+/// here — that mercy is DirectStep.cpp:430's endpoint check
+/// (`dest_receivable` above), not this one. BookStep.cpp:755 runs this per
+/// offer OWNER — an AMM pool account included — and perm-removes the
+/// unauthorized "even if no crossing occurs".
+///
+/// #106588526 0CEFB5D8/B0E70AB8: the CAMP/PINGU pool (rnSAXkQ…) holds its
+/// CAMP on a line with flags 0x01010000 — no auth bit — while issuer
+/// rfxucs… (0x408C0000) sets lsfRequireAuth: rippled's rev pass builds the
+/// synthetic, the stream then yields nothing, "Strand found dry in rev".
+///
+/// Returns None when a verdict needs state not in hand (issuer root
+/// unhydrated; or no line AND no owner root — the walk's "an unhydrated
+/// maker is never condemned" rule). Some(false) ⇒ reap/skip.
+pub(crate) fn require_auth_known(sandbox: &Sandbox, leg: &Leg, owner: &[u8; 20]) -> Option<bool> {
+    const LSF_REQUIRE_AUTH: u64 = 0x0004_0000; // AccountRoot
+    const LSF_LOW_AUTH: u64 = 0x0004_0000; // RippleState
+    const LSF_HIGH_AUTH: u64 = 0x0008_0000; // RippleState
+    if leg.xrp || owner == &leg.issuer {
+        return Some(true);
+    }
+    let iss = json_at(sandbox, &keylet::account_root_key(&leg.issuer))?;
+    if iss["Flags"].as_u64().unwrap_or(0) & LSF_REQUIRE_AUTH == 0 {
+        return Some(true);
+    }
+    let line = json_at(sandbox, &keylet::ripple_state_key(owner, &leg.issuer, &leg.cur));
+    match line {
+        Some(line) => {
+            let auth_bit = if &leg.issuer < owner { LSF_LOW_AUTH } else { LSF_HIGH_AUTH };
+            Some(line["Flags"].as_u64().unwrap_or(0) & auth_bit != 0)
+        }
+        None => json_at(sandbox, &keylet::account_root_key(owner)).map(|_| false),
+    }
+}
+
 /// Adjust one party's side of an IOU movement (line balance ±amt), creating
 /// the line if the receiver has none (rippled offer-crossing behavior).
 pub(crate) fn line_adjust(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, amt: Me, receiving: bool) {
@@ -1609,6 +1649,9 @@ fn live_head(
     start: &mut usize,
     taker: &[u8; 20],
     maker_pays_leg: &Leg,
+    // What the maker RECEIVES — the book's IN asset, which its owner must be
+    // authorized to hold (`require_auth_known`).
+    maker_gets_leg: &Leg,
     // Self-offers and DEAD offers (expired/unfunded) are removed under
     // separate flags: a stream-step reaps dead offers it passes even in a
     // PEEK once the strand is running (#106093637 1BE79D4A), but a peeked
@@ -1708,6 +1751,18 @@ fn live_head(
             continue;
         }
         if gives.0 == 0 || wants.0 == 0 || me_is_zero(available(sandbox, &maker, maker_pays_leg)) {
+            if mutate_dead {
+                delete_maker_offer(sandbox, &okey, &offer, &maker);
+                stale.push(okey);
+            }
+            i += 1;
+            continue;
+        }
+        // BookStep.cpp:755 — an owner unauthorized for the asset flowing INTO
+        // it is never crossable; the stream perm-removes it "even if no
+        // crossing occurs" (deletion under the same flag as the other dead
+        // arms; a peek still advances past it).
+        if require_auth_known(sandbox, maker_gets_leg, &maker) == Some(false) {
             if mutate_dead {
                 delete_maker_offer(sandbox, &okey, &offer, &maker);
                 stale.push(okey);
@@ -1901,6 +1956,14 @@ fn reap_if_dead(
         return true;
     }
     if funding_known && is_dust_offer(sandbox, maker, m_wants0, m_gives0, pays_leg, gets_leg) {
+        delete_maker_offer(sandbox, okey, offer, maker);
+        stale.push(*okey);
+        return true;
+    }
+    // BookStep.cpp:755 — after the stream's own dead tests, the caller
+    // perm-removes any offer whose OWNER may not hold the asset flowing INTO
+    // it (the maker receives `gets_leg`), "even if no crossing occurs".
+    if require_auth_known(sandbox, gets_leg, maker) == Some(false) {
         delete_maker_offer(sandbox, okey, offer, maker);
         stale.push(*okey);
         return true;
@@ -2194,9 +2257,9 @@ fn cross_bridged(
         // silently. Before any fill the peeks stay non-mutating: a strand
         // that is never built reaps nothing (#105795013-analog).
         let peek_rm = crossed > 0;
-        let dpeek = live_head(sandbox, &ld, &mut di, taker, pays_leg, false, peek_rm, stale);
-        let apeek = live_head(sandbox, &la, &mut ai, taker, &xrp_leg, false, peek_rm, stale);
-        let bpeek = live_head(sandbox, &lb, &mut bi, taker, pays_leg, false, peek_rm, stale);
+        let dpeek = live_head(sandbox, &ld, &mut di, taker, pays_leg, gets_leg, false, peek_rm, stale);
+        let apeek = live_head(sandbox, &la, &mut ai, taker, &xrp_leg, gets_leg, false, peek_rm, stale);
+        let bpeek = live_head(sandbox, &lb, &mut bi, taker, pays_leg, &xrp_leg, false, peek_rm, stale);
         let a_fib = amm_a.as_ref().and_then(|am| {
             crate::tx::amm_swap::fib_slice(sandbox, am, amm_a_init, amm_iters, &xrp_leg, gets_leg)
                 .map(|s| (crate::tx::amm_swap::slice_rate(s.0, s.1), s))
@@ -3086,7 +3149,7 @@ thr={t:?} admits_trunc={} admits_up={}",
             }
             if want_direct {
                 let Some((q, okey, offer, maker, gives0, wants0)) =
-                    live_head(sandbox, &ld, &mut di, taker, pays_leg, true, true, stale)
+                    live_head(sandbox, &ld, &mut di, taker, pays_leg, gets_leg, true, true, stale)
                 else { break 'attempt };
                 let funded = available(sandbox, &maker, pays_leg);
                 let m_gives = if me_cmp(funded, gives0).is_lt() { funded } else { gives0 };
@@ -3173,7 +3236,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 let a_book = if a_use_amm {
                     None
                 } else {
-                    match live_head(sandbox, &la, &mut ai, taker, &xrp_leg, true, true, stale) {
+                    match live_head(sandbox, &la, &mut ai, taker, &xrp_leg, gets_leg, true, true, stale) {
                         Some(h) => Some(h),
                         None => break 'attempt,
                     }
@@ -3181,7 +3244,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 let b_book = if b_use_amm {
                     None
                 } else {
-                    match live_head(sandbox, &lb, &mut bi, taker, pays_leg, true, true, stale) {
+                    match live_head(sandbox, &lb, &mut bi, taker, pays_leg, &xrp_leg, true, true, stale) {
                         Some(h) => Some(h),
                         None => break 'attempt,
                     }
