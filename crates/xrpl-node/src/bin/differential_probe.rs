@@ -118,12 +118,29 @@ static RPC_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 fn rpc(url: &str, method: &str, params: Value) -> Option<Value> {
     let dir = cache_dir();
     let path = dir.as_ref().map(|d| d.join(cache_key(url, method, &params)));
+    let dxlog = std::env::var("DX_RPCLOG").is_ok();
+    let brief = || {
+        let mut b = String::new();
+        for k in ["account", "index", "ledger_index", "marker"] {
+            if let Some(v) = params.get(k) {
+                b.push_str(&format!("{k}={} ", v.to_string().chars().take(24).collect::<String>()));
+            }
+        }
+        b
+    };
     if let Some(p) = &path {
         if let Ok(bytes) = std::fs::read(p) {
             if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+                if dxlog {
+                    let err = v.get("result").and_then(|r| r.get("error")).and_then(|e| e.as_str()).unwrap_or("-");
+                    eprintln!("DX_RPCLOG {method} {} CACHE-HIT err={err}", brief());
+                }
                 return Some(v);
             }
         }
+    }
+    if dxlog {
+        eprintln!("DX_RPCLOG {method} {} CACHE-MISS -> live", brief());
     }
     // One shared client: building one per call defeated connection reuse,
     // so every live call paid TCP (and TLS, on the fallback) setup.
@@ -174,14 +191,40 @@ fn rpc(url: &str, method: &str, params: Value) -> Option<Value> {
     if result.get("error").and_then(|e| e.as_str()) == Some("lgrNotFound") {
         if let Ok(fb) = std::env::var("XRPL_PROBE_FALLBACK") {
             if !fb.is_empty() && fb != url {
-                if let Ok(resp) = client
-                    .post(&fb)
-                    .json(&json!({"method": method, "params": [params]}))
-                    .send()
-                {
-                    if let Ok(v) = resp.json::<Value>() {
-                        result = v["result"].clone();
+                // Public full-history infra sheds load under fleet pressure: a
+                // single dropped attempt leaves the primary's lgrNotFound in
+                // place and hydration silently thins (l106281182 re-probed
+                // 52/57 while sweep workers shared the s2 pipe — 2428
+                // permanently-uncacheable misses). Retry like the primary
+                // does, and treat rate-limit answers (slowDown/tooBusy — a
+                // well-formed JSON error) as transient too. lgrNotFound FROM
+                // the full-history server is settled: the seq itself is bad.
+                for attempt in 0..3u64 {
+                    if attempt > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(500 * attempt));
                     }
+                    if let Ok(resp) = client
+                        .post(&fb)
+                        .json(&json!({"method": method, "params": [params]}))
+                        .send()
+                    {
+                        if let Ok(v) = resp.json::<Value>() {
+                            let r = v["result"].clone();
+                            let settled = match r.get("error").and_then(|e| e.as_str()) {
+                                None => !r.is_null(),
+                                Some("entryNotFound") | Some("actNotFound") | Some("lgrNotFound") => true,
+                                Some(_) => false,
+                            };
+                            result = r;
+                            if settled {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if dxlog {
+                    let err = result.get("error").and_then(|e| e.as_str()).unwrap_or("-");
+                    eprintln!("DX_RPCLOG {method} {} FALLBACK-> err={err}", brief());
                 }
             }
         }
@@ -1419,8 +1462,15 @@ fn load_book_pair(
         // both on encounter, our sandbox never loaded them (5v9 muts, engine
         // innocent). The old "marker must be an EXISTING key" constraint is
         // FALSE on xrpld 3.3.0 — a synthetic base24+zeros marker seeks fine.
-        let _ = bd0;
         let mut marker = serde_json::Value::String(format!("{base24}0000000000000000"));
+        // Ancient-fixture fallback: the base-seeded request is a NEW cache key,
+        // and for ledgers older than .39's (rebuilt, shallow) store it can only
+        // miss-then-lgrNotFound — while the OLD best_bd-seeded request's dxcache
+        // entries still hold months of history. First-call failure ⇒ reseed at
+        // bd0 and let the cache serve the walk. (2026-08-27: histsweep went
+        // 36/426 divergent on exactly this — phantom DRY/NO_DST from empty
+        // books on pre-rebuild fixtures.)
+        let mut seeded_fallback = false;
         let mut pages_done = 0usize;
         // Per-book budget for OFFER hydration beyond the first 24 pages: a
         // page object rides the ledger_data batch for free, but each offer
@@ -1437,12 +1487,24 @@ fn load_book_pair(
         'sweep: while pages_done < page_cap {
             let Some(res) = rpc(url, "ledger_data", json!({
                 "ledger_index": ledger_index,
-                "marker": marker,
+                "marker": marker.clone(),
                 "limit": 96,
                 "binary": false,
-            })) else { break };
+            })) else {
+                if !seeded_fallback && pages_done == 0 {
+                    seeded_fallback = true;
+                    marker = serde_json::Value::String(bd0.clone());
+                    continue;
+                }
+                break;
+            };
             let batch = res.get("state").and_then(|v| v.as_array()).cloned().unwrap_or_default();
             if batch.is_empty() {
+                if !seeded_fallback && pages_done == 0 {
+                    seeded_fallback = true;
+                    marker = serde_json::Value::String(bd0.clone());
+                    continue;
+                }
                 break;
             }
             for e in &batch {
