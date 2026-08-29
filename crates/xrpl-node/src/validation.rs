@@ -66,17 +66,27 @@ pub fn supported_amendments() -> Vec<Hash256> {
     names.iter().map(|n| amendment_hash(n)).collect()
 }
 
-/// `sfServerVersion`, encoded per rippled `BuildInfo::encodeSoftwareVersion`
-/// (BuildInfo.cpp:92): `0x183B` implementation identifier in the top 16 bits,
-/// then major<<40 | minor<<32 | patch<<24, then `0xC00000` marking a release
-/// (not a pre-release). We report 3.3.0 — the protocol surface this validator
-/// tracks and byte-verifies (upstream .39 runs xrpld 3.3.0; the engine's full
-/// battery is green against it). Explorers decode this as "3.3.0".
+/// `sfServerVersion`, laid out per rippled `BuildInfo::encodeSoftwareVersion`
+/// (BuildInfo.cpp:92): 16-bit implementation identifier in the top bits, then
+/// major<<40 | minor<<32 | patch<<24, then `0xC00000` marking a release.
 ///
-///   0x183B_0000_0000_0000 | 3<<40 | 3<<32 | 0<<24 | 0xC00000
-const SERVER_VERSION_ENCODED: u64 = 0x183B_0000_0000_0000
-    | (3u64 << 40)
-    | (3u64 << 32)
+/// The identifier is `0x4856` — ASCII "HV", Halcyon Validator — NOT rippled's
+/// `0x183B`: this is an independent Rust engine that tracks rippled 3.3.0's
+/// protocol surface, and claiming to BE rippled would misrepresent what runs
+/// here. Deliberate consequences of a foreign identifier:
+///   - `BuildInfo::isNewerVersion` (:171) tests `isXrpldVersion` first, so a
+///     non-rippled identifier can never trigger peer upgrade-nag logic — the
+///     field is inert on-network.
+///   - VHS/explorers appear to decode the semver bits regardless of the
+///     identifier (44 mainnet validators display non-rippled versions like
+///     "1.0.4"), so this should render as "1.0.0". If a site gates on 0x183B
+///     it will show no version for us — an acceptable price for honesty.
+///
+/// 1.0.0 is the Stage 3 release: state.rocks written from this engine's own
+/// mutation overlay, full battery green (2026-08-28).
+const SERVER_VERSION_ENCODED: u64 = 0x4856_0000_0000_0000
+    | (1u64 << 40)
+    | (0u64 << 32)
     | 0xC0_0000;
 
 /// `sfCookie`: one random-ish value per process run (rippled: `valCookie_`,

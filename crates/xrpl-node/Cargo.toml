@@ -1,6 +1,6 @@
 [package]
 name = "xrpl-node"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "XRPL validator node — peer protocol, consensus, and RPC server"
 license = "MIT"
