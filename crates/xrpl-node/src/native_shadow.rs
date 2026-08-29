@@ -238,7 +238,17 @@ impl NativeShadow {
         for tx in &ordered {
             let Some(txf) = build_txfields(tx) else { continue };
             let expected_ter = tx["metaData"]["TransactionResult"].as_str().unwrap_or("?");
-            let (our_ter, mods) = native_apply_one(&self.state, &txf);
+            let tx_hash = tx["hash"].as_str().unwrap_or("").to_string();
+            let (our_ter, mut mods) = native_apply_one(&self.state, &txf);
+            // Threading stamps (PreviousTxnID/PreviousTxnLgrSeq) — the replay
+            // applies them after every tx; first live ledger without them read
+            // 175 byte-diffs at zero TER mismatches (#106628655).
+            xrpl_ledger::ledger::threading::stamp_threading(
+                &mut mods,
+                &|k| self.state.state_map.lookup(k).map(|b| b.to_vec()),
+                &tx_hash,
+                seq,
+            );
             st.txs_applied.fetch_add(1, Ordering::Relaxed);
             if our_ter == expected_ter {
                 st.ter_matched.fetch_add(1, Ordering::Relaxed);
