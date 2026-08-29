@@ -17,6 +17,8 @@ mod field {
     pub const FLAGS: [u8; 1] = [0x22];            // type=2, field=2
 
     // STI_HASH256 (type 5)
+    pub const COOKIE: [u8; 1] = [0x3A];          // type=3 (UInt64), field=10
+    pub const SERVER_VERSION: [u8; 1] = [0x3B];  // type=3 (UInt64), field=11
     pub const LEDGER_HASH: [u8; 1] = [0x51];           // type=5, field=1
     pub const CONSENSUS_HASH: [u8; 1] = [0x52];         // type=5, field=2
 
@@ -64,6 +66,36 @@ pub fn supported_amendments() -> Vec<Hash256> {
     names.iter().map(|n| amendment_hash(n)).collect()
 }
 
+/// `sfServerVersion`, encoded per rippled `BuildInfo::encodeSoftwareVersion`
+/// (BuildInfo.cpp:92): `0x183B` implementation identifier in the top 16 bits,
+/// then major<<40 | minor<<32 | patch<<24, then `0xC00000` marking a release
+/// (not a pre-release). We report 3.3.0 — the protocol surface this validator
+/// tracks and byte-verifies (upstream .39 runs xrpld 3.3.0; the engine's full
+/// battery is green against it). Explorers decode this as "3.3.0".
+///
+///   0x183B_0000_0000_0000 | 3<<40 | 3<<32 | 0<<24 | 0xC00000
+const SERVER_VERSION_ENCODED: u64 = 0x183B_0000_0000_0000
+    | (3u64 << 40)
+    | (3u64 << 32)
+    | 0xC0_0000;
+
+/// `sfCookie`: one random-ish value per process run (rippled: `valCookie_`,
+/// drawn once at startup). Observers use it to distinguish a restart of one
+/// validator from two processes sharing a key. Derived, not cryptographic —
+/// uniqueness across restarts is all the field is for.
+fn process_cookie() -> u64 {
+    use std::sync::OnceLock;
+    static COOKIE: OnceLock<u64> = OnceLock::new();
+    *COOKIE.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64 ^ (d.as_secs() << 32))
+            .unwrap_or(0x5EED);
+        let mixed = nanos ^ ((std::process::id() as u64) << 17);
+        if mixed == 0 { 0x5EED } else { mixed }
+    })
+}
+
 /// Build the serialized validation object (without signature) for signing.
 /// If `amendments` is Some, includes the Amendments field (for flag ledger votes).
 fn build_validation_for_signing(
@@ -86,6 +118,16 @@ fn build_validation_for_signing(
 
     buf.extend_from_slice(&field::SIGNING_TIME);
     buf.extend_from_slice(&signing_time.to_be_bytes());
+
+    // Type 3 (UINT64): Cookie(10), ServerVersion(11) — rippled sets both on
+    // every validation (RCLConsensus.cpp:842,846). Cookie is a per-process
+    // random that lets observers tell a restart from two processes sharing a
+    // key; ServerVersion is what fills the "Version" column on VHS/xrpscan.
+    buf.extend_from_slice(&field::COOKIE);
+    buf.extend_from_slice(&process_cookie().to_be_bytes());
+
+    buf.extend_from_slice(&field::SERVER_VERSION);
+    buf.extend_from_slice(&SERVER_VERSION_ENCODED.to_be_bytes());
 
     // Type 5 (HASH256): LedgerHash(1), ConsensusHash(2)
     buf.extend_from_slice(&field::LEDGER_HASH);
@@ -154,8 +196,18 @@ pub fn sign_validation(
         .try_into()
         .unwrap_or(u32::MAX);
 
-    // Flags: 0x80000000 = vfFullValidation (we fully validated this ledger)
-    let flags: u32 = 0x80000000;
+    // Flags: kVfFullValidation — we fully validated this ledger.
+    //
+    //     include/xrpl/protocol/STValidation.h:19 (3.2.x):
+    //     constexpr std::uint32_t kVfFullValidation = 0x00000001;
+    //
+    // This was 0x80000000 until 2026-08-17. That value is tfFullyCanonicalSig
+    // (a TRANSACTION flag, TxFlags.h:60); STValidation::isFull() tests bit 0,
+    // so every validation we emitted read as PARTIAL on VHS/explorers.
+    // ⚠ The fix was first applied on m3060's ~/xrpl-330-prod only (deployed
+    // 2026-08-26); this backport makes .39 canonical again so a future rsync
+    // of this file cannot regress it. Verified live: VHS partial:false.
+    let flags: u32 = 0x00000001;
 
     let pub_key = identity.public_key();
 
