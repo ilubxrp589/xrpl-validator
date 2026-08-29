@@ -14,6 +14,9 @@
 //! - **Follower** — sync ledger state, serve RPC, no consensus
 //! - **Validator** — full consensus participation with validation signing
 
+pub mod native_apply;
+#[cfg(feature = "ffi")]
+pub mod native_shadow;
 pub mod amendments;
 pub mod bulk_sync;
 pub mod rippled_client;

@@ -105,6 +105,15 @@ pub async fn start_ws_sync(
     if stage3_cfg.enabled {
         eprintln!("[stage3] ENABLED — FFI overlay will source state.rocks bytes (singletons still RPC)");
     }
+    // Stage 4 Phase A: optional native-engine shadow (XRPL_NATIVE_SHADOW=1).
+    // Only meaningful under Stage 3 — the awaited FFI overlay is what it
+    // compares against; without Stage 3 it simply never fires.
+    #[cfg(feature = "ffi")]
+    let mut native_shadow = crate::native_shadow::NativeShadow::maybe_new();
+    #[cfg(feature = "ffi")]
+    if native_shadow.is_some() && !stage3_cfg.enabled {
+        eprintln!("[native-shadow] WARNING: XRPL_NATIVE_SHADOW set but Stage 3 is OFF — shadow will never run");
+    }
     // Publish stage3 state to FfiStats so /api/engine can expose it for
     // dashboards + watch_engine.py. Only when the ffi verifier is present.
     #[cfg(feature = "ffi")]
@@ -514,6 +523,27 @@ pub async fn start_ws_sync(
                                     match task.await {
                                         Ok(o) => ffi_overlay_opt = Some(o),
                                         Err(e) => eprintln!("[stage3] FFI verify task join failed for #{seq}: {e}"),
+                                    }
+                                    // Stage 4 Phase A: the native Rust engine shadows the
+                                    // FFI leg — same txs, in-RAM mirror, overlay-vs-overlay
+                                    // compare. Requires Stage 3 (the awaited overlay IS the
+                                    // comparand). First call hydrates the mirror from
+                                    // state.rocks (~minutes, once); the hold-position
+                                    // machinery absorbs the stall.
+                                    if let (Some(shadow), Some(overlay)) =
+                                        (native_shadow.as_mut(), ffi_overlay_opt.as_ref())
+                                    {
+                                        if !shadow.hydrated {
+                                            shadow.hydrate(&db, process_seq - 1);
+                                        }
+                                        shadow.on_ledger(
+                                            process_seq,
+                                            &ledger_header.parent_hash,
+                                            ledger_header.parent_close_time,
+                                            ledger_header.total_drops,
+                                            &sorted_txs,
+                                            overlay,
+                                        );
                                     }
                                 }
                                 // else: drop(task) is implicit; task continues running fire-and-forget

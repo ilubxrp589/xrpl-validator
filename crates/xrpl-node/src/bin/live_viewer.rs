@@ -1676,6 +1676,31 @@ async fn main() {
                     {
                         json["ffi_verifier"] = serde_json::json!({"enabled": false, "note": "build with --features ffi"});
                     }
+                    // Stage 4 Phase A: native-engine shadow counters.
+                    #[cfg(feature = "ffi")]
+                    {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        let s = xrpl_node::native_shadow::stats();
+                        json["native_shadow"] = serde_json::json!({
+                            "enabled": s.enabled.load(Relaxed) == 1,
+                            "hydrated": s.hydrated.load(Relaxed) == 1,
+                            "hydrate_objects": s.hydrate_objects.load(Relaxed),
+                            "hydrate_decode_err": s.hydrate_decode_err.load(Relaxed),
+                            "hydrate_ms": s.hydrate_ms.load(Relaxed),
+                            "ledgers": s.ledgers.load(Relaxed),
+                            "full_match": s.full_match.load(Relaxed),
+                            "overlay_diverged": s.overlay_diverged.load(Relaxed),
+                            "txs_applied": s.txs_applied.load(Relaxed),
+                            "ter_matched": s.ter_matched.load(Relaxed),
+                            "ter_mismatched": s.ter_mismatched.load(Relaxed),
+                            "keys_compared": s.keys_compared.load(Relaxed),
+                            "key_missing": s.key_missing.load(Relaxed),
+                            "key_extra": s.key_extra.load(Relaxed),
+                            "byte_mismatch": s.byte_mismatch.load(Relaxed),
+                            "skipped_gap": s.skipped_gap.load(Relaxed),
+                            "apply_ms_last": s.apply_ms_last.load(Relaxed),
+                        });
+                    }
                     axum::Json(json)
                 }
             }
