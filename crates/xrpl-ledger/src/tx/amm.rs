@@ -1597,11 +1597,39 @@ impl Transactor for AMMVoteTransactor {
             updated
                 .iter()
                 .map(|(a, f, w)| {
-                    serde_json::json!({"VoteEntry": {"Account": a, "TradingFee": f, "VoteWeight": w}})
+                    // Finding 33 (#106629215 AC9BA657): sfTradingFee is
+                    // SoeDefault in VoteEntry — a ZERO fee is OMITTED from the
+                    // serialization (r4eqGMgL votes fee 0; truth's object is
+                    // 3 bytes shorter than ours per omitted entry). Same rule
+                    // for the AMM root's own TradingFee below.
+                    if *f == 0 {
+                        serde_json::json!({"VoteEntry": {"Account": a, "VoteWeight": w}})
+                    } else {
+                        serde_json::json!({"VoteEntry": {"Account": a, "TradingFee": f, "VoteWeight": w}})
+                    }
                 })
                 .collect(),
         );
-        amm["TradingFee"] = serde_json::json!(fee_avg);
+        if fee_avg == 0 {
+            if let Some(o) = amm.as_object_mut() {
+                o.remove("TradingFee");
+            }
+        } else {
+            amm["TradingFee"] = serde_json::json!(fee_avg);
+        }
+        // Finding 33b (#106629215 AC9BA657): the AuctionSlot's DiscountedFee
+        // follows the vote — fee/10, set when nonzero, REMOVED when zero
+        // (AMMVote.cpp:208-218; truth 185/10=18 where we left the stale 10).
+        if amm.get("AuctionSlot").is_some() {
+            let df = fee_avg / 10;
+            if df == 0 {
+                if let Some(slot) = amm["AuctionSlot"].as_object_mut() {
+                    slot.remove("DiscountedFee");
+                }
+            } else {
+                amm["AuctionSlot"]["DiscountedFee"] = serde_json::json!(df);
+            }
+        }
         let _ = amm_acct;
         crate::tx::offer::put_json(sandbox, amm_key, &amm);
         TxResult::Success
