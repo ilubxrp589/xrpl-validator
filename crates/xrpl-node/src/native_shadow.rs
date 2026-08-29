@@ -254,9 +254,43 @@ impl NativeShadow {
                 st.ter_matched.fetch_add(1, Ordering::Relaxed);
             } else {
                 st.ter_mismatched.fetch_add(1, Ordering::Relaxed);
+                // Stale-mirror audit: for each key this tx's TRUE meta touched,
+                // does the mirror's CURRENT value match the meta's
+                // PreviousFields where given? A named mismatch here = the key
+                // went stale in the mirror before this ledger — the class name
+                // tells us which reconcile lane is leaking.
+                let mut stale: Vec<String> = Vec::new();
+                for node in tx["metaData"]["AffectedNodes"].as_array().into_iter().flatten() {
+                    let n = &node["ModifiedNode"];
+                    let (Some(li), Some(pf)) = (n["LedgerIndex"].as_str(), n["PreviousFields"].as_object()) else { continue };
+                    let Ok(kb) = hex::decode(li) else { continue };
+                    let Ok(karr) = <[u8; 32]>::try_from(kb.as_slice()) else { continue };
+                    let mine = self
+                        .state
+                        .state_map
+                        .lookup(&Hash256(karr))
+                        .and_then(|b| serde_json::from_slice::<Value>(b).ok());
+                    for (f, want) in pf {
+                        if f == "PreviousTxnID" || f == "PreviousTxnLgrSeq" {
+                            continue;
+                        }
+                        let have = mine.as_ref().and_then(|m| m.get(f));
+                        if have != Some(want) {
+                            let ty = n["LedgerEntryType"].as_str().unwrap_or("?");
+                            stale.push(format!(
+                                "{}:{ty}.{f} mirror={} meta={}",
+                                &li[..12.min(li.len())],
+                                have.map(|v| v.to_string().chars().take(28).collect::<String>()).unwrap_or_else(|| "ABSENT".into()),
+                                want.to_string().chars().take(28).collect::<String>()
+                            ));
+                        }
+                    }
+                }
                 ter_mm.push(format!(
-                    "{}:{our_ter} vs {expected_ter}",
-                    tx["hash"].as_str().unwrap_or("?").chars().take(12).collect::<String>()
+                    "{}:{} {our_ter} vs {expected_ter}{}",
+                    tx["hash"].as_str().unwrap_or("?").chars().take(12).collect::<String>(),
+                    txf.tx_type,
+                    if stale.is_empty() { String::new() } else { format!(" STALE[{}]", stale.join(" | ")) }
                 ));
             }
             for (k, ent) in mods {
@@ -286,7 +320,14 @@ impl NativeShadow {
             }
             compared += 1;
             if !dirty.contains(&kh) {
-                missing.push(hex::encode_upper(k));
+                // Name the class: decode the FFI bytes for LedgerEntryType so
+                // the receipt histogram says WHAT we fail to touch.
+                let ty = ffi_val
+                    .as_ref()
+                    .and_then(|b| xrpl_core::codec::decode::decode_transaction_binary(b).ok())
+                    .and_then(|v| v["LedgerEntryType"].as_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "deleted".to_string());
+                missing.push(format!("{}:{ty}", hex::encode_upper(k)));
                 continue;
             }
             let ours = self.state.state_map.lookup(&kh).map(|b| b.to_vec());
@@ -396,6 +437,56 @@ impl NativeShadow {
                     let _ = self.state.state_map.delete(&kh);
                 }
             }
+        }
+        // Post-reconcile verifier: every overlay key re-read from the mirror
+        // and byte-checked. A failure here is the leak AT BIRTH — the stale
+        // audits above only see it ledgers later.
+        let mut leak = 0u32;
+        for (k, ffi_val) in ffi_overlay {
+            let kh = Hash256(*k);
+            if is_singleton_key(&kh, seq) {
+                continue;
+            }
+            let mine = self.state.state_map.lookup(&kh).map(|b| b.to_vec());
+            match (mine, ffi_val) {
+                (None, None) => {}
+                (Some(jb), Some(fb)) => {
+                    let ok = serde_json::from_slice::<Value>(&jb).ok().and_then(|mut v| {
+                        canon_for_encode(&mut v);
+                        xrpl_core::codec::encode::encode_transaction_json(&v, false).ok()
+                    });
+                    if ok.as_deref() != Some(fb.as_slice()) {
+                        leak += 1;
+                        if leak <= 3 {
+                            eprintln!(
+                                "[native-shadow] #{seq} RECONCILE-LEAK reencode {} (roundtrip differs)",
+                                hex::encode_upper(k)
+                            );
+                        }
+                    }
+                }
+                (Some(_), None) => {
+                    leak += 1;
+                    if leak <= 3 {
+                        eprintln!(
+                            "[native-shadow] #{seq} RECONCILE-LEAK undead {} (should be deleted, still present)",
+                            hex::encode_upper(k)
+                        );
+                    }
+                }
+                (None, Some(_)) => {
+                    leak += 1;
+                    if leak <= 3 {
+                        eprintln!(
+                            "[native-shadow] #{seq} RECONCILE-LEAK vanished {} (should exist, absent)",
+                            hex::encode_upper(k)
+                        );
+                    }
+                }
+            }
+        }
+        if leak > 0 {
+            eprintln!("[native-shadow] #{seq} RECONCILE-LEAK total={leak}");
         }
         self.at_seq = seq;
     }
