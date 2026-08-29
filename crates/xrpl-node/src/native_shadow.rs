@@ -286,11 +286,24 @@ impl NativeShadow {
                         }
                     }
                 }
+                // Defect B instrument: the first mismatch per ledger dumps the
+                // ENGINE'S-EYE tx — the parsed fields exactly as build_txfields
+                // delivered them. Offline replays of the same ledgers read
+                // clean, so if the live inputs differ in any byte, this names
+                // it; if they match, the divergence is environmental to the
+                // process and the dump proves that too.
+                let dump = if ter_mm.is_empty() {
+                    let fields = serde_json::to_string(&txf.fields).unwrap_or_default();
+                    format!(" FIELDS[{}]", fields.chars().take(700).collect::<String>())
+                } else {
+                    String::new()
+                };
                 ter_mm.push(format!(
-                    "{}:{} {our_ter} vs {expected_ter}{}",
+                    "{}:{} {our_ter} vs {expected_ter}{}{}",
                     tx["hash"].as_str().unwrap_or("?").chars().take(12).collect::<String>(),
                     txf.tx_type,
-                    if stale.is_empty() { String::new() } else { format!(" STALE[{}]", stale.join(" | ")) }
+                    if stale.is_empty() { String::new() } else { format!(" STALE[{}]", stale.join(" | ")) },
+                    dump
                 ));
             }
             for (k, ent) in mods {
