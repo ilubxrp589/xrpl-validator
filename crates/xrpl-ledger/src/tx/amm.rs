@@ -359,6 +359,36 @@ use crate::tx::offer as ox;
 /// significant digits in ONE direction (`Number::upward` / `downward`), as
 /// opposed to `st_multiply`'s half-even. XRP is integral, so it rounds to whole
 /// drops instead.
+/// `num/den` ceiled at 16 significant digits — the equal-withdraw fraction's
+/// direction (finding 31/32): one exact division with any nonzero remainder
+/// rounding UP, so the 17→16 normalization can never eat the round.
+fn st_divide_up(num: ox::Me, den: ox::Me) -> ox::Me {
+    if num.0 == 0 || den.0 == 0 {
+        return (0, 0);
+    }
+    let (nm, ne) = ox::norm16(num);
+    let (dm, de) = ox::norm16(den);
+    // nm,dm ∈ [1e15,1e16) ⇒ nm·1e16/dm ∈ (1e15,1e17): at most 17 digits.
+    let scaled = nm * 10_000_000_000_000_000u128;
+    let (mut q, r) = (scaled / dm, scaled % dm);
+    let mut e = ne - de - 16;
+    if r != 0 {
+        q += 1;
+    }
+    while q >= 10_000_000_000_000_000 {
+        // Entered the 17-digit range: shed exactly like Number would, but the
+        // ceil already happened on the exact remainder — a shed nonzero digit
+        // re-ceils.
+        let d = q % 10;
+        q /= 10;
+        if d != 0 {
+            q += 1;
+        }
+        e += 1;
+    }
+    (q, e)
+}
+
 fn mul_directed(a: ox::Me, b: ox::Me, up: bool, xrp: bool) -> ox::Me {
     if a.0 == 0 || b.0 == 0 {
         return (0, 0);
@@ -1007,8 +1037,23 @@ fn payout_proportional_to(
         //
         // #105796380 2437575D (tfWithdrawAll) is the specimen: the withdrawer's
         // Jocker line lands …890599 against mainnet's …890600, one ulp.
-        let frac = ox::st_divide(tokens, total_lp, false);
+        // Findings 31+32 (#106629211 7ED17A0F, ONE tfWithdrawAll paying an
+        // ARMY/DROP two-IOU pool): the FRACTION rounds UP and both asset
+        // products round DOWN — the unique pair satisfying BOTH sides of the
+        // same withdrawal (DROP wanted …2140 where frac-nearest×down lands
+        // …2139; ARMY wanted …065 where frac-nearest×up lands …066). The
+        // dust calibrator #106014913 5788637E stays correct: a ceiled dust
+        // fraction times the pool still FLOORS to zero and the one-sided
+        // check fails with tecAMM_FAILED. The vendored source reads as plain
+        // divide + Downward products; the wire disagrees on the fraction —
+        // port the bytes, not the comment.
+        let frac = st_divide_up(tokens, total_lp);
         let share = mul_directed(pool, frac, false, leg.xrp);
+        if std::env::var("DX_AMMWD").is_ok() {
+            eprintln!(
+                "DX_AMMWD {f} pool={pool:?} tokens={tokens:?} total_lp={total_lp:?} frac={frac:?} share={share:?}"
+            );
+        }
         shares.push((leg, share));
     }
     // A side that rounded to zero fails the whole withdrawal — nothing written.
