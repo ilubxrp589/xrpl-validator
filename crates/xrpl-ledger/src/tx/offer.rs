@@ -3225,6 +3225,9 @@ thr={t:?} admits_trunc={} admits_up={}",
                 //
                 // Same defect as `offer_residual` (4556384), one level up: that
                 // fixed what we STORE, this fixes what we CARRY.
+                if std::env::var("DX_FILL").is_ok() {
+                    eprintln!("DX_FILL give={give:?} pay={pay:?} rem_pays={rem_pays:?} rem_gets={rem_gets:?}");
+                }
                 rem_pays = me_sub(rem_pays, give);
                 rem_gets = me_sub(rem_gets, pay);
                 crossed += 1;
@@ -4528,6 +4531,26 @@ pub(crate) fn cross_engine_to_net(
                 if me_cmp(pay, rem_gets).is_gt() {
                     pay = rem_gets;
                     taker_clamped = true;
+                    // Finding 30 (#106629200 9264210055): the FUNDS-exhausting
+                    // fill sizes from the gross-cap chain (STAmount adds — the
+                    // stored line's own arithmetic), not the rem_gets me_sub
+                    // chain; the two drift ±1 ulp apart over multi-fill
+                    // crossings and rippled re-reads the line per iteration.
+                    // UNRATED fills only: a rated fill's `pay` is the NET while
+                    // the cap is GROSS (its taker side is already verbatim via
+                    // a12ffd5; the net keeps today's path).
+                    if !gets_leg.xrp
+                        && transfer_rate(sandbox, gets_leg)
+                            .filter(|_| taker != &gets_leg.issuer && maker != gets_leg.issuer)
+                            .is_none()
+                    {
+                        if let Some(cap) = gets_gross_cap {
+                            let verb = me_sub(cap, in_gross_spent);
+                            if !me_is_zero(verb) {
+                                pay = verb;
+                            }
+                        }
+                    }
                     // The IN-limited mirror of the out-limited pricing above.
                     // `Quality::ceil_in` is
                     //   result.out = divRound(limit, quality.rate(), asset, roundUp)
@@ -4740,6 +4763,9 @@ pub(crate) fn cross_engine_to_net(
                         line_adjust(sandbox, &maker, gets_leg, pay, true);
                         taker_accs.1 = stamount_signed_add(false, taker_accs.1, false, g).1;
                     }
+                }
+                if std::env::var("DX_FILL").is_ok() {
+                    eprintln!("DX_FILL give={give:?} pay={pay:?} rem_pays={rem_pays:?} rem_gets={rem_gets:?}");
                 }
                 rem_pays = me_sub(rem_pays, give);
                 rem_gets = me_sub(rem_gets, pay);
@@ -5295,7 +5321,15 @@ impl Transactor for OfferCreateTransactor {
         // through the pool — mainnet lands canonical zero, the re-gross
         // left +1e-20. Underfunded+rated only: the unclamped path grosses
         // the same product on both sides and never splits.
-        let gross_cap = if underfunded { xfer_in.map(|_| avail) } else { None };
+        // Finding 30 (#106629200 9264210055): armed for UNRATED underfunded
+        // too — not for a gross/net split (none exists unrated) but because
+        // the funds-EXHAUSTING fill must take `cap − spent` VERBATIM: the
+        // walk's rem_gets me_sub chain and the line's STAmount adds round
+        // through different sequences and drift ±1 ulp over a multi-fill
+        // crossing (slice 5 pays …443496 off the chain where the stored line
+        // remainder — rippled's per-iteration re-read — is …443500, and the
+        // maker's owed line must close to EXACT ZERO).
+        let gross_cap = if underfunded { Some(avail) } else { None };
         let (rem_pays, rem_gets_cross, crossed) = cross_engine_to_net(
             &tx.account, &tx.account, tp0, tg_cross, &pays_leg, &gets_leg, threshold,
             threshold_self, sell, true, false, None, domain.as_ref(), None, gross_cap,
