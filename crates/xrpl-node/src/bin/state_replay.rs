@@ -626,6 +626,12 @@ fn run() -> i32 {
         let mut ter_mismatch = 0usize;
         let mut fatal_skip = 0usize;
 
+        // XRPL_REPLAY_TIMING=1: per-ledger phase timing on its own line (the
+        // Stage 4 perf gate — raw native-apply cost with no RPC in the path).
+        // Separate line, not REPLAY-line fields: the gates grep those lines.
+        let timing_on = std::env::var("XRPL_REPLAY_TIMING").is_ok();
+        let t_apply0 = std::time::Instant::now();
+
         for tx in &txs {
             let h = tx["hash"].as_str().unwrap_or("").to_string();
             let expected_ter =
@@ -716,7 +722,9 @@ fn run() -> i32 {
             }
         }
 
+        let apply_ms = t_apply0.elapsed().as_secs_f64() * 1000.0;
         update_skip_list(&mut state, &mut dirty, target, &parent_hash_hex);
+        let t_hash0 = std::time::Instant::now();
 
         // Re-encode every dirty node and patch the sorted entries vec.
         let mut encode_err = 0usize;
@@ -775,6 +783,13 @@ fn run() -> i32 {
         }
 
         let root = hex::encode_upper(fold_root(&entries).0);
+        if timing_on {
+            let hash_ms = t_hash0.elapsed().as_secs_f64() * 1000.0;
+            println!(
+                "TIMING #{target} txs={n_txs} apply={apply_ms:.1}ms encode+fold={hash_ms:.1}ms total={:.1}ms",
+                apply_ms + hash_ms
+            );
+        }
         let ok = root == expected_ah && fatal_skip == 0 && encode_err == 0;
         if diff && root != expected_ah {
             // Two-sided node diff against the true post-state.
