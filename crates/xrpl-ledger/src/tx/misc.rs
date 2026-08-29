@@ -19,16 +19,14 @@ use crate::ledger::keylet;
 use crate::ledger::sandbox::Sandbox;
 use crate::ledger::transactor::{Transactor, TxFields, TxResult};
 
-/// Helper: decode a 20-byte hex account ID from a JSON value.
+/// Helper: decode a 20-byte account ID from a JSON value.
+///
+/// Accepts 40-char hex (as the probe emits for hex-normalised ACCOUNT_FIELDS)
+/// and base58 r-addresses. Clawback's holder is the nested `Amount.issuer`,
+/// which the probe never hex-normalises -- decoding it hex-only returned None
+/// and wrongly rejected the tx as Malformed.
 fn decode_account_id(val: &serde_json::Value) -> Option<[u8; 20]> {
-    let hex_str = val.as_str()?;
-    let bytes = hex::decode(hex_str).ok()?;
-    if bytes.len() != 20 {
-        return None;
-    }
-    let mut arr = [0u8; 20];
-    arr.copy_from_slice(&bytes);
-    Some(arr)
+    crate::tx::offer::decode20(val.as_str()?)
 }
 
 // ---------------------------------------------------------------------------
@@ -136,22 +134,27 @@ impl Transactor for SignerListSetTransactor {
         };
 
         let acct_key = keylet::account_root_key(&tx.account);
-
-        // Use a deterministic key for the signer list: same space as owner dir
-        // but with a special marker. Simplified: hash(account + "SignerList").
-        let signer_list_key = {
-            use crate::shamap::hash::sha512_half;
-            let mut buf = Vec::with_capacity(30);
-            buf.extend_from_slice(&[0x00, 0x53]); // 'S' for SignerList
-            buf.extend_from_slice(&tx.account);
-            sha512_half(&buf)
-        };
+        // The REAL keylet (rippled keylet::signers): 0x0053 || account || u32 0.
+        // The previous fabricated key (no trailing SignerListID) pointed at a
+        // key mainnet never touches — #106069820 C9DBE048 deletes a list and
+        // we probed sandbox.exists at the wrong key, did nothing, fee-only
+        // 1v3 (mainnet deletes the SignerList AND its owner-dir entry).
+        let signer_list_key = keylet::signers_key(&tx.account);
 
         if quorum == 0 {
             // Quorum of 0 means delete the signer list
-            if sandbox.exists(&signer_list_key) {
+            if let Some(data) = sandbox.read(&signer_list_key) {
+                let node_hint = serde_json::from_slice::<serde_json::Value>(&data)
+                    .ok()
+                    .and_then(|l| {
+                        l.get("OwnerNode")
+                            .and_then(|v| v.as_str())
+                            .and_then(|h| u64::from_str_radix(h, 16).ok())
+                    });
                 sandbox.delete(signer_list_key);
-                // Decrement OwnerCount
+                crate::ledger::directory::owner_dir_remove(
+                    sandbox, &tx.account, &signer_list_key, node_hint, false,
+                );
                 if let Some(data) = sandbox.read(&acct_key) {
                     if let Ok(mut acct) = serde_json::from_slice::<serde_json::Value>(&data) {
                         let count = acct["OwnerCount"].as_u64().unwrap_or(0);
@@ -169,17 +172,22 @@ impl Transactor for SignerListSetTransactor {
 
             let already_exists = sandbox.exists(&signer_list_key);
 
+            // Mainnet shape: SignerListID 0 and lsfOneOwnerCount (65536,
+            // featureMultiSignReserve — every list charges ONE owner unit).
             let signer_list_obj = serde_json::json!({
                 "LedgerEntryType": "SignerList",
+                "Flags": 65536,
                 "SignerQuorum": quorum,
                 "SignerEntries": signers,
+                "SignerListID": 0,
                 "OwnerNode": "0",
             });
 
             sandbox.write(signer_list_key, serde_json::to_vec(&signer_list_obj).unwrap());
 
-            // Increment OwnerCount only if this is a new signer list
+            // Increment OwnerCount + owner-dir entry only for a NEW list
             if !already_exists {
+                crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &signer_list_key);
                 if let Some(data) = sandbox.read(&acct_key) {
                     if let Ok(mut acct) = serde_json::from_slice::<serde_json::Value>(&data) {
                         let count = acct["OwnerCount"].as_u64().unwrap_or(0);
@@ -316,9 +324,22 @@ impl Transactor for ClawbackTransactor {
         if tx.fee == 0 {
             return TxResult::BadFee;
         }
-        // Amount is required (IOU amount to claw back)
-        if tx.fields.get("Amount").is_none() {
+        // Amount is required (IOU or MPT amount to claw back)
+        let Some(amount) = tx.fields.get("Amount") else {
             return TxResult::Malformed;
+        };
+        // MPT arm (Clawback.cpp preflightHelper<MPTIssue>): Holder required,
+        // may not be the issuer itself, value positive within the signed cap.
+        if let Some((_, v)) = crate::tx::mpt::parse_mpt_amount(amount) {
+            let Some(holder) = tx.fields.get("Holder").and_then(|h| decode_account_id(h)) else {
+                return TxResult::Malformed;
+            };
+            if holder == tx.account {
+                return TxResult::Malformed;
+            }
+            if v == 0 || v > crate::tx::mpt::MAX_MPT_AMOUNT {
+                return TxResult::BadAmount;
+            }
         }
         TxResult::Success
     }
@@ -336,6 +357,80 @@ impl Transactor for ClawbackTransactor {
             Some(a) => a,
             None => return TxResult::Malformed,
         };
+
+        // MPT arm (Clawback.cpp preclaimHelper<MPTIssue> + applyHelper).
+        // rippled's preclaim order decides the code: missing issuance or
+        // missing holder MPToken → tecOBJECT_NOT_FOUND; no lsfMPTCanClawback
+        // or wrong issuer → tecNO_PERMISSION; a holder whose spendable
+        // balance is zero → tecINSUFFICIENT_FUNDS (3EC225FD, l106259185 —
+        // the tx still consumes its Ticket, which is all its meta shows).
+        // Unported, no specimen: tecPSEUDO_ACCOUNT / tecAMM_ACCOUNT holders.
+        if let Some((mptid, value)) = crate::tx::mpt::parse_mpt_amount(amount) {
+            let holder = match tx.fields.get("Holder").and_then(|h| decode_account_id(h)) {
+                Some(h) => h,
+                None => return TxResult::Malformed,
+            };
+            if !sandbox.exists(&keylet::account_root_key(&holder)) {
+                return TxResult::NoAccount;
+            }
+            let issuance_key = keylet::mpt_issuance_key(&mptid);
+            let Some(mut issuance) = sandbox
+                .read(&issuance_key)
+                .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+            else {
+                return TxResult::ObjectNotFound;
+            };
+            let iflags = issuance.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+            if iflags & crate::tx::mpt::LSF_MPT_CAN_CLAWBACK == 0 {
+                return TxResult::NoPermission;
+            }
+            let issuer_ok = issuance
+                .get("Issuer")
+                .and_then(|v| v.as_str())
+                .and_then(crate::tx::offer::decode20)
+                .map(|i| i == tx.account)
+                .unwrap_or(false);
+            if !issuer_ok {
+                return TxResult::NoPermission;
+            }
+            let token_key = keylet::mptoken_key(&issuance_key, &holder);
+            let Some(mut token) = sandbox
+                .read(&token_key)
+                .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+            else {
+                return TxResult::ObjectNotFound;
+            };
+            let spendable = token
+                .get("MPTAmount")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            if spendable == 0 {
+                return TxResult::InsufficientFunds;
+            }
+            // Claw min(spendable, amount): holder MPTAmount down (zero is
+            // omitted — SoeDefault), issuance OutstandingAmount down
+            // (SoeRequired — "0" stays written).
+            let claw = spendable.min(value);
+            let rest = spendable - claw;
+            if rest == 0 {
+                if let Some(o) = token.as_object_mut() {
+                    o.remove("MPTAmount");
+                }
+            } else {
+                token["MPTAmount"] = serde_json::Value::String(rest.to_string());
+            }
+            sandbox.write(token_key, serde_json::to_vec(&token).unwrap_or_default());
+            let outstanding = issuance
+                .get("OutstandingAmount")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            issuance["OutstandingAmount"] =
+                serde_json::Value::String(outstanding.saturating_sub(claw).to_string());
+            sandbox.write(issuance_key, serde_json::to_vec(&issuance).unwrap_or_default());
+            return TxResult::Success;
+        }
 
         // Amount must be an IOU object: {currency, issuer, value}
         let currency_str = match amount.get("currency").and_then(|c| c.as_str()) {
@@ -437,26 +532,6 @@ macro_rules! stub_transactor {
     };
 }
 
-stub_transactor!(TicketCreateTransactor, "TicketCreate");
-stub_transactor!(OracleSetTransactor, "OracleSet");
-stub_transactor!(OracleDeleteTransactor, "OracleDelete");
-stub_transactor!(DIDSetTransactor, "DIDSet");
-stub_transactor!(DIDDeleteTransactor, "DIDDelete");
-stub_transactor!(XChainCreateBridgeTransactor, "XChainCreateBridge");
-stub_transactor!(XChainCreateClaimIDTransactor, "XChainCreateClaimID");
-stub_transactor!(XChainCommitTransactor, "XChainCommit");
-stub_transactor!(XChainClaimTransactor, "XChainClaim");
-stub_transactor!(XChainModifyBridgeTransactor, "XChainModifyBridge");
-stub_transactor!(XChainAccountCreateCommitTransactor, "XChainAccountCreateCommit");
-stub_transactor!(XChainAddClaimAttestationTransactor, "XChainAddClaimAttestation");
-stub_transactor!(XChainAddAccountCreateAttestationTransactor, "XChainAddAccountCreateAttestation");
-stub_transactor!(PermissionedDomainSetTransactor, "PermissionedDomainSet");
-stub_transactor!(PermissionedDomainDeleteTransactor, "PermissionedDomainDelete");
-stub_transactor!(AMMClawbackTransactor, "AMMClawback");
-stub_transactor!(MPTokenIssuanceCreateTransactor, "MPTokenIssuanceCreate");
-stub_transactor!(MPTokenIssuanceDestroyTransactor, "MPTokenIssuanceDestroy");
-stub_transactor!(MPTokenIssuanceSetTransactor, "MPTokenIssuanceSet");
-stub_transactor!(MPTokenAuthorizeTransactor, "MPTokenAuthorize");
 
 #[cfg(test)]
 mod tests {
@@ -731,6 +806,61 @@ mod tests {
     }
 
     #[test]
+    fn clawback_decodes_base58_holder_issuer() {
+        // The probe never hex-normalises the nested Amount.issuer, so Clawback
+        // sees the holder as a base58 r-address. A hex-only decode returned
+        // None -> Malformed, wrongly dropping a tx mainnet applies (a spurious
+        // reject is consensus-relevant). offer::decode20 handles base58.
+        let issuer = [0x01u8; 20];
+        let holder_addr = "rNR6vtb85KWJyTs86mcHB2UqNVwgnaBGRF";
+        let holder =
+            crate::tx::offer::decode20(holder_addr).expect("base58 holder must decode");
+        let state = make_state(&[(issuer, 50_000_000), (holder, 50_000_000)]);
+        let mut sandbox = Sandbox::new(&state);
+
+        let currency_code = {
+            let mut code = [0u8; 20];
+            code[12] = b'U';
+            code[13] = b'S';
+            code[14] = b'D';
+            code
+        };
+        let line_key = keylet::ripple_state_key(&issuer, &holder, &currency_code);
+        let (low, high) = if issuer < holder {
+            (hex::encode(issuer), hex::encode(holder))
+        } else {
+            (hex::encode(holder), hex::encode(issuer))
+        };
+        let bal = if issuer < holder { "-100" } else { "100" };
+        let line_obj = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": {"currency": "USD", "issuer": "0000000000000000000000000000000000000000", "value": bal},
+            "LowLimit": {"currency": "USD", "issuer": low, "value": "0"},
+            "HighLimit": {"currency": "USD", "issuer": high, "value": "1000"},
+            "Flags": 0,
+        });
+        sandbox.write(line_key, serde_json::to_vec(&line_obj).unwrap());
+
+        let tx = TxFields {
+            account: issuer,
+            tx_type: "Clawback".to_string(),
+            fee: 12,
+            sequence: 1,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            // base58 issuer, exactly as the probe feeds it.
+            fields: serde_json::json!({
+                "Amount": { "currency": "USD", "issuer": holder_addr, "value": "30" }
+            }),
+        };
+        // Was Malformed before the fix (base58 holder failed the hex-only decode).
+        assert_eq!(
+            ClawbackTransactor.do_apply(&tx, &mut sandbox),
+            TxResult::Success
+        );
+    }
+
+    #[test]
     fn clawback_no_trust_line_fails() {
         let issuer = [0x01u8; 20];
         let state = make_state(&[(issuer, 50_000_000)]);
@@ -752,5 +882,276 @@ mod tests {
             }),
         };
         assert_eq!(ClawbackTransactor.do_apply(&tx, &mut sandbox), TxResult::NoEntry);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DID — DIDSet / DIDDelete (DIDSet.cpp / DIDDelete.cpp; ⚠ no mainnet
+// specimen in any fixture window — blind source port, the scout is the
+// verifier when one lands).
+// ---------------------------------------------------------------------------
+
+/// Shared create tail (DIDSet.cpp addSLE): reserve on the CURRENT (post-fee)
+/// balance, insert, owner-dir link, OwnerCount+1.
+fn add_owned_object(
+    sandbox: &mut Sandbox,
+    owner: &[u8; 20],
+    key: xrpl_core::types::Hash256,
+    mut obj: serde_json::Value,
+) -> TxResult {
+    let acct_key = keylet::account_root_key(owner);
+    let Some(acct) = crate::tx::offer::json_at(sandbox, &acct_key) else {
+        return TxResult::NoAccount;
+    };
+    let balance = acct["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let oc = acct["OwnerCount"].as_u64().unwrap_or(0);
+    if balance < crate::ledger::fees::account_reserve(sandbox, oc + 1) {
+        return TxResult::InsufficientReserve;
+    }
+    let node = crate::ledger::directory::owner_dir_insert(sandbox, owner, &key);
+    obj["OwnerNode"] = serde_json::Value::String(format!("{node:x}"));
+    sandbox.write(key, serde_json::to_vec(&obj).unwrap_or_default());
+    crate::tx::offer::owner_count_add(sandbox, owner, 1);
+    TxResult::Success
+}
+
+/// Shared delete tail (DIDDelete.cpp deleteSLE): dir unlink (keep_root),
+/// OwnerCount-1, erase. tecNO_ENTRY when the object is absent.
+fn delete_owned_object(
+    sandbox: &mut Sandbox,
+    owner: &[u8; 20],
+    key: xrpl_core::types::Hash256,
+) -> TxResult {
+    let Some(obj) = crate::tx::offer::json_at(sandbox, &key) else {
+        return TxResult::NoEntry;
+    };
+    let hint = obj
+        .get("OwnerNode")
+        .and_then(|v| v.as_str())
+        .and_then(|h| u64::from_str_radix(h, 16).ok());
+    crate::ledger::directory::owner_dir_remove(sandbox, owner, &key, hint, true);
+    crate::tx::offer::owner_count_add(sandbox, owner, -1);
+    sandbox.delete(key);
+    TxResult::Success
+}
+
+pub struct DIDSetTransactor;
+
+impl Transactor for DIDSetTransactor {
+    fn preflight(&self, tx: &TxFields) -> TxResult {
+        if tx.tx_type != "DIDSet" {
+            return TxResult::Malformed;
+        }
+        if tx.fee == 0 {
+            return TxResult::BadFee;
+        }
+        // At least one of the three payload fields must appear (preflight
+        // temEMPTY_DID is a tem; the tec arm is handled in do_apply).
+        if ["URI", "DIDDocument", "Data"].iter().all(|f| tx.fields.get(f).is_none()) {
+            return TxResult::Malformed;
+        }
+        TxResult::Success
+    }
+
+    fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        if !sandbox.exists(&keylet::account_root_key(&tx.account)) {
+            return TxResult::NoAccount;
+        }
+        TxResult::Success
+    }
+
+    fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        let key = keylet::did_key(&tx.account);
+        let update = |obj: &mut serde_json::Value| {
+            for f in ["URI", "DIDDocument", "Data"] {
+                if let Some(v) = tx.fields.get(f).and_then(|v| v.as_str()) {
+                    if v.is_empty() {
+                        obj.as_object_mut().map(|o| o.remove(f));
+                    } else {
+                        obj[f] = serde_json::Value::String(v.to_string());
+                    }
+                }
+            }
+        };
+        if let Some(mut did) = crate::tx::offer::json_at(sandbox, &key) {
+            update(&mut did);
+            if ["URI", "DIDDocument", "Data"].iter().all(|f| did.get(f).is_none()) {
+                return TxResult::EmptyDid;
+            }
+            sandbox.write(key, serde_json::to_vec(&did).unwrap_or_default());
+            return TxResult::Success;
+        }
+        let mut did = serde_json::json!({
+            "LedgerEntryType": "DID",
+            "Account": hex::encode(tx.account),
+        });
+        update(&mut did);
+        if ["URI", "DIDDocument", "Data"].iter().all(|f| did.get(f).is_none()) {
+            return TxResult::EmptyDid; // fixEmptyDID
+        }
+        add_owned_object(sandbox, &tx.account, key, did)
+    }
+}
+
+pub struct DIDDeleteTransactor;
+
+impl Transactor for DIDDeleteTransactor {
+    fn preflight(&self, tx: &TxFields) -> TxResult {
+        if tx.tx_type != "DIDDelete" {
+            return TxResult::Malformed;
+        }
+        if tx.fee == 0 {
+            return TxResult::BadFee;
+        }
+        TxResult::Success
+    }
+
+    fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        if !sandbox.exists(&keylet::account_root_key(&tx.account)) {
+            return TxResult::NoAccount;
+        }
+        TxResult::Success
+    }
+
+    fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        delete_owned_object(sandbox, &tx.account, keylet::did_key(&tx.account))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PermissionedDomain — Set / Delete (⚠ blind source port, no specimen).
+// ---------------------------------------------------------------------------
+
+pub struct PermissionedDomainSetTransactor;
+
+impl Transactor for PermissionedDomainSetTransactor {
+    fn preflight(&self, tx: &TxFields) -> TxResult {
+        if tx.tx_type != "PermissionedDomainSet" {
+            return TxResult::Malformed;
+        }
+        if tx.fee == 0 {
+            return TxResult::BadFee;
+        }
+        if tx.fields.get("AcceptedCredentials").and_then(|v| v.as_array()).map(|a| a.is_empty()).unwrap_or(true) {
+            return TxResult::Malformed;
+        }
+        TxResult::Success
+    }
+
+    fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        if !sandbox.exists(&keylet::account_root_key(&tx.account)) {
+            return TxResult::NoAccount;
+        }
+        TxResult::Success
+    }
+
+    fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        // credentials::makeSorted orders by (issuer, credential type).
+        let mut creds: Vec<serde_json::Value> = tx
+            .fields
+            .get("AcceptedCredentials")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        creds.sort_by_key(|c| {
+            let inner = c.get("Credential").unwrap_or(c);
+            (
+                inner
+                    .get("Issuer")
+                    .and_then(|v| v.as_str())
+                    .and_then(crate::tx::offer::decode20)
+                    .unwrap_or([0u8; 20]),
+                inner
+                    .get("CredentialType")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_uppercase(),
+            )
+        });
+        let sorted = serde_json::Value::Array(creds);
+
+        if let Some(domain_hex) = tx.fields.get("DomainID").and_then(|v| v.as_str()) {
+            // Modify: replace the credential list on the existing domain.
+            let Ok(kb) = hex::decode(domain_hex) else { return TxResult::Malformed };
+            let Ok(karr) = <[u8; 32]>::try_from(kb.as_slice()) else {
+                return TxResult::Malformed;
+            };
+            let key = xrpl_core::types::Hash256(karr);
+            let Some(mut pd) = crate::tx::offer::json_at(sandbox, &key) else {
+                // preclaim in rippled: missing domain -> tecNO_ENTRY
+                return TxResult::NoEntry;
+            };
+            let owner_ok = pd
+                .get("Owner")
+                .and_then(|v| v.as_str())
+                .and_then(crate::tx::offer::decode20)
+                .map(|o| o == tx.account)
+                .unwrap_or(false);
+            if !owner_ok {
+                return TxResult::NoPermission;
+            }
+            pd["AcceptedCredentials"] = sorted;
+            sandbox.write(key, serde_json::to_vec(&pd).unwrap_or_default());
+            return TxResult::Success;
+        }
+        let seq = if tx.uses_ticket() { tx.ticket_seq.unwrap_or(0) } else { tx.sequence };
+        let key = keylet::permissioned_domain_key(&tx.account, seq);
+        let pd = serde_json::json!({
+            "LedgerEntryType": "PermissionedDomain",
+            "Owner": hex::encode(tx.account),
+            "Sequence": seq,
+            "AcceptedCredentials": sorted,
+        });
+        add_owned_object(sandbox, &tx.account, key, pd)
+    }
+}
+
+pub struct PermissionedDomainDeleteTransactor;
+
+impl Transactor for PermissionedDomainDeleteTransactor {
+    fn preflight(&self, tx: &TxFields) -> TxResult {
+        if tx.tx_type != "PermissionedDomainDelete" {
+            return TxResult::Malformed;
+        }
+        if tx.fee == 0 {
+            return TxResult::BadFee;
+        }
+        if tx.fields.get("DomainID").is_none() {
+            return TxResult::Malformed;
+        }
+        TxResult::Success
+    }
+
+    fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        if !sandbox.exists(&keylet::account_root_key(&tx.account)) {
+            return TxResult::NoAccount;
+        }
+        TxResult::Success
+    }
+
+    fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        let Some(kb) = tx
+            .fields
+            .get("DomainID")
+            .and_then(|v| v.as_str())
+            .and_then(|s| hex::decode(s).ok())
+        else {
+            return TxResult::Malformed;
+        };
+        let Ok(karr) = <[u8; 32]>::try_from(kb.as_slice()) else { return TxResult::Malformed };
+        let key = xrpl_core::types::Hash256(karr);
+        let Some(pd) = crate::tx::offer::json_at(sandbox, &key) else {
+            return TxResult::NoEntry;
+        };
+        let owner_ok = pd
+            .get("Owner")
+            .and_then(|v| v.as_str())
+            .and_then(crate::tx::offer::decode20)
+            .map(|o| o == tx.account)
+            .unwrap_or(false);
+        if !owner_ok {
+            return TxResult::NoPermission;
+        }
+        delete_owned_object(sandbox, &tx.account, key)
     }
 }

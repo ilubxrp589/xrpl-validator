@@ -75,15 +75,38 @@ impl Transactor for CheckCreateTransactor {
         if !sandbox.exists(&acct_key) {
             return TxResult::NoAccount;
         }
-        // Destination must be a valid account
-        if let Some(dest) = tx.fields.get("Destination").and_then(|d| parse_account_id(d)) {
-            let dest_key = keylet::account_root_key(&dest);
-            if !sandbox.exists(&dest_key) {
-                return TxResult::NoDst;
-            }
-        } else {
+        let Some(dest) = tx.fields.get("Destination").and_then(|d| parse_account_id(d)) else {
             return TxResult::Malformed;
+        };
+        // Destination must be a valid account
+        let Some(dst) = sandbox
+            .read(&keylet::account_root_key(&dest))
+            .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+        else {
+            return TxResult::NoDst;
+        };
+        // The rest of rippled's CheckCreate::preclaim, in its order: a
+        // destination may refuse checks outright, may be a pseudo-account, or
+        // may insist on a tag.
+        let dflags = dst["Flags"].as_u64().unwrap_or(0);
+        if dflags & 0x0800_0000 != 0 {
+            return TxResult::NoPermission; // lsfDisallowIncomingCheck
         }
+        // Pseudo-accounts cannot cash checks — same designator fields as the
+        // Payment rule (`3a718aa`): sfAMMID / sfVaultID / sfLoanBrokerID.
+        if ["AMMID", "VaultID", "LoanBrokerID"].iter().any(|f| dst.get(f).is_some()) {
+            return TxResult::NoPermission;
+        }
+        // #105846674 F6CC9A594B17: a VRTY airdrop check to rnabZzjg, whose
+        // flags 0x120000 carry lsfRequireDestTag, with no DestinationTag on the
+        // transaction. Mainnet claims the fee in one mutation; we created the
+        // Check and both directory entries in seven.
+        if dflags & 0x0002_0000 != 0 && tx.fields.get("DestinationTag").is_none() {
+            return TxResult::DstTagNeeded; // lsfRequireDestTag
+        }
+        // NOT modelled: the non-native SendMax freeze block (global freeze, and
+        // either party's line frozen by the issuer → tecFROZEN) and the
+        // Expiration → tecEXPIRED check. No failing ledger for either yet.
         TxResult::Success
     }
 
@@ -105,25 +128,31 @@ impl Transactor for CheckCreateTransactor {
         };
         let check_key = keylet::check_key(&tx.account, seq);
 
-        // Create the Check ledger object
-        let check_obj = serde_json::json!({
+        // Create the Check ledger object — canonical shape: Flags always,
+        // both dir hints, optional passthroughs. Only the WRITER pays the
+        // reserve (byte census: the old both-sides bump left r6zw at
+        // OwnerCount 45 where mainnet has 44 — the dest-root touch in the
+        // meta is a threadOwners refresh, not a count change).
+        let mut check_obj = serde_json::json!({
             "LedgerEntryType": "Check",
+            "Flags": 0,
             "Account": hex::encode(tx.account),
             "Destination": hex::encode(dest),
             "SendMax": send_max,
             "Sequence": seq,
         });
-        sandbox.write(check_key, serde_json::to_vec(&check_obj).unwrap());
-
-        // Increment OwnerCount on sender
-        let acct_key = keylet::account_root_key(&tx.account);
-        if let Some(data) = sandbox.read(&acct_key) {
-            if let Ok(mut acct) = serde_json::from_slice::<serde_json::Value>(&data) {
-                let count = acct["OwnerCount"].as_u64().unwrap_or(0);
-                acct["OwnerCount"] = serde_json::Value::Number((count + 1).into());
-                sandbox.write(acct_key, serde_json::to_vec(&acct).unwrap());
+        for f in ["Expiration", "DestinationTag", "SourceTag", "InvoiceID"] {
+            if let Some(v) = tx.fields.get(f) {
+                check_obj[f] = v.clone();
             }
         }
+        let owner_node =
+            crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &check_key);
+        let dest_node = crate::ledger::directory::owner_dir_insert(sandbox, &dest, &check_key);
+        check_obj["OwnerNode"] = serde_json::Value::String(format!("{owner_node:x}"));
+        check_obj["DestinationNode"] = serde_json::Value::String(format!("{dest_node:x}"));
+        sandbox.write(check_key, serde_json::to_vec(&check_obj).unwrap());
+        crate::tx::offer::owner_count_add(sandbox, &tx.account, 1);
 
         TxResult::Success
     }
@@ -149,8 +178,13 @@ impl Transactor for CheckCashTransactor {
         if tx.fields.get("CheckID").is_none() {
             return TxResult::Malformed;
         }
-        // Must specify Amount (how much to cash)
-        if tx.fields.get("Amount").is_none() {
+        // EXACTLY ONE of Amount / DeliverMin (CheckCash.cpp:57
+        // `bool(optAmount) == bool(optDeliverMin) => temMALFORMED`): Amount is
+        // a fixed cash-out, DeliverMin a floor for a partial cash-out.
+        // Requiring Amount alone rejected every DeliverMin check
+        // (#105798519 8FBBA125 cashes with DeliverMin only — mainnet
+        // tesSUCCESS, 8 mutations, we said temMALFORMED).
+        if tx.fields.get("Amount").is_some() == tx.fields.get("DeliverMin").is_some() {
             return TxResult::Malformed;
         }
         TxResult::Success
@@ -203,70 +237,80 @@ impl Transactor for CheckCashTransactor {
             None => return TxResult::Malformed,
         };
 
-        // Parse the cash amount
-        let amount = match tx.fields.get("Amount").and_then(|a| parse_drops(a)) {
-            Some(a) => a,
-            None => return TxResult::Malformed,
+        // Cash via the shared transfer engine (XRP or IOU). The check's
+        // SendMax fixes the currency; the tx Amount is the requested delivery.
+        // Writer shortfall fails the rippled way: tecPATH_PARTIAL, fee-only.
+        use crate::tx::offer as ox;
+        let sm_json = check.get("SendMax").cloned().unwrap_or_default();
+        let amt_json = tx.fields.get("Amount")
+            .or(tx.fields.get("DeliverMin"))
+            .cloned()
+            .unwrap_or_else(|| sm_json.clone());
+        let (Some(leg), Some(want)) = (ox::leg_of(&sm_json), crate::ledger::keylet::amount_mant_exp(&amt_json)) else {
+            return TxResult::Malformed;
         };
-
-        // Check SendMax — the amount cashed cannot exceed SendMax
-        if let Some(send_max_drops) = check.get("SendMax").and_then(|s| parse_drops(s)) {
-            if amount > send_max_drops {
-                return TxResult::Unfunded;
+        let cap = crate::ledger::keylet::amount_mant_exp(&sm_json).unwrap_or(want);
+        if ox::me_cmp(want, cap).is_gt() {
+            return TxResult::PathPartial; // asking beyond the check's SendMax
+        }
+        // Cashing an IOU into a line the CASHER doesn't have first requires
+        // the reserve for creating it: `checkReserve` fires BEFORE the flow —
+        // "Trust line does not exist. Insufficient reserve to create line."
+        // ⇒ tecNO_LINE_INSUF_RESERVE (CheckCash.cpp:391-401, preFeeBalance
+        // vs accountReserve(ownerCount + 1)). #106233366 E7419B07: we fell
+        // through to the writer-funds check and said tecPATH_PARTIAL.
+        if !leg.xrp && tx.account != leg.issuer {
+            let line_key = crate::ledger::keylet::ripple_state_key(&tx.account, &leg.issuer, &leg.cur);
+            if !sandbox.exists(&line_key) {
+                let acct_key = crate::ledger::keylet::account_root_key(&tx.account);
+                if let Some(a) = sandbox
+                    .read(&acct_key)
+                    .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+                {
+                    let oc = a["OwnerCount"].as_u64().unwrap_or(0);
+                    let bal = a["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                    // do_apply runs post-fee; rippled compares preFeeBalance_.
+                    let pre_fee = bal.saturating_add(tx.fee);
+                    if pre_fee < crate::ledger::fees::account_reserve(sandbox, oc + 1) {
+                        return TxResult::NoLineInsufReserve;
+                    }
+                }
             }
         }
-
-        // Deduct from creator's balance
-        let creator_key = keylet::account_root_key(&creator);
-        let creator_data = match sandbox.read(&creator_key) {
-            Some(d) => d,
-            None => return TxResult::NoAccount,
-        };
-        let mut creator_acct: serde_json::Value = match serde_json::from_slice(&creator_data) {
-            Ok(v) => v,
-            Err(_) => return TxResult::Malformed,
-        };
-
-        let creator_balance = creator_acct["Balance"]
-            .as_str()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-
-        if creator_balance < amount {
-            return TxResult::Unfunded;
+        let mut avail = if creator == leg.issuer { want } else { ox::available(sandbox, &creator, &leg) };
+        // CASHING THE CHECK RELEASES THE CHECK'S OWN RESERVE, and that reserve
+        // counts toward the payment. rippled says so twice:
+        //     if (value.native())
+        //         availableFunds += XRPAmount{ctx.view.fees().increment};
+        //   "src will have one reserve's worth of additional XRP once the check
+        //    is cashed, since the check's reserve will no longer be required"
+        //   (CheckCash.cpp:175-181), and doApply spends it through
+        //   `xrpLiquid(psb, srcId, -1, viewJ)` — "Hence the -1" (:333-339).
+        // XRP ONLY: the test is `value.native()`, since an IOU check's reserve
+        // is not what funds the transfer.
+        //
+        // #106375426 0932105B: the writer holds 60741227 drops at OwnerCount 49,
+        // so a full 10800000 reserve leaves 49941227 against a 50000000 cash —
+        // short by 58773. Release the check's own 200000 and it clears with
+        // 141227 to spare. Mainnet succeeds in 7 nodes; we claimed the fee with
+        // tecPATH_PARTIAL in 3.
+        if leg.xrp && creator != leg.issuer {
+            avail = (avail.0.saturating_add(ox::XRP_RESERVE_INC), avail.1);
         }
-
-        creator_acct["Balance"] =
-            serde_json::Value::String((creator_balance - amount).to_string());
-
-        // Decrement creator's OwnerCount
-        let owner_count = creator_acct["OwnerCount"].as_u64().unwrap_or(0);
-        if owner_count > 0 {
-            creator_acct["OwnerCount"] =
-                serde_json::Value::Number((owner_count - 1).into());
+        if ox::me_cmp(avail, want).is_lt() {
+            return TxResult::PathPartial; // writer cannot cover — fee-only
         }
-        sandbox.write(creator_key, serde_json::to_vec(&creator_acct).unwrap());
+        ox::move_leg(sandbox, &creator, &tx.account, &leg, want);
 
-        // Credit destination (casher) — fail if destination account can't be read
-        let dest_key = keylet::account_root_key(&tx.account);
-        let dest_data = match sandbox.read(&dest_key) {
-            Some(d) => d,
-            None => return TxResult::Malformed,
-        };
-        let mut dest_acct: serde_json::Value = match serde_json::from_slice(&dest_data) {
-            Ok(v) => v,
-            Err(_) => return TxResult::Malformed,
-        };
-        let dest_balance = dest_acct["Balance"]
-            .as_str()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        dest_acct["Balance"] =
-            serde_json::Value::String((dest_balance + amount).to_string());
-        sandbox.write(dest_key, serde_json::to_vec(&dest_acct).unwrap());
-
-        // Delete the Check object
+        // Delete the Check and unlink it from BOTH owner directories
+        // (writer via OwnerNode, casher/destination via DestinationNode).
+        let owner_hint = check.get("OwnerNode").map(|v| ox::dirnum(v));
+        let dest_hint = check.get("DestinationNode").map(|v| ox::dirnum(v));
         sandbox.delete(check_key);
+        crate::ledger::directory::owner_dir_remove(sandbox, &creator, &check_key, owner_hint, true);
+        crate::ledger::directory::owner_dir_remove(sandbox, &tx.account, &check_key, dest_hint, true);
+        // Only the check WRITER ever paid the reserve.
+        ox::owner_count_add(sandbox, &creator, -1);
 
         TxResult::Success
     }
@@ -351,6 +395,31 @@ impl Transactor for CheckCancelTransactor {
             }
         }
 
+        // A Check is linked into TWO owner directories — the writer's (via
+        // OwnerNode) and the destination's (via DestinationNode) — so
+        // cancelling must unlink both, each through its stored page hint.
+        // Only the destination link is conditional: rippled skips it when the
+        // check is written to self, which it "shouldn't be"
+        // (CheckCancel.cpp:71-93). The reserve is the writer's alone, so only
+        // the writer's OwnerCount moves (adjustOwnerCount(sleSrc, -1), line 97)
+        // — the destination's AccountRoot appears in the metadata only when it
+        // is also the account paying the fee.
+        use crate::tx::offer as ox;
+        let owner_hint = check.get("OwnerNode").map(|v| ox::dirnum(v));
+        let dest_hint = check.get("DestinationNode").map(|v| ox::dirnum(v));
+        if let (Some(creator_id), Some(dest_id)) = (creator, dest) {
+            if creator_id != dest_id {
+                crate::ledger::directory::owner_dir_remove(
+                    sandbox, &dest_id, &check_key, dest_hint, true,
+                );
+            }
+        }
+        if let Some(creator_id) = creator {
+            crate::ledger::directory::owner_dir_remove(
+                sandbox, &creator_id, &check_key, owner_hint, true,
+            );
+        }
+
         // Delete the Check
         sandbox.delete(check_key);
 
@@ -407,6 +476,59 @@ mod tests {
             .and_then(|s| s.parse::<u64>().ok())
             .or_else(|| v[field].as_u64())
             .unwrap_or(0)
+    }
+
+    /// rippled's CheckCreate::preclaim refuses a check whose destination has
+    /// set `lsfRequireDestTag` (0x00020000) when the transaction carries no
+    /// DestinationTag. #105846674 F6CC9A594B17: a VRTY airdrop check to
+    /// rnabZzjg (flags 0x120000, no tag on the tx) — mainnet claims the fee in
+    /// one mutation, we created the Check and both dir entries in seven.
+    #[test]
+    fn a_check_needs_a_tag_when_the_destination_requires_one() {
+        let acct = [0x01u8; 20];
+        let dest = [0x02u8; 20];
+        let mut state = make_state_with_accounts(&[(&acct, 500_000_000), (&dest, 500_000_000)]);
+
+        let mut fields = serde_json::json!({
+            "Destination": hex::encode(dest),
+            "SendMax": "1000000",
+        });
+        let mut tx = TxFields {
+            account: acct,
+            tx_type: "CheckCreate".into(),
+            fee: 12,
+            sequence: 5,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: fields.clone(),
+        };
+        assert_eq!(
+            CheckCreateTransactor.preclaim(&tx, &Sandbox::new(&state)),
+            TxResult::Success,
+            "an untagged check to an ordinary destination stands",
+        );
+
+        // The destination now requires a tag — nothing else changes.
+        let dkey = keylet::account_root_key(&dest);
+        let mut d: serde_json::Value =
+            serde_json::from_slice(&Sandbox::new(&state).read(&dkey).unwrap()).unwrap();
+        d["Flags"] = serde_json::json!(0x0002_0000u64);
+        state.state_map.insert(dkey, serde_json::to_vec(&d).unwrap()).unwrap();
+
+        assert_eq!(
+            CheckCreateTransactor.preclaim(&tx, &Sandbox::new(&state)),
+            TxResult::DstTagNeeded,
+            "but not without a DestinationTag",
+        );
+
+        // Supplying the tag makes it good again.
+        fields["DestinationTag"] = serde_json::json!(12345u64);
+        tx.fields = fields;
+        assert_eq!(
+            CheckCreateTransactor.preclaim(&tx, &Sandbox::new(&state)),
+            TxResult::Success,
+            "a tagged check satisfies the requirement",
+        );
     }
 
     #[test]
@@ -526,6 +648,57 @@ mod tests {
         assert_eq!(read_field_u64(&sandbox, &dest, "Balance"), 10_000_000);
     }
 
+    /// Mainnet #105797946 (AD75E19EE0AC, 4B8AF3399363, 0AD4F6597D90): a Check
+    /// is linked into BOTH the writer's and the destination's owner directory,
+    /// so CheckCancel must unlink both — rippled CheckCancel.cpp:71-93 issues
+    /// one dirRemove per directory. We deleted the object and adjusted the
+    /// reserve but left two dangling directory entries, emitting 2 mutations
+    /// where mainnet emits 4.
+    #[test]
+    fn check_cancel_unlinks_both_owner_directories() {
+        let sender = [0x01u8; 20];
+        let dest = [0x02u8; 20];
+        let state = make_state_with_accounts(&[(&sender, 50_000_000), (&dest, 10_000_000)]);
+        let mut sandbox = Sandbox::new(&state);
+
+        let create_tx = TxFields {
+            account: sender, tx_type: "CheckCreate".to_string(), fee: 12, sequence: 1,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Destination": hex::encode(dest),
+                "SendMax": "5000000",
+            }),
+        };
+        assert_eq!(CheckCreateTransactor.do_apply(&create_tx, &mut sandbox), TxResult::Success);
+
+        let check_key = keylet::check_key(&sender, 1);
+        let entry = hex::encode_upper(check_key.0);
+        let listed = |sandbox: &Sandbox, owner: &[u8; 20]| -> bool {
+            let root = keylet::owner_dir_key(owner);
+            sandbox
+                .read(&root)
+                .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+                .and_then(|p| p.get("Indexes").and_then(|v| v.as_array()).cloned())
+                .is_some_and(|a| a.iter().any(|x| x.as_str() == Some(entry.as_str())))
+        };
+        // CheckCreate links the check into both directories.
+        assert!(listed(&sandbox, &sender), "writer's dir should list the check");
+        assert!(listed(&sandbox, &dest), "destination's dir should list the check");
+
+        let cancel_tx = TxFields {
+            account: sender, tx_type: "CheckCancel".to_string(), fee: 12, sequence: 2,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({ "CheckID": hex::encode(check_key.0) }),
+        };
+        assert_eq!(CheckCancelTransactor.do_apply(&cancel_tx, &mut sandbox), TxResult::Success);
+
+        assert!(!sandbox.exists(&check_key));
+        assert!(!listed(&sandbox, &sender), "writer's dir still lists a cancelled check");
+        assert!(!listed(&sandbox, &dest), "destination's dir still lists a cancelled check");
+        // The reserve is the writer's alone (adjustOwnerCount(sleSrc, -1)).
+        assert_eq!(read_field_u64(&sandbox, &sender, "OwnerCount"), 0);
+    }
+
     #[test]
     fn check_cash_exceeds_send_max() {
         let sender = [0x01u8; 20];
@@ -566,7 +739,7 @@ mod tests {
             }),
         };
 
-        assert_eq!(CheckCashTransactor.do_apply(&cash_tx, &mut sandbox), TxResult::Unfunded);
+        assert_eq!(CheckCashTransactor.do_apply(&cash_tx, &mut sandbox), TxResult::PathPartial);
 
         // Check should still exist
         assert!(sandbox.exists(&check_key));

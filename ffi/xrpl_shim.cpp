@@ -22,6 +22,7 @@
 #include <xrpl/tx/apply.h>
 #include <xrpl/tx/applySteps.h>
 #include <xrpl/beast/utility/Journal.h>
+#include <cstdlib>
 
 #include <cstdio>
 #include <cstring>
@@ -50,15 +51,37 @@ struct XrplApplyResult {
 };
 
 // Journal sink that captures error-and-above messages into a std::string.
+//
+// With XRPL_FFI_TRACE set it captures EVERYTHING instead, which is how you find
+// out what rippled actually did rather than what its source suggests it might.
+// The flow engine narrates its decisions at trace level and nowhere else:
+// "Path rejected by limitQuality", "AMMLiquidity::getOffer, higher clob
+// quality", "Strand found dry in rev", "Best path: in: … out: …",
+// "changeSpotPriceQuality calc failed". Those lines answer, per ledger, which
+// of the interacting gates (defaultPath_, ofrQ, offerAttempted,
+// qualityUpperBound, withinRelativeDistance, the AMM bail conditions) actually
+// fired — the thing that repeated source-reading kept getting wrong.
+//
+// OFF by default: gate runs must stay byte-identical, and trace capture is
+// neither free nor small.
+static bool ffi_trace_all() {
+    static bool const on = std::getenv("XRPL_FFI_TRACE") != nullptr;
+    return on;
+}
+
 class CapturingSink : public beast::Journal::Sink {
 public:
     CapturingSink(std::string& dest)
-        : beast::Journal::Sink(beast::Severity::Fatal, false), dest_(dest) {}
+        : beast::Journal::Sink(
+              ffi_trace_all() ? beast::Severity::Trace : beast::Severity::Fatal, false),
+          dest_(dest) {}
     void write(beast::Severity level, std::string const& text) override {
-        if (static_cast<int>(level) >= static_cast<int>(beast::Severity::Error)) {
-            if (!dest_.empty()) dest_.append(" | ");
-            dest_.append(text);
+        if (!ffi_trace_all()
+            && static_cast<int>(level) < static_cast<int>(beast::Severity::Error)) {
+            return;
         }
+        if (!dest_.empty()) dest_.append(" | ");
+        dest_.append(text);
     }
     void writeAlways(beast::Severity level, std::string const& text) override {
         write(level, text);
@@ -431,6 +454,12 @@ XrplApplyResult *xrpl_apply_with_mutations(
         xrpl::MinimalApp app(network_id);
         CapturingSink capturing_sink(result->last_fatal);
         beast::Journal journal(capturing_sink);
+        // Payments reach flow() through RippleCalc, which pulls its journal
+        // from the registry rather than from ctx_.journal — see
+        // MinimalApp::getJournal. Without this every flow() log on the payment
+        // path is dropped and XRPL_FFI_TRACE of a Payment comes back empty
+        // while an OfferCreate traces fine.
+        app.setTraceSink(&capturing_sink);
 
         auto apply_result = xrpl::apply(
             app, open_view, tx,

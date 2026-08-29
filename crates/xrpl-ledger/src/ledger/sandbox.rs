@@ -52,6 +52,23 @@ impl<'a> Sandbox<'a> {
         }
     }
 
+    /// Keys beginning with `prefix` as visible through this sandbox: base
+    /// state keys plus keys written here, minus deletions. Sorted ascending.
+    pub fn keys_with_prefix(&self, prefix: &[u8]) -> Vec<Hash256> {
+        let mut keys = self.base.state_map.keys_with_prefix(prefix);
+        for (k, e) in &self.modifications {
+            if k.0.len() >= prefix.len() && &k.0[..prefix.len()] == prefix {
+                if !matches!(e, SandboxEntry::Deleted) {
+                    keys.push(*k);
+                }
+            }
+        }
+        keys.sort_by(|a, b| a.0.cmp(&b.0));
+        keys.dedup();
+        keys.retain(|k| !matches!(self.modifications.get(k), Some(SandboxEntry::Deleted)));
+        keys
+    }
+
     /// Read an object by key. Checks modifications first, then falls through to base.
     /// Returns `None` if the object doesn't exist or was deleted.
     pub fn read(&self, key: &Hash256) -> Option<Vec<u8>> {
@@ -84,8 +101,24 @@ impl<'a> Sandbox<'a> {
     }
 
     /// Mark an object as deleted.
+    /// Drop any modification recorded for `key`, reverting reads to the base
+    /// state — for in-flight intermediates that must leave no trace.
+    pub fn forget(&mut self, key: &Hash256) {
+        self.modifications.remove(key);
+    }
+
     pub fn delete(&mut self, key: Hash256) {
-        self.modifications.insert(key, SandboxEntry::Deleted);
+        // An entry CREATED in this same apply and then deleted nets to
+        // nothing — rippled's meta never carries a create-then-delete node
+        // (e.g. an intermediate trust line auto-created and fully consumed in
+        // one payment strand). Only a base-existing entry yields a Deleted.
+        if matches!(self.modifications.get(&key), Some(SandboxEntry::Created(_)))
+            && self.base.state_map.lookup(&key).is_none()
+        {
+            self.modifications.remove(&key);
+        } else {
+            self.modifications.insert(key, SandboxEntry::Deleted);
+        }
     }
 
     /// Check if a key exists (in modifications or base, and not deleted).

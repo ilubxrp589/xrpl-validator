@@ -45,8 +45,109 @@ pub enum TxResult {
     Unfunded,
     /// No permission for this operation.
     NoPermission,
+    NoIssuer,
     /// Object not found.
     NoEntry,
+    /// The named target object does not exist (PaymentChannelClaim's missing
+    /// channel is tecNO_TARGET where PaymentChannelFund's is tecNO_ENTRY —
+    /// rippled keeps the two codes distinct per transactor).
+    NoTarget,
+    /// IoC/FoK offer crossed nothing (or FoK not fully filled).
+    Killed,
+    /// Placement would exceed the owner reserve.
+    InsufReserveOffer,
+    /// Offer is unfunded at apply time.
+    UnfundedOffer,
+    /// The transaction carries an `Expiration` that the parent close time has
+    /// already reached. rippled: `hasExpired(view, exp)` is
+    /// `parentCloseTime() >= exp` (View.cpp:48-54).
+    Expired,
+    /// Path delivered something but less than required (no partial flag).
+    PathPartial,
+    /// Destination requires a DestinationTag and the tx has none.
+    DstTagNeeded,
+    /// Resulting array exceeds its ledger-object maximum (e.g. an oracle's
+    /// merged PriceDataSeries over ten entries).
+    ArrayTooLarge,
+    /// The object this transaction would create already exists.
+    Duplicate,
+    /// A referenced object does not exist (NFT offers use this rather than
+    /// the older tecNO_ENTRY).
+    ObjectNotFound,
+    /// The account that must pay for an NFT offer cannot cover it.
+    /// `NFTokenAcceptOffer::preclaim` compares `accountFunds(offer owner)`
+    /// against the offer's own Amount.
+    InsufficientFunds,
+    /// An AMM pool cannot cover the requested amount, or the account holds no
+    /// LP tokens in it.
+    AmmBalance,
+    /// The account still owns something it cannot abandon, so it cannot be
+    /// deleted. `AccountDelete::preclaim` walks the owner DIRECTORY and refuses
+    /// on any entry whose type has no `nonObligationDeleter` — an Escrow, a
+    /// PayChannel, a Check, a trust line, an NFT page. NOT an OwnerCount test:
+    /// an escrow named to this account as DESTINATION sits in its directory
+    /// while leaving OwnerCount at zero.
+    HasObligations,
+    /// The LP tokens offered exceed what the account actually holds.
+    /// `AMMWithdraw::preclaim` splits this from `tecAMM_BALANCE`: holding NONE
+    /// is a balance failure, holding SOME BUT TOO FEW is an invalid-tokens one.
+    AmmInvalidTokens,
+    /// The pool's LPTokenBalance is zero — an emptied AMM awaiting deletion
+    /// refuses votes/deposits-without-tfTwoAssetIfEmpty with tecAMM_EMPTY.
+    AmmEmpty,
+    /// OracleSet's LastUpdateTime is below the ripple epoch, outside the
+    /// ±300s window around the last close, or not newer than the stored one.
+    InvalidUpdateTime,
+    /// The sender has no trust line at all for the IOU it is escrowing
+    /// (escrowCreatePreclaimHelper<Issue>) — tecNO_LINE.
+    NoLine,
+    /// The issuer froze the sender's or destination's line (or everything) —
+    /// tecFROZEN.
+    Frozen,
+    /// Directory is full (e.g. > 250 outstanding tickets).
+    DirFull,
+    /// Creating the owned object(s) would breach the account's owner reserve.
+    InsufficientReserve,
+    /// Modifying a trust line into a reserved state, but the owner can't afford
+    /// the incremental reserve.
+    InsufReserveLine,
+    /// Depositing into an AMM more than the depositor can actually fund.
+    UnfundedAmm,
+    /// An AMM operation whose amounts cannot satisfy the pool's constraints —
+    /// notably a two-asset deposit where NEITHER side's proportional partner
+    /// fits inside what the transaction offered.
+    AmmFailed,
+    /// Creating a trust line, but the owner can't afford the incremental reserve.
+    NoLineInsufReserve,
+    /// Setting a non-existent trust line to defaults — nothing to do.
+    NoLineRedundant,
+    /// The party lacks authorization for the asset — an MPT holder without an
+    /// MPToken (or unauthorized under lsfMPTRequireAuth), or a third-party
+    /// transfer of an MPT without lsfMPTCanTransfer.
+    NoAuth,
+    /// The MPT is locked — globally (issuance lsfMPTLocked) or individually
+    /// (either holder's MPToken lsfMPTLocked) — for a holder→holder payment.
+    Locked,
+    /// A DIDSet whose result would carry none of URI/DIDDocument/Data.
+    EmptyDid,
+    /// XChain: the tx account is the bridge door itself.
+    XChainSelfCommit,
+    /// XChain: the committed asset is not the bridge's chain-side issue.
+    XChainBadTransferIssue,
+    /// XChain: SignatureReward differs from the bridge's.
+    XChainRewardMismatch,
+    /// XChain: the referenced claim id does not exist.
+    XChainNoClaimId,
+    /// XChain: no submitted attestation is signed by a door signer.
+    XChainProofUnknownKey,
+    /// XChain: attestation's sending account differs from the claim's.
+    XChainSendingAccountMismatch,
+    /// XChain: attestation names the wrong destination chain.
+    XChainWrongChain,
+    /// XChain: an explicit claim without an attested quorum.
+    XChainClaimNoQuorum,
+    /// XChain: the door account has no signer list to attest against.
+    XChainNoSignersList,
 
     // tem — malformed, not applied at all
     /// Transaction is malformed.
@@ -65,6 +166,8 @@ pub enum TxResult {
     MaxLedger,
     /// Account not found.
     NoAccount,
+    /// Pseudo-transaction internal failure (tefFAILURE).
+    Failure,
 
     // Unsupported transaction type — deduct fee but skip apply
     Unsupported,
@@ -83,7 +186,45 @@ impl TxResult {
             | TxResult::PathDry
             | TxResult::Unfunded
             | TxResult::NoPermission
+            | TxResult::NoIssuer
             | TxResult::NoEntry
+            | TxResult::NoTarget
+            | TxResult::Killed
+            | TxResult::InsufReserveOffer
+            | TxResult::UnfundedOffer
+            | TxResult::Expired
+            | TxResult::PathPartial
+            | TxResult::DstTagNeeded
+            | TxResult::ArrayTooLarge
+            | TxResult::Duplicate
+            | TxResult::ObjectNotFound
+            | TxResult::InsufficientFunds
+            | TxResult::AmmBalance
+            | TxResult::AmmInvalidTokens
+            | TxResult::AmmEmpty
+            | TxResult::InvalidUpdateTime
+            | TxResult::NoLine
+            | TxResult::Frozen
+            | TxResult::HasObligations
+            | TxResult::DirFull
+            | TxResult::InsufficientReserve
+            | TxResult::InsufReserveLine
+            | TxResult::UnfundedAmm
+            | TxResult::AmmFailed
+            | TxResult::NoLineInsufReserve
+            | TxResult::NoLineRedundant
+            | TxResult::NoAuth
+            | TxResult::Locked
+            | TxResult::EmptyDid
+            | TxResult::XChainSelfCommit
+            | TxResult::XChainBadTransferIssue
+            | TxResult::XChainRewardMismatch
+            | TxResult::XChainNoClaimId
+            | TxResult::XChainProofUnknownKey
+            | TxResult::XChainSendingAccountMismatch
+            | TxResult::XChainWrongChain
+            | TxResult::XChainClaimNoQuorum
+            | TxResult::XChainNoSignersList
             | TxResult::Unsupported => true,
             // tem/tef: not claimed
             _ => false,
@@ -106,7 +247,45 @@ impl TxResult {
             TxResult::PathDry => "tecPATH_DRY",
             TxResult::Unfunded => "tecUNFUNDED",
             TxResult::NoPermission => "tecNO_PERMISSION",
+            TxResult::NoIssuer => "tecNO_ISSUER",
             TxResult::NoEntry => "tecNO_ENTRY",
+            TxResult::NoTarget => "tecNO_TARGET",
+            TxResult::Killed => "tecKILLED",
+            TxResult::InsufReserveOffer => "tecINSUF_RESERVE_OFFER",
+            TxResult::UnfundedOffer => "tecUNFUNDED_OFFER",
+            TxResult::Expired => "tecEXPIRED",
+            TxResult::PathPartial => "tecPATH_PARTIAL",
+            TxResult::DstTagNeeded => "tecDST_TAG_NEEDED",
+            TxResult::ArrayTooLarge => "tecARRAY_TOO_LARGE",
+            TxResult::Duplicate => "tecDUPLICATE",
+            TxResult::ObjectNotFound => "tecOBJECT_NOT_FOUND",
+            TxResult::InsufficientFunds => "tecINSUFFICIENT_FUNDS",
+            TxResult::AmmBalance => "tecAMM_BALANCE",
+            TxResult::AmmInvalidTokens => "tecAMM_INVALID_TOKENS",
+            TxResult::AmmEmpty => "tecAMM_EMPTY",
+            TxResult::InvalidUpdateTime => "tecINVALID_UPDATE_TIME",
+            TxResult::NoLine => "tecNO_LINE",
+            TxResult::Frozen => "tecFROZEN",
+            TxResult::HasObligations => "tecHAS_OBLIGATIONS",
+            TxResult::DirFull => "tecDIR_FULL",
+            TxResult::InsufficientReserve => "tecINSUFFICIENT_RESERVE",
+            TxResult::InsufReserveLine => "tecINSUF_RESERVE_LINE",
+            TxResult::UnfundedAmm => "tecUNFUNDED_AMM",
+            TxResult::AmmFailed => "tecAMM_FAILED",
+            TxResult::NoLineInsufReserve => "tecNO_LINE_INSUF_RESERVE",
+            TxResult::NoLineRedundant => "tecNO_LINE_REDUNDANT",
+            TxResult::NoAuth => "tecNO_AUTH",
+            TxResult::Locked => "tecLOCKED",
+            TxResult::EmptyDid => "tecEMPTY_DID",
+            TxResult::XChainSelfCommit => "tecXCHAIN_SELF_COMMIT",
+            TxResult::XChainBadTransferIssue => "tecXCHAIN_BAD_TRANSFER_ISSUE",
+            TxResult::XChainRewardMismatch => "tecXCHAIN_REWARD_MISMATCH",
+            TxResult::XChainNoClaimId => "tecXCHAIN_NO_CLAIM_ID",
+            TxResult::XChainProofUnknownKey => "tecXCHAIN_PROOF_UNKNOWN_KEY",
+            TxResult::XChainSendingAccountMismatch => "tecXCHAIN_SENDING_ACCOUNT_MISMATCH",
+            TxResult::XChainWrongChain => "tecXCHAIN_WRONG_CHAIN",
+            TxResult::XChainClaimNoQuorum => "tecXCHAIN_CLAIM_NO_QUORUM",
+            TxResult::XChainNoSignersList => "tecXCHAIN_NO_SIGNERS_LIST",
             TxResult::Malformed => "temMALFORMED",
             TxResult::BadFee => "temBAD_FEE",
             TxResult::BadAmount => "temBAD_AMOUNT",
@@ -114,6 +293,7 @@ impl TxResult {
             TxResult::PastSeq => "tefPAST_SEQ",
             TxResult::MaxLedger => "tefMAX_LEDGER",
             TxResult::NoAccount => "tefNO_ACCOUNT",
+            TxResult::Failure => "tefFAILURE",
             TxResult::Unsupported => "tecUNSUPPORTED",
         }
     }
@@ -159,6 +339,29 @@ pub trait Transactor {
 
 /// Deduct fee from sender and increment sequence.
 /// This runs for EVERY successfully-claimed transaction.
+/// Transactor.cpp:660 — an account carrying sfAccountTxnID (armed via
+/// asfAccountTxnID) gets it rewritten to the CURRENT tx's hash — but the
+/// stamp sits in `apply()` and a tec result ROLLS THE VIEW BACK to fee +
+/// sequence only, discarding it. Call this from the SUCCESS arm only.
+/// #106455052 BFF40FB0 (full-ledger replay): rapido's two #52 payments are
+/// tecPATH_PARTIAL / tecPATH_DRY, and mainnet's final AccountTxnID is
+/// still #51's C428A7A6 while PreviousTxnID threads to the tec fee write.
+/// (#106455036 E7C799A8 calibrated the success side: the second payment of
+/// the ledger leaves ITS hash.)
+pub fn stamp_account_txn_id(tx: &TxFields, sandbox: &mut Sandbox) {
+    let key = keylet::account_root_key(&tx.account);
+    let Some(data) = sandbox.read(&key) else { return };
+    let Ok(mut acct) = serde_json::from_slice::<serde_json::Value>(&data) else { return };
+    if acct.get("AccountTxnID").is_none() {
+        return;
+    }
+    let Some(h) = tx.fields.get("hash").and_then(|v| v.as_str()) else { return };
+    acct["AccountTxnID"] = serde_json::Value::String(h.to_uppercase());
+    if let Ok(bytes) = serde_json::to_vec(&acct) {
+        sandbox.write(key, bytes);
+    }
+}
+
 pub fn apply_common(tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
     let acct_key = keylet::account_root_key(&tx.account);
 
@@ -187,6 +390,7 @@ pub fn apply_common(tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
     // Deduct fee
     acct["Balance"] = serde_json::Value::String((balance - tx.fee).to_string());
 
+
     // Increment sequence only for non-ticket transactions.
     // Ticket-based txs (Sequence=0, TicketSequence present) don't touch the account sequence.
     if !tx.uses_ticket() {
@@ -196,6 +400,37 @@ pub fn apply_common(tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
             None => return TxResult::Malformed,
         };
         acct["Sequence"] = serde_json::Value::Number(next_seq.into());
+    } else {
+        // Consuming a Ticket (rippled SeqProxy consumption): delete the Ticket
+        // object, unlink it from the owner directory via its OwnerNode hint,
+        // and decrement OwnerCount + TicketCount. Mainnet-verified shape
+        // (#105663160 ticketed cancels): Ticket Deleted + its dir page
+        // Modified + AccountRoot {Balance, OwnerCount, TicketCount}.
+        let tk = keylet::ticket_key(&tx.account, tx.ticket_seq.unwrap_or(0));
+        if let Some(td) = sandbox.read(&tk) {
+            let hint = serde_json::from_slice::<serde_json::Value>(&td)
+                .ok()
+                .and_then(|t| {
+                    t.get("OwnerNode").and_then(|v| {
+                        v.as_u64()
+                            .or_else(|| v.as_str().and_then(|s| u64::from_str_radix(s, 16).ok()))
+                    })
+                });
+            sandbox.delete(tk);
+            crate::ledger::directory::owner_dir_remove(sandbox, &tx.account, &tk, hint, true);
+            let oc = acct["OwnerCount"].as_u64().unwrap_or(0);
+            acct["OwnerCount"] = serde_json::Value::Number(oc.saturating_sub(1).into());
+            // sfTicketCount is soeOPTIONAL: at zero the field is REMOVED,
+            // not stored as 0 (byte census: net omits, we kept 2028 00000000).
+            let tc = acct["TicketCount"].as_u64().unwrap_or(0).saturating_sub(1);
+            if tc == 0 {
+                if let Some(o) = acct.as_object_mut() {
+                    o.remove("TicketCount");
+                }
+            } else {
+                acct["TicketCount"] = serde_json::Value::Number(tc.into());
+            }
+        }
     }
 
     // Write back

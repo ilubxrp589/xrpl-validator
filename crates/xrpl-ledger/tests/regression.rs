@@ -54,6 +54,19 @@ fn payment(sender: [u8; 20], dest: [u8; 20], amount: u64, fee: u64, seq: u32) ->
     }
 }
 
+/// The network's base reserve, read from the engine rather than hardcoded.
+///
+/// These tests used to assume 10 XRP. Mainnet dropped the base reserve to
+/// 1 XRP in the 2024 fee vote and `fees::reserve_base` follows it, so the
+/// hardcoded figures silently stopped testing a boundary: "1 drop below
+/// reserve" was 9_999_999, which is ~10x ABOVE the real reserve and simply
+/// succeeded. Deriving it keeps the tests pinned to the boundary whatever the
+/// schedule votes to next.
+fn base_reserve(state: &LedgerState) -> u64 {
+    let sandbox = Sandbox::new(state);
+    xrpl_ledger::ledger::fees::account_reserve(&sandbox, 0)
+}
+
 fn read_balance(state: &LedgerState, id: &[u8; 20]) -> u64 {
     let key = keylet::account_root_key(id);
     let data = state.state_map.lookup(&key).expect("account not found");
@@ -108,22 +121,58 @@ fn empty_tx_set_produces_next_ledger() {
 
 // === Exact balance payment (spends everything minus fee) ===
 
+/// A sender spends everything ABOVE its reserve — not down to zero.
+///
+/// rippled Payment.cpp:
+///     minRequiredFunds = accountIsPayer ? max(reserve, fee) : reserve
+///     if (preFeeBalance_ < dstAmount.xrp() + minRequiredFunds)
+///         return tecUNFUNDED_PAYMENT;
+///
+/// The guard is on the balance BEFORE the fee, and the fee may then dip into
+/// the reserve ("The final spend may use the reserve to cover fees"), so the
+/// sender lands at `reserve - fee`, not at 0. This test used to fund alice
+/// with `amount + fee` and assert Success with a zero balance, which rippled
+/// forbids. Both sides of the boundary are pinned now.
 #[test]
 fn exact_balance_payment() {
     let alice = [0x01u8; 20];
     let bob = [0x02u8; 20];
     let mut state = make_state(100, 100_000_000_000_000_000);
-    add_account(&mut state, &alice, 20_000_012, 1); // exactly amount + fee
+    let reserve = base_reserve(&state);
+    let amount = 20_000_000u64;
+    let fee = 12u64;
+    add_account(&mut state, &alice, amount + reserve, 1); // exactly on the limit
     add_account(&mut state, &bob, 50_000_000, 1);
 
-    let tx = payment(alice, bob, 20_000_000, 12, 1);
+    let tx = payment(alice, bob, amount, fee, 1);
     let (new_state, results) = apply_transaction_set(
         &state, vec![(Hash256([0x01; 32]), tx)], 700_000_010, 10,
     ).unwrap();
 
     assert_eq!(results[0].result, TxResult::Success);
-    assert_eq!(read_balance(&new_state, &alice), 0);
-    assert_eq!(read_balance(&new_state, &bob), 70_000_000);
+    assert_eq!(read_balance(&new_state, &alice), reserve - fee);
+    assert_eq!(read_balance(&new_state, &bob), 50_000_000 + amount);
+}
+
+/// One drop under that limit is `tecUNFUNDED_PAYMENT` — the other side of the
+/// boundary `exact_balance_payment` sits on.
+#[test]
+fn one_drop_below_the_reserve_is_an_unfunded_payment() {
+    let alice = [0x01u8; 20];
+    let bob = [0x02u8; 20];
+    let mut state = make_state(100, 100_000_000_000_000_000);
+    let reserve = base_reserve(&state);
+    let amount = 20_000_000u64;
+    add_account(&mut state, &alice, amount + reserve - 1, 1);
+    add_account(&mut state, &bob, 50_000_000, 1);
+
+    let tx = payment(alice, bob, amount, 12, 1);
+    let (new_state, results) = apply_transaction_set(
+        &state, vec![(Hash256([0x01; 32]), tx)], 700_000_010, 10,
+    ).unwrap();
+
+    assert_eq!(results[0].result, TxResult::UnfundedPayment);
+    assert_eq!(read_balance(&new_state, &bob), 50_000_000, "no value moved");
 }
 
 // === Payment exceeding balance ===
@@ -238,7 +287,12 @@ fn create_account_below_reserve_fails() {
     let mut state = make_state(100, 100_000_000_000_000_000);
     add_account(&mut state, &alice, 50_000_000, 1);
 
-    let tx = payment(alice, newbie, 9_999_999, 12, 1); // 1 drop below reserve
+    // rippled: `accountReserve(0) > dstAmount.xrp()` -> tecNO_DST_INSUF_XRP,
+    // so `reserve` itself succeeds and one drop under it fails. Derived, not
+    // hardcoded: the old 9_999_999 assumed a 10 XRP reserve and is now ~10x
+    // ABOVE the real one, so this test was asserting nothing.
+    let reserve = base_reserve(&state);
+    let tx = payment(alice, newbie, reserve - 1, 12, 1); // 1 drop below reserve
     let (new_state, results) = apply_transaction_set(
         &state, vec![(Hash256([0x01; 32]), tx)], 700_000_010, 10,
     ).unwrap();
@@ -286,11 +340,15 @@ fn tec_rollback_only_commits_fee() {
     let mut state = make_state(100, 100_000_000_000_000_000);
     add_account(&mut state, &alice, 50_000_000, 1);
     // nonexistent account does NOT exist — payment below reserve should tec
+    let reserve = base_reserve(&state);
 
     // Use sandbox directly to test the tec rollback
     let mods = {
         let mut sandbox = Sandbox::new(&state);
-        let tx = payment(alice, nonexistent, 5_000_000, 12, 1); // below 10M reserve
+        // Derived: the old 5_000_000 was "below the 10M reserve" and is now
+        // well ABOVE the 1 XRP reserve, so do_apply succeeded and the test was
+        // no longer exercising a tec rollback at all.
+        let tx = payment(alice, nonexistent, reserve - 1, 12, 1);
 
         // apply_common succeeds (deducts fee)
         let common = apply_common(&tx, &mut sandbox);

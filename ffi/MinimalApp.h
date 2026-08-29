@@ -61,8 +61,19 @@ public:
     // ===== ServiceRegistry — infra kept safe (apply path may touch) =====
     bool isStopping() const override { return false; }
     Application& getApp() override { return *this; }
-    beast::Journal getJournal(std::string const&) override { return beast::Journal{beast::Journal::getNullSink()}; }
+    // RippleCalc takes its journal from the registry
+    // (registry.getJournal("Flow"), RippleCalc.cpp:54), NOT from ctx_.journal —
+    // so a null sink here silently discards every flow() log on the PAYMENT
+    // path, while offer crossing, which uses ctx_.journal directly, traces
+    // fine. That asymmetry is why an XRPL_FFI_TRACE of a Payment came back
+    // empty. Route it to the capturing sink when one is set.
+    void setTraceSink(beast::Journal::Sink* s) { traceSink_ = s; }
+    beast::Journal getJournal(std::string const&) override {
+        return traceSink_ ? beast::Journal{*traceSink_}
+                          : beast::Journal{beast::Journal::getNullSink()};
+    }
     std::optional<uint256> const& getTrapTxID() const override { return trapTxID_; }
+    beast::Journal::Sink* traceSink_ = nullptr;
     // Real: 3.2.0 preflight routes the tx NetworkID check through this service.
     NetworkIDService& getNetworkIDService() override { return *networkIDService_; }
     // Real: the apply()/preflight() chain reaches these (matches the <=3.1.x shim).

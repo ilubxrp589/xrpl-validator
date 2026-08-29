@@ -1,0 +1,237 @@
+//! parity_probe — replay a fixture ledger at runtime and report mainnet parity.
+//!
+//! The scout loop's workhorse: unlike the compiled-in `backlog_reapply` gates,
+//! this binary loads fixture files by PATH, so freshly-fetched ledgers can be
+//! probed without a rebuild.
+//!
+//! Usage:
+//!   parity_probe <lNNN_blobs.txt> <lNNN_expected.json> [--rpc URL]
+//!
+//! Prints the standard parity block (attempted / diverged / silent diverged /
+//! mutation diverged + samples). Exit codes: 0 full parity, 1 divergence,
+//! 2 usage/fixture error. SLE pre-state is fetched from the RPC pinned at
+//! seq-1 (LayeredProvider path), amendments from the same endpoint.
+
+#![cfg(feature = "ffi")]
+
+use std::collections::HashMap;
+
+use xrpl_node::ffi_engine::{
+    apply_ledger_in_order_with_net, fetch_mainnet_amendments_at, new_stats, NetParams,
+};
+
+
+fn hex_to_array32(s: &str) -> Option<[u8; 32]> {
+    let v = hex::decode(s).ok()?;
+    if v.len() != 32 {
+        return None;
+    }
+    let mut a = [0u8; 32];
+    a.copy_from_slice(&v);
+    Some(a)
+}
+
+fn parse_blobs(tsv: &str) -> Vec<Vec<u8>> {
+    let mut rows: Vec<(u32, Vec<u8>)> = tsv
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| {
+            let mut p = l.splitn(2, '\t');
+            let idx: u32 = p.next()?.parse().ok()?;
+            Some((idx, hex::decode(p.next()?).ok()?))
+        })
+        .collect();
+    rows.sort_by_key(|(i, _)| *i);
+    rows.into_iter().map(|(_, b)| b).collect()
+}
+
+fn main() {
+    std::process::exit(run());
+}
+
+fn run() -> i32 {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 3 {
+        eprintln!("usage: parity_probe <blobs.txt> <expected.json> [--rpc URL]");
+        return 2;
+    }
+    // `--rpc` states a PREFERENCE, not a pin: the node is chosen per LEDGER
+    // below, because our LAN validator rolls fixtures out of its window.
+    let rpc_pref = args
+        .iter()
+        .position(|a| a == "--rpc")
+        .and_then(|i| args.get(i + 1).cloned());
+
+    let blobs_tsv = match std::fs::read_to_string(&args[1]) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("blobs file {}: {e}", args[1]);
+            return 2;
+        }
+    };
+    let expected_json = match std::fs::read_to_string(&args[2]) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("expected file {}: {e}", args[2]);
+            return 2;
+        }
+    };
+    let exp: serde_json::Value = match serde_json::from_str(&expected_json) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("expected json parse: {e}");
+            return 2;
+        }
+    };
+
+    let hdr = &exp["header"];
+    let (Some(seq), Some(pct), Some(drops)) = (
+        hdr["ledger_seq"].as_u64(),
+        hdr["parent_close_time"].as_u64(),
+        hdr["total_drops"].as_u64(),
+    ) else {
+        eprintln!("expected json missing header fields");
+        return 2;
+    };
+    let seq = seq as u32;
+    // Every hydration targets seq-1, so the node is chosen once, per run.
+    let rpc_url = xrpl_node::rpc_select::select_rpc(rpc_pref, seq - 1);
+    let Some(parent_hash) = hdr["parent_hash"].as_str().and_then(hex_to_array32) else {
+        eprintln!("expected json bad parent_hash");
+        return 2;
+    };
+    // network params travel with the fixture (testnet/devnet pre-training);
+    // absent fields = mainnet defaults
+    let dflt = NetParams::default();
+    let net = NetParams {
+        network_id: hdr["network_id"].as_u64().unwrap_or(dflt.network_id as u64) as u32,
+        base_fee_drops: hdr["base_fee_drops"].as_u64().unwrap_or(dflt.base_fee_drops),
+        reserve_drops: hdr["reserve_drops"].as_u64().unwrap_or(dflt.reserve_drops),
+        increment_drops: hdr["increment_drops"].as_u64().unwrap_or(dflt.increment_drops),
+    };
+    if net.network_id != 0 {
+        println!("(non-mainnet fixture: network_id={} reserve={} inc={} fee={})",
+                 net.network_id, net.reserve_drops, net.increment_drops, net.base_fee_drops);
+    }
+
+    let mut expected_outcomes: HashMap<String, String> = HashMap::new();
+    let mut expected_mutations: HashMap<String, Vec<(String, u8)>> = HashMap::new();
+    // Mainnet's FinalFields per node, for DX_VALCHECK on the oracle leg. The
+    // mutation map above deliberately drops them — it only ever compared keys.
+    let mut expected_fields: HashMap<String, HashMap<String, serde_json::Value>> = HashMap::new();
+    let Some(txmap) = exp["txs"].as_object() else {
+        eprintln!("expected json missing txs");
+        return 2;
+    };
+    for (hash, v) in txmap {
+        if let Some(ter) = v["ter"].as_str() {
+            expected_outcomes.insert(hash.clone(), ter.to_string());
+        }
+        let nodes: Vec<(String, u8)> = v["nodes"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|n| Some((n[0].as_str()?.to_string(), n[1].as_u64()? as u8)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !nodes.is_empty() {
+            expected_mutations.insert(hash.clone(), nodes);
+        }
+        if let Some(arr) = v["nodes"].as_array() {
+            let f: HashMap<String, serde_json::Value> = arr
+                .iter()
+                .filter_map(|n| {
+                    let k = n[0].as_str()?.to_string();
+                    let fields = n.get(2)?;
+                    fields.is_object().then(|| (k, fields.clone()))
+                })
+                .collect();
+            if !f.is_empty() {
+                expected_fields.insert(hash.clone(), f);
+            }
+        }
+    }
+
+    let txs = parse_blobs(&blobs_tsv);
+    if txs.is_empty() {
+        eprintln!("fixture has no txs");
+        return 2;
+    }
+    // Amendments AS OF the fixture's pre-state ledger, not "validated" — the
+    // oracle must replay under the rules that were in force then. See
+    // `fetch_mainnet_amendments_at`.
+    let amd_index = (seq - 1).to_string();
+    println!("Fetching mainnet amendments at #{amd_index} from {rpc_url}…");
+    let amendments = fetch_mainnet_amendments_at(&rpc_url, &amd_index);
+    println!("Probing {} txs of #{seq} for mainnet parity…", txs.len());
+
+    let stats = new_stats();
+    let rpc_urls = vec![rpc_url];
+    let _overlay = apply_ledger_in_order_with_net(
+        &stats,
+        &txs,
+        seq,
+        &rpc_urls,
+        &amendments,
+        parent_hash,
+        pct as u32,
+        drops,
+        None,
+        None,
+        None,
+        Some(&expected_outcomes),
+        None,
+        Some(&expected_mutations),
+        Some(&expected_fields),
+        &net,
+    );
+
+    let s = stats.lock();
+    println!();
+    println!("=== #{seq} parity result ===");
+    println!("  attempted:          {}", s.live_apply_attempted);
+    println!("  ok/claimed:         {}/{}", s.live_apply_ok, s.live_apply_claimed);
+    println!("  diverged:           {}", s.live_apply_diverged);
+    println!("  silent diverged:    {}", s.live_apply_silent_diverged);
+    println!("  mutation diverged:  {}", s.live_apply_mutation_diverged);
+    for x in &s.diverged_tx_samples {
+        println!("    [ter ] {x}");
+    }
+    for x in &s.silent_diverged_samples {
+        println!("    [tersilent] {x}");
+    }
+    for x in &s.mutation_diverged_samples {
+        println!("    [muta] {x}");
+    }
+
+    // A dropped fetch is not a divergence. `SleProvider::read` cannot tell
+    // "exhausted every retry" from "this object does not exist", so an
+    // incomplete pre-state replays into a plausible-looking DIVERGENT — which
+    // is how #106099077 was filed as a path-engine bug that did not exist.
+    // Say so loudly and return a code the scout maps to "error", never to
+    // "divergent".
+    let exhausted = xrpl_node::ffi_engine::RPC_EXHAUSTED.load(std::sync::atomic::Ordering::Relaxed);
+    if exhausted > 0 {
+        println!(
+            "PROBE: HYDRATION-FAILED ({exhausted} read(s) exhausted every retry) \
+             — verdict withheld, the pre-state is incomplete"
+        );
+        return 3;
+    }
+    let attempted_all = s.live_apply_attempted as usize == txs.len();
+    let clean = s.live_apply_diverged == 0
+        && s.live_apply_silent_diverged == 0
+        && s.live_apply_mutation_diverged == 0;
+    if !attempted_all {
+        println!("PROBE: INCOMPLETE (attempted {} of {})", s.live_apply_attempted, txs.len());
+        return 2;
+    }
+    if clean {
+        println!("PROBE: CLEAN");
+        0
+    } else {
+        println!("PROBE: DIVERGENT");
+        1
+    }
+}

@@ -79,6 +79,40 @@ impl SHAMap {
     }
 
     /// Look up a value by key.
+    /// Collect the keys of all leaves whose key begins with `prefix` (byte
+    /// granularity), sorted ascending. Used by the offer-crossing walk to
+    /// enumerate a book's quality directories from loaded state.
+    pub fn keys_with_prefix(&self, prefix: &[u8]) -> Vec<Hash256> {
+        fn collect(node: &SHAMapNode, prefix: &[u8], depth: usize, out: &mut Vec<Hash256>) {
+            match node {
+                SHAMapNode::Leaf(leaf) => {
+                    if leaf.key().0[..prefix.len().min(32)] == prefix[..prefix.len().min(32)] {
+                        out.push(*leaf.key());
+                    }
+                }
+                SHAMapNode::Inner(inner) => {
+                    if depth >= prefix.len() * 2 {
+                        for i in 0..16u8 {
+                            if let Some(c) = inner.get_child_node(i) {
+                                collect(c, prefix, depth + 1, out);
+                            }
+                        }
+                    } else {
+                        let byte = prefix[depth / 2];
+                        let nib = if depth % 2 == 0 { byte >> 4 } else { byte & 0x0F };
+                        if let Some(c) = inner.get_child_node(nib) {
+                            collect(c, prefix, depth + 1, out);
+                        }
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        collect(&self.root, prefix, 0, &mut out);
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     pub fn lookup(&self, key: &Hash256) -> Option<&[u8]> {
         lookup_in(&self.root, key, 0)
     }

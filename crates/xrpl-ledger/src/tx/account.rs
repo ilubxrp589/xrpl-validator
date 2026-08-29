@@ -53,13 +53,54 @@ impl Transactor for AccountSetTransactor {
             Err(_) => return TxResult::Malformed,
         };
 
+        // asf → lsf per rippled SetAccount: the asf NUMBERS are not bit
+        // positions. #106455275 56049FD1 (SetFlag 13, DisallowIncomingCheck):
+        // mainnet stamps lsf 0x08000000 where the old `1 << 13` wrote 0x2000
+        // — invisible to every per-tx leg (mut compare is (key,kind), flags
+        // compared nowhere) and dormant for 240 replay ledgers because
+        // flag-setting AccountSets are rare. Constants verbatim from
+        // LedgerFormats.h:128-142 / TxFlags asf table :408-425. asf 5 and 10
+        // manage FIELD PRESENCE, not bits; unmapped values under 32 are
+        // rippled's silent no-op, not an error.
+        fn asf_lsf(flag: u64) -> Option<u64> {
+            Some(match flag {
+                1 => 0x0002_0000,  // asfRequireDest → lsfRequireDestTag
+                2 => 0x0004_0000,  // asfRequireAuth
+                3 => 0x0008_0000,  // asfDisallowXRP
+                4 => 0x0010_0000,  // asfDisableMaster
+                6 => 0x0020_0000,  // asfNoFreeze
+                7 => 0x0040_0000,  // asfGlobalFreeze
+                8 => 0x0080_0000,  // asfDefaultRipple
+                9 => 0x0100_0000,  // asfDepositAuth
+                12 => 0x0400_0000, // asfDisallowIncomingNFTokenOffer
+                13 => 0x0800_0000, // asfDisallowIncomingCheck
+                14 => 0x1000_0000, // asfDisallowIncomingPayChan
+                15 => 0x2000_0000, // asfDisallowIncomingTrustline
+                16 => 0x8000_0000, // asfAllowTrustLineClawback
+                17 => 0x4000_0000, // asfAllowTrustLineLocking
+                _ => return None,  // 5 AccountTxnID, 10 NFTokenMinter, 11 reserved
+            })
+        }
+
         // Apply SetFlag
         if let Some(flag) = tx.fields.get("SetFlag").and_then(|f| f.as_u64()) {
             if flag >= 32 {
                 return TxResult::Malformed;
             }
-            let current = acct["Flags"].as_u64().unwrap_or(0);
-            acct["Flags"] = serde_json::Value::Number((current | (1u64 << flag)).into());
+            if let Some(bit) = asf_lsf(flag) {
+                let current = acct["Flags"].as_u64().unwrap_or(0);
+                acct["Flags"] = serde_json::Value::Number((current | bit).into());
+            } else if flag == 5 && acct.get("AccountTxnID").is_none() {
+                // asfAccountTxnID: make the field present (zero hash);
+                // apply_common then rewrites it with each tx hash.
+                acct["AccountTxnID"] =
+                    serde_json::Value::String("0".repeat(64));
+            } else if flag == 10 {
+                // asfAuthorizedNFTokenMinter: the minter comes with the tx.
+                if let Some(m) = tx.fields.get("NFTokenMinter") {
+                    acct["NFTokenMinter"] = m.clone();
+                }
+            }
         }
 
         // Apply ClearFlag
@@ -67,8 +108,18 @@ impl Transactor for AccountSetTransactor {
             if flag >= 32 {
                 return TxResult::Malformed;
             }
-            let current = acct["Flags"].as_u64().unwrap_or(0);
-            acct["Flags"] = serde_json::Value::Number((current & !(1u64 << flag)).into());
+            if let Some(bit) = asf_lsf(flag) {
+                let current = acct["Flags"].as_u64().unwrap_or(0);
+                acct["Flags"] = serde_json::Value::Number((current & !bit).into());
+            } else if flag == 5 {
+                if let Some(o) = acct.as_object_mut() {
+                    o.remove("AccountTxnID");
+                }
+            } else if flag == 10 {
+                if let Some(o) = acct.as_object_mut() {
+                    o.remove("NFTokenMinter");
+                }
+            }
         }
 
         // Apply optional fields
@@ -91,9 +142,6 @@ impl Transactor for AccountDeleteTransactor {
         if tx.tx_type != "AccountDelete" {
             return TxResult::Malformed;
         }
-        if tx.fee < 2_000_000 {
-            return TxResult::BadFee;
-        }
         if tx.fields.get("Destination").is_none() {
             return TxResult::Malformed;
         }
@@ -101,6 +149,16 @@ impl Transactor for AccountDeleteTransactor {
     }
 
     fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        // "The fee required for AccountDelete is one owner reserve"
+        // (AccountDelete::calculateBaseFee -> calculateOwnerReserveFee). That
+        // is read from the ledger's fee settings, not fixed: the 2024 vote cut
+        // the increment from 2 XRP to 0.2, so a hardcoded 2_000_000 rejects
+        // every present-day AccountDelete (#105764469 2A99D114 pays exactly
+        // the 200000-drop increment — mainnet tesSUCCESS, we said temBAD_FEE).
+        // Needs the view, so it belongs here rather than in preflight.
+        if tx.fee < crate::ledger::fees::reserve_inc(sandbox) {
+            return TxResult::BadFee;
+        }
         let acct_key = keylet::account_root_key(&tx.account);
         let data = match sandbox.read(&acct_key) {
             Some(d) => d,
@@ -111,7 +169,80 @@ impl Transactor for AccountDeleteTransactor {
             Err(_) => return TxResult::Malformed,
         };
 
-        // Must have OwnerCount == 0
+        // OwnerCount ZERO IS NOT THE SAME AS OWNING NOTHING — and owning
+        // SOMETHING is not the same as an obligation. rippled has NO
+        // OwnerCount rule here at all: the directory walk below decides, and
+        // an obligation answers tecHAS_OBLIGATIONS whatever the count says.
+        // #106066467 248BF6E3: rhokiAcW holds obligations at a nonzero count;
+        // mainnet says HAS_OBLIGATIONS, the old count-first gate said
+        // NO_PERMISSION — right refusal, wrong code, from a rule rippled
+        // never had. The count-gate survives only BELOW the walk, as the
+        // stand-in for the doApply deleter we don't model yet (rippled
+        // deletes an all-deletable directory along with the account).
+        //
+        // rippled
+        // walks the owner DIRECTORY and refuses on any entry whose type has no
+        // `nonObligationDeleter` (AccountDelete.cpp):
+        //     if (dirIsEmpty(ctx.view, ownerDirKeylet)) return tesSUCCESS;
+        //     do {
+        //         auto sleItem = ctx.view.read(keylet::child(dirEntry));
+        //         if (nonObligationDeleter(nodeType) == nullptr)
+        //             return tecHAS_OBLIGATIONS;
+        //     } while (cdirNext(...));
+        // Deletable: Offer, SignerList, Ticket, DepositPreauth, NFTokenOffer,
+        // DID, Oracle, Credential, Delegate. Everything else is an obligation.
+        //
+        // #106322004 77C5E61D: the account holds OwnerCount 0 and one ESCROW.
+        // An escrow that names this account as DESTINATION is linked into its
+        // directory but does NOT raise its OwnerCount — the reserve sits with
+        // the escrow's creator. So the count says "owns nothing" while the
+        // directory says otherwise, and mainnet refuses. We deleted the account
+        // and paid its balance away: 2 mutations against mainnet's 1, and an
+        // account destroyed that mainnet keeps.
+        const DELETABLE: [&str; 9] = [
+            "Offer", "SignerList", "Ticket", "DepositPreauth", "NFTokenOffer",
+            "DID", "Oracle", "Credential", "Delegate",
+        ];
+        let dir_root = keylet::owner_dir_key(&tx.account);
+        let mut page_key = dir_root;
+        for _ in 0..1000 {
+            let Some(page) = sandbox
+                .read(&page_key)
+                .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+            else { break };
+            for idx in page.get("Indexes").and_then(|v| v.as_array()).into_iter().flatten() {
+                let Some(k) = idx.as_str().and_then(|s| {
+                    hex::decode(s).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                }) else { continue };
+                let kind = sandbox
+                    .read(&xrpl_core::types::Hash256(k))
+                    .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+                    .and_then(|o| o.get("LedgerEntryType").and_then(|t| t.as_str()).map(str::to_string));
+                match kind {
+                    // Unreadable means unhydrated, not absent — refusing on it
+                    // would invent obligations. Anything we CAN read decides.
+                    None => continue,
+                    Some(t) if DELETABLE.contains(&t.as_str()) => continue,
+                    Some(_) => return TxResult::HasObligations,
+                }
+            }
+            let next = page
+                .get("IndexNext")
+                .and_then(|v| {
+                    v.as_u64().or_else(|| v.as_str().and_then(|s| u64::from_str_radix(s, 16).ok()))
+                })
+                .unwrap_or(0);
+            if next == 0 {
+                break;
+            }
+            page_key = keylet::dir_page_key(&dir_root, next);
+        }
+
+        // All-deletable (or unreadable) directory at a nonzero count: rippled
+        // would delete those objects with the account (nonObligationDeleter);
+        // we do not model that deleter yet, so keep the old refusal rather
+        // than destroy objects wrongly. The obligation case above no longer
+        // reaches this.
         let owner_count = acct["OwnerCount"].as_u64().unwrap_or(0);
         if owner_count > 0 {
             return TxResult::NoPermission;
@@ -165,6 +296,15 @@ impl Transactor for AccountDeleteTransactor {
             Ok(v) => v,
             Err(_) => return TxResult::Malformed,
         };
+        // `AccountDelete::preclaim` (:229-235): tecNO_DST, then
+        // lsfRequireDestTag with no DestinationTag -> tecDST_TAG_NEEDED.
+        // Same sweep as pay_channel above; no failing ledger pins this one
+        // either, but rippled's condition is unambiguous.
+        if dest["Flags"].as_u64().unwrap_or(0) & 0x0002_0000 != 0
+            && tx.fields.get("DestinationTag").is_none()
+        {
+            return TxResult::DstTagNeeded; // lsfRequireDestTag
+        }
 
         let dest_balance = dest["Balance"]
             .as_str()
@@ -173,6 +313,40 @@ impl Transactor for AccountDeleteTransactor {
         dest["Balance"] =
             serde_json::Value::String(dest_balance.checked_add(balance).unwrap_or(u64::MAX).to_string());
         sandbox.write(dest_key, serde_json::to_vec(&dest).unwrap());
+
+        // The owner DIRECTORY goes too. rippled walks it deleting each owned
+        // object and then removes the directory ITSELF, before erasing the
+        // account (AccountDelete.cpp):
+        //     Keylet const ownerDirKeylet{keylet::ownerDir(accountID_)};
+        //     …
+        //     if (view().exists(ownerDirKeylet) && !view().emptyDirDelete(ownerDirKeylet))
+        //     view().update(dst);
+        //     view().erase(src);
+        //
+        // An account at OwnerCount 0 still OWNS an empty root page — the count
+        // tracks reserved objects, not the directory that held them — and that
+        // page is a ledger object mainnet removes. #106295546 4568277964F6 is
+        // exactly that and nothing else: 3 nodes to our 2, the missing one
+        // being the directory F2EAB202… whose RootIndex is itself.
+        //
+        // Guarded on emptiness because that is what `emptyDirDelete` means;
+        // preclaim already requires OwnerCount == 0, so a non-empty directory
+        // here would be a state we do not understand and must not silently
+        // discard.
+        let dir_key = keylet::owner_dir_key(&tx.account);
+        if let Some(d) = sandbox.read(&dir_key) {
+            let empty = serde_json::from_slice::<serde_json::Value>(&d)
+                .ok()
+                .map(|v| {
+                    v.get("Indexes")
+                        .and_then(|i| i.as_array())
+                        .is_none_or(|a| a.is_empty())
+                })
+                .unwrap_or(false);
+            if empty {
+                sandbox.delete(dir_key);
+            }
+        }
 
         // Delete the account
         sandbox.delete(acct_key);
@@ -236,7 +410,8 @@ mod tests {
         let key = keylet::account_root_key(&acct);
         let data = sandbox.read(&key).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&data).unwrap();
-        assert_eq!(v["Flags"].as_u64().unwrap() & (1 << 8), 1 << 8);
+        // asfDefaultRipple → lsfDefaultRipple 0x00800000, not 1 << 8.
+        assert_eq!(v["Flags"].as_u64().unwrap() & 0x0080_0000, 0x0080_0000);
     }
 
     #[test]

@@ -53,6 +53,30 @@ impl<'a> SleProvider for RocksDbProvider<'a> {
 /// Retries up to 10 times with exponential backoff to handle rippled overload
 /// at startup — a ledger with 0 amendments would cause massive divergence.
 pub fn fetch_mainnet_amendments(rpc_url: &str) -> Vec<[u8; 32]> {
+    fetch_mainnet_amendments_at(rpc_url, "validated")
+}
+
+/// Fetch the amendments active AS OF a given ledger.
+///
+/// ⚠ Replaying a historical fixture under `"validated"` replays it under
+/// TODAY'S rules, which is wrong on its own terms: a false oracle verdict is
+/// worse than no verdict, since the whole workflow reads "parity CLEAN => our
+/// engine is wrong, parity DIRTY => harness bug".
+///
+/// ⛔ CORRECTION. The commit that added this (`a191b79`) blamed #105663160's
+/// `NFTokenAcceptOffer tecNO_PERMISSION` on `fixCleanup3_2_0` — the one
+/// amendment activated since. THAT WAS WRONG, and so was the follow-on claim
+/// that "the oracle is a different rippled version than the ledger". Fetching
+/// amendments as-of the ledger did NOT change that divergence. The real cause
+/// is ours: `prefetch_nft_pages_for_tx` derives owners from the TX BYTES, and
+/// an NFTokenAcceptOffer names the offer by HASH — the seller appears only
+/// inside the NFTokenOffer object — so the seller's NFTokenPages are never
+/// prefetched and `nft::findToken` cannot locate a token that exists. See
+/// `prefetch_nft_pages_for_tx`.
+///
+/// `fetch_mainnet_amendments` keeps `"validated"` because its production
+/// caller (`ffi_verifier`) really does run at the live tip.
+pub fn fetch_mainnet_amendments_at(rpc_url: &str, ledger_index: &str) -> Vec<[u8; 32]> {
     let client = match reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -73,7 +97,7 @@ pub fn fetch_mainnet_amendments(rpc_url: &str) -> Vec<[u8; 32]> {
                 "method": "ledger_entry",
                 "params": [{
                     "index": "7DB0788C020F02780A673DC74757F23823FA3014C1866E72CC4CD8B226CD6EF4",
-                    "ledger_index": "validated",
+                    "ledger_index": ledger_index,
                     "binary": false
                 }]
             }))
@@ -136,6 +160,21 @@ pub enum RpcReadOutcome<'a> {
 ///
 /// Supports a list of RPC endpoints for failover. On "Server is overloaded"
 /// or network errors, rotates to the next endpoint before retrying.
+/// Reads that exhausted every retry on every endpoint — a NETWORK failure, not
+/// a "this object does not exist". The two are indistinguishable downstream:
+/// `SleProvider::read` collapses `EntryNotFound | Exhausted` to `None`, so a
+/// dropped fetch silently becomes an absent object, the replay proceeds against
+/// an incomplete pre-state, and the probe reports a perfectly plausible
+/// DIVERGENT. Process-global because the providers are built deep inside the
+/// apply path and the verdict is printed far outside it.
+///
+/// #106099077, 2026-08-06: the scout filed `tecPATH_DRY vs tesSUCCESS` on two
+/// circular-arb Payments and a triage note blaming the offer-book directory
+/// walk. Re-running the same fixture on the same binary — against .39 AND
+/// against the same s2 the scout used — came back CLEAN both times. A dropped
+/// fetch had emptied the book. Nothing was wrong with the engine.
+pub static RPC_EXHAUSTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub struct RpcProvider {
     client: reqwest::blocking::Client,
     rpc_urls: Vec<String>,
@@ -146,7 +185,30 @@ pub struct RpcProvider {
     pub miss_keys: parking_lot::Mutex<Vec<String>>,
     /// Next endpoint index to try first (round-robin on failover).
     next_url_idx: std::sync::atomic::AtomicUsize,
+    /// Books prefetched via `book_offers` (pre-ledger view). succ() answers
+    /// probes inside these quality ranges from here — a cold `ledger_data`
+    /// walk cannot serve them against Clio endpoints (see offer_books docs).
+    book_dirs: parking_lot::Mutex<Vec<crate::offer_books::BookDirs>>,
+    /// NFTokenPage sets prefetched via `account_objects` (pre-ledger view),
+    /// keyed by owner. succ() answers owner-prefixed page probes from here —
+    /// a cold `ledger_data` walk cannot serve them (see nft_pages docs).
+    nft_pages: parking_lot::Mutex<Vec<crate::nft_pages::OwnerNftPages>>,
 }
+
+/// Page size requested from `book_offers` during book prefetch.
+const BOOK_OFFERS_PAGE_LIMIT: usize = 100;
+/// Page size requested from `account_objects` during NFT-page prefetch. An
+/// NFTokenPage holds up to 32 tokens, so this covers ~6400 tokens in one
+/// round trip — every real owner lands in a single page.
+const ACCOUNT_OBJECTS_PAGE_LIMIT: usize = 200;
+/// Marker-resumption cap for the NFT-page prefetch (safety net against a
+/// marker loop; see `collect_owner_pages`).
+const NFT_PAGE_MAX_PAGES: usize = 8;
+/// A book is only marked `complete` when the offer count is safely below
+/// any plausible server-side clamp of our requested limit (Clio clamps
+/// out-of-range limits instead of erroring, so `count < requested` alone
+/// could mislabel a truncated page as complete).
+const BOOK_OFFERS_COMPLETE_BELOW: usize = 50;
 
 impl RpcProvider {
     /// Single-endpoint constructor (backwards compatible).
@@ -170,6 +232,8 @@ impl RpcProvider {
             misses: std::sync::atomic::AtomicU64::new(0),
             miss_keys: parking_lot::Mutex::new(Vec::new()),
             next_url_idx: std::sync::atomic::AtomicUsize::new(0),
+            book_dirs: parking_lot::Mutex::new(Vec::new()),
+            nft_pages: parking_lot::Mutex::new(Vec::new()),
         }
     }
 }
@@ -266,12 +330,311 @@ impl RpcProvider {
             }
         }
         // All retries exhausted
+        RPC_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
         self.misses.fetch_add(1, Ordering::Relaxed);
         let mut mk = self.miss_keys.lock();
         if mk.len() < 20 {
             mk.push(format!("{}@{}: EXHAUSTED {}", &key_hex[..16], self.ledger_index, last_err));
         }
         RpcReadOutcome::Exhausted(last_err)
+    }
+
+    /// Fetch + parse one `ledger_data` page at the provider's pinned
+    /// PRE-ledger index (era pinning — never "validated"/"current").
+    /// Same retry/rotation/backoff idiom as `read_with_outcome`: up to 6
+    /// attempts, rotating endpoints, exponential backoff. Returns `None`
+    /// only when all retries are exhausted — the walk treats that as
+    /// "lookup failed", never as "no successor".
+    fn fetch_ledger_data_page(
+        &self,
+        marker: &serde_json::Value,
+    ) -> Option<crate::succ_walk::LedgerDataPage> {
+        use std::sync::atomic::Ordering;
+        let mut backoff_ms: u64 = 10;
+        let mut url_idx = self.next_url_idx.load(Ordering::Relaxed) % self.rpc_urls.len();
+        for attempt in 0..6 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                backoff_ms *= 2;
+                url_idx = (url_idx + 1) % self.rpc_urls.len();
+            }
+            let rpc_url = &self.rpc_urls[url_idx];
+            let resp = match self
+                .client
+                .post(rpc_url)
+                .json(&serde_json::json!({
+                    "method": "ledger_data",
+                    "params": [{
+                        "ledger_index": self.ledger_index,
+                        "binary": true,
+                        "limit": 32,
+                        "marker": marker
+                    }]
+                }))
+                .send()
+            {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let body_text = match resp.text() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let tt = body_text.trim();
+            if tt.starts_with("Server is overloaded")
+                || tt.starts_with("Server too busy")
+                || tt.contains("service unavailable")
+            {
+                continue;
+            }
+            let body: serde_json::Value = match serde_json::from_str(&body_text) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            match crate::succ_walk::parse_ledger_data_page(&body) {
+                Ok(page) => {
+                    self.next_url_idx.store(url_idx, Ordering::Relaxed);
+                    return Some(page);
+                }
+                // Body-level error (overloaded, lgrNotFound on a pruned
+                // endpoint, malformed page) — rotate and retry.
+                Err(_) => continue,
+            }
+        }
+        None
+    }
+
+    /// Fetch one book's offers at the pinned PRE-ledger index and distill
+    /// the set of BookDirectory keys. Same retry/rotation/backoff idiom as
+    /// `read_with_outcome`. Returns (sorted deduped dirs, raw offer count),
+    /// or `None` when all retries are exhausted.
+    fn fetch_book_offers(
+        &self,
+        book_in: &crate::offer_books::Issue,
+        book_out: &crate::offer_books::Issue,
+    ) -> Option<(Vec<[u8; 32]>, usize)> {
+        use std::sync::atomic::Ordering;
+        let mut backoff_ms: u64 = 10;
+        let mut url_idx = self.next_url_idx.load(Ordering::Relaxed) % self.rpc_urls.len();
+        for attempt in 0..6 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                backoff_ms *= 2;
+                url_idx = (url_idx + 1) % self.rpc_urls.len();
+            }
+            let rpc_url = &self.rpc_urls[url_idx];
+            let resp = match self
+                .client
+                .post(rpc_url)
+                .json(&serde_json::json!({
+                    "method": "book_offers",
+                    "params": [{
+                        // Book {in, out}: its offers have TakerPays.issue ==
+                        // in and TakerGets.issue == out, which is exactly
+                        // how book_offers names its request sides.
+                        "taker_pays": crate::offer_books::issue_to_params(book_in),
+                        "taker_gets": crate::offer_books::issue_to_params(book_out),
+                        "ledger_index": self.ledger_index,
+                        "limit": BOOK_OFFERS_PAGE_LIMIT
+                    }]
+                }))
+                .send()
+            {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let body_text = match resp.text() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let tt = body_text.trim();
+            if tt.starts_with("Server is overloaded")
+                || tt.starts_with("Server too busy")
+                || tt.contains("service unavailable")
+            {
+                continue;
+            }
+            let body: serde_json::Value = match serde_json::from_str(&body_text) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            match crate::offer_books::parse_book_offers_dirs(&body) {
+                Ok(res) => {
+                    self.next_url_idx.store(url_idx, Ordering::Relaxed);
+                    return Some(res);
+                }
+                Err(_) => continue,
+            }
+        }
+        None
+    }
+
+    /// Seed the succ() book view for one tx: if it is an OfferCreate or a
+    /// cross-currency Payment (SendMax issue ≠ Amount issue), fetch every
+    /// book it can cross (both direct orientations plus XRP-bridged legs)
+    /// at the pinned pre-ledger index; a pathed Payment additionally gets
+    /// the books of every conversion hop along its Paths (a multi-step
+    /// strand consumes offers in EACH hop's book, not just the direct
+    /// SendMax→Amount pair). Idempotent per book base. A fetch failure
+    /// stores nothing — succ() then falls back to the `ledger_data` walk,
+    /// i.e. behaves exactly as before this feature.
+    pub fn prefetch_offer_books_for_tx(&self, tx_bytes: &[u8]) {
+        let mut pairs = Vec::new();
+        if let Some(books) = crate::offer_books::parse_offer_create(tx_bytes)
+            .or_else(|| crate::offer_books::parse_payment_books(tx_bytes))
+        {
+            pairs.extend(crate::offer_books::crossing_books(
+                &books.taker_pays,
+                &books.taker_gets,
+            ));
+        }
+        pairs.extend(crate::offer_books::payment_path_books(tx_bytes));
+        for (book_in, book_out) in pairs {
+            let base = crate::offer_books::book_base(&book_in, &book_out);
+            if self.book_dirs.lock().iter().any(|b| b.base == base) {
+                continue;
+            }
+            if let Some((dirs, count)) = self.fetch_book_offers(&book_in, &book_out) {
+                self.book_dirs.lock().push(crate::offer_books::BookDirs {
+                    base,
+                    dirs: dirs.into_iter().collect(),
+                    complete: count < BOOK_OFFERS_COMPLETE_BELOW,
+                });
+            }
+        }
+    }
+
+    /// Fetch one `account_objects` page of NFTokenPages for `owner` at the
+    /// pinned PRE-ledger index (era pinning — never "validated"/"current").
+    /// Same retry/rotation/backoff idiom as `read_with_outcome`. Returns
+    /// `None` only when all retries are exhausted.
+    fn fetch_account_nft_pages(
+        &self,
+        owner: &[u8; 20],
+        marker: Option<&serde_json::Value>,
+    ) -> Option<(Vec<[u8; 32]>, Option<serde_json::Value>)> {
+        use std::sync::atomic::Ordering;
+        let mut backoff_ms: u64 = 10;
+        let mut url_idx = self.next_url_idx.load(Ordering::Relaxed) % self.rpc_urls.len();
+        for attempt in 0..6 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                backoff_ms *= 2;
+                url_idx = (url_idx + 1) % self.rpc_urls.len();
+            }
+            let mut params = serde_json::json!({
+                "account": crate::offer_books::encode_account_id(owner),
+                "type": "nft_page",
+                "ledger_index": self.ledger_index,
+                "limit": ACCOUNT_OBJECTS_PAGE_LIMIT,
+            });
+            if let Some(m) = marker {
+                params["marker"] = m.clone();
+            }
+            let resp = match self
+                .client
+                .post(&self.rpc_urls[url_idx])
+                .json(&serde_json::json!({
+                    "method": "account_objects",
+                    "params": [params]
+                }))
+                .send()
+            {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let body_text = match resp.text() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let tt = body_text.trim();
+            if tt.starts_with("Server is overloaded")
+                || tt.starts_with("Server too busy")
+                || tt.contains("service unavailable")
+            {
+                continue;
+            }
+            let body: serde_json::Value = match serde_json::from_str(&body_text) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            match crate::nft_pages::parse_account_objects_pages(&body) {
+                Ok(res) => {
+                    self.next_url_idx.store(url_idx, Ordering::Relaxed);
+                    return Some(res);
+                }
+                // Body-level error (overloaded, lgrNotFound on a pruned
+                // endpoint, malformed page) — rotate and retry. `actNotFound`
+                // also lands here: an account that does not exist at the
+                // pinned ledger has no pages, but treating that as an
+                // authoritative empty set on a possibly-pruned endpoint
+                // risks a silently wrong succ, so we store nothing and let
+                // the walk decide.
+                Err(_) => continue,
+            }
+        }
+        None
+    }
+
+    /// Seed the succ() NFT-page view for one tx: if it is an NFToken tx,
+    /// fetch the NFTokenPage set of every account it names (see
+    /// `nft_pages::parse_nft_page_owners`) at the pinned pre-ledger index.
+    /// rippled locates a token's page with `succ(first, nftpage_max(owner)
+    /// .next())`, whose start key is derived from the token ID and so is not
+    /// a real ledger key — Clio rejects it as a `ledger_data` marker, and
+    /// the book prefetch never sees NFT pages. Idempotent per owner. A fetch
+    /// failure stores nothing — succ() then falls back to the `ledger_data`
+    /// walk, i.e. behaves exactly as before this feature.
+    ///
+    /// ⚠ KNOWN GAP, specimen #105663160 `5CCAAE138F560F07`. Owners come from
+    /// the TX BYTES only. An `NFTokenAcceptOffer` names its offer by HASH, so
+    /// the SELLER — whose pages `nft::findToken` must search — never appears
+    /// in the tx and is never prefetched. Verified: the blob carries the
+    /// acceptor's AccountID and not the seller's. libxrpl then returns
+    /// `tecNO_PERMISSION` ("the seller must own the token") on a token the
+    /// seller demonstrably owns, while our native engine, which pre-hydrates
+    /// in bulk, is 65/65 correct.
+    /// FIXED below by resolving the offer hashes to their `sfOwner`.
+    /// ⚠ The page BUDGET was never a contributing cause, despite first
+    /// appearances: `NFT_PAGE_MAX_PAGES` counts RPC FETCHES, each returning up
+    /// to `ACCOUNT_OBJECTS_PAGE_LIMIT` (200) page keys, so 8 covers 1600 pages
+    /// ≈ 51k NFTs. This seller's ~420 pages need ~3 fetches. Counting pages as
+    /// though they were fetches makes 8 look far too small; they are not the
+    /// same unit.
+    /// ⚠ `ffi_verifier` (the LIVE validator) uses this same prefetch, so this
+    /// was a plausible source of the FFI shadow divergences treated as noise.
+    pub fn prefetch_nft_pages_for_tx(&self, tx_bytes: &[u8]) {
+        let mut owners = crate::nft_pages::parse_nft_page_owners(tx_bytes);
+        // Resolve the counterparty. An NFTokenAcceptOffer names its offer by
+        // HASH, so the offer's `sfOwner` — the account whose pages
+        // `nft::findToken` searches — is reachable only by reading the
+        // NFTokenOffer object. Without this the seller is never prefetched.
+        for h in crate::nft_pages::parse_nft_offer_hashes(tx_bytes) {
+            let owner = match self.read_with_outcome(&h) {
+                RpcReadOutcome::Hit(bytes) => crate::nft_pages::parse_sle_owner(bytes),
+                // A missing or undelivered offer is not our problem here: the
+                // transactor will reach its own conclusion. Only skip the
+                // prefetch.
+                RpcReadOutcome::EntryNotFound | RpcReadOutcome::Exhausted(_) => None,
+            };
+            if let Some(id) = owner {
+                if !owners.contains(&id) {
+                    owners.push(id);
+                }
+            }
+        }
+        for owner in owners {
+            if self.nft_pages.lock().iter().any(|p| p.owner == owner) {
+                continue;
+            }
+            if let Some(set) = crate::nft_pages::collect_owner_pages(
+                |marker| self.fetch_account_nft_pages(&owner, marker),
+                &owner,
+                NFT_PAGE_MAX_PAGES,
+            ) {
+                self.nft_pages.lock().push(set);
+            }
+        }
     }
 }
 
@@ -280,6 +643,95 @@ impl SleProvider for RpcProvider {
         match self.read_with_outcome(key) {
             RpcReadOutcome::Hit(bytes) => Some(bytes),
             RpcReadOutcome::EntryNotFound | RpcReadOutcome::Exhausted(_) => None,
+        }
+    }
+
+    fn succ(&self, key: &[u8; 32], last: Option<&[u8; 32]>) -> Option<[u8; 32]> {
+        use std::sync::atomic::Ordering;
+        // 1. Prefetched book_offers view. A book base never exists as a
+        //    ledger object (its low 64 quality bits are zeroed), and Clio-
+        //    backed endpoints reject any ledger_data marker that is not an
+        //    existing key at the pinned ledger (markerDoesNotExist) — so the
+        //    cold walk below can never serve the FIRST probe of an offer
+        //    book. apply_ledger_in_order prefetches the books each
+        //    OfferCreate can cross; those ranges are answered here.
+        let mut walk_from: Option<[u8; 32]> = None;
+        {
+            let books = self.book_dirs.lock();
+            if let Some(book) = books
+                .iter()
+                .find(|b| crate::offer_books::in_book_range(&b.base, key))
+            {
+                match crate::offer_books::succ_from_book(book, key, last) {
+                    crate::offer_books::BookSuccAnswer::Found(k) => {
+                        self.hits.fetch_add(1, Ordering::Relaxed);
+                        return Some(k);
+                    }
+                    crate::offer_books::BookSuccAnswer::NoneAuthoritative => {
+                        self.misses.fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    }
+                    crate::offer_books::BookSuccAnswer::Unknown => {
+                        // Truncated prefetch and the probe is past every
+                        // known dir. Resume the walk from the largest known
+                        // dir <= key — an EXISTING key, which Clio accepts
+                        // as a ledger_data marker.
+                        walk_from = book.dirs.range(..=*key).next_back().copied();
+                    }
+                }
+            }
+        }
+        // 1b. Prefetched NFTokenPage view. rippled probes an owner's pages
+        //     with succ(nftpage(min(owner), tokenID), nftpage_max(owner)
+        //     .next()) — the start key is derived from the token ID and so
+        //     is almost never a real object, which Clio rejects as a
+        //     ledger_data marker; and the book view above never holds NFT
+        //     pages. Only probes provably confined to the owner's page range
+        //     are answered here (see nft_pages::interval_within_owner) —
+        //     anything wider falls through to the walk.
+        {
+            let owner = crate::nft_pages::owner_of_page_key(key);
+            let sets = self.nft_pages.lock();
+            if let Some(set) = sets.iter().find(|p| p.owner == owner) {
+                match crate::nft_pages::succ_from_pages(set, key, last) {
+                    crate::nft_pages::NftSuccAnswer::Found(k) => {
+                        self.hits.fetch_add(1, Ordering::Relaxed);
+                        return Some(k);
+                    }
+                    crate::nft_pages::NftSuccAnswer::NoneAuthoritative => {
+                        self.misses.fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    }
+                    crate::nft_pages::NftSuccAnswer::Unknown => {}
+                }
+            }
+        }
+        // 2. RPC directory walk via `ledger_data`: marker resumption is
+        //    ">= position". Start from the closest known-existing key when
+        //    we have one (Clio-safe), else from `key` itself (accepted by
+        //    plain rippled). The strictly-greater filter and the exclusive
+        //    `last` bound (open interval, per rippled's ReadView::succ) are
+        //    applied client-side in succ_walk, which is offline-unit-tested.
+        let start = walk_from.unwrap_or(*key);
+        let got = crate::succ_walk::walk_pages_for_succ(
+            |marker| self.fetch_ledger_data_page(marker),
+            key,
+            last,
+            8,
+            serde_json::Value::String(hex::encode_upper(start)),
+        );
+        // Activity accounting mirrors read(): an answered walk is a hit, a
+        // walk that ends without a successor (legit end-of-window or fetch
+        // exhaustion) counts as a miss, like entryNotFound does for read().
+        match got {
+            Some(k) => {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                Some(k)
+            }
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
         }
     }
 }
@@ -713,6 +1165,37 @@ impl<'a> SleProvider for LayeredProvider<'a> {
         // Fallback to RPC
         self.fallback.read(key)
     }
+
+    fn succ(&self, key: &[u8; 32], last: Option<&[u8; 32]>) -> Option<[u8; 32]> {
+        // Two candidate streams, exactly like OverlayedDbProvider::succ does
+        // with snapshot+overlay. Snapshot the overlay's view up front so the
+        // RPC walk below runs without holding the lock:
+        //   - tombstoned keys: deleted this ledger, must NOT be resurrected
+        //     by the RPC view (which still has the pre-ledger version);
+        //   - overlay candidate: smallest live overlay key strictly inside
+        //     the open interval (key, last).
+        let (tombstones, overlay_cand) = {
+            let overlay = self.overlay.lock();
+            let tombstones: std::collections::HashSet<[u8; 32]> = overlay
+                .iter()
+                .filter(|(_, v)| v.is_none())
+                .map(|(k, _)| *k)
+                .collect();
+            let overlay_cand = crate::succ_walk::overlay_succ_candidate(
+                overlay.iter().filter(|(_, v)| v.is_some()).map(|(k, _)| k),
+                key,
+                last,
+            );
+            (tombstones, overlay_cand)
+        };
+        crate::succ_walk::layered_succ(
+            |probe, l| self.fallback.succ(probe, l),
+            |c| tombstones.contains(c),
+            overlay_cand,
+            key,
+            last,
+        )
+    }
 }
 
 /// Live FFI stats for the dashboard.
@@ -748,6 +1231,15 @@ pub struct FfiStats {
     pub live_apply_ter_counts: std::collections::BTreeMap<String, u64>,
     /// Divergence breakdown: "{tx_type}/{ter_name}" → count
     pub live_diverged_by_type: std::collections::BTreeMap<String, u64>,
+    /// Whole-ledger verifies skipped by the pre-state era sentinel: the state
+    /// we were about to verify against already contained this ledger's
+    /// effects (held/re-driven ledger whose earlier write survived — the
+    /// 2026-07-15 #105612802 incident) or was missing prior ledgers.
+    /// Replaying would produce a meaningless tef*/ter* storm recorded as
+    /// false divergences, so the verify is skipped and counted here instead.
+    pub verify_skipped_era: u64,
+    /// Last era-skip detail: "L{seq} acct_seq={a} tx_seq={t} ({direction})".
+    pub verify_skipped_era_last: String,
     /// Silent divergences: our shim returned tesSUCCESS or tec*, but the
     /// network's recorded TransactionResult differed. Total across all
     /// tx_type/our_ter/net_ter combos.
@@ -1190,9 +1682,11 @@ impl Default for DivergenceLog {
 /// field code 0x68 followed by an 8-byte STAmount in native-XRP form. The
 /// high byte of that 8-byte block has the layout:
 ///
-///     bit 7 (0x80) = 0 → native XRP (clear) / 1 → IOU
-///     bit 6 (0x40) = 1 → positive       / 0 → negative
-///     bits 5..0    = top 6 bits of the 62-bit drops value
+/// ```text
+/// bit 7 (0x80) = 0 → native XRP (clear) / 1 → IOU
+/// bit 6 (0x40) = 1 → positive       / 0 → negative
+/// bits 5..0    = top 6 bits of the 62-bit drops value
+/// ```
 ///
 /// Fees are always native and positive, so the high byte is `0x40 | (top6)`.
 /// The 2-byte pattern `[0x68, 0x4_]` (where the second byte's top two bits
@@ -1212,6 +1706,35 @@ pub fn scan_sequence_in_account_root(data: &[u8]) -> Option<u32> {
     for i in 0..data.len().saturating_sub(5) {
         if data[i] == 0x24 {
             return Some(u32::from_be_bytes(data[i + 1..i + 5].try_into().ok()?));
+        }
+    }
+    None
+}
+
+/// Extract the Sequence field from a serialized transaction blob.
+/// Walks the canonical UInt-field prefix — TransactionType (0x12), then any
+/// of NetworkID (0x21) / Flags (0x22) / SourceTag (0x23) — until sfSequence
+/// (0x24). Returns None on any unexpected field or truncation; callers treat
+/// that as "sentinel unavailable", never as an error. Ticket-based txs carry
+/// Sequence == 0 (present but zero) — callers skip those for era checks.
+pub fn scan_sequence_in_tx(tx: &[u8]) -> Option<u32> {
+    let mut i = 0usize;
+    while i < tx.len() {
+        match tx[i] {
+            0x12 => i += 3,               // TransactionType: u16
+            0x21 | 0x22 | 0x23 => i += 5, // NetworkID / Flags / SourceTag: u32
+            0x24 => {
+                if i + 5 > tx.len() {
+                    return None;
+                }
+                return Some(u32::from_be_bytes([
+                    tx[i + 1],
+                    tx[i + 2],
+                    tx[i + 3],
+                    tx[i + 4],
+                ]));
+            }
+            _ => return None, // unexpected field before Sequence — inconclusive
         }
     }
     None
@@ -1447,6 +1970,166 @@ pub fn process_live_tx(stats: &SharedFfiStats, tx_bytes: &[u8], ledger_seq: u32)
 pub type LedgerOverlay = std::collections::HashMap<[u8; 32], Option<Vec<u8>>>;
 
 
+/// Resolve the pre-apply bytes for each Modified mutation through the SAME
+/// layered chain the apply used: the overlay slot first (a tombstone means
+/// the entry was deleted earlier in this ledger — never fall through past
+/// it), then the pre-ledger base via `base_lookup` (RocksDB snapshot on the
+/// DB path, era-pinned RPC fallback on the standalone path). Keys whose
+/// pre-state can't be resolved are absent from the result — the comparison
+/// then keeps the node (a false-positive divergence beats a silently wrong
+/// filter). Created/Deleted mutations are never captured: they cannot be
+/// no-ops.
+pub fn capture_pre_state_for_modified(
+    mutations: &[xrpl_ffi::SleMutation],
+    overlay: &std::collections::HashMap<[u8; 32], Option<Vec<u8>>>,
+    base_lookup: impl Fn(&[u8; 32]) -> Option<Vec<u8>>,
+) -> std::collections::HashMap<[u8; 32], Vec<u8>> {
+    let mut pre_state: std::collections::HashMap<[u8; 32], Vec<u8>> =
+        std::collections::HashMap::new();
+    for m in mutations {
+        if !matches!(m.kind, xrpl_ffi::MutationKind::Modified)
+            || pre_state.contains_key(&m.key)
+        {
+            continue;
+        }
+        let pre = match overlay.get(&m.key) {
+            // Overlay slot exists: use it verbatim. A tombstone (None) means
+            // the entry was deleted earlier this ledger — the base still has
+            // the stale pre-ledger version, so it must NOT be consulted.
+            Some(slot) => slot.clone(),
+            None => base_lookup(&m.key),
+        };
+        if let Some(bytes) = pre {
+            pre_state.insert(m.key, bytes);
+        }
+    }
+    pre_state
+}
+
+pub fn mutation_kind_byte(k: &xrpl_ffi::MutationKind) -> u8 {
+    match k {
+        xrpl_ffi::MutationKind::Created => 0,
+        xrpl_ffi::MutationKind::Modified => 1,
+        xrpl_ffi::MutationKind::Deleted => 2,
+    }
+}
+
+/// Build the comparison set of (key-hex, kind-byte) from our mutations,
+/// dropping no-op Modifieds: rippled's meta-build skips entries whose post
+/// bytes equal the pre bytes (ApplyStateTable.cpp:155 — `*curNode ==
+/// *origNode`) while libxrpl still emits them via rawReplace. Only this
+/// diagnostic set is filtered — `outcome.mutations` and overlay threading
+/// are untouched. A Modified with no captured pre-state is kept.
+/// One serialized AMOUNT field body as a signed decimal.
+///
+/// XRP is 8 bytes, bit 63 clear, bit 62 the sign. An IOU is 48 bytes: bit 63
+/// set, bit 62 the sign, bits 54-61 the exponent offset by 97, bits 0-53 the
+/// mantissa. Zero is the canonical 0x8000000000000000 and falls out as 0.0.
+fn amount_value(b: &[u8]) -> Option<f64> {
+    match b.len() {
+        8 => {
+            let raw = u64::from_be_bytes(b.try_into().ok()?);
+            let drops = (raw & 0x3FFF_FFFF_FFFF_FFFF) as f64;
+            Some(if raw & 0x4000_0000_0000_0000 != 0 { drops } else { -drops })
+        }
+        48 => {
+            let raw = u64::from_be_bytes(b[..8].try_into().ok()?);
+            if raw & 0x8000_0000_0000_0000 == 0 {
+                return None;
+            }
+            let mant = (raw & 0x003F_FFFF_FFFF_FFFF) as f64;
+            if mant == 0.0 {
+                return Some(0.0);
+            }
+            let exp = ((raw >> 54) & 0xFF) as i32 - 97;
+            let sign = if raw & 0x4000_0000_0000_0000 != 0 { 1.0 } else { -1.0 };
+            Some(sign * mant * 10f64.powi(exp))
+        }
+        _ => None,
+    }
+}
+
+/// Every AMOUNT field in a serialized SLE, as (field code, value).
+///
+/// Canonical field order sorts by type code, so every type-6 field precedes
+/// the first VL-encoded one (type >= 7) — which means a walk that skips only
+/// the fixed-width types ahead of it reads ALL of them and can stop dead at
+/// the first VL field. `offer_books::scan_two_amounts` leans on the same
+/// property. Field codes that matter here: 2 Balance, 4 TakerPays, 5 TakerGets.
+fn sle_amounts(sle: &[u8]) -> Vec<(u8, f64)> {
+    use crate::offer_books::read_field_header;
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos < sle.len() {
+        let Some((ty, field, hl)) = read_field_header(sle, pos) else { break };
+        pos += hl;
+        match ty {
+            1 => pos += 2,
+            2 => pos += 4,
+            3 => pos += 8,
+            4 => pos += 16,
+            5 => pos += 32,
+            6 => {
+                let len = if pos < sle.len() && sle[pos] & 0x80 == 0 { 8 } else { 48 };
+                if pos + len > sle.len() {
+                    break;
+                }
+                if let Some(v) = amount_value(&sle[pos..pos + len]) {
+                    out.push((field, v));
+                }
+                pos += len;
+            }
+            // type >= 7 is VL-encoded and every amount is already behind us.
+            _ => break,
+        }
+    }
+    out
+}
+
+pub fn build_ours_mutation_set(
+    mutations: &[xrpl_ffi::SleMutation],
+    pre_state_for_modified: &std::collections::HashMap<[u8; 32], Vec<u8>>,
+) -> std::collections::HashSet<(String, u8)> {
+    mutations
+        .iter()
+        .filter(|m| {
+            if !matches!(m.kind, xrpl_ffi::MutationKind::Modified) {
+                return true;
+            }
+            match pre_state_for_modified.get(&m.key) {
+                Some(pre_bytes) => pre_bytes != &m.data, // keep iff actually changed
+                None => true, // no pre-state captured → can't tell, keep it
+            }
+        })
+        .map(|m| (hex::encode_upper(m.key), mutation_kind_byte(&m.kind)))
+        .collect()
+}
+
+/// Network-specific apply parameters. Defaults are mainnet; testnet/devnet
+/// fixtures carry their own values (captured by fetch_ledger_fixture.py from
+/// `server_state`) so parity probes replay under the right rules — built for
+/// pre-training the replay lane on amendment traffic (e.g. LendingProtocol)
+/// before mainnet activation.
+pub struct NetParams {
+    pub network_id: u32,
+    pub base_fee_drops: u64,
+    pub reserve_drops: u64,
+    pub increment_drops: u64,
+}
+
+impl Default for NetParams {
+    fn default() -> Self {
+        Self {
+            network_id: 0,
+            base_fee_drops: 10,
+            reserve_drops: 1_000_000,  // Mainnet: 1 XRP
+            increment_drops: 200_000,  // Mainnet: 0.2 XRP
+        }
+    }
+}
+
+/// Mainnet-parameter wrapper — every existing caller keeps this signature.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_ledger_in_order(
     stats: &SharedFfiStats,
     txs_in_order: &[Vec<u8>],
@@ -1463,7 +2146,79 @@ pub fn apply_ledger_in_order(
     mutation_divergence_log: Option<&DivergenceLog>,
     expected_mutations: Option<&std::collections::HashMap<String, Vec<(String, u8)>>>,
 ) -> LedgerOverlay {
+    apply_ledger_in_order_with_net(
+        stats, txs_in_order, ledger_seq, rpc_urls, amendments, parent_hash,
+        parent_close_time, total_drops, divergence_log, db_snapshot,
+        silent_divergence_log, expected_outcomes, mutation_divergence_log,
+        expected_mutations, None, &NetParams::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn apply_ledger_in_order_with_net(
+    stats: &SharedFfiStats,
+    txs_in_order: &[Vec<u8>],
+    ledger_seq: u32,
+    rpc_urls: &[String],
+    amendments: &[[u8; 32]],
+    parent_hash: [u8; 32],
+    parent_close_time: u32,
+    total_drops: u64,
+    divergence_log: Option<&DivergenceLog>,
+    db_snapshot: Option<&OwnedSnapshot>,
+    silent_divergence_log: Option<&DivergenceLog>,
+    expected_outcomes: Option<&std::collections::HashMap<String, String>>,
+    mutation_divergence_log: Option<&DivergenceLog>,
+    expected_mutations: Option<&std::collections::HashMap<String, Vec<(String, u8)>>>,
+    // DX_VALCHECK for the ORACLE leg: tx hash -> node key -> mainnet FinalFields.
+    // Lets the value comparison run against what libxrpl itself produced, which
+    // is the only way to tell an engine defect from a pre-state one at value
+    // level. `None` everywhere except parity_probe.
+    expected_fields: Option<&std::collections::HashMap<String, std::collections::HashMap<String, serde_json::Value>>>,
+    net: &NetParams,
+) -> LedgerOverlay {
     let fallback = RpcProvider::with_endpoints(rpc_urls.to_vec(), ledger_seq.saturating_sub(1));
+
+    // Era sentinel (2026-07-15, #105612802): if the pre-state we're about to
+    // verify against already contains this ledger's effects (a held/re-driven
+    // ledger whose earlier write survived) — or is missing prior ledgers —
+    // replaying produces a meaningless tef*/ter* storm that lands in the
+    // divergence log as false positives. Check the first Sequence-bearing tx:
+    // at a true pre-ledger boundary its sender's AccountRoot.Sequence equals
+    // the tx's Sequence (a ledger never includes a seq-based tx otherwise).
+    // On mismatch: skip the whole verify, log ONE loud line, count it in
+    // stats — and write nothing to the divergence logs.
+    for tx_bytes in txs_in_order {
+        let Some(tx_seq) = scan_sequence_in_tx(tx_bytes) else { continue };
+        if tx_seq == 0 {
+            continue; // ticket-based tx: carries no era signal
+        }
+        let Some(sender_key) = extract_sender_account_root_key(tx_bytes) else { continue };
+        let acct_bytes: Option<Vec<u8>> = match db_snapshot {
+            Some(snap) => snap.get(&sender_key).ok().flatten(),
+            None => fallback.read(&sender_key).map(|b| b.to_vec()),
+        };
+        let Some(acct_seq) = acct_bytes.as_deref().and_then(scan_sequence_in_account_root) else {
+            break; // sender unreadable — sentinel inconclusive, proceed unguarded
+        };
+        if acct_seq != tx_seq {
+            let dir = if acct_seq > tx_seq {
+                "state already past this ledger"
+            } else {
+                "state behind this ledger"
+            };
+            eprintln!(
+                "[ffi] #{ledger_seq}: PRE-STATE ERA MISMATCH (sender seq={acct_seq} vs tx seq={tx_seq}) — {dir}; verify skipped, no divergences logged"
+            );
+            let mut s = stats.lock();
+            s.verify_skipped_era += 1;
+            s.verify_skipped_era_last =
+                format!("L{ledger_seq} acct_seq={acct_seq} tx_seq={tx_seq} ({dir})");
+            return LedgerOverlay::new();
+        }
+        break; // first seq-bearing tx checked clean — era OK, proceed
+    }
+
     let overlay: parking_lot::Mutex<std::collections::HashMap<[u8; 32], Option<Vec<u8>>>> =
         parking_lot::Mutex::new(std::collections::HashMap::new());
     let ledger = LedgerInfo {
@@ -1471,9 +2226,9 @@ pub fn apply_ledger_in_order(
         parent_close_time,
         total_drops,
         parent_hash,
-        base_fee_drops: 10,
-        reserve_drops: 1_000_000,   // Mainnet: 1 XRP
-        increment_drops: 200_000,   // Mainnet: 0.2 XRP
+        base_fee_drops: net.base_fee_drops,
+        reserve_drops: net.reserve_drops,
+        increment_drops: net.increment_drops,
     };
 
     // Reset per-round stats for this ledger
@@ -1504,6 +2259,19 @@ pub fn apply_ledger_in_order(
     );
     for tx_bytes in txs_in_order {
         tx_num += 1;
+        // No-snapshot (standalone RPC) path: seed succ()'s book view before
+        // applying. OfferCreate crossing and cross-currency Payment flow
+        // both probe the book's quality range via succ(bookBase, bookEnd),
+        // which the RPC provider can only answer from a book_offers prefetch
+        // (see RpcProvider::succ). The snapshot path answers succ from
+        // RocksDB and needs none of this.
+        if db_snapshot.is_none() {
+            fallback.prefetch_offer_books_for_tx(tx_bytes);
+            // Same story for NFToken txs: the page walk's probe key is
+            // derived from the token ID and is not a real ledger object, so
+            // the cold walk cannot start (see RpcProvider::succ).
+            fallback.prefetch_nft_pages_for_tx(tx_bytes);
+        }
         // Parse to get tx_type + hash (for diagnostic buckets)
         let (tx_type, tx_hash) = xrpl_ffi::parse_tx(tx_bytes)
             .map(|p| (p.tx_type, hex::encode_upper(p.hash)))
@@ -1514,7 +2282,7 @@ pub fn apply_ledger_in_order(
         let outcome_opt = if let Some(snap) = db_snapshot {
             let provider = OverlayedDbProvider::new(&overlay, snap, &fallback)
                 .with_rpc_consult_budget(&ledger_rpc_budget);
-            let r = xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, 0);
+            let r = xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, net.network_id);
             // Accumulate provider counters into stats
             use std::sync::atomic::Ordering;
             let h = provider.db_hits.load(Ordering::Relaxed);
@@ -1565,7 +2333,7 @@ pub fn apply_ledger_in_order(
             r
         } else {
             let provider = LayeredProvider::new(&overlay, &fallback);
-            xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, 0)
+            xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, net.network_id)
         };
         let mut outcome = match outcome_opt {
             Some(o) => o,
@@ -1596,24 +2364,19 @@ pub fn apply_ledger_in_order(
             std::collections::HashMap::new();
         if expected_mutations.is_some() && should_thread {
             let ov = overlay.lock();
-            for m in &outcome.mutations {
-                if matches!(m.kind, xrpl_ffi::MutationKind::Modified)
-                    && !pre_state_for_modified.contains_key(&m.key)
-                {
-                    let pre = if let Some(entry) = ov.get(&m.key) {
-                        entry.clone()
-                    } else if let Some(snap) = db_snapshot {
-                        snap.get(&m.key).ok().flatten()
-                    } else {
-                        None
-                    };
-                    if let Some(bytes) = pre {
-                        pre_state_for_modified.insert(m.key, bytes);
-                    }
-                    // If neither overlay nor snapshot has it, we can't detect a
-                    // no-op; treat as a real divergence (false positive — rare).
-                }
-            }
+            pre_state_for_modified = capture_pre_state_for_modified(
+                &outcome.mutations,
+                &ov,
+                |k| match db_snapshot {
+                    Some(snap) => snap.get(k).ok().flatten(),
+                    // Standalone RPC path: era-pinned pre-ledger read through
+                    // the same fallback the apply's LayeredProvider used. A
+                    // key first touched by THIS tx has no overlay slot, and
+                    // without this read its no-op Modified can't be detected
+                    // — the exact "+1 ModifiedNode" phantom (F1).
+                    None => fallback.read(k).map(|b| b.to_vec()),
+                },
+            );
         }
         let prior_overlay_size;
         let mut post_overlay_size;
@@ -1696,10 +2459,10 @@ pub fn apply_ledger_in_order(
                 let retry_opt = if let Some(snap) = db_snapshot {
                     let provider = OverlayedDbProvider::new(&overlay, snap, &fallback)
                         .with_rpc_consult_budget(&ledger_rpc_budget);
-                    xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, 0)
+                    xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, net.network_id)
                 } else {
                     let provider = LayeredProvider::new(&overlay, &fallback);
-                    xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, 0)
+                    xrpl_ffi::apply_with_mutations(tx_bytes, amendments, &ledger, &provider, 0, net.network_id)
                 };
                 let retry = match retry_opt {
                     Some(r) => r,
@@ -1831,6 +2594,23 @@ pub fn apply_ledger_in_order(
         }
         let _ = (overlay_hits, prior_overlay_size);
 
+        // XRPL_FFI_TRACE_TX=<hash prefix>, with XRPL_FFI_TRACE set on the shim,
+        // dumps everything libxrpl narrated while applying that transaction:
+        // which strands it built, which offers its stream stepped past, what
+        // each AMM offer was anchored on, and which gate rejected what. That is
+        // the ground truth for the crossing-path divergences — the source says
+        // what rippled CAN do, this says what it DID.
+        if let Ok(want) = std::env::var("XRPL_FFI_TRACE_TX") {
+            if !want.is_empty() && tx_hash.starts_with(&want) {
+                eprintln!(
+                    "=== FFI_TRACE {tx_hash} {tx_type}/{} ({} mutations) ===\n{}",
+                    outcome.ter_name,
+                    outcome.mutations.len(),
+                    outcome.last_fatal.replace(" | ", "\n"),
+                );
+            }
+        }
+
         let mut s = stats.lock();
         s.live_apply_attempted += 1;
         // Categorize: tesSUCCESS → ok, tec* → claimed (rippled agreed), else → diverged
@@ -1906,6 +2686,57 @@ pub fn apply_ledger_in_order(
         // affected nodes (cross-account paths, ticket count, etc.). Only run
         // when our outcome was tesSUCCESS or tec* AND network's TER matches
         // ours (otherwise the silent/regular checks above already flagged it).
+        // DX_VALCHECK ON THE ORACLE. The mutation check below compares KEYS,
+        // and so does the whole parity verdict — a `PROBE: CLEAN` says libxrpl
+        // touched the same objects mainnet did, never that it wrote the same
+        // NUMBERS. #105945386 7EF34E79F13A is 36/36 CLEAN with its rested offer
+        // 0.025 ShearPepe off, and the native probe's own DX_VALCHECK could not
+        // say whose fault that was, because it had nothing to compare libxrpl
+        // against.
+        //
+        // This closes that: it reads the AMOUNTS out of the SLEs libxrpl
+        // ACTUALLY PRODUCED and diffs them against mainnet's FinalFields. The
+        // oracle rule finally works at value level —
+        //   libxrpl == mainnet, we differ  ⇒ OUR ENGINE
+        //   libxrpl != mainnet             ⇒ pre-state / harness / version
+        // which is the verdict every one of the 175 value hits is waiting on.
+        if let (Ok(spec), Some(fmap)) = (std::env::var("DX_VALCHECK"), expected_fields) {
+            let tol: f64 = if spec == "1" { 1e-12 } else { spec.parse().unwrap_or(1e-12) };
+            if let Some(nodes) = fmap.get(&tx_hash) {
+                let amt = |v: &serde_json::Value| -> Option<f64> {
+                    match v {
+                        serde_json::Value::String(t) => t.parse::<f64>().ok(),
+                        serde_json::Value::Object(_) => {
+                            v["value"].as_str().and_then(|t| t.parse::<f64>().ok())
+                        }
+                        _ => None,
+                    }
+                };
+                for m in outcome.mutations.iter() {
+                    if matches!(m.kind, xrpl_ffi::MutationKind::Deleted) {
+                        continue;
+                    }
+                    let key = hex::encode_upper(m.key);
+                    let Some(nf) = nodes.get(&key) else { continue };
+                    for (code, ours) in sle_amounts(&m.data) {
+                        let name = match code {
+                            2 => "Balance",
+                            4 => "TakerPays",
+                            5 => "TakerGets",
+                            _ => continue,
+                        };
+                        let Some(net_v) = amt(&nf[name]) else { continue };
+                        let scale = ours.abs().max(net_v.abs()).max(1e-30);
+                        if (ours - net_v).abs() / scale > tol {
+                            eprintln!(
+                                "FFI_VALCHECK {} {} {} {} libxrpl={} net={}",
+                                tx_hash, tx_type, key, name, ours, net_v
+                            );
+                        }
+                    }
+                }
+            }
+        }
         if let Some(mut_map) = expected_mutations {
             let same_ter = expected_outcomes
                 .and_then(|m| m.get(&tx_hash))
@@ -1914,32 +2745,13 @@ pub fn apply_ledger_in_order(
             if same_ter && (outcome.ter_name == "tesSUCCESS" || outcome.ter_name.starts_with("tec")) {
                 if let Some(net_muts) = mut_map.get(&tx_hash) {
                     use std::collections::HashSet;
-                    let kind_byte = |k: &xrpl_ffi::MutationKind| -> u8 {
-                        match k {
-                            xrpl_ffi::MutationKind::Created => 0,
-                            xrpl_ffi::MutationKind::Modified => 1,
-                            xrpl_ffi::MutationKind::Deleted => 2,
-                        }
-                    };
-                    // Filter out no-op Modifieds: rippled's meta-build skips
-                    // these (ApplyStateTable.cpp:155 — `(*curNode == *origNode)`),
-                    // but libxrpl still emits them via rawReplace. Comparing
-                    // them as "extra in ours" produces ~150/min phantom
-                    // divergences on Payment-heavy workloads. Honesty preserved
-                    // because outcome.mutations itself is unchanged — only the
-                    // diagnostic set is filtered.
-                    let ours_set: HashSet<(String, u8)> = outcome.mutations.iter()
-                        .filter(|m| {
-                            if !matches!(m.kind, xrpl_ffi::MutationKind::Modified) {
-                                return true;
-                            }
-                            match pre_state_for_modified.get(&m.key) {
-                                Some(pre_bytes) => pre_bytes != &m.data, // keep iff actually changed
-                                None => true, // no pre-state captured → can't tell, keep it
-                            }
-                        })
-                        .map(|m| (hex::encode_upper(m.key), kind_byte(&m.kind)))
-                        .collect();
+                    // No-op Modifieds are dropped from the compared set (see
+                    // build_ours_mutation_set) — rippled's meta-build skips
+                    // them, libxrpl still emits them via rawReplace. Honesty
+                    // preserved because outcome.mutations itself is unchanged
+                    // — only the diagnostic set is filtered.
+                    let ours_set: HashSet<(String, u8)> =
+                        build_ours_mutation_set(&outcome.mutations, &pre_state_for_modified);
                     let net_set: HashSet<(String, u8)> = net_muts.iter().cloned().collect();
                     if ours_set != net_set {
                         let kind_label = |b: u8| match b { 0 => "C", 1 => "M", 2 => "D", _ => "?" };

@@ -76,12 +76,42 @@ pub fn ripple_state_key(
     sha512_half(&buf)
 }
 
+/// Compute the state tree key for an AMM instance keyed by its asset pair.
+/// rippled `keylet::amm`: issues ordered by (currency, account), serialized
+/// ACCOUNT-FIRST: `SHA512Half(0x0041 || min.account || min.currency ||
+/// max.account || max.currency)`. XRP is all-zero currency and account.
+/// Verified against mainnet AMMID 6DAA4FDF… (XRP/LEDGEND pool).
+pub fn amm_key(cur_a: &[u8; 20], iss_a: &[u8; 20], cur_b: &[u8; 20], iss_b: &[u8; 20]) -> Hash256 {
+    let a = (cur_a, iss_a);
+    let b = (cur_b, iss_b);
+    let (min, max) = if a <= b { (a, b) } else { (b, a) };
+    let mut buf = [0u8; 82];
+    buf[..2].copy_from_slice(&[0x00, 0x41]); // 'A'
+    buf[2..22].copy_from_slice(min.1);
+    buf[22..42].copy_from_slice(min.0);
+    buf[42..62].copy_from_slice(max.1);
+    buf[62..82].copy_from_slice(max.0);
+    sha512_half(&buf)
+}
+
 /// Compute the state tree key for an owner directory root.
 /// `key = SHA512Half(0x004F || account_id)`
 pub fn owner_dir_key(account_id: &[u8; 20]) -> Hash256 {
     let mut buf = [0u8; 22];
     buf[..2].copy_from_slice(&SPACE_OWNER_DIR);
     buf[2..].copy_from_slice(account_id);
+    sha512_half(&buf)
+}
+
+/// SignerList key: `SHA512Half(0x0053 || account || u32 0)` — rippled
+/// `keylet::signers(account)` hashes a trailing SignerListID of ZERO
+/// (Indexes.cpp `indexHash(LedgerNameSpace::SIGNER_LIST, account, 0u32)`).
+/// Omitting it lands on a key mainnet never touches.
+pub fn signers_key(account_id: &[u8; 20]) -> Hash256 {
+    let mut buf = [0u8; 26];
+    buf[..2].copy_from_slice(&[0x00, 0x53]);
+    buf[2..22].copy_from_slice(account_id);
+    // trailing u32 SignerListID = 0, big-endian
     sha512_half(&buf)
 }
 
@@ -101,8 +131,11 @@ pub fn skip_list_key() -> Hash256 {
     sha512_half(&SPACE_SKIP_LIST)
 }
 
-/// Compute the state tree key for the FeeSettings singleton.
-/// `key = SHA512Half(0x0065)`
+/// NegativeUNL singleton: `SHA512Half(0x004E ('N'))`.
+pub fn negative_unl_key() -> Hash256 {
+    sha512_half(&[0x00, 0x4E])
+}
+
 pub fn fee_settings_key() -> Hash256 {
     sha512_half(&SPACE_FEE)
 }
@@ -125,11 +158,85 @@ pub fn escrow_key(account_id: &[u8; 20], sequence: u32) -> Hash256 {
 
 /// Compute the state tree key for a PayChannel.
 /// `key = SHA512Half(0x0078 || account_id || sequence_be32)`
-pub fn pay_channel_key(account_id: &[u8; 20], sequence: u32) -> Hash256 {
-    let mut buf = [0u8; 26];
+/// `keylet::payChan` hashes SOURCE || DESTINATION || seq — omitting the
+/// destination produced a key no rippled node would ever read.
+pub fn pay_channel_key(account_id: &[u8; 20], dest_id: &[u8; 20], sequence: u32) -> Hash256 {
+    let mut buf = [0u8; 46];
     buf[..2].copy_from_slice(&SPACE_PAY_CHANNEL);
     buf[2..22].copy_from_slice(account_id);
+    buf[22..42].copy_from_slice(dest_id);
+    buf[42..46].copy_from_slice(&sequence.to_be_bytes());
+    sha512_half(&buf)
+}
+
+/// Bridge key: `SHA512Half(0x0048 ('H') || door || issue.currency)` — the
+/// door account and THAT chain side's currency (Indexes.cpp keylet::bridge).
+pub fn bridge_key(door: &[u8; 20], currency: &[u8; 20]) -> Hash256 {
+    let mut buf = [0u8; 42];
+    buf[..2].copy_from_slice(&[0x00, 0x48]);
+    buf[2..22].copy_from_slice(door);
+    buf[22..42].copy_from_slice(currency);
+    sha512_half(&buf)
+}
+
+/// XChainOwnedClaimID / XChainOwnedCreateAccountClaimID keys: namespace 'Q'
+/// (0x51) / 'K' (0x4B) || lockingDoor || lockingIssue || issuingDoor ||
+/// issuingIssue || seq_be64, an Issue serializing as currency(20)||account(20)
+/// (zeros for XRP).
+pub fn xchain_claim_id_key(
+    space: u8,
+    locking_door: &[u8; 20],
+    locking_issue: (&[u8; 20], &[u8; 20]),
+    issuing_door: &[u8; 20],
+    issuing_issue: (&[u8; 20], &[u8; 20]),
+    seq: u64,
+) -> Hash256 {
+    let mut buf = Vec::with_capacity(2 + 20 * 6 + 8);
+    buf.extend_from_slice(&[0x00, space]);
+    buf.extend_from_slice(locking_door);
+    buf.extend_from_slice(locking_issue.0);
+    buf.extend_from_slice(locking_issue.1);
+    buf.extend_from_slice(issuing_door);
+    buf.extend_from_slice(issuing_issue.0);
+    buf.extend_from_slice(issuing_issue.1);
+    buf.extend_from_slice(&seq.to_be_bytes());
+    sha512_half(&buf)
+}
+
+/// DID key: `SHA512Half(0x0049 ('I') || account)` — one DID per account.
+pub fn did_key(account_id: &[u8; 20]) -> Hash256 {
+    let mut buf = [0u8; 22];
+    buf[..2].copy_from_slice(&[0x00, 0x49]);
+    buf[2..22].copy_from_slice(account_id);
+    sha512_half(&buf)
+}
+
+/// PermissionedDomain key: `SHA512Half(0x006D ('m') || account || seq_be32)`.
+pub fn permissioned_domain_key(account_id: &[u8; 20], sequence: u32) -> Hash256 {
+    let mut buf = [0u8; 26];
+    buf[..2].copy_from_slice(&[0x00, 0x6D]);
+    buf[2..22].copy_from_slice(account_id);
     buf[22..26].copy_from_slice(&sequence.to_be_bytes());
+    sha512_half(&buf)
+}
+
+/// MPTokenIssuance key: `SHA512Half(0x007E ('~') || MPTID)` where MPTID is
+/// the 24-byte sequence_be32 || issuer concatenation carried verbatim in
+/// `mpt_issuance_id` amount JSON (Indexes.cpp keylet::mptIssuance).
+pub fn mpt_issuance_key(mptid: &[u8; 24]) -> Hash256 {
+    let mut buf = [0u8; 26];
+    buf[..2].copy_from_slice(&[0x00, 0x7E]);
+    buf[2..26].copy_from_slice(mptid);
+    sha512_half(&buf)
+}
+
+/// MPToken key: `SHA512Half(0x0074 ('t') || issuance_key || holder)`
+/// (Indexes.cpp keylet::mptoken — keyed by the issuance's KEY, not its ID).
+pub fn mptoken_key(issuance_key: &Hash256, holder: &[u8; 20]) -> Hash256 {
+    let mut buf = [0u8; 54];
+    buf[..2].copy_from_slice(&[0x00, 0x74]);
+    buf[2..34].copy_from_slice(&issuance_key.0);
+    buf[34..54].copy_from_slice(holder);
     sha512_half(&buf)
 }
 
@@ -141,6 +248,215 @@ pub fn check_key(account_id: &[u8; 20], sequence: u32) -> Hash256 {
     buf[2..22].copy_from_slice(account_id);
     buf[22..26].copy_from_slice(&sequence.to_be_bytes());
     sha512_half(&buf)
+}
+
+/// Order-book base key: `SHA512Half(0x0042 'B' || pays_currency ||
+/// gets_currency || pays_issuer || gets_issuer)`. The tradable quality
+/// directory replaces the low 64 bits with the encoded quality. Field order
+/// mainnet-verified across 341 offers (13 ledgers).
+pub fn book_base(
+    pays_currency: &[u8; 20],
+    gets_currency: &[u8; 20],
+    pays_issuer: &[u8; 20],
+    gets_issuer: &[u8; 20],
+) -> Hash256 {
+    let mut buf = [0u8; 82];
+    buf[..2].copy_from_slice(&[0x00, 0x42]);
+    buf[2..22].copy_from_slice(pays_currency);
+    buf[22..42].copy_from_slice(gets_currency);
+    buf[42..62].copy_from_slice(pays_issuer);
+    buf[62..82].copy_from_slice(gets_issuer);
+    sha512_half(&buf)
+}
+
+/// Permissioned-DEX (XLS-80) order-book base: the open-book preimage with the
+/// 32-byte DomainID appended. Mainnet-verified against #105666804's
+/// domain-scoped EUROP/XRP offer (B7D9F3DB).
+pub fn book_base_domain(
+    pays_currency: &[u8; 20],
+    gets_currency: &[u8; 20],
+    pays_issuer: &[u8; 20],
+    gets_issuer: &[u8; 20],
+    domain: &Hash256,
+) -> Hash256 {
+    let mut buf = [0u8; 114];
+    buf[..2].copy_from_slice(&[0x00, 0x42]);
+    buf[2..22].copy_from_slice(pays_currency);
+    buf[22..42].copy_from_slice(gets_currency);
+    buf[42..62].copy_from_slice(pays_issuer);
+    buf[62..82].copy_from_slice(gets_issuer);
+    buf[82..114].copy_from_slice(&domain.0);
+    sha512_half(&buf)
+}
+
+/// Quality directory key for a book: base with the low 64 bits replaced by
+/// the quality (big-endian).
+pub fn book_dir_key(base: &Hash256, quality: u64) -> Hash256 {
+    let mut k = base.0;
+    k[24..32].copy_from_slice(&quality.to_be_bytes());
+    Hash256(k)
+}
+
+/// Parse an amount's (mantissa, exponent): XRP drops are integral strings
+/// (exponent 0); IOU values are decimal strings, optionally scientific
+/// (`1000000000000000e-1`).
+pub fn amount_mant_exp(v: &serde_json::Value) -> Option<(u128, i32)> {
+    let s = match v {
+        serde_json::Value::String(s) => s.as_str(),
+        serde_json::Value::Object(o) => o.get("value")?.as_str()?,
+        _ => return None,
+    };
+    let s = s.trim_start_matches('-');
+    let (mant_str, mut exp): (String, i32) = if let Some(epos) = s.find(['e', 'E']) {
+        let (m, e) = (&s[..epos], &s[epos + 1..]);
+        (m.to_string(), e.parse().ok()?)
+    } else {
+        (s.to_string(), 0)
+    };
+    let (digits, frac) = match mant_str.find('.') {
+        Some(d) => (format!("{}{}", &mant_str[..d], &mant_str[d + 1..]), (mant_str.len() - d - 1) as i32),
+        None => (mant_str, 0),
+    };
+    let m: u128 = digits.parse().ok()?;
+    exp -= frac;
+    Some((m, exp))
+}
+
+/// Encode `pays/gets` as rippled's `getRate`: `((exponent+100) << 56) |
+/// mantissa`, i.e. `divide(in, out)` canonicalized.
+///
+/// Faithful to rippled's `STAmount divide` — the LEGACY muldiv, not the
+/// Number-exact rounding the fill path uses. Normalize both mantissas to
+/// [1e15,1e16), truncating muldiv at 10^17, `+5`, then ONE round-half-even
+/// pass over the excess tail (canonicalize).
+///
+/// ⚠ The `+5` is NOT a fudge to be "cleaned up" into exact half-even
+/// rounding. Two mainnet cases pin it from both sides: #105091579's
+/// tick-rounded placement needs `…DBA4`, which only `+5` produces, while exact
+/// half-even gives `…DBA3`; #105777146 needs `…5800`, which `+5` also
+/// produces from mainnet's own stored amounts. rippled genuinely has two
+/// divides — this one for `divide`/`multiply`/`getRate`, and Number's
+/// half-even for flow arithmetic (`offer::div_nearest_16`). Mixing them is
+/// what `0EAE58BB`/`42071037` punished on the fill path, and using the fill
+/// rule here is what put #105777146 one ULP off its book level.
+pub fn rate_encode(pays_m: u128, pays_e: i32, gets_m: u128, gets_e: i32) -> Option<u64> {
+    if pays_m == 0 || gets_m == 0 {
+        return None;
+    }
+    const LO: u128 = 1_000_000_000_000_000; // 1e15
+    const HI: u128 = 10_000_000_000_000_000; // 1e16
+    let norm = |mut m: u128, mut e: i32| {
+        while m >= HI {
+            m /= 10;
+            e += 1;
+        }
+        while m < LO {
+            m *= 10;
+            e -= 1;
+        }
+        (m, e)
+    };
+    let (nm, ne) = norm(pays_m, pays_e);
+    let (dm, de) = norm(gets_m, gets_e);
+    let v = nm * 100_000_000_000_000_000u128 / dm + 5; // trunc muldiv @1e17, +5
+    let mut e = ne - de - 17;
+    let mut k = 0u32;
+    let mut t = v;
+    while t >= HI {
+        t /= 10;
+        k += 1;
+    }
+    let d = 10u128.pow(k);
+    let (mut m, r) = (v / d, v % d);
+    if 2 * r > d || (2 * r == d && m & 1 == 1) {
+        m += 1;
+    }
+    e += k as i32;
+    if m >= HI {
+        m /= 10;
+        e += 1;
+    }
+    while m > 0 && m < LO {
+        m *= 10;
+        e -= 1;
+    }
+    if m == 0 {
+        return None;
+    }
+    Some((((e + 100) as u64) << 56) | m as u64)
+}
+
+/// Offer quality = rate = TakerPays/TakerGets. See [`rate_encode`].
+pub fn offer_quality(taker_pays: &serde_json::Value, taker_gets: &serde_json::Value) -> Option<u64> {
+    let (pm, pe) = amount_mant_exp(taker_pays)?;
+    let (gm, ge) = amount_mant_exp(taker_gets)?;
+    rate_encode(pm, pe, gm, ge)
+}
+
+/// Compute the state tree key for a Ticket.
+/// `key = SHA512Half(0x0054 || account_id || ticket_sequence_be32)` — 'T'.
+/// Mainnet-verified against #105663160's ticketed cancels.
+pub fn ticket_key(account_id: &[u8; 20], ticket_seq: u32) -> Hash256 {
+    let mut buf = [0u8; 26];
+    buf[..2].copy_from_slice(&[0x00, 0x54]);
+    buf[2..22].copy_from_slice(account_id);
+    buf[22..26].copy_from_slice(&ticket_seq.to_be_bytes());
+    sha512_half(&buf)
+}
+
+/// Compute the state tree key for a price Oracle (XLS-47).
+/// `key = SHA512Half(0x0052 || account_id || document_id_be32)` — 'R'.
+/// Mainnet-verified against #105091578's Band Protocol oracle update
+/// (rsNvoAZ9… doc 1 → D463D13A…).
+pub fn oracle_key(account_id: &[u8; 20], document_id: u32) -> Hash256 {
+    let mut buf = [0u8; 26];
+    buf[..2].copy_from_slice(&[0x00, 0x52]);
+    buf[2..22].copy_from_slice(account_id);
+    buf[22..26].copy_from_slice(&document_id.to_be_bytes());
+    sha512_half(&buf)
+}
+
+/// Compute the state tree key for an NFTokenOffer.
+/// `key = SHA512Half(0x0071 || account_id || sequence_be32)` — namespace 'q',
+/// distinct from DEX offers ('o'). Mainnet-verified against #105666725.
+pub fn nft_offer_key(account_id: &[u8; 20], sequence: u32) -> Hash256 {
+    let mut buf = [0u8; 26];
+    buf[..2].copy_from_slice(&[0x00, 0x71]);
+    buf[2..22].copy_from_slice(account_id);
+    buf[22..26].copy_from_slice(&sequence.to_be_bytes());
+    sha512_half(&buf)
+}
+
+/// Root key of the buy-offer directory for a token:
+/// `SHA512Half(0x0068 || NFTokenID)` (namespace 'h'). Mainnet-verified.
+pub fn nft_buy_offers_key(nft_id: &Hash256) -> Hash256 {
+    let mut buf = [0u8; 34];
+    buf[..2].copy_from_slice(&[0x00, 0x68]);
+    buf[2..34].copy_from_slice(&nft_id.0);
+    sha512_half(&buf)
+}
+
+/// Root key of the sell-offer directory for a token:
+/// `SHA512Half(0x0069 || NFTokenID)` (namespace 'i').
+pub fn nft_sell_offers_key(nft_id: &Hash256) -> Hash256 {
+    let mut buf = [0u8; 34];
+    buf[..2].copy_from_slice(&[0x00, 0x69]);
+    buf[2..34].copy_from_slice(&nft_id.0);
+    sha512_half(&buf)
+}
+
+/// AMM LP-token currency code (XLS-30): `0x03 ++ SHA512(minCur ‖ maxCur)[0..19]`.
+/// Mainnet-verified against #105666725's XRP/SPY pool (03DF681D…).
+pub fn amm_lpt_currency(cur_a: &[u8; 20], cur_b: &[u8; 20]) -> [u8; 20] {
+    let (lo, hi) = if cur_a <= cur_b { (cur_a, cur_b) } else { (cur_b, cur_a) };
+    let mut buf = [0u8; 40];
+    buf[..20].copy_from_slice(lo);
+    buf[20..].copy_from_slice(hi);
+    let h = sha512_half(&buf);
+    let mut c = [0u8; 20];
+    c[0] = 0x03;
+    c[1..20].copy_from_slice(&h.0[..19]);
+    c
 }
 
 /// Compute the state tree key for a DepositPreauth.
@@ -277,7 +593,7 @@ mod tests {
         let seq = 42u32;
         // Same account+sequence but different space keys → different results
         let ek = escrow_key(&acct, seq);
-        let pk = pay_channel_key(&acct, seq);
+        let pk = pay_channel_key(&acct, &[0x66u8; 20], seq);
         let ck = check_key(&acct, seq);
         assert_ne!(ek, pk);
         assert_ne!(ek, ck);

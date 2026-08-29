@@ -4,13 +4,20 @@
 
 pub mod account;
 pub mod amm;
+pub mod amm_swap;
 pub mod check;
 pub mod credential;
+pub mod direct_step;
 pub mod dispatch;
 pub mod escrow;
 pub mod misc;
+pub mod mpt;
 pub mod nftoken;
 pub mod offer;
+pub mod oracle;
 pub mod pay_channel;
 pub mod payment;
+pub mod pseudo;
+pub mod ticket;
 pub mod trust_set;
+pub mod xchain;
