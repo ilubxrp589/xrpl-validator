@@ -47,6 +47,7 @@ pub struct ShadowStats {
     pub hydrate_objects: AtomicU64,
     pub hydrate_decode_err: AtomicU64,
     pub hydrate_ms: AtomicU64,
+    pub hydrate_skipped_lowmem: AtomicU64,
     pub ledgers: AtomicU64,
     pub full_match: AtomicU64,
     pub overlay_diverged: AtomicU64,
@@ -64,6 +65,22 @@ pub struct ShadowStats {
 pub fn stats() -> &'static ShadowStats {
     static S: OnceLock<ShadowStats> = OnceLock::new();
     S.get_or_init(ShadowStats::default)
+}
+
+/// MemAvailable from /proc/meminfo, in GB — the kernel's honest "how much
+/// can you allocate before we start reclaiming/swapping" figure.
+fn mem_available_gb() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = s.lines().find(|l| l.starts_with("MemAvailable:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb / 1_048_576)
+}
+
+/// Our own resident set, in GB (VmRSS via /proc/self/statm page count).
+fn rss_gb() -> Option<f64> {
+    let s = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: f64 = s.split_whitespace().nth(1)?.parse().ok()?;
+    Some(pages * 4096.0 / 1_073_741_824.0)
 }
 
 /// The 4 static protocol singletons plus the rolling skip list: keys the FFI
@@ -146,6 +163,38 @@ impl NativeShadow {
     /// ws-sync's hold-position machinery absorbs the stall and catches up.
     /// `as_of` is the ledger the DB currently represents (last_synced).
     pub fn hydrate(&mut self, db: &rocksdb::DB, as_of: u32) {
+        // v5 memory diet. v4's single greedy pass spiked live_viewer to
+        // 58.6GB on the 62GB box — swap filled and the machine thrashed
+        // (the mirror itself fits fine; the SPIKE is the killer). Three
+        // levers, receipts to prove them:
+        //   1. Budget gate: refuse to start unless MemAvailable covers the
+        //      mirror plus slack — a skipped hydrate is a receipt, a
+        //      thrashing validator is an outage.
+        //   2. fill_cache(false): the full scan otherwise pumps the whole
+        //      store through the 4GB block cache (engine.rs:274) for blocks
+        //      we will never read again.
+        //   3. Progress receipts with live RSS every 2M objects, so the
+        //      console shows WHERE the memory goes instead of a silent
+        //      climb ending in SIGKILL. (Pair with MALLOC_CONF
+        //      background_thread:true,dirty_decay_ms:1000 at launch — the
+        //      20M dropped decode temporaries then return to the OS on a
+        //      purger thread instead of lingering in the arenas.)
+        let min_gb: u64 = std::env::var("XRPL_SHADOW_HYDRATE_MIN_GB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
+        if let Some(avail) = mem_available_gb() {
+            if avail < min_gb {
+                stats().hydrate_skipped_lowmem.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "[native-shadow] hydrate SKIPPED — MemAvailable {avail}GB < {min_gb}GB budget (XRPL_SHADOW_HYDRATE_MIN_GB); retry after cooldown"
+                );
+                // Arm the cooldown so the next attempt is 600s out, not
+                // every ledger.
+                self.last_hydrate = Some(std::time::Instant::now());
+                return;
+            }
+        }
         // v3 died here: re-hydration INSERTED into the existing 19.8M-object
         // map without clearing — two passes ~doubled RSS and the third met
         // the OOM killer (silent SIGKILL, no panic line). Fresh map first;
@@ -154,7 +203,9 @@ impl NativeShadow {
         let t0 = std::time::Instant::now();
         let mut n = 0u64;
         let mut bad = 0u64;
-        let iter = db.iterator(rocksdb::IteratorMode::Start);
+        let mut ro = rocksdb::ReadOptions::default();
+        ro.fill_cache(false);
+        let iter = db.iterator_opt(rocksdb::IteratorMode::Start, ro);
         for item in iter {
             let Ok((k, v)) = item else { continue };
             if k.len() != 32 {
@@ -170,6 +221,14 @@ impl NativeShadow {
                         .state_map
                         .insert(Hash256(key), serde_json::to_vec(&jv).unwrap_or_default());
                     n += 1;
+                    if n % 2_000_000 == 0 {
+                        eprintln!(
+                            "[native-shadow] hydrating… {}M objects, RSS {:.1}GB, {}s",
+                            n / 1_000_000,
+                            rss_gb().unwrap_or(0.0),
+                            t0.elapsed().as_secs()
+                        );
+                    }
                 }
                 Err(_) => {
                     bad += 1;
