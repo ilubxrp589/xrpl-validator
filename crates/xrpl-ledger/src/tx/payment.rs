@@ -1256,6 +1256,15 @@ impl PaymentTransactor {
             // part of it the pass did not spend. The difference is the same
             // quantity the balance delta at the bottom measures, at the walk's
             // own precision rather than the line's.
+            if std::env::var("DX_HOP").is_ok() {
+                eprintln!(
+                    "DX_HOP i={i} in={}{} out={}{} avail={avail:?} rw={rw:?} rs={rs:?} rate={hop_rate:?}",
+                    if chain[i].xrp { "XRP".into() } else { hex::encode_upper(&chain[i].cur[..4]) },
+                    if chain[i].xrp { String::new() } else { format!("/{}", &hex::encode(chain[i].issuer)[..6]) },
+                    if chain[i + 1].xrp { "XRP".into() } else { hex::encode_upper(&chain[i + 1].cur[..4]) },
+                    if chain[i + 1].xrp { String::new() } else { format!("/{}", &hex::encode(chain[i + 1].issuer)[..6]) },
+                );
+            }
             if i == 0 {
                 spent_precise = Some(ox::me_sub(avail, rs));
             }
@@ -2917,6 +2926,17 @@ impl PaymentTransactor {
             };
             saved_outs_net.push(net_r);
             rem_out_net = strand_rem(want_target, &mut saved_outs_net);
+            // rippled's remainingOut lives NET (savedOuts in outReq units) and
+            // every iteration REGROSSES it through the last step's rev pass —
+            // mulRatio roundUp on the fresh remainder. A gross-subtraction pot
+            // is a different number whenever the per-fill grossings cancel a
+            // tail the fresh product keeps: #106644326 431CAAFC iter-5 net
+            // 1.442557458781219 × 1.001 = …240000|219, regross …240001, pot
+            // …240000 exactly — and the UNI/XRPS rev-sizing amplified that
+            // ulp ×19000 into the XRPS line. Derive the pot from the net twin.
+            if let Some(r) = want_rate {
+                rem_out = ox::mul_ratio(rem_out_net, r as u128, 1_000_000_000, true);
+            }
             if out_net {
                 delivered_direct = ox::signed_add(false, delivered_direct, false, sout).1;
             } else if want_rate.is_some() && pick < n_books {
