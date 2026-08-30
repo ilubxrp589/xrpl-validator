@@ -359,6 +359,22 @@ use crate::tx::offer as ox;
 /// significant digits in ONE direction (`Number::upward` / `downward`), as
 /// opposed to `st_multiply`'s half-even. XRP is integral, so it rounds to whole
 /// drops instead.
+/// Is the amendment with this 64-hex feature id active in THIS state? Read
+/// straight off the Amendments singleton, so every world — probe hydration,
+/// full-state replay, the live mirror — answers for its own era. The census
+/// taught the need: #105880685 (pre-fixAMMv1_3) demands the legacy withdraw
+/// fraction while #106629215 (post) demands the ceil; rippled's own code
+/// splits on rules().enabled(fixAMMv1_3).
+fn amendment_enabled(sandbox: &Sandbox, id_hex: &str) -> bool {
+    ox::json_at(sandbox, &keylet::amendments_key())
+        .and_then(|o| o.get("Amendments").cloned())
+        .and_then(|a| a.as_array().cloned())
+        .map(|a| a.iter().any(|v| v.as_str().is_some_and(|s| s.eq_ignore_ascii_case(id_hex))))
+        .unwrap_or(false)
+}
+
+const FIX_AMM_V1_3: &str = "7CA70A7674A26FA517412858659EBC7EDEEF7D2D608824464E6FDEFD06854E14";
+
 /// `num/den` ceiled at 16 significant digits — the equal-withdraw fraction's
 /// direction (finding 31/32): one exact division with any nonzero remainder
 /// rounding UP, so the 17→16 normalization can never eat the round.
@@ -1038,16 +1054,21 @@ fn payout_proportional_to(
         // #105796380 2437575D (tfWithdrawAll) is the specimen: the withdrawer's
         // Jocker line lands …890599 against mainnet's …890600, one ulp.
         // Findings 31+32 (#106629211 7ED17A0F, ONE tfWithdrawAll paying an
-        // ARMY/DROP two-IOU pool): the FRACTION rounds UP and both asset
-        // products round DOWN — the unique pair satisfying BOTH sides of the
-        // same withdrawal (DROP wanted …2140 where frac-nearest×down lands
-        // …2139; ARMY wanted …065 where frac-nearest×up lands …066). The
-        // dust calibrator #106014913 5788637E stays correct: a ceiled dust
-        // fraction times the pool still FLOORS to zero and the one-sided
-        // check fails with tecAMM_FAILED. The vendored source reads as plain
-        // divide + Downward products; the wire disagrees on the fraction —
-        // port the bytes, not the comment.
-        let frac = st_divide_up(tokens, total_lp);
+        // ARMY/DROP two-IOU pool): under fixAMMv1_3 the FRACTION rounds UP
+        // and both asset products round DOWN — the unique pair satisfying
+        // BOTH sides of the same withdrawal (DROP wanted …2140 where
+        // frac-nearest×down lands …2139; ARMY wanted …065 where up lands
+        // …066). The dust calibrator #106014913 5788637E stays correct: a
+        // ceiled dust fraction times the pool still FLOORS to zero and the
+        // one-sided check fails with tecAMM_FAILED. PRE-amendment the legacy
+        // nearest fraction stands — the census's #105880685 (one ULP HIGH
+        // under an unconditional ceil) is the pre-era calibrator. rippled
+        // splits on rules().enabled(fixAMMv1_3) (AMMHelpers getRoundedAsset).
+        let frac = if amendment_enabled(sandbox, FIX_AMM_V1_3) {
+            st_divide_up(tokens, total_lp)
+        } else {
+            ox::st_divide(tokens, total_lp, false)
+        };
         let share = mul_directed(pool, frac, false, leg.xrp);
         if std::env::var("DX_AMMWD").is_ok() {
             eprintln!(
