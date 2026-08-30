@@ -91,7 +91,24 @@ pub struct NativeShadow {
     /// is the only sequence it will apply. Anything else marks a gap.
     at_seq: u32,
     pub hydrated: bool,
+    /// Monotonic instant of the last hydration — the caller gates re-entry
+    /// (v3's death loop: hydrate → 2-min stall → lag → overlay gap →
+    /// re-hydrate). At most one hydration per cooldown window.
+    pub last_hydrate: Option<std::time::Instant>,
     log: Option<std::fs::File>,
+}
+
+impl NativeShadow {
+    /// May the caller hydrate now? Only near the live edge (a mid-catch-up
+    /// hydration guarantees the next overlay ledger gaps past the mirror)
+    /// and not more than once per 10 minutes.
+    pub fn can_hydrate(&self, lag: u32) -> bool {
+        lag <= 2
+            && self
+                .last_hydrate
+                .map(|t| t.elapsed() > std::time::Duration::from_secs(600))
+                .unwrap_or(true)
+    }
 }
 
 impl NativeShadow {
@@ -121,7 +138,7 @@ impl NativeShadow {
             close_time_resolution: 10,
             close_flags: 0,
         };
-        Some(Self { state: LedgerState::new_unverified(header), at_seq: 0, hydrated: false, log })
+        Some(Self { state: LedgerState::new_unverified(header), at_seq: 0, hydrated: false, last_hydrate: None, log })
     }
 
     /// Full-scan `state.rocks` into the in-RAM mirror, decoding every binary
@@ -129,6 +146,11 @@ impl NativeShadow {
     /// ws-sync's hold-position machinery absorbs the stall and catches up.
     /// `as_of` is the ledger the DB currently represents (last_synced).
     pub fn hydrate(&mut self, db: &rocksdb::DB, as_of: u32) {
+        // v3 died here: re-hydration INSERTED into the existing 19.8M-object
+        // map without clearing — two passes ~doubled RSS and the third met
+        // the OOM killer (silent SIGKILL, no panic line). Fresh map first;
+        // the old one drops and jemalloc reclaims.
+        self.state = LedgerState::new_unverified(self.state.header.clone());
         let t0 = std::time::Instant::now();
         let mut n = 0u64;
         let mut bad = 0u64;
@@ -157,6 +179,7 @@ impl NativeShadow {
         let ms = t0.elapsed().as_millis() as u64;
         self.at_seq = as_of;
         self.hydrated = true;
+        self.last_hydrate = Some(std::time::Instant::now());
         stats().hydrated.store(1, Ordering::Relaxed);
         stats().hydrate_objects.store(n, Ordering::Relaxed);
         stats().hydrate_decode_err.store(bad, Ordering::Relaxed);

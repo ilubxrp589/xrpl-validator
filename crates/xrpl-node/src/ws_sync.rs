@@ -534,7 +534,15 @@ pub async fn start_ws_sync(
                                         (native_shadow.as_mut(), ffi_overlay_opt.as_ref())
                                     {
                                         if !shadow.hydrated {
-                                            shadow.hydrate(&db, process_seq - 1);
+                                            // Only hydrate at the live edge and at most
+                                            // once per cooldown — a mid-catch-up
+                                            // hydration guarantees the next overlay
+                                            // ledger gaps past the mirror (v3's death
+                                            // loop; the OOM did the killing).
+                                            let lag_now = closed_seq.saturating_sub(process_seq);
+                                            if shadow.can_hydrate(lag_now) {
+                                                shadow.hydrate(&db, process_seq - 1);
+                                            }
                                         }
                                         shadow.on_ledger(
                                             process_seq,
