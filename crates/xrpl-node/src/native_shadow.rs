@@ -141,7 +141,8 @@ impl NativeShadow {
             let mut key = [0u8; 32];
             key.copy_from_slice(&k);
             match xrpl_core::codec::decode::decode_transaction_binary(&v) {
-                Ok(jv) => {
+                Ok(mut jv) => {
+                    crate::native_apply::hexify_addresses(&mut jv);
                     let _ = self
                         .state
                         .state_map
@@ -431,7 +432,8 @@ impl NativeShadow {
             }
             match ffi_val {
                 Some(fb) => match xrpl_core::codec::decode::decode_transaction_binary(fb) {
-                    Ok(jv) => {
+                    Ok(mut jv) => {
+                        crate::native_apply::hexify_addresses(&mut jv);
                         let _ = self
                             .state
                             .state_map

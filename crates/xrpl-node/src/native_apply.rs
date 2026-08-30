@@ -44,6 +44,27 @@ pub fn decode_address(addr: &str) -> Option<[u8; 20]> {
     Some(id)
 }
 
+/// Recursively rewrite any base58 classic-address string (`r…`) to 20-byte
+/// hex — the native engine's account-field convention. Defect B's whole
+/// story: the offline worlds (snapshot loader, probe hydration) always ran
+/// this pass, the live mirror didn't, and every hex-only field parser
+/// (check.rs parse_account_id and kin) read r-addresses as ABSENT —
+/// tecNO_PERMISSION storms on ledgers the replay proves byte-perfect.
+pub fn hexify_addresses(v: &mut Value) {
+    match v {
+        Value::String(s) => {
+            if s.starts_with('r') && s.len() >= 25 && s.len() <= 40 {
+                if let Some(id) = decode_address(s) {
+                    *v = json!(hex::encode(id));
+                }
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(hexify_addresses),
+        Value::Object(m) => m.values_mut().for_each(hexify_addresses),
+        _ => {}
+    }
+}
+
 pub fn build_txfields(txjson: &Value) -> Option<TxFields> {
     // Pseudo-transactions carry Account: "" and Fee: "0" — the zero account.
     let account = match txjson["Account"].as_str()? {

@@ -33,7 +33,8 @@ use xrpl_ledger::shamap::hash::{
 use xrpl_ledger::shamap::node::{nibble_at, ZERO_HASH};
 use xrpl_ledger::tx::dispatch::get_transactor;
 use xrpl_node::native_apply::{
-    build_txfields, canon_for_encode, decode_address, native_apply_one, update_skip_list,
+    build_txfields, canon_for_encode, decode_address, hexify_addresses, native_apply_one,
+    update_skip_list,
 };
 
 #[global_allocator]
@@ -43,24 +44,6 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 
 
-
-/// Recursively rewrite any base58 classic-address string (`r…`) to 20-byte
-/// hex — the native engine's account-field convention (same pass the probe
-/// applies to every hydrated object).
-fn hexify_addresses(v: &mut Value) {
-    match v {
-        Value::String(s) => {
-            if s.starts_with('r') && s.len() >= 25 && s.len() <= 40 {
-                if let Some(id) = decode_address(s) {
-                    *v = json!(hex::encode(id));
-                }
-            }
-        }
-        Value::Array(a) => a.iter_mut().for_each(hexify_addresses),
-        Value::Object(m) => m.values_mut().for_each(hexify_addresses),
-        _ => {}
-    }
-}
 
 fn leaf_hash(key: &Hash256, blob: &[u8]) -> Hash256 {
     let mut buf = Vec::with_capacity(blob.len() + 32);
