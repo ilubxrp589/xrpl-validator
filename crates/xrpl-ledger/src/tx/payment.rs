@@ -1884,6 +1884,17 @@ impl Transactor for PaymentTransactor {
                 None => return TxResult::Malformed,
             };
             dest["Balance"] = serde_json::Value::String(new_dest_balance.to_string());
+            // Finding 35 (#106644275 F67C91C7-era, dst rMWEptMt): an XRP
+            // delivery RE-ARMS the destination's free key reset —
+            // "Re-arm the password change fee if we can and need to",
+            // Payment.cpp:674-676: clearFlag(lsfPasswordSpent) on the DST.
+            // SetRegularKey_test.cpp:98-100 pins it: a fee-0 regkey sets the
+            // flag, a later inbound payment clears it.
+            const LSF_PASSWORD_SPENT: u64 = 0x0001_0000;
+            let dflags = dest["Flags"].as_u64().unwrap_or(0);
+            if dflags & LSF_PASSWORD_SPENT != 0 {
+                dest["Flags"] = serde_json::json!(dflags & !LSF_PASSWORD_SPENT);
+            }
             sandbox.write(dest_key, serde_json::to_vec(&dest).expect("serializing valid JSON Value"));
         } else {
             // Destination doesn't exist — create new AccountRoot
