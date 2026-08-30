@@ -329,6 +329,35 @@ fn amm_ctx(
     Some((key, acct, crate::tx::offer::Leg { xrp: false, cur: lpt, issuer: acct }))
 }
 
+/// Reduce a mantissa to 16 significant digits rounding HALF-EVEN on the full
+/// shed remainder — Number's plain addition semantics (finding 36: the LP
+/// sum's shed .6 rounds up where truncation and the old exact-string path
+/// both landed one ULP low).
+fn round16_nearest(m: crate::tx::offer::Me) -> crate::tx::offer::Me {
+    let mut t = m.0;
+    let mut k = 0u32;
+    while t >= 10_000_000_000_000_000 {
+        t /= 10;
+        k += 1;
+    }
+    if k == 0 {
+        return m;
+    }
+    let d = 10u128.pow(k);
+    let (q, r) = (m.0 / d, m.0 % d);
+    let mut q = match (r * 2).cmp(&d) {
+        std::cmp::Ordering::Greater => q + 1,
+        std::cmp::Ordering::Less => q,
+        std::cmp::Ordering::Equal => q + (q & 1),
+    };
+    let mut e = m.1 + k as i32;
+    if q >= 10_000_000_000_000_000 {
+        q /= 10;
+        e += 1;
+    }
+    (q, e)
+}
+
 /// Adjust the AMM object's LPTokenBalance value (magnitude only — parity
 /// compares keys; the oracle corrects the number downstream).
 fn bump_lp_balance(
@@ -346,6 +375,13 @@ fn bump_lp_balance(
         .and_then(|s| keylet::amount_mant_exp(&serde_json::Value::String(s.to_string())))
         .unwrap_or((0, 0));
     let (neg, mag) = ox::signed_add(false, cur, !add, delta);
+    // Finding 36 (#106644320 749D3E45, tfTwoAsset deposit): the minted LP
+    // amount was already byte-exact (receipts: minted 251769204.3826585 ==
+    // truth to all 16 digits) — the divergence is THE ADD: the exact sum
+    // 279228264.81815046 must 16-digit-round NEAREST (truth keeps …1505;
+    // both the old exact-string path and a downward round give …1504).
+    // Number's plain addition semantics — half-even on the shed remainder.
+    let mag = if add { round16_nearest(mag) } else { mag };
     let sign = if neg && mag.0 > 0 { "-" } else { "" };
     obj["LPTokenBalance"]["value"] =
         serde_json::Value::String(format!("{}{}", sign, ox::me_to_value_string(mag)));
@@ -865,8 +901,40 @@ impl Transactor for AMMDepositTransactor {
             .or_else(|| sized.map(|(_, _, t)| t).filter(|t| t.0 > 0))
             .or_else(|| single_adj.map(|(_, t)| t))
             .unwrap_or((1_000_000_000_000_000, -8));
+        // Finding 36 (#106644320 749D3E45): a deposit into an EMPTY pool
+        // (every LP previously withdrew) revives it — rippled runs
+        // initializeFeeAuctionVote so the reviving depositor takes the
+        // auction slot and the vote, with the fee from the deposit's own
+        // TradingFee field (AMMDeposit.cpp:475-478).
+        let was_empty = ox::json_at(sandbox, &amm_key)
+            .and_then(|o| {
+                o["LPTokenBalance"]["value"]
+                    .as_str()
+                    .map(|s| keylet::amount_mant_exp(&serde_json::Value::String(s.to_string())))
+            })
+            .flatten()
+            .map(|m| m.0 == 0)
+            .unwrap_or(false);
+        if std::env::var("DX_AMMDEP").is_ok() {
+            let cur = ox::json_at(sandbox, &amm_key)
+                .and_then(|o| o["LPTokenBalance"]["value"].as_str().map(str::to_string));
+            eprintln!("DX_AMMDEP minted={minted:?} lp_pre={cur:?} sized={sized:?} single_adj={single_adj:?}");
+        }
         ox::move_leg(sandbox, &amm_acct, &tx.account, &lp_leg, minted);
         bump_lp_balance(sandbox, &amm_key, minted, true);
+        if std::env::var("DX_AMMDEP").is_ok() {
+            let post = ox::json_at(sandbox, &amm_key)
+                .and_then(|o| o["LPTokenBalance"]["value"].as_str().map(str::to_string));
+            eprintln!("DX_AMMDEP lp_post={post:?}");
+        }
+        if was_empty {
+            let tfee = tx
+                .fields
+                .get("TradingFee")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u16;
+            initialize_fee_auction_vote(sandbox, &amm_key, &tx.account, tfee, &lp_leg);
+        }
         TxResult::Success
     }
 }
@@ -983,6 +1051,58 @@ fn delete_amm(
     sandbox.delete(*amm_key);
     crate::ledger::directory::owner_dir_remove(sandbox, amm_acct, amm_key, amm_hint, false);
     sandbox.delete(keylet::account_root_key(amm_acct));
+}
+
+/// rippled `initializeFeeAuctionVote` (AMMHelpers.cpp:791-845), run when a
+/// deposit REVIVES an empty pool (AMMDeposit.cpp:475-478) and on AMMCreate:
+/// the depositor takes the auction slot for free — Expiration = parent close
+/// + 24h, Price = zero LP tokens, stale AuthAccounts dropped
+/// (fixCleanup3_2_0) — the vote slots reset to the depositor alone at full
+/// weight, and the pool TradingFee becomes the caller-supplied fee (omitted
+/// when zero, like every SoeDefault).
+fn initialize_fee_auction_vote(
+    sandbox: &mut Sandbox,
+    amm_key: &xrpl_core::types::Hash256,
+    account: &[u8; 20],
+    tfee: u16,
+    lp_leg: &crate::tx::offer::Leg,
+) {
+    use crate::tx::offer as ox;
+    let Some(mut amm) = ox::json_at(sandbox, amm_key) else { return };
+    let acct_hex = hex::encode(account);
+    let mut ve = serde_json::json!({
+        "Account": acct_hex,
+        "VoteWeight": 100_000u64,
+    });
+    if tfee != 0 {
+        ve["TradingFee"] = serde_json::json!(tfee);
+    }
+    amm["VoteSlots"] = serde_json::json!([{ "VoteEntry": ve }]);
+    if tfee == 0 {
+        if let Some(o) = amm.as_object_mut() {
+            o.remove("TradingFee");
+        }
+    } else {
+        amm["TradingFee"] = serde_json::json!(tfee);
+    }
+    let exp = sandbox.base().header.close_time as u64 + 86_400;
+    let mut slot = serde_json::json!({
+        "Account": hex::encode(account),
+        "Expiration": exp,
+        "Price": {
+            "currency": hex::encode_upper(lp_leg.cur),
+            "issuer": hex::encode(lp_leg.issuer),
+            "value": "0",
+        },
+    });
+    let dfee = tfee / 10;
+    if dfee != 0 {
+        slot["DiscountedFee"] = serde_json::json!(dfee);
+    }
+    // Whole-object replacement drops any stale AuthAccounts, matching the
+    // fixCleanup3_2_0 makeFieldAbsent.
+    amm["AuctionSlot"] = slot;
+    ox::put_json(sandbox, *amm_key, &amm);
 }
 
 /// Pay out BOTH pool assets in proportion to `tokens / total_lp`.
