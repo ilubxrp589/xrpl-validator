@@ -365,6 +365,7 @@ use crate::tx::offer as ox;
 /// taught the need: #105880685 (pre-fixAMMv1_3) demands the legacy withdraw
 /// fraction while #106629215 (post) demands the ceil; rippled's own code
 /// splits on rules().enabled(fixAMMv1_3).
+#[allow(dead_code)] // first amendment-reading helper; gates will want it
 fn amendment_enabled(sandbox: &Sandbox, id_hex: &str) -> bool {
     ox::json_at(sandbox, &keylet::amendments_key())
         .and_then(|o| o.get("Amendments").cloned())
@@ -373,6 +374,7 @@ fn amendment_enabled(sandbox: &Sandbox, id_hex: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[allow(dead_code)]
 const FIX_AMM_V1_3: &str = "7CA70A7674A26FA517412858659EBC7EDEEF7D2D608824464E6FDEFD06854E14";
 
 /// `num/den` ceiled at 16 significant digits — the equal-withdraw fraction's
@@ -999,8 +1001,9 @@ fn payout_proportional(
     amm_acct: &[u8; 20],
     tokens: (u128, i32),
     total_lp: (u128, i32),
+    withdraw_all: bool,
 ) -> bool {
-    payout_proportional_to(sandbox, tx, amm_acct, &tx.account, tokens, total_lp).is_some()
+    payout_proportional_to(sandbox, tx, amm_acct, &tx.account, tokens, total_lp, withdraw_all).is_some()
 }
 
 /// Same proportional two-asset payout, but to an arbitrary beneficiary
@@ -1013,6 +1016,7 @@ fn payout_proportional_to(
     who: &[u8; 20],
     tokens: (u128, i32),
     total_lp: (u128, i32),
+    withdraw_all: bool,
 ) -> Option<Vec<(crate::tx::offer::Leg, (u128, i32))>> {
     use crate::tx::offer as ox;
     let asset_leg = |v: &serde_json::Value| -> Option<ox::Leg> {
@@ -1064,7 +1068,14 @@ fn payout_proportional_to(
         // nearest fraction stands — the census's #105880685 (one ULP HIGH
         // under an unconditional ceil) is the pre-era calibrator. rippled
         // splits on rules().enabled(fixAMMv1_3) (AMMHelpers getRoundedAsset).
-        let frac = if amendment_enabled(sandbox, FIX_AMM_V1_3) {
+        // The discriminator is the withdraw MODE, not the amendment era
+        // (fixAMMv1_3 predates both calibrators — the amendment lead was
+        // false): tfWithdrawAll ceils the fraction (#106629211 7ED17A0F,
+        // both pool sides pinning it uniquely), tfLPToken partials keep the
+        // legacy nearest fraction (#105880685 F2CCA2BD, one ULP HIGH under
+        // an unconditional ceil; #105796380 likewise). Matches rippled's
+        // WithdrawAll::Yes/No split through adjustLPTokensIn + withdraw.
+        let frac = if withdraw_all {
             st_divide_up(tokens, total_lp)
         } else {
             ox::st_divide(tokens, total_lp, false)
@@ -1206,7 +1217,7 @@ impl Transactor for AMMWithdrawTransactor {
                 }
             } else {
                 // Both assets out, proportional to the redeemed LPToken share.
-                if !payout_proportional(sandbox, tx, &amm_acct, lp_bal, total_lp) {
+                if !payout_proportional(sandbox, tx, &amm_acct, lp_bal, total_lp, true) {
                     sandbox.restore_snapshot(snap);
                     return TxResult::AmmFailed;
                 }
@@ -1254,7 +1265,7 @@ impl Transactor for AMMWithdrawTransactor {
                     .and_then(|o| o["LPTokenBalance"]["value"].as_str().map(str::to_string))
                     .and_then(|s| keylet::amount_mant_exp(&serde_json::Value::String(s)))
                 {
-                    if !payout_proportional(sandbox, tx, &amm_acct, tokens, total_lp) {
+                    if !payout_proportional(sandbox, tx, &amm_acct, tokens, total_lp, false) {
                         sandbox.restore_snapshot(snap);
                         return TxResult::AmmFailed;
                     }
@@ -2663,7 +2674,9 @@ impl Transactor for AMMClawbackTransactor {
         };
 
         let Some(shares) =
-            payout_proportional_to(sandbox, tx, &amm_acct, &holder, tokens, total_lp)
+            // Clawback: partial semantics until a specimen calibrates the
+            // claw-all arm (rippled threads WithdrawAll there too).
+            payout_proportional_to(sandbox, tx, &amm_acct, &holder, tokens, total_lp, false)
         else {
             sandbox.restore_snapshot(snap);
             return TxResult::AmmFailed;
