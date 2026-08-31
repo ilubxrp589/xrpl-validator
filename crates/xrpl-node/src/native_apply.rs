@@ -167,6 +167,13 @@ pub fn canon_for_encode(v: &mut Value) {
         "IndexNext", "IndexPrevious", "XChainClaimID", "XChainAccountCreateCount",
         "XChainAccountClaimCount", "ReferenceCount", "NFTokenOfferNode", "IssuerNode",
         "AssetPrice",
+        // 2026-08-31 census vs definitions.json: the remaining u64 SFields a
+        // ledger entry can carry (hex-string forms pass through unchanged, so
+        // these are identity for decoded objects and normalization for any
+        // future number-form engine write). Hook/Emit families (Xahau, never
+        // in mainnet state) deliberately absent.
+        "ExchangeRate", "SubjectNode", "LoanBrokerNode", "VaultNode",
+        "BaseFee", "Cookie", "ServerVersion",
     ];
     const U64_DEC: &[&str] = &["MaximumAmount", "OutstandingAmount", "MPTAmount", "LockedAmount"];
     const ACCTS: &[&str] = &[
@@ -174,6 +181,12 @@ pub fn canon_for_encode(v: &mut Value) {
         "Unauthorize", "NFTokenMinter", "Holder", "OtherChainSource",
         "AttestationSignerAccount", "AttestationRewardAccount", "LockingChainDoor",
         "IssuingChainDoor", "issuer",
+        // 2026-08-31: every remaining AccountID-typed SField (definitions.json
+        // census). "Subject" alone was 386 of 19.8M hydrate-audit failures —
+        // every Credential in the mirror was unencodable, its 40-hex Subject
+        // fed to the base58 address parser (InvalidBase58/InvalidAddress).
+        "Subject", "Delegate", "Counterparty", "Borrower",
+        "OtherChainDestination", "EmitCallback", "HookAccount",
     ];
     match v {
         Value::Array(a) => {
@@ -215,6 +228,39 @@ pub fn canon_for_encode(v: &mut Value) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod canon_tests {
+    use super::*;
+
+    /// decode → hexify → canon → encode must reproduce the canonical bytes —
+    /// the exact chain the shadow mirror lives on (hydrate, reconcile,
+    /// compare). Vectors are real mainnet entries captured 2026-08-31.
+    fn roundtrip_exact(hex_str: &str) {
+        let bytes = hex::decode(hex_str.trim()).expect("vector hex");
+        let mut jv = xrpl_core::codec::decode::decode_transaction_binary(&bytes).expect("decodes");
+        hexify_addresses(&mut jv);
+        canon_for_encode(&mut jv);
+        let out = xrpl_core::codec::encode::encode_transaction_json(&jv, false).expect("encodes");
+        assert_eq!(hex::encode_upper(&out), hex::encode_upper(&bytes), "roundtrip differs");
+    }
+
+    /// The 386-of-19.8M hydrate-audit class: Credential entries were
+    /// unencodable because "Subject" was missing from canon's ACCTS table
+    /// (40-hex fed to the base58 address parser).
+    #[test]
+    fn credential_entries_roundtrip() {
+        roundtrip_exact(include_str!("../tests/vectors/credential_plain.hex"));
+        roundtrip_exact(include_str!("../tests/vectors/credential_uri_expiration.hex"));
+    }
+
+    /// A one-offer BookDirectory root (the 2026-08-31 RECONCILE-LEAK key
+    /// class) — always round-tripped offline; pinned here so it stays true.
+    #[test]
+    fn book_directory_root_roundtrips() {
+        roundtrip_exact(include_str!("../tests/vectors/book_directory_root.hex"));
     }
 }
 
