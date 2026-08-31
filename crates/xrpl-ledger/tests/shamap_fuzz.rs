@@ -93,6 +93,67 @@ fn clustered_ops_match_oracle() {
     }
 }
 
+/// Ordered prefix enumeration vs the oracle, under the same churn — the book
+/// walk's actual read primitive. The 2026-08-31 depth-64 insert fix made
+/// depth-64 leaf pairs exist in live trees for the first time; lookup-only
+/// fuzzing cannot see an enumeration defect (the replay world never churns
+/// via undo/reconcile, and the probe world enumerates from RPC instead).
+#[test]
+fn prefix_scan_matches_oracle_under_churn() {
+    let mut rng = Rng(0x74E2_46E5_7A64_18FC);
+    for trial in 0..24u32 {
+        let mut map = SHAMap::new(TreeType::State);
+        let mut oracle: std::collections::HashMap<[u8; 32], Vec<u8>> = std::collections::HashMap::new();
+        let bases: Vec<[u8; 32]> = (0..3u8)
+            .map(|b| {
+                let mut k = [0u8; 32];
+                k[..24].copy_from_slice(&[b.wrapping_mul(41).wrapping_add(trial as u8); 24]);
+                k
+            })
+            .collect();
+        for op in 0..8_000u32 {
+            let r = rng.next();
+            let mut key = bases[(r as usize >> 8) % bases.len()];
+            key[30] = ((r >> 16) & 0x0F) as u8;
+            key[31] = ((r >> 24) & 0x3F) as u8;
+            let kh = Hash256(key);
+            match r % 3 {
+                0 | 1 => {
+                    map.insert(kh, format!("t{trial}-o{op}").into_bytes()).unwrap();
+                    oracle.insert(key, Vec::new());
+                }
+                _ => {
+                    let _ = map.delete(&kh).unwrap();
+                    oracle.remove(&key);
+                }
+            }
+            if op % 97 == 0 {
+                for base in &bases {
+                    for plen in [24usize, 26, 30, 31, 32] {
+                        let prefix = &base[..plen];
+                        // The 32-byte prefix only matches when key[30..] is 0,
+                        // fine — the oracle agrees.
+                        let mut want: Vec<[u8; 32]> = oracle
+                            .keys()
+                            .filter(|k| &k[..plen] == prefix)
+                            .copied()
+                            .collect();
+                        want.sort();
+                        let got: Vec<[u8; 32]> = map.keys_with_prefix(prefix).iter().map(|h| h.0).collect();
+                        assert_eq!(
+                            got, want,
+                            "trial {trial} op {op}: keys_with_prefix({plen}B) diverges from oracle \
+                             (got {} keys, want {})",
+                            got.len(),
+                            want.len()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The minimal reproducer of the depth-64 freeze (2026-08-31): two keys
 /// differing only in their LAST nibble legally place both leaves at depth
 /// 64. The old top-of-insert `depth >= 64` guard let the pair be BUILT but
