@@ -48,6 +48,8 @@ pub struct ShadowStats {
     pub hydrate_decode_err: AtomicU64,
     pub hydrate_ms: AtomicU64,
     pub hydrate_skipped_lowmem: AtomicU64,
+    pub key_noop_missing: AtomicU64,
+    pub key_noop_extra: AtomicU64,
     pub ledgers: AtomicU64,
     pub full_match: AtomicU64,
     pub overlay_diverged: AtomicU64,
@@ -65,6 +67,56 @@ pub struct ShadowStats {
 pub fn stats() -> &'static ShadowStats {
     static S: OnceLock<ShadowStats> = OnceLock::new();
     S.get_or_init(ShadowStats::default)
+}
+
+/// Audit OUR pre-value of a byte-diffed key against the ledger metadata's
+/// PreviousFields: the first tx (apply order) to touch a key records the
+/// entry's state BEFORE the ledger — exactly what the mirror should have
+/// held going in. " STALE[..]" = the mirror's input was wrong (instrument);
+/// " PRE-OK" = the input was right and the divergence arose inside the
+/// apply (engine). Meta uses r-addresses inside amount objects where the
+/// mirror dialect is hex, so object-valued fields compare value+currency.
+fn pre_stale_audit(undo_pre: Option<&[u8]>, ordered: &[&Value], key_hex: &str) -> String {
+    let mine: Option<Value> = undo_pre.and_then(|b| serde_json::from_slice(b).ok());
+    for tx in ordered {
+        for n in tx["metaData"]["AffectedNodes"].as_array().into_iter().flatten() {
+            for node in n.as_object().into_iter().flat_map(|o| o.values()) {
+                if node["LedgerIndex"].as_str() != Some(key_hex) {
+                    continue;
+                }
+                let Some(pf) = node["PreviousFields"].as_object() else {
+                    return " PRE-UNKNOWN(no-prev)".into();
+                };
+                let mut stale = Vec::new();
+                for (f, want) in pf {
+                    if f == "PreviousTxnID" || f == "PreviousTxnLgrSeq" {
+                        continue;
+                    }
+                    let have = mine.as_ref().and_then(|m| m.get(f));
+                    let eq = match (have, want) {
+                        (Some(h), w) if h.is_object() && w.is_object() => {
+                            h.get("value") == w.get("value") && h.get("currency") == w.get("currency")
+                        }
+                        (h, w) => h == Some(w),
+                    };
+                    if !eq {
+                        stale.push(format!(
+                            "{f} mirror={} meta={}",
+                            have.map(|v| v.to_string().chars().take(28).collect::<String>())
+                                .unwrap_or_else(|| "ABSENT".into()),
+                            want.to_string().chars().take(28).collect::<String>()
+                        ));
+                    }
+                }
+                return if stale.is_empty() {
+                    " PRE-OK".into()
+                } else {
+                    format!(" STALE[{}]", stale.join(" | "))
+                };
+            }
+        }
+    }
+    " PRE-UNKNOWN(no-meta)".into()
 }
 
 /// MemAvailable from /proc/meminfo, in GB — the kernel's honest "how much
@@ -219,6 +271,27 @@ impl NativeShadow {
         let t0 = std::time::Instant::now();
         let mut n = 0u64;
         let mut bad = 0u64;
+        // Trust the store's own stamp over the caller's belief: the writer
+        // stamps last-written-seq inside each ledger's atomic batch, and the
+        // sync loop is frozen while we scan, so the stamp IS the scan's
+        // as-of. A missing stamp (pre-stamp store) falls back to the caller.
+        let as_of = match db
+            .get(b"meta:last_seq")
+            .ok()
+            .flatten()
+            .and_then(|v| <[u8; 4]>::try_from(&v[..]).ok())
+            .map(u32::from_le_bytes)
+        {
+            Some(stamped) => {
+                if stamped != as_of {
+                    eprintln!(
+                        "[native-shadow] hydrate as_of: caller believed #{as_of}, store stamp says #{stamped} — trusting the stamp"
+                    );
+                }
+                stamped
+            }
+            None => as_of,
+        };
         let mut ro = rocksdb::ReadOptions::default();
         ro.fill_cache(false);
         let iter = db.iterator_opt(rocksdb::IteratorMode::Start, ro);
@@ -423,6 +496,8 @@ impl NativeShadow {
         // ---- Compare native overlay vs FFI overlay (singletons excluded) ----
         let mut missing: Vec<String> = Vec::new(); // FFI wrote, we didn't
         let mut extra: Vec<String> = Vec::new(); // we wrote, FFI didn't
+        let mut noop_missing = 0u64; // FFI wrote a value the mirror already held
+        let mut noop_extra = 0u64; // we wrote back exactly the pre-state
         let mut byte_diff: Vec<String> = Vec::new();
         let mut compared = 0u64;
         for (k, ffi_val) in ffi_overlay {
@@ -432,6 +507,26 @@ impl NativeShadow {
             }
             compared += 1;
             if !dirty.contains(&kh) {
+                // Value-aware judge: the FFI leg re-writes objects it merely
+                // READ (on-demand hydration), so its overlay carries keys no
+                // transaction changed. If the overlay bytes equal what the
+                // mirror already holds, that is bookkeeping, not divergence —
+                // count it and stay quiet. (2026-08-31 soak: 1-3 phantom
+                // AccountRoots per ledger, one proven absent from every tx's
+                // metadata in its ledger.)
+                let ours_bin = self
+                    .state
+                    .state_map
+                    .lookup(&kh)
+                    .and_then(|jb| serde_json::from_slice::<Value>(jb).ok())
+                    .and_then(|mut v| {
+                        canon_for_encode(&mut v);
+                        xrpl_core::codec::encode::encode_transaction_json(&v, false).ok()
+                    });
+                if ours_bin.as_deref() == ffi_val.as_deref() {
+                    noop_missing += 1;
+                    continue;
+                }
                 // Name the class: decode the FFI bytes for LedgerEntryType so
                 // the receipt histogram says WHAT we fail to touch.
                 let ty = ffi_val
@@ -456,7 +551,20 @@ impl NativeShadow {
                         Some(ob) if &ob == fb => {}
                         Some(ob) => {
                             let off = ob.iter().zip(fb.iter()).position(|(a, b)| a != b).unwrap_or(ob.len().min(fb.len()));
-                            byte_diff.push(format!("{}:@{off} ours-len {} ffi-len {}", hex::encode_upper(k), ob.len(), fb.len()));
+                            // The decisive discriminator (2026-08-31): audit
+                            // OUR pre-value (undo map) against the ledger
+                            // meta's PreviousFields BEFORE the reconcile
+                            // erases the evidence. STALE[..] = the input was
+                            // wrong (mirror problem); PRE-OK = the input was
+                            // right and the divergence arose inside the apply
+                            // (engine problem). Both specimens of finding-38
+                            // died unclassifiable for want of this line.
+                            let audit = pre_stale_audit(
+                                undo.get(&kh).and_then(|o| o.as_deref()),
+                                &ordered,
+                                &hex::encode_upper(k),
+                            );
+                            byte_diff.push(format!("{}:@{off} ours-len {} ffi-len {}{audit}", hex::encode_upper(k), ob.len(), fb.len()));
                         }
                         None => byte_diff.push(format!("{}:encode-err", hex::encode_upper(k))),
                     }
@@ -468,6 +576,14 @@ impl NativeShadow {
                 continue;
             }
             if !ffi_overlay.contains_key(&k.0) {
+                // Our no-op twin: we wrote back exactly what was there
+                // (rippled elides unchanged writes from its overlay).
+                let pre = undo.get(k).and_then(|o| o.as_deref());
+                let post = self.state.state_map.lookup(k).map(|b| &b[..]);
+                if pre == post {
+                    noop_extra += 1;
+                    continue;
+                }
                 extra.push(hex::encode_upper(k.0));
             }
         }
@@ -478,16 +594,20 @@ impl NativeShadow {
         st.key_missing.fetch_add(missing.len() as u64, Ordering::Relaxed);
         st.key_extra.fetch_add(extra.len() as u64, Ordering::Relaxed);
         st.byte_mismatch.fetch_add(byte_diff.len() as u64, Ordering::Relaxed);
+        st.key_noop_missing.fetch_add(noop_missing, Ordering::Relaxed);
+        st.key_noop_extra.fetch_add(noop_extra, Ordering::Relaxed);
         if clean {
             st.full_match.fetch_add(1, Ordering::Relaxed);
         } else {
             st.overlay_diverged.fetch_add(1, Ordering::Relaxed);
             eprintln!(
-                "[native-shadow] #{seq} DIVERGED: missing={} extra={} bytes={} (ter-mm={})",
+                "[native-shadow] #{seq} DIVERGED: missing={} extra={} bytes={} (ter-mm={}, noop {}+{})",
                 missing.len(),
                 extra.len(),
                 byte_diff.len(),
-                ter_mm.len()
+                ter_mm.len(),
+                noop_missing,
+                noop_extra
             );
             if let Some(f) = &mut self.log {
                 let _ = writeln!(
@@ -499,6 +619,8 @@ impl NativeShadow {
                         "extra": extra,
                         "byte_diff": byte_diff,
                         "ter_mismatch": ter_mm,
+                        "noop_missing": noop_missing,
+                        "noop_extra": noop_extra,
                     })
                 );
             }

@@ -1308,6 +1308,13 @@ async fn process_ledger(
     // Capture `keys.len()` here — `keys` itself is moved into the spawn_blocking
     // closure below and can't be borrowed afterwards.
     let n_keys = keys.len();
+    // Hydration consistency stamp: travels in the SAME atomic batch as the
+    // ledger's writes, so no snapshot can ever see state and stamp disagree.
+    // The shadow's hydrate() trusts this over the caller's belief — the
+    // #106666210 stale-birth (mirror Balance 75825203 vs meta 1200000) is the
+    // class this kills. Non-32-byte key: invisible to the hasher and to the
+    // hydrate scan by their len==32 filters.
+    batch.put(b"meta:last_seq", seq.to_le_bytes());
     if let Err(e) = db.write(batch) {
         eprintln!("[ws-sync] Ledger #{seq}: DB write failed: {e}");
         return false;
@@ -1371,6 +1378,9 @@ async fn process_ledger(
                         }
                     }
                     let undo_keys: Vec<Hash256> = undo_pairs.iter().map(|(k, _)| *k).collect();
+                    // The rollback returns the store to the pre-ledger state;
+                    // the stamp must travel back with it.
+                    undo_batch.put(b"meta:last_seq", (seq - 1).to_le_bytes());
                     if let Err(e) = db.write(undo_batch) {
                         eprintln!("[ws-sync] #{seq}: FATAL — undo batch write failed: {e}. State.rocks is now in an unknown state. Halting.");
                         std::process::exit(1);
