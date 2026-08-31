@@ -350,12 +350,19 @@ impl Transactor for EscrowCreateTransactor {
         sandbox.write(sender_key, serde_json::to_vec(&sender).expect("serializing valid JSON Value"));
 
         // --- Create the Escrow ledger entry ---
-        let escrow_key = keylet::escrow_key(&tx.account, tx.sequence);
+        // rippled keys the escrow AND stamps the object with getSeqValue()
+        // (Escrow.cpp:531+544) — the tx sequence, or the ticket sequence for
+        // a ticketed create. The object carried no Sequence at all until
+        // 2026-08-31 (live shadow #106674441: ours 114B vs canonical 119B,
+        // diff @8 = exactly the missing 0x24 UInt32).
+        let seq_value = if tx.uses_ticket() { tx.ticket_seq.unwrap_or(0) } else { tx.sequence };
+        let escrow_key = keylet::escrow_key(&tx.account, seq_value);
 
         let mut escrow = serde_json::json!({
             "LedgerEntryType": "Escrow",
             "Flags": 0,
             "Account": hex::encode(tx.account),
+            "Sequence": seq_value,
             "Destination": hex::encode(dest_id),
             "Amount": match &iou {
                 Some(_) => tx.fields["Amount"].clone(),
