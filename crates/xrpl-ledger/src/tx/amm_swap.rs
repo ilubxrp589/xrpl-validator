@@ -126,6 +126,29 @@ pub(crate) fn n_div(a: Me, b: Me, rnd: Rnd) -> Me {
     round16(q, a.1 - b.1 - 17, false, rnd)
 }
 
+/// STAmount::divide — the getRate recipe, which is what every ENCODED rate
+/// (BookDirectory qualities, `Quality::rate()`, the synthetic AMM offer's
+/// pricing rate) is built from: 17-digit integer quotient, +5, truncate to
+/// 16 — i.e. round-HALF-UP at the 16th digit. This is NOT Number division
+/// (`n_div`, remainder-discarding) and NOT a ceiling.
+///
+/// Finding 47 (#106674439 iter 12) is the arbitration: exact rate
+/// 1.0038726967802571916…e-7 — half-up gives …257 (rippled: mulRoundStrict
+/// of it lands in=24.36214613632559), a ceiling gives …258 (ours landed
+/// …61, +2e-14 on the sender's line). The earlier #106455151 calibration
+/// could not distinguish the two: half-up equals ceil whenever the dropped
+/// tail is at or above half, which it was there.
+pub(crate) fn n_div_rate(a: Me, b: Me) -> Me {
+    if a.0 == 0 || b.0 == 0 {
+        return (0, 0);
+    }
+    let a = n_norm(a);
+    let b = n_norm(b);
+    let num = a.0 * 100_000_000_000_000_000u128; // ×1e17 ≤ 1e33, fits u128
+    let q = num / b.0 + 5;
+    n_norm((q / 10, a.1 - b.1 - 16))
+}
+
 pub(crate) fn n_add(a: Me, b: Me, rnd: Rnd) -> Me {
     if a.0 == 0 {
         return n_norm(b);
@@ -1059,13 +1082,15 @@ pub(crate) fn consume_fib(
     // slices, the sender's line remainder the only visible key (rippled's
     // shim shows NO SWAPOUT for the partial: it never re-curves, it prices
     // the generated offer linearly).
-    // The ENCODED quality rounds the rate UP at 16 digits — against the
-    // taker — exactly as the E7399DA3 receipt showed for a dir-encoded rate
-    // ("the encoded rate is the CEIL of the raw ratio"). #106455151 iter 3
-    // arbitrated all three forms with exact arithmetic: nearest-rate ceiling
-    // gives …405, the raw ratio …407, and only the CEIL-16 rate's ceiling
-    // lands rippled's …409 (iter 4's ratio rounds identically either way).
-    let q_px = n_div(s_in, s_out, Rnd::Up);
+    // The ENCODED quality is getRate's half-up-at-16 division (see
+    // `n_div_rate`): #106674439 iter 12 (finding 47) splits half-up from the
+    // ceiling this line used to take — rippled's Quality::rate() there is
+    // …257 (half-up) where the ceil is …258, and only the half-up rate's
+    // strict ceiling lands rippled's in=24.36214613632559. The #106455151
+    // iter-3 calibration ("only the CEIL-16 rate's ceiling lands …409") was
+    // DEGENERATE between the two: its dropped tail sat at/above half, where
+    // half-up and ceil coincide.
+    let q_px = n_div_rate(s_in, s_out);
     if !sell && n_cmp(take_out, rem_pays) == Ordering::Greater {
         take_in = to_amount(ox::mul_round16_up(rem_pays, q_px), gets_leg.xrp, Rnd::Up);
         take_out = rem_pays;
@@ -1664,6 +1689,22 @@ pub(crate) fn consume(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// getRate's half-up division, pinned to finding 47's arbitration
+    /// (#106674439 iter 12): rate(25.46390555628346 / 253656720 drops) —
+    /// exact 1.0038726967802571916…e-7 — must land …257 (half-up), where a
+    /// ceiling lands …258 and costs the taker +2e-14 on the partial fill.
+    #[test]
+    fn n_div_rate_is_half_up_at_16() {
+        assert_eq!(n_div_rate((2546390555628346, -14), (253656720, 0)), (1003872696780257, -22));
+        // The old ceiling disagrees on exactly this class.
+        assert_eq!(n_div((2546390555628346, -14), (253656720, 0), Rnd::Up), (1003872696780258, -22));
+        // A tail at/above half rounds up in both worlds (the degenerate
+        // class every earlier calibration specimen happened to sit in).
+        assert_eq!(n_div_rate((15, 0), (8, 0)), (1875000000000000, -15));
+        assert_eq!(n_div_rate((1, 0), (3, 0)), (3333333333333333, -16));
+        assert_eq!(n_div_rate((2, 0), (3, 0)), (6666666666666667, -16));
+    }
 
     /// `ammLPTokens` = sqrt(a*b), rounded DOWNWARD, with XRP in DROPS.
     ///
