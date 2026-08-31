@@ -296,8 +296,22 @@ pub async fn start_ws_sync(
                     // budget is better spent advancing process_seq. The shadow
                     // check is diagnostic in Phase A, so skipping it during
                     // catchup loses observability but not correctness.
+                    // With a hydrated native mirror the budget flips: hydration
+                    // blocks ~123s and leaves ~31 ledgers of backlog, and every
+                    // FFI-skipped ledger in that backlog starves the mirror of
+                    // its overlay — position freezes, gap, drop, 600s cooldown,
+                    // re-hydrate, same backlog: the 3-compares-per-cycle
+                    // livelock (2026-08-31, the SECOND layer of it — removing
+                    // the shadow-side lag guard exposed this one). 200 rides
+                    // out any hydration wake with margin; a catch-up deeper
+                    // than that gaps the mirror and the drop/re-hydrate path
+                    // handles it as before.
                     #[cfg(feature = "ffi")]
-                    let skip_shadow_for_catchup = closed_seq.saturating_sub(process_seq) > 25;
+                    let ffi_catchup_budget: u32 =
+                        if native_shadow.as_ref().map_or(false, |s| s.hydrated) { 200 } else { 25 };
+                    #[cfg(feature = "ffi")]
+                    let skip_shadow_for_catchup =
+                        closed_seq.saturating_sub(process_seq) > ffi_catchup_budget;
                     #[cfg(feature = "ffi")]
                     if meta_ok && !skip_shadow_for_catchup {
                         if let Some(ref verifier) = ffi_verifier {
