@@ -823,26 +823,46 @@ impl Transactor for AMMDepositTransactor {
         };
         // A single-asset deposit pays what the ADJUSTED tokens are worth, not
         // what was asked for — so this must be derived BEFORE anything moves.
-        let single_adj: Option<(ox::Me, ox::Me)> = single_pre.and_then(|(pool_pre, amt)| {
-            let obj = ox::json_at(sandbox, &amm_key)?;
-            let lpt = keylet::amount_mant_exp(&serde_json::Value::String(
-                obj["LPTokenBalance"]["value"].as_str()?.to_string(),
-            ))?;
-            let tfee = obj["TradingFee"].as_u64().unwrap_or(0) as u16;
-            let xrp = tx.fields.get("Amount").and_then(ox::leg_of).map(|l| l.xrp)?;
-            let t0 = crate::tx::amm_swap::adjust_lp_tokens(
-                lpt,
-                crate::tx::amm_swap::lp_tokens_out(pool_pre, amt, lpt, tfee),
-                true,
-            );
-            if t0.0 == 0 {
-                return None;
-            }
-            let (tokens, deposited) = crate::tx::amm_swap::adjust_asset_in_by_tokens(
-                pool_pre, amt, lpt, t0, tfee, xrp,
-            );
-            (tokens.0 > 0 && deposited.0 > 0).then_some((deposited, tokens))
-        });
+        //
+        // Finding 39 (#106668165 3691EF47, 1-drop XRP into XRP/SPY): tokens
+        // that ADJUST TO ZERO are a refusal, not an absence. rippled's
+        // singleDeposit fails tecAMM_INVALID_TOKENS the moment
+        // adjustLPTokensOut rounds the dust away (AMMDeposit.cpp — fixAMMv1_3
+        // arm; adjustAssetInByTokens zero is the same verdict, and deposit()'s
+        // epilogue re-checks `lpTokensDepositActual <= 0`). Our old shape
+        // returned None here, and the mover's fallback then deposited the RAW
+        // stated amount with tesSUCCESS — the exact live shadow catch (3 extra
+        // keys, PRE-OK byte diff, ter flip). Err carries the refusal past the
+        // "not a single-asset deposit" meaning of None.
+        let single_adj: Option<Result<(ox::Me, ox::Me), ()>> =
+            single_pre.and_then(|(pool_pre, amt)| {
+                let obj = ox::json_at(sandbox, &amm_key)?;
+                let lpt = keylet::amount_mant_exp(&serde_json::Value::String(
+                    obj["LPTokenBalance"]["value"].as_str()?.to_string(),
+                ))?;
+                let tfee = obj["TradingFee"].as_u64().unwrap_or(0) as u16;
+                let xrp = tx.fields.get("Amount").and_then(ox::leg_of).map(|l| l.xrp)?;
+                let t0 = crate::tx::amm_swap::adjust_lp_tokens(
+                    lpt,
+                    crate::tx::amm_swap::lp_tokens_out(pool_pre, amt, lpt, tfee),
+                    true,
+                );
+                if t0.0 == 0 {
+                    return Some(Err(()));
+                }
+                let (tokens, deposited) = crate::tx::amm_swap::adjust_asset_in_by_tokens(
+                    pool_pre, amt, lpt, t0, tfee, xrp,
+                );
+                Some(if tokens.0 > 0 && deposited.0 > 0 {
+                    Ok((deposited, tokens))
+                } else {
+                    Err(())
+                })
+            });
+        if matches!(single_adj, Some(Err(()))) {
+            return TxResult::AmmInvalidTokens;
+        }
+        let single_adj: Option<(ox::Me, ox::Me)> = single_adj.and_then(|r| r.ok());
 
         // Move the deposited side(s) depositor → AMM account (XRP or IOU
         // lines — move_leg handles both).
