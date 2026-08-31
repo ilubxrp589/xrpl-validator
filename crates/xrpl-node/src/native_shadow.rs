@@ -48,6 +48,9 @@ pub struct ShadowStats {
     pub hydrate_decode_err: AtomicU64,
     pub hydrate_ms: AtomicU64,
     pub hydrate_skipped_lowmem: AtomicU64,
+    pub hydrate_reencode_bad: AtomicU64,
+    pub reconcile_leaks: AtomicU64,
+    pub leak_retry_fixed: AtomicU64,
     pub key_noop_missing: AtomicU64,
     pub key_noop_extra: AtomicU64,
     pub ledgers: AtomicU64,
@@ -76,6 +79,9 @@ pub fn stats() -> &'static ShadowStats {
 /// " PRE-OK" = the input was right and the divergence arose inside the
 /// apply (engine). Meta uses r-addresses inside amount objects where the
 /// mirror dialect is hex, so object-valued fields compare value+currency.
+/// Each verdict names the first-toucher tx (hash#index): a mid-ledger STALE
+/// on a key whose first toucher is EARLIER than the diverging tx is an
+/// intra-ledger cascade, not pre-ledger staleness (#106670827 read that way).
 fn pre_stale_audit(undo_pre: Option<&[u8]>, ordered: &[&Value], key_hex: &str) -> String {
     let mine: Option<Value> = undo_pre.and_then(|b| serde_json::from_slice(b).ok());
     for tx in ordered {
@@ -84,8 +90,13 @@ fn pre_stale_audit(undo_pre: Option<&[u8]>, ordered: &[&Value], key_hex: &str) -
                 if node["LedgerIndex"].as_str() != Some(key_hex) {
                     continue;
                 }
+                let toucher = format!(
+                    " tx={}#{}",
+                    tx["hash"].as_str().unwrap_or("?").chars().take(12).collect::<String>(),
+                    tx["metaData"]["TransactionIndex"].as_u64().unwrap_or(u64::MAX)
+                );
                 let Some(pf) = node["PreviousFields"].as_object() else {
-                    return " PRE-UNKNOWN(no-prev)".into();
+                    return format!(" PRE-UNKNOWN(no-prev){toucher}");
                 };
                 let mut stale = Vec::new();
                 for (f, want) in pf {
@@ -100,23 +111,31 @@ fn pre_stale_audit(undo_pre: Option<&[u8]>, ordered: &[&Value], key_hex: &str) -
                         (h, w) => h == Some(w),
                     };
                     if !eq {
-                        stale.push(format!(
-                            "{f} mirror={} meta={}",
-                            have.map(|v| v.to_string().chars().take(28).collect::<String>())
-                                .unwrap_or_else(|| "ABSENT".into()),
-                            want.to_string().chars().take(28).collect::<String>()
-                        ));
+                        stale.push(format!("{f} mirror={} meta={}", disp(have), disp(Some(want))));
                     }
                 }
                 return if stale.is_empty() {
-                    " PRE-OK".into()
+                    format!(" PRE-OK{toucher}")
                 } else {
-                    format!(" STALE[{}]", stale.join(" | "))
+                    format!(" STALE[{}]{toucher}", stale.join(" | "))
                 };
             }
         }
     }
     " PRE-UNKNOWN(no-meta)".into()
+}
+
+/// Compact value display for audit receipts: an object's `value` (amounts)
+/// beats its currency-first prefix — a 28-char whole-object truncation hid
+/// every number in the #106670827 receipt.
+fn disp(v: Option<&Value>) -> String {
+    match v {
+        None => "ABSENT".into(),
+        Some(x) => {
+            let s = x.get("value").map(|w| w.to_string()).unwrap_or_else(|| x.to_string());
+            s.chars().take(64).collect()
+        }
+    }
 }
 
 /// MemAvailable from /proc/meminfo, in GB — the kernel's honest "how much
@@ -274,6 +293,14 @@ impl NativeShadow {
         let t0 = std::time::Instant::now();
         let mut n = 0u64;
         let mut bad = 0u64;
+        // Integrity audit: the scan plants ~20M decoded objects into the
+        // mirror with nothing checking them — after the per-ledger reconcile
+        // verifier landed, this is the one unguarded corruption channel left.
+        // Re-encode each decoded object and demand the raw store bytes back;
+        // failures are counted and the first few named. Costs roughly half
+        // the scan time again; XRPL_SHADOW_HYDRATE_AUDIT=0 disables.
+        let audit = std::env::var("XRPL_SHADOW_HYDRATE_AUDIT").map(|v| v != "0").unwrap_or(true);
+        let mut bad_rt = 0u64;
         // Trust the store's own stamp over the caller's belief: the writer
         // stamps last-written-seq inside each ledger's atomic batch, and the
         // sync loop is frozen while we scan, so the stamp IS the scan's
@@ -308,6 +335,23 @@ impl NativeShadow {
             match xrpl_core::codec::decode::decode_transaction_binary(&v) {
                 Ok(mut jv) => {
                     crate::native_apply::hexify_addresses(&mut jv);
+                    if audit {
+                        let mut cv = jv.clone();
+                        crate::native_apply::canon_for_encode(&mut cv);
+                        let ok = xrpl_core::codec::encode::encode_transaction_json(&cv, false)
+                            .map(|rb| rb.as_slice() == &v[..])
+                            .unwrap_or(false);
+                        if !ok {
+                            bad_rt += 1;
+                            if bad_rt <= 5 {
+                                eprintln!(
+                                    "[native-shadow] hydrate REENCODE-BAD {} ({} bytes)",
+                                    hex::encode_upper(key),
+                                    v.len()
+                                );
+                            }
+                        }
+                    }
                     let _ = self
                         .state
                         .state_map
@@ -334,11 +378,21 @@ impl NativeShadow {
         stats().hydrated.store(1, Ordering::Relaxed);
         stats().hydrate_objects.store(n, Ordering::Relaxed);
         stats().hydrate_decode_err.store(bad, Ordering::Relaxed);
+        stats().hydrate_reencode_bad.store(bad_rt, Ordering::Relaxed);
         stats().hydrate_ms.store(ms, Ordering::Relaxed);
         eprintln!(
-            "[native-shadow] hydrated {n} objects from state.rocks in {}s ({bad} undecodable) — mirror at #{as_of}",
+            "[native-shadow] hydrated {n} objects from state.rocks in {}s ({bad} undecodable, {bad_rt} reencode-bad) — mirror at #{as_of}",
             ms / 1000
         );
+        if bad_rt > 0 {
+            if let Some(f) = &mut self.log {
+                let _ = writeln!(
+                    f,
+                    "{}",
+                    json!({ "hydrate_audit": { "as_of": as_of, "objects": n, "reencode_bad": bad_rt } })
+                );
+            }
+        }
     }
 
     /// Apply ledger `seq` natively and compare against the FFI overlay.
@@ -455,8 +509,8 @@ impl NativeShadow {
                             stale.push(format!(
                                 "{}:{ty}.{f} mirror={} meta={}",
                                 &li[..12.min(li.len())],
-                                have.map(|v| v.to_string().chars().take(28).collect::<String>()).unwrap_or_else(|| "ABSENT".into()),
-                                want.to_string().chars().take(28).collect::<String>()
+                                disp(have),
+                                disp(Some(want))
                             ));
                         }
                     }
@@ -678,7 +732,21 @@ impl NativeShadow {
         }
         // Post-reconcile verifier: every overlay key re-read from the mirror
         // and byte-checked. A failure here is the leak AT BIRTH — the stale
-        // audits above only see it ledgers later.
+        // audits above only see it ledgers later. Each failure dumps full
+        // forensics to the receipt log (canonical bytes, mirror JSON, the
+        // re-encode result — an encode ERROR is a named verdict, previously
+        // indistinguishable from a byte diff) and then re-asserts the
+        // canonical value: `retry_fixed` splits a transient write fault from
+        // a deterministic in-process encode fault, and the re-assert repairs
+        // the mirror whenever it can (2026-08-31: 5 leaks/day, all created-
+        // then-deleted book pages, byte-identical bytes EXACT in every
+        // offline process — only live forensics can name the mechanism).
+        let reencode = |raw: &[u8]| -> Result<Vec<u8>, String> {
+            let mut v: Value = serde_json::from_slice(raw).map_err(|e| format!("parse: {e}"))?;
+            canon_for_encode(&mut v);
+            xrpl_core::codec::encode::encode_transaction_json(&v, false)
+                .map_err(|e| format!("encode: {e:?}"))
+        };
         let mut leak = 0u32;
         for (k, ffi_val) in ffi_overlay {
             let kh = Hash256(*k);
@@ -686,40 +754,95 @@ impl NativeShadow {
                 continue;
             }
             let mine = self.state.state_map.lookup(&kh).map(|b| b.to_vec());
-            match (mine, ffi_val) {
-                (None, None) => {}
-                (Some(jb), Some(fb)) => {
-                    let ok = serde_json::from_slice::<Value>(&jb).ok().and_then(|mut v| {
-                        canon_for_encode(&mut v);
-                        xrpl_core::codec::encode::encode_transaction_json(&v, false).ok()
-                    });
-                    if ok.as_deref() != Some(fb.as_slice()) {
-                        leak += 1;
-                        if leak <= 3 {
-                            eprintln!(
-                                "[native-shadow] #{seq} RECONCILE-LEAK reencode {} (roundtrip differs)",
-                                hex::encode_upper(k)
-                            );
+            let (kind, jb_str, re_hex, err, off) = match (mine, ffi_val) {
+                (None, None) => continue,
+                (Some(jb), Some(fb)) => match reencode(&jb) {
+                    Ok(b) if &b == fb => continue,
+                    Ok(b) => {
+                        let off = b
+                            .iter()
+                            .zip(fb.iter())
+                            .position(|(a, c)| a != c)
+                            .unwrap_or(b.len().min(fb.len()));
+                        (
+                            "reencode",
+                            Some(String::from_utf8_lossy(&jb).into_owned()),
+                            Some(hex::encode_upper(&b)),
+                            None,
+                            Some(off),
+                        )
+                    }
+                    Err(e) => {
+                        ("reencode", Some(String::from_utf8_lossy(&jb).into_owned()), None, Some(e), None)
+                    }
+                },
+                (Some(jb), None) => {
+                    ("undead", Some(String::from_utf8_lossy(&jb).into_owned()), None, None, None)
+                }
+                (None, Some(_)) => ("vanished", None, None, None, None),
+            };
+            leak += 1;
+            st.reconcile_leaks.fetch_add(1, Ordering::Relaxed);
+            // Re-assert the canonical trajectory for this key, then re-audit.
+            let mut retry_fixed = false;
+            let mut jb_retry: Option<String> = None;
+            match ffi_val {
+                Some(fb) => {
+                    if let Ok(mut jv) = xrpl_core::codec::decode::decode_transaction_binary(fb) {
+                        crate::native_apply::hexify_addresses(&mut jv);
+                        let _ = self
+                            .state
+                            .state_map
+                            .insert(kh, serde_json::to_vec(&jv).unwrap_or_default());
+                    }
+                    if let Some(jb2) = self.state.state_map.lookup(&kh).map(|b| b.to_vec()) {
+                        retry_fixed = matches!(reencode(&jb2), Ok(b) if &b == fb);
+                        if !retry_fixed {
+                            jb_retry = Some(String::from_utf8_lossy(&jb2).into_owned());
                         }
                     }
                 }
-                (Some(_), None) => {
-                    leak += 1;
-                    if leak <= 3 {
-                        eprintln!(
-                            "[native-shadow] #{seq} RECONCILE-LEAK undead {} (should be deleted, still present)",
-                            hex::encode_upper(k)
-                        );
-                    }
+                None => {
+                    let _ = self.state.state_map.delete(&kh);
+                    retry_fixed = self.state.state_map.lookup(&kh).is_none();
                 }
-                (None, Some(_)) => {
-                    leak += 1;
-                    if leak <= 3 {
-                        eprintln!(
-                            "[native-shadow] #{seq} RECONCILE-LEAK vanished {} (should exist, absent)",
-                            hex::encode_upper(k)
-                        );
-                    }
+            }
+            if retry_fixed {
+                st.leak_retry_fixed.fetch_add(1, Ordering::Relaxed);
+            }
+            if leak <= 3 {
+                eprintln!(
+                    "[native-shadow] #{seq} RECONCILE-LEAK {kind} {} ({}; retry_fixed={retry_fixed})",
+                    hex::encode_upper(k),
+                    err.clone().unwrap_or_else(|| match off {
+                        Some(o) => format!("diff @{o}"),
+                        None => "state".into(),
+                    })
+                );
+            }
+            // Full forensics for the first few leaks per ledger; a systemic
+            // event (say, a whole bad hydration) still counts every leak but
+            // must not write hundreds of multi-KB dumps per ledger.
+            if leak <= 4 {
+                if let Some(f) = &mut self.log {
+                    let _ = writeln!(
+                        f,
+                        "{}",
+                        json!({
+                            "seq": seq,
+                            "leak": {
+                                "kind": kind,
+                                "key": hex::encode_upper(k),
+                                "fb": ffi_val.as_ref().map(hex::encode_upper),
+                                "jb": jb_str,
+                                "re": re_hex,
+                                "err": err,
+                                "off": off,
+                                "retry_fixed": retry_fixed,
+                                "jb_retry": jb_retry,
+                            }
+                        })
+                    );
                 }
             }
         }
