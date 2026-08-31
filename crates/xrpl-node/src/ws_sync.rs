@@ -544,23 +544,30 @@ pub async fn start_ws_sync(
                                                 shadow.hydrate(&db, process_seq - 1);
                                             }
                                         }
-                                        // Compare only at the live edge too: catch-up
-                                        // overlays are fast-path BATCHES, and judging a
-                                        // single-ledger native apply against one
-                                        // produced 2026-08-30's missing=119 phantom
-                                        // diverges. Skipping here leaves at_seq behind,
-                                        // and the gap check drops the mirror — correct
-                                        // and self-healing.
-                                        if lag_now <= 2 {
-                                            shadow.on_ledger(
-                                                process_seq,
-                                                &ledger_header.parent_hash,
-                                                ledger_header.parent_close_time,
-                                                ledger_header.total_drops,
-                                                &sorted_txs,
-                                                overlay,
-                                            );
-                                        }
+                                        // Compare EVERY ledger this loop processes —
+                                        // including gap-fill: this path builds a real
+                                        // single-ledger overlay per iteration, and the
+                                        // shadow follows it sequentially. v7's lag<=2
+                                        // guard here was the livelock (2026-08-31):
+                                        // hydration blocks ~123s, the backlog runs
+                                        // through this same loop, the guard skipped
+                                        // every backlog ledger, at_seq froze, and the
+                                        // first at-edge compare manufactured the very
+                                        // gap the guard meant to avoid — 3 compares
+                                        // per 600s cooldown cycle, forever. The
+                                        // catch-up diverges that motivated the guard
+                                        // were stale-birth mirrors (as_of race), which
+                                        // the meta:last_seq stamp now fixes at the
+                                        // root. The gap check stays as the backstop
+                                        // for true jumps (reconnects, resyncs).
+                                        shadow.on_ledger(
+                                            process_seq,
+                                            &ledger_header.parent_hash,
+                                            ledger_header.parent_close_time,
+                                            ledger_header.total_drops,
+                                            &sorted_txs,
+                                            overlay,
+                                        );
                                     }
                                 }
                                 // else: drop(task) is implicit; task continues running fire-and-forget

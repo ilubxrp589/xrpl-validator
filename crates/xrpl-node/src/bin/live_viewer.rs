@@ -1696,8 +1696,11 @@ async fn main() {
                             "keys_compared": s.keys_compared.load(Relaxed),
                             "key_missing": s.key_missing.load(Relaxed),
                             "key_extra": s.key_extra.load(Relaxed),
+                            "key_noop_missing": s.key_noop_missing.load(Relaxed),
+                            "key_noop_extra": s.key_noop_extra.load(Relaxed),
                             "byte_mismatch": s.byte_mismatch.load(Relaxed),
                             "skipped_gap": s.skipped_gap.load(Relaxed),
+                            "hydrate_skipped_lowmem": s.hydrate_skipped_lowmem.load(Relaxed),
                             "apply_ms_last": s.apply_ms_last.load(Relaxed),
                         });
                     }

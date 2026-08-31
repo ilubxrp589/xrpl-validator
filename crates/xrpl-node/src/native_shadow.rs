@@ -177,6 +177,9 @@ impl NativeShadow {
     fn drop_mirror(&mut self, why: &str) {
         self.state = LedgerState::new_unverified(self.state.header.clone());
         self.hydrated = false;
+        // Keep the dashboard honest: the stats twin of `hydrated` stayed 1
+        // through drops until 2026-08-31 (API said True over a dropped mirror).
+        stats().hydrated.store(0, Ordering::Relaxed);
         eprintln!("[native-shadow] mirror dropped ({why}) — memory returns as jemalloc purges");
     }
 
