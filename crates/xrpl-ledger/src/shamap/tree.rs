@@ -165,20 +165,33 @@ fn lookup_in<'a>(node: &'a SHAMapNode, key: &Hash256, depth: usize) -> Option<&'
 }
 
 /// In-place insert — modifies the tree without cloning.
+///
+/// Depth semantics: a 32-byte key has 64 nibbles, consumed by inners at
+/// depths 0..=63 — so a LEAF at depth 64 is legal and occurs exactly when
+/// two keys share their first 63 nibbles (adjacent book-page qualities do
+/// this constantly). The old top-of-function `depth >= 64` guard refused to
+/// even LOOK at such a leaf: building the depth-64 pair succeeded, but every
+/// LATER overwrite of either key errored — and every `let _ = insert(...)`
+/// caller silently lost the write while lookup/delete (unguarded) kept
+/// serving the stale leaf. That was the live shadow's 2026-08-31
+/// RECONCILE-LEAK / frozen-book-page class. The impossible cases stay
+/// guarded where they are actually impossible: an INNER at depth 64 cannot
+/// exist (a depth-63 split of distinct keys always diverges), and a
+/// leaf-split at depth 63 with equal nibbles would mean two distinct keys
+/// sharing all 64 nibbles.
 fn insert_into_mut(
     node: &mut SHAMapNode,
     key: Hash256,
     data: Vec<u8>,
     depth: usize,
 ) -> Result<bool, LedgerError> {
-    if depth >= 64 {
-        return Err(LedgerError::InvalidTreeType(
-            "SHAMap depth exceeded 64".to_string(),
-        ));
-    }
-
     match node {
         SHAMapNode::Inner(ref mut inner) => {
+            if depth >= 64 {
+                return Err(LedgerError::InvalidTreeType(
+                    "SHAMap inner node at depth 64 (structurally impossible)".to_string(),
+                ));
+            }
             let nibble = nibble_at(&key, depth);
 
             if inner.has_child(nibble) {
@@ -198,6 +211,11 @@ fn insert_into_mut(
                 Ok(false)
             } else {
                 // Collision — replace this leaf with an inner node containing both
+                if depth >= 64 {
+                    return Err(LedgerError::InvalidTreeType(
+                        "SHAMap: two distinct keys sharing all 64 nibbles".to_string(),
+                    ));
+                }
                 let existing_key = *existing.key();
                 let existing_nibble = nibble_at(&existing_key, depth);
                 let new_nibble = nibble_at(&key, depth);
@@ -305,14 +323,16 @@ fn insert_hash_only_mut(
     leaf_hash: Hash256,
     depth: usize,
 ) -> Result<bool, LedgerError> {
-    if depth >= 64 {
-        return Err(LedgerError::InvalidTreeType(
-            "SHAMap depth exceeded 64".to_string(),
-        ));
-    }
-
+    // Same depth semantics as insert_into_mut: a leaf at depth 64 is legal
+    // (63 shared nibbles), an inner there is impossible, and so is a
+    // leaf-split of distinct keys at depth 64.
     match node {
         SHAMapNode::Inner(ref mut inner) => {
+            if depth >= 64 {
+                return Err(LedgerError::InvalidTreeType(
+                    "SHAMap inner node at depth 64 (structurally impossible)".to_string(),
+                ));
+            }
             let nibble = nibble_at(&key, depth);
 
             if inner.has_child(nibble) {
@@ -328,6 +348,11 @@ fn insert_hash_only_mut(
                 *node = SHAMapNode::Leaf(LeafNode::new_hash_only(key, leaf_hash));
                 Ok(false)
             } else {
+                if depth >= 64 {
+                    return Err(LedgerError::InvalidTreeType(
+                        "SHAMap: two distinct keys sharing all 64 nibbles".to_string(),
+                    ));
+                }
                 let existing_key = *existing.key();
                 let existing_nibble = nibble_at(&existing_key, depth);
                 let new_nibble = nibble_at(&key, depth);
