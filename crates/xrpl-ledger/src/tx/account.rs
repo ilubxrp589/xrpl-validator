@@ -238,15 +238,10 @@ impl Transactor for AccountDeleteTransactor {
             page_key = keylet::dir_page_key(&dir_root, next);
         }
 
-        // All-deletable (or unreadable) directory at a nonzero count: rippled
-        // would delete those objects with the account (nonObligationDeleter);
-        // we do not model that deleter yet, so keep the old refusal rather
-        // than destroy objects wrongly. The obligation case above no longer
-        // reaches this.
-        let owner_count = acct["OwnerCount"].as_u64().unwrap_or(0);
-        if owner_count > 0 {
-            return TxResult::NoPermission;
-        }
+        // Finding 41 (#106669431 535CFFF6): the count-gate that stood in for
+        // the unmodeled deleter is gone — the walk above is the whole rule.
+        // An all-deletable directory falls through to do_apply's cascade,
+        // exactly rippled's shape (obligations already refused per entry).
 
         // Account sequence + 256 must be <= current ledger sequence
         let acct_seq = acct["Sequence"].as_u64().unwrap_or(0) as u32;
@@ -313,6 +308,97 @@ impl Transactor for AccountDeleteTransactor {
         dest["Balance"] =
             serde_json::Value::String(dest_balance.checked_add(balance).unwrap_or(u64::MAX).to_string());
         sandbox.write(dest_key, serde_json::to_vec(&dest).unwrap());
+
+        // Finding 41: the nonObligationDeleter cascade. preclaim proved every
+        // owned object deletable; delete each with its own machinery — plain
+        // offers leave their book (delete_maker_offer), NFT offers leave the
+        // token-side directory and THREAD their Destination (rippled's meta
+        // for the specimen shows the Destination's root as a ModifiedNode
+        // with EMPTY PreviousFields — a threading-only touch), the simple
+        // types just leave the owner directory. Deletable-in-preclaim types
+        // we have no modeled deleter for (DID/Oracle/Credential/Delegate)
+        // keep the conservative refusal until a specimen arrives.
+        {
+            let dir_root = keylet::owner_dir_key(&tx.account);
+            let mut cascade: Vec<(xrpl_core::types::Hash256, serde_json::Value)> = Vec::new();
+            let mut page_key = dir_root;
+            for _ in 0..1000 {
+                let Some(page) = sandbox
+                    .read(&page_key)
+                    .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+                else { break };
+                for idx in page.get("Indexes").and_then(|v| v.as_array()).into_iter().flatten() {
+                    let Some(k) = idx.as_str().and_then(|s| {
+                        hex::decode(s).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                    }) else { continue };
+                    let kh = xrpl_core::types::Hash256(k);
+                    if let Some(obj) = sandbox
+                        .read(&kh)
+                        .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+                    {
+                        cascade.push((kh, obj));
+                    }
+                }
+                let next = page
+                    .get("IndexNext")
+                    .and_then(|v| {
+                        v.as_u64().or_else(|| v.as_str().and_then(|s| u64::from_str_radix(s, 16).ok()))
+                    })
+                    .unwrap_or(0);
+                if next == 0 {
+                    break;
+                }
+                page_key = keylet::dir_page_key(&dir_root, next);
+            }
+            let hint_of = |o: &serde_json::Value, f: &str| -> Option<u64> {
+                o.get(f).and_then(|v| {
+                    v.as_u64().or_else(|| v.as_str().and_then(|s| u64::from_str_radix(s, 16).ok()))
+                })
+            };
+            for (kh, obj) in &cascade {
+                match obj.get("LedgerEntryType").and_then(|t| t.as_str()) {
+                    Some("Offer") => {
+                        crate::tx::offer::delete_maker_offer(sandbox, kh, obj, &tx.account);
+                    }
+                    Some("NFTokenOffer") => {
+                        crate::ledger::directory::owner_dir_remove(
+                            sandbox, &tx.account, kh, hint_of(obj, "OwnerNode"), true,
+                        );
+                        if let Some(nft_id) = obj.get("NFTokenID").and_then(|v| v.as_str()).and_then(|s| {
+                            hex::decode(s).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                        }) {
+                            let nid = xrpl_core::types::Hash256(nft_id);
+                            let tok_dir = if obj["Flags"].as_u64().unwrap_or(0) & 1 != 0 {
+                                keylet::nft_sell_offers_key(&nid)
+                            } else {
+                                keylet::nft_buy_offers_key(&nid)
+                            };
+                            crate::ledger::directory::dir_remove(
+                                sandbox, &tok_dir, kh, hint_of(obj, "NFTokenOfferNode"), false,
+                            );
+                        }
+                        sandbox.delete(*kh);
+                        if let Some(dh) = obj.get("Destination").and_then(|v| v.as_str()) {
+                            if let Ok(db) = hex::decode(dh) {
+                                if let Ok(did) = <[u8; 20]>::try_from(db.as_slice()) {
+                                    let dk = keylet::account_root_key(&did);
+                                    if let Some(dv) = sandbox.read(&dk) {
+                                        sandbox.write(dk, dv);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some("Ticket") | Some("DepositPreauth") | Some("SignerList") => {
+                        crate::ledger::directory::owner_dir_remove(
+                            sandbox, &tx.account, kh, hint_of(obj, "OwnerNode"), true,
+                        );
+                        sandbox.delete(*kh);
+                    }
+                    _ => return TxResult::NoPermission,
+                }
+            }
+        }
 
         // The owner DIRECTORY goes too. rippled walks it deleting each owned
         // object and then removes the directory ITSELF, before erasing the
