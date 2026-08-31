@@ -116,6 +116,18 @@ pub struct NativeShadow {
 }
 
 impl NativeShadow {
+    /// Free the mirror NOW. A stale 19.8M-object map is ~14GB of dead weight,
+    /// and keeping it while waiting to re-hydrate deadlocks the budget gate
+    /// against itself: the gate refuses to hydrate because the corpse of the
+    /// LAST mirror is still holding the RAM (2026-08-30: one orphaned mirror,
+    /// 108 refusals overnight, MemAvailable pinned at 11GB on a box whose
+    /// steady baseline affords 25+).
+    fn drop_mirror(&mut self, why: &str) {
+        self.state = LedgerState::new_unverified(self.state.header.clone());
+        self.hydrated = false;
+        eprintln!("[native-shadow] mirror dropped ({why}) — memory returns as jemalloc purges");
+    }
+
     /// May the caller hydrate now? Only near the live edge (a mid-catch-up
     /// hydration guarantees the next overlay ledger gaps past the mirror)
     /// and not more than once per 10 minutes.
@@ -179,6 +191,15 @@ impl NativeShadow {
         //      background_thread:true,dirty_decay_ms:1000 at launch — the
         //      20M dropped decode temporaries then return to the OS on a
         //      purger thread instead of lingering in the arenas.)
+        // v3 died here: re-hydration INSERTED into the existing 19.8M-object
+        // map without clearing — two passes ~doubled RSS and the third met
+        // the OOM killer (silent SIGKILL, no panic line). Fresh map FIRST —
+        // and BEFORE the budget gate below, or a stale mirror deadlocks the
+        // gate against itself (the corpse holds the very RAM the gate is
+        // waiting to see free). The gap/undecodable paths drop_mirror()
+        // eagerly, so this is usually a no-op; it stays for any re-hydrate
+        // path that didn't.
+        self.state = LedgerState::new_unverified(self.state.header.clone());
         let min_gb: u64 = std::env::var("XRPL_SHADOW_HYDRATE_MIN_GB")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -195,11 +216,6 @@ impl NativeShadow {
                 return;
             }
         }
-        // v3 died here: re-hydration INSERTED into the existing 19.8M-object
-        // map without clearing — two passes ~doubled RSS and the third met
-        // the OOM killer (silent SIGKILL, no panic line). Fresh map first;
-        // the old one drops and jemalloc reclaims.
-        self.state = LedgerState::new_unverified(self.state.header.clone());
         let t0 = std::time::Instant::now();
         let mut n = 0u64;
         let mut bad = 0u64;
@@ -268,10 +284,10 @@ impl NativeShadow {
         }
         if self.at_seq + 1 != seq {
             // Gap (batch skip-ahead, resync): the mirror no longer represents
-            // the parent. Mark unhydrated; the caller re-hydrates.
+            // the parent. Drop it NOW; the caller re-hydrates.
             st.skipped_gap.fetch_add(1, Ordering::Relaxed);
-            self.hydrated = false;
             eprintln!("[native-shadow] gap: mirror at #{}, asked for #{seq} — will re-hydrate", self.at_seq);
+            self.drop_mirror("gap");
             return;
         }
         let t0 = std::time::Instant::now();
@@ -526,7 +542,7 @@ impl NativeShadow {
                         // stale on this key: safer to drop the mirror than
                         // silently drift. Re-hydrate.
                         eprintln!("[native-shadow] #{seq}: undecodable canonical byte — re-hydrating");
-                        self.hydrated = false;
+                        self.drop_mirror("undecodable canonical byte");
                         return;
                     }
                 },
