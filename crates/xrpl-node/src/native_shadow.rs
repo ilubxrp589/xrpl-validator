@@ -51,6 +51,7 @@ pub struct ShadowStats {
     pub hydrate_reencode_bad: AtomicU64,
     pub reconcile_leaks: AtomicU64,
     pub leak_retry_fixed: AtomicU64,
+    pub map_op_err: AtomicU64,
     pub key_noop_missing: AtomicU64,
     pub key_noop_extra: AtomicU64,
     pub ledgers: AtomicU64,
@@ -70,6 +71,17 @@ pub struct ShadowStats {
 pub fn stats() -> &'static ShadowStats {
     static S: OnceLock<ShadowStats> = OnceLock::new();
     S.get_or_init(ShadowStats::default)
+}
+
+/// Count a mirror map-op failure instead of swallowing it. The 2026-08-31
+/// depth-64 freeze hid for hours behind `let _ = insert(...)` — silently
+/// dropped writes froze book pages while lookups kept serving stale values.
+/// With the tree fixed this counter must read 0 forever; any tick is a
+/// structural regression.
+fn note_map_op(r: Result<bool, xrpl_ledger::error::LedgerError>) {
+    if r.is_err() {
+        stats().map_op_err.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Audit OUR pre-value of a byte-diffed key against the ledger metadata's
@@ -352,10 +364,11 @@ impl NativeShadow {
                             }
                         }
                     }
-                    let _ = self
-                        .state
-                        .state_map
-                        .insert(Hash256(key), serde_json::to_vec(&jv).unwrap_or_default());
+                    note_map_op(
+                        self.state
+                            .state_map
+                            .insert(Hash256(key), serde_json::to_vec(&jv).unwrap_or_default()),
+                    );
                     n += 1;
                     if n % 2_000_000 == 0 {
                         eprintln!(
@@ -450,12 +463,12 @@ impl NativeShadow {
                 match xrpl_ledger::tx::pseudo::rotate_negative_unl(&bytes, seq) {
                     Some(Some(nb)) => {
                         undo.entry(nk).or_insert_with(|| Some(bytes.clone()));
-                        let _ = self.state.state_map.insert(nk, nb);
+                        note_map_op(self.state.state_map.insert(nk, nb));
                         dirty.insert(nk);
                     }
                     Some(None) => {
                         undo.entry(nk).or_insert_with(|| Some(bytes.clone()));
-                        let _ = self.state.state_map.delete(&nk);
+                        note_map_op(self.state.state_map.delete(&nk));
                         dirty.insert(nk);
                     }
                     None => {}
@@ -539,10 +552,10 @@ impl NativeShadow {
                 undo.entry(k).or_insert_with(|| self.state.state_map.lookup(&k).map(|b| b.to_vec()));
                 match ent {
                     SandboxEntry::Created(b) | SandboxEntry::Modified(b) => {
-                        let _ = self.state.state_map.insert(k, b);
+                        note_map_op(self.state.state_map.insert(k, b));
                     }
                     SandboxEntry::Deleted => {
-                        let _ = self.state.state_map.delete(&k);
+                        note_map_op(self.state.state_map.delete(&k));
                     }
                 }
                 dirty.insert(k);
@@ -695,10 +708,10 @@ impl NativeShadow {
             }
             match old {
                 Some(b) => {
-                    let _ = self.state.state_map.insert(k, b);
+                    note_map_op(self.state.state_map.insert(k, b));
                 }
                 None => {
-                    let _ = self.state.state_map.delete(&k);
+                    note_map_op(self.state.state_map.delete(&k));
                 }
             }
         }
@@ -711,10 +724,11 @@ impl NativeShadow {
                 Some(fb) => match xrpl_core::codec::decode::decode_transaction_binary(fb) {
                     Ok(mut jv) => {
                         crate::native_apply::hexify_addresses(&mut jv);
-                        let _ = self
-                            .state
-                            .state_map
-                            .insert(kh, serde_json::to_vec(&jv).unwrap_or_default());
+                        note_map_op(
+                            self.state
+                                .state_map
+                                .insert(kh, serde_json::to_vec(&jv).unwrap_or_default()),
+                        );
                     }
                     Err(_) => {
                         // A canonical byte we cannot decode leaves the mirror
@@ -726,7 +740,7 @@ impl NativeShadow {
                     }
                 },
                 None => {
-                    let _ = self.state.state_map.delete(&kh);
+                    note_map_op(self.state.state_map.delete(&kh));
                 }
             }
         }
@@ -790,10 +804,11 @@ impl NativeShadow {
                 Some(fb) => {
                     if let Ok(mut jv) = xrpl_core::codec::decode::decode_transaction_binary(fb) {
                         crate::native_apply::hexify_addresses(&mut jv);
-                        let _ = self
-                            .state
-                            .state_map
-                            .insert(kh, serde_json::to_vec(&jv).unwrap_or_default());
+                        note_map_op(
+                            self.state
+                                .state_map
+                                .insert(kh, serde_json::to_vec(&jv).unwrap_or_default()),
+                        );
                     }
                     if let Some(jb2) = self.state.state_map.lookup(&kh).map(|b| b.to_vec()) {
                         retry_fixed = matches!(reencode(&jb2), Ok(b) if &b == fb);
@@ -803,7 +818,7 @@ impl NativeShadow {
                     }
                 }
                 None => {
-                    let _ = self.state.state_map.delete(&kh);
+                    note_map_op(self.state.state_map.delete(&kh));
                     retry_fixed = self.state.state_map.lookup(&kh).is_none();
                 }
             }

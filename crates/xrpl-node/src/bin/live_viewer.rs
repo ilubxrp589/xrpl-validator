@@ -1704,6 +1704,7 @@ async fn main() {
                             "hydrate_reencode_bad": s.hydrate_reencode_bad.load(Relaxed),
                             "reconcile_leaks": s.reconcile_leaks.load(Relaxed),
                             "leak_retry_fixed": s.leak_retry_fixed.load(Relaxed),
+                            "map_op_err": s.map_op_err.load(Relaxed),
                             "apply_ms_last": s.apply_ms_last.load(Relaxed),
                         });
                     }
