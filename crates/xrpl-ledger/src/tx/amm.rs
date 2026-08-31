@@ -219,6 +219,14 @@ impl Transactor for AMMCreateTransactor {
         };
         let amm_hash = crate::ledger::keylet::amm_key(&c1, &i1, &c2, &i2);
 
+        // rippled orders the pool pair (std::minmax on Issue — currency,
+        // then issuer): the OBJECT's Asset/Asset2 carry the sorted pair just
+        // like the keylet input does, regardless of the tx's Amount/Amount2
+        // order. #106674486: ours were swapped with everything else already
+        // byte-equal.
+        let (asset1, asset2) =
+            if (&c1, &i1) <= (&c2, &i2) { (asset1, asset2) } else { (asset2, asset1) };
+
         // Bug 4: Check for duplicate AMM
         if sandbox.exists(&amm_hash) {
             return TxResult::NoPermission;
@@ -256,6 +264,19 @@ impl Transactor for AMMCreateTransactor {
             if let (Some(leg), Some(amt)) = (ox::leg_of(v), keylet::amount_mant_exp(v)) {
                 if amt.0 > 0 {
                     ox::move_leg(sandbox, &tx.account, &amm_acct, &leg, amt);
+                    // rippled AMMCreate sendAndTrustSet: every non-XRP asset
+                    // line of the pool is stamped lsfAMMNode (AMMCreate.cpp:
+                    // 288-300). The LP-token line is NOT stamped — the live
+                    // shadow's #106674486 gate showed both asset lines a bit
+                    // short (0x00010000 vs 0x01010000) and the LP line clean.
+                    if !leg.xrp {
+                        let lk = keylet::ripple_state_key(&amm_acct, &leg.issuer, &leg.cur);
+                        if let Some(mut line) = ox::json_at(sandbox, &lk) {
+                            let f = line["Flags"].as_u64().unwrap_or(0) | 0x0100_0000;
+                            line["Flags"] = serde_json::json!(f);
+                            ox::put_json(sandbox, lk, &line);
+                        }
+                    }
                 }
             }
         }
@@ -274,10 +295,17 @@ impl Transactor for AMMCreateTransactor {
             };
         ox::move_leg(sandbox, &amm_acct, &tx.account, &lp_leg, minted);
 
-        // Create AMM ledger entry
+        // Create AMM ledger entry. rippled dirLinks the AMM object into the
+        // AMM account's own owner directory (AMMCreate.cpp:263, no reserve /
+        // OwnerCount) and the object carries the resulting OwnerNode plus an
+        // explicit zero Flags — #106674486's gate counted exactly those 14
+        // missing bytes and the absent directory entry.
+        let amm_owner_node = crate::ledger::directory::owner_dir_insert(sandbox, &amm_acct, &amm_hash);
         let amm_obj = serde_json::json!({
             "LedgerEntryType": "AMM",
+            "Flags": 0,
             "Account": hex::encode(amm_acct),
+            "OwnerNode": format!("{amm_owner_node:x}"),
             "Asset": asset1,
             "Asset2": asset2,
             "LPTokenBalance": {
@@ -290,6 +318,15 @@ impl Transactor for AMMCreateTransactor {
             "VoteSlots": [],
         });
         sandbox.write(amm_hash, serde_json::to_vec(&amm_obj).unwrap());
+
+        // rippled AMMCreate.cpp:260 initializes the fee, auction slot and
+        // vote slots on the freshly created object; the placeholders above
+        // were all a created AMM ever got until 2026-08-31 (live shadow
+        // #106674486: ours 205B vs canonical 333B — the missing 128 bytes
+        // ARE the AuctionSlot + VoteEntry). The helper already carried the
+        // faithful port for the deposit-revival path.
+        let tfee = tx.fields.get("TradingFee").and_then(|f| f.as_u64()).unwrap_or(0) as u16;
+        initialize_fee_auction_vote(sandbox, &amm_hash, &tx.account, tfee, &lp_leg);
 
         TxResult::Success
     }
