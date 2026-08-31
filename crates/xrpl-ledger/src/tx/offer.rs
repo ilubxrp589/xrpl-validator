@@ -2057,6 +2057,13 @@ fn settle_fill(
     let consumed = me_cmp(give, gives0).is_ge() || me_is_zero(funded);
     if consumed {
         delete_maker_offer(sandbox, okey, offer, maker);
+    } else if me_is_zero(give) && me_is_zero(pay) {
+        // Finding 40 (#106668867 575275AC, live shadow PRE-UNKNOWN(no-meta)):
+        // a ZERO fill is an offer examined, not an offer moved — rewriting it
+        // with identical amounts changes nothing except the threading stamp,
+        // and rippled leaves walked-past offers untouched (canonical stamp on
+        // the specimen still reads ledger 95475679 from 2023). The delete arm
+        // above still handles the walk-past-unfunded case (funded == 0).
     } else {
         let mut off2 = offer.clone();
         off2["TakerGets"] = me_amount_json(&offer["TakerGets"], offer_residual(gives0, give));
@@ -4793,6 +4800,9 @@ pub(crate) fn cross_engine_to_net(
                     || me_is_zero(res_pays);
                 if consumed {
                     delete_maker_offer(sandbox, &okey, &offer, &maker);
+                } else if me_is_zero(give) && me_is_zero(pay) {
+                    // Finding 40, autobridge twin: zero fill = examined, not
+                    // moved — no rewrite, no phantom threading stamp.
                 } else {
                     let mut off2 = offer.clone();
                     off2["TakerGets"] = me_amount_json(&offer["TakerGets"], res_gets);
