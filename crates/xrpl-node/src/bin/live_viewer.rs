@@ -910,7 +910,7 @@ async fn main() {
     {
         let consensus_for_unl = consensus.clone();
         tokio::spawn(async move {
-            match xrpl_node::unl_fetch::fetch_default_unl().await {
+            match xrpl_node::unl_fetch::fetch_default_unl_verified().await {
                 Ok(entries) => {
                     let mut eng = consensus_for_unl.lock();
                     // TMProposeSet messages are signed with EPHEMERAL signing keys, not master keys.

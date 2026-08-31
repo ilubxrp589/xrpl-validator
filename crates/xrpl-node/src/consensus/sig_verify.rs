@@ -159,7 +159,7 @@ pub struct SplitValidation {
 }
 
 /// Walk one canonical field header. Returns (type_code, field_code, bytes_consumed).
-fn read_field_header(blob: &[u8], i: usize) -> Option<(u8, u8, usize)> {
+pub(crate) fn read_field_header(blob: &[u8], i: usize) -> Option<(u8, u8, usize)> {
     let b0 = *blob.get(i)?;
     let t = b0 >> 4;
     let f = b0 & 0x0F;
@@ -181,7 +181,7 @@ fn read_field_header(blob: &[u8], i: usize) -> Option<(u8, u8, usize)> {
 }
 
 /// Decode a VL length prefix. Returns (length, prefix_bytes).
-fn read_vl_length(blob: &[u8], i: usize) -> Option<(usize, usize)> {
+pub(crate) fn read_vl_length(blob: &[u8], i: usize) -> Option<(usize, usize)> {
     let b0 = *blob.get(i)? as usize;
     if b0 <= 192 {
         Some((b0, 1))
@@ -199,7 +199,7 @@ fn read_vl_length(blob: &[u8], i: usize) -> Option<(usize, usize)> {
 
 /// Value length for a field of `type_code` starting at `i` (after the header).
 /// Returns (value_len, len_prefix_bytes). None = type we can't skip (nested/unknown).
-fn field_value_len(blob: &[u8], i: usize, type_code: u8) -> Option<(usize, usize)> {
+pub(crate) fn field_value_len(blob: &[u8], i: usize, type_code: u8) -> Option<(usize, usize)> {
     match type_code {
         1 => Some((2, 0)),   // UInt16
         2 => Some((4, 0)),   // UInt32

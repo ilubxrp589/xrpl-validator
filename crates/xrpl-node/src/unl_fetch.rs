@@ -110,8 +110,8 @@ fn read_vl(data: &[u8], pos: usize) -> Option<(usize, usize)> {
     }
 }
 
-/// Fetch and parse a UNL from a URL.
-pub async fn fetch_unl(url: &str) -> Result<Vec<UnlEntry>, String> {
+/// Fetch a validator-list document (the outer JSON) from a URL.
+async fn fetch_vl_body(url: &str) -> Result<serde_json::Value, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
@@ -127,10 +127,13 @@ pub async fn fetch_unl(url: &str) -> Result<Vec<UnlEntry>, String> {
         return Err(format!("{url} returned {}", resp.status()));
     }
 
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("parse JSON: {e}"))?;
+    resp.json().await.map_err(|e| format!("parse JSON: {e}"))
+}
+
+/// Fetch and parse a UNL from a URL — UNVERIFIED (the original path; the
+/// signatures are not checked). Prefer [`fetch_default_unl_verified`].
+pub async fn fetch_unl(url: &str) -> Result<Vec<UnlEntry>, String> {
+    let body = fetch_vl_body(url).await?;
 
     // Extract blob field (base64)
     let blob_b64 = body
@@ -168,6 +171,91 @@ pub async fn fetch_unl(url: &str) -> Result<Vec<UnlEntry>, String> {
     }
 
     Ok(entries)
+}
+
+/// Last-good state for the sequence gate: `{publisher, sequence}`.
+fn read_last_good(path: &str) -> Option<(String, u64)> {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    Some((v.get("publisher")?.as_str()?.to_string(), v.get("sequence")?.as_u64()?))
+}
+
+fn write_last_good(path: &str, publisher: &str, sequence: u64) {
+    let v = serde_json::json!({
+        "publisher": publisher,
+        "sequence": sequence,
+        "written_unix": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    });
+    if let Err(e) = std::fs::write(path, v.to_string()) {
+        eprintln!("[unl] last-good persist failed ({path}): {e}");
+    }
+}
+
+/// va-06: fetch, VERIFY, and gate a UNL from the default sources.
+///
+/// Env:
+///   XRPL_UNL_PINNED_KEY — publisher master key pin (hex; recommended)
+///   XRPL_UNL_ENFORCE=1  — fail-closed: no unverified fallback
+///   XRPL_UNL_STATE      — last-good file (default /mnt/xrpl-data/unl-last-good.json)
+///
+/// Every source is tried verified first (publisher pin, manifest chain, blob
+/// signature, expiry, per-validator manifests, sequence monotonicity vs the
+/// persisted last-good). Observe mode (default) falls back to the unverified
+/// parse only after EVERY source fails verification, loudly; enforce mode
+/// fails closed instead — the caller keeps whatever UNL it already has.
+pub async fn fetch_default_unl_verified() -> Result<Vec<UnlEntry>, String> {
+    let pinned = std::env::var("XRPL_UNL_PINNED_KEY").ok();
+    let enforce = std::env::var("XRPL_UNL_ENFORCE").map(|v| v == "1").unwrap_or(false);
+    let state_path = std::env::var("XRPL_UNL_STATE")
+        .unwrap_or_else(|_| "/mnt/xrpl-data/unl-last-good.json".to_string());
+    let mut last_err = String::new();
+    for url in DEFAULT_UNL_SOURCES {
+        let body = match fetch_vl_body(url).await {
+            Ok(b) => b,
+            Err(e) => {
+                last_err = e;
+                continue;
+            }
+        };
+        match crate::unl_verify::verify_vl(&body, pinned.as_deref()) {
+            Ok(v) => {
+                let last = read_last_good(&state_path)
+                    .filter(|(p, _)| *p == v.publisher)
+                    .map(|(_, s)| s);
+                if !crate::unl_verify::sequence_acceptable(last, v.sequence) {
+                    last_err = format!(
+                        "{url}: sequence regression {} < last-good {}",
+                        v.sequence,
+                        last.unwrap_or(0)
+                    );
+                    eprintln!("[unl] VERIFY-REJECT {last_err}");
+                    continue;
+                }
+                write_last_good(&state_path, &v.publisher, v.sequence);
+                eprintln!(
+                    "[unl] VERIFIED {url}: publisher {}… seq {} validators {} (manifests rejected: {})",
+                    &v.publisher[..12.min(v.publisher.len())],
+                    v.sequence,
+                    v.entries.len(),
+                    v.manifests_rejected
+                );
+                return Ok(v.entries);
+            }
+            Err(e) => {
+                last_err = format!("{url}: {e}");
+                eprintln!("[unl] VERIFY-FAIL {last_err}");
+            }
+        }
+    }
+    if enforce {
+        return Err(format!("all UNL sources failed verification (fail-closed): {last_err}"));
+    }
+    eprintln!(
+        "[unl] ⚠ every source failed verification — observe mode falls back to the UNVERIFIED parse ({last_err})"
+    );
+    fetch_default_unl().await
 }
 
 /// Try multiple UNL sources, return the first successful one.

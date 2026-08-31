@@ -42,6 +42,7 @@ pub mod rpc;
 pub mod state_hash;
 pub mod succ_walk;
 pub mod unl_fetch;
+pub mod unl_verify;
 pub mod validation;
 pub mod ws_sync;
 
