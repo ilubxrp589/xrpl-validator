@@ -517,7 +517,20 @@ impl NativeShadow {
                             continue;
                         }
                         let have = mine.as_ref().and_then(|m| m.get(f));
-                        if have != Some(want) {
+                        // Object-valued fields (amounts) compare value+currency —
+                        // the mirror dialect spells issuers as hex where the meta
+                        // has r-addresses; strict equality branded every such
+                        // field STALE with byte-identical values on both sides
+                        // (2026-08-31 evening: 4 path ter-mms mislabeled
+                        // input-caused when they were engine disagreements).
+                        let eq = match (have, want) {
+                            (Some(h), w) if h.is_object() && w.is_object() => {
+                                h.get("value") == w.get("value")
+                                    && h.get("currency") == w.get("currency")
+                            }
+                            (h, w) => h == Some(w),
+                        };
+                        if !eq {
                             let ty = n["LedgerEntryType"].as_str().unwrap_or("?");
                             stale.push(format!(
                                 "{}:{ty}.{f} mirror={} meta={}",
