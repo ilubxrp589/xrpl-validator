@@ -195,7 +195,7 @@ def main():
             try:
                 r = rpc("book_offers", {
                     "taker_gets": tg, "taker_pays": tp,
-                    "ledger_index": seq - 1, "limit": 8,
+                    "ledger_index": seq - 1, "limit": 32,
                 })
                 for o in r.get("offers", []):
                     oidx = o.get("index", "").upper()

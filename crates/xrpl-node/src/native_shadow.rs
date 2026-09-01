@@ -660,7 +660,32 @@ impl NativeShadow {
                             );
                             byte_diff.push(format!("{}:@{off} ours-len {} ffi-len {}{audit}", hex::encode_upper(k), ob.len(), fb.len()));
                         }
-                        None => byte_diff.push(format!("{}:encode-err", hex::encode_upper(k))),
+                        None => {
+                            // Self-documenting: the error and OUR stored JSON,
+                            // captured before the reconcile erases them —
+                            // #106692562 B580FF73 died unexplained for want of
+                            // this (bundle replays could not starve the same
+                            // walk into the same write).
+                            let err = serde_json::from_slice::<Value>(&jb)
+                                .ok()
+                                .and_then(|mut v| {
+                                    canon_for_encode(&mut v);
+                                    xrpl_core::codec::encode::encode_transaction_json(&v, false)
+                                        .err()
+                                        .map(|e| format!("{e:?}"))
+                                })
+                                .unwrap_or_else(|| "jb-not-json".to_string());
+                            let js: String =
+                                String::from_utf8_lossy(&jb).chars().take(700).collect();
+                            eprintln!(
+                                "[native-shadow] ENCODE-ERR #{seq} {} {err} jb={js}",
+                                hex::encode_upper(k)
+                            );
+                            byte_diff.push(format!(
+                                "{}:encode-err {err}",
+                                hex::encode_upper(k)
+                            ));
+                        }
                     }
                 }
             }
