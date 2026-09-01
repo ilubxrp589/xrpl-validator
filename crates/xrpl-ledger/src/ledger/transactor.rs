@@ -151,6 +151,9 @@ pub enum TxResult {
     /// Clearing the RegularKey with the master key disabled and no signer
     /// list to fall back on (tecNO_ALTERNATIVE_KEY, SetRegularKey.cpp:83).
     NoAlternativeKey,
+    /// Turning on RequireAuth while the account already owns objects
+    /// (tecOWNERS, SetAccount.cpp preclaim: `!dirIsEmpty(ownerDir)`).
+    Owners,
 
     // tem — malformed, not applied at all
     /// Transaction is malformed.
@@ -234,6 +237,7 @@ impl TxResult {
             | TxResult::XChainClaimNoQuorum
             | TxResult::XChainNoSignersList
             | TxResult::NoAlternativeKey
+            | TxResult::Owners
             | TxResult::Unsupported => true,
             // tem/tef: not claimed
             _ => false,
@@ -296,6 +300,7 @@ impl TxResult {
             TxResult::XChainClaimNoQuorum => "tecXCHAIN_CLAIM_NO_QUORUM",
             TxResult::XChainNoSignersList => "tecXCHAIN_NO_SIGNERS_LIST",
             TxResult::NoAlternativeKey => "tecNO_ALTERNATIVE_KEY",
+            TxResult::Owners => "tecOWNERS",
             TxResult::Malformed => "temMALFORMED",
             TxResult::BadFee => "temBAD_FEE",
             TxResult::BadAmount => "temBAD_AMOUNT",

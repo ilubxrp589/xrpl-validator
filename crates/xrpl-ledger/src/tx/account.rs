@@ -123,6 +123,62 @@ impl Transactor for AccountSetTransactor {
         }
 
         // Apply optional fields
+        // The transaction-level tf* flags are the OLD spelling of the same
+        // switches and rippled honours both: `bSetRequireDest = (uTxFlags &
+        // tfRequireDestTag) || uSetFlag == asfRequireDest` and so on for
+        // RequireAuth and DisallowXRP, with tfOptionalDestTag / tfOptionalAuth
+        // / tfAllowXRP as the clears (SetAccount.cpp:326-336, applied
+        // :45-84). We only read SetFlag/ClearFlag. #106698282 95AFC9A9
+        // (finding 65): `SetFlag: 8, Flags: 0x100000` (tfDisallowXRP) on a
+        // fresh issuer lands Flags 0x880000 on mainnet — DefaultRipple AND
+        // DisallowXRP — and 0x800000 here.
+        {
+            const TF_REQUIRE_DEST_TAG: u64 = 0x0001_0000;
+            const TF_OPTIONAL_DEST_TAG: u64 = 0x0002_0000;
+            const TF_REQUIRE_AUTH: u64 = 0x0004_0000;
+            const TF_OPTIONAL_AUTH: u64 = 0x0008_0000;
+            const TF_DISALLOW_XRP: u64 = 0x0010_0000;
+            const TF_ALLOW_XRP: u64 = 0x0020_0000;
+            let tf = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+            let mut flags = acct["Flags"].as_u64().unwrap_or(0);
+            // RequireAuth can only be switched ON while the account owns
+            // nothing (tecOWNERS, SetAccount.cpp preclaim). `flags_in` is
+            // the pre-tx word — the SetFlag path above may already have
+            // set the bit, so judge on the transaction's intent.
+            let flags_in = serde_json::from_slice::<serde_json::Value>(&data)
+                .ok()
+                .and_then(|v| v["Flags"].as_u64())
+                .unwrap_or(0);
+            let wants_require_auth = tf & TF_REQUIRE_AUTH != 0
+                || tx.fields.get("SetFlag").and_then(|f| f.as_u64()) == Some(2);
+            if wants_require_auth && flags_in & 0x0004_0000 == 0 {
+                let dir_key = keylet::owner_dir_key(&tx.account);
+                let owns_something = sandbox
+                    .read(&dir_key)
+                    .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+                    .map(|root| {
+                        root.get("Indexes").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty())
+                            || root.get("IndexNext").and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|x| u64::from_str_radix(x, 16).ok()))).unwrap_or(0) != 0
+                    })
+                    .unwrap_or(false);
+                if owns_something {
+                    return TxResult::Owners;
+                }
+            }
+            for (set_bit, clear_bit, lsf) in [
+                (TF_REQUIRE_DEST_TAG, TF_OPTIONAL_DEST_TAG, 0x0002_0000u64),
+                (TF_REQUIRE_AUTH, TF_OPTIONAL_AUTH, 0x0004_0000u64),
+                (TF_DISALLOW_XRP, TF_ALLOW_XRP, 0x0008_0000u64),
+            ] {
+                if tf & set_bit != 0 {
+                    flags |= lsf;
+                }
+                if tf & clear_bit != 0 {
+                    flags &= !lsf;
+                }
+            }
+            acct["Flags"] = serde_json::Value::Number(flags.into());
+        }
         for field in ["Domain", "EmailHash", "MessageKey", "TransferRate", "TickSize"] {
             if let Some(val) = tx.fields.get(field) {
                 acct[field] = val.clone();
