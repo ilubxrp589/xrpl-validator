@@ -1867,6 +1867,11 @@ fn spawn_peer_connection(
     proposal_tx: broadcast::Sender<PeerProposal>,
 ) {
     tokio::spawn(async move {
+        // Back off a peer that keeps failing (503 slot-full, handshake
+        // timeouts, refused): 10 s doubling to 10 min, reset by a session
+        // that actually ran. Before this every peer task retried every 10 s
+        // forever — 1391 "Connecting" lines per 14 ledgers on 2026-09-01.
+        let mut consecutive_failures: u32 = 0;
         loop {
             let current = connected_count.load(std::sync::atomic::Ordering::Relaxed);
             if current >= max_peers {
@@ -1874,14 +1879,26 @@ fn spawn_peer_connection(
             }
             connected_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             active_peers.lock().insert(peer.clone());
-            eprintln!("[peer] Connecting to {peer}...");
+            if consecutive_failures == 0 {
+                eprintln!("[peer] Connecting to {peer}...");
+            }
             match run_peer_connection(&peer, &tx, &known_peers, &connected_count, max_peers, &seen_msgs, &active_peers, &outbound_rx, &manifest, &rocks_db, &proposal_tx).await {
-                Ok(()) => eprintln!("[peer] {peer} disconnected"),
-                Err(e) => eprintln!("[peer] {peer}: {e}"),
+                Ok(()) => {
+                    eprintln!("[peer] {peer} disconnected");
+                    consecutive_failures = 0;
+                }
+                Err(e) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    if consecutive_failures <= 2 || consecutive_failures.is_power_of_two() {
+                        eprintln!("[peer] {peer}: {e} (failure #{consecutive_failures})");
+                    }
+                }
             }
             active_peers.lock().remove(&peer);
             connected_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            // 10 s, 20, 40, 80, 160, 320, then 600 s (capped).
+            let backoff = Duration::from_secs(10u64 << consecutive_failures.min(6));
+            tokio::time::sleep(backoff.min(Duration::from_secs(600))).await;
         }
     });
 }

@@ -43,14 +43,27 @@ pub async fn outbound_handshake(
         .await
         .map_err(|e| NodeError::Connection(format!("TCP connect to {addr}: {e}")))?;
 
-    // OpenSSL TLS connect (required for SSL_get_finished compatibility)
-    let mut ssl_builder = SslConnector::builder(SslMethod::tls())
-        .map_err(|e| NodeError::Connection(format!("SSL builder: {e}")))?;
-
-    // Don't verify peer certs (self-signed network)
-    ssl_builder.set_verify(SslVerifyMode::NONE);
-
-    let ssl_connector = ssl_builder.build();
+    // OpenSSL TLS connect (required for SSL_get_finished compatibility).
+    // ONE connector for the process: `SslConnector::builder` loads the
+    // system certificate store (X509_STORE_set_default_paths — every PEM
+    // under /etc/ssl/certs decoded) each time it runs, and the outbound
+    // loop ran it for every attempt at 8-25 attempts/s against full or
+    // dead peers — 36% of live_viewer's CPU in libcrypto plus a stream of
+    // OpenSSL rwlock traffic (perf, 2026-09-01; memory
+    // project_validator_wssync_lag_2026_09_01). Peer certs are never
+    // verified (self-signed network), so the store is dead weight anyway.
+    static CONNECTOR: std::sync::OnceLock<SslConnector> = std::sync::OnceLock::new();
+    let ssl_connector = match CONNECTOR.get() {
+        Some(c) => c,
+        None => {
+            let mut ssl_builder = SslConnector::builder(SslMethod::tls())
+                .map_err(|e| NodeError::Connection(format!("SSL builder: {e}")))?;
+            // Don't verify peer certs (self-signed network)
+            ssl_builder.set_verify(SslVerifyMode::NONE);
+            let _ = CONNECTOR.set(ssl_builder.build());
+            CONNECTOR.get().expect("connector just set")
+        }
+    };
     let ssl = ssl_connector
         .configure()
         .map_err(|e| NodeError::Connection(format!("SSL configure: {e}")))?

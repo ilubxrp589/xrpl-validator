@@ -778,6 +778,15 @@ impl OwnedSnapshot {
     pub fn iterator(&self, mode: rocksdb::IteratorMode) -> rocksdb::DBIteratorWithThreadMode<'_, rocksdb::DB> {
         self.snapshot.iterator(mode)
     }
+    /// Full-scan iterator with read options (the shadow hydrate's
+    /// `fill_cache(false)` pass over the snapshot).
+    pub fn iterator_opt(
+        &self,
+        mode: rocksdb::IteratorMode,
+        readopts: rocksdb::ReadOptions,
+    ) -> rocksdb::DBIteratorWithThreadMode<'_, rocksdb::DB> {
+        self.snapshot.iterator_opt(mode, readopts)
+    }
 }
 
 /// Three-tier SLE provider: overlay (in-ledger mutations) → OwnedSnapshot
@@ -2248,14 +2257,21 @@ pub fn apply_ledger_in_order_with_net(
     // gap, the same failure mode that caused the 2026-05-15 incident.
     // 500 covers ~100% of misses in typical ledgers (~280 misses/ledger
     // observed) and bounds worst-case latency: a single `ledger_entry`
-    // RPC against local rippled is sub-millisecond, so 500 consults is
-    // well under the 3.5s ledger interval even in pathological cases.
-    // If ws-sync timing degrades, dial back via XRPL_STATE_ROCKS_CONSULT_BUDGET.
+    // The consult is a HOLE DETECTOR, not a data source: across 15k+ probes
+    // (doc above) and the 108k consults of 2026-09-01 every answer was
+    // entryNotFound (db_miss_should_exist stayed 0) — state.rocks is
+    // complete. It is also the one cost inside the serialized ws-sync loop
+    // that scales with .39's load: a 500-per-ledger budget was spent in
+    // full (~290 consults per ledger) at ~9 ms each — 2.6 s of a ~3.8 s
+    // ledger interval — which is why the backlog left by a hydrate never
+    // drained (memory: project_validator_wssync_lag_2026_09_01). Eight
+    // keeps the detector sampling; raise XRPL_STATE_ROCKS_CONSULT_BUDGET
+    // for a catch-up investigation where the store may have gaps.
     let ledger_rpc_budget = std::sync::atomic::AtomicU32::new(
         std::env::var("XRPL_STATE_ROCKS_CONSULT_BUDGET")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(500),
+            .unwrap_or(8),
     );
     for tx_bytes in txs_in_order {
         tx_num += 1;

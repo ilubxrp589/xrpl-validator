@@ -308,7 +308,7 @@ pub async fn start_ws_sync(
                     // handles it as before.
                     #[cfg(feature = "ffi")]
                     let ffi_catchup_budget: u32 =
-                        if native_shadow.as_ref().map_or(false, |s| s.hydrated) { 200 } else { 25 };
+                        if native_shadow.as_ref().map_or(false, |s| s.is_active()) { 200 } else { 25 };
                     #[cfg(feature = "ffi")]
                     let skip_shadow_for_catchup =
                         closed_seq.saturating_sub(process_seq) > ffi_catchup_budget;

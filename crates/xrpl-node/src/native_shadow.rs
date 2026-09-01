@@ -203,7 +203,41 @@ pub struct NativeShadow {
     /// re-hydrate). At most one hydration per cooldown window.
     pub last_hydrate: Option<std::time::Instant>,
     log: Option<std::fs::File>,
+    /// A hydration in flight on its own thread (WS-lag fix step 2,
+    /// 2026-09-01): the mirror is built from a RocksDB snapshot while the
+    /// sync loop keeps flowing; ledgers that arrive meanwhile queue in
+    /// `pending` and replay in order the moment the build lands. Before
+    /// this the scan ran ON the sync loop — 244 s of stall per launch,
+    /// ~65 ledgers of backlog the loop could never drain (memory
+    /// project_validator_wssync_lag_2026_09_01).
+    hydrating: Option<std::thread::JoinHandle<Option<HydrateOutcome>>>,
+    pending: Vec<PendingLedger>,
 }
+
+/// What the hydrate thread hands back.
+struct HydrateOutcome {
+    state: LedgerState,
+    at_seq: u32,
+    objects: u64,
+    undecodable: u64,
+    reencode_bad: u64,
+    ms: u64,
+}
+
+/// A ledger the sync loop processed while the mirror was still building.
+struct PendingLedger {
+    seq: u32,
+    parent_hash: [u8; 32],
+    parent_close_time: u32,
+    total_drops: u64,
+    txs: Vec<Value>,
+    overlay: LedgerOverlay,
+}
+
+/// Deeper than this and the wait is not a hydration any more — drop the
+/// attempt (the caller's cooldown re-arms it) rather than hold ~GBs of
+/// buffered ledgers.
+const PENDING_CAP: usize = 400;
 
 impl NativeShadow {
     /// Free the mirror NOW. A stale 19.8M-object map is ~14GB of dead weight,
@@ -215,6 +249,10 @@ impl NativeShadow {
     fn drop_mirror(&mut self, why: &str) {
         self.state = LedgerState::new_unverified(self.state.header.clone());
         self.hydrated = false;
+        // A build still running is detached: its result is discarded when
+        // it lands (the JoinHandle is gone), and the buffer with it.
+        self.hydrating = None;
+        self.pending.clear();
         // Keep the dashboard honest: the stats twin of `hydrated` stayed 1
         // through drops until 2026-08-31 (API said True over a dropped mirror).
         stats().hydrated.store(0, Ordering::Relaxed);
@@ -260,14 +298,25 @@ impl NativeShadow {
             close_time_resolution: 10,
             close_flags: 0,
         };
-        Some(Self { state: LedgerState::new_unverified(header), at_seq: 0, hydrated: false, last_hydrate: None, log })
+        Some(Self {
+            state: LedgerState::new_unverified(header),
+            at_seq: 0,
+            hydrated: false,
+            last_hydrate: None,
+            log,
+            hydrating: None,
+            pending: Vec::new(),
+        })
     }
 
     /// Full-scan `state.rocks` into the in-RAM mirror, decoding every binary
     /// SLE to the engine's JSON form. Blocks the sync loop once (~minutes);
     /// ws-sync's hold-position machinery absorbs the stall and catches up.
     /// `as_of` is the ledger the DB currently represents (last_synced).
-    pub fn hydrate(&mut self, db: &rocksdb::DB, as_of: u32) {
+    pub fn hydrate(&mut self, db: &std::sync::Arc<rocksdb::DB>, as_of: u32) {
+        if self.hydrating.is_some() {
+            return;
+        }
         // v5 memory diet. v4's single greedy pass spiked live_viewer to
         // 58.6GB on the 62GB box — swap filled and the machine thrashed
         // (the mirror itself fits fine; the SPIKE is the killer). Three
@@ -293,6 +342,8 @@ impl NativeShadow {
         // eagerly, so this is usually a no-op; it stays for any re-hydrate
         // path that didn't.
         self.state = LedgerState::new_unverified(self.state.header.clone());
+        self.hydrated = false;
+        self.pending.clear();
         let min_gb: u64 = std::env::var("XRPL_SHADOW_HYDRATE_MIN_GB")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -309,89 +360,70 @@ impl NativeShadow {
                 return;
             }
         }
-        let t0 = std::time::Instant::now();
-        let mut n = 0u64;
-        let mut bad = 0u64;
-        // Integrity audit: the scan plants ~20M decoded objects into the
-        // mirror with nothing checking them — after the per-ledger reconcile
-        // verifier landed, this is the one unguarded corruption channel left.
-        // Re-encode each decoded object and demand the raw store bytes back;
-        // failures are counted and the first few named. Costs roughly half
-        // the scan time again; XRPL_SHADOW_HYDRATE_AUDIT=0 disables.
         let audit = std::env::var("XRPL_SHADOW_HYDRATE_AUDIT").map(|v| v != "0").unwrap_or(true);
-        let mut bad_rt = 0u64;
-        // Trust the store's own stamp over the caller's belief: the writer
-        // stamps last-written-seq inside each ledger's atomic batch, and the
-        // sync loop is frozen while we scan, so the stamp IS the scan's
-        // as-of. A missing stamp (pre-stamp store) falls back to the caller.
-        let as_of = match db
-            .get(b"meta:last_seq")
-            .ok()
-            .flatten()
-            .and_then(|v| <[u8; 4]>::try_from(&v[..]).ok())
-            .map(u32::from_le_bytes)
+        let snap = crate::ffi_engine::OwnedSnapshot::new(db.clone());
+        let header = self.state.header.clone();
+        self.last_hydrate = Some(std::time::Instant::now());
+        eprintln!("[native-shadow] hydrating in the background from a snapshot at #{as_of} — the sync loop keeps flowing");
+        match std::thread::Builder::new()
+            .name("shadow-hydrate".into())
+            .spawn(move || build_mirror(snap, header, as_of, audit))
         {
-            Some(stamped) => {
-                if stamped != as_of {
-                    eprintln!(
-                        "[native-shadow] hydrate as_of: caller believed #{as_of}, store stamp says #{stamped} — trusting the stamp"
-                    );
-                }
-                stamped
+            Ok(h) => self.hydrating = Some(h),
+            Err(e) => eprintln!("[native-shadow] hydrate thread failed to spawn: {e}"),
+        }
+    }
+
+    /// Whether the shadow is live OR building: the sync loop's catch-up
+    /// budget must treat both as "keep every ledger's overlay" — a skipped
+    /// overlay during the build is a gap the moment the mirror lands.
+    pub fn is_active(&self) -> bool {
+        self.hydrated || self.hydrating.is_some()
+    }
+
+    /// Land a finished build: install the mirror and replay everything the
+    /// loop processed meanwhile, in order. Cheap when nothing is in flight.
+    fn poll_hydrate(&mut self) {
+        let finished = self.hydrating.as_ref().is_some_and(|h| h.is_finished());
+        if !finished {
+            return;
+        }
+        let Some(h) = self.hydrating.take() else { return };
+        match h.join() {
+            Ok(Some(out)) => self.install_hydrate(out),
+            Ok(None) => {
+                eprintln!("[native-shadow] hydrate build produced no mirror — will retry after the cooldown");
+                self.pending.clear();
             }
-            None => as_of,
-        };
-        let mut ro = rocksdb::ReadOptions::default();
-        ro.fill_cache(false);
-        let iter = db.iterator_opt(rocksdb::IteratorMode::Start, ro);
-        for item in iter {
-            let Ok((k, v)) = item else { continue };
-            if k.len() != 32 {
-                continue;
-            }
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&k);
-            match xrpl_core::codec::decode::decode_transaction_binary(&v) {
-                Ok(mut jv) => {
-                    crate::native_apply::hexify_addresses(&mut jv);
-                    if audit {
-                        let mut cv = jv.clone();
-                        crate::native_apply::canon_for_encode(&mut cv);
-                        let ok = xrpl_core::codec::encode::encode_transaction_json(&cv, false)
-                            .map(|rb| rb.as_slice() == &v[..])
-                            .unwrap_or(false);
-                        if !ok {
-                            bad_rt += 1;
-                            if bad_rt <= 5 {
-                                eprintln!(
-                                    "[native-shadow] hydrate REENCODE-BAD {} ({} bytes)",
-                                    hex::encode_upper(key),
-                                    v.len()
-                                );
-                            }
-                        }
-                    }
-                    note_map_op(
-                        self.state
-                            .state_map
-                            .insert(Hash256(key), serde_json::to_vec(&jv).unwrap_or_default()),
-                    );
-                    n += 1;
-                    if n % 2_000_000 == 0 {
-                        eprintln!(
-                            "[native-shadow] hydrating… {}M objects, RSS {:.1}GB, {}s",
-                            n / 1_000_000,
-                            rss_gb().unwrap_or(0.0),
-                            t0.elapsed().as_secs()
-                        );
-                    }
-                }
-                Err(_) => {
-                    bad += 1;
-                }
+            Err(_) => {
+                eprintln!("[native-shadow] hydrate thread PANICKED — mirror not installed; retry after the cooldown");
+                self.pending.clear();
             }
         }
-        let ms = t0.elapsed().as_millis() as u64;
+        if !self.hydrated {
+            return;
+        }
+        let mut queued = std::mem::take(&mut self.pending);
+        queued.sort_by_key(|p| p.seq);
+        let n = queued.len();
+        for p in queued {
+            if p.seq <= self.at_seq {
+                continue;
+            }
+            self.on_ledger(p.seq, &p.parent_hash, p.parent_close_time, p.total_drops, &p.txs, &p.overlay);
+            if !self.hydrated {
+                break; // a gap dropped the mirror mid-replay
+            }
+        }
+        if n > 0 {
+            eprintln!("[native-shadow] replayed {n} ledgers buffered during hydration — mirror at #{}", self.at_seq);
+        }
+    }
+
+    fn install_hydrate(&mut self, out: HydrateOutcome) {
+        let HydrateOutcome { state, at_seq, objects: n, undecodable: bad, reencode_bad: bad_rt, ms } = out;
+        let as_of = at_seq;
+        self.state = state;
         self.at_seq = as_of;
         self.hydrated = true;
         self.last_hydrate = Some(std::time::Instant::now());
@@ -415,6 +447,7 @@ impl NativeShadow {
         }
     }
 
+
     /// Apply ledger `seq` natively and compare against the FFI overlay.
     /// `txs` are the parsed `metaData`-bearing tx JSONs, `parent_hash_hex`
     /// the header's parent hash (skip-list input), `close_time` the header
@@ -429,7 +462,23 @@ impl NativeShadow {
         ffi_overlay: &LedgerOverlay,
     ) {
         let st = stats();
+        self.poll_hydrate();
         if !self.hydrated {
+            if self.hydrating.is_some() {
+                if self.pending.len() >= PENDING_CAP {
+                    eprintln!("[native-shadow] {PENDING_CAP} ledgers queued behind the hydrate — dropping the attempt");
+                    self.drop_mirror("hydrate backlog");
+                    return;
+                }
+                self.pending.push(PendingLedger {
+                    seq,
+                    parent_hash: *parent_hash,
+                    parent_close_time,
+                    total_drops,
+                    txs: txs.to_vec(),
+                    overlay: ffi_overlay.clone(),
+                });
+            }
             return;
         }
         if self.at_seq + 1 != seq {
@@ -915,4 +964,100 @@ impl NativeShadow {
         }
         self.at_seq = seq;
     }
+}
+
+/// The hydrate scan, on its own thread: every binary SLE in the snapshot
+/// decoded to the engine's JSON form (and, with the audit on, re-encoded
+/// and compared byte-for-byte). Returns None when the snapshot held no
+/// state to build from.
+fn build_mirror(
+    snap: crate::ffi_engine::OwnedSnapshot,
+    header: LedgerHeader,
+    as_of: u32,
+    audit: bool,
+) -> Option<HydrateOutcome> {
+    let t0 = std::time::Instant::now();
+    let mut state = LedgerState::new_unverified(header);
+    let mut n = 0u64;
+    let mut bad = 0u64;
+    // Integrity audit: the scan plants ~20M decoded objects into the
+    // mirror with nothing checking them — after the per-ledger reconcile
+    // verifier landed, this is the one unguarded corruption channel left.
+    // Re-encode each decoded object and demand the raw store bytes back;
+    // failures are counted and the first few named. Costs roughly half
+    // the scan time again; XRPL_SHADOW_HYDRATE_AUDIT=0 disables.
+    let mut bad_rt = 0u64;
+    // Trust the store's own stamp over the caller's belief: the writer
+    // stamps last-written-seq inside each ledger's atomic batch, and the
+    // sync loop is frozen while we scan, so the stamp IS the scan's
+    // as-of. A missing stamp (pre-stamp store) falls back to the caller.
+    let as_of = match snap.get(b"meta:last_seq")
+        .ok()
+        .flatten()
+        .and_then(|v| <[u8; 4]>::try_from(&v[..]).ok())
+        .map(u32::from_le_bytes)
+    {
+        Some(stamped) => {
+            if stamped != as_of {
+                eprintln!(
+                    "[native-shadow] hydrate as_of: caller believed #{as_of}, store stamp says #{stamped} — trusting the stamp"
+                );
+            }
+            stamped
+        }
+        None => as_of,
+    };
+    let mut ro = rocksdb::ReadOptions::default();
+    ro.fill_cache(false);
+    let iter = snap.iterator_opt(rocksdb::IteratorMode::Start, ro);
+    for item in iter {
+        let Ok((k, v)) = item else { continue };
+        if k.len() != 32 {
+            continue;
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&k);
+        match xrpl_core::codec::decode::decode_transaction_binary(&v) {
+            Ok(mut jv) => {
+                crate::native_apply::hexify_addresses(&mut jv);
+                if audit {
+                    let mut cv = jv.clone();
+                    crate::native_apply::canon_for_encode(&mut cv);
+                    let ok = xrpl_core::codec::encode::encode_transaction_json(&cv, false)
+                        .map(|rb| rb.as_slice() == &v[..])
+                        .unwrap_or(false);
+                    if !ok {
+                        bad_rt += 1;
+                        if bad_rt <= 5 {
+                            eprintln!(
+                                "[native-shadow] hydrate REENCODE-BAD {} ({} bytes)",
+                                hex::encode_upper(key),
+                                v.len()
+                            );
+                        }
+                    }
+                }
+                note_map_op(
+                    state.state_map.insert(Hash256(key), serde_json::to_vec(&jv).unwrap_or_default()),
+                );
+                n += 1;
+                if n % 2_000_000 == 0 {
+                    eprintln!(
+                        "[native-shadow] hydrating… {}M objects, RSS {:.1}GB, {}s",
+                        n / 1_000_000,
+                        rss_gb().unwrap_or(0.0),
+                        t0.elapsed().as_secs()
+                    );
+                }
+            }
+            Err(_) => {
+                bad += 1;
+            }
+        }
+    }
+    let ms = t0.elapsed().as_millis() as u64;
+    if n == 0 {
+        return None;
+    }
+    Some(HydrateOutcome { state, at_seq: as_of, objects: n, undecodable: bad, reencode_bad: bad_rt, ms })
 }
