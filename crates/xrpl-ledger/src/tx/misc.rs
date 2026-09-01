@@ -41,10 +41,12 @@ impl Transactor for SetRegularKeyTransactor {
         if tx.tx_type != "SetRegularKey" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
-            return TxResult::BadFee;
-        }
-        // RegularKey is optional — if absent, clears the key
+        // No fee floor: a master-signed SetRegularKey on an account whose
+        // lsfPasswordSpent is clear has a base fee of ZERO
+        // (SetRegularKey::calculateBaseFee, SetRegularKey.cpp:29-49), so
+        // Fee: "0" is valid for it. Any other fee-0 SetRegularKey is
+        // telINSUF_FEE_P at the gate and never reaches a validated ledger.
+        // RegularKey is optional — if absent, clears the key.
         TxResult::Success
     }
 
@@ -67,10 +69,31 @@ impl Transactor for SetRegularKeyTransactor {
             Err(_) => return TxResult::Malformed,
         };
 
+        const LSF_PASSWORD_SPENT: u64 = 0x0001_0000;
+        const LSF_DISABLE_MASTER: u64 = 0x0010_0000;
+        let flags = acct["Flags"].as_u64().unwrap_or(0);
+
+        // `if (!minimumFee(app, ctx_.baseFee, fees, flags)) setFlag(
+        // lsfPasswordSpent)` (SetRegularKey.cpp:71): the flag follows the
+        // CALCULATED base fee, not the fee paid — zero iff the tx is signed
+        // with the sender's master key and the flag is still clear.
+        // #106696325 5B7E148E (finding 60) paid 12 drops and mainnet set it
+        // all the same; we never set it (Flags 0 vs 65536, PRE-OK).
+        if flags & LSF_PASSWORD_SPENT == 0 && Self::master_signed(tx) {
+            acct["Flags"] = serde_json::Value::Number((flags | LSF_PASSWORD_SPENT).into());
+        }
+
         if let Some(regular_key) = tx.fields.get("RegularKey") {
             // Set the regular key
             acct["RegularKey"] = regular_key.clone();
         } else {
+            // Clearing the key with the master disabled needs a signer list
+            // to fall back on (SetRegularKey.cpp:81-83).
+            if flags & LSF_DISABLE_MASTER != 0
+                && !sandbox.exists(&keylet::signers_key(&tx.account))
+            {
+                return TxResult::NoAlternativeKey;
+            }
             // Clear the regular key
             if let Some(obj) = acct.as_object_mut() {
                 obj.remove("RegularKey");
@@ -79,6 +102,27 @@ impl Transactor for SetRegularKeyTransactor {
 
         sandbox.write(acct_key, serde_json::to_vec(&acct).unwrap());
         TxResult::Success
+    }
+}
+
+impl SetRegularKeyTransactor {
+    /// Whether the transaction is signed with the sender's MASTER key:
+    /// `calcAccountID(PublicKey(SigningPubKey)) == Account`
+    /// (SetRegularKey.cpp:34-36). A multi-signed tx carries an empty
+    /// SigningPubKey and a regular-key-signed one derives another account;
+    /// neither is the free, password-spending form.
+    fn master_signed(tx: &TxFields) -> bool {
+        let Some(spk) = tx.fields.get("SigningPubKey").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        let Ok(bytes) = hex::decode(spk) else {
+            return false;
+        };
+        // publicKeyType(): 33 bytes, secp256k1 (0x02/0x03) or ed25519 (0xED).
+        if bytes.len() != 33 || !matches!(bytes[0], 0x02 | 0x03 | 0xED) {
+            return false;
+        }
+        xrpl_core::crypto::signing::public_key_to_account_id(&bytes) == tx.account
     }
 }
 
@@ -575,6 +619,92 @@ mod tests {
         let data = sandbox.read(&acct_key).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&data).unwrap();
         assert_eq!(v["RegularKey"].as_str().unwrap(), hex::encode([0xFFu8; 20]));
+    }
+
+    /// A master-signed SetRegularKey on a fresh account is the free form:
+    /// its base fee is zero, so `!minimumFee(...)` SPENDS the password
+    /// (lsfPasswordSpent) whatever fee the sender actually paid
+    /// (SetRegularKey.cpp:71; #106696325 5B7E148E paid 12 drops, finding 60).
+    #[test]
+    fn master_signed_regular_key_spends_the_password_whatever_fee_is_paid() {
+        let master_pk = [0x02u8; 33];
+        let alice = xrpl_core::crypto::signing::public_key_to_account_id(&master_pk);
+        let state = make_state(&[(alice, 50_000_000)]);
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: alice,
+            tx_type: "SetRegularKey".to_string(),
+            fee: 12,
+            sequence: 1,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({
+                "RegularKey": hex::encode([0xFFu8; 20]),
+                "SigningPubKey": hex::encode_upper(master_pk),
+            }),
+        };
+        assert_eq!(SetRegularKeyTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+        let data = sandbox.read(&keylet::account_root_key(&alice)).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        assert_eq!(v["Flags"].as_u64().unwrap_or(0) & 0x0001_0000, 0x0001_0000);
+        assert_eq!(v["RegularKey"].as_str().unwrap(), hex::encode([0xFFu8; 20]));
+
+        // Fee 0 is the canonical free form — valid, same effect.
+        let free = TxFields { fee: 0, ..tx.clone() };
+        assert_eq!(SetRegularKeyTransactor.preflight(&free), TxResult::Success);
+    }
+
+    /// Signed with a regular key (SigningPubKey derives someone else) or
+    /// multi-signed (empty SigningPubKey): the base fee is the normal one and
+    /// the password stays armed.
+    #[test]
+    fn regular_or_multi_signed_regular_key_keeps_the_password_armed() {
+        let alice = [0x01u8; 20];
+        let state = make_state(&[(alice, 50_000_000)]);
+        for spk in [hex::encode_upper([0x03u8; 33]), String::new()] {
+            let mut sandbox = Sandbox::new(&state);
+            let tx = TxFields {
+                account: alice,
+                tx_type: "SetRegularKey".to_string(),
+                fee: 12,
+                sequence: 1,
+                ticket_seq: None,
+                last_ledger_seq: None,
+                fields: serde_json::json!({
+                    "RegularKey": hex::encode([0xFFu8; 20]),
+                    "SigningPubKey": spk,
+                }),
+            };
+            assert_eq!(SetRegularKeyTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+            let data = sandbox.read(&keylet::account_root_key(&alice)).unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&data).unwrap();
+            assert_eq!(v["Flags"].as_u64().unwrap_or(0) & 0x0001_0000, 0);
+        }
+    }
+
+    /// Clearing the key with the master disabled and no signer list is
+    /// tecNO_ALTERNATIVE_KEY (SetRegularKey.cpp:81-83).
+    #[test]
+    fn clear_regular_key_with_master_disabled_needs_a_signer_list() {
+        let alice = [0x01u8; 20];
+        let mut state = make_state(&[(alice, 50_000_000)]);
+        let key = keylet::account_root_key(&alice);
+        let mut acct: serde_json::Value =
+            serde_json::from_slice(&state.state_map.lookup(&key).unwrap()).unwrap();
+        acct["Flags"] = serde_json::json!(0x0010_0000u64);
+        acct["RegularKey"] = serde_json::json!(hex::encode([0xAAu8; 20]));
+        state.state_map.insert(key, serde_json::to_vec(&acct).unwrap()).unwrap();
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: alice,
+            tx_type: "SetRegularKey".to_string(),
+            fee: 12,
+            sequence: 1,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({"SigningPubKey": hex::encode_upper([0x03u8; 33])}),
+        };
+        assert_eq!(SetRegularKeyTransactor.do_apply(&tx, &mut sandbox), TxResult::NoAlternativeKey);
     }
 
     #[test]

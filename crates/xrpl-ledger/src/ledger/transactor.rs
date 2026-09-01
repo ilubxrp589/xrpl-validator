@@ -148,6 +148,9 @@ pub enum TxResult {
     XChainClaimNoQuorum,
     /// XChain: the door account has no signer list to attest against.
     XChainNoSignersList,
+    /// Clearing the RegularKey with the master key disabled and no signer
+    /// list to fall back on (tecNO_ALTERNATIVE_KEY, SetRegularKey.cpp:83).
+    NoAlternativeKey,
 
     // tem — malformed, not applied at all
     /// Transaction is malformed.
@@ -230,6 +233,7 @@ impl TxResult {
             | TxResult::XChainWrongChain
             | TxResult::XChainClaimNoQuorum
             | TxResult::XChainNoSignersList
+            | TxResult::NoAlternativeKey
             | TxResult::Unsupported => true,
             // tem/tef: not claimed
             _ => false,
@@ -291,6 +295,7 @@ impl TxResult {
             TxResult::XChainWrongChain => "tecXCHAIN_WRONG_CHAIN",
             TxResult::XChainClaimNoQuorum => "tecXCHAIN_CLAIM_NO_QUORUM",
             TxResult::XChainNoSignersList => "tecXCHAIN_NO_SIGNERS_LIST",
+            TxResult::NoAlternativeKey => "tecNO_ALTERNATIVE_KEY",
             TxResult::Malformed => "temMALFORMED",
             TxResult::BadFee => "temBAD_FEE",
             TxResult::BadAmount => "temBAD_AMOUNT",
