@@ -103,3 +103,19 @@ fn offer_fill_line_recurrence_is_byte_exact() {
 fn offer_fill_cluster_is_byte_exact() {
     run_bundle(include_str!("vectors/offer_ulp_106688646.json"));
 }
+
+/// F56's regression guard (#106674447 2049BE47, XAH→RLUSD tfIoC through the
+/// XRP bridge, buying EXACTLY 1.0 RLUSD). The second slice's raw pool offer
+/// exceeds the remaining budget, so the in-clamp marks it IN-EXHAUSTED — and
+/// then the out-cap clamp binds tighter and re-derives it. With the gross
+/// cap armed for every fully-funded IOU-in taker (F56), the stale flag made
+/// an OUT-limited slice floor its pool mid (5253 for 5254), skip the
+/// whole-drop reprice and debit the taker's WHOLE remaining 929.66 XAH as
+/// the leg-A gross: six nodes off, forty ledgers of soak-98 cascade.
+/// rippled sizes an out-limited iteration by `ceil_out` and its in is the
+/// derived amount — the budget is not exhausted, whatever the raw offer
+/// said before the limit applied.
+#[test]
+fn offer_fill_out_limited_bridge_under_armed_cap_is_byte_exact() {
+    run_bundle(include_str!("vectors/offer_outlimit_106674447.json"));
+}

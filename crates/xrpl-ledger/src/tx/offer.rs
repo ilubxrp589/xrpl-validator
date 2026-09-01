@@ -3357,6 +3357,9 @@ thr={t:?} admits_trunc={} admits_up={}",
                     (None, Some((_, (s_in, s_out)))) => (*s_in, *s_in, *s_out, None),
                     (None, None) => break 'attempt,
                 };
+                if std::env::var("DX_BRIDGE").is_ok() {
+                    eprintln!("DX_CAPS a_cap_xrp={a_cap_xrp:?} a_in_full={a_in_full:?} a_out_full={a_out_full:?} b_cap_xrp={b_cap_xrp:?} b_in_full={b_in_full:?} b_out_full={b_out_full:?}");
+                }
                 // rippled prices a PARTIAL fill at the offer's filed
                 // BookDirectory quality, NOT at its current TakerPays/TakerGets
                 // ratio — the two drift apart once an offer has been partially
@@ -3442,6 +3445,18 @@ thr={t:?} admits_trunc={} admits_up={}",
                 let mut pays_out = rp_b(xrp, b_price(xrp), sandbox);
                 // Clamp on the limitOut-adjusted cap. For a tfSell offer
                 // `rem_pays` is not a bound, but the limit-sized cap is.
+                //
+                // An out-side clamp that binds TIGHTER than the in-budget
+                // supersedes the in-exhaustion above: the slice is then
+                // OUT-limited — rippled's `ceil_out` iteration, whose in is
+                // the DERIVED amount, not the remainder — so the budget is
+                // not exhausted, whatever the raw offer said before the limit
+                // applied. Leaving the flag set floored the pool mid (5253
+                // for 5254), skipped the whole-drop reprice and debited the
+                // taker's WHOLE remaining 929.66 XAH as the leg-A gross on
+                // #106674447 2049BE47 (buys exactly 1.0 RLUSD) the moment F56
+                // armed the cap for every fully-funded IOU-in taker: six
+                // nodes off, forty ledgers of soak-98 cascade.
                 let mut out_clamped = false;
                 if let Some(cap) = out_cap {
                     if me_cmp(pays_out, cap).is_gt() {
@@ -3449,6 +3464,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                         xrp = urp_b(pays_out, b_unprice(pays_out), sandbox);
                         gets_in = rp_a(xrp, a_price(xrp), sandbox);
                         out_clamped = true;
+                        in_exhausted = false;
                     }
                 }
                 // A leg-B book maker can only deliver what it HOLDS. Leg A has
@@ -3495,6 +3511,8 @@ thr={t:?} admits_trunc={} admits_up={}",
                         xrp = urp_b(pays_out, b_unprice(pays_out), sandbox);
                         gets_in = rp_a(xrp, a_price(xrp), sandbox);
                         out_clamped = true;
+                        // Funding-limited is out-limited (see the out_cap clamp).
+                        in_exhausted = false;
                     }
                 }
                 // DX_XRP: the bridged mid-leg is XRP and has to land on whole
