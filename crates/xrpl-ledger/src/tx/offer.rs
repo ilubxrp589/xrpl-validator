@@ -3584,7 +3584,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // on leg A (…327795253 for …424787519). The remaining-out clamp
                 // (`limitStepOut`, :705-708) keeps roundUp=true — the 2049BE47
                 // calibration above stands.
-                let xrp = (me_rescale(xrp, 0, !(a_use_amm && in_exhausted) && !b_funds_bound), 0);
+                let xrp = (me_rescale(xrp, 0, !((a_use_amm && in_exhausted) || b_funds_bound)), 0);
                 // ...and REPRICE leg A for it. `gets_in` above was computed
                 // from the FRACTIONAL xrp; rounding the mid-leg up to whole
                 // drops without redoing that leaves leg A buying a whole drop
