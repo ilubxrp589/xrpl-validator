@@ -98,6 +98,25 @@ pub(crate) fn n_mul(a: Me, b: Me, rnd: Rnd) -> Me {
     round16(a.0 * b.0, a.1 + b.1, false, rnd)
 }
 
+/// rippled `power(Number const& f, unsigned n)` — recursive square-and-
+/// multiply, one Number rounding per multiplication, in ITS operation
+/// order (the sequence decides the 16th digit; AMMBid's slot pricing runs
+/// power(fractionUsed, 60)).
+pub(crate) fn n_pow(f: Me, n: u32) -> Me {
+    if n == 0 {
+        return (1, 0);
+    }
+    if n == 1 {
+        return f;
+    }
+    let mut r = n_pow(f, n / 2);
+    r = n_mul(r, r, Rnd::Near);
+    if n % 2 != 0 {
+        r = n_mul(r, f, Rnd::Near);
+    }
+    r
+}
+
 pub(crate) fn n_div(a: Me, b: Me, rnd: Rnd) -> Me {
     if a.0 == 0 || b.0 == 0 {
         return (0, 0);

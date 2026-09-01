@@ -449,35 +449,6 @@ fn amendment_enabled(sandbox: &Sandbox, id_hex: &str) -> bool {
 #[allow(dead_code)]
 const FIX_AMM_V1_3: &str = "7CA70A7674A26FA517412858659EBC7EDEEF7D2D608824464E6FDEFD06854E14";
 
-/// `num/den` ceiled at 16 significant digits — the equal-withdraw fraction's
-/// direction (finding 31/32): one exact division with any nonzero remainder
-/// rounding UP, so the 17→16 normalization can never eat the round.
-fn st_divide_up(num: ox::Me, den: ox::Me) -> ox::Me {
-    if num.0 == 0 || den.0 == 0 {
-        return (0, 0);
-    }
-    let (nm, ne) = ox::norm16(num);
-    let (dm, de) = ox::norm16(den);
-    // nm,dm ∈ [1e15,1e16) ⇒ nm·1e16/dm ∈ (1e15,1e17): at most 17 digits.
-    let scaled = nm * 10_000_000_000_000_000u128;
-    let (mut q, r) = (scaled / dm, scaled % dm);
-    let mut e = ne - de - 16;
-    if r != 0 {
-        q += 1;
-    }
-    while q >= 10_000_000_000_000_000 {
-        // Entered the 17-digit range: shed exactly like Number would, but the
-        // ceil already happened on the exact remainder — a shed nonzero digit
-        // re-ceils.
-        let d = q % 10;
-        q /= 10;
-        if d != 0 {
-            q += 1;
-        }
-        e += 1;
-    }
-    (q, e)
-}
 
 fn mul_directed(a: ox::Me, b: ox::Me, up: bool, xrp: bool) -> ox::Me {
     if a.0 == 0 || b.0 == 0 {
@@ -1244,18 +1215,21 @@ fn payout_proportional_to(
         // nearest fraction stands — the census's #105880685 (one ULP HIGH
         // under an unconditional ceil) is the pre-era calibrator. rippled
         // splits on rules().enabled(fixAMMv1_3) (AMMHelpers getRoundedAsset).
-        // The discriminator is the withdraw MODE, not the amendment era
-        // (fixAMMv1_3 predates both calibrators — the amendment lead was
-        // false): tfWithdrawAll ceils the fraction (#106629211 7ED17A0F,
-        // both pool sides pinning it uniquely), tfLPToken partials keep the
-        // legacy nearest fraction (#105880685 F2CCA2BD, one ULP HIGH under
-        // an unconditional ceil; #105796380 likewise). Matches rippled's
-        // WithdrawAll::Yes/No split through adjustLPTokensIn + withdraw.
-        let frac = if withdraw_all {
-            st_divide_up(tokens, total_lp)
-        } else {
-            ox::st_divide(tokens, total_lp, false)
-        };
+        // F54 (#106692584 B27127D6, tfWithdrawAll Jocker/XRP): the mode
+        // fork was a PHANTOM. #106629211's "ceil uniquely required" was
+        // under-determined — with the withdrawer-line add and the pool-line
+        // subtract both quantizing at their own exponents, frac-…2139 and
+        // frac-…2140 land BYTE-IDENTICAL lines on BOTH sides, so that
+        // specimen never distinguished ceil from nearest. The fresh
+        // specimen does: ceil hands the withdrawer …615 where mainnet's
+        // …613 demands the nearest fraction, and the nearest fraction also
+        // satisfies #105880685 (partial), #106629211 (indifferent) and the
+        // dust calibrator #106014913 (a ceiled OR nearest dust fraction
+        // still floors the XRP side to zero → tecAMM_FAILED). One rule,
+        // all modes: frac = divide(tokensAdj, lptAMMBalance) under Number
+        // nearest, products DOWNWARD (getRoundedAsset, IsDeposit::No).
+        let _ = withdraw_all;
+        let frac = ox::st_divide(tokens, total_lp, false);
         let share = mul_directed(pool, frac, false, leg.xrp);
         if std::env::var("DX_AMMWD").is_ok() {
             eprintln!(
@@ -1901,25 +1875,227 @@ impl Transactor for AMMBidTransactor {
         TxResult::Success
     }
 
+    // rippled AMMBid::preclaim, tec paths only (tem/ter shapes never reach a
+    // validated ledger): empty pool → tecAMM_EMPTY; bidder holding no LP →
+    // tecAMM_INVALID_TOKENS; BidMin/BidMax above the bidder's LP or at/past
+    // the pool's whole balance, or min > max → tecAMM_INVALID_TOKENS.
     fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        use crate::tx::offer as ox;
         let acct_key = keylet::account_root_key(&tx.account);
         if !sandbox.exists(&acct_key) { return TxResult::NoAccount; }
+        let Some((amm_key, _amm_acct, lp_leg)) = amm_ctx(tx, sandbox) else {
+            return TxResult::Success; // unhydrated pool: never condemn (F49 rule)
+        };
+        let Some(amm) = ox::json_at(sandbox, &amm_key) else {
+            return TxResult::Success;
+        };
+        let Some(lpt_amm) = amm.get("LPTokenBalance").and_then(keylet::amount_mant_exp) else {
+            return TxResult::Success;
+        };
+        if lpt_amm.0 == 0 {
+            return TxResult::AmmEmpty;
+        }
+        let lkey = keylet::ripple_state_key(&tx.account, &lp_leg.issuer, &lp_leg.cur);
+        let lp_tokens = match ox::json_at(sandbox, &lkey) {
+            Some(l) => {
+                let (neg, bal) = ox::signed_value(&l["Balance"]);
+                let holds = if tx.account < lp_leg.issuer { !neg } else { neg };
+                if holds { bal } else { (0, 0) }
+            }
+            None => (0, 0),
+        };
+        if lp_tokens.0 == 0 {
+            return TxResult::AmmInvalidTokens;
+        }
+        let bid_of = |f: &str| -> Option<crate::tx::offer::Me> {
+            tx.fields.get(f).map(|v| ox::signed_value(v).1)
+        };
+        let (bid_min, bid_max) = (bid_of("BidMin"), bid_of("BidMax"));
+        for b in [bid_min, bid_max].into_iter().flatten() {
+            if ox::me_cmp(b, lp_tokens).is_gt() || !ox::me_cmp(b, lpt_amm).is_lt() {
+                return TxResult::AmmInvalidTokens;
+            }
+        }
+        if let (Some(mn), Some(mx)) = (bid_min, bid_max) {
+            if ox::me_cmp(mn, mx).is_gt() {
+                return TxResult::AmmInvalidTokens;
+            }
+        }
         TxResult::Success
     }
 
+    // rippled AMMBid.cpp applyBid, line for line. The old stub stamped a
+    // fake slot ({Account, Expiration: 0, Price: BidMin}) and always
+    // succeeded — first live conviction #106692271 DD579576F908 (XDC/XRP,
+    // XPmarket bid): computedPrice above BidMax must be tecAMM_FAILED.
     fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
-        // Bid for the AMM's auction slot (discounted trading fee)
-        if let Some(key) = amm_key_from_asset_fields(tx) {
-            if let Some(data) = sandbox.read(&key) {
-                if let Ok(mut amm) = serde_json::from_slice::<serde_json::Value>(&data) {
-                    amm["AuctionSlot"] = serde_json::json!({
-                        "Account": hex::encode(tx.account),
-                        "Expiration": 0,
-                        "Price": tx.fields.get("BidMin").cloned().unwrap_or(serde_json::json!("0")),
-                    });
-                    sandbox.write(key, serde_json::to_vec(&amm).unwrap());
+        use crate::tx::amm_swap::{n_add, n_div, n_mul, n_pow, n_sub, Rnd};
+        use crate::tx::offer as ox;
+        let Some((amm_key, _amm_acct, lp_leg)) = amm_ctx(tx, sandbox) else {
+            return TxResult::Success;
+        };
+        let Some(mut amm) = ox::json_at(sandbox, &amm_key) else {
+            return TxResult::Success;
+        };
+        let Some(lpt_amm) = amm.get("LPTokenBalance").and_then(keylet::amount_mant_exp) else {
+            return TxResult::Success;
+        };
+        // Bidder's LP holding, read ONCE before any movement (the payPrice
+        // ceiling judges against it).
+        let lp_tokens = {
+            let lkey = keylet::ripple_state_key(&tx.account, &lp_leg.issuer, &lp_leg.cur);
+            match ox::json_at(sandbox, &lkey) {
+                Some(l) => {
+                    let (neg, bal) = ox::signed_value(&l["Balance"]);
+                    let holds = if tx.account < lp_leg.issuer { !neg } else { neg };
+                    if holds { bal } else { (0, 0) }
+                }
+                None => (0, 0),
+            }
+        };
+        // `current` = the building ledger's parentCloseTime (the F46
+        // Expiration convention: base header close_time).
+        let current = sandbox.base().header.close_time as u64;
+        let tfee = amm.get("TradingFee").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+        let discounted_fee = tfee / 10;
+        // tradingFee = Number{tfee}/100000; minSlotPrice = lptAMM × fee / 25.
+        let trading_fee = n_div((tfee as u128, 0), (100_000, 0), Rnd::Near);
+        let min_slot_price = n_div(n_mul(lpt_amm, trading_fee, Rnd::Near), (25, 0), Rnd::Near);
+        let slot = amm.get("AuctionSlot").cloned().unwrap_or(serde_json::json!({}));
+        // ammAuctionTimeSlot: 0-19 while inside the 24h window, else None.
+        let time_slot: Option<u64> = slot
+            .get("Expiration")
+            .and_then(|v| v.as_u64())
+            .filter(|e| *e >= 86_400)
+            .and_then(|e| {
+                let start = e - 86_400;
+                current.checked_sub(start).filter(|d| *d < 86_400).map(|d| d / 4_320)
+            });
+        let owner: Option<[u8; 20]> = slot
+            .get("Account")
+            .and_then(|v| v.as_str())
+            .and_then(|h| hex::decode(h).ok())
+            .and_then(|b| <[u8; 20]>::try_from(b).ok());
+        // Valid range is 0-19 but the tailing slot (19) pays MinSlotPrice
+        // and doesn't refund, so the check is < 19.
+        let valid_owner = owner.is_some_and(|o| {
+            time_slot.is_some_and(|t| t < 19)
+                && sandbox.exists(&keylet::account_root_key(&o))
+        });
+        let bid_of = |f: &str| -> Option<crate::tx::offer::Me> {
+            tx.fields.get(f).map(|v| ox::signed_value(v).1)
+        };
+        let (bid_min, bid_max) = (bid_of("BidMin"), bid_of("BidMax"));
+        // getPayPrice: range-check against BidMin/BidMax, then the bidder
+        // must actually hold the price.
+        let get_pay_price = |computed: crate::tx::offer::Me| -> Result<crate::tx::offer::Me, TxResult> {
+            let pay = match (bid_min, bid_max) {
+                (Some(mn), Some(mx)) => {
+                    if !ox::me_cmp(computed, mx).is_gt() {
+                        if ox::me_cmp(computed, mn).is_lt() { mn } else { computed }
+                    } else {
+                        return Err(TxResult::AmmFailed);
+                    }
+                }
+                (Some(mn), None) => {
+                    if ox::me_cmp(computed, mn).is_lt() { mn } else { computed }
+                }
+                (None, Some(mx)) => {
+                    if !ox::me_cmp(computed, mx).is_gt() { computed } else {
+                        return Err(TxResult::AmmFailed);
+                    }
+                }
+                (None, None) => computed,
+            };
+            if ox::me_cmp(pay, lp_tokens).is_gt() {
+                return Err(TxResult::AmmInvalidTokens);
+            }
+            Ok(pay)
+        };
+        let (pay_price, burn) = if !valid_owner {
+            // No one owns the slot, or it expired: pay off minSlotPrice and
+            // burn the whole price.
+            match get_pay_price(min_slot_price) {
+                Ok(p) => (p, p),
+                Err(e) => return e,
+            }
+        } else {
+            // Occupied: 1.05× the purchase price, decayed by the used
+            // fraction of the 20-interval day, plus the floor.
+            let t = time_slot.unwrap_or(0);
+            let price_purchased = ox::signed_value(&slot["Price"]).1;
+            let fraction_used = n_div(n_add((t as u128, 0), (1, 0), Rnd::Near), (20, 0), Rnd::Near);
+            let fraction_remaining = n_sub((1, 0), fraction_used, Rnd::Near);
+            let p105 = (105u128, -2i32);
+            let computed = if t == 0 {
+                n_add(n_mul(price_purchased, p105, Rnd::Near), min_slot_price, Rnd::Near)
+            } else {
+                let decay = n_sub((1, 0), n_pow(fraction_used, 60), Rnd::Near);
+                n_add(
+                    n_mul(n_mul(price_purchased, p105, Rnd::Near), decay, Rnd::Near),
+                    min_slot_price,
+                    Rnd::Near,
+                )
+            };
+            let pay = match get_pay_price(computed) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            // Refund the previous owner the unused fraction of what they
+            // paid, in LP tokens, then burn the rest.
+            let refund = n_mul(fraction_remaining, price_purchased, Rnd::Near);
+            if ox::me_cmp(refund, pay).is_gt() {
+                return TxResult::AmmFailed; // "should never occur" (tecINTERNAL)
+            }
+            if refund.0 > 0 {
+                if let Some(o) = owner {
+                    ox::move_leg(sandbox, &tx.account, &o, &lp_leg, refund);
                 }
             }
+            (pay, n_sub(pay, refund, Rnd::Near))
+        };
+        // updateSlot: rewrite the slot whole (stale AuthAccounts drop), burn
+        // the bid from the bidder's line and the pool's LPTokenBalance.
+        let mut new_slot = serde_json::json!({
+            "Account": hex::encode(tx.account),
+            "Expiration": current + 86_400,
+            "Price": {
+                "currency": hex::encode_upper(lp_leg.cur),
+                "issuer": hex::encode(lp_leg.issuer),
+                "value": ox::me_to_value_string(pay_price),
+            },
+        });
+        if discounted_fee != 0 {
+            new_slot["DiscountedFee"] = serde_json::json!(discounted_fee);
+        }
+        if let Some(aa) = tx.fields.get("AuthAccounts") {
+            // Dialect: the mirror stores hex account ids.
+            let mut arr = Vec::new();
+            if let Some(list) = aa.as_array() {
+                for e in list {
+                    if let Some(a) = e
+                        .get("AuthAccount")
+                        .and_then(|o| o.get("Account"))
+                        .and_then(|v| v.as_str())
+                        .and_then(ox::decode20)
+                    {
+                        arr.push(serde_json::json!({
+                            "AuthAccount": { "Account": hex::encode(a) }
+                        }));
+                    }
+                }
+            }
+            new_slot["AuthAccounts"] = serde_json::Value::Array(arr);
+        }
+        amm["AuctionSlot"] = new_slot;
+        ox::put_json(sandbox, amm_key, &amm);
+        let sa_burn = crate::tx::amm_swap::adjust_lp_tokens(lpt_amm, burn, false);
+        if !ox::me_cmp(sa_burn, lpt_amm).is_lt() {
+            return TxResult::AmmFailed; // burn >= pool balance: tecINTERNAL shape
+        }
+        if sa_burn.0 > 0 {
+            ox::line_adjust(sandbox, &tx.account, &lp_leg, sa_burn, false);
+            bump_lp_balance(sandbox, &amm_key, sa_burn, false);
         }
         TxResult::Success
     }

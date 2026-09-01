@@ -133,6 +133,49 @@ def main():
         except Exception:
             pass
 
+    # Asset/Asset2 transactors (AMMBid/Vote/Deposit/Withdraw/Delete) read the
+    # AMM object, the bidder/voter's LP line and every slot-holder's LP line —
+    # none of which a tec's meta shows (it touches only the fee). The F49
+    # drill fetched these by hand; do it always.
+    if "Asset" in tx and "Asset2" in tx:
+        def asset_param(a):
+            if a.get("currency") == "XRP" and not a.get("issuer"):
+                return {"currency": "XRP"}
+            return {"currency": a["currency"], "issuer": a["issuer"]}
+        try:
+            r = rpc("ledger_entry", {
+                "amm": {"asset": asset_param(tx["Asset"]), "asset2": asset_param(tx["Asset2"])},
+                "ledger_index": seq - 1,
+            })
+            node = r.get("node") or {}
+            idx = (r.get("index") or "").upper()
+            if idx:
+                nb = fetch_key(idx)
+                if nb and idx not in pre:
+                    pre[idx] = nb
+            walk(node)
+            lp = node.get("LPTokenBalance") or {}
+            lp_cur, lp_iss = lp.get("currency"), lp.get("issuer")
+            holders = {tx.get("Account")}
+            for vs in node.get("VoteSlots") or []:
+                holders.add((vs.get("VoteEntry") or {}).get("Account"))
+            holders.add((node.get("AuctionSlot") or {}).get("Account"))
+            for h in holders:
+                if not h or not lp_cur or not lp_iss:
+                    continue
+                try:
+                    rr = rpc("ledger_entry", {
+                        "ripple_state": {"currency": lp_cur, "accounts": [h, lp_iss]},
+                        "ledger_index": seq - 1, "binary": True,
+                    })
+                    li = (rr.get("index") or "").upper()
+                    if rr.get("node_binary") and li and li not in pre:
+                        pre[li] = rr["node_binary"]
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     # An OfferCreate READS book heads it never writes: the direct book's tip
     # prices strand admission (multi-strand vs single), and the two XRP
     # bridge legs compete with it — a bundle without them walks a different
