@@ -926,6 +926,9 @@ impl Transactor for NFTokenAcceptOfferTransactor {
         if let (Some(b), Some(sl)) = (&bo, &so) {
             for d in [b.destination, sl.destination].into_iter().flatten() {
                 if d != tx.account {
+                    if std::env::var("DX_NFT").is_ok() {
+                        eprintln!("DX_NFT accept-preclaim REFUSE broker-destination {}", hex::encode(d));
+                    }
                     return TxResult::NoPermission;
                 }
             }
@@ -962,6 +965,13 @@ impl Transactor for NFTokenAcceptOfferTransactor {
             // tecNO_PERMISSION — not the tecNO_ENTRY our transfer_token
             // surfaced later.
             if nftpage::locate_token(sandbox, &seller, &sell.nft_id).is_none() {
+                if std::env::var("DX_NFT").is_ok() {
+                    eprintln!(
+                        "DX_NFT accept-preclaim REFUSE owns-token: seller={} nft={}",
+                        hex::encode(seller),
+                        hex::encode(sell.nft_id.0)
+                    );
+                }
                 return TxResult::NoPermission;
             }
             // rippled deletes BOTH offers first (doApply, before any payout
@@ -1024,6 +1034,13 @@ impl Transactor for NFTokenAcceptOfferTransactor {
         // stale sell offer (rpApJk4e no longer holds 00081B58…0100) and
         // mainnet claims the fee with NO_PERMISSION where we said NO_ENTRY.
         if nftpage::locate_token(sandbox, &seller, &offer.nft_id).is_none() {
+            if std::env::var("DX_NFT").is_ok() {
+                eprintln!(
+                    "DX_NFT accept-direct REFUSE owns-token: seller={} nft={}",
+                    hex::encode(seller),
+                    hex::encode(offer.nft_id.0)
+                );
+            }
             return TxResult::NoPermission;
         }
         // Offer deleted FIRST — same order as rippled's doApply (see the
@@ -1100,16 +1117,40 @@ fn pay_iou_with_transfer_fee(
     } else {
         (0, 0)
     };
-    ox::line_adjust(sandbox, buyer, &leg, value, false);
+    if std::env::var("DX_NFT").is_ok() {
+        eprintln!(
+            "DX_NFT pay_iou value={value:?} seller_side={seller_side:?} nft_cut={nft_cut:?} buyer={} seller={} nft_issuer={}",
+            hex::encode(buyer),
+            hex::encode(seller),
+            hex::encode(nft_issuer)
+        );
+    }
+    // Finding 48 (#106677548): every leg is a rippled `pay()` = accountSend
+    // FROM THE BUYER (NFTokenAcceptOffer.cpp:491-503 direct, 570-596
+    // brokered) — and accountSend grosses the SENDER's debit by the LEG
+    // issuer's TransferRate (receiver stays net, the issuer's fee burns).
+    // The single flat buyer debit here left the buyer 475 HADA rich on a
+    // 950,000 sale under the issuer's 1.0005 rate. A send whose party IS
+    // the leg issuer carries no fee (rippleSend's direct arm), and a
+    // buyer-to-self send (buyer == NFT issuer collecting their own
+    // royalty) is a no-op, though the seller still parts with the cut.
+    let rate = ox::transfer_rate(sandbox, &leg);
+    let mut send = |sandbox: &mut Sandbox, to: &[u8; 20], net: crate::tx::offer::Me| {
+        if net.0 == 0 || to == buyer {
+            return;
+        }
+        let r = if *buyer == leg.issuer || *to == leg.issuer { None } else { rate };
+        ox::move_leg_gross(sandbox, buyer, to, &leg, net, ox::gross_in(r, net));
+    };
     if let Some((br, _)) = broker {
         if broker_cut.0 > 0 {
-            ox::line_adjust(sandbox, br, &leg, broker_cut, true);
+            send(sandbox, br, broker_cut);
         }
     }
     if nft_cut.0 > 0 {
-        ox::line_adjust(sandbox, &nft_issuer, &leg, nft_cut, true);
+        send(sandbox, &nft_issuer, nft_cut);
     }
-    ox::line_adjust(sandbox, seller, &leg, ox::me_sub(seller_side, nft_cut), true);
+    send(sandbox, seller, ox::me_sub(seller_side, nft_cut));
     true
 }
 

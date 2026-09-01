@@ -460,9 +460,15 @@ pub fn locate_token(
     id: &Hash256,
 ) -> Option<(Hash256, serde_json::Value)> {
     let id_hex = hex::encode_upper(id.0);
+    let dx = std::env::var("DX_NFT").is_ok();
     let mut cur = max_page_key(owner);
-    for _ in 0..100_000 {
-        let page = read_page(sandbox, &cur)?;
+    for hop in 0..100_000 {
+        let Some(page) = read_page(sandbox, &cur) else {
+            if dx {
+                eprintln!("DX_NFT locate hop={hop} PAGE ABSENT {}", hex::encode_upper(cur.0));
+            }
+            return None;
+        };
         let found = page["NFTokens"]
             .as_array()
             .map(|a| a.iter().any(|e| entry_id(e) == id_hex))
@@ -470,7 +476,17 @@ pub fn locate_token(
         if found {
             return Some((cur, page));
         }
-        cur = parse_page_ref(page.get("PreviousPageMin"))?;
+        let Some(next) = parse_page_ref(page.get("PreviousPageMin")) else {
+            if dx {
+                eprintln!(
+                    "DX_NFT locate hop={hop} CHAIN END at {} (prev={:?})",
+                    hex::encode_upper(cur.0),
+                    page.get("PreviousPageMin")
+                );
+            }
+            return None;
+        };
+        cur = next;
     }
     None
 }
