@@ -4509,7 +4509,18 @@ pub(crate) fn cross_engine_to_net(
                 }
                 // Sizing sees the DELIVERABLE funds (F55); the reap above
                 // judged the raw balance.
-                let w_orate = maker_out_rate(sandbox, pays_leg, &maker, beneficiary);
+                // CROSSING ONLY: a payment strand's next hop charges the
+                // out-fee itself (rippleSend at the following DirectStep) —
+                // charging it here too double-debited the makers and broke
+                // soak-98 at #106674462, 25-ledger cascade (the second-site
+                // law: two sites enforcing one fee is the nastier case). An
+                // offer crossing's strand ENDS at the taker, so the walk is
+                // the only site — C3ECD3's drained-to-zero maker pins it.
+                let w_orate = if offer_crossing {
+                    maker_out_rate(sandbox, pays_leg, &maker, beneficiary)
+                } else {
+                    None
+                };
                 let funded = match w_orate {
                     Some(r) => mul_ratio(funded_raw, 1_000_000_000, r as u128, false),
                     None => funded_raw,
