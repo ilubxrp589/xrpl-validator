@@ -837,9 +837,6 @@ pub(crate) fn line_adjust(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, am
         // would call every inert update a change.
         let balance_before = (lneg && lbal.0 > 0, lbal);
         // party's holding: low holds when balance positive, high when negative
-        let (hneg, h) = if party_low { (lneg, lbal) } else { (!lneg && lbal.0 > 0, lbal) };
-        let hneg = if party_low { lneg } else { !lneg && lbal.0 > 0 };
-        let _ = (hneg, h);
         let (pneg, pmag) = if party_low { (lneg, lbal) } else { (!lneg, lbal) };
         let (nneg, nmag) = stamount_signed_add(pneg && pmag.0 > 0, pmag, !receiving, amt);
         // DX_LINEADJ=<key prefix|1>: print every balance adjustment landing on
@@ -1165,7 +1162,7 @@ pub(crate) fn move_leg(sandbox: &mut Sandbox, from: &[u8; 20], to: &[u8; 20], le
 
 /// Fully remove a maker offer: object + owner-dir entry + book-dir entry +
 /// maker OwnerCount.
-
+///
 /// During a flow, offer deletions are DEFERRED — rippled queues crossed
 /// offers as removable (OfferCreate.cpp:460) and stale ones in `ofrsToRm`
 /// (applied between iterations, StrandFlow.h:694), so within the walk the
@@ -1390,7 +1387,7 @@ fn st_multiply(a: Me, b: Me, xrp: bool) -> Me {
 /// algorithm as `keylet::offer_quality`, without the JSON round-trip. Both
 /// now share one implementation, so the book level an offer is PLACED on and
 /// the level it is read back from can never disagree.
-
+///
 /// Offer crossing judges a pass at its quality COMPOSED with the OUT
 /// issuer's transfer rate: `BookOfferCrossingStep::getQualityFunc` builds
 /// the CLOB quality function with `WaiveTransferFee::No`, so "Path
@@ -2144,9 +2141,14 @@ fn cross_bridged(
     sell: bool,
     inv_base: &Hash256,
     amm: &Option<crate::tx::amm_swap::Amm>,
+    // The crossing's GROSS in-budget (see `gets_gross_cap` on the walk):
+    // rippled consumes flowCross's grossed sendMax, and the slice that
+    // exhausts it takes the remainder VERBATIM, net by division (F50/F51).
+    gets_gross_cap: Option<Me>,
     sandbox: &mut Sandbox,
     stale: &mut Vec<Hash256>,
 ) -> Option<(Me, Me, u32)> {
+    let mut in_gross_spent: Me = (0, 0);
     // Fee-composed judge threshold for CLOB leg-B fills (AMM and
     // taker-owned leg-B offers waive) — crossing_judge_threshold.
     let thr_judge = crossing_judge_threshold(sandbox, pays_leg, gets_leg, taker, threshold);
@@ -3193,8 +3195,21 @@ thr={t:?} admits_trunc={} admits_up={}",
                 };
                 let mut give = if !sell && me_cmp(rem_pays, m_gives).is_lt() { rem_pays } else { m_gives };
                 let mut pay = price(give);
+                let mut in_exhausted = false;
                 if me_cmp(pay, rem_gets).is_gt() {
                     pay = rem_gets;
+                    // Gross-primary on the exhausting fill (F50/F51): the
+                    // remaining gross budget verbatim, its division as net.
+                    if let Some(cap) = gets_gross_cap {
+                        let verb = me_sub(cap, in_gross_spent);
+                        if !me_is_zero(verb) {
+                            pay = match fee_rate {
+                                None => verb,
+                                Some(r) => mul_ratio(verb, 1_000_000_000, r as u128, false),
+                            };
+                            in_exhausted = true;
+                        }
+                    }
                     // The clamp IS the partial case, so this always prices off
                     // the page — `a_unprice` takes the filed rate unconditionally
                     // for the same reason.
@@ -3211,8 +3226,13 @@ thr={t:?} admits_trunc={} admits_up={}",
                 //
                 // Charged as ONE debit of the gross, not a net debit plus a fee
                 // adjustment — `move_leg_gross` has the arithmetic.
+                let d_gross = match (in_exhausted, gets_gross_cap) {
+                    (true, Some(cap)) => me_sub(cap, in_gross_spent),
+                    _ => gross_in(fee_rate, pay),
+                };
+                in_gross_spent = stamount_signed_add(false, in_gross_spent, false, d_gross).1;
                 settle_fill(sandbox, &okey, &offer, &maker, taker, beneficiary,
-                            pays_leg, gets_leg, give, pay, gross_in(fee_rate, pay), gives0, wants0);
+                            pays_leg, gets_leg, give, pay, d_gross, gives0, wants0);
                 // The taker's RUNNING remainder is an STAmount in rippled, so it
                 // re-rounds to 16 digits at EVERY subtraction. `me_sub` is
                 // exact, so ours accumulates precision rippled never has and
@@ -3237,6 +3257,9 @@ thr={t:?} admits_trunc={} admits_up={}",
                 }
                 rem_pays = me_sub(rem_pays, give);
                 rem_gets = me_sub(rem_gets, pay);
+                if in_exhausted {
+                    rem_gets = (0, 0);
+                }
                 crossed += 1;
                 fill = Some((pay, give));
             } else {
@@ -3343,18 +3366,38 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // the limit and the judge discards it. That is exactly what
                 // regressed #105940336 the first time maxOffer was wired in.
                 let mut gets_in = rp_a(xrp, a_price(xrp), sandbox);
+                // Set when this slice exhausts the gross in-budget: the in is
+                // then GROSS-PRIMARY — the remainder verbatim on the debit,
+                // its division on the net — exactly rippled's in-limited
+                // iteration (F51, #106688646 5524F0F2: gross 4.070530048487853e-6
+                // minus iter0's 3.146629230966003e-6 leaves 9.2390081752185e-7,
+                // whose net is …911 where our net chain carried …912; the pool
+                // then pays 1642 drops, not 1643).
+                let mut in_exhausted = false;
                 if me_cmp(gets_in, rem_gets).is_gt() {
                     gets_in = rem_gets;
+                    if let Some(cap) = gets_gross_cap {
+                        let verb = me_sub(cap, in_gross_spent);
+                        if !me_is_zero(verb) {
+                            gets_in = match fee_rate {
+                                None => verb,
+                                Some(r) => mul_ratio(verb, 1_000_000_000, r as u128, false),
+                            };
+                            in_exhausted = true;
+                        }
+                    }
                     xrp = urp_a(gets_in, a_unprice(gets_in), sandbox);
                 }
                 let mut pays_out = rp_b(xrp, b_price(xrp), sandbox);
                 // Clamp on the limitOut-adjusted cap. For a tfSell offer
                 // `rem_pays` is not a bound, but the limit-sized cap is.
+                let mut out_clamped = false;
                 if let Some(cap) = out_cap {
                     if me_cmp(pays_out, cap).is_gt() {
                         pays_out = cap;
                         xrp = urp_b(pays_out, b_unprice(pays_out), sandbox);
                         gets_in = rp_a(xrp, a_price(xrp), sandbox);
+                        out_clamped = true;
                     }
                 }
                 // A leg-B book maker can only deliver what it HOLDS. Leg A has
@@ -3393,6 +3436,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                         pays_out = funded;
                         xrp = urp_b(pays_out, b_unprice(pays_out), sandbox);
                         gets_in = rp_a(xrp, a_price(xrp), sandbox);
+                        out_clamped = true;
                     }
                 }
                 // DX_XRP: the bridged mid-leg is XRP and has to land on whole
@@ -3407,7 +3451,13 @@ thr={t:?} admits_trunc={} admits_up={}",
                         me_cmp(trunc, up).is_lt(),
                     );
                 }
-                let xrp = (me_rescale(xrp, 0, true), 0);
+                // Whole drops for the mid-leg. A BOOK leg A ceils — the maker
+                // charges for the whole drop (calibrated, #105663160 below).
+                // A POOL leg A rounds DOWN: rippled's `swapAssetIn` rounds the
+                // XRP output downward and the pool keeps the fraction (F51,
+                // #106688646: 1642 drops for the …911 net, where the ceil said
+                // 1643 and pulled a phantom drop out of the pool).
+                let xrp = (me_rescale(xrp, 0, !a_use_amm), 0);
                 // ...and REPRICE leg A for it. `gets_in` above was computed
                 // from the FRACTIONAL xrp; rounding the mid-leg up to whole
                 // drops without redoing that leaves leg A buying a whole drop
@@ -3421,12 +3471,26 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // cost. All four bridged residuals are exactly this, short by
                 // 0.51, 0.65, 0.71 and 0.98 drops' worth: the fraction the
                 // rescale rounded away.
-                let gets_in = {
+                let gets_in = if in_exhausted {
+                    // Gross-primary: rippled charges the whole remaining in
+                    // however the drop rounding lands — its in-limited
+                    // iteration's `in` is the remainder verbatim.
+                    gets_in
+                } else {
                     let repriced = rp_a(xrp, a_price(xrp), sandbox);
                     // The earlier clamp to `rem_gets` still binds — a sub-drop
                     // reprice must not push the pass past what the taker has.
                     if me_cmp(repriced, rem_gets).is_gt() { rem_gets } else { repriced }
                 };
+                // Leg B consumes the WHOLE-drop mid, not the fractional value
+                // it was first priced from (F51's rider on #106688646: 1642
+                // drops at the filed rate is 0.002271007836142991 where the
+                // fractional 1642.578… priced 0.002271807732519948). An
+                // out-side clamp fixed `pays_out` canonically and re-derived
+                // the mid from it — those stay untouched.
+                if !out_clamped {
+                    pays_out = rp_b(xrp, b_price(xrp), sandbox);
+                }
                 if std::env::var("DX_BRIDGE").is_ok() {
                     eprintln!("DX_BRIDGE slice xrp={xrp:?} gets_in={gets_in:?} pays_out={pays_out:?} a_amm={a_use_amm} b_amm={b_use_amm} rem_g={rem_gets:?} rem_p={rem_pays:?}");
                 }
@@ -3437,8 +3501,14 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // taker and nets out of their mutation set). The taker pays the
                 // input transfer fee on top of what leg A's maker received and
                 // the issuer destroys it — as ONE debit of the gross, per
-                // `move_leg_gross`.
-                let a_gross = gross_in(fee_rate, gets_in);
+                // `move_leg_gross`. An exhausting slice debits the remaining
+                // gross budget VERBATIM (F51) — re-grossing its divided net
+                // can land an ulp off the remainder.
+                let a_gross = match (in_exhausted, gets_gross_cap) {
+                    (true, Some(cap)) => me_sub(cap, in_gross_spent),
+                    _ => gross_in(fee_rate, gets_in),
+                };
+                in_gross_spent = stamount_signed_add(false, in_gross_spent, false, a_gross).1;
                 match (&a_book, &a_fill) {
                     (Some((_, akey, aoffer, amaker, a_gives0, a_wants0)), _) => {
                         if std::env::var("DX_WALK").is_ok() {
@@ -3484,6 +3554,11 @@ thr={t:?} admits_trunc={} admits_up={}",
                 }
                 rem_gets = me_sub(rem_gets, gets_in);
                 rem_pays = me_sub(rem_pays, pays_out);
+                if in_exhausted {
+                    // The gross budget is spent; the net chain's leftover is
+                    // division dust rippled never sees (see the walk's rule).
+                    rem_gets = (0, 0);
+                }
                 crossed += 1;
                 fill = Some((gets_in, pays_out));
                 // One bump per ITERATION, however many of the two legs the pools
@@ -3902,7 +3977,7 @@ pub(crate) fn cross_engine_to_net(
     if offer_crossing && !pays_leg.xrp && !gets_leg.xrp && domain.is_none() {
         if let Some(r) = cross_bridged(
             taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, threshold_self,
-            sell, &inv_base, &amm, sandbox, stale,
+            sell, &inv_base, &amm, gets_gross_cap, sandbox, stale,
         ) {
             return r;
         }
@@ -4388,6 +4463,11 @@ pub(crate) fn cross_engine_to_net(
                 // 22.283542 of 22.928591 at the taker's EXACT limit q=0x5a091beb…
                 // — we rested full, mainnet crossed it and rested 0.645).
                 let mut taker_clamped = buy_bound;
+                // Set when the RATED in-clamp below sizes this fill off the
+                // remaining GROSS budget: the settlement then debits that
+                // remainder verbatim and the walk's net residual is spent
+                // round-down dust, not liquidity still owed.
+                let mut in_exhausted = false;
                 if pays_leg.xrp {
                     give = (me_rescale(give, 0, false), 0);
                 }
@@ -4543,18 +4623,31 @@ pub(crate) fn cross_engine_to_net(
                     // stored line's own arithmetic), not the rem_gets me_sub
                     // chain; the two drift ±1 ulp apart over multi-fill
                     // crossings and rippled re-reads the line per iteration.
-                    // UNRATED fills only: a rated fill's `pay` is the NET while
-                    // the cap is GROSS (its taker side is already verbatim via
-                    // a12ffd5; the net keeps today's path).
-                    if !gets_leg.xrp
-                        && transfer_rate(sandbox, gets_leg)
-                            .filter(|_| taker != &gets_leg.issuer && maker != gets_leg.issuer)
-                            .is_none()
-                    {
+                    // UNRATED: `pay` takes the remainder verbatim. RATED
+                    // (F50, #106679738 DA3C22D8): the remainder is GROSS and
+                    // the maker's net is its DIVISION, rounded down —
+                    // rippled's in-limited fill is gross-primary end to end:
+                    // `stpAmt.in = limit; inLmt = mulRatio(stpAmt.in,
+                    // QUALITY_ONE, transferRateIn, roundUp=false)`
+                    // (BookStep.cpp limitStepIn). Tracking the net budget
+                    // instead re-rounds once too often: sendMax 6.892359…225
+                    // grosses to 6.902697718337578, the AMM leg takes
+                    // 3.567913642620374, and mainnet's book fill is the
+                    // remainder over the rate = 3.329789391629759 where the
+                    // net chain said …760 — the class-B line-ULP family.
+                    if !gets_leg.xrp {
                         if let Some(cap) = gets_gross_cap {
                             let verb = me_sub(cap, in_gross_spent);
                             if !me_is_zero(verb) {
-                                pay = verb;
+                                match transfer_rate(sandbox, gets_leg)
+                                    .filter(|_| taker != &gets_leg.issuer && maker != gets_leg.issuer)
+                                {
+                                    None => pay = verb,
+                                    Some(r) => {
+                                        pay = mul_ratio(verb, 1_000_000_000, r as u128, false);
+                                        in_exhausted = true;
+                                    }
+                                }
                             }
                         }
                     }
@@ -4761,7 +4854,7 @@ pub(crate) fn cross_engine_to_net(
                         // walk's net avail is gross-primary: it takes the
                         // remaining gross cap verbatim (see `gets_gross_cap`).
                         let g = match gets_gross_cap {
-                            Some(cap) if !me_cmp(pay, rem_gets).is_lt() => {
+                            Some(cap) if in_exhausted || !me_cmp(pay, rem_gets).is_lt() => {
                                 me_sub(cap, in_gross_spent)
                             }
                             _ => gross_in(r, pay),
@@ -4776,6 +4869,13 @@ pub(crate) fn cross_engine_to_net(
                 }
                 rem_pays = me_sub(rem_pays, give);
                 rem_gets = me_sub(rem_gets, pay);
+                if in_exhausted {
+                    // The gross budget is spent to the last unit; the net
+                    // chain's leftover is the division's round-down dust,
+                    // which rippled — tracking gross — never sees. Chasing
+                    // it would buy a phantom ulp from the next offer.
+                    rem_gets = (0, 0);
+                }
                 if fold_rem {
                     // The iteration's actualOut accumulates STAmount-style
                     // (one 16-digit add per fill on the level).
@@ -5339,7 +5439,17 @@ impl Transactor for OfferCreateTransactor {
         // crossing (slice 5 pays …443496 off the chain where the stored line
         // remainder — rippled's per-iteration re-read — is …443500, and the
         // maker's owed line must close to EXACT ZERO).
-        let gross_cap = if underfunded { Some(avail) } else { None };
+        // Fully funded and RATED, the cap is armed too: flowCross grosses
+        // sendMax UNCONDITIONALLY — `sendMax = multiplyRound(takerAmount.in,
+        // gatewayXferRate, roundUp=true)` (OfferCreate.cpp:354) — and flow()
+        // consumes THAT budget, so the in-limited final fill takes the gross
+        // remainder verbatim and derives its net by division. `send_max`
+        // above is exactly that product. #106679738 DA3C22D8 (F50).
+        let gross_cap = if underfunded {
+            Some(avail)
+        } else {
+            xfer_in.map(|_| send_max)
+        };
         let (rem_pays, rem_gets_cross, crossed) = cross_engine_to_net(
             &tx.account, &tx.account, tp0, tg_cross, &pays_leg, &gets_leg, threshold,
             threshold_self, sell, true, false, None, domain.as_ref(), None, gross_cap,

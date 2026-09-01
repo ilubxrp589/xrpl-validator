@@ -1,0 +1,105 @@
+//! Byte-exact vector drills for the class-B line-ULP family (2026-09-01).
+//!
+//! One bot (rJfVTbJs…, tfSell|tfIoC, always selling Bitstamp IOUs, issuer
+//! rate 1.0015) generated the six-fix era's dominant byte-diff family. The
+//! shadow flags a one-ULP Balance divergence on the maker/taker lines the
+//! fill credits — ours-len == ffi-len, PRE-OK, tx-tagged. Root cause (F50):
+//! rippled's flowCross grosses sendMax ONCE (multiplyRound roundUp) and the
+//! in-limited final fill consumes the remaining GROSS verbatim, deriving
+//! its net by division (limitStepIn) — our walk tracked the NET budget and
+//! re-grossed per leg, one conversion too many.
+//!
+//! - 106679738 DA3C22D8: USD→XRP, real offer + AMM; maker line 0339209F…
+//!   must land …759 (net chain said …760). The founding specimen.
+//! - 106679743 AA7BF8C5: same key five ledgers later — the recurrence pin.
+//! - 106688646 5524F0F2: ETH→RLUSD (IOU/IOU) — the 4-hot-key cluster
+//!   specimen (A6203B55/77AC9AC2/A46F22FC/27577E3A), every touched node
+//!   byte-compared.
+use serde_json::Value;
+use xrpl_core::types::Hash256;
+use xrpl_ledger::ledger::header::LedgerHeader;
+use xrpl_ledger::ledger::sandbox::SandboxEntry;
+use xrpl_ledger::ledger::state::LedgerState;
+use xrpl_node::native_apply::{build_txfields, canon_for_encode, hexify_addresses, native_apply_one};
+
+fn key32(hex_key: &str) -> Hash256 {
+    Hash256(<[u8; 32]>::try_from(hex::decode(hex_key).unwrap().as_slice()).unwrap())
+}
+
+fn hydrate(state: &mut LedgerState, key_hex: &str, entry_hex: &str) {
+    let bytes = hex::decode(entry_hex.trim()).unwrap();
+    let mut jv = xrpl_core::codec::decode::decode_transaction_binary(&bytes).unwrap();
+    hexify_addresses(&mut jv);
+    state
+        .state_map
+        .insert(key32(key_hex), serde_json::to_vec(&jv).unwrap())
+        .unwrap();
+}
+
+fn run_bundle(bundle_json: &str) {
+    let bundle: Value = serde_json::from_str(bundle_json).unwrap();
+    let seq = bundle["seq"].as_u64().unwrap() as u32;
+    let pct = bundle["parent_close_time"].as_u64().unwrap() as u32;
+    let header = LedgerHeader {
+        sequence: seq - 1,
+        total_coins: bundle["total_coins"].as_u64().unwrap(),
+        parent_hash: key32(bundle["parent_hash"].as_str().unwrap()),
+        transaction_hash: Hash256([0; 32]),
+        account_hash: Hash256([0; 32]),
+        parent_close_time: pct,
+        close_time: pct,
+        close_time_resolution: 10,
+        close_flags: 0,
+    };
+    let mut state = LedgerState::new_unverified(header);
+    for (k, v) in bundle["pre"].as_object().unwrap() {
+        hydrate(&mut state, k, v.as_str().unwrap());
+    }
+
+    let tx = &bundle["tx"];
+    let tx_hash = tx["hash"].as_str().unwrap();
+    let txf = build_txfields(tx).expect("txfields");
+    let (ter, mut mods) = native_apply_one(&state, &txf);
+    assert_eq!(ter, "tesSUCCESS", "mainnet applied this OfferCreate");
+
+    xrpl_ledger::ledger::threading::stamp_threading(
+        &mut mods,
+        &|k| state.state_map.lookup(k).map(|b| b.to_vec()),
+        tx_hash,
+        seq,
+    );
+
+    for (k, want_hex) in bundle["expect"].as_object().unwrap() {
+        let ent = mods
+            .get(&key32(k))
+            .unwrap_or_else(|| panic!("target {k} must be written by the apply"));
+        let bytes = match ent {
+            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => b.clone(),
+            SandboxEntry::Deleted => panic!("target {k} deleted?"),
+        };
+        let mut jv: Value = serde_json::from_slice(&bytes).unwrap();
+        canon_for_encode(&mut jv);
+        let enc = xrpl_core::codec::encode::encode_transaction_json(&jv, false).unwrap();
+        let want = hex::decode(want_hex.as_str().unwrap().trim()).unwrap();
+        assert_eq!(
+            hex::encode_upper(&enc),
+            hex::encode_upper(&want),
+            "target {k} must byte-match the mainnet post-state"
+        );
+    }
+}
+
+#[test]
+fn offer_fill_line_is_byte_exact() {
+    run_bundle(include_str!("vectors/offer_ulp_106679738.json"));
+}
+
+#[test]
+fn offer_fill_line_recurrence_is_byte_exact() {
+    run_bundle(include_str!("vectors/offer_ulp_106679743.json"));
+}
+
+#[test]
+fn offer_fill_cluster_is_byte_exact() {
+    run_bundle(include_str!("vectors/offer_ulp_106688646.json"));
+}
