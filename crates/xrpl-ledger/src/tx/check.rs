@@ -128,6 +128,31 @@ impl Transactor for CheckCreateTransactor {
         };
         let check_key = keylet::check_key(&tx.account, seq);
 
+        // The writer must hold the reserve for one more object — judged on
+        // the balance BEFORE the fee (`mPriorBalance < accountReserve(
+        // OwnerCount + 1)`, CreateCheck.cpp), and apply_common has already
+        // taken the fee here, so add it back. #106692368 FAA401917278: a
+        // 12-object account at 5.63 XRP creates its 23rd check of the day —
+        // mainnet claims the fee alone with tecINSUFFICIENT_RESERVE; we
+        // wrote the check and both dir pages.
+        {
+            let ak = keylet::account_root_key(&tx.account);
+            let (bal, oc) = match sandbox
+                .read(&ak)
+                .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+            {
+                Some(a) => (
+                    a["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+                    a["OwnerCount"].as_u64().unwrap_or(0),
+                ),
+                None => return TxResult::NoAccount,
+            };
+            let reserve = crate::ledger::fees::account_reserve(sandbox, oc + 1);
+            if bal.saturating_add(tx.fee) < reserve {
+                return TxResult::InsufficientReserve;
+            }
+        }
+
         // Create the Check ledger object — canonical shape: Flags always,
         // both dir hints, optional passthroughs. Only the WRITER pays the
         // reserve (byte census: the old both-sides bump left r6zw at
