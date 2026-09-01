@@ -1752,9 +1752,23 @@ impl Transactor for AMMVoteTransactor {
             let q = if 2 * r > den || (2 * r == den && q % 2 == 1) { q + 1 } else { q };
             q as u64
         };
+        // Finding 49 (#106678645, XPM/XRP AMMVote): the loop below is
+        // applyVote ported line-for-line. The old form dropped every entry
+        // whose ROUNDED weight was zero (rippled drops only holders whose LP
+        // BALANCE is zero — a dust holder is retained at VoteWeight 0),
+        // replaced-and-appended the voter (rippled updates IN PLACE, keeping
+        // slot order), averaged the fee over rounded weights (rippled sums
+        // fee×lpTokens over Σ lpTokens in Number arithmetic), evicted by
+        // weight (rippled compares TOKENS, ties by lower fee then lower
+        // AccountID), and refused with tecAMM_FAILED when a full slate could
+        // not be outweighed (rippled falls through and simply refreshes the
+        // slots). Live: ours collapsed an 8-slot slate to the voter alone
+        // and wrote TradingFee 1000 where mainnet holds 761.
+        use crate::tx::amm_swap::{n_add, n_div, n_sub, Rnd};
+        type Me = crate::tx::offer::Me;
         let voter_hex = hex::encode(tx.account);
         let new_fee = tx.fields.get("TradingFee").and_then(|f| f.as_u64()).unwrap_or(0);
-        let new_weight = weight_of(lp_of(sandbox, &tx.account));
+        let voter_lp = lp_of(sandbox, &tx.account);
 
         let existing: Vec<serde_json::Value> = amm
             .get("VoteSlots")
@@ -1762,45 +1776,74 @@ impl Transactor for AMMVoteTransactor {
             .cloned()
             .unwrap_or_default();
         let mut updated: Vec<(String, u64, u64)> = Vec::new(); // (acct_hex, fee, weight)
+        let mut num: Me = (0, 0);
+        let mut den: Me = (0, 0);
+        let mut found = false;
+        // Least entry: (position, lpTokens, fee, account bytes) — rippled's
+        // comparator is lp <, then fee <, then AccountID <.
+        let mut min: Option<(usize, Me, u64, [u8; 20])> = None;
         for e in &existing {
             let Some(ve) = e.get("VoteEntry") else { continue };
             let Some(acct) = ve.get("Account").and_then(|a| a.as_str()) else { continue };
-            if acct.eq_ignore_ascii_case(&voter_hex) {
-                continue; // the voter's old entry is replaced below
-            }
             let Some(aid) = crate::tx::offer::decode20(acct) else { continue };
-            let w = weight_of(lp_of(sandbox, &aid));
-            if w == 0 {
-                continue; // holder sold out — entry drops
+            let is_voter = acct.eq_ignore_ascii_case(&voter_hex);
+            let lp = if is_voter { voter_lp } else { lp_of(sandbox, &aid) };
+            if lp.0 == 0 {
+                continue; // "account is not LP" — the only drop
             }
-            let fee = ve.get("TradingFee").and_then(|f| f.as_u64()).unwrap_or(0);
-            updated.push((acct.to_string(), fee, w));
-        }
-        if updated.len() < 8 {
-            updated.push((voter_hex, new_fee, new_weight));
-        } else {
-            let (mi, &(_, _, mw)) = updated
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, (_, _, w))| *w)
-                .map(|(i, t)| (i, t))
-                .unwrap();
-            if mw < new_weight {
-                updated[mi] = (voter_hex, new_fee, new_weight);
+            let fee = if is_voter {
+                found = true;
+                new_fee
             } else {
-                return TxResult::AmmFailed;
+                ve.get("TradingFee").and_then(|f| f.as_u64()).unwrap_or(0)
+            };
+            num = n_add(num, (lp.0 * fee as u128, lp.1), Rnd::Near);
+            den = n_add(den, lp, Rnd::Near);
+            let better = match &min {
+                None => true,
+                Some((_, mlp, mfee, maid)) => match crate::tx::offer::me_cmp(lp, *mlp) {
+                    std::cmp::Ordering::Less => true,
+                    std::cmp::Ordering::Equal => fee < *mfee || (fee == *mfee && aid < *maid),
+                    std::cmp::Ordering::Greater => false,
+                },
+            };
+            if better {
+                min = Some((updated.len(), lp, fee, aid));
+            }
+            updated.push((acct.to_string(), fee, weight_of(lp)));
+        }
+        if !found {
+            let new_weight = weight_of(voter_lp);
+            if updated.len() < 8 {
+                num = n_add(num, (voter_lp.0 * new_fee as u128, voter_lp.1), Rnd::Near);
+                den = n_add(den, voter_lp, Rnd::Near);
+                updated.push((voter_hex, new_fee, new_weight));
+            } else if let Some((mi, mlp, mfee, _)) = min {
+                let outweighs = match crate::tx::offer::me_cmp(voter_lp, mlp) {
+                    std::cmp::Ordering::Greater => true,
+                    std::cmp::Ordering::Equal => new_fee > mfee,
+                    std::cmp::Ordering::Less => false,
+                };
+                if outweighs {
+                    num = n_sub(num, (mlp.0 * mfee as u128, mlp.1), Rnd::Near);
+                    den = n_sub(den, mlp, Rnd::Near);
+                    num = n_add(num, (voter_lp.0 * new_fee as u128, voter_lp.1), Rnd::Near);
+                    den = n_add(den, voter_lp, Rnd::Near);
+                    updated[mi] = (voter_hex, new_fee, new_weight);
+                }
+                // else: full slate, not outweighed — the vote still succeeds
+                // and merely refreshes the surviving slots ("Update anyway").
             }
         }
-        // TradingFee = Σ(fee·w) / Σw, Number half-even to integer.
-        let num: i128 = updated.iter().map(|(_, f, w)| *f as i128 * *w as i128).sum();
-        let den: i128 = updated.iter().map(|(_, _, w)| *w as i128).sum();
-        let fee_avg = if den == 0 {
+        // TradingFee = Σ(fee·lp) / Σlp, Number arithmetic, nearest to integer.
+        let fee_avg: u64 = if den.0 == 0 {
             0
         } else {
-            let q = num / den;
-            let r = num % den;
-            if 2 * r > den || (2 * r == den && q % 2 == 1) { q + 1 } else { q }
-        } as u64;
+            let q = n_div(num, den, Rnd::Near);
+            let t = crate::tx::offer::me_rescale(q, -1, false); // floor(q × 10)
+            let (qq, d) = (t / 10, t % 10);
+            (if d > 5 || (d == 5 && qq % 2 == 1) { qq + 1 } else { qq }) as u64
+        };
 
         amm["VoteSlots"] = serde_json::Value::Array(
             updated

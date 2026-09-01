@@ -116,7 +116,14 @@ fn pre_stale_audit(undo_pre: Option<&[u8]>, ordered: &[&Value], key_hex: &str) -
                         continue;
                     }
                     let have = mine.as_ref().and_then(|m| m.get(f));
-                    let eq = match (have, want) {
+                    // Align the meta's dialect before comparing: r-addresses
+                    // become hex like the mirror's (arrays too — VoteSlots
+                    // false-STALEd #106678645 on VoteEntry.Account spelling
+                    // with byte-identical values, the 75d553e bug's array
+                    // flavor).
+                    let mut want_hex = want.clone();
+                    crate::native_apply::hexify_addresses(&mut want_hex);
+                    let eq = match (have, &want_hex) {
                         (Some(h), w) if h.is_object() && w.is_object() => {
                             h.get("value") == w.get("value") && h.get("currency") == w.get("currency")
                         }
@@ -523,7 +530,11 @@ impl NativeShadow {
                         // field STALE with byte-identical values on both sides
                         // (2026-08-31 evening: 4 path ter-mms mislabeled
                         // input-caused when they were engine disagreements).
-                        let eq = match (have, want) {
+                        // Arrays get the dialect aligned the same way
+                        // (#106678645's VoteSlots).
+                        let mut want_hex = want.clone();
+                        crate::native_apply::hexify_addresses(&mut want_hex);
+                        let eq = match (have, &want_hex) {
                             (Some(h), w) if h.is_object() && w.is_object() => {
                                 h.get("value") == w.get("value")
                                     && h.get("currency") == w.get("currency")
