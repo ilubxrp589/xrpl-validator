@@ -2616,11 +2616,31 @@ impl PaymentTransactor {
         // that has to be exact: measure its spend by differencing a balance and
         // 4.38e-11 of the SendMax reads unspent, which buys a whole extra
         // round — see `8d8d2e6`.
-        let rounds = 32;
-        for _round in 0..rounds {
+        // rippled's driver has no round cap of its own: it loops `while
+        // (remainingOut > 0 && *remainingIn > 0)` and only its safety bound
+        // ends it — the 1000th entry is telFAILED_PROCESSING (StrandFlow.h:
+        // 606-657), a local failure no validated ledger carries. The `32`
+        // this replaces was the multi-strand interleave cap kept when every
+        // strand started re-entering (4566c4e); for a lone strand it capped
+        // the fills-or-slices at 32. #106693003 E9919AA2 (finding 59): a
+        // tfPartialPayment XRP→BCHAMP buy mainnet fills through 33 book offers
+        // interleaved with 13 AMM slices; round 32 left 497 XRP of the SendMax
+        // unspent, 510958.66 delivered under the 737956.89 DeliverMin —
+        // tecPATH_PARTIAL against mainnet's tesSUCCESS. (maxOffersToConsider =
+        // 1500 offers stepped across the passes, StrandFlow.h:608/778, is not
+        // modelled: the passes do not report their offer counts.)
+        let max_tries = 1000usize;
+        let mut cur_try = 0usize;
+        loop {
             if ox::me_is_zero(rem_out) || ox::me_is_zero(rem_in) {
                 break;
             }
+            cur_try += 1;
+            if cur_try >= max_tries {
+                sandbox.restore_snapshot(snap);
+                return TxResult::FailedProcessing;
+            }
+            let _round = cur_try - 1;
             // ORDER BY UPPER BOUND, SELECT BY FIRST-TO-SURVIVE — rippled's
             // `ActiveStrands::activateNext` sorts candidates by
             // `qualityUpperBound` best-first and DROPS any whose bound misses

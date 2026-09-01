@@ -169,6 +169,11 @@ pub enum TxResult {
     /// Pseudo-transaction internal failure (tefFAILURE).
     Failure,
 
+    // tel — local failure, never in a validated ledger
+    /// The payment driver hit its safety bound of 1000 iterations
+    /// (telFAILED_PROCESSING, StrandFlow.h:655).
+    FailedProcessing,
+
     // Unsupported transaction type — deduct fee but skip apply
     Unsupported,
 }
@@ -294,6 +299,7 @@ impl TxResult {
             TxResult::MaxLedger => "tefMAX_LEDGER",
             TxResult::NoAccount => "tefNO_ACCOUNT",
             TxResult::Failure => "tefFAILURE",
+            TxResult::FailedProcessing => "telFAILED_PROCESSING",
             TxResult::Unsupported => "tecUNSUPPORTED",
         }
     }
