@@ -3451,13 +3451,17 @@ thr={t:?} admits_trunc={} admits_up={}",
                         me_cmp(trunc, up).is_lt(),
                     );
                 }
-                // Whole drops for the mid-leg. A BOOK leg A ceils — the maker
-                // charges for the whole drop (calibrated, #105663160 below).
-                // A POOL leg A rounds DOWN: rippled's `swapAssetIn` rounds the
-                // XRP output downward and the pool keeps the fraction (F51,
-                // #106688646: 1642 drops for the …911 net, where the ceil said
-                // 1643 and pulled a phantom drop out of the pool).
-                let xrp = (me_rescale(xrp, 0, !a_use_amm), 0);
+                // Whole drops for the mid-leg. The ceil is the calibrated
+                // default — a BOOK maker charges for the whole drop
+                // (#105663160 below), and an OUT-limited pass sizes by
+                // `ceil_out`, which rounds the in side UP for pool legs too
+                // (#106674447 2049BE47 buys exactly 1.0 RLUSD; flooring its
+                // pool mid broke six nodes and win98). ONLY the IN-EXHAUSTED
+                // pool slice floors: rippled's in-limited fwd rounds the swap
+                // output DOWN and the pool keeps the fraction (F51,
+                // #106688646: 1642 drops for the …911 net, where the ceil
+                // said 1643 and pulled a phantom drop out of the pool).
+                let xrp = (me_rescale(xrp, 0, !(a_use_amm && in_exhausted)), 0);
                 // ...and REPRICE leg A for it. `gets_in` above was computed
                 // from the FRACTIONAL xrp; rounding the mid-leg up to whole
                 // drops without redoing that leaves leg A buying a whole drop
@@ -3482,13 +3486,14 @@ thr={t:?} admits_trunc={} admits_up={}",
                     // reprice must not push the pass past what the taker has.
                     if me_cmp(repriced, rem_gets).is_gt() { rem_gets } else { repriced }
                 };
-                // Leg B consumes the WHOLE-drop mid, not the fractional value
-                // it was first priced from (F51's rider on #106688646: 1642
-                // drops at the filed rate is 0.002271007836142991 where the
-                // fractional 1642.578… priced 0.002271807732519948). An
-                // out-side clamp fixed `pays_out` canonically and re-derived
-                // the mid from it — those stay untouched.
-                if !out_clamped {
+                // The IN-EXHAUSTED slice's leg B consumes the WHOLE-drop mid,
+                // not the fractional value it was first priced from (F51's
+                // rider on #106688646: 1642 drops at the filed rate is
+                // 0.002271007836142991 where the fractional 1642.578… priced
+                // 0.002271807732519948). Scoped to the exhausting slice: an
+                // out-side clamp fixed `pays_out` canonically, and every
+                // other pass keeps its calibrated pre-F51 pricing.
+                if in_exhausted && !out_clamped {
                     pays_out = rp_b(xrp, b_price(xrp), sandbox);
                 }
                 if std::env::var("DX_BRIDGE").is_ok() {
