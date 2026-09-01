@@ -1228,8 +1228,12 @@ fn payout_proportional_to(
         // still floors the XRP side to zero → tecAMM_FAILED). One rule,
         // all modes: frac = divide(tokensAdj, lptAMMBalance) under Number
         // nearest, products DOWNWARD (getRoundedAsset, IsDeposit::No).
+        // F61: this `frac` is rippled's STAmount `divide(tokensAdj,
+        // lptAMMBalance, noIssue())` (AMMWithdraw.cpp:797), which carries the
+        // legacy +5 into Number's nearest canonicalisation — not the `Number`
+        // division of the two-asset paths. See `st_divide_legacy`.
         let _ = withdraw_all;
-        let frac = ox::st_divide(tokens, total_lp, false);
+        let frac = ox::st_divide_legacy(tokens, total_lp);
         let share = mul_directed(pool, frac, false, leg.xrp);
         if std::env::var("DX_AMMWD").is_ok() {
             eprintln!(

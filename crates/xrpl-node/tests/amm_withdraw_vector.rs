@@ -80,3 +80,82 @@ fn withdraw_all_line_is_byte_exact() {
         );
     }
 }
+
+fn hydrate(state: &mut LedgerState, key_hex: &str, entry_hex: &str) {
+    let bytes = hex::decode(entry_hex.trim()).unwrap();
+    let mut jv = xrpl_core::codec::decode::decode_transaction_binary(&bytes).unwrap();
+    hexify_addresses(&mut jv);
+    state
+        .state_map
+        .insert(key32(key_hex), serde_json::to_vec(&jv).unwrap())
+        .unwrap();
+}
+
+fn run_bundle(bundle_json: &str) {
+    let bundle: Value = serde_json::from_str(bundle_json).unwrap();
+    let seq = bundle["seq"].as_u64().unwrap() as u32;
+    let pct = bundle["parent_close_time"].as_u64().unwrap() as u32;
+    let header = LedgerHeader {
+        sequence: seq - 1,
+        total_coins: bundle["total_coins"].as_u64().unwrap(),
+        parent_hash: key32(bundle["parent_hash"].as_str().unwrap()),
+        transaction_hash: Hash256([0; 32]),
+        account_hash: Hash256([0; 32]),
+        parent_close_time: pct,
+        close_time: pct,
+        close_time_resolution: 10,
+        close_flags: 0,
+    };
+    let mut state = LedgerState::new_unverified(header);
+    for (k, v) in bundle["pre"].as_object().unwrap() {
+        hydrate(&mut state, k, v.as_str().unwrap());
+    }
+
+    let tx = &bundle["tx"];
+    let tx_hash = tx["hash"].as_str().unwrap();
+    let txf = build_txfields(tx).expect("txfields");
+    let (ter, mut mods) = native_apply_one(&state, &txf);
+    assert_eq!(ter, "tesSUCCESS", "mainnet applied this AMMWithdraw");
+
+    xrpl_ledger::ledger::threading::stamp_threading(
+        &mut mods,
+        &|k| state.state_map.lookup(k).map(|b| b.to_vec()),
+        tx_hash,
+        seq,
+    );
+
+    for (k, want_hex) in bundle["expect"].as_object().unwrap() {
+        let ent = mods
+            .get(&key32(k))
+            .unwrap_or_else(|| panic!("target {k} must be written by the apply"));
+        let bytes = match ent {
+            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => b.clone(),
+            SandboxEntry::Deleted => panic!("target {k} deleted?"),
+        };
+        let mut jv: Value = serde_json::from_slice(&bytes).unwrap();
+        canon_for_encode(&mut jv);
+        let enc = xrpl_core::codec::encode::encode_transaction_json(&jv, false).unwrap();
+        let want = hex::decode(want_hex.as_str().unwrap().trim()).unwrap();
+        assert_eq!(
+            hex::encode_upper(&enc),
+            hex::encode_upper(&want),
+            "target {k} must byte-match the mainnet post-state"
+        );
+    }
+}
+
+/// F61's regression guard (#106696548 9FEB2A66, tfWithdrawAll BCFT/XRP —
+/// two 211-byte PRE-OK line diffs in the live shadow right after the F45-F58
+/// deploy). The LP's 10588450.34004458 tokens against a supply of
+/// 94636650.79668728 is a fraction of 0.11188530290227921591…: every
+/// nearest rule gives …792 and the withdrawer lands 9762090.561664651,
+/// eight ulps under mainnet's 9762090.561664659. rippled's `divide` hands
+/// the STAmount constructor the truncated 17-digit quotient PLUS 5, and
+/// under fixUniversalNumber that constructor canonicalises through Number
+/// to_nearest — so 11188530290227921 + 5 → …7926 → …793, and the product
+/// rounded downward (getRoundedAsset, IsDeposit::No) is mainnet's share.
+#[test]
+fn withdraw_all_fraction_carries_divides_legacy_bias_is_byte_exact() {
+    run_bundle(include_str!("vectors/amm_withdraw_frac_106696548.json"));
+}
+

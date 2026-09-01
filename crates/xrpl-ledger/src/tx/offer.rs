@@ -1391,8 +1391,12 @@ fn div_nearest_16(num: u128, den: u128, e: i32) -> Me {
     (m, e)
 }
 
-/// rippled `divide(num, den, issue)` under Number semantics: exact quotient
-/// rounded half-even at 16 digits (drops for XRP).
+/// rippled `Number / Number` (and `Number{amount} / balance`): the exact
+/// quotient rounded half-even at 16 digits (drops for XRP). This is the
+/// fraction of `equalDepositLimit` / `equalWithdrawLimit` / AMMClawback
+/// (`Number{amount} / amountBalance`, `adjustFracByTokens`'s
+/// `tokens / lptAMMBalance`) — NOT of rippled's STAmount `divide()`, which
+/// is `st_divide_legacy` below.
 pub(crate) fn st_divide(num: Me, den: Me, xrp: bool) -> Me {
     if num.0 == 0 || den.0 == 0 {
         return (0, 0);
@@ -1405,6 +1409,30 @@ pub(crate) fn st_divide(num: Me, den: Me, xrp: bool) -> Me {
     } else {
         div_nearest_16(nm * 100_000_000_000_000_000u128, dm, ne - de - 17)
     }
+}
+
+/// rippled STAmount `divide(num, den, issue)` (STAmount.cpp): the TRUNCATED
+/// `muldiv(num, 10^17, den)` quotient — 17 or 18 digits — plus the legacy
+/// half-up bias of 5, handed to the STAmount constructor. Under
+/// fixUniversalNumber `canonicalize()` is `*this = iou()`: the 17/18-digit
+/// mantissa is normalised to 16 by Number under the AMBIENT rounding mode
+/// (to_nearest, half-even), so the +5 that once meant "round half up, then
+/// truncate" now rounds the quotient UP whenever its 17th digit is 1-9 and
+/// half-even only when it is 0. Used where rippled calls `divide()` on two
+/// STAmounts: `equalWithdrawTokens` (AMMWithdraw.cpp:797) and
+/// `equalDepositTokens` (AMMDeposit.cpp:663). #106696548 9FEB2A66 (finding
+/// 61, tfWithdrawAll BCFT/XRP): tokens/lptAMMBalance = 0.11188530290227921591…
+/// — every nearest rule gives …792, mainnet's share needs …793, and
+/// 11188530290227921 + 5 → …7926 → Number-nearest → …793 is the only path
+/// to it. The tfTwoAsset deposit/withdraw fractions are `Number` divisions
+/// (`st_divide`) and keep the exact quotient.
+pub(crate) fn st_divide_legacy(num: Me, den: Me) -> Me {
+    if num.0 == 0 || den.0 == 0 {
+        return (0, 0);
+    }
+    let (nm, ne) = norm16(num);
+    let (dm, de) = norm16(den);
+    div_nearest_16(nm * 100_000_000_000_000_000u128 / dm + 5, 1, ne - de - 17)
 }
 
 /// rippled `multiply(v1, v2, issue)` under Number semantics: exact product
