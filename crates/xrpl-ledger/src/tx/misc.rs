@@ -505,33 +505,6 @@ impl Transactor for ClawbackTransactor {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Stub transactors for less common / newer transaction types.
-// These do fee deduction (via apply_common) but skip type-specific effects.
-// The tx_engine verifies them via generic fee verification.
-// ---------------------------------------------------------------------------
-
-macro_rules! stub_transactor {
-    ($name:ident, $tx_type:expr) => {
-        pub struct $name;
-        impl Transactor for $name {
-            fn preflight(&self, tx: &TxFields) -> TxResult {
-                if tx.tx_type != $tx_type { return TxResult::Malformed; }
-                if tx.fee == 0 { return TxResult::BadFee; }
-                TxResult::Success
-            }
-            fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
-                let k = keylet::account_root_key(&tx.account);
-                if !sandbox.exists(&k) { return TxResult::NoAccount; }
-                TxResult::Success
-            }
-            fn do_apply(&self, _tx: &TxFields, _sandbox: &mut Sandbox) -> TxResult {
-                TxResult::Success
-            }
-        }
-    };
-}
-
 
 #[cfg(test)]
 mod tests {

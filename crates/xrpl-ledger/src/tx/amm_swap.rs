@@ -278,7 +278,8 @@ fn n_sqrt_rnd(x: Me, rnd: Rnd) -> Me {
     if r.0 == 0 {
         return (0, 0);
     }
-    let (mut rm1, mut rm2): (Me, Me) = ((0, 0), (0, 0));
+    let mut rm1: Me = (0, 0);
+    let mut rm2: Me;
     // The C++ loop is do/while, and its guard is `r != rm1 && r != rm2` — it
     // halts on a fixed point OR on a two-cycle (the "bouncing" its comment
     // names). The bound is a safety net; it converges in a handful of steps.

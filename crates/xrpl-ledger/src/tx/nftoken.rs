@@ -10,7 +10,7 @@
 //! each offer lives in BOTH its owner's directory and the token's buy/sell
 //! offer directory.
 
-use crate::ledger::directory::{dir_insert, dir_remove, owner_dir_insert, owner_dir_remove};
+use crate::ledger::directory::{dir_remove, owner_dir_insert, owner_dir_remove};
 use crate::ledger::keylet;
 use crate::ledger::nftpage;
 use crate::ledger::sandbox::Sandbox;
@@ -1135,7 +1135,7 @@ fn pay_iou_with_transfer_fee(
     // buyer-to-self send (buyer == NFT issuer collecting their own
     // royalty) is a no-op, though the seller still parts with the cut.
     let rate = ox::transfer_rate(sandbox, &leg);
-    let mut send = |sandbox: &mut Sandbox, to: &[u8; 20], net: crate::tx::offer::Me| {
+    let send = |sandbox: &mut Sandbox, to: &[u8; 20], net: crate::tx::offer::Me| {
         if net.0 == 0 || to == buyer {
             return;
         }

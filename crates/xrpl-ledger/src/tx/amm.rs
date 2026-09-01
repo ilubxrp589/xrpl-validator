@@ -19,7 +19,6 @@
 use crate::ledger::keylet;
 use crate::ledger::sandbox::Sandbox;
 use crate::ledger::transactor::{Transactor, TxFields, TxResult};
-use crate::shamap::hash::sha512_half;
 
 /// Compute a deterministic key for an AMM instance.
 /// AMM key = SHA512Half(0x0041 || issue1_currency(20) || issue1_issuer(20) || issue2_currency(20) || issue2_issuer(20))
