@@ -394,6 +394,91 @@ fn round16_nearest(m: crate::tx::offer::Me) -> crate::tx::offer::Me {
     (q, e)
 }
 
+/// fixAMMv1_1 `verifyAndAdjustLPTokenBalance` (AMMUtils.cpp), run by
+/// AMMWithdraw before anything is sized: the last LP's trust line and the
+/// AMM's LPTokenBalance drift apart by rounding dust over the pool's life,
+/// so when the withdrawer is the ONLY liquidity provider — no other
+/// account holds an LPToken line in the AMM account's owner directory
+/// (`isOnlyLiquidityProvider`) — the object's LPTokenBalance is snapped to
+/// the LP's line balance, provided the two are within 1e-3 relative
+/// distance (`withinRelativeDistance`, else tecAMM_INVALID_TOKENS).
+///
+/// #106696868 DFC7A0F4 (finding 63, tfTwoAsset by the sole LP): the line
+/// held 507670.4691518975 against an object balance of 507670.469151897.
+/// Sized from the object, every step — tokens UP, adjustLPTokens, SCRATCH
+/// DOWN — lands one ulp off (…392 for …394 tokens, …620 for …619
+/// SCRATCH) and the object and line end 5 ulps apart (…578 / …583);
+/// snapped first, both end at mainnet's …581.
+fn verify_and_adjust_lp_token_balance(
+    sandbox: &mut Sandbox,
+    amm_key: &xrpl_core::types::Hash256,
+    amm_acct: &[u8; 20],
+    lp: &[u8; 20],
+    lp_leg: &crate::tx::offer::Leg,
+    lp_tokens: crate::tx::offer::Me,
+) -> Result<(), TxResult> {
+    use crate::tx::offer as ox;
+    // isOnlyLiquidityProvider: any LPToken line in the AMM's owner
+    // directory whose other party is not this LP is another LP.
+    let dir_root = keylet::owner_dir_key(amm_acct);
+    let mut page_key = dir_root;
+    let lp_cur = hex::encode_upper(lp_leg.cur);
+    for _ in 0..1000 {
+        let Some(page) = ox::json_at(sandbox, &page_key) else { break };
+        for idx in page.get("Indexes").and_then(|v| v.as_array()).into_iter().flatten() {
+            let Some(k) = idx
+                .as_str()
+                .and_then(|s| hex::decode(s).ok())
+                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+            else {
+                continue;
+            };
+            let Some(obj) = ox::json_at(sandbox, &xrpl_core::types::Hash256(k)) else { continue };
+            if obj["LedgerEntryType"].as_str() != Some("RippleState") {
+                continue;
+            }
+            if !obj["LowLimit"]["currency"].as_str().unwrap_or("").eq_ignore_ascii_case(&lp_cur) {
+                continue;
+            }
+            let low = obj["LowLimit"]["issuer"].as_str().and_then(ox::decode20);
+            let high = obj["HighLimit"]["issuer"].as_str().and_then(ox::decode20);
+            if low != Some(*lp) && high != Some(*lp) {
+                return Ok(()); // another LP holds LPTokens: no snap
+            }
+        }
+        let next = page
+            .get("IndexNext")
+            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| u64::from_str_radix(s, 16).ok())))
+            .unwrap_or(0);
+        if next == 0 {
+            break;
+        }
+        page_key = keylet::dir_page_key(&dir_root, next);
+    }
+    let Some(mut obj) = ox::json_at(sandbox, amm_key) else { return Ok(()) };
+    let Some(cur) = obj["LPTokenBalance"]["value"]
+        .as_str()
+        .and_then(|v| keylet::amount_mant_exp(&serde_json::Value::String(v.to_string())))
+    else {
+        return Ok(());
+    };
+    if ox::me_cmp(cur, lp_tokens).is_eq() {
+        return Ok(());
+    }
+    // withinRelativeDistance: (max - min) / max < 1e-3
+    let (lo, hi) = if ox::me_cmp(cur, lp_tokens).is_lt() { (cur, lp_tokens) } else { (lp_tokens, cur) };
+    let ratio = ox::st_divide(ox::me_sub(hi, lo), hi, false);
+    if !ox::me_cmp(ratio, (1_000_000_000_000_000, -18)).is_lt() {
+        return Err(TxResult::AmmInvalidTokens);
+    }
+    if std::env::var("DX_AMMWD").is_ok() {
+        eprintln!("DX_AMMWD only-LP snap: LPTokenBalance {cur:?} -> line {lp_tokens:?}");
+    }
+    obj["LPTokenBalance"]["value"] = serde_json::Value::String(ox::me_to_value_string(lp_tokens));
+    ox::put_json(sandbox, *amm_key, &obj);
+    Ok(())
+}
+
 /// Adjust the AMM object's LPTokenBalance value (magnitude only — parity
 /// compares keys; the oracle corrects the number downstream).
 fn bump_lp_balance(
@@ -1316,6 +1401,13 @@ impl Transactor for AMMWithdrawTransactor {
         let lp_held = crate::tx::amm_swap::holds(sandbox, &tx.account, &lp_leg);
         if ox::me_is_zero(lp_held) {
             return TxResult::AmmBalance;
+        }
+        // fixAMMv1_1: the sole LP's line is the LPTokenBalance of record.
+        if let Err(e) =
+            verify_and_adjust_lp_token_balance(sandbox, &amm_key, &amm_acct, &tx.account, &lp_leg, lp_held)
+        {
+            sandbox.restore_snapshot(snap);
+            return e;
         }
         if let Some(want) = tx.fields.get("LPTokenIn").and_then(keylet::amount_mant_exp) {
             if ox::me_cmp(want, lp_held).is_gt() {

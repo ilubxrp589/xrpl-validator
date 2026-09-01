@@ -159,3 +159,16 @@ fn withdraw_all_fraction_carries_divides_legacy_bias_is_byte_exact() {
     run_bundle(include_str!("vectors/amm_withdraw_frac_106696548.json"));
 }
 
+/// F63's regression guard (#106696868 DFC7A0F4, tfTwoAsset CHICKEN/SCRATCH
+/// by the pool's ONLY LP — four 211/324-byte PRE-OK diffs in the live
+/// shadow after the F45-F58 deploy). The LP's line holds 507670.4691518975
+/// against an object LPTokenBalance of 507670.469151897: rounding dust of
+/// the pool's life. fixAMMv1_1 `verifyAndAdjustLPTokenBalance` snaps the
+/// object to the line before anything is sized (isOnlyLiquidityProvider
+/// walks the AMM's owner directory; 1e-3 relative distance). Sized from the
+/// object instead, tokens land …392 for …394, SCRATCH …620 for …619, and
+/// the object and line end five ulps apart where mainnet's agree at …581.
+#[test]
+fn only_lp_withdraw_snaps_the_object_to_the_line_is_byte_exact() {
+    run_bundle(include_str!("vectors/amm_withdraw_onlylp_106696868.json"));
+}
