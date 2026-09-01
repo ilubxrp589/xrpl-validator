@@ -431,6 +431,27 @@ def main():
         except Exception:
             pass
 
+    # The sender's OWN trust lines for every currency the tx names — read by
+    # preclaim (auth: checkAcceptAsset on TakerPays; funds: accountFunds on
+    # TakerGets / SendMax) and never written by a tec (fee-only) result, so
+    # a tec specimen's meta cannot surface them. #106698333 314D2290
+    # (tecNO_AUTH) probed tecNO_LINE without the taker's GTA6 line.
+    for f_ in ("TakerPays", "TakerGets", "Amount", "SendMax", "DeliverMin", "Amount2", "LimitAmount"):
+        v = tx.get(f_)
+        if not isinstance(v, dict) or not v.get("issuer") or v.get("currency") == "XRP":
+            continue
+        try:
+            rr = rpc("ledger_entry", {
+                "ripple_state": {"currency": v["currency"], "accounts": [tx["Account"], v["issuer"]]},
+                "ledger_index": seq - 1, "binary": True,
+            })
+            li = (rr.get("index") or "").upper()
+            if rr.get("node_binary") and li and li not in pre:
+                pre[li] = rr["node_binary"]
+            accts.add(v["issuer"])
+        except Exception:
+            pass
+
     # An OfferCreate READS book heads it never writes: the direct book's tip
     # prices strand admission (multi-strand vs single), and the two XRP
     # bridge legs compete with it — a bundle without them walks a different

@@ -60,7 +60,10 @@ fn run_bundle(bundle_json: &str) {
     let tx_hash = tx["hash"].as_str().unwrap();
     let txf = build_txfields(tx).expect("txfields");
     let (ter, mut mods) = native_apply_one(&state, &txf);
-    assert_eq!(ter, "tesSUCCESS", "mainnet applied this OfferCreate");
+    // The bundle carries the ledger's verdict ("result"); a tec pin compares
+    // the fee-only root exactly like a success pin compares its targets.
+    let want_ter = bundle["result"].as_str().unwrap_or("tesSUCCESS");
+    assert_eq!(ter, want_ter, "mainnet's result for this OfferCreate");
 
     xrpl_ledger::ledger::threading::stamp_threading(
         &mut mods,
@@ -134,4 +137,14 @@ fn offer_fill_out_limited_bridge_under_armed_cap_is_byte_exact() {
 #[test]
 fn offer_fill_funds_limited_bridge_leg_floors_the_mid_leg_is_byte_exact() {
     run_bundle(include_str!("vectors/offer_bridge_funds_106696774.json"));
+}
+
+/// F67's regression guard (#106698333 314D2290): an OfferCreate buying GTA6
+/// from a RequireAuth issuer (rhgbv9S3…) with a trust line the issuer has
+/// not authorized. CreateOffer::preclaim's checkAcceptAsset on the TakerPays
+/// side refuses with tecNO_AUTH (fee only); we crossed it. The pinned
+/// target is the sender's fee-only root.
+#[test]
+fn offer_create_unauthorized_taker_pays_line_is_tec_no_auth() {
+    run_bundle(include_str!("vectors/offer_noauth_106698333.json"));
 }

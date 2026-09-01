@@ -5411,6 +5411,33 @@ impl Transactor for OfferCreateTransactor {
             }
         }
 
+        // checkAcceptAsset on the TakerPays side, AFTER expiry (CreateOffer.cpp
+        // preclaim :63 → :236-300): the issuer must exist (tecNO_ISSUER) and,
+        // under its lsfRequireAuth, the taker must hold a line (tecNO_LINE)
+        // carrying the ISSUER-side auth bit (tecNO_AUTH) — the issuer's own
+        // issuance always passes. #106698333 314D2290 (finding 67): a taker
+        // buying GTA6 from a RequireAuth issuer with an unauthorized line
+        // crossed here where mainnet refused with tecNO_AUTH.
+        if let Some(pays) = leg_of(&tx.fields["TakerPays"]) {
+            if !pays.xrp && pays.issuer != tx.account {
+                const LSF_REQUIRE_AUTH: u64 = 0x0004_0000; // AccountRoot
+                const LSF_LOW_AUTH: u64 = 0x0004_0000; // RippleState
+                const LSF_HIGH_AUTH: u64 = 0x0008_0000; // RippleState
+                let Some(iss) = json_at(sandbox, &keylet::account_root_key(&pays.issuer)) else {
+                    return TxResult::NoIssuer;
+                };
+                if iss["Flags"].as_u64().unwrap_or(0) & LSF_REQUIRE_AUTH != 0 {
+                    let lkey = keylet::ripple_state_key(&tx.account, &pays.issuer, &pays.cur);
+                    let Some(line) = json_at(sandbox, &lkey) else {
+                        return TxResult::NoLine;
+                    };
+                    let auth_bit = if pays.issuer < tx.account { LSF_LOW_AUTH } else { LSF_HIGH_AUTH };
+                    if line["Flags"].as_u64().unwrap_or(0) & auth_bit == 0 {
+                        return TxResult::NoAuth;
+                    }
+                }
+            }
+        }
         TxResult::Success
     }
 
