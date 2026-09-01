@@ -930,22 +930,37 @@ pub(crate) fn discover(sandbox: &Sandbox, spend: &Leg, want: &Leg, taker: &[u8; 
     if ox::require_auth_known(sandbox, spend, &account) == Some(false) {
         return None;
     }
+    let tfee = effective_trading_fee(sandbox, &obj, taker);
+    Some(Amm { account, tfee })
+}
+
+/// rippled `getTradingFee(view, ammSle, account)` (AMMUtils.cpp:179-205):
+/// the pool's TradingFee, or the AuctionSlot's DiscountedFee while the
+/// slot is unexpired (`parentCloseTime < Expiration`) and `account` holds
+/// it or is one of its AuthAccounts. Every AMM transactor that sizes by
+/// fee reads THIS — BookStep's swap (via `discover`), AMMDeposit
+/// (AMMDeposit.cpp:393) and AMMWithdraw (AMMWithdraw.cpp:322) alike.
+/// #106698295 337D655A (finding 66): the slot holder's single-asset deposit
+/// of 970,200,000 Gta6 into a 9,800,000 pool at fee 810 minted
+/// 198,490,216 here against mainnet's 199,218,449 — Equation 3 at the
+/// discounted 81, to all sixteen digits.
+pub(crate) fn effective_trading_fee(sandbox: &Sandbox, obj: &serde_json::Value, account: &[u8; 20]) -> u16 {
     let mut tfee = obj.get("TradingFee").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
     if let Some(slot) = obj.get("AuctionSlot") {
         let expires = slot.get("Expiration").and_then(|v| v.as_u64()).unwrap_or(0);
         let close = sandbox.base().header.close_time as u64;
         if expires > close {
-            let taker_hex = hex::encode(taker);
+            let account_hex = hex::encode(account);
             let mut in_slot = slot
                 .get("Account")
                 .and_then(|v| v.as_str())
-                .map(|a| a.eq_ignore_ascii_case(&taker_hex))
+                .map(|a| a.eq_ignore_ascii_case(&account_hex))
                 .unwrap_or(false);
             if let Some(auth) = slot.get("AuthAccounts").and_then(|v| v.as_array()) {
                 for a in auth {
                     if a["AuthAccount"]["Account"]
                         .as_str()
-                        .map(|x| x.eq_ignore_ascii_case(&taker_hex))
+                        .map(|x| x.eq_ignore_ascii_case(&account_hex))
                         .unwrap_or(false)
                     {
                         in_slot = true;
@@ -957,7 +972,7 @@ pub(crate) fn discover(sandbox: &Sandbox, spend: &Leg, want: &Leg, taker: &[u8; 
             }
         }
     }
-    Some(Amm { account, tfee })
+    tfee
 }
 
 /// Pool balance of `leg` held by the AMM account (rippled ammAccountHolds:

@@ -932,7 +932,8 @@ impl Transactor for AMMDepositTransactor {
                 let lpt = keylet::amount_mant_exp(&serde_json::Value::String(
                     obj["LPTokenBalance"]["value"].as_str()?.to_string(),
                 ))?;
-                let tfee = obj["TradingFee"].as_u64().unwrap_or(0) as u16;
+                // F66: the slot holder deposits at the DISCOUNTED fee (getTradingFee).
+                let tfee = crate::tx::amm_swap::effective_trading_fee(sandbox, &obj, &tx.account);
                 let xrp = tx.fields.get("Amount").and_then(ox::leg_of).map(|l| l.xrp)?;
                 let t0 = crate::tx::amm_swap::adjust_lp_tokens(
                     lpt,
@@ -1449,9 +1450,10 @@ impl Transactor for AMMWithdrawTransactor {
                 if let Some(v) = tx.fields.get("Amount") {
                     if let Some(leg) = ox::leg_of(v) {
                         let bal = crate::tx::amm_swap::holds(sandbox, &amm_acct, &leg);
+                        // F66: the slot holder withdraws at the DISCOUNTED fee (getTradingFee).
                         let tfee = ox::json_at(sandbox, &amm_key)
-                            .and_then(|o| o["TradingFee"].as_u64())
-                            .unwrap_or(0) as u16;
+                            .map(|o| crate::tx::amm_swap::effective_trading_fee(sandbox, &o, &tx.account))
+                            .unwrap_or(0);
                         if let Some(out) =
                             crate::tx::amm_swap::amm_asset_out(bal, total_lp, lp_bal, tfee, leg.xrp)
                         {
@@ -1531,9 +1533,10 @@ impl Transactor for AMMWithdrawTransactor {
                 let total_lp = ox::json_at(sandbox, &amm_key)
                     .and_then(|o| o["LPTokenBalance"]["value"].as_str().map(str::to_string))
                     .and_then(|t| keylet::amount_mant_exp(&serde_json::Value::String(t)))?;
+                // F66: the slot holder withdraws at the DISCOUNTED fee (getTradingFee).
                 let tfee = ox::json_at(sandbox, &amm_key)
-                    .and_then(|o| o["TradingFee"].as_u64())
-                    .unwrap_or(0) as u16;
+                    .map(|o| crate::tx::amm_swap::effective_trading_fee(sandbox, &o, &tx.account))
+                    .unwrap_or(0);
                 // `singleWithdraw` (AMMWithdraw.cpp:969) does NOT burn what
                 // `lpTokensIn` returns, nor pay out the requested `Amount`:
                 //   tokens = adjustLPTokensIn(lpt, lpTokensIn(...), withdrawAll)
@@ -1600,9 +1603,10 @@ impl Transactor for AMMWithdrawTransactor {
                 let v = tx.fields.get("Amount")?;
                 let leg = ox::leg_of(v)?;
                 let lpt = pool_lpt(sandbox)?;
+                // F66: the slot holder withdraws at the DISCOUNTED fee (getTradingFee).
                 let tfee = ox::json_at(sandbox, &amm_key)
-                    .and_then(|o| o["TradingFee"].as_u64())
-                    .unwrap_or(0) as u16;
+                    .map(|o| crate::tx::amm_swap::effective_trading_fee(sandbox, &o, &tx.account))
+                    .unwrap_or(0);
                 let tokens = crate::tx::amm_swap::adjust_lp_tokens(lpt, lp_in, false);
                 let out = crate::tx::amm_swap::amm_asset_out(
                     crate::tx::amm_swap::holds(sandbox, &amm_acct, &leg),
@@ -2734,10 +2738,13 @@ mod tests {
         };
         assert_eq!(AMMWithdrawTransactor.do_apply(&wd_tx, &mut sandbox), TxResult::Success);
 
-        // Balance: 60M + 5M = 65M
+        // Balance: 60M + the single-asset payout. alice created the pool, so
+        // she holds its auction slot and (F66, getTradingFee) deposits and
+        // withdraws at the DISCOUNTED fee 50, not 500 — the payout the burned
+        // tokens buy back rounds to 4,999,999 drops at that fee.
         let data = sandbox.read(&key).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&data).unwrap();
-        assert_eq!(v["Balance"].as_str().unwrap(), "65000000");
+        assert_eq!(v["Balance"].as_str().unwrap(), "64999999");
     }
 
     /// tfWithdrawAll redeems the LP's whole position and TEARS DOWN the LPToken
