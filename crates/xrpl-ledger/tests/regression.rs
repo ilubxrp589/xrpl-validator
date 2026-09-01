@@ -275,7 +275,9 @@ fn create_account_at_exact_reserve() {
 
     assert_eq!(results[0].result, TxResult::Success);
     assert_eq!(read_balance(&new_state, &newbie), 10_000_000);
-    assert_eq!(read_seq(&new_state, &newbie), 1);
+    // DeletableAccounts: a created account starts at the CREATING ledger's
+    // sequence (parent 100 → child 101), not 1.
+    assert_eq!(read_seq(&new_state, &newbie), 101);
 }
 
 // === New account below reserve fails ===
