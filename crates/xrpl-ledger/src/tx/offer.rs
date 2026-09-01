@@ -1174,6 +1174,46 @@ pub(crate) fn move_leg(sandbox: &mut Sandbox, from: &[u8; 20], to: &[u8; 20], le
 /// offer's funding at OwnerCount 23 (2060885); our inline delete said 22
 /// (2260885) — and each subsequent reap re-inflated the pot, so the walk
 /// milked six extra 200000-clips mainnet never took.
+/// F55 (#106693634 C3ECD3): what a maker can DELIVER on a rated out-leg.
+/// The owner pays the out-issuer's TransferRate ON TOP of what the taker
+/// receives — `ownerGives = mulRatio(ofrAmt.out, ofrOutRate, roundUp=false)`
+/// bounded by funds, so a funding-limited fill sizes on `funds / rate`,
+/// rounded DOWN: `stpAmt.out = mulRatio(ownerFunds, QUALITY_ONE, ofrOutRate,
+/// roundUp=false)` (BookStep.cpp:816-826). The maker held 7173.556608098586
+/// EVR at rate 1.002 and mainnet's book leg delivered 7159.238131834916 —
+/// we delivered the raw balance and split the fill 874,298 drops off.
+/// Parity when the owner or the strand destination IS the issuer. Zero and
+/// reap tests stay on the RAW funds — rippled reaps on ownerFunds itself.
+fn maker_out_rate(sandbox: &Sandbox, leg: &Leg, maker: &[u8; 20], beneficiary: &[u8; 20]) -> Option<u64> {
+    transfer_rate(sandbox, leg).filter(|_| maker != &leg.issuer && beneficiary != &leg.issuer)
+}
+
+fn deliverable(
+    sandbox: &Sandbox,
+    maker: &[u8; 20],
+    leg: &Leg,
+    beneficiary: &[u8; 20],
+    funds: Me,
+) -> Me {
+    match maker_out_rate(sandbox, leg, maker, beneficiary) {
+        Some(r) => mul_ratio(funds, 1_000_000_000, r as u128, false),
+        None => funds,
+    }
+}
+
+/// The maker's DEBIT for a fill delivering `give`: `ownerGives =
+/// mulRatio(out, ofrOutRate, roundUp=false)`, except the funding-CLAMPED
+/// fill where ownerGives is the raw funds VERBATIM (the clamp sets it
+/// first and derives the out from it) — #106693634's maker line drains to
+/// exact zero while the taker receives funds/rate.
+fn owner_gives(orate: Option<u64>, give: Me, funded_sized: Me, funded_raw: Me) -> Me {
+    match orate {
+        None => give,
+        Some(_) if !me_cmp(give, funded_sized).is_lt() => funded_raw,
+        Some(r) => mul_ratio(give, r as u128, 1_000_000_000, false),
+    }
+}
+
 fn walk_available(
     sandbox: &Sandbox,
     maker: &[u8; 20],
@@ -2045,10 +2085,14 @@ fn settle_fill(
     // issuer's transfer fee, which the issuer destroys. Equal to `pay` where
     // no rate applies. See `move_leg_gross`.
     pay_gross: Me,
+    // What the MAKER parts with on the pays leg — `give` plus the OUT
+    // issuer's transfer fee (`ownerGives`, F55). Equal to `give` where no
+    // rate applies.
+    give_gross: Me,
     gives0: Me,
     wants0: Me,
 ) {
-    move_leg(sandbox, maker, to_beneficiary, pays_leg, give);
+    move_leg_gross(sandbox, maker, to_beneficiary, pays_leg, give, give_gross);
     move_leg_gross(sandbox, from_taker, maker, gets_leg, pay, pay_gross);
     let funded = available(sandbox, maker, pays_leg);
     let consumed = me_cmp(give, gives0).is_ge() || me_is_zero(funded);
@@ -2745,7 +2789,8 @@ thr={t:?} admits_trunc={} admits_up={}",
         // Both estimates come from the non-mutating peeks, mirroring the sizing
         // the execution branches do, so those branches stay untouched.
         let est_direct = dpeek.as_ref().and_then(|(_, _, _, maker, gives0, wants0)| {
-            let funded = available(sandbox, maker, pays_leg);
+            let funded =
+                deliverable(sandbox, maker, pays_leg, beneficiary, available(sandbox, maker, pays_leg));
             let m_gives = if me_cmp(funded, *gives0).is_lt() { funded } else { *gives0 };
             let mut give = if !sell && me_cmp(rem_pays, m_gives).is_lt() { rem_pays } else { m_gives };
             let mut pay = me_muldiv(give, *wants0, *gives0, true);
@@ -3160,7 +3205,12 @@ thr={t:?} admits_trunc={} admits_up={}",
                 let Some((q, okey, offer, maker, gives0, wants0)) =
                     live_head(sandbox, &ld, &mut di, taker, pays_leg, gets_leg, true, true, stale)
                 else { break 'attempt };
-                let funded = available(sandbox, &maker, pays_leg);
+                let funded_raw = available(sandbox, &maker, pays_leg);
+                let d_orate = maker_out_rate(sandbox, pays_leg, &maker, beneficiary);
+                let funded = match d_orate {
+                    Some(r) => mul_ratio(funded_raw, 1_000_000_000, r as u128, false),
+                    None => funded_raw,
+                };
                 let m_gives = if me_cmp(funded, gives0).is_lt() { funded } else { gives0 };
                 // PRICE A PARTIAL FILL AT THE FILED RATE — the rule `e2a9c99`
                 // gave the two bridge legs, which this third fill site inside
@@ -3231,8 +3281,9 @@ thr={t:?} admits_trunc={} admits_up={}",
                     _ => gross_in(fee_rate, pay),
                 };
                 in_gross_spent = stamount_signed_add(false, in_gross_spent, false, d_gross).1;
+                let give_gross = owner_gives(d_orate, give, funded, funded_raw);
                 settle_fill(sandbox, &okey, &offer, &maker, taker, beneficiary,
-                            pays_leg, gets_leg, give, pay, d_gross, gives0, wants0);
+                            pays_leg, gets_leg, give, pay, d_gross, give_gross, gives0, wants0);
                 // The taker's RUNNING remainder is an STAmount in rippled, so it
                 // re-rounds to 16 digits at EVERY subtraction. `me_sub` is
                 // exact, so ours accumulates precision rippled never has and
@@ -3422,8 +3473,15 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // finds the maker at zero and reaps BOTH offers — which is
                 // rippled's `Removing became unfunded offer 66B29DEB` — and
                 // walks on to the next maker's offer for the remainder.
+                let mut b_funding: Option<(Option<u64>, Me, Me)> = None;
                 if let Some((_, _, _, bmaker, _, _)) = &b_book {
-                    let funded = available(sandbox, bmaker, pays_leg);
+                    let funded_raw = available(sandbox, bmaker, pays_leg);
+                    let b_orate = maker_out_rate(sandbox, pays_leg, bmaker, beneficiary);
+                    let funded = match b_orate {
+                        Some(r) => mul_ratio(funded_raw, 1_000_000_000, r as u128, false),
+                        None => funded_raw,
+                    };
+                    b_funding = Some((b_orate, funded, funded_raw));
                     // What the leg-B head can ACTUALLY deliver at this moment.
                     // The walk's DEPTH turns on this: a head that is
                     // funding-limited forces the step onward to the next offer,
@@ -3521,7 +3579,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                                 hex::encode(akey.0), hex::encode(amaker));
                         }
                         settle_fill(sandbox, akey, aoffer, amaker, taker, taker,
-                                    &xrp_leg, gets_leg, xrp, gets_in, a_gross, *a_gives0, *a_wants0);
+                                    &xrp_leg, gets_leg, xrp, gets_in, a_gross, xrp, *a_gives0, *a_wants0);
                     }
                     (None, Some(_)) => {
                         crate::tx::amm_swap::apply_slice(
@@ -3546,8 +3604,12 @@ thr={t:?} admits_trunc={} admits_up={}",
                         if bmaker != taker {
                             fee_judged = true;
                         }
+                        let b_give_gross = match b_funding {
+                            Some((orate, fs, fr)) => owner_gives(orate, pays_out, fs, fr),
+                            None => pays_out,
+                        };
                         settle_fill(sandbox, bkey, boffer, bmaker, taker, beneficiary,
-                                    pays_leg, &xrp_leg, pays_out, xrp, xrp, *b_gives0, *b_wants0);
+                                    pays_leg, &xrp_leg, pays_out, xrp, xrp, b_give_gross, *b_gives0, *b_wants0);
                     }
                     (None, Some(_)) => {
                         crate::tx::amm_swap::apply_slice(
@@ -4431,20 +4493,27 @@ pub(crate) fn cross_engine_to_net(
                         }
                     }
                 }
-                let funded = walk_available(sandbox, &maker, pays_leg, Some(&mut oc0));
+                let funded_raw = walk_available(sandbox, &maker, pays_leg, Some(&mut oc0));
                 if std::env::var("DX_WALK").is_ok() {
                     eprintln!(
-                        "DX_WALK maker={} okey={} gives0={m_gives0:?} wants0={m_wants0:?} funded={funded:?} rem_pays={rem_pays:?} rem_gets={rem_gets:?}",
+                        "DX_WALK maker={} okey={} gives0={m_gives0:?} wants0={m_wants0:?} funded={funded_raw:?} rem_pays={rem_pays:?} rem_gets={rem_gets:?}",
                         hex::encode(maker),
                         hex::encode(okey.0),
                     );
                 }
-                if me_is_zero(funded) {
+                if me_is_zero(funded_raw) {
                     // Unfunded offers found during the walk are removed.
                     delete_maker_offer(sandbox, &okey, &offer, &maker);
                     stale.push(okey);
                     continue;
                 }
+                // Sizing sees the DELIVERABLE funds (F55); the reap above
+                // judged the raw balance.
+                let w_orate = maker_out_rate(sandbox, pays_leg, &maker, beneficiary);
+                let funded = match w_orate {
+                    Some(r) => mul_ratio(funded_raw, 1_000_000_000, r as u128, false),
+                    None => funded_raw,
+                };
                 // `step` applies the tiny-offer test to every offer it reaches,
                 // not just the ones ahead of the head (OfferStream.cpp:302).
                 if is_dust_offer(sandbox, &maker, m_wants0, m_gives0, pays_leg, gets_leg) {
@@ -4822,7 +4891,11 @@ pub(crate) fn cross_engine_to_net(
                 if pays_leg.xrp {
                     move_leg(sandbox, &maker, beneficiary, pays_leg, give);
                 } else {
-                    line_adjust(sandbox, &maker, pays_leg, give, false);
+                    // The maker parts with ownerGives (F55): give × outRate
+                    // rounded DOWN, or the raw funds VERBATIM on the
+                    // funding-clamped fill; the issuer destroys the surplus.
+                    let gg = owner_gives(w_orate, give, funded, funded_raw);
+                    line_adjust(sandbox, &maker, pays_leg, gg, false);
                     taker_accs.0 = stamount_signed_add(false, taker_accs.0, false, give).1;
                 }
                 // The taker pays the INPUT issuer's rate on top of what the
@@ -5450,6 +5523,10 @@ impl Transactor for OfferCreateTransactor {
         // consumes THAT budget, so the in-limited final fill takes the gross
         // remainder verbatim and derives its net by division. `send_max`
         // above is exactly that product. #106679738 DA3C22D8 (F50).
+        // ⚠ NOT armed fully-funded UNRATED: an XRP-in budget is integer
+        // drops — no 16-digit drift exists — and arming it fed cap−spent
+        // through the AMM-slice verbatim arms and broke a passing target
+        // on #106693634 (tried and reverted 09-01).
         let gross_cap = if underfunded {
             Some(avail)
         } else {
