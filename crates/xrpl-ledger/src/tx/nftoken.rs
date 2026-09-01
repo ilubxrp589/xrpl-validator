@@ -296,10 +296,25 @@ impl Transactor for NFTokenMintTransactor {
             return TxResult::Malformed;
         };
         let minted = iacct["MintedNFTokens"].as_u64().unwrap_or(0) as u32;
+        // First mint on this issuer: `sfFirstNFTokenSequence = acctSeq` when
+        // the tx names an Issuer (an authorized minter — the issuer's
+        // Sequence was never consumed) or spends a Ticket, else
+        // `acctSeq - 1` — the minter's own root has ALREADY been bumped
+        // past the tx's Sequence by the time doApply runs (NFTokenMint.cpp:
+        // 263-275, fixNFTokenRemint). #106697665 37030A48 (finding 64): a
+        // first self-mint at Sequence 106697663 landed FirstNFTokenSequence
+        // 106697664 here, and the NFTokenID's token sequence with it.
         let first = iacct["FirstNFTokenSequence"]
             .as_u64()
             .map(|v| v as u32)
-            .unwrap_or_else(|| iacct["Sequence"].as_u64().unwrap_or(0) as u32);
+            .unwrap_or_else(|| {
+                let acct_seq = iacct["Sequence"].as_u64().unwrap_or(0) as u32;
+                if tx.fields.get("Issuer").is_some() || tx.uses_ticket() {
+                    acct_seq
+                } else {
+                    acct_seq.wrapping_sub(1)
+                }
+            });
         let token_seq = first.wrapping_add(minted);
 
         let scramble = 384_160_001u32.wrapping_mul(token_seq).wrapping_add(2459);
