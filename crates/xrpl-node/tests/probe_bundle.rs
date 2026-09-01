@@ -43,7 +43,10 @@ fn probe_bundle() {
     let tx_hash = tx["hash"].as_str().unwrap();
     let txf = build_txfields(tx).expect("txfields");
     let (ter, mut mods) = native_apply_one(&state, &txf);
-    assert_eq!(ter, "tesSUCCESS", "mainnet applied this tx");
+    // The bundle carries the ledger's verdict (fetch_tx_bundle.py "result");
+    // older bundles without it were all tesSUCCESS specimens.
+    let want_ter = bundle["result"].as_str().unwrap_or("tesSUCCESS");
+    assert_eq!(ter, want_ter, "mainnet's result for this tx");
 
     xrpl_ledger::ledger::threading::stamp_threading(
         &mut mods,

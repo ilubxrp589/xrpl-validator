@@ -794,6 +794,9 @@ def main():
     tx.pop("metaData", None)
     bundle = {
         "tx": tx,
+        # The ledger's verdict — a tec specimen (fee-only) is pinned against
+        # THIS, not against tesSUCCESS (probe_bundle / run_bundle read it).
+        "result": meta.get("TransactionResult"),
         "tx_index_note": meta.get("TransactionIndex"),
         "seq": seq,
         "parent_hash": cur["parent_hash"],
