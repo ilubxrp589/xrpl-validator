@@ -119,3 +119,19 @@ fn offer_fill_cluster_is_byte_exact() {
 fn offer_fill_out_limited_bridge_under_armed_cap_is_byte_exact() {
     run_bundle(include_str!("vectors/offer_outlimit_106674447.json"));
 }
+
+/// F62's regression guard (#106696774 12AF1556 — the 183B@108 family: the
+/// XAH→RLUSD tfIoC bot through the XRP bridge, hot key 61C1E7D1, still
+/// bleeding after the F45-F60 deploy). Slice 1 crosses book leg A
+/// (A1A868D4) with a book leg B (8A50B0EF) whose maker holds only 0.32275
+/// of its 0.47025 RLUSD. rippled's BookStep sizes an owner-FUNDS-limited
+/// offer with `limitOut(…, roundUp=false)` (fixReducedOffersV1, "prevent
+/// order book blocking by strictly rounding down"), so the mid-leg XRP is
+/// floor(0.32275 × 348573 / 0.47025) = 239238 drops — the FFI trace's
+/// `accountSendIOU … 239238/XRP`. Our ceil paid 239239, and one drop's
+/// worth of XAH more on leg A: five nodes off, roots ±1 drop, both lines
+/// and the rested offer.
+#[test]
+fn offer_fill_funds_limited_bridge_leg_floors_the_mid_leg_is_byte_exact() {
+    run_bundle(include_str!("vectors/offer_bridge_funds_106696774.json"));
+}

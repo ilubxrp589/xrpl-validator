@@ -3518,6 +3518,9 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // rippled's `Removing became unfunded offer 66B29DEB` — and
                 // walks on to the next maker's offer for the remainder.
                 let mut b_funding: Option<(Option<u64>, Me, Me)> = None;
+                // F62: the owner-FUNDS clamp is the one out-limit rippled
+                // sizes with roundUp=false (below).
+                let mut b_funds_bound = false;
                 if let Some((_, _, _, bmaker, _, _)) = &b_book {
                     let funded_raw = available(sandbox, bmaker, pays_leg);
                     let b_orate = maker_out_rate(sandbox, pays_leg, bmaker, beneficiary);
@@ -3541,6 +3544,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                         out_clamped = true;
                         // Funding-limited is out-limited (see the out_cap clamp).
                         in_exhausted = false;
+                        b_funds_bound = true;
                     }
                 }
                 // DX_XRP: the bridged mid-leg is XRP and has to land on whole
@@ -3565,7 +3569,22 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // output DOWN and the pool keeps the fraction (F51,
                 // #106688646: 1642 drops for the …911 net, where the ceil
                 // said 1643 and pulled a phantom drop out of the pool).
-                let xrp = (me_rescale(xrp, 0, !(a_use_amm && in_exhausted)), 0);
+                //
+                // F62 (#106696774 12AF1556, the 183B@108 family — XAH→RLUSD
+                // tfIoC through the XRP bridge, hot key 61C1E7D1): when the
+                // leg-B BOOK maker's FUNDS are the binding limit, rippled's
+                // BookStep::forEachOffer sizes the offer with
+                // `limitOut(ofrAmt, stpAmt.out, /*roundUp*/ false)` — "we can
+                // prevent order book blocking by (strictly) rounding down the
+                // ceil_out() result" (fixReducedOffersV1, BookStep.cpp:822-829)
+                // — so its in, the mid-leg XRP, FLOORS: 0.32275 RLUSD of funds
+                // at 348573/0.47025 is 239238.59 drops, and mainnet pays the
+                // maker 239238 (FFI trace: `accountSendIOU … : 239238/XRP`);
+                // the ceil paid 239239 and bought one drop's worth of XAH more
+                // on leg A (…327795253 for …424787519). The remaining-out clamp
+                // (`limitStepOut`, :705-708) keeps roundUp=true — the 2049BE47
+                // calibration above stands.
+                let xrp = (me_rescale(xrp, 0, !(a_use_amm && in_exhausted) && !b_funds_bound), 0);
                 // ...and REPRICE leg A for it. `gets_in` above was computed
                 // from the FRACTIONAL xrp; rounding the mid-leg up to whole
                 // drops without redoing that leaves leg A buying a whole drop
