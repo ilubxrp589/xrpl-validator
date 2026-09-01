@@ -5529,8 +5529,20 @@ impl Transactor for OfferCreateTransactor {
         // on #106693634 (tried and reverted 09-01).
         let gross_cap = if underfunded {
             Some(avail)
+        } else if gets_leg.xrp {
+            // Integer drops: the in chain is exact and the verbatim arms
+            // would distort whole-drop debits (tried twice 09-01 — broke
+            // #106693634's account roots both times). XRP-in stays unarmed.
+            None
         } else {
-            xfer_in.map(|_| send_max)
+            // IOU in, fully funded: sendMax IS the budget — grossed when
+            // rated (F50) and AS-IS when unrated. #106693639 8B7AE3 sells
+            // TakerGets == its entire RLUSD balance across EIGHT iterations;
+            // rippled's per-iteration 16-digit chain lands the line on
+            // EXACT ZERO while our exact me_sub chain kept 6e-7. The
+            // exhausting fill takes the remainder verbatim (Finding 30's
+            // drain law, fully-funded flavor).
+            Some(send_max)
         };
         let (rem_pays, rem_gets_cross, crossed) = cross_engine_to_net(
             &tx.account, &tx.account, tp0, tg_cross, &pays_leg, &gets_leg, threshold,
@@ -5811,12 +5823,21 @@ impl Transactor for OfferCreateTransactor {
         // census: we stored 0x80000 and even 0x80000000 where mainnet has
         // 0x20000 / 0).
         let lsf_flags = (flags & 0x0001_0000) | if flags & 0x0008_0000 != 0 { 0x0002_0000 } else { 0 };
+        // What RESTS is an STAmount — 16-digit, always. The BRIDGED
+        // controller carries its remainders through exact me_sub (the
+        // direct walk's fold re-rounds; the bridge never did), and storing
+        // the raw carry wrote a 20-digit TakerPays the encoder refused:
+        // ENCODE-ERR #106694175 F6CD9285, value "273.15283573181998844"
+        // (InvalidAmount) — the self-documenting receipt's first catch.
+        let rest16 = |v: Me| -> Me {
+            crate::tx::amm_swap::round16(v.0, v.1, false, crate::tx::amm_swap::Rnd::Near)
+        };
         let mut offer_obj = serde_json::json!({
             "LedgerEntryType": "Offer",
             "Account": hex::encode(tx.account),
             "Sequence": seq,
-            "TakerPays": me_amount_json(&tp_json, rem_pays),
-            "TakerGets": me_amount_json(&tg_json, rem_gets),
+            "TakerPays": me_amount_json(&tp_json, rest16(rem_pays)),
+            "TakerGets": me_amount_json(&tg_json, rest16(rem_gets)),
             "Flags": lsf_flags,
             "OwnerNode": format!("{owner_node:x}"),
         });
