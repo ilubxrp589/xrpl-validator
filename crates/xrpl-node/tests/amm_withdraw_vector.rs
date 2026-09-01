@@ -115,7 +115,8 @@ fn run_bundle(bundle_json: &str) {
     let tx_hash = tx["hash"].as_str().unwrap();
     let txf = build_txfields(tx).expect("txfields");
     let (ter, mut mods) = native_apply_one(&state, &txf);
-    assert_eq!(ter, "tesSUCCESS", "mainnet applied this AMMWithdraw");
+    let want_ter = bundle["result"].as_str().unwrap_or("tesSUCCESS");
+    assert_eq!(ter, want_ter, "mainnet's result for this AMMWithdraw");
 
     xrpl_ledger::ledger::threading::stamp_threading(
         &mut mods,
@@ -171,4 +172,15 @@ fn withdraw_all_fraction_carries_divides_legacy_bias_is_byte_exact() {
 #[test]
 fn only_lp_withdraw_snaps_the_object_to_the_line_is_byte_exact() {
     run_bundle(include_str!("vectors/amm_withdraw_onlylp_106696868.json"));
+}
+
+/// F68's regression guard (#106699133 6B6670FD, one of five in a row from
+/// rh9vsQip…): tfOneAssetWithdrawAll of 40,500,694.89 of the pool's
+/// 140,528,763.31 LP tokens as XRP alone, with `Amount` 345.906940 XRP as
+/// the floor. rippled's singleWithdrawTokens pays only if ammAssetOut buys
+/// at least that floor — it does not, so mainnet recorded tecAMM_FAILED
+/// (fee only) where we paid the position out.
+#[test]
+fn one_asset_withdraw_all_under_its_amount_floor_is_tec_amm_failed() {
+    run_bundle(include_str!("vectors/amm_withdraw_floor_106699133.json"));
 }

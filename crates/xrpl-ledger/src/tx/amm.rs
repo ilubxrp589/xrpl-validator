@@ -1457,6 +1457,18 @@ impl Transactor for AMMWithdrawTransactor {
                         if let Some(out) =
                             crate::tx::amm_swap::amm_asset_out(bal, total_lp, lp_bal, tfee, leg.xrp)
                         {
+                            // singleWithdrawTokens (AMMWithdraw.cpp:1004-1016): the
+                            // LP's whole position must buy at least `Amount`
+                            // (`amount == 0 || amountWithdraw >= amount`), else
+                            // tecAMM_FAILED. #106699133 6B6670FD (finding 68):
+                            // 40.5M of 140.5M LP tokens as XRP alone against a
+                            // 345.906940 XRP floor — mainnet failed it five ledgers
+                            // running; we paid out.
+                            let floor = keylet::amount_mant_exp(v).unwrap_or((0, 0));
+                            if floor.0 > 0 && ox::me_cmp(out, floor).is_lt() {
+                                sandbox.restore_snapshot(snap);
+                                return TxResult::AmmFailed;
+                            }
                             if out.0 > 0 {
                                 ox::move_leg(sandbox, &amm_acct, &tx.account, &leg, out);
                             }
@@ -1593,6 +1605,8 @@ impl Transactor for AMMWithdrawTransactor {
         // tfOneAssetLPToken: LPTokenIn is what is burned and the AMOUNT is
         // DERIVED from it via `ammAssetOut` (`Amount` is only a minimum) —
         // rippled `singleWithdrawTokens` (AMMWithdraw.cpp:1020).
+        // F68: `Amount` is a FLOOR in this mode too (singleWithdrawTokens).
+        let mut one_asset_floor_unmet = false;
         let one_asset: Option<(ox::Me, ox::Me)> = if wd_sized.is_none() {
             (|| {
                 let lp_in = tx
@@ -1615,11 +1629,20 @@ impl Transactor for AMMWithdrawTransactor {
                     tfee,
                     leg.xrp,
                 )?;
+                let floor = keylet::amount_mant_exp(v).unwrap_or((0, 0));
+                if floor.0 > 0 && ox::me_cmp(out, floor).is_lt() {
+                    one_asset_floor_unmet = true;
+                    return None;
+                }
                 Some((out, tokens))
             })()
         } else {
             None
         };
+        if one_asset_floor_unmet {
+            sandbox.restore_snapshot(snap);
+            return TxResult::AmmFailed;
+        }
 
         // rippled's withdraw() core judges the ACTUAL burn against the LP's
         // position for EVERY mode (AMMWithdraw.cpp:515-520): tokens that
