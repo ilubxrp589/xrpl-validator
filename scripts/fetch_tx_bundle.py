@@ -14,16 +14,35 @@ Same-ledger staleness: the bot txs this drill exists for fire several
 times per ledger, so a key touched by an EARLIER tx has a parent image that
 is NOT this tx's pre-image (#106674447's leg-B maker line was credited 10
 RLUSD by tx#5 before the crossing read it). Such keys are rebuilt from the
-last earlier toucher's BINARY meta — ModifiedNode.FinalFields is the node
-byte-exact minus the three fields metadata never carries (LedgerEntryType,
-and the thread PreviousTxnID/PreviousTxnLgrSeq the toucher stamped with its
-own hash and this ledger). A CreatedNode's NewFields omits default-valued
-fields (Flags=0, BookNode=0, …) so it cannot be rebuilt without the type
-template — that stays a WARN.
+ledger's BINARY metas, two ways that cross-check each other:
+  BACKWARD — the last earlier toucher's ModifiedNode.FinalFields is the node
+    byte-exact minus the three fields metadata never carries (LedgerEntryType
+    and the thread PreviousTxnID/PreviousTxnLgrSeq it stamped with its own
+    hash and this ledger). Thread-only touches (threadTx on an owner's
+    AccountRoot) carry no fields: walk back to the nearest full image, or the
+    parent ledger's, and re-stamp. A CreatedNode's NewFields omits default-
+    valued fields (Flags=0, LowNode=0, …) so it cannot stand alone.
+  FORWARD — the first toucher at or after this tx (this tx itself when it
+    writes the key) records in PreviousFields exactly what it changed, so its
+    FinalFields with those put back is the image just before it = this tx's
+    pre-image; no such toucher → the post-ledger image. Its one ambiguity is
+    a field that toucher ADDED (in FinalFields, not PreviousFields), so when
+    the key was CREATED in this ledger every field beyond the creator's
+    NewFields must be default-valued, else the key is refused.
+  DIRECTORY PAGES are the exception to both: sfIndexes is sMD_Never, so no
+    meta ever carries a page's entries. Their entries are REPLAYED instead:
+    every object an earlier tx created/deleted names its pages (OwnerNode,
+    BookNode, LowNode/HighNode, …), owner pages take sorted inserts and book
+    pages appends (rippled dirInsert vs dirAppend), removals keep order. The
+    same replay continued through the later txs must land on the post-ledger
+    page, or the page is refused.
+Keys this tx writes that are NOT stale get the forward derivation (and pages
+the entry replay) anyway, as a self-check against the parent ledger.
 
 Usage: fetch_tx_bundle.py <tx_hash_prefix> <ledger_seq> <out.json> [target_key ...]
        (no targets → every Created/Modified node becomes a target)
 """
+import bisect
 import hashlib
 import json
 import sys
@@ -120,43 +139,150 @@ def _obj(b, i):
     return out, i + 1
 
 
-def rebuild_post_image(meta_hex, li, tx_hash, seq):
-    """(kind, hex) — the byte-exact image of key `li` AFTER the tx whose
-    binary meta this is: its ModifiedNode.FinalFields plus LedgerEntryType
-    (0x11, from the node) and the thread stamp PreviousTxnLgrSeq (0x25 =
-    this ledger) / PreviousTxnID (0x55 = this tx), in canonical (type,
-    field) order. hex is None unless the node is a ModifiedNode."""
-    b = bytes.fromhex(meta_hex)
-    i, top = 0, []
-    while i < len(b):
+def _fields_of(b, i, end):
+    """{(type, field): raw header+value bytes} of the fields in b[i:end)."""
+    out = {}
+    while i < end:
         s = i
         t, f, i = _hdr(b, i)
         i = _skip(b, i, t)
-        top.append((t, f, s, i))
-    for t, f, s, _ in top:
-        if (t, f) != (15, 8):  # AffectedNodes
-            continue
-        _, _, j = _hdr(b, s)
-        while b[j] != 0xF1:
-            _, nf, j = _hdr(b, j)  # 3 Created / 4 Deleted / 5 Modified
-            fields, j = _obj(b, j)
-            fm = {(t2, f2): (s2, e2) for t2, f2, s2, e2 in fields}
-            if (5, 6) not in fm:  # LedgerIndex
-                continue
-            if b[fm[(5, 6)][1] - 32:fm[(5, 6)][1]].hex().upper() != li:
-                continue
-            kind = {3: "CreatedNode", 4: "DeletedNode", 5: "ModifiedNode"}.get(nf, f"node{nf}")
-            if kind != "ModifiedNode" or (1, 1) not in fm or (14, 7) not in fm:
-                return kind, None
-            _, _, k = _hdr(b, fm[(14, 7)][0])  # into FinalFields
-            inner, _ = _obj(b, k)
-            raw = {(t3, f3): b[s3:e3] for t3, f3, s3, e3 in inner}
-            raw.setdefault((1, 1), b[fm[(1, 1)][0]:fm[(1, 1)][1]])
-            raw.setdefault((2, 5), b"\x25" + seq.to_bytes(4, "big"))
-            raw.setdefault((5, 5), b"\x55" + bytes.fromhex(tx_hash))
-            return kind, b"".join(raw[key] for key in sorted(raw)).hex().upper()
-    return None, None
+        out[(t, f)] = b[s:i]
+    return out
 
+
+def meta_node(meta_hex, li):
+    """The AffectedNode of key `li` in a binary meta, as {"kind", "node",
+    "finals", "prevs", "news"} with the field maps as {(type, field): raw
+    header+value bytes} (None for an absent sub-object). finals is None on
+    a thread-only touch: rippled's threadTx stamps an owner's AccountRoot
+    with the new PreviousTxnID/PreviousTxnLgrSeq and records nothing else.
+    None when the key is not in this meta."""
+    b = bytes.fromhex(meta_hex)
+    top = _fields_of(b, 0, len(b))
+    if (15, 8) not in top:  # AffectedNodes
+        return None
+    arr = top[(15, 8)]
+    _, _, j = _hdr(arr, 0)
+    while arr[j] != 0xF1:
+        _, nf, j = _hdr(arr, j)  # 3 CreatedNode / 4 DeletedNode / 5 ModifiedNode
+        fields, j = _obj(arr, j)
+        fm = {(t, f): arr[s:e] for t, f, s, e in fields}
+        if (5, 6) not in fm or fm[(5, 6)][-32:].hex().upper() != li:  # LedgerIndex
+            continue
+
+        def sub(code):  # a nested STObject's own fields: header, body, 0xE1
+            if code not in fm:
+                return None
+            fb = fm[code]
+            _, _, k = _hdr(fb, 0)
+            return _fields_of(fb, k, len(fb) - 1)
+
+        return {"kind": {3: "CreatedNode", 4: "DeletedNode", 5: "ModifiedNode"}.get(nf, f"node{nf}"),
+                "node": fm, "finals": sub((14, 7)), "prevs": sub((14, 6)), "news": sub((14, 8))}
+    return None
+
+
+def stamped(fields, let_raw, tx_hash, seq):
+    """Raw field map of a node: LedgerEntryType (0x11) supplied when missing,
+    and — when tx_hash is given — the thread stamp PreviousTxnLgrSeq (0x25) /
+    PreviousTxnID (0x55) REPLACED by (seq, tx_hash). Every other field's
+    bytes pass through untouched — nothing re-serializes."""
+    raw = dict(fields)
+    if let_raw and (1, 1) not in raw:
+        raw[(1, 1)] = let_raw
+    if tx_hash:
+        raw[(2, 5)] = b"\x25" + seq.to_bytes(4, "big")
+        raw[(5, 5)] = b"\x55" + bytes.fromhex(tx_hash)
+    return raw
+
+
+def canonical(raw):
+    """Node bytes from a raw field map, (type, field) order, upper hex."""
+    return b"".join(raw[k] for k in sorted(raw)).hex().upper()
+
+
+def _is_default(t, raw):
+    """Would rippled's STBase::isDefault omit this field from NewFields?"""
+    _, _, i = _hdr(raw, 0)
+    v = raw[i:]
+    if t == 6:  # Amount: only native (XRP) zero is default
+        return v == b"\x40" + bytes(7)
+    if t == 8:  # AccountID: VL(20) + zero account
+        return v == b"\x14" + bytes(20)
+    if t in (7, 19):  # Blob / Vector256: empty
+        return v == b"\x00"
+    if t == 14:
+        return v == b"\xe1"
+    if t == 15:
+        return v == b"\xf1"
+    return not any(v)
+
+
+def _vl_encode(n):
+    if n <= 192:
+        return bytes([n])
+    if n <= 12480:
+        n -= 193
+        return bytes([193 + (n >> 8), n & 0xFF])
+    n -= 12481
+    return bytes([241 + (n >> 16), (n >> 8) & 0xFF, n & 0xFF])
+
+
+def indexes_of(raw):
+    """Entries of a raw sfIndexes field (header + VL + 32-byte keys)."""
+    _, _, i = _hdr(raw, 0)
+    n, i = _vl(raw, i)
+    data = raw[i:i + n]
+    return [data[k:k + 32].hex().upper() for k in range(0, n, 32)]
+
+
+def indexes_raw(header_raw, entries):
+    """A raw sfIndexes field with these entries, header bytes reused."""
+    _, _, i = _hdr(header_raw, 0)
+    return header_raw[:i] + _vl_encode(32 * len(entries)) + b"".join(bytes.fromhex(e) for e in entries)
+
+
+LET_DIR_NODE = 0x0064
+
+# Where an object lives: (page-number field, owner-account field). Offers and
+# trust lines are special-cased (book page / two owners); SignerList has no
+# account field (its owner is the tx account); NFTokenOffer's token directory
+# is not modelled — the post-ledger replay check refuses a page it disturbs.
+_OWNER_HINTS = {
+    "Ticket": [("OwnerNode", "Account")],
+    "Escrow": [("OwnerNode", "Account"), ("DestinationNode", "Destination")],
+    "PayChannel": [("OwnerNode", "Account"), ("DestinationNode", "Destination")],
+    "Check": [("OwnerNode", "Account"), ("DestinationNode", "Destination")],
+    "DepositPreauth": [("OwnerNode", "Account")],
+    "NFTokenOffer": [("OwnerNode", "Owner")],
+    "DID": [("OwnerNode", "Account")],
+    "Oracle": [("OwnerNode", "Owner")],
+    "AMM": [("OwnerNode", "Account")],
+    "MPTokenIssuance": [("OwnerNode", "Issuer")],
+    "MPToken": [("OwnerNode", "Account")],
+    "Credential": [("IssuerNode", "Issuer"), ("SubjectNode", "Subject")],
+    "PermissionedDomain": [("OwnerNode", "Owner")],
+    "Vault": [("OwnerNode", "Owner")],
+    "Delegate": [("OwnerNode", "Account")],
+    "Bridge": [("OwnerNode", "Account")],
+    "XChainOwnedClaimID": [("OwnerNode", "Account")],
+    "XChainOwnedCreateAccountClaimID": [("OwnerNode", "Account")],
+}
+
+
+def created_consistent(raw, news):
+    """None if `raw` can be the object NewFields describes: every NewFields
+    field byte-identical, every extra (non-thread) field default-valued —
+    the fields rippled omits from NewFields. Else the reason."""
+    for k, v in news.items():
+        if raw.get(k) != v:
+            return f"field {k} differs from the creator's NewFields"
+    for k, v in raw.items():
+        if k in news or k in ((1, 1), (2, 5), (5, 5)):
+            continue
+        if not _is_default(k[0], v):
+            return f"extra non-default field {k} (added after creation?)"
+    return None
 
 def main():
     pfx, seq, out = sys.argv[1].upper(), int(sys.argv[2]), sys.argv[3]
@@ -174,21 +300,19 @@ def main():
     # this drill exists for fire several times per ledger (#106688646's
     # offer read back a later tx's PreviousTxnID). Same on the PRE side: an
     # EARLIER toucher makes the parent-ledger image stale for this tx.
-    my_index = meta["TransactionIndex"]
-    touched_later = set()
-    earlier = {}  # key → (index, kind, hash) of its LAST toucher before this tx
+    my_index, my_hash = meta["TransactionIndex"], tx["hash"].upper()
+    touchers = {}  # key → [(index, kind, hash), …] ascending, this tx included
     for other in led["ledger"]["transactions"]:
         om = other.get("metaData", {})
         oi = om.get("TransactionIndex")
-        if oi is None or oi == my_index:
+        if oi is None:
             continue
         for n in om.get("AffectedNodes", []):
             for kind, v in n.items():
-                li = v["LedgerIndex"]
-                if oi > my_index:
-                    touched_later.add(li)
-                elif li not in earlier or earlier[li][0] < oi:
-                    earlier[li] = (oi, kind, other["hash"].upper())
+                touchers.setdefault(v["LedgerIndex"], []).append((oi, kind, other["hash"].upper()))
+    for chain in touchers.values():
+        chain.sort()
+    touched_later = {li for li, ch in touchers.items() if ch[-1][0] > my_index}
 
     pre, targets = {}, {}
     for n in meta["AffectedNodes"]:
@@ -352,6 +476,77 @@ def main():
         h = hashlib.sha512(b"\x00d" + bytes.fromhex(root_hex) + n.to_bytes(8, "big"))
         return h.digest()[:32].hex().upper()
 
+    def owner_dir(addr):
+        return hashlib.sha512(b"\x00O" + bytes.fromhex(acct_id(addr))).digest()[:32].hex().upper()
+
+    def dir_ops(txj):
+        """[(page_key | None, 'add' | 'del', entry_key, sorted_insert)] for
+        every directory entry a tx's created/deleted objects imply. A None
+        page marks a placement this script does not model."""
+        ops = []
+        for n in txj.get("metaData", {}).get("AffectedNodes", []):
+            for kind, v in n.items():
+                if kind == "ModifiedNode":
+                    continue
+                fl = (v.get("NewFields") if kind == "CreatedNode" else v.get("FinalFields")) or {}
+                let, key, op = v.get("LedgerEntryType"), v["LedgerIndex"].upper(), "add" if kind == "CreatedNode" else "del"
+
+                def page(field):  # NewFields omits a zero page number: absent = root page
+                    return int(str(fl.get(field, "0")), 16)
+
+                spots = []
+                try:
+                    if let == "Offer":
+                        spots.append((owner_dir(fl["Account"]), page("OwnerNode"), True))
+                        spots.append((fl["BookDirectory"].upper(), page("BookNode"), False))
+                    elif let == "RippleState":
+                        spots.append((owner_dir(fl["LowLimit"]["issuer"]), page("LowNode"), True))
+                        spots.append((owner_dir(fl["HighLimit"]["issuer"]), page("HighNode"), True))
+                    elif let == "SignerList":
+                        spots.append((owner_dir(txj["Account"]), page("OwnerNode"), True))
+                    elif let in _OWNER_HINTS:
+                        for node_f, acct_f in _OWNER_HINTS[let]:
+                            a = fl.get(acct_f)
+                            if not a or (node_f == "DestinationNode" and a == fl.get("Account")):
+                                continue
+                            spots.append((owner_dir(a), page(node_f), True))
+                    elif let in ("DirectoryNode", "NFTokenPage", "AccountRoot", "Amendments", "FeeSettings", "NegativeUNL", "LedgerHashes"):
+                        continue  # not directory entries
+                    else:
+                        spots.append(None)
+                except (KeyError, ValueError, TypeError):
+                    spots.append(None)
+                for sp in spots:
+                    ops.append((None if sp is None else dir_page(sp[0], sp[1]), op, key, sp[2] if sp else None))
+        return ops
+
+    def replay_dir(entries, ops, page_key):
+        """Entries after rippled's dirInsert/dirAppend/dirRemove for the ops
+        that hit this page; None when an op is inconsistent with them."""
+        entries = list(entries)
+        for pk, op, key, sorted_insert in ops:
+            if pk != page_key:
+                continue
+            if op == "del":
+                if key not in entries:
+                    return None
+                entries.remove(key)  # order preserved
+            else:
+                if key in entries:
+                    return None
+                if sorted_insert:  # dirInsert: sort the page, insert in order
+                    entries.sort()
+                    entries.insert(bisect.bisect_left(entries, key), key)
+                else:  # dirAppend (book pages): FIFO
+                    entries.append(key)
+        return entries
+
+    ops_by_index = {}
+    for other in led["ledger"]["transactions"]:
+        oi = other.get("metaData", {}).get("TransactionIndex")
+        if oi is not None:
+            ops_by_index[oi] = dir_ops(other)
+
     for bd in sorted(book_dirs):
         n, seen = 0, set()
         try:
@@ -421,33 +616,178 @@ def main():
     meta_keys = {v["LedgerIndex"] for n in meta["AffectedNodes"]
                  for kind, v in n.items() if kind != "CreatedNode"}
     bin_meta = {}
+
+    def node_of(h, li):
+        if h not in bin_meta:
+            r = rpc("tx", {"transaction": h, "binary": True})
+            bin_meta[h] = r.get("meta") if isinstance(r.get("meta"), str) else r.get("meta_blob")
+        return meta_node(bin_meta[h], li)
+
+    def backward(li, before):
+        """(raw | None, provenance): the image AFTER the last earlier toucher."""
+        _, _, last = before[-1]
+        hops = []
+        for oi2, _, h2 in reversed(before):
+            rec = node_of(h2, li)
+            if rec is None or rec["kind"] != "ModifiedNode":
+                return None, f"tx#{oi2} {h2[:8]} {rec['kind'] if rec else 'absent from its meta'}"
+            if rec["finals"] is not None:
+                via = f"tx#{oi2} {h2[:8]} FinalFields"
+                if hops:
+                    via += f" + thread-only tx#{','.join(map(str, hops))}"
+                return stamped(rec["finals"], rec["node"].get((1, 1)), last, seq), via
+            hops.append(oi2)
+        base = pre.get(li) or fetch_key(li)
+        if not base:
+            return None, "thread-only touches of a key the parent ledger lacks"
+        b = bytes.fromhex(base)
+        return stamped(_fields_of(b, 0, len(b)), None, last, seq), f"parent image + thread-only tx#{','.join(map(str, hops))}"
+
+    def forward(li, after, last):
+        """(raw | None, provenance, own): the image BEFORE the first toucher at
+        or after this tx — its FinalFields with PreviousFields put back —
+        stamped with the last earlier toucher; no such toucher → the
+        post-ledger image. own = True when that toucher is this tx."""
+        for oi2, _, h2 in after:
+            rec = node_of(h2, li)
+            if rec is None:
+                return None, f"tx#{oi2} {h2[:8]} absent from its meta", False
+            if rec["kind"] == "CreatedNode":
+                return None, f"tx#{oi2} {h2[:8]} re-created it (deleted in between)", False
+            if rec["finals"] is None:
+                continue  # thread-only: content unchanged, stamp overridden below
+            raw = dict(rec["finals"])
+            raw.update(rec["prevs"] or {})
+            if rec["kind"] == "ModifiedNode":  # node-level thread = the pre values
+                for k in ((2, 5), (5, 5)):
+                    if k in rec["node"]:
+                        raw[k] = rec["node"][k]
+            own = h2 == my_hash
+            who = "this tx's" if own else f"tx#{oi2} {h2[:8]}"
+            return stamped(raw, rec["node"].get((1, 1)), last, seq), f"{who} FinalFields+PreviousFields", own
+        post = rpc("ledger_entry", {"index": li, "ledger_index": seq, "binary": True}).get("node_binary")
+        if not post:
+            return None, "no post-ledger image", False
+        b = bytes.fromhex(post)
+        return stamped(_fields_of(b, 0, len(b)), None, last, seq), "post-ledger image", False
+
+    def is_dir_image(hexs):
+        return hexs[:6].upper() == "110064"  # LedgerEntryType == DirectoryNode
+
+    def ops_between(lo, hi):
+        return [op for oi in sorted(ops_by_index) if lo <= oi < hi for op in ops_by_index[oi]]
+
+    def post_entries(li):
+        post = rpc("ledger_entry", {"index": li, "ledger_index": seq, "binary": True}).get("node_binary")
+        if not post:
+            return None
+        pf = _fields_of(bytes.fromhex(post), 0, len(bytes.fromhex(post)))
+        return indexes_of(pf[(19, 1)]) if (19, 1) in pf else []
+
+    def page_pre(li, before):
+        """(hex | None, provenance) for a directory page: the last earlier
+        toucher's FinalFields carries every field but sfIndexes; the entries
+        are the parent page's replayed through the earlier txs' directory
+        ops, and that replay continued through the later txs must reproduce
+        the post-ledger page."""
+        base = pre.get(li) or fetch_key(li)
+        if not base:
+            return None, "page absent from the parent ledger (created in-ledger)"
+        pf = _fields_of(bytes.fromhex(base), 0, len(bytes.fromhex(base)))
+        if (19, 1) not in pf:
+            return None, "parent page carries no sfIndexes"
+        back, via = backward(li, before)
+        if back is None:
+            return None, via
+        honest = replay_dir(indexes_of(pf[(19, 1)]), ops_between(0, my_index), li)
+        if honest is None:
+            return None, "earlier directory ops inconsistent with the parent page"
+        end = replay_dir(honest, ops_between(my_index, 10 ** 9), li)
+        want = post_entries(li)
+        if want is None:
+            want = []  # page deleted later: the replay must have emptied it
+        if end != want:
+            return None, f"entry replay does not reach the post-ledger page ({len(end) if end is not None else '?'} vs {len(want)} entries)"
+        raw = dict(back)
+        raw[(19, 1)] = indexes_raw(pf[(19, 1)], honest)
+        return canonical(raw), f"{via} + {len(honest)} entries replayed (post-ledger page reproduced)"
+
+    own_ok, own_bad, page_ok, page_bad = 0, [], 0, []
     for li in sorted(set(pre) | meta_keys):
-        if li not in earlier:
+        chain = touchers.get(li, [])
+        before = [t for t in chain if t[0] < my_index]
+        after = [t for t in chain if t[0] >= my_index]
+        if not before:
+            # Not stale. This tx's own meta must reproduce the parent image, and
+            # a page's entry replay the post-ledger page — the free self-checks
+            # that the derivations (and the walker) are right.
+            if li in meta_keys and li in pre:
+                try:
+                    if is_dir_image(pre[li]):
+                        pf = _fields_of(bytes.fromhex(pre[li]), 0, len(bytes.fromhex(pre[li])))
+                        end = replay_dir(indexes_of(pf[(19, 1)]) if (19, 1) in pf else [], ops_between(my_index, 10 ** 9), li)
+                        want = post_entries(li)
+                        if end == (want if want is not None else []):
+                            page_ok += 1
+                        else:
+                            page_bad.append(li)
+                    else:
+                        raw, via, own = forward(li, after, None)
+                        if own and raw is not None:
+                            if canonical(raw) == pre[li]:
+                                own_ok += 1
+                            else:
+                                own_bad.append(li)
+                except Exception as e:  # noqa: BLE001
+                    print(f"WARN: self-check {li[:16]}… {e}")
             continue
-        oi, kind, h = earlier[li]
+        oi, kind, h = before[-1]
         where = "parent image is stale" if li in pre else "absent from the bundle"
         if kind == "DeletedNode":
             if pre.pop(li, None) is not None:
                 print(f"note: pre {li[:16]}… dropped (deleted by earlier tx#{oi} {h[:8]})")
             continue
-        if kind == "CreatedNode":
-            print(f"WARN: pre {li[:16]}… CREATED by earlier tx#{oi} {h[:8]} — NewFields omit defaults, not rebuilt; {where}")
-            continue
         if my_prev.get(li) and my_prev[li] != h:
             print(f"WARN: pre {li[:16]}… thread names {my_prev[li][:8]} but last earlier toucher is tx#{oi} {h[:8]} — not rebuilt; {where}")
             continue
+        if li in pre and is_dir_image(pre[li]):
+            try:
+                img, via = page_pre(li, before)
+            except Exception as e:  # noqa: BLE001
+                img, via = None, f"parse error: {e}"
+            if img:
+                pre[li] = img
+                print(f"note: page {li[:16]}… rebuilt from {via} ({len(img) // 2} bytes)")
+            else:
+                print(f"WARN: page {li[:16]}… touched by earlier tx#{oi} {h[:8]} — not rebuilt ({via}); parent image is stale")
+            continue
         try:
-            if h not in bin_meta:
-                r = rpc("tx", {"transaction": h, "binary": True})
-                bin_meta[h] = r.get("meta") if isinstance(r.get("meta"), str) else r.get("meta_blob")
-            k2, img = rebuild_post_image(bin_meta[h], li, h, seq)
+            back, via_b = (None, f"tx#{oi} {h[:8]} CreatedNode") if kind == "CreatedNode" else backward(li, before)
+            fwd, via_f, _ = forward(li, after, h)
+            if kind == "CreatedNode" and fwd is not None:
+                why = created_consistent(fwd, node_of(h, li)["news"] or {})
+                if why:
+                    print(f"WARN: pre {li[:16]}… forward image ({via_f}) is not the object tx#{oi} {h[:8]} created: {why} — not rebuilt; {where}")
+                    fwd = None
         except Exception as e:  # noqa: BLE001 — a parse failure must not poison the bundle
-            k2, img = f"parse error: {e}", None
-        if img:
-            pre[li] = img
-            print(f"note: pre {li[:16]}… rebuilt from earlier tx#{oi} {h[:8]} FinalFields ({len(img) // 2} bytes)")
+            back, fwd, via_b, via_f = None, None, f"parse error: {e}", ""
+        if back is not None and fwd is not None and canonical(back) != canonical(fwd):
+            print(f"WARN: pre {li[:16]}… backward ({via_b}) and forward ({via_f}) images disagree — backward used")
+        raw = back if back is not None else fwd
+        if raw is not None:
+            pre[li] = canonical(raw)
+            via = via_b if back is not None else via_f
+            agree = " (forward agrees)" if back is not None and fwd is not None else ""
+            print(f"note: pre {li[:16]}… rebuilt from {via}{agree} ({len(pre[li]) // 2} bytes)")
         else:
-            print(f"WARN: pre {li[:16]}… touched by earlier tx#{oi} {h[:8]} as {k2} — not rebuilt; {where}")
+            print(f"WARN: pre {li[:16]}… touched by earlier tx#{oi} {h[:8]} — not rebuilt (backward: {via_b}; forward: {via_f}); {where}")
+    if own_ok or own_bad or page_ok or page_bad:
+        print(f"self-check: own meta reproduces the parent image for {own_ok}/{own_ok + len(own_bad)} non-stale objects this tx writes; "
+              f"entry replay reproduces the post-ledger page for {page_ok}/{page_ok + len(page_bad)} pages")
+        for li in own_bad[:5]:
+            print(f"WARN: self-check {li[:16]}… own-meta image != parent image")
+        for li in page_bad[:5]:
+            print(f"WARN: self-check page {li[:16]}… entry replay != post-ledger page")
 
     parent = rpc("ledger", {"ledger_index": seq - 1})["ledger"]
     cur = rpc("ledger", {"ledger_index": seq})["ledger"]
