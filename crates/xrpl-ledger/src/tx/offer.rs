@@ -1473,6 +1473,18 @@ pub(crate) fn st_divide_legacy(num: Me, den: Me) -> Me {
 
 /// rippled `multiply(v1, v2, issue)` under Number semantics: exact product
 /// rounded half-even at 16 digits (drops for XRP).
+///
+/// The XRP side is `Number{v1} * Number{v2}` then `XRPAmount{Number}`
+/// (STAmount.cpp:1416, canonicalize :880): TWO half-even roundings — the
+/// product to Number's 16 digits, then to integer drops ("round to nearest,
+/// even on tie", Number.h:395). It used to carry the legacy `+7` form
+/// (`muldiv(v1, v2, 10^14) + 7`, :1451), which is dead under
+/// STNumberSwitchover and breaks every exact half-drop tie upward.
+/// #106710940 3F9DDD254714 (finding 95): tfSell 16.71404 SOL for 1250 XRP
+/// under the issuer's TickSize 6 — rate rounds up to 74787500 drops/SOL,
+/// TakerPays = 1250001266.5 → mainnet files 1250001266 (even); `+7` filed
+/// 1250001267 and rested the offer one book level off (`…22D4AD189` for
+/// `…22CEF8678`).
 fn st_multiply(a: Me, b: Me, xrp: bool) -> Me {
     if a.0 == 0 || b.0 == 0 {
         return (0, 0);
@@ -1480,8 +1492,8 @@ fn st_multiply(a: Me, b: Me, xrp: bool) -> Me {
     let (am, ae) = norm16(a);
     let (bm, be) = norm16(b);
     if xrp {
-        let v = am * bm / 100_000_000_000_000u128 + 7;
-        (me_rescale_nearest((v, ae + be + 14)), 0)
+        let (m, e) = fold16(am * bm, ae + be);
+        (me_rescale_nearest((m, e)), 0)
     } else {
         div_nearest_16(am * bm, 1, ae + be)
     }

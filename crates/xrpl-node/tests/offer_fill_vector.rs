@@ -237,3 +237,16 @@ fn offer_sell_remaining_input_is_the_fold_of_saved_iteration_ins() {
 fn offer_bridged_in_limited_book_leg_floors_the_mid_leg() {
     run_bundle(include_str!("vectors/offer_bridged_in_limited_floor_106708835.json"));
 }
+
+/// #106710940 3F9DDD254714 (finding 95): a tfPassive|tfSell offer of 16.71404
+/// SOL for 1250 XRP under the SOL issuer's TickSize 6. rippled rounds the
+/// rate UP to the tick (74787500 drops/SOL) and re-derives TakerPays with
+/// `multiply` under Number semantics: 1250001266.5 rounds half-EVEN to
+/// 1250001266 drops, and the filed rate is then `divide`'s `+5` folded
+/// half-even to `…22CEF8678`. Our XRP-side multiply still carried the legacy
+/// `+7` form and filed 1250001267 one book level higher. Byte-exact on the
+/// created Offer and its directory page.
+#[test]
+fn offer_tick_size_sell_rounds_taker_pays_half_even() {
+    run_bundle(include_str!("vectors/offer_ticksize_halfeven_106710940.json"));
+}
