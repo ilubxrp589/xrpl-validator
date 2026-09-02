@@ -77,7 +77,7 @@ impl<'a> Sandbox<'a> {
                 Some(data.clone())
             }
             Some(SandboxEntry::Deleted) => None,
-            None => self.base.state_map.lookup(key).map(|d| d.to_vec()),
+            None => self.base.read_json(key),
         }
     }
 

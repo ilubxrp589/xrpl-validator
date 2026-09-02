@@ -9,6 +9,8 @@
 //! account_hash. A MATCH means the native engine reproduced the whole
 //! ledger byte-for-byte.
 //!
+//! Leaves hold RAW blobs (decoded lazily on read through
+//! `LedgerState::leaf_decoder`), so a full mainnet state fits in ~10 GB.
 //! The load pass doubles as a full-state codec census: decode(blob) →
 //! canon → encode must reproduce the original blob for every object in
 //! the ledger (--no-census to skip).
@@ -82,6 +84,23 @@ fn compute_subtree_hash(entries: &[(Hash256, Hash256)], depth: usize) -> Hash256
 }
 
 /// Root hash: parallel fold over the 16 depth-0 buckets.
+/// Lazy leaf decoder installed on the replay state: raw blob → engine JSON
+/// (hex account ids, `index` = the key) exactly as the eager loader used to
+/// store. A decode failure is loud — it would otherwise read as "no object".
+fn decode_leaf(key: &Hash256, blob: &[u8]) -> Option<Vec<u8>> {
+    match xrpl_core::codec::decode::decode_transaction_binary(blob) {
+        Ok(mut j) => {
+            hexify_addresses(&mut j);
+            j["index"] = json!(hex::encode_upper(key.0));
+            serde_json::to_vec(&j).ok()
+        }
+        Err(e) => {
+            eprintln!("LAZY DECODE FAIL {} len {}: {e}", hex::encode_upper(key.0), blob.len());
+            None
+        }
+    }
+}
+
 fn fold_root(entries: &[(Hash256, Hash256)]) -> Hash256 {
     if entries.is_empty() {
         return ZERO_HASH;
@@ -208,6 +227,7 @@ fn run() -> i32 {
         close_flags: 0,
     };
     let mut state = LedgerState::new_unverified(header0);
+    state.leaf_decoder = Some(decode_leaf);
     let mut n_objects: u64 = 0;
     let mut n_decode_err: u64 = 0;
     let mut n_census_bad: u64 = 0;
@@ -232,10 +252,17 @@ fn run() -> i32 {
                     let Ok(karr) = <[u8; 32]>::try_from(kb.as_slice()) else { continue };
                     let key = Hash256(karr);
                     let leaf = leaf_hash(&key, &blob);
+                    // Leaves hold the RAW blob; the engine decodes on read via
+                    // `LedgerState::leaf_decoder` (decode_leaf). Only the census
+                    // decodes at load, and drops the JSON immediately.
+                    if !census {
+                        out.push((key, leaf, Some(blob), false, None));
+                        continue;
+                    }
                     match xrpl_core::codec::decode::decode_transaction_binary(&blob) {
-                        Ok(mut j) => {
+                        Ok(j) => {
                             let mut bad = None;
-                            if census {
+                            {
                                 let mut c = j.clone();
                                 canon_for_encode(&mut c);
                                 match xrpl_core::codec::encode::encode_transaction_json(&c, false) {
@@ -256,9 +283,7 @@ fn run() -> i32 {
                                     }
                                 }
                             }
-                            hexify_addresses(&mut j);
-                            j["index"] = json!(idx.to_uppercase());
-                            out.push((key, leaf, serde_json::to_vec(&j).ok(), false, bad));
+                            out.push((key, leaf, Some(blob), false, bad));
                         }
                         Err(e) => out.push((
                             key,
@@ -366,7 +391,7 @@ fn run() -> i32 {
         // outside every tx meta).
         if target % 256 == 0 {
             let nk = keylet::negative_unl_key();
-            if let Some(bytes) = state.state_map.lookup(&nk).map(|b| b.to_vec()) {
+            if let Some(bytes) = state.read_json(&nk) {
                 match xrpl_ledger::tx::pseudo::rotate_negative_unl(&bytes, target) {
                     Some(Some(nb)) => {
                         let _ = state.state_map.insert(nk, nb);
@@ -434,7 +459,7 @@ fn run() -> i32 {
             }
             xrpl_ledger::ledger::threading::stamp_threading(
                 &mut mods,
-                &|k| state.state_map.lookup(k).map(|b| b.to_vec()),
+                &|k| state.read_json(k),
                 &h,
                 target,
             );
@@ -491,7 +516,7 @@ fn run() -> i32 {
         let mut encode_err = 0usize;
         for k in &dirty {
             let pos = entries.binary_search_by(|e| e.0 .0.cmp(&k.0));
-            match state.state_map.lookup(k).map(|b| b.to_vec()) {
+            match state.read_json(k) {
                 Some(jb) => match serde_json::from_slice::<Value>(&jb) {
                     Ok(mut v) => {
                         canon_for_encode(&mut v);
@@ -502,9 +527,10 @@ fn run() -> i32 {
                                     Ok(i) => entries[i].1 = leaf,
                                     Err(i) => entries.insert(i, (*k, leaf)),
                                 }
-                                // Re-store the node as decode(encode(json)) —
-                                // the same pipeline hydration uses. rippled's
-                                // persisted state is CANONICAL: an STAmount
+                                // Re-store the node as its CANONICAL bytes;
+                                // reads decode them lazily (decode_leaf), the
+                                // same pipeline hydration uses. rippled's
+                                // persisted state is canonical: an STAmount
                                 // never carries more than 16 digits into the
                                 // next ledger, while our sandbox JSON can (the
                                 // serialized bytes round; the JSON keeps the
@@ -514,14 +540,7 @@ fn run() -> i32 {
                                 // dust where mainnet writes canonical zero —
                                 // per-tx probes hydrate canonical values and
                                 // were structurally blind to it.
-                                if let Ok(mut cj) =
-                                    xrpl_core::codec::decode::decode_transaction_binary(&blob)
-                                {
-                                    hexify_addresses(&mut cj);
-                                    if let Ok(cb) = serde_json::to_vec(&cj) {
-                                        let _ = state.state_map.insert(*k, cb);
-                                    }
-                                }
+                                let _ = state.state_map.insert(*k, blob);
                             }
                             Err(e) => {
                                 eprintln!(
@@ -582,7 +601,7 @@ fn run() -> i32 {
                 )
                 .ok()
                 .and_then(|r| r["result"]["node_binary"].as_str().map(|s| s.to_string()));
-                let ours = state.state_map.lookup(k).map(|b| b.to_vec()).and_then(|jb| {
+                let ours = state.read_json(k).and_then(|jb| {
                     let mut v = serde_json::from_slice::<Value>(&jb).ok()?;
                     canon_for_encode(&mut v);
                     xrpl_core::codec::encode::encode_transaction_json(&v, false).ok()
@@ -593,9 +612,8 @@ fn run() -> i32 {
                         let oh = hex::encode_upper(&o);
                         if oh != th {
                             let ty = state
-                                .state_map
-                                .lookup(k)
-                                .and_then(|b| serde_json::from_slice::<Value>(b).ok())
+                                .read_json(k)
+                                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
                                 .and_then(|v| v["LedgerEntryType"].as_str().map(|s| s.to_string()))
                                 .unwrap_or_default();
                             let off = oh

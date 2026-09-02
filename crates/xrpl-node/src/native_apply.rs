@@ -285,10 +285,12 @@ pub fn update_skip_list(
 ) {
     let prev = target - 1;
     let mut write = |key: Hash256, trim: bool| {
+        // read_json: the replay keeps raw leaves (lazy decode) — a direct
+        // state_map lookup would fail to parse and silently restart the
+        // skip list from empty on every ledger.
         let mut obj = state
-            .state_map
-            .lookup(&key)
-            .and_then(|b| serde_json::from_slice::<Value>(b).ok())
+            .read_json(&key)
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
             .unwrap_or_else(|| {
                 json!({
                     "LedgerEntryType": "LedgerHashes",

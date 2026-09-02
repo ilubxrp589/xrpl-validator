@@ -18,6 +18,11 @@ pub struct LedgerState {
     pub tx_map: SHAMap,
     /// Whether this ledger has been validated by the network.
     pub validated: bool,
+    /// Optional lazy leaf decoder: when a state leaf holds a raw serialized
+    /// blob (first byte != `{`) instead of engine JSON, `read_json` hands the
+    /// (key, blob) to this hook to produce the JSON bytes on demand. Lets a
+    /// full-state replay keep ~150 B raw leaves instead of ~1.5 KB JSON.
+    pub leaf_decoder: Option<fn(&Hash256, &[u8]) -> Option<Vec<u8>>>,
 }
 
 impl LedgerState {
@@ -32,6 +37,7 @@ impl LedgerState {
             state_map,
             tx_map,
             validated: false,
+            leaf_decoder: None,
         };
 
         state.verify()?;
@@ -45,6 +51,18 @@ impl LedgerState {
             state_map: SHAMap::new(TreeType::State),
             tx_map: SHAMap::new(TreeType::Transaction),
             validated: false,
+            leaf_decoder: None,
+        }
+    }
+
+    /// Read a state leaf as engine JSON bytes, decoding a raw serialized leaf
+    /// through `leaf_decoder` when one is installed. JSON leaves (leading `{`)
+    /// are returned as stored. A raw leaf with no decoder is returned as-is.
+    pub fn read_json(&self, key: &Hash256) -> Option<Vec<u8>> {
+        let data = self.state_map.lookup(key)?;
+        match self.leaf_decoder {
+            Some(decode) if data.first() != Some(&b'{') => decode(key, data),
+            _ => Some(data.to_vec()),
         }
     }
 
