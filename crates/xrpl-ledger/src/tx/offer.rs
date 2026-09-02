@@ -447,6 +447,60 @@ fn div_round16_down(a: Me, rate: Me) -> Me {
 /// both:
 ///   #106308202 6B6D7EFC  283956.0452856067 -> 283956  (0.045 discarded)
 ///   #105672435 B409D45C  165388.7424863569 -> 165389  (0.7 carries)
+/// `divRound(a, rate, iouAsset, roundUp = true)` — the ceiling sibling of
+/// `div_round16_down`: quotient at the 17-shift rounded UP, then
+/// `canonicalizeRound(up)` (STAmount.cpp divRoundImpl).
+pub(crate) fn div_round16_up(a: Me, rate: Me) -> Me {
+    let (a, r) = (norm16(a), norm16(rate));
+    if a.0 == 0 || r.0 == 0 {
+        return (0, 0);
+    }
+    const TEN17: u128 = 100_000_000_000_000_000;
+    const MAXV: u128 = 9_999_999_999_999_999;
+    let num = a.0.saturating_mul(TEN17);
+    let mut m = num / r.0 + u128::from(num % r.0 != 0);
+    let mut e = a.1 - r.1 - 17;
+    if m > MAXV {
+        while m > 10 * MAXV {
+            m /= 10;
+            e += 1;
+        }
+        m = (m + 9) / 10;
+        e += 1;
+    }
+    while m < 1_000_000_000_000_000 {
+        m *= 10;
+        e -= 1;
+    }
+    (m, e)
+}
+
+/// `divRound(a, rate, XRP, roundUp = true)` as whole drops: the 17-shift
+/// quotient rounded up, then `canonicalizeRound(native, up)` exactly as
+/// `mul_round_drops` finishes a product.
+fn div_round_drops_up(a: Me, rate: Me) -> u128 {
+    let (a, r) = (norm16(a), norm16(rate));
+    if a.0 == 0 || r.0 == 0 {
+        return 0;
+    }
+    const TEN17: u128 = 100_000_000_000_000_000;
+    let num = a.0.saturating_mul(TEN17);
+    let mut m = num / r.0 + u128::from(num % r.0 != 0);
+    let mut e = a.1 - r.1 - 17;
+    if e < 0 {
+        let mut loops = 0;
+        while e < -1 {
+            m /= 10;
+            e += 1;
+            loops += 1;
+        }
+        m += if loops >= 2 { 9 } else { 10 };
+        m /= 10;
+        e += 1;
+    }
+    m.saturating_mul(10u128.saturating_pow(e.clamp(0, 38) as u32))
+}
+
 fn mul_round_drops(a: Me, b: Me) -> u128 {
     let (a, b) = (norm16(a), norm16(b));
     if a.0 == 0 || b.0 == 0 {
@@ -6003,6 +6057,35 @@ impl Transactor for OfferCreateTransactor {
         // (InvalidAmount) — the self-documenting receipt's first catch.
         let rest16 = |v: Me| -> Me {
             crate::tx::amm_swap::round16(v.0, v.1, false, crate::tx::amm_swap::Rnd::Near)
+        };
+        // F79 — the RESTING remainder is re-derived from the offer's own rate,
+        // not carried out of the walk: `flowCross` (CreateOffer.cpp:439-467)
+        //   rate = Quality{takerAmount.out, takerAmount.in}.rate()   (in/out)
+        //   buy:  out -= actualOut;  in  = mulRound(out, rate, in.issue,  up)
+        //   sell: in  -= actualIn;   out = divRound(in,  rate, out.issue, up)
+        // so one side is exact and the other is the rate-derived ceiling.
+        // #106701372 8BFFFACE (passive RLUSD→BTC, 176.449 RLUSD crossed):
+        // mainnet rests 1728.598227693783 RLUSD, the walk's net remainder was
+        // …782 — one ULP, the class-B line-ULP costume on the offer itself.
+        let (rem_pays, rem_gets) = if crossed > 0 && !me_is_zero(rem_pays) && !me_is_zero(rem_gets) {
+            // `rate_of_me(a, b)` is a/b: in/out = TakerGets/TakerPays.
+            match rate_of_me(tg0, tp0) {
+                Some(q) => {
+                    let rate = rate_me(q);
+                    if sell {
+                        let inn = rest16(rem_gets);
+                        let out = if pays_leg.xrp { (div_round_drops_up(inn, rate), 0) } else { div_round16_up(inn, rate) };
+                        (out, inn)
+                    } else {
+                        let out = rest16(rem_pays);
+                        let inn = if gets_leg.xrp { (mul_round_drops(out, rate), 0) } else { mul_round16_up(out, rate) };
+                        (out, inn)
+                    }
+                }
+                None => (rem_pays, rem_gets),
+            }
+        } else {
+            (rem_pays, rem_gets)
         };
         let mut offer_obj = serde_json::json!({
             "LedgerEntryType": "Offer",

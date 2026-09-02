@@ -180,3 +180,12 @@ fn offer_create_xrp_fills_feed_the_gross_cap_of_the_tail_slice() {
 fn offer_create_multipath_pools_rank_on_the_raw_tip_and_gross_the_direct_slice() {
     run_bundle(include_str!("vectors/offer_multipath_rawtip_fee_106701467.json"));
 }
+
+/// Findings 77 + 79 — #106701372 8BFFFACE: a passive RLUSD/BTC offer whose
+/// bridge leg B is the XRP/BTC pool with no book (77), resting a remainder
+/// that rippled re-derives from the offer's own rate with round-up (79):
+/// 1728.598227693783 RLUSD, one ULP above the walk's net remainder.
+#[test]
+fn offer_create_pool_only_leg_fills_and_the_remainder_follows_the_rate() {
+    run_bundle(include_str!("vectors/offer_pool_leg_remainder_106701372.json"));
+}
