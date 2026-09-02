@@ -1935,10 +1935,22 @@ impl Transactor for AMMVoteTransactor {
         let fee_avg: u64 = if den.0 == 0 {
             0
         } else {
-            let q = n_div(num, den, Rnd::Near);
-            let t = crate::tx::offer::me_rescale(q, -1, false); // floor(q × 10)
-            let (qq, d) = (t / 10, t % 10);
-            (if d > 5 || (d == 5 && qq % 2 == 1) { qq + 1 } else { qq }) as u64
+            // F71 — `Number::operator rep()` (Number.cpp:845-875) rounds on the
+            // EXACT discarded fraction: above half rounds up, exactly half rounds
+            // to even. We floored q×10 and read its last digit as the tie test, so
+            // every fraction in [0.5, 0.6) looked like an exact tie and rounded to
+            // even. #106698734 C1FE51B5 tallies 740.58… — mainnet 741, ours 740.
+            let (m, e) = n_div(num, den, Rnd::Near);
+            if e >= 0 {
+                m.saturating_mul(10u128.saturating_pow(e as u32)) as u64
+            } else if -e > 38 {
+                0
+            } else {
+                let div = 10u128.pow((-e) as u32);
+                let (ip, rem) = (m / div, m % div);
+                let half = div / 2;
+                (if rem > half || (rem == half && ip % 2 == 1) { ip + 1 } else { ip }) as u64
+            }
         };
 
         amm["VoteSlots"] = serde_json::Value::Array(
