@@ -4999,7 +4999,18 @@ pub(crate) fn cross_engine_to_net(
                     let r = transfer_rate(sandbox, gets_leg)
                         .filter(|_| taker != &gets_leg.issuer && maker != gets_leg.issuer);
                     if gets_leg.xrp {
-                        move_leg_gross(sandbox, taker, &maker, gets_leg, pay, gross_in(r, pay));
+                        // F75 — the XRP fill is debited on the spot, but it is
+                        // still part of the walk's GROSS spend: the tail pool
+                        // slice sizes its verbatim debit as cap − in_gross_spent
+                        // (see the `direct-tail` turn), and a stale accumulator
+                        // hands it a cap the taker no longer holds. #106700231
+                        // 4CEDDA54: slice 41,089,108 + fills 5,966,854 + 546,200
+                        // left a 5,181,445-drop tail; with the fills unrecorded
+                        // the tail asked for 11,694,499, the debit was dropped,
+                        // and the taker kept 5,181,445 drops the pool received.
+                        let g = gross_in(r, pay);
+                        move_leg_gross(sandbox, taker, &maker, gets_leg, pay, g);
+                        in_gross_spent = stamount_signed_add(false, in_gross_spent, false, g).1;
                     } else {
                         // Maker credited the NET per fill; the taker's GROSS
                         // debit accumulates (rippled grosses per offer —

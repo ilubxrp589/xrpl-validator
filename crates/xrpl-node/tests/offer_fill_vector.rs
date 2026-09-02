@@ -159,3 +159,14 @@ fn offer_create_unauthorized_taker_pays_line_is_tec_no_auth() {
 fn offer_create_issuer_side_noripple_refuses_the_book_step() {
     run_bundle(include_str!("vectors/offer_ioc_noripple_106698812.json"));
 }
+
+/// Finding 75 — #106700231 4CEDDA54: a funds-limited tfSell|tfIoC selling
+/// XRP for RLUSD, filled by an AMM slice, two CLOB offers and a tail AMM
+/// slice. The XRP CLOB fills were never added to the gross-spent
+/// accumulator, so the tail slice's remaining cap was stale (11.69M drops
+/// for a 5.18M slice); the oversized debit was dropped and the taker kept
+/// 5,181,445 drops the pool had already received.
+#[test]
+fn offer_create_xrp_fills_feed_the_gross_cap_of_the_tail_slice() {
+    run_bundle(include_str!("vectors/offer_xrp_tail_gross_106700231.json"));
+}
