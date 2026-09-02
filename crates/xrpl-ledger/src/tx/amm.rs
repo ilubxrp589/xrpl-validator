@@ -502,7 +502,10 @@ fn bump_lp_balance(
     // 279228264.81815046 must 16-digit-round NEAREST (truth keeps …1505;
     // both the old exact-string path and a downward round give …1504).
     // Number's plain addition semantics — half-even on the shed remainder.
-    let mag = if add { round16_nearest(mag) } else { mag };
+    // F84 — the burn is the same Number subtraction: nearest on BOTH sides.
+    // #106702692 6F7C52C0 (tfWithdrawAll): 29320.99190061032 − 993.427226328693
+    // = 28327.564674281627 → mainnet 28327.56467428163, ours truncated …62.
+    let mag = round16_nearest(mag);
     let sign = if neg && mag.0 > 0 { "-" } else { "" };
     obj["LPTokenBalance"]["value"] =
         serde_json::Value::String(format!("{}{}", sign, ox::me_to_value_string(mag)));

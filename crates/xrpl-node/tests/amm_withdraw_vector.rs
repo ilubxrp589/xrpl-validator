@@ -184,3 +184,11 @@ fn only_lp_withdraw_snaps_the_object_to_the_line_is_byte_exact() {
 fn one_asset_withdraw_all_under_its_amount_floor_is_tec_amm_failed() {
     run_bundle(include_str!("vectors/amm_withdraw_floor_106699133.json"));
 }
+
+/// Finding 84 — #106702692 6F7C52C0: a tfWithdrawAll burn. The pool's
+/// LPTokenBalance after the subtraction is a Number result rounded to
+/// nearest (…63); we truncated (…62).
+#[test]
+fn amm_withdraw_all_burn_rounds_the_pool_balance_to_nearest() {
+    run_bundle(include_str!("vectors/amm_withdraw_all_lp_rounding_106702692.json"));
+}
