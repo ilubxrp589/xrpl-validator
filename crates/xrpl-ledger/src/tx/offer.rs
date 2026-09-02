@@ -5424,8 +5424,17 @@ pub(crate) fn cross_engine_to_net(
                         // "AMMLiquidity::getOffer, created 15.362… USD /
                         // 11382615 XRP" then fills the whole want through the
                         // pool (in 2.372382758599013). We rested the offer.
-                        let spot = crate::tx::amm_swap::spot_quality(sandbox, a, pays_leg, gets_leg);
-                        spot != 0 && spot < q
+                        //
+                        // Revised the same day (#106715477 / #106715482, same
+                        // account and book, mainnet RESTS): the spot beating
+                        // the tip is not the test — the ANCHORED offer's own
+                        // quality is what `qualityUpperBound` hands the
+                        // strand admission, judged against the taker's NET
+                        // limit (ActiveStrands drops a strand whose bound is
+                        // worse than limitQuality). Between spot and tip, it
+                        // clears the limit for the first specimen only.
+                        crate::tx::amm_swap::anchored_offer_quality(sandbox, a, pays_leg, gets_leg, q)
+                            .is_some_and(|aq| aq <= threshold)
                     }
                 }
                 None => true,

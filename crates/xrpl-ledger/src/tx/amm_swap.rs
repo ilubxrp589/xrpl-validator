@@ -1057,6 +1057,62 @@ pub(crate) fn spot_quality(sandbox: &Sandbox, amm: &Amm, pays_leg: &Leg, gets_le
     rate_of(pool_in, n_mul(pool_out, omf, Rnd::Near))
 }
 
+/// The quality of the offer `AMMLiquidity::getOffer` generates against the
+/// LOB tip `clob` (AMMLiquidity.cpp:184-222): None when the pool cannot beat
+/// the tip — fee-inclusive spot not strictly better, or within 1e-7 of it —
+/// else `changeSpotPriceQuality`'s offer (fixAMMv1_2: maxOffer when that
+/// fails and still beats the book), as `rate_of(in, out)` in the walk's
+/// encoding (lower is better). This is the quality `tip()` hands
+/// `qualityUpperBound` with the transfer fee WAIVED, so strand admission
+/// judges it against the taker's limit as is.
+///
+/// Finding 99, revised on #106715477 01019A7D3E59 / #106715482 52CFB1FDE091:
+/// the pool's spot beating the tip is NOT the admission test. Same account,
+/// same book as #106714102: spot better than the tip in all three, yet
+/// mainnet fills only the first — its anchored offer (15.362 USD /
+/// 11382615 XRP, 1.34962e-6) beats the net limit 1.35048e-6, while the
+/// later two (11.153 USD / 8272983 XRP, 1.34815e-6) miss theirs
+/// (1.34781e-6): "All strands dry", the offer rests. The anchored offer's
+/// average quality sits between the spot and the tip, and only IT is
+/// compared with the limit.
+pub(crate) fn anchored_offer_quality(
+    sandbox: &Sandbox,
+    amm: &Amm,
+    pays_leg: &Leg,
+    gets_leg: &Leg,
+    clob: u64,
+) -> Option<u64> {
+    let pool_in = holds_for_offer(sandbox, &amm.account, gets_leg);
+    let pool_out = holds_for_offer(sandbox, &amm.account, pays_leg);
+    if pool_in.0 == 0 || pool_out.0 == 0 || clob == 0 {
+        return None;
+    }
+    let omf = n_sub(N_ONE, fee_n(amm.tfee), Rnd::Near);
+    let spot = rate_of(pool_in, n_mul(pool_out, omf, Rnd::Near));
+    if spot == 0 || spot >= clob {
+        return None;
+    }
+    let (rs, rb) = (decode_rate(spot), decode_rate(clob));
+    let dist = n_div(n_sub(rb, rs, Rnd::Near), rb, Rnd::Near);
+    if n_cmp(dist, (LO, -22)) == Ordering::Less {
+        return None; // within 1e-7
+    }
+    let offer = anchored_offer(pool_in, pool_out, gets_leg.xrp, pays_leg.xrp, clob, amm.tfee).or_else(|| {
+        let out = to_amount(n_mul(pool_out, (9_900_000_000_000_000, -16), Rnd::Near), pays_leg.xrp, Rnd::Down);
+        if out.0 == 0 || n_cmp(out, pool_out) != Ordering::Less {
+            return None;
+        }
+        swap_asset_out(pool_in, pool_out, out, amm.tfee, gets_leg.xrp)
+            .map(|i| (i, out))
+            .filter(|(i, o)| rate_of(*i, *o) < clob)
+    })?;
+    let q = rate_of(offer.0, offer.1);
+    if std::env::var("DX_AMM").is_ok() {
+        eprintln!("DX_AMM anchored-offer in={:?} out={:?} q={q:x} clob={clob:x} spot={spot:x}", offer.0, offer.1);
+    }
+    (q != 0).then_some(q)
+}
+
 pub(crate) fn holds_for_offer(sandbox: &Sandbox, acct: &[u8; 20], leg: &Leg) -> Me {
     if !leg.xrp {
         let gf = ox::json_at(sandbox, &keylet::account_root_key(&leg.issuer))

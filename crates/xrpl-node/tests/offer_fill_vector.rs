@@ -276,3 +276,17 @@ fn offer_bridge_direct_head_funds_bound_fill_floors_the_input() {
 fn offer_amm_admitted_when_pool_spot_beats_a_tip_inside_the_fee_band() {
     run_bundle(include_str!("vectors/offer_amm_tip_in_fee_band_106714102.json"));
 }
+
+/// #106715477 01019A7D3E59 (finding 99, revised): the same account and book
+/// as #106714102 five hundred ledgers later — pool spot better than the
+/// order book tip, tip inside the fee band — and mainnet RESTS the offer.
+/// The anchored pool offer rippled generates (11.153 USD / 8272983 XRP,
+/// 1.34815e-6) misses the taker's net limit (1.34781e-6), so the strand is
+/// dropped at admission ("All strands dry"); the first specimen's anchored
+/// offer cleared its limit. Admission judges the anchored offer, not the
+/// spot. Byte-exact on the created Offer, both directory pages and the
+/// taker's AccountRoot; the pool untouched.
+#[test]
+fn offer_amm_rests_when_the_anchored_pool_offer_misses_the_net_limit() {
+    run_bundle(include_str!("vectors/offer_amm_anchored_misses_net_limit_106715477.json"));
+}
