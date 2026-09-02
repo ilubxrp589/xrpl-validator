@@ -389,6 +389,33 @@ def main():
         except Exception:
             pass
 
+    # The pool account's whole owner directory and every LPToken line on it:
+    # fixAMMv1_1's isOnlyLiquidityProvider (AMMWithdraw, finding 63) walks the
+    # AMM's owner dir counting LP lines — with the other LPs' lines absent the
+    # probe declares the withdrawer the sole LP and refuses with
+    # tecAMM_INVALID_TOKENS (#106702692 6F7C52C0, live tesSUCCESS).
+    if tx.get("TransactionType", "").startswith("AMM") and tx.get("Asset") is not None and tx.get("Asset2") is not None:
+        try:
+            def ap2(x):
+                return {"currency": "XRP"} if x.get("currency") == "XRP" and not x.get("issuer") else {"currency": x["currency"], "issuer": x["issuer"]}
+            r = rpc("ledger_entry", {"amm": {"asset": ap2(tx["Asset"]), "asset2": ap2(tx["Asset2"])}, "ledger_index": seq - 1})
+            pool = (r.get("node") or {}).get("Account")
+            if pool:
+                d = rpc("account_objects", {"account": pool, "ledger_index": seq - 1, "limit": 400})
+                for o in d.get("account_objects", []):
+                    oi = (o.get("index") or "").upper()
+                    if oi and oi not in pre:
+                        nb = fetch_key(oi)
+                        if nb:
+                            pre[oi] = nb
+                            walk(o)
+                od = rpc("ledger_entry", {"directory": {"owner": pool}, "ledger_index": seq - 1, "binary": True})
+                oi = (od.get("index") or "").upper()
+                if od.get("node_binary") and oi and oi not in pre:
+                    pre[oi] = od["node_binary"]
+        except Exception:
+            pass
+
     # Asset/Asset2 transactors (AMMBid/Vote/Deposit/Withdraw/Delete) read the
     # AMM object, the bidder/voter's LP line and every slot-holder's LP line —
     # none of which a tec's meta shows (it touches only the fee). The F49
