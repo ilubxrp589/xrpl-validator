@@ -447,60 +447,6 @@ fn div_round16_down(a: Me, rate: Me) -> Me {
 /// both:
 ///   #106308202 6B6D7EFC  283956.0452856067 -> 283956  (0.045 discarded)
 ///   #105672435 B409D45C  165388.7424863569 -> 165389  (0.7 carries)
-/// `divRound(a, rate, iouAsset, roundUp = true)` — the ceiling sibling of
-/// `div_round16_down`: quotient at the 17-shift rounded UP, then
-/// `canonicalizeRound(up)` (STAmount.cpp divRoundImpl).
-pub(crate) fn div_round16_up(a: Me, rate: Me) -> Me {
-    let (a, r) = (norm16(a), norm16(rate));
-    if a.0 == 0 || r.0 == 0 {
-        return (0, 0);
-    }
-    const TEN17: u128 = 100_000_000_000_000_000;
-    const MAXV: u128 = 9_999_999_999_999_999;
-    let num = a.0.saturating_mul(TEN17);
-    let mut m = num / r.0 + u128::from(num % r.0 != 0);
-    let mut e = a.1 - r.1 - 17;
-    if m > MAXV {
-        while m > 10 * MAXV {
-            m /= 10;
-            e += 1;
-        }
-        m = (m + 9) / 10;
-        e += 1;
-    }
-    while m < 1_000_000_000_000_000 {
-        m *= 10;
-        e -= 1;
-    }
-    (m, e)
-}
-
-/// `divRound(a, rate, XRP, roundUp = true)` as whole drops: the 17-shift
-/// quotient rounded up, then `canonicalizeRound(native, up)` exactly as
-/// `mul_round_drops` finishes a product.
-fn div_round_drops_up(a: Me, rate: Me) -> u128 {
-    let (a, r) = (norm16(a), norm16(rate));
-    if a.0 == 0 || r.0 == 0 {
-        return 0;
-    }
-    const TEN17: u128 = 100_000_000_000_000_000;
-    let num = a.0.saturating_mul(TEN17);
-    let mut m = num / r.0 + u128::from(num % r.0 != 0);
-    let mut e = a.1 - r.1 - 17;
-    if e < 0 {
-        let mut loops = 0;
-        while e < -1 {
-            m /= 10;
-            e += 1;
-            loops += 1;
-        }
-        m += if loops >= 2 { 9 } else { 10 };
-        m /= 10;
-        e += 1;
-    }
-    m.saturating_mul(10u128.saturating_pow(e.clamp(0, 38) as u32))
-}
-
 fn mul_round_drops(a: Me, b: Me) -> u128 {
     let (a, b) = (norm16(a), norm16(b));
     if a.0 == 0 || b.0 == 0 {
@@ -6079,8 +6025,18 @@ impl Transactor for OfferCreateTransactor {
                 Some(q) => {
                     let rate = rate_me(q);
                     if sell {
+                        // F79b — fixReducedOffersV1: the sell remainder's out is
+                        // `divRoundStrict(in, rate, out.issue, /*roundUp*/ false)`
+                        // — rounded DOWN, "so the reduced offer never blocks the
+                        // book" (CreateOffer.cpp:479-492); the up-rounding
+                        // divRound is the pre-amendment arm. The rate is
+                        // getRate's legacy divide (17-digit truncate, +5,
+                        // nearest), which is what `rate_of_me` encodes.
+                        // #106644297 2B6E3D5A: 405718691 / 56222099782.98270
+                        // truncates to 0.007216356069340599 (mainnet); rounding
+                        // up gave …600 and broke eight HIST60 ledgers.
                         let inn = rest16(rem_gets);
-                        let out = if pays_leg.xrp { (div_round_drops_up(inn, rate), 0) } else { div_round16_up(inn, rate) };
+                        let out = if pays_leg.xrp { (div_round_drops_strict_floor(inn, rate), 0) } else { div_round16_down(inn, rate) };
                         (out, inn)
                     } else {
                         let out = rest16(rem_pays);

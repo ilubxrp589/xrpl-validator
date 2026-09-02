@@ -189,3 +189,12 @@ fn offer_create_multipath_pools_rank_on_the_raw_tip_and_gross_the_direct_slice()
 fn offer_create_pool_only_leg_fills_and_the_remainder_follows_the_rate() {
     run_bundle(include_str!("vectors/offer_pool_leg_remainder_106701372.json"));
 }
+
+/// Finding 79b — #106644297 2B6E3D5A: a tfSell XRP→BTC offer partially
+/// crossed. Under fixReducedOffersV1 the resting out is
+/// divRoundStrict(in, rate, roundUp = false): 0.007216356069340599 BTC on
+/// mainnet; the first cut of finding 79 rounded it up to …600.
+#[test]
+fn offer_create_sell_remainder_rounds_down_under_fix_reduced_offers() {
+    run_bundle(include_str!("vectors/offer_sell_remainder_106644297.json"));
+}
