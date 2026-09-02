@@ -447,6 +447,44 @@ fn div_round16_down(a: Me, rate: Me) -> Me {
 /// both:
 ///   #106308202 6B6D7EFC  283956.0452856067 -> 283956  (0.045 discarded)
 ///   #105672435 B409D45C  165388.7424863569 -> 165389  (0.7 carries)
+/// F81 — a strand's remainders live in `TIn`/`TOut` (IOUAmount / XRPAmount):
+/// every `remainingIn -= stpAmt.in` / `remainingOut -= stpAmt.out` in
+/// `BookStep::revImp`/`fwdImp` and StrandFlow's `remainingIn -= f.in` is
+/// IOUAmount arithmetic — `Number`, normalized to 16 digits, nearest — while
+/// `me_sub` kept every digit. The next in-limited fill is sized from that
+/// remainder, so the walk drifted one ULP on the last fill. #106702066
+/// 344657FD (tfSell|tfIoC, 73409.392239516 XSPECTAR into XRP over nine
+/// iterations): rippled's total in is 73409.39223951599 — one ULP of dust
+/// stays on the taker's line, the last maker's offer and line sit one ULP
+/// the other way; we consumed the line to exactly zero.
+fn rem_after(leg: &Leg, rem: Me, x: Me) -> Me {
+    if leg.xrp {
+        me_sub(rem, x)
+    } else {
+        iou_amount(crate::tx::amm_swap::n_sub(rem, x, crate::tx::amm_swap::Rnd::Near))
+    }
+}
+
+/// `IOUAmount::normalize()` (IOUAmount.cpp:91-107): a Number-normalized
+/// 16-digit mantissa, and anything whose exponent falls below −96 IS ZERO
+/// (STAmount's cMinOffset). A strand's remainders are IOUAmounts, so a dust
+/// remainder cannot shrink forever: #106703062 AC58204A (BTC→FLR partial
+/// payment) delivered all but 2e-14 FLR in its first round, and our
+/// unbounded remainders (exponents past −2700) kept the flow spinning until
+/// the 1000-round cap fired telFAILED_PROCESSING where rippled's next round
+/// found the pool's slice rounding to nothing and went dry.
+pub(crate) fn iou_amount(v: Me) -> Me {
+    if v.0 == 0 {
+        return (0, 0);
+    }
+    let n = crate::tx::amm_swap::n_norm_pub(v);
+    if n.1 < -96 {
+        (0, 0)
+    } else {
+        n
+    }
+}
+
 fn mul_round_drops(a: Me, b: Me) -> u128 {
     let (a, b) = (norm16(a), norm16(b));
     if a.0 == 0 || b.0 == 0 {
@@ -3363,8 +3401,8 @@ thr={t:?} admits_trunc={} admits_up={}",
                 if std::env::var("DX_FILL").is_ok() {
                     eprintln!("DX_FILL give={give:?} pay={pay:?} rem_pays={rem_pays:?} rem_gets={rem_gets:?}");
                 }
-                rem_pays = me_sub(rem_pays, give);
-                rem_gets = me_sub(rem_gets, pay);
+                rem_pays = rem_after(pays_leg, rem_pays, give);
+                rem_gets = rem_after(gets_leg, rem_gets, pay);
                 if in_exhausted {
                     rem_gets = (0, 0);
                 }
@@ -3713,8 +3751,8 @@ thr={t:?} admits_trunc={} admits_up={}",
                     }
                     _ => break 'attempt,
                 }
-                rem_gets = me_sub(rem_gets, gets_in);
-                rem_pays = me_sub(rem_pays, pays_out);
+                rem_gets = rem_after(gets_leg, rem_gets, gets_in);
+                rem_pays = rem_after(pays_leg, rem_pays, pays_out);
                 if in_exhausted {
                     // The gross budget is spent; the net chain's leftover is
                     // division dust rippled never sees (see the walk's rule).
@@ -5061,8 +5099,8 @@ pub(crate) fn cross_engine_to_net(
                 if std::env::var("DX_FILL").is_ok() {
                     eprintln!("DX_FILL give={give:?} pay={pay:?} rem_pays={rem_pays:?} rem_gets={rem_gets:?}");
                 }
-                rem_pays = me_sub(rem_pays, give);
-                rem_gets = me_sub(rem_gets, pay);
+                rem_pays = rem_after(pays_leg, rem_pays, give);
+                rem_gets = rem_after(gets_leg, rem_gets, pay);
                 if in_exhausted {
                     // The gross budget is spent to the last unit; the net
                     // chain's leftover is the division's round-down dust,

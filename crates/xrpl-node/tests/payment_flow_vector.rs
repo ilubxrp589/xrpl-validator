@@ -94,3 +94,12 @@ fn run_bundle(bundle_json: &str) {
 fn payment_flow_driver_runs_on_remainders_not_a_round_cap() {
     run_bundle(include_str!("vectors/payment_rounds_106693003.json"));
 }
+
+/// Finding 81 (payments) — #106703062 AC58204A: a BTC→FLR partial payment
+/// whose first round leaves 2e-14 FLR of dust. IOUAmount remainders zero
+/// below 1e-96 and the flow goes dry; ours spun to the 1000-round cap and
+/// returned telFAILED_PROCESSING.
+#[test]
+fn payment_dust_remainders_are_iou_amounts() {
+    run_bundle(include_str!("vectors/payment_dust_remainder_106703062.json"));
+}

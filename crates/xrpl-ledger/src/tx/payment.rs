@@ -2632,7 +2632,16 @@ impl PaymentTransactor {
         let max_tries = 1000usize;
         let mut cur_try = 0usize;
         loop {
-            if ox::me_is_zero(rem_out) || ox::me_is_zero(rem_in) {
+            // F81 (payments) — rippled loops `while (remainingOut > 0 &&
+            // remainingIn > 0)` on ONE gross remainder (`remainingIn -= f.in`,
+            // StrandFlow.h:652); the net twin below is our own running
+            // subtraction and can hold a one-ULP residue after the strand has
+            // consumed the whole SendMax. #106703062 AC58204A: 1.335056517376953e-6
+            // BTC spent in full, net residue 1e-21, 1000 rounds of dust →
+            // telFAILED_PROCESSING where mainnet stops after one iteration.
+            rem_in_gross = ox::iou_amount(rem_in_gross);
+            rem_out = ox::iou_amount(rem_out);
+            if ox::me_is_zero(rem_out) || ox::me_is_zero(rem_in) || ox::me_is_zero(rem_in_gross) {
                 break;
             }
             cur_try += 1;
