@@ -48,7 +48,8 @@ fn run_bundle(bundle_json: &str) {
     let tx_hash = tx["hash"].as_str().unwrap();
     let txf = build_txfields(tx).expect("txfields");
     let (ter, mut mods) = native_apply_one(&state, &txf);
-    assert_eq!(ter, "tesSUCCESS", "mainnet applied this transaction");
+    let want_ter = bundle["result"].as_str().unwrap_or("tesSUCCESS");
+    assert_eq!(ter, want_ter, "mainnet recorded this transaction result");
 
     xrpl_ledger::ledger::threading::stamp_threading(
         &mut mods,
@@ -83,4 +84,12 @@ fn run_bundle(bundle_json: &str) {
 #[test]
 fn signer_list_set_files_the_owner_keylet_field() {
     run_bundle(include_str!("vectors/signerlist_owner_106699661.json"));
+}
+
+/// Finding 83 — #106703005 F62BBA1C: a SignerListSet whose entries arrive
+/// out of account order. rippled sorts them before writing the list
+/// (SetSignerList.cpp:66); we filed them as sent.
+#[test]
+fn signer_list_set_files_entries_in_account_order() {
+    run_bundle(include_str!("vectors/signerlist_sorted_entries_106703005.json"));
 }

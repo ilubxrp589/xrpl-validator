@@ -210,9 +210,22 @@ impl Transactor for SignerListSetTransactor {
                 }
             }
         } else {
-            let signers = tx.fields.get("SignerEntries")
+            let mut signers = tx.fields.get("SignerEntries")
                 .cloned()
                 .unwrap_or(serde_json::Value::Array(vec![]));
+            // F83 — rippled sorts the deserialized entries before writing the
+            // list (SetSignerList.cpp:66 `std::sort`, SignerEntries::operator<
+            // = account order). #106703005 F62BBA1C filed its entries in tx
+            // order; mainnet's list is ascending by AccountID.
+            if let Some(arr) = signers.as_array_mut() {
+                arr.sort_by_key(|e| {
+                    e.get("SignerEntry")
+                        .and_then(|se| se.get("Account"))
+                        .and_then(|a| a.as_str())
+                        .and_then(crate::tx::offer::decode20)
+                        .unwrap_or([0u8; 20])
+                });
+            }
 
             let already_exists = sandbox.exists(&signer_list_key);
 
