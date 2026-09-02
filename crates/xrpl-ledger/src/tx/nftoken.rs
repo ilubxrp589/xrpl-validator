@@ -793,7 +793,14 @@ fn nft_royalty_drops(drops: u64, fee_units: u128) -> u128 {
 }
 
 /// Move `drops` from buyer to seller, carving the NFTokenID-embedded transfer
-/// fee (1/100000 units) out for the issuer when the seller isn't the issuer.
+/// fee (1/100000 units) out for the issuer when NEITHER party is the issuer.
+///
+/// rippled's gate is `seller != issuer && buyer != issuer`
+/// (NFTokenAcceptOffer.cpp:423 direct, :542 brokered): an issuer buying its
+/// own token back pays no royalty to itself and the seller keeps the whole
+/// price. #106711435 DC521081D420 is the specimen — a brokered sale whose
+/// BUYER is the minter; the seller-only test carved 5 % (500000 drops) off
+/// the seller and handed it to the buyer (finding 94).
 fn pay_xrp_with_transfer_fee(
     sandbox: &mut Sandbox,
     buyer: &[u8; 20],
@@ -804,7 +811,7 @@ fn pay_xrp_with_transfer_fee(
     let fee_units = u16::from_be_bytes([nft_id.0[2], nft_id.0[3]]) as u128;
     let issuer = nftpage::issuer_of(nft_id);
     let mut to_issuer = 0u128;
-    if fee_units > 0 && issuer != *seller {
+    if fee_units > 0 && issuer != *seller && issuer != *buyer {
         to_issuer = nft_royalty_drops(drops, fee_units);
     }
     adjust_xrp(sandbox, buyer, -(drops as i128));
@@ -1011,7 +1018,7 @@ impl Transactor for NFTokenAcceptOfferTransactor {
                 if broker_fee > 0 {
                     adjust_xrp(sandbox, &tx.account, broker_fee as i128);
                 }
-                pay_settle_seller(sandbox, &seller, &sell.nft_id, to_seller);
+                pay_settle_seller(sandbox, &buyer, &seller, &sell.nft_id, to_seller);
             } else {
                 // IOU-priced brokered sale: same shape over trust lines.
                 let bf = tx.fields.get("NFTokenBrokerFee");
@@ -1109,7 +1116,9 @@ fn pay_iou_with_transfer_fee(
     let seller_side = ox::me_sub(value, broker_cut);
     let fee_units = u16::from_be_bytes([nft_id.0[2], nft_id.0[3]]) as u128;
     let nft_issuer = nftpage::issuer_of(nft_id);
-    let nft_cut = if fee_units > 0 && nft_issuer != *seller {
+    // Same issuer gate as the XRP flavor: no royalty when the buyer or the
+    // seller IS the issuer (NFTokenAcceptOffer.cpp:542, finding 94).
+    let nft_cut = if fee_units > 0 && nft_issuer != *seller && nft_issuer != *buyer {
         // Same rippled call as the XRP flavor — multiply(amount, rate), the
         // Number pipeline: ONE half-even reduction of the FULL product to 16
         // significant digits; the /100000 is exponent arithmetic, exact.
@@ -1170,11 +1179,21 @@ fn pay_iou_with_transfer_fee(
 }
 
 /// Credit the seller with `drops`, carving the transfer fee for the issuer.
-fn pay_settle_seller(sandbox: &mut Sandbox, seller: &[u8; 20], nft_id: &Hash256, drops: u64) {
+/// Brokered-mode seller leg: the buyer was already debited the full buy
+/// amount and the broker paid; carve the issuer's cut from what remains —
+/// unless the buyer or the seller is the issuer (NFTokenAcceptOffer.cpp:542,
+/// finding 94).
+fn pay_settle_seller(
+    sandbox: &mut Sandbox,
+    buyer: &[u8; 20],
+    seller: &[u8; 20],
+    nft_id: &Hash256,
+    drops: u64,
+) {
     let fee_units = u16::from_be_bytes([nft_id.0[2], nft_id.0[3]]) as u128;
     let issuer = nftpage::issuer_of(nft_id);
     let mut to_issuer = 0u128;
-    if fee_units > 0 && issuer != *seller {
+    if fee_units > 0 && issuer != *seller && issuer != *buyer {
         to_issuer = nft_royalty_drops(drops, fee_units);
     }
     adjust_xrp(sandbox, seller, drops as i128 - to_issuer as i128);
@@ -1405,10 +1424,10 @@ mod tests {
                 "OwnerCount": 0,
                 "Flags": 0,
             });
-            state.state_map.insert(
-                keylet::account_root_key(id),
-                serde_json::to_vec(&acct).unwrap(),
-            );
+            state
+                .state_map
+                .insert(keylet::account_root_key(id), serde_json::to_vec(&acct).unwrap())
+                .unwrap();
         }
         state
     }

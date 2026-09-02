@@ -152,3 +152,14 @@ fn run_bundle(bundle_json: &str) {
 fn first_self_mint_first_nftoken_sequence_is_the_tx_sequence_is_byte_exact() {
     run_bundle(include_str!("vectors/nft_mint_firstseq_106697665.json"));
 }
+
+/// Finding 94 (2026-09-02): mainnet #106711435 tx DC521081D420… — a brokered
+/// accept whose BUYER is the token's minter. rippled pays the issuer's cut
+/// only when `seller != issuer && buyer != issuer`
+/// (NFTokenAcceptOffer.cpp:542); our seller-only gate carved 500000 drops
+/// (the 5 % TransferFee) off the seller and credited the buyer with them.
+/// RED at HEAD~ (two AccountRoots one balance apart), GREEN with the gate.
+#[test]
+fn nft_accept_brokered_issuer_buyer_pays_no_royalty() {
+    run_bundle(include_str!("vectors/nftaccept_brokered_issuer_buyer_106711435.json"));
+}
