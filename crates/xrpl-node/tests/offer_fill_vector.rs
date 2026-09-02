@@ -148,3 +148,14 @@ fn offer_fill_funds_limited_bridge_leg_floors_the_mid_leg_is_byte_exact() {
 fn offer_create_unauthorized_taker_pays_line_is_tec_no_auth() {
     run_bundle(include_str!("vectors/offer_noauth_106698333.json"));
 }
+
+/// Finding 69 — #106698812 5D50FA86: tfSell|tfIoC selling 9.08905 QUWAGI for
+/// 193960 drops. The taker's QUWAGI line carries NoRipple on the ISSUER's
+/// side (Flags 0x330000), so rippled's `BookStep::check` refuses the strand
+/// (`toStep failed: -90` = terNO_RIPPLE), nothing crosses although the book's
+/// tip is a funds-limited offer at a better rate, and the IoC is tecKILLED
+/// with one mutation. We crossed the tip and reported tesSUCCESS.
+#[test]
+fn offer_create_issuer_side_noripple_refuses_the_book_step() {
+    run_bundle(include_str!("vectors/offer_ioc_noripple_106698812.json"));
+}

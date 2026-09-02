@@ -5647,11 +5647,46 @@ impl Transactor for OfferCreateTransactor {
             // drain law, fully-funded flavor).
             Some(send_max)
         };
-        let (rem_pays, rem_gets_cross, crossed) = cross_engine_to_net(
-            &tx.account, &tx.account, tp0, tg_cross, &pays_leg, &gets_leg, threshold,
-            threshold_self, sell, true, false, None, domain.as_ref(), None, gross_cap,
-            sandbox, &mut stale,
-        );
+        // F69 — NO-RIPPLE REFUSES THE BOOK STEP ITSELF (BookStep.cpp:1385-1401).
+        // `BookStep::check` reads the line between the previous DIRECT step's
+        // source (the taker) and the book's in-issuer, and fails the strand
+        // with terNO_RIPPLE when the ISSUER's side carries NoRipple (terNO_LINE
+        // without a line). `toStrands` then has nothing to offer — "failed to
+        // add default path" — and `flowCross` swallows the failure: the amounts
+        // come back untouched, `crossed` stays false, and the offer rests WHOLE
+        // (IoC/FoK: tecKILLED). No offer is ever stepped, so nothing stale is
+        // reaped either. The XRP bridge and the AMM ride the same book step,
+        // so an IOU/IOU crossing is refused just the same.
+        //
+        // #106698812 5D50FA86 (tfSell|tfIoC, 9.08905 QUWAGI for 193960 drops):
+        // the taker's QUWAGI line carries lsfHighNoRipple on the issuer's side
+        // (Flags 0x330000), the book's tip is a funds-limited 199959-drop offer
+        // at a better rate, and rippled's own trace reads `toStep failed: -90`
+        // → tecKILLED with one mutation. We crossed the tip and reported
+        // tesSUCCESS. The issuer's DefaultRipple (set) is irrelevant: the flag
+        // that counts is the one FILED on this line.
+        let book_refused = !gets_leg.xrp && tx.account != gets_leg.issuer && {
+            let lk = keylet::ripple_state_key(&tx.account, &gets_leg.issuer, &gets_leg.cur);
+            match json_at(sandbox, &lk) {
+                None => true,
+                Some(line) => {
+                    let bit = if gets_leg.issuer > tx.account { 0x0020_0000 } else { 0x0010_0000 };
+                    line["Flags"].as_u64().unwrap_or(0) & bit != 0
+                }
+            }
+        };
+        let (rem_pays, rem_gets_cross, crossed) = if book_refused {
+            if std::env::var("DX_FOK").is_ok() {
+                eprintln!("DX_FOK book-refused: issuer-side NoRipple on the taker's TakerGets line");
+            }
+            (tp0, tg_cross, 0)
+        } else {
+            cross_engine_to_net(
+                &tx.account, &tx.account, tp0, tg_cross, &pays_leg, &gets_leg, threshold,
+                threshold_self, sell, true, false, None, domain.as_ref(), None, gross_cap,
+                sandbox, &mut stale,
+            )
+        };
         // Re-express the leftover against the ORIGINAL TakerGets: only the
         // funded part could be spent, but the whole unspent remainder rests.
         // Left exactly as returned when the clamp did not bite, so the fully
