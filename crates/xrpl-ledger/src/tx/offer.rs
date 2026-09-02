@@ -3218,8 +3218,17 @@ thr={t:?} admits_trunc={} admits_up={}",
                     // pool-only and unbounded, so admitting fills what mainnet
                     // rests. Fixing it needs the anchored-slice cap + CLOB
                     // continuation per leg — one build, both sites together.
+                    // F77 — a leg with NO book offers is still a live leg when a
+                    // pool stands behind it: `forEachOffer` falls to
+                    // `tryAMM(std::nullopt)` (BookStep.cpp:866-869) and the
+                    // single-path `getOffer` emits `maxOffer`, whose quality is
+                    // the feeless spot — the leg's upper bound. #106701372
+                    // 8BFFFACE (passive RLUSD/BTC): the direct book misses the
+                    // limit, the XRP→BTC leg has no offers, and rippled fills
+                    // 176.449 RLUSD through offer 7C87A968 + the XRP/BTC pool in
+                    // one single-path iteration; we admitted nothing.
                     let single_tip = |book: Option<Me>, spot: Option<Me>| -> Option<Me> {
-                        let b = book?;
+                        let Some(b) = book else { return spot };
                         match spot {
                             // `spotPriceQ <= clobQuality` bails "higher clob
                             // quality" first, so the pool must be STRICTLY better.
@@ -7605,7 +7614,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bridge_leg_with_a_pool_but_no_book_carries_nothing() {
+    fn a_bridge_leg_with_a_pool_but_no_book_is_priced_by_the_pool() {
         let taker = [0x01u8; 20];
         let mk_a = [0x04u8; 20];
         let pool_b = [0x07u8; 20];
@@ -7680,17 +7689,23 @@ mod tests {
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
-        assert_eq!(
-            read_balance(&sandbox, &pool_b), pool_xrp_before,
-            "the pool behind an empty leg book must not be touched",
+        // F77 (2026-09-01): rippled's `forEachOffer` falls to `tryAMM(nullopt)`
+        // on an empty book and the single-path `getOffer` emits `maxOffer`, so
+        // the pool IS the leg. The 07-30 rule ("carries nothing") had the right
+        // OUTCOME on #105813899 44E799C6 for the wrong reason: rippled's trace
+        // shows the pool-only leg admitted and sized (in 0.01243304967819184,
+        // out 0.000006577394048876431) and the pass then "rejected by
+        // limitQuality" — the judge, not a gate. Here the composition (0.01
+        // AAA/BBB) sits well inside the 0.1 limit, so the pass crosses.
+        assert!(
+            read_balance(&sandbox, &pool_b) > pool_xrp_before,
+            "the pool behind an empty leg book is the leg's liquidity",
         );
-        assert_eq!(
-            json_at(&sandbox, &keylet::offer_key(&mk_a, 2)).unwrap()["TakerGets"].as_str(),
-            Some("1000000"),
-            "leg A's book maker must be untouched",
+        let leg_a = json_at(&sandbox, &keylet::offer_key(&mk_a, 2));
+        assert!(
+            leg_a.map_or(true, |o| o["TakerGets"].as_str() != Some("1000000")),
+            "leg A's book maker was consumed on the way to the pool",
         );
-        let rested = json_at(&sandbox, &keylet::offer_key(&taker, 9)).expect("offer rests");
-        assert_eq!(rested["TakerGets"]["value"].as_str(), Some("10"), "and rests in full");
     }
 
     /// Mainnet tx 9BA91A9E… (ledger 105777146): the WETH issuer publishes
