@@ -605,10 +605,22 @@ fn to_amount(x: Me, xrp: bool, rnd: Rnd) -> Me {
         // relative). rippled keeps it because `limitOut` actually reduced the
         // output, which arms the `adjustedRemOut` 1e-7 forgiveness — the
         // tolerance and this rounding are one mechanism, not two.
+        // F74 — `XRPAmount{Number}` converts through `Number::operator rep()`
+        // (Number.cpp:845-875): above half rounds up, an EXACT half rounds to
+        // even. Reading floor(x×10)'s last digit rounded every tie up, so
+        // 2.5 drops became 3 where rippled takes 2. Same family as F71.
         Rnd::Near => {
-            let t = ox::me_rescale(x, -1, false); // floor(x * 10)
-            let (q, d) = (t / 10, t % 10);
-            (if d >= 5 { q + 1 } else { q }, 0)
+            let (m, e) = n_norm(x);
+            if e >= 0 {
+                (m.saturating_mul(10u128.saturating_pow(e as u32)), 0)
+            } else if -e > 38 {
+                (0, 0)
+            } else {
+                let div = 10u128.pow((-e) as u32);
+                let (ip, rem) = (m / div, m % div);
+                let half = div / 2;
+                (if rem > half || (rem == half && ip % 2 == 1) { ip + 1 } else { ip }, 0)
+            }
         }
     }
 }
@@ -1723,6 +1735,19 @@ pub(crate) fn consume(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn xrp_nearest_rounds_exact_ties_to_even() {
+        // F74: Number::operator rep() semantics for drops.
+        let d = |m: u128, e: i32| to_amount((m, e), true, Rnd::Near).0;
+        assert_eq!(d(25, -1), 2); // 2.5 → 2 (tie, even)
+        assert_eq!(d(35, -1), 4); // 3.5 → 4 (tie, odd)
+        assert_eq!(d(251, -2), 3); // 2.51 → 3
+        assert_eq!(d(249, -2), 2); // 2.49 → 2
+        assert_eq!(d(2611709076568765, -10), 261171); // #105843839 limitOut drop
+        assert_eq!(d(7, 0), 7);
+        assert_eq!(d(0, 0), 0);
+    }
+
     use super::*;
 
     /// getRate's half-up division, pinned to finding 47's arbitration
