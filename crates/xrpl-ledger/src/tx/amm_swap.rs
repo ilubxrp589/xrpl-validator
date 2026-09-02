@@ -1515,6 +1515,56 @@ pub(crate) fn apply_slice(
 /// (beyond 1e-7 relative distance), moving balances in the sandbox.
 /// Returns updated (rem_pays, rem_gets, used).
 #[allow(clippy::too_many_arguments)]
+/// `StrandFlow::limitOut` for a strand whose only non-constant step is this
+/// pool: the output at which the strand's average quality equals the limit.
+///
+/// `BookStep::getQualityFunc` builds the pool's QualityFunction (AMMTag:
+/// m = −f/poolIn, b = poolOut·f/poolIn, both at Nearest) and, when the taker
+/// pays an in-side transfer rate, COMBINES it behind
+/// `QualityFunction{Quality{trIn}, CLOBLikeTag}` (b₀ = 1/trIn at Nearest):
+/// m ← b₀·m, b ← b₀·b. `outFromAvgQ` then evaluates (1/limit − b)/m under
+/// Upward rounding per op — 1/limit rounds up, the negative difference
+/// rounds toward zero (magnitude down), the positive quotient rounds up —
+/// where `limit` is the crossing's INFLATED limitQuality (Quality{out,
+/// sendMax}, OfferCreate.cpp flowCross), the walk's `threshold_self`.
+///
+/// Solving the net form (raw threshold, unscaled m/b) is the same algebra
+/// but not the same roundings: #106703173 AE6C73F9 (FLR/BTC pool, fee 969,
+/// FLR rate 1.003) — rippled out 5.509588100528479e-8, net form
+/// 5.509588100530126e-8, and the two pool lines land two ulps off. With no
+/// in-side rate (b₀ = 1, limit = threshold) this is the previous computation
+/// verbatim. (finding 90)
+fn qf_limit_out(
+    pool_in: Me,
+    pool_out: Me,
+    tfee: u16,
+    in_gross_rate: Option<u64>,
+    threshold: u64,
+    threshold_gross: u64,
+) -> Option<Me> {
+    let cfee = n_sub(N_ONE, fee_n(tfee), Rnd::Near);
+    let mut m = n_div(cfee, pool_in, Rnd::Near);
+    let mut b = n_div(n_mul(pool_out, cfee, Rnd::Near), pool_in, Rnd::Near);
+    let lim = match in_gross_rate {
+        Some(r) if r != 1_000_000_000 && threshold_gross != u64::MAX => {
+            let b0 = n_div(N_ONE, n_norm((r as u128, -9)), Rnd::Near);
+            m = n_mul(b0, m, Rnd::Near);
+            b = n_mul(b0, b, Rnd::Near);
+            decode_rate(threshold_gross)
+        }
+        _ => decode_rate(threshold),
+    };
+    if lim.0 == 0 || m.0 == 0 {
+        return None;
+    }
+    let r1 = n_div(N_ONE, lim, Rnd::Up);
+    let num = n_sub(b, r1, Rnd::Down);
+    if num.0 == 0 {
+        return None;
+    }
+    Some(n_div(num, m, Rnd::Up))
+}
+
 pub(crate) fn consume(
     sandbox: &mut Sandbox,
     amm: &Amm,
@@ -1532,6 +1582,12 @@ pub(crate) fn consume(
     pays_leg: &Leg,
     gets_leg: &Leg,
     threshold: u64,
+    // The crossing's limitQuality as rippled's flow() sees it: `Quality{out,
+    // sendMax}` with sendMax = TakerGets × trIn rounded up (OfferCreate.cpp
+    // flowCross), i.e. the walk's `threshold_self`. Equals `threshold` when
+    // no in-side transfer rate applies. Only the QualityFunction limit solve
+    // reads it (finding 90).
+    threshold_gross: u64,
     sell: bool,
     clob: Option<u64>,
     // Payment-mode IN-side transfer rate (BookStep.cpp:770 rdrIn), exactly
@@ -1614,18 +1670,13 @@ pub(crate) fn consume(
         swap_asset_out(pool_in, pool_out, out, amm.tfee, gets_leg.xrp).map(|i| (i, out))
     };
     let offer = if limit_anchor && threshold != u64::MAX {
-        // out = (1/thr − b)/m = poolOut − poolIn/(f·thr); in = swapAssetOut.
+        // StrandFlow::limitOut: out from the strand's QualityFunction at the
+        // limit, then AMMOffer::limitOut re-swaps it for the in. The
+        // closed form poolOut − poolIn/(f·thr) is the same algebra with
+        // different roundings — #106703173 AE6C73F9 lands 3e-13 off it.
         (|| {
-            let thr_n = decode_rate(threshold);
-            let denom = n_mul(omf_spot, thr_n, Rnd::Near);
-            if denom.0 == 0 {
-                return None;
-            }
-            let sub = n_div(pool_in, denom, Rnd::Near);
-            if n_cmp(sub, pool_out) != Ordering::Less {
-                return None;
-            }
-            let out = to_amount(n_sub(pool_out, sub, Rnd::Near), pays_leg.xrp, Rnd::Down);
+            let out_n = qf_limit_out(pool_in, pool_out, amm.tfee, in_gross_rate, threshold, threshold_gross)?;
+            let out = to_amount(out_n, pays_leg.xrp, Rnd::Near);
             if out.0 == 0 || n_cmp(out, pool_out) != Ordering::Less {
                 return None;
             }
@@ -1666,18 +1717,9 @@ pub(crate) fn consume(
     // DDFDD49B killed at 6 ppm over, 2C4DF181 filled inside).
     if threshold != u64::MAX && n_cmp(rate_of_me_pair(take_in, take_out), decode_rate(threshold)) == Ordering::Greater {
         let thr_me = decode_rate(threshold);
-        let cfee = n_sub(N_ONE, fee_n(amm.tfee), Rnd::Near);
-        let m = n_div(cfee, pool_in, Rnd::Near);
-        let b = n_div(n_mul(pool_out, cfee, Rnd::Near), pool_in, Rnd::Near);
-        // out = (1/rate − b)/(−m), signed-Upward per op: 1/rate rounds up;
-        // the negative difference rounds toward zero (magnitude down); the
-        // positive quotient rounds up.
-        let r1 = n_div(N_ONE, thr_me, Rnd::Up);
-        let num = n_sub(b, r1, Rnd::Down);
-        if num.0 == 0 {
+        let Some(mut out_req) = qf_limit_out(pool_in, pool_out, amm.tfee, in_gross_rate, threshold, threshold_gross) else {
             return (rem_pays, rem_gets, false);
-        }
-        let mut out_req = n_div(num, m, Rnd::Up);
+        };
         let mut adjusted = true;
         if !sell && n_cmp(out_req, rem_pays) != Ordering::Less {
             out_req = rem_pays;

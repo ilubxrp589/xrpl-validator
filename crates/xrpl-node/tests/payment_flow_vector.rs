@@ -115,3 +115,31 @@ fn payment_dust_remainders_are_iou_amounts() {
 fn payment_pool_drain_prices_the_max_offer_cap_nearest() {
     run_bundle(include_str!("vectors/payment_pool_drain_max_offer_106704888.json"));
 }
+
+/// #106705935 71D0477C (finding 89): a partial SGB→XRP payment whose sender
+/// line carries a 0.3% transfer rate. The driver measured round 0's spend as
+/// the line's balance DELTA (the walk's precise figure was NET, so the fee
+/// made the two disagree and the guard rejected it), and at the line's
+/// precision (256853.7283596457, ulp 1e-10) the gross 6379.277459070794 read
+/// as 6379.2774590708. rippled subtracts the strand's own reported in — the
+/// sum of per-fill mulRatio grosses — so its round-1 SendMax remainder is
+/// 5334.264789309106, ours 5334.2647893091, and the maker's net credit
+/// (5318.309859729916 vs …910) left its TakerPays one ulp high.
+#[test]
+fn payment_fee_leg_spend_is_the_walks_gross_not_the_line_delta() {
+    run_bundle(include_str!("vectors/payment_fee_leg_gross_spend_106705935.json"));
+}
+
+/// #106674444 E514B993 (finding 81b): a PLX→USDC→RLUSD→589 payment with
+/// DeliverMin that rippled settles in ONE flow iteration (no step limits, so
+/// the reverse-pass amounts are final). Finding 81 had made every per-fill
+/// remainder a 16-digit IOUAmount; the CLOB hop's residual then normalised
+/// to exponent −32, the next hop's carry inherited that scale, and the pool
+/// swap's forward recompute delivered 564.5944089112000 for the requested
+/// …246 — a phantom 2.46e-11 second round that moved five lines and the
+/// maker offer. The round loop keeps finding 81's normalisation; the fills
+/// keep their exact remainders. Red at HEAD~, green with WIN98's 98 ledgers.
+#[test]
+fn payment_forward_fill_remainders_stay_exact() {
+    run_bundle(include_str!("vectors/payment_fwd_remainders_exact_106674444.json"));
+}

@@ -457,14 +457,6 @@ fn div_round16_down(a: Me, rate: Me) -> Me {
 /// iterations): rippled's total in is 73409.39223951599 — one ULP of dust
 /// stays on the taker's line, the last maker's offer and line sit one ULP
 /// the other way; we consumed the line to exactly zero.
-fn rem_after(leg: &Leg, rem: Me, x: Me) -> Me {
-    if leg.xrp {
-        me_sub(rem, x)
-    } else {
-        iou_amount(crate::tx::amm_swap::n_sub(rem, x, crate::tx::amm_swap::Rnd::Near))
-    }
-}
-
 /// `IOUAmount::normalize()` (IOUAmount.cpp:91-107): a Number-normalized
 /// 16-digit mantissa, and anything whose exponent falls below −96 IS ZERO
 /// (STAmount's cMinOffset). A strand's remainders are IOUAmounts, so a dust
@@ -2807,7 +2799,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 } else {
                 crate::tx::amm_swap::consume(
                     sandbox, a, taker, beneficiary, None, None, rem_pays, rem_gets, pays_leg, gets_leg,
-                    threshold, sell, anchor_clob, fee_rate, limit_anchor,
+                    threshold, threshold_self, sell, anchor_clob, fee_rate, limit_anchor,
                 )
                 }
             } else {
@@ -3401,8 +3393,8 @@ thr={t:?} admits_trunc={} admits_up={}",
                 if std::env::var("DX_FILL").is_ok() {
                     eprintln!("DX_FILL give={give:?} pay={pay:?} rem_pays={rem_pays:?} rem_gets={rem_gets:?}");
                 }
-                rem_pays = rem_after(pays_leg, rem_pays, give);
-                rem_gets = rem_after(gets_leg, rem_gets, pay);
+                rem_pays = me_sub(rem_pays, give);
+                rem_gets = me_sub(rem_gets, pay);
                 if in_exhausted {
                     rem_gets = (0, 0);
                 }
@@ -3751,8 +3743,8 @@ thr={t:?} admits_trunc={} admits_up={}",
                     }
                     _ => break 'attempt,
                 }
-                rem_gets = rem_after(gets_leg, rem_gets, gets_in);
-                rem_pays = rem_after(pays_leg, rem_pays, pays_out);
+                rem_gets = me_sub(rem_gets, gets_in);
+                rem_pays = me_sub(rem_pays, pays_out);
                 if in_exhausted {
                     // The gross budget is spent; the net chain's leftover is
                     // division dust rippled never sees (see the walk's rule).
@@ -3948,10 +3940,11 @@ pub(crate) fn cross_engine_to(
     sandbox: &mut Sandbox,
     stale: &mut Vec<Hash256>,
 ) -> (Me, Me, u32) {
-    cross_engine_to_net(
+    let (rp, rg, c, _gross) = cross_engine_to_net(
         taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, threshold_self,
         sell, offer_crossing, single_pass, amm_fib, domain, None, None, sandbox, stale,
-    )
+    );
+    (rp, rg, c)
 }
 
 pub(crate) fn cross_engine_to_net(
@@ -3997,7 +3990,7 @@ pub(crate) fn cross_engine_to_net(
     gets_gross_cap: Option<Me>,
     sandbox: &mut Sandbox,
     stale: &mut Vec<Hash256>,
-) -> (Me, Me, u32) {
+) -> (Me, Me, u32, Me) {
     let ask0 = rem_pays;
     let mut in_gross_spent: Me = (0, 0);
     if std::env::var("DX_ENTRY").is_ok() {
@@ -4025,6 +4018,19 @@ pub(crate) fn cross_engine_to_net(
     let out_req0 = rem_pays;
     let mut saved_level_outs: Vec<Me> = Vec::new();
     let mut level_out_acc: Me = (0, 0);
+    // The IN side is re-derived the same way — StrandFlow.h:724
+    // `remainingIn = *sendMax - sum(savedIns)`, the ascending 16-digit fold of
+    // every iteration's in. #106702066 344657FD (tfSell|IoC, nine iterations):
+    // the fold budgets the ninth at 7963.16183528205 where the running
+    // remainder reads …206; rippled's last fill pays …205, the maker's
+    // residual sits one ulp higher and the taker keeps 1e-11 on its line.
+    // Off once the gross budget is declared spent (`in_exhausted`): rippled
+    // tracks gross there and a re-derived net crumb would buy a phantom fill.
+    // (finding 91)
+    let in_req0 = rem_gets;
+    let mut saved_level_ins: Vec<Me> = Vec::new();
+    let mut level_in_acc: Me = (0, 0);
+    let mut in_fold_off = false;
     fn fold16(v: &mut Vec<Me>) -> Me {
         v.sort_by(|a, b| me_cmp(*a, *b));
         let mut t: Me = (0, 0);
@@ -4077,7 +4083,7 @@ pub(crate) fn cross_engine_to_net(
     };
     let (entry_pays, entry_gets) = (rem_pays, rem_gets);
     if threshold == 0 {
-        return (rem_pays, rem_gets, crossed);
+        return (rem_pays, rem_gets, crossed, in_gross_spent);
     }
     // Strand is exhausted when the gets side is spent (always) or, for a
     // buy, when the wanted pays side is fully acquired.
@@ -4178,7 +4184,10 @@ pub(crate) fn cross_engine_to_net(
             taker, beneficiary, rem_pays, rem_gets, pays_leg, gets_leg, threshold, threshold_self,
             sell, &inv_base, &amm, gets_gross_cap, sandbox, stale,
         ) {
-            return r;
+            // Bridged crossings are OfferCreate-only; the gross-spend figure
+            // is consumed by the payment driver's hop-0 spend measurement
+            // alone, so the bridged walk's own accumulator is not surfaced.
+            return (r.0, r.1, r.2, in_gross_spent);
         }
     }
     let dirs = sandbox.keys_with_prefix(&inv_base.0[..24]);
@@ -4319,7 +4328,7 @@ pub(crate) fn cross_engine_to_net(
                 amm_fib.as_deref_mut(), sandbox, a, taker, beneficiary,
                 benef_net.map(|(r, na)| (r, na, ask0)),
                 gets_gross_cap.map(|c| me_sub(c, in_gross_spent)), rem_pays, rem_gets,
-                pays_leg, gets_leg, threshold, sell, Some(q), pay_in_rate,
+                pays_leg, gets_leg, threshold, threshold_self, sell, Some(q), pay_in_rate,
             );
             if used {
                 // Mirror of the slice settlement's own gross (settle_slice):
@@ -4344,13 +4353,25 @@ pub(crate) fn cross_engine_to_net(
                     saved_level_outs.push(slice_out);
                 }
                 rem_pays = me_sub(out_req0, fold16(&mut saved_level_outs));
+                if !me_is_zero(level_in_acc) {
+                    saved_level_ins.push(level_in_acc);
+                    level_in_acc = (0, 0);
+                }
+                let slice_in = me_sub(rem_gets, rg);
+                if !me_is_zero(slice_in) {
+                    saved_level_ins.push(slice_in);
+                }
             } else {
                 rem_pays = rp;
             }
             if used {
                 sweep_admitted = None;
             }
-            rem_gets = rg;
+            rem_gets = if fold_rem && used && !in_fold_off {
+                me_sub(in_req0, fold16(&mut saved_level_ins))
+            } else {
+                rg
+            };
             crossed += used as u32;
             if done(rem_pays, rem_gets) {
                 break 'dirs;
@@ -4375,7 +4396,7 @@ pub(crate) fn cross_engine_to_net(
             // offer-crossing pass that is byte-exact today.
             if used && !offer_crossing {
                 settle_taker!();
-                return (rem_pays, rem_gets, crossed);
+                return (rem_pays, rem_gets, crossed, in_gross_spent);
             }
         }
         // Set when this level CONSUMES an offer, which is what ends a pass and
@@ -4859,7 +4880,20 @@ pub(crate) fn cross_engine_to_net(
                                 match transfer_rate(sandbox, gets_leg)
                                     .filter(|_| taker != &gets_leg.issuer && maker != gets_leg.issuer)
                                 {
-                                    None => pay = verb,
+                                    // rippled caps the pass by BOTH the line it
+                                    // re-reads (the DirectStep's maxSrcToDst) and
+                                    // flow()'s remainingIn — the fold — and the
+                                    // smaller wins (StrandFlow.h:125 "exceeded
+                                    // maxIn"). Unrated, `pay` IS that fold
+                                    // (finding 91): the verbatim line remainder
+                                    // only ever lowers it. Outside a crossing the
+                                    // fold is off and the line chain rules as
+                                    // before (finding 30).
+                                    None => {
+                                        if !(fold_rem && me_cmp(pay, verb).is_lt()) {
+                                            pay = verb;
+                                        }
+                                    }
                                     Some(r) => {
                                         pay = mul_ratio(verb, 1_000_000_000, r as u128, false);
                                         in_exhausted = true;
@@ -5015,7 +5049,7 @@ pub(crate) fn cross_engine_to_net(
                             // SPEPE for the same 535677 drops) after the check
                             // had correctly rejected 46.96292384379671.
                             settle_taker!();
-                            return (rem_pays, rem_gets, crossed);
+                            return (rem_pays, rem_gets, crossed, in_gross_spent);
                         }
                     }
                 }
@@ -5087,7 +5121,17 @@ pub(crate) fn cross_engine_to_net(
                         // remaining gross cap verbatim (see `gets_gross_cap`).
                         let g = match gets_gross_cap {
                             Some(cap) if in_exhausted || !me_cmp(pay, rem_gets).is_lt() => {
-                                me_sub(cap, in_gross_spent)
+                                let verb = me_sub(cap, in_gross_spent);
+                                // Unrated in a crossing, `pay` is flow()'s
+                                // folded remainingIn (finding 91); when that is
+                                // the binding limit rippled debits it — the line
+                                // keeps the difference (#106702066 344657FD:
+                                // 1e-11 left on the taker's line).
+                                if fold_rem && r.is_none() && me_cmp(pay, verb).is_lt() {
+                                    pay
+                                } else {
+                                    verb
+                                }
                             }
                             _ => gross_in(r, pay),
                         };
@@ -5099,19 +5143,21 @@ pub(crate) fn cross_engine_to_net(
                 if std::env::var("DX_FILL").is_ok() {
                     eprintln!("DX_FILL give={give:?} pay={pay:?} rem_pays={rem_pays:?} rem_gets={rem_gets:?}");
                 }
-                rem_pays = rem_after(pays_leg, rem_pays, give);
-                rem_gets = rem_after(gets_leg, rem_gets, pay);
+                rem_pays = me_sub(rem_pays, give);
+                rem_gets = me_sub(rem_gets, pay);
                 if in_exhausted {
                     // The gross budget is spent to the last unit; the net
                     // chain's leftover is the division's round-down dust,
                     // which rippled — tracking gross — never sees. Chasing
                     // it would buy a phantom ulp from the next offer.
                     rem_gets = (0, 0);
+                    in_fold_off = true;
                 }
                 if fold_rem {
                     // The iteration's actualOut accumulates STAmount-style
                     // (one 16-digit add per fill on the level).
                     level_out_acc = stamount_signed_add(false, level_out_acc, false, give).1;
+                    level_in_acc = stamount_signed_add(false, level_in_acc, false, pay).1;
                 }
                 crossed += 1;
                 level_crossed = true;
@@ -5217,13 +5263,20 @@ pub(crate) fn cross_engine_to_net(
             saved_level_outs.push(level_out_acc);
             level_out_acc = (0, 0);
             rem_pays = me_sub(out_req0, fold16(&mut saved_level_outs));
+            if !me_is_zero(level_in_acc) {
+                saved_level_ins.push(level_in_acc);
+                level_in_acc = (0, 0);
+            }
+            if !in_fold_off {
+                rem_gets = me_sub(in_req0, fold16(&mut saved_level_ins));
+            }
         }
         prev_level_crossed = level_crossed;
     }
     // A single pass whose level boundary tripped exits before the tail turn.
     if single_pass && trailing {
         settle_taker!();
-        return (rem_pays, rem_gets, crossed);
+        return (rem_pays, rem_gets, crossed, in_gross_spent);
     }
     // Final AMM turn once the book is exhausted (maxOffer sizing).
     if let Some(a) = &amm {
@@ -5263,7 +5316,7 @@ pub(crate) fn cross_engine_to_net(
                 amm_fib.as_deref_mut(), sandbox, a, taker, beneficiary,
                 benef_net.map(|(r, na)| (r, na, ask0)),
                 gets_gross_cap.map(|c| me_sub(c, in_gross_spent)), rem_pays, rem_gets,
-                pays_leg, gets_leg, threshold, sell,
+                pays_leg, gets_leg, threshold, threshold_self, sell,
                 // A remembered self-offer within the limit is still the tip
                 // rippled's tail pass anchors on (see self_anchor_q above);
                 // beyond the limit rippled anchors nothing (#106295504).
@@ -5289,13 +5342,25 @@ pub(crate) fn cross_engine_to_net(
                     saved_level_outs.push(slice_out);
                 }
                 rem_pays = me_sub(out_req0, fold16(&mut saved_level_outs));
+                if !me_is_zero(level_in_acc) {
+                    saved_level_ins.push(level_in_acc);
+                    level_in_acc = (0, 0);
+                }
+                let slice_in = me_sub(rem_gets, rg);
+                if !me_is_zero(slice_in) {
+                    saved_level_ins.push(slice_in);
+                }
             } else {
                 rem_pays = rp;
             }
             if used {
                 sweep_admitted = None;
             }
-            rem_gets = rg;
+            rem_gets = if fold_rem && used && !in_fold_off {
+                me_sub(in_req0, fold16(&mut saved_level_ins))
+            } else {
+                rg
+            };
             crossed += used as u32;
         }
     }
@@ -5354,13 +5419,13 @@ pub(crate) fn cross_engine_to_net(
                 };
                 delete_maker_offer(sandbox, okey, &off, &maker);
             }
-            return (entry_pays, entry_gets, 0);
+            return (entry_pays, entry_gets, 0, in_gross_spent);
         }
     }
     // Per-pass taker settlement — AFTER the judge: a rolled-back pass never
     // sees these writes (the snapshot restore above returns without them).
     settle_taker!();
-    (rem_pays, rem_gets, crossed)
+    (rem_pays, rem_gets, crossed, in_gross_spent)
 }
 
 /// One AMM turn. With no fib state this is the single-path `maxOffer` sizing
@@ -5385,6 +5450,7 @@ fn amm_turn(
     pays_leg: &Leg,
     gets_leg: &Leg,
     threshold: u64,
+    threshold_gross: u64,
     sell: bool,
     clob: Option<u64>,
     // Payment-mode IN-side transfer rate (see consume_fib). Crossing = None.
@@ -5392,7 +5458,7 @@ fn amm_turn(
 ) -> (Me, Me, bool) {
     let Some(f) = fib else {
         return crate::tx::amm_swap::consume(
-            sandbox, a, taker, beneficiary, benef_net, in_gross_cap, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell, clob,
+            sandbox, a, taker, beneficiary, benef_net, in_gross_cap, rem_pays, rem_gets, pays_leg, gets_leg, threshold, threshold_gross, sell, clob,
             in_gross_rate, false,
         );
     };
@@ -5759,11 +5825,12 @@ impl Transactor for OfferCreateTransactor {
             }
             (tp0, tg_cross, 0)
         } else {
-            cross_engine_to_net(
+            let (rp, rg, c, _gross) = cross_engine_to_net(
                 &tx.account, &tx.account, tp0, tg_cross, &pays_leg, &gets_leg, threshold,
                 threshold_self, sell, true, false, None, domain.as_ref(), None, gross_cap,
                 sandbox, &mut stale,
-            )
+            );
+            (rp, rg, c)
         };
         // Re-express the leftover against the ORIGINAL TakerGets: only the
         // funded part could be spent, but the whole unspent remainder rests.

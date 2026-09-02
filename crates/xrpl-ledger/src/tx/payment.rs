@@ -1244,7 +1244,7 @@ impl PaymentTransactor {
                 Some(r) => ox::mul_ratio(carry, 1_000_000_000, r as u128, false),
                 None => carry,
             };
-            let (rw, rs, _c) = ox::cross_engine_to_net(
+            let (rw, rs, _c, gross_spent) = ox::cross_engine_to_net(
                 &tx.account, benef, want_cap, avail, chain[i + 1], chain[i],
                 hop_thr, hop_thr, false, false, single_pass, amm_fib.as_deref_mut(), None,
                 if last { want_net } else { None },
@@ -1266,7 +1266,16 @@ impl PaymentTransactor {
                 );
             }
             if i == 0 {
-                spent_precise = Some(ox::me_sub(avail, rs));
+                // On a fee-bearing spend leg the walk debits net + fee per
+                // fill; `avail - rs` is only the NET, so it can never agree
+                // with the gross balance delta and the chooser below fell
+                // back to the delta — truncated at the LINE's ulp. rippled's
+                // strand reports the sum of its per-fill stpIn (mulRatio
+                // gross), which is exactly `in_gross_spent`. #106705935
+                // 71D0477C: gross 6379.277459070794 read as 6379.2774590708
+                // off a 256853.7283596457 line, and the next round's maker
+                // credit landed one ulp low. (finding 89)
+                spent_precise = Some(if spend_gross.is_some() { gross_spent } else { ox::me_sub(avail, rs) });
             }
             // rippled's fwd BookStep swallows its WHOLE input. When the want
             // is met (rw == 0) with input left over — the carry overshoot

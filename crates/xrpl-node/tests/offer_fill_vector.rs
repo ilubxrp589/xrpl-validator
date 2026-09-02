@@ -198,3 +198,29 @@ fn offer_create_pool_only_leg_fills_and_the_remainder_follows_the_rate() {
 fn offer_create_sell_remainder_rounds_down_under_fix_reduced_offers() {
     run_bundle(include_str!("vectors/offer_sell_remainder_106644297.json"));
 }
+
+/// #106703173 AE6C73F9 (finding 90): FLR→BTC OfferCreate against the FLR/BTC
+/// pool (fee 969) where FLR carries a 1.003 transfer rate. The single-path
+/// fill is sized by StrandFlow::limitOut from the strand's QualityFunction;
+/// BookStep::getQualityFunc folds the in-side rate into that function (m and
+/// b scaled by 1/trIn at Nearest) and the limit is the crossing's inflated
+/// limitQuality (Quality{out, sendMax}). Solving the net form instead lands
+/// out at 5.509588100530126e-8 for rippled's 5.509588100528479e-8 and both
+/// pool lines two ulps off.
+#[test]
+fn offer_amm_limit_solve_folds_the_transfer_rate_into_the_quality_function() {
+    run_bundle(include_str!("vectors/offer_amm_limit_qf_transfer_rate_106703173.json"));
+}
+
+/// #106702066 344657FD (finding 91): a tfSell|tfImmediateOrCancel XSPECTAR→XRP
+/// crossing that runs nine flow iterations. rippled re-derives the remaining
+/// input each iteration as sendMax minus the ascending 16-digit fold of every
+/// saved iteration in (StrandFlow.h:724), never a running subtraction; the
+/// fold budgets the ninth iteration at 7963.16183528205 where the running
+/// remainder reads …206. Its last fill therefore pays …205, the maker's
+/// TakerPays residual sits one ulp higher, and the taker keeps 1e-11 on its
+/// line where we drained it to zero.
+#[test]
+fn offer_sell_remaining_input_is_the_fold_of_saved_iteration_ins() {
+    run_bundle(include_str!("vectors/offer_sell_in_fold_106702066.json"));
+}
