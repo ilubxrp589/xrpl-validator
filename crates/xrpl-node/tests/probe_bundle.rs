@@ -55,6 +55,38 @@ fn probe_bundle() {
         seq,
     );
 
+    // PROBE_LIST=1: every key the apply wrote, with its kind and entry type —
+    // for receipts whose target set cannot name the object we create or drop.
+    if std::env::var("PROBE_LIST").is_ok() {
+        for (k, ent) in mods.iter() {
+            let (kind, ty) = match ent {
+                SandboxEntry::Created(b) | SandboxEntry::Modified(b) => {
+                    let ty = serde_json::from_slice::<Value>(b)
+                        .ok()
+                        .and_then(|j| j["LedgerEntryType"].as_str().map(str::to_string))
+                        .unwrap_or_default();
+                    (if matches!(ent, SandboxEntry::Created(_)) { "CREATED" } else { "MODIFIED" }, ty)
+                }
+                SandboxEntry::Deleted => ("DELETED", String::new()),
+            };
+            let detail = match ent {
+                SandboxEntry::Created(b) | SandboxEntry::Modified(b) => serde_json::from_slice::<Value>(b)
+                    .ok()
+                    .map(|j| {
+                        let mut j = j;
+                        if let Some(ix) = j.get_mut("Indexes").and_then(|v| v.as_array_mut()) {
+                            let n = ix.len();
+                            ix.truncate(2);
+                            ix.push(Value::String(format!("…{n} entries")));
+                        }
+                        j.to_string()
+                    })
+                    .unwrap_or_default(),
+                SandboxEntry::Deleted => String::new(),
+            };
+            println!("LIST {kind} {ty} {} {}", hex::encode_upper(k.0), &detail[..detail.len().min(420)]);
+        }
+    }
     let mut bad = 0;
     for (k, want_hex) in bundle["expect"].as_object().unwrap() {
         let Some(ent) = mods.get(&key32(k)) else {
