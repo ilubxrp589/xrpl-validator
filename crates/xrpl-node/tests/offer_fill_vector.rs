@@ -224,3 +224,16 @@ fn offer_amm_limit_solve_folds_the_transfer_rate_into_the_quality_function() {
 fn offer_sell_remaining_input_is_the_fold_of_saved_iteration_ins() {
     run_bundle(include_str!("vectors/offer_sell_in_fold_106702066.json"));
 }
+
+/// #106708835 74C9F462 (finding 93): a tfSell|tfFillOrKill EUR→ETH crossing
+/// that autobridges through XRP with a BOOK leg A and a pool leg B, and whose
+/// single slice exhausts the taker's 100 EUR. rippled's forward pass is
+/// in-limited — `limitStepIn` → `ceilInStrict(…, roundUp = false)` — so the
+/// XRP mid-leg FLOORS for any offer type: 86946030 drops, not the ceil's
+/// 86946031, and the pool then pays 0.048037377799289 ETH instead of
+/// …378344132. Byte-exact on the maker's XRP offer, both trust lines and
+/// both XRP balances.
+#[test]
+fn offer_bridged_in_limited_book_leg_floors_the_mid_leg() {
+    run_bundle(include_str!("vectors/offer_bridged_in_limited_floor_106708835.json"));
+}

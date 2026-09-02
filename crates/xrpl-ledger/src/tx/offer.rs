@@ -3643,7 +3643,15 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // on leg A (…327795253 for …424787519). The remaining-out clamp
                 // (`limitStepOut`, :705-708) keeps roundUp=true — the 2049BE47
                 // calibration above stands.
-                let xrp = (me_rescale(xrp, 0, !((a_use_amm && in_exhausted) || b_funds_bound)), 0);
+                // #106708835 74C9F462 (finding 93): the SAME floor applies to a
+                // BOOK leg A when the slice exhausts the taker's in — rippled's
+                // forward pass is `limitStepIn` → `ceilInStrict(…, roundUp =
+                // false)` → `divRoundStrict(limit, rate, XRP, false)` for any
+                // offer type (BookStep.cpp limitStepIn, fixReducedOffersV2).
+                // 100 EUR into the EUR/XRP maker at 86946030.x drops: mainnet
+                // pays 86946030 (FFI: `accountSendIOU … : 86946030/XRP`); the
+                // ceil paid 86946031 and bought 5.4e-10 ETH more from the pool.
+                let xrp = (me_rescale(xrp, 0, !(in_exhausted || b_funds_bound)), 0);
                 // ...and REPRICE leg A for it. `gets_in` above was computed
                 // from the FRACTIONAL xrp; rounding the mid-leg up to whole
                 // drops without redoing that leaves leg A buying a whole drop
