@@ -1074,7 +1074,13 @@ pub(crate) fn move_leg_gross(
     net: Me,
     gross: Me,
 ) {
-    if me_cmp(gross, net) == std::cmp::Ordering::Equal {
+    // F75b — an XRP leg has no transfer rate, so gross == net by construction;
+    // a caller that nevertheless hands a different gross must not push XRP
+    // down the IOU line path: `line_adjust` on an XRP leg fabricates a
+    // RippleState against the zero account plus its owner directory
+    // (#106700231's phantom `owner_dir(zero)` A317582B…, seen again in
+    // #106701366 and #106701473). Net moves through the roots, always.
+    if leg.xrp || me_cmp(gross, net) == std::cmp::Ordering::Equal {
         move_leg(sandbox, from, to, leg, net);
         return;
     }
@@ -6332,6 +6338,29 @@ mod tests {
         let key = keylet::account_root_key(id);
         state.state_map.insert(key, serde_json::to_vec(&acct).unwrap()).unwrap();
         state
+    }
+
+    #[test]
+    fn xrp_leg_never_takes_the_line_path_in_move_leg_gross() {
+        // F75b: gross ≠ net on an XRP leg moves NET through the roots and
+        // fabricates nothing (no zero-account line, no owner directory).
+        let (from, to) = ([0x11u8; 20], [0x22u8; 20]);
+        let mut state = make_state_with_account(&from, 50_000_000);
+        let acct = serde_json::json!({
+            "LedgerEntryType": "AccountRoot", "Account": hex::encode(to), "Balance": "20000000",
+            "Sequence": 1, "OwnerCount": 0, "Flags": 0, "PreviousTxnID": "00".repeat(32), "PreviousTxnLgrSeq": 1,
+        });
+        state.state_map.insert(keylet::account_root_key(&to), serde_json::to_vec(&acct).unwrap()).unwrap();
+        let mut sandbox = Sandbox::new(&state);
+        let xrp = Leg { xrp: true, cur: [0u8; 20], issuer: [0u8; 20] };
+        move_leg_gross(&mut sandbox, &from, &to, &xrp, (5_181_445, 0), (11_694_499, 0));
+        let bal = |sb: &Sandbox, id: &[u8; 20]| {
+            json_at(sb, &keylet::account_root_key(id)).unwrap()["Balance"].as_str().unwrap().parse::<u64>().unwrap()
+        };
+        assert_eq!(bal(&sandbox, &from), 50_000_000 - 5_181_445);
+        assert_eq!(bal(&sandbox, &to), 20_000_000 + 5_181_445);
+        assert!(!sandbox.exists(&keylet::owner_dir_key(&[0u8; 20])), "phantom owner_dir(zero)");
+        assert!(!sandbox.exists(&keylet::ripple_state_key(&from, &[0u8; 20], &[0u8; 20])), "phantom XRP line");
     }
 
     #[test]
