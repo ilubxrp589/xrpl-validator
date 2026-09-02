@@ -1063,6 +1063,7 @@ impl PaymentTransactor {
         mut amm_fib: Option<&mut crate::tx::offer::AmmFib>,
         sandbox: &mut Sandbox,
     ) -> (crate::tx::offer::Me, crate::tx::offer::Me) {
+        let _pass_guard = ox::PassGuard; // finding 98: registry cleared on every exit
         use crate::tx::offer as ox;
         let n = chain.len().saturating_sub(1);
         if n == 0 {
@@ -1244,6 +1245,23 @@ impl PaymentTransactor {
                 Some(r) => ox::mul_ratio(carry, 1_000_000_000, r as u128, false),
                 None => carry,
             };
+            // Finding 98: a hop's IN that is not the payment's spend (i > 0)
+            // and a hop's OUT that is not the delivery (!last) are pass-through
+            // — rippled never lands them on the sender's own line. Register
+            // them so the walk's taker-side settlements skip the sender (the
+            // makers and pools still move); see `offer::set_passthrough`.
+            {
+                let mut pass = Vec::new();
+                if i > 0 {
+                    let l = &chain[i];
+                    pass.push((tx.account, ox::Leg { xrp: l.xrp, cur: l.cur, issuer: l.issuer }, ox::PassRole::In));
+                }
+                if !last {
+                    let l = &chain[i + 1];
+                    pass.push((tx.account, ox::Leg { xrp: l.xrp, cur: l.cur, issuer: l.issuer }, ox::PassRole::Out));
+                }
+                ox::set_passthrough(pass);
+            }
             let (rw, rs, _c, gross_spent) = ox::cross_engine_to_net(
                 &tx.account, benef, want_cap, avail, chain[i + 1], chain[i],
                 hop_thr, hop_thr, false, false, single_pass, amm_fib.as_deref_mut(), None,
@@ -1305,10 +1323,12 @@ impl PaymentTransactor {
                             let fo = crate::tx::amm_swap::swap_asset_in(
                                 pin, pout, rs, a.tfee, chain[i + 1].xrp,
                             );
-                            ox::line_adjust(sandbox, &tx.account, chain[i], rs, false);
+                            if !ox::passthrough(&tx.account, chain[i], ox::PassRole::In) {
+                                ox::line_adjust(sandbox, &tx.account, chain[i], rs, false);
+                            }
                             ox::line_adjust(sandbox, &a.account, chain[i], rs, true);
                             ox::line_adjust(sandbox, &a.account, chain[i + 1], fo, false);
-                            if !last {
+                            if !last && !ox::passthrough(&tx.account, chain[i + 1], ox::PassRole::Out) {
                                 ox::line_adjust(sandbox, &tx.account, chain[i + 1], fo, true);
                             }
                             if std::env::var("DX_PAY").is_ok() {

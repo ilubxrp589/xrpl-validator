@@ -972,6 +972,12 @@ pub(crate) fn line_adjust(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, am
             put_json(sandbox, lkey, &line);
         }
     } else if receiving {
+        if let Ok(want) = std::env::var("DX_LINEADJ") {
+            let kh = hex::encode_upper(lkey.0);
+            if want == "1" || kh.starts_with(&want) {
+                eprintln!("DX_LINEADJ {kh} CREATE party={} amt={amt:?}", hex::encode(party));
+            }
+        }
         let (lo, hi) = if party_low { (party, &leg.issuer) } else { (&leg.issuer, party) };
         let bal_neg = !party_low; // holding sits on the party's side
         let sign = if bal_neg { "-" } else { "" };
@@ -1060,10 +1066,10 @@ pub(crate) fn move_leg_gross(
         move_leg(sandbox, from, to, leg, net);
         return;
     }
-    if !me_is_zero(gross) {
+    if !me_is_zero(gross) && !passthrough(from, leg, PassRole::In) {
         line_adjust(sandbox, from, leg, gross, false);
     }
-    if !me_is_zero(net) {
+    if !me_is_zero(net) && !passthrough(to, leg, PassRole::Out) {
         line_adjust(sandbox, to, leg, net, true);
     }
 }
@@ -1175,6 +1181,56 @@ pub(crate) fn gross_in(fee_rate: Option<u64>, net: Me) -> Me {
 }
 
 /// Move `amt` of `leg` from one account to another.
+/// A payment's PASS-THROUGH intermediate (finding 98). rippled's strand hands
+/// a BookStep's output straight to the next step — the issuer's DirectStep or
+/// the next book's makers — and the SENDER's own line in that currency is
+/// never touched. Our hop chain settles every hop against the taker, so a hop
+/// that is not the first (its IN) or not the last (its OUT) parks the
+/// intermediate on the sender's line and takes it back one hop later. Inert
+/// on an existing line; on a MISSING one it CREATES the line — owner-dir
+/// entries on both sides, OwnerCount + 1 — and the round trip is one rounding
+/// residue away from never reverting it. #106712861 1A6A9DA7AD0A: the sender
+/// has no PAX line, hop 0 parks 903.5709982659300 PAX, hop 1 takes
+/// 903.5709982659301, and the ledger keeps a phantom directory entry and
+/// OwnerCount 730 for mainnet's 729 — every ledger, from a bot that fires the
+/// shape ten times a ledger (the 9935C581 receipts).
+///
+/// `set_passthrough` names the (party, leg, role) pairs the current hop must
+/// not touch; every taker-side value move consults it. The ROLE keeps a
+/// self-owned maker honest: the sender crossing its own offer is still
+/// credited and debited AS A MAKER, because a maker's OUT is a debit of the
+/// leg the sender only ever RECEIVES as pass-through, and vice versa.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PassRole {
+    In,
+    Out,
+}
+thread_local! {
+    static PASSTHROUGH: std::cell::RefCell<Vec<([u8; 20], Leg, PassRole)>> = std::cell::RefCell::new(Vec::new());
+}
+pub(crate) fn set_passthrough(list: Vec<([u8; 20], Leg, PassRole)>) {
+    PASSTHROUGH.with(|p| *p.borrow_mut() = list);
+}
+pub(crate) fn clear_passthrough() {
+    PASSTHROUGH.with(|p| p.borrow_mut().clear());
+}
+/// Clears the pass-through registry on every exit path of the strand pass
+/// that armed it — a leftover would silently skip a later transaction's
+/// settlement for the same account and leg.
+pub(crate) struct PassGuard;
+impl Drop for PassGuard {
+    fn drop(&mut self) {
+        clear_passthrough();
+    }
+}
+pub(crate) fn passthrough(party: &[u8; 20], leg: &Leg, role: PassRole) -> bool {
+    PASSTHROUGH.with(|p| {
+        p.borrow().iter().any(|(a, l, r)| {
+            a == party && *r == role && l.xrp == leg.xrp && l.cur == leg.cur && l.issuer == leg.issuer
+        })
+    })
+}
+
 pub(crate) fn move_leg(sandbox: &mut Sandbox, from: &[u8; 20], to: &[u8; 20], leg: &Leg, amt: Me) {
     if me_is_zero(amt) {
         return;
@@ -1182,6 +1238,9 @@ pub(crate) fn move_leg(sandbox: &mut Sandbox, from: &[u8; 20], to: &[u8; 20], le
     if leg.xrp {
         let drops = me_rescale(amt, 0, false);
         for (id, add) in [(from, false), (to, true)] {
+            if passthrough(id, leg, if add { PassRole::Out } else { PassRole::In }) {
+                continue;
+            }
             let key = keylet::account_root_key(id);
             if let Some(mut a) = json_at(sandbox, &key) {
                 let bal: u128 = a["Balance"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -1191,8 +1250,12 @@ pub(crate) fn move_leg(sandbox: &mut Sandbox, from: &[u8; 20], to: &[u8; 20], le
             }
         }
     } else {
-        line_adjust(sandbox, from, leg, amt, false);
-        line_adjust(sandbox, to, leg, amt, true);
+        if !passthrough(from, leg, PassRole::In) {
+            line_adjust(sandbox, from, leg, amt, false);
+        }
+        if !passthrough(to, leg, PassRole::Out) {
+            line_adjust(sandbox, to, leg, amt, true);
+        }
     }
 }
 
@@ -4191,9 +4254,11 @@ pub(crate) fn cross_engine_to_net(
                     }
                     None => taker_accs.0,
                 };
-                line_adjust(sandbox, beneficiary, pays_leg, credit, true);
+                if !passthrough(beneficiary, pays_leg, PassRole::Out) {
+                    line_adjust(sandbox, beneficiary, pays_leg, credit, true);
+                }
             }
-            if !me_is_zero(taker_accs.1) {
+            if !me_is_zero(taker_accs.1) && !passthrough(taker, gets_leg, PassRole::In) {
                 line_adjust(sandbox, taker, gets_leg, taker_accs.1, false);
             }
         };
@@ -5316,6 +5381,12 @@ pub(crate) fn cross_engine_to_net(
         return (rem_pays, rem_gets, crossed, in_gross_spent);
     }
     // Final AMM turn once the book is exhausted (maxOffer sizing).
+    if std::env::var("DX_AMM").is_ok() {
+        eprintln!(
+            "DX_AMM tail-gate amm={} rem_pays={rem_pays:?} rem_gets={rem_gets:?} crossed={crossed} trailing={trailing} single={single_pass}",
+            amm.is_some()
+        );
+    }
     if let Some(a) = &amm {
         // For a CROSSING with no remembered anchor, the strand must first be
         // ADMITTED. rippled's next pass anchors tryAMM on the residual raw
@@ -5340,6 +5411,12 @@ pub(crate) fn cross_engine_to_net(
                 Some(q) => !(q > threshold && q <= threshold_self),
                 None => true,
             };
+        if std::env::var("DX_AMM").is_ok() {
+            eprintln!(
+                "DX_AMM tail admitted={tail_admitted} done={} residual_q={residual_q:?} thr={threshold:x} thr_self={threshold_self:x} self_anchor={self_anchor_q:?}",
+                done(rem_pays, rem_gets)
+            );
+        }
         if tail_admitted && !done(rem_pays, rem_gets) {
             if std::env::var("DX_AMM").is_ok() {
                 eprintln!("DX_AMM site=direct-tail");

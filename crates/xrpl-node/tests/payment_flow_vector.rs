@@ -156,3 +156,18 @@ fn payment_forward_fill_remainders_stay_exact() {
 fn payment_direct_transfer_fee_delivery_rounds_like_mul_ratio() {
     run_bundle(include_str!("vectors/payment_direct_fee_mulratio_106711980.json"));
 }
+
+/// #106712861 1A6A9DA7AD0A (finding 98): a self-payment XAH → PAX → XRP whose
+/// sender holds no PAX line. rippled's strand hands the first book's PAX
+/// straight to the second book's makers (through the issuer's fee); the
+/// sender's own PAX line is never touched. Our hop chain parked the
+/// intermediate on the sender — creating the line (both owner directories,
+/// OwnerCount + 1) — and took back one ulp more a hop later, leaving a
+/// phantom directory entry and OwnerCount 730 for mainnet's 729. The target
+/// is the sender's AccountRoot rebuilt from the meta's FinalFields; the fix
+/// registers the hop's pass-through legs so no taker-side move lands on
+/// the sender.
+#[test]
+fn payment_intermediate_hop_never_lands_on_the_senders_line() {
+    run_bundle(include_str!("vectors/payment_passthrough_intermediate_106712861.json"));
+}
