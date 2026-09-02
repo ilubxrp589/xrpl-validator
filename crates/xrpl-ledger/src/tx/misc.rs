@@ -218,9 +218,15 @@ impl Transactor for SignerListSetTransactor {
 
             // Mainnet shape: SignerListID 0 and lsfOneOwnerCount (65536,
             // featureMultiSignReserve — every list charges ONE owner unit).
+            // F73 — fixIncludeKeyletFields files the keylet's account on the
+            // object: `ledgerEntry->setAccountID(sfOwner, account_)`
+            // (SetSignerList.cpp:428-431), for a fresh list and a replacement
+            // alike. #106699661 55F46ED0: mainnet's one-entry SignerList is 118
+            // bytes, ours was 96 — exactly the 22-byte Owner field.
             let signer_list_obj = serde_json::json!({
                 "LedgerEntryType": "SignerList",
                 "Flags": 65536,
+                "Owner": hex::encode(tx.account),
                 "SignerQuorum": quorum,
                 "SignerEntries": signers,
                 "SignerListID": 0,
