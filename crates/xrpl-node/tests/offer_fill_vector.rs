@@ -170,3 +170,13 @@ fn offer_create_issuer_side_noripple_refuses_the_book_step() {
 fn offer_create_xrp_fills_feed_the_gross_cap_of_the_tail_slice() {
     run_bundle(include_str!("vectors/offer_xrp_tail_gross_106700231.json"));
 }
+
+/// Findings 76 + 78 — #106701467 DAE80780: an FLR/USD offer crossed through
+/// the direct FLR/USD pool and the XRP bridge (both legs pools) with a
+/// 2-drop dust tip on the XRP→USD book. rippled ranks the pool slice against
+/// the tip AS FILED (76) and grosses the direct-pool slice by the in-issuer's
+/// rate (78); red with either missing.
+#[test]
+fn offer_create_multipath_pools_rank_on_the_raw_tip_and_gross_the_direct_slice() {
+    run_bundle(include_str!("vectors/offer_multipath_rawtip_fee_106701467.json"));
+}

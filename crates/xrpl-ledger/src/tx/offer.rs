@@ -2692,6 +2692,13 @@ thr={t:?} admits_trunc={} admits_up={}",
         // anchored arm engages one round after the dust CLOB fill drops the
         // tip past the limit — same fills, same final state.
         if let (Some(a), Some(init)) = (amm, &amm_init) {
+            // F78 — the DIRECT strand's pool slice pays the in-issuer's rate like
+            // every other in: rippled's BookStep `trIn` grosses the step's in
+            // (BookStep.cpp:734-739), and the direct walk's `amm_turn` sites
+            // already pass `pay_in_rate`; this controller passed None, so the
+            // taker was debited NET. #106701467 DAE80780: 1.257009702543272 FLR
+            // debited where mainnet takes 1.260780731650903 (× 1.003).
+            let rg_before = rem_gets;
             let (rp, rg, used) = if !multi_now && threshold != u64::MAX {
                 // Anchor from the LIVE direct head (dpeek skips consumed and
                 // self offers) — `ld[di]` lags one fill behind and anchored
@@ -2756,7 +2763,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 } else {
                 crate::tx::amm_swap::consume(
                     sandbox, a, taker, beneficiary, None, None, rem_pays, rem_gets, pays_leg, gets_leg,
-                    threshold, sell, anchor_clob, None, limit_anchor,
+                    threshold, sell, anchor_clob, fee_rate, limit_anchor,
                 )
                 }
             } else {
@@ -2771,12 +2778,15 @@ thr={t:?} admits_trunc={} admits_up={}",
                 }
                 crate::tx::amm_swap::consume_fib(
                     sandbox, a, taker, beneficiary, None, None, rem_pays, rem_gets, pays_leg, gets_leg,
-                    threshold, sell, *init, amm_iters, best_book, None,
+                    threshold, sell, *init, amm_iters, best_book, fee_rate,
                 )
             };
             rem_pays = rp;
             rem_gets = rg;
             if used {
+                // The slice's GROSS joins the walk's spend (see gets_gross_cap).
+                let slice_net = me_sub(rg_before, rg);
+                in_gross_spent = stamount_signed_add(false, in_gross_spent, false, gross_in(fee_rate, slice_net)).1;
                 amm_iters += 1;
                 crossed += 1;
                 if done(rem_pays, rem_gets) {
