@@ -982,6 +982,21 @@ impl Transactor for NFTokenAcceptOfferTransactor {
             };
             let seller = sell.owner;
             let buyer = buy.owner;
+            // "The two offers may not form a loop. A broker may not sell the
+            // token to the current owner of the token"
+            // (NFTokenAcceptOffer.cpp:105-108): buyer == seller is
+            // tecCANT_ACCEPT_OWN_NFTOKEN_OFFER, checked BEFORE ownership.
+            // #106714409 DB792CF854A2 (finding 100): broker rpx9JT brokers
+            // r3DuY4i5's buy offer against r3DuY4i5's own sell offer; we ran
+            // the sale (seven writes) where mainnet claims the fee. The
+            // per-offer rule below — an account can't accept an offer it
+            // placed (:165-167, :224-226) — also applies in brokered mode.
+            if buyer == seller
+                || buyer == tx.account
+                || seller == tx.account
+            {
+                return TxResult::CantAcceptOwnNftOffer;
+            }
             // "The seller must own the token" (NFTokenAcceptOffer.cpp:229):
             // a stale offer whose owner no longer holds the NFToken is
             // tecNO_PERMISSION — not the tecNO_ENTRY our transfer_token
@@ -1043,6 +1058,11 @@ impl Transactor for NFTokenAcceptOfferTransactor {
             if dest != tx.account {
                 return TxResult::NoPermission;
             }
+        }
+        // "An account can't accept an offer it placed"
+        // (NFTokenAcceptOffer.cpp:165-167 buy, :224-226 sell) — finding 100.
+        if offer.owner == tx.account {
+            return TxResult::CantAcceptOwnNftOffer;
         }
         let (seller, buyer) = if offer.is_sell {
             (offer.owner, tx.account)

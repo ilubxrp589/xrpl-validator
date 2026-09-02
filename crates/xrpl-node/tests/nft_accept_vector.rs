@@ -110,7 +110,10 @@ fn run_bundle(bundle_json: &str) {
     let tx_hash = tx["hash"].as_str().unwrap();
     let txf = build_txfields(tx).expect("txfields");
     let (ter, mut mods) = native_apply_one(&state, &txf);
-    assert_eq!(ter, "tesSUCCESS", "mainnet applied this transaction");
+    // The ledger's verdict — a tec specimen (fee-only) is pinned against
+    // THIS, not against tesSUCCESS (fetch_tx_bundle records it as `result`).
+    let want_ter = bundle["result"].as_str().unwrap_or("tesSUCCESS");
+    assert_eq!(ter, want_ter, "the ledger's verdict for this transaction");
 
     xrpl_ledger::ledger::threading::stamp_threading(
         &mut mods,
@@ -162,4 +165,16 @@ fn first_self_mint_first_nftoken_sequence_is_the_tx_sequence_is_byte_exact() {
 #[test]
 fn nft_accept_brokered_issuer_buyer_pays_no_royalty() {
     run_bundle(include_str!("vectors/nftaccept_brokered_issuer_buyer_106711435.json"));
+}
+
+/// #106714409 DB792CF854A2 (finding 100): broker rpx9JT brokers r3DuY4i5's
+/// buy offer against r3DuY4i5's OWN sell offer. rippled's preclaim refuses
+/// the loop — "a broker may not sell the token to the current owner"
+/// (NFTokenAcceptOffer.cpp:105-108) — with tecCANT_ACCEPT_OWN_NFTOKEN_OFFER
+/// and claims the fee; we ran the sale. The two offers are injected into
+/// the bundle by hand (a tec meta carries only the AccountRoot); the target
+/// is the broker's fee-only AccountRoot and the bundle's tec result.
+#[test]
+fn nft_accept_brokered_loop_is_cant_accept_own() {
+    run_bundle(include_str!("vectors/nftaccept_brokered_loop_106714409.json"));
 }

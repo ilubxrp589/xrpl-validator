@@ -74,6 +74,10 @@ pub enum TxResult {
     /// A referenced object does not exist (NFT offers use this rather than
     /// the older tecNO_ENTRY).
     ObjectNotFound,
+    /// NFTokenAcceptOffer: the two brokered offers belong to one account (a
+    /// loop), or the acceptor placed the offer it is accepting
+    /// (NFTokenAcceptOffer.cpp:105-108, :165-167, :224-226).
+    CantAcceptOwnNftOffer,
     /// The account that must pay for an NFT offer cannot cover it.
     /// `NFTokenAcceptOffer::preclaim` compares `accountFunds(offer owner)`
     /// against the offer's own Amount.
@@ -209,6 +213,7 @@ impl TxResult {
             | TxResult::ArrayTooLarge
             | TxResult::Duplicate
             | TxResult::ObjectNotFound
+            | TxResult::CantAcceptOwnNftOffer
             | TxResult::InsufficientFunds
             | TxResult::AmmBalance
             | TxResult::AmmInvalidTokens
@@ -272,6 +277,7 @@ impl TxResult {
             TxResult::ArrayTooLarge => "tecARRAY_TOO_LARGE",
             TxResult::Duplicate => "tecDUPLICATE",
             TxResult::ObjectNotFound => "tecOBJECT_NOT_FOUND",
+            TxResult::CantAcceptOwnNftOffer => "tecCANT_ACCEPT_OWN_NFTOKEN_OFFER",
             TxResult::InsufficientFunds => "tecINSUFFICIENT_FUNDS",
             TxResult::AmmBalance => "tecAMM_BALANCE",
             TxResult::AmmInvalidTokens => "tecAMM_INVALID_TOKENS",
