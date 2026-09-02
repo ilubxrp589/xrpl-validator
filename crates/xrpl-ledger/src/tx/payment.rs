@@ -2030,8 +2030,23 @@ impl PaymentTransactor {
             return TxResult::PathDry;
         }
         // What the sender must part with to land `target` on the destination.
+        //
+        // The fee is charged by the issuer→destination DirectStepI (the
+        // previous step redeems, so `qualitiesSrcIssues` sets srcQOut to the
+        // issuer's TransferRate) and both passes run rippled's IOUAmount
+        // `mulRatio`, NOT a plain ceil/floor: the reverse pass sizes the
+        // input with `mulRatio(out, rate, QUALITY_ONE, roundUp=true)`
+        // (DirectStep.cpp:537), the forward pass delivers
+        // `mulRatio(in, QUALITY_ONE, rate, roundUp=false)` (:646) — whose
+        // "round down" is Number's half-even NEAREST of the 18-digit quotient
+        // for a positive amount — and `setCacheLimiting` (:575) never lets
+        // the forward output exceed the reverse pass's. Finding 96:
+        // #106711980 81340311C30C sends 190.36 EUR (GateHub, rate 1.002)
+        // under tfPartialPayment: 190.36 / 1.002 = 189.98003992015968… and
+        // mainnet delivers 189.9800399201597; the truncating `me_muldiv`
+        // delivered …596, one ulp under, on the destination's line.
         let need = match rate {
-            Some(r) => ox::me_muldiv(target, (r as u128, 0), (1_000_000_000, 0), true),
+            Some(r) => ox::mul_ratio(target, r as u128, 1_000_000_000, true),
             None => target,
         };
         let spend = [avail, cap, need]
@@ -2039,7 +2054,10 @@ impl PaymentTransactor {
             .reduce(|a, b| if ox::me_cmp(a, b).is_lt() { a } else { b })
             .unwrap_or(want);
         let deliver = match rate {
-            Some(r) => ox::me_muldiv(spend, (1_000_000_000, 0), (r as u128, 0), false),
+            Some(r) => {
+                let fwd = ox::mul_ratio(spend, 1_000_000_000, r as u128, false);
+                if ox::me_cmp(fwd, target).is_gt() { target } else { fwd }
+            }
             None => spend,
         };
         if ox::me_is_zero(deliver) {

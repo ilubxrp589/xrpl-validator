@@ -143,3 +143,16 @@ fn payment_fee_leg_spend_is_the_walks_gross_not_the_line_delta() {
 fn payment_forward_fill_remainders_stay_exact() {
     run_bundle(include_str!("vectors/payment_fwd_remainders_exact_106674444.json"));
 }
+
+/// #106711980 81340311C30C (finding 96): a direct 190.36 EUR payment between
+/// two GateHub holders (TransferRate 1.002) under tfPartialPayment. The fee
+/// step's forward pass is rippled's IOUAmount `mulRatio(in, QUALITY_ONE,
+/// rate, roundUp=false)` (DirectStep.cpp:646), whose "round down" is
+/// Number's half-even nearest of the 18-digit quotient: 190.36 / 1.002 =
+/// 189.98003992015968… delivers 189.9800399201597. The truncating
+/// `me_muldiv` credited …596 on the destination's line. Byte-exact on both
+/// trust lines and the sender's AccountRoot.
+#[test]
+fn payment_direct_transfer_fee_delivery_rounds_like_mul_ratio() {
+    run_bundle(include_str!("vectors/payment_direct_fee_mulratio_106711980.json"));
+}
