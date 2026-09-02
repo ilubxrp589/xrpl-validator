@@ -48,7 +48,8 @@ import json
 import sys
 import urllib.request
 
-RPC = "http://127.0.0.1:5005/"
+import os
+RPC = os.environ.get("XRPL_RPC", "http://127.0.0.1:5005/")
 
 
 def rpc(method, params):
@@ -568,6 +569,37 @@ def main():
         if oi is not None:
             ops_by_index[oi] = dir_ops(other)
 
+    # TOP OF THE BOOKS the crossing reads: the direct book and both XRP-bridge
+    # books, whether or not any offer on them is touched. `book_offers` names
+    # the best offers; their BookDirectory pages then join `book_dirs` and the
+    # page sweep below pulls every offer on them. #106701383 644B3509: the
+    # XRP→USD book's tip keeps rippled's bridge strand ACTIVE (multi-path fib
+    # slices through eight iterations); without it the probe ran single-path.
+    if tx.get("TransactionType") in ("OfferCreate", "Payment"):
+        def leg_of(v):
+            return {"currency": "XRP"} if isinstance(v, str) else {"currency": v["currency"], "issuer": v["issuer"]}
+        gets = tx.get("TakerGets") if tx.get("TransactionType") == "OfferCreate" else tx.get("SendMax", tx.get("Amount"))
+        pays = tx.get("TakerPays") if tx.get("TransactionType") == "OfferCreate" else tx.get("Amount")
+        if gets is not None and pays is not None:
+            g, p_ = leg_of(gets), leg_of(pays); xrp = {"currency": "XRP"}
+            books = [(g, p_)]
+            if g != xrp and p_ != xrp:
+                books += [(g, xrp), (xrp, p_)]
+            for tg, tp in books:
+                try:
+                    r = rpc("book_offers", {"taker_gets": tp, "taker_pays": tg, "ledger_index": seq - 1, "limit": 12})
+                    for o in r.get("offers", []):
+                        oi = (o.get("index") or "").upper()
+                        if oi and oi not in pre:
+                            nb = fetch_key(oi)
+                            if nb:
+                                pre[oi] = nb
+                                walk(o)
+                        if o.get("BookDirectory"):
+                            book_dirs.add(o["BookDirectory"].upper())
+                except Exception:
+                    pass
+
     for bd in sorted(book_dirs):
         n, seen = 0, set()
         try:
@@ -583,13 +615,24 @@ def main():
                 node = rj.get("node") or {}
                 for oidx in node.get("Indexes", []):
                     oidx = oidx.upper()
-                    if oidx in pre:
-                        continue
-                    ob = fetch_key(oidx)
-                    if ob:
-                        pre[oidx] = ob
-                        oj = rpc("ledger_entry", {"index": oidx, "ledger_index": seq - 1})
-                        walk(oj.get("node") or {})
+                    if oidx not in pre:
+                        ob = fetch_key(oidx)
+                        if ob:
+                            pre[oidx] = ob
+                    oj = rpc("ledger_entry", {"index": oidx, "ledger_index": seq - 1}).get("node") or {}
+                    walk(oj)
+                    # The maker's FUNDING line: `accountFunds(owner, TakerGets)`
+                    # decides whether the offer is live at all. Without it a
+                    # book head reads as unfunded and the whole leg vanishes
+                    # (#106701383 644B3509: the XRP→USD dust tip 97C11ACC kept
+                    # rippled's bridge strand active; ours saw no leg).
+                    tgets = oj.get("TakerGets")
+                    if isinstance(tgets, dict) and oj.get("Account") and tgets.get("issuer") != oj.get("Account"):
+                        rl = rpc("ledger_entry", {"ripple_state": {"currency": tgets["currency"], "accounts": [oj["Account"], tgets["issuer"]]},
+                                                  "ledger_index": seq - 1, "binary": True})
+                        li4 = (rl.get("index") or "").upper()
+                        if rl.get("node_binary") and li4 and li4 not in pre:
+                            pre[li4] = rl["node_binary"]
                 nxt = node.get("IndexNext")
                 if not nxt or int(str(nxt), 16) == 0:
                     break
@@ -622,6 +665,69 @@ def main():
                 if not prev:
                     break
                 page = prev.upper()
+        except Exception:
+            pass
+
+    # AMM objects the CROSSING may read but no meta names: a pool fill touches
+    # the pseudo-account's lines and root, never the AMM object itself, and
+    # the root only enters `pre` late (via the lines' peers) — after the
+    # AMMID scan above ran. Fetch by PAIR instead: the direct book's pool and
+    # the two XRP-bridge pools (#106701467 DAE80780: mainnet fills an FLR/USD
+    # offer from the FLR/USD pool; the bundle lacked the object, so the probe
+    # could only see the bridged strand and rested the offer whole).
+    def amm_pair(a, b):
+        def ap(x):
+            return {"currency": "XRP"} if x.get("currency") == "XRP" and not x.get("issuer") else {"currency": x["currency"], "issuer": x["issuer"]}
+        try:
+            r = rpc("ledger_entry", {"amm": {"asset": ap(a), "asset2": ap(b)},
+                                     "ledger_index": seq - 1, "binary": True})
+            idx = (r.get("index") or "").upper()
+            if r.get("node_binary") and idx and idx not in pre:
+                pre[idx] = r["node_binary"]
+                rj = rpc("ledger_entry", {"index": idx, "ledger_index": seq - 1})
+                acct = (rj.get("node") or {}).get("Account")
+                if acct:
+                    accts.add(acct)
+                    # (`accts` was already swept above — fetch the root and owner
+                    # directory here.) A pool's XRP side IS its root balance.
+                    for q_ in ({"account_root": acct}, {"directory": {"owner": acct}}):
+                        rr = rpc("ledger_entry", dict(q_, ledger_index=seq - 1, binary=True))
+                        li3 = (rr.get("index") or "").upper()
+                        if rr.get("node_binary") and li3 and li3 not in pre:
+                            pre[li3] = rr["node_binary"]
+                    # The pool's own lines: a swap reads and writes them, and a
+                    # bridge leg cannot be PRICED without the pool's balances.
+                    for x in (a, b):
+                        if x.get("currency") != "XRP" and x.get("issuer"):
+                            rl = rpc("ledger_entry", {"ripple_state": {"currency": x["currency"], "accounts": [acct, x["issuer"]]},
+                                                      "ledger_index": seq - 1, "binary": True})
+                            li2 = (rl.get("index") or "").upper()
+                            if rl.get("node_binary") and li2 and li2 not in pre:
+                                pre[li2] = rl["node_binary"]
+        except Exception:
+            pass
+    legs = []
+    for f_ in ("TakerPays", "TakerGets", "Amount", "SendMax", "DeliverMin"):
+        v = tx.get(f_)
+        if v is None:
+            continue
+        legs.append({"currency": "XRP"} if isinstance(v, str) else {"currency": v["currency"], "issuer": v["issuer"]})
+    if tx.get("TransactionType") in ("OfferCreate", "Payment") and len(legs) >= 2:
+        xrp = {"currency": "XRP"}
+        for i in range(len(legs)):
+            for j in range(i + 1, len(legs)):
+                if legs[i] != legs[j]:
+                    amm_pair(legs[i], legs[j])
+            if legs[i] != xrp:
+                amm_pair(legs[i], xrp)
+    # Second AMMID pass over everything gathered since the first scan.
+    for li in list(pre):
+        try:
+            node = rpc("ledger_entry", {"index": li, "ledger_index": seq - 1}).get("node") or {}
+            if node.get("AMMID") and node["AMMID"].upper() not in pre:
+                nb = fetch_key(node["AMMID"].upper())
+                if nb:
+                    pre[node["AMMID"].upper()] = nb
         except Exception:
             pass
 
@@ -802,6 +908,113 @@ def main():
             print(f"note: pre {li[:16]}… rebuilt from {via}{agree} ({len(pre[li]) // 2} bytes)")
         else:
             print(f"WARN: pre {li[:16]}… touched by earlier tx#{oi} {h[:8]} — not rebuilt (backward: {via_b}; forward: {via_f}); {where}")
+    # IN-LEDGER CREATIONS the walk reads but no meta of ours names: an offer
+    # placed earlier in this ledger sits in a quality page that may not exist
+    # in the parent ledger at all, and neither does the offer. The parent
+    # fetches above can't see them; the touchers can. Rebuild an absent key
+    # from its own creation (NewFields, stamped) or its last earlier
+    # modification (FinalFields), and a page created in-ledger from the
+    # creating tx's entries replayed through the earlier directory ops —
+    # checked, as page_pre is, by replaying on to the post-ledger page.
+    # #106701372 8BFFFACE: rpiFwLYi's RLUSD/XRP offer 7C87A968 was created at
+    # tx#75 and consumed at tx#100; without its page the walk crossed nothing.
+    def ensure_key(li, depth=0):
+        if li in pre or depth > 3:
+            return li in pre
+        chain = touchers.get(li, [])
+        before = [t for t in chain if t[0] < my_index]
+        if not before:
+            nb = fetch_key(li)
+            if nb:
+                pre[li] = nb
+            return li in pre
+        oi, kind, h = before[-1]
+        if kind == "DeletedNode":
+            return False
+        try:
+            rec = node_of(h, li)
+            if rec is None:
+                return False
+            if kind == "CreatedNode":
+                raw = dict(rec["news"] or {})
+                if not raw:
+                    return False
+                raw = stamped(raw, rec["node"].get((1, 1)), h, seq)
+            else:
+                raw, _via = backward(li, before)
+                if raw is None:
+                    return False
+            let_raw = bytes(rec["node"].get((1, 1)) or b"")
+            if (19, 1) in raw or let_raw[-2:] == b"\x00\x64":
+                return False  # pages go through ensure_page
+            pre[li] = canonical(raw)
+            print(f"note: pre {li[:16]}… rebuilt from in-ledger tx#{oi} {h[:8]} {kind} ({len(pre[li]) // 2} bytes)")
+            return True
+        except Exception as e:  # noqa: BLE001
+            print(f"WARN: in-ledger rebuild {li[:16]}… {e}")
+            return False
+
+    def ensure_page(bd):
+        """A quality page created earlier in this ledger: entries = the
+        creating tx's NewFields replayed through the earlier ops; other fields
+        from the last earlier toucher. Verified against the post-ledger page."""
+        if bd in pre:
+            return
+        chain = touchers.get(bd, [])
+        before = [t for t in chain if t[0] < my_index]
+        if not before or before[0][1] != "CreatedNode":
+            return
+        try:
+            ci, _, ch = before[0]
+            crec = node_of(ch, bd)
+            if crec is None or not crec["news"]:
+                return
+            # sfIndexes is sMD_Never: a created page's entries are the creating
+            # tx's own directory ops replayed on an EMPTY page, then the later
+            # earlier txs' ops.
+            honest = replay_dir([], ops_between(ci, my_index), bd)
+            if honest is None:
+                print(f"WARN: page {bd[:16]}… created in-ledger at tx#{ci}: earlier ops inconsistent — not rebuilt")
+                return
+            end = replay_dir(list(honest), ops_between(my_index, 10 ** 9), bd)
+            want = post_entries(bd)
+            if end != (want if want is not None else []):
+                print(f"WARN: page {bd[:16]}… created in-ledger at tx#{ci}: replay misses the post-ledger page — not rebuilt")
+                return
+            raw = dict(crec["news"])
+            if len(before) > 1:
+                back, _ = backward(bd, before)
+                if back is not None:
+                    raw = dict(back)
+            raw = {k: v for k, v in raw.items() if k != (19, 1)}
+            raw.setdefault((2, 2), bytes.fromhex("2200000000"))  # sfFlags is soeREQUIRED on every ledger entry; NewFields omit the zero
+            raw = stamped(raw, crec["node"].get((1, 1)), before[-1][2], seq) if len(before) == 1 else raw
+            raw[(19, 1)] = indexes_raw(bytes.fromhex("0113") + b"\x20" + bytes(32), honest)
+            pre[bd] = canonical(raw)
+            print(f"note: page {bd[:16]}… rebuilt from in-ledger creation tx#{ci} {ch[:8]} + {len(honest)} entries replayed (post-ledger page reproduced)")
+            for e in honest:
+                ensure_key(e.upper(), 1)
+        except Exception as e:  # noqa: BLE001
+            print(f"WARN: in-ledger page {bd[:16]}… {e}")
+
+    # Offers rebuilt from in-ledger images carry their BookDirectory in the
+    # raw (field 5/16); the seq-1 JSON scan above never saw them.
+    for li in list(pre):
+        try:
+            b = bytes.fromhex(pre[li])
+            if b[:3] != bytes.fromhex("11006F"):
+                continue
+            pf = _fields_of(b, 0, len(b))
+            bd = pf.get((5, 16))
+            if bd is None:
+                continue
+            bd = (bd.hex().upper() if isinstance(bd, (bytes, bytearray)) else str(bd).upper())[-64:]  # strip the field header
+            if bd not in pre:
+                if not ensure_key(bd) or is_dir_image(pre.get(bd, "")) is False:
+                    ensure_page(bd)
+        except Exception:
+            pass
+
     if own_ok or own_bad or page_ok or page_bad:
         print(f"self-check: own meta reproduces the parent image for {own_ok}/{own_ok + len(own_bad)} non-stale objects this tx writes; "
               f"entry replay reproduces the post-ledger page for {page_ok}/{page_ok + len(page_bad)} pages")
