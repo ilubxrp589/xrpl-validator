@@ -1024,6 +1024,26 @@ def main():
         except Exception as e:  # noqa: BLE001
             print(f"WARN: in-ledger page {bd[:16]}… {e}")
 
+    # A page CREATED earlier in this ledger that the meta walk seated from
+    # FinalFields/NewFields carries no sfIndexes (sMD_Never) — an EMPTY page,
+    # which is exactly what q63 509460161CB0@106711585 crossed nothing on
+    # (the maker's mirror offer sat on a page created by tx#4). Replay it
+    # from empty through the earlier txs' directory ops instead.
+    for li in list(pre):
+        try:
+            b = bytes.fromhex(pre[li])
+            if b[:3] != bytes.fromhex("110064") or (19, 1) in _fields_of(b, 0, len(b)):
+                continue
+            chain = touchers.get(li, [])
+            before = [t for t in chain if t[0] < my_index]
+            if before and before[0][1] == "CreatedNode":
+                del pre[li]
+                ensure_page(li)
+                if li not in pre:
+                    print(f"WARN: in-ledger created page {li[:16]}… could not be replayed — left absent")
+        except Exception as e:  # noqa: BLE001
+            print(f"WARN: in-ledger page pass {li[:16]}… {e}")
+
     # Offers rebuilt from in-ledger images carry their BookDirectory in the
     # raw (field 5/16); the seq-1 JSON scan above never saw them.
     for li in list(pre):
@@ -1036,6 +1056,13 @@ def main():
             if bd is None:
                 continue
             bd = (bd.hex().upper() if isinstance(bd, (bytes, bytearray)) else str(bd).upper())[-64:]  # strip the field header
+            if bd not in pre:
+                # A page CREATED earlier in this ledger must go through the
+                # entry replay first: ensure_key would seat the creating tx's
+                # NewFields image, which never carries sfIndexes (sMD_Never),
+                # and an empty page is exactly what q63 509460161CB0@106711585
+                # crossed nothing on. ensure_page is a no-op for any other page.
+                ensure_page(bd)
             if bd not in pre:
                 if not ensure_key(bd) or is_dir_image(pre.get(bd, "")) is False:
                     ensure_page(bd)
