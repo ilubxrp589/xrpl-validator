@@ -287,22 +287,29 @@ impl Transactor for EscrowCreateTransactor {
             }
         }
 
+        // F85 — EscrowCreate::doApply (Escrow.cpp:496-506) judges the
+        // post-fee balance (mSourceBalance) against the reserve for
+        // OwnerCount + 1 — the escrow about to exist — BEFORE anything else:
+        // tecINSUFFICIENT_RESERVE for XRP and token escrows alike; then, for an
+        // XRP amount only, mSourceBalance < reserve + amount is tecUNFUNDED.
+        // The destination tests (tag) come after both. #106703533 F84D3EB3:
+        // 1000 drops from an account with 96 objects and 20274654 drops —
+        // reserve(97) = 20400000, mainnet refuses; we escrowed it.
+        let post_fee = balance_of(&acct).saturating_sub(tx.fee);
+        let oc = acct["OwnerCount"].as_u64().unwrap_or(0);
+        let reserve = crate::ledger::fees::account_reserve(sandbox, oc + 1);
+        if post_fee < reserve {
+            return TxResult::InsufficientReserve;
+        }
         if Self::iou_amount(tx).is_some() {
             if needs_tag {
                 return TxResult::DstTagNeeded;
             }
-            if balance_of(&acct) < tx.fee {
-                return TxResult::UnfundedPayment;
-            }
             return TxResult::Success;
         }
-
-        // Check balance >= amount + fee
-        let balance = balance_of(&acct);
         let amount = Self::amount_drops(tx).unwrap_or(0);
-        let total_needed = amount.saturating_add(tx.fee);
-        if balance < total_needed {
-            return TxResult::UnfundedPayment;
+        if post_fee < reserve.saturating_add(amount) {
+            return TxResult::Unfunded;
         }
         // XRP escrow: the funding test comes FIRST, then the tag test.
         if needs_tag {
@@ -1097,7 +1104,7 @@ mod tests {
         let sandbox = Sandbox::new(&state);
         assert_eq!(
             EscrowCreateTransactor.preclaim(&tx, &sandbox),
-            TxResult::UnfundedPayment
+            TxResult::InsufficientReserve
         );
     }
 

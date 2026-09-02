@@ -143,7 +143,18 @@ impl Transactor for PaymentChannelCreateTransactor {
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(0);
                 let amount = tx.fields.get("Amount").and_then(|a| parse_drops(a)).unwrap_or(0);
-                if balance < amount.checked_add(tx.fee).unwrap_or(u64::MAX) {
+                // F85 — PayChanCreate::preclaim (PayChan.cpp:205-218): the
+                // reserve is for OwnerCount + 1 (the channel to be created);
+                // balance < reserve is tecINSUFFICIENT_RESERVE, balance <
+                // reserve + amount is tecUNFUNDED. #106703535 F44C919F: 1000
+                // drops from an account below its next reserve — mainnet
+                // refuses, we created the channel.
+                let oc = acct["OwnerCount"].as_u64().unwrap_or(0);
+                let reserve = crate::ledger::fees::account_reserve(sandbox, oc + 1);
+                if balance < reserve {
+                    return TxResult::InsufficientReserve;
+                }
+                if balance < reserve.checked_add(amount).unwrap_or(u64::MAX) {
                     return TxResult::Unfunded;
                 }
             }
