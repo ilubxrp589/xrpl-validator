@@ -104,9 +104,45 @@ impl Transactor for CheckCreateTransactor {
         if dflags & 0x0002_0000 != 0 && tx.fields.get("DestinationTag").is_none() {
             return TxResult::DstTagNeeded; // lsfRequireDestTag
         }
-        // NOT modelled: the non-native SendMax freeze block (global freeze, and
-        // either party's line frozen by the issuer → tecFROZEN) and the
-        // Expiration → tecEXPIRED check. No failing ledger for either yet.
+        // The non-native SendMax freeze block (CheckCreate.cpp:108-150,
+        // ungated): the currency may not be globally frozen; the SOURCE's
+        // line may not be frozen by the issuer (the issuer's side bit —
+        // lsfHighFreeze when the issuer is the high account); the
+        // DESTINATION's line may not be frozen by the destination itself
+        // (the destination's side bit). A party that has no line passes.
+        // #106708057 CEDC31F6: an XAU check from rsonARFc… where mainnet
+        // returns tecFROZEN; we created the Check and its directory entries.
+        // (finding 92)
+        if let Some(leg) = tx.fields.get("SendMax").and_then(crate::tx::offer::leg_of) {
+            if !leg.xrp {
+                const LSF_GLOBAL_FREEZE: u64 = 0x0040_0000;
+                const LSF_LOW_FREEZE: u64 = 0x0040_0000;
+                const LSF_HIGH_FREEZE: u64 = 0x0080_0000;
+                let flags_at = |key: &xrpl_core::types::Hash256| -> Option<u64> {
+                    crate::tx::offer::json_at(sandbox, key).and_then(|j| j["Flags"].as_u64())
+                };
+                if flags_at(&keylet::account_root_key(&leg.issuer)).is_some_and(|f| f & LSF_GLOBAL_FREEZE != 0) {
+                    return TxResult::Frozen;
+                }
+                if leg.issuer != tx.account {
+                    let issuer_bit = if leg.issuer > tx.account { LSF_HIGH_FREEZE } else { LSF_LOW_FREEZE };
+                    if flags_at(&keylet::ripple_state_key(&tx.account, &leg.issuer, &leg.cur))
+                        .is_some_and(|f| f & issuer_bit != 0)
+                    {
+                        return TxResult::Frozen;
+                    }
+                }
+                if leg.issuer != dest {
+                    let dst_bit = if dest > leg.issuer { LSF_HIGH_FREEZE } else { LSF_LOW_FREEZE };
+                    if flags_at(&keylet::ripple_state_key(&leg.issuer, &dest, &leg.cur))
+                        .is_some_and(|f| f & dst_bit != 0)
+                    {
+                        return TxResult::Frozen;
+                    }
+                }
+            }
+        }
+        // NOT modelled: the Expiration → tecEXPIRED check (no failing ledger yet).
         TxResult::Success
     }
 
