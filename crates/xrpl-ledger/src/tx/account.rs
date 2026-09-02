@@ -179,9 +179,47 @@ impl Transactor for AccountSetTransactor {
             }
             acct["Flags"] = serde_json::Value::Number(flags.into());
         }
-        for field in ["Domain", "EmailHash", "MessageKey", "TransferRate", "TickSize"] {
+        // F70 — AN EMPTY OR ZERO VALUE CLEARS THE FIELD (SetAccount.cpp:500-590).
+        // rippled never files the sentinel: an empty Domain/MessageKey blob, a
+        // zero EmailHash/WalletLocator, a TransferRate of 0 or QUALITY_ONE and
+        // a TickSize of 0 or Quality::maxTickSize (15) all `makeFieldAbsent`.
+        // We copied the tx value across, so a clear wrote an empty VL field.
+        //
+        // #106699631 D842A3B1: `Domain: ""` with SetFlag 15 — mainnet's root
+        // is 87 bytes, ours carried a `7700` (empty Domain) at 89.
+        let mut clear = |acct: &mut serde_json::Value, field: &str| {
+            if let Some(o) = acct.as_object_mut() {
+                o.remove(field);
+            }
+        };
+        for field in ["Domain", "MessageKey"] {
             if let Some(val) = tx.fields.get(field) {
-                acct[field] = val.clone();
+                if val.as_str().is_none_or(|v| v.is_empty()) {
+                    clear(&mut acct, field);
+                } else {
+                    acct[field] = val.clone();
+                }
+            }
+        }
+        for field in ["EmailHash", "WalletLocator"] {
+            if let Some(val) = tx.fields.get(field) {
+                if val.as_str().is_none_or(|v| v.bytes().all(|b| b == b'0')) {
+                    clear(&mut acct, field);
+                } else {
+                    acct[field] = val.clone();
+                }
+            }
+        }
+        if let Some(val) = tx.fields.get("TransferRate") {
+            match val.as_u64() {
+                Some(r) if r != 0 && r != 1_000_000_000 => acct["TransferRate"] = val.clone(),
+                _ => clear(&mut acct, "TransferRate"),
+            }
+        }
+        if let Some(val) = tx.fields.get("TickSize") {
+            match val.as_u64() {
+                Some(t) if t != 0 && t != 15 => acct["TickSize"] = val.clone(),
+                _ => clear(&mut acct, "TickSize"),
             }
         }
 

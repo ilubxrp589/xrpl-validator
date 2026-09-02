@@ -87,3 +87,11 @@ fn run_bundle(bundle_json: &str) {
 fn account_set_honours_the_transaction_level_tf_flags_is_byte_exact() {
     run_bundle(include_str!("vectors/accountset_tfflags_106698282.json"));
 }
+
+/// Finding 70 — #106699631 D842A3B1: AccountSet with `Domain: ""` (and
+/// SetFlag 15). rippled `makeFieldAbsent(sfDomain)` on an empty blob; we
+/// filed an empty VL field (`7700`), two bytes longer than mainnet's root.
+#[test]
+fn account_set_empty_domain_removes_the_field() {
+    run_bundle(include_str!("vectors/accountset_clear_domain_106699631.json"));
+}
