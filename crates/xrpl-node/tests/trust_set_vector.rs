@@ -48,7 +48,8 @@ fn run_bundle(bundle_json: &str) {
     let tx_hash = tx["hash"].as_str().unwrap();
     let txf = build_txfields(tx).expect("txfields");
     let (ter, mut mods) = native_apply_one(&state, &txf);
-    assert_eq!(ter, "tesSUCCESS", "mainnet applied this transaction");
+    let want_ter = bundle["result"].as_str().unwrap_or("tesSUCCESS");
+    assert_eq!(ter, want_ter, "mainnet recorded this transaction result");
 
     xrpl_ledger::ledger::threading::stamp_threading(
         &mut mods,

@@ -49,7 +49,8 @@ fn run_bundle(bundle_json: &str) {
     let tx_hash = tx["hash"].as_str().unwrap();
     let txf = build_txfields(tx).expect("txfields");
     let (ter, mut mods) = native_apply_one(&state, &txf);
-    assert_eq!(ter, "tesSUCCESS", "mainnet applied this transaction");
+    let want_ter = bundle["result"].as_str().unwrap_or("tesSUCCESS");
+    assert_eq!(ter, want_ter, "mainnet recorded this transaction result");
 
     xrpl_ledger::ledger::threading::stamp_threading(
         &mut mods,
@@ -94,4 +95,12 @@ fn account_set_honours_the_transaction_level_tf_flags_is_byte_exact() {
 #[test]
 fn account_set_empty_domain_removes_the_field() {
     run_bundle(include_str!("vectors/accountset_clear_domain_106699631.json"));
+}
+
+/// Finding 86 — #106703565 9709366F: SetFlag 16 (asfAllowTrustLineClawback)
+/// by an account that owns 96 objects. rippled refuses with tecOWNERS unless
+/// the owner directory is empty (SetAccount.cpp:288-292); we set the bit.
+#[test]
+fn account_set_clawback_needs_an_empty_owner_directory() {
+    run_bundle(include_str!("vectors/accountset_clawback_owners_106703565.json"));
 }

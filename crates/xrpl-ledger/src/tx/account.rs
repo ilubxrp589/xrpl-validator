@@ -151,7 +151,17 @@ impl Transactor for AccountSetTransactor {
                 .unwrap_or(0);
             let wants_require_auth = tf & TF_REQUIRE_AUTH != 0
                 || tx.fields.get("SetFlag").and_then(|f| f.as_u64()) == Some(2);
-            if wants_require_auth && flags_in & 0x0004_0000 == 0 {
+            // F86 — asfAllowTrustLineClawback (16) has the same "owns nothing"
+            // gate (SetAccount.cpp:278-292): refused tecNO_PERMISSION while
+            // lsfNoFreeze is set, tecOWNERS while the owner directory holds
+            // anything. #106703565 9709366F: SetFlag 16 by an account with 96
+            // objects — mainnet tecOWNERS, we set the bit.
+            let wants_clawback = tx.fields.get("SetFlag").and_then(|f| f.as_u64()) == Some(16)
+                && flags_in & 0x8000_0000 == 0;
+            if wants_clawback && flags_in & 0x0020_0000 != 0 {
+                return TxResult::NoPermission;
+            }
+            if (wants_require_auth && flags_in & 0x0004_0000 == 0) || wants_clawback {
                 let dir_key = keylet::owner_dir_key(&tx.account);
                 let owns_something = sandbox
                     .read(&dir_key)
