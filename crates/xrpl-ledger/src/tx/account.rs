@@ -401,6 +401,18 @@ impl Transactor for AccountDeleteTransactor {
             .unwrap_or(0);
         dest["Balance"] =
             serde_json::Value::String(dest_balance.checked_add(balance).unwrap_or(u64::MAX).to_string());
+        // F80 — "Re-arm the password change fee": a positive credit clears the
+        // destination's lsfPasswordSpent (DeleteAccount.cpp:436-437), exactly
+        // as an XRP Payment does (Payment.cpp:715-717, mirrored in payment.rs).
+        // #106702154 67271C65: rns1WK7… held 0x20010000 and mainnet leaves it
+        // at 0x20000000; we kept the bit.
+        if balance > 0 {
+            const LSF_PASSWORD_SPENT: u64 = 0x0001_0000;
+            let dflags = dest["Flags"].as_u64().unwrap_or(0);
+            if dflags & LSF_PASSWORD_SPENT != 0 {
+                dest["Flags"] = serde_json::json!(dflags & !LSF_PASSWORD_SPENT);
+            }
+        }
         sandbox.write(dest_key, serde_json::to_vec(&dest).unwrap());
 
         // Finding 41: the nonObligationDeleter cascade. preclaim proved every
