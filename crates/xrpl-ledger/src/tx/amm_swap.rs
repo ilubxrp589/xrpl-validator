@@ -1596,8 +1596,15 @@ pub(crate) fn consume(
     // Generated offer: anchored to the book when present (with the maxOffer
     // fallback of fixAMMv1_2), else maxOffer = 99% of pool.out.
     let max_offer = || -> Option<(Me, Me)> {
+        // maxOut: `out * Number{99,-2}` is a Number multiply in its default
+        // NEAREST mode; only the toAmount conversion is Downward. Rounding the
+        // product down too costs one ulp whenever the 99% cap binds — a
+        // pool-draining payment (#106704888 16B59A8C: 17.93069198232003 *
+        // 0.99 = 17.7513850624968297 → rippled …83, ours …82), which the
+        // rapido bot does to the LOVE/BONSAI pool every ledger. Same rule
+        // `max_offer_amounts` pinned on 2026-08-07. (finding 88)
         let out = to_amount(
-            n_mul(pool_out, (9_900_000_000_000_000, -16), Rnd::Down),
+            n_mul(pool_out, (9_900_000_000_000_000, -16), Rnd::Near),
             pays_leg.xrp,
             Rnd::Down,
         );

@@ -103,3 +103,15 @@ fn payment_flow_driver_runs_on_remainders_not_a_round_cap() {
 fn payment_dust_remainders_are_iou_amounts() {
     run_bundle(include_str!("vectors/payment_dust_remainder_106703062.json"));
 }
+
+/// #106704888 16B59A8C (finding 88): a path payment that drains more than 99%
+/// of the LOVE/BONSAI pool binds AMMLiquidity::maxOffer's 99% cap. rippled
+/// computes `out * Number{99,-2}` in Number's default NEAREST mode and only
+/// the toAmount conversion rounds down: 17.93069198232003 * 0.99 =
+/// 17.7513850624968297 → 17.75138506249683. Ours rounded the product down too
+/// (…82), and swapAssetOut of the smaller out moved the LOVE side by 3.1e-13
+/// — the rapido bot's hot pair 92DFA753/E97DC12B, receipted every ledger.
+#[test]
+fn payment_pool_drain_prices_the_max_offer_cap_nearest() {
+    run_bundle(include_str!("vectors/payment_pool_drain_max_offer_106704888.json"));
+}
