@@ -250,3 +250,16 @@ fn offer_bridged_in_limited_book_leg_floors_the_mid_leg() {
 fn offer_tick_size_sell_rounds_taker_pays_half_even() {
     run_bundle(include_str!("vectors/offer_ticksize_halfeven_106710940.json"));
 }
+
+/// #106712068 070969D26A53 (finding 97): a tfPassive|tfSell USDC→RLUSD
+/// crossing whose first fill is the DIRECT head inside a bridge attempt,
+/// bound by the maker's funds (807.6986554420118 of 807.6986563115758
+/// RLUSD). rippled's funds clamp is `limitOut(…, roundUp = false)`
+/// (BookStep.cpp:790) — a floor at 16 digits — so the taker pays
+/// 807.6978469356594 USDC; the site's unconditional ceil charged …595, and
+/// the one-ulp drift reached the next maker's fill and line. Byte-exact on
+/// the second maker's USDC line and its partially consumed offer.
+#[test]
+fn offer_bridge_direct_head_funds_bound_fill_floors_the_input() {
+    run_bundle(include_str!("vectors/offer_bridge_head_funds_floor_106712068.json"));
+}

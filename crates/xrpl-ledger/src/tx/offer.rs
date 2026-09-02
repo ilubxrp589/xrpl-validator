@@ -3342,8 +3342,25 @@ thr={t:?} admits_trunc={} admits_up={}",
                         me_muldiv(g, wants0, gives0, true)
                     }
                 };
-                let mut give = if !sell && me_cmp(rem_pays, m_gives).is_lt() { rem_pays } else { m_gives };
-                let mut pay = price(give);
+                // WHICH side binds decides the rounding, exactly as at the
+                // walk's fill site: a taker-bound partial is `limitStepOut` →
+                // `limitOut(…, roundUp = true)` (BookStep.cpp:675, the ceil
+                // above), but a MAKER-FUNDS-bound partial is the funds clamp →
+                // `limitOut(…, roundUp = false)` (:790) — `mulRoundStrict` with
+                // the Number guard at TowardsZero, a floor at 16 digits. This
+                // site ceiled both. #106712068 070969D26A53 (finding 97): the
+                // direct head D6259E0B is funded 807.6986554420118 of
+                // 807.6986563115758 RLUSD; at the filed 0.9999989990000022 the
+                // exact input is 807.697846935659479… — rippled charges
+                // …594, we charged …595, and the drift rode into the next
+                // maker's fill (220.3553047743405 for mainnet's …406).
+                let taker_bound = !sell && me_cmp(rem_pays, m_gives).is_lt();
+                let mut give = if taker_bound { rem_pays } else { m_gives };
+                let mut pay = if !taker_bound && whole.is_none() {
+                    mul_round16_down(give, rate_me(q))
+                } else {
+                    price(give)
+                };
                 let mut in_exhausted = false;
                 if me_cmp(pay, rem_gets).is_gt() {
                     pay = rem_gets;
