@@ -96,3 +96,12 @@ fn slot_holder_single_asset_deposit_uses_the_discounted_fee_is_byte_exact() {
 fn amm_deposit_limit_lp_token_within_eprice_takes_the_full_amount() {
     run_bundle(include_str!("vectors/amm_deposit_eprice_106702459.json"));
 }
+
+/// Finding 87 — #106704718 DC1B6BD3: a tfOneAssetLPToken deposit (Amount
+/// as the maximum, LPTokenOut as the target). rippled adjusts the tokens,
+/// derives the asset with ammAssetIn and deposits exactly that; the mode
+/// used to fall through to the placeholder mover.
+#[test]
+fn amm_deposit_one_asset_lp_token_derives_the_asset_from_the_tokens() {
+    run_bundle(include_str!("vectors/amm_deposit_one_asset_lp_token_106704718.json"));
+}

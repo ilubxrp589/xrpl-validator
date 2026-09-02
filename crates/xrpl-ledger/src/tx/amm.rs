@@ -919,7 +919,18 @@ impl Transactor for AMMDepositTransactor {
         } else {
             None
         };
-        let single_pre = if flags_dep & TF_SINGLE_ASSET != 0 || eprice.is_some() {
+        // F87 — tfOneAssetLPToken (Amount + LPTokenOut): `singleDepositTokens`
+        // (AMMDeposit.cpp) adjusts the requested tokens, derives the asset
+        // with ammAssetIn, and refuses tecAMM_FAILED when that exceeds Amount
+        // (the stated Amount is a MAXIMUM). This mode also fell through to the
+        // placeholder mover. #106704718 DC1B6BD3.
+        const TF_ONE_ASSET_LP_TOKEN: u64 = 0x0020_0000;
+        let lp_token_out = if flags_dep & TF_ONE_ASSET_LP_TOKEN != 0 {
+            tx.fields.get("LPTokenOut").and_then(keylet::amount_mant_exp).filter(|m| m.0 > 0)
+        } else {
+            None
+        };
+        let single_pre = if flags_dep & TF_SINGLE_ASSET != 0 || eprice.is_some() || lp_token_out.is_some() {
             tx.fields.get("Amount").and_then(|v| {
                 let leg = ox::leg_of(v)?;
                 let amt = keylet::amount_mant_exp(v)?;
@@ -941,6 +952,7 @@ impl Transactor for AMMDepositTransactor {
         // stated amount with tesSUCCESS — the exact live shadow catch (3 extra
         // keys, PRE-OK byte diff, ter flip). Err carries the refusal past the
         // "not a single-asset deposit" meaning of None.
+        let mut one_asset_lp_token_over = false;
         let single_adj: Option<Result<(ox::Me, ox::Me), ()>> =
             single_pre.and_then(|(pool_pre, amt)| {
                 let obj = ox::json_at(sandbox, &amm_key)?;
@@ -950,6 +962,20 @@ impl Transactor for AMMDepositTransactor {
                 // F66: the slot holder deposits at the DISCOUNTED fee (getTradingFee).
                 let tfee = crate::tx::amm_swap::effective_trading_fee(sandbox, &obj, &tx.account);
                 let xrp = tx.fields.get("Amount").and_then(ox::leg_of).map(|l| l.xrp)?;
+                if let Some(want_tokens) = lp_token_out {
+                    let tokens_adj = crate::tx::amm_swap::adjust_lp_tokens_out(lpt, want_tokens);
+                    if tokens_adj.0 == 0 {
+                        return Some(Err(()));
+                    }
+                    let Some(amount_dep) = crate::tx::amm_swap::amm_asset_in(pool_pre, lpt, tokens_adj, tfee, xrp) else {
+                        return Some(Err(()));
+                    };
+                    if crate::tx::amm_swap::n_cmp(amount_dep, amt) == std::cmp::Ordering::Greater {
+                        one_asset_lp_token_over = true;
+                        return Some(Err(()));
+                    }
+                    return Some(Ok((amount_dep, tokens_adj)));
+                }
                 let t0 = crate::tx::amm_swap::adjust_lp_tokens(
                     lpt,
                     crate::tx::amm_swap::lp_tokens_out(pool_pre, amt, lpt, tfee),
@@ -1012,7 +1038,7 @@ impl Transactor for AMMDepositTransactor {
                 Some(if tokens2.0 > 0 && deposited2.0 > 0 { Ok((deposited2, tokens2)) } else { Err(()) })
             });
         if matches!(single_adj, Some(Err(()))) {
-            return TxResult::AmmInvalidTokens;
+            return if one_asset_lp_token_over { TxResult::AmmFailed } else { TxResult::AmmInvalidTokens };
         }
         let single_adj: Option<(ox::Me, ox::Me)> = single_adj.and_then(|r| r.ok());
 
