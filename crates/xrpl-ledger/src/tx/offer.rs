@@ -2349,17 +2349,6 @@ fn cross_bridged(
             crate::tx::amm_swap::fib_slice(sandbox, am, amm_b_init, amm_iters, pays_leg, &xrp_leg)
                 .map(|s| (crate::tx::amm_swap::slice_rate(s.0, s.1), s))
         });
-        // A BOOK offer competing with a POOL is not worth its face quality: in
-        // offer crossing `ownerPaysTransferFee_` is true, so the offer OWNER
-        // pays the output issuer's TransferRate and the taker receives that
-        // much less (BookStep.cpp:737-739). An AMM offer pays no such fee.
-        // Only a leg whose OUTPUT carries an issuer is affected — leg A pays
-        // out XRP and is never discounted.
-        let out_rate = transfer_rate(sandbox, pays_leg);
-        let discount = |q: Me| match out_rate {
-            Some(r) => me_muldiv(q, (r as u128, 0), (1_000_000_000, 0), true),
-            None => q,
-        };
         let qa_book = apeek.as_ref().map(|(q, ..)| rate_me(*q));
         let qb_book = bpeek.as_ref().map(|(q, ..)| rate_me(*q));
         // Each leg pool's SPOT quality — `Quality{balances}`, the comparison
@@ -2379,8 +2368,22 @@ fn cross_bridged(
             (Some(_), None) => true,
             _ => false,
         };
+        // F76 — the pool-vs-tip CHOICE is made on the tip's RAW filed quality:
+        // `tryAMM(offers.tip().quality())` → `getOffer(view, clobQuality)`
+        // bails "higher clob quality" on the feeless spot and, in multi-path,
+        // returns no offer when `Quality{amounts} < clobQuality` — the fib
+        // slice must strictly beat the tip AS FILED (AMMLiquidity.cpp:78-92,
+        // BookStep.cpp:838-869). `ownerPaysTransferFee_` only shows up at
+        // EXECUTION (the maker delivers less); rippled never re-ranks on it.
+        // #106701467 DAE80780 (FLR/USD, out fee 1.002): the XRP→USD tip is a
+        // 2-drop dust offer filed at 7.4074e-10, the pool's fib-0 slice sits
+        // at 7.4138e-10; rippled consumes the dust first ("New flow iter 0:
+        // 0.000394 → 0.0000049"), we took the pool because the discounted tip
+        // (7.4222e-10) looked worse — every later fib index then ran one
+        // iteration early, and the pass rippled rejects on limitQuality was
+        // accepted here.
         let b_use_amm = match (&b_fib, qb_book) {
-            (Some((qf, _)), Some(qb)) => me_cmp(*qf, discount(qb)).is_lt(),
+            (Some((qf, _)), Some(qb)) => me_cmp(*qf, qb).is_lt(),
             (Some(_), None) => true,
             _ => false,
         };
@@ -2492,10 +2495,11 @@ fn cross_bridged(
         // single-path AMM case charges only `trIn` — `trOut` is hardcoded to
         // parity because "AMM doesn't pay the transfer fee on the out amount".
         //
-        // `discount()` above is right for CHOOSING book-vs-pool, because at
-        // EXECUTION `ownerPaysTransferFee_` really does make a book offer
-        // deliver that much less. It is wrong for ADMISSION, where charging it
-        // makes the estimate pessimistic and stops being a bound at all.
+        // (Until F76 the CHOICE below discounted the tip by the output
+        // transfer rate — "the maker delivers that much less" — which rippled
+        // never does: `getOffer` compares the fib slice with the tip as filed.
+        // Admission never charged it either: a pessimistic estimate stops
+        // being a bound at all.)
         //
         // Measured on #105912454 FE592890B233 against rippled's own FLOWDBG:
         //     rippled ub strand 1  63800.63315852392
