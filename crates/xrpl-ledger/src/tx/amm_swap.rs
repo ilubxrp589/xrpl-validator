@@ -933,6 +933,15 @@ fn hex20(s: &str) -> Option<[u8; 20]> {
 /// unexpired slot).
 pub(crate) fn discover(sandbox: &Sandbox, spend: &Leg, want: &Leg, taker: &[u8; 20]) -> Option<Amm> {
     let key = keylet::amm_key(&spend.cur, &spend.issuer, &want.cur, &want.issuer);
+    if std::env::var("DX_DISC").is_ok() {
+        eprintln!(
+            "DX_DISC key={} present={} spend_xrp={} want_xrp={}",
+            hex::encode_upper(key.0),
+            ox::json_at(sandbox, &key).is_some(),
+            spend.xrp,
+            want.xrp
+        );
+    }
     let obj = ox::json_at(sandbox, &key)?;
     if obj.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("AMM") {
         return None;
@@ -943,7 +952,11 @@ pub(crate) fn discover(sandbox: &Sandbox, spend: &Leg, want: &Leg, taker: &[u8; 
     // flowing INTO it yields no synthetic at any size — the strand it anchors
     // prices and executes as if the AMM were not there (#106588526, "Strand
     // found dry in rev" with the synthetic built and never yielded).
-    if ox::require_auth_known(sandbox, spend, &account) == Some(false) {
+    let auth = ox::require_auth_known(sandbox, spend, &account);
+    if std::env::var("DX_DISC").is_ok() {
+        eprintln!("DX_DISC pool={} require_auth_known={auth:?}", hex::encode(account));
+    }
+    if auth == Some(false) {
         return None;
     }
     let tfee = effective_trading_fee(sandbox, &obj, taker);
@@ -1028,6 +1041,22 @@ pub(crate) fn holds(sandbox: &Sandbox, acct: &[u8; 20], leg: &Leg) -> Me {
 ///
 /// AMMDeposit/Withdraw keep using raw `holds`: rippled fetches those with
 /// their own FreezeHandling (withdraw ignores freeze by design).
+/// The pool's spot-price quality for taking `gets_leg` and paying `pays_leg`,
+/// fee included — rippled's `Quality{poolOut × (1 − fee), poolIn}` — in the
+/// walk's rate encoding (lower is better), 0 when a side is empty. This is
+/// the quality `AMMLiquidity::getOffer` compares against the LOB tip to
+/// decide which one IS the tip (BookStep.cpp `tip()`); the consume gate
+/// computes the same value inline.
+pub(crate) fn spot_quality(sandbox: &Sandbox, amm: &Amm, pays_leg: &Leg, gets_leg: &Leg) -> u64 {
+    let pool_in = holds_for_offer(sandbox, &amm.account, gets_leg);
+    let pool_out = holds_for_offer(sandbox, &amm.account, pays_leg);
+    if pool_in.0 == 0 || pool_out.0 == 0 {
+        return 0;
+    }
+    let omf = n_sub(N_ONE, fee_n(amm.tfee), Rnd::Near);
+    rate_of(pool_in, n_mul(pool_out, omf, Rnd::Near))
+}
+
 pub(crate) fn holds_for_offer(sandbox: &Sandbox, acct: &[u8; 20], leg: &Leg) -> Me {
     if !leg.xrp {
         let gf = ox::json_at(sandbox, &keylet::account_root_key(&leg.issuer))

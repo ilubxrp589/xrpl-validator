@@ -263,3 +263,16 @@ fn offer_tick_size_sell_rounds_taker_pays_half_even() {
 fn offer_bridge_direct_head_funds_bound_fill_floors_the_input() {
     run_bundle(include_str!("vectors/offer_bridge_head_funds_floor_106712068.json"));
 }
+
+/// #106714102 A1B242D893E7 (finding 99): 2.376631 USD.Bitstamp for 1759848
+/// drops against the XRP/USD pool, with the order book's tip sitting between
+/// the net limit and the transfer-rate-inflated one. rippled anchors the AMM
+/// offer on the LOB quality, it comes out strictly better than the tip, so
+/// the tip IS the AMM offer: `qualityUpperBound` waives the fee, the strand
+/// is admitted, and the pool fills the whole want (in 2.372382758599013).
+/// Our tail gate rested the offer whenever the tip sat in that band. Byte-
+/// exact on both USD lines and both AccountRoots (taker and pool).
+#[test]
+fn offer_amm_admitted_when_pool_spot_beats_a_tip_inside_the_fee_band() {
+    run_bundle(include_str!("vectors/offer_amm_tip_in_fee_band_106714102.json"));
+}

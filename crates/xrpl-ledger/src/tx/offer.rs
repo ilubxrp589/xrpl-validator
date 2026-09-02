@@ -5408,7 +5408,26 @@ pub(crate) fn cross_engine_to_net(
             && threshold_self != u64::MAX
             && self_anchor_q.is_none())
             || match residual_q {
-                Some(q) => !(q > threshold && q <= threshold_self),
+                Some(q) => {
+                    !(q > threshold && q <= threshold_self) || {
+                        // Finding 99: a tip inside (net, gross] blocks the
+                        // strand only when the tip IS the CLOB offer. When the
+                        // pool's spot beats that tip, `tip()` anchors the AMM
+                        // offer on the LOB quality and it comes out strictly
+                        // better (BookStep.cpp:945-948, "AMM quality is
+                        // better"), so the tip is OfferType::Amm — its
+                        // `qualityUpperBound` WAIVES the transfer fee and a
+                        // tip within the inflated limit is admitted as is.
+                        // #106714102 A1B242D893E7: 2.376631 USD.Bitstamp for
+                        // 1759848 drops, LOB tip 1.35089e-6 between the net
+                        // 1.350475e-6 and the gross 1.3525e-6; rippled's trace
+                        // "AMMLiquidity::getOffer, created 15.362… USD /
+                        // 11382615 XRP" then fills the whole want through the
+                        // pool (in 2.372382758599013). We rested the offer.
+                        let spot = crate::tx::amm_swap::spot_quality(sandbox, a, pays_leg, gets_leg);
+                        spot != 0 && spot < q
+                    }
+                }
                 None => true,
             };
         if std::env::var("DX_AMM").is_ok() {
