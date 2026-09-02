@@ -904,10 +904,22 @@ impl Transactor for AMMDepositTransactor {
         // the assets landed, so capture that side here — below the move it is
         // already inflated by the deposit itself.
         const TF_SINGLE_ASSET: u64 = 0x0008_0000;
-        let single_pre = if tx.fields.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0)
-            & TF_SINGLE_ASSET
-            != 0
-        {
+        // F82 — tfLimitLPToken (Amount + EPrice) is the single-asset deposit
+        // with a price ceiling: `singleDepositEPrice` (AMMDeposit.cpp) first
+        // tries the full Amount at Equation 3 and keeps it when the effective
+        // price deposited/tokens is within EPrice; otherwise it solves the
+        // quadratic for the amount that lands exactly on EPrice. This mode
+        // fell through to the 1e7 placeholder. #106702459 F648B73A: 11.172545
+        // XRP into Gta6/XRP at EPrice 4 drops — mainnet mints 3320034.6897731
+        // (3.365 drops each), we minted 10000000.
+        const TF_LIMIT_LP_TOKEN: u64 = 0x0040_0000;
+        let flags_dep = tx.fields.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0);
+        let eprice = if flags_dep & TF_LIMIT_LP_TOKEN != 0 {
+            tx.fields.get("EPrice").and_then(keylet::amount_mant_exp).filter(|m| m.0 > 0)
+        } else {
+            None
+        };
+        let single_pre = if flags_dep & TF_SINGLE_ASSET != 0 || eprice.is_some() {
             tx.fields.get("Amount").and_then(|v| {
                 let leg = ox::leg_of(v)?;
                 let amt = keylet::amount_mant_exp(v)?;
@@ -949,11 +961,55 @@ impl Transactor for AMMDepositTransactor {
                 let (tokens, deposited) = crate::tx::amm_swap::adjust_asset_in_by_tokens(
                     pool_pre, amt, lpt, t0, tfee, xrp,
                 );
-                Some(if tokens.0 > 0 && deposited.0 > 0 {
-                    Ok((deposited, tokens))
-                } else {
-                    Err(())
-                })
+                if tokens.0 == 0 || deposited.0 == 0 {
+                    return Some(Err(()));
+                }
+                let Some(ep_max) = eprice else {
+                    return Some(Ok((deposited, tokens)));
+                };
+                use crate::tx::amm_swap::{n_add, n_div, n_mul, n_sqrt, n_sub, Rnd};
+                let ep = n_div(deposited, tokens, Rnd::Near);
+                if crate::tx::amm_swap::n_cmp(ep, ep_max) != std::cmp::Ordering::Greater {
+                    return Some(Ok((deposited, tokens)));
+                }
+                // Past the ceiling: the amount whose price is exactly EPrice.
+                // R = (-b1 + sqrt(b1^2 - 4*a1*c1)) / (2*a1) with
+                //   f1 = 1 - fee, f2 = (1 - fee/2) / f1, c = f1*B / (E*T),
+                //   d = f1 + c*f2 - c, a1 = c^2, b1 = (c*f2)^2 + 2c - d^2,
+                //   c1 = 2c*f2^2 + 1 - 2*d*f2   (AMMDeposit.cpp, singleDepositEPrice)
+                let one: ox::Me = (1_000_000_000_000_000, -15);
+                let fee = (tfee as u128, -5);
+                let f1 = n_sub(one, fee, Rnd::Near);
+                let f2 = n_div(n_sub(one, (tfee as u128 * 5, -6), Rnd::Near), f1, Rnd::Near);
+                let c = n_div(n_mul(f1, pool_pre, Rnd::Near), n_mul(ep_max, lpt, Rnd::Near), Rnd::Near);
+                let d = n_sub(n_add(f1, n_mul(c, f2, Rnd::Near), Rnd::Near), c, Rnd::Near);
+                let a1 = n_mul(c, c, Rnd::Near);
+                let cf2 = n_mul(c, f2, Rnd::Near);
+                let b1 = n_sub(n_add(n_mul(cf2, cf2, Rnd::Near), n_mul((2, 0), c, Rnd::Near), Rnd::Near), n_mul(d, d, Rnd::Near), Rnd::Near);
+                let c1 = n_sub(
+                    n_add(n_mul((2, 0), n_mul(c, n_mul(f2, f2, Rnd::Near), Rnd::Near), Rnd::Near), one, Rnd::Near),
+                    n_mul((2, 0), n_mul(d, f2, Rnd::Near), Rnd::Near),
+                    Rnd::Near,
+                );
+                let disc = n_sub(n_mul(b1, b1, Rnd::Near), n_mul((4, 0), n_mul(a1, c1, Rnd::Near), Rnd::Near), Rnd::Near);
+                if disc.0 == 0 && b1.0 != 0 {
+                    return Some(Err(()));
+                }
+                let r = n_div(n_sub(n_sqrt(disc), b1, Rnd::Near), n_mul((2, 0), a1, Rnd::Near), Rnd::Near);
+                // getRoundedAsset(deposit): multiply(balance, f1*R, upward)
+                let amount_dep = crate::tx::amm_swap::to_amount(n_mul(pool_pre, n_mul(f1, r, Rnd::Near), Rnd::Up), xrp, Rnd::Up);
+                if amount_dep.0 == 0 {
+                    return Some(Err(()));
+                }
+                // getRoundedLPTokens(deposit): tokens = amount / EPrice rounded DOWN, then adjustLPTokens
+                let tok = crate::tx::amm_swap::adjust_lp_tokens(lpt, n_div(amount_dep, ep_max, Rnd::Down), true);
+                if tok.0 == 0 {
+                    return Some(Err(()));
+                }
+                let (tokens2, deposited2) = crate::tx::amm_swap::adjust_asset_in_by_tokens(
+                    pool_pre, amount_dep, lpt, tok, tfee, xrp,
+                );
+                Some(if tokens2.0 > 0 && deposited2.0 > 0 { Ok((deposited2, tokens2)) } else { Err(()) })
             });
         if matches!(single_adj, Some(Err(()))) {
             return TxResult::AmmInvalidTokens;

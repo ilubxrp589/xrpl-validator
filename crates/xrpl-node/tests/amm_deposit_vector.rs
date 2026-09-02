@@ -87,3 +87,12 @@ fn run_bundle(bundle_json: &str) {
 fn slot_holder_single_asset_deposit_uses_the_discounted_fee_is_byte_exact() {
     run_bundle(include_str!("vectors/amm_deposit_slotfee_106698295.json"));
 }
+
+/// Finding 82 — #106702459 F648B73A: a tfLimitLPToken deposit (11.172545 XRP
+/// into Gta6/XRP, EPrice 4 drops per LP token). The full amount prices at
+/// 3.365 drops per token, inside the ceiling, so rippled mints Equation 3's
+/// 3320034.6897731 tokens; the mode used to fall through to a placeholder.
+#[test]
+fn amm_deposit_limit_lp_token_within_eprice_takes_the_full_amount() {
+    run_bundle(include_str!("vectors/amm_deposit_eprice_106702459.json"));
+}

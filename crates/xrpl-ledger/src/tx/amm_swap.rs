@@ -73,11 +73,15 @@ pub(crate) fn round16(m: u128, e: i32, sticky: bool, rnd: Rnd) -> Me {
     (q, e)
 }
 
+pub(crate) fn n_norm_pub(x: Me) -> Me {
+    n_norm(x)
+}
+
 fn n_norm(x: Me) -> Me {
     round16(x.0, x.1, false, Rnd::Near)
 }
 
-fn n_cmp(a: Me, b: Me) -> Ordering {
+pub(crate) fn n_cmp(a: Me, b: Me) -> Ordering {
     let a = n_norm(a);
     let b = n_norm(b);
     if a.0 == 0 || b.0 == 0 {
@@ -239,7 +243,7 @@ fn isqrt(n: u128) -> u128 {
 }
 
 /// Correctly rounded (to nearest) square root.
-fn n_sqrt(x: Me) -> Me {
+pub(crate) fn n_sqrt(x: Me) -> Me {
     n_sqrt_rnd(x, Rnd::Near)
 }
 
@@ -581,7 +585,7 @@ pub(crate) fn adjust_lp_tokens_out(lpt: Me, tokens: Me) -> Me {
     adjust_lp_tokens(lpt, tokens, true)
 }
 
-fn to_amount(x: Me, xrp: bool, rnd: Rnd) -> Me {
+pub(crate) fn to_amount(x: Me, xrp: bool, rnd: Rnd) -> Me {
     if x.0 == 0 {
         return (0, 0);
     }
