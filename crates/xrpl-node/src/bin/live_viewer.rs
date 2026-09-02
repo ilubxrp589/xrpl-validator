@@ -1381,10 +1381,13 @@ async fn main() {
                                 // Gate passed (ready_to_sign && non-zero hash) — proceed.
                                 {
 
-                                // On flag ledgers (every 256th), include amendment votes
-                                let amendments = if xrpl_node::consensus::amendment_vote::is_flag_ledger(seq) {
+                                // Amendment votes ride the VOTING ledger — the one
+                                // directly before a flag ledger (seq % 256 == 255),
+                                // rippled `isVotingLedger()`; the flag ledger itself
+                                // (seq % 256 == 0) tallies them.
+                                let amendments = if xrpl_node::consensus::amendment_vote::is_voting_ledger(seq) {
                                     let a = xrpl_node::validation::supported_amendments();
-                                    eprintln!("[validator] Flag ledger #{seq} — voting on {} amendments", a.len());
+                                    eprintln!("[validator] Voting ledger #{seq} (flag ledger #{}) — voting on {} amendments", seq + 1, a.len());
                                     Some(a)
                                 } else {
                                     None

@@ -5,6 +5,15 @@ use std::collections::HashMap;
 use xrpl_core::types::Hash256;
 
 /// Every 256th ledger is a flag ledger where amendment votes are tallied.
+/// The ledger directly PRECEDING a flag ledger (seq % 256 == 255) — rippled
+/// `Ledger::isVotingLedger()` = `isFlagLedger(seq + 1)`. Validations of this
+/// ledger carry the fee vote, the amendment votes and ServerVersion; the flag
+/// ledger itself only tallies them.
+pub fn is_voting_ledger(seq: u32) -> bool {
+    #[allow(clippy::manual_is_multiple_of)]
+    { seq.wrapping_add(1) % 256 == 0 }
+}
+
 pub fn is_flag_ledger(seq: u32) -> bool {
     #[allow(clippy::manual_is_multiple_of)]
     { seq > 0 && seq % 256 == 0 }

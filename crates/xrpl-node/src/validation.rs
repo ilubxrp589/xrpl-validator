@@ -20,7 +20,11 @@ mod field {
     pub const COOKIE: [u8; 1] = [0x3A];          // type=3 (UInt64), field=10
     pub const SERVER_VERSION: [u8; 1] = [0x3B];  // type=3 (UInt64), field=11
     pub const LEDGER_HASH: [u8; 1] = [0x51];           // type=5, field=1
-    pub const CONSENSUS_HASH: [u8; 1] = [0x52];         // type=5, field=2
+    // sfConsensusHash is UINT256 field 23 (sfields.macro), NOT field 2 — a
+    // one-byte 0x52 header would be sfTransactionHash. Field codes above 15
+    // take the two-byte form: 0x50 then the code.
+    pub const CONSENSUS_HASH: [u8; 2] = [0x50, 0x17];   // type=5, field=23
+    pub const VALIDATED_HASH: [u8; 2] = [0x50, 0x19];   // type=5, field=25
 
     // STI_VL (variable length, type 7)
     pub const SIGNING_PUB_KEY: [u8; 1] = [0x73]; // type=7, field=3
@@ -107,13 +111,17 @@ fn process_cookie() -> u64 {
 }
 
 /// Build the serialized validation object (without signature) for signing.
-/// If `amendments` is Some, includes the Amendments field (for flag ledger votes).
+/// `voting` is the cadence switch (see `sign_validation`): ServerVersion and
+/// the Amendments vote are emitted only when it is set.
+#[allow(clippy::too_many_arguments)] // one field per parameter; the caller is `sign_validation` alone
 fn build_validation_for_signing(
     ledger_seq: u32,
     ledger_hash: &[u8; 32],
+    validated_hash: Option<&[u8; 32]>,
     signing_time: u32,
     signing_pub_key: &[u8],
     flags: u32,
+    voting: bool,
     amendments: Option<&[Hash256]>,
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(128);
@@ -129,19 +137,35 @@ fn build_validation_for_signing(
     buf.extend_from_slice(&field::SIGNING_TIME);
     buf.extend_from_slice(&signing_time.to_be_bytes());
 
-    // Type 3 (UINT64): Cookie(10), ServerVersion(11) — rippled sets both on
-    // every validation (RCLConsensus.cpp:842,846). Cookie is a per-process
-    // random that lets observers tell a restart from two processes sharing a
-    // key; ServerVersion is what fills the "Version" column on VHS/xrpscan.
+    // Type 3 (UINT64): Cookie(10) on EVERY validation, ServerVersion(11) only
+    // on the VOTING ledger — rippled RCLConsensus.cpp `validate()`:
+    //     v.setFieldU64(sfCookie, valCookie_);
+    //     // Report our server version every flag ledger:
+    //     if (ledger.ledger->isVotingLedger())
+    //         v.setFieldU64(sfServerVersion, BuildInfo::getEncodedVersion());
+    // `isVotingLedger()` is the ledger directly PRECEDING a flag ledger
+    // (seq % 256 == 255, Ledger.cpp). Until 2026-09-02 we attached
+    // ServerVersion to every validation; observers classify those as
+    // off-cadence and discard the version signal.
     buf.extend_from_slice(&field::COOKIE);
     buf.extend_from_slice(&process_cookie().to_be_bytes());
 
-    buf.extend_from_slice(&field::SERVER_VERSION);
-    buf.extend_from_slice(&SERVER_VERSION_ENCODED.to_be_bytes());
+    if voting {
+        buf.extend_from_slice(&field::SERVER_VERSION);
+        buf.extend_from_slice(&SERVER_VERSION_ENCODED.to_be_bytes());
+    }
 
-    // Type 5 (HASH256): LedgerHash(1), ConsensusHash(2)
+    // Type 5 (HASH256): LedgerHash(1), ValidatedHash(25) — rippled attests
+    // to the hash of the last fully validated ledger on every validation
+    // ("This may be the hash of the ledger we are validating here, and
+    // that's fine"). ConsensusHash(23) is the consensus tx SET id, which
+    // this node does not track separately from the ledger's tx tree.
     buf.extend_from_slice(&field::LEDGER_HASH);
     buf.extend_from_slice(ledger_hash);
+    if let Some(vh) = validated_hash {
+        buf.extend_from_slice(&field::VALIDATED_HASH);
+        buf.extend_from_slice(vh);
+    }
 
     // Type 7 (VL): SigningPubKey(3) — length-prefixed
     buf.extend_from_slice(&field::SIGNING_PUB_KEY);
@@ -153,8 +177,10 @@ fn build_validation_for_signing(
     buf.push(spk_len as u8);
     buf.extend_from_slice(signing_pub_key);
 
-    // Type 19 (VECTOR256): Amendments(3) — only on flag ledgers
-    if let Some(amends) = amendments {
+    // Type 19 (VECTOR256): Amendments(3) — only on the VOTING ledger
+    // (seq % 256 == 255), the same ledger that carries the fee vote in
+    // rippled; the flag ledger itself (seq % 256 == 0) tallies them.
+    if let (true, Some(amends)) = (voting, amendments) {
         if !amends.is_empty() {
             buf.extend_from_slice(&field::AMENDMENTS);
             // VL length: total bytes = num_amendments * 32
@@ -221,9 +247,17 @@ pub fn sign_validation(
 
     let pub_key = identity.public_key();
 
+    // Cadence is decided HERE from the sequence, not by the caller: the
+    // voting ledger directly precedes a flag ledger (rippled
+    // `Ledger::isVotingLedger` = isFlagLedger(seq + 1)).
+    let voting = crate::consensus::amendment_vote::is_voting_ledger(ledger_seq);
+    if amendments.is_some() && !voting {
+        eprintln!("[validation] amendment votes offered on non-voting ledger #{ledger_seq} — dropped (they belong on seq % 256 == 255)");
+    }
+
     // Build the validation object without signature
     let unsigned = build_validation_for_signing(
-        ledger_seq, ledger_hash, signing_time, pub_key, flags, amendments,
+        ledger_seq, ledger_hash, Some(ledger_hash), signing_time, pub_key, flags, voting, amendments,
     );
 
     // Hash for signing: SHA512Half(VAL\0 || unsigned_validation)
@@ -384,11 +418,13 @@ mod tests {
         let identity = NodeIdentity::generate().unwrap();
         let ledger_hash = [0xAB; 32];
 
+        // 255 is the VOTING ledger (the one before flag ledger 256); votes
+        // offered on 256 itself are dropped (see the cadence test below).
         let amendments = supported_amendments();
-        let validation = sign_validation(&identity, 256, &ledger_hash, Some(&amendments));
+        let validation = sign_validation(&identity, 255, &ledger_hash, Some(&amendments));
 
         // Should be larger than without amendments
-        let plain = sign_validation(&identity, 256, &ledger_hash, None);
+        let plain = sign_validation(&identity, 255, &ledger_hash, None);
         assert!(validation.len() > plain.len());
 
         // Should contain the Amendments field code [0x03, 0x13]
@@ -403,5 +439,99 @@ mod tests {
 
         let h3 = amendment_hash("PayChan");
         assert_ne!(h1, h3);
+    }
+
+    /// Decode the (type, field) headers of a serialized validation in order —
+    /// a substring search would false-positive on header-looking bytes inside
+    /// a random public key or signature.
+    fn fields_of(bytes: &[u8]) -> Vec<(u8, u8)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            i += 1;
+            let mut ty = b >> 4;
+            let mut fld = b & 0x0F;
+            if ty == 0 {
+                ty = bytes[i];
+                i += 1;
+            }
+            if fld == 0 {
+                fld = bytes[i];
+                i += 1;
+            }
+            let size = match ty {
+                2 => 4,
+                3 => 8,
+                5 => 32,
+                7 | 19 => {
+                    // VL length: 1 byte ≤ 192, 2 bytes ≤ 12480, else 3 bytes
+                    let b1 = bytes[i] as usize;
+                    i += 1;
+                    if b1 <= 192 {
+                        b1
+                    } else if b1 <= 240 {
+                        let b2 = bytes[i] as usize;
+                        i += 1;
+                        193 + (b1 - 193) * 256 + b2
+                    } else {
+                        let b2 = bytes[i] as usize;
+                        let b3 = bytes[i + 1] as usize;
+                        i += 2;
+                        12481 + (b1 - 241) * 65536 + b2 * 256 + b3
+                    }
+                }
+                t => panic!("unexpected field type {t} at {i}"),
+            };
+            out.push((ty, fld));
+            i += size;
+        }
+        out
+    }
+
+    fn has_field(bytes: &[u8], hdr: &[u8]) -> bool {
+        let (ty, fld) = match hdr {
+            [h] => (h >> 4, h & 0x0F),
+            [h, code] if h >> 4 == 0 => (*code, h & 0x0F),
+            [h, code] => (h >> 4, *code),
+            _ => unreachable!(),
+        };
+        fields_of(bytes).contains(&(ty, fld))
+    }
+
+    #[test]
+    fn server_version_and_amendments_only_on_the_voting_ledger() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let identity = NodeIdentity::generate().unwrap();
+        let hash = [0x11u8; 32];
+        let amends = supported_amendments();
+        // 106664651 % 256 == 203: an ordinary ledger — no version, no votes,
+        // even if a caller offers amendments.
+        let plain = sign_validation(&identity, 106664651, &hash, Some(&amends));
+        assert!(has_field(&plain, &field::COOKIE), "Cookie is on every validation");
+        assert!(!has_field(&plain, &field::SERVER_VERSION), "ServerVersion must not ride an ordinary ledger");
+        assert!(!has_field(&plain, &field::AMENDMENTS), "Amendments must not ride an ordinary ledger");
+        // The flag ledger itself (seq % 256 == 0) is NOT the voting ledger.
+        let flag = sign_validation(&identity, 106664704, &hash, Some(&amends));
+        assert!(!has_field(&flag, &field::SERVER_VERSION));
+        assert!(!has_field(&flag, &field::AMENDMENTS));
+        // The ledger before it (seq % 256 == 255) carries both.
+        let voting = sign_validation(&identity, 106664703, &hash, Some(&amends));
+        assert!(has_field(&voting, &field::SERVER_VERSION), "ServerVersion belongs on the voting ledger");
+        assert!(has_field(&voting, &field::AMENDMENTS), "Amendments belong on the voting ledger");
+        assert!(has_field(&voting, &field::VALIDATED_HASH));
+    }
+
+    #[test]
+    fn validated_hash_follows_ledger_hash_in_canonical_order() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let identity = NodeIdentity::generate().unwrap();
+        let hash = [0x22u8; 32];
+        let v = sign_validation(&identity, 100, &hash, None);
+        let f = fields_of(&v);
+        let lh = f.iter().position(|x| *x == (5, 1)).unwrap();
+        let vh = f.iter().position(|x| *x == (5, 25)).unwrap();
+        assert!(lh < vh, "LedgerHash(1) precedes ValidatedHash(25)");
+        assert_eq!(f.iter().filter(|x| x.0 == 5).count(), 2, "exactly LedgerHash and ValidatedHash");
     }
 }
