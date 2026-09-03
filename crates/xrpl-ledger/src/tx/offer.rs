@@ -153,6 +153,22 @@ pub(crate) fn decode20(s: &str) -> Option<[u8; 20]> {
     xrpl_core::types::AccountId::from_address(s).ok().map(|a| a.0)
 }
 
+/// Exact `Me` addition (no 16-digit re-rounding): align to the smaller
+/// exponent and add the mantissas. Used for the leg-B group's XRP totals,
+/// whose members are whole drops except the partial one's ceil16 product —
+/// that fraction is what the pass-level drop rounding decides on.
+pub(crate) fn me_add_xrp(a: Me, b: Me) -> Me {
+    if a.0 == 0 {
+        return b;
+    }
+    if b.0 == 0 {
+        return a;
+    }
+    let e = a.1.min(b.1);
+    let scale = |m: Me| -> u128 { m.0 * 10u128.pow((m.1 - e) as u32) };
+    (scale(a) + scale(b), e)
+}
+
 pub(crate) fn me_rescale(a: Me, e: i32, ceil: bool) -> u128 {
     if a.1 >= e {
         let d = (a.1 - e).min(38) as u32;
@@ -4227,6 +4243,15 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // `a_qbook` / `b_qbook` are the offers' filed BookDirectory
                 // rates, carried alongside the amounts so a PARTIAL fill can be
                 // priced the way rippled prices it — see `a_price` below.
+                // Finding 138: a multi-path pool slice is a regular offer to
+                // the step — `AMMOffer::limitOut/limitIn` go through
+                // `quality().ceilOutStrict/ceilInStrict` (AMMOffer.cpp:82-121),
+                // i.e. `mulRoundStrict(limit, rate)` / `divRoundStrict(limit,
+                // rate)` on the slice's 16-digit `getRate` quality — NOT the
+                // exact in/out ratio. #106739364 B2E8A289F84F iteration 0:
+                // 99188 drops × 1.015419366759505e-4 = 10.07174161501417|82
+                // → 10.07174161501418 (mainnet); the exact ratio ceils to …419.
+                // The rate rides along as a `Me` for pools and books alike.
                 let (a_cap_xrp, a_in_full, a_out_full, a_qbook) = match (&a_book, &a_fill) {
                     (Some((q, _, _, amaker, a_gives0, a_wants0)), _) => {
                         let funded = available(sandbox, amaker, &xrp_leg);
@@ -4234,20 +4259,86 @@ thr={t:?} admits_trunc={} admits_up={}",
                         // Whole-offer only when the maker can actually fund it;
                         // a funding-limited head is a partial fill.
                         let whole = me_cmp(funded, *a_gives0).is_ge().then_some(*a_gives0);
-                        (a_gives, *a_wants0, *a_gives0, Some((*q, whole)))
+                        (a_gives, *a_wants0, *a_gives0, Some((rate_me(*q), whole)))
                     }
-                    (None, Some((_, (s_in, s_out)))) => (*s_out, *s_in, *s_out, None),
+                    (None, Some((sq, (s_in, s_out)))) => (*s_out, *s_in, *s_out, Some((*sq, Some(*s_out)))),
                     (None, None) => break 'attempt,
                 };
-                let (b_cap_xrp, b_in_full, b_out_full, b_qbook) = match (&b_book, &b_fill) {
-                    (Some((q, _, _, _, b_gives0, b_wants0)), _) => {
-                        (*b_wants0, *b_wants0, *b_gives0, Some((*q, Some(*b_wants0))))
+                // Finding 137: `BookStep::forEachOffer` consumes, in ONE pass,
+                // every offer whose quality equals the first offer's
+                // (`else if (*ofrQ != offer.quality()) return false;`,
+                // BookStep.cpp) — the whole same-quality directory group —
+                // and the flow iterates only when the quality changes. Ours
+                // took one leg-B offer per iteration, so a ladder of equal-
+                // priced XRP/RLUSD offers cost us an iteration each; the
+                // pool on leg A advances its Fibonacci slice per ITERATION
+                // (`AMMContext::curIters`), so by our iteration 6 the slice
+                // had outgrown the CLOB maker's quality and we filled 19.88
+                // XAH from the book where mainnet, done in 5 iterations,
+                // never left the pool. #106739364 B2E8A289F84F (rnCEEqDn,
+                // 1 RLUSD for XAH, IoC — the hot recurring key: every ~15
+                // ledgers): iteration 1 takes THREE 68118-drop offers
+                // (rMbww9t3 ×2 + rNycYwuF) as one group.
+                //
+                // The group is the head plus every following live ladder
+                // entry filed under the SAME directory quality; each member
+                // caps at what its owner can fund (`ownerFunds`, rounded
+                // DOWN as `limitOut(…, roundUp = false)` does), the pass's
+                // XRP is dealt through the members in order, and the last
+                // member takes the partial at the shared filed rate.
+                let b_group: Vec<(Hash256, serde_json::Value, [u8; 20], Me, Me, Me, Me, Option<u64>, Me, Me)> = {
+                    // (key, offer, maker, gives0, wants0, deliverable, xrp_cap, orate, funded, funded_raw)
+                    let mut g = Vec::new();
+                    if let Some(head) = &b_book {
+                        let q0 = head.0;
+                        let mut members: Vec<(u64, Hash256, serde_json::Value, [u8; 20], Me, Me)> = vec![head.clone()];
+                        let mut j = bi + 1;
+                        while j < lb.len() && lb[j].0 == q0 && members.len() < 1000 {
+                            let mut jj = j;
+                            match live_head(sandbox, &lb, &mut jj, taker, pays_leg, &xrp_leg, true, true, stale) {
+                                Some(h) if h.0 == q0 => {
+                                    members.push(h);
+                                    j = jj + 1;
+                                }
+                                _ => break,
+                            }
+                        }
+                        let rate = rate_me(q0);
+                        for (_, key, offer, maker, gives0, wants0) in members {
+                            let funded_raw = available(sandbox, &maker, pays_leg);
+                            let orate = maker_out_rate(sandbox, pays_leg, &maker, beneficiary);
+                            let funded = match orate {
+                                Some(r) => mul_ratio(funded_raw, 1_000_000_000, r as u128, false),
+                                None => funded_raw,
+                            };
+                            let (deliverable, xrp_cap) = if me_cmp(funded, gives0).is_lt() {
+                                // `ownerGives = funds; ofrAmt = offer.limitOut(ofrAmt,
+                                // stpAmt.out, roundUp = false)` — the in floors.
+                                let fl = me_muldiv(funded, rate, (1u128, 0i32), false);
+                                (funded, (me_rescale(fl, 0, false), 0))
+                            } else {
+                                (gives0, wants0)
+                            };
+                            g.push((key, offer, maker, gives0, wants0, deliverable, xrp_cap, orate, funded, funded_raw));
+                        }
                     }
-                    (None, Some((_, (s_in, s_out)))) => (*s_in, *s_in, *s_out, None),
+                    g
+                };
+                let (b_cap_xrp, b_in_full, b_out_full, b_qbook) = match (&b_book, &b_fill) {
+                    (Some((q, ..)), _) => {
+                        let mut cap = (0u128, 0i32);
+                        let mut out = (0u128, 0i32);
+                        for m in &b_group {
+                            cap = me_add_xrp(cap, m.6);
+                            out = stamount_signed_add(false, out, false, m.5).1;
+                        }
+                        (cap, cap, out, Some((rate_me(*q), Some(cap))))
+                    }
+                    (None, Some((sq, (s_in, s_out)))) => (*s_in, *s_in, *s_out, Some((*sq, Some(*s_in)))),
                     (None, None) => break 'attempt,
                 };
                 if std::env::var("DX_BRIDGE").is_ok() {
-                    eprintln!("DX_CAPS a_cap_xrp={a_cap_xrp:?} a_in_full={a_in_full:?} a_out_full={a_out_full:?} b_cap_xrp={b_cap_xrp:?} b_in_full={b_in_full:?} b_out_full={b_out_full:?}");
+                    eprintln!("DX_CAPS a_cap_xrp={a_cap_xrp:?} a_in_full={a_in_full:?} a_out_full={a_out_full:?} b_cap_xrp={b_cap_xrp:?} b_in_full={b_in_full:?} b_out_full={b_out_full:?} b_n={}", b_group.len());
                 }
                 // rippled prices a PARTIAL fill at the offer's filed
                 // BookDirectory quality, NOT at its current TakerPays/TakerGets
@@ -4269,31 +4360,72 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // recovered from the amounts — it has to be read off the page.
                 let a_price = |xrp: Me| -> Me {
                     match a_qbook {
-                        Some((q, whole)) if whole.is_none_or(|w| me_cmp(xrp, w).is_lt()) => {
-                            mul_round16_up(xrp, rate_me(q))
+                        Some((r, whole)) if whole.is_none_or(|w| me_cmp(xrp, w).is_lt()) => {
+                            mul_round16_up(xrp, r)
                         }
                         _ => me_muldiv(xrp, a_in_full, a_out_full, true),
                     }
                 };
                 let a_unprice = |gets: Me| -> Me {
                     match a_qbook {
-                        Some((q, _)) => me_muldiv(gets, (1u128, 0i32), rate_me(q), false),
+                        Some((r, _)) => me_muldiv(gets, (1u128, 0i32), r, false),
                         None => me_muldiv(gets, a_out_full, a_in_full, false),
                     }
                 };
+                // Leg-B group walkers: whole members deliver their own
+                // amounts (full fill = the offer's own TakerGets), the member
+                // the slice ends in takes the partial at the shared filed rate
+                // (`ceil_in` floors the out; `ceil_out` ceils the in).
                 let b_price = |xrp: Me| -> Me {
-                    match b_qbook {
-                        Some((q, whole)) if whole.is_none_or(|w| me_cmp(xrp, w).is_lt()) => {
-                            me_muldiv(xrp, (1u128, 0i32), rate_me(q), false)
-                        }
-                        _ => me_muldiv(xrp, b_out_full, b_in_full, false),
+                    if b_group.is_empty() {
+                        return match b_qbook {
+                            Some((r, whole)) if whole.is_none_or(|w| me_cmp(xrp, w).is_lt()) => {
+                                me_muldiv(xrp, (1u128, 0i32), r, false)
+                            }
+                            _ => me_muldiv(xrp, b_out_full, b_in_full, false),
+                        };
                     }
+                    let r = b_qbook.map(|(r, _)| r).unwrap_or((1, 0));
+                    let mut rem = xrp;
+                    let mut out = (0u128, 0i32);
+                    for m in &b_group {
+                        if me_is_zero(rem) {
+                            break;
+                        }
+                        if me_cmp(rem, m.6).is_ge() {
+                            out = stamount_signed_add(false, out, false, m.5).1;
+                            rem = me_sub(rem, m.6);
+                        } else {
+                            let part = me_muldiv(rem, (1u128, 0i32), r, false);
+                            out = stamount_signed_add(false, out, false, part).1;
+                            rem = (0, 0);
+                        }
+                    }
+                    out
                 };
                 let b_unprice = |pays: Me| -> Me {
-                    match b_qbook {
-                        Some((q, _)) => mul_round16_up(pays, rate_me(q)),
-                        None => me_muldiv(pays, b_in_full, b_out_full, true),
+                    if b_group.is_empty() {
+                        return match b_qbook {
+                            Some((r, _)) => mul_round16_up(pays, r),
+                            None => me_muldiv(pays, b_in_full, b_out_full, true),
+                        };
                     }
+                    let r = b_qbook.map(|(r, _)| r).unwrap_or((1, 0));
+                    let mut rem = pays;
+                    let mut xrp = (0u128, 0i32);
+                    for m in &b_group {
+                        if me_is_zero(rem) {
+                            break;
+                        }
+                        if me_cmp(rem, m.5).is_ge() {
+                            xrp = me_add_xrp(xrp, m.6);
+                            rem = stamount_signed_add(false, rem, true, m.5).1;
+                        } else {
+                            xrp = me_add_xrp(xrp, mul_round16_up(rem, r));
+                            rem = (0, 0);
+                        }
+                    }
+                    xrp
                 };
                 let mut xrp = if me_cmp(a_cap_xrp, b_cap_xrp).is_lt() { a_cap_xrp } else { b_cap_xrp };
                 // `AMMOffer::limitOut` — for a SINGLE-PATH pool the clamped
@@ -4378,36 +4510,10 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // finds the maker at zero and reaps BOTH offers — which is
                 // rippled's `Removing became unfunded offer 66B29DEB` — and
                 // walks on to the next maker's offer for the remainder.
-                let mut b_funding: Option<(Option<u64>, Me, Me)> = None;
-                // F62: the owner-FUNDS clamp is the one out-limit rippled
-                // sizes with roundUp=false (below).
-                let mut b_funds_bound = false;
-                if let Some((_, _, _, bmaker, _, _)) = &b_book {
-                    let funded_raw = available(sandbox, bmaker, pays_leg);
-                    let b_orate = maker_out_rate(sandbox, pays_leg, bmaker, beneficiary);
-                    let funded = match b_orate {
-                        Some(r) => mul_ratio(funded_raw, 1_000_000_000, r as u128, false),
-                        None => funded_raw,
-                    };
-                    b_funding = Some((b_orate, funded, funded_raw));
-                    // What the leg-B head can ACTUALLY deliver at this moment.
-                    // The walk's DEPTH turns on this: a head that is
-                    // funding-limited forces the step onward to the next offer,
-                    // and mid-ledger balances are not the pre-state balances.
-                    if std::env::var("DX_WALK").is_ok() {
-                        eprintln!("DX_BFUND maker={} funded={funded:?} want={pays_out:?} clamped={}",
-                            hex::encode(bmaker), me_cmp(pays_out, funded).is_gt());
-                    }
-                    if me_cmp(pays_out, funded).is_gt() {
-                        pays_out = funded;
-                        xrp = urp_b(pays_out, b_unprice(pays_out), sandbox);
-                        gets_in = rp_a(xrp, a_price(xrp), sandbox);
-                        out_clamped = true;
-                        // Funding-limited is out-limited (see the out_cap clamp).
-                        in_exhausted = false;
-                        b_funds_bound = true;
-                    }
-                }
+                // Finding 137: leg-B funding is capped per group member above
+                // (`ownerFunds`, floored in), so the slice never exceeds what
+                // the makers hold; a funds-bound member's XRP is already whole.
+                let b_funds_bound = false;
                 // DX_XRP: the bridged mid-leg is XRP and has to land on whole
                 // drops. Every value-divergent BRIDGED crossing found so far
                 // carries the same ±1-drop footprint, so measure whether this
@@ -4526,24 +4632,50 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // Leg B: taker sells that XRP for the pays side. Its input is
                 // the XRP middle, which carries no issuer rate.
                 match (&b_book, &b_fill) {
-                    (Some((_, bkey, boffer, bmaker, b_gives0, b_wants0)), _) => {
-                        // ONE offer per leg per ITERATION. rippled's BookStep
-                        // walks as many offers as the step needs and DELETES
-                        // each as it is exhausted; a divergence in walk DEPTH
-                        // shows up here as "we modify what mainnet deletes".
-                        if std::env::var("DX_WALK").is_ok() {
-                            eprintln!("DX_FILL legB book okey={} maker={} in={xrp:?} out={pays_out:?} gives0={b_gives0:?} wants0={b_wants0:?}",
-                                hex::encode(bkey.0), hex::encode(bmaker));
+                    (Some(_), _) => {
+                        // Finding 137: deal the pass's XRP through the same-
+                        // quality group in directory order; the totals equal
+                        // `b_price(xrp)` by construction (same walk).
+                        let r = b_qbook.map(|(r, _)| r).unwrap_or((1, 0));
+                        let mut rem = xrp;
+                        let mut dealt_out = (0u128, 0i32);
+                        let n = b_group.len();
+                        for (idx, m) in b_group.iter().enumerate() {
+                            if me_is_zero(rem) {
+                                break;
+                            }
+                            let (bkey, boffer, bmaker, b_gives0, b_wants0, deliverable, xrp_cap, orate, funded, funded_raw) = m;
+                            let take = if me_cmp(rem, *xrp_cap).is_ge() { *xrp_cap } else { rem };
+                            // The member the slice ENDS in delivers the
+                            // slice's remaining out: `pays_out` already
+                            // carries the pass's rounding — floor(in / rate)
+                            // when the XRP was primary (`ceil_in`), the out
+                            // limit itself when the out was (`limitStepOut`
+                            // keeps `limit` as the out and derives the in).
+                            let ends_here = me_cmp(rem, *xrp_cap).is_le() || idx + 1 == n;
+                            let out_m = if ends_here {
+                                let left = me_sub(pays_out, dealt_out);
+                                if me_cmp(left, (0, 0)).is_gt() { left } else { *deliverable }
+                            } else {
+                                *deliverable
+                            };
+                            let _ = r;
+                            if me_is_zero(take) || me_is_zero(out_m) {
+                                break;
+                            }
+                            if std::env::var("DX_WALK").is_ok() {
+                                eprintln!("DX_FILL legB book okey={} maker={} in={take:?} out={out_m:?} gives0={b_gives0:?} wants0={b_wants0:?} member={idx}/{n}",
+                                    hex::encode(bkey.0), hex::encode(bmaker));
+                            }
+                            if bmaker != taker {
+                                fee_judged = true;
+                            }
+                            let b_give_gross = owner_gives(*orate, out_m, *funded, *funded_raw);
+                            settle_fill(sandbox, bkey, boffer, bmaker, taker, beneficiary,
+                                        pays_leg, &xrp_leg, out_m, take, take, b_give_gross, *b_gives0, *b_wants0);
+                            dealt_out = stamount_signed_add(false, dealt_out, false, out_m).1;
+                            rem = me_sub(rem, take);
                         }
-                        if bmaker != taker {
-                            fee_judged = true;
-                        }
-                        let b_give_gross = match b_funding {
-                            Some((orate, fs, fr)) => owner_gives(orate, pays_out, fs, fr),
-                            None => pays_out,
-                        };
-                        settle_fill(sandbox, bkey, boffer, bmaker, taker, beneficiary,
-                                    pays_leg, &xrp_leg, pays_out, xrp, xrp, b_give_gross, *b_gives0, *b_wants0);
                     }
                     (None, Some(_)) => {
                         crate::tx::amm_swap::apply_slice(

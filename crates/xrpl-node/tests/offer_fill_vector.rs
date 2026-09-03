@@ -638,3 +638,20 @@ fn offer_residual_is_not_placed_below_the_pre_fee_reserve() {
     run_bundle(include_str!("vectors/offer_residual_not_placed_below_pre_fee_reserve_106738995.json"));
 }
 
+/// Findings 137 + 138 — #106739364 B2E8A289F84F (rnCEEqDn, 1 RLUSD for XAH,
+/// IoC; the recurring key). `BookStep::forEachOffer` consumes the whole
+/// same-quality directory group in one pass (iteration 1 takes three
+/// 68118-drop offers), so mainnet finishes in five iterations without the
+/// leg-A pool's Fibonacci slice ever outgrowing the CLOB maker; and a
+/// multi-path pool slice prices its partial by the 16-digit `getRate` quality
+/// (`ceilOutStrict`), not the exact in/out ratio.
+#[test]
+fn offer_bridged_pass_takes_the_same_quality_group() {
+    run_bundle(include_str!("vectors/offer_bridged_pass_takes_same_quality_group_106739364.json"));
+}
+
+/// Same rule, the next firing 15 ledgers on — #106739379 99186CFE20EC.
+#[test]
+fn offer_bridged_pass_takes_the_same_quality_group_second_specimen() {
+    run_bundle(include_str!("vectors/offer_bridged_pass_takes_same_quality_group_second_specimen_106739379.json"));
+}
