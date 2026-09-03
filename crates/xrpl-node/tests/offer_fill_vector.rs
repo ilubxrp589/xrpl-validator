@@ -612,3 +612,18 @@ fn offer_bridged_limit_out_composes_the_tips_offer_not_the_forced_pool() {
 fn offer_bridged_limit_out_composes_the_tips_offer_not_the_forced_pool_second_specimen() {
     run_bundle(include_str!("vectors/offer_bridged_limit_out_composes_the_tip_second_specimen_106735988.json"));
 }
+
+/// Finding 133 (#106737559 6001F5CA): a tfSell|IoC of 3494.2683829543 RLUSD
+/// for XRP crossing eleven iterations — seven book levels and four anchored
+/// pool slices. rippled's DirectStep caps the source by
+/// `PaymentSandbox::balanceHookIOU`: the lesser of the line as carried
+/// (195.5222760261612 after ten sixteen-digit debits) and the original
+/// balance less the deferred-credits table, a chronological sum of the ten
+/// debits (3298.74610692814) — 195.52227602616. The sorted budget fold said
+/// 195.522276026161 and the maker rURtT5MM's residual landed one unit high.
+/// Eighteen targets byte-pinned.
+#[test]
+fn offer_taker_spend_is_capped_by_the_deferred_credits_balance() {
+    run_bundle(include_str!("vectors/offer_taker_spend_capped_by_deferred_credits_106737559.json"));
+}
+

@@ -78,6 +78,8 @@ thread_local! {
 }
 pub(crate) fn amm_ctx_reset() {
     AMM_CTX.with(|c| c.set((0, false, false)));
+    // Finding 134: the remembered owner counts live only inside a flow.
+    ox::owner_count_epoch_start();
 }
 pub(crate) fn amm_ctx_iters() -> u32 {
     AMM_CTX.with(|c| c.get().0)

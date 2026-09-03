@@ -331,3 +331,17 @@ fn payment_fib_seed_multiplies_at_nearest_and_converts_upward() {
 fn payment_forward_pass_reswaps_the_downstream_pool_at_the_carried_input() {
     run_bundle(include_str!("vectors/payment_forward_pass_reswaps_the_downstream_pool_106734485.json"));
 }
+
+/// Finding 134 (#106738595 94693121): r4kSEsvD's partial payment of
+/// 241.520105 RLUSD for XRP down the default book. Maker rB2f945fb3 holds
+/// 3.2 XRP against a reserve of 2.6 (OwnerCount 8): its first offer fills
+/// for the 0.6 XRP of funds and is stepped past and deleted. rippled's
+/// PaymentSandbox remembers the owner count at that first adjustment and
+/// `ownerCountHook` keeps the reserve at 2.6, so the owner's second offer is
+/// unfunded and skipped; we let the deletion free 0.2 XRP and crossed it,
+/// then took one XRP less from rAB4F's deeper offer. Twenty-two targets
+/// byte-pinned.
+#[test]
+fn payment_makers_reserve_holds_at_the_flows_original_owner_count() {
+    run_bundle(include_str!("vectors/payment_makers_reserve_holds_the_original_owner_count_106738595.json"));
+}

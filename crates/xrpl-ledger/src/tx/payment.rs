@@ -1850,6 +1850,8 @@ impl Transactor for PaymentTransactor {
     fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
         // rippled's AMMContext lives for the whole flow of ONE transaction.
         let _amm_ctx = crate::tx::amm_swap::AmmCtxGuard::new();
+        // Finding 134: the payment's PaymentSandbox opens with the flow.
+        crate::tx::offer::owner_count_epoch_start();
         let dest_id = match Self::destination(tx) {
             Some(d) => d,
             None => return TxResult::Malformed,

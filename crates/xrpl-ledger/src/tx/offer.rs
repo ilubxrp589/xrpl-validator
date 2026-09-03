@@ -672,10 +672,31 @@ pub(crate) fn signed_add(aneg: bool, a: Me, bneg: bool, b: Me) -> (bool, Me) {
     }
 }
 
+/// Finding 134 (#106738595 94693121): rippled's PaymentSandbox remembers an
+/// account's owner count at its FIRST adjustment inside the flow
+/// (`DeferredCredits::ownerCount`), and `ownerCountHook` hands `xrpLiquid`
+/// the larger of the current and the remembered count — the reserve an
+/// offer's deletion frees never funds the same owner's later offers within
+/// the payment. The epoch is the PaymentSandbox's lifetime: Payment's flow,
+/// and OfferCreate's crossing AFTER its OfferSequence cancel (that cancel
+/// runs on the plain sandbox and its decrement does count).
+thread_local! {
+    static ORIG_OWNER_COUNTS: std::cell::RefCell<std::collections::HashMap<[u8; 20], u64>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+pub(crate) fn owner_count_epoch_start() {
+    ORIG_OWNER_COUNTS.with(|m| m.borrow_mut().clear());
+}
+fn owner_count_remembered(id: &[u8; 20]) -> Option<u64> {
+    ORIG_OWNER_COUNTS.with(|m| m.borrow().get(id).copied())
+}
 pub(crate) fn owner_count_add(sandbox: &mut Sandbox, id: &[u8; 20], delta: i64) {
     let key = keylet::account_root_key(id);
     if let Some(mut a) = json_at(sandbox, &key) {
         let c = a["OwnerCount"].as_u64().unwrap_or(0) as i64;
+        ORIG_OWNER_COUNTS.with(|m| {
+            m.borrow_mut().entry(*id).or_insert(c.max(0) as u64);
+        });
         a["OwnerCount"] = serde_json::Value::Number(((c + delta).max(0) as u64).into());
         put_json(sandbox, key, &a);
     }
@@ -687,7 +708,10 @@ pub(crate) fn available(sandbox: &Sandbox, id: &[u8; 20], leg: &Leg) -> Me {
         let key = keylet::account_root_key(id);
         let Some(a) = json_at(sandbox, &key) else { return (0, 0) };
         let bal: u128 = a["Balance"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let oc = a["OwnerCount"].as_u64().unwrap_or(0) as u128;
+        let oc_now = a["OwnerCount"].as_u64().unwrap_or(0);
+        // Finding 134: `ownerCountHook` — the larger of the current and the
+        // count remembered at the flow's first adjustment.
+        let oc = owner_count_remembered(id).map_or(oc_now, |r| r.max(oc_now)) as u128;
         let reserve = XRP_RESERVE_BASE + XRP_RESERVE_INC * oc;
         (bal.saturating_sub(reserve), 0)
     } else if id == &leg.issuer {
@@ -1398,7 +1422,15 @@ fn walk_available(
     let Some(a) = json_at(sandbox, &key) else { return (0, 0) };
     let bal: u128 = a["Balance"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
     let cur = a["OwnerCount"].as_u64().unwrap_or(0);
-    let oc = *oc0.entry(*maker).or_insert(cur);
+    // Finding 134: rippled's `ownerCountHook` is the larger of the current
+    // count and the one remembered at the flow's first adjustment; the
+    // first-sight map alone missed a maker whose first fill took its whole
+    // offer (no funds check, no entry) and was then deleted — #106738595's
+    // r28cc8bb5 read 13 for its second offer where mainnet's reserve held
+    // at 14, and the fill overshot the owner's funds by 0.2 XRP.
+    let oc = (*oc0.entry(*maker).or_insert(cur))
+        .max(cur)
+        .max(owner_count_remembered(maker).unwrap_or(0));
     let reserve = XRP_RESERVE_BASE + XRP_RESERVE_INC * oc as u128;
     (bal.saturating_sub(reserve), 0)
 }
@@ -4773,6 +4805,15 @@ pub(crate) fn cross_engine_to_net(
 ) -> (Me, Me, u32, Me) {
     let ask0 = rem_pays;
     let mut in_gross_spent: Me = (0, 0);
+    // Finding 133 (#106737559 6001F5CA): rippled's DirectStep caps a
+    // redeeming source by `PaymentSandbox::balanceHookIOU` —
+    // min(the line as the sandbox carries it, origBalance − Σdebits) — where
+    // Σdebits is the deferred-credits table: a chronological sixteen-digit
+    // sum of this transaction's debits, each iteration's total merged into
+    // the outer sandbox as ONE addition. `orig_held` is the line at the
+    // crossing's start; `outer_debits` the merged per-iteration totals.
+    let orig_held: Me = available(sandbox, taker, gets_leg);
+    let mut outer_debits: Me = (0, 0);
     if std::env::var("DX_ENTRY").is_ok() {
         eprintln!(
             "DX_ENTRY rem_pays={rem_pays:?} rem_gets={rem_gets:?} benef_net={benef_net:?} gets_gross_cap={gets_gross_cap:?} single={single_pass} thr={threshold:016x} thr_self={threshold_self:016x}"
@@ -4948,6 +4989,8 @@ pub(crate) fn cross_engine_to_net(
             if !me_is_zero(taker_accs.1) && !passthrough(taker, gets_leg, PassRole::In) {
                 line_adjust(sandbox, taker, gets_leg, taker_accs.1, false);
             }
+            // Finding 133: the iteration's debit total joins the outer table.
+            outer_debits = stamount_signed_add(false, outer_debits, false, taker_accs.1).1;
         };
     }
     // AMM for the pair competes with the book at every quality level
@@ -5128,6 +5171,8 @@ pub(crate) fn cross_engine_to_net(
                     _ => gross_in(pay_in_rate, slice_net),
                 };
                 in_gross_spent = stamount_signed_add(false, in_gross_spent, false, g).1;
+                // Finding 133: a pool slice is its own iteration.
+                outer_debits = stamount_signed_add(false, outer_debits, false, g).1;
             }
             // An AMM slice is its own flow iteration (BookStep.cpp:818):
             // bank the pending level entry, then the slice's out, and
@@ -5842,6 +5887,29 @@ pub(crate) fn cross_engine_to_net(
                         } else {
                             (0, 0)
                         };
+                        // Finding 133 (#106737559 6001F5CA): `balanceHookIOU` is
+                        // min(amount, origBalance − Σdebits) — the line as carried
+                        // AND the original balance less the chronological table.
+                        // A tfSell of 3494.2683829543 RLUSD over eleven
+                        // iterations (seven levels, four pool slices): the line
+                        // after ten per-iteration debits reads 195.5222760261612
+                        // and the sorted fold 195.522276026161, but the table
+                        // sums the ten debits in order to 3298.74610692814 and
+                        // the cap is 195.52227602616 — the figure mainnet's last
+                        // fill takes (the maker's residual …0400, ours …0390).
+                        let deferred_gross = {
+                            let acc = stamount_signed_add(false, outer_debits, false, taker_accs.1).1;
+                            if me_cmp(orig_held, acc).is_gt() {
+                                stamount_signed_add(false, orig_held, true, acc).1
+                            } else {
+                                (0, 0)
+                            }
+                        };
+                        let live_gross = if me_cmp(deferred_gross, live_gross).is_lt() {
+                            deferred_gross
+                        } else {
+                            live_gross
+                        };
                         let live = match transfer_rate(sandbox, gets_leg)
                             .filter(|_| taker != &gets_leg.issuer && maker != gets_leg.issuer)
                         {
@@ -6304,6 +6372,8 @@ pub(crate) fn cross_engine_to_net(
                     _ => gross_in(pay_in_rate, slice_net),
                 };
                 in_gross_spent = stamount_signed_add(false, in_gross_spent, false, g).1;
+                // Finding 133: a pool slice is its own iteration.
+                outer_debits = stamount_signed_add(false, outer_debits, false, g).1;
             }
             // Tail slice = its own iteration too (see the level-head turn).
             if fold_rem && used {
@@ -6613,6 +6683,10 @@ impl Transactor for OfferCreateTransactor {
         // digits and re-derives the non-exact side — BEFORE crossing, so the
         // crossing and the placed remainder both use the rounded amounts
         // (rippled CreateOffer::applyGuts).
+        // Finding 134: the crossing's PaymentSandbox opens here — after the
+        // cancel, whose freed reserve the taker may spend.
+        owner_count_epoch_start();
+
         let tick = tick_size_for(sandbox, &pays_leg, &gets_leg);
         let (tp0, tg0) = apply_tick_size(tp0, tg0, sell, tick, pays_leg.xrp, gets_leg.xrp);
         if tp0.0 == 0 || tg0.0 == 0 {
