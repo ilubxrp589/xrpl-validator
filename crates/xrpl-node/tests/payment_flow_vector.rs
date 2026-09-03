@@ -250,3 +250,27 @@ fn payment_inflight_line_cleanup_keeps_other_directory_entries() {
 fn payment_first_book_hop_composes_its_in_transfer_rate_into_the_quality_function() {
     run_bundle(include_str!("vectors/payment_first_hop_trin_in_the_quality_function_106732759.json"));
 }
+
+/// Finding 126 (#106735554 9BCDD090): rapido's partial payment RLUSD → USD
+/// → XRP. The reverse pass is limited by rpxqUyf's 0.837973427575079 USD
+/// line; the forward pass feeds rvYAfWj's USD/XRP book 0.8379734275750757
+/// gross, and rippled's `limitStepIn` nets it at mulRatio-nearest over the
+/// 1.0015 transfer rate: quotient …006|98, so the maker rPrDM69j receives
+/// 0.8367183500500007 and its offer 3CDA2E79 keeps 0.7018076499499993.
+/// The mixed engine's book segment truncated to …006 — the fifth floor of
+/// the net-division family — and the residual read …994. Ten targets
+/// byte-pinned.
+#[test]
+fn payment_mixed_book_segment_nets_its_carry_at_mulratio_nearest() {
+    run_bundle(include_str!("vectors/payment_mixed_book_segment_nets_at_mulratio_nearest_106735554.json"));
+}
+
+/// Finding 126, second specimen (#106733664 37F54060): rapido again, a
+/// partial payment of 1.605472 XRP for USDT through the mixed engine, the
+/// maker's residual TakerPays one ULP high in ours (95.81228262477523 for
+/// mainnet's …522) from the same truncating book-segment netting. Nine
+/// targets byte-pinned.
+#[test]
+fn payment_mixed_book_segment_nets_its_carry_at_mulratio_nearest_second_specimen() {
+    run_bundle(include_str!("vectors/payment_mixed_book_segment_nets_at_mulratio_nearest_second_specimen_106733664.json"));
+}

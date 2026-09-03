@@ -1013,8 +1013,18 @@ impl PaymentTransactor {
                     let hop_rate = (i > 0 && !from.xrp && tx.account != from.issuer)
                         .then(|| Self::transfer_rate(sandbox, from))
                         .flatten();
+                    // Finding 126 (#106735554 9BCDD090, rapido's RLUSD → USD →
+                    // XRP partial payment): the FIFTH floor of the net-division
+                    // family (strand_pass's hop-joint, spend0 and live-line
+                    // clamp, the hop `avail` — all mulRatio-NEAREST since
+                    // e4c1581/a12ffd5). rippled's `limitStepIn` nets the fed
+                    // input at `mulRatio(stpAmt.in, QUALITY_ONE, trIn, false)`:
+                    // 0.8379734275750757 over 1.0015 has quotient …006|98,
+                    // nearest …007, and mainnet hands rPrDM69j's offer
+                    // 0.8367183500500007, leaving its TakerPays at …993. This
+                    // floor said …006 and the residual read …994.
                     let avail = match hop_rate {
-                        Some(r) => ox::me_muldiv(carry, (1_000_000_000, 0), (r as u128, 0), false),
+                        Some(r) => ox::mul_ratio(carry, 1_000_000_000, r as u128, false),
                         None => carry,
                     };
                     let feeds_run =
