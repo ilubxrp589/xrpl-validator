@@ -588,3 +588,27 @@ fn offer_makers_xrp_residual_is_subtracted_in_exact_drops() {
 fn offer_makers_xrp_residual_is_subtracted_in_exact_drops_second_specimen() {
     run_bundle(include_str!("vectors/offer_xrp_residual_is_exact_drops_second_specimen_106736674.json"));
 }
+
+/// Finding 128 (#106735983 92E1A551): a tfPassive buy of 0.02379 BTC for
+/// 1910.26219 RLUSD over the XRP bridge. rippled's `limitOut` composes the
+/// strand's quality function from `tip()`, which takes the pool offer only
+/// when the offer it would generate beats the book's tip; leg B's unbounded
+/// maxOffer (9934678820119 drops for 1.781794014448948 BTC) does not, so the
+/// function is constant, the pass runs for the whole 0.02379, the pool
+/// executes first and the pass misses the limit: "All strands dry", the
+/// offer rests whole. We composed the pool's curve, limited the output to
+/// 0.0001645576049539761 BTC and filled at the limit. Twelve targets
+/// byte-pinned.
+#[test]
+fn offer_bridged_limit_out_composes_the_tips_offer_not_the_forced_pool() {
+    run_bundle(include_str!("vectors/offer_bridged_limit_out_composes_the_tip_106735983.json"));
+}
+
+/// Finding 128, second specimen (#106735988 ED391EC4, the same bot five
+/// ledgers on): 1910.61699 RLUSD for 0.02379 BTC, mainnet rests it whole
+/// after the unlimited pass delivers 0.023486064930029 and is rejected;
+/// we filled 0.0004987469251640261 BTC at the limit.
+#[test]
+fn offer_bridged_limit_out_composes_the_tips_offer_not_the_forced_pool_second_specimen() {
+    run_bundle(include_str!("vectors/offer_bridged_limit_out_composes_the_tip_second_specimen_106735988.json"));
+}

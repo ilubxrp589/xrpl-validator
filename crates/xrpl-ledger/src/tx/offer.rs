@@ -3776,6 +3776,8 @@ thr={t:?} admits_trunc={} admits_up={}",
         if std::env::var("DX_BRIDGE").is_ok() {
             eprintln!("DX_ANCHOR a_anchored={a_anchored} b_anchored={b_anchored} a_unb={a_unb_raw} b_unb={b_unb_raw} multi_now={multi_now}");
         }
+        let a_fib_better = a_use_amm;
+        let b_fib_better = b_use_amm;
         let a_use_amm = a_use_amm || (!multi_now && (a_unb_raw || a_anchored));
         let b_use_amm = b_use_amm || (!multi_now && (b_unb_raw || b_anchored));
         // ⚠ Under multiPath, a clamped POOL fill is priced at the OFFER'S
@@ -3860,6 +3862,45 @@ thr={t:?} admits_trunc={} admits_up={}",
         //
         // Only for a SINGLE active strand: with two, sizing one to the limit
         // would misstate the other's share.
+        // Finding 128 (#106735983 92E1A551, #106735988 ED391EC4 — a tfPassive
+        // RLUSD→BTC bot): `limitOut` composes each BookStep's quality function
+        // from `tip()`, and `tip()` hands back the pool offer ONLY when the
+        // offer it would generate beats the book's tip on its own quality —
+        // `ammOffer->quality() > lobQuality` (BookStep.cpp `tip`). The
+        // single-path forcing above (`b_unb_raw`: the unit-blind
+        // `qualityThreshold` makes the pool the leg's only EXECUTED liquidity)
+        // is `tryAMM`'s rule, not `tip()`'s. Leg B's unbounded maxOffer —
+        // 9934678820119 drops for 1.781794014448948 BTC — is far worse than the
+        // 55693 tip, so rippled's tip is the CLOB, the strand's function is
+        // constant, `limitOut` leaves the pass at the full 0.02379, the pool
+        // then executes first (1326817354 drops → 0.023486064930029) and the
+        // pass misses the limit outright: "Path rejected by limitQuality …
+        // All strands dry", the offer rests whole. We composed the pool's
+        // curve, limited the output to 0.0001645576049539761 BTC and filled
+        // exactly at the limit.
+        let tip_amm = |fib_better: bool,
+                       unb: bool,
+                       anch_q: Option<Me>,
+                       amm: &Option<crate::tx::amm_swap::Amm>,
+                       book: Option<Me>,
+                       out_leg: &Leg,
+                       in_leg: &Leg,
+                       sandbox: &Sandbox|
+         -> bool {
+            if multi_now {
+                return fib_better;
+            }
+            let Some(am) = amm.as_ref() else { return false };
+            let Some(lob) = book else { return true };
+            if unb {
+                crate::tx::amm_swap::max_offer(sandbox, am, out_leg, in_leg)
+                    .is_some_and(|(i, o)| me_cmp(crate::tx::amm_swap::slice_rate(i, o), lob).is_lt())
+            } else {
+                anch_q.is_some_and(|q| me_cmp(q, lob).is_lt())
+            }
+        };
+        let a_qf_amm = tip_amm(a_fib_better, a_unb_raw, a_anch_q, &amm_a, qa_book, &xrp_leg, gets_leg, sandbox);
+        let b_qf_amm = tip_amm(b_fib_better, b_unb_raw, b_anch_q, &amm_b, qb_book, pays_leg, &xrp_leg, sandbox);
         let strand_qf = |sandbox: &Sandbox| -> Option<crate::tx::amm_swap::QualityFn> {
             use crate::tx::amm_swap::{pool_balances, QualityFn};
             let leg = |use_amm: bool, amm: &Option<crate::tx::amm_swap::Amm>,
@@ -3873,8 +3914,8 @@ thr={t:?} admits_trunc={} admits_up={}",
                 }
             };
             // Strand order is source-first: leg A (gets -> XRP), then leg B.
-            let mut qf = leg(a_use_amm, &amm_a, qa_book, &xrp_leg, gets_leg)?;
-            qf.combine(&leg(b_use_amm, &amm_b, qb_book, pays_leg, &xrp_leg)?);
+            let mut qf = leg(a_qf_amm, &amm_a, qa_book, &xrp_leg, gets_leg)?;
+            qf.combine(&leg(b_qf_amm, &amm_b, qb_book, pays_leg, &xrp_leg)?);
             Some(qf)
         };
         // `remainingOut` for this pass: a tfSell offer is not bounded by the
