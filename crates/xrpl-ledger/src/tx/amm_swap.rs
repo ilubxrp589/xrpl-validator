@@ -561,19 +561,36 @@ pub(crate) fn adjust_asset_in_by_tokens(
     };
     let mut tokens_adj = tokens;
     if n_cmp(asset_adj, amount) == Ordering::Greater {
+        // rippled (AMMHelpers.cpp adjustAssetInByTokens, fixAMMv1_3):
+        //     adjAmount = amount - (assetAdj - amount);
+        //     t         = lpTokensOut(balance, adjAmount, lptAMMBalance, tfee);
+        //     tokensAdj = adjustLPTokens(lptAMMBalance, t, IsDeposit::Yes);
+        // and the caller refuses `tokensAdj == 0` with tecAMM_INVALID_TOKENS
+        // (a negative one dies the same way in deposit(): "adjusted tokens
+        // zero"). So a deposit whose rounded-up asset-in overshoots by as much
+        // as it is worth — the adjusted amount reaching zero, or the tokens
+        // it buys rounding to zero — yields NO tokens: the answer is the
+        // refusal, not the unadjusted grant.
+        //
+        // Finding 108 (#106724081 8DC704493796): a tfSingleAsset deposit of
+        // ONE drop into the XRP/SPY pool (23,896,311.69 LP tokens). The drop
+        // is worth 0.00117353 LP tokens, ammAssetIn for those rounds up to
+        // 2 drops, the adjusted amount is 0, and mainnet answers
+        // tecAMM_INVALID_TOKENS, fee only. We bailed out with the original
+        // tokens and minted them.
         let over = n_sub(asset_adj, amount, Rnd::Near);
         let adj_amount = n_sub(amount, over, Rnd::Near);
         if adj_amount.0 == 0 {
-            return (tokens, amount);
+            return ((0, 0), amount);
         }
         let t = adjust_lp_tokens(lpt, lp_tokens_out(balance, adj_amount, lpt, tfee), true);
         if t.0 == 0 {
-            return (tokens, amount);
+            return ((0, 0), amount);
         }
         tokens_adj = t;
         match amm_asset_in(balance, lpt, tokens_adj, tfee, xrp) {
             Some(v) => asset_adj = v,
-            None => return (tokens, amount),
+            None => return ((0, 0), amount),
         }
     }
     let deposited = match n_cmp(amount, asset_adj) {

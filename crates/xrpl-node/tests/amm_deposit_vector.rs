@@ -120,3 +120,15 @@ fn amm_deposit_one_asset_lp_token_derives_the_asset_from_the_tokens() {
 fn amm_deposit_no_line_to_a_require_auth_issuer_is_tec_no_line() {
     run_bundle(include_str!("vectors/amm_deposit_require_auth_no_line_106721484.json"));
 }
+
+/// Finding 108 (#106724081 8DC704493796): a tfSingleAsset deposit of ONE drop
+/// into the XRP/SPY pool. The drop is worth 0.00117353 LP tokens; rippled's
+/// adjustAssetInByTokens recomputes the asset-in for those tokens (rounded
+/// up: 2 drops), the adjusted amount is 0, the tokens it buys are 0, and
+/// AMMDeposit answers tecAMM_INVALID_TOKENS with the fee alone. We fell back
+/// to the unadjusted tokens and minted them.
+#[test]
+fn amm_deposit_one_drop_whose_tokens_round_away_is_invalid_tokens() {
+    run_bundle(include_str!("vectors/amm_deposit_single_asset_dust_106724081.json"));
+}
+
