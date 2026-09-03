@@ -6640,6 +6640,14 @@ impl Transactor for OfferCreateTransactor {
     fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
         // rippled's AMMContext lives for the whole flow of ONE transaction.
         let _amm_ctx = crate::tx::amm_swap::AmmCtxGuard::new();
+        // rippled's `preFeeBalance_` (Transactor.cpp:896): the creator's XRP
+        // balance as of BEFORE this transaction's fee was taken. Captured here,
+        // ahead of the OfferSequence cancel and the crossing, because the
+        // reserve gate below reads it AFTER crossing has moved XRP (finding 135).
+        let pre_fee_xrp: u128 = json_at(sandbox, &keylet::account_root_key(&tx.account))
+            .and_then(|a| a["Balance"].as_str().and_then(|s| s.parse::<u128>().ok()))
+            .unwrap_or(0)
+            + tx.fee as u128;
         let tp_json = tx.fields["TakerPays"].clone();
         let tg_json = tx.fields["TakerGets"].clone();
         let (Some(tp0), Some(tg0)) =
@@ -6961,29 +6969,35 @@ impl Transactor for OfferCreateTransactor {
             return TxResult::Success; // fully consumed
         }
 
-        if crossed == 0 {
-            // Pure-placement refusals (mainnet meta: fee-only AccountRoot).
-            if me_is_zero(available(sandbox, &tx.account, &gets_leg)) {
-                return TxResult::UnfundedOffer;
-            }
+        if crossed == 0 && me_is_zero(available(sandbox, &tx.account, &gets_leg)) {
+            // Pure-placement refusal (preclaim tecUNFUNDED_OFFER; fee-only meta).
+            return TxResult::UnfundedOffer;
+        }
+        // Reserve gate, OfferCreate.cpp:835-851: `preFeeBalance_` — the balance
+        // as of BEFORE this transaction's fee was taken — against the reserve for
+        // one more object at the CURRENT owner count. Below it the remainder is
+        // never placed: nothing crossed → tecINSUF_RESERVE_OFFER (fee-only meta);
+        // something crossed → tesSUCCESS with the fills kept and the residual
+        // dropped ("If something actually crossed, then we allow this").
+        // #105845719 90E12EF294C9: post-fee 2799988 vs reserve 2800000 (12 drops,
+        // one fee) — mainnet places the offer, and the same account's later
+        // OfferCreate at index 46 in that ledger *does* get tecINSUF_RESERVE_OFFER,
+        // so the boundary is a genuine off-by-fee rather than a wrong reserve.
+        // #106738995 C171D5D57C05 (finding 135): rn3S6j5b crossed 1 offer with a
+        // prior balance of 1.602638 XRP < 1.8 XRP (OwnerCount 3 + 1) — mainnet
+        // keeps the fill and rests nothing; we placed the residual (extra Offer +
+        // directory pages, OwnerCount +1) because the gate ran only when nothing
+        // crossed and read the post-crossing balance.
+        {
             let acct_key = keylet::account_root_key(&tx.account);
             if let Some(a) = json_at(sandbox, &acct_key) {
-                let bal: u128 = a["Balance"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
                 let oc = a["OwnerCount"].as_u64().unwrap_or(0) as u128;
-                // rippled compares `preFeeBalance_` — the balance as of BEFORE
-                // this transaction's fee was taken (OfferCreate.cpp:834-841).
-                // `do_apply` runs after apply_common has already deducted it,
-                // so add it back; otherwise the account reads short by exactly
-                // one fee at the boundary.
-                // #105845719 90E12EF294C9: post-fee 2799988 vs reserve 2800000
-                // (12 drops, one fee) — mainnet places the offer, and the same
-                // account's later OfferCreate at index 46 in that ledger *does*
-                // get tecINSUF_RESERVE_OFFER, so this is a genuine off-by-fee
-                // rather than a wrong reserve.
-                if bal + (tx.fee as u128) // pre-fee balance
-                    < XRP_RESERVE_BASE + XRP_RESERVE_INC * (oc + 1)
-                {
-                    return TxResult::InsufReserveOffer;
+                if pre_fee_xrp < XRP_RESERVE_BASE + XRP_RESERVE_INC * (oc + 1) {
+                    return if crossed == 0 {
+                        TxResult::InsufReserveOffer
+                    } else {
+                        TxResult::Success // keep fills, never place
+                    };
                 }
             }
         }

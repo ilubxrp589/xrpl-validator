@@ -627,3 +627,14 @@ fn offer_taker_spend_is_capped_by_the_deferred_credits_balance() {
     run_bundle(include_str!("vectors/offer_taker_spend_capped_by_deferred_credits_106737559.json"));
 }
 
+/// Finding 135 — #106738995 C171D5D57C05 (rn3S6j5b, 44.73 XRP for 5M PHNIX,
+/// prior balance 1.602638 XRP, OwnerCount 3). One offer crossed; rippled's
+/// reserve gate (OfferCreate.cpp:835-851) compares `preFeeBalance_` against the
+/// reserve for one more object and, below it, rests nothing: tesSUCCESS with the
+/// fill kept. We placed the residual (extra Offer, two directory pages,
+/// OwnerCount +1) because the gate ran only when nothing crossed.
+#[test]
+fn offer_residual_is_not_placed_below_the_pre_fee_reserve() {
+    run_bundle(include_str!("vectors/offer_residual_not_placed_below_pre_fee_reserve_106738995.json"));
+}
+
