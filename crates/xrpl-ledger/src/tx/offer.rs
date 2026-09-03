@@ -2923,6 +2923,26 @@ fn cross_bridged(
             }
             found
         };
+        // Finding 125 (#106735332 F24954BB): rippled ranks the strands on
+        // `qualityUpperBound` — `tipOfferQuality`, a `BookTip::step` over the
+        // view as it stands when the iteration OPENS: the winning strand's
+        // sandbox and every stream's dead offers were applied at the END of
+        // the previous iteration (StrandFlow.h `best->sb.apply(sb)` and the
+        // `ofrsToRm` `offerDelete` loop), and `BookTip` reads the directory,
+        // not the offer — a self-offer, an expired or unfunded one still
+        // prices the strand until a stream steps onto it. Our ladder cursor
+        // persists only through the mutation walk, so after round 1 emptied
+        // 4D9233FD's level (72.486 XAH/RLUSD) it still named it while the
+        // live tip was DE6AD7AC at 150; ranked on the stale 72.486 the direct
+        // strand beat the bridge's 72.502 and the pass crossed the 150 offer
+        // mainnet never touched — rippled's iteration 1 is the bridge,
+        // 36.5559691 XAH for the remaining 0.5042040783120998. Read the first
+        // entry the sandbox still holds, BEFORE this round's peeks reap what
+        // rippled's streams only find inside the iteration.
+        let d_book_ub = ld[di.min(ld.len())..]
+            .iter()
+            .find(|(_, k)| json_at(sandbox, k).is_some())
+            .map(|(q, _)| rate_me(*q));
         let dpeek = live_head(sandbox, &ld, &mut di, taker, pays_leg, gets_leg, false, peek_rm, stale);
         let apeek = live_head(sandbox, &la, &mut ai, taker, &xrp_leg, gets_leg, false, peek_rm, stale);
         let bpeek = live_head(sandbox, &lb, &mut bi, taker, pays_leg, &xrp_leg, false, peek_rm, stale);
@@ -3195,7 +3215,9 @@ thr={t:?} admits_trunc={} admits_up={}",
         // and with it multi-path, and the pass instead ends where the bridge's
         // own composition falls outside the limit.
         let d_tip = {
-            let book = ld.get(di).map(|(q, _)| rate_me(*q));
+            // Finding 125: the round-open tip (see `d_book_ub` above), not the
+            // ladder at the cursor.
+            let book = d_book_ub;
             let pool = amm.as_ref().zip(amm_init.as_ref()).and_then(|(a, init)| {
                 crate::tx::amm_swap::fib_slice(sandbox, a, *init, amm_iters, pays_leg, gets_leg)
                     .map(|s| crate::tx::amm_swap::slice_rate(s.0, s.1))

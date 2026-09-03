@@ -554,3 +554,18 @@ fn offer_budget_bound_exhausting_fill_takes_the_folded_remainder() {
 fn offer_out_limited_input_is_clamped_to_the_underfunded_makers_own_input() {
     run_bundle(include_str!("vectors/offer_out_limited_input_clamped_to_the_funds_limited_input_106735594.json"));
 }
+
+/// Finding 125 (#106735332 F24954BB): an ImmediateOrCancel buy of 1 RLUSD for
+/// up to 1000 XAH over two strands. Iteration 0 takes 4D9233FD's whole
+/// 35.93848027814264 XAH for 0.4957959216879002 on the direct book — both
+/// engines agree. rippled's iteration 1 ranks the strands on
+/// `qualityUpperBound`, the first directory page still holding an entry: the
+/// direct book's live tip is DE6AD7AC at 150 XAH/RLUSD, the pool's fib slice
+/// 73.16, the bridge 72.502 — the bridge goes first and fills the remaining
+/// 0.5042040783120998 for 36.5559691 XAH. Our ladder cursor still named the
+/// emptied 72.486 level, ranked the direct strand first, and crossed the 150
+/// offer for 75.63061250312109 XAH. Seventeen targets byte-pinned.
+#[test]
+fn offer_direct_upper_bound_reads_the_live_tip_not_the_emptied_level() {
+    run_bundle(include_str!("vectors/offer_direct_upper_bound_reads_the_live_tip_106735332.json"));
+}
