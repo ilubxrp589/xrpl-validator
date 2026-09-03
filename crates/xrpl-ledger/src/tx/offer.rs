@@ -2350,6 +2350,152 @@ fn reap_to_live_head(
     false
 }
 
+/// Finding 114 (#106730661 3241437EB11D): rippled's REV pass sizes a level
+/// against the strand's WANT — `deliver` for a buy, "the largest possible
+/// amount" for a sell (OfferCreate.cpp:416-441) — before the first DirectStep
+/// limits the sender to their funds (StrandFlow.h:187 rev, :227 fwd), and
+/// `limitOut` only ever shrinks that want for a strand with an AMM step
+/// (StrandFlow.h:378-410, "QualityFunction is constant → remainingOut").
+/// Every WHOLE consumption returns true — "return true b/c even if the payment
+/// is satisfied, we need to consume the offer" (BookStep.cpp:1034-1043) — and
+/// `do { execOffer(tip) } while (offers.step())` (BookStep.cpp:840-844) then
+/// STEPS: `OfferStream::step` reaps every dead offer it passes until it lands
+/// on a live one, which `execOffer` refuses without touching it when it sits
+/// on a worse level (`*ofrQ != offer.quality()`, BookStep.cpp:719) or the want
+/// is already met (`remainingOut <= 0`, :1031). A PARTIAL consumption returns
+/// `offer.fullyConsumed()` and stops. The reaps outlive the pass — "rm bad
+/// offers even if the strand fails" (StrandFlow.h:698), applied to the base
+/// view (:766) or handed back as `ofrsToRmOnFail` for `sbCancel`.
+///
+/// The specimen buys 20.58 XRP with RLUSD from a balance of 0.0000206 RLUSD.
+/// rev consumes the 2.456-XRP tip 2B30E6F4 whole (3.368041 RLUSD), steps,
+/// removes the expired 729F17CE and 392EFC07 on the next level (…4F04DF824B0B
+/// C6DD) and stops at the live offer behind them; the DirectStep then limits
+/// the strand to the taker's funds ("Limiting … in: 0.00002055542526") and the
+/// fwd pass is "rejected by limitQuality" → nothing crossed, tecKILLED, the two
+/// expired offers and their page gone. Our walk sizes every fill by
+/// min(want, funds) from the first offer, so it never left the tip.
+///
+/// This scan is the rev pass's STEPPING only: it consumes nothing and reaps
+/// exactly what `OfferStream::step` would, at this level past the point the
+/// funded walk stops and — when the want carries the whole level — across the
+/// following levels up to their first live offer (`reap_to_live_head`, the
+/// same stepper the beyond-limit levels already use). `rev_out` is None for a
+/// sell: the rev want is unbounded, every offer at the level is whole.
+#[allow(clippy::too_many_arguments)]
+fn rev_extent_reap(
+    sandbox: &mut Sandbox,
+    dirs: &[Hash256],
+    di: usize,
+    rev_out: Option<Me>,
+    taker: &[u8; 20],
+    beneficiary: &[u8; 20],
+    pays_leg: &Leg,
+    gets_leg: &Leg,
+    offer_crossing: bool,
+    oc0: &mut std::collections::HashMap<[u8; 20], u64>,
+    stale: &mut Vec<Hash256>,
+) {
+    let Some(dk) = dirs.get(di) else { return };
+    let trace = std::env::var("DX_REV").is_ok();
+    let mut rem = rev_out;
+    // TRUE while the last action was a whole consumption — the state in
+    // which rippled's loop calls `offers.step()` again.
+    let mut stepping = false;
+    let mut page_key_h = *dk;
+    for _ in 0..10_000 {
+        let Some(page) = json_at(sandbox, &page_key_h) else { return };
+        let entries: Vec<String> = page
+            .get("Indexes")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        for ent in entries {
+            let Some(okey) = hex::decode(&ent)
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                .map(xrpl_core::types::Hash256)
+            else { continue };
+            let Some(offer) = json_at(sandbox, &okey) else { continue };
+            if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
+                continue;
+            }
+            let Some(maker) = offer.get("Account").and_then(|v| v.as_str()).and_then(decode20)
+            else { continue };
+            // The taker's own offer: `limitSelfCrossQuality` removes it and
+            // returns true — the loop steps on (the sweep above owns the
+            // removal itself).
+            if offer_crossing && &maker == taker {
+                stepping = true;
+                continue;
+            }
+            if reap_if_dead(sandbox, &okey, &offer, &maker, pays_leg, gets_leg, Some(oc0), stale) {
+                if trace {
+                    eprintln!("DX_REV level={} reaped {}", hex::encode(&dk.0[24..]), hex::encode(okey.0));
+                }
+                continue;
+            }
+            let Some(m_gives0) = offer.get("TakerGets").and_then(keylet::amount_mant_exp) else {
+                continue;
+            };
+            let funded_raw = walk_available(sandbox, &maker, pays_leg, Some(oc0));
+            let funded = match if offer_crossing {
+                maker_out_rate(sandbox, pays_leg, &maker, beneficiary)
+            } else {
+                None
+            } {
+                Some(r) => mul_ratio(funded_raw, 1_000_000_000, r as u128, false),
+                None => funded_raw,
+            };
+            let m_gives = if me_cmp(funded, m_gives0).is_lt() { funded } else { m_gives0 };
+            let whole = match rem {
+                None => true,
+                Some(r) if me_is_zero(r) => {
+                    // Stepped onto with the want already met: refused untouched.
+                    if trace {
+                        eprintln!("DX_REV level={} want met at {}", hex::encode(&dk.0[24..]), hex::encode(okey.0));
+                    }
+                    return;
+                }
+                Some(r) => me_cmp(m_gives, r).is_le(),
+            };
+            if trace {
+                eprintln!(
+                    "DX_REV level={} {} {} gives={m_gives:?} rem={rem:?}",
+                    hex::encode(&dk.0[24..]),
+                    if whole { "whole" } else { "partial" },
+                    hex::encode(okey.0)
+                );
+            }
+            if !whole {
+                return;
+            }
+            if let Some(r) = rem {
+                rem = Some(me_sub(r, m_gives));
+            }
+            stepping = true;
+        }
+        let next = page.get("IndexNext").map(dirnum).unwrap_or(0);
+        if next == 0 {
+            break;
+        }
+        page_key_h = keylet::dir_page_key(dk, next);
+    }
+    if !stepping {
+        return;
+    }
+    // The level is spent by the want: the stream steps to the next LIVE
+    // offer, wherever it sits, reaping what it passes.
+    for dk2 in &dirs[di + 1..] {
+        if trace {
+            eprintln!("DX_REV step across to level {}", hex::encode(&dk2.0[24..]));
+        }
+        if reap_to_live_head(sandbox, dk2, pays_leg, gets_leg, Some(oc0), stale) {
+            return;
+        }
+    }
+}
+
 /// A maker offer's remaining side after a fill, as an STAmount.
 ///
 /// `TOffer::consume` subtracts through STAmount, so the result is rounded back
@@ -4542,7 +4688,7 @@ pub(crate) fn cross_engine_to_net(
     // TRUE once any level activated the strand (tip or pool within the
     // limit) — the moment rippled would have BUILT the offer stream.
     let mut stream_ran = false;
-    'dirs: for dk in dirs {
+    'dirs: for (di, dk) in dirs.clone().into_iter().enumerate() {
         let (level_pays_in, level_gets_in) = (rem_pays, rem_gets);
         let q = u64::from_be_bytes(dk.0[24..32].try_into().unwrap_or_default());
         if trailing {
@@ -4883,6 +5029,13 @@ pub(crate) fn cross_engine_to_net(
             }
             break;
         }
+        // Finding 114: rippled's rev pass steps this level by the WANT, not by
+        // the taker's funds — reap what that stepping reaches before the funded
+        // walk below sizes the fills (`rev_extent_reap`).
+        rev_extent_reap(
+            sandbox, &dirs, di, if sell { None } else { Some(rem_pays) }, taker, beneficiary,
+            pays_leg, gets_leg, offer_crossing, &mut oc0, stale,
+        );
         let mut page_key_h = dk;
         for _ in 0..10_000 {
             let Some(page) = json_at(sandbox, &page_key_h) else { break };

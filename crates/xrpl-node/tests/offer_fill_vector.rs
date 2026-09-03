@@ -348,3 +348,22 @@ fn offer_dust_remainder_whose_quality_rounds_worse_is_removed_not_crossed() {
     run_bundle(include_str!("vectors/offer_dust_xrp_offer_increased_quality_removed_106727096.json"));
 }
 
+
+/// Finding 114 (#106730661 3241437EB11D): a tfImmediateOrCancel buy of
+/// 20.575959 XRP for 28.215814 RLUSD by a taker holding 0.0000206 RLUSD.
+/// rippled's REV pass sizes the book against the WANT before the DirectStep
+/// limits the sender to their funds: it consumes the 2.456-XRP tip 2B30E6F4
+/// whole, and the `do … while (offers.step())` loop then steps the stream —
+/// removing the expired 729F17CE and 392EFC07 on the next level — until the
+/// live offer behind them ends the pass (a worse level). The fwd pass, limited
+/// to the funds, is then "rejected by limitQuality": nothing crosses,
+/// tecKILLED, and the two expired offers are gone with their page — "rm bad
+/// offers even if the strand fails", applied through sbCancel. Our walk sized
+/// every fill by min(want, funds) from the first offer and never left the tip.
+/// Three targets byte-pinned: the reaped makers' owner directory and root and
+/// the taker's root; the page …4F04DF824B0BC6DD was created and removed
+/// earlier in the same ledger, so its pre-image is seated by hand.
+#[test]
+fn offer_killed_crossing_still_reaps_what_the_rev_pass_stepped_over() {
+    run_bundle(include_str!("vectors/offer_killed_crossing_reaps_the_rev_pass_step_106730661.json"));
+}
