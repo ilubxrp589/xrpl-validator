@@ -1837,21 +1837,40 @@ fn book_offer_ladder(sandbox: &Sandbox, base: &Hash256, cap: usize) -> Vec<(u64,
 ///
 /// Same formula as `d_tip` in `cross_bridged`, which matched rippled's own
 /// FLOWDBG `ub strand` value exactly on #105912454.
+/// A hop's quality upper bound — rippled's `BookStep::tip`: the book's tip
+/// unless `getOffer` hands back a pool offer of better quality (or there is
+/// no book at all). The pool offer's SHAPE follows `ammContext.multiPath()`:
+///   * multi-path: the fib slice for the flow's iteration count (an
+///     overflowing slice is NO offer under fixAMMOverflowOffer);
+///   * single-path: anchored at the book's tip when the spot beats it —
+///     quality ≈ the tip — or `maxOffer` when no book, whose quality is the
+///     feeless spot `Quality{balances}`.
+/// Finding 107: sizing the single-path bound by the fib slice let a counted
+/// iteration index overflow the slice and drop the pool from a strand that
+/// rippled still walks (#106723025, round 18 of 30).
 pub(crate) fn hop_tip(
     sandbox: &Sandbox,
     taker: &[u8; 20],
     in_leg: &Leg,
     out_leg: &Leg,
     amm_iters: u32,
+    multi: bool,
 ) -> Option<Me> {
     let base = keylet::book_base(&in_leg.cur, &out_leg.cur, &in_leg.issuer, &out_leg.issuer);
     let book = book_offer_ladder(sandbox, &base, 1).first().map(|(q, _)| rate_me(*q));
     let pool = crate::tx::amm_swap::discover(sandbox, in_leg, out_leg, taker).and_then(|a| {
         let init = crate::tx::amm_swap::pool_balances(sandbox, &a, out_leg, in_leg);
-        crate::tx::amm_swap::fib_slice(sandbox, &a, init, amm_iters, out_leg, in_leg)
-            .map(|s| crate::tx::amm_swap::slice_rate(s.0, s.1))
+        if multi {
+            crate::tx::amm_swap::fib_slice(sandbox, &a, init, amm_iters, out_leg, in_leg)
+                .map(|s| crate::tx::amm_swap::slice_rate(s.0, s.1))
+        } else {
+            (init.0.0 > 0 && init.1.0 > 0).then(|| crate::tx::amm_swap::slice_rate(init.0, init.1))
+        }
     });
     match (book, pool) {
+        // Single-path: the anchored offer's quality is the tip's own; only a
+        // book-less hop is priced by the pool (the feeless spot).
+        (Some(b), Some(_)) if !multi => Some(b),
         (Some(b), Some(p)) => Some(if me_cmp(p, b).is_lt() { p } else { b }),
         (Some(b), None) => Some(b),
         (None, Some(p)) => Some(p),
@@ -2970,6 +2989,8 @@ thr={t:?} admits_trunc={} admits_up={}",
                 let slice_net = me_sub(rg_before, rg);
                 in_gross_spent = stamount_signed_add(false, in_gross_spent, false, gross_in(fee_rate, slice_net)).1;
                 amm_iters += 1;
+                // The flow-wide AMMContext counts this iteration too (F107).
+                crate::tx::amm_swap::amm_ctx_walk_iteration();
                 crossed += 1;
                 if done(rem_pays, rem_gets) {
                     break;
@@ -3927,6 +3948,8 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // carried — `ammContext.update()` is `if (ammUsed_) ++ammIters_`.
                 if amm_used {
                     amm_iters += 1;
+                    // The flow-wide AMMContext counts this iteration too (F107).
+                    crate::tx::amm_swap::amm_ctx_walk_iteration();
                 }
             }
             }
@@ -5692,10 +5715,16 @@ fn amm_turn(
     in_gross_rate: Option<u64>,
 ) -> (Me, Me, bool) {
     let Some(f) = fib else {
-        return crate::tx::amm_swap::consume(
+        let r = crate::tx::amm_swap::consume(
             sandbox, a, taker, beneficiary, benef_net, in_gross_cap, rem_pays, rem_gets, pays_leg, gets_leg, threshold, threshold_gross, sell, clob,
             in_gross_rate, false,
         );
+        // `AMMOffer::consume` → `setAMMUsed()`: single-path offers count
+        // toward the flow's 30 AMM iterations too (finding 107).
+        if r.2 {
+            crate::tx::amm_swap::amm_ctx_mark_used();
+        }
+        return r;
     };
     let init = match f.init.get(&a.account) {
         Some(v) => *v,
@@ -5711,6 +5740,7 @@ fn amm_turn(
     );
     if r.2 {
         f.used = true;
+        crate::tx::amm_swap::amm_ctx_mark_used();
     }
     r
 }
@@ -5821,6 +5851,8 @@ impl Transactor for OfferCreateTransactor {
     }
 
     fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        // rippled's AMMContext lives for the whole flow of ONE transaction.
+        let _amm_ctx = crate::tx::amm_swap::AmmCtxGuard::new();
         let tp_json = tx.fields["TakerPays"].clone();
         let tg_json = tx.fields["TakerGets"].clone();
         let (Some(tp0), Some(tg0)) =

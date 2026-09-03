@@ -297,12 +297,13 @@ impl PaymentTransactor {
         taker: &[u8; 20],
         chain: &[&crate::tx::offer::Leg],
         amm_iters: u32,
+        multi: bool,
     ) -> Option<crate::tx::offer::Me> {
         use crate::tx::offer as ox;
         const ONE: ox::Me = (1_000_000_000_000_000, -15);
         let mut acc: ox::Me = ONE;
         for w in chain.windows(2) {
-            let tip = ox::hop_tip(sandbox, taker, w[0], w[1], amm_iters)?;
+            let tip = ox::hop_tip(sandbox, taker, w[0], w[1], amm_iters, multi)?;
             acc = ox::me_muldiv(acc, tip, ONE, false);
             // THE INTERMEDIATE GATEWAY'S CUT IS PART OF THE BOUND. A payment
             // book step composes its quality with `trIn` — the transfer rate of
@@ -764,6 +765,7 @@ impl PaymentTransactor {
         taker: &[u8; 20],
         segs: &[crate::tx::direct_step::SegLayout],
         amm_iters: u32,
+        multi: bool,
     ) -> Option<crate::tx::offer::Me> {
         use crate::tx::direct_step as ds;
         use crate::tx::offer as ox;
@@ -777,7 +779,7 @@ impl PaymentTransactor {
                     acc = ox::me_muldiv(acc, ds::run_upper_bound(sandbox, hops, after_book), ONE, false);
                 }
                 ds::SegLayout::Book { from, to } => {
-                    let tip = ox::hop_tip(sandbox, taker, from, to, amm_iters)?;
+                    let tip = ox::hop_tip(sandbox, taker, from, to, amm_iters, multi)?;
                     acc = ox::me_muldiv(acc, tip, ONE, false);
                     if !first_book && !from.xrp && taker != &from.issuer {
                         if let Some(r) = Self::transfer_rate(sandbox, from) {
@@ -1786,6 +1788,8 @@ impl Transactor for PaymentTransactor {
     /// val-062: Apply payment state changes — direct XRP, direct IOU, or
     /// cross-currency via the order books (the crossing engine).
     fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        // rippled's AMMContext lives for the whole flow of ONE transaction.
+        let _amm_ctx = crate::tx::amm_swap::AmmCtxGuard::new();
         let dest_id = match Self::destination(tx) {
             Some(d) => d,
             None => return TxResult::Malformed,
@@ -2691,6 +2695,10 @@ impl PaymentTransactor {
         // across rounds is the point — restart it each round and every slice
         // would be the base one, where rippled's grow 1,1,2,3,5,8,13.
         let mut amm_fib = ox::AmmFib::default();
+        // This loop is rippled's flow(): it alone counts AMM iterations
+        // (`ammContext.update()` once per winning round); the book walks
+        // its hops run through must not (finding 107).
+        crate::tx::amm_swap::amm_ctx_driver_owned(true);
         // `setMultiPath(activeStrands.size() > 1)` is re-evaluated EVERY
         // iteration (StrandFlow.h:649), and a strand that flowed nothing is
         // not pushed back into `next_` — so a payment whose second strand is
@@ -2773,12 +2781,16 @@ impl PaymentTransactor {
                 let mut c: Vec<(usize, ox::Me)> = (0..total_strands)
                     .filter_map(|i| {
                         if i < n_books {
-                            Self::strand_upper_bound(sandbox, &tx.account, &strands[i], amm_fib.iters)
+                            // `activateNext` prices the strands with the PREVIOUS
+                            // iteration's `multiPath()` — `setMultiPath` runs after
+                            // it — so the bound follows `multi_now` as it stands
+                            // here, before this round's order resets it (F107).
+                            Self::strand_upper_bound(sandbox, &tx.account, &strands[i], amm_fib.iters, multi_now)
                         } else if i < n_books + n_direct {
                             crate::tx::direct_step::direct_upper_bound(sandbox, &dstrands[i - n_books])
                         } else {
                             Self::mixed_upper_bound(
-                                sandbox, &tx.account, &mstrands[i - n_books - n_direct], amm_fib.iters,
+                                sandbox, &tx.account, &mstrands[i - n_books - n_direct], amm_fib.iters, multi_now,
                             )
                         }
                         .filter(|ub| thr_me.is_none_or(|t| ox::me_cmp(*ub, t).is_le()))
@@ -2837,6 +2849,9 @@ impl PaymentTransactor {
             for &i in &order {
                 let try_snap = sandbox.snapshot();
                 let mut try_fib = amm_fib.clone();
+                // `ammContext.clear()` before every strand execution: the used
+                // flag describes THIS strand's pass, not a failed earlier one.
+                crate::tx::amm_swap::amm_ctx_clear_used();
                 // EVERY strand runs ONE PASS, lone or not — the third and last
                 // part of the iteration model, and the same `if multi` gate the
                 // rounds carried. A pass ends when an offer is CONSUMED and
@@ -2963,12 +2978,14 @@ impl PaymentTransactor {
                     }
                 }
                 amm_fib = try_fib;
-                // ammContext.update(): one fib iteration per WINNING round
-                // that used any pool (AMMContext.h; FLOWDRIVER-DESIGN §5.1).
-                if amm_fib.used {
-                    amm_fib.iters += 1;
-                    amm_fib.used = false;
-                }
+                // ammContext.update(): one AMM iteration per WINNING round
+                // that used any pool (AMMContext.h; FLOWDRIVER-DESIGN §5.1) —
+                // in EITHER offer mode, since `AMMOffer::consume` sets the
+                // flag for single-path offers too (finding 107). The fib
+                // index IS that counter.
+                crate::tx::amm_swap::amm_ctx_update();
+                amm_fib.iters = crate::tx::amm_swap::amm_ctx_iters();
+                amm_fib.used = false;
                 applied = Some((i, sin, sout, in_gross, out_net));
                 break;
             }

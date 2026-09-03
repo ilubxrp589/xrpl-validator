@@ -1077,6 +1077,37 @@ def main():
         for li in page_bad[:5]:
             print(f"WARN: self-check page {li[:16]}… entry replay != post-ledger page")
 
+    # EXTRA_KEYS=<file>: keys the caller knows the walk will need beyond what
+    # the meta names (deep book levels, pools on the path, their owners) —
+    # every one seated the honest way: parent image when nothing earlier in
+    # the ledger touched it, otherwise rebuilt through the in-ledger touchers.
+    # #106723025 62498920 (finding 107): a tec specimen whose meta names the
+    # fee alone, while the walk it must reproduce runs 30 book levels deep.
+    extra_file = os.environ.get("EXTRA_KEYS")
+    if extra_file:
+        n_before = len(pre)
+        with open(extra_file) as ef:
+            extra_keys = [k.strip().upper() for k in ef if k.strip()]
+        for k in extra_keys:
+            if k in pre:
+                continue
+            before = [t for t in touchers.get(k, []) if t[0] < my_index]
+            if before:
+                # A page that exists at the parent but was touched earlier in
+                # this ledger: parent entries + the earlier ops (page_pre).
+                # An in-ledger CREATED page: ensure_page. Anything else: the
+                # last earlier toucher's image (ensure_key).
+                hexs, _why = page_pre(k, before)
+                if hexs is not None:
+                    pre[k] = hexs
+                    continue
+                ensure_page(k)
+                if k not in pre:
+                    ensure_key(k)
+            else:
+                ensure_key(k)
+        print(f"extra keys: {len(extra_keys)} requested, {len(pre) - n_before} seated")
+
     parent = rpc("ledger", {"ledger_index": seq - 1})["ledger"]
     cur = rpc("ledger", {"ledger_index": seq})["ledger"]
     tx.pop("metaData", None)

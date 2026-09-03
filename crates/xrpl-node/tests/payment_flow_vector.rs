@@ -186,3 +186,20 @@ fn payment_intermediate_hop_never_lands_on_the_senders_line() {
 fn payment_book_behind_an_issuer_no_ripple_line_is_path_dry() {
     run_bundle(include_str!("vectors/payment_noripple_into_book_106722089.json"));
 }
+
+/// Finding 107 (#106723025 62498920E4FE): a tfPartialPayment self-conversion,
+/// SendMax 910,314,466.5 TIME → [FUZZY, XRP] → 263.0198 RLUSD (DeliverMin
+/// 261.517), whose TIME→FUZZY hop is a pool with no book behind it. rippled's
+/// AMMContext allows a flow 30 iterations that consume pool liquidity —
+/// in either offer mode — and then `getOffer` answers nullopt for the rest of
+/// the flow. Its trace runs exactly 30 "Best path" iterations, each identical
+/// to ours to the last digit, then "All strands dry": 101.4 RLUSD delivered,
+/// tecPATH_PARTIAL, fee only. We kept iterating (47 rounds on this bundle),
+/// reached DeliverMin and wrote 127 nodes. The bundle carries the 70 XRP/RLUSD
+/// book levels, their makers and the three pools (EXTRA_KEYS), seated through
+/// the in-ledger replay, so the walk here is the live walk.
+#[test]
+fn payment_pool_liquidity_stops_after_thirty_amm_iterations() {
+    run_bundle(include_str!("vectors/payment_amm_iteration_cap_106723025.json"));
+}
+

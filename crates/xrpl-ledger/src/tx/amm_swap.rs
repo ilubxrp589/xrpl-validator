@@ -18,6 +18,91 @@ use crate::ledger::keylet;
 use crate::ledger::sandbox::Sandbox;
 use std::cmp::Ordering;
 
+// ─── AMMContext (rippled AMMContext.h): ONE iteration counter for a whole
+// flow. `AMMOffer::consume` sets `ammUsed_` in EITHER offer mode (fib or
+// single-path), `flow()` calls `ammContext.update()` once per winning
+// iteration (`if (ammUsed_) ++ammIters_`), clears the flag before every
+// strand execution, and `AMMLiquidity::getOffer` answers nullopt for the
+// rest of the flow once `ammIters_ >= kMaxIterations` (30). The counter is
+// per flow, not per pool: every pool the flow touches reads the same one.
+//
+// Finding 107 (#106723025 62498920E4FE): a tfPartialPayment SendMax
+// 910,314,466.5 TIME → [FUZZY, XRP] → 263.0198 RLUSD (DeliverMin 261.517)
+// whose TIME→FUZZY hop is a POOL with no book behind it. rippled's trace
+// runs exactly 30 "Best path" iterations — every one identical to ours to
+// the last digit — then "All strands dry": the pools have gone silent and
+// the strand has no other liquidity. 101.4 RLUSD delivered, tecPATH_PARTIAL,
+// fee only. We kept iterating past 30, reached DeliverMin and wrote 127
+// nodes.
+pub(crate) const MAX_AMM_ITERS: u32 = 30;
+// (iterations, used-in-this-pass, a flow driver owns the count). The
+// payment driver counts one iteration per WINNING round itself; the offer
+// walks count one per consumed pool slice, which is what an iteration is for
+// offer crossing — but those same walks run the payment's book hops, so
+// they must not count while a driver owns the flow.
+thread_local! {
+    static AMM_CTX: std::cell::Cell<(u32, bool, bool)> =
+        const { std::cell::Cell::new((0, false, false)) };
+}
+pub(crate) fn amm_ctx_reset() {
+    AMM_CTX.with(|c| c.set((0, false, false)));
+}
+pub(crate) fn amm_ctx_iters() -> u32 {
+    AMM_CTX.with(|c| c.get().0)
+}
+pub(crate) fn amm_ctx_exhausted() -> bool {
+    amm_ctx_iters() >= MAX_AMM_ITERS
+}
+/// A strand driver (the payment round loop) owns the iteration count.
+pub(crate) fn amm_ctx_driver_owned(owned: bool) {
+    AMM_CTX.with(|c| {
+        let (i, u, _) = c.get();
+        c.set((i, u, owned));
+    });
+}
+/// `ammContext.clear()` — before each strand execution.
+pub(crate) fn amm_ctx_clear_used() {
+    AMM_CTX.with(|c| {
+        let (i, _, o) = c.get();
+        c.set((i, false, o));
+    });
+}
+/// `setAMMUsed()` — a pool moved value in the current pass.
+pub(crate) fn amm_ctx_mark_used() {
+    AMM_CTX.with(|c| {
+        let (i, _, o) = c.get();
+        c.set((i, true, o));
+    });
+}
+/// `ammContext.update()` — once per winning driver iteration.
+pub(crate) fn amm_ctx_update() {
+    AMM_CTX.with(|c| {
+        let (i, u, o) = c.get();
+        c.set((if u { i + 1 } else { i }, false, o));
+    });
+}
+/// An offer walk consumed a pool slice: that IS an iteration when the walk
+/// is the flow (offer crossing); under a strand driver it is only "used".
+pub(crate) fn amm_ctx_walk_iteration() {
+    amm_ctx_mark_used();
+    if !AMM_CTX.with(|c| c.get().2) {
+        amm_ctx_update();
+    }
+}
+/// Scopes the counter to one transaction: fresh on entry, cleared on exit.
+pub(crate) struct AmmCtxGuard;
+impl AmmCtxGuard {
+    pub(crate) fn new() -> Self {
+        amm_ctx_reset();
+        AmmCtxGuard
+    }
+}
+impl Drop for AmmCtxGuard {
+    fn drop(&mut self) {
+        amm_ctx_reset();
+    }
+}
+
 const LO: u128 = 1_000_000_000_000_000; // 1e15
 const HI: u128 = 10_000_000_000_000_000; // 1e16
 const N_ONE: Me = (LO, -15);
@@ -932,6 +1017,14 @@ fn hex20(s: &str) -> Option<[u8; 20]> {
 /// fee (auction-slot discount when the taker holds or is authorized on an
 /// unexpired slot).
 pub(crate) fn discover(sandbox: &Sandbox, spend: &Leg, want: &Leg, taker: &[u8; 20]) -> Option<Amm> {
+    // `getOffer`: `if (ammContext_.maxItersReached()) return std::nullopt;` —
+    // past the cap a pool is simply not liquidity any more (finding 107).
+    if amm_ctx_exhausted() {
+        if std::env::var("DX_DISC").is_ok() {
+            eprintln!("DX_DISC amm iterations exhausted ({}) — pool ignored", amm_ctx_iters());
+        }
+        return None;
+    }
     let key = keylet::amm_key(&spend.cur, &spend.issuer, &want.cur, &want.issuer);
     if std::env::var("DX_DISC").is_ok() {
         eprintln!(
@@ -1175,6 +1268,9 @@ pub(crate) fn consume_fib(
     // calibration).
     in_gross_rate: Option<u64>,
 ) -> (Me, Me, bool) {
+    if amm_ctx_exhausted() {
+        return (rem_pays, rem_gets, false);
+    }
     // tfSell: the pays side is only a MINIMUM — once met it saturates to
     // zero while the sell keeps spending rem_gets. rippled's sell flow keeps
     // taking pool liquidity for the remaining IN; #106250947 46FC6146
@@ -1310,7 +1406,16 @@ pub(crate) fn fib_slice(
     if pool_in.0 == 0 || pool_out.0 == 0 || init.0.0 == 0 || init.1.0 == 0 {
         return None;
     }
-    const FIB: [u32; 16] = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597];
+    // rippled's kFib[AMMContext::kMaxIterations]: the slice grows for the
+    // whole 30-iteration life of the flow (finding 107 — the table used to
+    // stop at 16 entries and clamp).
+    const FIB: [u32; 30] = [
+        1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597, 2584, 4181, 6765, 10946,
+        17711, 28657, 46368, 75025, 121393, 196418, 317811, 514229, 832040, 1346269,
+    ];
+    if iters >= MAX_AMM_ITERS {
+        return None;
+    }
     let pct: Me = (2_500_000_000_000_000, -19); // kInitialFibSeqPct = 5/20000
     let base_in = to_amount(n_mul(init.0, pct, Rnd::Up), gets_leg.xrp, Rnd::Up);
     if base_in.0 == 0 {
@@ -1322,7 +1427,7 @@ pub(crate) fn fib_slice(
         s_out = swap_asset_in(init.0, init.1, s_in, amm.tfee, pays_leg.xrp);
     } else {
         let out0 = swap_asset_in(init.0, init.1, base_in, amm.tfee, pays_leg.xrp);
-        let idx = (iters as usize - 1).min(FIB.len() - 1);
+        let idx = iters as usize - 1;
         s_out = to_amount(
             n_mul(out0, ((FIB[idx] as u128) * LO, -15), Rnd::Down),
             pays_leg.xrp,
@@ -1693,6 +1798,9 @@ pub(crate) fn consume(
     // small.
     limit_anchor: bool,
 ) -> (Me, Me, bool) {
+    if amm_ctx_exhausted() {
+        return (rem_pays, rem_gets, false);
+    }
     // tfSell: the pays side is only a MINIMUM — once met it saturates to
     // zero while the sell keeps spending rem_gets. rippled's sell flow keeps
     // taking pool liquidity for the remaining IN; #106250947 46FC6146
