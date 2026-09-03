@@ -3246,8 +3246,60 @@ thr={t:?} admits_trunc={} admits_up={}",
         // iteration, StrandFlow.h:672-674.)
         // The qualityThreshold override is single-path only: force the pool
         // leg now that multiPath is known (see a_unb_raw above).
-        let a_use_amm = a_use_amm || (!multi_now && a_unb_raw);
-        let b_use_amm = b_use_amm || (!multi_now && b_unb_raw);
+        // Finding 111 (#106723136 DDE9287F69AF, RLUSD→USDC 172.013 each, no
+        // flags): single-path, and a leg whose BOOK tip sits inside the limit
+        // while the POOL's spot beats that tip. rippled's `tryAMM(tip)` runs
+        // before the tip's own offer: `getOffer(tip)` anchors a pool offer at
+        // the tip's quality (changeSpotPriceQuality) and BookStep consumes
+        // it first — the trace shows leg A (RLUSD→XRP) filled by the
+        // XRP/RLUSD pool's anchored 301.29 RLUSD / 222.98 XRP and the tip
+        // 8FD686B8 untouched. We priced the leg by the multi-path fib slice
+        // (whose slippage lost to the tip by 1.4e-4), took the tip's offer,
+        // and wrote the maker's nodes for the pool's. The anchored slice
+        // `slice_of` sizes below caps the leg exactly as rippled's offer
+        // does; the tip's own level follows on the NEXT pass, once the pool
+        // has been drawn down to it (`spotPriceQ <= clobQuality` → no offer).
+        let anchored = |amm: &Option<crate::tx::amm_swap::Amm>,
+                        peek: &Option<(u64, Hash256, serde_json::Value, [u8; 20], Me, Me)>,
+                        out_leg: &Leg, in_leg: &Leg| -> bool {
+            match (amm, peek) {
+                (Some(a), Some((q, ..))) => {
+                    !(threshold_self != 0 && threshold_self < *q)
+                        && crate::tx::amm_swap::anchored_offer_quality(sandbox, a, out_leg, in_leg, *q).is_some()
+                }
+                _ => false,
+            }
+        };
+        let a_anchored = !multi_now && anchored(&amm_a, &apeek, &xrp_leg, gets_leg);
+        let b_anchored = !multi_now && anchored(&amm_b, &bpeek, pays_leg, &xrp_leg);
+        // Finding 103 (#106720945 527C1FA56527, tfSell|tfFillOrKill XDC→XRPH):
+        // the quality a single-path leg is JUDGED by. rippled's `tip()` hands
+        // back the pool offer's own `quality()`: for the anchored offer that
+        // is Quality{amounts} — the AVERAGE over the slice that walks the spot
+        // up to the tip, far better than the tip when the slice is deep —
+        // while `maxOffer` carries Quality{balances}, the feeless spot. q83:
+        // leg A's anchored 550,390,143.78 XDC / 466,550,412 drops is 1.1797
+        // XDC per drop against a tip of 1.408; composed with leg B's spot the
+        // bridge is 11,714 XDC per XRPH inside the 12,378 limit, and rippled
+        // fills 30,920,313.975492 XDC → 3084.200478487 XRPH in one pass. We
+        // judged the leg at the tip, read 13,986, and killed the offer.
+        let anchored_q = |amm: &Option<crate::tx::amm_swap::Amm>,
+                          peek: &Option<(u64, Hash256, serde_json::Value, [u8; 20], Me, Me)>,
+                          out_leg: &Leg, in_leg: &Leg| -> Option<Me> {
+            match (amm, peek) {
+                (Some(a), Some((q, ..))) => {
+                    crate::tx::amm_swap::anchored_offer_quality(sandbox, a, out_leg, in_leg, *q).map(rate_me)
+                }
+                _ => None,
+            }
+        };
+        let a_anch_q = a_anchored.then(|| anchored_q(&amm_a, &apeek, &xrp_leg, gets_leg)).flatten();
+        let b_anch_q = b_anchored.then(|| anchored_q(&amm_b, &bpeek, pays_leg, &xrp_leg)).flatten();
+        if std::env::var("DX_BRIDGE").is_ok() {
+            eprintln!("DX_ANCHOR a_anchored={a_anchored} b_anchored={b_anchored} a_unb={a_unb_raw} b_unb={b_unb_raw} multi_now={multi_now}");
+        }
+        let a_use_amm = a_use_amm || (!multi_now && (a_unb_raw || a_anchored));
+        let b_use_amm = b_use_amm || (!multi_now && (b_unb_raw || b_anchored));
         // ⚠ Under multiPath, a clamped POOL fill is priced at the OFFER'S
         // QUALITY, not re-swapped through the conservation function:
         //     if (ammLiquidity_.multiPath())
@@ -3442,19 +3494,20 @@ thr={t:?} admits_trunc={} admits_up={}",
                     // limit, the XRP→BTC leg has no offers, and rippled fills
                     // 176.449 RLUSD through offer 7C87A968 + the XRP/BTC pool in
                     // one single-path iteration; we admitted nothing.
-                    let single_tip = |book: Option<Me>, spot: Option<Me>| -> Option<Me> {
+                    let single_tip = |book: Option<Me>, spot: Option<Me>, anch: Option<Me>| -> Option<Me> {
                         let Some(b) = book else { return spot };
                         match spot {
                             // `spotPriceQ <= clobQuality` bails "higher clob
                             // quality" first, so the pool must be STRICTLY better.
                             Some(s) if me_cmp(t, b).is_lt() && me_cmp(s, b).is_lt() => Some(s),
-                            _ => Some(b),
+                            // Anchored: the offer's own (average) quality — F103.
+                            _ => anch.or(Some(b)),
                         }
                     };
                     let admit = if multi {
                         bq
                     } else {
-                        match (single_tip(qa_book, spot_a), single_tip(qb_book, spot_b)) {
+                        match (single_tip(qa_book, spot_a, a_anch_q), single_tip(qb_book, spot_b, b_anch_q)) {
                             (Some(a), Some(b)) => Some(norm16((a.0 * b.0, a.1 + b.1))),
                             _ => None,
                         }
@@ -7407,15 +7460,24 @@ mod tests {
         assert!(!sandbox.exists(&keylet::offer_key(&acct, 5)), "and nothing is placed");
     }
 
-    /// A bridged pass cannot stop at the pool: off the default path rippled's
-    /// per-offer quality gate is disabled, so the step keeps stepping into the
-    /// leg's CLOB and StrandFlow judges the pass as a whole. Here leg A's pool
-    /// is 100x better than leg A's book, and the pool slice is a fraction of
-    /// the request — so mainnet's pass would be dominated by that book and
-    /// rejected outright. #105807256 84FD7DC8 is the live case: it rests in
-    /// 4 nodes while we crossed 8 objects off six pool slices.
+    /// A single-path bridged pass takes a pool leg at the POOL OFFER'S OWN
+    /// quality, and the leg's book does not join that pass. rippled's
+    /// `forEachOffer` runs `tryAMM(tip)` first; the pool offer sets `ofrQ`,
+    /// and `execOffer(tip)` then breaks on `*ofrQ != offer.quality()` — the
+    /// book's level follows on a LATER pass, once the pool has been drawn
+    /// down to it. The offer is `maxOffer` (quality = the feeless spot) when
+    /// the tip sits beyond the limit, else the anchored slice (quality = its
+    /// own average). Here leg A's pool (100 AAA / 500 XRP) is 500x better
+    /// than leg A's book, so the bridge prices inside the limit and the whole
+    /// 100 BBB crosses for 0.2004 AAA, both book makers' offers untouched
+    /// except leg B's, which carries the XRP.
+    ///
+    /// This supersedes the earlier reading of #105807256 84FD7DC8 ("the pass
+    /// is judged with the book's composition"), which had no specimen pin;
+    /// findings 103 (#106720945 527C1FA5) and 111 (#106723136 DDE9287F) pin
+    /// the tip()/execOffer semantics byte-for-byte.
     #[test]
-    fn a_bridged_pass_needs_its_book_composition_within_the_limit() {
+    fn a_bridged_pass_off_the_default_path_takes_the_pool_leg_at_its_own_quality() {
         let taker = [0x01u8; 20];
         let mk_a = [0x04u8; 20];
         let mk_b = [0x05u8; 20];
@@ -7486,20 +7548,23 @@ mod tests {
             }),
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
-
-        // Nothing crossed: both makers untouched and the offer rests in full.
+        // Leg A's book maker is untouched: the pool priced and filled the leg.
         assert_eq!(
             json_at(&sandbox, &keylet::offer_key(&mk_a, 2)).unwrap()["TakerGets"].as_str(),
             Some("1000000"),
             "leg A's book maker must be untouched",
         );
-        assert_eq!(
-            json_at(&sandbox, &keylet::offer_key(&mk_b, 2)).unwrap()["TakerGets"]["value"].as_str(),
-            Some("100"),
-            "leg B's book maker must be untouched",
+        // Leg B's book carried the XRP into BBB: the maker's 100 BBB are gone.
+        assert!(
+            json_at(&sandbox, &keylet::offer_key(&mk_b, 2)).is_none(),
+            "leg B's maker offer is consumed in full",
         );
-        let rested = json_at(&sandbox, &keylet::offer_key(&taker, 9)).expect("offer rests");
-        assert_eq!(rested["TakerGets"]["value"].as_str(), Some("10"), "and rests in full");
+        // The taker got the whole 100 BBB and nothing rests.
+        assert!(!sandbox.exists(&keylet::offer_key(&taker, 9)), "fully crossed: nothing rests");
+        let bbb = json_at(&sandbox, &keylet::ripple_state_key(&taker, &iss_b, &cb)).expect("taker's BBB line");
+        assert_eq!(bbb["Balance"]["value"].as_str().map(|v| v.trim_start_matches('-')), Some("100"));
+        let aaa = json_at(&sandbox, &keylet::ripple_state_key(&taker, &iss_a, &ca)).expect("taker's AAA line");
+        assert_eq!(aaa["Balance"]["value"].as_str(), Some("999.7995991983967"), "0.2004008016033 AAA left the taker");
     }
 
     /// The taker's OWN resting offer keeps a second strand alive, and that is

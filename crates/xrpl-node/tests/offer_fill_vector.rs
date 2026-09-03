@@ -303,3 +303,34 @@ fn offer_amm_rests_when_the_anchored_pool_offer_misses_the_net_limit() {
 fn offer_pool_covering_the_want_leaves_the_takers_own_tip_offer_alone() {
     run_bundle(include_str!("vectors/offer_amm_fills_before_self_offer_reap_106716594.json"));
 }
+
+/// Finding 111 (#106723136 DDE9287F69AF): an OfferCreate selling 172.013 RLUSD
+/// for 172.013 USDC with no flags — single-path, the direct book beyond the
+/// limit, so the XRP bridge alone. Leg A (RLUSD→XRP) has a book tip inside
+/// the limit AND a pool whose spot beats it: rippled's `tryAMM(tip)` runs
+/// first and `getOffer(tip)` anchors a pool offer at the tip's quality, so
+/// BookStep consumes the pool (301.29 RLUSD / 222.98 XRP, all of it needed)
+/// and the tip's offer 8FD686B8 never moves. We priced the leg by the
+/// multi-path fib slice, lost to the tip by 1.4e-4, took the tip's offer and
+/// wrote the maker's nodes instead of the pool's. Three targets byte-pinned;
+/// the taker's in is rippled's 171.7982923412997 RLUSD.
+#[test]
+fn offer_bridge_leg_takes_the_pool_anchored_at_its_book_tip() {
+    run_bundle(include_str!("vectors/offer_bridge_leg_pool_anchored_at_the_tip_106723136.json"));
+}
+
+/// Finding 103 (#106720945 527C1FA56527): a tfSell|tfFillOrKill OfferCreate
+/// selling 30,920,313.975492 XDC for 2497.84 XRPH. No direct book or pool;
+/// the XRP bridge has an XDC/XRP pool behind a book tip and an XRP/XRPH pool
+/// with no book. rippled's `tip()` judges leg A by the anchored pool offer's
+/// OWN quality — Quality{amounts} of the 550,390,143.78 XDC / 466,550,412
+/// drop slice that walks the spot up to the tip, 1.1797 XDC per drop against
+/// a tip of 1.408 — and leg B by maxOffer's Quality{balances}, the feeless
+/// spot; composed, 11,714 XDC per XRPH sits inside the 12,378 limit and one
+/// single-path pass fills the whole offer (→ 3084.200478487 XRPH). We judged
+/// leg A at the tip, read 13,986, and killed it. Five targets byte-pinned.
+#[test]
+fn offer_bridge_anchored_leg_is_judged_by_its_offers_own_quality() {
+    run_bundle(include_str!("vectors/offer_bridge_anchored_leg_judged_by_its_offer_106720945.json"));
+}
+
