@@ -367,3 +367,21 @@ fn offer_dust_remainder_whose_quality_rounds_worse_is_removed_not_crossed() {
 fn offer_killed_crossing_still_reaps_what_the_rev_pass_stepped_over() {
     run_bundle(include_str!("vectors/offer_killed_crossing_reaps_the_rev_pass_step_106730661.json"));
 }
+
+/// Finding 115 (#106731793 E3E8726FA355): the F114 rule's second face. A
+/// tfSell|tfImmediateOrCancel sale of 1.5 XRP for XRPCAT. rippled's rev pass
+/// takes rfD9A7M8's 01EA78BD whole — its entire 1.9M XRPCAT — reaps the
+/// unfunded 1F26E638 beside it, and steps to the next level, where the same
+/// maker's 9EABC3F5 is now worth 0.0003525 XRPCAT: `ceilOutStrict` clips its
+/// XRP in to ZERO drops, `shouldRmSmallIncreasedQOffer` says remove, and
+/// because the pass itself shrank the funds it is "became tiny" — stepped
+/// past, not removed — which is how the stream reaches and reaps the unfunded
+/// 8BB6A1F0 behind it. The funded fwd pass then takes 653713 XRPCAT of
+/// 01EA78BD and 9EABC3F5 rests untouched. Two ports: the rev scan tracks what
+/// its whole consumptions took from each maker, and the tiny-offer test
+/// floors a funds-clipped XRP in to whole drops. Six targets byte-pinned,
+/// both book pages among them — the reaps live in their entry lists.
+#[test]
+fn offer_rev_pass_steps_past_a_maker_it_emptied_and_reaps_behind_it() {
+    run_bundle(include_str!("vectors/offer_rev_pass_steps_past_a_became_tiny_offer_106731793.json"));
+}

@@ -1952,7 +1952,18 @@ fn small_increased_q_offer(
         return false;
     }
     let (eff_in, eff_out) = if maker != &maker_pays_leg.issuer && me_cmp(funded_raw, gives).is_lt() {
-        (mul_round16_down(funded_raw, rate_me(q)), funded_raw)
+        // `Quality::ceilOutStrict(ofrAmts, ownerFunds, roundUp=false)`: the
+        // clipped IN is `mulRoundStrict` in the IN asset — for XRP, whole
+        // drops rounded DOWN, so a funded remainder worth less than a drop
+        // reads as an in of ZERO and the offer is removed (OfferStream.cpp:
+        // 166-176 "If either the effective in or out are zero then remove the
+        // offer"). Finding 115 (#106731793 E3E8726F): rfD9A7M8's 9EABC3F5,
+        // left 0.0003525 XRPCAT by the pass, is 0.0008 drops of in —
+        // stepped past as "became tiny", which is how the stream reached the
+        // unfunded 8BB6A1F0 behind it.
+        let eff_in = mul_round16_down(funded_raw, rate_me(q));
+        let eff_in = if maker_gets_leg.xrp { (me_rescale(eff_in, 0, false), 0) } else { eff_in };
+        (eff_in, funded_raw)
     } else {
         (wants, gives)
     };
@@ -2396,15 +2407,77 @@ fn rev_extent_reap(
     oc0: &mut std::collections::HashMap<[u8; 20], u64>,
     stale: &mut Vec<Hash256>,
 ) {
-    let Some(dk) = dirs.get(di) else { return };
+    if di >= dirs.len() {
+        return;
+    }
     let trace = std::env::var("DX_REV").is_ok();
     let mut rem = rev_out;
-    // TRUE while the last action was a whole consumption — the state in
-    // which rippled's loop calls `offers.step()` again.
-    let mut stepping = false;
+    // What the scan's whole consumptions took from each maker (F115).
+    let mut consumed: std::collections::HashMap<[u8; 20], Me> = Default::default();
+    if rev_scan_level(
+        sandbox, &dirs[di], &mut rem, &mut consumed, true, taker, beneficiary, pays_leg,
+        gets_leg, offer_crossing, oc0, stale, trace,
+    ) {
+        return;
+    }
+    // The level is spent by the want: the stream steps to the next LIVE
+    // offer, wherever it sits, reaping what it passes.
+    for dk2 in &dirs[di + 1..] {
+        if trace {
+            eprintln!("DX_REV step across to level {}", hex::encode(&dk2.0[24..]));
+        }
+        if rev_scan_level(
+            sandbox, dk2, &mut rem, &mut consumed, false, taker, beneficiary, pays_leg,
+            gets_leg, offer_crossing, oc0, stale, trace,
+        ) {
+            return;
+        }
+    }
+}
+
+/// One level of the rev extent. `consume` is true at the level being
+/// executed — its live offers are consumed by the want — and false on the
+/// levels the stepping crosses afterwards, where the first live offer ends
+/// it (`execOffer` refuses a worse level before touching it).
+///
+/// Finding 115 (#106731793 E3E8726FA355, the F114 rule's second face):
+/// `consumed` carries what the scan's whole consumptions took from each
+/// maker. rippled's rev pass applies them to its sandbox, so a maker's LATER
+/// offer reads as "became unfunded" (OfferStream.cpp:279-305: funds now zero
+/// but not zero before the transaction) — skipped without removal, and the
+/// stream steps on past it. The specimen sells 1.5 XRP for XRPCAT: rev takes
+/// rfD9A7M8's 01EA78BD whole (its entire 1.9M XRPCAT), reaps rn2zm7j6's
+/// unfunded 1F26E638 beside it, steps to the next level, passes rfD9A7M8's
+/// 9EABC3F5 as became-unfunded and reaps rn2zm7j6's unfunded 8BB6A1F0 behind
+/// it; the funded fwd pass then takes 653713 XRPCAT of 01EA78BD and 9EABC3F5
+/// rests untouched. Without the tracking the scan stops at 9EABC3F5 (funded
+/// in the base view) and 8BB6A1F0 survives.
+///
+/// Returns true when the stepping stopped — on a live offer, a partial
+/// consumption or a met want — and false when the level was exhausted with
+/// the stream still stepping.
+#[allow(clippy::too_many_arguments)]
+fn rev_scan_level(
+    sandbox: &mut Sandbox,
+    dk: &Hash256,
+    rem: &mut Option<Me>,
+    consumed: &mut std::collections::HashMap<[u8; 20], Me>,
+    consume: bool,
+    taker: &[u8; 20],
+    beneficiary: &[u8; 20],
+    pays_leg: &Leg,
+    gets_leg: &Leg,
+    offer_crossing: bool,
+    oc0: &mut std::collections::HashMap<[u8; 20], u64>,
+    stale: &mut Vec<Hash256>,
+    trace: bool,
+) -> bool {
+    let lvl = hex::encode(&dk.0[24..]);
     let mut page_key_h = *dk;
     for _ in 0..10_000 {
-        let Some(page) = json_at(sandbox, &page_key_h) else { return };
+        // An unreadable page is unknown, not empty: stop stepping rather
+        // than reap on evidence we do not have.
+        let Some(page) = json_at(sandbox, &page_key_h) else { return true };
         let entries: Vec<String> = page
             .get("Indexes")
             .and_then(|v| v.as_array())
@@ -2422,16 +2495,19 @@ fn rev_extent_reap(
             }
             let Some(maker) = offer.get("Account").and_then(|v| v.as_str()).and_then(decode20)
             else { continue };
-            // The taker's own offer: `limitSelfCrossQuality` removes it and
-            // returns true — the loop steps on (the sweep above owns the
-            // removal itself).
+            // The taker's own offer: at the executing level
+            // `limitSelfCrossQuality` removes it and returns true — the loop
+            // steps on (the sweep above owns the removal itself); on a later
+            // level the quality check refuses it first, like any live offer.
             if offer_crossing && &maker == taker {
-                stepping = true;
-                continue;
+                if consume {
+                    continue;
+                }
+                return true;
             }
             if reap_if_dead(sandbox, &okey, &offer, &maker, pays_leg, gets_leg, Some(oc0), stale) {
                 if trace {
-                    eprintln!("DX_REV level={} reaped {}", hex::encode(&dk.0[24..]), hex::encode(okey.0));
+                    eprintln!("DX_REV level={lvl} reaped {}", hex::encode(okey.0));
                 }
                 continue;
             }
@@ -2447,33 +2523,69 @@ fn rev_extent_reap(
                 Some(r) => mul_ratio(funded_raw, 1_000_000_000, r as u128, false),
                 None => funded_raw,
             };
-            let m_gives = if me_cmp(funded, m_gives0).is_lt() { funded } else { m_gives0 };
-            let whole = match rem {
+            let taken = consumed.get(&maker).copied().unwrap_or((0, 0));
+            let left = if me_cmp(funded, taken).is_gt() { me_sub(funded, taken) } else { (0, 0) };
+            if me_is_zero(left) {
+                // Became unfunded inside the pass: skipped, not removed.
+                if trace {
+                    eprintln!("DX_REV level={lvl} became-unfunded {} (skipped)", hex::encode(okey.0));
+                }
+                continue;
+            }
+            // `shouldRmSmallIncreasedQOffer` judges the offer at what its
+            // owner can still fund inside the pass (OfferStream.cpp:308-332):
+            // tiny and priced worse than its level, it is removed when the
+            // funds are untouched ("found") and merely stepped past when the
+            // pass itself shrank them ("became tiny") — the specimen's
+            // 9EABC3F5, left 0.0003525 XRPCAT by 01EA78BD's whole consumption.
+            let q = u64::from_be_bytes(dk.0[24..32].try_into().unwrap_or_default());
+            let Some(m_wants0) = offer.get("TakerPays").and_then(keylet::amount_mant_exp) else {
+                continue;
+            };
+            if small_increased_q_offer(q, m_wants0, m_gives0, left, &maker, pays_leg, gets_leg) {
+                if me_is_zero(taken) {
+                    if trace {
+                        eprintln!("DX_REV level={lvl} reaped tiny {}", hex::encode(okey.0));
+                    }
+                    delete_maker_offer(sandbox, &okey, &offer, &maker);
+                    stale.push(okey);
+                } else if trace {
+                    eprintln!("DX_REV level={lvl} became-tiny {} (skipped)", hex::encode(okey.0));
+                }
+                continue;
+            }
+            if !consume {
+                if trace {
+                    eprintln!("DX_REV level={lvl} live {} ends the stepping", hex::encode(okey.0));
+                }
+                return true;
+            }
+            let m_gives = if me_cmp(left, m_gives0).is_lt() { left } else { m_gives0 };
+            let whole = match *rem {
                 None => true,
                 Some(r) if me_is_zero(r) => {
                     // Stepped onto with the want already met: refused untouched.
                     if trace {
-                        eprintln!("DX_REV level={} want met at {}", hex::encode(&dk.0[24..]), hex::encode(okey.0));
+                        eprintln!("DX_REV level={lvl} want met at {}", hex::encode(okey.0));
                     }
-                    return;
+                    return true;
                 }
                 Some(r) => me_cmp(m_gives, r).is_le(),
             };
             if trace {
                 eprintln!(
-                    "DX_REV level={} {} {} gives={m_gives:?} rem={rem:?}",
-                    hex::encode(&dk.0[24..]),
+                    "DX_REV level={lvl} {} {} gives={m_gives:?} rem={rem:?}",
                     if whole { "whole" } else { "partial" },
                     hex::encode(okey.0)
                 );
             }
             if !whole {
-                return;
+                return true;
             }
-            if let Some(r) = rem {
-                rem = Some(me_sub(r, m_gives));
+            if let Some(r) = *rem {
+                *rem = Some(me_sub(r, m_gives));
             }
-            stepping = true;
+            consumed.insert(maker, stamount_signed_add(false, taken, false, m_gives).1);
         }
         let next = page.get("IndexNext").map(dirnum).unwrap_or(0);
         if next == 0 {
@@ -2481,19 +2593,7 @@ fn rev_extent_reap(
         }
         page_key_h = keylet::dir_page_key(dk, next);
     }
-    if !stepping {
-        return;
-    }
-    // The level is spent by the want: the stream steps to the next LIVE
-    // offer, wherever it sits, reaping what it passes.
-    for dk2 in &dirs[di + 1..] {
-        if trace {
-            eprintln!("DX_REV step across to level {}", hex::encode(&dk2.0[24..]));
-        }
-        if reap_to_live_head(sandbox, dk2, pays_leg, gets_leg, Some(oc0), stale) {
-            return;
-        }
-    }
+    false
 }
 
 /// A maker offer's remaining side after a fill, as an STAmount.
