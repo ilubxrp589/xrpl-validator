@@ -69,6 +69,22 @@ thread_local! {
 pub(crate) fn set_fwd_gross_in(g: Option<Me>) {
     FWD_GROSS_IN.with(|c| c.set(g));
 }
+thread_local! {
+    // Finding 147: whether the pool being consumed is the strand's FIRST book
+    // step — fed by the sender's own spend. The tiny-sliver sweep below models
+    // `BookStep::fwdImp` consuming the WHOLE product a previous step handed
+    // it; the first step's forward input is not a product but the reverse
+    // pass's own answer (`limitStepOut` → `swapAssetOut(want)`, already the
+    // exact in), so nothing is swept and the unspent sliver stays with the
+    // sender.
+    static FWD_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+pub(crate) fn set_fwd_first(t: bool) {
+    FWD_FIRST.with(|c| c.set(t));
+}
+fn fwd_first() -> bool {
+    FWD_FIRST.with(|c| c.get())
+}
 fn fwd_gross_in() -> Option<Me> {
     FWD_GROSS_IN.with(|c| c.get())
 }
@@ -2026,7 +2042,14 @@ pub(crate) fn consume(
                 );
                 return (ox::me_sub(rem_pays, take_out), (0, 0), true);
             }
-            if tiny {
+            // Finding 147 (#106743109 8D712D436C1D, rGEEkK5: 544.290782 XRP
+            // for up to 100,000 ARMY through the ARMY/XRP pool, one hop):
+            // mainnet's reverse pass sizes the in from the want —
+            // 99999.99992362 ARMY — and 7.638e-5 stays with the sender; the
+            // sweep spent all 100,000 and the pool took the sliver. A
+            // DOWNSTREAM pool fed by a previous step's product (#106734485,
+            // finding 131) is still swept.
+            if tiny && !fwd_first() {
                 let whole = swap_asset_in(pool_in, pool_out, rem_gets, amm.tfee, pays_leg.xrp);
                 if n_cmp(whole, rem_pays) != Ordering::Less {
                     take_in = rem_gets;

@@ -357,3 +357,13 @@ fn payment_makers_reserve_holds_at_the_flows_original_owner_count() {
 fn payment_path_naming_the_sendmax_issuer_is_the_default_strand() {
     run_bundle(include_str!("vectors/payment_path_naming_sendmax_issuer_is_default_strand_106739814.json"));
 }
+
+/// Finding 147 — #106743109 8D712D436C1D (rGEEkK5, 544.290782 XRP for up to
+/// 100,000 ARMY through the ARMY/XRP pool, a single hop). The reverse pass
+/// sizes the in from the want (99999.99992362 ARMY) and 7.638e-5 ARMY stays
+/// with the sender; our tiny-sliver sweep — finding 131's rule for a pool that
+/// feeds a NEXT step — spent the whole SendMax into the pool.
+#[test]
+fn payment_first_pool_hop_is_sized_by_the_reverse_pass() {
+    run_bundle(include_str!("vectors/payment_first_pool_hop_is_sized_by_the_reverse_pass_106743109.json"));
+}
