@@ -540,3 +540,17 @@ fn offer_bridged_round_takes_rippleds_current_activation_for_its_multipath_flag(
 fn offer_budget_bound_exhausting_fill_takes_the_folded_remainder() {
     run_bundle(include_str!("vectors/offer_budget_bound_fill_takes_the_folded_remainder_106734208.json"));
 }
+
+/// Finding 124 (#106735594 982E2CDBD610): a partial payment of 605278 drops
+/// for 2.065196669826816 "666" against rJ4EpEPT's offer, funded for
+/// 2.06519666982682 of its 20.021509. The fill is out-limited to the want,
+/// and rippled's `ceilOutImpl` clamps the priced input to the OFFER's input —
+/// which, for an underfunded maker, is the funds-limited input rounded DOWN
+/// (`limitOut(…, roundUp=false)` at the funds clamp): the want's ceiling is
+/// 605278 drops, the funds' floor 605277, and mainnet takes 605277. Ours
+/// clamped only to the full wants and took 605278 — the maker's root and
+/// residual offer one drop off. Three targets byte-pinned.
+#[test]
+fn offer_out_limited_input_is_clamped_to_the_underfunded_makers_own_input() {
+    run_bundle(include_str!("vectors/offer_out_limited_input_clamped_to_the_funds_limited_input_106735594.json"));
+}

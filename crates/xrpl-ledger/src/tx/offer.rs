@@ -5599,8 +5599,23 @@ pub(crate) fn cross_engine_to_net(
                 // a conserved 1-drop overpay (maker +1, sender −1) and the
                 // offer surviving as Modified where mainnet Deletes it, taking
                 // its book page D58F81E8 and owner-dir entry 171D3DDD with it.
-                if buy_bound && me_cmp(pay, m_wants0).is_gt() {
-                    pay = m_wants0;
+                // Finding 124 (#106735594 982E2CDBD610): `ceilOutImpl`'s "Clamp
+                // in" bounds the out-limited input by the OFFER's input — and
+                // for an underfunded maker that offer is the funds-limited one,
+                // whose input rounds DOWN (`limitOut(…, roundUp=false)` at the
+                // funds clamp, BookStep.cpp). rapido's payment wants
+                // 2.065196669826816 "666" from rJ4EpEPT's offer funded
+                // 2.06519666982682: the want's ceiling is 605278 drops, the
+                // funds' floor 605277, and mainnet takes 605277 — the maker's
+                // root and residual offer were one drop off in ours.
+                let in_cap = if me_cmp(funded, m_gives0).is_lt() {
+                    let c = mul_round16_down(m_gives, rate_me(q));
+                    if gets_leg.xrp { (me_rescale(c, 0, false), 0) } else { c }
+                } else {
+                    m_wants0
+                };
+                if buy_bound && me_cmp(pay, in_cap).is_gt() {
+                    pay = in_cap;
                 }
                 // DX_PRICE: what the out-limited pricing actually produced,
                 // printed BEFORE the clamp test so a fill that does not reach
