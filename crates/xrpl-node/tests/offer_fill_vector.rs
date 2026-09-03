@@ -692,3 +692,16 @@ fn offer_unanchored_pool_tips_by_spot_and_the_pass_is_limit_sized() {
 fn offer_round_zero_multipath_follows_strand_activation() {
     run_bundle(include_str!("vectors/offer_round_zero_multipath_follows_activation_106742048.json"));
 }
+
+/// Finding 145 — #106742494 3E0D8EB82426 (rTeLeproT3, tfSell 15,000 XAH for
+/// 211.65 RLUSD). Iterations 0–5 match; at 6 the direct strand's bound — the
+/// pool's 13x Fibonacci slice, composed with the previous round's multiPath —
+/// misses the limit, `activateNext` drops it, and the bridge's anchored pass
+/// sells the remaining 3815.39521136895 XAH through both pools. We admitted
+/// the direct pool on its single-path spot bound and took two limit-sized
+/// slices first.
+#[test]
+fn offer_direct_pool_is_consulted_only_if_its_strand_survives_activation() {
+    run_bundle(include_str!("vectors/offer_direct_pool_consulted_only_if_strand_survives_activation_106742494.json"));
+}
+

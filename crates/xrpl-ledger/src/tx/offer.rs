@@ -3377,6 +3377,8 @@ thr={t:?} admits_trunc={} admits_up={}",
         // offer. (#106455042 446DCA57's oracle trace already read "iter 0
         // activeStrands 1 multiPath false" with the bridge out.)
         let mp_entry = multi_now;
+        // The upper-bound composition lags one round (finding 145).
+        let mp_ub = multi_prev;
         bridged_round += 1;
         multi_prev = multi_now;
         // AMM turn: the direct-pair pool competes with the best BOOK rate.
@@ -3462,9 +3464,30 @@ thr={t:?} admits_trunc={} admits_up={}",
                 //    realizes the limit exactly.
                 // `multi_prev` is our carry of rippled's iteration-entry
                 // multiPath (the 4ee4288 calibration).
+                // Finding 145 (#106742494 3E0D8EB82426, rTeLeproT3 selling
+                // 15,000 XAH for RLUSD): the direct pool is consulted in a
+                // single-path round only if the DIRECT STRAND survived
+                // `activateNext` — whose bound is `d_tip`, composed at the
+                // round top with the PREVIOUS iteration's multiPath (the pool's
+                // Fibonacci slice at this iteration count when it was multi)
+                // and held against rippled's one, fee-inclusive limitQuality.
+                // At iteration 6 the 13x slice (883.69 XAH / 12.4666 RLUSD)
+                // misses the 70.87 XAH/RLUSD limit, mainnet drops the strand
+                // and the bridge's anchored pass sells the remaining 3815.40
+                // XAH; we admitted the pool on its single-path SPOT bound
+                // against the fee-free rate and took two limit slices first.
+                // (#106742048 stays: the seed slice sits inside the fee-
+                // inclusive limit there, so the strand is kept and, alone,
+                // consumes single-path.)
                 let pool_admitted = if limit_anchor {
-                    let thr_me = rate_me(threshold);
-                    if mp_entry {
+                    let thr_me = rate_me(threshold_self);
+                    let strand_kept = thr_admit.is_some_and(|t| d_tip.is_some_and(|v| me_cmp(v, t).is_le()));
+                    if std::env::var("DX_AMM").is_ok() {
+                        eprintln!("DX_AMM bridged-single strand_kept={strand_kept} d_tip={d_tip:?} thr_self={thr_me:?} mp_prev_ub={mp_ub}");
+                    }
+                    if !strand_kept {
+                        false
+                    } else if mp_ub {
                         match crate::tx::amm_swap::fib_slice(
                             sandbox, a, *init, amm_iters, pays_leg, gets_leg,
                         ) {
@@ -3495,7 +3518,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                         }
                     } else {
                         crate::tx::amm_swap::spot_upper_bound(sandbox, a, pays_leg, gets_leg)
-                            <= threshold
+                            <= threshold_self
                     }
                 } else {
                     true
