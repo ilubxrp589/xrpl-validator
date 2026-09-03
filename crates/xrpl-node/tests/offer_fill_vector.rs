@@ -448,3 +448,40 @@ fn offer_remaining_in_budget_is_an_stamount() {
 fn offer_remaining_in_budget_is_an_stamount_under_a_spend_rate() {
     run_bundle(include_str!("vectors/offer_remaining_in_is_an_stamount_rated_106732165.json"));
 }
+
+/// Finding 120 (#106734370 895B4F980691): a buy of 0.00389351611 BTC for
+/// 220.3 XRP against the BTC/XRP pool (fee 19) with the CLOB tip 4A06477A one
+/// hair past the taker's net limit 4A064769 and inside the transfer-rate
+/// inflated one 4A0649D3. rippled's `tryAMM` anchors on that tip — its
+/// `BookOfferCrossingStep::qualityThreshold(lobQuality)` unanchors the pool
+/// (max offer) only when the tip is WORSE than `qualityThreshold_`, the
+/// inflated limit — takes the tip-anchored slice, 99.673705 XRP for
+/// 0.001760274370140327 BTC, finds "higher clob quality" on the next pass,
+/// has the tip's own fill "rejected by limitQuality", and rests 120.626295 XRP
+/// for 0.0021319129499415 BTC. Our direct-tail turn anchored only on a self
+/// offer, ran the unanchored max offer, took 175.917309 XRP and rested
+/// 44.382691. Five targets byte-pinned: the resting offer, both BTC lines, the
+/// taker's root and the pool's XRP root.
+#[test]
+fn offer_tail_pool_turn_anchors_on_the_residual_tip_inside_the_inflated_limit() {
+    run_bundle(include_str!("vectors/offer_tail_pool_anchored_on_the_residual_tip_106734370.json"));
+}
+
+/// Finding 121 (#106733288 9954A265, recurring #106734683 208D914F): a
+/// tfSell of 20000 RLUSD for 101896 BBRL by a bot whose PREVIOUS offer still
+/// rests at the RLUSD/BBRL book's tip (0.19612 RLUSD per BBRL, better than
+/// this order's 0.19628 limit). rippled anchors `tryAMM` on that raw tip —
+/// the taker's own offer included — and the tiny RLUSD/BBRL pool
+/// (2.5007/12.874, fee 1000) cannot be moved there
+/// (getAMMOfferStartWithTakerPays: pool.out·rate − pool.in/f < 0,
+/// "changeSpotPrice calc failed"); `execOffer` then steps onto the self tip
+/// and removes it ("even if no crossing occurs"), the pass consumed nothing,
+/// the strand is dry, the bridged strand's bound misses the limit: nothing
+/// crosses, the old offer is gone, the new one rests in full. Ours skipped the
+/// self tip when peeking, anchored the pool on the LIMIT instead, sold
+/// 0.005170288597693149 BBRL for 0.001014816793143435 RLUSD, kept the old
+/// offer and rested the remainder. Two targets byte-pinned.
+#[test]
+fn offer_bridged_pool_anchors_on_the_takers_own_tip_and_the_dry_pass_removes_it() {
+    run_bundle(include_str!("vectors/offer_bridged_pool_anchored_on_the_takers_own_tip_106733288.json"));
+}

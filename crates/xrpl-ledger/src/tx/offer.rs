@@ -2835,6 +2835,9 @@ fn cross_bridged(
     let thr = (threshold != u64::MAX).then(|| rate_me(threshold));
     let (mut di, mut ai, mut bi) = (0usize, 0usize, 0usize);
     let mut crossed = 0u32;
+    // Finding 121: the direct strand went dry on a pass that anchored the
+    // pool on the taker's own tip and consumed nothing (see below).
+    let mut direct_dry = false;
     // Offer crossing is always multi-strand (direct + XRP bridge), so the pool
     // competes with FIB-sequence offers off its starting balances. Single-
     // strand walks never reach here — they size the AMM through
@@ -2873,6 +2876,34 @@ fn cross_bridged(
         // silently. Before any fill the peeks stay non-mutating: a strand
         // that is never built reaps nothing (#105795013-analog).
         let peek_rm = crossed > 0;
+        // Finding 121 (#106733288 9954A265, recurring #106734683): the tip
+        // rippled anchors `tryAMM` on is the raw head of the book — the
+        // taker's OWN resting offer included; `limitSelfCrossQuality` only
+        // removes it when `execOffer` steps onto it afterwards. `live_head`
+        // skips self offers (they are never crossed), so peek the raw head
+        // first: the first LIVE entry, if it is the taker's (consumed and
+        // dead entries are stepped over, a live foreign one ends the peek).
+        let raw_self_tip: Option<(u64, Hash256, serde_json::Value)> = {
+            let mut found = None;
+            for (q, okey) in ld.iter().skip(di) {
+                let Some(offer) = json_at(sandbox, okey) else { continue };
+                if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
+                    continue;
+                }
+                if let Some(exp) = offer.get("Expiration").and_then(|v| v.as_u64()) {
+                    if exp != 0 && sandbox.base().header.close_time as u64 >= exp {
+                        continue;
+                    }
+                }
+                let Some(maker) = offer.get("Account").and_then(|v| v.as_str()).and_then(decode20)
+                else { continue };
+                if &maker == taker {
+                    found = Some((*q, *okey, offer));
+                }
+                break;
+            }
+            found
+        };
         let dpeek = live_head(sandbox, &ld, &mut di, taker, pays_leg, gets_leg, false, peek_rm, stale);
         let apeek = live_head(sandbox, &la, &mut ai, taker, &xrp_leg, gets_leg, false, peek_rm, stale);
         let bpeek = live_head(sandbox, &lb, &mut bi, taker, pays_leg, &xrp_leg, false, peek_rm, stale);
@@ -3234,13 +3265,28 @@ thr={t:?} admits_trunc={} admits_up={}",
             // taker was debited NET. #106701467 DAE80780: 1.257009702543272 FLR
             // debited where mainnet takes 1.260780731650903 (× 1.003).
             let rg_before = rem_gets;
-            let (rp, rg, used) = if !multi_now && threshold != u64::MAX {
+            let (rp, rg, used) = if direct_dry {
+                (rem_pays, rem_gets, false)
+            } else if !multi_now && threshold != u64::MAX {
                 // Anchor from the LIVE direct head (dpeek skips consumed and
                 // self offers) — `ld[di]` lags one fill behind and anchored
                 // round 2 at the already-consumed dust offer's rate, which
                 // sat BELOW the pool's spot and refused the slice.
-                let (anchor_clob, limit_anchor) = match dpeek.as_ref().map(|(q, ..)| *q) {
-                    Some(t) if t <= threshold => (Some(t), false),
+                // Finding 121 / 120: the anchor is the raw tip — self offer
+                // included — whenever it is inside rippled's TRUE threshold
+                // (`qualityThreshold(lobQuality)` unanchors the pool only when
+                // the tip is worse than the transfer-rate-inflated limit).
+                // The specimen's RLUSD/BBRL pool (2.5007/12.874, fee 1000)
+                // anchored on the taker's own tip at 0.19612 cannot be moved
+                // there (getAMMOfferStartWithTakerPays: pool.out·rate −
+                // pool.in/f < 0, "changeSpotPrice calc failed"); anchored on
+                // the limit instead, ours sold 0.005170288597693149 BBRL.
+                let tip_q = raw_self_tip
+                    .as_ref()
+                    .map(|(q, ..)| *q)
+                    .or(dpeek.as_ref().map(|(q, ..)| *q));
+                let (anchor_clob, limit_anchor) = match tip_q {
+                    Some(t) if t <= threshold_self => (Some(t), false),
                     _ => (None, true),
                 };
                 // ADMISSION precedes limitOut, and the pool leg's admission
@@ -3318,6 +3364,20 @@ thr={t:?} admits_trunc={} admits_up={}",
             };
             rem_pays = rp;
             rem_gets = rg;
+            // Finding 121: after `tryAMM` at this level, `execOffer` steps onto
+            // the tip; the taker's own offer there is removed whatever the pool
+            // did ("Remove this offer even if no crossing occurs",
+            // limitSelfCrossQuality), and a pass that consumed nothing leaves
+            // the direct strand dry — no unanchored retry.
+            if let Some((sq, skey, soffer)) = raw_self_tip.as_ref() {
+                if !direct_dry && !multi_now && threshold != u64::MAX && *sq <= threshold_self {
+                    delete_maker_offer(sandbox, skey, soffer, taker);
+                    stale.push(*skey);
+                    if !used {
+                        direct_dry = true;
+                    }
+                }
+            }
             if used {
                 // The slice's GROSS joins the walk's spend (see gets_gross_cap).
                 let slice_net = me_sub(rg_before, rg);
@@ -3448,7 +3508,7 @@ thr={t:?} admits_trunc={} admits_up={}",
         // rippled never ranks strands on what they realise, it ranks on the
         // bound and then lets the pass prove itself (see the loop below).
         let ub_ok = |q: Option<Me>| q.filter(|v| thr.is_none_or(|t| me_cmp(*v, t).is_le()));
-        let order: &[bool] = match (ub_ok(d_tip), ub_ok(bq_ub)) {
+        let order: &[bool] = match (ub_ok(d_tip).filter(|_| !direct_dry), ub_ok(bq_ub)) {
             (Some(d), Some(b)) => {
                 if me_cmp(d, b).is_le() {
                     &[true, false]
@@ -6017,7 +6077,25 @@ pub(crate) fn cross_engine_to_net(
                 // A remembered self-offer within the limit is still the tip
                 // rippled's tail pass anchors on (see self_anchor_q above);
                 // beyond the limit rippled anchors nothing (#106295504).
-                self_anchor_q.filter(|qs| *qs <= threshold),
+                // Finding 120 (#106734370 895B4F980691): rippled anchors this
+                // pass's `tryAMM` on the residual tip whenever that tip is inside
+                // its TRUE threshold — `BookOfferCrossingStep::qualityThreshold(
+                // lobQuality)` returns nullopt (the unanchored max offer) only
+                // when `qualityThreshold_ > lobQuality`, i.e. the tip is WORSE
+                // than the transfer-rate-inflated limit (BookStep.cpp). A tip
+                // between the net limit and the inflated one is not crossable
+                // itself (the strand's realised quality misses limitQuality) but
+                // it still shapes the pool's offer. The specimen buys
+                // 0.00389351611 BTC for 220.3 XRP against a BTC/XRP pool with
+                // the CLOB tip 4A06477A one hair past the net limit 4A064769 and
+                // inside the inflated 4A0649D3: mainnet takes the tip-anchored
+                // slice — 99.673705 XRP for 0.001760274370140327 BTC, the figure
+                // our own anchored peek computed — and rests 120.626295; our
+                // unanchored tail took the max offer, 175.917309 XRP, and rested
+                // 44.382691.
+                self_anchor_q
+                    .filter(|qs| *qs <= threshold)
+                    .or(residual_q.filter(|q| *q <= threshold_self)),
                 pay_in_rate,
             );
             if used {
