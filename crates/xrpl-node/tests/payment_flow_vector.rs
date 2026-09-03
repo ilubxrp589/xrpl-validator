@@ -274,3 +274,46 @@ fn payment_mixed_book_segment_nets_its_carry_at_mulratio_nearest() {
 fn payment_mixed_book_segment_nets_its_carry_at_mulratio_nearest_second_specimen() {
     run_bundle(include_str!("vectors/payment_mixed_book_segment_nets_at_mulratio_nearest_second_specimen_106733664.json"));
 }
+
+/// Finding 129 (#106736593 3D845265): r9Vf7UMf's partial payment of
+/// 0.27976441545926 MXR into the MXR/PLX pool, two strands built so the pool
+/// offers the fib slice 0.499490147013714 → 3931.92254433. rippled's
+/// `getRate` is `muldiv(num, 1e17, den) + 5` canonicalized by Number at
+/// to_nearest: 127034584578478051|29 + 5 → …781. Our division truncated
+/// after the +5 and read …780, so the SendMax-limited fill priced at that
+/// quality delivered 2202.269692049335 for mainnet's …333. Five targets
+/// byte-pinned.
+#[test]
+fn payment_encoded_rate_rounds_to_nearest_after_the_legacy_half_up() {
+    run_bundle(include_str!("vectors/payment_encoded_rate_rounds_nearest_after_the_legacy_half_up_106736593.json"));
+}
+
+/// Finding 129, second specimen (#106732893 F6F7F340): a DeliverMin partial
+/// payment walking the XRP/TPR pool through ~30 fib iterations — parked
+/// since morning as a "deep fold-order drill"; one line one ULP off, and the
+/// encoded rate of one slice was the whole of it. Byte-pinned.
+#[test]
+fn payment_encoded_rate_rounds_to_nearest_thirty_fib_iterations() {
+    run_bundle(include_str!("vectors/payment_encoded_rate_rounds_nearest_thirty_fib_iterations_106732893.json"));
+}
+
+/// Finding 129, third specimen (#106736591 2AC6273B): rGdBUkZe's partial
+/// payment, a five-round fib chain, the destination line …108 for
+/// mainnet's …107. Byte-pinned.
+#[test]
+fn payment_encoded_rate_rounds_to_nearest_fib_chain() {
+    run_bundle(include_str!("vectors/payment_encoded_rate_rounds_nearest_fib_chain_106736591.json"));
+}
+
+/// Finding 130 (#106734110 790B4EA7): r9Vf7UMf again, 0.14133821372812 MXR
+/// into the MXR/PLX pool with two strands built. rippled's fib seed is
+/// `toAmount(kInitialFibSeqPct * initialBalances.in, Upward)` — the multiply
+/// under Number's nearest, Upward only on the conversion — and 0.00025 ×
+/// 1994.997505611309 is an exact tie that lands …272; our product rounded
+/// up to …273, the slice's encoded rate moved from …277 to …278, and the
+/// SendMax-limited fill delivered 1115.898338689759 for mainnet's
+/// 1115.89833868976. Byte-pinned.
+#[test]
+fn payment_fib_seed_multiplies_at_nearest_and_converts_upward() {
+    run_bundle(include_str!("vectors/payment_fib_seed_multiplies_at_nearest_106734110.json"));
+}

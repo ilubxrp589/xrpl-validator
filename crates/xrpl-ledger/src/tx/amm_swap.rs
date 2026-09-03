@@ -254,7 +254,17 @@ pub(crate) fn n_div_rate(a: Me, b: Me) -> Me {
     let b = n_norm(b);
     let num = a.0 * 100_000_000_000_000_000u128; // ×1e17 ≤ 1e33, fits u128
     let q = num / b.0 + 5;
-    n_norm((q / 10, a.1 - b.1 - 16))
+    // Finding 129 (#106736593 3D845265, #106734110 790B4EA7 — r9Vf7UMf's
+    // MXR→PLX pool payments): `divide` hands the constructor
+    // `muldiv(num, 1e17, den) + 5` at offset −17 — the +5 is the legacy
+    // half-up at the EIGHTEENTH digit — and `STAmount::canonicalize` is
+    // `*this = iou()` since fixUniversalNumber: an IOUAmount, i.e. Number,
+    // which normalizes the 17-/18-digit mantissa to sixteen at to_nearest.
+    // The fib slice 0.499490147013714 / 3931.92254433 divides to
+    // 127034584578478051|29…: +5 → …8056, nearest → …781; the old
+    // /10-then-truncate said …780, and the SendMax-limited fill priced at
+    // …780 delivered 2202.269692049335 where mainnet's is …333.
+    round16(q, a.1 - b.1 - 17, false, Rnd::Near)
 }
 
 pub(crate) fn n_add(a: Me, b: Me, rnd: Rnd) -> Me {
@@ -1434,7 +1444,16 @@ pub(crate) fn fib_slice(
         return None;
     }
     let pct: Me = (2_500_000_000_000_000, -19); // kInitialFibSeqPct = 5/20000
-    let base_in = to_amount(n_mul(init.0, pct, Rnd::Up), gets_leg.xrp, Rnd::Up);
+    // Finding 130 (#106734110 790B4EA7, r9Vf7UMf's MXR→PLX pool): rippled's
+    // `generateFibSeqOffer` is `toAmount(kInitialFibSeqPct * initialBalances.in,
+    // Upward)` — the MULTIPLY runs under Number's default nearest, and Upward
+    // governs only the conversion to the amount type (a no-op on a
+    // sixteen-digit IOU, a ceiling to drops for XRP). 0.00025 ×
+    // 1994.997505611309 is 0.49874937640282725, a tie: nearest-even lands
+    // …272, the product rounded up landed …273 — and one ulp of the seed
+    // moved the slice's encoded rate from …277 to …278 and the
+    // SendMax-limited fill from mainnet's 1115.89833868976 to …759.
+    let base_in = to_amount(n_mul(init.0, pct, Rnd::Near), gets_leg.xrp, Rnd::Up);
     if base_in.0 == 0 {
         return None;
     }
@@ -2025,7 +2044,11 @@ mod tests {
         // A tail at/above half rounds up in both worlds (the degenerate
         // class every earlier calibration specimen happened to sit in).
         assert_eq!(n_div_rate((15, 0), (8, 0)), (1875000000000000, -15));
-        assert_eq!(n_div_rate((1, 0), (3, 0)), (3333333333333333, -16));
+        // Finding 129: the +5 lands on the SEVENTEENTH digit when num < den
+        // (a 17-digit quotient), and Number's nearest then carries it — 1/3
+        // is 33333333333333333 + 5 → …338 → …334. Only an exact tail of zero
+        // stays (15/8 above: …0005 is a tie, and 16 digits of …000 are even).
+        assert_eq!(n_div_rate((1, 0), (3, 0)), (3333333333333334, -16));
         assert_eq!(n_div_rate((2, 0), (3, 0)), (6666666666666667, -16));
     }
 
