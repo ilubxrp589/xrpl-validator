@@ -4634,6 +4634,28 @@ pub(crate) fn cross_engine_to_net(
             // iteration 0, admitted once at the q1 tip ("FLOWDBG iter 0 …
             // admitted true", then All strands dry). The verdict is
             // re-judged only after a fill or slice — a new iteration.
+            // Finding 101 (#106716594 DE0753F0C77B): at this level rippled
+            // tries the pool FIRST — `tryAMM(offers.tip().quality())` runs
+            // before the level's CLOB offers are visited (BookStep.cpp:837-
+            // 846) — and when the anchored pool offer covers the remaining
+            // want, execOffer returns false and the tip is never reached:
+            // the taker's own resting offer at the tip stays (mainnet
+            // OwnerCount 4). Our sweep below self-reaped it (OwnerCount 3,
+            // offer + page gone) before the tail took the same pool fill.
+            // Skip the sweep when the anchored slice at this level covers
+            // what is left; the tail turn then fills exactly as mainnet.
+            let amm_covers_want = amm
+                .as_ref()
+                .and_then(|a| crate::tx::amm_swap::anchored_slice(sandbox, a, pays_leg, gets_leg, q))
+                .is_some_and(|(si, so)| {
+                    if sell { me_cmp(si, rem_gets).is_ge() } else { me_cmp(so, rem_pays).is_ge() }
+                });
+            if amm_covers_want && offer_crossing && q <= threshold_self {
+                if std::env::var("DX_WALK").is_ok() {
+                    eprintln!("DX_WALK level {q:016x}: anchored pool covers the want — sweep skipped");
+                }
+                break 'dirs;
+            }
             if offer_crossing && threshold_self != 0
                 && threshold_self != u64::MAX && q <= threshold_self
                 && *sweep_admitted.get_or_insert_with(|| {

@@ -290,3 +290,16 @@ fn offer_amm_admitted_when_pool_spot_beats_a_tip_inside_the_fee_band() {
 fn offer_amm_rests_when_the_anchored_pool_offer_misses_the_net_limit() {
     run_bundle(include_str!("vectors/offer_amm_anchored_misses_net_limit_106715477.json"));
 }
+
+/// #106716594 DE0753F0C77B (finding 101): the crossed book's tip is the
+/// taker's OWN resting offer, one level beyond the net limit, and the
+/// XRP/USD pool anchored at that level covers the whole want. rippled runs
+/// tryAMM before it visits the level's offers (BookStep.cpp:837-846); the
+/// pool fills everything, execOffer returns false, and the self offer is
+/// never reached — it stays, OwnerCount 4. Our sweep self-reaped it before
+/// the tail took the identical pool fill (OwnerCount 3, offer and page
+/// gone). Byte-exact on the pool root, both USD lines and the taker's root.
+#[test]
+fn offer_pool_covering_the_want_leaves_the_takers_own_tip_offer_alone() {
+    run_bundle(include_str!("vectors/offer_amm_fills_before_self_offer_reap_106716594.json"));
+}
