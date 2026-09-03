@@ -467,7 +467,22 @@ impl PaymentTransactor {
         let mut m: ox::Me = (0, 0);
         let mut b: ox::Me = ONE;
         for (i, w) in chain.windows(2).enumerate() {
-            if i > 0 && !w[0].xrp && taker != &w[0].issuer {
+            // Finding 119 (#106732759 34694521561A): the FIRST book hop
+            // composes its in-side transfer rate too. rippled's
+            // BookPaymentStep::adjustQualityWithFees takes `trIn` whenever the
+            // previous step REDEEMS (BookStep.cpp) — and the sender's own
+            // DirectStep into the issuer redeems the moment the sender holds
+            // the issuer's IOU. The specimen sells USDT (issuer rate 1.001)
+            // through two pools for UNI (issuer rate 1.001) under
+            // tfLimitQuality: rippled's single-strand `limitOut` trims the
+            // last iteration to 9.790866331963915 UNI — the quality function
+            // carries 1/1.001 twice, USDT's trIn at hop 0 and UNI's srcQOut at
+            // the closing DirectStep — while an `i > 0` gate here dropped the
+            // first factor, priced the strand a hair too well (11.64), left
+            // the full 10.62 remainder untrimmed, and the pass was "rejected
+            // by limitQuality": 3.81 UNI delivered through the pools against
+            // mainnet's 13.61.
+            if !w[0].xrp && taker != &w[0].issuer {
                 if let Some(r) = Self::transfer_rate(sandbox, w[0]) {
                     fold(&mut m, &mut b, (0, 0), am::n_div(ONE, (r as u128, -9), am::Rnd::Near));
                 }
@@ -492,6 +507,9 @@ impl PaymentTransactor {
                         let qm = am::n_div(cfee, pin, am::Rnd::Near);
                         let qb =
                             am::n_div(am::n_mul(pout, cfee, am::Rnd::Near), pin, am::Rnd::Near);
+                        if std::env::var("DX_QF").is_ok() {
+                            eprintln!("DX_QF hop={i} amm pin={pin:?} pout={pout:?} tfee={} cfee={cfee:?} qm={qm:?} qb={qb:?}", a.tfee);
+                        }
                         fold(&mut m, &mut b, qm, qb);
                         took_amm = true;
                     }
@@ -500,12 +518,23 @@ impl PaymentTransactor {
             if !took_amm {
                 match lob {
                     Some(t) => fold(&mut m, &mut b, (0, 0), am::n_div(ONE, t, am::Rnd::Near)),
-                    None => return None,
+                    None => {
+                        if std::env::var("DX_QF").is_ok() {
+                            eprintln!("DX_QF hop={i} no lob, no amm -> None");
+                        }
+                        return None;
+                    }
                 }
+            }
+            if std::env::var("DX_QF").is_ok() {
+                eprintln!("DX_QF hop={i} lob={lob:?} took_amm={took_amm} m={m:?} b={b:?}");
             }
         }
         if let Some(r) = want_rate {
             fold(&mut m, &mut b, (0, 0), am::n_div(ONE, (r as u128, -9), am::Rnd::Near));
+        }
+        if std::env::var("DX_QF").is_ok() {
+            eprintln!("DX_QF final m={m:?} b={b:?} want_rate={want_rate:?} thr={thr:?}");
         }
         Some((m, b))
     }
@@ -531,10 +560,16 @@ impl PaymentTransactor {
         }
         let invq = am::n_div(ONE, thr, am::Rnd::Up);
         if ox::me_cmp(b, invq).is_le() {
+            if std::env::var("DX_QF").is_ok() {
+                eprintln!("DX_QF limit_out: b={b:?} <= invq={invq:?} -> None");
+            }
             return None;
         }
         let diff = am::n_sub(b, invq, am::Rnd::Down);
         let out = am::n_div(diff, m, am::Rnd::Up);
+        if std::env::var("DX_QF").is_ok() {
+            eprintln!("DX_QF limit_out: b={b:?} invq={invq:?} diff={diff:?} m={m:?} out={out:?}");
+        }
         (!ox::me_is_zero(out)).then_some(out)
     }
 

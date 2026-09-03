@@ -232,3 +232,21 @@ fn payment_inflight_line_cleanup_keeps_other_directory_entries() {
     run_bundle(include_str!("vectors/payment_inflight_line_cleanup_keeps_dir_entries_106730304.json"));
 }
 
+
+/// Finding 119 (#106732759 34694521561A): a self-payment of 16.45 UNI for
+/// SendMax 100.32 USDT, tfPartialPayment|tfLimitQuality, six paths, two of
+/// them through pools (USDT/XRPS, XRPS/UNI). Our rounds 0–4 match rippled's
+/// iterations exactly; at round 5 only the two-pool strand is active and
+/// rippled's `limitOut` sizes it from the strand's composed quality function
+/// to 9.790866331963915 UNI. That function carries 1/1.001 twice — the USDT
+/// issuer's transfer rate at the first book hop (the sender REDEEMS into the
+/// pool: BookPaymentStep::adjustQualityWithFees composes trIn) and the UNI
+/// issuer's at the closing DirectStep — while our fold skipped hop 0, priced
+/// the strand at 11.64, asked the full 10.62 remainder and was rejected:
+/// 3.81 UNI through the pools against mainnet's 13.61. The bundle carries the
+/// four issuer roots (EXTRA_KEYS) so the rates are visible; twelve targets
+/// byte-pinned.
+#[test]
+fn payment_first_book_hop_composes_its_in_transfer_rate_into_the_quality_function() {
+    run_bundle(include_str!("vectors/payment_first_hop_trin_in_the_quality_function_106732759.json"));
+}
