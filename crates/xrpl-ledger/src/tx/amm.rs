@@ -86,6 +86,18 @@ fn read_amm_key_from_fields(tx: &TxFields) -> Option<xrpl_core::types::Hash256> 
 }
 
 /// For AMMDeposit/Withdraw/Vote/Bid/Delete — read the AMM key from Asset+Asset2
+/// An `Asset`/`Asset2` field ({"currency"[, "issuer"]}) as a walk leg: XRP
+/// when it names XRP, else the 160-bit currency with its issuer.
+fn asset_leg(v: &serde_json::Value) -> Option<crate::tx::offer::Leg> {
+    let cur = v.get("currency").and_then(|c| c.as_str())?;
+    if cur == "XRP" && v.get("issuer").is_none() {
+        return Some(crate::tx::offer::Leg { xrp: true, cur: [0u8; 20], issuer: [0u8; 20] });
+    }
+    let issuer_s = v.get("issuer").and_then(|i| i.as_str())?;
+    let issuer = crate::tx::offer::decode20(issuer_s)?;
+    Some(crate::tx::offer::Leg { xrp: false, cur: asset_currency20(v), issuer })
+}
+
 fn amm_key_from_asset_fields(tx: &TxFields) -> Option<xrpl_core::types::Hash256> {
     read_amm_key_from_fields(tx)
 }
@@ -771,6 +783,28 @@ impl Transactor for AMMDepositTransactor {
                 if !sandbox.exists(&key) { return TxResult::NoEntry; }
             }
             None => return TxResult::Malformed,
+        }
+        // featureAMMClawback (AMMDeposit.cpp:255-283): BOTH pool assets pass
+        // requireAuth(WeakAuth) then checkFrozen for the depositor, before
+        // any funding arithmetic — a depositor with no line to a
+        // RequireAuth issuer is tecNO_LINE, an unauthorized line tecNO_AUTH,
+        // a frozen one tecFROZEN. Then each deposited amount's asset passes
+        // the STRONG check (:297) — no line at all is tecNO_LINE regardless
+        // of the issuer's flags. Finding 104 (#106721484 3F14213E0C76).
+        for f in ["Asset", "Asset2"] {
+            let Some(leg) = tx.fields.get(f).and_then(asset_leg) else { continue };
+            if let Some(t) = ox::require_auth_ter(sandbox, &leg, &tx.account, false) {
+                if t != TxResult::Success { return t; }
+            }
+            if let Some(t) = ox::frozen_ter(sandbox, &leg, &tx.account) {
+                if t != TxResult::Success { return t; }
+            }
+        }
+        for f in ["Amount", "Amount2"] {
+            let Some(leg) = tx.fields.get(f).and_then(ox::leg_of) else { continue };
+            if let Some(t) = ox::require_auth_ter(sandbox, &leg, &tx.account, true) {
+                if t != TxResult::Success { return t; }
+            }
         }
         // The depositor must be able to FUND an XRP side, and rippled measures
         // that against the reserve it will owe AFTER the deposit: `xrpLiquid`

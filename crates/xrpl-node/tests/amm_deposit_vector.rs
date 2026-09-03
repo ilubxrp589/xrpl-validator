@@ -48,7 +48,10 @@ fn run_bundle(bundle_json: &str) {
     let tx_hash = tx["hash"].as_str().unwrap();
     let txf = build_txfields(tx).expect("txfields");
     let (ter, mut mods) = native_apply_one(&state, &txf);
-    assert_eq!(ter, "tesSUCCESS", "mainnet applied this transaction");
+    // The ledger's verdict — a tec specimen (fee-only) is pinned against
+    // THIS, not against tesSUCCESS (fetch_tx_bundle records it as `result`).
+    let want_ter = bundle["result"].as_str().unwrap_or("tesSUCCESS");
+    assert_eq!(ter, want_ter, "the ledger's verdict for this transaction");
 
     xrpl_ledger::ledger::threading::stamp_threading(
         &mut mods,
@@ -104,4 +107,16 @@ fn amm_deposit_limit_lp_token_within_eprice_takes_the_full_amount() {
 #[test]
 fn amm_deposit_one_asset_lp_token_derives_the_asset_from_the_tokens() {
     run_bundle(include_str!("vectors/amm_deposit_one_asset_lp_token_106704718.json"));
+}
+
+/// #106721484 3F14213E0C76 (finding 104): a single-asset 5 XRP deposit into
+/// the XRP/BFOOT pool by an account with NO BFOOT line while the BFOOT
+/// issuer has lsfRequireAuth. AMMDeposit::preclaim runs requireAuth
+/// (WeakAuth) on BOTH pool assets before any funding arithmetic
+/// (AMMDeposit.cpp:263, RippleStateHelpers.cpp requireAuth): no line to a
+/// RequireAuth issuer is tecNO_LINE and mainnet claims the fee. We minted
+/// LP tokens. Fee-only AccountRoot, the bundle's tec result.
+#[test]
+fn amm_deposit_no_line_to_a_require_auth_issuer_is_tec_no_line() {
+    run_bundle(include_str!("vectors/amm_deposit_require_auth_no_line_106721484.json"));
 }

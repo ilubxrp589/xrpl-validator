@@ -833,6 +833,77 @@ pub(crate) fn require_auth_known(sandbox: &Sandbox, leg: &Leg, owner: &[u8; 20])
     }
 }
 
+/// rippled `requireAuth(view, issue, account, authType)` as a verdict
+/// (RippleStateHelpers.cpp): XRP or the issuer itself → Success; a STRONG
+/// check with no line → tecNO_LINE; an issuer with lsfRequireAuth → the
+/// line's auth bit for this side (lsfLowAuth when the account sorts above
+/// the issuer, else lsfHighAuth) or tecNO_AUTH, and tecNO_LINE without a
+/// line at all. None when the issuer's root is not in hand.
+///
+/// Finding 104 — #106721484 3F14213E0C76: a single-asset 5 XRP deposit into
+/// the XRP/BFOOT pool by an account holding no BFOOT line while the BFOOT
+/// issuer requires auth; AMMDeposit::preclaim runs this WEAK check on both
+/// pool assets (AMMDeposit.cpp:263) and mainnet claims the fee with
+/// tecNO_LINE. We minted LP tokens.
+pub(crate) fn require_auth_ter(
+    sandbox: &Sandbox,
+    leg: &Leg,
+    account: &[u8; 20],
+    strong: bool,
+) -> Option<crate::ledger::transactor::TxResult> {
+    use crate::ledger::transactor::TxResult;
+    const LSF_REQUIRE_AUTH: u64 = 0x0004_0000;
+    const LSF_LOW_AUTH: u64 = 0x0004_0000;
+    const LSF_HIGH_AUTH: u64 = 0x0008_0000;
+    if leg.xrp || account == &leg.issuer {
+        return Some(TxResult::Success);
+    }
+    let line = json_at(sandbox, &keylet::ripple_state_key(account, &leg.issuer, &leg.cur));
+    if line.is_none() && strong {
+        return Some(TxResult::NoLine);
+    }
+    let iss = json_at(sandbox, &keylet::account_root_key(&leg.issuer))?;
+    if iss["Flags"].as_u64().unwrap_or(0) & LSF_REQUIRE_AUTH != 0 {
+        return Some(match line {
+            Some(l) => {
+                let bit = if account > &leg.issuer { LSF_LOW_AUTH } else { LSF_HIGH_AUTH };
+                if l["Flags"].as_u64().unwrap_or(0) & bit != 0 { TxResult::Success } else { TxResult::NoAuth }
+            }
+            None => TxResult::NoLine,
+        });
+    }
+    Some(TxResult::Success)
+}
+
+/// rippled `checkFrozen(view, account, asset)` → tecFROZEN when the issuer
+/// has GlobalFreeze or the account's line is frozen by the issuer's side
+/// (isFrozen). None when the issuer's root is not in hand.
+pub(crate) fn frozen_ter(
+    sandbox: &Sandbox,
+    leg: &Leg,
+    account: &[u8; 20],
+) -> Option<crate::ledger::transactor::TxResult> {
+    use crate::ledger::transactor::TxResult;
+    const LSF_GLOBAL_FREEZE: u64 = 0x0040_0000;
+    const LSF_LOW_FREEZE: u64 = 0x0040_0000;
+    const LSF_HIGH_FREEZE: u64 = 0x0080_0000;
+    if leg.xrp || account == &leg.issuer {
+        return Some(TxResult::Success);
+    }
+    let iss = json_at(sandbox, &keylet::account_root_key(&leg.issuer))?;
+    if iss["Flags"].as_u64().unwrap_or(0) & LSF_GLOBAL_FREEZE != 0 {
+        return Some(TxResult::Frozen);
+    }
+    if let Some(l) = json_at(sandbox, &keylet::ripple_state_key(account, &leg.issuer, &leg.cur)) {
+        // The ISSUER's side of the line carries the freeze that binds the holder.
+        let bit = if &leg.issuer < account { LSF_LOW_FREEZE } else { LSF_HIGH_FREEZE };
+        if l["Flags"].as_u64().unwrap_or(0) & bit != 0 {
+            return Some(TxResult::Frozen);
+        }
+    }
+    Some(TxResult::Success)
+}
+
 /// Adjust one party's side of an IOU movement (line balance ±amt), creating
 /// the line if the receiver has none (rippled offer-crossing behavior).
 pub(crate) fn line_adjust(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, amt: Me, receiving: bool) {
