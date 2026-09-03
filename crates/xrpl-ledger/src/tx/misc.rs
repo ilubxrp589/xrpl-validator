@@ -184,6 +184,12 @@ impl Transactor for SignerListSetTransactor {
         // we probed sandbox.exists at the wrong key, did nothing, fee-only
         // 1v3 (mainnet deletes the SignerList AND its owner-dir entry).
         let signer_list_key = keylet::signers_key(&tx.account);
+        // rippled's `preFeeBalance_` (Transactor.cpp:896): the balance before
+        // this transaction's fee. apply_common has already taken the fee.
+        let pre_fee_xrp: u128 = crate::tx::offer::json_at(sandbox, &acct_key)
+            .and_then(|a| a["Balance"].as_str().and_then(|b| b.parse::<u128>().ok()))
+            .unwrap_or(0)
+            + tx.fee as u128;
 
         if quorum == 0 {
             // Quorum of 0 means delete the signer list
@@ -227,7 +233,53 @@ impl Transactor for SignerListSetTransactor {
                 });
             }
 
-            let already_exists = sandbox.exists(&signer_list_key);
+            // Finding 136 — rippled `replaceSignerList` (SignerListSet.cpp:
+            // 299-355) is remove-then-create, for a fresh list and a
+            // replacement alike: `removeSignersFromLedger` = dirRemove at the
+            // old list's OwnerNode hint + OwnerCount −1 (lsfOneOwnerCount; a
+            // legacy list without the flag gives back 2 + n) + erase; then the
+            // reserve check on `preFeeBalance_` for one more object; then a
+            // fresh SLE, dirInsert — the key lands at the END of the owner
+            // directory, possibly on another page, filed as sfOwnerNode — and
+            // OwnerCount +1. #106739411 780DFE9BF728 (rDPdmrS5, 3-signer
+            // replace): mainnet rewrites the owner-directory page with the
+            // SignerList key moved to the end; we modified the list in place
+            // and never touched the directory ("missing" DirectoryNode).
+            if let Some(data) = sandbox.read(&signer_list_key) {
+                let old = serde_json::from_slice::<serde_json::Value>(&data).ok();
+                let hint = old.as_ref().and_then(|l| {
+                    l.get("OwnerNode")
+                        .and_then(|v| v.as_str())
+                        .and_then(|h| u64::from_str_radix(h, 16).ok())
+                });
+                let dec: i64 = match old.as_ref() {
+                    Some(l) if l["Flags"].as_u64().unwrap_or(0) & 0x0001_0000 != 0 => 1,
+                    Some(l) => 2 + l["SignerEntries"].as_array().map_or(0, |a| a.len()) as i64,
+                    None => 1,
+                };
+                crate::ledger::directory::owner_dir_remove(
+                    sandbox, &tx.account, &signer_list_key, hint, false,
+                );
+                crate::tx::offer::owner_count_add(sandbox, &tx.account, -dec);
+                sandbox.delete(signer_list_key);
+            }
+
+            // `checkReserve(preFeeBalance_, ownerCountDelta = 1)` after the
+            // removal ("may reduce the reserve, so this is done before checking
+            // the reserve"); a tec here rolls the removal back with the rest.
+            if let Some(a) = crate::tx::offer::json_at(sandbox, &acct_key) {
+                let oc = a["OwnerCount"].as_u64().unwrap_or(0) as u128;
+                if pre_fee_xrp
+                    < crate::tx::offer::XRP_RESERVE_BASE
+                        + crate::tx::offer::XRP_RESERVE_INC * (oc + 1)
+                {
+                    return TxResult::InsufficientReserve;
+                }
+            }
+
+            let page = crate::ledger::directory::owner_dir_insert(
+                sandbox, &tx.account, &signer_list_key,
+            );
 
             // Mainnet shape: SignerListID 0 and lsfOneOwnerCount (65536,
             // featureMultiSignReserve — every list charges ONE owner unit).
@@ -243,22 +295,11 @@ impl Transactor for SignerListSetTransactor {
                 "SignerQuorum": quorum,
                 "SignerEntries": signers,
                 "SignerListID": 0,
-                "OwnerNode": "0",
+                "OwnerNode": format!("{page:x}"),
             });
 
             sandbox.write(signer_list_key, serde_json::to_vec(&signer_list_obj).unwrap());
-
-            // Increment OwnerCount + owner-dir entry only for a NEW list
-            if !already_exists {
-                crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &signer_list_key);
-                if let Some(data) = sandbox.read(&acct_key) {
-                    if let Ok(mut acct) = serde_json::from_slice::<serde_json::Value>(&data) {
-                        let count = acct["OwnerCount"].as_u64().unwrap_or(0);
-                        acct["OwnerCount"] = serde_json::Value::Number((count + 1).into());
-                        sandbox.write(acct_key, serde_json::to_vec(&acct).unwrap());
-                    }
-                }
-            }
+            crate::tx::offer::owner_count_add(sandbox, &tx.account, 1);
         }
 
         TxResult::Success

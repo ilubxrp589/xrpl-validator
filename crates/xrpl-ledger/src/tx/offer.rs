@@ -128,7 +128,7 @@ impl Amount {
 // ===========================================================================
 
 /// Mainnet owner reserve (drops): base 1 XRP + 0.2 XRP per owned object.
-const XRP_RESERVE_BASE: u128 = 1_000_000;
+pub(crate) const XRP_RESERVE_BASE: u128 = 1_000_000;
 pub(crate) const XRP_RESERVE_INC: u128 = 200_000;
 
 pub(crate) type Me = (u128, i32);
@@ -672,14 +672,14 @@ pub(crate) fn signed_add(aneg: bool, a: Me, bneg: bool, b: Me) -> (bool, Me) {
     }
 }
 
-/// Finding 134 (#106738595 94693121): rippled's PaymentSandbox remembers an
-/// account's owner count at its FIRST adjustment inside the flow
-/// (`DeferredCredits::ownerCount`), and `ownerCountHook` hands `xrpLiquid`
-/// the larger of the current and the remembered count — the reserve an
-/// offer's deletion frees never funds the same owner's later offers within
-/// the payment. The epoch is the PaymentSandbox's lifetime: Payment's flow,
-/// and OfferCreate's crossing AFTER its OfferSequence cancel (that cancel
-/// runs on the plain sandbox and its decrement does count).
+// Finding 134 (#106738595 94693121): rippled's PaymentSandbox remembers an
+// account's owner count at its FIRST adjustment inside the flow
+// (`DeferredCredits::ownerCount`), and `ownerCountHook` hands `xrpLiquid`
+// the larger of the current and the remembered count — the reserve an
+// offer's deletion frees never funds the same owner's later offers within
+// the payment. The epoch is the PaymentSandbox's lifetime: Payment's flow,
+// and OfferCreate's crossing AFTER its OfferSequence cancel (that cancel
+// runs on the plain sandbox and its decrement does count).
 thread_local! {
     static ORIG_OWNER_COUNTS: std::cell::RefCell<std::collections::HashMap<[u8; 20], u64>> =
         std::cell::RefCell::new(std::collections::HashMap::new());

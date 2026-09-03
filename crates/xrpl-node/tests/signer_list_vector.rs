@@ -93,3 +93,13 @@ fn signer_list_set_files_the_owner_keylet_field() {
 fn signer_list_set_files_entries_in_account_order() {
     run_bundle(include_str!("vectors/signerlist_sorted_entries_106703005.json"));
 }
+
+/// Finding 136 — #106739411 780DFE9BF728 (rDPdmrS5, 3-signer replace).
+/// rippled's `replaceSignerList` (SignerListSet.cpp:299-355) removes the old
+/// list from the owner directory and re-inserts the fresh one, so the
+/// SignerList key moves to the END of the directory page; we modified the list
+/// in place and never touched the page ("missing" DirectoryNode).
+#[test]
+fn signer_list_replace_reinserts_the_owner_directory_entry() {
+    run_bundle(include_str!("vectors/signer_list_replace_reinserts_owner_dir_entry_106739411.json"));
+}
