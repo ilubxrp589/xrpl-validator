@@ -334,3 +334,17 @@ fn offer_bridge_anchored_leg_is_judged_by_its_offers_own_quality() {
     run_bundle(include_str!("vectors/offer_bridge_anchored_leg_judged_by_its_offer_106720945.json"));
 }
 
+/// Finding 112 (#106727096 DD7DCA711B8A): a tfSell|tfImmediateOrCancel sale
+/// of ONE drop for 0.000001 USD. The book's tip 5B469CA9 is a one-drop
+/// remainder (TakerPays 1 drop, TakerGets 0.0000013709342 USD) whose
+/// quality, recomputed from what is left, rounds WORSE than the directory it
+/// sits in: rippled's OfferStream::step removes it unexecuted
+/// (shouldRmSmallIncreasedQOffer — fixRmSmallIncreasedQOffers) and crosses
+/// the next level, BD4970D4, for the drop (2.380987 → 2.380985629809433 USD).
+/// We crossed the remainder itself and left BD4970D4 alone. Seven targets
+/// byte-pinned, BD4970D4 among them (created earlier in the same ledger).
+#[test]
+fn offer_dust_remainder_whose_quality_rounds_worse_is_removed_not_crossed() {
+    run_bundle(include_str!("vectors/offer_dust_xrp_offer_increased_quality_removed_106727096.json"));
+}
+

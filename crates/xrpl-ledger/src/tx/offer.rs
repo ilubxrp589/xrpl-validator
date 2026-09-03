@@ -1921,6 +1921,52 @@ pub(crate) fn rate_me(q: u64) -> Me {
 /// skipped, not condemned; phantom deletions poisoned the first bridge
 /// attempt). Without `mutate`, this is a pure peek: nothing is touched and
 /// the caller's index is not advanced.
+/// rippled's `OfferStream::step` → `shouldRmSmallIncreasedQOffer`
+/// (fixRmSmallIncreasedQOffers): an offer whose EFFECTIVE amounts — clipped
+/// to the owner's funds with ceilOutStrict (round DOWN) when the owner is not
+/// the issuer and short — have a TakerPays at the asset's smallest positive
+/// unit and a quality, recomputed from those amounts, WORSE than the
+/// directory it sits in, is removed unexecuted and the walk steps on.
+/// TakerGets in XRP is never subject to it; two IOUs only when TakerPays <
+/// TakerGets. `q` is the directory's quality, `wants`/`gives` the offer's
+/// TakerPays/TakerGets, `funded_raw` the owner's funds in `maker_pays_leg`.
+///
+/// Finding 112 (#106727096 DD7DCA711B8A): tfSell|tfIOC selling ONE drop for
+/// 0.000001 USD. The tip 5B469CA9 is a one-drop remainder (1 drop for
+/// 0.0000013709342 USD) whose recomputed rate lands a digit above the
+/// directory's 729429.6108449260: rippled deletes it untouched and takes the
+/// drop from the next level BD4970D4. We crossed the remainder.
+fn small_increased_q_offer(
+    q: u64,
+    wants: Me,
+    gives: Me,
+    funded_raw: Me,
+    maker: &[u8; 20],
+    maker_pays_leg: &Leg,
+    maker_gets_leg: &Leg,
+) -> bool {
+    if maker_pays_leg.xrp {
+        return false;
+    }
+    if !maker_gets_leg.xrp && me_cmp(wants, gives).is_ge() {
+        return false;
+    }
+    let (eff_in, eff_out) = if maker != &maker_pays_leg.issuer && me_cmp(funded_raw, gives).is_lt() {
+        (mul_round16_down(funded_raw, rate_me(q)), funded_raw)
+    } else {
+        (wants, gives)
+    };
+    if me_is_zero(eff_in) || me_is_zero(eff_out) {
+        return true;
+    }
+    let one_unit: Me = if maker_gets_leg.xrp { (1, 0) } else { (1_000_000_000_000_000, -96) };
+    if me_cmp(eff_in, one_unit).is_gt() {
+        return false;
+    }
+    // Quality{effective} < offer.quality(): a LARGER rate is the worse quality.
+    rate_of_me(eff_in, eff_out).is_some_and(|eq| eq > q)
+}
+
 fn live_head(
     sandbox: &mut Sandbox,
     ladder: &[(u64, Hash256)],
@@ -2041,6 +2087,17 @@ fn live_head(
         // crossing occurs" (deletion under the same flag as the other dead
         // arms; a peek still advances past it).
         if require_auth_known(sandbox, maker_gets_leg, &maker) == Some(false) {
+            if mutate_dead {
+                delete_maker_offer(sandbox, &okey, &offer, &maker);
+                stale.push(okey);
+            }
+            i += 1;
+            continue;
+        }
+        if small_increased_q_offer(q, wants, gives, available(sandbox, &maker, maker_pays_leg), &maker, maker_pays_leg, maker_gets_leg) {
+            if std::env::var("DX_WALK").is_ok() {
+                eprintln!("DX_WALK rm-small-increased-q okey={} q={q:x}", hex::encode(okey.0));
+            }
             if mutate_dead {
                 delete_maker_offer(sandbox, &okey, &offer, &maker);
                 stale.push(okey);
@@ -4930,6 +4987,16 @@ pub(crate) fn cross_engine_to_net(
                     }
                 }
                 let funded_raw = walk_available(sandbox, &maker, pays_leg, Some(&mut oc0));
+                // Finding 112: rippled's stream removes a dust remainder whose
+                // recomputed quality is worse than its directory's, unexecuted.
+                if small_increased_q_offer(q, m_wants0, m_gives0, funded_raw, &maker, pays_leg, gets_leg) {
+                    if std::env::var("DX_WALK").is_ok() {
+                        eprintln!("DX_WALK rm-small-increased-q okey={} q={q:x}", hex::encode(okey.0));
+                    }
+                    delete_maker_offer(sandbox, &okey, &offer, &maker);
+                    stale.push(okey);
+                    continue;
+                }
                 if std::env::var("DX_WALK").is_ok() {
                     eprintln!(
                         "DX_WALK maker={} okey={} gives0={m_gives0:?} wants0={m_wants0:?} funded={funded_raw:?} rem_pays={rem_pays:?} rem_gets={rem_gets:?}",
