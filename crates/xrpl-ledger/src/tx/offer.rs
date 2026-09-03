@@ -3909,7 +3909,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                     // Gross-primary on the exhausting fill (F50/F51): the
                     // remaining gross budget verbatim, its division as net.
                     if let Some(cap) = gets_gross_cap {
-                        let verb = me_sub(cap, in_gross_spent);
+                        let verb = stamount_signed_add(false, cap, true, in_gross_spent).1; // F118: STAmount remainder
                         if !me_is_zero(verb) {
                             pay = match fee_rate {
                                 None => verb,
@@ -3935,7 +3935,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // Charged as ONE debit of the gross, not a net debit plus a fee
                 // adjustment — `move_leg_gross` has the arithmetic.
                 let d_gross = match (in_exhausted, gets_gross_cap) {
-                    (true, Some(cap)) => me_sub(cap, in_gross_spent),
+                    (true, Some(cap)) => stamount_signed_add(false, cap, true, in_gross_spent).1,
                     _ => gross_in(fee_rate, pay),
                 };
                 in_gross_spent = stamount_signed_add(false, in_gross_spent, false, d_gross).1;
@@ -3965,7 +3965,9 @@ thr={t:?} admits_trunc={} admits_up={}",
                     eprintln!("DX_FILL give={give:?} pay={pay:?} rem_pays={rem_pays:?} rem_gets={rem_gets:?}");
                 }
                 rem_pays = me_sub(rem_pays, give);
-                rem_gets = me_sub(rem_gets, pay);
+                // Finding 118: the remaining-in budget is an STAmount (see the
+                // gross-cap remainder above) — subtract as rippled does.
+                rem_gets = stamount_signed_add(false, rem_gets, true, pay).1;
                 if in_exhausted {
                     rem_gets = (0, 0);
                 }
@@ -4089,7 +4091,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 if me_cmp(gets_in, rem_gets).is_gt() {
                     gets_in = rem_gets;
                     if let Some(cap) = gets_gross_cap {
-                        let verb = me_sub(cap, in_gross_spent);
+                        let verb = stamount_signed_add(false, cap, true, in_gross_spent).1; // F118: STAmount remainder
                         if !me_is_zero(verb) {
                             gets_in = match fee_rate {
                                 None => verb,
@@ -4271,7 +4273,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // gross budget VERBATIM (F51) — re-grossing its divided net
                 // can land an ulp off the remainder.
                 let a_gross = match (in_exhausted, gets_gross_cap) {
-                    (true, Some(cap)) => me_sub(cap, in_gross_spent),
+                    (true, Some(cap)) => stamount_signed_add(false, cap, true, in_gross_spent).1,
                     _ => gross_in(fee_rate, gets_in),
                 };
                 in_gross_spent = stamount_signed_add(false, in_gross_spent, false, a_gross).1;
@@ -4322,7 +4324,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                     }
                     _ => break 'attempt,
                 }
-                rem_gets = me_sub(rem_gets, gets_in);
+                rem_gets = stamount_signed_add(false, rem_gets, true, gets_in).1;
                 rem_pays = me_sub(rem_pays, pays_out);
                 if in_exhausted {
                     // The gross budget is spent; the net chain's leftover is
@@ -4951,7 +4953,7 @@ pub(crate) fn cross_engine_to_net(
                 sweep_admitted = None;
             }
             rem_gets = if fold_rem && used && !in_fold_off {
-                me_sub(in_req0, fold16(&mut saved_level_ins))
+                stamount_signed_add(false, in_req0, true, fold16(&mut saved_level_ins)).1
             } else {
                 rg
             };
@@ -5501,7 +5503,28 @@ pub(crate) fn cross_engine_to_net(
                     // net chain said …760 — the class-B line-ULP family.
                     if !gets_leg.xrp {
                         if let Some(cap) = gets_gross_cap {
-                            let verb = me_sub(cap, in_gross_spent);
+                            // Finding 118 (#106733048 E4014705, #106732165
+                            // 185A4B50): the remainder is an STAmount.
+                            // rippled's `remainingIn = sendMax − sum(savedIns)`
+                            // (StrandFlow.h flow()) is IOUAmount arithmetic —
+                            // sixteen significant digits, nearest, half-even —
+                            // and the in-limited fill derives its output from
+                            // THAT. An exact 17-digit difference fed the
+                            // derivation one digit rippled never had:
+                            // 8267788.778091 − 109292.8270744682 is
+                            // 8158495.951016531|8 → rippled 8158495.951016532,
+                            // out (rate 1) 8158495.951016532; ours kept …5318
+                            // and the floor to 16 digits gave …6531 — the
+                            // taker's LHT line one ULP short. 200.4 −
+                            // 0.2538819407514244 → 200.1461180592486 / 1.002 →
+                            // 199.7466248096293 the same way (ours …292).
+                            // Offer crossing only: finding 81b pinned the payment
+                            // walk's remainders EXACT (#106674444).
+                            let verb = if offer_crossing {
+                                stamount_signed_add(false, cap, true, in_gross_spent).1
+                            } else {
+                                me_sub(cap, in_gross_spent)
+                            };
                             if !me_is_zero(verb) {
                                 match transfer_rate(sandbox, gets_leg)
                                     .filter(|_| taker != &gets_leg.issuer && maker != gets_leg.issuer)
@@ -5747,7 +5770,7 @@ pub(crate) fn cross_engine_to_net(
                         // remaining gross cap verbatim (see `gets_gross_cap`).
                         let g = match gets_gross_cap {
                             Some(cap) if in_exhausted || !me_cmp(pay, rem_gets).is_lt() => {
-                                let verb = me_sub(cap, in_gross_spent);
+                                let verb = if offer_crossing { stamount_signed_add(false, cap, true, in_gross_spent).1 } else { me_sub(cap, in_gross_spent) }; // F118 (offer crossing only)
                                 // Unrated in a crossing, `pay` is flow()'s
                                 // folded remainingIn (finding 91); when that is
                                 // the binding limit rippled debits it — the line
@@ -5770,7 +5793,15 @@ pub(crate) fn cross_engine_to_net(
                     eprintln!("DX_FILL give={give:?} pay={pay:?} rem_pays={rem_pays:?} rem_gets={rem_gets:?}");
                 }
                 rem_pays = me_sub(rem_pays, give);
-                rem_gets = me_sub(rem_gets, pay);
+                // Finding 118: the remaining-in budget is an STAmount (see the
+                // gross-cap remainder above) — subtract as rippled does. Offer
+                // crossing only: finding 81b pinned the payment walk's
+                // remainders EXACT (#106674444).
+                rem_gets = if offer_crossing {
+                    stamount_signed_add(false, rem_gets, true, pay).1
+                } else {
+                    me_sub(rem_gets, pay)
+                };
                 if in_exhausted {
                     // The gross budget is spent to the last unit; the net
                     // chain's leftover is the division's round-down dust,
@@ -5894,7 +5925,7 @@ pub(crate) fn cross_engine_to_net(
                 level_in_acc = (0, 0);
             }
             if !in_fold_off {
-                rem_gets = me_sub(in_req0, fold16(&mut saved_level_ins));
+                rem_gets = stamount_signed_add(false, in_req0, true, fold16(&mut saved_level_ins)).1;
             }
         }
         prev_level_crossed = level_crossed;
@@ -6023,7 +6054,7 @@ pub(crate) fn cross_engine_to_net(
                 sweep_admitted = None;
             }
             rem_gets = if fold_rem && used && !in_fold_off {
-                me_sub(in_req0, fold16(&mut saved_level_ins))
+                stamount_signed_add(false, in_req0, true, fold16(&mut saved_level_ins)).1
             } else {
                 rg
             };

@@ -423,3 +423,28 @@ fn offer_tie_level_is_judged_by_the_directory_quality_not_the_offers_own_rate() 
 fn offer_walk_steps_through_a_level_it_emptied_and_reaps_the_makers_remaining_offers() {
     run_bundle(include_str!("vectors/offer_emptied_level_page_is_stepped_through_106733197.json"));
 }
+
+/// Finding 118 (#106733048 E4014705): a tfSell of 8267788.778091 CSC for LHT
+/// takes 109292.8270744682 CSC at the first level and the remainder at a 1:1
+/// maker. rippled's `remainingIn = sendMax − sum(savedIns)` is IOUAmount
+/// arithmetic — sixteen significant digits, nearest — so the remainder is
+/// 8158495.951016532 and the 1:1 fill delivers exactly that. Our exact
+/// 17-digit remainder (…5318) fed the derivation and the floor to sixteen
+/// digits gave …6531: the taker's LHT line one ULP short. Ten targets
+/// byte-pinned.
+#[test]
+fn offer_remaining_in_budget_is_an_stamount() {
+    run_bundle(include_str!("vectors/offer_remaining_in_is_an_stamount_106733048.json"));
+}
+
+/// Finding 118, the rated face (#106732165 185A4B50): a tfSell|tfIoC of 200
+/// EVR (issuer rate 1.002, sendMax grossed to 200.4) takes 0.2538819407514244
+/// gross at a tiny first level; the remainder rippled carries is the
+/// STAmount 200.1461180592486, and the maker's net is that over 1.002 —
+/// 199.7466248096293 — leaving its TakerPays at 332.7392751903707. Our exact
+/// remainder …485756 netted to …292 and left …708. Eight targets byte-pinned,
+/// the residual offer among them.
+#[test]
+fn offer_remaining_in_budget_is_an_stamount_under_a_spend_rate() {
+    run_bundle(include_str!("vectors/offer_remaining_in_is_an_stamount_rated_106732165.json"));
+}
