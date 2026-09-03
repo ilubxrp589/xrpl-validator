@@ -667,3 +667,16 @@ fn offer_bridged_pass_takes_the_same_quality_group_second_specimen() {
 fn offer_passive_bridge_keeps_the_direct_strand_active_and_its_self_offers() {
     run_bundle(include_str!("vectors/offer_passive_bridge_keeps_direct_strand_and_self_offers_106738901.json"));
 }
+
+/// Finding 141 — #106740670 BEB587B55F6D (rMsXVzCug7, tfPassive, 1907.04056
+/// RLUSD for 0.02338 BTC, bridged RLUSD → XRP → BTC). Leg B's book tip is
+/// worse than the strand's limit, so the XRP/BTC pool is unanchored
+/// (`maxOffer`), whose quality is the pool's SPOT (`Quality{balances}`): the
+/// pool tips the leg, the strand's quality function is curve-shaped, and
+/// `limitOut` sizes the single pass to exactly the limit quality — 115.85 RLUSD
+/// for 0.00142027347946324 BTC, 1791.19 RLUSD resting. We compared the slice's
+/// average, priced the leg as a fixed-rate book and rested the whole offer.
+#[test]
+fn offer_unanchored_pool_tips_by_spot_and_the_pass_is_limit_sized() {
+    run_bundle(include_str!("vectors/offer_unanchored_pool_tips_by_spot_and_limits_the_pass_106740670.json"));
+}

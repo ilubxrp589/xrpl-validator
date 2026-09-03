@@ -3966,8 +3966,27 @@ thr={t:?} admits_trunc={} admits_up={}",
             let Some(am) = amm.as_ref() else { return false };
             let Some(lob) = book else { return true };
             if unb {
-                crate::tx::amm_swap::max_offer(sandbox, am, out_leg, in_leg)
-                    .is_some_and(|(i, o)| me_cmp(crate::tx::amm_swap::slice_rate(i, o), lob).is_lt())
+                // Finding 141 (#106740670 BEB587B55F6D): the unanchored
+                // `maxOffer` carries `Quality{balances}` — the pool's feeless
+                // SPOT — as its quality (AMMLiquidity.cpp `maxOffer`:
+                // `AMMOffer(*this, {swapAssetOut(balances, out), out},
+                // balances, Quality{balances})`), so the tip compare
+                // `ammOffer->quality() > lobQuality` is SPOT against the book,
+                // not the slice's average. The slice here is 9.9M XRP for
+                // 1.78 BTC — 100x worse than the book — and comparing it
+                // priced leg B as a fixed-rate book: the strand's quality
+                // function went constant, `limitOut` had nothing to size, the
+                // full-size pass missed the limit and we rested the whole
+                // offer. mainnet: the pool tips leg B, the curve-shaped
+                // function sizes the pass to exactly the limit quality
+                // (115.85 RLUSD → 0.00142027347946324 BTC), and 1791.19
+                // RLUSD rests.
+                let (pin, pout) = crate::tx::amm_swap::pool_balances(sandbox, am, out_leg, in_leg);
+                if pin.0 == 0 || pout.0 == 0 {
+                    return false;
+                }
+                me_cmp(crate::tx::amm_swap::slice_rate(pin, pout), lob).is_lt()
+                    && crate::tx::amm_swap::max_offer(sandbox, am, out_leg, in_leg).is_some()
             } else {
                 anch_q.is_some_and(|q| me_cmp(q, lob).is_lt())
             }
