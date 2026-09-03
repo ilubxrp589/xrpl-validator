@@ -680,3 +680,15 @@ fn offer_passive_bridge_keeps_the_direct_strand_active_and_its_self_offers() {
 fn offer_unanchored_pool_tips_by_spot_and_the_pass_is_limit_sized() {
     run_bundle(include_str!("vectors/offer_unanchored_pool_tips_by_spot_and_limits_the_pass_106740670.json"));
 }
+
+/// Finding 142 — #106742048 7AFAC4E00D8F (r3rhWeE31Jt5, 19.73 USDC for
+/// 0.000243994516152997 BTC). `activateNext` runs before the first iteration
+/// too: the bridge's upper bound misses the limit, one strand survives,
+/// `multiPath` is false from the start, and the direct USDC/BTC pool answers
+/// with the single-path, limit-sized slice (0.0201 USDC → 2.48e-7 BTC at
+/// exactly the limit). We gave round 0 the built-strand entry, asked for a
+/// Fibonacci slice, refused it and rested the whole offer.
+#[test]
+fn offer_round_zero_multipath_follows_strand_activation() {
+    run_bundle(include_str!("vectors/offer_round_zero_multipath_follows_activation_106742048.json"));
+}

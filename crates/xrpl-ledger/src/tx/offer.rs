@@ -3363,7 +3363,20 @@ thr={t:?} admits_trunc={} admits_up={}",
         // mainnet takes. Carrying the previous round's verdict ran a fib
         // slice there and refused it. Round 0 keeps the built-strand entry
         // (#106455293: multiPath=1 at iters=0 with the round ending empty).
-        let mp_entry = if bridged_round == 0 { multi_prev } else { multi_now };
+        // Finding 142 (#106742048 7AFAC4E00D8F, r3rhWeE31Jt5 selling 19.73
+        // USDC for BTC): iteration 0 is no exception. `flow()` runs
+        // `activateNext` at the TOP of every iteration — including the first —
+        // and only then `setMultiPath(activeStrands.size() > 1)`; a strand
+        // whose upper bound misses limitQuality is dropped before the pools
+        // are asked for offers. Here the bridge's bound (8.25e4 USDC/BTC)
+        // misses the 8.11e4 limit, one strand survives, and mainnet's direct
+        // pool answers SINGLE-path: the limit-sized slice, 0.0201 USDC for
+        // 2.48e-7 BTC at exactly the limit quality. We handed round 0 the
+        // built-strand entry (`multi_prev`), asked the pool for a Fibonacci
+        // slice, refused it as worse than the limit and rested the whole
+        // offer. (#106455042 446DCA57's oracle trace already read "iter 0
+        // activeStrands 1 multiPath false" with the bridge out.)
+        let mp_entry = multi_now;
         bridged_round += 1;
         multi_prev = multi_now;
         // AMM turn: the direct-pair pool competes with the best BOOK rate.
