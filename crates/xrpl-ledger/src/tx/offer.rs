@@ -2892,7 +2892,24 @@ fn cross_bridged(
         return None; // no bridge: caller runs the direct walk
     }
     let ld = book_offer_ladder(sandbox, inv_base, 128);
-    let thr = (threshold != u64::MAX).then(|| rate_me(threshold));
+    // Finding 139: rippled has ONE limitQuality for the crossing —
+    // `Quality{takerAmount.out, sendMax}` with the gateway transfer fee
+    // INSIDE sendMax (OfferCreate.cpp:380-393) — and holds the strands' RAW
+    // upper bounds against it (`adjustQualityWithFees` returns the tip's own
+    // quality for CLOB and multi-path pool offers): strand activation
+    // (StrandFlow.h `activateNext`), the per-strand `qualityUpperBound <
+    // limitQuality` skip, and the step's `checkQualityThreshold`. Ours held
+    // the raw bounds against the fee-FREE taker quality — 0.15% too strict
+    // under ETH's 1.0015 rate. #106738901 B7B46440CED2 (rMsXVzCug7, tfPassive
+    // ETH → RLUSD): the direct book's tip is the taker's own 7B23C16BD7DF at
+    // 3.997041e-4, inside mainnet's 3.9975457e-4 limit and outside our
+    // 3.9915584e-4; mainnet keeps two strands active (`multiPath` → three
+    // Fibonacci pool slices), we dropped to one and anchored after the first.
+    // The realised-fill judge stays on the fee-free rate against the NET in
+    // (`jthr`) — the same test as rippled's fee-inclusive rate on the gross.
+    let thr = (threshold != u64::MAX).then(|| {
+        rate_me(if threshold_self != 0 && threshold_self != u64::MAX { threshold_self } else { threshold })
+    });
     let (mut di, mut ai, mut bi) = (0usize, 0usize, 0usize);
     let mut crossed = 0u32;
     // Finding 121: the direct strand went dry on a pass that anchored the
@@ -3553,9 +3570,17 @@ thr={t:?} admits_trunc={} admits_up={}",
         // removes it and its now-empty book page and crosses no value at all.
         // The direct walk in `cross_engine_to` already does this inline, after
         // its own AMM turn.
-        if taker == beneficiary && !pool_offer_this_round {
-            reap_self_offers_at_head(sandbox, &ld, di, taker, threshold_self, stale);
-        }
+        // Finding 139 (cont.): that is only true when the direct strand is
+        // EXECUTED. `flow()` tries the active strands best-bound first and
+        // stops at the first that produces (`best.emplace(…); break;`), so a
+        // direct strand sorted behind a winning bridge never runs its
+        // BookStep and its self-offers stay (#106738901: 7B23C16BD7DF,
+        // 95ED71B7C939, CB12CC10E9DF all survive; we reaped them at every
+        // round's opening). The direct candidate's own `live_head` below
+        // reaps the tip self-offers the moment that strand runs, whether or
+        // not its pass is kept — rippled's `permRmOffer` lands in
+        // `ofrsToRm`, "rm bad offers even if the strand fails".
+        let _ = (&pool_offer_this_round, reap_self_offers_at_head as fn(&mut Sandbox, &[(u64, Hash256)], usize, &[u8; 20], u64, &mut Vec<Hash256>));
         // Choose on what each candidate REALISES, not on its marginal rate.
         // A source's marginal quality prices that source's own slice; the pass
         // moves a different (usually much smaller) amount and prices better.
@@ -4817,9 +4842,8 @@ had_fill={} n={} keys={:?}",
                 else {
                     continue;
                 };
-                if mk == *taker {
-                    continue; // self-cross deletion — resurrects with the rollback
-                }
+                // Finding 139: self-offers reaped by the direct pass are in
+                // rippled's `ofrsToRm` and go even when that pass loses.
                 delete_maker_offer(sandbox, &okey, &off, &mk);
                 keep.push(okey);
             }
@@ -8448,7 +8472,7 @@ mod tests {
     /// `changeSpotPriceQuality` offer matched to the book's, which `tip` then
     /// discards in favour of the book. `BookTip` applies no owner filter, so an
     /// offer of the taker's own still prices the direct strand for admission
-    /// even though it will be removed rather than crossed.
+    /// (and, finding 139, it is removed only if that strand ever runs).
     ///
     /// Same books and pool as the test above, whose only difference is that
     /// there the direct strand does not exist — so the composition gate must
@@ -8548,9 +8572,15 @@ mod tests {
             json_at(&sandbox, &keylet::offer_key(&mk_b, 2)).is_none(),
             "leg B's book maker must be consumed by the bridged pass",
         );
+        // Finding 139: the bridge wins every iteration and fills the want, so
+        // the direct strand is never flowed — `flow()` stops at the first
+        // strand that produces — and `limitSelfCrossQuality` never runs on the
+        // taker's own offer. It survives (#106738901: three self-offers stay;
+        // #105930662: the one there goes because the bridge fails at the end
+        // and the direct strand runs).
         assert!(
-            json_at(&sandbox, &keylet::offer_key(&taker, 3)).is_none(),
-            "and the taker's own offer is removed, not crossed",
+            json_at(&sandbox, &keylet::offer_key(&taker, 3)).is_some(),
+            "and the taker's own offer survives: the direct strand never ran",
         );
     }
 

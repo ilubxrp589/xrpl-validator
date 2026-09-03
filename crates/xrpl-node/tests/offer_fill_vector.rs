@@ -655,3 +655,15 @@ fn offer_bridged_pass_takes_the_same_quality_group() {
 fn offer_bridged_pass_takes_the_same_quality_group_second_specimen() {
     run_bundle(include_str!("vectors/offer_bridged_pass_takes_same_quality_group_second_specimen_106739379.json"));
 }
+
+/// Finding 139 — #106738901 B7B46440CED2 (rMsXVzCug7, tfPassive ETH → RLUSD).
+/// rippled's one limitQuality is fee-inclusive (`Quality{takerAmount.out,
+/// sendMax}`) and the strands' RAW upper bounds are held against it: the
+/// direct book's tip is the taker's own 7B23C16BD7DF at 3.997041e-4, inside
+/// the 3.9975457e-4 limit, so two strands stay active (three Fibonacci pool
+/// slices on the bridge). The direct strand never runs — the bridge wins every
+/// iteration — so the taker's three self-offers survive.
+#[test]
+fn offer_passive_bridge_keeps_the_direct_strand_active_and_its_self_offers() {
+    run_bundle(include_str!("vectors/offer_passive_bridge_keeps_direct_strand_and_self_offers_106738901.json"));
+}
