@@ -203,3 +203,17 @@ fn payment_pool_liquidity_stops_after_thirty_amm_iterations() {
     run_bundle(include_str!("vectors/payment_amm_iteration_cap_106723025.json"));
 }
 
+/// Finding 109 (#106723438 23BA5CD66ACE): a tfPartialPayment self-conversion,
+/// SendMax 5 RLUSD → [XRP] → 1248.0865 xSPECTAR (DeliverMin 1223.3719), with
+/// a direct RLUSD/xSPECTAR pool and an XRP bridge. rippled takes eight direct
+/// fib rounds and then the bridge (4.93944527 RLUSD → 1211.67226294),
+/// delivering 1226.858 — tesSUCCESS through ten nodes. Our strand bound sized
+/// the direct pool's fib slice from the pool's CURRENT balances instead of the
+/// flow's origin (AmmFib.init, rippled's initialBalances_), drifted 1e-4 from
+/// the slice that would actually fill, won a ninth direct round on a near-tie
+/// and came up 2.8 xSPECTAR under DeliverMin: tecPATH_PARTIAL.
+#[test]
+fn payment_strand_bound_prices_the_fib_slice_from_the_flows_origin() {
+    run_bundle(include_str!("vectors/payment_strand_tie_bridge_wins_106723438.json"));
+}
+

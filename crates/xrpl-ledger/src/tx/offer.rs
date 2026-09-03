@@ -1848,6 +1848,15 @@ fn book_offer_ladder(sandbox: &Sandbox, base: &Hash256, cap: usize) -> Vec<(u64,
 /// Finding 107: sizing the single-path bound by the fib slice let a counted
 /// iteration index overflow the slice and drop the pool from a strand that
 /// rippled still walks (#106723025, round 18 of 30).
+/// Finding 109 (#106723438 23BA5CD6): the fib slice a bound is priced by
+/// must be the slice the pass will CONSUME. rippled's `AMMLiquidity` keeps
+/// `initialBalances_` from the flow's start and `generateFibSeqOffer` seeds
+/// every slice from them; our consume path records the same in `AmmFib.init`
+/// at a pool's first use — but the bound sized its slice from the pool's
+/// CURRENT balances, so after a few rounds the two drifted ~1e-4 apart and a
+/// near-tie between the direct pool and the XRP bridge flipped: we ran a
+/// ninth direct fib round where rippled already took the bridge, and came up
+/// 2.8 xSPECTAR under DeliverMin (tecPATH_PARTIAL vs tesSUCCESS).
 pub(crate) fn hop_tip(
     sandbox: &Sandbox,
     taker: &[u8; 20],
@@ -1855,11 +1864,14 @@ pub(crate) fn hop_tip(
     out_leg: &Leg,
     amm_iters: u32,
     multi: bool,
+    fib_init: Option<&std::collections::BTreeMap<[u8; 20], (Me, Me)>>,
 ) -> Option<Me> {
     let base = keylet::book_base(&in_leg.cur, &out_leg.cur, &in_leg.issuer, &out_leg.issuer);
     let book = book_offer_ladder(sandbox, &base, 1).first().map(|(q, _)| rate_me(*q));
     let pool = crate::tx::amm_swap::discover(sandbox, in_leg, out_leg, taker).and_then(|a| {
-        let init = crate::tx::amm_swap::pool_balances(sandbox, &a, out_leg, in_leg);
+        let init = fib_init
+            .and_then(|m| m.get(&a.account).copied())
+            .unwrap_or_else(|| crate::tx::amm_swap::pool_balances(sandbox, &a, out_leg, in_leg));
         if multi {
             crate::tx::amm_swap::fib_slice(sandbox, &a, init, amm_iters, out_leg, in_leg)
                 .map(|s| crate::tx::amm_swap::slice_rate(s.0, s.1))

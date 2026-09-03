@@ -296,14 +296,14 @@ impl PaymentTransactor {
         sandbox: &Sandbox,
         taker: &[u8; 20],
         chain: &[&crate::tx::offer::Leg],
-        amm_iters: u32,
+        fib: &crate::tx::offer::AmmFib,
         multi: bool,
     ) -> Option<crate::tx::offer::Me> {
         use crate::tx::offer as ox;
         const ONE: ox::Me = (1_000_000_000_000_000, -15);
         let mut acc: ox::Me = ONE;
         for w in chain.windows(2) {
-            let tip = ox::hop_tip(sandbox, taker, w[0], w[1], amm_iters, multi)?;
+            let tip = ox::hop_tip(sandbox, taker, w[0], w[1], fib.iters, multi, Some(&fib.init))?;
             acc = ox::me_muldiv(acc, tip, ONE, false);
             // THE INTERMEDIATE GATEWAY'S CUT IS PART OF THE BOUND. A payment
             // book step composes its quality with `trIn` — the transfer rate of
@@ -764,7 +764,7 @@ impl PaymentTransactor {
         sandbox: &Sandbox,
         taker: &[u8; 20],
         segs: &[crate::tx::direct_step::SegLayout],
-        amm_iters: u32,
+        fib: &crate::tx::offer::AmmFib,
         multi: bool,
     ) -> Option<crate::tx::offer::Me> {
         use crate::tx::direct_step as ds;
@@ -779,7 +779,7 @@ impl PaymentTransactor {
                     acc = ox::me_muldiv(acc, ds::run_upper_bound(sandbox, hops, after_book), ONE, false);
                 }
                 ds::SegLayout::Book { from, to } => {
-                    let tip = ox::hop_tip(sandbox, taker, from, to, amm_iters, multi)?;
+                    let tip = ox::hop_tip(sandbox, taker, from, to, fib.iters, multi, Some(&fib.init))?;
                     acc = ox::me_muldiv(acc, tip, ONE, false);
                     if !first_book && !from.xrp && taker != &from.issuer {
                         if let Some(r) = Self::transfer_rate(sandbox, from) {
@@ -2785,12 +2785,12 @@ impl PaymentTransactor {
                             // iteration's `multiPath()` — `setMultiPath` runs after
                             // it — so the bound follows `multi_now` as it stands
                             // here, before this round's order resets it (F107).
-                            Self::strand_upper_bound(sandbox, &tx.account, &strands[i], amm_fib.iters, multi_now)
+                            Self::strand_upper_bound(sandbox, &tx.account, &strands[i], &amm_fib, multi_now)
                         } else if i < n_books + n_direct {
                             crate::tx::direct_step::direct_upper_bound(sandbox, &dstrands[i - n_books])
                         } else {
                             Self::mixed_upper_bound(
-                                sandbox, &tx.account, &mstrands[i - n_books - n_direct], amm_fib.iters, multi_now,
+                                sandbox, &tx.account, &mstrands[i - n_books - n_direct], &amm_fib, multi_now,
                             )
                         }
                         .filter(|ub| thr_me.is_none_or(|t| ox::me_cmp(*ub, t).is_le()))
