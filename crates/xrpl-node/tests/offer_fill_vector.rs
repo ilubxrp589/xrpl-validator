@@ -569,3 +569,22 @@ fn offer_out_limited_input_is_clamped_to_the_underfunded_makers_own_input() {
 fn offer_direct_upper_bound_reads_the_live_tip_not_the_emptied_level() {
     run_bundle(include_str!("vectors/offer_direct_upper_bound_reads_the_live_tip_106735332.json"));
 }
+
+/// Finding 127 (#106736673 9C615823): a 3.526798 XRP buy against rB18cdac's
+/// ask of 899635.0815887755 for 89963508158877567 drops — seventeen digits
+/// of drops. rippled's native STAmount subtracts the consumed 3526798 drops
+/// exactly and rests the ask at 89963508155350769; our residual rounded the
+/// difference back to sixteen significant digits and read …770. One target
+/// byte-pinned.
+#[test]
+fn offer_makers_xrp_residual_is_subtracted_in_exact_drops() {
+    run_bundle(include_str!("vectors/offer_xrp_residual_is_exact_drops_106736673.json"));
+}
+
+/// Finding 127, second specimen (#106736674 939B1191, the next ledger): the
+/// same ask filled for 1013201 drops rests at 89963508154337568 on mainnet;
+/// the sixteen-digit rounding read …570.
+#[test]
+fn offer_makers_xrp_residual_is_subtracted_in_exact_drops_second_specimen() {
+    run_bundle(include_str!("vectors/offer_xrp_residual_is_exact_drops_second_specimen_106736674.json"));
+}

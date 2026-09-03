@@ -2626,8 +2626,20 @@ fn rev_scan_level(
 /// Same family as the fused-vs-stepwise arithmetic elsewhere: `Number`'s
 /// operations are implementations, not ideal maths, and being more precise than
 /// rippled is a defect.
-fn offer_residual(a: Me, b: Me) -> Me {
-    stamount_signed_add(false, a, true, b).1
+///
+/// Finding 127 (#106736673 9C615823, #106736674 939B1191): that rounding is
+/// an IOU rule. rippled's native STAmount holds drops as an int64 and
+/// `operator-` subtracts them EXACTLY — an ask wanting 89963508158877567
+/// drops (seventeen digits) filled for 3526798 rests at …769 on mainnet;
+/// rounded back to sixteen digits it read …770, and the next ledger's fill
+/// of 1013201 drops read …570 for mainnet's …568. An XRP side subtracts in
+/// drops; only an IOU side rounds.
+fn offer_residual(a: Me, b: Me, xrp: bool) -> Me {
+    if xrp {
+        me_sub(a, b)
+    } else {
+        stamount_signed_add(false, a, true, b).1
+    }
 }
 
 /// Consume `give` of the maker's gives / `pay` of their wants against one
@@ -2670,8 +2682,8 @@ fn settle_fill(
         // above still handles the walk-past-unfunded case (funded == 0).
     } else {
         let mut off2 = offer.clone();
-        off2["TakerGets"] = me_amount_json(&offer["TakerGets"], offer_residual(gives0, give));
-        off2["TakerPays"] = me_amount_json(&offer["TakerPays"], offer_residual(wants0, pay));
+        off2["TakerGets"] = me_amount_json(&offer["TakerGets"], offer_residual(gives0, give, pays_leg.xrp));
+        off2["TakerPays"] = me_amount_json(&offer["TakerPays"], offer_residual(wants0, pay, gets_leg.xrp));
         put_json(sandbox, *okey, &off2);
     }
 }
@@ -6032,8 +6044,8 @@ pub(crate) fn cross_engine_to_net(
                 // sits on the gets side, and rippled removes that offer.
                 // #106297387 2B053E4F leaves TakerGets 2e-12 against TakerPays
                 // 0, and mainnet Deletes it.
-                let res_gets = offer_residual(m_gives0, give);
-                let res_pays = offer_residual(m_wants0, pay);
+                let res_gets = offer_residual(m_gives0, give, pays_leg.xrp);
+                let res_pays = offer_residual(m_wants0, pay, gets_leg.xrp);
                 let consumed = me_cmp(give, m_gives0).is_ge()
                     || me_cmp(give, funded).is_ge()
                     || me_is_zero(res_gets)
