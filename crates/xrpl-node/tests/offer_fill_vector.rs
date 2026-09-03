@@ -385,3 +385,22 @@ fn offer_killed_crossing_still_reaps_what_the_rev_pass_stepped_over() {
 fn offer_rev_pass_steps_past_a_maker_it_emptied_and_reaps_behind_it() {
     run_bundle(include_str!("vectors/offer_rev_pass_steps_past_a_became_tiny_offer_106731793.json"));
 }
+
+/// Finding 116 (#106732842 7BD990E595DF): a buy of 19.718743 "666" for
+/// 5.783103 XRP against a maker whose page TIES the taker's limit at 16
+/// digits (2932794955540523e-10) while its own 5254632/17.91680659458702
+/// encodes one ULP worse. rippled judges the limit by the level —
+/// `checkQualityThreshold(offer.quality())` with the directory's quality —
+/// and the maker is underfunded (12.709 of 17.917), so the funds-limited
+/// fill floors to 3727433 drops, realises a rate inside the limit, and
+/// mainnet crosses it: the maker's line drains to zero, its offer and owner
+/// page are deleted, and the taker rests 7.00924955970754 for 2.055670 XRP.
+/// Our own-rate pre-screen skipped the maker and rested the taker's full
+/// offer. The pre-screen's own specimen, #105787531 BB6660FA (same tie, fully
+/// funded), is decided by the achieved-quality judge instead: a whole-offer
+/// fill realises exactly the own rate, one ULP over, and the pass is
+/// rejected. Eight targets byte-pinned, both owner pages among them.
+#[test]
+fn offer_tie_level_is_judged_by_the_directory_quality_not_the_offers_own_rate() {
+    run_bundle(include_str!("vectors/offer_tie_level_judged_by_directory_quality_106732842.json"));
+}

@@ -5221,24 +5221,28 @@ pub(crate) fn cross_engine_to_net(
                     stale.push(okey);
                     continue;
                 }
-                // rippled re-checks the maker's ACTUAL quality against the
-                // taker's limit, not just the quantized book-dir level it rests
-                // in: an offer can sit in a page that ties the threshold while
-                // its exact getRate is one ULP worse, and rippled leaves such an
-                // offer untouched. #105787531 BB6660FA rests in dir
-                // 5A090CC3291B2B61 (== threshold) but its 5211839/20.46019077105154
-                // rate encodes to 2547307138198370, one over the threshold's
-                // ...369 — mainnet never crosses it; we did (10v4). This is NOT
-                // the fill's achieved rate (that check is below) but the maker
-                // offer's own advertised rate. The equal-quality maker of
-                // #105672435 (rate == threshold) still crosses.
-                if threshold != u64::MAX {
-                    if let Some(mq) = rate_of_me(m_wants0, m_gives0) {
-                        if mq > threshold {
-                            continue;
-                        }
-                    }
-                }
+                // Finding 116 (#106732842 7BD990E595DF): the taker's limit is
+                // judged by the LEVEL's quality, never by the offer's own
+                // recomputed rate. `execOffer` asks
+                // `checkQualityThreshold(offer.quality())` (BookStep.cpp:763)
+                // and `offer.quality()` is the directory's — the stream builds
+                // every offer as `TOffer(entry, tip_.quality())`
+                // (OfferStream.cpp:232). The specimen's maker 16DAB624 sits on
+                // a page that TIES the taker's limit (2932794955540523e-10)
+                // while its own 5254632/17.91680659458702 encodes one ULP
+                // worse; it is underfunded (12.709 of 17.917 "666"), so the
+                // funds-limited fill floors to 3727433 drops and realises a
+                // rate inside the limit — mainnet crosses it, deletes it and
+                // rests the taker's 7.009 remainder. An own-rate pre-screen
+                // here skipped it and rested the taker's full offer.
+                //
+                // The pre-screen was added for #105787531 BB6660FA — same
+                // tie, fully funded — where mainnet leaves the maker untouched.
+                // That outcome is the achieved-quality judge's below: a fill
+                // that takes the WHOLE offer moves its own amounts verbatim,
+                // realises exactly the own rate, one ULP over the limit, and
+                // rippled rejects the pass ("Path rejected by limitQuality").
+                // Both specimens fall out of the judge alone.
                 let funded_raw = walk_available(sandbox, &maker, pays_leg, Some(&mut oc0));
                 // Finding 112: rippled's stream removes a dust remainder whose
                 // recomputed quality is worse than its directory's, unexecuted.
