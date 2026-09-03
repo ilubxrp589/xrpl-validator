@@ -1043,12 +1043,14 @@ impl PaymentTransactor {
                         .then(|| Self::leg_signed_balance(sandbox, &tx.account, to))
                         .flatten();
                     let _ = crate::tx::amm_swap::take_fwd_excess();
+                    crate::tx::amm_swap::set_fwd_gross_in(hop_rate.map(|_| carry));
                     let (rw, rs, _c) = ox::cross_engine_to(
                         &tx.account, benef, out_target[i], avail, to, from, thr, thr, false,
                         false, single_pass, amm_fib.as_deref_mut(), None, sandbox,
                         &mut Vec::new(),
                     );
                     let excess = crate::tx::amm_swap::take_fwd_excess();
+                    crate::tx::amm_swap::set_fwd_gross_in(None);
                     if i == 0 {
                         sin = ox::me_sub(avail, rs);
                     }
@@ -1310,6 +1312,7 @@ impl PaymentTransactor {
                 ox::set_passthrough(pass);
             }
             let _ = crate::tx::amm_swap::take_fwd_excess();
+            crate::tx::amm_swap::set_fwd_gross_in(hop_rate.map(|_| carry));
             let (rw, rs, _c, gross_spent) = ox::cross_engine_to_net(
                 &tx.account, benef, want_cap, avail, chain[i + 1], chain[i],
                 hop_thr, hop_thr, false, false, single_pass, amm_fib.as_deref_mut(), None,
@@ -1318,6 +1321,7 @@ impl PaymentTransactor {
                 sandbox, &mut Vec::new(),
             );
             let excess = crate::tx::amm_swap::take_fwd_excess();
+            crate::tx::amm_swap::set_fwd_gross_in(None);
             // Hop 0's input IS the spend leg — `hop_rate` is gated on `i > 0`,
             // so `avail` there is still `avail_in` untouched — and `rs` is the
             // part of it the pass did not spend. The difference is the same

@@ -40,14 +40,14 @@ pub(crate) const MAX_AMM_ITERS: u32 = 30;
 // walks count one per consumed pool slice, which is what an iteration is for
 // offer crossing — but those same walks run the payment's book hops, so
 // they must not count while a driver owns the flow.
-/// Finding 131 (#106734485 83E5899A): a pool turn's OVERSHOOT — the output
-/// beyond the hop's want when the fill was input-clamped. rippled's forward
-/// pass hands a step's whole product to the next step (`BookStep::fwdImp`
-/// consumes by input; the reverse cache reinstates the reverse amounts only
-/// when `limitStepOut(cache.out)` lands exactly on the forward input, which
-/// a curve never does), so the excess rides the carry into the next hop's
-/// pool. The driver reads it after each walk; the sender's line cannot be
-/// differenced for it when the intermediate rides through in flight.
+// Finding 131 (#106734485 83E5899A): a pool turn's OVERSHOOT — the output
+// beyond the hop's want when the fill was input-clamped. rippled's forward
+// pass hands a step's whole product to the next step (`BookStep::fwdImp`
+// consumes by input; the reverse cache reinstates the reverse amounts only
+// when `limitStepOut(cache.out)` lands exactly on the forward input, which
+// a curve never does), so the excess rides the carry into the next hop's
+// pool. The driver reads it after each walk; the sender's line cannot be
+// differenced for it when the intermediate rides through in flight.
 thread_local! {
     static FWD_EXCESS: std::cell::Cell<Me> = const { std::cell::Cell::new((0, 0)) };
 }
@@ -59,6 +59,18 @@ fn add_fwd_excess(x: Me) {
 }
 pub(crate) fn take_fwd_excess() -> Me {
     FWD_EXCESS.with(|c| c.replace((0, 0)))
+}
+// The GROSS input the driver carried into the current hop (before the
+// in-side transfer rate netted it) — `remainingIn` as `BookStep::fwdImp`
+// sees it. `None` for a hop fed by the payment's own spend.
+thread_local! {
+    static FWD_GROSS_IN: std::cell::Cell<Option<Me>> = const { std::cell::Cell::new(None) };
+}
+pub(crate) fn set_fwd_gross_in(g: Option<Me>) {
+    FWD_GROSS_IN.with(|c| c.set(g));
+}
+fn fwd_gross_in() -> Option<Me> {
+    FWD_GROSS_IN.with(|c| c.get())
 }
 thread_local! {
     static AMM_CTX: std::cell::Cell<(u32, bool, bool)> =
@@ -1979,6 +1991,39 @@ pub(crate) fn consume(
         if n_cmp(rem_gets, take_in) == Ordering::Greater {
             let sliver = n_sub(rem_gets, take_in, Rnd::Near);
             let tiny = n_cmp(n_mul(sliver, (1_000_000_000, 0), Rnd::Near), rem_gets) == Ordering::Less;
+            // `fwdImp`'s reconciliation: when the forward output exceeds the
+            // reverse cache, `limitStepOut(cache.out)` re-sizes the offer to
+            // the reverse amounts, and if THAT step input — the reverse net
+            // re-grossed by the in-side rate — equals the forward input as
+            // carried, the reverse amounts stand and the whole gross is
+            // consumed (the fee absorbs the sliver). #106674483 8A50B39E:
+            // the USD→XDX pool's reverse net 0.07005040855643557 re-grosses
+            // over 1.002 to exactly the carried 0.07019050937354845, so the
+            // pool moves the reverse pair and the chain stays exact; the
+            // single swap of the sliver put the XDX and PLX lines one unit
+            // off and broke the window's state hash. #106734485 (no rate):
+            // 60.69318969933 ≠ the carried 60.6931897 — the sweep stands.
+            let reconciles = match fwd_gross_in() {
+                Some(g) => n_cmp(ox::gross_in(in_gross_rate, take_in), g) == Ordering::Equal,
+                None => false,
+            };
+            if reconciles {
+                let _ = sliver;
+                settle_slice(
+                    sandbox,
+                    taker,
+                    beneficiary,
+                    &amm.account,
+                    pays_leg,
+                    gets_leg,
+                    take_in,
+                    fwd_gross_in().unwrap_or_else(|| ox::gross_in(in_gross_rate, take_in)),
+                    take_out,
+                    take_out,
+                    benef_net,
+                );
+                return (ox::me_sub(rem_pays, take_out), (0, 0), true);
+            }
             if tiny {
                 let whole = swap_asset_in(pool_in, pool_out, rem_gets, amm.tfee, pays_leg.xrp);
                 if n_cmp(whole, rem_pays) != Ordering::Less {
