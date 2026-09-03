@@ -705,3 +705,12 @@ fn offer_direct_pool_is_consulted_only_if_its_strand_survives_activation() {
     run_bundle(include_str!("vectors/offer_direct_pool_consulted_only_if_strand_survives_activation_106742494.json"));
 }
 
+/// Finding 144 — #106742463 1E7ED524888A (rM2gGZdJ, tfSell 2,001,000 XRPS for
+/// 3613.806 CNY through both pools, eight iterations). rippled's residual is
+/// `takerAmount.in - actualAmountIn`, the latter the STAmount SUM of the
+/// iterations' ins (each `+=` canonicalized): 1800041.456967373 → a residual
+/// of 200958.543032627. Our running subtraction left 200958.5430326276.
+#[test]
+fn offer_residual_is_the_original_minus_the_summed_ins() {
+    run_bundle(include_str!("vectors/offer_residual_is_original_minus_the_summed_ins_106742463.json"));
+}

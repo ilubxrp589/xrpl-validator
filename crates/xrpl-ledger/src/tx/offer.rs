@@ -2815,6 +2815,14 @@ fn cross_bridged(
     sandbox: &mut Sandbox,
     stale: &mut Vec<Hash256>,
 ) -> Option<(Me, Me, u32)> {
+    // Finding 144: the crossing's residual is `takerAmount.in - actualAmountIn`
+    // (OfferCreate.cpp:497-520), where actualAmountIn is the STAmount SUM of
+    // the iterations' ins — `sum(savedIns)`, each `+=` canonicalized to 16
+    // digits — not the running subtraction we carried. `in_gross_spent` is
+    // that sum (the gross side); `out_sum` is its `savedOuts` twin.
+    let entry_gets = rem_gets;
+    let entry_pays = rem_pays;
+    let mut out_sum: Me = (0, 0);
     let mut in_gross_spent: Me = (0, 0);
     // Fee-composed judge threshold for CLOB leg-B fills (AMM and
     // taker-owned leg-B offers waive) — crossing_judge_threshold.
@@ -3418,6 +3426,7 @@ thr={t:?} admits_trunc={} admits_up={}",
             // taker was debited NET. #106701467 DAE80780: 1.257009702543272 FLR
             // debited where mainnet takes 1.260780731650903 (× 1.003).
             let rg_before = rem_gets;
+            let rp_before = rem_pays;
             let (rp, rg, used) = if direct_dry {
                 (rem_pays, rem_gets, false)
             } else if !multi_now && threshold != u64::MAX {
@@ -3557,6 +3566,7 @@ thr={t:?} admits_trunc={} admits_up={}",
             };
             rem_pays = rp;
             rem_gets = rg;
+            out_sum = stamount_signed_add(false, out_sum, false, me_sub(rp_before, rp)).1;
             // Finding 121: after `tryAMM` at this level, `execOffer` steps onto
             // the tip; the taker's own offer there is removed whatever the pool
             // did ("Remove this offer even if no crossing occurs",
@@ -4085,6 +4095,7 @@ thr={t:?} admits_trunc={} admits_up={}",
             let snap = sandbox.snapshot();
             let (rp0, rg0, cr0, di0, ai0, bi0, it0) =
                 (rem_pays, rem_gets, crossed, di, ai, bi, amm_iters);
+            let (igs0, os0) = (in_gross_spent, out_sum);
             let st0 = stale.len();
             amm_used = false;
             // (in, out) of this candidate's fill, in the same orientation as
@@ -4264,6 +4275,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                     _ => gross_in(fee_rate, pay),
                 };
                 in_gross_spent = stamount_signed_add(false, in_gross_spent, false, d_gross).1;
+                out_sum = stamount_signed_add(false, out_sum, false, give).1;
                 let give_gross = owner_gives(d_orate, give, funded, funded_raw);
                 settle_fill(sandbox, &okey, &offer, &maker, taker, beneficiary,
                             pays_leg, gets_leg, give, pay, d_gross, give_gross, gives0, wants0);
@@ -4692,6 +4704,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                     _ => gross_in(fee_rate, gets_in),
                 };
                 in_gross_spent = stamount_signed_add(false, in_gross_spent, false, a_gross).1;
+                out_sum = stamount_signed_add(false, out_sum, false, pays_out).1;
                 match (&a_book, &a_fill) {
                     (Some((_, akey, aoffer, amaker, a_gives0, a_wants0)), _) => {
                         if std::env::var("DX_WALK").is_ok() {
@@ -4905,10 +4918,31 @@ had_fill={} n={} keys={:?}",
             stale.extend(keep);
             rem_pays = rp0; rem_gets = rg0; crossed = cr0;
             di = di0; ai = ai0; bi = bi0; amm_iters = it0;
+            in_gross_spent = igs0; out_sum = os0;
             amm_used = false;
         }
         if !filled {
             break;
+        }
+    }
+    // Finding 144 (#106742463 1E7ED524888A, rM2gGZdJ tfSell 2,001,000 XRPS for
+    // CNY through both pools, eight iterations): the eight ins sum, rounded at
+    // each step, to 1800041.456967373 and the residual is 200958.543032627 —
+    // the running subtraction left us at 200958.5430326276. tfSell subtracts
+    // the non-gateway in (`divideRound(actualIn, xferRate, up)`), a buy
+    // subtracts the out sum; the placement's rate arithmetic then follows.
+    if crossed > 0 {
+        if !gets_leg.xrp && !me_is_zero(rem_gets) {
+            let spent = match fee_rate {
+                Some(r) => mul_ratio(in_gross_spent, 1_000_000_000, r as u128, true),
+                None => in_gross_spent,
+            };
+            let (neg, v) = stamount_signed_add(false, entry_gets, true, spent);
+            rem_gets = if neg { (0, 0) } else { v };
+        }
+        if !pays_leg.xrp && !me_is_zero(rem_pays) {
+            let (neg, v) = stamount_signed_add(false, entry_pays, true, out_sum);
+            rem_pays = if neg { (0, 0) } else { v };
         }
     }
     Some((rem_pays, rem_gets, crossed))
