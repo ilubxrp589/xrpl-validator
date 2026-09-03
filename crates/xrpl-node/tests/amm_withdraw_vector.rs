@@ -192,3 +192,15 @@ fn one_asset_withdraw_all_under_its_amount_floor_is_tec_amm_failed() {
 fn amm_withdraw_all_burn_rounds_the_pool_balance_to_nearest() {
     run_bundle(include_str!("vectors/amm_withdraw_all_lp_rounding_106702692.json"));
 }
+
+/// #106720743 E0D5A4947D22 (finding 102): a tfTwoAsset withdraw asking for
+/// exactly 98 % of both sides. equalWithdrawLimit leads with Amount and
+/// derives Amount2 (overshoots the cap by 3e-9), then leads with Amount2 and
+/// derives Amount (overshoots by 2e-8) — under fixAMMv1_3 that is
+/// tecAMM_FAILED (AMMWithdraw.cpp:949). We fell through to the verbatim
+/// move and paid both amounts in full. Fee-only AccountRoot, the bundle's
+/// tec result.
+#[test]
+fn amm_withdraw_two_asset_both_orderings_overshoot_is_amm_failed() {
+    run_bundle(include_str!("vectors/amm_withdraw_two_asset_limits_fail_106720743.json"));
+}

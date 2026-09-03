@@ -687,14 +687,24 @@ fn equal_withdraw_limit(
             return None;
         }
         let frac = ox::st_divide(tokens, lpt_balance, false);
-        Some((mul_directed(out_balance, frac, false, out_xrp), tokens))
+        let out = mul_directed(out_balance, frac, false, out_xrp);
+        if std::env::var("DX_AMMWD").is_ok() {
+            eprintln!("DX_AMMWD led num={num:?} den={den:?} tokens={tokens:?} frac={frac:?} out={out:?} (out_balance={out_balance:?})");
+        }
+        Some((out, tokens))
     };
     if let Some((a2, t)) = led(amount, amount_balance, amount2_balance, amount2_xrp) {
+        if std::env::var("DX_AMMWD").is_ok() {
+            eprintln!("DX_AMMWD way1 a2={a2:?} <= amount2={amount2:?} ? {}", ox::me_cmp(a2, amount2).is_le());
+        }
         if ox::me_cmp(a2, amount2).is_le() {
             return Some((amount, a2, t));
         }
     }
     if let Some((a1, t)) = led(amount2, amount2_balance, amount_balance, amount_xrp) {
+        if std::env::var("DX_AMMWD").is_ok() {
+            eprintln!("DX_AMMWD way2 a1={a1:?} <= amount={amount:?} ? {}", ox::me_cmp(a1, amount).is_le());
+        }
         if ox::me_cmp(a1, amount).is_le() {
             return Some((a1, amount2, t));
         }
@@ -1721,6 +1731,15 @@ impl Transactor for AMMWithdrawTransactor {
         } else {
             None
         };
+        // Finding 102 (#106720743 E0D5A4947D22): when NEITHER ordering fits
+        // both maxima, rippled's equalWithdrawLimit returns tecAMM_FAILED
+        // (AMMWithdraw.cpp:949, fixAMMv1_3) — the withdrawer asked for
+        // exactly 98 % of both sides and each derived side overshot its cap
+        // by a rounding hair. We fell through to the verbatim move and paid
+        // the full amounts.
+        if wd_flags & TF_TWO_ASSET_W != 0 && wd_sized.is_none() {
+            return TxResult::AmmFailed;
+        }
         // tfOneAssetLPToken: LPTokenIn is what is burned and the AMOUNT is
         // DERIVED from it via `ammAssetOut` (`Amount` is only a minimum) —
         // rippled `singleWithdrawTokens` (AMMWithdraw.cpp:1020).
