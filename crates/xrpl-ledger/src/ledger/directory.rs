@@ -167,6 +167,7 @@ pub fn dir_insert_with(
     // Walk to the last page via the root's back-pointer.
     let last_num = root.get("IndexPrevious").map(page_num).unwrap_or(0);
     let last_key = page_key(&root_key, last_num);
+    let last_present = last_num == 0 || read_dir(sandbox, &last_key).is_some();
     let mut last = if last_num == 0 {
         root.clone()
     } else {
@@ -178,6 +179,14 @@ pub fn dir_insert_with(
         .and_then(|v| v.as_array())
         .map(|a| a.len() >= DIR_MAX)
         .unwrap_or(false);
+    if std::env::var("DX_DIR").is_ok() {
+        let n = last.get("Indexes").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+        let dup = last.get("Indexes").and_then(|v| v.as_array()).is_some_and(|a| a.iter().any(|x| x.as_str().is_some_and(|s| s.eq_ignore_ascii_case(&entry))));
+        eprintln!(
+            "DX_DIR INSERT root={} entry={} last_num={last_num:#x} last_present={last_present} n={n} full={full} dup={dup} append={append}",
+            hex::encode_upper(&root_key.0[..6]), &entry[..12]
+        );
+    }
 
     if !full {
         // Append to the last page (Modified). If last IS root, this writes root.

@@ -217,3 +217,18 @@ fn payment_strand_bound_prices_the_fib_slice_from_the_flows_origin() {
     run_bundle(include_str!("vectors/payment_strand_tie_bridge_wins_106723438.json"));
 }
 
+/// Finding 113 (#106730304 B666C9B462C6): a tfPartialPayment self-conversion,
+/// SendMax 25,579 LIQUIDX for 2 drops, walking LIQUIDX → BOOT → BITx → FLR →
+/// XRP. The FLR→XRP hop crosses a maker holding no FLR line, so the crossing
+/// creates one (8EFF74ED) and appends it to the FLR issuer's last owner
+/// directory page 0x6ab. Our walk had also carried the sender's in-flight
+/// FLR through a temporary line, and the cleanup that erases that line's
+/// traces restored the issuer's directory page from its pre-hop image —
+/// dropping the maker's legitimate entry with it. rippled never materialises
+/// the sender's in-flight line, so its page keeps the entry. Twelve targets
+/// byte-pinned, page CD88D854 among them.
+#[test]
+fn payment_inflight_line_cleanup_keeps_other_directory_entries() {
+    run_bundle(include_str!("vectors/payment_inflight_line_cleanup_keeps_dir_entries_106730304.json"));
+}
+

@@ -23,6 +23,13 @@ use crate::ledger::transactor::{Transactor, TxFields, TxResult};
 /// Payment transactor.
 pub struct PaymentTransactor;
 
+/// A sender's in-flight line captured before an intermediate hop (F113).
+struct InflightLine {
+    lk: xrpl_core::types::Hash256,
+    line_pre: Option<Vec<u8>>,
+    owners: [[u8; 20]; 2],
+}
+
 impl PaymentTransactor {
     /// Extract the destination account ID from the transaction fields.
     fn destination(tx: &TxFields) -> Option<[u8; 20]> {
@@ -47,6 +54,50 @@ impl PaymentTransactor {
     /// `[XAG,SOL]`, `[XRPS,XAG,SOL]`, `[XAG,XRPS,SOL]`. Path 0 is the direct
     /// USDT→SOL book and it is dry, so we returned tecPATH_DRY with one
     /// mutation while mainnet routed path 2 (USDT→XRPS→SOL) for seven.
+    /// Finding 113 — the SENDER's in-flight line on an intermediate hop.
+    /// Intermediate acquisitions ride through the sender: a hop credits the
+    /// sender's line in the hop currency and the next hop debits it, and the
+    /// net-zero line drops out of the mutation set. rippled never materialises
+    /// that line (BookStep output is held by the strand), so every trace of a
+    /// line that did NOT exist before the hop must go — the line itself and
+    /// the two owner-directory entries its creation inserted — while a line
+    /// that DID exist is put back byte for byte.
+    ///
+    /// #106730304 B666C9B462C6 (LIQUIDX → BOOT → BITx → FLR → XRP): erasing
+    /// the traces by restoring the owners' directory ROOT and LAST PAGE
+    /// images from before the hop also wiped the entry the hop had
+    /// legitimately added to the FLR issuer's page 0x6ab — the maker's new
+    /// FLR line 8EFF74ED — leaving the page one entry short at ledger end.
+    /// Removing exactly the temporary line's entries (owner_dir_remove,
+    /// rippled's dirDelete semantics) keeps everyone else's.
+    fn capture_inflight_line(
+        sandbox: &Sandbox,
+        acct: &[u8; 20],
+        leg: &crate::tx::offer::Leg,
+    ) -> Option<InflightLine> {
+        if leg.xrp || acct == &leg.issuer {
+            return None;
+        }
+        let lk = keylet::ripple_state_key(acct, &leg.issuer, &leg.cur);
+        Some(InflightLine { lk, line_pre: sandbox.read(&lk), owners: [*acct, leg.issuer] })
+    }
+
+    fn undo_inflight_lines(sandbox: &mut Sandbox, lines: &[InflightLine]) {
+        for l in lines.iter().rev() {
+            match &l.line_pre {
+                Some(bytes) => sandbox.write(l.lk, bytes.clone()),
+                None => {
+                    if sandbox.read(&l.lk).is_some() {
+                        for owner in &l.owners {
+                            crate::ledger::directory::owner_dir_remove(sandbox, owner, &l.lk, None, false);
+                        }
+                        sandbox.forget(&l.lk);
+                    }
+                }
+            }
+        }
+    }
+
     fn path_chains(tx: &TxFields) -> (Vec<Vec<crate::tx::offer::Leg>>, usize) {
         let Some(paths) = tx.fields.get("Paths").and_then(|p| p.as_array()) else {
             // No `Paths` at all: one empty chain, i.e. the plain direct cross.
@@ -836,51 +887,13 @@ impl PaymentTransactor {
         // run's REAL delivery and the fiction ride the SAME line object,
         // and an end-restore erased the delivery with the fiction
         // (#106374244's missing destination-line mutation, 8v9).
-        type Snap = (xrpl_core::types::Hash256, Option<Vec<u8>>);
-        let capture_leg = |sandbox: &mut Sandbox, leg: &ox::Leg| -> Vec<Snap> {
-            let mut group: Vec<Snap> = Vec::new();
-            if leg.xrp || tx.account == leg.issuer {
-                return group;
-            }
-            let lk = keylet::ripple_state_key(&tx.account, &leg.issuer, &leg.cur);
-            let line_pre = sandbox.read(&lk);
-            let absent = line_pre.is_none();
-            group.push((lk, line_pre));
-            if absent {
-                for owner in [&tx.account, &leg.issuer] {
-                    let root = keylet::owner_dir_key(owner);
-                    let pre = sandbox.read(&root);
-                    if let Some(bytes) = &pre {
-                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) {
-                            let last = v
-                                .get("IndexPrevious")
-                                .and_then(|pv| {
-                                    pv.as_u64().or_else(|| {
-                                        pv.as_str().and_then(|x| u64::from_str_radix(x, 16).ok())
-                                    })
-                                })
-                                .unwrap_or(0);
-                            if last != 0 {
-                                let pk = keylet::dir_page_key(&root, last);
-                                group.push((pk, sandbox.read(&pk)));
-                            }
-                        }
-                    }
-                    group.push((root, pre));
-                }
-            }
-            group
+        let capture_leg = |sandbox: &mut Sandbox, leg: &ox::Leg| -> Vec<InflightLine> {
+            Self::capture_inflight_line(sandbox, &tx.account, leg).into_iter().collect()
         };
-        let restore = |sandbox: &mut Sandbox, group: &[Snap]| {
-            for (k, pre) in group.iter().rev() {
-                match pre {
-                    Some(b) => sandbox.write(*k, b.clone()),
-                    None => sandbox.forget(k),
-                }
-            }
+        let restore = |sandbox: &mut Sandbox, group: &[InflightLine]| {
+            Self::undo_inflight_lines(sandbox, group);
         };
-        // End-restored: joints not adjacent to any run.
-        let mut inflight: Vec<Snap> = Vec::new();
+        let mut inflight: Vec<InflightLine> = Vec::new();
         for (i, seg) in segs.iter().enumerate() {
             let ds::SegLayout::Book { from, to } = seg else { continue };
             let fed_by_run = i > 0 && matches!(segs[i - 1], ds::SegLayout::Run(_));
@@ -1089,36 +1102,13 @@ impl PaymentTransactor {
         let hop_thr = if n > 1 { u64::MAX } else { threshold };
         let (spend_leg, want_leg) = (chain[0], chain[n]);
         let same = |a: &ox::Leg, b: &ox::Leg| a.xrp == b.xrp && a.cur == b.cur && a.issuer == b.issuer;
-        let mut inflight: Vec<_> = Vec::new();
+        let mut inflight: Vec<InflightLine> = Vec::new();
         for l in chain[1..n]
             .iter()
             .filter(|l| !l.xrp && !same(l, want_leg) && !same(l, spend_leg))
         {
-            let lk = keylet::ripple_state_key(&tx.account, &l.issuer, &l.cur);
-            let line_pre = sandbox.read(&lk);
-            let absent = line_pre.is_none();
-            inflight.push((lk, line_pre));
-            if !absent {
-                continue; // pre-existing line: no creation, no dir droppings
-            }
-            for owner in [&tx.account, &l.issuer] {
-                let root = keylet::owner_dir_key(owner);
-                let pre = sandbox.read(&root);
-                if let Some(bytes) = &pre {
-                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) {
-                        let last = v
-                            .get("IndexPrevious")
-                            .and_then(|p| {
-                                p.as_u64().or_else(|| p.as_str().and_then(|s| u64::from_str_radix(s, 16).ok()))
-                            })
-                            .unwrap_or(0);
-                        if last != 0 {
-                            let pk = keylet::dir_page_key(&root, last);
-                            inflight.push((pk, sandbox.read(&pk)));
-                        }
-                    }
-                }
-                inflight.push((root, pre));
+            if let Some(c) = Self::capture_inflight_line(sandbox, &tx.account, l) {
+                inflight.push(c);
             }
         }
         // REVERSE pass first: size each hop to what the one after it needs IN
@@ -1450,12 +1440,7 @@ impl PaymentTransactor {
                 break; // hop dried: nothing delivered
             }
         }
-        for (k, pre) in inflight {
-            match pre {
-                Some(bytes) => sandbox.write(k, bytes),
-                None => sandbox.forget(&k),
-            }
-        }
+        Self::undo_inflight_lines(sandbox, &inflight);
         // ASK THE WALK what it spent; do not DIFFERENCE the sender's balance.
         // The same defect `44c20d9` fixed for a hop's carry and `45a7092` for
         // the reverse pass sat here too: a balance holds 16 significant digits
