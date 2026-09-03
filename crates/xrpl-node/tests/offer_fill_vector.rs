@@ -485,3 +485,58 @@ fn offer_tail_pool_turn_anchors_on_the_residual_tip_inside_the_inflated_limit() 
 fn offer_bridged_pool_anchors_on_the_takers_own_tip_and_the_dry_pass_removes_it() {
     run_bundle(include_str!("vectors/offer_bridged_pool_anchored_on_the_takers_own_tip_106733288.json"));
 }
+
+/// Finding 122 (#106734972 E7CB46461F09): a tfSell|tfImmediateOrCancel of
+/// the taker's whole 7080.694618635 RLUSD balance for XRP that rippled fills
+/// across 39 levels. The last level is funds-limited, and the figure it takes
+/// is the LINE's remaining balance — rippled's DirectStep limits the iteration
+/// to `maxSrcToDst`, the balance as the ledger carries it after every earlier
+/// iteration's 16-digit debit — 653.9861023930549 after thirty-eight
+/// half-even debits, where the budget's folded remainder (`sendMax −
+/// sum(savedIns)`) says …550. Ours sized the fill from the folded remainder
+/// and left two lines one ULP off. Every earlier iteration matches to the
+/// digit. Sixty-seven targets byte-pinned.
+#[test]
+fn offer_funds_exhausting_fill_takes_the_lines_own_remaining_balance() {
+    run_bundle(include_str!("vectors/offer_funds_exhausting_fill_takes_the_line_balance_106734972.json"));
+}
+
+/// Finding 122, second specimen (#106734622 C1183E11AEC3): a
+/// tfImmediateOrCancel sale of RLUSD for 25.446614 XRP that runs the taker's
+/// line dry on its fifth fill. The folded remainder carries a sixteenth
+/// digit — 11048.84189960121 — that the line, debited level by level, does
+/// not: 11048.8418996012. Mainnet takes the line's figure; one line was one
+/// ULP off in ours. Eleven targets byte-pinned.
+#[test]
+fn offer_funds_exhausting_fill_takes_the_lines_own_remaining_balance_second_specimen() {
+    run_bundle(include_str!("vectors/offer_funds_exhausting_fill_takes_the_line_balance_106734622.json"));
+}
+
+/// Finding 123 (#106734683 208D914F651B): the F121 bot buying back —
+/// 50000 RLUSD for 256055 BBRL, no flags. Four bridged fib rounds match
+/// rippled's iterations 0–3 to the drop (4812, 4812, 9624, 14436 through the
+/// BBRL/XRP pool and rpiFwLYi's XRP→RLUSD offer). At iteration 4 the bridge's
+/// next slice misses the limit, `activateNext` keeps only the direct strand,
+/// `multiPath` is false, and the direct RLUSD/BBRL pool's offer is the
+/// single-path, limit-sized one — 0.003821352718250826 BBRL for
+/// 0.000746416288641 RLUSD — which mainnet takes before resting
+/// 49999.95236579247. Our round carried the previous iteration's multi-path
+/// verdict, sized a fib slice instead, refused it as beyond the limit and
+/// rested 49999.95311220876. Thirteen targets byte-pinned.
+#[test]
+fn offer_bridged_round_takes_rippleds_current_activation_for_its_multipath_flag() {
+    run_bundle(include_str!("vectors/offer_bridged_multipath_follows_the_current_activation_106734683.json"));
+}
+
+/// Finding 122, third specimen (#106734208 FDD69EE819BC): a
+/// tfSell|tfImmediateOrCancel of 10000 RLUSD by a taker holding more than
+/// that, filled across 64 levels — the BUDGET binds, not the line. rippled's
+/// last fill takes `sendMax − sum(savedIns)`, the sorted fold: 2066.665195811112.
+/// Our running gross-spend chain said …110 and overrode the fold the walk
+/// already carried; the residual maker offer 043B556F was two ULPs off.
+/// Every earlier iteration matches to the digit. One hundred and thirty-one
+/// targets byte-pinned.
+#[test]
+fn offer_budget_bound_exhausting_fill_takes_the_folded_remainder() {
+    run_bundle(include_str!("vectors/offer_budget_bound_fill_takes_the_folded_remainder_106734208.json"));
+}

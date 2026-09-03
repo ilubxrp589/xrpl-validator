@@ -2854,6 +2854,9 @@ fn cross_bridged(
     // entry (Flow.cpp:106, `strands.size() > 1`). The round's own `multi_now`
     // (computed after admission, below) becomes next round's flag.
     let mut multi_prev = true;
+    // Finding 123 (#106734683 208D914F): rounds after the first take rippled's
+    // CURRENT `activateNext` verdict (see `mp_entry` below).
+    let mut bridged_round: u32 = 0;
     for _ in 0..512 {
         if done(rem_pays, rem_gets) {
             break;
@@ -2885,8 +2888,24 @@ fn cross_bridged(
         // dead entries are stepped over, a live foreign one ends the peek).
         let raw_self_tip: Option<(u64, Hash256, serde_json::Value)> = {
             let mut found = None;
-            for (q, okey) in ld.iter().skip(di) {
-                let Some(offer) = json_at(sandbox, okey) else { continue };
+            // From the ladder's head, not the cursor: `live_head` advanced `di`
+            // past this very offer in earlier rounds (#106734683's 73ACA46E,
+            // placed by the bot's preceding tx, anchors iteration 4 at 5.1196).
+            for (q, okey) in ld.iter() {
+                let Some(offer) = json_at(sandbox, okey) else {
+                    if std::env::var("DX_RAWTIP").is_ok() {
+                        eprintln!("DX_RAWTIP q={q:016x} {} gone", hex::encode(&okey.0[..4]));
+                    }
+                    continue;
+                };
+                if std::env::var("DX_RAWTIP").is_ok() {
+                    eprintln!(
+                        "DX_RAWTIP q={q:016x} {} owner={} exp={:?}",
+                        hex::encode(&okey.0[..4]),
+                        offer.get("Account").and_then(|v| v.as_str()).map(|a| &a[..8]).unwrap_or("?"),
+                        offer.get("Expiration")
+                    );
+                }
                 if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
                     continue;
                 }
@@ -3234,7 +3253,19 @@ thr={t:?} admits_trunc={} admits_up={}",
         // BUILT (>1) for iteration 0 and the PREVIOUS iteration's active
         // count after (#106455293's FFI_GETOFFER: multiPath=1 iters=0 while
         // the same round's activeStrands ends 0).
-        let mp_entry = multi_prev;
+        // Finding 123 (#106734683 208D914F, the F121 bot buying back): rippled
+        // sets `multiPath` at the TOP of every iteration from the strands
+        // `activateNext` just kept — those whose upper bound still meets
+        // limitQuality when more than one is pending (StrandFlow.h
+        // ActiveStrands::activateNext). At iteration 4 the bridge's next fib
+        // slice misses the limit, only the direct strand survives, and the
+        // direct pool's offer is the single-path, limit-sized one
+        // (0.003821352718250826 BBRL for 0.000746416288641 RLUSD), which
+        // mainnet takes. Carrying the previous round's verdict ran a fib
+        // slice there and refused it. Round 0 keeps the built-strand entry
+        // (#106455293: multiPath=1 at iters=0 with the round ending empty).
+        let mp_entry = if bridged_round == 0 { multi_prev } else { multi_now };
+        bridged_round += 1;
         multi_prev = multi_now;
         // AMM turn: the direct-pair pool competes with the best BOOK rate.
         // Under MULTI-path it offers FIB slices; a SINGLE-path round anchors
@@ -3257,6 +3288,14 @@ thr={t:?} admits_trunc={} admits_up={}",
         // `multi_prev` carries last round's active-strand verdict, so the
         // anchored arm engages one round after the dust CLOB fill drops the
         // tip past the limit — same fills, same final state.
+        // Finding 121 (third face, #106734683): rippled steps onto the tip —
+        // and removes a self offer there — only when its pass consumed NO
+        // pool offer first or consumed one at the tip's own quality; a fib
+        // slice at any other quality ends the pass at `*ofrQ !=
+        // offer.quality()` before the tip is reached, whether or not that
+        // strand wins the round. TRUE when the pool generated an offer this
+        // round that the tip's level cannot follow.
+        let mut pool_offer_this_round = false;
         if let (Some(a), Some(init)) = (amm, &amm_init) {
             // F78 — the DIRECT strand's pool slice pays the in-issuer's rate like
             // every other in: rippled's BookStep `trIn` grosses the step's in
@@ -3289,6 +3328,10 @@ thr={t:?} admits_trunc={} admits_up={}",
                     Some(t) if t <= threshold_self => (Some(t), false),
                     _ => (None, true),
                 };
+                // An anchored offer sits at the tip's own quality, so the pass
+                // reaches the tip either way (removal handled below); only an
+                // unanchored max offer can end the pass before it.
+                pool_offer_this_round = limit_anchor;
                 // ADMISSION precedes limitOut, and the pool leg's admission
                 // quality is CONTEXT-DEPENDENT (FFI_GETOFFER receipts,
                 // AMMLiquidity.cpp):
@@ -3323,9 +3366,20 @@ thr={t:?} admits_trunc={} admits_up={}",
                                     Some(t) => me_cmp(q, rate_me(t)).is_lt(),
                                     None => true,
                                 };
+                                if std::env::var("DX_AMM").is_ok() {
+                                    eprintln!(
+                                        "DX_AMM bridged-single fib slice fi={fi:?} fo={fo:?} q={q:?} thr={thr_me:?} within={within_limit} beats_tip={beats_tip} tip={:?} iters={amm_iters}",
+                                        dpeek.as_ref().map(|(t, ..)| rate_me(*t))
+                                    );
+                                }
                                 within_limit && beats_tip
                             }
-                            None => false,
+                            None => {
+                                if std::env::var("DX_AMM").is_ok() {
+                                    eprintln!("DX_AMM bridged-single fib slice NONE iters={amm_iters}");
+                                }
+                                false
+                            }
                         }
                     } else {
                         crate::tx::amm_swap::spot_upper_bound(sandbox, a, pays_leg, gets_leg)
@@ -3357,6 +3411,10 @@ thr={t:?} admits_trunc={} admits_up={}",
                 if std::env::var("DX_AMM").is_ok() {
                     eprintln!("DX_AMM site=bridged best_book={best_book:?}");
                 }
+                pool_offer_this_round = crate::tx::amm_swap::fib_slice(
+                    sandbox, a, *init, amm_iters, pays_leg, gets_leg,
+                )
+                .is_some();
                 crate::tx::amm_swap::consume_fib(
                     sandbox, a, taker, beneficiary, None, None, rem_pays, rem_gets, pays_leg, gets_leg,
                     threshold, sell, *init, amm_iters, best_book, fee_rate,
@@ -3369,13 +3427,17 @@ thr={t:?} admits_trunc={} admits_up={}",
             // did ("Remove this offer even if no crossing occurs",
             // limitSelfCrossQuality), and a pass that consumed nothing leaves
             // the direct strand dry — no unanchored retry.
+            // The removal lands on the pass whose anchored pool attempt yields
+            // NOTHING: a pass that consumed the anchored slice leaves the self
+            // tip in place to anchor the next one (#106734683: iteration 4
+            // takes the 5.1196-anchored 0.000746 RLUSD, iteration 5 finds the
+            // spot already there — "changeSpotPrice calc failed" — steps onto
+            // the self tip, removes it and goes dry).
             if let Some((sq, skey, soffer)) = raw_self_tip.as_ref() {
-                if !direct_dry && !multi_now && threshold != u64::MAX && *sq <= threshold_self {
+                if !direct_dry && !multi_now && threshold != u64::MAX && *sq <= threshold_self && !used {
                     delete_maker_offer(sandbox, skey, soffer, taker);
                     stale.push(*skey);
-                    if !used {
-                        direct_dry = true;
-                    }
+                    direct_dry = true;
                 }
             }
             if used {
@@ -3409,7 +3471,7 @@ thr={t:?} admits_trunc={} admits_up={}",
         // removes it and its now-empty book page and crosses no value at all.
         // The direct walk in `cross_engine_to` already does this inline, after
         // its own AMM turn.
-        if taker == beneficiary {
+        if taker == beneficiary && !pool_offer_this_round {
             reap_self_offers_at_head(sandbox, &ld, di, taker, threshold_self, stale);
         }
         // Choose on what each candidate REALISES, not on its marginal rate.
@@ -4673,6 +4735,13 @@ pub(crate) fn cross_engine_to_net(
     let in_req0 = rem_gets;
     let mut saved_level_ins: Vec<Me> = Vec::new();
     let mut level_in_acc: Me = (0, 0);
+    // Finding 122 (#106734972 E7CB4646): a level's input total is rippled's
+    // `sum(savedIns)` — the level's fills folded SMALLEST TO LARGEST
+    // (BookStep::fwdImp keeps them in a flat_multiset) — not a running sum
+    // in fill order. Over 39 levels the two differ by an ULP, and the
+    // exhausting fill's `remainingIn` (653.9861023930549 on mainnet, ours
+    // …550) is exactly that difference.
+    let mut level_ins: Vec<Me> = Vec::new();
     let mut in_fold_off = false;
     fn fold16(v: &mut Vec<Me>) -> Me {
         v.sort_by(|a, b| me_cmp(*a, *b));
@@ -4998,8 +5067,9 @@ pub(crate) fn cross_engine_to_net(
                     saved_level_outs.push(slice_out);
                 }
                 rem_pays = me_sub(out_req0, fold16(&mut saved_level_outs));
-                if !me_is_zero(level_in_acc) {
-                    saved_level_ins.push(level_in_acc);
+                if !level_ins.is_empty() {
+                    saved_level_ins.push(fold16(&mut level_ins));
+                    level_ins.clear();
                     level_in_acc = (0, 0);
                 }
                 let slice_in = me_sub(rem_gets, rg);
@@ -5599,7 +5669,15 @@ pub(crate) fn cross_engine_to_net(
                                     // fold is off and the line chain rules as
                                     // before (finding 30).
                                     None => {
-                                        if !(fold_rem && me_cmp(pay, verb).is_lt()) {
+                                        // Finding 122 (#106734208 FDD69EE8, 64
+                                        // levels with the budget binding): the
+                                        // budget's remainder is the sorted
+                                        // fold `rem_gets` carries (finding
+                                        // 118), 2066.665195811112 on mainnet;
+                                        // the running gross-spend chain said
+                                        // …110. A balance-bound fill is capped
+                                        // by the line itself below.
+                                        if !fold_rem {
                                             pay = verb;
                                         }
                                     }
@@ -5658,6 +5736,35 @@ pub(crate) fn cross_engine_to_net(
                     // taker receives decides the destination's credit:
                     //   floor 239.8357738014002 /1.002 -> 239.3570596820361  <- mainnet
                     //   ceil  239.8357738014003 /1.002 -> 239.3570596820362  <- ours
+                    // Finding 122 (#106734972 E7CB4646): when the taker's own
+                    // funds bind, the exhausting fill takes what the LINE still
+                    // holds — rippled's DirectStep limits the iteration to
+                    // `maxSrcToDst`, the balance as the ledger carries it after
+                    // every earlier iteration's 16-digit debit — not the
+                    // budget's folded remainder. A 39-level sale of the whole
+                    // balance: the sorted fold leaves 653.9861023930550, the
+                    // line 653.9861023930549 (sequential half-even debits, the
+                    // figure mainnet took); two lines landed one ULP off.
+                    if offer_crossing && !gets_leg.xrp {
+                        let held = available(sandbox, taker, gets_leg);
+                        let live_gross = if me_cmp(held, taker_accs.1).is_gt() {
+                            stamount_signed_add(false, held, true, taker_accs.1).1
+                        } else {
+                            (0, 0)
+                        };
+                        let live = match transfer_rate(sandbox, gets_leg)
+                            .filter(|_| taker != &gets_leg.issuer && maker != gets_leg.issuer)
+                        {
+                            Some(r) => mul_ratio(live_gross, 1_000_000_000, r as u128, false),
+                            None => live_gross,
+                        };
+                        if !me_is_zero(live) && me_cmp(live, pay).is_lt() {
+                            if std::env::var("DX_CLAMP").is_ok() {
+                                eprintln!("DX_CLAMP line-bound pay={pay:?} -> live={live:?} held={held:?} accs={:?}", taker_accs.1);
+                            }
+                            pay = live;
+                        }
+                    }
                     give = me_muldiv(pay, (1u128, 0i32), rate_me(q), false);
                     // DX_CLAMP: does a given fill actually REACH this branch?
                     // The 2026-08-08 ceil attempt assumed the twelve one-drop
@@ -5874,6 +5981,7 @@ pub(crate) fn cross_engine_to_net(
                     // The iteration's actualOut accumulates STAmount-style
                     // (one 16-digit add per fill on the level).
                     level_out_acc = stamount_signed_add(false, level_out_acc, false, give).1;
+                    level_ins.push(pay);
                     level_in_acc = stamount_signed_add(false, level_in_acc, false, pay).1;
                 }
                 crossed += 1;
@@ -5980,8 +6088,9 @@ pub(crate) fn cross_engine_to_net(
             saved_level_outs.push(level_out_acc);
             level_out_acc = (0, 0);
             rem_pays = me_sub(out_req0, fold16(&mut saved_level_outs));
-            if !me_is_zero(level_in_acc) {
-                saved_level_ins.push(level_in_acc);
+            if !level_ins.is_empty() {
+                saved_level_ins.push(fold16(&mut level_ins));
+                level_ins.clear();
                 level_in_acc = (0, 0);
             }
             if !in_fold_off {
@@ -6117,8 +6226,9 @@ pub(crate) fn cross_engine_to_net(
                     saved_level_outs.push(slice_out);
                 }
                 rem_pays = me_sub(out_req0, fold16(&mut saved_level_outs));
-                if !me_is_zero(level_in_acc) {
-                    saved_level_ins.push(level_in_acc);
+                if !level_ins.is_empty() {
+                    saved_level_ins.push(fold16(&mut level_ins));
+                    level_ins.clear();
                     level_in_acc = (0, 0);
                 }
                 let slice_in = me_sub(rem_gets, rg);
