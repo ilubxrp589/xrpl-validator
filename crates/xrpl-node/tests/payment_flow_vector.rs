@@ -317,3 +317,17 @@ fn payment_encoded_rate_rounds_to_nearest_fib_chain() {
 fn payment_fib_seed_multiplies_at_nearest_and_converts_upward() {
     run_bundle(include_str!("vectors/payment_fib_seed_multiplies_at_nearest_106734110.json"));
 }
+
+/// Finding 131 (#106734485 83E5899A): a partial payment of 5090 drops for
+/// 3979.37885397957 Sketch through two single-path pools, XRP/X then
+/// X/Sketch. The reverse pass sizes the X/Sketch pool at 60.69318969933 X
+/// and the XRP/X pool beyond the SendMax, so rippled resets and runs
+/// forwards: 5090 drops swap to 60.6931897 X, and the X/Sketch pool is
+/// driven by THAT input — 60.6931897 for 3979.3788540239 — while the
+/// terminal DirectStep delivers the reverse request (within 1e-9) and the
+/// issuer keeps the sliver. We consumed the second pool at its reverse
+/// amounts and left 6.7e-10 X on the sender's line. Byte-pinned.
+#[test]
+fn payment_forward_pass_reswaps_the_downstream_pool_at_the_carried_input() {
+    run_bundle(include_str!("vectors/payment_forward_pass_reswaps_the_downstream_pool_106734485.json"));
+}

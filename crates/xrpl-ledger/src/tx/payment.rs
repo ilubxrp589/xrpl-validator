@@ -1042,11 +1042,13 @@ impl PaymentTransactor {
                     let before = (!last)
                         .then(|| Self::leg_signed_balance(sandbox, &tx.account, to))
                         .flatten();
+                    let _ = crate::tx::amm_swap::take_fwd_excess();
                     let (rw, rs, _c) = ox::cross_engine_to(
                         &tx.account, benef, out_target[i], avail, to, from, thr, thr, false,
                         false, single_pass, amm_fib.as_deref_mut(), None, sandbox,
                         &mut Vec::new(),
                     );
+                    let excess = crate::tx::amm_swap::take_fwd_excess();
                     if i == 0 {
                         sin = ox::me_sub(avail, rs);
                     }
@@ -1081,6 +1083,14 @@ impl PaymentTransactor {
                             }
                             _ => produced,
                         };
+                        // Finding 131: the pool turn's overshoot rides the
+                        // carry (see strand_pass).
+                        if !ox::me_is_zero(excess) {
+                            let whole = ox::signed_add(false, produced, false, excess).1;
+                            if ox::me_cmp(carry, whole).is_lt() {
+                                carry = whole;
+                            }
+                        }
                     }
                     // Run-adjacent joints come clean NOW, before the next
                     // run writes the same lines for real.
@@ -1299,6 +1309,7 @@ impl PaymentTransactor {
                 }
                 ox::set_passthrough(pass);
             }
+            let _ = crate::tx::amm_swap::take_fwd_excess();
             let (rw, rs, _c, gross_spent) = ox::cross_engine_to_net(
                 &tx.account, benef, want_cap, avail, chain[i + 1], chain[i],
                 hop_thr, hop_thr, false, false, single_pass, amm_fib.as_deref_mut(), None,
@@ -1306,6 +1317,7 @@ impl PaymentTransactor {
                 if i == 0 { spend_gross } else { None },
                 sandbox, &mut Vec::new(),
             );
+            let excess = crate::tx::amm_swap::take_fwd_excess();
             // Hop 0's input IS the spend leg — `hop_rate` is gated on `i > 0`,
             // so `avail` there is still `avail_in` untouched — and `rs` is the
             // part of it the pass did not spend. The difference is the same
@@ -1473,6 +1485,20 @@ impl PaymentTransactor {
                 // enough to subtract exactly.
                 _ => ox::me_sub(want_cap, rw),
             };
+            // Finding 131: the walk's pool turn reports its overshoot — the
+            // input-clamped fill's output beyond the want — and rippled's
+            // forward pass hands that whole product on. The delta above
+            // sees it only when the sender's pre-balance was zero; an
+            // intermediate riding through in flight has no line to
+            // difference at all (#106734485: before=None, pool 1 emits
+            // 60.6931897 X against a want of 60.69318969933, and pool 2
+            // must receive the whole figure).
+            if !last && !ox::me_is_zero(excess) {
+                let whole = ox::signed_add(false, ox::me_sub(want_cap, rw), false, excess).1;
+                if ox::me_cmp(carry, whole).is_lt() {
+                    carry = whole;
+                }
+            }
             if std::env::var("DX_PAY").is_ok() {
                 let nm = |l: &ox::Leg| if l.xrp { "XRP".to_string() } else { format!("{}/{}", hex::encode_upper(&l.cur[12..15]), hex::encode(&l.issuer[..4])) };
                 eprintln!(

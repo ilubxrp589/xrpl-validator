@@ -40,6 +40,26 @@ pub(crate) const MAX_AMM_ITERS: u32 = 30;
 // walks count one per consumed pool slice, which is what an iteration is for
 // offer crossing — but those same walks run the payment's book hops, so
 // they must not count while a driver owns the flow.
+/// Finding 131 (#106734485 83E5899A): a pool turn's OVERSHOOT — the output
+/// beyond the hop's want when the fill was input-clamped. rippled's forward
+/// pass hands a step's whole product to the next step (`BookStep::fwdImp`
+/// consumes by input; the reverse cache reinstates the reverse amounts only
+/// when `limitStepOut(cache.out)` lands exactly on the forward input, which
+/// a curve never does), so the excess rides the carry into the next hop's
+/// pool. The driver reads it after each walk; the sender's line cannot be
+/// differenced for it when the intermediate rides through in flight.
+thread_local! {
+    static FWD_EXCESS: std::cell::Cell<Me> = const { std::cell::Cell::new((0, 0)) };
+}
+fn add_fwd_excess(x: Me) {
+    if x.0 == 0 {
+        return;
+    }
+    FWD_EXCESS.with(|c| c.set(n_add(c.get(), x, Rnd::Near)));
+}
+pub(crate) fn take_fwd_excess() -> Me {
+    FWD_EXCESS.with(|c| c.replace((0, 0)))
+}
 thread_local! {
     static AMM_CTX: std::cell::Cell<(u32, bool, bool)> =
         const { std::cell::Cell::new((0, false, false)) };
@@ -1365,6 +1385,9 @@ pub(crate) fn consume_fib(
     if take_in.0 == 0 || take_out.0 == 0 {
         return (rem_pays, rem_gets, false);
     }
+    if !sell && n_cmp(take_out, rem_pays) == Ordering::Greater {
+        add_fwd_excess(n_sub(take_out, rem_pays, Rnd::Near));
+    }
     settle_slice(
         sandbox,
         taker,
@@ -1379,6 +1402,7 @@ pub(crate) fn consume_fib(
             Some(cap) if n_cmp(take_in, rem_gets) != Ordering::Less => cap,
             _ => ox::gross_in(in_gross_rate, take_in),
         },
+        take_out,
         take_out,
         benef_net,
     );
@@ -1691,6 +1715,10 @@ fn settle_slice(
     take_in: Me,
     take_in_gross: Me,
     take_out: Me,
+    // What the beneficiary is credited (≤ take_out): the pool parts with
+    // `take_out`; a forward-swept turn's excess stays with the issuer
+    // (finding 131).
+    deliver: Me,
     // (want rate, rev-sized net ask, the walk's gross ask): a strand-tail
     // slice credits the DESTINATION NET, per the fwd rev-cache rule — the
     // pool still parts with the gross and the issuer destroys the
@@ -1703,14 +1731,14 @@ fn settle_slice(
     ox::move_leg_gross(sandbox, taker, amm_account, gets_leg, take_in, take_in_gross);
     match benef_net {
         Some((rate, net_ask, ask0)) => {
-            let net = if ox::me_cmp(take_out, ask0) == std::cmp::Ordering::Equal {
+            let net = if ox::me_cmp(deliver, ask0) == std::cmp::Ordering::Equal {
                 net_ask
             } else {
-                ox::mul_ratio(take_out, 1_000_000_000, rate as u128, false)
+                ox::mul_ratio(deliver, 1_000_000_000, rate as u128, false)
             };
             ox::move_leg_gross(sandbox, amm_account, beneficiary, pays_leg, net, take_out);
         }
-        None => ox::move_leg(sandbox, amm_account, beneficiary, pays_leg, take_out),
+        None => ox::move_leg_gross(sandbox, amm_account, beneficiary, pays_leg, deliver, take_out),
     }
 }
 
@@ -1926,11 +1954,41 @@ pub(crate) fn consume(
     // against the pool (AMMOffer::limitOut / limitIn). For a tfSell offer the
     // pays side (rem_pays) is only a minimum, not a cap — the taker takes the
     // surplus — so only rem_gets bounds the fill.
+    // The delivery the beneficiary is credited; the pool parts with
+    // `take_out`. Equal except in the forward-swept case below.
+    let mut deliver_cap: Option<Me> = None;
     if !sell && n_cmp(take_out, rem_pays) == Ordering::Greater {
         take_out = rem_pays;
         match swap_asset_out(pool_in, pool_out, take_out, amm.tfee, gets_leg.xrp) {
             Some(i) => take_in = i,
             None => return (rem_pays, rem_gets, false),
+        }
+        // Finding 131 (#106734485 83E5899A): rippled's forward pass drives a
+        // BookStep by its INPUT — `fwdImp` hands `limitStepIn` the whole
+        // remaining input and a single-path pool re-swaps it in ONE
+        // `swapAssetIn`; the reverse cache reinstates the reverse amounts only
+        // when `limitStepOut(cache.out)` lands exactly on that input, which a
+        // curve never does. When the carried input exceeds the reverse-sized
+        // input by a rounding sliver (an upstream pool's rounded-up product —
+        // 60.6931897 X against 60.69318969933 here), the pool takes the whole
+        // input in one swap (3979.3788540239 Sketch, not the reverse
+        // 3979.37885397957 plus a crumb swap of the sliver, …0231) and the
+        // beneficiary is credited the request; the terminal DirectStep keeps
+        // its cache within 1e-9 and the issuer holds the difference. An XRP
+        // delivery has no issuer to hold it and receives the whole output.
+        if n_cmp(rem_gets, take_in) == Ordering::Greater {
+            let sliver = n_sub(rem_gets, take_in, Rnd::Near);
+            let tiny = n_cmp(n_mul(sliver, (1_000_000_000, 0), Rnd::Near), rem_gets) == Ordering::Less;
+            if tiny {
+                let whole = swap_asset_in(pool_in, pool_out, rem_gets, amm.tfee, pays_leg.xrp);
+                if n_cmp(whole, rem_pays) != Ordering::Less {
+                    take_in = rem_gets;
+                    take_out = whole;
+                    if !pays_leg.xrp {
+                        deliver_cap = Some(rem_pays);
+                    }
+                }
+            }
         }
     }
     if n_cmp(take_in, rem_gets) == Ordering::Greater {
@@ -1987,6 +2045,12 @@ pub(crate) fn consume(
     if take_in.0 == 0 || take_out.0 == 0 {
         return (rem_pays, rem_gets, false);
     }
+    // Finding 131: an input-clamped fill's output beyond the want is the
+    // forward pass's whole product; report it for the carry.
+    if !sell && n_cmp(take_out, rem_pays) == Ordering::Greater {
+        add_fwd_excess(n_sub(take_out, rem_pays, Rnd::Near));
+    }
+    let deliver = deliver_cap.unwrap_or(take_out);
     if std::env::var("DX_AMM").is_ok() {
         eprintln!("DX_AMM CONSUMED acct={} take_in={take_in:?} take_out={take_out:?} spot={spot:x} thr={threshold:x} clob={clob:?}",
             hex::encode(amm.account));
@@ -2006,10 +2070,11 @@ pub(crate) fn consume(
             _ => ox::gross_in(in_gross_rate, take_in),
         },
         take_out,
+        deliver,
         benef_net,
     );
     (
-        ox::me_sub(rem_pays, take_out),
+        ox::me_sub(rem_pays, deliver),
         ox::me_sub(rem_gets, take_in),
         true,
     )
