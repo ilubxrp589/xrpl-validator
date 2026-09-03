@@ -743,7 +743,13 @@ pub fn mixed_layout(
                     Some(p) => {
                         if p != a {
                             run.push(DirectHop { src: p, dst: a, cur: cur.cur });
-                            real_run = true;
+                            // Finding 140: the head hop src → SendMax issuer is
+                            // implied on EVERY strand (toStrand's normalization);
+                            // an element that merely names it does not make this
+                            // a mixed strand — the classic chain already is it.
+                            if !(p == *src && a == spend_leg.issuer) {
+                                real_run = true;
+                            }
                         }
                     }
                     None => {

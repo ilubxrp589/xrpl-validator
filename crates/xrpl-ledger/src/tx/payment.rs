@@ -122,10 +122,19 @@ impl PaymentTransactor {
                 }
                 Some(c20)
             });
+        // Finding 140: the SendMax issuer, for the leading account element
+        // that names it (see `path_legs`).
+        let spend_issuer: Option<[u8; 20]> = tx
+            .fields
+            .get("SendMax")
+            .or_else(|| tx.fields.get("Amount"))
+            .and_then(|a| a.get("issuer"))
+            .and_then(|c| c.as_str())
+            .and_then(crate::tx::offer::decode20);
         let chains = paths
             .iter()
             .filter_map(|p| p.as_array())
-            .filter_map(|els| Self::path_legs(els, spend_cur))
+            .filter_map(|els| Self::path_legs(els, spend_cur, spend_issuer))
             .collect();
         (chains, paths.len())
     }
@@ -136,6 +145,7 @@ impl PaymentTransactor {
     fn path_legs(
         els: &[serde_json::Value],
         spend_cur: Option<[u8; 20]>,
+        spend_issuer: Option<[u8; 20]>,
     ) -> Option<Vec<crate::tx::offer::Leg>> {
         let mut legs: Vec<crate::tx::offer::Leg> = Vec::new();
         for el in els {
@@ -151,6 +161,19 @@ impl PaymentTransactor {
                     .and_then(crate::tx::offer::decode20);
                 match (acct, legs.last()) {
                     (Some(a), Some(prev)) if !prev.xrp && a == prev.issuer => continue,
+                    // Finding 140 (#106739814 741DD630E126): a LEADING account
+                    // element naming the SendMax issuer is the hop toStrand's
+                    // normalization inserts on every strand (src → SendMax
+                    // issuer, PaySteps.cpp) — `[rMxCK, XRP]` and `[XRP]` build
+                    // the SAME strand and `toStrands` keeps one (`hasStrand`).
+                    // Modelled as the plain chain here, the chain dedup below
+                    // merges it; we used to drop the path from this pipeline
+                    // and let the mixed pipeline flow it as a SECOND strand —
+                    // two strands where rippled has one, `multiPath` on, and
+                    // the RLUSD/XRP pool sized by a Fibonacci slice instead of
+                    // the single-path anchored offer: 1981089 drops delivered
+                    // for 1981581.
+                    (Some(a), None) if spend_issuer == Some(a) => continue,
                     _ => return None,
                 }
             }

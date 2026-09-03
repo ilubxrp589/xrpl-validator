@@ -345,3 +345,15 @@ fn payment_forward_pass_reswaps_the_downstream_pool_at_the_carried_input() {
 fn payment_makers_reserve_holds_at_the_flows_original_owner_count() {
     run_bundle(include_str!("vectors/payment_makers_reserve_holds_the_original_owner_count_106738595.json"));
 }
+
+/// Finding 140 — #106739814 741DD630E126 (rEEGpeYc, 2.9101496 RLUSD → XRP to
+/// self, tfPartialPayment, paths `[rMxCK, XRP]` and `[XRP]`). The first path
+/// only names the SendMax issuer at its head — the hop every strand starts
+/// with — so rippled's `toStrands` keeps ONE strand (`hasStrand`) and the
+/// flow runs single-path: the RLUSD/XRP pool is sized by the anchored offer
+/// and delivers 1981581 drops. We flowed it twice (two strands, `multiPath`,
+/// a Fibonacci slice) and delivered 1981089.
+#[test]
+fn payment_path_naming_the_sendmax_issuer_is_the_default_strand() {
+    run_bundle(include_str!("vectors/payment_path_naming_sendmax_issuer_is_default_strand_106739814.json"));
+}
