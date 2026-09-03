@@ -2387,6 +2387,61 @@ impl PaymentTransactor {
                 }
             }
         }
+        // NO-RIPPLE (OR NO LINE) BLOCKS THE STEP INTO A BOOK. The mirror of
+        // the rule above: a BOOK step that follows a DirectStepI is refused
+        // when the line between that step's SOURCE and the book's in-issuer
+        // is missing, or carries NoRipple on the ISSUER's side
+        // (BookStep.cpp, BookStep::check):
+        //     if (auto const prev = ctx.prevStep->directStepSrcAcct()) {
+        //         auto sle = view.read(keylet::line(*prev, cur, issue.currency));
+        //         if (!sle) return terNO_LINE;
+        //         if (sle->isFlag((cur > *prev) ? lsfHighNoRipple : lsfLowNoRipple))
+        //             return terNO_RIPPLE;
+        //     }
+        // Every strand we model opens with the same DirectStepI (sender ->
+        // spend issuer) and then its first book, so the flag on the ISSUER's
+        // side of the SENDER's spend line decides whether ANY strand can
+        // leave the sender at all; Payment turns the ter into tecPATH_DRY
+        // (Payment.cpp: isTerRetry -> tecPATH_DRY). No book, no check: a
+        // same-currency delivery is DirectStepI hops only, and a sender who
+        // IS the issuer enters the book without a direct step in front.
+        // Strands that ripple through an ACCOUNT hop before their first
+        // book (`mstrands`) reach that book from the hop's line, not the
+        // sender's, so they are judged by their own checks and the refusal
+        // below is only whole-payment when none of them exists.
+        //
+        // #106722089 819A6BBC (finding 105): a tfPartialPayment self-
+        // conversion, SendMax 200000 XA3 for 15.976242 XRP through the
+        // XA3/XRP pool the sender dominates (94% of the LP tokens). The
+        // sender's XA3 line predates the issuer's DefaultRipple and still
+        // carries lsfLowNoRipple on the issuer's (low) side. Mainnet:
+        // tecPATH_DRY, fee only. We swapped 199995.93 XA3 through the pool,
+        // delivered the whole Amount and wrote three extra nodes.
+        if !spend_leg.xrp
+            && tx.account != spend_leg.issuer
+            && (spend_leg.xrp != want_leg.xrp || spend_leg.cur != want_leg.cur)
+            && mstrands.is_empty()
+        {
+            let lk = keylet::ripple_state_key(&tx.account, &spend_leg.issuer, &spend_leg.cur);
+            let blocked = match ox::json_at(sandbox, &lk) {
+                None => true,
+                Some(line) => {
+                    let flags = line["Flags"].as_u64().unwrap_or(0);
+                    // The flag belongs to the book's in-ISSUER: low side if
+                    // its id sorts first, high side otherwise.
+                    let issuer_low = &spend_leg.issuer < &tx.account;
+                    let bit = if issuer_low { 0x0010_0000 } else { 0x0020_0000 };
+                    flags & bit != 0
+                }
+            };
+            if blocked {
+                if std::env::var("DX_PAY").is_ok() {
+                    eprintln!("DX_PAY DRY-EXIT spend-line-noripple-into-book");
+                }
+                sandbox.restore_snapshot(snap);
+                return TxResult::PathDry;
+            }
+        }
         // The delivered IOU is re-issued to the destination by the strand's
         // last step, which charges the issuer's TransferRate (see below), so
         // the books must be worked for `Amount × rate` GROSS for the

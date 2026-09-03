@@ -51,7 +51,10 @@ fn run_bundle(bundle_json: &str) {
     let tx_hash = tx["hash"].as_str().unwrap();
     let txf = build_txfields(tx).expect("txfields");
     let (ter, mut mods) = native_apply_one(&state, &txf);
-    assert_eq!(ter, "tesSUCCESS", "mainnet applied this Payment");
+    // A bundle pinned on a tec carries mainnet's result; the fee-only
+    // AccountRoot in `expect` then checks the refusal's shape too.
+    let want_ter = bundle["result"].as_str().unwrap_or("tesSUCCESS");
+    assert_eq!(ter, want_ter, "mainnet's result for this Payment");
 
     xrpl_ledger::ledger::threading::stamp_threading(
         &mut mods,
@@ -170,4 +173,16 @@ fn payment_direct_transfer_fee_delivery_rounds_like_mul_ratio() {
 #[test]
 fn payment_intermediate_hop_never_lands_on_the_senders_line() {
     run_bundle(include_str!("vectors/payment_passthrough_intermediate_106712861.json"));
+}
+
+/// Finding 105 (#106722089 819A6BBC): a tfPartialPayment self-conversion,
+/// SendMax 200000 XA3 for 15.976242 XRP through the XA3/XRP pool the sender
+/// dominates. The sender's XA3 line carries NoRipple on the ISSUER's (low)
+/// side, so rippled's BookStep::check refuses the book that follows the
+/// sender -> issuer DirectStepI (terNO_RIPPLE), the default path fails to
+/// build and Payment reports tecPATH_DRY with the fee alone. We swapped
+/// 199995.93 XA3 through the pool and delivered the whole Amount.
+#[test]
+fn payment_book_behind_an_issuer_no_ripple_line_is_path_dry() {
+    run_bundle(include_str!("vectors/payment_noripple_into_book_106722089.json"));
 }
