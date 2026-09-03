@@ -303,69 +303,74 @@ impl Transactor for DepositPreauthTransactor {
         if !sandbox.exists(&acct_key) {
             return TxResult::NoAccount;
         }
+        // DepositPreauth::preclaim — the authorized account must exist
+        // (tecNO_TARGET), the entry must not already exist (tecDUPLICATE);
+        // an Unauthorize needs the entry (tecNO_ENTRY).
+        if let Some(auth_val) = tx.fields.get("Authorize") {
+            let Some(authorized) = decode_account_id(auth_val) else {
+                return TxResult::Malformed;
+            };
+            if !sandbox.exists(&keylet::account_root_key(&authorized)) {
+                return TxResult::NoTarget;
+            }
+            if sandbox.exists(&keylet::deposit_preauth_key(&tx.account, &authorized)) {
+                return TxResult::Duplicate;
+            }
+        } else if let Some(unauth_val) = tx.fields.get("Unauthorize") {
+            let Some(unauthorized) = decode_account_id(unauth_val) else {
+                return TxResult::Malformed;
+            };
+            if !sandbox.exists(&keylet::deposit_preauth_key(&tx.account, &unauthorized)) {
+                return TxResult::NoEntry;
+            }
+        }
         TxResult::Success
     }
-
     fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
         if let Some(auth_val) = tx.fields.get("Authorize") {
-            // Authorize: create a DepositPreauth entry
+            // Finding 132 (#106737708 2EDFEDC7, #106737754 EDF9D55A): rippled's
+            // DepositPreauth::doApply inserts the entry into the owner
+            // directory and records the page (`sfOwnerNode`); the entry, like
+            // every ledger entry, carries `Flags` (zero). We wrote the object
+            // bare — no Flags, no OwnerNode, no directory entry — so mainnet's
+            // directory page read untouched and the object serialized two
+            // fields short.
             let authorized = match decode_account_id(auth_val) {
                 Some(id) => id,
                 None => return TxResult::Malformed,
             };
-
             let dp_key = keylet::deposit_preauth_key(&tx.account, &authorized);
-
             if sandbox.exists(&dp_key) {
-                // Already authorized — this is a no-op in rippled but we return success
-                return TxResult::Success;
+                return TxResult::Duplicate;
             }
-
-            let dp_obj = serde_json::json!({
+            let mut dp_obj = serde_json::json!({
                 "LedgerEntryType": "DepositPreauth",
+                "Flags": 0,
                 "Account": hex::encode(tx.account),
                 "Authorize": hex::encode(authorized),
             });
-
+            let owner_node =
+                crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &dp_key);
+            dp_obj["OwnerNode"] = serde_json::Value::String(format!("{owner_node:x}"));
             sandbox.write(dp_key, serde_json::to_vec(&dp_obj).unwrap());
-
-            // Increment OwnerCount
-            let acct_key = keylet::account_root_key(&tx.account);
-            if let Some(data) = sandbox.read(&acct_key) {
-                if let Ok(mut acct) = serde_json::from_slice::<serde_json::Value>(&data) {
-                    let count = acct["OwnerCount"].as_u64().unwrap_or(0);
-                    acct["OwnerCount"] = serde_json::Value::Number((count + 1).into());
-                    sandbox.write(acct_key, serde_json::to_vec(&acct).unwrap());
-                }
-            }
+            crate::tx::offer::owner_count_add(sandbox, &tx.account, 1);
         } else if let Some(unauth_val) = tx.fields.get("Unauthorize") {
-            // Unauthorize: delete the DepositPreauth entry
             let unauthorized = match decode_account_id(unauth_val) {
                 Some(id) => id,
                 None => return TxResult::Malformed,
             };
-
             let dp_key = keylet::deposit_preauth_key(&tx.account, &unauthorized);
-
-            if !sandbox.exists(&dp_key) {
+            let Some(data) = sandbox.read(&dp_key) else {
                 return TxResult::NoEntry;
-            }
-
+            };
+            let hint = serde_json::from_slice::<serde_json::Value>(&data)
+                .ok()
+                .and_then(|o| o.get("OwnerNode").and_then(|v| v.as_str()).map(String::from))
+                .and_then(|s| u64::from_str_radix(&s, 16).ok());
+            crate::ledger::directory::owner_dir_remove(sandbox, &tx.account, &dp_key, hint, true);
             sandbox.delete(dp_key);
-
-            // Decrement OwnerCount
-            let acct_key = keylet::account_root_key(&tx.account);
-            if let Some(data) = sandbox.read(&acct_key) {
-                if let Ok(mut acct) = serde_json::from_slice::<serde_json::Value>(&data) {
-                    let count = acct["OwnerCount"].as_u64().unwrap_or(0);
-                    if count > 0 {
-                        acct["OwnerCount"] = serde_json::Value::Number((count - 1).into());
-                    }
-                    sandbox.write(acct_key, serde_json::to_vec(&acct).unwrap());
-                }
-            }
+            crate::tx::offer::owner_count_add(sandbox, &tx.account, -1);
         }
-
         TxResult::Success
     }
 }
