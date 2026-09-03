@@ -404,3 +404,22 @@ fn offer_rev_pass_steps_past_a_maker_it_emptied_and_reaps_behind_it() {
 fn offer_tie_level_is_judged_by_the_directory_quality_not_the_offers_own_rate() {
     run_bundle(include_str!("vectors/offer_tie_level_judged_by_directory_quality_106732842.json"));
 }
+
+/// Finding 117 (#106733197 DFD1E132035C): a tfImmediateOrCancel buy of
+/// 3111.618064 XRP for RLUSD takes three underfunded bot makers whole on
+/// three levels (0.8, 0.6 and 0.4 XRP) and rests nothing (the next live
+/// level and the pool both miss the limit). rippled's stream deletes what it
+/// steps past: the dead offers on the levels behind each fill, and — in the
+/// forward pass of a successful iteration — the same makers' remaining
+/// offers, now "became unfunded" (D8118C65, 119270E3), page by page. Our
+/// rev-extent scan (F114) had already reaped the dead offers ahead of the
+/// funded walk and emptied their levels; when the walk then reached the
+/// first such level its page was gone, `reap_to_live_head` reported an
+/// unreadable page as "live", and the stepping ended two levels short of
+/// the two remaining offers. A page this apply has deleted is an emptied
+/// level, not an unknown one. Eleven targets byte-pinned: the makers' roots
+/// and owner pages, the taker's, and the book pages.
+#[test]
+fn offer_walk_steps_through_a_level_it_emptied_and_reaps_the_makers_remaining_offers() {
+    run_bundle(include_str!("vectors/offer_emptied_level_page_is_stepped_through_106733197.json"));
+}

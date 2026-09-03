@@ -2330,7 +2330,26 @@ fn reap_to_live_head(
         // An unreadable page is unknown, not empty: claiming the level dead
         // would suppress the pool's anchor on evidence we do not have. Report
         // it live and leave the level exactly as it behaved before.
-        let Some(page) = json_at(sandbox, &page_key_h) else { return true };
+        //
+        // Finding 117 (#106733197 DFD1E132035C): a page this apply has already
+        // DELETED is not unknown — it is a level the walk itself emptied.
+        // The rev-extent scan (F114) reaps dead offers on the levels ahead of
+        // the funded walk, and a level whose last offer it removed loses its
+        // page; when the walk then reaches that level, reporting it "live"
+        // ended the stepping there. rippled's stream simply steps through
+        // (the directory has no such page any more, `succ` skips to the next
+        // level). The specimen's taker takes three underfunded makers whole
+        // across three levels; rippled's next iteration then steps from the
+        // tip again and finds rD7q6194Bw's remaining D8118C65 and 119270E3
+        // "found unfunded" — reaped with their pages — before the live
+        // FF165009 ends it. We stopped at the first emptied level and left
+        // both behind (OwnerCount and owner page off).
+        let Some(page) = json_at(sandbox, &page_key_h) else {
+            return !matches!(
+                sandbox.modifications().get(&page_key_h),
+                Some(crate::ledger::sandbox::SandboxEntry::Deleted)
+            );
+        };
         let entries: Vec<String> = page
             .get("Indexes")
             .and_then(|v| v.as_array())
