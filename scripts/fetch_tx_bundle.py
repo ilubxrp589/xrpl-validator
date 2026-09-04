@@ -202,6 +202,39 @@ def canonical(raw):
     return b"".join(raw[k] for k in sorted(raw)).hex().upper()
 
 
+# rippled's CreatedNode NewFields omit every field at its default (STBase::
+# isDefault), so an object rebuilt from them lacks the REQUIRED fields the
+# real SLE serializes at zero — an Offer's BookNode "0" (9 bytes), Flags 0,
+# an AccountRoot's OwnerCount 0. Only fields the transactor ALWAYS sets can be
+# put back (an absent OPTIONAL field is indistinguishable from a default).
+# (finding 143's vector: the in-ledger bid 8F73 came back 9 bytes short.)
+_ALWAYS_SET = {
+    0x006F: [(2, 2), (3, 3), (3, 4)],  # Offer: Flags, BookNode, OwnerNode
+    0x0072: [(2, 2), (3, 7), (3, 8)],  # RippleState: Flags, LowNode, HighNode
+    0x0064: [(2, 2)],  # DirectoryNode: Flags
+    0x0061: [(2, 2), (2, 13)],  # AccountRoot: Flags, OwnerCount
+    0x0043: [(2, 2), (3, 4), (3, 9)],  # Check: Flags, OwnerNode, DestinationNode
+    0x0075: [(2, 2), (3, 4)],  # Escrow: Flags, OwnerNode (DestinationNode is optional)
+    0x0078: [(2, 2), (3, 4)],  # PayChannel: Flags, OwnerNode
+    0x0054: [(2, 2), (3, 4)],  # Ticket: Flags, OwnerNode
+    0x0070: [(2, 2), (3, 4)],  # DepositPreauth: Flags, OwnerNode
+    0x0037: [(2, 2), (3, 4), (3, 12)],  # NFTokenOffer: Flags, OwnerNode, NFTokenOfferNode
+}
+
+
+def readd_defaults(raw):
+    """Put back the always-set fields NewFields dropped as defaults."""
+    let = raw.get((1, 1))
+    if not let or len(let) != 3:
+        return raw
+    for ty, code in _ALWAYS_SET.get(int.from_bytes(let[1:3], "big"), []):
+        if (ty, code) in raw:
+            continue
+        hdr = bytes([(ty << 4) | code]) if code < 16 else bytes([ty << 4, code])
+        raw[(ty, code)] = hdr + bytes(4 if ty == 2 else 8)
+    return raw
+
+
 def _is_default(t, raw):
     """Would rippled's STBase::isDefault omit this field from NewFields?"""
     _, _, i = _hdr(raw, 0)
@@ -966,7 +999,7 @@ def main():
                 raw = dict(rec["news"] or {})
                 if not raw:
                     return False
-                raw = stamped(raw, rec["node"].get((1, 1)), h, seq)
+                raw = readd_defaults(stamped(raw, rec["node"].get((1, 1)), h, seq))
             else:
                 raw, _via = backward(li, before)
                 if raw is None:
@@ -996,6 +1029,8 @@ def main():
             crec = node_of(ch, bd)
             if crec is None or not crec["news"]:
                 return
+            if crec["node"].get((1, 1)) != b"\x11" + LET_DIR_NODE.to_bytes(2, "big"):
+                return  # not a page (an in-ledger created Offer, say): ensure_key rebuilds it
             # sfIndexes is sMD_Never: a created page's entries are the creating
             # tx's own directory ops replayed on an EMPTY page, then the later
             # earlier txs' ops.
@@ -1083,11 +1118,25 @@ def main():
     # the ledger touched it, otherwise rebuilt through the in-ledger touchers.
     # #106723025 62498920 (finding 107): a tec specimen whose meta names the
     # fee alone, while the walk it must reproduce runs 30 book levels deep.
+    # UNTOUCHED_TARGETS=<file>: keys the transaction must leave ALONE — seated
+    # exactly like EXTRA_KEYS and then pinned in `expect` at their pre-image
+    # (probe_bundle / run_bundle pass an unwritten expectation that equals the
+    # seated bytes). Finding 143: the taker's own bid beyond a later ask's
+    # limit is never named by the ask's meta, so a meta-only target list was
+    # green at HEAD while the live engine deleted the bid.
     extra_file = os.environ.get("EXTRA_KEYS")
-    if extra_file:
+    ut_file = os.environ.get("UNTOUCHED_TARGETS")
+    ut_keys = []
+    if ut_file:
+        with open(ut_file) as uf:
+            ut_keys = [k.strip().upper() for k in uf if k.strip()]
+    if extra_file or ut_keys:
         n_before = len(pre)
-        with open(extra_file) as ef:
-            extra_keys = [k.strip().upper() for k in ef if k.strip()]
+        extra_keys = list(ut_keys)
+        if extra_file:
+            with open(extra_file) as ef:
+                extra_keys += [k.strip().upper() for k in ef if k.strip()]
+        extra_keys = list(dict.fromkeys(extra_keys))
         for k in extra_keys:
             if k in pre:
                 continue
@@ -1107,6 +1156,15 @@ def main():
             else:
                 ensure_key(k)
         print(f"extra keys: {len(extra_keys)} requested, {len(pre) - n_before} seated")
+        pinned = 0
+        for k in ut_keys:
+            if k in pre:
+                targets[k] = pre[k]
+                pinned += 1
+            else:
+                print(f"WARN: untouched target {k[:16]}… could not be seated")
+        if ut_keys:
+            print(f"untouched targets: {len(ut_keys)} requested, {pinned} pinned")
 
     parent = rpc("ledger", {"ledger_index": seq - 1})["ledger"]
     cur = rpc("ledger", {"ledger_index": seq})["ledger"]
