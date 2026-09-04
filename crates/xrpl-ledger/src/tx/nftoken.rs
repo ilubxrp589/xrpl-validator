@@ -443,6 +443,32 @@ impl Transactor for NFTokenBurnTransactor {
         if !sandbox.exists(&acct_key) {
             return TxResult::NoAccount;
         }
+        // Finding 154 — NFTokenBurn::preclaim: the token's OWNER may always
+        // burn it; anyone else needs the token flagged burnable (0x0001 in
+        // the NFTokenID's flag word) AND to be its issuer or the issuer's
+        // current `NFTokenMinter` (an issuer without a minter set fails the
+        // comparison; an issuer whose root is gone skips it). We had no
+        // check at all. #106747838 EE7C95A6D70C: rDQ9jYQ1 burns rBpHoJQjj's
+        // token 000827106DEF… — flags 0x0008, transferable but NOT burnable —
+        // mainnet returns tecNO_PERMISSION and charges the fee; we burned it
+        // (the page and the issuer's BurnedNFTokens moved).
+        if let Some(id) = tx.fields.get("NFTokenID").and_then(hash256_from) {
+            let owner = tx.fields.get("Owner").and_then(decode_account_id).unwrap_or(tx.account);
+            if owner != tx.account {
+                if nftpage::flags_of(&id) & nftpage::NFT_FLAG_BURNABLE == 0 {
+                    return TxResult::NoPermission;
+                }
+                let issuer = nftpage::issuer_of(&id);
+                if issuer != tx.account {
+                    if let Some(d) = sandbox.read(&keylet::account_root_key(&issuer)) {
+                        let sle: serde_json::Value = serde_json::from_slice(&d).unwrap_or_default();
+                        if sle.get("NFTokenMinter").and_then(decode_account_id) != Some(tx.account) {
+                            return TxResult::NoPermission;
+                        }
+                    }
+                }
+            }
+        }
         TxResult::Success
     }
 

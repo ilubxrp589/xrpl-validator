@@ -28,6 +28,14 @@ pub fn low96(id: &Hash256) -> [u8; 12] {
     b
 }
 
+/// The flag word embedded in an NFTokenID (bytes 0..2, big-endian):
+/// 0x0001 burnable, 0x0002 only-XRP, 0x0004 trust-line (retired),
+/// 0x0008 transferable (`nft::getFlags`).
+pub fn flags_of(id: &Hash256) -> u16 {
+    u16::from_be_bytes([id.0[0], id.0[1]])
+}
+pub const NFT_FLAG_BURNABLE: u16 = 0x0001;
+
 /// Issuer account embedded in an NFTokenID (bytes 4..24).
 pub fn issuer_of(id: &Hash256) -> [u8; 20] {
     let mut b = [0u8; 20];

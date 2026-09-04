@@ -67,9 +67,19 @@ fn nft_accept_line_is_byte_exact() {
     );
 
     for (k, want_hex) in bundle["expect"].as_object().unwrap() {
-        let ent = mods
-            .get(&key32(k))
-            .unwrap_or_else(|| panic!("target {k} must be written by the apply"));
+        // An expectation the apply did not write pins an object the
+        // transaction must leave ALONE: it passes when it equals the seated
+        // pre-image (finding 143's rule; finding 154's refused burn pins the
+        // owner's page and the issuer's root this way).
+        let Some(ent) = mods.get(&key32(k)) else {
+            let pre_hex = bundle["pre"][k].as_str().unwrap_or_default().trim().to_uppercase();
+            assert_eq!(
+                want_hex.as_str().unwrap().trim().to_uppercase(),
+                pre_hex,
+                "target {k} was not written by the apply and does not pin the untouched pre-image"
+            );
+            continue;
+        };
         let bytes = match ent {
             SandboxEntry::Created(b) | SandboxEntry::Modified(b) => b.clone(),
             SandboxEntry::Deleted => panic!("target {k} deleted?"),
@@ -123,9 +133,19 @@ fn run_bundle(bundle_json: &str) {
     );
 
     for (k, want_hex) in bundle["expect"].as_object().unwrap() {
-        let ent = mods
-            .get(&key32(k))
-            .unwrap_or_else(|| panic!("target {k} must be written by the apply"));
+        // An expectation the apply did not write pins an object the
+        // transaction must leave ALONE: it passes when it equals the seated
+        // pre-image (finding 143's rule; finding 154's refused burn pins the
+        // owner's page and the issuer's root this way).
+        let Some(ent) = mods.get(&key32(k)) else {
+            let pre_hex = bundle["pre"][k].as_str().unwrap_or_default().trim().to_uppercase();
+            assert_eq!(
+                want_hex.as_str().unwrap().trim().to_uppercase(),
+                pre_hex,
+                "target {k} was not written by the apply and does not pin the untouched pre-image"
+            );
+            continue;
+        };
         let bytes = match ent {
             SandboxEntry::Created(b) | SandboxEntry::Modified(b) => b.clone(),
             SandboxEntry::Deleted => panic!("target {k} deleted?"),
@@ -177,4 +197,14 @@ fn nft_accept_brokered_issuer_buyer_pays_no_royalty() {
 #[test]
 fn nft_accept_brokered_loop_is_cant_accept_own() {
     run_bundle(include_str!("vectors/nftaccept_brokered_loop_106714409.json"));
+}
+
+// Finding 154 — #106747838 EE7C95A6D70C: rDQ9jYQ1 burns a token owned by
+// rBpHoJQjj (Owner set) whose flag word is 0x0008 — transferable, not
+// burnable — so `NFTokenBurn::preclaim` refuses with tecNO_PERMISSION before
+// looking at the issuer's minter. We had no permission check. The owner's
+// last NFTokenPage and the issuer's root are pinned untouched.
+#[test]
+fn nft_burn_by_a_stranger_needs_a_burnable_token() {
+    run_bundle(include_str!("vectors/nft_burn_by_a_stranger_needs_a_burnable_token_106747838.json"));
 }
