@@ -143,6 +143,16 @@ fn offer_pass_quality_is_judged_with_its_pool_slice_106755996() {
     run_bundle(include_str!("vectors/offer_pass_quality_is_judged_with_its_pool_slice_106755996.json"));
 }
 
+/// Finding 160 (#106755998 A3D3541FD33F): rURtT5MM's tfSell 0.12393 BTC →
+/// RLUSD crosses one offer for 0.05880101336798101 BTC gross (rate 1.0015).
+/// The residual subtracts `divideRound(gross, rate, up)` — STAmount's lossy
+/// `divRound`, which truncates an 18-digit quotient to 17 before its
+/// ceiling — leaving 0.06521705604794707 to rest, repriced 5274.658319744447.
+/// The nearest-and-bump `mulRatio` model rested one ulp low on both sides.
+#[test]
+fn offer_sell_residual_uses_divround_106755998() {
+    run_bundle(include_str!("vectors/offer_sell_residual_uses_divround_106755998.json"));
+}
 
 #[test]
 fn offer_fill_line_recurrence_is_byte_exact() {

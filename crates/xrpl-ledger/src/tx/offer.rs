@@ -443,6 +443,46 @@ fn div_round_drops_strict_floor(a: Me, rate: Me) -> u128 {
     m
 }
 
+/// rippled `divRound(num, den, iouAsset, roundUp = true)` — the NON-strict
+/// one (`divRoundImpl<DontAffectNumberRoundMode>`, STAmount.cpp:1570), whose
+/// ceiling is LOSSY the same way `mul_round16_up`'s is: `muldivRound(num,
+/// 1e17, den, den − 1)` ceils the 17-18-digit quotient, then
+/// `canonicalizeRound` (:1329) TRUNCATES an 18-digit result to 17 digits and
+/// only then adds 9 and divides once more. Digit 18 never reaches the
+/// ceiling: a quotient …293|0|6 lands on …293 where a true ceiling says
+/// …294. This is `divideRound(amount, transferRate, asset, true)`
+/// (Rate2.cpp:80) — the "gateway fee divided back out" of a tfSell
+/// residual, OfferCreate.cpp:501.
+///
+/// Finding 160 (#106755998 A3D3541FD33F, rURtT5MM tfSell 0.12393 BTC →
+/// RLUSD, BTC rate 1.0015): the crossing debits 0.05880101336798101 gross;
+/// rippled's non-gateway in is …293 and the rested TakerGets
+/// 0.06521705604794707, repriced to 5274.658319744447. `mul_ratio`'s
+/// nearest-and-bump said …294 and we rested …706 / …446, one ulp low on
+/// both sides of the placed offer.
+fn div_round16_up(a: Me, rate: Me) -> Me {
+    let (a, r) = (norm16(a), norm16(rate));
+    if a.0 == 0 || r.0 == 0 {
+        return (0, 0);
+    }
+    const TEN17: u128 = 100_000_000_000_000_000;
+    const MAXV: u128 = 9_999_999_999_999_999;
+    // 16-digit mantissas: num < 1e33, quotient in (1e16, 1e18).
+    let num = a.0.saturating_mul(TEN17);
+    let mut m = (num + (r.0 - 1)) / r.0;
+    let mut e = a.1 - r.1 - 17;
+    if m > MAXV {
+        while m > 10 * MAXV {
+            m /= 10;
+            e += 1;
+        }
+        m += 9;
+        m /= 10;
+        e += 1;
+    }
+    (m, e)
+}
+
 /// rippled `divRoundStrict(num, rate, iouAsset, roundUp = false)` — 16-digit
 /// floor of the quotient.
 fn div_round16_down(a: Me, rate: Me) -> Me {
@@ -5049,10 +5089,12 @@ had_fill={} n={} keys={:?}",
     // the running subtraction left us at 200958.5430326276. tfSell subtracts
     // the non-gateway in (`divideRound(actualIn, xferRate, up)`), a buy
     // subtracts the out sum; the placement's rate arithmetic then follows.
+    // Finding 160: `divideRound(actualAmountIn, gatewayXferRate, asset,
+    // true)` is STAmount `divRound` — the lossy ceiling — not `mulRatio`.
     if crossed > 0 {
         if !gets_leg.xrp && !me_is_zero(rem_gets) {
             let spent = match fee_rate {
-                Some(r) => mul_ratio(in_gross_spent, 1_000_000_000, r as u128, true),
+                Some(r) => div_round16_up(in_gross_spent, (r as u128, -9)),
                 None => in_gross_spent,
             };
             let (neg, v) = stamount_signed_add(false, entry_gets, true, spent);
