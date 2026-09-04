@@ -2801,6 +2801,26 @@ impl PaymentTransactor {
         // strand delivered under DeliverMin and turned a tesSUCCESS into
         // tecPATH_PARTIAL.
         let mut multi_now = multi;
+        // Finding 151: rippled's `ActiveStrands` — the candidate set is `next_`,
+        // seeded with every strand and rebuilt each iteration from what the
+        // previous iteration PUSHED: the strand that produced (unless it went
+        // inactive) plus the strands behind it in that iteration's order
+        // (StrandFlow.h:730-733). A strand that flowed nothing, failed, or was
+        // rejected by limitQuality is simply not pushed and never returns;
+        // `activateNext` also drops a strand it cannot bound (or whose bound
+        // misses the limit) — but only when more than one strand is pending: a
+        // lone pending strand is activated unexamined (StrandFlow.h:475-512).
+        //
+        // #106743104 F80847602E68 (rLpnXUyv, 1.9M XRPH → RLUSD, 54 iterations):
+        // the direct strand goes dry after iteration 49 and rippled never looks
+        // at it again, so iterations 50-53 run a LONE strand — single-path
+        // pricing, the pool leg taken along the curve (118197.49 XRPH →
+        // 969.962495443). We re-admitted the dry strand whenever it could be
+        // bounded (every other round), flipped the pool to multi-path pricing
+        // at the anchored offer's own ratio, and took 13500.15 → 21.7125
+        // instead; the fills, the pool balances and the taker's line all part
+        // from there (190 mutations to mainnet's 181).
+        let mut next_set: Vec<usize> = (0..total_strands).collect();
         // EVERY strand re-enters, lone or not. This used to be `if multi`,
         // justified by "one call already sized it correctly" — which the AMM
         // once-per-iteration boundary in `cross_engine_to` FALSIFIES: a single
@@ -2866,8 +2886,10 @@ impl PaymentTransactor {
             // one of those trials was still INSIDE the 75.827 limit — nothing
             // was rejected, we simply re-ranked on a quantity that moves for
             // the wrong reason. An upper bound does not.
-            let order: Vec<usize> = if multi {
-                let mut c: Vec<(usize, ox::Me)> = (0..total_strands)
+            let order: Vec<usize> = if multi && next_set.len() > 1 {
+                let mut c: Vec<(usize, ox::Me)> = next_set
+                    .iter()
+                    .copied()
                     .filter_map(|i| {
                         if i < n_books {
                             // `activateNext` prices the strands with the PREVIOUS
@@ -2891,6 +2913,10 @@ impl PaymentTransactor {
                     eprintln!("DX_PAY   round={_round} order={:?}", c);
                 }
                 c.into_iter().map(|(i, _)| i).collect()
+            } else if multi {
+                // Finding 151: a lone pending strand (or none) is activated
+                // without evaluating its bound.
+                next_set.clone()
             } else {
                 vec![0]
             };
@@ -2935,7 +2961,8 @@ impl PaymentTransactor {
                 }
             }
             let mut applied: Option<(usize, ox::Me, ox::Me, bool, bool)> = None;
-            for &i in &order {
+            let mut applied_pos: Option<usize> = None;
+            for (pos, &i) in order.iter().enumerate() {
                 let try_snap = sandbox.snapshot();
                 let mut try_fib = amm_fib.clone();
                 // `ammContext.clear()` before every strand execution: the used
@@ -3076,9 +3103,16 @@ impl PaymentTransactor {
                 amm_fib.iters = crate::tx::amm_swap::amm_ctx_iters();
                 amm_fib.used = false;
                 applied = Some((i, sin, sout, in_gross, out_net));
+                applied_pos = Some(pos);
                 break;
             }
             let Some((pick, sin, sout, in_gross, out_net)) = applied else { break };
+            // Finding 151: the producing strand and the strands behind it are
+            // what the next iteration activates; everything tried before it
+            // flowed nothing and is gone.
+            if let Some(pos) = applied_pos {
+                next_set = order[pos..].to_vec();
+            }
             let _ = pick;
             if std::env::var("DX_PAY").is_ok() {
                 eprintln!("DX_PAY round={_round} strand={pick} sin={sin:?} sout={sout:?} rem_in={rem_in:?} rem_out={rem_out:?} multi={multi}");

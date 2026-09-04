@@ -367,3 +367,15 @@ fn payment_path_naming_the_sendmax_issuer_is_the_default_strand() {
 fn payment_first_pool_hop_is_sized_by_the_reverse_pass() {
     run_bundle(include_str!("vectors/payment_first_pool_hop_is_sized_by_the_reverse_pass_106743109.json"));
 }
+
+// Finding 151 — #106743104 F80847602E68 (rLpnXUyv, 1.9M XRPH → RLUSD, 54
+// flow iterations): rippled's `ActiveStrands` drops a strand for good once it
+// flows nothing (it is never pushed to `next_`), so iterations 50-53 run a
+// LONE strand under single-path pricing — the pool leg along the curve. We
+// re-admitted the dry direct strand every other round and priced the pool
+// leg multi-path at the anchored offer's ratio (13500.15 → 21.7125 where
+// mainnet takes 118197.49 → 969.962495443).
+#[test]
+fn payment_dry_strand_never_returns() {
+    run_bundle(include_str!("vectors/payment_dry_strand_never_returns_106743104.json"));
+}
