@@ -17,6 +17,21 @@ const WS_ENDPOINTS: &[&str] = &[
     "wss://s1.ripple.com:51233",   // Ripple's public WS
 ];
 
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Seconds since a fallback stint began (0 when not on a fallback).
+fn stint_secs(since_millis: u64) -> f64 {
+    if since_millis == 0 {
+        return 0.0;
+    }
+    now_millis().saturating_sub(since_millis) as f64 / 1000.0
+}
+
 /// A resilient RPC client that automatically fails over between endpoints.
 #[derive(Clone)]
 pub struct RippledClient {
@@ -31,8 +46,14 @@ pub struct RippledClient {
     pub total_failovers: Arc<AtomicU64>,
     /// Whether we're currently on a fallback endpoint.
     pub on_fallback: Arc<AtomicBool>,
-    /// Consecutive successes on current endpoint (used to try switching back to primary).
+    /// Successes on the CURRENT fallback stint (reset on every failover and
+    /// on every flip back to the primary); drives the periodic retry.
     consecutive_ok: Arc<AtomicU64>,
+    /// Unix millis when the current fallback stint began (0 = on primary).
+    fallback_since: Arc<AtomicU64>,
+    /// Set when the client has flipped back to the primary and is waiting for
+    /// its first answer — the next primary success reports the recovery.
+    probing_primary: Arc<AtomicBool>,
     /// Optional env-var override for primary RPC URL.
     rpc_override: Option<String>,
     /// Optional env-var override for primary WS URL.
@@ -61,6 +82,8 @@ impl RippledClient {
             total_failovers: Arc::new(AtomicU64::new(0)),
             on_fallback: Arc::new(AtomicBool::new(false)),
             consecutive_ok: Arc::new(AtomicU64::new(0)),
+            fallback_since: Arc::new(AtomicU64::new(0)),
+            probing_primary: Arc::new(AtomicBool::new(false)),
             rpc_override,
             ws_override,
         }
@@ -118,9 +141,22 @@ impl RippledClient {
                             // Success — update active endpoint if we failed over
                             if attempt > 0 {
                                 self.active_rpc.store(idx as u64, Ordering::Relaxed);
-                                self.on_fallback.store(idx > 0, Ordering::Relaxed);
+                                let was_on_fallback = self.on_fallback.swap(idx > 0, Ordering::Relaxed);
                                 self.total_failovers.fetch_add(1, Ordering::Relaxed);
+                                self.probing_primary.store(false, Ordering::Relaxed);
+                                // A new fallback stint: count its successes and its
+                                // clock from here, not from process start.
+                                if idx > 0 && !was_on_fallback {
+                                    self.consecutive_ok.store(0, Ordering::Relaxed);
+                                    self.fallback_since.store(now_millis(), Ordering::Relaxed);
+                                }
                                 eprintln!("[rpc] Failover to {} (attempt {})", url, attempt + 1);
+                            } else if idx == 0 && self.probing_primary.swap(false, Ordering::Relaxed) {
+                                let since = self.fallback_since.swap(0, Ordering::Relaxed);
+                                eprintln!(
+                                    "[rpc] Primary endpoint healthy again after {:.1}s on fallback",
+                                    stint_secs(since)
+                                );
                             }
 
                             // Periodically try to switch back to primary
@@ -129,7 +165,12 @@ impl RippledClient {
                                 // Try primary again
                                 self.active_rpc.store(0, Ordering::Relaxed);
                                 self.on_fallback.store(false, Ordering::Relaxed);
-                                eprintln!("[rpc] Trying primary endpoint again after {ok} successes on fallback");
+                                self.probing_primary.store(true, Ordering::Relaxed);
+                                self.consecutive_ok.store(0, Ordering::Relaxed);
+                                eprintln!(
+                                    "[rpc] Trying primary endpoint again after {ok} successes and {:.1}s on fallback",
+                                    stint_secs(self.fallback_since.load(Ordering::Relaxed))
+                                );
                             }
 
                             return Ok(json);
