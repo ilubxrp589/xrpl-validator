@@ -132,3 +132,13 @@ fn amm_deposit_one_drop_whose_tokens_round_away_is_invalid_tokens() {
     run_bundle(include_str!("vectors/amm_deposit_single_asset_dust_106724081.json"));
 }
 
+
+// Finding 155 — #106748884 089332F8CBDA (rn5eEXkk, tfTwoAsset: 27 XRP +
+// 62,780,683.698714 SEAL with LPTokenOut 12,238,246.4983469): on the two-asset
+// path the field is only a minimum; rippled mints the rounded proportional
+// 12,299,745.22446 tokens. We minted the minimum, leaving the pool's
+// LPTokenBalance and the depositor's LP line 61,498 tokens short.
+#[test]
+fn amm_two_asset_deposit_lptokenout_is_a_minimum() {
+    run_bundle(include_str!("vectors/amm_two_asset_deposit_lptokenout_is_a_minimum_106748884.json"));
+}

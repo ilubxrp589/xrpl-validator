@@ -939,6 +939,25 @@ impl Transactor for AMMDepositTransactor {
                             Some(triple) => sized = Some(triple),
                             None => return TxResult::AmmFailed,
                         }
+                        // Finding 155: on this path `LPTokenOut` is only a MINIMUM
+                        // (`equalDepositLimit(…, lpTokensDepositMin, …)` and
+                        // `deposit()`: `lpTokensDepositActual < lpTokensDepositMin`
+                        // → tecAMM_FAILED, before anything moves); the tokens
+                        // minted are the rounded proportional amount, never the
+                        // field. #106748884 089332F8CBDA (rn5eEXkk: 27 XRP +
+                        // 62,780,683.698714 SEAL, LPTokenOut 12,238,246.4983469):
+                        // mainnet mints 12,299,745.22446 (LPTokenBalance
+                        // 11664921677.5991 → 11677221422.82356); we minted the
+                        // minimum and left the pool and the LP line 61,498
+                        // tokens short.
+                        if let (Some((_, _, t)), Some(min)) = (
+                            sized,
+                            tx.fields.get("LPTokenOut").and_then(keylet::amount_mant_exp).filter(|m| m.0 > 0),
+                        ) {
+                            if ox::me_cmp(t, min).is_lt() {
+                                return TxResult::AmmFailed;
+                            }
+                        }
                     }
                 }
             }
@@ -1135,12 +1154,12 @@ impl Transactor for AMMDepositTransactor {
         // unconditionally. That is deliberate: the line KEY is what the
         // key-level gate needs, and the magnitude shows up under DX_VALCHECK
         // until each mode's formula lands.
-        let minted = tx
-            .fields
-            .get("LPTokenOut")
-            .and_then(keylet::amount_mant_exp)
-            .filter(|m| m.0 > 0)
-            .or_else(|| sized.map(|(_, _, t)| t).filter(|t| t.0 > 0))
+        // Finding 155: a two-asset deposit mints its SIZED tokens; the field
+        // is a floor there (checked above). The other modes keep the field.
+        let minted = sized
+            .map(|(_, _, t)| t)
+            .filter(|t| t.0 > 0)
+            .or_else(|| tx.fields.get("LPTokenOut").and_then(keylet::amount_mant_exp).filter(|m| m.0 > 0))
             .or_else(|| single_adj.map(|(_, t)| t))
             .unwrap_or((1_000_000_000_000_000, -8));
         // Finding 36 (#106644320 749D3E45): a deposit into an EMPTY pool
