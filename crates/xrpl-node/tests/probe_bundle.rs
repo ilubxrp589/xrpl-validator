@@ -89,7 +89,16 @@ fn probe_bundle() {
     }
     let mut bad = 0;
     for (k, want_hex) in bundle["expect"].as_object().unwrap() {
+        // Deletion pin (finding 158): an EMPTY expectation says mainnet's
+        // meta deleted this object in this transaction, so the apply must
+        // delete it too.
+        let want_deleted = want_hex.as_str().unwrap_or_default().trim().is_empty();
         let Some(ent) = mods.get(&key32(k)) else {
+            if want_deleted {
+                println!("PROBE {k}: NOT DELETED (not written)");
+                bad += 1;
+                continue;
+            }
             // Untouched-object pin: an expectation equal to the seated
             // pre-image says the transaction must leave the object alone.
             let pre_hex = bundle["pre"][k].as_str().unwrap_or_default().trim().to_uppercase();
@@ -102,10 +111,21 @@ fn probe_bundle() {
             continue;
         };
         let bytes = match ent {
-            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => b.clone(),
+            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => {
+                if want_deleted {
+                    println!("PROBE {k}: NOT DELETED (written)");
+                    bad += 1;
+                    continue;
+                }
+                b.clone()
+            }
             SandboxEntry::Deleted => {
-                println!("PROBE {k}: DELETED");
-                bad += 1;
+                if want_deleted {
+                    println!("PROBE {k}: DELETED (as expected)");
+                } else {
+                    println!("PROBE {k}: DELETED");
+                    bad += 1;
+                }
                 continue;
             }
         };

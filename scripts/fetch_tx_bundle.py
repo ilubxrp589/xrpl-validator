@@ -356,6 +356,11 @@ def main():
                 r = rpc("ledger_entry", {"index": li, "ledger_index": seq - 1, "binary": True})
                 if r.get("node_binary"):
                     pre[li] = r["node_binary"]
+            if kind == "DeletedNode" and (not want_targets or li in want_targets):
+                # Deletion pin (finding 158): an EMPTY expectation tells the
+                # harnesses the apply must delete this object.
+                targets[li] = ""
+                continue
             if kind != "DeletedNode" and (not want_targets or li in want_targets):
                 if li in touched_later:
                     print(f"note: target {li[:16]}… dropped (touched by a LATER tx; post-ledger image is not this tx's)")

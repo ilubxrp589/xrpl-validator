@@ -73,12 +73,16 @@ fn run_bundle(bundle_json: &str) {
     );
 
     for (k, want_hex) in bundle["expect"].as_object().unwrap() {
+        // An EMPTY expectation is a deletion pin (finding 158): mainnet's
+        // meta deleted the object in this transaction, so must the apply.
+        let want_deleted = want_hex.as_str().unwrap().trim().is_empty();
         // An expectation the apply did not write is legitimate only when it
         // pins an object the transaction must leave ALONE: its post-image is
         // then its pre-image, and the vector says so by expecting exactly
         // the seated bytes (finding 143 — the taker's own bid beyond the
         // ask's limit, which mainnet never names).
         let Some(ent) = mods.get(&key32(k)) else {
+            assert!(!want_deleted, "target {k} must be deleted by the apply, which never wrote it");
             let pre_hex = bundle["pre"][k].as_str().unwrap_or_default().trim().to_uppercase();
             assert_eq!(
                 want_hex.as_str().unwrap().trim().to_uppercase(),
@@ -88,8 +92,14 @@ fn run_bundle(bundle_json: &str) {
             continue;
         };
         let bytes = match ent {
-            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => b.clone(),
-            SandboxEntry::Deleted => panic!("target {k} deleted?"),
+            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => {
+                assert!(!want_deleted, "target {k} must be deleted by the apply, which wrote it instead");
+                b.clone()
+            }
+            SandboxEntry::Deleted => {
+                assert!(want_deleted, "target {k} deleted?");
+                continue;
+            }
         };
         let mut jv: Value = serde_json::from_slice(&bytes).unwrap();
         canon_for_encode(&mut jv);
@@ -106,6 +116,19 @@ fn run_bundle(bundle_json: &str) {
 #[test]
 fn offer_fill_line_is_byte_exact() {
     run_bundle(include_str!("vectors/offer_ulp_106679738.json"));
+}
+
+/// Finding 158 (#106755558 15B9744CE01E): rw7nJtEN sells 256225 BBRL for
+/// 50000 RLUSD; the direct tip is its own 20000 RLUSD bid at 5.1232 and the
+/// next level its own bid at 5.1238, both inside the 5.1243 limit. rippled's
+/// `execOffer` removes the first and, with nothing attempted yet, resets the
+/// level quality and removes the second as well — two offers and two book
+/// pages gone, nothing crossed, the rest placed. We removed the tip alone.
+#[test]
+fn offer_self_cross_removes_every_self_offer_inside_the_limit_106755558() {
+    run_bundle(include_str!(
+        "vectors/offer_self_cross_removes_every_self_offer_inside_the_limit_106755558.json"
+    ));
 }
 
 #[test]

@@ -2840,6 +2840,21 @@ fn settle_fill(
 /// (offers.step()); }`). The pool therefore gets its turn FIRST, and an order
 /// the pool fills on its own removes nothing at all. Call sites must preserve
 /// that order.
+///
+/// Finding 158 (#106755558 15B9744CE01E, rw7nJtEN selling 256225 BBRL for
+/// 50000 RLUSD at 5.1243): the tip is the taker's own 20000 RLUSD bid at
+/// 5.1232 and the next level its own bid at 5.1238 — both inside the limit.
+/// `execOffer` removes the first with `offerAttempted` still false, so
+/// `ofrQ = std::nullopt` ("it's okay to move to a different quality"), steps
+/// onto the second and removes that too; only a foreign offer ends the walk.
+/// Mainnet deletes both offers and both book pages and crosses nothing; we
+/// removed the tip alone and carried an owner-directory entry and an
+/// OwnerCount unit too many. The walk is a RUN from the ladder's head: gone,
+/// foreign-typed and expired entries are stepped past exactly as the raw-tip
+/// peek steps past them (an expired offer never reaches `execOffer`), a
+/// self-offer beyond the limit fails `limitSelfCrossQuality` (b) and then
+/// `checkQualityThreshold`, ending the pass with the offer in place.
+/// Returns how many offers it removed.
 fn reap_self_offers_at_head(
     sandbox: &mut Sandbox,
     ladder: &[(u64, Hash256)],
@@ -2847,25 +2862,34 @@ fn reap_self_offers_at_head(
     taker: &[u8; 20],
     threshold: u64,
     stale: &mut Vec<Hash256>,
-) {
+) -> usize {
+    let close_time = sandbox.base().header.close_time as u64;
+    let mut removed = 0;
     for &(q, okey) in ladder.iter().skip(start) {
         if q > threshold {
-            return;
+            return removed;
         }
         let Some(offer) = json_at(sandbox, &okey) else { continue };
         if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
             continue;
+        }
+        if let Some(exp) = offer.get("Expiration").and_then(|v| v.as_u64()) {
+            if exp != 0 && close_time >= exp {
+                continue;
+            }
         }
         let Some(maker) = offer.get("Account").and_then(|v| v.as_str()).and_then(decode20)
         else { continue };
         // Stops at the first offer that is not ours: rippled removes only what
         // sits AT the tip, then crosses whatever it uncovers.
         if &maker != taker {
-            return;
+            return removed;
         }
         delete_maker_offer(sandbox, &okey, &offer, &maker);
         stale.push(okey);
+        removed += 1;
     }
+    removed
 }
 
 fn cross_bridged(
@@ -3657,10 +3681,15 @@ thr={t:?} admits_trunc={} admits_up={}",
             // takes the 5.1196-anchored 0.000746 RLUSD, iteration 5 finds the
             // spot already there — "changeSpotPrice calc failed" — steps onto
             // the self tip, removes it and goes dry).
-            if let Some((sq, skey, soffer)) = raw_self_tip.as_ref() {
+            // Finding 158: `execOffer` does not stop at the tip — every
+            // consecutive self-offer inside the limit goes with it (the level
+            // quality resets after each removal while nothing was attempted).
+            if let Some((sq, ..)) = raw_self_tip.as_ref() {
                 if !direct_dry && !multi_now && threshold != u64::MAX && *sq <= threshold_self && !used {
-                    delete_maker_offer(sandbox, skey, soffer, taker);
-                    stale.push(*skey);
+                    let removed = reap_self_offers_at_head(sandbox, &ld, 0, taker, threshold_self, stale);
+                    if std::env::var("DX_RM").is_ok() {
+                        eprintln!("DX_RM SELF-RUN removed={removed} tip_q={sq:016x} thr_self={threshold_self:016x}");
+                    }
                     direct_dry = true;
                 }
             }
@@ -3705,7 +3734,7 @@ thr={t:?} admits_trunc={} admits_up={}",
         // reaps the tip self-offers the moment that strand runs, whether or
         // not its pass is kept — rippled's `permRmOffer` lands in
         // `ofrsToRm`, "rm bad offers even if the strand fails".
-        let _ = (&pool_offer_this_round, reap_self_offers_at_head as fn(&mut Sandbox, &[(u64, Hash256)], usize, &[u8; 20], u64, &mut Vec<Hash256>));
+        let _ = &pool_offer_this_round;
         // Choose on what each candidate REALISES, not on its marginal rate.
         // A source's marginal quality prices that source's own slice; the pass
         // moves a different (usually much smaller) amount and prices better.
