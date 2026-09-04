@@ -5104,6 +5104,13 @@ pub(crate) fn cross_engine_to_net(
     // …550) is exactly that difference.
     let mut level_ins: Vec<Me> = Vec::new();
     let mut in_fold_off = false;
+    // Finding 149: the level's CLOB fills in book order —
+    // (maker, give, pay, full, ownerGives, out-rate, level q) — for the
+    // limiting-pass re-execution at the level boundary (`reexec_level!`).
+    // `full` = the fill went through neither `limitStepOut` (`buy_bound`)
+    // nor `limitStepIn` (`taker_clamped`): the reverse pass took the whole
+    // (funded) offer.
+    let mut level_fills: Vec<([u8; 20], Me, Me, bool, Me, Option<u64>, u64)> = Vec::new();
     fn fold16(v: &mut Vec<Me>) -> Me {
         v.sort_by(|a, b| me_cmp(*a, *b));
         let mut t: Me = (0, 0);
@@ -5236,6 +5243,89 @@ pub(crate) fn cross_engine_to_net(
             }
             // Finding 133: the iteration's debit total joins the outer table.
             outer_debits = stamount_signed_add(false, outer_debits, false, taker_accs.1).1;
+        };
+    }
+    // Finding 149 — rippled re-runs a LIMITING book pass in reverse with the
+    // pass's own 16-digit total as the target (StrandFlow.h:176-184: "Throw
+    // out previous results … re-execute the limiting step", `stepOut =
+    // r.second`), and that second run derives the pass's LAST offer from the
+    // remainder `out − sum(savedOuts)` (BookStep.cpp:1042 `remainingOut =
+    // out − result.out`, then the `limitStepOut` branch) instead of from the
+    // offer's own amounts. A level whose every offer was consumed in full is
+    // limiting whenever the taker asked for more than the level held — every
+    // tfSell, whose `out` is the 4999999999999999e80 sentinel — so the last
+    // maker delivers `total16 − Σprev`, one ulp short of its TakerGets when
+    // the level's ascending fold rounded down, for the same input
+    // (`limitStepOut`: `ofrAmt = offer.limitOut(out', roundUp = true)`,
+    // `ownerGives = mulRatio(out', trOut, roundUp = false)`).
+    //
+    // #106743984 12111F1FB0FA (rwKpr5aUr3bV, tfSell|FoK, 1170 XRP → RLUSD):
+    // the level's two offers deliver 752.7065985500001 (79F4) and 725 (5FD7);
+    // the fold is 1477.70659855, so the re-run asks 5FD7 for
+    // 1477.70659855 − 752.7065985500001 = 724.9999999999999 against its whole
+    // 500,000,000 drops — mainnet's "accountSendIOU: rLguUzb → rMxCK :
+    // 724.9999999999999" (the first run's line 55 sent 725) — and the maker's
+    // line lands 745.5000000000001 where we wrote 745.5.
+    //
+    // A fill trimmed by the taker's out (`buy_bound`) or in (`taker_clamped`)
+    // went through `limitStepOut`/`limitStepIn`, whose branch sets
+    // `result.out = out` — such a pass is never limiting and the first run
+    // stands. XRP outs fold exactly. A pool slice is its own pass
+    // (BookStep.cpp:818, finding 133) and never joins a level's fold. The
+    // re-run's input is checked against the first run's: a re-priced input
+    // (possible only on a funding-clamped or IOU-in offer at the rounding
+    // cusp) would leave the offer alive with a dust residual — not modelled,
+    // DX_REEXEC names it.
+    macro_rules! reexec_level {
+        () => {
+            if fold_rem && !pays_leg.xrp && level_fills.len() >= 2 && level_fills.iter().all(|f| f.3) {
+                let mut all: Vec<Me> = level_fills.iter().map(|f| f.1).collect();
+                let total16 = fold16(&mut all);
+                let mut prefix: Vec<Me> = level_fills[..level_fills.len() - 1].iter().map(|f| f.1).collect();
+                let (neg, rem_last) = stamount_signed_add(false, total16, true, fold16(&mut prefix));
+                if let Some((maker_l, give_l, pay_l, _, gg_l, orate_l, q_l)) = level_fills.last().copied() {
+                    if !neg && me_cmp(rem_last, give_l).is_lt() {
+                        // `ceilOutImpl` (Quality.cpp:70-77): the re-priced
+                        // input is `mulRoundStrict(limit, rate, roundUp)`
+                        // CLAMPED to the offer's own input — the page rate is
+                        // a 16-digit ceiling of the offer's ratio, so the
+                        // strict product of a whole offer's out overshoots
+                        // its in by a unit (500,000,001 for 5FD7 above).
+                        let mut in2 = if gets_leg.xrp {
+                            (mul_round_drops_strict(rem_last, rate_me(q_l), true), 0)
+                        } else {
+                            mul_round16_up(rem_last, rate_me(q_l))
+                        };
+                        if me_cmp(in2, pay_l).is_gt() {
+                            in2 = pay_l;
+                        }
+                        if std::env::var("DX_REEXEC").is_ok() {
+                            eprintln!(
+                                "DX_REEXEC n={} total16={total16:?} rem_last={rem_last:?} give={give_l:?} pay={pay_l:?} in2={in2:?} apply={}",
+                                level_fills.len(),
+                                me_cmp(in2, pay_l).is_eq()
+                            );
+                        }
+                        if me_cmp(in2, pay_l).is_eq() {
+                            let gg2 = match orate_l {
+                                None => rem_last,
+                                Some(r) => mul_ratio(rem_last, r as u128, 1_000_000_000, false),
+                            };
+                            let (dneg, dgg) = stamount_signed_add(false, gg_l, true, gg2);
+                            if !dneg && !me_is_zero(dgg) {
+                                line_adjust(sandbox, &maker_l, pays_leg, dgg, true);
+                            }
+                            let delta = stamount_signed_add(false, give_l, true, rem_last).1;
+                            // The pass's out is `out` = total16 — the closing
+                            // DirectStep credits exactly that.
+                            taker_accs.0 = total16;
+                            level_out_acc = total16;
+                            rem_pays = stamount_signed_add(false, rem_pays, false, delta).1;
+                        }
+                    }
+                }
+            }
+            level_fills.clear();
         };
     }
     // AMM for the pair competes with the book at every quality level
@@ -6387,6 +6477,16 @@ pub(crate) fn cross_engine_to_net(
                     level_ins.push(pay);
                     level_in_acc = stamount_signed_add(false, level_in_acc, false, pay).1;
                 }
+                // Finding 149: the level's fill record (see `reexec_level!`).
+                level_fills.push((
+                    maker,
+                    give,
+                    pay,
+                    !buy_bound && !taker_clamped,
+                    if pays_leg.xrp { give } else { owner_gives(w_orate, give, funded, funded_raw) },
+                    w_orate,
+                    q,
+                ));
                 crossed += 1;
                 level_crossed = true;
                 self_anchor_q = None;
@@ -6461,6 +6561,10 @@ pub(crate) fn cross_engine_to_net(
                     if buy_bound && !consumed {
                         break 'dirs;
                     }
+                    // Finding 149: the pass that satisfied the taker is still
+                    // re-run when it was limiting (a sell whose budget ends
+                    // exactly on a full fill).
+                    reexec_level!();
                     trailing = true;
                     continue;
                 }
@@ -6485,6 +6589,8 @@ pub(crate) fn cross_engine_to_net(
             trailing = true;
             continue;
         }
+        // Finding 149: re-run a limiting level before banking it.
+        reexec_level!();
         // Level boundary = iteration boundary: bank the level's actualOut and
         // re-derive the remainder from the fold (StrandFlow.h:639-642).
         if fold_rem && !me_is_zero(level_out_acc) {
@@ -6502,6 +6608,8 @@ pub(crate) fn cross_engine_to_net(
         }
         prev_level_crossed = level_crossed;
     }
+    // Finding 149: a level left through a `break` still gets its re-run.
+    reexec_level!();
     // A single pass whose level boundary tripped exits before the tail turn.
     if single_pass && trailing {
         settle_taker!();

@@ -714,3 +714,14 @@ fn offer_direct_pool_is_consulted_only_if_its_strand_survives_activation() {
 fn offer_residual_is_the_original_minus_the_summed_ins() {
     run_bundle(include_str!("vectors/offer_residual_is_original_minus_the_summed_ins_106742463.json"));
 }
+
+// Finding 149 — #106743984 12111F1FB0FA (rwKpr5aUr3bV, tfSell|FoK, 1170 XRP
+// → RLUSD): a level whose every offer is consumed in full is a LIMITING pass,
+// and rippled re-runs it in reverse with the level's own 16-digit total as
+// the target; the re-run trims the last maker to `total16 − Σprev`
+// (724.9999999999999 for 5FD7's whole 500,000,000 drops, its line
+// 745.5000000000001) — the input capped at the offer's own (`ceilOutImpl`).
+#[test]
+fn offer_limiting_level_rerun_reprices_the_last_maker() {
+    run_bundle(include_str!("vectors/offer_limiting_level_rerun_reprices_the_last_maker_106743984.json"));
+}
