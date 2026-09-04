@@ -5329,6 +5329,19 @@ pub(crate) fn cross_engine_to_net(
     //   #106455038 136FE701  X|C|X   (anchored slice, fill, tail slice)
     let mut taker_accs: (Me, Me) = ((0, 0), (0, 0));
     let mut acc_level: Option<u64> = None;
+    // Finding 159 (#106755996 D84E769E7583, rhhh49pF tfIoC 21.88 XRP → CNY):
+    // rippled judges `limitQuality` on the ITERATION's totals — the pool
+    // slice `tryAMM` took at the level head PLUS every fill `execOffer`
+    // made at that level, one `forEachOffer` call (StrandFlow.h "Path
+    // rejected by limitQuality", q = Quality(f.out, f.in)). The specimen's
+    // slice lands a hair inside the limit (6980735 drops for 67.015056 CNY)
+    // and the tip fill a hair outside it (14899265 for 143.032939624, the
+    // drop ceiling), and together they are EXACTLY the taker's 21880000 for
+    // 210.047995624. Judged on the fill alone we rejected it and crossed the
+    // pool only: the maker's offer, line and root untouched, three nodes
+    // short. (net in, out) of the current pass; the slice seeds it, a new
+    // level with fills of its own resets it.
+    let mut pass_tot: (Me, Me) = ((0, 0), (0, 0));
     macro_rules! settle_taker {
         () => {
             if !me_is_zero(taker_accs.0) {
@@ -5620,6 +5633,8 @@ pub(crate) fn cross_engine_to_net(
                 gets_gross_cap.map(|c| me_sub(c, in_gross_spent)), rem_pays, rem_gets,
                 pays_leg, gets_leg, threshold, threshold_self, sell, Some(q), pay_in_rate,
             );
+            // Finding 159: the slice opens this pass's totals.
+            pass_tot = if used { (me_sub(rem_gets, rg), me_sub(rem_pays, rp)) } else { ((0, 0), (0, 0)) };
             if used {
                 // Mirror of the slice settlement's own gross (settle_slice):
                 // exhausting rem_gets takes the remaining cap, else gross_in.
@@ -6468,13 +6483,20 @@ pub(crate) fn cross_engine_to_net(
                 // the check then stranded #105672435 B409D45C. With the input
                 // rounding following rev/fwd correctly that overcharge is gone,
                 // so the check can be what rippled's is: always, and exact.
+                // Finding 159: a fill that opens a new level without a pool
+                // turn opens a new iteration — nothing carries over.
+                if acc_level.is_some_and(|l| l != q) {
+                    pass_tot = ((0, 0), (0, 0));
+                }
+                let tot_in = stamount_signed_add(false, pass_tot.0, false, pay).1;
+                let tot_out = stamount_signed_add(false, pass_tot.1, false, give).1;
                 if thr_judge != u64::MAX && !me_is_zero(give) && !me_is_zero(pay) {
                     if std::env::var("DX_JUDGE").is_ok() {
-                        eprintln!("DX_JUDGE give={give:?} pay={pay:?} ach={:?} thr={thr_judge} reject={}",
-                            rate_of_me(pay, give),
-                            rate_of_me(pay, give).is_some_and(|a| a > thr_judge));
+                        eprintln!("DX_JUDGE give={give:?} pay={pay:?} tot_in={tot_in:?} tot_out={tot_out:?} ach={:?} thr={thr_judge} reject={}",
+                            rate_of_me(tot_in, tot_out),
+                            rate_of_me(tot_in, tot_out).is_some_and(|a| a > thr_judge));
                     }
-                    if let Some(ach) = rate_of_me(pay, give) {
+                    if let Some(ach) = rate_of_me(tot_in, tot_out) {
                         if ach > thr_judge {
                             // A rejected pass ends the crossing outright —
                             // rippled logs "All strands dry" and its Total flow
@@ -6499,6 +6521,8 @@ pub(crate) fn cross_engine_to_net(
                     acc_level = Some(q);
                     drained_level.clear();
                 }
+                // Finding 159: the accepted fill joins the pass's totals.
+                pass_tot = (tot_in, tot_out);
                 // Maker debited per fill; the taker's credit accumulates for
                 // the per-level settlement (see `taker_accs` above). The
                 // IOU split is exactly `move_leg`'s own two `line_adjust`s

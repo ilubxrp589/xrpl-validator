@@ -131,6 +131,19 @@ fn offer_self_cross_removes_every_self_offer_inside_the_limit_106755558() {
     ));
 }
 
+/// Finding 159 (#106755996 D84E769E7583): rhhh49pF's tfIoC sells 21.88 XRP
+/// for 210.047995624 CNY. The XRP/CNY pool's anchored slice (6980735 drops
+/// for 67.015056) sits a hair inside the limit and the tip's partial fill
+/// (14899265 drops for 143.032939624, the drop ceiling) a hair outside it;
+/// together they are exactly the taker's amounts. rippled judges the
+/// iteration's totals and fills; judged on the fill alone we crossed the
+/// pool and left the maker's offer, line and root untouched.
+#[test]
+fn offer_pass_quality_is_judged_with_its_pool_slice_106755996() {
+    run_bundle(include_str!("vectors/offer_pass_quality_is_judged_with_its_pool_slice_106755996.json"));
+}
+
+
 #[test]
 fn offer_fill_line_recurrence_is_byte_exact() {
     run_bundle(include_str!("vectors/offer_ulp_106679743.json"));
