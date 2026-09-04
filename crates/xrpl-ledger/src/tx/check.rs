@@ -142,7 +142,14 @@ impl Transactor for CheckCreateTransactor {
                 }
             }
         }
-        // NOT modelled: the Expiration → tecEXPIRED check (no failing ledger yet).
+        // Finding 152: `hasExpired(ctx.view, ctx.tx[~sfExpiration])` — a check
+        // created already expired is tecEXPIRED (CheckCreate.cpp:179-183); the
+        // same parentCloseTime >= Expiration rule CheckCash applies.
+        if let Some(exp) = tx.fields.get("Expiration").and_then(|v| v.as_u64()) {
+            if exp != 0 && sandbox.base().header.close_time as u64 >= exp {
+                return TxResult::Expired;
+            }
+        }
         TxResult::Success
     }
 
@@ -290,6 +297,18 @@ impl Transactor for CheckCashTransactor {
         };
         if dest != tx.account {
             return TxResult::NoPermission;
+        }
+        // Finding 152: `hasExpired(view, sleCheck->at(~sfExpiration))` —
+        // parentCloseTime >= Expiration is tecEXPIRED (CheckCash.cpp:132-136),
+        // judged after the destination and before any funds move.
+        // #106744882 0BFD2FD7C45E (rJPSUEG8 cashing 8B269A63 for 25 FLL, and
+        // again at #106744885): the check had expired; mainnet returns
+        // tecEXPIRED and touches nothing but the fee, we cashed it — nine
+        // mutations mainnet never made.
+        if let Some(exp) = check.get("Expiration").and_then(|v| v.as_u64()) {
+            if exp != 0 && sandbox.base().header.close_time as u64 >= exp {
+                return TxResult::Expired;
+            }
         }
 
         // Get the check creator
