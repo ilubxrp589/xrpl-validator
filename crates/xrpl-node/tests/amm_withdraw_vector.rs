@@ -62,9 +62,19 @@ fn withdraw_all_line_is_byte_exact() {
     );
 
     for (k, want_hex) in bundle["expect"].as_object().unwrap() {
-        let ent = mods
-            .get(&key32(k))
-            .unwrap_or_else(|| panic!("target {k} must be written by the apply"));
+        // An expectation the apply did not write pins an object the
+        // transaction must leave ALONE: it passes when it equals the seated
+        // pre-image (finding 143's rule; finding 156's refused withdraw pins
+        // the pool and its lines this way).
+        let Some(ent) = mods.get(&key32(k)) else {
+            let pre_hex = bundle["pre"][k].as_str().unwrap_or_default().trim().to_uppercase();
+            assert_eq!(
+                want_hex.as_str().unwrap().trim().to_uppercase(),
+                pre_hex,
+                "target {k} was not written by the apply and does not pin the untouched pre-image"
+            );
+            continue;
+        };
         let bytes = match ent {
             SandboxEntry::Created(b) | SandboxEntry::Modified(b) => b.clone(),
             SandboxEntry::Deleted => panic!("target {k} deleted?"),
@@ -126,9 +136,19 @@ fn run_bundle(bundle_json: &str) {
     );
 
     for (k, want_hex) in bundle["expect"].as_object().unwrap() {
-        let ent = mods
-            .get(&key32(k))
-            .unwrap_or_else(|| panic!("target {k} must be written by the apply"));
+        // An expectation the apply did not write pins an object the
+        // transaction must leave ALONE: it passes when it equals the seated
+        // pre-image (finding 143's rule; finding 156's refused withdraw pins
+        // the pool and its lines this way).
+        let Some(ent) = mods.get(&key32(k)) else {
+            let pre_hex = bundle["pre"][k].as_str().unwrap_or_default().trim().to_uppercase();
+            assert_eq!(
+                want_hex.as_str().unwrap().trim().to_uppercase(),
+                pre_hex,
+                "target {k} was not written by the apply and does not pin the untouched pre-image"
+            );
+            continue;
+        };
         let bytes = match ent {
             SandboxEntry::Created(b) | SandboxEntry::Modified(b) => b.clone(),
             SandboxEntry::Deleted => panic!("target {k} deleted?"),
@@ -203,4 +223,14 @@ fn amm_withdraw_all_burn_rounds_the_pool_balance_to_nearest() {
 #[test]
 fn amm_withdraw_two_asset_both_orderings_overshoot_is_amm_failed() {
     run_bundle(include_str!("vectors/amm_withdraw_two_asset_limits_fail_106720743.json"));
+}
+
+// Finding 156 — #106752895 BFEB6847B8E9 (rJd4HMcu, tfSingleAsset withdraw of
+// 22,222,222 FUZZY with no FUZZY trust line): rippled's `sufficientReserve`
+// charges a new object's reserve against the pre-fee balance and refuses with
+// tecINSUFFICIENT_RESERVE; we created the line and paid out. The pool, its
+// lines and the LP line are pinned untouched.
+#[test]
+fn amm_withdraw_needs_reserve_for_a_new_line() {
+    run_bundle(include_str!("vectors/amm_withdraw_needs_reserve_for_a_new_line_106752895.json"));
 }

@@ -1490,6 +1490,29 @@ fn payout_proportional_to(
 
 pub struct AMMWithdrawTransactor;
 
+/// Finding 156 — `AMMWithdraw::withdraw`'s `sufficientReserve` (fixAMMv1_2):
+/// an IOU the account holds NO trust line for costs a new object, and the
+/// check is TrustSet's — nothing owed while the account owns fewer than two
+/// objects, else base + increment × (OwnerCount + 1) — against the balance
+/// BEFORE the fee (`max(priorBalance, balance)`). Run for every asset
+/// delivered, right before its send, so a line created for the first asset
+/// raises the second asset's bar. #106752895 BFEB6847B8E9 (rJd4HMcu, a
+/// single-asset withdraw of 22,222,222 FUZZY with no FUZZY line): mainnet
+/// returns tecINSUFFICIENT_RESERVE; we created the line and paid out.
+fn withdraw_reserve_ok(sandbox: &Sandbox, account: &[u8; 20], leg: &crate::tx::offer::Leg, pre_fee_xrp: u128) -> bool {
+    use crate::tx::offer as ox;
+    if leg.xrp || account == &leg.issuer {
+        return true;
+    }
+    if ox::json_at(sandbox, &keylet::ripple_state_key(account, &leg.issuer, &leg.cur)).is_some() {
+        return true;
+    }
+    let Some(root) = ox::json_at(sandbox, &keylet::account_root_key(account)) else { return true };
+    let oc = root["OwnerCount"].as_u64().unwrap_or(0) as u128;
+    let reserve = if oc < 2 { 0 } else { ox::XRP_RESERVE_BASE + ox::XRP_RESERVE_INC * (oc + 1) };
+    pre_fee_xrp >= reserve
+}
+
 impl Transactor for AMMWithdrawTransactor {
     fn preflight(&self, tx: &TxFields) -> TxResult {
         if tx.tx_type != "AMMWithdraw" { return TxResult::Malformed; }
@@ -1521,6 +1544,12 @@ impl Transactor for AMMWithdrawTransactor {
         let Some((amm_key, amm_acct, lp_leg)) = amm_ctx(tx, sandbox) else {
             return TxResult::NoEntry;
         };
+        // Finding 156: the reserve test compares against the balance before
+        // the fee (`priorBalance`).
+        let pre_fee_xrp: u128 = ox::json_at(sandbox, &keylet::account_root_key(&tx.account))
+            .and_then(|a| a["Balance"].as_str().and_then(|b| b.parse::<u128>().ok()))
+            .unwrap_or(0)
+            + tx.fee as u128;
         // A pool cannot pay out more of an asset than it holds:
         // AMMWithdraw::preclaim's checkAmount rejects amount > balance with
         // tecAMM_BALANCE before anything moves (AMMWithdraw.cpp:232).
@@ -1618,6 +1647,10 @@ impl Transactor for AMMWithdrawTransactor {
                                 return TxResult::AmmFailed;
                             }
                             if out.0 > 0 {
+                                if !withdraw_reserve_ok(sandbox, &tx.account, &leg, pre_fee_xrp) {
+                                    sandbox.restore_snapshot(snap);
+                                    return TxResult::InsufficientReserve; // finding 156
+                                }
                                 ox::move_leg(sandbox, &amm_acct, &tx.account, &leg, out);
                             }
                         }
@@ -1845,6 +1878,10 @@ impl Transactor for AMMWithdrawTransactor {
                         _ => amt0,
                     };
                     if amt.0 > 0 {
+                        if !withdraw_reserve_ok(sandbox, &tx.account, &leg, pre_fee_xrp) {
+                            sandbox.restore_snapshot(snap);
+                            return TxResult::InsufficientReserve; // finding 156
+                        }
                         ox::move_leg(sandbox, &amm_acct, &tx.account, &leg, amt);
                     }
                 }
