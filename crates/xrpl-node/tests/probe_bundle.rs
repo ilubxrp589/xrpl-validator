@@ -90,8 +90,15 @@ fn probe_bundle() {
     let mut bad = 0;
     for (k, want_hex) in bundle["expect"].as_object().unwrap() {
         let Some(ent) = mods.get(&key32(k)) else {
-            println!("PROBE {k}: NOT WRITTEN");
-            bad += 1;
+            // Untouched-object pin: an expectation equal to the seated
+            // pre-image says the transaction must leave the object alone.
+            let pre_hex = bundle["pre"][k].as_str().unwrap_or_default().trim().to_uppercase();
+            if !pre_hex.is_empty() && pre_hex == want_hex.as_str().unwrap_or_default().trim().to_uppercase() {
+                println!("PROBE {k}: UNTOUCHED (as expected)");
+            } else {
+                println!("PROBE {k}: NOT WRITTEN");
+                bad += 1;
+            }
             continue;
         };
         let bytes = match ent {

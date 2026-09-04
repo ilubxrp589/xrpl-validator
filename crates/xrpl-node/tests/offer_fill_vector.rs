@@ -73,9 +73,20 @@ fn run_bundle(bundle_json: &str) {
     );
 
     for (k, want_hex) in bundle["expect"].as_object().unwrap() {
-        let ent = mods
-            .get(&key32(k))
-            .unwrap_or_else(|| panic!("target {k} must be written by the apply"));
+        // An expectation the apply did not write is legitimate only when it
+        // pins an object the transaction must leave ALONE: its post-image is
+        // then its pre-image, and the vector says so by expecting exactly
+        // the seated bytes (finding 143 — the taker's own bid beyond the
+        // ask's limit, which mainnet never names).
+        let Some(ent) = mods.get(&key32(k)) else {
+            let pre_hex = bundle["pre"][k].as_str().unwrap_or_default().trim().to_uppercase();
+            assert_eq!(
+                want_hex.as_str().unwrap().trim().to_uppercase(),
+                pre_hex,
+                "target {k} was not written by the apply and does not pin the untouched pre-image"
+            );
+            continue;
+        };
         let bytes = match ent {
             SandboxEntry::Created(b) | SandboxEntry::Modified(b) => b.clone(),
             SandboxEntry::Deleted => panic!("target {k} deleted?"),
@@ -724,4 +735,16 @@ fn offer_residual_is_the_original_minus_the_summed_ins() {
 #[test]
 fn offer_limiting_level_rerun_reprices_the_last_maker() {
     run_bundle(include_str!("vectors/offer_limiting_level_rerun_reprices_the_last_maker_106743984.json"));
+}
+
+// Finding 143 — #106746247 9C42CD0DCFF7 (rMsXVzCug7, an ETH ask at 2506.88
+// RLUSD/ETH placed right after its own bid at 2499.37 in the same ledger):
+// the bid sits at the bids-book tip, outside the ask's limit. rippled's
+// `limitSelfCrossQuality` removes a self-offer only inside the limit and the
+// pass ends at one beyond it; we deleted the bid and its page. The bundle
+// seats every Offer/DirectoryNode the account's earlier transactions in the
+// ledger created or touched, which is what puts the bid on the tip.
+#[test]
+fn offer_direct_pass_stops_at_a_self_offer_beyond_the_limit() {
+    run_bundle(include_str!("vectors/offer_direct_pass_stops_at_a_self_offer_beyond_the_limit_106746247.json"));
 }

@@ -2043,6 +2043,12 @@ fn live_head(
     mutate_self: bool,
     mutate_dead: bool,
     stale: &mut Vec<Hash256>,
+    // Finding 143: the DIRECT strand's pass only removes a self-offer that is
+    // INSIDE the taker's limit (`limitSelfCrossQuality`: `offer.quality() >=
+    // qualityThreshold_`); one beyond it fails `checkQualityThreshold` and
+    // ENDS the pass. `Some(limit)` = that strand; `None` = peeks and bridge
+    // legs (which keep their existing behaviour).
+    self_limit: Option<u64>,
 ) -> Option<(u64, Hash256, serde_json::Value, [u8; 20], Me, Me)> {
     let mut i = *start;
     let result = loop {
@@ -2060,6 +2066,16 @@ fn live_head(
             continue;
         };
         if &maker == taker {
+            // Finding 143 (#106742126, rMsXVzCug7 quoting both sides of
+            // BTC/RLUSD): a bid at 82,090 RLUSD/BTC meets the taker's own
+            // asks at 82,420 and 82,502 on the direct tip — outside its
+            // limit. rippled leaves them (the pass stops there); we deleted
+            // both, two owner-directory entries short from then on.
+            if let Some(lim) = self_limit {
+                if q > lim {
+                    break None;
+                }
+            }
             if mutate_self {
                 delete_maker_offer(sandbox, &okey, &offer, &maker);
                 stale.push(okey);
@@ -3028,9 +3044,9 @@ fn cross_bridged(
             .iter()
             .find(|(_, k)| json_at(sandbox, k).is_some())
             .map(|(q, _)| rate_me(*q));
-        let dpeek = live_head(sandbox, &ld, &mut di, taker, pays_leg, gets_leg, false, peek_rm, stale);
-        let apeek = live_head(sandbox, &la, &mut ai, taker, &xrp_leg, gets_leg, false, peek_rm, stale);
-        let bpeek = live_head(sandbox, &lb, &mut bi, taker, pays_leg, &xrp_leg, false, peek_rm, stale);
+        let dpeek = live_head(sandbox, &ld, &mut di, taker, pays_leg, gets_leg, false, peek_rm, stale, None);
+        let apeek = live_head(sandbox, &la, &mut ai, taker, &xrp_leg, gets_leg, false, peek_rm, stale, None);
+        let bpeek = live_head(sandbox, &lb, &mut bi, taker, pays_leg, &xrp_leg, false, peek_rm, stale, None);
         let a_fib = amm_a.as_ref().and_then(|am| {
             crate::tx::amm_swap::fib_slice(sandbox, am, amm_a_init, amm_iters, &xrp_leg, gets_leg)
                 .map(|s| (crate::tx::amm_swap::slice_rate(s.0, s.1), s))
@@ -4180,7 +4196,7 @@ thr={t:?} admits_trunc={} admits_up={}",
             }
             if want_direct {
                 let Some((q, okey, offer, maker, gives0, wants0)) =
-                    live_head(sandbox, &ld, &mut di, taker, pays_leg, gets_leg, true, true, stale)
+                    live_head(sandbox, &ld, &mut di, taker, pays_leg, gets_leg, true, true, stale, (threshold_self != 0 && threshold_self != u64::MAX).then_some(threshold_self))
                 else { break 'attempt };
                 let funded_raw = available(sandbox, &maker, pays_leg);
                 let d_orate = maker_out_rate(sandbox, pays_leg, &maker, beneficiary);
@@ -4317,7 +4333,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 let a_book = if a_use_amm {
                     None
                 } else {
-                    match live_head(sandbox, &la, &mut ai, taker, &xrp_leg, gets_leg, true, true, stale) {
+                    match live_head(sandbox, &la, &mut ai, taker, &xrp_leg, gets_leg, true, true, stale, None) {
                         Some(h) => Some(h),
                         None => break 'attempt,
                     }
@@ -4325,7 +4341,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 let b_book = if b_use_amm {
                     None
                 } else {
-                    match live_head(sandbox, &lb, &mut bi, taker, pays_leg, &xrp_leg, true, true, stale) {
+                    match live_head(sandbox, &lb, &mut bi, taker, pays_leg, &xrp_leg, true, true, stale, None) {
                         Some(h) => Some(h),
                         None => break 'attempt,
                     }
@@ -4387,7 +4403,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                         let mut j = bi + 1;
                         while j < lb.len() && lb[j].0 == q0 && members.len() < 1000 {
                             let mut jj = j;
-                            match live_head(sandbox, &lb, &mut jj, taker, pays_leg, &xrp_leg, true, true, stale) {
+                            match live_head(sandbox, &lb, &mut jj, taker, pays_leg, &xrp_leg, true, true, stale, None) {
                                 Some(h) if h.0 == q0 => {
                                     members.push(h);
                                     j = jj + 1;
