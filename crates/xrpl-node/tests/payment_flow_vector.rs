@@ -64,9 +64,19 @@ fn run_bundle(bundle_json: &str) {
     );
 
     for (k, want_hex) in bundle["expect"].as_object().unwrap() {
-        let ent = mods
-            .get(&key32(k))
-            .unwrap_or_else(|| panic!("target {k} must be written by the apply"));
+        // An expectation the apply did not write pins an object the
+        // transaction must leave ALONE: it passes when it equals the seated
+        // pre-image (finding 143's rule; finding 157's dry payment pins both
+        // trust lines this way).
+        let Some(ent) = mods.get(&key32(k)) else {
+            let pre_hex = bundle["pre"][k].as_str().unwrap_or_default().trim().to_uppercase();
+            assert_eq!(
+                want_hex.as_str().unwrap().trim().to_uppercase(),
+                pre_hex,
+                "target {k} was not written by the apply and does not pin the untouched pre-image"
+            );
+            continue;
+        };
         let bytes = match ent {
             SandboxEntry::Created(b) | SandboxEntry::Modified(b) => b.clone(),
             SandboxEntry::Deleted => panic!("target {k} deleted?"),
@@ -378,4 +388,13 @@ fn payment_first_pool_hop_is_sized_by_the_reverse_pass() {
 #[test]
 fn payment_dry_strand_never_returns() {
     run_bundle(include_str!("vectors/payment_dry_strand_never_returns_106743104.json"));
+}
+
+// Finding 157 — #106753769 DD2CD0BC4C81 (rARKjtjX pays 0.005461 ASC to
+// r37rYnxT, whose account root carries lsfGlobalFreeze): `checkFreeze` makes
+// the issuer → destination hop terNO_LINE, the default strand is dry and
+// mainnet returns tecPATH_DRY. We paid. Both trust lines pinned untouched.
+#[test]
+fn payment_direct_hop_into_a_globally_frozen_account_is_dry() {
+    run_bundle(include_str!("vectors/payment_direct_hop_into_a_globally_frozen_account_is_dry_106753769.json"));
 }

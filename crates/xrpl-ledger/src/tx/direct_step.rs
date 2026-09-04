@@ -175,6 +175,45 @@ fn max_src_to_dst(sandbox: &Sandbox, hop: &DirectHop) -> ox::Me {
 /// path-drop plumbing that maps a flow with no strands to tecPATH_DRY.
 /// A pure-account strand has no book steps, so the NoRipple-after-book
 /// rule has nothing to test here (stage 2's concern).
+/// Finding 157 — `checkFreeze` (StepChecks.h:19-46), run on every direct hop
+/// that is not the strand's only step ("pure issue/redeem can't be frozen"):
+/// the hop is dry when the DESTINATION account carries lsfGlobalFreeze — the
+/// holder's own flag, whoever the issuer is — when the (src, dst) line
+/// carries the destination's freeze bit, or when either side deep-froze it.
+/// #106753769 DD2CD0BC4C81 (again at #106753771): rARKjtjX pays 0.005461 ASC
+/// to r37rYnxT, whose root has lsfGlobalFreeze set; the issuer → destination
+/// hop is terNO_LINE, the strand is dry and mainnet returns tecPATH_DRY. We
+/// paid — the destination's line and the sender's moved on a transaction
+/// that only charged a fee.
+pub(crate) fn hop_frozen(sandbox: &Sandbox, hop: &DirectHop) -> bool {
+    hop_frozen_parts(sandbox, &hop.src, &hop.dst, &hop.cur)
+}
+
+/// `hop_frozen` on a (src, dst, currency) triple — the simple holder → issuer
+/// → holder payment in payment.rs has no `DirectHop`.
+pub(crate) fn hop_frozen_parts(sandbox: &Sandbox, src: &[u8; 20], dst: &[u8; 20], cur: &[u8; 20]) -> bool {
+    let hop = DirectHop { src: *src, dst: *dst, cur: *cur };
+    let hop = &hop;
+    const LSF_GLOBAL_FREEZE: u64 = 0x0040_0000; // AccountRoot
+    const LSF_LOW_FREEZE: u64 = 0x0040_0000; // RippleState
+    const LSF_HIGH_FREEZE: u64 = 0x0080_0000;
+    const LSF_LOW_DEEP_FREEZE: u64 = 0x0200_0000;
+    const LSF_HIGH_DEEP_FREEZE: u64 = 0x0400_0000;
+    if ox::json_at(sandbox, &keylet::account_root_key(&hop.dst))
+        .is_some_and(|a| a["Flags"].as_u64().unwrap_or(0) & LSF_GLOBAL_FREEZE != 0)
+    {
+        return true;
+    }
+    if let Some(line) = ox::json_at(sandbox, &keylet::ripple_state_key(&hop.src, &hop.dst, &hop.cur)) {
+        let f = line["Flags"].as_u64().unwrap_or(0);
+        let dst_bit = if hop.dst > hop.src { LSF_HIGH_FREEZE } else { LSF_LOW_FREEZE };
+        if f & dst_bit != 0 || f & (LSF_LOW_DEEP_FREEZE | LSF_HIGH_DEEP_FREEZE) != 0 {
+            return true;
+        }
+    }
+    false
+}
+
 pub(crate) fn build_direct_strand(
     sandbox: &Sandbox,
     seq: &[[u8; 20]],
@@ -206,6 +245,14 @@ pub(crate) fn build_direct_strand(
             }
             return None;
         };
+        // Finding 157: checkFreeze — skipped only when this hop is the whole
+        // strand (`ctx.isFirst && ctx.isLast`).
+        if seq.len() > 2 && hop_frozen(sandbox, &hop) {
+            if std::env::var("DX_PAY").is_ok() {
+                eprintln!("DX_PAY direct drop: FROZEN {}~{}", hex::encode(&hop.src[..4]), hex::encode(&hop.dst[..4]));
+            }
+            return None;
+        }
         // Issuer-side auth: src requires auth, the line is unauthorized on
         // src's side, and the balance is zero ⇒ terNO_AUTH.
         let src_requires_auth = ox::json_at(sandbox, &keylet::account_root_key(&hop.src))
@@ -873,6 +920,18 @@ pub(crate) fn check_mixed_strand(sandbox: &Sandbox, segs: &[SegLayout]) -> bool 
                         }
                         return false; // terNO_LINE
                     };
+                    // Finding 157: checkFreeze — a mixed strand always has more
+                    // than one step, so every hop is subject to it.
+                    if hop_frozen(sandbox, hop) {
+                        if std::env::var("DX_PAY").is_ok() {
+                            eprintln!(
+                                "DX_PAY mixed drop: FROZEN {}~{}",
+                                hex::encode(&hop.src[..4]),
+                                hex::encode(&hop.dst[..4])
+                            );
+                        }
+                        return false; // terNO_LINE
+                    }
                     // The step OUT of a book refuses when the source side of
                     // its line carries NoRipple.
                     if i == 0 && prev_was_book {

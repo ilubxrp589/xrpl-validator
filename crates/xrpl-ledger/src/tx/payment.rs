@@ -2135,6 +2135,22 @@ impl PaymentTransactor {
         // `ledger_entry` by index shows it, which is why the existing
         // "destination must have a line" guard passes and we delivered. All
         // three are 3v1: mainnet claims the fee alone.
+        // Finding 157 — `checkFreeze` on the issuer → destination hop. The
+        // holder → issuer → holder strand is two steps, so both are subject
+        // (the sender's leg is already judged by `available`); a sender or
+        // destination that IS the issuer makes a one-step strand, which
+        // rippled exempts ("pure issue/redeem can't be frozen"). The
+        // destination's own lsfGlobalFreeze, its side of the (issuer,
+        // destination) line frozen, or a deep freeze, and the strand is dry.
+        // #106753769 DD2CD0BC4C81 (again #106753771, #106753953): rARKjtjX
+        // pays ASC/RPR to r37rYnxT, whose root has lsfGlobalFreeze — mainnet
+        // returns tecPATH_DRY; we moved the funds across both lines.
+        if tx.account != leg.issuer
+            && dest != &leg.issuer
+            && crate::tx::direct_step::hop_frozen_parts(sandbox, &leg.issuer, dest, &leg.cur)
+        {
+            return TxResult::PathDry;
+        }
         let target = match ox::dest_receivable(sandbox, dest, &leg) {
             Some(r) if ox::me_cmp(r, want).is_lt() => r,
             _ => want,
