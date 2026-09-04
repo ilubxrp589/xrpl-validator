@@ -144,12 +144,23 @@ impl Transactor for CredentialCreateTransactor {
         // Modifies the subject's dir root 6F370348 AND a tail page of the
         // issuer's multi-page dir (1D0093BB) — 4 nodes to our 2.
         const LSF_ACCEPTED: u64 = 0x0001_0000;
-        crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &cred_key);
+        // Finding 150: the credential carries its directory pages —
+        // `sleCred->setFieldU64(sfIssuerNode, *page)` after the issuer's
+        // dirInsert, `sfSubjectNode` after the subject's (CredentialCreate.cpp
+        // doApply; no SubjectNode on a self-issued credential). Both are
+        // UInt64 fields with two-byte headers, ten bytes each: without them
+        // our object is 20 bytes short of mainnet's — #106744392
+        // 7958D8E901FF (rhUaQmNP → rsiPEXNs, SCPO_BASIC) and #106744275
+        // 763A54D94565, 109 bytes against 129, the diff starting right
+        // after Expiration.
+        let issuer_page = crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &cred_key);
+        cred_obj["IssuerNode"] = serde_json::Value::String(format!("{issuer_page:x}"));
         if subject == tx.account {
             cred_obj["Flags"] = serde_json::json!(LSF_ACCEPTED);
             cred_obj["Accepted"] = serde_json::json!(true);
         } else {
-            crate::ledger::directory::owner_dir_insert(sandbox, &subject, &cred_key);
+            let subject_page = crate::ledger::directory::owner_dir_insert(sandbox, &subject, &cred_key);
+            cred_obj["SubjectNode"] = serde_json::Value::String(format!("{subject_page:x}"));
         }
         sandbox.write(cred_key, serde_json::to_vec(&cred_obj).unwrap());
 
