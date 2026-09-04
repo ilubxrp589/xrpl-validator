@@ -748,3 +748,15 @@ fn offer_limiting_level_rerun_reprices_the_last_maker() {
 fn offer_direct_pass_stops_at_a_self_offer_beyond_the_limit() {
     run_bundle(include_str!("vectors/offer_direct_pass_stops_at_a_self_offer_beyond_the_limit_106746247.json"));
 }
+
+// Finding 153 — #106746952 AC39E946C478 (rwHSyWL5Yd, tfSell|FoK XRPH → XRPHAI,
+// tecKILLED): round one consumes rhVbJJS1's 51E6 — its whole XRPHAI balance
+// — and the trailing stream step lands on the same owner's ACB8. rippled's
+// OfferStream sees the owner funded at the iteration's start and unfunded
+// now ("became unfunded"): stepped past, but never a permanent removal, so
+// the killed transaction leaves it — with its page, owner directory and
+// root — exactly as it was. We reaped it for good. Four untouched pins.
+#[test]
+fn offer_became_unfunded_offer_survives_a_killed_crossing() {
+    run_bundle(include_str!("vectors/offer_became_unfunded_offer_survives_a_killed_crossing_106746952.json"));
+}

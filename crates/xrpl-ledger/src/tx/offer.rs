@@ -718,6 +718,37 @@ pub(crate) fn owner_count_add(sandbox: &mut Sandbox, id: &[u8; 20], delta: i64) 
     }
 }
 
+thread_local! {
+    // Finding 153: offers the walk deleted as "became unfunded" — stepped
+    // past like every offer the stream leaves behind (BookTip::step deletes
+    // the previous entry in the iteration's sandbox), but never
+    // `permRmOffer`'d (OfferStream::step: `originalFunds != ownerFunds`), so
+    // they come back when the TRANSACTION fails: tecKILLED applies
+    // `sbCancel`, which carries only the permanent removals
+    // (OfferCreate.cpp:461-466). The round-rollback re-delete keeps them
+    // (rippled's iteration sandbox was applied); the kill paths skip them.
+    static SOFT_STALE: std::cell::RefCell<std::collections::HashSet<[u8; 32]>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+pub(crate) fn soft_stale_clear() {
+    SOFT_STALE.with(|c| c.borrow_mut().clear());
+}
+fn soft_stale_mark(k: &Hash256) {
+    SOFT_STALE.with(|c| {
+        c.borrow_mut().insert(k.0);
+    });
+}
+fn soft_stale_contains(k: &Hash256) -> bool {
+    SOFT_STALE.with(|c| c.borrow().contains(&k.0))
+}
+/// The permanent reaps in `stale` — what `sbCancel` carries on a failure.
+fn hard_stale(stale: &[Hash256]) -> Vec<Hash256> {
+    stale.iter().filter(|k| !soft_stale_contains(k)).copied().collect()
+}
+/// (maker, currency) pairs drained to zero by the CURRENT iteration's own
+/// fills — the offers they still hold are "became unfunded" (finding 153).
+pub(crate) type Drained = std::collections::HashSet<([u8; 20], [u8; 20])>;
+
 /// How much of `leg` the account can actually deliver.
 pub(crate) fn available(sandbox: &Sandbox, id: &[u8; 20], leg: &Leg) -> Me {
     if leg.xrp {
@@ -2049,6 +2080,10 @@ fn live_head(
     // ENDS the pass. `Some(limit)` = that strand; `None` = peeks and bridge
     // legs (which keep their existing behaviour).
     self_limit: Option<u64>,
+    // Finding 153: (maker, currency) pairs the CURRENT iteration drained —
+    // their remaining offers are "became unfunded": stepped past and deleted
+    // in the sandbox, but not permanently (`soft_stale_mark`).
+    drained: Option<&Drained>,
 ) -> Option<(u64, Hash256, serde_json::Value, [u8; 20], Me, Me)> {
     let mut i = *start;
     let result = loop {
@@ -2150,9 +2185,25 @@ fn live_head(
             continue;
         }
         if gives.0 == 0 || wants.0 == 0 || me_is_zero(available(sandbox, &maker, maker_pays_leg)) {
+            // Finding 153 — "became unfunded": an owner drained by THIS
+            // iteration's own fill is stepped past and deleted in the
+            // iteration's sandbox, but the removal is not permanent; it is
+            // resurrected when the transaction fails. #106746952
+            // AC39E946C478 (rwHSyWL5Yd, tfSell|FoK XRPH → XRPHAI, tecKILLED):
+            // rhVbJJS1's XRPHAI offer ACB8 was drained by its own 51E6 one
+            // round earlier — rippled's trace steps onto it twice, "Removing
+            // became unfunded offer", and the ledger keeps it; we reaped it
+            // for good (offer, page, owner dir, OwnerCount — four extra
+            // mutations on a killed transaction).
+            let soft = gives.0 != 0
+                && wants.0 != 0
+                && drained.is_some_and(|d| d.contains(&(maker, maker_pays_leg.cur)));
             if mutate_dead {
                 delete_maker_offer(sandbox, &okey, &offer, &maker);
                 stale.push(okey);
+                if soft {
+                    soft_stale_mark(&okey);
+                }
             }
             i += 1;
             continue;
@@ -2322,6 +2373,7 @@ fn reap_if_dead(
     gets_leg: &Leg,
     oc0: Option<&mut std::collections::HashMap<[u8; 20], u64>>,
     stale: &mut Vec<Hash256>,
+    drained: Option<&Drained>,
 ) -> bool {
     // `hasExpired`: the BASE ledger's close time is the test (View.cpp:48, and
     // BookStep.cpp:705 builds the stream with `sb.parentCloseTime()`).
@@ -2363,6 +2415,10 @@ fn reap_if_dead(
     if funding_known && me_is_zero(walk_available(sandbox, maker, pays_leg, oc0)) {
         delete_maker_offer(sandbox, okey, offer, maker);
         stale.push(*okey);
+        // Finding 153: drained by this iteration's own fill → not permanent.
+        if drained.is_some_and(|d| d.contains(&(*maker, pays_leg.cur))) {
+            soft_stale_mark(okey);
+        }
         return true;
     }
     if funding_known && is_dust_offer(sandbox, maker, m_wants0, m_gives0, pays_leg, gets_leg) {
@@ -2388,6 +2444,7 @@ fn reap_to_live_head(
     gets_leg: &Leg,
     mut oc0: Option<&mut std::collections::HashMap<[u8; 20], u64>>,
     stale: &mut Vec<Hash256>,
+    drained: Option<&Drained>,
 ) -> bool {
     let mut page_key_h = *dk;
     for _ in 0..10_000 {
@@ -2431,7 +2488,7 @@ fn reap_to_live_head(
             }
             let Some(maker) = offer.get("Account").and_then(|v| v.as_str()).and_then(decode20)
             else { continue };
-            if !reap_if_dead(sandbox, &okey, &offer, &maker, pays_leg, gets_leg, oc0.as_deref_mut(), stale) {
+            if !reap_if_dead(sandbox, &okey, &offer, &maker, pays_leg, gets_leg, oc0.as_deref_mut(), stale, drained) {
                 return true;
             }
         }
@@ -2588,7 +2645,7 @@ fn rev_scan_level(
                 }
                 return true;
             }
-            if reap_if_dead(sandbox, &okey, &offer, &maker, pays_leg, gets_leg, Some(oc0), stale) {
+            if reap_if_dead(sandbox, &okey, &offer, &maker, pays_leg, gets_leg, Some(oc0), stale, None) {
                 if trace {
                     eprintln!("DX_REV level={lvl} reaped {}", hex::encode(okey.0));
                 }
@@ -2958,11 +3015,15 @@ fn cross_bridged(
     // Finding 123 (#106734683 208D914F): rounds after the first take rippled's
     // CURRENT `activateNext` verdict (see `mp_entry` below).
     let mut bridged_round: u32 = 0;
+    // Finding 153: makers drained to zero by a round's fills; the next
+    // round's peeks treat their remaining offers as "became unfunded".
+    let mut drained_next: Drained = Default::default();
     for _ in 0..512 {
         if done(rem_pays, rem_gets) {
             break;
         }
         amm_used = false;
+        let drained_prev = std::mem::take(&mut drained_next);
         // PEEK both sources (no mutation) to pick the better rate within the
         // threshold; only the chosen source is then walked with mutation, so
         // dead-offer cleanup happens exactly where rippled's walk reaches.
@@ -3044,9 +3105,11 @@ fn cross_bridged(
             .iter()
             .find(|(_, k)| json_at(sandbox, k).is_some())
             .map(|(q, _)| rate_me(*q));
-        let dpeek = live_head(sandbox, &ld, &mut di, taker, pays_leg, gets_leg, false, peek_rm, stale, None);
-        let apeek = live_head(sandbox, &la, &mut ai, taker, &xrp_leg, gets_leg, false, peek_rm, stale, None);
-        let bpeek = live_head(sandbox, &lb, &mut bi, taker, pays_leg, &xrp_leg, false, peek_rm, stale, None);
+        // Finding 153: the peeks model the PREVIOUS iteration's trailing
+        // stream steps, so a maker that iteration drained is "became unfunded".
+        let dpeek = live_head(sandbox, &ld, &mut di, taker, pays_leg, gets_leg, false, peek_rm, stale, None, Some(&drained_prev));
+        let apeek = live_head(sandbox, &la, &mut ai, taker, &xrp_leg, gets_leg, false, peek_rm, stale, None, Some(&drained_prev));
+        let bpeek = live_head(sandbox, &lb, &mut bi, taker, pays_leg, &xrp_leg, false, peek_rm, stale, None, Some(&drained_prev));
         let a_fib = amm_a.as_ref().and_then(|am| {
             crate::tx::amm_swap::fib_slice(sandbox, am, amm_a_init, amm_iters, &xrp_leg, gets_leg)
                 .map(|s| (crate::tx::amm_swap::slice_rate(s.0, s.1), s))
@@ -4196,7 +4259,7 @@ thr={t:?} admits_trunc={} admits_up={}",
             }
             if want_direct {
                 let Some((q, okey, offer, maker, gives0, wants0)) =
-                    live_head(sandbox, &ld, &mut di, taker, pays_leg, gets_leg, true, true, stale, (threshold_self != 0 && threshold_self != u64::MAX).then_some(threshold_self))
+                    live_head(sandbox, &ld, &mut di, taker, pays_leg, gets_leg, true, true, stale, (threshold_self != 0 && threshold_self != u64::MAX).then_some(threshold_self), Some(&drained_next))
                 else { break 'attempt };
                 let funded_raw = available(sandbox, &maker, pays_leg);
                 let d_orate = maker_out_rate(sandbox, pays_leg, &maker, beneficiary);
@@ -4295,6 +4358,9 @@ thr={t:?} admits_trunc={} admits_up={}",
                 let give_gross = owner_gives(d_orate, give, funded, funded_raw);
                 settle_fill(sandbox, &okey, &offer, &maker, taker, beneficiary,
                             pays_leg, gets_leg, give, pay, d_gross, give_gross, gives0, wants0);
+                if me_is_zero(available(sandbox, &maker, pays_leg)) {
+                    drained_next.insert((maker, pays_leg.cur));
+                }
                 // The taker's RUNNING remainder is an STAmount in rippled, so it
                 // re-rounds to 16 digits at EVERY subtraction. `me_sub` is
                 // exact, so ours accumulates precision rippled never has and
@@ -4333,7 +4399,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 let a_book = if a_use_amm {
                     None
                 } else {
-                    match live_head(sandbox, &la, &mut ai, taker, &xrp_leg, gets_leg, true, true, stale, None) {
+                    match live_head(sandbox, &la, &mut ai, taker, &xrp_leg, gets_leg, true, true, stale, None, Some(&drained_next)) {
                         Some(h) => Some(h),
                         None => break 'attempt,
                     }
@@ -4341,7 +4407,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 let b_book = if b_use_amm {
                     None
                 } else {
-                    match live_head(sandbox, &lb, &mut bi, taker, pays_leg, &xrp_leg, true, true, stale, None) {
+                    match live_head(sandbox, &lb, &mut bi, taker, pays_leg, &xrp_leg, true, true, stale, None, Some(&drained_next)) {
                         Some(h) => Some(h),
                         None => break 'attempt,
                     }
@@ -4403,7 +4469,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                         let mut j = bi + 1;
                         while j < lb.len() && lb[j].0 == q0 && members.len() < 1000 {
                             let mut jj = j;
-                            match live_head(sandbox, &lb, &mut jj, taker, pays_leg, &xrp_leg, true, true, stale, None) {
+                            match live_head(sandbox, &lb, &mut jj, taker, pays_leg, &xrp_leg, true, true, stale, None, Some(&drained_next)) {
                                 Some(h) if h.0 == q0 => {
                                     members.push(h);
                                     j = jj + 1;
@@ -4729,6 +4795,9 @@ thr={t:?} admits_trunc={} admits_up={}",
                         }
                         settle_fill(sandbox, akey, aoffer, amaker, taker, taker,
                                     &xrp_leg, gets_leg, xrp, gets_in, a_gross, xrp, *a_gives0, *a_wants0);
+                        if me_is_zero(available(sandbox, amaker, &xrp_leg)) {
+                            drained_next.insert((*amaker, xrp_leg.cur));
+                        }
                     }
                     (None, Some(_)) => {
                         crate::tx::amm_swap::apply_slice(
@@ -4782,6 +4851,9 @@ thr={t:?} admits_trunc={} admits_up={}",
                             let b_give_gross = owner_gives(*orate, out_m, *funded, *funded_raw);
                             settle_fill(sandbox, bkey, boffer, bmaker, taker, beneficiary,
                                         pays_leg, &xrp_leg, out_m, take, take, b_give_gross, *b_gives0, *b_wants0);
+                            if me_is_zero(available(sandbox, bmaker, pays_leg)) {
+                                drained_next.insert((*bmaker, pays_leg.cur));
+                            }
                             dealt_out = stamount_signed_add(false, dealt_out, false, out_m).1;
                             rem = me_sub(rem, take);
                         }
@@ -4910,6 +4982,7 @@ had_fill={} n={} keys={:?}",
             // while its key stays marked stale — deleted from our bookkeeping,
             // alive in the state, and never revisited.
             sandbox.restore_snapshot(snap);
+            drained_next.clear(); // finding 153: a rolled-back round drained nobody
             // Re-apply the failed candidate's DEAD-offer reaps (rippled banks
             // ofrsToRm even when the strand fails) — but NOT its SELF-cross
             // deletions: limitSelfCrossQuality removes the taker's own offers
@@ -5407,11 +5480,15 @@ pub(crate) fn cross_engine_to_net(
     // TRUE once any level activated the strand (tip or pool within the
     // limit) — the moment rippled would have BUILT the offer stream.
     let mut stream_ran = false;
+    // Finding 153: makers drained by the CURRENT iteration's fills (a level,
+    // or the trailing sweep behind it) — their other offers are "became
+    // unfunded", stepped past but not permanently removed.
+    let mut drained_level: Drained = Default::default();
     'dirs: for (di, dk) in dirs.clone().into_iter().enumerate() {
         let (level_pays_in, level_gets_in) = (rem_pays, rem_gets);
         let q = u64::from_be_bytes(dk.0[24..32].try_into().unwrap_or_default());
         if trailing {
-            if reap_to_live_head(sandbox, &dk, pays_leg, gets_leg, Some(&mut oc0), stale) {
+            if reap_to_live_head(sandbox, &dk, pays_leg, gets_leg, Some(&mut oc0), stale, Some(&drained_level)) {
                 break 'dirs;
             }
             continue;
@@ -5456,7 +5533,7 @@ pub(crate) fn cross_engine_to_net(
                 crate::tx::amm_swap::spot_upper_bound(sandbox, a, pays_leg, gets_leg) <= threshold
             });
         stream_ran = stream_ran || strand_active;
-        if strand_active && !reap_to_live_head(sandbox, &dk, pays_leg, gets_leg, Some(&mut oc0), stale) {
+        if strand_active && !reap_to_live_head(sandbox, &dk, pays_leg, gets_leg, Some(&mut oc0), stale, Some(&drained_level)) {
             continue;
         }
         // AMM turn: consume pool liquidity while its spot quality strictly
@@ -5507,6 +5584,7 @@ pub(crate) fn cross_engine_to_net(
             settle_taker!();
             taker_accs = ((0, 0), (0, 0));
             acc_level = None;
+            drained_level.clear();
             let (rp, rg, used) = amm_turn(
                 amm_fib.as_deref_mut(), sandbox, a, taker, beneficiary,
                 benef_net.map(|(r, na)| (r, na, ask0)),
@@ -5719,7 +5797,7 @@ pub(crate) fn cross_engine_to_net(
                         }
                         if reap_if_dead(
                             sandbox, &okey, &offer, &maker, pays_leg, gets_leg,
-                            Some(&mut oc0), stale,
+                            Some(&mut oc0), stale, Some(&drained_level),
                         ) {
                             continue;
                         }
@@ -5744,7 +5822,7 @@ pub(crate) fn cross_engine_to_net(
             // built reaps nothing — #105795013 rests in 4 nodes and leaves
             // the expired E39542EC alone.
             if stream_ran {
-                if reap_to_live_head(sandbox, &dk, pays_leg, gets_leg, Some(&mut oc0), stale) {
+                if reap_to_live_head(sandbox, &dk, pays_leg, gets_leg, Some(&mut oc0), stale, Some(&drained_level)) {
                     break 'dirs;
                 }
                 continue;
@@ -5791,7 +5869,7 @@ pub(crate) fn cross_engine_to_net(
                 let Some(maker) = offer.get("Account").and_then(|v| v.as_str()).and_then(decode20)
                 else { continue };
                 if trailing {
-                    if reap_if_dead(sandbox, &okey, &offer, &maker, pays_leg, gets_leg, Some(&mut oc0), stale) {
+                    if reap_if_dead(sandbox, &okey, &offer, &maker, pays_leg, gets_leg, Some(&mut oc0), stale, Some(&drained_level)) {
                         continue;
                     }
                     break 'dirs;
@@ -5884,9 +5962,14 @@ pub(crate) fn cross_engine_to_net(
                     );
                 }
                 if me_is_zero(funded_raw) {
-                    // Unfunded offers found during the walk are removed.
+                    // Unfunded offers found during the walk are removed —
+                    // permanently unless THIS iteration drained the owner
+                    // (finding 153: "became unfunded").
                     delete_maker_offer(sandbox, &okey, &offer, &maker);
                     stale.push(okey);
+                    if drained_level.contains(&(maker, pays_leg.cur)) {
+                        soft_stale_mark(&okey);
+                    }
                     continue;
                 }
                 // Sizing sees the DELIVERABLE funds (F55); the reap above
@@ -6385,6 +6468,7 @@ pub(crate) fn cross_engine_to_net(
                     settle_taker!();
                     taker_accs = ((0, 0), (0, 0));
                     acc_level = Some(q);
+                    drained_level.clear();
                 }
                 // Maker debited per fill; the taker's credit accumulates for
                 // the per-level settlement (see `taker_accs` above). The
@@ -6399,6 +6483,9 @@ pub(crate) fn cross_engine_to_net(
                     let gg = owner_gives(w_orate, give, funded, funded_raw);
                     line_adjust(sandbox, &maker, pays_leg, gg, false);
                     taker_accs.0 = stamount_signed_add(false, taker_accs.0, false, give).1;
+                }
+                if me_is_zero(available(sandbox, &maker, pays_leg)) {
+                    drained_level.insert((maker, pays_leg.cur));
                 }
                 // The taker pays the INPUT issuer's rate on top of what the
                 // maker receives, and the issuer destroys the difference:
@@ -6705,6 +6792,7 @@ pub(crate) fn cross_engine_to_net(
             settle_taker!();
             taker_accs = ((0, 0), (0, 0));
             acc_level = None;
+            drained_level.clear();
             let (rp, rg, used) = amm_turn(
                 amm_fib.as_deref_mut(), sandbox, a, taker, beneficiary,
                 benef_net.map(|(r, na)| (r, na, ask0)),
@@ -6825,7 +6913,7 @@ pub(crate) fn cross_engine_to_net(
             // rippled applies its `removableOffers` to the cancel sandbox too
             // (OfferCreate.cpp:460), so the reap must survive the rollback that
             // just restored them.
-            for okey in stale.iter() {
+            for okey in stale.iter().filter(|k| !soft_stale_contains(k)) {
                 let Some(off) = json_at(sandbox, okey) else { continue };
                 let Some(maker) = off.get("Account").and_then(|v| v.as_str()).and_then(decode20)
                 else {
@@ -7009,6 +7097,7 @@ impl Transactor for OfferCreateTransactor {
     fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
         // rippled's AMMContext lives for the whole flow of ONE transaction.
         let _amm_ctx = crate::tx::amm_swap::AmmCtxGuard::new();
+        soft_stale_clear();
         // rippled's `preFeeBalance_` (Transactor.cpp:896): the creator's XRP
         // balance as of BEFORE this transaction's fee was taken. Captured here,
         // ahead of the OfferSequence cancel and the crossing, because the
@@ -7323,13 +7412,13 @@ impl Transactor for OfferCreateTransactor {
             // FillOrKill not fully filled: nothing survives but the fee and
             // the stale-offer cleanup.
             sandbox.restore_snapshot(snap);
-            reap(sandbox, &stale);
+            reap(sandbox, &hard_stale(&stale)); // finding 153: sbCancel carries only permanent removals
             return TxResult::Killed;
         }
         if ioc {
             if crossed == 0 {
                 sandbox.restore_snapshot(snap);
-                reap(sandbox, &stale);
+                reap(sandbox, &hard_stale(&stale));
                 return TxResult::Killed;
             }
             return TxResult::Success; // keep fills, never place
