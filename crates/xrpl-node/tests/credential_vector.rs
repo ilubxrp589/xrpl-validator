@@ -108,3 +108,14 @@ fn run_bundle(bundle_json: &str) {
 fn credential_carries_its_directory_pages() {
     run_bundle(include_str!("vectors/credential_carries_its_directory_pages_106744392.json"));
 }
+
+// Finding 182 — #106786929 7F9BF933CE7F (r9avT7NU, 76 objects, 16.199892
+// XRP): CredentialCreate must hold the reserve for one more object on the
+// PRE-FEE balance (`checkReserve(…, preFeeBalance_, {.ownerCountDelta = 1})`)
+// — 16.4 XRP here — and mainnet claims the fee alone with
+// tecINSUFFICIENT_RESERVE. We had no reserve check and wrote the credential
+// and three directory pages; the account retried in five more ledgers.
+#[test]
+fn credential_create_below_the_reserve_is_refused() {
+    run_bundle(include_str!("vectors/credential_create_below_the_reserve_is_refused_106786929.json"));
+}

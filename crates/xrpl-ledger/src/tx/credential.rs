@@ -106,9 +106,42 @@ impl Transactor for CredentialCreateTransactor {
 
         let cred_key = credential_key(&subject, &tx.account, &cred_type_bytes(cred_type_str));
 
+        // CredentialCreate::preclaim — the subject must exist (tecNO_TARGET)
+        // before the duplicate test (CredentialCreate.cpp preclaim, in that
+        // order).
+        if !sandbox.exists(&keylet::account_root_key(&subject)) {
+            return TxResult::NoTarget;
+        }
         // Check if credential already exists
         if sandbox.exists(&cred_key) {
             return TxResult::Duplicate;
+        }
+        // Finding 182: the issuer must hold the reserve for ONE MORE object —
+        // `checkReserve(ctx, sleIssuer, preFeeBalance_, {.ownerCountDelta = 1})`
+        // (CredentialCreate::doApply, AccountRootHelpers.cpp): the balance
+        // BEFORE the fee against `accountReserve(OwnerCount + 1)`, judged
+        // before anything is written. apply_common has already taken the fee
+        // here, so add it back. We had no reserve check at all. #106786929
+        // 7F9BF933CE7F (and 7B0E267674BD, then #106786947/48/66/67/68 — the
+        // same r9avT7NU retrying): 76 objects and 16.199892 XRP against a
+        // 16.4 XRP reserve for the 77th — mainnet claims the fee alone with
+        // tecINSUFFICIENT_RESERVE; we wrote the credential and three
+        // directory pages every time.
+        {
+            let ak = keylet::account_root_key(&tx.account);
+            let (bal, oc) = match sandbox
+                .read(&ak)
+                .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+            {
+                Some(a) => (
+                    a["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+                    a["OwnerCount"].as_u64().unwrap_or(0),
+                ),
+                None => return TxResult::NoAccount,
+            };
+            if bal.saturating_add(tx.fee) < crate::ledger::fees::account_reserve(sandbox, oc + 1) {
+                return TxResult::InsufficientReserve;
+            }
         }
 
         let mut cred_obj = serde_json::json!({
@@ -401,7 +434,15 @@ mod delete_tests {
     fn a_credential_joins_both_owner_directories() {
         let issuer = [0x01u8; 20];
         let subject = [0x03u8; 20];
-        let st = state_with(&issuer);
+        let mut st = state_with(&issuer);
+        // Finding 182: the subject must exist (tecNO_TARGET otherwise).
+        let subj_root = serde_json::json!({
+            "LedgerEntryType": "AccountRoot", "Account": hex::encode(subject),
+            "Balance": "100000000", "Sequence": 1, "OwnerCount": 0,
+        });
+        st.state_map
+            .insert(keylet::account_root_key(&subject), serde_json::to_vec(&subj_root).unwrap())
+            .unwrap();
         let mut sb = Sandbox::new(&st);
 
         let tx = TxFields {
