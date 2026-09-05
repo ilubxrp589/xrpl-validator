@@ -1891,6 +1891,11 @@ pub(crate) fn consume(
     // taker's 1.34067 limit; the exact-curve anchored slice lands 1e-4
     // small.
     limit_anchor: bool,
+    // The book's RAW first directory entry, dead or alive — what
+    // `BookStep::tip()` sees (BookTip::step walks the directory with no
+    // funding, expiry or ownership check). It decides WHICH QualityFunction
+    // sized this pass's `limitOut`; None = the AMM's (finding 166b).
+    raw_tip: Option<u64>,
 ) -> (Me, Me, bool) {
     if amm_ctx_exhausted() {
         return (rem_pays, rem_gets, false);
@@ -2074,6 +2079,34 @@ pub(crate) fn consume(
     // DDFDD49B killed at 6 ppm over, 2C4DF181 filled inside).
     if threshold != u64::MAX && n_cmp(rate_of_me_pair(take_in, take_out), decode_rate(threshold)) == Ordering::Greater {
         let thr_me = decode_rate(threshold);
+        // Which QualityFunction sized this pass's `limitOut` (StrandFlow.h
+        // :664-672 → BookStep::getQualityFunc → tip()): the AMM's curve only
+        // when `tip()` hands back the AMM offer — generated against the
+        // qualityThreshold of the RAW directory tip and strictly better than
+        // it (BookStep.cpp:921-953). A LOB tip the pool cannot beat, live or
+        // dead, makes the QF the CLOB's constant: no solve, remainingOut
+        // untouched, adjustedRemOut=false, and a fill worse than the limit
+        // is "Path rejected by limitQuality" outright. Finding 166b
+        // (#106774713 5AC0BDFA, tfSell): the tip 795D3CE4 sat 0.006% inside
+        // the pool's fee-inclusive spot and was UNFUNDED — rippled anchored
+        // to it, could not, reaped it in forEachOffer and rejected the
+        // in-capped max offer (49.6k out for 160 XRP, 0.8% under the limit);
+        // we reaped it first, solved the limit and filled 25.475268 XRP.
+        let qf_is_amm = match raw_tip {
+            None => true,
+            // LOB beyond the crossing's limit: qualityThreshold → nullopt →
+            // maxOffer, whose quality is the feeless spot (AMMLiquidity.cpp
+            // :136-144, Quality{balances}); the AMM wins when that beats
+            // the LOB.
+            Some(rq) if rq > threshold_gross => spot_upper_bound(sandbox, amm, pays_leg, gets_leg) < rq,
+            Some(rq) => anchored_offer_quality(sandbox, amm, pays_leg, gets_leg, rq).is_some_and(|aq| aq < rq),
+        };
+        if !qf_is_amm {
+            if std::env::var("DX_AMM").is_ok() {
+                eprintln!("DX_AMM limit reject (CLOB quality function, no solve) raw_tip={raw_tip:?} thr={thr_me:?}");
+            }
+            return (rem_pays, rem_gets, false);
+        }
         let Some(mut out_req) = qf_limit_out(pool_in, pool_out, amm.tfee, in_gross_rate, threshold, threshold_gross) else {
             return (rem_pays, rem_gets, false);
         };
@@ -2092,9 +2125,14 @@ pub(crate) fn consume(
         take_in = in_req;
         take_out = out_amt;
         if n_cmp(take_in, rem_gets) == Ordering::Greater {
+            // `adjustedRemOut` is settled by limitOut ALONE, before the
+            // passes cap the input (StrandFlow.h:664-672): an in-clamped
+            // fill whose OUT the limit solve trimmed keeps the 1e-7
+            // forgiveness. Finding 166 (#106759265 7556BE4A, IoC sell): the
+            // clamped fill landed 1.4e-14 over the limit — rippled fills it,
+            // the reset here killed it (tecKILLED vs tesSUCCESS).
             take_in = rem_gets;
             take_out = swap_asset_in(pool_in, pool_out, take_in, amm.tfee, pays_leg.xrp);
-            adjusted = false;
         }
         if take_in.0 == 0 || take_out.0 == 0 {
             return (rem_pays, rem_gets, false);

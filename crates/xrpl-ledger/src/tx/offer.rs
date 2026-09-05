@@ -3777,7 +3777,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 } else {
                 crate::tx::amm_swap::consume(
                     sandbox, a, taker, beneficiary, None, None, rem_pays, rem_gets, pays_leg, gets_leg,
-                    threshold, threshold_self, sell, anchor_clob, fee_rate, limit_anchor,
+                    threshold, threshold_self, sell, anchor_clob, fee_rate, limit_anchor, None,
                 )
                 }
             } else {
@@ -5623,6 +5623,10 @@ pub(crate) fn cross_engine_to_net(
         }
     }
     let dirs = sandbox.keys_with_prefix(&inv_base.0[..24]);
+    // The book's raw first entry before the walk reaps anything — the
+    // quality `BookStep::tip()` anchors the first pass's QualityFunction to
+    // (finding 166b; see `consume`'s `raw_tip`).
+    let raw_first_q: Option<u64> = dirs.first().map(|dk| u64::from_be_bytes(dk.0[24..32].try_into().unwrap_or_default()));
     // Set once the fill is satisfied but rippled would still have stepped the
     // stream. The stream spans the whole BOOK, not one level: `step` carries no
     // quality test, so it keeps reaping across levels until it reaches a live
@@ -5957,6 +5961,7 @@ pub(crate) fn cross_engine_to_net(
                 benef_net.map(|(r, na)| (r, na, ask0)),
                 gets_gross_cap.map(|c| me_sub(c, in_gross_spent)), rem_pays, rem_gets,
                 pays_leg, gets_leg, threshold, threshold_self, sell, Some(q), pay_in_rate,
+                None,
             );
             // Finding 159: the slice opens this pass's totals — but only when
             // the level's offers can join the same iteration.
@@ -7066,6 +7071,7 @@ pub(crate) fn cross_engine_to_net(
                     .filter(|qs| *qs <= threshold)
                     .or(residual_q.filter(|q| *q <= threshold_self)),
                 pay_in_rate,
+                if crossed == 0 { raw_first_q } else { residual_q },
             );
             if used {
                 let slice_net = me_sub(rem_gets, rg);
@@ -7202,11 +7208,13 @@ fn amm_turn(
     clob: Option<u64>,
     // Payment-mode IN-side transfer rate (see consume_fib). Crossing = None.
     in_gross_rate: Option<u64>,
+    // See `consume`'s `raw_tip` (finding 166b). Fib turns ignore it.
+    raw_tip: Option<u64>,
 ) -> (Me, Me, bool) {
     let Some(f) = fib else {
         let r = crate::tx::amm_swap::consume(
             sandbox, a, taker, beneficiary, benef_net, in_gross_cap, rem_pays, rem_gets, pays_leg, gets_leg, threshold, threshold_gross, sell, clob,
-            in_gross_rate, false,
+            in_gross_rate, false, raw_tip,
         );
         // `AMMOffer::consume` → `setAMMUsed()`: single-path offers count
         // toward the flow's 30 AMM iterations too (finding 107).

@@ -819,3 +819,13 @@ fn offer_live_tip_beyond_strict_inside_inflated_is_attempted_106771950() {
         "vectors/offer_live_tip_beyond_strict_inside_inflated_is_attempted_106771950.json"
     ));
 }
+
+#[test]
+fn offer_ioc_sell_in_capped_fill_keeps_the_limit_forgiveness_106759265() {
+    run_bundle(include_str!("vectors/offer_ioc_sell_in_capped_fill_keeps_the_limit_forgiveness_106759265.json"));
+}
+
+#[test]
+fn offer_dead_book_tip_inside_the_limit_pins_a_constant_quality_function_106774713() {
+    run_bundle(include_str!("vectors/offer_dead_book_tip_inside_the_limit_pins_a_constant_quality_function_106774713.json"));
+}
