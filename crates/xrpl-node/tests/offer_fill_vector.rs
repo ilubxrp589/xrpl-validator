@@ -844,3 +844,8 @@ fn offer_issuer_owned_maker_still_grosses_the_taker_spend_106758320() {
 fn offer_sell_past_its_minimum_rests_the_unsold_remainder_106758110() {
     run_bundle(include_str!("vectors/offer_sell_past_its_minimum_rests_the_unsold_remainder_106758110.json"));
 }
+
+#[test]
+fn offer_crossing_remaining_out_folds_to_sixteen_digits_106769838() {
+    run_bundle(include_str!("vectors/offer_crossing_remaining_out_folds_to_sixteen_digits_106769838.json"));
+}

@@ -79,6 +79,19 @@ thread_local! {
     // sender.
     static FWD_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+thread_local! {
+    // The walk is sizing the payment SENDER's own SendMax hop (hop 0): the
+    // only payment hop whose taker line rippled's DirectStep bounds
+    // (finding 169b). Later hops spend a carry the hop chain parks on the
+    // sender's line (finding 98), which rippled never touches.
+    static SENDER_HOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+pub(crate) fn set_sender_hop(t: bool) {
+    SENDER_HOP.with(|c| c.set(t));
+}
+pub(crate) fn sender_hop() -> bool {
+    SENDER_HOP.with(|c| c.get())
+}
 pub(crate) fn set_fwd_first(t: bool) {
     FWD_FIRST.with(|c| c.set(t));
 }
@@ -1761,7 +1774,9 @@ fn settle_slice(
     ox::move_leg_gross(sandbox, taker, amm_account, gets_leg, take_in, take_in_gross);
     match benef_net {
         Some((rate, net_ask, ask0)) => {
-            let net = if ox::me_cmp(deliver, ask0) == std::cmp::Ordering::Equal {
+            // Finding 170 (see the walk's settle_taker!): a forward surplus
+            // over the rev ask keeps the rev cache — setCacheLimiting.
+            let net = if ox::me_cmp(deliver, ask0).is_ge() {
                 net_ask
             } else {
                 ox::mul_ratio(deliver, 1_000_000_000, rate as u128, false)

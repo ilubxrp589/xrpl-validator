@@ -446,3 +446,8 @@ fn payment_sweep_last_fill_is_bounded_by_the_deferred_debits_fold_106773978() {
 fn payment_funds_limited_fill_clamps_to_the_offers_own_taker_pays_106759499() {
     run_bundle(include_str!("vectors/payment_funds_limited_fill_clamps_to_the_offers_own_taker_pays_106759499.json"));
 }
+
+#[test]
+fn payment_forward_surplus_keeps_the_reverse_cache_106763015() {
+    run_bundle(include_str!("vectors/payment_forward_surplus_keeps_the_reverse_cache_106763015.json"));
+}

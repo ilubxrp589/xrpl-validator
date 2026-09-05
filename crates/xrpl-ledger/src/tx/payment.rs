@@ -1067,6 +1067,7 @@ impl PaymentTransactor {
                         .flatten();
                     let _ = crate::tx::amm_swap::take_fwd_excess();
                     crate::tx::amm_swap::set_fwd_gross_in(hop_rate.map(|_| carry));
+                    crate::tx::amm_swap::set_sender_hop(i == 0);
                     crate::tx::amm_swap::set_fwd_first(!segs[..i].iter().any(|g| matches!(g, ds::SegLayout::Book { .. }))); // finding 147
                     let (rw, rs, _c) = ox::cross_engine_to(
                         &tx.account, benef, out_target[i], avail, to, from, thr, thr, false,
@@ -1075,6 +1076,7 @@ impl PaymentTransactor {
                     );
                     let excess = crate::tx::amm_swap::take_fwd_excess();
                     crate::tx::amm_swap::set_fwd_gross_in(None);
+                    crate::tx::amm_swap::set_sender_hop(false);
                     crate::tx::amm_swap::set_fwd_first(false);
                     if i == 0 {
                         sin = ox::me_sub(avail, rs);
@@ -1338,6 +1340,7 @@ impl PaymentTransactor {
             }
             let _ = crate::tx::amm_swap::take_fwd_excess();
             crate::tx::amm_swap::set_fwd_gross_in(hop_rate.map(|_| carry));
+            crate::tx::amm_swap::set_sender_hop(i == 0);
                     crate::tx::amm_swap::set_fwd_first(i == 0); // finding 147
             let (rw, rs, _c, gross_spent) = ox::cross_engine_to_net(
                 &tx.account, benef, want_cap, avail, chain[i + 1], chain[i],
@@ -1348,6 +1351,7 @@ impl PaymentTransactor {
             );
             let excess = crate::tx::amm_swap::take_fwd_excess();
             crate::tx::amm_swap::set_fwd_gross_in(None);
+            crate::tx::amm_swap::set_sender_hop(false);
                     crate::tx::amm_swap::set_fwd_first(false);
             // Hop 0's input IS the spend leg — `hop_rate` is gated on `i > 0`,
             // so `avail` there is still `avail_in` untouched — and `rs` is the

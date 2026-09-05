@@ -1041,6 +1041,8 @@ struct DeferredEntry {
     orig_neg: bool,
     orig: (u128, i32),
     debits: (u128, i32),
+    // The line took a CREDIT in this transaction (kept for the trace).
+    credited: bool,
 }
 type DeferredTable = std::collections::HashMap<String, DeferredEntry>;
 fn deferred_key(party: &[u8; 20], leg: &Leg) -> String {
@@ -1055,14 +1057,19 @@ fn deferred_load(sandbox: &Sandbox) -> DeferredTable {
     if let Some(o) = v.as_object() {
         for (k, e) in o {
             let a = e.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
-            if a.len() != 5 {
+            if a.len() != 6 {
                 continue;
             }
             let m = |i: usize| a[i].as_str().and_then(|s| s.parse::<u128>().ok()).unwrap_or(0);
             let x = |i: usize| a[i].as_i64().unwrap_or(0) as i32;
             t.insert(
                 k.clone(),
-                DeferredEntry { orig_neg: a[0].as_bool().unwrap_or(false), orig: (m(1), x(2)), debits: (m(3), x(4)) },
+                DeferredEntry {
+                    orig_neg: a[0].as_bool().unwrap_or(false),
+                    orig: (m(1), x(2)),
+                    debits: (m(3), x(4)),
+                    credited: a[5].as_bool().unwrap_or(false),
+                },
             );
         }
     }
@@ -1073,7 +1080,7 @@ fn deferred_store(sandbox: &mut Sandbox, t: &DeferredTable) {
     for (k, e) in t {
         o.insert(
             k.clone(),
-            serde_json::json!([e.orig_neg, e.orig.0.to_string(), e.orig.1, e.debits.0.to_string(), e.debits.1]),
+            serde_json::json!([e.orig_neg, e.orig.0.to_string(), e.orig.1, e.debits.0.to_string(), e.debits.1, e.credited]),
         );
     }
     if let Ok(d) = serde_json::to_vec(&serde_json::Value::Object(o)) {
@@ -1088,9 +1095,12 @@ fn deferred_record(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, holding_n
         orig_neg: holding_neg,
         orig: holding,
         debits: (0, 0),
+        credited: false,
     });
     if !receiving {
         e.debits = stamount_signed_add(false, e.debits, false, amt).1;
+    } else {
+        e.credited = true;
     }
     if std::env::var("DX_DEFER").is_ok() {
         eprintln!("DX_DEFER record party={} recv={receiving} amt={amt:?} orig={:?}{:?} debits={:?}", hex::encode(party), e.orig_neg, e.orig, e.debits);
@@ -4574,7 +4584,21 @@ thr={t:?} admits_trunc={} admits_up={}",
                 if std::env::var("DX_FILL").is_ok() {
                     eprintln!("DX_FILL give={give:?} pay={pay:?} rem_pays={rem_pays:?} rem_gets={rem_gets:?}");
                 }
-                rem_pays = me_sub(rem_pays, give);
+                // Finding 173 (#106769838 3F05F579): rippled's remainingOut is
+                // an IOUAmount — `remainingOut = out − sum(savedOuts)` in the
+                // BookStep and `remainingOut -= best.out` in StrandFlow — so it
+                // carries 16 digits, half-even. 499.998999 − 31.85618977563462
+                // is 468.1428092243654 to rippled and 468.14280922436538
+                // exactly; the second maker's in then priced one ulp apart
+                // (…4660 vs …4659). Offer crossing only, as finding 118's
+                // in-side fold; a payment keeps finding 81b's exact remainder.
+                // (cross_bridged carries no `offer_crossing`; a payment has no limitQuality)
+                rem_pays = if threshold != u64::MAX && !pays_leg.xrp {
+                    let (neg, m) = stamount_signed_add(false, rem_pays, true, give);
+                    if neg { (0, 0) } else { m }
+                } else {
+                    me_sub(rem_pays, give)
+                };
                 // Finding 118: the remaining-in budget is an STAmount (see the
                 // gross-cap remainder above) — subtract as rippled does.
                 rem_gets = stamount_signed_add(false, rem_gets, true, pay).1;
@@ -5521,7 +5545,18 @@ pub(crate) fn cross_engine_to_net(
                 // mulRatio-nearest otherwise.
                 let credit = match benef_net {
                     Some((rate, net_ask)) => {
-                        if me_cmp(taker_accs.0, ask0) == std::cmp::Ordering::Equal {
+                        // Finding 170: DirectStepI::setCacheLimiting keeps the
+                        // REVERSE cache whenever the forward pass would exceed
+                        // it — fwdIn > cache.in, srcToDst or out likewise — so
+                        // a forward surplus lands on the rev amounts, not only
+                        // an exact hit. #106763015 360F1D30 (1e6 drops → GBP
+                        // through the pool, issuer rate 1.002): rev asks
+                        // 1.678428412228995 for 1.67507825571756; the pool's
+                        // forward swap yields 1.678428412229, and rippled
+                        // credits the cache's 1.67507825571756 (trace:
+                        // DirectStepI::fwd srcToDst 1.675078255717565, credit
+                        // 1.67507825571756). We divided and landed one ulp up.
+                        if me_cmp(taker_accs.0, ask0).is_ge() {
                             net_ask
                         } else {
                             mul_ratio(taker_accs.0, 1_000_000_000, rate as u128, false)
@@ -6046,7 +6081,13 @@ pub(crate) fn cross_engine_to_net(
                 if !me_is_zero(slice_out) {
                     saved_level_outs.push(slice_out);
                 }
-                rem_pays = me_sub(out_req0, fold16(&mut saved_level_outs));
+                rem_pays = if offer_crossing && !pays_leg.xrp {
+                    // finding 173: 16-digit remainingOut (see the per-fill fold)
+                    let (neg, m) = stamount_signed_add(false, out_req0, true, fold16(&mut saved_level_outs));
+                    if neg { (0, 0) } else { m }
+                } else {
+                    me_sub(out_req0, fold16(&mut saved_level_outs))
+                };
                 if !level_ins.is_empty() {
                     saved_level_ins.push(fold16(&mut level_ins));
                     level_ins.clear();
@@ -6607,9 +6648,12 @@ pub(crate) fn cross_engine_to_net(
                     // rippled's trace shows the last DirectStepI::rev bounded
                     // at 50251.6343549063 and the line keeps 2e-11. The exact
                     // remainder rule (finding 81b) drained it to zero
-                    // (#106773978 −3e-9 the same way). A pass-through hop's
-                    // line (finding 98) is never debited, so it is not bounded.
-                    if !gets_leg.xrp && (offer_crossing || !passthrough(taker, gets_leg, PassRole::In)) {
+                    // (#106773978 −3e-9 the same way). Only the sender's own
+                    // SendMax hop is bounded: a later hop spends a carry the
+                    // chain parks on the sender's line (finding 98), which
+                    // rippled's strand never touches — #106735554 9BCDD090's
+                    // last hop divided a parked carry by the issuer rate.
+                    if !gets_leg.xrp && (offer_crossing || crate::tx::amm_swap::sender_hop()) {
                         let held = available(sandbox, taker, gets_leg);
                         let live_gross = if me_cmp(held, taker_accs.1).is_gt() {
                             stamount_signed_add(false, held, true, taker_accs.1).1
@@ -6869,7 +6913,20 @@ pub(crate) fn cross_engine_to_net(
                 if std::env::var("DX_FILL").is_ok() {
                     eprintln!("DX_FILL give={give:?} pay={pay:?} rem_pays={rem_pays:?} rem_gets={rem_gets:?}");
                 }
-                rem_pays = me_sub(rem_pays, give);
+                // Finding 173 (#106769838 3F05F579): rippled's remainingOut is
+                // an IOUAmount — `remainingOut = out − sum(savedOuts)` in the
+                // BookStep and `remainingOut -= best.out` in StrandFlow — so it
+                // carries 16 digits, half-even. 499.998999 − 31.85618977563462
+                // is 468.1428092243654 to rippled and 468.14280922436538
+                // exactly; the second maker's in then priced one ulp apart
+                // (…4660 vs …4659). Offer crossing only, as finding 118's
+                // in-side fold; a payment keeps finding 81b's exact remainder.
+                rem_pays = if offer_crossing && !pays_leg.xrp {
+                    let (neg, m) = stamount_signed_add(false, rem_pays, true, give);
+                    if neg { (0, 0) } else { m }
+                } else {
+                    me_sub(rem_pays, give)
+                };
                 // Finding 118: the remaining-in budget is an STAmount (see the
                 // gross-cap remainder above) — subtract as rippled does. Offer
                 // crossing only: finding 81b pinned the payment walk's
@@ -7013,7 +7070,13 @@ pub(crate) fn cross_engine_to_net(
         if fold_rem && !me_is_zero(level_out_acc) {
             saved_level_outs.push(level_out_acc);
             level_out_acc = (0, 0);
-            rem_pays = me_sub(out_req0, fold16(&mut saved_level_outs));
+            rem_pays = if offer_crossing && !pays_leg.xrp {
+                // finding 173: 16-digit remainingOut (see the per-fill fold)
+                let (neg, m) = stamount_signed_add(false, out_req0, true, fold16(&mut saved_level_outs));
+                if neg { (0, 0) } else { m }
+            } else {
+                me_sub(out_req0, fold16(&mut saved_level_outs))
+            };
             if !level_ins.is_empty() {
                 saved_level_ins.push(fold16(&mut level_ins));
                 level_ins.clear();
@@ -7157,7 +7220,13 @@ pub(crate) fn cross_engine_to_net(
                 if !me_is_zero(slice_out) {
                     saved_level_outs.push(slice_out);
                 }
-                rem_pays = me_sub(out_req0, fold16(&mut saved_level_outs));
+                rem_pays = if offer_crossing && !pays_leg.xrp {
+                    // finding 173: 16-digit remainingOut (see the per-fill fold)
+                    let (neg, m) = stamount_signed_add(false, out_req0, true, fold16(&mut saved_level_outs));
+                    if neg { (0, 0) } else { m }
+                } else {
+                    me_sub(out_req0, fold16(&mut saved_level_outs))
+                };
                 if !level_ins.is_empty() {
                     saved_level_ins.push(fold16(&mut level_ins));
                     level_ins.clear();
