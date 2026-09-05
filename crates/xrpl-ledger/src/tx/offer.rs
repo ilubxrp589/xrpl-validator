@@ -6491,7 +6491,7 @@ pub(crate) fn cross_engine_to_net(
                             };
                             if !me_is_zero(verb) {
                                 match transfer_rate(sandbox, gets_leg)
-                                    .filter(|_| taker != &gets_leg.issuer && maker != gets_leg.issuer)
+                                    .filter(|_| taker != &gets_leg.issuer)
                                 {
                                     // rippled caps the pass by BOTH the line it
                                     // re-reads (the DirectStep's maxSrcToDst) and
@@ -6610,7 +6610,7 @@ pub(crate) fn cross_engine_to_net(
                             live_gross
                         };
                         let live = match transfer_rate(sandbox, gets_leg)
-                            .filter(|_| taker != &gets_leg.issuer && maker != gets_leg.issuer)
+                            .filter(|_| taker != &gets_leg.issuer)
                         {
                             Some(r) => mul_ratio(live_gross, 1_000_000_000, r as u128, false),
                             None => live_gross,
@@ -6782,9 +6782,19 @@ pub(crate) fn cross_engine_to_net(
                 //
                 // Charged as ONE debit of the gross rather than a net debit
                 // followed by a fee adjustment — see `move_leg_gross`.
+                //
+                // Finding 171 (#106758320 A092BA66, tfSell|tfIoC selling
+                // 18.5185185185186 BST at rate 1.08 into the ISSUER's own
+                // offer): the in-side rate is waived only when the offer's
+                // owner is the strand source — alice paying alice
+                // (BookOfferCrossingStep::getOfrInRate) — never because the
+                // owner is the issuer. The taker's DirectStep still hands the
+                // issuer the gross; the issuer→owner send is the no-op.
+                // Mainnet debits the taker 20.0000 and the issuer's offer
+                // 18.5185185; the old `maker != issuer` clause debited 18.5185.
                 {
                     let r = transfer_rate(sandbox, gets_leg)
-                        .filter(|_| taker != &gets_leg.issuer && maker != gets_leg.issuer);
+                        .filter(|_| taker != &gets_leg.issuer);
                     if gets_leg.xrp {
                         // F75 — the XRP fill is debited on the spot, but it is
                         // still part of the walk's GROSS spend: the tail pool

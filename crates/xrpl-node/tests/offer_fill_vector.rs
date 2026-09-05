@@ -834,3 +834,8 @@ fn offer_dead_book_tip_inside_the_limit_pins_a_constant_quality_function_1067747
 fn offer_pool_alone_survives_a_book_tip_beyond_the_limit_106766924() {
     run_bundle(include_str!("vectors/offer_pool_alone_survives_a_book_tip_beyond_the_limit_106766924.json"));
 }
+
+#[test]
+fn offer_issuer_owned_maker_still_grosses_the_taker_spend_106758320() {
+    run_bundle(include_str!("vectors/offer_issuer_owned_maker_still_grosses_the_taker_spend_106758320.json"));
+}
