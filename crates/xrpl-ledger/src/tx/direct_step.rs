@@ -194,10 +194,12 @@ pub(crate) fn hop_frozen(sandbox: &Sandbox, hop: &DirectHop) -> bool {
 /// refused when `cur`'s own NoRipple flag is set on BOTH of its lines — the
 /// one from `prev` and the one to `next` — or when either line is missing:
 ///
-///     if (!sleIn || !sleOut) return terNO_LINE;
-///     if (sleIn->isFlag((cur > prev) ? lsfHighNoRipple : lsfLowNoRipple) &&
-///         sleOut->isFlag((cur > next) ? lsfHighNoRipple : lsfLowNoRipple))
-///         return terNO_RIPPLE;
+/// ```text
+/// if (!sleIn || !sleOut) return terNO_LINE;
+/// if (sleIn->isFlag((cur > prev) ? lsfHighNoRipple : lsfLowNoRipple) &&
+///     sleOut->isFlag((cur > next) ? lsfHighNoRipple : lsfLowNoRipple))
+///     return terNO_RIPPLE;
+/// ```
 ///
 /// The default path of a holder → holder IOU payment ripples through the
 /// ISSUER, so an issuer that set NoRipple on its side of both holders' lines
