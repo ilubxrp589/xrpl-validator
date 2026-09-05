@@ -806,3 +806,16 @@ fn offer_direct_pass_stops_at_a_self_offer_beyond_the_limit() {
 fn offer_became_unfunded_offer_survives_a_killed_crossing() {
     run_bundle(include_str!("vectors/offer_became_unfunded_offer_survives_a_killed_crossing_106746952.json"));
 }
+
+/// Finding 163 (#106771950 B1283A3C1288): rBTwLga3i2 buys 1M XRP with
+/// 1,380,000.5 USD.Bitstamp (limit 1.3800005e-6 USD/drop). The tip is a
+/// 2208-drop dust offer FILED at 1.3800013e-6, beyond the strict limit but
+/// inside the 1.0015-inflated one, whose own amounts price at 1.3795e-6.
+/// rippled attempts it, consumes it whole at its amounts, and the strand
+/// check passes; we ended the walk at the level and crossed nothing.
+#[test]
+fn offer_live_tip_beyond_strict_inside_inflated_is_attempted_106771950() {
+    run_bundle(include_str!(
+        "vectors/offer_live_tip_beyond_strict_inside_inflated_is_attempted_106771950.json"
+    ));
+}

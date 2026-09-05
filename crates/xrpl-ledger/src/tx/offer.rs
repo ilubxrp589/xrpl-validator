@@ -5620,141 +5620,11 @@ pub(crate) fn cross_engine_to_net(
         if strand_active && !reap_to_live_head(sandbox, &dk, pays_leg, gets_leg, Some(&mut oc0), stale, Some(&drained_level)) {
             continue;
         }
-        // AMM turn: consume pool liquidity while its spot quality strictly
-        // beats this book level (anchored so the book resumes at `q`).
-        //
-        // ONE turn per PASS, not per level. rippled calls `tryAMM` exactly once
-        // per `forEachOffer`, anchored on the first live tip
-        // (BookStep.cpp:855-865), and a pass ends only when an offer is really
-        // CONSUMED — the strand then re-runs and the pool gets another turn. An
-        // offer merely REMOVED never ends the pass: `limitSelfCrossQuality`
-        // returns before anything is consumed and the walk keeps stepping
-        // inside the same `forEachOffer`, with no second `tryAMM`.
-        //
-        // #105945386 7EF34E79F13A: the two levels ahead of the pool hold
-        // nothing but the taker's OWN offers, so re-anchoring on each of them
-        // took three slices (182925 + 113464 + 422213 drops) that bought the
-        // order outright. rippled takes ONE slice of 182925 and then flows the
-        // remaining 535677 as a single pass costing 46.96292384379671 SPEPE —
-        // one unit past its own limit — which the achieved-quality check then
-        // rejects, leaving exactly that remainder to rest.
-        //
-        // ...AND ONLY ON A LEVEL THE TAKER COULD ACTUALLY TRADE. `tryAMM` is
-        // handed `offers.tip().quality()`, and a tip beyond the limit is not a
-        // tip the stream ever reaches — rippled then calls it with NO clob
-        // quality at all, which is `maxOffer`, and `limitOut` trims that to the
-        // limit instead. Anchoring to an unreachable level sizes the slice off
-        // a price the taker rejected.
-        //
-        // #106295504 E9F363D7 (and #106297489 3BEC441E, the same market maker
-        // hours later): tfSell|tfPassive, 1250 XRP for 16.604535 SOL, so a
-        // limit of 75280230.658627. The book's tip is 75323299.971751 — WORSE —
-        // and the XRP/SOL pool sits between them at 75152490.428151. rippled
-        // builds maxOffer, trims it, flows 133055 drops realising
-        // 75280687.18924356, misses its own limit by 6.06e-6 (past the 1e-7
-        // forgiveness) and REJECTS the pass: `Total flow: in: 0 out: 0`, the
-        // offer rests whole. Anchored to that unreachable tip we sized 128056
-        // drops instead, whose realised quality CLEARS the limit — so we
-        // crossed a pool mainnet never touched, three extra mutations.
-        // The break below then falls through to the unanchored tail turn, which
-        // is exactly the call rippled makes.
-        if let Some(a) = amm.as_ref().filter(|_| prev_level_crossed && q <= threshold) {
-            if std::env::var("DX_AMM").is_ok() {
-                eprintln!("DX_AMM site=direct-walk q={q:x}");
-            }
-            // A turn happens at a level head: close the open level's debit
-            // (harmless when the turn declines — the level was ending
-            // anyway). The slice itself settles per-slice inside consume.
-            settle_taker!();
-            taker_accs = ((0, 0), (0, 0));
-            acc_level = None;
-            drained_level.clear();
-            let (rp, rg, used) = amm_turn(
-                amm_fib.as_deref_mut(), sandbox, a, taker, beneficiary,
-                benef_net.map(|(r, na)| (r, na, ask0)),
-                gets_gross_cap.map(|c| me_sub(c, in_gross_spent)), rem_pays, rem_gets,
-                pays_leg, gets_leg, threshold, threshold_self, sell, Some(q), pay_in_rate,
-            );
-            // Finding 159: the slice opens this pass's totals.
-            pass_tot = if used { (me_sub(rem_gets, rg), me_sub(rem_pays, rp)) } else { ((0, 0), (0, 0)) };
-            if used {
-                // Mirror of the slice settlement's own gross (settle_slice):
-                // exhausting rem_gets takes the remaining cap, else gross_in.
-                let slice_net = me_sub(rem_gets, rg);
-                let g = match gets_gross_cap {
-                    Some(cap) if me_is_zero(rg) => me_sub(cap, in_gross_spent),
-                    _ => gross_in(pay_in_rate, slice_net),
-                };
-                in_gross_spent = stamount_signed_add(false, in_gross_spent, false, g).1;
-                // Finding 133: a pool slice is its own iteration.
-                outer_debits = stamount_signed_add(false, outer_debits, false, g).1;
-            }
-            // An AMM slice is its own flow iteration (BookStep.cpp:818):
-            // bank the pending level entry, then the slice's out, and
-            // re-derive from the fold.
-            if fold_rem && used {
-                if !me_is_zero(level_out_acc) {
-                    saved_level_outs.push(level_out_acc);
-                    level_out_acc = (0, 0);
-                }
-                let slice_out = me_sub(rem_pays, rp);
-                if !me_is_zero(slice_out) {
-                    saved_level_outs.push(slice_out);
-                }
-                rem_pays = me_sub(out_req0, fold16(&mut saved_level_outs));
-                if !level_ins.is_empty() {
-                    saved_level_ins.push(fold16(&mut level_ins));
-                    level_ins.clear();
-                    level_in_acc = (0, 0);
-                }
-                let slice_in = me_sub(rem_gets, rg);
-                if !me_is_zero(slice_in) {
-                    saved_level_ins.push(slice_in);
-                }
-            } else {
-                rem_pays = rp;
-            }
-            if used {
-                sweep_admitted = None;
-            }
-            rem_gets = if fold_rem && used && !in_fold_off {
-                stamount_signed_add(false, in_req0, true, fold16(&mut saved_level_ins)).1
-            } else {
-                rg
-            };
-            crossed += used as u32;
-            if done(rem_pays, rem_gets) {
-                break 'dirs;
-            }
-            // ONE AMM CONSUMPTION PER PAYMENT-ENGINE ITERATION. "At any payment
-            // engine iteration, AMM offer can only be consumed once"
-            // (BookStep.cpp:818) — so when a payment wants more pool liquidity
-            // than one AMM offer gives, rippled ENDS the pass and `flow()`
-            // re-enters the strand for the next one. Each iteration writes the
-            // maker's residual, so N iterations are N roundings; taking fib
-            // slices inside a single pass rounds once and lands elsewhere.
-            //
-            // #105795329 ED4F899F is the specimen: two rounds of 220.414... and
-            // 144.460... spend 193488035 drops + 10 fee, which is mainnet's
-            // spend to the drop, and the transaction goes 4 hits to 1.
-            //
-            // PAYMENTS ONLY. The boundary is only meaningful because
-            // `apply_path_payment`'s round loop re-enters the strand with what
-            // is left, exactly as `flow()`'s driver does. FlowCross has no such
-            // loop, so returning here would abandon the rest of the book rather
-            // than come back to it — measured, and it moves the XRP side of an
-            // offer-crossing pass that is byte-exact today.
-            if used && !offer_crossing {
-                settle_taker!();
-                return (rem_pays, rem_gets, crossed, in_gross_spent);
-            }
-        }
-        // Set when this level CONSUMES an offer, which is what ends a pass and
-        // earns the pool its next turn. Removals leave it false.
-        let mut level_crossed = false;
-        if std::env::var("DX_BOOK").is_ok() {
-            eprintln!("DX_BOOK dir q={q:016x} threshold={threshold:016x} cross={}", q <= threshold);
-        }
+        // Finding 163: a beyond-strict level whose first live foreign offer
+        // is inside the inflated limit is ATTEMPTED — the pool's turn first
+        // (rippled: `tryAMM(offers.tip().quality())` precedes `execOffer`
+        // at every level), then the offer, judged on the pass totals.
+        let mut attempt_beyond = false;
         if q > threshold {
             if residual_q.is_none() {
                 residual_q = Some(q);
@@ -5846,7 +5716,7 @@ pub(crate) fn cross_engine_to_net(
                 })
             {
                 let mut page_key_h = dk;
-                for _ in 0..10_000 {
+                'sweep: for _ in 0..10_000 {
                     let Some(page) = json_at(sandbox, &page_key_h) else { break };
                     let entries: Vec<String> = page
                         .get("Indexes")
@@ -5887,7 +5757,27 @@ pub(crate) fn cross_engine_to_net(
                         ) {
                             continue;
                         }
-                        break 'dirs;
+                        // Finding 163 (#106771950 B1283A3C1288, again at
+                        // #106772087 and #106772093 — rBTwLga3i2 buying 1M
+                        // XRP with 1,380,000.5 USD.Bitstamp): the tip is
+                        // rsRdjxq2's 2208-drop dust offer FILED at
+                        // 1.3800013e-6 USD/drop, a hair beyond the strict
+                        // 1.3800005e-6 limit but inside the 1.0015-inflated
+                        // one, while its OWN amounts (0.0030459516 USD for
+                        // 2208 drops) price at 1.3795e-6 — inside strict.
+                        // rippled gates the level on the filed quality
+                        // against the inflated `qualityThreshold_`, attempts
+                        // the offer, consumes it WHOLE at its own amounts,
+                        // and the strand check passes: net 1.3795e-6 ≤ the
+                        // limit. Mainnet moves 2208 drops and two USD lines
+                        // and rests 1380000.496952959 for 999999997792; we
+                        // ended the walk here, crossed nothing and rested the
+                        // full offer. A live foreign offer on this level is
+                        // ATTEMPTED like any other: the pass judge decides
+                        // (a PARTIAL fill priced at the filed rate still
+                        // misses the limit and ends the pass, as before).
+                        attempt_beyond = true;
+                        break 'sweep;
                     }
                     let next = page.get("IndexNext").map(dirnum).unwrap_or(0);
                     if next == 0 {
@@ -5895,8 +5785,13 @@ pub(crate) fn cross_engine_to_net(
                     }
                     page_key_h = keylet::dir_page_key(&dk, next);
                 }
-                continue;
-            }
+                if !attempt_beyond {
+                    continue;
+                }
+                if std::env::var("DX_BOOK").is_ok() {
+                    eprintln!("DX_BOOK level {q:016x} beyond strict, inside inflated — attempting its live tip (F163)");
+                }
+            } else {
             // rippled's offer stream has no quality gate for STEPPING: once
             // the strand was BUILT, rev keeps stepping past DEAD offers on
             // levels beyond the limit — reaping them — until a LIVE offer
@@ -5914,6 +5809,169 @@ pub(crate) fn cross_engine_to_net(
                 continue;
             }
             break;
+            }
+        }
+        // AMM turn: consume pool liquidity while its spot quality strictly
+        // beats this book level (anchored so the book resumes at `q`).
+        //
+        // ONE turn per PASS, not per level. rippled calls `tryAMM` exactly once
+        // per `forEachOffer`, anchored on the first live tip
+        // (BookStep.cpp:855-865), and a pass ends only when an offer is really
+        // CONSUMED — the strand then re-runs and the pool gets another turn. An
+        // offer merely REMOVED never ends the pass: `limitSelfCrossQuality`
+        // returns before anything is consumed and the walk keeps stepping
+        // inside the same `forEachOffer`, with no second `tryAMM`.
+        //
+        // #105945386 7EF34E79F13A: the two levels ahead of the pool hold
+        // nothing but the taker's OWN offers, so re-anchoring on each of them
+        // took three slices (182925 + 113464 + 422213 drops) that bought the
+        // order outright. rippled takes ONE slice of 182925 and then flows the
+        // remaining 535677 as a single pass costing 46.96292384379671 SPEPE —
+        // one unit past its own limit — which the achieved-quality check then
+        // rejects, leaving exactly that remainder to rest.
+        //
+        // ...AND ONLY ON A LEVEL THE TAKER COULD ACTUALLY TRADE. `tryAMM` is
+        // handed `offers.tip().quality()`, and a tip beyond the limit is not a
+        // tip the stream ever reaches — rippled then calls it with NO clob
+        // quality at all, which is `maxOffer`, and `limitOut` trims that to the
+        // limit instead. Anchoring to an unreachable level sizes the slice off
+        // a price the taker rejected.
+        //
+        // #106295504 E9F363D7 (and #106297489 3BEC441E, the same market maker
+        // hours later): tfSell|tfPassive, 1250 XRP for 16.604535 SOL, so a
+        // limit of 75280230.658627. The book's tip is 75323299.971751 — WORSE —
+        // and the XRP/SOL pool sits between them at 75152490.428151. rippled
+        // builds maxOffer, trims it, flows 133055 drops realising
+        // 75280687.18924356, misses its own limit by 6.06e-6 (past the 1e-7
+        // forgiveness) and REJECTS the pass: `Total flow: in: 0 out: 0`, the
+        // offer rests whole. Anchored to that unreachable tip we sized 128056
+        // drops instead, whose realised quality CLEARS the limit — so we
+        // crossed a pool mainnet never touched, three extra mutations.
+        // The break below then falls through to the unanchored tail turn, which
+        // is exactly the call rippled makes.
+        if let Some(a) = amm.as_ref().filter(|_| prev_level_crossed && (q <= threshold || attempt_beyond)) {
+            if std::env::var("DX_AMM").is_ok() {
+                eprintln!("DX_AMM site=direct-walk q={q:x}");
+            }
+            // A turn happens at a level head: close the open level's debit
+            // (harmless when the turn declines — the level was ending
+            // anyway). The slice itself settles per-slice inside consume.
+            settle_taker!();
+            taker_accs = ((0, 0), (0, 0));
+            acc_level = None;
+            drained_level.clear();
+            let (rp, rg, used) = amm_turn(
+                amm_fib.as_deref_mut(), sandbox, a, taker, beneficiary,
+                benef_net.map(|(r, na)| (r, na, ask0)),
+                gets_gross_cap.map(|c| me_sub(c, in_gross_spent)), rem_pays, rem_gets,
+                pays_leg, gets_leg, threshold, threshold_self, sell, Some(q), pay_in_rate,
+            );
+            // Finding 159: the slice opens this pass's totals — but only when
+            // the level's offers can join the same iteration.
+            //
+            // Finding 163: `execOffer` anchors an iteration on its FIRST
+            // offer's quality (`ofrQ`, BookStep.cpp:712-720), and the AMM
+            // offer's quality is `Quality{amounts}` of the slice itself
+            // (AMMLiquidity.cpp:211). An anchored slice is sized to the tip's
+            // quality, so with two IOUs the 16-digit rates coincide and the
+            // tip follows in the same iteration (q200: 6980735 drops for
+            // 67.015056 CNY encodes to the tip's 104166.6666666667). With
+            // XRP on one side the whole-drop rounding leaves them apart, the
+            // tip returns false, and the slice is alone: the next iteration's
+            // `tryAMM` declines ("higher clob quality") and the tip is judged
+            // by ITSELF — q120 (#106734370): the 5 XRP tip fill "rejected by
+            // limitQuality" after the 99.673705 XRP slice went through.
+            pass_tot = match used {
+                true => {
+                    let (si, so) = (me_sub(rem_gets, rg), me_sub(rem_pays, rp));
+                    let same_iteration = rate_of_me(si, so) == Some(q);
+                    if std::env::var("DX_AMM").is_ok() {
+                        eprintln!(
+                            "DX_AMM slice q={:?} level q={q:016x} same_iteration={same_iteration}",
+                            rate_of_me(si, so).map(|r| format!("{r:016x}"))
+                        );
+                    }
+                    if same_iteration { (si, so) } else { ((0, 0), (0, 0)) }
+                }
+                false => ((0, 0), (0, 0)),
+            };
+            if used {
+                // Mirror of the slice settlement's own gross (settle_slice):
+                // exhausting rem_gets takes the remaining cap, else gross_in.
+                let slice_net = me_sub(rem_gets, rg);
+                let g = match gets_gross_cap {
+                    Some(cap) if me_is_zero(rg) => me_sub(cap, in_gross_spent),
+                    _ => gross_in(pay_in_rate, slice_net),
+                };
+                in_gross_spent = stamount_signed_add(false, in_gross_spent, false, g).1;
+                // Finding 133: a pool slice is its own iteration.
+                outer_debits = stamount_signed_add(false, outer_debits, false, g).1;
+            }
+            // An AMM slice is its own flow iteration (BookStep.cpp:818):
+            // bank the pending level entry, then the slice's out, and
+            // re-derive from the fold.
+            if fold_rem && used {
+                if !me_is_zero(level_out_acc) {
+                    saved_level_outs.push(level_out_acc);
+                    level_out_acc = (0, 0);
+                }
+                let slice_out = me_sub(rem_pays, rp);
+                if !me_is_zero(slice_out) {
+                    saved_level_outs.push(slice_out);
+                }
+                rem_pays = me_sub(out_req0, fold16(&mut saved_level_outs));
+                if !level_ins.is_empty() {
+                    saved_level_ins.push(fold16(&mut level_ins));
+                    level_ins.clear();
+                    level_in_acc = (0, 0);
+                }
+                let slice_in = me_sub(rem_gets, rg);
+                if !me_is_zero(slice_in) {
+                    saved_level_ins.push(slice_in);
+                }
+            } else {
+                rem_pays = rp;
+            }
+            if used {
+                sweep_admitted = None;
+            }
+            rem_gets = if fold_rem && used && !in_fold_off {
+                stamount_signed_add(false, in_req0, true, fold16(&mut saved_level_ins)).1
+            } else {
+                rg
+            };
+            crossed += used as u32;
+            if done(rem_pays, rem_gets) {
+                break 'dirs;
+            }
+            // ONE AMM CONSUMPTION PER PAYMENT-ENGINE ITERATION. "At any payment
+            // engine iteration, AMM offer can only be consumed once"
+            // (BookStep.cpp:818) — so when a payment wants more pool liquidity
+            // than one AMM offer gives, rippled ENDS the pass and `flow()`
+            // re-enters the strand for the next one. Each iteration writes the
+            // maker's residual, so N iterations are N roundings; taking fib
+            // slices inside a single pass rounds once and lands elsewhere.
+            //
+            // #105795329 ED4F899F is the specimen: two rounds of 220.414... and
+            // 144.460... spend 193488035 drops + 10 fee, which is mainnet's
+            // spend to the drop, and the transaction goes 4 hits to 1.
+            //
+            // PAYMENTS ONLY. The boundary is only meaningful because
+            // `apply_path_payment`'s round loop re-enters the strand with what
+            // is left, exactly as `flow()`'s driver does. FlowCross has no such
+            // loop, so returning here would abandon the rest of the book rather
+            // than come back to it — measured, and it moves the XRP side of an
+            // offer-crossing pass that is byte-exact today.
+            if used && !offer_crossing {
+                settle_taker!();
+                return (rem_pays, rem_gets, crossed, in_gross_spent);
+            }
+        }
+        // Set when this level CONSUMES an offer, which is what ends a pass and
+        // earns the pool its next turn. Removals leave it false.
+        let mut level_crossed = false;
+        if std::env::var("DX_BOOK").is_ok() {
+            eprintln!("DX_BOOK dir q={q:016x} threshold={threshold:016x} cross={} attempt_beyond={attempt_beyond}", q <= threshold);
         }
         // Finding 114: rippled's rev pass steps this level by the WANT, not by
         // the taker's funds — reap what that stepping reaches before the funded
