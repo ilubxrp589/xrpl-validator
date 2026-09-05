@@ -85,3 +85,13 @@ fn run_bundle(bundle_json: &str) {
 fn trust_set_creates_a_line_with_a_symbol_currency_code() {
     run_bundle(include_str!("vectors/trustset_symbol_currency_106699694.json"));
 }
+
+/// Finding 161 (#106759500 D92BD1028719): rMY7ERFxNN sets a 100000 "RLUSD"
+/// line toward rQhWct2f…, an account that does not exist. With AMM enabled
+/// rippled's preclaim returns tecNO_DST for a missing destination
+/// (TrustSet.cpp:213-216); mainnet takes the fee and writes nothing else.
+/// We created the line. The same bot repeated it six more times that day.
+#[test]
+fn trust_set_to_a_missing_issuer_is_tec_no_dst() {
+    run_bundle(include_str!("vectors/trust_set_to_a_missing_issuer_is_tec_no_dst_106759500.json"));
+}

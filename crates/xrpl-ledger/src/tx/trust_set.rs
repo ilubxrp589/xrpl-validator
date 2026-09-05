@@ -198,14 +198,26 @@ impl Transactor for TrustSetTransactor {
         // Destination rules (TrustSet.cpp:220-278), in rippled's order —
         // both run in preclaim, before any reserve arithmetic. The line's
         // counterparty is the LimitAmount's issuer, whose AccountRoot is
-        // hydrated for every tx (collect_issuers), so a readable destination
-        // gates the checks and absence skips them.
+        // hydrated for every tx (collect_issuers).
+        //
+        // Finding 161 (#106759500 D92BD1028719 and six more from rMY7ERFxNN
+        // in the same day, all "RLUSD" lines toward rQhWct2f…, an account
+        // that does not exist): with AMM (or SingleAssetVault) enabled a
+        // missing destination is tecNO_DST — `if ((ammEnabled(rules) ||
+        // featureSingleAssetVault) && sleDst == nullptr) return tecNO_DST;`,
+        // TrustSet.cpp:213-216 — and both amendments are live on mainnet.
+        // We skipped every destination rule when the root was absent and
+        // created the line: a RippleState, two directory entries and an
+        // OwnerCount against mainnet's fee-only root.
         {
             let currency = Self::currency_code(currency_str);
             let dst_key = keylet::account_root_key(&issuer);
-            if let Some(dst) = sandbox
+            let Some(dst) = sandbox
                 .read(&dst_key)
                 .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+            else {
+                return TxResult::NoDst;
+            };
             {
                 let line_exists =
                     sandbox.exists(&keylet::ripple_state_key(&tx.account, &issuer, &currency));
