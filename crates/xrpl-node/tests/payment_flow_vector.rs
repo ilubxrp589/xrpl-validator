@@ -494,3 +494,17 @@ fn payment_sender_issues_its_own_iou_to_the_issuer_within_its_limit_106784160() 
 fn payment_lone_strand_runs_on_after_its_rival_goes_unboundable_106743104() {
     run_bundle(include_str!("vectors/payment_lone_strand_runs_on_after_its_rival_goes_unboundable_106743104.json"));
 }
+
+// Finding 183 — #106788656 1B9CE050C5DB (rfcoGE3E59, 200 RLUSD → USDC,
+// tfPartialPayment, six strands): iteration 0 spends 0.0002455730745894072
+// RLUSD through the CNY strand. rippled's `remainingIn` falls by the strand's
+// OWN reported in; we measured the spend by differencing the sender's RLUSD
+// line, whose 16-digit balance resolves 1e-12, and read 0.000245573075 — so
+// iteration 1's in-limited fill of maker A3F9DCB7 was 199.999754426925 for
+// mainnet's 199.9997544269254 and the offer's TakerPays rested 4 ulp high.
+// The walk's own figure is trusted whenever it sits within the line's quantum
+// of the balance delta.
+#[test]
+fn payment_strand_in_beats_the_lines_quantised_delta_106788656() {
+    run_bundle(include_str!("vectors/payment_strand_in_beats_the_lines_quantised_delta_106788656.json"));
+}

@@ -1611,13 +1611,37 @@ impl PaymentTransactor {
                 // balance is blind. l106267220 F328A94C round 5: the dust
                 // round spends ~5e-22 for its 2 drops; with d=0 the loop
                 // broke and rounds 6+ (the real 26794) never ran.
+                // Finding 183: the line's 16 digits are spent on its MAGNITUDE,
+                // so `d` is the true spend quantised to the balance's ulp — for
+                // a small spend from a large line that quantum dwarfs the 1e-9
+                // relative test above and the walk's exact figure was refused.
+                // rippled's `remainingIn -= f.in` (StrandFlow.h:652) never sees
+                // the line at all. #106788656 1B9CE050C5DB: iteration 0 spends
+                // 0.0002455730745894072 RLUSD from a line resolving 1e-12; the
+                // delta read 0.000245573075, iteration 1's in-limited fill of
+                // maker A3F9DCB7 became 199.999754426925 for mainnet's
+                // 199.9997544269254, and the offer's TakerPays rested 4 ulp high.
+                // The walk's figure is trusted whenever it sits within two ulp
+                // of the coarser balance (before or after) of the delta.
+                let quantum = {
+                    let nb = ox::iou_amount(b);
+                    let na = ox::iou_amount(a);
+                    let e = nb.1.max(na.1);
+                    (2u128, e)
+                };
+                let within_quantum = |p: ox::Me| {
+                    !ox::me_is_zero(p) && {
+                        let (hi, lo) = if ox::me_cmp(p, d).is_gt() { (p, d) } else { (d, p) };
+                        ox::me_cmp(ox::me_sub(hi, lo), quantum).is_le()
+                    }
+                };
                 if ox::me_is_zero(d) {
                     match spent_precise.filter(|p| !ox::me_is_zero(*p)) {
                         Some(p) => p,
                         None => d,
                     }
                 } else {
-                    match spent_precise.filter(|p| agree(*p)) {
+                    match spent_precise.filter(|p| agree(*p) || within_quantum(*p)) {
                         Some(p) => p,
                         None => d,
                     }
