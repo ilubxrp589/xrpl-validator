@@ -839,3 +839,8 @@ fn offer_pool_alone_survives_a_book_tip_beyond_the_limit_106766924() {
 fn offer_issuer_owned_maker_still_grosses_the_taker_spend_106758320() {
     run_bundle(include_str!("vectors/offer_issuer_owned_maker_still_grosses_the_taker_spend_106758320.json"));
 }
+
+#[test]
+fn offer_sell_past_its_minimum_rests_the_unsold_remainder_106758110() {
+    run_bundle(include_str!("vectors/offer_sell_past_its_minimum_rests_the_unsold_remainder_106758110.json"));
+}

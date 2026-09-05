@@ -7710,7 +7710,16 @@ impl Transactor for OfferCreateTransactor {
             }
             return TxResult::Success; // keep fills, never place
         }
-        if me_is_zero(rem_pays) || me_is_zero(rem_gets) {
+        // "Offer fully crossed" (OfferCreate.cpp:778) is judged on the amounts
+        // that would REST — for tfSell the out side is re-derived from the
+        // unsold in (flowCross :489-506: afterCross.out = divRoundStrict(
+        // afterCross.in, rate)), so a sell whose minimum was met but whose
+        // TakerGets did not all sell still rests the rest. Finding 172
+        // (#106758110 E664290A): 7559 BAYN tfSell; the pool took 7456.036 for
+        // 124.14 XRP — past the 118.68 minimum — and mainnet rested
+        // 102.963884945252 BAYN for 1616532 drops; the saturated pays here
+        // read as fully crossed and we rested nothing (OwnerCount 1371/1372).
+        if me_is_zero(rem_gets) || (!sell && me_is_zero(rem_pays)) {
             return TxResult::Success; // fully consumed
         }
 
@@ -7914,6 +7923,9 @@ impl Transactor for OfferCreateTransactor {
             };
             if me_is_zero(derived) { rem_gets } else { derived }
         };
+        if me_is_zero(rem_pays) || me_is_zero(rem_gets) {
+            return TxResult::Success; // fully crossed once repriced (OfferCreate.cpp:778)
+        }
         let seq = if tx.uses_ticket() { tx.ticket_seq.unwrap_or(0) } else { tx.sequence };
         let offer_key = keylet::offer_key(&tx.account, seq);
         let owner_node = crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &offer_key);
