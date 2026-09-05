@@ -3101,8 +3101,15 @@ fn cross_bridged(
     // Leg A: spend our gets, acquire XRP. Leg B: spend XRP, acquire our pays.
     let base_a = keylet::book_base(&gets_leg.cur, &zero, &gets_leg.issuer, &zero);
     let base_b = keylet::book_base(&zero, &pays_leg.cur, &zero, &pays_leg.issuer);
-    let la = book_offer_ladder(sandbox, &base_a, 128);
-    let lb = book_offer_ladder(sandbox, &base_b, 128);
+    // Finding 179: a bridge leg's ladder ends where rippled's does —
+    // kMaxOffersToConsume, 1000 offers per BookStep per transaction
+    // (BookStep.cpp:60, :1085/:1247) — not at 128. Surfaced by #106743104
+    // F8084760, a 54-iteration XRPH→XRP→RLUSD crawl whose bundle probe went
+    // dry at round 50; that probe turned out to lack the XRPH/XRP book tip
+    // rippled anchors the pool to (never consumed, so never in the meta),
+    // so the cap is aligned on rippled's constant alone.
+    let la = book_offer_ladder(sandbox, &base_a, 1000);
+    let lb = book_offer_ladder(sandbox, &base_b, 1000);
     // Per-leg AMM liquidity: each bridge leg is a BookStep of its own pair.
     let amm_a = crate::tx::amm_swap::discover(sandbox, gets_leg, &xrp_leg, taker);
     let amm_b = crate::tx::amm_swap::discover(sandbox, &xrp_leg, pays_leg, taker);
