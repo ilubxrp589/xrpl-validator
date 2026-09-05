@@ -461,3 +461,8 @@ fn payment_bound_sender_pays_the_line_bound_gross_verbatim_106782303() {
 fn payment_parked_carry_take_back_is_capped_at_the_park_106733664() {
     run_bundle(include_str!("vectors/payment_parked_carry_take_back_is_capped_at_the_park_106733664.json"));
 }
+
+#[test]
+fn payment_park_undo_reverts_the_creators_owner_count_106735554() {
+    run_bundle(include_str!("vectors/payment_park_undo_reverts_the_creators_owner_count_106735554.json"));
+}

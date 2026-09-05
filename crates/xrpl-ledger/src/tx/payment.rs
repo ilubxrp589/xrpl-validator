@@ -84,14 +84,36 @@ impl PaymentTransactor {
 
     fn undo_inflight_lines(sandbox: &mut Sandbox, lines: &[InflightLine]) {
         for l in lines.iter().rev() {
+            if std::env::var("DX_UNDO").is_ok() {
+                eprintln!(
+                    "DX_UNDO {} pre={} now={}",
+                    hex::encode(&l.lk.0[..4]),
+                    l.line_pre.is_some(),
+                    sandbox.read(&l.lk).is_some()
+                );
+            }
             match &l.line_pre {
                 Some(bytes) => sandbox.write(l.lk, bytes.clone()),
                 None => {
-                    if sandbox.read(&l.lk).is_some() {
+                    if let Some(line) = crate::tx::offer::json_at(sandbox, &l.lk) {
+                        // Finding 178 (#106735554 9BCDD090): a line the PARK
+                        // created (line_adjust's trustCreate path) carries its
+                        // creator's reserve bit, sits in both owner directories
+                        // and charged the creator's OwnerCount; a
+                        // `fund_for_trial` fiction is a bare Flags-0 object
+                        // that charged nothing. Reverting the park without the
+                        // count left rapido one object high on every mixed
+                        // path whose book output feeds an account run.
+                        let party_low = l.owners[0] < l.owners[1];
+                        let reserve_bit: u64 = if party_low { 0x0001_0000 } else { 0x0002_0000 };
+                        let charged = line["Flags"].as_u64().unwrap_or(0) & reserve_bit != 0;
                         for owner in &l.owners {
                             crate::ledger::directory::owner_dir_remove(sandbox, owner, &l.lk, None, false);
                         }
                         sandbox.forget(&l.lk);
+                        if charged {
+                            crate::tx::offer::owner_count_add(sandbox, &l.owners[0], -1);
+                        }
                     }
                 }
             }
