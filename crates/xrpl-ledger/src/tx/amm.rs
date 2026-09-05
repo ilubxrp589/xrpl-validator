@@ -1229,13 +1229,48 @@ fn tear_down_lp_line(
     };
     let limit_zero = lp_line[my_limit]["value"].as_str().map(|v| v == "0").unwrap_or(true);
     let quality_zero = lp_line.get(my_q_in).is_none() && lp_line.get(my_q_out).is_none();
-    if !(limit_zero && quality_zero) {
+    // …and the REST of rippleCreditIOU's guard (TokenHelpers.cpp:702-716),
+    // the rule `line_adjust` already applies to ordinary lines: the LP's
+    // reserve bit is set, its NoRipple bit DIFFERS from its account's
+    // DefaultRipple, and its side is not frozen. Finding 168 (#106766906
+    // 29526F1B): rEWLR7's LP line carried lsfLowNoRipple while the account
+    // has DefaultRipple — a non-default line — so mainnet zeroed and KEPT it
+    // (OwnerCount 709 untouched); we deleted it and took 708.
+    let flags = lp_line["Flags"].as_u64().unwrap_or(0);
+    let (my_reserve, my_no_ripple, my_freeze, their_reserve): (u64, u64, u64, u64) = if who < amm_acct {
+        (0x0001_0000, 0x0010_0000, 0x0040_0000, 0x0002_0000)
+    } else {
+        (0x0002_0000, 0x0020_0000, 0x0080_0000, 0x0001_0000)
+    };
+    let default_ripple = ox::json_at(sandbox, &keylet::account_root_key(who))
+        .and_then(|a| a["Flags"].as_u64())
+        .map(|f| f & 0x0080_0000 != 0)
+        .unwrap_or(false);
+    let default_state = flags & my_reserve != 0
+        && (flags & my_no_ripple != 0) != default_ripple
+        && flags & my_freeze == 0
+        && limit_zero
+        && quality_zero;
+    if !default_state {
         // Zero the balance in place; the line stays.
         let mut line = lp_line.clone();
         if let Some(b) = line.get_mut("Balance") {
             b["value"] = serde_json::Value::String("0".to_string());
         }
         sandbox.write(lp_key, serde_json::to_vec(&line).unwrap_or_default());
+        return;
+    }
+    if flags & their_reserve != 0 {
+        // The LP's reserve is released but the pool's side holds one:
+        // `bDelete = !saBalance && !receiverReserveFlag` fails — the line
+        // stays at zero with the LP's reserve bit cleared.
+        let mut line = lp_line.clone();
+        if let Some(b) = line.get_mut("Balance") {
+            b["value"] = serde_json::Value::String("0".to_string());
+        }
+        line["Flags"] = serde_json::Value::from(flags & !my_reserve);
+        sandbox.write(lp_key, serde_json::to_vec(&line).unwrap_or_default());
+        crate::tx::offer::owner_count_add(sandbox, who, -1);
         return;
     }
     let node = |field: &str| {

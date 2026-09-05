@@ -234,3 +234,8 @@ fn amm_withdraw_two_asset_both_orderings_overshoot_is_amm_failed() {
 fn amm_withdraw_needs_reserve_for_a_new_line() {
     run_bundle(include_str!("vectors/amm_withdraw_needs_reserve_for_a_new_line_106752895.json"));
 }
+
+#[test]
+fn amm_withdraw_keeps_a_non_default_lp_line_at_zero_106766906() {
+    run_bundle(include_str!("vectors/amm_withdraw_keeps_a_non_default_lp_line_at_zero_106766906.json"));
+}
