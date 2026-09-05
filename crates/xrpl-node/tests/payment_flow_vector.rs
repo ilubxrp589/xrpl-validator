@@ -451,3 +451,8 @@ fn payment_funds_limited_fill_clamps_to_the_offers_own_taker_pays_106759499() {
 fn payment_forward_surplus_keeps_the_reverse_cache_106763015() {
     run_bundle(include_str!("vectors/payment_forward_surplus_keeps_the_reverse_cache_106763015.json"));
 }
+
+#[test]
+fn payment_bound_sender_pays_the_line_bound_gross_verbatim_106782303() {
+    run_bundle(include_str!("vectors/payment_bound_sender_pays_the_line_bound_gross_verbatim_106782303.json"));
+}

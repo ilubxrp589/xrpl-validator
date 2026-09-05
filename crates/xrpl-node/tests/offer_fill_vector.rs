@@ -849,3 +849,8 @@ fn offer_sell_past_its_minimum_rests_the_unsold_remainder_106758110() {
 fn offer_crossing_remaining_out_folds_to_sixteen_digits_106769838() {
     run_bundle(include_str!("vectors/offer_crossing_remaining_out_folds_to_sixteen_digits_106769838.json"));
 }
+
+#[test]
+fn offer_bridged_leg_out_remainder_folds_to_sixteen_digits_106781871() {
+    run_bundle(include_str!("vectors/offer_bridged_leg_out_remainder_folds_to_sixteen_digits_106781871.json"));
+}

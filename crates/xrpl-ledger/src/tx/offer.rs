@@ -5082,7 +5082,15 @@ thr={t:?} admits_trunc={} admits_up={}",
                     _ => break 'attempt,
                 }
                 rem_gets = stamount_signed_add(false, rem_gets, true, gets_in).1;
-                rem_pays = me_sub(rem_pays, pays_out);
+                // finding 173 (bridged leg): a crossing's remainingOut is a
+                // 16-digit IOUAmount (#106781871 825A156A: 1.84386153980520|36
+                // → the maker's last give is 0.528031539805204, not …2036).
+                rem_pays = if threshold != u64::MAX && !pays_leg.xrp {
+                    let (neg, m) = stamount_signed_add(false, rem_pays, true, pays_out);
+                    if neg { (0, 0) } else { m }
+                } else {
+                    me_sub(rem_pays, pays_out)
+                };
                 if in_exhausted {
                     // The gross budget is spent; the net chain's leftover is
                     // division dust rippled never sees (see the walk's rule).
@@ -6325,6 +6333,13 @@ pub(crate) fn cross_engine_to_net(
                 // 22.283542 of 22.928591 at the taker's EXACT limit q=0x5a091beb…
                 // — we rested full, mainnet crossed it and rested 0.645).
                 let mut taker_clamped = buy_bound;
+                // Finding 174: when the line-bound below sizes the fill, the
+                // taker's GROSS is that bound verbatim — DirectStepI::rev
+                // "Limiting … in: maxSrcToDst" — not the net re-grossed
+                // (#106782303 74294420: the line held 0.001900570613249341
+                // BTC at rate 1.002; the walk's gross budget remainder read
+                // …342, one ulp over, and we drove the line to −1e-18).
+                let mut bound_gross: Option<Me> = None;
                 // Set when the RATED in-clamp below sizes this fill off the
                 // remaining GROSS budget: the settlement then debits that
                 // remainder verbatim and the walk's net residual is spent
@@ -6694,6 +6709,7 @@ pub(crate) fn cross_engine_to_net(
                                 eprintln!("DX_CLAMP line-bound pay={pay:?} -> live={live:?} held={held:?} accs={:?}", taker_accs.1);
                             }
                             pay = live;
+                            bound_gross = Some(live_gross); // finding 174
                         }
                     }
                     give = me_muldiv(pay, (1u128, 0i32), rate_me(q), false);
@@ -6890,6 +6906,7 @@ pub(crate) fn cross_engine_to_net(
                         // walk's net avail is gross-primary: it takes the
                         // remaining gross cap verbatim (see `gets_gross_cap`).
                         let g = match gets_gross_cap {
+                            _ if bound_gross.is_some() => bound_gross.unwrap_or(pay), // finding 174
                             Some(cap) if in_exhausted || !me_cmp(pay, rem_gets).is_lt() => {
                                 let verb = if offer_crossing { stamount_signed_add(false, cap, true, in_gross_spent).1 } else { me_sub(cap, in_gross_spent) }; // F118 (offer crossing only)
                                 // Unrated in a crossing, `pay` is flow()'s
