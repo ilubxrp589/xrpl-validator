@@ -1092,6 +1092,9 @@ fn deferred_record(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, holding_n
     if !receiving {
         e.debits = stamount_signed_add(false, e.debits, false, amt).1;
     }
+    if std::env::var("DX_DEFER").is_ok() {
+        eprintln!("DX_DEFER record party={} recv={receiving} amt={amt:?} orig={:?}{:?} debits={:?}", hex::encode(party), e.orig_neg, e.orig, e.debits);
+    }
     deferred_store(sandbox, &t);
 }
 /// `min(live, orig − debits)` for a giving party, or `live` when the table
@@ -1104,6 +1107,9 @@ fn deferred_cap(sandbox: &Sandbox, party: &[u8; 20], leg: &Leg, live: Me) -> Me 
     }
     let (neg, adj) = stamount_signed_add(false, e.orig, true, e.debits);
     let adj = if neg && adj.0 > 0 { (0, 0) } else { adj };
+    if std::env::var("DX_DEFER").is_ok() {
+        eprintln!("DX_DEFER cap party={} live={live:?} orig={:?} debits={:?} adj={adj:?} binds={}", hex::encode(party), e.orig, e.debits, me_cmp(adj, live).is_lt());
+    }
     if me_cmp(adj, live).is_lt() { adj } else { live }
 }
 
@@ -6428,12 +6434,23 @@ pub(crate) fn cross_engine_to_net(
                 // funds' floor 605277, and mainnet takes 605277 — the maker's
                 // root and residual offer were one drop off in ours.
                 let in_cap = if me_cmp(funded, m_gives0).is_lt() {
+                    // ceilOutImpl clamps the funds-priced in to the offer's OWN
+                    // TakerPays — `if (result.in > amount.in) result.in =
+                    // amount.in` (Quality.cpp:92-93). Finding 169c (#106759499
+                    // 09D0874A): rHT6EWF9's offer asks 2555012 drops for
+                    // 60402.23376675009 FUZZY but holds 60402.23376674909, 1e-9
+                    // short; the funds-limited in prices at floor(60402.2337…
+                    // × 42.3) = 2555014 and rippled clamps it to 2555012, taking
+                    // the whole balance (line → 0 and deleted). We let 2555014
+                    // stand, the taker's 2555012 SendMax then re-priced the fill
+                    // as in-limited and left 5.9e-11 on the maker's line.
                     let c = mul_round16_down(m_gives, rate_me(q));
-                    if gets_leg.xrp { (me_rescale(c, 0, false), 0) } else { c }
+                    let c = if gets_leg.xrp { (me_rescale(c, 0, false), 0) } else { c };
+                    if me_cmp(c, m_wants0).is_gt() { m_wants0 } else { c }
                 } else {
                     m_wants0
                 };
-                if buy_bound && me_cmp(pay, in_cap).is_gt() {
+                if me_cmp(pay, in_cap).is_gt() {
                     pay = in_cap;
                 }
                 // DX_PRICE: what the out-limited pricing actually produced,
@@ -6579,7 +6596,20 @@ pub(crate) fn cross_engine_to_net(
                     // balance: the sorted fold leaves 653.9861023930550, the
                     // line 653.9861023930549 (sequential half-even debits, the
                     // figure mainnet took); two lines landed one ULP off.
-                    if offer_crossing && !gets_leg.xrp {
+                    // Finding 169b: this line-bound is rippled's
+                    // PaymentSandbox::balanceHookIOU — min(live, origBalance −
+                    // Σdebits) with the debits a 16-digit half-even fold — and
+                    // it governs a PAYMENT's sender exactly as it governs a
+                    // crossing's taker (DirectStepI::rev/fwd maxSrcToDst).
+                    // #106777783 6EF9AF7D (tfPartialPayment FUZZY→XRP sweep):
+                    // four sends fold to 357111.1171553637, 407362.75151027 −
+                    // that = 50251.6343549063 while the line reads …632;
+                    // rippled's trace shows the last DirectStepI::rev bounded
+                    // at 50251.6343549063 and the line keeps 2e-11. The exact
+                    // remainder rule (finding 81b) drained it to zero
+                    // (#106773978 −3e-9 the same way). A pass-through hop's
+                    // line (finding 98) is never debited, so it is not bounded.
+                    if !gets_leg.xrp && (offer_crossing || !passthrough(taker, gets_leg, PassRole::In)) {
                         let held = available(sandbox, taker, gets_leg);
                         let live_gross = if me_cmp(held, taker_accs.1).is_gt() {
                             stamount_signed_add(false, held, true, taker_accs.1).1

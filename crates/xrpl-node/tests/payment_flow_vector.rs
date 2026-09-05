@@ -432,4 +432,17 @@ fn payment_circular_self_fill_funds_from_the_original_balance_106772946() {
     run_bundle(include_str!("vectors/payment_circular_self_fill_funds_from_the_original_balance_s432.json"));
 }
 
+#[test]
+fn payment_sweep_last_fill_is_bounded_by_the_deferred_debits_fold_106777783() {
+    run_bundle(include_str!("vectors/payment_sweep_last_fill_is_bounded_by_the_deferred_debits_fold_106777783.json"));
+}
 
+#[test]
+fn payment_sweep_last_fill_is_bounded_by_the_deferred_debits_fold_106773978() {
+    run_bundle(include_str!("vectors/payment_sweep_last_fill_is_bounded_by_the_deferred_debits_fold_106773978.json"));
+}
+
+#[test]
+fn payment_funds_limited_fill_clamps_to_the_offers_own_taker_pays_106759499() {
+    run_bundle(include_str!("vectors/payment_funds_limited_fill_clamps_to_the_offers_own_taker_pays_106759499.json"));
+}
