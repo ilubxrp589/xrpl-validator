@@ -130,7 +130,7 @@ fn transfer_rate_of(sandbox: &Sandbox, account: &[u8; 20]) -> u128 {
 
 /// Does `src` REDEEM on this hop right now? (DirectStep.cpp:492-500 —
 /// positive holding toward dst means redeeming its own debt back.)
-fn src_redeems(sandbox: &Sandbox, hop: &DirectHop) -> bool {
+pub(crate) fn src_redeems(sandbox: &Sandbox, hop: &DirectHop) -> bool {
     matches!(holding_toward(sandbox, &hop.src, &hop.dst, &hop.cur),
              Some((false, m)) if m.0 > 0)
 }
@@ -151,7 +151,7 @@ fn hop_dirs(sandbox: &Sandbox, hops: &[DirectHop]) -> Vec<bool> {
 /// maxSrcToDst (DirectStep.cpp:476-490): what src can still push to dst.
 /// Redeeming ⇒ the holding itself; issuing ⇒ dst's limit minus what dst
 /// already holds.
-fn max_src_to_dst(sandbox: &Sandbox, hop: &DirectHop) -> ox::Me {
+pub(crate) fn max_src_to_dst(sandbox: &Sandbox, hop: &DirectHop) -> ox::Me {
     match holding_toward(sandbox, &hop.src, &hop.dst, &hop.cur) {
         Some((false, m)) if m.0 > 0 => m,
         held => {

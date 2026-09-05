@@ -471,3 +471,14 @@ fn payment_park_undo_reverts_the_creators_owner_count_106735554() {
 fn payment_anchored_pool_slice_and_its_level_share_one_pass_106770629() {
     run_bundle(include_str!("vectors/payment_anchored_pool_slice_and_its_level_share_one_pass_106770629.json"));
 }
+
+// Finding 181 — #106784160 A7D5C4E4960A: rKN4dh8q sends 10,000,000,000
+// EverBurnX to its issuer rGKWaLgD holding NONE of it; the issuer's side of
+// the line trusts rKN4dh8q for exactly that, so the one-step strand ISSUES
+// (DirectStepI::maxPaymentFlow's `creditLimit2(dst, src) + srcOwed`) and
+// mainnet moves the line 0 → 10B. We read the sender's holdings alone and
+// answered tecPATH_DRY.
+#[test]
+fn payment_sender_issues_its_own_iou_to_the_issuer_within_its_limit_106784160() {
+    run_bundle(include_str!("vectors/payment_sender_issues_its_own_iou_to_the_issuer_within_its_limit_106784160.json"));
+}

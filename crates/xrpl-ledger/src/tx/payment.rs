@@ -2122,7 +2122,32 @@ impl PaymentTransactor {
         let avail = if tx.account == leg.issuer {
             want // issuers mint their own IOU
         } else {
-            ox::available(sandbox, &tx.account, &leg)
+            let held = ox::available(sandbox, &tx.account, &leg);
+            // Finding 181: the sender's hop is `DirectStepI::maxPaymentFlow`
+            // (DirectStep.cpp:476-490), and when the sender holds NONE of the
+            // issuer's IOU that hop ISSUES — the sender's own IOU, up to the
+            // issuer's trust limit toward the sender less what it already owes
+            // (`creditLimit2(dst, src) + srcOwed`). `available` reads holdings
+            // alone, so a holder-less sender was dry. #106784160 A7D5C4E4960A:
+            // rKN4dh8q sends 10,000,000,000 EverBurnX to its issuer rGKWaLgD,
+            // whose side of the line trusts rKN4dh8q for exactly that; mainnet
+            // moves the line 0 → 10B (tesSUCCESS), we claimed tecPATH_DRY. A
+            // one-step strand (destination IS the issuer) is exempt from
+            // `checkFreeze` ("pure issue/redeem can't be frozen"); the two-step
+            // strand is not, so the issuing room is denied when the issuer has
+            // frozen the sender's line or itself. A frozen HOLDER stays dry —
+            // `available` already answered zero for it and this fallback runs
+            // only in the issuing direction.
+            let hop = crate::tx::direct_step::DirectHop { src: tx.account, dst: leg.issuer, cur: leg.cur };
+            if !ox::me_is_zero(held) || crate::tx::direct_step::src_redeems(sandbox, &hop) {
+                held
+            } else if dest != &leg.issuer
+                && crate::tx::direct_step::hop_frozen_parts(sandbox, &tx.account, &leg.issuer, &leg.cur)
+            {
+                (0, 0)
+            } else {
+                crate::tx::direct_step::max_src_to_dst(sandbox, &hop)
+            }
         };
         if ox::me_is_zero(avail) {
             return TxResult::PathDry;
