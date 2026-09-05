@@ -6922,6 +6922,21 @@ pub(crate) fn cross_engine_to_net(
                             }
                             _ => gross_in(r, pay),
                         };
+                        // Finding 177 (#106735554 9BCDD090, #106733664 37F54060):
+                        // a carry hop spends what the chain PARKED on the
+                        // sender's line (finding 98) — a line rippled's strand
+                        // never touches, the carry riding the intermediaries'
+                        // lines instead. Re-grossing the net take-back lands a
+                        // hair over the park and strands a −1e-16 line the
+                        // sender never had (OwnerCount one high). The take-back
+                        // is capped at the holding: the line returns to where
+                        // it stood and is reaped as before the park.
+                        let g = if !offer_crossing && !crate::tx::amm_swap::sender_hop() && !gets_leg.xrp {
+                            let held = crate::tx::amm_swap::holds(sandbox, taker, gets_leg);
+                            if !me_is_zero(held) && me_cmp(g, held).is_gt() { held } else { g }
+                        } else {
+                            g
+                        };
                         in_gross_spent = stamount_signed_add(false, in_gross_spent, false, g).1;
                         line_adjust(sandbox, &maker, gets_leg, pay, true);
                         taker_accs.1 = stamount_signed_add(false, taker_accs.1, false, g).1;

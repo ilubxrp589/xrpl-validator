@@ -456,3 +456,8 @@ fn payment_forward_surplus_keeps_the_reverse_cache_106763015() {
 fn payment_bound_sender_pays_the_line_bound_gross_verbatim_106782303() {
     run_bundle(include_str!("vectors/payment_bound_sender_pays_the_line_bound_gross_verbatim_106782303.json"));
 }
+
+#[test]
+fn payment_parked_carry_take_back_is_capped_at_the_park_106733664() {
+    run_bundle(include_str!("vectors/payment_parked_carry_take_back_is_capped_at_the_park_106733664.json"));
+}
