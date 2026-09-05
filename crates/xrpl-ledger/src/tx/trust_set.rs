@@ -277,6 +277,52 @@ impl Transactor for TrustSetTransactor {
             }
         }
 
+        // TrustSet::preclaim's freeze invariants (TrustSet.cpp:237-282, in
+        // force since DeepFreeze): a NoFreeze issuer may not freeze or
+        // deep-freeze; setting and clearing in one tx is refused; and the
+        // resulting line may not be deep-frozen without being frozen — which
+        // also refuses clearing the plain freeze while deep-frozen. All
+        // tecNO_PERMISSION, and they run BEFORE the reserve and redundancy
+        // checks below (those are doApply's). Finding 167.
+        {
+            const TF_SET_FREEZE: u64 = 0x0010_0000;
+            const TF_CLEAR_FREEZE: u64 = 0x0020_0000;
+            const TF_SET_DEEP_FREEZE: u64 = 0x0040_0000;
+            const TF_CLEAR_DEEP_FREEZE: u64 = 0x0080_0000;
+            const LSF_NO_FREEZE: u64 = 0x0020_0000;
+            let txf = tx.fields.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0);
+            let (set_f, clr_f) = (txf & TF_SET_FREEZE != 0, txf & TF_CLEAR_FREEZE != 0);
+            let (set_d, clr_d) = (txf & TF_SET_DEEP_FREEZE != 0, txf & TF_CLEAR_DEEP_FREEZE != 0);
+            let no_freeze = acct["Flags"].as_u64().unwrap_or(0) & LSF_NO_FREEZE != 0;
+            if no_freeze && (set_f || set_d) {
+                return TxResult::NoPermission;
+            }
+            if (set_f || set_d) && (clr_f || clr_d) {
+                return TxResult::NoPermission;
+            }
+            let high = tx.account > issuer;
+            let (fz_bit, deep_bit): (u64, u64) =
+                if high { (0x0080_0000, 0x0400_0000) } else { (0x0040_0000, 0x0200_0000) };
+            let cur = Self::currency_code(currency_str);
+            let mut lf = sandbox
+                .read(&keylet::ripple_state_key(&tx.account, &issuer, &cur))
+                .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+                .and_then(|l| l["Flags"].as_u64())
+                .unwrap_or(0);
+            if set_f && !clr_f && !no_freeze {
+                lf |= fz_bit;
+            } else if clr_f && !set_f {
+                lf &= !fz_bit;
+            }
+            if set_d && !clr_d && !no_freeze {
+                lf |= deep_bit;
+            } else if clr_d && !set_d {
+                lf &= !deep_bit;
+            }
+            if lf & deep_bit != 0 && lf & fz_bit == 0 {
+                return TxResult::NoPermission;
+            }
+        }
         // Owner reserve required to gain a trust line. rippled SetTrust:
         // reserve is NOT enforced until the account owns >= 2 objects — the
         // gateway-funding carve-out — otherwise accountReserve(ownerCount + 1).
@@ -396,10 +442,22 @@ impl Transactor for TrustSetTransactor {
                     } else if txf & TF_CLEAR_NO_RIPPLE != 0 {
                         lf &= !no_ripple_bit;
                     }
-                    if txf & TF_SET_FREEZE != 0 {
+                    // computeFreezeFlags (TrustSet.cpp:43-58): set wins
+                    // only without the matching clear; deep freeze has its
+                    // own pair (tfSetDeepFreeze 0x400000 / tfClearDeepFreeze
+                    // 0x800000 → lsfLow/HighDeepFreeze). Finding 167.
+                    const TF_SET_DEEP_FREEZE: u64 = 0x0040_0000;
+                    const TF_CLEAR_DEEP_FREEZE: u64 = 0x0080_0000;
+                    let deep_bit: u64 = if sender_low { 0x0200_0000 } else { 0x0400_0000 };
+                    if txf & TF_SET_FREEZE != 0 && txf & TF_CLEAR_FREEZE == 0 {
                         lf |= freeze_bit;
-                    } else if txf & TF_CLEAR_FREEZE != 0 {
+                    } else if txf & TF_CLEAR_FREEZE != 0 && txf & TF_SET_FREEZE == 0 {
                         lf &= !freeze_bit;
+                    }
+                    if txf & TF_SET_DEEP_FREEZE != 0 && txf & TF_CLEAR_DEEP_FREEZE == 0 {
+                        lf |= deep_bit;
+                    } else if txf & TF_CLEAR_DEEP_FREEZE != 0 && txf & TF_SET_DEEP_FREEZE == 0 {
+                        lf &= !deep_bit;
                     }
                     line["Flags"] = serde_json::Value::Number(lf.into());
                 }
@@ -557,6 +615,28 @@ impl Transactor for TrustSetTransactor {
                 let mut f = reserve_bit;
                 if txf & 0x0002_0000 != 0 && txf & 0x0004_0000 == 0 {
                     f |= my_nr; // tfSetNoRipple && !tfClearNoRipple
+                }
+                // trustCreate's other creator-side bits (RippleStateHelpers
+                // .cpp:262-277): `bAuth` = tfSetfAuth, `bFreeze` =
+                // tfSetFreeze && !tfClearFreeze, `bDeepFreeze` =
+                // tfSetDeepFreeze (TrustSet.cpp:735-738; preclaim already
+                // refused set-with-clear and deep-without-freeze). Finding
+                // 167 (#106766868 63F07E36, #106774650): an issuer
+                // authorising a holder that has no line yet CREATES it with
+                // lsfLowAuth — mainnet 0x250000, we minted 0x210000.
+                let (auth_bit, freeze_bit, deep_bit): (u64, u64, u64) = if sender_low {
+                    (0x0004_0000, 0x0040_0000, 0x0200_0000)
+                } else {
+                    (0x0008_0000, 0x0080_0000, 0x0400_0000)
+                };
+                if txf & 0x0001_0000 != 0 {
+                    f |= auth_bit; // tfSetfAuth
+                }
+                if txf & 0x0010_0000 != 0 && txf & 0x0020_0000 == 0 {
+                    f |= freeze_bit; // tfSetFreeze && !tfClearFreeze
+                }
+                if txf & 0x0040_0000 != 0 {
+                    f |= deep_bit; // tfSetDeepFreeze
                 }
                 if !peer_default_ripple {
                     f |= peer_nr;

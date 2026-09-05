@@ -95,3 +95,13 @@ fn trust_set_creates_a_line_with_a_symbol_currency_code() {
 fn trust_set_to_a_missing_issuer_is_tec_no_dst() {
     run_bundle(include_str!("vectors/trust_set_to_a_missing_issuer_is_tec_no_dst_106759500.json"));
 }
+
+#[test]
+fn trust_set_authorising_a_holder_without_a_line_creates_it_authorised_106761226() {
+    run_bundle(include_str!("vectors/trust_set_authorising_a_holder_without_a_line_creates_it_authorised_106761226.json"));
+}
+
+#[test]
+fn trust_set_authorising_a_holder_without_a_line_creates_it_authorised_106773044() {
+    run_bundle(include_str!("vectors/trust_set_authorising_a_holder_without_a_line_creates_it_authorised_106773044.json"));
+}
