@@ -68,7 +68,11 @@ fn run_bundle(bundle_json: &str) {
         // transaction must leave ALONE: it passes when it equals the seated
         // pre-image (finding 143's rule; finding 157's dry payment pins both
         // trust lines this way).
+        // An EMPTY expectation is a deletion pin (finding 158): mainnet's
+        // meta deleted the object in this transaction, so must the apply.
+        let want_deleted = want_hex.as_str().unwrap().trim().is_empty();
         let Some(ent) = mods.get(&key32(k)) else {
+            assert!(!want_deleted, "target {k} must be deleted by the apply, which never wrote it");
             let pre_hex = bundle["pre"][k].as_str().unwrap_or_default().trim().to_uppercase();
             assert_eq!(
                 want_hex.as_str().unwrap().trim().to_uppercase(),
@@ -78,8 +82,14 @@ fn run_bundle(bundle_json: &str) {
             continue;
         };
         let bytes = match ent {
-            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => b.clone(),
-            SandboxEntry::Deleted => panic!("target {k} deleted?"),
+            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => {
+                assert!(!want_deleted, "target {k} must be deleted by the apply, which wrote it instead");
+                b.clone()
+            }
+            SandboxEntry::Deleted => {
+                assert!(want_deleted, "target {k} deleted?");
+                continue;
+            }
         };
         let mut jv: Value = serde_json::from_slice(&bytes).unwrap();
         canon_for_encode(&mut jv);
@@ -410,3 +420,16 @@ fn payment_through_an_issuer_with_no_ripple_on_both_lines_is_dry_106779252() {
         "vectors/payment_through_an_issuer_with_no_ripple_on_both_lines_is_dry_106779252.json"
     ));
 }
+
+/// Finding 165 (#106772946 C9E92CF8532F): rLc1HmTpWg's circular tfPartialPayment
+/// crosses its own FUZZY offers, so one line is credited as the destination
+/// and debited as the maker. rippled funds the maker from the ORIGINAL line
+/// less the sixteen-digit fold of its debits (PaymentSandbox::balanceHookIOU,
+/// deferred credits invisible); the last self-fill overshoots the live line
+/// by 4e-11 and the line ends at −4e-11. We drained the live line to zero.
+#[test]
+fn payment_circular_self_fill_funds_from_the_original_balance_106772946() {
+    run_bundle(include_str!("vectors/payment_circular_self_fill_funds_from_the_original_balance_s432.json"));
+}
+
+

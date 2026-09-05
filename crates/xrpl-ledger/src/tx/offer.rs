@@ -833,7 +833,11 @@ pub(crate) fn available(sandbox: &Sandbox, id: &[u8; 20], leg: &Leg) -> Me {
         let party_low = id < &leg.issuer;
         let party_holds = if party_low { !neg } else { neg };
         let _ = holds;
-        if party_holds && bal.0 > 0 { bal } else { (0, 0) }
+        let live = if party_holds && bal.0 > 0 { bal } else { (0, 0) };
+        // Finding 165: what the account may GIVE is capped by its original
+        // balance less its debits so far — credits it received in this
+        // transaction do not fund it.
+        deferred_cap(sandbox, id, leg, live)
     }
 }
 
@@ -1017,6 +1021,92 @@ pub(crate) fn frozen_ter(
 
 /// Adjust one party's side of an IOU movement (line balance ±amt), creating
 /// the line if the receiver has none (rippled offer-crossing behavior).
+/// Finding 165 — rippled's deferred-credits table (`PaymentSandbox::
+/// balanceHookIOU`, PaymentSandbox.cpp:284): an account's funds for GIVING an
+/// IOU inside a transaction are `min(live balance, origBalance − Σ debits)`,
+/// where `origBalance` is the line as it stood at the account's first
+/// adjustment in the transaction and the debits are a sixteen-digit running
+/// sum. Credits received earlier in the same transaction are invisible.
+/// This applies to every source — a maker included — not only the sender's
+/// spend (finding 133 folded that one).
+///
+/// #106772946 C9E92CF8532F (rLc1HmTpWg, a circular tfPartialPayment whose
+/// path crosses the payer's OWN FUZZY offers): the payer is credited as the
+/// destination and debited as the maker on one line. rippled sizes the last
+/// self-fill from `orig − fold(debits)`, a hair above the live line, and the
+/// line ends at −4e-11; ours drained the live line to exactly zero
+/// (#106773978 −3e-9 and #106777783 −2e-11 the same way).
+#[derive(Default, Clone, Copy)]
+struct DeferredEntry {
+    orig_neg: bool,
+    orig: (u128, i32),
+    debits: (u128, i32),
+}
+type DeferredTable = std::collections::HashMap<String, DeferredEntry>;
+fn deferred_key(party: &[u8; 20], leg: &Leg) -> String {
+    format!("{}{}{}", hex::encode(party), hex::encode(leg.issuer), hex::encode(leg.cur))
+}
+// The table rides the sandbox as a JSON object: key -> [orig_neg, orig_m, orig_e, deb_m, deb_e]
+// (mantissas as decimal strings — u128 does not fit a JSON number).
+fn deferred_load(sandbox: &Sandbox) -> DeferredTable {
+    let mut t = DeferredTable::new();
+    let Some(d) = sandbox.aux_get() else { return t };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&d) else { return t };
+    if let Some(o) = v.as_object() {
+        for (k, e) in o {
+            let a = e.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+            if a.len() != 5 {
+                continue;
+            }
+            let m = |i: usize| a[i].as_str().and_then(|s| s.parse::<u128>().ok()).unwrap_or(0);
+            let x = |i: usize| a[i].as_i64().unwrap_or(0) as i32;
+            t.insert(
+                k.clone(),
+                DeferredEntry { orig_neg: a[0].as_bool().unwrap_or(false), orig: (m(1), x(2)), debits: (m(3), x(4)) },
+            );
+        }
+    }
+    t
+}
+fn deferred_store(sandbox: &mut Sandbox, t: &DeferredTable) {
+    let mut o = serde_json::Map::new();
+    for (k, e) in t {
+        o.insert(
+            k.clone(),
+            serde_json::json!([e.orig_neg, e.orig.0.to_string(), e.orig.1, e.debits.0.to_string(), e.debits.1]),
+        );
+    }
+    if let Ok(d) = serde_json::to_vec(&serde_json::Value::Object(o)) {
+        sandbox.aux_set(d);
+    }
+}
+/// The party's holding before this adjustment is remembered on first touch;
+/// a debit joins the sixteen-digit fold.
+fn deferred_record(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, holding_neg: bool, holding: Me, amt: Me, receiving: bool) {
+    let mut t = deferred_load(sandbox);
+    let e = t.entry(deferred_key(party, leg)).or_insert_with(|| DeferredEntry {
+        orig_neg: holding_neg,
+        orig: holding,
+        debits: (0, 0),
+    });
+    if !receiving {
+        e.debits = stamount_signed_add(false, e.debits, false, amt).1;
+    }
+    deferred_store(sandbox, &t);
+}
+/// `min(live, orig − debits)` for a giving party, or `live` when the table
+/// has never seen it.
+fn deferred_cap(sandbox: &Sandbox, party: &[u8; 20], leg: &Leg, live: Me) -> Me {
+    let t = deferred_load(sandbox);
+    let Some(e) = t.get(&deferred_key(party, leg)) else { return live };
+    if e.orig_neg && e.orig.0 > 0 {
+        return (0, 0);
+    }
+    let (neg, adj) = stamount_signed_add(false, e.orig, true, e.debits);
+    let adj = if neg && adj.0 > 0 { (0, 0) } else { adj };
+    if me_cmp(adj, live).is_lt() { adj } else { live }
+}
+
 pub(crate) fn line_adjust(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, amt: Me, receiving: bool) {
     if party == &leg.issuer {
         return;
@@ -1050,6 +1140,8 @@ pub(crate) fn line_adjust(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, am
         let balance_before = (lneg && lbal.0 > 0, lbal);
         // party's holding: low holds when balance positive, high when negative
         let (pneg, pmag) = if party_low { (lneg, lbal) } else { (!lneg, lbal) };
+        // Finding 165: remember the holding before the first touch, fold debits.
+        deferred_record(sandbox, party, leg, pneg && pmag.0 > 0, pmag, amt, receiving);
         let (nneg, nmag) = stamount_signed_add(pneg && pmag.0 > 0, pmag, !receiving, amt);
         // DX_LINEADJ=<key prefix|1>: print every balance adjustment landing on
         // a matching RippleState — the credit-granularity receipt for the

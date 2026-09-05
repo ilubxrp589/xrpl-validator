@@ -38,6 +38,9 @@ pub enum SandboxEntry {
 ///
 /// Reads fall through to the base state if not modified.
 /// Writes are buffered until `commit()` is called.
+/// Reserved key for `aux_get`/`aux_set` (finding 165); no ledger object hashes to it.
+pub const AUX_KEY: Hash256 = Hash256([0xFF; 32]);
+
 pub struct Sandbox<'a> {
     base: &'a LedgerState,
     modifications: HashMap<Hash256, SandboxEntry>,
@@ -57,6 +60,9 @@ impl<'a> Sandbox<'a> {
     pub fn keys_with_prefix(&self, prefix: &[u8]) -> Vec<Hash256> {
         let mut keys = self.base.state_map.keys_with_prefix(prefix);
         for (k, e) in &self.modifications {
+            if *k == AUX_KEY {
+                continue;
+            }
             if k.0.len() >= prefix.len() && &k.0[..prefix.len()] == prefix {
                 if !matches!(e, SandboxEntry::Deleted) {
                     keys.push(*k);
@@ -148,7 +154,24 @@ impl<'a> Sandbox<'a> {
     /// Extract all modifications, consuming the sandbox.
     /// This drops the borrow on base so the caller can then mutate the state.
     pub fn into_modifications(self) -> HashMap<Hash256, SandboxEntry> {
-        self.modifications
+        let mut m = self.modifications;
+        m.remove(&AUX_KEY);
+        m
+    }
+
+    /// Finding 165 — transaction-scoped bookkeeping that must roll back with
+    /// the sandbox (rippled keeps its deferred-credits table inside the
+    /// PaymentSandbox for the same reason). Stored under a reserved key so
+    /// every `snapshot`/`restore_snapshot` carries it; never a ledger object.
+    pub fn aux_get(&self) -> Option<Vec<u8>> {
+        match self.modifications.get(&AUX_KEY) {
+            Some(SandboxEntry::Modified(d)) | Some(SandboxEntry::Created(d)) => Some(d.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn aux_set(&mut self, data: Vec<u8>) {
+        self.modifications.insert(AUX_KEY, SandboxEntry::Modified(data));
     }
 
     /// Discard all modifications (no-op, just consumes self).
