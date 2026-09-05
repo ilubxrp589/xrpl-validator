@@ -482,3 +482,15 @@ fn payment_anchored_pool_slice_and_its_level_share_one_pass_106770629() {
 fn payment_sender_issues_its_own_iou_to_the_issuer_within_its_limit_106784160() {
     run_bundle(include_str!("vectors/payment_sender_issues_its_own_iou_to_the_issuer_within_its_limit_106784160.json"));
 }
+
+// #106743104 F8084760 again, now with the book state rippled actually saw
+// (200-offer seeding): the XRPH/XRP levels 5103CE…5111805A are consumed by
+// iteration 49, the direct strand's pool slice overflows and it goes
+// unboundable — dropped, since two strands are pending — while the bridge
+// strand is still bounded by the XRPH/XRP level 511FF98B the shallow bundle
+// lacked; iterations 50-53 run it alone (single-path anchored pool offers)
+// and the payment clears DeliverMin: tesSUCCESS, 181 mutations.
+#[test]
+fn payment_lone_strand_runs_on_after_its_rival_goes_unboundable_106743104() {
+    run_bundle(include_str!("vectors/payment_lone_strand_runs_on_after_its_rival_goes_unboundable_106743104.json"));
+}

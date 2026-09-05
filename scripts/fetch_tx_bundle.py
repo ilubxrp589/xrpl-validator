@@ -650,18 +650,58 @@ def main():
             books = [(g, p_)]
             if g != xrp and p_ != xrp:
                 books += [(g, xrp), (xrp, p_)]
+            # EXPLICIT PATHS: every currency hop names a book the strand reads,
+            # and an account hop re-issues the held currency (rippled's toStrand
+            # sets curIssue.account from the step). #106758148 0638A180
+            # (XRP->PKEG->FARM) and #106766924 DA053F84 (USDC->PLX->XLM->XRP):
+            # neither hop's book was in the bundle and the probe read the
+            # strand DRY while rippled filled it.
+            for path in tx.get("Paths") or []:
+                cur_leg = g
+                for step in path:
+                    nxt = None
+                    if "currency" in step:
+                        if step["currency"] == "XRP":
+                            nxt = xrp
+                        elif step.get("issuer"):
+                            nxt = {"currency": step["currency"], "issuer": step["issuer"]}
+                    elif step.get("account") and cur_leg != xrp:
+                        nxt = {"currency": cur_leg["currency"], "issuer": step["account"]}
+                    if nxt is not None and nxt != cur_leg:
+                        if nxt["currency"] != cur_leg["currency"] and (cur_leg, nxt) not in books:
+                            books.append((cur_leg, nxt))
+                        cur_leg = nxt
+                if cur_leg != p_ and cur_leg["currency"] != p_["currency"] and (cur_leg, p_) not in books:
+                    books.append((cur_leg, p_))
+            # DEPTH: a long sweep walks PAST every level the meta names and
+            # then anchors the pool at the first level it never consumed —
+            # a read-only tip no meta records. #106743104 F8084760 (1.9M XRPH
+            # → RLUSD, 54 iterations): the XRPH/XRP levels 5103CE…5111805A
+            # were all consumed and rippled priced iterations 50-53 against
+            # 511FF98B; a 12-offer seed lacked it, our walk read the book
+            # empty, and the bridge strand went unboundable — dropped, where
+            # rippled ran it alone (tecPATH_PARTIAL vs tesSUCCESS). Two pages
+            # of 100 — the marker continues where the first page ended.
             for tg, tp in books:
                 try:
-                    r = rpc("book_offers", {"taker_gets": tp, "taker_pays": tg, "ledger_index": seq - 1, "limit": 12})
-                    for o in r.get("offers", []):
-                        oi = (o.get("index") or "").upper()
-                        if oi and oi not in pre:
-                            nb = fetch_key(oi)
-                            if nb:
-                                pre[oi] = nb
-                                walk(o)
-                        if o.get("BookDirectory"):
-                            book_dirs.add(o["BookDirectory"].upper())
+                    marker = None
+                    for _page in range(2):
+                        q = {"taker_gets": tp, "taker_pays": tg, "ledger_index": seq - 1, "limit": 100}
+                        if marker is not None:
+                            q["marker"] = marker
+                        r = rpc("book_offers", q)
+                        for o in r.get("offers", []):
+                            oi = (o.get("index") or "").upper()
+                            if oi and oi not in pre:
+                                nb = fetch_key(oi)
+                                if nb:
+                                    pre[oi] = nb
+                                    walk(o)
+                            if o.get("BookDirectory"):
+                                book_dirs.add(o["BookDirectory"].upper())
+                        marker = r.get("marker")
+                        if not marker:
+                            break
                 except Exception:
                     pass
 
@@ -777,6 +817,17 @@ def main():
         if v is None:
             continue
         legs.append({"currency": "XRP"} if isinstance(v, str) else {"currency": v["currency"], "issuer": v["issuer"]})
+    # The pools of every explicit-path hop join the pair sweep (same specimens).
+    for path in tx.get("Paths") or []:
+        for step in path:
+            if step.get("currency") == "XRP":
+                leg = {"currency": "XRP"}
+            elif step.get("currency") and step.get("issuer"):
+                leg = {"currency": step["currency"], "issuer": step["issuer"]}
+            else:
+                continue
+            if leg not in legs:
+                legs.append(leg)
     if tx.get("TransactionType") in ("OfferCreate", "Payment") and len(legs) >= 2:
         xrp = {"currency": "XRP"}
         for i in range(len(legs)):
