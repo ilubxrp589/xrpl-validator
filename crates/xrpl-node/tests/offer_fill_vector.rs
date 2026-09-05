@@ -829,3 +829,8 @@ fn offer_ioc_sell_in_capped_fill_keeps_the_limit_forgiveness_106759265() {
 fn offer_dead_book_tip_inside_the_limit_pins_a_constant_quality_function_106774713() {
     run_bundle(include_str!("vectors/offer_dead_book_tip_inside_the_limit_pins_a_constant_quality_function_106774713.json"));
 }
+
+#[test]
+fn offer_pool_alone_survives_a_book_tip_beyond_the_limit_106766924() {
+    run_bundle(include_str!("vectors/offer_pool_alone_survives_a_book_tip_beyond_the_limit_106766924.json"));
+}

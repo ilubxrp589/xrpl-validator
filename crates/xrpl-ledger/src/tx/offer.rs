@@ -3729,7 +3729,31 @@ thr={t:?} admits_trunc={} admits_up={}",
                     if std::env::var("DX_AMM").is_ok() {
                         eprintln!("DX_AMM bridged-single strand_kept={strand_kept} d_tip={d_tip:?} thr_self={thr_me:?} mp_prev_ub={mp_ub}");
                     }
-                    if !strand_kept {
+                    // Finding 169a (#106766924 961C38C7, IoC XLM→CNY, iteration 1):
+                    // `activateNext`'s bound is `tip()` — the AMM offer when it
+                    // beats the LOB tip, else the LOB tip (BookStep.cpp:921-953).
+                    // A LOB tip BEYOND the limit does not drop the strand by
+                    // itself: qualityThreshold(lob) is then nullopt, getOffer
+                    // emits the maxOffer (single path; quality = the feeless
+                    // spot) or the Fibonacci slice (multi path), and the strand
+                    // lives while THAT bound clears the limit. Here the next
+                    // direct offer sat at 0.83737 XLM/CNY against the 0.83724
+                    // limit, the pool's spot at 0.83465 — mainnet kept the
+                    // strand and the limit-sized pool slice took the taker's
+                    // last 5.1288833183 XLM (6.1262472753 CNY); the old gate
+                    // dropped it and left the XLM on the taker's line. The
+                    // checks below ARE the AMM bound when the pool is the only
+                    // live strand. With the BRIDGE alive too, rippled's flow
+                    // runs this iteration multi-path: the pool's offer is the
+                    // Fibonacci slice, which must clear the limit and beat the
+                    // funded tip, and the two strands then compete by quality —
+                    // q172 #106742536 7F8370E9 iteration 6: the slice misses
+                    // the 0.55772 limit, the bridge alone flows and the pool
+                    // stays untouched. That competition is not modelled at
+                    // this site, so a LOB tip beyond the limit keeps the old
+                    // bridge-first answer whenever the bridge is alive.
+                    let bridge_alive = thr_admit.is_some_and(|t| bq_ub.is_some_and(|v| me_cmp(v, t).is_le()));
+                    if !strand_kept && bridge_alive {
                         false
                     } else if mp_ub {
                         match crate::tx::amm_swap::fib_slice(
