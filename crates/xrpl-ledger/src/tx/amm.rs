@@ -1410,6 +1410,26 @@ fn initialize_fee_auction_vote(
 /// IsDeposit::No rounds DOWN, which is what `me_muldiv(.., false)` does.
 ///
 /// Shared by the tfWithdrawAll path (tokens = the LP's whole balance) and the
+/// fixAMMv1_3 `adjustLPTokens` for a withdrawal (AMMHelpers.cpp:181-189,
+/// via AMMWithdraw.cpp:752-761 `adjustLPTokensIn`, which exempts the
+/// WithdrawAll flags): the requested tokens snap to the precision of the
+/// pool's LPTokenBalance — `(lpTokens − lptAMMBalance) + lptAMMBalance`
+/// under Downward rounding, i.e. the negative intermediate rounds its
+/// magnitude UP and the sum rounds DOWN. Finding 175 (#106782285 A4B18D75):
+/// rPLvYSKR asks 38534539.5663724 of a 1143652631.196906 pool; rippled
+/// burns 38534539.566372, the LP keeps 0.0000004 and the line SURVIVES
+/// (OwnerCount 73), and the BEAR out is 1547978.251529562 from that
+/// fraction rounded down. We burned the request verbatim, deleted the line
+/// and paid 1547978.251529578.
+fn adjust_lp_tokens_in(tokens: (u128, i32), total_lp: (u128, i32)) -> (u128, i32) {
+    use crate::tx::amm_swap::{n_sub, Rnd};
+    use crate::tx::offer as ox;
+    if ox::me_cmp(tokens, total_lp).is_ge() {
+        return tokens;
+    }
+    let d = n_sub(total_lp, tokens, Rnd::Up);
+    n_sub(total_lp, d, Rnd::Down)
+}
 /// tfLPToken path (tokens = the requested LPTokenIn).
 fn payout_proportional(
     sandbox: &mut Sandbox,
@@ -1741,7 +1761,12 @@ impl Transactor for AMMWithdrawTransactor {
                     .and_then(|o| o["LPTokenBalance"]["value"].as_str().map(str::to_string))
                     .and_then(|s| keylet::amount_mant_exp(&serde_json::Value::String(s)))
                 {
-                    if !payout_proportional(sandbox, tx, &amm_acct, tokens, total_lp, false) {
+                    let tokens_adj = adjust_lp_tokens_in(tokens, total_lp); // finding 175
+                    if tokens_adj.0 == 0 {
+                        sandbox.restore_snapshot(snap);
+                        return TxResult::AmmInvalidTokens;
+                    }
+                    if !payout_proportional(sandbox, tx, &amm_acct, tokens_adj, total_lp, false) {
                         sandbox.restore_snapshot(snap);
                         return TxResult::AmmFailed;
                     }
@@ -1937,6 +1962,13 @@ impl Transactor for AMMWithdrawTransactor {
                     .get("LPTokenIn")
                     .and_then(keylet::amount_mant_exp)
                     .filter(|m| m.0 > 0)
+                    // finding 175: the burn is the snapped request, not the raw one
+                    .map(|m| {
+                        ox::json_at(sandbox, &amm_key)
+                            .and_then(|o| o["LPTokenBalance"]["value"].as_str().map(str::to_string))
+                            .and_then(|s| keylet::amount_mant_exp(&serde_json::Value::String(s)))
+                            .map_or(m, |total| adjust_lp_tokens_in(m, total))
+                    })
             })
             .or(single_asset_burn.map(|(_, t)| t))
             .unwrap_or((1_000_000_000_000_000, -8));

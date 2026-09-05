@@ -239,3 +239,8 @@ fn amm_withdraw_needs_reserve_for_a_new_line() {
 fn amm_withdraw_keeps_a_non_default_lp_line_at_zero_106766906() {
     run_bundle(include_str!("vectors/amm_withdraw_keeps_a_non_default_lp_line_at_zero_106766906.json"));
 }
+
+#[test]
+fn amm_withdraw_lp_tokens_snap_to_the_pool_balance_precision_106782285() {
+    run_bundle(include_str!("vectors/amm_withdraw_lp_tokens_snap_to_the_pool_balance_precision_106782285.json"));
+}
