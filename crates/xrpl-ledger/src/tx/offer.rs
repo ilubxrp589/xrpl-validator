@@ -460,7 +460,7 @@ fn div_round_drops_strict_floor(a: Me, rate: Me) -> u128 {
 /// 0.06521705604794707, repriced to 5274.658319744447. `mul_ratio`'s
 /// nearest-and-bump said …294 and we rested …706 / …446, one ulp low on
 /// both sides of the placed offer.
-fn div_round16_up(a: Me, rate: Me) -> Me {
+pub(crate) fn div_round16_up(a: Me, rate: Me) -> Me {
     let (a, r) = (norm16(a), norm16(rate));
     if a.0 == 0 || r.0 == 0 {
         return (0, 0);

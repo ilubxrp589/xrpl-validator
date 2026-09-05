@@ -123,6 +123,8 @@ pub enum TxResult {
     AmmFailed,
     /// Creating a trust line, but the owner can't afford the incremental reserve.
     NoLineInsufReserve,
+    /// The credit would push the receiver's trust line past its limit.
+    LimitExceeded,
     /// Setting a non-existent trust line to defaults — nothing to do.
     NoLineRedundant,
     /// The party lacks authorization for the asset — an MPT holder without an
@@ -292,6 +294,7 @@ impl TxResult {
             TxResult::UnfundedAmm => "tecUNFUNDED_AMM",
             TxResult::AmmFailed => "tecAMM_FAILED",
             TxResult::NoLineInsufReserve => "tecNO_LINE_INSUF_RESERVE",
+            TxResult::LimitExceeded => "tecLIMIT_EXCEEDED",
             TxResult::NoLineRedundant => "tecNO_LINE_REDUNDANT",
             TxResult::NoAuth => "tecNO_AUTH",
             TxResult::Locked => "tecLOCKED",

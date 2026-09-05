@@ -399,6 +399,19 @@ impl Transactor for EscrowCreateTransactor {
             escrow["DestinationNode"] = serde_json::Value::String(format!("{dn:x}"));
         }
         if let Some((leg, want)) = iou {
+            // Finding 164 (#106758324 330B52F56E04, r4uNAZYC2k escrowing 10
+            // BST whose issuer charges 1.08): a token escrow snapshots the
+            // issuer's transfer rate at creation — `(*slep)[sfTransferRate]
+            // = transferRate(view, amount).value` when it is not parity
+            // (EscrowCreate.cpp:497-499) — and EscrowFinish delivers against
+            // the LESSER of that snapshot and the rate then in force. Our
+            // object carried no rate (five bytes short) and the finish
+            // credited the full 10 where mainnet credits 9.2592592592593.
+            if let Some(rate) = crate::tx::offer::transfer_rate(sandbox, &leg) {
+                if rate != 1_000_000_000 {
+                    escrow["TransferRate"] = serde_json::Value::from(rate);
+                }
+            }
             if leg.issuer != tx.account && leg.issuer != dest_id {
                 let inode =
                     crate::ledger::directory::owner_dir_insert(sandbox, &leg.issuer, &escrow_key);
@@ -596,6 +609,68 @@ impl Transactor for EscrowFinishTransactor {
             Err(_) => return TxResult::Malformed,
         };
 
+        // Finding 164: a token escrow's delivery, `escrowUnlockApplyHelper`
+        // (EscrowHelpers.h). The receiver must hold a line unless it is the
+        // sender (tecNO_LINE), the locked rate is the lesser of the escrow's
+        // snapshot and the issuer's current rate, the receiver gets
+        // `amount − (amount − divideRound(amount, rate, up))` when neither
+        // party is the issuer, and the credit may not breach the line's
+        // limit (tecLIMIT_EXCEEDED). All decided before anything is written.
+        let iou_credit: Option<(crate::tx::offer::Leg, (u128, i32))> = match escrow_iou(&escrow) {
+            None => None,
+            Some((leg, want)) => {
+                use crate::tx::offer::{div_round16_up, me_cmp, norm16, stamount_signed_add};
+                let dest_is_issuer = dest_id == leg.issuer;
+                let owner_is_issuer = owner_id == leg.issuer;
+                let line_key = keylet::ripple_state_key(&dest_id, &leg.issuer, &leg.cur);
+                let line = if dest_is_issuer { None } else { crate::tx::offer::json_at(sandbox, &line_key) };
+                if !dest_is_issuer && line.is_none() && dest_id != owner_id {
+                    return TxResult::NoLine;
+                }
+                let mut locked = escrow
+                    .get("TransferRate")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1_000_000_000);
+                if let Some(now) = crate::tx::offer::transfer_rate(sandbox, &leg) {
+                    if now < locked {
+                        locked = now;
+                    }
+                }
+                let final_amt = if !owner_is_issuer && !dest_is_issuer && locked != 1_000_000_000 {
+                    let net = div_round16_up(want, (locked as u128, -9));
+                    let fee = stamount_signed_add(false, want, true, net).1;
+                    norm16(stamount_signed_add(false, want, true, fee).1)
+                } else {
+                    want
+                };
+                if let Some(line) = line.as_ref().filter(|_| dest_id != owner_id) {
+                    let dest_low = dest_id < leg.issuer;
+                    let limit = line[if dest_low { "LowLimit" } else { "HighLimit" }]
+                        .get("value")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| keylet::amount_mant_exp(&serde_json::json!({"value": s})))
+                        .unwrap_or((0, 0));
+                    let bal = line["Balance"]["value"]
+                        .as_str()
+                        .and_then(|s| {
+                            let neg = s.starts_with('-');
+                            keylet::amount_mant_exp(&serde_json::json!({"value": s.trim_start_matches('-')}))
+                                .map(|m| (neg, m))
+                        })
+                        .unwrap_or((false, (0, 0)));
+                    // The balance is filed from the low side; the receiver's
+                    // holding is that value for the low account and its negation
+                    // for the high one.
+                    let held_neg = if dest_low { bal.0 } else { !bal.0 };
+                    let (nneg, nbal) = stamount_signed_add(held_neg, bal.1, false, final_amt);
+                    if !nneg && me_cmp(nbal, limit).is_gt() {
+                        return TxResult::LimitExceeded;
+                    }
+                }
+                Some((leg, final_amt))
+            }
+        };
+
         let dest_balance = balance_of(&dest);
         let new_dest_balance = match dest_balance.checked_add(amount) {
             Some(b) => b,
@@ -608,8 +683,9 @@ impl Transactor for EscrowFinishTransactor {
         // hole Cancel had: `Amount` is an object, so the XRP credit above adds
         // 0 drops and the tokens simply never arrived. `EscrowCreate` locked
         // them off the sender's line and nothing ever gave them back.
-        if let Some((leg, want)) = escrow_iou(&escrow) {
-            crate::tx::offer::line_adjust(sandbox, &dest_id, &leg, want, true);
+        // Finding 164: net of the locked transfer rate (decided above).
+        if let Some((leg, final_amt)) = iou_credit {
+            crate::tx::offer::line_adjust(sandbox, &dest_id, &leg, final_amt, true);
         }
 
         // --- Delete the Escrow object ---

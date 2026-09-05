@@ -138,12 +138,21 @@ fn run_bundle(bundle_json: &str) {
     );
 
     for (k, want_hex) in bundle["expect"].as_object().unwrap() {
+        // An EMPTY expectation is a deletion pin (finding 158): the apply
+        // must delete the object.
+        let want_deleted = want_hex.as_str().unwrap().trim().is_empty();
         let ent = mods
             .get(&key32(k))
             .unwrap_or_else(|| panic!("target {k} must be written by the apply"));
         let bytes = match ent {
-            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => b.clone(),
-            SandboxEntry::Deleted => panic!("target {k} deleted?"),
+            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => {
+                assert!(!want_deleted, "target {k} must be deleted by the apply, which wrote it instead");
+                b.clone()
+            }
+            SandboxEntry::Deleted => {
+                assert!(want_deleted, "target {k} deleted?");
+                continue;
+            }
         };
         let mut jv: Value = serde_json::from_slice(&bytes).unwrap();
         canon_for_encode(&mut jv);
@@ -164,4 +173,22 @@ fn run_bundle(bundle_json: &str) {
 #[test]
 fn escrow_create_reserves_for_the_new_object() {
     run_bundle(include_str!("vectors/escrow_create_reserve_plus_one_106703533.json"));
+}
+
+/// Finding 164 (#106758324 330B52F56E04): r4uNAZYC2k escrows 10 BST, whose
+/// issuer charges a 1.08 transfer rate, under a crypto-condition. rippled
+/// snapshots the rate on the Escrow object (`TransferRate` 1080000000,
+/// EscrowCreate.cpp:497-499); ours carried none, five bytes short.
+#[test]
+fn escrow_create_snapshots_the_issuer_transfer_rate() {
+    run_bundle(include_str!("vectors/escrow_create_snapshots_the_issuer_transfer_rate_106758324.json"));
+}
+
+/// Finding 164 (#106758384 F578BE463712): the finish of that escrow. The
+/// receiver gets `amount − (amount − divideRound(amount, min(locked, current),
+/// up))` — 9.2592592592593 BST of the 10 (EscrowHelpers.h
+/// escrowUnlockApplyHelper); we credited the full 10.
+#[test]
+fn escrow_finish_delivers_net_of_the_locked_rate() {
+    run_bundle(include_str!("vectors/escrow_finish_delivers_net_of_the_locked_rate_106758384.json"));
 }
