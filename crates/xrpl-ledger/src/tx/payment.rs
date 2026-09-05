@@ -2084,6 +2084,15 @@ impl PaymentTransactor {
                 return TxResult::PathDry;
             }
         }
+        // Finding 162: the default path ripples through the ISSUER, and
+        // checkNoRipple refuses that when the issuer's NoRipple flag sits on
+        // both holders' lines (DirectStep.cpp:859) — tecPATH_DRY, fee only.
+        if tx.account != leg.issuer
+            && dest != &leg.issuer
+            && crate::tx::direct_step::check_no_ripple(sandbox, &tx.account, &leg.issuer, dest, &leg.cur)
+        {
+            return TxResult::PathDry;
+        }
         let avail = if tx.account == leg.issuer {
             want // issuers mint their own IOU
         } else {

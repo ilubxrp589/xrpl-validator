@@ -398,3 +398,15 @@ fn payment_dry_strand_never_returns() {
 fn payment_direct_hop_into_a_globally_frozen_account_is_dry() {
     run_bundle(include_str!("vectors/payment_direct_hop_into_a_globally_frozen_account_is_dry_106753769.json"));
 }
+
+/// Finding 162 (#106779252 3AD7EA863312): rJEvC4cuk pays 2,000,000
+/// XRPFLORIDAGATORS to rpFYjv6SF. Both lines exist and the sender is funded,
+/// but the issuer's NoRipple flag sits on both holders' lines, so rippled's
+/// checkNoRipple refuses to ripple through it: no strand, tecPATH_DRY, fee
+/// only. We delivered and moved both lines. Seven receipts that morning.
+#[test]
+fn payment_through_an_issuer_with_no_ripple_on_both_lines_is_dry_106779252() {
+    run_bundle(include_str!(
+        "vectors/payment_through_an_issuer_with_no_ripple_on_both_lines_is_dry_106779252.json"
+    ));
+}

@@ -189,6 +189,46 @@ pub(crate) fn hop_frozen(sandbox: &Sandbox, hop: &DirectHop) -> bool {
     hop_frozen_parts(sandbox, &hop.src, &hop.dst, &hop.cur)
 }
 
+/// Finding 162 — `checkNoRipple` (DirectStep.cpp:859, the rule for a direct
+/// step whose previous step is a direct step): rippling THROUGH `cur` is
+/// refused when `cur`'s own NoRipple flag is set on BOTH of its lines — the
+/// one from `prev` and the one to `next` — or when either line is missing:
+///
+///     if (!sleIn || !sleOut) return terNO_LINE;
+///     if (sleIn->isFlag((cur > prev) ? lsfHighNoRipple : lsfLowNoRipple) &&
+///         sleOut->isFlag((cur > next) ? lsfHighNoRipple : lsfLowNoRipple))
+///         return terNO_RIPPLE;
+///
+/// The default path of a holder → holder IOU payment ripples through the
+/// ISSUER, so an issuer that set NoRipple on its side of both holders' lines
+/// cannot have its token moved between them — the strand fails to build and
+/// the payment is tecPATH_DRY.
+///
+/// #106779252 3AD7EA863312 (and six more the same morning): rJEvC4cuk pays
+/// 2,000,000 XRPFLORIDAGATORS to rpFYjv6SF; both lines exist, the sender
+/// holds 99,999,999,999, and the issuer rMpjR1oh carries NoRipple on both.
+/// Mainnet: tecPATH_DRY, fee only. We delivered and moved both lines.
+pub(crate) fn check_no_ripple(
+    sandbox: &Sandbox,
+    prev: &[u8; 20],
+    cur: &[u8; 20],
+    next: &[u8; 20],
+    currency: &[u8; 20],
+) -> bool {
+    const LSF_LOW_NO_RIPPLE: u64 = 0x0010_0000;
+    const LSF_HIGH_NO_RIPPLE: u64 = 0x0020_0000;
+    let flags = |a: &[u8; 20], b: &[u8; 20]| -> Option<u64> {
+        ox::json_at(sandbox, &keylet::ripple_state_key(a, b, currency))
+            .map(|l| l["Flags"].as_u64().unwrap_or(0))
+    };
+    let (Some(fin), Some(fout)) = (flags(prev, cur), flags(cur, next)) else {
+        return true; // terNO_LINE
+    };
+    let bit_in = if cur > prev { LSF_HIGH_NO_RIPPLE } else { LSF_LOW_NO_RIPPLE };
+    let bit_out = if cur > next { LSF_HIGH_NO_RIPPLE } else { LSF_LOW_NO_RIPPLE };
+    fin & bit_in != 0 && fout & bit_out != 0
+}
+
 /// `hop_frozen` on a (src, dst, currency) triple — the simple holder → issuer
 /// → holder payment in payment.rs has no `DirectHop`.
 pub(crate) fn hop_frozen_parts(sandbox: &Sandbox, src: &[u8; 20], dst: &[u8; 20], cur: &[u8; 20]) -> bool {
@@ -228,8 +268,19 @@ pub(crate) fn build_direct_strand(
     let mut seen_src: Vec<[u8; 20]> = Vec::new();
     let mut seen_dst: Vec<[u8; 20]> = Vec::new();
     let mut hops = Vec::with_capacity(seq.len() - 1);
+    let mut prev_src: Option<[u8; 20]> = None;
     for w in seq.windows(2) {
         let hop = DirectHop { src: w[0], dst: w[1], cur: *cur };
+        // Finding 162: a direct step after a direct step runs checkNoRipple
+        // on the account it ripples through.
+        if let Some(prev) = prev_src.replace(hop.src) {
+            if check_no_ripple(sandbox, &prev, &hop.src, &hop.dst, cur) {
+                if std::env::var("DX_PAY").is_ok() {
+                    eprintln!("DX_PAY direct drop: NO RIPPLE through {}", hex::encode(&hop.src[..4]));
+                }
+                return None; // terNO_RIPPLE
+            }
+        }
         if seen_src.contains(&hop.src) || seen_dst.contains(&hop.dst) {
             return None; // temBAD_PATH_LOOP ⇒ path dropped
         }
@@ -931,6 +982,14 @@ pub(crate) fn check_mixed_strand(sandbox: &Sandbox, segs: &[SegLayout]) -> bool 
                             );
                         }
                         return false; // terNO_LINE
+                    }
+                    // Finding 162: a direct step after a direct step runs
+                    // checkNoRipple on the account it ripples through.
+                    if i > 0 && check_no_ripple(sandbox, &hops[i - 1].src, &hop.src, &hop.dst, &hop.cur) {
+                        if std::env::var("DX_PAY").is_ok() {
+                            eprintln!("DX_PAY mixed drop: NO RIPPLE through {}", hex::encode(&hop.src[..4]));
+                        }
+                        return false; // terNO_RIPPLE
                     }
                     // The step OUT of a book refuses when the source side of
                     // its line carries NoRipple.
