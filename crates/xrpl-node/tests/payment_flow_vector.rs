@@ -466,3 +466,8 @@ fn payment_parked_carry_take_back_is_capped_at_the_park_106733664() {
 fn payment_park_undo_reverts_the_creators_owner_count_106735554() {
     run_bundle(include_str!("vectors/payment_park_undo_reverts_the_creators_owner_count_106735554.json"));
 }
+
+#[test]
+fn payment_anchored_pool_slice_and_its_level_share_one_pass_106770629() {
+    run_bundle(include_str!("vectors/payment_anchored_pool_slice_and_its_level_share_one_pass_106770629.json"));
+}

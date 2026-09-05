@@ -6145,7 +6145,18 @@ pub(crate) fn cross_engine_to_net(
             // loop, so returning here would abandon the rest of the book rather
             // than come back to it — measured, and it moves the XRP side of an
             // offer-crossing pass that is byte-exact today.
-            if used && !offer_crossing {
+            //
+            // Finding 180 (#106770629 FF3E66E6): NOT when the slice was
+            // anchored at this level's own quality (`same_iteration`, i.e.
+            // `pass_tot` holds it). rippled's forEachOffer runs tryAMM on the
+            // funded tip's quality and then every offer AT that quality in the
+            // same pass (`ofrQ` is the AMM offer's quality, the tip's), so the
+            // pool's 28.0574113498 USDC and rLtCVnoj's 1.538480007399999 reach
+            // the RLUSD book as ONE 29.5958913572 and its maker is debited
+            // once (7879.338142785851 − 29.59331668965259 = …198); two rounds
+            // debited it twice and landed one ulp up (…199). The Fibonacci
+            // case above keeps its return — each slice is its own iteration.
+            if used && !offer_crossing && me_is_zero(pass_tot.0) {
                 settle_taker!();
                 return (rem_pays, rem_gets, crossed, in_gross_spent);
             }
