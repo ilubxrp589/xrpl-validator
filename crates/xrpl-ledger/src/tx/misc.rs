@@ -1149,8 +1149,14 @@ impl Transactor for DIDSetTransactor {
             sandbox.write(key, serde_json::to_vec(&did).unwrap_or_default());
             return TxResult::Success;
         }
+        // Finding 187: `sfFlags` is soeREQUIRED on the DID ledger format, so a
+        // freshly created DID serialises `Flags: 0` right after its type —
+        // `22 00000000` — whether or not DIDSet touches it. #106796939
+        // B4CE24D232CE (rDcohNUmBA sets Data): mainnet's object is 112 bytes,
+        // ours 107, the five missing bytes being exactly that field.
         let mut did = serde_json::json!({
             "LedgerEntryType": "DID",
+            "Flags": 0u64,
             "Account": hex::encode(tx.account),
         });
         update(&mut did);
