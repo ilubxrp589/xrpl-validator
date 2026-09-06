@@ -800,7 +800,23 @@ pub(crate) fn available(sandbox: &Sandbox, id: &[u8; 20], leg: &Leg) -> Me {
         // count remembered at the flow's first adjustment.
         let oc = owner_count_remembered(id).map_or(oc_now, |r| r.max(oc_now)) as u128;
         let reserve = XRP_RESERVE_BASE + XRP_RESERVE_INC * oc;
-        (bal.saturating_sub(reserve), 0)
+        // Finding 192: what the account may SPEND is its original balance
+        // less its debits in this flow (PaymentSandbox::balanceHook via
+        // xrpLiquid) — XRP credited to it earlier in the same flow does not
+        // fund it. #106804064 335BC2814C3A (r9nKwYtEbe, circular 100M XQK →
+        // XRP under tfPartialPayment): iteration 0 takes 16217439 drops from
+        // the pool INTO the sender; iteration 1 then meets the sender's OWN
+        // XRP-for-XQK offer 870E3D10. rippled funds it from the original
+        // balance alone — 10489581 drops after the reserve — fills that,
+        // finds the offer unfunded and removes it, then takes the pool and
+        // rGW67HJbw's offer for the rest. We funded it with the fresh
+        // 16217439 as well (26707020), filled 23473874 drops in one go and
+        // ended the flow early: two makers never touched, the own offer left
+        // partially filled, the sender's lines off (15 objects across the
+        // ledger's cascade).
+        let basis = deferred_cap(sandbox, id, leg, (bal, 0));
+        let basis = me_rescale(basis, 0, false);
+        (basis.saturating_sub(reserve), 0)
     } else if id == &leg.issuer {
         (u128::MAX / 4, 20) // issuers deliver their own IOU without limit
     } else {
@@ -1539,6 +1555,12 @@ pub(crate) fn move_leg(sandbox: &mut Sandbox, from: &[u8; 20], to: &[u8; 20], le
             let key = keylet::account_root_key(id);
             if let Some(mut a) = json_at(sandbox, &key) {
                 let bal: u128 = a["Balance"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+                // Finding 192: XRP moves join the deferred-credit table too —
+                // rippled's PaymentSandbox `balanceHook` (xrpLiquid → adjusted
+                // balance) lets an account spend only its ORIGINAL balance
+                // less its debits so far; XRP it received earlier in the same
+                // flow is deferred until the transaction completes.
+                deferred_record(sandbox, id, leg, false, (bal, 0), (drops, 0), add);
                 let nb = if add { bal.saturating_add(drops) } else { bal.saturating_sub(drops) };
                 a["Balance"] = serde_json::Value::String(nb.to_string());
                 put_json(sandbox, key, &a);
@@ -1632,7 +1654,11 @@ fn walk_available(
         .max(cur)
         .max(owner_count_remembered(maker).unwrap_or(0));
     let reserve = XRP_RESERVE_BASE + XRP_RESERVE_INC * oc as u128;
-    (bal.saturating_sub(reserve), 0)
+    // Finding 192: the walk's maker funding is `accountFunds` on the
+    // PaymentSandbox — the deferred basis (original balance less debits in
+    // this flow), never XRP the maker was paid earlier in the same flow.
+    let basis = me_rescale(deferred_cap(sandbox, maker, pays_leg, (bal, 0)), 0, false);
+    (basis.saturating_sub(reserve), 0)
 }
 
 pub(crate) fn delete_maker_offer(
@@ -4627,6 +4653,24 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // Resolve each leg's source: book maker offer or that pair's
                 // pool fib slice. A-side capacity/rate in (XRP-out, gets-in),
                 // B-side in (pays-out, XRP-in).
+                // Finding 193: the stream STEPS before the pool's turn —
+                // `while (offers.step())` opens BookStep::forEachOffer and
+                // `tryAMM(offers.tip().quality())` runs inside it — so the
+                // dead offers at a leg's head are reaped ("Removing unfunded
+                // offer") even when the pool then takes the whole leg and no
+                // CLOB offer is crossed. A pool-served leg used to skip its
+                // head entirely. #106804073 729458F452EE (rnCEEqDnCu sells
+                // 1000 XAH for 2 RLUSD, tfImmediateOrCancel): the XAH→XRP
+                // head is rsvWreRXHt's 983050F6, funded to exactly zero
+                // (37.2 XRP against 181 objects); rippled removes it, its
+                // page and the owner-directory entry, then the XAH/XRP pool
+                // fills the leg. Same fill, four objects short.
+                if a_use_amm {
+                    let _ = live_head(sandbox, &la, &mut ai, taker, &xrp_leg, gets_leg, false, true, stale, None, Some(&drained_next), true);
+                }
+                if b_use_amm {
+                    let _ = live_head(sandbox, &lb, &mut bi, taker, pays_leg, &xrp_leg, false, true, stale, None, Some(&drained_next), true);
+                }
                 let a_book = if a_use_amm {
                     None
                 } else {

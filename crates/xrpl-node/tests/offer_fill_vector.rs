@@ -894,3 +894,14 @@ fn amm_multipath_in_limited_slice_truncates_its_out_106796893() {
 fn offer_self_offers_beyond_the_strict_limit_ride_the_tips_admission_106803506() {
     run_bundle(include_str!("vectors/offer_self_offers_beyond_the_strict_limit_ride_the_tips_admission_106803506.json"));
 }
+
+// Finding 193 — #106804073 729458F452EE (rnCEEqDnCu sells 1000 XAH for
+// 2 RLUSD, tfImmediateOrCancel, autobridged): the offer stream steps before
+// the pool's turn, so the XAH→XRP head — rsvWreRXHt's 983050F6, funded to
+// exactly zero — is removed with its page and owner-directory entry even
+// though the XAH/XRP pool then fills the whole leg. A pool-served leg used
+// to skip its head; same fill, four objects short.
+#[test]
+fn offer_bridge_leg_reaps_the_unfunded_tip_before_the_pool_106804073() {
+    run_bundle(include_str!("vectors/offer_bridge_leg_reaps_the_unfunded_tip_before_the_pool_106804073.json"));
+}

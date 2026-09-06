@@ -522,3 +522,16 @@ fn payment_strand_in_beats_the_lines_quantised_delta_106788656() {
 fn payment_inter_gateway_tail_keeps_the_strand_active_106800968() {
     run_bundle(include_str!("vectors/payment_inter_gateway_tail_keeps_the_strand_active_106800968.json"));
 }
+
+// Finding 192 — #106804064 335BC2814C3A (r9nKwYtEbe, circular 100M XQK → XRP
+// under tfPartialPayment): iteration 0 takes 16217439 drops from the XQK/XRP
+// pool into the sender; iteration 1 meets the sender's OWN XRP-for-XQK offer.
+// PaymentSandbox defers the credit, so rippled funds that offer from the
+// original balance alone (10489581 drops after the reserve), fills exactly
+// that, finds the offer unfunded and removes it, then takes the pool again
+// and rGW67HJbw's offer. We let the fresh 16217439 drops fund it too and
+// filled 23473874 in one go, ending the flow early.
+#[test]
+fn payment_own_offer_is_funded_by_the_original_xrp_balance_106804064() {
+    run_bundle(include_str!("vectors/payment_own_offer_is_funded_by_the_original_xrp_balance_106804064.json"));
+}
