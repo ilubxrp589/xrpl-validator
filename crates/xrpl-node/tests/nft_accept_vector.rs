@@ -208,3 +208,13 @@ fn nft_accept_brokered_loop_is_cant_accept_own() {
 fn nft_burn_by_a_stranger_needs_a_burnable_token() {
     run_bundle(include_str!("vectors/nft_burn_by_a_stranger_needs_a_burnable_token_106747838.json"));
 }
+
+// Finding 185 — #106793245 E2BD39A88D8C (r4Tfxnu8qy sells an NFT for 1 XRP
+// to rDeizxSR with Expiration 841935600, 13.6 h before the parent ledger's
+// close): `hasExpired` is NFTokenCreateOffer::preclaim's first test and
+// mainnet answers tecEXPIRED, fee only. We had no expiration check and
+// created the offer with three directory pages.
+#[test]
+fn nftoken_create_offer_with_a_past_expiration_is_refused() {
+    run_bundle(include_str!("vectors/nftoken_create_offer_with_a_past_expiration_is_refused_106793245.json"));
+}

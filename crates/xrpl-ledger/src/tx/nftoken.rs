@@ -550,6 +550,18 @@ impl Transactor for NFTokenCreateOfferTransactor {
         if !sandbox.exists(&acct_key) {
             return TxResult::NoAccount;
         }
+        // Finding 185: `hasExpired(ctx.view, ctx.tx[~sfExpiration])` is the
+        // FIRST test of NFTokenCreateOffer::preclaim — the offer's Expiration
+        // at or before the parent ledger's close time is tecEXPIRED, before
+        // the token is even looked up. #106793245 E2BD39A88D8C (r4Tfxnu8qy
+        // sells 00081F40…0EF5 for 1 XRP to rDeizxSR, Expiration 841935600,
+        // 13.6 h before the parent close 841984472): mainnet claims the fee
+        // alone; we created the offer and three directory pages.
+        if let Some(exp) = tx.fields.get("Expiration").and_then(|v| v.as_u64()) {
+            if sandbox.base().header.close_time as u64 >= exp {
+                return TxResult::Expired;
+            }
+        }
         // rippled NFTokenCreateOffer::preclaim — the token must EXIST in the
         // relevant owner's pages, else tecNO_ENTRY. Owner is the offer's
         // seller: the tx account for a sell offer (tfSellNFToken), the sfOwner
