@@ -399,11 +399,35 @@ impl Transactor for TrustSetTransactor {
                     // Sender is the high side
                     line["HighLimit"]["value"] = serde_json::Value::String(new_value.to_string());
                 }
-                if let Some(qin) = tx.fields.get("QualityIn") {
-                    line["QualityIn"] = qin.clone();
-                }
-                if let Some(qout) = tx.fields.get("QualityOut") {
-                    line["QualityOut"] = qout.clone();
+                // Finding 188: the sender-side quality fields — `bHigh ?
+                // sfHighQualityIn : sfLowQualityIn` (and Out) — are SET when the
+                // transaction's value is non-zero and not QUALITY_ONE and
+                // `makeFieldAbsent` otherwise (TrustSet.cpp doApply). This used
+                // to copy the transaction's QualityIn/QualityOut onto the line
+                // under the TRANSACTION field names, so a RippleState went out
+                // carrying sfQualityIn (20) / sfQualityOut (21) — and a real
+                // quality never reached its side field. #106800767 5DDFFF08DAD2
+                // (rKYS7VMBjX, QualityIn 0, QualityOut 0 on an existing
+                // Greyhound line): mainnet 211 bytes, ours 223.
+                {
+                    const QUALITY_ONE: u64 = 1_000_000_000;
+                    let sender_low = tx.account < issuer;
+                    let (qin_f, qout_f) = if sender_low {
+                        ("LowQualityIn", "LowQualityOut")
+                    } else {
+                        ("HighQualityIn", "HighQualityOut")
+                    };
+                    for (txf, lf) in [("QualityIn", qin_f), ("QualityOut", qout_f)] {
+                        if let Some(q) = tx.fields.get(txf).and_then(|v| v.as_u64()) {
+                            if q == 0 || q == QUALITY_ONE {
+                                if let Some(o) = line.as_object_mut() {
+                                    o.remove(lf);
+                                }
+                            } else {
+                                line[lf] = serde_json::json!(q);
+                            }
+                        }
+                    }
                 }
 
                 // Apply the tx's tf-flags to the SENDER's side of the line
@@ -676,6 +700,24 @@ impl Transactor for TrustSetTransactor {
                 "Flags": creation_flags,
             });
             let mut line_obj = line_obj;
+            // Finding 188 (creation): `trustCreate(…, uQualityIn, uQualityOut)`
+            // stores the sender-side quality when non-zero and not QUALITY_ONE.
+            {
+                const QUALITY_ONE: u64 = 1_000_000_000;
+                let sender_low = tx.account < issuer;
+                let (qin_f, qout_f) = if sender_low {
+                    ("LowQualityIn", "LowQualityOut")
+                } else {
+                    ("HighQualityIn", "HighQualityOut")
+                };
+                for (txf, lf) in [("QualityIn", qin_f), ("QualityOut", qout_f)] {
+                    if let Some(q) = tx.fields.get(txf).and_then(|v| v.as_u64()) {
+                        if q != 0 && q != QUALITY_ONE {
+                            line_obj[lf] = serde_json::json!(q);
+                        }
+                    }
+                }
+            }
 
             // A new RippleState is inserted into BOTH parties' owner
             // directories, and the line stores both hints (SoeRequired —

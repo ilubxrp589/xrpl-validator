@@ -105,3 +105,13 @@ fn trust_set_authorising_a_holder_without_a_line_creates_it_authorised_106761226
 fn trust_set_authorising_a_holder_without_a_line_creates_it_authorised_106773044() {
     run_bundle(include_str!("vectors/trust_set_authorising_a_holder_without_a_line_creates_it_authorised_106773044.json"));
 }
+
+// Finding 188 — #106800767 5DDFFF08DAD2 (rKYS7VMBjX, tfSetNoRipple|tfSetFreeze,
+// LimitAmount 0, QualityIn 0, QualityOut 0 on an existing Greyhound line):
+// TrustSet::doApply writes a quality field only when it is non-zero and not
+// QUALITY_ONE; zero (and 1e9) `makeFieldAbsent` it. We wrote LowQualityIn
+// and LowQualityOut as 0 — twelve bytes mainnet's 211-byte line lacks.
+#[test]
+fn trust_set_zero_quality_removes_the_field_106800767() {
+    run_bundle(include_str!("vectors/trust_set_zero_quality_removes_the_field_106800767.json"));
+}
