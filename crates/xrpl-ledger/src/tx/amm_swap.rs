@@ -1418,11 +1418,20 @@ pub(crate) fn consume_fib(
         take_out = rem_pays;
     }
     if n_cmp(take_in, rem_gets) == Ordering::Greater {
-        take_out = to_amount(
-            ox::me_muldiv(rem_gets, (1_000_000_000_000_000, -15), q_px, false),
-            pays_leg.xrp,
-            Rnd::Down,
-        );
+        // Finding 186: the in-limited slice is `limitStepIn` →
+        // `AMMOffer::limitIn(…, roundUp=false)` → multi-path
+        // `Quality::ceilInStrict` → `divRoundStrict(limit, rate, false)`:
+        // the 17-digit integer quotient TRUNCATED to 16 digits
+        // (STAmount.cpp divRoundImpl, roundUp=false ⇒ muldivRound with no
+        // bump, canonicalizeRound down). `me_muldiv` floored a ~17-digit
+        // quotient and then re-normalised to 16 digits at NEAREST, one ulp
+        // high whenever the dropped digit was ≥ 5. #106796893 A65B72F14BFF
+        // (tfSell|tfIoC, 39.648 coreum7c8… into the coreum1ae… pool, four
+        // fib slices): the last slice is capped by the 16.13435662111176
+        // left to spend; rippled prices it 1.015492104670499 through the
+        // slice's rate 15.88821473540351 (exact …49989…), we said …500 and
+        // the pool's line rested at −1484.969386679854 for mainnet's …855.
+        take_out = to_amount(n_div(rem_gets, q_px, Rnd::Down), pays_leg.xrp, Rnd::Down);
         take_in = rem_gets;
     }
     if take_in.0 == 0 || take_out.0 == 0 {

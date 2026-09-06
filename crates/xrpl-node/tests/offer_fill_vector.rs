@@ -869,3 +869,15 @@ fn offer_bridged_leg_out_remainder_folds_to_sixteen_digits_106781871() {
 fn offer_bridge_leg_crosses_the_takers_own_offer_106791885() {
     run_bundle(include_str!("vectors/offer_bridge_leg_crosses_the_takers_own_offer_106791885.json"));
 }
+
+// Finding 186 — #106796893 A65B72F14BFF (tfSell|tfIoC, 39.648 coreum7c8… into
+// the coreum7c8/coreum1ae pool over four multi-path fib slices): the last
+// slice is in-limited by the 16.13435662111176 left to spend, and rippled
+// sizes its out through the slice's encoded rate with `divRoundStrict(…,
+// roundUp=false)` — truncated to 16 digits, 1.015492104670499. We floored a
+// 17-digit quotient and re-normalised at nearest: …500, and the pool's line
+// rested one ulp low.
+#[test]
+fn amm_multipath_in_limited_slice_truncates_its_out_106796893() {
+    run_bundle(include_str!("vectors/amm_multipath_in_limited_slice_truncates_its_out_106796893.json"));
+}
