@@ -6139,7 +6139,15 @@ pub(crate) fn cross_engine_to_net(
             let (rp, rg, used) = amm_turn(
                 amm_fib.as_deref_mut(), sandbox, a, taker, beneficiary,
                 benef_net.map(|(r, na)| (r, na, ask0)),
-                gets_gross_cap.map(|c| me_sub(c, in_gross_spent)), rem_pays, rem_gets,
+                // Finding 194: on a FEE-LESS in-leg the remaining gross cap IS
+                // rippled's `remainingIn` — SendMax less the ascending 16-digit
+                // fold of the saved per-iteration ins — which `rem_gets` already
+                // carries; the running `in_gross_spent` chain folds in fill
+                // order and can sit an ulp apart. #106804619 91FE04938B23
+                // (tfSell|tfIoC, 50M FUZZY, five iterations): the exhausting
+                // pool slice was sized at 14120619.07956684 but the taker's
+                // line was debited the chain's …685 — one ulp high.
+                gets_gross_cap.map(|c| if pay_in_rate.is_none() { rem_gets } else { me_sub(c, in_gross_spent) }), rem_pays, rem_gets,
                 pays_leg, gets_leg, threshold, threshold_self, sell, Some(q), pay_in_rate,
                 None,
             );
@@ -7323,7 +7331,15 @@ pub(crate) fn cross_engine_to_net(
             let (rp, rg, used) = amm_turn(
                 amm_fib.as_deref_mut(), sandbox, a, taker, beneficiary,
                 benef_net.map(|(r, na)| (r, na, ask0)),
-                gets_gross_cap.map(|c| me_sub(c, in_gross_spent)), rem_pays, rem_gets,
+                // Finding 194: on a FEE-LESS in-leg the remaining gross cap IS
+                // rippled's `remainingIn` — SendMax less the ascending 16-digit
+                // fold of the saved per-iteration ins — which `rem_gets` already
+                // carries; the running `in_gross_spent` chain folds in fill
+                // order and can sit an ulp apart. #106804619 91FE04938B23
+                // (tfSell|tfIoC, 50M FUZZY, five iterations): the exhausting
+                // pool slice was sized at 14120619.07956684 but the taker's
+                // line was debited the chain's …685 — one ulp high.
+                gets_gross_cap.map(|c| if pay_in_rate.is_none() { rem_gets } else { me_sub(c, in_gross_spent) }), rem_pays, rem_gets,
                 pays_leg, gets_leg, threshold, threshold_self, sell,
                 // A remembered self-offer within the limit is still the tip
                 // rippled's tail pass anchors on (see self_anchor_q above);

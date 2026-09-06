@@ -905,3 +905,15 @@ fn offer_self_offers_beyond_the_strict_limit_ride_the_tips_admission_106803506()
 fn offer_bridge_leg_reaps_the_unfunded_tip_before_the_pool_106804073() {
     run_bundle(include_str!("vectors/offer_bridge_leg_reaps_the_unfunded_tip_before_the_pool_106804073.json"));
 }
+
+// Finding 194 — #106804619 91FE04938B23 (rU4nC6CZic, tfSell|tfIoC, 50M FUZZY
+// into the FUZZY/XRP book and pool, five iterations): the exhausting pool
+// slice's in is rippled's `remainingIn` — SendMax less the ascending
+// 16-digit fold of the saved per-iteration ins, 14120619.07956684 — and the
+// taker's line is debited exactly that. We sized the slice right but
+// debited the running gross-cap chain (…685), one ulp high, so the taker's
+// FUZZY line rested at −30710637.09496807 for mainnet's …808.
+#[test]
+fn offer_sell_exhausting_slice_debits_the_folded_remainder_106804619() {
+    run_bundle(include_str!("vectors/offer_sell_exhausting_slice_debits_the_folded_remainder_106804619.json"));
+}
