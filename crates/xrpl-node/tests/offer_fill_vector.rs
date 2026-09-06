@@ -881,3 +881,16 @@ fn offer_bridge_leg_crosses_the_takers_own_offer_106791885() {
 fn amm_multipath_in_limited_slice_truncates_its_out_106796893() {
     run_bundle(include_str!("vectors/amm_multipath_in_limited_slice_truncates_its_out_106796893.json"));
 }
+
+// Finding 191 — #106803506 C44893FAAF3C (rsRdjxq24y bids 6.715897 XRP for
+// 9.552183 USD.rvYA): its own three asks sit at 1.41783e-6, 1.42086e-6 and
+// 1.42388e-6 USD/drop against a strict limit of 1.42232e-6 (inflated by the
+// 1.0015 rate to 1.42446e-6). Admission is judged once, at the iteration's
+// raw tip, and self-removals never re-judge it: rippled removes all three
+// asks and their pages and rests the bid. We judged the beyond-strict sweep
+// at the third level, where the pool's synthetic anchored there × 1.0015
+// misses the inflated limit, and left the third ask in place.
+#[test]
+fn offer_self_offers_beyond_the_strict_limit_ride_the_tips_admission_106803506() {
+    run_bundle(include_str!("vectors/offer_self_offers_beyond_the_strict_limit_ride_the_tips_admission_106803506.json"));
+}

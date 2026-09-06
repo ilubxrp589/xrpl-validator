@@ -5802,6 +5802,39 @@ pub(crate) fn cross_engine_to_net(
                 crate::tx::amm_swap::spot_upper_bound(sandbox, a, pays_leg, gets_leg) <= threshold
             });
         stream_ran = stream_ran || strand_active;
+        // Finding 191: the beyond-strict sweep's admission is judged ONCE per
+        // iteration, AT THE ITERATION'S TIP (qualityUpperBound on the view as
+        // the iteration opens) — and every consecutive self-removal with no
+        // offer attempted resets the stream's level anchor without re-judging
+        // (BookStep.cpp:441-448). So when this iteration's first level sits
+        // inside the strict limit, settle the memo HERE with that level's
+        // pool-vs-tip verdict; the lazy evaluation below would otherwise judge
+        // it at the first beyond-strict level, where an anchored synthetic
+        // that composes trIn can fail the inflated limit. #106803506
+        // C44893FAAF3C (rsRdjxq24y bids 6.715897 XRP for 9.552183 USD.rvYA):
+        // its own three asks sit at 1.41783e-6, 1.42086e-6 and 1.42388e-6
+        // USD/drop against a strict limit of 1.42232e-6 (×1.0015 = 1.42446e-6).
+        // rippled admits the strand at the raw tip, removes all three and
+        // rests the bid; we removed two — at the third level the pool's
+        // synthetic anchored there (spot 1.4188e-6 beats it) × 1.0015 missed
+        // the inflated limit and the sweep was refused: offer, page,
+        // owner-directory entry and OwnerCount unit all one high.
+        if offer_crossing
+            && q <= threshold
+            && sweep_admitted.is_none()
+            && threshold_self != 0
+            && threshold_self != u64::MAX
+        {
+            sweep_admitted = Some(
+                match amm.as_ref().and_then(|a| {
+                    crate::tx::amm_swap::anchored_slice(sandbox, a, pays_leg, gets_leg, q)
+                }) {
+                    Some((si, so)) => rate_of_me(gross_in(pay_in_rate, si), so)
+                        .is_some_and(|ub| ub != 0 && ub <= threshold_self),
+                    None => true,
+                },
+            );
+        }
         if strand_active && !reap_to_live_head(sandbox, &dk, pays_leg, gets_leg, Some(&mut oc0), stale, Some(&drained_level)) {
             continue;
         }
@@ -5880,7 +5913,21 @@ pub(crate) fn cross_engine_to_net(
                 .as_ref()
                 .and_then(|a| crate::tx::amm_swap::anchored_slice(sandbox, a, pays_leg, gets_leg, q))
                 .is_some_and(|(si, so)| {
-                    if sell { me_cmp(si, rem_gets).is_ge() } else { me_cmp(so, rem_pays).is_ge() }
+                    let covers = if sell { me_cmp(si, rem_gets).is_ge() } else { me_cmp(so, rem_pays).is_ge() };
+                    // Finding 191: the pool's turn pre-empts the tip only when
+                    // its anchored offer is itself INSIDE the limit. Beyond it,
+                    // `tryAMM`'s offer fails the quality threshold, nothing is
+                    // consumed, `execOffer` steps onto the tip and a self-offer
+                    // there is removed. #106803506 C44893FAAF3C: at the third
+                    // self-ask's level (1.42388e-6 USD/drop) the XRP/USD.rvYA
+                    // pool's synthetic anchored there × 1.0015 = 1.4260e-6
+                    // misses the inflated limit 1.42446e-6 — rippled removes
+                    // the ask ("Strand found dry in rev") and rests the bid; we
+                    // took the pool's coverage as reason to skip the sweep and
+                    // left the ask, its page and an OwnerCount unit behind.
+                    let inside = rate_of_me(gross_in(pay_in_rate, si), so)
+                        .is_some_and(|ub| ub != 0 && ub <= threshold_self);
+                    covers && inside
                 });
             if amm_covers_want && offer_crossing && q <= threshold_self {
                 if std::env::var("DX_WALK").is_ok() {
