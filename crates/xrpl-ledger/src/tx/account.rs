@@ -347,11 +347,18 @@ impl Transactor for AccountDeleteTransactor {
         // An all-deletable directory falls through to do_apply's cascade,
         // exactly rippled's shape (obligations already refused per entry).
 
-        // Account sequence + 256 must be <= current ledger sequence
+        // Finding 189: `(*sleAccount)[sfSequence] + kSeqDelta > ctx.view.seq()`
+        // → tecTOO_SOON, with kSeqDelta = 255 and `view.seq()` the ledger being
+        // BUILT — the parent's sequence plus one (AccountDelete.cpp:287-289).
+        // This compared sequence + 256 against the PARENT and answered
+        // tecNO_PERMISSION: two ledgers too strict and the wrong code.
+        // #106800984 6E3A8F3606D0 (rPt8AyBFLR, Sequence 106800728, deleting
+        // into rpiydPTiX7 at ledger 106800984 = 106800728 + 256): mainnet
+        // deletes the account, we claimed tecNO_PERMISSION.
         let acct_seq = acct["Sequence"].as_u64().unwrap_or(0) as u32;
-        let ledger_seq = sandbox.base().header.sequence;
-        if acct_seq.saturating_add(256) > ledger_seq {
-            return TxResult::NoPermission;
+        let view_seq = sandbox.base().header.sequence.saturating_add(1);
+        if acct_seq.saturating_add(255) > view_seq {
+            return TxResult::TooSoon;
         }
 
         TxResult::Success

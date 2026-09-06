@@ -62,6 +62,9 @@ pub enum TxResult {
     /// already reached. rippled: `hasExpired(view, exp)` is
     /// `parentCloseTime() >= exp` (View.cpp:48-54).
     Expired,
+    /// AccountDelete: the account's Sequence is too recent —
+    /// `sequence + 255 > view.seq()` (AccountDelete.cpp kSeqDelta).
+    TooSoon,
     /// Path delivered something but less than required (no partial flag).
     PathPartial,
     /// Destination requires a DestinationTag and the tx has none.
@@ -210,6 +213,7 @@ impl TxResult {
             | TxResult::InsufReserveOffer
             | TxResult::UnfundedOffer
             | TxResult::Expired
+            | TxResult::TooSoon
             | TxResult::PathPartial
             | TxResult::DstTagNeeded
             | TxResult::ArrayTooLarge
@@ -267,6 +271,7 @@ impl TxResult {
             TxResult::PathDry => "tecPATH_DRY",
             TxResult::Unfunded => "tecUNFUNDED",
             TxResult::NoPermission => "tecNO_PERMISSION",
+            TxResult::TooSoon => "tecTOO_SOON",
             TxResult::NoIssuer => "tecNO_ISSUER",
             TxResult::NoEntry => "tecNO_ENTRY",
             TxResult::NoTarget => "tecNO_TARGET",

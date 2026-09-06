@@ -59,12 +59,33 @@ fn run_bundle(bundle_json: &str) {
     );
 
     for (k, want_hex) in bundle["expect"].as_object().unwrap() {
-        let ent = mods
-            .get(&key32(k))
-            .unwrap_or_else(|| panic!("target {k} must be written by the apply"));
+        // An EMPTY expectation is a deletion pin (finding 158): mainnet's
+        // meta deleted the object in this transaction, so must the apply.
+        let want_deleted = want_hex.as_str().unwrap().trim().is_empty();
+        // An expectation the apply did not write is legitimate only when it
+        // pins an object the transaction must leave ALONE: its post-image is
+        // then its pre-image, and the vector says so by expecting exactly
+        // the seated bytes (finding 143 — the taker's own bid beyond the
+        // ask's limit, which mainnet never names).
+        let Some(ent) = mods.get(&key32(k)) else {
+            assert!(!want_deleted, "target {k} must be deleted by the apply, which never wrote it");
+            let pre_hex = bundle["pre"][k].as_str().unwrap_or_default().trim().to_uppercase();
+            assert_eq!(
+                want_hex.as_str().unwrap().trim().to_uppercase(),
+                pre_hex,
+                "target {k} was not written by the apply and does not pin the untouched pre-image"
+            );
+            continue;
+        };
         let bytes = match ent {
-            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => b.clone(),
-            SandboxEntry::Deleted => panic!("target {k} deleted?"),
+            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => {
+                assert!(!want_deleted, "target {k} must be deleted by the apply, which wrote it instead");
+                b.clone()
+            }
+            SandboxEntry::Deleted => {
+                assert!(want_deleted, "target {k} deleted?");
+                continue;
+            }
         };
         let mut jv: Value = serde_json::from_slice(&bytes).unwrap();
         canon_for_encode(&mut jv);
@@ -84,4 +105,14 @@ fn run_bundle(bundle_json: &str) {
 #[test]
 fn account_delete_credit_clears_the_destinations_password_spent_flag() {
     run_bundle(include_str!("vectors/accountdelete_password_spent_106702154.json"));
+}
+
+// Finding 189 — #106800984 6E3A8F3606D0 (rPt8AyBFLR, Sequence 106800728,
+// deleted at ledger 106800984 = Sequence + 256): the age rule is
+// `Sequence + 255 > view.seq()` → tecTOO_SOON, against the ledger being
+// BUILT. We compared Sequence + 256 against the parent and answered
+// tecNO_PERMISSION; mainnet deletes the account and credits rpiydPTiX7.
+#[test]
+fn account_delete_at_the_255_ledger_boundary_106800984() {
+    run_bundle(include_str!("vectors/account_delete_at_the_255_ledger_boundary_106800984.json"));
 }
