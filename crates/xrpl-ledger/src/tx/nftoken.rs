@@ -262,6 +262,17 @@ impl Transactor for NFTokenMintTransactor {
         // ⚠ A transaction that is TWO operations inherits BOTH sets of rules.
         // Reading NFTokenMint's own preclaim in isolation shows nothing.
         if tx.fields.get("Amount").is_some() {
+            // Finding 196: the offer half expires like NFTokenCreateOffer's —
+            //     if (hasExpired(ctx.view, ctx.tx[~sfExpiration]))
+            //         return tecEXPIRED;                (NFTokenMint.cpp:201)
+            // is the FIRST test of the Amount block, ahead of
+            // tokenOfferCreatePreclaim; hasExpired = parentCloseTime >= exp
+            // (View.cpp:48). Same rule F185 gave NFTokenCreateOffer.
+            if let Some(exp) = tx.fields.get("Expiration").and_then(|v| v.as_u64()) {
+                if sandbox.base().header.close_time as u64 >= exp {
+                    return TxResult::Expired;
+                }
+            }
             if let Some(dest) = tx.fields.get("Destination").and_then(decode_account_id) {
                 if let Some(d) = sandbox
                     .read(&keylet::account_root_key(&dest))
@@ -1783,6 +1794,34 @@ mod tests {
             "sell-offer directory page is one of the three missing mutations",
         );
         assert!(!sb.exists(&keylet::nft_buy_offers_key(&nft_id)));
+    }
+
+    /// Finding 196 — the offer half of a mint expires like NFTokenCreateOffer's:
+    /// `hasExpired(ctx.view, ctx.tx[~sfExpiration])` is the first test of the
+    /// Amount block (NFTokenMint.cpp:201), parentCloseTime >= Expiration →
+    /// tecEXPIRED. Port of rippled 3.3.0, no specimen yet.
+    #[test]
+    fn a_mint_whose_offer_has_already_expired_is_refused() {
+        let minter = [0x01u8; 20];
+        // make_state closes the parent at 10.
+        let mut state = make_state(&[(minter, 100_000_000)]);
+        let mut sb = Sandbox::new(&mut state);
+
+        let mut tx = mint_tx(minter, 1);
+        tx.fields["Amount"] = serde_json::json!("0");
+        tx.fields["Expiration"] = serde_json::json!(10u64);
+        assert_eq!(
+            NFTokenMintTransactor.preclaim(&tx, &sb),
+            TxResult::Expired,
+            "an Expiration EQUAL to the parent close is already expired (>=)",
+        );
+
+        tx.fields["Expiration"] = serde_json::json!(11u64);
+        assert_eq!(NFTokenMintTransactor.preclaim(&tx, &sb), TxResult::Success);
+        assert_eq!(NFTokenMintTransactor.do_apply(&tx, &mut sb), TxResult::Success);
+        let raw = sb.read(&keylet::nft_offer_key(&minter, 7)).expect("the mint rests its offer");
+        let offer: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(offer["Expiration"], 11u64);
     }
 
     /// The control: a plain mint with no `Amount` rests nothing. Without this

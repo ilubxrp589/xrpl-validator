@@ -116,6 +116,20 @@ impl Transactor for CredentialCreateTransactor {
         if sandbox.exists(&cred_key) {
             return TxResult::Duplicate;
         }
+        // Finding 196: an Expiration already behind the parent close is
+        // tecEXPIRED — CredentialCreate::doApply, BEFORE the reserve check:
+        //     std::uint32_t const closeTime =
+        //         ctx_.view().header().parentCloseTime...count();
+        //     if (closeTime > *optExp) return tecEXPIRED;
+        // Strictly greater: an Expiration EQUAL to the parent close still
+        // creates (unlike hasExpired's `>=` for NFT offers). No `exp != 0`
+        // guard either — a present Expiration of 0 is simply in the past.
+        // Ported line-for-line from rippled 3.3.0 (no mainnet specimen yet).
+        if let Some(exp) = tx.fields.get("Expiration").and_then(|v| v.as_u64()) {
+            if sandbox.base().header.close_time as u64 > exp {
+                return TxResult::Expired;
+            }
+        }
         // Finding 182: the issuer must hold the reserve for ONE MORE object —
         // `checkReserve(ctx, sleIssuer, preFeeBalance_, {.ownerCountDelta = 1})`
         // (CredentialCreate::doApply, AccountRootHelpers.cpp): the balance
@@ -907,5 +921,46 @@ mod tests {
         // Second create with same params is tecDUPLICATE, the code rippled's
         // preclaim returns when the credential keylet already exists.
         assert_eq!(CredentialCreateTransactor.do_apply(&create_tx, &mut sandbox), TxResult::Duplicate);
+    }
+
+    /// Finding 196 — CredentialCreate::doApply refuses an Expiration behind
+    /// the parent close (`closeTime > *optExp` → tecEXPIRED) before it looks
+    /// at the reserve, and the test is STRICT: an Expiration equal to the
+    /// parent close still creates. Port of rippled 3.3.0, no specimen yet.
+    #[test]
+    fn credential_create_with_a_past_expiration_is_refused() {
+        let issuer = [0x01u8; 20];
+        let subject = [0x02u8; 20];
+        // make_state closes the parent at 10.
+        let state = make_state(&[(issuer, 50_000_000), (subject, 50_000_000)]);
+        let mut sandbox = Sandbox::new(&state);
+        let tx_with = |exp: u64| TxFields {
+            account: issuer,
+            tx_type: "CredentialCreate".to_string(),
+            fee: 12,
+            sequence: 1,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Subject": hex::encode(subject),
+                "CredentialType": "KYC",
+                "Expiration": exp,
+            }),
+        };
+        let run = |tx: &TxFields, sb: &mut Sandbox| {
+            let r = CredentialCreateTransactor.preclaim(tx, sb);
+            if r != TxResult::Success {
+                return r;
+            }
+            CredentialCreateTransactor.do_apply(tx, sb)
+        };
+
+        assert_eq!(run(&tx_with(9), &mut sandbox), TxResult::Expired, "9 < parent close 10");
+        assert!(!sandbox.exists(&credential_key(&subject, &issuer, b"KYC")));
+
+        assert_eq!(run(&tx_with(10), &mut sandbox), TxResult::Success, "equal is NOT expired");
+        let data = sandbox.read(&credential_key(&subject, &issuer, b"KYC")).unwrap();
+        let cred: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        assert_eq!(cred["Expiration"], 10u64);
     }
 }
