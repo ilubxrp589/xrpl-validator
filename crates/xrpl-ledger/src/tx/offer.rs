@@ -1346,6 +1346,9 @@ pub(crate) fn move_leg_gross(
     net: Me,
     gross: Me,
 ) {
+    if from == to {
+        return; // Finding 184: sender == receiver is a no-op, fee included.
+    }
     // F75b — an XRP leg has no transfer rate, so gross == net by construction;
     // a caller that nevertheless hands a different gross must not push XRP
     // down the IOU line path: `line_adjust` on an XRP leg fabricates a
@@ -1522,7 +1525,9 @@ pub(crate) fn passthrough(party: &[u8; 20], leg: &Leg, role: PassRole) -> bool {
 }
 
 pub(crate) fn move_leg(sandbox: &mut Sandbox, from: &[u8; 20], to: &[u8; 20], leg: &Leg, amt: Me) {
-    if me_is_zero(amt) {
+    // Finding 184: `accountSend` with sender == receiver is a no-op (View.cpp)
+    // — a taker crossing its OWN offer on a bridge leg moves nothing.
+    if me_is_zero(amt) || from == to {
         return;
     }
     if leg.xrp {
@@ -2232,6 +2237,10 @@ fn live_head(
     // their remaining offers are "became unfunded": stepped past and deleted
     // in the sandbox, but not permanently (`soft_stale_mark`).
     drained: Option<&Drained>,
+    // Finding 184: a BRIDGE leg crosses the taker's own offer like any
+    // other — `limitSelfCrossQuality` is gated on `defaultPath_`, the direct
+    // strand only (BookStep.cpp:402-445). True on the autobridged legs.
+    self_is_maker: bool,
 ) -> Option<(u64, Hash256, serde_json::Value, [u8; 20], Me, Me)> {
     let mut i = *start;
     let result = loop {
@@ -2248,7 +2257,7 @@ fn live_head(
             i += 1;
             continue;
         };
-        if &maker == taker {
+        if &maker == taker && !self_is_maker {
             // Finding 143 (#106742126, rMsXVzCug7 quoting both sides of
             // BTC/RLUSD): a bid at 82,090 RLUSD/BTC meets the taker's own
             // asks at 82,420 and 82,502 on the direct tip — outside its
@@ -3286,9 +3295,9 @@ fn cross_bridged(
             .map(|(q, _)| rate_me(*q));
         // Finding 153: the peeks model the PREVIOUS iteration's trailing
         // stream steps, so a maker that iteration drained is "became unfunded".
-        let dpeek = live_head(sandbox, &ld, &mut di, taker, pays_leg, gets_leg, false, peek_rm, stale, None, Some(&drained_prev));
-        let apeek = live_head(sandbox, &la, &mut ai, taker, &xrp_leg, gets_leg, false, peek_rm, stale, None, Some(&drained_prev));
-        let bpeek = live_head(sandbox, &lb, &mut bi, taker, pays_leg, &xrp_leg, false, peek_rm, stale, None, Some(&drained_prev));
+        let dpeek = live_head(sandbox, &ld, &mut di, taker, pays_leg, gets_leg, false, peek_rm, stale, None, Some(&drained_prev), false);
+        let apeek = live_head(sandbox, &la, &mut ai, taker, &xrp_leg, gets_leg, false, peek_rm, stale, None, Some(&drained_prev), true);
+        let bpeek = live_head(sandbox, &lb, &mut bi, taker, pays_leg, &xrp_leg, false, peek_rm, stale, None, Some(&drained_prev), true);
         let a_fib = amm_a.as_ref().and_then(|am| {
             crate::tx::amm_swap::fib_slice(sandbox, am, amm_a_init, amm_iters, &xrp_leg, gets_leg)
                 .map(|s| (crate::tx::amm_swap::slice_rate(s.0, s.1), s))
@@ -4467,7 +4476,7 @@ thr={t:?} admits_trunc={} admits_up={}",
             }
             if want_direct {
                 let Some((q, okey, offer, maker, gives0, wants0)) =
-                    live_head(sandbox, &ld, &mut di, taker, pays_leg, gets_leg, true, true, stale, (threshold_self != 0 && threshold_self != u64::MAX).then_some(threshold_self), Some(&drained_next))
+                    live_head(sandbox, &ld, &mut di, taker, pays_leg, gets_leg, true, true, stale, (threshold_self != 0 && threshold_self != u64::MAX).then_some(threshold_self), Some(&drained_next), false)
                 else { break 'attempt };
                 let funded_raw = available(sandbox, &maker, pays_leg);
                 let d_orate = maker_out_rate(sandbox, pays_leg, &maker, beneficiary);
@@ -4621,7 +4630,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 let a_book = if a_use_amm {
                     None
                 } else {
-                    match live_head(sandbox, &la, &mut ai, taker, &xrp_leg, gets_leg, true, true, stale, None, Some(&drained_next)) {
+                    match live_head(sandbox, &la, &mut ai, taker, &xrp_leg, gets_leg, true, true, stale, None, Some(&drained_next), true) {
                         Some(h) => Some(h),
                         None => break 'attempt,
                     }
@@ -4629,7 +4638,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 let b_book = if b_use_amm {
                     None
                 } else {
-                    match live_head(sandbox, &lb, &mut bi, taker, pays_leg, &xrp_leg, true, true, stale, None, Some(&drained_next)) {
+                    match live_head(sandbox, &lb, &mut bi, taker, pays_leg, &xrp_leg, true, true, stale, None, Some(&drained_next), true) {
                         Some(h) => Some(h),
                         None => break 'attempt,
                     }
@@ -4691,7 +4700,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                         let mut j = bi + 1;
                         while j < lb.len() && lb[j].0 == q0 && members.len() < 1000 {
                             let mut jj = j;
-                            match live_head(sandbox, &lb, &mut jj, taker, pays_leg, &xrp_leg, true, true, stale, None, Some(&drained_next)) {
+                            match live_head(sandbox, &lb, &mut jj, taker, pays_leg, &xrp_leg, true, true, stale, None, Some(&drained_next), true) {
                                 Some(h) if h.0 == q0 => {
                                     members.push(h);
                                     j = jj + 1;

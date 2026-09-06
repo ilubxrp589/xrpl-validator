@@ -854,3 +854,18 @@ fn offer_crossing_remaining_out_folds_to_sixteen_digits_106769838() {
 fn offer_bridged_leg_out_remainder_folds_to_sixteen_digits_106781871() {
     run_bundle(include_str!("vectors/offer_bridged_leg_out_remainder_folds_to_sixteen_digits_106781871.json"));
 }
+
+// Finding 184 — #106791885 081712E21BF2 (rphatRpwXc sells 0.9345 BONSAI for
+// 100 SHAMAN): the autobridged strand's XRP leg finds the taker's OWN
+// XRP-for-BONSAI offer 353BBCFB at the tip and rippled CROSSES it — the
+// self-cross removal (`limitSelfCrossQuality`) is gated on `defaultPath_`,
+// the direct strand only — 105 drops for 0.3198051439420001 BONSAI, the
+// self-transfers netting to nothing (`accountSend` sender == receiver is a
+// no-op), then the XRP/SHAMAN pool for the 100 SHAMAN. We skipped the own
+// offer on the bridge and drew the BONSAI leg from the BONSAI/XRP pool
+// instead: the own offer untouched, the pool's root and line moved, the
+// taker's BONSAI line debited.
+#[test]
+fn offer_bridge_leg_crosses_the_takers_own_offer_106791885() {
+    run_bundle(include_str!("vectors/offer_bridge_leg_crosses_the_takers_own_offer_106791885.json"));
+}
