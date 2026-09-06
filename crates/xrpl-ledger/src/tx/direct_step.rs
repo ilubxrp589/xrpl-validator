@@ -923,6 +923,23 @@ pub fn mixed_layout(
             return None;
         }
         if p != want_leg.issuer && *dst != want_leg.issuer {
+            // Finding 190: when the value sits at an account that is NOT the
+            // deliver issuer, this implied hop is an INTER-GATEWAY ripple —
+            // toStrand's normalization appends the deliver issuer as an
+            // account element and builds a DirectStep across the two
+            // gateways' mutual line (PaySteps.cpp). The classic chain cannot
+            // represent it (payment.rs `terminal_is_ripple_step` drops such a
+            // path), so it makes the strand a REAL mixed one: `[Book, Run]`,
+            // checked by `check_mixed_strand` exactly where rippled's
+            // DirectStepI::check would refuse it (no line ⇒ dropped).
+            // #106800968 13567222623C (rMF4Tg8Sm3, circular XRP → SGB.rctA,
+            // second path [SGB/rhrFfvzZ, account rhrFfvzZ]): rhrFfvzZ holds
+            // 6.32M SGB.rctA, so rippled keeps the strand ACTIVE — it delivers
+            // nothing, but two active strands put the XRP/SGB pool in
+            // multi-path mode and its first fib slice priced 994000 drops
+            // linearly at 1256.908860292824 SGB; we dropped the strand, ran
+            // single-path and re-curved the anchored offer to 1257.12637193.
+            real_run = true;
             run.push(DirectHop { src: p, dst: want_leg.issuer, cur: cur.cur });
             p = want_leg.issuer;
         }

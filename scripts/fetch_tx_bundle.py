@@ -673,6 +673,22 @@ def main():
                         cur_leg = nxt
                 if cur_leg != p_ and cur_leg["currency"] != p_["currency"] and (cur_leg, p_) not in books:
                     books.append((cur_leg, p_))
+                # Finding 190: a path that ends holding the delivered CURRENCY
+                # under another issuer ripples across the two gateways' mutual
+                # line (toStrand appends the deliver issuer as an account
+                # element). Seed that line so the probe can build the strand
+                # rippled builds (#106800968 13567222623C: rhrFfvzZ–rctArjqV SGB).
+                if (cur_leg != p_ and cur_leg["currency"] == p_["currency"] and cur_leg["currency"] != "XRP"
+                        and cur_leg.get("issuer") and p_.get("issuer")):
+                    try:
+                        rl = rpc("ledger_entry", {"ripple_state": {"currency": p_["currency"], "accounts": [cur_leg["issuer"], p_["issuer"]]},
+                                                  "ledger_index": seq - 1, "binary": True})
+                        li5 = (rl.get("index") or "").upper()
+                        if rl.get("node_binary") and li5 and li5 not in pre:
+                            pre[li5] = rl["node_binary"]
+                            accts.add(cur_leg["issuer"]); accts.add(p_["issuer"])
+                    except Exception:
+                        pass
             # DEPTH: a long sweep walks PAST every level the meta names and
             # then anchors the pool at the first level it never consumed —
             # a read-only tip no meta records. #106743104 F8084760 (1.9M XRPH

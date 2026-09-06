@@ -508,3 +508,17 @@ fn payment_lone_strand_runs_on_after_its_rival_goes_unboundable_106743104() {
 fn payment_strand_in_beats_the_lines_quantised_delta_106788656() {
     run_bundle(include_str!("vectors/payment_strand_in_beats_the_lines_quantised_delta_106788656.json"));
 }
+
+// Finding 190 — #106800968 13567222623C (rMF4Tg8Sm3, circular XRP → SGB.rctA
+// under tfPartialPayment; second path [SGB/rhrFfvzZ, account rhrFfvzZ]):
+// toStrand appends the deliver issuer as an account element, so the strand
+// closes with DirectSteps rhrFfvzZ → rctArjqV → sender across the gateways'
+// mutual line (rhrFfvzZ holds 6.32M SGB.rctA). rippled keeps it ACTIVE —
+// it delivers nothing, but two active strands put the XRP/SGB pool in
+// multi-path mode and the first fib slice prices 994000 drops linearly at
+// 1256.908860292824 SGB. We dropped the path, ran single-path and re-curved
+// the anchored offer to 1257.12637193.
+#[test]
+fn payment_inter_gateway_tail_keeps_the_strand_active_106800968() {
+    run_bundle(include_str!("vectors/payment_inter_gateway_tail_keeps_the_strand_active_106800968.json"));
+}
