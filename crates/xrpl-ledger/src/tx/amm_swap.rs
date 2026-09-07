@@ -2124,7 +2124,21 @@ pub(crate) fn consume(
         // reverse's 14360.35978279596 — Number's cancellation in
         // `swapAssetIn` keeps twelve digits — and the 4e-9 we carried
         // moved both pools' lines.
-        if n_cmp(take_out, rem_pays) == Ordering::Greater {
+        // Finding 216 (#106644289 2F44ECDC153B, rwzNV6JacZWX tfSell|tfFillOrKill
+        // 27.035411 XRP for 100594608.947363 FERAL through the FERAL/XRP pool;
+        // the whole HIST60 window cascaded from it): a SELL crossing has no
+        // cached out to re-anchor to. `CreateOffer::flowCross` replaces the
+        // deliver amount of a sell with the largest representable one — "we
+        // are selling, so we will accept *more* than the offer specified"
+        // (OfferCreate.cpp:416-441) — so the reverse pass's `cache_->out` is
+        // unbounded and `fwdImp`'s branch never fires: the pool parts with
+        // the whole swap, 100594612.198335 FERAL. The bot sizes its offers
+        // from the pool, so `swapAssetOut(TakerPays)` equalled the input
+        // exactly and we re-anchored to the TakerPays, leaving 3.25 FERAL in
+        // the pool. A payment's sell-mode hop keeps the re-anchor: its
+        // `rem_pays` is the downstream reverse need, rippled's cached out.
+        let sell_crossing = sell && threshold != u64::MAX;
+        if n_cmp(take_out, rem_pays) == Ordering::Greater && !sell_crossing {
             if let Some(in_req) = swap_asset_out(pool_in, pool_out, rem_pays, amm.tfee, gets_leg.xrp) {
                 if n_cmp(ox::gross_in(in_gross_rate, in_req), ox::gross_in(in_gross_rate, take_in)) == Ordering::Equal {
                     if std::env::var("DX_AMM").is_ok() {

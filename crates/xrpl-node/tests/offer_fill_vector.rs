@@ -1095,3 +1095,19 @@ fn offer_bridged_round_bound_is_per_iteration_106823899() {
 fn offer_bridged_strands_die_for_the_rest_of_the_crossing_106823884() {
     run_bundle(include_str!("vectors/offer_bridged_strands_die_for_the_rest_of_the_crossing_106823884.json"));
 }
+
+// Finding 216 — #106644289 2F44ECDC153B (rwzNV6JacZWX, tfSell|tfFillOrKill
+// 27.035411 XRP for 100594608.947363 FERAL through the FERAL/XRP pool; the
+// whole HIST60 window cascaded from it): a sell crossing has no cached out to
+// re-anchor to — `CreateOffer::flowCross` replaces a sell's deliver amount
+// with the largest representable one ("we are selling, so we will accept
+// *more* than the offer specified"), so `fwdImp`'s re-anchor never fires and
+// the pool parts with the whole swap, 100594612.198335 FERAL. The bot sizes
+// its offers from the pool, so `swapAssetOut(TakerPays)` equalled the input
+// exactly and finding 210 re-anchored to the TakerPays, leaving 3.25 FERAL in
+// the pool. The pool's root and FERAL line are pinned from this
+// transaction's own metadata (later transactions touch them).
+#[test]
+fn offer_sell_crossing_takes_the_pools_whole_swap_106644289() {
+    run_bundle(include_str!("vectors/offer_sell_crossing_takes_the_pools_whole_swap_106644289.json"));
+}
