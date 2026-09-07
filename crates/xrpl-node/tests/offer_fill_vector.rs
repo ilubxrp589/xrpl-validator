@@ -958,4 +958,14 @@ fn offer_sell_iterates_the_single_path_pool_until_the_limit_rejects_106810920() 
 #[test]
 fn offer_consecutive_self_offers_are_swept_in_the_walking_pass_106806465() {
     run_bundle(include_str!("vectors/offer_consecutive_self_offers_are_swept_in_the_walking_pass_106806465.json"));
+// Finding 202 — #106812132 D14C85E904F5 (rnCEEqDnCu, tfSell 1000 XAH → 2 RLUSD,
+// six bridged iterations): rippled's `remainingOut` after every iteration is
+// `outReq − sum(savedOuts)` with the saved outs folded ASCENDING at sixteen
+// digits (StrandFlow.h flat_multiset), not a sequential `remainingOut −= out`
+// chain. The six outs fold to 1.891770442283155, so the last pass asks
+// 0.108229557716845 of the RLUSD tip; fill by fill we asked …8440, and the
+// maker's give, its line and its residual offer each sat one ulp off.
+#[test]
+fn offer_bridged_walk_folds_its_saved_outs_ascending_106812132() {
+    run_bundle(include_str!("vectors/offer_bridged_walk_folds_its_saved_outs_ascending_106812132.json"));
 }

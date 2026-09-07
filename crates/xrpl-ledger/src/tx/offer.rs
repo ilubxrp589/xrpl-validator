@@ -1162,6 +1162,26 @@ fn deferred_cap(sandbox: &Sandbox, party: &[u8; 20], leg: &Leg, live: Me) -> Me 
     if me_cmp(adj, live).is_lt() { adj } else { live }
 }
 
+/// rippled's `sum(savedOuts)` / `sum(savedIns)` (StrandFlow.h flow()): the
+/// saved per-iteration amounts live in a `flat_multiset` — ASCENDING — and the
+/// sum folds them in that order, each `+=` an STAmount add canonicalised to
+/// sixteen digits. Finding 202 (the bridged walk's twin of finding 173).
+fn fold16_multiset(v: &[Me]) -> Me {
+    let mut sorted: Vec<Me> = v.to_vec();
+    sorted.sort_by(|a, b| me_cmp(*a, *b));
+    let mut t: Me = (0, 0);
+    for e in &sorted {
+        t = stamount_signed_add(false, t, false, *e).1;
+    }
+    t
+}
+
+/// `remainingOut = outReq − sum(savedOuts)` — sixteen digits, clipped at zero.
+fn rem_from_fold(entry: Me, saved: &[Me]) -> Me {
+    let (neg, m) = stamount_signed_add(false, entry, true, fold16_multiset(saved));
+    if neg { (0, 0) } else { m }
+}
+
 pub(crate) fn line_adjust(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, amt: Me, receiving: bool) {
     if party == &leg.issuer {
         return;
@@ -3126,6 +3146,17 @@ fn cross_bridged(
     let entry_gets = rem_gets;
     let entry_pays = rem_pays;
     let mut out_sum: Me = (0, 0);
+    // Finding 202 (#106812132 D14C85E904F5, rnCEEqDnCu tfSell 1000 XAH → 2
+    // RLUSD, six bridged iterations): rippled's `remainingOut` after every
+    // iteration is `outReq − sum(savedOuts)` with the saved outs folded
+    // ASCENDING at sixteen digits (StrandFlow.h:743, `flat_multiset`), not
+    // the sequential `remainingOut −= out` chain this walk carried. The six
+    // outs fold to 1.891770442283155 (the exact 1.8917704422831554 rounded
+    // once), so the last pass asks 0.108229557716845 of the RLUSD tip;
+    // subtracting fill by fill we asked …8440. The maker's give, its line
+    // and its residual offer each sat one ulp off. Crossings only, as
+    // finding 173 in the direct walk; a payment keeps the exact remainder.
+    let mut saved_outs: Vec<Me> = Vec::new();
     let mut in_gross_spent: Me = (0, 0);
     // Fee-composed judge threshold for CLOB leg-B fills (AMM and
     // taker-owned leg-B offers waive) — crossing_judge_threshold.
@@ -3907,6 +3938,12 @@ thr={t:?} admits_trunc={} admits_up={}",
             rem_pays = rp;
             rem_gets = rg;
             out_sum = stamount_signed_add(false, out_sum, false, me_sub(rp_before, rp)).1;
+            if !me_is_zero(me_sub(rp_before, rp)) {
+                saved_outs.push(me_sub(rp_before, rp));
+                if threshold != u64::MAX && !pays_leg.xrp {
+                    rem_pays = rem_from_fold(entry_pays, &saved_outs); // finding 202
+                }
+            }
             // Finding 121: after `tryAMM` at this level, `execOffer` steps onto
             // the tip; the taker's own offer there is removed whatever the pool
             // did ("Remove this offer even if no crossing occurs",
@@ -4441,6 +4478,7 @@ thr={t:?} admits_trunc={} admits_up={}",
             let (rp0, rg0, cr0, di0, ai0, bi0, it0) =
                 (rem_pays, rem_gets, crossed, di, ai, bi, amm_iters);
             let (igs0, os0) = (in_gross_spent, out_sum);
+            let so0 = saved_outs.len();
             let st0 = stale.len();
             amm_used = false;
             // (in, out) of this candidate's fill, in the same orientation as
@@ -4665,8 +4703,8 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // in-side fold; a payment keeps finding 81b's exact remainder.
                 // (cross_bridged carries no `offer_crossing`; a payment has no limitQuality)
                 rem_pays = if threshold != u64::MAX && !pays_leg.xrp {
-                    let (neg, m) = stamount_signed_add(false, rem_pays, true, give);
-                    if neg { (0, 0) } else { m }
+                    saved_outs.push(give);
+                    rem_from_fold(entry_pays, &saved_outs) // finding 202
                 } else {
                     me_sub(rem_pays, give)
                 };
@@ -5180,8 +5218,8 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // 16-digit IOUAmount (#106781871 825A156A: 1.84386153980520|36
                 // → the maker's last give is 0.528031539805204, not …2036).
                 rem_pays = if threshold != u64::MAX && !pays_leg.xrp {
-                    let (neg, m) = stamount_signed_add(false, rem_pays, true, pays_out);
-                    if neg { (0, 0) } else { m }
+                    saved_outs.push(pays_out);
+                    rem_from_fold(entry_pays, &saved_outs) // finding 202
                 } else {
                     me_sub(rem_pays, pays_out)
                 };
@@ -5325,6 +5363,7 @@ had_fill={} n={} keys={:?}",
             rem_pays = rp0; rem_gets = rg0; crossed = cr0;
             di = di0; ai = ai0; bi = bi0; amm_iters = it0;
             in_gross_spent = igs0; out_sum = os0;
+            saved_outs.truncate(so0);
             amm_used = false;
         }
         if !filled {
