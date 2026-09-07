@@ -3350,6 +3350,36 @@ fn cross_bridged(
         amm_used = false;
         pool_bq_blocked = false;
         let drained_prev = std::mem::take(&mut drained_next);
+        // Finding 212 (#106823771 C43DE0F7B8DF, rphatRpwXc selling 2099.99
+        // USDM for BONSAI with 1352.29801127919 in hand: six bridged fib
+        // iterations, then two direct-pool slices, the last exhausting):
+        // every strand of a crossing begins with the taker's DirectStep, and
+        // rippled bounds its in by `balanceHookIOU` = min(live line,
+        // original − Σdebits) on each iteration (finding 197 for the
+        // exhausting book fills, finding 208 for the direct walk's pool
+        // turns). The seven debits summed through Number sit 3e-13 above the
+        // line's sequential adjustments: mainnet's exhausting pool slice is
+        // 141.0277204892860 and the line keeps 3e-13 — and the next
+        // iteration finds BOTH strands dry, the bound now being zero. We
+        // handed the pool the walk's remainder and sold 141.0277204892863,
+        // and a round later the bridge sold the dust the bound would have
+        // refused. Gross, net of the in-side rate, like the fills.
+        if gets_gross_cap.is_some() && !me_is_zero(rem_gets) {
+            let verb_gross = gross_in(fee_rate, rem_gets);
+            let bound_gross = line_bound_gross(sandbox, taker, gets_leg, verb_gross);
+            if me_cmp(bound_gross, verb_gross).is_lt() {
+                if std::env::var("DX_AMM").is_ok() {
+                    eprintln!("DX_AMM F212 round budget line-bound {verb_gross:?} -> {bound_gross:?}");
+                }
+                rem_gets = match fee_rate {
+                    None => bound_gross,
+                    Some(r) => mul_ratio(bound_gross, 1_000_000_000, r as u128, false),
+                };
+                if done(rem_pays, rem_gets) {
+                    break;
+                }
+            }
+        }
         // PEEK both sources (no mutation) to pick the better rate within the
         // threshold; only the chosen source is then walked with mutation, so
         // dead-offer cleanup happens exactly where rippled's walk reaches.

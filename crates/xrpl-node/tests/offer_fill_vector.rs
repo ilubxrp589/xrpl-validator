@@ -1034,3 +1034,17 @@ fn offer_pool_turn_is_bounded_by_the_takers_live_line_106822626() {
 fn offer_direct_pool_is_gated_by_its_own_clob_tip_only_106823772() {
     run_bundle(include_str!("vectors/offer_direct_pool_is_gated_by_its_own_clob_tip_only_106823772.json"));
 }
+
+// Finding 212 — #106823771 C43DE0F7B8DF (rphatRpwXc, 2099.99934297 USDM for
+// 136.7844 BONSAI with 1352.29801127919 USDM in hand: six bridged fib
+// iterations through the USDM/XRP and XRP/BONSAI pools, then two direct
+// USDM/BONSAI pool slices, the last exhausting): the direct pool strand's
+// DirectStep is bounded by `balanceHookIOU` = min(live line, original −
+// Σdebits) like every other. The seven debits summed through Number sit 3e-13
+// above the line's sequential adjustments, so mainnet's last slice is
+// 141.0277204892860 and the line keeps 3e-13; the bridged crossing handed the
+// pool the walk's remainder, sold 141.0277204892863 and closed the line.
+#[test]
+fn offer_bridged_pool_turn_is_bounded_by_the_deferred_line_106823771() {
+    run_bundle(include_str!("vectors/offer_bridged_pool_turn_is_bounded_by_the_deferred_line_106823771.json"));
+}
