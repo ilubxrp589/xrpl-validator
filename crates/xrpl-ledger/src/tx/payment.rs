@@ -1430,8 +1430,22 @@ impl PaymentTransactor {
                     crate::tx::amm_swap::set_fwd_first(i == 0); // finding 147
             let (rw, rs, _c, gross_spent) = ox::cross_engine_to_net(
                 &tx.account, benef, want_cap, avail, chain[i + 1], chain[i],
-                hop_thr, hop_thr, fwd_driven && i > 0 && !last, false, single_pass, amm_fib.as_deref_mut(), None,
-                if last { want_net } else { None },
+                // Finding 220 (#106825938 D97A404AA9BF, r9tcGwSyYP: 0.1 XRP → WETH
+                // → USDC → RLUSD, the reverse asking 100001 drops of a 100000
+                // SendMax): an input-limited strand's forward pass drives its
+                // LAST book step by input as well — `fwdImp` hands
+                // `limitStepIn` the whole carry, the RLUSD/USDC offer gives
+                // 0.1384312667324735 for it, 33 ulps over the want — and the
+                // closing DirectStep clamps the delivery to the reverse want
+                // (`setCacheLimiting`, finding 170); the excess is redeemed
+                // against the issuer. Out-limiting the last fill to the want
+                // left 3.257e-13 USDC of carry, flushed into a pool, and the
+                // maker's residual 31 and 33 ulps off. The last hop now walks
+                // input-driven too, and its delivery is capped at the reverse
+                // want through the same `benef_net` rule a rated leg uses —
+                // with a unit rate when the leg carries none.
+                hop_thr, hop_thr, fwd_driven && i > 0, false, single_pass, amm_fib.as_deref_mut(), None,
+                if last { want_net.or(Some((1_000_000_000, want_cap))) } else { None },
                 hop_gross,
                 sandbox, &mut Vec::new(),
             );

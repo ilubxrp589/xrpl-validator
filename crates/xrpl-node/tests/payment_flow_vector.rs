@@ -658,3 +658,17 @@ fn payment_exact_spend_executes_the_reverse_pass_verbatim_106824803() {
 fn payment_hop_zero_gross_cap_is_bounded_by_the_holding_106826590() {
     run_bundle(include_str!("vectors/payment_hop_zero_gross_cap_is_bounded_by_the_holding_106826590.json"));
 }
+
+// Finding 220 — #106825938 D97A404AA9BF (r9tcGwSyYP: 0.1 XRP → WETH → USDC →
+// RLUSD under tfPartialPayment|tfLimitQuality, the reverse asking 100001
+// drops of a 100000 SendMax): an input-limited strand's forward pass drives
+// its LAST book step by input as well — `fwdImp` hands `limitStepIn` the
+// whole carry, the RLUSD/USDC offer gives 0.1384312667324735 for it, 33 ulps
+// over the want — and the closing DirectStep clamps the delivery to the
+// reverse want; the excess is redeemed against the issuer. Out-limiting the
+// last fill to the want left 3.257e-13 USDC of carry flushed into a pool and
+// the maker's residual 31 and 33 ulps off.
+#[test]
+fn payment_input_driven_last_book_hop_consumes_the_carry_106825938() {
+    run_bundle(include_str!("vectors/payment_input_driven_last_book_hop_consumes_the_carry_106825938.json"));
+}
