@@ -115,3 +115,15 @@ fn trust_set_authorising_a_holder_without_a_line_creates_it_authorised_106773044
 fn trust_set_zero_quality_removes_the_field_106800767() {
     run_bundle(include_str!("vectors/trust_set_zero_quality_removes_the_field_106800767.json"));
 }
+
+// Finding 199 — #106814855 4C02C566F2A3 (r4bCkC8, tfSetNoRipple with
+// LimitAmount 1e9 on its existing XRR line toward rDdfed7Sh, which holds
+// 899,000,000 XRR that r4bCkC8 issued — the sender's balance is negative):
+// TrustSet::doApply refuses "Cannot set noRipple on a negative balance" with
+// tecNO_PERMISSION, ahead of the reserve check. We set the flag and wrote
+// the line: a ter mismatch and an extra object (#106814864 8B679340DE6E is
+// the same account retrying nine ledgers later).
+#[test]
+fn trust_set_no_ripple_on_a_negative_balance_is_refused_106814855() {
+    run_bundle(include_str!("vectors/trust_set_no_ripple_on_a_negative_balance_is_refused_106814855.json"));
+}

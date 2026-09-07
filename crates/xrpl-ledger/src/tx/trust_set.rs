@@ -345,6 +345,36 @@ impl Transactor for TrustSetTransactor {
             // cannot cover the incremental reserve → tecINSUF_RESERVE_LINE
             // (#105765230, #105765676, #105779597, #105795073, #105796649).
             if let Ok(line) = serde_json::from_slice::<serde_json::Value>(&line_data) {
+                // Finding 199: "Cannot set noRipple on a negative balance" —
+                // TrustSet::doApply, the first refusal on an existing line
+                // and ahead of its reserve check:
+                //     if (bSetNoRipple && !bClearNoRipple) {
+                //         if ((bHigh ? saHighBalance : saLowBalance) >= beast::zero)
+                //             uFlagsOut |= (bHigh ? lsfHighNoRipple : lsfLowNoRipple);
+                //         else
+                //             return tecNO_PERMISSION;
+                //     }
+                // The sender's balance is the stored (low-perspective) one
+                // negated for the high side. #106814855 4C02C566F2A3 and
+                // #106814864 8B679340DE6E (r4bCkC8, tfSetNoRipple on its XRR
+                // line toward rDdfed7Sh, which holds 899,000,000 XRR r4bCkC8
+                // issued): mainnet claims the fee; we set the flag
+                // (do_apply's unconditional `lf |= no_ripple_bit`) and wrote
+                // the line — a ter mismatch and an extra object.
+                {
+                    const TF_SET_NO_RIPPLE: u64 = 0x0002_0000;
+                    const TF_CLEAR_NO_RIPPLE: u64 = 0x0004_0000;
+                    let txf = tx.fields.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0);
+                    if txf & TF_SET_NO_RIPPLE != 0 && txf & TF_CLEAR_NO_RIPPLE == 0 {
+                        let bal = line["Balance"]["value"].as_str().unwrap_or("0");
+                        let bal_zero = bal == "0" || bal == "-0";
+                        let bal_neg = !bal_zero && bal.starts_with('-');
+                        let sender_negative = if tx.account < issuer { bal_neg } else { !bal_zero && !bal_neg };
+                        if sender_negative {
+                            return TxResult::NoPermission;
+                        }
+                    }
+                }
                 let (reserve_set, currently_reserved) =
                     Self::sender_reserve_state(tx, sandbox, &line, &issuer);
                 let reserve_increase = reserve_set && !currently_reserved;
@@ -461,9 +491,12 @@ impl Transactor for TrustSetTransactor {
                     if txf & TF_SETF_AUTH != 0 {
                         lf |= auth_bit;
                     }
-                    if txf & TF_SET_NO_RIPPLE != 0 {
+                    // Set only without the matching clear, clear only without
+                    // the set (TrustSet::doApply); a negative sender balance
+                    // was refused in preclaim (finding 199).
+                    if txf & TF_SET_NO_RIPPLE != 0 && txf & TF_CLEAR_NO_RIPPLE == 0 {
                         lf |= no_ripple_bit;
-                    } else if txf & TF_CLEAR_NO_RIPPLE != 0 {
+                    } else if txf & TF_CLEAR_NO_RIPPLE != 0 && txf & TF_SET_NO_RIPPLE == 0 {
                         lf &= !no_ripple_bit;
                     }
                     // computeFreezeFlags (TrustSet.cpp:43-58): set wins
@@ -976,5 +1009,46 @@ mod tests {
             0,
             "the side with no reserve bit is untouched — mainnet leaves it at 0"
         );
+    }
+
+    /// Finding 199 — TrustSet::doApply: "Cannot set noRipple on a negative
+    /// balance" → tecNO_PERMISSION, judged on the SENDER's side of the stored
+    /// (low-perspective) balance. #106814855 4C02C566F2A3.
+    #[test]
+    fn setting_no_ripple_on_a_negative_balance_is_refused() {
+        let (state, sender, issuer, _cur, line_key) = line_106110230();
+        let base = state.state_map.lookup(&line_key).expect("fixture line").clone();
+        let with_balance = |value: &str| -> Vec<u8> {
+            let mut line: serde_json::Value = serde_json::from_slice(&base).unwrap();
+            line["Balance"]["value"] = serde_json::Value::String(value.to_string());
+            serde_json::to_vec(&line).unwrap()
+        };
+        let tx = TxFields {
+            account: sender,
+            tx_type: "TrustSet".to_string(),
+            fee: 12,
+            sequence: 3,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({
+                "LimitAmount": {"currency": "USD", "issuer": hex::encode(issuer), "value": "45000000"},
+                "Flags": 0x0002_0000u64, // tfSetNoRipple
+            }),
+        };
+        // The sender is the LOW side: a negative stored balance is its debt.
+        let mut sandbox = Sandbox::new(&state);
+        sandbox.write(line_key, with_balance("-5"));
+        assert_eq!(TrustSetTransactor.preclaim(&tx, &sandbox), TxResult::NoPermission);
+
+        // Zero and positive balances may set it.
+        for v in ["0", "5"] {
+            let mut sandbox = Sandbox::new(&state);
+            sandbox.write(line_key, with_balance(v));
+            assert_eq!(TrustSetTransactor.preclaim(&tx, &sandbox), TxResult::Success, "balance {v}");
+            assert_eq!(TrustSetTransactor.do_apply(&tx, &mut sandbox), TxResult::Success, "balance {v}");
+            let line: serde_json::Value =
+                serde_json::from_slice(&sandbox.read(&line_key).expect("line stays")).unwrap();
+            assert_ne!(line["Flags"].as_u64().unwrap() & 0x0010_0000, 0, "lsfLowNoRipple set at {v}");
+        }
     }
 }
