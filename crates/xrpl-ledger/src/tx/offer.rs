@@ -3343,6 +3343,25 @@ fn cross_bridged(
     // Finding 214: the walk's own remaining-in chain at the previous round's
     // top and the bounded budget that replaced it for that round.
     let mut chain_gets: Option<(Me, Me)> = None;
+    // Finding 215 (#106823884 BCD057CAA9E8, rphatRpwXc selling 136.7844
+    // BONSAI for 1899.99940554 USDM; #106823887 the same): strands DIE.
+    // rippled's `ActiveStrands` (StrandFlow.h) rebuilds `next_` each
+    // iteration only from the strands that produced this iteration (`push`)
+    // and the untried remainder behind the winner (`pushRemainingCurToNext`);
+    // `activateNext` drops a pending strand whose upper bound misses
+    // limitQuality when more than one is pending, and never re-checks a lone
+    // one. A strand dropped or run dry is gone for the rest of the crossing.
+    // At iteration 6 the bridge's bound missed the limit and only the direct
+    // pool ran (single path, 58.81489564576 BONSAI); at iteration 7 that
+    // pool's max offer missed too — "All strands dry", 110.686 BONSAI in,
+    // 1544.76 USDM out, the rest placed. We re-admitted the bridge from its
+    // bound (0.0718211 against the 0.0719918 limit) as the lone strand and
+    // sold 14.88771277639 BONSAI more through both pools.
+    let mut direct_alive = true;
+    let mut bridge_alive = true;
+    // Finding 215 (cont.): a round re-run for finding 211 is the SAME rippled
+    // iteration — its activation and multiPath stand.
+    let mut retry_multi = false;
     // Finding 153: makers drained to zero by a round's fills; the next
     // round's peeks treat their remaining offers as "became unfunded".
     let mut drained_next: Drained = Default::default();
@@ -3807,15 +3826,32 @@ thr={t:?} admits_trunc={} admits_up={}",
         // ammContext there, the same one-round lag.
         let thr_admit = (threshold_self != 0 && threshold_self != u64::MAX)
             .then(|| rate_me(threshold_self));
-        let multi_now = match thr_admit {
-            Some(t) => {
-                let w = |q: Option<Me>| q.is_some_and(|v| me_cmp(v, t).is_le());
-                (w(d_tip) as u8) + (w(bq_ub) as u8) > 1
+        // Finding 215: `activateNext` — with more than one strand pending, a
+        // bound that misses the limit drops the strand for good; a lone
+        // pending strand is activated unchecked. `multiPath` is then the
+        // count of the activated strands.
+        if !pool_unblocked {
+            let live_d = direct_alive && !direct_dry;
+            let pending = live_d as u8 + bridge_alive as u8;
+            if pending == 0 {
+                break;
             }
-            // No limitQuality (a payment): rippled enters with multiPath =
-            // `strands.size() > 1`, which a bridged payment satisfies.
-            None => true,
-        };
+            if pending > 1 {
+                if let Some(t) = thr_admit {
+                    let w = |q: Option<Me>| q.is_some_and(|v| me_cmp(v, t).is_le());
+                    if !w(d_tip) {
+                        direct_alive = false;
+                    }
+                    if !w(bq_ub) {
+                        bridge_alive = false;
+                    }
+                }
+            }
+        }
+        // No limitQuality (a payment): rippled enters with multiPath =
+        // `strands.size() > 1`, which a bridged payment satisfies — until a
+        // strand dies.
+        let multi_now = if pool_unblocked { retry_multi } else { direct_alive && !direct_dry && bridge_alive };
         // The iteration-ENTRY multiPath — rippled's getOffer sees strands
         // BUILT (>1) for iteration 0 and the PREVIOUS iteration's active
         // count after (#106455293's FFI_GETOFFER: multiPath=1 iters=0 while
@@ -3887,7 +3923,7 @@ thr={t:?} admits_trunc={} admits_up={}",
             // debited where mainnet takes 1.260780731650903 (× 1.003).
             let rg_before = rem_gets;
             let rp_before = rem_pays;
-            let (rp, rg, used) = if direct_dry {
+            let (rp, rg, used) = if direct_dry || !direct_alive {
                 (rem_pays, rem_gets, false)
             } else if !multi_now && threshold != u64::MAX {
                 // Anchor from the LIVE direct head (dpeek skips consumed and
@@ -4307,7 +4343,7 @@ thr={t:?} admits_trunc={} admits_up={}",
         } else {
             bq_ub
         };
-        let order: &[bool] = match (ub_ok(d_tip).filter(|_| !direct_dry), ub_ok(bq_adm)) {
+        let order: &[bool] = match (ub_ok(d_tip).filter(|_| !direct_dry && direct_alive), ub_ok(bq_adm).filter(|_| bridge_alive)) {
             (Some(d), Some(b)) => {
                 if me_cmp(d, b).is_le() {
                     &[true, false]
@@ -5482,6 +5518,17 @@ thr={t:?} admits_trunc={} admits_up={}",
                 filled = true;
                 break;
             }
+            // Finding 215: a strand that ran and produced nothing is not
+            // pushed to the next iteration — dead. The direct strand is
+            // spared when its pool was refused only by a rival's bound
+            // (finding 211 re-runs the round with it admitted).
+            if want_direct {
+                if !pool_bq_blocked {
+                    direct_alive = false;
+                }
+            } else {
+                bridge_alive = false;
+            }
             // DX_RM — hunt the known `ofrsToRm` deviation.
             //
             // rippled banks a failed strand's offer removals: `setUnion(ofrsToRm,
@@ -5575,6 +5622,7 @@ had_fill={} n={} keys={:?}",
             // admitted by its own book's tip.
             if pool_bq_blocked && !pool_unblocked {
                 pool_unblocked = true;
+                retry_multi = multi_now;
                 continue;
             }
             break;

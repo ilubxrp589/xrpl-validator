@@ -1077,3 +1077,21 @@ fn offer_bridged_pool_slice_remainder_is_sixteen_digits_106823807() {
 fn offer_bridged_round_bound_is_per_iteration_106823899() {
     run_bundle(include_str!("vectors/offer_bridged_round_bound_is_per_iteration_106823899.json"));
 }
+
+// Finding 215 — #106823884 BCD057CAA9E8 (rphatRpwXc selling 136.7844 BONSAI
+// for 1899.99940554 USDM; #106823887 the same): strands die. rippled's
+// `ActiveStrands` rebuilds the next iteration only from the strands that
+// produced this one and the untried remainder behind the winner;
+// `activateNext` drops a pending strand whose upper bound misses limitQuality
+// when more than one is pending and never re-checks a lone one. At iteration
+// 6 the bridge's bound missed and only the direct pool ran (single path,
+// 58.81489564576 BONSAI); at iteration 7 that pool's max offer missed too —
+// "All strands dry", 110.686 BONSAI in, 1544.76 USDM out, the rest placed.
+// We re-admitted the bridge from its bound as the lone strand and sold
+// 14.88771277639 BONSAI more through both pools. A round re-run for finding
+// 211 keeps its iteration's activation: the dust crossings of #106823772 are
+// multi-path fills of the direct pool's fib offer, limited proportionally.
+#[test]
+fn offer_bridged_strands_die_for_the_rest_of_the_crossing_106823884() {
+    run_bundle(include_str!("vectors/offer_bridged_strands_die_for_the_rest_of_the_crossing_106823884.json"));
+}
