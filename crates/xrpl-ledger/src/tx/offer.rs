@@ -7352,9 +7352,31 @@ pub(crate) fn cross_engine_to_net(
                 done(rem_pays, rem_gets)
             );
         }
-        if tail_admitted && !done(rem_pays, rem_gets) {
+        // Finding 198: rippled's flow() keeps ITERATING a single-path pool —
+        // each pass is one `getOffer` (maxOffer: 99% of the pool's out at
+        // the CURRENT balances) and the next pass starts from the moved pool
+        // — until the taker's in is spent, the want is met, or a pass misses
+        // limitQuality (`limitOut` sizes it to the limit, the realised
+        // quality is judged, "Path rejected by limitQuality" → dry). The
+        // tail turn ran ONCE. #106810920 19E5FD025B79 (r3TzYjBQEX,
+        // tfSell|tfIoC, 1 XRP into the XRP/SIRR pool holding 6 drops against
+        // 1e14 SIRR — twelve receipts from the same bot in an hour): rippled
+        // takes maxOffer twice — 594 drops (6 → 600) then 59,400 (600 →
+        // 60,000) — and rejects the third pass (limitOut 3,684,250,433.7
+        // SIRR for 35,001 drops misses the limit by 1e-5, "All strands
+        // dry"); we took the first slice and stopped, four objects short
+        // every time. `consume` already sizes and judges one pass exactly
+        // that way; only the loop was missing.
+        // Offer crossing only: a payment's rounds are driven by the payment
+        // engine (one walk per round, `amm_ctx_driver_owned`), which is
+        // where rippled's iteration lives for it; iterating here as well
+        // double-steps its fib sequence (six payment vectors, q110b/q112/
+        // q133/q134/q178 and s439 when tried).
+        let mut tail_iters = 0u32;
+        while tail_admitted && !done(rem_pays, rem_gets) && tail_iters < 64 && (offer_crossing || tail_iters == 0) {
+            tail_iters += 1;
             if std::env::var("DX_AMM").is_ok() {
-                eprintln!("DX_AMM site=direct-tail");
+                eprintln!("DX_AMM site=direct-tail iter={tail_iters}");
             }
             // Tail turn = past the last level: close the open group first
             // (see the level-boundary note at `taker_accs`).
@@ -7448,6 +7470,9 @@ pub(crate) fn cross_engine_to_net(
                 rg
             };
             crossed += used as u32;
+            if !used {
+                break;
+            }
         }
     }
     // The judge. Realised quality is measured on the NET spent, against the NET

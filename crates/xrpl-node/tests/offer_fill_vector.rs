@@ -932,3 +932,18 @@ fn offer_sell_exhausting_slice_debits_the_folded_remainder_106804619() {
 fn offer_bridge_exhausting_slice_is_bounded_by_the_takers_line_106806079() {
     run_bundle(include_str!("vectors/offer_bridge_exhausting_slice_is_bounded_by_the_takers_line_106806079.json"));
 }
+
+// Finding 198 — #106810920 19E5FD025B79 (r3TzYjBQEX, tfSell|tfIoC, 1 XRP into
+// the XRP/SIRR pool holding 6 drops against 1e14 SIRR; twelve receipts from
+// the same bot in an hour): rippled's flow() keeps ITERATING a single-path
+// pool — each pass is one `getOffer` (maxOffer: 99% of the pool's out at the
+// current balances) — until the in is spent, the want is met, or a pass
+// misses limitQuality. Here it takes maxOffer twice — 594 drops (6 → 600)
+// then 59,400 (600 → 60,000) — and rejects the third pass (limitOut
+// 3,684,250,433.7 SIRR for 35,001 drops misses the limit by 1e-5, "All
+// strands dry"): 59,994 drops for 99,990,000,499,950 SIRR. Our tail turn ran
+// once and stopped at 594, four objects short every time.
+#[test]
+fn offer_sell_iterates_the_single_path_pool_until_the_limit_rejects_106810920() {
+    run_bundle(include_str!("vectors/offer_sell_iterates_the_single_path_pool_until_the_limit_rejects_106810920.json"));
+}
