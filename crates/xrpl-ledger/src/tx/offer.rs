@@ -3338,7 +3338,7 @@ fn cross_bridged(
     let mut bridged_round: u32 = 0;
     // Finding 211: the pool turn was refused by a rival strand's bound this
     // round / the round is being re-run with the pool admitted by its own tip.
-    let mut pool_bq_blocked = false;
+    let mut pool_bq_blocked: bool;
     let mut pool_unblocked = false;
     // Finding 214: the walk's own remaining-in chain at the previous round's
     // top and the bounded budget that replaced it for that round.
