@@ -251,13 +251,16 @@ cmd_diff() {
   local blobs=$LOOP/scout/l${seq}_blobs.txt exp=$LOOP/scout/l${seq}_expected.json
   [ -f "$blobs" ] && [ -f "$exp" ] || { say "fixture for #$seq not staged"; exit 70; }
   reap_stale; take_lock; require_mem 4
+  # Built UNCONDITIONALLY, like cmd_probe: the old "build if absent" left this
+  # binary at 2026-09-05 while the harness tree moved on, so the native leg
+  # judged with a two-day-old engine (four phantom AMMWithdraw
+  # tecAMM_INVALID_TOKENS "finds" on 2026-09-07, all green at HEAD). cargo is
+  # a no-op when the tree is current.
   local bin=$LOOP/harness/target/debug/differential_probe
-  if [ ! -x "$bin" ]; then
-    local jobs; jobs=$(probe_jobs)
-    say "building differential_probe (harness, -j$jobs)…"
-    local blog=$LOOP/logs/diff-build-$TS.log
-    ( cd "$LOOP/harness/crates/xrpl-node" && CARGO_TARGET_DIR=$LOOP/harness/target run_cargo "$blog" 1800 "$CARGO" build --features ffi -j"$jobs" --bin differential_probe ) || { say "diff build failed"; tail -5 "$blog"; exit 70; }
-  fi
+  local jobs; jobs=$(probe_jobs)
+  say "building differential_probe (harness, -j$jobs)…"
+  local blog=$LOOP/logs/diff-build-$TS.log
+  ( cd "$LOOP/harness/crates/xrpl-node" && CARGO_TARGET_DIR=$LOOP/harness/target run_cargo "$blog" 1800 "$CARGO" build --features ffi -j"$jobs" --bin differential_probe ) || { say "diff build failed"; tail -5 "$blog"; exit 70; }
   local log=$LOOP/logs/diff-$TS-$seq.log
   run_cargo "$log" 900 "$bin" "$blobs" "$exp" --rpc "$rpc"
   local rc=$?
