@@ -1714,7 +1714,21 @@ pub(crate) fn max_offer_amounts(
 
 /// Average rate (in per out) of a fill — public face of the Quality compare.
 pub(crate) fn slice_rate(inp: Me, out: Me) -> Me {
-    rate_of_me_pair(inp, out)
+    // Finding 206 (#106815773 AB52A93710BF and #106818089/113/224/228/233/234
+    // — rphatRpwXc's USDM → BONSAI crossings, seven bridged fib iterations
+    // each): the fib offer's quality is rippled's `Quality{amounts}` =
+    // `getRate(out, in)` = `divide(in, out)`: floor(in·10^17/out) + 5, then
+    // canonicalised to sixteen digits under Number's default ToNearest.
+    // 1280 drops for 3.8405119856 BONSAI is 333.28889606369153…: getRate
+    // lands …916, a nearest division …915. The leg-B fill limited by leg
+    // A's 830 drops is `ceilInStrict` — 830 divided by that rate, floored —
+    // and the rate's last digit decides it: 2.490331990662499 (…916, the
+    // ledger) against 2.4903319906625 (…915, ours); iteration 2 the same
+    // way (…549 vs …551). Two ulps across seven credits moved the taker's
+    // BONSAI line one unit at its 947633.1651243573 scale, on every trade
+    // this bot makes.
+    let q = rate_of(inp, out);
+    if q == 0 { (0, 0) } else { crate::tx::offer::rate_me(q) }
 }
 
 /// `AMMLiquidity::getOffer` for a SINGLE-PATH leg that still has a live CLOB

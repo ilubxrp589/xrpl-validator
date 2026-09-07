@@ -987,3 +987,19 @@ fn offer_bridged_walk_folds_its_saved_outs_ascending_106812132() {
 fn offer_bridge_readmitted_under_single_path_tips_before_it_runs_106804746() {
     run_bundle(include_str!("vectors/offer_bridge_readmitted_under_single_path_tips_before_it_runs_106804746.json"));
 }
+
+// Finding 206 — #106815773 AB52A93710BF (rphatRpwXc, 874.99 USDM for 58.88
+// BONSAI, seven bridged fib iterations through the USDM/XRP and XRP/BONSAI
+// pools; #106818089/113/224/228/233/234/300 are the same bot): a fib offer's
+// quality is rippled's `Quality{amounts}` = `getRate(out, in)` — floor of the
+// 17-digit quotient plus 5, then canonicalised to sixteen digits nearest —
+// and the leg-B fill limited by leg A's 830 drops is `ceilInStrict`: 830
+// divided by that rate, floored. 1280 drops for 3.8405119856 BONSAI is
+// 333.28889606369153…, getRate …916, a nearest division …915: the ledger's
+// 2.490331990662499 against our 2.4903319906625 (iteration 2 the same,
+// …549 vs …551). Two ulps across seven credits moved the taker's BONSAI line
+// one unit at its 947633.1651243573 scale on every trade this bot makes.
+#[test]
+fn offer_fib_slice_quality_is_getrate_rounded_106815773() {
+    run_bundle(include_str!("vectors/offer_fib_slice_quality_is_getrate_rounded_106815773.json"));
+}
