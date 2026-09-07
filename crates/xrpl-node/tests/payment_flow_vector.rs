@@ -616,3 +616,18 @@ fn payment_forward_pool_hop_reanchors_to_the_cached_out_106823210() {
 fn payment_forward_pool_hop_reanchors_to_the_cached_out_second_specimen_106823225() {
     run_bundle(include_str!("vectors/payment_forward_pool_hop_reanchors_to_the_cached_out_second_specimen_106823225.json"));
 }
+
+// Finding 217 — #106824781 8B1596BFACC9 (rapido5rxP selling XWLF for
+// 59.934028 XRP with SendMax 3526.095273376751 against a line of
+// 2350.730182251167, eleven book fills): rippled's `remainingIn` counts down
+// from SendMax — `sendMax − sum(savedIns)` — and the sender's holding enters
+// only through the DirectStep's per-iteration bound, min(live line, original
+// − Σdebits). Clamping the pot to the holding up front made the fold's
+// remainder the exhausting fill's size, 206.6261549223710 against a line
+// holding …718: the line kept 8e-16 and the last maker's offer and line sat
+// eight and one ulps off, where mainnet's last DirectStep is "Limiting … in:
+// 206.6261549223718" and the line closes at zero.
+#[test]
+fn payment_pot_counts_down_from_sendmax_and_hop_zero_is_bounded_by_the_holding_106824781() {
+    run_bundle(include_str!("vectors/payment_pot_counts_down_from_sendmax_and_hop_zero_is_bounded_by_the_holding_106824781.json"));
+}

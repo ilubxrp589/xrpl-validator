@@ -1381,6 +1381,15 @@ impl PaymentTransactor {
                 Some(r) => ox::mul_ratio(carry, 1_000_000_000, r as u128, false),
                 None => carry,
             };
+            // Finding 217: the sender's DirectStep bounds the strand's first
+            // hop by what the sender holds NOW — min(live, original − Σdebits)
+            // — every iteration; the pot above counts down from SendMax.
+            let avail = if i == 0 {
+                let held = ox::available(sandbox, &tx.account, &chain[0]);
+                if ox::me_cmp(held, avail).is_lt() { held } else { avail }
+            } else {
+                avail
+            };
             // Finding 98: a hop's IN that is not the payment's spend (i > 0)
             // and a hop's OUT that is not the delivery (!last) are pass-through
             // — rippled never lands them on the sender's own line. Register
@@ -2404,7 +2413,20 @@ impl PaymentTransactor {
         if ox::me_is_zero(spend_avail) {
             return TxResult::PathDry;
         }
-        let spend0 = if ox::me_cmp(spend_avail, spend0).is_lt() { spend_avail } else { spend0 };
+        // Finding 217 (#106824781 8B1596BFACC9, rapido5rxP selling XWLF for
+        // 59.934028 XRP with SendMax 3526.095273376751 against a line of
+        // 2350.730182251167, eleven book fills): rippled's `remainingIn`
+        // counts down from SENDMAX — `sendMax − sum(savedIns)` (StrandFlow.h)
+        // — and the sender's holding enters only through the DirectStep's
+        // per-iteration bound, `balanceHookIOU` = min(live line, original −
+        // Σdebits). Clamping the pot to the holding up front made the fold's
+        // remainder the exhausting fill's size: 206.6261549223710 against a
+        // line holding …718, so the line kept 8e-16 and the last maker's
+        // offer and line sat eight and one ulps off; mainnet's last
+        // DirectStep is "Limiting … in: 206.6261549223718" — the line —
+        // and it closes at zero. The pot stays SendMax; hop 0 of every
+        // strand pass is bounded by the sender's holding as it stands.
+        let _ = &spend_avail;
         // INPUT-side TransferRate. A payment sets `ownerPaysTransferFee_ =
         // false`, so `trIn = transferRate(book_.in.account)` — the SENDER pays
         // `amount × rate` and the counterparty receives `amount`
