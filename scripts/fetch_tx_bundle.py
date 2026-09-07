@@ -338,9 +338,9 @@ _META_REBUILD = {
 
 def rebuild_from_meta(kind, node, tx_hash, seq, pre_hex):
     """The object's post-image after THIS tx, from its meta node — for a key a
-    later tx in the ledger also touches. FinalFields carry the changed fields
-    and the identity; the pre-image supplies what the meta leaves out because
-    it did not change. Directories are not rebuilt (the meta omits Indexes)."""
+    later tx in the ledger also touches. FinalFields (or NewFields) carry the
+    whole object for the types listed; only the zero node fields and the
+    threading are added. Directories are not rebuilt (the meta omits Indexes)."""
     ty = node.get("LedgerEntryType")
     if ty not in _META_REBUILD:
         return None
@@ -348,15 +348,15 @@ def rebuild_from_meta(kind, node, tx_hash, seq, pre_hex):
     if fields is None:
         return None
     try:
-        from xrpl.core.binarycodec import decode, encode
+        from xrpl.core.binarycodec import encode
     except ImportError:
         return None
+    # FinalFields carry the whole object for these types (only directories
+    # leave Indexes out, and they are not rebuilt); the pre-image is not
+    # consulted — xrpl-py cannot even decode rippled's zero IOU form, and a
+    # decode failure here used to abort the whole fetch (#106825804).
     obj = dict(fields)
     obj["LedgerEntryType"] = ty
-    if kind == "ModifiedNode" and pre_hex:
-        for f, val in decode(pre_hex).items():
-            if f not in obj and f not in ("PreviousTxnID", "PreviousTxnLgrSeq", "index", "LedgerIndex"):
-                obj[f] = val
     for f in _META_REBUILD[ty]:
         obj.setdefault(f, "0000000000000000")
     obj["PreviousTxnID"] = tx_hash
