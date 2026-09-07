@@ -564,3 +564,19 @@ fn payment_in_limited_pool_slice_delivers_no_more_than_the_want_106807323() {
 fn payment_strand_quality_function_takes_the_clob_tip_where_the_pools_spot_misses_it_106811381() {
     run_bundle(include_str!("vectors/payment_strand_quality_function_takes_the_clob_tip_where_the_pools_spot_misses_it_106811381.json"));
 }
+
+// Finding 204 — #106813814 BAB4F7ABBA64 (rwUx1Zgz7U, 100000 drops of
+// tfPartialPayment|tfLimitQuality through the XRP/BTC pool, the BTC/RLUSD book
+// and the RLUSD/FUZZY pool): the reverse pass asks 100001 drops of a 100000
+// SendMax, so rippled's forward pass is driven by the INPUT at every book
+// step — `fwdImp` hands `limitStepIn` the whole carry — and only the closing
+// DirectStep clamps the delivery to the reverse want. Each hop here bought
+// exactly the reverse want and left the carry's rounding surplus (3.3e-14 BTC)
+// with the sender; mainnet pushed it through the BTC/RLUSD offer and the
+// RLUSD/FUZZY pool. Intermediate hops of an input-limited strand now walk in
+// sell mode and hand their surplus on; the last pool parts with the whole
+// swap and delivers the want (finding 200).
+#[test]
+fn payment_input_limited_strand_drives_its_middle_hops_by_the_carry_106813814() {
+    run_bundle(include_str!("vectors/payment_input_limited_strand_drives_its_middle_hops_by_the_carry_106813814.json"));
+}

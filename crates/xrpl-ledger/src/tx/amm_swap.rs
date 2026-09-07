@@ -51,7 +51,7 @@ pub(crate) const MAX_AMM_ITERS: u32 = 30;
 thread_local! {
     static FWD_EXCESS: std::cell::Cell<Me> = const { std::cell::Cell::new((0, 0)) };
 }
-fn add_fwd_excess(x: Me) {
+pub(crate) fn add_fwd_excess(x: Me) {
     if x.0 == 0 {
         return;
     }
@@ -1437,7 +1437,9 @@ pub(crate) fn consume_fib(
     if take_in.0 == 0 || take_out.0 == 0 {
         return (rem_pays, rem_gets, false);
     }
-    if !sell && n_cmp(take_out, rem_pays) == Ordering::Greater {
+    // Finding 204: in SELL mode (an input-driven intermediate payment hop) the
+    // slice runs past the want too, and that surplus is the next hop's carry.
+    if n_cmp(take_out, rem_pays) == Ordering::Greater {
         add_fwd_excess(n_sub(take_out, rem_pays, Rnd::Near));
     }
     settle_slice(
@@ -2196,7 +2198,9 @@ pub(crate) fn consume(
     }
     // Finding 131: an input-clamped fill's output beyond the want is the
     // forward pass's whole product; report it for the carry.
-    if !sell && n_cmp(take_out, rem_pays) == Ordering::Greater {
+    // Finding 204: in SELL mode (an input-driven intermediate payment hop) the
+    // slice runs past the want too, and that surplus is the next hop's carry.
+    if n_cmp(take_out, rem_pays) == Ordering::Greater {
         add_fwd_excess(n_sub(take_out, rem_pays, Rnd::Near));
     }
     let deliver = deliver_cap.unwrap_or(take_out);

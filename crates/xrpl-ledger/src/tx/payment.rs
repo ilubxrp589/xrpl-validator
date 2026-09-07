@@ -1291,6 +1291,24 @@ impl PaymentTransactor {
                 }
             }
         }
+        // Finding 204 (#106813814 BAB4F7ABBA64, rwUx1Zgz7U's 100000-drop
+        // tfPartialPayment|tfLimitQuality through the XRP/BTC pool, the
+        // BTC/RLUSD book and the RLUSD/FUZZY pool): once the reverse pass asks
+        // more input than the strand has (100001 drops against 100000),
+        // rippled's forward pass is driven by the INPUT at every book step —
+        // `fwdImp` hands `limitStepIn` the whole carry and the reverse amounts
+        // are reinstated only on an exact cache hit — and only the closing
+        // DirectStep clamps the delivery to the reverse want (finding 170).
+        // Each hop here bought exactly the reverse want and left the carry's
+        // rounding surplus (3.3e-14 BTC) with the sender; mainnet pushed it
+        // through the BTC/RLUSD offer and the RLUSD/FUZZY pool, so the
+        // maker's residual, its line and both pool lines sat a few ulps off
+        // while the destination's credit agreed (2470.44573818548, the
+        // clamp). Intermediate hops of an input-limited strand therefore walk
+        // in SELL mode — the want is a floor, the carry is spent whole — and
+        // the last hop keeps the want as its cap (a pool parts with the whole
+        // swap and delivers the want, finding 200).
+        let mut fwd_driven = false;
         for i in 0..n {
             let last = i + 1 == n;
             let benef = if last { dest } else { &tx.account };
@@ -1386,7 +1404,7 @@ impl PaymentTransactor {
                     crate::tx::amm_swap::set_fwd_first(i == 0); // finding 147
             let (rw, rs, _c, gross_spent) = ox::cross_engine_to_net(
                 &tx.account, benef, want_cap, avail, chain[i + 1], chain[i],
-                hop_thr, hop_thr, false, false, single_pass, amm_fib.as_deref_mut(), None,
+                hop_thr, hop_thr, fwd_driven && i > 0 && !last, false, single_pass, amm_fib.as_deref_mut(), None,
                 if last { want_net } else { None },
                 if i == 0 { spend_gross } else { None },
                 sandbox, &mut Vec::new(),
@@ -1395,6 +1413,11 @@ impl PaymentTransactor {
             crate::tx::amm_swap::set_fwd_gross_in(None);
             crate::tx::amm_swap::set_sender_hop(false);
                     crate::tx::amm_swap::set_fwd_first(false);
+            // Finding 204: hop 0 spent its whole input — the strand is
+            // input-limited and the forward pass drives the rest.
+            if i == 0 && ox::me_is_zero(rs) && n > 2 {
+                fwd_driven = true;
+            }
             // Hop 0's input IS the spend leg — `hop_rate` is gated on `i > 0`,
             // so `avail` there is still `avail_in` untouched — and `rs` is the
             // part of it the pass did not spend. The difference is the same

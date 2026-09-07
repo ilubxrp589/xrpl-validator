@@ -7210,6 +7210,12 @@ pub(crate) fn cross_engine_to_net(
                 // exactly; the second maker's in then priced one ulp apart
                 // (…4660 vs …4659). Offer crossing only, as finding 118's
                 // in-side fold; a payment keeps finding 81b's exact remainder.
+                // Finding 204: a sell-mode PAYMENT hop is rippled's input-driven
+                // forward pass — the fill runs past the want, and the surplus
+                // is the next hop's carry (see the payment engine's `excess`).
+                if sell && !offer_crossing && me_cmp(give, rem_pays).is_gt() {
+                    crate::tx::amm_swap::add_fwd_excess(me_sub(give, rem_pays));
+                }
                 rem_pays = if offer_crossing && !pays_leg.xrp {
                     let (neg, m) = stamount_signed_add(false, rem_pays, true, give);
                     if neg { (0, 0) } else { m }
