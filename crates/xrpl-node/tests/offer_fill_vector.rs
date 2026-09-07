@@ -1111,3 +1111,17 @@ fn offer_bridged_strands_die_for_the_rest_of_the_crossing_106823884() {
 fn offer_sell_crossing_takes_the_pools_whole_swap_106644289() {
     run_bundle(include_str!("vectors/offer_sell_crossing_takes_the_pools_whole_swap_106644289.json"));
 }
+
+/// Finding 224 (#106832069 123A0608ED05): rMsXVzCug7's passive 0.02416 BTC →
+/// 1907.42869 RLUSD placement autobridges through the BTC/XRP and XRP/RLUSD
+/// pools. rippled's strand quality function prepends the taker's 0.15% BTC
+/// transfer fee as a CLOB-like constant before the first pool leg
+/// (BookStep::getQualityFunc, adjustQualityWithFees on the in side of a
+/// redeeming step); limitOut then trims the ask to 0.09999… no — to
+/// 5.593676743024166 RLUSD, which mainnet fills. Ours composed the two pool
+/// curves alone, solved 181.01 RLUSD, sized the pool slice to 33.25 RLUSD and
+/// rejected it on quality: no crossing, the full offer placed.
+#[test]
+fn offer_bridge_limit_out_carries_the_in_side_transfer_fee_106832069() {
+    run_bundle(include_str!("vectors/offer_bridge_limit_out_carries_the_in_side_transfer_fee_106832069.json"));
+}

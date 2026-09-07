@@ -4672,7 +4672,26 @@ thr={t:?} admits_trunc={} admits_up={}",
                 }
             };
             // Strand order is source-first: leg A (gets -> XRP), then leg B.
-            let mut qf = leg(a_qf_amm, &amm_a, qa_book, &xrp_leg, gets_leg)?;
+            let leg_a = leg(a_qf_amm, &amm_a, qa_book, &xrp_leg, gets_leg)?;
+            // Finding 224: BookStep::getQualityFunc folds the IN-side transfer
+            // fee into the first leg's function — adjustQualityWithFees(kQOne,
+            // prevStepDir) with the taker's DirectStep redeeming, so trIn is
+            // the gets issuer's TransferRate — as a CLOB-like constant
+            // combined BEFORE the pool curve (a CLOB tip gets the fee composed
+            // into its quality: the same product). #106832069 123A0608ED05
+            // (rMsXVzCug7, passive 0.02416 BTC → 1907.43 RLUSD, BTC/XRP pool
+            // tfee 19 ∘ XRP/RLUSD pool tfee 205, BTC TransferRate 1.0015):
+            // rippled's solve trims the ask to 5.593676743024166 RLUSD and
+            // fills it; without the constant we solved 181.010803, sized the
+            // pool slice to 33.25 RLUSD, rejected it on quality and placed the
+            // whole offer.
+            let mut qf = match fee_rate.and_then(|r| QualityFn::clob((r as u128, -9))) {
+                Some(mut f) => {
+                    f.combine(&leg_a);
+                    f
+                }
+                None => leg_a,
+            };
             qf.combine(&leg(b_qf_amm, &amm_b, qb_book, pays_leg, &xrp_leg)?);
             Some(qf)
         };
