@@ -1384,11 +1384,27 @@ impl PaymentTransactor {
             // Finding 217: the sender's DirectStep bounds the strand's first
             // hop by what the sender holds NOW — min(live, original − Σdebits)
             // — every iteration; the pot above counts down from SendMax.
-            let avail = if i == 0 {
+            // Finding 219 (#106826590 DDE6F9E974AB, raRBY29mxK paying USD
+            // (issuer rate 1.0015) for XRP under tfPartialPayment with SendMax
+            // 0.0144553203466773 against a line of 0.01417191457932401): the
+            // holding is GROSS. Compared with the NET budget it never bound,
+            // and the verbatim gross cap the exhausting fill debits (finding
+            // 118) was SendMax itself, so the line went to −2.8e-4 where
+            // mainnet's DirectStep — in = min(remainingIn, srcLiquid), both
+            // gross — spends exactly the line and closes it at zero. The
+            // holding nets down for the budget and caps the gross cap.
+            let (avail, hop_gross) = if i == 0 {
                 let held = ox::available(sandbox, &tx.account, chain[0]);
-                if ox::me_cmp(held, avail).is_lt() { held } else { avail }
+                let rated = !chain[0].xrp && tx.account != chain[0].issuer;
+                let held_net = match Self::transfer_rate(sandbox, chain[0]).filter(|_| rated) {
+                    Some(r) => ox::mul_ratio(held, 1_000_000_000, r as u128, false),
+                    None => held,
+                };
+                let avail = if ox::me_cmp(held_net, avail).is_lt() { held_net } else { avail };
+                let g = spend_gross.map(|g| if ox::me_cmp(held, g).is_lt() { held } else { g });
+                (avail, g)
             } else {
-                avail
+                (avail, None)
             };
             // Finding 98: a hop's IN that is not the payment's spend (i > 0)
             // and a hop's OUT that is not the delivery (!last) are pass-through
@@ -1416,7 +1432,7 @@ impl PaymentTransactor {
                 &tx.account, benef, want_cap, avail, chain[i + 1], chain[i],
                 hop_thr, hop_thr, fwd_driven && i > 0 && !last, false, single_pass, amm_fib.as_deref_mut(), None,
                 if last { want_net } else { None },
-                if i == 0 { spend_gross } else { None },
+                hop_gross,
                 sandbox, &mut Vec::new(),
             );
             let excess = crate::tx::amm_swap::take_fwd_excess();

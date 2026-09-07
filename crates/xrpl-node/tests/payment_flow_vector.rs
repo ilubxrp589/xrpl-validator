@@ -646,3 +646,15 @@ fn payment_pot_counts_down_from_sendmax_and_hop_zero_is_bounded_by_the_holding_1
 fn payment_exact_spend_executes_the_reverse_pass_verbatim_106824803() {
     run_bundle(include_str!("vectors/payment_exact_spend_executes_the_reverse_pass_verbatim_106824803.json"));
 }
+
+// Finding 219 — #106826590 DDE6F9E974AB (raRBY29mxK paying USD, issuer rate
+// 1.0015, for XRP under tfPartialPayment with SendMax 0.0144553203466773
+// against a line of 0.01417191457932401): the holding is gross. Compared
+// with the net budget it never bound, and the verbatim gross cap the
+// exhausting fill debits was SendMax itself, so the line went to −2.8e-4
+// where mainnet's DirectStep spends exactly the line and closes it at zero.
+// The holding now nets down for the budget and caps the gross cap.
+#[test]
+fn payment_hop_zero_gross_cap_is_bounded_by_the_holding_106826590() {
+    run_bundle(include_str!("vectors/payment_hop_zero_gross_cap_is_bounded_by_the_holding_106826590.json"));
+}
