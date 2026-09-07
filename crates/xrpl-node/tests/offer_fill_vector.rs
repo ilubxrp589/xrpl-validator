@@ -1062,3 +1062,18 @@ fn offer_bridged_pool_turn_is_bounded_by_the_deferred_line_106823771() {
 fn offer_bridged_pool_slice_remainder_is_sixteen_digits_106823807() {
     run_bundle(include_str!("vectors/offer_bridged_pool_slice_remainder_is_sixteen_digits_106823807.json"));
 }
+
+// Finding 214 — #106823899 9985C6C67C38 (rphatRpwXc, the same 2099.99934297
+// USDM for 136.7844 BONSAI offer with 1431.153930007916 USDM in hand, eight
+// direct-pool fib slices): the deferred bound is per iteration — rippled's
+// strand keeps its own `remainingIn` and the DirectStep re-reads the line each
+// pass — so the walk's chain continues from what a round actually spent, not
+// from the bound; and the slice that exhausts the bounded budget debits the
+// gross bound verbatim, as the exhausting book fills do. Persisting the bound
+// at iteration 4 left the chain a unit short at the exhausting iteration,
+// where it undercut the deferred bound itself: 219.9845725933745 against
+// mainnet's …750, and the line kept 1e-12 where mainnet keeps 5e-13.
+#[test]
+fn offer_bridged_round_bound_is_per_iteration_106823899() {
+    run_bundle(include_str!("vectors/offer_bridged_round_bound_is_per_iteration_106823899.json"));
+}

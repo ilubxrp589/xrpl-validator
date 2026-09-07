@@ -3340,6 +3340,9 @@ fn cross_bridged(
     // round / the round is being re-run with the pool admitted by its own tip.
     let mut pool_bq_blocked = false;
     let mut pool_unblocked = false;
+    // Finding 214: the walk's own remaining-in chain at the previous round's
+    // top and the bounded budget that replaced it for that round.
+    let mut chain_gets: Option<(Me, Me)> = None;
     // Finding 153: makers drained to zero by a round's fills; the next
     // round's peeks treat their remaining offers as "became unfunded".
     let mut drained_next: Drained = Default::default();
@@ -3364,17 +3367,39 @@ fn cross_bridged(
         // handed the pool the walk's remainder and sold 141.0277204892863,
         // and a round later the bridge sold the dust the bound would have
         // refused. Gross, net of the in-side rate, like the fills.
+        // Finding 214 (#106823899 9985C6C67C38, the same offer with
+        // 1431.153930007916 USDM): the slice that exhausts the bounded budget
+        // debits the taker the GROSS bound verbatim — rippled's in is gross,
+        // and finding 118's exhausting book fills already take the remaining
+        // gross cap as it stands. Re-grossing the pool's net take-in landed
+        // 219.9845725933745 against the bound's …750, and the line kept 1e-12
+        // where mainnet keeps 5e-13.
+        let mut round_gross_cap: Option<Me> = None;
+        // Finding 214 (cont.): the bound is per iteration — rippled's strand
+        // keeps its own `remainingIn` and the DirectStep re-reads the line
+        // each pass — so the walk's chain continues from what the round
+        // actually spent, not from the bound. Persisting the bound at
+        // iteration 4 (one unit under the line) left the chain a unit short
+        // at the exhausting iteration, where it undercut the deferred bound
+        // itself: 219.9845725933745 against mainnet's …750.
+        if let Some((chain, bounded)) = chain_gets.take() {
+            let spent = me_sub(bounded, rem_gets);
+            rem_gets = stamount_signed_add(false, chain, true, spent).1;
+        }
         if gets_gross_cap.is_some() && !me_is_zero(rem_gets) {
             let verb_gross = gross_in(fee_rate, rem_gets);
             let bound_gross = line_bound_gross(sandbox, taker, gets_leg, verb_gross);
             if me_cmp(bound_gross, verb_gross).is_lt() {
+                round_gross_cap = Some(bound_gross);
                 if std::env::var("DX_AMM").is_ok() {
                     eprintln!("DX_AMM F212 round budget line-bound {verb_gross:?} -> {bound_gross:?}");
                 }
-                rem_gets = match fee_rate {
+                let bounded = match fee_rate {
                     None => bound_gross,
                     Some(r) => mul_ratio(bound_gross, 1_000_000_000, r as u128, false),
                 };
+                chain_gets = Some((rem_gets, bounded));
+                rem_gets = bounded;
                 if done(rem_pays, rem_gets) {
                     break;
                 }
@@ -4000,7 +4025,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                     (rem_pays, rem_gets, false)
                 } else {
                 crate::tx::amm_swap::consume(
-                    sandbox, a, taker, beneficiary, None, None, rem_pays, rem_gets, pays_leg, gets_leg,
+                    sandbox, a, taker, beneficiary, None, round_gross_cap, rem_pays, rem_gets, pays_leg, gets_leg,
                     threshold, threshold_self, sell, anchor_clob, fee_rate, limit_anchor, None,
                 )
                 }
@@ -4046,7 +4071,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                         && (threshold == u64::MAX || !me_cmp(q, rate_me(threshold)).is_gt())
                 });
                 crate::tx::amm_swap::consume_fib(
-                    sandbox, a, taker, beneficiary, None, None, rem_pays, rem_gets, pays_leg, gets_leg,
+                    sandbox, a, taker, beneficiary, None, round_gross_cap, rem_pays, rem_gets, pays_leg, gets_leg,
                     threshold, sell, *init, amm_iters, best_book, fee_rate,
                 )
             };
