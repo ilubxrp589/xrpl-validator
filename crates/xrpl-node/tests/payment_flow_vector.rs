@@ -580,3 +580,17 @@ fn payment_strand_quality_function_takes_the_clob_tip_where_the_pools_spot_misse
 fn payment_input_limited_strand_drives_its_middle_hops_by_the_carry_106813814() {
     run_bundle(include_str!("vectors/payment_input_limited_strand_drives_its_middle_hops_by_the_carry_106813814.json"));
 }
+
+// Finding 209 — #106823197 4332E5712967 (rapido5rxP, a circular LTC → XRP
+// arbitrage paying 12727272727272.72 LTC through two offers): rippled
+// subtracts IOUs through `Number` at the sixteen-digit scale, where a
+// difference whose coarse mantissa lands exactly on 10^15 with digits left in
+// the guard is rounded there instead of receiving its sixteenth digit.
+// 12727272727272.72 − 2727272727272.727 is exactly 9999999999999.993; the
+// ledger's line holds …990, the next DirectStep is bounded by it, and the
+// second maker's line and offer residual follow (…990 and 0.01 against our
+// …993 and 0.007).
+#[test]
+fn payment_iou_subtraction_at_the_cusp_rounds_the_coarse_mantissa_106823197() {
+    run_bundle(include_str!("vectors/payment_iou_subtraction_at_the_cusp_rounds_the_coarse_mantissa_106823197.json"));
+}

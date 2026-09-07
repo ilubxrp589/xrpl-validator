@@ -709,11 +709,64 @@ pub(crate) fn stamount_signed_add(aneg: bool, a: Me, bneg: bool, b: Me) -> (bool
     if aneg == bneg {
         return (aneg, round16(av + bv, e, false, Rnd::Near));
     }
+    let k0 = (a.1.max(b.1) - e) as u32;
     match av.cmp(&bv) {
         std::cmp::Ordering::Equal => (false, (0, 0)),
-        std::cmp::Ordering::Greater => (aneg, round16(av - bv, e, false, Rnd::Near)),
-        std::cmp::Ordering::Less => (bneg, round16(bv - av, e, false, Rnd::Near)),
+        std::cmp::Ordering::Greater => (aneg, number_diff16(av - bv, e, k0)),
+        std::cmp::Ordering::Less => (bneg, number_diff16(bv - av, e, k0)),
     }
+}
+
+/// Finding 209: rippled subtracts IOUs through `Number` (STAmount.cpp
+/// `operator+` → `IOUAmount::operator+=` → `Number::operator+=`) at the
+/// SIXTEEN-digit "Small" mantissa scale — Rules.cpp `setCurrentTransactionRules`
+/// selects the nineteen-digit scales only under SingleAssetVault or
+/// LendingProtocol, neither live — where the cusp-rounding fix is Disabled.
+/// The operand with the smaller exponent is truncated to the larger exponent
+/// and its dropped digits kept in a Guard; the coarse difference is taken at
+/// that scale; guard digits are pulled back only while the mantissa is below
+/// 10^15 (Number.cpp: `while (xm < minMantissa …) { xm *= 10; xm -= g.pop();
+/// --xe; }`), and whatever the guard still holds then ROUNDS that mantissa
+/// (`doRoundDown`: Round::Up → `--mantissa`, and a mantissa that thereby falls
+/// under 10^15 is multiplied by ten with a TRAILING ZERO). A difference whose
+/// coarse mantissa lands exactly on 10^15 with digits left in the guard never
+/// receives its sixteenth digit: the remainder decides between
+/// 1000000000000000 and 9999999999999990 at the coarser scale. Everywhere
+/// else the algorithm equals the exact difference rounded half-even to
+/// sixteen digits, which is what this function did before.
+///
+/// #106823197 4332E5712967 (rapido5rxP, a circular LTC → XRP arbitrage; zv301
+/// and zv302 are the same bot): the line holding 12727272727272.72 pays
+/// 2727272727272.727. Exactly that is 9999999999999.993; rippled takes
+/// 1272727272727272 − 272727272727272 = 10^15 with 0.7 in the guard, rounds
+/// to 999999999999999 and re-scales: 9999999999999.990. The next iteration's
+/// DirectStep is bounded by that line, so mainnet sized the whole strand at
+/// …990 — the maker's line got …990 (ours …993) and its offer kept 0.01
+/// (ours 0.007).
+///
+/// `x` is the exact |a − b| at scale `e` (the smaller exponent); `k0` is the
+/// larger exponent minus `e`, the number of digits the smaller operand lost.
+/// The coarse mantissa after `k` digits are pulled back is ceil(x / 10^(k0−k)).
+fn number_diff16(x: u128, e: i32, k0: u32) -> Me {
+    use crate::tx::amm_swap::{round16, Rnd};
+    const MIN16: u128 = 1_000_000_000_000_000;
+    for k in 0..=k0 {
+        let p = 10u128.pow(k0 - k);
+        let rem = x % p;
+        let i = x / p + (rem != 0) as u128;
+        if i >= MIN16 {
+            if i == MIN16 && rem != 0 {
+                // The cusp. The guard holds (p − rem) / p: above one half it
+                // rounds up (ToNearest), exactly one half ties to even and
+                // 10^15 is even.
+                let g2 = p - rem;
+                let scale = e + (k0 - k) as i32;
+                return if 2 * g2 > p { (9_999_999_999_999_990, scale - 1) } else { (MIN16, scale) };
+            }
+            break;
+        }
+    }
+    round16(x, e, false, Rnd::Near)
 }
 
 pub(crate) fn signed_add(aneg: bool, a: Me, bneg: bool, b: Me) -> (bool, Me) {
@@ -8701,6 +8754,32 @@ mod tests {
     /// trace: 2000892.236615386 + 100.153148870651 is exactly
     /// 2000992.389764256|651, so the stored value is ...257. Truncating gives
     /// ...256, one ulp low, which re-prices every later slice off that pool.
+    #[test]
+    fn iou_subtraction_at_the_cusp_rounds_the_coarse_mantissa_106823197() {
+        // Finding 209: 12727272727272.72 − 2727272727272.727 is exactly
+        // 9999999999999.993; rippled's sixteen-digit Number lands on 10^15
+        // with 0.7 in the guard and re-scales 999999999999999 with a
+        // trailing zero.
+        let r = stamount_signed_add(false, (1272727272727272, -2), true, (2727272727272727, -3));
+        assert_eq!(r, (false, (9999999999999990, -3)));
+        // The same cusp below one half keeps 10^15 at the coarse scale.
+        let r = stamount_signed_add(false, (1272727272727272, -2), true, (2727272727272723, -3));
+        assert_eq!(r, (false, (1000000000000000, -2)));
+        // Exactly one half ties to even (10^15).
+        let r = stamount_signed_add(false, (1272727272727272, -2), true, (2727272727272725, -3));
+        assert_eq!(r, (false, (1000000000000000, -2)));
+        // Off the cusp the exact difference rounds half-even as before:
+        // 159.3804149074318 − 27.56231189237938 = 131.81810301505242 → …524.
+        let r = stamount_signed_add(false, (1593804149074318, -13), true, (2756231189237938, -14));
+        assert_eq!(r, (false, (1318181030150524, -13)));
+        // A leading cancellation pulls the guard digits back exactly.
+        let r = stamount_signed_add(false, (1000000000000000, -2), true, (2727272727272727, -3));
+        assert_eq!(r, (false, (7272727272727273, -3)));
+        // The maker's residual: 10^13 − 9999999999999.99 = 0.01.
+        let r = stamount_signed_add(false, (1000000000000000, -2), true, (9999999999999990, -3));
+        assert_eq!(r, (false, (1000000000000000, -17)));
+    }
+
     #[test]
     fn iou_addition_rounds_half_even_not_truncated() {
         let (neg, sum) = stamount_signed_add(
