@@ -142,3 +142,13 @@ fn amm_deposit_one_drop_whose_tokens_round_away_is_invalid_tokens() {
 fn amm_two_asset_deposit_lptokenout_is_a_minimum() {
     run_bundle(include_str!("vectors/amm_two_asset_deposit_lptokenout_is_a_minimum_106748884.json"));
 }
+
+/// Finding 221 (#106637600 24CCA52264A3): a tfSingleAsset wAAPL deposit into
+/// a pool whose OWN wAAPL line the issuer froze (lsfLowFreeze on the AMM
+/// account's line). AMMDeposit.cpp:330-346 `checkAmount` refuses tecFROZEN
+/// for the AMM account while fixCleanup3_3_0 is not live; we only checked
+/// the depositor's line and deposited.
+#[test]
+fn amm_deposit_refuses_a_pool_line_the_issuer_froze_106637600() {
+    run_bundle(include_str!("vectors/amm_deposit_refuses_a_pool_line_the_issuer_froze_106637600.json"));
+}

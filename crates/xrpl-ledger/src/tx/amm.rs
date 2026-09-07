@@ -815,6 +815,21 @@ impl Transactor for AMMDepositTransactor {
             if let Some(t) = ox::require_auth_ter(sandbox, &leg, &tx.account, true) {
                 if t != TxResult::Success { return t; }
             }
+            // AMMDeposit.cpp:330-346 `checkAmount`, while fixCleanup3_3_0 is
+            // not live: the deposited asset must not be frozen for the AMM
+            // ACCOUNT either — an issuer freezing the pool's own line (or a
+            // global freeze) refuses the deposit tecFROZEN although the
+            // depositor's line is clean; withdrawals stay allowed. Finding 221
+            // (#106637600 24CCA52264A3: tfSingleAsset wAAPL into rMfkgc8Mx's
+            // pool, whose wAAPL line carries the issuer's lsfLowFreeze —
+            // mainnet tecFROZEN, ours deposited). The depositor's own
+            // checkIndividualFrozen that follows it is subsumed by the Asset
+            // loop above.
+            if let Some((_, amm_acct, _)) = amm_ctx(tx, sandbox) {
+                if let Some(t) = ox::frozen_ter(sandbox, &leg, &amm_acct) {
+                    if t != TxResult::Success { return t; }
+                }
+            }
         }
         // The depositor must be able to FUND an XRP side, and rippled measures
         // that against the reserve it will owe AFTER the deposit: `xrpLiquid`
