@@ -491,6 +491,31 @@ def main():
     # AMM's owner dir counting LP lines — with the other LPs' lines absent the
     # probe declares the withdrawer the sole LP and refuses with
     # tecAMM_INVALID_TOKENS (#106702692 6F7C52C0, live tesSUCCESS).
+    # A tec EscrowFinish/EscrowCancel (or a refused PaymentChannel*/Check*
+    # claim) touches nothing but the fee, so the object it names never reaches
+    # the meta — and without it the probe answers tecNO_TARGET for whatever
+    # mainnet actually decided. #106743443 44A81646DF43: an EscrowFinish two
+    # seconds before FinishAfter, mainnet tecNO_PERMISSION, ours tecNO_TARGET
+    # with the escrow unhydrated. keylet::escrow = SHA512Half('u' || owner ||
+    # OfferSequence be32); Channel and CheckID are the keys themselves.
+    named_keys = []
+    if tx.get("TransactionType") in ("EscrowFinish", "EscrowCancel") and tx.get("Owner") and tx.get("OfferSequence") is not None:
+        try:
+            named_keys.append(hashlib.sha512(b"\x00u" + bytes.fromhex(acct_id(tx["Owner"])) + int(tx["OfferSequence"]).to_bytes(4, "big")).digest()[:32].hex().upper())
+        except Exception as e:
+            print(f"note: escrow key: {e}", file=sys.stderr)
+    for f in ("Channel", "CheckID"):
+        v = tx.get(f)
+        if isinstance(v, str) and len(v) == 64:
+            named_keys.append(v.upper())
+    for nk in named_keys:
+        if nk not in pre:
+            try:
+                nb = fetch_key(nk)
+                if nb:
+                    pre[nk] = nb
+            except Exception as e:
+                print(f"note: named key {nk[:12]}: {e}", file=sys.stderr)
     if tx.get("TransactionType", "").startswith("AMM") and tx.get("Asset") is not None and tx.get("Asset2") is not None:
         try:
             def ap2(x):
