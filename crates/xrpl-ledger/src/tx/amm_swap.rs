@@ -2109,6 +2109,31 @@ pub(crate) fn consume(
     if n_cmp(take_in, rem_gets) == Ordering::Greater {
         take_in = rem_gets;
         take_out = swap_asset_in(pool_in, pool_out, take_in, amm.tfee, pays_leg.xrp);
+        // Finding 210 (#106823210 813F674F2C38, rapido5rxP, XRP → WETH →
+        // LAWAS → LTC): rippled's `BookStep::fwdImp` — "the step produced
+        // more output in the forward pass than the reverse pass while
+        // consuming the same input (or less)" — re-prices the offer for the
+        // CACHED out (`limitStepOut(cache_->out)`; single-path
+        // `AMMOffer::limitOut` = `swapAssetOut`), and when the input that
+        // requires equals the input provided it consumes that input and
+        // produces the output the reverse pass requested. The surplus stays
+        // in the pool. Only when the required input differs does the whole
+        // forward swap go through and its surplus become the next hop's
+        // carry (finding 204). The forward swap of the exact reverse input
+        // 0.0001165445495622757 WETH yields 14360.3597828 LAWAS against the
+        // reverse's 14360.35978279596 — Number's cancellation in
+        // `swapAssetIn` keeps twelve digits — and the 4e-9 we carried
+        // moved both pools' lines.
+        if n_cmp(take_out, rem_pays) == Ordering::Greater {
+            if let Some(in_req) = swap_asset_out(pool_in, pool_out, rem_pays, amm.tfee, gets_leg.xrp) {
+                if n_cmp(ox::gross_in(in_gross_rate, in_req), ox::gross_in(in_gross_rate, take_in)) == Ordering::Equal {
+                    if std::env::var("DX_AMM").is_ok() {
+                        eprintln!("DX_AMM F210 fwd re-anchored to the cached out {rem_pays:?} (swap gave {take_out:?})");
+                    }
+                    take_out = rem_pays;
+                }
+            }
+        }
         // Finding 200: the in-limited re-swap can land ABOVE the remaining
         // want, and rippled's forward pass never delivers that surplus —
         // the strand's last DirectStep keeps its REVERSE cache whenever the

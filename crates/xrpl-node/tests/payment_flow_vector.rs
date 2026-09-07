@@ -594,3 +594,25 @@ fn payment_input_limited_strand_drives_its_middle_hops_by_the_carry_106813814() 
 fn payment_iou_subtraction_at_the_cusp_rounds_the_coarse_mantissa_106823197() {
     run_bundle(include_str!("vectors/payment_iou_subtraction_at_the_cusp_rounds_the_coarse_mantissa_106823197.json"));
 }
+
+// Finding 210 — #106823210 813F674F2C38 (rapido5rxP, 0.20682 XRP → WETH →
+// LAWAS → LTC, tfPartialPayment|tfLimitQuality): rippled's `BookStep::fwdImp`
+// re-prices an offer whose forward output exceeds the reverse pass's cached
+// out (`limitStepOut(cache_->out)`, for a single-path pool `swapAssetOut`),
+// and when the input that requires equals the input provided it consumes
+// that input and produces exactly the cached output — the surplus stays in
+// the pool. The forward swap of the exact reverse input 0.0001165445495622757
+// WETH yields 14360.3597828 LAWAS against the reverse's 14360.35978279596
+// (Number's cancellation in `swapAssetIn` keeps twelve digits); we carried
+// the 4e-9 into the LAWAS/LTC pool and both pools' lines moved.
+#[test]
+fn payment_forward_pool_hop_reanchors_to_the_cached_out_106823210() {
+    run_bundle(include_str!("vectors/payment_forward_pool_hop_reanchors_to_the_cached_out_106823210.json"));
+}
+
+// Finding 210, second specimen — #106823225 1699E047B113 (the same bot,
+// 0.035827 XRP → TWINS → BITx → LTC): one line two ulps off the same way.
+#[test]
+fn payment_forward_pool_hop_reanchors_to_the_cached_out_second_specimen_106823225() {
+    run_bundle(include_str!("vectors/payment_forward_pool_hop_reanchors_to_the_cached_out_second_specimen_106823225.json"));
+}
