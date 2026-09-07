@@ -354,6 +354,34 @@ fn load_nft_pages(state: &mut LedgerState, url: &str, addr: &str, ledger_index: 
     }
 }
 
+/// Load every RippleState an account holds at `ledger_index` via paginated
+/// account_objects(type=state), the way load_nft_pages loads pages.
+fn load_account_states(state: &mut LedgerState, url: &str, addr: &str, ledger_index: u32) {
+    let mut marker: Option<Value> = None;
+    for _ in 0..60 {
+        let mut params = json!({"account": addr, "ledger_index": ledger_index,
+               "type": "state", "limit": 400});
+        if let Some(m) = &marker {
+            params["marker"] = m.clone();
+        }
+        let Some(res) = rpc(url, "account_objects", params) else { return };
+        for obj in res["account_objects"].as_array().into_iter().flatten() {
+            let Some(idx) = obj["index"].as_str() else { continue };
+            let Ok(kb) = hex::decode(idx) else { continue };
+            if kb.len() != 32 { continue; }
+            let mut node = obj.clone();
+            hexify_addresses(&mut node);
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&kb);
+            let _ = state.state_map.insert(Hash256(k), serde_json::to_vec(&node).unwrap_or_default());
+        }
+        marker = res.get("marker").filter(|m| !m.is_null()).cloned();
+        if marker.is_none() {
+            return;
+        }
+    }
+}
+
 /// NFT-page pre-state for the tx types that walk pages: mint/modify/burn need
 /// the owner's chain; accept needs both parties' — the counterparty is only
 /// discoverable through the offer SLE, fetched here (cached) pre-hexify so
@@ -835,6 +863,23 @@ fn native_read_keys(txj: &Value) -> Vec<String> {
                 ) {
                     let currency = currency_code(gcs);
                     keys.push(hex::encode_upper(keylet::ripple_state_key(&acct, &gi2, &currency).0));
+                }
+            }
+            // …and the PAYS-side line: OfferCreate::preclaim's checkAcceptAsset
+            // reads the taker's line for the currency it will RECEIVE when
+            // that issuer sets lsfRequireAuth (no line → tecNO_LINE, line
+            // without the auth bit → tecNO_AUTH). A pure placement never
+            // touches that line either, so meta carries nothing. #106821332
+            // A56150E02425: rGMgDw64 buying USDV (issuer rfffsukW, RequireAuth
+            // set) with a line that mainnet accepted; unhydrated, the native
+            // leg refused tecNO_LINE — green under probe_bundle.
+            if let (Some(acct), Some(pobj)) = (txj["Account"].as_str().and_then(decode_address), p.as_object()) {
+                if let (Some(pi2), Some(pcs)) = (
+                    pobj.get("issuer").and_then(|v| v.as_str()).and_then(decode_issuer),
+                    pobj.get("currency").and_then(|v| v.as_str()),
+                ) {
+                    let currency = currency_code(pcs);
+                    keys.push(hex::encode_upper(keylet::ripple_state_key(&acct, &pi2, &currency).0));
                 }
             }
         }
@@ -1909,6 +1954,19 @@ fn load_amm_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_ind
         let adroot = keylet::owner_dir_key(&aid);
         let k = hex::encode_upper(adroot.0);
         load_object(state, url, &k, ledger_index);
+        // …the WHOLE pool directory and every trust line the pool holds.
+        // fixAMMv1_1's verifyAndAdjustLPTokenBalance asks isOnlyLiquidityProvider,
+        // which walks the pool's owner directory and reads each entry's
+        // RippleState to find another LP's LPToken line; an entry whose
+        // object is unhydrated is skipped as "not an LP". With only the root
+        // and tail pages (and no lines) hydrated, every withdrawer looked
+        // like the SOLE LP, the line-vs-LPTokenBalance snap fired, and the
+        // native leg answered tecAMM_INVALID_TOKENS where mainnet succeeded:
+        // #106816232 D45A17916FD1, #106822082 B857D3D4FF66, #106826178
+        // 88A39967A3E4 (2 of 36 LP lines, 7 of 40 pages hydrated) — all
+        // green under probe_bundle, never receipted by the live shadow.
+        load_owner_dir_chain(state, url, &aid, ledger_index);
+        load_account_states(state, url, amm_acct, ledger_index);
         // …and the pool dir's TAIL page: a withdraw that CREATES a trust
         // line dirAdds into the LAST page of BOTH owners' directories, and
         // an AMM's directory runs to hundreds of pages. #106131297
