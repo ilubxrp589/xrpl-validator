@@ -73,6 +73,19 @@ pub(crate) fn mark_in_limited() {
 pub(crate) fn take_in_limited() -> bool {
     IN_LIMITED.with(|c| c.replace(false))
 }
+// Whether the strand driver already trimmed this pass's remaining OUT to the
+// limit-quality solve (`adjustedRemOut`, StrandFlow.h:664-672) — set per
+// strand try by the payment driver, read by the pool judge so a request it
+// finds ALREADY at the solve's size still counts as adjusted. Finding 223.
+thread_local! {
+    static REM_OUT_TRIMMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+pub(crate) fn set_rem_out_trimmed(v: bool) {
+    REM_OUT_TRIMMED.with(|c| c.set(v));
+}
+fn rem_out_trimmed() -> bool {
+    REM_OUT_TRIMMED.with(|c| c.get())
+}
 // The GROSS input the driver carried into the current hop (before the
 // in-side transfer rate netted it) — `remainingIn` as `BookStep::fwdImp`
 // sees it. `None` for a hop fed by the payment's own spend.
@@ -2224,7 +2237,14 @@ pub(crate) fn consume(
         let mut adjusted = true;
         if !sell && n_cmp(out_req, rem_pays) != Ordering::Less {
             out_req = rem_pays;
-            adjusted = false;
+            // `adjustedRemOut` belongs to the STRAND: when the driver already
+            // trimmed remainingOut to this very solve, the request arrives
+            // equal to it and the forgiveness must survive. Finding 223
+            // (#106831931 202239C6B762, tfPartialPayment+tfLimitQuality
+            // 1106798 XRPS → 1984.11 CNY): the ask trimmed to
+            // 0.09999996787867368 CNY, the fill 1.3e-9 over the limit —
+            // mainnet delivers exactly that, we answered tecPATH_DRY.
+            adjusted = rem_out_trimmed();
         }
         let out_amt = to_amount(out_req, pays_leg.xrp, Rnd::Near);
         if out_amt.0 == 0 {

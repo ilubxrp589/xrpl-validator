@@ -672,3 +672,16 @@ fn payment_hop_zero_gross_cap_is_bounded_by_the_holding_106826590() {
 fn payment_input_driven_last_book_hop_consumes_the_carry_106825938() {
     run_bundle(include_str!("vectors/payment_input_driven_last_book_hop_consumes_the_carry_106825938.json"));
 }
+
+/// Finding 223 (#106831931 202239C6B762): rKLpjpCoXg's tfPartialPayment +
+/// tfLimitQuality self-payment, 1106798 XRPS → 1984.11 CNY through the
+/// XRPS/CNY pool. StrandFlow's limitOut trims the ask to 0.09999996787867368
+/// CNY via the pool's quality function (adjustedRemOut = true), and the fill
+/// lands 1.3e-9 over the limit — inside the 1e-7 forgiveness rippled grants
+/// a TRIMMED request. Our pool judge recomputed the trim, found it equal to
+/// the already-trimmed ask, called it "not adjusted" and refused: tecPATH_DRY
+/// against mainnet's 0.09999996787867368 CNY delivered.
+#[test]
+fn payment_limit_quality_trimmed_ask_keeps_the_forgiveness_106831931() {
+    run_bundle(include_str!("vectors/payment_limit_quality_trimmed_ask_keeps_the_forgiveness_106831931.json"));
+}

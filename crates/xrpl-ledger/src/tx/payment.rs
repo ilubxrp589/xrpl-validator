@@ -3144,6 +3144,7 @@ impl PaymentTransactor {
             // rejects. The trimmed flag also gates the 1e-7 judge forgiveness
             // below, exactly as `adjustedRemOut` does at StrandFlow.h:739-741.
             let mut adjusted_ask = false;
+            crate::tx::amm_swap::set_rem_out_trimmed(false);
             let mut ask_gross = rem_out;
             let mut ask_net = rem_out_net;
             if let Some(t) = thr_me {
@@ -3175,6 +3176,9 @@ impl PaymentTransactor {
             for (pos, &i) in order.iter().enumerate() {
                 let try_snap = sandbox.snapshot();
                 let mut try_fib = amm_fib.clone();
+                // Finding 223: the pool judge must know this pass's ask was
+                // trimmed by the limit solve (StrandFlow's adjustedRemOut).
+                crate::tx::amm_swap::set_rem_out_trimmed(adjusted_ask);
                 // `ammContext.clear()` before every strand execution: the used
                 // flag describes THIS strand's pass, not a failed earlier one.
                 crate::tx::amm_swap::amm_ctx_clear_used();
@@ -3316,6 +3320,7 @@ impl PaymentTransactor {
                 applied_pos = Some(pos);
                 break;
             }
+            crate::tx::amm_swap::set_rem_out_trimmed(false);
             let Some((pick, sin, sout, in_gross, out_net)) = applied else { break };
             // Finding 151: the producing strand and the strands behind it are
             // what the next iteration activates; everything tried before it
