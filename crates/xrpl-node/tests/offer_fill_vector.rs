@@ -1003,3 +1003,18 @@ fn offer_bridge_readmitted_under_single_path_tips_before_it_runs_106804746() {
 fn offer_fib_slice_quality_is_getrate_rounded_106815773() {
     run_bundle(include_str!("vectors/offer_fib_slice_quality_is_getrate_rounded_106815773.json"));
 }
+
+// Finding 208 — #106822626 6648A9506CFC (rLwycuCDDt, tfSell 227.931836 RLUSD
+// for 162.52 XRP while holding 159.3804149074318 RLUSD; two pool slices and
+// two CLOB fills, then the exhausting pool slice): rippled's DirectStepI
+// bounds the taker's in by `balanceHookIOU` = min(live line, original −
+// Σdebits). The walk's remainder is the second figure, 74.92888707773091; the
+// line, adjusted sequentially at sixteen digits, holds …089 (the first
+// adjustment 159.3804149074318 − 27.56231189237938 kept …524 of
+// 131.81810301505242). The CLOB fill already takes the line; the pool turn
+// sized its last slice at the fold's …091 and left the line at −2e-14 where
+// mainnet closes it at exact zero.
+#[test]
+fn offer_pool_turn_is_bounded_by_the_takers_live_line_106822626() {
+    run_bundle(include_str!("vectors/offer_pool_turn_is_bounded_by_the_takers_live_line_106822626.json"));
+}

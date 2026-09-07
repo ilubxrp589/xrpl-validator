@@ -6311,6 +6311,27 @@ pub(crate) fn cross_engine_to_net(
             taker_accs = ((0, 0), (0, 0));
             acc_level = None;
             drained_level.clear();
+            // Finding 208 (#106822626 6648A9506CFC, rLwycuCDDt tfSell 227.93
+            // RLUSD holding 159.3804149074318): rippled's DirectStepI rev pass
+            // bounds the taker's in by `balanceHookIOU` = min(live line,
+            // original − Σdebits). The walk's `rem_gets` is the second figure
+            // (the fold of the spends); the LINE, adjusted sequentially at 16
+            // digits, can sit an ulp under it — 159.3804149074318 −
+            // 27.56231189237938 is 131.81810301505242 and keeps …524, losing
+            // 2e-14. The CLOB fill already takes the line (finding 174); the
+            // pool turn sized its exhausting slice at the fold's
+            // 74.92888707773091 against a line holding …089 and left it at
+            // −2e-14 where mainnet closes it at exact zero. Bound the turn by
+            // the line, and a turn that drains the line ends the walk — every
+            // later rev pass finds the source dry.
+            // The crossing walk only: the offer flow's sizing walks and the
+            // payment engine's hops run this walk in payment mode with a
+            // budget that is not a line the taker holds.
+            let rg_turn = if offer_crossing && pay_in_rate.is_none() { line_bound_gross(sandbox, taker, gets_leg, rem_gets) } else { rem_gets };
+            let line_bound = me_cmp(rg_turn, rem_gets).is_lt();
+            if line_bound && std::env::var("DX_AMM").is_ok() {
+                eprintln!("DX_AMM F208 line-bound rem_gets={rem_gets:?} -> {rg_turn:?}");
+            }
             let (rp, rg, used) = amm_turn(
                 amm_fib.as_deref_mut(), sandbox, a, taker, beneficiary,
                 benef_net.map(|(r, na)| (r, na, ask0)),
@@ -6322,10 +6343,14 @@ pub(crate) fn cross_engine_to_net(
                 // (tfSell|tfIoC, 50M FUZZY, five iterations): the exhausting
                 // pool slice was sized at 14120619.07956684 but the taker's
                 // line was debited the chain's …685 — one ulp high.
-                gets_gross_cap.map(|c| if pay_in_rate.is_none() { rem_gets } else { me_sub(c, in_gross_spent) }), rem_pays, rem_gets,
+                gets_gross_cap.map(|c| if pay_in_rate.is_none() { rg_turn } else { me_sub(c, in_gross_spent) }), rem_pays, rg_turn,
                 pays_leg, gets_leg, threshold, threshold_self, sell, Some(q), pay_in_rate,
                 None,
             );
+            let line_drained = line_bound && used && me_is_zero(rg);
+            // Re-express the turn's remainder against the walk's own budget:
+            // the slice took rg_turn − rg.
+            let rg = if line_bound { me_sub(rem_gets, me_sub(rg_turn, rg)) } else { rg };
             // Finding 159: the slice opens this pass's totals — but only when
             // the level's offers can join the same iteration.
             //
@@ -6406,6 +6431,10 @@ pub(crate) fn cross_engine_to_net(
             } else {
                 rg
             };
+            if line_drained {
+                rem_gets = (0, 0);
+                in_fold_off = true;
+            }
             crossed += used as u32;
             if done(rem_pays, rem_gets) {
                 break 'dirs;
@@ -7535,6 +7564,27 @@ pub(crate) fn cross_engine_to_net(
             taker_accs = ((0, 0), (0, 0));
             acc_level = None;
             drained_level.clear();
+            // Finding 208 (#106822626 6648A9506CFC, rLwycuCDDt tfSell 227.93
+            // RLUSD holding 159.3804149074318): rippled's DirectStepI rev pass
+            // bounds the taker's in by `balanceHookIOU` = min(live line,
+            // original − Σdebits). The walk's `rem_gets` is the second figure
+            // (the fold of the spends); the LINE, adjusted sequentially at 16
+            // digits, can sit an ulp under it — 159.3804149074318 −
+            // 27.56231189237938 is 131.81810301505242 and keeps …524, losing
+            // 2e-14. The CLOB fill already takes the line (finding 174); the
+            // pool turn sized its exhausting slice at the fold's
+            // 74.92888707773091 against a line holding …089 and left it at
+            // −2e-14 where mainnet closes it at exact zero. Bound the turn by
+            // the line, and a turn that drains the line ends the walk — every
+            // later rev pass finds the source dry.
+            // The crossing walk only: the offer flow's sizing walks and the
+            // payment engine's hops run this walk in payment mode with a
+            // budget that is not a line the taker holds.
+            let rg_turn = if offer_crossing && pay_in_rate.is_none() { line_bound_gross(sandbox, taker, gets_leg, rem_gets) } else { rem_gets };
+            let line_bound = me_cmp(rg_turn, rem_gets).is_lt();
+            if line_bound && std::env::var("DX_AMM").is_ok() {
+                eprintln!("DX_AMM F208 line-bound rem_gets={rem_gets:?} -> {rg_turn:?}");
+            }
             let (rp, rg, used) = amm_turn(
                 amm_fib.as_deref_mut(), sandbox, a, taker, beneficiary,
                 benef_net.map(|(r, na)| (r, na, ask0)),
@@ -7546,7 +7596,7 @@ pub(crate) fn cross_engine_to_net(
                 // (tfSell|tfIoC, 50M FUZZY, five iterations): the exhausting
                 // pool slice was sized at 14120619.07956684 but the taker's
                 // line was debited the chain's …685 — one ulp high.
-                gets_gross_cap.map(|c| if pay_in_rate.is_none() { rem_gets } else { me_sub(c, in_gross_spent) }), rem_pays, rem_gets,
+                gets_gross_cap.map(|c| if pay_in_rate.is_none() { rg_turn } else { me_sub(c, in_gross_spent) }), rem_pays, rg_turn,
                 pays_leg, gets_leg, threshold, threshold_self, sell,
                 // A remembered self-offer within the limit is still the tip
                 // rippled's tail pass anchors on (see self_anchor_q above);
@@ -7573,6 +7623,10 @@ pub(crate) fn cross_engine_to_net(
                 pay_in_rate,
                 if crossed == 0 { raw_first_q } else { residual_q },
             );
+            let line_drained = line_bound && used && me_is_zero(rg);
+            // Re-express the turn's remainder against the walk's own budget:
+            // the slice took rg_turn − rg.
+            let rg = if line_bound { me_sub(rem_gets, me_sub(rg_turn, rg)) } else { rg };
             if used {
                 let slice_net = me_sub(rem_gets, rg);
                 let g = match gets_gross_cap {
@@ -7620,6 +7674,10 @@ pub(crate) fn cross_engine_to_net(
             } else {
                 rg
             };
+            if line_drained {
+                rem_gets = (0, 0);
+                in_fold_off = true;
+            }
             crossed += used as u32;
             if !used {
                 break;
