@@ -958,6 +958,8 @@ fn offer_sell_iterates_the_single_path_pool_until_the_limit_rejects_106810920() 
 #[test]
 fn offer_consecutive_self_offers_are_swept_in_the_walking_pass_106806465() {
     run_bundle(include_str!("vectors/offer_consecutive_self_offers_are_swept_in_the_walking_pass_106806465.json"));
+}
+
 // Finding 202 — #106812132 D14C85E904F5 (rnCEEqDnCu, tfSell 1000 XAH → 2 RLUSD,
 // six bridged iterations): rippled's `remainingOut` after every iteration is
 // `outReq − sum(savedOuts)` with the saved outs folded ASCENDING at sixteen
