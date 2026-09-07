@@ -1048,3 +1048,17 @@ fn offer_direct_pool_is_gated_by_its_own_clob_tip_only_106823772() {
 fn offer_bridged_pool_turn_is_bounded_by_the_deferred_line_106823771() {
     run_bundle(include_str!("vectors/offer_bridged_pool_turn_is_bounded_by_the_deferred_line_106823771.json"));
 }
+
+// Finding 213 — #106823807 AE481B5F05C8 (rphatRpwXc, 2099.99934297 USDM for
+// 136.7844 BONSAI with 1899.99940554 USDM in hand, eight direct-pool fib
+// slices): a crossing's remaining in is an STAmount — rippled's `remainingIn`
+// is an IOUAmount and the DirectStep's bound a line balance, both sixteen
+// digits. The bridged crossing's pool turn kept the exact difference: after
+// seven slices 684.77358996884592, eight femto-units under the line's
+// 684.7735899688460, so the deferred bound never engaged, the exhausting
+// slice took the exact figure and the line kept 1e-13 where mainnet closes it
+// at zero.
+#[test]
+fn offer_bridged_pool_slice_remainder_is_sixteen_digits_106823807() {
+    run_bundle(include_str!("vectors/offer_bridged_pool_slice_remainder_is_sixteen_digits_106823807.json"));
+}

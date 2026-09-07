@@ -4051,7 +4051,22 @@ thr={t:?} admits_trunc={} admits_up={}",
                 )
             };
             rem_pays = rp;
-            rem_gets = rg;
+            // Finding 213 (#106823807 AE481B5F05C8, rphatRpwXc, the same offer
+            // with 1899.99940554 USDM in hand, eight direct-pool fib slices):
+            // a crossing's remaining in is an STAmount — rippled's
+            // `remainingIn` is an IOUAmount and the DirectStep's bound a line
+            // balance, both sixteen digits (finding 118 for the book fills).
+            // The pool turn kept the exact difference: after seven slices
+            // 684.77358996884592, eight femto-units UNDER the line's
+            // 684.7735899688460, so the deferred bound (finding 212) never
+            // engaged, the exhausting slice took the exact figure, and the
+            // line — debited its sixteen-digit rounding …459 — kept 1e-13
+            // where mainnet's slice is the line itself and it closes at zero.
+            rem_gets = if used && gets_gross_cap.is_some() {
+                stamount_signed_add(false, rg_before, true, me_sub(rg_before, rg)).1
+            } else {
+                rg
+            };
             out_sum = stamount_signed_add(false, out_sum, false, me_sub(rp_before, rp)).1;
             if !me_is_zero(me_sub(rp_before, rp)) {
                 saved_outs.push(me_sub(rp_before, rp));
