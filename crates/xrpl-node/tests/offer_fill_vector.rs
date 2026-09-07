@@ -917,3 +917,18 @@ fn offer_bridge_leg_reaps_the_unfunded_tip_before_the_pool_106804073() {
 fn offer_sell_exhausting_slice_debits_the_folded_remainder_106804619() {
     run_bundle(include_str!("vectors/offer_sell_exhausting_slice_debits_the_folded_remainder_106804619.json"));
 }
+
+// Finding 197 — #106806079 E6A85AF43436 (rsPrWzpYp5, tfSell 236 USD/RLUSD
+// holding only 23.59578284547195 USD, six iterations through the RLUSD book
+// and the USD/XRP pool): the exhausting fill's gross is bounded by the taker's
+// LINE as the ledger carries it — rippled's DirectStep maxSrcToDst through
+// PaymentSandbox::balanceHookIOU = min(live balance, original − Σdebits) —
+// not the budget's 16-digit fold alone. The fold leaves 9.13174059843837, the
+// line 9.131740598438366; mainnet debits the line figure, the line closes at
+// EXACT ZERO and is deleted (reserve released, both owner directories
+// written). The bridge walk's direct-head arm took the fold verbatim and left
+// the line at −4e-15: not deleted, five objects.
+#[test]
+fn offer_bridge_exhausting_slice_is_bounded_by_the_takers_line_106806079() {
+    run_bundle(include_str!("vectors/offer_bridge_exhausting_slice_is_bounded_by_the_takers_line_106806079.json"));
+}

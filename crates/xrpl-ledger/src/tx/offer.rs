@@ -857,6 +857,29 @@ pub(crate) fn available(sandbox: &Sandbox, id: &[u8; 20], leg: &Leg) -> Me {
     }
 }
 
+/// Finding 197: rippled's DirectStep bounds an iteration's in by the taker's
+/// line AS THE LEDGER CARRIES IT — `maxSrcToDst` read through
+/// `PaymentSandbox::balanceHookIOU` = min(live balance, original − Σdebits)
+/// — so the exhausting slice's verbatim gross remainder (F50/F51: budget −
+/// the 16-digit fold of the spends) can never exceed what the line still
+/// holds after the sequential per-iteration debits. The two chains drift an
+/// ulp apart on a long crossing, and rippled takes the smaller.
+///
+/// #106806079 E6A85AF43436 (rsPrWzpYp5, tfSell 236 USD/RLUSD holding only
+/// 23.59578284547195 USD, six iterations through the RLUSD book and the
+/// USD/XRP pool): the fold leaves 9.13174059843837, the line 9.131740598438366;
+/// mainnet debits the line figure and the line closes at EXACT ZERO and is
+/// deleted (reserve released, both owner directories written). We debited
+/// the fold's …370 and left the line at −4e-15: not deleted, five objects.
+/// `available` already IS balanceHookIOU (finding 165's deferred table).
+fn line_bound_gross(sandbox: &Sandbox, taker: &[u8; 20], leg: &Leg, verb: Me) -> Me {
+    if leg.xrp || taker == &leg.issuer {
+        return verb;
+    }
+    let held = available(sandbox, taker, leg);
+    if me_cmp(held, verb).is_lt() { held } else { verb }
+}
+
 /// The most a payment can land on `dest`'s trust line for `leg` — rippled
 /// `DirectStepI::maxPaymentFlow` (DirectStep.cpp:476-488), the ceiling the
 /// strand's final issuer→dest step imposes. When `dest` already holds the IOU
@@ -4562,6 +4585,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                     price(give)
                 };
                 let mut in_exhausted = false;
+                let mut exhaust_gross: Option<Me> = None;
                 if me_cmp(pay, rem_gets).is_gt() {
                     pay = rem_gets;
                     // Gross-primary on the exhausting fill (F50/F51): the
@@ -4569,10 +4593,15 @@ thr={t:?} admits_trunc={} admits_up={}",
                     if let Some(cap) = gets_gross_cap {
                         let verb = stamount_signed_add(false, cap, true, in_gross_spent).1; // F118: STAmount remainder
                         if !me_is_zero(verb) {
+                            // Finding 197: never more than the taker's line
+                            // still holds (balanceHookIOU) — the debit below
+                            // takes this same figure.
+                            let verb = line_bound_gross(sandbox, taker, gets_leg, verb);
                             pay = match fee_rate {
                                 None => verb,
                                 Some(r) => mul_ratio(verb, 1_000_000_000, r as u128, false),
                             };
+                            exhaust_gross = Some(verb);
                             in_exhausted = true;
                         }
                     }
@@ -4593,7 +4622,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // Charged as ONE debit of the gross, not a net debit plus a fee
                 // adjustment — `move_leg_gross` has the arithmetic.
                 let d_gross = match (in_exhausted, gets_gross_cap) {
-                    (true, Some(cap)) => stamount_signed_add(false, cap, true, in_gross_spent).1,
+                    (true, Some(cap)) => exhaust_gross.unwrap_or(stamount_signed_add(false, cap, true, in_gross_spent).1), // F197
                     _ => gross_in(fee_rate, pay),
                 };
                 in_gross_spent = stamount_signed_add(false, in_gross_spent, false, d_gross).1;
@@ -4898,15 +4927,20 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // whose net is …911 where our net chain carried …912; the pool
                 // then pays 1642 drops, not 1643).
                 let mut in_exhausted = false;
+                let mut exhaust_gross: Option<Me> = None;
                 if me_cmp(gets_in, rem_gets).is_gt() {
                     gets_in = rem_gets;
                     if let Some(cap) = gets_gross_cap {
                         let verb = stamount_signed_add(false, cap, true, in_gross_spent).1; // F118: STAmount remainder
                         if !me_is_zero(verb) {
+                            // Finding 197: bounded by the taker's line (see
+                            // `line_bound_gross`); the debit takes the same figure.
+                            let verb = line_bound_gross(sandbox, taker, gets_leg, verb);
                             gets_in = match fee_rate {
                                 None => verb,
                                 Some(r) => mul_ratio(verb, 1_000_000_000, r as u128, false),
                             };
+                            exhaust_gross = Some(verb);
                             in_exhausted = true;
                         }
                     }
@@ -5057,7 +5091,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // gross budget VERBATIM (F51) — re-grossing its divided net
                 // can land an ulp off the remainder.
                 let a_gross = match (in_exhausted, gets_gross_cap) {
-                    (true, Some(cap)) => stamount_signed_add(false, cap, true, in_gross_spent).1,
+                    (true, Some(cap)) => exhaust_gross.unwrap_or(stamount_signed_add(false, cap, true, in_gross_spent).1), // F197
                     _ => gross_in(fee_rate, gets_in),
                 };
                 in_gross_spent = stamount_signed_add(false, in_gross_spent, false, a_gross).1;
