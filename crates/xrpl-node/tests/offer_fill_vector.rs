@@ -947,3 +947,15 @@ fn offer_bridge_exhausting_slice_is_bounded_by_the_takers_line_106806079() {
 fn offer_sell_iterates_the_single_path_pool_until_the_limit_rejects_106810920() {
     run_bundle(include_str!("vectors/offer_sell_iterates_the_single_path_pool_until_the_limit_rejects_106810920.json"));
 }
+
+// Finding 201 — #106806465 C94E3A3CD3DA (rsRdjxq24y, 9.533549 USD for 6654796
+// drops against its own two XRP asks and the USD/XRP pool): `tryAMM` runs
+// ONCE per pass, at the first tip's quality, and `execOffer` removes a
+// self-offer before it looks at any amount. Pass 1 is the pool slice anchored
+// on the first ask; pass 2 finds the spot already there, removes BOTH asks and
+// runs dry. We removed the first, saw the pool cover the rest at the second's
+// level, and left it — offer, page and OwnerCount.
+#[test]
+fn offer_consecutive_self_offers_are_swept_in_the_walking_pass_106806465() {
+    run_bundle(include_str!("vectors/offer_consecutive_self_offers_are_swept_in_the_walking_pass_106806465.json"));
+}

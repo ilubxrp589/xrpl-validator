@@ -5803,6 +5803,9 @@ pub(crate) fn cross_engine_to_net(
     // The first level always anchors the pool: rippled's single `tryAMM` fires
     // on the first live tip whatever it is, self-offer included.
     let mut prev_level_crossed = true;
+    // Finding 201: the previous level's sweep removed the taker's OWN offer at
+    // its tip — rippled's pass is still walking (see the skip below).
+    let mut prev_level_self_reaped = false;
     // A self-offer SKIPPED without consumption stays the tip of rippled's book
     // until an EXECUTING pass steps onto it (`limitSelfCrossQuality` removes it
     // then; removals apply between flow iterations, StrandFlow.h:694). Every
@@ -5832,6 +5835,8 @@ pub(crate) fn cross_engine_to_net(
     // unfunded", stepped past but not permanently removed.
     let mut drained_level: Drained = Default::default();
     'dirs: for (di, dk) in dirs.clone().into_iter().enumerate() {
+        // Finding 201: set when this level's sweep removes the taker's own offer.
+        let mut level_self_reaped = false;
         let (level_pays_in, level_gets_in) = (rem_pays, rem_gets);
         let q = u64::from_be_bytes(dk.0[24..32].try_into().unwrap_or_default());
         if trailing {
@@ -6008,6 +6013,55 @@ pub(crate) fn cross_engine_to_net(
                     covers && inside
                 });
             if amm_covers_want && offer_crossing && q <= threshold_self {
+                // Finding 201: `tryAMM` runs ONCE per pass, at the FIRST tip's
+                // quality (BookStep::forEachOffer: `if (tryAMM(offers.tip().
+                // quality())) do { execOffer(tip) } while (offers.step())`),
+                // and `execOffer` removes a self-offer before it looks at any
+                // amount (limitSelfCrossQuality). So when the previous level's
+                // tip was the taker's own offer and the sweep removed it, the
+                // same pass steps straight onto THIS level's tip: a self-offer
+                // here is removed too, and no pool offer anchored at this
+                // level ever exists to "cover the want". Only the leading
+                // self-offers go — the first stranger's offer beyond the net
+                // limit ends the pass. #106806465 C94E3A3CD3DA (rsRdjxq24y,
+                // 9.533549 USD for 6654796 drops against its own two XRP asks
+                // and the USD/XRP pool): pass 1 is the pool slice anchored on
+                // the first ask, pass 2 finds the spot already there, removes
+                // both asks and runs dry ("Strand found dry in rev"); we
+                // removed the first, saw the pool cover the rest at the
+                // second's level, and left it — offer, page, OwnerCount.
+                if prev_level_self_reaped {
+                    if let Some(page) = json_at(sandbox, &dk) {
+                        let entries: Vec<String> = page
+                            .get("Indexes")
+                            .and_then(|v| v.as_array())
+                            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                            .unwrap_or_default();
+                        for ent in entries {
+                            let Some(okey) = hex::decode(&ent)
+                                .ok()
+                                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                                .map(xrpl_core::types::Hash256)
+                            else { continue };
+                            let Some(offer) = json_at(sandbox, &okey) else { continue };
+                            if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
+                                continue;
+                            }
+                            let Some(maker) = offer.get("Account").and_then(|v| v.as_str()).and_then(decode20)
+                            else { continue };
+                            if &maker != taker {
+                                break;
+                            }
+                            if std::env::var("DX_WALK").is_ok() {
+                                eprintln!("DX_WALK selfreap (pass walking on) q={q:016x} okey={}", hex::encode(okey.0));
+                            }
+                            delete_maker_offer(sandbox, &okey, &offer, &maker);
+                            stale.push(okey);
+                            level_self_reaped = true;
+                        }
+                    }
+                    prev_level_self_reaped = level_self_reaped;
+                }
                 if std::env::var("DX_WALK").is_ok() {
                     eprintln!("DX_WALK level {q:016x}: anchored pool covers the want — sweep skipped");
                 }
@@ -6059,6 +6113,7 @@ pub(crate) fn cross_engine_to_net(
                             }
                             delete_maker_offer(sandbox, &okey, &offer, &maker);
                             stale.push(okey);
+                            level_self_reaped = true;
                             continue;
                         }
                         if reap_if_dead(
@@ -6373,6 +6428,9 @@ pub(crate) fn cross_engine_to_net(
                     // unconditionally emptied the book and gave tecPATH_DRY.
                     delete_maker_offer(sandbox, &okey, &offer, &maker);
                     stale.push(okey);
+                    // Finding 201: this removal is rippled's `execOffer` on the
+                    // tip after `tryAMM` — the pass walks on to the next level.
+                    level_self_reaped = true;
                     if self_anchor_q.is_none() {
                         self_anchor_q = Some(q);
                     }
@@ -7279,6 +7337,7 @@ pub(crate) fn cross_engine_to_net(
             }
         }
         prev_level_crossed = level_crossed;
+        prev_level_self_reaped = level_self_reaped;
     }
     // Finding 149: a level left through a `break` still gets its re-run.
     reexec_level!();
