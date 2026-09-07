@@ -1385,7 +1385,7 @@ impl PaymentTransactor {
             // hop by what the sender holds NOW — min(live, original − Σdebits)
             // — every iteration; the pot above counts down from SendMax.
             let avail = if i == 0 {
-                let held = ox::available(sandbox, &tx.account, &chain[0]);
+                let held = ox::available(sandbox, &tx.account, chain[0]);
                 if ox::me_cmp(held, avail).is_lt() { held } else { avail }
             } else {
                 avail
@@ -1408,6 +1408,7 @@ impl PaymentTransactor {
                 ox::set_passthrough(pass);
             }
             let _ = crate::tx::amm_swap::take_fwd_excess();
+            let _ = crate::tx::amm_swap::take_in_limited();
             crate::tx::amm_swap::set_fwd_gross_in(hop_rate.map(|_| carry));
             crate::tx::amm_swap::set_sender_hop(i == 0);
                     crate::tx::amm_swap::set_fwd_first(i == 0); // finding 147
@@ -1419,12 +1420,26 @@ impl PaymentTransactor {
                 sandbox, &mut Vec::new(),
             );
             let excess = crate::tx::amm_swap::take_fwd_excess();
+            let in_limited = crate::tx::amm_swap::take_in_limited();
             crate::tx::amm_swap::set_fwd_gross_in(None);
             crate::tx::amm_swap::set_sender_hop(false);
                     crate::tx::amm_swap::set_fwd_first(false);
             // Finding 204: hop 0 spent its whole input — the strand is
             // input-limited and the forward pass drives the rest.
-            if i == 0 && ox::me_is_zero(rs) && n > 2 {
+            // Finding 218 (#106824803 539C94786AED, rnXYxidJfj: 0.05 XRP → CSC →
+            // BITx → RLUSD with a SendMax of exactly the reverse-required
+            // 50000 drops): a strand whose reverse pass finds NOTHING limiting
+            // runs no forward pass at all — `flow()` walks forward only from
+            // the limiting step, and a spend that exactly meets the reverse
+            // in is not limiting (StrandFlow.h: `if (sendMax && strandIn >
+            // sendMax)`) — so the reverse-sized amounts execute verbatim:
+            // one iteration, in 50000, out 0.0702782901285746, the reverse
+            // figure. Hop 0 spending its whole input is forward-driving only
+            // when it also left its reverse want unmet; treating an exact
+            // meet as input-limited re-swapped hops 1 and 2 and Number's
+            // cancellation dropped the tails (…956000 for …956540, …850000
+            // delivered for …857460).
+            if i == 0 && in_limited && n > 2 {
                 fwd_driven = true;
             }
             // Hop 0's input IS the spend leg — `hop_rate` is gated on `i > 0`,

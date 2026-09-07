@@ -631,3 +631,18 @@ fn payment_forward_pool_hop_reanchors_to_the_cached_out_second_specimen_10682322
 fn payment_pot_counts_down_from_sendmax_and_hop_zero_is_bounded_by_the_holding_106824781() {
     run_bundle(include_str!("vectors/payment_pot_counts_down_from_sendmax_and_hop_zero_is_bounded_by_the_holding_106824781.json"));
 }
+
+// Finding 218 — #106824803 539C94786AED (rnXYxidJfj: 0.05 XRP → CSC → BITx
+// → RLUSD, tfPartialPayment|tfLimitQuality with DeliverMin, SendMax of
+// exactly the reverse-required 50000 drops): a strand whose reverse pass finds
+// nothing limiting runs no forward pass — `flow()` walks forward only from
+// the limiting step, and a spend that exactly meets the reverse in is not
+// limiting — so the reverse-sized amounts execute verbatim: one iteration, in
+// 50000, out 0.0702782901285746. Hop 0 spending its whole input is
+// forward-driving only when it also left its reverse want unmet; an exact
+// meet treated as input-limited re-swapped hops 1 and 2 and Number's
+// cancellation dropped the tails, two pool lines an ulp off.
+#[test]
+fn payment_exact_spend_executes_the_reverse_pass_verbatim_106824803() {
+    run_bundle(include_str!("vectors/payment_exact_spend_executes_the_reverse_pass_verbatim_106824803.json"));
+}

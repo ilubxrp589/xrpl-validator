@@ -60,6 +60,19 @@ pub(crate) fn add_fwd_excess(x: Me) {
 pub(crate) fn take_fwd_excess() -> Me {
     FWD_EXCESS.with(|c| c.replace((0, 0)))
 }
+// Finding 218: whether a fill clamped its input to the budget — rippled's
+// strand is "limiting" when the reverse pass asks more input than the strand
+// has, and only then does `flow()` run a forward pass from that step. The
+// driver reads it after hop 0's walk.
+thread_local! {
+    static IN_LIMITED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+pub(crate) fn mark_in_limited() {
+    IN_LIMITED.with(|c| c.set(true));
+}
+pub(crate) fn take_in_limited() -> bool {
+    IN_LIMITED.with(|c| c.replace(false))
+}
 // The GROSS input the driver carried into the current hop (before the
 // in-side transfer rate netted it) — `remainingIn` as `BookStep::fwdImp`
 // sees it. `None` for a hop fed by the payment's own spend.
@@ -1418,6 +1431,7 @@ pub(crate) fn consume_fib(
         take_out = rem_pays;
     }
     if n_cmp(take_in, rem_gets) == Ordering::Greater {
+        mark_in_limited();
         // Finding 186: the in-limited slice is `limitStepIn` →
         // `AMMOffer::limitIn(…, roundUp=false)` → multi-path
         // `Quality::ceilInStrict` → `divRoundStrict(limit, rate, false)`:
@@ -2107,6 +2121,7 @@ pub(crate) fn consume(
         }
     }
     if n_cmp(take_in, rem_gets) == Ordering::Greater {
+        mark_in_limited();
         take_in = rem_gets;
         take_out = swap_asset_in(pool_in, pool_out, take_in, amm.tfee, pays_leg.xrp);
         // Finding 210 (#106823210 813F674F2C38, rapido5rxP, XRP → WETH →
@@ -2221,6 +2236,7 @@ pub(crate) fn consume(
         take_in = in_req;
         take_out = out_amt;
         if n_cmp(take_in, rem_gets) == Ordering::Greater {
+            mark_in_limited();
             // `adjustedRemOut` is settled by limitOut ALONE, before the
             // passes cap the input (StrandFlow.h:664-672): an in-clamped
             // fill whose OUT the limit solve trimmed keeps the 1e-7

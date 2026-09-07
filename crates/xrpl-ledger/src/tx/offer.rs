@@ -7135,6 +7135,7 @@ pub(crate) fn cross_engine_to_net(
                                     Some(r) => {
                                         pay = mul_ratio(verb, 1_000_000_000, r as u128, false);
                                         in_exhausted = true;
+                                        crate::tx::amm_swap::mark_in_limited();
                                     }
                                 }
                             }
@@ -7254,6 +7255,7 @@ pub(crate) fn cross_engine_to_net(
                             }
                             pay = live;
                             bound_gross = Some(live_gross); // finding 174
+                            crate::tx::amm_swap::mark_in_limited();
                         }
                     }
                     give = me_muldiv(pay, (1u128, 0i32), rate_me(q), false);
