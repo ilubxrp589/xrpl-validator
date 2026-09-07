@@ -272,6 +272,39 @@ impl Transactor for AccountDeleteTransactor {
             Ok(v) => v,
             Err(_) => return TxResult::Malformed,
         };
+        // AccountDelete.cpp:256-303, in rippled's order and all BEFORE the
+        // directory walk (an NFT-holding or too-young account answers here
+        // even when its directory also holds obligations):
+        //   (*sle)[~sfMintedNFTokens] != (*sle)[~sfBurnedNFTokens]  → tecHAS_OBLIGATIONS
+        //   any NFTokenPage in [nftokenPageMin, nftokenPageMax]      → tecHAS_OBLIGATIONS
+        //   Sequence + 255 > view.seq()                              → tecTOO_SOON
+        //   FirstNFTokenSequence + MintedNFTokens + 255 > view.seq() → tecTOO_SOON
+        // Finding 222 (#106605216 8A58D560B941): rfbtMnEG holds 15 NFTokenPages
+        // — not owner-directory entries, so the walk below saw nothing and we
+        // deleted an account mainnet keeps (tecHAS_OBLIGATIONS). The optionals
+        // compare as rippled's std::optional does: absent == absent, absent !=
+        // present.
+        let minted = acct.get("MintedNFTokens").and_then(|v| v.as_u64());
+        let burned = acct.get("BurnedNFTokens").and_then(|v| v.as_u64());
+        if minted != burned {
+            return TxResult::HasObligations;
+        }
+        // NFTokenUtils keeps an owner's LAST page at nftokenPageMax for as
+        // long as any page exists, so that one key answers "owns any NFT".
+        let mut page_max = keylet::nftoken_page_key(&tx.account);
+        page_max.0[20..32].fill(0xFF);
+        if sandbox.exists(&page_max) {
+            return TxResult::HasObligations;
+        }
+        let acct_seq = acct["Sequence"].as_u64().unwrap_or(0) as u32;
+        let view_seq = sandbox.base().header.sequence.saturating_add(1);
+        if acct_seq.saturating_add(255) > view_seq {
+            return TxResult::TooSoon;
+        }
+        let first_nft_seq = acct.get("FirstNFTokenSequence").and_then(|v| v.as_u64()).unwrap_or(0);
+        if first_nft_seq.saturating_add(minted.unwrap_or(0)).saturating_add(255) > u64::from(view_seq) {
+            return TxResult::TooSoon;
+        }
 
         // OwnerCount ZERO IS NOT THE SAME AS OWNING NOTHING — and owning
         // SOMETHING is not the same as an obligation. rippled has NO
@@ -355,11 +388,8 @@ impl Transactor for AccountDeleteTransactor {
         // #106800984 6E3A8F3606D0 (rPt8AyBFLR, Sequence 106800728, deleting
         // into rpiydPTiX7 at ledger 106800984 = 106800728 + 256): mainnet
         // deletes the account, we claimed tecNO_PERMISSION.
-        let acct_seq = acct["Sequence"].as_u64().unwrap_or(0) as u32;
-        let view_seq = sandbox.base().header.sequence.saturating_add(1);
-        if acct_seq.saturating_add(255) > view_seq {
-            return TxResult::TooSoon;
-        }
+        // The Sequence rule (finding 189) now runs above the walk, where
+        // rippled has it: tecTOO_SOON is decided before the directory is read.
 
         TxResult::Success
     }

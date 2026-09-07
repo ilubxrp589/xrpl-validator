@@ -116,3 +116,12 @@ fn account_delete_credit_clears_the_destinations_password_spent_flag() {
 fn account_delete_at_the_255_ledger_boundary_106800984() {
     run_bundle(include_str!("vectors/account_delete_at_the_255_ledger_boundary_106800984.json"));
 }
+
+/// Finding 222 (#106605216 8A58D560B941): rfbtMnEG holds 15 NFTokenPages —
+/// not owner-directory entries, so the obligations walk saw nothing and we
+/// deleted an account mainnet keeps. AccountDelete.cpp:264-270 refuses
+/// tecHAS_OBLIGATIONS when any page exists in [nftokenPageMin, nftokenPageMax].
+#[test]
+fn account_delete_refuses_an_nft_holder_106605216() {
+    run_bundle(include_str!("vectors/account_delete_refuses_an_nft_holder_106605216.json"));
+}
