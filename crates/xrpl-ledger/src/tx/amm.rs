@@ -1371,6 +1371,41 @@ fn delete_amm(
 /// (fixCleanup3_2_0) — the vote slots reset to the depositor alone at full
 /// weight, and the pool TradingFee becomes the caller-supplied fee (omitted
 /// when zero, like every SoeDefault).
+/// AMMWithdraw.cpp:568-593 `withdraw()` — once the burn and the ACTUAL
+/// amounts are known, rippled refuses tecAMM_BALANCE, in this order, when
+///   one side of the pool is drained but not the other,
+///   every LP token is burned without draining both sides,
+///   more than the pool holds of either asset would leave.
+/// `out2` is the second asset's actual amount, `None` for a one-asset
+/// withdrawal — and rippled's `std::optional` compares unequal to any
+/// balance, so a one-asset burn of the whole supply always fails the second
+/// rule. Finding 225 (#106833279 26335D58F700: rBs98SrAo2 holds all
+/// 13839233.81652656 LP tokens of the Sketch/YAGA pool and asks for the whole
+/// Sketch side with tfOneAssetWithdrawAll — mainnet tecAMM_BALANCE, we paid
+/// the side out and tore the pool down: twelve objects mainnet never wrote).
+fn withdraw_pool_guards(
+    out1: crate::tx::offer::Me,
+    cur1: crate::tx::offer::Me,
+    out2: Option<crate::tx::offer::Me>,
+    cur2: crate::tx::offer::Me,
+    burn: crate::tx::offer::Me,
+    lpt_total: crate::tx::offer::Me,
+) -> Option<TxResult> {
+    use crate::tx::offer as ox;
+    let eq = |a: ox::Me, b: ox::Me| ox::me_cmp(a, b).is_eq();
+    let out2_eq_cur2 = out2.is_some_and(|o| eq(o, cur2));
+    if (eq(out1, cur1) && !out2_eq_cur2) || (out2_eq_cur2 && !eq(out1, cur1)) {
+        return Some(TxResult::AmmBalance);
+    }
+    if eq(burn, lpt_total) && (!eq(out1, cur1) || !out2_eq_cur2) {
+        return Some(TxResult::AmmBalance);
+    }
+    if ox::me_cmp(out1, cur1).is_gt() || out2.is_some_and(|o| ox::me_cmp(o, cur2).is_gt()) {
+        return Some(TxResult::AmmBalance);
+    }
+    None
+}
+
 fn initialize_fee_auction_vote(
     sandbox: &mut Sandbox,
     amm_key: &xrpl_core::types::Hash256,
@@ -1716,6 +1751,18 @@ impl Transactor for AMMWithdrawTransactor {
                                 sandbox.restore_snapshot(snap);
                                 return TxResult::AmmFailed;
                             }
+                            // Finding 225: the whole supply burned for ONE
+                            // asset never drains both sides — tecAMM_BALANCE.
+                            let other_bal = ["Asset", "Asset2"]
+                                .iter()
+                                .filter_map(|f| tx.fields.get(*f).and_then(asset_leg))
+                                .find(|l| l.cur != leg.cur || l.issuer != leg.issuer)
+                                .map(|l| crate::tx::amm_swap::holds(sandbox, &amm_acct, &l))
+                                .unwrap_or((0, 0));
+                            if let Some(t) = withdraw_pool_guards(out, bal, None, other_bal, lp_bal, total_lp) {
+                                sandbox.restore_snapshot(snap);
+                                return t;
+                            }
                             if out.0 > 0 {
                                 if !withdraw_reserve_ok(sandbox, &tx.account, &leg, pre_fee_xrp) {
                                     sandbox.restore_snapshot(snap);
@@ -1940,18 +1987,51 @@ impl Transactor for AMMWithdrawTransactor {
             }
         }
 
+        let actual = |i: usize, amt0: ox::Me| match (wd_sized, one_asset, single_asset_burn) {
+            (Some((a, _, _)), _, _) if i == 0 => a,
+            (Some((_, b, _)), _, _) => b,
+            (None, Some((a, _)), _) if i == 0 => a,
+            // tfSingleAsset pays what the ADJUSTED tokens are worth.
+            (None, None, Some((a, _))) if i == 0 => a,
+            _ => amt0,
+        };
+        // Finding 225: rippled's `withdraw()` pool-balance guards run on the
+        // ACTUAL amounts of every mode before anything moves (AMMWithdraw.cpp
+        // :568-593) — see `withdraw_pool_guards`.
+        {
+            let field = |i: usize, f: &str| {
+                tx.fields
+                    .get(f)
+                    .and_then(|v| Some((ox::leg_of(v)?, keylet::amount_mant_exp(v)?)))
+                    .map(|(leg, amt0)| (leg, actual(i, amt0)))
+            };
+            if let Some((leg1, amt1)) = field(0, "Amount") {
+                let cur1 = crate::tx::amm_swap::holds(sandbox, &amm_acct, &leg1);
+                let second = field(1, "Amount2");
+                let leg2 = second.as_ref().map(|(l, _)| l.clone()).or_else(|| {
+                    ["Asset", "Asset2"]
+                        .iter()
+                        .filter_map(|f| tx.fields.get(*f).and_then(asset_leg))
+                        .find(|l| l.cur != leg1.cur || l.issuer != leg1.issuer)
+                });
+                let cur2 = leg2.map(|l| crate::tx::amm_swap::holds(sandbox, &amm_acct, &l)).unwrap_or((0, 0));
+                let burn = derived_burn.or(lp_token_in);
+                let lpt_total = ox::json_at(sandbox, &amm_key)
+                    .and_then(|o| o["LPTokenBalance"]["value"].as_str().map(str::to_string))
+                    .and_then(|s| keylet::amount_mant_exp(&serde_json::Value::String(s)));
+                if let (Some(burn), Some(lpt_total)) = (burn, lpt_total) {
+                    if let Some(t) = withdraw_pool_guards(amt1, cur1, second.map(|(_, a)| a), cur2, burn, lpt_total) {
+                        sandbox.restore_snapshot(snap);
+                        return t;
+                    }
+                }
+            }
+        }
         // Move the withdrawn side(s) AMM account → withdrawer.
         for (i, f) in ["Amount", "Amount2"].iter().enumerate() {
             if let Some(v) = tx.fields.get(*f) {
                 if let (Some(leg), Some(amt0)) = (ox::leg_of(v), keylet::amount_mant_exp(v)) {
-                    let amt = match (wd_sized, one_asset, single_asset_burn) {
-                        (Some((a, _, _)), _, _) if i == 0 => a,
-                        (Some((_, b, _)), _, _) => b,
-                        (None, Some((a, _)), _) if i == 0 => a,
-                        // tfSingleAsset pays what the ADJUSTED tokens are worth.
-                        (None, None, Some((a, _))) if i == 0 => a,
-                        _ => amt0,
-                    };
+                    let amt = actual(i, amt0);
                     if amt.0 > 0 {
                         if !withdraw_reserve_ok(sandbox, &tx.account, &leg, pre_fee_xrp) {
                             sandbox.restore_snapshot(snap);
@@ -3140,8 +3220,15 @@ mod tests {
     /// The same key appearing as missing-Deleted AND extra-Modified is the
     /// whole signature. Flags 262144 is easy to misread as tfSingleAsset —
     /// that is 0x00080000, a different transaction entirely.
+    ///
+    /// Finding 225: alice is the SOLE LP here, and rippled's `withdraw()`
+    /// refuses to burn the whole supply for ONE asset (AMMWithdraw.cpp
+    /// :576-583 — every token gone without draining both sides is
+    /// tecAMM_BALANCE; #106833279 26335D58F700 is the mainnet specimen). The
+    /// mainnet cases above had other LPs, so their burn was partial and the
+    /// position emptied; the vector suite carries that shape.
     #[test]
-    fn one_asset_withdraw_all_empties_the_position() {
+    fn one_asset_withdraw_all_by_the_sole_lp_is_refused() {
         let alice = [0x01u8; 20];
         let usd_issuer = [0x02u8; 20];
         let state = make_state(&alice, 200_000_000);
@@ -3182,16 +3269,13 @@ mod tests {
         assert!(sandbox.exists(&lp_line), "alice holds the LPToken line after create");
 
         let xrp_before = xrp_drops(&sandbox, &alice);
-        assert_eq!(AMMWithdrawTransactor.do_apply(&wd, &mut sandbox), TxResult::Success);
+        assert_eq!(AMMWithdrawTransactor.do_apply(&wd, &mut sandbox), TxResult::AmmBalance);
 
         assert!(
-            !sandbox.exists(&lp_line),
-            "tfOneAssetWithdrawAll empties the position, so the LPToken line is torn down",
+            sandbox.exists(&lp_line),
+            "the sole LP keeps the LPToken line: rippled moves nothing",
         );
-        assert!(
-            xrp_drops(&sandbox, &alice) > xrp_before,
-            "and the named side is paid out",
-        );
+        assert_eq!(xrp_drops(&sandbox, &alice), xrp_before, "and nothing is paid out");
     }
 
     /// tfLPToken: the LP names only how many LPTokens to redeem and receives

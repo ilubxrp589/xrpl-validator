@@ -244,3 +244,14 @@ fn amm_withdraw_keeps_a_non_default_lp_line_at_zero_106766906() {
 fn amm_withdraw_lp_tokens_snap_to_the_pool_balance_precision_106782285() {
     run_bundle(include_str!("vectors/amm_withdraw_lp_tokens_snap_to_the_pool_balance_precision_106782285.json"));
 }
+
+/// Finding 225 (#106833279 26335D58F700): rBs98SrAo2 holds every LP token of
+/// the Sketch/YAGA pool and asks for the whole Sketch side with
+/// tfOneAssetWithdrawAll. AMMWithdraw.cpp:568-593 `withdraw()` refuses
+/// tecAMM_BALANCE when all tokens are burned without draining both sides (a
+/// one-asset withdrawal never does); we paid the side out and tore the pool
+/// down — twelve objects mainnet never wrote.
+#[test]
+fn amm_withdraw_refuses_burning_the_supply_for_one_side_106833279() {
+    run_bundle(include_str!("vectors/amm_withdraw_refuses_burning_the_supply_for_one_side_106833279.json"));
+}
