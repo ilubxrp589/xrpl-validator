@@ -537,6 +537,26 @@ impl PaymentTransactor {
             if let Some((a, pin, pout)) = amm {
                 if !ox::me_is_zero(pin) && !ox::me_is_zero(pout) {
                     let cfee = am::n_sub(ONE, am::fee_n(a.tfee), am::Rnd::Near);
+                    // Finding 203 (#106811381 8279411B2B5A and #106815274
+                    // 937E7F418B92, rBf5SF3p3U's tfPartialPayment|tfLimitQuality
+                    // XRP → RLUSD → CNY → XLM): the strand's quality function
+                    // takes a pool's shape at a hop only when rippled's
+                    // `tipOfferQualityF` would — `getAMMOffer(view,
+                    // qualityThreshold(lob))` must yield an offer that beats
+                    // the tip, and for a PAYMENT step `qualityThreshold` is
+                    // the tip itself (`BookPaymentStep::qualityThreshold
+                    // { return lobQuality; }`, BookStep.cpp:320). The
+                    // `qualityThreshold_ > lobQuality → nullopt` override
+                    // that admits the unanchored maxOffer belongs to
+                    // BookOfferCrossingStep alone (:476-481), and a clause
+                    // here compared the STRAND's limit (drops per XLM) with
+                    // the HOP's tip (drops per RLUSD) — unit-blind on a
+                    // multi-hop strand — and so folded the XRP/RLUSD pool's
+                    // slope into the function where rippled folds the CLOB
+                    // tip. The function's spot sat 0.14% low; `limitOut`
+                    // trimmed iteration 2 to 4.297 XLM where rippled's
+                    // 149.1506565923698 filled (57188990 drops → 435.65 XLM
+                    // delivered against our 38153979 → 290.8).
                     let use_amm = match lob {
                         None => true,
                         Some(t) => {
@@ -545,7 +565,7 @@ impl PaymentTransactor {
                                 cfee,
                                 am::Rnd::Near,
                             );
-                            ox::me_cmp(sp, t).is_le() || ox::me_cmp(thr, t).is_lt()
+                            ox::me_cmp(sp, t).is_le()
                         }
                     };
                     if use_amm {

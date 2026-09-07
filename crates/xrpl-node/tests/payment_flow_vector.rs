@@ -548,3 +548,19 @@ fn payment_own_offer_is_funded_by_the_original_xrp_balance_106804064() {
 fn payment_in_limited_pool_slice_delivers_no_more_than_the_want_106807323() {
     run_bundle(include_str!("vectors/payment_in_limited_pool_slice_delivers_no_more_than_the_want_106807323.json"));
 }
+
+// Finding 203 — #106811381 8279411B2B5A (rBf5SF3p3U, tfPartialPayment|
+// tfLimitQuality 250 XRP → 1902.542098 XLM through RLUSD and CNY; #106815274
+// 937E7F418B92 is the same bot again): the strand's quality function takes a
+// pool's shape at a hop only when rippled's `tipOfferQualityF` would — the
+// pool's fee-inclusive spot must beat the tip; a payment step's
+// `qualityThreshold` is the tip itself. A clause compared the STRAND's limit
+// (drops per XLM) with the HOP's tip (drops per RLUSD), unit-blind, and folded
+// the XRP/RLUSD pool's slope in where rippled folds the CLOB tip. The
+// function's spot sat 0.14% low, `limitOut` trimmed iteration 2 to 4.297 XLM
+// where rippled's 149.1506565923698 filled: 57188990 drops → 435.65 XLM on
+// mainnet against our 38153979 → 290.8.
+#[test]
+fn payment_strand_quality_function_takes_the_clob_tip_where_the_pools_spot_misses_it_106811381() {
+    run_bundle(include_str!("vectors/payment_strand_quality_function_takes_the_clob_tip_where_the_pools_spot_misses_it_106811381.json"));
+}
