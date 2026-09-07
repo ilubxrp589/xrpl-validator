@@ -318,6 +318,55 @@ def created_consistent(raw, news):
             return f"extra non-default field {k} (added after creation?)"
     return None
 
+
+# Ledger-object types whose post-image this tx's meta can rebuild, with the
+# UInt64 node fields rippled stores even when zero but the meta omits.
+_META_REBUILD = {
+    "AccountRoot": (),
+    "RippleState": ("LowNode", "HighNode"),
+    "Offer": ("BookNode", "OwnerNode"),
+    "Escrow": ("OwnerNode",),
+    "Check": ("OwnerNode",),
+    "PayChannel": ("OwnerNode",),
+    "Ticket": ("OwnerNode",),
+    "NFTokenOffer": ("OwnerNode", "NFTokenOfferNode"),
+    "DID": ("OwnerNode",),
+    "Credential": ("IssuerNode", "SubjectNode"),
+    "AMM": (),
+}
+
+
+def rebuild_from_meta(kind, node, tx_hash, seq, pre_hex):
+    """The object's post-image after THIS tx, from its meta node — for a key a
+    later tx in the ledger also touches. FinalFields carry the changed fields
+    and the identity; the pre-image supplies what the meta leaves out because
+    it did not change. Directories are not rebuilt (the meta omits Indexes)."""
+    ty = node.get("LedgerEntryType")
+    if ty not in _META_REBUILD:
+        return None
+    fields = node.get("FinalFields") if kind == "ModifiedNode" else node.get("NewFields")
+    if fields is None:
+        return None
+    try:
+        from xrpl.core.binarycodec import decode, encode
+    except ImportError:
+        return None
+    obj = dict(fields)
+    obj["LedgerEntryType"] = ty
+    if kind == "ModifiedNode" and pre_hex:
+        for f, val in decode(pre_hex).items():
+            if f not in obj and f not in ("PreviousTxnID", "PreviousTxnLgrSeq", "index", "LedgerIndex"):
+                obj[f] = val
+    for f in _META_REBUILD[ty]:
+        obj.setdefault(f, "0000000000000000")
+    obj["PreviousTxnID"] = tx_hash
+    obj["PreviousTxnLgrSeq"] = seq
+    try:
+        return encode(obj).upper()
+    except Exception as e:  # noqa: BLE001 — a rebuild we cannot trust is no target
+        print(f"note: meta rebuild of {ty} failed ({e}); target dropped")
+        return None
+
 def main():
     pfx, seq, out = sys.argv[1].upper(), int(sys.argv[2]), sys.argv[3]
     want_targets = [t.upper() for t in sys.argv[4:]]
@@ -363,7 +412,17 @@ def main():
                 continue
             if kind != "DeletedNode" and (not want_targets or li in want_targets):
                 if li in touched_later:
-                    print(f"note: target {li[:16]}… dropped (touched by a LATER tx; post-ledger image is not this tx's)")
+                    # Finding 216's lesson: the ledger image is a later tx's, but
+                    # THIS tx's meta carries the object's post-image — FinalFields
+                    # (plus what the pre-image holds that the meta leaves out)
+                    # or NewFields, threaded to this tx. A pool every later swap
+                    # touches was invisible to every per-tx probe until this.
+                    hx = rebuild_from_meta(kind, v, my_hash, seq, pre.get(li))
+                    if hx:
+                        targets[li] = hx
+                        print(f"note: target {li[:16]}… rebuilt from this tx's meta (touched by a LATER tx)")
+                    else:
+                        print(f"note: target {li[:16]}… dropped (touched by a LATER tx; post-ledger image is not this tx's)")
                     continue
                 r = rpc("ledger_entry", {"index": li, "ledger_index": seq, "binary": True})
                 if r.get("node_binary"):
