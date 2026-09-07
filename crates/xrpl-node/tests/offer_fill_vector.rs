@@ -971,3 +971,19 @@ fn offer_consecutive_self_offers_are_swept_in_the_walking_pass_106806465() {
 fn offer_bridged_walk_folds_its_saved_outs_ascending_106812132() {
     run_bundle(include_str!("vectors/offer_bridged_walk_folds_its_saved_outs_ascending_106812132.json"));
 }
+
+// Finding 205 — #106804746 D1A6CBC75CF3 (rBERMc8i2D, tfSell 2.923 USD for
+// RLUSD while holding 0.0904 USD; the bridge USD → XRP → RLUSD is the only
+// strand once the direct pool's slice misses the limit): the round's
+// admission priced the bridge under multiPath — leg A by its fib slice at the
+// pool's spot, leg B by the RLUSD tip — 0.98698 USD/RLUSD, inside the limit.
+// rippled's next `activateNext` re-prices the lone strand under
+// multiPath=false — leg A by the pool offer ANCHORED on the USD/XRP tip
+// (1.4129e-6 USD/drop) — and the net bound 1.000741 misses the net limit
+// 0.999999: the trace shows that bound computed twice and no rev pass ("All
+// strands dry"), and the whole offer rests. We executed on the multipath bound
+// and filled the 0.09 USD through both pools, resting nothing.
+#[test]
+fn offer_bridge_readmitted_under_single_path_tips_before_it_runs_106804746() {
+    run_bundle(include_str!("vectors/offer_bridge_readmitted_under_single_path_tips_before_it_runs_106804746.json"));
+}

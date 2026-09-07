@@ -4105,7 +4105,54 @@ thr={t:?} admits_trunc={} admits_up={}",
         // rippled never ranks strands on what they realise, it ranks on the
         // bound and then lets the pass prove itself (see the loop below).
         let ub_ok = |q: Option<Me>| q.filter(|v| thr.is_none_or(|t| me_cmp(*v, t).is_le()));
-        let order: &[bool] = match (ub_ok(d_tip).filter(|_| !direct_dry), ub_ok(bq_ub)) {
+        // Finding 205 (#106804746 D1A6CBC75CF3, rBERMc8i2D's tfSell of 2.923 USD
+        // for RLUSD while holding 0.0904): the round's admission priced the
+        // bridge under multiPath — leg A by its fib slice at the pool's spot
+        // (1.3935e-6 USD/drop), leg B by the RLUSD tip — 0.98698 USD/RLUSD,
+        // inside the 1.0015 limit. But once that verdict leaves ONE strand,
+        // rippled's next `activateNext` re-prices it under multiPath=false —
+        // leg A by the pool offer ANCHORED on the USD/XRP tip (67.63 USD →
+        // 47865569 drops, 1.4264e-6) — and 1.0103 misses the limit: the
+        // trace shows that single-path bound computed twice and no rev pass
+        // ("All strands dry"), and the offer rests whole. We executed on the
+        // multipath bound and filled the 0.09 USD through both pools. So a
+        // bridge admitted by its multipath bound is admitted for execution
+        // only if its single-path bound clears the limit too.
+        let bq_adm = if mp_ub && !multi_now && bq_ub.is_some() {
+            let anch = |am: &Option<crate::tx::amm_swap::Amm>,
+                        peek: &Option<(u64, Hash256, serde_json::Value, [u8; 20], Me, Me)>,
+                        out_leg: &Leg, in_leg: &Leg, spot: Option<Me>, book: Option<Me>, unb: bool| -> Option<Me> {
+                match (am, peek) {
+                    (Some(a), Some((q, ..))) if !(threshold_self != 0 && threshold_self < *q) => {
+                        crate::tx::amm_swap::anchored_offer_quality(sandbox, a, out_leg, in_leg, *q)
+                            .map(rate_me)
+                            .or_else(|| single_ub(spot, book, unb))
+                    }
+                    _ => single_ub(spot, book, unb),
+                }
+            };
+            let qa_s = anch(&amm_a, &apeek, &xrp_leg, gets_leg, spot_a, qa_book, a_unb_raw);
+            let qb_s = anch(&amm_b, &bpeek, pays_leg, &xrp_leg, spot_b, qb_book, b_unb_raw);
+            let bq_s = match (qa_s, qb_s) {
+                (Some((am, ae)), Some((bm, be))) => Some(norm16((am * bm, ae + be))),
+                _ => None,
+            };
+            if std::env::var("DX_BRIDGE").is_ok() {
+                eprintln!("DX_BRIDGE single-path re-admission qa_s={qa_s:?} qb_s={qb_s:?} bq_s={bq_s:?} thr={thr:?}");
+            }
+            // rippled composes leg A's in-side transfer rate (`trIn`, the
+            // taker redeems its USD into the book) into the bound and judges
+            // it against the fee-inflated limitQuality; our legs are priced
+            // NET, so the same comparison is net bound against NET limit —
+            // 1.000741 against 0.999999 here, not against the inflated 1.0015.
+            match bq_s {
+                Some(v) if threshold != u64::MAX && me_cmp(v, rate_me(threshold)).is_gt() => None,
+                _ => bq_ub,
+            }
+        } else {
+            bq_ub
+        };
+        let order: &[bool] = match (ub_ok(d_tip).filter(|_| !direct_dry), ub_ok(bq_adm)) {
             (Some(d), Some(b)) => {
                 if me_cmp(d, b).is_le() {
                     &[true, false]
