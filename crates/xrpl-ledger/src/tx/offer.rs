@@ -3336,6 +3336,10 @@ fn cross_bridged(
     // Finding 123 (#106734683 208D914F): rounds after the first take rippled's
     // CURRENT `activateNext` verdict (see `mp_entry` below).
     let mut bridged_round: u32 = 0;
+    // Finding 211: the pool turn was refused by a rival strand's bound this
+    // round / the round is being re-run with the pool admitted by its own tip.
+    let mut pool_bq_blocked = false;
+    let mut pool_unblocked = false;
     // Finding 153: makers drained to zero by a round's fills; the next
     // round's peeks treat their remaining offers as "became unfunded".
     let mut drained_next: Drained = Default::default();
@@ -3344,6 +3348,7 @@ fn cross_bridged(
             break;
         }
         amm_used = false;
+        pool_bq_blocked = false;
         let drained_prev = std::mem::take(&mut drained_next);
         // PEEK both sources (no mutation) to pick the better rate within the
         // threshold; only the chosen source is then walked with mutation, so
@@ -3970,19 +3975,46 @@ thr={t:?} admits_trunc={} admits_up={}",
                 )
                 }
             } else {
-                let best_book = match (dq, bq) {
+                let best_book_ranked = match (dq, bq) {
                     (Some(d), Some(b)) => Some(if me_cmp(d, b).is_le() { d } else { b }),
                     (Some(d), None) => Some(d),
                     (None, Some(b)) => Some(b),
                     (None, None) => None,
                 };
+                // Finding 211 (#106823772 BF4C20293858, rphatRpwXc selling
+                // 2099.99934297 USDM for 136.7844 BONSAI while its USDM line
+                // holds 3e-13; sixteen more of the bot's offers in
+                // #106823771…945): ranking the pool's fib slice against the
+                // best BOOK rate is `flow()` trying the active strands
+                // best-bound first — but a strand that runs and produces
+                // NOTHING does not end the iteration; the next active strand
+                // runs. The AMM offer itself is gated by ITS OWN book's CLOB
+                // tip alone (`AMMLiquidity::getOffer(sb, clobQuality)`,
+                // `tryAMM(lobQuality)`). Here the bridge (the better bound)
+                // turns the dust into zero drops and is dry; rippled runs the
+                // direct USDM/BONSAI pool, sells the 3e-13 for 2e-14 BONSAI —
+                // every other balance absorbs that below its last digit — and
+                // the offer is "crossed": tesSUCCESS, the USDM line closed at
+                // exact zero, nothing placed for want of reserve. Gated on the
+                // bridge's quality the pool was refused, nothing crossed, and
+                // the reserve gate answered tecINSUF_RESERVE_OFFER; the bot's
+                // later offers then found 3e-13 on a line mainnet had emptied.
+                // A round whose candidates all fail while the pool was refused
+                // only by a rival strand's bound is re-run with the pool
+                // admitted by its own tip (see the round's exit).
+                let best_book = if pool_unblocked { dq } else { best_book_ranked };
+                pool_unblocked = false;
                 if std::env::var("DX_AMM").is_ok() {
                     eprintln!("DX_AMM site=bridged best_book={best_book:?}");
                 }
-                pool_offer_this_round = crate::tx::amm_swap::fib_slice(
-                    sandbox, a, *init, amm_iters, pays_leg, gets_leg,
-                )
-                .is_some();
+                let fib = crate::tx::amm_swap::fib_slice(sandbox, a, *init, amm_iters, pays_leg, gets_leg);
+                pool_offer_this_round = fib.is_some();
+                pool_bq_blocked = fib.is_some_and(|(s_in, s_out)| {
+                    let q = crate::tx::amm_swap::slice_rate(s_in, s_out);
+                    best_book.is_some_and(|b| !me_cmp(q, b).is_lt())
+                        && dq.is_none_or(|d| me_cmp(q, d).is_lt())
+                        && (threshold == u64::MAX || !me_cmp(q, rate_me(threshold)).is_gt())
+                });
                 crate::tx::amm_swap::consume_fib(
                     sandbox, a, taker, beneficiary, None, None, rem_pays, rem_gets, pays_leg, gets_leg,
                     threshold, sell, *init, amm_iters, best_book, fee_rate,
@@ -5467,6 +5499,14 @@ had_fill={} n={} keys={:?}",
             amm_used = false;
         }
         if !filled {
+            // Finding 211: every candidate strand produced nothing while the
+            // pool was refused only by a rival's bound — rippled's `flow()`
+            // runs the next active strand. Re-run the round with the pool
+            // admitted by its own book's tip.
+            if pool_bq_blocked && !pool_unblocked {
+                pool_unblocked = true;
+                continue;
+            }
             break;
         }
     }

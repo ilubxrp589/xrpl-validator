@@ -1018,3 +1018,19 @@ fn offer_fib_slice_quality_is_getrate_rounded_106815773() {
 fn offer_pool_turn_is_bounded_by_the_takers_live_line_106822626() {
     run_bundle(include_str!("vectors/offer_pool_turn_is_bounded_by_the_takers_live_line_106822626.json"));
 }
+
+// Finding 211 — #106823772 BF4C20293858 (rphatRpwXc, 2099.99934297 USDM for
+// 136.7844 BONSAI while its USDM line holds 3e-13; sixteen more of the bot's
+// offers in #106823771…945 diverged the same way): an AMM offer is gated by
+// its own book's CLOB tip alone (`AMMLiquidity::getOffer(sb, clobQuality)`),
+// and which strand runs is `flow()`'s business — the direct strand runs
+// whenever the bridge ahead of it is dry. The bridge turns the dust into zero
+// drops; rippled runs the direct USDM/BONSAI pool, sells the 3e-13 for 2e-14
+// BONSAI that every other balance absorbs below its last digit, and the offer
+// is "crossed": tesSUCCESS, the USDM line closed at exact zero, nothing
+// placed for want of reserve. Gated on the bridge's quality we refused the
+// pool, crossed nothing, and answered tecINSUF_RESERVE_OFFER.
+#[test]
+fn offer_direct_pool_is_gated_by_its_own_clob_tip_only_106823772() {
+    run_bundle(include_str!("vectors/offer_direct_pool_is_gated_by_its_own_clob_tip_only_106823772.json"));
+}
