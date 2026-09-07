@@ -535,3 +535,16 @@ fn payment_inter_gateway_tail_keeps_the_strand_active_106800968() {
 fn payment_own_offer_is_funded_by_the_original_xrp_balance_106804064() {
     run_bundle(include_str!("vectors/payment_own_offer_is_funded_by_the_original_xrp_balance_106804064.json"));
 }
+
+// Finding 200 — #106807323 9D5AD40FD56E (rw6khHVtjd, tfPartialPayment 1400 XRP
+// → 33567640.000661 FUZZY, third round through the XRP/FUZZY pool):
+// swapAssetOut(21496358.22437994) asks 897232553 drops, one over the 897232552
+// left, so the pass is in-limited and swapAssetIn yields 21496358.22438000 —
+// 6e-8 over the want. rippled's forward pass never delivers that surplus: the
+// strand's last DirectStep keeps its REVERSE cache when the forward input
+// exceeds it (setCacheLimiting), crediting the want while the pool parts with
+// the whole swap. Mainnet's line lands on …9397072; ours credited …073.
+#[test]
+fn payment_in_limited_pool_slice_delivers_no_more_than_the_want_106807323() {
+    run_bundle(include_str!("vectors/payment_in_limited_pool_slice_delivers_no_more_than_the_want_106807323.json"));
+}

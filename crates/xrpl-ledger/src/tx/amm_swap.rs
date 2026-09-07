@@ -2093,6 +2093,23 @@ pub(crate) fn consume(
     if n_cmp(take_in, rem_gets) == Ordering::Greater {
         take_in = rem_gets;
         take_out = swap_asset_in(pool_in, pool_out, take_in, amm.tfee, pays_leg.xrp);
+        // Finding 200: the in-limited re-swap can land ABOVE the remaining
+        // want, and rippled's forward pass never delivers that surplus —
+        // the strand's last DirectStep keeps its REVERSE cache whenever the
+        // forward input exceeds it (`setCacheLimiting`, finding 170), so
+        // the beneficiary is credited the reverse out — the want — while
+        // the pool parts with the whole swap (the difference is redeemed
+        // against the issuer). Finding 131's sliver branch already did this;
+        // the plain in-limit did not. #106807323 9D5AD40FD56E (rw6khHVtjd,
+        // tfPartialPayment 1400 XRP → 33567640.000661 FUZZY, third round
+        // through the XRP/FUZZY pool): swapAssetOut(21496358.22437994) asks
+        // 897232553 drops, one over the 897232552 left, so the pass is
+        // in-limited and swapAssetIn yields 21496358.22438000 — 6e-8 over
+        // the want. Mainnet's line lands on …9397072 (the want credited);
+        // ours on …073.
+        if !sell && !pays_leg.xrp && n_cmp(take_out, rem_pays) == Ordering::Greater {
+            deliver_cap = Some(rem_pays);
+        }
     }
     // Taker limit handling (rippled StrandFlow limitOut + post-check): the
     // requested OUT is trimmed via the pool's QualityFunction so the fill's
