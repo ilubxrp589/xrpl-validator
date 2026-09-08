@@ -1372,10 +1372,12 @@ fn delete_amm(
 /// weight, and the pool TradingFee becomes the caller-supplied fee (omitted
 /// when zero, like every SoeDefault).
 /// AMMWithdraw.cpp:568-593 `withdraw()` — once the burn and the ACTUAL
-/// amounts are known, rippled refuses tecAMM_BALANCE, in this order, when
-///   one side of the pool is drained but not the other,
-///   every LP token is burned without draining both sides,
-///   more than the pool holds of either asset would leave.
+/// amounts are known, rippled refuses tecAMM_BALANCE, in this order, when:
+///
+/// - one side of the pool is drained but not the other,
+/// - every LP token is burned without draining both sides,
+/// - more than the pool holds of either asset would leave.
+///
 /// `out2` is the second asset's actual amount, `None` for a one-asset
 /// withdrawal — and rippled's `std::optional` compares unequal to any
 /// balance, so a one-asset burn of the whole supply always fails the second
