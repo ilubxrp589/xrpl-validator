@@ -2205,7 +2205,7 @@ impl PaymentTransactor {
     /// issuer-side legs settle implicitly. Insufficient holdings fail the
     /// rippled way: nothing delivered -> tecPATH_DRY, partial short-fall
     /// without tfPartialPayment -> tecPATH_PARTIAL (both fee-only).
-    fn apply_iou_direct(
+    pub(crate) fn apply_iou_direct(
         &self,
         tx: &TxFields,
         sandbox: &mut Sandbox,

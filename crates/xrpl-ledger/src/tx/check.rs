@@ -322,65 +322,140 @@ impl Transactor for CheckCashTransactor {
         // Writer shortfall fails the rippled way: tecPATH_PARTIAL, fee-only.
         use crate::tx::offer as ox;
         let sm_json = check.get("SendMax").cloned().unwrap_or_default();
-        let amt_json = tx.fields.get("Amount")
-            .or(tx.fields.get("DeliverMin"))
+        let deliver_min = tx.fields.get("DeliverMin").cloned();
+        let value_json = tx
+            .fields
+            .get("Amount")
+            .or(deliver_min.as_ref())
             .cloned()
             .unwrap_or_else(|| sm_json.clone());
-        let (Some(leg), Some(want)) = (ox::leg_of(&sm_json), crate::ledger::keylet::amount_mant_exp(&amt_json)) else {
+        let (Some(leg), Some(value)) = (ox::leg_of(&sm_json), crate::ledger::keylet::amount_mant_exp(&value_json)) else {
             return TxResult::Malformed;
         };
-        let cap = crate::ledger::keylet::amount_mant_exp(&sm_json).unwrap_or(want);
-        if ox::me_cmp(want, cap).is_gt() {
-            return TxResult::PathPartial; // asking beyond the check's SendMax
+        let cap = crate::ledger::keylet::amount_mant_exp(&sm_json).unwrap_or(value);
+        // CheckCash::preclaim: `sendMax < value => tecPATH_PARTIAL`.
+        if ox::me_cmp(value, cap).is_gt() {
+            return TxResult::PathPartial;
         }
-        // Cashing an IOU into a line the CASHER doesn't have first requires
-        // the reserve for creating it: `checkReserve` fires BEFORE the flow —
-        // "Trust line does not exist. Insufficient reserve to create line."
-        // ⇒ tecNO_LINE_INSUF_RESERVE (CheckCash.cpp:391-401, preFeeBalance
-        // vs accountReserve(ownerCount + 1)). #106233366 E7419B07: we fell
-        // through to the writer-funds check and said tecPATH_PARTIAL.
-        if !leg.xrp && tx.account != leg.issuer {
-            let line_key = crate::ledger::keylet::ripple_state_key(&tx.account, &leg.issuer, &leg.cur);
-            if !sandbox.exists(&line_key) {
-                let acct_key = crate::ledger::keylet::account_root_key(&tx.account);
-                if let Some(a) = sandbox
-                    .read(&acct_key)
-                    .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
-                {
-                    let oc = a["OwnerCount"].as_u64().unwrap_or(0);
-                    let bal = a["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-                    // do_apply runs post-fee; rippled compares preFeeBalance_.
-                    let pre_fee = bal.saturating_add(tx.fee);
-                    if pre_fee < crate::ledger::fees::account_reserve(sandbox, oc + 1) {
-                        return TxResult::NoLineInsufReserve;
+        // Finding 234 (#106849342 0B8830B868D4): a check is cashed by rippled's
+        // PAYMENT ENGINE, not by a transfer of the requested amount
+        // (CheckCash.cpp:331-577). XRP: `xrpDeliver = DeliverMin ?
+        // max(DeliverMin, min(sendMax, srcLiquid)) : Amount`, refused with
+        // tecUNFUNDED_PAYMENT when the writer's liquid XRP (its own reserve
+        // for the check already released) falls short. IOU: `flow(src ->
+        // casher, deliver = DeliverMin ? max-IOU : Amount, partial =
+        // DeliverMin present, sendMax = the check's SendMax)` with the
+        // casher's trust-line limit lifted to the maximum for the flow's
+        // duration (:495-502, restored :533-540), the line created first
+        // when missing (:436-484, limit 0, NoRipple per DefaultRipple), and
+        // tecPATH_PARTIAL only afterwards when the flow delivered under
+        // DeliverMin (:565-571). So a DeliverMin cash-out takes EVERYTHING
+        // SendMax buys through the issuer, transfer fee included: rhxXuUBjYo
+        // cashes rHKatUKdi's 1 EVR check (ra9g3LAJ, TransferRate 1.002) with
+        // DeliverMin 0.998 — mainnet debits the writer 1 EVR and credits the
+        // casher 0.9980039920159681; we moved 0.998 fee-free, both lines a
+        // byte off.
+        if creator != tx.account {
+            if leg.xrp {
+                let mut liquid = ox::available(sandbox, &creator, &leg);
+                liquid = (liquid.0.saturating_add(ox::XRP_RESERVE_INC), liquid.1);
+                let deliver = if deliver_min.is_some() {
+                    let m = if ox::me_cmp(cap, liquid).is_lt() { cap } else { liquid };
+                    if ox::me_cmp(value, m).is_gt() { value } else { m }
+                } else {
+                    value
+                };
+                if ox::me_cmp(liquid, deliver).is_lt() {
+                    return TxResult::UnfundedPayment;
+                }
+                ox::move_leg(sandbox, &creator, &tx.account, &leg, deliver);
+            } else {
+                let casher = tx.account;
+                let truster = if leg.issuer == casher { creator } else { casher };
+                let line_key = crate::ledger::keylet::ripple_state_key(&truster, &leg.issuer, &leg.cur);
+                if leg.issuer != casher && !sandbox.exists(&line_key) {
+                    let acct_key = crate::ledger::keylet::account_root_key(&casher);
+                    if let Some(a) = sandbox
+                        .read(&acct_key)
+                        .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+                    {
+                        let oc = a["OwnerCount"].as_u64().unwrap_or(0);
+                        let bal = a["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                        // CheckCash.cpp:403-421 `checkReserve(preFeeBalance_, ownerCountDelta 1)`.
+                        let pre_fee = bal.saturating_add(tx.fee);
+                        if pre_fee < crate::ledger::fees::account_reserve(sandbox, oc + 1) {
+                            return TxResult::NoLineInsufReserve;
+                        }
+                    }
+                    // trustCreate: zero balance, limit 0, NoRipple per the casher's DefaultRipple.
+                    ox::line_adjust(sandbox, &casher, &leg, (0, 0), true);
+                }
+                // The casher's limit is lifted to the maximum while the flow runs.
+                let limit_field = if casher < leg.issuer { "LowLimit" } else { "HighLimit" };
+                let saved_limit = if leg.issuer != casher {
+                    ox::json_at(sandbox, &line_key).map(|mut l| {
+                        let old = l[limit_field]["value"].clone();
+                        l[limit_field]["value"] = serde_json::Value::String("9999999999999999e80".to_string());
+                        ox::put_json(sandbox, line_key, &l);
+                        old
+                    })
+                } else {
+                    None
+                };
+                let holding = |sandbox: &Sandbox| -> ox::Me {
+                    let Some(l) = ox::json_at(sandbox, &line_key) else { return (0, 0) };
+                    let (neg, mag) = ox::signed_value(&l["Balance"]);
+                    let truster_low = truster < leg.issuer;
+                    let holds = if truster_low { !neg } else { neg };
+                    if holds && mag.0 > 0 { mag } else { (0, 0) }
+                };
+                let partial = deliver_min.is_some();
+                let flow_amt = if partial {
+                    serde_json::json!({
+                        "currency": value_json["currency"].clone(),
+                        "issuer": value_json["issuer"].clone(),
+                        "value": "4999999999999999e80",
+                    })
+                } else {
+                    value_json.clone()
+                };
+                let synth = TxFields {
+                    account: creator,
+                    tx_type: "Payment".to_string(),
+                    fee: 0,
+                    sequence: 0,
+                    ticket_seq: None,
+                    last_ledger_seq: None,
+                    fields: serde_json::json!({
+                        "Amount": flow_amt.clone(),
+                        "SendMax": sm_json.clone(),
+                        "Flags": if partial { 0x0002_0000u64 } else { 0 },
+                    }),
+                };
+                let before = holding(sandbox);
+                let r = crate::tx::payment::PaymentTransactor.apply_iou_direct(&synth, sandbox, &flow_amt, &casher, partial);
+                if let Some(old) = saved_limit {
+                    if let Some(mut l) = ox::json_at(sandbox, &line_key) {
+                        l[limit_field]["value"] = old;
+                        ox::put_json(sandbox, line_key, &l);
+                    }
+                }
+                if !matches!(r, TxResult::Success) {
+                    return r;
+                }
+                if let Some(dm) = deliver_min.as_ref().and_then(crate::ledger::keylet::amount_mant_exp) {
+                    let after = holding(sandbox);
+                    let delivered = if ox::me_cmp(after, before).is_ge() {
+                        ox::me_sub(after, before)
+                    } else {
+                        ox::me_sub(before, after)
+                    };
+                    if ox::me_cmp(delivered, dm).is_lt() {
+                        return TxResult::PathPartial;
                     }
                 }
             }
         }
-        let mut avail = if creator == leg.issuer { want } else { ox::available(sandbox, &creator, &leg) };
-        // CASHING THE CHECK RELEASES THE CHECK'S OWN RESERVE, and that reserve
-        // counts toward the payment. rippled says so twice:
-        //     if (value.native())
-        //         availableFunds += XRPAmount{ctx.view.fees().increment};
-        //   "src will have one reserve's worth of additional XRP once the check
-        //    is cashed, since the check's reserve will no longer be required"
-        //   (CheckCash.cpp:175-181), and doApply spends it through
-        //   `xrpLiquid(psb, srcId, -1, viewJ)` — "Hence the -1" (:333-339).
-        // XRP ONLY: the test is `value.native()`, since an IOU check's reserve
-        // is not what funds the transfer.
-        //
-        // #106375426 0932105B: the writer holds 60741227 drops at OwnerCount 49,
-        // so a full 10800000 reserve leaves 49941227 against a 50000000 cash —
-        // short by 58773. Release the check's own 200000 and it clears with
-        // 141227 to spare. Mainnet succeeds in 7 nodes; we claimed the fee with
-        // tecPATH_PARTIAL in 3.
-        if leg.xrp && creator != leg.issuer {
-            avail = (avail.0.saturating_add(ox::XRP_RESERVE_INC), avail.1);
-        }
-        if ox::me_cmp(avail, want).is_lt() {
-            return TxResult::PathPartial; // writer cannot cover — fee-only
-        }
-        ox::move_leg(sandbox, &creator, &tx.account, &leg, want);
 
         // Delete the Check and unlink it from BOTH owner directories
         // (writer via OwnerNode, casher/destination via DestinationNode).

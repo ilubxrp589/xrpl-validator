@@ -59,12 +59,33 @@ fn run_bundle(bundle_json: &str) {
     );
 
     for (k, want_hex) in bundle["expect"].as_object().unwrap() {
-        let ent = mods
-            .get(&key32(k))
-            .unwrap_or_else(|| panic!("target {k} must be written by the apply"));
+        // An EMPTY expectation is a deletion pin (finding 158): mainnet's
+        // meta deleted the object in this transaction, so must the apply.
+        let want_deleted = want_hex.as_str().unwrap().trim().is_empty();
+        // An expectation the apply did not write is legitimate only when it
+        // pins an object the transaction must leave ALONE: its post-image is
+        // then its pre-image, and the vector says so by expecting exactly
+        // the seated bytes (finding 143 — the taker's own bid beyond the
+        // ask's limit, which mainnet never names).
+        let Some(ent) = mods.get(&key32(k)) else {
+            assert!(!want_deleted, "target {k} must be deleted by the apply, which never wrote it");
+            let pre_hex = bundle["pre"][k].as_str().unwrap_or_default().trim().to_uppercase();
+            assert_eq!(
+                want_hex.as_str().unwrap().trim().to_uppercase(),
+                pre_hex,
+                "target {k} was not written by the apply and does not pin the untouched pre-image"
+            );
+            continue;
+        };
         let bytes = match ent {
-            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => b.clone(),
-            SandboxEntry::Deleted => panic!("target {k} deleted?"),
+            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => {
+                assert!(!want_deleted, "target {k} must be deleted by the apply, which wrote it instead");
+                b.clone()
+            }
+            SandboxEntry::Deleted => {
+                assert!(want_deleted, "target {k} deleted?");
+                continue;
+            }
         };
         let mut jv: Value = serde_json::from_slice(&bytes).unwrap();
         canon_for_encode(&mut jv);
@@ -105,4 +126,15 @@ fn run_bundle(bundle_json: &str) {
 #[test]
 fn check_cash_of_an_expired_check_is_tec_expired() {
     run_bundle(include_str!("vectors/check_cash_expired_is_tec_expired_106744882.json"));
+}
+
+// Finding 234 — #106849342 0B8830B868D4 (rhxXuUBjYo cashes rHKatUKdi's 1 EVR
+// check, issuer ra9g3LAJ with TransferRate 1.002, DeliverMin 0.998): rippled
+// cashes through the payment engine — the writer pays the whole SendMax
+// through the issuer, fee included, and DeliverMin is only a floor checked
+// afterwards. Mainnet debits 1 EVR and credits the casher's new line
+// 0.9980039920159681; we moved 0.998 fee-free. Both lines byte-pinned.
+#[test]
+fn check_cash_with_deliver_min_takes_everything_send_max_buys_106849342() {
+    run_bundle(include_str!("vectors/check_cash_with_deliver_min_takes_everything_send_max_buys_106849342.json"));
 }
