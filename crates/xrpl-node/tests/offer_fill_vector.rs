@@ -1172,3 +1172,14 @@ fn offer_second_self_offer_within_the_inflated_limit_is_swept_106848591() {
 fn offer_bridge_peek_reaps_only_the_strands_rippled_flows_106848589() {
     run_bundle(include_str!("vectors/offer_bridge_peek_reaps_only_the_strands_rippled_flows_106848589.json"));
 }
+
+/// Finding 236 (#106854857 8430289C4DF6): rNsoJDBYBe sells 1108501.353514
+/// SGB (rctArjqVv, TransferRate 1.003) for XRP with tfSell; four fills and a
+/// pool turn cross 318465.046634136 gross. rippled rests TakerGets less that
+/// total divided ONCE by the gateway rate, rounded up (OfferCreate.cpp
+/// 490-517): 790988.8444071844. Our direct walk folded each fill's net share
+/// and rested …845, one ULP high.
+#[test]
+fn offer_sell_rests_taker_gets_less_the_gross_fold_divided_once_106854857() {
+    run_bundle(include_str!("vectors/offer_sell_rests_taker_gets_less_the_gross_fold_divided_once_106854857.json"));
+}

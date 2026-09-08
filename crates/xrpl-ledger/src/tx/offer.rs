@@ -8137,6 +8137,33 @@ pub(crate) fn cross_engine_to_net(
     // Per-pass taker settlement — AFTER the judge: a rolled-back pass never
     // sees these writes (the snapshot restore above returns without them).
     settle_taker!();
+    // Finding 236 (#106854857 8430289C4DF6): what an OFFER CROSSING rests on
+    // the in side is TakerGets less the crossed amount with the gateway fee
+    // divided back out ONCE — OfferCreate.cpp:490-517, `nonGatewayAmountIn =
+    // divideRound(result.actualAmountIn, gatewayXferRate, roundUp = true)`,
+    // `afterCross.in -= nonGatewayAmountIn` — where `actualAmountIn` is the
+    // sorted-multiset fold of the iterations' GROSS ins (Finding 226). The
+    // walk's running remainder folds each fill's NET share instead, and the
+    // two can disagree by an ULP. rNsoJDBYBe sells 1108501.353514 SGB
+    // (rctArjqVv, TransferRate 1.003) across five iterations — four fills and
+    // a pool turn, 318465.046634136 gross; 318465.046634136 / 1.003 =
+    // 317512.5091068155|5 rounds UP to …156 and mainnet rests
+    // 790988.8444071844, where our per-fill net fold rested …845. The
+    // bridged walk already rests it this way (its tail); the direct walk
+    // did not. Payments keep the walk's remainder — theirs is never rested.
+    if offer_crossing && crossed > 0 && !gets_leg.xrp && !me_is_zero(rem_gets) {
+        let gross = fold16_multiset(&saved_ins);
+        let spent = match pay_in_rate {
+            Some(r) => div_round16_up(gross, (r as u128, -9)),
+            None => gross,
+        };
+        let (neg, v) = stamount_signed_add(false, entry_gets, true, spent);
+        let rested = if neg { (0, 0) } else { v };
+        if std::env::var("DX_PLACE").is_ok() && me_cmp(rested, rem_gets) != std::cmp::Ordering::Equal {
+            eprintln!("DX_PLACE F236 rem_gets {rem_gets:?} -> {rested:?} (gross fold {gross:?}, rate {pay_in_rate:?})");
+        }
+        rem_gets = rested;
+    }
     (rem_pays, rem_gets, crossed, in_gross_spent)
 }
 
