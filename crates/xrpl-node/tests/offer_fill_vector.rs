@@ -1146,3 +1146,17 @@ fn offer_exhausting_fill_debits_the_gross_countdown_106835966() {
 fn offer_walk_reaps_the_expired_head_beyond_the_limit_106845273() {
     run_bundle(include_str!("vectors/offer_walk_reaps_the_expired_head_beyond_the_limit_106845273.json"));
 }
+
+/// Finding 232 (#106848591 85AFE71190C6): rLtCVnojyd sells 0.00378849264 BTC
+/// for 206.4 XRP into a book holding two of its own asks. The pool turns
+/// first at the 4A068493 level (slice quality off the level, iteration ends),
+/// so the next iteration's tip is that same self-offer with the pool now AT
+/// the level: no synthetic, sweep admitted, and rippled removes BOTH
+/// self-offers — the second, 9723F6B9, sits beyond the strict limit but
+/// inside the inflated one (limitSelfCrossQuality). We re-judged the sweep at
+/// the second level, where the anchored synthetic × trIn missed, and left the
+/// offer, its page and one OwnerCount unit behind.
+#[test]
+fn offer_second_self_offer_within_the_inflated_limit_is_swept_106848591() {
+    run_bundle(include_str!("vectors/offer_second_self_offer_within_the_inflated_limit_is_swept_106848591.json"));
+}

@@ -6648,10 +6648,11 @@ pub(crate) fn cross_engine_to_net(
             // `tryAMM` declines ("higher clob quality") and the tip is judged
             // by ITSELF — q120 (#106734370): the 5 XRP tip fill "rejected by
             // limitQuality" after the 99.673705 XRP slice went through.
+            let turn_same_level = used && rate_of_me(me_sub(rem_gets, rg), me_sub(rem_pays, rp)) == Some(q);
             pass_tot = match used {
                 true => {
                     let (si, so) = (me_sub(rem_gets, rg), me_sub(rem_pays, rp));
-                    let same_iteration = rate_of_me(si, so) == Some(q);
+                    let same_iteration = turn_same_level;
                     if std::env::var("DX_AMM").is_ok() {
                         eprintln!(
                             "DX_AMM slice q={:?} level q={q:016x} same_iteration={same_iteration}",
@@ -6707,7 +6708,39 @@ pub(crate) fn cross_engine_to_net(
                 rem_pays = rp;
             }
             if used {
-                sweep_admitted = None;
+                // Finding 232: a pool turn whose slice sits off this level's
+                // quality ends the iteration BEFORE the level's own offers are
+                // reached (`*ofrQ != offer.quality()`), so the next iteration
+                // opens with its tip right HERE, still inside the strict limit
+                // — and Finding 191's rule says the beyond-strict sweep is
+                // judged once, at that tip, on the post-turn pool. Judging it
+                // lazily at the first beyond-strict level instead composes the
+                // anchored synthetic THERE with trIn, which can miss the
+                // inflated limit and refuse a sweep rippled performs.
+                // #106848591 85AFE71190C6 (rLtCVnojyd sells 0.00378849264 BTC
+                // for 206.4 XRP): the pool turns first at the taker's own
+                // 4A068493 level (slice 4A0683F4 ≠ level, iteration ends),
+                // the next iteration's tip is that same self-offer — pool now
+                // AT the level, no synthetic, sweep admitted — and rippled
+                // steps on to remove the second self-offer 9723F6B9 on the
+                // beyond-strict 4A0685AD level (inside the inflated limit,
+                // BookStep.cpp:439 limitSelfCrossQuality). We judged at
+                // 4A0685AD, where the anchored synthetic × trIn failed, and
+                // left the offer, its page and one OwnerCount unit behind.
+                // A same-level slice keeps the iteration going through this
+                // level's offers, so the next tip is a later level and the
+                // lazy judgement there is the right one.
+                sweep_admitted = (!turn_same_level && q <= threshold).then(|| {
+                    let admitted = match crate::tx::amm_swap::anchored_slice(sandbox, a, pays_leg, gets_leg, q) {
+                        Some((si, so)) => rate_of_me(gross_in(pay_in_rate, si), so)
+                            .is_some_and(|ub| ub != 0 && ub <= threshold_self),
+                        None => true,
+                    };
+                    if std::env::var("DX_BOOK").is_ok() {
+                        eprintln!("DX_BOOK F232 post-turn tip stays at {q:016x}: sweep admitted={admitted}");
+                    }
+                    admitted
+                });
             }
             rem_gets = if fold_rem && used && !in_fold_off {
                 stamount_signed_add(false, in_req0, true, fold16(&mut saved_level_ins)).1
