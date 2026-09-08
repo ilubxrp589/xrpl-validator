@@ -696,3 +696,15 @@ fn payment_limit_quality_trimmed_ask_keeps_the_forgiveness_106831931() {
 fn payment_self_payment_keeps_the_lined_terminal_ripple_step_106842419() {
     run_bundle(include_str!("vectors/payment_self_payment_keeps_the_lined_terminal_ripple_step_106842419.json"));
 }
+
+/// Finding 228 (#106842607 DB75971543DE): rPGurZ522z's tfPartialPayment +
+/// tfLimitQuality self-payment CNY.rKiCet8 → USD.rKiCet8 through the pool.
+/// A payment step's qualityThreshold IS the book tip, so rippled anchors the
+/// pool's offer on the tip even though the tip sits beyond the limit and is
+/// never crossed: iteration 0 fills the tip-anchored 0.000280601767372 USD,
+/// iteration 1 is rejected by limitQuality. Our tail turn dropped the anchor
+/// by the offer-crossing rule and consumed the whole trimmed ask.
+#[test]
+fn payment_tail_turn_anchors_on_the_raw_tip_106842607() {
+    run_bundle(include_str!("vectors/payment_tail_turn_anchors_on_the_raw_tip_106842607.json"));
+}

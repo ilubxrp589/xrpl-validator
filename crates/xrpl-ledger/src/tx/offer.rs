@@ -7871,9 +7871,22 @@ pub(crate) fn cross_engine_to_net(
                 // our own anchored peek computed — and rests 120.626295; our
                 // unanchored tail took the max offer, 175.917309 XRP, and rested
                 // 44.382691.
+                // Finding 228: the threshold→nullopt override belongs to
+                // BookOfferCrossingStep alone (BookStep.cpp:476-481); a
+                // PAYMENT step's `qualityThreshold(lob)` IS the lob, so
+                // `tryAMM(offers.tip().quality())` anchors the pool on the
+                // raw tip even when that tip sits beyond limitQuality and is
+                // never crossed. #106842607 DB75971543DE (rPGurZ522z,
+                // tfPartialPayment|tfLimitQuality CNY.rKiCet8 → USD.rKiCet8
+                // through the pool, tip 0.664 a hair past the limit
+                // 0.66399): rippled's iteration 0 is the tip-anchored offer
+                // 0.001862248447319548 CNY → 0.000280601767372 USD and
+                // iteration 1 is rejected by limitQuality; our unanchored
+                // tail consumed the whole trimmed ask, 0.0003725117087328301
+                // USD, and four lines closed off.
                 self_anchor_q
                     .filter(|qs| *qs <= threshold)
-                    .or(residual_q.filter(|q| *q <= threshold_self)),
+                    .or(residual_q.filter(|q| !offer_crossing || *q <= threshold_self)),
                 pay_in_rate,
                 if crossed == 0 { raw_first_q } else { residual_q },
             );
