@@ -7331,6 +7331,20 @@ pub(crate) fn cross_engine_to_net(
                         }
                     }
                     give = me_muldiv(pay, (1u128, 0i32), rate_me(q), false);
+                    // Finding 231: `Quality::ceilIn` derives the output from
+                    // the limited input at the offer's stored rate and then
+                    // CLAMPS it to the offer's own output (Quality.cpp
+                    // ceilInImpl: "if (result.out > amount.out) result.out =
+                    // amount.out") — a rate rounded to sixteen digits can
+                    // otherwise hand out more than the offer holds.
+                    // #106847596 7212BA04A61F (rapido5rxP, RLUSD → CNY → XRP):
+                    // the CNY offer C499497938D8 holds 13.17986826120811 for
+                    // 1.990916655771713; in-limited at 1.990916655771711 the
+                    // rate gives 13.17986826120872 — mainnet's maker parts with
+                    // …811, ours with …872, the line a byte off.
+                    if me_cmp(give, m_gives).is_gt() {
+                        give = m_gives;
+                    }
                     // DX_CLAMP: does a given fill actually REACH this branch?
                     // The 2026-08-08 ceil attempt assumed the twelve one-drop
                     // residuals came from here and regressed two calibrated

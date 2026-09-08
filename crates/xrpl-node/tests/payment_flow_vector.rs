@@ -708,3 +708,15 @@ fn payment_self_payment_keeps_the_lined_terminal_ripple_step_106842419() {
 fn payment_tail_turn_anchors_on_the_raw_tip_106842607() {
     run_bundle(include_str!("vectors/payment_tail_turn_anchors_on_the_raw_tip_106842607.json"));
 }
+
+/// Finding 231 (#106847596 7212BA04A61F): rapido5rxP's self-payment, RLUSD →
+/// CNY.rKiCet8 → XRP, is in-limited on the CNY offer C499497938D8
+/// (13.17986826120811 CNY for 1.990916655771713 RLUSD) with 1.990916655771711
+/// RLUSD to spend. rippled's ceilIn derives the output from the input at the
+/// offer's stored quality, 13.17986826120872, and then CLAMPS it to the
+/// offer's own 13.17986826120811 (Quality.cpp ceilInImpl); we handed the
+/// maker's line the unclamped figure, 61 ulps more than the offer held.
+#[test]
+fn payment_in_limited_fill_clamps_to_the_offers_out_106847596() {
+    run_bundle(include_str!("vectors/payment_in_limited_fill_clamps_to_the_offers_out_106847596.json"));
+}
