@@ -3211,6 +3211,13 @@ fn cross_bridged(
     // finding 173 in the direct walk; a payment keeps the exact remainder.
     let mut saved_outs: Vec<Me> = Vec::new();
     let mut in_gross_spent: Me = (0, 0);
+    // Finding 226: rippled recomputes `remainingIn = sendMax - sum(savedIns)`
+    // after every iteration (StrandFlow.h:745), and `savedIns` is a sorted
+    // multiset — the sixteen-digit fold runs in ASCENDING order, exactly as
+    // finding 202 already does for `savedOuts`. The insertion-order Σ in
+    // `in_gross_spent` can land an ulp away (#106835966 E9F0B9C69653), so
+    // the exhausting fill's verbatim remainder folds this multiset instead.
+    let mut saved_ins: Vec<Me> = Vec::new();
     // Fee-composed judge threshold for CLOB leg-B fills (AMM and
     // taker-owned leg-B offers waive) — crossing_judge_threshold.
     let thr_judge = crossing_judge_threshold(sandbox, pays_leg, gets_leg, taker, threshold);
@@ -4162,6 +4169,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // The slice's GROSS joins the walk's spend (see gets_gross_cap).
                 let slice_net = me_sub(rg_before, rg);
                 in_gross_spent = stamount_signed_add(false, in_gross_spent, false, gross_in(fee_rate, slice_net)).1;
+                saved_ins.push(gross_in(fee_rate, slice_net));
                 amm_iters += 1;
                 // The flow-wide AMMContext counts this iteration too (F107).
                 crate::tx::amm_swap::amm_ctx_walk_iteration();
@@ -4736,6 +4744,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 (rem_pays, rem_gets, crossed, di, ai, bi, amm_iters);
             let (igs0, os0) = (in_gross_spent, out_sum);
             let so0 = saved_outs.len();
+            let si0 = saved_ins.len();
             let st0 = stale.len();
             amm_used = false;
             // (in, out) of this candidate's fill, in the same orientation as
@@ -4886,7 +4895,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                     // Gross-primary on the exhausting fill (F50/F51): the
                     // remaining gross budget verbatim, its division as net.
                     if let Some(cap) = gets_gross_cap {
-                        let verb = stamount_signed_add(false, cap, true, in_gross_spent).1; // F118: STAmount remainder
+                        let verb = rem_from_fold(cap, &saved_ins); // F118: STAmount remainder; F226: sorted-multiset fold
                         if !me_is_zero(verb) {
                             // Finding 197: never more than the taker's line
                             // still holds (balanceHookIOU) — the debit below
@@ -4917,10 +4926,11 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // Charged as ONE debit of the gross, not a net debit plus a fee
                 // adjustment — `move_leg_gross` has the arithmetic.
                 let d_gross = match (in_exhausted, gets_gross_cap) {
-                    (true, Some(cap)) => exhaust_gross.unwrap_or(stamount_signed_add(false, cap, true, in_gross_spent).1), // F197
+                    (true, Some(cap)) => exhaust_gross.unwrap_or(rem_from_fold(cap, &saved_ins)), // F197, F226
                     _ => gross_in(fee_rate, pay),
                 };
                 in_gross_spent = stamount_signed_add(false, in_gross_spent, false, d_gross).1;
+                saved_ins.push(d_gross);
                 out_sum = stamount_signed_add(false, out_sum, false, give).1;
                 let give_gross = owner_gives(d_orate, give, funded, funded_raw);
                 settle_fill(sandbox, &okey, &offer, &maker, taker, beneficiary,
@@ -5226,7 +5236,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 if me_cmp(gets_in, rem_gets).is_gt() {
                     gets_in = rem_gets;
                     if let Some(cap) = gets_gross_cap {
-                        let verb = stamount_signed_add(false, cap, true, in_gross_spent).1; // F118: STAmount remainder
+                        let verb = rem_from_fold(cap, &saved_ins); // F118: STAmount remainder; F226: sorted-multiset fold
                         if !me_is_zero(verb) {
                             // Finding 197: bounded by the taker's line (see
                             // `line_bound_gross`); the debit takes the same figure.
@@ -5386,10 +5396,11 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // gross budget VERBATIM (F51) — re-grossing its divided net
                 // can land an ulp off the remainder.
                 let a_gross = match (in_exhausted, gets_gross_cap) {
-                    (true, Some(cap)) => exhaust_gross.unwrap_or(stamount_signed_add(false, cap, true, in_gross_spent).1), // F197
+                    (true, Some(cap)) => exhaust_gross.unwrap_or(rem_from_fold(cap, &saved_ins)), // F197, F226
                     _ => gross_in(fee_rate, gets_in),
                 };
                 in_gross_spent = stamount_signed_add(false, in_gross_spent, false, a_gross).1;
+                saved_ins.push(a_gross);
                 out_sum = stamount_signed_add(false, out_sum, false, pays_out).1;
                 match (&a_book, &a_fill) {
                     (Some((_, akey, aoffer, amaker, a_gives0, a_wants0)), _) => {
@@ -5632,6 +5643,7 @@ had_fill={} n={} keys={:?}",
             di = di0; ai = ai0; bi = bi0; amm_iters = it0;
             in_gross_spent = igs0; out_sum = os0;
             saved_outs.truncate(so0);
+            saved_ins.truncate(si0);
             amm_used = false;
         }
         if !filled {
@@ -5774,6 +5786,13 @@ pub(crate) fn cross_engine_to_net(
 ) -> (Me, Me, u32, Me) {
     let ask0 = rem_pays;
     let mut in_gross_spent: Me = (0, 0);
+    // Finding 226: rippled recomputes `remainingIn = sendMax - sum(savedIns)`
+    // after every iteration (StrandFlow.h:745), and `savedIns` is a sorted
+    // multiset — the sixteen-digit fold runs in ASCENDING order, exactly as
+    // finding 202 already does for `savedOuts`. The insertion-order Σ in
+    // `in_gross_spent` can land an ulp away (#106835966 E9F0B9C69653), so
+    // the exhausting fill's verbatim remainder folds this multiset instead.
+    let mut saved_ins: Vec<Me> = Vec::new();
     // Finding 133 (#106737559 6001F5CA): rippled's DirectStep caps a
     // redeeming source by `PaymentSandbox::balanceHookIOU` —
     // min(the line as the sandbox carries it, origBalance − Σdebits) — where
@@ -6619,6 +6638,7 @@ pub(crate) fn cross_engine_to_net(
                     _ => gross_in(pay_in_rate, slice_net),
                 };
                 in_gross_spent = stamount_signed_add(false, in_gross_spent, false, g).1;
+                saved_ins.push(g);
                 // Finding 133: a pool slice is its own iteration.
                 outer_debits = stamount_signed_add(false, outer_debits, false, g).1;
             }
@@ -7121,7 +7141,7 @@ pub(crate) fn cross_engine_to_net(
                             // Offer crossing only: finding 81b pinned the payment
                             // walk's remainders EXACT (#106674444).
                             let verb = if offer_crossing {
-                                stamount_signed_add(false, cap, true, in_gross_spent).1
+                                rem_from_fold(cap, &saved_ins) // F226
                             } else {
                                 me_sub(cap, in_gross_spent)
                             };
@@ -7463,6 +7483,7 @@ pub(crate) fn cross_engine_to_net(
                         let g = gross_in(r, pay);
                         move_leg_gross(sandbox, taker, &maker, gets_leg, pay, g);
                         in_gross_spent = stamount_signed_add(false, in_gross_spent, false, g).1;
+                        saved_ins.push(g);
                     } else {
                         // Maker credited the NET per fill; the taker's GROSS
                         // debit accumulates (rippled grosses per offer —
@@ -7473,7 +7494,7 @@ pub(crate) fn cross_engine_to_net(
                         let g = match gets_gross_cap {
                             _ if bound_gross.is_some() => bound_gross.unwrap_or(pay), // finding 174
                             Some(cap) if in_exhausted || !me_cmp(pay, rem_gets).is_lt() => {
-                                let verb = if offer_crossing { stamount_signed_add(false, cap, true, in_gross_spent).1 } else { me_sub(cap, in_gross_spent) }; // F118 (offer crossing only)
+                                let verb = if offer_crossing { rem_from_fold(cap, &saved_ins) } else { me_sub(cap, in_gross_spent) }; // F118, F226 (offer crossing only)
                                 // Unrated in a crossing, `pay` is flow()'s
                                 // folded remainingIn (finding 91); when that is
                                 // the binding limit rippled debits it — the line
@@ -7503,6 +7524,7 @@ pub(crate) fn cross_engine_to_net(
                             g
                         };
                         in_gross_spent = stamount_signed_add(false, in_gross_spent, false, g).1;
+                        saved_ins.push(g);
                         line_adjust(sandbox, &maker, gets_leg, pay, true);
                         taker_accs.1 = stamount_signed_add(false, taker_accs.1, false, g).1;
                     }
@@ -7866,6 +7888,7 @@ pub(crate) fn cross_engine_to_net(
                     _ => gross_in(pay_in_rate, slice_net),
                 };
                 in_gross_spent = stamount_signed_add(false, in_gross_spent, false, g).1;
+                saved_ins.push(g);
                 // Finding 133: a pool slice is its own iteration.
                 outer_debits = stamount_signed_add(false, outer_debits, false, g).1;
             }

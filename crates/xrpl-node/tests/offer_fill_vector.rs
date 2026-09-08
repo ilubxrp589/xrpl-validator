@@ -1125,3 +1125,14 @@ fn offer_sell_crossing_takes_the_pools_whole_swap_106644289() {
 fn offer_bridge_limit_out_carries_the_in_side_transfer_fee_106832069() {
     run_bundle(include_str!("vectors/offer_bridge_limit_out_carries_the_in_side_transfer_fee_106832069.json"));
 }
+
+/// Finding 226 (#106835966 E9F0B9C69653): rNvzmfHiHm's immediate-or-cancel
+/// sell of 10000 RLUSD sweeps sixteen fills. rippled counts `remainingIn`
+/// DOWN one STAmount subtraction per iteration and the exhausting fill debits
+/// that remainder, 585.307869539417; we debited the cap minus the Σ-of-spent
+/// add chain, 585.307869539416, and the taker's RLUSD line closed one ulp
+/// high (…739 for …738).
+#[test]
+fn offer_exhausting_fill_debits_the_gross_countdown_106835966() {
+    run_bundle(include_str!("vectors/offer_exhausting_fill_debits_the_gross_countdown_106835966.json"));
+}
