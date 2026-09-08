@@ -3532,9 +3532,16 @@ fn cross_bridged(
             .map(|(q, _)| rate_me(*q));
         // Finding 153: the peeks model the PREVIOUS iteration's trailing
         // stream steps, so a maker that iteration drained is "became unfunded".
-        let dpeek = live_head(sandbox, &ld, &mut di, taker, pays_leg, gets_leg, false, peek_rm, stale, None, Some(&drained_prev), false);
-        let apeek = live_head(sandbox, &la, &mut ai, taker, &xrp_leg, gets_leg, false, peek_rm, stale, None, Some(&drained_prev), true);
-        let bpeek = live_head(sandbox, &lb, &mut bi, taker, pays_leg, &xrp_leg, false, peek_rm, stale, None, Some(&drained_prev), true);
+        // Finding 233: the peeks themselves never reap. rippled removes the
+        // dead offers a stream steps past only in a strand it FLOWS this
+        // iteration, and a strand is flowed only when its quality upper bound
+        // (raw tips and pools, StrandFlow.h `qualityUpperBound < limitQuality
+        // => continue`) is inside the limit — a fill on the OTHER strand says
+        // nothing about that. The reaping moves below, once the strands this
+        // round flows are known.
+        let dpeek = live_head(sandbox, &ld, &mut di, taker, pays_leg, gets_leg, false, false, stale, None, Some(&drained_prev), false);
+        let apeek = live_head(sandbox, &la, &mut ai, taker, &xrp_leg, gets_leg, false, false, stale, None, Some(&drained_prev), true);
+        let bpeek = live_head(sandbox, &lb, &mut bi, taker, pays_leg, &xrp_leg, false, false, stale, None, Some(&drained_prev), true);
         let a_fib = amm_a.as_ref().and_then(|am| {
             crate::tx::amm_swap::fib_slice(sandbox, am, amm_a_init, amm_iters, &xrp_leg, gets_leg)
                 .map(|s| (crate::tx::amm_swap::slice_rate(s.0, s.1), s))
@@ -4383,6 +4390,43 @@ thr={t:?} admits_trunc={} admits_up={}",
             // them all and the flow ends — "All strands dry".
             (None, None) => break,
         };
+        // Finding 233 (#106848589 CE3A4ED69A26): rsPrWzpYp5 buys 1026.35
+        // USD.rKiCet8 with RLUSD it only holds 102.7 of. The direct book
+        // fills twice; the RLUSD→XRP→USD bridge is never flowed — its upper
+        // bound (pool spot 6.9875e5 × leg a) is 1.0110 against a 1.0005
+        // limit — yet after the first fill our bridge peeks reaped the
+        // EXPIRED raw tip of the XRP/USD leg (rGSooBxy's BB79E605, exp
+        // 842198336 ≤ parent close 842198531): offer, book page, owner-dir
+        // entry and one OwnerCount unit that mainnet leaves alone, since
+        // rippled's stream never stepped there. A strand rippled flows this
+        // round DOES reap what its stream passes, even when its liquidity is
+        // not taken (#106093637 1BE79D4A) — so reap here for exactly those:
+        // a strand this round admits, or one whose RAW tip (dead or not —
+        // `BookTip::step` reads the first directory entry as it stands) sits
+        // inside the limit, which is what `qualityUpperBound` sees.
+        if peek_rm {
+            let raw_q = |l: &[(u64, Hash256)], i: usize| l.get(i).map(|(q, _)| rate_me(*q));
+            let raw_bridge = match (raw_q(&la, ai), raw_q(&lb, bi)) {
+                (Some((am, ae)), Some((bm, be))) => Some(norm16((am * bm, ae + be))),
+                _ => None,
+            };
+            let flows_direct = !direct_dry && direct_alive
+                && (order.contains(&true) || ub_ok(raw_q(&ld, di)).is_some());
+            let flows_bridge = bridge_alive
+                && (order.contains(&false) || ub_ok(raw_bridge).is_some());
+            if std::env::var("DX_BRIDGE").is_ok() {
+                eprintln!("DX_BRIDGE F233 reap gate: direct={flows_direct} bridge={flows_bridge} raw_d={:?} raw_bridge={raw_bridge:?}", raw_q(&ld, di));
+            }
+            if flows_direct {
+                let mut i = di;
+                let _ = live_head(sandbox, &ld, &mut i, taker, pays_leg, gets_leg, false, true, stale, None, Some(&drained_prev), false);
+            }
+            if flows_bridge {
+                let (mut i, mut j) = (ai, bi);
+                let _ = live_head(sandbox, &la, &mut i, taker, &xrp_leg, gets_leg, false, true, stale, None, Some(&drained_prev), true);
+                let _ = live_head(sandbox, &lb, &mut j, taker, pays_leg, &xrp_leg, false, true, stale, None, Some(&drained_prev), true);
+            }
+        }
         if std::env::var("DX_BRIDGE").is_ok() {
             eprintln!("DX_EST direct={est_direct:?} bridge={est_bridge:?} thr={threshold} order={order:?}");
             eprintln!("DX_BRIDGE dq={dq:?} bq={bq:?} bq_ub={bq_ub:?} thr={thr:?} order={order:?} di={di} ai={ai} bi={bi} ld={} la={} lb={}", ld.len(), la.len(), lb.len());

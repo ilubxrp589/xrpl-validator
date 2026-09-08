@@ -1160,3 +1160,15 @@ fn offer_walk_reaps_the_expired_head_beyond_the_limit_106845273() {
 fn offer_second_self_offer_within_the_inflated_limit_is_swept_106848591() {
     run_bundle(include_str!("vectors/offer_second_self_offer_within_the_inflated_limit_is_swept_106848591.json"));
 }
+
+/// Finding 233 (#106848589 CE3A4ED69A26): rsPrWzpYp5 buys 1026.35 USD.rKiCet8
+/// with RLUSD it holds 102.7 of; the direct book fills twice and the
+/// RLUSD→XRP→USD bridge is never flowed (its upper bound misses the limit).
+/// After the first fill our bridge peeks reaped the EXPIRED raw tip of the
+/// XRP/USD leg — rGSooBxy's BB79E605, its book page, owner-directory entry
+/// and OwnerCount unit — which rippled's stream never stepped onto. The
+/// four keys are pinned as untouched.
+#[test]
+fn offer_bridge_peek_reaps_only_the_strands_rippled_flows_106848589() {
+    run_bundle(include_str!("vectors/offer_bridge_peek_reaps_only_the_strands_rippled_flows_106848589.json"));
+}
