@@ -685,3 +685,14 @@ fn payment_input_driven_last_book_hop_consumes_the_carry_106825938() {
 fn payment_limit_quality_trimmed_ask_keeps_the_forgiveness_106831931() {
     run_bundle(include_str!("vectors/payment_limit_quality_trimmed_ask_keeps_the_forgiveness_106831931.json"));
 }
+
+/// Finding 227 (#106842419 9450A8A0F31A): rHgg35915, the CNY gateway, pays
+/// ITSELF 4000 CNY/rHgg for XRP over [CNY/rKiCet8, rKiCet8]. The destination
+/// is the deliver issuer, so toStrand appends no issuer hop and the strand
+/// ends with DirectStepI(rKiCet8 → rHgg) — kept because that trust line
+/// exists. Mainnet buys 4000 CNY.rKiCet8 into rHgg's line; we dropped the path
+/// by shape and refused tecPATH_PARTIAL.
+#[test]
+fn payment_self_payment_keeps_the_lined_terminal_ripple_step_106842419() {
+    run_bundle(include_str!("vectors/payment_self_payment_keeps_the_lined_terminal_ripple_step_106842419.json"));
+}

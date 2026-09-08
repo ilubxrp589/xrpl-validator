@@ -2845,19 +2845,48 @@ impl PaymentTransactor {
             // The delivered currency already in hand under another issuer is a
             // gateway-to-gateway ripple, not a book — rippled drops the path.
             if !names_delivery && Self::terminal_is_ripple_step(&chain) {
-                if std::env::var("DX_PAY").is_ok() {
-                    eprintln!(
-                        "DX_PAY terminal ripple step {} -> {}: path dropped (needs inter-gateway line)",
-                        hex::encode_upper(chain[chain.len() - 2].issuer),
-                        hex::encode_upper(chain[chain.len() - 1].issuer));
+                // Finding 227: when the DESTINATION itself is the deliver
+                // issuer, toStrand appends no issuer hop (PaySteps.cpp:308-313)
+                // and the strand ends with DirectStepI(lastIssuer → dst) — a
+                // plain trust-line step rippled KEEPS whenever that line
+                // exists (DirectStepI::check refuses only a missing one). The
+                // delivered asset is then the last hop's issue, credited to
+                // dst's line with it. #106842419 9450A8A0 (rHgg35915, the CNY
+                // gateway, paying ITSELF 4000 CNY/rHgg for XRP over
+                // [CNY/rKiCet8, rKiCet8]): mainnet buys 4000 CNY.rKiCet8 into
+                // rHgg's line (−4.89 → 3995.1) through a dry default strand
+                // and this one; we dropped the path by shape and answered
+                // tecPATH_PARTIAL. The two-gateway shape (deliver issuer ≠
+                // dst) still drops: no specimen delivers across it yet.
+                let n = chain.len();
+                let last = chain[n - 2];
+                let lined = want_leg.issuer == *dest
+                    && sandbox.exists(&keylet::ripple_state_key(&last.issuer, dest, &last.cur));
+                if lined {
+                    chain.pop();
+                    if std::env::var("DX_PAY").is_ok() {
+                        eprintln!(
+                            "DX_PAY terminal ripple step {} -> dst: lined, strand delivers {}/{}",
+                            hex::encode_upper(last.issuer),
+                            hex::encode_upper(last.cur),
+                            hex::encode_upper(last.issuer));
+                    }
+                } else {
+                    if std::env::var("DX_PAY").is_ok() {
+                        eprintln!(
+                            "DX_PAY terminal ripple step {} -> {}: path dropped (needs inter-gateway line)",
+                            hex::encode_upper(chain[chain.len() - 2].issuer),
+                            hex::encode_upper(chain[chain.len() - 1].issuer));
+                    }
+                    continue;
                 }
-                continue;
             }
             // A named path that collapses to [spend, want] IS the default path,
             // so the block below must not add it a second time. #106156904's
             // path 0 is exactly that: a bare [SOL] element on a USDT->SOL
-            // payment.
-            if chain.len() == 2 {
+            // payment. (A finding-227 strand trimmed to [spend, lastIssue] is
+            // NOT the default: its last leg is not the want.)
+            if chain.len() == 2 && chain.last().is_some_and(|l| same(l, &want_leg)) {
                 have_direct = true;
             }
             // Two named paths can also collapse onto each other once the
