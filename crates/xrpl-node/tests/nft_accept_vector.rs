@@ -218,3 +218,14 @@ fn nft_burn_by_a_stranger_needs_a_burnable_token() {
 fn nftoken_create_offer_with_a_past_expiration_is_refused() {
     run_bundle(include_str!("vectors/nftoken_create_offer_with_a_past_expiration_is_refused_106793245.json"));
 }
+
+/// Finding 235 (#106850559 CF28C7C9E016): rwM46RCWpQ bids 10 NOIR.rhdbs6zj
+/// for rQNUjxkQ's NFT while its NOIR line holds 0. rippled's
+/// tokenOfferCreatePreclaim refuses with tecUNFUNDED_OFFER
+/// (accountFunds(acct, amount).signum() <= 0); our preclaim had no funds
+/// check at all and rested the offer, its directory page and an OwnerCount
+/// unit.
+#[test]
+fn nft_buy_offer_from_an_unfunded_buyer_is_tec_unfunded_offer_106850559() {
+    run_bundle(include_str!("vectors/nft_buy_offer_from_an_unfunded_buyer_is_tec_unfunded_offer_106850559.json"));
+}
