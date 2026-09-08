@@ -2379,6 +2379,24 @@ fn live_head(
             i += 1;
             continue;
         };
+        // Finding 230: OfferStream::step removes an EXPIRED offer before any
+        // self-cross or quality logic ever sees it (OfferStream.cpp:192,
+        // "Removing expired offer"), whoever owns it and wherever it sits
+        // against the limit. The self-offer branch below stops the step on a
+        // self-offer beyond the limit — right for a LIVE one, but it used to
+        // catch the taker's own expired offer first and leave it standing.
+        // #106845273 ED647CC0C250: rKVBZwTWcN's expired 9E5F5669 at the level
+        // past its limit — mainnet reaps offer and page (OwnerCount 5 → 4).
+        if let Some(exp) = offer.get("Expiration").and_then(|v| v.as_u64()) {
+            if exp != 0 && sandbox.base().header.close_time as u64 >= exp {
+                if mutate_dead {
+                    delete_maker_offer(sandbox, &okey, &offer, &maker);
+                    stale.push(okey);
+                }
+                i += 1;
+                continue;
+            }
+        }
         if &maker == taker && !self_is_maker {
             // Finding 143 (#106742126, rMsXVzCug7 quoting both sides of
             // BTC/RLUSD): a bid at 82,090 RLUSD/BTC meets the taker's own
@@ -4983,6 +5001,21 @@ thr={t:?} admits_trunc={} admits_up={}",
                 }
                 crossed += 1;
                 fill = Some((pay, give));
+                // Finding 230: when a fully consumed fill leaves the pass
+                // wanting, rippled's stream STEPS ON inside the same pass,
+                // reaping every dead offer it passes until the next live one
+                // (which execOffer's checkQualityThreshold then judges). The
+                // next round's peek is read-only, so step here.
+                let consumed_now =
+                    me_cmp(give, gives0).is_ge() || me_is_zero(available(sandbox, &maker, pays_leg));
+                if consumed_now && !done(rem_pays, rem_gets) {
+                    let mut dn = di + 1;
+                    let _ = live_head(
+                        sandbox, &ld, &mut dn, taker, pays_leg, gets_leg, false, true, stale,
+                        (threshold_self != 0 && threshold_self != u64::MAX).then_some(threshold_self),
+                        Some(&drained_next), false,
+                    );
+                }
             } else {
                 // Resolve each leg's source: book maker offer or that pair's
                 // pool fib slice. A-side capacity/rate in (XRP-out, gets-in),

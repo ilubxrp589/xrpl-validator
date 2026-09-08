@@ -1136,3 +1136,13 @@ fn offer_bridge_limit_out_carries_the_in_side_transfer_fee_106832069() {
 fn offer_exhausting_fill_debits_the_gross_countdown_106835966() {
     run_bundle(include_str!("vectors/offer_exhausting_fill_debits_the_gross_countdown_106835966.json"));
 }
+
+/// Finding 230 (#106845273 ED647CC0C250): rKVBZwTWcN sells 968 XLM for USD;
+/// after one fill the next level, beyond the taker's limit, holds the taker's
+/// own EXPIRED offer 9E5F5669. rippled's offer stream reaps it on contact
+/// before the quality check stops the walk (offer and page deleted,
+/// OwnerCount 5 → 4); our walk skipped the inactive level unreaped.
+#[test]
+fn offer_walk_reaps_the_expired_head_beyond_the_limit_106845273() {
+    run_bundle(include_str!("vectors/offer_walk_reaps_the_expired_head_beyond_the_limit_106845273.json"));
+}
