@@ -34,7 +34,6 @@ const SPACE_ESCROW: [u8; 2] = [0x00, 0x75];       // 'u'
 const SPACE_PAY_CHANNEL: [u8; 2] = [0x00, 0x78];  // 'x'
 const SPACE_CHECK: [u8; 2] = [0x00, 0x43];        // 'C'
 const SPACE_DEPOSIT_PREAUTH: [u8; 2] = [0x00, 0x70]; // 'p'
-const SPACE_NFTOKEN_PAGE: [u8; 2] = [0x00, 0x50]; // 'P'
 
 /// Compute the state tree key for an AccountRoot.
 /// `key = SHA512Half(0x0061 || account_id)`
@@ -469,19 +468,21 @@ pub fn deposit_preauth_key(account_id: &[u8; 20], authorized: &[u8; 20]) -> Hash
     sha512_half(&buf)
 }
 
-/// Compute the base state tree key for an NFTokenPage.
+/// The base (minimum) key of an account's NFTokenPage range — rippled's
+/// `keylet::nftokenPageMin(owner)` (Indexes.cpp:418-423): the OWNER'S 20
+/// ACCOUNT BYTES followed by twelve zero bytes, no hashing at all. A page for
+/// a token is `(base & ~pageMask) + (tokenID & pageMask)` and the owner's last
+/// page always sits at `nftokenPageMax` = owner || 0xFF×12.
 ///
-/// The correct rippled formula is: `SHA512Half(0x0050 || account_id)`, then
-/// the low 96 bits are cleared to produce the base key. For finding a specific
-/// page, the token_id's low 96 bits are OR'd into the base key — but since we
-/// don't do page lookups yet, this function returns the base key only.
+/// Finding 229 (#106845267 43503777EEED): this used to hash
+/// `0x0050 || account` the way `indexHash` keylets do, so the AccountDelete
+/// NFT-holder check (finding 222) probed a key no page ever has and
+/// rBCiWdCH5x — one NFTokenPage, no minted tokens — was deleted where mainnet
+/// answered tecHAS_OBLIGATIONS. Finding 222's own specimen passed only because
+/// that issuer also failed the minted≠burned rule.
 pub fn nftoken_page_key(account_id: &[u8; 20]) -> Hash256 {
-    let mut buf = [0u8; 22];
-    buf[..2].copy_from_slice(&SPACE_NFTOKEN_PAGE);
-    buf[2..22].copy_from_slice(account_id);
-    let mut key = sha512_half(&buf);
-    // Clear the low 96 bits (12 bytes) — bytes 20..32
-    key.0[20..32].fill(0);
+    let mut key = Hash256([0u8; 32]);
+    key.0[..20].copy_from_slice(account_id);
     key
 }
 

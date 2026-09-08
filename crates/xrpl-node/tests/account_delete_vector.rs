@@ -125,3 +125,13 @@ fn account_delete_at_the_255_ledger_boundary_106800984() {
 fn account_delete_refuses_an_nft_holder_106605216() {
     run_bundle(include_str!("vectors/account_delete_refuses_an_nft_holder_106605216.json"));
 }
+
+/// Finding 229 (#106845267 43503777EEED): rBCiWdCH5x holds exactly one NFT
+/// on one NFTokenPage and minted none. rippled's page keylets are the owner's
+/// raw account bytes (Indexes.cpp:418-431); ours hashed them, so the
+/// finding-222 holder check probed a key no page has and we deleted an
+/// account mainnet keeps (tecHAS_OBLIGATIONS).
+#[test]
+fn account_delete_refuses_a_holder_of_one_nft_106845267() {
+    run_bundle(include_str!("vectors/account_delete_refuses_a_holder_of_one_nft_106845267.json"));
+}
