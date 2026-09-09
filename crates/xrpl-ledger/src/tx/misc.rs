@@ -408,7 +408,23 @@ impl Transactor for DepositPreauthTransactor {
                 .ok()
                 .and_then(|o| o.get("OwnerNode").and_then(|v| v.as_str()).map(String::from))
                 .and_then(|s| u64::from_str_radix(&s, 16).ok());
-            crate::ledger::directory::owner_dir_remove(sandbox, &tx.account, &dp_key, hint, true);
+            // Finding 242 (#106869297 307EE2842F54): rippled unlinks a
+            // DepositPreauth with keepRoot FALSE —
+            // `view.dirRemove(keylet::ownerDir(account), page, preauthIndex,
+            // false)` (DepositPreauth.cpp:283) — so an owner directory the
+            // unauthorize empties loses its ROOT page too. We passed true and
+            // left the emptied root behind: rnkdphV8uZ unauthorizes its only
+            // preauth, mainnet deletes the object, the root page B5675724 and
+            // takes OwnerCount 1 -> 0; we kept the page.
+            //
+            // Audited against every dirRemove in rippled 3.3.0: this is the
+            // ONLY site where we disagreed. Tickets (Transactor.cpp:826),
+            // CheckCancel (:79/:89), CheckCash (:586/:596), EscrowFinish
+            // (:322/:334/:390), EscrowCancel (:145/:157/:202), OracleDelete
+            // (:62), PaymentChannelHelpers (:31) and DIDDelete (:41) all keep
+            // the root and so do we; SignerListSet (:208) drops it and so do
+            // we.
+            crate::ledger::directory::owner_dir_remove(sandbox, &tx.account, &dp_key, hint, false);
             sandbox.delete(dp_key);
             crate::tx::offer::owner_count_add(sandbox, &tx.account, -1);
         }

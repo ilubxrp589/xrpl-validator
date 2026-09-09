@@ -62,12 +62,33 @@ fn run_bundle(bundle_json: &str) {
     );
 
     for (k, want_hex) in bundle["expect"].as_object().unwrap() {
-        let ent = mods
-            .get(&key32(k))
-            .unwrap_or_else(|| panic!("target {k} must be written by the apply"));
+        // Deletion-aware expect loop, spliced from account_delete_vector: an
+        // EMPTY expectation is a deletion pin (finding 158), and an expectation
+        // the apply never wrote is legitimate only when it pins an untouched
+        // pre-image (finding 143). This suite's original loop panicked on any
+        // deleted target, so a transaction that removes an object could not be
+        // pinned here at all — finding 242's unauthorize empties and deletes an
+        // owner-directory root page.
+        let want_deleted = want_hex.as_str().unwrap().trim().is_empty();
+        let Some(ent) = mods.get(&key32(k)) else {
+            assert!(!want_deleted, "target {k} must be deleted by the apply, which never wrote it");
+            let pre_hex = bundle["pre"][k].as_str().unwrap_or_default().trim().to_uppercase();
+            assert_eq!(
+                want_hex.as_str().unwrap().trim().to_uppercase(),
+                pre_hex,
+                "target {k} was not written by the apply and does not pin the untouched pre-image"
+            );
+            continue;
+        };
         let bytes = match ent {
-            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => b.clone(),
-            SandboxEntry::Deleted => panic!("target {k} deleted?"),
+            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => {
+                assert!(!want_deleted, "target {k} must be deleted by the apply, which wrote it instead");
+                b.clone()
+            }
+            SandboxEntry::Deleted => {
+                assert!(want_deleted, "target {k} deleted?");
+                continue;
+            }
         };
         let mut jv: Value = serde_json::from_slice(&bytes).unwrap();
         canon_for_encode(&mut jv);
@@ -112,4 +133,15 @@ fn deposit_preauth_entry_carries_flags_and_its_owner_directory_node() {
 #[test]
 fn deposit_preauth_entry_carries_flags_and_its_owner_directory_node_second_specimen() {
     run_bundle(include_str!("vectors/deposit_preauth_entry_carries_flags_and_owner_node_second_specimen_106737754.json"));
+}
+
+/// Finding 242 (#106869297 307EE2842F54): rnkdphV8uZ unauthorizes its only
+/// DepositPreauth. rippled unlinks it with keepRoot FALSE
+/// (DepositPreauth.cpp:283), so the owner directory the removal empties loses
+/// its ROOT page as well — mainnet deletes the preauth object, the root page
+/// B5675724 and takes OwnerCount 1 -> 0. We passed keepRoot true and left the
+/// emptied page present.
+#[test]
+fn deposit_preauth_unauthorize_drops_the_emptied_owner_directory_106869297() {
+    run_bundle(include_str!("vectors/deposit_preauth_unauthorize_drops_the_emptied_owner_directory_106869297.json"));
 }
