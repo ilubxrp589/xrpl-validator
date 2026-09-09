@@ -766,6 +766,31 @@ impl NativeShadow {
         st.key_noop_extra.fetch_add(noop_extra, Ordering::Relaxed);
         if clean {
             st.full_match.fetch_add(1, Ordering::Relaxed);
+            // Finding 241's lesson, made permanent: a ter mismatch on an
+            // otherwise clean ledger used to be counted and then thrown away.
+            // The state overlay cannot see a wrong result code — a bad tec
+            // charges the same fee and writes the same bytes — so 292 CheckCash
+            // disagreements rode through cycle 108's gate and only the live
+            // ter-miss counter noticed. Emit them, marked so the soak receipt
+            // tally can filter them out (`ter_only`).
+            if !ter_mm.is_empty() {
+                if let Some(f) = &mut self.log {
+                    let _ = writeln!(
+                        f,
+                        "{}",
+                        json!({
+                            "seq": seq,
+                            "ter_only": true,
+                            "missing": [],
+                            "extra": [],
+                            "byte_diff": [],
+                            "ter_mismatch": ter_mm,
+                            "noop_missing": noop_missing,
+                            "noop_extra": noop_extra,
+                        })
+                    );
+                }
+            }
         } else {
             st.overlay_diverged.fetch_add(1, Ordering::Relaxed);
             eprintln!(

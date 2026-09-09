@@ -337,6 +337,30 @@ impl Transactor for CheckCashTransactor {
         if ox::me_cmp(value, cap).is_gt() {
             return TxResult::PathPartial;
         }
+        // Finding 241 (live ter-miss on deploy108, 56/56 CheckCash reading
+        // tecUNFUNDED_PAYMENT vs mainnet's tecPATH_PARTIAL): preclaim also
+        // requires the WRITER to hold at least `value` before the engine ever
+        // runs (CheckCash.cpp:169-192):
+        //     availableFunds = accountFunds(check.Account, value,
+        //                                   ZeroIfFrozen, ZeroIfUnauthorized)
+        //     if (value.native() && !check[sfSponsor])
+        //         availableFunds += fees().increment
+        //     if (value > availableFunds) return tecPATH_PARTIAL;
+        // The reserve increment comes back because cashing releases the
+        // check's own reserve. F234 rewrote the apply path faithfully — its
+        // `srcLiquid < xrpDeliver => tecUNFUNDED_PAYMENT` is CheckCash.cpp:353
+        // — but dropped this gate, so every writer shortfall fell through to
+        // the apply code and answered with the wrong tec. Both are real; this
+        // one fires first.
+        {
+            let mut available = ox::available(sandbox, &creator, &leg);
+            if leg.xrp && check.get("Sponsor").is_none() {
+                available = (available.0.saturating_add(ox::XRP_RESERVE_INC), available.1);
+            }
+            if ox::me_cmp(value, available).is_gt() {
+                return TxResult::PathPartial;
+            }
+        }
         // Finding 234 (#106849342 0B8830B868D4): a check is cashed by rippled's
         // PAYMENT ENGINE, not by a transfer of the requested amount
         // (CheckCash.cpp:331-577). XRP: `xrpDeliver = DeliverMin ?

@@ -138,3 +138,17 @@ fn check_cash_of_an_expired_check_is_tec_expired() {
 fn check_cash_with_deliver_min_takes_everything_send_max_buys_106849342() {
     run_bundle(include_str!("vectors/check_cash_with_deliver_min_takes_everything_send_max_buys_106849342.json"));
 }
+
+/// Finding 241 (#106868992 8ADC7115B92C): rEfFcvUUe3 cashes a 50 XRP check
+/// whose WRITER cannot cover it. rippled refuses in preclaim —
+/// availableFunds = accountFunds(check.Account, value) plus one reserve
+/// increment back for an unsponsored XRP check, and `value > availableFunds`
+/// is tecPATH_PARTIAL (CheckCash.cpp:169-192) — so the apply path's
+/// tecUNFUNDED_PAYMENT (:353) is never reached. F234 rewrote the apply path
+/// faithfully but dropped that gate, and every writer shortfall answered with
+/// the wrong tec: 292 of them rode through cycle 108's windows unnoticed
+/// because a wrong result code writes identical state.
+#[test]
+fn check_cash_writer_shortfall_is_path_partial_in_preclaim_106868992() {
+    run_bundle(include_str!("vectors/check_cash_writer_shortfall_is_path_partial_in_preclaim_106868992.json"));
+}
