@@ -1203,3 +1203,18 @@ fn offer_bridge_leg_a_takes_the_whole_level_into_one_pool_slice_106858065() {
 fn offer_bridge_leg_a_takes_the_whole_level_into_one_pool_slice_106858067() {
     run_bundle(include_str!("vectors/offer_bridge_leg_a_takes_the_whole_level_into_one_pool_slice_106858067.json"));
 }
+
+/// Finding 239 (#106863376 7597883D5031): rHxwV4vsoa sells 0.005472
+/// BTC.rchGBxcD for EUR.rhub8VRN with tfSell|tfPassive, bridged through XRP.
+/// rippled's rev pass calls leg B's BookStep with the sell's unbounded out
+/// request, consumes rGssxjk's D21ABBCA whole (9248.15479200975 EUR) and
+/// steps — reaping rMwarjay's D7DDDE09, expired since 842221845 against a
+/// parent close of 842255710, one level behind it — before the fwd pass
+/// re-sizes the strand down to the taker's BTC (298797108 drops, 368.263
+/// EUR), leaving D21ABBCA partially consumed. Our fills were byte-exact on
+/// both legs; the expired offer, its book page CA462483 and one OwnerCount
+/// unit stayed behind because cross_bridged never ran the rev extent.
+#[test]
+fn offer_bridge_rev_pass_reaps_past_the_level_it_consumes_whole_106863376() {
+    run_bundle(include_str!("vectors/offer_bridge_rev_pass_reaps_past_the_level_it_consumes_whole_106863376.json"));
+}

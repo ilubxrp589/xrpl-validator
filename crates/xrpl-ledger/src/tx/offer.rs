@@ -3277,6 +3277,18 @@ fn cross_bridged(
     // so the cap is aligned on rippled's constant alone.
     let la = book_offer_ladder(sandbox, &base_a, 1000);
     let lb = book_offer_ladder(sandbox, &base_b, 1000);
+    // Finding 239 (#106863376 7597883D5031): leg B's rev extent needs the
+    // book's LEVELS, not just its ladder of offers — `rev_extent_reap` steps
+    // level by level. Same construction and same lifetime as the direct
+    // walk's `dirs`; a level this apply empties reads back as a deleted page
+    // and the stepper stops there on its own.
+    let dirs_b = sandbox.keys_with_prefix(&base_b.0[..24]);
+    let dir_at = |dirs: &[Hash256], q: u64| {
+        dirs.iter().position(|d| u64::from_be_bytes(d.0[24..32].try_into().unwrap_or_default()) == q)
+    };
+    // The rev scan's owner-count adjustments, carried across the rounds of one
+    // crossing exactly as the direct walk carries its own.
+    let mut oc_b: std::collections::HashMap<[u8; 20], u64> = Default::default();
     // Per-leg AMM liquidity: each bridge leg is a BookStep of its own pair.
     let amm_a = crate::tx::amm_swap::discover(sandbox, gets_leg, &xrp_leg, taker);
     let amm_b = crate::tx::amm_swap::discover(sandbox, &xrp_leg, pays_leg, taker);
@@ -4404,16 +4416,16 @@ thr={t:?} admits_trunc={} admits_up={}",
         // a strand this round admits, or one whose RAW tip (dead or not —
         // `BookTip::step` reads the first directory entry as it stands) sits
         // inside the limit, which is what `qualityUpperBound` sees.
+        let raw_q = |l: &[(u64, Hash256)], i: usize| l.get(i).map(|(q, _)| rate_me(*q));
+        let raw_bridge = match (raw_q(&la, ai), raw_q(&lb, bi)) {
+            (Some((am, ae)), Some((bm, be))) => Some(norm16((am * bm, ae + be))),
+            _ => None,
+        };
+        let flows_direct = !direct_dry && direct_alive
+            && (order.contains(&true) || ub_ok(raw_q(&ld, di)).is_some());
+        let flows_bridge = bridge_alive
+            && (order.contains(&false) || ub_ok(raw_bridge).is_some());
         if peek_rm {
-            let raw_q = |l: &[(u64, Hash256)], i: usize| l.get(i).map(|(q, _)| rate_me(*q));
-            let raw_bridge = match (raw_q(&la, ai), raw_q(&lb, bi)) {
-                (Some((am, ae)), Some((bm, be))) => Some(norm16((am * bm, ae + be))),
-                _ => None,
-            };
-            let flows_direct = !direct_dry && direct_alive
-                && (order.contains(&true) || ub_ok(raw_q(&ld, di)).is_some());
-            let flows_bridge = bridge_alive
-                && (order.contains(&false) || ub_ok(raw_bridge).is_some());
             if std::env::var("DX_BRIDGE").is_ok() {
                 eprintln!("DX_BRIDGE F233 reap gate: direct={flows_direct} bridge={flows_bridge} raw_d={:?} raw_bridge={raw_bridge:?}", raw_q(&ld, di));
             }
@@ -4425,6 +4437,39 @@ thr={t:?} admits_trunc={} admits_up={}",
                 let (mut i, mut j) = (ai, bi);
                 let _ = live_head(sandbox, &la, &mut i, taker, &xrp_leg, gets_leg, false, true, stale, None, Some(&drained_prev), true);
                 let _ = live_head(sandbox, &lb, &mut j, taker, pays_leg, &xrp_leg, false, true, stale, None, Some(&drained_prev), true);
+            }
+        }
+        // Finding 239 (#106863376 7597883D5031, rHxwV4vsoa tfSell 0.005472
+        // BTC.rchGBxcD -> EUR.rhub8VRN, bridged through XRP): the F233 gate
+        // above only reaps what a peek's `live_head` lands ON, and only once
+        // something has crossed. rippled's REV pass on the flowed strand goes
+        // further, and goes there on the FIRST iteration: leg B's BookStep is
+        // called with the strand's out request — `4999999999999999e80`, the
+        // sell's "largest possible amount", since the terminal DirectStep is
+        // non-limiting — so it consumes the head level WHOLE (rGssxjk's
+        // D21ABBCA for its entire 9248.15479200975 EUR) and then STEPS,
+        // reaping what it passes until the first live offer ends the
+        // iteration on a worse level (`*ofrQ != offer.quality()`,
+        // BookStep.cpp:719). The forward pass then re-sizes the whole strand
+        // to the taker's 0.005472678415921056 BTC — 298797108 drops, 368.263
+        // EUR — so D21ABBCA rests partially consumed, but the removals the
+        // rev pass made are permanent ("rm bad offers even if the strand
+        // fails", StrandFlow.h:698). rMwarjay's D7DDDE09 sat one level behind
+        // it, expired since 842221845 against a parent close of 842255710;
+        // mainnet took the offer, its book page CA462483 and one OwnerCount,
+        // and our fills — byte-exact on both legs — left all three.
+        //
+        // This is F114's rule applied to the bridge: the direct walk has run
+        // `rev_extent_reap` per level since then, and cross_bridged never
+        // did. Leg B only. Leg A's rev want is not the strand's — it is
+        // whatever leg B's rev pass asked for in XRP — and no specimen has
+        // convicted it yet.
+        if flows_bridge {
+            if let Some(dj) = lb.get(bi).and_then(|(q, _)| dir_at(&dirs_b, *q)) {
+                rev_extent_reap(
+                    sandbox, &dirs_b, dj, if sell { None } else { Some(rem_pays) },
+                    taker, beneficiary, pays_leg, &xrp_leg, true, &mut oc_b, stale,
+                );
             }
         }
         if std::env::var("DX_BRIDGE").is_ok() {
