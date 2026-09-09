@@ -195,13 +195,19 @@ pub fn dir_insert_with(
                 if append {
                     arr.push(serde_json::Value::String(entry));
                 } else {
-                    let pos = arr
-                        .iter()
-                        .position(|x| {
-                            x.as_str().is_some_and(|s| s.to_uppercase() > entry)
-                        })
-                        .unwrap_or(arr.len());
-                    arr.insert(pos, serde_json::Value::String(entry));
+                    // Finding 238 (#106860967 A30675AAC978): rippled's
+                    // `dirAdd` with `preserveOrder == false` (every owner
+                    // directory) pushes the key and `std::sort`s the WHOLE
+                    // page (ApplyView.cpp). A page that predates
+                    // SortedDirectories still holds its entries in insertion
+                    // order until something is added to it — rGYuZfVZpx's
+                    // page 1, 21 entries laid down years ago — and the next
+                    // insert sorts all of them, not just the newcomer.
+                    // Slotting the new key before the first greater entry
+                    // left the old ones where they were: 22 keys in the
+                    // right set and the wrong order.
+                    arr.push(serde_json::Value::String(entry));
+                    arr.sort_by_cached_key(|x| x.as_str().map(str::to_uppercase).unwrap_or_default());
                 }
             }
         }

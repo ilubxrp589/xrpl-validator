@@ -127,3 +127,13 @@ fn trust_set_zero_quality_removes_the_field_106800767() {
 fn trust_set_no_ripple_on_a_negative_balance_is_refused_106814855() {
     run_bundle(include_str!("vectors/trust_set_no_ripple_on_a_negative_balance_is_refused_106814855.json"));
 }
+
+/// Finding 238 (#106860967 A30675AAC978): rGYuZfVZpx's TrustSet adds a line
+/// to an owner-directory page written before SortedDirectories, whose 21
+/// entries still sit in insertion order. rippled's dirAdd pushes the key and
+/// sorts the WHOLE page; we slotted the newcomer before the first greater
+/// entry and left the rest unsorted. The page is byte-pinned.
+#[test]
+fn trust_set_insert_sorts_the_whole_owner_directory_page_106860967() {
+    run_bundle(include_str!("vectors/trust_set_insert_sorts_the_whole_owner_directory_page_106860967.json"));
+}
