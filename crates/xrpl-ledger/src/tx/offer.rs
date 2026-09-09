@@ -9132,8 +9132,19 @@ impl Transactor for OfferCreateTransactor {
         // the raw carry wrote a 20-digit TakerPays the encoder refused:
         // ENCODE-ERR #106694175 F6CD9285, value "273.15283573181998844"
         // (InvalidAmount) — the self-documenting receipt's first catch.
-        let rest16 = |v: Me| -> Me {
-            crate::tx::amm_swap::round16(v.0, v.1, false, crate::tx::amm_swap::Rnd::Near)
+        // Finding 240: "16-digit, always" holds for an IOU, NOT for XRP. A
+        // native STAmount carries drops as an exact integer up to 1e17, so a
+        // seventeen-digit TakerPays rests VERBATIM: mainnet rested
+        // 10027343714655998 on #106867574 where round16 gave us
+        // 10027343714656000, two drops high. The native side is instead
+        // brought to a whole drop count, which is what rippled's
+        // XRPAmount{Number} conversion does.
+        let rest16 = |v: Me, native: bool| -> Me {
+            if native {
+                (me_rescale_nearest(v), 0)
+            } else {
+                crate::tx::amm_swap::round16(v.0, v.1, false, crate::tx::amm_swap::Rnd::Near)
+            }
         };
         // F79 — the RESTING remainder is re-derived from the offer's own rate,
         // not carried out of the walk: `flowCross` (CreateOffer.cpp:439-467)
@@ -9160,11 +9171,11 @@ impl Transactor for OfferCreateTransactor {
                         // #106644297 2B6E3D5A: 405718691 / 56222099782.98270
                         // truncates to 0.007216356069340599 (mainnet); rounding
                         // up gave …600 and broke eight HIST60 ledgers.
-                        let inn = rest16(rem_gets);
+                        let inn = rest16(rem_gets, gets_leg.xrp);
                         let out = if pays_leg.xrp { (div_round_drops_strict_floor(inn, rate), 0) } else { div_round16_down(inn, rate) };
                         (out, inn)
                     } else {
-                        let out = rest16(rem_pays);
+                        let out = rest16(rem_pays, pays_leg.xrp);
                         let inn = if gets_leg.xrp { (mul_round_drops(out, rate), 0) } else { mul_round16_up(out, rate) };
                         (out, inn)
                     }
@@ -9178,8 +9189,8 @@ impl Transactor for OfferCreateTransactor {
             "LedgerEntryType": "Offer",
             "Account": hex::encode(tx.account),
             "Sequence": seq,
-            "TakerPays": me_amount_json(&tp_json, rest16(rem_pays)),
-            "TakerGets": me_amount_json(&tg_json, rest16(rem_gets)),
+            "TakerPays": me_amount_json(&tp_json, rest16(rem_pays, pays_leg.xrp)),
+            "TakerGets": me_amount_json(&tg_json, rest16(rem_gets, gets_leg.xrp)),
             "Flags": lsf_flags,
             "OwnerNode": format!("{owner_node:x}"),
         });
@@ -9193,7 +9204,11 @@ impl Transactor for OfferCreateTransactor {
         // unlink the book page. A hydrated offer carries them from mainnet;
         // one WE placed only has what we write here — omitting them left the
         // book page undeleted when a same-ledger cancel followed (D63363BB).
-        if let Some(q) = rate_of_me(tp0, tg0) {
+        // Finding 240: the filed rate is rippled's `divide`, which does not
+        // shrink a native mantissa — see keylet::rate_encode_native.
+        if let Some(q) =
+            keylet::rate_encode_native(tp0.0, tp0.1, pays_leg.xrp, tg0.0, tg0.1, gets_leg.xrp)
+        {
             let base = match &domain {
                 Some(d) => keylet::book_base_domain(&pays_leg.cur, &gets_leg.cur, &pays_leg.issuer, &gets_leg.issuer, d),
                 None => keylet::book_base(&pays_leg.cur, &gets_leg.cur, &pays_leg.issuer, &gets_leg.issuer),

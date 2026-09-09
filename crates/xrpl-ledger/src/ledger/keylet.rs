@@ -339,13 +339,41 @@ pub fn amount_mant_exp(v: &serde_json::Value) -> Option<(u128, i32)> {
 /// what `0EAE58BB`/`42071037` punished on the fill path, and using the fill
 /// rule here is what put #105777146 one ULP off its book level.
 pub fn rate_encode(pays_m: u128, pays_e: i32, gets_m: u128, gets_e: i32) -> Option<u64> {
+    rate_encode_native(pays_m, pays_e, false, gets_m, gets_e, false)
+}
+
+/// `rate_encode` with each side told whether it is NATIVE (drops).
+///
+/// Finding 240 (#106867574 B62A51EA3D33): rippled's `divide` scales a mantissa
+/// UP and only ever up — `if (num.integral()) while (numVal < kMinValue) {
+/// numVal *= 10; --numOffset; }` (STAmount.cpp:1347-1380) — and then hands
+/// `muldiv(numVal, kTenTO17, denVal)` whatever it has. An IOU never needs more:
+/// canonicalization already leaves its mantissa in [1e15,1e16). A NATIVE
+/// amount is different — drops are an exact integer up to 1e17, so a
+/// seventeen-digit TakerPays like 10027343714655998 reaches the divide whole.
+/// Our down-scale truncated it to 1002734371465599 and filed the offer's book
+/// rate at mantissa 7999999999999992 where mainnet filed 7999999999999998.
+///
+/// The down-scale still stands for IOUs: our `Me` values are not canonicalized
+/// the way an STAmount is, so it is doing STAmount's own canonicalize work
+/// there. Deleting it for both sides regressed nine specimens (q123, q139,
+/// s346, s348, zb302 and four offer_fill / two payment_flow vectors) — it is
+/// load-bearing, and only the NATIVE side may skip it.
+pub fn rate_encode_native(
+    pays_m: u128,
+    pays_e: i32,
+    pays_native: bool,
+    gets_m: u128,
+    gets_e: i32,
+    gets_native: bool,
+) -> Option<u64> {
     if pays_m == 0 || gets_m == 0 {
         return None;
     }
     const LO: u128 = 1_000_000_000_000_000; // 1e15
     const HI: u128 = 10_000_000_000_000_000; // 1e16
-    let norm = |mut m: u128, mut e: i32| {
-        while m >= HI {
+    let norm = |mut m: u128, mut e: i32, native: bool| {
+        while !native && m >= HI {
             m /= 10;
             e += 1;
         }
@@ -355,8 +383,8 @@ pub fn rate_encode(pays_m: u128, pays_e: i32, gets_m: u128, gets_e: i32) -> Opti
         }
         (m, e)
     };
-    let (nm, ne) = norm(pays_m, pays_e);
-    let (dm, de) = norm(gets_m, gets_e);
+    let (nm, ne) = norm(pays_m, pays_e, pays_native);
+    let (dm, de) = norm(gets_m, gets_e, gets_native);
     let v = nm * 100_000_000_000_000_000u128 / dm + 5; // trunc muldiv @1e17, +5
     let mut e = ne - de - 17;
     let mut k = 0u32;

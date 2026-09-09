@@ -1218,3 +1218,18 @@ fn offer_bridge_leg_a_takes_the_whole_level_into_one_pool_slice_106858067() {
 fn offer_bridge_rev_pass_reaps_past_the_level_it_consumes_whole_106863376() {
     run_bundle(include_str!("vectors/offer_bridge_rev_pass_reaps_past_the_level_it_consumes_whole_106863376.json"));
 }
+
+/// Finding 240 (#106867574 B62A51EA3D33): rsb77RcRmm6 rests 1253417.964332
+/// BAWK.rpwfrktc for 10027343714655998 drops — a TakerPays of SEVENTEEN
+/// significant digits. A native mantissa carries drops exactly up to 1e17 and
+/// is not held to the sixteen-digit form an IOU is canonicalized into, and
+/// rippled's `divide` only ever scales a mantissa UP toward cMinValue. Our
+/// rate_encode down-scaled it to 1002734371465599, dropping the trailing 8,
+/// and filed the offer's BookDirectory at exponent -6 mantissa
+/// 7999999999999992 where mainnet filed 7999999999999998 (the exact quotient
+/// is 7999999999999998.404…). A partial fill against a rested offer is priced
+/// at its FILED rate, so the six-ULP error would not have been self-correcting.
+#[test]
+fn offer_rests_at_the_rate_of_the_full_drops_not_a_truncated_mantissa_106867574() {
+    run_bundle(include_str!("vectors/offer_rests_at_the_rate_of_the_full_drops_not_a_truncated_mantissa_106867574.json"));
+}

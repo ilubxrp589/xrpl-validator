@@ -139,6 +139,16 @@ async fn validate_10_consecutive_ledgers() {
         let mut tx_fields_list: Vec<(Hash256, TxFields)> = Vec::new();
 
         if let Some(txs) = transactions {
+            // The `ledger` RPC hands back the transaction SHAMap in HASH
+            // order, which is not the order rippled applied them in. Two
+            // transactions from one account then arrive with their sequences
+            // inverted: on testnet #20614469 rGA4xH5vc's Seq 14135579 came
+            // before …578, so the first was judged temBAD_SEQUENCE against an
+            // account still at …578 — and a tem charges no fee, leaving
+            // total_coins 12 drops high. Canonical order is
+            // metaData.TransactionIndex (what soak_triage.py already sorts on).
+            let mut txs: Vec<&Value> = txs.iter().collect();
+            txs.sort_by_key(|t| t["metaData"]["TransactionIndex"].as_u64().unwrap_or(0));
             for tx in txs {
                 let tx_type = tx["TransactionType"].as_str().unwrap_or("Unknown");
                 *tx_type_counts.entry(tx_type.to_string()).or_insert(0) += 1;
