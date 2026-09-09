@@ -5112,14 +5112,66 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // 99188 drops × 1.015419366759505e-4 = 10.07174161501417|82
                 // → 10.07174161501418 (mainnet); the exact ratio ceils to …419.
                 // The rate rides along as a `Me` for pools and books alike.
+                // Finding 237 (#106858065 CC531C645642, #106858067 5BF83F3CC55E):
+                // rippled's BookStep consumes EVERY live offer at the tip's
+                // quality in one pass (`execOffer` keeps going while `ofrQ`
+                // matches) and the next leg then prices their COMBINED XRP
+                // once. Leg B has grouped its level this way since Finding
+                // 137; leg A took one offer per round, handing the leg-B pool
+                // one slice per offer instead of one per level. rBERMc8i2D
+                // sells 12.5 USD.rvYA for USD.rhub through XRP against
+                // rsRdjxq24y's ladder: mainnet's iteration 3 takes three
+                // 1.061654 offers (2223825 drops) into ONE slice of the
+                // XRP/USD.rhub pool for 3.27145919014, iteration 5 one full
+                // and one partial 1.061646 into one slice for 1.38499032306.
+                // Our three (and two) rounds sliced the pool anew each time,
+                // and the taker's and the pool's USD.rhub lines ended 1.4e-6
+                // apart. A single-member level keeps the pre-237 arithmetic
+                // exactly.
+                let a_group: Vec<(Hash256, serde_json::Value, [u8; 20], Me, Me, Me, bool)> = {
+                    let mut g = Vec::new();
+                    if let Some(head) = &a_book {
+                        let q0 = head.0;
+                        let mut members: Vec<(u64, Hash256, serde_json::Value, [u8; 20], Me, Me)> = vec![head.clone()];
+                        let mut j = ai + 1;
+                        while j < la.len() && la[j].0 == q0 && members.len() < 1000 {
+                            let mut jj = j;
+                            match live_head(sandbox, &la, &mut jj, taker, &xrp_leg, gets_leg, true, true, stale, None, Some(&drained_next), true) {
+                                Some(h) if h.0 == q0 => {
+                                    members.push(h);
+                                    j = jj + 1;
+                                }
+                                _ => break,
+                            }
+                        }
+                        for (_, key, offer, maker, gives0, wants0) in members {
+                            let funded = available(sandbox, &maker, &xrp_leg);
+                            let whole = me_cmp(funded, gives0).is_ge();
+                            let cap = if whole { gives0 } else { funded };
+                            g.push((key, offer, maker, gives0, wants0, cap, whole));
+                        }
+                    }
+                    g
+                };
                 let (a_cap_xrp, a_in_full, a_out_full, a_qbook) = match (&a_book, &a_fill) {
-                    (Some((q, _, _, amaker, a_gives0, a_wants0)), _) => {
+                    (Some((q, _, _, amaker, a_gives0, a_wants0)), _) if a_group.len() <= 1 => {
                         let funded = available(sandbox, amaker, &xrp_leg);
                         let a_gives = if me_cmp(funded, *a_gives0).is_lt() { funded } else { *a_gives0 };
                         // Whole-offer only when the maker can actually fund it;
                         // a funding-limited head is a partial fill.
                         let whole = me_cmp(funded, *a_gives0).is_ge().then_some(*a_gives0);
                         (a_gives, *a_wants0, *a_gives0, Some((rate_me(*q), whole)))
+                    }
+                    (Some((q, ..)), _) => {
+                        let r = rate_me(*q);
+                        let mut cap = (0u128, 0i32);
+                        let mut ins = (0u128, 0i32);
+                        for m in &a_group {
+                            cap = me_add_xrp(cap, m.5);
+                            let in_m = if m.6 { m.4 } else { mul_round16_up(m.5, r) };
+                            ins = stamount_signed_add(false, ins, false, in_m).1;
+                        }
+                        (cap, ins, cap, Some((r, None)))
                     }
                     (None, Some((sq, (s_in, s_out)))) => (*s_out, *s_in, *s_out, Some((*sq, Some(*s_out)))),
                     (None, None) => break 'attempt,
@@ -5219,18 +5271,58 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // The book rate is only a 16-digit mantissa, so it cannot be
                 // recovered from the amounts — it has to be read off the page.
                 let a_price = |xrp: Me| -> Me {
-                    match a_qbook {
-                        Some((r, whole)) if whole.is_none_or(|w| me_cmp(xrp, w).is_lt()) => {
-                            mul_round16_up(xrp, r)
-                        }
-                        _ => me_muldiv(xrp, a_in_full, a_out_full, true),
+                    if a_group.len() <= 1 {
+                        return match a_qbook {
+                            Some((r, whole)) if whole.is_none_or(|w| me_cmp(xrp, w).is_lt()) => {
+                                mul_round16_up(xrp, r)
+                            }
+                            _ => me_muldiv(xrp, a_in_full, a_out_full, true),
+                        };
                     }
+                    // F237: whole members cost their own TakerPays, the member
+                    // the slice ends in is priced at the level's filed rate.
+                    let r = a_qbook.map(|(r, _)| r).unwrap_or((1, 0));
+                    let mut rem = xrp;
+                    let mut gets = (0u128, 0i32);
+                    for m in &a_group {
+                        if me_is_zero(rem) {
+                            break;
+                        }
+                        if me_cmp(rem, m.5).is_ge() {
+                            let in_m = if m.6 { m.4 } else { mul_round16_up(m.5, r) };
+                            gets = stamount_signed_add(false, gets, false, in_m).1;
+                            rem = me_sub(rem, m.5);
+                        } else {
+                            gets = stamount_signed_add(false, gets, false, mul_round16_up(rem, r)).1;
+                            rem = (0, 0);
+                        }
+                    }
+                    gets
                 };
                 let a_unprice = |gets: Me| -> Me {
-                    match a_qbook {
-                        Some((r, _)) => me_muldiv(gets, (1u128, 0i32), r, false),
-                        None => me_muldiv(gets, a_out_full, a_in_full, false),
+                    if a_group.len() <= 1 {
+                        return match a_qbook {
+                            Some((r, _)) => me_muldiv(gets, (1u128, 0i32), r, false),
+                            None => me_muldiv(gets, a_out_full, a_in_full, false),
+                        };
                     }
+                    let r = a_qbook.map(|(r, _)| r).unwrap_or((1, 0));
+                    let mut rem = gets;
+                    let mut xrp = (0u128, 0i32);
+                    for m in &a_group {
+                        if me_is_zero(rem) {
+                            break;
+                        }
+                        let in_m = if m.6 { m.4 } else { mul_round16_up(m.5, r) };
+                        if me_cmp(rem, in_m).is_ge() {
+                            xrp = me_add_xrp(xrp, m.5);
+                            rem = stamount_signed_add(false, rem, true, in_m).1;
+                        } else {
+                            xrp = me_add_xrp(xrp, me_muldiv(rem, (1u128, 0i32), r, false));
+                            rem = (0, 0);
+                        }
+                    }
+                    xrp
                 };
                 // Leg-B group walkers: whole members deliver their own
                 // amounts (full fill = the offer's own TakerGets), the member
@@ -5472,15 +5564,93 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // `move_leg_gross`. An exhausting slice debits the remaining
                 // gross budget VERBATIM (F51) — re-grossing its divided net
                 // can land an ulp off the remainder.
+                // F237: the leg-A members this slice takes, in book order —
+                // every whole member at its own amounts, the member the slice
+                // ends in with the residual of the slice's in (rippled's
+                // `limitStepIn` on the last offer of the pass).
+                let a_plan: Vec<(usize, Me, Me)> = if a_group.len() >= 2 {
+                    let r = a_qbook.map(|(r, _)| r).unwrap_or((1, 0));
+                    let mut rem = xrp;
+                    let mut dealt = (0u128, 0i32);
+                    let mut dealt_gross = (0u128, 0i32);
+                    let mut plan = Vec::new();
+                    let n = a_group.len();
+                    for (idx, m) in a_group.iter().enumerate() {
+                        if me_is_zero(rem) {
+                            break;
+                        }
+                        let take = if me_cmp(rem, m.5).is_ge() { m.5 } else { rem };
+                        let ends_here = me_cmp(rem, m.5).is_le() || idx + 1 == n;
+                        let in_m = if ends_here {
+                            // An exhausting pass ends in an offer whose in is
+                            // what is LEFT of the gross budget after the whole
+                            // members' own gross, divided back to net —
+                            // rippled's `limitStepIn` on that offer — not the
+                            // round's rounded net total less the others.
+                            // #106858065 iteration 5: 1.35111711772478 −
+                            // 1.063238469 = 0.28787871772478 gross →
+                            // 0.2874474775085172 net; the total-first route
+                            // lands on …170.
+                            let exhausting = in_exhausted && exhaust_gross.is_some();
+                            if exhausting {
+                                let (neg, left_g) = stamount_signed_add(false, exhaust_gross.unwrap_or((0, 0)), true, dealt_gross);
+                                let lg = if neg { (0, 0) } else { left_g };
+                                match fee_rate {
+                                    None => lg,
+                                    Some(fr) => mul_ratio(lg, 1_000_000_000, fr as u128, false),
+                                }
+                            } else {
+                                let (neg, left) = stamount_signed_add(false, gets_in, true, dealt);
+                                if !neg && !me_is_zero(left) {
+                                    left
+                                } else if m.6 && me_cmp(take, m.5).is_ge() {
+                                    m.4
+                                } else {
+                                    mul_round16_up(take, r)
+                                }
+                            }
+                        } else if m.6 {
+                            m.4
+                        } else {
+                            mul_round16_up(m.5, r)
+                        };
+                        plan.push((idx, take, in_m));
+                        dealt = stamount_signed_add(false, dealt, false, in_m).1;
+                        dealt_gross = stamount_signed_add(false, dealt_gross, false, gross_in(fee_rate, in_m)).1;
+                        rem = me_sub(rem, take);
+                    }
+                    plan
+                } else {
+                    Vec::new()
+                };
+                // The round's net in is what the members actually cost.
+                let gets_in = if a_plan.is_empty() {
+                    gets_in
+                } else {
+                    let mut t = (0u128, 0i32);
+                    for (_, _, in_m) in &a_plan {
+                        t = stamount_signed_add(false, t, false, *in_m).1;
+                    }
+                    t
+                };
                 let a_gross = match (in_exhausted, gets_gross_cap) {
                     (true, Some(cap)) => exhaust_gross.unwrap_or(rem_from_fold(cap, &saved_ins)), // F197, F226
+                    // F237: the pass's in is the fold of each member's own
+                    // gross (`stpAmt.in = mulRatio(ofrAmt.in, rate, up)`).
+                    _ if !a_plan.is_empty() => {
+                        let mut t = (0u128, 0i32);
+                        for (_, _, in_m) in &a_plan {
+                            t = stamount_signed_add(false, t, false, gross_in(fee_rate, *in_m)).1;
+                        }
+                        t
+                    }
                     _ => gross_in(fee_rate, gets_in),
                 };
                 in_gross_spent = stamount_signed_add(false, in_gross_spent, false, a_gross).1;
                 saved_ins.push(a_gross);
                 out_sum = stamount_signed_add(false, out_sum, false, pays_out).1;
                 match (&a_book, &a_fill) {
-                    (Some((_, akey, aoffer, amaker, a_gives0, a_wants0)), _) => {
+                    (Some((_, akey, aoffer, amaker, a_gives0, a_wants0)), _) if a_plan.is_empty() => {
                         if std::env::var("DX_WALK").is_ok() {
                             eprintln!("DX_FILL legA book okey={} maker={} in={gets_in:?} out={xrp:?} gives0={a_gives0:?} wants0={a_wants0:?}",
                                 hex::encode(akey.0), hex::encode(amaker));
@@ -5489,6 +5659,30 @@ thr={t:?} admits_trunc={} admits_up={}",
                                     &xrp_leg, gets_leg, xrp, gets_in, a_gross, xrp, *a_gives0, *a_wants0);
                         if me_is_zero(available(sandbox, amaker, &xrp_leg)) {
                             drained_next.insert((*amaker, xrp_leg.cur));
+                        }
+                    }
+                    (Some(_), _) => {
+                        let mut dealt_gross = (0u128, 0i32);
+                        let last = a_plan.len() - 1;
+                        let n = a_group.len();
+                        for (pi, (idx, take, in_m)) in a_plan.iter().enumerate() {
+                            let (akey, aoffer, amaker, a_gives0, a_wants0, ..) = &a_group[*idx];
+                            let gross_m = if pi == last {
+                                let (neg, left) = stamount_signed_add(false, a_gross, true, dealt_gross);
+                                if !neg && !me_is_zero(left) { left } else { gross_in(fee_rate, *in_m) }
+                            } else {
+                                gross_in(fee_rate, *in_m)
+                            };
+                            if std::env::var("DX_WALK").is_ok() {
+                                eprintln!("DX_FILL legA book okey={} maker={} in={in_m:?} out={take:?} gross={gross_m:?} gives0={a_gives0:?} wants0={a_wants0:?} member={idx}/{n}",
+                                    hex::encode(akey.0), hex::encode(amaker));
+                            }
+                            settle_fill(sandbox, akey, aoffer, amaker, taker, taker,
+                                        &xrp_leg, gets_leg, *take, *in_m, gross_m, *take, *a_gives0, *a_wants0);
+                            if me_is_zero(available(sandbox, amaker, &xrp_leg)) {
+                                drained_next.insert((*amaker, xrp_leg.cur));
+                            }
+                            dealt_gross = stamount_signed_add(false, dealt_gross, false, gross_m).1;
                         }
                     }
                     (None, Some(_)) => {

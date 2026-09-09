@@ -1183,3 +1183,23 @@ fn offer_bridge_peek_reaps_only_the_strands_rippled_flows_106848589() {
 fn offer_sell_rests_taker_gets_less_the_gross_fold_divided_once_106854857() {
     run_bundle(include_str!("vectors/offer_sell_rests_taker_gets_less_the_gross_fold_divided_once_106854857.json"));
 }
+
+/// Finding 237 (#106858065 CC531C645642): rBERMc8i2D sells 12.5 USD.rvYA
+/// (TransferRate 1.0015) for USD.rhub with tfSell, bridged through XRP
+/// against rsRdjxq24y's ladder on the rvYA/XRP book and the XRP/USD.rhub
+/// pool. rippled takes every offer at one quality in a single pass and
+/// slices the pool ONCE for their combined XRP — three 1.061654 offers in
+/// iteration 3, one full and one partial 1.061646 in iteration 5. Our
+/// bridge took one offer per round with a fresh pool slice each time; the
+/// taker's and the pool's USD.rhub lines ended 1.4e-6 apart.
+#[test]
+fn offer_bridge_leg_a_takes_the_whole_level_into_one_pool_slice_106858065() {
+    run_bundle(include_str!("vectors/offer_bridge_leg_a_takes_the_whole_level_into_one_pool_slice_106858065.json"));
+}
+
+/// Finding 237, the same account's next order two ledgers later
+/// (#106858067 5BF83F3CC55E): the same shape on the moved ladder.
+#[test]
+fn offer_bridge_leg_a_takes_the_whole_level_into_one_pool_slice_106858067() {
+    run_bundle(include_str!("vectors/offer_bridge_leg_a_takes_the_whole_level_into_one_pool_slice_106858067.json"));
+}
