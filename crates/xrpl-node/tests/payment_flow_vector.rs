@@ -750,3 +750,17 @@ fn payment_limiting_book_hop_re_runs_with_the_levels_sixteen_digit_fold_10688938
 fn payment_dry_source_without_partial_payment_is_tec_path_partial_106905925() {
     run_bundle(include_str!("vectors/payment_dry_source_without_partial_payment_is_tec_path_partial_106905925.json"));
 }
+
+/// Finding 255 — #106908423 2F90DCC6EDD9: rJyPE3eyHb pays 243.26322084 ArcX
+/// to rPHuB6xke4 from a line holding 0 (the issuer extends it no credit),
+/// no tfPartialPayment. The sender→issuer DirectIPaymentStep's `check`
+/// (DirectStep.cpp:450-460, `owed <= 0 && -owed >= limit`) refuses the
+/// strand at BUILD — libxrpl: "DirectStepI: dry: owed: 0/ArcX limit:
+/// 0/ArcX" — so tecPATH_DRY whatever the flag; finding 252's flow-time
+/// reading claimed tecPATH_PARTIAL. (The bundle seats the destination's
+/// line by hand: the fetch does not gather a fee-only tx's far line, and
+/// without it the dest-no-line guard would answer DRY for the wrong reason.)
+#[test]
+fn payment_iou_sender_holding_nothing_is_tec_path_dry_at_strand_build() {
+    run_bundle(include_str!("vectors/payment_iou_sender_holding_nothing_is_tec_path_dry_at_build_106908423.json"));
+}

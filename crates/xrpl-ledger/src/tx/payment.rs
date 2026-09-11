@@ -2283,9 +2283,22 @@ impl PaymentTransactor {
         // spend) pays 0.01 USD via XRP/USD without tfPartialPayment; mainnet
         // tecPATH_PARTIAL, we claimed tecPATH_DRY. Fee-only either way, so
         // invisible to the state-hash leg — a ter-mismatch receipt only.
+        //
+        // Finding 255 narrows that to the XRP endpoint. An IOU hop is a
+        // DirectIPaymentStep, and its `check` (DirectStep.cpp:450-460) is a
+        // STRAND-BUILD verdict: `owed = creditBalance(dst, src); if (owed <= 0
+        // && -owed >= creditLimit(dst, src)) return tecPATH_DRY` — the step's
+        // source holds nothing of the counterparty's IOU and the counterparty
+        // extends it no credit. For the sender→issuer hop that is exactly
+        // "holds nothing, no issuing room" (`avail` zero here), and it answers
+        // tecPATH_DRY whatever tfPartialPayment says. #106908423 2F90DCC6EDD9
+        // (and rJyPE3eyHb's retry every other ledger): 243.26322084 ArcX to
+        // rPHuB6xke4 from a line holding 0 with the issuer's limit 0, no
+        // partial flag; libxrpl: "DirectStepI: dry: owed: 0/ArcX limit:
+        // 0/ArcX" → tecPATH_DRY, and finding 252 had us claim tecPATH_PARTIAL.
         if ox::me_is_zero(avail) {
-            // F252: sender holds nothing to spend
-            return if partial { TxResult::PathDry } else { TxResult::PathPartial };
+            // F255: an IOU hop whose source holds nothing is dry at strand build
+            return TxResult::PathDry;
         }
         // Rippling from one holder to another goes through the issuer, which
         // charges its TransferRate: the sender parts with `spend` and the
@@ -2351,8 +2364,10 @@ impl PaymentTransactor {
             _ => want,
         };
         if ox::me_is_zero(target) {
-            // F252: destination can receive nothing
-            return if partial { TxResult::PathDry } else { TxResult::PathPartial };
+            // F255: the issuer→destination hop's check — the destination
+            // already owes the issuer its whole limit (`-owed >= limit`,
+            // DirectStep.cpp:450-460) — is dry at strand build, any flag.
+            return TxResult::PathDry;
         }
         // What the sender must part with to land `target` on the destination.
         //
@@ -2457,8 +2472,9 @@ impl PaymentTransactor {
         // merely near its limit caps the fill instead of blocking it.
         let recv_cap = ox::dest_receivable(sandbox, dest, &want_leg);
         if matches!(&recv_cap, Some(c) if ox::me_is_zero(*c)) {
-            // F252: destination can receive nothing
-            return if partial { TxResult::PathDry } else { TxResult::PathPartial };
+            // F255: the last hop's `check` (DirectStep.cpp:450-460) refuses a
+            // destination at its limit at strand build — tecPATH_DRY, any flag.
+            return TxResult::PathDry;
         }
         // Drive the strand toward the smaller of the requested Amount and the
         // destination's remaining capacity; `want0` is kept for the "delivered
@@ -2472,12 +2488,14 @@ impl PaymentTransactor {
         // reserve; IOU is the trust-line holding). A sender with nothing to
         // spend is a dry path regardless of book or AMM depth.
         let spend_avail = ox::available(sandbox, &tx.account, &spend_leg);
-        // Finding 252 (see apply_iou_direct): the strand built, so a sender
-        // with nothing to spend is a zero flow, judged by the flag —
-        // tecPATH_PARTIAL without tfPartialPayment (#106905925 is this site).
+        // Finding 252 (see apply_iou_direct): an XRP sender with nothing to
+        // spend is a zero FLOW — the XRPEndpointStep has no funds check at
+        // build — judged by the flag: tecPATH_PARTIAL without tfPartialPayment
+        // (#106905925 is this site). Finding 255: an IOU SendMax starts with a
+        // sender→issuer DirectIPaymentStep, whose `check` refuses a source
+        // holding nothing at strand build — tecPATH_DRY, any flag.
         if ox::me_is_zero(spend_avail) {
-            // F252: sender holds nothing to spend
-            return if partial { TxResult::PathDry } else { TxResult::PathPartial };
+            return if !spend_leg.xrp || partial { TxResult::PathDry } else { TxResult::PathPartial };
         }
         // Finding 217 (#106824781 8B1596BFACC9, rapido5rxP selling XWLF for
         // 59.934028 XRP with SendMax 3526.095273376751 against a line of
@@ -3944,7 +3962,7 @@ mod tests {
     /// 1.002263 and 1.040687 against a limit of 0; #105855167 3F56723B pays
     /// YZZUF into a default-state line, limit 0 and balance 0.
     #[test]
-    fn a_direct_iou_payment_is_path_partial_when_the_destination_cannot_receive() {
+    fn a_direct_iou_payment_is_dry_when_the_destination_cannot_receive() {
         let sender = [0x01u8; 20];
         let dest = [0x02u8; 20];
         let issuer = [0x03u8; 20];
@@ -3991,14 +4009,15 @@ mod tests {
                 "Amount": {"currency": "USD", "issuer": hex::encode(issuer), "value": "1"},
             }),
         };
-        // Finding 252: the strand BUILDS (the line exists) and flows nothing,
-        // and the payment carries no tfPartialPayment — rippled answers
-        // tecPATH_PARTIAL, not tecPATH_DRY (StrandFlow.h:812-827; the same
-        // verdict TrustSet_test.cpp:355 pins for a destination at its limit).
+        // Finding 255: a destination at its limit fails the issuer→destination
+        // step's `check` at strand BUILD (DirectStep.cpp:450-460, `-owed >=
+        // limit`) — tecPATH_DRY regardless of tfPartialPayment. (Finding 252
+        // briefly read it as a flow-time zero; TrustSet_test.cpp:355's
+        // tecPATH_PARTIAL is a destination with ROOM for 100 of 200.)
         assert_eq!(
             PaymentTransactor.do_apply(&tx, &mut Sandbox::new(&state)),
-            TxResult::PathPartial,
-            "a destination that can receive nothing flows zero: tecPATH_PARTIAL without tfPartialPayment",
+            TxResult::PathDry,
+            "a destination that can receive nothing is dry at strand build",
         );
 
         // Raise only the destination's limit — the same payment now lands.
