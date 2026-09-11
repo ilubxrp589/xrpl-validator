@@ -735,3 +735,18 @@ fn payment_in_limited_fill_clamps_to_the_offers_out_106847596() {
 fn payment_limiting_book_hop_re_runs_with_the_levels_sixteen_digit_fold_106889388() {
     run_bundle(include_str!("vectors/payment_limiting_book_hop_re_runs_with_the_levels_sixteen_digit_fold_106889388.json"));
 }
+
+/// Finding 252 (#106905925 A2A90EE3FC9A): rH4krKvBq pays itself 6.399968
+/// USD.rvYAfWj5 for up to 9.106178 XRP with NO tfPartialPayment, holding
+/// 7.99995 XRP against an 8 XRP reserve — nothing to spend. rippled builds
+/// the strand (an XRP source needs no line), the XRP/USD pool offers, the
+/// source's `accountHolds` reads 0 and the strand is found dry in rev: "All
+/// strands dry. Total flow: in: 0 out: 0" — and the driver's ending makes a
+/// dry, non-partial flow tecPATH_PARTIAL (StrandFlow.h: `!partialPayment` is
+/// judged before `actualOut == 0`). Our pre-driver "sender has nothing to
+/// spend" guard said tecPATH_DRY, the verdict rippled reserves for a
+/// tfPartialPayment that delivers nothing. Fee-only either way.
+#[test]
+fn payment_dry_source_without_partial_payment_is_tec_path_partial_106905925() {
+    run_bundle(include_str!("vectors/payment_dry_source_without_partial_payment_is_tec_path_partial_106905925.json"));
+}

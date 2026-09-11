@@ -2270,8 +2270,22 @@ impl PaymentTransactor {
                 crate::tx::direct_step::max_src_to_dst(sandbox, &hop)
             }
         };
+        // Finding 252: a strand that BUILDS but flows NOTHING is not a dry
+        // path — rippled judges `!partialPayment` first (StrandFlow.h:812-827,
+        // 3.3.0: `if (actualOut != outReq) { if (!partialPayment) return
+        // tecPATH_PARTIAL; else if (actualOut == 0) return tecPATH_DRY; }`).
+        // Only a strand that fails to BUILD — no line (terNO_LINE), NoRipple
+        // (terNO_RIPPLE), a frozen hop — is tecPATH_DRY, by Payment.cpp:600's
+        // `isTerRetry → tecPATH_DRY`. The construction guards above keep DRY;
+        // the flow-time zero guards below answer by the flag, as the driver's
+        // own "delivered less than asked" verdict already does. #106905925
+        // 6CB5BE9D1DEC: rH4krKvBq (7.99995 XRP, reserve 8 XRP — nothing to
+        // spend) pays 0.01 USD via XRP/USD without tfPartialPayment; mainnet
+        // tecPATH_PARTIAL, we claimed tecPATH_DRY. Fee-only either way, so
+        // invisible to the state-hash leg — a ter-mismatch receipt only.
         if ox::me_is_zero(avail) {
-            return TxResult::PathDry;
+            // F252: sender holds nothing to spend
+            return if partial { TxResult::PathDry } else { TxResult::PathPartial };
         }
         // Rippling from one holder to another goes through the issuer, which
         // charges its TransferRate: the sender parts with `spend` and the
@@ -2337,7 +2351,8 @@ impl PaymentTransactor {
             _ => want,
         };
         if ox::me_is_zero(target) {
-            return TxResult::PathDry;
+            // F252: destination can receive nothing
+            return if partial { TxResult::PathDry } else { TxResult::PathPartial };
         }
         // What the sender must part with to land `target` on the destination.
         //
@@ -2371,7 +2386,8 @@ impl PaymentTransactor {
             None => spend,
         };
         if ox::me_is_zero(deliver) {
-            return TxResult::PathDry;
+            // F252: nothing lands after the rate
+            return if partial { TxResult::PathDry } else { TxResult::PathPartial };
         }
         if ox::me_cmp(deliver, want).is_lt() && !partial {
             return TxResult::PathPartial;
@@ -2441,7 +2457,8 @@ impl PaymentTransactor {
         // merely near its limit caps the fill instead of blocking it.
         let recv_cap = ox::dest_receivable(sandbox, dest, &want_leg);
         if matches!(&recv_cap, Some(c) if ox::me_is_zero(*c)) {
-            return TxResult::PathDry;
+            // F252: destination can receive nothing
+            return if partial { TxResult::PathDry } else { TxResult::PathPartial };
         }
         // Drive the strand toward the smaller of the requested Amount and the
         // destination's remaining capacity; `want0` is kept for the "delivered
@@ -2455,8 +2472,12 @@ impl PaymentTransactor {
         // reserve; IOU is the trust-line holding). A sender with nothing to
         // spend is a dry path regardless of book or AMM depth.
         let spend_avail = ox::available(sandbox, &tx.account, &spend_leg);
+        // Finding 252 (see apply_iou_direct): the strand built, so a sender
+        // with nothing to spend is a zero flow, judged by the flag —
+        // tecPATH_PARTIAL without tfPartialPayment (#106905925 is this site).
         if ox::me_is_zero(spend_avail) {
-            return TxResult::PathDry;
+            // F252: sender holds nothing to spend
+            return if partial { TxResult::PathDry } else { TxResult::PathPartial };
         }
         // Finding 217 (#106824781 8B1596BFACC9, rapido5rxP selling XWLF for
         // 59.934028 XRP with SendMax 3526.095273376751 against a line of
@@ -3923,7 +3944,7 @@ mod tests {
     /// 1.002263 and 1.040687 against a limit of 0; #105855167 3F56723B pays
     /// YZZUF into a default-state line, limit 0 and balance 0.
     #[test]
-    fn a_direct_iou_payment_is_dry_when_the_destination_cannot_receive() {
+    fn a_direct_iou_payment_is_path_partial_when_the_destination_cannot_receive() {
         let sender = [0x01u8; 20];
         let dest = [0x02u8; 20];
         let issuer = [0x03u8; 20];
@@ -3970,10 +3991,14 @@ mod tests {
                 "Amount": {"currency": "USD", "issuer": hex::encode(issuer), "value": "1"},
             }),
         };
+        // Finding 252: the strand BUILDS (the line exists) and flows nothing,
+        // and the payment carries no tfPartialPayment — rippled answers
+        // tecPATH_PARTIAL, not tecPATH_DRY (StrandFlow.h:812-827; the same
+        // verdict TrustSet_test.cpp:355 pins for a destination at its limit).
         assert_eq!(
             PaymentTransactor.do_apply(&tx, &mut Sandbox::new(&state)),
-            TxResult::PathDry,
-            "a destination that can receive nothing makes the strand dry",
+            TxResult::PathPartial,
+            "a destination that can receive nothing flows zero: tecPATH_PARTIAL without tfPartialPayment",
         );
 
         // Raise only the destination's limit — the same payment now lands.
