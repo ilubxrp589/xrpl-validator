@@ -6354,9 +6354,24 @@ pub(crate) fn cross_engine_to_net(
     // (possible only on a funding-clamped or IOU-in offer at the rounding
     // cusp) would leave the offer alive with a dust residual — not modelled,
     // DX_REEXEC names it.
+    //
+    // Finding 248 (#106889388 2817B7C6DBDD, rww2AZLgG3 500 XRP → XPM, partial):
+    // the rule is StrandFlow's, not the crossing's — a PAYMENT hop whose level
+    // cannot fill the want is limiting the same way, and rippled re-runs its
+    // rev with the level's 16-digit fold (narration: raFN5J 1312.16098265896
+    // and rKnEWE 363.3858381502891 whole, then the re-run's rKnEWE
+    // 363.385838150289 = 1675.546820809249 − 1312.16098265896). The pass's
+    // fold was already the driver's (payment.rs keeps StrandFlow's totals);
+    // only the LAST MAKER'S debit stayed at its own TakerGets — one ulp on
+    // rKnEWE's line, the offer deleted either way (in exhausted, 1e-13 out
+    // left behind). So a single-pass payment hop takes the re-run too.
     macro_rules! reexec_level {
         () => {
-            if fold_rem && !pays_leg.xrp && level_fills.len() >= 2 && level_fills.iter().all(|f| f.3) {
+            if (fold_rem || (single_pass && !offer_crossing))
+                && !pays_leg.xrp
+                && level_fills.len() >= 2
+                && level_fills.iter().all(|f| f.3)
+            {
                 let mut all: Vec<Me> = level_fills.iter().map(|f| f.1).collect();
                 let total16 = fold16(&mut all);
                 let mut prefix: Vec<Me> = level_fills[..level_fills.len() - 1].iter().map(|f| f.1).collect();

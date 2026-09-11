@@ -720,3 +720,18 @@ fn payment_tail_turn_anchors_on_the_raw_tip_106842607() {
 fn payment_in_limited_fill_clamps_to_the_offers_out_106847596() {
     run_bundle(include_str!("vectors/payment_in_limited_fill_clamps_to_the_offers_out_106847596.json"));
 }
+
+/// Finding 248 (#106889388 2817B7C6DBDD): rww2AZLgG3's partial payment of
+/// 500 XRP into XPM takes the 3460-drops/XPM level whole — raFN5J's
+/// 1312.16098265896 and rKnEWE's 363.3858381502891 — and the level cannot
+/// fill the 145457 XPM want, so the pass is LIMITING: rippled re-runs the
+/// book step's rev with the level's 16-digit fold, 1675.546820809249, and
+/// that re-run sizes rKnEWE by limitStepOut at the page rate:
+/// 1675.546820809249 − 1312.16098265896 = 363.385838150289 for its whole
+/// 1257315 drops (StrandFlow.h:176-184, BookStep.cpp revImp). Finding 149
+/// ported that for crossings; a payment hop takes it now. rKnEWE's line
+/// ends at 0.0006124416636 (we wrote …635); the offer is deleted either way.
+#[test]
+fn payment_limiting_book_hop_re_runs_with_the_levels_sixteen_digit_fold_106889388() {
+    run_bundle(include_str!("vectors/payment_limiting_book_hop_re_runs_with_the_levels_sixteen_digit_fold_106889388.json"));
+}
