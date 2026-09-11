@@ -611,8 +611,14 @@ fn adjust_lp_tokens(lpt_balance: ox::Me, tokens: ox::Me) -> ox::Me {
 /// offered 3.235503279094231 (2 ulp short), and 10000001 drops where it
 /// offered 10000000 (1 drop short), so BOTH directions miss.
 ///
-/// Returns the (Amount, Amount2) actually to be moved, or None for
-/// tecAMM_FAILED.
+/// Returns the (Amount, Amount2, tokens) actually to be moved, or the
+/// transaction's verdict: tecAMM_FAILED when neither direction fits, and —
+/// finding 247 — tecAMM_INVALID_TOKENS the moment a lead direction rounds to
+/// ZERO LP tokens (`tokensAdj == beast::zero` under fixAMMv1_3,
+/// AMMDeposit.cpp:735-741 and :762-767), which is judged before that
+/// direction's fit and ends the search. #106894782 ED009182D8E8: 7e-13 589
+/// and 6e-13 PLX into the 589/PLX pool; fee-only either way, so a
+/// result-code receipt.
 fn equal_deposit_limit(
     amount_balance: ox::Me,
     amount2_balance: ox::Me,
@@ -621,9 +627,9 @@ fn equal_deposit_limit(
     amount2: ox::Me,
     amount_xrp: bool,
     amount2_xrp: bool,
-) -> Option<(ox::Me, ox::Me, ox::Me)> {
+) -> Result<(ox::Me, ox::Me, ox::Me), TxResult> {
     if amount_balance.0 == 0 || amount2_balance.0 == 0 || lpt_balance.0 == 0 {
-        return None;
+        return Err(TxResult::AmmFailed);
     }
     let led = |num: ox::Me, den: ox::Me, out_balance: ox::Me, out_xrp: bool|
      -> Option<(ox::Me, ox::Me)> {
@@ -635,17 +641,19 @@ fn equal_deposit_limit(
         let frac = ox::st_divide(tokens, lpt_balance, false);
         Some((mul_directed(out_balance, frac, true, out_xrp), tokens))
     };
-    if let Some((a2, t)) = led(amount, amount_balance, amount2_balance, amount2_xrp) {
-        if ox::me_cmp(a2, amount2).is_le() {
-            return Some((amount, a2, t));
-        }
+    let Some((a2, t)) = led(amount, amount_balance, amount2_balance, amount2_xrp) else {
+        return Err(TxResult::AmmInvalidTokens);
+    };
+    if ox::me_cmp(a2, amount2).is_le() {
+        return Ok((amount, a2, t));
     }
-    if let Some((a1, t)) = led(amount2, amount2_balance, amount_balance, amount_xrp) {
-        if ox::me_cmp(a1, amount).is_le() {
-            return Some((a1, amount2, t));
-        }
+    let Some((a1, t)) = led(amount2, amount2_balance, amount_balance, amount_xrp) else {
+        return Err(TxResult::AmmInvalidTokens);
+    };
+    if ox::me_cmp(a1, amount).is_le() {
+        return Ok((a1, amount2, t));
     }
-    None
+    Err(TxResult::AmmFailed)
 }
 
 /// rippled `AMMWithdraw::equalWithdrawLimit` (AMMWithdraw.cpp:899), the
@@ -951,8 +959,8 @@ impl Transactor for AMMDepositTransactor {
                             aleg.xrp,
                             bleg.xrp,
                         ) {
-                            Some(triple) => sized = Some(triple),
-                            None => return TxResult::AmmFailed,
+                            Ok(triple) => sized = Some(triple),
+                            Err(verdict) => return verdict,
                         }
                         // Finding 155: on this path `LPTokenOut` is only a MINIMUM
                         // (`equalDepositLimit(…, lpTokensDepositMin, …)` and
@@ -2798,7 +2806,7 @@ mod tests {
                 amount_balance, amount2_balance, lpt_balance,
                 (10_000_000, 0), (3_235_503_279_094_231, -15), true, false,
             ),
-            None,
+            Err(TxResult::AmmFailed),
             "XRP-led needs 3.235503279094233 QQ1 and QQ1-led needs 10000001 drops",
         );
 

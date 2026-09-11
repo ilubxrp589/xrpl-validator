@@ -152,3 +152,13 @@ fn amm_two_asset_deposit_lptokenout_is_a_minimum() {
 fn amm_deposit_refuses_a_pool_line_the_issuer_froze_106637600() {
     run_bundle(include_str!("vectors/amm_deposit_refuses_a_pool_line_the_issuer_froze_106637600.json"));
 }
+
+/// Finding 247 (#106894782 ED009182D8E8): a tfTwoAsset deposit of 7e-13 589
+/// and 6e-13 PLX into the 589/PLX pool rounds to ZERO LP tokens.
+/// `equalDepositLimit` reports that as tecAMM_INVALID_TOKENS under fixAMMv1_3
+/// (AMMDeposit.cpp:735-741); we folded it into the both-directions-overshoot
+/// tecAMM_FAILED. Fee-only either way — a result-code (ter_only) receipt.
+#[test]
+fn amm_two_asset_deposit_of_dust_is_tec_amm_invalid_tokens_106894782() {
+    run_bundle(include_str!("vectors/amm_two_asset_deposit_of_dust_is_tec_amm_invalid_tokens_106894782.json"));
+}
