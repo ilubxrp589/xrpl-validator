@@ -807,6 +807,15 @@ impl Transactor for AMMDepositTransactor {
         // any funding arithmetic — a depositor with no line to a
         // RequireAuth issuer is tecNO_LINE, an unauthorized line tecNO_AUTH,
         // a frozen one tecFROZEN. Finding 104 (#106721484 3F14213E0C76).
+        // Finding 259 — fixCleanup3_3_0 (AMMDeposit.cpp:258-283): the unified
+        // `checkDepositFreeze` runs for BOTH pool assets — the issuer's global
+        // freeze, the depositor's own frozen line (unless it is the issuer)
+        // and the POOL ACCOUNT's frozen line — before any amount is looked
+        // at; the per-amount freeze checks below are then skipped. Pre-
+        // amendment the pool account's line was only examined for the
+        // assets actually deposited (finding 221).
+        let fix330 = crate::ledger::amendments::fix_cleanup_3_3_0(sandbox);
+        let amm_acct_for_freeze = amm_ctx(tx, sandbox).map(|(_, a, _)| a);
         for f in ["Asset", "Asset2"] {
             let Some(leg) = tx.fields.get(f).and_then(asset_leg) else { continue };
             if let Some(t) = ox::require_auth_ter(sandbox, &leg, &tx.account, false) {
@@ -814,6 +823,13 @@ impl Transactor for AMMDepositTransactor {
             }
             if let Some(t) = ox::frozen_ter(sandbox, &leg, &tx.account) {
                 if t != TxResult::Success { return t; }
+            }
+            if fix330 {
+                if let Some(amm_acct) = amm_acct_for_freeze.as_ref() {
+                    if let Some(t) = ox::frozen_ter(sandbox, &leg, amm_acct) {
+                        if t != TxResult::Success { return t; }
+                    }
+                }
             }
         }
         // Then each deposited amount's asset passes `checkAmount`'s
@@ -842,9 +858,11 @@ impl Transactor for AMMDepositTransactor {
             // mainnet tecFROZEN, ours deposited). The depositor's own
             // checkIndividualFrozen that follows it is subsumed by the Asset
             // loop above.
-            if let Some((_, amm_acct, _)) = amm_ctx(tx, sandbox) {
-                if let Some(t) = ox::frozen_ter(sandbox, &leg, &amm_acct) {
-                    if t != TxResult::Success { return t; }
+            if !fix330 {
+                if let Some((_, amm_acct, _)) = amm_ctx(tx, sandbox) {
+                    if let Some(t) = ox::frozen_ter(sandbox, &leg, &amm_acct) {
+                        if t != TxResult::Success { return t; }
+                    }
                 }
             }
         }
@@ -1678,12 +1696,44 @@ impl Transactor for AMMWithdrawTransactor {
         // AMMWithdraw::preclaim's checkAmount rejects amount > balance with
         // tecAMM_BALANCE before anything moves (AMMWithdraw.cpp:232).
         // #105763689 740D41D6 asks for 50950 drops from a pool holding 43921.
+        // Finding 259: that balance is `ammHolds` under ZeroIfFrozen — a
+        // globally frozen asset, or a pool line the issuer froze, reads as
+        // nothing to pay out — except (fixCleanup3_3_0, AMMWithdraw.cpp:322)
+        // for the ISSUER of that asset, who can always take its own token
+        // back. Each named amount then passes `requireAuth(WeakAuth)` and the
+        // era's freeze check: pre-amendment `checkFrozen(ammAccount)` then
+        // `checkIndividualFrozen(account)`; post, `checkWithdrawFreeze` —
+        // nothing when the withdrawer is the issuer, else the global freeze
+        // and the POOL account's frozen line (the withdrawer's own frozen
+        // line no longer blocks: a regular freeze stops sending, not
+        // receiving). AMMWithdraw.cpp:218-262.
+        let fix330 = crate::ledger::amendments::fix_cleanup_3_3_0(sandbox);
         for f in ["Amount", "Amount2"] {
             if let Some(v) = tx.fields.get(f) {
                 if let (Some(leg), Some(amt)) = (ox::leg_of(v), keylet::amount_mant_exp(v)) {
-                    let held = crate::tx::amm_swap::holds(sandbox, &amm_acct, &leg);
+                    let held = if fix330 && !leg.xrp && tx.account == leg.issuer {
+                        crate::tx::amm_swap::holds(sandbox, &amm_acct, &leg)
+                    } else {
+                        crate::tx::amm_swap::holds_for_offer(sandbox, &amm_acct, &leg)
+                    };
                     if ox::me_cmp(amt, held).is_gt() {
                         return TxResult::AmmBalance;
+                    }
+                    if let Some(t) = ox::require_auth_ter(sandbox, &leg, &tx.account, false) {
+                        if t != TxResult::Success { return t; }
+                    }
+                    if fix330 {
+                        if !leg.xrp && tx.account != leg.issuer {
+                            if let Some(t) = ox::frozen_ter(sandbox, &leg, &amm_acct) {
+                                if t != TxResult::Success { return t; }
+                            }
+                        }
+                    } else {
+                        for who in [&amm_acct, &tx.account] {
+                            if let Some(t) = ox::frozen_ter(sandbox, &leg, who) {
+                                if t != TxResult::Success { return t; }
+                            }
+                        }
                     }
                 }
             }
@@ -2104,6 +2154,32 @@ impl Transactor for AMMWithdrawTransactor {
             let (_neg, mag) = ox::signed_value(&line["Balance"]);
             if mag.0 == 0 {
                 tear_down_lp_line(sandbox, &tx.account, &amm_acct, lp_key, &line);
+            }
+        }
+        // Finding 259 — fixCleanup3_3_0 with fixAMMv1_3 (AMMWithdraw.cpp:440,
+        // AMMHelpers.cpp checkAMMPrecisionLoss): once the payout and the burn
+        // are settled, sqrt(pool1·pool2) must still cover the LPToken balance
+        // of record; a shortfall past the invariant's 1e-11 relative tolerance
+        // is tecPRECISION_LOSS and nothing moves.
+        if crate::ledger::amendments::fix_cleanup_3_3_0(sandbox) {
+            use crate::tx::amm_swap::{n_cmp, n_mul, n_sqrt, n_sub, Rnd};
+            let pools: Vec<ox::Me> = ["Asset", "Asset2"]
+                .iter()
+                .filter_map(|f| tx.fields.get(*f).and_then(asset_leg))
+                .map(|l| crate::tx::amm_swap::holds(sandbox, &amm_acct, &l))
+                .collect();
+            if let (Some(new_lpt), [p1, p2]) = (pool_lpt(sandbox), pools.as_slice()) {
+                if new_lpt.0 > 0 {
+                    let mean = n_sqrt(n_mul(*p1, *p2, Rnd::Near));
+                    if n_cmp(mean, new_lpt) == std::cmp::Ordering::Less {
+                        let short = n_sub(new_lpt, mean, Rnd::Near);
+                        let tol = n_mul(new_lpt, (1, -11), Rnd::Near);
+                        if n_cmp(short, tol) == std::cmp::Ordering::Greater {
+                            sandbox.restore_snapshot(snap);
+                            return TxResult::PrecisionLoss;
+                        }
+                    }
+                }
             }
         }
         // Finding 256: LAST LP OUT by tfLPToken. `LPTokenIn == lptAMMBalance`

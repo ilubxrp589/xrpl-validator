@@ -5,6 +5,7 @@
 //! - A state SHAMap containing all current ledger objects
 //! - A transaction SHAMap containing all transactions in this ledger
 
+pub mod amendments;
 pub mod apply;
 pub mod close;
 pub mod directory;

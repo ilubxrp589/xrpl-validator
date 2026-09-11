@@ -124,6 +124,10 @@ pub enum TxResult {
     /// notably a two-asset deposit where NEITHER side's proportional partner
     /// fits inside what the transaction offered.
     AmmFailed,
+    /// An AMM withdrawal that would leave sqrt(pool1·pool2) below the LPToken
+    /// balance beyond the invariant's tolerance — tecPRECISION_LOSS
+    /// (fixCleanup3_3_0 with fixAMMv1_3, finding 259).
+    PrecisionLoss,
     /// Creating a trust line, but the owner can't afford the incremental reserve.
     NoLineInsufReserve,
     /// The credit would push the receiver's trust line past its limit.
@@ -233,6 +237,7 @@ impl TxResult {
             | TxResult::InsufReserveLine
             | TxResult::UnfundedAmm
             | TxResult::AmmFailed
+                | TxResult::PrecisionLoss
             | TxResult::NoLineInsufReserve
             | TxResult::NoLineRedundant
             | TxResult::NoAuth
@@ -298,6 +303,7 @@ impl TxResult {
             TxResult::InsufReserveLine => "tecINSUF_RESERVE_LINE",
             TxResult::UnfundedAmm => "tecUNFUNDED_AMM",
             TxResult::AmmFailed => "tecAMM_FAILED",
+            TxResult::PrecisionLoss => "tecPRECISION_LOSS",
             TxResult::NoLineInsufReserve => "tecNO_LINE_INSUF_RESERVE",
             TxResult::LimitExceeded => "tecLIMIT_EXCEEDED",
             TxResult::NoLineRedundant => "tecNO_LINE_REDUNDANT",
