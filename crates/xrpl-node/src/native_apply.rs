@@ -150,7 +150,11 @@ pub fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<
         xrpl_ledger::ledger::transactor::stamp_account_txn_id(tx, &mut sb);
         (TxResult::Success.code_str().to_string(), sb.into_modifications())
     } else if applied.is_claimed() {
-        if applied != TxResult::Killed {
+        // tecEXPIRED keeps its NFTokenOffer / Credential erasures (finding 245,
+        // rippled's processPersistentChanges) — same settlement as apply.rs.
+        if applied == TxResult::Expired {
+            xrpl_ledger::ledger::apply::settle_expired(&mut sb, snap);
+        } else if applied != TxResult::Killed {
             sb.restore_snapshot(snap);
         }
         (applied.code_str().to_string(), sb.into_modifications())

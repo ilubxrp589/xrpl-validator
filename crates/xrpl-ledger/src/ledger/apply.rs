@@ -19,8 +19,9 @@
 use xrpl_core::types::Hash256;
 
 use super::header::LedgerHeader;
-use super::sandbox::{apply_modifications, Sandbox};
+use super::sandbox::{apply_modifications, Sandbox, SandboxEntry};
 use super::state::LedgerState;
+use std::collections::HashMap;
 use super::transactor::{apply_common, TxFields, TxResult};
 use crate::tx::dispatch::get_transactor;
 use crate::LedgerError;
@@ -31,6 +32,77 @@ pub struct AppliedTx {
     pub tx_hash: Hash256,
     pub result: TxResult,
     pub fee: u64,
+}
+
+/// A tecEXPIRED keeps its erasures. rippled's tec reset discards doApply's
+/// writes and then RE-APPLIES the deletions it harvested from the discarded
+/// view — for tecEXPIRED the ltNFTOKEN_OFFER and ltCREDENTIAL objects
+/// (Transactor.cpp `processPersistentChanges`, rippled 3.3.0: `typesForResult`
+/// → removeExpiredNFTokenOffers / removeExpiredCredentials). Finding 245
+/// (NFTokenAcceptOffer deletes each expired named offer, then tecEXPIRED) and
+/// CredentialAccept's expired delete both rest on it.
+///
+/// The same settlement from the other side: roll `do_apply` back to
+/// `snapshot` EXCEPT the part of its delta that an erasure of those two types
+/// produces — the deleted object itself, the directory pages it was unlinked
+/// from (modified, or deleted when emptied) and an AccountRoot whose
+/// OwnerCount is the ONLY field that moved. Anything else a transactor wrote
+/// before returning Expired is discarded, exactly as rippled's reset discards
+/// it — so a transactor must not write ahead of that verdict (PayChannelCreate
+/// judged CancelAfter after its debit until finding 245 moved it).
+pub fn settle_expired(sandbox: &mut Sandbox, mut snapshot: HashMap<Hash256, SandboxEntry>) {
+    let entry_type = |bytes: &[u8]| -> Option<String> {
+        serde_json::from_slice::<serde_json::Value>(bytes)
+            .ok()
+            .and_then(|v| v.get("LedgerEntryType").and_then(|t| t.as_str()).map(str::to_string))
+    };
+    let mods = sandbox.modifications().clone();
+    for (key, entry) in mods {
+        // Only do_apply's own delta is judged; what apply_common wrote stands.
+        let unchanged = match (&entry, snapshot.get(&key)) {
+            (SandboxEntry::Deleted, Some(SandboxEntry::Deleted)) => true,
+            (SandboxEntry::Created(a), Some(SandboxEntry::Created(b)))
+            | (SandboxEntry::Modified(a), Some(SandboxEntry::Modified(b))) => a == b,
+            _ => false,
+        };
+        if unchanged {
+            continue;
+        }
+        // The image do_apply started from: the snapshot's, else the base ledger's.
+        let before: Option<Vec<u8>> = match snapshot.get(&key) {
+            Some(SandboxEntry::Created(b)) | Some(SandboxEntry::Modified(b)) => Some(b.clone()),
+            Some(SandboxEntry::Deleted) => None,
+            None => sandbox.base().state_map.lookup(&key).map(|b| b.to_vec()),
+        };
+        let before_type = before.as_deref().and_then(entry_type);
+        let keep = match (&entry, before_type.as_deref()) {
+            (SandboxEntry::Deleted, Some("NFTokenOffer" | "Credential" | "DirectoryNode")) => true,
+            (SandboxEntry::Modified(_), Some("DirectoryNode")) => true,
+            (SandboxEntry::Modified(after), Some("AccountRoot")) => {
+                only_owner_count_moved(before.as_deref().unwrap_or(&[]), after)
+            }
+            _ => false,
+        };
+        if keep {
+            snapshot.insert(key, entry);
+        }
+    }
+    sandbox.restore_snapshot(snapshot);
+}
+
+/// True when the two AccountRoot images differ in OwnerCount alone.
+fn only_owner_count_moved(before: &[u8], after: &[u8]) -> bool {
+    let (Ok(mut a), Ok(mut b)) = (
+        serde_json::from_slice::<serde_json::Value>(before),
+        serde_json::from_slice::<serde_json::Value>(after),
+    ) else {
+        return false;
+    };
+    if let (Some(a), Some(b)) = (a.as_object_mut(), b.as_object_mut()) {
+        a.remove("OwnerCount");
+        b.remove("OwnerCount");
+    }
+    a == b
 }
 
 /// Apply a transaction set to produce a new ledger state.
@@ -169,7 +241,14 @@ pub fn apply_transaction_set(
                         // stale-offer cleanup, which rippled keeps by running
                         // removableOffers against the cancel sandbox as well
                         // (OfferCreate.cpp:460). Restoring here would drop it.
-                        if apply_result != TxResult::Killed {
+                        //
+                        // tecEXPIRED keeps its erasures (finding 245): rippled's
+                        // reset re-applies the NFTokenOffer / Credential
+                        // deletions it harvested from the discarded view —
+                        // `settle_expired` rolls back everything else.
+                        if apply_result == TxResult::Expired {
+                            settle_expired(&mut sandbox, common_snapshot);
+                        } else if apply_result != TxResult::Killed {
                             sandbox.restore_snapshot(common_snapshot);
                         }
                         let mods = sandbox.into_modifications();

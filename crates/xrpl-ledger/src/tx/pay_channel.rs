@@ -245,6 +245,17 @@ impl Transactor for PaymentChannelCreateTransactor {
             return TxResult::Unfunded;
         }
 
+        // fixPayChanCancelAfter: a CancelAfter already past at create time is
+        // refused outright (tecEXPIRED) — checked before any state moves.
+        // It used to sit AFTER the debit below, which only the pipeline's
+        // tec rollback hid; a tecEXPIRED now keeps its erasures (finding
+        // 245), so nothing may be written ahead of this verdict.
+        if let Some(ca) = tx.fields.get("CancelAfter").and_then(|v| v.as_u64()) {
+            if (sandbox.base().header.close_time as u64) > ca {
+                return TxResult::Expired;
+            }
+        }
+
         sender_acct["Balance"] =
             serde_json::Value::String((sender_balance - amount).to_string());
 
@@ -252,14 +263,6 @@ impl Transactor for PaymentChannelCreateTransactor {
         let owner_count = sender_acct["OwnerCount"].as_u64().unwrap_or(0);
         sender_acct["OwnerCount"] = serde_json::Value::Number((owner_count + 1).into());
         sandbox.write(sender_key, serde_json::to_vec(&sender_acct).unwrap());
-
-        // fixPayChanCancelAfter: a CancelAfter already past at create time is
-        // refused outright (tecEXPIRED) — checked before any state moves.
-        if let Some(ca) = tx.fields.get("CancelAfter").and_then(|v| v.as_u64()) {
-            if (sandbox.base().header.close_time as u64) > ca {
-                return TxResult::Expired;
-            }
-        }
 
         // Create PayChannel object. keylet::payChan hashes src || DST || seq.
         let seq = if tx.uses_ticket() {

@@ -133,11 +133,16 @@ fn run_bundle(bundle_json: &str) {
     );
 
     for (k, want_hex) in bundle["expect"].as_object().unwrap() {
+        // An EMPTY expectation is a deletion pin (finding 158): mainnet's
+        // meta deleted the object in this transaction, so must the apply
+        // (finding 245's expired offer is the first one this suite pins).
+        let want_deleted = want_hex.as_str().unwrap().trim().is_empty();
         // An expectation the apply did not write pins an object the
         // transaction must leave ALONE: it passes when it equals the seated
         // pre-image (finding 143's rule; finding 154's refused burn pins the
         // owner's page and the issuer's root this way).
         let Some(ent) = mods.get(&key32(k)) else {
+            assert!(!want_deleted, "target {k} must be deleted by the apply, which never wrote it");
             let pre_hex = bundle["pre"][k].as_str().unwrap_or_default().trim().to_uppercase();
             assert_eq!(
                 want_hex.as_str().unwrap().trim().to_uppercase(),
@@ -147,8 +152,14 @@ fn run_bundle(bundle_json: &str) {
             continue;
         };
         let bytes = match ent {
-            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => b.clone(),
-            SandboxEntry::Deleted => panic!("target {k} deleted?"),
+            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => {
+                assert!(!want_deleted, "target {k} must be deleted by the apply, which wrote it instead");
+                b.clone()
+            }
+            SandboxEntry::Deleted => {
+                assert!(want_deleted, "target {k} deleted?");
+                continue;
+            }
         };
         let mut jv: Value = serde_json::from_slice(&bytes).unwrap();
         canon_for_encode(&mut jv);
@@ -228,4 +239,16 @@ fn nftoken_create_offer_with_a_past_expiration_is_refused() {
 #[test]
 fn nft_buy_offer_from_an_unfunded_buyer_is_tec_unfunded_offer_106850559() {
     run_bundle(include_str!("vectors/nft_buy_offer_from_an_unfunded_buyer_is_tec_unfunded_offer_106850559.json"));
+}
+
+/// Finding 245 (#106898039 8C6528F472A7): rNBpHhJcev accepts rKqqb5QZXV's
+/// sell offer FBA94DA4 — Amount 0, Destination the submitter — whose
+/// Expiration 842038938 lies four days before the parent close 842389472.
+/// `checkOffer` refuses it with tecEXPIRED before anything else is judged
+/// (NFTokenAcceptOffer.cpp:75, hasExpired = parentCloseTime >= Expiration);
+/// we moved the token and wrote its pages, fifteen times across
+/// #106898039-#106898413.
+#[test]
+fn nft_accept_of_an_expired_sell_offer_is_tec_expired_106898039() {
+    run_bundle(include_str!("vectors/nft_accept_of_an_expired_sell_offer_is_tec_expired_106898039.json"));
 }

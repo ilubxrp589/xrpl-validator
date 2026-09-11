@@ -731,6 +731,7 @@ struct OfferSle {
     owner_node: Option<u64>,
     offer_node: Option<u64>,
     destination: Option<[u8; 20]>,
+    expiration: Option<u64>,
 }
 
 /// `accountFunds(view, payer, needed, ...) < needed` for an XRP-priced NFT
@@ -814,6 +815,7 @@ fn read_offer(sandbox: &Sandbox, key: Hash256) -> Option<OfferSle> {
         owner_node: node_hint(o.get("OwnerNode")),
         offer_node: node_hint(o.get("NFTokenOfferNode")),
         destination: o.get("Destination").and_then(decode_account_id),
+        expiration: o.get("Expiration").and_then(|v| v.as_u64()),
     })
 }
 
@@ -987,6 +989,12 @@ impl Transactor for NFTokenAcceptOfferTransactor {
         // rippled's `checkOffer` (NFTokenAcceptOffer.cpp): a named offer that is
         // the zero hash, or that is not in the ledger, is tecOBJECT_NOT_FOUND —
         // and that verdict is reached BEFORE any of the checks below.
+        //
+        // An EXPIRED offer passes preclaim. Before fixCleanup3_1_3 `checkOffer`
+        // refused it here with tecEXPIRED and it sat on the ledger for ever;
+        // under the amendment (NFTokenAcceptOffer.cpp:69-75, rippled 3.3.0) it
+        // is let through so that doApply can DELETE it — see finding 245 in
+        // do_apply below. The pre-amendment verdict is gone from mainnet.
         let read = |field: &str| -> Result<Option<OfferSle>, TxResult> {
             let Some(v) = tx.fields.get(field) else { return Ok(None) };
             match hash256_from(v) {
@@ -1062,6 +1070,34 @@ impl Transactor for NFTokenAcceptOfferTransactor {
     fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
         let sell_ref = tx.fields.get("NFTokenSellOffer").and_then(hash256_from);
         let buy_ref = tx.fields.get("NFTokenBuyOffer").and_then(hash256_from);
+
+        // Finding 245 — rippled 3.3.0, fixCleanup3_1_3 (NFTokenAcceptOffer.cpp
+        // :446-477): the FIRST act of doApply is to delete every named offer
+        // that has expired — `hasExpired(view(), (*offer)[~sfExpiration])`,
+        // parentCloseTime >= Expiration, buy then sell — and, if any was,
+        // return tecEXPIRED. The tec reset then re-applies exactly those
+        // erasures (Transactor.cpp processPersistentChanges: ltNFTOKEN_OFFER
+        // and ltCREDENTIAL survive a tecEXPIRED), so the offer, its owner-dir
+        // and offer-dir links and the owner's reserve unit all go while the
+        // accept itself never happens.
+        // #106898039 8C6528F472A7 — and fourteen more tries by rNBpHhJcev
+        // through #106898413: sell offer FBA94DA4 (Amount 0, Destination the
+        // submitter) expired at 842038938, four days before the parent close
+        // 842389472. Mainnet deleted it and claimed the fee; we moved the
+        // token and wrote its pages every time.
+        let close = sandbox.base().header.close_time as u64;
+        let mut found_expired = false;
+        for key in [buy_ref, sell_ref].into_iter().flatten() {
+            if let Some(o) = read_offer(sandbox, key) {
+                if o.expiration.is_some_and(|e| close >= e) {
+                    delete_offer(sandbox, &o);
+                    found_expired = true;
+                }
+            }
+        }
+        if found_expired {
+            return TxResult::Expired;
+        }
 
         // Brokered mode: both offers named; tx.account is the broker.
         if let (Some(sk), Some(bk)) = (sell_ref, buy_ref) {
