@@ -786,4 +786,13 @@ fn payment_book_fill_leaves_a_1e96_offer_untouched() {
 #[test]
 fn payment_self_owned_offer_cross_moves_no_line_106913409() {
     run_bundle(include_str!("vectors/payment_self_owned_offer_cross_moves_no_line_106913409.json"));
+/// Finding 262 — #106913870 B63308CA10E3: rapido's partial XRP→USDT
+/// self-payment with DeliverMin 0.0777 against a USDT line whose limit is
+/// 9999999999999999e79. `dest_receivable` computed limit − held through
+/// `me_sub`, whose u128 rescale saturates 104 orders down, and the room
+/// read 0.034 USDT: the strand was sized to it and the payment answered
+/// tecPATH_PARTIAL where mainnet delivers 0.07781135333001987.
+#[test]
+fn payment_dest_limit_at_stamount_ceiling_is_not_a_cap_106913870() {
+    run_bundle(include_str!("vectors/payment_dest_limit_at_stamount_ceiling_is_not_a_cap_106913870.json"));
 }

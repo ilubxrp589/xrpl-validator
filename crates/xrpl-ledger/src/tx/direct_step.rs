@@ -164,7 +164,10 @@ pub(crate) fn max_src_to_dst(sandbox: &Sandbox, hop: &DirectHop) -> ox::Me {
             if ox::me_cmp(dst_holds, limit) != std::cmp::Ordering::Less {
                 (0, 0)
             } else {
-                ox::me_sub(limit, dst_holds)
+                // Finding 262: IOUAmount subtraction — a limit filed at
+                // STAmount's ceiling (9999999999999999e79) must not saturate
+                // `me_sub`'s u128 rescale into a 0.034 "room".
+                ox::stamount_signed_add(false, limit, true, dst_holds).1
             }
         }
     }

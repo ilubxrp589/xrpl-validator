@@ -1012,8 +1012,19 @@ pub(crate) fn dest_receivable(sandbox: &Sandbox, dest: &[u8; 20], leg: &Leg) -> 
     let held = if dest_holds { bmag } else { (0, 0) };
     let limit_field = if dest_low { "LowLimit" } else { "HighLimit" };
     let limit = keylet::amount_mant_exp(&line[limit_field]).unwrap_or((0, 0));
+    // Finding 262 (#106913870 B63308CA10E3, rapido's XRP→USDT self-payment
+    // with DeliverMin): the headroom is an IOUAmount subtraction, not an
+    // exact one. rapido files its limits at STAmount's ceiling —
+    // 9999999999999999e79 — and `me_sub` rescales the limit to the held
+    // balance's exponent (1e-25 here), 104 orders down, which
+    // `me_rescale` saturates at u128::MAX: the "room" came out as
+    // 340282366920938463463373607431768211455e-40 = 0.034 USDT, the
+    // strand was sized to that, 0.0341 landed against a 0.0777 DeliverMin
+    // and we answered tecPATH_PARTIAL where mainnet delivered the whole
+    // 0.07781135333001987. `stamount_signed_add` is rippled's arithmetic:
+    // an operand more than 22 orders below the other is not a change.
     if me_cmp(limit, held).is_gt() {
-        Some(me_sub(limit, held))
+        Some(stamount_signed_add(false, limit, true, held).1)
     } else {
         Some((0, 0))
     }
