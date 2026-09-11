@@ -1301,3 +1301,16 @@ fn offer_bridge_ending_member_keeps_its_own_ceil_out_second_specimen_106891531()
 fn offer_pool_exhausting_slice_debits_the_gross_fold_remainder_106871187() {
     run_bundle(include_str!("vectors/offer_pool_exhausting_slice_debits_the_gross_fold_remainder_106871187.json"));
 }
+
+/// Finding 257 — #106906800 062555D5D965: rMsXVzCug7's tfPassive 0.02472 BTC
+/// → 1912.65096 RLUSD, bridged through the BTC/XRP and XRP/RLUSD pools.
+/// rippled crosses it in seven rounds; the seventh is both-pool-served and
+/// admitted because a single-path leg's upper bound is `getOffer(lobQuality)`
+/// — the `changeSpotPriceQuality` offer sized against the book tip
+/// (0.01186133456634961 BTC / 672206925 XRP) — not the tip itself. Our
+/// single-path bound priced leg A at its tip, dropped the round, placed the
+/// 339.204090452 RLUSD remainder and cascaded 50 objects across the ledger.
+#[test]
+fn offer_bridged_single_path_bound_is_the_anchored_pool_offer_106906800() {
+    run_bundle(include_str!("vectors/offer_bridged_single_path_bound_is_the_anchored_pool_offer_106906800.json"));
+}

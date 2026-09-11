@@ -3779,11 +3779,40 @@ fn cross_bridged(
                 (_, bk) => bk,
             }
         };
-        let qa_ub = if multi_prev { qa } else { single_ub(spot_a, qa_book, a_unb_raw) };
+        // Finding 257 (#106906800 062555D5D965, rMsXVzCug7's tfPassive
+        // 0.02472 BTC → 1912.65096 RLUSD bridged through the BTC/XRP and
+        // XRP/RLUSD pools): rippled's SINGLE-path bound for a leg whose pool
+        // is live is `tip()` = `getOffer(lobQuality)` — the offer
+        // `changeSpotPriceQuality` sizes AGAINST the book tip, whose average
+        // quality sits between the spot and the tip (finding 99's rule for
+        // the direct walk, AMMLiquidity.cpp:184-222) — and only the
+        // qualityThreshold override (unb) or an empty book hands it the
+        // spot. `single_ub` knew spot and book alone, so leg A here was
+        // bounded at its BTC/XRP tip (1.7776e-11 × leg B = 1.3016e-5 against
+        // the 1.2944e-5 limit) and the seventh round — both legs pool-served,
+        // in 0.004377774539248429 BTC for the last 339.204090452 RLUSD — was
+        // never attempted: we placed the remainder mainnet had crossed, and
+        // 50 later objects in the ledger cascaded off the phantom offer.
+        // A bridge leg's peeked head: (quality, key, offer, maker, gives, wants).
+        type LegPeek = Option<(u64, Hash256, serde_json::Value, [u8; 20], Me, Me)>;
+        let anch_ub = |sb: &Sandbox,
+                       am: &Option<crate::tx::amm_swap::Amm>,
+                       peek: &LegPeek,
+                       out_leg: &Leg, in_leg: &Leg, spot: Option<Me>, book: Option<Me>, unb: bool| -> Option<Me> {
+            match (am, peek) {
+                (Some(a), Some((q, ..))) if !(threshold_self != 0 && threshold_self < *q) => {
+                    crate::tx::amm_swap::anchored_offer_quality(sb, a, out_leg, in_leg, *q)
+                        .map(rate_me)
+                        .or_else(|| single_ub(spot, book, unb))
+                }
+                _ => single_ub(spot, book, unb),
+            }
+        };
+        let qa_ub = if multi_prev { qa } else { anch_ub(sandbox, &amm_a, &apeek, &xrp_leg, gets_leg, spot_a, qa_book, a_unb_raw) };
         let qb_ub = if multi_prev {
             if b_use_amm_ub { b_fib.as_ref().map(|(q, _)| *q) } else { qb_book }
         } else {
-            single_ub(spot_b, qb_book, b_unb_raw)
+            anch_ub(sandbox, &amm_b, &bpeek, pays_leg, &xrp_leg, spot_b, qb_book, b_unb_raw)
         };
         let bq_ub = match (qa_ub, qb_ub) {
             (Some((am, ae)), Some((bm, be))) => Some(norm16((am * bm, ae + be))),
