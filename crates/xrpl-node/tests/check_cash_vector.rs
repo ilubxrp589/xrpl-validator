@@ -152,3 +152,13 @@ fn check_cash_with_deliver_min_takes_everything_send_max_buys_106849342() {
 fn check_cash_writer_shortfall_is_path_partial_in_preclaim_106868992() {
     run_bundle(include_str!("vectors/check_cash_writer_shortfall_is_path_partial_in_preclaim_106868992.json"));
 }
+
+/// Finding 246 (#106900377 A252917DB8E8): rpcjmdWFCQ — neither writer nor
+/// destination — cancels rDoxEVqFy3's check 3FF6163A to rJdFnb1nif after
+/// its Expiration 842398366 (parent close 842398501). An expired check may
+/// be cancelled by anyone (CancelCheck.cpp:56-66): the check, both directory
+/// links and the writer's reserve unit go; we refused with tecNO_PERMISSION.
+#[test]
+fn check_cancel_of_an_expired_check_by_a_stranger_106900377() {
+    run_bundle(include_str!("vectors/check_cancel_of_an_expired_check_by_a_stranger_106900377.json"));
+}

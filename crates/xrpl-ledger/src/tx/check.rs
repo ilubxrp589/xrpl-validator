@@ -548,14 +548,30 @@ impl Transactor for CheckCancelTransactor {
             Err(_) => return TxResult::Malformed,
         };
 
-        // Only the creator or destination may cancel
+        // Only the creator or destination may cancel a LIVE check; an EXPIRED
+        // one, anyone (CancelCheck.cpp:56-66):
+        //     if (!optExpiry || (ctx.view.parentCloseTime() < timepoint{duration{*optExpiry}}))
+        //         if (acctId != (*sleCheck)[sfAccount] && acctId != (*sleCheck)[sfDestination])
+        //             return tecNO_PERMISSION;
+        // Finding 246: #106900377 A252917DB8E8 (then #106900393, #106900408) —
+        // rpcjmdWFCQ, neither writer nor destination, cancels rDoxEVqFy3's
+        // check 3FF6163A to rJdFnb1nif, Expiration 842398366 against a parent
+        // close of 842398501. Mainnet deletes the check, both directory links
+        // and the writer's reserve unit; we claimed the fee with
+        // tecNO_PERMISSION. The receipt file's most-logged result-code class
+        // (16,134 entries since #106628973): one sweeper account cancelling
+        // other people's dead checks.
         let creator = check.get("Account").and_then(|a| parse_account_id(a));
         let dest = check.get("Destination").and_then(|d| parse_account_id(d));
 
         let is_creator = creator.map_or(false, |c| c == tx.account);
         let is_dest = dest.map_or(false, |d| d == tx.account);
+        let expired = check
+            .get("Expiration")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|e| sandbox.base().header.close_time as u64 >= e);
 
-        if !is_creator && !is_dest {
+        if !expired && !is_creator && !is_dest {
             return TxResult::NoPermission;
         }
 
