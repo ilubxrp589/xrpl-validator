@@ -1264,3 +1264,27 @@ fn offer_bridge_rev_extent_must_not_reap_an_untouched_offer_106873753() {
 fn offer_bridge_leg_a_funds_capped_head_rounds_its_in_down_106891190() {
     run_bundle(include_str!("vectors/offer_bridge_leg_a_funds_capped_head_rounds_its_in_down_106891190.json"));
 }
+
+/// Finding 250 (#106891330 9C0074184E52): rnCEEqDn sells 1000 XAH for 2 RLUSD
+/// (IoC) through XAH→XRP→RLUSD. Leg A's level (page 1.042861612264053e-4)
+/// holds raYbn9's C33544FF whole (1008062 drops, 105.1269162582119 XAH) and
+/// B30D68E1 for the rest, 457838 drops; the pass is OUT-limited by leg B's
+/// 2 RLUSD, so the ending member is sized by limitStepOut at the page rate:
+/// ceil16(457838 × 1.042861612264053e-4) = 47.74616748357495. The pass's in
+/// is the 16-digit fold of the two, 152.8730837417868 — the fold's lost
+/// digit is the taker's. We handed the ending member `total − Σprev` =
+/// 47.7461674835749, one ulp down on the maker's line and up on the offer's
+/// TakerPays (752.2538325164251 vs 752.253832516425).
+#[test]
+fn offer_bridge_ending_member_keeps_its_own_ceil_out_the_fold_loss_is_the_takers_106891330() {
+    run_bundle(include_str!("vectors/offer_bridge_ending_member_keeps_its_own_ceil_out_the_fold_loss_is_the_takers_106891330.json"));
+}
+
+/// Finding 250, second specimen (#106891531 B8703A147B03): the same bot two
+/// hundred ledgers on, the fold rounding the other way — raYbn9's 70510074
+/// ends slice 2 (570963 drops) and rested at 940.456460527688 on mainnet
+/// where our `total − Σprev` left 940.4564605276879.
+#[test]
+fn offer_bridge_ending_member_keeps_its_own_ceil_out_second_specimen_106891531() {
+    run_bundle(include_str!("vectors/offer_bridge_ending_member_keeps_its_own_ceil_out_second_specimen_106891531.json"));
+}

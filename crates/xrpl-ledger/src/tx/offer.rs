@@ -5654,15 +5654,22 @@ thr={t:?} admits_trunc={} admits_up={}",
                                     None => lg,
                                     Some(fr) => mul_ratio(lg, 1_000_000_000, fr as u128, false),
                                 }
+                            } else if m.6 && me_cmp(take, m.5).is_ge() {
+                                m.4
                             } else {
-                                let (neg, left) = stamount_signed_add(false, gets_in, true, dealt);
-                                if !neg && !me_is_zero(left) {
-                                    left
-                                } else if m.6 && me_cmp(take, m.5).is_ge() {
-                                    m.4
-                                } else {
-                                    mul_round16_up(take, r)
-                                }
+                                // Finding 250 (#106891330 9C0074184E52 and #106891531
+                                // B8703A147B03 — rnCEEqDn's XAH→XRP→RLUSD IoC sells): an
+                                // OUT-limited pass ends in `limitStepOut`, so the ending
+                                // member's in is ITS OWN ceil_out at the page rate
+                                // (457838 drops → 47.74616748357495), and the pass's in is
+                                // the sixteen-digit FOLD of the members (…8685 → …868):
+                                // the fold's lost digit is the TAKER's, never the maker's.
+                                // Handing the ending member `total − Σprev` moved that
+                                // digit onto the maker's line and the offer's TakerPays —
+                                // one ulp down on zz301 (fold rounded down), one ulp up on
+                                // zz302 (fold rounded up). The members' fold below is the
+                                // pass's in either way.
+                                mul_round16_up(take, r)
                             }
                         } else if m.6 {
                             m.4
@@ -5720,6 +5727,18 @@ thr={t:?} admits_trunc={} admits_up={}",
                         let mut dealt_gross = (0u128, 0i32);
                         let last = a_plan.len() - 1;
                         let n = a_group.len();
+                        // Finding 250, the taker's side: rippled debits the taker ONCE
+                        // per iteration — the DirectStep before the book is asked for
+                        // the pass's folded `stpAmt.in` (narration: `DirectStepI::rev
+                        // outReq 152.8730837417868`, one directSendNoFeeIOU) — while
+                        // every maker is credited its own `ofrAmt.in`. Debiting the
+                        // taker member by member rounds its line at each step:
+                        // 99904.37463029779 − 105.1269162582119 − 47.74616748357495
+                        // lands on …601 where the single fold debit lands on …600
+                        // (#106891330). A member that IS the taker keeps the old
+                        // per-member path (`move_leg_gross` skips sender == receiver).
+                        let fold_debit = !gets_leg.xrp
+                            && !a_plan.iter().any(|(i, _, _)| a_group[*i].2 == *taker);
                         for (pi, (idx, take, in_m)) in a_plan.iter().enumerate() {
                             let (akey, aoffer, amaker, a_gives0, a_wants0, ..) = &a_group[*idx];
                             let gross_m = if pi == last {
@@ -5729,15 +5748,22 @@ thr={t:?} admits_trunc={} admits_up={}",
                                 gross_in(fee_rate, *in_m)
                             };
                             if std::env::var("DX_WALK").is_ok() {
-                                eprintln!("DX_FILL legA book okey={} maker={} in={in_m:?} out={take:?} gross={gross_m:?} gives0={a_gives0:?} wants0={a_wants0:?} member={idx}/{n}",
+                                eprintln!("DX_FILL legA book okey={} maker={} in={in_m:?} out={take:?} gross={gross_m:?} fold_debit={fold_debit} gives0={a_gives0:?} wants0={a_wants0:?} member={idx}/{n}",
                                     hex::encode(akey.0), hex::encode(amaker));
                             }
+                            // A zero pay_gross credits the maker and leaves the taker
+                            // alone (`move_leg_gross`: gross ≠ net, gross zero).
                             settle_fill(sandbox, akey, aoffer, amaker, taker, taker,
-                                        &xrp_leg, gets_leg, *take, *in_m, gross_m, *take, *a_gives0, *a_wants0);
+                                        &xrp_leg, gets_leg, *take, *in_m,
+                                        if fold_debit { (0, 0) } else { gross_m },
+                                        *take, *a_gives0, *a_wants0);
                             if me_is_zero(available(sandbox, amaker, &xrp_leg)) {
                                 drained_next.insert((*amaker, xrp_leg.cur));
                             }
                             dealt_gross = stamount_signed_add(false, dealt_gross, false, gross_m).1;
+                        }
+                        if fold_debit && !me_is_zero(a_gross) && !passthrough(taker, gets_leg, PassRole::In) {
+                            line_adjust(sandbox, taker, gets_leg, a_gross, false);
                         }
                     }
                     (None, Some(_)) => {
