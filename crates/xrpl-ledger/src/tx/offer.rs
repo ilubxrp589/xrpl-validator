@@ -581,22 +581,41 @@ pub(crate) fn me_to_value_string(a: Me) -> String {
     if a.0 == 0 {
         return "0".into();
     }
+    // Finding 258: spell the value the way the decoder (rippled
+    // STAmount::getText, STAmount.cpp:696) spells it, so an engine write and
+    // a decoded pre-image of the SAME number are the same text: canonical
+    // 16-digit mantissa, then "<mantissa>e<exponent>" when the exponent is
+    // outside [-25, -5] (and non-zero), else decimal with the fraction's
+    // trailing zeros trimmed. The old decimal-only form padded a positive
+    // exponent with at most 40 zeros, so 9999999999999999e80 — the size of
+    // mainnet's gateway bridge offers — came back as 9999999999999999e40.
+    // #106908905 94F7CFBF7ADB: a 34322054.3 fill of the USDCAllow→USDC
+    // bridge offer 575275AC leaves both 1e96 amounts untouched (STAmount
+    // alignment truncates the addend; rippled drops the identical node,
+    // ApplyStateTable.cpp:152); we rewrote and threaded it.
     let (mut m, mut e) = a;
-    while m % 10 == 0 && e < 0 {
+    while m >= 10_000_000_000_000_000 {
         m /= 10;
         e += 1;
     }
-    if e >= 0 {
-        format!("{}{}", m, "0".repeat(e.min(40) as usize))
-    } else {
-        let s = m.to_string();
-        let k = (-e) as usize;
-        if s.len() > k {
-            format!("{}.{}", &s[..s.len() - k], &s[s.len() - k..])
-        } else {
-            format!("0.{}{}", "0".repeat(k - s.len()), s)
-        }
+    while m < 1_000_000_000_000_000 {
+        m *= 10;
+        e -= 1;
     }
+    if e != 0 && !(-25..=-5).contains(&e) {
+        return format!("{m}e{e}");
+    }
+    let s = m.to_string();
+    if e >= 0 {
+        return format!("{}{}", s, "0".repeat(e as usize));
+    }
+    let k = (-e) as usize;
+    let out = if s.len() > k {
+        format!("{}.{}", &s[..s.len() - k], &s[s.len() - k..])
+    } else {
+        format!("0.{}{}", "0".repeat(k - s.len()), s)
+    };
+    out.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 /// Remainder amount in the same JSON shape as the original tx field.
@@ -9458,6 +9477,22 @@ mod ulp_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn value_string_keeps_an_exponent_80_amount_whole() {
+        // Finding 258: 9999999999999999e80 is STAmount's largest value; the
+        // formatter used to stop at 40 zeros.
+        let s = super::me_to_value_string((9_999_999_999_999_999, 80));
+        assert_eq!(s, "9999999999999999e80"); // the decoder's spelling too
+        assert_eq!(super::me_to_value_string((5, 3)), "5000");
+        assert_eq!(super::me_to_value_string((12345, -2)), "123.45");
+        assert_eq!(super::me_to_value_string((5, 11)), "5000000000000000e-4");
+        assert_eq!(super::me_to_value_string((7, -30)), "7000000000000000e-45");
+        assert_eq!(
+            crate::ledger::keylet::amount_mant_exp(&serde_json::Value::String(s)),
+            Some((9_999_999_999_999_999, 80))
+        );
+    }
+
     use super::*;
     use crate::ledger::header::LedgerHeader;
     use crate::ledger::sandbox::{apply_modifications, Sandbox};

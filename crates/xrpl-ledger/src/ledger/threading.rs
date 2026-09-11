@@ -48,6 +48,60 @@ fn canon_material(v: &mut serde_json::Value) {
     obj.remove("PreviousTxnID");
     obj.remove("PreviousTxnLgrSeq");
     obj.remove("index");
+    // Finding 258: an amount's VALUE is a number, not a spelling. The
+    // decoder and the engine write the same IOU differently once the
+    // exponent is large (9999999999999999e80 as a 96-digit string on one
+    // side, its scientific form on the other), and a textual compare then
+    // called an untouched bridge offer changed and threaded it. Compare
+    // every amount by its canonical (mantissa, exponent).
+    for (_, f) in obj.iter_mut() {
+        canon_amount(f);
+    }
+}
+
+/// Rewrite an amount — a drops string or an {currency, issuer, value}
+/// object — so that equal values spell the same.
+fn canon_amount(f: &mut serde_json::Value) {
+    // Textual canonicalisation — no integer parse, so a 96-digit spelling
+    // and its scientific twin meet as the same (digits, exponent).
+    let canon = |s: &str| -> Option<String> {
+        let neg = s.starts_with('-');
+        let s = s.trim_start_matches('-');
+        let (mant, mut exp): (&str, i64) = match s.find(['e', 'E']) {
+            Some(i) => (&s[..i], s[i + 1..].parse().ok()?),
+            None => (s, 0),
+        };
+        let mut digits = String::with_capacity(mant.len());
+        for (i, ch) in mant.chars().enumerate() {
+            match ch {
+                '0'..='9' => digits.push(ch),
+                '.' => exp -= (mant.len() - i - 1) as i64,
+                _ => return None,
+            }
+        }
+        let trimmed = digits.trim_start_matches('0');
+        let tail_zeros = trimmed.len() - trimmed.trim_end_matches('0').len();
+        let core = &trimmed[..trimmed.len() - tail_zeros];
+        if core.is_empty() {
+            return Some("0".into());
+        }
+        Some(format!("{}{}e{}", if neg { "-" } else { "" }, core, exp + tail_zeros as i64))
+    };
+    match f {
+        serde_json::Value::Object(o) => {
+            if let Some(serde_json::Value::String(v)) = o.get("value") {
+                if let Some(c) = canon(v) {
+                    o.insert("value".into(), serde_json::Value::String(c));
+                }
+            }
+        }
+        serde_json::Value::String(v) if v.bytes().all(|b| b.is_ascii_digit()) && !v.is_empty() => {
+            if let Some(c) = canon(v) {
+                *f = serde_json::Value::String(c);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Content-equal modulo pointer spelling and existing threading — the writes

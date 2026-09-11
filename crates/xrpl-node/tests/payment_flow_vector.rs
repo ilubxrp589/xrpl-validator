@@ -764,3 +764,14 @@ fn payment_dry_source_without_partial_payment_is_tec_path_partial_106905925() {
 fn payment_iou_sender_holding_nothing_is_tec_path_dry_at_strand_build() {
     run_bundle(include_str!("vectors/payment_iou_sender_holding_nothing_is_tec_path_dry_at_build_106908423.json"));
 }
+
+/// Finding 258 — #106908905 94F7CFBF7ADB: 34322054.3 USDCAllow→USDC through
+/// the bridge offer 575275AC whose TakerPays = TakerGets = 9999999999999999e80.
+/// The fill leaves both amounts untouched in STAmount arithmetic and rippled
+/// drops the identical node (ApplyStateTable.cpp:152) — the offer is pinned
+/// to its pre-image here. `me_to_value_string` capped the exponent at 40
+/// zeros, so we wrote the offer back as 9999999999999999e40 and threaded it.
+#[test]
+fn payment_book_fill_leaves_a_1e96_offer_untouched() {
+    run_bundle(include_str!("vectors/payment_book_fill_leaves_a_1e96_offer_untouched_106908905.json"));
+}
