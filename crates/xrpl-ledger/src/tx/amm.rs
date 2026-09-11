@@ -1830,9 +1830,9 @@ impl Transactor for AMMWithdrawTransactor {
         // being the two RippleStates and the AccountRoot the payout touches.
         //
         // Not modelled: rippled returns tecAMM_FAILED when either side rounds
-        // to zero, and treats LPTokenIn == lptAMMBalance as a full withdrawal.
-        // Neither is exercised by a known case; left with the other deferred
-        // AMM rounding question rather than guessed at.
+        // to zero. LPTokenIn == lptAMMBalance is the full withdrawal — the
+        // proportional payout at frac 1 pays both balances whole, and the
+        // tail below then tears the AMM down (finding 256).
         let lp_token_in = tx.fields.get("LPTokenIn").and_then(keylet::amount_mant_exp);
         let has_explicit_amount =
             tx.fields.get("Amount").is_some() || tx.fields.get("Amount2").is_some();
@@ -2105,6 +2105,22 @@ impl Transactor for AMMWithdrawTransactor {
             if mag.0 == 0 {
                 tear_down_lp_line(sandbox, &tx.account, &amm_acct, lp_key, &line);
             }
+        }
+        // Finding 256: LAST LP OUT by tfLPToken. `LPTokenIn == lptAMMBalance`
+        // is rippled's full withdrawal (AMMWithdraw.cpp:852, both balances
+        // paid out whole) and `deleteAMMAccountIfEmpty` (:800-820) then tears
+        // the AMM down once the new LPTokenBalance is zero — pool lines,
+        // AMM object, owner directory and the pool ACCOUNT — exactly as the
+        // tfWithdrawAll arm above already does. This tail only tore the LP
+        // line down. #106909010 9D68FB6F8D41: rBLGrfTgk redeems all
+        // 43377070.68046511 LP of the BCHAMPGF/YOLO pool; mainnet deletes
+        // six objects, we left the pool account, AMM and its directory
+        // standing (three present-vs-deleted receipts).
+        let lpt_zero = ox::json_at(sandbox, &amm_key)
+            .and_then(|o| o["LPTokenBalance"]["value"].as_str().map(|v| v == "0"))
+            .unwrap_or(false);
+        if lpt_zero {
+            delete_amm(sandbox, &amm_key, &amm_acct, tx);
         }
         TxResult::Success
     }

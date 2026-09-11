@@ -66,7 +66,12 @@ fn withdraw_all_line_is_byte_exact() {
         // transaction must leave ALONE: it passes when it equals the seated
         // pre-image (finding 143's rule; finding 156's refused withdraw pins
         // the pool and its lines this way).
+        // An EMPTY expectation is a deletion pin (finding 158's rule; finding
+        // 256's last-LP withdrawal pins six of them): mainnet's meta deleted
+        // the object in this transaction, so must the apply.
+        let want_deleted = want_hex.as_str().unwrap().trim().is_empty();
         let Some(ent) = mods.get(&key32(k)) else {
+            assert!(!want_deleted, "target {k} must be deleted by the apply, which never wrote it");
             let pre_hex = bundle["pre"][k].as_str().unwrap_or_default().trim().to_uppercase();
             assert_eq!(
                 want_hex.as_str().unwrap().trim().to_uppercase(),
@@ -76,8 +81,14 @@ fn withdraw_all_line_is_byte_exact() {
             continue;
         };
         let bytes = match ent {
-            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => b.clone(),
-            SandboxEntry::Deleted => panic!("target {k} deleted?"),
+            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => {
+                assert!(!want_deleted, "target {k} must be deleted by the apply, which wrote it instead");
+                b.clone()
+            }
+            SandboxEntry::Deleted => {
+                assert!(want_deleted, "target {k} deleted?");
+                continue;
+            }
         };
         let mut jv: Value = serde_json::from_slice(&bytes).unwrap();
         canon_for_encode(&mut jv);
@@ -140,7 +151,12 @@ fn run_bundle(bundle_json: &str) {
         // transaction must leave ALONE: it passes when it equals the seated
         // pre-image (finding 143's rule; finding 156's refused withdraw pins
         // the pool and its lines this way).
+        // An EMPTY expectation is a deletion pin (finding 158's rule; finding
+        // 256's last-LP withdrawal pins six of them): mainnet's meta deleted
+        // the object in this transaction, so must the apply.
+        let want_deleted = want_hex.as_str().unwrap().trim().is_empty();
         let Some(ent) = mods.get(&key32(k)) else {
+            assert!(!want_deleted, "target {k} must be deleted by the apply, which never wrote it");
             let pre_hex = bundle["pre"][k].as_str().unwrap_or_default().trim().to_uppercase();
             assert_eq!(
                 want_hex.as_str().unwrap().trim().to_uppercase(),
@@ -150,8 +166,14 @@ fn run_bundle(bundle_json: &str) {
             continue;
         };
         let bytes = match ent {
-            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => b.clone(),
-            SandboxEntry::Deleted => panic!("target {k} deleted?"),
+            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => {
+                assert!(!want_deleted, "target {k} must be deleted by the apply, which wrote it instead");
+                b.clone()
+            }
+            SandboxEntry::Deleted => {
+                assert!(want_deleted, "target {k} deleted?");
+                continue;
+            }
         };
         let mut jv: Value = serde_json::from_slice(&bytes).unwrap();
         canon_for_encode(&mut jv);
@@ -254,4 +276,16 @@ fn amm_withdraw_lp_tokens_snap_to_the_pool_balance_precision_106782285() {
 #[test]
 fn amm_withdraw_refuses_burning_the_supply_for_one_side_106833279() {
     run_bundle(include_str!("vectors/amm_withdraw_refuses_burning_the_supply_for_one_side_106833279.json"));
+}
+
+/// Finding 256 — #106909010 9D68FB6F8D41: a tfLPToken withdrawal whose
+/// LPTokenIn equals the pool's whole LPTokenBalance (43377070.68046511) —
+/// the last LP out. rippled treats it as the full withdrawal
+/// (AMMWithdraw.cpp:852) and `deleteAMMAccountIfEmpty` (:800-820) then
+/// deletes the pool lines, the AMM object, its owner directory and the pool
+/// account; the tfLPToken tail only tore the LP line down and left the
+/// three objects standing (present-vs-deleted receipts).
+#[test]
+fn amm_withdraw_last_lp_by_lptoken_deletes_the_amm_106909010() {
+    run_bundle(include_str!("vectors/amm_withdraw_last_lp_by_lptoken_deletes_the_amm_106909010.json"));
 }
