@@ -806,9 +806,7 @@ impl Transactor for AMMDepositTransactor {
         // requireAuth(WeakAuth) then checkFrozen for the depositor, before
         // any funding arithmetic — a depositor with no line to a
         // RequireAuth issuer is tecNO_LINE, an unauthorized line tecNO_AUTH,
-        // a frozen one tecFROZEN. Then each deposited amount's asset passes
-        // the STRONG check (:297) — no line at all is tecNO_LINE regardless
-        // of the issuer's flags. Finding 104 (#106721484 3F14213E0C76).
+        // a frozen one tecFROZEN. Finding 104 (#106721484 3F14213E0C76).
         for f in ["Asset", "Asset2"] {
             let Some(leg) = tx.fields.get(f).and_then(asset_leg) else { continue };
             if let Some(t) = ox::require_auth_ter(sandbox, &leg, &tx.account, false) {
@@ -818,9 +816,20 @@ impl Transactor for AMMDepositTransactor {
                 if t != TxResult::Success { return t; }
             }
         }
+        // Then each deposited amount's asset passes `checkAmount`'s
+        // requireAuth (AMMDeposit.cpp:321) — called with the DEFAULT
+        // AuthType::Legacy (TokenHelpers.h:340), NOT StrongAuth: no line at
+        // all is only tecNO_LINE when the issuer requires auth
+        // (RippleStateHelpers.cpp requireAuth); otherwise the account simply
+        // holds nothing and `balance` answers tecUNFUNDED_AMM. Finding 104
+        // read this as the strong check, and finding 254 pays for it:
+        // #106906914 587A372B07BA, r94eXEET's tfTwoAsset 10,000,000 XDX +
+        // 490.5611178 RLUSD deposit with NO RLUSD line and a permissive
+        // issuer — mainnet tecUNFUNDED_AMM, we claimed tecNO_LINE. Fee-only
+        // either way; a ter-mismatch receipt.
         for f in ["Amount", "Amount2"] {
             let Some(leg) = tx.fields.get(f).and_then(ox::leg_of) else { continue };
-            if let Some(t) = ox::require_auth_ter(sandbox, &leg, &tx.account, true) {
+            if let Some(t) = ox::require_auth_ter(sandbox, &leg, &tx.account, false) {
                 if t != TxResult::Success { return t; }
             }
             // AMMDeposit.cpp:330-346 `checkAmount`, while fixCleanup3_3_0 is

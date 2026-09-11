@@ -162,3 +162,14 @@ fn amm_deposit_refuses_a_pool_line_the_issuer_froze_106637600() {
 fn amm_two_asset_deposit_of_dust_is_tec_amm_invalid_tokens_106894782() {
     run_bundle(include_str!("vectors/amm_two_asset_deposit_of_dust_is_tec_amm_invalid_tokens_106894782.json"));
 }
+
+/// Finding 254 — #106906914 587A372B07BA: a tfTwoAsset XDX + RLUSD deposit
+/// by an account with NO RLUSD line whose issuer does not require auth.
+/// `checkAmount`'s requireAuth (AMMDeposit.cpp:321) is the DEFAULT
+/// AuthType::Legacy, not Strong: a missing line only fails when the issuer
+/// requires auth; otherwise `balance` finds nothing held and answers
+/// tecUNFUNDED_AMM. Finding 104's strong reading claimed tecNO_LINE.
+#[test]
+fn amm_deposit_no_line_to_a_permissive_issuer_is_tec_unfunded_amm() {
+    run_bundle(include_str!("vectors/amm_deposit_no_line_permissive_issuer_unfunded_106906914.json"));
+}
