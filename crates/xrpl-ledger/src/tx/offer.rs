@@ -5208,7 +5208,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                         let mut ins = (0u128, 0i32);
                         for m in &a_group {
                             cap = me_add_xrp(cap, m.5);
-                            let in_m = if m.6 { m.4 } else { mul_round16_up(m.5, r) };
+                            let in_m = if m.6 { m.4 } else { mul_round16_down(m.5, r) }; // F249: funds cap rounds down
                             ins = stamount_signed_add(false, ins, false, in_m).1;
                         }
                         (cap, ins, cap, Some((r, None)))
@@ -5314,7 +5314,22 @@ thr={t:?} admits_trunc={} admits_up={}",
                     if a_group.len() <= 1 {
                         return match a_qbook {
                             Some((r, whole)) if whole.is_none_or(|w| me_cmp(xrp, w).is_lt()) => {
-                                mul_round16_up(xrp, r)
+                                // Finding 249: at the head's own FUNDS cap this is
+                                // rippled's funds branch — `limitOut(ofrAmt, funds,
+                                // roundUp = false)` (BookStep.cpp:779-793) rounds the
+                                // in DOWN; below the cap the slice is limitStepOut's
+                                // roundUp = true. #106891190 4C8DF8AB9B00 (rnCEEqDn,
+                                // 1000 XAH → RLUSD IoC): rUtSVn's 1300000-drop head
+                                // can fund 1146425; page rate 1.042644145553122e-4 →
+                                // 119.53133145657379…, mainnet credits
+                                // 119.5313314565737 where we credited …738. The
+                                // same rule sizes every group member consumed AT its
+                                // funds cap (the `_down(m.5, r)` sites).
+                                if whole.is_none() && me_cmp(xrp, a_cap_xrp).is_eq() {
+                                    mul_round16_down(xrp, r)
+                                } else {
+                                    mul_round16_up(xrp, r)
+                                }
                             }
                             _ => me_muldiv(xrp, a_in_full, a_out_full, true),
                         };
@@ -5329,7 +5344,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                             break;
                         }
                         if me_cmp(rem, m.5).is_ge() {
-                            let in_m = if m.6 { m.4 } else { mul_round16_up(m.5, r) };
+                            let in_m = if m.6 { m.4 } else { mul_round16_down(m.5, r) }; // F249: funds cap rounds down
                             gets = stamount_signed_add(false, gets, false, in_m).1;
                             rem = me_sub(rem, m.5);
                         } else {
@@ -5353,7 +5368,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                         if me_is_zero(rem) {
                             break;
                         }
-                        let in_m = if m.6 { m.4 } else { mul_round16_up(m.5, r) };
+                        let in_m = if m.6 { m.4 } else { mul_round16_down(m.5, r) }; // F249: funds cap rounds down
                         if me_cmp(rem, in_m).is_ge() {
                             xrp = me_add_xrp(xrp, m.5);
                             rem = stamount_signed_add(false, rem, true, in_m).1;
@@ -5652,7 +5667,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                         } else if m.6 {
                             m.4
                         } else {
-                            mul_round16_up(m.5, r)
+                            mul_round16_down(m.5, r) // F249: funds cap rounds down
                         };
                         plan.push((idx, take, in_m));
                         dealt = stamount_signed_add(false, dealt, false, in_m).1;

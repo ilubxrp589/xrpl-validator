@@ -1252,3 +1252,15 @@ fn offer_rests_at_the_rate_of_the_full_drops_not_a_truncated_mantissa_106867574(
 fn offer_bridge_rev_extent_must_not_reap_an_untouched_offer_106873753() {
     run_bundle(include_str!("vectors/offer_bridge_rev_extent_must_not_reap_an_untouched_offer_106873753.json"));
 }
+
+/// Finding 249 (#106891190 4C8DF8AB9B00): rnCEEqDn sells 1000 XAH for RLUSD
+/// (IoC) through XAH→XRP→RLUSD; leg A's head, rUtSVn's 1300000-drop offer at
+/// page rate 1.042644145553122e-4, can fund only 1146425 drops. rippled's
+/// funds branch sizes it with `limitOut(ofrAmt, funds, roundUp = false)`
+/// (BookStep.cpp:779-793): in = 1146425 × rate rounded DOWN =
+/// 119.5313314565737 — we rounded up to …738, one ulp on the maker's XAH
+/// line. The head is deleted either way (its XRP side was exhausted).
+#[test]
+fn offer_bridge_leg_a_funds_capped_head_rounds_its_in_down_106891190() {
+    run_bundle(include_str!("vectors/offer_bridge_leg_a_funds_capped_head_rounds_its_in_down_106891190.json"));
+}
