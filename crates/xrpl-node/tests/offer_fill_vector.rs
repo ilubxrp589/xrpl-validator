@@ -1214,14 +1214,12 @@ fn offer_bridge_leg_a_takes_the_whole_level_into_one_pool_slice_106858067() {
 /// EUR), leaving D21ABBCA partially consumed. Our fills were byte-exact on
 /// both legs; the expired offer, its book page CA462483 and one OwnerCount
 /// unit stayed behind because cross_bridged never ran the rev extent.
-/// ⚠ OPEN, NOT FIXED. Finding 239's rev extent was withdrawn by finding 244
-/// (#106873753) because it reaped offers rippled's stream never steps onto —
-/// four ledgers running it removed rLDyWWMiW6's EE68DEE8, live on mainnet.
-/// This specimen still records the real divergence and must go green again
-/// when the extent's true reach is derived; the pair to satisfy is this
-/// bundle AND offer_bridge_rev_extent_must_not_reap_an_untouched_offer_106873753.
+/// Finding 244 withdrew the extent (it reaped rLDyWWMiW6's EE68DEE8 on
+/// #106873753, an offer rippled's stream never stepped onto); finding 251
+/// brought it back gated on the pass being CLOB-served — a pool-served pass
+/// only peeks the tip — and both this bundle and
+/// offer_bridge_rev_extent_must_not_reap_an_untouched_offer_106873753 hold.
 #[test]
-#[ignore = "finding 239 withdrawn by finding 244 — reach not yet derived"]
 fn offer_bridge_rev_pass_reaps_past_the_level_it_consumes_whole_106863376() {
     run_bundle(include_str!("vectors/offer_bridge_rev_pass_reaps_past_the_level_it_consumes_whole_106863376.json"));
 }
