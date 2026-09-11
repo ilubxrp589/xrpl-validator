@@ -1288,3 +1288,18 @@ fn offer_bridge_ending_member_keeps_its_own_ceil_out_the_fold_loss_is_the_takers
 fn offer_bridge_ending_member_keeps_its_own_ceil_out_second_specimen_106891531() {
     run_bundle(include_str!("vectors/offer_bridge_ending_member_keeps_its_own_ceil_out_second_specimen_106891531.json"));
 }
+
+/// Finding 243 (#106871187 7866B5998F0C): rLgwudPW86 sells 32.832483 EVR
+/// (TransferRate 1.002) for XAH, IoC, through the EVR/XAH pool in six
+/// Fibonacci slices. rippled's strand keeps `remainingIn` GROSS — `maxIn −
+/// sum(savedIns)` at sixteen digits — and the slice that exhausts it debits
+/// that remainder verbatim: 32.898147966 − 19.76837526058514 =
+/// 13.12977270541486 (the narration's sixth `directSendNoFeeIOU`). We
+/// re-grossed the NET remainder, 13.10356557426634 × 1.002 → …488, two ulps
+/// more, and the taker's EVR line ended at …78097 against mainnet's …78099.
+/// The five earlier slices, their grosses and the line chain between them
+/// were already exact.
+#[test]
+fn offer_pool_exhausting_slice_debits_the_gross_fold_remainder_106871187() {
+    run_bundle(include_str!("vectors/offer_pool_exhausting_slice_debits_the_gross_fold_remainder_106871187.json"));
+}

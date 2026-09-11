@@ -1469,6 +1469,17 @@ pub(crate) fn consume_fib(
     if n_cmp(take_out, rem_pays) == Ordering::Greater {
         add_fwd_excess(n_sub(take_out, rem_pays, Rnd::Near));
     }
+    if std::env::var("DX_AMM").is_ok() {
+        let exhaust = n_cmp(take_in, rem_gets) != Ordering::Less;
+        let g = match in_gross_cap {
+            Some(cap) if exhaust => cap,
+            _ => ox::gross_in(in_gross_rate, take_in),
+        };
+        eprintln!(
+            "DX_AMM fib settle iter={iters} take_in={take_in:?} take_out={take_out:?} gross={g:?} exhaust={exhaust} in_gross_cap={in_gross_cap:?} rem_gets={rem_gets:?} taker_avail={:?}",
+            ox::available(sandbox, taker, gets_leg)
+        );
+    }
     settle_slice(
         sandbox,
         taker,

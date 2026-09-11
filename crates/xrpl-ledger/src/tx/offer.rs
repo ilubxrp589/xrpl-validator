@@ -3436,8 +3436,26 @@ fn cross_bridged(
             let spent = me_sub(bounded, rem_gets);
             rem_gets = stamount_signed_add(false, chain, true, spent).1;
         }
-        if gets_gross_cap.is_some() && !me_is_zero(rem_gets) {
+        if let (Some(cap), false) = (gets_gross_cap, me_is_zero(rem_gets)) {
+            // Finding 243 (#106871187 7866B5998F0C, rLgwudPW86 32.832483 EVR → XAH
+            // IoC through the EVR/XAH pool, six fib slices): rippled's
+            // `remainingIn` is GROSS-primary — `maxIn − sum(savedIns)` at
+            // sixteen digits (StrandFlow) — and the slice that exhausts it
+            // debits that remainder verbatim, the net being derived. Re-grossing
+            // the NET remainder (13.10356557426634 × 1.002 → …488) sat two ulps
+            // above the fold remainder 13.12977270541486, and the taker's EVR
+            // line kept …78097 where mainnet keeps …78099. So the round's cap
+            // is the fold remainder always, not only when the line binds; the
+            // line bound (finding 212) still caps it below.
+            // The finding-212 comparison keeps the re-grossed NET chain as its
+            // yardstick — that is the figure the deferred line is measured
+            // against, and it also sets `rem_gets = bounded` so the exhausting
+            // slice's NET is the bounded one (#106823771: the pool takes
+            // 141.0277204892860, not the chain's …863). When the line does NOT
+            // bind, the round's cap is the gross fold remainder (finding 243);
+            // the exhausting slice then debits that and keeps the chain's net.
             let verb_gross = gross_in(fee_rate, rem_gets);
+            round_gross_cap = Some(rem_from_fold(cap, &saved_ins));
             let bound_gross = line_bound_gross(sandbox, taker, gets_leg, verb_gross);
             if me_cmp(bound_gross, verb_gross).is_lt() {
                 round_gross_cap = Some(bound_gross);
@@ -5767,6 +5785,12 @@ thr={t:?} admits_trunc={} admits_up={}",
                         }
                     }
                     (None, Some(_)) => {
+                        if std::env::var("DX_AMM").is_ok() {
+                            eprintln!(
+                                "DX_AMM legA slice settle gets_in={gets_in:?} a_gross={a_gross:?} xrp={xrp:?} in_exhausted={in_exhausted} exhaust_gross={exhaust_gross:?} saved_ins={saved_ins:?} taker_avail={:?}",
+                                available(sandbox, taker, gets_leg)
+                            );
+                        }
                         crate::tx::amm_swap::apply_slice(
                             sandbox, amm_a.as_ref().unwrap(), taker, taker, &xrp_leg, gets_leg, gets_in, a_gross, xrp,
                         );
