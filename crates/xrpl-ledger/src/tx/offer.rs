@@ -8033,8 +8033,25 @@ pub(crate) fn cross_engine_to_net(
                         };
                         in_gross_spent = stamount_signed_add(false, in_gross_spent, false, g).1;
                         saved_ins.push(g);
-                        line_adjust(sandbox, &maker, gets_leg, pay, true);
-                        taker_accs.1 = stamount_signed_add(false, taker_accs.1, false, g).1;
+                        // Finding 260 (#106913409 993BFC235125, r9nKwYtEbe's partial
+                        // RNTB→XRP self-payment): the taker crossing its OWN offer.
+                        // rippled's `accountSendIOU` returns before touching
+                        // anything when sender == receiver (TokenHelpers.cpp:1451),
+                        // fee included — the line never moves, while the strand's
+                        // actualIn still counts against remainingIn. We credited
+                        // the maker per fill and debited the taker once at pass
+                        // end — the same line, two half-even 16-digit adds — and
+                        // the 2e-9 they left made the driver's balance delta
+                        // disagree with the walk's exact spend, so it took the
+                        // delta: rem_in stood, the offer was crossed again for the
+                        // want remainder (offer residual 6218711 for mainnet's
+                        // 7264340) and the line rested 2 ulp low. The flow
+                        // bookkeeping above (in_gross_spent, saved_ins) is kept;
+                        // only the ledger movement is the no-op.
+                        if &maker != taker {
+                            line_adjust(sandbox, &maker, gets_leg, pay, true);
+                            taker_accs.1 = stamount_signed_add(false, taker_accs.1, false, g).1;
+                        }
                     }
                 }
                 if std::env::var("DX_FILL").is_ok() {

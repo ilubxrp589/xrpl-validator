@@ -775,3 +775,15 @@ fn payment_iou_sender_holding_nothing_is_tec_path_dry_at_strand_build() {
 fn payment_book_fill_leaves_a_1e96_offer_untouched() {
     run_bundle(include_str!("vectors/payment_book_fill_leaves_a_1e96_offer_untouched_106908905.json"));
 }
+
+/// Finding 260 — #106913409 993BFC235125: r9nKwYtEbe's partial circular
+/// RNTB→XRP payment (DeliverMin) crosses the pool, then its OWN offer
+/// C0C94607. rippled's `accountSend` is a no-op for sender == receiver, so
+/// the RNTB line never moves on that fill while the strand's actualIn
+/// (741178.0257434814) still exhausts SendMax. We credited and debited the
+/// same line — 2 ulp of drift — which made the driver distrust the walk's
+/// spend, keep crossing, and over-consume the offer (6218711 for 7264340).
+#[test]
+fn payment_self_owned_offer_cross_moves_no_line_106913409() {
+    run_bundle(include_str!("vectors/payment_self_owned_offer_cross_moves_no_line_106913409.json"));
+}
