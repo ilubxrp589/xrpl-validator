@@ -786,6 +786,8 @@ fn payment_book_fill_leaves_a_1e96_offer_untouched() {
 #[test]
 fn payment_self_owned_offer_cross_moves_no_line_106913409() {
     run_bundle(include_str!("vectors/payment_self_owned_offer_cross_moves_no_line_106913409.json"));
+}
+
 /// Finding 262 — #106913870 B63308CA10E3: rapido's partial XRP→USDT
 /// self-payment with DeliverMin 0.0777 against a USDT line whose limit is
 /// 9999999999999999e79. `dest_receivable` computed limit − held through
