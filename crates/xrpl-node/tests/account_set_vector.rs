@@ -104,3 +104,15 @@ fn account_set_empty_domain_removes_the_field() {
 fn account_set_clawback_needs_an_empty_owner_directory() {
     run_bundle(include_str!("vectors/accountset_clawback_owners_106703565.json"));
 }
+
+/// Finding 253 — #106906126 85C26301282E: AccountSet with SetFlag 5
+/// (asfAccountTxnID) on a root that carries no AccountTxnID. rippled stamps
+/// the field with the current tx hash in `Transactor::apply` BEFORE doApply
+/// (Transactor.cpp:906, `if (sle->isFieldPresent(sfAccountTxnID))`), and
+/// doApply's `makeFieldPresent` (AccountSet.cpp:380-383) then creates it as
+/// the ZERO hash — the arming transaction itself is never recorded; the next
+/// one is. We stamped after do_apply and wrote the arming tx's own hash.
+#[test]
+fn account_set_arming_account_txn_id_leaves_it_zero_until_the_next_tx() {
+    run_bundle(include_str!("vectors/accountset_arm_accounttxnid_zero_106906126.json"));
+}

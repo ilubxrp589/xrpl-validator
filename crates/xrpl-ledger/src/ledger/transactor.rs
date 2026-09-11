@@ -378,10 +378,24 @@ pub trait Transactor {
 /// still #51's C428A7A6 while PreviousTxnID threads to the tec fee write.
 /// (#106455036 E7C799A8 calibrated the success side: the second payment of
 /// the ledger leaves ITS hash.)
-pub fn stamp_account_txn_id(tx: &TxFields, sandbox: &mut Sandbox) {
+///
+/// `armed_before` is the field's presence BEFORE do_apply ran
+/// (`account_txn_id_armed`, read where the pipeline takes its post-common
+/// snapshot). rippled's stamp sits in `Transactor::apply` ahead of doApply
+/// (Transactor.cpp:906, `if (sle->isFieldPresent(sfAccountTxnID))`), so the
+/// AccountSet that ARMS the field — doApply's `makeFieldPresent`, the zero
+/// hash (AccountSet.cpp:380-383) — is never itself recorded; the next tx is.
+/// Finding 253, #106906126 85C26301282E: rKRQCkc9's SetFlag 5 lands a root
+/// with AccountTxnID 0000…0000 on mainnet; stamping after do_apply saw the
+/// freshly created field and wrote the arming tx's own hash.
+pub fn stamp_account_txn_id(tx: &TxFields, sandbox: &mut Sandbox, armed_before: bool) {
+    if !armed_before {
+        return;
+    }
     let key = keylet::account_root_key(&tx.account);
     let Some(data) = sandbox.read(&key) else { return };
     let Ok(mut acct) = serde_json::from_slice::<serde_json::Value>(&data) else { return };
+    // Still present: a ClearFlag 5 in the same tx removed it (AccountSet.cpp:386).
     if acct.get("AccountTxnID").is_none() {
         return;
     }
@@ -390,6 +404,17 @@ pub fn stamp_account_txn_id(tx: &TxFields, sandbox: &mut Sandbox) {
     if let Ok(bytes) = serde_json::to_vec(&acct) {
         sandbox.write(key, bytes);
     }
+}
+
+/// Whether the sender's root carries AccountTxnID right now — read before
+/// do_apply, it is what rippled's pre-doApply stamp would have seen (finding
+/// 253).
+pub fn account_txn_id_armed(tx: &TxFields, sandbox: &Sandbox) -> bool {
+    let key = keylet::account_root_key(&tx.account);
+    sandbox
+        .read(&key)
+        .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
+        .is_some_and(|acct| acct.get("AccountTxnID").is_some())
 }
 
 pub fn apply_common(tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {

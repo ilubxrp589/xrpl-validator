@@ -222,12 +222,15 @@ pub fn apply_transaction_set(
                     // Snapshot after apply_common so we can rollback do_apply
                     // changes on tec results (only fee + sequence should persist).
                     let common_snapshot = sandbox.snapshot();
+                    // Finding 253: the stamp answers the field's presence
+                    // BEFORE do_apply (rippled stamps ahead of doApply).
+                    let txn_id_armed = super::transactor::account_txn_id_armed(tx, &sandbox);
 
                     let apply_result = transactor.do_apply(tx, &mut sandbox);
                     if apply_result.is_success() {
                         // Success-only (Transactor.cpp:660; a tec rolls the
                         // stamp back with the rest of doApply's writes).
-                        super::transactor::stamp_account_txn_id(tx, &mut sandbox);
+                        super::transactor::stamp_account_txn_id(tx, &mut sandbox, txn_id_armed);
                         let mods = sandbox.into_modifications();
                         apply_modifications(&mut new_state, mods)?;
                         (TxResult::Success, tx.fee)
