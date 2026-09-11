@@ -1214,7 +1214,14 @@ fn offer_bridge_leg_a_takes_the_whole_level_into_one_pool_slice_106858067() {
 /// EUR), leaving D21ABBCA partially consumed. Our fills were byte-exact on
 /// both legs; the expired offer, its book page CA462483 and one OwnerCount
 /// unit stayed behind because cross_bridged never ran the rev extent.
+/// ⚠ OPEN, NOT FIXED. Finding 239's rev extent was withdrawn by finding 244
+/// (#106873753) because it reaped offers rippled's stream never steps onto —
+/// four ledgers running it removed rLDyWWMiW6's EE68DEE8, live on mainnet.
+/// This specimen still records the real divergence and must go green again
+/// when the extent's true reach is derived; the pair to satisfy is this
+/// bundle AND offer_bridge_rev_extent_must_not_reap_an_untouched_offer_106873753.
 #[test]
+#[ignore = "finding 239 withdrawn by finding 244 — reach not yet derived"]
 fn offer_bridge_rev_pass_reaps_past_the_level_it_consumes_whole_106863376() {
     run_bundle(include_str!("vectors/offer_bridge_rev_pass_reaps_past_the_level_it_consumes_whole_106863376.json"));
 }
@@ -1232,4 +1239,16 @@ fn offer_bridge_rev_pass_reaps_past_the_level_it_consumes_whole_106863376() {
 #[test]
 fn offer_rests_at_the_rate_of_the_full_drops_not_a_truncated_mantissa_106867574() {
     run_bundle(include_str!("vectors/offer_rests_at_the_rate_of_the_full_drops_not_a_truncated_mantissa_106867574.json"));
+}
+
+/// Finding 244 (#106873753 C4FEF57142AA): rMsXVzCug7's tfPassive BTC->RLUSD
+/// offer crosses NOTHING — mainnet touches six nodes and rests it. Finding
+/// 239's leg-B rev extent nevertheless walked the BTC->XRP->RLUSD bridge and
+/// reaped rLDyWWMiW6's EE68DEE8 (dead: its owner holds 0 RLUSD) together with
+/// its book page, owner page and OwnerCount. A dead offer is removed only when
+/// something actually contacts it, and rippled's rev pass runs per ITERATION —
+/// none ran here. The four keys are pinned as UNTOUCHED targets.
+#[test]
+fn offer_bridge_rev_extent_must_not_reap_an_untouched_offer_106873753() {
+    run_bundle(include_str!("vectors/offer_bridge_rev_extent_must_not_reap_an_untouched_offer_106873753.json"));
 }

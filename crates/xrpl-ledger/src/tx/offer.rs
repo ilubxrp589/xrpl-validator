@@ -3277,18 +3277,12 @@ fn cross_bridged(
     // so the cap is aligned on rippled's constant alone.
     let la = book_offer_ladder(sandbox, &base_a, 1000);
     let lb = book_offer_ladder(sandbox, &base_b, 1000);
-    // Finding 239 (#106863376 7597883D5031): leg B's rev extent needs the
-    // book's LEVELS, not just its ladder of offers — `rev_extent_reap` steps
-    // level by level. Same construction and same lifetime as the direct
-    // walk's `dirs`; a level this apply empties reads back as a deleted page
-    // and the stepper stops there on its own.
-    let dirs_b = sandbox.keys_with_prefix(&base_b.0[..24]);
-    let dir_at = |dirs: &[Hash256], q: u64| {
-        dirs.iter().position(|d| u64::from_be_bytes(d.0[24..32].try_into().unwrap_or_default()) == q)
-    };
-    // The rev scan's owner-count adjustments, carried across the rounds of one
-    // crossing exactly as the direct walk carries its own.
-    let mut oc_b: std::collections::HashMap<[u8; 20], u64> = Default::default();
+    // Finding 239 (#106863376 7597883D5031) gave leg B a level stepper here —
+    // the book's LEVELS (`keys_with_prefix(&base_b.0[..24])`), a `dir_at`
+    // locator and an owner-count carry, feeding `rev_extent_reap` after each
+    // round. Finding 244 withdrew that extent (see the round loop below), so
+    // its inputs went with it; rebuild them beside the extent when its true
+    // reach is derived.
     // Per-leg AMM liquidity: each bridge leg is a BookStep of its own pair.
     let amm_a = crate::tx::amm_swap::discover(sandbox, gets_leg, &xrp_leg, taker);
     let amm_b = crate::tx::amm_swap::discover(sandbox, &xrp_leg, pays_leg, taker);
@@ -4464,14 +4458,15 @@ thr={t:?} admits_trunc={} admits_up={}",
         // did. Leg B only. Leg A's rev want is not the strand's — it is
         // whatever leg B's rev pass asked for in XRP — and no specimen has
         // convicted it yet.
-        if flows_bridge {
-            if let Some(dj) = lb.get(bi).and_then(|(q, _)| dir_at(&dirs_b, *q)) {
-                rev_extent_reap(
-                    sandbox, &dirs_b, dj, if sell { None } else { Some(rem_pays) },
-                    taker, beneficiary, pays_leg, &xrp_leg, true, &mut oc_b, stale,
-                );
-            }
-        }
+        // Finding 239 REVERTED (see finding 244, #106873753 C4FEF57142AA):
+        // the leg-B rev extent reaped offers rippled's stream never steps
+        // onto — rMsXVzCug7's tfPassive offer crossed nothing, yet we removed
+        // rLDyWWMiW6's live-on-mainnet EE68DEE8 and its pages, four ledgers
+        // running. Neither `flows_bridge` nor the tighter "the bridge is the
+        // executing strand" bound stopped it, so the extent is withdrawn
+        // whole until its true reach is derived from a specimen that pins
+        // BOTH #106863376 (which needs the reap) and #106873753 (which must
+        // not have it).
         if std::env::var("DX_BRIDGE").is_ok() {
             eprintln!("DX_EST direct={est_direct:?} bridge={est_bridge:?} thr={threshold} order={order:?}");
             eprintln!("DX_BRIDGE dq={dq:?} bq={bq:?} bq_ub={bq_ub:?} thr={thr:?} order={order:?} di={di} ai={ai} bi={bi} ld={} la={} lb={}", ld.len(), la.len(), lb.len());
