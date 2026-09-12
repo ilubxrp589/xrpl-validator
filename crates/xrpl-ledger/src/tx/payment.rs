@@ -2243,7 +2243,22 @@ impl PaymentTransactor {
         let avail = if tx.account == leg.issuer {
             want // issuers mint their own IOU
         } else {
-            let held = ox::available(sandbox, &tx.account, &leg);
+            // Finding 265 (#106920314 BD1C16580721, #106920343 1C775FEE3763):
+            // paying the ISSUER is a one-step strand, and rippled's
+            // DirectStepI sizes it from `accountHolds(…, IgnoreFreeze)`
+            // (DirectStep.cpp maxPaymentFlow); the freeze is enforced by
+            // `checkFreeze` at strand build, which a one-step strand skips —
+            // "pure issue/redeem can't be frozen". `available` reads the
+            // holder through fhZERO_IF_FROZEN (right for offers and for the
+            // two-step strand), so a holder of rB3gZey7's GLOBALLY FROZEN JPY
+            // redeeming its whole 16.5947297373 to the issuer read as holding
+            // nothing, and finding 255 called the strand dry where mainnet
+            // moved it (tesSUCCESS). Redemption reads the raw holding.
+            let held = if dest == &leg.issuer {
+                crate::tx::amm_swap::holds(sandbox, &tx.account, &leg)
+            } else {
+                ox::available(sandbox, &tx.account, &leg)
+            };
             // Finding 181: the sender's hop is `DirectStepI::maxPaymentFlow`
             // (DirectStep.cpp:476-490), and when the sender holds NONE of the
             // issuer's IOU that hop ISSUES — the sender's own IOU, up to the

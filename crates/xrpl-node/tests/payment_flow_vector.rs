@@ -798,3 +798,13 @@ fn payment_self_owned_offer_cross_moves_no_line_106913409() {
 fn payment_dest_limit_at_stamount_ceiling_is_not_a_cap_106913870() {
     run_bundle(include_str!("vectors/payment_dest_limit_at_stamount_ceiling_is_not_a_cap_106913870.json"));
 }
+
+/// Finding 265 — #106920314 BD1C16580721: rGPdpPN2 redeems its whole
+/// 16.5947297373 JPY to the issuer rB3gZey7, which has lsfGlobalFreeze set.
+/// A one-step strand skips `checkFreeze` and sizes from the raw holding
+/// (`accountHolds(IgnoreFreeze)`), so mainnet moves it — tesSUCCESS; our
+/// frozen-holder-reads-zero funding made finding 255 call it tecPATH_DRY.
+#[test]
+fn payment_redeems_globally_frozen_iou_to_its_issuer_106920314() {
+    run_bundle(include_str!("vectors/payment_redeems_globally_frozen_iou_to_its_issuer_106920314.json"));
+}
