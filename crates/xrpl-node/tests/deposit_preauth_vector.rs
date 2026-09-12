@@ -145,3 +145,12 @@ fn deposit_preauth_entry_carries_flags_and_its_owner_directory_node_second_speci
 fn deposit_preauth_unauthorize_drops_the_emptied_owner_directory_106869297() {
     run_bundle(include_str!("vectors/deposit_preauth_unauthorize_drops_the_emptied_owner_directory_106869297.json"));
 }
+
+/// Finding 264 — #106919118 488994D99083: DepositPreauth(Authorize) by an
+/// account whose pre-fee balance is below the reserve at OwnerCount + 1.
+/// rippled's `checkReserve` (DepositPreauth.cpp:168-173) answers
+/// tecINSUFFICIENT_RESERVE before the entry exists; we created it.
+#[test]
+fn deposit_preauth_needs_the_owner_reserve_106919118() {
+    run_bundle(include_str!("vectors/deposit_preauth_needs_the_owner_reserve_106919118.json"));
+}

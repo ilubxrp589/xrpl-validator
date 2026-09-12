@@ -384,6 +384,25 @@ impl Transactor for DepositPreauthTransactor {
             if sandbox.exists(&dp_key) {
                 return TxResult::Duplicate;
             }
+            // Finding 264 (#106919118 488994D99083): a preauth entry counts
+            // against the creator's owner reserve — DepositPreauth.cpp:168-173
+            // `checkReserve(sleOwner, preFeeBalance_, {ownerCountDelta = 1})`,
+            // judged on the balance BEFORE the fee so the fee may dip into
+            // the reserve. rKcKQAeu1 authorises rDFdzbujD with 2 XRP less than
+            // its reserve at OwnerCount + 1; mainnet tecINSUFFICIENT_RESERVE,
+            // we created the entry.
+            {
+                let (bal, oc) = match crate::tx::offer::json_at(sandbox, &keylet::account_root_key(&tx.account)) {
+                    Some(a) => (
+                        a["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+                        a["OwnerCount"].as_u64().unwrap_or(0),
+                    ),
+                    None => return TxResult::NoAccount,
+                };
+                if bal.saturating_add(tx.fee) < crate::ledger::fees::account_reserve(sandbox, oc + 1) {
+                    return TxResult::InsufficientReserve;
+                }
+            }
             let mut dp_obj = serde_json::json!({
                 "LedgerEntryType": "DepositPreauth",
                 "Flags": 0,
