@@ -625,7 +625,41 @@ impl Transactor for EscrowFinishTransactor {
                 let line_key = keylet::ripple_state_key(&dest_id, &leg.issuer, &leg.cur);
                 let line = if dest_is_issuer { None } else { crate::tx::offer::json_at(sandbox, &line_key) };
                 if !dest_is_issuer && line.is_none() && dest_id != owner_id {
-                    return TxResult::NoLine;
+                    // Finding 266 (#106937018 D157B8D102BD): a token escrow
+                    // finished BY ITS DESTINATION creates the missing line.
+                    // rippled's `escrowUnlockApplyHelper<Issue>`
+                    // (EscrowHelpers.h) runs `trustCreate` when
+                    // `createAsset = destID == accountID_` (EscrowFinish.cpp:368)
+                    // — limit zero, NoRipple per the destination's
+                    // DefaultRipple, the reserve on its side, both owner
+                    // directories, OwnerCount + 1 — after `checkReserve` at
+                    // OwnerCount + 1 on the PRE-FEE balance
+                    // (tecNO_LINE_INSUF_RESERVE) and after preclaim's Legacy
+                    // `requireAuth` on the destination (EscrowFinish.cpp:152).
+                    // A finisher who is not the destination still needs the
+                    // line (finding 164's tecNO_LINE). 992230e1 finished its own
+                    // 46245596244 BBB escrow with no BBB line; mainnet built the
+                    // line (0x220000, HighLimit 0) and moved it — we said
+                    // tecNO_LINE, eight objects short.
+                    if dest_id != tx.account {
+                        return TxResult::NoLine;
+                    }
+                    if let Some(t) = crate::tx::offer::require_auth_ter(sandbox, &leg, &dest_id, false) {
+                        if t != TxResult::Success {
+                            return t;
+                        }
+                    }
+                    let (bal, oc) = match crate::tx::offer::json_at(sandbox, &keylet::account_root_key(&dest_id)) {
+                        Some(a) => (
+                            a["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+                            a["OwnerCount"].as_u64().unwrap_or(0),
+                        ),
+                        None => return TxResult::NoDst,
+                    };
+                    if bal.saturating_add(tx.fee) < crate::ledger::fees::account_reserve(sandbox, oc + 1) {
+                        return TxResult::NoLineInsufReserve;
+                    }
+                    // `line_adjust` below creates the line as `trustCreate` does.
                 }
                 let mut locked = escrow
                     .get("TransferRate")

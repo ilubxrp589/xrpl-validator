@@ -192,3 +192,14 @@ fn escrow_create_snapshots_the_issuer_transfer_rate() {
 fn escrow_finish_delivers_net_of_the_locked_rate() {
     run_bundle(include_str!("vectors/escrow_finish_delivers_net_of_the_locked_rate_106758384.json"));
 }
+
+/// Finding 266 — #106937018 D157B8D102BD: a BBB token escrow finished by
+/// its destination, which holds no BBB line. rippled's unlock helper runs
+/// `trustCreate` when the finisher is the destination (`createAsset`),
+/// after the reserve check at OwnerCount + 1 — the line lands with limit
+/// zero, the reserve flag and NoRipple on the destination's side, and the
+/// tokens move. We answered tecNO_LINE and left eight objects unwritten.
+#[test]
+fn escrow_finish_by_destination_creates_the_token_line_106937018() {
+    run_bundle(include_str!("vectors/escrow_finish_by_destination_creates_the_token_line_106937018.json"));
+}
