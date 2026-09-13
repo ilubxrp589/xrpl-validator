@@ -7172,6 +7172,28 @@ pub(crate) fn cross_engine_to_net(
                 // exhausting rem_gets takes the remaining cap, else gross_in.
                 let slice_net = me_sub(rem_gets, rg);
                 let g = match gets_gross_cap {
+                    // Finding 274: the exhausting slice's bookkeeping in is
+                    // rippled's `remainingIn` — `sendMax − sum(savedIns)`, the
+                    // sixteen-digit sorted-multiset fold of the ITERATIONS'
+                    // ins (one book level or one pool slice each), not the
+                    // walk's exact running total. The two part by an ULP as
+                    // soon as a level held two offers (rippled folds their sum
+                    // as one entry, the per-fill list folds two), and that ULP
+                    // is what the FillOrKill judge at the tail reads.
+                    // #106913895 24DB4E147B09: rippled's last iteration is
+                    // in-limited to 31.09117340575 and the closing fold lands
+                    // 1e-11 short of TakerGets → tecPATH_PARTIAL → tecKILLED;
+                    // the running total sized ours to …576 and the fold closed
+                    // exactly. Fee-free crossings only: with a gateway rate
+                    // the gross per-fill fold of Finding 236 stands.
+                    Some(cap) if me_is_zero(rg) && fold_rem && pay_in_rate.is_none() => {
+                        let mut sl = saved_level_ins.clone();
+                        if !level_ins.is_empty() {
+                            let mut li = level_ins.clone();
+                            sl.push(fold16(&mut li));
+                        }
+                        rem_from_fold(cap, &sl)
+                    }
                     Some(cap) if me_is_zero(rg) => me_sub(cap, in_gross_spent),
                     _ => gross_in(pay_in_rate, slice_net),
                 };
@@ -8498,6 +8520,28 @@ pub(crate) fn cross_engine_to_net(
             if used {
                 let slice_net = me_sub(rem_gets, rg);
                 let g = match gets_gross_cap {
+                    // Finding 274: the exhausting slice's bookkeeping in is
+                    // rippled's `remainingIn` — `sendMax − sum(savedIns)`, the
+                    // sixteen-digit sorted-multiset fold of the ITERATIONS'
+                    // ins (one book level or one pool slice each), not the
+                    // walk's exact running total. The two part by an ULP as
+                    // soon as a level held two offers (rippled folds their sum
+                    // as one entry, the per-fill list folds two), and that ULP
+                    // is what the FillOrKill judge at the tail reads.
+                    // #106913895 24DB4E147B09: rippled's last iteration is
+                    // in-limited to 31.09117340575 and the closing fold lands
+                    // 1e-11 short of TakerGets → tecPATH_PARTIAL → tecKILLED;
+                    // the running total sized ours to …576 and the fold closed
+                    // exactly. Fee-free crossings only: with a gateway rate
+                    // the gross per-fill fold of Finding 236 stands.
+                    Some(cap) if me_is_zero(rg) && fold_rem && pay_in_rate.is_none() => {
+                        let mut sl = saved_level_ins.clone();
+                        if !level_ins.is_empty() {
+                            let mut li = level_ins.clone();
+                            sl.push(fold16(&mut li));
+                        }
+                        rem_from_fold(cap, &sl)
+                    }
                     Some(cap) if me_is_zero(rg) => me_sub(cap, in_gross_spent),
                     _ => gross_in(pay_in_rate, slice_net),
                 };
@@ -8628,8 +8672,30 @@ pub(crate) fn cross_engine_to_net(
     // 790988.8444071844, where our per-fill net fold rested …845. The
     // bridged walk already rests it this way (its tail); the direct walk
     // did not. Payments keep the walk's remainder — theirs is never rested.
-    if offer_crossing && crossed > 0 && !gets_leg.xrp && !me_is_zero(rem_gets) {
-        let gross = fold16_multiset(&saved_ins);
+    //
+    // Finding 274: the fold decides even when the walk's running remainder
+    // is EXACTLY zero. The drain law hands the exhausting fill the remainder
+    // verbatim, so the running figure lands on zero whenever the in side is
+    // spent — but rippled's `remainingIn = *sendMax - sum(savedIns)`
+    // (StrandFlow.h:745) is the sixteen-digit fold of the iterations' ins,
+    // and a FillOrKill sell is judged on THAT (:829-841: "remainingIn must
+    // be zero (all funds must be consumed) or else we kill the offer" →
+    // tecPATH_PARTIAL → tecKILLED). #106913895 24DB4E147B09 (rGnhJjLF,
+    // tfSell|tfFillOrKill 77110.18662517994 RLUSD → XRP, sixty iterations
+    // agreeing with ours to the digit): the fold sums to 77110.18662517993,
+    // 1e-11 short, and mainnet kills the offer with one mutation; we read
+    // the drained remainder as zero and settled 163. Non-FoK sells rest
+    // nothing different: a 1e-11 `afterCross.in` re-derives an out of zero
+    // drops and the offer is "fully crossed" either way.
+    if offer_crossing && crossed > 0 && !gets_leg.xrp {
+        // Finding 274 (see the pool-slice bookkeeping above): fee-free, the
+        // fold runs over the ITERATIONS' ins — `saved_level_ins`, one entry
+        // per book level or pool slice — which is rippled's `savedIns`.
+        let per_iteration = fold_rem && pay_in_rate.is_none() && !saved_level_ins.is_empty();
+        let gross = if per_iteration { fold16_multiset(&saved_level_ins) } else { fold16_multiset(&saved_ins) };
+        if std::env::var("DX_PLACE").is_ok() {
+            eprintln!("DX_PLACE F274 per_iteration={per_iteration} n_iter={} n_fills={} fold={gross:?} entry_gets={entry_gets:?}", saved_level_ins.len(), saved_ins.len());
+        }
         let spent = match pay_in_rate {
             Some(r) => div_round16_up(gross, (r as u128, -9)),
             None => gross,
