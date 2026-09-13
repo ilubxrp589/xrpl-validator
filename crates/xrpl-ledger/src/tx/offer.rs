@@ -5509,10 +5509,26 @@ thr={t:?} admits_trunc={} admits_up={}",
                     }
                     out
                 };
+                // Finding 268 (#106948593 757F9FE508F5, rnCEEqDn sells 1000
+                // XAH for 1 RLUSD tfIoC, bridged through XRP): an OUT-limited
+                // leg-B book partial is sized by `limitStepOut` →
+                // `TOffer::limitOut` → `Quality::ceilOutStrict` (Offer.h:216-
+                // 221, "the ceil_out implementation has some slop in it, which
+                // ceil_out_strict removes") — a TRUE ceiling of the exact
+                // product to whole drops. `mul_round16_up` is the lossy legacy
+                // `mulRound`, which discards everything below the 17th digit
+                // before its carry: iteration 1 asks 0.4496277284182357 RLUSD
+                // of the 8040098/11 maker, exactly 328641.0000000000013726
+                // drops — mainnet pays 328642 (FFI: `accountSendIOU … :
+                // 328642/XRP`), the legacy form saw 328641.0000000000 and paid
+                // 328641, one drop short on leg B and one drop split the other
+                // way between leg A's two makers (F36DCB −1, 778A88 +1) with the
+                // XAH lines and 94EC7E's residual following. Iteration 0
+                // (402276.9999999999986 → 402277) is unchanged either way.
                 let b_unprice = |pays: Me| -> Me {
                     if b_group.is_empty() {
                         return match b_qbook {
-                            Some((r, _)) => mul_round16_up(pays, r),
+                            Some((r, _)) => (mul_round_drops_strict(pays, r, true), 0),
                             None => me_muldiv(pays, b_in_full, b_out_full, true),
                         };
                     }
@@ -5527,7 +5543,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                             xrp = me_add_xrp(xrp, m.6);
                             rem = stamount_signed_add(false, rem, true, m.5).1;
                         } else {
-                            xrp = me_add_xrp(xrp, mul_round16_up(rem, r));
+                            xrp = me_add_xrp(xrp, (mul_round_drops_strict(rem, r, true), 0));
                             rem = (0, 0);
                         }
                     }

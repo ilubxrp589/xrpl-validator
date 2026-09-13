@@ -1314,3 +1314,12 @@ fn offer_pool_exhausting_slice_debits_the_gross_fold_remainder_106871187() {
 fn offer_bridged_single_path_bound_is_the_anchored_pool_offer_106906800() {
     run_bundle(include_str!("vectors/offer_bridged_single_path_bound_is_the_anchored_pool_offer_106906800.json"));
 }
+
+/// Finding 268 — an OUT-limited leg-B book partial on the XRP bridge is sized
+/// by `ceilOutStrict`: a true ceiling of the exact product to whole drops.
+/// 0.4496277284182357 RLUSD at 8040098/11 is 328641.0000000000013726 drops
+/// and mainnet pays 328642; the lossy legacy rounding paid 328641.
+#[test]
+fn offer_bridged_out_limited_leg_b_partial_ceils_the_mid_leg_strictly_106948593() {
+    run_bundle(include_str!("vectors/offer_bridged_out_limited_leg_b_partial_ceils_the_mid_leg_strictly_106948593.json"));
+}
