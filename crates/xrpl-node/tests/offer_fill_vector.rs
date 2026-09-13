@@ -1358,3 +1358,11 @@ fn offer_walk_stops_using_the_pool_after_thirty_iterations_106913859() {
 fn offer_became_unfunded_reap_inside_a_rejected_trial_is_discarded_106914017() {
     run_bundle(include_str!("vectors/offer_became_unfunded_reap_inside_a_rejected_trial_is_discarded_106914017.json"));
 }
+
+/// Finding 276 — an offer rate whose muldiv quotient reaches 2^63 wraps
+/// through Number's signed mantissa: mainnet files 1e17 drops for 1e11 tokens
+/// at 8446744073709552e-10, not 1e6, and the offer lands on that book page.
+#[test]
+fn offer_rate_quotient_at_two_to_the_63_wraps_through_the_signed_mantissa_106963823() {
+    run_bundle(include_str!("vectors/offer_rate_quotient_at_two_to_the_63_wraps_through_the_signed_mantissa_106963823.json"));
+}

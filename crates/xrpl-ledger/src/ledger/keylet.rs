@@ -386,6 +386,17 @@ pub fn rate_encode_native(
     let (nm, ne) = norm(pays_m, pays_e, pays_native);
     let (dm, de) = norm(gets_m, gets_e, gets_native);
     let v = nm * 100_000_000_000_000_000u128 / dm + 5; // trunc muldiv @1e17, +5
+    // Finding 276: `divide` hands that mantissa to `STAmount(asset, uint64,
+    // exponent, negative)`, whose `canonicalize()` builds `Number(negative,
+    // value_, offset_)` — and Number's mantissa is a SIGNED 64-bit. A quotient
+    // at or above 2^63 wraps negative; the magnitude that survives is 2^64 −
+    // v, and `getRate` files it, sign dropped. #106963823 13CE0F71D3C6 (and
+    // #106963885 D8994FA0FADC, rsL9eAH9): 100000000000000000 drops for 1e11
+    // XRP✎ — muldiv(1e17, 1e17, 1e15) + 5 = 10000000000000000005 ≥ 2^63 —
+    // and mainnet files the offer at 8446744073709552e-10 (page …DC05A7F0),
+    // not the 1e6 the arithmetic means (page …4C68000). Same wrap every
+    // time a native TakerPays in the 1e17 range prices a small IOU.
+    let v = if v >= 1u128 << 63 { (1u128 << 64) - v } else { v };
     let mut e = ne - de - 17;
     let mut k = 0u32;
     let mut t = v;
