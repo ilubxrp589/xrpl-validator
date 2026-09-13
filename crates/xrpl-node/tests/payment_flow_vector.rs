@@ -808,3 +808,12 @@ fn payment_dest_limit_at_stamount_ceiling_is_not_a_cap_106913870() {
 fn payment_redeems_globally_frozen_iou_to_its_issuer_106920314() {
     run_bundle(include_str!("vectors/payment_redeems_globally_frozen_iou_to_its_issuer_106920314.json"));
 }
+
+/// Finding 271 — the reverse-pass sizing ladder escalates past a rung that
+/// yields nothing (below the hop's quantum) instead of reading it as a
+/// liquidity bound: five pools, 81 drops out, and the FACE/XRP pool must be
+/// sized from the drops, not consumed at its maxOffer.
+#[test]
+fn payment_five_pool_path_rev_pass_escalates_past_a_sub_drop_rung_106921383() {
+    run_bundle(include_str!("vectors/payment_five_pool_path_rev_pass_escalates_past_a_sub_drop_rung_106921383.json"));
+}

@@ -676,7 +676,22 @@ impl PaymentTransactor {
                 // a want_cap of 9.99e75 that way and fell through to the
                 // unbounded cap, so hop 0 bought the whole book level (978268
                 // drops) to feed a hop that only needed 15508.
-                if ox::me_is_zero(rw) || ox::me_cmp(consumed, granted).is_lt() {
+                //
+                // Finding 271 — a rung that yields NOTHING is not "bound by
+                // liquidity", it is below the hop's quantum: escalate. The
+                // smallest rung is 1e6 of the in-asset, and a pool priced at
+                // ~2.8e6 FACE per drop turns 1e6 FACE into 0.36 drops, which
+                // floors to zero. `consumed == 0 < granted` then read as a
+                // liquidity bound, the hop reported 0, the hop before it got
+                // the UNBOUNDED cap and consumed its pool's whole maxOffer,
+                // and the forward pass spent the entire SendMax.
+                // #106921383 EDA585DD9ED8 (rHs7y3kE, tfLimitQuality|tfPartial
+                // 0.000090106672646 RLUSD → 81 drops through FIVE pools
+                // RLUSD/CX1/DFI/AMM/FACE/XRP): rippled's rev pass sizes the
+                // FACE/XRP pool at 227224741.517588 FACE for the 81 drops and
+                // spends 0.000089060106719 RLUSD; we spent all
+                // 0.000090106672646 and every pool line landed ~1.1% off.
+                if ox::me_is_zero(rw) || (ox::me_cmp(consumed, granted).is_lt() && !ox::me_is_zero(consumed)) {
                     break;
                 }
             }
