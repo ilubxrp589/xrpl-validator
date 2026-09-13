@@ -8674,15 +8674,37 @@ fn amm_turn(
     // See `consume`'s `raw_tip` (finding 166b). Fib turns ignore it.
     raw_tip: Option<u64>,
 ) -> (Me, Me, bool) {
+    // Finding 273 — `AMMLiquidity::getOffer` answers nullopt once
+    // `ammContext.maxItersReached()` (kMaxIterations = 30), and the counter
+    // advances once per flow iteration whose winning pass used the pool
+    // (`setAMMUsed` → `update`). The offer walk IS the flow: every slice it
+    // takes is one such iteration, so it must count here and stop here.
+    // Finding 107 gated only `discover`, which the walk calls ONCE — the
+    // 31st slice and every one after it went through.
+    // #106913859 7547D84BE6EA (rGnhJjLF, tfSell|tfFillOrKill 74718.06 RLUSD
+    // → XRP): rippled's trace uses the pool on iterations 2…84 — thirty
+    // times — and never logs AMMLiquidity again; its book-only tail crosses
+    // 51583913507 drops. We took 47 slices and crossed 51635920469, 52 XRP
+    // more, 77 objects off. #106913895 24DB4E147B09 (same bot, 36 ledgers
+    // on) is tecKILLED on mainnet for want of that liquidity; we filled it.
+    if crate::tx::amm_swap::amm_ctx_exhausted() {
+        if std::env::var("DX_AMM").is_ok() {
+            eprintln!("DX_AMM turn refused: {} pool iterations spent (F273)", crate::tx::amm_swap::amm_ctx_iters());
+        }
+        return (rem_pays, rem_gets, false);
+    }
     let Some(f) = fib else {
         let r = crate::tx::amm_swap::consume(
             sandbox, a, taker, beneficiary, benef_net, in_gross_cap, rem_pays, rem_gets, pays_leg, gets_leg, threshold, threshold_gross, sell, clob,
             in_gross_rate, false, raw_tip,
         );
         // `AMMOffer::consume` → `setAMMUsed()`: single-path offers count
-        // toward the flow's 30 AMM iterations too (finding 107).
+        // toward the flow's 30 AMM iterations too (finding 107) — and in
+        // the offer walk each taken slice IS the iteration (finding 273):
+        // `amm_ctx_walk_iteration` marks and, unless a strand driver owns
+        // the count, advances it.
         if r.2 {
-            crate::tx::amm_swap::amm_ctx_mark_used();
+            crate::tx::amm_swap::amm_ctx_walk_iteration();
         }
         return r;
     };

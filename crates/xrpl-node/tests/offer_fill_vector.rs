@@ -1341,3 +1341,13 @@ fn offer_bridged_book_leg_quality_function_carries_no_transfer_fee_106921838() {
 fn offer_bridged_in_limited_forward_floors_to_zero_drops_and_the_bridge_is_dry_106913721() {
     run_bundle(include_str!("vectors/offer_bridged_in_limited_forward_floors_to_zero_drops_and_the_bridge_is_dry_106913721.json"));
 }
+
+/// Finding 273 — the pool answers at most thirty iterations of one flow;
+/// the offer walk counts each taken slice as one and stops there. rippled
+/// crosses this tfSell|FoK RLUSD sale with 30 pool slices and a book-only
+/// tail; we took 47 and crossed 52 XRP more.
+#[test]
+fn offer_walk_stops_using_the_pool_after_thirty_iterations_106913859() {
+    run_bundle(include_str!("vectors/offer_walk_stops_using_the_pool_after_thirty_iterations_106913859.json"));
+}
+
