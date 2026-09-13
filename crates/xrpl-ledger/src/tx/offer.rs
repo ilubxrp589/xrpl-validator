@@ -1793,6 +1793,9 @@ pub(crate) fn delete_maker_offer(
     offer: &serde_json::Value,
     maker: &[u8; 20],
 ) {
+    if std::env::var("DX_DEL").is_ok() {
+        eprintln!("DX_DEL delete_maker_offer okey={} maker={} soft={}", hex::encode_upper(&okey.0[..6]), hex::encode(&maker[..6]), soft_stale_contains(okey));
+    }
     let hint = |f: &str| offer.get(f).map(dirnum).filter(|n| *n > 0);
     let owner_hint = offer.get("OwnerNode").map(dirnum);
     let book_hint = offer.get("BookNode").map(dirnum);
@@ -2570,12 +2573,26 @@ fn live_head(
             continue;
         }
         if small_increased_q_offer(q, wants, gives, available(sandbox, &maker, maker_pays_leg), &maker, maker_pays_leg, maker_gets_leg) {
+            // Finding 277: rippled splits this removal exactly as it splits
+            // the unfunded one (OfferStream.cpp:308-332) — "Removing tiny
+            // offer due to reduced quality" is `permRmOffer` when the owner's
+            // funds are what the pristine view held, "Removing tiny offer
+            // that BECAME tiny due to reduced quality" is the strand's own
+            // sandbox otherwise, discarded with a rejected trial or a killed
+            // transaction. #106963526 51FE06BA22C9 (tfSell|tfFillOrKill,
+            // tecKILLED): 6186AFBA and EF22C1D5 became tiny behind iteration
+            // 0's fill; mainnet's kill keeps both, their pages, and their
+            // owners' counts — three mutations — we reaped them for good.
+            let became = deferred_load(sandbox).contains_key(&deferred_key(&maker, maker_pays_leg));
             if std::env::var("DX_WALK").is_ok() {
-                eprintln!("DX_WALK rm-small-increased-q okey={} q={q:x}", hex::encode(okey.0));
+                eprintln!("DX_WALK rm-small-increased-q okey={} q={q:x} became={became}", hex::encode(okey.0));
             }
             if mutate_dead {
                 delete_maker_offer(sandbox, &okey, &offer, &maker);
                 stale.push(okey);
+                if became {
+                    soft_stale_mark(&okey);
+                }
             }
             i += 1;
             continue;
@@ -2761,18 +2778,33 @@ fn reap_if_dead(
             // sells holds zero of it, and absence is the answer.
             || json_at(sandbox, &keylet::account_root_key(maker)).is_some()
     };
+    // Findings 275/277: rippled's pristine-view test — a maker whose line
+    // this TRANSACTION moved (the deferred-credits table has it) "became"
+    // unfunded or tiny, and that removal is the strand's own, not permanent.
+    let became = drained.is_some_and(|d| d.contains(&(*maker, pays_leg.cur)))
+        || deferred_load(sandbox).contains_key(&deferred_key(maker, pays_leg));
     if funding_known && me_is_zero(walk_available(sandbox, maker, pays_leg, oc0)) {
         delete_maker_offer(sandbox, okey, offer, maker);
         stale.push(*okey);
         // Finding 153: drained by this iteration's own fill → not permanent.
-        if drained.is_some_and(|d| d.contains(&(*maker, pays_leg.cur))) {
+        if became {
             soft_stale_mark(okey);
         }
         return true;
     }
     if funding_known && is_dust_offer(sandbox, maker, m_wants0, m_gives0, pays_leg, gets_leg) {
+        // Finding 277: #106963526 51FE06BA22C9 — EF22C1D5, left dust by the
+        // same owner's 05EC0554 fill one level up in this very pass, was
+        // reaped here for good; rippled's "became tiny due to reduced
+        // quality" dies with the kill and mainnet keeps it.
+        if std::env::var("DX_WALK").is_ok() {
+            eprintln!("DX_WALK rm-dust okey={} became={became}", hex::encode(okey.0));
+        }
         delete_maker_offer(sandbox, okey, offer, maker);
         stale.push(*okey);
+        if became {
+            soft_stale_mark(okey);
+        }
         return true;
     }
     // BookStep.cpp:755 — after the stream's own dead tests, the caller
@@ -3033,11 +3065,17 @@ fn rev_scan_level(
             };
             if small_increased_q_offer(q, m_wants0, m_gives0, left, &maker, pays_leg, gets_leg) {
                 if me_is_zero(taken) {
+                    // Finding 277 (see `live_head`): permanent only when the
+                    // owner's funds are untouched by this TRANSACTION.
+                    let became = deferred_load(sandbox).contains_key(&deferred_key(&maker, pays_leg));
                     if trace {
-                        eprintln!("DX_REV level={lvl} reaped tiny {}", hex::encode(okey.0));
+                        eprintln!("DX_REV level={lvl} reaped tiny {} became={became}", hex::encode(okey.0));
                     }
                     delete_maker_offer(sandbox, &okey, &offer, &maker);
                     stale.push(okey);
+                    if became {
+                        soft_stale_mark(&okey);
+                    }
                 } else if trace {
                     eprintln!("DX_REV level={lvl} became-tiny {} (skipped)", hex::encode(okey.0));
                 }
@@ -7493,11 +7531,19 @@ pub(crate) fn cross_engine_to_net(
                 // Finding 112: rippled's stream removes a dust remainder whose
                 // recomputed quality is worse than its directory's, unexecuted.
                 if small_increased_q_offer(q, m_wants0, m_gives0, funded_raw, &maker, pays_leg, gets_leg) {
+                    // Finding 277 (see `live_head`): "became tiny" — the owner's
+                    // funds moved in this transaction — is the strand's own
+                    // removal, discarded with a rejected trial or a kill; only
+                    // "found tiny" is `permRmOffer`ed.
+                    let became = deferred_load(sandbox).contains_key(&deferred_key(&maker, pays_leg));
                     if std::env::var("DX_WALK").is_ok() {
-                        eprintln!("DX_WALK rm-small-increased-q okey={} q={q:x}", hex::encode(okey.0));
+                        eprintln!("DX_WALK rm-small-increased-q okey={} q={q:x} became={became}", hex::encode(okey.0));
                     }
                     delete_maker_offer(sandbox, &okey, &offer, &maker);
                     stale.push(okey);
+                    if became {
+                        soft_stale_mark(&okey);
+                    }
                     continue;
                 }
                 if std::env::var("DX_WALK").is_ok() {
@@ -9302,6 +9348,9 @@ impl Transactor for OfferCreateTransactor {
             // FillOrKill not fully filled: nothing survives but the fee and
             // the stale-offer cleanup.
             sandbox.restore_snapshot(snap);
+            if std::env::var("DX_DEL").is_ok() {
+                eprintln!("DX_DEL kill-path hard_stale={:?}", hard_stale(&stale).iter().map(|k| hex::encode_upper(&k.0[..6])).collect::<Vec<_>>());
+            }
             reap(sandbox, &hard_stale(&stale)); // finding 153: sbCancel carries only permanent removals
             return TxResult::Killed;
         }
