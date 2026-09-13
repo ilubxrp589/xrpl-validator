@@ -2522,9 +2522,31 @@ fn live_head(
             // became unfunded offer", and the ledger keeps it; we reaped it
             // for good (offer, page, owner dir, OwnerCount — four extra
             // mutations on a killed transaction).
+            //
+            // Finding 275: rippled's test is against the PRISTINE view —
+            // "If the owner's balance in the pristine view is the same, we
+            // haven't modified the balance and therefore the offer is 'found
+            // unfunded' versus 'became unfunded'" (OfferStream.cpp:279-305),
+            // i.e. a maker whose line this TRANSACTION moved, in any
+            // iteration, not only the one just closed. The deferred-credits
+            // table (Finding 165) records exactly those lines. `drained`
+            // alone missed a maker drained two iterations back once the
+            // round in between rolled back and cleared it (#106914017
+            // 43DA5E1B21C5, rMsXVzCug7's DBABF24D: soft on iteration 4's
+            // trial, "found unfunded" — permanent — on iteration 5's).
             let soft = gives.0 != 0
                 && wants.0 != 0
-                && drained.is_some_and(|d| d.contains(&(maker, maker_pays_leg.cur)));
+                && (drained.is_some_and(|d| d.contains(&(maker, maker_pays_leg.cur)))
+                    || deferred_load(sandbox).contains_key(&deferred_key(&maker, maker_pays_leg)));
+            if std::env::var("DX_RM").is_ok() {
+                eprintln!(
+                    "DX_RM dead okey={} maker={} gives={gives:?} wants={wants:?} avail={:?} soft={soft} mutate_dead={mutate_dead} drained_has={} drained_n={}",
+                    hex::encode_upper(&okey.0[..6]), hex::encode(&maker[..6]),
+                    available(sandbox, &maker, maker_pays_leg),
+                    drained.is_some_and(|d| d.contains(&(maker, maker_pays_leg.cur))),
+                    drained.map(|d| d.len()).unwrap_or(0)
+                );
+            }
             if mutate_dead {
                 delete_maker_offer(sandbox, &okey, &offer, &maker);
                 stale.push(okey);
@@ -4498,19 +4520,11 @@ thr={t:?} admits_trunc={} admits_up={}",
             && (order.contains(&true) || ub_ok(raw_q(&ld, di)).is_some());
         let flows_bridge = bridge_alive
             && (order.contains(&false) || ub_ok(raw_bridge).is_some());
-        if peek_rm {
-            if std::env::var("DX_BRIDGE").is_ok() {
-                eprintln!("DX_BRIDGE F233 reap gate: direct={flows_direct} bridge={flows_bridge} raw_d={:?} raw_bridge={raw_bridge:?}", raw_q(&ld, di));
-            }
-            if flows_direct {
-                let mut i = di;
-                let _ = live_head(sandbox, &ld, &mut i, taker, pays_leg, gets_leg, false, true, stale, None, Some(&drained_prev), false);
-            }
-            if flows_bridge {
-                let (mut i, mut j) = (ai, bi);
-                let _ = live_head(sandbox, &la, &mut i, taker, &xrp_leg, gets_leg, false, true, stale, None, Some(&drained_prev), true);
-                let _ = live_head(sandbox, &lb, &mut j, taker, pays_leg, &xrp_leg, false, true, stale, None, Some(&drained_prev), true);
-            }
+        // Finding 275: the gate's reaps now run INSIDE each candidate's
+        // attempt (see the loop below) — a "became unfunded" removal lives in
+        // the trial's sandbox and is discarded with a rejected trial.
+        if peek_rm && std::env::var("DX_BRIDGE").is_ok() {
+            eprintln!("DX_BRIDGE F233 reap gate: direct={flows_direct} bridge={flows_bridge} raw_d={:?} raw_bridge={raw_bridge:?}", raw_q(&ld, di));
         }
         // Finding 239 (#106863376 7597883D5031, rHxwV4vsoa tfSell 0.005472
         // BTC.rchGBxcD -> EUR.rhub8VRN, bridged through XRP): the F233 gate
@@ -4967,6 +4981,33 @@ thr={t:?} admits_trunc={} admits_up={}",
             let so0 = saved_outs.len();
             let si0 = saved_ins.len();
             let st0 = stale.len();
+            // Finding 275 — the F233 reap gate, scoped to THIS trial. rippled's
+            // `FlowOfferStream` deletes a "became unfunded" offer (funds zero
+            // now, non-zero in the pristine view) in the STRAND'S sandbox: it
+            // stays deleted only if that strand wins the iteration and is
+            // applied; a rejected trial's sandbox — removal included — is
+            // discarded ("Path rejected by limitQuality"). Only a "found
+            // unfunded" offer is `permRmOffer`ed for good, and those keep
+            // their place in `stale` for the tail's cleanup. The gate used to
+            // run ahead of the candidates' snapshot, so a soft reap made in
+            // a trial the judge then rejected survived the rollback.
+            // #106914017 43DA5E1B21C5 (rURtT5MM, tfSell 3.833 ETH → RLUSD):
+            // rMsXVzCug7's DBABF24D (4427.67 RLUSD) is drained to zero by
+            // iteration 1's fill of its sibling; the direct trial of iteration
+            // 4 steps over it — "Removing became unfunded offer DBABF24D" —
+            // and is rejected on quality. Mainnet keeps the offer and its
+            // book page 4327BA72; we deleted both.
+            if peek_rm {
+                if want_direct && flows_direct {
+                    let mut i = di;
+                    let _ = live_head(sandbox, &ld, &mut i, taker, pays_leg, gets_leg, false, true, stale, None, Some(&drained_prev), false);
+                }
+                if !want_direct && flows_bridge {
+                    let (mut i, mut j) = (ai, bi);
+                    let _ = live_head(sandbox, &la, &mut i, taker, &xrp_leg, gets_leg, false, true, stale, None, Some(&drained_prev), true);
+                    let _ = live_head(sandbox, &lb, &mut j, taker, pays_leg, &xrp_leg, false, true, stale, None, Some(&drained_prev), true);
+                }
+            }
             amm_used = false;
             // (in, out) of this candidate's fill, in the same orientation as
             // `est_direct`/`est_bridge`: gets-side in, pays-side out.
@@ -6150,6 +6191,16 @@ had_fill={} n={} keys={:?}",
             // Skipped keys leave `stale` so the later tx can revisit them.
             let mut keep = Vec::new();
             for okey in stale.drain(st0..) {
+                // Finding 275: a "became unfunded" removal belongs to the
+                // trial's sandbox and is discarded with a rejected trial
+                // (rippled applies only the winning strand's sandbox; the
+                // permanent `permRmOffer` set carries found-unfunded, expired
+                // and domain removals). Re-deleting it here is what kept
+                // rMsXVzCug7's DBABF24D and its page 4327BA72 gone on
+                // #106914017 43DA5E1B21C5 while mainnet keeps both.
+                if soft_stale_contains(&okey) {
+                    continue;
+                }
                 let Some(off) = json_at(sandbox, &okey) else { continue };
                 let Some(mk) = off.get("Account").and_then(|v| v.as_str()).and_then(decode20)
                 else {

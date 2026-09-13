@@ -1351,3 +1351,10 @@ fn offer_walk_stops_using_the_pool_after_thirty_iterations_106913859() {
     run_bundle(include_str!("vectors/offer_walk_stops_using_the_pool_after_thirty_iterations_106913859.json"));
 }
 
+/// Finding 275 — the reap gate runs inside each trial's sandbox: an offer
+/// that became unfunded is deleted only by the strand that wins; a rejected
+/// trial's removal is discarded, so the offer and its book page stay.
+#[test]
+fn offer_became_unfunded_reap_inside_a_rejected_trial_is_discarded_106914017() {
+    run_bundle(include_str!("vectors/offer_became_unfunded_reap_inside_a_rejected_trial_is_discarded_106914017.json"));
+}
