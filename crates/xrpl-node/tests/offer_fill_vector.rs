@@ -1323,3 +1323,4 @@ fn offer_bridged_single_path_bound_is_the_anchored_pool_offer_106906800() {
 fn offer_bridged_out_limited_leg_b_partial_ceils_the_mid_leg_strictly_106948593() {
     run_bundle(include_str!("vectors/offer_bridged_out_limited_leg_b_partial_ceils_the_mid_leg_strictly_106948593.json"));
 }
+

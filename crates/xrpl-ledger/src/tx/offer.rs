@@ -9010,9 +9010,44 @@ impl Transactor for OfferCreateTransactor {
                 }
             }
         };
-        let (rem_pays, rem_gets_cross, crossed) = if book_refused {
+        // Finding 269 — THE DELIVERY STEP REFUSES A FROZEN TAKER (StepChecks.h
+        // `checkFreeze(view, src, dst)`, run by the strand's LAST step with
+        // dst = the taker: `DirectStepI::check` for an IOU delivery,
+        // `XRPEndpointStep::check` with src = xrpAccount for XRP). It returns
+        // terNO_LINE when the taker's OWN AccountRoot carries lsfGlobalFreeze,
+        // or — IOU delivery — when the taker's line to the issuer carries the
+        // TAKER-side freeze bit (`(dst > src) ? lsfHighFreeze : lsfLowFreeze`)
+        // or either deep-freeze bit. Like F69's NoRipple refusal the strand is
+        // never built, `flowCross` swallows it, nothing crosses and nothing is
+        // reaped: the offer rests whole, IoC/FoK read tecKILLED.
+        //
+        // #106921732 D0A14FC6319D (rnkVDWABs, tfSell|tfFillOrKill, 13845
+        // drops for 39.469672 OXP): the taker's root has Flags 0xC00000 —
+        // lsfGlobalFreeze set on itself — and the XRP/OXP pool (290.86 XRP /
+        // 878085 OXP, 331 drops per OXP against the 350.8 asked) would have
+        // filled it. rippled's trace: `toStep failed: -94` → `failed to add
+        // default path` → tecKILLED, one mutation. We filled it through the
+        // pool and reported tesSUCCESS.
+        let freeze_refused = {
+            const LSF_GLOBAL_FREEZE: u64 = 0x0040_0000;
+            const LSF_LOW_FREEZE: u64 = 0x0040_0000;
+            const LSF_HIGH_FREEZE: u64 = 0x0080_0000;
+            const LSF_DEEP_FREEZE_EITHER: u64 = 0x0200_0000 | 0x0400_0000;
+            let root_frozen = json_at(sandbox, &keylet::account_root_key(&tx.account))
+                .is_some_and(|a| a["Flags"].as_u64().unwrap_or(0) & LSF_GLOBAL_FREEZE != 0);
+            let line_frozen = !pays_leg.xrp && tx.account != pays_leg.issuer && {
+                let lk = keylet::ripple_state_key(&tx.account, &pays_leg.issuer, &pays_leg.cur);
+                json_at(sandbox, &lk).is_some_and(|line| {
+                    let f = line["Flags"].as_u64().unwrap_or(0);
+                    let own = if tx.account > pays_leg.issuer { LSF_HIGH_FREEZE } else { LSF_LOW_FREEZE };
+                    f & own != 0 || f & LSF_DEEP_FREEZE_EITHER != 0
+                })
+            };
+            root_frozen || line_frozen
+        };
+        let (rem_pays, rem_gets_cross, crossed) = if book_refused || freeze_refused {
             if std::env::var("DX_FOK").is_ok() {
-                eprintln!("DX_FOK book-refused: issuer-side NoRipple on the taker's TakerGets line");
+                eprintln!("DX_FOK strand refused: book_refused={book_refused} (issuer-side NoRipple on the TakerGets line) freeze_refused={freeze_refused} (taker GlobalFreeze / own freeze on the TakerPays line)");
             }
             (tp0, tg_cross, 0)
         } else {
