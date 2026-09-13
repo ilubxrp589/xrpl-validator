@@ -1333,3 +1333,11 @@ fn offer_bridged_out_limited_leg_b_partial_ceils_the_mid_leg_strictly_106948593(
 fn offer_bridged_book_leg_quality_function_carries_no_transfer_fee_106921838() {
     run_bundle(include_str!("vectors/offer_bridged_book_leg_quality_function_carries_no_transfer_fee_106921838.json"));
 }
+
+/// Finding 272 — when the whole drop the out side ceiled to costs more than
+/// the taker has left, the forward pass is in-limited and leg A yields the
+/// floor: zero drops here, so the bridge is dry and the direct pool fills.
+#[test]
+fn offer_bridged_in_limited_forward_floors_to_zero_drops_and_the_bridge_is_dry_106913721() {
+    run_bundle(include_str!("vectors/offer_bridged_in_limited_forward_floors_to_zero_drops_and_the_bridge_is_dry_106913721.json"));
+}

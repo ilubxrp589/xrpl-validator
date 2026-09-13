@@ -5706,7 +5706,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 // 100 EUR into the EUR/XRP maker at 86946030.x drops: mainnet
                 // pays 86946030 (FFI: `accountSendIOU … : 86946030/XRP`); the
                 // ceil paid 86946031 and bought 5.4e-10 ETH more from the pool.
-                let xrp = (me_rescale(xrp, 0, !(in_exhausted || b_funds_bound)), 0);
+                let mut xrp = (me_rescale(xrp, 0, !(in_exhausted || b_funds_bound)), 0);
                 // ...and REPRICE leg A for it. `gets_in` above was computed
                 // from the FRACTIONAL xrp; rounding the mid-leg up to whole
                 // drops without redoing that leaves leg A buying a whole drop
@@ -5729,7 +5729,36 @@ thr={t:?} admits_trunc={} admits_up={}",
                     let repriced = rp_a(xrp, a_price(xrp), sandbox);
                     // The earlier clamp to `rem_gets` still binds — a sub-drop
                     // reprice must not push the pass past what the taker has.
-                    if me_cmp(repriced, rem_gets).is_gt() { rem_gets } else { repriced }
+                    if me_cmp(repriced, rem_gets).is_gt() {
+                        // Finding 272 — the whole drop the OUT side ceiled to
+                        // costs more than the taker has left, so rippled's
+                        // FORWARD pass is in-limited and leg A yields
+                        // `floor(in / rate)` drops (F93's `limitStepIn` →
+                        // `ceilInStrict(…, roundUp = false)`; a pool's
+                        // `swapAssetIn` output rounds down the same way).
+                        // Clamping `gets_in` to the remainder while keeping
+                        // the ceiled drop bought a drop the taker could not
+                        // pay for. #106913721 50CED920F580 (r3rhWeE3, buys
+                        // 8.5129e-11 ETH with 1.8895e-7 EUR, both legs pools):
+                        // the out side ceils 0.157 drops to ONE; forward,
+                        // 1.8895e-7 EUR is 0.158 drops → 0 → "Non-limiting
+                        // step found dry" — the bridge is DRY and rippled
+                        // fills through the direct EUR/ETH pool for
+                        // 1.879821157782992e-7 EUR. We charged the whole
+                        // 1.8895e-7 for one bridged drop.
+                        let fwd = (me_rescale(urp_a(rem_gets, a_unprice(rem_gets), sandbox), 0, false), 0);
+                        if std::env::var("DX_BRIDGE").is_ok() {
+                            eprintln!("DX_BRIDGE F272 in-limited forward: ceiled xrp={xrp:?} costs {repriced:?} > rem_gets={rem_gets:?}; forward floor={fwd:?}");
+                        }
+                        if me_is_zero(fwd) {
+                            break 'attempt;
+                        }
+                        xrp = fwd;
+                        pays_out = rp_b(xrp, b_price(xrp), sandbox);
+                        rem_gets
+                    } else {
+                        repriced
+                    }
                 };
                 // The IN-EXHAUSTED slice's leg B consumes the WHOLE-drop mid,
                 // not the fractional value it was first priced from (F51's
