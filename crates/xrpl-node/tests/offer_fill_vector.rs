@@ -1324,3 +1324,12 @@ fn offer_bridged_out_limited_leg_b_partial_ceils_the_mid_leg_strictly_106948593(
     run_bundle(include_str!("vectors/offer_bridged_out_limited_leg_b_partial_ceils_the_mid_leg_strictly_106948593.json"));
 }
 
+
+/// Finding 270 — a book tip enters the single-strand quality function
+/// fee-free (only a single-path pool leg carries trIn), solved against the
+/// fee-inflated limit: rippled sizes the bridged pass to 19.079, the realised
+/// rate misses the limit, nothing crosses and the tfSell offer rests whole.
+#[test]
+fn offer_bridged_book_leg_quality_function_carries_no_transfer_fee_106921838() {
+    run_bundle(include_str!("vectors/offer_bridged_book_leg_quality_function_carries_no_transfer_fee_106921838.json"));
+}

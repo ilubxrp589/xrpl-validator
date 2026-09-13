@@ -4894,7 +4894,27 @@ thr={t:?} admits_trunc={} admits_up={}",
             // fills it; without the constant we solved 181.010803, sized the
             // pool slice to 33.25 RLUSD, rejected it on quality and placed the
             // whole offer.
-            let mut qf = match fee_rate.and_then(|r| QualityFn::clob((r as u128, -9))) {
+            //
+            // Finding 270 corrects the CLOB half of that claim. rippled's
+            // `BookOfferCrossingStep::adjustQualityWithFees` (BookStep.cpp
+            // :512-540) returns the offer quality UNTOUCHED for
+            // `OfferType::Clob` — "Offer x-ing does not charge a transfer fee
+            // … Single path AMM offer has to factor in the transfer in rate …
+            // because single path AMM's offer quality is not constant" — so
+            // only a single-path POOL leg carries trIn into the strand's
+            // quality function; a book tip enters fee-free, while the
+            // limitQuality it is solved against stays the fee-INFLATED one.
+            // #106921838 C24060ADA9B9 (rBERMc8i2D, tfSell 24.98085862498086
+            // USD.rhub → 24.9808586 USD.rvYA, rhub TransferRate 1.002; leg A
+            // the USD.rhub/XRP book at 46.898/34.579208, leg B the XRP/
+            // USD.rvYA pool 3464.77/4719.17 fee 220): rippled's fee-free
+            // function against the 1.002000001002 limit sizes the pass to
+            // 19.07910609351217, the realised rate 1.004004 (= 1.002²) then
+            // misses the limit — "Path rejected by limitQuality … All
+            // strands dry" — and the offer rests WHOLE. Folding trIn into
+            // the book tip solved 9.678916361181241, a pass whose realised
+            // rate sat inside the limit, and we crossed it.
+            let mut qf = match fee_rate.filter(|_| a_qf_amm).and_then(|r| QualityFn::clob((r as u128, -9))) {
                 Some(mut f) => {
                     f.combine(&leg_a);
                     f
