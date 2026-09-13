@@ -85,6 +85,12 @@ pub enum TxResult {
     /// `NFTokenAcceptOffer::preclaim` compares `accountFunds(offer owner)`
     /// against the offer's own Amount.
     InsufficientFunds,
+    /// Brokered NFT accept: the buy offer does not cover the sell offer's ask
+    /// (or does not once the broker's fee is taken) — tecINSUFFICIENT_PAYMENT.
+    InsufficientPayment,
+    /// Brokered NFT accept: the two offers name different tokens or assets,
+    /// or the broker fee is in another asset — tecNFTOKEN_BUY_SELL_MISMATCH.
+    NftokenBuySellMismatch,
     /// An AMM pool cannot cover the requested amount, or the account holds no
     /// LP tokens in it.
     AmmBalance,
@@ -225,6 +231,8 @@ impl TxResult {
             | TxResult::ObjectNotFound
             | TxResult::CantAcceptOwnNftOffer
             | TxResult::InsufficientFunds
+            | TxResult::InsufficientPayment
+            | TxResult::NftokenBuySellMismatch
             | TxResult::AmmBalance
             | TxResult::AmmInvalidTokens
             | TxResult::AmmEmpty
@@ -291,6 +299,8 @@ impl TxResult {
             TxResult::ObjectNotFound => "tecOBJECT_NOT_FOUND",
             TxResult::CantAcceptOwnNftOffer => "tecCANT_ACCEPT_OWN_NFTOKEN_OFFER",
             TxResult::InsufficientFunds => "tecINSUFFICIENT_FUNDS",
+            TxResult::InsufficientPayment => "tecINSUFFICIENT_PAYMENT",
+            TxResult::NftokenBuySellMismatch => "tecNFTOKEN_BUY_SELL_MISMATCH",
             TxResult::AmmBalance => "tecAMM_BALANCE",
             TxResult::AmmInvalidTokens => "tecAMM_INVALID_TOKENS",
             TxResult::AmmEmpty => "tecAMM_EMPTY",

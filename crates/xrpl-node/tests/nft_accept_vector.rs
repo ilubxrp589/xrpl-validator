@@ -252,3 +252,19 @@ fn nft_buy_offer_from_an_unfunded_buyer_is_tec_unfunded_offer_106850559() {
 fn nft_accept_of_an_expired_sell_offer_is_tec_expired_106898039() {
     run_bundle(include_str!("vectors/nft_accept_of_an_expired_sell_offer_is_tec_expired_106898039.json"));
 }
+
+/// Finding 267 — brokered accept whose buy amount, less the broker's fee,
+/// leaves the seller one drop short of the ask: rippled 3.3.0 refuses it in
+/// preclaim with tecINSUFFICIENT_PAYMENT (NFTokenAcceptOffer.cpp:141-142),
+/// claims the fee and leaves both offers standing. We brokered the sale.
+#[test]
+fn nft_brokered_accept_one_drop_short_after_the_broker_fee_is_tec_insufficient_payment_106945777() {
+    run_bundle(include_str!("vectors/nft_brokered_accept_one_drop_short_after_the_broker_fee_is_tec_insufficient_payment_106945777.json"));
+}
+
+/// Finding 267, second specimen by the same broker 33 ledgers later: buy
+/// 2000000 less fee 31781 against an ask of 1968220 — short by one drop.
+#[test]
+fn nft_brokered_accept_one_drop_short_after_the_broker_fee_is_tec_insufficient_payment_106945810() {
+    run_bundle(include_str!("vectors/nft_brokered_accept_one_drop_short_after_the_broker_fee_is_tec_insufficient_payment_106945810.json"));
+}

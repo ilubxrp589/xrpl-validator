@@ -734,6 +734,60 @@ struct OfferSle {
     expiration: Option<u64>,
 }
 
+/// The two NFT-offer amounts price the same asset: both XRP, or the same
+/// currency and issuer (`STAmount::asset()` equality, finding 267).
+fn nft_same_asset(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    use crate::tx::offer as ox;
+    match (ox::leg_of(a), ox::leg_of(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// `a > b` between two NFT-offer amounts of the same asset. XRP compares in
+/// drops exactly; an IOU compares the 16-digit-normalized mantissa/exponent
+/// pair the way `STAmount::operator>` does (finding 267).
+fn nft_amount_gt(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    use crate::tx::offer as ox;
+    match (a.as_str(), b.as_str()) {
+        (Some(x), Some(y)) => match (x.parse::<u64>(), y.parse::<u64>()) {
+            (Ok(x), Ok(y)) => x > y,
+            _ => false,
+        },
+        _ => match (
+            crate::ledger::keylet::amount_mant_exp(a),
+            crate::ledger::keylet::amount_mant_exp(b),
+        ) {
+            (Some(x), Some(y)) => {
+                ox::me_cmp(ox::me_norm(x), ox::me_norm(y)) == std::cmp::Ordering::Greater
+            }
+            _ => false,
+        },
+    }
+}
+
+/// `a - b` between two NFT-offer amounts of the same asset, with `a > b`
+/// already established; None when either amount does not parse.
+fn nft_amount_sub(a: &serde_json::Value, b: &serde_json::Value) -> Option<serde_json::Value> {
+    use crate::tx::offer as ox;
+    match (a.as_str(), b.as_str()) {
+        (Some(x), Some(y)) => {
+            let (x, y) = (x.parse::<u64>().ok()?, y.parse::<u64>().ok()?);
+            Some(serde_json::Value::String(x.checked_sub(y)?.to_string()))
+        }
+        _ => {
+            let (x, y) = (
+                crate::ledger::keylet::amount_mant_exp(a)?,
+                crate::ledger::keylet::amount_mant_exp(b)?,
+            );
+            let (m, e) = ox::me_sub(ox::me_norm(x), ox::me_norm(y));
+            let mut v = a.clone();
+            v["value"] = serde_json::Value::String(format!("{m}e{e}"));
+            Some(v)
+        }
+    }
+}
+
 /// `accountFunds(view, payer, needed, ...) < needed` for an XRP-priced NFT
 /// offer. For XRP that resolves to `accountHolds`, i.e. the balance less the
 /// account's reserve at its current OwnerCount.
@@ -1045,12 +1099,60 @@ impl Transactor for NFTokenAcceptOfferTransactor {
         // brokered the sale, moved the token and paid out 5074492 drops plus a
         // 508-drop broker fee. 7 mutations against 1.
         if let (Some(b), Some(sl)) = (&bo, &so) {
+            // Brokered mode's consistency checks, rippled's order
+            // (NFTokenAcceptOffer.cpp:95-113, rippled 3.3.0) — finding 267:
+            //   same token            -> tecNFTOKEN_BUY_SELL_MISMATCH
+            //   same asset            -> tecNFTOKEN_BUY_SELL_MISMATCH
+            //   no loop (same owner)  -> tecCANT_ACCEPT_OWN_NFTOKEN_OFFER
+            //   so.Amount > bo.Amount -> tecINSUFFICIENT_PAYMENT
+            // then the two Destination checks below, then the broker fee.
+            if b.nft_id != sl.nft_id {
+                return TxResult::NftokenBuySellMismatch;
+            }
+            if !nft_same_asset(&b.amount, &sl.amount) {
+                return TxResult::NftokenBuySellMismatch;
+            }
+            if b.owner == sl.owner {
+                return TxResult::CantAcceptOwnNftOffer;
+            }
+            if nft_amount_gt(&sl.amount, &b.amount) {
+                return TxResult::InsufficientPayment;
+            }
             for d in [b.destination, sl.destination].into_iter().flatten() {
                 if d != tx.account {
                     if std::env::var("DX_NFT").is_ok() {
                         eprintln!("DX_NFT accept-preclaim REFUSE broker-destination {}", hex::encode(d));
                     }
                     return TxResult::NoPermission;
+                }
+            }
+            // "The broker can specify an amount that represents their cut; if
+            // they have, ensure that the seller will get at least as much as
+            // they want to get *after* this fee is accounted for" (:129-142):
+            //   fee.asset != bo.asset      -> tecNFTOKEN_BUY_SELL_MISMATCH
+            //   fee >= bo.Amount           -> tecINSUFFICIENT_PAYMENT
+            //   so.Amount > bo.Amount - fee -> tecINSUFFICIENT_PAYMENT
+            // #106945777 72D0814A5F3B and #106945810 D921F504F064 (rpx9JThQ,
+            // "xrp.cafe - sale"): buy 7822353 / fee 122354 against an ask of
+            // 7700000 — the seller would net 7699999, ONE DROP short; and buy
+            // 2000000 / fee 31781 against 1968220, short by one drop again.
+            // Mainnet claims the 30-drop fee and leaves both offers; we
+            // brokered the sale, moved the token and paid everyone out.
+            if let Some(fee) = tx.fields.get("NFTokenBrokerFee") {
+                if !nft_same_asset(fee, &b.amount) {
+                    return TxResult::NftokenBuySellMismatch;
+                }
+                if !nft_amount_gt(&b.amount, fee) {
+                    return TxResult::InsufficientPayment;
+                }
+                let Some(net) = nft_amount_sub(&b.amount, fee) else {
+                    return TxResult::InsufficientPayment;
+                };
+                if nft_amount_gt(&sl.amount, &net) {
+                    if std::env::var("DX_NFT").is_ok() {
+                        eprintln!("DX_NFT accept-preclaim REFUSE ask-not-covered-after-broker-fee");
+                    }
+                    return TxResult::InsufficientPayment;
                 }
             }
         }
