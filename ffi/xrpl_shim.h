@@ -312,7 +312,8 @@ typedef struct XrplAmt {
 enum { XRPL_ARITH_MULROUND = 0, XRPL_ARITH_MULROUND_STRICT = 1, XRPL_ARITH_DIVROUND = 2,
        XRPL_ARITH_DIVROUND_STRICT = 3, XRPL_ARITH_MULTIPLY = 4, XRPL_ARITH_DIVIDE = 5,
        XRPL_ARITH_ADD = 6, XRPL_ARITH_SUB = 7, XRPL_ARITH_CANONICALIZE = 8 };
-enum { XRPL_NUM_ADD = 0, XRPL_NUM_SUB = 1, XRPL_NUM_MUL = 2, XRPL_NUM_DIV = 3, XRPL_NUM_ROOT2 = 4 };
+enum { XRPL_NUM_ADD = 0, XRPL_NUM_SUB = 1, XRPL_NUM_MUL = 2, XRPL_NUM_DIV = 3, XRPL_NUM_ROOT2 = 4,
+       XRPL_NUM_TO_DROPS = 5 /* Number::operator rep(): whole drops in out_m, out_e = 0 */ };
 /* rounding_mode: 0 ToNearest, 1 TowardsZero, 2 Downward, 3 Upward */
 /* Number's mantissa width is amendment-gated (Rules.cpp setCurrentTransactionRules):
  * 16 digits ("Small") unless SingleAssetVault or LendingProtocol is enabled — mainnet

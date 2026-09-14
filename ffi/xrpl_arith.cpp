@@ -105,6 +105,13 @@ int xrpl_arith_number_op(int op, int64_t m1, int32_t e1, int64_t m2, int32_t e2,
             case XRPL_NUM_MUL: r = a * b; break;
             case XRPL_NUM_DIV: r = a / b; break;
             case XRPL_NUM_ROOT2: r = xrpl::root2(a); break;
+            case XRPL_NUM_TO_DROPS: {
+                // XRPAmount{Number}: the explicit conversion, under the mode.
+                *out_m = static_cast<std::int64_t>(a);
+                *out_e = 0;
+                xrpl::Number::setround(saved);
+                return 0;
+            }
             default: xrpl::Number::setround(saved); g_last_error = "unknown op"; return 2;
         }
         *out_m = r.mantissa();

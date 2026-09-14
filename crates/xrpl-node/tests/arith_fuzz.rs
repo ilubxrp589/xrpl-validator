@@ -7,7 +7,7 @@
 //! run with `--nocapture` to read the list. Deterministic: a fixed xorshift
 //! seed, overridable with ARITH_FUZZ_SEED; case count with ARITH_FUZZ_N.
 use xrpl_ffi::arith;
-use xrpl_ffi::{XrplAmt, ARITH_ADD, ARITH_CANONICALIZE, ARITH_DIVROUND, ARITH_MULROUND, ARITH_MULROUND_STRICT, ARITH_SUB};
+use xrpl_ffi::{XrplAmt, ARITH_ADD, ARITH_CANONICALIZE, ARITH_DIVIDE, ARITH_DIVROUND, ARITH_MULROUND, ARITH_MULROUND_STRICT, ARITH_MULTIPLY, ARITH_SUB, NUM_TO_DROPS};
 use xrpl_ledger::tx::arith_probe as ours;
 
 struct Rng(u64);
@@ -133,6 +133,39 @@ fn arithmetic_agrees_with_libxrpl() {
                 t.entry("divRound IOU up").or_default().note(ok, || format!("{}e{} / {}e{} -> libxrpl {} ours {}e{}", am, ae, bm, be, fmt_amt(&r), o.0, o.1));
             }
             Err(_) => t.entry("divRound IOU up").or_default().oracle_errors += 1,
+        }
+        // --- STAmount multiply / divide (IOU): Number product at nearest; the
+        // legacy `muldiv(num, 1e17, den) + 5` quotient ----------------------------
+        match arith::stamount_op(ARITH_MULTIPLY, iou(am, ae), iou(bm, be), false, false) {
+            Ok(r) => {
+                let o = ours::number_op_signed(2, (am as i64, ae), (bm as i64, be), 0);
+                let ok = matches!(o, Ok((m, e)) if m as u128 == r.mantissa as u128 && e == r.exponent);
+                t.entry("STAmount multiply IOU").or_default().note(ok, || format!("{}e{} * {}e{} -> libxrpl {} ours {:?}", am, ae, bm, be, fmt_amt(&r), o));
+            }
+            Err(_) => t.entry("STAmount multiply IOU").or_default().oracle_errors += 1,
+        }
+        match arith::stamount_op(ARITH_DIVIDE, iou(am, ae), iou(bm, be), false, false) {
+            Ok(r) => {
+                let o = ours::divide16((am as u128, ae), (bm as u128, be));
+                let ok = r.mantissa as u128 == o.0 && r.exponent == o.1;
+                t.entry("STAmount divide IOU").or_default().note(ok, || format!("{}e{} / {}e{} -> libxrpl {} ours {}e{}", am, ae, bm, be, fmt_amt(&r), o.0, o.1));
+            }
+            Err(_) => t.entry("STAmount divide IOU").or_default().oracle_errors += 1,
+        }
+        // --- Number → drops under the three modes ---------------------------------
+        {
+            let (dm, de) = (rng.mantissa(), rng.exponent(-20, 2));
+            for mode in [0u8, 2, 3] {
+                let key: &'static str = match mode { 0 => "Number to_drops nearest", 2 => "Number to_drops down", _ => "Number to_drops up" };
+                match arith::number_op(NUM_TO_DROPS, (dm as i64, de), (1, 0), mode as i32) {
+                    Ok((d, _)) => {
+                        let o = ours::number_to_drops((dm as i64, de), mode);
+                        let ok = matches!(o, Ok(od) if od == d);
+                        t.entry(key).or_default().note(ok, || format!("{}e{} mode{} -> libxrpl {} drops ours {:?}", dm, de, mode, d, o));
+                    }
+                    Err(_) => t.entry(key).or_default().oracle_errors += 1,
+                }
+            }
         }
         // --- STAmount add / sub (IOU) --------------------------------------------
         // Gaps up to twenty digits either way: the wide ones are where Number's

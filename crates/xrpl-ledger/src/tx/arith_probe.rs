@@ -72,6 +72,18 @@ pub fn number_op_signed(op: u8, a: (i64, i32), b: (i64, i32), mode: u8) -> Resul
     .map_err(|e| format!("{e:?}"))?;
     Ok((r.signed_mantissa(), r.exponent))
 }
+/// `XRPAmount{Number}` — `Number::operator rep()` under `mode` (0 nearest,
+/// 1 towards-zero, 2 down, 3 up), through the port.
+pub fn number_to_drops(a: (i64, i32), mode: u8) -> Result<i64, String> {
+    use super::number::{Number, Rounding};
+    let mode = match mode { 1 => Rounding::TowardsZero, 2 => Rounding::Downward, 3 => Rounding::Upward, _ => Rounding::ToNearest };
+    Number::new(a.0, a.1, mode).and_then(|n| n.to_drops(mode)).map_err(|e| format!("{e:?}"))
+}
+/// STAmount `divide(num, den, IOU)` — `muldiv(num, 1e17, den) + 5` at
+/// offset −17, canonicalised at nearest (the engine's `n_div_rate`).
+pub fn divide16(a: Me, b: Me) -> Me {
+    amm_swap::n_div_rate(a, b)
+}
 /// Round an arbitrary (mantissa, exponent) to 16 significant digits, nearest
 /// (ties to even) — `STAmount`'s constructor canonicalisation under Number's
 /// default ToNearest mode.

@@ -501,6 +501,8 @@ pub const NUM_SUB: i32 = 1;
 pub const NUM_MUL: i32 = 2;
 pub const NUM_DIV: i32 = 3;
 pub const NUM_ROOT2: i32 = 4;
+/// `Number::operator rep()` — whole drops under the rounding mode (`b` ignored).
+pub const NUM_TO_DROPS: i32 = 5;
 /// Number rounding modes: 0 ToNearest, 1 TowardsZero, 2 Downward, 3 Upward.
 pub const NUM_ROUND_NEAREST: i32 = 0;
 pub const NUM_ROUND_TOWARDS_ZERO: i32 = 1;

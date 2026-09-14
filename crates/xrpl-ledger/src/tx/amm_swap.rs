@@ -789,44 +789,22 @@ pub(crate) fn to_amount(x: Me, xrp: bool, rnd: Rnd) -> Me {
     if !xrp {
         return n_norm(x);
     }
-    match rnd {
-        Rnd::Up => (ox::me_rescale(x, 0, true), 0),
-        Rnd::Down => (ox::me_rescale(x, 0, false), 0),
-        // `rnd == Rnd::Up` alone silently FLOORED a nearest request. Only the
-        // `limitOut` branch of `consume` asks for Near — every other call site
-        // states Up or Down — so this is the one place it ever mattered, and
-        // there it decides a whole drop.
-        //
-        // #105843839 C1F9FB1F: limitOut solves to 261170.9076568765 drops.
-        // Floored that is 261170; mainnet takes 261171 and its 6 metadata hits
-        // are all that single drop — two conserved pairs (taker/pool in AUDD
-        // and in XRP) plus the rested offer reflecting them.
-        //
-        // ⚠ 261171 is very slightly WORSE than the taker's limit (7.4e-10
-        // relative). rippled keeps it because `limitOut` actually reduced the
-        // output, which arms the `adjustedRemOut` 1e-7 forgiveness — the
-        // tolerance and this rounding are one mechanism, not two.
-        // F74 — `XRPAmount{Number}` converts through `Number::operator rep()`
-        // (Number.cpp:845-875): above half rounds up, an EXACT half rounds to
-        // even. Reading floor(x×10)'s last digit rounded every tie up, so
-        // 2.5 drops became 3 where rippled takes 2. Same family as F71.
-        Rnd::Near => {
-            let (m, e) = n_norm(x);
-            if e >= 0 {
-                (m.saturating_mul(10u128.saturating_pow(e as u32)), 0)
-            } else if -e > 38 {
-                (0, 0)
-            } else {
-                let div = 10u128.pow((-e) as u32);
-                let (ip, rem) = (m / div, m % div);
-                let half = div / 2;
-                (if rem > half || (rem == half && ip % 2 == 1) { ip + 1 } else { ip }, 0)
-            }
-        }
+    // `XRPAmount{Number}` is `Number::operator rep()` (tx::number `to_drops`):
+    // the fraction's digits go through the guard and the mode decides the
+    // drop — above half up, an exact half to even under ToNearest (F74:
+    // 2.5 drops is 2, not 3), Upward any remainder, Downward none. #105843839
+    // C1F9FB1F: `limitOut` solves to 261170.9076568765 drops at nearest and
+    // mainnet takes 261171 — very slightly worse than the taker's limit,
+    // kept because `limitOut` did reduce the output, which arms the
+    // `adjustedRemOut` 1e-7 forgiveness (one mechanism, not two).
+    use crate::tx::number::Number;
+    let mode = rounding(rnd);
+    match Number::from_parts(false, x.0, x.1, mode).and_then(|n| n.to_drops(mode)) {
+        Ok(d) => (d.unsigned_abs() as u128, 0),
+        Err(_) => (0, 0),
     }
 }
 
-/// getRate-encode a rate value: ((exp+100)<<56) | mantissa∈[1e15,1e16).
 fn encode_rate(n: Me) -> u64 {
     if n.0 == 0 {
         return 0;
