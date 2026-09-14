@@ -324,6 +324,12 @@ pub(crate) fn mul_round16_up(a: Me, b: Me) -> Me {
         m *= 10;
         e -= 1;
     }
+    // Finding 281: an exponent under STAmount's kMinOffset (−96) canonicalises
+    // to zero, and `mulRoundImpl` then answers a round-up with the minimum
+    // positive IOU, `kMinValue × 10^kMinOffset`.
+    if e < -96 {
+        return (1_000_000_000_000_000, -96);
+    }
     (m, e)
 }
 
@@ -385,9 +391,12 @@ pub(crate) fn mul_round_drops_strict(a: Me, b: Me, round_up: bool) -> u128 {
         return 0;
     }
     const TEN14: u128 = 100_000_000_000_000;
-    // `muldiv_round(m1, m2, tenTo14, tenTo14m1)` — a ceiling division.
+    // `muldivRound(m1, m2, tenTo14, roundUp ? tenTo14m1 : 0)` — a ceiling
+    // division only when rounding up; rounding down truncates here too
+    // (finding 280's second half: the one strict-down fuzz case left was
+    // this stage ceiling, one drop high).
     let prod = a.0 * b.0;
-    let mut m = prod / TEN14 + u128::from(prod % TEN14 != 0);
+    let mut m = prod / TEN14 + u128::from(round_up && prod % TEN14 != 0);
     let mut e = a.1 + b.1 + 14;
     if e < 0 {
         let mut had_remainder = false;
@@ -407,7 +416,10 @@ pub(crate) fn mul_round_drops_strict(a: Me, b: Me, round_up: bool) -> u128 {
         m /= 10;
         e += 1;
     }
-    m.saturating_mul(10u128.saturating_pow(e.clamp(0, 38) as u32))
+    let drops = m.saturating_mul(10u128.saturating_pow(e.clamp(0, 38) as u32));
+    // Finding 281: rounding up, a zero result from non-zero operands is one
+    // drop (`mulRoundImpl`'s closing clamp, shared with the legacy form).
+    if round_up && drops == 0 { 1 } else { drops }
 }
 
 /// `mulRound(a, b, IOU, roundUp = false)` — the LEGACY form rounding down,
@@ -507,6 +519,11 @@ pub(crate) fn div_round16_up(a: Me, rate: Me) -> Me {
         m /= 10;
         e += 1;
     }
+    // Finding 281: `divRoundImpl` closes the same way as `mulRoundImpl` — a
+    // quotient under kMinOffset rounds up to the minimum positive IOU.
+    if e < -96 {
+        return (1_000_000_000_000_000, -96);
+    }
     (m, e)
 }
 
@@ -580,7 +597,12 @@ pub(crate) fn mul_round_drops(a: Me, b: Me) -> u128 {
         m /= 10;
         e += 1;
     }
-    m.saturating_mul(10u128.saturating_pow(e.clamp(0, 38) as u32))
+    let drops = m.saturating_mul(10u128.saturating_pow(e.clamp(0, 38) as u32));
+    // Finding 281: `mulRoundImpl` ends `if (roundUp && !resultNegative &&
+    // !result) → amount = 1` — a product too small for a drop rounds up to
+    // ONE drop, never to zero (track-1 fuzz: 1.000000000000027e-2 ×
+    // 7.384998913361 → libxrpl 1 drop, ours 0).
+    if drops == 0 { 1 } else { drops }
 }
 
 pub(crate) fn me_muldiv(a: Me, b: Me, c: Me, ceil: bool) -> Me {
@@ -730,89 +752,34 @@ pub(crate) fn stamount_signed_add(aneg: bool, a: Me, bneg: bool, b: Me) -> (bool
     use crate::tx::amm_swap::{round16, Rnd};
     let a = round16(a.0, a.1, false, Rnd::Near);
     let b = round16(b.0, b.1, false, Rnd::Near);
-    // rippled adds IOUs through `Number` (STAmount.cpp:391, IOUAmount.cpp:142,
-    // both gated on `getSTNumberSwitchover()` — fixUniversalNumber, long since
-    // enabled): the operands are aligned with a GUARD DIGIT plus a sticky bit
-    // and the exact result is rounded HALF-EVEN back to 16 digits.
+    // rippled adds IOUs through `Number`: STAmount `operator+` →
+    // `IOUAmount::operator+=` → `Number{a} + Number{b}` at the 16-digit Small
+    // scale (Rules.cpp selects the 19-digit scales only under SingleAssetVault
+    // or LendingProtocol, neither live). `tx::number` is that operator ported
+    // line for line — the Guard alignment, the borrow loop, `doRoundDown`,
+    // the cusp that loses a digit — replacing the two models that preceded it:
+    // exact-then-half-even (finding 47: #106143011's pool sum
+    // 2000892.236615386 + 100.153148870651 = …256|651 stored as …257) and
+    // finding 209's cusp special case (#106823197 4332E5712967: the line at
+    // 12727272727272.72 paying 2727272727272.727 lands on 10^15 with 0.7 in
+    // the guard and re-scales to 9999999999999.990, not the exact …993).
+    // The track-1 fuzz (2026-09-14) put 20,000 subtractions per rounding mode
+    // through libxrpl and the port: identical, where the exact model differed
+    // on 1,277 / 115 / 91 of them.
     //
-    // Aligning to the larger exponent and dropping the tail is the LEGACY
-    // branch immediately below that switchover (`mantissa_ /= 10` in a loop),
-    // and it lands one ulp low whenever the discarded tail reaches half.
-    // #106143011's pool ran 2000892.236615386 + 100.153148870651: the exact
-    // sum is 2000992.389764256|651, so mainnet stores ...257 and we stored
-    // ...256. One ulp on the pool balance re-prices every later AMM slice —
-    // it walked into `changeSpotPriceQuality`, moved the generated offer just
-    // inside the target quality where rippled's lands just outside, and gave
-    // us a 6th AMM turn rippled never takes.
-    let e = a.1.min(b.1);
-    if (a.1.max(b.1) - e) as u32 > 22 {
-        // The smaller operand sits more than a full mantissa below the larger:
-        // under half an ulp, so it can only ever be sticky.
-        return if a.1 > b.1 { (aneg, a) } else { (bneg, b) };
+    // `IOUAmount(Number)`: an exponent under STAmount's kMinOffset (−96) is
+    // zero; over kMaxOffset (80) rippled throws — unreachable from two
+    // in-range operands, mapped to zero here.
+    use crate::tx::number::{Number, Rounding};
+    let to_number = |neg: bool, m: Me| Number::from_parts(neg, m.0, m.1, Rounding::ToNearest);
+    let (Ok(x), Ok(y)) = (to_number(aneg, a), to_number(bneg, b)) else {
+        return (false, (0, 0));
+    };
+    match x.add(y, Rounding::ToNearest) {
+        Ok(r) if r.is_zero() || r.exponent < -96 || r.exponent > 80 => (false, (0, 0)),
+        Ok(r) => (r.negative, (r.mantissa as u128, r.exponent)),
+        Err(_) => (false, (0, 0)),
     }
-    let av = a.0 * 10u128.pow((a.1 - e) as u32);
-    let bv = b.0 * 10u128.pow((b.1 - e) as u32);
-    if aneg == bneg {
-        return (aneg, round16(av + bv, e, false, Rnd::Near));
-    }
-    let k0 = (a.1.max(b.1) - e) as u32;
-    match av.cmp(&bv) {
-        std::cmp::Ordering::Equal => (false, (0, 0)),
-        std::cmp::Ordering::Greater => (aneg, number_diff16(av - bv, e, k0)),
-        std::cmp::Ordering::Less => (bneg, number_diff16(bv - av, e, k0)),
-    }
-}
-
-/// Finding 209: rippled subtracts IOUs through `Number` (STAmount.cpp
-/// `operator+` → `IOUAmount::operator+=` → `Number::operator+=`) at the
-/// SIXTEEN-digit "Small" mantissa scale — Rules.cpp `setCurrentTransactionRules`
-/// selects the nineteen-digit scales only under SingleAssetVault or
-/// LendingProtocol, neither live — where the cusp-rounding fix is Disabled.
-/// The operand with the smaller exponent is truncated to the larger exponent
-/// and its dropped digits kept in a Guard; the coarse difference is taken at
-/// that scale; guard digits are pulled back only while the mantissa is below
-/// 10^15 (Number.cpp: `while (xm < minMantissa …) { xm *= 10; xm -= g.pop();
-/// --xe; }`), and whatever the guard still holds then ROUNDS that mantissa
-/// (`doRoundDown`: Round::Up → `--mantissa`, and a mantissa that thereby falls
-/// under 10^15 is multiplied by ten with a TRAILING ZERO). A difference whose
-/// coarse mantissa lands exactly on 10^15 with digits left in the guard never
-/// receives its sixteenth digit: the remainder decides between
-/// 1000000000000000 and 9999999999999990 at the coarser scale. Everywhere
-/// else the algorithm equals the exact difference rounded half-even to
-/// sixteen digits, which is what this function did before.
-///
-/// #106823197 4332E5712967 (rapido5rxP, a circular LTC → XRP arbitrage; zv301
-/// and zv302 are the same bot): the line holding 12727272727272.72 pays
-/// 2727272727272.727. Exactly that is 9999999999999.993; rippled takes
-/// 1272727272727272 − 272727272727272 = 10^15 with 0.7 in the guard, rounds
-/// to 999999999999999 and re-scales: 9999999999999.990. The next iteration's
-/// DirectStep is bounded by that line, so mainnet sized the whole strand at
-/// …990 — the maker's line got …990 (ours …993) and its offer kept 0.01
-/// (ours 0.007).
-///
-/// `x` is the exact |a − b| at scale `e` (the smaller exponent); `k0` is the
-/// larger exponent minus `e`, the number of digits the smaller operand lost.
-/// The coarse mantissa after `k` digits are pulled back is ceil(x / 10^(k0−k)).
-fn number_diff16(x: u128, e: i32, k0: u32) -> Me {
-    use crate::tx::amm_swap::{round16, Rnd};
-    const MIN16: u128 = 1_000_000_000_000_000;
-    for k in 0..=k0 {
-        let p = 10u128.pow(k0 - k);
-        let rem = x % p;
-        let i = x / p + (rem != 0) as u128;
-        if i >= MIN16 {
-            if i == MIN16 && rem != 0 {
-                // The cusp. The guard holds (p − rem) / p: above one half it
-                // rounds up (ToNearest), exactly one half ties to even and
-                // 10^15 is even.
-                let g2 = p - rem;
-                let scale = e + (k0 - k) as i32;
-                return if 2 * g2 > p { (9_999_999_999_999_990, scale - 1) } else { (MIN16, scale) };
-            }
-            break;
-        }
-    }
-    round16(x, e, false, Rnd::Near)
 }
 
 pub(crate) fn signed_add(aneg: bool, a: Me, bneg: bool, b: Me) -> (bool, Me) {

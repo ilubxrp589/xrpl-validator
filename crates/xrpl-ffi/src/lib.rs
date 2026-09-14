@@ -509,6 +509,7 @@ pub const NUM_ROUND_UP: i32 = 3;
 
 #[link(name = "xrpl_shim", kind = "static")]
 extern "C" {
+    pub fn xrpl_arith_set_scale(large: u8);
     pub fn xrpl_arith_last_error() -> *const c_char;
     pub fn xrpl_arith_stamount_op(op: i32, a: *const XrplAmt, b: *const XrplAmt, round_up: u8, result_native: u8, out: *mut XrplAmt) -> i32;
     pub fn xrpl_arith_get_rate(offer_out: *const XrplAmt, offer_in: *const XrplAmt) -> u64;
@@ -524,6 +525,12 @@ pub mod arith {
     }
     pub fn xrp(drops: u64) -> XrplAmt {
         XrplAmt { mantissa: drops, exponent: 0, negative: 0, native: 1 }
+    }
+    /// Select Number's mantissa width: `large` = the 19-digit Large330 scale
+    /// (the process default; SingleAssetVault / LendingProtocol era), else the
+    /// 16-digit Small scale that mainnet transaction processing runs today.
+    pub fn set_scale(large: bool) {
+        unsafe { xrpl_arith_set_scale(large as u8) }
     }
     fn last_error() -> String {
         unsafe { std::ffi::CStr::from_ptr(xrpl_arith_last_error()).to_string_lossy().into_owned() }

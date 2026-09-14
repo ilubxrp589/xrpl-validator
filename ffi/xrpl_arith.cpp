@@ -46,6 +46,11 @@ xrpl::Number::RoundingMode mode_of(int m) {
 
 extern "C" {
 
+void xrpl_arith_set_scale(uint8_t large) {
+    using S = xrpl::MantissaRange::MantissaScale;
+    xrpl::Number::setMantissaScale(large ? S::Large330 : S::Small);
+}
+
 const char* xrpl_arith_last_error(void) {
     return g_last_error.c_str();
 }
@@ -99,7 +104,7 @@ int xrpl_arith_number_op(int op, int64_t m1, int32_t e1, int64_t m2, int32_t e2,
             case XRPL_NUM_SUB: r = a - b; break;
             case XRPL_NUM_MUL: r = a * b; break;
             case XRPL_NUM_DIV: r = a / b; break;
-            case XRPL_NUM_ROOT2: r = xrpl::root(a, 2); break;
+            case XRPL_NUM_ROOT2: r = xrpl::root2(a); break;
             default: xrpl::Number::setround(saved); g_last_error = "unknown op"; return 2;
         }
         *out_m = r.mantissa();

@@ -356,52 +356,48 @@ pub(crate) fn n_div_rate(a: Me, b: Me) -> Me {
     round16(q, a.1 - b.1 - 17, false, Rnd::Near)
 }
 
-pub(crate) fn n_add(a: Me, b: Me, rnd: Rnd) -> Me {
-    if a.0 == 0 {
-        return n_norm(b);
-    }
-    if b.0 == 0 {
-        return n_norm(a);
-    }
-    let a = n_norm(a);
-    let b = n_norm(b);
-    let (hi, lo) = if a.1 >= b.1 { (a, b) } else { (b, a) };
-    let diff = (hi.1 - lo.1) as u32;
-    if diff <= 22 {
-        round16(hi.0 * 10u128.pow(diff) + lo.0, lo.1, false, rnd)
-    } else {
-        // lo is far below one ulp of hi: pure sticky
-        round16(hi.0, hi.1, true, rnd)
+fn rounding(rnd: Rnd) -> crate::tx::number::Rounding {
+    use crate::tx::number::Rounding;
+    match rnd {
+        Rnd::Near => Rounding::ToNearest,
+        Rnd::Down => Rounding::Downward,
+        Rnd::Up => Rounding::Upward,
     }
 }
 
-/// a − b, clamped to zero when b ≥ a (callers treat zero as "nothing left").
-pub(crate) fn n_sub(a: Me, b: Me, rnd: Rnd) -> Me {
-    if b.0 == 0 {
-        return n_norm(a);
-    }
-    if a.0 == 0 || n_cmp(a, b) != Ordering::Greater {
+/// `Number + Number` under `rnd` — `tx::number`, rippled's operator ported
+/// line for line (the guard alignment, not exact-then-round: the two agree
+/// on every one of 20,000 fuzzed additions per mode, and differ on 6% of
+/// subtractions rounding down — see `n_sub`).
+pub(crate) fn n_add(a: Me, b: Me, rnd: Rnd) -> Me {
+    use crate::tx::number::Number;
+    let mode = rounding(rnd);
+    let (Ok(x), Ok(y)) = (Number::from_parts(false, a.0, a.1, mode), Number::from_parts(false, b.0, b.1, mode)) else {
         return (0, 0);
+    };
+    match x.add(y, mode) {
+        Ok(r) => (r.mantissa as u128, r.exponent),
+        Err(_) => (0, 0),
     }
-    let a = n_norm(a);
-    let b = n_norm(b);
-    if (a.1 - b.1).unsigned_abs() <= 22 {
-        let emin = a.1.min(b.1);
-        let av = a.0 * 10u128.pow((a.1 - emin) as u32);
-        let bv = b.0 * 10u128.pow((b.1 - emin) as u32);
-        round16(av - bv, emin, false, rnd)
-    } else {
-        // b is negligible: a − ε
-        match rnd {
-            Rnd::Down => {
-                if a.0 > LO {
-                    (a.0 - 1, a.1)
-                } else {
-                    (HI - 1, a.1 - 1)
-                }
-            }
-            _ => a, // Up and Near: ε is below half an ulp
-        }
+}
+
+/// a − b through `Number`, clamped to zero when b ≥ a (callers treat zero as
+/// "nothing left"). rippled's subtraction borrows the dropped digits back
+/// one at a time and never re-rounds across the 1e15 cusp: `1e15 − ε`
+/// rounding down is `9999999999999990e-1`, and a subtrahend more than sixteen
+/// digits below the minuend cannot borrow at all. The track-1 fuzz
+/// (2026-09-14) found the exact model 1,277 / 115 / 91 cases out of 20,000
+/// from libxrpl under down / nearest / up; the port is identical.
+pub(crate) fn n_sub(a: Me, b: Me, rnd: Rnd) -> Me {
+    use crate::tx::number::Number;
+    let mode = rounding(rnd);
+    let (Ok(x), Ok(y)) = (Number::from_parts(false, a.0, a.1, mode), Number::from_parts(false, b.0, b.1, mode)) else {
+        return (0, 0);
+    };
+    match x.sub(y, mode) {
+        Ok(r) if r.negative || r.is_zero() => (0, 0),
+        Ok(r) => (r.mantissa as u128, r.exponent),
+        Err(_) => (0, 0),
     }
 }
 

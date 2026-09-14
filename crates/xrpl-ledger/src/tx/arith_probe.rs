@@ -54,6 +54,24 @@ pub fn number_op(op: u8, a: Me, b: Me, mode: u8) -> Me {
         _ => amm_swap::n_sqrt(a),
     }
 }
+/// `Number` ops through the literal port (`tx::number`), signed: 0 add, 1 sub,
+/// 2 mul, 3 div, 4 root2 (unary; `b` ignored); mode 0 nearest, 1 towards-zero, 2 down, 3 up. `Err` where
+/// rippled throws (overflow, divide by zero).
+pub fn number_op_signed(op: u8, a: (i64, i32), b: (i64, i32), mode: u8) -> Result<(i64, i32), String> {
+    use super::number::{Number, Rounding};
+    let mode = match mode { 1 => Rounding::TowardsZero, 2 => Rounding::Downward, 3 => Rounding::Upward, _ => Rounding::ToNearest };
+    let x = Number::new(a.0, a.1, mode).map_err(|e| format!("{e:?}"))?;
+    let y = Number::new(b.0, b.1, mode).map_err(|e| format!("{e:?}"))?;
+    let r = match op {
+        0 => x.add(y, mode),
+        1 => x.sub(y, mode),
+        2 => x.mul(y, mode),
+        3 => x.div(y, mode),
+        _ => x.root2(mode),
+    }
+    .map_err(|e| format!("{e:?}"))?;
+    Ok((r.signed_mantissa(), r.exponent))
+}
 /// Round an arbitrary (mantissa, exponent) to 16 significant digits, nearest
 /// (ties to even) — `STAmount`'s constructor canonicalisation under Number's
 /// default ToNearest mode.

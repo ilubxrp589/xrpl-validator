@@ -49,7 +49,7 @@ public:
     bool setup(boost::program_options::variables_map const&) override;
     void start(bool) override;
     void run() override;
-    void signalStop(std::string) override;
+    void signalStop(std::string const&) override;
     std::uint64_t instanceID() const override;
     std::pair<PublicKey, SecretKey> const& nodeIdentity() override;
     std::optional<PublicKey const> getValidationPublicKey() const override;

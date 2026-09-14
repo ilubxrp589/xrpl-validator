@@ -78,6 +78,11 @@ fn fmt_amt(a: &XrplAmt) -> String {
 fn arithmetic_agrees_with_libxrpl() {
     let seed = std::env::var("ARITH_FUZZ_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0x9E37_79B9_7F4A_7C15u64);
     let n: u64 = std::env::var("ARITH_FUZZ_N").ok().and_then(|s| s.parse().ok()).unwrap_or(20_000);
+    // Mainnet runs Number's 16-digit Small scale (the large scale waits on
+    // SingleAssetVault / LendingProtocol); ARITH_SCALE=large fuzzes the other.
+    let large = std::env::var("ARITH_SCALE").map(|v| v == "large").unwrap_or(false);
+    arith::set_scale(large);
+    eprintln!("[arith_fuzz] Number scale: {}", if large { "Large330 (19 digits)" } else { "Small (16 digits)" });
     let mut rng = Rng(seed);
     let mut t: std::collections::BTreeMap<&'static str, Tally> = Default::default();
 
@@ -130,7 +135,9 @@ fn arithmetic_agrees_with_libxrpl() {
             Err(_) => t.entry("divRound IOU up").or_default().oracle_errors += 1,
         }
         // --- STAmount add / sub (IOU) --------------------------------------------
-        let (cm, ce) = (rng.mantissa(), ae + rng.exponent(-3, 3));
+        // Gaps up to twenty digits either way: the wide ones are where Number's
+        // guard cannot borrow and the exact-then-round model used to disagree.
+        let (cm, ce) = (rng.mantissa(), ae + if rng.next() % 2 == 0 { rng.exponent(-3, 3) } else { rng.exponent(-20, 20) });
         match arith::stamount_op(ARITH_ADD, iou(am, ae), iou(cm, ce), false, false) {
             Ok(r) => {
                 let (neg, o) = ours::stamount_signed_add(false, (am as u128, ae), false, (cm as u128, ce));
@@ -169,23 +176,22 @@ fn arithmetic_agrees_with_libxrpl() {
         let r_ours = ours::rate_encode_native(pays.0 as u128, pays.1, false, gets.0 as u128, gets.1, false).unwrap_or(0);
         t.entry("getRate IOU/IOU").or_default().note(r_ffi == r_ours, || format!("pays {}e{} gets {}e{} -> libxrpl {:016x} ours {:016x}", pays.0, pays.1, gets.0, gets.1, r_ffi, r_ours));
         // --- Number ops under the four rounding modes ------------------------------
-        for (op, name) in [(0u8, "Number add"), (1, "Number sub"), (2, "Number mul"), (3, "Number div")] {
+        for (op, name) in [(0u8, "Number add"), (1, "Number sub"), (2, "Number mul"), (3, "Number div"), (4, "Number root2")] {
             for mode in [0u8, 2, 3] {
                 let key: &'static str = match (name, mode) {
                     ("Number add", 0) => "Number add nearest", ("Number add", 2) => "Number add down", ("Number add", _) => "Number add up",
                     ("Number sub", 0) => "Number sub nearest", ("Number sub", 2) => "Number sub down", ("Number sub", _) => "Number sub up",
                     ("Number mul", 0) => "Number mul nearest", ("Number mul", 2) => "Number mul down", ("Number mul", _) => "Number mul up",
-                    (_, 0) => "Number div nearest", (_, 2) => "Number div down", (_, _) => "Number div up",
+                    ("Number div", 0) => "Number div nearest", ("Number div", 2) => "Number div down", ("Number div", _) => "Number div up",
+                    (_, 0) => "Number root2 nearest", (_, 2) => "Number root2 down", (_, _) => "Number root2 up",
                 };
-                // keep a >= b for sub so both sides stay positive (ours is unsigned)
-                let lt = |x: (u64, i32), y: (u64, i32)| (x.0 as f64) * 10f64.powi(x.1) < (y.0 as f64) * 10f64.powi(y.1);
-                let (xa, xb) = if op == 1 && lt((am, ae), (bm, be)) { ((bm, be), (am, ae)) } else { ((am, ae), (bm, be)) };
+                // Signed, exact: both sides are 16-digit Number results at the Small scale.
+                let (xa, xb) = ((am, ae), (bm, be));
                 match arith::number_op(op as i32, (xa.0 as i64, xa.1), (xb.0 as i64, xb.1), mode as i32) {
                     Ok((m, e)) => {
-                        let o = ours::number_op(op, (xa.0 as u128, xa.1), (xb.0 as u128, xb.1), mode);
-                        let proj = match mode { 2 => ours::norm16_trunc((m.max(0) as u128, e)), 3 => ours::round16_up((m.max(0) as u128, e)), _ => ours::round16_nearest((m.max(0) as u128, e)) };
-                        let ok = m >= 0 && proj.0 == o.0 && (m == 0 || proj.1 == o.1);
-                        t.entry(key).or_default().note(ok, || format!("{}e{} op{} {}e{} mode{} -> libxrpl {}e{} (16d {}e{}) ours {}e{}", xa.0, xa.1, op, xb.0, xb.1, mode, m, e, proj.0, proj.1, o.0, o.1));
+                        let o = ours::number_op_signed(op, (xa.0 as i64, xa.1), (xb.0 as i64, xb.1), mode);
+                        let ok = matches!(o, Ok((om, oe)) if om == m && (m == 0 || oe == e));
+                        t.entry(key).or_default().note(ok, || format!("{}e{} op{} {}e{} mode{} -> libxrpl {}e{} ours {:?}", xa.0, xa.1, op, xb.0, xb.1, mode, m, e, o));
                     }
                     Err(_) => t.entry(key).or_default().oracle_errors += 1,
                 }

@@ -50,7 +50,7 @@ MinimalApp::MinimalApp(std::uint32_t networkID)
 bool MinimalApp::setup(boost::program_options::variables_map const&) { throw std::runtime_error("MinimalApp::setup — not implemented"); }
 void MinimalApp::start(bool) { throw std::runtime_error("MinimalApp::start — not implemented"); }
 void MinimalApp::run() { throw std::runtime_error("MinimalApp::run — not implemented"); }
-void MinimalApp::signalStop(std::string) { throw std::runtime_error("MinimalApp::signalStop — not implemented"); }
+void MinimalApp::signalStop(std::string const&) { throw std::runtime_error("MinimalApp::signalStop — not implemented"); }
 std::uint64_t MinimalApp::instanceID() const { throw std::runtime_error("MinimalApp::instanceID — not implemented"); }
 std::pair<PublicKey, SecretKey> const& MinimalApp::nodeIdentity() { throw std::runtime_error("MinimalApp::nodeIdentity — not implemented"); }
 std::optional<PublicKey const> MinimalApp::getValidationPublicKey() const { throw std::runtime_error("MinimalApp::getValidationPublicKey — not implemented"); }

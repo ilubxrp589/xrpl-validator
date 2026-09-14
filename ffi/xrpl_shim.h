@@ -314,6 +314,10 @@ enum { XRPL_ARITH_MULROUND = 0, XRPL_ARITH_MULROUND_STRICT = 1, XRPL_ARITH_DIVRO
        XRPL_ARITH_ADD = 6, XRPL_ARITH_SUB = 7, XRPL_ARITH_CANONICALIZE = 8 };
 enum { XRPL_NUM_ADD = 0, XRPL_NUM_SUB = 1, XRPL_NUM_MUL = 2, XRPL_NUM_DIV = 3, XRPL_NUM_ROOT2 = 4 };
 /* rounding_mode: 0 ToNearest, 1 TowardsZero, 2 Downward, 3 Upward */
+/* Number's mantissa width is amendment-gated (Rules.cpp setCurrentTransactionRules):
+ * 16 digits ("Small") unless SingleAssetVault or LendingProtocol is enabled — mainnet
+ * today. The process default is the 19-digit Large330, so select before fuzzing. */
+void xrpl_arith_set_scale(uint8_t large);
 const char *xrpl_arith_last_error(void);
 int xrpl_arith_stamount_op(int op, const XrplAmt *a, const XrplAmt *b, uint8_t round_up, uint8_t result_native, XrplAmt *out);
 uint64_t xrpl_arith_get_rate(const XrplAmt *offer_out, const XrplAmt *offer_in);
