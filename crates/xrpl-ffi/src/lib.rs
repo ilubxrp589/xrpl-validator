@@ -474,3 +474,75 @@ impl SleProvider for MemoryProvider {
         self.map.get(key).map(|v| v.as_slice())
     }
 }
+
+// ---- Track 1: arithmetic oracle (ffi/xrpl_arith.cpp) ------------------------
+
+/// Mirror of the C `XrplAmt`: an STAmount as (mantissa, exponent, sign, native).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct XrplAmt {
+    pub mantissa: u64,
+    pub exponent: i32,
+    pub negative: u8,
+    pub native: u8,
+}
+
+pub const ARITH_MULROUND: i32 = 0;
+pub const ARITH_MULROUND_STRICT: i32 = 1;
+pub const ARITH_DIVROUND: i32 = 2;
+pub const ARITH_DIVROUND_STRICT: i32 = 3;
+pub const ARITH_MULTIPLY: i32 = 4;
+pub const ARITH_DIVIDE: i32 = 5;
+pub const ARITH_ADD: i32 = 6;
+pub const ARITH_SUB: i32 = 7;
+pub const ARITH_CANONICALIZE: i32 = 8;
+pub const NUM_ADD: i32 = 0;
+pub const NUM_SUB: i32 = 1;
+pub const NUM_MUL: i32 = 2;
+pub const NUM_DIV: i32 = 3;
+pub const NUM_ROOT2: i32 = 4;
+/// Number rounding modes: 0 ToNearest, 1 TowardsZero, 2 Downward, 3 Upward.
+pub const NUM_ROUND_NEAREST: i32 = 0;
+pub const NUM_ROUND_TOWARDS_ZERO: i32 = 1;
+pub const NUM_ROUND_DOWN: i32 = 2;
+pub const NUM_ROUND_UP: i32 = 3;
+
+#[link(name = "xrpl_shim", kind = "static")]
+extern "C" {
+    pub fn xrpl_arith_last_error() -> *const c_char;
+    pub fn xrpl_arith_stamount_op(op: i32, a: *const XrplAmt, b: *const XrplAmt, round_up: u8, result_native: u8, out: *mut XrplAmt) -> i32;
+    pub fn xrpl_arith_get_rate(offer_out: *const XrplAmt, offer_in: *const XrplAmt) -> u64;
+    pub fn xrpl_arith_number_op(op: i32, m1: i64, e1: i32, m2: i64, e2: i32, rounding_mode: i32, out_m: *mut i64, out_e: *mut i32) -> i32;
+}
+
+/// Safe wrappers over the oracle. `Err(msg)` carries rippled's exception text.
+pub mod arith {
+    use super::*;
+
+    pub fn iou(mantissa: u64, exponent: i32) -> XrplAmt {
+        XrplAmt { mantissa, exponent, negative: 0, native: 0 }
+    }
+    pub fn xrp(drops: u64) -> XrplAmt {
+        XrplAmt { mantissa: drops, exponent: 0, negative: 0, native: 1 }
+    }
+    fn last_error() -> String {
+        unsafe { std::ffi::CStr::from_ptr(xrpl_arith_last_error()).to_string_lossy().into_owned() }
+    }
+    /// libxrpl's STAmount operation `op` on `a` and `b`; the result's asset is
+    /// XRP when `result_native`, else an IOU of no issue.
+    pub fn stamount_op(op: i32, a: XrplAmt, b: XrplAmt, round_up: bool, result_native: bool) -> Result<XrplAmt, String> {
+        let mut out = XrplAmt { mantissa: 0, exponent: 0, negative: 0, native: 0 };
+        let rc = unsafe { xrpl_arith_stamount_op(op, &a, &b, round_up as u8, result_native as u8, &mut out) };
+        if rc == 0 { Ok(out) } else { Err(last_error()) }
+    }
+    /// `getRate(offerOut, offerIn)`: the 64-bit book quality, 0 on overflow.
+    pub fn get_rate(offer_out: XrplAmt, offer_in: XrplAmt) -> u64 {
+        unsafe { xrpl_arith_get_rate(&offer_out, &offer_in) }
+    }
+    /// `Number` operation `op` under `rounding_mode`; returns (mantissa, exponent).
+    pub fn number_op(op: i32, a: (i64, i32), b: (i64, i32), rounding_mode: i32) -> Result<(i64, i32), String> {
+        let (mut m, mut e) = (0i64, 0i32);
+        let rc = unsafe { xrpl_arith_number_op(op, a.0, a.1, b.0, b.1, rounding_mode, &mut m, &mut e) };
+        if rc == 0 { Ok((m, e)) } else { Err(last_error()) }
+    }
+}

@@ -379,7 +379,7 @@ pub(crate) fn mul_round16_down(a: Me, b: Me) -> Me {
 /// we hand over the full 20.17908820997. rippled ceilings to 18593612, finds
 /// it cannot afford that, and re-derives the output from the 18593611 it does
 /// have: `New flow iter (iter, in, out): 3 18593611 20.17908820996999`.
-fn mul_round_drops_strict(a: Me, b: Me, round_up: bool) -> u128 {
+pub(crate) fn mul_round_drops_strict(a: Me, b: Me, round_up: bool) -> u128 {
     let (a, b) = (norm16(a), norm16(b));
     if a.0 == 0 || b.0 == 0 {
         return 0;
@@ -397,11 +397,38 @@ fn mul_round_drops_strict(a: Me, b: Me, round_up: bool) -> u128 {
             m = nv;
             e += 1;
         }
-        m += if had_remainder && round_up { 10 } else { 9 };
+        // Finding 280 (track-1 fuzz, 15,492 of 20,000 `roundUp = false`
+        // cases off by one drop): `canonicalizeRoundStrict` runs only when
+        // `resultNegative != roundUp` — for a positive product, only when
+        // rounding UP. Rounding down, the mantissa goes straight into
+        // `STAmount(asset, amount, offset)` whose XRP conversion runs under
+        // TowardsZero (`NumberRoundModeGuard`): a plain truncation, no `+9`.
+        m += if round_up { if had_remainder { 10 } else { 9 } } else { 0 };
         m /= 10;
         e += 1;
     }
     m.saturating_mul(10u128.saturating_pow(e.clamp(0, 38) as u32))
+}
+
+/// `mulRound(a, b, IOU, roundUp = false)` — the LEGACY form rounding down,
+/// which is not a floor: `mulRoundImpl<canonicalizeRound, DontAffectNumberRoundMode>`
+/// truncates the product at 1e14 (18 digits), skips `canonicalizeRound` (it
+/// runs only for `resultNegative != roundUp`), and hands the 18-digit
+/// mantissa to `STAmount(asset, amount, offset)` — whose canonicalisation
+/// runs under Number's DEFAULT mode, ToNearest. So "down" is round-to-nearest
+/// of the truncated product. Track-1 fuzz: 6,597 of 20,000 cases differ from
+/// a floor (finding 279). No caller yet: each `mul_round16_down` site is a
+/// rippled `mulRound` OR `mulRoundStrict` call and must be classified before
+/// it moves here.
+pub(crate) fn mul_round16_legacy_down(a: Me, b: Me) -> Me {
+    let (a, b) = (norm16(a), norm16(b));
+    if a.0 == 0 || b.0 == 0 {
+        return (0, 0);
+    }
+    const TEN14: u128 = 100_000_000_000_000;
+    let m = a.0 * b.0 / TEN14; // truncating muldiv
+    let e = a.1 + b.1 + 14;
+    crate::tx::amm_swap::round16(m, e, false, crate::tx::amm_swap::Rnd::Near)
 }
 
 /// `mulRound(a, b, XRP, roundUp)` — `a * b` as whole DROPS, the NON-strict way.
@@ -533,7 +560,7 @@ pub(crate) fn iou_amount(v: Me) -> Me {
     }
 }
 
-fn mul_round_drops(a: Me, b: Me) -> u128 {
+pub(crate) fn mul_round_drops(a: Me, b: Me) -> u128 {
     let (a, b) = (norm16(a), norm16(b));
     if a.0 == 0 || b.0 == 0 {
         return 0;

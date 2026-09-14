@@ -82,3 +82,8 @@ required-features = ["ffi"]
 name = "differential_probe"
 path = "src/bin/differential_probe.rs"
 required-features = ["ffi"]
+
+[[test]]
+name = "arith_fuzz"
+path = "tests/arith_fuzz.rs"
+required-features = ["ffi"]

@@ -5,7 +5,7 @@
 cmake_minimum_required(VERSION 3.22)
 project(xrpl_shim CXX)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)   # rippled 3.3.0 headers use std::expected
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -31,6 +31,7 @@ find_package(xxHash REQUIRED)
 find_package(lz4 REQUIRED)
 find_package(LibArchive REQUIRED)
 find_package(SOCI REQUIRED)
+find_package(mpt-crypto REQUIRED)   # rippled 3.3.0: Protocol.h includes <mpt_protocol.h>
 find_package(SQLite3 REQUIRED)
 find_package(RocksDB REQUIRED)
 find_package(nudb REQUIRED)
@@ -97,6 +98,7 @@ set(xrpld_sources
 
 add_library(xrpl_shim STATIC
     xrpl_shim.cpp
+    xrpl_arith.cpp
     MinimalApp.cpp
     CallbackReadView.cpp
     MutationCollector.cpp
@@ -132,6 +134,7 @@ target_link_libraries(xrpl_shim PUBLIC
     SQLite::SQLite3
     RocksDB::rocksdb
     NuDB::nudb
+    mpt-crypto::mpt-crypto
     absl::random_random
     Snappy::snappy
     BZip2::BZip2

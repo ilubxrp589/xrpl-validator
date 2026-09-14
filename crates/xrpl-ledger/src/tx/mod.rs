@@ -5,6 +5,7 @@
 pub mod account;
 pub mod amm;
 pub mod amm_swap;
+pub mod arith_probe;
 pub mod check;
 pub mod credential;
 pub mod direct_step;

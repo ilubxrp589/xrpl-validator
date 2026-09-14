@@ -301,6 +301,24 @@ bool xrpl_test_callback_read(
     size_t sle_len);
 
 #ifdef __cplusplus
+/* ---- Track 1: arithmetic oracle (xrpl_arith.cpp) ------------------------------
+ * Pure STAmount / Number operations for differential fuzzing against our port. */
+typedef struct XrplAmt {
+    uint64_t mantissa;
+    int32_t  exponent;   /* ignored when native */
+    uint8_t  negative;
+    uint8_t  native;     /* 1 = XRP drops in mantissa */
+} XrplAmt;
+enum { XRPL_ARITH_MULROUND = 0, XRPL_ARITH_MULROUND_STRICT = 1, XRPL_ARITH_DIVROUND = 2,
+       XRPL_ARITH_DIVROUND_STRICT = 3, XRPL_ARITH_MULTIPLY = 4, XRPL_ARITH_DIVIDE = 5,
+       XRPL_ARITH_ADD = 6, XRPL_ARITH_SUB = 7, XRPL_ARITH_CANONICALIZE = 8 };
+enum { XRPL_NUM_ADD = 0, XRPL_NUM_SUB = 1, XRPL_NUM_MUL = 2, XRPL_NUM_DIV = 3, XRPL_NUM_ROOT2 = 4 };
+/* rounding_mode: 0 ToNearest, 1 TowardsZero, 2 Downward, 3 Upward */
+const char *xrpl_arith_last_error(void);
+int xrpl_arith_stamount_op(int op, const XrplAmt *a, const XrplAmt *b, uint8_t round_up, uint8_t result_native, XrplAmt *out);
+uint64_t xrpl_arith_get_rate(const XrplAmt *offer_out, const XrplAmt *offer_in);
+int xrpl_arith_number_op(int op, int64_t m1, int32_t e1, int64_t m2, int32_t e2, int rounding_mode, int64_t *out_m, int32_t *out_e);
+
 }  /* extern "C" */
 #endif
 
