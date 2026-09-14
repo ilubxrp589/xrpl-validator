@@ -54,6 +54,10 @@ fn amendment_hash(name: &str) -> Hash256 {
 /// 3.2.0 declares but does not yet implement. Regenerate at each upgrade (PORT-3.2.0.md).
 pub fn supported_amendments() -> Vec<Hash256> {
     let names = [
+        // BatchV1_1: voted yes 2026-09-14 (James) — support for the amendment; the
+        // FFI leg that keeps the state-hash matching once it activates is in
+        // (docs/superpowers/specs/2026-09-14-batch-support-design.md).
+        "BatchV1_1",
         "fixCleanup3_2_0", "fixCleanup3_1_3", "LendingProtocol", "fixDirectoryLimit",
         "fixIncludeKeyletFields", "fixTokenEscrowV1", "fixPriceOracleOrder", "fixMPTDeliveredAmount",
         "fixAMMClawbackRounding", "TokenEscrow", "fixEnforceNFTokenTrustlineV2", "fixAMMv1_3",
