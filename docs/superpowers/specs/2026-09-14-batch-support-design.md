@@ -1,7 +1,9 @@
 # Batch (BatchV1_1) support — design
 
-**Date:** 2026-09-14 · **Branch:** t0-batch · **Status:** FFI leg implemented and
-verified on devnet fixtures; native leg pending review.
+**Date:** 2026-09-14 · **Branch:** t0-batch · **Status:** FFI leg implemented (t0-batch 06b21f8, 964a862) and verified —
+8 of 11 devnet Batch ledgers CLEAN, the other 3 diverge only on VaultDeposit /
+LoanPay hydration (devnet-only amendments); mainnet fixture 106980883 CLEAN
+(no regression); 22 suites, lib, fuzz, clippy green. Native leg pending review.
 
 ## Why now
 
