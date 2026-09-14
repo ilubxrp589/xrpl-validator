@@ -1230,6 +1230,8 @@ pub struct FfiStats {
     pub live_types_seen: std::collections::BTreeMap<String, u64>,
     // Full apply on live mainnet tx (with RPC-fetched state)
     pub live_apply_attempted: u64,
+    /// Inner Batch entries skipped by the feed — applied inside their outer Batch.
+    pub live_apply_batch_inner_skipped: u64,
     pub live_apply_ok: u64,        // tesSUCCESS
     pub live_apply_claimed: u64,   // tec* (legit claimed failures — rippled also returned these)
     pub live_apply_diverged: u64,  // terPRE_SEQ / tef* / tem* / tel* (our processing issues)
@@ -1397,6 +1399,7 @@ pub fn render_prometheus(s: &FfiStats) -> String {
     let _ = writeln!(out, "xrpl_ffi_apply_total{{result=\"tec_claimed\"}} {}", s.live_apply_claimed);
     let _ = writeln!(out, "xrpl_ffi_apply_total{{result=\"diverged\"}} {}", s.live_apply_diverged);
     let _ = writeln!(out, "xrpl_ffi_apply_attempted_total {}", s.live_apply_attempted);
+    let _ = writeln!(out, "xrpl_ffi_apply_batch_inner_skipped_total {}", s.live_apply_batch_inner_skipped);
 
     // Mainnet agreement ratio (gauge)
     let agreed = s.live_apply_ok + s.live_apply_claimed;
@@ -2353,6 +2356,7 @@ pub fn apply_ledger_in_order_with_net(
             .unwrap_or_else(|| ("Unknown".to_string(), String::new()));
         if inner_of.contains_key(&tx_hash) {
             skipped_inner += 1;
+            stats.lock().live_apply_batch_inner_skipped += 1;
             continue;
         }
         let t0 = std::time::Instant::now();

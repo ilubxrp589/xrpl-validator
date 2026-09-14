@@ -191,6 +191,9 @@ fn run() -> i32 {
     println!();
     println!("=== #{seq} parity result ===");
     println!("  attempted:          {}", s.live_apply_attempted);
+    if s.live_apply_batch_inner_skipped > 0 {
+        println!("  batch inner (in outer): {}", s.live_apply_batch_inner_skipped);
+    }
     println!("  ok/claimed:         {}/{}", s.live_apply_ok, s.live_apply_claimed);
     println!("  diverged:           {}", s.live_apply_diverged);
     println!("  silent diverged:    {}", s.live_apply_silent_diverged);
@@ -219,12 +222,14 @@ fn run() -> i32 {
         );
         return 3;
     }
-    let attempted_all = s.live_apply_attempted as usize == txs.len();
+    // Inner Batch entries are applied inside their outer Batch, not attempted on their own.
+    let covered = s.live_apply_attempted + s.live_apply_batch_inner_skipped;
+    let attempted_all = covered as usize == txs.len();
     let clean = s.live_apply_diverged == 0
         && s.live_apply_silent_diverged == 0
         && s.live_apply_mutation_diverged == 0;
     if !attempted_all {
-        println!("PROBE: INCOMPLETE (attempted {} of {})", s.live_apply_attempted, txs.len());
+        println!("PROBE: INCOMPLETE (attempted {} of {})", covered, txs.len());
         return 2;
     }
     if clean {
