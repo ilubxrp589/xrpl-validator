@@ -2181,6 +2181,33 @@ fn stamount_divide(num: Me, den: Me, xrp: bool) -> Me {
     }
 }
 
+/// The directory pages of a book that HOLD something — rippled's `BookTip::step`
+/// walks `succ()` from page to page and `continue`s past any whose `dirFirst`
+/// finds no entry, so an empty page is no level: not the tip, not a quality
+/// the pool is measured against, not a stop for the walk.
+///
+/// Finding 283 (#106983394 5B4E06B079D4, rapido5rxP RLUSD → USD → CNY → XRP):
+/// the CNY.rKiCet8/XRP book carries an EMPTY root page at 4D0ADF550834D180,
+/// a quality better than every resting offer and than the pool's spot. Our
+/// level list took it as the tip: the pool's turn measured against it
+/// ("CLOB better") and never generated the slice, and the walk went on to
+/// consume rN5nsAc5's and rwvLbHQ's offers at 4F21… instead — 16 mutations
+/// against mainnet's 10, the pool's account and CNY line untouched. rippled's
+/// tip is the first non-empty page, 4F21342332122000, the pool's
+/// `changeSpotPriceQuality` beats it, and the slice carries the whole 519.24
+/// CNY. The bundle drill could not show it: an empty page appears in no meta.
+fn book_dir_keys(sandbox: &Sandbox, base: &Hash256) -> Vec<Hash256> {
+    sandbox
+        .keys_with_prefix(&base.0[..24])
+        .into_iter()
+        .filter(|dk| {
+            json_at(sandbox, dk)
+                .and_then(|p| p.get("Indexes").and_then(|v| v.as_array()).map(|a| !a.is_empty()))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
 /// Quality-ordered (rate, offer key) ladder of a book — every resting offer,
 /// best first, capped.
 fn book_offer_ladder(sandbox: &Sandbox, base: &Hash256, cap: usize) -> Vec<(u64, Hash256)> {
@@ -3364,7 +3391,7 @@ fn cross_bridged(
     // Finding 239 (#106863376 7597883D5031): leg B's rev extent needs the
     // book's LEVELS, not just its ladder of offers — `rev_extent_reap` steps
     // level by level. (Withdrawn by finding 244, re-derived here — F251.)
-    let dirs_b = sandbox.keys_with_prefix(&base_b.0[..24]);
+    let dirs_b = book_dir_keys(sandbox, &base_b); // finding 283: no empty pages
     let dir_at = |dirs: &[Hash256], q: u64| {
         dirs.iter().position(|d| u64::from_be_bytes(d.0[24..32].try_into().unwrap_or_default()) == q)
     };
@@ -3412,7 +3439,7 @@ fn cross_bridged(
     }
     let ld = book_offer_ladder(sandbox, inv_base, 128);
     // Finding 282: the direct strand's rev extent (see the trial below).
-    let dirs_d = sandbox.keys_with_prefix(&inv_base.0[..24]);
+    let dirs_d = book_dir_keys(sandbox, inv_base);
     let mut oc_d: std::collections::HashMap<[u8; 20], u64> = Default::default();
     // Finding 139: rippled has ONE limitQuality for the crossing —
     // `Quality{takerAmount.out, sendMax}` with the gateway transfer fee
@@ -6773,7 +6800,7 @@ pub(crate) fn cross_engine_to_net(
             return (r.0, r.1, r.2, in_gross_spent);
         }
     }
-    let dirs = sandbox.keys_with_prefix(&inv_base.0[..24]);
+    let dirs = book_dir_keys(sandbox, &inv_base); // finding 283: an empty page is no level
     // The book's raw first entry before the walk reaps anything — the
     // quality `BookStep::tip()` anchors the first pass's QualityFunction to
     // (finding 166b; see `consume`'s `raw_tip`).

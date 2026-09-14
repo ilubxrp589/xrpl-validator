@@ -817,3 +817,16 @@ fn payment_redeems_globally_frozen_iou_to_its_issuer_106920314() {
 fn payment_five_pool_path_rev_pass_escalates_past_a_sub_drop_rung_106921383() {
     run_bundle(include_str!("vectors/payment_five_pool_path_rev_pass_escalates_past_a_sub_drop_rung_106921383.json"));
 }
+
+/// Finding 283 (#106983394 5B4E06B079D4, rapido5rxP RLUSD → USD → CNY → XRP):
+/// the CNY.rKiCet8/XRP book carries an EMPTY root page at 4D0ADF550834D180,
+/// better than every resting offer and than the pool's spot. rippled's
+/// `BookTip::step` passes empty pages, so its tip is 4F21342332122000 and
+/// the pool's `changeSpotPriceQuality` slice carries the whole 519.24 CNY;
+/// our level list took the empty page as the tip, refused the pool and
+/// consumed two resting offers instead. The page appears in no meta, so this
+/// bundle carries its parent-ledger image by hand.
+#[test]
+fn payment_empty_book_page_is_no_level_the_pool_slice_beats_the_real_tip_106983394() {
+    run_bundle(include_str!("vectors/payment_empty_book_page_is_no_level_the_pool_slice_beats_the_real_tip_106983394.json"));
+}
