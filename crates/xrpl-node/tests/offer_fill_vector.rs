@@ -1374,3 +1374,16 @@ fn offer_rate_quotient_at_two_to_the_63_wraps_through_the_signed_mantissa_106963
 fn offer_exhausted_walk_rests_by_the_per_fill_fold_not_the_partial_level_list_106980883() {
     run_bundle(include_str!("vectors/offer_exhausted_walk_rests_by_the_per_fill_fold_not_the_partial_level_list_106980883.json"));
 }
+
+/// Finding 282 (#106983394 34561BC0DC71): rsPrWzpYp5 buys 9862 USDC.rcEGREd8
+/// with RLUSD from a 316.5 RLUSD line, autobridged. The direct strand's rev
+/// pass sizes the book by the want, steps past rUgWjzwo's head (consumed
+/// whole in the sandbox) to rDeXHakZ's ECB6743009C2 funded by a zero line and
+/// `permRmOffer`s it — offer, its emptied page 2A7C2AB29622 and the owner's
+/// count — while the fwd pass, limited to the taker's 316.5, fills a third of
+/// the head. The bridged crossing sized the direct candidate from the head
+/// alone and never reached the dead offer.
+#[test]
+fn offer_direct_strand_rev_extent_reaps_the_unfunded_offer_behind_the_head_106983394() {
+    run_bundle(include_str!("vectors/offer_direct_strand_rev_extent_reaps_the_unfunded_offer_behind_the_head_106983394.json"));
+}

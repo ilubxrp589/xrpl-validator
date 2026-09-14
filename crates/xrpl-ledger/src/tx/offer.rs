@@ -3411,6 +3411,9 @@ fn cross_bridged(
         return None; // no bridge: caller runs the direct walk
     }
     let ld = book_offer_ladder(sandbox, inv_base, 128);
+    // Finding 282: the direct strand's rev extent (see the trial below).
+    let dirs_d = sandbox.keys_with_prefix(&inv_base.0[..24]);
+    let mut oc_d: std::collections::HashMap<[u8; 20], u64> = Default::default();
     // Finding 139: rippled has ONE limitQuality for the crossing —
     // `Quality{takerAmount.out, sendMax}` with the gateway transfer fee
     // INSIDE sendMax (OfferCreate.cpp:380-393) — and holds the strands' RAW
@@ -5125,6 +5128,32 @@ thr={t:?} admits_trunc={} admits_up={}",
                 let Some((q, okey, offer, maker, gives0, wants0)) =
                     live_head(sandbox, &ld, &mut di, taker, pays_leg, gets_leg, true, true, stale, (threshold_self != 0 && threshold_self != u64::MAX).then_some(threshold_self), Some(&drained_next), false)
                 else { break 'attempt };
+                // Finding 282 (#106983394 34561BC0DC71, rsPrWzpYp5 buying 9862
+                // USDC.rcEGREd8 with RLUSD from a 316.5 RLUSD line): the direct
+                // strand's REV pass sizes the book by the WANT (finding 114),
+                // stepping past rUgWjzwo's head offer — consumed whole at
+                // 399.04 USDC in the sandbox — to rDeXHakZ's ECB6743009C2
+                // behind it, funded by a zero line: "Removing unfunded offer",
+                // a `permRmOffer` that outlives the pass and the taker's funds
+                // limit; its emptied page 2A7C2AB29622 goes with it and the
+                // owner's count moves. The DirectStep then limits the strand to
+                // the 316.5 the taker holds and the fwd pass fills a third of
+                // the head. Finding 251 gave this stepping to the bridge's leg
+                // B; the direct candidate sized its fill from the head alone
+                // and never reached ECB6743009C2 — 8 mutations against
+                // mainnet's 12. As for leg B, a pool-served pass does not step
+                // onto the book (finding 244/251).
+                if !pool_offer_this_round {
+                    if let Some(dj) = ld.get(di).and_then(|(q, _)| dir_at(&dirs_d, *q)) {
+                        if std::env::var("DX_REV").is_ok() {
+                            eprintln!("DX_REV direct extent enter di={di} dj={dj} sell={sell} rem_pays={rem_pays:?} crossed={crossed}");
+                        }
+                        rev_extent_reap(
+                            sandbox, &dirs_d, dj, if sell { None } else { Some(rem_pays) },
+                            taker, beneficiary, pays_leg, gets_leg, true, &mut oc_d, stale,
+                        );
+                    }
+                }
                 let funded_raw = available(sandbox, &maker, pays_leg);
                 let d_orate = maker_out_rate(sandbox, pays_leg, &maker, beneficiary);
                 let funded = match d_orate {
