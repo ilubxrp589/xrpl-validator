@@ -2273,6 +2273,65 @@ pub fn apply_ledger_in_order_with_net(
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(8),
     );
+    // Batch (BatchV1_1): rippled records each inner transaction as its own
+    // ledger entry — own hash, own meta with ParentBatchID, the indices right
+    // after the outer — and applies them INSIDE the outer's application. The
+    // shim now does the same (apply_batch_if_needed), so the inner entries are
+    // skipped here exactly as rippled's OpenLedger skips tfInnerBatchTxn
+    // entries; their expected mutation sets fold into their outer's, which is
+    // where our collector reports them.
+    let mut inner_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for blob in txs_in_order {
+        let ids = xrpl_ffi::batch_inner_ids(blob);
+        if ids.is_empty() {
+            continue;
+        }
+        let outer = xrpl_ffi::parse_tx(blob).map(|p| hex::encode_upper(p.hash)).unwrap_or_default();
+        for id in ids {
+            inner_of.insert(hex::encode_upper(id), outer.clone());
+        }
+    }
+    let merged_expected: Option<std::collections::HashMap<String, Vec<(String, u8)>>> =
+        match (expected_mutations, inner_of.is_empty()) {
+            (Some(m), false) => {
+                let mut mm = m.clone();
+                let mut outers: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for (inner, outer) in &inner_of {
+                    if let Some(v) = m.get(inner) {
+                        mm.entry(outer.clone()).or_default().extend(v.iter().cloned());
+                        outers.insert(outer.clone());
+                    }
+                }
+                // One key touched by several inners: the collector reports the
+                // net effect — Created wins over Modified, Created-then-Deleted
+                // is no entry at all.
+                for outer in outers {
+                    if let Some(v) = mm.get_mut(&outer) {
+                        let mut kinds: std::collections::HashMap<String, (bool, bool, bool)> = Default::default();
+                        for (k, b) in v.iter() {
+                            let e = kinds.entry(k.clone()).or_default();
+                            match b {
+                                0 => e.0 = true,
+                                2 => e.2 = true,
+                                _ => e.1 = true,
+                            }
+                        }
+                        let mut out = Vec::with_capacity(kinds.len());
+                        for (k, (c, _m, d)) in kinds {
+                            if c && d {
+                                continue;
+                            }
+                            out.push((k, if c { 0 } else if d { 2 } else { 1 }));
+                        }
+                        *v = out;
+                    }
+                }
+                Some(mm)
+            }
+            _ => None,
+        };
+    let expected_mutations = merged_expected.as_ref().or(expected_mutations);
+    let mut skipped_inner = 0u32;
     for tx_bytes in txs_in_order {
         tx_num += 1;
         // No-snapshot (standalone RPC) path: seed succ()'s book view before
@@ -2292,6 +2351,10 @@ pub fn apply_ledger_in_order_with_net(
         let (tx_type, tx_hash) = xrpl_ffi::parse_tx(tx_bytes)
             .map(|p| (p.tx_type, hex::encode_upper(p.hash)))
             .unwrap_or_else(|| ("Unknown".to_string(), String::new()));
+        if inner_of.contains_key(&tx_hash) {
+            skipped_inner += 1;
+            continue;
+        }
         let t0 = std::time::Instant::now();
         // Use DB-first provider when a pre-ledger OwnedSnapshot is supplied.
         // The snapshot is stable (rocksdb MVCC) — safe against concurrent writes.
@@ -2853,6 +2916,14 @@ pub fn apply_ledger_in_order_with_net(
         }
     }
     stats.lock().ledgers_applied += 1;
+    if skipped_inner > 0 {
+        eprintln!(
+            "[ffi-batch] #{ledger_seq}: {skipped_inner} inner Batch entr{} applied through {} outer Batch{}",
+            if skipped_inner == 1 { "y" } else { "ies" },
+            inner_of.values().collect::<std::collections::HashSet<_>>().len(),
+            if inner_of.values().collect::<std::collections::HashSet<_>>().len() == 1 { "" } else { "es" },
+        );
+    }
 
     // Export cumulative RPC provider counters (per-ledger)
     use std::sync::atomic::Ordering;

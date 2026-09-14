@@ -19,6 +19,8 @@
 #include <xrpl/protocol/XRPAmount.h>
 #include <xrpl/protocol/Fees.h>
 #include <xrpl/ledger/OpenView.h>
+#include <xrpl/protocol/TER.h>
+#include <xrpl/protocol/TxFlags.h>
 #include <xrpl/tx/apply.h>
 #include <xrpl/tx/applySteps.h>
 #include <xrpl/beast/utility/Journal.h>
@@ -89,6 +91,67 @@ public:
 private:
     std::string& dest_;
 };
+
+namespace xrpl {
+// apply.cpp defines this overload (used by applyBatchTransactions) with external
+// linkage, but no public header declares it.
+ApplyResult
+apply(
+    ServiceRegistry& registry,
+    OpenView& view,
+    uint256 const& parentBatchId,
+    STTx const& tx,
+    ApplyFlags flags,
+    beast::Journal journal);
+}  // namespace xrpl
+
+namespace {
+// Batch (BatchV1_1). rippled applies a Batch's inner transactions in
+// `applyTransaction` → `applyBatchTransactions` (apply.cpp, a static function),
+// NOT in `apply()`: an outer Batch through `xrpl::apply` alone charges its fee
+// and sequence and returns tesSUCCESS with the inners untouched. This is that
+// function, line for line, so the shim's view — and the mutation collector
+// reading it — carries the inners' state changes.
+bool apply_batch_inners(
+    xrpl::ServiceRegistry& registry,
+    xrpl::OpenView& batchView,
+    xrpl::STTx const& batchTxn,
+    beast::Journal j) {
+    auto const parentBatchId = batchTxn.getTransactionID();
+    auto const mode = batchTxn.getFlags();
+    int applied = 0;
+    for (auto const& stx : batchTxn.getBatchTransactions()) {
+        xrpl::OpenView perTxBatchView(xrpl::kBatchView, batchView);
+        auto const ret = xrpl::apply(registry, perTxBatchView, parentBatchId, *stx, xrpl::TapBatch, j);
+        if (ret.applied && (xrpl::isTesSuccess(ret.ter) || xrpl::isTecClaim(ret.ter))) {
+            perTxBatchView.apply(batchView);
+            ++applied;
+        }
+        if (!xrpl::isTesSuccess(ret.ter)) {
+            if ((mode & xrpl::tfAllOrNothing) != 0u) return false;
+            if ((mode & xrpl::tfUntilFailure) != 0u) break;
+        } else if ((mode & xrpl::tfOnlyOne) != 0u) {
+            break;
+        }
+    }
+    return applied != 0;
+}
+
+// After a successful outer apply: run the inners on a whole-batch view and fold
+// it into `view` when at least one applied (applyTransaction's ttBATCH branch).
+void apply_batch_if_needed(
+    xrpl::ServiceRegistry& registry,
+    xrpl::OpenView& view,
+    xrpl::STTx const& tx,
+    xrpl::ApplyResult const& result,
+    beast::Journal j) {
+    if (!(result.applied && xrpl::isTesSuccess(result.ter) && tx.getTxnType() == xrpl::ttBATCH))
+        return;
+    xrpl::OpenView wholeBatchView(xrpl::kBatchView, view);
+    if (apply_batch_inners(registry, wholeBatchView, tx, j))
+        wholeBatchView.apply(view);
+}
+}  // namespace
 
 extern "C" {
 
@@ -186,6 +249,26 @@ bool xrpl_tx_parse(
         return true;
     } catch (...) {
         return false;
+    }
+}
+
+// Batch: the inner transaction ids of a ttBATCH blob (STTx::getBatchTransactionIDs),
+// up to `cap` copied into out_ids (32 bytes each). Returns the count of inners
+// (0 for any other type), -1 on a parse failure.
+int xrpl_tx_batch_inner_ids(
+    const uint8_t *tx_bytes, size_t tx_len,
+    uint8_t *out_ids, size_t cap) {
+    try {
+        xrpl::SerialIter sit(tx_bytes, tx_len);
+        xrpl::STTx tx(sit);
+        if (tx.getTxnType() != xrpl::ttBATCH) return 0;
+        auto const ids = tx.getBatchTransactionIDs();
+        size_t const n = std::min(ids.size(), cap);
+        for (size_t k = 0; k < n; ++k)
+            std::memcpy(out_ids + 32 * k, ids[k].data(), 32);
+        return static_cast<int>(ids.size());
+    } catch (...) {
+        return -1;
     }
 }
 
@@ -338,6 +421,7 @@ int32_t xrpl_apply(
             tx,
             static_cast<xrpl::ApplyFlags>(apply_flags),
             journal);
+        apply_batch_if_needed(app, open_view, tx, result, journal);
 
         if (out_applied) *out_applied = result.applied;
 
@@ -464,6 +548,7 @@ XrplApplyResult *xrpl_apply_with_mutations(
         auto apply_result = xrpl::apply(
             app, open_view, tx,
             static_cast<xrpl::ApplyFlags>(apply_flags), journal);
+        apply_batch_if_needed(app, open_view, tx, apply_result, journal);
 
         result->ter = TERtoInt(apply_result.ter);
         result->applied = apply_result.applied;

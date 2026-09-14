@@ -175,6 +175,9 @@ void xrpl_result_destroy(XrplApplyResult *result);
  * Useful for validating/inspecting before full apply.
  * ============================================================ */
 
+/* Batch: inner transaction ids of a ttBATCH blob, up to cap × 32 bytes into
+ * out_ids. Returns the inner count (0 for other types), -1 on parse failure. */
+int xrpl_tx_batch_inner_ids(const uint8_t *tx_bytes, size_t tx_len, uint8_t *out_ids, size_t cap);
 bool xrpl_tx_parse(
     const uint8_t *tx_bytes, size_t tx_len,
     uint8_t out_hash[32],

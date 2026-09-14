@@ -54,6 +54,8 @@ extern "C" {
     pub fn xrpl_engine_create() -> *mut XrplEngine;
     pub fn xrpl_engine_destroy(engine: *mut XrplEngine);
 
+    pub fn xrpl_tx_batch_inner_ids(tx_bytes: *const u8, tx_len: usize, out_ids: *mut u8, cap: usize) -> i32;
+
     pub fn xrpl_tx_parse(
         tx_bytes: *const u8,
         tx_len: usize,
@@ -166,6 +168,25 @@ pub struct ParsedTx {
 ///
 /// Returns the tx hash and type name. This calls libxrpl's `STTx` constructor
 /// via `SerialIter`. Returns `None` if the tx is malformed.
+/// The inner transaction ids of a Batch blob (empty for any other type or on a
+/// parse failure). rippled records each inner as its own ledger entry; the
+/// outer's apply covers them, so a replay must skip these ids.
+pub fn batch_inner_ids(tx_bytes: &[u8]) -> Vec<[u8; 32]> {
+    const CAP: usize = 8; // kMaxBatchTxCount
+    let mut buf = [0u8; 32 * CAP];
+    let n = unsafe { xrpl_tx_batch_inner_ids(tx_bytes.as_ptr(), tx_bytes.len(), buf.as_mut_ptr(), CAP) };
+    if n <= 0 {
+        return Vec::new();
+    }
+    (0..(n as usize).min(CAP))
+        .map(|k| {
+            let mut id = [0u8; 32];
+            id.copy_from_slice(&buf[32 * k..32 * k + 32]);
+            id
+        })
+        .collect()
+}
+
 pub fn parse_tx(tx_bytes: &[u8]) -> Option<ParsedTx> {
     let mut hash = [0u8; 32];
     let mut type_name_buf = [0u8; 64];
