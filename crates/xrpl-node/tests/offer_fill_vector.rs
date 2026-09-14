@@ -1366,3 +1366,11 @@ fn offer_became_unfunded_reap_inside_a_rejected_trial_is_discarded_106914017() {
 fn offer_rate_quotient_at_two_to_the_63_wraps_through_the_signed_mantissa_106963823() {
     run_bundle(include_str!("vectors/offer_rate_quotient_at_two_to_the_63_wraps_through_the_signed_mantissa_106963823.json"));
 }
+
+/// Finding 278 — an in-exhausting walk turns the level fold off, so the
+/// rested amount comes from the per-fill gross fold: this underfunded
+/// passive sell fully crosses on mainnet and rests nothing.
+#[test]
+fn offer_exhausted_walk_rests_by_the_per_fill_fold_not_the_partial_level_list_106980883() {
+    run_bundle(include_str!("vectors/offer_exhausted_walk_rests_by_the_per_fill_fold_not_the_partial_level_list_106980883.json"));
+}

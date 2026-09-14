@@ -8788,8 +8788,30 @@ pub(crate) fn cross_engine_to_net(
         // Finding 274 (see the pool-slice bookkeeping above): fee-free, the
         // fold runs over the ITERATIONS' ins — `saved_level_ins`, one entry
         // per book level or pool slice — which is rippled's `savedIns`.
-        let per_iteration = fold_rem && pay_in_rate.is_none() && !saved_level_ins.is_empty();
-        let gross = if per_iteration { fold16_multiset(&saved_level_ins) } else { fold16_multiset(&saved_ins) };
+        //
+        // Finding 278: not once the walk has switched its in-fold OFF — an
+        // in-exhausting fill (the drain law, Finding 30) closes the in side
+        // by construction and stops folding levels, so `saved_level_ins` is
+        // then INCOMPLETE and Finding 274's per-iteration fold under-counts.
+        // #106980883 ADC78C340C2E (rpiFwLYi, tfPassive, underfunded — 283.46
+        // of 514.31 RLUSD spendable): three fills at one level exhaust the
+        // taker; the level list held one entry (22.0), the fold rested
+        // 261.46 and we placed an offer mainnet never placed — its page and
+        // the next transaction's kill cascaded from it. Finding 236's
+        // per-fill gross fold is the right figure for an exhausted walk.
+        // The two lists must account for the same total (they differ only in
+        // grouping and by the ULPs the grouping moves); when the level list
+        // is short of the fills — a path that fills without recording its
+        // level — it is not rippled's savedIns and the per-fill fold stands.
+        let fill_fold = fold16_multiset(&saved_ins);
+        let level_fold = fold16_multiset(&saved_level_ins);
+        let lists_agree = {
+            let (_, diff) = stamount_signed_add(false, level_fold, true, fill_fold);
+            let tol = me_muldiv(fill_fold, (1, 0), (100_000_000_000_000, 0), false); // 1e-14 relative
+            me_cmp(diff, tol).is_le()
+        };
+        let per_iteration = fold_rem && !in_fold_off && pay_in_rate.is_none() && !saved_level_ins.is_empty() && lists_agree;
+        let gross = if per_iteration { level_fold } else { fill_fold };
         if std::env::var("DX_PLACE").is_ok() {
             eprintln!("DX_PLACE F274 per_iteration={per_iteration} n_iter={} n_fills={} fold={gross:?} entry_gets={entry_gets:?}", saved_level_ins.len(), saved_ins.len());
         }
