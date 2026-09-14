@@ -58,6 +58,8 @@ pub fn supported_amendments() -> Vec<Hash256> {
         // FFI leg that keeps the state-hash matching once it activates is in
         // (docs/superpowers/specs/2026-09-14-batch-support-design.md).
         "BatchV1_1",
+        // fixCleanup3_3_0: ported (finding 259); added to the vote 2026-09-14.
+        "fixCleanup3_3_0",
         "fixCleanup3_2_0", "fixCleanup3_1_3", "LendingProtocol", "fixDirectoryLimit",
         "fixIncludeKeyletFields", "fixTokenEscrowV1", "fixPriceOracleOrder", "fixMPTDeliveredAmount",
         "fixAMMClawbackRounding", "TokenEscrow", "fixEnforceNFTokenTrustlineV2", "fixAMMv1_3",
