@@ -1387,3 +1387,19 @@ fn offer_exhausted_walk_rests_by_the_per_fill_fold_not_the_partial_level_list_10
 fn offer_direct_strand_rev_extent_reaps_the_unfunded_offer_behind_the_head_106983394() {
     run_bundle(include_str!("vectors/offer_direct_strand_rev_extent_reaps_the_unfunded_offer_behind_the_head_106983394.json"));
 }
+}
+
+/// Finding 288 (#106990975 36B71A8A3816): rMsXVzCug7's tfPassive 0.02447 BTC
+/// → 1907.06654 RLUSD, bridged through the BTC/XRP and XRP/RLUSD pools. The
+/// bound a strand is admitted on is `BookStep::tip`, whose CLOB half is
+/// `BookTip::step` — the first directory entry as it stands, expired or not.
+/// Leg B's raw tip is E21DCFAF, expired to the second, filed 0.019% better
+/// than the live offer behind it; rippled admits the bridge on it, flows the
+/// strand (reaping the expired offer, its page CFEC8953, the owner-dir entry
+/// and one OwnerCount), then rejects the realised quality and rests the
+/// offer whole. Bounding on the live head missed the limit by 0.006% and
+/// never flowed the strand.
+#[test]
+fn offer_bridge_admission_reads_the_raw_book_tip_expired_or_not_106990975() {
+    run_bundle(include_str!("vectors/offer_bridge_admission_reads_the_raw_book_tip_expired_or_not_106990975.json"));
+}

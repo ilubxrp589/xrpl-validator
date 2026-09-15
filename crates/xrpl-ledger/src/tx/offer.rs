@@ -3890,24 +3890,60 @@ fn cross_bridged(
         // 50 later objects in the ledger cascaded off the phantom offer.
         // A bridge leg's peeked head: (quality, key, offer, maker, gives, wants).
         type LegPeek = Option<(u64, Hash256, serde_json::Value, [u8; 20], Me, Me)>;
+        // Finding 288 (#106990975 36B71A8A3816, rMsXVzCug7's tfPassive 0.02447
+        // BTC → 1907.06654 RLUSD, bridged through the BTC/XRP and XRP/RLUSD
+        // pools): the bound rippled admits a strand on is `BookStep::tip`,
+        // and its CLOB half is `BookTip::step` — the FIRST directory entry as
+        // it stands, with no expiry or funding test (BookTip.cpp: `succ` →
+        // `dirFirst` → `peek`; the "Removing expired offer" step belongs to
+        // the OfferStream, which only runs once the strand is flowed). Leg
+        // B's raw tip was rGssxjk-style dead wood: E21DCFAF, expired to the
+        // second (842747460 against a parent close of 842747460), filed at
+        // 7.056046e5 drops/RLUSD, with the live 9059D2A8 behind it at
+        // 7.057412e5. rippled bounded the bridge on the expired page
+        // (1.28300e-5 BTC/RLUSD, inside the 1.28313e-5 net limit), flowed
+        // it, reaped the expired offer in the rev pass, and rejected the
+        // realised 1.287848e-5 against the 1.285047e-5 limit — "All strands
+        // dry", the offer rests, and the reap stays (offer, its page
+        // CFEC8953, the owner-dir entry and one OwnerCount). We bounded on
+        // the live head — 1.28321e-5, outside by 0.006% — never flowed the
+        // strand, and left all four. The raw tip prices ADMISSION only; the
+        // pool-versus-tip choice at execution stays on the live tip
+        // (`forEachOffer` asks `offers.tip()`, past the dead ones).
+        let raw_tip_q = |sb: &Sandbox, l: &[(u64, Hash256)], i: usize| -> Option<u64> {
+            l.iter().skip(i).find_map(|(q, k)| {
+                let e = json_at(sb, k)?;
+                (e.get("LedgerEntryType").and_then(|v| v.as_str()) == Some("Offer")).then_some(*q)
+            })
+        };
+        let qa_raw = raw_tip_q(sandbox, &la, ai);
+        let qb_raw = raw_tip_q(sandbox, &lb, bi);
+        let qa_book_raw = qa_raw.map(rate_me).or(qa_book);
+        let qb_book_raw = qb_raw.map(rate_me).or(qb_book);
+        if std::env::var("DX_BRIDGE").is_ok() {
+            eprintln!("DX_RAWTIP qa_raw={qa_raw:?} qb_raw={qb_raw:?} qa_book_raw={qa_book_raw:?} qb_book_raw={qb_book_raw:?} threshold_self={threshold_self:x}");
+        }
         let anch_ub = |sb: &Sandbox,
                        am: &Option<crate::tx::amm_swap::Amm>,
-                       peek: &LegPeek,
-                       out_leg: &Leg, in_leg: &Leg, spot: Option<Me>, book: Option<Me>, unb: bool| -> Option<Me> {
-            match (am, peek) {
-                (Some(a), Some((q, ..))) if !(threshold_self != 0 && threshold_self < *q) => {
-                    crate::tx::amm_swap::anchored_offer_quality(sb, a, out_leg, in_leg, *q)
+                       raw: Option<u64>,
+                       out_leg: &Leg, in_leg: &Leg, spot: Option<Me>, book: Option<Me>| -> Option<Me> {
+            // `qualityThreshold(lobQuality)` on the raw tip: the taker's limit
+            // beating it means no anchor and the unbounded curve offer.
+            let unb = am.is_some() && threshold_self != 0 && raw.is_some_and(|q| threshold_self < q);
+            match (am, raw) {
+                (Some(a), Some(q)) if !(threshold_self != 0 && threshold_self < q) => {
+                    crate::tx::amm_swap::anchored_offer_quality(sb, a, out_leg, in_leg, q)
                         .map(rate_me)
                         .or_else(|| single_ub(spot, book, unb))
                 }
                 _ => single_ub(spot, book, unb),
             }
         };
-        let qa_ub = if multi_prev { qa } else { anch_ub(sandbox, &amm_a, &apeek, &xrp_leg, gets_leg, spot_a, qa_book, a_unb_raw) };
+        let qa_ub = if multi_prev { qa } else { anch_ub(sandbox, &amm_a, qa_raw, &xrp_leg, gets_leg, spot_a, qa_book_raw) };
         let qb_ub = if multi_prev {
             if b_use_amm_ub { b_fib.as_ref().map(|(q, _)| *q) } else { qb_book }
         } else {
-            anch_ub(sandbox, &amm_b, &bpeek, pays_leg, &xrp_leg, spot_b, qb_book, b_unb_raw)
+            anch_ub(sandbox, &amm_b, qb_raw, pays_leg, &xrp_leg, spot_b, qb_book_raw)
         };
         let bq_ub = match (qa_ub, qb_ub) {
             (Some((am, ae)), Some((bm, be))) => Some(norm16((am * bm, ae + be))),
@@ -4512,20 +4548,10 @@ thr={t:?} admits_trunc={} admits_up={}",
         // bridge admitted by its multipath bound is admitted for execution
         // only if its single-path bound clears the limit too.
         let bq_adm = if mp_ub && !multi_now && bq_ub.is_some() {
-            let anch = |am: &Option<crate::tx::amm_swap::Amm>,
-                        peek: &Option<(u64, Hash256, serde_json::Value, [u8; 20], Me, Me)>,
-                        out_leg: &Leg, in_leg: &Leg, spot: Option<Me>, book: Option<Me>, unb: bool| -> Option<Me> {
-                match (am, peek) {
-                    (Some(a), Some((q, ..))) if !(threshold_self != 0 && threshold_self < *q) => {
-                        crate::tx::amm_swap::anchored_offer_quality(sandbox, a, out_leg, in_leg, *q)
-                            .map(rate_me)
-                            .or_else(|| single_ub(spot, book, unb))
-                    }
-                    _ => single_ub(spot, book, unb),
-                }
-            };
-            let qa_s = anch(&amm_a, &apeek, &xrp_leg, gets_leg, spot_a, qa_book, a_unb_raw);
-            let qb_s = anch(&amm_b, &bpeek, pays_leg, &xrp_leg, spot_b, qb_book, b_unb_raw);
+            // Finding 288: the single-path bound reads the RAW tip too (see
+            // `raw_tip_q` above) — `anch_ub` is that bound.
+            let qa_s = anch_ub(sandbox, &amm_a, qa_raw, &xrp_leg, gets_leg, spot_a, qa_book_raw);
+            let qb_s = anch_ub(sandbox, &amm_b, qb_raw, pays_leg, &xrp_leg, spot_b, qb_book_raw);
             let bq_s = match (qa_s, qb_s) {
                 (Some((am, ae)), Some((bm, be))) => Some(norm16((am * bm, ae + be))),
                 _ => None,
@@ -4545,6 +4571,12 @@ thr={t:?} admits_trunc={} admits_up={}",
         } else {
             bq_ub
         };
+        if std::env::var("DX_BRIDGE").is_ok() {
+            eprintln!(
+                "DX_ADMIT d_tip={d_tip:?} ub_ok(d)={:?} direct_dry={direct_dry} direct_alive={direct_alive} bq_adm={bq_adm:?} bq_ub={bq_ub:?} ub_ok(b)={:?} bridge_alive={bridge_alive} thr_admit={thr_admit:?}",
+                ub_ok(d_tip), ub_ok(bq_adm)
+            );
+        }
         let order: &[bool] = match (ub_ok(d_tip).filter(|_| !direct_dry && direct_alive), ub_ok(bq_adm).filter(|_| bridge_alive)) {
             (Some(d), Some(b)) => {
                 if me_cmp(d, b).is_le() {
