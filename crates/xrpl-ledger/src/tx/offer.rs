@@ -9509,7 +9509,22 @@ impl Transactor for OfferCreateTransactor {
             };
             root_frozen || line_frozen
         };
-        let (rem_pays, rem_gets_cross, crossed) = if book_refused || freeze_refused {
+        // Track 2: the ported flow engine crosses the books when
+        // XRPL_FLOW_ENGINE=port (CreateOffer::flowCross, flow/offer_cross.rs).
+        let mut port_after_in: Option<Me> = None;
+        let (rem_pays, rem_gets_cross, crossed) = if crate::flow::payment_flow::port_enabled() && !(book_refused || freeze_refused) {
+            let asset_of = |l: &Leg| crate::flow::steps::Asset { currency: l.cur, issuer: if l.xrp { None } else { Some(l.issuer) } };
+            let amt_of = |l: &Leg, m: Me| if l.xrp { crate::flow::amounts::EitherAmount::Xrp(me_rescale(m, 0, false) as i128) } else { crate::flow::amounts::EitherAmount::Iou(crate::flow::amounts::IouAmount::from_me(false, m)) };
+            let r = crate::flow::offer_cross::flow_cross(sandbox, &tx.account, asset_of(&gets_leg), amt_of(&gets_leg, tg0), asset_of(&pays_leg), amt_of(&pays_leg, tp0), flags, domain);
+            for k in &r.removed {
+                if !stale.contains(k) {
+                    stale.push(*k);
+                }
+            }
+            let crossed = if r.actual_out.signum() > 0 { 1 } else { 0 };
+            port_after_in = Some(r.after_in.mantissa_exp());
+            (r.after_out.mantissa_exp(), r.after_in.mantissa_exp(), crossed)
+        } else if book_refused || freeze_refused {
             if std::env::var("DX_FOK").is_ok() {
                 eprintln!("DX_FOK strand refused: book_refused={book_refused} (issuer-side NoRipple on the TakerGets line) freeze_refused={freeze_refused} (taker GlobalFreeze / own freeze on the TakerPays line)");
             }
@@ -9526,7 +9541,9 @@ impl Transactor for OfferCreateTransactor {
         // funded part could be spent, but the whole unspent remainder rests.
         // Left exactly as returned when the clamp did not bite, so the fully
         // funded path keeps its value rather than re-deriving it.
-        let rem_gets = if underfunded {
+        let rem_gets = if let Some(a) = port_after_in {
+            a
+        } else if underfunded {
             me_norm(me_sub(tg0, me_sub(tg_cross, rem_gets_cross)))
         } else {
             rem_gets_cross

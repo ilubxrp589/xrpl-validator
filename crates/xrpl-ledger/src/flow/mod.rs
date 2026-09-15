@@ -22,6 +22,7 @@ pub mod amm;
 pub mod amounts;
 pub mod book_step;
 pub mod direct_step;
+pub mod offer_cross;
 pub mod offer_stream;
 pub mod pay_steps;
 pub mod payment_flow;
