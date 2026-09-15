@@ -253,6 +253,12 @@ impl<'a, 'b> PaymentSandbox<'a, 'b> {
         self.sandbox
     }
 
+    /// The view the flow opened with — the `cancelView` an OfferStream
+    /// reads "original funds" from: the base ledger beneath every layer.
+    pub fn base_view(&self) -> &Sandbox<'a> {
+        self.sandbox
+    }
+
     /// `afView` read: the entry as it stood when the innermost layer opened
     /// (or the live view outside any layer).
     pub fn af_read(&self, key: &Hash256) -> Option<Vec<u8>> {

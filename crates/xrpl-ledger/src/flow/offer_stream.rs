@@ -1,0 +1,541 @@
+//! rippled `BookTip` (`src/xrpld/app/tx/detail/BookTip.cpp`) and
+//! `TOfferStreamBase` / `FlowOfferStream` (`OfferStream.cpp`): the cursor a
+//! `BookStep` walks a book with, and the stream that steps it past every
+//! offer that cannot trade — missing, expired, empty, deep-frozen, out of
+//! its domain, unfunded, or tiny at a worse quality than filed — removing
+//! the ones rippled removes and recording, per `FlowOfferStream`, which
+//! removals are permanent (`permToRemove_`).
+//!
+//! Two facts the engine in `tx::offer` had to learn per finding are the
+//! structure here:
+//!
+//!   * `BookTip::step` reads the FIRST directory entry as it stands, with no
+//!     test at all (findings 233, 288): that raw quality is what
+//!     `BookStep::tip` prices admission on.
+//!   * the stream distinguishes an offer FOUND unfunded (funds zero in the
+//!     `cancelView`, the view as the flow opened — `permRmOffer`, kept even
+//!     when the strand is discarded) from one that BECAME unfunded inside
+//!     this flow (stepped past, deleted only in the strand's sandbox, gone
+//!     with a rejected strand) — findings 153, 275, 277.
+use crate::ledger::keylet;
+use crate::tx::offer::{decode20, json_at};
+use xrpl_core::types::Hash256;
+
+use super::amounts::{EitherAmount, IouAmount};
+use super::payment_sandbox::PaymentSandbox;
+use super::quality_function::Quality;
+use super::st_amount::{mul_round, mul_round_strict, StAmount};
+use super::steps::Asset;
+use super::view::{
+    account_funds_iou, book_base, dir_first, is_deep_frozen, page_quality, quality_next, read_offer,
+    succ_in_book, xrp_liquid, AuthHandling, FreezeHandling, OfferEntry,
+};
+
+/// `BookTip`: the cursor over a book's directory pages, best quality first.
+pub struct BookTip {
+    base: Hash256,
+    /// `m_book`: the key the next `succ` starts strictly after.
+    book: Hash256,
+    /// `m_end`: `getQualityNext(base)`.
+    end: Hash256,
+    /// `m_dir`: the page the current entry was read from.
+    dir: Option<Hash256>,
+    /// `m_index`: the current offer's key.
+    index: Option<Hash256>,
+    /// `m_entry`: the current offer, None when the directory names a key
+    /// that holds no offer.
+    entry: Option<OfferEntry>,
+    quality: Option<Quality>,
+    valid: bool,
+}
+
+impl BookTip {
+    /// `BookTip(view, book)`.
+    pub fn new(input: &Asset, output: &Asset, domain: Option<&Hash256>) -> BookTip {
+        let base = book_base(input, output, domain);
+        BookTip { base, book: base, end: quality_next(&base), dir: None, index: None, entry: None, quality: None, valid: false }
+    }
+
+    pub fn dir(&self) -> Option<Hash256> {
+        self.dir
+    }
+    pub fn index(&self) -> Option<Hash256> {
+        self.index
+    }
+    pub fn entry(&self) -> Option<&OfferEntry> {
+        self.entry.as_ref()
+    }
+    pub fn quality(&self) -> Option<Quality> {
+        self.quality
+    }
+
+    /// `BookTip::step`: delete the offer the cursor sits on (it has been
+    /// consumed or judged dead — "BookTip::step deletes the current offer
+    /// from the view before advancing"), then move to the first entry of
+    /// the next non-empty page. Returns false when the book is exhausted.
+    pub fn step(&mut self, ps: &mut PaymentSandbox) -> bool {
+        if self.valid {
+            if let Some(key) = self.index.take() {
+                if self.entry.is_some() {
+                    offer_delete(ps, &key);
+                }
+            }
+            self.entry = None;
+        }
+        loop {
+            let Some(first_page) = succ_in_book(ps.sandbox(), &self.base, &self.book, &self.end) else {
+                return false;
+            };
+            if let Some((page, index)) = dir_first(ps.sandbox(), &first_page) {
+                self.dir = Some(page);
+                self.index = Some(index);
+                self.entry = read_offer(ps.sandbox(), &index);
+                self.quality = Some(Quality(page_quality(&first_page)));
+                self.valid = true;
+                // Next query starts before this directory: the quality
+                // immediately before the next quality (`--m_book`).
+                self.book = first_page;
+                dec_key(&mut self.book);
+                return true;
+            }
+            // An empty directory: advance past it.
+            self.book = first_page;
+        }
+    }
+}
+
+/// `--m_book` on a uint256: the key one below.
+fn dec_key(k: &mut Hash256) {
+    for b in k.0.iter_mut().rev() {
+        if *b == 0 {
+            *b = 0xFF;
+        } else {
+            *b -= 1;
+            break;
+        }
+    }
+}
+
+/// `offerDelete(view, offer)`: remove the offer from its book page and its
+/// owner's directory, and give the owner back one owner-count unit. The
+/// engine's `delete_maker_offer` does exactly this over the sandbox.
+pub fn offer_delete(ps: &mut PaymentSandbox, key: &Hash256) {
+    let Some(offer) = json_at(ps.sandbox(), key) else { return };
+    let Some(owner) = offer.get("Account").and_then(|v| v.as_str()).and_then(decode20) else { return };
+    crate::tx::offer::delete_maker_offer(ps.view(), key, &offer, &owner);
+}
+
+/// `StepCounter`: the per-transaction budget of stream steps (1000 for a
+/// payment flow, `flow()`'s `StepCounter counter(1000, j)`).
+pub struct StepCounter {
+    limit: u32,
+    count: u32,
+}
+
+impl StepCounter {
+    pub fn new(limit: u32) -> StepCounter {
+        StepCounter { limit, count: 0 }
+    }
+    /// `StepCounter::step`: false once the limit is reached.
+    pub fn step(&mut self) -> bool {
+        if self.count >= self.limit {
+            return false;
+        }
+        self.count += 1;
+        true
+    }
+}
+
+/// `TOffer<TIn, TOut>` as the stream hands it to the step: the entry, its
+/// FILED quality (the page's, never recomputed — "an important business
+/// rule that maintains accuracy when an offer is partially filled"), and
+/// its current amounts.
+#[derive(Clone, Debug)]
+pub struct Offer {
+    pub key: Hash256,
+    pub owner: [u8; 20],
+    pub quality: Quality,
+    pub asset_in: Asset,
+    pub asset_out: Asset,
+    /// (in, out) = (TakerPays, TakerGets).
+    pub amount_in: EitherAmount,
+    pub amount_out: EitherAmount,
+}
+
+impl Offer {
+    fn from_entry(e: &OfferEntry, quality: Quality) -> Offer {
+        Offer {
+            key: e.key,
+            owner: e.owner,
+            quality,
+            asset_in: e.asset_in,
+            asset_out: e.asset_out,
+            amount_in: either(e.asset_in.is_xrp(), e.taker_pays),
+            amount_out: either(e.asset_out.is_xrp(), e.taker_gets),
+        }
+    }
+
+    /// `fully_consumed`: nothing more can flow through this offer.
+    pub fn fully_consumed(&self) -> bool {
+        self.amount_in.is_zero() || self.amount_out.is_zero() || self.amount_in.negative() || self.amount_out.negative()
+    }
+
+    /// `TOffer::consume`: subtract what a fill took and write the entry.
+    pub fn consume(&mut self, ps: &mut PaymentSandbox, consumed_in: EitherAmount, consumed_out: EitherAmount) {
+        self.amount_in = self.amount_in.sub(consumed_in);
+        self.amount_out = self.amount_out.sub(consumed_out);
+        let Some(mut offer) = json_at(ps.sandbox(), &self.key) else { return };
+        set_amount(&mut offer, "TakerPays", &self.amount_in);
+        set_amount(&mut offer, "TakerGets", &self.amount_out);
+        crate::tx::offer::put_json(ps.view(), self.key, &offer);
+    }
+
+    /// `TOffer::limitOut` (fixReducedOffersV1 on mainnet):
+    /// `quality().ceil_out_strict(offrAmt, limit, roundUp)`.
+    pub fn limit_out(&self, amt_in: EitherAmount, amt_out: EitherAmount, limit: EitherAmount, round_up: bool) -> (EitherAmount, EitherAmount) {
+        ceil_out_strict(self.quality, amt_in, amt_out, limit, round_up)
+    }
+
+    /// `TOffer::limitIn` (fixReducedOffersV2 is NOT on mainnet):
+    /// `m_quality.ceil_in(offrAmt, limit)`.
+    pub fn limit_in(&self, amt_in: EitherAmount, amt_out: EitherAmount, limit: EitherAmount) -> (EitherAmount, EitherAmount) {
+        ceil_in(self.quality, amt_in, amt_out, limit)
+    }
+}
+
+fn either(xrp: bool, v: (bool, (u128, i32))) -> EitherAmount {
+    let (neg, (m, e)) = v;
+    if xrp {
+        let d = crate::tx::offer::me_rescale(m_e(m, e), 0, false) as i128;
+        EitherAmount::Xrp(if neg { -d } else { d })
+    } else {
+        EitherAmount::Iou(IouAmount::from_me(neg, (m, e)))
+    }
+}
+
+fn m_e(m: u128, e: i32) -> (u128, i32) {
+    (m, e)
+}
+
+fn set_amount(offer: &mut serde_json::Value, field: &str, v: &EitherAmount) {
+    match v {
+        EitherAmount::Xrp(d) => {
+            offer[field] = serde_json::Value::String(d.to_string());
+        }
+        EitherAmount::Iou(a) => {
+            if let Some(obj) = offer.get_mut(field).and_then(|x| x.as_object_mut()) {
+                obj.insert("value".to_string(), serde_json::Value::String(format!("{}{}", if a.negative && a.mantissa != 0 { "-" } else { "" }, crate::tx::offer::me_to_value_string((a.mantissa as u128, a.exponent)))));
+            }
+        }
+    }
+}
+
+fn st(v: EitherAmount) -> StAmount {
+    match v {
+        EitherAmount::Xrp(d) => StAmount { native: true, negative: d < 0, mantissa: d.unsigned_abs() as u64, exponent: 0 },
+        EitherAmount::Iou(a) => StAmount::iou(a.negative, a.mantissa, a.exponent),
+    }
+}
+
+fn un_st(a: StAmount) -> EitherAmount {
+    if a.native {
+        let d = a.mantissa as i128;
+        EitherAmount::Xrp(if a.negative { -d } else { d })
+    } else {
+        EitherAmount::Iou(IouAmount { negative: a.negative, mantissa: a.mantissa, exponent: a.exponent })
+    }
+}
+
+/// `Quality::ceil_out_impl<mulRoundStrict>`: when `amount.out > limit`,
+/// `in = mulRoundStrict(limit, rate, in.asset, roundUp)` clamped to the
+/// offer's in, out = limit.
+pub fn ceil_out_strict(quality: Quality, amt_in: EitherAmount, amt_out: EitherAmount, limit: EitherAmount, round_up: bool) -> (EitherAmount, EitherAmount) {
+    if amt_out.gt(&limit) {
+        let rate = super::st_amount::rate_amount(quality.0);
+        let mut r_in = mul_round_strict(&st(limit), &rate, amt_in.is_xrp(), round_up).map(un_st).unwrap_or(amt_in);
+        if r_in.gt(&amt_in) {
+            r_in = amt_in;
+        }
+        return (r_in, limit);
+    }
+    (amt_in, amt_out)
+}
+
+/// `Quality::ceil_out` (legacy `mulRound`, roundUp = true).
+pub fn ceil_out(quality: Quality, amt_in: EitherAmount, amt_out: EitherAmount, limit: EitherAmount) -> (EitherAmount, EitherAmount) {
+    if amt_out.gt(&limit) {
+        let rate = super::st_amount::rate_amount(quality.0);
+        let mut r_in = mul_round(&st(limit), &rate, amt_in.is_xrp(), true).map(un_st).unwrap_or(amt_in);
+        if r_in.gt(&amt_in) {
+            r_in = amt_in;
+        }
+        return (r_in, limit);
+    }
+    (amt_in, amt_out)
+}
+
+/// `Quality::ceil_in` (legacy `divRound`, roundUp = true): when
+/// `amount.in > limit`, `out = divRound(limit, rate, out.asset, true)`
+/// clamped to the offer's out, in = limit.
+pub fn ceil_in(quality: Quality, amt_in: EitherAmount, amt_out: EitherAmount, limit: EitherAmount) -> (EitherAmount, EitherAmount) {
+    if amt_in.gt(&limit) {
+        let rate = super::st_amount::rate_amount(quality.0);
+        let mut r_out = super::st_amount::div_round(&st(limit), &rate, amt_out.is_xrp(), true).map(un_st).unwrap_or(amt_out);
+        if r_out.gt(&amt_out) {
+            r_out = amt_out;
+        }
+        return (limit, r_out);
+    }
+    (amt_in, amt_out)
+}
+
+/// `Quality::ceil_in_strict` (`divRoundStrict`).
+pub fn ceil_in_strict(quality: Quality, amt_in: EitherAmount, amt_out: EitherAmount, limit: EitherAmount, round_up: bool) -> (EitherAmount, EitherAmount) {
+    if amt_in.gt(&limit) {
+        let rate = super::st_amount::rate_amount(quality.0);
+        let mut r_out = super::st_amount::div_round_strict(&st(limit), &rate, amt_out.is_xrp(), round_up).map(un_st).unwrap_or(amt_out);
+        if r_out.gt(&amt_out) {
+            r_out = amt_out;
+        }
+        return (limit, r_out);
+    }
+    (amt_in, amt_out)
+}
+
+/// `FlowOfferStream<TIn, TOut>`: the stream over one book inside a flow.
+pub struct FlowOfferStream {
+    tip: BookTip,
+    book_in: Asset,
+    book_out: Asset,
+    /// `expire_`: the parent ledger's close time.
+    expire: u64,
+    /// `offer_`: the offer the stream sits on after a successful `step`.
+    offer: Option<Offer>,
+    /// `ownerFunds_`.
+    owner_funds: Option<EitherAmount>,
+    /// `permToRemove_`: keys removed for good, whatever the strand's fate.
+    perm_to_remove: Vec<Hash256>,
+}
+
+impl FlowOfferStream {
+    /// `FlowOfferStream(view, cancelView, book, when, counter, j)`.
+    pub fn new(book_in: Asset, book_out: Asset, domain: Option<&Hash256>, expire: u64) -> FlowOfferStream {
+        FlowOfferStream { tip: BookTip::new(&book_in, &book_out, domain), book_in, book_out, expire, offer: None, owner_funds: None, perm_to_remove: Vec::new() }
+    }
+
+    pub fn tip(&self) -> Option<&Offer> {
+        self.offer.as_ref()
+    }
+    pub fn tip_mut(&mut self) -> Option<&mut Offer> {
+        self.offer.as_mut()
+    }
+    pub fn owner_funds(&self) -> Option<EitherAmount> {
+        self.owner_funds
+    }
+    /// `FlowOfferStream::permToRemove`.
+    pub fn perm_to_remove(&self) -> &[Hash256] {
+        &self.perm_to_remove
+    }
+
+    /// `FlowOfferStream::permRmOffer`: recorded, not deleted here — the
+    /// flow deletes the set once it is done, "even if the strand fails"
+    /// (StrandFlow.h).
+    fn perm_rm_offer(&mut self, key: Hash256) {
+        if !self.perm_to_remove.contains(&key) {
+            self.perm_to_remove.push(key);
+        }
+    }
+
+    /// The owner's funds for this offer, read through `view` (the strand's
+    /// sandbox — `ownerFunds_`) or the `cancelView` (the view as the flow
+    /// opened — "original_funds"). `accountFundsHelper`: an IOU's issuer is
+    /// self-funded for the offer's own amount; XRP is `xrpLiquid`.
+    fn funds(&self, ps: &PaymentSandbox, offer: &Offer, original: bool) -> EitherAmount {
+        match offer.amount_out {
+            EitherAmount::Xrp(_) => {
+                if original {
+                    // The flow's opening view: xrpLiquid over the base view
+                    // with no owner-count adjustment recorded.
+                    EitherAmount::Xrp(xrp_liquid_original(ps, &offer.owner))
+                } else {
+                    EitherAmount::Xrp(xrp_liquid(ps, &offer.owner, 0))
+                }
+            }
+            EitherAmount::Iou(amt) => {
+                if original {
+                    EitherAmount::Iou(account_funds_iou_original(ps, &offer.owner, &offer.asset_out, amt))
+                } else {
+                    EitherAmount::Iou(account_funds_iou(ps, &offer.owner, &offer.asset_out, amt, FreezeHandling::ZeroIfFrozen, AuthHandling::IgnoreAuth))
+                }
+            }
+        }
+    }
+
+    /// `TOfferStreamBase::step` — "Modifying the order or logic of these
+    /// operations causes a protocol breaking change."
+    pub fn step(&mut self, ps: &mut PaymentSandbox, counter: &mut StepCounter) -> bool {
+        loop {
+            self.owner_funds = None;
+            // BookTip::step deletes the current offer from the view before
+            // advancing to the next (unless the ledger entry is missing).
+            if !self.tip.step(ps) {
+                return false;
+            }
+            if !counter.step() {
+                return false;
+            }
+            let Some(index) = self.tip.index() else { return false };
+            // Remove if missing: the directory names an offer that is not
+            // there — erase the directory entry (`erase(view_)`,
+            // `erase(cancelView_)`).
+            let Some(entry) = self.tip.entry().cloned() else {
+                if let Some(dir) = self.tip.dir() {
+                    erase_dir_entry(ps, &dir, &index);
+                }
+                continue;
+            };
+            // Remove if expired: `Expiration <= parentCloseTime`.
+            if let Some(exp) = entry.expiration {
+                if exp <= self.expire {
+                    self.perm_rm_offer(index);
+                    continue;
+                }
+            }
+            let Some(quality) = self.tip.quality() else { return false };
+            let offer = Offer::from_entry(&entry, quality);
+            // Remove if either amount is zero ("Removing bad offer").
+            if offer.amount_in.is_zero() || offer.amount_out.is_zero() {
+                self.perm_rm_offer(index);
+                self.offer = None;
+                continue;
+            }
+            // Deep-frozen owner on the IN side: removed.
+            if is_deep_frozen(ps.sandbox(), &offer.owner, &offer.asset_in) {
+                self.perm_rm_offer(index);
+                self.offer = None;
+                continue;
+            }
+            // (DomainID offers: mainnet has no permissioned DEX domains in
+            // the books this port replays; `offerInDomain` is not modelled.)
+            // Owner funds.
+            let funds = self.funds(ps, &offer, false);
+            self.owner_funds = Some(funds);
+            if funds.is_zero() || funds.negative() {
+                // "Found unfunded" (funds unchanged since the flow opened)
+                // is permanent; "became unfunded" is stepped past only.
+                let original = self.funds(ps, &offer, true);
+                if original == funds {
+                    self.perm_rm_offer(index);
+                }
+                self.offer = None;
+                continue;
+            }
+            // `shouldRmSmallIncreasedQOffer`.
+            if should_rm_small_increased_q_offer(&offer, funds) {
+                let original = self.funds(ps, &offer, true);
+                if original == funds {
+                    self.perm_rm_offer(index);
+                }
+                self.offer = None;
+                continue;
+            }
+            self.offer = Some(offer);
+            return true;
+        }
+    }
+}
+
+/// The two `original_funds` reads: `accountFundsHelper(cancelView_, …)`.
+/// The cancelView is the view the flow opened with — the base ledger plus
+/// what THIS transaction wrote before the flow (fee, sequence): for an
+/// offer owner other than the taker, the base ledger's own balance.
+fn account_funds_iou_original(ps: &PaymentSandbox, owner: &[u8; 20], asset: &Asset, amt_default: IouAmount) -> IouAmount {
+    if asset.issuer == Some(*owner) {
+        return amt_default;
+    }
+    let base = ps.base_view();
+    if super::view::is_frozen(base, owner, asset) {
+        return IouAmount::ZERO;
+    }
+    let bal = super::view::line_balance(base, owner, asset);
+    if bal <= IouAmount::ZERO { IouAmount::ZERO } else { bal }
+}
+
+fn xrp_liquid_original(ps: &PaymentSandbox, owner: &[u8; 20]) -> i128 {
+    let base = ps.base_view();
+    let Some(root) = json_at(base, &keylet::account_root_key(owner)) else { return 0 };
+    let balance: i128 = root["Balance"].as_str().and_then(|s| s.parse::<i128>().ok()).unwrap_or(0);
+    let count = super::view::owner_counts(base, owner).count() as u64;
+    let reserve = crate::ledger::fees::account_reserve(base, count) as i128;
+    (balance - reserve).max(0)
+}
+
+/// `TOfferStreamBase::erase`: drop a dangling directory entry.
+fn erase_dir_entry(ps: &mut PaymentSandbox, dir: &Hash256, index: &Hash256) {
+    let Some(mut page) = json_at(ps.sandbox(), dir) else { return };
+    let want = hex::encode_upper(index.0);
+    let Some(arr) = page.get_mut("Indexes").and_then(|v| v.as_array_mut()) else { return };
+    let before = arr.len();
+    arr.retain(|v| v.as_str().map(|s| s.to_uppercase()) != Some(want.clone()));
+    if arr.len() != before {
+        crate::tx::offer::put_json(ps.view(), *dir, &page);
+    }
+}
+
+/// `shouldRmSmallIncreasedQOffer` (fixRmSmallIncreasedQOffers on): an offer
+/// whose effective in — after the owner's funds shrink its out — is at most
+/// one minimum unit and whose effective quality is worse than filed.
+/// Considered only when TakerPays is XRP, or both sides are IOU with
+/// TakerPays < TakerGets; never when TakerGets is XRP.
+pub fn should_rm_small_increased_q_offer(offer: &Offer, owner_funds: EitherAmount) -> bool {
+    if offer.amount_out.is_xrp() {
+        return false;
+    }
+    if !offer.amount_in.is_xrp() && !offer.amount_out.is_xrp() && !offer.amount_in.lt(&offer.amount_out) {
+        return false;
+    }
+    // fixReducedOffersV1: `ceil_out_strict(ofrAmts, ownerFunds, false)`.
+    let (eff_in, eff_out) = if offer.asset_out.issuer != Some(offer.owner) && owner_funds.lt(&offer.amount_out) {
+        ceil_out_strict(offer.quality, offer.amount_in, offer.amount_out, owner_funds, false)
+    } else {
+        (offer.amount_in, offer.amount_out)
+    };
+    if eff_in.signum() <= 0 || eff_out.signum() <= 0 {
+        return true;
+    }
+    if eff_in.gt(&EitherAmount::min_positive(eff_in.is_xrp())) {
+        return false;
+    }
+    // `Quality{effectiveAmounts} < offer.quality()`: a WORSE quality.
+    let eff_q = quality_of(eff_in, eff_out);
+    eff_q.is_some_and(|q| q.0 > offer.quality.0)
+}
+
+/// `Quality{amounts}` = `getRate(out, in)`.
+pub fn quality_of(amt_in: EitherAmount, amt_out: EitherAmount) -> Option<Quality> {
+    let ((im, ie), (om, oe)) = (amt_in.mantissa_exp(), amt_out.mantissa_exp());
+    crate::ledger::keylet::rate_encode_native(im, ie, amt_in.is_xrp(), om, oe, amt_out.is_xrp()).map(Quality)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_step_counter_stops_at_its_limit() {
+        let mut c = StepCounter::new(2);
+        assert!(c.step());
+        assert!(c.step());
+        assert!(!c.step());
+    }
+
+    #[test]
+    fn dec_key_borrows() {
+        let mut k = Hash256([0u8; 32]);
+        k.0[31] = 0;
+        k.0[30] = 1;
+        dec_key(&mut k);
+        assert_eq!(k.0[30], 0);
+        assert_eq!(k.0[31], 0xFF);
+    }
+}

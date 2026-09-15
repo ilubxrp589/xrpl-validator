@@ -49,6 +49,40 @@ impl IouAmount {
         Number { negative: self.negative, mantissa: self.mantissa, exponent: self.exponent }
     }
 
+    /// `STAmount::getText()` for an IOU: plain decimal when the exponent
+    /// sits in [-25, -5] or is zero, otherwise `<mantissa>e<exponent>`.
+    pub fn to_decimal_string(&self) -> String {
+        if self.mantissa == 0 {
+            return "0".to_string();
+        }
+        let sign = if self.negative { "-" } else { "" };
+        let m = self.mantissa.to_string();
+        let e = self.exponent;
+        if e != 0 && !(-25..=-5).contains(&e) {
+            return format!("{sign}{m}e{e}");
+        }
+        // Fixed notation: shift the decimal point by `e`.
+        let digits = m;
+        let mut s = if e >= 0 {
+            format!("{digits}{}", "0".repeat(e as usize))
+        } else {
+            let k = (-e) as usize;
+            if digits.len() > k {
+                format!("{}.{}", &digits[..digits.len() - k], &digits[digits.len() - k..])
+            } else {
+                format!("0.{}{}", "0".repeat(k - digits.len()), digits)
+            }
+        };
+        if s.contains('.') {
+            while s.ends_with('0') {
+                s.pop();
+            }
+            if s.ends_with('.') {
+                s.pop();
+            }
+        }
+        format!("{sign}{s}")
+    }
     pub fn is_zero(self) -> bool {
         self.mantissa == 0
     }
@@ -138,6 +172,71 @@ impl EitherAmount {
             EitherAmount::Iou(a) => *a,
             EitherAmount::Xrp(_) => panic!("EitherAmount: IOU expected, XRP held"),
         }
+    }
+    pub fn is_xrp(&self) -> bool {
+        matches!(self, EitherAmount::Xrp(_))
+    }
+    pub fn negative(&self) -> bool {
+        match self {
+            EitherAmount::Xrp(d) => *d < 0,
+            EitherAmount::Iou(a) => a.negative && a.mantissa != 0,
+        }
+    }
+    /// `signum()`: −1, 0, +1.
+    pub fn signum(&self) -> i8 {
+        if self.is_zero() { 0 } else if self.negative() { -1 } else { 1 }
+    }
+    /// `operator-` on like amounts (XRP exact; IOU through `Number`).
+    pub fn sub(self, other: EitherAmount) -> EitherAmount {
+        match (self, other) {
+            (EitherAmount::Xrp(a), EitherAmount::Xrp(b)) => EitherAmount::Xrp(a - b),
+            (EitherAmount::Iou(a), EitherAmount::Iou(b)) => EitherAmount::Iou(a.sub(b)),
+            _ => panic!("EitherAmount: mixed XRP/IOU subtraction"),
+        }
+    }
+    pub fn add(self, other: EitherAmount) -> EitherAmount {
+        match (self, other) {
+            (EitherAmount::Xrp(a), EitherAmount::Xrp(b)) => EitherAmount::Xrp(a + b),
+            (EitherAmount::Iou(a), EitherAmount::Iou(b)) => EitherAmount::Iou(a.add(b)),
+            _ => panic!("EitherAmount: mixed XRP/IOU addition"),
+        }
+    }
+    pub fn cmp_like(&self, other: &EitherAmount) -> core::cmp::Ordering {
+        match (self, other) {
+            (EitherAmount::Xrp(a), EitherAmount::Xrp(b)) => a.cmp(b),
+            (EitherAmount::Iou(a), EitherAmount::Iou(b)) => a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal),
+            _ => panic!("EitherAmount: mixed XRP/IOU comparison"),
+        }
+    }
+    pub fn gt(&self, other: &EitherAmount) -> bool {
+        self.cmp_like(other).is_gt()
+    }
+    pub fn lt(&self, other: &EitherAmount) -> bool {
+        self.cmp_like(other).is_lt()
+    }
+    pub fn le(&self, other: &EitherAmount) -> bool {
+        self.cmp_like(other).is_le()
+    }
+    pub fn ge(&self, other: &EitherAmount) -> bool {
+        self.cmp_like(other).is_ge()
+    }
+    /// `minPositiveAmount()`: one drop, or `IOUAmount{1, -81}`.
+    pub fn min_positive(xrp: bool) -> EitherAmount {
+        if xrp {
+            EitherAmount::Xrp(1)
+        } else {
+            EitherAmount::Iou(IouAmount { negative: false, mantissa: 1_000_000_000_000_000, exponent: K_MIN_OFFSET })
+        }
+    }
+    /// The (mantissa, exponent) pair as the engine's `Me` (magnitude only).
+    pub fn mantissa_exp(&self) -> (u128, i32) {
+        match self {
+            EitherAmount::Xrp(d) => (d.unsigned_abs(), 0),
+            EitherAmount::Iou(a) => (a.mantissa as u128, a.exponent),
+        }
+    }
+    pub fn zero(xrp: bool) -> EitherAmount {
+        if xrp { EitherAmount::Xrp(0) } else { EitherAmount::Iou(IouAmount::ZERO) }
     }
 }
 
