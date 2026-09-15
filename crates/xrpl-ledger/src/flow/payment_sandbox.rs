@@ -247,6 +247,12 @@ impl<'a, 'b> PaymentSandbox<'a, 'b> {
         self.sandbox.read(key)
     }
 
+    /// The live view, read-only (`view.rs` answers `accountHolds` and the
+    /// directory walk over it).
+    pub fn sandbox(&self) -> &Sandbox<'a> {
+        self.sandbox
+    }
+
     /// `afView` read: the entry as it stood when the innermost layer opened
     /// (or the live view outside any layer).
     pub fn af_read(&self, key: &Hash256) -> Option<Vec<u8>> {

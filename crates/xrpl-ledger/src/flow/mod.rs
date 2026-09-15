@@ -21,4 +21,6 @@
 pub mod amounts;
 pub mod payment_sandbox;
 pub mod quality_function;
+pub mod st_amount;
 pub mod steps;
+pub mod view;

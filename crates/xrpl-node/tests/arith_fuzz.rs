@@ -7,7 +7,7 @@
 //! run with `--nocapture` to read the list. Deterministic: a fixed xorshift
 //! seed, overridable with ARITH_FUZZ_SEED; case count with ARITH_FUZZ_N.
 use xrpl_ffi::arith;
-use xrpl_ffi::{XrplAmt, ARITH_ADD, ARITH_CANONICALIZE, ARITH_DIVIDE, ARITH_DIVROUND, ARITH_MULROUND, ARITH_MULROUND_STRICT, ARITH_MULTIPLY, ARITH_SUB, NUM_TO_DROPS};
+use xrpl_ffi::{XrplAmt, ARITH_ADD, ARITH_CANONICALIZE, ARITH_DIVIDE, ARITH_DIVROUND, ARITH_DIVROUND_STRICT, ARITH_MULROUND, ARITH_MULROUND_STRICT, ARITH_MULTIPLY, ARITH_SUB, NUM_TO_DROPS};
 use xrpl_ledger::tx::arith_probe as ours;
 
 struct Rng(u64);
@@ -133,6 +133,41 @@ fn arithmetic_agrees_with_libxrpl() {
                 t.entry("divRound IOU up").or_default().note(ok, || format!("{}e{} / {}e{} -> libxrpl {} ours {}e{}", am, ae, bm, be, fmt_amt(&r), o.0, o.1));
             }
             Err(_) => t.entry("divRound IOU up").or_default().oracle_errors += 1,
+        }
+        // --- Track 2 st_amount: the four rounding functions × result asset ×
+        // rounding, written once from STAmount.cpp — every cell against libxrpl.
+        {
+            let ops = [(ARITH_MULROUND, 0u8, "mulRound"), (ARITH_MULROUND_STRICT, 1, "mulRoundStrict"), (ARITH_DIVROUND, 2, "divRound"), (ARITH_DIVROUND_STRICT, 3, "divRoundStrict")];
+            let (xm, xe) = (rng.mantissa(), rng.exponent(-12, 4));
+            let (ym, ye) = (rng.mantissa(), rng.exponent(-12, 4));
+            let drops_a = rng.drops();
+            for (shim_op, op, name) in ops {
+                for result_native in [false, true] {
+                    for round_up in [true, false] {
+                        // IOU op IOU → IOU, or IOU op IOU → XRP (the ceil_out / ceil_in shapes);
+                        // for the XRP result, the multiply's first operand is drops
+                        // (limit × rate) and the divide's numerator is drops (limit / rate).
+                        let (a, b) = if result_native && op <= 1 {
+                            ((drops_a, 0, true), (ym, ye, false))
+                        } else if result_native {
+                            ((drops_a, 0, true), (ym, ye, false))
+                        } else {
+                            ((xm, xe, false), (ym, ye, false))
+                        };
+                        let key: &'static str = Box::leak(format!("st {name} {} {}", if result_native { "XRP" } else { "IOU" }, if round_up { "up" } else { "down" }).into_boxed_str());
+                        let fa = if a.2 { arith::xrp(a.0) } else { iou(a.0, a.1) };
+                        let fb = if b.2 { arith::xrp(b.0) } else { iou(b.0, b.1) };
+                        match arith::stamount_op(shim_op, fa, fb, round_up, result_native) {
+                            Ok(r) => {
+                                let o = ours::st_round(op, a, b, result_native, round_up);
+                                let ok = matches!(o, Ok((m, e, n)) if m == r.mantissa && (m == 0 || e == r.exponent) && n == (r.native != 0));
+                                t.entry(key).or_default().note(ok, || format!("{:?} {name} {:?} -> libxrpl {} ours {:?}", a, b, fmt_amt(&r), o));
+                            }
+                            Err(_) => t.entry(key).or_default().oracle_errors += 1,
+                        }
+                    }
+                }
+            }
         }
         // --- STAmount multiply / divide (IOU): Number product at nearest; the
         // legacy `muldiv(num, 1e17, den) + 5` quotient ----------------------------

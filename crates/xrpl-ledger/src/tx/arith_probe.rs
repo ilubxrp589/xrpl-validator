@@ -106,3 +106,23 @@ pub fn round16_up(a: Me) -> Me {
     if a.0 == 0 { return (0, 0); }
     super::amm_swap::round16(a.0, a.1, false, super::amm_swap::Rnd::Up)
 }
+
+/// Track 2's `flow::st_amount` — the four rippled rounding functions written
+/// once from STAmount.cpp. `op`: 0 mulRound, 1 mulRoundStrict, 2 divRound,
+/// 3 divRoundStrict; operands are IOU (mantissa, exponent) unless `*_native`.
+pub fn st_round(op: u8, a: (u64, i32, bool), b: (u64, i32, bool), result_native: bool, round_up: bool) -> Result<(u64, i32, bool), String> {
+    use crate::flow::st_amount::{div_round, div_round_strict, mul_round, mul_round_strict, StAmount};
+    // The shim builds each operand with `STAmount(asset, mantissa, exponent,
+    // negative)`, which canonicalises a short IOU mantissa; mirror that here
+    // (f375: every mismatch was a 10–15 digit operand fed raw).
+    let mk = |v: (u64, i32, bool)| if v.2 { StAmount::drops(v.0) } else { StAmount::iou_me(false, (v.0 as u128, v.1)) };
+    let (x, y) = (mk(a), mk(b));
+    let r = match op {
+        0 => mul_round(&x, &y, result_native, round_up),
+        1 => mul_round_strict(&x, &y, result_native, round_up),
+        2 => div_round(&x, &y, result_native, round_up),
+        _ => div_round_strict(&x, &y, result_native, round_up),
+    }
+    .map_err(|e| format!("{e:?}"))?;
+    Ok((r.mantissa, r.exponent, r.native))
+}

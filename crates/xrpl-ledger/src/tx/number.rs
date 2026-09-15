@@ -446,6 +446,40 @@ impl Number {
         Ok(if self.negative { -d } else { d })
     }
 
+    /// `XRPAmount{Number{negative, mantissa, exponent, Unchecked}}` — the
+    /// STAmount constructor's native canonicalisation: `operator rep()` on
+    /// the RAW pair, digits below the ones place dropped one at a time into
+    /// the guard (no 16-digit normalisation first), `mode` deciding the drop.
+    pub fn rep_from_raw(negative: bool, mantissa: u128, exponent: i32, mode: Rounding) -> Result<i64, NumberError> {
+        let mut drops = mantissa;
+        let mut offset = exponent;
+        let mut g = Guard::new(mode);
+        if drops != 0 {
+            if negative {
+                g.set_negative();
+            }
+            while offset < 0 {
+                g.drop_digit(&mut drops, &mut offset);
+            }
+            while offset > 0 {
+                if drops > K_MAX_REP / 10 {
+                    return Err(NumberError::Overflow);
+                }
+                drops *= 10;
+                offset -= 1;
+            }
+            let r = g.round();
+            if r == Round::Up || (r == Round::Even && (drops & 1) == 1) {
+                if drops >= K_MAX_REP {
+                    return Err(NumberError::Overflow);
+                }
+                drops += 1;
+            }
+        }
+        let d = drops as i64;
+        Ok(if negative { -d } else { d })
+    }
+
     /// The signed external mantissa (`Number::mantissa()`).
     pub fn signed_mantissa(&self) -> i64 {
         let m = self.mantissa as i64;
