@@ -83,6 +83,10 @@ impl IouAmount {
         }
         format!("{sign}{s}")
     }
+    /// `signum()`: −1, 0, +1.
+    pub fn signum(self) -> i8 {
+        if self.mantissa == 0 { 0 } else if self.negative { -1 } else { 1 }
+    }
     pub fn is_zero(self) -> bool {
         self.mantissa == 0
     }

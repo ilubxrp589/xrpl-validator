@@ -118,6 +118,16 @@ pub trait Step {
         None
     }
 
+    /// A DirectStep's currency (for `equal`).
+    fn direct_step_currency(&self) -> Option<[u8; 20]> {
+        None
+    }
+
+    /// An XRPEndpointStep's (account, isLast) (for `equal`).
+    fn xrp_endpoint_acct(&self) -> Option<([u8; 20], bool)> {
+        None
+    }
+
     /// `debtDirection(view, dir)`: whether this step's source issues or
     /// redeems, as seen by the pass `dir`.
     fn debt_direction(&self, sb: &PaymentSandbox, dir: StrandDirection) -> DebtDirection;

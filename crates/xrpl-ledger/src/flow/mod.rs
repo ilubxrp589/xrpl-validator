@@ -21,9 +21,11 @@
 pub mod amm;
 pub mod amounts;
 pub mod book_step;
+pub mod direct_step;
 pub mod offer_stream;
 pub mod payment_sandbox;
 pub mod quality_function;
 pub mod st_amount;
 pub mod steps;
 pub mod view;
+pub mod xrp_endpoint_step;

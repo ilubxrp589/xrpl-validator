@@ -14,6 +14,7 @@ use crate::tx::offer::{decode20, json_at, signed_value};
 use xrpl_core::types::Hash256;
 
 use super::amounts::{EitherAmount, IouAmount, XrpAmount};
+use super::steps::DebtDirection;
 use super::payment_sandbox::{OwnerCounts, PaymentSandbox};
 use super::steps::Asset;
 
@@ -106,7 +107,7 @@ pub fn line_balance(sb: &Sandbox, account: &[u8; 20], asset: &Asset) -> IouAmoun
 pub fn account_holds_iou(ps: &PaymentSandbox, account: &[u8; 20], asset: &Asset, freeze: FreezeHandling, auth: AuthHandling) -> IouAmount {
     let sb = ps.sandbox();
     let Some(issuer) = asset.issuer else { return IouAmount::ZERO };
-    if freeze == FreezeHandling::ZeroIfFrozen && is_frozen(sb, account, asset) {
+    if freeze == FreezeHandling::ZeroIfFrozen && (is_frozen(sb, account, asset) || is_deep_frozen(sb, account, asset)) {
         return IouAmount::ZERO;
     }
     if auth == AuthHandling::ZeroIfUnauthorized && !is_authorized(sb, asset, account) {
@@ -118,6 +119,152 @@ pub fn account_holds_iou(ps: &PaymentSandbox, account: &[u8; 20], asset: &Asset,
     }
     ps.balance_hook_iou(account, &issuer, &asset.currency, bal)
 }
+
+/// `accountHolds` with its sign: `getTrustLineBalance` (the holder's side
+/// of the line, no opposite limit) through `balanceHook`. A missing line
+/// is zero; `ZeroIfFrozen` drops a frozen or deep-frozen line.
+pub fn account_holds_signed_iou(ps: &PaymentSandbox, account: &[u8; 20], asset: &Asset, freeze: FreezeHandling) -> IouAmount {
+    let sb = ps.sandbox();
+    let Some(issuer) = asset.issuer else { return IouAmount::ZERO };
+    if json_at(sb, &keylet::ripple_state_key(account, &issuer, &asset.currency)).is_none() {
+        return ps.balance_hook_iou(account, &issuer, &asset.currency, IouAmount::ZERO);
+    }
+    if freeze == FreezeHandling::ZeroIfFrozen && (is_frozen(sb, account, asset) || is_deep_frozen(sb, account, asset)) {
+        return ps.balance_hook_iou(account, &issuer, &asset.currency, IouAmount::ZERO);
+    }
+    let bal = line_balance(sb, account, asset);
+    ps.balance_hook_iou(account, &issuer, &asset.currency, bal)
+}
+
+/// `QualityDirection`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum QualityDirection {
+    In,
+    Out,
+}
+
+/// `DirectIPaymentStep::quality`: the line `dst`–`src`'s QualityIn (from
+/// the destination's side) or QualityOut (from the source's side);
+/// QUALITY_ONE when absent or zero.
+pub fn line_quality(sb: &Sandbox, src: &[u8; 20], dst: &[u8; 20], currency: &[u8; 20], dir: QualityDirection) -> u32 {
+    let Some(line) = json_at(sb, &keylet::ripple_state_key(dst, src, currency)) else { return QUALITY_ONE };
+    let field = match dir {
+        QualityDirection::In => {
+            if dst < src { "LowQualityIn" } else { "HighQualityIn" }
+        }
+        QualityDirection::Out => {
+            if src < dst { "LowQualityOut" } else { "HighQualityOut" }
+        }
+    };
+    match line.get(field).and_then(|v| v.as_u64()) {
+        Some(q) if q != 0 => q as u32,
+        _ => QUALITY_ONE,
+    }
+}
+
+/// `creditLimit2(view, account, issuer, currency)`: the limit `account`
+/// extends to `issuer` on their line (zero without a line).
+pub fn credit_limit(sb: &Sandbox, account: &[u8; 20], issuer: &[u8; 20], currency: &[u8; 20]) -> IouAmount {
+    let Some(line) = json_at(sb, &keylet::ripple_state_key(account, issuer, currency)) else { return IouAmount::ZERO };
+    let field = if account < issuer { "LowLimit" } else { "HighLimit" };
+    let (neg, m) = signed_value(&line[field]);
+    IouAmount::from_me(neg && m.0 > 0, m)
+}
+
+/// `creditBalance(view, account, issuer, currency)`: the line's balance
+/// from `account`'s side.
+pub fn credit_balance(sb: &Sandbox, account: &[u8; 20], issuer: &[u8; 20], currency: &[u8; 20]) -> IouAmount {
+    let Some(line) = json_at(sb, &keylet::ripple_state_key(account, issuer, currency)) else { return IouAmount::ZERO };
+    let (neg, m) = signed_value(&line["Balance"]);
+    // Stored from the low account's side; `account < issuer` negates.
+    let account_neg = if account < issuer { !neg && m.0 > 0 } else { neg && m.0 > 0 };
+    IouAmount::from_me(account_neg, m)
+}
+
+/// The step checks' error codes (`StepChecks.h`, `DirectStep.cpp`,
+/// `XRPEndpointStep.cpp`, `BookStep.cpp`): the strand builder maps them
+/// to their TERs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StepCheckError {
+    /// temBAD_PATH
+    BadPath,
+    /// temBAD_PATH_LOOP
+    BadPathLoop,
+    /// terNO_LINE
+    NoLine,
+    /// terNO_RIPPLE
+    NoRipple,
+    /// terNO_ACCOUNT
+    NoAccount,
+    /// terNO_AUTH
+    NoAuth,
+    /// tecPATH_DRY
+    PathDry,
+    /// tecNO_ISSUER
+    NoIssuer,
+}
+
+/// `checkFreeze(view, src, dst, currency)`: the destination's global
+/// freeze, or its side of the `src`–`dst` line frozen, or either side
+/// deep-frozen → terNO_LINE.
+pub fn check_freeze(sb: &Sandbox, src: &[u8; 20], dst: &[u8; 20], currency: &[u8; 20]) -> Result<(), StepCheckError> {
+    if dst != &[0u8; 20] {
+        if let Some(root) = json_at(sb, &keylet::account_root_key(dst)) {
+            if root["Flags"].as_u64().unwrap_or(0) & LSF_GLOBAL_FREEZE != 0 {
+                return Err(StepCheckError::NoLine);
+            }
+        }
+    }
+    if src != &[0u8; 20] && dst != &[0u8; 20] {
+        if let Some(line) = json_at(sb, &keylet::ripple_state_key(src, dst, currency)) {
+            let flags = line["Flags"].as_u64().unwrap_or(0);
+            let bit = if dst > src { LSF_HIGH_FREEZE } else { LSF_LOW_FREEZE };
+            if flags & bit != 0 {
+                return Err(StepCheckError::NoLine);
+            }
+            if flags & (LSF_LOW_DEEP_FREEZE | LSF_HIGH_DEEP_FREEZE) != 0 {
+                return Err(StepCheckError::NoLine);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `checkNoRipple(view, prev, cur, next, currency)`: both of `cur`'s lines
+/// flagged NoRipple on its side → terNO_RIPPLE; a missing line → terNO_LINE.
+pub fn check_no_ripple(sb: &Sandbox, prev: &[u8; 20], cur: &[u8; 20], next: &[u8; 20], currency: &[u8; 20]) -> Result<(), StepCheckError> {
+    let Some(line_in) = json_at(sb, &keylet::ripple_state_key(prev, cur, currency)) else { return Err(StepCheckError::NoLine) };
+    let Some(line_out) = json_at(sb, &keylet::ripple_state_key(cur, next, currency)) else { return Err(StepCheckError::NoLine) };
+    let bit_in: u64 = if cur > prev { 0x0020_0000 } else { 0x0010_0000 };
+    let bit_out: u64 = if cur > next { 0x0020_0000 } else { 0x0010_0000 };
+    if line_in["Flags"].as_u64().unwrap_or(0) & bit_in != 0 && line_out["Flags"].as_u64().unwrap_or(0) & bit_out != 0 {
+        return Err(StepCheckError::NoRipple);
+    }
+    Ok(())
+}
+
+/// The `authField` test of `DirectIPaymentStep::check`: the line's auth
+/// bit on the SOURCE's (issuer's) side.
+pub fn is_authorized_line_flag(line: &serde_json::Value, src: &[u8; 20], dst: &[u8; 20]) -> bool {
+    let bit = if src > dst { LSF_HIGH_AUTH } else { LSF_LOW_AUTH };
+    line["Flags"].as_u64().unwrap_or(0) & bit != 0
+}
+
+/// `mulRatio(IOUAmount, num, den, roundUp)`.
+pub fn mul_ratio_iou(a: IouAmount, num: u32, den: u32, round_up: bool) -> IouAmount {
+    match mul_ratio_either(EitherAmount::Iou(a), num, den, round_up) {
+        EitherAmount::Iou(v) => v,
+        EitherAmount::Xrp(_) => a,
+    }
+}
+
+/// `rippleCredit` for the steps (the DirectStep's transfer).
+pub fn ripple_credit_pub(ps: &mut PaymentSandbox, sender: &[u8; 20], receiver: &[u8; 20], asset: &Asset, amount: IouAmount) {
+    ripple_credit(ps, sender, receiver, asset, amount)
+}
+
+#[allow(dead_code)]
+fn _dir(_: DebtDirection) {}
 
 /// `OwnerCounts` of an account root.
 pub fn owner_counts(sb: &Sandbox, account: &[u8; 20]) -> OwnerCounts {
@@ -139,8 +286,11 @@ pub fn xrp_liquid(ps: &PaymentSandbox, account: &[u8; 20], owner_count_adj: i64)
     let counts = ps.owner_count_hook(account, owner_counts(sb, account));
     let count = (counts.count() as i64 + owner_count_adj).max(0) as u64;
     let reserve = crate::ledger::fees::account_reserve(sb, count) as i128;
+    // `xrpLiquid`: fullBalance − reserve, then `balanceHook(account,
+    // xrpAccount(), balance)` clamps by the deferred credits, floor zero.
     let liquid = balance - reserve;
-    if liquid < 0 { 0 } else { liquid }
+    let hooked = ps.balance_hook_xrp(account, liquid);
+    if hooked < 0 { 0 } else { hooked }
 }
 
 /// `accountFunds` for an offer owner selling `asset` (OfferStream's
@@ -305,67 +455,106 @@ pub fn mul_ratio_either(amt: EitherAmount, num: u32, den: u32, round_up: bool) -
     }
 }
 
-/// Move drops between two account roots (`accountSend` for XRP): the
-/// receiver may be any account; a missing receiver root is the caller's
-/// error (tecNO_DST is checked upstream).
-fn xrp_adjust(sb: &mut Sandbox, account: &[u8; 20], delta: i128) -> Result<(), crate::ledger::transactor::TxResult> {
-    let key = keylet::account_root_key(account);
-    let Some(mut root) = json_at(sb, &key) else { return Err(crate::ledger::transactor::TxResult::NoDst) };
-    let bal: i128 = root["Balance"].as_str().and_then(|s| s.parse::<i128>().ok()).unwrap_or(0);
-    let nb = bal + delta;
-    if nb < 0 {
-        return Err(crate::ledger::transactor::TxResult::Unfunded);
+/// `accountSendIOU`'s XRP legs: the sender's root falls (creditHook
+/// with its balance), the receiver's rises (creditHook with the negated
+/// balance). A sender below the amount is tecFAILED_PROCESSING; either
+/// party may be the XRP account (all zero) and is then skipped.
+fn xrp_send(ps: &mut PaymentSandbox, from: &[u8; 20], to: &[u8; 20], amount: i128) -> Result<(), crate::ledger::transactor::TxResult> {
+    let zero = [0u8; 20];
+    if from != &zero {
+        let key = keylet::account_root_key(from);
+        let Some(mut root) = json_at(ps.sandbox(), &key) else { return Err(crate::ledger::transactor::TxResult::NoDst) };
+        let bal: i128 = root["Balance"].as_str().and_then(|s| s.parse::<i128>().ok()).unwrap_or(0);
+        if bal < amount {
+            return Err(crate::ledger::transactor::TxResult::Unfunded);
+        }
+        ps.credit_hook_xrp(from, &zero, amount, bal);
+        root["Balance"] = serde_json::Value::String((bal - amount).to_string());
+        crate::tx::offer::put_json(ps.view(), key, &root);
     }
-    root["Balance"] = serde_json::Value::String(nb.to_string());
-    crate::tx::offer::put_json(sb, key, &root);
+    if to != &zero {
+        let key = keylet::account_root_key(to);
+        let Some(mut root) = json_at(ps.sandbox(), &key) else { return Err(crate::ledger::transactor::TxResult::NoDst) };
+        let bal: i128 = root["Balance"].as_str().and_then(|s| s.parse::<i128>().ok()).unwrap_or(0);
+        root["Balance"] = serde_json::Value::String((bal + amount).to_string());
+        ps.credit_hook_xrp(&zero, to, amount, -bal);
+        crate::tx::offer::put_json(ps.view(), key, &root);
+    }
     Ok(())
 }
 
-/// `accountSend(view, from, to, amount)` as the path engine uses it — XRP
-/// between two roots, or an IOU where one party is the issuer
-/// (`rippleCredit`): the other party's line moves and the PaymentSandbox's
-/// `creditHook` records the credit. (Two non-issuer parties — `rippleSend`
-/// through the issuer — arrive with the DirectStep slice.)
+/// `rippleCreditIOU(view, sender, receiver, amount)`: the line between
+/// them moves by `amount` in the sender's terms, `creditHook` first with
+/// the sender-side balance. The engine's `line_adjust` carries the line
+/// mechanics (reserve flag, deletion, creation) for the non-issuer party.
+fn ripple_credit(ps: &mut PaymentSandbox, sender: &[u8; 20], receiver: &[u8; 20], asset: &Asset, amount: IouAmount) {
+    let issuer = asset.issuer.unwrap_or([0; 20]);
+    let leg = crate::tx::offer::Leg { xrp: false, cur: asset.currency, issuer };
+    let magnitude = (amount.mantissa as u128, amount.exponent);
+    // The sender-side balance before the credit: the balance of the line
+    // as the SENDER sees it (positive = the sender is owed).
+    let pre = {
+        let lk = keylet::ripple_state_key(sender, receiver, &asset.currency);
+        match json_at(ps.sandbox(), &lk) {
+            Some(line) => {
+                let (neg, bal) = signed_value(&line["Balance"]);
+                let sender_low = sender < receiver;
+                let sender_neg = if sender_low { neg && bal.0 > 0 } else { !neg && bal.0 > 0 };
+                IouAmount::from_me(sender_neg, bal)
+            }
+            None => IouAmount::ZERO,
+        }
+    };
+    ps.credit_hook_iou(sender, receiver, &asset.currency, amount, pre);
+    if sender == &issuer {
+        crate::tx::offer::line_adjust(ps.view(), receiver, &leg, magnitude, true);
+    } else if receiver == &issuer {
+        crate::tx::offer::line_adjust(ps.view(), sender, &leg, magnitude, false);
+    } else {
+        // A line between two non-issuers (checkIssuer = false): both
+        // sides move on the one line.
+        crate::tx::offer::line_adjust(ps.view(), sender, &leg, magnitude, false);
+        crate::tx::offer::line_adjust(ps.view(), receiver, &leg, magnitude, true);
+    }
+}
+
+/// `accountSend(view, from, to, amount, waiveFee)` — `accountSendIOU`:
+/// nothing for a zero amount or `from == to`; XRP moves between roots;
+/// an IOU goes `rippleSendIOU`: straight `rippleCredit` when either party
+/// is the issuer, otherwise through the issuer with the sender paying
+/// `multiply(amount, transferRate(issuer))` unless the fee is waived.
 pub fn account_send(ps: &mut PaymentSandbox, from: &[u8; 20], to: &[u8; 20], asset: &Asset, amount: EitherAmount) -> Result<(), crate::ledger::transactor::TxResult> {
-    if amount.is_zero() {
+    account_send_fee(ps, from, to, asset, amount, false)
+}
+
+pub fn account_send_fee(ps: &mut PaymentSandbox, from: &[u8; 20], to: &[u8; 20], asset: &Asset, amount: EitherAmount, waive_fee: bool) -> Result<(), crate::ledger::transactor::TxResult> {
+    if amount.is_zero() || from == to {
         return Ok(());
     }
     match amount {
-        EitherAmount::Xrp(d) => {
-            if from != &[0u8; 20] {
-                xrp_adjust(ps.view(), from, -d)?;
-            }
-            if to != &[0u8; 20] {
-                xrp_adjust(ps.view(), to, d)?;
-            }
-            Ok(())
-        }
+        EitherAmount::Xrp(d) => xrp_send(ps, from, to, d),
         EitherAmount::Iou(a) => {
             let issuer = asset.issuer.unwrap_or([0; 20]);
-            let leg = crate::tx::offer::Leg { xrp: false, cur: asset.currency, issuer };
-            let magnitude = (a.mantissa as u128, a.exponent);
-            if from == &issuer && to != &issuer {
-                // Issuer → holder: the holder's line rises.
-                let pre = line_balance(ps.sandbox(), to, asset);
-                crate::tx::offer::line_adjust(ps.view(), to, &leg, magnitude, true);
-                ps.credit_hook_iou(from, to, &asset.currency, a, pre);
-                Ok(())
-            } else if to == &issuer && from != &issuer {
-                // Holder → issuer: the holder's line falls.
-                let pre = line_balance(ps.sandbox(), to, asset);
-                crate::tx::offer::line_adjust(ps.view(), from, &leg, magnitude, false);
-                ps.credit_hook_iou(from, to, &asset.currency, a, pre);
-                Ok(())
-            } else if from == to {
-                Ok(())
-            } else {
-                // rippleSend through the issuer: slice 4 (DirectStep).
-                let pre = line_balance(ps.sandbox(), to, asset);
-                crate::tx::offer::line_adjust(ps.view(), from, &leg, magnitude, false);
-                crate::tx::offer::line_adjust(ps.view(), to, &leg, magnitude, true);
-                ps.credit_hook_iou(from, to, &asset.currency, a, pre);
-                Ok(())
+            if from == &issuer || to == &issuer {
+                ripple_credit(ps, from, to, asset, a);
+                return Ok(());
             }
+            let actual = if waive_fee {
+                a
+            } else {
+                let rate = transfer_rate(ps.sandbox(), &issuer);
+                if rate == QUALITY_ONE {
+                    a
+                } else {
+                    // `multiply(saAmount, transferRate)`: STAmount × the
+                    // rate as an IOU value (rate / 1e9), Number nearest.
+                    let r = crate::tx::amm_swap::n_mul((a.mantissa as u128, a.exponent), (rate as u128, -9), crate::tx::amm_swap::Rnd::Near);
+                    IouAmount::from_me(a.negative, r)
+                }
+            };
+            ripple_credit(ps, &issuer, to, asset, a);
+            ripple_credit(ps, from, &issuer, asset, actual);
+            Ok(())
         }
     }
 }

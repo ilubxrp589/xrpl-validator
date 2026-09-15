@@ -88,9 +88,27 @@ struct ValueIou {
 
 /// `detail::DeferredCredits` — IOU lines and owner counts (the MPT tables
 /// arrive with the MPT slice).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct ValueXrp {
+    low_acct_debits: i128,
+    high_acct_debits: i128,
+    low_acct_orig_balance: i128,
+}
+
+/// `DeferredCredits::Adjustment` for XRP (drops).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct AdjustmentXrp {
+    pub debits: i128,
+    pub credits: i128,
+    pub orig_balance: i128,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DeferredCredits {
     credits_iou: BTreeMap<([u8; 20], [u8; 20], [u8; 20]), ValueIou>,
+    /// XRP credits: keyed like the IOU table with the XRP currency and
+    /// `xrpAccount()` (all zero) as the other party.
+    credits_xrp: BTreeMap<([u8; 20], [u8; 20]), ValueXrp>,
     owner_counts: BTreeMap<[u8; 20], OwnerCounts>,
 }
 
@@ -146,6 +164,40 @@ impl DeferredCredits {
 
     /// `adjustmentsIOU(main, other, currency)`: the line's record from
     /// `main`'s side, if any.
+    /// `creditXRP(sender, receiver, amount, preCreditSenderBalance)`.
+    pub fn credit_xrp(&mut self, sender: &[u8; 20], receiver: &[u8; 20], amount: i128, pre_credit_sender_balance: i128) {
+        debug_assert!(sender != receiver, "DeferredCredits::creditXRP : sender is not receiver");
+        let k = if sender < receiver { (*sender, *receiver) } else { (*receiver, *sender) };
+        let sender_low = sender < receiver;
+        match self.credits_xrp.get_mut(&k) {
+            None => {
+                let v = if sender_low {
+                    ValueXrp { low_acct_debits: amount, high_acct_debits: 0, low_acct_orig_balance: pre_credit_sender_balance }
+                } else {
+                    ValueXrp { low_acct_debits: 0, high_acct_debits: amount, low_acct_orig_balance: -pre_credit_sender_balance }
+                };
+                self.credits_xrp.insert(k, v);
+            }
+            Some(v) => {
+                if sender_low {
+                    v.low_acct_debits += amount;
+                } else {
+                    v.high_acct_debits += amount;
+                }
+            }
+        }
+    }
+
+    pub fn adjustments_xrp(&self, main: &[u8; 20], other: &[u8; 20]) -> Option<AdjustmentXrp> {
+        let k = if main < other { (*main, *other) } else { (*other, *main) };
+        let v = self.credits_xrp.get(&k)?;
+        Some(if main < other {
+            AdjustmentXrp { debits: v.low_acct_debits, credits: v.high_acct_debits, orig_balance: v.low_acct_orig_balance }
+        } else {
+            AdjustmentXrp { debits: v.high_acct_debits, credits: v.low_acct_debits, orig_balance: -v.low_acct_orig_balance }
+        })
+    }
+
     pub fn adjustments_iou(&self, main: &[u8; 20], other: &[u8; 20], currency: &[u8; 20]) -> Option<AdjustmentIou> {
         let v = self.credits_iou.get(&Self::key(main, other, currency))?;
         Some(if main < other {
@@ -178,6 +230,17 @@ impl DeferredCredits {
                 Some(t) => {
                     t.low_acct_debits = t.low_acct_debits.add(v.low_acct_debits);
                     t.high_acct_debits = t.high_acct_debits.add(v.high_acct_debits);
+                }
+            }
+        }
+        for (k, v) in &self.credits_xrp {
+            match to.credits_xrp.get_mut(k) {
+                None => {
+                    to.credits_xrp.insert(*k, *v);
+                }
+                Some(t) => {
+                    t.low_acct_debits += v.low_acct_debits;
+                    t.high_acct_debits += v.high_acct_debits;
                 }
             }
         }
@@ -259,6 +322,13 @@ impl<'a, 'b> PaymentSandbox<'a, 'b> {
         self.sandbox
     }
 
+    /// `afView` read as JSON: the entry as it stood when the innermost
+    /// layer opened (rippled's "all funds" view — `PaymentSandbox
+    /// afView(&baseView)` at the top of a strand's flow).
+    pub fn af_json(&self, key: &Hash256) -> Option<serde_json::Value> {
+        self.af_read(key).and_then(|d| serde_json::from_slice(&d).ok())
+    }
+
     /// `afView` read: the entry as it stood when the innermost layer opened
     /// (or the live view outside any layer).
     pub fn af_read(&self, key: &Hash256) -> Option<Vec<u8>> {
@@ -313,6 +383,32 @@ impl<'a, 'b> PaymentSandbox<'a, 'b> {
     /// `creditHookIOU(from, to, amount, preCreditBalance)`.
     pub fn credit_hook_iou(&mut self, from: &[u8; 20], to: &[u8; 20], currency: &[u8; 20], amount: IouAmount, pre_credit_balance: IouAmount) {
         self.tab_mut().credit_iou(from, to, currency, amount, pre_credit_balance);
+    }
+
+    /// `balanceHook` for XRP (`accountSendIOU`'s drops legs record their
+    /// credits with `xrpAccount()` as the other party): the same
+    /// min-of-three rule as the IOU hook, floored at zero.
+    pub fn balance_hook_xrp(&self, account: &[u8; 20], amount: i128) -> i128 {
+        let other = [0u8; 20];
+        let mut delta: i128 = 0;
+        let mut last_bal = amount;
+        let mut min_bal = amount;
+        for tab in self.tabs() {
+            if let Some(adj) = tab.adjustments_xrp(account, &other) {
+                delta += adj.debits;
+                last_bal = adj.orig_balance;
+                if last_bal < min_bal {
+                    min_bal = last_bal;
+                }
+            }
+        }
+        let adjusted = amount.min(last_bal - delta).min(min_bal);
+        adjusted.max(0)
+    }
+
+    /// `creditHook` for XRP.
+    pub fn credit_hook_xrp(&mut self, from: &[u8; 20], to: &[u8; 20], amount: i128, pre_credit_balance: i128) {
+        self.tab_mut().credit_xrp(from, to, amount, pre_credit_balance);
     }
 
     /// `adjustOwnerCountHook(account, cur, next)`.

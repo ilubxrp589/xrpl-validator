@@ -18,7 +18,7 @@
 //!     this flow (stepped past, deleted only in the strand's sandbox, gone
 //!     with a rejected strand) — findings 153, 275, 277.
 use crate::ledger::keylet;
-use crate::tx::offer::{decode20, json_at};
+use crate::tx::offer::{decode20, json_at, signed_value};
 use xrpl_core::types::Hash256;
 
 use super::amounts::{EitherAmount, IouAmount};
@@ -536,23 +536,37 @@ impl FlowOfferStream {
 /// what THIS transaction wrote before the flow (fee, sequence): for an
 /// offer owner other than the taker, the base ledger's own balance.
 fn account_funds_iou_original(ps: &PaymentSandbox, owner: &[u8; 20], asset: &Asset, amt_default: IouAmount) -> IouAmount {
-    if asset.issuer == Some(*owner) {
+    let Some(issuer) = asset.issuer else { return IouAmount::ZERO };
+    if issuer == *owner {
         return amt_default;
     }
-    let base = ps.base_view();
-    if super::view::is_frozen(base, owner, asset) {
+    // `isFrozen` on the afView: the issuer's global freeze or its side of
+    // the line.
+    let global = ps.af_json(&keylet::account_root_key(&issuer)).is_some_and(|a| a["Flags"].as_u64().unwrap_or(0) & super::view::LSF_GLOBAL_FREEZE != 0);
+    if global {
         return IouAmount::ZERO;
     }
-    let bal = super::view::line_balance(base, owner, asset);
-    if bal <= IouAmount::ZERO { IouAmount::ZERO } else { bal }
+    let Some(line) = ps.af_json(&keylet::ripple_state_key(owner, &issuer, &asset.currency)) else { return IouAmount::ZERO };
+    let bit: u64 = if issuer > *owner { 0x0080_0000 } else { 0x0040_0000 };
+    if line["Flags"].as_u64().unwrap_or(0) & bit != 0 {
+        return IouAmount::ZERO;
+    }
+    let (neg, bal) = signed_value(&line["Balance"]);
+    let party_low = *owner < issuer;
+    let holder_neg = if party_low { neg && bal.0 > 0 } else { !neg && bal.0 > 0 };
+    let b = IouAmount::from_me(holder_neg, bal);
+    if b <= IouAmount::ZERO { IouAmount::ZERO } else { b }
 }
 
 fn xrp_liquid_original(ps: &PaymentSandbox, owner: &[u8; 20]) -> i128 {
-    let base = ps.base_view();
-    let Some(root) = json_at(base, &keylet::account_root_key(owner)) else { return 0 };
+    let Some(root) = ps.af_json(&keylet::account_root_key(owner)) else { return 0 };
     let balance: i128 = root["Balance"].as_str().and_then(|s| s.parse::<i128>().ok()).unwrap_or(0);
-    let count = super::view::owner_counts(base, owner).count() as u64;
-    let reserve = crate::ledger::fees::account_reserve(base, count) as i128;
+    let counts = super::payment_sandbox::OwnerCounts {
+        owner: root["OwnerCount"].as_u64().unwrap_or(0) as u32,
+        sponsored: root["SponsoredOwnerCount"].as_u64().unwrap_or(0) as u32,
+        sponsoring: root["SponsoringOwnerCount"].as_u64().unwrap_or(0) as u32,
+    };
+    let reserve = crate::ledger::fees::account_reserve(ps.sandbox(), counts.count() as u64) as i128;
     (balance - reserve).max(0)
 }
 
