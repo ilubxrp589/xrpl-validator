@@ -176,7 +176,9 @@ impl StepCounter {
 /// its current amounts.
 #[derive(Clone, Debug)]
 pub struct Offer {
-    pub key: Hash256,
+    /// The ledger entry (None for the pool's synthetic offer — `key()`
+    /// is `std::nullopt` there, so `permRmOffer` never sees it).
+    pub key: Option<Hash256>,
     pub owner: [u8; 20],
     pub quality: Quality,
     pub asset_in: Asset,
@@ -184,24 +186,57 @@ pub struct Offer {
     /// (in, out) = (TakerPays, TakerGets).
     pub amount_in: EitherAmount,
     pub amount_out: EitherAmount,
+    /// `AMMOffer`: the pool offer's own state (slice 3).
+    pub amm: Option<super::amm::AmmOffer>,
 }
 
 impl Offer {
     fn from_entry(e: &OfferEntry, quality: Quality) -> Offer {
         Offer {
-            key: e.key,
+            key: Some(e.key),
             owner: e.owner,
             quality,
             asset_in: e.asset_in,
             asset_out: e.asset_out,
             amount_in: either(e.asset_in.is_xrp(), e.taker_pays),
             amount_out: either(e.asset_out.is_xrp(), e.taker_gets),
+            amm: None,
         }
     }
 
-    /// `TOffer::isFunded`: the owner is the OUT issuer — unlimited funds.
+    /// The pool's offer as `execOffer` receives it.
+    pub fn from_amm(a: super::amm::AmmOffer) -> Offer {
+        Offer {
+            key: None,
+            owner: a.owner,
+            quality: a.quality,
+            asset_in: a.asset_in,
+            asset_out: a.asset_out,
+            amount_in: a.amount_in,
+            amount_out: a.amount_out,
+            amm: Some(a),
+        }
+    }
+
+    /// `AMMOffer::adjustRates`: the pool pays no transfer fee on either
+    /// side (fixAMMv1_1); a CLOB offer keeps the step's rates.
+    pub fn adjust_rates(&self, ofr_in_rate: u32, ofr_out_rate: u32) -> (u32, u32) {
+        if self.amm.is_some() { (super::view::QUALITY_ONE, super::view::QUALITY_ONE) } else { (ofr_in_rate, ofr_out_rate) }
+    }
+
+    /// `checkInvariant`: a CLOB offer always holds; the pool's product
+    /// must not fall.
+    pub fn check_invariant(&self, consumed_in: EitherAmount, consumed_out: EitherAmount) -> bool {
+        match &self.amm {
+            Some(a) => a.check_invariant(consumed_in, consumed_out),
+            None => true,
+        }
+    }
+
+    /// `isFunded`: the owner is the OUT issuer — unlimited funds; the
+    /// pool's offer is always funded (its amounts are its balances).
     pub fn is_funded(&self) -> bool {
-        self.asset_out.issuer == Some(self.owner)
+        self.amm.is_some() || self.asset_out.issuer == Some(self.owner)
     }
 
     /// `fully_consumed`: nothing more can flow through this offer.
@@ -210,25 +245,41 @@ impl Offer {
     }
 
     /// `TOffer::consume`: subtract what a fill took and write the entry.
-    pub fn consume(&mut self, ps: &mut PaymentSandbox, consumed_in: EitherAmount, consumed_out: EitherAmount) {
+    /// `AMMOffer::consume`: nothing written (the pool moved with the
+    /// transfers); the context learns the pool was used.
+    pub fn consume(&mut self, ps: &mut PaymentSandbox, ctx: Option<&super::amm::SharedAmmContext>, consumed_in: EitherAmount, consumed_out: EitherAmount) {
+        if let Some(a) = self.amm.as_mut() {
+            if let Some(ctx) = ctx {
+                a.consume(ctx, consumed_in, consumed_out);
+            }
+            return;
+        }
         self.amount_in = self.amount_in.sub(consumed_in);
         self.amount_out = self.amount_out.sub(consumed_out);
-        let Some(mut offer) = json_at(ps.sandbox(), &self.key) else { return };
+        let Some(key) = self.key else { return };
+        let Some(mut offer) = json_at(ps.sandbox(), &key) else { return };
         set_amount(&mut offer, "TakerPays", &self.amount_in);
         set_amount(&mut offer, "TakerGets", &self.amount_out);
-        crate::tx::offer::put_json(ps.view(), self.key, &offer);
+        crate::tx::offer::put_json(ps.view(), key, &offer);
     }
 
     /// `TOffer::limitOut` (fixReducedOffersV1 on mainnet):
-    /// `quality().ceil_out_strict(offrAmt, limit, roundUp)`.
+    /// `quality().ceil_out_strict(offrAmt, limit, roundUp)`; the pool's
+    /// offer re-prices (`AMMOffer::limitOut`).
     pub fn limit_out(&self, amt_in: EitherAmount, amt_out: EitherAmount, limit: EitherAmount, round_up: bool) -> (EitherAmount, EitherAmount) {
-        ceil_out_strict(self.quality, amt_in, amt_out, limit, round_up)
+        match &self.amm {
+            Some(a) => a.limit_out(amt_in, amt_out, limit, round_up),
+            None => ceil_out_strict(self.quality, amt_in, amt_out, limit, round_up),
+        }
     }
 
     /// `TOffer::limitIn` (fixReducedOffersV2 is NOT on mainnet):
-    /// `m_quality.ceil_in(offrAmt, limit)`.
+    /// `m_quality.ceil_in(offrAmt, limit)`; the pool's offer re-prices.
     pub fn limit_in(&self, amt_in: EitherAmount, amt_out: EitherAmount, limit: EitherAmount) -> (EitherAmount, EitherAmount) {
-        ceil_in(self.quality, amt_in, amt_out, limit)
+        match &self.amm {
+            Some(a) => a.limit_in(amt_in, amt_out, limit),
+            None => ceil_in(self.quality, amt_in, amt_out, limit),
+        }
     }
 }
 

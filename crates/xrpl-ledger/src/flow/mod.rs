@@ -18,6 +18,7 @@
 //!   4. `strand_flow` + `pay_steps` (flow(), ActiveStrands, limitOut, the
 //!      judge, toStrands) and the Payment dispatch; then OfferCreate's
 //!      crossing.
+pub mod amm;
 pub mod amounts;
 pub mod book_step;
 pub mod offer_stream;

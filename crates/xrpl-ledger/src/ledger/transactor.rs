@@ -56,6 +56,8 @@ pub enum TxResult {
     NoTarget,
     /// IoC/FoK offer crossed nothing (or FoK not fully filled).
     Killed,
+    /// tecINVARIANT_FAILED — an AMM offer whose pool product would fall (fixAMMOverflowOffer).
+    InvariantFailed,
     /// Placement would exceed the owner reserve.
     InsufReserveOffer,
     /// Offer is unfunded at apply time.
@@ -293,6 +295,7 @@ impl TxResult {
             TxResult::NoEntry => "tecNO_ENTRY",
             TxResult::NoTarget => "tecNO_TARGET",
             TxResult::Killed => "tecKILLED",
+            TxResult::InvariantFailed => "tecINVARIANT_FAILED",
             TxResult::InsufReserveOffer => "tecINSUF_RESERVE_OFFER",
             TxResult::UnfundedOffer => "tecUNFUNDED_OFFER",
             TxResult::Expired => "tecEXPIRED",

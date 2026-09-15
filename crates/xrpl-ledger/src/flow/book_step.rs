@@ -26,8 +26,9 @@
 //! CLOB-only until then.
 use xrpl_core::types::Hash256;
 
+use super::amm::{AmmLiquidity, SharedAmmContext};
 use super::amounts::{EitherAmount, IouAmount};
-use super::offer_stream::{ceil_in, ceil_out_strict, BookTip, FlowOfferStream, Offer, StepCounter};
+use super::offer_stream::{BookTip, FlowOfferStream, Offer, StepCounter};
 use super::payment_sandbox::PaymentSandbox;
 use super::quality_function::{Quality, QualityFunction};
 use super::steps::{
@@ -81,12 +82,15 @@ pub struct BookStep {
     inactive: bool,
     offers_used: u32,
     cache: Option<(EitherAmount, EitherAmount)>,
+    /// `ammLiquidity_`: set when the pair has a pool with LP tokens.
+    amm: Option<AmmLiquidity>,
+    amm_ctx: SharedAmmContext,
 }
 
 impl BookStep {
     /// `BookStep(ctx, in, out)` for a payment or a crossing. `prev` carries
     /// what `ctx.prevStep` would answer.
-    pub fn new(ctx: &StrandContext, input: Asset, output: Asset, prev: Option<&dyn Step>, sb: &PaymentSandbox) -> BookStep {
+    pub fn new(ctx: &StrandContext, input: Asset, output: Asset, prev: Option<&dyn Step>, sb: &PaymentSandbox, amm_ctx: &SharedAmmContext) -> BookStep {
         let kind = match ctx.offer_crossing {
             super::steps::OfferCrossing::No => BookKind::Payment,
             _ => BookKind::OfferCrossing {
@@ -119,7 +123,13 @@ impl BookStep {
             inactive: false,
             offers_used: 0,
             cache: None,
+            amm: AmmLiquidity::discover(sb.sandbox(), amm_ctx, &input, &output),
+            amm_ctx: amm_ctx.clone(),
         }
+    }
+
+    fn amm_multi_path(&self) -> bool {
+        self.amm.is_some() && self.amm_ctx.borrow().multi_path()
     }
 
     fn in_is_xrp(&self) -> bool {
@@ -148,7 +158,9 @@ impl BookStep {
         // `offer.quality() >= qualityThreshold_`: a LOWER encoded value is
         // a better quality.
         if default_path && offer.quality.0 <= quality_threshold.0 && self.strand_src == offer.owner && self.strand_dst == offer.owner {
-            offers.perm_rm_offer_pub(offer.key);
+            if let Some(key) = offer.key {
+                offers.perm_rm_offer_pub(key);
+            }
             if !offer_attempted {
                 *ofr_q = None;
             }
@@ -232,9 +244,9 @@ impl BookStep {
 
     // ---- the AMM hook (slice 3) ----------------------------------------
 
-    /// `getAMMOffer(view, clobQuality)`: None until slice 3.
-    fn amm_offer(&self, _sb: &PaymentSandbox, _clob_quality: Option<Quality>) -> Option<Offer> {
-        None
+    /// `getAMMOffer(view, clobQuality)`.
+    fn amm_offer(&self, sb: &PaymentSandbox, clob_quality: Option<Quality>) -> Option<Offer> {
+        self.amm.as_ref().and_then(|l| l.get_offer(sb.sandbox(), clob_quality)).map(Offer::from_amm)
     }
 
     /// `tip(view)`: the raw BookTip quality, or the AMM offer when it is
@@ -276,7 +288,9 @@ impl BookStep {
             // Owner authorisation to hold the IN asset from its issuer.
             if !offer.asset_in.is_xrp() && Some(offer.owner) != offer.asset_in.issuer {
                 if !is_authorized(sb.base_view(), &offer.asset_in, &offer.owner) {
-                    offers.perm_rm_offer_pub(offer.key);
+                    if let Some(key) = offer.key {
+                        offers.perm_rm_offer_pub(key);
+                    }
                     if !*offer_attempted {
                         *ofr_q = None;
                     }
@@ -286,8 +300,7 @@ impl BookStep {
             if !this.check_quality_threshold(offer.quality) {
                 return Ok(false);
             }
-            let ofr_in_rate = this.ofr_in_rate(&offer.owner, tr_in);
-            let ofr_out_rate = this.ofr_out_rate(&offer.owner, tr_out);
+            let (ofr_in_rate, ofr_out_rate) = offer.adjust_rates(this.ofr_in_rate(&offer.owner, tr_in), this.ofr_out_rate(&offer.owner, tr_out));
             let mut ofr_amt = StepAmounts { input: offer.amount_in, output: offer.amount_out };
             let mut stp_amt = StepAmounts { input: mul_ratio_either(ofr_amt.input, ofr_in_rate, QUALITY_ONE, true), output: ofr_amt.output };
             // The owner pays the transfer fee.
@@ -296,7 +309,7 @@ impl BookStep {
             if funds.lt(&owner_gives) {
                 owner_gives = funds;
                 stp_amt.output = mul_ratio_either(owner_gives, QUALITY_ONE, ofr_out_rate, false);
-                let (i, o) = ceil_out_strict(offer.quality, ofr_amt.input, ofr_amt.output, stp_amt.output, false);
+                let (i, o) = offer.limit_out(ofr_amt.input, ofr_amt.output, stp_amt.output, false);
                 ofr_amt = StepAmounts { input: i, output: o };
                 stp_amt.input = mul_ratio_either(ofr_amt.input, ofr_in_rate, QUALITY_ONE, true);
             }
@@ -310,7 +323,7 @@ impl BookStep {
             if this.book.domain.is_some() {
                 return Ok(true);
             }
-            let quality_threshold = lob_quality.and_then(|lq| this.quality_threshold(lq, false));
+            let quality_threshold = lob_quality.and_then(|lq| this.quality_threshold(lq, this.amm_multi_path()));
             match this.amm_offer(sb, quality_threshold) {
                 None => Ok(true),
                 Some(mut amm) => exec_offer(this, sb, offers, &mut amm, offer_attempted, ofr_q, callback),
@@ -348,9 +361,13 @@ impl BookStep {
     fn consume_offer(&self, sb: &mut PaymentSandbox, offer: &mut Offer, ofr_amt: StepAmounts, _stp_amt: StepAmounts, owner_gives: EitherAmount) -> Result<(), FlowError> {
         let in_issuer = self.book.input.issuer.unwrap_or([0; 20]);
         let out_issuer = self.book.output.issuer.unwrap_or([0; 20]);
+        if !offer.check_invariant(ofr_amt.input, ofr_amt.output) {
+            // fixAMMOverflowOffer: tecINVARIANT_FAILED.
+            return Err(FlowError(crate::ledger::transactor::TxResult::InvariantFailed));
+        }
         account_send(sb, &in_issuer, &offer.owner, &self.book.input, ofr_amt.input).map_err(FlowError)?;
         account_send(sb, &offer.owner, &out_issuer, &self.book.output, owner_gives).map_err(FlowError)?;
-        offer.consume(sb, ofr_amt.input, ofr_amt.output);
+        offer.consume(sb, Some(&self.amm_ctx), ofr_amt.input, ofr_amt.output);
         Ok(())
     }
 
@@ -533,8 +550,9 @@ pub fn limit_step_in(offer: &Offer, mut ofr_amt: StepAmounts, mut stp_amt: StepA
     if limit.lt(&stp_amt.input) {
         stp_amt.input = limit;
         let in_lmt = mul_ratio_either(stp_amt.input, QUALITY_ONE, tr_in, false);
-        // fixReducedOffersV2 is NOT on mainnet: the legacy `ceil_in`.
-        let (i, o) = ceil_in(offer.quality, ofr_amt.input, ofr_amt.output, in_lmt);
+        // fixReducedOffersV2 is NOT on mainnet: the legacy `ceil_in`
+        // (`offer.limitIn`; the pool's offer re-prices).
+        let (i, o) = offer.limit_in(ofr_amt.input, ofr_amt.output, in_lmt);
         ofr_amt = StepAmounts { input: i, output: o };
         stp_amt.output = ofr_amt.output;
         owner_gives = mul_ratio_either(ofr_amt.output, tr_out, QUALITY_ONE, false);
@@ -547,8 +565,9 @@ pub fn limit_step_out(offer: &Offer, mut ofr_amt: StepAmounts, mut stp_amt: Step
     if limit.lt(&stp_amt.output) {
         stp_amt.output = limit;
         owner_gives = mul_ratio_either(stp_amt.output, tr_out, QUALITY_ONE, false);
-        // fixReducedOffersV1 is live: `ceil_out_strict(.., roundUp = true)`.
-        let (i, o) = ceil_out_strict(offer.quality, ofr_amt.input, ofr_amt.output, stp_amt.output, true);
+        // fixReducedOffersV1 is live: `ceil_out_strict(.., roundUp = true)`
+        // (`offer.limitOut`; the pool's offer re-prices).
+        let (i, o) = offer.limit_out(ofr_amt.input, ofr_amt.output, stp_amt.output, true);
         ofr_amt = StepAmounts { input: i, output: o };
         stp_amt.input = mul_ratio_either(ofr_amt.input, tr_in, QUALITY_ONE, true);
     }
@@ -592,13 +611,41 @@ impl Step for BookStep {
         let dir = self.debt_direction(sb, StrandDirection::Forward);
         let Some((q, offer_type)) = self.tip(sb) else { return (None, dir) };
         let waive = offer_type == OfferType::Amm;
-        (Some(self.adjust_quality_with_fees(sb, q, prev_step_dir, waive, offer_type, false)), dir)
+        (Some(self.adjust_quality_with_fees(sb, q, prev_step_dir, waive, offer_type, self.amm_multi_path())), dir)
     }
 
+    /// `getQualityFunc`: `tipOfferQualityF` — a CLOB tip's constant
+    /// function, or the pool offer's (sloped under single path), with the
+    /// fee-adjusted parity quality composed in front of an AMM function.
     fn get_quality_func(&self, sb: &PaymentSandbox, prev_step_dir: DebtDirection) -> (Option<QualityFunction>, DebtDirection) {
-        // CLOB only until slice 3: the constant function of the bound.
-        let (q, dir) = self.quality_upper_bound(sb, prev_step_dir);
-        (q.and_then(|q| QualityFunction::clob_like(q).ok()), dir)
+        let dir = self.debt_direction(sb, StrandDirection::Forward);
+        let mut bt = BookTip::new(&self.book.input, &self.book.output, self.book.domain.as_ref());
+        let lob_quality = if bt.peek(sb) { bt.quality() } else { None };
+        let amm = self.amm_offer(sb, lob_quality).filter(|a| lob_quality.is_none_or(|lq| a.quality.0 < lq.0));
+        match amm {
+            Some(a) => {
+                let Some(res) = a.amm.as_ref().and_then(|x| x.get_quality_func()) else { return (None, dir) };
+                if res.is_const() {
+                    return (Some(res), dir);
+                }
+                // `adjustQualityWithFees(qOne, …, WaiveTransferFee::Yes, AMM)`
+                let q_one = Quality(crate::ledger::keylet::rate_encode_native(1, 0, false, 1, 0, false).unwrap_or(0));
+                let q = self.adjust_quality_with_fees(sb, q_one, prev_step_dir, true, OfferType::Amm, self.amm_multi_path());
+                if q == q_one {
+                    return (Some(res), dir);
+                }
+                let mut qf = match QualityFunction::clob_like(q) { Ok(f) => f, Err(_) => return (None, dir) };
+                if qf.combine(&res).is_err() {
+                    return (None, dir);
+                }
+                (Some(qf), dir)
+            }
+            None => {
+                let Some(q) = lob_quality else { return (None, dir) };
+                let q = self.adjust_quality_with_fees(sb, q, prev_step_dir, false, OfferType::Clob, self.amm_multi_path());
+                (QualityFunction::clob_like(q).ok(), dir)
+            }
+        }
     }
 
     fn offers_used(&self) -> u32 {
