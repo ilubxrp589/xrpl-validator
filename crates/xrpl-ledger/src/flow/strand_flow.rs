@@ -218,6 +218,9 @@ pub fn limit_out(sb: &PaymentSandbox, strand: &Strand, remaining_out: EitherAmou
     let mut dir = DebtDirection::Issues;
     for step in strand.iter() {
         let (sqf, d) = step.get_quality_func(sb, dir);
+        if std::env::var("XRPL_FLOW_TRACE").is_ok() {
+            eprintln!("FLOW   qf step {}: prev_dir={:?} -> dir={:?} const={:?} m={:?} b={:?}", step.log_string().split(':').next().unwrap_or(""), dir, d, sqf.as_ref().map(|f| f.is_const()), sqf.as_ref().map(|f| f.m_parts()), sqf.as_ref().map(|f| f.b_parts()));
+        }
         dir = d;
         let Some(sqf) = sqf else { return remaining_out };
         match qf.as_mut() {
@@ -230,10 +233,16 @@ pub fn limit_out(sb: &PaymentSandbox, strand: &Strand, remaining_out: EitherAmou
         }
     }
     let Some(qf) = qf else { return remaining_out };
+    if std::env::var("XRPL_FLOW_TRACE").is_ok() {
+        eprintln!("FLOW limitOut: composed qf const={} m={:?} b={:?} limit={:x} remaining_out={}", qf.is_const(), qf.m_parts(), qf.b_parts(), limit_quality.0, remaining_out);
+    }
     if qf.is_const() {
         return remaining_out;
     }
     let Ok(Some(out)) = qf.out_from_avg_q(limit_quality) else { return remaining_out };
+    if std::env::var("XRPL_FLOW_TRACE").is_ok() {
+        eprintln!("FLOW limitOut: outFromAvgQ={:?}", (out.negative, out.mantissa, out.exponent));
+    }
     let out = match remaining_out {
         EitherAmount::Xrp(_) => EitherAmount::Xrp(out.to_drops(crate::tx::number::Rounding::ToNearest).unwrap_or(0) as i128),
         EitherAmount::Iou(_) => EitherAmount::Iou(super::amounts::IouAmount::from_number(out)),
@@ -375,6 +384,9 @@ pub fn flow_strands(
         }
         active.activate_next(sb, strands, limit_quality);
         amm_ctx.borrow_mut().set_multi_path(active.size() > 1);
+        if std::env::var("XRPL_FLOW_TRACE").is_ok() {
+            eprintln!("FLOW iter {} active={} remaining_out={} remaining_in={:?}", cur_try - 1, active.size(), remaining_out, remaining_in);
+        }
         // Limit only if one strand and limitQuality.
         let limit_remaining_out = match (active.size(), limit_quality) {
             (1, Some(lq)) => match active.get(0) {

@@ -641,6 +641,9 @@ impl Step for BookStep {
                 // `adjustQualityWithFees(qOne, …, WaiveTransferFee::Yes, AMM)`
                 let q_one = Quality(crate::ledger::keylet::rate_encode_native(1, 0, false, 1, 0, false).unwrap_or(0));
                 let q = self.adjust_quality_with_fees(sb, q_one, prev_step_dir, true, OfferType::Amm, self.amm_multi_path());
+                if std::env::var("XRPL_FLOW_TRACE").is_ok() {
+                    eprintln!("FLOW   qf book {}: prev_dir={:?} q_one={:x} q={:x} amm_fn m={:?} b={:?}", self.log_string().split(':').next().unwrap_or(""), prev_step_dir, q_one.0, q.0, res.m_parts(), res.b_parts());
+                }
                 if q == q_one {
                     return (Some(res), dir);
                 }

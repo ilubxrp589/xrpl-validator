@@ -342,7 +342,12 @@ impl Step for DirectStep {
     fn quality_upper_bound(&self, sb: &PaymentSandbox, prev_step_dir: DebtDirection) -> (Option<Quality>, DebtDirection) {
         let dir = self.debt_direction(sb, StrandDirection::Forward);
         let (src_q_out, dst_q_in) = if redeems(dir) { self.qualities_src_redeems(sb) } else { self.qualities_src_issues(sb, prev_step_dir) };
-        let q = keylet::rate_encode_native(dst_q_in as u128, 0, false, src_q_out as u128, 0, false).map(Quality);
+        // `Quality(getRate(STAmount(iss, dstQIn), STAmount(iss, srcQOut)))`:
+        // getRate(offerOut, offerIn) = offerIn / offerOut = srcQOut / dstQIn —
+        // the step's IN per OUT, so `rate_encode_native(pays = srcQOut,
+        // gets = dstQIn)`. (Finding 119's vector: the closing DirectStep's
+        // 1/1.001 came out as 1.001 with the arguments swapped.)
+        let q = keylet::rate_encode_native(src_q_out as u128, 0, false, dst_q_in as u128, 0, false).map(Quality);
         (q, dir)
     }
 

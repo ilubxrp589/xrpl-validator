@@ -90,6 +90,12 @@ impl QualityFunction {
         Ok(Some(out))
     }
 
+    pub fn m_parts(&self) -> (bool, u64, i32) {
+        (self.m.negative, self.m.mantissa, self.m.exponent)
+    }
+    pub fn b_parts(&self) -> (bool, u64, i32) {
+        (self.b.negative, self.b.mantissa, self.b.exponent)
+    }
     pub fn is_const(&self) -> bool {
         self.quality.is_some()
     }
