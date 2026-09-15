@@ -988,6 +988,10 @@ impl PaymentTransactor {
         use crate::tx::direct_step as ds;
         use crate::tx::offer as ox;
         let n = segs.len();
+        // Findings 285/287: the flow iterates again only while SendMax has
+        // budget left. A pass capped by the sender's FUNDS leaves budget, so
+        // rippled's next rev pass still steps the books (#106983955); a pass
+        // that spends SendMax itself ends the flow (#106989105, #106889388).
         if n == 0 || ox::me_is_zero(rem_in) || ox::me_is_zero(rem_out) {
             return ((0, 0), (0, 0));
         }
@@ -1959,6 +1963,49 @@ impl Transactor for PaymentTransactor {
                 return TxResult::MaxLedger;
             }
         }
+        // Finding 286 (#106988696 D9DC48A444E4, #106988717 E9387B226C53: rwc9Dqir
+        // paying rLcoFM9X with five CredentialIDs, one of them a credential it
+        // ISSUED to rMB8xNE6 rather than one it holds): rippled's
+        // `credentials::valid` (CredentialHelpers.cpp) runs in Payment::preclaim
+        // before any deposit-auth test and whether or not the destination
+        // requires credentials — every id must exist, name the sender as
+        // Subject and carry lsfAccepted, else tecBAD_CREDENTIALS. Expiry is
+        // judged in doApply (removeExpiredCredentials → tecEXPIRED), not here.
+        // `checkFields` (preflight): non-empty, at most 8, no duplicates.
+        if let Some(ids) = tx.fields.get("CredentialIDs").and_then(|v| v.as_array()) {
+            if ids.is_empty() || ids.len() > 8 {
+                return TxResult::Malformed;
+            }
+            let mut seen = std::collections::HashSet::new();
+            for id in ids {
+                let Some(hex_id) = id.as_str() else { return TxResult::Malformed };
+                let Ok(raw) = hex::decode(hex_id) else { return TxResult::Malformed };
+                let Ok(key) = <[u8; 32]>::try_from(raw.as_slice()) else { return TxResult::Malformed };
+                if !seen.insert(key) {
+                    return TxResult::Malformed;
+                }
+                let Some(cred) = sandbox
+                    .read(&xrpl_core::types::Hash256(key))
+                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                else {
+                    return TxResult::BadCredentials;
+                };
+                if cred.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Credential") {
+                    return TxResult::BadCredentials;
+                }
+                let subject_is_sender = cred
+                    .get("Subject")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| s.eq_ignore_ascii_case(&hex::encode(tx.account)));
+                if !subject_is_sender {
+                    return TxResult::BadCredentials;
+                }
+                const LSF_ACCEPTED: u64 = 0x0001_0000;
+                if cred.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & LSF_ACCEPTED == 0 {
+                    return TxResult::BadCredentials;
+                }
+            }
+        }
 
         // If destination doesn't exist, amount must meet reserve
         let dest = match Self::destination(tx) {
@@ -2518,6 +2565,15 @@ impl PaymentTransactor {
         // reserve; IOU is the trust-line holding). A sender with nothing to
         // spend is a dry path regardless of book or AMM depth.
         let spend_avail = ox::available(sandbox, &tx.account, &spend_leg);
+        // Findings 285/287: rippled's flow iterates again only while SendMax
+        // has budget left (StrandFlow `flow()`: remainingIn > 0 && remainingOut
+        // > 0). A pass capped by the sender's FUNDS leaves budget, so the next
+        // rev pass still steps the books past a pool-served slice and reaps
+        // what it finds (#106983955: SendMax 1e15 USD against a 29.99 line);
+        // a pass that spends SendMax itself ends the flow (#106989105's
+        // 5000000-drop SendMax, #106889388's 500 XRP). The walk reads this
+        // flag where its pool turn exhausts the input.
+        crate::tx::amm_swap::set_flow_funds_bound(ox::me_cmp(spend_avail, spend0).is_lt());
         // Finding 252 (see apply_iou_direct): an XRP sender with nothing to
         // spend is a zero FLOW — the XRPEndpointStep has no funds check at
         // build — judged by the flag: tecPATH_PARTIAL without tfPartialPayment

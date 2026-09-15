@@ -45,6 +45,8 @@ pub enum TxResult {
     Unfunded,
     /// No permission for this operation.
     NoPermission,
+    /// tecBAD_CREDENTIALS — a CredentialID that is missing, not the sender's, or not accepted (finding 286).
+    BadCredentials,
     NoIssuer,
     /// Object not found.
     NoEntry,
@@ -216,6 +218,7 @@ impl TxResult {
             | TxResult::PathDry
             | TxResult::Unfunded
             | TxResult::NoPermission
+            | TxResult::BadCredentials
             | TxResult::NoIssuer
             | TxResult::NoEntry
             | TxResult::NoTarget
@@ -284,6 +287,7 @@ impl TxResult {
             TxResult::PathDry => "tecPATH_DRY",
             TxResult::Unfunded => "tecUNFUNDED",
             TxResult::NoPermission => "tecNO_PERMISSION",
+            TxResult::BadCredentials => "tecBAD_CREDENTIALS",
             TxResult::TooSoon => "tecTOO_SOON",
             TxResult::NoIssuer => "tecNO_ISSUER",
             TxResult::NoEntry => "tecNO_ENTRY",

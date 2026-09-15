@@ -7418,6 +7418,39 @@ pub(crate) fn cross_engine_to_net(
             }
             crossed += used as u32;
             if done(rem_pays, rem_gets) {
+                // Finding 285 (#106983955 D4DD62F77155, rDsxqzXU paying itself
+                // 999999999999999 XRP for USD.rKiCet8 from a 29.99 USD line):
+                // the pool's slice at the tip's quality takes everything the
+                // taker HOLDS, but rippled's rev pass is sized by the strand's
+                // WANT (finding 114): it consumes r4L6ZLHk's tip whole in the
+                // sandbox, steps on, and permRmOffers rGSooBxyk's EXPIRED
+                // 657585B0C18C on the next level — offer, its emptied page
+                // 06725EA8BE24, the owner's count — before the DirectStep
+                // limits the strand to the 29.99. Finding 244 withdrew the
+                // stepping for a pool-served pass whose slice met the whole
+                // want (#106873753); the rule is the WANT: with output still
+                // wanted the stream steps onto the book exactly as after a
+                // CLOB-served pass. Mainnet 8 mutations, ours 4.
+                // ...and only when the FLOW will iterate again: rippled's loop
+                // runs while remainingIn (the SendMax budget) and remainingOut
+                // are both positive. #106983955's SendMax is 1e15 USD against
+                // a 29.99 line, so iteration 1's rev pass steps the book before
+                // the DirectStep finds nothing to spend; #106989105 CFDEA6E1A25E
+                // spends its whole 5000000-drop SendMax in iteration 0 and the
+                // flow ends there — rippled reaps nothing (finding 287).
+                // No known budget (#106889388's in-exhausted partial payment
+                // spends its whole SendMax): the flow does not iterate, so the
+                // stream does not step.
+                let budget_left = match gets_gross_cap {
+                    Some(cap) => !me_is_zero(rem_from_fold(cap, &saved_ins)),
+                    None => !offer_crossing && crate::tx::amm_swap::flow_funds_bound(),
+                };
+                if used && !me_is_zero(rem_pays) && budget_left {
+                    rev_extent_reap(
+                        sandbox, &dirs, di, if sell { None } else { Some(rem_pays) }, taker,
+                        beneficiary, pays_leg, gets_leg, offer_crossing, &mut oc0, stale,
+                    );
+                }
                 break 'dirs;
             }
             // ONE AMM CONSUMPTION PER PAYMENT-ENGINE ITERATION. "At any payment

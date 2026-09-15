@@ -830,3 +830,22 @@ fn payment_five_pool_path_rev_pass_escalates_past_a_sub_drop_rung_106921383() {
 fn payment_empty_book_page_is_no_level_the_pool_slice_beats_the_real_tip_106983394() {
     run_bundle(include_str!("vectors/payment_empty_book_page_is_no_level_the_pool_slice_beats_the_real_tip_106983394.json"));
 }
+
+/// Finding 285 (#106983955 D4DD62F77155): the pool's slice takes everything
+/// the taker holds, but the rev pass is sized by the want — it consumes the
+/// tip whole, steps to the next level and reaps the expired offer there
+/// (offer, emptied page, owner count) before the DirectStep limits the strand.
+#[test]
+fn payment_pool_served_pass_with_output_still_wanted_steps_the_book_and_reaps_the_expired_next_level_106983955() {
+    run_bundle(include_str!("vectors/payment_pool_served_pass_with_output_still_wanted_steps_the_book_and_reaps_the_expired_next_level_106983955.json"));
+}
+
+/// Finding 286 (#106988696 D9DC48A444E4): a Payment carrying CredentialIDs is
+/// judged by rippled's `credentials::valid` in preclaim — every id must exist,
+/// name the sender as Subject and be accepted — before any deposit-auth test.
+/// One of rwc9Dqir's five ids is a credential it ISSUED, not one it holds:
+/// tecBAD_CREDENTIALS, fee only.
+#[test]
+fn payment_credential_ids_must_name_the_sender_as_subject_and_be_accepted_106988696() {
+    run_bundle(include_str!("vectors/payment_credential_ids_must_name_the_sender_as_subject_and_be_accepted_106988696.json"));
+}

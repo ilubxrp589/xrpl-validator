@@ -112,6 +112,19 @@ thread_local! {
     // sender's line (finding 98), which rippled never touches.
     static SENDER_HOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+thread_local! {
+    /// Finding 285/287: does the strand's input cap come from the sender's
+    /// FUNDS (so rippled's flow iterates again — SendMax not yet spent — and
+    /// the next rev pass steps the book) or from SendMax itself (the flow
+    /// ends)? Set by the payment driver per strand pass.
+    static FLOW_FUNDS_BOUND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+pub(crate) fn set_flow_funds_bound(t: bool) {
+    FLOW_FUNDS_BOUND.with(|c| c.set(t));
+}
+pub(crate) fn flow_funds_bound() -> bool {
+    FLOW_FUNDS_BOUND.with(|c| c.get())
+}
 pub(crate) fn set_sender_hop(t: bool) {
     SENDER_HOP.with(|c| c.set(t));
 }
