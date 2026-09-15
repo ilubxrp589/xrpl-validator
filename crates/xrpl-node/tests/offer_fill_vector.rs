@@ -1387,7 +1387,6 @@ fn offer_exhausted_walk_rests_by_the_per_fill_fold_not_the_partial_level_list_10
 fn offer_direct_strand_rev_extent_reaps_the_unfunded_offer_behind_the_head_106983394() {
     run_bundle(include_str!("vectors/offer_direct_strand_rev_extent_reaps_the_unfunded_offer_behind_the_head_106983394.json"));
 }
-}
 
 /// Finding 288 (#106990975 36B71A8A3816): rMsXVzCug7's tfPassive 0.02447 BTC
 /// → 1907.06654 RLUSD, bridged through the BTC/XRP and XRP/RLUSD pools. The
