@@ -254,7 +254,11 @@ impl BookStep {
     fn tip(&self, sb: &PaymentSandbox) -> Option<(Quality, OfferType)> {
         let mut bt = BookTip::new(&self.book.input, &self.book.output, self.book.domain.as_ref());
         let lob_quality = if bt.peek(sb) { bt.quality() } else { None };
-        if let Some(amm) = self.amm_offer(sb, lob_quality) {
+        // `getAMMOffer(view, qualityThreshold)` — fixAMMv1_1: the crossing's
+        // `qualityThreshold(lobQuality)` (nullopt when the limit beats the
+        // tip under single path), a payment's is the tip itself.
+        let threshold = lob_quality.and_then(|lq| self.quality_threshold(lq, self.amm_multi_path()));
+        if let Some(amm) = self.amm_offer(sb, threshold) {
             if lob_quality.is_none_or(|lq| amm.quality.0 < lq.0) {
                 return Some((amm.quality, OfferType::Amm));
             }
@@ -631,7 +635,8 @@ impl Step for BookStep {
         let dir = self.debt_direction(sb, StrandDirection::Forward);
         let mut bt = BookTip::new(&self.book.input, &self.book.output, self.book.domain.as_ref());
         let lob_quality = if bt.peek(sb) { bt.quality() } else { None };
-        let amm = self.amm_offer(sb, lob_quality).filter(|a| lob_quality.is_none_or(|lq| a.quality.0 < lq.0));
+        let threshold = lob_quality.and_then(|lq| self.quality_threshold(lq, self.amm_multi_path()));
+        let amm = self.amm_offer(sb, threshold).filter(|a| lob_quality.is_none_or(|lq| a.quality.0 < lq.0));
         match amm {
             Some(a) => {
                 let Some(res) = a.amm.as_ref().and_then(|x| x.get_quality_func()) else { return (None, dir) };

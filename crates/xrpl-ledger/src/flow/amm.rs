@@ -207,7 +207,16 @@ impl AmmLiquidity {
         if inp.0 == 0 || out.0 == 0 {
             return None; // "no valid offer"
         }
-        let quality = quality_of_me(inp, out, self.asset_in.is_xrp(), self.asset_out.is_xrp())?;
+        // The offer's quality: `Quality{amounts}` for the Fibonacci and the
+        // changeSpotPriceQuality offers, but `Quality{balances}` — the SPOT
+        // price — for maxOffer (AMMLiquidity.cpp: `AMMOffer(*this,
+        // {swapAssetOut(balances, out), out}, balances, Quality{balances})`).
+        let is_max_offer = !multi && (clob_quality.is_none() || amm_swap::anchored_slice(sb, &self.amm, &pays_leg, &gets_leg, clob_quality.map(|q| q.0).unwrap_or(0)).is_none());
+        let quality = if is_max_offer {
+            quality_of_me(balances.0, balances.1, self.asset_in.is_xrp(), self.asset_out.is_xrp())?
+        } else {
+            quality_of_me(inp, out, self.asset_in.is_xrp(), self.asset_out.is_xrp())?
+        };
         Some(AmmOffer {
             owner: self.amm.account,
             asset_in: self.asset_in,
