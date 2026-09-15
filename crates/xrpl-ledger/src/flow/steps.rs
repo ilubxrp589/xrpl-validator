@@ -81,7 +81,7 @@ pub struct FlowError(pub TxResult);
 /// stream (`permRmOffer`) that are removed from the base view after the
 /// flow whether or not the strand succeeded (StrandFlow.h "rm bad offers
 /// even if the strand fails").
-pub type OffersToRemove = BTreeSet<Hash256>;
+pub type OffersToRemove = BTreeSet<[u8; 32]>;
 
 /// rippled `Step`. Amounts cross the boundary as `EitherAmount`; each
 /// implementation works in its own (TIn, TOut) types (`StepImp`).

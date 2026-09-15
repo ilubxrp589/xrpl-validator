@@ -19,6 +19,7 @@
 //!      judge, toStrands) and the Payment dispatch; then OfferCreate's
 //!      crossing.
 pub mod amounts;
+pub mod book_step;
 pub mod offer_stream;
 pub mod payment_sandbox;
 pub mod quality_function;

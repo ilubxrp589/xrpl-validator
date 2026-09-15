@@ -69,6 +69,27 @@ impl BookTip {
         self.quality
     }
 
+    /// A read-only `step` from a fresh cursor — what `BookStep::tip` does
+    /// on its scratch `Sandbox`: the first entry of the first non-empty
+    /// page, nothing deleted. Returns false for an empty book.
+    pub fn peek(&mut self, ps: &PaymentSandbox) -> bool {
+        loop {
+            let Some(first_page) = succ_in_book(ps.sandbox(), &self.base, &self.book, &self.end) else {
+                return false;
+            };
+            if let Some((page, index)) = dir_first(ps.sandbox(), &first_page) {
+                self.dir = Some(page);
+                self.index = Some(index);
+                self.entry = read_offer(ps.sandbox(), &index);
+                self.quality = Some(Quality(page_quality(&first_page)));
+                self.book = first_page;
+                dec_key(&mut self.book);
+                return true;
+            }
+            self.book = first_page;
+        }
+    }
+
     /// `BookTip::step`: delete the offer the cursor sits on (it has been
     /// consumed or judged dead — "BookTip::step deletes the current offer
     /// from the view before advancing"), then move to the first entry of
@@ -136,6 +157,9 @@ impl StepCounter {
     pub fn new(limit: u32) -> StepCounter {
         StepCounter { limit, count: 0 }
     }
+    pub fn count(&self) -> u32 {
+        self.count
+    }
     /// `StepCounter::step`: false once the limit is reached.
     pub fn step(&mut self) -> bool {
         if self.count >= self.limit {
@@ -173,6 +197,11 @@ impl Offer {
             amount_in: either(e.asset_in.is_xrp(), e.taker_pays),
             amount_out: either(e.asset_out.is_xrp(), e.taker_gets),
         }
+    }
+
+    /// `TOffer::isFunded`: the owner is the OUT issuer — unlimited funds.
+    pub fn is_funded(&self) -> bool {
+        self.asset_out.issuer == Some(self.owner)
     }
 
     /// `fully_consumed`: nothing more can flow through this offer.
@@ -335,6 +364,12 @@ impl FlowOfferStream {
     /// `FlowOfferStream::permToRemove`.
     pub fn perm_to_remove(&self) -> &[Hash256] {
         &self.perm_to_remove
+    }
+
+    /// `permRmOffer` as `forEachOffer` calls it (self-cross, unauthorised
+    /// owner).
+    pub fn perm_rm_offer_pub(&mut self, key: Hash256) {
+        self.perm_rm_offer(key);
     }
 
     /// `FlowOfferStream::permRmOffer`: recorded, not deleted here — the
