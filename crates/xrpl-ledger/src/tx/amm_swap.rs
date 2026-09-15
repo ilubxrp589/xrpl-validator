@@ -119,6 +119,52 @@ thread_local! {
     /// ends)? Set by the payment driver per strand pass.
     static FLOW_FUNDS_BOUND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+thread_local! {
+    /// Finding 290: whether the LAST pool offer `consume` generated was
+    /// `changeSpotPriceQuality`'s — priced at the CLOB tip's quality
+    /// (`execOffer`'s `*ofrQ != offer.quality()` then admits the tip) —
+    /// as opposed to the spot-priced maxOffer / limit-anchored offer.
+    static POOL_OFFER_AT_TIP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// Finding 290 (second half): would the pool hand `getOffer` an offer on
+/// its CURRENT balances against the CLOB quality `clob`? This decides what
+/// the NEXT flow iteration's rev pass does at this level: with an AMM
+/// offer, `tryAMM` executes it and `execOffer(tip)` then fails the
+/// same-quality test — the pass ends at the pool and the stream never
+/// steps; with none ("changeSpotPrice calc failed", or a maxOffer no
+/// better than the tip), the CLOB tip is consumed by the want and the
+/// stream steps past it, reaping what it finds (finding 285's specimen).
+pub(crate) fn pool_would_offer_again(sandbox: &Sandbox, amm: &Amm, pays_leg: &Leg, gets_leg: &Leg, clob: u64) -> bool {
+    if amm_ctx_exhausted() {
+        return false;
+    }
+    let spot = spot_upper_bound(sandbox, amm, pays_leg, gets_leg);
+    if spot == 0 || spot >= clob {
+        return false; // "higher clob quality"
+    }
+    // `withinRelativeDistance(spotPriceQ, clobQuality, Number(1, -7))`:
+    // (worse.rate − better.rate) / worse.rate < 1e-7 — the spot (better,
+    // smaller rate) against the tip.
+    {
+        let (rs, rb) = (decode_rate(spot), decode_rate(clob));
+        let diff = n_sub(rb, rs, Rnd::Near);
+        let rel = n_div(diff, rb, Rnd::Near);
+        if n_cmp(rel, (1_000_000_000_000_000, -22)) == Ordering::Less {
+            return false;
+        }
+    }
+    if anchored_slice(sandbox, amm, pays_leg, gets_leg, clob).is_some() {
+        return true;
+    }
+    max_offer(sandbox, amm, pays_leg, gets_leg).is_some_and(|(i, o)| rate_of(i, o) < clob)
+}
+
+pub(crate) fn set_pool_offer_at_tip(t: bool) {
+    POOL_OFFER_AT_TIP.with(|c| c.set(t));
+}
+pub(crate) fn pool_offer_at_tip() -> bool {
+    POOL_OFFER_AT_TIP.with(|c| c.get())
+}
 pub(crate) fn set_flow_funds_bound(t: bool) {
     FLOW_FUNDS_BOUND.with(|c| c.set(t));
 }
@@ -2026,6 +2072,7 @@ pub(crate) fn consume(
         }
         swap_asset_out(pool_in, pool_out, out, amm.tfee, gets_leg.xrp).map(|i| (i, out))
     };
+    set_pool_offer_at_tip(false);
     let offer = if limit_anchor && threshold != u64::MAX {
         // StrandFlow::limitOut: out from the strand's QualityFunction at the
         // limit, then AMMOffer::limitOut re-swaps it for the in. The
@@ -2050,6 +2097,16 @@ pub(crate) fn consume(
     let Some((mut take_in, mut take_out)) = offer else {
         return (rem_pays, rem_gets, false);
     };
+    // Finding 290: `forEachOffer` sets `ofrQ` to the AMM offer's OWN
+    // `Quality{amounts}` and then runs `execOffer` on the CLOB tip, whose
+    // first test is `*ofrQ != offer.quality() → return false`. The stream
+    // goes on into the book after a pool offer only when that offer's
+    // quality — of the amounts as GENERATED, before any clamp — equals the
+    // tip's encoded quality. changeSpotPriceQuality's offer is priced
+    // BETWEEN the spot and the tip (#106992486: 459164192.94 ATM for
+    // 2395603301 drops = 0.19166 against a 0.19909 tip), so it usually
+    // does not; finding 285's did.
+    set_pool_offer_at_tip(clob.is_some_and(|qb| rate_of(take_in, take_out) == qb));
     // Single-path limit semantics: the binding limit is re-swapped directly
     // against the pool (AMMOffer::limitOut / limitIn). For a tfSell offer the
     // pays side (rem_pays) is only a minimum, not a cap — the taker takes the

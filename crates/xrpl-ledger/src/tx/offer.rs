@@ -7506,7 +7506,42 @@ pub(crate) fn cross_engine_to_net(
                     Some(cap) => !me_is_zero(rem_from_fold(cap, &saved_ins)),
                     None => !offer_crossing && crate::tx::amm_swap::flow_funds_bound(),
                 };
-                if used && !me_is_zero(rem_pays) && budget_left {
+                // Finding 290 (#106992486 1E418A4F5724, rDireAucG's partial
+                // self-payment of a sentinel XRP amount for 226662 ATM through
+                // the ATM/XRP pool): ...and only when the pool's offer sat AT
+                // this level's quality. `forEachOffer` runs `execOffer` on the
+                // CLOB tip right after the AMM offer, and its first test is
+                // `*ofrQ != offer.quality() → return false` (BookStep.cpp:
+                // 757-760): `ofrQ` is the AMM offer's quality, so a pool
+                // offer priced off the tip — the spot-priced maxOffer here,
+                // 459164192.94 ATM for 2395603301 drops against a 540711e7
+                // tip — ends the pass at the AMM with the tip untouched and
+                // nothing stepped (rippled: no "Removing", 4 mutations). Only
+                // the anchored offer (changeSpotPriceQuality, quality == the
+                // tip's — finding 285's specimen) lets the stream consume the
+                // tip and step past it (`pool_offer_at_tip`, set by the
+                // consumption that chose `changeSpotPriceQuality`'s offer;
+                // the realised slice rate is NOT the test — finding 285's
+                // funds-clamped slice lands off the level's encoded rate).
+                // We stepped on the budget alone,
+                // consumed c43ce18c's tip whole in the scan and reaped
+                // fbda64e9's expired FC1110C8 with its page: 8 mutations.
+                // Finding 290, the rule as rippled's next iteration runs it:
+                // the pool is asked AGAIN on its post-slice balances. An offer
+                // (#106992486: changeSpotPriceQuality succeeds, 458941973.19
+                // ATM for 2394399550 drops) means `tryAMM` executes it and
+                // `execOffer(tip)` fails `*ofrQ != offer.quality()` — the
+                // pass ends at the pool, nothing stepped, 4 mutations. No
+                // offer (#106983955: "changeSpotPrice calc failed") means the
+                // CLOB tip is consumed by the want and the stream steps past
+                // it — finding 285's reap of the expired next level.
+                let pool_again = amm
+                    .as_ref()
+                    .is_some_and(|a| crate::tx::amm_swap::pool_would_offer_again(sandbox, a, pays_leg, gets_leg, q));
+                if std::env::var("DX_REV").is_ok() {
+                    eprintln!("DX_REV F285-site used={used} pool_again={pool_again} rem_pays={rem_pays:?} rem_gets={rem_gets:?} budget_left={budget_left}");
+                }
+                if used && !pool_again && !me_is_zero(rem_pays) && budget_left {
                     rev_extent_reap(
                         sandbox, &dirs, di, if sell { None } else { Some(rem_pays) },
                         if sell && !offer_crossing { Some(rem_gets) } else { None }, taker,
@@ -7554,6 +7589,9 @@ pub(crate) fn cross_engine_to_net(
         let mut level_crossed = false;
         if std::env::var("DX_BOOK").is_ok() {
             eprintln!("DX_BOOK dir q={q:016x} threshold={threshold:016x} cross={} attempt_beyond={attempt_beyond}", q <= threshold);
+        }
+        if std::env::var("DX_REV").is_ok() {
+            eprintln!("DX_REV level-entry site q={q:016x} rem_pays={rem_pays:?} rem_gets={rem_gets:?} sell={sell}");
         }
         // Finding 114: rippled's rev pass steps this level by the WANT, not by
         // the taker's funds — reap what that stepping reaches before the funded

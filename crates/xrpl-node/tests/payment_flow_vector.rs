@@ -863,3 +863,18 @@ fn payment_credential_ids_must_name_the_sender_as_subject_and_be_accepted_106988
 fn payment_in_driven_fwd_pass_stops_at_a_trimmed_head_offer_106991212() {
     run_bundle(include_str!("vectors/payment_in_driven_fwd_pass_stops_at_a_trimmed_head_offer_106991212.json"));
 }
+
+/// Finding 290 (#106992486 1E418A4F5724): rDireAucG's partial self-payment
+/// of a sentinel XRP amount for 226662 ATM through the ATM/XRP pool. The
+/// pool's changeSpotPriceQuality offer is priced between the spot and the
+/// tip, so `execOffer(tip)` fails `*ofrQ != offer.quality()` right after it
+/// and the pass ends at the pool with nothing stepped — and the next
+/// iteration's pool offers again, so the stream never reaches the expired
+/// FC1110C8 behind the tip. Finding 285's rule (step the book after a
+/// pool-served pass while the SendMax budget lasts) fired on the budget
+/// alone and reaped it: the three pins hold the offer, its page and the
+/// owner's root untouched.
+#[test]
+fn payment_pool_that_offers_again_ends_the_pass_at_the_pool_no_stepping_106992486() {
+    run_bundle(include_str!("vectors/payment_pool_that_offers_again_ends_the_pass_at_the_pool_no_stepping_106992486.json"));
+}
