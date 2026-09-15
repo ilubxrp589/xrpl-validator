@@ -49,6 +49,10 @@ impl AmmContext {
     pub fn set_amm_used(&mut self) {
         self.amm_used = true;
     }
+    /// `clear()`: reset the used flag before a strand runs.
+    pub fn clear(&mut self) {
+        self.amm_used = false;
+    }
     /// `update()`: once per payment-engine iteration.
     pub fn update(&mut self) {
         if self.amm_used {

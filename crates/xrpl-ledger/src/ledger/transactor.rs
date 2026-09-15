@@ -58,6 +58,12 @@ pub enum TxResult {
     Killed,
     /// tecINVARIANT_FAILED — an AMM offer whose pool product would fall (fixAMMOverflowOffer).
     InvariantFailed,
+    /// temBAD_PATH
+    BadPath,
+    /// terNO_RIPPLE
+    NoRipple,
+    /// temRIPPLE_EMPTY
+    RippleEmpty,
     /// Placement would exceed the owner reserve.
     InsufReserveOffer,
     /// Offer is unfunded at apply time.
@@ -296,6 +302,9 @@ impl TxResult {
             TxResult::NoTarget => "tecNO_TARGET",
             TxResult::Killed => "tecKILLED",
             TxResult::InvariantFailed => "tecINVARIANT_FAILED",
+            TxResult::BadPath => "temBAD_PATH",
+            TxResult::NoRipple => "terNO_RIPPLE",
+            TxResult::RippleEmpty => "temRIPPLE_EMPTY",
             TxResult::InsufReserveOffer => "tecINSUF_RESERVE_OFFER",
             TxResult::UnfundedOffer => "tecUNFUNDED_OFFER",
             TxResult::Expired => "tecEXPIRED",
