@@ -286,11 +286,13 @@ pub fn xrp_liquid(ps: &PaymentSandbox, account: &[u8; 20], owner_count_adj: i64)
     let counts = ps.owner_count_hook(account, owner_counts(sb, account));
     let count = (counts.count() as i64 + owner_count_adj).max(0) as u64;
     let reserve = crate::ledger::fees::account_reserve(sb, count) as i128;
-    // `xrpLiquid`: fullBalance − reserve, then `balanceHook(account,
-    // xrpAccount(), balance)` clamps by the deferred credits, floor zero.
-    let liquid = balance - reserve;
-    let hooked = ps.balance_hook_xrp(account, liquid);
-    if hooked < 0 { 0 } else { hooked }
+    // `xrpLiquid`: `balance = balanceHook(id, xrpAccount(), fullBalance)`
+    // FIRST — the deferred credits clamp the FULL balance to what it was
+    // when the flow opened — then `balance < reserve ? 0 : balance −
+    // reserve` (finding 192's rule: the sender's own offer is funded from
+    // the original balance alone).
+    let hooked = ps.balance_hook_xrp(account, balance);
+    if hooked < reserve { 0 } else { hooked - reserve }
 }
 
 /// `accountFunds` for an offer owner selling `asset` (OfferStream's

@@ -143,7 +143,14 @@ fn dec_key(k: &mut Hash256) {
 pub fn offer_delete(ps: &mut PaymentSandbox, key: &Hash256) {
     let Some(offer) = json_at(ps.sandbox(), key) else { return };
     let Some(owner) = offer.get("Account").and_then(|v| v.as_str()).and_then(decode20) else { return };
+    // `adjustOwnerCount` → `view.adjustOwnerCountHook(id, cur, next)`: the
+    // PaymentSandbox remembers the HIGHER count, so the owner's reserve —
+    // and with it `xrpLiquid` — holds at the flow's original count even
+    // after this deletion (the maker's XRP funds do not grow mid-flow).
+    let cur = super::view::owner_counts(ps.sandbox(), &owner);
     crate::tx::offer::delete_maker_offer(ps.view(), key, &offer, &owner);
+    let next = super::view::owner_counts(ps.sandbox(), &owner);
+    ps.adjust_owner_count_hook(&owner, cur, next);
 }
 
 /// `StepCounter`: the per-transaction budget of stream steps (1000 for a
