@@ -319,10 +319,14 @@ pub fn transfer_rate(sb: &Sandbox, issuer: &[u8; 20]) -> u32 {
 /// `getBookBase(book)`: the 24-byte prefix every page of a book shares.
 pub fn book_base(input: &Asset, output: &Asset, domain: Option<&Hash256>) -> Hash256 {
     let (pi, gi) = (input.issuer.unwrap_or([0; 20]), output.issuer.unwrap_or([0; 20]));
-    match domain {
+    let mut k = match domain {
         Some(d) => keylet::book_base_domain(&input.currency, &output.currency, &pi, &gi, d),
         None => keylet::book_base(&input.currency, &output.currency, &pi, &gi),
-    }
+    };
+    // `getBookBase` returns `getQualityIndex(hash)`: the low 64 bits — the
+    // quality — zeroed, so `succ(base, next)` starts BEFORE the best page.
+    k.0[24..32].copy_from_slice(&[0u8; 8]);
+    k
 }
 
 /// `view.succ(key, last)`: the first existing key strictly greater than
@@ -330,6 +334,9 @@ pub fn book_base(input: &Asset, output: &Asset, domain: Option<&Hash256>) -> Has
 /// pages are the only keys under that prefix.
 pub fn succ_in_book(sb: &Sandbox, base: &Hash256, key: &Hash256, last: &Hash256) -> Option<Hash256> {
     let mut keys = sb.keys_with_prefix(&base.0[..24]);
+    if std::env::var("XRPL_FLOW_TRACE").is_ok() {
+        eprintln!("FLOW   succ base={} keys={} after={} last={} first_key={}", hex::encode(base.0), keys.len(), hex::encode(key.0), hex::encode(last.0), keys.first().map(|k| hex::encode(k.0)).unwrap_or_default());
+    }
     keys.sort_by(|a, b| a.0.cmp(&b.0));
     keys.into_iter().find(|k| k.0 > key.0 && k.0 < last.0)
 }
@@ -360,7 +367,11 @@ pub fn quality_next(base: &Hash256) -> Hash256 {
 pub fn dir_first(sb: &Sandbox, root: &Hash256) -> Option<(Hash256, Hash256)> {
     let mut page_key = *root;
     for _ in 0..10_000 {
-        let page = json_at(sb, &page_key)?;
+        let page = json_at(sb, &page_key);
+        if std::env::var("XRPL_FLOW_TRACE").is_ok() {
+            eprintln!("FLOW   dir_first page={} present={} indexes={:?}", hex::encode(&page_key.0[24..]), page.is_some(), page.as_ref().and_then(|p| p.get("Indexes")).map(|v| v.to_string().chars().take(80).collect::<String>()));
+        }
+        let page = page?;
         if let Some(first) = page.get("Indexes").and_then(|v| v.as_array()).and_then(|a| a.first()) {
             let k = first.as_str().and_then(|s| hex::decode(s).ok()).and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())?;
             return Some((page_key, Hash256(k)));
@@ -400,8 +411,17 @@ fn amount_asset(v: &serde_json::Value) -> Option<Asset> {
         return Some(Asset::XRP);
     }
     let cur = v.get("currency").and_then(|c| c.as_str()).and_then(|s| {
-        let raw = hex::decode(s).ok()?;
-        <[u8; 20]>::try_from(raw.as_slice()).ok()
+        if s.len() == 40 {
+            let raw = hex::decode(s).ok()?;
+            <[u8; 20]>::try_from(raw.as_slice()).ok()
+        } else if s.len() == 3 && s != "XRP" {
+            // A standard three-letter code: bytes 12..15 of the 20-byte form.
+            let mut c = [0u8; 20];
+            c[12..15].copy_from_slice(s.as_bytes());
+            Some(c)
+        } else {
+            None
+        }
     })?;
     let issuer = v.get("issuer").and_then(|i| i.as_str()).and_then(decode20)?;
     Some(Asset { currency: cur, issuer: Some(issuer) })

@@ -103,7 +103,11 @@ impl AmmLiquidity {
     pub fn discover(sb: &Sandbox, ctx: &SharedAmmContext, asset_in: &Asset, asset_out: &Asset) -> Option<AmmLiquidity> {
         let (li, lo) = (leg(asset_in), leg(asset_out));
         let key = keylet::amm_key(&li.cur, &li.issuer, &lo.cur, &lo.issuer);
-        let obj = json_at(sb, &key)?;
+        let obj = json_at(sb, &key);
+        if std::env::var("XRPL_FLOW_TRACE").is_ok() {
+            eprintln!("FLOW   amm discover key={} present={} lpt={:?}", hex::encode(&key.0[..12]), obj.is_some(), obj.as_ref().and_then(|o| o.get("LPTokenBalance")).map(|v| v.to_string()).unwrap_or_default());
+        }
+        let obj = obj?;
         if obj.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("AMM") {
             return None;
         }
@@ -148,10 +152,21 @@ impl AmmLiquidity {
 
     /// `AMMLiquidity::getOffer(view, clobQuality)`.
     pub fn get_offer(&self, sb: &Sandbox, clob_quality: Option<Quality>) -> Option<AmmOffer> {
+        let r = self.get_offer_inner(sb, clob_quality);
+        if std::env::var("XRPL_FLOW_TRACE").is_ok() {
+            eprintln!("FLOW   amm getOffer clob={:?} multi={} iters={} -> {}", clob_quality.map(|q| format!("{:x}", q.0)), self.ctx.borrow().multi_path(), self.ctx.borrow().cur_iters(), r.as_ref().map(|o| format!("in={} out={} q={:x}", o.amount_in, o.amount_out, o.quality.0)).unwrap_or_else(|| "none".into()));
+        }
+        r
+    }
+
+    fn get_offer_inner(&self, sb: &Sandbox, clob_quality: Option<Quality>) -> Option<AmmOffer> {
         if self.ctx.borrow().max_iters_reached() {
             return None;
         }
         let balances = self.fetch_balances(sb);
+        if std::env::var("XRPL_FLOW_TRACE").is_ok() {
+            eprintln!("FLOW   amm balances in={:?} out={:?} initial={:?}", balances.0, balances.1, self.initial_balances);
+        }
         if balances.0 .0 == 0 || balances.1 .0 == 0 {
             return None; // "frozen accounts"
         }

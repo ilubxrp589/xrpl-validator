@@ -273,3 +273,12 @@ mod tests {
         assert!(iou(-3, 0) < IouAmount::ZERO);
     }
 }
+
+impl core::fmt::Display for EitherAmount {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            EitherAmount::Xrp(d) => write!(f, "{d}drops"),
+            EitherAmount::Iou(a) => write!(f, "{}{}e{}", if a.negative { "-" } else { "" }, a.mantissa, a.exponent),
+        }
+    }
+}

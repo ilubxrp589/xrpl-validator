@@ -475,14 +475,19 @@ impl FlowOfferStream {
             // there — erase the directory entry (`erase(view_)`,
             // `erase(cancelView_)`).
             let Some(entry) = self.tip.entry().cloned() else {
+                if std::env::var("XRPL_FLOW_TRACE").is_ok() {
+                    eprintln!("FLOW   stream: {} missing (directory names no readable offer) — erasing the entry", hex::encode(&index.0[..6]));
+                }
                 if let Some(dir) = self.tip.dir() {
                     erase_dir_entry(ps, &dir, &index);
                 }
                 continue;
             };
+            let tr = std::env::var("XRPL_FLOW_TRACE").is_ok();
             // Remove if expired: `Expiration <= parentCloseTime`.
             if let Some(exp) = entry.expiration {
                 if exp <= self.expire {
+                    if tr { eprintln!("FLOW   stream: {} expired ({exp} <= {})", hex::encode(&index.0[..6]), self.expire); }
                     self.perm_rm_offer(index);
                     continue;
                 }
@@ -491,12 +496,14 @@ impl FlowOfferStream {
             let offer = Offer::from_entry(&entry, quality);
             // Remove if either amount is zero ("Removing bad offer").
             if offer.amount_in.is_zero() || offer.amount_out.is_zero() {
+                if tr { eprintln!("FLOW   stream: {} bad offer (zero amount)", hex::encode(&index.0[..6])); }
                 self.perm_rm_offer(index);
                 self.offer = None;
                 continue;
             }
             // Deep-frozen owner on the IN side: removed.
             if is_deep_frozen(ps.sandbox(), &offer.owner, &offer.asset_in) {
+                if tr { eprintln!("FLOW   stream: {} deep frozen", hex::encode(&index.0[..6])); }
                 self.perm_rm_offer(index);
                 self.offer = None;
                 continue;
@@ -510,6 +517,7 @@ impl FlowOfferStream {
                 // "Found unfunded" (funds unchanged since the flow opened)
                 // is permanent; "became unfunded" is stepped past only.
                 let original = self.funds(ps, &offer, true);
+                if tr { eprintln!("FLOW   stream: {} unfunded funds={funds} original={original} owner={}", hex::encode(&index.0[..6]), hex::encode(&offer.owner[..6])); }
                 if original == funds {
                     self.perm_rm_offer(index);
                 }
@@ -519,6 +527,7 @@ impl FlowOfferStream {
             // `shouldRmSmallIncreasedQOffer`.
             if should_rm_small_increased_q_offer(&offer, funds) {
                 let original = self.funds(ps, &offer, true);
+                if tr { eprintln!("FLOW   stream: {} small increased-q offer funds={funds}", hex::encode(&index.0[..6])); }
                 if original == funds {
                     self.perm_rm_offer(index);
                 }

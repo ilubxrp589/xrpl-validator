@@ -71,13 +71,22 @@ pub fn flow_strand(sb: &mut PaymentSandbox, strand: &mut Strand, max_in: Option<
             i -= 1;
             let r = match strand[i].rev(sb, &mut ofrs_to_rm, &step_out) {
                 Ok(r) => r,
-                Err(_) => {
+                Err(e) => {
+                    if std::env::var("XRPL_FLOW_TRACE").is_ok() {
+                        eprintln!("FLOW rev step {i} error {:?}", e.0);
+                    }
                     sb.discard();
                     return fail(strand, ofrs_to_rm);
                 }
             };
+            if std::env::var("XRPL_FLOW_TRACE").is_ok() {
+                eprintln!("FLOW rev step {i} ({}) out_req={} -> in={} out={}", strand[i].log_string().split(':').next().unwrap_or(""), step_out, r.0, r.1);
+            }
             if is_zero(&r.1) {
                 // "Strand found dry in rev"
+                if std::env::var("XRPL_FLOW_TRACE").is_ok() {
+                    eprintln!("FLOW strand found dry in rev at step {i}");
+                }
                 sb.discard();
                 return fail(strand, ofrs_to_rm);
             }
@@ -108,6 +117,9 @@ pub fn flow_strand(sb: &mut PaymentSandbox, strand: &mut Strand, max_in: Option<
             } else if r.1 != step_out {
                 // Limiting: throw out the sandbox (and the all-funds view),
                 // re-execute this step at what it can give.
+                if std::env::var("XRPL_FLOW_TRACE").is_ok() {
+                    eprintln!("FLOW step {i} is limiting: re-executing rev at out={}", r.1);
+                }
                 sb.discard();
                 sb.push();
                 limiting_step = i;
@@ -121,10 +133,16 @@ pub fn flow_strand(sb: &mut PaymentSandbox, strand: &mut Strand, max_in: Option<
                 };
                 limit_step_out = r.1;
                 if is_zero(&r.1) {
+                    if std::env::var("XRPL_FLOW_TRACE").is_ok() {
+                        eprintln!("FLOW limiting step {i} found dry");
+                    }
                     sb.discard();
                     return fail(strand, ofrs_to_rm);
                 }
                 if r.1 != step_out {
+                    if std::env::var("XRPL_FLOW_TRACE").is_ok() {
+                        eprintln!("FLOW re-executed limiting step {i} failed: out={} wanted {}", r.1, step_out);
+                    }
                     sb.discard();
                     return fail(strand, ofrs_to_rm);
                 }
@@ -140,16 +158,28 @@ pub fn flow_strand(sb: &mut PaymentSandbox, strand: &mut Strand, max_in: Option<
         while i < s {
             let r = match strand[i].fwd(sb, &mut ofrs_to_rm, &step_in) {
                 Ok(r) => r,
-                Err(_) => {
+                Err(e) => {
+                    if std::env::var("XRPL_FLOW_TRACE").is_ok() {
+                        eprintln!("FLOW fwd step {i} error {:?}", e.0);
+                    }
                     sb.discard();
                     return fail(strand, ofrs_to_rm);
                 }
             };
+            if std::env::var("XRPL_FLOW_TRACE").is_ok() {
+                eprintln!("FLOW fwd step {i} ({}) in={} -> in={} out={}", strand[i].log_string().split(':').next().unwrap_or(""), step_in, r.0, r.1);
+            }
             if is_zero(&r.1) {
+                if std::env::var("XRPL_FLOW_TRACE").is_ok() {
+                    eprintln!("FLOW non-limiting step {i} found dry");
+                }
                 sb.discard();
                 return fail(strand, ofrs_to_rm);
             }
             if r.0 != step_in {
+                if std::env::var("XRPL_FLOW_TRACE").is_ok() {
+                    eprintln!("FLOW re-executed forward pass failed at step {i}: in={} wanted {}", r.0, step_in);
+                }
                 sb.discard();
                 return fail(strand, ofrs_to_rm);
             }
@@ -372,6 +402,9 @@ pub fn flow_strands(
                 }
             }
             let f = flow_strand(sb, &mut strands[si], remaining_in, limit_remaining_out, in_xrp, out_xrp);
+            if std::env::var("XRPL_FLOW_TRACE").is_ok() {
+                eprintln!("FLOW iter {} strand {} -> success={} in={:?} out={:?} inactive={} rm={}", cur_try - 1, si, f.success, f.input, f.out, f.inactive, f.ofrs_to_rm.len());
+            }
             // rm bad offers even if the strand fails
             ofrs_to_rm.extend(f.ofrs_to_rm.iter().copied());
             offers_considered += f.ofrs_used;

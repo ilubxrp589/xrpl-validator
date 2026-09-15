@@ -330,7 +330,17 @@ impl BookStep {
             }
         };
 
-        if offers.step(sb, &mut counter) {
+        let stepped = offers.step(sb, &mut counter);
+        if std::env::var("XRPL_FLOW_TRACE").is_ok() {
+            eprintln!(
+                "FLOW   book {}: amm={} tip={} perm_rm={}",
+                self.log_string(),
+                self.amm.is_some(),
+                offers.tip().map(|o| format!("{} q={:x} in={} out={}", hex::encode(&o.key.map(|k| k.0).unwrap_or([0; 32])[..6]), o.quality.0, o.amount_in, o.amount_out)).unwrap_or_else(|| "none".into()),
+                offers.perm_to_remove().len()
+            );
+        }
+        if stepped {
             let tip_q = offers.tip().map(|o| o.quality);
             if try_amm(self, sb, &mut offers, tip_q, &mut offer_attempted, &mut ofr_q, callback)? {
                 loop {

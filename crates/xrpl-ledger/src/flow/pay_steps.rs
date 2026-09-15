@@ -67,8 +67,15 @@ impl PathElement {
         let currency = v.get("currency").and_then(|x| x.as_str()).and_then(|s| {
             if s == "XRP" {
                 Some([0u8; 20])
-            } else {
+            } else if s.len() == 40 {
                 hex::decode(s).ok().and_then(|b| <[u8; 20]>::try_from(b.as_slice()).ok())
+            } else if s.len() == 3 {
+                // A standard currency code: bytes 12..15 of the 20-byte form.
+                let mut c = [0u8; 20];
+                c[12..15].copy_from_slice(s.as_bytes());
+                Some(c)
+            } else {
+                None
             }
         });
         let issuer = v.get("issuer").and_then(|x| x.as_str()).and_then(decode20);
@@ -85,6 +92,10 @@ impl PathElement {
         }
         Some(PathElement { node_type: t, account: account.unwrap_or([0; 20]), currency: currency.unwrap_or([0; 20]), issuer: issuer.unwrap_or([0; 20]) })
     }
+}
+
+fn trace() -> bool {
+    std::env::var("XRPL_FLOW_TRACE").is_ok()
 }
 
 fn is_xrp_id(id: &[u8; 20]) -> bool {
@@ -342,6 +353,9 @@ pub fn to_strand(sb: &PaymentSandbox, inputs: &StrandInputs, path: &[PathElement
             norm.push(PathElement::account(dst));
         }
     }
+    if trace() {
+        eprintln!("FLOW norm path: {}", norm.iter().map(|e| format!("[t{:x} a={} c={} i={}]", e.node_type, hex::encode(&e.account[..4]), hex::encode(&e.currency[..4]), hex::encode(&e.issuer[..4]))).collect::<Vec<_>>().join(" "));
+    }
     if norm.len() < 2 {
         return Err(TxResult::BadPath);
     }
@@ -453,7 +467,11 @@ pub fn to_strands(sb: &PaymentSandbox, inputs: &StrandInputs, paths: &[Vec<PathE
         }
     };
     if add_default_path {
-        match to_strand(sb, inputs, &[]) {
+        let r = to_strand(sb, inputs, &[]);
+        if trace() {
+            eprintln!("FLOW toStrand(default) -> {}", match &r { Ok(st) => format!("{} steps: {}", st.len(), st.iter().map(|x| x.log_string()).collect::<Vec<_>>().join(" | ")), Err(t) => format!("{t:?}") });
+        }
+        match r {
             Ok(strand) => {
                 if strand.is_empty() {
                     return Err(TxResult::FailedProcessing);
@@ -471,7 +489,11 @@ pub fn to_strands(sb: &PaymentSandbox, inputs: &StrandInputs, paths: &[Vec<PathE
     }
     let mut last_fail = TxResult::Success;
     for p in paths {
-        match to_strand(sb, inputs, p) {
+        let r = to_strand(sb, inputs, p);
+        if trace() {
+            eprintln!("FLOW toStrand(path {:?}) -> {}", p.iter().map(|e| format!("t{:x}", e.node_type)).collect::<Vec<_>>(), match &r { Ok(st) => format!("{} steps: {}", st.len(), st.iter().map(|x| x.log_string()).collect::<Vec<_>>().join(" | ")), Err(t) => format!("{t:?}") });
+        }
+        match r {
             Ok(strand) => {
                 if strand.is_empty() {
                     return Err(TxResult::FailedProcessing);
