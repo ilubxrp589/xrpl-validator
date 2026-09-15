@@ -24,6 +24,7 @@ pub mod book_step;
 pub mod direct_step;
 pub mod offer_stream;
 pub mod pay_steps;
+pub mod payment_flow;
 pub mod payment_sandbox;
 pub mod quality_function;
 pub mod st_amount;
