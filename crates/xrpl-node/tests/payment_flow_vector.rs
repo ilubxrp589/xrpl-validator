@@ -849,3 +849,17 @@ fn payment_pool_served_pass_with_output_still_wanted_steps_the_book_and_reaps_th
 fn payment_credential_ids_must_name_the_sender_as_subject_and_be_accepted_106988696() {
     run_bundle(include_str!("vectors/payment_credential_ids_must_name_the_sender_as_subject_and_be_accepted_106988696.json"));
 }
+
+/// Finding 289 (#106991212 0B722FF6EA7F): r9tcGwSyYP pays itself 0.071 RLUSD
+/// for 50000 drops, XRP → XUSD → USDC.axl → RLUSD, the first two hops
+/// pool-served. The last hop's forward pass carries 0.0710127 USDC.axl onto
+/// rpkHXWZu's 97.3 head offer: `fwdImp` trims the fill to the remaining
+/// input (`limitStepIn`, processMore = false) and the stream never steps.
+/// Our in-driven walk took no in-cap on its rev extent and trailed past the
+/// head after the fill, reaping rDeXHakZ's three dead offers and their pages
+/// — 17 mutations against mainnet's 9. The seven pins are untouched-object
+/// pins: the offers, their pages and the owner's root must stay as seated.
+#[test]
+fn payment_in_driven_fwd_pass_stops_at_a_trimmed_head_offer_106991212() {
+    run_bundle(include_str!("vectors/payment_in_driven_fwd_pass_stops_at_a_trimmed_head_offer_106991212.json"));
+}

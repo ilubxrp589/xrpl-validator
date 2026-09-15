@@ -2941,6 +2941,12 @@ fn rev_extent_reap(
     dirs: &[Hash256],
     di: usize,
     rev_out: Option<Me>,
+    // Finding 289: the IN side of the extent — a payment's fwd pass steps
+    // the book by what it carries in (`fwdImp`: `forEachOffer` runs while
+    // `remainingIn > 0`), so an offer is consumed whole only when the carry
+    // covers its whole (funded) TakerPays. `None` = uncapped (a sell's rev
+    // want, finding 239).
+    rev_in: Option<Me>,
     taker: &[u8; 20],
     beneficiary: &[u8; 20],
     pays_leg: &Leg,
@@ -2954,10 +2960,11 @@ fn rev_extent_reap(
     }
     let trace = std::env::var("DX_REV").is_ok();
     let mut rem = rev_out;
+    let mut rem_in = rev_in;
     // What the scan's whole consumptions took from each maker (F115).
     let mut consumed: std::collections::HashMap<[u8; 20], Me> = Default::default();
     if rev_scan_level(
-        sandbox, &dirs[di], &mut rem, &mut consumed, true, taker, beneficiary, pays_leg,
+        sandbox, &dirs[di], &mut rem, &mut rem_in, &mut consumed, true, taker, beneficiary, pays_leg,
         gets_leg, offer_crossing, oc0, stale, trace,
     ) {
         return;
@@ -2969,7 +2976,7 @@ fn rev_extent_reap(
             eprintln!("DX_REV step across to level {}", hex::encode(&dk2.0[24..]));
         }
         if rev_scan_level(
-            sandbox, dk2, &mut rem, &mut consumed, false, taker, beneficiary, pays_leg,
+            sandbox, dk2, &mut rem, &mut rem_in, &mut consumed, false, taker, beneficiary, pays_leg,
             gets_leg, offer_crossing, oc0, stale, trace,
         ) {
             return;
@@ -3003,6 +3010,7 @@ fn rev_scan_level(
     sandbox: &mut Sandbox,
     dk: &Hash256,
     rem: &mut Option<Me>,
+    rem_in: &mut Option<Me>,
     consumed: &mut std::collections::HashMap<[u8; 20], Me>,
     consume: bool,
     taker: &[u8; 20],
@@ -3109,7 +3117,14 @@ fn rev_scan_level(
                 return true;
             }
             let m_gives = if me_cmp(left, m_gives0).is_lt() { left } else { m_gives0 };
-            let whole = match *rem {
+            // Finding 289: what the whole (funded) offer takes IN — `ceilIn`
+            // of the funded gives at the offer's own rate.
+            let m_wants = if me_cmp(m_gives, m_gives0).is_lt() {
+                me_muldiv(m_wants0, m_gives, m_gives0, true)
+            } else {
+                m_wants0
+            };
+            let whole_out = match *rem {
                 None => true,
                 Some(r) if me_is_zero(r) => {
                     // Stepped onto with the want already met: refused untouched.
@@ -3120,6 +3135,17 @@ fn rev_scan_level(
                 }
                 Some(r) => me_cmp(m_gives, r).is_le(),
             };
+            let whole_in = match *rem_in {
+                None => true,
+                Some(r) if me_is_zero(r) => {
+                    if trace {
+                        eprintln!("DX_REV level={lvl} in spent at {}", hex::encode(okey.0));
+                    }
+                    return true;
+                }
+                Some(r) => me_cmp(m_wants, r).is_le(),
+            };
+            let whole = whole_out && whole_in;
             if trace {
                 eprintln!(
                     "DX_REV level={lvl} {} {} gives={m_gives:?} rem={rem:?}",
@@ -3132,6 +3158,9 @@ fn rev_scan_level(
             }
             if let Some(r) = *rem {
                 *rem = Some(me_sub(r, m_gives));
+            }
+            if let Some(r) = *rem_in {
+                *rem_in = Some(if me_cmp(r, m_wants).is_gt() { me_sub(r, m_wants) } else { (0, 0) });
             }
             consumed.insert(maker, stamount_signed_add(false, taken, false, m_gives).1);
         }
@@ -4831,7 +4860,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                     eprintln!("DX_REV extent enter bi={bi} dj={dj} sell={sell} rem_pays={rem_pays:?} crossed={crossed} lb_q={:x}", lb[bi].0);
                 }
                 rev_extent_reap(
-                    sandbox, &dirs_b, dj, if sell { None } else { Some(rem_pays) },
+                    sandbox, &dirs_b, dj, if sell { None } else { Some(rem_pays) }, None,
                     taker, beneficiary, pays_leg, &xrp_leg, true, &mut oc_b, stale,
                 );
             }
@@ -5208,7 +5237,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                             eprintln!("DX_REV direct extent enter di={di} dj={dj} sell={sell} rem_pays={rem_pays:?} crossed={crossed}");
                         }
                         rev_extent_reap(
-                            sandbox, &dirs_d, dj, if sell { None } else { Some(rem_pays) },
+                            sandbox, &dirs_d, dj, if sell { None } else { Some(rem_pays) }, None,
                             taker, beneficiary, pays_leg, gets_leg, true, &mut oc_d, stale,
                         );
                     }
@@ -7479,7 +7508,8 @@ pub(crate) fn cross_engine_to_net(
                 };
                 if used && !me_is_zero(rem_pays) && budget_left {
                     rev_extent_reap(
-                        sandbox, &dirs, di, if sell { None } else { Some(rem_pays) }, taker,
+                        sandbox, &dirs, di, if sell { None } else { Some(rem_pays) },
+                        if sell && !offer_crossing { Some(rem_gets) } else { None }, taker,
                         beneficiary, pays_leg, gets_leg, offer_crossing, &mut oc0, stale,
                     );
                 }
@@ -7528,8 +7558,20 @@ pub(crate) fn cross_engine_to_net(
         // Finding 114: rippled's rev pass steps this level by the WANT, not by
         // the taker's funds — reap what that stepping reaches before the funded
         // walk below sizes the fills (`rev_extent_reap`).
+        //
+        // Finding 289 (#106991212 0B722FF6EA7F, r9tcGwSyYP paying itself
+        // 0.071 RLUSD for 50000 drops, XRP → XUSD → USDC.axl → RLUSD, the
+        // first two hops pool-served): the last hop's fwd pass carries
+        // 0.0710127 USDC.axl onto the RLUSD book, where rpkHXWZu's head
+        // offer wants 97.3 — `fwdImp` fills a sliver of it and its stream
+        // never steps (`remainingIn` is spent). An in-driven walk here passed
+        // NO cap (`sell` → None, finding 239's sell-rev rule), consumed the
+        // head whole and stepped across three levels reaping rDeXHakZ's dead
+        // 9D93A8D8, 2D5A2C4F, DD06C71B with their pages: 17 mutations against
+        // mainnet's 9. A payment's in-driven pass is capped by its carry.
         rev_extent_reap(
-            sandbox, &dirs, di, if sell { None } else { Some(rem_pays) }, taker, beneficiary,
+            sandbox, &dirs, di, if sell { None } else { Some(rem_pays) },
+            if sell && !offer_crossing { Some(rem_gets) } else { None }, taker, beneficiary,
             pays_leg, gets_leg, offer_crossing, &mut oc0, stale,
         );
         let mut page_key_h = dk;
@@ -8492,7 +8534,20 @@ pub(crate) fn cross_engine_to_net(
                     // (offer + page deleted, root + dir modified, 7v11 for
                     // us). Only a trimmed fill that leaves the offer alive
                     // ends the walk here.
-                    if buy_bound && !consumed {
+                    // Finding 289 (#106991212 0B722FF6EA7F): the IN side too.
+                    // `fwdImp`'s callback consumes an offer whole while
+                    // `stpAmt.in <= remainingIn` ("consume the offer even if
+                    // stepAmt.in == remainingIn", processMore = true) and
+                    // stops — `limitStepIn`, processMore = false — the moment
+                    // an offer had to be trimmed to the remaining input. The
+                    // last hop of that self-payment carried 0.0710127
+                    // USDC.axl onto rpkHXWZu's 97.3 head: a sliver filled,
+                    // the offer alive, and rippled's stream never stepped;
+                    // ours trailed on and reaped rDeXHakZ's three dead
+                    // offers behind it. A fill clamped by EITHER of the
+                    // taker's sides that leaves the offer standing ends the
+                    // walk.
+                    if taker_clamped && !consumed {
                         break 'dirs;
                     }
                     // Finding 149: the pass that satisfied the taker is still
