@@ -560,9 +560,9 @@ pub fn limit_step_in(offer: &Offer, mut ofr_amt: StepAmounts, mut stp_amt: StepA
     if limit.lt(&stp_amt.input) {
         stp_amt.input = limit;
         let in_lmt = mul_ratio_either(stp_amt.input, QUALITY_ONE, tr_in, false);
-        // fixReducedOffersV2 is NOT on mainnet: the legacy `ceil_in`
-        // (`offer.limitIn`; the pool's offer re-prices).
-        let (i, o) = offer.limit_in(ofr_amt.input, ofr_amt.output, in_lmt);
+        // `offer.limitIn(ofrAmt, inLmt, roundUp = false)` — fixReducedOffersV2
+        // is live: `ceil_in_strict` rounding DOWN (the pool's offer re-prices).
+        let (i, o) = offer.limit_in(ofr_amt.input, ofr_amt.output, in_lmt, false);
         ofr_amt = StepAmounts { input: i, output: o };
         stp_amt.output = ofr_amt.output;
         owner_gives = mul_ratio_either(ofr_amt.output, tr_out, QUALITY_ONE, false);

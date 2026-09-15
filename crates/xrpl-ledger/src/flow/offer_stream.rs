@@ -218,10 +218,11 @@ impl Offer {
         }
     }
 
-    /// `AMMOffer::adjustRates`: the pool pays no transfer fee on either
-    /// side (fixAMMv1_1); a CLOB offer keeps the step's rates.
+    /// `AMMOffer::adjustRates`: "AMM doesn't pay transfer fee on Payment
+    /// tx" — the OUT rate is waived, the IN rate stays (AMMOffer.h:136-140);
+    /// a CLOB offer keeps both.
     pub fn adjust_rates(&self, ofr_in_rate: u32, ofr_out_rate: u32) -> (u32, u32) {
-        if self.amm.is_some() { (super::view::QUALITY_ONE, super::view::QUALITY_ONE) } else { (ofr_in_rate, ofr_out_rate) }
+        if self.amm.is_some() { (ofr_in_rate, super::view::QUALITY_ONE) } else { (ofr_in_rate, ofr_out_rate) }
     }
 
     /// `checkInvariant`: a CLOB offer always holds; the pool's product
@@ -273,12 +274,13 @@ impl Offer {
         }
     }
 
-    /// `TOffer::limitIn` (fixReducedOffersV2 is NOT on mainnet):
-    /// `m_quality.ceil_in(offrAmt, limit)`; the pool's offer re-prices.
-    pub fn limit_in(&self, amt_in: EitherAmount, amt_out: EitherAmount, limit: EitherAmount) -> (EitherAmount, EitherAmount) {
+    /// `TOffer::limitIn` — fixReducedOffersV2 IS live on mainnet (feature
+    /// RPC, 2026-09-15): `quality().ceil_in_strict(offrAmt, limit, roundUp)`;
+    /// the pool's offer re-prices.
+    pub fn limit_in(&self, amt_in: EitherAmount, amt_out: EitherAmount, limit: EitherAmount, round_up: bool) -> (EitherAmount, EitherAmount) {
         match &self.amm {
-            Some(a) => a.limit_in(amt_in, amt_out, limit),
-            None => ceil_in(self.quality, amt_in, amt_out, limit),
+            Some(a) => a.limit_in(amt_in, amt_out, limit, round_up),
+            None => ceil_in_strict(self.quality, amt_in, amt_out, limit, round_up),
         }
     }
 }

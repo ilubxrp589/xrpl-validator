@@ -273,11 +273,11 @@ impl AmmOffer {
         (inp, limit)
     }
 
-    /// `AMMOffer::limitIn`: multi-path `ceil_in` (fixReducedOffersV2 is
-    /// not on mainnet); single-path `swapAssetIn`.
-    pub fn limit_in(&self, amt_in: EitherAmount, amt_out: EitherAmount, limit: EitherAmount) -> (EitherAmount, EitherAmount) {
+    /// `AMMOffer::limitIn`: multi-path `ceil_in_strict` (fixReducedOffersV2
+    /// is live); single-path `swapAssetIn`.
+    pub fn limit_in(&self, amt_in: EitherAmount, amt_out: EitherAmount, limit: EitherAmount, round_up: bool) -> (EitherAmount, EitherAmount) {
         if self.multi_path {
-            return super::offer_stream::ceil_in(self.quality, amt_in, amt_out, limit);
+            return super::offer_stream::ceil_in_strict(self.quality, amt_in, amt_out, limit, round_up);
         }
         let out = amm_swap::swap_asset_in(me(self.balances_in), me(self.balances_out), me(limit), self.tfee, self.asset_out.is_xrp());
         (limit, either(self.asset_out.is_xrp(), out))
