@@ -2277,6 +2277,54 @@ fn canon_ptrs(v: &mut Value) {
     }
 }
 
+/// rippled's OTHER threading shape: a fixture node `[key, kind, post-image]`
+/// whose ModifiedNode carries FULL FinalFields but null PreviousFields — the
+/// write moved PreviousTxnID and nothing else. The fixture format keeps
+/// FinalFields only, so nullness of PreviousFields is lost; equality against
+/// the CURRENT base object recovers it exactly. Anything unreadable (no base
+/// object in the mirror, an unparseable key) is NOT a refresh.
+fn node_is_threading_refresh(state: &LedgerState, n: &Value) -> bool {
+    let judge = || -> Option<bool> {
+        let k = n[0].as_str()?;
+        let exp = n.get(2)?.clone();
+        let kb: [u8; 32] = hex::decode(k).ok().and_then(|b| b.as_slice().try_into().ok())?;
+        let old = state.state_map.lookup(&Hash256(kb))?;
+        let mut po: Value = serde_json::from_slice(&old).ok()?;
+        let mut pe = exp;
+        canon_ptrs(&mut po);
+        canon_ptrs(&mut pe);
+        // fixture FinalFields carry base58 addresses; the engine stores hex —
+        // same rewrite hydration applies.
+        hexify_addresses(&mut pe);
+        hexify_addresses(&mut po);
+        let strip = |v: &Value| -> Option<serde_json::Map<String, Value>> {
+            Some(
+                v.as_object()?
+                    .iter()
+                    .filter(|(k, _)| !k.starts_with("PreviousTxn") && k.as_str() != "index")
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            )
+        };
+        let (se, so) = (strip(&pe)?, strip(&po)?);
+        if std::env::var("DX_THREAD").is_ok() && se != so {
+            let d: Vec<String> = se
+                .iter()
+                .filter(|(fk, fv)| so.get(*fk) != Some(*fv))
+                .map(|(fk, fv)| format!("{fk}: exp={fv} base={:?}", so.get(fk)))
+                .chain(
+                    so.keys()
+                        .filter(|fk| !se.contains_key(*fk))
+                        .map(|fk| format!("{fk}: only-in-base")),
+                )
+                .collect();
+            eprintln!("DX_THREAD {} differs: {:?}", &k[..16], d);
+        }
+        Some(se == so)
+    };
+    judge().unwrap_or(false)
+}
+
 /// (hex_upper key, kind byte) set with no-op-Modified filtering (semantic JSON
 /// compare of pre vs post), matching the FFI leg's `build_ours_mutation_set`.
 fn native_mutset(
@@ -2380,6 +2428,41 @@ fn run() -> i32 {
     let order: Vec<String> = exp["tx_order"].as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
         .unwrap_or_else(|| txjson_map.keys().cloned().collect());
+
+    // Batch (BatchV1_1): the ledger records every inner transaction as its own
+    // entry — own hash, own metadata, the indices right after its outer — but
+    // rippled APPLIES it inside the outer's application, and so does
+    // BatchTransactor::do_apply. The inner entries are therefore skipped in
+    // the compare loop below (applying one standalone is rejected out of hand:
+    // tfInnerBatchTxn with Fee "0") and their expected mutations fold into
+    // their outer's, which is where our engine writes them.
+    //
+    // The link is RECOMPUTED, not read: a fixture's `tx_json` carries the
+    // transaction FIELDS only (fetch_ledger_fixture.py strips metaData), so no
+    // entry here has a ParentBatchID for `native_apply::batch_attribution` to
+    // read. rippled files each inner under the ordinary transaction id of its
+    // own serialization, which `batch_inner_ids` recomputes from the outer's
+    // RawTransactions — leg A names them the same way
+    // (`xrpl_ffi::batch_inner_ids` off the outer's blob).
+    //
+    // Ids the fixture does not carry are dropped: a mode that stops early
+    // (tfUntilFailure, tfOnlyOne) leaves its untried inners out of the ledger,
+    // and the kept list must stay index-aligned with the engine's per-inner
+    // results, which cover exactly the inners it ATTEMPTED.
+    let mut batch_skip: HashSet<String> = HashSet::new();
+    let mut batch_inners: HashMap<String, Vec<String>> = HashMap::new();
+    for h in &order {
+        let Some(txj) = txjson_map.get(h) else { continue };
+        if txj["TransactionType"].as_str() != Some("Batch") {
+            continue;
+        }
+        let ids: Vec<String> = xrpl_node::native_apply::batch_inner_ids(txj)
+            .into_iter()
+            .filter(|id| txmap.contains_key(id.as_str()))
+            .collect();
+        batch_skip.extend(ids.iter().cloned());
+        batch_inners.insert(h.to_uppercase(), ids);
+    }
 
     // Build native base state at seq-1 from account_info of every involved account.
     // parent_hash feeds the AMMCreate account derivation (ripesha over
@@ -2526,100 +2609,96 @@ fn run() -> i32 {
 
     for h in &order {
         let Some(txj) = txjson_map.get(h) else { continue };
+        if batch_skip.contains(&h.to_uppercase()) {
+            continue; // applied inside its outer Batch, attributed there
+        }
         let tx_type = txj["TransactionType"].as_str().unwrap_or("?").to_string();
         let net = &txmap[h];
         let net_ter = net["ter"].as_str().unwrap_or("?").to_string();
+        // The expected side of a Batch outer is its OWN metadata followed by
+        // its inners', in TransactionIndex order: rippled splits the record
+        // (the outer's entry carries only its fee and sequence) but applies
+        // them as one, and so does our engine — every key below reaches the
+        // state through this outer's mods. For every other transaction this
+        // is its own node list, unchanged.
+        let mut net_nodes: Vec<&Value> =
+            net["nodes"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
+        for ih in batch_inners.get(&h.to_uppercase()).map(Vec::as_slice).unwrap_or(&[]) {
+            if let Some(inner_net) = txmap.get(ih.as_str()) {
+                net_nodes.extend(inner_net["nodes"].as_array().into_iter().flatten());
+            }
+        }
         // Mainnet's meta lists nodes rippled merely TOUCHED — a ModifiedNode
         // carrying neither FinalFields nor PreviousFields, only a refreshed
         // PreviousTxnID (e.g. an issuer AccountRoot peeked during
-        // trustCreate). They record no state delta, and native does not model
-        // PreviousTxnID, so they are dropped here — symmetric with the
-        // no-op-Modified filtering `native_mutset` already applies to OUR
-        // side. Matching them would require an engine to bump a field rippled
-        // does not bump.
-        // Keys mainnet merely TOUCHED: a ModifiedNode carrying neither
-        // FinalFields nor PreviousFields, only a refreshed PreviousTxnID
-        // (e.g. an issuer AccountRoot peeked during trustCreate). They record
-        // no state delta and native does not model PreviousTxnID, so the key
-        // is excluded from BOTH sides — dropping it from mainnet's set alone
-        // would turn a legitimate native write into a phantom "extra".
-        let touched_only: HashSet<String> = net["nodes"].as_array()
-            .map(|a| {
-                a.iter()
-                    .filter(|n| n[1].as_u64() == Some(1))
-                    .filter(|n| {
-                        !n.get(2)
-                            .and_then(|f| f.as_object())
-                            .map(|o| o.keys().any(|k| k != "LedgerEntryType"))
-                            .unwrap_or(false)
-                    })
-                    .filter_map(|n| n[0].as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        // ...and the OTHER threading shape: a ModifiedNode carrying FULL
-        // FinalFields but null PreviousFields — rippled fills PreviousFields
-        // only when a field actually changed, so FinalFields == the base
-        // object means the write was a threading refresh (threadOwners:
-        // trustDelete threads BOTH owners' roots; #106065267 F9E4D516 redeems
-        // EXP to its issuer, the zeroed line is deleted, and the ISSUER's
-        // AccountRoot appears Modified with every field identical to the
-        // parent ledger — only PreviousTxnID moved). The fixture format keeps
-        // FinalFields, so nullness of PreviousFields is lost; equality
-        // against the base recovers it exactly. Symmetric with
-        // native_mutset's no-op-Modified filtering on OUR side.
-        let thread_touched: HashSet<String> = net["nodes"].as_array()
-            .map(|a| {
-                a.iter()
-                    .filter(|n| n[1].as_u64() == Some(1))
-                    .filter_map(|n| {
-                        let k = n[0].as_str()?;
-                        let exp = n.get(2)?.clone();
-                        let kb: [u8; 32] =
-                            hex::decode(k).ok().and_then(|b| b.as_slice().try_into().ok())?;
-                        let old = state.state_map.lookup(&Hash256(kb))?;
-                        let mut po: Value = serde_json::from_slice(&old).ok()?;
-                        let mut pe = exp;
-                        canon_ptrs(&mut po);
-                        canon_ptrs(&mut pe);
-                        // fixture FinalFields carry base58 addresses; the
-                        // engine stores hex — same rewrite hydration applies.
-                        hexify_addresses(&mut pe);
-                        hexify_addresses(&mut po);
-                        let strip = |v: &Value| -> Option<serde_json::Map<String, Value>> {
-                            Some(
-                                v.as_object()?
-                                    .iter()
-                                    .filter(|(k, _)| {
-                                        !k.starts_with("PreviousTxn") && k.as_str() != "index"
-                                    })
-                                    .map(|(k, v)| (k.clone(), v.clone()))
-                                    .collect(),
-                            )
-                        };
-                        let (se, so) = (strip(&pe)?, strip(&po)?);
-                        if std::env::var("DX_THREAD").is_ok() && se != so {
-                            let d: Vec<String> = se.iter()
-                                .filter(|(fk, fv)| so.get(*fk) != Some(*fv))
-                                .map(|(fk, fv)| format!("{fk}: exp={fv} base={:?}", so.get(fk)))
-                                .chain(so.keys().filter(|fk| !se.contains_key(*fk))
-                                    .map(|fk| format!("{fk}: only-in-base")))
-                                .collect();
-                            eprintln!("DX_THREAD {} differs: {:?}", &k[..16], d);
-                        }
-                        (se == so).then(|| k.to_string())
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let net_mut: HashSet<(String, u8)> = net["nodes"].as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|n| Some((n[0].as_str()?.to_string(), n[1].as_u64()? as u8)))
-                    .filter(|(k, b)| !touched_only.contains(k) && !(*b == 1 && thread_touched.contains(k)))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // trustCreate) — and, in the OTHER threading shape, nodes carrying
+        // FULL FinalFields but null PreviousFields: rippled fills
+        // PreviousFields only when a field actually changed, so FinalFields ==
+        // the base object means the write was a threading refresh
+        // (threadOwners: trustDelete threads BOTH owners' roots; #106065267
+        // F9E4D516 redeems EXP to its issuer, the zeroed line is deleted, and
+        // the ISSUER's AccountRoot appears Modified with every field identical
+        // to the parent ledger — only PreviousTxnID moved). The fixture format
+        // keeps FinalFields, so nullness of PreviousFields is lost; equality
+        // against the base recovers it exactly.
+        //
+        // Neither shape records a state delta and native does not model
+        // PreviousTxnID, so the key is excluded from BOTH sides — dropping it
+        // from mainnet's set alone would turn a legitimate native write into a
+        // phantom "extra". Both are symmetric with the no-op-Modified
+        // filtering `native_mutset` already applies to OUR side.
+        //
+        // The classification is per NODE, the exclusion per KEY: a key drops
+        // out only when NO source recorded a material change to it. Inside one
+        // metadata a key appears exactly once, so for every non-Batch
+        // transaction this is the rule the probe has always applied; across a
+        // Batch outer and its inners it stops one entry's threading refresh of
+        // a key ANOTHER entry really changed from erasing that key from the
+        // expected side.
+        let mut touched_only: HashSet<String> = HashSet::new();
+        let mut thread_touched: HashSet<String> = HashSet::new();
+        let mut material: HashSet<String> = HashSet::new();
+        for n in net_nodes.iter().copied() {
+            let Some(key) = n[0].as_str() else { continue };
+            if n[1].as_u64() != Some(1) {
+                material.insert(key.to_string());
+                continue;
+            }
+            // Judged for EVERY ModifiedNode, fieldless ones included, so
+            // DX_THREAD's report reads exactly as it did.
+            let refresh = node_is_threading_refresh(&state, n);
+            let has_fields = n
+                .get(2)
+                .and_then(|f| f.as_object())
+                .map(|o| o.keys().any(|k| k != "LedgerEntryType"))
+                .unwrap_or(false);
+            if !has_fields {
+                touched_only.insert(key.to_string());
+            } else if refresh {
+                thread_touched.insert(key.to_string());
+            } else {
+                material.insert(key.to_string());
+            }
+        }
+        for key in &material {
+            touched_only.remove(key);
+            thread_touched.remove(key);
+        }
+        // One key touched by several entries of the same batch folds to its
+        // NET effect, with leg A's rules (ffi_engine.rs `merged_expected`):
+        // Created wins over Modified, Created-then-Deleted is no entry at all.
+        // A single metadata names each key once, so this is the identity for
+        // every non-Batch transaction.
+        let net_mut: HashSet<(String, u8)> = xrpl_node::native_apply::fold_batch_mutset(
+            &net_nodes
+                .iter()
+                .copied()
+                .filter_map(|n| Some((n[0].as_str()?.to_string(), n[1].as_u64()? as u8)))
+                .filter(|(k, b)| {
+                    !touched_only.contains(k) && !(*b == 1 && thread_touched.contains(k))
+                })
+                .collect::<Vec<(String, u8)>>(),
+        );
 
         let e = agg.entry(tx_type.clone()).or_insert_with(TypeAgg::new);
 
@@ -2670,12 +2749,63 @@ fn run() -> i32 {
         // carry PreviousTxn*, so the per-tx compares are unaffected and the
         // truth-overlay below preserves the stamps; DX_THREADCHECK verifies
         // them against the real post-state at fixture end.
-        xrpl_ledger::ledger::threading::stamp_threading(
-            &mut mods,
-            &|k| state.state_map.lookup(k).map(|b| b.to_vec()),
-            h,
-            seq as u32,
-        );
+        //
+        // A Batch is threaded PER INNER: rippled applies each inner as its own
+        // transaction, so the objects an inner touched carry the INNER's hash
+        // and only the outer's own changes (its fee and sequence) carry the
+        // outer's. The ledger's inner hashes, in TransactionIndex order, pair
+        // with the engine's per-inner touched-key sets. Drain those on EVERY
+        // Batch outer, for the same staleness reason the per-inner results
+        // below are drained unconditionally — the cell is cleared at do_apply
+        // entry, so an outer that never got there would otherwise leave the
+        // PREVIOUS batch's sets for the next reader.
+        let inner_touched = if tx_type == "Batch" {
+            xrpl_ledger::tx::batch::take_inner_touched()
+        } else {
+            Vec::new()
+        };
+        match batch_inners.get(&h.to_uppercase()) {
+            Some(inners) => xrpl_ledger::ledger::threading::stamp_batch_threading(
+                &mut mods,
+                &|k| state.state_map.lookup(k).map(|b| b.to_vec()),
+                h,
+                seq as u32,
+                inners,
+                &inner_touched,
+            ),
+            None => xrpl_ledger::ledger::threading::stamp_threading(
+                &mut mods,
+                &|k| state.state_map.lookup(k).map(|b| b.to_vec()),
+                h,
+                seq as u32,
+            ),
+        }
+        // The inners ran inside our do_apply; their per-inner results come back
+        // through the ledger crate's thread-local, in the same order. Drained
+        // on EVERY Batch outer for the staleness reason above. A mismatch is
+        // the outer's DIVERGE-TER — ledger ENTRIES are what the SUMMARY
+        // counts, one per attempted outer, so an inner never opens its own
+        // line in the accounting.
+        let inner_results = if tx_type == "Batch" {
+            xrpl_ledger::tx::batch::take_inner_results()
+        } else {
+            Vec::new()
+        };
+        let mut inner_ter: Vec<String> = Vec::new();
+        for (i, ih) in
+            batch_inners.get(&h.to_uppercase()).map(Vec::as_slice).unwrap_or(&[]).iter().enumerate()
+        {
+            let want = txmap.get(ih.as_str()).and_then(|t| t["ter"].as_str()).unwrap_or("?");
+            let got = inner_results.get(i).map(String::as_str).unwrap_or("(not run)");
+            if got != want {
+                eprintln!(
+                    "  DIVERGE-TER {tx_type} {} INNER[{i}] {}   our_ter={got} net_ter={want}",
+                    &h[..12.min(h.len())],
+                    &ih[..12.min(ih.len())]
+                );
+                inner_ter.push(format!("{i}:{ih}:{got}!={want}"));
+            }
+        }
         if std::env::var("DX_THREADCHECK").is_ok() || std::env::var("DX_BYTECHECK").is_ok() {
             for (k, ent) in mods.iter() {
                 if !matches!(ent, SandboxEntry::Deleted) {
@@ -2813,12 +2943,12 @@ fn run() -> i32 {
                 }
             }
             let mut net_fields: HashMap<String, &Value> = HashMap::new();
-            if let Some(nodes) = net["nodes"].as_array() {
-                for n in nodes {
-                    if let (Some(k), Some(f)) = (n[0].as_str(), n.get(2)) {
-                        if f.is_object() {
-                            net_fields.insert(k.to_string(), f);
-                        }
+            // The outer's nodes followed by its inners' (see `net_nodes`): for
+            // a key several entries wrote, the LAST is the post-batch image.
+            for n in net_nodes.iter().copied() {
+                if let (Some(k), Some(f)) = (n[0].as_str(), n.get(2)) {
+                    if f.is_object() {
+                        net_fields.insert(k.to_string(), f);
                     }
                 }
             }
@@ -2873,9 +3003,13 @@ fn run() -> i32 {
         // contamination: every field the meta records is corrected to truth
         // before the next tx.
         let _ = apply_modifications(&mut state, mods);
-        if let Some(nodes) = net["nodes"].as_array() {
+        {
             let mut overlay: HashMap<Hash256, SandboxEntry> = HashMap::new();
-            for n in nodes {
+            // Inners included, in TransactionIndex order: a key several entries
+            // wrote ends at the LAST one's image, and without the inners'
+            // post-state the ledger would carry a MID-batch image into the next
+            // transaction.
+            for n in net_nodes.iter().copied() {
                 let (Some(key), Some(kind)) = (n[0].as_str(), n[1].as_u64()) else { continue };
                 let Ok(kb) = hex::decode(key) else { continue };
                 if kb.len() != 32 { continue; }
@@ -2905,7 +3039,7 @@ fn run() -> i32 {
         }
 
         e.attempted += 1;
-        let ter_ok = our_ter == net_ter;
+        let ter_ok = our_ter == net_ter && inner_ter.is_empty();
         let mut_ok = our_mut == net_mut;
         let verdict = if ter_ok && mut_ok {
             e.matched += 1; "MATCH"
@@ -2926,12 +3060,18 @@ fn run() -> i32 {
             .map(|(k, b)| format!("{k}:{b}")).take(kcap).collect();
         let extra: Vec<String> = our_mut.difference(&net_mut)
             .map(|(k, b)| format!("{k}:{b}")).take(kcap).collect();
-        per_tx.push(json!({
+        let mut row = json!({
             "hash": h, "type": tx_type, "verdict": verdict,
             "our_ter": our_ter, "net_ter": net_ter,
             "our_muts": our_mut.len(), "net_muts": net_mut.len(),
             "missing_in_ours": missing, "extra_in_ours": extra,
-        }));
+        });
+        if !inner_ter.is_empty() {
+            // Only ever present on a Batch outer whose inners disagreed, so
+            // every existing row is byte-identical to what it was.
+            row["inner_ter"] = json!(inner_ter);
+        }
+        per_tx.push(row);
     }
 
     // Report

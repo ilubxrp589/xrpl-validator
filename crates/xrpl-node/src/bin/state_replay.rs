@@ -408,6 +408,20 @@ fn run() -> i32 {
 
         let mut txs: Vec<Value> = lgr["transactions"].as_array().cloned().unwrap_or_default();
         txs.sort_by_key(|t| t["metaData"]["TransactionIndex"].as_u64().unwrap_or(u64::MAX));
+        // Batch (BatchV1_1): the ledger records every inner transaction as its
+        // own entry — own hash, own metadata carrying ParentBatchID, the
+        // indices right after its outer — but rippled APPLIES it inside the
+        // outer's application, and so does BatchTransactor::do_apply. The
+        // inner entries are therefore skipped below (applying one standalone
+        // is rejected: tfInnerBatchTxn with Fee "0") and their mutations reach
+        // the state through their outer, which is where our engine writes
+        // them.
+        let ordered: Vec<&Value> = txs.iter().collect();
+        let attribution = xrpl_node::native_apply::batch_attribution(&ordered);
+        let by_hash: HashMap<String, &Value> = ordered
+            .iter()
+            .map(|t| (t["hash"].as_str().unwrap_or("").to_uppercase(), *t))
+            .collect();
         let n_txs = txs.len();
         let mut ter_mismatch = 0usize;
         let mut fatal_skip = 0usize;
@@ -423,6 +437,10 @@ fn run() -> i32 {
             let expected_ter =
                 tx["metaData"]["TransactionResult"].as_str().unwrap_or("?").to_string();
             let tx_type = tx["TransactionType"].as_str().unwrap_or("?").to_string();
+            let h_up = h.to_uppercase();
+            if attribution.skip.contains(&h_up) {
+                continue; // applied inside its outer Batch
+            }
             if std::env::var("DX_PAY").is_ok() || std::env::var("DX_AMM").is_ok() {
                 eprintln!("DX_TX {h} {tx_type}");
             }
@@ -457,15 +475,63 @@ fn run() -> i32 {
                     }
                 }
             }
-            xrpl_ledger::ledger::threading::stamp_threading(
-                &mut mods,
-                &|k| state.read_json(k),
-                &h,
-                target,
-            );
+            // A Batch is threaded PER INNER: rippled applies each inner as
+            // its own transaction, so the objects an inner touched carry the
+            // INNER's hash and only the outer's own changes (its fee and
+            // sequence) carry the outer's. The ledger's inner hashes, in
+            // TransactionIndex order, pair with the engine's per-inner
+            // touched-key sets. Drain those on EVERY Batch outer, for the same
+            // staleness reason the per-inner results below are drained
+            // unconditionally — the cell is cleared at do_apply entry, so an
+            // outer that never got there would otherwise leave the PREVIOUS
+            // batch's sets for the next reader.
+            let inner_touched = if tx_type == "Batch" {
+                xrpl_ledger::tx::batch::take_inner_touched()
+            } else {
+                Vec::new()
+            };
+            match attribution.inners_of.get(&h_up) {
+                Some(inners) => xrpl_ledger::ledger::threading::stamp_batch_threading(
+                    &mut mods,
+                    &|k| state.read_json(k),
+                    &h,
+                    target,
+                    inners,
+                    &inner_touched,
+                ),
+                None => xrpl_ledger::ledger::threading::stamp_threading(
+                    &mut mods,
+                    &|k| state.read_json(k),
+                    &h,
+                    target,
+                ),
+            }
             if our_ter != expected_ter {
                 eprintln!("  TER {h} {tx_type}: ours {our_ter} mainnet {expected_ter}");
                 ter_mismatch += 1;
+            }
+            // The inners ran inside our do_apply; their per-inner results come
+            // back through the ledger crate's thread-local, in the same order.
+            // Drained on EVERY Batch outer for the staleness reason above.
+            let inner_results = if tx_type == "Batch" {
+                xrpl_ledger::tx::batch::take_inner_results()
+            } else {
+                Vec::new()
+            };
+            if let Some(inners) = attribution.inners_of.get(&h_up) {
+                for (i, ih) in inners.iter().enumerate() {
+                    let want = by_hash
+                        .get(ih)
+                        .and_then(|it| it["metaData"]["TransactionResult"].as_str())
+                        .unwrap_or("?");
+                    let got = inner_results.get(i).map(String::as_str).unwrap_or("(not run)");
+                    if got != want {
+                        eprintln!(
+                            "  TER {h} {tx_type} INNER[{i}] {ih}: ours {got} mainnet {want}"
+                        );
+                        ter_mismatch += 1;
+                    }
+                }
             }
             for (k, ent) in mods {
                 // DX_WATCH=<hex key prefix>: print the node's Balance after

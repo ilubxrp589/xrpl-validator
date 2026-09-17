@@ -12,7 +12,7 @@ use xrpl_ledger::ledger::keylet;
 use xrpl_ledger::ledger::sandbox::{Sandbox, SandboxEntry};
 use xrpl_ledger::ledger::state::LedgerState;
 use xrpl_ledger::ledger::transactor::{apply_common, TxFields, TxResult};
-use xrpl_ledger::shamap::hash::sha512_half;
+use xrpl_ledger::shamap::hash::{sha512_half, sha512_half_prefixed, HASH_PREFIX_TRANSACTION_ID};
 use xrpl_ledger::tx::dispatch::get_transactor;
 
 pub const ACCOUNT_FIELDS: &[&str] = &["Destination", "Owner", "Authorize", "Unauthorize", "RegularKey"];
@@ -330,6 +330,146 @@ pub fn update_skip_list(
         write(skip_every_key(prev), false);
     }
     write(keylet::skip_list_key(), true);
+}
+
+/// The transaction ids of a Batch outer's inner transactions, in
+/// `RawTransactions` order — the native counterpart of leg A's
+/// `xrpl_ffi::batch_inner_ids`. rippled files every inner in the ledger as a
+/// transaction in its own right, under the ordinary transaction id
+/// `SHA512Half("TXN\0" ‖ its serialization)`, so a leg holding only the
+/// OUTER can still name its inner entries: `differential_probe`'s fixtures
+/// carry `tx_json` with the metadata stripped, so no inner entry there has a
+/// `ParentBatchID` for `batch_attribution` to read.
+pub fn batch_inner_ids(outer: &Value) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for raw in outer.get("RawTransactions").and_then(|v| v.as_array()).into_iter().flatten() {
+        let Some(inner) = raw.get("RawTransaction") else { continue };
+        let mut v = inner.clone();
+        // Idempotent on API-form JSON (addresses already base58): the
+        // re-spelling only bites when the caller holds the mirror dialect.
+        canon_for_encode(&mut v);
+        let Ok(blob) = xrpl_core::codec::encode::encode_transaction_json(&v, false) else {
+            continue;
+        };
+        ids.push(hex::encode_upper(sha512_half_prefixed(&HASH_PREFIX_TRANSACTION_ID, &blob).0));
+    }
+    ids
+}
+
+/// One key touched by several entries of the same Batch: the expected side
+/// reports the NET effect. The rules are leg A's, verbatim
+/// (`ffi_engine.rs` `merged_expected`): Created wins over Modified, and a key
+/// Created and then Deleted inside the batch is no entry at all. `nodes` is
+/// the `(key, kind)` pairs of the outer's metadata followed by its inners' in
+/// TransactionIndex order, kinds as the fixtures spell them — 0 Created,
+/// 1 Modified, 2 Deleted.
+///
+/// Inside ONE metadata a key appears exactly once, so for a non-Batch
+/// transaction this is the identity over its nodes.
+pub fn fold_batch_mutset(nodes: &[(String, u8)]) -> HashSet<(String, u8)> {
+    let mut kinds: HashMap<&str, (bool, bool, bool)> = HashMap::new();
+    for (key, kind) in nodes {
+        let e = kinds.entry(key.as_str()).or_default();
+        match kind {
+            0 => e.0 = true,
+            2 => e.2 = true,
+            _ => e.1 = true,
+        }
+    }
+    let mut out: HashSet<(String, u8)> = HashSet::with_capacity(kinds.len());
+    for (key, (created, _modified, deleted)) in kinds {
+        if created && deleted {
+            continue; // created and destroyed inside the batch — no entry
+        }
+        let kind = if created {
+            0
+        } else if deleted {
+            2
+        } else {
+            1
+        };
+        out.insert((key.to_string(), kind));
+    }
+    out
+}
+
+#[cfg(test)]
+mod batch_fold_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn k(key: &str, kind: u8) -> (String, u8) {
+        (key.to_string(), kind)
+    }
+
+    #[test]
+    fn fold_batch_mutset_created_wins_over_modified() {
+        assert_eq!(fold_batch_mutset(&[k("AA", 1), k("AA", 0)]), HashSet::from([k("AA", 0)]));
+        assert_eq!(fold_batch_mutset(&[k("AA", 0), k("AA", 1)]), HashSet::from([k("AA", 0)]));
+    }
+
+    #[test]
+    fn fold_batch_mutset_created_then_deleted_vanishes() {
+        assert!(fold_batch_mutset(&[k("AA", 0), k("AA", 2)]).is_empty());
+        assert!(fold_batch_mutset(&[k("AA", 2), k("AA", 0)]).is_empty());
+    }
+
+    #[test]
+    fn fold_batch_mutset_modified_then_deleted_is_deleted() {
+        assert_eq!(fold_batch_mutset(&[k("AA", 1), k("AA", 2)]), HashSet::from([k("AA", 2)]));
+    }
+
+    #[test]
+    fn fold_batch_mutset_keys_touched_once_pass_through() {
+        let nodes = [k("AA", 0), k("BB", 1), k("CC", 2)];
+        assert_eq!(fold_batch_mutset(&nodes), nodes.iter().cloned().collect::<HashSet<_>>());
+    }
+
+    /// devnet #5309670, Batch 0DB84681FAAD…: rippled files each inner as a
+    /// transaction in its own right, so its ledger entry hash is the ordinary
+    /// transaction id of the RawTransaction's own serialization. Both hashes
+    /// below are the ledger's, read off `l5309670_blobs.txt`.
+    #[test]
+    fn batch_inner_ids_reproduce_the_devnet_inner_entry_hashes() {
+        let outer = json!({
+            "TransactionType": "Batch",
+            "Flags": 0x0004_0000u64,
+            "RawTransactions": [
+                {"RawTransaction": {
+                    "Account": "rJB72TyLVYfTHS7iPC2MBMPRHN7PqJms7D",
+                    "Amount": "1000000",
+                    "Destination": "rsvXCjhcBetR4fdpJWXf6DhJdy3KEbRRmw",
+                    "Fee": "0",
+                    "Flags": 1073741824u64,
+                    "Sequence": 5309666,
+                    "SigningPubKey": "",
+                    "TransactionType": "Payment"
+                }},
+                {"RawTransaction": {
+                    "Account": "r4JxwgKZJjHYfiFWhujThxsVxxrXcQYM4C",
+                    "Amount": "1000000",
+                    "Destination": "rsvXCjhcBetR4fdpJWXf6DhJdy3KEbRRmw",
+                    "Fee": "0",
+                    "Flags": 1073741824u64,
+                    "Sequence": 5309667,
+                    "SigningPubKey": "",
+                    "TransactionType": "Payment"
+                }},
+            ]
+        });
+        assert_eq!(
+            batch_inner_ids(&outer),
+            vec![
+                "F835E19C2C403DD7B5BC54E69D995CC06D0CB9ED34B5CC419182BC1146EE4AB3".to_string(),
+                "C7A3E4417CBCA87BC90D1237F23203E16E1251B97452F29F272DA11CE3F96FB1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_transaction_without_raw_transactions_has_no_inner_ids() {
+        assert!(batch_inner_ids(&json!({"TransactionType": "Payment"})).is_empty());
+    }
 }
 
 #[cfg(test)]
