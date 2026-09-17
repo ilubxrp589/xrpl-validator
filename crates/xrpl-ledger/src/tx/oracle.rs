@@ -177,8 +177,12 @@ impl Transactor for OracleSetTransactor {
             if tx.fields.get("Provider").is_none() || tx.fields.get("AssetClass").is_none() {
                 return TxResult::Malformed;
             }
+            // `sfFlags` is soeREQUIRED on the Oracle ledger format, so the
+            // created object carries `Flags: 0` right after its type (finding
+            // 293, #107052956 B1EB9B20: ours serialized five bytes short).
             let mut oracle = serde_json::json!({
                 "LedgerEntryType": "Oracle",
+                "Flags": 0,
                 "Owner": hex::encode(tx.account),
                 "OracleDocumentID": id,
                 "PriceDataSeries": tx.fields["PriceDataSeries"].clone(),
