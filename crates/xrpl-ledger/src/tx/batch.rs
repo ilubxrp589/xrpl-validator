@@ -62,15 +62,18 @@ fn signer_accounts(outer: &Value) -> Option<Vec<[u8; 20]>> {
     Some(out)
 }
 
-/// `TxFields::from_json` decodes accounts via `tx::offer::decode20` (hex
-/// first, base58 fallback), but hex alone suffices here: by the time a
-/// transaction reaches this engine, `native_apply::hexify_addresses` has
-/// already rewritten every r-address to hex — including inside nested
-/// `RawTransactions` — so a `Batch`'s inner and `BatchSigner` accounts are
-/// always the 40-hex-char dialect.
+/// Transaction JSON from the feed and from the vector bundles carries
+/// base58 r-addresses inside `RawTransactions` and `BatchSigners`:
+/// `native_apply::hexify_addresses` is applied to ledger-state images
+/// (pre-images hydrated from the store), not to the transaction itself, and
+/// `TxFields::from_json` only rewrites the outer's own top-level account
+/// fields — nested `RawTransaction`/`BatchSigner` objects are untouched in
+/// `tx.fields`. So a `Batch`'s inner and `BatchSigner` accounts arrive in
+/// either dialect and must decode both, exactly as `TxFields::from_json`
+/// does for the outer's own fields: hex first, checksummed base58 fallback,
+/// via the same `tx::offer::decode20` helper.
 fn decode_account(s: &str) -> Option<[u8; 20]> {
-    let b = hex::decode(s).ok()?;
-    <[u8; 20]>::try_from(b.as_slice()).ok()
+    crate::tx::offer::decode20(s)
 }
 
 /// `base + calculateBaseFee(outer) + Σ calculateBaseFee(inner) + base × signers`
