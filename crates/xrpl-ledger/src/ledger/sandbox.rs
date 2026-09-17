@@ -174,6 +174,20 @@ impl<'a> Sandbox<'a> {
         self.modifications.insert(AUX_KEY, SandboxEntry::Modified(data));
     }
 
+    /// Drop the aux slot, leaving every ledger key untouched.
+    ///
+    /// The table is TRANSACTION-scoped (rippled keeps its deferred-credits
+    /// table in the PaymentSandbox, which lives for one transaction), but a
+    /// `Batch` applies several transactions on ONE sandbox: rippled gives each
+    /// inner a fresh per-tx view, so an inner must never read the previous
+    /// inner's deferred credits. `tx::batch::do_apply` calls this before each
+    /// inner. Without it the second inner's `deferred_cap` reads the FIRST
+    /// inner's "original holding" for a party and caps it there — an account
+    /// paid by inner 1 could not spend that credit in inner 2.
+    pub fn aux_clear(&mut self) {
+        self.modifications.remove(&AUX_KEY);
+    }
+
     /// Discard all modifications (no-op, just consumes self).
     pub fn discard(self) {
         // Modifications are dropped
@@ -354,5 +368,26 @@ mod tests {
         sandbox.write(key(2), vec![0x02]);
         sandbox.delete(key(3));
         assert_eq!(sandbox.modification_count(), 3);
+    }
+
+    /// `aux_clear` drops the aux slot and nothing else — the per-inner reset a
+    /// `Batch` needs so each inner starts with an empty deferred-credits table.
+    #[test]
+    fn aux_clear_drops_only_the_aux_slot() {
+        let state = test_state();
+        let mut sandbox = Sandbox::new(&state);
+        sandbox.write(key(1), vec![0x01]);
+        sandbox.aux_set(vec![0xAA, 0xBB]);
+        assert_eq!(sandbox.aux_get(), Some(vec![0xAA, 0xBB]));
+        assert_eq!(sandbox.modification_count(), 2);
+
+        sandbox.aux_clear();
+        assert_eq!(sandbox.aux_get(), None);
+        assert_eq!(sandbox.modification_count(), 1, "the ledger key survives");
+        assert_eq!(sandbox.read(&key(1)), Some(vec![0x01]));
+
+        // Idempotent: clearing an already-empty slot is a no-op.
+        sandbox.aux_clear();
+        assert_eq!(sandbox.modification_count(), 1);
     }
 }

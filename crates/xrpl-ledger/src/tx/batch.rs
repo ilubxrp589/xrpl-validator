@@ -28,6 +28,36 @@ pub const MAX_BATCH_TX_COUNT: usize = 8;
 pub const MAX_BATCH_SIGNERS: usize = MAX_BATCH_TX_COUNT * 3;
 const MODE_MASK: u64 = TF_ALL_OR_NOTHING | TF_ONLY_ONE | TF_UNTIL_FAILURE | TF_INDEPENDENT;
 
+/// `Batch::kDisabledTxTypes` (rippled 3.3.0 `Batch.h:60-76`) — the Vault and
+/// Loan families, transcribed in the header's order and spelled as
+/// `transactions.macro` names them. An inner of one of these types is
+/// `temINVALID_INNER_BATCH`, checked before every other per-inner rule
+/// (`Batch.cpp:290-295`, right after the duplicate-hash check).
+///
+/// Note what is NOT here: `Batch` itself (nesting is rejected at STTx
+/// construction, `temINVALID`) and the pseudo-transaction types (an inner
+/// pseudo fails its own `preflight0` — `isPseudoTx(tx) &&
+/// tx.isFlag(tfInnerBatchTxn)` is `temINVALID_FLAG` there — which the outer
+/// reports as `temINVALID_INNER_BATCH` from the inner-preflight call, far
+/// later in the order).
+pub const DISABLED_INNER_TYPES: &[&str] = &[
+    "VaultCreate",
+    "VaultSet",
+    "VaultDelete",
+    "VaultDeposit",
+    "VaultWithdraw",
+    "VaultClawback",
+    "LoanBrokerSet",
+    "LoanBrokerDelete",
+    "LoanBrokerCoverDeposit",
+    "LoanBrokerCoverWithdraw",
+    "LoanBrokerCoverClawback",
+    "LoanSet",
+    "LoanDelete",
+    "LoanManage",
+    "LoanPay",
+];
+
 thread_local! {
     static INNER_RESULTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     static INNER_TOUCHED: RefCell<Vec<Vec<Hash256>>> = const { RefCell::new(Vec::new()) };
@@ -130,8 +160,30 @@ fn decode_account(s: &str) -> Option<[u8; 20]> {
     crate::tx::offer::decode20(s)
 }
 
-/// `base + calculateBaseFee(outer) + Σ calculateBaseFee(inner) + base × signers`
-/// with every ordinary transaction's base fee one unit: `base × (2 + n + s)`.
+/// A LOWER BOUND of rippled's `Batch::calculateBaseFeeImpl`, not an exact
+/// port: `base + calculateBaseFee(outer) + Σ calculateBaseFee(inner) + base ×
+/// signers`, evaluated with every ordinary transaction's base fee taken as ONE
+/// unit — `base × (2 + n + s)`.
+///
+/// Three terms of rippled's formula are therefore missing, each of which can
+/// only raise the real requirement:
+///   * an inner whose own `calculateBaseFee` is not one unit (an
+///     `EscrowFinish` with a fulfilment, an `AMMCreate`, a multi-signed
+///     inner's signer count, …);
+///   * the nested `Signers` count inside a `BatchSigner` (a multi-signed
+///     batch signer adds one unit per nested signature);
+///   * the outer's OWN multi-sign factor (`Transactor::calculateBaseFee`
+///     charges `1 + sfSigners.size()`).
+///
+/// So a batch this function accepts may still be under-funded by rippled's
+/// reckoning; a batch it REJECTS is under-funded for certain. Every specimen
+/// the vectors cover is one unit per part, which is why the bound has been
+/// exact in practice.
+///
+/// `base_fee_drops` is the caller's reference base. `preflight` passes 10 —
+/// the protocol reference fee (`Config::FEE_DEFAULT`), NOT a value read from
+/// this ledger's `FeeSettings`: the engine never loads it, and a validated
+/// ledger's transactions have already cleared the real one.
 pub fn batch_base_fee(outer: &Value, base_fee_drops: u64) -> u64 {
     let n = inner_jsons(outer).len() as u64;
     let s = signer_accounts(outer).map(|v| v.len() as u64).unwrap_or(0);
@@ -141,27 +193,32 @@ pub fn batch_base_fee(outer: &Value, base_fee_drops: u64) -> u64 {
 pub struct BatchTransactor;
 
 impl BatchTransactor {
-    /// Per-inner checks, in rippled 3.3.0's order (Batch.cpp preflight):
-    /// nested `Batch` → `temINVALID`; a disabled/pseudo inner type → the
-    /// same `temINVALID_INNER_BATCH` a failing inner preflight produces
-    /// (rippled's `kDisabledTxTypes` check and its `xrpl::preflight(...,
-    /// TapBatch, ...)` call both fold into that code — a pseudo type fails
-    /// the inner's own `preflight0`, since `isPseudoTx(tx) &&
-    /// tx.isFlag(tfInnerBatchTxn)` is `temINVALID_FLAG` there, which the
-    /// outer then reports as `temINVALID_INNER_BATCH`); missing
-    /// `tfInnerBatchTxn` → `temINVALID_FLAG`; `checkSignatureFields` split
-    /// three ways (`TxnSignature` → `temBAD_SIGNATURE`, `Signers` →
-    /// `temBAD_SIGNER`, non-empty `SigningPubKey` → `temBAD_REGKEY`); a
-    /// non-zero `Fee` → `temBAD_FEE`; an inner that fails to parse (our
-    /// stand-in for "fails its own preflight") → `temINVALID_INNER_BATCH`;
+    /// Per-inner checks, in rippled 3.3.0's order (`Batch.cpp:278-398`):
+    /// a `kDisabledTxTypes` inner (the Vault/Loan family) →
+    /// `temINVALID_INNER_BATCH`, FIRST; a nested `Batch` → `temINVALID`
+    /// (rippled never gets here — `STTx`'s constructor rejects a `Batch`
+    /// inside `sfRawTransactions` outright — so the code is the construction
+    /// failure's, not a preflight verdict); missing `tfInnerBatchTxn` →
+    /// `temINVALID_FLAG`; `checkSignatureFields` split three ways
+    /// (`TxnSignature` → `temBAD_SIGNATURE`, `Signers` → `temBAD_SIGNER`,
+    /// non-empty `SigningPubKey` → `temBAD_REGKEY`); a non-zero `Fee` →
+    /// `temBAD_FEE`; then the inner's OWN preflight → `temINVALID_INNER_BATCH`
+    /// on any failure, which is where both a pseudo-transaction inner
+    /// (`preflight0`: `isPseudoTx(tx) && tx.isFlag(tfInnerBatchTxn)` is
+    /// `temINVALID_FLAG` there) and an inner we cannot parse land; finally
     /// both or neither of `Sequence`/`TicketSequence` → `temSEQ_AND_TICKET`.
+    ///
+    /// The pseudo check sits with the parse deliberately: a pseudo inner that
+    /// is ALSO malformed in a way rippled catches earlier (a non-zero `Fee`,
+    /// say) must return the earlier code, which it would not if the pseudo
+    /// test ran first.
     fn preflight_inner(inner: &Value) -> TxResult {
         let ty = inner.get("TransactionType").and_then(|t| t.as_str()).unwrap_or("");
+        if DISABLED_INNER_TYPES.contains(&ty) {
+            return TxResult::InvalidInnerBatch;
+        }
         if ty == "Batch" {
             return TxResult::InvalidTx;
-        }
-        if is_pseudo(ty) {
-            return TxResult::InvalidInnerBatch;
         }
         if flags_of(inner) & TF_INNER_BATCH_TXN == 0 {
             return TxResult::InvalidFlag;
@@ -179,7 +236,10 @@ impl BatchTransactor {
         if inner.get("Fee").and_then(|f| f.as_str()) != Some("0") {
             return TxResult::BadFee;
         }
-        if TxFields::from_json(inner).is_none() {
+        // The inner's own preflight, as far as the engine models it: a pseudo
+        // type fails `preflight0`, and a transaction we cannot parse is our
+        // stand-in for "fails its own preflight". Both are the same code.
+        if is_pseudo(ty) || TxFields::from_json(inner).is_none() {
             return TxResult::InvalidInnerBatch;
         }
         let has_seq = inner.get("Sequence").and_then(|s| s.as_u64()).map(|s| s != 0).unwrap_or(false);
@@ -254,6 +314,18 @@ impl Transactor for BatchTransactor {
                 return TxResult::Redundant;
             }
             seen_seq.push((acct, seq_or_ticket));
+            // rippled builds this set from `rb.getInitiator()`, not
+            // `sfAccount` (`Batch.cpp:405-440`): when an inner carries
+            // `sfDelegate`, the DELEGATE is the required signer, because the
+            // delegate is who signed it. The engine does not model delegation
+            // (nor the two other members rippled adds here, `sfCounterparty`
+            // and a fee-sponsoring `sfSponsor` with an `sfSponsorSignature`),
+            // so a delegated inner would demand a signer for the account
+            // holder where rippled demands one for the delegate. Harmless
+            // today — the engine verifies no signatures, and every validated
+            // Batch reaching it has already satisfied rippled's real rule —
+            // but this preflight would reject such a batch for the wrong
+            // reason if it were ever fed an unvalidated one.
             if acct != tx.account && !inner_accounts.contains(&acct) {
                 inner_accounts.push(acct);
             }
@@ -325,6 +397,16 @@ impl Transactor for BatchTransactor {
         // know which inner touched what (`take_inner_touched`).
         let mut touched: Vec<Vec<Hash256>> = Vec::new();
         for inner in inner_jsons(&tx.fields) {
+            // rippled gives every inner its own `perTxBatchView` over the
+            // batch view, and the deferred-credits table lives IN that view —
+            // so each inner starts with an empty one. Our inners share this
+            // sandbox, so the table must be cleared by hand; leaving it in
+            // place makes the second inner read the first's "original
+            // holding" for a party and cap it there (`offer::deferred_cap`
+            // = min(live, orig − debits)), so an account paid by inner 1
+            // could not spend that credit in inner 2. Ledger keys are
+            // untouched — only the reserved AUX slot is dropped.
+            sandbox.aux_clear();
             let Some(mut f) = TxFields::from_json(inner) else {
                 results.push(TxResult::Malformed.code_str().to_string());
                 touched.push(Vec::new()); // never applied
@@ -450,6 +532,49 @@ mod tests {
         // there), which Batch::preflight reports as temINVALID_INNER_BATCH.
         let mut pseudo = inner_payment(1, 2, 1, 6); pseudo["RawTransaction"]["TransactionType"] = json!("EnableAmendment");
         assert_eq!(pf(&outer(TF_INDEPENDENT, vec![pseudo, inner_payment(1, 2, 1, 7)], None)), "temINVALID_INNER_BATCH");
+        // kDisabledTxTypes (Batch.h:60-76): the Vault/Loan family is refused
+        // outright, ahead of every other per-inner rule.
+        let mut vault = inner_payment(1, 2, 1, 6); vault["RawTransaction"]["TransactionType"] = json!("VaultDeposit");
+        assert_eq!(pf(&outer(TF_INDEPENDENT, vec![vault, inner_payment(1, 2, 1, 7)], None)), "temINVALID_INNER_BATCH");
+    }
+
+    #[test]
+    fn preflight_rejects_every_disabled_inner_type_before_any_other_inner_rule() {
+        assert_eq!(DISABLED_INNER_TYPES.len(), 15, "Batch.h:60-76 lists fifteen types");
+        assert!(!DISABLED_INNER_TYPES.contains(&"Batch"), "nesting is temINVALID, not temINVALID_INNER_BATCH");
+        for ty in DISABLED_INNER_TYPES {
+            let mut bad = inner_payment(1, 2, 1, 6);
+            bad["RawTransaction"]["TransactionType"] = json!(ty);
+            // Also malformed in three ways rippled reports differently for an
+            // ENABLED type — the disabled check runs first, so the code is
+            // still temINVALID_INNER_BATCH.
+            bad["RawTransaction"]["Flags"] = json!(0);
+            bad["RawTransaction"]["Fee"] = json!("10");
+            bad["RawTransaction"]["TxnSignature"] = json!("3045");
+            assert_eq!(
+                pf(&outer(TF_INDEPENDENT, vec![bad, inner_payment(1, 2, 1, 7)], None)),
+                "temINVALID_INNER_BATCH",
+                "{ty} is a disabled inner type"
+            );
+        }
+        // The same three malformations on an ENABLED type still report their
+        // own codes, so the assertion above is about the type, not the fields.
+        let mut bad_flag = inner_payment(1, 2, 1, 6); bad_flag["RawTransaction"]["Flags"] = json!(0);
+        assert_eq!(pf(&outer(TF_INDEPENDENT, vec![bad_flag, inner_payment(1, 2, 1, 7)], None)), "temINVALID_FLAG");
+    }
+
+    /// The pseudo check moved down beside the parse, so a pseudo inner that is
+    /// ALSO malformed earlier in rippled's order reports the EARLIER code.
+    #[test]
+    fn a_pseudo_inner_that_is_malformed_earlier_reports_the_earlier_code() {
+        let mut pseudo_bad_fee = inner_payment(1, 2, 1, 6);
+        pseudo_bad_fee["RawTransaction"]["TransactionType"] = json!("EnableAmendment");
+        pseudo_bad_fee["RawTransaction"]["Fee"] = json!("10");
+        assert_eq!(
+            pf(&outer(TF_INDEPENDENT, vec![pseudo_bad_fee, inner_payment(1, 2, 1, 7)], None)),
+            "temBAD_FEE",
+            "Batch.cpp checks the inner Fee (line 329) before calling the inner's preflight (line 342)"
+        );
     }
 
     #[test]
@@ -624,6 +749,129 @@ mod tests {
         assert_eq!(inners.len(), 3);
         assert_eq!(balance_seq(&sb, 1), (50_000_000 - 1000 - 3_000_000, 8));
         assert_eq!(balance_seq(&sb, 2), (23_000_000, 1));
+    }
+
+    // ---- the deferred-credits table is per INNER (finding 165 / item 1) ----
+
+    /// A, B and C all hold a line to issuer I; only A is funded.
+    fn iou_state() -> (LedgerState, [u8; 20]) {
+        const A: u8 = 1;
+        const B: u8 = 2;
+        const I: u8 = 3;
+        const C: u8 = 4;
+        let issuer = acct(I);
+        let cur = crate::tx::offer::amount_currency20(
+            &json!({"currency": "USD", "issuer": hexa(I), "value": "1"}),
+        )
+        .expect("currency");
+        // Account 5 is the batch's outer (its own sequence 5); A and B are
+        // inner accounts only, so their sequences are untouched by the outer's
+        // apply_common and the standalone oracle uses the same two.
+        let mut state = state_with_accounts(&[
+            (A, 500_000_000, 6), (B, 500_000_000, 1), (I, 500_000_000, 1), (C, 500_000_000, 1),
+            (5, 500_000_000, 5),
+        ]);
+        for (who, bal) in [(A, "100"), (B, "0"), (C, "0")] {
+            let id = acct(who);
+            let (lo, hi) = if id < issuer { (id, issuer) } else { (issuer, id) };
+            let (lo_lim, hi_lim) = if id < issuer { ("1000000", "0") } else { ("0", "1000000") };
+            let value = if id < issuer { bal.to_string() } else { format!("-{bal}") };
+            let line = json!({
+                "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+                "Balance": {"currency": hex::encode_upper(cur),
+                            "issuer": "0000000000000000000000000000000000000000", "value": value},
+                "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": lo_lim},
+                "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": hi_lim},
+            });
+            state
+                .state_map
+                .insert(keylet::ripple_state_key(&id, &issuer, &cur), serde_json::to_vec(&line).expect("json"))
+                .expect("insert");
+        }
+        (state, cur)
+    }
+
+    fn inner_iou_payment(from: u8, to: u8, issuer: u8, value: &str, seq: u32) -> Value {
+        json!({ "RawTransaction": {
+            "TransactionType": "Payment", "Account": hexa(from), "Destination": hexa(to),
+            "Amount": {"currency": "USD", "issuer": hexa(issuer), "value": value},
+            "Fee": "0", "Sequence": seq, "Flags": 0x4000_0000u64, "SigningPubKey": "" } })
+    }
+
+    /// The holder's own signed balance on its line to the issuer, as a string
+    /// ("" when the line is gone).
+    fn line_value(read: &dyn Fn(&Hash256) -> Option<Vec<u8>>, who: u8, issuer: u8, cur: &[u8; 20]) -> String {
+        let id = acct(who);
+        let iss = acct(issuer);
+        let Some(b) = read(&keylet::ripple_state_key(&id, &iss, cur)) else { return String::new() };
+        let Ok(v) = serde_json::from_slice::<Value>(&b) else { return String::new() };
+        let raw = v["Balance"]["value"].as_str().unwrap_or("").to_string();
+        // Balance is written from the LOW account's perspective; report the
+        // holder's own sign.
+        if id < iss {
+            raw
+        } else {
+            match raw.strip_prefix('-') {
+                Some(rest) => rest.to_string(),
+                None if raw == "0" => raw,
+                None => format!("-{raw}"),
+            }
+        }
+    }
+
+    /// Finding 165's deferred-credits table is TRANSACTION scoped: rippled
+    /// runs every inner on its own `perTxBatchView`, so each inner starts with
+    /// an empty table. Inner 1 pays B, inner 2 has B spend what it just
+    /// received — only possible when the table did not carry B's "original
+    /// holding of 0" over from inner 1 (`deferred_cap` = min(live, orig −
+    /// debits) would pin B at 0 and the payment would find no liquidity).
+    ///
+    /// The oracle is the same two transactions applied STANDALONE, each on its
+    /// own fresh sandbox over the previous one's committed state — which is
+    /// what a ledger containing them as two ordinary transactions would show.
+    #[test]
+    fn each_inner_starts_with_an_empty_deferred_credits_table() {
+        const A: u8 = 1;
+        const B: u8 = 2;
+        const I: u8 = 3;
+        const C: u8 = 4;
+        let i1 = inner_iou_payment(A, B, I, "10", 6);
+        let i2 = inner_iou_payment(B, C, I, "5", 1);
+
+        // --- standalone: two ordinary transactions, one after the other ---
+        let (mut state, cur) = iou_state();
+        let mut standalone_results: Vec<String> = Vec::new();
+        for raw in [&i1, &i2] {
+            let inner = raw.get("RawTransaction").expect("inner");
+            let mut f = TxFields::from_json(inner).expect("fields");
+            f.inner_batch = true;
+            let mut sb = Sandbox::new(&state);
+            let (r, _applied) = crate::tx::dispatch::apply_on_sandbox(&f, &mut sb);
+            standalone_results.push(r.code_str().to_string());
+            let mods = sb.into_modifications();
+            crate::ledger::sandbox::apply_modifications(&mut state, mods).expect("commit");
+        }
+        let want: Vec<String> = [A, B, C]
+            .iter()
+            .map(|w| line_value(&|k| state.read_json(k), *w, I, &cur))
+            .collect();
+        assert_eq!(standalone_results, vec!["tesSUCCESS", "tesSUCCESS"], "the oracle itself must land");
+        assert_eq!(want, vec!["90".to_string(), "5".to_string(), "5".to_string()], "A pays 10, B forwards 5");
+
+        // --- the same two as one batch's inners ---
+        let (state, cur) = iou_state();
+        // The outer is account 5: both inner accounts differ from it, so both
+        // are required BatchSigners (ascending by account id).
+        let mut o = outer(TF_INDEPENDENT, vec![i1, i2], Some(vec![A, B]));
+        o["Account"] = json!(hexa(5));
+        let (sb, r, inners) = run(&o, &state);
+        assert_eq!(r, "tesSUCCESS");
+        assert_eq!(inners, standalone_results, "inner 2 must not inherit inner 1's deferred credits");
+        let got: Vec<String> = [A, B, C]
+            .iter()
+            .map(|w| line_value(&|k| sb.read(k), *w, I, &cur))
+            .collect();
+        assert_eq!(got, want, "batch balances equal two standalone applications");
     }
 
     #[test]
