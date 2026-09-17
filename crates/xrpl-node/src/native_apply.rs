@@ -217,6 +217,36 @@ pub fn canon_for_encode(v: &mut Value) {
     }
 }
 
+/// Batch (BatchV1_1): rippled records every inner transaction as its own
+/// ledger entry — own hash, own metadata carrying `ParentBatchID`, the
+/// indices right after its outer — and applies it INSIDE the outer's
+/// application (`applyBatchTransactions`). The native engine's
+/// `BatchTransactor::do_apply` does the same, so inner entries are skipped
+/// in the replay and their metadata is attributed to the outer.
+pub struct BatchAttribution {
+    pub skip: HashSet<String>,
+    pub inners_of: HashMap<String, Vec<String>>,
+}
+
+pub fn batch_attribution(ordered: &[&Value]) -> BatchAttribution {
+    let mut skip = HashSet::new();
+    let mut inners_of: HashMap<String, Vec<String>> = HashMap::new();
+    for tx in ordered {
+        let flags = tx.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+        let parent = tx["metaData"].get("ParentBatchID").and_then(|p| p.as_str());
+        if flags & xrpl_ledger::tx::batch::TF_INNER_BATCH_TXN == 0 {
+            continue;
+        }
+        // An inner is identified by the flag AND the link: a stray
+        // tfInnerBatchTxn on a top-level tx is not somebody's inner.
+        let Some(parent) = parent else { continue };
+        let hash = tx["hash"].as_str().unwrap_or("").to_uppercase();
+        skip.insert(hash.clone());
+        inners_of.entry(parent.to_uppercase()).or_default().push(hash);
+    }
+    BatchAttribution { skip, inners_of }
+}
+
 #[cfg(test)]
 mod canon_tests {
     use super::*;
@@ -302,3 +332,37 @@ pub fn update_skip_list(
     write(keylet::skip_list_key(), true);
 }
 
+#[cfg(test)]
+mod batch_attribution_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn entry(hash: &str, idx: u64, flags: u64, parent: Option<&str>) -> Value {
+        let mut meta = json!({"TransactionIndex": idx, "TransactionResult": "tesSUCCESS", "AffectedNodes": []});
+        if let Some(p) = parent { meta["ParentBatchID"] = json!(p); }
+        json!({"hash": hash, "TransactionType": "Payment", "Flags": flags, "metaData": meta})
+    }
+
+    #[test]
+    fn inner_entries_are_skipped_and_grouped_under_their_outer_in_index_order() {
+        let o = json!({"hash": "AA", "TransactionType": "Batch", "Flags": 0x0004_0000u64,
+                       "metaData": {"TransactionIndex": 1, "TransactionResult": "tesSUCCESS", "AffectedNodes": []}});
+        let i2 = entry("CC", 3, 0x4000_0000, Some("AA"));
+        let i1 = entry("BB", 2, 0x4000_0000, Some("AA"));
+        let other = entry("DD", 4, 0, None);
+        let ordered: Vec<&Value> = vec![&o, &i1, &i2, &other];
+        let a = batch_attribution(&ordered);
+        assert_eq!(a.skip.len(), 2);
+        assert!(a.skip.contains("BB") && a.skip.contains("CC"));
+        assert_eq!(a.inners_of.get("AA").cloned().unwrap_or_default(), vec!["BB".to_string(), "CC".to_string()]);
+        assert!(!a.skip.contains("DD"));
+    }
+
+    #[test]
+    fn an_inner_flag_without_a_parent_is_not_an_inner() {
+        let lone = entry("EE", 1, 0x4000_0000, None);
+        let ordered: Vec<&Value> = vec![&lone];
+        let a = batch_attribution(&ordered);
+        assert!(a.skip.is_empty());
+    }
+}
