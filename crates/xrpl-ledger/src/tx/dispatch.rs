@@ -71,6 +71,7 @@ pub fn is_pseudo(tx_type: &str) -> bool {
 pub fn get_transactor(tx_type: &str) -> Option<Box<dyn Transactor>> {
     match tx_type {
         "Payment" => Some(Box::new(PaymentTransactor)),
+        "Batch" => Some(Box::new(crate::tx::batch::BatchTransactor)),
         "OfferCreate" => Some(Box::new(OfferCreateTransactor)),
         "OfferCancel" => Some(Box::new(OfferCancelTransactor)),
         "TrustSet" => Some(Box::new(TrustSetTransactor)),
