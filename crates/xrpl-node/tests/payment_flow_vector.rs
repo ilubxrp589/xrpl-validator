@@ -893,3 +893,16 @@ fn payment_pool_that_offers_again_ends_the_pass_at_the_pool_no_stepping_10699248
 fn payment_own_offers_behind_an_issuer_hop_are_credited_107052630() {
     run_bundle(include_str!("vectors/payment_own_offers_behind_an_issuer_hop_are_credited_107052630.json"));
 }
+
+/// Finding 296 — #107009438 2877CBCC88C9: a deliver-max partial payment of
+/// 166716 drops for RLUSD through USDC.axl. rippled's REVERSE pass, asked for
+/// everything, walks the whole USDC.axl/RLUSD book: past the one funded tip it
+/// steps over rDeXHa's three unfunded offers and marks them `ofrsToRm`; the
+/// forward pass buys 0.2129 RLUSD from the tip alone, and the driver still
+/// deletes the three (plus their book pages, the owner page, OwnerCount) after
+/// the iteration — 17 mutations. Our reverse sizing ran in a snapshot, so
+/// those reaps were rolled back and the ledger showed 9.
+#[test]
+fn payment_reverse_pass_reaps_survive_the_snapshot_107009438() {
+    run_bundle(include_str!("vectors/payment_reverse_pass_reaps_survive_the_snapshot_107009438.json"));
+}

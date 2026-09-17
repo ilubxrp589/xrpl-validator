@@ -847,6 +847,27 @@ fn soft_stale_mark(k: &Hash256) {
 fn soft_stale_contains(k: &Hash256) -> bool {
     SOFT_STALE.with(|c| c.borrow().contains(&k.0))
 }
+/// Finding 296 (#107009438 2877CBCC88C9): offers `reap_if_dead` removed FOR
+/// GOOD (expired, empty, unfunded or dust on a pristine line, unauthorized)
+/// — rippled's `ofrsToRm`, which BOTH passes of every attempted strand fill
+/// and the driver deletes from the base view after the iteration
+/// (StrandFlow.h:706 `SetUnion`, applied whether the strand won or failed).
+/// Our REVERSE sizing runs in a snapshot (`measure_hop`), so reaps it found
+/// past the forward pass's reach were rolled back: rDeXHa's three unfunded
+/// RLUSD offers behind the one funded tip stayed on mainnet's deleted list
+/// and off ours (9 mutations for 17). Cleared per round, drained after it.
+thread_local! {
+    static DEAD_REAPED: std::cell::RefCell<Vec<Hash256>> = std::cell::RefCell::new(Vec::new());
+}
+fn dead_reaped_mark(k: &Hash256) {
+    DEAD_REAPED.with(|c| c.borrow_mut().push(*k));
+}
+pub(crate) fn dead_reaped_clear() {
+    DEAD_REAPED.with(|c| c.borrow_mut().clear());
+}
+pub(crate) fn take_dead_reaped() -> Vec<Hash256> {
+    DEAD_REAPED.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
 /// The permanent reaps in `stale` — what `sbCancel` carries on a failure.
 fn hard_stale(stale: &[Hash256]) -> Vec<Hash256> {
     stale.iter().filter(|k| !soft_stale_contains(k)).copied().collect()
@@ -2780,6 +2801,7 @@ fn reap_if_dead(
         if exp != 0 && sandbox.base().header.close_time as u64 >= exp {
             delete_maker_offer(sandbox, okey, offer, maker);
             stale.push(*okey);
+            dead_reaped_mark(okey);
             return true;
         }
     }
@@ -2790,6 +2812,7 @@ fn reap_if_dead(
     if m_gives0.0 == 0 || m_wants0.0 == 0 {
         delete_maker_offer(sandbox, okey, offer, maker);
         stale.push(*okey);
+        dead_reaped_mark(okey);
         return true;
     }
     if std::env::var("DX_RM").is_ok() {
@@ -2822,6 +2845,8 @@ fn reap_if_dead(
         // Finding 153: drained by this iteration's own fill → not permanent.
         if became {
             soft_stale_mark(okey);
+        } else {
+            dead_reaped_mark(okey);
         }
         return true;
     }
@@ -2837,6 +2862,8 @@ fn reap_if_dead(
         stale.push(*okey);
         if became {
             soft_stale_mark(okey);
+        } else {
+            dead_reaped_mark(okey);
         }
         return true;
     }
@@ -2846,6 +2873,7 @@ fn reap_if_dead(
     if require_auth_known(sandbox, gets_leg, maker) == Some(false) {
         delete_maker_offer(sandbox, okey, offer, maker);
         stale.push(*okey);
+        dead_reaped_mark(okey);
         return true;
     }
     false

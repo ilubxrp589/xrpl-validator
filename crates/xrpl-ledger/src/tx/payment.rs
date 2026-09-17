@@ -3293,6 +3293,9 @@ impl PaymentTransactor {
                     })
                     .collect();
                 c.sort_by(|a, b| ox::me_cmp(a.1, b.1));
+                // Finding 296: a fresh `ofrsToRm` per iteration — the
+                // attempts below fill it, the round's end applies it.
+                ox::dead_reaped_clear();
                 if std::env::var("DX_PAY").is_ok() {
                     eprintln!("DX_PAY   round={_round} order={:?}", c);
                 }
@@ -3611,6 +3614,26 @@ impl PaymentTransactor {
             // spending — there is no line to difference. `rem_in` would then
             // never fall and the loop would keep buying against a SendMax it
             // cannot account for, so stop after this round instead.
+            //
+            // Finding 296 (#107009438 2877CBCC88C9): before that, rippled's
+            // per-iteration `ofrsToRm` — every offer an ATTEMPTED strand's
+            // reverse or forward pass found dead — leaves the base view
+            // (StrandFlow.h:706), won or failed. The forward pass deletes
+            // inline; the reverse sizing ran in a snapshot, so its reaps
+            // land here. Deferred to the round's end so the makers'
+            // OwnerCounts price this round's funding checks as before.
+            for okey in ox::take_dead_reaped() {
+                let Some(offer) = ox::json_at(sandbox, &okey) else { continue };
+                if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
+                    continue;
+                }
+                let Some(maker) = offer.get("Account").and_then(|v| v.as_str()).and_then(ox::decode20)
+                else { continue };
+                if std::env::var("DX_DEL").is_ok() {
+                    eprintln!("DX_DEL round-end reap okey={}", hex::encode_upper(&okey.0[..6]));
+                }
+                ox::delete_maker_offer(sandbox, &okey, &offer, &maker);
+            }
             if ox::me_is_zero(sin) {
                 break;
             }
