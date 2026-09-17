@@ -108,7 +108,7 @@ impl Transactor for EscrowCreateTransactor {
         if tx.tx_type != "EscrowCreate" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
 
@@ -513,7 +513,7 @@ impl Transactor for EscrowFinishTransactor {
         if tx.tx_type != "EscrowFinish" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if Self::owner(tx).is_none() {
@@ -772,7 +772,7 @@ impl Transactor for EscrowCancelTransactor {
         if tx.tx_type != "EscrowCancel" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if Self::owner(tx).is_none() {

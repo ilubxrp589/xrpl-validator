@@ -1849,7 +1849,7 @@ impl Transactor for PaymentTransactor {
         }
 
         // Fee must be positive
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
 
@@ -4693,5 +4693,23 @@ mod tests {
         let line = sandbox.read(&keylet::ripple_state_key(&taker, &issuer, &cur)).unwrap();
         let line: serde_json::Value = serde_json::from_slice(&line).unwrap();
         assert_eq!(line["Balance"]["value"].as_str().unwrap(), "0");
+    }
+
+    #[test]
+    fn payment_preflight_waives_fee_zero_for_a_batch_inner() {
+        use crate::ledger::transactor::{Transactor, TxFields, TxResult};
+        let tx = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": "0000000000000000000000000000000000000001",
+            "Destination": "0000000000000000000000000000000000000002",
+            "Amount": "1000000",
+            "Fee": "0",
+            "Sequence": 3,
+            "Flags": 0x4000_0000u64,
+        });
+        let mut f = TxFields::from_json(&tx).expect("fields");
+        assert_eq!(PaymentTransactor.preflight(&f), TxResult::BadFee, "standalone: Fee 0 is temBAD_FEE");
+        f.inner_batch = true;
+        assert_ne!(PaymentTransactor.preflight(&f), TxResult::BadFee, "inner: Fee 0 is the rule");
     }
 }

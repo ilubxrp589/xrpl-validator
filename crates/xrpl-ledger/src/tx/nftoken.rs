@@ -196,7 +196,7 @@ impl Transactor for NFTokenMintTransactor {
         if tx.tx_type != "NFTokenMint" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("NFTokenTaxon").is_none() {
@@ -440,7 +440,7 @@ impl Transactor for NFTokenBurnTransactor {
         if tx.tx_type != "NFTokenBurn" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("NFTokenID").is_none() {
@@ -547,7 +547,7 @@ impl Transactor for NFTokenCreateOfferTransactor {
         if tx.tx_type != "NFTokenCreateOffer" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("NFTokenID").is_none() || tx.fields.get("Amount").is_none() {
@@ -1024,7 +1024,7 @@ impl Transactor for NFTokenAcceptOfferTransactor {
         if tx.tx_type != "NFTokenAcceptOffer" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("NFTokenSellOffer").is_none()
@@ -1462,7 +1462,7 @@ impl Transactor for NFTokenCancelOfferTransactor {
         if tx.tx_type != "NFTokenCancelOffer" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("NFTokenOffers").is_none() {
@@ -1554,7 +1554,7 @@ impl Transactor for NFTokenModifyTransactor {
         if tx.tx_type != "NFTokenModify" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("NFTokenID").is_none() {

@@ -109,7 +109,7 @@ pub struct AMMCreateTransactor;
 impl Transactor for AMMCreateTransactor {
     fn preflight(&self, tx: &TxFields) -> TxResult {
         if tx.tx_type != "AMMCreate" { return TxResult::Malformed; }
-        if tx.fee == 0 { return TxResult::BadFee; }
+        if tx.fee_missing() { return TxResult::BadFee; }
         if tx.fields.get("Amount").is_none() || tx.fields.get("Amount2").is_none() {
             return TxResult::Malformed;
         }
@@ -784,7 +784,7 @@ pub struct AMMDepositTransactor;
 impl Transactor for AMMDepositTransactor {
     fn preflight(&self, tx: &TxFields) -> TxResult {
         if tx.tx_type != "AMMDeposit" { return TxResult::Malformed; }
-        if tx.fee == 0 { return TxResult::BadFee; }
+        if tx.fee_missing() { return TxResult::BadFee; }
         if tx.fields.get("Asset").is_none() || tx.fields.get("Asset2").is_none() {
             return TxResult::Malformed;
         }
@@ -1658,7 +1658,7 @@ fn withdraw_reserve_ok(sandbox: &Sandbox, account: &[u8; 20], leg: &crate::tx::o
 impl Transactor for AMMWithdrawTransactor {
     fn preflight(&self, tx: &TxFields) -> TxResult {
         if tx.tx_type != "AMMWithdraw" { return TxResult::Malformed; }
-        if tx.fee == 0 { return TxResult::BadFee; }
+        if tx.fee_missing() { return TxResult::BadFee; }
         if tx.fields.get("Asset").is_none() || tx.fields.get("Asset2").is_none() {
             return TxResult::Malformed;
         }
@@ -2209,7 +2209,7 @@ pub struct AMMVoteTransactor;
 impl Transactor for AMMVoteTransactor {
     fn preflight(&self, tx: &TxFields) -> TxResult {
         if tx.tx_type != "AMMVote" { return TxResult::Malformed; }
-        if tx.fee == 0 { return TxResult::BadFee; }
+        if tx.fee_missing() { return TxResult::BadFee; }
         if tx.fields.get("Asset").is_none() || tx.fields.get("Asset2").is_none() {
             return TxResult::Malformed;
         }
@@ -2470,7 +2470,7 @@ pub struct AMMBidTransactor;
 impl Transactor for AMMBidTransactor {
     fn preflight(&self, tx: &TxFields) -> TxResult {
         if tx.tx_type != "AMMBid" { return TxResult::Malformed; }
-        if tx.fee == 0 { return TxResult::BadFee; }
+        if tx.fee_missing() { return TxResult::BadFee; }
         if tx.fields.get("Asset").is_none() || tx.fields.get("Asset2").is_none() {
             return TxResult::Malformed;
         }
@@ -2710,7 +2710,7 @@ pub struct AMMDeleteTransactor;
 impl Transactor for AMMDeleteTransactor {
     fn preflight(&self, tx: &TxFields) -> TxResult {
         if tx.tx_type != "AMMDelete" { return TxResult::Malformed; }
-        if tx.fee == 0 { return TxResult::BadFee; }
+        if tx.fee_missing() { return TxResult::BadFee; }
         if tx.fields.get("Asset").is_none() || tx.fields.get("Asset2").is_none() {
             return TxResult::Malformed;
         }
@@ -3572,7 +3572,7 @@ impl Transactor for AMMClawbackTransactor {
         if tx.tx_type != "AMMClawback" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("Holder").is_none()

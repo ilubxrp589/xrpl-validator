@@ -28,7 +28,7 @@ impl Transactor for AccountSetTransactor {
         if tx.tx_type != "AccountSet" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         TxResult::Success

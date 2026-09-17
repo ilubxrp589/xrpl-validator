@@ -113,7 +113,7 @@ impl Transactor for PaymentChannelCreateTransactor {
         if tx.tx_type != "PaymentChannelCreate" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("Destination").is_none() {
@@ -322,7 +322,7 @@ impl Transactor for PaymentChannelClaimTransactor {
         if tx.tx_type != "PaymentChannelClaim" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         // fixCleanup3_2_0: an all-zero Channel is malformed.
@@ -527,7 +527,7 @@ impl Transactor for PaymentChannelFundTransactor {
         if tx.tx_type != "PaymentChannelFund" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("Channel").is_none() {

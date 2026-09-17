@@ -9233,7 +9233,7 @@ impl Transactor for OfferCreateTransactor {
         if tx.tx_type != "OfferCreate" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("TakerPays").is_none() || tx.fields.get("TakerGets").is_none() {
@@ -10033,7 +10033,7 @@ impl Transactor for OfferCancelTransactor {
         if tx.tx_type != "OfferCancel" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("OfferSequence").is_none() {

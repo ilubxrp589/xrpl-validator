@@ -322,7 +322,7 @@ impl Transactor for MPTokenIssuanceCreateTransactor {
         if tx.tx_type != "MPTokenIssuanceCreate" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         // A NON-ZERO TransferFee demands tfMPTCanTransfer; the cap is 50000.
@@ -404,7 +404,7 @@ impl Transactor for MPTokenIssuanceDestroyTransactor {
         if tx.tx_type != "MPTokenIssuanceDestroy" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("MPTokenIssuanceID").is_none() {
@@ -458,7 +458,7 @@ impl Transactor for MPTokenAuthorizeTransactor {
         if tx.tx_type != "MPTokenAuthorize" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("MPTokenIssuanceID").is_none() {
@@ -596,7 +596,7 @@ impl Transactor for MPTokenIssuanceSetTransactor {
         if tx.tx_type != "MPTokenIssuanceSet" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("MPTokenIssuanceID").is_none() {

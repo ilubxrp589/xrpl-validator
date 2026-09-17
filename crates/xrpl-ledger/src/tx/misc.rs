@@ -138,7 +138,7 @@ impl Transactor for SignerListSetTransactor {
         if tx.tx_type != "SignerListSet" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         // SignerQuorum is required
@@ -318,7 +318,7 @@ impl Transactor for DepositPreauthTransactor {
         if tx.tx_type != "DepositPreauth" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         // Must have exactly one of Authorize or Unauthorize
@@ -465,7 +465,7 @@ impl Transactor for ClawbackTransactor {
         if tx.tx_type != "Clawback" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         // Amount is required (IOU or MPT amount to claw back)
@@ -1159,7 +1159,7 @@ impl Transactor for DIDSetTransactor {
         if tx.tx_type != "DIDSet" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         // At least one of the three payload fields must appear (preflight
@@ -1223,7 +1223,7 @@ impl Transactor for DIDDeleteTransactor {
         if tx.tx_type != "DIDDelete" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         TxResult::Success
@@ -1252,7 +1252,7 @@ impl Transactor for PermissionedDomainSetTransactor {
         if tx.tx_type != "PermissionedDomainSet" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("AcceptedCredentials").and_then(|v| v.as_array()).map(|a| a.is_empty()).unwrap_or(true) {
@@ -1336,7 +1336,7 @@ impl Transactor for PermissionedDomainDeleteTransactor {
         if tx.tx_type != "PermissionedDomainDelete" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("DomainID").is_none() {

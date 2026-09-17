@@ -27,7 +27,7 @@ impl Transactor for TicketCreateTransactor {
         if tx.tx_type != "TicketCreate" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         // temINVALID_COUNT: 1..=250 tickets per transaction.

@@ -67,7 +67,7 @@ impl Transactor for CredentialCreateTransactor {
         if tx.tx_type != "CredentialCreate" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         // Subject is required
@@ -239,7 +239,7 @@ impl Transactor for CredentialDeleteTransactor {
         if tx.tx_type != "CredentialDelete" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         // rippled needs at least ONE of Subject/Issuer, not both
@@ -561,7 +561,7 @@ impl Transactor for CredentialAcceptTransactor {
         if tx.tx_type != "CredentialAccept" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         // Issuer and CredentialType are required

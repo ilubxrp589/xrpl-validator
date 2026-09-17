@@ -58,7 +58,7 @@ impl Transactor for CheckCreateTransactor {
         if tx.tx_type != "CheckCreate" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("Destination").is_none() {
@@ -239,7 +239,7 @@ impl Transactor for CheckCashTransactor {
         if tx.tx_type != "CheckCash" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         // Must specify CheckID to identify the check
@@ -508,7 +508,7 @@ impl Transactor for CheckCancelTransactor {
         if tx.tx_type != "CheckCancel" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("CheckID").is_none() {

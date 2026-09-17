@@ -55,7 +55,7 @@ impl Transactor for OracleSetTransactor {
         if tx.tx_type != "OracleSet" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if doc_id(tx).is_none() || tx.fields.get("LastUpdateTime").is_none() {
@@ -206,7 +206,7 @@ impl Transactor for OracleDeleteTransactor {
         if tx.tx_type != "OracleDelete" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if doc_id(tx).is_none() {

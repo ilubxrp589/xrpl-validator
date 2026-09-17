@@ -167,7 +167,7 @@ impl Transactor for TrustSetTransactor {
         if tx.tx_type != "TrustSet" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("LimitAmount").is_none() {
