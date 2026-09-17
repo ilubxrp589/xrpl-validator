@@ -878,3 +878,18 @@ fn payment_in_driven_fwd_pass_stops_at_a_trimmed_head_offer_106991212() {
 fn payment_pool_that_offers_again_ends_the_pass_at_the_pool_no_stepping_106992486() {
     run_bundle(include_str!("vectors/payment_pool_that_offers_again_ends_the_pass_at_the_pool_no_stepping_106992486.json"));
 }
+
+/// Findings 294 + 295 — #107052630 32386DDEB6B8: rUnRkdr pays 117.732708 USDT
+/// with FIL through the explicit issuer hop [rsL5Y] and the XRP bridge, and
+/// strand 1 crosses its OWN two FIL/USDT offers (100 FIL, then 9.48 of 186).
+/// (294) rippled's DirectStep debits the sender the gross once and
+/// `consumeOffer`'s issuer→owner send credits the owner the net per fill — the
+/// same line, so only the 0.1% fee stays: −(35.169 × 1.001) − 109.4805 × 0.001.
+/// The mixed strand's run-fed fiction restore erased the owner credits and
+/// left the FIL line 109.48 low. (295) The destination's USDT line took five
+/// gross credits and one fee trim from the full-precision accumulator and
+/// rested at …7079999999; a completed delivery lands on pre + Amount exactly.
+#[test]
+fn payment_own_offers_behind_an_issuer_hop_are_credited_107052630() {
+    run_bundle(include_str!("vectors/payment_own_offers_behind_an_issuer_hop_are_credited_107052630.json"));
+}

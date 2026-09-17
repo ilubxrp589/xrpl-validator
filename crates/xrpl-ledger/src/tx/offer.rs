@@ -1637,6 +1637,18 @@ pub(crate) enum PassRole {
 thread_local! {
     static PASSTHROUGH: std::cell::RefCell<Vec<([u8; 20], Leg, PassRole)>> = std::cell::RefCell::new(Vec::new());
 }
+/// Finding 294 (#107052630 32386DDEB6B8): the taker's OWN offers filled on the
+/// walk's gets leg — the `pay` each fill credits the owner, rippled's
+/// issuer→owner `accountSend` in `consumeOffer`. Finding 260 keeps the walk
+/// from moving the sender's line for them; a caller that restores that line
+/// after the walk (the mixed strand's run-fed fiction) lands these again, per
+/// fill, in order. Drained by `take_self_maker_credits` before every walk.
+thread_local! {
+    static SELF_MAKER_CREDITS: std::cell::RefCell<Vec<Me>> = std::cell::RefCell::new(Vec::new());
+}
+pub(crate) fn take_self_maker_credits() -> Vec<Me> {
+    SELF_MAKER_CREDITS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
 pub(crate) fn set_passthrough(list: Vec<([u8; 20], Leg, PassRole)>) {
     PASSTHROUGH.with(|p| *p.borrow_mut() = list);
 }
@@ -8461,6 +8473,12 @@ pub(crate) fn cross_engine_to_net(
                         if &maker != taker {
                             line_adjust(sandbox, &maker, gets_leg, pay, true);
                             taker_accs.1 = stamount_signed_add(false, taker_accs.1, false, g).1;
+                        } else {
+                            // Finding 294: the owner credit is still real in
+                            // rippled (`consumeOffer`'s issuer→owner send); a
+                            // caller that restores the sender's line after the
+                            // walk re-applies it — see `take_self_maker_credits`.
+                            SELF_MAKER_CREDITS.with(|c| c.borrow_mut().push(pay));
                         }
                     }
                 }

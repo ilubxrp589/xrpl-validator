@@ -1130,6 +1130,7 @@ impl PaymentTransactor {
                     crate::tx::amm_swap::set_fwd_gross_in(hop_rate.map(|_| carry));
                     crate::tx::amm_swap::set_sender_hop(i == 0);
                     crate::tx::amm_swap::set_fwd_first(!segs[..i].iter().any(|g| matches!(g, ds::SegLayout::Book { .. }))); // finding 147
+                    let _ = ox::take_self_maker_credits();
                     let (rw, rs, _c) = ox::cross_engine_to(
                         &tx.account, benef, out_target[i], avail, to, from, thr, thr, false,
                         false, single_pass, amm_fib.as_deref_mut(), None, sandbox,
@@ -1186,6 +1187,22 @@ impl PaymentTransactor {
                     // run writes the same lines for real.
                     restore(sandbox, &from_group);
                     restore(sandbox, &to_group);
+                    // Finding 294 (#107052630 32386DDEB6B8): rUnRkdr's FIL→USDT
+                    // payment through the explicit issuer hop [rsL5Y] crosses
+                    // its OWN two FIL/USDT offers. rippled's DirectStep debits
+                    // the sender the gross once and `consumeOffer`'s
+                    // issuer→owner send credits the owner the net per fill —
+                    // the same line, so only the fee stays: −(35.169 × 1.001)
+                    // − 109.4805 × 0.001. The restore above erased those
+                    // owner credits with the walk's taker moves and left the
+                    // line 109.48 low; they land again here, per fill, in
+                    // order, on the run-fed leg the run already debited.
+                    let self_credits = ox::take_self_maker_credits();
+                    if fed_by_run {
+                        for c in self_credits {
+                            ox::line_adjust(sandbox, &tx.account, from, c, true);
+                        }
+                    }
                 }
             }
         }
@@ -3088,6 +3105,9 @@ impl PaymentTransactor {
         let mut rem_in_gross = spend0_gross;
         let mut rem_out = want_gross;
         let mut delivered: ox::Me = (0, 0);
+        // Finding 295: what the destination held before the rounds — the
+        // post-loop trim lands a FULL delivery on this plus the Amount.
+        let dest_held0 = crate::tx::amm_swap::holds(sandbox, dest, &want_leg);
         // NET deliveries from DIRECT strands. A book walk credits the
         // destination GROSS and the post-loop trim carves the issuer's fee
         // off; a direct strand's last hop credits exactly NET (its srcQOut
@@ -3643,12 +3663,37 @@ impl PaymentTransactor {
                 // half: #106455062 AF6A3460 (full-ledger replay) —
                 // 4369.93132409 SOLO gross over the 1.0001 issuer must
                 // deliver …652540, floor said …652539.
-                let net = if ox::me_cmp(delivered, want_gross) == std::cmp::Ordering::Equal {
+                let full = ox::me_cmp(delivered, want_gross) == std::cmp::Ordering::Equal
+                    || (ox::me_is_zero(rem_out) && !ox::me_cmp(delivered, want_gross).is_lt());
+                let net = if full {
                     want_target
                 } else {
                     ox::mul_ratio(delivered, 1_000_000_000, rate as u128, false)
                 };
-                ox::line_adjust(sandbox, dest, &want_leg, ox::me_sub(delivered, net), false);
+                if full && dest != &tx.account {
+                    // Finding 295 (#107052630 32386DDEB6B8): five book rounds
+                    // land 5.7798 + 81.7053 + 9.5571 + 13.2211 + 7.5871 USDT on
+                    // the destination's line — 117.850440708 after the line's
+                    // 16-digit adds — while the full-precision accumulator
+                    // reads …708000054, so a trim of `delivered − Amount`
+                    // took 0.117732708000054 and left …7079999999. rippled's
+                    // last DirectStep credits NET per round and the closing
+                    // round the exact remainder (the rev-cache hit), so a
+                    // completed delivery rests the line on pre + Amount to
+                    // the digit: trim (or top up) against the LINE's own
+                    // chain, not the accumulator. A circular payment's line
+                    // also carries the spend, so it keeps the accumulator.
+                    let now = crate::tx::amm_swap::holds(sandbox, dest, &want_leg);
+                    let target = ox::signed_add(false, dest_held0, false, want_target).1;
+                    // target − now: negative means the line sits ABOVE the
+                    // target and is trimmed; positive means it is topped up.
+                    let (over, d) = ox::signed_add(false, target, true, now);
+                    if !ox::me_is_zero(d) {
+                        ox::line_adjust(sandbox, dest, &want_leg, d, !over);
+                    }
+                } else {
+                    ox::line_adjust(sandbox, dest, &want_leg, ox::me_sub(delivered, net), false);
+                }
                 net
             }
             _ => delivered,
