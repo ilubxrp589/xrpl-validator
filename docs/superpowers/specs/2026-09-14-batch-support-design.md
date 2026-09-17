@@ -1,9 +1,15 @@
 # Batch (BatchV1_1) support — design
 
-**Date:** 2026-09-14 · **Branch:** t0-batch · **Status:** FFI leg implemented (t0-batch 06b21f8, 964a862) and verified —
-8 of 11 devnet Batch ledgers CLEAN, the other 3 diverge only on VaultDeposit /
-LoanPay hydration (devnet-only amendments); mainnet fixture 106980883 CLEAN
-(no regression); 22 suites, lib, fuzz, clippy green. Native leg pending review.
+**Date:** 2026-09-14 · **Branch:** t0-batch · **Status:** Leg A deployed (cycles
+129/130). Leg B implemented on branch t0-batch-b (plan
+docs/superpowers/plans/2026-09-17-batch-leg-b-native-transactor.md):
+BatchTransactor + shadow attribution; devnet vectors byte-exact; dp on both
+devnet Batch ledgers (l5309670: 6/6 attempted txs MATCH, outer
+0DB84681FAAD1C… verdict=MATCH our_ter=net_ter=tesSUCCESS our_muts=net_muts=3;
+l5309584: 3/3 attempted txs MATCH, outer C2E675EEF5AD8… verdict=MATCH
+our_ter=net_ter=tesSUCCESS our_muts=net_muts=3), zero DIVERGE-TER/DIVERGE-MUT
+on either ledger, no threading-fallback receipts. Awaiting the next deploy
+cycle.
 
 ## Why now
 
