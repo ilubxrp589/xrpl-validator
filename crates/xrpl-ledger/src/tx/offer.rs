@@ -8541,6 +8541,72 @@ pub(crate) fn cross_engine_to_net(
                     );
                 }
                 if done(rem_pays, rem_gets) {
+                    // Finding 291 (#107044846 21AFDEFB and nine siblings, 107044848-857,
+                    // rGH4WSUU's Fill-or-Kill RLUSD buys): rippled's remainingOut is
+                    // `outReq - sum(savedOuts)` RE-DERIVED at every iteration
+                    // boundary (StrandFlow.h:791) from the ASCENDING multiset —
+                    // never the running chain. Four iterations (24.33333333333333,
+                    // 20.20166157769699, 1.041989285030025, 0.08777380393965)
+                    // decrement the chain to exactly zero, but the sorted fold is
+                    // 45.66475799999999 against 45.664758 wanted — a 1e-14 crumb —
+                    // so rippled runs a FIFTH iteration for it: the tip prices the
+                    // crumb at one drop (`in: 1 out: 1e-14`), the strand's realised
+                    // quality misses limitQuality ("Path rejected by limitQuality
+                    // limit: 6492916584215336950 path q: 7134701809754865664"),
+                    // "All strands dry", Total flow out 45.66475799999999 ≠ outReq
+                    // → the Fill-or-Kill is tecKILLED with 3 mutations. We believed
+                    // the chain, filled, and reported tesSUCCESS with 19. So: bank
+                    // this iteration and re-derive BEFORE believing `done`. A crumb
+                    // that survives the fold is a real want; when the taker pays in
+                    // drops the crumb's one-drop price can never meet the limit (a
+                    // crumb is at most an ulp of the sum: crumb × limit < 1 drop
+                    // unless TakerGets ≥ 1e9 XRP), so the crossing ends with the
+                    // crumb outstanding and the verdict follows from it. An IOU-in
+                    // crumb prices to a representable sliver rippled would judge on
+                    // its merits and usually fill — not modelled here (the running
+                    // zero stands), narrated so a receipt can name it.
+                    let mut folded_crumb = false;
+                    if fold_rem && !me_is_zero(level_out_acc) {
+                        saved_level_outs.push(level_out_acc);
+                        level_out_acc = (0, 0);
+                        let rem_pays_fold = if offer_crossing && !pays_leg.xrp {
+                            let (neg, m) = stamount_signed_add(false, out_req0, true, fold16(&mut saved_level_outs));
+                            if neg { (0, 0) } else { m }
+                        } else {
+                            me_sub(out_req0, fold16(&mut saved_level_outs))
+                        };
+                        if !level_ins.is_empty() {
+                            saved_level_ins.push(fold16(&mut level_ins));
+                            level_ins.clear();
+                            level_in_acc = (0, 0);
+                        }
+                        let rem_gets_fold = if !in_fold_off {
+                            stamount_signed_add(false, in_req0, true, fold16(&mut saved_level_ins)).1
+                        } else {
+                            rem_gets
+                        };
+                        if !done(rem_pays_fold, rem_gets_fold) {
+                            // The crumb iteration: rejected by limitQuality when
+                            // even one drop over-prices it.
+                            let one_drop_rejects = gets_leg.xrp
+                                && rate_of_me((1, 0), rem_pays_fold).is_some_and(|q| q > thr_judge);
+                            if std::env::var("DX_FOLD").is_ok() {
+                                eprintln!(
+                                    "DX_FOLD F291 crumb after fold: rem_pays {rem_pays:?} -> {rem_pays_fold:?} rem_gets {rem_gets:?} -> {rem_gets_fold:?} xrp_in={} one_drop_rejects={one_drop_rejects}",
+                                    gets_leg.xrp
+                                );
+                            }
+                            if one_drop_rejects {
+                                rem_pays = rem_pays_fold;
+                                rem_gets = rem_gets_fold;
+                                folded_crumb = true;
+                            }
+                        } else {
+                            rem_pays = rem_pays_fold;
+                            rem_gets = rem_gets_fold;
+                        }
+                    }
+                    let _ = folded_crumb;
                     // rippled does not stop at a satisfied fill. Its reverse
                     // pass returns TRUE from the offer callback whenever the
                     // step's output fits inside what is still wanted —
@@ -8623,6 +8689,7 @@ pub(crate) fn cross_engine_to_net(
         if fold_rem && !me_is_zero(level_out_acc) {
             saved_level_outs.push(level_out_acc);
             level_out_acc = (0, 0);
+            if std::env::var("DX_FOLD").is_ok() { eprintln!("DX_FOLD level-boundary at line {}: banked={saved_level_outs:?}", 8624); }
             rem_pays = if offer_crossing && !pays_leg.xrp {
                 // finding 173: 16-digit remainingOut (see the per-fill fold)
                 let (neg, m) = stamount_signed_add(false, out_req0, true, fold16(&mut saved_level_outs));

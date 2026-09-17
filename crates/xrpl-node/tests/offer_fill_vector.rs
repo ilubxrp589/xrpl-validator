@@ -1402,3 +1402,20 @@ fn offer_direct_strand_rev_extent_reaps_the_unfunded_offer_behind_the_head_10698
 fn offer_bridge_admission_reads_the_raw_book_tip_expired_or_not_106990975() {
     run_bundle(include_str!("vectors/offer_bridge_admission_reads_the_raw_book_tip_expired_or_not_106990975.json"));
 }
+
+/// Finding 291 (#107044846 21AFDEFB, and 107044848-857: ten consecutive
+/// tecKILLED receipts from rGH4WSUU's Fill-or-Kill RLUSD buys, 06:23-06:40
+/// on 2026-09-17): rippled derives remainingOut at every iteration boundary
+/// as `outReq - sum(savedOuts)` over the ASCENDING multiset (StrandFlow.h:791),
+/// never as a running chain. Four iterations — 24.33333333333333,
+/// 20.20166157769699, 1.041989285030025, 0.08777380393965 — decrement the
+/// chain to exactly zero, but the sorted 16-digit fold is 45.66475799999999
+/// against 45.664758 wanted, so rippled runs a fifth iteration for the 1e-14
+/// crumb, prices it at one drop, rejects the strand by limitQuality ("path q:
+/// 7134701809754865664"), finds all strands dry, and kills the offer with 3
+/// mutations. We believed the chain, filled, and reported tesSUCCESS with 19.
+/// The done check now banks the iteration and re-derives from the fold first.
+#[test]
+fn offer_fill_or_kill_is_judged_on_the_sorted_fold_not_the_running_chain_107044846() {
+    run_bundle(include_str!("vectors/offer_fill_or_kill_is_judged_on_the_sorted_fold_not_the_running_chain_107044846.json"));
+}
