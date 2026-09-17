@@ -189,9 +189,13 @@ pub enum TxResult {
     InvalidFlag,
     /// temREDUNDANT — Batch: duplicate inner, or duplicate (account, sequence) under AllOrNothing/UntilFailure.
     Redundant,
-    /// temBAD_SIGNER — Batch: BatchSigners not sorted/unique, missing or spurious signer.
+    /// temBAD_SIGNER — Batch: BatchSigners not sorted/unique, missing or
+    /// spurious signer, a signer that is the outer account; also an inner
+    /// carrying a Signers field.
     BadSigner,
-    /// temINVALID_INNER_BATCH — an inner without tfInnerBatchTxn, or tfInnerBatchTxn without a parent batch.
+    /// temINVALID_INNER_BATCH — Batch: an inner of a disabled/pseudo type,
+    /// or an inner that otherwise fails its own preflight (rippled's
+    /// `xrpl::preflight(..., TapBatch, ...)` call on the inner).
     InvalidInnerBatch,
     /// temARRAY_EMPTY — Batch: RawTransactions absent or empty.
     ArrayEmpty,
@@ -199,8 +203,10 @@ pub enum TxResult {
     TemArrayTooLarge,
     /// temSEQ_AND_TICKET — an inner with both or neither of Sequence / TicketSequence.
     SeqAndTicket,
-    /// temBAD_SIGNATURE — an inner carrying SigningPubKey / TxnSignature / Signers.
+    /// temBAD_SIGNATURE — an inner carrying TxnSignature.
     BadSignature,
+    /// temBAD_REGKEY — an inner carrying a non-empty SigningPubKey.
+    BadRegKey,
     /// temINVALID — an inner of a disallowed type (Batch inside Batch, pseudo types).
     InvalidTx,
 
@@ -365,6 +371,7 @@ impl TxResult {
             TxResult::TemArrayTooLarge => "temARRAY_TOO_LARGE",
             TxResult::SeqAndTicket => "temSEQ_AND_TICKET",
             TxResult::BadSignature => "temBAD_SIGNATURE",
+            TxResult::BadRegKey => "temBAD_REGKEY",
             TxResult::InvalidTx => "temINVALID",
             TxResult::PastSeq => "tefPAST_SEQ",
             TxResult::MaxLedger => "tefMAX_LEDGER",
@@ -741,10 +748,11 @@ mod tests {
         assert_eq!(TxResult::TemArrayTooLarge.code_str(), "temARRAY_TOO_LARGE");
         assert_eq!(TxResult::SeqAndTicket.code_str(), "temSEQ_AND_TICKET");
         assert_eq!(TxResult::BadSignature.code_str(), "temBAD_SIGNATURE");
+        assert_eq!(TxResult::BadRegKey.code_str(), "temBAD_REGKEY");
         assert_eq!(TxResult::InvalidTx.code_str(), "temINVALID");
         for r in [TxResult::InvalidFlag, TxResult::Redundant, TxResult::BadSigner,
                   TxResult::InvalidInnerBatch, TxResult::ArrayEmpty, TxResult::TemArrayTooLarge,
-                  TxResult::SeqAndTicket, TxResult::BadSignature, TxResult::InvalidTx] {
+                  TxResult::SeqAndTicket, TxResult::BadSignature, TxResult::BadRegKey, TxResult::InvalidTx] {
             assert!(!r.is_claimed(), "{:?} is a tem code, never claimed", r);
             assert!(!r.is_success());
         }

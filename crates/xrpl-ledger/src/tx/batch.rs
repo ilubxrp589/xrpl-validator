@@ -13,12 +13,17 @@ use crate::tx::dispatch::{apply_on_sandbox, is_pseudo};
 use serde_json::Value;
 use std::cell::RefCell;
 
+// Result codes below track rippled 3.3.0
+// (libxrpl/tx/transactors/system/Batch.cpp), not the older FFI-vendored copy.
 pub const TF_ALL_OR_NOTHING: u64 = 0x0001_0000;
 pub const TF_ONLY_ONE: u64 = 0x0002_0000;
 pub const TF_UNTIL_FAILURE: u64 = 0x0004_0000;
 pub const TF_INDEPENDENT: u64 = 0x0008_0000;
 pub const TF_INNER_BATCH_TXN: u64 = 0x4000_0000;
 pub const MAX_BATCH_TX_COUNT: usize = 8;
+/// `kMaxBatchSigners = kMaxBatchTxCount * 3` (Protocol.h) — the BatchSigners
+/// cap is independent of, and larger than, the inner-transaction cap.
+pub const MAX_BATCH_SIGNERS: usize = MAX_BATCH_TX_COUNT * 3;
 const MODE_MASK: u64 = TF_ALL_OR_NOTHING | TF_ONLY_ONE | TF_UNTIL_FAILURE | TF_INDEPENDENT;
 
 thread_local! {
@@ -26,8 +31,11 @@ thread_local! {
 }
 
 /// The per-inner results of the last `do_apply` on this thread, in
-/// RawTransactions order, drained on read. The shadow reports them beside
-/// the inner entries' recorded results.
+/// RawTransactions order, drained on read. Meaningful only immediately after
+/// a `Batch` `do_apply` on this thread — `do_apply` clears this at entry, so
+/// a batch that fails preflight/preclaim (and so never reaches `do_apply`)
+/// never exposes a previous batch's results, and a second call here (with no
+/// intervening `do_apply`) drains an empty `Vec`.
 pub fn take_inner_results() -> Vec<String> {
     INNER_RESULTS.with(|r| std::mem::take(&mut *r.borrow_mut()))
 }
@@ -54,8 +62,12 @@ fn signer_accounts(outer: &Value) -> Option<Vec<[u8; 20]>> {
     Some(out)
 }
 
-/// The engine's account dialect is 40 hex chars; `TxFields::from_json`
-/// decodes the same way — keep the two in step.
+/// `TxFields::from_json` decodes accounts via `tx::offer::decode20` (hex
+/// first, base58 fallback), but hex alone suffices here: by the time a
+/// transaction reaches this engine, `native_apply::hexify_addresses` has
+/// already rewritten every r-address to hex — including inside nested
+/// `RawTransactions` — so a `Batch`'s inner and `BatchSigner` accounts are
+/// always the 40-hex-char dialect.
 fn decode_account(s: &str) -> Option<[u8; 20]> {
     let b = hex::decode(s).ok()?;
     <[u8; 20]>::try_from(b.as_slice()).ok()
@@ -72,28 +84,51 @@ pub fn batch_base_fee(outer: &Value, base_fee_drops: u64) -> u64 {
 pub struct BatchTransactor;
 
 impl BatchTransactor {
+    /// Per-inner checks, in rippled 3.3.0's order (Batch.cpp preflight):
+    /// nested `Batch` → `temINVALID`; a disabled/pseudo inner type → the
+    /// same `temINVALID_INNER_BATCH` a failing inner preflight produces
+    /// (rippled's `kDisabledTxTypes` check and its `xrpl::preflight(...,
+    /// TapBatch, ...)` call both fold into that code — a pseudo type fails
+    /// the inner's own `preflight0`, since `isPseudoTx(tx) &&
+    /// tx.isFlag(tfInnerBatchTxn)` is `temINVALID_FLAG` there, which the
+    /// outer then reports as `temINVALID_INNER_BATCH`); missing
+    /// `tfInnerBatchTxn` → `temINVALID_FLAG`; `checkSignatureFields` split
+    /// three ways (`TxnSignature` → `temBAD_SIGNATURE`, `Signers` →
+    /// `temBAD_SIGNER`, non-empty `SigningPubKey` → `temBAD_REGKEY`); a
+    /// non-zero `Fee` → `temBAD_FEE`; an inner that fails to parse (our
+    /// stand-in for "fails its own preflight") → `temINVALID_INNER_BATCH`;
+    /// both or neither of `Sequence`/`TicketSequence` → `temSEQ_AND_TICKET`.
     fn preflight_inner(inner: &Value) -> TxResult {
         let ty = inner.get("TransactionType").and_then(|t| t.as_str()).unwrap_or("");
-        if ty == "Batch" || is_pseudo(ty) {
+        if ty == "Batch" {
             return TxResult::InvalidTx;
         }
-        if flags_of(inner) & TF_INNER_BATCH_TXN == 0 {
+        if is_pseudo(ty) {
             return TxResult::InvalidInnerBatch;
+        }
+        if flags_of(inner) & TF_INNER_BATCH_TXN == 0 {
+            return TxResult::InvalidFlag;
+        }
+        if inner.get("TxnSignature").is_some() {
+            return TxResult::BadSignature;
+        }
+        if inner.get("Signers").is_some() {
+            return TxResult::BadSigner;
+        }
+        let spk_empty = inner.get("SigningPubKey").map(|k| k.as_str() == Some("")).unwrap_or(true);
+        if !spk_empty {
+            return TxResult::BadRegKey;
         }
         if inner.get("Fee").and_then(|f| f.as_str()) != Some("0") {
             return TxResult::BadFee;
         }
-        let spk_empty = inner.get("SigningPubKey").map(|k| k.as_str() == Some("")).unwrap_or(true);
-        if !spk_empty || inner.get("TxnSignature").is_some() || inner.get("Signers").is_some() {
-            return TxResult::BadSignature;
+        if TxFields::from_json(inner).is_none() {
+            return TxResult::InvalidInnerBatch;
         }
         let has_seq = inner.get("Sequence").and_then(|s| s.as_u64()).map(|s| s != 0).unwrap_or(false);
         let has_ticket = inner.get("TicketSequence").is_some();
         if has_seq == has_ticket {
             return TxResult::SeqAndTicket;
-        }
-        if TxFields::from_json(inner).is_none() {
-            return TxResult::Malformed;
         }
         TxResult::Success
     }
@@ -108,12 +143,35 @@ impl Transactor for BatchTransactor {
         if (flags & MODE_MASK).count_ones() != 1 || flags & TF_INNER_BATCH_TXN != 0 {
             return TxResult::InvalidFlag;
         }
+        // `RawTransactions` must be present and, if so, every element must
+        // be `{"RawTransaction": {…object…}}` — rippled fails
+        // deserialization on anything else, before `Batch::preflight` ever
+        // runs. Checked structurally *before* counting inners: silently
+        // dropping a malformed element (as a naive filter_map would) could
+        // let a too-large array slip under the inner-count cap.
+        let Some(raw_arr) = tx.fields.get("RawTransactions").and_then(|v| v.as_array()) else {
+            return TxResult::ArrayEmpty;
+        };
+        if !raw_arr.iter().all(|e| matches!(e.get("RawTransaction"), Some(Value::Object(_)))) {
+            return TxResult::Malformed;
+        }
         let inners = inner_jsons(&tx.fields);
-        if inners.is_empty() {
+        // rippled: `if (rawTxns.size() <= 1) return temARRAY_EMPTY;` — a
+        // single-inner batch is rejected, not just an empty one.
+        if inners.len() <= 1 {
             return TxResult::ArrayEmpty;
         }
         if inners.len() > MAX_BATCH_TX_COUNT {
             return TxResult::TemArrayTooLarge;
+        }
+        // BatchSigners' size cap (kMaxBatchSigners = kMaxBatchTxCount * 3),
+        // checked before the inner loop, same as rippled.
+        if let Some(v) = tx.fields.get("BatchSigners") {
+            match v.as_array() {
+                Some(a) if a.len() > MAX_BATCH_SIGNERS => return TxResult::TemArrayTooLarge,
+                Some(_) => {}
+                None => return TxResult::BadSigner,
+            }
         }
         let mut seen_json: Vec<&Value> = Vec::with_capacity(inners.len());
         let mut seen_seq: Vec<([u8; 20], u64)> = Vec::with_capacity(inners.len());
@@ -152,9 +210,6 @@ impl Transactor for BatchTransactor {
                 None => return TxResult::BadSigner,
             },
         };
-        if signers.len() > MAX_BATCH_TX_COUNT {
-            return TxResult::TemArrayTooLarge;
-        }
         if signers.windows(2).any(|w| w[0] >= w[1]) {
             return TxResult::BadSigner;
         }
@@ -197,6 +252,13 @@ impl Transactor for BatchTransactor {
     /// rollback; AllOrNothing's `return false` is a restore to the entry
     /// snapshot. The outer's own result is always tesSUCCESS.
     fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        // Clear any previous batch's results up front: `take_inner_results`
+        // must never expose a stale read from an earlier `Batch` on this
+        // thread if this one turns out not to reach the loop below (it
+        // always does today — `do_apply` only runs after preflight and
+        // preclaim both succeed — but this keeps the invariant local rather
+        // than relying on that).
+        INNER_RESULTS.with(|r| r.borrow_mut().clear());
         let flags = flags_of(&tx.fields);
         let batch_snap = sandbox.snapshot();
         let mut results: Vec<String> = Vec::new();
@@ -284,22 +346,54 @@ mod tests {
     #[test]
     fn preflight_rejects_empty_and_oversized_inner_arrays() {
         assert_eq!(pf(&outer(TF_INDEPENDENT, vec![], None)), "temARRAY_EMPTY");
+        assert_eq!(
+            pf(&outer(TF_INDEPENDENT, vec![inner_payment(1, 2, 1, 6)], None)),
+            "temARRAY_EMPTY",
+            "rippled 3.3.0: rawTxns.size() <= 1 is temARRAY_EMPTY, not just 0"
+        );
         let nine: Vec<Value> = (0..9).map(|i| inner_payment(1, 2, 1, 10 + i)).collect();
         assert_eq!(pf(&outer(TF_INDEPENDENT, nine, None)), "temARRAY_TOO_LARGE");
+        let mut no_raw_txns = outer(TF_INDEPENDENT, vec![inner_payment(1, 2, 1, 6), inner_payment(1, 2, 1, 7)], None);
+        no_raw_txns.as_object_mut().expect("object").remove("RawTransactions");
+        assert_eq!(pf(&no_raw_txns), "temARRAY_EMPTY", "RawTransactions absent entirely");
+    }
+
+    #[test]
+    fn preflight_rejects_a_malformed_raw_transactions_element_even_under_the_inner_count_cap() {
+        // A 9-element array where one entry lacks "RawTransaction" must not
+        // silently filter down to 8 well-formed inners and pass the ≤8 gate.
+        let mut nine: Vec<Value> = (0..9).map(|i| inner_payment(1, 2, 1, 10 + i)).collect();
+        nine[3] = json!({"NotARawTransaction": {}});
+        assert_eq!(pf(&outer(TF_INDEPENDENT, nine, None)), "temMALFORMED");
     }
 
     #[test]
     fn preflight_checks_each_inner_s_field_rules() {
+        // rippled 3.3.0: a missing tfInnerBatchTxn is temINVALID_FLAG (the
+        // inner's own preflight0 check), not temINVALID_INNER_BATCH.
         let mut bad_flag = inner_payment(1, 2, 1, 6); bad_flag["RawTransaction"]["Flags"] = json!(0);
-        assert_eq!(pf(&outer(TF_INDEPENDENT, vec![bad_flag, inner_payment(1, 2, 1, 7)], None)), "temINVALID_INNER_BATCH");
+        assert_eq!(pf(&outer(TF_INDEPENDENT, vec![bad_flag, inner_payment(1, 2, 1, 7)], None)), "temINVALID_FLAG");
         let mut bad_fee = inner_payment(1, 2, 1, 6); bad_fee["RawTransaction"]["Fee"] = json!("10");
         assert_eq!(pf(&outer(TF_INDEPENDENT, vec![bad_fee, inner_payment(1, 2, 1, 7)], None)), "temBAD_FEE");
-        let mut signed = inner_payment(1, 2, 1, 6); signed["RawTransaction"]["TxnSignature"] = json!("3045");
-        assert_eq!(pf(&outer(TF_INDEPENDENT, vec![signed, inner_payment(1, 2, 1, 7)], None)), "temBAD_SIGNATURE");
         let mut both = inner_payment(1, 2, 1, 6); both["RawTransaction"]["TicketSequence"] = json!(9);
         assert_eq!(pf(&outer(TF_INDEPENDENT, vec![both, inner_payment(1, 2, 1, 7)], None)), "temSEQ_AND_TICKET");
         let mut nested = inner_payment(1, 2, 1, 6); nested["RawTransaction"]["TransactionType"] = json!("Batch");
         assert_eq!(pf(&outer(TF_INDEPENDENT, vec![nested, inner_payment(1, 2, 1, 7)], None)), "temINVALID");
+        // A pseudo-transaction type as an inner fails the inner's own
+        // preflight0 (isPseudoTx && tfInnerBatchTxn -> temINVALID_FLAG
+        // there), which Batch::preflight reports as temINVALID_INNER_BATCH.
+        let mut pseudo = inner_payment(1, 2, 1, 6); pseudo["RawTransaction"]["TransactionType"] = json!("EnableAmendment");
+        assert_eq!(pf(&outer(TF_INDEPENDENT, vec![pseudo, inner_payment(1, 2, 1, 7)], None)), "temINVALID_INNER_BATCH");
+    }
+
+    #[test]
+    fn preflight_splits_the_three_signature_field_rejections() {
+        let mut txn_sig = inner_payment(1, 2, 1, 6); txn_sig["RawTransaction"]["TxnSignature"] = json!("3045");
+        assert_eq!(pf(&outer(TF_INDEPENDENT, vec![txn_sig, inner_payment(1, 2, 1, 7)], None)), "temBAD_SIGNATURE");
+        let mut signers = inner_payment(1, 2, 1, 6); signers["RawTransaction"]["Signers"] = json!([]);
+        assert_eq!(pf(&outer(TF_INDEPENDENT, vec![signers, inner_payment(1, 2, 1, 7)], None)), "temBAD_SIGNER");
+        let mut reg_key = inner_payment(1, 2, 1, 6); reg_key["RawTransaction"]["SigningPubKey"] = json!("EDABCD");
+        assert_eq!(pf(&outer(TF_INDEPENDENT, vec![reg_key, inner_payment(1, 2, 1, 7)], None)), "temBAD_REGKEY");
     }
 
     #[test]
@@ -310,6 +404,17 @@ mod tests {
         assert_eq!(pf(&same_seq), "temREDUNDANT", "same (account, sequence) under UntilFailure");
         let same_seq_ok = outer(TF_INDEPENDENT, vec![inner_payment(1, 2, 1, 6), inner_payment(1, 2, 2, 6)], None);
         assert_eq!(pf(&same_seq_ok), "tesSUCCESS", "Independent tolerates a shared sequence (the second fails at apply)");
+        let same_seq_only_one = outer(TF_ONLY_ONE, vec![inner_payment(1, 2, 1, 6), inner_payment(1, 2, 2, 6)], None);
+        assert_eq!(pf(&same_seq_only_one), "tesSUCCESS", "OnlyOne is not in the AllOrNothing/UntilFailure dedup set either");
+    }
+
+    #[test]
+    fn preflight_accepts_a_ticket_sequence_only_inner() {
+        let mut ticket_only = inner_payment(1, 2, 1, 0);
+        ticket_only["RawTransaction"].as_object_mut().expect("object").remove("Sequence");
+        ticket_only["RawTransaction"]["TicketSequence"] = json!(9);
+        let o = outer(TF_INDEPENDENT, vec![ticket_only, inner_payment(1, 2, 1, 7)], None);
+        assert_eq!(pf(&o), "tesSUCCESS");
     }
 
     #[test]
@@ -321,6 +426,17 @@ mod tests {
         assert_eq!(pf(&outer(TF_INDEPENDENT, vec![inner_payment(1, 2, 1, 6), inner_payment(3, 2, 1, 1)], Some(vec![1, 3]))), "temBAD_SIGNER");
         assert_eq!(pf(&outer(TF_INDEPENDENT, vec![inner_payment(1, 2, 1, 6), inner_payment(3, 2, 1, 1)], Some(vec![3, 4]))), "temBAD_SIGNER");
         assert_eq!(pf(&outer(TF_INDEPENDENT, vec![inner_payment(3, 2, 1, 1), inner_payment(4, 2, 1, 1)], Some(vec![4, 3]))), "temBAD_SIGNER");
+    }
+
+    #[test]
+    fn preflight_rejects_more_than_max_batch_signers() {
+        assert_eq!(MAX_BATCH_SIGNERS, 24, "kMaxBatchSigners = kMaxBatchTxCount * 3");
+        // The cap is checked before the signer set is matched against the
+        // inners, so a batch that would fail for other reasons still trips
+        // temARRAY_TOO_LARGE first once the count exceeds 24.
+        let signers: Vec<u8> = (10..(10 + MAX_BATCH_SIGNERS as u8 + 1)).collect();
+        let o = outer(TF_INDEPENDENT, vec![inner_payment(1, 2, 1, 6), inner_payment(1, 2, 1, 7)], Some(signers));
+        assert_eq!(pf(&o), "temARRAY_TOO_LARGE");
     }
 
     #[test]
@@ -397,7 +513,7 @@ mod tests {
         o["RawTransactions"][1]["RawTransaction"]["Sequence"] = json!(99);
         let (sb, r, inners) = run(&o, &state);
         assert_eq!(r, "tesSUCCESS", "the outer itself succeeds");
-        assert_eq!(inners.len(), 2);
+        assert_eq!(inners, vec!["tesSUCCESS", "temBAD_SEQUENCE"]);
         assert_eq!(balance_seq(&sb, 1), (50_000_000 - 1000, 6), "only the outer's fee and sequence remain");
         assert_eq!(balance_seq(&sb, 2), (20_000_000, 1));
     }
@@ -423,5 +539,14 @@ mod tests {
         assert_eq!(inners.len(), 3);
         assert_eq!(balance_seq(&sb, 1), (50_000_000 - 1000 - 3_000_000, 8));
         assert_eq!(balance_seq(&sb, 2), (23_000_000, 1));
+    }
+
+    #[test]
+    fn take_inner_results_drains_and_a_second_call_is_empty() {
+        let state = state_with_accounts(&[(1, 50_000_000, 5), (2, 20_000_000, 1)]);
+        let o = outer(TF_UNTIL_FAILURE, vec![inner_payment(1, 2, 1, 6), inner_payment(1, 2, 1, 7)], None);
+        let (_sb, _r, inners) = run(&o, &state);
+        assert_eq!(inners, vec!["tesSUCCESS", "tesSUCCESS"]);
+        assert_eq!(take_inner_results(), Vec::<String>::new(), "already drained by run()'s call");
     }
 }
