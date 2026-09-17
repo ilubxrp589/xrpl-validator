@@ -30,6 +30,23 @@ the two dicts:
             the image from the LAST toucher in apply order, which is the
             post-batch image.
 
+Two further keys are written for the harness:
+
+  inner_hashes   = each inner bundle's own transaction hash, in the order
+                   the inner bundles were given on the command line, which
+                   must be the outer's RawTransactions (= TransactionIndex)
+                   order. `run_batch_bundle` pairs these with the engine's
+                   per-inner touched-key sets to thread each object with
+                   the id of the inner that last touched it.
+  inner_results  = each inner entry's own recorded TransactionResult, in
+                   the same order, which the harness asserts against
+                   `tx::batch::take_inner_results()`.
+
+Both lists cover only the inners the LEDGER FILED — a mode that stopped
+early, or an inner that failed without claiming, leaves no entry to fetch
+a bundle for — so they can be SHORTER than the outer's RawTransactions,
+never longer.
+
 The one thing that IS still fatal is an inner bundle fetched from a
 different ledger than the outer (`seq` mismatch) — that means the bundles
 don't describe the same Batch at all.
@@ -51,6 +68,13 @@ def main():
             pre.setdefault(k, v)
         for k, v in b.get("expect", {}).items():
             expect[k] = v
+    # A ledger files at most one entry per RawTransactions element, so more
+    # inner bundles than the outer has inners means the wrong bundles were
+    # named on the command line — and every later pairing would be off by one.
+    n_raw = len(outer["tx"].get("RawTransactions", []))
+    assert len(inners) <= n_raw, (
+        f"{len(inners)} inner bundles but the outer carries {n_raw} RawTransactions"
+    )
     merged["pre"], merged["expect"] = pre, expect
     merged["inner_hashes"] = [b["tx"]["hash"] for b in inners]
     merged["inner_results"] = [b["result"] for b in inners]
