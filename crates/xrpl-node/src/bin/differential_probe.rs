@@ -2445,10 +2445,16 @@ fn run() -> i32 {
     // RawTransactions — leg A names them the same way
     // (`xrpl_ffi::batch_inner_ids` off the outer's blob).
     //
-    // Ids the fixture does not carry are dropped: a mode that stops early
-    // (tfUntilFailure, tfOnlyOne) leaves its untried inners out of the ledger,
-    // and the kept list must stay index-aligned with the engine's per-inner
-    // results, which cover exactly the inners it ATTEMPTED.
+    // The list is EVERY inner, in RawTransactions order — including the ones
+    // the ledger did not file. A mode that stops early (tfUntilFailure,
+    // tfOnlyOne), an inner that failed without claiming, a tfAllOrNothing
+    // batch that was discarded: each leaves a different hole in the FILED set,
+    // and the engine reports one result per inner it ATTEMPTED. Keeping only
+    // the filed ids and zipping by index shifts every later inner onto its
+    // neighbour's verdict, so the two are paired BY ID below
+    // (`native_apply::pair_inner_verdicts`). Ids the fixture does not carry
+    // simply have no expected metadata and no filed TER — which is itself the
+    // expectation that inner was not applied.
     let mut batch_skip: HashSet<String> = HashSet::new();
     let mut batch_inners: HashMap<String, Vec<String>> = HashMap::new();
     for h in &order {
@@ -2456,10 +2462,9 @@ fn run() -> i32 {
         if txj["TransactionType"].as_str() != Some("Batch") {
             continue;
         }
-        let ids: Vec<String> = xrpl_node::native_apply::batch_inner_ids(txj)
-            .into_iter()
-            .filter(|id| txmap.contains_key(id.as_str()))
-            .collect();
+        let ids: Vec<String> = xrpl_node::native_apply::batch_inner_ids(txj);
+        // Only ids the fixture actually carries can appear in `order`; the
+        // rest never match anything and are harmless in the skip set.
         batch_skip.extend(ids.iter().cloned());
         batch_inners.insert(h.to_uppercase(), ids);
     }
@@ -2753,32 +2758,43 @@ fn run() -> i32 {
         // A Batch is threaded PER INNER: rippled applies each inner as its own
         // transaction, so the objects an inner touched carry the INNER's hash
         // and only the outer's own changes (its fee and sequence) carry the
-        // outer's. The ledger's inner hashes, in TransactionIndex order, pair
-        // with the engine's per-inner touched-key sets. Drain those on EVERY
-        // Batch outer, for the same staleness reason the per-inner results
-        // below are drained unconditionally — the cell is cleared at do_apply
-        // entry, so an outer that never got there would otherwise leave the
-        // PREVIOUS batch's sets for the next reader.
-        let inner_touched = if tx_type == "Batch" {
+        // outer's. `batch_inners` holds every inner id in RawTransactions
+        // order; an inner the ledger never filed has an empty touched set, so
+        // nothing is stamped with its hash. Drain the sets on EVERY Batch
+        // outer, for the same staleness reason the per-inner results below are
+        // drained unconditionally — the cell is cleared at do_apply entry, so
+        // an outer that never got there would otherwise leave the PREVIOUS
+        // batch's sets for the next reader.
+        let inner_ids: &[String] =
+            batch_inners.get(&h.to_uppercase()).map(Vec::as_slice).unwrap_or(&[]);
+        let mut inner_touched = if tx_type == "Batch" {
             xrpl_ledger::tx::batch::take_inner_touched()
         } else {
             Vec::new()
         };
-        match batch_inners.get(&h.to_uppercase()) {
-            Some(inners) => xrpl_ledger::ledger::threading::stamp_batch_threading(
+        // One set per ATTEMPTED inner, one id per inner: pad so the pairing
+        // lines up. A vector LONGER than the ids means an id could not be
+        // recomputed — stamp_batch_threading's own guard then stamps the outer
+        // alone, and the TER guard below withholds the inner verdicts.
+        if inner_touched.len() < inner_ids.len() {
+            inner_touched.resize(inner_ids.len(), Vec::new());
+        }
+        if inner_ids.is_empty() {
+            xrpl_ledger::ledger::threading::stamp_threading(
                 &mut mods,
                 &|k| state.state_map.lookup(k).map(|b| b.to_vec()),
                 h,
                 seq as u32,
-                inners,
+            );
+        } else {
+            xrpl_ledger::ledger::threading::stamp_batch_threading(
+                &mut mods,
+                &|k| state.state_map.lookup(k).map(|b| b.to_vec()),
+                h,
+                seq as u32,
+                inner_ids,
                 &inner_touched,
-            ),
-            None => xrpl_ledger::ledger::threading::stamp_threading(
-                &mut mods,
-                &|k| state.state_map.lookup(k).map(|b| b.to_vec()),
-                h,
-                seq as u32,
-            ),
+            );
         }
         // The inners ran inside our do_apply; their per-inner results come back
         // through the ledger crate's thread-local, in the same order. Drained
@@ -2792,31 +2808,43 @@ fn run() -> i32 {
             Vec::new()
         };
         let mut inner_ter: Vec<String> = Vec::new();
-        let inners = batch_inners.get(&h.to_uppercase()).map(Vec::as_slice).unwrap_or(&[]);
-        if inners.len() != inner_results.len() {
-            // The ids are the inners the LEDGER filed, the results the inners
-            // the engine ATTEMPTED. Pairing them by index is only meaningful
-            // while the two agree: one hole in either list shifts every later
-            // inner onto its neighbour's result and would report a confident,
-            // wrong verdict. So no per-inner comparison is made — but the
+        if inner_results.len() > inner_ids.len() {
+            // One result per ATTEMPTED inner can never outnumber the inners
+            // themselves: more results than ids means an id could not be
+            // recomputed from the outer's RawTransactions, and then NO pairing
+            // is trustworthy. So no per-inner comparison is made — but the
             // outer still DIVERGEs, so a withheld comparison cannot pass as a
             // MATCH. The receipt mirrors stamp_batch_threading's fallback line
             // (threading.rs:289-296), which the same disagreement triggers.
             eprintln!(
                 "  BATCH-INNER {h}: {} inner ids vs {} results — inner verdicts withheld",
-                inners.len(),
+                inner_ids.len(),
                 inner_results.len()
             );
             inner_ter.push(format!(
                 "withheld:{}ids-vs-{}results",
-                inners.len(),
+                inner_ids.len(),
                 inner_results.len()
             ));
         } else {
-            for (i, ih) in inners.iter().enumerate() {
-                let want = txmap.get(ih.as_str()).and_then(|t| t["ter"].as_str()).unwrap_or("?");
-                let got = inner_results.get(i).map(String::as_str).unwrap_or("(not run)");
-                if got != want {
+            // Paired BY ID: the fixture's `ter` for every inner it carries,
+            // and "not applied" for the inners the ledger never filed — for
+            // which any tes or tec of ours is the mismatch.
+            let filed: HashMap<String, String> = inner_ids
+                .iter()
+                .filter_map(|id| {
+                    let t = txmap.get(id.as_str())?["ter"].as_str()?;
+                    Some((id.clone(), t.to_string()))
+                })
+                .collect();
+            for (i, ih, want, mismatch) in
+                xrpl_node::native_apply::pair_inner_verdicts(inner_ids, &inner_results, &filed)
+            {
+                if mismatch {
+                    let got = inner_results
+                        .get(i)
+                        .map(String::as_str)
+                        .unwrap_or(xrpl_node::native_apply::INNER_NOT_ATTEMPTED);
                     eprintln!(
                         "  DIVERGE-TER {tx_type} {} INNER[{i}] {}   our_ter={got} net_ter={want}",
                         &h[..12.min(h.len())],

@@ -478,33 +478,55 @@ fn run() -> i32 {
             // A Batch is threaded PER INNER: rippled applies each inner as
             // its own transaction, so the objects an inner touched carry the
             // INNER's hash and only the outer's own changes (its fee and
-            // sequence) carry the outer's. The ledger's inner hashes, in
-            // TransactionIndex order, pair with the engine's per-inner
-            // touched-key sets. Drain those on EVERY Batch outer, for the same
+            // sequence) carry the outer's.
+            //
+            // The id list is the FULL RawTransactions order, RECOMPUTED from
+            // the outer — not `attribution.inners_of`, which reads
+            // ParentBatchID and so names only the inners the ledger FILED. An
+            // inner that failed, or that a mode never reached, has no entry at
+            // all, and the engine reports one result and one touched set per
+            // inner it ATTEMPTED: pairing those against the filed subset
+            // shifts every later inner onto its neighbour's.
+            let inner_ids: Vec<String> = if tx_type == "Batch" {
+                xrpl_node::native_apply::batch_inner_ids(tx)
+            } else {
+                Vec::new()
+            };
+            // Drain the touched sets on EVERY Batch outer, for the same
             // staleness reason the per-inner results below are drained
             // unconditionally — the cell is cleared at do_apply entry, so an
             // outer that never got there would otherwise leave the PREVIOUS
             // batch's sets for the next reader.
-            let inner_touched = if tx_type == "Batch" {
+            let mut inner_touched = if tx_type == "Batch" {
                 xrpl_ledger::tx::batch::take_inner_touched()
             } else {
                 Vec::new()
             };
-            match attribution.inners_of.get(&h_up) {
-                Some(inners) => xrpl_ledger::ledger::threading::stamp_batch_threading(
+            // One set per ATTEMPTED inner; the ids cover every inner. Pad so
+            // the two line up — an inner the mode never reached touched
+            // nothing, which is exactly an empty set. (A vector LONGER than
+            // the ids means an id could not be recomputed; the length guard
+            // inside stamp_batch_threading catches that and stamps the outer
+            // alone, and the TER guard below withholds the inner verdicts.)
+            if inner_touched.len() < inner_ids.len() {
+                inner_touched.resize(inner_ids.len(), Vec::new());
+            }
+            if inner_ids.is_empty() {
+                xrpl_ledger::ledger::threading::stamp_threading(
                     &mut mods,
                     &|k| state.read_json(k),
                     &h,
                     target,
-                    inners,
+                );
+            } else {
+                xrpl_ledger::ledger::threading::stamp_batch_threading(
+                    &mut mods,
+                    &|k| state.read_json(k),
+                    &h,
+                    target,
+                    &inner_ids,
                     &inner_touched,
-                ),
-                None => xrpl_ledger::ledger::threading::stamp_threading(
-                    &mut mods,
-                    &|k| state.read_json(k),
-                    &h,
-                    target,
-                ),
+                );
             }
             if our_ter != expected_ter {
                 eprintln!("  TER {h} {tx_type}: ours {our_ter} mainnet {expected_ter}");
@@ -518,18 +540,43 @@ fn run() -> i32 {
             } else {
                 Vec::new()
             };
-            if let Some(inners) = attribution.inners_of.get(&h_up) {
-                for (i, ih) in inners.iter().enumerate() {
-                    let want = by_hash
-                        .get(ih)
-                        .and_then(|it| it["metaData"]["TransactionResult"].as_str())
-                        .unwrap_or("?");
-                    let got = inner_results.get(i).map(String::as_str).unwrap_or("(not run)");
-                    if got != want {
-                        eprintln!(
-                            "  TER {h} {tx_type} INNER[{i}] {ih}: ours {got} mainnet {want}"
-                        );
-                        ter_mismatch += 1;
+            if !inner_ids.is_empty() {
+                if inner_results.len() > inner_ids.len() {
+                    // More results than inners means an id could not be
+                    // recomputed, so no pairing is trustworthy. Withhold the
+                    // per-inner verdicts and count the outer as a mismatch —
+                    // a withheld comparison must never read as agreement.
+                    // (differential_probe prints the same receipt.)
+                    eprintln!(
+                        "  BATCH-INNER {h}: {} inner ids vs {} results — inner verdicts withheld",
+                        inner_ids.len(),
+                        inner_results.len()
+                    );
+                    ter_mismatch += 1;
+                } else {
+                    // The ledger's verdict for every inner it FILED, by id.
+                    let filed: HashMap<String, String> = inner_ids
+                        .iter()
+                        .filter_map(|id| {
+                            let t = by_hash.get(id)?["metaData"]["TransactionResult"].as_str()?;
+                            Some((id.clone(), t.to_string()))
+                        })
+                        .collect();
+                    for (i, ih, want, mismatch) in xrpl_node::native_apply::pair_inner_verdicts(
+                        &inner_ids,
+                        &inner_results,
+                        &filed,
+                    ) {
+                        if mismatch {
+                            let got = inner_results
+                                .get(i)
+                                .map(String::as_str)
+                                .unwrap_or(xrpl_node::native_apply::INNER_NOT_ATTEMPTED);
+                            eprintln!(
+                                "  TER {h} {tx_type} INNER[{i}] {ih}: ours {got} mainnet {want}"
+                            );
+                            ter_mismatch += 1;
+                        }
                     }
                 }
             }

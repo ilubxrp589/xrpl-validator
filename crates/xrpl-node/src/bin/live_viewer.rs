@@ -1696,6 +1696,10 @@ async fn main() {
                             "txs_applied": s.txs_applied.load(Relaxed),
                             "ter_matched": s.ter_matched.load(Relaxed),
                             "ter_mismatched": s.ter_mismatched.load(Relaxed),
+                            // Batch INNER disagreements, kept OUT of
+                            // ter_mismatched so ter_matched + ter_mismatched
+                            // stays == txs_applied (one per ledger entry).
+                            "batch_inner_ter_mm": s.batch_inner_ter_mm.load(Relaxed),
                             "keys_compared": s.keys_compared.load(Relaxed),
                             "key_missing": s.key_missing.load(Relaxed),
                             "key_extra": s.key_extra.load(Relaxed),

@@ -460,7 +460,8 @@ impl TxFields {
 
 /// Account-bearing fields (other than `Account` itself) that get rewritten
 /// from base58 to hex by `TxFields::from_json` — mirrors
-/// `xrpl_node::native_apply::ACCOUNT_FIELDS`.
+/// `differential_probe`'s list of the same name, which hex-normalises a
+/// fixture's transaction JSON before the engine ever sees it.
 const ACCOUNT_FIELDS: &[&str] = &["Destination", "Owner", "Authorize", "Unauthorize", "RegularKey"];
 
 /// Trait that every transaction type implements.

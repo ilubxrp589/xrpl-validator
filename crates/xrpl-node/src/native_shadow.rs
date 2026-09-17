@@ -60,6 +60,13 @@ pub struct ShadowStats {
     pub txs_applied: AtomicU64,
     pub ter_matched: AtomicU64,
     pub ter_mismatched: AtomicU64,
+    /// Batch INNER transactions whose result disagreed with the ledger's,
+    /// counted separately and NEVER folded into `ter_mismatched`: that pair
+    /// counts ledger ENTRIES applied (`ter_matched + ter_mismatched ==
+    /// txs_applied`, one per outer), and an inner is not an entry this leg
+    /// applied on its own. A tick here with `ter_mismatched` at zero means the
+    /// outer agreed while something inside it did not.
+    pub batch_inner_ter_mm: AtomicU64,
     pub keys_compared: AtomicU64,
     pub key_missing: AtomicU64,
     pub key_extra: AtomicU64,
@@ -561,33 +568,48 @@ impl NativeShadow {
             // A Batch is threaded per inner: rippled applies each inner as
             // its own transaction, so the objects an inner touched carry the
             // INNER's hash and only the outer's own changes (its fee and
-            // sequence) carry the outer's. The ledger's inner hashes, in
-            // TransactionIndex order, pair with the engine's per-inner
-            // touched-key sets. Drain those on EVERY Batch outer, for the
-            // same staleness reason the per-inner results below are drained
+            // sequence) carry the outer's.
+            //
+            // The ids are RECOMPUTED from the outer's RawTransactions, not
+            // taken from `attribution.inners_of`: ParentBatchID names only the
+            // inners the ledger FILED, and an inner that failed, or that a
+            // mode never reached, has no entry at all. The engine reports one
+            // result and one touched set per inner it ATTEMPTED, so pairing
+            // those against the filed subset shifts every later inner onto its
+            // neighbour's. An inner with an empty touched set stamps nothing.
+            let is_batch = tx["TransactionType"].as_str() == Some("Batch");
+            let inner_ids: Vec<String> =
+                if is_batch { crate::native_apply::batch_inner_ids(tx) } else { Vec::new() };
+            // Drain the touched sets on EVERY Batch outer, for the same
+            // staleness reason the per-inner results below are drained
             // unconditionally — the cell is cleared at do_apply entry, so an
             // outer that never got there would otherwise leave the PREVIOUS
             // batch's sets for the next reader.
-            let inner_touched = if tx["TransactionType"].as_str() == Some("Batch") {
-                xrpl_ledger::tx::batch::take_inner_touched()
+            let mut inner_touched =
+                if is_batch { xrpl_ledger::tx::batch::take_inner_touched() } else { Vec::new() };
+            // One set per attempted inner, one id per inner: pad so the two
+            // line up. A vector LONGER than the ids means an id could not be
+            // recomputed — stamp_batch_threading's own guard then stamps the
+            // outer alone, and the TER guard below withholds the verdicts.
+            if inner_touched.len() < inner_ids.len() {
+                inner_touched.resize(inner_ids.len(), Vec::new());
+            }
+            if inner_ids.is_empty() {
+                xrpl_ledger::ledger::threading::stamp_threading(
+                    &mut mods,
+                    &|k| self.state.state_map.lookup(k).map(|b| b.to_vec()),
+                    &tx_hash,
+                    seq,
+                );
             } else {
-                Vec::new()
-            };
-            match attribution.inners_of.get(&this_hash) {
-                Some(inners) => xrpl_ledger::ledger::threading::stamp_batch_threading(
+                xrpl_ledger::ledger::threading::stamp_batch_threading(
                     &mut mods,
                     &|k| self.state.state_map.lookup(k).map(|b| b.to_vec()),
                     &tx_hash,
                     seq,
-                    inners,
+                    &inner_ids,
                     &inner_touched,
-                ),
-                None => xrpl_ledger::ledger::threading::stamp_threading(
-                    &mut mods,
-                    &|k| self.state.state_map.lookup(k).map(|b| b.to_vec()),
-                    &tx_hash,
-                    seq,
-                ),
+                );
             }
             st.txs_applied.fetch_add(1, Ordering::Relaxed);
             if our_ter == expected_ter {
@@ -601,11 +623,12 @@ impl NativeShadow {
                 // tells us which reconcile lane is leaking.
                 let mut stale: Vec<String> = Vec::new();
                 let mut node_sources: Vec<&Value> = vec![*tx];
-                if let Some(inners) = attribution.inners_of.get(&this_hash) {
-                    for ih in inners {
-                        if let Some(it) = by_hash.get(ih) {
-                            node_sources.push(*it);
-                        }
+                // The same recomputed id list: the ones the ledger filed have
+                // an entry here (in RawTransactions order, which for the filed
+                // subset is TransactionIndex order), the rest have none.
+                for ih in &inner_ids {
+                    if let Some(it) = by_hash.get(ih) {
+                        node_sources.push(*it);
                     }
                 }
                 // A Batch outer's expected mutation set is the union of its own
@@ -716,18 +739,49 @@ impl NativeShadow {
             } else {
                 Vec::new()
             };
-            if let Some(inners) = attribution.inners_of.get(&this_hash) {
-                for (i, ih) in inners.iter().enumerate() {
-                    let want = by_hash
-                        .get(ih)
-                        .and_then(|it| it["metaData"]["TransactionResult"].as_str())
-                        .unwrap_or("?");
-                    let got = inner_results.get(i).map(String::as_str).unwrap_or("(not run)");
-                    if got != want {
-                        // Receipt only: ter_matched + ter_mismatched counts
-                        // LEDGER ENTRIES applied (one per outer), so an inner
-                        // must not move those counters.
-                        ter_mm.push(format!("{this_hash} BATCH-INNER[{i}] {ih}: our_ter={got} net_ter={want}"));
+            if !inner_ids.is_empty() {
+                if inner_results.len() > inner_ids.len() {
+                    // One result per ATTEMPTED inner can never outnumber the
+                    // inners themselves: more results than ids means an id
+                    // could not be recomputed and no pairing is trustworthy.
+                    // Withhold the verdicts, but say so and count it — a
+                    // withheld comparison must not read as agreement.
+                    st.batch_inner_ter_mm.fetch_add(1, Ordering::Relaxed);
+                    ter_mm.push(format!(
+                        "{this_hash} BATCH-INNER: {} inner ids vs {} results — inner verdicts withheld",
+                        inner_ids.len(),
+                        inner_results.len()
+                    ));
+                } else {
+                    // Paired BY ID against what the ledger FILED: an inner
+                    // with no entry was not applied, and any tes or tec of
+                    // ours for it is the disagreement.
+                    let filed: HashMap<String, String> = inner_ids
+                        .iter()
+                        .filter_map(|id| {
+                            let t = by_hash.get(id)?["metaData"]["TransactionResult"].as_str()?;
+                            Some((id.clone(), t.to_string()))
+                        })
+                        .collect();
+                    for (i, ih, want, mismatch) in crate::native_apply::pair_inner_verdicts(
+                        &inner_ids,
+                        &inner_results,
+                        &filed,
+                    ) {
+                        if !mismatch {
+                            continue;
+                        }
+                        let got = inner_results
+                            .get(i)
+                            .map(String::as_str)
+                            .unwrap_or(crate::native_apply::INNER_NOT_ATTEMPTED);
+                        // Its own counter, never `ter_mismatched`: that pair
+                        // counts LEDGER ENTRIES applied (one per outer), so an
+                        // inner must not move it.
+                        st.batch_inner_ter_mm.fetch_add(1, Ordering::Relaxed);
+                        ter_mm.push(format!(
+                            "{this_hash} BATCH-INNER[{i}] {ih}: our_ter={got} net_ter={want}"
+                        ));
                     }
                 }
             }

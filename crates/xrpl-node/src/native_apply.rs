@@ -15,8 +15,6 @@ use xrpl_ledger::ledger::transactor::{apply_common, TxFields, TxResult};
 use xrpl_ledger::shamap::hash::{sha512_half, sha512_half_prefixed, HASH_PREFIX_TRANSACTION_ID};
 use xrpl_ledger::tx::dispatch::get_transactor;
 
-pub const ACCOUNT_FIELDS: &[&str] = &["Destination", "Owner", "Authorize", "Unauthorize", "RegularKey"];
-
 pub fn decode_address(addr: &str) -> Option<[u8; 20]> {
     const ALPHABET: &[u8] = b"rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz";
     let mut n: Vec<u8> = vec![0];
@@ -224,7 +222,15 @@ pub fn canon_for_encode(v: &mut Value) {
 /// `BatchTransactor::do_apply` does the same, so inner entries are skipped
 /// in the replay and their metadata is attributed to the outer.
 pub struct BatchAttribution {
+    /// Every entry to skip in the apply loop: it was applied inside its outer.
     pub skip: HashSet<String>,
+    /// The ledger's OWN view of the link — outer hash to the inner hashes it
+    /// FILED, in `TransactionIndex` order. Note what this cannot tell you: an
+    /// inner that failed, or that a mode never reached, has no ledger entry
+    /// and so appears nowhere here. Consumers that must line inner ids up with
+    /// the engine's per-inner results or touched sets therefore use
+    /// `batch_inner_ids`, which recomputes ALL of them from the outer's
+    /// `RawTransactions`; this map remains the ledger-side cross-check.
     pub inners_of: HashMap<String, Vec<String>>,
 }
 
@@ -356,6 +362,66 @@ pub fn batch_inner_ids(outer: &Value) -> Vec<String> {
     ids
 }
 
+/// The expectation for an inner the ledger did not file: rippled records an
+/// inner entry only when it was APPLIED (tes, or a tec that claims a fee —
+/// `apply.cpp applyBatchTransactions`), so an absent entry means the inner
+/// either never ran (a mode stopped the loop first) or ran and failed
+/// without claiming.
+pub const INNER_NOT_APPLIED: &str = "(not applied)";
+
+/// Our engine's stand-in when it never attempted an inner at all.
+pub const INNER_NOT_ATTEMPTED: &str = "(not attempted)";
+
+/// Pair a `Batch` outer's inners with their ledger verdicts BY ID.
+///
+/// The two lists do not line up positionally and never did: `ids` is every
+/// inner in `RawTransactions` order (`batch_inner_ids`), `results` holds one
+/// code per inner the engine ATTEMPTED (`tx::batch::take_inner_results`), and
+/// the ledger files only the inners that were APPLIED. tfUntilFailure stopping
+/// on inner 2 of 4, tfAllOrNothing discarding all of them and tfIndependent
+/// with a failure in the middle each leave a different hole, so zipping our
+/// results against the FILED entries shifts every later inner onto its
+/// neighbour's verdict.
+///
+/// `filed` maps an inner id (upper-case hex) to the `TransactionResult` its
+/// ledger entry recorded. For each id, in order, this returns
+/// `(index, id, expectation, mismatch)`:
+///
+///   * filed, and we attempted it — the expectation is the filed code and a
+///     mismatch is any difference;
+///   * NOT filed, and we attempted it — the expectation is
+///     `INNER_NOT_APPLIED`, and a mismatch is our producing a `tes` or `tec`
+///     code, which rippled would have filed. Any `tem`/`tef`/`ter` agrees;
+///   * NOT filed, and we never attempted it — no disagreement, no mismatch;
+///   * filed, but we never attempted it — a mismatch: the ledger applied an
+///     inner our mode stopped short of.
+///
+/// The caller supplies our own code for the receipt (`results.get(index)`) and
+/// guards the one case this cannot express: `results` longer than `ids`, which
+/// means an id could not be recomputed and every pairing is suspect.
+pub fn pair_inner_verdicts(
+    ids: &[String],
+    results: &[String],
+    filed: &HashMap<String, String>,
+) -> Vec<(usize, String, String, bool)> {
+    let mut out = Vec::with_capacity(ids.len());
+    for (i, id) in ids.iter().enumerate() {
+        let want = filed.get(id).map(String::as_str);
+        let got = results.get(i).map(String::as_str);
+        let (expectation, mismatch) = match (want, got) {
+            (Some(w), Some(g)) => (w.to_string(), w != g),
+            (None, Some(g)) => (
+                INNER_NOT_APPLIED.to_string(),
+                g.starts_with("tes") || g.starts_with("tec"),
+            ),
+            (Some(w), None) => (w.to_string(), true),
+            (None, None) => (INNER_NOT_APPLIED.to_string(), false),
+        };
+        out.push((i, id.clone(), expectation, mismatch));
+    }
+    out
+}
+
 /// One key touched by several entries of the same Batch: the expected side
 /// reports the NET effect. The rules are leg A's, verbatim
 /// (`ffi_engine.rs` `merged_expected`): Created wins over Modified, and a key
@@ -469,6 +535,119 @@ mod batch_fold_tests {
     #[test]
     fn a_transaction_without_raw_transactions_has_no_inner_ids() {
         assert!(batch_inner_ids(&json!({"TransactionType": "Payment"})).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pair_inner_verdicts_tests {
+    use super::*;
+
+    fn ids(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("{i:064X}")).collect()
+    }
+
+    fn filed(pairs: &[(usize, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(i, t)| (format!("{i:064X}"), t.to_string())).collect()
+    }
+
+    fn verdict(v: &[(usize, String, String, bool)]) -> Vec<(usize, &str, bool)> {
+        v.iter().map(|(i, _id, want, mm)| (*i, want.as_str(), *mm)).collect()
+    }
+
+    /// Every inner applied and filed: the ordinary case, index pairing and id
+    /// pairing agree, and only a real code difference is a mismatch.
+    #[test]
+    fn every_inner_filed_pairs_straight_through() {
+        let got = pair_inner_verdicts(
+            &ids(3),
+            &["tesSUCCESS".into(), "tecUNFUNDED_PAYMENT".into(), "tesSUCCESS".into()],
+            &filed(&[(0, "tesSUCCESS"), (1, "tecUNFUNDED_PAYMENT"), (2, "tesSUCCESS")]),
+        );
+        assert_eq!(
+            verdict(&got),
+            vec![(0, "tesSUCCESS", false), (1, "tecUNFUNDED_PAYMENT", false), (2, "tesSUCCESS", false)]
+        );
+
+        let wrong = pair_inner_verdicts(
+            &ids(2),
+            &["tesSUCCESS".into(), "tesSUCCESS".into()],
+            &filed(&[(0, "tesSUCCESS"), (1, "tecUNFUNDED_PAYMENT")]),
+        );
+        assert_eq!(verdict(&wrong), vec![(0, "tesSUCCESS", false), (1, "tecUNFUNDED_PAYMENT", true)]);
+    }
+
+    /// tfUntilFailure: inner 2 failed without claiming, so the ledger filed
+    /// only inner 1 and inner 3 never ran. Our tem for inner 2 agrees with
+    /// "not applied"; a tes there is the whole point of the check.
+    #[test]
+    fn until_failure_pairs_the_unfiled_inner_against_not_applied() {
+        let ok = pair_inner_verdicts(
+            &ids(3),
+            &["tesSUCCESS".into(), "temBAD_SEQUENCE".into()],
+            &filed(&[(0, "tesSUCCESS")]),
+        );
+        assert_eq!(
+            verdict(&ok),
+            vec![
+                (0, "tesSUCCESS", false),
+                (1, INNER_NOT_APPLIED, false),
+                // inner 3 was never attempted and never filed — nothing to say
+                (2, INNER_NOT_APPLIED, false),
+            ]
+        );
+
+        let bad = pair_inner_verdicts(
+            &ids(3),
+            &["tesSUCCESS".into(), "tesSUCCESS".into()],
+            &filed(&[(0, "tesSUCCESS")]),
+        );
+        assert_eq!(
+            verdict(&bad),
+            vec![(0, "tesSUCCESS", false), (1, INNER_NOT_APPLIED, true), (2, INNER_NOT_APPLIED, false)],
+            "a tes we produced for an inner the ledger never filed is a mismatch"
+        );
+    }
+
+    /// tfAllOrNothing that failed: the batch view was discarded, so NOTHING is
+    /// filed. Both a tes and a tec of ours disagree — either would have been
+    /// filed had the batch stood.
+    #[test]
+    fn all_or_nothing_with_nothing_filed_flags_every_applied_result() {
+        let got = pair_inner_verdicts(
+            &ids(2),
+            &["tesSUCCESS".into(), "tecUNFUNDED_PAYMENT".into()],
+            &HashMap::new(),
+        );
+        assert_eq!(verdict(&got), vec![(0, INNER_NOT_APPLIED, true), (1, INNER_NOT_APPLIED, true)]);
+    }
+
+    /// The other direction: the ledger filed an inner our mode stopped short
+    /// of. Nothing to compare, and silence would be the wrong answer.
+    #[test]
+    fn an_inner_the_ledger_filed_but_we_never_attempted_is_a_mismatch() {
+        let got = pair_inner_verdicts(
+            &ids(2),
+            &["temBAD_SEQUENCE".into()],
+            &filed(&[(1, "tesSUCCESS")]),
+        );
+        assert_eq!(verdict(&got), vec![(0, INNER_NOT_APPLIED, false), (1, "tesSUCCESS", true)]);
+    }
+
+    /// Pairing is by id, so a filed entry the engine reached at a DIFFERENT
+    /// index is still read against its own id, never its neighbour's.
+    #[test]
+    fn a_hole_in_the_middle_does_not_shift_later_inners() {
+        // Independent: inner 2 failed (unfiled), inners 1 and 3 applied.
+        let got = pair_inner_verdicts(
+            &ids(3),
+            &["tesSUCCESS".into(), "temBAD_SEQUENCE".into(), "tesSUCCESS".into()],
+            &filed(&[(0, "tesSUCCESS"), (2, "tesSUCCESS")]),
+        );
+        assert_eq!(
+            verdict(&got),
+            vec![(0, "tesSUCCESS", false), (1, INNER_NOT_APPLIED, false), (2, "tesSUCCESS", false)],
+            "positional pairing against the two FILED entries would read inner 3's tes against inner 2"
+        );
     }
 }
 
