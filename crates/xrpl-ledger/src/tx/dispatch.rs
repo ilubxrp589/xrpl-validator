@@ -263,7 +263,7 @@ mod apply_on_sandbox_tests {
     use crate::ledger::keylet;
     use crate::ledger::sandbox::Sandbox;
     use crate::ledger::state::LedgerState;
-    use crate::ledger::transactor::{TxFields, TxResult};
+    use crate::ledger::transactor::TxFields;
     use xrpl_core::types::Hash256;
 
     fn state_with_accounts(accts: &[([u8; 20], u64, u32)]) -> LedgerState {
@@ -353,6 +353,28 @@ mod apply_on_sandbox_tests {
         let state = state_with_accounts(&[(acct(1), 1_000_000, 5), (acct(2), 20_000_000, 1)]);
         let mut sb = Sandbox::new(&state);
         let (r, applied) = apply_on_sandbox(&payment(acct(1), acct(2), 900_000_000, 0, 5, true), &mut sb);
+        assert!(r.code_str().starts_with("tec"), "{}", r.code_str());
+        assert!(applied, "a tec is claimed: applied with the common changes only");
+        assert_eq!(balance_of(&sb, &acct(1)), (1_000_000, 6), "fee 0, sequence consumed, nothing moved");
+        assert_eq!(balance_of(&sb, &acct(2)), (20_000_000, 1));
+    }
+
+    /// tfPartialPayment (0x0002_0000) skips Payment::preclaim's pure-XRP
+    /// funding guard (payment.rs:2059-2078 — `pure_xrp && !partial`), so an
+    /// unfunded direct-XRP send fails inside do_apply instead
+    /// (payment.rs's `sender_balance < amount => TxResult::UnfundedPayment`,
+    /// just after the cross-currency/IOU dispatch). That's the branch of
+    /// apply_on_sandbox that restores to `post_common` rather than `entry` —
+    /// this test is the one that actually exercises it (tests 3 and 4 both
+    /// return from the preflight/preclaim stage, before do_apply runs).
+    #[test]
+    fn a_do_apply_tec_inner_is_applied_with_only_its_sequence_consumed() {
+        let state = state_with_accounts(&[(acct(1), 1_000_000, 5), (acct(2), 20_000_000, 1)]);
+        let mut sb = Sandbox::new(&state);
+        let mut tx = payment(acct(1), acct(2), 900_000_000, 0, 5, true);
+        // tfPartialPayment | tfInnerBatchTxn
+        tx.fields["Flags"] = serde_json::json!(0x4002_0000u64);
+        let (r, applied) = apply_on_sandbox(&tx, &mut sb);
         assert!(r.code_str().starts_with("tec"), "{}", r.code_str());
         assert!(applied, "a tec is claimed: applied with the common changes only");
         assert_eq!(balance_of(&sb, &acct(1)), (1_000_000, 6), "fee 0, sequence consumed, nothing moved");
