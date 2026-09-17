@@ -557,12 +557,38 @@ impl NativeShadow {
             // Threading stamps (PreviousTxnID/PreviousTxnLgrSeq) — the replay
             // applies them after every tx; first live ledger without them read
             // 175 byte-diffs at zero TER mismatches (#106628655).
-            xrpl_ledger::ledger::threading::stamp_threading(
-                &mut mods,
-                &|k| self.state.state_map.lookup(k).map(|b| b.to_vec()),
-                &tx_hash,
-                seq,
-            );
+            //
+            // A Batch is threaded per inner: rippled applies each inner as
+            // its own transaction, so the objects an inner touched carry the
+            // INNER's hash and only the outer's own changes (its fee and
+            // sequence) carry the outer's. The ledger's inner hashes, in
+            // TransactionIndex order, pair with the engine's per-inner
+            // touched-key sets. Drain those on EVERY Batch outer, for the
+            // same staleness reason the per-inner results below are drained
+            // unconditionally — the cell is cleared at do_apply entry, so an
+            // outer that never got there would otherwise leave the PREVIOUS
+            // batch's sets for the next reader.
+            let inner_touched = if tx["TransactionType"].as_str() == Some("Batch") {
+                xrpl_ledger::tx::batch::take_inner_touched()
+            } else {
+                Vec::new()
+            };
+            match attribution.inners_of.get(&this_hash) {
+                Some(inners) => xrpl_ledger::ledger::threading::stamp_batch_threading(
+                    &mut mods,
+                    &|k| self.state.state_map.lookup(k).map(|b| b.to_vec()),
+                    &tx_hash,
+                    seq,
+                    inners,
+                    &inner_touched,
+                ),
+                None => xrpl_ledger::ledger::threading::stamp_threading(
+                    &mut mods,
+                    &|k| self.state.state_map.lookup(k).map(|b| b.to_vec()),
+                    &tx_hash,
+                    seq,
+                ),
+            }
             st.txs_applied.fetch_add(1, Ordering::Relaxed);
             if our_ter == expected_ter {
                 st.ter_matched.fetch_add(1, Ordering::Relaxed);
