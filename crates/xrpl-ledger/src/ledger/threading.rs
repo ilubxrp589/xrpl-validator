@@ -16,7 +16,7 @@
 //! carries PreviousTxnID = 462DE605… (the crossing tx), PreviousTxnLgrSeq =
 //! 106433073 — exactly what `stamp_threading` produces.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::sandbox::SandboxEntry;
 use xrpl_core::types::Hash256;
@@ -127,8 +127,33 @@ pub fn stamp_threading(
     tx_hash_hex: &str,
     ledger_seq: u32,
 ) {
+    stamp_threading_keys(mods, pre, tx_hash_hex, ledger_seq, None)
+}
+
+/// `stamp_threading` restricted to a set of keys: with `only` given, every
+/// `mods` entry outside it is left exactly as it was — including for the
+/// `threadOwners` pass, which then considers only the created/deleted nodes
+/// among those keys (the owner roots it threads are still written wherever
+/// they live, as rippled does). `None` visits everything, which is
+/// `stamp_threading`.
+///
+/// A `Batch` needs this: rippled applies each inner as its own transaction
+/// (`applyBatchTransactions` -> `apply(..., inner, tapBATCH)`), so an object
+/// an inner touched is threaded with the INNER's id, not the outer's — see
+/// `stamp_batch_threading`.
+pub fn stamp_threading_keys(
+    mods: &mut HashMap<Hash256, SandboxEntry>,
+    pre: &dyn Fn(&Hash256) -> Option<Vec<u8>>,
+    tx_hash_hex: &str,
+    ledger_seq: u32,
+    only: Option<&HashSet<Hash256>>,
+) {
     let hash_upper = tx_hash_hex.to_uppercase();
+    let visit = |k: &Hash256| only.map(|s| s.contains(k)).unwrap_or(true);
     for (k, ent) in mods.iter_mut() {
+        if !visit(k) {
+            continue;
+        }
         let modified = matches!(ent, SandboxEntry::Modified(_));
         let bytes = match ent {
             SandboxEntry::Created(b) | SandboxEntry::Modified(b) => b,
@@ -189,6 +214,9 @@ pub fn stamp_threading(
         }
     };
     for (k, ent) in mods.iter() {
+        if !visit(k) {
+            continue;
+        }
         match ent {
             SandboxEntry::Created(b) => {
                 if let Ok(v) = serde_json::from_slice::<serde_json::Value>(b) {
@@ -232,6 +260,128 @@ pub fn stamp_threading(
                     }
                 }
             }
+        }
+    }
+}
+
+/// Thread a `Batch` outer and its inners the way rippled's
+/// `ApplyStateTable` ends up doing it: the outer's own application is
+/// stamped with the outer's id first (its fee and sequence on its own
+/// account root), then each inner re-stamps, in order, exactly the keys it
+/// touched with the inner's own transaction id. The LAST toucher wins, which
+/// is what a mainnet post-state records.
+///
+/// `inner_hashes` are the ledger's inner transaction ids in RawTransactions
+/// order and `inner_touched` the engine's per-inner touched-key sets
+/// (`tx::batch::take_inner_touched`), in the same order. The engine does not
+/// hash transactions, so the two must be supplied together; if their lengths
+/// disagree the pairing is unknown and this stamps the outer alone rather
+/// than attributing a key to the wrong inner.
+pub fn stamp_batch_threading(
+    mods: &mut HashMap<Hash256, SandboxEntry>,
+    pre: &dyn Fn(&Hash256) -> Option<Vec<u8>>,
+    outer_hash_hex: &str,
+    ledger_seq: u32,
+    inner_hashes: &[String],
+    inner_touched: &[Vec<Hash256>],
+) {
+    stamp_threading_keys(mods, pre, outer_hash_hex, ledger_seq, None);
+    if inner_hashes.len() != inner_touched.len() {
+        return;
+    }
+    for (hash, touched) in inner_hashes.iter().zip(inner_touched.iter()) {
+        if touched.is_empty() {
+            continue; // not applied, or applied and rolled back — touched nothing
+        }
+        let only: HashSet<Hash256> = touched.iter().copied().collect();
+        stamp_threading_keys(mods, pre, hash, ledger_seq, Some(&only));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn k(n: u8) -> Hash256 {
+        let mut b = [0u8; 32];
+        b[31] = n;
+        Hash256(b)
+    }
+
+    /// An AccountRoot image — the entry type `threadOwners` ignores, so these
+    /// tests see the per-key stamping alone.
+    fn root(n: u8, balance: u64) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": hex::encode([n; 20]),
+            "Balance": balance.to_string(),
+        }))
+        .expect("json")
+    }
+
+    /// The pre-transaction image of every key: a different Balance, so no
+    /// entry below is a content-equal write-back.
+    fn pre(h: &Hash256) -> Option<Vec<u8>> {
+        Some(root(h.0[31], 1))
+    }
+
+    fn threading_of(mods: &HashMap<Hash256, SandboxEntry>, key: Hash256) -> (String, u64) {
+        let bytes = match mods.get(&key) {
+            Some(SandboxEntry::Created(b)) | Some(SandboxEntry::Modified(b)) => b,
+            _ => panic!("no entry for the key"),
+        };
+        let v: serde_json::Value = serde_json::from_slice(bytes).expect("json");
+        (
+            v["PreviousTxnID"].as_str().unwrap_or_default().to_string(),
+            v["PreviousTxnLgrSeq"].as_u64().unwrap_or_default(),
+        )
+    }
+
+    fn three_roots() -> HashMap<Hash256, SandboxEntry> {
+        let mut mods = HashMap::new();
+        mods.insert(k(1), SandboxEntry::Modified(root(1, 10)));
+        mods.insert(k(2), SandboxEntry::Modified(root(2, 20)));
+        mods.insert(k(3), SandboxEntry::Modified(root(3, 30)));
+        mods
+    }
+
+    #[test]
+    fn stamp_batch_threading_gives_every_key_to_its_last_toucher() {
+        let mut mods = three_roots();
+        let inner_hashes = ["INNER1".to_string(), "INNER2".to_string()];
+        // inner 1 touched B; inner 2 touched C and B again.
+        let touched = [vec![k(2)], vec![k(3), k(2)]];
+        stamp_batch_threading(&mut mods, &pre, "OUTER", 7, &inner_hashes, &touched);
+        assert_eq!(threading_of(&mods, k(1)), ("OUTER".into(), 7), "no inner touched A");
+        assert_eq!(threading_of(&mods, k(2)), ("INNER2".into(), 7), "the last inner to touch B wins");
+        assert_eq!(threading_of(&mods, k(3)), ("INNER2".into(), 7));
+    }
+
+    #[test]
+    fn stamp_batch_threading_falls_back_to_the_outer_on_a_length_mismatch() {
+        let mut mods = three_roots();
+        let inner_hashes = ["INNER1".to_string(), "INNER2".to_string()];
+        let touched = [vec![k(2)]];
+        stamp_batch_threading(&mut mods, &pre, "OUTER", 7, &inner_hashes, &touched);
+        for n in 1..=3 {
+            assert_eq!(threading_of(&mods, k(n)), ("OUTER".into(), 7), "key {n}");
+        }
+    }
+
+    #[test]
+    fn stamp_threading_keys_leaves_every_key_outside_the_restriction_alone() {
+        let mut mods = three_roots();
+        let only: std::collections::HashSet<Hash256> = [k(2)].into_iter().collect();
+        stamp_threading_keys(&mut mods, &pre, "INNER1", 7, Some(&only));
+        assert_eq!(threading_of(&mods, k(2)), ("INNER1".into(), 7));
+        for n in [1u8, 3] {
+            let bytes = match mods.get(&k(n)) {
+                Some(SandboxEntry::Modified(b)) => b.clone(),
+                _ => panic!("no entry"),
+            };
+            let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+            assert!(v.get("PreviousTxnID").is_none(), "key {n} was not in the restriction");
         }
     }
 }

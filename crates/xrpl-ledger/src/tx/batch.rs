@@ -7,11 +7,13 @@
 //! Not modelled: BatchSigners signature verification. The engine verifies no
 //! signatures today (validated ledgers carry only verified transactions);
 //! the structural checks on the signer set are enforced.
-use crate::ledger::sandbox::Sandbox;
+use crate::ledger::sandbox::{Sandbox, SandboxEntry, AUX_KEY};
 use crate::ledger::transactor::{Transactor, TxFields, TxResult};
 use crate::tx::dispatch::{apply_on_sandbox, is_pseudo};
 use serde_json::Value;
 use std::cell::RefCell;
+use std::collections::HashMap;
+use xrpl_core::types::Hash256;
 
 // Result codes below track rippled 3.3.0
 // (libxrpl/tx/transactors/system/Batch.cpp), not the older FFI-vendored copy.
@@ -28,6 +30,7 @@ const MODE_MASK: u64 = TF_ALL_OR_NOTHING | TF_ONLY_ONE | TF_UNTIL_FAILURE | TF_I
 
 thread_local! {
     static INNER_RESULTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static INNER_TOUCHED: RefCell<Vec<Vec<Hash256>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// The per-inner results of the last `do_apply` on this thread, in
@@ -38,6 +41,57 @@ thread_local! {
 /// intervening `do_apply`) drains an empty `Vec`.
 pub fn take_inner_results() -> Vec<String> {
     INNER_RESULTS.with(|r| std::mem::take(&mut *r.borrow_mut()))
+}
+
+/// The keys each inner of the last `do_apply` on this thread changed in the
+/// sandbox, in RawTransactions order and as long as `take_inner_results` —
+/// an inner that was not applied (or was applied and rolled back inside
+/// `apply_on_sandbox`) reports an empty set. Drained on read, cleared at
+/// `do_apply` entry, with the same staleness guarantee as the results.
+///
+/// rippled applies every inner as its own transaction, so the objects an
+/// inner touched carry the INNER's id in `PreviousTxnID`. The engine does
+/// not hash transactions; the caller knows the inner hashes from the ledger
+/// and pairs them with these sets in
+/// `ledger::threading::stamp_batch_threading`.
+pub fn take_inner_touched() -> Vec<Vec<Hash256>> {
+    INNER_TOUCHED.with(|r| std::mem::take(&mut *r.borrow_mut()))
+}
+
+/// Same key, same state — the pair a sandbox diff must NOT report.
+fn entries_agree(a: &SandboxEntry, b: &SandboxEntry) -> bool {
+    match (a, b) {
+        (SandboxEntry::Deleted, SandboxEntry::Deleted) => true,
+        (SandboxEntry::Created(x), SandboxEntry::Created(y)) => x == y,
+        (SandboxEntry::Modified(x), SandboxEntry::Modified(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// The keys whose sandbox state differs between two snapshots: present in
+/// one and not the other, or written differently. `AUX_KEY` is excluded —
+/// it is the sandbox's own transaction-scoped bookkeeping (finding 165),
+/// never a ledger object, and `into_modifications` drops it.
+fn touched_keys(
+    before: &HashMap<Hash256, SandboxEntry>,
+    after: &HashMap<Hash256, SandboxEntry>,
+) -> Vec<Hash256> {
+    let mut out: Vec<Hash256> = Vec::new();
+    for (k, a) in after {
+        if *k == AUX_KEY {
+            continue;
+        }
+        if !before.get(k).map(|b| entries_agree(a, b)).unwrap_or(false) {
+            out.push(*k);
+        }
+    }
+    for k in before.keys() {
+        if *k != AUX_KEY && !after.contains_key(k) {
+            out.push(*k);
+        }
+    }
+    out.sort_unstable_by_key(|h| h.0);
+    out
 }
 
 fn flags_of(v: &Value) -> u64 {
@@ -262,12 +316,18 @@ impl Transactor for BatchTransactor {
         // preclaim both succeed — but this keeps the invariant local rather
         // than relying on that).
         INNER_RESULTS.with(|r| r.borrow_mut().clear());
+        INNER_TOUCHED.with(|r| r.borrow_mut().clear());
         let flags = flags_of(&tx.fields);
         let batch_snap = sandbox.snapshot();
         let mut results: Vec<String> = Vec::new();
+        // Per inner, the keys it changed — rippled threads each of those
+        // objects with the INNER's transaction id, so the caller needs to
+        // know which inner touched what (`take_inner_touched`).
+        let mut touched: Vec<Vec<Hash256>> = Vec::new();
         for inner in inner_jsons(&tx.fields) {
             let Some(mut f) = TxFields::from_json(inner) else {
                 results.push(TxResult::Malformed.code_str().to_string());
+                touched.push(Vec::new()); // never applied
                 if flags & TF_ALL_OR_NOTHING != 0 {
                     sandbox.restore_snapshot(batch_snap.clone());
                     break;
@@ -278,7 +338,9 @@ impl Transactor for BatchTransactor {
                 continue;
             };
             f.inner_batch = true;
+            let before = sandbox.snapshot();
             let (r, _applied) = apply_on_sandbox(&f, sandbox);
+            touched.push(touched_keys(&before, &sandbox.snapshot()));
             results.push(r.code_str().to_string());
             if !r.is_success() {
                 if flags & TF_ALL_OR_NOTHING != 0 {
@@ -293,6 +355,7 @@ impl Transactor for BatchTransactor {
             }
         }
         INNER_RESULTS.with(|r| *r.borrow_mut() = results);
+        INNER_TOUCHED.with(|r| *r.borrow_mut() = touched);
         TxResult::Success
     }
 }
@@ -491,6 +554,16 @@ mod tests {
         assert_eq!(inners, vec!["tesSUCCESS", "tesSUCCESS"]);
         assert_eq!(balance_seq(&sb, 1), (50_000_000 - 1000 - 3_000_000, 8), "outer fee + seq, both inners' seqs");
         assert_eq!(balance_seq(&sb, 2), (23_000_000, 1));
+        // Per-inner touched keys, in RawTransactions order and as long as the
+        // results: each Payment moved the sender's and the destination's
+        // AccountRoot, so each inner's set names both.
+        let touched = take_inner_touched();
+        assert_eq!(touched.len(), 2, "one touched set per attempted inner");
+        for (i, t) in touched.iter().enumerate() {
+            assert!(t.contains(&keylet::account_root_key(&acct(1))), "inner {i} touched the sender's root");
+            assert!(t.contains(&keylet::account_root_key(&acct(2))), "inner {i} touched the destination's root");
+        }
+        assert!(take_inner_touched().is_empty(), "drained on read, like the results");
     }
 
     #[test]
@@ -519,6 +592,15 @@ mod tests {
         assert_eq!(inners, vec!["tesSUCCESS", "temBAD_SEQUENCE"]);
         assert_eq!(balance_seq(&sb, 1), (50_000_000 - 1000, 6), "only the outer's fee and sequence remain");
         assert_eq!(balance_seq(&sb, 2), (20_000_000, 1));
+        // The touched sets describe what each inner touched BEFORE the
+        // AllOrNothing discard: the first moved both roots, the second was
+        // rolled back inside apply_on_sandbox (its sequence never matched)
+        // and so touched nothing. Both inners are reported either way.
+        let touched = take_inner_touched();
+        assert_eq!(touched.len(), 2, "one touched set per attempted inner, discard or not");
+        assert!(touched[0].contains(&keylet::account_root_key(&acct(1))));
+        assert!(touched[0].contains(&keylet::account_root_key(&acct(2))));
+        assert!(touched[1].is_empty(), "apply_on_sandbox restored the sandbox for the failing inner");
     }
 
     #[test]
