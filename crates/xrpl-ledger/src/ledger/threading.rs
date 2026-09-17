@@ -287,6 +287,11 @@ pub fn stamp_batch_threading(
 ) {
     stamp_threading_keys(mods, pre, outer_hash_hex, ledger_seq, None);
     if inner_hashes.len() != inner_touched.len() {
+        eprintln!(
+            "threading: batch stamp fell back to the outer — {} inner hashes vs {} touched sets",
+            inner_hashes.len(),
+            inner_touched.len()
+        );
         return;
     }
     for (hash, touched) in inner_hashes.iter().zip(inner_touched.iter()) {
@@ -383,5 +388,36 @@ mod tests {
             let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
             assert!(v.get("PreviousTxnID").is_none(), "key {n} was not in the restriction");
         }
+    }
+
+    #[test]
+    fn a_restricted_stamp_threads_the_owner_of_a_created_node_outside_the_restriction() {
+        // rippled's `threadOwners`: a CREATED node threads its owner's
+        // AccountRoot too, even though the inner never wrote that root — so
+        // the root must take the INNER's id, not the outer's, although it is
+        // not in the inner's touched set.
+        let owner = [7u8; 20];
+        let offer_key = k(9);
+        let root_key = crate::ledger::keylet::account_root_key(&owner);
+        let offer = serde_json::to_vec(&json!({
+            "LedgerEntryType": "Offer",
+            "Account": hex::encode(owner),
+            "BookDirectory": "AB".repeat(32),
+            "TakerPays": "1000",
+            "TakerGets": "2000",
+        }))
+        .expect("json");
+        let mut mods = HashMap::new();
+        mods.insert(offer_key, SandboxEntry::Created(offer));
+        mods.insert(root_key, SandboxEntry::Modified(root(7, 10)));
+
+        stamp_batch_threading(&mut mods, &pre, "OUTER", 7, &["INNER1".to_string()], &[vec![offer_key]]);
+
+        assert_eq!(threading_of(&mods, offer_key), ("INNER1".into(), 7), "the created node itself");
+        assert_eq!(
+            threading_of(&mods, root_key),
+            ("INNER1".into(), 7),
+            "threadOwners reaches the owner root even outside the inner's touched set"
+        );
     }
 }

@@ -59,7 +59,7 @@ fn apply_bundle(bundle: &Value) -> (LedgerState, String, HashMap<Hash256, Sandbo
 }
 
 /// Every `expect` entry byte-for-byte against the stamped mutation map.
-fn assert_expect(bundle: &Value, state: &LedgerState, mods: &HashMap<Hash256, SandboxEntry>) {
+fn assert_expect(bundle: &Value, mods: &HashMap<Hash256, SandboxEntry>) {
     for (k, want_hex) in bundle["expect"].as_object().unwrap() {
         // An EMPTY expectation is a deletion pin (finding 158): mainnet's
         // meta deleted the object in this transaction, so must the apply.
@@ -101,6 +101,8 @@ fn assert_expect(bundle: &Value, state: &LedgerState, mods: &HashMap<Hash256, Sa
     }
 }
 
+// The non-batch path of the shared harness shape; kept so a non-Batch bundle
+// can join this file without re-copying the harness.
 #[allow(dead_code)]
 fn run_bundle(bundle_json: &str) {
     let bundle: Value = serde_json::from_str(bundle_json).unwrap();
@@ -111,7 +113,7 @@ fn run_bundle(bundle_json: &str) {
         bundle["tx"]["hash"].as_str().unwrap(),
         bundle["seq"].as_u64().unwrap() as u32,
     );
-    assert_expect(&bundle, &state, &mods);
+    assert_expect(&bundle, &mods);
 }
 
 /// A Batch outer: the inners run inside the outer's `do_apply`, but rippled
@@ -143,8 +145,10 @@ fn run_batch_bundle(bundle_json: &str) {
         &inner_touched,
     );
 
-    assert_expect(&bundle, &state, &mods);
+    // The inner results first: a wrong one is a TER receipt naming the inner,
+    // a far more useful failure than the byte-diff it would also cause.
     assert_eq!(ours, want_inner, "each inner's TransactionResult, in RawTransactions order");
+    assert_expect(&bundle, &mods);
 }
 
 #[test]
