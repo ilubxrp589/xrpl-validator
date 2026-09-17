@@ -708,6 +708,7 @@ mod tests {
             fields: serde_json::json!({
                 "RegularKey": hex::encode([0xFFu8; 20]),
             }),
+            inner_batch: false,
         };
 
         assert_eq!(SetRegularKeyTransactor.preflight(&tx), TxResult::Success);
@@ -742,6 +743,7 @@ mod tests {
                 "RegularKey": hex::encode([0xFFu8; 20]),
                 "SigningPubKey": hex::encode_upper(master_pk),
             }),
+            inner_batch: false,
         };
         assert_eq!(SetRegularKeyTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
         let data = sandbox.read(&keylet::account_root_key(&alice)).unwrap();
@@ -774,6 +776,7 @@ mod tests {
                     "RegularKey": hex::encode([0xFFu8; 20]),
                     "SigningPubKey": spk,
                 }),
+                inner_batch: false,
             };
             assert_eq!(SetRegularKeyTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
             let data = sandbox.read(&keylet::account_root_key(&alice)).unwrap();
@@ -803,6 +806,7 @@ mod tests {
             ticket_seq: None,
             last_ledger_seq: None,
             fields: serde_json::json!({"SigningPubKey": hex::encode_upper([0x03u8; 33])}),
+            inner_batch: false,
         };
         assert_eq!(SetRegularKeyTransactor.do_apply(&tx, &mut sandbox), TxResult::NoAlternativeKey);
     }
@@ -823,6 +827,7 @@ mod tests {
             ticket_seq: None,
             last_ledger_seq: None,
             fields: serde_json::json!({"RegularKey": hex::encode([0xAAu8; 20])}),
+            inner_batch: false,
         };
         SetRegularKeyTransactor.do_apply(&set_tx, &mut sandbox);
 
@@ -835,6 +840,7 @@ mod tests {
             ticket_seq: None,
             last_ledger_seq: None,
             fields: serde_json::json!({}),
+            inner_batch: false,
         };
         assert_eq!(SetRegularKeyTransactor.do_apply(&clear_tx, &mut sandbox), TxResult::Success);
 
@@ -866,6 +872,7 @@ mod tests {
                     {"SignerEntry": {"Account": hex::encode([0x03u8; 20]), "SignerWeight": 1}},
                 ]
             }),
+            inner_batch: false,
         };
 
         assert_eq!(SignerListSetTransactor.preflight(&set_tx), TxResult::Success);
@@ -881,6 +888,7 @@ mod tests {
             ticket_seq: None,
             last_ledger_seq: None,
             fields: serde_json::json!({"SignerQuorum": 0}),
+            inner_batch: false,
         };
 
         assert_eq!(SignerListSetTransactor.do_apply(&remove_tx, &mut sandbox), TxResult::Success);
@@ -906,6 +914,7 @@ mod tests {
             fields: serde_json::json!({
                 "Authorize": hex::encode(bob),
             }),
+            inner_batch: false,
         };
 
         assert_eq!(DepositPreauthTransactor.preflight(&auth_tx), TxResult::Success);
@@ -926,6 +935,7 @@ mod tests {
             fields: serde_json::json!({
                 "Unauthorize": hex::encode(bob),
             }),
+            inner_batch: false,
         };
 
         assert_eq!(DepositPreauthTransactor.do_apply(&unauth_tx, &mut sandbox), TxResult::Success);
@@ -948,6 +958,7 @@ mod tests {
                 "Authorize": hex::encode(bob),
                 "Unauthorize": hex::encode(bob),
             }),
+            inner_batch: false,
         };
         assert_eq!(DepositPreauthTransactor.preflight(&tx), TxResult::Malformed);
     }
@@ -995,6 +1006,7 @@ mod tests {
                     "value": "30"
                 }
             }),
+            inner_batch: false,
         };
 
         assert_eq!(ClawbackTransactor.preflight(&tx), TxResult::Success);
@@ -1055,6 +1067,7 @@ mod tests {
             fields: serde_json::json!({
                 "Amount": { "currency": "USD", "issuer": holder_addr, "value": "30" }
             }),
+            inner_batch: false,
         };
         // Was Malformed before the fix (base58 holder failed the hex-only decode).
         assert_eq!(
@@ -1083,6 +1096,7 @@ mod tests {
                     "value": "50"
                 }
             }),
+            inner_batch: false,
         };
         assert_eq!(ClawbackTransactor.do_apply(&tx, &mut sandbox), TxResult::NoEntry);
     }

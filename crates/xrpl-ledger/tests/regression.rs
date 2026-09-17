@@ -51,6 +51,7 @@ fn payment(sender: [u8; 20], dest: [u8; 20], amount: u64, fee: u64, seq: u32) ->
             "Destination": hex::encode(dest),
             "Amount": amount.to_string(),
         }),
+        inner_batch: false,
     }
 }
 
@@ -245,6 +246,7 @@ fn ticket_based_payment() {
             "Destination": hex::encode(bob),
             "Amount": "5000000",
         }),
+        inner_batch: false,
     };
 
     let (new_state, results) = apply_transaction_set(
@@ -321,6 +323,7 @@ fn unsupported_type_still_burns_fee() {
         ticket_seq: None,
         last_ledger_seq: None,
         fields: serde_json::json!({}),
+        inner_batch: false,
     };
 
     let (new_state, results) = apply_transaction_set(

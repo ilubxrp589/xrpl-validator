@@ -185,6 +185,24 @@ pub enum TxResult {
     BadAmount,
     /// Invalid sequence.
     BadSequence,
+    /// temINVALID_FLAG — Batch: not exactly one mode flag, or tfInnerBatchTxn on the outer.
+    InvalidFlag,
+    /// temREDUNDANT — Batch: duplicate inner, or duplicate (account, sequence) under AllOrNothing/UntilFailure.
+    Redundant,
+    /// temBAD_SIGNER — Batch: BatchSigners not sorted/unique, missing or spurious signer.
+    BadSigner,
+    /// temINVALID_INNER_BATCH — an inner without tfInnerBatchTxn, or tfInnerBatchTxn without a parent batch.
+    InvalidInnerBatch,
+    /// temARRAY_EMPTY — Batch: RawTransactions absent or empty.
+    ArrayEmpty,
+    /// temARRAY_TOO_LARGE — Batch: more than 8 inners or signers (the tem code; `ArrayTooLarge` is the tec).
+    TemArrayTooLarge,
+    /// temSEQ_AND_TICKET — an inner with both or neither of Sequence / TicketSequence.
+    SeqAndTicket,
+    /// temBAD_SIGNATURE — an inner carrying SigningPubKey / TxnSignature / Signers.
+    BadSignature,
+    /// temINVALID — an inner of a disallowed type (Batch inside Batch, pseudo types).
+    InvalidTx,
 
     // tef — failed, not applied
     /// Sequence already past.
@@ -339,6 +357,15 @@ impl TxResult {
             TxResult::BadFee => "temBAD_FEE",
             TxResult::BadAmount => "temBAD_AMOUNT",
             TxResult::BadSequence => "temBAD_SEQUENCE",
+            TxResult::InvalidFlag => "temINVALID_FLAG",
+            TxResult::Redundant => "temREDUNDANT",
+            TxResult::BadSigner => "temBAD_SIGNER",
+            TxResult::InvalidInnerBatch => "temINVALID_INNER_BATCH",
+            TxResult::ArrayEmpty => "temARRAY_EMPTY",
+            TxResult::TemArrayTooLarge => "temARRAY_TOO_LARGE",
+            TxResult::SeqAndTicket => "temSEQ_AND_TICKET",
+            TxResult::BadSignature => "temBAD_SIGNATURE",
+            TxResult::InvalidTx => "temINVALID",
             TxResult::PastSeq => "tefPAST_SEQ",
             TxResult::MaxLedger => "tefMAX_LEDGER",
             TxResult::NoAccount => "tefNO_ACCOUNT",
@@ -366,6 +393,11 @@ pub struct TxFields {
     pub last_ledger_seq: Option<u32>,
     /// Raw JSON for type-specific fields.
     pub fields: serde_json::Value,
+    /// Set by `BatchTransactor` for the inner transactions it applies
+    /// (rippled's `tapBATCH`): the inner carries `Fee: "0"` by rule, so
+    /// the fee-zero gate every transactor enforces is waived, and no
+    /// signature is expected.
+    pub inner_batch: bool,
 }
 
 impl TxFields {
@@ -373,7 +405,56 @@ impl TxFields {
     pub fn uses_ticket(&self) -> bool {
         self.sequence == 0 && self.ticket_seq.is_some()
     }
+
+    /// The preflight fee gate: a standalone transaction with `Fee: "0"`
+    /// is malformed (`temBAD_FEE`); a batch inner carries `Fee: "0"` by
+    /// rule (rippled preflight1 under `tapBATCH`).
+    pub fn fee_missing(&self) -> bool {
+        self.fee == 0 && !self.inner_batch
+    }
+
+    /// The common-field reader that used to live in
+    /// `xrpl_node::native_apply::build_txfields`. Accepts the engine's hex
+    /// account dialect (via `tx::offer::decode20`, which tries hex first and
+    /// falls back to base58) and the pseudo-transaction zero account.
+    pub fn from_json(txjson: &serde_json::Value) -> Option<TxFields> {
+        // Pseudo-transactions carry Account: "" and Fee: "0" — the zero account.
+        let account = match txjson["Account"].as_str()? {
+            "" => [0u8; 20],
+            a => crate::tx::offer::decode20(a)?,
+        };
+        let tx_type = txjson["TransactionType"].as_str()?.to_string();
+        let fee = txjson["Fee"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let sequence = txjson["Sequence"].as_u64().unwrap_or(0) as u32;
+        let ticket_seq = txjson.get("TicketSequence").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let last_ledger_seq = txjson.get("LastLedgerSequence").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let mut fields = txjson.clone();
+        for k in ACCOUNT_FIELDS {
+            if let Some(a) = fields.get(*k).and_then(|v| v.as_str()) {
+                if a.starts_with('r') {
+                    if let Some(id) = crate::tx::offer::decode20(a) {
+                        fields[*k] = serde_json::json!(hex::encode(id));
+                    }
+                }
+            }
+        }
+        Some(TxFields {
+            account,
+            tx_type,
+            fee,
+            sequence,
+            ticket_seq,
+            last_ledger_seq,
+            fields,
+            inner_batch: false,
+        })
+    }
 }
+
+/// Account-bearing fields (other than `Account` itself) that get rewritten
+/// from base58 to hex by `TxFields::from_json` — mirrors
+/// `xrpl_node::native_apply::ACCOUNT_FIELDS`.
+const ACCOUNT_FIELDS: &[&str] = &["Destination", "Owner", "Authorize", "Unauthorize", "RegularKey"];
 
 /// Trait that every transaction type implements.
 pub trait Transactor {
@@ -562,6 +643,7 @@ mod tests {
             last_ledger_seq: None,
             ticket_seq: None,
             fields: serde_json::Value::Null,
+            inner_batch: false,
         }
     }
 
@@ -613,5 +695,58 @@ mod tests {
         assert!(!TxResult::Malformed.is_claimed());
         assert!(!TxResult::PastSeq.is_claimed());
         assert!(TxResult::NoDst.is_claimed()); // tec codes are claimed
+    }
+
+    #[test]
+    fn txfields_from_json_reads_the_common_fields_and_defaults_inner_batch_off() {
+        let tx = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": "0000000000000000000000000000000000000001",
+            "Fee": "12",
+            "Sequence": 7,
+            "LastLedgerSequence": 99,
+            "Amount": "1000000",
+        });
+        let f = TxFields::from_json(&tx).expect("fields");
+        assert_eq!(f.tx_type, "Payment");
+        assert_eq!(f.fee, 12);
+        assert_eq!(f.sequence, 7);
+        assert_eq!(f.ticket_seq, None);
+        assert_eq!(f.last_ledger_seq, Some(99));
+        assert!(!f.inner_batch);
+        assert!(!f.fee_missing());
+    }
+
+    #[test]
+    fn fee_missing_is_waived_for_a_batch_inner() {
+        let tx = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": "0000000000000000000000000000000000000001",
+            "Fee": "0",
+            "Sequence": 7,
+        });
+        let mut f = TxFields::from_json(&tx).expect("fields");
+        assert!(f.fee_missing(), "a standalone zero-fee tx is missing its fee");
+        f.inner_batch = true;
+        assert!(!f.fee_missing(), "a batch inner carries Fee 0 by rule");
+    }
+
+    #[test]
+    fn batch_result_codes_have_their_rippled_names() {
+        assert_eq!(TxResult::InvalidFlag.code_str(), "temINVALID_FLAG");
+        assert_eq!(TxResult::Redundant.code_str(), "temREDUNDANT");
+        assert_eq!(TxResult::BadSigner.code_str(), "temBAD_SIGNER");
+        assert_eq!(TxResult::InvalidInnerBatch.code_str(), "temINVALID_INNER_BATCH");
+        assert_eq!(TxResult::ArrayEmpty.code_str(), "temARRAY_EMPTY");
+        assert_eq!(TxResult::TemArrayTooLarge.code_str(), "temARRAY_TOO_LARGE");
+        assert_eq!(TxResult::SeqAndTicket.code_str(), "temSEQ_AND_TICKET");
+        assert_eq!(TxResult::BadSignature.code_str(), "temBAD_SIGNATURE");
+        assert_eq!(TxResult::InvalidTx.code_str(), "temINVALID");
+        for r in [TxResult::InvalidFlag, TxResult::Redundant, TxResult::BadSigner,
+                  TxResult::InvalidInnerBatch, TxResult::ArrayEmpty, TxResult::TemArrayTooLarge,
+                  TxResult::SeqAndTicket, TxResult::BadSignature, TxResult::InvalidTx] {
+            assert!(!r.is_claimed(), "{:?} is a tem code, never claimed", r);
+            assert!(!r.is_success());
+        }
     }
 }

@@ -431,6 +431,7 @@ mod delete_tests {
         TxFields {
             account, tx_type: "CredentialDelete".to_string(), fee: 12, sequence: 7,
             ticket_seq: None, last_ledger_seq: None, fields: f,
+            inner_batch: false,
         }
     }
 
@@ -466,6 +467,7 @@ mod delete_tests {
                 "Subject": hex::encode(subject),
                 "CredentialType": "4142",
             }),
+            inner_batch: false,
         };
         assert_eq!(CredentialCreateTransactor.do_apply(&tx, &mut sb), TxResult::Success);
 
@@ -713,6 +715,7 @@ mod tests {
                 "CredentialType": "KYC",
                 "URI": "https://example.com/kyc",
             }),
+            inner_batch: false,
         };
 
         assert_eq!(CredentialCreateTransactor.preflight(&create_tx), TxResult::Success);
@@ -740,6 +743,7 @@ mod tests {
                 "Issuer": hex::encode(issuer),
                 "CredentialType": "KYC",
             }),
+            inner_batch: false,
         };
 
         assert_eq!(CredentialAcceptTransactor.preflight(&accept_tx), TxResult::Success);
@@ -773,6 +777,7 @@ mod tests {
                 "Subject": hex::encode(subject),
                 "CredentialType": "AML",
             }),
+            inner_batch: false,
         };
         CredentialCreateTransactor.do_apply(&create_tx, &mut sandbox);
 
@@ -789,6 +794,7 @@ mod tests {
                 "Issuer": hex::encode(issuer),
                 "CredentialType": "AML",
             }),
+            inner_batch: false,
         };
 
         assert_eq!(CredentialDeleteTransactor.preflight(&delete_tx), TxResult::Success);
@@ -825,6 +831,7 @@ mod tests {
                 "Subject": hex::encode(subject),
                 "CredentialType": "KYC",
             }),
+            inner_batch: false,
         };
         CredentialCreateTransactor.do_apply(&create_tx, &mut sandbox);
 
@@ -841,6 +848,7 @@ mod tests {
                 "Issuer": hex::encode(issuer),
                 "CredentialType": "KYC",
             }),
+            inner_batch: false,
         };
 
         assert_eq!(CredentialDeleteTransactor.do_apply(&delete_tx, &mut sandbox), TxResult::NoPermission);
@@ -863,6 +871,7 @@ mod tests {
                 "Issuer": hex::encode([0x01u8; 20]),
                 "CredentialType": "KYC",
             }),
+            inner_batch: false,
         };
         assert_eq!(CredentialAcceptTransactor.do_apply(&tx, &mut sandbox), TxResult::NoEntry);
     }
@@ -880,6 +889,7 @@ mod tests {
             ticket_seq: None,
             last_ledger_seq: None,
             fields: serde_json::json!({"CredentialType": "KYC"}),
+            inner_batch: false,
         };
         assert_eq!(CredentialCreateTransactor.preflight(&tx1), TxResult::Malformed);
 
@@ -892,6 +902,7 @@ mod tests {
             ticket_seq: None,
             last_ledger_seq: None,
             fields: serde_json::json!({"Subject": hex::encode([0x02u8; 20])}),
+            inner_batch: false,
         };
         assert_eq!(CredentialCreateTransactor.preflight(&tx2), TxResult::Malformed);
     }
@@ -915,6 +926,7 @@ mod tests {
                 "Subject": hex::encode(subject),
                 "CredentialType": "KYC",
             }),
+            inner_batch: false,
         };
 
         assert_eq!(CredentialCreateTransactor.do_apply(&create_tx, &mut sandbox), TxResult::Success);
@@ -946,6 +958,7 @@ mod tests {
                 "CredentialType": "KYC",
                 "Expiration": exp,
             }),
+            inner_batch: false,
         };
         let run = |tx: &TxFields, sb: &mut Sandbox| {
             let r = CredentialCreateTransactor.preclaim(tx, sb);

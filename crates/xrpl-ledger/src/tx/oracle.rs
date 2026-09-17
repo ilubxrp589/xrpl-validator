@@ -305,6 +305,7 @@ mod tests {
                 "AssetClass": "63757272656E6379",
                 "PriceDataSeries": series,
             }),
+            inner_batch: false,
         }
     }
 
@@ -347,6 +348,7 @@ mod tests {
             ticket_seq: None,
             last_ledger_seq: None,
             fields: serde_json::json!({ "OracleDocumentID": 1 }),
+            inner_batch: false,
         };
         let tr = OracleDeleteTransactor;
         assert_eq!(tr.do_apply(&del, &mut sb), TxResult::Success);

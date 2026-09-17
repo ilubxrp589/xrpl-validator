@@ -66,27 +66,7 @@ pub fn hexify_addresses(v: &mut Value) {
 }
 
 pub fn build_txfields(txjson: &Value) -> Option<TxFields> {
-    // Pseudo-transactions carry Account: "" and Fee: "0" — the zero account.
-    let account = match txjson["Account"].as_str()? {
-        "" => [0u8; 20],
-        a => decode_address(a)?,
-    };
-    let tx_type = txjson["TransactionType"].as_str()?.to_string();
-    let fee = txjson["Fee"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let sequence = txjson["Sequence"].as_u64().unwrap_or(0) as u32;
-    let ticket_seq = txjson.get("TicketSequence").and_then(|v| v.as_u64()).map(|v| v as u32);
-    let last_ledger_seq = txjson.get("LastLedgerSequence").and_then(|v| v.as_u64()).map(|v| v as u32);
-    let mut fields = txjson.clone();
-    for k in ACCOUNT_FIELDS {
-        if let Some(a) = fields.get(*k).and_then(|v| v.as_str()) {
-            if a.starts_with('r') {
-                if let Some(id) = decode_address(a) {
-                    fields[*k] = json!(hex::encode(id));
-                }
-            }
-        }
-    }
-    Some(TxFields { account, tx_type, fee, sequence, ticket_seq, last_ledger_seq, fields })
+    TxFields::from_json(txjson)
 }
 
 /// Native per-tx apply — identical branching to differential_probe's copy

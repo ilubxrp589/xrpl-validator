@@ -2093,7 +2093,7 @@ fn build_txfields(txjson: &Value) -> Option<TxFields> {
             }
         }
     }
-    Some(TxFields { account, tx_type, fee, sequence, ticket_seq, last_ledger_seq, fields })
+    Some(TxFields { account, tx_type, fee, sequence, ticket_seq, last_ledger_seq, fields, inner_batch: false })
 }
 
 /// Native per-tx apply, mirroring `apply.rs::apply_transaction_set`'s per-tx

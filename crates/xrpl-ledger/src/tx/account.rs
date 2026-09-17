@@ -642,6 +642,7 @@ mod tests {
             ticket_seq: None,
             last_ledger_seq: None,
             fields: serde_json::json!({"SetFlag": 8}), // asfDefaultRipple
+            inner_batch: false,
         };
 
         assert_eq!(AccountSetTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
@@ -678,6 +679,7 @@ mod tests {
             ticket_seq: None,
             last_ledger_seq: None,
             fields: serde_json::json!({"Destination": hex::encode(bob)}),
+            inner_batch: false,
         };
 
         assert_eq!(AccountDeleteTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);

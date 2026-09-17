@@ -997,6 +997,7 @@ mod tests {
                 "Amount": "1000000",
                 "FinishAfter": 900,
             }),
+            inner_batch: false,
         };
 
         // An ordinary destination is fine — this is the control, and it is what
@@ -1067,6 +1068,7 @@ mod tests {
                 "Amount": {"currency": "STS", "issuer": hex::encode(issuer), "value": "30"},
                 "FinishAfter": 900,
             }),
+            inner_batch: false,
         };
         let mut sandbox = Sandbox::new(&state);
         assert_eq!(EscrowCreateTransactor.preflight(&tx), TxResult::Success, "an IOU Amount is legal");
@@ -1121,6 +1123,7 @@ mod tests {
                 "Amount": "25000000",
                 "FinishAfter": 600000000,
             }),
+            inner_batch: false,
         };
 
         let transactor = EscrowCreateTransactor;
@@ -1180,6 +1183,7 @@ mod tests {
                 "Amount": "25000000",
                 // No FinishAfter, no Condition
             }),
+            inner_batch: false,
         };
         assert_eq!(EscrowCreateTransactor.preflight(&tx), TxResult::Malformed);
     }
@@ -1209,6 +1213,7 @@ mod tests {
                 "Amount": "50000000",
                 "FinishAfter": 600000000,
             }),
+            inner_batch: false,
         };
 
         let sandbox = Sandbox::new(&state);
@@ -1272,6 +1277,7 @@ mod tests {
                 "Owner": hex::encode(alice),
                 "OfferSequence": 1,
             }),
+            inner_batch: false,
         };
 
         let transactor = EscrowFinishTransactor;
@@ -1315,6 +1321,7 @@ mod tests {
                 "Owner": hex::encode(alice),
                 "OfferSequence": 99, // does not exist
             }),
+            inner_batch: false,
         };
 
         let sandbox = Sandbox::new(&state);
@@ -1375,6 +1382,7 @@ mod tests {
                 "Owner": hex::encode(alice),
                 "OfferSequence": 1,
             }),
+            inner_batch: false,
         };
 
         let transactor = EscrowCancelTransactor;
@@ -1414,6 +1422,7 @@ mod tests {
                 // no Owner
                 "OfferSequence": 1,
             }),
+            inner_batch: false,
         };
         assert_eq!(EscrowCancelTransactor.preflight(&tx), TxResult::Malformed);
     }
@@ -1432,6 +1441,7 @@ mod tests {
                 "Owner": hex::encode(alice),
                 // no OfferSequence
             }),
+            inner_batch: false,
         };
         assert_eq!(EscrowCancelTransactor.preflight(&tx), TxResult::Malformed);
     }

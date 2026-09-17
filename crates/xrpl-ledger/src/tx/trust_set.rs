@@ -849,6 +849,7 @@ mod tests {
                     "value": "1000"
                 }
             }),
+            inner_batch: false,
         };
 
         assert_eq!(TrustSetTransactor.preflight(&tx), TxResult::Success);
@@ -900,6 +901,7 @@ mod tests {
                 "LimitAmount": {"currency": "USD", "issuer": hex::encode(issuer), "value": "1000"},
                 "Flags": 0x0001_0000u64, // tfSetfAuth
             }),
+            inner_batch: false,
         };
         assert_eq!(TrustSetTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
@@ -965,6 +967,7 @@ mod tests {
                 "LimitAmount": {"currency": "USD", "issuer": hex::encode(issuer), "value": "0"},
                 "Flags": 0x0022_0000u64, // tfSetNoRipple | tfClearFreeze
             }),
+            inner_batch: false,
         }
     }
 
@@ -1034,6 +1037,7 @@ mod tests {
                 "LimitAmount": {"currency": "USD", "issuer": hex::encode(issuer), "value": "45000000"},
                 "Flags": 0x0002_0000u64, // tfSetNoRipple
             }),
+            inner_batch: false,
         };
         // The sender is the LOW side: a negative stored balance is its debt.
         let mut sandbox = Sandbox::new(&state);

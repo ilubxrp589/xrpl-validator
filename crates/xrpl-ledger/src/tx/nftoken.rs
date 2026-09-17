@@ -1690,6 +1690,7 @@ mod tests {
             ticket_seq: None,
             last_ledger_seq: None,
             fields: serde_json::json!({ "NFTokenTaxon": taxon, "Flags": 8 }),
+            inner_batch: false,
         }
     }
 
@@ -1732,6 +1733,7 @@ mod tests {
                 "NFTokenID": id, "Amount": "1000000",
                 "Owner": hex::encode(owner), "Flags": 0,
             }),
+            inner_batch: false,
         };
         // Nothing else about the offer changes — only the owner's opt-out.
         assert_eq!(
@@ -1847,6 +1849,7 @@ mod tests {
             fields: serde_json::json!({
                 "NFTokenSellOffer": hex::encode_upper(offer_key.0),
             }),
+            inner_batch: false,
         };
         assert_eq!(
             NFTokenAcceptOfferTransactor.do_apply(&accept, &mut sb),
@@ -1887,6 +1890,7 @@ mod tests {
             fields: serde_json::json!({
                 "NFTokenOffers": [hex::encode_upper(offer_key.0)],
             }),
+            inner_batch: false,
         };
         assert_eq!(
             NFTokenCancelOfferTransactor.do_apply(&cancel, &mut sb),
@@ -1914,6 +1918,7 @@ mod tests {
             ticket_seq: None,
             last_ledger_seq: None,
             fields: serde_json::json!({ "NFTokenID": id_hex, "URI": "697066733A2F2F78" }),
+            inner_batch: false,
         };
         assert_eq!(
             NFTokenModifyTransactor.do_apply(&modify, &mut sb),

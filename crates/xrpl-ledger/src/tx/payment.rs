@@ -3781,6 +3781,7 @@ mod tests {
                 "Amount": amount.to_string(),
                 "Flags": 0u64,
             }),
+            inner_batch: false,
         };
         assert_eq!(
             PaymentTransactor.preclaim(&tx, &sandbox),
@@ -3815,6 +3816,7 @@ mod tests {
                 "Destination": hex::encode(dest),
                 "Amount": amount.to_string(),
             }),
+            inner_batch: false,
         }
     }
 
@@ -3853,6 +3855,7 @@ mod tests {
             last_ledger_seq: None,
             ticket_seq: None,
             fields: serde_json::json!({"Amount": "1000000"}),
+            inner_batch: false,
         };
         assert_eq!(PaymentTransactor.preflight(&tx), TxResult::Malformed);
     }
@@ -4094,6 +4097,7 @@ mod tests {
                 "Destination": hex::encode(dest),
                 "Amount": {"currency": "USD", "issuer": hex::encode(issuer), "value": "1"},
             }),
+            inner_batch: false,
         };
         // Finding 255: a destination at its limit fails the issuer→destination
         // step's `check` at strand BUILD (DirectStep.cpp:450-460, `-owed >=
@@ -4154,6 +4158,7 @@ mod tests {
                 "TakerPays": "5000000",
                 "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "5"},
             }),
+            inner_batch: false,
         };
         assert_eq!(
             crate::tx::offer::OfferCreateTransactor.do_apply(&offer_tx, &mut sandbox),
@@ -4238,6 +4243,7 @@ mod tests {
                 "TakerPays": "10000000",
                 "TakerGets": {"currency": "AAA", "issuer": hex::encode(iss), "value": "10000"},
             }),
+            inner_batch: false,
         };
         assert_eq!(crate::tx::offer::OfferCreateTransactor.do_apply(&mk, &mut sandbox), TxResult::Success);
         let mods = sandbox.into_modifications();
@@ -4256,6 +4262,7 @@ mod tests {
                 "Flags": 131072u64, // tfPartialPayment
                 "Paths": [[{"type": 48, "currency": "AAA", "issuer": hex::encode(iss)}]],
             }),
+            inner_batch: false,
         };
         assert_eq!(PaymentTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
@@ -4303,6 +4310,7 @@ mod tests {
                 "SendMax": "5000000",
                 "Flags": 131072u64,
             }),
+            inner_batch: false,
         };
         assert_eq!(PaymentTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
         // Taker spent the 5 XRP on the book.
@@ -4409,6 +4417,7 @@ mod tests {
                     "TakerPays": "5000000",
                     "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "5"},
                 }),
+                inner_batch: false,
             };
             assert_eq!(
                 crate::tx::offer::OfferCreateTransactor.do_apply(&offer_tx, &mut sandbox),
@@ -4432,6 +4441,7 @@ mod tests {
                 "SendMax": "5000000",
                 "Flags": 131072u64, // tfPartialPayment
             }),
+            inner_batch: false,
         };
 
         // Limit 0 while already holding 1 USD ⇒ receives nothing ⇒ dry, and the
@@ -4500,6 +4510,7 @@ mod tests {
                 "Destination": hex::encode(dest),
                 "Amount": {"currency": "USD", "issuer": hex::encode(issuer), "value": "25"},
             }),
+            inner_batch: false,
         };
 
         // Destination without a USD line: dry, and no line phantom-created.
@@ -4558,6 +4569,7 @@ mod tests {
                 "TakerPays": "5000000",
                 "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "5"},
             }),
+            inner_batch: false,
         };
         assert_eq!(
             crate::tx::offer::OfferCreateTransactor.do_apply(&offer_tx, &mut sandbox),
@@ -4581,6 +4593,7 @@ mod tests {
                 "SendMax": "5000000",
                 "Flags": 131072u64,
             }),
+            inner_batch: false,
         };
         assert_eq!(PaymentTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
@@ -4616,6 +4629,7 @@ mod tests {
                 "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "5"},
                 "TakerGets": "5000000",
             }),
+            inner_batch: false,
         };
         assert_eq!(
             crate::tx::offer::OfferCreateTransactor.do_apply(&offer_tx, &mut sandbox),
@@ -4639,6 +4653,7 @@ mod tests {
                 "SendMax": {"currency": "USD", "issuer": hex::encode(issuer), "value": "5"},
                 "Flags": 131072u64,
             }),
+            inner_batch: false,
         };
         assert_eq!(PaymentTransactor.do_apply(&tx, &mut sandbox), TxResult::PathDry);
         // Fee-only: taker's XRP untouched, maker's offer untouched.
@@ -4666,6 +4681,7 @@ mod tests {
                 "DeliverMin": {"currency": "USD", "issuer": hex::encode(issuer), "value": "10"},
                 "Flags": 131072u64,
             }),
+            inner_batch: false,
         };
         assert_eq!(PaymentTransactor.do_apply(&tx, &mut sandbox), TxResult::PathPartial);
         // Rolled back: XRP untouched, and the taker's line still holds nothing.

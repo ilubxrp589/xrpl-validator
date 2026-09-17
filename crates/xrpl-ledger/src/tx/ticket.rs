@@ -152,6 +152,7 @@ mod tests {
             ticket_seq: None,
             last_ledger_seq: None,
             fields: serde_json::json!({ "TicketCount": count }),
+            inner_batch: false,
         }
     }
 

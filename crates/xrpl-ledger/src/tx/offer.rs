@@ -10296,6 +10296,7 @@ mod tests {
                 "TakerPays": {"currency": "USD", "issuer": hex::encode([0x02u8; 20]), "value": "10"},
                 "TakerGets": "1000000",
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.preflight(&tx), TxResult::Success);
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
@@ -10329,6 +10330,7 @@ mod tests {
                 "TakerPays": "1000000",
                 "TakerGets": {"currency": "USD", "issuer": hex::encode([0x02u8; 20]), "value": "10"},
             }),
+            inner_batch: false,
         };
         OfferCreateTransactor.do_apply(&create_tx, &mut sandbox);
 
@@ -10341,6 +10343,7 @@ mod tests {
             ticket_seq: None,
             last_ledger_seq: None,
             fields: serde_json::json!({"OfferSequence": 5}),
+            inner_batch: false,
         };
         assert_eq!(OfferCancelTransactor.do_apply(&cancel_tx, &mut sandbox), TxResult::Success);
 
@@ -10401,6 +10404,7 @@ mod tests {
                 "TakerGets": {"currency": "USD", "issuer": hex::encode([0x02u8; 20]), "value": "10"},
                 "Flags": 0x00020000u64, // tfImmediateOrCancel
             }),
+            inner_batch: false,
         };
         // Mainnet (ImmediateOfferKilled amendment): IoC that crosses nothing
         // is tecKILLED, and nothing is placed.
@@ -10436,6 +10440,7 @@ mod tests {
                 "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "5"},
                 "Flags": 0x000C_0000u64,
             }),
+            inner_batch: false,
         };
         // The probe runs preclaim first — it must agree on tecUNFUNDED_OFFER,
         // not the generic tecUNFUNDED.
@@ -10484,6 +10489,7 @@ mod tests {
                 "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
                 "TakerGets": "10000000",
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&maker_offer, &mut sandbox), TxResult::Success);
         let mods = sandbox.into_modifications();
@@ -10499,6 +10505,7 @@ mod tests {
                 "TakerPays": "1000000",
                 "Flags": 0x000C_0000u64,
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::UnfundedOffer);
         // Nothing crossed: maker's offer and taker's XRP untouched.
@@ -10557,6 +10564,7 @@ mod tests {
                 "TakerPays": "50000000",
                 "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&maker_offer, &mut sandbox), TxResult::Success);
         let mods = sandbox.into_modifications();
@@ -10573,6 +10581,7 @@ mod tests {
                 "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
                 "Flags": 0x0004_0000u64,
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Killed);
         // Killed rolls everything back: the maker's offer survives untouched
@@ -10625,6 +10634,7 @@ mod tests {
                 "TakerPays": "5878826",
                 "TakerGets": {"currency": "666", "issuer": hex::encode(issuer), "value": "22.928591"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&maker_offer, &mut sandbox), TxResult::Success);
         let mods = sandbox.into_modifications();
@@ -10643,6 +10653,7 @@ mod tests {
                 "TakerGets": "5878826",
                 "TakerPays": {"currency": "666", "issuer": hex::encode(issuer), "value": "22.928591"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
         // The maker's funds are exhausted so its offer is consumed, and the taker
@@ -10695,6 +10706,7 @@ mod tests {
                     "TakerPays": "50000000",
                     "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
                 }),
+                inner_batch: false,
             };
             assert_eq!(OfferCreateTransactor.do_apply(&maker_offer, &mut sandbox), TxResult::Success);
             let mods = sandbox.into_modifications();
@@ -10709,6 +10721,7 @@ mod tests {
                 "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
                 "Flags": flags,
             }),
+            inner_batch: false,
         };
 
         // Non-passive at the maker's exact rate: crosses and consumes it.
@@ -10768,6 +10781,7 @@ mod tests {
                 "TakerPays": "10000000",
                 "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&maker_offer, &mut sandbox), TxResult::Success);
         assert!(sandbox.exists(&keylet::offer_key(&maker, 2)), "maker offer placed");
@@ -10785,6 +10799,7 @@ mod tests {
                 "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "5"},
                 "Flags": 0x000C_0000u64, // tfSell | tfFillOrKill
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
@@ -10923,6 +10938,7 @@ mod tests {
                 "TakerPays": {"currency": "STX", "issuer": hex::encode(issuer), "value": "813087.72688567"},
                 "TakerGets": "8539920",
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
@@ -10978,6 +10994,7 @@ mod tests {
                 "TakerPays": "1000000",
                 "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "10"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::UnfundedOffer);
         assert!(!sandbox.exists(&keylet::offer_key(&acct, 5)), "and nothing is placed");
@@ -11053,6 +11070,7 @@ mod tests {
                 account: who, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
                 ticket_seq: None, last_ledger_seq: None,
                 fields: serde_json::json!({"TakerPays": pays, "TakerGets": gets}),
+                inner_batch: false,
             };
             assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
             let mods = sandbox.into_modifications();
@@ -11069,6 +11087,7 @@ mod tests {
                 "TakerGets": {"currency": "AAA", "issuer": hex::encode(iss_a), "value": "10"},
                 "TakerPays": {"currency": "BBB", "issuer": hex::encode(iss_b), "value": "100"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
         // Leg A's book maker is untouched: the pool priced and filled the leg.
@@ -11168,6 +11187,7 @@ mod tests {
                 account: who, tx_type: "OfferCreate".to_string(), fee: 12, sequence: seq,
                 ticket_seq: None, last_ledger_seq: None,
                 fields: serde_json::json!({"TakerPays": pays, "TakerGets": gets}),
+                inner_batch: false,
             };
             assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
             let mods = sandbox.into_modifications();
@@ -11185,6 +11205,7 @@ mod tests {
                 "TakerGets": {"currency": "AAA", "issuer": hex::encode(iss_a), "value": "10"},
                 "TakerPays": {"currency": "BBB", "issuer": hex::encode(iss_b), "value": "100"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
@@ -11279,6 +11300,7 @@ mod tests {
                     "TakerGets": gets,
                     "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": pays},
                 }),
+                inner_batch: false,
             };
             assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
             let mods = sandbox.into_modifications();
@@ -11294,6 +11316,7 @@ mod tests {
                 "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "61"},
                 "TakerPays": "709289",
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
@@ -11386,6 +11409,7 @@ mod tests {
                 account: who, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
                 ticket_seq: None, last_ledger_seq: None,
                 fields: serde_json::json!({"TakerPays": pays, "TakerGets": gets}),
+                inner_batch: false,
             };
             assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
             let mods = sandbox.into_modifications();
@@ -11402,6 +11426,7 @@ mod tests {
                 "TakerGets": {"currency": "AAA", "issuer": hex::encode(iss_a), "value": "99.5"},
                 "TakerPays": {"currency": "BBB", "issuer": hex::encode(iss_b), "value": "100"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
@@ -11481,6 +11506,7 @@ mod tests {
                 "TakerPays": "100000000",
                 "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&mk, &mut sandbox), TxResult::Success);
         let mods = sandbox.into_modifications();
@@ -11530,6 +11556,7 @@ mod tests {
                 "TakerGets": "90000000",
                 "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
@@ -11623,6 +11650,7 @@ mod tests {
                 account: who, tx_type: "OfferCreate".to_string(), fee: 12, sequence: seq,
                 ticket_seq: None, last_ledger_seq: None,
                 fields: serde_json::json!({"TakerPays": pays, "TakerGets": gets}),
+                inner_batch: false,
             };
             assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
             let mods = sandbox.into_modifications();
@@ -11638,6 +11666,7 @@ mod tests {
                 "TakerGets": {"currency": "AAA", "issuer": hex::encode(iss_a), "value": "10"},
                 "TakerPays": {"currency": "BBB", "issuer": hex::encode(iss_b), "value": "5"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
@@ -11713,6 +11742,7 @@ mod tests {
                     "TakerPays": {"currency":"AAA","issuer":hex::encode(iss_a),"value":"1"},
                     "TakerGets": "1000000",
                 }),
+                inner_batch: false,
             };
             assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
             let mods = sandbox.into_modifications();
@@ -11732,6 +11762,7 @@ mod tests {
                 "TakerGets": {"currency": "AAA", "issuer": hex::encode(iss_a), "value": "10"},
                 "TakerPays": {"currency": "BBB", "issuer": hex::encode(iss_b), "value": "100"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
@@ -11794,6 +11825,7 @@ mod tests {
                 "TakerPays": "1000000",
                 "TakerGets": {"currency": "WETH", "issuer": hex::encode(issuer), "value": "0.00059094"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
@@ -11852,6 +11884,7 @@ mod tests {
                 "TakerPays": "100000000",
                 "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&maker_offer, &mut sandbox), TxResult::Success);
         let mods = sandbox.into_modifications();
@@ -11999,6 +12032,7 @@ mod tests {
                 "TakerGets": "100000000",
                 "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&own, &mut sandbox), TxResult::Success);
         let mods = sandbox.into_modifications();
@@ -12092,6 +12126,7 @@ mod tests {
                 "TakerPays": "100000000",
                 "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&own, &mut sandbox), TxResult::Success);
         let mods = sandbox.into_modifications();
@@ -12174,6 +12209,7 @@ mod tests {
                     "TakerPays": pays,
                     "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
                 }),
+                inner_batch: false,
             };
             assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
             let mods = sandbox.into_modifications();
@@ -12312,6 +12348,7 @@ mod tests {
                     "TakerPays": pays,
                     "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
                 }),
+                inner_batch: false,
             };
             assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
             let mods = sandbox.into_modifications();
@@ -12426,6 +12463,7 @@ mod tests {
                 "TakerPays": "50000000",
                 "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&maker_offer, &mut sandbox), TxResult::Success);
         let mods = sandbox.into_modifications();
@@ -12442,6 +12480,7 @@ mod tests {
                 "TakerGets": "5000000",
                 "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "9"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
@@ -12529,6 +12568,7 @@ mod tests {
         TxFields {
             account: *who, tx_type: "OfferCreate".to_string(), fee: 12, sequence: seq,
             ticket_seq: None, last_ledger_seq: None, fields,
+            inner_batch: false,
         }
     }
 

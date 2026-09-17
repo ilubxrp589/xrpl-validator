@@ -81,6 +81,7 @@ pub fn decode_raw_tx(raw_tx: &[u8]) -> Option<(Hash256, TxFields)> {
         ticket_seq,
         last_ledger_seq,
         fields: decoded,
+        inner_batch: false,
     };
 
     Some((tx_hash, tx_fields))

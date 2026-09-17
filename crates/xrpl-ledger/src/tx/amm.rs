@@ -3008,6 +3008,7 @@ mod tests {
                 "Amount2": "446527",
                 "Flags": 1_048_576u64,
             }),
+            inner_batch: false,
         };
         // 446527 drops wanted, only 246527 liquid once the new LP line's
         // reserve is counted, and no LP line exists yet.
@@ -3066,6 +3067,7 @@ mod tests {
                 "Amount2": {"currency": "USD", "issuer": hex::encode([0x02u8; 20]), "value": "100"},
                 "TradingFee": 500,
             }),
+            inner_batch: false,
         };
 
         assert_eq!(AMMCreateTransactor.preflight(&tx), TxResult::Success);
@@ -3098,6 +3100,7 @@ mod tests {
                 "Amount2": {"currency": "USD", "issuer": hex::encode([0x02u8; 20]), "value": "100"},
                 "TradingFee": 500,
             }),
+            inner_batch: false,
         };
         AMMCreateTransactor.do_apply(&create_tx, &mut sandbox);
 
@@ -3114,6 +3117,7 @@ mod tests {
                 "Asset2": {"currency": "USD", "issuer": hex::encode([0x02u8; 20])},
                 "TradingFee": 300,
             }),
+            inner_batch: false,
         };
         assert_eq!(AMMVoteTransactor.preflight(&vote_tx), TxResult::Success);
         assert_eq!(AMMVoteTransactor.do_apply(&vote_tx, &mut sandbox), TxResult::Success);
@@ -3141,6 +3145,7 @@ mod tests {
                 "Asset2": {"currency": "USD", "issuer": hex::encode(issuer)},
                 "TradingFee": 300,
             }),
+            inner_batch: false,
         };
         let akey = amm_key_from_asset_fields(&tx).unwrap();
         let amm = |lpt: &str| {
@@ -3199,6 +3204,7 @@ mod tests {
                 "Amount2": {"currency": "USD", "issuer": hex::encode([0x02u8; 20]), "value": "100"},
                 "TradingFee": 500,
             }),
+            inner_batch: false,
         };
         AMMCreateTransactor.do_apply(&create_tx, &mut sandbox);
 
@@ -3215,6 +3221,7 @@ mod tests {
                 "Asset2": {"currency": "USD", "issuer": hex::encode([0x02u8; 20])},
                 "Amount": "10000000",
             }),
+            inner_batch: false,
         };
         assert_eq!(AMMDepositTransactor.do_apply(&dep_tx, &mut sandbox), TxResult::Success);
 
@@ -3237,6 +3244,7 @@ mod tests {
                 "Asset2": {"currency": "USD", "issuer": hex::encode([0x02u8; 20])},
                 "Amount": "5000000",
             }),
+            inner_batch: false,
         };
         assert_eq!(AMMWithdrawTransactor.do_apply(&wd_tx, &mut sandbox), TxResult::Success);
 
@@ -3268,6 +3276,7 @@ mod tests {
                 "Amount2": {"currency": "USD", "issuer": hex::encode(usd_issuer), "value": "100"},
                 "TradingFee": 500,
             }),
+            inner_batch: false,
         };
         assert_eq!(AMMCreateTransactor.do_apply(&create_tx, &mut sandbox), TxResult::Success);
 
@@ -3282,6 +3291,7 @@ mod tests {
                 "Asset2": {"currency": "USD", "issuer": hex::encode(usd_issuer)},
                 "Amount": "10000000",
             }),
+            inner_batch: false,
         };
         assert_eq!(AMMDepositTransactor.do_apply(&dep, &mut sandbox), TxResult::Success);
 
@@ -3293,6 +3303,7 @@ mod tests {
                 "Asset2": {"currency": "USD", "issuer": hex::encode(usd_issuer)},
                 "Flags": 0x0002_0000u64, // tfWithdrawAll
             }),
+            inner_batch: false,
         };
         // Alice's LPToken trust line (she holds all the pool's LPTokens).
         let amm_key = amm_key_from_asset_fields(&wd_all).unwrap();
@@ -3353,6 +3364,7 @@ mod tests {
                 "Amount2": {"currency": "USD", "issuer": hex::encode(usd_issuer), "value": "100"},
                 "TradingFee": 236,
             }),
+            inner_batch: false,
         };
         assert_eq!(AMMCreateTransactor.do_apply(&create_tx, &mut sandbox), TxResult::Success);
 
@@ -3366,6 +3378,7 @@ mod tests {
                 "Amount": "1",
                 "Flags": 0x0004_0000u64, // tfOneAssetWithdrawAll
             }),
+            inner_batch: false,
         };
         let amm_key = amm_key_from_asset_fields(&wd).unwrap();
         let amm_obj: serde_json::Value = serde_json::from_slice(&sandbox.read(&amm_key).unwrap()).unwrap();
@@ -3415,6 +3428,7 @@ mod tests {
                 "Amount2": {"currency": "USD", "issuer": hex::encode(usd_issuer), "value": "100"},
                 "TradingFee": 500,
             }),
+            inner_batch: false,
         };
         assert_eq!(AMMCreateTransactor.do_apply(&create_tx, &mut sandbox), TxResult::Success);
 
@@ -3426,6 +3440,7 @@ mod tests {
                 "Asset2": {"currency": "USD", "issuer": hex::encode(usd_issuer)},
                 "Flags": 0x0001_0000u64, // tfLPToken — note: no Amount/Amount2
             }),
+            inner_batch: false,
         };
         let amm_key = amm_key_from_asset_fields(&wd).unwrap();
         let amm_obj: serde_json::Value = serde_json::from_slice(&sandbox.read(&amm_key).unwrap()).unwrap();
@@ -3491,6 +3506,7 @@ mod tests {
                 "Amount2": {"currency": "USD", "issuer": hex::encode(usd_issuer), "value": "100"},
                 "TradingFee": 500,
             }),
+            inner_batch: false,
         };
         assert_eq!(AMMCreateTransactor.do_apply(&create_tx, &mut sandbox), TxResult::Success);
 
@@ -3506,6 +3522,7 @@ mod tests {
                 "Asset2": {"currency": "USD", "issuer": hex::encode(usd_issuer)},
                 "Amount": "500000",
             }),
+            inner_batch: false,
         };
         let put_acct = |sb: &mut Sandbox, id: &[u8; 20], bal: &str| {
             sb.write(
