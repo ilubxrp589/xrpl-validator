@@ -4854,17 +4854,6 @@ thr={t:?} admits_trunc={} admits_up={}",
         // when the round is then refused (tfPassive: "Path rejected by
         // limitQuality … All strands dry"): rippled keeps the rev pass's
         // removals ("rm bad offers even if the strand fails").
-        if flows_bridge && !b_use_amm {
-            if let Some(dj) = lb.get(bi).and_then(|(q, _)| dir_at(&dirs_b, *q)) {
-                if std::env::var("DX_REV").is_ok() {
-                    eprintln!("DX_REV extent enter bi={bi} dj={dj} sell={sell} rem_pays={rem_pays:?} crossed={crossed} lb_q={:x}", lb[bi].0);
-                }
-                rev_extent_reap(
-                    sandbox, &dirs_b, dj, if sell { None } else { Some(rem_pays) }, None,
-                    taker, beneficiary, pays_leg, &xrp_leg, true, &mut oc_b, stale,
-                );
-            }
-        }
         // ⚠ Under multiPath, a clamped POOL fill is priced at the OFFER'S
         // QUALITY, not re-swapped through the conservation function:
         //     if (ammLiquidity_.multiPath())
@@ -5209,6 +5198,37 @@ thr={t:?} admits_trunc={} admits_up={}",
                     }
                     if !within(admit) {
                         break 'attempt;
+                    }
+                }
+                // Finding 292 (#107002363 580C51AC and #106999572 6302A085,
+                // rJfVTbJs selling ETH for RLUSD, tfSell|tfImmediateOrCancel,
+                // two strands): FlowSortStrands (enabled) makes an iteration
+                // flow its admitted strands IN BOUND ORDER and BREAK at the
+                // first that succeeds and passes limitQuality
+                // (StrandFlow.h: `best.emplace(...); pushRemainingCurToNext(
+                // strandIndex + 1); break;`). The strands behind the winner are
+                // not flowed that iteration — no rev pass, no stream, nothing
+                // reaped. Here the direct ETH/RLUSD strand sorted first
+                // (4.0391e-4 against the bridge's 4.0429e-4) and filled the
+                // whole 4.039e-6 ETH; rippled's narration has one strand's
+                // rev/fwd and six mutations. We ran leg B's rev extent for
+                // every admitted bridge BEFORE the candidate loop (finding
+                // 251's site) and reaped rfPBiFvF's expired BF0EA46B, its
+                // page and an OwnerCount unit — ten mutations. The extent now
+                // runs inside the bridge's own attempt, so it happens exactly
+                // when rippled flows the bridge: when it sorts first, or when
+                // every strand ahead of it failed. Finding 251's semantics are
+                // unchanged — a refused bridge still keeps its removals (the
+                // rollback re-applies hard stale).
+                if flows_bridge && !b_use_amm {
+                    if let Some(dj) = lb.get(bi).and_then(|(q, _)| dir_at(&dirs_b, *q)) {
+                        if std::env::var("DX_REV").is_ok() {
+                            eprintln!("DX_REV extent enter bi={bi} dj={dj} sell={sell} rem_pays={rem_pays:?} crossed={crossed} lb_q={:x}", lb[bi].0);
+                        }
+                        rev_extent_reap(
+                            sandbox, &dirs_b, dj, if sell { None } else { Some(rem_pays) }, None,
+                            taker, beneficiary, pays_leg, &xrp_leg, true, &mut oc_b, stale,
+                        );
                     }
                 }
             }

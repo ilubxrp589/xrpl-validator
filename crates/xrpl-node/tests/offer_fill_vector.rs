@@ -1419,3 +1419,20 @@ fn offer_bridge_admission_reads_the_raw_book_tip_expired_or_not_106990975() {
 fn offer_fill_or_kill_is_judged_on_the_sorted_fold_not_the_running_chain_107044846() {
     run_bundle(include_str!("vectors/offer_fill_or_kill_is_judged_on_the_sorted_fold_not_the_running_chain_107044846.json"));
 }
+
+/// Finding 292 (#107002363 580C51AC and #106999572 6302A085, rJfVTbJs selling
+/// ETH for RLUSD, tfSell|tfImmediateOrCancel, two strands): FlowSortStrands
+/// makes an iteration flow its admitted strands in bound order and break at
+/// the first that succeeds and passes limitQuality; the strands behind the
+/// winner are not flowed that iteration — no rev pass, no stream, nothing
+/// reaped. The direct ETH/RLUSD strand sorted first (4.0391e-4 against the
+/// bridge's 4.0429e-4) and filled the whole 4.039e-6 ETH: rippled's narration
+/// has one strand's rev/fwd and six mutations. We ran the bridge's leg-B rev
+/// extent before the candidate loop and reaped rfPBiFvF's expired BF0EA46B,
+/// its page and an OwnerCount unit — ten. Four untouched-object pins carry
+/// the rule (post == pre for the offer, its page, the owner's root and owner
+/// directory).
+#[test]
+fn offer_sorted_strands_break_at_the_first_success_the_bridge_behind_a_winner_is_not_flowed_107002363() {
+    run_bundle(include_str!("vectors/offer_sorted_strands_break_at_the_first_success_the_bridge_behind_a_winner_is_not_flowed_107002363.json"));
+}
