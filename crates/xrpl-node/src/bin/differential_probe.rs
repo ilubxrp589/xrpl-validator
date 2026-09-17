@@ -2792,18 +2792,38 @@ fn run() -> i32 {
             Vec::new()
         };
         let mut inner_ter: Vec<String> = Vec::new();
-        for (i, ih) in
-            batch_inners.get(&h.to_uppercase()).map(Vec::as_slice).unwrap_or(&[]).iter().enumerate()
-        {
-            let want = txmap.get(ih.as_str()).and_then(|t| t["ter"].as_str()).unwrap_or("?");
-            let got = inner_results.get(i).map(String::as_str).unwrap_or("(not run)");
-            if got != want {
-                eprintln!(
-                    "  DIVERGE-TER {tx_type} {} INNER[{i}] {}   our_ter={got} net_ter={want}",
-                    &h[..12.min(h.len())],
-                    &ih[..12.min(ih.len())]
-                );
-                inner_ter.push(format!("{i}:{ih}:{got}!={want}"));
+        let inners = batch_inners.get(&h.to_uppercase()).map(Vec::as_slice).unwrap_or(&[]);
+        if inners.len() != inner_results.len() {
+            // The ids are the inners the LEDGER filed, the results the inners
+            // the engine ATTEMPTED. Pairing them by index is only meaningful
+            // while the two agree: one hole in either list shifts every later
+            // inner onto its neighbour's result and would report a confident,
+            // wrong verdict. So no per-inner comparison is made — but the
+            // outer still DIVERGEs, so a withheld comparison cannot pass as a
+            // MATCH. The receipt mirrors stamp_batch_threading's fallback line
+            // (threading.rs:289-296), which the same disagreement triggers.
+            eprintln!(
+                "  BATCH-INNER {h}: {} inner ids vs {} results — inner verdicts withheld",
+                inners.len(),
+                inner_results.len()
+            );
+            inner_ter.push(format!(
+                "withheld:{}ids-vs-{}results",
+                inners.len(),
+                inner_results.len()
+            ));
+        } else {
+            for (i, ih) in inners.iter().enumerate() {
+                let want = txmap.get(ih.as_str()).and_then(|t| t["ter"].as_str()).unwrap_or("?");
+                let got = inner_results.get(i).map(String::as_str).unwrap_or("(not run)");
+                if got != want {
+                    eprintln!(
+                        "  DIVERGE-TER {tx_type} {} INNER[{i}] {}   our_ter={got} net_ter={want}",
+                        &h[..12.min(h.len())],
+                        &ih[..12.min(ih.len())]
+                    );
+                    inner_ter.push(format!("{i}:{ih}:{got}!={want}"));
+                }
             }
         }
         if std::env::var("DX_THREADCHECK").is_ok() || std::env::var("DX_BYTECHECK").is_ok() {
@@ -3186,10 +3206,18 @@ fn run() -> i32 {
         for r in &per_tx {
             let v = r["verdict"].as_str().unwrap_or("");
             if v.starts_with("DIVERGE") {
-                println!("  {} {} {}   our_ter={} net_ter={} our_muts={} net_muts={} missing={:?} extra={:?}",
+                // A Batch outer's divergence can live entirely in its inners:
+                // without them the line reads DIVERGE-TER with our_ter ==
+                // net_ter and explains nothing. Present only on such an outer,
+                // so every other line is byte-identical.
+                let inner = match r.get("inner_ter") {
+                    Some(t) => format!(" inner_ter={t}"),
+                    None => String::new(),
+                };
+                println!("  {} {} {}   our_ter={} net_ter={} our_muts={} net_muts={} missing={:?} extra={:?}{}",
                     v, r["type"].as_str().unwrap_or(""), &r["hash"].as_str().unwrap_or("")[..12],
                     r["our_ter"].as_str().unwrap_or(""), r["net_ter"].as_str().unwrap_or(""),
-                    r["our_muts"], r["net_muts"], r["missing_in_ours"], r["extra_in_ours"]);
+                    r["our_muts"], r["net_muts"], r["missing_in_ours"], r["extra_in_ours"], inner);
             }
         }
     }
