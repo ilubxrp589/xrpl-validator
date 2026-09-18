@@ -300,9 +300,9 @@ pub fn book_dir_key(base: &Hash256, quality: u64) -> Hash256 {
 /// (exponent 0); IOU values are decimal strings, optionally scientific
 /// (`1000000000000000e-1`).
 pub fn amount_mant_exp(v: &serde_json::Value) -> Option<(u128, i32)> {
-    let s = match v {
-        serde_json::Value::String(s) => s.as_str(),
-        serde_json::Value::Object(o) => o.get("value")?.as_str()?,
+    let (s, iou) = match v {
+        serde_json::Value::String(s) => (s.as_str(), false),
+        serde_json::Value::Object(o) => (o.get("value")?.as_str()?, true),
         _ => return None,
     };
     let s = s.trim_start_matches('-');
@@ -316,9 +316,35 @@ pub fn amount_mant_exp(v: &serde_json::Value) -> Option<(u128, i32)> {
         Some(d) => (format!("{}{}", &mant_str[..d], &mant_str[d + 1..]), (mant_str.len() - d - 1) as i32),
         None => (mant_str, 0),
     };
-    let m: u128 = digits.parse().ok()?;
     exp -= frac;
+    // Finding 303 (differential fuzz of #107009438, 19 mutants doubling a
+    // deliver-max Amount to a 96-digit value): rippled's STAmount keeps the
+    // first sixteen significant digits and carries the rest in the exponent
+    // (canonicalize divides the mantissa down); `u128::parse` overflowed on
+    // anything past 38 digits and the payment read temBAD_AMOUNT where
+    // libxrpl applied it.
+    // XRP drops are an exact integer (XRPAmount), never canonicalized —
+    // the cap is for IOU values only.
+    let digits = if iou { digits.trim_start_matches('0') } else { digits.as_str() };
+    let digits = if iou && digits.len() > 16 {
+        exp += (digits.len() - 16) as i32;
+        &digits[..16]
+    } else {
+        digits
+    };
+    let m: u128 = if digits.is_empty() { 0 } else { digits.parse().ok()? };
     Some((m, exp))
+}
+
+#[cfg(test)]
+mod amount_parse_tests {
+    #[test]
+    fn a_ninety_six_digit_value_keeps_sixteen_digits_and_the_exponent() {
+        let v = serde_json::json!({"currency": "USD", "issuer": "r", "value": "199999999999999800000000000000000000000000000000000000000000000000000000000000000000000000000000"});
+        assert_eq!(super::amount_mant_exp(&v), Some((1999999999999998u128, 80)));
+        assert_eq!(super::amount_mant_exp(&serde_json::json!("0.000")), Some((0, -3)));
+        assert_eq!(super::amount_mant_exp(&serde_json::json!("117.732708")), Some((117732708, -6)));
+    }
 }
 
 /// Encode `pays/gets` as rippled's `getRate`: `((exponent+100) << 56) |

@@ -1451,3 +1451,11 @@ fn offer_sorted_strands_break_at_the_first_success_the_bridge_behind_a_winner_is
 fn offer_fib_pool_is_gated_by_its_own_book_tip_107060755() {
     run_bundle(include_str!("vectors/offer_fib_pool_is_gated_by_its_own_book_tip_107060755.json"));
 }
+
+/// Finding 302 — from the differential fuzzer: tfImmediateOrCancel and
+/// tfFillOrKill together are malformed (CreateOffer.cpp:82-85); libxrpl's
+/// verdict on the mutant is the expectation.
+#[test]
+fn offer_ioc_and_fok_together_is_invalid_flag_fuzz_107009438() {
+    run_bundle(include_str!("vectors/offer_ioc_and_fok_together_is_invalid_flag_fuzz_107009438.json"));
+}

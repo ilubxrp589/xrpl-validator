@@ -187,8 +187,25 @@ pub enum TxResult {
     BadSequence,
     /// temINVALID_FLAG — Batch: not exactly one mode flag, or tfInnerBatchTxn on the outer.
     InvalidFlag,
-    /// temREDUNDANT — Batch: duplicate inner, or duplicate (account, sequence) under AllOrNothing/UntilFailure.
+    /// temREDUNDANT — Batch: duplicate inner, or duplicate (account, sequence) under AllOrNothing/UntilFailure;
+    /// Payment: destination is the sender, same asset both ends, no Paths (Payment.cpp:171).
     Redundant,
+    /// temBAD_SEND_XRP_MAX — XRP-to-XRP payment carrying SendMax (finding 299).
+    BadSendXrpMax,
+    /// temBAD_SEND_XRP_PATHS — XRP-to-XRP (or MPT) payment carrying Paths.
+    BadSendXrpPaths,
+    /// temBAD_SEND_XRP_PARTIAL — XRP-to-XRP payment with tfPartialPayment.
+    BadSendXrpPartial,
+    /// temBAD_SEND_XRP_LIMIT — XRP-to-XRP (or MPT) payment with tfLimitQuality.
+    BadSendXrpLimit,
+    /// temBAD_SEND_XRP_NO_DIRECT — XRP-to-XRP (or MPT) payment with tfNoRippleDirect.
+    BadSendXrpNoDirect,
+    /// temRIPPLE_EMPTY — tfNoRippleDirect with no Paths: no strand can exist (PaySteps.cpp:542, finding 300).
+    RippleEmpty,
+    /// temBAD_CURRENCY — the reserved "XRP" currency code on an IOU amount.
+    BadCurrency,
+    /// temDST_NEEDED — Payment without a Destination.
+    DstNeeded,
     /// temBAD_SIGNER — Batch: BatchSigners not sorted/unique, missing or
     /// spurious signer, a signer that is the outer account; also an inner
     /// carrying a Signers field.
@@ -365,6 +382,14 @@ impl TxResult {
             TxResult::BadSequence => "temBAD_SEQUENCE",
             TxResult::InvalidFlag => "temINVALID_FLAG",
             TxResult::Redundant => "temREDUNDANT",
+            TxResult::BadSendXrpMax => "temBAD_SEND_XRP_MAX",
+            TxResult::BadSendXrpPaths => "temBAD_SEND_XRP_PATHS",
+            TxResult::BadSendXrpPartial => "temBAD_SEND_XRP_PARTIAL",
+            TxResult::BadSendXrpLimit => "temBAD_SEND_XRP_LIMIT",
+            TxResult::BadSendXrpNoDirect => "temBAD_SEND_XRP_NO_DIRECT",
+            TxResult::RippleEmpty => "temRIPPLE_EMPTY",
+            TxResult::BadCurrency => "temBAD_CURRENCY",
+            TxResult::DstNeeded => "temDST_NEEDED",
             TxResult::BadSigner => "temBAD_SIGNER",
             TxResult::InvalidInnerBatch => "temINVALID_INNER_BATCH",
             TxResult::ArrayEmpty => "temARRAY_EMPTY",

@@ -1939,9 +1939,73 @@ impl Transactor for PaymentTransactor {
             Some(d) => d,
             None => return TxResult::Malformed,
         };
-        if dest == tx.account {
-            // rippled actually allows this — it's just a fee burn
-            // We'll allow it too
+        // Finding 299 (differential fuzz of #107052630, mutants of eleven
+        // XRP payments): the shape checks rippled's Payment::preflight runs
+        // AFTER the amount checks, in its order (Payment.cpp:134-208). A
+        // tem never reaches a validated ledger, so the shadow could not
+        // find these; libxrpl on the same mutants did.
+        let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+        let is_xrp = |v: &serde_json::Value| v.is_string();
+        let amount = tx.fields.get("Amount");
+        let send_max = tx.fields.get("SendMax");
+        let has_max = send_max.is_some();
+        let has_paths = tx.fields.get("Paths").is_some();
+        let mpt_direct = amount.and_then(crate::tx::mpt::parse_mpt_amount).is_some();
+        // rippled's maxSourceAmount defaults to the Amount when SendMax is
+        // absent, so "both native" means Amount is XRP and SendMax, if
+        // present, is XRP too.
+        let xrp_direct = amount.is_some_and(is_xrp) && send_max.is_none_or(is_xrp);
+        let same_asset = |a: &serde_json::Value, b: &serde_json::Value| -> bool {
+            match (a.as_object(), b.as_object()) {
+                (Some(x), Some(y)) => x.get("currency") == y.get("currency") && x.get("issuer") == y.get("issuer"),
+                (None, None) => true, // both XRP
+                _ => false,
+            }
+        };
+        // A payment to oneself in one asset with no Paths does nothing but
+        // burn the fee — rippled refuses it as temREDUNDANT (Payment.cpp:171).
+        // Cross-currency self-payments (SendMax in another asset) are the
+        // arbitrage shape and stay legal.
+        if let (Some(a), Some(src)) = (amount, send_max.or(amount)) {
+            if dest == tx.account && same_asset(a, src) && !has_paths {
+                return TxResult::Redundant;
+            }
+        }
+        if xrp_direct && has_max {
+            return TxResult::BadSendXrpMax;
+        }
+        if (xrp_direct || mpt_direct) && has_paths {
+            return TxResult::BadSendXrpPaths;
+        }
+        if xrp_direct && flags & 0x0002_0000 != 0 {
+            return TxResult::BadSendXrpPartial;
+        }
+        if (xrp_direct || mpt_direct) && flags & 0x0004_0000 != 0 {
+            return TxResult::BadSendXrpLimit;
+        }
+        if (xrp_direct || mpt_direct) && flags & 0x0001_0000 != 0 {
+            return TxResult::BadSendXrpNoDirect;
+        }
+        // Finding 301 (differential fuzz of #107009438, 43 mutants): the
+        // DeliverMin rules (Payment.cpp:210-243) — only with tfPartialPayment,
+        // positive, the Amount's asset, and not above the Amount.
+        if let Some(dmin) = tx.fields.get("DeliverMin") {
+            if flags & 0x0002_0000 == 0 {
+                return TxResult::BadAmount;
+            }
+            let Some(a) = amount else { return TxResult::BadAmount };
+            if !same_asset(a, dmin) {
+                return TxResult::BadAmount;
+            }
+            let positive_and_within = match (crate::ledger::keylet::amount_mant_exp(dmin), crate::ledger::keylet::amount_mant_exp(a)) {
+                (Some((dm, de)), Some((am, ae))) if dm > 0 => {
+                    crate::tx::offer::me_cmp((dm, de), (am, ae)) != std::cmp::Ordering::Greater
+                }
+                _ => false,
+            };
+            if !positive_and_within {
+                return TxResult::BadAmount;
+            }
         }
 
         TxResult::Success
@@ -2525,6 +2589,16 @@ impl PaymentTransactor {
         partial: bool,
     ) -> TxResult {
         use crate::tx::offer as ox;
+        // Finding 300 (differential fuzz of #107052630 and #107009438,
+        // tfNoRippleDirect on pathless payments): with the default path
+        // suppressed and no Paths there is no strand to build, so the flow
+        // answers temRIPPLE_EMPTY before it looks at any line or book
+        // (PaySteps.cpp:539-542) — ahead of the dry checks below, which
+        // used to answer tecPATH_DRY for the same shape.
+        let no_direct_flag = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & 0x0001_0000 != 0;
+        if no_direct_flag && tx.fields.get("Paths").and_then(|p| p.as_array()).is_none_or(|a| a.is_empty()) {
+            return TxResult::RippleEmpty;
+        }
         let Some(sm_json) = sendmax else {
             // Paths without SendMax: spend the Amount currency itself.
             return self.apply_iou_direct(tx, sandbox, amt_json, dest, partial);
@@ -3910,6 +3984,53 @@ mod tests {
         let dest = [0x02u8; 20];
         let tx = payment_tx(sender, dest, 1_000_000, 0, 1);
         assert_eq!(PaymentTransactor.preflight(&tx), TxResult::BadFee);
+    }
+
+    #[test]
+    fn preflight_xrp_direct_shape_rules_finding_299() {
+        let mk = |extra: serde_json::Value| -> TxFields {
+            let mut f = serde_json::json!({"Amount": "4000000", "Destination": hex::encode([2u8; 20]), "Flags": 0});
+            for (k, v) in extra.as_object().unwrap() {
+                f[k] = v.clone();
+            }
+            TxFields { account: [1u8; 20], tx_type: "Payment".into(), fee: 12, sequence: 1, ticket_seq: None, last_ledger_seq: None, fields: f, inner_batch: false }
+        };
+        let t = PaymentTransactor;
+        assert_eq!(t.preflight(&mk(serde_json::json!({}))), TxResult::Success);
+        assert_eq!(t.preflight(&mk(serde_json::json!({"Flags": 0x20000}))), TxResult::BadSendXrpPartial);
+        assert_eq!(t.preflight(&mk(serde_json::json!({"Flags": 0x40000}))), TxResult::BadSendXrpLimit);
+        assert_eq!(t.preflight(&mk(serde_json::json!({"Flags": 0x10000}))), TxResult::BadSendXrpNoDirect);
+        assert_eq!(t.preflight(&mk(serde_json::json!({"SendMax": "5000000"}))), TxResult::BadSendXrpMax);
+        assert_eq!(t.preflight(&mk(serde_json::json!({"Paths": [[{"currency": "USD", "issuer": hex::encode([3u8; 20]), "type": 48}]]}))), TxResult::BadSendXrpPaths);
+        // an IOU payment with the same flags is fine at preflight
+        let iou = serde_json::json!({"Amount": {"currency": "USD", "issuer": hex::encode([3u8; 20]), "value": "1"}, "Flags": 0x20000});
+        assert_eq!(t.preflight(&mk(iou)), TxResult::Success);
+        // redundant: to self, same asset, no paths — but not with a cross-currency SendMax
+        let me = hex::encode([1u8; 20]); // the engine's fields carry hex account ids
+        assert_eq!(t.preflight(&mk(serde_json::json!({"Destination": me}))), TxResult::Redundant);
+        assert_eq!(t.preflight(&mk(serde_json::json!({"Destination": me, "SendMax": {"currency": "USD", "issuer": hex::encode([3u8; 20]), "value": "1"}}))), TxResult::Success);
+    }
+
+    #[test]
+    fn preflight_deliver_min_rules_finding_301() {
+        let usd = |v: &str| serde_json::json!({"currency": "USD", "issuer": hex::encode([3u8; 20]), "value": v});
+        let mk = |extra: serde_json::Value| -> TxFields {
+            let mut f = serde_json::json!({"Amount": usd("10"), "SendMax": "5000000", "Destination": hex::encode([2u8; 20]), "Flags": 0x20000});
+            for (k, v) in extra.as_object().unwrap() {
+                f[k] = v.clone();
+            }
+            TxFields { account: [1u8; 20], tx_type: "Payment".into(), fee: 12, sequence: 1, ticket_seq: None, last_ledger_seq: None, fields: f, inner_batch: false }
+        };
+        let t = PaymentTransactor;
+        assert_eq!(t.preflight(&mk(serde_json::json!({"DeliverMin": usd("5")}))), TxResult::Success);
+        assert_eq!(t.preflight(&mk(serde_json::json!({"DeliverMin": usd("10")}))), TxResult::Success);
+        // a seventeenth digit is truncated by STAmount (finding 303), so 10.000000000000001 == 10 and passes;
+        // one ulp above at sixteen digits does not.
+        assert_eq!(t.preflight(&mk(serde_json::json!({"DeliverMin": usd("10.000000000000001")}))), TxResult::Success);
+        assert_eq!(t.preflight(&mk(serde_json::json!({"DeliverMin": usd("10.00000000000001")}))), TxResult::BadAmount);
+        assert_eq!(t.preflight(&mk(serde_json::json!({"DeliverMin": usd("5"), "Flags": 0}))), TxResult::BadAmount);
+        assert_eq!(t.preflight(&mk(serde_json::json!({"DeliverMin": "1000"}))), TxResult::BadAmount);
+        assert_eq!(t.preflight(&mk(serde_json::json!({"DeliverMin": usd("0")}))), TxResult::BadAmount);
     }
 
     #[test]

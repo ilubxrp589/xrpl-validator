@@ -9286,6 +9286,13 @@ impl Transactor for OfferCreateTransactor {
         if tx.fields.get("TakerPays").is_none() || tx.fields.get("TakerGets").is_none() {
             return TxResult::Malformed;
         }
+        // Finding 302 (differential fuzz of #107009438, 38 mutants):
+        // tfImmediateOrCancel and tfFillOrKill together are malformed
+        // (CreateOffer.cpp:82-85) — we crossed as FoK and answered tecKILLED.
+        let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+        if flags & 0x0002_0000 != 0 && flags & 0x0004_0000 != 0 {
+            return TxResult::InvalidFlag;
+        }
         TxResult::Success
     }
 
@@ -9388,6 +9395,12 @@ impl Transactor for OfferCreateTransactor {
         let sell = flags & 0x0008_0000 != 0;
         let ioc = flags & 0x0002_0000 != 0;
         let fok = flags & 0x0004_0000 != 0;
+        // Finding 302 (differential fuzz of #107009438, three mutants):
+        // tfImmediateOrCancel and tfFillOrKill together are malformed
+        // (CreateOffer.cpp:82-85) — we crossed as FoK and answered tecKILLED.
+        if ioc && fok {
+            return TxResult::InvalidFlag;
+        }
 
         // The kill-path snapshot is taken BEFORE the cancel-and-replace: the
         // cancellation is transactional state like any other, and a tec

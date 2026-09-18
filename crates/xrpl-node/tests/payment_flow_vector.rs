@@ -921,3 +921,25 @@ fn payment_reverse_pass_reaps_survive_the_snapshot_107009438() {
 fn payment_pool_stands_aside_on_raw_quality_not_fee_spot_107056200() {
     run_bundle(include_str!("vectors/payment_pool_stands_aside_on_raw_quality_not_fee_spot_107056200.json"));
 }
+
+/// Findings 299–303 — the first vectors from the differential fuzzer
+/// (`differential_probe --fuzz`): unsigned mutants of real #107009438
+/// transactions, judged by libxrpl 3.4.0 on the same pre-state. The
+/// expectation is libxrpl's verdict; there is no mainnet metadata because
+/// a tem never reaches a ledger.
+#[test]
+fn payment_xrp_direct_with_partial_flag_is_malformed_fuzz_107009438() {
+    run_bundle(include_str!("vectors/payment_xrp_direct_with_partial_flag_is_malformed_fuzz_107009438.json"));
+}
+#[test]
+fn payment_no_ripple_direct_without_paths_is_ripple_empty_fuzz_107009438() {
+    run_bundle(include_str!("vectors/payment_no_ripple_direct_without_paths_is_ripple_empty_fuzz_107009438.json"));
+}
+#[test]
+fn payment_deliver_min_without_partial_is_bad_amount_fuzz_107009438() {
+    run_bundle(include_str!("vectors/payment_deliver_min_without_partial_is_bad_amount_fuzz_107009438.json"));
+}
+#[test]
+fn payment_ninety_six_digit_amount_parses_fuzz_107009438() {
+    run_bundle(include_str!("vectors/payment_ninety_six_digit_amount_parses_fuzz_107009438.json"));
+}
