@@ -172,6 +172,8 @@ pub enum TxResult {
     /// Clearing the RegularKey with the master key disabled and no signer
     /// list to fall back on (tecNO_ALTERNATIVE_KEY, SetRegularKey.cpp:83).
     NoAlternativeKey,
+    /// tecNEED_MASTER_KEY — asfDisableMaster / asfNoFreeze not signed with the master key.
+    NeedMasterKey,
     /// Turning on RequireAuth while the account already owns objects
     /// (tecOWNERS, SetAccount.cpp preclaim: `!dirIsEmpty(ownerDir)`).
     Owners,
@@ -224,6 +226,12 @@ pub enum TxResult {
     BadSignature,
     /// temBAD_REGKEY — an inner carrying a non-empty SigningPubKey.
     BadRegKey,
+    /// temBAD_TRANSFER_RATE — AccountSet TransferRate outside [1e9, 2e9] (0 clears).
+    BadTransferRate,
+    /// temBAD_EXPIRATION — EscrowCreate without any timeout, or CancelAfter <= FinishAfter.
+    BadExpiration,
+    /// temBAD_QUORUM — SignerListSet quorum of zero or beyond the weights' sum.
+    BadQuorum,
     /// temINVALID — an inner of a disallowed type (Batch inside Batch, pseudo types).
     InvalidTx,
 
@@ -232,6 +240,17 @@ pub enum TxResult {
     PastSeq,
     /// LastLedgerSequence exceeded.
     MaxLedger,
+    /// tefNO_TICKET — the TicketSequence names a ticket that was already used.
+    NoTicket,
+    /// tefWRONG_PRIOR — AccountTxnID does not match the account's.
+    WrongPrior,
+    /// tefNO_AUTH_REQUIRED — tfSetfAuth on an account without lsfRequireAuth.
+    NoAuthRequired,
+    // ter — retry, not applied
+    /// terPRE_SEQ — a future Sequence.
+    PreSeq,
+    /// terPRE_TICKET — a TicketSequence not yet created.
+    PreTicket,
     /// Account not found.
     NoAccount,
     /// Pseudo-transaction internal failure (tefFAILURE).
@@ -305,6 +324,7 @@ impl TxResult {
             | TxResult::XChainClaimNoQuorum
             | TxResult::XChainNoSignersList
             | TxResult::NoAlternativeKey
+            | TxResult::NeedMasterKey
             | TxResult::Owners
             | TxResult::Unsupported => true,
             // tem/tef: not claimed
@@ -375,11 +395,15 @@ impl TxResult {
             TxResult::XChainClaimNoQuorum => "tecXCHAIN_CLAIM_NO_QUORUM",
             TxResult::XChainNoSignersList => "tecXCHAIN_NO_SIGNERS_LIST",
             TxResult::NoAlternativeKey => "tecNO_ALTERNATIVE_KEY",
+            TxResult::NeedMasterKey => "tecNEED_MASTER_KEY",
             TxResult::Owners => "tecOWNERS",
             TxResult::Malformed => "temMALFORMED",
             TxResult::BadFee => "temBAD_FEE",
             TxResult::BadAmount => "temBAD_AMOUNT",
             TxResult::BadSequence => "temBAD_SEQUENCE",
+            TxResult::BadTransferRate => "temBAD_TRANSFER_RATE",
+            TxResult::BadExpiration => "temBAD_EXPIRATION",
+            TxResult::BadQuorum => "temBAD_QUORUM",
             TxResult::InvalidFlag => "temINVALID_FLAG",
             TxResult::Redundant => "temREDUNDANT",
             TxResult::BadSendXrpMax => "temBAD_SEND_XRP_MAX",
@@ -400,6 +424,11 @@ impl TxResult {
             TxResult::InvalidTx => "temINVALID",
             TxResult::PastSeq => "tefPAST_SEQ",
             TxResult::MaxLedger => "tefMAX_LEDGER",
+            TxResult::NoTicket => "tefNO_TICKET",
+            TxResult::WrongPrior => "tefWRONG_PRIOR",
+            TxResult::NoAuthRequired => "tefNO_AUTH_REQUIRED",
+            TxResult::PreSeq => "terPRE_SEQ",
+            TxResult::PreTicket => "terPRE_TICKET",
             TxResult::NoAccount => "tefNO_ACCOUNT",
             TxResult::Failure => "tefFAILURE",
             TxResult::FailedProcessing => "telFAILED_PROCESSING",
@@ -442,7 +471,13 @@ impl TxFields {
     /// is malformed (`temBAD_FEE`); a batch inner carries `Fee: "0"` by
     /// rule (rippled preflight1 under `tapBATCH`).
     pub fn fee_missing(&self) -> bool {
-        self.fee == 0 && !self.inner_batch
+        // Finding 313 (fuzz fee:zero, 31 mutants on 107060755): rippled's
+        // preflight1 rejects only a non-native or NEGATIVE fee (temBAD_FEE);
+        // the fee LEVEL is judged in checkFee only while the ledger is open
+        // (telINSUF_FEE_P), never for a closed-ledger application. `Fee: "0"`
+        // applies — libxrpl returned tesSUCCESS where we said temBAD_FEE.
+        let _ = self;
+        false
     }
 
     /// The common-field reader that used to live in
@@ -549,6 +584,46 @@ pub fn account_txn_id_armed(tx: &TxFields, sandbox: &Sandbox) -> bool {
         .read(&key)
         .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
         .is_some_and(|acct| acct.get("AccountTxnID").is_some())
+}
+
+/// The checks every transaction passes between preflight and its own
+/// preclaim (rippled Transactor::preclaim → checkSeqProxy,
+/// checkPriorTxAndLastLedger), for the ledger `ledger_seq` being built.
+/// Finding 312 (fuzz seq:±1 / lls:past, 81 mutants on 107060755): we
+/// incremented the account's Sequence without ever comparing it — a future
+/// sequence applied (or, in the Payment path, read temBAD_SEQUENCE), a past
+/// one applied, a LastLedgerSequence behind the ledger applied.
+pub fn preclaim_common(tx: &TxFields, sandbox: &Sandbox, ledger_seq: u32) -> TxResult {
+    let acct_key = keylet::account_root_key(&tx.account);
+    let Some(data) = sandbox.read(&acct_key) else {
+        return TxResult::NoAccount;
+    };
+    let Ok(acct) = serde_json::from_slice::<serde_json::Value>(&data) else {
+        return TxResult::Malformed;
+    };
+    let acct_seq = acct["Sequence"].as_u64().unwrap_or(0) as u32;
+    if !tx.uses_ticket() {
+        if tx.sequence != acct_seq {
+            return if acct_seq < tx.sequence { TxResult::PreSeq } else { TxResult::PastSeq };
+        }
+    } else {
+        let tseq = tx.ticket_seq.unwrap_or(0);
+        if !sandbox.exists(&keylet::ticket_key(&tx.account, tseq)) {
+            return if tseq >= acct_seq { TxResult::PreTicket } else { TxResult::NoTicket };
+        }
+    }
+    if let Some(want) = tx.fields.get("AccountTxnID").and_then(|v| v.as_str()) {
+        let have = acct.get("AccountTxnID").and_then(|v| v.as_str()).unwrap_or("");
+        if !have.eq_ignore_ascii_case(want) {
+            return TxResult::WrongPrior;
+        }
+    }
+    if let Some(lls) = tx.last_ledger_seq {
+        if ledger_seq > lls {
+            return TxResult::MaxLedger;
+        }
+    }
+    TxResult::Success
 }
 
 pub fn apply_common(tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
@@ -759,7 +834,7 @@ mod tests {
             "Sequence": 7,
         });
         let mut f = TxFields::from_json(&tx).expect("fields");
-        assert!(f.fee_missing(), "a standalone zero-fee tx is missing its fee");
+        assert!(!f.fee_missing(), "finding 313: a standalone zero-fee tx is valid");
         f.inner_batch = true;
         assert!(!f.fee_missing(), "a batch inner carries Fee 0 by rule");
     }
