@@ -518,6 +518,19 @@ fn decode_issuer(s: &str) -> Option<[u8; 20]> {
 /// Transactor-specific; extend as more types are hardened.
 fn native_read_keys(txj: &Value) -> Vec<String> {
     let mut keys = Vec::new();
+    // Every party's owner-directory ROOT, whatever the transaction type: any
+    // transactor that files an owned object appends to the owner's directory
+    // through its root (IndexPrevious → tail), and a root the state lacks
+    // makes native "create" a root that exists. The per-type blocks below
+    // grew one specimen at a time; #107074173 06F51E33BB43
+    // (PermissionedDomainSet, 29-page dir), testnet 20863507 D958776AB6D7
+    // (MPTokenIssuanceCreate) and 20863509 0AEE09161265 (MPTokenAuthorize)
+    // were three more of the same shape in one afternoon.
+    for f in PARTY_FIELDS {
+        if let Some(a) = txj.get(f).and_then(|v| v.as_str()).and_then(decode_address) {
+            keys.push(hex::encode_upper(keylet::owner_dir_key(&a).0));
+        }
+    }
     // A Payment to an lsfDepositAuth destination is refused unless a
     // DepositPreauth(dst, src) object exists — and that object is READ, never
     // written, so a payment it ALLOWS touches it in no metadata and the
@@ -979,6 +992,11 @@ fn load_owner_dir_chain(state: &mut LedgerState, url: &str, owner: &[u8; 20], le
     }
 }
 
+/// Transaction fields that name a party whose owner directory an insert may
+/// touch. Address-valued only (issuer fields inside amounts are handled per
+/// type below).
+const PARTY_FIELDS: [&str; 7] = ["Account", "Destination", "Owner", "Issuer", "Subject", "Holder", "Authorize"];
+
 fn load_owner_dir_tail(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
     if txj["TransactionType"].as_str() == Some("AccountDelete") {
         if let Some(a) = txj["Account"].as_str().and_then(decode_address) {
@@ -986,6 +1004,13 @@ fn load_owner_dir_tail(state: &mut LedgerState, url: &str, txj: &Value, ledger_i
         }
     }
     let mut owners: Vec<[u8; 20]> = Vec::new();
+    // Every party's tail page (see `native_read_keys`: the root alone is not
+    // enough — the insert lands on root.IndexPrevious).
+    for f in PARTY_FIELDS {
+        if let Some(a) = txj.get(f).and_then(|v| v.as_str()).and_then(decode_address) {
+            owners.push(a);
+        }
+    }
     if txj["TransactionType"].as_str() == Some("EscrowCreate") {
         for f in ["Account", "Destination"] {
             if let Some(a) = txj[f].as_str().and_then(decode_address) {
