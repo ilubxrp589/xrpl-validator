@@ -17,8 +17,41 @@
 //! If you are adding a new amendment or tx type: add it to the FFI path,
 //! not here. See `ffi/ARCHITECTURE.md` for the architectural decision record.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use xrpl_core::types::Hash256;
+
+thread_local! {
+    /// The base keys a transactor read or enumerated while the log was armed
+    /// (`None` = off, the production default). The differential fuzzer arms
+    /// it around our leg so a bundle's `pre` carries every object OUR walk
+    /// consulted, not only libxrpl's reads — a bundle that lacks the book
+    /// pages we step replays a different, narrower walk (fuzz #85 off
+    /// 107009438: 64 mutations live, 4 from the bundle).
+    static READ_LOG: RefCell<Option<HashSet<Hash256>>> = const { RefCell::new(None) };
+}
+
+/// Arm the read log for this thread (clears any earlier keys).
+pub fn read_log_begin() {
+    READ_LOG.with(|l| *l.borrow_mut() = Some(HashSet::new()));
+}
+
+/// Disarm the read log and hand back the keys it saw, sorted.
+pub fn read_log_take() -> Vec<Hash256> {
+    let mut v: Vec<Hash256> =
+        READ_LOG.with(|l| l.borrow_mut().take()).map(|s| s.into_iter().collect()).unwrap_or_default();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+#[inline]
+fn read_log_note(key: &Hash256) {
+    READ_LOG.with(|l| {
+        if let Some(set) = l.borrow_mut().as_mut() {
+            set.insert(*key);
+        }
+    });
+}
 
 use super::state::LedgerState;
 use crate::LedgerError;
@@ -72,6 +105,9 @@ impl<'a> Sandbox<'a> {
         keys.sort_by(|a, b| a.0.cmp(&b.0));
         keys.dedup();
         keys.retain(|k| !matches!(self.modifications.get(k), Some(SandboxEntry::Deleted)));
+        for k in &keys {
+            read_log_note(k);
+        }
         keys
     }
 
@@ -83,7 +119,13 @@ impl<'a> Sandbox<'a> {
                 Some(data.clone())
             }
             Some(SandboxEntry::Deleted) => None,
-            None => self.base.read_json(key),
+            None => {
+                let r = self.base.read_json(key);
+                if r.is_some() {
+                    read_log_note(key);
+                }
+                r
+            }
         }
     }
 

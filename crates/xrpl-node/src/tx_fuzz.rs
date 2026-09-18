@@ -156,8 +156,11 @@ impl FuzzCtx {
                 }
             }
 
-            // Our leg.
+            // Our leg — with the sandbox read log armed, so the bundle's
+            // `pre` can carry every base object our walk consulted.
+            xrpl_ledger::ledger::sandbox::read_log_begin();
             let (our_ter, mut mods) = native_apply_one(state, &txf);
+            let native_reads = xrpl_ledger::ledger::sandbox::read_log_take();
             xrpl_ledger::ledger::threading::stamp_threading(
                 &mut mods,
                 &|k| state.state_map.lookup(k).map(|b| b.to_vec()),
@@ -287,6 +290,21 @@ impl FuzzCtx {
                     let b = encode_obj(js);
                     if !b.is_empty() {
                         pre.entry(hex::encode_upper(k.0)).or_insert(Value::String(hex::encode_upper(&b)));
+                    }
+                }
+            }
+            // Every base object OUR leg read or enumerated, as it stood
+            // before the mutant: the bundle then replays our walk, not a
+            // narrower one confined to what libxrpl happened to read.
+            for k in &native_reads {
+                let kh = hex::encode_upper(k.0);
+                if pre.contains_key(&kh) {
+                    continue;
+                }
+                if let Some(js) = state.state_map.lookup(k) {
+                    let b = encode_obj(js);
+                    if !b.is_empty() {
+                        pre.insert(kh, Value::String(hex::encode_upper(&b)));
                     }
                 }
             }
