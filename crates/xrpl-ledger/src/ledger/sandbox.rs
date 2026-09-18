@@ -198,6 +198,21 @@ impl<'a> Sandbox<'a> {
     pub fn into_modifications(self) -> HashMap<Hash256, SandboxEntry> {
         let mut m = self.modifications;
         m.remove(&AUX_KEY);
+        // Finding 335: rippled's ApplyStateTable emits a modified node only
+        // when `*curNode != *origNode` (ApplyStateTable.cpp:155) — a
+        // transactor that writes an object back unchanged has changed
+        // nothing. Testnet 20863999 0DF65AD75341 re-filed the same credential
+        // list on its domain: libxrpl's set had the root alone, ours the root
+        // and the domain. The comparison is `threading::semantically_equal`,
+        // the one the stamp already applies.
+        let base = &self.base;
+        m.retain(|k, e| match e {
+            SandboxEntry::Modified(b) => match base.read_json(k) {
+                Some(pre) => !super::threading::semantically_equal(&pre, b),
+                None => true,
+            },
+            _ => true,
+        });
         m
     }
 
@@ -431,5 +446,37 @@ mod tests {
         // Idempotent: clearing an already-empty slot is a no-op.
         sandbox.aux_clear();
         assert_eq!(sandbox.modification_count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod unchanged_write_tests {
+    use super::*;
+    use crate::ledger::header::LedgerHeader;
+    use crate::ledger::state::LedgerState;
+
+    #[test]
+    fn a_write_back_equal_to_the_base_is_not_a_modification() {
+        let header = LedgerHeader {
+            sequence: 1,
+            total_coins: 0,
+            parent_hash: Hash256([0; 32]),
+            transaction_hash: Hash256([0; 32]),
+            account_hash: Hash256([0; 32]),
+            parent_close_time: 0,
+            close_time: 0,
+            close_time_resolution: 10,
+            close_flags: 0,
+        };
+        let mut state = LedgerState::new_unverified(header);
+        let k = Hash256([7; 32]);
+        let obj = br#"{"LedgerEntryType":"PermissionedDomain","Owner":"08F93A124EDA9FA269D6BD7557873350B7522ABC","PreviousTxnID":"AABBCCDD","PreviousTxnLgrSeq":1}"#;
+        let _ = state.state_map.insert(k, obj.to_vec());
+        let mut sb = Sandbox::new(&state);
+        sb.write(k, br#"{"LedgerEntryType":"PermissionedDomain","Owner":"08f93a124eda9fa269d6bd7557873350b7522abc","PreviousTxnID":"aabbccdd","PreviousTxnLgrSeq":1}"#.to_vec());
+        assert!(sb.into_modifications().is_empty(), "an unchanged write-back is dropped");
+        let mut sb2 = Sandbox::new(&state);
+        sb2.write(k, br#"{"LedgerEntryType":"PermissionedDomain","Owner":"08F93A124EDA9FA269D6BD7557873350B7522ABC","PreviousTxnID":"AABBCCDD","PreviousTxnLgrSeq":1,"Data":"00"}"#.to_vec());
+        assert_eq!(sb2.into_modifications().len(), 1, "a real change survives");
     }
 }
