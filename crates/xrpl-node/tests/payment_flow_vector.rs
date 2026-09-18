@@ -1016,3 +1016,9 @@ fn payment_mpt_direct_with_no_ripple_direct_is_invalid_flag_fuzz_testnet_2086393
 fn escrow_create_cancel_after_at_or_before_finish_after_is_bad_expiration_fuzz_testnet_20864035() {
     run_bundle(include_str!("vectors/escrow_create_cancel_after_at_or_before_finish_after_is_bad_expiration_fuzz_testnet_20864035.json"));
 }
+
+/// Finding 334 — the devnet campaign's permissioned-DEX hybrid offer.
+#[test]
+fn payment_consuming_a_hybrid_offer_unlinks_its_open_book_entry_devnet_5419040() {
+    run_bundle(include_str!("vectors/payment_consuming_a_hybrid_offer_unlinks_its_open_book_entry_devnet_5419040.json"));
+}

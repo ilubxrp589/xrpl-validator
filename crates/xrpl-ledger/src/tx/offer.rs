@@ -1850,7 +1850,26 @@ pub(crate) fn delete_maker_offer(
     {
         crate::ledger::directory::dir_remove(sandbox, &bd, okey, book_hint, false);
     }
+    // Finding 334: a hybrid's open-book entry goes with it (View.cpp
+    // offerDelete :1953-1968).
+    remove_additional_books(sandbox, okey, offer);
     owner_count_add(sandbox, maker, -1);
+}
+
+/// Unlink every `AdditionalBooks` entry of a (hybrid) offer.
+pub(crate) fn remove_additional_books(sandbox: &mut Sandbox, okey: &xrpl_core::types::Hash256, offer: &serde_json::Value) {
+    for b in offer.get("AdditionalBooks").and_then(|v| v.as_array()).into_iter().flatten() {
+        let book = b.get("Book").unwrap_or(b);
+        let Some(bd) = book
+            .get("BookDirectory")
+            .and_then(|v| v.as_str())
+            .and_then(|s| hex::decode(s).ok())
+            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+            .map(xrpl_core::types::Hash256)
+        else { continue };
+        let node = book.get("BookNode").map(dirnum);
+        crate::ledger::directory::dir_remove(sandbox, &bd, okey, node, false);
+    }
 }
 
 /// The issuer-published TickSize governing a pair: the smaller of the two
@@ -9324,6 +9343,13 @@ pub struct OfferCreateTransactor;
 
 impl Transactor for OfferCreateTransactor {
     fn preflight(&self, tx: &TxFields) -> TxResult {
+        // Finding 334: tfHybrid without a DomainID is temINVALID_FLAG
+        // (CreateOffer.cpp:76-77).
+        if tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & 0x0010_0000 != 0
+            && tx.fields.get("DomainID").is_none()
+        {
+            return TxResult::InvalidFlag;
+        }
         if tx.tx_type != "OfferCreate" {
             return TxResult::Malformed;
         }
@@ -10131,6 +10157,31 @@ impl Transactor for OfferCreateTransactor {
             );
             offer_obj["BookDirectory"] = serde_json::Value::String(hex::encode_upper(bdir.0));
             offer_obj["BookNode"] = serde_json::Value::String(format!("{book_node:x}"));
+            // Finding 334 (devnet 5419038 A4C673A49260, the campaign's
+            // tfHybrid offer): a hybrid domain offer is ALSO appended to the
+            // open book at the same rate — the page carries no DomainID — and
+            // records that entry in AdditionalBooks; the offer gains lsfHybrid
+            // (CreateOffer.cpp applyHybrid :536-580, :923-928).
+            if flags & 0x0010_0000 != 0 && domain.is_some() {
+                let base_open = keylet::book_base(&pays_leg.cur, &gets_leg.cur, &pays_leg.issuer, &gets_leg.issuer);
+                let bdir_open = keylet::book_dir_key(&base_open, q);
+                let open_extra = serde_json::json!({
+                    "ExchangeRate": format!("{:016x}", u64::from_be_bytes(bdir_open.0[24..32].try_into().unwrap_or([0u8;8]))),
+                    "TakerPaysCurrency": hex::encode(pays_leg.cur),
+                    "TakerPaysIssuer": hex::encode(pays_leg.issuer),
+                    "TakerGetsCurrency": hex::encode(gets_leg.cur),
+                    "TakerGetsIssuer": hex::encode(gets_leg.issuer),
+                });
+                let open_node = crate::ledger::directory::dir_insert_with(
+                    sandbox, &bdir_open, None, &offer_key, Some(&open_extra), true,
+                );
+                let f = offer_obj["Flags"].as_u64().unwrap_or(0) | 0x0004_0000; // lsfHybrid
+                offer_obj["Flags"] = serde_json::Value::from(f);
+                offer_obj["AdditionalBooks"] = serde_json::json!([{"Book": {
+                    "BookDirectory": hex::encode_upper(bdir_open.0),
+                    "BookNode": format!("{open_node:x}"),
+                }}]);
+            }
         }
         if let Some(e) = tx.fields.get("Expiration") {
             offer_obj["Expiration"] = e.clone();
@@ -10213,6 +10264,9 @@ impl Transactor for OfferCancelTransactor {
             crate::ledger::directory::owner_dir_remove(sandbox, &tx.account, &offer_key, owner_node, false);
             if let Some(bd) = book_dir {
                 crate::ledger::directory::dir_remove(sandbox, &bd, &offer_key, book_node, false);
+            }
+            if let Some(o) = offer.as_ref() {
+                remove_additional_books(sandbox, &offer_key, o); // finding 334
             }
 
             // Decrement OwnerCount
