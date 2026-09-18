@@ -9814,7 +9814,19 @@ impl Transactor for OfferCreateTransactor {
                 a.as_ref().map(|x| x["OwnerCount"].clone()),
             );
         }
-        if underfunded && me_is_zero(rem_gets_cross) {
+        //
+        // Finding 305 (fuzz #54 off 107060755 B90D5364B3D9, TakerGets doubled
+        // to 1724548 CNY against a 95186.945 CNY line): 25 fills folded to
+        // 95186.94504322240 against an entry of ...241 — one ulp short — so
+        // the clamped remainder read 1e-11 instead of zero and the residual
+        // was rested (Offer + book page, OwnerCount 2 vs 1). rippled does not
+        // test the remainder at all: `takerInBalance = accountFunds(psb, ...)`
+        // is re-read AFTER crossing (flowCross :438-446) and `<= 0` clears
+        // both sides. The clamped remainder is not the test either way: fuzz
+        // #43 (5DA2F55D5276, same ledger) spent its budget to exactly zero
+        // while the line kept 1e-17 CNY, and libxrpl rested the residual.
+        // The account, read after crossing, is the only judge.
+        if me_is_zero(available(sandbox, &tx.account, &gets_leg)) {
             return TxResult::Success;
         }
 

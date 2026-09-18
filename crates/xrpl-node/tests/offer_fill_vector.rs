@@ -1459,3 +1459,23 @@ fn offer_fib_pool_is_gated_by_its_own_book_tip_107060755() {
 fn offer_ioc_and_fok_together_is_invalid_flag_fuzz_107009438() {
     run_bundle(include_str!("vectors/offer_ioc_and_fok_together_is_invalid_flag_fuzz_107009438.json"));
 }
+
+/// Finding 305 — from the differential fuzzer (TakerGets doubled past the
+/// taker's CNY line): after crossing, rippled re-reads `accountFunds` and
+/// rests nothing when it is exhausted (flowCross :438-446). Our test was on
+/// the clamped remainder, which folded one ulp short of zero after 25 fills,
+/// so we rested an Offer and its book page the account could not fund.
+#[test]
+fn offer_residual_rests_only_while_the_account_is_still_funded_fuzz_107060755() {
+    run_bundle(include_str!(
+        "vectors/offer_residual_rests_only_while_the_account_is_still_funded_fuzz_107060755.json"
+    ));
+}
+
+/// Finding 305, the mirror: the clamped remainder spent to exactly zero while
+/// the line kept 1e-17 CNY — libxrpl rests the residual, because the account
+/// is the only judge. We rested nothing.
+#[test]
+fn offer_residual_rests_on_a_one_ulp_line_fuzz_107060755() {
+    run_bundle(include_str!("vectors/offer_residual_rests_on_a_one_ulp_line_fuzz_107060755.json"));
+}
