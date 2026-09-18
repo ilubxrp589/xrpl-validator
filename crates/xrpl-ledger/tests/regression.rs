@@ -85,7 +85,11 @@ fn read_seq(state: &LedgerState, id: &[u8; 20]) -> u32 {
 // === Self-payment ===
 
 #[test]
-fn self_payment_only_burns_fee() {
+fn self_payment_in_one_asset_is_redundant() {
+    // Finding 299: rippled's Payment::preflight refuses a payment to
+    // oneself in a single asset with no Paths as temREDUNDANT
+    // (Payment.cpp:171). A tem is never applied: no fee, no sequence, no
+    // change to total coins. (This test used to expect a fee-only burn.)
     let alice = [0x01u8; 20];
     let mut state = make_state(100, 100_000_000_000_000_000);
     add_account(&mut state, &alice, 50_000_000, 1);
@@ -95,11 +99,10 @@ fn self_payment_only_burns_fee() {
         &state, vec![(Hash256([0xAA; 32]), tx)], 700_000_010, 10,
     ).unwrap();
 
-    assert_eq!(results[0].result, TxResult::Success);
-    // Self-payment: balance goes down by fee only (amount cancels out)
-    assert_eq!(read_balance(&new_state, &alice), 50_000_000 - 12);
-    // Total coins reduced by fee
-    assert_eq!(new_state.header.total_coins, 100_000_000_000_000_000 - 12);
+    assert_eq!(results[0].result, TxResult::Redundant);
+    assert_eq!(read_balance(&new_state, &alice), 50_000_000);
+    assert_eq!(read_seq(&new_state, &alice), 1);
+    assert_eq!(new_state.header.total_coins, 100_000_000_000_000_000);
 }
 
 // === Empty transaction set ===
