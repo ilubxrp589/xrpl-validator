@@ -592,7 +592,7 @@ def main():
             continue
         try:
             rr = rpc("ledger_entry", {
-                "ripple_state": {"currency": v["currency"], "accounts": [tx["Account"], v["issuer"]]},
+                "ripple_state": {"currency": v.get("currency", "XRP"), "accounts": [tx["Account"], v.get("issuer", tx["Account"])]},
                 "ledger_index": seq - 1, "binary": True,
             })
             li = (rr.get("index") or "").upper()
@@ -611,7 +611,7 @@ def main():
     if tx.get("TransactionType") == "OfferCreate":
         def cur(v):
             if isinstance(v, dict):
-                return {"currency": v["currency"], "issuer": v["issuer"]}
+                return None if "mpt_issuance_id" in v else {"currency": v["currency"], "issuer": v["issuer"]}
             return {"currency": "XRP"}
         gets, pays, xrp = cur(tx.get("TakerGets")), cur(tx.get("TakerPays")), {"currency": "XRP"}
         pairs = [(gets, pays), (pays, gets)]
@@ -726,7 +726,7 @@ def main():
     # slices through eight iterations); without it the probe ran single-path.
     if tx.get("TransactionType") in ("OfferCreate", "Payment"):
         def leg_of(v):
-            return {"currency": "XRP"} if isinstance(v, str) else {"currency": v["currency"], "issuer": v["issuer"]}
+            return {"currency": "XRP"} if isinstance(v, str) else (None if "mpt_issuance_id" in v else {"currency": v["currency"], "issuer": v["issuer"]})
         gets = tx.get("TakerGets") if tx.get("TransactionType") == "OfferCreate" else tx.get("SendMax", tx.get("Amount"))
         pays = tx.get("TakerPays") if tx.get("TransactionType") == "OfferCreate" else tx.get("Amount")
         if gets is not None and pays is not None:
@@ -916,7 +916,7 @@ def main():
         v = tx.get(f_)
         if v is None:
             continue
-        legs.append({"currency": "XRP"} if isinstance(v, str) else {"currency": v["currency"], "issuer": v["issuer"]})
+        legs.append({"currency": "XRP"} if isinstance(v, str) else ({"mpt": v["mpt_issuance_id"]} if "mpt_issuance_id" in v else {"currency": v["currency"], "issuer": v["issuer"]}))
     # The pools of every explicit-path hop join the pair sweep (same specimens).
     for path in tx.get("Paths") or []:
         for step in path:
