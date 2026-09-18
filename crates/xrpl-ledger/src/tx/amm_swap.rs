@@ -1379,6 +1379,57 @@ pub(crate) fn holds_for_offer(sandbox: &Sandbox, acct: &[u8; 20], leg: &Leg) -> 
     holds(sandbox, acct, leg)
 }
 
+/// Finding 298's first gate on its own: `AMMLiquidity::getOffer` answers
+/// "higher clob quality" when the pool's RAW spot (no fee) is not strictly
+/// better than its own book's tip, or sits within 1e-7 of it
+/// (AMMLiquidity.cpp:181-196). An empty pool side stands aside too.
+pub(crate) fn fib_spot_stands_aside(
+    sandbox: &Sandbox,
+    amm: &Amm,
+    clob_tip: Option<Me>,
+    pays_leg: &Leg,
+    gets_leg: &Leg,
+    iters: u32,
+) -> bool {
+    let Some(tip) = clob_tip else { return false };
+    let pool_in = holds_for_offer(sandbox, &amm.account, gets_leg);
+    let pool_out = holds_for_offer(sandbox, &amm.account, pays_leg);
+    if pool_in.0 == 0 || pool_out.0 == 0 {
+        return true;
+    }
+    let raw = rate_of_me_pair(pool_in, pool_out);
+    let stands_aside = n_cmp(raw, tip) != Ordering::Less
+        || n_cmp(n_div(n_sub(tip, raw, Rnd::Near), tip, Rnd::Near), (LO, -22)) == Ordering::Less;
+    if std::env::var("DX_AMM").is_ok() {
+        eprintln!("DX_AMM fib gate iter={iters} raw_spot={raw:?} tip={tip:?} stands_aside={stands_aside}");
+    }
+    stands_aside
+}
+
+/// Finding 306: would the pool's Fibonacci offer be refused by ITS OWN tip,
+/// whatever any rival strand's bound says? Both of finding 298's gates —
+/// the raw spot against the tip, and the slice itself against the tip
+/// (`Quality{amounts} < clobQuality` → nullopt). A strand whose pool is
+/// refused this way ran and produced nothing on its own account, and rippled
+/// drops it from the next iteration (StrandFlow.h: only a strand that flowed
+/// is pushed back) — it is NOT the "refused only by a rival's bound" case
+/// that finding 211 re-runs and finding 215 spares.
+pub(crate) fn fib_refused_by_own_tip(
+    sandbox: &Sandbox,
+    amm: &Amm,
+    clob_tip: Option<Me>,
+    slice: (Me, Me),
+    pays_leg: &Leg,
+    gets_leg: &Leg,
+    iters: u32,
+) -> bool {
+    let Some(tip) = clob_tip else { return false };
+    if fib_spot_stands_aside(sandbox, amm, clob_tip, pays_leg, gets_leg, iters) {
+        return true;
+    }
+    n_cmp(rate_of_me_pair(slice.0, slice.1), tip) == Ordering::Greater
+}
+
 /// One MULTI-PATH AMM turn (rippled generateFibSeqOffer): with more than one
 /// strand (every IOU↔IOU crossing bridges), the pool competes as a CLOB-like
 /// offer sized by the Fibonacci sequence off the pool balances at the START
@@ -1445,21 +1496,8 @@ pub(crate) fn consume_fib(
     // ran dry on the self-offer and the bridge took the iteration (4590.39
     // ASC through both pools). We kept slicing the direct pool (seven
     // slices, 70.9 ASC) and never flowed the bridge.
-    if let Some(tip) = clob_tip {
-        let pool_in = holds_for_offer(sandbox, &amm.account, gets_leg);
-        let pool_out = holds_for_offer(sandbox, &amm.account, pays_leg);
-        if pool_in.0 == 0 || pool_out.0 == 0 {
-            return (rem_pays, rem_gets, false);
-        }
-        let raw = rate_of_me_pair(pool_in, pool_out);
-        let stands_aside = n_cmp(raw, tip) != Ordering::Less
-            || n_cmp(n_div(n_sub(tip, raw, Rnd::Near), tip, Rnd::Near), (LO, -22)) == Ordering::Less;
-        if std::env::var("DX_AMM").is_ok() {
-            eprintln!("DX_AMM fib gate iter={iters} raw_spot={raw:?} tip={tip:?} stands_aside={stands_aside}");
-        }
-        if stands_aside {
-            return (rem_pays, rem_gets, false);
-        }
+    if fib_spot_stands_aside(sandbox, amm, clob_tip, pays_leg, gets_leg, iters) {
+        return (rem_pays, rem_gets, false);
     }
     let Some((s_in, s_out)) = fib_slice(sandbox, amm, init, iters, pays_leg, gets_leg) else {
         return (rem_pays, rem_gets, false);

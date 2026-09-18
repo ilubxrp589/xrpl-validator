@@ -4408,7 +4408,23 @@ thr={t:?} admits_trunc={} admits_up={}",
                 pool_offer_this_round = fib.is_some();
                 pool_bq_blocked = fib.is_some_and(|(s_in, s_out)| {
                     let q = crate::tx::amm_swap::slice_rate(s_in, s_out);
-                    best_book.is_some_and(|b| !me_cmp(q, b).is_lt())
+                    // Finding 306 (fuzz #20 off 107009438, 7665065807E8 with
+                    // TakerGets doubled — r3rhWeE3's FLR→BTC offer over a
+                    // direct pool and a two-leg XRP bridge): at iteration 8
+                    // the direct pool's fib slice (1.2377) fell behind the
+                    // direct tip — the taker's OWN resting offer at 1.2346 —
+                    // and rippled's direct strand ran dry ("Strand found dry
+                    // in rev"), was never pushed back, and the lone bridge
+                    // then ran single-path (changeSpotPriceQuality on leg A,
+                    // 56551.28 FLR for the whole 0.004443 BTC). We spared the
+                    // strand as "refused only by the rival's bound" (the
+                    // bridge's 1.23459 was also better), re-ran it next
+                    // round with the self-offer gone, took a ninth slice, and
+                    // stayed multi-path. A pool its OWN tip refuses was not
+                    // spared by anyone.
+                    !crate::tx::amm_swap::fib_refused_by_own_tip(
+                        sandbox, a, d_book_ub, (s_in, s_out), pays_leg, gets_leg, amm_iters,
+                    ) && best_book.is_some_and(|b| !me_cmp(q, b).is_lt())
                         && dq.is_none_or(|d| me_cmp(q, d).is_lt())
                         && (threshold == u64::MAX || !me_cmp(q, rate_me(threshold)).is_gt())
                 });
