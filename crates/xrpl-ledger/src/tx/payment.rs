@@ -2197,6 +2197,19 @@ impl Transactor for PaymentTransactor {
         if let Some((mptid, value)) = crate::tx::mpt::parse_mpt_amount(&amt_json) {
             return crate::tx::mpt::apply_mpt_payment(tx, sandbox, &dest_id, mptid, value, partial);
         }
+        // Finding 300 (differential fuzz, tfNoRippleDirect on pathless
+        // payments — #107052630 545777BD/333459A7, #107009438 BBECA90F,
+        // 1E112DB4, C1E18884, #107056200 28F5FF07): with the default path
+        // suppressed and no Paths there is no strand to build, and rippled's
+        // flow answers temRIPPLE_EMPTY before it looks at any line or book
+        // (PaySteps.cpp:539-542) — for EVERY non-XRP-direct shape, the plain
+        // IOU send included (the XRP-direct shape is temBAD_SEND_XRP_NO_DIRECT
+        // at preflight, finding 299). Ahead of every branch below.
+        let no_direct_flag = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & 0x0001_0000 != 0;
+        let xrp_direct = amt_json.is_string() && sendmax.as_ref().is_none_or(|s| s.is_string());
+        if no_direct_flag && !xrp_direct && tx.fields.get("Paths").and_then(|p| p.as_array()).is_none_or(|a| a.is_empty()) {
+            return TxResult::RippleEmpty;
+        }
         let cross_currency = match (&sendmax, amt_json.is_string()) {
             (Some(sm), true) => !sm.is_string(),
             (Some(sm), false) => {
@@ -2589,16 +2602,6 @@ impl PaymentTransactor {
         partial: bool,
     ) -> TxResult {
         use crate::tx::offer as ox;
-        // Finding 300 (differential fuzz of #107052630 and #107009438,
-        // tfNoRippleDirect on pathless payments): with the default path
-        // suppressed and no Paths there is no strand to build, so the flow
-        // answers temRIPPLE_EMPTY before it looks at any line or book
-        // (PaySteps.cpp:539-542) — ahead of the dry checks below, which
-        // used to answer tecPATH_DRY for the same shape.
-        let no_direct_flag = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & 0x0001_0000 != 0;
-        if no_direct_flag && tx.fields.get("Paths").and_then(|p| p.as_array()).is_none_or(|a| a.is_empty()) {
-            return TxResult::RippleEmpty;
-        }
         let Some(sm_json) = sendmax else {
             // Paths without SendMax: spend the Amount currency itself.
             return self.apply_iou_direct(tx, sandbox, amt_json, dest, partial);
