@@ -2739,8 +2739,15 @@ impl PaymentTransactor {
         // whose implied ratio would read every book as dry.
         let limit_quality =
             tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & 0x0004_0000 != 0;
+        // Finding 304: rippled's limit is `Quality{Amounts{maxSourceAmount,
+        // dstAmount}}` = getRate(Amount, SendMax); a ratio the ledger cannot
+        // represent (a deliver-max Amount against a small SendMax) files
+        // rate 0, and Quality(0) is the BEST quality — every strand's
+        // quality falls short of it and is rejected ("Path rejected by
+        // limitQuality"), so the payment is tecPATH_DRY. `None` used to read
+        // as "no limit" here and the payment went through.
         let threshold = if limit_quality {
-            crate::ledger::keylet::offer_quality(sm_json, amt_json).unwrap_or(u64::MAX)
+            crate::ledger::keylet::offer_quality(sm_json, amt_json).unwrap_or(0)
         } else {
             u64::MAX
         };

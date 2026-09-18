@@ -337,6 +337,18 @@ pub fn amount_mant_exp(v: &serde_json::Value) -> Option<(u128, i32)> {
 }
 
 #[cfg(test)]
+mod rate_range_tests {
+    #[test]
+    fn a_ratio_below_the_stamount_floor_has_no_rate() {
+        // 200000 drops for 9999999999999990e79 RLUSD: the quotient's exponent
+        // is far below -96 — rippled's divide underflows to zero.
+        assert_eq!(super::rate_encode_native(200_000, 0, true, 9_999_999_999_999_990, 79, false), None);
+        // an ordinary rate still encodes
+        assert!(super::rate_encode_native(200_000, 0, true, 1_275_435_882_197_093, -15, false).is_some());
+    }
+}
+
+#[cfg(test)]
 mod amount_parse_tests {
     #[test]
     fn a_ninety_six_digit_value_keeps_sixteen_digits_and_the_exponent() {
@@ -445,6 +457,19 @@ pub fn rate_encode_native(
         e -= 1;
     }
     if m == 0 {
+        return None;
+    }
+    // Finding 304 (differential fuzz of #107009438, tfLimitQuality on
+    // deliver-max partial payments): the quotient is an STAmount, and its
+    // exponent lives in [-96, 80] (cMinOffset/cMaxOffset). Below the floor
+    // `divide` canonicalizes to ZERO and `getRate` files rate 0; above the
+    // ceiling it throws and getRate files 0 as well. The encoding here has
+    // an 8-bit exponent field and a negative `e + 100` wrapped through the
+    // `as u64` cast into a rate with exponent +150 — a limit quality no
+    // strand could fail. `None` now, and the caller decides what rate 0
+    // means (for a limit quality: the best quality there is, every strand
+    // rejected — libxrpl's tecPATH_DRY on the specimen).
+    if !(-96..=80).contains(&e) {
         return None;
     }
     Some((((e + 100) as u64) << 56) | m as u64)

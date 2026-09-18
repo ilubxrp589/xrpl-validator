@@ -943,3 +943,14 @@ fn payment_deliver_min_without_partial_is_bad_amount_fuzz_107009438() {
 fn payment_ninety_six_digit_amount_parses_fuzz_107009438() {
     run_bundle(include_str!("vectors/payment_ninety_six_digit_amount_parses_fuzz_107009438.json"));
 }
+
+/// Finding 304 — from the differential fuzzer: tfLimitQuality on a
+/// deliver-max partial payment (Amount 9999999999999990e79 RLUSD for 200000
+/// drops). rippled's limit is getRate(Amount, SendMax); a ratio below the
+/// STAmount floor files rate 0, Quality(0) is the best quality there is, and
+/// every strand is "rejected by limitQuality": tecPATH_DRY. Our encoder
+/// wrapped the exponent into a rate no strand could fail.
+#[test]
+fn payment_limit_quality_below_the_stamount_floor_rejects_every_strand_fuzz_107009438() {
+    run_bundle(include_str!("vectors/payment_limit_quality_below_the_stamount_floor_rejects_every_strand_fuzz_107009438.json"));
+}
