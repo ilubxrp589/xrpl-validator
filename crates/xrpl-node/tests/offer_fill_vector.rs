@@ -1493,3 +1493,15 @@ fn offer_strand_refused_by_its_own_tip_stays_dead_fuzz_107009438() {
         "vectors/offer_strand_refused_by_its_own_tip_stays_dead_fuzz_107009438.json"
     ));
 }
+
+/// Finding 310 — from the differential fuzzer (r3rhWeE3 buying 27954.62 EUR
+/// with ETH over the book and an XRP bridge, TakerGets doubled, 139
+/// iterations): a buy's residual is TakerPays minus flow()'s `sum(savedOuts)`
+/// — the iterations' outs folded in the multiset's sorted order. Our per-fill
+/// chain in consumption order landed two ulp high on both resting amounts.
+#[test]
+fn offer_buy_residual_folds_the_iterations_outs_in_multiset_order_fuzz_107009438() {
+    run_bundle(include_str!(
+        "vectors/offer_buy_residual_folds_the_iterations_outs_in_multiset_order_fuzz_107009438.json"
+    ));
+}
