@@ -34,6 +34,7 @@ const SPACE_ESCROW: [u8; 2] = [0x00, 0x75];       // 'u'
 const SPACE_PAY_CHANNEL: [u8; 2] = [0x00, 0x78];  // 'x'
 const SPACE_CHECK: [u8; 2] = [0x00, 0x43];        // 'C'
 const SPACE_DEPOSIT_PREAUTH: [u8; 2] = [0x00, 0x70]; // 'p'
+const SPACE_DEPOSIT_PREAUTH_CREDENTIALS: [u8; 2] = [0x00, 0x50]; // 'P'
 
 /// Compute the state tree key for an AccountRoot.
 /// `key = SHA512Half(0x0061 || account_id)`
@@ -550,6 +551,30 @@ pub fn amm_lpt_currency(cur_a: &[u8; 20], cur_b: &[u8; 20]) -> [u8; 20] {
 
 /// Compute the state tree key for a DepositPreauth.
 /// `key = SHA512Half(0x0070 || account_id || authorized_id)`
+/// keylet::depositPreauth(owner, sorted credentials) — finding 319: the
+/// credential-keyed DepositPreauth (XLS-70). Each credential hashes as
+/// sha512Half(issuer || type); the index is sha512Half('P' space || owner ||
+/// hashes in the credentials' sorted order) (Indexes.cpp:352-365).
+pub fn deposit_preauth_credentials_key(account_id: &[u8; 20], sorted: &[([u8; 20], Vec<u8>)]) -> Hash256 {
+    let mut buf = Vec::with_capacity(22 + 32 * sorted.len());
+    buf.extend_from_slice(&SPACE_DEPOSIT_PREAUTH_CREDENTIALS);
+    buf.extend_from_slice(account_id);
+    for (issuer, ct) in sorted {
+        let mut one = Vec::with_capacity(20 + ct.len());
+        one.extend_from_slice(issuer);
+        one.extend_from_slice(ct);
+        buf.extend_from_slice(&sha512_half(&one).0);
+    }
+    // beast::hash_append for a std::vector appends the element COUNT after
+    // the elements as a size_t, and sha512Half's hasher is declared
+    // big-endian (the same reason the namespace prefix is): BIG-endian u64.
+    // Without it the key misses — testnet 20864007 7D29BE82C2FE read
+    // tecNO_ENTRY on the entry 20864003 had just filed; verified against
+    // that entry's key 61EEB051… by brute force over the variants.
+    buf.extend_from_slice(&(sorted.len() as u64).to_be_bytes());
+    sha512_half(&buf)
+}
+
 pub fn deposit_preauth_key(account_id: &[u8; 20], authorized: &[u8; 20]) -> Hash256 {
     let mut buf = [0u8; 42];
     buf[..2].copy_from_slice(&SPACE_DEPOSIT_PREAUTH);
