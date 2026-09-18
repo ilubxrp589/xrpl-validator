@@ -529,7 +529,29 @@ fn native_read_keys(txj: &Value) -> Vec<String> {
     for f in PARTY_FIELDS {
         if let Some(a) = txj.get(f).and_then(|v| v.as_str()).and_then(decode_address) {
             keys.push(hex::encode_upper(keylet::owner_dir_key(&a).0));
+            // The party's ROOT too: a transactor that answers tecNO_TARGET /
+            // tecNO_ISSUER on an absent root reads the state, never the meta
+            // (testnet 20863992 A80C7451A083, CredentialCreate's Subject).
+            keys.push(hex::encode_upper(keylet::account_root_key(&a).0));
         }
+    }
+    // Issuers and subjects nested in credential arrays (AuthorizeCredentials,
+    // UnauthorizeCredentials, AcceptedCredentials): testnet 20864003
+    // D962386A932B read tecNO_ISSUER on an issuer the state never held.
+    for f in ["AuthorizeCredentials", "UnauthorizeCredentials", "AcceptedCredentials"] {
+        for e in txj.get(f).and_then(|v| v.as_array()).into_iter().flatten() {
+            let inner = e.get("Credential").unwrap_or(e);
+            for g in ["Issuer", "Subject"] {
+                if let Some(a) = inner.get(g).and_then(|v| v.as_str()).and_then(decode_address) {
+                    keys.push(hex::encode_upper(keylet::account_root_key(&a).0));
+                }
+            }
+        }
+    }
+    // The sender's signer list — asfDisableMaster's alternative-key check
+    // reads it (testnet 20864007 9809DC6D9D4D, tecNO_ALTERNATIVE_KEY).
+    if let Some(a) = txj.get("Account").and_then(|v| v.as_str()).and_then(decode_address) {
+        keys.push(hex::encode_upper(keylet::signers_key(&a).0));
     }
     // Every 32-byte hex field names a ledger object the transactor will
     // READ (DomainID, CheckID, Channel, NFTokenBuyOffer/SellOffer, VaultID,
