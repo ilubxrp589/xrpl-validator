@@ -160,3 +160,4 @@ fn batch_until_failure_two_payments_devnet_5309670() {
 fn batch_until_failure_two_payments_devnet_5309584() {
     run_batch_bundle(include_str!("vectors/batch_until_failure_two_payments_devnet_5309584.json"));
 }
+
