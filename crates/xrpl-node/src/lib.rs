@@ -46,8 +46,11 @@ pub mod unl_verify;
 pub mod validation;
 pub mod ws_sync;
 
+pub mod fuzz_mutants;
 #[cfg(feature = "ffi")]
 pub mod ffi_engine;
+#[cfg(feature = "ffi")]
+pub mod tx_fuzz;
 
 #[cfg(feature = "ffi")]
 pub mod ffi_verifier;
