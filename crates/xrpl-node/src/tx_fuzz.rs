@@ -191,8 +191,15 @@ impl FuzzCtx {
             // shadow reports the same asymmetry as `noop_extra`/`noop_missing`
             // rather than a divergence. Set-differences made only of those
             // are classed NOOP so the real MUT cases stand out.
+            // The pre-image: what libxrpl read, else the object as our
+            // native state holds it (a key only our leg wrote was never read
+            // by libxrpl, so its pre-image lives only in the state).
             let pre_of = |k: &[u8; 32]| -> Option<Vec<u8>> {
-                reads.iter().find(|(rk, _)| rk == k).map(|(_, b)| b.clone())
+                reads
+                    .iter()
+                    .find(|(rk, _)| rk == k)
+                    .map(|(_, b)| b.clone())
+                    .or_else(|| state.state_map.lookup(&Hash256(*k)).map(|js| encode_obj(js)).filter(|b| !b.is_empty()))
             };
             let threading_only = |k: &[u8; 32], kind: u8, b: &[u8]| -> bool {
                 kind == 1 && pre_of(k).is_some_and(|pre| strip_threading(&pre) == strip_threading(b))
@@ -279,9 +286,31 @@ impl FuzzCtx {
                     }
                 }
             }
-            let expect: serde_json::Map<String, Value> = ffi_map
+            let mut expect: serde_json::Map<String, Value> = ffi_map
                 .iter()
                 .map(|(k, (_, b))| (hex::encode_upper(k), Value::String(hex::encode_upper(b))))
+                .collect();
+            // An object only our leg wrote becomes an UNTOUCHED pin (expect ==
+            // pre): the bundle probe then reports it as written when the
+            // replay repeats the divergence, so the drill sees the object by
+            // name instead of a key prefix.
+            for (k, _) in our_map.iter().filter(|(k, _)| !ffi_map.contains_key(*k)) {
+                let pre_bytes = pre_of(k).or_else(|| state.state_map.lookup(&Hash256(*k)).map(|js| encode_obj(js)));
+                if let Some(b) = pre_bytes.filter(|b| !b.is_empty()) {
+                    let kh = hex::encode_upper(k);
+                    pre.entry(kh.clone()).or_insert(Value::String(hex::encode_upper(&b)));
+                    expect.entry(kh).or_insert(Value::String(hex::encode_upper(&b)));
+                }
+            }
+            // Our leg's bytes for every key the legs disagree on, so the
+            // drill can diff them against the pre-image without re-running
+            // the fuzz state (a set difference need not reproduce from the
+            // bundle's pre alone — our route may have touched objects
+            // libxrpl never read).
+            let ours_hex: serde_json::Map<String, Value> = our_map
+                .iter()
+                .filter(|(k, (kind, b))| ffi_map.get(*k).map(|(fk, fb)| (fk, fb)) != Some((kind, b)))
+                .map(|(k, (kind, b))| (hex::encode_upper(k), json!({"kind": kind, "hex": hex::encode_upper(b)})))
                 .collect();
             let bundle = json!({
                 "seq": self.seq,
@@ -294,7 +323,7 @@ impl FuzzCtx {
                 "expect": expect,
                 "fuzz": {"base_hash": base_hash, "index": idx, "mutant": n, "label": label, "seed": self.seed,
                           "class": class, "our_ter": our_ter, "libxrpl_ter": outcome.ter_name,
-                          "libxrpl_fatal": outcome.last_fatal}
+                          "libxrpl_fatal": outcome.last_fatal, "ours": ours_hex}
             });
             let safe = label.replace([':', '+', '-'], "_");
             let path = self.out_dir.join(format!("fuzz_{}_{idx:03}_{n}_{safe}.json", self.seq));
