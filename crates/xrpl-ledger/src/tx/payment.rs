@@ -638,6 +638,23 @@ impl PaymentTransactor {
         (!ox::me_is_zero(out)).then_some(out)
     }
 
+    /// rippled's `withinRelativeDistance(calc, req, Number(1, -9))` on
+    /// amounts (AMMHelpers.h:156-162): equal ⇒ true, else (max − min)/max
+    /// strictly below 1e-9. Finding 307.
+    fn within_relative_1e9(a: crate::tx::offer::Me, b: crate::tx::offer::Me) -> bool {
+        use crate::tx::amm_swap as am;
+        use crate::tx::offer as ox;
+        if ox::me_cmp(a, b).is_eq() {
+            return true;
+        }
+        let (lo, hi) = if ox::me_cmp(a, b).is_lt() { (a, b) } else { (b, a) };
+        if ox::me_is_zero(hi) {
+            return false;
+        }
+        let rel = am::n_div(am::n_sub(hi, lo, am::Rnd::Near), hi, am::Rnd::Near);
+        ox::me_cmp(rel, (1, -9)).is_lt()
+    }
+
     /// Reverse-size ONE book hop: the input `consumed` for a target `want`
     /// out, via the grant ladder + refine — extracted verbatim from
     /// `reverse_requirements` so the mixed-strand walker sizes its book
@@ -3413,7 +3430,22 @@ impl PaymentTransactor {
                     if let Some((qm, qb)) = Self::strand_quality_fn(
                         sandbox, &tx.account, &strands[order[0]], want_rate, t,
                     ) {
-                        if let Some(lim_net) = Self::strand_limit_out(qm, qb, t) {
+                        // Finding 307 (fuzz #121 off 107009438, 2249B3B51059 with
+                        // tfLimitQuality added — rogue5Hn's PLX→GALLOWS payment
+                        // through one strand): "A tiny difference could be due to
+                        // the round off" — `limitOut` hands back `remainingOut`
+                        // UNTRIMMED when the solved out is within 1e-9 relative of
+                        // it (StrandFlow.h:415-418, `withinRelativeDistance(out,
+                        // remainingOut, Number(1, -9))` = (max − min)/max < dist),
+                        // so `adjustedRemOut` stays false and the 1e-7 judge
+                        // forgiveness never applies. We trimmed 2737.937883092858
+                        // to …524 (1.2e-13 relative), flagged the ask adjusted, and
+                        // forgave a pass rippled rejects: "Path rejected by
+                        // limitQuality limit: 5987432887942128731 path q:
+                        // …129601" → tecPATH_DRY.
+                        if let Some(lim_net) = Self::strand_limit_out(qm, qb, t)
+                            .filter(|lim| !Self::within_relative_1e9(*lim, rem_out_net))
+                        {
                             let lim_gross = match want_rate {
                                 Some(r) => ox::mul_ratio(lim_net, r as u128, 1_000_000_000, true),
                                 None => lim_net,
