@@ -740,7 +740,14 @@ impl NativeShadow {
                 Vec::new()
             };
             if !inner_ids.is_empty() {
-                if inner_results.len() > inner_ids.len() {
+                let tripped = crate::native_apply::inner_id_tripwire(
+                    &inner_ids,
+                    attribution.inners_of.get(&this_hash).map(Vec::as_slice),
+                );
+                if let Some(why) = tripped {
+                    st.batch_inner_ter_mm.fetch_add(1, Ordering::Relaxed);
+                    ter_mm.push(format!("{this_hash} BATCH-INNER: {why} — inner verdicts withheld"));
+                } else if inner_results.len() > inner_ids.len() {
                     // One result per ATTEMPTED inner can never outnumber the
                     // inners themselves: more results than ids means an id
                     // could not be recomputed and no pairing is trustworthy.
@@ -767,6 +774,7 @@ impl NativeShadow {
                         &inner_ids,
                         &inner_results,
                         &filed,
+                        crate::native_apply::batch_all_or_nothing(tx),
                     ) {
                         if !mismatch {
                             continue;

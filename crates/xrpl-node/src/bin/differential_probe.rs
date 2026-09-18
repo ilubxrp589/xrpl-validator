@@ -2838,7 +2838,12 @@ fn run() -> i32 {
                 })
                 .collect();
             for (i, ih, want, mismatch) in
-                xrpl_node::native_apply::pair_inner_verdicts(inner_ids, &inner_results, &filed)
+                xrpl_node::native_apply::pair_inner_verdicts(
+                    inner_ids,
+                    &inner_results,
+                    &filed,
+                    xrpl_node::native_apply::batch_all_or_nothing(txj),
+                )
             {
                 if mismatch {
                     let got = inner_results

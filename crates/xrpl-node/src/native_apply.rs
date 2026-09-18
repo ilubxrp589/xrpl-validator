@@ -355,12 +355,67 @@ pub fn batch_inner_ids(outer: &Value) -> Vec<String> {
         // re-spelling only bites when the caller holds the mirror dialect.
         canon_for_encode(&mut v);
         let Ok(blob) = xrpl_core::codec::encode::encode_transaction_json(&v, false) else {
+            // A hole must keep its position: `continue` left-shifted every
+            // later id onto its neighbour's verdict, and the caller's
+            // "more results than ids" guard could not see a hole that sat
+            // after an early stop. The sentinel pairs with nothing and
+            // trips `inner_id_tripwire`.
+            ids.push(inner_id_sentinel(ids.len()));
             continue;
         };
         ids.push(hex::encode_upper(sha512_half_prefixed(&HASH_PREFIX_TRANSACTION_ID, &blob).0));
     }
     ids
 }
+
+/// The id recorded for an inner whose serialization failed — never a real
+/// transaction id (not hex), so it pairs with no filed entry.
+pub fn inner_id_sentinel(index: usize) -> String {
+    format!("UNENCODABLE#{index}")
+}
+
+/// Why a Batch outer's inner pairing cannot be trusted, if it cannot:
+/// an inner id that could not be recomputed (`inner_id_sentinel`), or an
+/// entry the ledger ATTRIBUTES to this outer (`ParentBatchID`,
+/// `BatchAttribution::inners_of`) whose id we did not recompute — the
+/// recomputed set must cover the attributed set. `None` when the pairing
+/// stands. Callers withhold the inner verdicts and count the tripwire so a
+/// withheld comparison never reads as agreement.
+pub fn inner_id_tripwire(ids: &[String], attributed: Option<&[String]>) -> Option<String> {
+    let holes: Vec<usize> = ids
+        .iter()
+        .enumerate()
+        .filter(|(_, id)| id.starts_with("UNENCODABLE#"))
+        .map(|(i, _)| i)
+        .collect();
+    if !holes.is_empty() {
+        return Some(format!("inner ids not recomputable at {holes:?}"));
+    }
+    if let Some(att) = attributed {
+        let missing: Vec<&str> = att
+            .iter()
+            .filter(|a| !ids.iter().any(|id| id.eq_ignore_ascii_case(a)))
+            .map(|a| &a[..12.min(a.len())])
+            .collect();
+        if !missing.is_empty() {
+            return Some(format!("ledger attributes inners we did not recompute: {missing:?}"));
+        }
+    }
+    None
+}
+
+/// Whether a Batch outer runs in tfAllOrNothing mode.
+pub fn batch_all_or_nothing(outer: &Value) -> bool {
+    outer.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0)
+        & xrpl_ledger::tx::batch::TF_ALL_OR_NOTHING
+        != 0
+}
+
+/// The expectation for every inner of a tfAllOrNothing batch the ledger
+/// discarded: rippled applied the inners to a whole-batch view and threw it
+/// away on the first failure, filing none (apply.cpp
+/// `applyBatchTransactions`), so no inner has a ledger verdict at all.
+pub const INNER_BATCH_DISCARDED: &str = "(batch discarded)";
 
 /// The expectation for an inner the ledger did not file: rippled records an
 /// inner entry only when it was APPLIED (tes, or a tec that claims a fee —
@@ -403,8 +458,24 @@ pub fn pair_inner_verdicts(
     ids: &[String],
     results: &[String],
     filed: &HashMap<String, String>,
+    all_or_nothing: bool,
 ) -> Vec<(usize, String, String, bool)> {
     let mut out = Vec::with_capacity(ids.len());
+    // A tfAllOrNothing batch the ledger filed NO inner of is a batch rippled
+    // discarded whole: its outer is tesSUCCESS (fee claimed) and every inner
+    // we attempted is expected to have been thrown away. Pairing them one by
+    // one flagged each tes of ours as "rippled would have filed it" — a
+    // false positive whenever an inner AFTER the tes ones failed. The only
+    // disagreement in this shape is our seeing NO failure at all: then we
+    // would have committed the batch rippled discarded, and the first inner
+    // carries the receipt.
+    if all_or_nothing && filed.is_empty() && !results.is_empty() {
+        let all_tes = results.iter().all(|r| r.starts_with("tes"));
+        for (i, id) in ids.iter().enumerate() {
+            out.push((i, id.clone(), INNER_BATCH_DISCARDED.to_string(), all_tes && i == 0));
+        }
+        return out;
+    }
     for (i, id) in ids.iter().enumerate() {
         let want = filed.get(id).map(String::as_str);
         let got = results.get(i).map(String::as_str);
@@ -533,6 +604,56 @@ mod batch_fold_tests {
     }
 
     #[test]
+    fn a_failed_all_or_nothing_batch_is_not_a_false_positive() {
+        let ids = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let filed: HashMap<String, String> = HashMap::new();
+        // inner C failed at preclaim: rippled discarded the batch, we recorded tes, tes, tec.
+        let results = vec!["tesSUCCESS".to_string(), "tesSUCCESS".to_string(), "tecUNFUNDED".to_string()];
+        let pairs = pair_inner_verdicts(&ids, &results, &filed, true);
+        assert!(pairs.iter().all(|p| !p.3), "{pairs:?}");
+        assert!(pairs.iter().all(|p| p.2 == INNER_BATCH_DISCARDED));
+        // the same ledger shape without the mode: our tes inners would have been filed — mismatches.
+        let pairs = pair_inner_verdicts(&ids, &results, &filed, false);
+        assert_eq!(pairs.iter().filter(|p| p.3).count(), 3); // two tes and the tec, all "would have been filed"
+    }
+
+    #[test]
+    fn an_all_or_nothing_batch_we_would_have_committed_is_the_mismatch() {
+        let ids = vec!["A".to_string(), "B".to_string()];
+        let filed: HashMap<String, String> = HashMap::new();
+        let results = vec!["tesSUCCESS".to_string(), "tesSUCCESS".to_string()];
+        let pairs = pair_inner_verdicts(&ids, &results, &filed, true);
+        assert!(pairs[0].3 && !pairs[1].3, "{pairs:?}");
+        // a filed set (the batch succeeded) pairs as before
+        let filed: HashMap<String, String> =
+            [("A".to_string(), "tesSUCCESS".to_string()), ("B".to_string(), "tesSUCCESS".to_string())].into();
+        let pairs = pair_inner_verdicts(&ids, &results, &filed, true);
+        assert!(pairs.iter().all(|p| !p.3));
+    }
+
+    #[test]
+    fn an_unencodable_inner_keeps_its_position_and_trips_the_wire() {
+        let outer = serde_json::json!({
+            "TransactionType": "Batch",
+            "RawTransactions": [
+                {"RawTransaction": {"TransactionType": "Payment", "Account": "rrrrrrrrrrrrrrrrrrrrBZbvji", "Destination": "rrrrrrrrrrrrrrrrrrrrBZbvji", "Amount": "1", "Fee": "0", "Sequence": 1, "SigningPubKey": "", "Flags": 1073741824}},
+                {"RawTransaction": {"TransactionType": "NoSuchType", "Account": "rrrrrrrrrrrrrrrrrrrrBZbvji"}},
+                {"RawTransaction": {"TransactionType": "Payment", "Account": "rrrrrrrrrrrrrrrrrrrrBZbvji", "Destination": "rrrrrrrrrrrrrrrrrrrrBZbvji", "Amount": "2", "Fee": "0", "Sequence": 2, "SigningPubKey": "", "Flags": 1073741824}}
+            ]
+        });
+        let ids = batch_inner_ids(&outer);
+        assert_eq!(ids.len(), 3, "{ids:?}");
+        assert_eq!(ids[1], inner_id_sentinel(1));
+        assert_ne!(ids[0], ids[2]);
+        assert!(inner_id_tripwire(&ids, None).unwrap().contains("[1]"));
+        let good = vec![ids[0].clone(), ids[2].clone()];
+        assert!(inner_id_tripwire(&good, None).is_none());
+        let att = vec!["DEADBEEF".to_string()];
+        assert!(inner_id_tripwire(&good, Some(&att)).unwrap().contains("DEADBEEF"));
+        assert!(inner_id_tripwire(&good, Some(&[good[0].to_lowercase()])).is_none());
+    }
+
+    #[test]
     fn a_transaction_without_raw_transactions_has_no_inner_ids() {
         assert!(batch_inner_ids(&json!({"TransactionType": "Payment"})).is_empty());
     }
@@ -562,6 +683,7 @@ mod pair_inner_verdicts_tests {
             &ids(3),
             &["tesSUCCESS".into(), "tecUNFUNDED_PAYMENT".into(), "tesSUCCESS".into()],
             &filed(&[(0, "tesSUCCESS"), (1, "tecUNFUNDED_PAYMENT"), (2, "tesSUCCESS")]),
+            false,
         );
         assert_eq!(
             verdict(&got),
@@ -572,6 +694,7 @@ mod pair_inner_verdicts_tests {
             &ids(2),
             &["tesSUCCESS".into(), "tesSUCCESS".into()],
             &filed(&[(0, "tesSUCCESS"), (1, "tecUNFUNDED_PAYMENT")]),
+            false,
         );
         assert_eq!(verdict(&wrong), vec![(0, "tesSUCCESS", false), (1, "tecUNFUNDED_PAYMENT", true)]);
     }
@@ -585,6 +708,7 @@ mod pair_inner_verdicts_tests {
             &ids(3),
             &["tesSUCCESS".into(), "temBAD_SEQUENCE".into()],
             &filed(&[(0, "tesSUCCESS")]),
+            false,
         );
         assert_eq!(
             verdict(&ok),
@@ -600,6 +724,7 @@ mod pair_inner_verdicts_tests {
             &ids(3),
             &["tesSUCCESS".into(), "tesSUCCESS".into()],
             &filed(&[(0, "tesSUCCESS")]),
+            false,
         );
         assert_eq!(
             verdict(&bad),
@@ -617,6 +742,7 @@ mod pair_inner_verdicts_tests {
             &ids(2),
             &["tesSUCCESS".into(), "tecUNFUNDED_PAYMENT".into()],
             &HashMap::new(),
+            false,
         );
         assert_eq!(verdict(&got), vec![(0, INNER_NOT_APPLIED, true), (1, INNER_NOT_APPLIED, true)]);
     }
@@ -629,6 +755,7 @@ mod pair_inner_verdicts_tests {
             &ids(2),
             &["temBAD_SEQUENCE".into()],
             &filed(&[(1, "tesSUCCESS")]),
+            false,
         );
         assert_eq!(verdict(&got), vec![(0, INNER_NOT_APPLIED, false), (1, "tesSUCCESS", true)]);
     }
@@ -642,6 +769,7 @@ mod pair_inner_verdicts_tests {
             &ids(3),
             &["tesSUCCESS".into(), "temBAD_SEQUENCE".into(), "tesSUCCESS".into()],
             &filed(&[(0, "tesSUCCESS"), (2, "tesSUCCESS")]),
+            false,
         );
         assert_eq!(
             verdict(&got),

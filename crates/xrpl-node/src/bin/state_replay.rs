@@ -566,6 +566,7 @@ fn run() -> i32 {
                         &inner_ids,
                         &inner_results,
                         &filed,
+                        xrpl_node::native_apply::batch_all_or_nothing(tx),
                     ) {
                         if mismatch {
                             let got = inner_results
