@@ -1893,6 +1893,18 @@ impl Transactor for PaymentTransactor {
         if tx.tx_type != "Payment" {
             return TxResult::Malformed;
         }
+        // Finding 318 (testnet 20863937 C87DF8E36A9B, flag:norippledirect):
+        // an MPT-direct payment's flag mask is tfMPTPaymentMask — only
+        // tfPartialPayment survives; tfNoRippleDirect or tfLimitQuality is
+        // temINVALID_FLAG at preflight1's universal-mask check, before every
+        // other rule (Payment.cpp getFlagsMask, Transactor.cpp:214).
+        {
+            let flags0 = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+            let mpt0 = tx.fields.get("Amount").and_then(crate::tx::mpt::parse_mpt_amount).is_some();
+            if mpt0 && flags0 & (0x0001_0000 | 0x0004_0000) != 0 {
+                return TxResult::InvalidFlag;
+            }
+        }
 
         // Fee must be positive
         if tx.fee_missing() {
@@ -4037,7 +4049,9 @@ mod tests {
         let sender = [0x01u8; 20];
         let dest = [0x02u8; 20];
         let tx = payment_tx(sender, dest, 1_000_000, 0, 1);
-        assert_eq!(PaymentTransactor.preflight(&tx), TxResult::BadFee);
+        // Finding 313: Fee 0 is preflight-valid (rippled rejects only a
+        // non-native or negative fee; the level is an open-ledger check).
+        assert_ne!(PaymentTransactor.preflight(&tx), TxResult::BadFee);
     }
 
     #[test]
@@ -4951,7 +4965,7 @@ mod tests {
             "Flags": 0x4000_0000u64,
         });
         let mut f = TxFields::from_json(&tx).expect("fields");
-        assert_eq!(PaymentTransactor.preflight(&f), TxResult::BadFee, "standalone: Fee 0 is temBAD_FEE");
+        assert_ne!(PaymentTransactor.preflight(&f), TxResult::BadFee, "finding 313: Fee 0 is valid standalone too");
         f.inner_batch = true;
         assert_ne!(PaymentTransactor.preflight(&f), TxResult::BadFee, "inner: Fee 0 is the rule");
     }

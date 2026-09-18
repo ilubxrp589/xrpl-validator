@@ -981,3 +981,38 @@ fn payment_overshoot_flushes_only_through_a_pool_the_hop_took_107064266() {
         "vectors/payment_overshoot_flushes_only_through_a_pool_the_hop_took_107064266.json"
     ));
 }
+
+/// Findings 312-316 — from the structural differential fuzzer (sweep 3 on
+/// 107060755); libxrpl's result is the expectation.
+#[test]
+fn payment_last_ledger_behind_the_ledger_is_tefmax_ledger_fuzz_107060755() {
+    run_bundle(include_str!("vectors/payment_last_ledger_behind_the_ledger_is_tefmax_ledger_fuzz_107060755.json"));
+}
+
+/// Findings 312-316 — from the structural differential fuzzer (sweep 3 on
+/// 107060755); libxrpl's result is the expectation.
+#[test]
+fn payment_future_sequence_is_terpre_seq_fuzz_107060755() {
+    run_bundle(include_str!("vectors/payment_future_sequence_is_terpre_seq_fuzz_107060755.json"));
+}
+
+/// Findings 312-316 — from the structural differential fuzzer (sweep 3 on
+/// 107060755); libxrpl's result is the expectation.
+#[test]
+fn payment_zero_fee_is_valid_and_applies_fuzz_107060755() {
+    run_bundle(include_str!("vectors/payment_zero_fee_is_valid_and_applies_fuzz_107060755.json"));
+}
+
+/// Findings 317/318 — from the structural differential fuzzer; libxrpl's
+/// result is the expectation.
+#[test]
+fn payment_mpt_direct_with_no_ripple_direct_is_invalid_flag_fuzz_testnet_20863937() {
+    run_bundle(include_str!("vectors/payment_mpt_direct_with_no_ripple_direct_is_invalid_flag_fuzz_testnet_20863937.json"));
+}
+
+/// Findings 320-326 — from the testnet campaign's differential fuzz (libxrpl's
+/// result is the expectation).
+#[test]
+fn escrow_create_cancel_after_at_or_before_finish_after_is_bad_expiration_fuzz_testnet_20864035() {
+    run_bundle(include_str!("vectors/escrow_create_cancel_after_at_or_before_finish_after_is_bad_expiration_fuzz_testnet_20864035.json"));
+}

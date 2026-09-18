@@ -190,6 +190,13 @@ impl Transactor for TrustSetTransactor {
         let Ok(acct) = serde_json::from_slice::<serde_json::Value>(&data) else {
             return TxResult::Malformed;
         };
+        // Finding 316 (fuzz flag:setfauth on 107060755 2A1407585FEC):
+        // tfSetfAuth on an account without lsfRequireAuth is
+        // tefNO_AUTH_REQUIRED (SetTrust.cpp:204-210).
+        let tx_flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+        if tx_flags & 0x0001_0000 != 0 && acct["Flags"].as_u64().unwrap_or(0) & 0x0004_0000 == 0 {
+            return TxResult::NoAuthRequired;
+        }
 
         let Some((currency_str, issuer)) = Self::extract_limit_amount(tx) else {
             return TxResult::Malformed;

@@ -160,6 +160,20 @@ impl Transactor for SignerListSetTransactor {
                 return TxResult::Malformed;
             }
         }
+        // Finding 324 (testnet 20864035 fuzz quorum:+1): with entries present
+        // the quorum must be reachable — `quorum <= 0 || sum(weights) <
+        // quorum` is temBAD_QUORUM (SetSignerList.cpp:325-329).
+        if let Some(arr) = tx.fields.get("SignerEntries").and_then(|v| v.as_array()) {
+            if !arr.is_empty() {
+                let total: u64 = arr
+                    .iter()
+                    .filter_map(|e| e.get("SignerEntry").and_then(|se| se.get("SignerWeight")).and_then(|w| w.as_u64()))
+                    .sum();
+                if quorum == 0 || total < quorum {
+                    return TxResult::BadQuorum;
+                }
+            }
+        }
         TxResult::Success
     }
 

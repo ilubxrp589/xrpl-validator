@@ -31,13 +31,48 @@ impl Transactor for AccountSetTransactor {
         if tx.fee_missing() {
             return TxResult::BadFee;
         }
+        // Finding 314 (fuzz setflag:10 on 107060755 3BF114A758BD): SetAccount
+        // preflight — asfAuthorizedNFTokenMinter must come with NFTokenMinter,
+        // clearing it must not, and NFTokenMinter without the flag is
+        // malformed (SetAccount.cpp:176-224).
+        let set_flag = tx.fields.get("SetFlag").and_then(|f| f.as_u64());
+        let clear_flag = tx.fields.get("ClearFlag").and_then(|f| f.as_u64());
+        let has_minter = tx.fields.get("NFTokenMinter").is_some();
+        if set_flag == Some(10) && !has_minter {
+            return TxResult::Malformed;
+        }
+        if clear_flag == Some(10) && has_minter {
+            return TxResult::Malformed;
+        }
+        if has_minter && set_flag != Some(10) {
+            return TxResult::Malformed;
+        }
+        // Finding 321 (testnet 20864013 fuzz transferrate:overmax): a
+        // TransferRate below QUALITY_ONE (unless 0, which clears) or above
+        // 2 × QUALITY_ONE is temBAD_TRANSFER_RATE (SetAccount.cpp:128-140).
+        if let Some(r) = tx.fields.get("TransferRate").and_then(|v| v.as_u64()) {
+            if (r != 0 && r < 1_000_000_000) || r > 2_000_000_000 {
+                return TxResult::BadTransferRate;
+            }
+        }
         TxResult::Success
     }
 
     fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
         let acct_key = keylet::account_root_key(&tx.account);
-        if !sandbox.exists(&acct_key) {
+        let Some(acct) = crate::tx::offer::json_at(sandbox, &acct_key) else {
             return TxResult::NoAccount;
+        };
+        // Finding 323 (testnet 20864015 fuzz setflag:6): NoFreeze cannot be
+        // set once clawback is enabled, and clawback cannot be set once
+        // NoFreeze is (SetAccount.cpp:276-300, featureClawback).
+        let flags_in = acct["Flags"].as_u64().unwrap_or(0);
+        let set_flag = tx.fields.get("SetFlag").and_then(|f| f.as_u64());
+        if set_flag == Some(6) && flags_in & 0x8000_0000 != 0 {
+            return TxResult::NoPermission;
+        }
+        if set_flag == Some(16) && flags_in & 0x0020_0000 != 0 {
+            return TxResult::NoPermission;
         }
         TxResult::Success
     }
@@ -52,6 +87,37 @@ impl Transactor for AccountSetTransactor {
             Ok(v) => v,
             Err(_) => return TxResult::Malformed,
         };
+        // Finding 314 (fuzz setflag:4 on 107060755 3BF114A758BD): disabling
+        // the master key, or setting NoFreeze while the master is enabled,
+        // needs the transaction signed WITH the master key — `sigWithMaster`
+        // is the SigningPubKey deriving to the account (SetAccount.cpp
+        // :397-411, :441-447) — and DisableMaster needs an alternative key.
+        {
+            let flags_in = acct["Flags"].as_u64().unwrap_or(0);
+            const LSF_DISABLE_MASTER: u64 = 0x0010_0000;
+            let set_flag = tx.fields.get("SetFlag").and_then(|f| f.as_u64());
+            let sig_with_master = tx
+                .fields
+                .get("SigningPubKey")
+                .and_then(|v| v.as_str())
+                .and_then(|h| hex::decode(h).ok())
+                .filter(|pk| pk.len() == 33)
+                .map(|pk| xrpl_core::crypto::signing::public_key_to_account_id(&pk) == tx.account)
+                .unwrap_or(false);
+            if set_flag == Some(4) && flags_in & LSF_DISABLE_MASTER == 0 {
+                if !sig_with_master {
+                    return TxResult::NeedMasterKey;
+                }
+                if acct.get("RegularKey").is_none()
+                    && !sandbox.exists(&keylet::signers_key(&tx.account))
+                {
+                    return TxResult::NoAlternativeKey;
+                }
+            }
+            if set_flag == Some(6) && !sig_with_master && flags_in & LSF_DISABLE_MASTER == 0 {
+                return TxResult::NeedMasterKey;
+            }
+        }
 
         // asf → lsf per rippled SetAccount: the asf NUMBERS are not bit
         // positions. #106455275 56049FD1 (SetFlag 13, DisallowIncomingCheck):
@@ -103,8 +169,10 @@ impl Transactor for AccountSetTransactor {
             }
         }
 
-        // Apply ClearFlag
-        if let Some(flag) = tx.fields.get("ClearFlag").and_then(|f| f.as_u64()) {
+        // Apply ClearFlag. Finding 320 (testnet 20863982 fuzz clearflag:16):
+        // asfAllowTrustLineClawback has no clear branch in SetAccount — the
+        // flag is permanent, and clearing it is a no-op.
+        if let Some(flag) = tx.fields.get("ClearFlag").and_then(|f| f.as_u64()).filter(|f| *f != 16) {
             if flag >= 32 {
                 return TxResult::Malformed;
             }
@@ -192,7 +260,7 @@ impl Transactor for AccountSetTransactor {
         // F70 — AN EMPTY OR ZERO VALUE CLEARS THE FIELD (SetAccount.cpp:500-590).
         // rippled never files the sentinel: an empty Domain/MessageKey blob, a
         // zero EmailHash/WalletLocator, a TransferRate of 0 or QUALITY_ONE and
-        // a TickSize of 0 or Quality::maxTickSize (15) all `makeFieldAbsent`.
+        // a TickSize of 0 or Quality::maxTickSize (16) all `makeFieldAbsent`.
         // We copied the tx value across, so a clear wrote an empty VL field.
         //
         // #106699631 D842A3B1: `Domain: ""` with SetFlag 15 — mainnet's root
@@ -228,7 +296,9 @@ impl Transactor for AccountSetTransactor {
         }
         if let Some(val) = tx.fields.get("TickSize") {
             match val.as_u64() {
-                Some(t) if t != 0 && t != 15 => acct["TickSize"] = val.clone(),
+                // Finding 317 (fuzz ticksize:15/16 on 107009438): Quality::maxTickSize
+                // is 16, not 15 — 15 is STORED, 16 (and 0) clears the field.
+                Some(t) if t != 0 && t != 16 => acct["TickSize"] = val.clone(),
                 _ => clear(&mut acct, "TickSize"),
             }
         }

@@ -107,6 +107,13 @@ pub fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<
         return (preflight.code_str().to_string(), HashMap::new());
     }
     let mut sb = Sandbox::new(state);
+    // rippled's Transactor::preclaim runs the sequence / ticket / prior-tx /
+    // LastLedgerSequence gates before the transactor's own (finding 312).
+    // The state is the parent ledger's; the ledger being built is one on.
+    let gate = xrpl_ledger::ledger::transactor::preclaim_common(tx, &sb, state.header.sequence + 1);
+    if !gate.is_success() {
+        return (gate.code_str().to_string(), HashMap::new());
+    }
     let preclaim = transactor.preclaim(tx, &sb);
     if !preclaim.is_success() && !preclaim.is_claimed() {
         return (preclaim.code_str().to_string(), HashMap::new());

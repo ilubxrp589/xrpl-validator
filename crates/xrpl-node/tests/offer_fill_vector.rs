@@ -1505,3 +1505,45 @@ fn offer_buy_residual_folds_the_iterations_outs_in_multiset_order_fuzz_107009438
         "vectors/offer_buy_residual_folds_the_iterations_outs_in_multiset_order_fuzz_107009438.json"
     ));
 }
+
+/// Findings 312-316 — from the structural differential fuzzer (sweep 3 on
+/// 107060755); libxrpl's result is the expectation.
+#[test]
+fn nft_cancel_offer_past_sequence_is_tefpast_seq_fuzz_107060755() {
+    run_bundle(include_str!("vectors/nft_cancel_offer_past_sequence_is_tefpast_seq_fuzz_107060755.json"));
+}
+
+/// Findings 312-316 — from the structural differential fuzzer (sweep 3 on
+/// 107060755); libxrpl's result is the expectation.
+#[test]
+fn offer_cancel_sequence_at_or_past_the_account_is_bad_sequence_fuzz_107060755() {
+    run_bundle(include_str!("vectors/offer_cancel_sequence_at_or_past_the_account_is_bad_sequence_fuzz_107060755.json"));
+}
+
+/// Findings 320-326 — from the testnet campaign's differential fuzz (libxrpl's
+/// result is the expectation).
+#[test]
+fn nft_create_offer_destination_self_is_malformed_fuzz_testnet_20864086() {
+    run_bundle(include_str!("vectors/nft_create_offer_destination_self_is_malformed_fuzz_testnet_20864086.json"));
+}
+
+/// Findings 320-326 — from the testnet campaign's differential fuzz (libxrpl's
+/// result is the expectation).
+#[test]
+fn nft_create_offer_sell_with_owner_is_malformed_fuzz_testnet_20864090() {
+    run_bundle(include_str!("vectors/nft_create_offer_sell_with_owner_is_malformed_fuzz_testnet_20864090.json"));
+}
+
+/// Findings 328/329 — from the structural differential fuzzer (libxrpl's
+/// result is the expectation).
+#[test]
+fn nft_accept_broker_fee_needs_both_offers_buy_dropped_fuzz_107075103() {
+    run_bundle(include_str!("vectors/nft_accept_broker_fee_needs_both_offers_buy_dropped_fuzz_107075103.json"));
+}
+
+/// Findings 328/329 — from the structural differential fuzzer (libxrpl's
+/// result is the expectation).
+#[test]
+fn nft_accept_broker_fee_needs_both_offers_sell_dropped_fuzz_107075103() {
+    run_bundle(include_str!("vectors/nft_accept_broker_fee_needs_both_offers_sell_dropped_fuzz_107075103.json"));
+}
