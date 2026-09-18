@@ -191,8 +191,15 @@ impl FuzzCtx {
             // shadow reports the same asymmetry as `noop_extra`/`noop_missing`
             // rather than a divergence. Set-differences made only of those
             // are classed NOOP so the real MUT cases stand out.
+            // The pre-image: what libxrpl read, else the object as our
+            // native state holds it (a key only our leg wrote was never read
+            // by libxrpl, so its pre-image lives only in the state).
             let pre_of = |k: &[u8; 32]| -> Option<Vec<u8>> {
-                reads.iter().find(|(rk, _)| rk == k).map(|(_, b)| b.clone())
+                reads
+                    .iter()
+                    .find(|(rk, _)| rk == k)
+                    .map(|(_, b)| b.clone())
+                    .or_else(|| state.state_map.lookup(&Hash256(*k)).map(|js| encode_obj(js)).filter(|b| !b.is_empty()))
             };
             let threading_only = |k: &[u8; 32], kind: u8, b: &[u8]| -> bool {
                 kind == 1 && pre_of(k).is_some_and(|pre| strip_threading(&pre) == strip_threading(b))
