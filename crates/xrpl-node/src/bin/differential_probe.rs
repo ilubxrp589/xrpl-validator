@@ -2385,7 +2385,7 @@ fn main() {
 fn run() -> i32 {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: differential_probe <blobs.txt> <expected.json> [--rpc URL] [--json]");
+        eprintln!("usage: differential_probe <blobs.txt> <expected.json> [--rpc URL] [--json] [--fuzz K --seed S --fuzz-out DIR]");
         return 2;
     }
     // `--rpc` states a PREFERENCE, not a pin: `select_rpc` below falls back to
@@ -2393,6 +2393,12 @@ fn run() -> i32 {
     let rpc_pref = args.iter().position(|a| a == "--rpc")
         .and_then(|i| args.get(i + 1).cloned());
     let want_json = args.iter().any(|a| a == "--json");
+    // --fuzz K [--seed S] [--fuzz-out DIR]: K unsigned mutants per transaction,
+    // libxrpl vs our engine on the same pre-state (`xrpl_node::tx_fuzz`).
+    let argval = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned());
+    let fuzz_k: usize = argval("--fuzz").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let fuzz_seed: u64 = argval("--seed").and_then(|v| v.parse().ok()).unwrap_or(1);
+    let fuzz_out: String = argval("--fuzz-out").unwrap_or_else(|| "fuzz".to_string());
 
     let expected_json = match std::fs::read_to_string(&args[2]) {
         Ok(s) => s,
@@ -2477,6 +2483,13 @@ fn run() -> i32 {
         .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
         .map(Hash256)
         .unwrap_or(Hash256([0; 32]));
+    let mut fuzz = (fuzz_k > 0).then(|| {
+        eprintln!("FUZZ: {fuzz_k} mutants per tx, seed {fuzz_seed}, bundles -> {fuzz_out}/");
+        xrpl_node::tx_fuzz::FuzzCtx::new(&rpc_url, seq as u32, hdr, parent_hash.0, &fuzz_out, fuzz_seed, fuzz_k)
+    });
+    let mut fuzz_tally = xrpl_node::tx_fuzz::FuzzTally::default();
+    let mut fuzz_deleted: HashSet<[u8; 32]> = HashSet::new();
+    let mut fuzz_idx: usize = 0;
     let header = LedgerHeader {
         sequence: seq.saturating_sub(1),
         total_coins: hdr["total_drops"].as_u64().unwrap_or(100_000_000_000_000_000),
@@ -2741,6 +2754,13 @@ fn run() -> i32 {
                 }
             }
         }
+        if let Some(ctx) = fuzz.as_mut() {
+            if tx_type != "Batch" && !xrpl_ledger::tx::dispatch::is_pseudo(&tx_type) {
+                let t = ctx.fuzz_tx(&mut state, txj, h, fuzz_idx, &fuzz_deleted);
+                fuzz_tally.add(&t);
+            }
+        }
+        fuzz_idx += 1;
         let (our_ter, mut mods) = native_apply_one(&state, &txf);
         if dx_armed {
             if let Ok(list) = std::env::var("DX_REPLAY_SET") {
@@ -3055,6 +3075,20 @@ fn run() -> i32 {
         // FinalFields at all) down to empty shells. This bounds cascade
         // contamination: every field the meta records is corrected to truth
         // before the next tx.
+        if fuzz.is_some() {
+            // Keys this ledger deleted so far: the parent ledger still has
+            // them and the fuzz provider must not resurrect them.
+            for (k, ent) in mods.iter() {
+                match ent {
+                    SandboxEntry::Deleted => {
+                        fuzz_deleted.insert(k.0);
+                    }
+                    _ => {
+                        fuzz_deleted.remove(&k.0);
+                    }
+                }
+            }
+        }
         let _ = apply_modifications(&mut state, mods);
         {
             let mut overlay: HashMap<Hash256, SandboxEntry> = HashMap::new();
@@ -3257,6 +3291,16 @@ fn run() -> i32 {
 
     let total_attempted: u32 = agg.values().map(|a| a.attempted).sum();
     let total_matched: u32 = agg.values().map(|a| a.matched).sum();
+    if fuzz.is_some() {
+        let t = &fuzz_tally;
+        eprintln!(
+            "FUZZ SUMMARY: attempted={} agree={} TER={} MUT={} BYTE={} NOOP={} ffi_null={} skipped={} bundles={}",
+            t.attempted, t.agree, t.ter_mm, t.mut_mm, t.byte_mm, t.noop, t.ffi_null, t.skipped, t.written.len()
+        );
+        for w in &t.written {
+            eprintln!("  {w}");
+        }
+    }
     eprintln!("SUMMARY: {total_matched}/{total_attempted} attempted txs MATCH mainnet (native engine)");
     if total_attempted == 0 {
         return 2;

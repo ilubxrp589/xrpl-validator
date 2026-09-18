@@ -18,6 +18,7 @@
 #include <xrpl/protocol/TxFormats.h>
 #include <xrpl/protocol/XRPAmount.h>
 #include <xrpl/protocol/Fees.h>
+#include <xrpl/ledger/ApplyView.h>  // ApplyFlags (tapDRY_RUN) for apply_maybe_dry
 #include <xrpl/ledger/OpenView.h>
 #include <xrpl/protocol/TER.h>
 #include <xrpl/protocol/TxFlags.h>
@@ -104,6 +105,46 @@ apply(
     ApplyFlags flags,
     beast::Journal journal);
 }  // namespace xrpl
+
+namespace {
+// Differential fuzzing (differential_probe --fuzz): an UNSIGNED mutant of a
+// real transaction is applied under tapDRY_RUN — rippled's `simulate` path,
+// which accepts an empty SigningPubKey with no TxnSignature/Signers
+// (Transactor.cpp:719) — but `ApplyViewImpl::apply(…, dryRun=true)` builds the
+// metadata without landing the view on the base, so the shim's collector
+// would see nothing. rippled's `apply()` is preflight → preclaim → doApply
+// with no early return (apply.cpp); this runs the first two under the
+// caller's flags and hands doApply a PreclaimResult with the dry-run bit
+// cleared, so the ApplyContext it builds applies for real. Everything else
+// tapDRY_RUN touches is signature-only.
+xrpl::ApplyResult apply_maybe_dry(
+    xrpl::MinimalApp& app,
+    xrpl::OpenView& view,
+    xrpl::STTx const& tx,
+    xrpl::ApplyFlags flags,
+    beast::Journal journal)
+{
+    if (!(flags & xrpl::TapDryRun))
+        return xrpl::apply(app, view, tx, flags, journal);
+    auto const pf = xrpl::preflight(app, view.rules(), tx, flags, journal);
+    auto const pc = xrpl::preclaim(pf, app, view);
+    struct Ctx {
+        xrpl::ReadView const& view;
+        xrpl::STTx const& tx;
+        std::optional<xrpl::uint256 const> parentBatchId;
+        xrpl::ApplyFlags flags;
+        beast::Journal j;
+    };
+    Ctx const wet{
+        pc.view,
+        pc.tx,
+        pc.parentBatchId,
+        static_cast<xrpl::ApplyFlags>(static_cast<std::uint32_t>(pc.flags) & ~static_cast<std::uint32_t>(xrpl::TapDryRun)),
+        pc.j};
+    xrpl::PreclaimResult const pc_wet(wet, pc.ter);
+    return xrpl::doApply(pc_wet, app, view);
+}
+}  // namespace
 
 namespace {
 // Batch (BatchV1_1). rippled applies a Batch's inner transactions in
@@ -416,7 +457,7 @@ int32_t xrpl_apply(
         xrpl::MinimalApp app(network_id);
         beast::Journal journal(beast::Journal::getNullSink());
 
-        auto result = xrpl::apply(
+        auto result = apply_maybe_dry(
             app,
             open_view,
             tx,
@@ -546,7 +587,7 @@ XrplApplyResult *xrpl_apply_with_mutations(
         // while an OfferCreate traces fine.
         app.setTraceSink(&capturing_sink);
 
-        auto apply_result = xrpl::apply(
+        auto apply_result = apply_maybe_dry(
             app, open_view, tx,
             static_cast<xrpl::ApplyFlags>(apply_flags), journal);
         apply_batch_if_needed(app, open_view, tx, apply_result, journal);
