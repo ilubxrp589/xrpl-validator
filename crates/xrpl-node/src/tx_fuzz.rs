@@ -279,10 +279,22 @@ impl FuzzCtx {
                     }
                 }
             }
-            let expect: serde_json::Map<String, Value> = ffi_map
+            let mut expect: serde_json::Map<String, Value> = ffi_map
                 .iter()
                 .map(|(k, (_, b))| (hex::encode_upper(k), Value::String(hex::encode_upper(b))))
                 .collect();
+            // An object only our leg wrote becomes an UNTOUCHED pin (expect ==
+            // pre): the bundle probe then reports it as written when the
+            // replay repeats the divergence, so the drill sees the object by
+            // name instead of a key prefix.
+            for (k, _) in our_map.iter().filter(|(k, _)| !ffi_map.contains_key(*k)) {
+                let pre_bytes = pre_of(k).or_else(|| state.state_map.lookup(&Hash256(*k)).map(|js| encode_obj(js)));
+                if let Some(b) = pre_bytes.filter(|b| !b.is_empty()) {
+                    let kh = hex::encode_upper(k);
+                    pre.entry(kh.clone()).or_insert(Value::String(hex::encode_upper(&b)));
+                    expect.entry(kh).or_insert(Value::String(hex::encode_upper(&b)));
+                }
+            }
             let bundle = json!({
                 "seq": self.seq,
                 "parent_hash": hex::encode_upper(self.parent_hash),
