@@ -4415,6 +4415,7 @@ thr={t:?} admits_trunc={} admits_up={}",
                 crate::tx::amm_swap::consume_fib(
                     sandbox, a, taker, beneficiary, None, round_gross_cap, rem_pays, rem_gets, pays_leg, gets_leg,
                     threshold, sell, *init, amm_iters, best_book, fee_rate,
+                    d_book_ub, // finding 298: the pool's own-book gate
                 )
             };
             rem_pays = rp;
@@ -9244,7 +9245,7 @@ fn amm_turn(
     };
     let r = crate::tx::amm_swap::consume_fib(
         sandbox, a, taker, beneficiary, benef_net, in_gross_cap, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell,
-        init, f.iters, clob.map(rate_me), in_gross_rate,
+        init, f.iters, clob.map(rate_me), in_gross_rate, None,
     );
     if r.2 {
         f.used = true;

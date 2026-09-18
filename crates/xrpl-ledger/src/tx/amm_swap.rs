@@ -1418,6 +1418,7 @@ pub(crate) fn consume_fib(
     // AMM offer pays no such fee" — BookStep.cpp:737-739, the discount
     // calibration).
     in_gross_rate: Option<u64>,
+    clob_tip: Option<Me>,
 ) -> (Me, Me, bool) {
     if amm_ctx_exhausted() {
         return (rem_pays, rem_gets, false);
@@ -1432,10 +1433,43 @@ pub(crate) fn consume_fib(
     if ox::me_is_zero(rem_gets) || (!sell && ox::me_is_zero(rem_pays)) {
         return (rem_pays, rem_gets, false);
     }
+    // Finding 298 (#107060755 F43C3C4DA037, rsdsSA7's ASC→PLR tfSell offer
+    // over a direct pool and a two-pool XRP bridge): `AMMLiquidity::getOffer`
+    // is gated by ITS OWN book's tip whatever the ranking says
+    // (AMMLiquidity.cpp:181-196) — the RAW pool quality (no fee) must beat
+    // the tip and not sit within 1e-7 of it, and the Fibonacci offer itself
+    // must not be worse than the tip. The tip is the stream's, the taker's
+    // own offer included: 4CF7660E at 1.401935 priced the direct book while
+    // the pool's raw spot slid from 1.3939 to 1.40353 over five slices, so
+    // rippled's sixth call answered "higher clob quality", the direct strand
+    // ran dry on the self-offer and the bridge took the iteration (4590.39
+    // ASC through both pools). We kept slicing the direct pool (seven
+    // slices, 70.9 ASC) and never flowed the bridge.
+    if let Some(tip) = clob_tip {
+        let pool_in = holds_for_offer(sandbox, &amm.account, gets_leg);
+        let pool_out = holds_for_offer(sandbox, &amm.account, pays_leg);
+        if pool_in.0 == 0 || pool_out.0 == 0 {
+            return (rem_pays, rem_gets, false);
+        }
+        let raw = rate_of_me_pair(pool_in, pool_out);
+        let stands_aside = n_cmp(raw, tip) != Ordering::Less
+            || n_cmp(n_div(n_sub(tip, raw, Rnd::Near), tip, Rnd::Near), (LO, -22)) == Ordering::Less;
+        if std::env::var("DX_AMM").is_ok() {
+            eprintln!("DX_AMM fib gate iter={iters} raw_spot={raw:?} tip={tip:?} stands_aside={stands_aside}");
+        }
+        if stands_aside {
+            return (rem_pays, rem_gets, false);
+        }
+    }
     let Some((s_in, s_out)) = fib_slice(sandbox, amm, init, iters, pays_leg, gets_leg) else {
         return (rem_pays, rem_gets, false);
     };
     let q = rate_of_me_pair(s_in, s_out);
+    if let Some(tip) = clob_tip {
+        if n_cmp(q, tip) == Ordering::Greater {
+            return (rem_pays, rem_gets, false); // `Quality{amounts} < clobQuality` → nullopt
+        }
+    }
     if std::env::var("DX_AMM").is_ok() {
         eprintln!("DX_AMM fib iter={iters} q={q:?} best_book={best_book:?} thr={threshold:x} slice=({s_in:?},{s_out:?})");
     }

@@ -1436,3 +1436,18 @@ fn offer_fill_or_kill_is_judged_on_the_sorted_fold_not_the_running_chain_1070448
 fn offer_sorted_strands_break_at_the_first_success_the_bridge_behind_a_winner_is_not_flowed_107002363() {
     run_bundle(include_str!("vectors/offer_sorted_strands_break_at_the_first_success_the_bridge_behind_a_winner_is_not_flowed_107002363.json"));
 }
+
+/// Finding 298 — #107060755 F43C3C4DA037: rsdsSA7's tfSell offer, 852332.25
+/// ASC for 599530.50 PLR, meets a direct ASC/PLR pool and a two-pool XRP
+/// bridge (multi-path, Fibonacci offers). rippled takes five direct-pool
+/// slices (25.645 ASC), then `AMMLiquidity::getOffer` gates the pool by its
+/// OWN book's tip — the raw pool quality (1.40353) no longer beats the tip
+/// (the taker's own 4CF7660E at 1.401935) — the direct strand runs dry on
+/// that self-offer and the bridge takes iteration 5 (4590.39 ASC through
+/// both pools, 3243.97 PLR). We ranked the pool only against the rival
+/// strand, sliced it seven times (70.9 ASC) and never flowed the bridge:
+/// four pool objects unwritten, nine targets wrong.
+#[test]
+fn offer_fib_pool_is_gated_by_its_own_book_tip_107060755() {
+    run_bundle(include_str!("vectors/offer_fib_pool_is_gated_by_its_own_book_tip_107060755.json"));
+}
