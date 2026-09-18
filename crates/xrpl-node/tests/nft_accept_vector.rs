@@ -268,3 +268,16 @@ fn nft_brokered_accept_one_drop_short_after_the_broker_fee_is_tec_insufficient_p
 fn nft_brokered_accept_one_drop_short_after_the_broker_fee_is_tec_insufficient_payment_106945810() {
     run_bundle(include_str!("vectors/nft_brokered_accept_one_drop_short_after_the_broker_fee_is_tec_insufficient_payment_106945810.json"));
 }
+
+/// Finding 309 (#107063938 EBF238024D19): accepting a buy offer priced in an
+/// IOU checks the BUYER's funds through `accountFunds(..., fhZERO_IF_FROZEN)`
+/// (NFTokenAcceptOffer.cpp:212-218). rDnNmaX1 held 0.3373 of the 337.002
+/// xSPECTAR it offered: tecINSUFFICIENT_FUNDS; we judged only XRP prices.
+/// The bundle's pre carries the offer, the buyer's root and line, and the
+/// issuer's root, fetched at the parent ledger (a tec's meta touches none).
+#[test]
+fn nft_accept_buy_offer_priced_in_iou_needs_the_buyer_funded_107063938() {
+    run_bundle(include_str!(
+        "vectors/nft_accept_buy_offer_priced_in_iou_needs_the_buyer_funded_107063938.json"
+    ));
+}

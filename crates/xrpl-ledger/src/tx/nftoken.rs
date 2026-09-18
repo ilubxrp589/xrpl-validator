@@ -792,11 +792,27 @@ fn nft_amount_sub(a: &serde_json::Value, b: &serde_json::Value) -> Option<serde_
 /// offer. For XRP that resolves to `accountHolds`, i.e. the balance less the
 /// account's reserve at its current OwnerCount.
 ///
-/// ⚠ IOU-priced offers return FALSE — not "funded", but "not judged here".
-/// `do_apply` still does not move value over trust lines for them (see its own
-/// note), so inventing a funds verdict would swap one wrong result code for
-/// another. When IOU settlement lands, this is the first thing to revisit.
+/// IOU prices are judged through `available` (finding 309); XRP prices
+/// against the balance past the reserve.
 fn nft_funds_short(sandbox: &Sandbox, payer: &[u8; 20], amount: &serde_json::Value) -> bool {
+    // Finding 309 (#107063938 EBF238024D19, rnyJvF5 accepting rDnNmaX1's
+    // 337.002 xSPECTAR buy offer): rippled's preclaim reads the buyer's
+    // funds through `accountFunds(view, owner, needed, fhZERO_IF_FROZEN)`
+    // for EVERY currency (NFTokenAcceptOffer.cpp:212-218, fixNonFungible-
+    // TokensV1_2) — an issuer buying with its own IOU is unbounded, a
+    // frozen holder has nothing, anyone else has the line balance. The
+    // buyer held 0.3373 of the 337.002: mainnet tecINSUFFICIENT_FUNDS,
+    // we accepted (IOU prices were "not judged here").
+    if amount.is_object() {
+        use crate::tx::offer as ox;
+        let (Some(leg), Some(needed)) = (ox::leg_of(amount), keylet::amount_mant_exp(amount)) else {
+            return false;
+        };
+        if payer == &leg.issuer {
+            return false;
+        }
+        return ox::me_cmp(ox::available(sandbox, payer, &leg), needed).is_lt();
+    }
     let Some(needed) = amount.as_str().and_then(|s| s.parse::<u64>().ok()) else {
         return false;
     };
