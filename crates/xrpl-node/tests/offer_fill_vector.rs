@@ -1547,3 +1547,9 @@ fn nft_accept_broker_fee_needs_both_offers_buy_dropped_fuzz_107075103() {
 fn nft_accept_broker_fee_needs_both_offers_sell_dropped_fuzz_107075103() {
     run_bundle(include_str!("vectors/nft_accept_broker_fee_needs_both_offers_sell_dropped_fuzz_107075103.json"));
 }
+
+/// Finding 334 — the devnet campaign's permissioned-DEX hybrid offer.
+#[test]
+fn offer_hybrid_domain_offer_rests_in_both_books_devnet_5419038() {
+    run_bundle(include_str!("vectors/offer_hybrid_domain_offer_rests_in_both_books_devnet_5419038.json"));
+}
