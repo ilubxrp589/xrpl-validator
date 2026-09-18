@@ -531,6 +531,33 @@ fn native_read_keys(txj: &Value) -> Vec<String> {
             keys.push(hex::encode_upper(keylet::owner_dir_key(&a).0));
         }
     }
+    // Every 32-byte hex field names a ledger object the transactor will
+    // READ (DomainID, CheckID, Channel, NFTokenBuyOffer/SellOffer, VaultID,
+    // CredentialIDs…) — a modification that leaves the object byte-identical
+    // never reaches the meta, and a state without it reads tecNO_ENTRY:
+    // testnet 20863999 0DF65AD75341, a PermissionedDomainSet re-filing the
+    // same credential list.
+    for (k, v) in txj.as_object().into_iter().flatten() {
+        if k == "hash" || k == "AccountTxnID" || k == "PreviousTxnID" {
+            continue;
+        }
+        let push = |s: &str, keys: &mut Vec<String>| {
+            if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+                keys.push(s.to_uppercase());
+            }
+        };
+        match v {
+            Value::String(sv) => push(sv, &mut keys),
+            Value::Array(arr) => {
+                for e in arr {
+                    if let Some(sv) = e.as_str() {
+                        push(sv, &mut keys);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     // A Payment to an lsfDepositAuth destination is refused unless a
     // DepositPreauth(dst, src) object exists — and that object is READ, never
     // written, so a payment it ALLOWS touches it in no metadata and the
