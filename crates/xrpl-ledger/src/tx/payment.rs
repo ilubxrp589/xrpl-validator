@@ -1481,6 +1481,7 @@ impl PaymentTransactor {
             crate::tx::amm_swap::set_fwd_gross_in(hop_rate.map(|_| carry));
             crate::tx::amm_swap::set_sender_hop(i == 0);
                     crate::tx::amm_swap::set_fwd_first(i == 0); // finding 147
+            let pool_use_seq0 = crate::tx::amm_swap::amm_use_seq();
             let (rw, rs, _c, gross_spent) = ox::cross_engine_to_net(
                 &tx.account, benef, want_cap, avail, chain[i + 1], chain[i],
                 // Finding 220 (#106825938 D97A404AA9BF, r9tcGwSyYP: 0.1 XRP → WETH
@@ -1564,7 +1565,18 @@ impl PaymentTransactor {
             // Amount exactly — both VALCHECK deltas are exactly this flush.
             // IOU-only and unrated (the specimen's shape); rated or XRP legs
             // log and skip until a specimen calibrates them.
-            if !ox::me_is_zero(rs) && ox::me_is_zero(rw) && hop_rate.is_none() && i > 0 {
+            //
+            // Finding 311 (#107064266 12C8A416327C, rogue5Hn PLX→LHT→CSC — the
+            // soak-17 receipt): the hop's liquidity was a BOOK offer (one fill
+            // met the want), the CSC/LHT pool merely existed, and the 5.3e-11
+            // LHT overshoot was flushed into the pool anyway — its LHT line
+            // rounded up one ulp (…4DBC → …4DBD), the ninth mutation mainnet
+            // never wrote. rippled's fwd step feeds the excess through the
+            // stream it consumed, where an offer absorbs it below the lines'
+            // precision. Flush through the pool only when THIS hop's walk
+            // took the pool.
+            let pool_used_here = crate::tx::amm_swap::amm_use_seq() != pool_use_seq0;
+            if !ox::me_is_zero(rs) && ox::me_is_zero(rw) && hop_rate.is_none() && i > 0 && pool_used_here {
                 let tiny =
                     ox::me_cmp(ox::me_muldiv(rs, (1_000_000_000, 0), (1, 0), false), avail)
                         .is_lt();

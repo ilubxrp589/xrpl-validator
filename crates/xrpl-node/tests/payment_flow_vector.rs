@@ -968,3 +968,16 @@ fn payment_limit_out_within_a_billionth_is_not_a_trim_fuzz_107009438() {
         "vectors/payment_limit_out_within_a_billionth_is_not_a_trim_fuzz_107009438.json"
     ));
 }
+
+/// Finding 311 (#107064266 12C8A416327C, soak-17 receipt): rogue5Hn's
+/// PLX→LHT→CSC payment met hop 1 with one book offer; the CSC/LHT pool
+/// merely existed, yet the 5.3e-11 LHT carry overshoot was flushed into it
+/// and its LHT line rounded up one ulp — a ninth mutation mainnet never
+/// wrote. The flush goes through the pool only when the hop's own walk took
+/// the pool. The pool's LHT line is pinned untouched in `expect`.
+#[test]
+fn payment_overshoot_flushes_only_through_a_pool_the_hop_took_107064266() {
+    run_bundle(include_str!(
+        "vectors/payment_overshoot_flushes_only_through_a_pool_the_hop_took_107064266.json"
+    ));
+}
