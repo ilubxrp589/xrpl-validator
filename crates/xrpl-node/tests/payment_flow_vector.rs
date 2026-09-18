@@ -906,3 +906,18 @@ fn payment_own_offers_behind_an_issuer_hop_are_credited_107052630() {
 fn payment_reverse_pass_reaps_survive_the_snapshot_107009438() {
     run_bundle(include_str!("vectors/payment_reverse_pass_reaps_survive_the_snapshot_107009438.json"));
 }
+
+/// Finding 297 — #107056200 BD9C7473B84F: rhTsmUJ's 6 XRP partial self-payment
+/// (DeliverMin) into RVR meets rMBPaL7's fresh offer at the tip and a 0.506%
+/// pool. `AMMLiquidity::getOffer` stands the pool aside only when the RAW pool
+/// quality (`Quality{balances}`, no fee) is not strictly better than the tip
+/// or sits within 1e-7 of it; the fee enters only in the anchored offer
+/// `changeSpotPriceQuality` then generates. We judged the fee-inclusive spot,
+/// 5.5e-8 inside the tip, and let the offer take all 6 XRP; mainnet's raw spot
+/// is 0.5% better, the pool's anchored slice is 52 drops for 0.428107876 RVR
+/// (shim trace: "changeSpotPriceQuality succeeded … 52 0.428107876") and the
+/// tip fills the other 5999948 — seven mutations, ours had five.
+#[test]
+fn payment_pool_stands_aside_on_raw_quality_not_fee_spot_107056200() {
+    run_bundle(include_str!("vectors/payment_pool_stands_aside_on_raw_quality_not_fee_spot_107056200.json"));
+}

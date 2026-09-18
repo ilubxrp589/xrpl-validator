@@ -1301,7 +1301,7 @@ pub(crate) fn spot_quality(sandbox: &Sandbox, amm: &Amm, pays_leg: &Leg, gets_le
 
 /// The quality of the offer `AMMLiquidity::getOffer` generates against the
 /// LOB tip `clob` (AMMLiquidity.cpp:184-222): None when the pool cannot beat
-/// the tip — fee-inclusive spot not strictly better, or within 1e-7 of it —
+/// the tip — RAW spot (no fee) not strictly better, or within 1e-7 of it —
 /// else `changeSpotPriceQuality`'s offer (fixAMMv1_2: maxOffer when that
 /// fails and still beats the book), as `rate_of(in, out)` in the walk's
 /// encoding (lower is better). This is the quality `tip()` hands
@@ -1329,8 +1329,10 @@ pub(crate) fn anchored_offer_quality(
     if pool_in.0 == 0 || pool_out.0 == 0 || clob == 0 {
         return None;
     }
-    let omf = n_sub(N_ONE, fee_n(amm.tfee), Rnd::Near);
-    let spot = rate_of(pool_in, n_mul(pool_out, omf, Rnd::Near));
+    // Finding 297: the stand-aside test is on `Quality{balances}` — the
+    // RAW pool quality, no trading fee (AMMLiquidity.cpp:181-183); the fee
+    // enters only in the offer `changeSpotPriceQuality` then generates.
+    let spot = rate_of(pool_in, pool_out);
     if spot == 0 || spot >= clob {
         return None;
     }
@@ -1822,8 +1824,14 @@ pub(crate) fn anchored_slice(
     if pool_in.0 == 0 || pool_out.0 == 0 {
         return None;
     }
-    let omf_spot = n_sub(N_ONE, fee_n(amm.tfee), Rnd::Near);
-    let spot = rate_of(pool_in, n_mul(pool_out, omf_spot, Rnd::Near));
+    // Finding 297 (#107056200 BD9C7473B84F): the stand-aside test is on
+    // `Quality{balances}` — the RAW pool quality, no trading fee
+    // (AMMLiquidity.cpp:181-183). rhTsmUJ's 6 XRP partial self-payment
+    // met a 0.506% pool whose fee-inclusive spot sat 5.5e-8 inside the
+    // tip, and the gate here let the tip take all 6 XRP; mainnet's raw
+    // spot is 0.5% better, the pool generates its 52-drop anchored slice,
+    // and the tip fills the other 5999948.
+    let spot = rate_of(pool_in, pool_out);
     if spot == 0 || spot >= clob {
         return None;
     }
@@ -2043,10 +2051,13 @@ pub(crate) fn consume(
     // AMM participates only when strictly better than the CLOB and not
     // within 1e-7 relative distance of it (AMMLiquidity::getOffer).
     if let Some(qb) = clob {
-        if spot >= qb {
+        // Finding 297: judged on the RAW pool quality (no fee) — see
+        // `anchored_slice`.
+        let spot_raw = rate_of(pool_in, pool_out);
+        if spot_raw == 0 || spot_raw >= qb {
             return (rem_pays, rem_gets, false);
         }
-        let (rs, rb) = (decode_rate(spot), decode_rate(qb));
+        let (rs, rb) = (decode_rate(spot_raw), decode_rate(qb));
         let dist = n_div(n_sub(rb, rs, Rnd::Near), rb, Rnd::Near);
         if n_cmp(dist, (LO, -22)) == Ordering::Less {
             return (rem_pays, rem_gets, false); // within 1e-7
