@@ -358,9 +358,12 @@ impl Transactor for BatchTransactor {
         if signers != required {
             return TxResult::BadSigner;
         }
-        if tx.fee < batch_base_fee(&tx.fields, 10) {
-            return TxResult::BadFee;
-        }
+        // Finding 331 (devnet 5419046 1455FD412810 / 5419049 6A4D25E0FD9B,
+        // Fee 4 drops on a one-drop network): the OUTER fee's level is
+        // Transactor::checkFee's business, judged only while the ledger is
+        // open — Batch::preflight checks that every INNER fee is zero and
+        // nothing about the outer (Batch.cpp:326-334). Finding 313's rule.
+        let _ = batch_base_fee;
         TxResult::Success
     }
 
@@ -642,8 +645,10 @@ mod tests {
     fn batch_base_fee_counts_two_units_plus_one_per_inner_and_per_signer() {
         let o = outer(TF_INDEPENDENT, vec![inner_payment(1, 2, 1, 6), inner_payment(3, 2, 1, 1)], Some(vec![3]));
         assert_eq!(batch_base_fee(&o, 10), 10 * (2 + 2 + 1));
+        // Finding 331: the outer fee's LEVEL is an open-ledger matter; preflight
+        // accepts any non-negative outer fee.
         let mut cheap = o.clone(); cheap["Fee"] = json!("40");
-        assert_eq!(pf(&cheap), "temBAD_FEE");
+        assert_ne!(pf(&cheap), "temBAD_FEE");
     }
 
     // ---- do_apply ----
