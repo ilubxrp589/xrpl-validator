@@ -113,6 +113,11 @@ impl FuzzCtx {
                 continue;
             };
             let hash_hex = hex::encode_upper(sha512_half_prefixed(&HASH_PREFIX_TRANSACTION_ID, &bytes).0);
+            // The engine reads the transaction id from the JSON's `hash`
+            // (stamp_account_txn_id): give the mutant its own id before our
+            // leg runs, as the ledger feed would.
+            let mut mutant = mutant;
+            mutant["hash"] = Value::String(hash_hex.clone());
             let Some(txf) = build_txfields(&mutant) else {
                 tally.skipped += 1;
                 continue;
@@ -267,8 +272,7 @@ impl FuzzCtx {
                 ffi_map.len()
             );
             // Bundle for the drill.
-            let mut tx = mutant.clone();
-            tx["hash"] = Value::String(hash_hex.clone());
+            let tx = mutant.clone();
             let mut pre: serde_json::Map<String, Value> = reads
                 .iter()
                 .map(|(k, b)| (hex::encode_upper(k), Value::String(hex::encode_upper(b))))
