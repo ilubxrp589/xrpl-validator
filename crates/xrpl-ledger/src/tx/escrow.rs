@@ -100,6 +100,21 @@ impl EscrowCreateTransactor {
         let v = keylet::amount_mant_exp(amt)?;
         (v.0 != 0).then_some((leg, v))
     }
+
+    /// The escrowed Amount as an MPT `(issuance id, value)`.
+    ///
+    /// Finding 332 (devnet 5418986 161CF6C1 / 5419010 C892D928): TokenEscrow
+    /// covers MPTs too — `escrowCreatePreflightHelper<MPTIssue>` — and we
+    /// answered temBAD_AMOUNT because the amount is neither drops nor an
+    /// issued currency. The value is locked ON the holder's MPToken
+    /// (MPTAmount −, LockedAmount +) and mirrored on the issuance.
+    fn mpt_amount(tx: &TxFields) -> Option<([u8; 24], u64)> {
+        let amt = tx.fields.get("Amount")?;
+        if !amt.is_object() || amt.get("mpt_issuance_id").is_none() {
+            return None;
+        }
+        crate::tx::mpt::parse_mpt_amount(amt)
+    }
 }
 
 impl Transactor for EscrowCreateTransactor {
@@ -112,8 +127,15 @@ impl Transactor for EscrowCreateTransactor {
             return TxResult::BadFee;
         }
 
-        // Amount is XRP drops, or — under token escrow — an issued currency.
-        if Self::iou_amount(tx).is_none() {
+        // Amount is XRP drops, or — under token escrow — an issued currency
+        // or an MPT (finding 332: zero or past kMaxMpTokenAmount is
+        // temBAD_AMOUNT, Escrow.cpp:114-116).
+        if let Some(amt) = tx.fields.get("Amount").filter(|a| a.get("mpt_issuance_id").is_some()) {
+            match crate::tx::mpt::parse_mpt_amount(amt) {
+                Some((_, v)) if v > 0 && v <= crate::tx::mpt::MAX_MPT_AMOUNT => {}
+                _ => return TxResult::BadAmount,
+            }
+        } else if Self::iou_amount(tx).is_none() {
             let amount = match Self::amount_drops(tx) {
                 Some(a) => a,
                 None => return TxResult::BadAmount,
@@ -279,6 +301,50 @@ impl Transactor for EscrowCreateTransactor {
             }
         }
 
+        // Finding 332: `escrowCreatePreclaimHelper<MPTIssue>` (Escrow.cpp:
+        // 284-364), in rippled's order. The issuer of an MPT is embedded in
+        // its id (bytes 4..24), which is what `amount.getIssuer()` reads.
+        if let Some((mptid, want)) = Self::mpt_amount(tx) {
+            use crate::tx::mpt as mp;
+            let id_issuer: [u8; 20] = mptid[4..24].try_into().expect("24-byte id");
+            if id_issuer == tx.account {
+                return TxResult::NoPermission;
+            }
+            let ikey = keylet::mpt_issuance_key(&mptid);
+            let Some(issuance) = mp::json_at(sandbox, &ikey) else {
+                return TxResult::ObjectNotFound;
+            };
+            let iflags = issuance["Flags"].as_u64().unwrap_or(0);
+            if iflags & mp::LSF_MPT_CAN_ESCROW == 0 {
+                return TxResult::NoPermission;
+            }
+            if mp::issuance_issuer(&issuance) != Some(id_issuer) {
+                return TxResult::NoPermission;
+            }
+            let tkey = keylet::mptoken_key(&ikey, &tx.account);
+            let Some(token) = mp::json_at(sandbox, &tkey) else {
+                return TxResult::ObjectNotFound;
+            };
+            for who in [&tx.account, &dest_id] {
+                if let Some(t) = mp::require_auth_weak(sandbox, &ikey, &issuance, who) {
+                    return t;
+                }
+            }
+            for who in [&tx.account, &dest_id] {
+                if mp::any_frozen(sandbox, &ikey, &issuance, &[who]) {
+                    return TxResult::Locked;
+                }
+            }
+            if !mp::can_transfer(&issuance, &tx.account, &dest_id) {
+                return TxResult::NoAuth;
+            }
+            // accountHolds(IGNORE_FREEZE, IGNORE_AUTH) = the token's MPTAmount.
+            let spendable = mp::dec_field(&token, "MPTAmount");
+            if spendable == 0 || spendable < want {
+                return TxResult::InsufficientFunds;
+            }
+        }
+
         // doApply's FIRST act (EscrowCreate.cpp:422-428): a CancelAfter or
         // FinishAfter already at-or-before the parent close time is
         // tecNO_PERMISSION — `after(closeTime, mark)` is strictly `>`
@@ -315,7 +381,7 @@ impl Transactor for EscrowCreateTransactor {
         if post_fee < reserve {
             return TxResult::InsufficientReserve;
         }
-        if Self::iou_amount(tx).is_some() {
+        if Self::iou_amount(tx).is_some() || Self::mpt_amount(tx).is_some() {
             if needs_tag {
                 return TxResult::DstTagNeeded;
             }
@@ -336,10 +402,11 @@ impl Transactor for EscrowCreateTransactor {
     /// val-072: Apply — deduct amount, create Escrow object, increment OwnerCount.
     fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
         let iou = Self::iou_amount(tx);
-        let amount = match (&iou, Self::amount_drops(tx)) {
-            (Some(_), _) => 0, // token escrow moves no XRP
-            (None, Some(a)) => a,
-            (None, None) => return TxResult::BadAmount,
+        let mpt = Self::mpt_amount(tx);
+        let amount = match (&iou, &mpt, Self::amount_drops(tx)) {
+            (Some(_), _, _) | (_, Some(_), _) => 0, // token escrow moves no XRP
+            (None, None, Some(a)) => a,
+            (None, None, None) => return TxResult::BadAmount,
         };
         let dest_id = match Self::destination(tx) {
             Some(d) => d,
@@ -358,7 +425,7 @@ impl Transactor for EscrowCreateTransactor {
         };
 
         let sender_balance = balance_of(&sender);
-        if iou.is_none() {
+        if iou.is_none() && mpt.is_none() {
             if sender_balance < amount {
                 return TxResult::UnfundedPayment;
             }
@@ -385,9 +452,10 @@ impl Transactor for EscrowCreateTransactor {
             "Account": hex::encode(tx.account),
             "Sequence": seq_value,
             "Destination": hex::encode(dest_id),
-            "Amount": match &iou {
-                Some(_) => tx.fields["Amount"].clone(),
-                None => serde_json::Value::String(amount.to_string()),
+            "Amount": if iou.is_some() || mpt.is_some() {
+                tx.fields["Amount"].clone()
+            } else {
+                serde_json::Value::String(amount.to_string())
             },
         });
 
@@ -437,6 +505,25 @@ impl Transactor for EscrowCreateTransactor {
             // 92500000 STSH to 88750000 — exactly the escrowed 3750000.
             crate::tx::offer::line_adjust(sandbox, &tx.account, &leg, want, false);
         }
+        if let Some((mptid, want)) = mpt {
+            // Finding 332: the MPT rate snapshot is the issuance's TransferFee
+            // (View.cpp:851), stored when not parity; no IssuerNode — "the
+            // locked balance is already stored directly in the
+            // MPTokenIssuance object" (Escrow.cpp:580-583); then
+            // `rippleLockEscrowMPT`.
+            use crate::tx::mpt as mp;
+            let ikey = keylet::mpt_issuance_key(&mptid);
+            if let Some(issuance) = mp::json_at(sandbox, &ikey) {
+                let rate = mp::issuance_transfer_rate(&issuance);
+                if rate != 1_000_000_000 {
+                    escrow["TransferRate"] = serde_json::Value::from(rate);
+                }
+            }
+            let r = mp::lock_escrow(sandbox, &ikey, &tx.account, want);
+            if r != TxResult::Success {
+                return r;
+            }
+        }
         sandbox.write(escrow_key, serde_json::to_vec(&escrow).expect("serializing valid JSON Value"));
 
         TxResult::Success
@@ -476,6 +563,81 @@ fn escrow_iou(escrow: &serde_json::Value) -> Option<(crate::tx::offer::Leg, (u12
 /// A real token escrow carries all three hints, e.g. #106179351's
 /// `E7CFE233788C`: `OwnerNode "7"`, `DestinationNode "0"`, `IssuerNode "92"`.
 /// Neither Finish nor Cancel removed ANY directory entry before this.
+/// The escrowed Amount off the ESCROW OBJECT as an MPT `(issuance id, value)`.
+fn escrow_mpt(escrow: &serde_json::Value) -> Option<([u8; 24], u64)> {
+    let amt = escrow.get("Amount")?;
+    if !amt.is_object() || amt.get("mpt_issuance_id").is_none() {
+        return None;
+    }
+    crate::tx::mpt::parse_mpt_amount(amt)
+}
+
+/// `divideRound(amount, rate, asset, roundUp=true)` for an integral (MPT)
+/// asset: amount / (rate / 1e9), rounded away from zero (STAmount.cpp
+/// divRoundImpl, canonicalizeRound on an integral result).
+fn mpt_divide_round_up(amount: u64, rate: u64) -> u64 {
+    if rate == 1_000_000_000 {
+        return amount;
+    }
+    ((amount as u128 * 1_000_000_000u128).div_ceil(rate as u128)) as u64
+}
+
+/// Finding 332 — `escrowUnlockApplyHelper<MPTIssue>` (Escrow.cpp:955-1017),
+/// the part that DECIDES before anything is written: the receiver's MPToken
+/// is created when the destination finishes its own escrow (reserve at
+/// OwnerCount + 1 on the prior balance, `createMPToken`, OwnerCount + 1 on
+/// `dest`), a still-missing token is tecNO_PERMISSION, and the net is the
+/// gross less the transfer fee at the LESSER of the snapshot and the
+/// issuance's rate — issuer endpoints pay none. Returns
+/// `(issuance key, net, gross)`; the caller runs `unlock_escrow`.
+fn mpt_unlock_plan(
+    sandbox: &mut Sandbox,
+    escrow: &serde_json::Value,
+    mptid: [u8; 24],
+    want: u64,
+    owner_id: &[u8; 20],
+    dest_id: &[u8; 20],
+    dest: &mut serde_json::Value,
+    create_asset: bool,
+    prior_balance: u64,
+    locked_rate: u64,
+) -> Result<(xrpl_core::types::Hash256, u64, u64), TxResult> {
+    use crate::tx::mpt as mp;
+    let ikey = keylet::mpt_issuance_key(&mptid);
+    let Some(issuance) = mp::json_at(sandbox, &ikey) else {
+        return Err(TxResult::ObjectNotFound);
+    };
+    let Some(issuer) = mp::issuance_issuer(&issuance) else {
+        return Err(TxResult::Malformed);
+    };
+    let dest_is_issuer = *dest_id == issuer;
+    let owner_is_issuer = *owner_id == issuer;
+    let tkey = keylet::mptoken_key(&ikey, dest_id);
+    if !sandbox.exists(&tkey) && create_asset && !dest_is_issuer {
+        let oc = dest["OwnerCount"].as_u64().unwrap_or(0);
+        if prior_balance < crate::ledger::fees::account_reserve(sandbox, oc + 1) {
+            return Err(TxResult::InsufficientReserve);
+        }
+        mp::create_mptoken(sandbox, &ikey, &mptid, dest_id);
+        dest["OwnerCount"] = serde_json::Value::Number((oc + 1).into());
+    }
+    if !sandbox.exists(&tkey) && !dest_is_issuer {
+        return Err(TxResult::NoPermission);
+    }
+    let _ = escrow;
+    let mut locked = locked_rate;
+    let now = mp::issuance_transfer_rate(&issuance);
+    if now < locked {
+        locked = now;
+    }
+    let net = if !owner_is_issuer && !dest_is_issuer && locked != 1_000_000_000 {
+        mpt_divide_round_up(want, locked)
+    } else {
+        want
+    };
+    Ok((ikey, net, want))
+}
+
 fn escrow_dir_teardown(
     sandbox: &mut Sandbox,
     escrow: &serde_json::Value,
@@ -554,6 +716,29 @@ impl Transactor for EscrowFinishTransactor {
         if !sandbox.exists(&esc_key) {
             // rippled Escrow: a missing escrow is tecNO_TARGET, not tecNO_ENTRY
             return TxResult::NoTarget;
+        }
+
+        // Finding 332: `escrowFinishPreclaimHelper<MPTIssue>` (Escrow.cpp:
+        // 741-772) — the destination, unless it is the issuer, must pass the
+        // issuance's weak auth and not be frozen.
+        if let Some(escrow) = crate::tx::offer::json_at(sandbox, &esc_key) {
+            if let Some((mptid, _)) = escrow_mpt(&escrow) {
+                use crate::tx::mpt as mp;
+                let id_issuer: [u8; 20] = mptid[4..24].try_into().expect("24-byte id");
+                let dest_id = escrow.get("Destination").and_then(parse_account_id).unwrap_or(owner_id);
+                if dest_id != id_issuer {
+                    let ikey = keylet::mpt_issuance_key(&mptid);
+                    let Some(issuance) = mp::json_at(sandbox, &ikey) else {
+                        return TxResult::ObjectNotFound;
+                    };
+                    if let Some(t) = mp::require_auth_weak(sandbox, &ikey, &issuance, &dest_id) {
+                        return t;
+                    }
+                    if mp::any_frozen(sandbox, &ikey, &issuance, &[&dest_id]) {
+                        return TxResult::Locked;
+                    }
+                }
+            }
         }
 
         TxResult::Success
@@ -719,6 +904,25 @@ impl Transactor for EscrowFinishTransactor {
             }
         };
 
+        // Finding 332: the MPT unlock is decided here (token creation, reserve,
+        // rate) and applied after the destination root is written.
+        let mpt_unlock = match escrow_mpt(&escrow) {
+            None => None,
+            Some((mptid, want)) => {
+                let locked_rate = escrow.get("TransferRate").and_then(|v| v.as_u64()).unwrap_or(1_000_000_000);
+                // mPriorBalance is the FINISHER's pre-fee balance; the token is
+                // created only when the finisher IS the destination.
+                let prior = balance_of(&dest).saturating_add(tx.fee);
+                match mpt_unlock_plan(
+                    sandbox, &escrow, mptid, want, &owner_id, &dest_id, &mut dest,
+                    dest_id == tx.account, prior, locked_rate,
+                ) {
+                    Ok(plan) => Some(plan),
+                    Err(t) => return t,
+                }
+            }
+        };
+
         let dest_balance = balance_of(&dest);
         let new_dest_balance = match dest_balance.checked_add(amount) {
             Some(b) => b,
@@ -726,6 +930,12 @@ impl Transactor for EscrowFinishTransactor {
         };
         dest["Balance"] = serde_json::Value::String(new_dest_balance.to_string());
         sandbox.write(dest_key, serde_json::to_vec(&dest).expect("serializing valid JSON Value"));
+        if let Some((ikey, net, gross)) = mpt_unlock {
+            let r = crate::tx::mpt::unlock_escrow(sandbox, &ikey, &owner_id, &dest_id, net, gross);
+            if r != TxResult::Success {
+                return r;
+            }
+        }
 
         // A TOKEN escrow RELEASES the issued currency to the destination. Same
         // hole Cancel had: `Amount` is an object, so the XRP credit above adds
@@ -815,6 +1025,21 @@ impl Transactor for EscrowCancelTransactor {
             return TxResult::NoTarget;
         }
 
+        // Finding 332: `escrowCancelPreclaimHelper<MPTIssue>` (Escrow.cpp:
+        // 1270-1296) — the owner must pass the issuance's weak auth.
+        if let Some(escrow) = crate::tx::offer::json_at(sandbox, &esc_key) {
+            if let Some((mptid, _)) = escrow_mpt(&escrow) {
+                use crate::tx::mpt as mp;
+                let ikey = keylet::mpt_issuance_key(&mptid);
+                let Some(issuance) = mp::json_at(sandbox, &ikey) else {
+                    return TxResult::ObjectNotFound;
+                };
+                if let Some(t) = mp::require_auth_weak(sandbox, &ikey, &issuance, &owner_id) {
+                    return t;
+                }
+            }
+        }
+
         TxResult::Success
     }
 
@@ -890,6 +1115,25 @@ impl Transactor for EscrowCancelTransactor {
         // this shape. We returned nothing and unlinked nothing.
         if let Some((leg, want)) = escrow_iou(&escrow) {
             crate::tx::offer::line_adjust(sandbox, &owner_id, &leg, want, true);
+        }
+        // Finding 332: an MPT escrow unlocks back onto the owner's own token
+        // at parity — sender and receiver are the same (Escrow.cpp:1407-1424).
+        if let Some((mptid, want)) = escrow_mpt(&escrow) {
+            let mut owner_json = crate::tx::offer::json_at(sandbox, &owner_key).unwrap_or_default();
+            let prior = balance_of(&owner_json).saturating_add(tx.fee);
+            match mpt_unlock_plan(
+                sandbox, &escrow, mptid, want, &owner_id, &owner_id, &mut owner_json,
+                owner_id == tx.account, prior, 1_000_000_000,
+            ) {
+                Ok((ikey, net, gross)) => {
+                    sandbox.write(owner_key, serde_json::to_vec(&owner_json).expect("serializing valid JSON Value"));
+                    let r = crate::tx::mpt::unlock_escrow(sandbox, &ikey, &owner_id, &owner_id, net, gross);
+                    if r != TxResult::Success {
+                        return r;
+                    }
+                }
+                Err(t) => return t,
+            }
         }
 
         // --- Delete the Escrow object and unlink it everywhere ---
@@ -1316,6 +1560,158 @@ mod tests {
 
         apply_modifications(&mut state, mods).unwrap();
         assert_eq!(read_balance_from_state(&state, &bob), 75_000_000);
+    }
+
+    /// Finding 332 fixtures: an issuance (CanEscrow|CanTransfer, TransferFee
+    /// as given) held 500 by `holder`; `dest` holds an empty token.
+    fn mpt_fixture(state: &mut LedgerState, issuer: &[u8; 20], holder: &[u8; 20], dest: &[u8; 20], fee: Option<u64>) -> [u8; 24] {
+        let mut id = [0u8; 24];
+        id[..4].copy_from_slice(&7u32.to_be_bytes());
+        id[4..].copy_from_slice(issuer);
+        let ikey = keylet::mpt_issuance_key(&id);
+        let mut iss = serde_json::json!({
+            "LedgerEntryType": "MPTokenIssuance",
+            "Issuer": hex::encode(issuer),
+            "Flags": crate::tx::mpt::LSF_MPT_CAN_ESCROW | crate::tx::mpt::LSF_MPT_CAN_TRANSFER,
+            "Sequence": 7,
+            "OutstandingAmount": "500",
+            "OwnerNode": "0",
+        });
+        if let Some(f) = fee {
+            iss["TransferFee"] = serde_json::Value::from(f);
+        }
+        state.state_map.insert(ikey, serde_json::to_vec(&iss).unwrap()).unwrap();
+        for (who, bal) in [(holder, Some("500")), (dest, None)] {
+            let mut t = serde_json::json!({
+                "LedgerEntryType": "MPToken",
+                "Account": hex::encode(who),
+                "MPTokenIssuanceID": hex::encode_upper(id),
+                "Flags": 0,
+                "OwnerNode": "0",
+            });
+            if let Some(b) = bal {
+                t["MPTAmount"] = serde_json::Value::String(b.into());
+            }
+            state.state_map.insert(keylet::mptoken_key(&ikey, who), serde_json::to_vec(&t).unwrap()).unwrap();
+        }
+        id
+    }
+
+    fn mpt_json(sandbox: &Sandbox, key: &Hash256) -> serde_json::Value {
+        serde_json::from_slice(&sandbox.read(key).expect("object")).unwrap()
+    }
+
+    fn run_tx<'a>(state: &'a LedgerState, t: &dyn Transactor, tx: &TxFields) -> (TxResult, Sandbox<'a>) {
+        let mut sb = Sandbox::new(state);
+        let r = t.preflight(tx);
+        if r != TxResult::Success {
+            return (r, sb);
+        }
+        let r = t.preclaim(tx, &sb);
+        if r != TxResult::Success {
+            return (r, sb);
+        }
+        assert_eq!(apply_common(tx, &mut sb), TxResult::Success);
+        (t.do_apply(tx, &mut sb), sb)
+    }
+
+    /// Finding 332: create locks the holder's token and the issuance; cancel
+    /// by the owner puts it all back — LockedAmount absent again at zero.
+    #[test]
+    fn an_mpt_escrow_locks_on_create_and_unlocks_on_cancel() {
+        let issuer = [0x0Au8; 20];
+        let holder = [0x0Bu8; 20];
+        let dest = [0x0Cu8; 20];
+        let mut state = make_state();
+        add_account(&mut state, &issuer, 100_000_000, 5);
+        add_account(&mut state, &holder, 100_000_000, 3);
+        add_account(&mut state, &dest, 100_000_000, 9);
+        let id = mpt_fixture(&mut state, &issuer, &holder, &dest, None);
+        let ikey = keylet::mpt_issuance_key(&id);
+        let hkey = keylet::mptoken_key(&ikey, &holder);
+        let create = TxFields {
+            account: holder, tx_type: "EscrowCreate".into(), fee: 12, sequence: 3, last_ledger_seq: None, ticket_seq: None,
+            fields: serde_json::json!({
+                "Amount": {"mpt_issuance_id": hex::encode_upper(id), "value": "100"},
+                "Destination": hex::encode(dest), "FinishAfter": 15, "CancelAfter": 20,
+            }),
+            inner_batch: false,
+        };
+        let (r, sb) = run_tx(&state, &EscrowCreateTransactor, &create);
+        assert_eq!(r, TxResult::Success);
+        let tok = mpt_json(&sb, &hkey);
+        assert_eq!(tok["MPTAmount"], "400");
+        assert_eq!(tok["LockedAmount"], "100");
+        let iss = mpt_json(&sb, &ikey);
+        assert_eq!(iss["LockedAmount"], "100");
+        assert_eq!(iss["OutstandingAmount"], "500");
+        let esc = mpt_json(&sb, &keylet::escrow_key(&holder, 3));
+        assert!(esc.get("IssuerNode").is_none(), "MPT escrows carry no IssuerNode");
+        assert!(esc.get("TransferRate").is_none(), "parity rate is not snapshotted");
+        let mods = sb.into_modifications();
+        apply_modifications(&mut state, mods).unwrap();
+
+        let cancel = TxFields {
+            account: holder, tx_type: "EscrowCancel".into(), fee: 12, sequence: 4, last_ledger_seq: None, ticket_seq: None,
+            fields: serde_json::json!({"Owner": hex::encode(holder), "OfferSequence": 3}),
+            inner_batch: false,
+        };
+        let (r, sb) = run_tx(&state, &EscrowCancelTransactor, &cancel);
+        assert_eq!(r, TxResult::Success);
+        let tok = mpt_json(&sb, &hkey);
+        assert_eq!(tok["MPTAmount"], "500");
+        assert!(tok.get("LockedAmount").is_none());
+        let iss = mpt_json(&sb, &ikey);
+        assert!(iss.get("LockedAmount").is_none());
+        assert_eq!(iss["OutstandingAmount"], "500");
+        assert!(!sb.exists(&keylet::escrow_key(&holder, 3)));
+    }
+
+    /// Finding 332: with a 10% TransferFee the create snapshots the rate
+    /// (1.1e9) and the finish delivers divideRound(100, 1.1, up) = 91, the
+    /// 9-unit fee leaving OutstandingAmount; the holder's lock drops by the
+    /// gross 100.
+    #[test]
+    fn an_mpt_escrow_finish_takes_the_transfer_fee_off_the_outstanding_amount() {
+        let issuer = [0x0Au8; 20];
+        let holder = [0x0Bu8; 20];
+        let dest = [0x0Cu8; 20];
+        let mut state = make_state();
+        add_account(&mut state, &issuer, 100_000_000, 5);
+        add_account(&mut state, &holder, 100_000_000, 3);
+        add_account(&mut state, &dest, 100_000_000, 9);
+        let id = mpt_fixture(&mut state, &issuer, &holder, &dest, Some(10_000));
+        let ikey = keylet::mpt_issuance_key(&id);
+        let create = TxFields {
+            account: holder, tx_type: "EscrowCreate".into(), fee: 12, sequence: 3, last_ledger_seq: None, ticket_seq: None,
+            fields: serde_json::json!({
+                "Amount": {"mpt_issuance_id": hex::encode_upper(id), "value": "100"},
+                "Destination": hex::encode(dest), "FinishAfter": 15,
+            }),
+            inner_batch: false,
+        };
+        let (r, sb) = run_tx(&state, &EscrowCreateTransactor, &create);
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(mpt_json(&sb, &keylet::escrow_key(&holder, 3))["TransferRate"], 1_100_000_000u64);
+        let mods = sb.into_modifications();
+        apply_modifications(&mut state, mods).unwrap();
+
+        state.header.close_time = 20; // past FinishAfter
+        let finish = TxFields {
+            account: dest, tx_type: "EscrowFinish".into(), fee: 12, sequence: 9, last_ledger_seq: None, ticket_seq: None,
+            fields: serde_json::json!({"Owner": hex::encode(holder), "OfferSequence": 3}),
+            inner_batch: false,
+        };
+        let (r, sb) = run_tx(&state, &EscrowFinishTransactor, &finish);
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(mpt_json(&sb, &keylet::mptoken_key(&ikey, &dest))["MPTAmount"], "91");
+        let htok = mpt_json(&sb, &keylet::mptoken_key(&ikey, &holder));
+        assert_eq!(htok["MPTAmount"], "400");
+        assert!(htok.get("LockedAmount").is_none());
+        let iss = mpt_json(&sb, &ikey);
+        assert!(iss.get("LockedAmount").is_none());
+        assert_eq!(iss["OutstandingAmount"], "491");
+        assert!(!sb.exists(&keylet::escrow_key(&holder, 3)));
     }
 
     #[test]

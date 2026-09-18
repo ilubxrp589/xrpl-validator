@@ -203,3 +203,20 @@ fn escrow_finish_delivers_net_of_the_locked_rate() {
 fn escrow_finish_by_destination_creates_the_token_line_106937018() {
     run_bundle(include_str!("vectors/escrow_finish_by_destination_creates_the_token_line_106937018.json"));
 }
+
+/// Finding 332 — devnet 5418986 161CF6C1: an EscrowCreate of 100 units of
+/// MPT 0052AF9C…. The holder's MPToken goes 500 → 400 with LockedAmount 100,
+/// the issuance gains LockedAmount 100 (OutstandingAmount untouched), the
+/// escrow carries the MPT amount and no IssuerNode. We said temBAD_AMOUNT.
+#[test]
+fn escrow_create_locks_an_mpt_on_the_holder_token() {
+    run_bundle(include_str!("vectors/escrow_create_locks_an_mpt_on_the_holder_token_devnet_5418986.json"));
+}
+
+/// Finding 332 — devnet 5419010 C892D928: the destination finishes that
+/// escrow. Its existing MPToken gains MPTAmount 100, the holder's and the
+/// issuance's LockedAmount fields go absent at zero, the escrow is deleted.
+#[test]
+fn escrow_finish_unlocks_an_mpt_to_the_destination_token() {
+    run_bundle(include_str!("vectors/escrow_finish_unlocks_an_mpt_to_the_destination_token_devnet_5419010.json"));
+}
