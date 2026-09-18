@@ -195,6 +195,19 @@ pub(crate) fn amm_ctx_reset() {
     // Finding 134: the remembered owner counts live only inside a flow.
     ox::owner_count_epoch_start();
 }
+
+/// Every thread-local of the pool walk, cleared (see `offer::thread_state_reset`).
+pub(crate) fn thread_state_reset() {
+    FWD_EXCESS.with(|c| c.set((0, 0)));
+    IN_LIMITED.with(|c| c.set(false));
+    REM_OUT_TRIMMED.with(|c| c.set(false));
+    FWD_GROSS_IN.with(|c| c.set(None));
+    FWD_FIRST.with(|c| c.set(false));
+    SENDER_HOP.with(|c| c.set(false));
+    FLOW_FUNDS_BOUND.with(|c| c.set(false));
+    POOL_OFFER_AT_TIP.with(|c| c.set(false));
+    amm_ctx_reset();
+}
 pub(crate) fn amm_ctx_iters() -> u32 {
     AMM_CTX.with(|c| c.get().0)
 }

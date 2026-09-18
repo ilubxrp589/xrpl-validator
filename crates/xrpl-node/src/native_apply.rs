@@ -70,6 +70,7 @@ pub fn build_txfields(txjson: &Value) -> Option<TxFields> {
 /// Native per-tx apply — identical branching to differential_probe's copy
 /// (which mirrors apply.rs::apply_transaction_set). Returns (ter, mods).
 pub fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<Hash256, SandboxEntry>) {
+    xrpl_ledger::tx::reset_thread_state();
     let transactor = match get_transactor(&tx.tx_type) {
         Some(t) => t,
         None => {

@@ -87,3 +87,10 @@ fn run_bundle(bundle_json: &str) {
 fn oracle_set_creates_the_object_with_flags_zero_107052956() {
     run_bundle(include_str!("vectors/oracle_set_creates_the_object_with_flags_zero_107052956.json"));
 }
+
+/// Finding 308 (#107074173 06F51E33BB43): a PermissionedDomain is filed
+/// with `Flags: 0` — five bytes we left out of the created object.
+#[test]
+fn permissioned_domain_set_files_flags_zero_107074173() {
+    run_bundle(include_str!("vectors/permissioned_domain_set_files_flags_zero_107074173.json"));
+}
