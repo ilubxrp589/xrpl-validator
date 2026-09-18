@@ -873,12 +873,33 @@ pub(crate) fn take_dead_reaped() -> Vec<Hash256> {
 /// carries nothing from one transaction into the next; these carry what the
 /// PREVIOUS application left — and a discarded application (a fuzz mutant,
 /// a dry-run) leaves the most. Called from the per-transaction entry.
+thread_local! {
+    /// Finding 336: the walk's GROSS in-fold — rippled's `sum(savedIns)`,
+    /// what the taker paid including the gateway's cut. A tfSell
+    /// FillOrKill is filled only when flow()'s `remainingIn` — the gross
+    /// sendMax (clamped to the balance) minus that fold — is EXACTLY zero
+    /// (StrandFlow.h:884-897); an ulp past it is tecPATH_PARTIAL, and
+    /// CreateOffer kills the offer with every fill rolled back.
+    /// #107078027 CFFAB9071559 and three siblings from rKjqjLdp in one
+    /// hour: rippled's total in 0.05301369003189998 against a sendMax of
+    /// 0.0530136900318999 (its whole line), we judged the NET budget spent
+    /// to zero and filled.
+    static SELL_IN_FOLD: std::cell::Cell<Option<Me>> = const { std::cell::Cell::new(None) };
+}
+fn sell_in_fold_set(f: Me) {
+    SELL_IN_FOLD.with(|c| c.set(Some(f)));
+}
+pub(crate) fn take_sell_in_fold() -> Option<Me> {
+    SELL_IN_FOLD.with(|c| c.take())
+}
+
 pub(crate) fn thread_state_reset() {
     ORIG_OWNER_COUNTS.with(|m| m.borrow_mut().clear());
     SOFT_STALE.with(|c| c.borrow_mut().clear());
     DEAD_REAPED.with(|c| c.borrow_mut().clear());
     PASSTHROUGH.with(|p| p.borrow_mut().clear());
     SELF_MAKER_CREDITS.with(|c| c.borrow_mut().clear());
+    SELL_IN_FOLD.with(|c| c.set(None));
 }
 /// The permanent reaps in `stale` — what `sbCancel` carries on a failure.
 fn hard_stale(stale: &[Hash256]) -> Vec<Hash256> {
@@ -4514,9 +4535,21 @@ thr={t:?} admits_trunc={} admits_up={}",
             }
             if used {
                 // The slice's GROSS joins the walk's spend (see gets_gross_cap).
+                // Finding 336: the slice that EXHAUSTS the round's in is
+                // settled at the round's gross cap verbatim (settle_slice's
+                // exhaust branch, finding 243) — so that is what rippled's
+                // savedIns holds for the iteration, not the re-grossed net.
+                // #106871187 7866B5998F0C: re-grossing 13.10356557426634 ×
+                // 1.002 lands …488, two ulps over the …486 remainder rippled
+                // debited, and the closing fold overshoots TakerGets by 2e-14
+                // — a FillOrKill sell mainnet fills, judged tecKILLED.
                 let slice_net = me_sub(rg_before, rg);
-                in_gross_spent = stamount_signed_add(false, in_gross_spent, false, gross_in(fee_rate, slice_net)).1;
-                saved_ins.push(gross_in(fee_rate, slice_net));
+                let slice_gross = match round_gross_cap {
+                    Some(cap) if me_is_zero(rg) => cap,
+                    _ => gross_in(fee_rate, slice_net),
+                };
+                in_gross_spent = stamount_signed_add(false, in_gross_spent, false, slice_gross).1;
+                saved_ins.push(slice_gross);
                 amm_iters += 1;
                 // The flow-wide AMMContext counts this iteration too (F107).
                 crate::tx::amm_swap::amm_ctx_walk_iteration();
@@ -6498,6 +6531,9 @@ had_fill={} n={} keys={:?}",
     // Finding 160: `divideRound(actualAmountIn, gatewayXferRate, asset,
     // true)` is STAmount `divRound` — the lossy ceiling — not `mulRatio`.
     if crossed > 0 {
+        if !gets_leg.xrp {
+            sell_in_fold_set(fold16_multiset(&saved_ins)); // finding 336
+        }
         if !gets_leg.xrp && !me_is_zero(rem_gets) {
             let spent = match fee_rate {
                 Some(r) => div_round16_up(in_gross_spent, (r as u128, -9)),
@@ -9220,8 +9256,9 @@ pub(crate) fn cross_engine_to_net(
         };
         let per_iteration = fold_rem && !in_fold_off && pay_in_rate.is_none() && !saved_level_ins.is_empty() && lists_agree;
         let gross = if per_iteration { level_fold } else { fill_fold };
+        sell_in_fold_set(gross); // finding 336
         if std::env::var("DX_PLACE").is_ok() {
-            eprintln!("DX_PLACE F274 per_iteration={per_iteration} n_iter={} n_fills={} fold={gross:?} entry_gets={entry_gets:?}", saved_level_ins.len(), saved_ins.len());
+            eprintln!("DX_PLACE F274 per_iteration={per_iteration} n_iter={} n_fills={} fold={gross:?} entry_gets={entry_gets:?} level_fold={level_fold:?} fill_fold={fill_fold:?} saved_level_ins={saved_level_ins:?} saved_ins={saved_ins:?}", saved_level_ins.len(), saved_ins.len());
         }
         let spent = match pay_in_rate {
             Some(r) => div_round16_up(gross, (r as u128, -9)),
@@ -9793,7 +9830,24 @@ impl Transactor for OfferCreateTransactor {
         // reverted: it let those three plain-FoK offers succeed, and the
         // liquidity they wrongly consumed then starved this very transaction,
         // which is why the target stayed tecKILLED and the fix looked inert.
-        let filled = if sell { me_is_zero(rem_gets_cross) } else { me_is_zero(rem_pays) };
+        // Finding 336: a sell whose in-fold overshot the entry is NOT filled —
+        // rippled's remainingIn is a negative ulp, and only exact zero passes.
+        // Finding 336: a sell is filled when rippled's remainingIn — the gross
+        // sendMax, clamped to the balance, minus the iterations' gross in-fold
+        // — is EXACTLY zero; an ulp past the budget is tecPATH_PARTIAL.
+        let filled = if sell {
+            let budget = if underfunded { avail } else { send_max };
+            let fold = take_sell_in_fold();
+            if std::env::var("DX_FOK").is_ok() {
+                eprintln!("DX_FOK F336 fold={fold:?} budget={budget:?} underfunded={underfunded} avail={avail:?} send_max={send_max:?} rem_gets_cross={rem_gets_cross:?}");
+            }
+            match fold {
+                Some(fold) => me_cmp(fold, budget).is_eq(),
+                None => me_is_zero(rem_gets_cross),
+            }
+        } else {
+            me_is_zero(rem_pays)
+        };
         if fok && !filled {
             // FillOrKill not fully filled: nothing survives but the fee and
             // the stale-offer cleanup.

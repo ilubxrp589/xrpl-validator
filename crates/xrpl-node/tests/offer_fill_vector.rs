@@ -1553,3 +1553,35 @@ fn nft_accept_broker_fee_needs_both_offers_sell_dropped_fuzz_107075103() {
 fn offer_hybrid_domain_offer_rests_in_both_books_devnet_5419038() {
     run_bundle(include_str!("vectors/offer_hybrid_domain_offer_rests_in_both_books_devnet_5419038.json"));
 }
+
+/// Finding 336 — a tfSell FillOrKill whose per-iteration in-fold lands an
+/// ulp past sendMax: flow()'s remainingIn is negative, not zero, and the
+/// offer is killed with its fills rolled back (soak #18, rKjqjLdp).
+#[test]
+fn offer_sell_fill_or_kill_whose_in_fold_overshoots_is_killed_107078027() {
+    run_bundle(include_str!("vectors/offer_sell_fill_or_kill_whose_in_fold_overshoots_is_killed_107078027.json"));
+}
+
+/// Finding 336 — a tfSell FillOrKill whose per-iteration in-fold lands an
+/// ulp past sendMax: flow()'s remainingIn is negative, not zero, and the
+/// offer is killed with its fills rolled back (soak #18, rKjqjLdp).
+#[test]
+fn offer_sell_fill_or_kill_whose_in_fold_overshoots_is_killed_107078041() {
+    run_bundle(include_str!("vectors/offer_sell_fill_or_kill_whose_in_fold_overshoots_is_killed_107078041.json"));
+}
+
+/// Finding 336 — a tfSell FillOrKill whose per-iteration in-fold lands an
+/// ulp past sendMax: flow()'s remainingIn is negative, not zero, and the
+/// offer is killed with its fills rolled back (soak #18, rKjqjLdp).
+#[test]
+fn offer_sell_fill_or_kill_whose_in_fold_overshoots_is_killed_107078052() {
+    run_bundle(include_str!("vectors/offer_sell_fill_or_kill_whose_in_fold_overshoots_is_killed_107078052.json"));
+}
+
+/// Finding 336 — a tfSell FillOrKill whose per-iteration in-fold lands an
+/// ulp past sendMax: flow()'s remainingIn is negative, not zero, and the
+/// offer is killed with its fills rolled back (soak #18, rKjqjLdp).
+#[test]
+fn offer_sell_fill_or_kill_whose_in_fold_overshoots_is_killed_107078068() {
+    run_bundle(include_str!("vectors/offer_sell_fill_or_kill_whose_in_fold_overshoots_is_killed_107078068.json"));
+}
