@@ -295,6 +295,16 @@ impl FuzzCtx {
                     expect.entry(kh).or_insert(Value::String(hex::encode_upper(&b)));
                 }
             }
+            // Our leg's bytes for every key the legs disagree on, so the
+            // drill can diff them against the pre-image without re-running
+            // the fuzz state (a set difference need not reproduce from the
+            // bundle's pre alone — our route may have touched objects
+            // libxrpl never read).
+            let ours_hex: serde_json::Map<String, Value> = our_map
+                .iter()
+                .filter(|(k, (kind, b))| ffi_map.get(*k).map(|(fk, fb)| (fk, fb)) != Some((kind, b)))
+                .map(|(k, (kind, b))| (hex::encode_upper(k), json!({"kind": kind, "hex": hex::encode_upper(b)})))
+                .collect();
             let bundle = json!({
                 "seq": self.seq,
                 "parent_hash": hex::encode_upper(self.parent_hash),
@@ -306,7 +316,7 @@ impl FuzzCtx {
                 "expect": expect,
                 "fuzz": {"base_hash": base_hash, "index": idx, "mutant": n, "label": label, "seed": self.seed,
                           "class": class, "our_ter": our_ter, "libxrpl_ter": outcome.ter_name,
-                          "libxrpl_fatal": outcome.last_fatal}
+                          "libxrpl_fatal": outcome.last_fatal, "ours": ours_hex}
             });
             let safe = label.replace([':', '+', '-'], "_");
             let path = self.out_dir.join(format!("fuzz_{}_{idx:03}_{n}_{safe}.json", self.seq));
