@@ -325,6 +325,57 @@ impl Transactor for SignerListSetTransactor {
 // ---------------------------------------------------------------------------
 
 /// DepositPreauth transactor — authorize or deauthorize a sender for preauthorized deposits.
+
+/// `credentials::checkArray` + `credentials::makeSorted` (CredentialHelpers.cpp):
+/// 1..=max entries, a non-zero Issuer, a CredentialType of 1..=64 bytes, no
+/// duplicate (issuer, type) — then the pairs sorted as rippled's std::set
+/// orders them (issuer bytes, then type bytes). Finding 319.
+pub(crate) fn credentials_checked_sorted(
+    arr: &serde_json::Value,
+    max: usize,
+) -> Result<Vec<([u8; 20], Vec<u8>)>, TxResult> {
+    let Some(items) = arr.as_array() else { return Err(TxResult::Malformed) };
+    if items.is_empty() {
+        return Err(TxResult::ArrayEmpty);
+    }
+    if items.len() > max {
+        return Err(TxResult::TemArrayTooLarge);
+    }
+    let mut out: Vec<([u8; 20], Vec<u8>)> = Vec::with_capacity(items.len());
+    for c in items {
+        let inner = c.get("Credential").unwrap_or(c);
+        let Some(issuer) = inner.get("Issuer").and_then(|v| v.as_str()).and_then(crate::tx::offer::decode20) else {
+            return Err(TxResult::Malformed);
+        };
+        if issuer == [0u8; 20] {
+            return Err(TxResult::Malformed); // temINVALID_ACCOUNT_ID
+        }
+        let Some(ct) = inner.get("CredentialType").and_then(|v| v.as_str()).and_then(|h| hex::decode(h).ok()) else {
+            return Err(TxResult::Malformed);
+        };
+        if ct.is_empty() || ct.len() > 64 {
+            return Err(TxResult::Malformed);
+        }
+        if out.iter().any(|(i, t)| *i == issuer && *t == ct) {
+            return Err(TxResult::Malformed);
+        }
+        out.push((issuer, ct));
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// The `AuthorizeCredentials` array as rippled files it: sorted, each entry a
+/// `Credential` object with Issuer and CredentialType.
+fn credentials_array_json(sorted: &[([u8; 20], Vec<u8>)]) -> serde_json::Value {
+    serde_json::Value::Array(
+        sorted
+            .iter()
+            .map(|(i, t)| serde_json::json!({"Credential": {"Issuer": hex::encode(i), "CredentialType": hex::encode_upper(t)}}))
+            .collect(),
+    )
+}
+
 pub struct DepositPreauthTransactor;
 
 impl Transactor for DepositPreauthTransactor {
@@ -335,12 +386,22 @@ impl Transactor for DepositPreauthTransactor {
         if tx.fee_missing() {
             return TxResult::BadFee;
         }
-        // Must have exactly one of Authorize or Unauthorize
+        // Finding 319 (testnet 20864003 D962386A932B, 20864007 7D29BE82C2FE —
+        // the campaign's credential-keyed preauths, XLS-70): exactly one of
+        // Authorize, Unauthorize, AuthorizeCredentials, UnauthorizeCredentials
+        // (DepositPreauth.cpp:50-67); a credentials array passes checkArray.
         let has_auth = tx.fields.get("Authorize").is_some();
         let has_unauth = tx.fields.get("Unauthorize").is_some();
-        if has_auth == has_unauth {
-            // Both present or both absent
+        let cred_auth = tx.fields.get("AuthorizeCredentials");
+        let cred_unauth = tx.fields.get("UnauthorizeCredentials");
+        let n = has_auth as u8 + has_unauth as u8 + cred_auth.is_some() as u8 + cred_unauth.is_some() as u8;
+        if n != 1 {
             return TxResult::Malformed;
+        }
+        if let Some(arr) = cred_auth.or(cred_unauth) {
+            if let Err(e) = credentials_checked_sorted(arr, 8) {
+                return e;
+            }
         }
         // Bug 14: Cannot authorize yourself
         if let Some(auth_val) = tx.fields.get("Authorize") {
@@ -376,6 +437,29 @@ impl Transactor for DepositPreauthTransactor {
                 return TxResult::Malformed;
             };
             if !sandbox.exists(&keylet::deposit_preauth_key(&tx.account, &unauthorized)) {
+                return TxResult::NoEntry;
+            }
+        } else if let Some(arr) = tx.fields.get("AuthorizeCredentials") {
+            // Finding 319: every issuer must exist (tecNO_ISSUER); the entry
+            // must not (tecDUPLICATE) — DepositPreauth.cpp:130-147.
+            let sorted = match credentials_checked_sorted(arr, 8) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            for (issuer, _) in &sorted {
+                if !sandbox.exists(&keylet::account_root_key(issuer)) {
+                    return TxResult::NoIssuer;
+                }
+            }
+            if sandbox.exists(&keylet::deposit_preauth_credentials_key(&tx.account, &sorted)) {
+                return TxResult::Duplicate;
+            }
+        } else if let Some(arr) = tx.fields.get("UnauthorizeCredentials") {
+            let sorted = match credentials_checked_sorted(arr, 8) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            if !sandbox.exists(&keylet::deposit_preauth_credentials_key(&tx.account, &sorted)) {
                 return TxResult::NoEntry;
             }
         }
@@ -457,6 +541,50 @@ impl Transactor for DepositPreauthTransactor {
             // (:62), PaymentChannelHelpers (:31) and DIDDelete (:41) all keep
             // the root and so do we; SignerListSet (:208) drops it and so do
             // we.
+            crate::ledger::directory::owner_dir_remove(sandbox, &tx.account, &dp_key, hint, false);
+            sandbox.delete(dp_key);
+            crate::tx::offer::owner_count_add(sandbox, &tx.account, -1);
+        } else if let Some(arr) = tx.fields.get("AuthorizeCredentials") {
+            let sorted = match credentials_checked_sorted(arr, 8) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let dp_key = keylet::deposit_preauth_credentials_key(&tx.account, &sorted);
+            {
+                let (bal, oc) = match crate::tx::offer::json_at(sandbox, &keylet::account_root_key(&tx.account)) {
+                    Some(a) => (
+                        a["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+                        a["OwnerCount"].as_u64().unwrap_or(0),
+                    ),
+                    None => return TxResult::NoAccount,
+                };
+                if bal.saturating_add(tx.fee) < crate::ledger::fees::account_reserve(sandbox, oc + 1) {
+                    return TxResult::InsufficientReserve;
+                }
+            }
+            let mut dp_obj = serde_json::json!({
+                "LedgerEntryType": "DepositPreauth",
+                "Flags": 0,
+                "Account": hex::encode(tx.account),
+                "AuthorizeCredentials": credentials_array_json(&sorted),
+            });
+            let owner_node = crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &dp_key);
+            dp_obj["OwnerNode"] = serde_json::Value::String(format!("{owner_node:x}"));
+            sandbox.write(dp_key, serde_json::to_vec(&dp_obj).unwrap());
+            crate::tx::offer::owner_count_add(sandbox, &tx.account, 1);
+        } else if let Some(arr) = tx.fields.get("UnauthorizeCredentials") {
+            let sorted = match credentials_checked_sorted(arr, 8) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let dp_key = keylet::deposit_preauth_credentials_key(&tx.account, &sorted);
+            let Some(data) = sandbox.read(&dp_key) else {
+                return TxResult::NoEntry;
+            };
+            let hint = serde_json::from_slice::<serde_json::Value>(&data)
+                .ok()
+                .and_then(|o| o.get("OwnerNode").and_then(|v| v.as_str()).map(String::from))
+                .and_then(|s| u64::from_str_radix(&s, 16).ok());
             crate::ledger::directory::owner_dir_remove(sandbox, &tx.account, &dp_key, hint, false);
             sandbox.delete(dp_key);
             crate::tx::offer::owner_count_add(sandbox, &tx.account, -1);
