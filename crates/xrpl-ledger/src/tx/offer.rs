@@ -6487,8 +6487,27 @@ had_fill={} n={} keys={:?}",
             let (neg, v) = stamount_signed_add(false, entry_gets, true, spent);
             rem_gets = if neg { (0, 0) } else { v };
         }
+        // Finding 310 (fuzz #6 off 107009438, 24038BE2F358 with TakerGets
+        // doubled — r3rhWeE3 buying 27954.62 EUR with ETH over the book and
+        // an XRP bridge, 139 iterations): a buy's residual is `afterCross.out
+        // -= result.actualAmountOut`, and actualAmountOut is flow()'s
+        // `sum(savedOuts)` — the ITERATIONS' outs accumulated in the
+        // multiset's SORTED order (StrandFlow.h:642-647, 792-794), which
+        // finding 202 already keeps in `saved_outs`. The per-fill chain
+        // `out_sum` folds the same amounts in consumption order and lands
+        // 14311.68529682502 where rippled's fold is 14311.685296825: the
+        // resting offer two ulp off on both sides (the in is re-derived from
+        // the out). Sorted fold when every round recorded its out; the chain
+        // stays for a walk that filled without recording (the F278 lesson).
         if !pays_leg.xrp && !me_is_zero(rem_pays) {
-            let (neg, v) = stamount_signed_add(false, entry_pays, true, out_sum);
+            let lists_agree = !saved_outs.is_empty() && {
+                let fold = fold16_multiset(&saved_outs);
+                let (_, diff) = stamount_signed_add(false, fold, true, out_sum);
+                let tol = me_muldiv(out_sum, (1, 0), (100_000_000_000_000, 0), false); // 1e-14 relative
+                me_cmp(diff, tol).is_le()
+            };
+            let taken = if lists_agree { fold16_multiset(&saved_outs) } else { out_sum };
+            let (neg, v) = stamount_signed_add(false, entry_pays, true, taken);
             rem_pays = if neg { (0, 0) } else { v };
         }
     }

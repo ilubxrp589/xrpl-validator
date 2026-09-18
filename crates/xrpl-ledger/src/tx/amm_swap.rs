@@ -206,6 +206,7 @@ pub(crate) fn thread_state_reset() {
     SENDER_HOP.with(|c| c.set(false));
     FLOW_FUNDS_BOUND.with(|c| c.set(false));
     POOL_OFFER_AT_TIP.with(|c| c.set(false));
+    AMM_USE_SEQ.with(|c| c.set(0));
     amm_ctx_reset();
 }
 pub(crate) fn amm_ctx_iters() -> u32 {
@@ -234,6 +235,17 @@ pub(crate) fn amm_ctx_mark_used() {
         let (i, _, o) = c.get();
         c.set((i, true, o));
     });
+    AMM_USE_SEQ.with(|c| c.set(c.get().wrapping_add(1)));
+}
+
+thread_local! {
+    /// Counts every pool consumption on this thread. The `used` flag above
+    /// is strand-wide; a hop that needs to know whether ITS OWN walk took
+    /// the pool compares this before and after (finding 311).
+    static AMM_USE_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+pub(crate) fn amm_use_seq() -> u64 {
+    AMM_USE_SEQ.with(|c| c.get())
 }
 /// `ammContext.update()` — once per winning driver iteration.
 pub(crate) fn amm_ctx_update() {
