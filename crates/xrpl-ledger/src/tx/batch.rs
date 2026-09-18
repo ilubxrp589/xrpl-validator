@@ -69,6 +69,14 @@ thread_local! {
 /// a batch that fails preflight/preclaim (and so never reaches `do_apply`)
 /// never exposes a previous batch's results, and a second call here (with no
 /// intervening `do_apply`) drains an empty `Vec`.
+/// Both inner-collection thread-locals, cleared (see `offer::thread_state_reset`).
+/// Only the OUTER per-transaction entry may call this: inners run nested
+/// inside the Batch's own `do_apply` and fill these for it.
+pub(crate) fn thread_state_reset() {
+    INNER_RESULTS.with(|r| r.borrow_mut().clear());
+    INNER_TOUCHED.with(|t| t.borrow_mut().clear());
+}
+
 pub fn take_inner_results() -> Vec<String> {
     INNER_RESULTS.with(|r| std::mem::take(&mut *r.borrow_mut()))
 }

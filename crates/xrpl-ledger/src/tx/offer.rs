@@ -868,6 +868,18 @@ pub(crate) fn dead_reaped_clear() {
 pub(crate) fn take_dead_reaped() -> Vec<Hash256> {
     DEAD_REAPED.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
+
+/// Every thread-local the offer walk keeps between calls, cleared. rippled
+/// carries nothing from one transaction into the next; these carry what the
+/// PREVIOUS application left — and a discarded application (a fuzz mutant,
+/// a dry-run) leaves the most. Called from the per-transaction entry.
+pub(crate) fn thread_state_reset() {
+    ORIG_OWNER_COUNTS.with(|m| m.borrow_mut().clear());
+    SOFT_STALE.with(|c| c.borrow_mut().clear());
+    DEAD_REAPED.with(|c| c.borrow_mut().clear());
+    PASSTHROUGH.with(|p| p.borrow_mut().clear());
+    SELF_MAKER_CREDITS.with(|c| c.borrow_mut().clear());
+}
 /// The permanent reaps in `stale` — what `sbCancel` carries on a failure.
 fn hard_stale(stale: &[Hash256]) -> Vec<Hash256> {
     stale.iter().filter(|k| !soft_stale_contains(k)).copied().collect()
