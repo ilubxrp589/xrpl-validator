@@ -1319,8 +1319,14 @@ impl Transactor for PermissionedDomainSetTransactor {
         }
         let seq = if tx.uses_ticket() { tx.ticket_seq.unwrap_or(0) } else { tx.sequence };
         let key = keylet::permissioned_domain_key(&tx.account, seq);
+        // Finding 308 (#107074173 06F51E33BB43, r9avT7's first domain): the
+        // object rippled files carries `Flags: 0` — `sle->setFieldU32(sfFlags,
+        // 0)` is part of the create in PermissionedDomainSet::doApply, so the
+        // serialized entry is 5 bytes longer than one without it (the
+        // Oracle lesson of finding 293 again).
         let pd = serde_json::json!({
             "LedgerEntryType": "PermissionedDomain",
+            "Flags": 0,
             "Owner": hex::encode(tx.account),
             "Sequence": seq,
             "AcceptedCredentials": sorted,
