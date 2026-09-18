@@ -1479,3 +1479,17 @@ fn offer_residual_rests_only_while_the_account_is_still_funded_fuzz_107060755() 
 fn offer_residual_rests_on_a_one_ulp_line_fuzz_107060755() {
     run_bundle(include_str!("vectors/offer_residual_rests_on_a_one_ulp_line_fuzz_107060755.json"));
 }
+
+/// Finding 306 — from the differential fuzzer (r3rhWeE3's FLR→BTC offer,
+/// TakerGets doubled, a direct pool plus a two-leg XRP bridge): at iteration
+/// 8 the direct pool's Fibonacci slice fell behind the direct tip — the
+/// taker's OWN resting offer — so rippled's direct strand ran dry, was never
+/// pushed back into the active set, and the lone bridge finished single-path.
+/// We spared the strand as "refused only by the rival's bound", took a ninth
+/// direct slice next round and stayed multi-path (12 vs 11 fills).
+#[test]
+fn offer_strand_refused_by_its_own_tip_stays_dead_fuzz_107009438() {
+    run_bundle(include_str!(
+        "vectors/offer_strand_refused_by_its_own_tip_stays_dead_fuzz_107009438.json"
+    ));
+}
