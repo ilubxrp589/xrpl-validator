@@ -160,7 +160,8 @@ const char *xrpl_shim_version(void) {
 }
 
 const char *xrpl_rippled_version(void) {
-    static std::string v = xrpl::BuildInfo::getVersionString();
+    // 3.4.0: the namespace was renamed from BuildInfo to build_info.
+    static std::string v = xrpl::build_info::getVersionString();
     return v.c_str();
 }
 

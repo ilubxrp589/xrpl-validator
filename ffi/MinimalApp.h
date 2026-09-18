@@ -13,6 +13,10 @@
 #pragma once
 
 #include <xrpld/app/main/Application.h>
+// libxrpl 3.4.0 no longer pulls these in through Application.h; the
+// overrides below name the types, so include them explicitly.
+#include <xrpl/resource/ResourceManager.h>
+#include <xrpl/nodestore/Database.h>
 #include <xrpl/core/HashRouter.h>
 #include <xrpl/server/LoadFeeTrack.h>
 #include <xrpl/ledger/OrderBookDB.h>
@@ -99,8 +103,8 @@ public:
     Overlay& getOverlay() override;
     Cluster& getCluster() override;
     PeerReservationTable& getPeerReservations() override;
-    Resource::Manager& getResourceManager() override;
-    NodeStore::Database& getNodeStore() override;
+    resource::Manager& getResourceManager() override;   // 3.4.0: xrpl::Resource → xrpl::resource
+    node_store::Database& getNodeStore() override;    // 3.4.0: xrpl::NodeStore → xrpl::node_store
     SHAMapStore& getSHAMapStore() override;
     RelationalDatabase& getRelationalDatabase() override;
     InboundLedgers& getInboundLedgers() override;
