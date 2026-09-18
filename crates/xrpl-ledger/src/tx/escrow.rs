@@ -128,8 +128,22 @@ impl Transactor for EscrowCreateTransactor {
             return TxResult::Malformed;
         }
 
+        // Finding 322 (testnet 20864035 fuzz cancelafter:past): at least one
+        // timeout, and a CancelAfter that is strictly after FinishAfter —
+        // temBAD_EXPIRATION either way (Escrow.cpp:151-159), judged before
+        // the fix1571 "FinishAfter or Condition" rule below.
+        let finish_after = tx.fields.get("FinishAfter").and_then(|v| v.as_u64());
+        let cancel_after = tx.fields.get("CancelAfter").and_then(|v| v.as_u64());
+        if finish_after.is_none() && cancel_after.is_none() {
+            return TxResult::BadExpiration;
+        }
+        if let (Some(c), Some(f)) = (cancel_after, finish_after) {
+            if c <= f {
+                return TxResult::BadExpiration;
+            }
+        }
         // Must have at least FinishAfter or Condition (or both)
-        let has_finish_after = tx.fields.get("FinishAfter").is_some();
+        let has_finish_after = finish_after.is_some();
         let has_condition = tx.fields.get("Condition").is_some();
         if !has_finish_after && !has_condition {
             return TxResult::Malformed;
@@ -1181,11 +1195,12 @@ mod tests {
             fields: serde_json::json!({
                 "Destination": hex::encode(bob),
                 "Amount": "25000000",
-                // No FinishAfter, no Condition
+                // No FinishAfter, no Condition — and no CancelAfter either, so
+                // rippled's first rule answers: temBAD_EXPIRATION (finding 322).
             }),
             inner_batch: false,
         };
-        assert_eq!(EscrowCreateTransactor.preflight(&tx), TxResult::Malformed);
+        assert_eq!(EscrowCreateTransactor.preflight(&tx), TxResult::BadExpiration);
     }
 
     #[test]

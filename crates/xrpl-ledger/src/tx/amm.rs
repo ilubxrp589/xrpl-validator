@@ -788,6 +788,39 @@ impl Transactor for AMMDepositTransactor {
         if tx.fields.get("Asset").is_none() || tx.fields.get("Asset2").is_none() {
             return TxResult::Malformed;
         }
+        // Finding 329 (fuzz mode:* on 107075103 695B7891621E): exactly one
+        // deposit sub-type flag, and the field set it demands
+        // (AMMDeposit.cpp:55-100).
+        {
+            let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+            const LP: u64 = 0x0001_0000;
+            const SINGLE: u64 = 0x0008_0000;
+            const TWO: u64 = 0x0010_0000;
+            const ONE_LP: u64 = 0x0020_0000;
+            const LIMIT_LP: u64 = 0x0040_0000;
+            const TWO_IF_EMPTY: u64 = 0x0080_0000;
+            let sub = flags & (LP | SINGLE | TWO | ONE_LP | LIMIT_LP | TWO_IF_EMPTY);
+            if sub.count_ones() != 1 {
+                return TxResult::Malformed;
+            }
+            let amount = tx.fields.get("Amount").is_some();
+            let amount2 = tx.fields.get("Amount2").is_some();
+            let eprice = tx.fields.get("EPrice").is_some();
+            let lp = tx.fields.get("LPTokenOut").is_some();
+            let fee = tx.fields.get("TradingFee").is_some();
+            let bad = match sub {
+                LP => !lp || eprice || (amount && !amount2) || (!amount && amount2) || fee,
+                SINGLE => !amount || amount2 || eprice || fee,
+                TWO => !amount || !amount2 || eprice || fee,
+                ONE_LP => !amount || !lp || amount2 || eprice || fee,
+                LIMIT_LP => !amount || !eprice || lp || amount2 || fee,
+                TWO_IF_EMPTY => !amount || !amount2 || eprice || lp,
+                _ => true,
+            };
+            if bad {
+                return TxResult::Malformed;
+            }
+        }
         TxResult::Success
     }
 

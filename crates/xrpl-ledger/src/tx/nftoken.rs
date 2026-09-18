@@ -553,6 +553,23 @@ impl Transactor for NFTokenCreateOfferTransactor {
         if tx.fields.get("NFTokenID").is_none() || tx.fields.get("Amount").is_none() {
             return TxResult::Malformed;
         }
+        // Findings 325/326 (testnet 20864086 fuzz destination:self, 20864090
+        // flag:sellnftoken): tokenOfferCreatePreflight — a Destination equal
+        // to the account, a sell offer carrying Owner, or a buy offer without
+        // Owner (or with Owner == account) is temMALFORMED.
+        let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+        let is_sell = flags & 0x0000_0001 != 0;
+        let acct_hex = hex::encode(tx.account);
+        let same = |v: &serde_json::Value| v.as_str().is_some_and(|s| s.eq_ignore_ascii_case(&acct_hex));
+        if tx.fields.get("Destination").is_some_and(same) {
+            return TxResult::Malformed;
+        }
+        match tx.fields.get("Owner") {
+            Some(_) if is_sell => return TxResult::Malformed,
+            Some(o) if same(o) => return TxResult::Malformed,
+            None if !is_sell => return TxResult::Malformed,
+            _ => {}
+        }
         TxResult::Success
     }
 
@@ -1047,6 +1064,25 @@ impl Transactor for NFTokenAcceptOfferTransactor {
             && tx.fields.get("NFTokenBuyOffer").is_none()
         {
             return TxResult::Malformed;
+        }
+        // Finding 328 (fuzz nftokenbuyoffer:drop / nftokenselloffer:drop on
+        // 107075103 F2704F9A1074): a broker fee needs BOTH offers and must be
+        // positive (NFTokenAcceptOffer.cpp:47-55).
+        if let Some(bf) = tx.fields.get("NFTokenBrokerFee") {
+            if tx.fields.get("NFTokenSellOffer").is_none() || tx.fields.get("NFTokenBuyOffer").is_none() {
+                return TxResult::Malformed;
+            }
+            let positive = match bf {
+                serde_json::Value::String(d) => d.parse::<u64>().map(|v| v > 0).unwrap_or(false),
+                serde_json::Value::Object(_) => {
+                    keylet::amount_mant_exp(bf).is_some_and(|m| m.0 != 0)
+                        && !bf.get("value").and_then(|v| v.as_str()).is_some_and(|v| v.starts_with('-'))
+                }
+                _ => false,
+            };
+            if !positive {
+                return TxResult::Malformed;
+            }
         }
         TxResult::Success
     }

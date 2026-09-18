@@ -10163,8 +10163,18 @@ impl Transactor for OfferCancelTransactor {
 
     fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
         let acct_key = keylet::account_root_key(&tx.account);
-        if !sandbox.exists(&acct_key) {
+        let Some(acct) = json_at(sandbox, &acct_key) else {
             return TxResult::NoAccount;
+        };
+        // Finding 315 (fuzz offersequence:+1 on 107060755 5A6E343D5827):
+        // CancelOffer::preclaim — the account's Sequence must be past the
+        // OfferSequence, `if ((*sle)[sfSequence] <= offerSequence) return
+        // temBAD_SEQUENCE` (CancelOffer.cpp:52-56).
+        let acct_seq = acct["Sequence"].as_u64().unwrap_or(0);
+        if let Some(os) = tx.fields.get("OfferSequence").and_then(|s| s.as_u64()) {
+            if acct_seq <= os {
+                return TxResult::BadSequence;
+            }
         }
         TxResult::Success
     }

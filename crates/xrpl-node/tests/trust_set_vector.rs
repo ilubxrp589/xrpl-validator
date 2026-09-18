@@ -59,12 +59,26 @@ fn run_bundle(bundle_json: &str) {
     );
 
     for (k, want_hex) in bundle["expect"].as_object().unwrap() {
-        let ent = mods
-            .get(&key32(k))
-            .unwrap_or_else(|| panic!("target {k} must be written by the apply"));
+        let want_deleted = want_hex.as_str().unwrap().trim().is_empty();
+        let Some(ent) = mods.get(&key32(k)) else {
+            assert!(!want_deleted, "target {k} must be deleted by the apply, which never wrote it");
+            let pre_hex = bundle["pre"][k].as_str().unwrap_or_default().trim().to_uppercase();
+            assert_eq!(
+                want_hex.as_str().unwrap().trim().to_uppercase(),
+                pre_hex,
+                "target {k} was not written by the apply and does not pin the untouched pre-image"
+            );
+            continue;
+        };
         let bytes = match ent {
-            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => b.clone(),
-            SandboxEntry::Deleted => panic!("target {k} deleted?"),
+            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => {
+                assert!(!want_deleted, "target {k} must be deleted by the apply, which wrote it instead");
+                b.clone()
+            }
+            SandboxEntry::Deleted => {
+                assert!(want_deleted, "target {k} deleted?");
+                continue;
+            }
         };
         let mut jv: Value = serde_json::from_slice(&bytes).unwrap();
         canon_for_encode(&mut jv);
@@ -136,4 +150,11 @@ fn trust_set_no_ripple_on_a_negative_balance_is_refused_106814855() {
 #[test]
 fn trust_set_insert_sorts_the_whole_owner_directory_page_106860967() {
     run_bundle(include_str!("vectors/trust_set_insert_sorts_the_whole_owner_directory_page_106860967.json"));
+}
+
+/// Findings 312-316 — from the structural differential fuzzer (sweep 3 on
+/// 107060755); libxrpl's result is the expectation.
+#[test]
+fn trust_set_setfauth_without_require_auth_is_tefno_auth_required_fuzz_107060755() {
+    run_bundle(include_str!("vectors/trust_set_setfauth_without_require_auth_is_tefno_auth_required_fuzz_107060755.json"));
 }
