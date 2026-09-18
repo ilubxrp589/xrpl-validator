@@ -45,8 +45,14 @@ fn canon_material(v: &mut serde_json::Value) {
             }
         }
     }
-    obj.remove("PreviousTxnID");
-    obj.remove("PreviousTxnLgrSeq");
+    // Finding 330: rippled's ApplyStateTable skips a modified node only when
+    // `*curNode == *origNode` — STObject equality over EVERY field, the
+    // threading fields included (ApplyStateTable.cpp:155). A node modified
+    // in place keeps its old PreviousTxnID and compares equal when nothing
+    // material moved; a page emptied and re-created is a fresh SLE without
+    // them, differs, and is threaded — #106739411 780DFE9BF728's owner
+    // directory root under a SignerListSet replace. So the threading fields
+    // stay in the comparison; only the client-side `index` is dropped.
     obj.remove("index");
     // Finding 258: an amount's VALUE is a number, not a spelling. The
     // decoder and the engine write the same IOU differently once the
@@ -56,6 +62,42 @@ fn canon_material(v: &mut serde_json::Value) {
     // every amount by its canonical (mantissa, exponent).
     for (_, f) in obj.iter_mut() {
         canon_amount(f);
+        canon_nested(f);
+    }
+}
+
+/// Finding 330 (testnet 20863999 0DF65AD75341 under fee mutants): a
+/// PermissionedDomainSet re-filing the same credential list rewrote the
+/// domain with the transaction's lowercase hex where the decoded pre-image
+/// is uppercase — an identical object read as material, was threaded, and
+/// diverged on PreviousTxnID/LgrSeq alone. rippled never emits an unchanged
+/// node. Hex strings compare case-blind, and arrays/objects are canonicalised
+/// all the way down.
+fn canon_nested(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::String(s) => {
+            if s.len() >= 4 && s.len() % 2 == 0 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+                *s = s.to_ascii_uppercase();
+            } else if s.starts_with('r') && (25..=35).contains(&s.len()) {
+                // The decoder spells account fields as r-addresses; the
+                // engine writes them as hex. Same account, one spelling.
+                if let Ok(id) = xrpl_core::address::decode_account_id(s) {
+                    *s = hex::encode_upper(id);
+                }
+            }
+        }
+        serde_json::Value::Array(a) => {
+            for e in a.iter_mut() {
+                canon_nested(e);
+            }
+        }
+        serde_json::Value::Object(o) => {
+            for (_, f) in o.iter_mut() {
+                canon_amount(f);
+                canon_nested(f);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -419,5 +461,23 @@ mod tests {
             ("INNER1".into(), 7),
             "threadOwners reaches the owner root even outside the inner's touched set"
         );
+    }
+}
+
+#[cfg(test)]
+mod writeback_tests {
+    use super::semantically_equal;
+
+    #[test]
+    fn hex_case_and_nested_arrays_are_not_material() {
+        let pre = br#"{"LedgerEntryType":"PermissionedDomain","Owner":"08F93A124EDA9FA269D6BD7557873350B7522ABC","PreviousTxnID":"AABBCCDD","PreviousTxnLgrSeq":1,"AcceptedCredentials":[{"Credential":{"Issuer":"08F93A124EDA9FA269D6BD7557873350B7522ABC","CredentialType":"4B5943"}}]}"#;
+        let post = br#"{"LedgerEntryType":"PermissionedDomain","Owner":"08f93a124eda9fa269d6bd7557873350b7522abc","PreviousTxnID":"aabbccdd","PreviousTxnLgrSeq":1,"AcceptedCredentials":[{"Credential":{"Issuer":"08f93a124eda9fa269d6bd7557873350b7522abc","CredentialType":"4b5943"}}]}"#;
+        assert!(semantically_equal(pre, post));
+        // A fresh object without the threading the original carried is a
+        // change (rippled's erase-and-recreate of a directory page).
+        let fresh = br#"{"LedgerEntryType":"PermissionedDomain","Owner":"08F93A124EDA9FA269D6BD7557873350B7522ABC","AcceptedCredentials":[{"Credential":{"Issuer":"08F93A124EDA9FA269D6BD7557873350B7522ABC","CredentialType":"4B5943"}}]}"#;
+        assert!(!semantically_equal(pre, fresh));
+        let changed = br#"{"LedgerEntryType":"PermissionedDomain","Owner":"08F93A124EDA9FA269D6BD7557873350B7522ABC","AcceptedCredentials":[{"Credential":{"Issuer":"08F93A124EDA9FA269D6BD7557873350B7522ABC","CredentialType":"4B5944"}}]}"#;
+        assert!(!semantically_equal(pre, changed));
     }
 }

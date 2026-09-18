@@ -94,3 +94,12 @@ fn oracle_set_creates_the_object_with_flags_zero_107052956() {
 fn permissioned_domain_set_files_flags_zero_107074173() {
     run_bundle(include_str!("vectors/permissioned_domain_set_files_flags_zero_107074173.json"));
 }
+
+/// Finding 330 — re-filing an identical credential list leaves the domain
+/// untouched: rippled never emits an unchanged node, so its threading stays.
+#[test]
+fn permissioned_domain_refile_of_the_same_list_is_not_a_change_fuzz_testnet_20863999() {
+    run_bundle(include_str!(
+        "vectors/permissioned_domain_refile_of_the_same_list_is_not_a_change_fuzz_testnet_20863999.json"
+    ));
+}
