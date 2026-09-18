@@ -954,3 +954,17 @@ fn payment_ninety_six_digit_amount_parses_fuzz_107009438() {
 fn payment_limit_quality_below_the_stamount_floor_rejects_every_strand_fuzz_107009438() {
     run_bundle(include_str!("vectors/payment_limit_quality_below_the_stamount_floor_rejects_every_strand_fuzz_107009438.json"));
 }
+
+/// Finding 307 — from the differential fuzzer (rogue5Hn's PLX→GALLOWS
+/// payment with tfLimitQuality added): rippled's `limitOut` hands back the
+/// remainder UNTRIMMED when the solved out is within 1e-9 relative of it
+/// ("A tiny difference could be due to the round off"), so `adjustedRemOut`
+/// stays false and the 1e-7 judge forgiveness never applies. We trimmed by
+/// 1.2e-13 relative, called the ask adjusted, and forgave a pass rippled
+/// rejects: tecPATH_DRY.
+#[test]
+fn payment_limit_out_within_a_billionth_is_not_a_trim_fuzz_107009438() {
+    run_bundle(include_str!(
+        "vectors/payment_limit_out_within_a_billionth_is_not_a_trim_fuzz_107009438.json"
+    ));
+}
