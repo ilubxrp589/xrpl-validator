@@ -103,7 +103,7 @@ impl FuzzCtx {
     /// ledger still has them and the provider must not resurrect them.
     pub fn fuzz_tx(&mut self, state: &mut LedgerState, base: &Value, base_hash: &str, idx: usize, deleted: &HashSet<[u8; 32]>) -> FuzzTally {
         let mut tally = FuzzTally::default();
-        let muts = mutants(base, self.pct, &mut self.rng, self.k);
+        let muts = mutants(base, self.pct, self.seq, &mut self.rng, self.k);
         for (n, (label, mutant)) in muts.into_iter().enumerate() {
             // Encode the mutant (unsigned) and name it by its own id.
             let mut enc = mutant.clone();
