@@ -37,6 +37,7 @@ pub struct FuzzTally {
     pub ter_mm: u64,
     pub mut_mm: u64,
     pub byte_mm: u64,
+    pub noop: u64,
     pub ffi_null: u64,
     pub skipped: u64,
     pub written: Vec<String>,
@@ -49,6 +50,7 @@ impl FuzzTally {
         self.ter_mm += o.ter_mm;
         self.mut_mm += o.mut_mm;
         self.byte_mm += o.byte_mm;
+        self.noop += o.noop;
         self.ffi_null += o.ffi_null;
         self.skipped += o.skipped;
         self.written.extend(o.written.iter().cloned());
@@ -182,12 +184,34 @@ impl FuzzCtx {
                     (k.0, (kind, bytes))
                 })
                 .collect();
+            // A Modified entry whose content equals the object's pre-image
+            // once PreviousTxnID/PreviousTxnLgrSeq are set aside is a
+            // threading-only write: rippled files it as a ModifiedNode when a
+            // transactor `update()`s a node it did not change, and the live
+            // shadow reports the same asymmetry as `noop_extra`/`noop_missing`
+            // rather than a divergence. Set-differences made only of those
+            // are classed NOOP so the real MUT cases stand out.
+            let pre_of = |k: &[u8; 32]| -> Option<Vec<u8>> {
+                reads.iter().find(|(rk, _)| rk == k).map(|(_, b)| b.clone())
+            };
+            let threading_only = |k: &[u8; 32], kind: u8, b: &[u8]| -> bool {
+                kind == 1 && pre_of(k).is_some_and(|pre| strip_threading(&pre) == strip_threading(b))
+            };
             let class = if our_ter != outcome.ter_name {
                 "TER"
             } else if ffi_map.len() != our_map.len()
                 || ffi_map.iter().any(|(k, (kind, _))| our_map.get(k).map(|(ok, _)| ok) != Some(kind))
             {
-                "MUT"
+                let all_noop = ffi_map
+                    .iter()
+                    .filter(|(k, _)| !our_map.contains_key(*k))
+                    .all(|(k, (kind, b))| threading_only(k, *kind, b))
+                    && our_map
+                        .iter()
+                        .filter(|(k, _)| !ffi_map.contains_key(*k))
+                        .all(|(k, (kind, b))| threading_only(k, *kind, b))
+                    && ffi_map.iter().all(|(k, (kind, _))| our_map.get(k).is_none_or(|(ok, _)| ok == kind));
+                if all_noop { "NOOP" } else { "MUT" }
             } else if ffi_map.iter().any(|(k, (_, b))| our_map.get(k).map(|(_, ob)| ob) != Some(b)) {
                 "BYTE"
             } else {
@@ -197,10 +221,39 @@ impl FuzzCtx {
             match class {
                 "TER" => tally.ter_mm += 1,
                 "MUT" => tally.mut_mm += 1,
+                "NOOP" => tally.noop += 1,
                 _ => tally.byte_mm += 1,
             }
+            let letype = |b: &[u8]| -> String {
+                xrpl_core::codec::decode::decode_transaction_binary(b)
+                    .ok()
+                    .and_then(|v| v.get("LedgerEntryType").and_then(|t| t.as_str()).map(str::to_string))
+                    .unwrap_or_else(|| "?".to_string())
+            };
+            let mut detail = String::new();
+            if class != "TER" {
+                let only_ffi: Vec<String> = ffi_map
+                    .iter()
+                    .filter(|(k, _)| !our_map.contains_key(*k))
+                    .map(|(k, (kind, b))| format!("{}:{}:{}", &hex::encode_upper(k)[..8], kind, letype(b)))
+                    .collect();
+                let only_ours: Vec<String> = our_map
+                    .iter()
+                    .filter(|(k, _)| !ffi_map.contains_key(*k))
+                    .map(|(k, (kind, b))| format!("{}:{}:{}", &hex::encode_upper(k)[..8], kind, letype(b)))
+                    .collect();
+                let kind_diff: Vec<String> = ffi_map
+                    .iter()
+                    .filter_map(|(k, (kind, _))| our_map.get(k).filter(|(ok, _)| ok != kind).map(|(ok, _)| format!("{}:{}vs{}", &hex::encode_upper(k)[..8], kind, ok)))
+                    .collect();
+                let byte_diff: Vec<String> = ffi_map
+                    .iter()
+                    .filter_map(|(k, (kind, b))| our_map.get(k).filter(|(ok, ob)| ok == kind && ob != b).map(|_| format!("{}:{}", &hex::encode_upper(k)[..8], letype(b))))
+                    .collect();
+                detail = format!(" only-libxrpl={only_ffi:?} only-ours={only_ours:?} kind={kind_diff:?} bytes={byte_diff:?}");
+            }
             eprintln!(
-                "  FUZZ-{class} #{idx} {}[{n}] {label}: ours {our_ter} libxrpl {} (ours {} muts, libxrpl {})",
+                "  FUZZ-{class} #{idx} {}[{n}] {label}: ours {our_ter} libxrpl {} (ours {} muts, libxrpl {}){detail}",
                 &base_hash[..12.min(base_hash.len())],
                 outcome.ter_name,
                 our_map.len(),
@@ -209,10 +262,23 @@ impl FuzzCtx {
             // Bundle for the drill.
             let mut tx = mutant.clone();
             tx["hash"] = Value::String(hash_hex.clone());
-            let pre: serde_json::Map<String, Value> = reads
+            let mut pre: serde_json::Map<String, Value> = reads
                 .iter()
                 .map(|(k, b)| (hex::encode_upper(k), Value::String(hex::encode_upper(b))))
                 .collect();
+            // A preflight rejection reads nothing, but the native replay must
+            // still find the parties to reach the same decision: seed the
+            // bundle with the sender's and destination's roots as they stand.
+            for f in ["Account", "Destination", "Owner", "Issuer"] {
+                let Some(id) = mutant.get(f).and_then(|v| v.as_str()).and_then(crate::native_apply::decode_address) else { continue };
+                let k = xrpl_ledger::ledger::keylet::account_root_key(&id);
+                if let Some(js) = state.state_map.lookup(&k) {
+                    let b = encode_obj(js);
+                    if !b.is_empty() {
+                        pre.entry(hex::encode_upper(k.0)).or_insert(Value::String(hex::encode_upper(&b)));
+                    }
+                }
+            }
             let expect: serde_json::Map<String, Value> = ffi_map
                 .iter()
                 .map(|(k, (_, b))| (hex::encode_upper(k), Value::String(hex::encode_upper(b))))
@@ -237,6 +303,21 @@ impl FuzzCtx {
             }
         }
         tally
+    }
+}
+
+/// The object's fields as JSON with the threading stamps removed, for the
+/// no-op test; unparsable bytes compare as themselves (hex).
+fn strip_threading(sle: &[u8]) -> String {
+    match xrpl_core::codec::decode::decode_transaction_binary(sle) {
+        Ok(mut v) => {
+            if let Some(o) = v.as_object_mut() {
+                o.remove("PreviousTxnID");
+                o.remove("PreviousTxnLgrSeq");
+            }
+            v.to_string()
+        }
+        Err(_) => hex::encode(sle),
     }
 }
 

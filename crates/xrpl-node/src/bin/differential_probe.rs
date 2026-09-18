@@ -3294,8 +3294,8 @@ fn run() -> i32 {
     if fuzz.is_some() {
         let t = &fuzz_tally;
         eprintln!(
-            "FUZZ SUMMARY: attempted={} agree={} TER={} MUT={} BYTE={} ffi_null={} skipped={} bundles={}",
-            t.attempted, t.agree, t.ter_mm, t.mut_mm, t.byte_mm, t.ffi_null, t.skipped, t.written.len()
+            "FUZZ SUMMARY: attempted={} agree={} TER={} MUT={} BYTE={} NOOP={} ffi_null={} skipped={} bundles={}",
+            t.attempted, t.agree, t.ter_mm, t.mut_mm, t.byte_mm, t.noop, t.ffi_null, t.skipped, t.written.len()
         );
         for w in &t.written {
             eprintln!("  {w}");
