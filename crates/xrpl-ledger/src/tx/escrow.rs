@@ -631,7 +631,18 @@ fn mpt_unlock_plan(
         locked = now;
     }
     let net = if !owner_is_issuer && !dest_is_issuer && locked != 1_000_000_000 {
-        mpt_divide_round_up(want, locked)
+        // Finding 338 (devnet 5423379 082003AB, 100 units at a 10% fee →
+        // 90): the 3.4.0 RELEASE gates the MPT fee on fixCleanup3_4_0 —
+        // "MPTs are integral, so round the delivered amount down":
+        // `mulRatio(amount, parity, lockedRate, false)`; before it, the
+        // divideRound-up delivery (91). Mainnet has not enabled the
+        // amendment (2026-09-18); the rule follows the ledger's own
+        // Amendments singleton, as fixCleanup3_3_0 does.
+        if crate::ledger::amendments::fix_cleanup_3_4_0(sandbox) {
+            ((want as u128 * 1_000_000_000u128) / locked as u128) as u64
+        } else {
+            mpt_divide_round_up(want, locked)
+        }
     } else {
         want
     };
@@ -1712,6 +1723,18 @@ mod tests {
         assert!(iss.get("LockedAmount").is_none());
         assert_eq!(iss["OutstandingAmount"], "491");
         assert!(!sb.exists(&keylet::escrow_key(&holder, 3)));
+
+        // Finding 338: with fixCleanup3_4_0 enabled in the ledger's
+        // Amendments singleton the delivery floors — 90, fee 10.
+        let am = serde_json::json!({
+            "LedgerEntryType": "Amendments", "Flags": 0,
+            "Amendments": [crate::ledger::amendments::FIX_CLEANUP_3_4_0],
+        });
+        state.state_map.insert(keylet::amendments_key(), serde_json::to_vec(&am).unwrap()).unwrap();
+        let (r, sb) = run_tx(&state, &EscrowFinishTransactor, &finish);
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(mpt_json(&sb, &keylet::mptoken_key(&ikey, &dest))["MPTAmount"], "90");
+        assert_eq!(mpt_json(&sb, &ikey)["OutstandingAmount"], "490");
     }
 
     #[test]

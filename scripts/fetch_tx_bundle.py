@@ -508,6 +508,10 @@ def main():
         v = tx.get(f)
         if isinstance(v, str) and len(v) == 64:
             named_keys.append(v.upper())
+    # The Amendments singleton (7DB0788C…): amendment-gated rules read it
+    # (fixCleanup3_3_0, fixCleanup3_4_0 — finding 338), and a bundle without
+    # it answers "not enabled" for everything.
+    named_keys.append("7DB0788C020F02780A673DC74757F23823FA3014C1866E72CC4CD8B226CD6EF4")
     # Finding 333: a DomainID transaction is judged by accountInDomain — the
     # domain object plus, per party, the Credential objects its
     # AcceptedCredentials name (keylet credential(subject, issuer, type)).

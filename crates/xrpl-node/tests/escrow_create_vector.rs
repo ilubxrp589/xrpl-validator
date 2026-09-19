@@ -220,3 +220,34 @@ fn escrow_create_locks_an_mpt_on_the_holder_token() {
 fn escrow_finish_unlocks_an_mpt_to_the_destination_token() {
     run_bundle(include_str!("vectors/escrow_finish_unlocks_an_mpt_to_the_destination_token_devnet_5419010.json"));
 }
+
+/// Finding 338 — devnet 5423379 082003AB: the destination finishes a 100-unit
+/// MPT escrow at a 10% snapshot rate with no MPToken of its own. The token is
+/// created (reserve at OwnerCount + 1), and — fixCleanup3_4_0 being enabled
+/// on devnet (the bundle carries the Amendments singleton) — the delivery
+/// floors to 90, the 10-unit fee leaving OutstandingAmount.
+#[test]
+fn escrow_finish_mpt_fee_floors_under_fixcleanup_3_4_0() {
+    run_bundle(include_str!("vectors/escrow_finish_mpt_fee_floors_under_fixcleanup_3_4_0_devnet_5423379.json"));
+}
+
+/// Finding 332/338 — devnet 5423377 560111E5: an MPT escrow create against an
+/// issuance with TransferFee 10000 stores TransferRate 1100000000.
+#[test]
+fn escrow_create_mpt_snapshots_the_issuance_transfer_fee() {
+    run_bundle(include_str!("vectors/escrow_create_mpt_snapshots_the_issuance_transfer_fee_devnet_5423377.json"));
+}
+
+/// Finding 332 — devnet 5423388 585CB793: finishing an MPT escrow whose
+/// destination is the issuer burns the units off OutstandingAmount, no fee.
+#[test]
+fn escrow_finish_mpt_to_the_issuer_burns_outstanding() {
+    run_bundle(include_str!("vectors/escrow_finish_mpt_to_the_issuer_burns_outstanding_devnet_5423388.json"));
+}
+
+/// Finding 332 — devnet 5423393 D22B063A: a stranger cancels an MPT escrow
+/// past CancelAfter; the lock returns to the owner's token at parity.
+#[test]
+fn escrow_cancel_mpt_returns_the_lock() {
+    run_bundle(include_str!("vectors/escrow_cancel_mpt_returns_the_lock_devnet_5423393.json"));
+}
