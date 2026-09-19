@@ -1601,3 +1601,13 @@ fn offer_create_removes_a_domain_offer_whose_owner_left_the_domain_devnet_542296
 fn offer_create_outside_its_domain_is_no_permission_devnet_5422957() {
     run_bundle(include_str!("vectors/offer_create_outside_its_domain_is_no_permission_devnet_5422957.json"));
 }
+
+/// Finding 339 — #107080701 8EB3E8F0B045: an IoC buy of 436 drops for
+/// 0.000619 RLUSD. The tip fills 435; for the last drop the pool wins the
+/// turn anchored on the next tip, its slice misses the limit and rippled's
+/// flow breaks — the offer behind the pool (EE9CCDBD, pinned with its owner's
+/// root and line) is never touched. We filled the drop from it.
+#[test]
+fn offer_ioc_buy_ends_when_the_pool_slice_misses_the_limit_107080701() {
+    run_bundle(include_str!("vectors/offer_ioc_buy_ends_when_the_pool_slice_misses_the_limit_107080701.json"));
+}

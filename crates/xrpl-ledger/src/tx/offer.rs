@@ -7097,6 +7097,9 @@ pub(crate) fn cross_engine_to_net(
     // or the trailing sweep behind it) — their other offers are "became
     // unfunded", stepped past but not permanently removed.
     let mut drained_level: Drained = Default::default();
+    // Finding 339: set when a pool turn that won its iteration was rejected
+    // by limitQuality — the flow is over, tail turn included.
+    let mut walk_ended_by_pool = false;
     'dirs: for (di, dk) in dirs.clone().into_iter().enumerate() {
         // Finding 201: set when this level's sweep removes the taker's own offer.
         let mut level_self_reaped = false;
@@ -7524,6 +7527,16 @@ pub(crate) fn cross_engine_to_net(
                 pays_leg, gets_leg, threshold, threshold_self, sell, Some(q), pay_in_rate,
                 None,
             );
+            if !used && crate::tx::amm_swap::take_turn_rejected() {
+                // Finding 339: the pool won the turn and its slice was
+                // "Path rejected by limitQuality" — rippled breaks out of
+                // flow(); the level's offers are never visited.
+                if std::env::var("DX_AMM").is_ok() {
+                    eprintln!("DX_AMM turn rejected by limitQuality → walk ends (F339)");
+                }
+                walk_ended_by_pool = true;
+                break 'dirs;
+            }
             let line_drained = line_bound && used && me_is_zero(rg);
             // Re-express the turn's remainder against the walk's own budget:
             // the slice took rg_turn − rg.
@@ -8920,7 +8933,7 @@ pub(crate) fn cross_engine_to_net(
             amm.is_some()
         );
     }
-    if let Some(a) = &amm {
+    if let Some(a) = amm.as_ref().filter(|_| !walk_ended_by_pool) {
         // For a CROSSING with no remembered anchor, the strand must first be
         // ADMITTED. rippled's next pass anchors tryAMM on the residual raw
         // tip; when that tip sits WITHIN the inflated limitQuality

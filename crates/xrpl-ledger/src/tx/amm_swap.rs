@@ -70,6 +70,20 @@ thread_local! {
 pub(crate) fn mark_in_limited() {
     IN_LIMITED.with(|c| c.set(true));
 }
+// Finding 339: the pool WON this iteration's turn (its anchored offer was
+// the tip) and the sized slice was then "Path rejected by limitQuality"
+// (StrandFlow.h:721-732). rippled's iteration yields no best path and the
+// flow BREAKS — the CLOB offer behind the pool is never reached, this
+// iteration or later. The walker reads this after a declined turn and ends.
+thread_local! {
+    static TURN_REJECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+pub(crate) fn mark_turn_rejected() {
+    TURN_REJECTED.with(|c| c.set(true));
+}
+pub(crate) fn take_turn_rejected() -> bool {
+    TURN_REJECTED.with(|c| c.replace(false))
+}
 pub(crate) fn take_in_limited() -> bool {
     IN_LIMITED.with(|c| c.replace(false))
 }
@@ -198,6 +212,7 @@ pub(crate) fn amm_ctx_reset() {
 
 /// Every thread-local of the pool walk, cleared (see `offer::thread_state_reset`).
 pub(crate) fn thread_state_reset() {
+    TURN_REJECTED.with(|c| c.set(false));
     FWD_EXCESS.with(|c| c.set((0, 0)));
     IN_LIMITED.with(|c| c.set(false));
     REM_OUT_TRIMMED.with(|c| c.set(false));
@@ -2441,6 +2456,14 @@ pub(crate) fn consume(
                 if std::env::var("DX_AMM").is_ok() {
                     eprintln!("DX_AMM limit reject q={q:?} thr={thr_me:?} adjusted={adjusted}");
                 }
+                // Finding 339 (#107080701 8EB3E8F0B045, rPztkopz IoC buying
+                // 436 drops for 0.000619 RLUSD): iteration 1 took 435 drops
+                // off the tip; iteration 2's tryAMM anchored the pool on the
+                // next tip (quality tie → the AMM offer is the source), the
+                // one-drop slice cost 1.4209e-6 against a 1.4197e-6 limit,
+                // "Path rejected by limitQuality", "Total flow: out 435".
+                // We stepped onto that tip and filled the drop (10 muts v 7).
+                mark_turn_rejected();
                 return (rem_pays, rem_gets, false);
             }
         }
