@@ -1044,6 +1044,8 @@ fn payment_with_credentials_into_a_deposit_auth_destination_107093460() {
 #[test]
 fn payment_with_credentials_into_a_deposit_auth_destination_107093959() {
     run_bundle(include_str!("vectors/payment_with_credentials_into_a_deposit_auth_destination_107093959.json"));
+}
+
 /// Finding 341 — #107093372 BE1B5D257244: a partial XAH→RLUSD payment whose
 /// first iteration leaves a 1e-14 remainder. The pool wins iteration two
 /// anchored at the next tip's quality, its forward swap of the 1.55e-12 XAH
