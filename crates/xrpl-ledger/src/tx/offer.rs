@@ -9357,6 +9357,20 @@ fn amm_turn(
     r
 }
 
+/// The transaction's DomainID (XLS-80) as a key, when it carries one.
+pub(crate) fn tx_domain(tx: &TxFields) -> Option<Hash256> {
+    tx.fields
+        .get("DomainID")
+        .and_then(|v| v.as_str())
+        .and_then(|s| hex::decode(s).ok())
+        .filter(|b| b.len() == 32)
+        .map(|b| {
+            let mut d = [0u8; 32];
+            d.copy_from_slice(&b);
+            Hash256(d)
+        })
+}
+
 /// Cross with the taker as its own beneficiary (OfferCreate semantics).
 pub(crate) fn cross_engine(
     taker: &[u8; 20],
@@ -9473,6 +9487,14 @@ impl Transactor for OfferCreateTransactor {
                 }
             }
         }
+        // Finding 333 (CreateOffer.cpp:221-227): a DomainID names a domain the
+        // creator must belong to — owner, or holder of an accepted unexpired
+        // credential the domain lists — else tecNO_PERMISSION, judged LAST.
+        if let Some(d) = tx_domain(tx) {
+            if !crate::tx::misc::account_in_domain(sandbox, &tx.account, &d) {
+                return TxResult::NoPermission;
+            }
+        }
         TxResult::Success
     }
 
@@ -9558,17 +9580,7 @@ impl Transactor for OfferCreateTransactor {
 
         // A DomainID (XLS-80) scopes both crossing and placement to the
         // domain's book.
-        let domain: Option<Hash256> = tx
-            .fields
-            .get("DomainID")
-            .and_then(|v| v.as_str())
-            .and_then(|s| hex::decode(s).ok())
-            .filter(|b| b.len() == 32)
-            .map(|b| {
-                let mut d = [0u8; 32];
-                d.copy_from_slice(&b);
-                Hash256(d)
-            });
+        let domain: Option<Hash256> = tx_domain(tx);
 
         // Cross against the inverse book while the maker's rate is within the
         // taker's limit price (threshold = quality with the sides swapped).
@@ -10491,6 +10503,38 @@ mod tests {
         let key = keylet::account_root_key(id);
         state.state_map.insert(key, serde_json::to_vec(&acct).unwrap()).unwrap();
         state
+    }
+
+    /// Finding 333: an OfferCreate naming a domain the creator is not in is
+    /// tecNO_PERMISSION (CreateOffer.cpp:221-227); the domain owner passes.
+    #[test]
+    fn offer_create_preclaim_requires_the_creator_in_its_domain_finding_333() {
+        let taker = [0x41u8; 20];
+        let issuer = [0x42u8; 20];
+        let mut state = make_state_with_account(&taker, 1_000_000_000);
+        let iss = serde_json::json!({
+            "LedgerEntryType": "AccountRoot", "Account": hex::encode(issuer), "Balance": "1000000000",
+            "Sequence": 1, "OwnerCount": 0, "Flags": 0,
+        });
+        state.state_map.insert(keylet::account_root_key(&issuer), serde_json::to_vec(&iss).unwrap()).unwrap();
+        let dkey = Hash256([0x55u8; 32]);
+        let pd = serde_json::json!({
+            "LedgerEntryType": "PermissionedDomain", "Flags": 0, "Owner": hex::encode(taker), "Sequence": 1,
+            "AcceptedCredentials": [{"Credential": {"Issuer": hex::encode(issuer), "CredentialType": "AB"}}],
+        });
+        state.state_map.insert(dkey, serde_json::to_vec(&pd).unwrap()).unwrap();
+        let mk = |domain: [u8; 32]| TxFields {
+            account: taker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 1, last_ledger_seq: None, ticket_seq: None,
+            fields: serde_json::json!({
+                "TakerGets": "1000000",
+                "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "1"},
+                "DomainID": hex::encode_upper(domain),
+            }),
+            inner_batch: false,
+        };
+        let sandbox = Sandbox::new(&state);
+        assert_eq!(OfferCreateTransactor.preclaim(&mk(dkey.0), &sandbox), TxResult::Success);
+        assert_eq!(OfferCreateTransactor.preclaim(&mk([0x56u8; 32]), &sandbox), TxResult::NoPermission);
     }
 
     #[test]

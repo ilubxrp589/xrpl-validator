@@ -766,7 +766,7 @@ impl PaymentTransactor {
         let mut trial_fib = amm_fib.cloned();
         let (rw, rem_in, _) = ox::cross_engine_to(
             &tx.account, &tx.account, want, granted, out_leg, in_leg,
-            threshold, threshold, false, false, single_pass, trial_fib.as_mut(), None,
+            threshold, threshold, false, false, single_pass, trial_fib.as_mut(), ox::tx_domain(tx).as_ref(), // finding 333
             sandbox, &mut Vec::new(),
         );
         let consumed = match (before, Self::leg_signed_balance(sandbox, &tx.account, in_leg)) {
@@ -1150,7 +1150,7 @@ impl PaymentTransactor {
                     let _ = ox::take_self_maker_credits();
                     let (rw, rs, _c) = ox::cross_engine_to(
                         &tx.account, benef, out_target[i], avail, to, from, thr, thr, false,
-                        false, single_pass, amm_fib.as_deref_mut(), None, sandbox,
+                        false, single_pass, amm_fib.as_deref_mut(), ox::tx_domain(tx).as_ref(), sandbox, // finding 333
                         &mut Vec::new(),
                     );
                     let excess = crate::tx::amm_swap::take_fwd_excess();
@@ -1498,7 +1498,7 @@ impl PaymentTransactor {
                 // input-driven too, and its delivery is capped at the reverse
                 // want through the same `benef_net` rule a rated leg uses —
                 // with a unit rate when the leg carries none.
-                hop_thr, hop_thr, fwd_driven && i > 0, false, single_pass, amm_fib.as_deref_mut(), None,
+                hop_thr, hop_thr, fwd_driven && i > 0, false, single_pass, amm_fib.as_deref_mut(), ox::tx_domain(tx).as_ref(), // finding 333
                 if last { want_net.or(Some((1_000_000_000, want_cap))) } else { None },
                 hop_gross,
                 sandbox, &mut Vec::new(),
@@ -2197,6 +2197,19 @@ impl Transactor for PaymentTransactor {
                 .saturating_add(Self::reserve_inc(sandbox).saturating_mul(oc));
             if balance < amount.saturating_add(reserve) {
                 return TxResult::UnfundedPayment;
+            }
+        }
+
+        // Finding 333 (Payment.cpp:397-405): a DomainID payment needs BOTH the
+        // sender and the destination in the domain (`accountInDomain`) —
+        // tecNO_PERMISSION otherwise, judged after every other preclaim test.
+        // The flow then walks the DOMAIN books only (BookStep's `book_` carries
+        // the domain; no AMM there), see the `cross_engine_to` call sites.
+        if let Some(d) = crate::tx::offer::tx_domain(tx) {
+            if !crate::tx::misc::account_in_domain(sandbox, &tx.account, &d)
+                || !crate::tx::misc::account_in_domain(sandbox, &dest, &d)
+            {
+                return TxResult::NoPermission;
             }
         }
 
@@ -4125,6 +4138,41 @@ mod tests {
         let sandbox = Sandbox::new(&state);
         let tx = payment_tx(sender, dest, 1_000_000, 12, 1);
         assert_eq!(PaymentTransactor.preclaim(&tx, &sandbox), TxResult::NoAccount);
+    }
+
+    /// Finding 333: a DomainID payment is tecNO_PERMISSION unless BOTH the
+    /// sender and the destination are in the domain (owner or accepted
+    /// credential); judged after the funding tests.
+    #[test]
+    fn preclaim_domain_payment_needs_both_parties_in_the_domain_finding_333() {
+        let sender = [0x01u8; 20];
+        let dest = [0x02u8; 20];
+        let issuer = [0x03u8; 20];
+        let mut state = make_state();
+        add_account(&mut state, &sender, 50_000_000, 1);
+        add_account(&mut state, &dest, 50_000_000, 1);
+        let dkey = Hash256([0x66u8; 32]);
+        let pd = serde_json::json!({
+            "LedgerEntryType": "PermissionedDomain", "Flags": 0, "Owner": hex::encode(sender), "Sequence": 1,
+            "AcceptedCredentials": [{"Credential": {"Issuer": hex::encode(issuer), "CredentialType": "AB"}}],
+        });
+        state.state_map.insert(dkey, serde_json::to_vec(&pd).unwrap()).unwrap();
+        let mut tx = payment_tx(sender, dest, 1_000_000, 12, 1);
+        tx.fields["DomainID"] = serde_json::Value::String(hex::encode_upper(dkey.0));
+        {
+            let sandbox = Sandbox::new(&state);
+            assert_eq!(PaymentTransactor.preclaim(&tx, &sandbox), TxResult::NoPermission, "destination outside the domain");
+        }
+        let cred = serde_json::json!({
+            "LedgerEntryType": "Credential", "Subject": hex::encode(dest), "Issuer": hex::encode(issuer),
+            "CredentialType": "AB", "Flags": 0x0001_0000u64,
+        });
+        let ckey = crate::tx::credential::credential_key(&dest, &issuer, &hex::decode("AB").unwrap());
+        state.state_map.insert(ckey, serde_json::to_vec(&cred).unwrap()).unwrap();
+        let sandbox = Sandbox::new(&state);
+        assert_eq!(PaymentTransactor.preclaim(&tx, &sandbox), TxResult::Success);
+        tx.fields["DomainID"] = serde_json::Value::String(hex::encode_upper([0x67u8; 32]));
+        assert_eq!(PaymentTransactor.preclaim(&tx, &sandbox), TxResult::NoPermission, "missing domain");
     }
 
     #[test]

@@ -800,6 +800,40 @@ mod tests {
     use crate::ledger::state::LedgerState;
     use xrpl_core::types::Hash256;
 
+    /// Finding 333: owner, accepted credential, expired credential, stranger.
+    #[test]
+    fn account_in_domain_admits_the_owner_and_accepted_unexpired_credentials() {
+        let owner = [0x31u8; 20];
+        let issuer = [0x32u8; 20];
+        let holder = [0x33u8; 20];
+        let expired = [0x34u8; 20];
+        let stranger = [0x35u8; 20];
+        let mut state = make_state(&[(owner, 1_000_000_000)]);
+        let dkey = Hash256([0x77u8; 32]);
+        let pd = serde_json::json!({
+            "LedgerEntryType": "PermissionedDomain", "Flags": 0, "Owner": hex::encode(owner), "Sequence": 1,
+            "AcceptedCredentials": [{"Credential": {"Issuer": hex::encode(issuer), "CredentialType": "ABCD"}}],
+        });
+        state.state_map.insert(dkey, serde_json::to_vec(&pd).unwrap()).unwrap();
+        for (who, flags, exp) in [(holder, 0x0001_0000u64, None), (expired, 0x0001_0000, Some(5u64)), (stranger, 0, None)] {
+            let mut cred = serde_json::json!({
+                "LedgerEntryType": "Credential", "Subject": hex::encode(who), "Issuer": hex::encode(issuer),
+                "CredentialType": "ABCD", "Flags": flags,
+            });
+            if let Some(e) = exp {
+                cred["Expiration"] = serde_json::Value::from(e);
+            }
+            let key = crate::tx::credential::credential_key(&who, &issuer, &hex::decode("ABCD").unwrap());
+            state.state_map.insert(key, serde_json::to_vec(&cred).unwrap()).unwrap();
+        }
+        let sb = Sandbox::new(&state); // close_time 10 > Expiration 5 ⇒ expired
+        assert!(account_in_domain(&sb, &owner, &dkey));
+        assert!(account_in_domain(&sb, &holder, &dkey));
+        assert!(!account_in_domain(&sb, &expired, &dkey));
+        assert!(!account_in_domain(&sb, &stranger, &dkey), "unaccepted credential");
+        assert!(!account_in_domain(&sb, &owner, &Hash256([0x78u8; 32])), "missing domain");
+    }
+
     fn make_state(accounts: &[([u8; 20], u64)]) -> LedgerState {
         let header = LedgerHeader {
             sequence: 100,
@@ -1475,6 +1509,36 @@ impl Transactor for PermissionedDomainSetTransactor {
         });
         add_owned_object(sandbox, &tx.account, key, pd)
     }
+}
+
+/// Finding 333 — `permissioned_dex::accountInDomain` (PermissionedDEXHelpers.
+/// cpp:28-56): the domain's Owner is in it; anyone else needs, for one of the
+/// domain's AcceptedCredentials, a Credential object keyed (account, Issuer,
+/// CredentialType) that is lsfAccepted and not expired — `checkExpired` is
+/// `parentCloseTime > Expiration`. A missing domain admits nobody.
+pub(crate) fn account_in_domain(sandbox: &Sandbox, account: &[u8; 20], domain: &xrpl_core::types::Hash256) -> bool {
+    let Some(pd) = crate::tx::offer::json_at(sandbox, domain) else { return false };
+    if pd.get("Owner").and_then(|v| v.as_str()).and_then(crate::tx::offer::decode20) == Some(*account) {
+        return true;
+    }
+    let now = sandbox.base().close_time() as u64;
+    let Some(creds) = pd.get("AcceptedCredentials").and_then(|v| v.as_array()) else { return false };
+    creds.iter().any(|c| {
+        let inner = c.get("Credential").unwrap_or(c);
+        let Some(issuer) = inner.get("Issuer").and_then(|v| v.as_str()).and_then(crate::tx::offer::decode20) else {
+            return false;
+        };
+        let Some(ct) = inner.get("CredentialType").and_then(|v| v.as_str()).and_then(|h| hex::decode(h).ok()) else {
+            return false;
+        };
+        let key = crate::tx::credential::credential_key(account, &issuer, &ct);
+        let Some(cred) = crate::tx::offer::json_at(sandbox, &key) else { return false };
+        if cred["Flags"].as_u64().unwrap_or(0) & 0x0001_0000 == 0 {
+            return false; // not lsfAccepted
+        }
+        let exp = cred.get("Expiration").and_then(|v| v.as_u64()).unwrap_or(u64::MAX);
+        now <= exp
+    })
 }
 
 pub struct PermissionedDomainDeleteTransactor;

@@ -386,6 +386,51 @@ fn load_account_states(state: &mut LedgerState, url: &str, addr: &str, ledger_in
 /// the owner's chain; accept needs both parties' — the counterparty is only
 /// discoverable through the offer SLE, fetched here (cached) pre-hexify so
 /// its Owner is still base58 for account_objects.
+/// Finding 333: a DomainID transaction (Payment, OfferCreate) is judged by
+/// `accountInDomain` — the domain object (already a 64-hex read key) AND, for
+/// every party, the Credential objects the domain's AcceptedCredentials name.
+/// The engine reads those keys and nothing in the meta names them (an
+/// in-domain party changes no credential), so they must be loaded here: the
+/// domain first, then keylet::credential(party, Issuer, CredentialType) per
+/// accepted entry. Devnet 5419038 A4C673A4 (r4uY's hybrid offer, credential
+/// 78540263… issued by the domain owner) was tecNO_PERMISSION unhydrated.
+fn load_domain_credentials_for_tx(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
+    let Some(domain_hex) = txj.get("DomainID").and_then(|v| v.as_str()).filter(|s| s.len() == 64) else {
+        return;
+    };
+    load_object(state, url, domain_hex, ledger_index);
+    let Ok(db) = hex::decode(domain_hex) else { return };
+    let mut dk = [0u8; 32];
+    dk.copy_from_slice(&db);
+    let Some(dom) = state.state_map.lookup(&Hash256(dk)).and_then(|b| serde_json::from_slice::<Value>(b).ok()) else {
+        return;
+    };
+    let addr20 = |s: &str| -> Option<[u8; 20]> {
+        if s.len() == 40 {
+            hex::decode(s).ok().and_then(|b| b.try_into().ok())
+        } else {
+            decode_address(s)
+        }
+    };
+    let parties: Vec<[u8; 20]> = ["Account", "Destination"]
+        .iter()
+        .filter_map(|f| txj.get(*f).and_then(|v| v.as_str()).and_then(decode_address))
+        .collect();
+    for e in dom.get("AcceptedCredentials").and_then(|v| v.as_array()).into_iter().flatten() {
+        let inner = e.get("Credential").unwrap_or(e);
+        let (Some(issuer), Some(ct)) = (
+            inner.get("Issuer").and_then(|v| v.as_str()).and_then(addr20),
+            inner.get("CredentialType").and_then(|v| v.as_str()).and_then(|h| hex::decode(h).ok()),
+        ) else {
+            continue;
+        };
+        for p in &parties {
+            let k = keylet::credential_key(p, &issuer, &ct);
+            load_object(state, url, &hex::encode_upper(k.0), ledger_index);
+        }
+    }
+}
+
 fn load_nft_pages_for_tx(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
     match txj["TransactionType"].as_str() {
         Some("NFTokenMint") => {
@@ -2653,6 +2698,7 @@ fn run() -> i32 {
         load_owner_dir_tail(&mut state, &rpc_url, txj, seq - 1);
         load_payment_books(&mut state, &rpc_url, txj, seq - 1, &mut books_seen);
         load_nft_pages_for_tx(&mut state, &rpc_url, txj, seq - 1);
+        load_domain_credentials_for_tx(&mut state, &rpc_url, txj, seq - 1); // finding 333
         load_amm_prestate(&mut state, &rpc_url, txj, seq - 1);
         load_offer_cancel_prestate(&mut state, &rpc_url, txj, seq - 1);
         load_paychan_prestate(&mut state, &rpc_url, txj, seq - 1);

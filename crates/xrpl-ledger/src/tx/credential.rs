@@ -29,13 +29,8 @@ use crate::shamap::hash::sha512_half;
 /// fields, with credType as its RAW bytes. Hashing the type separately, or
 /// hashing the hex TEXT of the type, both yield a key that can never match a
 /// credential the network created — so a duplicate would go unnoticed.
-fn credential_key(subject: &[u8; 20], issuer: &[u8; 20], credential_type: &[u8]) -> xrpl_core::types::Hash256 {
-    let mut buf = Vec::with_capacity(2 + 20 + 20 + credential_type.len());
-    buf.extend_from_slice(&[0x00, 0x44]); // 'D'
-    buf.extend_from_slice(subject);
-    buf.extend_from_slice(issuer);
-    buf.extend_from_slice(credential_type);
-    sha512_half(&buf)
+pub(crate) fn credential_key(subject: &[u8; 20], issuer: &[u8; 20], credential_type: &[u8]) -> xrpl_core::types::Hash256 {
+    crate::ledger::keylet::credential_key(subject, issuer, credential_type)
 }
 
 /// CredentialType travels as hex text in our tx JSON; the keylet wants the

@@ -504,10 +504,27 @@ def main():
             named_keys.append(hashlib.sha512(b"\x00u" + bytes.fromhex(acct_id(tx["Owner"])) + int(tx["OfferSequence"]).to_bytes(4, "big")).digest()[:32].hex().upper())
         except Exception as e:
             print(f"note: escrow key: {e}", file=sys.stderr)
-    for f in ("Channel", "CheckID"):
+    for f in ("Channel", "CheckID", "DomainID"):
         v = tx.get(f)
         if isinstance(v, str) and len(v) == 64:
             named_keys.append(v.upper())
+    # Finding 333: a DomainID transaction is judged by accountInDomain — the
+    # domain object plus, per party, the Credential objects its
+    # AcceptedCredentials name (keylet credential(subject, issuer, type)).
+    if isinstance(tx.get("DomainID"), str) and len(tx["DomainID"]) == 64:
+        try:
+            dom = rpc("ledger_entry", {"index": tx["DomainID"], "ledger_index": seq - 1}).get("node") or {}
+            for e in dom.get("AcceptedCredentials", []):
+                inner = e.get("Credential", e)
+                for pf in ("Account", "Destination"):
+                    subj = tx.get(pf)
+                    if not subj or not inner.get("Issuer") or not inner.get("CredentialType"):
+                        continue
+                    c = rpc("ledger_entry", {"credential": {"subject": subj, "issuer": inner["Issuer"], "credential_type": inner["CredentialType"]}, "ledger_index": seq - 1, "binary": True})
+                    if c.get("node_binary") and c.get("index"):
+                        pre[c["index"].upper()] = c["node_binary"]
+        except Exception as e:
+            print(f"note: domain credentials: {e}", file=sys.stderr)
     for nk in named_keys:
         if nk not in pre:
             try:

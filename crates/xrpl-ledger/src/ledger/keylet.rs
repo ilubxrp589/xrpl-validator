@@ -211,6 +211,17 @@ pub fn did_key(account_id: &[u8; 20]) -> Hash256 {
     sha512_half(&buf)
 }
 
+/// Credential key: `SHA512Half(0x0044 ('D') || subject || issuer || credType bytes)`
+/// (Indexes.cpp credential): ONE flat hash, the type as its RAW bytes.
+pub fn credential_key(subject: &[u8; 20], issuer: &[u8; 20], credential_type: &[u8]) -> Hash256 {
+    let mut buf = Vec::with_capacity(2 + 20 + 20 + credential_type.len());
+    buf.extend_from_slice(&[0x00, 0x44]);
+    buf.extend_from_slice(subject);
+    buf.extend_from_slice(issuer);
+    buf.extend_from_slice(credential_type);
+    sha512_half(&buf)
+}
+
 /// PermissionedDomain key: `SHA512Half(0x006D ('m') || account || seq_be32)`.
 pub fn permissioned_domain_key(account_id: &[u8; 20], sequence: u32) -> Hash256 {
     let mut buf = [0u8; 26];
