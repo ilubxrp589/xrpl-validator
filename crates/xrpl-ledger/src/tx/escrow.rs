@@ -834,7 +834,14 @@ impl Transactor for EscrowFinishTransactor {
                 let owner_is_issuer = owner_id == leg.issuer;
                 let line_key = keylet::ripple_state_key(&dest_id, &leg.issuer, &leg.cur);
                 let line = if dest_is_issuer { None } else { crate::tx::offer::json_at(sandbox, &line_key) };
-                if !dest_is_issuer && line.is_none() && dest_id != owner_id {
+                // Finding 340 (#107088326 7B29A3CAC3C1, rnMYFsTv finishing its
+                // OWN self-escrow of 1400000 XRPL14 with no line and 1.399968
+                // XRP against a reserve of 1.6): `createAsset = destID ==
+                // account_` — the owner being the destination changes nothing;
+                // the line is created (reserve permitting) or the finish is
+                // tecNO_LINE. The `dest != owner` guard here skipped both and
+                // credited a line that did not exist (5 muts v 1).
+                if !dest_is_issuer && line.is_none() {
                     // Finding 266 (#106937018 D157B8D102BD): a token escrow
                     // finished BY ITS DESTINATION creates the missing line.
                     // rippled's `escrowUnlockApplyHelper<Issue>`
@@ -887,7 +894,9 @@ impl Transactor for EscrowFinishTransactor {
                 } else {
                     want
                 };
-                if let Some(line) = line.as_ref().filter(|_| dest_id != owner_id) {
+                // The limit test runs only when the finisher is NOT the receiver
+                // (`if (!createAsset)`, Escrow.cpp:921).
+                if let Some(line) = line.as_ref().filter(|_| dest_id != tx.account) {
                     let dest_low = dest_id < leg.issuer;
                     let limit = line[if dest_low { "LowLimit" } else { "HighLimit" }]
                         .get("value")

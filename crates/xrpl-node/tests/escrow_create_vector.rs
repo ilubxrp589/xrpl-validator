@@ -260,3 +260,12 @@ fn escrow_cancel_mpt_returns_the_lock() {
 fn escrow_cancel_mpt_before_cancel_after_by_a_stranger_is_no_permission() {
     run_bundle(include_str!("vectors/escrow_cancel_mpt_before_cancel_after_by_a_stranger_is_no_permission_devnet_5423390.json"));
 }
+
+/// Finding 340 — #107088326 7B29A3CAC3C1: an owner finishes its own token
+/// self-escrow with no trust line and 1.399968 XRP against a reserve of 1.6
+/// for the line → tecNO_LINE_INSUF_RESERVE, fee only. We credited a line
+/// that did not exist.
+#[test]
+fn escrow_finish_self_escrow_without_a_line_needs_the_reserve_107088326() {
+    run_bundle(include_str!("vectors/escrow_finish_self_escrow_without_a_line_needs_the_reserve_107088326.json"));
+}
