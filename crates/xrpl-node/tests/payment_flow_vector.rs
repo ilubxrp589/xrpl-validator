@@ -1030,3 +1030,18 @@ fn payment_consuming_a_hybrid_offer_unlinks_its_open_book_entry_devnet_5419040()
 fn payment_in_domain_short_of_liquidity_is_path_partial_devnet_5422959() {
     run_bundle(include_str!("vectors/payment_in_domain_short_of_liquidity_is_path_partial_devnet_5422959.json"));
 }
+
+/// Finding 342 — #107093460 D125FEC040CD: a CCR payment into a DepositAuth
+/// destination carrying one accepted, unexpired CredentialID; the
+/// destination pre-authorised that (Issuer, CredentialType) — the
+/// DepositPreauth-by-credentials object is in the pre-state. We refused it.
+#[test]
+fn payment_with_credentials_into_a_deposit_auth_destination_107093460() {
+    run_bundle(include_str!("vectors/payment_with_credentials_into_a_deposit_auth_destination_107093460.json"));
+}
+
+/// Finding 342 — #107093959 1A036B0C6D6F: the sibling bot account, same shape.
+#[test]
+fn payment_with_credentials_into_a_deposit_auth_destination_107093959() {
+    run_bundle(include_str!("vectors/payment_with_credentials_into_a_deposit_auth_destination_107093959.json"));
+}

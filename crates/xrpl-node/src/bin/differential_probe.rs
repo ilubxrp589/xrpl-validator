@@ -431,6 +431,43 @@ fn load_domain_credentials_for_tx(state: &mut LedgerState, url: &str, txj: &Valu
     }
 }
 
+/// Finding 342: a transaction carrying CredentialIDs into a DepositAuth
+/// destination is authorised by DepositPreauth(dst, sorted (Issuer,
+/// CredentialType) of those credentials) — an object nothing in the meta
+/// names when the payment succeeds. The credentials themselves are 64-hex
+/// read keys (loaded already); this reads them and loads the preauth object.
+fn load_credential_preauth_for_tx(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
+    let Some(ids) = txj.get("CredentialIDs").and_then(|v| v.as_array()) else { return };
+    let Some(dst) = txj.get("Destination").and_then(|v| v.as_str()).and_then(decode_address) else { return };
+    let addr20 = |s: &str| -> Option<[u8; 20]> {
+        if s.len() == 40 {
+            hex::decode(s).ok().and_then(|b| b.try_into().ok())
+        } else {
+            decode_address(s)
+        }
+    };
+    let mut sorted: Vec<([u8; 20], Vec<u8>)> = Vec::new();
+    for id in ids.iter().filter_map(|v| v.as_str()) {
+        load_object(state, url, id, ledger_index);
+        let Ok(kb) = hex::decode(id) else { continue };
+        let Ok(k) = <[u8; 32]>::try_from(kb.as_slice()) else { continue };
+        let Some(c) = state.state_map.lookup(&Hash256(k)).and_then(|b| serde_json::from_slice::<Value>(b).ok()) else { continue };
+        if let (Some(issuer), Some(ct)) = (
+            c.get("Issuer").and_then(|v| v.as_str()).and_then(addr20),
+            c.get("CredentialType").and_then(|v| v.as_str()).and_then(|h| hex::decode(h).ok()),
+        ) {
+            sorted.push((issuer, ct));
+        }
+    }
+    if sorted.is_empty() {
+        return;
+    }
+    sorted.sort();
+    sorted.dedup();
+    let k = keylet::deposit_preauth_credentials_key(&dst, &sorted);
+    load_object(state, url, &hex::encode_upper(k.0), ledger_index);
+}
+
 fn load_nft_pages_for_tx(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
     match txj["TransactionType"].as_str() {
         Some("NFTokenMint") => {
@@ -2749,6 +2786,7 @@ fn run() -> i32 {
         load_payment_books(&mut state, &rpc_url, txj, seq - 1, &mut books_seen);
         load_nft_pages_for_tx(&mut state, &rpc_url, txj, seq - 1);
         load_domain_credentials_for_tx(&mut state, &rpc_url, txj, seq - 1); // finding 333
+        load_credential_preauth_for_tx(&mut state, &rpc_url, txj, seq - 1); // finding 342
         load_amm_prestate(&mut state, &rpc_url, txj, seq - 1);
         load_offer_cancel_prestate(&mut state, &rpc_url, txj, seq - 1);
         load_paychan_prestate(&mut state, &rpc_url, txj, seq - 1);

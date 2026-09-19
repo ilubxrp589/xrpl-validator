@@ -535,6 +535,27 @@ def main():
                     pre[r["index"].upper()] = r["node_binary"]
     except Exception as e:
         print(f"note: mpt escrow prestate: {e}", file=sys.stderr)
+    # Finding 342: CredentialIDs name Credential objects (their keys), and a
+    # DepositAuth destination authorises them through DepositPreauth(dst,
+    # sorted (Issuer, CredentialType)) — the RPC's deposit_preauth form with
+    # authorized_credentials resolves that key.
+    try:
+        cids = tx.get("CredentialIDs") or []
+        creds = []
+        for cid in cids:
+            r = rpc("ledger_entry", {"index": cid, "ledger_index": seq - 1})
+            n = r.get("node") or {}
+            if n.get("Issuer") and n.get("CredentialType"):
+                creds.append({"issuer": n["Issuer"], "credential_type": n["CredentialType"]})
+            rb = rpc("ledger_entry", {"index": cid, "ledger_index": seq - 1, "binary": True})
+            if rb.get("node_binary"):
+                pre[cid.upper()] = rb["node_binary"]
+        if creds and tx.get("Destination"):
+            dp = rpc("ledger_entry", {"deposit_preauth": {"owner": tx["Destination"], "authorized_credentials": creds}, "ledger_index": seq - 1, "binary": True})
+            if dp.get("node_binary") and dp.get("index"):
+                pre[dp["index"].upper()] = dp["node_binary"]
+    except Exception as e:
+        print(f"note: credential preauth: {e}", file=sys.stderr)
     # The Amendments singleton (7DB0788C…): amendment-gated rules read it
     # (fixCleanup3_3_0, fixCleanup3_4_0 — finding 338), and a bundle without
     # it answers "not enabled" for everything.

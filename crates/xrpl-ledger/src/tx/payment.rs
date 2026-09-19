@@ -2297,6 +2297,45 @@ impl Transactor for PaymentTransactor {
         // mutations against mainnet's 1. Succeeding where mainnet REFUSES moves
         // value mainnet never moved, which is why this outranked the rest of
         // the batch.
+        // Finding 342 (#107093460 D125FEC040CD and twenty more in soak #19,
+        // rCCRYBtRB/rCCRSvpkB paying DepositAuth destinations with a
+        // CredentialID): `verifyDepositPreauth` (CredentialHelpers.cpp:361)
+        // first removes any EXPIRED credential named by the transaction —
+        // `checkExpired`, parentCloseTime > Expiration — and answers
+        // tecEXPIRED (the deletions stand, a tec keeps them); then, with the
+        // destination under lsfDepositAuth and no DepositPreauth(dst, src),
+        // a transaction carrying credentials is authorized when
+        // DepositPreauth(dst, sorted (Issuer, CredentialType) of those
+        // credentials) exists — else tecNO_PERMISSION. We knew only the
+        // by-account object and refused all twenty-one.
+        let cred_ids: Vec<xrpl_core::types::Hash256> = tx
+            .fields
+            .get("CredentialIDs")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter_map(|h| hex::decode(h).ok())
+                    .filter_map(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                    .map(xrpl_core::types::Hash256)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !cred_ids.is_empty() {
+            let now = sandbox.base().close_time() as u64;
+            let mut expired = false;
+            for k in &cred_ids {
+                let exp = crate::tx::offer::json_at(sandbox, k)
+                    .and_then(|c| c.get("Expiration").and_then(|v| v.as_u64()));
+                if exp.is_some_and(|e| now > e) {
+                    crate::tx::credential::delete_credential_object(sandbox, k);
+                    expired = true;
+                }
+            }
+            if expired {
+                return TxResult::Expired;
+            }
+        }
         if let Some(dst) = crate::tx::offer::json_at(sandbox, &keylet::account_root_key(&dest_id)) {
             if dst["Flags"].as_u64().unwrap_or(0) & 0x0100_0000 != 0 && dest_id != tx.account {
                 let ripple = cross_currency || !amt_json.is_string() || sendmax.is_some();
@@ -2311,7 +2350,27 @@ impl Transactor for PaymentTransactor {
                         .read(&keylet::deposit_preauth_key(&dest_id, &tx.account))
                         .is_none()
                 {
-                    return TxResult::NoPermission;
+                    if cred_ids.is_empty() {
+                        return TxResult::NoPermission;
+                    }
+                    // `authorizedDepositPreauth`: the credentials' (Issuer,
+                    // CredentialType) pairs, sorted, name the preauth object.
+                    let mut sorted: Vec<([u8; 20], Vec<u8>)> = Vec::new();
+                    for k in &cred_ids {
+                        let Some(c) = crate::tx::offer::json_at(sandbox, k) else { return TxResult::NoPermission };
+                        let (Some(issuer), Some(ct)) = (
+                            c.get("Issuer").and_then(|v| v.as_str()).and_then(crate::tx::offer::decode20),
+                            c.get("CredentialType").and_then(|v| v.as_str()).and_then(|h| hex::decode(h).ok()),
+                        ) else {
+                            return TxResult::NoPermission;
+                        };
+                        sorted.push((issuer, ct));
+                    }
+                    sorted.sort();
+                    sorted.dedup();
+                    if sandbox.read(&keylet::deposit_preauth_credentials_key(&dest_id, &sorted)).is_none() {
+                        return TxResult::NoPermission;
+                    }
                 }
             }
         }
