@@ -1585,3 +1585,19 @@ fn offer_sell_fill_or_kill_whose_in_fold_overshoots_is_killed_107078052() {
 fn offer_sell_fill_or_kill_whose_in_fold_overshoots_is_killed_107078068() {
     run_bundle(include_str!("vectors/offer_sell_fill_or_kill_whose_in_fold_overshoots_is_killed_107078068.json"));
 }
+
+/// Finding 337 — devnet 5422969 556E025939A5: rQNx's domain offer walks the
+/// domain book onto r4uY's BF23A33D, whose owner lost its KYC credential two
+/// ledgers earlier. `offerInDomain` fails → the offer is removed for good and
+/// the taker's offer rests uncrossed. We crossed it.
+#[test]
+fn offer_create_removes_a_domain_offer_whose_owner_left_the_domain_devnet_5422969() {
+    run_bundle(include_str!("vectors/offer_create_removes_a_domain_offer_whose_owner_left_the_domain_devnet_5422969.json"));
+}
+
+/// Finding 333 — devnet 5422957 114F74C8AB4F: r4uY, its credential deleted,
+/// names the domain on an OfferCreate → tecNO_PERMISSION (accountInDomain).
+#[test]
+fn offer_create_outside_its_domain_is_no_permission_devnet_5422957() {
+    run_bundle(include_str!("vectors/offer_create_outside_its_domain_is_no_permission_devnet_5422957.json"));
+}

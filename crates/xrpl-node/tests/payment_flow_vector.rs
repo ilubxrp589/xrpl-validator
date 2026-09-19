@@ -1022,3 +1022,11 @@ fn escrow_create_cancel_after_at_or_before_finish_after_is_bad_expiration_fuzz_t
 fn payment_consuming_a_hybrid_offer_unlinks_its_open_book_entry_devnet_5419040() {
     run_bundle(include_str!("vectors/payment_consuming_a_hybrid_offer_unlinks_its_open_book_entry_devnet_5419040.json"));
 }
+
+/// Finding 333 — devnet 5422959 FE1A0200A515: a domain payment (rQNx to
+/// itself, SendMax 5 USD for 1 XRP) whose domain book cannot fill it →
+/// tecPATH_PARTIAL, fee only.
+#[test]
+fn payment_in_domain_short_of_liquidity_is_path_partial_devnet_5422959() {
+    run_bundle(include_str!("vectors/payment_in_domain_short_of_liquidity_is_path_partial_devnet_5422959.json"));
+}

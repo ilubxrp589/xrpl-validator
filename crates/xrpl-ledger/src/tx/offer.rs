@@ -2867,6 +2867,34 @@ fn reap_if_dead(
         dead_reaped_mark(okey);
         return true;
     }
+    // Finding 337 (OfferStream.cpp:293-301): an offer carrying a DomainID
+    // whose owner is NO LONGER in that domain — `permissioned_dex::
+    // offerInDomain` — is removed for good ("Removing offer no longer in
+    // domain"), whichever book the stream reached it through (a hybrid
+    // offer rests in the open book too). Devnet 5422969 556E025939A5: r4uY's
+    // domain offer BF23A33D after the issuer deleted its KYC credential —
+    // rQNx's crossing offer removed it and RESTED; we crossed it.
+    if let Some(d) = offer
+        .get("DomainID")
+        .and_then(|v| v.as_str())
+        .and_then(|h| hex::decode(h).ok())
+        .filter(|b| b.len() == 32)
+        .map(|b| {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&b);
+            Hash256(k)
+        })
+    {
+        if !crate::tx::misc::account_in_domain(sandbox, maker, &d) {
+            if std::env::var("DX_RM").is_ok() {
+                eprintln!("DX_RM domain-orphan okey={} maker={}", hex::encode(okey.0), hex::encode(maker));
+            }
+            delete_maker_offer(sandbox, okey, offer, maker);
+            stale.push(*okey);
+            dead_reaped_mark(okey);
+            return true;
+        }
+    }
     if std::env::var("DX_RM").is_ok() {
         eprintln!(
             "DX_RM peek maker={} gives0={m_gives0:?} avail={:?} acct={}",
