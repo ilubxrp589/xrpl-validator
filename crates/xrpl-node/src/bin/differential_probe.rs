@@ -2307,6 +2307,12 @@ fn build_txfields(txjson: &Value) -> Option<TxFields> {
 /// so the harness can build the per-tx mutation set. Caller threads the mods
 /// forward via `apply_modifications`.
 fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<Hash256, SandboxEntry>) {
+    // The engine's per-transaction thread-locals (finding 336's SELL_IN_FOLD,
+    // finding 339's TURN_REJECTED, …) must not leak from one tx into the
+    // next: the node resets them in native_apply.rs; the probe applies
+    // through its own copy and did not (1AD9E8033191 in #107093372 read a
+    // flag C932E2C004EA's tail turn left behind).
+    xrpl_ledger::tx::reset_thread_state();
     let transactor = match get_transactor(&tx.tx_type) {
         Some(t) => t,
         None => {

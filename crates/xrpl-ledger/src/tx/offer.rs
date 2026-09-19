@@ -4561,6 +4561,9 @@ thr={t:?} admits_trunc={} admits_up={}",
                     direct_dry = true;
                 }
             }
+            // Finding 341: the bridged pool's refusals are modelled by finding
+            // 306's own rules; drop the direct-walk flag so it cannot leak.
+            let _ = crate::tx::amm_swap::take_turn_rejected();
             if used {
                 // The slice's GROSS joins the walk's spend (see gets_gross_cap).
                 // Finding 336: the slice that EXHAUSTS the round's in is
@@ -7532,7 +7535,7 @@ pub(crate) fn cross_engine_to_net(
                 // "Path rejected by limitQuality" — rippled breaks out of
                 // flow(); the level's offers are never visited.
                 if std::env::var("DX_AMM").is_ok() {
-                    eprintln!("DX_AMM turn rejected by limitQuality → walk ends (F339)");
+                    eprintln!("DX_AMM pool took the iteration and yielded nothing usable (limit reject or dry swap) → walk ends (F339/F341)");
                 }
                 walk_ended_by_pool = true;
                 break 'dirs;
@@ -9095,6 +9098,10 @@ pub(crate) fn cross_engine_to_net(
                 pay_in_rate,
                 if crossed == 0 { raw_first_q } else { residual_q },
             );
+            // Finding 341: a tail turn that took the iteration and yielded
+            // nothing ends nothing further — the walk is at its end already;
+            // consume the flag so it cannot leak into a later walk.
+            let _ = crate::tx::amm_swap::take_turn_rejected();
             let line_drained = line_bound && used && me_is_zero(rg);
             // Re-express the turn's remainder against the walk's own budget:
             // the slice took rg_turn − rg.
