@@ -1908,6 +1908,56 @@ fn load_mpt_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_ind
     }
 }
 
+/// Escrow pre-state for Finish/Cancel: the escrow object itself, keyed by
+/// (Owner, OfferSequence) — a fee-only tec (too early, wrong canceller)
+/// never carries it in the meta, and without it the engine answers
+/// tecNO_TARGET for whatever the network decided (devnet 5423390
+/// 4EC1AB97AE48, tecNO_PERMISSION) — and, for an MPT escrow, the issuance
+/// and the owner's, destination's and finisher's MPTokens that the unlock
+/// helpers read (finding 332/338).
+fn load_escrow_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
+    if !matches!(txj["TransactionType"].as_str(), Some("EscrowFinish") | Some("EscrowCancel")) {
+        return;
+    }
+    let (Some(owner), Some(seq)) = (txj["Owner"].as_str().and_then(decode_address), txj["OfferSequence"].as_u64()) else {
+        return;
+    };
+    let ekey = keylet::escrow_key(&owner, seq as u32);
+    load_object(state, url, &hex::encode_upper(ekey.0), ledger_index);
+    let Some(esc) = state.state_map.lookup(&ekey).and_then(|b| serde_json::from_slice::<Value>(b).ok()) else {
+        return;
+    };
+    let addr20 = |s: &str| -> Option<[u8; 20]> {
+        if s.len() == 40 {
+            hex::decode(s).ok().and_then(|b| b.try_into().ok())
+        } else {
+            decode_address(s)
+        }
+    };
+    let Some(id) = esc
+        .get("Amount")
+        .and_then(|a| a.get("mpt_issuance_id"))
+        .and_then(|v| v.as_str())
+        .and_then(|h| hex::decode(h).ok())
+        .and_then(|b| <[u8; 24]>::try_from(b.as_slice()).ok())
+    else {
+        return;
+    };
+    let ikey = keylet::mpt_issuance_key(&id);
+    load_object(state, url, &hex::encode_upper(ikey.0), ledger_index);
+    let mut parties = vec![owner];
+    if let Some(d) = esc.get("Destination").and_then(|v| v.as_str()).and_then(addr20) {
+        parties.push(d);
+    }
+    if let Some(a) = txj["Account"].as_str().and_then(decode_address) {
+        parties.push(a);
+    }
+    for p in parties {
+        load_object(state, url, &hex::encode_upper(keylet::mptoken_key(&ikey, &p).0), ledger_index);
+        load_object(state, url, &hex::encode_upper(keylet::account_root_key(&p).0), ledger_index);
+    }
+}
+
 /// PayChannel pre-state: hydration is meta-driven, and a Fund/Claim's meta
 /// never touches the channel DESTINATION's AccountRoot — but the engine's
 /// dst-exists check (tecNO_DST) reads it. Gate 'paychan' caught the miss:
@@ -2703,6 +2753,7 @@ fn run() -> i32 {
         load_offer_cancel_prestate(&mut state, &rpc_url, txj, seq - 1);
         load_paychan_prestate(&mut state, &rpc_url, txj, seq - 1);
         load_mpt_prestate(&mut state, &rpc_url, txj, seq - 1);
+        load_escrow_prestate(&mut state, &rpc_url, txj, seq - 1);
     }
     // FLAG-LEDGER OPEN: rotate the NegativeUNL pending fields into
     // DisabledValidators before any transaction applies — a ledger-level

@@ -251,3 +251,12 @@ fn escrow_finish_mpt_to_the_issuer_burns_outstanding() {
 fn escrow_cancel_mpt_returns_the_lock() {
     run_bundle(include_str!("vectors/escrow_cancel_mpt_returns_the_lock_devnet_5423393.json"));
 }
+
+/// Finding 332 — devnet 5423390 4EC1AB97AE48: a stranger cancels an MPT
+/// escrow before CancelAfter → tecNO_PERMISSION. The bundle carries the
+/// issuance and the parties' MPTokens the cancel preclaim reads (harness
+/// finding: without them the engine answered tecOBJECT_NOT_FOUND).
+#[test]
+fn escrow_cancel_mpt_before_cancel_after_by_a_stranger_is_no_permission() {
+    run_bundle(include_str!("vectors/escrow_cancel_mpt_before_cancel_after_by_a_stranger_is_no_permission_devnet_5423390.json"));
+}

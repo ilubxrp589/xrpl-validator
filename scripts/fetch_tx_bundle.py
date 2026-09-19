@@ -508,6 +508,33 @@ def main():
         v = tx.get(f)
         if isinstance(v, str) and len(v) == 64:
             named_keys.append(v.upper())
+    # Finding 332/338: an MPT escrow's Finish/Cancel reads the issuance and
+    # the owner's, destination's and finisher's MPTokens off the ESCROW's
+    # amount; an MPT EscrowCreate reads them off its own Amount. A fee-only
+    # tec never carries any of them (devnet 5423390 4EC1AB97, ours
+    # tecOBJECT_NOT_FOUND for the network's tecNO_PERMISSION).
+    try:
+        mpt_parties = []
+        mpt_id = None
+        if tx.get("TransactionType") in ("EscrowFinish", "EscrowCancel") and tx.get("Owner") and tx.get("OfferSequence") is not None:
+            en = rpc("ledger_entry", {"escrow": {"owner": tx["Owner"], "seq": int(tx["OfferSequence"])}, "ledger_index": seq - 1}).get("node") or {}
+            amt = en.get("Amount")
+            if isinstance(amt, dict) and amt.get("mpt_issuance_id"):
+                mpt_id = amt["mpt_issuance_id"]
+                mpt_parties = [tx["Owner"], en.get("Destination"), tx.get("Account")]
+        elif tx.get("TransactionType") == "EscrowCreate" and isinstance(tx.get("Amount"), dict) and tx["Amount"].get("mpt_issuance_id"):
+            mpt_id = tx["Amount"]["mpt_issuance_id"]
+            mpt_parties = [tx.get("Account"), tx.get("Destination")]
+        if mpt_id:
+            r = rpc("ledger_entry", {"mpt_issuance": mpt_id, "ledger_index": seq - 1, "binary": True})
+            if r.get("node_binary") and r.get("index"):
+                pre[r["index"].upper()] = r["node_binary"]
+            for p in [x for x in mpt_parties if x]:
+                r = rpc("ledger_entry", {"mptoken": {"mpt_issuance_id": mpt_id, "account": p}, "ledger_index": seq - 1, "binary": True})
+                if r.get("node_binary") and r.get("index"):
+                    pre[r["index"].upper()] = r["node_binary"]
+    except Exception as e:
+        print(f"note: mpt escrow prestate: {e}", file=sys.stderr)
     # The Amendments singleton (7DB0788C…): amendment-gated rules read it
     # (fixCleanup3_3_0, fixCleanup3_4_0 — finding 338), and a bundle without
     # it answers "not enabled" for everything.
