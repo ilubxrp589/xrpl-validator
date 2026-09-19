@@ -2241,7 +2241,14 @@ pub(crate) fn consume(
         take_out = rem_pays;
         match swap_asset_out(pool_in, pool_out, take_out, amm.tfee, gets_leg.xrp) {
             Some(i) => take_in = i,
-            None => return (rem_pays, rem_gets, false),
+            None => {
+                // Finding 341: the pool took the iteration (getOffer created
+                // its offer) and the re-swap for the want yields nothing —
+                // rippled's strand is dry and flow() ends; the CLOB behind
+                // the pool is never reached.
+                mark_turn_rejected();
+                return (rem_pays, rem_gets, false);
+            }
         }
         // Finding 131 (#106734485 83E5899A): rippled's forward pass drives a
         // BookStep by its INPUT — `fwdImp` hands `limitStepIn` the whole
@@ -2469,6 +2476,15 @@ pub(crate) fn consume(
         }
     }
     if take_in.0 == 0 || take_out.0 == 0 {
+        // Finding 341 (#107093372 BE1B5D257244, rogue5Hn 12.814 XAH →
+        // 0.19223 RLUSD, tfPartialPayment): iteration 2's tryAMM anchored the
+        // pool on the next tip (150 XAH/RLUSD; the pool's 68 beats it) and
+        // the forward pass swapped the 1.55e-12 XAH remainder for NOTHING
+        // — "Non-limiting step found dry", "All strands dry", Total flow =
+        // iteration 1. We declined the zero slice and filled the remainder
+        // from the tip behind the pool, crediting a line mainnet never
+        // touched (10 muts v 9). The pool took the iteration: the walk ends.
+        mark_turn_rejected();
         return (rem_pays, rem_gets, false);
     }
     // Finding 131: an input-clamped fill's output beyond the want is the

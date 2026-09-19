@@ -1030,3 +1030,13 @@ fn payment_consuming_a_hybrid_offer_unlinks_its_open_book_entry_devnet_5419040()
 fn payment_in_domain_short_of_liquidity_is_path_partial_devnet_5422959() {
     run_bundle(include_str!("vectors/payment_in_domain_short_of_liquidity_is_path_partial_devnet_5422959.json"));
 }
+
+/// Finding 341 — #107093372 BE1B5D257244: a partial XAH→RLUSD payment whose
+/// first iteration leaves a 1e-14 remainder. The pool wins iteration two
+/// anchored at the next tip's quality, its forward swap of the 1.55e-12 XAH
+/// left yields nothing, the strand is dry and rippled's flow ends. We filled
+/// the remainder from the tip behind the pool (its owner's XAH line pinned).
+#[test]
+fn payment_pool_dry_iteration_ends_the_flow_107093372() {
+    run_bundle(include_str!("vectors/payment_pool_dry_iteration_ends_the_flow_107093372.json"));
+}
