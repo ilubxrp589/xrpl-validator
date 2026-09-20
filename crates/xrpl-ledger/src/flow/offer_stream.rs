@@ -590,11 +590,24 @@ fn account_funds_iou_original(ps: &PaymentSandbox, owner: &[u8; 20], asset: &Ass
 fn xrp_liquid_original(ps: &PaymentSandbox, owner: &[u8; 20]) -> i128 {
     let Some(root) = ps.af_json(&keylet::account_root_key(owner)) else { return 0 };
     let balance: i128 = root["Balance"].as_str().and_then(|s| s.parse::<i128>().ok()).unwrap_or(0);
-    let counts = super::payment_sandbox::OwnerCounts {
+    if std::env::var("XRPL_FLOW_TRACE").is_ok() {
+        let live = json_at(ps.sandbox(), &keylet::account_root_key(owner)).and_then(|r| r["Balance"].as_str().map(|s| s.to_string()));
+        eprintln!("FLOW   xrp_liquid_original owner={} af_balance={balance} live_balance={live:?} layers={}", hex::encode(&owner[..6]), ps.depth());
+    }
+    let raw = super::payment_sandbox::OwnerCounts {
         owner: root["OwnerCount"].as_u64().unwrap_or(0) as u32,
         sponsored: root["SponsoredOwnerCount"].as_u64().unwrap_or(0) as u32,
         sponsoring: root["SponsoringOwnerCount"].as_u64().unwrap_or(0) as u32,
     };
+    // `xrpLiquid(cancelView_, …)` runs `view.ownerCountHook(id, OwnerCount)`
+    // on the afView, whose chain (`ps_`) is the flow's own sandbox — an
+    // offer deleted by an earlier iteration still counts toward the reserve
+    // (`adjustOwnerCountHook`). offer_sell_remaining_input_is_the_fold_of_
+    // saved_iteration_ins: the maker's first offer went at iteration 2, its
+    // root read 73 at iteration 8, the reserve fell 0.2 XRP short and
+    // "original" 200000 ≠ current 0 made a found-unfunded offer look like
+    // one that merely became so — mainnet removed it (OwnerCount 72).
+    let counts = ps.owner_count_hook(owner, raw);
     let reserve = crate::ledger::fees::account_reserve(ps.sandbox(), counts.count() as u64) as i128;
     (balance - reserve).max(0)
 }

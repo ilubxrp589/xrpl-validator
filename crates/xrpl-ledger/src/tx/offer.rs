@@ -9952,7 +9952,13 @@ impl Transactor for OfferCreateTransactor {
         // 124.14 XRP — past the 118.68 minimum — and mainnet rested
         // 102.963884945252 BAYN for 1616532 drops; the saturated pays here
         // read as fully crossed and we rested nothing (OwnerCount 1371/1372).
-        if me_is_zero(rem_gets) || (!sell && me_is_zero(rem_pays)) {
+        // Track 2: the port hands back rippled's own `afterCross` pair — for a
+        // sell, `afterCross.out = divRoundStrict(afterCross.in, rate, false)`
+        // — and `place_offer.in == 0 || place_offer.out == 0` is "Offer fully
+        // crossed!" (CreateOffer.cpp:778) whichever side it is: a 1e-11 IOU
+        // dust left on the line rounds to zero drops and rests nothing
+        // (offer_sell_remaining_input_is_the_fold_of_saved_iteration_ins).
+        if me_is_zero(rem_gets) || ((!sell || port_after_in.is_some()) && me_is_zero(rem_pays)) {
             return TxResult::Success; // fully consumed
         }
 
