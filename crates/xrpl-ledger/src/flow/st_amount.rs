@@ -61,8 +61,15 @@ impl StAmount {
     pub fn drops(d: u64) -> StAmount {
         StAmount { native: true, negative: false, mantissa: d, exponent: 0 }
     }
+    /// `STAmount(issue, mantissa, exponent, negative)` — rippled's constructor
+    /// CANONICALISES (`canonicalize()`), so a ten-digit rate mantissa such as
+    /// `1001500000e-9` becomes `1001500000000000e-15` before any arithmetic
+    /// touches it. The raw form fed `mulRoundImpl` a short mantissa and the
+    /// crossing budget of offer_fill_cluster_is_byte_exact lost five digits
+    /// (4.0705300485e-6 for rippled's 4.070530048487853e-6).
     pub fn iou(negative: bool, mantissa: u64, exponent: i32) -> StAmount {
-        StAmount { native: false, negative, mantissa, exponent }
+        Self::construct(false, negative, mantissa as u128, exponent, Rounding::ToNearest)
+            .unwrap_or(StAmount { native: false, negative, mantissa, exponent })
     }
     /// An IOU from the engine's `(u128, i32)` pair, canonicalised at
     /// ToNearest (the constructor's default mode).
@@ -327,6 +334,23 @@ mod tests {
         let r = div_round_strict(&one, &three, false, false).unwrap();
         assert_eq!((r.mantissa, r.exponent), (3_333_333_333_333_333, -16));
         assert_eq!(div_round(&one, &StAmount::zero(false), false, true), Err(StError::DivideByZero));
+    }
+}
+
+#[cfg(test)]
+mod gross_budget_tests {
+    use super::*;
+
+    /// offer_fill_cluster_is_byte_exact (#106688646): CreateOffer's
+    /// `multiplyRound(takerAmount.in, gatewayXferRate, issue, true)` —
+    /// 4.064433398390267e-6 ETH × 1.0015 rounds UP to 4.070530048487853e-6;
+    /// the port's crossing budget came out 4.0705300485e-6 (eleven digits).
+    #[test]
+    fn multiply_round_keeps_sixteen_digits_on_the_gross_budget() {
+        let a = StAmount::iou(false, 4_064_433_398_390_267, -21);
+        let rate = StAmount::iou(false, 1_001_500_000, -9);
+        let r = mul_round(&a, &rate, false, true).unwrap();
+        assert_eq!((r.mantissa, r.exponent), (4_070_530_048_487_853, -21));
     }
 }
 
