@@ -708,8 +708,15 @@ pub(crate) fn signed_value(v: &serde_json::Value) -> (bool, Me) {
         _ => "0",
     };
     let neg = s.starts_with('-');
-    let me = keylet::amount_mant_exp(&serde_json::Value::String(s.trim_start_matches('-').to_string()))
-        .unwrap_or((0, 0));
+    // An IOU object goes to the parser AS an object: finding 303's sixteen-
+    // digit cap applies to IOU values only, and re-wrapping the value as a
+    // bare string read it as drops — a 96-digit deliver-max Amount then
+    // overflowed to (0, 0) and the port's payment delivered nothing
+    // (payment_ninety_six_digit_amount_parses_fuzz_107009438).
+    let me = match v {
+        serde_json::Value::Object(_) => keylet::amount_mant_exp(v).unwrap_or((0, 0)),
+        _ => keylet::amount_mant_exp(&serde_json::Value::String(s.trim_start_matches('-').to_string())).unwrap_or((0, 0)),
+    };
     (neg && me.0 > 0, me)
 }
 
