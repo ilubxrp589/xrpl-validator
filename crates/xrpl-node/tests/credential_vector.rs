@@ -147,3 +147,13 @@ fn deposit_preauth_by_credentials_files_the_credential_keyed_entry_testnet_20864
 fn deposit_preauth_unauthorize_credentials_removes_the_entry_testnet_20864007() {
     run_bundle(include_str!("vectors/deposit_preauth_unauthorize_credentials_removes_the_entry_testnet_20864007.json"));
 }
+
+/// Finding 345 — testnet campaign 6, #20909796 91B4ACF7: the subject accepts
+/// a credential while holding 2.99999 XRP with 11 objects; the reserve for
+/// the 12th (3.4 XRP) is not there. rippled judges the SUBJECT's reserve on
+/// acceptance (the object becomes theirs) — tecINSUFFICIENT_RESERVE, fee
+/// only. We accepted it and moved the owner count.
+#[test]
+fn credential_accept_subject_below_reserve_is_insufficient_reserve_testnet_20909796() {
+    run_bundle(include_str!("vectors/credential_accept_subject_below_reserve_is_insufficient_reserve_testnet_20909796.json"));
+}

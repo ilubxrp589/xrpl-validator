@@ -657,6 +657,30 @@ impl Transactor for CredentialAcceptTransactor {
             }
         }
 
+        // Finding 345 (testnet campaign 6, #20909796 91B4ACF7): the SUBJECT
+        // must hold the reserve for the object it is about to own —
+        // `accountReserve(sleSubject OwnerCount + 1)` against mPriorBalance
+        // (the balance BEFORE this tx's fee), CredentialAccept.cpp:118-121,
+        // after the expiry check and before lsfAccepted. A subject at
+        // 2.99999 XRP with 11 objects (reserve 3.4) is tecINSUFFICIENT_RESERVE;
+        // we accepted and moved the owner count.
+        {
+            let sk = keylet::account_root_key(&subject);
+            let (bal, oc) = match sandbox
+                .read(&sk)
+                .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
+            {
+                Some(a) => (
+                    a["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+                    a["OwnerCount"].as_u64().unwrap_or(0),
+                ),
+                None => return TxResult::NoAccount,
+            };
+            if bal.saturating_add(tx.fee) < crate::ledger::fees::account_reserve(sandbox, oc + 1) {
+                return TxResult::InsufficientReserve;
+            }
+        }
+
         // Mark as accepted
         cred["Accepted"] = serde_json::Value::Bool(true);
 
