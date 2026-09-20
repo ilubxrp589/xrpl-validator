@@ -519,6 +519,21 @@ def main():
         if tx.get("TransactionType") in ("EscrowFinish", "EscrowCancel") and tx.get("Owner") and tx.get("OfferSequence") is not None:
             en = rpc("ledger_entry", {"escrow": {"owner": tx["Owner"], "seq": int(tx["OfferSequence"])}, "ledger_index": seq - 1}).get("node") or {}
             amt = en.get("Amount")
+            # The destination's root, and for an IOU escrow the destination's
+            # and owner's lines with the issuer plus the issuer's root
+            # (#107103593: a ticketed finish into a line at its limit).
+            if en.get("Destination"):
+                ar = rpc("ledger_entry", {"account_root": en["Destination"], "ledger_index": seq - 1, "binary": True})
+                if ar.get("node_binary") and ar.get("index"):
+                    pre[ar["index"].upper()] = ar["node_binary"]
+                if isinstance(amt, dict) and amt.get("currency") and amt.get("issuer"):
+                    for party in (en["Destination"], tx["Owner"]):
+                        rs = rpc("ledger_entry", {"ripple_state": {"currency": amt["currency"], "accounts": [party, amt["issuer"]]}, "ledger_index": seq - 1, "binary": True})
+                        if rs.get("node_binary") and rs.get("index"):
+                            pre[rs["index"].upper()] = rs["node_binary"]
+                    ir = rpc("ledger_entry", {"account_root": amt["issuer"], "ledger_index": seq - 1, "binary": True})
+                    if ir.get("node_binary") and ir.get("index"):
+                        pre[ir["index"].upper()] = ir["node_binary"]
             if isinstance(amt, dict) and amt.get("mpt_issuance_id"):
                 mpt_id = amt["mpt_issuance_id"]
                 mpt_parties = [tx["Owner"], en.get("Destination"), tx.get("Account")]
@@ -677,6 +692,27 @@ def main():
     # topology than the live mirror did (#106688646 crossed on mainnet,
     # tecKILLED in its first bundle). Seed the tip offers of every book the
     # walk can consult; their pages and owners ride the existing sweeps.
+    # Finding 337: a DomainID crossing walks the DOMAIN book, and every
+    # offer met there is judged by accountInDomain(owner) — hydrate the
+    # domain book too, and each domain offer owner's credentials.
+    dom_cache = {}
+    def owner_credentials(o):
+        dh = o.get("DomainID")
+        if not dh or not o.get("Account"):
+            return
+        if dh not in dom_cache:
+            dom_cache[dh] = rpc("ledger_entry", {"index": dh, "ledger_index": seq - 1}).get("node") or {}
+            if dh.upper() not in pre:
+                db = fetch_key(dh.upper())
+                if db:
+                    pre[dh.upper()] = db
+        for e in dom_cache[dh].get("AcceptedCredentials", []):
+            inner = e.get("Credential", e)
+            if not inner.get("Issuer") or not inner.get("CredentialType"):
+                continue
+            c = rpc("ledger_entry", {"credential": {"subject": o["Account"], "issuer": inner["Issuer"], "credential_type": inner["CredentialType"]}, "ledger_index": seq - 1, "binary": True})
+            if c.get("node_binary") and c.get("index"):
+                pre[c["index"].upper()] = c["node_binary"]
     if tx.get("TransactionType") == "OfferCreate":
         def cur(v):
             if isinstance(v, dict):
@@ -686,12 +722,15 @@ def main():
         pairs = [(gets, pays), (pays, gets)]
         if gets != xrp and pays != xrp:
             pairs += [(gets, xrp), (xrp, gets), (xrp, pays), (pays, xrp)]
-        for tg, tp in pairs:
+        queries = [(tg, tp, None) for tg, tp in pairs]
+        if isinstance(tx.get("DomainID"), str) and len(tx["DomainID"]) == 64:
+            queries += [(tg, tp, tx["DomainID"]) for tg, tp in pairs[:2]]
+        for tg, tp, dom_id in queries:
             try:
-                r = rpc("book_offers", {
-                    "taker_gets": tg, "taker_pays": tp,
-                    "ledger_index": seq - 1, "limit": 32,
-                })
+                q = {"taker_gets": tg, "taker_pays": tp, "ledger_index": seq - 1, "limit": 32}
+                if dom_id:
+                    q["domain"] = dom_id
+                r = rpc("book_offers", q)
                 for o in r.get("offers", []):
                     oidx = o.get("index", "").upper()
                     if oidx and oidx not in pre:
@@ -701,6 +740,10 @@ def main():
                     walk(o)
                     if o.get("BookDirectory"):
                         book_dirs.add(o["BookDirectory"].upper())
+                    try:
+                        owner_credentials(o)
+                    except Exception as e:
+                        print(f"note: domain owner credentials: {e}", file=sys.stderr)
             except Exception:
                 pass
 
@@ -851,28 +894,38 @@ def main():
             # empty, and the bridge strand went unboundable — dropped, where
             # rippled ran it alone (tecPATH_PARTIAL vs tesSUCCESS). Two pages
             # of 100 — the marker continues where the first page ended.
+            dom_variants = [None]
+            if isinstance(tx.get("DomainID"), str) and len(tx["DomainID"]) == 64:
+                dom_variants.append(tx["DomainID"])  # finding 337: the domain book too
             for tg, tp in books:
-                try:
-                    marker = None
-                    for _page in range(2):
-                        q = {"taker_gets": tp, "taker_pays": tg, "ledger_index": seq - 1, "limit": 100}
-                        if marker is not None:
-                            q["marker"] = marker
-                        r = rpc("book_offers", q)
-                        for o in r.get("offers", []):
-                            oi = (o.get("index") or "").upper()
-                            if oi and oi not in pre:
-                                nb = fetch_key(oi)
-                                if nb:
-                                    pre[oi] = nb
-                                    walk(o)
-                            if o.get("BookDirectory"):
-                                book_dirs.add(o["BookDirectory"].upper())
-                        marker = r.get("marker")
-                        if not marker:
-                            break
-                except Exception:
-                    pass
+                for dom_id in dom_variants:
+                    try:
+                        marker = None
+                        for _page in range(2):
+                            q = {"taker_gets": tp, "taker_pays": tg, "ledger_index": seq - 1, "limit": 100}
+                            if dom_id:
+                                q["domain"] = dom_id
+                            if marker is not None:
+                                q["marker"] = marker
+                            r = rpc("book_offers", q)
+                            for o in r.get("offers", []):
+                                oi = (o.get("index") or "").upper()
+                                if oi and oi not in pre:
+                                    nb = fetch_key(oi)
+                                    if nb:
+                                        pre[oi] = nb
+                                        walk(o)
+                                if o.get("BookDirectory"):
+                                    book_dirs.add(o["BookDirectory"].upper())
+                                try:
+                                    owner_credentials(o)
+                                except Exception as e:
+                                    print(f"note: domain owner credentials: {e}", file=sys.stderr)
+                            marker = r.get("marker")
+                            if not marker:
+                                break
+                    except Exception:
+                        pass
 
     for bd in sorted(book_dirs):
         n, seen = 0, set()

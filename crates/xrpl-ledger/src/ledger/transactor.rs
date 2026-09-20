@@ -302,6 +302,7 @@ impl TxResult {
             | TxResult::InvalidUpdateTime
             | TxResult::NoLine
             | TxResult::Frozen
+            | TxResult::LimitExceeded
             | TxResult::HasObligations
             | TxResult::DirFull
             | TxResult::InsufficientReserve
@@ -702,6 +703,27 @@ pub fn apply_common(tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
     sandbox.write(acct_key, serialized);
 
     TxResult::Success
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::*;
+
+    /// Finding 343 (#107103593 350D8E96B831, a ticketed EscrowFinish into a
+    /// line at its limit): every tec claims the fee and consumes the
+    /// sequence or ticket; tecLIMIT_EXCEEDED was the one code missing from
+    /// the list, so the transaction wrote nothing — no fee, ticket left.
+    #[test]
+    fn every_tec_code_is_claimed() {
+        let all = [
+            TxResult::LimitExceeded, TxResult::NoLine, TxResult::Frozen, TxResult::NoPermission,
+            TxResult::PathDry, TxResult::PathPartial, TxResult::Killed, TxResult::Expired,
+        ];
+        for r in all {
+            assert!(r.code_str().starts_with("tec"), "{:?}", r);
+            assert!(r.is_claimed(), "{:?} must claim", r);
+        }
+    }
 }
 
 #[cfg(test)]
