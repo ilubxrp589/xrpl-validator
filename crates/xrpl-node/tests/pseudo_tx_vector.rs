@@ -124,3 +124,11 @@ fn unlmodify_reenable_after_the_flag_rotation_107068672() {
 fn enable_amendment_fixcleanup330_106911489() {
     run_bundle(include_str!("vectors/enable_amendment_fixcleanup330_106911489.json"));
 }
+
+/// #107003649 7CAF9159: EnableAmendment with tfGotMajority (Flags 0x10000)
+/// — an amendment crossing 80%: it is recorded in the Amendments
+/// singleton's Majorities array with its CloseTime, not enabled yet.
+#[test]
+fn enable_amendment_got_majority_107003649() {
+    run_bundle(include_str!("vectors/enable_amendment_got_majority_107003649.json"));
+}
