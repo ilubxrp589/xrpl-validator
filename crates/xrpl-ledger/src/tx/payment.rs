@@ -2375,6 +2375,12 @@ impl Transactor for PaymentTransactor {
             }
         }
 
+        // Track 2: the structural port of rippled's flow engine takes every
+        // "ripple" payment (paths, a SendMax, or a non-XRP Amount —
+        // Payment.cpp's `ripple` condition) when XRPL_FLOW_ENGINE=port.
+        if crate::flow::payment_flow::port_enabled() && (cross_currency || !amt_json.is_string() || sendmax.is_some()) {
+            return crate::flow::payment_flow::apply_ripple_payment(tx, sandbox);
+        }
         if cross_currency {
             return self.apply_path_payment(tx, sandbox, &amt_json, sendmax.as_ref(), &dest_id, partial);
         }

@@ -708,8 +708,15 @@ pub(crate) fn signed_value(v: &serde_json::Value) -> (bool, Me) {
         _ => "0",
     };
     let neg = s.starts_with('-');
-    let me = keylet::amount_mant_exp(&serde_json::Value::String(s.trim_start_matches('-').to_string()))
-        .unwrap_or((0, 0));
+    // An IOU object goes to the parser AS an object: finding 303's sixteen-
+    // digit cap applies to IOU values only, and re-wrapping the value as a
+    // bare string read it as drops — a 96-digit deliver-max Amount then
+    // overflowed to (0, 0) and the port's payment delivered nothing
+    // (payment_ninety_six_digit_amount_parses_fuzz_107009438).
+    let me = match v {
+        serde_json::Value::Object(_) => keylet::amount_mant_exp(v).unwrap_or((0, 0)),
+        _ => keylet::amount_mant_exp(&serde_json::Value::String(s.trim_start_matches('-').to_string())).unwrap_or((0, 0)),
+    };
     (neg && me.0 > 0, me)
 }
 
@@ -9834,7 +9841,22 @@ impl Transactor for OfferCreateTransactor {
             };
             root_frozen || line_frozen
         };
-        let (rem_pays, rem_gets_cross, crossed) = if book_refused || freeze_refused {
+        // Track 2: the ported flow engine crosses the books when
+        // XRPL_FLOW_ENGINE=port (CreateOffer::flowCross, flow/offer_cross.rs).
+        let mut port_after_in: Option<Me> = None;
+        let (rem_pays, rem_gets_cross, crossed) = if crate::flow::payment_flow::port_enabled() && !(book_refused || freeze_refused) {
+            let asset_of = |l: &Leg| crate::flow::steps::Asset { currency: l.cur, issuer: if l.xrp { None } else { Some(l.issuer) } };
+            let amt_of = |l: &Leg, m: Me| if l.xrp { crate::flow::amounts::EitherAmount::Xrp(me_rescale(m, 0, false) as i128) } else { crate::flow::amounts::EitherAmount::Iou(crate::flow::amounts::IouAmount::from_me(false, m)) };
+            let r = crate::flow::offer_cross::flow_cross(sandbox, &tx.account, asset_of(&gets_leg), amt_of(&gets_leg, tg0), asset_of(&pays_leg), amt_of(&pays_leg, tp0), flags, domain);
+            for k in &r.removed {
+                if !stale.contains(k) {
+                    stale.push(*k);
+                }
+            }
+            let crossed = if r.actual_out.signum() > 0 { 1 } else { 0 };
+            port_after_in = Some(r.after_in.mantissa_exp());
+            (r.after_out.mantissa_exp(), r.after_in.mantissa_exp(), crossed)
+        } else if book_refused || freeze_refused {
             if std::env::var("DX_FOK").is_ok() {
                 eprintln!("DX_FOK strand refused: book_refused={book_refused} (issuer-side NoRipple on the TakerGets line) freeze_refused={freeze_refused} (taker GlobalFreeze / own freeze on the TakerPays line)");
             }
@@ -9851,7 +9873,9 @@ impl Transactor for OfferCreateTransactor {
         // funded part could be spent, but the whole unspent remainder rests.
         // Left exactly as returned when the clamp did not bite, so the fully
         // funded path keeps its value rather than re-deriving it.
-        let rem_gets = if underfunded {
+        let rem_gets = if let Some(a) = port_after_in {
+            a
+        } else if underfunded {
             me_norm(me_sub(tg0, me_sub(tg_cross, rem_gets_cross)))
         } else {
             rem_gets_cross
@@ -9943,7 +9967,13 @@ impl Transactor for OfferCreateTransactor {
         // 124.14 XRP — past the 118.68 minimum — and mainnet rested
         // 102.963884945252 BAYN for 1616532 drops; the saturated pays here
         // read as fully crossed and we rested nothing (OwnerCount 1371/1372).
-        if me_is_zero(rem_gets) || (!sell && me_is_zero(rem_pays)) {
+        // Track 2: the port hands back rippled's own `afterCross` pair — for a
+        // sell, `afterCross.out = divRoundStrict(afterCross.in, rate, false)`
+        // — and `place_offer.in == 0 || place_offer.out == 0` is "Offer fully
+        // crossed!" (CreateOffer.cpp:778) whichever side it is: a 1e-11 IOU
+        // dust left on the line rounds to zero drops and rests nothing
+        // (offer_sell_remaining_input_is_the_fold_of_saved_iteration_ins).
+        if me_is_zero(rem_gets) || ((!sell || port_after_in.is_some()) && me_is_zero(rem_pays)) {
             return TxResult::Success; // fully consumed
         }
 

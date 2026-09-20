@@ -56,6 +56,12 @@ pub enum TxResult {
     NoTarget,
     /// IoC/FoK offer crossed nothing (or FoK not fully filled).
     Killed,
+    /// tecINVARIANT_FAILED — an AMM offer whose pool product would fall (fixAMMOverflowOffer).
+    InvariantFailed,
+    /// temBAD_PATH
+    BadPath,
+    /// terNO_RIPPLE
+    NoRipple,
     /// Placement would exceed the owner reserve.
     InsufReserveOffer,
     /// Offer is unfunded at apply time.
@@ -355,6 +361,10 @@ impl TxResult {
             TxResult::NoEntry => "tecNO_ENTRY",
             TxResult::NoTarget => "tecNO_TARGET",
             TxResult::Killed => "tecKILLED",
+            TxResult::InvariantFailed => "tecINVARIANT_FAILED",
+            TxResult::BadPath => "temBAD_PATH",
+            TxResult::NoRipple => "terNO_RIPPLE",
+            TxResult::RippleEmpty => "temRIPPLE_EMPTY",
             TxResult::InsufReserveOffer => "tecINSUF_RESERVE_OFFER",
             TxResult::UnfundedOffer => "tecUNFUNDED_OFFER",
             TxResult::Expired => "tecEXPIRED",
@@ -412,7 +422,6 @@ impl TxResult {
             TxResult::BadSendXrpPartial => "temBAD_SEND_XRP_PARTIAL",
             TxResult::BadSendXrpLimit => "temBAD_SEND_XRP_LIMIT",
             TxResult::BadSendXrpNoDirect => "temBAD_SEND_XRP_NO_DIRECT",
-            TxResult::RippleEmpty => "temRIPPLE_EMPTY",
             TxResult::BadCurrency => "temBAD_CURRENCY",
             TxResult::DstNeeded => "temDST_NEEDED",
             TxResult::BadSigner => "temBAD_SIGNER",
