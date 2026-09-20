@@ -1621,3 +1621,12 @@ fn offer_ioc_buy_ends_when_the_pool_slice_misses_the_limit_107080701() {
 fn offer_sell_budget_is_the_legacy_mulround_of_the_rate_107105811() {
     run_bundle(include_str!("vectors/offer_sell_budget_is_the_legacy_mulround_of_the_rate_107105811.json"));
 }
+
+/// Coverage pin (2026-09-20 inventory): OfferCancel is ~9% of mainnet
+/// traffic with one (tem) vector. #107113838 FDE7B024: a live offer is
+/// cancelled — offer deleted, both book and owner directories unlinked,
+/// OwnerCount down.
+#[test]
+fn offer_cancel_of_a_live_offer_107113838() {
+    run_bundle(include_str!("vectors/offer_cancel_of_a_live_offer_107113838.json"));
+}
