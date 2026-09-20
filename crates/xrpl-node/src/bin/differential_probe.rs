@@ -1995,6 +1995,21 @@ fn load_mpt_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_ind
 /// 4EC1AB97AE48, tecNO_PERMISSION) — and, for an MPT escrow, the issuance
 /// and the owner's, destination's and finisher's MPTokens that the unlock
 /// helpers read (finding 332/338).
+/// DIDSet / DIDDelete: the account's DID object. A DIDSet that re-writes the
+/// same Data/URI is a no-op on the object, so the meta never names it and
+/// the meta-driven hydration leaves it out — the engine then CREATES it
+/// (OwnerCount +1, a directory insert). Testnet campaign 6, #20909840
+/// B55AAC2B: the account root came out with OwnerCount 2 for mainnet's 1.
+fn load_did_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
+    let tt = txj.get("TransactionType").and_then(|v| v.as_str()).unwrap_or("");
+    if tt != "DIDSet" && tt != "DIDDelete" {
+        return;
+    }
+    let Some(acct) = txj.get("Account").and_then(|v| v.as_str()).and_then(decode_address) else { return };
+    let k = xrpl_ledger::ledger::keylet::did_key(&acct);
+    load_object(state, url, &hex::encode_upper(k.0), ledger_index);
+}
+
 fn load_escrow_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
     if !matches!(txj["TransactionType"].as_str(), Some("EscrowFinish") | Some("EscrowCancel")) {
         return;
@@ -2859,6 +2874,7 @@ fn run() -> i32 {
         load_paychan_prestate(&mut state, &rpc_url, txj, seq - 1);
         load_mpt_prestate(&mut state, &rpc_url, txj, seq - 1);
         load_escrow_prestate(&mut state, &rpc_url, txj, seq - 1);
+        load_did_prestate(&mut state, &rpc_url, txj, seq - 1); // campaign 6 #20909840
     }
     // FLAG-LEDGER OPEN: rotate the NegativeUNL pending fields into
     // DisabledValidators before any transaction applies — a ledger-level

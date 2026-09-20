@@ -632,9 +632,14 @@ impl Transactor for CredentialAcceptTransactor {
             Err(_) => return TxResult::Malformed,
         };
 
-        // Bug 17: If already accepted, return NoPermission
-        if cred["Accepted"].as_bool().unwrap_or(false) {
-            return TxResult::NoPermission;
+        // Finding 346 (testnet campaign 6, #20910018 9FA43E04 / #20910020
+        // EB51DBF9): an already-accepted credential is tecDUPLICATE —
+        // `sleCred->getFlags() & lsfAccepted` in CredentialAccept::preclaim.
+        // The old check read a JSON `Accepted` field that no ledger object
+        // carries, so it never fired: we re-accepted and moved the owner
+        // count from issuer to subject a second time.
+        if cred["Flags"].as_u64().unwrap_or(0) & 0x0001_0000 != 0 {
+            return TxResult::Duplicate;
         }
 
         // Expired credentials are deleted even though the accept fails —

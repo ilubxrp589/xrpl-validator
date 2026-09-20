@@ -124,3 +124,12 @@ fn run_bundle(bundle_json: &str) {
 fn did_set_creates_the_object_with_flags_zero_106796939() {
     run_bundle(include_str!("vectors/did_set_creates_the_object_with_flags_zero_106796939.json"));
 }
+
+/// Harness pin (testnet campaign 6, #20909840 B55AAC2B): a DIDSet that
+/// re-writes the same Data and URI. The object is unchanged, so mainnet's
+/// meta never names it — the bundle carries it by keylet — and the apply
+/// must take the UPDATE path: no owner-count bump, no directory insert.
+#[test]
+fn did_set_rewriting_the_same_data_is_a_noop_on_the_object_testnet_20909840() {
+    run_bundle(include_str!("vectors/did_set_rewriting_the_same_data_is_a_noop_on_the_object_testnet_20909840.json"));
+}

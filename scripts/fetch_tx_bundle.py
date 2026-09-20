@@ -499,6 +499,9 @@ def main():
     # with the escrow unhydrated. keylet::escrow = SHA512Half('u' || owner ||
     # OfferSequence be32); Channel and CheckID are the keys themselves.
     named_keys = []
+    if tx.get("TransactionType") in ("DIDSet", "DIDDelete"):
+        # keylet::did = sha512half(0x0049 'I' + AccountID). A no-op DIDSet never names its object in the meta (campaign 6 #20909840).
+        named_keys.append(hashlib.sha512(b"\x00I" + bytes.fromhex(acct_id(tx["Account"]))).digest()[:32].hex().upper())
     if tx.get("TransactionType") in ("EscrowFinish", "EscrowCancel") and tx.get("Owner") and tx.get("OfferSequence") is not None:
         try:
             named_keys.append(hashlib.sha512(b"\x00u" + bytes.fromhex(acct_id(tx["Owner"])) + int(tx["OfferSequence"]).to_bytes(4, "big")).digest()[:32].hex().upper())

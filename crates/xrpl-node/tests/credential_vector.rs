@@ -157,3 +157,12 @@ fn deposit_preauth_unauthorize_credentials_removes_the_entry_testnet_20864007() 
 fn credential_accept_subject_below_reserve_is_insufficient_reserve_testnet_20909796() {
     run_bundle(include_str!("vectors/credential_accept_subject_below_reserve_is_insufficient_reserve_testnet_20909796.json"));
 }
+
+/// Finding 346 — testnet campaign 6, #20910018 9FA43E04: the subject accepts
+/// a credential that is already accepted (lsfAccepted set). rippled's
+/// preclaim answers tecDUPLICATE; we read a JSON `Accepted` field no ledger
+/// object carries, never noticed, and moved the owner count a second time.
+#[test]
+fn credential_accept_twice_is_duplicate_testnet_20910018() {
+    run_bundle(include_str!("vectors/credential_accept_twice_is_duplicate_testnet_20910018.json"));
+}
