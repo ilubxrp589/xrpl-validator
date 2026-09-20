@@ -2107,7 +2107,8 @@ fn load_paychan_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger
     }
 }
 
-/// AMM Deposit/Withdraw/Vote pre-state: the pool account's owner-directory
+/// AMM Deposit/Withdraw/Vote/Delete pre-state (AMMDelete: finding 347's
+/// tecAMM_NOT_EMPTY reads the pool object; a fee-only tec never names it): the pool account's owner-directory
 /// ROOT (the dir walk starts there; meta only carries the touched page) plus
 /// the depositor's dir root and both parties' account roots. For AMMVote the
 /// load matters even though a vote moves nothing: the not-an-LP refusal
@@ -2117,7 +2118,7 @@ fn load_amm_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_ind
     let tt = txj["TransactionType"].as_str();
     if !matches!(
         tt,
-        Some("AMMDeposit") | Some("AMMWithdraw") | Some("AMMCreate") | Some("AMMVote")
+        Some("AMMDeposit") | Some("AMMWithdraw") | Some("AMMCreate") | Some("AMMVote") | Some("AMMDelete")
     ) {
         return;
     }
