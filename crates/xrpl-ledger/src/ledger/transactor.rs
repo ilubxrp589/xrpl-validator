@@ -62,8 +62,6 @@ pub enum TxResult {
     BadPath,
     /// terNO_RIPPLE
     NoRipple,
-    /// temRIPPLE_EMPTY
-    RippleEmpty,
     /// Placement would exceed the owner reserve.
     InsufReserveOffer,
     /// Offer is unfunded at apply time.
@@ -423,7 +421,6 @@ impl TxResult {
             TxResult::BadSendXrpPartial => "temBAD_SEND_XRP_PARTIAL",
             TxResult::BadSendXrpLimit => "temBAD_SEND_XRP_LIMIT",
             TxResult::BadSendXrpNoDirect => "temBAD_SEND_XRP_NO_DIRECT",
-            TxResult::RippleEmpty => "temRIPPLE_EMPTY",
             TxResult::BadCurrency => "temBAD_CURRENCY",
             TxResult::DstNeeded => "temDST_NEEDED",
             TxResult::BadSigner => "temBAD_SIGNER",
