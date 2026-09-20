@@ -320,7 +320,41 @@ fn load_object(state: &mut LedgerState, url: &str, index_hex: &str, ledger_index
     hexify_addresses(&mut node);
     let mut k = [0u8; 32];
     k.copy_from_slice(&kb);
+    let is_domain_offer = node.get("LedgerEntryType").and_then(|v| v.as_str()) == Some("Offer") && node.get("DomainID").is_some();
     let _ = state.state_map.insert(Hash256(k), serde_json::to_vec(&node).unwrap_or_default());
+    if is_domain_offer {
+        load_domain_offer_owner_credentials(state, url, &node, ledger_index);
+    }
+}
+
+/// Finding 337's stream rule reads, for every offer carrying a DomainID it
+/// meets, `accountInDomain(owner)`: the domain object and the OWNER's
+/// Credential objects for the domain's accepted list. Nothing in the meta
+/// names them when the owner is in good standing, and an unhydrated owner
+/// reads as an orphan — devnet 5419034 3D3DF8253F2F reaped the offer it
+/// should have crossed, 5419040 F225E303718B read tecPATH_PARTIAL.
+fn load_domain_offer_owner_credentials(state: &mut LedgerState, url: &str, offer: &Value, ledger_index: u32) {
+    let (Some(dh), Some(owner_hex)) = (offer.get("DomainID").and_then(|v| v.as_str()), offer.get("Account").and_then(|v| v.as_str())) else { return };
+    let addr20 = |s: &str| -> Option<[u8; 20]> {
+        if s.len() == 40 { hex::decode(s).ok().and_then(|b| b.try_into().ok()) } else { decode_address(s) }
+    };
+    let Some(owner) = addr20(owner_hex) else { return };
+    let Ok(db) = hex::decode(dh) else { return };
+    let Ok(dk) = <[u8; 32]>::try_from(db.as_slice()) else { return };
+    if state.state_map.lookup(&Hash256(dk)).is_none() {
+        load_object(state, url, dh, ledger_index);
+    }
+    let Some(dom) = state.state_map.lookup(&Hash256(dk)).and_then(|b| serde_json::from_slice::<Value>(b).ok()) else { return };
+    for e in dom.get("AcceptedCredentials").and_then(|v| v.as_array()).into_iter().flatten() {
+        let inner = e.get("Credential").unwrap_or(e);
+        if let (Some(issuer), Some(ct)) = (
+            inner.get("Issuer").and_then(|v| v.as_str()).and_then(addr20),
+            inner.get("CredentialType").and_then(|v| v.as_str()).and_then(|h| hex::decode(h).ok()),
+        ) {
+            let k = keylet::credential_key(&owner, &issuer, &ct);
+            load_object(state, url, &hex::encode_upper(k.0), ledger_index);
+        }
+    }
 }
 
 /// Load an account's full NFTokenPage chain at `ledger_index` via
@@ -1031,6 +1065,15 @@ fn native_read_keys(txj: &Value) -> Vec<String> {
     if txj["TransactionType"].as_str() == Some("NFTokenCreateOffer") {
         if let Some(acct) = txj["Account"].as_str().and_then(decode_address) {
             keys.push(hex::encode_upper(keylet::owner_dir_key(&acct).0));
+            // Finding 309's funds test on an IOU Amount reads the creator's
+            // line with the issuer and the issuer's root (testnet 20864090
+            // FFC112235EE7 read tecNO_LINE unhydrated).
+            if let Some(a) = txj.get("Amount").filter(|a| a.is_object()) {
+                if let (Some(cur), Some(iss)) = (a.get("currency").and_then(|v| v.as_str()), a.get("issuer").and_then(|v| v.as_str()).and_then(decode_issuer)) {
+                    keys.push(hex::encode_upper(keylet::ripple_state_key(&acct, &iss, &currency_code(cur)).0));
+                    keys.push(hex::encode_upper(keylet::account_root_key(&iss).0));
+                }
+            }
         }
         if let Some(nft_id) = txj.get("NFTokenID").and_then(|v| v.as_str())
             .and_then(|s| hex::decode(s).ok())
@@ -1971,6 +2014,24 @@ fn load_escrow_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_
             decode_address(s)
         }
     };
+    // The destination's root (tecNO_DST), and for an IOU escrow the
+    // destination's trust line with the issuer (tecNO_LINE / the
+    // tecLIMIT_EXCEEDED test) and the issuer's root (transfer rate, freeze):
+    // #107103593 350D8E96B831 (a ticketed finish into a line at its limit)
+    // read tecNO_LINE unhydrated for mainnet's tecLIMIT_EXCEEDED.
+    if let Some(d) = esc.get("Destination").and_then(|v| v.as_str()).and_then(addr20) {
+        load_object(state, url, &hex::encode_upper(keylet::account_root_key(&d).0), ledger_index);
+        if let Some(amt) = esc.get("Amount").filter(|a| a.is_object() && a.get("mpt_issuance_id").is_none()) {
+            if let (Some(cur), Some(iss)) = (
+                amt.get("currency").and_then(|v| v.as_str()).map(currency_code),
+                amt.get("issuer").and_then(|v| v.as_str()).and_then(addr20),
+            ) {
+                load_object(state, url, &hex::encode_upper(keylet::ripple_state_key(&d, &iss, &cur).0), ledger_index);
+                load_object(state, url, &hex::encode_upper(keylet::ripple_state_key(&owner, &iss, &cur).0), ledger_index);
+                load_object(state, url, &hex::encode_upper(keylet::account_root_key(&iss).0), ledger_index);
+            }
+        }
+    }
     let Some(id) = esc
         .get("Amount")
         .and_then(|a| a.get("mpt_issuance_id"))
