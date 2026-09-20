@@ -1,4 +1,4 @@
-//! Byte-exact vector drills for the UNLModify pseudo-transaction (2026-09-20).
+//! Byte-exact vector drills for the pseudo-transactions — UNLModify, EnableAmendment (2026-09-20).
 //!
 //! Each test replays one mainnet transaction against its same-ledger
 //! pre-images and compares every touched object byte-for-byte with the
@@ -50,9 +50,10 @@ fn run_bundle(bundle_json: &str) {
     for (k, v) in bundle["pre"].as_object().unwrap() {
         hydrate(&mut state, k, v.as_str().unwrap());
     }
-    assert_eq!(seq % 256, 0, "UNLModify only lands in flag ledgers");
+    // UNLModify lands IN the flag ledger (rotation first); EnableAmendment and
+    // SetFee land in the ledger AFTER it (no rotation).
     let nk = xrpl_ledger::ledger::keylet::negative_unl_key();
-    if let Some(bytes) = state.state_map.lookup(&nk).map(|b| b.to_vec()) {
+    if let (0, Some(bytes)) = (seq % 256, state.state_map.lookup(&nk).map(|b| b.to_vec())) {
         match xrpl_ledger::tx::pseudo::rotate_negative_unl(&bytes, seq) {
             Some(Some(nb)) => {
                 state.state_map.insert(nk, nb).unwrap();
@@ -114,4 +115,12 @@ fn unlmodify_disable_a_validator_107068416() {
 #[test]
 fn unlmodify_reenable_after_the_flag_rotation_107068672() {
     run_bundle(include_str!("vectors/unlmodify_reenable_after_the_flag_rotation_107068672.json"));
+}
+
+/// #106911489 5749CFD2: the ledger after the flag ledger that carried
+/// fixCleanup3_3_0 over the threshold — EnableAmendment moves the amendment
+/// out of Majorities and into the Amendments singleton's enabled list.
+#[test]
+fn enable_amendment_fixcleanup330_106911489() {
+    run_bundle(include_str!("vectors/enable_amendment_fixcleanup330_106911489.json"));
 }
