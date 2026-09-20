@@ -132,3 +132,20 @@ fn payment_partial_delivermin_eur_to_usd_through_paths_testnet_20910241() {
     port();
     run_bundle(include_str!("vectors/payment_partial_delivermin_eur_to_usd_through_paths_testnet_20910241.json"));
 }
+
+/// #20910434 4EA250F1: BST (8% fee) → USD, tfPartialPayment, one path, no
+/// DeliverMin. Model misses a modified node.
+#[test]
+fn payment_partial_bst_to_usd_over_a_fee_issuer_testnet_20910434() {
+    port();
+    run_bundle(include_str!("vectors/payment_partial_bst_to_usd_over_a_fee_issuer_testnet_20910434.json"));
+}
+
+/// #20910299 9949C9FA: EUR → USD, no flags, no explicit paths — the default
+/// path only, with the direct book and the XRP bridge competing. Model
+/// misses a modified node.
+#[test]
+fn payment_eur_to_usd_default_paths_testnet_20910299() {
+    port();
+    run_bundle(include_str!("vectors/payment_eur_to_usd_default_paths_testnet_20910299.json"));
+}
