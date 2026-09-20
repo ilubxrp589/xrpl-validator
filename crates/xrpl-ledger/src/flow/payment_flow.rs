@@ -161,7 +161,13 @@ pub fn apply_ripple_payment(tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
         .unwrap_or_default();
     let domain = tx.fields.get("DomainID").and_then(|v| v.as_str()).and_then(|s| hex::decode(s).ok()).and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()).map(Hash256);
     // rippleCalculate's inputs.
-    let limit_quality = if limit_quality_flag && max_source.amount.signum() > 0 { quality_of(max_source.amount, dst_amount.amount) } else { None };
+    // Finding 304: `Quality{Amounts{maxSourceAmount, dstAmount}}` = getRate,
+    // which files rate 0 for a ratio the STAmount range cannot hold (a
+    // deliver-max Amount against a small SendMax) — and Quality(0) is the
+    // BEST quality: every strand falls short, "Path rejected by
+    // limitQuality", tecPATH_DRY. An unencodable ratio used to read as no
+    // limit here.
+    let limit_quality = if limit_quality_flag && max_source.amount.signum() > 0 { Some(quality_of(max_source.amount, dst_amount.amount).unwrap_or(Quality(0))) } else { None };
     // sendMax: the max unless it is the Amount re-issued by the sender
     // (then no SendMax at all).
     let flow_send_max = {
