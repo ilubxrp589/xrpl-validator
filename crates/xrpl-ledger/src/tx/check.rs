@@ -58,7 +58,7 @@ impl Transactor for CheckCreateTransactor {
         if tx.tx_type != "CheckCreate" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("Destination").is_none() {
@@ -239,7 +239,7 @@ impl Transactor for CheckCashTransactor {
         if tx.tx_type != "CheckCash" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         // Must specify CheckID to identify the check
@@ -455,6 +455,7 @@ impl Transactor for CheckCashTransactor {
                         "SendMax": sm_json.clone(),
                         "Flags": if partial { 0x0002_0000u64 } else { 0 },
                     }),
+                    inner_batch: false,
                 };
                 let before = holding(sandbox);
                 let r = crate::tx::payment::PaymentTransactor.apply_iou_direct(&synth, sandbox, &flow_amt, &casher, partial);
@@ -507,7 +508,7 @@ impl Transactor for CheckCancelTransactor {
         if tx.tx_type != "CheckCancel" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("CheckID").is_none() {
@@ -696,6 +697,7 @@ mod tests {
             ticket_seq: None,
             last_ledger_seq: None,
             fields: fields.clone(),
+            inner_batch: false,
         };
         assert_eq!(
             CheckCreateTransactor.preclaim(&tx, &Sandbox::new(&state)),
@@ -746,6 +748,7 @@ mod tests {
                 "Destination": hex::encode(dest),
                 "SendMax": "5000000",
             }),
+            inner_batch: false,
         };
 
         assert_eq!(CheckCreateTransactor.preflight(&create_tx), TxResult::Success);
@@ -772,6 +775,7 @@ mod tests {
                 "CheckID": check_id_hex,
                 "Amount": "3000000",
             }),
+            inner_batch: false,
         };
 
         assert_eq!(CheckCashTransactor.preflight(&cash_tx), TxResult::Success);
@@ -809,6 +813,7 @@ mod tests {
                 "Destination": hex::encode(dest),
                 "SendMax": "5000000",
             }),
+            inner_batch: false,
         };
         assert_eq!(CheckCreateTransactor.do_apply(&create_tx, &mut sandbox), TxResult::Success);
 
@@ -828,6 +833,7 @@ mod tests {
             fields: serde_json::json!({
                 "CheckID": check_id_hex,
             }),
+            inner_batch: false,
         };
 
         assert_eq!(CheckCancelTransactor.preflight(&cancel_tx), TxResult::Success);
@@ -863,6 +869,7 @@ mod tests {
                 "Destination": hex::encode(dest),
                 "SendMax": "5000000",
             }),
+            inner_batch: false,
         };
         assert_eq!(CheckCreateTransactor.do_apply(&create_tx, &mut sandbox), TxResult::Success);
 
@@ -884,6 +891,7 @@ mod tests {
             account: sender, tx_type: "CheckCancel".to_string(), fee: 12, sequence: 2,
             ticket_seq: None, last_ledger_seq: None,
             fields: serde_json::json!({ "CheckID": hex::encode(check_key.0) }),
+            inner_batch: false,
         };
         assert_eq!(CheckCancelTransactor.do_apply(&cancel_tx, &mut sandbox), TxResult::Success);
 
@@ -914,6 +922,7 @@ mod tests {
                 "Destination": hex::encode(dest),
                 "SendMax": "5000000",
             }),
+            inner_batch: false,
         };
         CheckCreateTransactor.do_apply(&create_tx, &mut sandbox);
 
@@ -932,6 +941,7 @@ mod tests {
                 "CheckID": check_id_hex,
                 "Amount": "10000000",
             }),
+            inner_batch: false,
         };
 
         assert_eq!(CheckCashTransactor.do_apply(&cash_tx, &mut sandbox), TxResult::PathPartial);
@@ -965,6 +975,7 @@ mod tests {
                 "Destination": hex::encode(dest),
                 "SendMax": "5000000",
             }),
+            inner_batch: false,
         };
         CheckCreateTransactor.do_apply(&create_tx, &mut sandbox);
 
@@ -982,6 +993,7 @@ mod tests {
             fields: serde_json::json!({
                 "CheckID": check_id_hex,
             }),
+            inner_batch: false,
         };
 
         assert_eq!(

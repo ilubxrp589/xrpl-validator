@@ -60,12 +60,26 @@ fn run_bundle(bundle_json: &str) {
     );
 
     for (k, want_hex) in bundle["expect"].as_object().unwrap() {
-        let ent = mods
-            .get(&key32(k))
-            .unwrap_or_else(|| panic!("target {k} must be written by the apply"));
+        let want_deleted = want_hex.as_str().unwrap().trim().is_empty();
+        let Some(ent) = mods.get(&key32(k)) else {
+            assert!(!want_deleted, "target {k} must be deleted by the apply, which never wrote it");
+            let pre_hex = bundle["pre"][k].as_str().unwrap_or_default().trim().to_uppercase();
+            assert_eq!(
+                want_hex.as_str().unwrap().trim().to_uppercase(),
+                pre_hex,
+                "target {k} was not written by the apply and does not pin the untouched pre-image"
+            );
+            continue;
+        };
         let bytes = match ent {
-            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => b.clone(),
-            SandboxEntry::Deleted => panic!("target {k} deleted?"),
+            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => {
+                assert!(!want_deleted, "target {k} must be deleted by the apply, which wrote it instead");
+                b.clone()
+            }
+            SandboxEntry::Deleted => {
+                assert!(want_deleted, "target {k} deleted?");
+                continue;
+            }
         };
         let mut jv: Value = serde_json::from_slice(&bytes).unwrap();
         canon_for_encode(&mut jv);
@@ -115,4 +129,67 @@ fn account_set_clawback_needs_an_empty_owner_directory() {
 #[test]
 fn account_set_arming_account_txn_id_leaves_it_zero_until_the_next_tx() {
     run_bundle(include_str!("vectors/accountset_arm_accounttxnid_zero_106906126.json"));
+}
+
+/// Findings 312-316 — from the structural differential fuzzer (sweep 3 on
+/// 107060755); libxrpl's result is the expectation.
+#[test]
+fn account_set_authorized_minter_without_minter_is_malformed_fuzz_107060755() {
+    run_bundle(include_str!("vectors/account_set_authorized_minter_without_minter_is_malformed_fuzz_107060755.json"));
+}
+
+/// Findings 312-316 — from the structural differential fuzzer (sweep 3 on
+/// 107060755); libxrpl's result is the expectation.
+#[test]
+fn account_set_disable_master_needs_the_master_signature_fuzz_107060755() {
+    run_bundle(include_str!("vectors/account_set_disable_master_needs_the_master_signature_fuzz_107060755.json"));
+}
+
+/// Findings 312-316 — from the structural differential fuzzer (sweep 3 on
+/// 107060755); libxrpl's result is the expectation.
+#[test]
+fn account_set_future_sequence_is_terpre_seq_fuzz_107060755() {
+    run_bundle(include_str!("vectors/account_set_future_sequence_is_terpre_seq_fuzz_107060755.json"));
+}
+
+/// Findings 317/318 — from the structural differential fuzzer; libxrpl's
+/// result is the expectation.
+#[test]
+fn account_set_tick_size_fifteen_is_stored_sixteen_clears_fuzz_107009438() {
+    run_bundle(include_str!("vectors/account_set_tick_size_fifteen_is_stored_sixteen_clears_fuzz_107009438.json"));
+}
+
+/// Findings 320-326 — from the testnet campaign's differential fuzz (libxrpl's
+/// result is the expectation).
+#[test]
+fn account_set_clearing_allow_clawback_is_a_no_op_fuzz_testnet_20863982() {
+    run_bundle(include_str!("vectors/account_set_clearing_allow_clawback_is_a_no_op_fuzz_testnet_20863982.json"));
+}
+
+/// Findings 320-326 — from the testnet campaign's differential fuzz (libxrpl's
+/// result is the expectation).
+#[test]
+fn account_set_transfer_rate_over_max_is_bad_transfer_rate_fuzz_testnet_20864013() {
+    run_bundle(include_str!("vectors/account_set_transfer_rate_over_max_is_bad_transfer_rate_fuzz_testnet_20864013.json"));
+}
+
+/// Findings 320-326 — from the testnet campaign's differential fuzz (libxrpl's
+/// result is the expectation).
+#[test]
+fn account_set_no_freeze_after_clawback_is_no_permission_fuzz_testnet_20864015() {
+    run_bundle(include_str!("vectors/account_set_no_freeze_after_clawback_is_no_permission_fuzz_testnet_20864015.json"));
+}
+
+/// Findings 320-326 — from the testnet campaign's differential fuzz (libxrpl's
+/// result is the expectation).
+#[test]
+fn signer_list_set_unreachable_quorum_is_bad_quorum_fuzz_testnet_20864035() {
+    run_bundle(include_str!("vectors/signer_list_set_unreachable_quorum_is_bad_quorum_fuzz_testnet_20864035.json"));
+}
+
+/// Findings 328/329 — from the structural differential fuzzer (libxrpl's
+/// result is the expectation).
+#[test]
+fn account_set_authorized_minter_without_minter_is_malformed_second_fuzz_107009438() {
+    run_bundle(include_str!("vectors/account_set_authorized_minter_without_minter_is_malformed_second_fuzz_107009438.json"));
 }

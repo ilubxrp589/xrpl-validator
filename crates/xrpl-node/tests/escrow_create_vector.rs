@@ -203,3 +203,69 @@ fn escrow_finish_delivers_net_of_the_locked_rate() {
 fn escrow_finish_by_destination_creates_the_token_line_106937018() {
     run_bundle(include_str!("vectors/escrow_finish_by_destination_creates_the_token_line_106937018.json"));
 }
+
+/// Finding 332 — devnet 5418986 161CF6C1: an EscrowCreate of 100 units of
+/// MPT 0052AF9C…. The holder's MPToken goes 500 → 400 with LockedAmount 100,
+/// the issuance gains LockedAmount 100 (OutstandingAmount untouched), the
+/// escrow carries the MPT amount and no IssuerNode. We said temBAD_AMOUNT.
+#[test]
+fn escrow_create_locks_an_mpt_on_the_holder_token() {
+    run_bundle(include_str!("vectors/escrow_create_locks_an_mpt_on_the_holder_token_devnet_5418986.json"));
+}
+
+/// Finding 332 — devnet 5419010 C892D928: the destination finishes that
+/// escrow. Its existing MPToken gains MPTAmount 100, the holder's and the
+/// issuance's LockedAmount fields go absent at zero, the escrow is deleted.
+#[test]
+fn escrow_finish_unlocks_an_mpt_to_the_destination_token() {
+    run_bundle(include_str!("vectors/escrow_finish_unlocks_an_mpt_to_the_destination_token_devnet_5419010.json"));
+}
+
+/// Finding 338 — devnet 5423379 082003AB: the destination finishes a 100-unit
+/// MPT escrow at a 10% snapshot rate with no MPToken of its own. The token is
+/// created (reserve at OwnerCount + 1), and — fixCleanup3_4_0 being enabled
+/// on devnet (the bundle carries the Amendments singleton) — the delivery
+/// floors to 90, the 10-unit fee leaving OutstandingAmount.
+#[test]
+fn escrow_finish_mpt_fee_floors_under_fixcleanup_3_4_0() {
+    run_bundle(include_str!("vectors/escrow_finish_mpt_fee_floors_under_fixcleanup_3_4_0_devnet_5423379.json"));
+}
+
+/// Finding 332/338 — devnet 5423377 560111E5: an MPT escrow create against an
+/// issuance with TransferFee 10000 stores TransferRate 1100000000.
+#[test]
+fn escrow_create_mpt_snapshots_the_issuance_transfer_fee() {
+    run_bundle(include_str!("vectors/escrow_create_mpt_snapshots_the_issuance_transfer_fee_devnet_5423377.json"));
+}
+
+/// Finding 332 — devnet 5423388 585CB793: finishing an MPT escrow whose
+/// destination is the issuer burns the units off OutstandingAmount, no fee.
+#[test]
+fn escrow_finish_mpt_to_the_issuer_burns_outstanding() {
+    run_bundle(include_str!("vectors/escrow_finish_mpt_to_the_issuer_burns_outstanding_devnet_5423388.json"));
+}
+
+/// Finding 332 — devnet 5423393 D22B063A: a stranger cancels an MPT escrow
+/// past CancelAfter; the lock returns to the owner's token at parity.
+#[test]
+fn escrow_cancel_mpt_returns_the_lock() {
+    run_bundle(include_str!("vectors/escrow_cancel_mpt_returns_the_lock_devnet_5423393.json"));
+}
+
+/// Finding 332 — devnet 5423390 4EC1AB97AE48: a stranger cancels an MPT
+/// escrow before CancelAfter → tecNO_PERMISSION. The bundle carries the
+/// issuance and the parties' MPTokens the cancel preclaim reads (harness
+/// finding: without them the engine answered tecOBJECT_NOT_FOUND).
+#[test]
+fn escrow_cancel_mpt_before_cancel_after_by_a_stranger_is_no_permission() {
+    run_bundle(include_str!("vectors/escrow_cancel_mpt_before_cancel_after_by_a_stranger_is_no_permission_devnet_5423390.json"));
+}
+
+/// Finding 340 — #107088326 7B29A3CAC3C1: an owner finishes its own token
+/// self-escrow with no trust line and 1.399968 XRP against a reserve of 1.6
+/// for the line → tecNO_LINE_INSUF_RESERVE, fee only. We credited a line
+/// that did not exist.
+#[test]
+fn escrow_finish_self_escrow_without_a_line_needs_the_reserve_107088326() {
+    run_bundle(include_str!("vectors/escrow_finish_self_escrow_without_a_line_needs_the_reserve_107088326.json"));
+}

@@ -59,12 +59,26 @@ fn run_bundle(bundle_json: &str) {
     );
 
     for (k, want_hex) in bundle["expect"].as_object().unwrap() {
-        let ent = mods
-            .get(&key32(k))
-            .unwrap_or_else(|| panic!("target {k} must be written by the apply"));
+        let want_deleted = want_hex.as_str().unwrap().trim().is_empty();
+        let Some(ent) = mods.get(&key32(k)) else {
+            assert!(!want_deleted, "target {k} must be deleted by the apply, which never wrote it");
+            let pre_hex = bundle["pre"][k].as_str().unwrap_or_default().trim().to_uppercase();
+            assert_eq!(
+                want_hex.as_str().unwrap().trim().to_uppercase(),
+                pre_hex,
+                "target {k} was not written by the apply and does not pin the untouched pre-image"
+            );
+            continue;
+        };
         let bytes = match ent {
-            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => b.clone(),
-            SandboxEntry::Deleted => panic!("target {k} deleted?"),
+            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => {
+                assert!(!want_deleted, "target {k} must be deleted by the apply, which wrote it instead");
+                b.clone()
+            }
+            SandboxEntry::Deleted => {
+                assert!(want_deleted, "target {k} deleted?");
+                continue;
+            }
         };
         let mut jv: Value = serde_json::from_slice(&bytes).unwrap();
         canon_for_encode(&mut jv);
@@ -118,4 +132,18 @@ fn credential_carries_its_directory_pages() {
 #[test]
 fn credential_create_below_the_reserve_is_refused() {
     run_bundle(include_str!("vectors/credential_create_below_the_reserve_is_refused_106786929.json"));
+}
+
+/// Finding 319 — the testnet campaign's credential-keyed DepositPreauth
+/// (XLS-70): keylet::depositPreauth(owner, sorted credentials).
+#[test]
+fn deposit_preauth_by_credentials_files_the_credential_keyed_entry_testnet_20864003() {
+    run_bundle(include_str!("vectors/deposit_preauth_by_credentials_files_the_credential_keyed_entry_testnet_20864003.json"));
+}
+
+/// Finding 319 — the testnet campaign's credential-keyed DepositPreauth
+/// (XLS-70): keylet::depositPreauth(owner, sorted credentials).
+#[test]
+fn deposit_preauth_unauthorize_credentials_removes_the_entry_testnet_20864007() {
+    run_bundle(include_str!("vectors/deposit_preauth_unauthorize_credentials_removes_the_entry_testnet_20864007.json"));
 }

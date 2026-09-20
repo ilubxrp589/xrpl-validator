@@ -638,6 +638,23 @@ impl PaymentTransactor {
         (!ox::me_is_zero(out)).then_some(out)
     }
 
+    /// rippled's `withinRelativeDistance(calc, req, Number(1, -9))` on
+    /// amounts (AMMHelpers.h:156-162): equal ⇒ true, else (max − min)/max
+    /// strictly below 1e-9. Finding 307.
+    fn within_relative_1e9(a: crate::tx::offer::Me, b: crate::tx::offer::Me) -> bool {
+        use crate::tx::amm_swap as am;
+        use crate::tx::offer as ox;
+        if ox::me_cmp(a, b).is_eq() {
+            return true;
+        }
+        let (lo, hi) = if ox::me_cmp(a, b).is_lt() { (a, b) } else { (b, a) };
+        if ox::me_is_zero(hi) {
+            return false;
+        }
+        let rel = am::n_div(am::n_sub(hi, lo, am::Rnd::Near), hi, am::Rnd::Near);
+        ox::me_cmp(rel, (1, -9)).is_lt()
+    }
+
     /// Reverse-size ONE book hop: the input `consumed` for a target `want`
     /// out, via the grant ladder + refine — extracted verbatim from
     /// `reverse_requirements` so the mixed-strand walker sizes its book
@@ -749,7 +766,7 @@ impl PaymentTransactor {
         let mut trial_fib = amm_fib.cloned();
         let (rw, rem_in, _) = ox::cross_engine_to(
             &tx.account, &tx.account, want, granted, out_leg, in_leg,
-            threshold, threshold, false, false, single_pass, trial_fib.as_mut(), None,
+            threshold, threshold, false, false, single_pass, trial_fib.as_mut(), ox::tx_domain(tx).as_ref(), // finding 333
             sandbox, &mut Vec::new(),
         );
         let consumed = match (before, Self::leg_signed_balance(sandbox, &tx.account, in_leg)) {
@@ -1130,9 +1147,10 @@ impl PaymentTransactor {
                     crate::tx::amm_swap::set_fwd_gross_in(hop_rate.map(|_| carry));
                     crate::tx::amm_swap::set_sender_hop(i == 0);
                     crate::tx::amm_swap::set_fwd_first(!segs[..i].iter().any(|g| matches!(g, ds::SegLayout::Book { .. }))); // finding 147
+                    let _ = ox::take_self_maker_credits();
                     let (rw, rs, _c) = ox::cross_engine_to(
                         &tx.account, benef, out_target[i], avail, to, from, thr, thr, false,
-                        false, single_pass, amm_fib.as_deref_mut(), None, sandbox,
+                        false, single_pass, amm_fib.as_deref_mut(), ox::tx_domain(tx).as_ref(), sandbox, // finding 333
                         &mut Vec::new(),
                     );
                     let excess = crate::tx::amm_swap::take_fwd_excess();
@@ -1186,6 +1204,22 @@ impl PaymentTransactor {
                     // run writes the same lines for real.
                     restore(sandbox, &from_group);
                     restore(sandbox, &to_group);
+                    // Finding 294 (#107052630 32386DDEB6B8): rUnRkdr's FIL→USDT
+                    // payment through the explicit issuer hop [rsL5Y] crosses
+                    // its OWN two FIL/USDT offers. rippled's DirectStep debits
+                    // the sender the gross once and `consumeOffer`'s
+                    // issuer→owner send credits the owner the net per fill —
+                    // the same line, so only the fee stays: −(35.169 × 1.001)
+                    // − 109.4805 × 0.001. The restore above erased those
+                    // owner credits with the walk's taker moves and left the
+                    // line 109.48 low; they land again here, per fill, in
+                    // order, on the run-fed leg the run already debited.
+                    let self_credits = ox::take_self_maker_credits();
+                    if fed_by_run {
+                        for c in self_credits {
+                            ox::line_adjust(sandbox, &tx.account, from, c, true);
+                        }
+                    }
                 }
             }
         }
@@ -1447,6 +1481,7 @@ impl PaymentTransactor {
             crate::tx::amm_swap::set_fwd_gross_in(hop_rate.map(|_| carry));
             crate::tx::amm_swap::set_sender_hop(i == 0);
                     crate::tx::amm_swap::set_fwd_first(i == 0); // finding 147
+            let pool_use_seq0 = crate::tx::amm_swap::amm_use_seq();
             let (rw, rs, _c, gross_spent) = ox::cross_engine_to_net(
                 &tx.account, benef, want_cap, avail, chain[i + 1], chain[i],
                 // Finding 220 (#106825938 D97A404AA9BF, r9tcGwSyYP: 0.1 XRP → WETH
@@ -1463,7 +1498,7 @@ impl PaymentTransactor {
                 // input-driven too, and its delivery is capped at the reverse
                 // want through the same `benef_net` rule a rated leg uses —
                 // with a unit rate when the leg carries none.
-                hop_thr, hop_thr, fwd_driven && i > 0, false, single_pass, amm_fib.as_deref_mut(), None,
+                hop_thr, hop_thr, fwd_driven && i > 0, false, single_pass, amm_fib.as_deref_mut(), ox::tx_domain(tx).as_ref(), // finding 333
                 if last { want_net.or(Some((1_000_000_000, want_cap))) } else { None },
                 hop_gross,
                 sandbox, &mut Vec::new(),
@@ -1530,7 +1565,18 @@ impl PaymentTransactor {
             // Amount exactly — both VALCHECK deltas are exactly this flush.
             // IOU-only and unrated (the specimen's shape); rated or XRP legs
             // log and skip until a specimen calibrates them.
-            if !ox::me_is_zero(rs) && ox::me_is_zero(rw) && hop_rate.is_none() && i > 0 {
+            //
+            // Finding 311 (#107064266 12C8A416327C, rogue5Hn PLX→LHT→CSC — the
+            // soak-17 receipt): the hop's liquidity was a BOOK offer (one fill
+            // met the want), the CSC/LHT pool merely existed, and the 5.3e-11
+            // LHT overshoot was flushed into the pool anyway — its LHT line
+            // rounded up one ulp (…4DBC → …4DBD), the ninth mutation mainnet
+            // never wrote. rippled's fwd step feeds the excess through the
+            // stream it consumed, where an offer absorbs it below the lines'
+            // precision. Flush through the pool only when THIS hop's walk
+            // took the pool.
+            let pool_used_here = crate::tx::amm_swap::amm_use_seq() != pool_use_seq0;
+            if !ox::me_is_zero(rs) && ox::me_is_zero(rw) && hop_rate.is_none() && i > 0 && pool_used_here {
                 let tiny =
                     ox::me_cmp(ox::me_muldiv(rs, (1_000_000_000, 0), (1, 0), false), avail)
                         .is_lt();
@@ -1847,9 +1893,21 @@ impl Transactor for PaymentTransactor {
         if tx.tx_type != "Payment" {
             return TxResult::Malformed;
         }
+        // Finding 318 (testnet 20863937 C87DF8E36A9B, flag:norippledirect):
+        // an MPT-direct payment's flag mask is tfMPTPaymentMask — only
+        // tfPartialPayment survives; tfNoRippleDirect or tfLimitQuality is
+        // temINVALID_FLAG at preflight1's universal-mask check, before every
+        // other rule (Payment.cpp getFlagsMask, Transactor.cpp:214).
+        {
+            let flags0 = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+            let mpt0 = tx.fields.get("Amount").and_then(crate::tx::mpt::parse_mpt_amount).is_some();
+            if mpt0 && flags0 & (0x0001_0000 | 0x0004_0000) != 0 {
+                return TxResult::InvalidFlag;
+            }
+        }
 
         // Fee must be positive
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
 
@@ -1922,9 +1980,73 @@ impl Transactor for PaymentTransactor {
             Some(d) => d,
             None => return TxResult::Malformed,
         };
-        if dest == tx.account {
-            // rippled actually allows this — it's just a fee burn
-            // We'll allow it too
+        // Finding 299 (differential fuzz of #107052630, mutants of eleven
+        // XRP payments): the shape checks rippled's Payment::preflight runs
+        // AFTER the amount checks, in its order (Payment.cpp:134-208). A
+        // tem never reaches a validated ledger, so the shadow could not
+        // find these; libxrpl on the same mutants did.
+        let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+        let is_xrp = |v: &serde_json::Value| v.is_string();
+        let amount = tx.fields.get("Amount");
+        let send_max = tx.fields.get("SendMax");
+        let has_max = send_max.is_some();
+        let has_paths = tx.fields.get("Paths").is_some();
+        let mpt_direct = amount.and_then(crate::tx::mpt::parse_mpt_amount).is_some();
+        // rippled's maxSourceAmount defaults to the Amount when SendMax is
+        // absent, so "both native" means Amount is XRP and SendMax, if
+        // present, is XRP too.
+        let xrp_direct = amount.is_some_and(is_xrp) && send_max.is_none_or(is_xrp);
+        let same_asset = |a: &serde_json::Value, b: &serde_json::Value| -> bool {
+            match (a.as_object(), b.as_object()) {
+                (Some(x), Some(y)) => x.get("currency") == y.get("currency") && x.get("issuer") == y.get("issuer"),
+                (None, None) => true, // both XRP
+                _ => false,
+            }
+        };
+        // A payment to oneself in one asset with no Paths does nothing but
+        // burn the fee — rippled refuses it as temREDUNDANT (Payment.cpp:171).
+        // Cross-currency self-payments (SendMax in another asset) are the
+        // arbitrage shape and stay legal.
+        if let (Some(a), Some(src)) = (amount, send_max.or(amount)) {
+            if dest == tx.account && same_asset(a, src) && !has_paths {
+                return TxResult::Redundant;
+            }
+        }
+        if xrp_direct && has_max {
+            return TxResult::BadSendXrpMax;
+        }
+        if (xrp_direct || mpt_direct) && has_paths {
+            return TxResult::BadSendXrpPaths;
+        }
+        if xrp_direct && flags & 0x0002_0000 != 0 {
+            return TxResult::BadSendXrpPartial;
+        }
+        if (xrp_direct || mpt_direct) && flags & 0x0004_0000 != 0 {
+            return TxResult::BadSendXrpLimit;
+        }
+        if (xrp_direct || mpt_direct) && flags & 0x0001_0000 != 0 {
+            return TxResult::BadSendXrpNoDirect;
+        }
+        // Finding 301 (differential fuzz of #107009438, 43 mutants): the
+        // DeliverMin rules (Payment.cpp:210-243) — only with tfPartialPayment,
+        // positive, the Amount's asset, and not above the Amount.
+        if let Some(dmin) = tx.fields.get("DeliverMin") {
+            if flags & 0x0002_0000 == 0 {
+                return TxResult::BadAmount;
+            }
+            let Some(a) = amount else { return TxResult::BadAmount };
+            if !same_asset(a, dmin) {
+                return TxResult::BadAmount;
+            }
+            let positive_and_within = match (crate::ledger::keylet::amount_mant_exp(dmin), crate::ledger::keylet::amount_mant_exp(a)) {
+                (Some((dm, de)), Some((am, ae))) if dm > 0 => {
+                    crate::tx::offer::me_cmp((dm, de), (am, ae)) != std::cmp::Ordering::Greater
+                }
+                _ => false,
+            };
+            if !positive_and_within {
+                return TxResult::BadAmount;
+            }
         }
 
         TxResult::Success
@@ -2078,6 +2200,19 @@ impl Transactor for PaymentTransactor {
             }
         }
 
+        // Finding 333 (Payment.cpp:397-405): a DomainID payment needs BOTH the
+        // sender and the destination in the domain (`accountInDomain`) —
+        // tecNO_PERMISSION otherwise, judged after every other preclaim test.
+        // The flow then walks the DOMAIN books only (BookStep's `book_` carries
+        // the domain; no AMM there), see the `cross_engine_to` call sites.
+        if let Some(d) = crate::tx::offer::tx_domain(tx) {
+            if !crate::tx::misc::account_in_domain(sandbox, &tx.account, &d)
+                || !crate::tx::misc::account_in_domain(sandbox, &dest, &d)
+            {
+                return TxResult::NoPermission;
+            }
+        }
+
         TxResult::Success
     }
 
@@ -2116,6 +2251,19 @@ impl Transactor for PaymentTransactor {
         if let Some((mptid, value)) = crate::tx::mpt::parse_mpt_amount(&amt_json) {
             return crate::tx::mpt::apply_mpt_payment(tx, sandbox, &dest_id, mptid, value, partial);
         }
+        // Finding 300 (differential fuzz, tfNoRippleDirect on pathless
+        // payments — #107052630 545777BD/333459A7, #107009438 BBECA90F,
+        // 1E112DB4, C1E18884, #107056200 28F5FF07): with the default path
+        // suppressed and no Paths there is no strand to build, and rippled's
+        // flow answers temRIPPLE_EMPTY before it looks at any line or book
+        // (PaySteps.cpp:539-542) — for EVERY non-XRP-direct shape, the plain
+        // IOU send included (the XRP-direct shape is temBAD_SEND_XRP_NO_DIRECT
+        // at preflight, finding 299). Ahead of every branch below.
+        let no_direct_flag = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & 0x0001_0000 != 0;
+        let xrp_direct = amt_json.is_string() && sendmax.as_ref().is_none_or(|s| s.is_string());
+        if no_direct_flag && !xrp_direct && tx.fields.get("Paths").and_then(|p| p.as_array()).is_none_or(|a| a.is_empty()) {
+            return TxResult::RippleEmpty;
+        }
         let cross_currency = match (&sendmax, amt_json.is_string()) {
             (Some(sm), true) => !sm.is_string(),
             (Some(sm), false) => {
@@ -2149,6 +2297,45 @@ impl Transactor for PaymentTransactor {
         // mutations against mainnet's 1. Succeeding where mainnet REFUSES moves
         // value mainnet never moved, which is why this outranked the rest of
         // the batch.
+        // Finding 342 (#107093460 D125FEC040CD and twenty more in soak #19,
+        // rCCRYBtRB/rCCRSvpkB paying DepositAuth destinations with a
+        // CredentialID): `verifyDepositPreauth` (CredentialHelpers.cpp:361)
+        // first removes any EXPIRED credential named by the transaction —
+        // `checkExpired`, parentCloseTime > Expiration — and answers
+        // tecEXPIRED (the deletions stand, a tec keeps them); then, with the
+        // destination under lsfDepositAuth and no DepositPreauth(dst, src),
+        // a transaction carrying credentials is authorized when
+        // DepositPreauth(dst, sorted (Issuer, CredentialType) of those
+        // credentials) exists — else tecNO_PERMISSION. We knew only the
+        // by-account object and refused all twenty-one.
+        let cred_ids: Vec<xrpl_core::types::Hash256> = tx
+            .fields
+            .get("CredentialIDs")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter_map(|h| hex::decode(h).ok())
+                    .filter_map(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                    .map(xrpl_core::types::Hash256)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !cred_ids.is_empty() {
+            let now = sandbox.base().close_time() as u64;
+            let mut expired = false;
+            for k in &cred_ids {
+                let exp = crate::tx::offer::json_at(sandbox, k)
+                    .and_then(|c| c.get("Expiration").and_then(|v| v.as_u64()));
+                if exp.is_some_and(|e| now > e) {
+                    crate::tx::credential::delete_credential_object(sandbox, k);
+                    expired = true;
+                }
+            }
+            if expired {
+                return TxResult::Expired;
+            }
+        }
         if let Some(dst) = crate::tx::offer::json_at(sandbox, &keylet::account_root_key(&dest_id)) {
             if dst["Flags"].as_u64().unwrap_or(0) & 0x0100_0000 != 0 && dest_id != tx.account {
                 let ripple = cross_currency || !amt_json.is_string() || sendmax.is_some();
@@ -2163,7 +2350,27 @@ impl Transactor for PaymentTransactor {
                         .read(&keylet::deposit_preauth_key(&dest_id, &tx.account))
                         .is_none()
                 {
-                    return TxResult::NoPermission;
+                    if cred_ids.is_empty() {
+                        return TxResult::NoPermission;
+                    }
+                    // `authorizedDepositPreauth`: the credentials' (Issuer,
+                    // CredentialType) pairs, sorted, name the preauth object.
+                    let mut sorted: Vec<([u8; 20], Vec<u8>)> = Vec::new();
+                    for k in &cred_ids {
+                        let Some(c) = crate::tx::offer::json_at(sandbox, k) else { return TxResult::NoPermission };
+                        let (Some(issuer), Some(ct)) = (
+                            c.get("Issuer").and_then(|v| v.as_str()).and_then(crate::tx::offer::decode20),
+                            c.get("CredentialType").and_then(|v| v.as_str()).and_then(|h| hex::decode(h).ok()),
+                        ) else {
+                            return TxResult::NoPermission;
+                        };
+                        sorted.push((issuer, ct));
+                    }
+                    sorted.sort();
+                    sorted.dedup();
+                    if sandbox.read(&keylet::deposit_preauth_credentials_key(&dest_id, &sorted)).is_none() {
+                        return TxResult::NoPermission;
+                    }
                 }
             }
         }
@@ -2651,8 +2858,15 @@ impl PaymentTransactor {
         // whose implied ratio would read every book as dry.
         let limit_quality =
             tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & 0x0004_0000 != 0;
+        // Finding 304: rippled's limit is `Quality{Amounts{maxSourceAmount,
+        // dstAmount}}` = getRate(Amount, SendMax); a ratio the ledger cannot
+        // represent (a deliver-max Amount against a small SendMax) files
+        // rate 0, and Quality(0) is the BEST quality — every strand's
+        // quality falls short of it and is rejected ("Path rejected by
+        // limitQuality"), so the payment is tecPATH_DRY. `None` used to read
+        // as "no limit" here and the payment went through.
         let threshold = if limit_quality {
-            crate::ledger::keylet::offer_quality(sm_json, amt_json).unwrap_or(u64::MAX)
+            crate::ledger::keylet::offer_quality(sm_json, amt_json).unwrap_or(0)
         } else {
             u64::MAX
         };
@@ -3094,6 +3308,9 @@ impl PaymentTransactor {
         let mut rem_in_gross = spend0_gross;
         let mut rem_out = want_gross;
         let mut delivered: ox::Me = (0, 0);
+        // Finding 295: what the destination held before the rounds — the
+        // post-loop trim lands a FULL delivery on this plus the Amount.
+        let dest_held0 = crate::tx::amm_swap::holds(sandbox, dest, &want_leg);
         // NET deliveries from DIRECT strands. A book walk credits the
         // destination GROSS and the post-loop trim carves the issuer's fee
         // off; a direct strand's last hop credits exactly NET (its srcQOut
@@ -3279,6 +3496,9 @@ impl PaymentTransactor {
                     })
                     .collect();
                 c.sort_by(|a, b| ox::me_cmp(a.1, b.1));
+                // Finding 296: a fresh `ofrsToRm` per iteration — the
+                // attempts below fill it, the round's end applies it.
+                ox::dead_reaped_clear();
                 if std::env::var("DX_PAY").is_ok() {
                     eprintln!("DX_PAY   round={_round} order={:?}", c);
                 }
@@ -3312,7 +3532,22 @@ impl PaymentTransactor {
                     if let Some((qm, qb)) = Self::strand_quality_fn(
                         sandbox, &tx.account, &strands[order[0]], want_rate, t,
                     ) {
-                        if let Some(lim_net) = Self::strand_limit_out(qm, qb, t) {
+                        // Finding 307 (fuzz #121 off 107009438, 2249B3B51059 with
+                        // tfLimitQuality added — rogue5Hn's PLX→GALLOWS payment
+                        // through one strand): "A tiny difference could be due to
+                        // the round off" — `limitOut` hands back `remainingOut`
+                        // UNTRIMMED when the solved out is within 1e-9 relative of
+                        // it (StrandFlow.h:415-418, `withinRelativeDistance(out,
+                        // remainingOut, Number(1, -9))` = (max − min)/max < dist),
+                        // so `adjustedRemOut` stays false and the 1e-7 judge
+                        // forgiveness never applies. We trimmed 2737.937883092858
+                        // to …524 (1.2e-13 relative), flagged the ask adjusted, and
+                        // forgave a pass rippled rejects: "Path rejected by
+                        // limitQuality limit: 5987432887942128731 path q:
+                        // …129601" → tecPATH_DRY.
+                        if let Some(lim_net) = Self::strand_limit_out(qm, qb, t)
+                            .filter(|lim| !Self::within_relative_1e9(*lim, rem_out_net))
+                        {
                             let lim_gross = match want_rate {
                                 Some(r) => ox::mul_ratio(lim_net, r as u128, 1_000_000_000, true),
                                 None => lim_net,
@@ -3597,6 +3832,26 @@ impl PaymentTransactor {
             // spending — there is no line to difference. `rem_in` would then
             // never fall and the loop would keep buying against a SendMax it
             // cannot account for, so stop after this round instead.
+            //
+            // Finding 296 (#107009438 2877CBCC88C9): before that, rippled's
+            // per-iteration `ofrsToRm` — every offer an ATTEMPTED strand's
+            // reverse or forward pass found dead — leaves the base view
+            // (StrandFlow.h:706), won or failed. The forward pass deletes
+            // inline; the reverse sizing ran in a snapshot, so its reaps
+            // land here. Deferred to the round's end so the makers'
+            // OwnerCounts price this round's funding checks as before.
+            for okey in ox::take_dead_reaped() {
+                let Some(offer) = ox::json_at(sandbox, &okey) else { continue };
+                if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
+                    continue;
+                }
+                let Some(maker) = offer.get("Account").and_then(|v| v.as_str()).and_then(ox::decode20)
+                else { continue };
+                if std::env::var("DX_DEL").is_ok() {
+                    eprintln!("DX_DEL round-end reap okey={}", hex::encode_upper(&okey.0[..6]));
+                }
+                ox::delete_maker_offer(sandbox, &okey, &offer, &maker);
+            }
             if ox::me_is_zero(sin) {
                 break;
             }
@@ -3649,12 +3904,37 @@ impl PaymentTransactor {
                 // half: #106455062 AF6A3460 (full-ledger replay) —
                 // 4369.93132409 SOLO gross over the 1.0001 issuer must
                 // deliver …652540, floor said …652539.
-                let net = if ox::me_cmp(delivered, want_gross) == std::cmp::Ordering::Equal {
+                let full = ox::me_cmp(delivered, want_gross) == std::cmp::Ordering::Equal
+                    || (ox::me_is_zero(rem_out) && !ox::me_cmp(delivered, want_gross).is_lt());
+                let net = if full {
                     want_target
                 } else {
                     ox::mul_ratio(delivered, 1_000_000_000, rate as u128, false)
                 };
-                ox::line_adjust(sandbox, dest, &want_leg, ox::me_sub(delivered, net), false);
+                if full && dest != &tx.account {
+                    // Finding 295 (#107052630 32386DDEB6B8): five book rounds
+                    // land 5.7798 + 81.7053 + 9.5571 + 13.2211 + 7.5871 USDT on
+                    // the destination's line — 117.850440708 after the line's
+                    // 16-digit adds — while the full-precision accumulator
+                    // reads …708000054, so a trim of `delivered − Amount`
+                    // took 0.117732708000054 and left …7079999999. rippled's
+                    // last DirectStep credits NET per round and the closing
+                    // round the exact remainder (the rev-cache hit), so a
+                    // completed delivery rests the line on pre + Amount to
+                    // the digit: trim (or top up) against the LINE's own
+                    // chain, not the accumulator. A circular payment's line
+                    // also carries the spend, so it keeps the accumulator.
+                    let now = crate::tx::amm_swap::holds(sandbox, dest, &want_leg);
+                    let target = ox::signed_add(false, dest_held0, false, want_target).1;
+                    // target − now: negative means the line sits ABOVE the
+                    // target and is trimmed; positive means it is topped up.
+                    let (over, d) = ox::signed_add(false, target, true, now);
+                    if !ox::me_is_zero(d) {
+                        ox::line_adjust(sandbox, dest, &want_leg, d, !over);
+                    }
+                } else {
+                    ox::line_adjust(sandbox, dest, &want_leg, ox::me_sub(delivered, net), false);
+                }
                 net
             }
             _ => delivered,
@@ -3787,6 +4067,7 @@ mod tests {
                 "Amount": amount.to_string(),
                 "Flags": 0u64,
             }),
+            inner_batch: false,
         };
         assert_eq!(
             PaymentTransactor.preclaim(&tx, &sandbox),
@@ -3821,6 +4102,7 @@ mod tests {
                 "Destination": hex::encode(dest),
                 "Amount": amount.to_string(),
             }),
+            inner_batch: false,
         }
     }
 
@@ -3845,7 +4127,56 @@ mod tests {
         let sender = [0x01u8; 20];
         let dest = [0x02u8; 20];
         let tx = payment_tx(sender, dest, 1_000_000, 0, 1);
-        assert_eq!(PaymentTransactor.preflight(&tx), TxResult::BadFee);
+        // Finding 313: Fee 0 is preflight-valid (rippled rejects only a
+        // non-native or negative fee; the level is an open-ledger check).
+        assert_ne!(PaymentTransactor.preflight(&tx), TxResult::BadFee);
+    }
+
+    #[test]
+    fn preflight_xrp_direct_shape_rules_finding_299() {
+        let mk = |extra: serde_json::Value| -> TxFields {
+            let mut f = serde_json::json!({"Amount": "4000000", "Destination": hex::encode([2u8; 20]), "Flags": 0});
+            for (k, v) in extra.as_object().unwrap() {
+                f[k] = v.clone();
+            }
+            TxFields { account: [1u8; 20], tx_type: "Payment".into(), fee: 12, sequence: 1, ticket_seq: None, last_ledger_seq: None, fields: f, inner_batch: false }
+        };
+        let t = PaymentTransactor;
+        assert_eq!(t.preflight(&mk(serde_json::json!({}))), TxResult::Success);
+        assert_eq!(t.preflight(&mk(serde_json::json!({"Flags": 0x20000}))), TxResult::BadSendXrpPartial);
+        assert_eq!(t.preflight(&mk(serde_json::json!({"Flags": 0x40000}))), TxResult::BadSendXrpLimit);
+        assert_eq!(t.preflight(&mk(serde_json::json!({"Flags": 0x10000}))), TxResult::BadSendXrpNoDirect);
+        assert_eq!(t.preflight(&mk(serde_json::json!({"SendMax": "5000000"}))), TxResult::BadSendXrpMax);
+        assert_eq!(t.preflight(&mk(serde_json::json!({"Paths": [[{"currency": "USD", "issuer": hex::encode([3u8; 20]), "type": 48}]]}))), TxResult::BadSendXrpPaths);
+        // an IOU payment with the same flags is fine at preflight
+        let iou = serde_json::json!({"Amount": {"currency": "USD", "issuer": hex::encode([3u8; 20]), "value": "1"}, "Flags": 0x20000});
+        assert_eq!(t.preflight(&mk(iou)), TxResult::Success);
+        // redundant: to self, same asset, no paths — but not with a cross-currency SendMax
+        let me = hex::encode([1u8; 20]); // the engine's fields carry hex account ids
+        assert_eq!(t.preflight(&mk(serde_json::json!({"Destination": me}))), TxResult::Redundant);
+        assert_eq!(t.preflight(&mk(serde_json::json!({"Destination": me, "SendMax": {"currency": "USD", "issuer": hex::encode([3u8; 20]), "value": "1"}}))), TxResult::Success);
+    }
+
+    #[test]
+    fn preflight_deliver_min_rules_finding_301() {
+        let usd = |v: &str| serde_json::json!({"currency": "USD", "issuer": hex::encode([3u8; 20]), "value": v});
+        let mk = |extra: serde_json::Value| -> TxFields {
+            let mut f = serde_json::json!({"Amount": usd("10"), "SendMax": "5000000", "Destination": hex::encode([2u8; 20]), "Flags": 0x20000});
+            for (k, v) in extra.as_object().unwrap() {
+                f[k] = v.clone();
+            }
+            TxFields { account: [1u8; 20], tx_type: "Payment".into(), fee: 12, sequence: 1, ticket_seq: None, last_ledger_seq: None, fields: f, inner_batch: false }
+        };
+        let t = PaymentTransactor;
+        assert_eq!(t.preflight(&mk(serde_json::json!({"DeliverMin": usd("5")}))), TxResult::Success);
+        assert_eq!(t.preflight(&mk(serde_json::json!({"DeliverMin": usd("10")}))), TxResult::Success);
+        // a seventeenth digit is truncated by STAmount (finding 303), so 10.000000000000001 == 10 and passes;
+        // one ulp above at sixteen digits does not.
+        assert_eq!(t.preflight(&mk(serde_json::json!({"DeliverMin": usd("10.000000000000001")}))), TxResult::Success);
+        assert_eq!(t.preflight(&mk(serde_json::json!({"DeliverMin": usd("10.00000000000001")}))), TxResult::BadAmount);
+        assert_eq!(t.preflight(&mk(serde_json::json!({"DeliverMin": usd("5"), "Flags": 0}))), TxResult::BadAmount);
+        assert_eq!(t.preflight(&mk(serde_json::json!({"DeliverMin": "1000"}))), TxResult::BadAmount);
+        assert_eq!(t.preflight(&mk(serde_json::json!({"DeliverMin": usd("0")}))), TxResult::BadAmount);
     }
 
     #[test]
@@ -3859,6 +4190,7 @@ mod tests {
             last_ledger_seq: None,
             ticket_seq: None,
             fields: serde_json::json!({"Amount": "1000000"}),
+            inner_batch: false,
         };
         assert_eq!(PaymentTransactor.preflight(&tx), TxResult::Malformed);
     }
@@ -3871,6 +4203,41 @@ mod tests {
         let sandbox = Sandbox::new(&state);
         let tx = payment_tx(sender, dest, 1_000_000, 12, 1);
         assert_eq!(PaymentTransactor.preclaim(&tx, &sandbox), TxResult::NoAccount);
+    }
+
+    /// Finding 333: a DomainID payment is tecNO_PERMISSION unless BOTH the
+    /// sender and the destination are in the domain (owner or accepted
+    /// credential); judged after the funding tests.
+    #[test]
+    fn preclaim_domain_payment_needs_both_parties_in_the_domain_finding_333() {
+        let sender = [0x01u8; 20];
+        let dest = [0x02u8; 20];
+        let issuer = [0x03u8; 20];
+        let mut state = make_state();
+        add_account(&mut state, &sender, 50_000_000, 1);
+        add_account(&mut state, &dest, 50_000_000, 1);
+        let dkey = Hash256([0x66u8; 32]);
+        let pd = serde_json::json!({
+            "LedgerEntryType": "PermissionedDomain", "Flags": 0, "Owner": hex::encode(sender), "Sequence": 1,
+            "AcceptedCredentials": [{"Credential": {"Issuer": hex::encode(issuer), "CredentialType": "AB"}}],
+        });
+        state.state_map.insert(dkey, serde_json::to_vec(&pd).unwrap()).unwrap();
+        let mut tx = payment_tx(sender, dest, 1_000_000, 12, 1);
+        tx.fields["DomainID"] = serde_json::Value::String(hex::encode_upper(dkey.0));
+        {
+            let sandbox = Sandbox::new(&state);
+            assert_eq!(PaymentTransactor.preclaim(&tx, &sandbox), TxResult::NoPermission, "destination outside the domain");
+        }
+        let cred = serde_json::json!({
+            "LedgerEntryType": "Credential", "Subject": hex::encode(dest), "Issuer": hex::encode(issuer),
+            "CredentialType": "AB", "Flags": 0x0001_0000u64,
+        });
+        let ckey = crate::tx::credential::credential_key(&dest, &issuer, &hex::decode("AB").unwrap());
+        state.state_map.insert(ckey, serde_json::to_vec(&cred).unwrap()).unwrap();
+        let sandbox = Sandbox::new(&state);
+        assert_eq!(PaymentTransactor.preclaim(&tx, &sandbox), TxResult::Success);
+        tx.fields["DomainID"] = serde_json::Value::String(hex::encode_upper([0x67u8; 32]));
+        assert_eq!(PaymentTransactor.preclaim(&tx, &sandbox), TxResult::NoPermission, "missing domain");
     }
 
     #[test]
@@ -4100,6 +4467,7 @@ mod tests {
                 "Destination": hex::encode(dest),
                 "Amount": {"currency": "USD", "issuer": hex::encode(issuer), "value": "1"},
             }),
+            inner_batch: false,
         };
         // Finding 255: a destination at its limit fails the issuer→destination
         // step's `check` at strand BUILD (DirectStep.cpp:450-460, `-owed >=
@@ -4160,6 +4528,7 @@ mod tests {
                 "TakerPays": "5000000",
                 "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "5"},
             }),
+            inner_batch: false,
         };
         assert_eq!(
             crate::tx::offer::OfferCreateTransactor.do_apply(&offer_tx, &mut sandbox),
@@ -4244,6 +4613,7 @@ mod tests {
                 "TakerPays": "10000000",
                 "TakerGets": {"currency": "AAA", "issuer": hex::encode(iss), "value": "10000"},
             }),
+            inner_batch: false,
         };
         assert_eq!(crate::tx::offer::OfferCreateTransactor.do_apply(&mk, &mut sandbox), TxResult::Success);
         let mods = sandbox.into_modifications();
@@ -4262,6 +4632,7 @@ mod tests {
                 "Flags": 131072u64, // tfPartialPayment
                 "Paths": [[{"type": 48, "currency": "AAA", "issuer": hex::encode(iss)}]],
             }),
+            inner_batch: false,
         };
         assert_eq!(PaymentTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
@@ -4309,6 +4680,7 @@ mod tests {
                 "SendMax": "5000000",
                 "Flags": 131072u64,
             }),
+            inner_batch: false,
         };
         assert_eq!(PaymentTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
         // Taker spent the 5 XRP on the book.
@@ -4415,6 +4787,7 @@ mod tests {
                     "TakerPays": "5000000",
                     "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "5"},
                 }),
+                inner_batch: false,
             };
             assert_eq!(
                 crate::tx::offer::OfferCreateTransactor.do_apply(&offer_tx, &mut sandbox),
@@ -4438,6 +4811,7 @@ mod tests {
                 "SendMax": "5000000",
                 "Flags": 131072u64, // tfPartialPayment
             }),
+            inner_batch: false,
         };
 
         // Limit 0 while already holding 1 USD ⇒ receives nothing ⇒ dry, and the
@@ -4506,6 +4880,7 @@ mod tests {
                 "Destination": hex::encode(dest),
                 "Amount": {"currency": "USD", "issuer": hex::encode(issuer), "value": "25"},
             }),
+            inner_batch: false,
         };
 
         // Destination without a USD line: dry, and no line phantom-created.
@@ -4564,6 +4939,7 @@ mod tests {
                 "TakerPays": "5000000",
                 "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "5"},
             }),
+            inner_batch: false,
         };
         assert_eq!(
             crate::tx::offer::OfferCreateTransactor.do_apply(&offer_tx, &mut sandbox),
@@ -4587,6 +4963,7 @@ mod tests {
                 "SendMax": "5000000",
                 "Flags": 131072u64,
             }),
+            inner_batch: false,
         };
         assert_eq!(PaymentTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
@@ -4622,6 +4999,7 @@ mod tests {
                 "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "5"},
                 "TakerGets": "5000000",
             }),
+            inner_batch: false,
         };
         assert_eq!(
             crate::tx::offer::OfferCreateTransactor.do_apply(&offer_tx, &mut sandbox),
@@ -4645,6 +5023,7 @@ mod tests {
                 "SendMax": {"currency": "USD", "issuer": hex::encode(issuer), "value": "5"},
                 "Flags": 131072u64,
             }),
+            inner_batch: false,
         };
         assert_eq!(PaymentTransactor.do_apply(&tx, &mut sandbox), TxResult::PathDry);
         // Fee-only: taker's XRP untouched, maker's offer untouched.
@@ -4672,6 +5051,7 @@ mod tests {
                 "DeliverMin": {"currency": "USD", "issuer": hex::encode(issuer), "value": "10"},
                 "Flags": 131072u64,
             }),
+            inner_batch: false,
         };
         assert_eq!(PaymentTransactor.do_apply(&tx, &mut sandbox), TxResult::PathPartial);
         // Rolled back: XRP untouched, and the taker's line still holds nothing.
@@ -4683,5 +5063,23 @@ mod tests {
         let line = sandbox.read(&keylet::ripple_state_key(&taker, &issuer, &cur)).unwrap();
         let line: serde_json::Value = serde_json::from_slice(&line).unwrap();
         assert_eq!(line["Balance"]["value"].as_str().unwrap(), "0");
+    }
+
+    #[test]
+    fn payment_preflight_waives_fee_zero_for_a_batch_inner() {
+        use crate::ledger::transactor::{Transactor, TxFields, TxResult};
+        let tx = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": "0000000000000000000000000000000000000001",
+            "Destination": "0000000000000000000000000000000000000002",
+            "Amount": "1000000",
+            "Fee": "0",
+            "Sequence": 3,
+            "Flags": 0x4000_0000u64,
+        });
+        let mut f = TxFields::from_json(&tx).expect("fields");
+        assert_ne!(PaymentTransactor.preflight(&f), TxResult::BadFee, "finding 313: Fee 0 is valid standalone too");
+        f.inner_batch = true;
+        assert_ne!(PaymentTransactor.preflight(&f), TxResult::BadFee, "inner: Fee 0 is the rule");
     }
 }

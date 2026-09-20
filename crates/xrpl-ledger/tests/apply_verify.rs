@@ -207,6 +207,7 @@ async fn verify_payment_application_against_testnet() {
             ticket_seq,
             last_ledger_seq,
             fields,
+            inner_batch: false,
         }));
     }
 

@@ -17,8 +17,41 @@
 //! If you are adding a new amendment or tx type: add it to the FFI path,
 //! not here. See `ffi/ARCHITECTURE.md` for the architectural decision record.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use xrpl_core::types::Hash256;
+
+thread_local! {
+    /// The base keys a transactor read or enumerated while the log was armed
+    /// (`None` = off, the production default). The differential fuzzer arms
+    /// it around our leg so a bundle's `pre` carries every object OUR walk
+    /// consulted, not only libxrpl's reads — a bundle that lacks the book
+    /// pages we step replays a different, narrower walk (fuzz #85 off
+    /// 107009438: 64 mutations live, 4 from the bundle).
+    static READ_LOG: RefCell<Option<HashSet<Hash256>>> = const { RefCell::new(None) };
+}
+
+/// Arm the read log for this thread (clears any earlier keys).
+pub fn read_log_begin() {
+    READ_LOG.with(|l| *l.borrow_mut() = Some(HashSet::new()));
+}
+
+/// Disarm the read log and hand back the keys it saw, sorted.
+pub fn read_log_take() -> Vec<Hash256> {
+    let mut v: Vec<Hash256> =
+        READ_LOG.with(|l| l.borrow_mut().take()).map(|s| s.into_iter().collect()).unwrap_or_default();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+#[inline]
+fn read_log_note(key: &Hash256) {
+    READ_LOG.with(|l| {
+        if let Some(set) = l.borrow_mut().as_mut() {
+            set.insert(*key);
+        }
+    });
+}
 
 use super::state::LedgerState;
 use crate::LedgerError;
@@ -72,6 +105,9 @@ impl<'a> Sandbox<'a> {
         keys.sort_by(|a, b| a.0.cmp(&b.0));
         keys.dedup();
         keys.retain(|k| !matches!(self.modifications.get(k), Some(SandboxEntry::Deleted)));
+        for k in &keys {
+            read_log_note(k);
+        }
         keys
     }
 
@@ -83,7 +119,13 @@ impl<'a> Sandbox<'a> {
                 Some(data.clone())
             }
             Some(SandboxEntry::Deleted) => None,
-            None => self.base.read_json(key),
+            None => {
+                let r = self.base.read_json(key);
+                if r.is_some() {
+                    read_log_note(key);
+                }
+                r
+            }
         }
     }
 
@@ -156,6 +198,21 @@ impl<'a> Sandbox<'a> {
     pub fn into_modifications(self) -> HashMap<Hash256, SandboxEntry> {
         let mut m = self.modifications;
         m.remove(&AUX_KEY);
+        // Finding 335: rippled's ApplyStateTable emits a modified node only
+        // when `*curNode != *origNode` (ApplyStateTable.cpp:155) — a
+        // transactor that writes an object back unchanged has changed
+        // nothing. Testnet 20863999 0DF65AD75341 re-filed the same credential
+        // list on its domain: libxrpl's set had the root alone, ours the root
+        // and the domain. The comparison is `threading::semantically_equal`,
+        // the one the stamp already applies.
+        let base = &self.base;
+        m.retain(|k, e| match e {
+            SandboxEntry::Modified(b) => match base.read_json(k) {
+                Some(pre) => !super::threading::semantically_equal(&pre, b),
+                None => true,
+            },
+            _ => true,
+        });
         m
     }
 
@@ -172,6 +229,20 @@ impl<'a> Sandbox<'a> {
 
     pub fn aux_set(&mut self, data: Vec<u8>) {
         self.modifications.insert(AUX_KEY, SandboxEntry::Modified(data));
+    }
+
+    /// Drop the aux slot, leaving every ledger key untouched.
+    ///
+    /// The table is TRANSACTION-scoped (rippled keeps its deferred-credits
+    /// table in the PaymentSandbox, which lives for one transaction), but a
+    /// `Batch` applies several transactions on ONE sandbox: rippled gives each
+    /// inner a fresh per-tx view, so an inner must never read the previous
+    /// inner's deferred credits. `tx::batch::do_apply` calls this before each
+    /// inner. Without it the second inner's `deferred_cap` reads the FIRST
+    /// inner's "original holding" for a party and caps it there — an account
+    /// paid by inner 1 could not spend that credit in inner 2.
+    pub fn aux_clear(&mut self) {
+        self.modifications.remove(&AUX_KEY);
     }
 
     /// Discard all modifications (no-op, just consumes self).
@@ -354,5 +425,58 @@ mod tests {
         sandbox.write(key(2), vec![0x02]);
         sandbox.delete(key(3));
         assert_eq!(sandbox.modification_count(), 3);
+    }
+
+    /// `aux_clear` drops the aux slot and nothing else — the per-inner reset a
+    /// `Batch` needs so each inner starts with an empty deferred-credits table.
+    #[test]
+    fn aux_clear_drops_only_the_aux_slot() {
+        let state = test_state();
+        let mut sandbox = Sandbox::new(&state);
+        sandbox.write(key(1), vec![0x01]);
+        sandbox.aux_set(vec![0xAA, 0xBB]);
+        assert_eq!(sandbox.aux_get(), Some(vec![0xAA, 0xBB]));
+        assert_eq!(sandbox.modification_count(), 2);
+
+        sandbox.aux_clear();
+        assert_eq!(sandbox.aux_get(), None);
+        assert_eq!(sandbox.modification_count(), 1, "the ledger key survives");
+        assert_eq!(sandbox.read(&key(1)), Some(vec![0x01]));
+
+        // Idempotent: clearing an already-empty slot is a no-op.
+        sandbox.aux_clear();
+        assert_eq!(sandbox.modification_count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod unchanged_write_tests {
+    use super::*;
+    use crate::ledger::header::LedgerHeader;
+    use crate::ledger::state::LedgerState;
+
+    #[test]
+    fn a_write_back_equal_to_the_base_is_not_a_modification() {
+        let header = LedgerHeader {
+            sequence: 1,
+            total_coins: 0,
+            parent_hash: Hash256([0; 32]),
+            transaction_hash: Hash256([0; 32]),
+            account_hash: Hash256([0; 32]),
+            parent_close_time: 0,
+            close_time: 0,
+            close_time_resolution: 10,
+            close_flags: 0,
+        };
+        let mut state = LedgerState::new_unverified(header);
+        let k = Hash256([7; 32]);
+        let obj = br#"{"LedgerEntryType":"PermissionedDomain","Owner":"08F93A124EDA9FA269D6BD7557873350B7522ABC","PreviousTxnID":"AABBCCDD","PreviousTxnLgrSeq":1}"#;
+        let _ = state.state_map.insert(k, obj.to_vec());
+        let mut sb = Sandbox::new(&state);
+        sb.write(k, br#"{"LedgerEntryType":"PermissionedDomain","Owner":"08f93a124eda9fa269d6bd7557873350b7522abc","PreviousTxnID":"aabbccdd","PreviousTxnLgrSeq":1}"#.to_vec());
+        assert!(sb.into_modifications().is_empty(), "an unchanged write-back is dropped");
+        let mut sb2 = Sandbox::new(&state);
+        sb2.write(k, br#"{"LedgerEntryType":"PermissionedDomain","Owner":"08F93A124EDA9FA269D6BD7557873350B7522ABC","PreviousTxnID":"AABBCCDD","PreviousTxnLgrSeq":1,"Data":"00"}"#.to_vec());
+        assert_eq!(sb2.into_modifications().len(), 1, "a real change survives");
     }
 }

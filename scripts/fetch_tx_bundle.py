@@ -504,10 +504,79 @@ def main():
             named_keys.append(hashlib.sha512(b"\x00u" + bytes.fromhex(acct_id(tx["Owner"])) + int(tx["OfferSequence"]).to_bytes(4, "big")).digest()[:32].hex().upper())
         except Exception as e:
             print(f"note: escrow key: {e}", file=sys.stderr)
-    for f in ("Channel", "CheckID"):
+    for f in ("Channel", "CheckID", "DomainID"):
         v = tx.get(f)
         if isinstance(v, str) and len(v) == 64:
             named_keys.append(v.upper())
+    # Finding 332/338: an MPT escrow's Finish/Cancel reads the issuance and
+    # the owner's, destination's and finisher's MPTokens off the ESCROW's
+    # amount; an MPT EscrowCreate reads them off its own Amount. A fee-only
+    # tec never carries any of them (devnet 5423390 4EC1AB97, ours
+    # tecOBJECT_NOT_FOUND for the network's tecNO_PERMISSION).
+    try:
+        mpt_parties = []
+        mpt_id = None
+        if tx.get("TransactionType") in ("EscrowFinish", "EscrowCancel") and tx.get("Owner") and tx.get("OfferSequence") is not None:
+            en = rpc("ledger_entry", {"escrow": {"owner": tx["Owner"], "seq": int(tx["OfferSequence"])}, "ledger_index": seq - 1}).get("node") or {}
+            amt = en.get("Amount")
+            if isinstance(amt, dict) and amt.get("mpt_issuance_id"):
+                mpt_id = amt["mpt_issuance_id"]
+                mpt_parties = [tx["Owner"], en.get("Destination"), tx.get("Account")]
+        elif tx.get("TransactionType") == "EscrowCreate" and isinstance(tx.get("Amount"), dict) and tx["Amount"].get("mpt_issuance_id"):
+            mpt_id = tx["Amount"]["mpt_issuance_id"]
+            mpt_parties = [tx.get("Account"), tx.get("Destination")]
+        if mpt_id:
+            r = rpc("ledger_entry", {"mpt_issuance": mpt_id, "ledger_index": seq - 1, "binary": True})
+            if r.get("node_binary") and r.get("index"):
+                pre[r["index"].upper()] = r["node_binary"]
+            for p in [x for x in mpt_parties if x]:
+                r = rpc("ledger_entry", {"mptoken": {"mpt_issuance_id": mpt_id, "account": p}, "ledger_index": seq - 1, "binary": True})
+                if r.get("node_binary") and r.get("index"):
+                    pre[r["index"].upper()] = r["node_binary"]
+    except Exception as e:
+        print(f"note: mpt escrow prestate: {e}", file=sys.stderr)
+    # Finding 342: CredentialIDs name Credential objects (their keys), and a
+    # DepositAuth destination authorises them through DepositPreauth(dst,
+    # sorted (Issuer, CredentialType)) — the RPC's deposit_preauth form with
+    # authorized_credentials resolves that key.
+    try:
+        cids = tx.get("CredentialIDs") or []
+        creds = []
+        for cid in cids:
+            r = rpc("ledger_entry", {"index": cid, "ledger_index": seq - 1})
+            n = r.get("node") or {}
+            if n.get("Issuer") and n.get("CredentialType"):
+                creds.append({"issuer": n["Issuer"], "credential_type": n["CredentialType"]})
+            rb = rpc("ledger_entry", {"index": cid, "ledger_index": seq - 1, "binary": True})
+            if rb.get("node_binary"):
+                pre[cid.upper()] = rb["node_binary"]
+        if creds and tx.get("Destination"):
+            dp = rpc("ledger_entry", {"deposit_preauth": {"owner": tx["Destination"], "authorized_credentials": creds}, "ledger_index": seq - 1, "binary": True})
+            if dp.get("node_binary") and dp.get("index"):
+                pre[dp["index"].upper()] = dp["node_binary"]
+    except Exception as e:
+        print(f"note: credential preauth: {e}", file=sys.stderr)
+    # The Amendments singleton (7DB0788C…): amendment-gated rules read it
+    # (fixCleanup3_3_0, fixCleanup3_4_0 — finding 338), and a bundle without
+    # it answers "not enabled" for everything.
+    named_keys.append("7DB0788C020F02780A673DC74757F23823FA3014C1866E72CC4CD8B226CD6EF4")
+    # Finding 333: a DomainID transaction is judged by accountInDomain — the
+    # domain object plus, per party, the Credential objects its
+    # AcceptedCredentials name (keylet credential(subject, issuer, type)).
+    if isinstance(tx.get("DomainID"), str) and len(tx["DomainID"]) == 64:
+        try:
+            dom = rpc("ledger_entry", {"index": tx["DomainID"], "ledger_index": seq - 1}).get("node") or {}
+            for e in dom.get("AcceptedCredentials", []):
+                inner = e.get("Credential", e)
+                for pf in ("Account", "Destination"):
+                    subj = tx.get(pf)
+                    if not subj or not inner.get("Issuer") or not inner.get("CredentialType"):
+                        continue
+                    c = rpc("ledger_entry", {"credential": {"subject": subj, "issuer": inner["Issuer"], "credential_type": inner["CredentialType"]}, "ledger_index": seq - 1, "binary": True})
+                    if c.get("node_binary") and c.get("index"):
+                        pre[c["index"].upper()] = c["node_binary"]
+        except Exception as e:
+            print(f"note: domain credentials: {e}", file=sys.stderr)
     for nk in named_keys:
         if nk not in pre:
             try:
@@ -592,7 +661,7 @@ def main():
             continue
         try:
             rr = rpc("ledger_entry", {
-                "ripple_state": {"currency": v["currency"], "accounts": [tx["Account"], v["issuer"]]},
+                "ripple_state": {"currency": v.get("currency", "XRP"), "accounts": [tx["Account"], v.get("issuer", tx["Account"])]},
                 "ledger_index": seq - 1, "binary": True,
             })
             li = (rr.get("index") or "").upper()
@@ -611,7 +680,7 @@ def main():
     if tx.get("TransactionType") == "OfferCreate":
         def cur(v):
             if isinstance(v, dict):
-                return {"currency": v["currency"], "issuer": v["issuer"]}
+                return None if "mpt_issuance_id" in v else {"currency": v["currency"], "issuer": v["issuer"]}
             return {"currency": "XRP"}
         gets, pays, xrp = cur(tx.get("TakerGets")), cur(tx.get("TakerPays")), {"currency": "XRP"}
         pairs = [(gets, pays), (pays, gets)]
@@ -726,7 +795,7 @@ def main():
     # slices through eight iterations); without it the probe ran single-path.
     if tx.get("TransactionType") in ("OfferCreate", "Payment"):
         def leg_of(v):
-            return {"currency": "XRP"} if isinstance(v, str) else {"currency": v["currency"], "issuer": v["issuer"]}
+            return {"currency": "XRP"} if isinstance(v, str) else (None if "mpt_issuance_id" in v else {"currency": v["currency"], "issuer": v["issuer"]})
         gets = tx.get("TakerGets") if tx.get("TransactionType") == "OfferCreate" else tx.get("SendMax", tx.get("Amount"))
         pays = tx.get("TakerPays") if tx.get("TransactionType") == "OfferCreate" else tx.get("Amount")
         if gets is not None and pays is not None:
@@ -916,7 +985,7 @@ def main():
         v = tx.get(f_)
         if v is None:
             continue
-        legs.append({"currency": "XRP"} if isinstance(v, str) else {"currency": v["currency"], "issuer": v["issuer"]})
+        legs.append({"currency": "XRP"} if isinstance(v, str) else ({"mpt": v["mpt_issuance_id"]} if "mpt_issuance_id" in v else {"currency": v["currency"], "issuer": v["issuer"]}))
     # The pools of every explicit-path hop join the pair sweep (same specimens).
     for path in tx.get("Paths") or []:
         for step in path:

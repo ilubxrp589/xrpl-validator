@@ -180,6 +180,8 @@ pub enum TxResult {
     /// Clearing the RegularKey with the master key disabled and no signer
     /// list to fall back on (tecNO_ALTERNATIVE_KEY, SetRegularKey.cpp:83).
     NoAlternativeKey,
+    /// tecNEED_MASTER_KEY — asfDisableMaster / asfNoFreeze not signed with the master key.
+    NeedMasterKey,
     /// Turning on RequireAuth while the account already owns objects
     /// (tecOWNERS, SetAccount.cpp preclaim: `!dirIsEmpty(ownerDir)`).
     Owners,
@@ -193,12 +195,70 @@ pub enum TxResult {
     BadAmount,
     /// Invalid sequence.
     BadSequence,
+    /// temINVALID_FLAG — Batch: not exactly one mode flag, or tfInnerBatchTxn on the outer.
+    InvalidFlag,
+    /// temREDUNDANT — Batch: duplicate inner, or duplicate (account, sequence) under AllOrNothing/UntilFailure;
+    /// Payment: destination is the sender, same asset both ends, no Paths (Payment.cpp:171).
+    Redundant,
+    /// temBAD_SEND_XRP_MAX — XRP-to-XRP payment carrying SendMax (finding 299).
+    BadSendXrpMax,
+    /// temBAD_SEND_XRP_PATHS — XRP-to-XRP (or MPT) payment carrying Paths.
+    BadSendXrpPaths,
+    /// temBAD_SEND_XRP_PARTIAL — XRP-to-XRP payment with tfPartialPayment.
+    BadSendXrpPartial,
+    /// temBAD_SEND_XRP_LIMIT — XRP-to-XRP (or MPT) payment with tfLimitQuality.
+    BadSendXrpLimit,
+    /// temBAD_SEND_XRP_NO_DIRECT — XRP-to-XRP (or MPT) payment with tfNoRippleDirect.
+    BadSendXrpNoDirect,
+    /// temRIPPLE_EMPTY — tfNoRippleDirect with no Paths: no strand can exist (PaySteps.cpp:542, finding 300).
+    RippleEmpty,
+    /// temBAD_CURRENCY — the reserved "XRP" currency code on an IOU amount.
+    BadCurrency,
+    /// temDST_NEEDED — Payment without a Destination.
+    DstNeeded,
+    /// temBAD_SIGNER — Batch: BatchSigners not sorted/unique, missing or
+    /// spurious signer, a signer that is the outer account; also an inner
+    /// carrying a Signers field.
+    BadSigner,
+    /// temINVALID_INNER_BATCH — Batch: an inner of a disabled/pseudo type,
+    /// or an inner that otherwise fails its own preflight (rippled's
+    /// `xrpl::preflight(..., TapBatch, ...)` call on the inner).
+    InvalidInnerBatch,
+    /// temARRAY_EMPTY — Batch: RawTransactions absent or empty.
+    ArrayEmpty,
+    /// temARRAY_TOO_LARGE — Batch: more than 8 inners or signers (the tem code; `ArrayTooLarge` is the tec).
+    TemArrayTooLarge,
+    /// temSEQ_AND_TICKET — an inner with both or neither of Sequence / TicketSequence.
+    SeqAndTicket,
+    /// temBAD_SIGNATURE — an inner carrying TxnSignature.
+    BadSignature,
+    /// temBAD_REGKEY — an inner carrying a non-empty SigningPubKey.
+    BadRegKey,
+    /// temBAD_TRANSFER_RATE — AccountSet TransferRate outside [1e9, 2e9] (0 clears).
+    BadTransferRate,
+    /// temBAD_EXPIRATION — EscrowCreate without any timeout, or CancelAfter <= FinishAfter.
+    BadExpiration,
+    /// temBAD_QUORUM — SignerListSet quorum of zero or beyond the weights' sum.
+    BadQuorum,
+    /// temINVALID — an inner of a disallowed type (Batch inside Batch, pseudo types).
+    InvalidTx,
 
     // tef — failed, not applied
     /// Sequence already past.
     PastSeq,
     /// LastLedgerSequence exceeded.
     MaxLedger,
+    /// tefNO_TICKET — the TicketSequence names a ticket that was already used.
+    NoTicket,
+    /// tefWRONG_PRIOR — AccountTxnID does not match the account's.
+    WrongPrior,
+    /// tefNO_AUTH_REQUIRED — tfSetfAuth on an account without lsfRequireAuth.
+    NoAuthRequired,
+    // ter — retry, not applied
+    /// terPRE_SEQ — a future Sequence.
+    PreSeq,
+    /// terPRE_TICKET — a TicketSequence not yet created.
+    PreTicket,
     /// Account not found.
     NoAccount,
     /// Pseudo-transaction internal failure (tefFAILURE).
@@ -272,6 +332,7 @@ impl TxResult {
             | TxResult::XChainClaimNoQuorum
             | TxResult::XChainNoSignersList
             | TxResult::NoAlternativeKey
+            | TxResult::NeedMasterKey
             | TxResult::Owners
             | TxResult::Unsupported => true,
             // tem/tef: not claimed
@@ -346,13 +407,40 @@ impl TxResult {
             TxResult::XChainClaimNoQuorum => "tecXCHAIN_CLAIM_NO_QUORUM",
             TxResult::XChainNoSignersList => "tecXCHAIN_NO_SIGNERS_LIST",
             TxResult::NoAlternativeKey => "tecNO_ALTERNATIVE_KEY",
+            TxResult::NeedMasterKey => "tecNEED_MASTER_KEY",
             TxResult::Owners => "tecOWNERS",
             TxResult::Malformed => "temMALFORMED",
             TxResult::BadFee => "temBAD_FEE",
             TxResult::BadAmount => "temBAD_AMOUNT",
             TxResult::BadSequence => "temBAD_SEQUENCE",
+            TxResult::BadTransferRate => "temBAD_TRANSFER_RATE",
+            TxResult::BadExpiration => "temBAD_EXPIRATION",
+            TxResult::BadQuorum => "temBAD_QUORUM",
+            TxResult::InvalidFlag => "temINVALID_FLAG",
+            TxResult::Redundant => "temREDUNDANT",
+            TxResult::BadSendXrpMax => "temBAD_SEND_XRP_MAX",
+            TxResult::BadSendXrpPaths => "temBAD_SEND_XRP_PATHS",
+            TxResult::BadSendXrpPartial => "temBAD_SEND_XRP_PARTIAL",
+            TxResult::BadSendXrpLimit => "temBAD_SEND_XRP_LIMIT",
+            TxResult::BadSendXrpNoDirect => "temBAD_SEND_XRP_NO_DIRECT",
+            TxResult::RippleEmpty => "temRIPPLE_EMPTY",
+            TxResult::BadCurrency => "temBAD_CURRENCY",
+            TxResult::DstNeeded => "temDST_NEEDED",
+            TxResult::BadSigner => "temBAD_SIGNER",
+            TxResult::InvalidInnerBatch => "temINVALID_INNER_BATCH",
+            TxResult::ArrayEmpty => "temARRAY_EMPTY",
+            TxResult::TemArrayTooLarge => "temARRAY_TOO_LARGE",
+            TxResult::SeqAndTicket => "temSEQ_AND_TICKET",
+            TxResult::BadSignature => "temBAD_SIGNATURE",
+            TxResult::BadRegKey => "temBAD_REGKEY",
+            TxResult::InvalidTx => "temINVALID",
             TxResult::PastSeq => "tefPAST_SEQ",
             TxResult::MaxLedger => "tefMAX_LEDGER",
+            TxResult::NoTicket => "tefNO_TICKET",
+            TxResult::WrongPrior => "tefWRONG_PRIOR",
+            TxResult::NoAuthRequired => "tefNO_AUTH_REQUIRED",
+            TxResult::PreSeq => "terPRE_SEQ",
+            TxResult::PreTicket => "terPRE_TICKET",
             TxResult::NoAccount => "tefNO_ACCOUNT",
             TxResult::Failure => "tefFAILURE",
             TxResult::FailedProcessing => "telFAILED_PROCESSING",
@@ -378,6 +466,11 @@ pub struct TxFields {
     pub last_ledger_seq: Option<u32>,
     /// Raw JSON for type-specific fields.
     pub fields: serde_json::Value,
+    /// Set by `BatchTransactor` for the inner transactions it applies
+    /// (rippled's `tapBATCH`): the inner carries `Fee: "0"` by rule, so
+    /// the fee-zero gate every transactor enforces is waived, and no
+    /// signature is expected.
+    pub inner_batch: bool,
 }
 
 impl TxFields {
@@ -385,7 +478,63 @@ impl TxFields {
     pub fn uses_ticket(&self) -> bool {
         self.sequence == 0 && self.ticket_seq.is_some()
     }
+
+    /// The preflight fee gate: a standalone transaction with `Fee: "0"`
+    /// is malformed (`temBAD_FEE`); a batch inner carries `Fee: "0"` by
+    /// rule (rippled preflight1 under `tapBATCH`).
+    pub fn fee_missing(&self) -> bool {
+        // Finding 313 (fuzz fee:zero, 31 mutants on 107060755): rippled's
+        // preflight1 rejects only a non-native or NEGATIVE fee (temBAD_FEE);
+        // the fee LEVEL is judged in checkFee only while the ledger is open
+        // (telINSUF_FEE_P), never for a closed-ledger application. `Fee: "0"`
+        // applies — libxrpl returned tesSUCCESS where we said temBAD_FEE.
+        let _ = self;
+        false
+    }
+
+    /// The common-field reader that used to live in
+    /// `xrpl_node::native_apply::build_txfields`. Accepts the engine's hex
+    /// account dialect (via `tx::offer::decode20`, which tries hex first and
+    /// falls back to base58) and the pseudo-transaction zero account.
+    pub fn from_json(txjson: &serde_json::Value) -> Option<TxFields> {
+        // Pseudo-transactions carry Account: "" and Fee: "0" — the zero account.
+        let account = match txjson["Account"].as_str()? {
+            "" => [0u8; 20],
+            a => crate::tx::offer::decode20(a)?,
+        };
+        let tx_type = txjson["TransactionType"].as_str()?.to_string();
+        let fee = txjson["Fee"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let sequence = txjson["Sequence"].as_u64().unwrap_or(0) as u32;
+        let ticket_seq = txjson.get("TicketSequence").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let last_ledger_seq = txjson.get("LastLedgerSequence").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let mut fields = txjson.clone();
+        for k in ACCOUNT_FIELDS {
+            if let Some(a) = fields.get(*k).and_then(|v| v.as_str()) {
+                if a.starts_with('r') {
+                    if let Some(id) = crate::tx::offer::decode20(a) {
+                        fields[*k] = serde_json::json!(hex::encode(id));
+                    }
+                }
+            }
+        }
+        Some(TxFields {
+            account,
+            tx_type,
+            fee,
+            sequence,
+            ticket_seq,
+            last_ledger_seq,
+            fields,
+            inner_batch: false,
+        })
+    }
 }
+
+/// Account-bearing fields (other than `Account` itself) that get rewritten
+/// from base58 to hex by `TxFields::from_json` — mirrors
+/// `differential_probe`'s list of the same name, which hex-normalises a
+/// fixture's transaction JSON before the engine ever sees it.
+const ACCOUNT_FIELDS: &[&str] = &["Destination", "Owner", "Authorize", "Unauthorize", "RegularKey"];
 
 /// Trait that every transaction type implements.
 pub trait Transactor {
@@ -447,6 +596,46 @@ pub fn account_txn_id_armed(tx: &TxFields, sandbox: &Sandbox) -> bool {
         .read(&key)
         .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
         .is_some_and(|acct| acct.get("AccountTxnID").is_some())
+}
+
+/// The checks every transaction passes between preflight and its own
+/// preclaim (rippled Transactor::preclaim → checkSeqProxy,
+/// checkPriorTxAndLastLedger), for the ledger `ledger_seq` being built.
+/// Finding 312 (fuzz seq:±1 / lls:past, 81 mutants on 107060755): we
+/// incremented the account's Sequence without ever comparing it — a future
+/// sequence applied (or, in the Payment path, read temBAD_SEQUENCE), a past
+/// one applied, a LastLedgerSequence behind the ledger applied.
+pub fn preclaim_common(tx: &TxFields, sandbox: &Sandbox, ledger_seq: u32) -> TxResult {
+    let acct_key = keylet::account_root_key(&tx.account);
+    let Some(data) = sandbox.read(&acct_key) else {
+        return TxResult::NoAccount;
+    };
+    let Ok(acct) = serde_json::from_slice::<serde_json::Value>(&data) else {
+        return TxResult::Malformed;
+    };
+    let acct_seq = acct["Sequence"].as_u64().unwrap_or(0) as u32;
+    if !tx.uses_ticket() {
+        if tx.sequence != acct_seq {
+            return if acct_seq < tx.sequence { TxResult::PreSeq } else { TxResult::PastSeq };
+        }
+    } else {
+        let tseq = tx.ticket_seq.unwrap_or(0);
+        if !sandbox.exists(&keylet::ticket_key(&tx.account, tseq)) {
+            return if tseq >= acct_seq { TxResult::PreTicket } else { TxResult::NoTicket };
+        }
+    }
+    if let Some(want) = tx.fields.get("AccountTxnID").and_then(|v| v.as_str()) {
+        let have = acct.get("AccountTxnID").and_then(|v| v.as_str()).unwrap_or("");
+        if !have.eq_ignore_ascii_case(want) {
+            return TxResult::WrongPrior;
+        }
+    }
+    if let Some(lls) = tx.last_ledger_seq {
+        if ledger_seq > lls {
+            return TxResult::MaxLedger;
+        }
+    }
+    TxResult::Success
 }
 
 pub fn apply_common(tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
@@ -574,6 +763,7 @@ mod tests {
             last_ledger_seq: None,
             ticket_seq: None,
             fields: serde_json::Value::Null,
+            inner_batch: false,
         }
     }
 
@@ -625,5 +815,59 @@ mod tests {
         assert!(!TxResult::Malformed.is_claimed());
         assert!(!TxResult::PastSeq.is_claimed());
         assert!(TxResult::NoDst.is_claimed()); // tec codes are claimed
+    }
+
+    #[test]
+    fn txfields_from_json_reads_the_common_fields_and_defaults_inner_batch_off() {
+        let tx = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": "0000000000000000000000000000000000000001",
+            "Fee": "12",
+            "Sequence": 7,
+            "LastLedgerSequence": 99,
+            "Amount": "1000000",
+        });
+        let f = TxFields::from_json(&tx).expect("fields");
+        assert_eq!(f.tx_type, "Payment");
+        assert_eq!(f.fee, 12);
+        assert_eq!(f.sequence, 7);
+        assert_eq!(f.ticket_seq, None);
+        assert_eq!(f.last_ledger_seq, Some(99));
+        assert!(!f.inner_batch);
+        assert!(!f.fee_missing());
+    }
+
+    #[test]
+    fn fee_missing_is_waived_for_a_batch_inner() {
+        let tx = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": "0000000000000000000000000000000000000001",
+            "Fee": "0",
+            "Sequence": 7,
+        });
+        let mut f = TxFields::from_json(&tx).expect("fields");
+        assert!(!f.fee_missing(), "finding 313: a standalone zero-fee tx is valid");
+        f.inner_batch = true;
+        assert!(!f.fee_missing(), "a batch inner carries Fee 0 by rule");
+    }
+
+    #[test]
+    fn batch_result_codes_have_their_rippled_names() {
+        assert_eq!(TxResult::InvalidFlag.code_str(), "temINVALID_FLAG");
+        assert_eq!(TxResult::Redundant.code_str(), "temREDUNDANT");
+        assert_eq!(TxResult::BadSigner.code_str(), "temBAD_SIGNER");
+        assert_eq!(TxResult::InvalidInnerBatch.code_str(), "temINVALID_INNER_BATCH");
+        assert_eq!(TxResult::ArrayEmpty.code_str(), "temARRAY_EMPTY");
+        assert_eq!(TxResult::TemArrayTooLarge.code_str(), "temARRAY_TOO_LARGE");
+        assert_eq!(TxResult::SeqAndTicket.code_str(), "temSEQ_AND_TICKET");
+        assert_eq!(TxResult::BadSignature.code_str(), "temBAD_SIGNATURE");
+        assert_eq!(TxResult::BadRegKey.code_str(), "temBAD_REGKEY");
+        assert_eq!(TxResult::InvalidTx.code_str(), "temINVALID");
+        for r in [TxResult::InvalidFlag, TxResult::Redundant, TxResult::BadSigner,
+                  TxResult::InvalidInnerBatch, TxResult::ArrayEmpty, TxResult::TemArrayTooLarge,
+                  TxResult::SeqAndTicket, TxResult::BadSignature, TxResult::BadRegKey, TxResult::InvalidTx] {
+            assert!(!r.is_claimed(), "{:?} is a tem code, never claimed", r);
+            assert!(!r.is_success());
+        }
     }
 }

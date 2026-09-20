@@ -1402,3 +1402,212 @@ fn offer_direct_strand_rev_extent_reaps_the_unfunded_offer_behind_the_head_10698
 fn offer_bridge_admission_reads_the_raw_book_tip_expired_or_not_106990975() {
     run_bundle(include_str!("vectors/offer_bridge_admission_reads_the_raw_book_tip_expired_or_not_106990975.json"));
 }
+
+/// Finding 291 (#107044846 21AFDEFB, and 107044848-857: ten consecutive
+/// tecKILLED receipts from rGH4WSUU's Fill-or-Kill RLUSD buys, 06:23-06:40
+/// on 2026-09-17): rippled derives remainingOut at every iteration boundary
+/// as `outReq - sum(savedOuts)` over the ASCENDING multiset (StrandFlow.h:791),
+/// never as a running chain. Four iterations — 24.33333333333333,
+/// 20.20166157769699, 1.041989285030025, 0.08777380393965 — decrement the
+/// chain to exactly zero, but the sorted 16-digit fold is 45.66475799999999
+/// against 45.664758 wanted, so rippled runs a fifth iteration for the 1e-14
+/// crumb, prices it at one drop, rejects the strand by limitQuality ("path q:
+/// 7134701809754865664"), finds all strands dry, and kills the offer with 3
+/// mutations. We believed the chain, filled, and reported tesSUCCESS with 19.
+/// The done check now banks the iteration and re-derives from the fold first.
+#[test]
+fn offer_fill_or_kill_is_judged_on_the_sorted_fold_not_the_running_chain_107044846() {
+    run_bundle(include_str!("vectors/offer_fill_or_kill_is_judged_on_the_sorted_fold_not_the_running_chain_107044846.json"));
+}
+
+/// Finding 292 (#107002363 580C51AC and #106999572 6302A085, rJfVTbJs selling
+/// ETH for RLUSD, tfSell|tfImmediateOrCancel, two strands): FlowSortStrands
+/// makes an iteration flow its admitted strands in bound order and break at
+/// the first that succeeds and passes limitQuality; the strands behind the
+/// winner are not flowed that iteration — no rev pass, no stream, nothing
+/// reaped. The direct ETH/RLUSD strand sorted first (4.0391e-4 against the
+/// bridge's 4.0429e-4) and filled the whole 4.039e-6 ETH: rippled's narration
+/// has one strand's rev/fwd and six mutations. We ran the bridge's leg-B rev
+/// extent before the candidate loop and reaped rfPBiFvF's expired BF0EA46B,
+/// its page and an OwnerCount unit — ten. Four untouched-object pins carry
+/// the rule (post == pre for the offer, its page, the owner's root and owner
+/// directory).
+#[test]
+fn offer_sorted_strands_break_at_the_first_success_the_bridge_behind_a_winner_is_not_flowed_107002363() {
+    run_bundle(include_str!("vectors/offer_sorted_strands_break_at_the_first_success_the_bridge_behind_a_winner_is_not_flowed_107002363.json"));
+}
+
+/// Finding 298 — #107060755 F43C3C4DA037: rsdsSA7's tfSell offer, 852332.25
+/// ASC for 599530.50 PLR, meets a direct ASC/PLR pool and a two-pool XRP
+/// bridge (multi-path, Fibonacci offers). rippled takes five direct-pool
+/// slices (25.645 ASC), then `AMMLiquidity::getOffer` gates the pool by its
+/// OWN book's tip — the raw pool quality (1.40353) no longer beats the tip
+/// (the taker's own 4CF7660E at 1.401935) — the direct strand runs dry on
+/// that self-offer and the bridge takes iteration 5 (4590.39 ASC through
+/// both pools, 3243.97 PLR). We ranked the pool only against the rival
+/// strand, sliced it seven times (70.9 ASC) and never flowed the bridge:
+/// four pool objects unwritten, nine targets wrong.
+#[test]
+fn offer_fib_pool_is_gated_by_its_own_book_tip_107060755() {
+    run_bundle(include_str!("vectors/offer_fib_pool_is_gated_by_its_own_book_tip_107060755.json"));
+}
+
+/// Finding 302 — from the differential fuzzer: tfImmediateOrCancel and
+/// tfFillOrKill together are malformed (CreateOffer.cpp:82-85); libxrpl's
+/// verdict on the mutant is the expectation.
+#[test]
+fn offer_ioc_and_fok_together_is_invalid_flag_fuzz_107009438() {
+    run_bundle(include_str!("vectors/offer_ioc_and_fok_together_is_invalid_flag_fuzz_107009438.json"));
+}
+
+/// Finding 305 — from the differential fuzzer (TakerGets doubled past the
+/// taker's CNY line): after crossing, rippled re-reads `accountFunds` and
+/// rests nothing when it is exhausted (flowCross :438-446). Our test was on
+/// the clamped remainder, which folded one ulp short of zero after 25 fills,
+/// so we rested an Offer and its book page the account could not fund.
+#[test]
+fn offer_residual_rests_only_while_the_account_is_still_funded_fuzz_107060755() {
+    run_bundle(include_str!(
+        "vectors/offer_residual_rests_only_while_the_account_is_still_funded_fuzz_107060755.json"
+    ));
+}
+
+/// Finding 305, the mirror: the clamped remainder spent to exactly zero while
+/// the line kept 1e-17 CNY — libxrpl rests the residual, because the account
+/// is the only judge. We rested nothing.
+#[test]
+fn offer_residual_rests_on_a_one_ulp_line_fuzz_107060755() {
+    run_bundle(include_str!("vectors/offer_residual_rests_on_a_one_ulp_line_fuzz_107060755.json"));
+}
+
+/// Finding 306 — from the differential fuzzer (r3rhWeE3's FLR→BTC offer,
+/// TakerGets doubled, a direct pool plus a two-leg XRP bridge): at iteration
+/// 8 the direct pool's Fibonacci slice fell behind the direct tip — the
+/// taker's OWN resting offer — so rippled's direct strand ran dry, was never
+/// pushed back into the active set, and the lone bridge finished single-path.
+/// We spared the strand as "refused only by the rival's bound", took a ninth
+/// direct slice next round and stayed multi-path (12 vs 11 fills).
+#[test]
+fn offer_strand_refused_by_its_own_tip_stays_dead_fuzz_107009438() {
+    run_bundle(include_str!(
+        "vectors/offer_strand_refused_by_its_own_tip_stays_dead_fuzz_107009438.json"
+    ));
+}
+
+/// Finding 310 — from the differential fuzzer (r3rhWeE3 buying 27954.62 EUR
+/// with ETH over the book and an XRP bridge, TakerGets doubled, 139
+/// iterations): a buy's residual is TakerPays minus flow()'s `sum(savedOuts)`
+/// — the iterations' outs folded in the multiset's sorted order. Our per-fill
+/// chain in consumption order landed two ulp high on both resting amounts.
+#[test]
+fn offer_buy_residual_folds_the_iterations_outs_in_multiset_order_fuzz_107009438() {
+    run_bundle(include_str!(
+        "vectors/offer_buy_residual_folds_the_iterations_outs_in_multiset_order_fuzz_107009438.json"
+    ));
+}
+
+/// Findings 312-316 — from the structural differential fuzzer (sweep 3 on
+/// 107060755); libxrpl's result is the expectation.
+#[test]
+fn nft_cancel_offer_past_sequence_is_tefpast_seq_fuzz_107060755() {
+    run_bundle(include_str!("vectors/nft_cancel_offer_past_sequence_is_tefpast_seq_fuzz_107060755.json"));
+}
+
+/// Findings 312-316 — from the structural differential fuzzer (sweep 3 on
+/// 107060755); libxrpl's result is the expectation.
+#[test]
+fn offer_cancel_sequence_at_or_past_the_account_is_bad_sequence_fuzz_107060755() {
+    run_bundle(include_str!("vectors/offer_cancel_sequence_at_or_past_the_account_is_bad_sequence_fuzz_107060755.json"));
+}
+
+/// Findings 320-326 — from the testnet campaign's differential fuzz (libxrpl's
+/// result is the expectation).
+#[test]
+fn nft_create_offer_destination_self_is_malformed_fuzz_testnet_20864086() {
+    run_bundle(include_str!("vectors/nft_create_offer_destination_self_is_malformed_fuzz_testnet_20864086.json"));
+}
+
+/// Findings 320-326 — from the testnet campaign's differential fuzz (libxrpl's
+/// result is the expectation).
+#[test]
+fn nft_create_offer_sell_with_owner_is_malformed_fuzz_testnet_20864090() {
+    run_bundle(include_str!("vectors/nft_create_offer_sell_with_owner_is_malformed_fuzz_testnet_20864090.json"));
+}
+
+/// Findings 328/329 — from the structural differential fuzzer (libxrpl's
+/// result is the expectation).
+#[test]
+fn nft_accept_broker_fee_needs_both_offers_buy_dropped_fuzz_107075103() {
+    run_bundle(include_str!("vectors/nft_accept_broker_fee_needs_both_offers_buy_dropped_fuzz_107075103.json"));
+}
+
+/// Findings 328/329 — from the structural differential fuzzer (libxrpl's
+/// result is the expectation).
+#[test]
+fn nft_accept_broker_fee_needs_both_offers_sell_dropped_fuzz_107075103() {
+    run_bundle(include_str!("vectors/nft_accept_broker_fee_needs_both_offers_sell_dropped_fuzz_107075103.json"));
+}
+
+/// Finding 334 — the devnet campaign's permissioned-DEX hybrid offer.
+#[test]
+fn offer_hybrid_domain_offer_rests_in_both_books_devnet_5419038() {
+    run_bundle(include_str!("vectors/offer_hybrid_domain_offer_rests_in_both_books_devnet_5419038.json"));
+}
+
+/// Finding 336 — a tfSell FillOrKill whose per-iteration in-fold lands an
+/// ulp past sendMax: flow()'s remainingIn is negative, not zero, and the
+/// offer is killed with its fills rolled back (soak #18, rKjqjLdp).
+#[test]
+fn offer_sell_fill_or_kill_whose_in_fold_overshoots_is_killed_107078027() {
+    run_bundle(include_str!("vectors/offer_sell_fill_or_kill_whose_in_fold_overshoots_is_killed_107078027.json"));
+}
+
+/// Finding 336 — a tfSell FillOrKill whose per-iteration in-fold lands an
+/// ulp past sendMax: flow()'s remainingIn is negative, not zero, and the
+/// offer is killed with its fills rolled back (soak #18, rKjqjLdp).
+#[test]
+fn offer_sell_fill_or_kill_whose_in_fold_overshoots_is_killed_107078041() {
+    run_bundle(include_str!("vectors/offer_sell_fill_or_kill_whose_in_fold_overshoots_is_killed_107078041.json"));
+}
+
+/// Finding 336 — a tfSell FillOrKill whose per-iteration in-fold lands an
+/// ulp past sendMax: flow()'s remainingIn is negative, not zero, and the
+/// offer is killed with its fills rolled back (soak #18, rKjqjLdp).
+#[test]
+fn offer_sell_fill_or_kill_whose_in_fold_overshoots_is_killed_107078052() {
+    run_bundle(include_str!("vectors/offer_sell_fill_or_kill_whose_in_fold_overshoots_is_killed_107078052.json"));
+}
+
+/// Finding 336 — a tfSell FillOrKill whose per-iteration in-fold lands an
+/// ulp past sendMax: flow()'s remainingIn is negative, not zero, and the
+/// offer is killed with its fills rolled back (soak #18, rKjqjLdp).
+#[test]
+fn offer_sell_fill_or_kill_whose_in_fold_overshoots_is_killed_107078068() {
+    run_bundle(include_str!("vectors/offer_sell_fill_or_kill_whose_in_fold_overshoots_is_killed_107078068.json"));
+}
+
+/// Finding 337 — devnet 5422969 556E025939A5: rQNx's domain offer walks the
+/// domain book onto r4uY's BF23A33D, whose owner lost its KYC credential two
+/// ledgers earlier. `offerInDomain` fails → the offer is removed for good and
+/// the taker's offer rests uncrossed. We crossed it.
+#[test]
+fn offer_create_removes_a_domain_offer_whose_owner_left_the_domain_devnet_5422969() {
+    run_bundle(include_str!("vectors/offer_create_removes_a_domain_offer_whose_owner_left_the_domain_devnet_5422969.json"));
+}
+
+/// Finding 333 — devnet 5422957 114F74C8AB4F: r4uY, its credential deleted,
+/// names the domain on an OfferCreate → tecNO_PERMISSION (accountInDomain).
+#[test]
+fn offer_create_outside_its_domain_is_no_permission_devnet_5422957() {
+    run_bundle(include_str!("vectors/offer_create_outside_its_domain_is_no_permission_devnet_5422957.json"));
+}
+
+/// Finding 339 — #107080701 8EB3E8F0B045: an IoC buy of 436 drops for
+/// 0.000619 RLUSD. The tip fills 435; for the last drop the pool wins the
+/// turn anchored on the next tip, its slice misses the limit and rippled's
+/// flow breaks — the offer behind the pool (EE9CCDBD, pinned with its owner's
+/// root and line) is never touched. We filled the drop from it.
+#[test]
+fn offer_ioc_buy_ends_when_the_pool_slice_misses_the_limit_107080701() {
+    run_bundle(include_str!("vectors/offer_ioc_buy_ends_when_the_pool_slice_misses_the_limit_107080701.json"));
+}

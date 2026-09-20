@@ -61,12 +61,26 @@ fn run_bundle(bundle_json: &str) {
     );
 
     for (k, want_hex) in bundle["expect"].as_object().unwrap() {
-        let ent = mods
-            .get(&key32(k))
-            .unwrap_or_else(|| panic!("target {k} must be written by the apply"));
+        let want_deleted = want_hex.as_str().unwrap().trim().is_empty();
+        let Some(ent) = mods.get(&key32(k)) else {
+            assert!(!want_deleted, "target {k} must be deleted by the apply, which never wrote it");
+            let pre_hex = bundle["pre"][k].as_str().unwrap_or_default().trim().to_uppercase();
+            assert_eq!(
+                want_hex.as_str().unwrap().trim().to_uppercase(),
+                pre_hex,
+                "target {k} was not written by the apply and does not pin the untouched pre-image"
+            );
+            continue;
+        };
         let bytes = match ent {
-            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => b.clone(),
-            SandboxEntry::Deleted => panic!("target {k} deleted?"),
+            SandboxEntry::Created(b) | SandboxEntry::Modified(b) => {
+                assert!(!want_deleted, "target {k} must be deleted by the apply, which wrote it instead");
+                b.clone()
+            }
+            SandboxEntry::Deleted => {
+                assert!(want_deleted, "target {k} deleted?");
+                continue;
+            }
         };
         let mut jv: Value = serde_json::from_slice(&bytes).unwrap();
         canon_for_encode(&mut jv);
@@ -172,4 +186,25 @@ fn amm_two_asset_deposit_of_dust_is_tec_amm_invalid_tokens_106894782() {
 #[test]
 fn amm_deposit_no_line_to_a_permissive_issuer_is_tec_unfunded_amm() {
     run_bundle(include_str!("vectors/amm_deposit_no_line_permissive_issuer_unfunded_106906914.json"));
+}
+
+/// Findings 328/329 — from the structural differential fuzzer (libxrpl's
+/// result is the expectation).
+#[test]
+fn amm_deposit_limit_lp_token_mode_needs_eprice_fuzz_107075103() {
+    run_bundle(include_str!("vectors/amm_deposit_limit_lp_token_mode_needs_eprice_fuzz_107075103.json"));
+}
+
+/// Findings 328/329 — from the structural differential fuzzer (libxrpl's
+/// result is the expectation).
+#[test]
+fn amm_deposit_lp_token_mode_needs_lptokenout_fuzz_107075103() {
+    run_bundle(include_str!("vectors/amm_deposit_lp_token_mode_needs_lptokenout_fuzz_107075103.json"));
+}
+
+/// Findings 328/329 — from the structural differential fuzzer (libxrpl's
+/// result is the expectation).
+#[test]
+fn amm_deposit_two_asset_if_empty_mode_needs_both_amounts_fuzz_107075103() {
+    run_bundle(include_str!("vectors/amm_deposit_two_asset_if_empty_mode_needs_both_amounts_fuzz_107075103.json"));
 }

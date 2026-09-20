@@ -109,7 +109,7 @@ pub struct AMMCreateTransactor;
 impl Transactor for AMMCreateTransactor {
     fn preflight(&self, tx: &TxFields) -> TxResult {
         if tx.tx_type != "AMMCreate" { return TxResult::Malformed; }
-        if tx.fee == 0 { return TxResult::BadFee; }
+        if tx.fee_missing() { return TxResult::BadFee; }
         if tx.fields.get("Amount").is_none() || tx.fields.get("Amount2").is_none() {
             return TxResult::Malformed;
         }
@@ -784,9 +784,42 @@ pub struct AMMDepositTransactor;
 impl Transactor for AMMDepositTransactor {
     fn preflight(&self, tx: &TxFields) -> TxResult {
         if tx.tx_type != "AMMDeposit" { return TxResult::Malformed; }
-        if tx.fee == 0 { return TxResult::BadFee; }
+        if tx.fee_missing() { return TxResult::BadFee; }
         if tx.fields.get("Asset").is_none() || tx.fields.get("Asset2").is_none() {
             return TxResult::Malformed;
+        }
+        // Finding 329 (fuzz mode:* on 107075103 695B7891621E): exactly one
+        // deposit sub-type flag, and the field set it demands
+        // (AMMDeposit.cpp:55-100).
+        {
+            let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+            const LP: u64 = 0x0001_0000;
+            const SINGLE: u64 = 0x0008_0000;
+            const TWO: u64 = 0x0010_0000;
+            const ONE_LP: u64 = 0x0020_0000;
+            const LIMIT_LP: u64 = 0x0040_0000;
+            const TWO_IF_EMPTY: u64 = 0x0080_0000;
+            let sub = flags & (LP | SINGLE | TWO | ONE_LP | LIMIT_LP | TWO_IF_EMPTY);
+            if sub.count_ones() != 1 {
+                return TxResult::Malformed;
+            }
+            let amount = tx.fields.get("Amount").is_some();
+            let amount2 = tx.fields.get("Amount2").is_some();
+            let eprice = tx.fields.get("EPrice").is_some();
+            let lp = tx.fields.get("LPTokenOut").is_some();
+            let fee = tx.fields.get("TradingFee").is_some();
+            let bad = match sub {
+                LP => !lp || eprice || (amount && !amount2) || (!amount && amount2) || fee,
+                SINGLE => !amount || amount2 || eprice || fee,
+                TWO => !amount || !amount2 || eprice || fee,
+                ONE_LP => !amount || !lp || amount2 || eprice || fee,
+                LIMIT_LP => !amount || !eprice || lp || amount2 || fee,
+                TWO_IF_EMPTY => !amount || !amount2 || eprice || lp,
+                _ => true,
+            };
+            if bad {
+                return TxResult::Malformed;
+            }
         }
         TxResult::Success
     }
@@ -1658,7 +1691,7 @@ fn withdraw_reserve_ok(sandbox: &Sandbox, account: &[u8; 20], leg: &crate::tx::o
 impl Transactor for AMMWithdrawTransactor {
     fn preflight(&self, tx: &TxFields) -> TxResult {
         if tx.tx_type != "AMMWithdraw" { return TxResult::Malformed; }
-        if tx.fee == 0 { return TxResult::BadFee; }
+        if tx.fee_missing() { return TxResult::BadFee; }
         if tx.fields.get("Asset").is_none() || tx.fields.get("Asset2").is_none() {
             return TxResult::Malformed;
         }
@@ -2209,7 +2242,7 @@ pub struct AMMVoteTransactor;
 impl Transactor for AMMVoteTransactor {
     fn preflight(&self, tx: &TxFields) -> TxResult {
         if tx.tx_type != "AMMVote" { return TxResult::Malformed; }
-        if tx.fee == 0 { return TxResult::BadFee; }
+        if tx.fee_missing() { return TxResult::BadFee; }
         if tx.fields.get("Asset").is_none() || tx.fields.get("Asset2").is_none() {
             return TxResult::Malformed;
         }
@@ -2470,7 +2503,7 @@ pub struct AMMBidTransactor;
 impl Transactor for AMMBidTransactor {
     fn preflight(&self, tx: &TxFields) -> TxResult {
         if tx.tx_type != "AMMBid" { return TxResult::Malformed; }
-        if tx.fee == 0 { return TxResult::BadFee; }
+        if tx.fee_missing() { return TxResult::BadFee; }
         if tx.fields.get("Asset").is_none() || tx.fields.get("Asset2").is_none() {
             return TxResult::Malformed;
         }
@@ -2710,7 +2743,7 @@ pub struct AMMDeleteTransactor;
 impl Transactor for AMMDeleteTransactor {
     fn preflight(&self, tx: &TxFields) -> TxResult {
         if tx.tx_type != "AMMDelete" { return TxResult::Malformed; }
-        if tx.fee == 0 { return TxResult::BadFee; }
+        if tx.fee_missing() { return TxResult::BadFee; }
         if tx.fields.get("Asset").is_none() || tx.fields.get("Asset2").is_none() {
             return TxResult::Malformed;
         }
@@ -3008,6 +3041,7 @@ mod tests {
                 "Amount2": "446527",
                 "Flags": 1_048_576u64,
             }),
+            inner_batch: false,
         };
         // 446527 drops wanted, only 246527 liquid once the new LP line's
         // reserve is counted, and no LP line exists yet.
@@ -3066,6 +3100,7 @@ mod tests {
                 "Amount2": {"currency": "USD", "issuer": hex::encode([0x02u8; 20]), "value": "100"},
                 "TradingFee": 500,
             }),
+            inner_batch: false,
         };
 
         assert_eq!(AMMCreateTransactor.preflight(&tx), TxResult::Success);
@@ -3098,6 +3133,7 @@ mod tests {
                 "Amount2": {"currency": "USD", "issuer": hex::encode([0x02u8; 20]), "value": "100"},
                 "TradingFee": 500,
             }),
+            inner_batch: false,
         };
         AMMCreateTransactor.do_apply(&create_tx, &mut sandbox);
 
@@ -3114,6 +3150,7 @@ mod tests {
                 "Asset2": {"currency": "USD", "issuer": hex::encode([0x02u8; 20])},
                 "TradingFee": 300,
             }),
+            inner_batch: false,
         };
         assert_eq!(AMMVoteTransactor.preflight(&vote_tx), TxResult::Success);
         assert_eq!(AMMVoteTransactor.do_apply(&vote_tx, &mut sandbox), TxResult::Success);
@@ -3141,6 +3178,7 @@ mod tests {
                 "Asset2": {"currency": "USD", "issuer": hex::encode(issuer)},
                 "TradingFee": 300,
             }),
+            inner_batch: false,
         };
         let akey = amm_key_from_asset_fields(&tx).unwrap();
         let amm = |lpt: &str| {
@@ -3199,6 +3237,7 @@ mod tests {
                 "Amount2": {"currency": "USD", "issuer": hex::encode([0x02u8; 20]), "value": "100"},
                 "TradingFee": 500,
             }),
+            inner_batch: false,
         };
         AMMCreateTransactor.do_apply(&create_tx, &mut sandbox);
 
@@ -3215,6 +3254,7 @@ mod tests {
                 "Asset2": {"currency": "USD", "issuer": hex::encode([0x02u8; 20])},
                 "Amount": "10000000",
             }),
+            inner_batch: false,
         };
         assert_eq!(AMMDepositTransactor.do_apply(&dep_tx, &mut sandbox), TxResult::Success);
 
@@ -3237,6 +3277,7 @@ mod tests {
                 "Asset2": {"currency": "USD", "issuer": hex::encode([0x02u8; 20])},
                 "Amount": "5000000",
             }),
+            inner_batch: false,
         };
         assert_eq!(AMMWithdrawTransactor.do_apply(&wd_tx, &mut sandbox), TxResult::Success);
 
@@ -3268,6 +3309,7 @@ mod tests {
                 "Amount2": {"currency": "USD", "issuer": hex::encode(usd_issuer), "value": "100"},
                 "TradingFee": 500,
             }),
+            inner_batch: false,
         };
         assert_eq!(AMMCreateTransactor.do_apply(&create_tx, &mut sandbox), TxResult::Success);
 
@@ -3282,6 +3324,7 @@ mod tests {
                 "Asset2": {"currency": "USD", "issuer": hex::encode(usd_issuer)},
                 "Amount": "10000000",
             }),
+            inner_batch: false,
         };
         assert_eq!(AMMDepositTransactor.do_apply(&dep, &mut sandbox), TxResult::Success);
 
@@ -3293,6 +3336,7 @@ mod tests {
                 "Asset2": {"currency": "USD", "issuer": hex::encode(usd_issuer)},
                 "Flags": 0x0002_0000u64, // tfWithdrawAll
             }),
+            inner_batch: false,
         };
         // Alice's LPToken trust line (she holds all the pool's LPTokens).
         let amm_key = amm_key_from_asset_fields(&wd_all).unwrap();
@@ -3353,6 +3397,7 @@ mod tests {
                 "Amount2": {"currency": "USD", "issuer": hex::encode(usd_issuer), "value": "100"},
                 "TradingFee": 236,
             }),
+            inner_batch: false,
         };
         assert_eq!(AMMCreateTransactor.do_apply(&create_tx, &mut sandbox), TxResult::Success);
 
@@ -3366,6 +3411,7 @@ mod tests {
                 "Amount": "1",
                 "Flags": 0x0004_0000u64, // tfOneAssetWithdrawAll
             }),
+            inner_batch: false,
         };
         let amm_key = amm_key_from_asset_fields(&wd).unwrap();
         let amm_obj: serde_json::Value = serde_json::from_slice(&sandbox.read(&amm_key).unwrap()).unwrap();
@@ -3415,6 +3461,7 @@ mod tests {
                 "Amount2": {"currency": "USD", "issuer": hex::encode(usd_issuer), "value": "100"},
                 "TradingFee": 500,
             }),
+            inner_batch: false,
         };
         assert_eq!(AMMCreateTransactor.do_apply(&create_tx, &mut sandbox), TxResult::Success);
 
@@ -3426,6 +3473,7 @@ mod tests {
                 "Asset2": {"currency": "USD", "issuer": hex::encode(usd_issuer)},
                 "Flags": 0x0001_0000u64, // tfLPToken — note: no Amount/Amount2
             }),
+            inner_batch: false,
         };
         let amm_key = amm_key_from_asset_fields(&wd).unwrap();
         let amm_obj: serde_json::Value = serde_json::from_slice(&sandbox.read(&amm_key).unwrap()).unwrap();
@@ -3491,6 +3539,7 @@ mod tests {
                 "Amount2": {"currency": "USD", "issuer": hex::encode(usd_issuer), "value": "100"},
                 "TradingFee": 500,
             }),
+            inner_batch: false,
         };
         assert_eq!(AMMCreateTransactor.do_apply(&create_tx, &mut sandbox), TxResult::Success);
 
@@ -3506,6 +3555,7 @@ mod tests {
                 "Asset2": {"currency": "USD", "issuer": hex::encode(usd_issuer)},
                 "Amount": "500000",
             }),
+            inner_batch: false,
         };
         let put_acct = |sb: &mut Sandbox, id: &[u8; 20], bal: &str| {
             sb.write(
@@ -3555,7 +3605,7 @@ impl Transactor for AMMClawbackTransactor {
         if tx.tx_type != "AMMClawback" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("Holder").is_none()

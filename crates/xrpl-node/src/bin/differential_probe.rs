@@ -386,6 +386,88 @@ fn load_account_states(state: &mut LedgerState, url: &str, addr: &str, ledger_in
 /// the owner's chain; accept needs both parties' — the counterparty is only
 /// discoverable through the offer SLE, fetched here (cached) pre-hexify so
 /// its Owner is still base58 for account_objects.
+/// Finding 333: a DomainID transaction (Payment, OfferCreate) is judged by
+/// `accountInDomain` — the domain object (already a 64-hex read key) AND, for
+/// every party, the Credential objects the domain's AcceptedCredentials name.
+/// The engine reads those keys and nothing in the meta names them (an
+/// in-domain party changes no credential), so they must be loaded here: the
+/// domain first, then keylet::credential(party, Issuer, CredentialType) per
+/// accepted entry. Devnet 5419038 A4C673A4 (r4uY's hybrid offer, credential
+/// 78540263… issued by the domain owner) was tecNO_PERMISSION unhydrated.
+fn load_domain_credentials_for_tx(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
+    let Some(domain_hex) = txj.get("DomainID").and_then(|v| v.as_str()).filter(|s| s.len() == 64) else {
+        return;
+    };
+    load_object(state, url, domain_hex, ledger_index);
+    let Ok(db) = hex::decode(domain_hex) else { return };
+    let mut dk = [0u8; 32];
+    dk.copy_from_slice(&db);
+    let Some(dom) = state.state_map.lookup(&Hash256(dk)).and_then(|b| serde_json::from_slice::<Value>(b).ok()) else {
+        return;
+    };
+    let addr20 = |s: &str| -> Option<[u8; 20]> {
+        if s.len() == 40 {
+            hex::decode(s).ok().and_then(|b| b.try_into().ok())
+        } else {
+            decode_address(s)
+        }
+    };
+    let parties: Vec<[u8; 20]> = ["Account", "Destination"]
+        .iter()
+        .filter_map(|f| txj.get(*f).and_then(|v| v.as_str()).and_then(decode_address))
+        .collect();
+    for e in dom.get("AcceptedCredentials").and_then(|v| v.as_array()).into_iter().flatten() {
+        let inner = e.get("Credential").unwrap_or(e);
+        let (Some(issuer), Some(ct)) = (
+            inner.get("Issuer").and_then(|v| v.as_str()).and_then(addr20),
+            inner.get("CredentialType").and_then(|v| v.as_str()).and_then(|h| hex::decode(h).ok()),
+        ) else {
+            continue;
+        };
+        for p in &parties {
+            let k = keylet::credential_key(p, &issuer, &ct);
+            load_object(state, url, &hex::encode_upper(k.0), ledger_index);
+        }
+    }
+}
+
+/// Finding 342: a transaction carrying CredentialIDs into a DepositAuth
+/// destination is authorised by DepositPreauth(dst, sorted (Issuer,
+/// CredentialType) of those credentials) — an object nothing in the meta
+/// names when the payment succeeds. The credentials themselves are 64-hex
+/// read keys (loaded already); this reads them and loads the preauth object.
+fn load_credential_preauth_for_tx(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
+    let Some(ids) = txj.get("CredentialIDs").and_then(|v| v.as_array()) else { return };
+    let Some(dst) = txj.get("Destination").and_then(|v| v.as_str()).and_then(decode_address) else { return };
+    let addr20 = |s: &str| -> Option<[u8; 20]> {
+        if s.len() == 40 {
+            hex::decode(s).ok().and_then(|b| b.try_into().ok())
+        } else {
+            decode_address(s)
+        }
+    };
+    let mut sorted: Vec<([u8; 20], Vec<u8>)> = Vec::new();
+    for id in ids.iter().filter_map(|v| v.as_str()) {
+        load_object(state, url, id, ledger_index);
+        let Ok(kb) = hex::decode(id) else { continue };
+        let Ok(k) = <[u8; 32]>::try_from(kb.as_slice()) else { continue };
+        let Some(c) = state.state_map.lookup(&Hash256(k)).and_then(|b| serde_json::from_slice::<Value>(b).ok()) else { continue };
+        if let (Some(issuer), Some(ct)) = (
+            c.get("Issuer").and_then(|v| v.as_str()).and_then(addr20),
+            c.get("CredentialType").and_then(|v| v.as_str()).and_then(|h| hex::decode(h).ok()),
+        ) {
+            sorted.push((issuer, ct));
+        }
+    }
+    if sorted.is_empty() {
+        return;
+    }
+    sorted.sort();
+    sorted.dedup();
+    let k = keylet::deposit_preauth_credentials_key(&dst, &sorted);
+    load_object(state, url, &hex::encode_upper(k.0), ledger_index);
+}
+
 fn load_nft_pages_for_tx(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
     match txj["TransactionType"].as_str() {
         Some("NFTokenMint") => {
@@ -518,6 +600,68 @@ fn decode_issuer(s: &str) -> Option<[u8; 20]> {
 /// Transactor-specific; extend as more types are hardened.
 fn native_read_keys(txj: &Value) -> Vec<String> {
     let mut keys = Vec::new();
+    // Every party's owner-directory ROOT, whatever the transaction type: any
+    // transactor that files an owned object appends to the owner's directory
+    // through its root (IndexPrevious → tail), and a root the state lacks
+    // makes native "create" a root that exists. The per-type blocks below
+    // grew one specimen at a time; #107074173 06F51E33BB43
+    // (PermissionedDomainSet, 29-page dir), testnet 20863507 D958776AB6D7
+    // (MPTokenIssuanceCreate) and 20863509 0AEE09161265 (MPTokenAuthorize)
+    // were three more of the same shape in one afternoon.
+    for f in PARTY_FIELDS {
+        if let Some(a) = txj.get(f).and_then(|v| v.as_str()).and_then(decode_address) {
+            keys.push(hex::encode_upper(keylet::owner_dir_key(&a).0));
+            // The party's ROOT too: a transactor that answers tecNO_TARGET /
+            // tecNO_ISSUER on an absent root reads the state, never the meta
+            // (testnet 20863992 A80C7451A083, CredentialCreate's Subject).
+            keys.push(hex::encode_upper(keylet::account_root_key(&a).0));
+        }
+    }
+    // Issuers and subjects nested in credential arrays (AuthorizeCredentials,
+    // UnauthorizeCredentials, AcceptedCredentials): testnet 20864003
+    // D962386A932B read tecNO_ISSUER on an issuer the state never held.
+    for f in ["AuthorizeCredentials", "UnauthorizeCredentials", "AcceptedCredentials"] {
+        for e in txj.get(f).and_then(|v| v.as_array()).into_iter().flatten() {
+            let inner = e.get("Credential").unwrap_or(e);
+            for g in ["Issuer", "Subject"] {
+                if let Some(a) = inner.get(g).and_then(|v| v.as_str()).and_then(decode_address) {
+                    keys.push(hex::encode_upper(keylet::account_root_key(&a).0));
+                }
+            }
+        }
+    }
+    // The sender's signer list — asfDisableMaster's alternative-key check
+    // reads it (testnet 20864007 9809DC6D9D4D, tecNO_ALTERNATIVE_KEY).
+    if let Some(a) = txj.get("Account").and_then(|v| v.as_str()).and_then(decode_address) {
+        keys.push(hex::encode_upper(keylet::signers_key(&a).0));
+    }
+    // Every 32-byte hex field names a ledger object the transactor will
+    // READ (DomainID, CheckID, Channel, NFTokenBuyOffer/SellOffer, VaultID,
+    // CredentialIDs…) — a modification that leaves the object byte-identical
+    // never reaches the meta, and a state without it reads tecNO_ENTRY:
+    // testnet 20863999 0DF65AD75341, a PermissionedDomainSet re-filing the
+    // same credential list.
+    for (k, v) in txj.as_object().into_iter().flatten() {
+        if k == "hash" || k == "AccountTxnID" || k == "PreviousTxnID" {
+            continue;
+        }
+        let push = |s: &str, keys: &mut Vec<String>| {
+            if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+                keys.push(s.to_uppercase());
+            }
+        };
+        match v {
+            Value::String(sv) => push(sv, &mut keys),
+            Value::Array(arr) => {
+                for e in arr {
+                    if let Some(sv) = e.as_str() {
+                        push(sv, &mut keys);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     // A Payment to an lsfDepositAuth destination is refused unless a
     // DepositPreauth(dst, src) object exists — and that object is READ, never
     // written, so a payment it ALLOWS touches it in no metadata and the
@@ -979,6 +1123,11 @@ fn load_owner_dir_chain(state: &mut LedgerState, url: &str, owner: &[u8; 20], le
     }
 }
 
+/// Transaction fields that name a party whose owner directory an insert may
+/// touch. Address-valued only (issuer fields inside amounts are handled per
+/// type below).
+const PARTY_FIELDS: [&str; 7] = ["Account", "Destination", "Owner", "Issuer", "Subject", "Holder", "Authorize"];
+
 fn load_owner_dir_tail(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
     if txj["TransactionType"].as_str() == Some("AccountDelete") {
         if let Some(a) = txj["Account"].as_str().and_then(decode_address) {
@@ -986,6 +1135,13 @@ fn load_owner_dir_tail(state: &mut LedgerState, url: &str, txj: &Value, ledger_i
         }
     }
     let mut owners: Vec<[u8; 20]> = Vec::new();
+    // Every party's tail page (see `native_read_keys`: the root alone is not
+    // enough — the insert lands on root.IndexPrevious).
+    for f in PARTY_FIELDS {
+        if let Some(a) = txj.get(f).and_then(|v| v.as_str()).and_then(decode_address) {
+            owners.push(a);
+        }
+    }
     if txj["TransactionType"].as_str() == Some("EscrowCreate") {
         for f in ["Account", "Destination"] {
             if let Some(a) = txj[f].as_str().and_then(decode_address) {
@@ -1789,6 +1945,56 @@ fn load_mpt_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_ind
     }
 }
 
+/// Escrow pre-state for Finish/Cancel: the escrow object itself, keyed by
+/// (Owner, OfferSequence) — a fee-only tec (too early, wrong canceller)
+/// never carries it in the meta, and without it the engine answers
+/// tecNO_TARGET for whatever the network decided (devnet 5423390
+/// 4EC1AB97AE48, tecNO_PERMISSION) — and, for an MPT escrow, the issuance
+/// and the owner's, destination's and finisher's MPTokens that the unlock
+/// helpers read (finding 332/338).
+fn load_escrow_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
+    if !matches!(txj["TransactionType"].as_str(), Some("EscrowFinish") | Some("EscrowCancel")) {
+        return;
+    }
+    let (Some(owner), Some(seq)) = (txj["Owner"].as_str().and_then(decode_address), txj["OfferSequence"].as_u64()) else {
+        return;
+    };
+    let ekey = keylet::escrow_key(&owner, seq as u32);
+    load_object(state, url, &hex::encode_upper(ekey.0), ledger_index);
+    let Some(esc) = state.state_map.lookup(&ekey).and_then(|b| serde_json::from_slice::<Value>(b).ok()) else {
+        return;
+    };
+    let addr20 = |s: &str| -> Option<[u8; 20]> {
+        if s.len() == 40 {
+            hex::decode(s).ok().and_then(|b| b.try_into().ok())
+        } else {
+            decode_address(s)
+        }
+    };
+    let Some(id) = esc
+        .get("Amount")
+        .and_then(|a| a.get("mpt_issuance_id"))
+        .and_then(|v| v.as_str())
+        .and_then(|h| hex::decode(h).ok())
+        .and_then(|b| <[u8; 24]>::try_from(b.as_slice()).ok())
+    else {
+        return;
+    };
+    let ikey = keylet::mpt_issuance_key(&id);
+    load_object(state, url, &hex::encode_upper(ikey.0), ledger_index);
+    let mut parties = vec![owner];
+    if let Some(d) = esc.get("Destination").and_then(|v| v.as_str()).and_then(addr20) {
+        parties.push(d);
+    }
+    if let Some(a) = txj["Account"].as_str().and_then(decode_address) {
+        parties.push(a);
+    }
+    for p in parties {
+        load_object(state, url, &hex::encode_upper(keylet::mptoken_key(&ikey, &p).0), ledger_index);
+        load_object(state, url, &hex::encode_upper(keylet::account_root_key(&p).0), ledger_index);
+    }
+}
+
 /// PayChannel pre-state: hydration is meta-driven, and a Fund/Claim's meta
 /// never touches the channel DESTINATION's AccountRoot — but the engine's
 /// dst-exists check (tecNO_DST) reads it. Gate 'paychan' caught the miss:
@@ -2093,7 +2299,7 @@ fn build_txfields(txjson: &Value) -> Option<TxFields> {
             }
         }
     }
-    Some(TxFields { account, tx_type, fee, sequence, ticket_seq, last_ledger_seq, fields })
+    Some(TxFields { account, tx_type, fee, sequence, ticket_seq, last_ledger_seq, fields, inner_batch: false })
 }
 
 /// Native per-tx apply, mirroring `apply.rs::apply_transaction_set`'s per-tx
@@ -2101,6 +2307,12 @@ fn build_txfields(txjson: &Value) -> Option<TxFields> {
 /// so the harness can build the per-tx mutation set. Caller threads the mods
 /// forward via `apply_modifications`.
 fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<Hash256, SandboxEntry>) {
+    // The engine's per-transaction thread-locals (finding 336's SELL_IN_FOLD,
+    // finding 339's TURN_REJECTED, …) must not leak from one tx into the
+    // next: the node resets them in native_apply.rs; the probe applies
+    // through its own copy and did not (1AD9E8033191 in #107093372 read a
+    // flag C932E2C004EA's tail turn left behind).
+    xrpl_ledger::tx::reset_thread_state();
     let transactor = match get_transactor(&tx.tx_type) {
         Some(t) => t,
         None => {
@@ -2277,6 +2489,54 @@ fn canon_ptrs(v: &mut Value) {
     }
 }
 
+/// rippled's OTHER threading shape: a fixture node `[key, kind, post-image]`
+/// whose ModifiedNode carries FULL FinalFields but null PreviousFields — the
+/// write moved PreviousTxnID and nothing else. The fixture format keeps
+/// FinalFields only, so nullness of PreviousFields is lost; equality against
+/// the CURRENT base object recovers it exactly. Anything unreadable (no base
+/// object in the mirror, an unparseable key) is NOT a refresh.
+fn node_is_threading_refresh(state: &LedgerState, n: &Value) -> bool {
+    let judge = || -> Option<bool> {
+        let k = n[0].as_str()?;
+        let exp = n.get(2)?.clone();
+        let kb: [u8; 32] = hex::decode(k).ok().and_then(|b| b.as_slice().try_into().ok())?;
+        let old = state.state_map.lookup(&Hash256(kb))?;
+        let mut po: Value = serde_json::from_slice(&old).ok()?;
+        let mut pe = exp;
+        canon_ptrs(&mut po);
+        canon_ptrs(&mut pe);
+        // fixture FinalFields carry base58 addresses; the engine stores hex —
+        // same rewrite hydration applies.
+        hexify_addresses(&mut pe);
+        hexify_addresses(&mut po);
+        let strip = |v: &Value| -> Option<serde_json::Map<String, Value>> {
+            Some(
+                v.as_object()?
+                    .iter()
+                    .filter(|(k, _)| !k.starts_with("PreviousTxn") && k.as_str() != "index")
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            )
+        };
+        let (se, so) = (strip(&pe)?, strip(&po)?);
+        if std::env::var("DX_THREAD").is_ok() && se != so {
+            let d: Vec<String> = se
+                .iter()
+                .filter(|(fk, fv)| so.get(*fk) != Some(*fv))
+                .map(|(fk, fv)| format!("{fk}: exp={fv} base={:?}", so.get(fk)))
+                .chain(
+                    so.keys()
+                        .filter(|fk| !se.contains_key(*fk))
+                        .map(|fk| format!("{fk}: only-in-base")),
+                )
+                .collect();
+            eprintln!("DX_THREAD {} differs: {:?}", &k[..16], d);
+        }
+        Some(se == so)
+    };
+    judge().unwrap_or(false)
+}
+
 /// (hex_upper key, kind byte) set with no-op-Modified filtering (semantic JSON
 /// compare of pre vs post), matching the FFI leg's `build_ours_mutation_set`.
 fn native_mutset(
@@ -2337,7 +2597,7 @@ fn main() {
 fn run() -> i32 {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: differential_probe <blobs.txt> <expected.json> [--rpc URL] [--json]");
+        eprintln!("usage: differential_probe <blobs.txt> <expected.json> [--rpc URL] [--json] [--fuzz K --seed S --fuzz-out DIR]");
         return 2;
     }
     // `--rpc` states a PREFERENCE, not a pin: `select_rpc` below falls back to
@@ -2345,6 +2605,12 @@ fn run() -> i32 {
     let rpc_pref = args.iter().position(|a| a == "--rpc")
         .and_then(|i| args.get(i + 1).cloned());
     let want_json = args.iter().any(|a| a == "--json");
+    // --fuzz K [--seed S] [--fuzz-out DIR]: K unsigned mutants per transaction,
+    // libxrpl vs our engine on the same pre-state (`xrpl_node::tx_fuzz`).
+    let argval = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned());
+    let fuzz_k: usize = argval("--fuzz").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let fuzz_seed: u64 = argval("--seed").and_then(|v| v.parse().ok()).unwrap_or(1);
+    let fuzz_out: String = argval("--fuzz-out").unwrap_or_else(|| "fuzz".to_string());
 
     let expected_json = match std::fs::read_to_string(&args[2]) {
         Ok(s) => s,
@@ -2381,6 +2647,46 @@ fn run() -> i32 {
         .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
         .unwrap_or_else(|| txjson_map.keys().cloned().collect());
 
+    // Batch (BatchV1_1): the ledger records every inner transaction as its own
+    // entry — own hash, own metadata, the indices right after its outer — but
+    // rippled APPLIES it inside the outer's application, and so does
+    // BatchTransactor::do_apply. The inner entries are therefore skipped in
+    // the compare loop below (applying one standalone is rejected out of hand:
+    // tfInnerBatchTxn with Fee "0") and their expected mutations fold into
+    // their outer's, which is where our engine writes them.
+    //
+    // The link is RECOMPUTED, not read: a fixture's `tx_json` carries the
+    // transaction FIELDS only (fetch_ledger_fixture.py strips metaData), so no
+    // entry here has a ParentBatchID for `native_apply::batch_attribution` to
+    // read. rippled files each inner under the ordinary transaction id of its
+    // own serialization, which `batch_inner_ids` recomputes from the outer's
+    // RawTransactions — leg A names them the same way
+    // (`xrpl_ffi::batch_inner_ids` off the outer's blob).
+    //
+    // The list is EVERY inner, in RawTransactions order — including the ones
+    // the ledger did not file. A mode that stops early (tfUntilFailure,
+    // tfOnlyOne), an inner that failed without claiming, a tfAllOrNothing
+    // batch that was discarded: each leaves a different hole in the FILED set,
+    // and the engine reports one result per inner it ATTEMPTED. Keeping only
+    // the filed ids and zipping by index shifts every later inner onto its
+    // neighbour's verdict, so the two are paired BY ID below
+    // (`native_apply::pair_inner_verdicts`). Ids the fixture does not carry
+    // simply have no expected metadata and no filed TER — which is itself the
+    // expectation that inner was not applied.
+    let mut batch_skip: HashSet<String> = HashSet::new();
+    let mut batch_inners: HashMap<String, Vec<String>> = HashMap::new();
+    for h in &order {
+        let Some(txj) = txjson_map.get(h) else { continue };
+        if txj["TransactionType"].as_str() != Some("Batch") {
+            continue;
+        }
+        let ids: Vec<String> = xrpl_node::native_apply::batch_inner_ids(txj);
+        // Only ids the fixture actually carries can appear in `order`; the
+        // rest never match anything and are harmless in the skip set.
+        batch_skip.extend(ids.iter().cloned());
+        batch_inners.insert(h.to_uppercase(), ids);
+    }
+
     // Build native base state at seq-1 from account_info of every involved account.
     // parent_hash feeds the AMMCreate account derivation (ripesha over
     // sha512half(prefix ‖ parentHash ‖ ammKeylet)).
@@ -2389,6 +2695,13 @@ fn run() -> i32 {
         .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
         .map(Hash256)
         .unwrap_or(Hash256([0; 32]));
+    let mut fuzz = (fuzz_k > 0).then(|| {
+        eprintln!("FUZZ: {fuzz_k} mutants per tx, seed {fuzz_seed}, bundles -> {fuzz_out}/");
+        xrpl_node::tx_fuzz::FuzzCtx::new(&rpc_url, seq as u32, hdr, parent_hash.0, &fuzz_out, fuzz_seed, fuzz_k)
+    });
+    let mut fuzz_tally = xrpl_node::tx_fuzz::FuzzTally::default();
+    let mut fuzz_deleted: HashSet<[u8; 32]> = HashSet::new();
+    let mut fuzz_idx: usize = 0;
     let header = LedgerHeader {
         sequence: seq.saturating_sub(1),
         total_coins: hdr["total_drops"].as_u64().unwrap_or(100_000_000_000_000_000),
@@ -2478,10 +2791,13 @@ fn run() -> i32 {
         load_owner_dir_tail(&mut state, &rpc_url, txj, seq - 1);
         load_payment_books(&mut state, &rpc_url, txj, seq - 1, &mut books_seen);
         load_nft_pages_for_tx(&mut state, &rpc_url, txj, seq - 1);
+        load_domain_credentials_for_tx(&mut state, &rpc_url, txj, seq - 1); // finding 333
+        load_credential_preauth_for_tx(&mut state, &rpc_url, txj, seq - 1); // finding 342
         load_amm_prestate(&mut state, &rpc_url, txj, seq - 1);
         load_offer_cancel_prestate(&mut state, &rpc_url, txj, seq - 1);
         load_paychan_prestate(&mut state, &rpc_url, txj, seq - 1);
         load_mpt_prestate(&mut state, &rpc_url, txj, seq - 1);
+        load_escrow_prestate(&mut state, &rpc_url, txj, seq - 1);
     }
     // FLAG-LEDGER OPEN: rotate the NegativeUNL pending fields into
     // DisabledValidators before any transaction applies — a ledger-level
@@ -2526,100 +2842,96 @@ fn run() -> i32 {
 
     for h in &order {
         let Some(txj) = txjson_map.get(h) else { continue };
+        if batch_skip.contains(&h.to_uppercase()) {
+            continue; // applied inside its outer Batch, attributed there
+        }
         let tx_type = txj["TransactionType"].as_str().unwrap_or("?").to_string();
         let net = &txmap[h];
         let net_ter = net["ter"].as_str().unwrap_or("?").to_string();
+        // The expected side of a Batch outer is its OWN metadata followed by
+        // its inners', in TransactionIndex order: rippled splits the record
+        // (the outer's entry carries only its fee and sequence) but applies
+        // them as one, and so does our engine — every key below reaches the
+        // state through this outer's mods. For every other transaction this
+        // is its own node list, unchanged.
+        let mut net_nodes: Vec<&Value> =
+            net["nodes"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
+        for ih in batch_inners.get(&h.to_uppercase()).map(Vec::as_slice).unwrap_or(&[]) {
+            if let Some(inner_net) = txmap.get(ih.as_str()) {
+                net_nodes.extend(inner_net["nodes"].as_array().into_iter().flatten());
+            }
+        }
         // Mainnet's meta lists nodes rippled merely TOUCHED — a ModifiedNode
         // carrying neither FinalFields nor PreviousFields, only a refreshed
         // PreviousTxnID (e.g. an issuer AccountRoot peeked during
-        // trustCreate). They record no state delta, and native does not model
-        // PreviousTxnID, so they are dropped here — symmetric with the
-        // no-op-Modified filtering `native_mutset` already applies to OUR
-        // side. Matching them would require an engine to bump a field rippled
-        // does not bump.
-        // Keys mainnet merely TOUCHED: a ModifiedNode carrying neither
-        // FinalFields nor PreviousFields, only a refreshed PreviousTxnID
-        // (e.g. an issuer AccountRoot peeked during trustCreate). They record
-        // no state delta and native does not model PreviousTxnID, so the key
-        // is excluded from BOTH sides — dropping it from mainnet's set alone
-        // would turn a legitimate native write into a phantom "extra".
-        let touched_only: HashSet<String> = net["nodes"].as_array()
-            .map(|a| {
-                a.iter()
-                    .filter(|n| n[1].as_u64() == Some(1))
-                    .filter(|n| {
-                        !n.get(2)
-                            .and_then(|f| f.as_object())
-                            .map(|o| o.keys().any(|k| k != "LedgerEntryType"))
-                            .unwrap_or(false)
-                    })
-                    .filter_map(|n| n[0].as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        // ...and the OTHER threading shape: a ModifiedNode carrying FULL
-        // FinalFields but null PreviousFields — rippled fills PreviousFields
-        // only when a field actually changed, so FinalFields == the base
-        // object means the write was a threading refresh (threadOwners:
-        // trustDelete threads BOTH owners' roots; #106065267 F9E4D516 redeems
-        // EXP to its issuer, the zeroed line is deleted, and the ISSUER's
-        // AccountRoot appears Modified with every field identical to the
-        // parent ledger — only PreviousTxnID moved). The fixture format keeps
-        // FinalFields, so nullness of PreviousFields is lost; equality
-        // against the base recovers it exactly. Symmetric with
-        // native_mutset's no-op-Modified filtering on OUR side.
-        let thread_touched: HashSet<String> = net["nodes"].as_array()
-            .map(|a| {
-                a.iter()
-                    .filter(|n| n[1].as_u64() == Some(1))
-                    .filter_map(|n| {
-                        let k = n[0].as_str()?;
-                        let exp = n.get(2)?.clone();
-                        let kb: [u8; 32] =
-                            hex::decode(k).ok().and_then(|b| b.as_slice().try_into().ok())?;
-                        let old = state.state_map.lookup(&Hash256(kb))?;
-                        let mut po: Value = serde_json::from_slice(&old).ok()?;
-                        let mut pe = exp;
-                        canon_ptrs(&mut po);
-                        canon_ptrs(&mut pe);
-                        // fixture FinalFields carry base58 addresses; the
-                        // engine stores hex — same rewrite hydration applies.
-                        hexify_addresses(&mut pe);
-                        hexify_addresses(&mut po);
-                        let strip = |v: &Value| -> Option<serde_json::Map<String, Value>> {
-                            Some(
-                                v.as_object()?
-                                    .iter()
-                                    .filter(|(k, _)| {
-                                        !k.starts_with("PreviousTxn") && k.as_str() != "index"
-                                    })
-                                    .map(|(k, v)| (k.clone(), v.clone()))
-                                    .collect(),
-                            )
-                        };
-                        let (se, so) = (strip(&pe)?, strip(&po)?);
-                        if std::env::var("DX_THREAD").is_ok() && se != so {
-                            let d: Vec<String> = se.iter()
-                                .filter(|(fk, fv)| so.get(*fk) != Some(*fv))
-                                .map(|(fk, fv)| format!("{fk}: exp={fv} base={:?}", so.get(fk)))
-                                .chain(so.keys().filter(|fk| !se.contains_key(*fk))
-                                    .map(|fk| format!("{fk}: only-in-base")))
-                                .collect();
-                            eprintln!("DX_THREAD {} differs: {:?}", &k[..16], d);
-                        }
-                        (se == so).then(|| k.to_string())
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let net_mut: HashSet<(String, u8)> = net["nodes"].as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|n| Some((n[0].as_str()?.to_string(), n[1].as_u64()? as u8)))
-                    .filter(|(k, b)| !touched_only.contains(k) && !(*b == 1 && thread_touched.contains(k)))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // trustCreate) — and, in the OTHER threading shape, nodes carrying
+        // FULL FinalFields but null PreviousFields: rippled fills
+        // PreviousFields only when a field actually changed, so FinalFields ==
+        // the base object means the write was a threading refresh
+        // (threadOwners: trustDelete threads BOTH owners' roots; #106065267
+        // F9E4D516 redeems EXP to its issuer, the zeroed line is deleted, and
+        // the ISSUER's AccountRoot appears Modified with every field identical
+        // to the parent ledger — only PreviousTxnID moved). The fixture format
+        // keeps FinalFields, so nullness of PreviousFields is lost; equality
+        // against the base recovers it exactly.
+        //
+        // Neither shape records a state delta and native does not model
+        // PreviousTxnID, so the key is excluded from BOTH sides — dropping it
+        // from mainnet's set alone would turn a legitimate native write into a
+        // phantom "extra". Both are symmetric with the no-op-Modified
+        // filtering `native_mutset` already applies to OUR side.
+        //
+        // The classification is per NODE, the exclusion per KEY: a key drops
+        // out only when NO source recorded a material change to it. Inside one
+        // metadata a key appears exactly once, so for every non-Batch
+        // transaction this is the rule the probe has always applied; across a
+        // Batch outer and its inners it stops one entry's threading refresh of
+        // a key ANOTHER entry really changed from erasing that key from the
+        // expected side.
+        let mut touched_only: HashSet<String> = HashSet::new();
+        let mut thread_touched: HashSet<String> = HashSet::new();
+        let mut material: HashSet<String> = HashSet::new();
+        for n in net_nodes.iter().copied() {
+            let Some(key) = n[0].as_str() else { continue };
+            if n[1].as_u64() != Some(1) {
+                material.insert(key.to_string());
+                continue;
+            }
+            // Judged for EVERY ModifiedNode, fieldless ones included, so
+            // DX_THREAD's report reads exactly as it did.
+            let refresh = node_is_threading_refresh(&state, n);
+            let has_fields = n
+                .get(2)
+                .and_then(|f| f.as_object())
+                .map(|o| o.keys().any(|k| k != "LedgerEntryType"))
+                .unwrap_or(false);
+            if !has_fields {
+                touched_only.insert(key.to_string());
+            } else if refresh {
+                thread_touched.insert(key.to_string());
+            } else {
+                material.insert(key.to_string());
+            }
+        }
+        for key in &material {
+            touched_only.remove(key);
+            thread_touched.remove(key);
+        }
+        // One key touched by several entries of the same batch folds to its
+        // NET effect, with leg A's rules (ffi_engine.rs `merged_expected`):
+        // Created wins over Modified, Created-then-Deleted is no entry at all.
+        // A single metadata names each key once, so this is the identity for
+        // every non-Batch transaction.
+        let net_mut: HashSet<(String, u8)> = xrpl_node::native_apply::fold_batch_mutset(
+            &net_nodes
+                .iter()
+                .copied()
+                .filter_map(|n| Some((n[0].as_str()?.to_string(), n[1].as_u64()? as u8)))
+                .filter(|(k, b)| {
+                    !touched_only.contains(k) && !(*b == 1 && thread_touched.contains(k))
+                })
+                .collect::<Vec<(String, u8)>>(),
+        );
 
         let e = agg.entry(tx_type.clone()).or_insert_with(TypeAgg::new);
 
@@ -2657,6 +2969,13 @@ fn run() -> i32 {
                 }
             }
         }
+        if let Some(ctx) = fuzz.as_mut() {
+            if tx_type != "Batch" && !xrpl_ledger::tx::dispatch::is_pseudo(&tx_type) {
+                let t = ctx.fuzz_tx(&mut state, txj, h, fuzz_idx, &fuzz_deleted);
+                fuzz_tally.add(&t);
+            }
+        }
+        fuzz_idx += 1;
         let (our_ter, mut mods) = native_apply_one(&state, &txf);
         if dx_armed {
             if let Ok(list) = std::env::var("DX_REPLAY_SET") {
@@ -2670,12 +2989,111 @@ fn run() -> i32 {
         // carry PreviousTxn*, so the per-tx compares are unaffected and the
         // truth-overlay below preserves the stamps; DX_THREADCHECK verifies
         // them against the real post-state at fixture end.
-        xrpl_ledger::ledger::threading::stamp_threading(
-            &mut mods,
-            &|k| state.state_map.lookup(k).map(|b| b.to_vec()),
-            h,
-            seq as u32,
-        );
+        //
+        // A Batch is threaded PER INNER: rippled applies each inner as its own
+        // transaction, so the objects an inner touched carry the INNER's hash
+        // and only the outer's own changes (its fee and sequence) carry the
+        // outer's. `batch_inners` holds every inner id in RawTransactions
+        // order; an inner the ledger never filed has an empty touched set, so
+        // nothing is stamped with its hash. Drain the sets on EVERY Batch
+        // outer, for the same staleness reason the per-inner results below are
+        // drained unconditionally — the cell is cleared at do_apply entry, so
+        // an outer that never got there would otherwise leave the PREVIOUS
+        // batch's sets for the next reader.
+        let inner_ids: &[String] =
+            batch_inners.get(&h.to_uppercase()).map(Vec::as_slice).unwrap_or(&[]);
+        let mut inner_touched = if tx_type == "Batch" {
+            xrpl_ledger::tx::batch::take_inner_touched()
+        } else {
+            Vec::new()
+        };
+        // One set per ATTEMPTED inner, one id per inner: pad so the pairing
+        // lines up. A vector LONGER than the ids means an id could not be
+        // recomputed — stamp_batch_threading's own guard then stamps the outer
+        // alone, and the TER guard below withholds the inner verdicts.
+        if inner_touched.len() < inner_ids.len() {
+            inner_touched.resize(inner_ids.len(), Vec::new());
+        }
+        if inner_ids.is_empty() {
+            xrpl_ledger::ledger::threading::stamp_threading(
+                &mut mods,
+                &|k| state.state_map.lookup(k).map(|b| b.to_vec()),
+                h,
+                seq as u32,
+            );
+        } else {
+            xrpl_ledger::ledger::threading::stamp_batch_threading(
+                &mut mods,
+                &|k| state.state_map.lookup(k).map(|b| b.to_vec()),
+                h,
+                seq as u32,
+                inner_ids,
+                &inner_touched,
+            );
+        }
+        // The inners ran inside our do_apply; their per-inner results come back
+        // through the ledger crate's thread-local, in the same order. Drained
+        // on EVERY Batch outer for the staleness reason above. A mismatch is
+        // the outer's DIVERGE-TER — ledger ENTRIES are what the SUMMARY
+        // counts, one per attempted outer, so an inner never opens its own
+        // line in the accounting.
+        let inner_results = if tx_type == "Batch" {
+            xrpl_ledger::tx::batch::take_inner_results()
+        } else {
+            Vec::new()
+        };
+        let mut inner_ter: Vec<String> = Vec::new();
+        if inner_results.len() > inner_ids.len() {
+            // One result per ATTEMPTED inner can never outnumber the inners
+            // themselves: more results than ids means an id could not be
+            // recomputed from the outer's RawTransactions, and then NO pairing
+            // is trustworthy. So no per-inner comparison is made — but the
+            // outer still DIVERGEs, so a withheld comparison cannot pass as a
+            // MATCH. The receipt mirrors stamp_batch_threading's fallback line
+            // (threading.rs:289-296), which the same disagreement triggers.
+            eprintln!(
+                "  BATCH-INNER {h}: {} inner ids vs {} results — inner verdicts withheld",
+                inner_ids.len(),
+                inner_results.len()
+            );
+            inner_ter.push(format!(
+                "withheld:{}ids-vs-{}results",
+                inner_ids.len(),
+                inner_results.len()
+            ));
+        } else {
+            // Paired BY ID: the fixture's `ter` for every inner it carries,
+            // and "not applied" for the inners the ledger never filed — for
+            // which any tes or tec of ours is the mismatch.
+            let filed: HashMap<String, String> = inner_ids
+                .iter()
+                .filter_map(|id| {
+                    let t = txmap.get(id.as_str())?["ter"].as_str()?;
+                    Some((id.clone(), t.to_string()))
+                })
+                .collect();
+            for (i, ih, want, mismatch) in
+                xrpl_node::native_apply::pair_inner_verdicts(
+                    inner_ids,
+                    &inner_results,
+                    &filed,
+                    xrpl_node::native_apply::batch_all_or_nothing(txj),
+                )
+            {
+                if mismatch {
+                    let got = inner_results
+                        .get(i)
+                        .map(String::as_str)
+                        .unwrap_or(xrpl_node::native_apply::INNER_NOT_ATTEMPTED);
+                    eprintln!(
+                        "  DIVERGE-TER {tx_type} {} INNER[{i}] {}   our_ter={got} net_ter={want}",
+                        &h[..12.min(h.len())],
+                        &ih[..12.min(ih.len())]
+                    );
+                    inner_ter.push(format!("{i}:{ih}:{got}!={want}"));
+                }
+            }
+        }
         if std::env::var("DX_THREADCHECK").is_ok() || std::env::var("DX_BYTECHECK").is_ok() {
             for (k, ent) in mods.iter() {
                 if !matches!(ent, SandboxEntry::Deleted) {
@@ -2813,12 +3231,12 @@ fn run() -> i32 {
                 }
             }
             let mut net_fields: HashMap<String, &Value> = HashMap::new();
-            if let Some(nodes) = net["nodes"].as_array() {
-                for n in nodes {
-                    if let (Some(k), Some(f)) = (n[0].as_str(), n.get(2)) {
-                        if f.is_object() {
-                            net_fields.insert(k.to_string(), f);
-                        }
+            // The outer's nodes followed by its inners' (see `net_nodes`): for
+            // a key several entries wrote, the LAST is the post-batch image.
+            for n in net_nodes.iter().copied() {
+                if let (Some(k), Some(f)) = (n[0].as_str(), n.get(2)) {
+                    if f.is_object() {
+                        net_fields.insert(k.to_string(), f);
                     }
                 }
             }
@@ -2872,10 +3290,28 @@ fn run() -> i32 {
         // FinalFields at all) down to empty shells. This bounds cascade
         // contamination: every field the meta records is corrected to truth
         // before the next tx.
+        if fuzz.is_some() {
+            // Keys this ledger deleted so far: the parent ledger still has
+            // them and the fuzz provider must not resurrect them.
+            for (k, ent) in mods.iter() {
+                match ent {
+                    SandboxEntry::Deleted => {
+                        fuzz_deleted.insert(k.0);
+                    }
+                    _ => {
+                        fuzz_deleted.remove(&k.0);
+                    }
+                }
+            }
+        }
         let _ = apply_modifications(&mut state, mods);
-        if let Some(nodes) = net["nodes"].as_array() {
+        {
             let mut overlay: HashMap<Hash256, SandboxEntry> = HashMap::new();
-            for n in nodes {
+            // Inners included, in TransactionIndex order: a key several entries
+            // wrote ends at the LAST one's image, and without the inners'
+            // post-state the ledger would carry a MID-batch image into the next
+            // transaction.
+            for n in net_nodes.iter().copied() {
                 let (Some(key), Some(kind)) = (n[0].as_str(), n[1].as_u64()) else { continue };
                 let Ok(kb) = hex::decode(key) else { continue };
                 if kb.len() != 32 { continue; }
@@ -2905,7 +3341,7 @@ fn run() -> i32 {
         }
 
         e.attempted += 1;
-        let ter_ok = our_ter == net_ter;
+        let ter_ok = our_ter == net_ter && inner_ter.is_empty();
         let mut_ok = our_mut == net_mut;
         let verdict = if ter_ok && mut_ok {
             e.matched += 1; "MATCH"
@@ -2926,12 +3362,18 @@ fn run() -> i32 {
             .map(|(k, b)| format!("{k}:{b}")).take(kcap).collect();
         let extra: Vec<String> = our_mut.difference(&net_mut)
             .map(|(k, b)| format!("{k}:{b}")).take(kcap).collect();
-        per_tx.push(json!({
+        let mut row = json!({
             "hash": h, "type": tx_type, "verdict": verdict,
             "our_ter": our_ter, "net_ter": net_ter,
             "our_muts": our_mut.len(), "net_muts": net_mut.len(),
             "missing_in_ours": missing, "extra_in_ours": extra,
-        }));
+        });
+        if !inner_ter.is_empty() {
+            // Only ever present on a Batch outer whose inners disagreed, so
+            // every existing row is byte-identical to what it was.
+            row["inner_ter"] = json!(inner_ter);
+        }
+        per_tx.push(row);
     }
 
     // Report
@@ -3046,16 +3488,34 @@ fn run() -> i32 {
         for r in &per_tx {
             let v = r["verdict"].as_str().unwrap_or("");
             if v.starts_with("DIVERGE") {
-                println!("  {} {} {}   our_ter={} net_ter={} our_muts={} net_muts={} missing={:?} extra={:?}",
+                // A Batch outer's divergence can live entirely in its inners:
+                // without them the line reads DIVERGE-TER with our_ter ==
+                // net_ter and explains nothing. Present only on such an outer,
+                // so every other line is byte-identical.
+                let inner = match r.get("inner_ter") {
+                    Some(t) => format!(" inner_ter={t}"),
+                    None => String::new(),
+                };
+                println!("  {} {} {}   our_ter={} net_ter={} our_muts={} net_muts={} missing={:?} extra={:?}{}",
                     v, r["type"].as_str().unwrap_or(""), &r["hash"].as_str().unwrap_or("")[..12],
                     r["our_ter"].as_str().unwrap_or(""), r["net_ter"].as_str().unwrap_or(""),
-                    r["our_muts"], r["net_muts"], r["missing_in_ours"], r["extra_in_ours"]);
+                    r["our_muts"], r["net_muts"], r["missing_in_ours"], r["extra_in_ours"], inner);
             }
         }
     }
 
     let total_attempted: u32 = agg.values().map(|a| a.attempted).sum();
     let total_matched: u32 = agg.values().map(|a| a.matched).sum();
+    if fuzz.is_some() {
+        let t = &fuzz_tally;
+        eprintln!(
+            "FUZZ SUMMARY: attempted={} agree={} TER={} MUT={} BYTE={} NOOP={} ffi_null={} skipped={} bundles={}",
+            t.attempted, t.agree, t.ter_mm, t.mut_mm, t.byte_mm, t.noop, t.ffi_null, t.skipped, t.written.len()
+        );
+        for w in &t.written {
+            eprintln!("  {w}");
+        }
+    }
     eprintln!("SUMMARY: {total_matched}/{total_attempted} attempted txs MATCH mainnet (native engine)");
     if total_attempted == 0 {
         return 2;

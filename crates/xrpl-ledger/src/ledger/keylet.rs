@@ -34,6 +34,7 @@ const SPACE_ESCROW: [u8; 2] = [0x00, 0x75];       // 'u'
 const SPACE_PAY_CHANNEL: [u8; 2] = [0x00, 0x78];  // 'x'
 const SPACE_CHECK: [u8; 2] = [0x00, 0x43];        // 'C'
 const SPACE_DEPOSIT_PREAUTH: [u8; 2] = [0x00, 0x70]; // 'p'
+const SPACE_DEPOSIT_PREAUTH_CREDENTIALS: [u8; 2] = [0x00, 0x50]; // 'P'
 
 /// Compute the state tree key for an AccountRoot.
 /// `key = SHA512Half(0x0061 || account_id)`
@@ -210,6 +211,17 @@ pub fn did_key(account_id: &[u8; 20]) -> Hash256 {
     sha512_half(&buf)
 }
 
+/// Credential key: `SHA512Half(0x0044 ('D') || subject || issuer || credType bytes)`
+/// (Indexes.cpp credential): ONE flat hash, the type as its RAW bytes.
+pub fn credential_key(subject: &[u8; 20], issuer: &[u8; 20], credential_type: &[u8]) -> Hash256 {
+    let mut buf = Vec::with_capacity(2 + 20 + 20 + credential_type.len());
+    buf.extend_from_slice(&[0x00, 0x44]);
+    buf.extend_from_slice(subject);
+    buf.extend_from_slice(issuer);
+    buf.extend_from_slice(credential_type);
+    sha512_half(&buf)
+}
+
 /// PermissionedDomain key: `SHA512Half(0x006D ('m') || account || seq_be32)`.
 pub fn permissioned_domain_key(account_id: &[u8; 20], sequence: u32) -> Hash256 {
     let mut buf = [0u8; 26];
@@ -300,9 +312,9 @@ pub fn book_dir_key(base: &Hash256, quality: u64) -> Hash256 {
 /// (exponent 0); IOU values are decimal strings, optionally scientific
 /// (`1000000000000000e-1`).
 pub fn amount_mant_exp(v: &serde_json::Value) -> Option<(u128, i32)> {
-    let s = match v {
-        serde_json::Value::String(s) => s.as_str(),
-        serde_json::Value::Object(o) => o.get("value")?.as_str()?,
+    let (s, iou) = match v {
+        serde_json::Value::String(s) => (s.as_str(), false),
+        serde_json::Value::Object(o) => (o.get("value")?.as_str()?, true),
         _ => return None,
     };
     let s = s.trim_start_matches('-');
@@ -316,9 +328,47 @@ pub fn amount_mant_exp(v: &serde_json::Value) -> Option<(u128, i32)> {
         Some(d) => (format!("{}{}", &mant_str[..d], &mant_str[d + 1..]), (mant_str.len() - d - 1) as i32),
         None => (mant_str, 0),
     };
-    let m: u128 = digits.parse().ok()?;
     exp -= frac;
+    // Finding 303 (differential fuzz of #107009438, 19 mutants doubling a
+    // deliver-max Amount to a 96-digit value): rippled's STAmount keeps the
+    // first sixteen significant digits and carries the rest in the exponent
+    // (canonicalize divides the mantissa down); `u128::parse` overflowed on
+    // anything past 38 digits and the payment read temBAD_AMOUNT where
+    // libxrpl applied it.
+    // XRP drops are an exact integer (XRPAmount), never canonicalized —
+    // the cap is for IOU values only.
+    let digits = if iou { digits.trim_start_matches('0') } else { digits.as_str() };
+    let digits = if iou && digits.len() > 16 {
+        exp += (digits.len() - 16) as i32;
+        &digits[..16]
+    } else {
+        digits
+    };
+    let m: u128 = if digits.is_empty() { 0 } else { digits.parse().ok()? };
     Some((m, exp))
+}
+
+#[cfg(test)]
+mod rate_range_tests {
+    #[test]
+    fn a_ratio_below_the_stamount_floor_has_no_rate() {
+        // 200000 drops for 9999999999999990e79 RLUSD: the quotient's exponent
+        // is far below -96 — rippled's divide underflows to zero.
+        assert_eq!(super::rate_encode_native(200_000, 0, true, 9_999_999_999_999_990, 79, false), None);
+        // an ordinary rate still encodes
+        assert!(super::rate_encode_native(200_000, 0, true, 1_275_435_882_197_093, -15, false).is_some());
+    }
+}
+
+#[cfg(test)]
+mod amount_parse_tests {
+    #[test]
+    fn a_ninety_six_digit_value_keeps_sixteen_digits_and_the_exponent() {
+        let v = serde_json::json!({"currency": "USD", "issuer": "r", "value": "199999999999999800000000000000000000000000000000000000000000000000000000000000000000000000000000"});
+        assert_eq!(super::amount_mant_exp(&v), Some((1999999999999998u128, 80)));
+        assert_eq!(super::amount_mant_exp(&serde_json::json!("0.000")), Some((0, -3)));
+        assert_eq!(super::amount_mant_exp(&serde_json::json!("117.732708")), Some((117732708, -6)));
+    }
 }
 
 /// Encode `pays/gets` as rippled's `getRate`: `((exponent+100) << 56) |
@@ -421,6 +471,19 @@ pub fn rate_encode_native(
     if m == 0 {
         return None;
     }
+    // Finding 304 (differential fuzz of #107009438, tfLimitQuality on
+    // deliver-max partial payments): the quotient is an STAmount, and its
+    // exponent lives in [-96, 80] (cMinOffset/cMaxOffset). Below the floor
+    // `divide` canonicalizes to ZERO and `getRate` files rate 0; above the
+    // ceiling it throws and getRate files 0 as well. The encoding here has
+    // an 8-bit exponent field and a negative `e + 100` wrapped through the
+    // `as u64` cast into a rate with exponent +150 — a limit quality no
+    // strand could fail. `None` now, and the caller decides what rate 0
+    // means (for a limit quality: the best quality there is, every strand
+    // rejected — libxrpl's tecPATH_DRY on the specimen).
+    if !(-96..=80).contains(&e) {
+        return None;
+    }
     Some((((e + 100) as u64) << 56) | m as u64)
 }
 
@@ -499,6 +562,30 @@ pub fn amm_lpt_currency(cur_a: &[u8; 20], cur_b: &[u8; 20]) -> [u8; 20] {
 
 /// Compute the state tree key for a DepositPreauth.
 /// `key = SHA512Half(0x0070 || account_id || authorized_id)`
+/// keylet::depositPreauth(owner, sorted credentials) — finding 319: the
+/// credential-keyed DepositPreauth (XLS-70). Each credential hashes as
+/// sha512Half(issuer || type); the index is sha512Half('P' space || owner ||
+/// hashes in the credentials' sorted order) (Indexes.cpp:352-365).
+pub fn deposit_preauth_credentials_key(account_id: &[u8; 20], sorted: &[([u8; 20], Vec<u8>)]) -> Hash256 {
+    let mut buf = Vec::with_capacity(22 + 32 * sorted.len());
+    buf.extend_from_slice(&SPACE_DEPOSIT_PREAUTH_CREDENTIALS);
+    buf.extend_from_slice(account_id);
+    for (issuer, ct) in sorted {
+        let mut one = Vec::with_capacity(20 + ct.len());
+        one.extend_from_slice(issuer);
+        one.extend_from_slice(ct);
+        buf.extend_from_slice(&sha512_half(&one).0);
+    }
+    // beast::hash_append for a std::vector appends the element COUNT after
+    // the elements as a size_t, and sha512Half's hasher is declared
+    // big-endian (the same reason the namespace prefix is): BIG-endian u64.
+    // Without it the key misses — testnet 20864007 7D29BE82C2FE read
+    // tecNO_ENTRY on the entry 20864003 had just filed; verified against
+    // that entry's key 61EEB051… by brute force over the variants.
+    buf.extend_from_slice(&(sorted.len() as u64).to_be_bytes());
+    sha512_half(&buf)
+}
+
 pub fn deposit_preauth_key(account_id: &[u8; 20], authorized: &[u8; 20]) -> Hash256 {
     let mut buf = [0u8; 42];
     buf[..2].copy_from_slice(&SPACE_DEPOSIT_PREAUTH);

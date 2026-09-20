@@ -243,6 +243,7 @@ async fn validate_10_consecutive_ledgers() {
                     ticket_seq,
                     last_ledger_seq,
                     fields,
+                    inner_batch: false,
                 }));
             }
         }

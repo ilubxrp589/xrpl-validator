@@ -29,13 +29,8 @@ use crate::shamap::hash::sha512_half;
 /// fields, with credType as its RAW bytes. Hashing the type separately, or
 /// hashing the hex TEXT of the type, both yield a key that can never match a
 /// credential the network created — so a duplicate would go unnoticed.
-fn credential_key(subject: &[u8; 20], issuer: &[u8; 20], credential_type: &[u8]) -> xrpl_core::types::Hash256 {
-    let mut buf = Vec::with_capacity(2 + 20 + 20 + credential_type.len());
-    buf.extend_from_slice(&[0x00, 0x44]); // 'D'
-    buf.extend_from_slice(subject);
-    buf.extend_from_slice(issuer);
-    buf.extend_from_slice(credential_type);
-    sha512_half(&buf)
+pub(crate) fn credential_key(subject: &[u8; 20], issuer: &[u8; 20], credential_type: &[u8]) -> xrpl_core::types::Hash256 {
+    crate::ledger::keylet::credential_key(subject, issuer, credential_type)
 }
 
 /// CredentialType travels as hex text in our tx JSON; the keylet wants the
@@ -67,7 +62,7 @@ impl Transactor for CredentialCreateTransactor {
         if tx.tx_type != "CredentialCreate" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         // Subject is required
@@ -239,7 +234,7 @@ impl Transactor for CredentialDeleteTransactor {
         if tx.tx_type != "CredentialDelete" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         // rippled needs at least ONE of Subject/Issuer, not both
@@ -401,6 +396,39 @@ impl Transactor for CredentialDeleteTransactor {
     }
 }
 
+/// `credentials::deleteSLE` for a credential the ledger already holds: the
+/// object goes, both owner directories drop it (stored page hints), and the
+/// reserve holder — the subject once accepted, the issuer before that or
+/// when self-issued — loses one OwnerCount. Used by `removeExpired`
+/// (finding 342); CredentialDelete keeps its own inline copy.
+pub(crate) fn delete_credential_object(sandbox: &mut Sandbox, cred_key: &xrpl_core::types::Hash256) -> bool {
+    let Some(cred) = sandbox.read(cred_key).and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok()) else {
+        return false;
+    };
+    let (Some(issuer), Some(subject)) = (
+        cred.get("Issuer").and_then(decode_account_id),
+        cred.get("Subject").and_then(decode_account_id),
+    ) else {
+        return false;
+    };
+    let hint = |f: &str| -> Option<u64> {
+        match cred.get(f) {
+            Some(serde_json::Value::String(h)) => u64::from_str_radix(h, 16).ok(),
+            Some(serde_json::Value::Number(n)) => n.as_u64(),
+            _ => None,
+        }
+    };
+    let accepted = cred["Flags"].as_u64().unwrap_or(0) & 0x0001_0000 != 0;
+    sandbox.delete(*cred_key);
+    crate::ledger::directory::owner_dir_remove(sandbox, &issuer, cred_key, hint("IssuerNode"), false);
+    if subject != issuer {
+        crate::ledger::directory::owner_dir_remove(sandbox, &subject, cred_key, hint("SubjectNode"), false);
+    }
+    let charged = if !accepted || subject == issuer { issuer } else { subject };
+    crate::tx::offer::owner_count_add(sandbox, &charged, -1);
+    true
+}
+
 #[cfg(test)]
 mod delete_tests {
     use super::*;
@@ -431,6 +459,7 @@ mod delete_tests {
         TxFields {
             account, tx_type: "CredentialDelete".to_string(), fee: 12, sequence: 7,
             ticket_seq: None, last_ledger_seq: None, fields: f,
+            inner_batch: false,
         }
     }
 
@@ -466,6 +495,7 @@ mod delete_tests {
                 "Subject": hex::encode(subject),
                 "CredentialType": "4142",
             }),
+            inner_batch: false,
         };
         assert_eq!(CredentialCreateTransactor.do_apply(&tx, &mut sb), TxResult::Success);
 
@@ -559,7 +589,7 @@ impl Transactor for CredentialAcceptTransactor {
         if tx.tx_type != "CredentialAccept" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         // Issuer and CredentialType are required
@@ -713,6 +743,7 @@ mod tests {
                 "CredentialType": "KYC",
                 "URI": "https://example.com/kyc",
             }),
+            inner_batch: false,
         };
 
         assert_eq!(CredentialCreateTransactor.preflight(&create_tx), TxResult::Success);
@@ -740,6 +771,7 @@ mod tests {
                 "Issuer": hex::encode(issuer),
                 "CredentialType": "KYC",
             }),
+            inner_batch: false,
         };
 
         assert_eq!(CredentialAcceptTransactor.preflight(&accept_tx), TxResult::Success);
@@ -773,6 +805,7 @@ mod tests {
                 "Subject": hex::encode(subject),
                 "CredentialType": "AML",
             }),
+            inner_batch: false,
         };
         CredentialCreateTransactor.do_apply(&create_tx, &mut sandbox);
 
@@ -789,6 +822,7 @@ mod tests {
                 "Issuer": hex::encode(issuer),
                 "CredentialType": "AML",
             }),
+            inner_batch: false,
         };
 
         assert_eq!(CredentialDeleteTransactor.preflight(&delete_tx), TxResult::Success);
@@ -825,6 +859,7 @@ mod tests {
                 "Subject": hex::encode(subject),
                 "CredentialType": "KYC",
             }),
+            inner_batch: false,
         };
         CredentialCreateTransactor.do_apply(&create_tx, &mut sandbox);
 
@@ -841,6 +876,7 @@ mod tests {
                 "Issuer": hex::encode(issuer),
                 "CredentialType": "KYC",
             }),
+            inner_batch: false,
         };
 
         assert_eq!(CredentialDeleteTransactor.do_apply(&delete_tx, &mut sandbox), TxResult::NoPermission);
@@ -863,6 +899,7 @@ mod tests {
                 "Issuer": hex::encode([0x01u8; 20]),
                 "CredentialType": "KYC",
             }),
+            inner_batch: false,
         };
         assert_eq!(CredentialAcceptTransactor.do_apply(&tx, &mut sandbox), TxResult::NoEntry);
     }
@@ -880,6 +917,7 @@ mod tests {
             ticket_seq: None,
             last_ledger_seq: None,
             fields: serde_json::json!({"CredentialType": "KYC"}),
+            inner_batch: false,
         };
         assert_eq!(CredentialCreateTransactor.preflight(&tx1), TxResult::Malformed);
 
@@ -892,6 +930,7 @@ mod tests {
             ticket_seq: None,
             last_ledger_seq: None,
             fields: serde_json::json!({"Subject": hex::encode([0x02u8; 20])}),
+            inner_batch: false,
         };
         assert_eq!(CredentialCreateTransactor.preflight(&tx2), TxResult::Malformed);
     }
@@ -915,6 +954,7 @@ mod tests {
                 "Subject": hex::encode(subject),
                 "CredentialType": "KYC",
             }),
+            inner_batch: false,
         };
 
         assert_eq!(CredentialCreateTransactor.do_apply(&create_tx, &mut sandbox), TxResult::Success);
@@ -946,6 +986,7 @@ mod tests {
                 "CredentialType": "KYC",
                 "Expiration": exp,
             }),
+            inner_batch: false,
         };
         let run = |tx: &TxFields, sb: &mut Sandbox| {
             let r = CredentialCreateTransactor.preclaim(tx, sb);

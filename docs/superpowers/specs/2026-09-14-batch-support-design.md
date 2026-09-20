@@ -1,9 +1,26 @@
 # Batch (BatchV1_1) support — design
 
-**Date:** 2026-09-14 · **Branch:** t0-batch · **Status:** FFI leg implemented (t0-batch 06b21f8, 964a862) and verified —
-8 of 11 devnet Batch ledgers CLEAN, the other 3 diverge only on VaultDeposit /
-LoanPay hydration (devnet-only amendments); mainnet fixture 106980883 CLEAN
-(no regression); 22 suites, lib, fuzz, clippy green. Native leg pending review.
+**Date:** 2026-09-14 · **Branch:** t0-batch · **Status:** Leg A deployed (cycles
+129/130). Leg B implemented on branch t0-batch-b (plan
+docs/superpowers/plans/2026-09-17-batch-leg-b-native-transactor.md):
+BatchTransactor + shadow attribution; devnet vectors byte-exact; dp on both
+devnet Batch ledgers (l5309670: 6/6 attempted txs MATCH, outer
+0DB84681FAAD1C… verdict=MATCH our_ter=net_ter=tesSUCCESS our_muts=net_muts=3;
+l5309584: 3/3 attempted txs MATCH, outer C2E675EEF5AD8… verdict=MATCH
+our_ter=net_ter=tesSUCCESS our_muts=net_muts=3), zero DIVERGE-TER/DIVERGE-MUT
+on either ledger, no threading-fallback receipts. Awaiting the next deploy
+cycle.
+
+**Coverage, honestly.** All four modes are covered by unit tests in
+`crates/xrpl-ledger/src/tx/batch.rs` (synthetic ledgers). The byte-exact
+VECTORS, and both devnet dp ledgers, are `tfUntilFailure` batches in which
+every inner SUCCEEDED — so no vector yet exercises a mode discarding or
+stopping on a failed inner, which is precisely where the outer's mutation set,
+the per-inner threading and the inner-TER pairing differ between the modes.
+The engine handles those cases by construction and by unit test, and the
+consumers pair inner verdicts by ID (not by position, which was wrong for
+exactly those batches — `native_apply::pair_inner_verdicts`), but a devnet or
+mainnet specimen of a partially-applied batch is the missing evidence.
 
 ## Why now
 
@@ -54,12 +71,21 @@ would.)
 
 - Outer: exactly one of `tfAllOrNothing` (0x10000), `tfOnlyOne` (0x20000),
   `tfUntilFailure` (0x40000), `tfIndependent` (0x80000); `tfInnerBatchTxn`
-  (0x40000000) forbidden. 2..8 `RawTransactions`, unique by hash; inner types
-  in `kDisabledTxTypes` (Batch itself and pseudo types) rejected. Each inner:
-  `tfInnerBatchTxn` set, `Fee` = 0, empty `SigningPubKey`, no `TxnSignature` /
-  `Signers`, exactly one of `Sequence` / `TicketSequence`, and must pass
-  `preflight(…, parentBatchId, TapBatch)`. Under AllOrNothing / UntilFailure the
-  (account, sequence-or-ticket) pairs must be unique across inners.
+  (0x40000000) forbidden. 2..8 `RawTransactions`, unique by hash; an inner
+  whose type is in `kDisabledTxTypes` is `temINVALID_INNER_BATCH`, checked
+  first. That list (`Batch.h:60-76`) is the **Vault and Loan family** —
+  VaultCreate/Set/Delete/Deposit/Withdraw/Clawback, LoanBrokerSet/Delete,
+  LoanBrokerCoverDeposit/Withdraw/Clawback, LoanSet/Delete/Manage/Pay — and
+  neither `Batch` itself nor the pseudo types are in it: a nested `Batch` is
+  refused when the outer's `STTx` is CONSTRUCTED (`temINVALID`), and a pseudo
+  inner fails its own `preflight0` (`isPseudoTx && tfInnerBatchTxn` is
+  `temINVALID_FLAG` there), which the outer reports as
+  `temINVALID_INNER_BATCH` from the inner-preflight call much later in the
+  order. Each inner: `tfInnerBatchTxn` set, `Fee` = 0, empty `SigningPubKey`,
+  no `TxnSignature` / `Signers`, exactly one of `Sequence` / `TicketSequence`,
+  and must pass `preflight(…, parentBatchId, TapBatch)`. Under AllOrNothing /
+  UntilFailure the (account, sequence-or-ticket) pairs must be unique across
+  inners.
 - Fee: `base + Transactor::calculateBaseFee(outer)` + Σ `calculateBaseFee(inner)`
   + `base × signerCount` (BatchSigners: one per single-signed signer, or the
   nested `Signers` count).

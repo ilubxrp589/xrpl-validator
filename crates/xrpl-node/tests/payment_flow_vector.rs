@@ -863,3 +863,195 @@ fn payment_credential_ids_must_name_the_sender_as_subject_and_be_accepted_106988
 fn payment_in_driven_fwd_pass_stops_at_a_trimmed_head_offer_106991212() {
     run_bundle(include_str!("vectors/payment_in_driven_fwd_pass_stops_at_a_trimmed_head_offer_106991212.json"));
 }
+
+/// Finding 290 (#106992486 1E418A4F5724): rDireAucG's partial self-payment
+/// of a sentinel XRP amount for 226662 ATM through the ATM/XRP pool. The
+/// pool's changeSpotPriceQuality offer is priced between the spot and the
+/// tip, so `execOffer(tip)` fails `*ofrQ != offer.quality()` right after it
+/// and the pass ends at the pool with nothing stepped — and the next
+/// iteration's pool offers again, so the stream never reaches the expired
+/// FC1110C8 behind the tip. Finding 285's rule (step the book after a
+/// pool-served pass while the SendMax budget lasts) fired on the budget
+/// alone and reaped it: the three pins hold the offer, its page and the
+/// owner's root untouched.
+#[test]
+fn payment_pool_that_offers_again_ends_the_pass_at_the_pool_no_stepping_106992486() {
+    run_bundle(include_str!("vectors/payment_pool_that_offers_again_ends_the_pass_at_the_pool_no_stepping_106992486.json"));
+}
+
+/// Findings 294 + 295 — #107052630 32386DDEB6B8: rUnRkdr pays 117.732708 USDT
+/// with FIL through the explicit issuer hop [rsL5Y] and the XRP bridge, and
+/// strand 1 crosses its OWN two FIL/USDT offers (100 FIL, then 9.48 of 186).
+/// (294) rippled's DirectStep debits the sender the gross once and
+/// `consumeOffer`'s issuer→owner send credits the owner the net per fill — the
+/// same line, so only the 0.1% fee stays: −(35.169 × 1.001) − 109.4805 × 0.001.
+/// The mixed strand's run-fed fiction restore erased the owner credits and
+/// left the FIL line 109.48 low. (295) The destination's USDT line took five
+/// gross credits and one fee trim from the full-precision accumulator and
+/// rested at …7079999999; a completed delivery lands on pre + Amount exactly.
+#[test]
+fn payment_own_offers_behind_an_issuer_hop_are_credited_107052630() {
+    run_bundle(include_str!("vectors/payment_own_offers_behind_an_issuer_hop_are_credited_107052630.json"));
+}
+
+/// Finding 296 — #107009438 2877CBCC88C9: a deliver-max partial payment of
+/// 166716 drops for RLUSD through USDC.axl. rippled's REVERSE pass, asked for
+/// everything, walks the whole USDC.axl/RLUSD book: past the one funded tip it
+/// steps over rDeXHa's three unfunded offers and marks them `ofrsToRm`; the
+/// forward pass buys 0.2129 RLUSD from the tip alone, and the driver still
+/// deletes the three (plus their book pages, the owner page, OwnerCount) after
+/// the iteration — 17 mutations. Our reverse sizing ran in a snapshot, so
+/// those reaps were rolled back and the ledger showed 9.
+#[test]
+fn payment_reverse_pass_reaps_survive_the_snapshot_107009438() {
+    run_bundle(include_str!("vectors/payment_reverse_pass_reaps_survive_the_snapshot_107009438.json"));
+}
+
+/// Finding 297 — #107056200 BD9C7473B84F: rhTsmUJ's 6 XRP partial self-payment
+/// (DeliverMin) into RVR meets rMBPaL7's fresh offer at the tip and a 0.506%
+/// pool. `AMMLiquidity::getOffer` stands the pool aside only when the RAW pool
+/// quality (`Quality{balances}`, no fee) is not strictly better than the tip
+/// or sits within 1e-7 of it; the fee enters only in the anchored offer
+/// `changeSpotPriceQuality` then generates. We judged the fee-inclusive spot,
+/// 5.5e-8 inside the tip, and let the offer take all 6 XRP; mainnet's raw spot
+/// is 0.5% better, the pool's anchored slice is 52 drops for 0.428107876 RVR
+/// (shim trace: "changeSpotPriceQuality succeeded … 52 0.428107876") and the
+/// tip fills the other 5999948 — seven mutations, ours had five.
+#[test]
+fn payment_pool_stands_aside_on_raw_quality_not_fee_spot_107056200() {
+    run_bundle(include_str!("vectors/payment_pool_stands_aside_on_raw_quality_not_fee_spot_107056200.json"));
+}
+
+/// Findings 299–303 — the first vectors from the differential fuzzer
+/// (`differential_probe --fuzz`): unsigned mutants of real #107009438
+/// transactions, judged by libxrpl 3.4.0 on the same pre-state. The
+/// expectation is libxrpl's verdict; there is no mainnet metadata because
+/// a tem never reaches a ledger.
+#[test]
+fn payment_xrp_direct_with_partial_flag_is_malformed_fuzz_107009438() {
+    run_bundle(include_str!("vectors/payment_xrp_direct_with_partial_flag_is_malformed_fuzz_107009438.json"));
+}
+#[test]
+fn payment_no_ripple_direct_without_paths_is_ripple_empty_fuzz_107009438() {
+    run_bundle(include_str!("vectors/payment_no_ripple_direct_without_paths_is_ripple_empty_fuzz_107009438.json"));
+}
+#[test]
+fn payment_deliver_min_without_partial_is_bad_amount_fuzz_107009438() {
+    run_bundle(include_str!("vectors/payment_deliver_min_without_partial_is_bad_amount_fuzz_107009438.json"));
+}
+#[test]
+fn payment_ninety_six_digit_amount_parses_fuzz_107009438() {
+    run_bundle(include_str!("vectors/payment_ninety_six_digit_amount_parses_fuzz_107009438.json"));
+}
+
+/// Finding 304 — from the differential fuzzer: tfLimitQuality on a
+/// deliver-max partial payment (Amount 9999999999999990e79 RLUSD for 200000
+/// drops). rippled's limit is getRate(Amount, SendMax); a ratio below the
+/// STAmount floor files rate 0, Quality(0) is the best quality there is, and
+/// every strand is "rejected by limitQuality": tecPATH_DRY. Our encoder
+/// wrapped the exponent into a rate no strand could fail.
+#[test]
+fn payment_limit_quality_below_the_stamount_floor_rejects_every_strand_fuzz_107009438() {
+    run_bundle(include_str!("vectors/payment_limit_quality_below_the_stamount_floor_rejects_every_strand_fuzz_107009438.json"));
+}
+
+/// Finding 307 — from the differential fuzzer (rogue5Hn's PLX→GALLOWS
+/// payment with tfLimitQuality added): rippled's `limitOut` hands back the
+/// remainder UNTRIMMED when the solved out is within 1e-9 relative of it
+/// ("A tiny difference could be due to the round off"), so `adjustedRemOut`
+/// stays false and the 1e-7 judge forgiveness never applies. We trimmed by
+/// 1.2e-13 relative, called the ask adjusted, and forgave a pass rippled
+/// rejects: tecPATH_DRY.
+#[test]
+fn payment_limit_out_within_a_billionth_is_not_a_trim_fuzz_107009438() {
+    run_bundle(include_str!(
+        "vectors/payment_limit_out_within_a_billionth_is_not_a_trim_fuzz_107009438.json"
+    ));
+}
+
+/// Finding 311 (#107064266 12C8A416327C, soak-17 receipt): rogue5Hn's
+/// PLX→LHT→CSC payment met hop 1 with one book offer; the CSC/LHT pool
+/// merely existed, yet the 5.3e-11 LHT carry overshoot was flushed into it
+/// and its LHT line rounded up one ulp — a ninth mutation mainnet never
+/// wrote. The flush goes through the pool only when the hop's own walk took
+/// the pool. The pool's LHT line is pinned untouched in `expect`.
+#[test]
+fn payment_overshoot_flushes_only_through_a_pool_the_hop_took_107064266() {
+    run_bundle(include_str!(
+        "vectors/payment_overshoot_flushes_only_through_a_pool_the_hop_took_107064266.json"
+    ));
+}
+
+/// Findings 312-316 — from the structural differential fuzzer (sweep 3 on
+/// 107060755); libxrpl's result is the expectation.
+#[test]
+fn payment_last_ledger_behind_the_ledger_is_tefmax_ledger_fuzz_107060755() {
+    run_bundle(include_str!("vectors/payment_last_ledger_behind_the_ledger_is_tefmax_ledger_fuzz_107060755.json"));
+}
+
+/// Findings 312-316 — from the structural differential fuzzer (sweep 3 on
+/// 107060755); libxrpl's result is the expectation.
+#[test]
+fn payment_future_sequence_is_terpre_seq_fuzz_107060755() {
+    run_bundle(include_str!("vectors/payment_future_sequence_is_terpre_seq_fuzz_107060755.json"));
+}
+
+/// Findings 312-316 — from the structural differential fuzzer (sweep 3 on
+/// 107060755); libxrpl's result is the expectation.
+#[test]
+fn payment_zero_fee_is_valid_and_applies_fuzz_107060755() {
+    run_bundle(include_str!("vectors/payment_zero_fee_is_valid_and_applies_fuzz_107060755.json"));
+}
+
+/// Findings 317/318 — from the structural differential fuzzer; libxrpl's
+/// result is the expectation.
+#[test]
+fn payment_mpt_direct_with_no_ripple_direct_is_invalid_flag_fuzz_testnet_20863937() {
+    run_bundle(include_str!("vectors/payment_mpt_direct_with_no_ripple_direct_is_invalid_flag_fuzz_testnet_20863937.json"));
+}
+
+/// Findings 320-326 — from the testnet campaign's differential fuzz (libxrpl's
+/// result is the expectation).
+#[test]
+fn escrow_create_cancel_after_at_or_before_finish_after_is_bad_expiration_fuzz_testnet_20864035() {
+    run_bundle(include_str!("vectors/escrow_create_cancel_after_at_or_before_finish_after_is_bad_expiration_fuzz_testnet_20864035.json"));
+}
+
+/// Finding 334 — the devnet campaign's permissioned-DEX hybrid offer.
+#[test]
+fn payment_consuming_a_hybrid_offer_unlinks_its_open_book_entry_devnet_5419040() {
+    run_bundle(include_str!("vectors/payment_consuming_a_hybrid_offer_unlinks_its_open_book_entry_devnet_5419040.json"));
+}
+
+/// Finding 333 — devnet 5422959 FE1A0200A515: a domain payment (rQNx to
+/// itself, SendMax 5 USD for 1 XRP) whose domain book cannot fill it →
+/// tecPATH_PARTIAL, fee only.
+#[test]
+fn payment_in_domain_short_of_liquidity_is_path_partial_devnet_5422959() {
+    run_bundle(include_str!("vectors/payment_in_domain_short_of_liquidity_is_path_partial_devnet_5422959.json"));
+}
+
+/// Finding 342 — #107093460 D125FEC040CD: a CCR payment into a DepositAuth
+/// destination carrying one accepted, unexpired CredentialID; the
+/// destination pre-authorised that (Issuer, CredentialType) — the
+/// DepositPreauth-by-credentials object is in the pre-state. We refused it.
+#[test]
+fn payment_with_credentials_into_a_deposit_auth_destination_107093460() {
+    run_bundle(include_str!("vectors/payment_with_credentials_into_a_deposit_auth_destination_107093460.json"));
+}
+
+/// Finding 342 — #107093959 1A036B0C6D6F: the sibling bot account, same shape.
+#[test]
+fn payment_with_credentials_into_a_deposit_auth_destination_107093959() {
+    run_bundle(include_str!("vectors/payment_with_credentials_into_a_deposit_auth_destination_107093959.json"));
+}
+
+/// Finding 341 — #107093372 BE1B5D257244: a partial XAH→RLUSD payment whose
+/// first iteration leaves a 1e-14 remainder. The pool wins iteration two
+/// anchored at the next tip's quality, its forward swap of the 1.55e-12 XAH
+/// left yields nothing, the strand is dry and rippled's flow ends. We filled
+/// the remainder from the tip behind the pool (its owner's XAH line pinned).
+#[test]
+fn payment_pool_dry_iteration_ends_the_flow_107093372() {
+    run_bundle(include_str!("vectors/payment_pool_dry_iteration_ends_the_flow_107093372.json"));
+}

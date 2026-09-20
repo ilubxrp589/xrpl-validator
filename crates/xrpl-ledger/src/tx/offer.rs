@@ -847,6 +847,60 @@ fn soft_stale_mark(k: &Hash256) {
 fn soft_stale_contains(k: &Hash256) -> bool {
     SOFT_STALE.with(|c| c.borrow().contains(&k.0))
 }
+/// Finding 296 (#107009438 2877CBCC88C9): offers `reap_if_dead` removed FOR
+/// GOOD (expired, empty, unfunded or dust on a pristine line, unauthorized)
+/// — rippled's `ofrsToRm`, which BOTH passes of every attempted strand fill
+/// and the driver deletes from the base view after the iteration
+/// (StrandFlow.h:706 `SetUnion`, applied whether the strand won or failed).
+/// Our REVERSE sizing runs in a snapshot (`measure_hop`), so reaps it found
+/// past the forward pass's reach were rolled back: rDeXHa's three unfunded
+/// RLUSD offers behind the one funded tip stayed on mainnet's deleted list
+/// and off ours (9 mutations for 17). Cleared per round, drained after it.
+thread_local! {
+    static DEAD_REAPED: std::cell::RefCell<Vec<Hash256>> = std::cell::RefCell::new(Vec::new());
+}
+fn dead_reaped_mark(k: &Hash256) {
+    DEAD_REAPED.with(|c| c.borrow_mut().push(*k));
+}
+pub(crate) fn dead_reaped_clear() {
+    DEAD_REAPED.with(|c| c.borrow_mut().clear());
+}
+pub(crate) fn take_dead_reaped() -> Vec<Hash256> {
+    DEAD_REAPED.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+/// Every thread-local the offer walk keeps between calls, cleared. rippled
+/// carries nothing from one transaction into the next; these carry what the
+/// PREVIOUS application left — and a discarded application (a fuzz mutant,
+/// a dry-run) leaves the most. Called from the per-transaction entry.
+thread_local! {
+    /// Finding 336: the walk's GROSS in-fold — rippled's `sum(savedIns)`,
+    /// what the taker paid including the gateway's cut. A tfSell
+    /// FillOrKill is filled only when flow()'s `remainingIn` — the gross
+    /// sendMax (clamped to the balance) minus that fold — is EXACTLY zero
+    /// (StrandFlow.h:884-897); an ulp past it is tecPATH_PARTIAL, and
+    /// CreateOffer kills the offer with every fill rolled back.
+    /// #107078027 CFFAB9071559 and three siblings from rKjqjLdp in one
+    /// hour: rippled's total in 0.05301369003189998 against a sendMax of
+    /// 0.0530136900318999 (its whole line), we judged the NET budget spent
+    /// to zero and filled.
+    static SELL_IN_FOLD: std::cell::Cell<Option<Me>> = const { std::cell::Cell::new(None) };
+}
+fn sell_in_fold_set(f: Me) {
+    SELL_IN_FOLD.with(|c| c.set(Some(f)));
+}
+pub(crate) fn take_sell_in_fold() -> Option<Me> {
+    SELL_IN_FOLD.with(|c| c.take())
+}
+
+pub(crate) fn thread_state_reset() {
+    ORIG_OWNER_COUNTS.with(|m| m.borrow_mut().clear());
+    SOFT_STALE.with(|c| c.borrow_mut().clear());
+    DEAD_REAPED.with(|c| c.borrow_mut().clear());
+    PASSTHROUGH.with(|p| p.borrow_mut().clear());
+    SELF_MAKER_CREDITS.with(|c| c.borrow_mut().clear());
+    SELL_IN_FOLD.with(|c| c.set(None));
+}
 /// The permanent reaps in `stale` — what `sbCancel` carries on a failure.
 fn hard_stale(stale: &[Hash256]) -> Vec<Hash256> {
     stale.iter().filter(|k| !soft_stale_contains(k)).copied().collect()
@@ -1637,6 +1691,18 @@ pub(crate) enum PassRole {
 thread_local! {
     static PASSTHROUGH: std::cell::RefCell<Vec<([u8; 20], Leg, PassRole)>> = std::cell::RefCell::new(Vec::new());
 }
+/// Finding 294 (#107052630 32386DDEB6B8): the taker's OWN offers filled on the
+/// walk's gets leg — the `pay` each fill credits the owner, rippled's
+/// issuer→owner `accountSend` in `consumeOffer`. Finding 260 keeps the walk
+/// from moving the sender's line for them; a caller that restores that line
+/// after the walk (the mixed strand's run-fed fiction) lands these again, per
+/// fill, in order. Drained by `take_self_maker_credits` before every walk.
+thread_local! {
+    static SELF_MAKER_CREDITS: std::cell::RefCell<Vec<Me>> = std::cell::RefCell::new(Vec::new());
+}
+pub(crate) fn take_self_maker_credits() -> Vec<Me> {
+    SELF_MAKER_CREDITS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
 pub(crate) fn set_passthrough(list: Vec<([u8; 20], Leg, PassRole)>) {
     PASSTHROUGH.with(|p| *p.borrow_mut() = list);
 }
@@ -1805,7 +1871,26 @@ pub(crate) fn delete_maker_offer(
     {
         crate::ledger::directory::dir_remove(sandbox, &bd, okey, book_hint, false);
     }
+    // Finding 334: a hybrid's open-book entry goes with it (View.cpp
+    // offerDelete :1953-1968).
+    remove_additional_books(sandbox, okey, offer);
     owner_count_add(sandbox, maker, -1);
+}
+
+/// Unlink every `AdditionalBooks` entry of a (hybrid) offer.
+pub(crate) fn remove_additional_books(sandbox: &mut Sandbox, okey: &xrpl_core::types::Hash256, offer: &serde_json::Value) {
+    for b in offer.get("AdditionalBooks").and_then(|v| v.as_array()).into_iter().flatten() {
+        let book = b.get("Book").unwrap_or(b);
+        let Some(bd) = book
+            .get("BookDirectory")
+            .and_then(|v| v.as_str())
+            .and_then(|s| hex::decode(s).ok())
+            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+            .map(xrpl_core::types::Hash256)
+        else { continue };
+        let node = book.get("BookNode").map(dirnum);
+        crate::ledger::directory::dir_remove(sandbox, &bd, okey, node, false);
+    }
 }
 
 /// The issuer-published TickSize governing a pair: the smaller of the two
@@ -2768,6 +2853,7 @@ fn reap_if_dead(
         if exp != 0 && sandbox.base().header.close_time as u64 >= exp {
             delete_maker_offer(sandbox, okey, offer, maker);
             stale.push(*okey);
+            dead_reaped_mark(okey);
             return true;
         }
     }
@@ -2778,7 +2864,36 @@ fn reap_if_dead(
     if m_gives0.0 == 0 || m_wants0.0 == 0 {
         delete_maker_offer(sandbox, okey, offer, maker);
         stale.push(*okey);
+        dead_reaped_mark(okey);
         return true;
+    }
+    // Finding 337 (OfferStream.cpp:293-301): an offer carrying a DomainID
+    // whose owner is NO LONGER in that domain — `permissioned_dex::
+    // offerInDomain` — is removed for good ("Removing offer no longer in
+    // domain"), whichever book the stream reached it through (a hybrid
+    // offer rests in the open book too). Devnet 5422969 556E025939A5: r4uY's
+    // domain offer BF23A33D after the issuer deleted its KYC credential —
+    // rQNx's crossing offer removed it and RESTED; we crossed it.
+    if let Some(d) = offer
+        .get("DomainID")
+        .and_then(|v| v.as_str())
+        .and_then(|h| hex::decode(h).ok())
+        .filter(|b| b.len() == 32)
+        .map(|b| {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&b);
+            Hash256(k)
+        })
+    {
+        if !crate::tx::misc::account_in_domain(sandbox, maker, &d) {
+            if std::env::var("DX_RM").is_ok() {
+                eprintln!("DX_RM domain-orphan okey={} maker={}", hex::encode(okey.0), hex::encode(maker));
+            }
+            delete_maker_offer(sandbox, okey, offer, maker);
+            stale.push(*okey);
+            dead_reaped_mark(okey);
+            return true;
+        }
     }
     if std::env::var("DX_RM").is_ok() {
         eprintln!(
@@ -2810,6 +2925,8 @@ fn reap_if_dead(
         // Finding 153: drained by this iteration's own fill → not permanent.
         if became {
             soft_stale_mark(okey);
+        } else {
+            dead_reaped_mark(okey);
         }
         return true;
     }
@@ -2825,6 +2942,8 @@ fn reap_if_dead(
         stale.push(*okey);
         if became {
             soft_stale_mark(okey);
+        } else {
+            dead_reaped_mark(okey);
         }
         return true;
     }
@@ -2834,6 +2953,7 @@ fn reap_if_dead(
     if require_auth_known(sandbox, gets_leg, maker) == Some(false) {
         delete_maker_offer(sandbox, okey, offer, maker);
         stale.push(*okey);
+        dead_reaped_mark(okey);
         return true;
     }
     false
@@ -4368,13 +4488,30 @@ thr={t:?} admits_trunc={} admits_up={}",
                 pool_offer_this_round = fib.is_some();
                 pool_bq_blocked = fib.is_some_and(|(s_in, s_out)| {
                     let q = crate::tx::amm_swap::slice_rate(s_in, s_out);
-                    best_book.is_some_and(|b| !me_cmp(q, b).is_lt())
+                    // Finding 306 (fuzz #20 off 107009438, 7665065807E8 with
+                    // TakerGets doubled — r3rhWeE3's FLR→BTC offer over a
+                    // direct pool and a two-leg XRP bridge): at iteration 8
+                    // the direct pool's fib slice (1.2377) fell behind the
+                    // direct tip — the taker's OWN resting offer at 1.2346 —
+                    // and rippled's direct strand ran dry ("Strand found dry
+                    // in rev"), was never pushed back, and the lone bridge
+                    // then ran single-path (changeSpotPriceQuality on leg A,
+                    // 56551.28 FLR for the whole 0.004443 BTC). We spared the
+                    // strand as "refused only by the rival's bound" (the
+                    // bridge's 1.23459 was also better), re-ran it next
+                    // round with the self-offer gone, took a ninth slice, and
+                    // stayed multi-path. A pool its OWN tip refuses was not
+                    // spared by anyone.
+                    !crate::tx::amm_swap::fib_refused_by_own_tip(
+                        sandbox, a, d_book_ub, (s_in, s_out), pays_leg, gets_leg, amm_iters,
+                    ) && best_book.is_some_and(|b| !me_cmp(q, b).is_lt())
                         && dq.is_none_or(|d| me_cmp(q, d).is_lt())
                         && (threshold == u64::MAX || !me_cmp(q, rate_me(threshold)).is_gt())
                 });
                 crate::tx::amm_swap::consume_fib(
                     sandbox, a, taker, beneficiary, None, round_gross_cap, rem_pays, rem_gets, pays_leg, gets_leg,
                     threshold, sell, *init, amm_iters, best_book, fee_rate,
+                    d_book_ub, // finding 298: the pool's own-book gate
                 )
             };
             rem_pays = rp;
@@ -4424,11 +4561,26 @@ thr={t:?} admits_trunc={} admits_up={}",
                     direct_dry = true;
                 }
             }
+            // Finding 341: the bridged pool's refusals are modelled by finding
+            // 306's own rules; drop the direct-walk flag so it cannot leak.
+            let _ = crate::tx::amm_swap::take_turn_rejected();
             if used {
                 // The slice's GROSS joins the walk's spend (see gets_gross_cap).
+                // Finding 336: the slice that EXHAUSTS the round's in is
+                // settled at the round's gross cap verbatim (settle_slice's
+                // exhaust branch, finding 243) — so that is what rippled's
+                // savedIns holds for the iteration, not the re-grossed net.
+                // #106871187 7866B5998F0C: re-grossing 13.10356557426634 ×
+                // 1.002 lands …488, two ulps over the …486 remainder rippled
+                // debited, and the closing fold overshoots TakerGets by 2e-14
+                // — a FillOrKill sell mainnet fills, judged tecKILLED.
                 let slice_net = me_sub(rg_before, rg);
-                in_gross_spent = stamount_signed_add(false, in_gross_spent, false, gross_in(fee_rate, slice_net)).1;
-                saved_ins.push(gross_in(fee_rate, slice_net));
+                let slice_gross = match round_gross_cap {
+                    Some(cap) if me_is_zero(rg) => cap,
+                    _ => gross_in(fee_rate, slice_net),
+                };
+                in_gross_spent = stamount_signed_add(false, in_gross_spent, false, slice_gross).1;
+                saved_ins.push(slice_gross);
                 amm_iters += 1;
                 // The flow-wide AMMContext counts this iteration too (F107).
                 crate::tx::amm_swap::amm_ctx_walk_iteration();
@@ -4854,17 +5006,6 @@ thr={t:?} admits_trunc={} admits_up={}",
         // when the round is then refused (tfPassive: "Path rejected by
         // limitQuality … All strands dry"): rippled keeps the rev pass's
         // removals ("rm bad offers even if the strand fails").
-        if flows_bridge && !b_use_amm {
-            if let Some(dj) = lb.get(bi).and_then(|(q, _)| dir_at(&dirs_b, *q)) {
-                if std::env::var("DX_REV").is_ok() {
-                    eprintln!("DX_REV extent enter bi={bi} dj={dj} sell={sell} rem_pays={rem_pays:?} crossed={crossed} lb_q={:x}", lb[bi].0);
-                }
-                rev_extent_reap(
-                    sandbox, &dirs_b, dj, if sell { None } else { Some(rem_pays) }, None,
-                    taker, beneficiary, pays_leg, &xrp_leg, true, &mut oc_b, stale,
-                );
-            }
-        }
         // ⚠ Under multiPath, a clamped POOL fill is priced at the OFFER'S
         // QUALITY, not re-swapped through the conservation function:
         //     if (ammLiquidity_.multiPath())
@@ -5209,6 +5350,37 @@ thr={t:?} admits_trunc={} admits_up={}",
                     }
                     if !within(admit) {
                         break 'attempt;
+                    }
+                }
+                // Finding 292 (#107002363 580C51AC and #106999572 6302A085,
+                // rJfVTbJs selling ETH for RLUSD, tfSell|tfImmediateOrCancel,
+                // two strands): FlowSortStrands (enabled) makes an iteration
+                // flow its admitted strands IN BOUND ORDER and BREAK at the
+                // first that succeeds and passes limitQuality
+                // (StrandFlow.h: `best.emplace(...); pushRemainingCurToNext(
+                // strandIndex + 1); break;`). The strands behind the winner are
+                // not flowed that iteration — no rev pass, no stream, nothing
+                // reaped. Here the direct ETH/RLUSD strand sorted first
+                // (4.0391e-4 against the bridge's 4.0429e-4) and filled the
+                // whole 4.039e-6 ETH; rippled's narration has one strand's
+                // rev/fwd and six mutations. We ran leg B's rev extent for
+                // every admitted bridge BEFORE the candidate loop (finding
+                // 251's site) and reaped rfPBiFvF's expired BF0EA46B, its
+                // page and an OwnerCount unit — ten mutations. The extent now
+                // runs inside the bridge's own attempt, so it happens exactly
+                // when rippled flows the bridge: when it sorts first, or when
+                // every strand ahead of it failed. Finding 251's semantics are
+                // unchanged — a refused bridge still keeps its removals (the
+                // rollback re-applies hard stale).
+                if flows_bridge && !b_use_amm {
+                    if let Some(dj) = lb.get(bi).and_then(|(q, _)| dir_at(&dirs_b, *q)) {
+                        if std::env::var("DX_REV").is_ok() {
+                            eprintln!("DX_REV extent enter bi={bi} dj={dj} sell={sell} rem_pays={rem_pays:?} crossed={crossed} lb_q={:x}", lb[bi].0);
+                        }
+                        rev_extent_reap(
+                            sandbox, &dirs_b, dj, if sell { None } else { Some(rem_pays) }, None,
+                            taker, beneficiary, pays_leg, &xrp_leg, true, &mut oc_b, stale,
+                        );
                     }
                 }
             }
@@ -6390,6 +6562,9 @@ had_fill={} n={} keys={:?}",
     // Finding 160: `divideRound(actualAmountIn, gatewayXferRate, asset,
     // true)` is STAmount `divRound` — the lossy ceiling — not `mulRatio`.
     if crossed > 0 {
+        if !gets_leg.xrp {
+            sell_in_fold_set(fold16_multiset(&saved_ins)); // finding 336
+        }
         if !gets_leg.xrp && !me_is_zero(rem_gets) {
             let spent = match fee_rate {
                 Some(r) => div_round16_up(in_gross_spent, (r as u128, -9)),
@@ -6398,8 +6573,27 @@ had_fill={} n={} keys={:?}",
             let (neg, v) = stamount_signed_add(false, entry_gets, true, spent);
             rem_gets = if neg { (0, 0) } else { v };
         }
+        // Finding 310 (fuzz #6 off 107009438, 24038BE2F358 with TakerGets
+        // doubled — r3rhWeE3 buying 27954.62 EUR with ETH over the book and
+        // an XRP bridge, 139 iterations): a buy's residual is `afterCross.out
+        // -= result.actualAmountOut`, and actualAmountOut is flow()'s
+        // `sum(savedOuts)` — the ITERATIONS' outs accumulated in the
+        // multiset's SORTED order (StrandFlow.h:642-647, 792-794), which
+        // finding 202 already keeps in `saved_outs`. The per-fill chain
+        // `out_sum` folds the same amounts in consumption order and lands
+        // 14311.68529682502 where rippled's fold is 14311.685296825: the
+        // resting offer two ulp off on both sides (the in is re-derived from
+        // the out). Sorted fold when every round recorded its out; the chain
+        // stays for a walk that filled without recording (the F278 lesson).
         if !pays_leg.xrp && !me_is_zero(rem_pays) {
-            let (neg, v) = stamount_signed_add(false, entry_pays, true, out_sum);
+            let lists_agree = !saved_outs.is_empty() && {
+                let fold = fold16_multiset(&saved_outs);
+                let (_, diff) = stamount_signed_add(false, fold, true, out_sum);
+                let tol = me_muldiv(out_sum, (1, 0), (100_000_000_000_000, 0), false); // 1e-14 relative
+                me_cmp(diff, tol).is_le()
+            };
+            let taken = if lists_agree { fold16_multiset(&saved_outs) } else { out_sum };
+            let (neg, v) = stamount_signed_add(false, entry_pays, true, taken);
             rem_pays = if neg { (0, 0) } else { v };
         }
     }
@@ -6906,6 +7100,9 @@ pub(crate) fn cross_engine_to_net(
     // or the trailing sweep behind it) — their other offers are "became
     // unfunded", stepped past but not permanently removed.
     let mut drained_level: Drained = Default::default();
+    // Finding 339: set when a pool turn that won its iteration was rejected
+    // by limitQuality — the flow is over, tail turn included.
+    let mut walk_ended_by_pool = false;
     'dirs: for (di, dk) in dirs.clone().into_iter().enumerate() {
         // Finding 201: set when this level's sweep removes the taker's own offer.
         let mut level_self_reaped = false;
@@ -7333,6 +7530,16 @@ pub(crate) fn cross_engine_to_net(
                 pays_leg, gets_leg, threshold, threshold_self, sell, Some(q), pay_in_rate,
                 None,
             );
+            if !used && crate::tx::amm_swap::take_turn_rejected() {
+                // Finding 339: the pool won the turn and its slice was
+                // "Path rejected by limitQuality" — rippled breaks out of
+                // flow(); the level's offers are never visited.
+                if std::env::var("DX_AMM").is_ok() {
+                    eprintln!("DX_AMM pool took the iteration and yielded nothing usable (limit reject or dry swap) → walk ends (F339/F341)");
+                }
+                walk_ended_by_pool = true;
+                break 'dirs;
+            }
             let line_drained = line_bound && used && me_is_zero(rg);
             // Re-express the turn's remainder against the walk's own budget:
             // the slice took rg_turn − rg.
@@ -8441,6 +8648,12 @@ pub(crate) fn cross_engine_to_net(
                         if &maker != taker {
                             line_adjust(sandbox, &maker, gets_leg, pay, true);
                             taker_accs.1 = stamount_signed_add(false, taker_accs.1, false, g).1;
+                        } else {
+                            // Finding 294: the owner credit is still real in
+                            // rippled (`consumeOffer`'s issuer→owner send); a
+                            // caller that restores the sender's line after the
+                            // walk re-applies it — see `take_self_maker_credits`.
+                            SELF_MAKER_CREDITS.with(|c| c.borrow_mut().push(pay));
                         }
                     }
                 }
@@ -8541,6 +8754,72 @@ pub(crate) fn cross_engine_to_net(
                     );
                 }
                 if done(rem_pays, rem_gets) {
+                    // Finding 291 (#107044846 21AFDEFB and nine siblings, 107044848-857,
+                    // rGH4WSUU's Fill-or-Kill RLUSD buys): rippled's remainingOut is
+                    // `outReq - sum(savedOuts)` RE-DERIVED at every iteration
+                    // boundary (StrandFlow.h:791) from the ASCENDING multiset —
+                    // never the running chain. Four iterations (24.33333333333333,
+                    // 20.20166157769699, 1.041989285030025, 0.08777380393965)
+                    // decrement the chain to exactly zero, but the sorted fold is
+                    // 45.66475799999999 against 45.664758 wanted — a 1e-14 crumb —
+                    // so rippled runs a FIFTH iteration for it: the tip prices the
+                    // crumb at one drop (`in: 1 out: 1e-14`), the strand's realised
+                    // quality misses limitQuality ("Path rejected by limitQuality
+                    // limit: 6492916584215336950 path q: 7134701809754865664"),
+                    // "All strands dry", Total flow out 45.66475799999999 ≠ outReq
+                    // → the Fill-or-Kill is tecKILLED with 3 mutations. We believed
+                    // the chain, filled, and reported tesSUCCESS with 19. So: bank
+                    // this iteration and re-derive BEFORE believing `done`. A crumb
+                    // that survives the fold is a real want; when the taker pays in
+                    // drops the crumb's one-drop price can never meet the limit (a
+                    // crumb is at most an ulp of the sum: crumb × limit < 1 drop
+                    // unless TakerGets ≥ 1e9 XRP), so the crossing ends with the
+                    // crumb outstanding and the verdict follows from it. An IOU-in
+                    // crumb prices to a representable sliver rippled would judge on
+                    // its merits and usually fill — not modelled here (the running
+                    // zero stands), narrated so a receipt can name it.
+                    let mut folded_crumb = false;
+                    if fold_rem && !me_is_zero(level_out_acc) {
+                        saved_level_outs.push(level_out_acc);
+                        level_out_acc = (0, 0);
+                        let rem_pays_fold = if offer_crossing && !pays_leg.xrp {
+                            let (neg, m) = stamount_signed_add(false, out_req0, true, fold16(&mut saved_level_outs));
+                            if neg { (0, 0) } else { m }
+                        } else {
+                            me_sub(out_req0, fold16(&mut saved_level_outs))
+                        };
+                        if !level_ins.is_empty() {
+                            saved_level_ins.push(fold16(&mut level_ins));
+                            level_ins.clear();
+                            level_in_acc = (0, 0);
+                        }
+                        let rem_gets_fold = if !in_fold_off {
+                            stamount_signed_add(false, in_req0, true, fold16(&mut saved_level_ins)).1
+                        } else {
+                            rem_gets
+                        };
+                        if !done(rem_pays_fold, rem_gets_fold) {
+                            // The crumb iteration: rejected by limitQuality when
+                            // even one drop over-prices it.
+                            let one_drop_rejects = gets_leg.xrp
+                                && rate_of_me((1, 0), rem_pays_fold).is_some_and(|q| q > thr_judge);
+                            if std::env::var("DX_FOLD").is_ok() {
+                                eprintln!(
+                                    "DX_FOLD F291 crumb after fold: rem_pays {rem_pays:?} -> {rem_pays_fold:?} rem_gets {rem_gets:?} -> {rem_gets_fold:?} xrp_in={} one_drop_rejects={one_drop_rejects}",
+                                    gets_leg.xrp
+                                );
+                            }
+                            if one_drop_rejects {
+                                rem_pays = rem_pays_fold;
+                                rem_gets = rem_gets_fold;
+                                folded_crumb = true;
+                            }
+                        } else {
+                            rem_pays = rem_pays_fold;
+                            rem_gets = rem_gets_fold;
+                        }
+                    }
+                    let _ = folded_crumb;
                     // rippled does not stop at a satisfied fill. Its reverse
                     // pass returns TRUE from the offer callback whenever the
                     // step's output fits inside what is still wanted —
@@ -8623,6 +8902,7 @@ pub(crate) fn cross_engine_to_net(
         if fold_rem && !me_is_zero(level_out_acc) {
             saved_level_outs.push(level_out_acc);
             level_out_acc = (0, 0);
+            if std::env::var("DX_FOLD").is_ok() { eprintln!("DX_FOLD level-boundary at line {}: banked={saved_level_outs:?}", 8624); }
             rem_pays = if offer_crossing && !pays_leg.xrp {
                 // finding 173: 16-digit remainingOut (see the per-fill fold)
                 let (neg, m) = stamount_signed_add(false, out_req0, true, fold16(&mut saved_level_outs));
@@ -8656,7 +8936,7 @@ pub(crate) fn cross_engine_to_net(
             amm.is_some()
         );
     }
-    if let Some(a) = &amm {
+    if let Some(a) = amm.as_ref().filter(|_| !walk_ended_by_pool) {
         // For a CROSSING with no remembered anchor, the strand must first be
         // ADMITTED. rippled's next pass anchors tryAMM on the residual raw
         // tip; when that tip sits WITHIN the inflated limitQuality
@@ -8818,6 +9098,10 @@ pub(crate) fn cross_engine_to_net(
                 pay_in_rate,
                 if crossed == 0 { raw_first_q } else { residual_q },
             );
+            // Finding 341: a tail turn that took the iteration and yielded
+            // nothing ends nothing further — the walk is at its end already;
+            // consume the flag so it cannot leak into a later walk.
+            let _ = crate::tx::amm_swap::take_turn_rejected();
             let line_drained = line_bound && used && me_is_zero(rg);
             // Re-express the turn's remainder against the walk's own budget:
             // the slice took rg_turn − rg.
@@ -9020,8 +9304,9 @@ pub(crate) fn cross_engine_to_net(
         };
         let per_iteration = fold_rem && !in_fold_off && pay_in_rate.is_none() && !saved_level_ins.is_empty() && lists_agree;
         let gross = if per_iteration { level_fold } else { fill_fold };
+        sell_in_fold_set(gross); // finding 336
         if std::env::var("DX_PLACE").is_ok() {
-            eprintln!("DX_PLACE F274 per_iteration={per_iteration} n_iter={} n_fills={} fold={gross:?} entry_gets={entry_gets:?}", saved_level_ins.len(), saved_ins.len());
+            eprintln!("DX_PLACE F274 per_iteration={per_iteration} n_iter={} n_fills={} fold={gross:?} entry_gets={entry_gets:?} level_fold={level_fold:?} fill_fold={fill_fold:?} saved_level_ins={saved_level_ins:?} saved_ins={saved_ins:?}", saved_level_ins.len(), saved_ins.len());
         }
         let spent = match pay_in_rate {
             Some(r) => div_round16_up(gross, (r as u128, -9)),
@@ -9111,13 +9396,27 @@ fn amm_turn(
     };
     let r = crate::tx::amm_swap::consume_fib(
         sandbox, a, taker, beneficiary, benef_net, in_gross_cap, rem_pays, rem_gets, pays_leg, gets_leg, threshold, sell,
-        init, f.iters, clob.map(rate_me), in_gross_rate,
+        init, f.iters, clob.map(rate_me), in_gross_rate, None,
     );
     if r.2 {
         f.used = true;
         crate::tx::amm_swap::amm_ctx_mark_used();
     }
     r
+}
+
+/// The transaction's DomainID (XLS-80) as a key, when it carries one.
+pub(crate) fn tx_domain(tx: &TxFields) -> Option<Hash256> {
+    tx.fields
+        .get("DomainID")
+        .and_then(|v| v.as_str())
+        .and_then(|s| hex::decode(s).ok())
+        .filter(|b| b.len() == 32)
+        .map(|b| {
+            let mut d = [0u8; 32];
+            d.copy_from_slice(&b);
+            Hash256(d)
+        })
 }
 
 /// Cross with the taker as its own beneficiary (OfferCreate semantics).
@@ -9143,14 +9442,28 @@ pub struct OfferCreateTransactor;
 
 impl Transactor for OfferCreateTransactor {
     fn preflight(&self, tx: &TxFields) -> TxResult {
+        // Finding 334: tfHybrid without a DomainID is temINVALID_FLAG
+        // (CreateOffer.cpp:76-77).
+        if tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & 0x0010_0000 != 0
+            && tx.fields.get("DomainID").is_none()
+        {
+            return TxResult::InvalidFlag;
+        }
         if tx.tx_type != "OfferCreate" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("TakerPays").is_none() || tx.fields.get("TakerGets").is_none() {
             return TxResult::Malformed;
+        }
+        // Finding 302 (differential fuzz of #107009438, 38 mutants):
+        // tfImmediateOrCancel and tfFillOrKill together are malformed
+        // (CreateOffer.cpp:82-85) — we crossed as FoK and answered tecKILLED.
+        let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+        if flags & 0x0002_0000 != 0 && flags & 0x0004_0000 != 0 {
+            return TxResult::InvalidFlag;
         }
         TxResult::Success
     }
@@ -9222,6 +9535,14 @@ impl Transactor for OfferCreateTransactor {
                 }
             }
         }
+        // Finding 333 (CreateOffer.cpp:221-227): a DomainID names a domain the
+        // creator must belong to — owner, or holder of an accepted unexpired
+        // credential the domain lists — else tecNO_PERMISSION, judged LAST.
+        if let Some(d) = tx_domain(tx) {
+            if !crate::tx::misc::account_in_domain(sandbox, &tx.account, &d) {
+                return TxResult::NoPermission;
+            }
+        }
         TxResult::Success
     }
 
@@ -9254,6 +9575,12 @@ impl Transactor for OfferCreateTransactor {
         let sell = flags & 0x0008_0000 != 0;
         let ioc = flags & 0x0002_0000 != 0;
         let fok = flags & 0x0004_0000 != 0;
+        // Finding 302 (differential fuzz of #107009438, three mutants):
+        // tfImmediateOrCancel and tfFillOrKill together are malformed
+        // (CreateOffer.cpp:82-85) — we crossed as FoK and answered tecKILLED.
+        if ioc && fok {
+            return TxResult::InvalidFlag;
+        }
 
         // The kill-path snapshot is taken BEFORE the cancel-and-replace: the
         // cancellation is transactional state like any other, and a tec
@@ -9301,17 +9628,7 @@ impl Transactor for OfferCreateTransactor {
 
         // A DomainID (XLS-80) scopes both crossing and placement to the
         // domain's book.
-        let domain: Option<Hash256> = tx
-            .fields
-            .get("DomainID")
-            .and_then(|v| v.as_str())
-            .and_then(|s| hex::decode(s).ok())
-            .filter(|b| b.len() == 32)
-            .map(|b| {
-                let mut d = [0u8; 32];
-                d.copy_from_slice(&b);
-                Hash256(d)
-            });
+        let domain: Option<Hash256> = tx_domain(tx);
 
         // Cross against the inverse book while the maker's rate is within the
         // taker's limit price (threshold = quality with the sides swapped).
@@ -9590,7 +9907,24 @@ impl Transactor for OfferCreateTransactor {
         // reverted: it let those three plain-FoK offers succeed, and the
         // liquidity they wrongly consumed then starved this very transaction,
         // which is why the target stayed tecKILLED and the fix looked inert.
-        let filled = if sell { me_is_zero(rem_gets_cross) } else { me_is_zero(rem_pays) };
+        // Finding 336: a sell whose in-fold overshot the entry is NOT filled —
+        // rippled's remainingIn is a negative ulp, and only exact zero passes.
+        // Finding 336: a sell is filled when rippled's remainingIn — the gross
+        // sendMax, clamped to the balance, minus the iterations' gross in-fold
+        // — is EXACTLY zero; an ulp past the budget is tecPATH_PARTIAL.
+        let filled = if sell {
+            let budget = if underfunded { avail } else { send_max };
+            let fold = take_sell_in_fold();
+            if std::env::var("DX_FOK").is_ok() {
+                eprintln!("DX_FOK F336 fold={fold:?} budget={budget:?} underfunded={underfunded} avail={avail:?} send_max={send_max:?} rem_gets_cross={rem_gets_cross:?}");
+            }
+            match fold {
+                Some(fold) => me_cmp(fold, budget).is_eq(),
+                None => me_is_zero(rem_gets_cross),
+            }
+        } else {
+            me_is_zero(rem_pays)
+        };
         if fok && !filled {
             // FillOrKill not fully filled: nothing survives but the fee and
             // the stale-offer cleanup.
@@ -9684,7 +10018,19 @@ impl Transactor for OfferCreateTransactor {
                 a.as_ref().map(|x| x["OwnerCount"].clone()),
             );
         }
-        if underfunded && me_is_zero(rem_gets_cross) {
+        //
+        // Finding 305 (fuzz #54 off 107060755 B90D5364B3D9, TakerGets doubled
+        // to 1724548 CNY against a 95186.945 CNY line): 25 fills folded to
+        // 95186.94504322240 against an entry of ...241 — one ulp short — so
+        // the clamped remainder read 1e-11 instead of zero and the residual
+        // was rested (Offer + book page, OwnerCount 2 vs 1). rippled does not
+        // test the remainder at all: `takerInBalance = accountFunds(psb, ...)`
+        // is re-read AFTER crossing (flowCross :438-446) and `<= 0` clears
+        // both sides. The clamped remainder is not the test either way: fuzz
+        // #43 (5DA2F55D5276, same ledger) spent its budget to exactly zero
+        // while the line kept 1e-17 CNY, and libxrpl rested the residual.
+        // The account, read after crossing, is the only judge.
+        if me_is_zero(available(sandbox, &tx.account, &gets_leg)) {
             return TxResult::Success;
         }
 
@@ -9942,6 +10288,31 @@ impl Transactor for OfferCreateTransactor {
             );
             offer_obj["BookDirectory"] = serde_json::Value::String(hex::encode_upper(bdir.0));
             offer_obj["BookNode"] = serde_json::Value::String(format!("{book_node:x}"));
+            // Finding 334 (devnet 5419038 A4C673A49260, the campaign's
+            // tfHybrid offer): a hybrid domain offer is ALSO appended to the
+            // open book at the same rate — the page carries no DomainID — and
+            // records that entry in AdditionalBooks; the offer gains lsfHybrid
+            // (CreateOffer.cpp applyHybrid :536-580, :923-928).
+            if flags & 0x0010_0000 != 0 && domain.is_some() {
+                let base_open = keylet::book_base(&pays_leg.cur, &gets_leg.cur, &pays_leg.issuer, &gets_leg.issuer);
+                let bdir_open = keylet::book_dir_key(&base_open, q);
+                let open_extra = serde_json::json!({
+                    "ExchangeRate": format!("{:016x}", u64::from_be_bytes(bdir_open.0[24..32].try_into().unwrap_or([0u8;8]))),
+                    "TakerPaysCurrency": hex::encode(pays_leg.cur),
+                    "TakerPaysIssuer": hex::encode(pays_leg.issuer),
+                    "TakerGetsCurrency": hex::encode(gets_leg.cur),
+                    "TakerGetsIssuer": hex::encode(gets_leg.issuer),
+                });
+                let open_node = crate::ledger::directory::dir_insert_with(
+                    sandbox, &bdir_open, None, &offer_key, Some(&open_extra), true,
+                );
+                let f = offer_obj["Flags"].as_u64().unwrap_or(0) | 0x0004_0000; // lsfHybrid
+                offer_obj["Flags"] = serde_json::Value::from(f);
+                offer_obj["AdditionalBooks"] = serde_json::json!([{"Book": {
+                    "BookDirectory": hex::encode_upper(bdir_open.0),
+                    "BookNode": format!("{open_node:x}"),
+                }}]);
+            }
         }
         if let Some(e) = tx.fields.get("Expiration") {
             offer_obj["Expiration"] = e.clone();
@@ -9963,7 +10334,7 @@ impl Transactor for OfferCancelTransactor {
         if tx.tx_type != "OfferCancel" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("OfferSequence").is_none() {
@@ -9974,8 +10345,18 @@ impl Transactor for OfferCancelTransactor {
 
     fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
         let acct_key = keylet::account_root_key(&tx.account);
-        if !sandbox.exists(&acct_key) {
+        let Some(acct) = json_at(sandbox, &acct_key) else {
             return TxResult::NoAccount;
+        };
+        // Finding 315 (fuzz offersequence:+1 on 107060755 5A6E343D5827):
+        // CancelOffer::preclaim — the account's Sequence must be past the
+        // OfferSequence, `if ((*sle)[sfSequence] <= offerSequence) return
+        // temBAD_SEQUENCE` (CancelOffer.cpp:52-56).
+        let acct_seq = acct["Sequence"].as_u64().unwrap_or(0);
+        if let Some(os) = tx.fields.get("OfferSequence").and_then(|s| s.as_u64()) {
+            if acct_seq <= os {
+                return TxResult::BadSequence;
+            }
         }
         TxResult::Success
     }
@@ -10014,6 +10395,9 @@ impl Transactor for OfferCancelTransactor {
             crate::ledger::directory::owner_dir_remove(sandbox, &tx.account, &offer_key, owner_node, false);
             if let Some(bd) = book_dir {
                 crate::ledger::directory::dir_remove(sandbox, &bd, &offer_key, book_node, false);
+            }
+            if let Some(o) = offer.as_ref() {
+                remove_additional_books(sandbox, &offer_key, o); // finding 334
             }
 
             // Decrement OwnerCount
@@ -10186,6 +10570,38 @@ mod tests {
         state
     }
 
+    /// Finding 333: an OfferCreate naming a domain the creator is not in is
+    /// tecNO_PERMISSION (CreateOffer.cpp:221-227); the domain owner passes.
+    #[test]
+    fn offer_create_preclaim_requires_the_creator_in_its_domain_finding_333() {
+        let taker = [0x41u8; 20];
+        let issuer = [0x42u8; 20];
+        let mut state = make_state_with_account(&taker, 1_000_000_000);
+        let iss = serde_json::json!({
+            "LedgerEntryType": "AccountRoot", "Account": hex::encode(issuer), "Balance": "1000000000",
+            "Sequence": 1, "OwnerCount": 0, "Flags": 0,
+        });
+        state.state_map.insert(keylet::account_root_key(&issuer), serde_json::to_vec(&iss).unwrap()).unwrap();
+        let dkey = Hash256([0x55u8; 32]);
+        let pd = serde_json::json!({
+            "LedgerEntryType": "PermissionedDomain", "Flags": 0, "Owner": hex::encode(taker), "Sequence": 1,
+            "AcceptedCredentials": [{"Credential": {"Issuer": hex::encode(issuer), "CredentialType": "AB"}}],
+        });
+        state.state_map.insert(dkey, serde_json::to_vec(&pd).unwrap()).unwrap();
+        let mk = |domain: [u8; 32]| TxFields {
+            account: taker, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 1, last_ledger_seq: None, ticket_seq: None,
+            fields: serde_json::json!({
+                "TakerGets": "1000000",
+                "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "1"},
+                "DomainID": hex::encode_upper(domain),
+            }),
+            inner_batch: false,
+        };
+        let sandbox = Sandbox::new(&state);
+        assert_eq!(OfferCreateTransactor.preclaim(&mk(dkey.0), &sandbox), TxResult::Success);
+        assert_eq!(OfferCreateTransactor.preclaim(&mk([0x56u8; 32]), &sandbox), TxResult::NoPermission);
+    }
+
     #[test]
     fn xrp_leg_never_takes_the_line_path_in_move_leg_gross() {
         // F75b: gross ≠ net on an XRP leg moves NET through the roots and
@@ -10226,6 +10642,7 @@ mod tests {
                 "TakerPays": {"currency": "USD", "issuer": hex::encode([0x02u8; 20]), "value": "10"},
                 "TakerGets": "1000000",
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.preflight(&tx), TxResult::Success);
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
@@ -10259,6 +10676,7 @@ mod tests {
                 "TakerPays": "1000000",
                 "TakerGets": {"currency": "USD", "issuer": hex::encode([0x02u8; 20]), "value": "10"},
             }),
+            inner_batch: false,
         };
         OfferCreateTransactor.do_apply(&create_tx, &mut sandbox);
 
@@ -10271,6 +10689,7 @@ mod tests {
             ticket_seq: None,
             last_ledger_seq: None,
             fields: serde_json::json!({"OfferSequence": 5}),
+            inner_batch: false,
         };
         assert_eq!(OfferCancelTransactor.do_apply(&cancel_tx, &mut sandbox), TxResult::Success);
 
@@ -10331,6 +10750,7 @@ mod tests {
                 "TakerGets": {"currency": "USD", "issuer": hex::encode([0x02u8; 20]), "value": "10"},
                 "Flags": 0x00020000u64, // tfImmediateOrCancel
             }),
+            inner_batch: false,
         };
         // Mainnet (ImmediateOfferKilled amendment): IoC that crosses nothing
         // is tecKILLED, and nothing is placed.
@@ -10366,6 +10786,7 @@ mod tests {
                 "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "5"},
                 "Flags": 0x000C_0000u64,
             }),
+            inner_batch: false,
         };
         // The probe runs preclaim first — it must agree on tecUNFUNDED_OFFER,
         // not the generic tecUNFUNDED.
@@ -10414,6 +10835,7 @@ mod tests {
                 "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
                 "TakerGets": "10000000",
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&maker_offer, &mut sandbox), TxResult::Success);
         let mods = sandbox.into_modifications();
@@ -10429,6 +10851,7 @@ mod tests {
                 "TakerPays": "1000000",
                 "Flags": 0x000C_0000u64,
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::UnfundedOffer);
         // Nothing crossed: maker's offer and taker's XRP untouched.
@@ -10487,6 +10910,7 @@ mod tests {
                 "TakerPays": "50000000",
                 "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&maker_offer, &mut sandbox), TxResult::Success);
         let mods = sandbox.into_modifications();
@@ -10503,6 +10927,7 @@ mod tests {
                 "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
                 "Flags": 0x0004_0000u64,
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Killed);
         // Killed rolls everything back: the maker's offer survives untouched
@@ -10555,6 +10980,7 @@ mod tests {
                 "TakerPays": "5878826",
                 "TakerGets": {"currency": "666", "issuer": hex::encode(issuer), "value": "22.928591"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&maker_offer, &mut sandbox), TxResult::Success);
         let mods = sandbox.into_modifications();
@@ -10573,6 +10999,7 @@ mod tests {
                 "TakerGets": "5878826",
                 "TakerPays": {"currency": "666", "issuer": hex::encode(issuer), "value": "22.928591"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
         // The maker's funds are exhausted so its offer is consumed, and the taker
@@ -10625,6 +11052,7 @@ mod tests {
                     "TakerPays": "50000000",
                     "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
                 }),
+                inner_batch: false,
             };
             assert_eq!(OfferCreateTransactor.do_apply(&maker_offer, &mut sandbox), TxResult::Success);
             let mods = sandbox.into_modifications();
@@ -10639,6 +11067,7 @@ mod tests {
                 "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
                 "Flags": flags,
             }),
+            inner_batch: false,
         };
 
         // Non-passive at the maker's exact rate: crosses and consumes it.
@@ -10698,6 +11127,7 @@ mod tests {
                 "TakerPays": "10000000",
                 "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&maker_offer, &mut sandbox), TxResult::Success);
         assert!(sandbox.exists(&keylet::offer_key(&maker, 2)), "maker offer placed");
@@ -10715,6 +11145,7 @@ mod tests {
                 "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "5"},
                 "Flags": 0x000C_0000u64, // tfSell | tfFillOrKill
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
@@ -10853,6 +11284,7 @@ mod tests {
                 "TakerPays": {"currency": "STX", "issuer": hex::encode(issuer), "value": "813087.72688567"},
                 "TakerGets": "8539920",
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
@@ -10908,6 +11340,7 @@ mod tests {
                 "TakerPays": "1000000",
                 "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "10"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::UnfundedOffer);
         assert!(!sandbox.exists(&keylet::offer_key(&acct, 5)), "and nothing is placed");
@@ -10983,6 +11416,7 @@ mod tests {
                 account: who, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
                 ticket_seq: None, last_ledger_seq: None,
                 fields: serde_json::json!({"TakerPays": pays, "TakerGets": gets}),
+                inner_batch: false,
             };
             assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
             let mods = sandbox.into_modifications();
@@ -10999,6 +11433,7 @@ mod tests {
                 "TakerGets": {"currency": "AAA", "issuer": hex::encode(iss_a), "value": "10"},
                 "TakerPays": {"currency": "BBB", "issuer": hex::encode(iss_b), "value": "100"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
         // Leg A's book maker is untouched: the pool priced and filled the leg.
@@ -11098,6 +11533,7 @@ mod tests {
                 account: who, tx_type: "OfferCreate".to_string(), fee: 12, sequence: seq,
                 ticket_seq: None, last_ledger_seq: None,
                 fields: serde_json::json!({"TakerPays": pays, "TakerGets": gets}),
+                inner_batch: false,
             };
             assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
             let mods = sandbox.into_modifications();
@@ -11115,6 +11551,7 @@ mod tests {
                 "TakerGets": {"currency": "AAA", "issuer": hex::encode(iss_a), "value": "10"},
                 "TakerPays": {"currency": "BBB", "issuer": hex::encode(iss_b), "value": "100"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
@@ -11209,6 +11646,7 @@ mod tests {
                     "TakerGets": gets,
                     "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": pays},
                 }),
+                inner_batch: false,
             };
             assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
             let mods = sandbox.into_modifications();
@@ -11224,6 +11662,7 @@ mod tests {
                 "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "61"},
                 "TakerPays": "709289",
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
@@ -11316,6 +11755,7 @@ mod tests {
                 account: who, tx_type: "OfferCreate".to_string(), fee: 12, sequence: 2,
                 ticket_seq: None, last_ledger_seq: None,
                 fields: serde_json::json!({"TakerPays": pays, "TakerGets": gets}),
+                inner_batch: false,
             };
             assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
             let mods = sandbox.into_modifications();
@@ -11332,6 +11772,7 @@ mod tests {
                 "TakerGets": {"currency": "AAA", "issuer": hex::encode(iss_a), "value": "99.5"},
                 "TakerPays": {"currency": "BBB", "issuer": hex::encode(iss_b), "value": "100"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
@@ -11411,6 +11852,7 @@ mod tests {
                 "TakerPays": "100000000",
                 "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&mk, &mut sandbox), TxResult::Success);
         let mods = sandbox.into_modifications();
@@ -11460,6 +11902,7 @@ mod tests {
                 "TakerGets": "90000000",
                 "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
@@ -11553,6 +11996,7 @@ mod tests {
                 account: who, tx_type: "OfferCreate".to_string(), fee: 12, sequence: seq,
                 ticket_seq: None, last_ledger_seq: None,
                 fields: serde_json::json!({"TakerPays": pays, "TakerGets": gets}),
+                inner_batch: false,
             };
             assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
             let mods = sandbox.into_modifications();
@@ -11568,6 +12012,7 @@ mod tests {
                 "TakerGets": {"currency": "AAA", "issuer": hex::encode(iss_a), "value": "10"},
                 "TakerPays": {"currency": "BBB", "issuer": hex::encode(iss_b), "value": "5"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
@@ -11643,6 +12088,7 @@ mod tests {
                     "TakerPays": {"currency":"AAA","issuer":hex::encode(iss_a),"value":"1"},
                     "TakerGets": "1000000",
                 }),
+                inner_batch: false,
             };
             assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
             let mods = sandbox.into_modifications();
@@ -11662,6 +12108,7 @@ mod tests {
                 "TakerGets": {"currency": "AAA", "issuer": hex::encode(iss_a), "value": "10"},
                 "TakerPays": {"currency": "BBB", "issuer": hex::encode(iss_b), "value": "100"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
@@ -11724,6 +12171,7 @@ mod tests {
                 "TakerPays": "1000000",
                 "TakerGets": {"currency": "WETH", "issuer": hex::encode(issuer), "value": "0.00059094"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
@@ -11782,6 +12230,7 @@ mod tests {
                 "TakerPays": "100000000",
                 "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&maker_offer, &mut sandbox), TxResult::Success);
         let mods = sandbox.into_modifications();
@@ -11929,6 +12378,7 @@ mod tests {
                 "TakerGets": "100000000",
                 "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&own, &mut sandbox), TxResult::Success);
         let mods = sandbox.into_modifications();
@@ -12022,6 +12472,7 @@ mod tests {
                 "TakerPays": "100000000",
                 "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&own, &mut sandbox), TxResult::Success);
         let mods = sandbox.into_modifications();
@@ -12104,6 +12555,7 @@ mod tests {
                     "TakerPays": pays,
                     "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
                 }),
+                inner_batch: false,
             };
             assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
             let mods = sandbox.into_modifications();
@@ -12242,6 +12694,7 @@ mod tests {
                     "TakerPays": pays,
                     "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
                 }),
+                inner_batch: false,
             };
             assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
             let mods = sandbox.into_modifications();
@@ -12356,6 +12809,7 @@ mod tests {
                 "TakerPays": "50000000",
                 "TakerGets": {"currency": "USD", "issuer": hex::encode(issuer), "value": "100"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&maker_offer, &mut sandbox), TxResult::Success);
         let mods = sandbox.into_modifications();
@@ -12372,6 +12826,7 @@ mod tests {
                 "TakerGets": "5000000",
                 "TakerPays": {"currency": "USD", "issuer": hex::encode(issuer), "value": "9"},
             }),
+            inner_batch: false,
         };
         assert_eq!(OfferCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
@@ -12459,6 +12914,7 @@ mod tests {
         TxFields {
             account: *who, tx_type: "OfferCreate".to_string(), fee: 12, sequence: seq,
             ticket_seq: None, last_ledger_seq: None, fields,
+            inner_batch: false,
         }
     }
 

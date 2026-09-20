@@ -150,7 +150,7 @@ macro_rules! xchain_preflight {
         if $tx.tx_type != $name {
             return TxResult::Malformed;
         }
-        if $tx.fee == 0 {
+        if $tx.fee_missing() {
             return TxResult::BadFee;
         }
         if $tx.fields.get("XChainBridge").is_none() {

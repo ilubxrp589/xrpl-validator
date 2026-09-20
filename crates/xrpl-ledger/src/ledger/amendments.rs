@@ -32,6 +32,18 @@ pub fn fix_cleanup_3_3_0(sandbox: &Sandbox) -> bool {
     enabled(sandbox, FIX_CLEANUP_3_3_0)
 }
 
+/// fixCleanup3_4_0 — in the 3.4.0 release (the vendored libxrpl snapshot
+/// predates it): MPT escrow fee floors the delivery (EscrowHelpers.h),
+/// plus OfferStream, CredentialHelpers, AMMBid/AMMClawback, Sign, apply and
+/// the invariants. Not enabled on mainnet as of 2026-09-18 (no majority);
+/// enabled on devnet.
+pub const FIX_CLEANUP_3_4_0: &str =
+    "98433DD001A5737F773D74F8CA2A25A065089C73B2E611C760BAF369E4FECA76";
+
+pub fn fix_cleanup_3_4_0(sandbox: &Sandbox) -> bool {
+    enabled(sandbox, FIX_CLEANUP_3_4_0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

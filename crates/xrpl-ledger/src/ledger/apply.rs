@@ -344,6 +344,7 @@ mod tests {
                 "Destination": hex::encode(dest),
                 "Amount": amount.to_string(),
             }),
+            inner_batch: false,
         }
     }
 
@@ -451,6 +452,7 @@ mod tests {
             last_ledger_seq: None,
             ticket_seq: None,
             fields: serde_json::json!({}),
+            inner_batch: false,
         };
 
         let (new_state, results) = apply_transaction_set(

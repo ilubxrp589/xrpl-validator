@@ -70,6 +70,20 @@ thread_local! {
 pub(crate) fn mark_in_limited() {
     IN_LIMITED.with(|c| c.set(true));
 }
+// Finding 339: the pool WON this iteration's turn (its anchored offer was
+// the tip) and the sized slice was then "Path rejected by limitQuality"
+// (StrandFlow.h:721-732). rippled's iteration yields no best path and the
+// flow BREAKS — the CLOB offer behind the pool is never reached, this
+// iteration or later. The walker reads this after a declined turn and ends.
+thread_local! {
+    static TURN_REJECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+pub(crate) fn mark_turn_rejected() {
+    TURN_REJECTED.with(|c| c.set(true));
+}
+pub(crate) fn take_turn_rejected() -> bool {
+    TURN_REJECTED.with(|c| c.replace(false))
+}
 pub(crate) fn take_in_limited() -> bool {
     IN_LIMITED.with(|c| c.replace(false))
 }
@@ -195,6 +209,21 @@ pub(crate) fn amm_ctx_reset() {
     // Finding 134: the remembered owner counts live only inside a flow.
     ox::owner_count_epoch_start();
 }
+
+/// Every thread-local of the pool walk, cleared (see `offer::thread_state_reset`).
+pub(crate) fn thread_state_reset() {
+    TURN_REJECTED.with(|c| c.set(false));
+    FWD_EXCESS.with(|c| c.set((0, 0)));
+    IN_LIMITED.with(|c| c.set(false));
+    REM_OUT_TRIMMED.with(|c| c.set(false));
+    FWD_GROSS_IN.with(|c| c.set(None));
+    FWD_FIRST.with(|c| c.set(false));
+    SENDER_HOP.with(|c| c.set(false));
+    FLOW_FUNDS_BOUND.with(|c| c.set(false));
+    POOL_OFFER_AT_TIP.with(|c| c.set(false));
+    AMM_USE_SEQ.with(|c| c.set(0));
+    amm_ctx_reset();
+}
 pub(crate) fn amm_ctx_iters() -> u32 {
     AMM_CTX.with(|c| c.get().0)
 }
@@ -221,6 +250,17 @@ pub(crate) fn amm_ctx_mark_used() {
         let (i, _, o) = c.get();
         c.set((i, true, o));
     });
+    AMM_USE_SEQ.with(|c| c.set(c.get().wrapping_add(1)));
+}
+
+thread_local! {
+    /// Counts every pool consumption on this thread. The `used` flag above
+    /// is strand-wide; a hop that needs to know whether ITS OWN walk took
+    /// the pool compares this before and after (finding 311).
+    static AMM_USE_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+pub(crate) fn amm_use_seq() -> u64 {
+    AMM_USE_SEQ.with(|c| c.get())
 }
 /// `ammContext.update()` — once per winning driver iteration.
 pub(crate) fn amm_ctx_update() {
@@ -1301,7 +1341,7 @@ pub(crate) fn spot_quality(sandbox: &Sandbox, amm: &Amm, pays_leg: &Leg, gets_le
 
 /// The quality of the offer `AMMLiquidity::getOffer` generates against the
 /// LOB tip `clob` (AMMLiquidity.cpp:184-222): None when the pool cannot beat
-/// the tip — fee-inclusive spot not strictly better, or within 1e-7 of it —
+/// the tip — RAW spot (no fee) not strictly better, or within 1e-7 of it —
 /// else `changeSpotPriceQuality`'s offer (fixAMMv1_2: maxOffer when that
 /// fails and still beats the book), as `rate_of(in, out)` in the walk's
 /// encoding (lower is better). This is the quality `tip()` hands
@@ -1329,8 +1369,10 @@ pub(crate) fn anchored_offer_quality(
     if pool_in.0 == 0 || pool_out.0 == 0 || clob == 0 {
         return None;
     }
-    let omf = n_sub(N_ONE, fee_n(amm.tfee), Rnd::Near);
-    let spot = rate_of(pool_in, n_mul(pool_out, omf, Rnd::Near));
+    // Finding 297: the stand-aside test is on `Quality{balances}` — the
+    // RAW pool quality, no trading fee (AMMLiquidity.cpp:181-183); the fee
+    // enters only in the offer `changeSpotPriceQuality` then generates.
+    let spot = rate_of(pool_in, pool_out);
     if spot == 0 || spot >= clob {
         return None;
     }
@@ -1377,6 +1419,57 @@ pub(crate) fn holds_for_offer(sandbox: &Sandbox, acct: &[u8; 20], leg: &Leg) -> 
     holds(sandbox, acct, leg)
 }
 
+/// Finding 298's first gate on its own: `AMMLiquidity::getOffer` answers
+/// "higher clob quality" when the pool's RAW spot (no fee) is not strictly
+/// better than its own book's tip, or sits within 1e-7 of it
+/// (AMMLiquidity.cpp:181-196). An empty pool side stands aside too.
+pub(crate) fn fib_spot_stands_aside(
+    sandbox: &Sandbox,
+    amm: &Amm,
+    clob_tip: Option<Me>,
+    pays_leg: &Leg,
+    gets_leg: &Leg,
+    iters: u32,
+) -> bool {
+    let Some(tip) = clob_tip else { return false };
+    let pool_in = holds_for_offer(sandbox, &amm.account, gets_leg);
+    let pool_out = holds_for_offer(sandbox, &amm.account, pays_leg);
+    if pool_in.0 == 0 || pool_out.0 == 0 {
+        return true;
+    }
+    let raw = rate_of_me_pair(pool_in, pool_out);
+    let stands_aside = n_cmp(raw, tip) != Ordering::Less
+        || n_cmp(n_div(n_sub(tip, raw, Rnd::Near), tip, Rnd::Near), (LO, -22)) == Ordering::Less;
+    if std::env::var("DX_AMM").is_ok() {
+        eprintln!("DX_AMM fib gate iter={iters} raw_spot={raw:?} tip={tip:?} stands_aside={stands_aside}");
+    }
+    stands_aside
+}
+
+/// Finding 306: would the pool's Fibonacci offer be refused by ITS OWN tip,
+/// whatever any rival strand's bound says? Both of finding 298's gates —
+/// the raw spot against the tip, and the slice itself against the tip
+/// (`Quality{amounts} < clobQuality` → nullopt). A strand whose pool is
+/// refused this way ran and produced nothing on its own account, and rippled
+/// drops it from the next iteration (StrandFlow.h: only a strand that flowed
+/// is pushed back) — it is NOT the "refused only by a rival's bound" case
+/// that finding 211 re-runs and finding 215 spares.
+pub(crate) fn fib_refused_by_own_tip(
+    sandbox: &Sandbox,
+    amm: &Amm,
+    clob_tip: Option<Me>,
+    slice: (Me, Me),
+    pays_leg: &Leg,
+    gets_leg: &Leg,
+    iters: u32,
+) -> bool {
+    let Some(tip) = clob_tip else { return false };
+    if fib_spot_stands_aside(sandbox, amm, clob_tip, pays_leg, gets_leg, iters) {
+        return true;
+    }
+    n_cmp(rate_of_me_pair(slice.0, slice.1), tip) == Ordering::Greater
+}
+
 /// One MULTI-PATH AMM turn (rippled generateFibSeqOffer): with more than one
 /// strand (every IOU↔IOU crossing bridges), the pool competes as a CLOB-like
 /// offer sized by the Fibonacci sequence off the pool balances at the START
@@ -1416,6 +1509,7 @@ pub(crate) fn consume_fib(
     // AMM offer pays no such fee" — BookStep.cpp:737-739, the discount
     // calibration).
     in_gross_rate: Option<u64>,
+    clob_tip: Option<Me>,
 ) -> (Me, Me, bool) {
     if amm_ctx_exhausted() {
         return (rem_pays, rem_gets, false);
@@ -1430,10 +1524,30 @@ pub(crate) fn consume_fib(
     if ox::me_is_zero(rem_gets) || (!sell && ox::me_is_zero(rem_pays)) {
         return (rem_pays, rem_gets, false);
     }
+    // Finding 298 (#107060755 F43C3C4DA037, rsdsSA7's ASC→PLR tfSell offer
+    // over a direct pool and a two-pool XRP bridge): `AMMLiquidity::getOffer`
+    // is gated by ITS OWN book's tip whatever the ranking says
+    // (AMMLiquidity.cpp:181-196) — the RAW pool quality (no fee) must beat
+    // the tip and not sit within 1e-7 of it, and the Fibonacci offer itself
+    // must not be worse than the tip. The tip is the stream's, the taker's
+    // own offer included: 4CF7660E at 1.401935 priced the direct book while
+    // the pool's raw spot slid from 1.3939 to 1.40353 over five slices, so
+    // rippled's sixth call answered "higher clob quality", the direct strand
+    // ran dry on the self-offer and the bridge took the iteration (4590.39
+    // ASC through both pools). We kept slicing the direct pool (seven
+    // slices, 70.9 ASC) and never flowed the bridge.
+    if fib_spot_stands_aside(sandbox, amm, clob_tip, pays_leg, gets_leg, iters) {
+        return (rem_pays, rem_gets, false);
+    }
     let Some((s_in, s_out)) = fib_slice(sandbox, amm, init, iters, pays_leg, gets_leg) else {
         return (rem_pays, rem_gets, false);
     };
     let q = rate_of_me_pair(s_in, s_out);
+    if let Some(tip) = clob_tip {
+        if n_cmp(q, tip) == Ordering::Greater {
+            return (rem_pays, rem_gets, false); // `Quality{amounts} < clobQuality` → nullopt
+        }
+    }
     if std::env::var("DX_AMM").is_ok() {
         eprintln!("DX_AMM fib iter={iters} q={q:?} best_book={best_book:?} thr={threshold:x} slice=({s_in:?},{s_out:?})");
     }
@@ -1822,8 +1936,14 @@ pub(crate) fn anchored_slice(
     if pool_in.0 == 0 || pool_out.0 == 0 {
         return None;
     }
-    let omf_spot = n_sub(N_ONE, fee_n(amm.tfee), Rnd::Near);
-    let spot = rate_of(pool_in, n_mul(pool_out, omf_spot, Rnd::Near));
+    // Finding 297 (#107056200 BD9C7473B84F): the stand-aside test is on
+    // `Quality{balances}` — the RAW pool quality, no trading fee
+    // (AMMLiquidity.cpp:181-183). rhTsmUJ's 6 XRP partial self-payment
+    // met a 0.506% pool whose fee-inclusive spot sat 5.5e-8 inside the
+    // tip, and the gate here let the tip take all 6 XRP; mainnet's raw
+    // spot is 0.5% better, the pool generates its 52-drop anchored slice,
+    // and the tip fills the other 5999948.
+    let spot = rate_of(pool_in, pool_out);
     if spot == 0 || spot >= clob {
         return None;
     }
@@ -2043,10 +2163,13 @@ pub(crate) fn consume(
     // AMM participates only when strictly better than the CLOB and not
     // within 1e-7 relative distance of it (AMMLiquidity::getOffer).
     if let Some(qb) = clob {
-        if spot >= qb {
+        // Finding 297: judged on the RAW pool quality (no fee) — see
+        // `anchored_slice`.
+        let spot_raw = rate_of(pool_in, pool_out);
+        if spot_raw == 0 || spot_raw >= qb {
             return (rem_pays, rem_gets, false);
         }
-        let (rs, rb) = (decode_rate(spot), decode_rate(qb));
+        let (rs, rb) = (decode_rate(spot_raw), decode_rate(qb));
         let dist = n_div(n_sub(rb, rs, Rnd::Near), rb, Rnd::Near);
         if n_cmp(dist, (LO, -22)) == Ordering::Less {
             return (rem_pays, rem_gets, false); // within 1e-7
@@ -2118,7 +2241,14 @@ pub(crate) fn consume(
         take_out = rem_pays;
         match swap_asset_out(pool_in, pool_out, take_out, amm.tfee, gets_leg.xrp) {
             Some(i) => take_in = i,
-            None => return (rem_pays, rem_gets, false),
+            None => {
+                // Finding 341: the pool took the iteration (getOffer created
+                // its offer) and the re-swap for the want yields nothing —
+                // rippled's strand is dry and flow() ends; the CLOB behind
+                // the pool is never reached.
+                mark_turn_rejected();
+                return (rem_pays, rem_gets, false);
+            }
         }
         // Finding 131 (#106734485 83E5899A): rippled's forward pass drives a
         // BookStep by its INPUT — `fwdImp` hands `limitStepIn` the whole
@@ -2333,11 +2463,28 @@ pub(crate) fn consume(
                 if std::env::var("DX_AMM").is_ok() {
                     eprintln!("DX_AMM limit reject q={q:?} thr={thr_me:?} adjusted={adjusted}");
                 }
+                // Finding 339 (#107080701 8EB3E8F0B045, rPztkopz IoC buying
+                // 436 drops for 0.000619 RLUSD): iteration 1 took 435 drops
+                // off the tip; iteration 2's tryAMM anchored the pool on the
+                // next tip (quality tie → the AMM offer is the source), the
+                // one-drop slice cost 1.4209e-6 against a 1.4197e-6 limit,
+                // "Path rejected by limitQuality", "Total flow: out 435".
+                // We stepped onto that tip and filled the drop (10 muts v 7).
+                mark_turn_rejected();
                 return (rem_pays, rem_gets, false);
             }
         }
     }
     if take_in.0 == 0 || take_out.0 == 0 {
+        // Finding 341 (#107093372 BE1B5D257244, rogue5Hn 12.814 XAH →
+        // 0.19223 RLUSD, tfPartialPayment): iteration 2's tryAMM anchored the
+        // pool on the next tip (150 XAH/RLUSD; the pool's 68 beats it) and
+        // the forward pass swapped the 1.55e-12 XAH remainder for NOTHING
+        // — "Non-limiting step found dry", "All strands dry", Total flow =
+        // iteration 1. We declined the zero slice and filled the remainder
+        // from the tip behind the pool, crediting a line mainnet never
+        // touched (10 muts v 9). The pool took the iteration: the walk ends.
+        mark_turn_rejected();
         return (rem_pays, rem_gets, false);
     }
     // Finding 131: an input-clamped fill's output beyond the want is the

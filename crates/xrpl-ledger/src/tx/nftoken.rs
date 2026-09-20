@@ -196,7 +196,7 @@ impl Transactor for NFTokenMintTransactor {
         if tx.tx_type != "NFTokenMint" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("NFTokenTaxon").is_none() {
@@ -440,7 +440,7 @@ impl Transactor for NFTokenBurnTransactor {
         if tx.tx_type != "NFTokenBurn" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("NFTokenID").is_none() {
@@ -547,11 +547,28 @@ impl Transactor for NFTokenCreateOfferTransactor {
         if tx.tx_type != "NFTokenCreateOffer" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("NFTokenID").is_none() || tx.fields.get("Amount").is_none() {
             return TxResult::Malformed;
+        }
+        // Findings 325/326 (testnet 20864086 fuzz destination:self, 20864090
+        // flag:sellnftoken): tokenOfferCreatePreflight — a Destination equal
+        // to the account, a sell offer carrying Owner, or a buy offer without
+        // Owner (or with Owner == account) is temMALFORMED.
+        let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+        let is_sell = flags & 0x0000_0001 != 0;
+        let acct_hex = hex::encode(tx.account);
+        let same = |v: &serde_json::Value| v.as_str().is_some_and(|s| s.eq_ignore_ascii_case(&acct_hex));
+        if tx.fields.get("Destination").is_some_and(same) {
+            return TxResult::Malformed;
+        }
+        match tx.fields.get("Owner") {
+            Some(_) if is_sell => return TxResult::Malformed,
+            Some(o) if same(o) => return TxResult::Malformed,
+            None if !is_sell => return TxResult::Malformed,
+            _ => {}
         }
         TxResult::Success
     }
@@ -792,11 +809,27 @@ fn nft_amount_sub(a: &serde_json::Value, b: &serde_json::Value) -> Option<serde_
 /// offer. For XRP that resolves to `accountHolds`, i.e. the balance less the
 /// account's reserve at its current OwnerCount.
 ///
-/// ⚠ IOU-priced offers return FALSE — not "funded", but "not judged here".
-/// `do_apply` still does not move value over trust lines for them (see its own
-/// note), so inventing a funds verdict would swap one wrong result code for
-/// another. When IOU settlement lands, this is the first thing to revisit.
+/// IOU prices are judged through `available` (finding 309); XRP prices
+/// against the balance past the reserve.
 fn nft_funds_short(sandbox: &Sandbox, payer: &[u8; 20], amount: &serde_json::Value) -> bool {
+    // Finding 309 (#107063938 EBF238024D19, rnyJvF5 accepting rDnNmaX1's
+    // 337.002 xSPECTAR buy offer): rippled's preclaim reads the buyer's
+    // funds through `accountFunds(view, owner, needed, fhZERO_IF_FROZEN)`
+    // for EVERY currency (NFTokenAcceptOffer.cpp:212-218, fixNonFungible-
+    // TokensV1_2) — an issuer buying with its own IOU is unbounded, a
+    // frozen holder has nothing, anyone else has the line balance. The
+    // buyer held 0.3373 of the 337.002: mainnet tecINSUFFICIENT_FUNDS,
+    // we accepted (IOU prices were "not judged here").
+    if amount.is_object() {
+        use crate::tx::offer as ox;
+        let (Some(leg), Some(needed)) = (ox::leg_of(amount), keylet::amount_mant_exp(amount)) else {
+            return false;
+        };
+        if payer == &leg.issuer {
+            return false;
+        }
+        return ox::me_cmp(ox::available(sandbox, payer, &leg), needed).is_lt();
+    }
     let Some(needed) = amount.as_str().and_then(|s| s.parse::<u64>().ok()) else {
         return false;
     };
@@ -1024,13 +1057,32 @@ impl Transactor for NFTokenAcceptOfferTransactor {
         if tx.tx_type != "NFTokenAcceptOffer" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("NFTokenSellOffer").is_none()
             && tx.fields.get("NFTokenBuyOffer").is_none()
         {
             return TxResult::Malformed;
+        }
+        // Finding 328 (fuzz nftokenbuyoffer:drop / nftokenselloffer:drop on
+        // 107075103 F2704F9A1074): a broker fee needs BOTH offers and must be
+        // positive (NFTokenAcceptOffer.cpp:47-55).
+        if let Some(bf) = tx.fields.get("NFTokenBrokerFee") {
+            if tx.fields.get("NFTokenSellOffer").is_none() || tx.fields.get("NFTokenBuyOffer").is_none() {
+                return TxResult::Malformed;
+            }
+            let positive = match bf {
+                serde_json::Value::String(d) => d.parse::<u64>().map(|v| v > 0).unwrap_or(false),
+                serde_json::Value::Object(_) => {
+                    keylet::amount_mant_exp(bf).is_some_and(|m| m.0 != 0)
+                        && !bf.get("value").and_then(|v| v.as_str()).is_some_and(|v| v.starts_with('-'))
+                }
+                _ => false,
+            };
+            if !positive {
+                return TxResult::Malformed;
+            }
         }
         TxResult::Success
     }
@@ -1462,7 +1514,7 @@ impl Transactor for NFTokenCancelOfferTransactor {
         if tx.tx_type != "NFTokenCancelOffer" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("NFTokenOffers").is_none() {
@@ -1554,7 +1606,7 @@ impl Transactor for NFTokenModifyTransactor {
         if tx.tx_type != "NFTokenModify" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("NFTokenID").is_none() {
@@ -1690,6 +1742,7 @@ mod tests {
             ticket_seq: None,
             last_ledger_seq: None,
             fields: serde_json::json!({ "NFTokenTaxon": taxon, "Flags": 8 }),
+            inner_batch: false,
         }
     }
 
@@ -1732,6 +1785,7 @@ mod tests {
                 "NFTokenID": id, "Amount": "1000000",
                 "Owner": hex::encode(owner), "Flags": 0,
             }),
+            inner_batch: false,
         };
         // Nothing else about the offer changes — only the owner's opt-out.
         assert_eq!(
@@ -1847,6 +1901,7 @@ mod tests {
             fields: serde_json::json!({
                 "NFTokenSellOffer": hex::encode_upper(offer_key.0),
             }),
+            inner_batch: false,
         };
         assert_eq!(
             NFTokenAcceptOfferTransactor.do_apply(&accept, &mut sb),
@@ -1887,6 +1942,7 @@ mod tests {
             fields: serde_json::json!({
                 "NFTokenOffers": [hex::encode_upper(offer_key.0)],
             }),
+            inner_batch: false,
         };
         assert_eq!(
             NFTokenCancelOfferTransactor.do_apply(&cancel, &mut sb),
@@ -1914,6 +1970,7 @@ mod tests {
             ticket_seq: None,
             last_ledger_seq: None,
             fields: serde_json::json!({ "NFTokenID": id_hex, "URI": "697066733A2F2F78" }),
+            inner_batch: false,
         };
         assert_eq!(
             NFTokenModifyTransactor.do_apply(&modify, &mut sb),

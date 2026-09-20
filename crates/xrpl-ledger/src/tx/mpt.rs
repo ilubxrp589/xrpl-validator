@@ -43,13 +43,13 @@ pub fn parse_mpt_amount(v: &serde_json::Value) -> Option<([u8; 24], u64)> {
     Some((id, val))
 }
 
-fn json_at(sandbox: &Sandbox, key: &Hash256) -> Option<serde_json::Value> {
+pub(crate) fn json_at(sandbox: &Sandbox, key: &Hash256) -> Option<serde_json::Value> {
     sandbox.read(key).and_then(|d| serde_json::from_slice(&d).ok())
 }
 
 /// Read a u64 ledger field serialized as a DECIMAL string ("281380138") —
 /// the MPT amount family — treating an absent field as zero (SoeDefault).
-fn dec_field(obj: &serde_json::Value, f: &str) -> u64 {
+pub(crate) fn dec_field(obj: &serde_json::Value, f: &str) -> u64 {
     match obj.get(f) {
         Some(serde_json::Value::String(s)) => s.parse::<u64>().unwrap_or(0),
         Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(0),
@@ -60,7 +60,7 @@ fn dec_field(obj: &serde_json::Value, f: &str) -> u64 {
 /// Write a decimal-string u64 field honoring its Soe class: `required` fields
 /// always carry the value; default fields are REMOVED at zero (rippled omits
 /// a defaulted STUInt64 from the serialization, so it never reaches JSON).
-fn set_dec_field(obj: &mut serde_json::Value, f: &str, v: u64, required: bool) {
+pub(crate) fn set_dec_field(obj: &mut serde_json::Value, f: &str, v: u64, required: bool) {
     if v == 0 && !required {
         if let Some(o) = obj.as_object_mut() {
             o.remove(f);
@@ -71,7 +71,7 @@ fn set_dec_field(obj: &mut serde_json::Value, f: &str, v: u64, required: bool) {
 }
 
 /// The issuance's Issuer account, decoded from either address form.
-fn issuance_issuer(issuance: &serde_json::Value) -> Option<[u8; 20]> {
+pub(crate) fn issuance_issuer(issuance: &serde_json::Value) -> Option<[u8; 20]> {
     issuance.get("Issuer").and_then(|v| v.as_str()).and_then(crate::tx::offer::decode20)
 }
 
@@ -103,7 +103,7 @@ pub fn require_auth(
 
 /// `isAnyFrozen` for MPT: issuance lsfMPTLocked, or either party's MPToken
 /// lsfMPTLocked. (Vault pseudo-account freeze recursion unported.)
-fn any_frozen(
+pub(crate) fn any_frozen(
     sandbox: &Sandbox,
     issuance_key: &Hash256,
     issuance: &serde_json::Value,
@@ -118,6 +118,152 @@ fn any_frozen(
             .map(|f| f & LSF_MPT_LOCKED != 0)
             .unwrap_or(false)
     })
+}
+
+pub const LSF_MPT_CAN_ESCROW: u64 = 0x0000_0008;
+
+/// `requireAuth(view, mptIssue, account, AuthType::WeakAuth)` (View.cpp):
+/// the issuer is always authorized; a WEAK check lets an account WITHOUT an
+/// MPToken through unless the issuance carries lsfMPTRequireAuth, in which
+/// case a missing or unauthorized token is tecNO_AUTH. The DomainID
+/// credential branch and the vault recursion are unported (no specimen).
+pub(crate) fn require_auth_weak(
+    sandbox: &Sandbox,
+    issuance_key: &Hash256,
+    issuance: &serde_json::Value,
+    account: &[u8; 20],
+) -> Option<TxResult> {
+    let issuer = issuance_issuer(issuance)?;
+    if issuer == *account {
+        return None;
+    }
+    let iflags = issuance.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+    if iflags & LSF_MPT_REQUIRE_AUTH == 0 {
+        return None;
+    }
+    let authorized = json_at(sandbox, &keylet::mptoken_key(issuance_key, account))
+        .and_then(|t| t.get("Flags").and_then(|f| f.as_u64()))
+        .map(|f| f & LSF_MPT_AUTHORIZED != 0)
+        .unwrap_or(false);
+    (!authorized).then_some(TxResult::NoAuth)
+}
+
+/// `canTransfer(view, mptIssue, from, to)`: without lsfMPTCanTransfer only
+/// issuer-adjacent moves are allowed (tecNO_AUTH otherwise).
+pub(crate) fn can_transfer(issuance: &serde_json::Value, from: &[u8; 20], to: &[u8; 20]) -> bool {
+    let Some(issuer) = issuance_issuer(issuance) else { return false };
+    issuance.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & LSF_MPT_CAN_TRANSFER != 0
+        || *from == issuer
+        || *to == issuer
+}
+
+/// `transferRate(view, MPTID)` (View.cpp:851): 1e9 + 10,000 × TransferFee
+/// when the issuance carries the field, parity otherwise.
+pub(crate) fn issuance_transfer_rate(issuance: &serde_json::Value) -> u64 {
+    match issuance.get("TransferFee") {
+        Some(_) => 1_000_000_000 + 10_000 * dec_field(issuance, "TransferFee"),
+        None => 1_000_000_000,
+    }
+}
+
+/// `MPTokenAuthorize::createMPToken(view, mptID, holder, 0)`: the bare
+/// holder object linked into the holder's owner directory. The caller
+/// adjusts the holder's OwnerCount (rippled's `adjustOwnerCount` follows).
+pub(crate) fn create_mptoken(sandbox: &mut Sandbox, issuance_key: &Hash256, mptid: &[u8; 24], holder: &[u8; 20]) {
+    let tkey = keylet::mptoken_key(issuance_key, holder);
+    let node = crate::ledger::directory::owner_dir_insert(sandbox, holder, &tkey);
+    let obj = serde_json::json!({
+        "LedgerEntryType": "MPToken",
+        "Account": hex::encode(holder),
+        "MPTokenIssuanceID": hex::encode_upper(mptid),
+        "Flags": 0,
+        "OwnerNode": format!("{node:x}"),
+    });
+    sandbox.write(tkey, serde_json::to_vec(&obj).unwrap_or_default());
+}
+
+/// `rippleLockEscrowMPT` (View.cpp:3674): the holder's MPTAmount drops by
+/// the escrowed value and its LockedAmount rises by it; the issuance's
+/// LockedAmount rises too, its OutstandingAmount untouched. Finding 332
+/// (devnet 5418986 161CF6C1, 100 units of 0052AF9C…: holder 500 → 400 +
+/// LockedAmount 100, issuance LockedAmount 100).
+pub(crate) fn lock_escrow(sandbox: &mut Sandbox, issuance_key: &Hash256, sender: &[u8; 20], amt: u64) -> TxResult {
+    let Some(mut issuance) = json_at(sandbox, issuance_key) else { return TxResult::ObjectNotFound };
+    if issuance_issuer(&issuance) == Some(*sender) {
+        return TxResult::Malformed; // tecINTERNAL
+    }
+    let tkey = keylet::mptoken_key(issuance_key, sender);
+    let Some(mut token) = json_at(sandbox, &tkey) else { return TxResult::ObjectNotFound };
+    let bal = dec_field(&token, "MPTAmount");
+    if bal < amt {
+        return TxResult::Malformed; // tecINTERNAL — preclaim judged the funds
+    }
+    set_dec_field(&mut token, "MPTAmount", bal - amt, false);
+    let tl = dec_field(&token, "LockedAmount") + amt;
+    set_dec_field(&mut token, "LockedAmount", tl, false);
+    sandbox.write(tkey, serde_json::to_vec(&token).unwrap_or_default());
+    let il = dec_field(&issuance, "LockedAmount") + amt;
+    set_dec_field(&mut issuance, "LockedAmount", il, false);
+    sandbox.write(*issuance_key, serde_json::to_vec(&issuance).unwrap_or_default());
+    TxResult::Success
+}
+
+/// `rippleUnlockEscrowMPT` (View.cpp:3771, fixTokenEscrowV1 shape — enabled
+/// on mainnet): the issuance's LockedAmount drops by the GROSS (absent at
+/// zero); the receiver's MPTAmount rises by the NET — or, receiver being the
+/// issuer, OutstandingAmount drops by it; the sender's LockedAmount drops by
+/// the gross (absent at zero); the gross−net fee leaves OutstandingAmount.
+pub(crate) fn unlock_escrow(
+    sandbox: &mut Sandbox,
+    issuance_key: &Hash256,
+    sender: &[u8; 20],
+    receiver: &[u8; 20],
+    net: u64,
+    gross: u64,
+) -> TxResult {
+    let Some(mut issuance) = json_at(sandbox, issuance_key) else { return TxResult::ObjectNotFound };
+    let Some(issuer) = issuance_issuer(&issuance) else { return TxResult::Malformed };
+    if issuer == *sender {
+        return TxResult::Malformed; // tecINTERNAL
+    }
+    let locked = dec_field(&issuance, "LockedAmount");
+    if issuance.get("LockedAmount").is_none() || locked < gross {
+        return TxResult::Malformed; // tecINTERNAL
+    }
+    set_dec_field(&mut issuance, "LockedAmount", locked - gross, false);
+    if issuer != *receiver {
+        let rkey = keylet::mptoken_key(issuance_key, receiver);
+        let Some(mut rtok) = json_at(sandbox, &rkey) else { return TxResult::ObjectNotFound };
+        let rb = dec_field(&rtok, "MPTAmount") + net;
+        set_dec_field(&mut rtok, "MPTAmount", rb, false);
+        sandbox.write(rkey, serde_json::to_vec(&rtok).unwrap_or_default());
+    } else {
+        let outstanding = dec_field(&issuance, "OutstandingAmount");
+        if outstanding < net {
+            return TxResult::Malformed;
+        }
+        set_dec_field(&mut issuance, "OutstandingAmount", outstanding - net, true);
+    }
+    {
+        let skey = keylet::mptoken_key(issuance_key, sender);
+        let Some(mut stok) = json_at(sandbox, &skey) else { return TxResult::ObjectNotFound };
+        let slocked = dec_field(&stok, "LockedAmount");
+        if stok.get("LockedAmount").is_none() || slocked < gross {
+            return TxResult::Malformed;
+        }
+        set_dec_field(&mut stok, "LockedAmount", slocked - gross, false);
+        sandbox.write(skey, serde_json::to_vec(&stok).unwrap_or_default());
+    }
+    let diff = gross - net;
+    if diff != 0 {
+        let outstanding = dec_field(&issuance, "OutstandingAmount");
+        if outstanding < diff {
+            return TxResult::Malformed;
+        }
+        set_dec_field(&mut issuance, "OutstandingAmount", outstanding - diff, true);
+    }
+    sandbox.write(*issuance_key, serde_json::to_vec(&issuance).unwrap_or_default());
+    TxResult::Success
 }
 
 /// `directSendNoFeeMPT` (TokenHelpers.cpp:1060): the single-leg MPT move.
@@ -322,7 +468,7 @@ impl Transactor for MPTokenIssuanceCreateTransactor {
         if tx.tx_type != "MPTokenIssuanceCreate" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         // A NON-ZERO TransferFee demands tfMPTCanTransfer; the cap is 50000.
@@ -404,7 +550,7 @@ impl Transactor for MPTokenIssuanceDestroyTransactor {
         if tx.tx_type != "MPTokenIssuanceDestroy" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("MPTokenIssuanceID").is_none() {
@@ -458,7 +604,7 @@ impl Transactor for MPTokenAuthorizeTransactor {
         if tx.tx_type != "MPTokenAuthorize" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("MPTokenIssuanceID").is_none() {
@@ -596,7 +742,7 @@ impl Transactor for MPTokenIssuanceSetTransactor {
         if tx.tx_type != "MPTokenIssuanceSet" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("MPTokenIssuanceID").is_none() {

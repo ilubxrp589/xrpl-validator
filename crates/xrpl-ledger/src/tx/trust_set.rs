@@ -167,7 +167,7 @@ impl Transactor for TrustSetTransactor {
         if tx.tx_type != "TrustSet" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("LimitAmount").is_none() {
@@ -190,6 +190,13 @@ impl Transactor for TrustSetTransactor {
         let Ok(acct) = serde_json::from_slice::<serde_json::Value>(&data) else {
             return TxResult::Malformed;
         };
+        // Finding 316 (fuzz flag:setfauth on 107060755 2A1407585FEC):
+        // tfSetfAuth on an account without lsfRequireAuth is
+        // tefNO_AUTH_REQUIRED (SetTrust.cpp:204-210).
+        let tx_flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+        if tx_flags & 0x0001_0000 != 0 && acct["Flags"].as_u64().unwrap_or(0) & 0x0004_0000 == 0 {
+            return TxResult::NoAuthRequired;
+        }
 
         let Some((currency_str, issuer)) = Self::extract_limit_amount(tx) else {
             return TxResult::Malformed;
@@ -849,6 +856,7 @@ mod tests {
                     "value": "1000"
                 }
             }),
+            inner_batch: false,
         };
 
         assert_eq!(TrustSetTransactor.preflight(&tx), TxResult::Success);
@@ -900,6 +908,7 @@ mod tests {
                 "LimitAmount": {"currency": "USD", "issuer": hex::encode(issuer), "value": "1000"},
                 "Flags": 0x0001_0000u64, // tfSetfAuth
             }),
+            inner_batch: false,
         };
         assert_eq!(TrustSetTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
 
@@ -965,6 +974,7 @@ mod tests {
                 "LimitAmount": {"currency": "USD", "issuer": hex::encode(issuer), "value": "0"},
                 "Flags": 0x0022_0000u64, // tfSetNoRipple | tfClearFreeze
             }),
+            inner_batch: false,
         }
     }
 
@@ -1034,6 +1044,7 @@ mod tests {
                 "LimitAmount": {"currency": "USD", "issuer": hex::encode(issuer), "value": "45000000"},
                 "Flags": 0x0002_0000u64, // tfSetNoRipple
             }),
+            inner_batch: false,
         };
         // The sender is the LOW side: a negative stored balance is its debt.
         let mut sandbox = Sandbox::new(&state);

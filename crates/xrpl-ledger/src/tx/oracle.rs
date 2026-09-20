@@ -55,7 +55,7 @@ impl Transactor for OracleSetTransactor {
         if tx.tx_type != "OracleSet" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if doc_id(tx).is_none() || tx.fields.get("LastUpdateTime").is_none() {
@@ -177,8 +177,12 @@ impl Transactor for OracleSetTransactor {
             if tx.fields.get("Provider").is_none() || tx.fields.get("AssetClass").is_none() {
                 return TxResult::Malformed;
             }
+            // `sfFlags` is soeREQUIRED on the Oracle ledger format, so the
+            // created object carries `Flags: 0` right after its type (finding
+            // 293, #107052956 B1EB9B20: ours serialized five bytes short).
             let mut oracle = serde_json::json!({
                 "LedgerEntryType": "Oracle",
+                "Flags": 0,
                 "Owner": hex::encode(tx.account),
                 "OracleDocumentID": id,
                 "PriceDataSeries": tx.fields["PriceDataSeries"].clone(),
@@ -206,7 +210,7 @@ impl Transactor for OracleDeleteTransactor {
         if tx.tx_type != "OracleDelete" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if doc_id(tx).is_none() {
@@ -305,6 +309,7 @@ mod tests {
                 "AssetClass": "63757272656E6379",
                 "PriceDataSeries": series,
             }),
+            inner_batch: false,
         }
     }
 
@@ -347,6 +352,7 @@ mod tests {
             ticket_seq: None,
             last_ledger_seq: None,
             fields: serde_json::json!({ "OracleDocumentID": 1 }),
+            inner_batch: false,
         };
         let tr = OracleDeleteTransactor;
         assert_eq!(tr.do_apply(&del, &mut sb), TxResult::Success);

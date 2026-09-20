@@ -113,7 +113,7 @@ impl Transactor for PaymentChannelCreateTransactor {
         if tx.tx_type != "PaymentChannelCreate" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("Destination").is_none() {
@@ -322,7 +322,7 @@ impl Transactor for PaymentChannelClaimTransactor {
         if tx.tx_type != "PaymentChannelClaim" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         // fixCleanup3_2_0: an all-zero Channel is malformed.
@@ -527,7 +527,7 @@ impl Transactor for PaymentChannelFundTransactor {
         if tx.tx_type != "PaymentChannelFund" {
             return TxResult::Malformed;
         }
-        if tx.fee == 0 {
+        if tx.fee_missing() {
             return TxResult::BadFee;
         }
         if tx.fields.get("Channel").is_none() {
@@ -743,6 +743,7 @@ mod tests {
                 "Amount": "10000000",
                 "PublicKey": "030FBA552C9626B1DECA8CFAD9F2121DCA55C1066928210397EDCF4F625F6E272C",
             }),
+            inner_batch: false,
         };
         let build = |mutate: &dyn Fn(&mut serde_json::Value)| {
             let state = make_state_with_accounts(&[(&sender, 50_000_000), (&dest, 10_000_000)]);
@@ -814,6 +815,7 @@ mod tests {
                 "Amount": "10000000",
                 "PublicKey": "030FBA552C9626B1DECA8CFAD9F2121DCA55C1066928210397EDCF4F625F6E272C",
             }),
+            inner_batch: false,
         };
 
         assert_eq!(PaymentChannelCreateTransactor.preflight(&create_tx), TxResult::Success);
@@ -844,6 +846,7 @@ mod tests {
                 "PublicKey": "030FBA552C9626B1DECA8CFAD9F2121DCA55C1066928210397EDCF4F625F6E272C",
                 "Signature": "DEADBEEF",
             }),
+            inner_batch: false,
         };
 
         assert_eq!(PaymentChannelClaimTransactor.preflight(&claim_tx), TxResult::Success);
@@ -883,6 +886,7 @@ mod tests {
                 "Amount": "5000000",
                 "PublicKey": "030FBA552C9626B1DECA8CFAD9F2121DCA55C1066928210397EDCF4F625F6E272C",
             }),
+            inner_batch: false,
         };
         PaymentChannelCreateTransactor.do_apply(&create_tx, &mut sandbox);
 
@@ -906,6 +910,7 @@ mod tests {
                 // deletion needs tfClose (receiver ⇒ immediate) or expiry.
                 "Flags": 131072u64,
             }),
+            inner_batch: false,
         };
 
         assert_eq!(PaymentChannelClaimTransactor.do_apply(&claim_tx, &mut sandbox), TxResult::Success);
@@ -938,6 +943,7 @@ mod tests {
                 "Destination": hex::encode(dest),
                 "Amount": "5000000",
             }),
+            inner_batch: false,
         };
         PaymentChannelCreateTransactor.do_apply(&create_tx, &mut sandbox);
 
@@ -959,6 +965,7 @@ mod tests {
                 "Channel": channel_hex,
                 "Amount": "3000000",
             }),
+            inner_batch: false,
         };
 
         assert_eq!(PaymentChannelFundTransactor.preflight(&fund_tx), TxResult::Success);
@@ -994,6 +1001,7 @@ mod tests {
                 "Destination": hex::encode(dest),
                 "Amount": "5000000",
             }),
+            inner_batch: false,
         };
         PaymentChannelCreateTransactor.do_apply(&create_tx, &mut sandbox);
 
@@ -1012,6 +1020,7 @@ mod tests {
                 "Channel": channel_hex,
                 "Amount": "3000000",
             }),
+            inner_batch: false,
         };
 
         assert_eq!(
