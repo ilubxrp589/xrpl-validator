@@ -9659,8 +9659,16 @@ impl Transactor for OfferCreateTransactor {
             Some(r) if tx.account != gets_leg.issuer => Some(r),
             _ => None,
         };
+        // Finding 344 (#107105811 6BC27A644C0A, ra66c3cz selling 92.5925925925926
+        // BST at the issuer's 1.08): `sendMax = multiplyRound(takerAmount.in,
+        // gatewayXferRate, issue, true)` (CreateOffer.cpp:354) is the LEGACY
+        // mulRound — seventeen digits truncated before the ceiling step — so
+        // 92.5925925925926 × 1.08 = 100.000000000000008 lands on
+        // 100.0000000000000, not the exact-ceiling 100.0000000000001, and the
+        // taker's line closes at 261.0799. The exact ceiling debited one ulp
+        // more (the ported engine, which carries the legacy form, matched).
         let send_max = match xfer_in {
-            Some(r) => me_muldiv(tg0, (r as u128, 0), (1_000_000_000, 0), true),
+            Some(r) => mul_round16_up(tg0, (r as u128, -9)),
             _ => tg0,
         };
         let mut threshold_self = rate_of_me(send_max, tp0).unwrap_or(0);

@@ -1611,3 +1611,13 @@ fn offer_create_outside_its_domain_is_no_permission_devnet_5422957() {
 fn offer_ioc_buy_ends_when_the_pool_slice_misses_the_limit_107080701() {
     run_bundle(include_str!("vectors/offer_ioc_buy_ends_when_the_pool_slice_misses_the_limit_107080701.json"));
 }
+
+/// Finding 344 — #107105811 6BC27A644C0A: a tfSell|IoC of 92.5925925925926 BST
+/// (issuer rate 1.08). CreateOffer's sendMax is the LEGACY mulRound of the
+/// rate — 100.0000000000000, not the exact ceiling 100.0000000000001 — and
+/// the taker's BST line closes at 261.0799 on mainnet; we debited an ulp
+/// more.
+#[test]
+fn offer_sell_budget_is_the_legacy_mulround_of_the_rate_107105811() {
+    run_bundle(include_str!("vectors/offer_sell_budget_is_the_legacy_mulround_of_the_rate_107105811.json"));
+}
