@@ -149,3 +149,11 @@ fn payment_eur_to_usd_default_paths_testnet_20910299() {
     port();
     run_bundle(include_str!("vectors/payment_eur_to_usd_default_paths_testnet_20910299.json"));
 }
+
+/// #20910353 15773BE3: BST (8% fee) → USD, tfPartialPayment with DeliverMin
+/// and no explicit paths. Model misses a modified node.
+#[test]
+fn payment_partial_delivermin_bst_to_usd_default_paths_testnet_20910353() {
+    port();
+    run_bundle(include_str!("vectors/payment_partial_delivermin_bst_to_usd_default_paths_testnet_20910353.json"));
+}
