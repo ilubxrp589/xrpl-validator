@@ -517,8 +517,19 @@ impl FlowOfferStream {
                 self.offer = None;
                 continue;
             }
-            // (DomainID offers: mainnet has no permissioned DEX domains in
-            // the books this port replays; `offerInDomain` is not modelled.)
+            // Remove if no longer in its domain (OfferStream.cpp:293-301,
+            // `permissioned_dex::offerInDomain`): an offer carrying a DomainID
+            // whose owner fails `accountInDomain` — owner, or an accepted
+            // unexpired credential the domain lists — is removed for good,
+            // whichever book reached it (finding 337).
+            if let Some(d) = entry.domain {
+                if !crate::tx::misc::account_in_domain(ps.sandbox(), &offer.owner, &d) {
+                    if tr { eprintln!("FLOW   stream: {} no longer in domain", hex::encode(&index.0[..6])); }
+                    self.perm_rm_offer(index);
+                    self.offer = None;
+                    continue;
+                }
+            }
             // Owner funds.
             let funds = self.funds(ps, &offer, false);
             self.owner_funds = Some(funds);
