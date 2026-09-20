@@ -2023,7 +2023,7 @@ fn load_escrow_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_
         load_object(state, url, &hex::encode_upper(keylet::account_root_key(&d).0), ledger_index);
         if let Some(amt) = esc.get("Amount").filter(|a| a.is_object() && a.get("mpt_issuance_id").is_none()) {
             if let (Some(cur), Some(iss)) = (
-                amt.get("currency").and_then(|v| v.as_str()).and_then(|c| if c.len() == 40 { hex::decode(c).ok().and_then(|b| <[u8; 20]>::try_from(b.as_slice()).ok()) } else { None }),
+                amt.get("currency").and_then(|v| v.as_str()).map(currency_code),
                 amt.get("issuer").and_then(|v| v.as_str()).and_then(addr20),
             ) {
                 load_object(state, url, &hex::encode_upper(keylet::ripple_state_key(&d, &iss, &cur).0), ledger_index);
