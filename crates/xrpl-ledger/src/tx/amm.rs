@@ -2753,29 +2753,35 @@ impl Transactor for AMMDeleteTransactor {
     fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
         let acct_key = keylet::account_root_key(&tx.account);
         if !sandbox.exists(&acct_key) { return TxResult::NoAccount; }
+        // Finding 347 (testnet campaign 6, #20910502 E11CE295): AMMDelete
+        // only finishes what the last withdrawal could not — a pool whose
+        // LPTokenBalance is still non-zero is tecAMM_NOT_EMPTY, a pool that
+        // does not exist is terNO_AMM (AMMDelete::preclaim). We deleted the
+        // AMM object outright and took an owner count off its creator.
+        let Some(key) = amm_key_from_asset_fields(tx) else { return TxResult::Malformed };
+        let Some(amm) = crate::tx::offer::json_at(sandbox, &key) else { return TxResult::NoAmm };
+        let lpt_zero = amm["LPTokenBalance"]["value"].as_str().map(|v| v == "0").unwrap_or(false);
+        if !lpt_zero {
+            return TxResult::AmmNotEmpty;
+        }
         TxResult::Success
     }
-
     fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
-        if let Some(key) = amm_key_from_asset_fields(tx) {
-            if sandbox.exists(&key) {
-                // Read AMM to find the creator for OwnerCount
-                if let Some(data) = sandbox.read(&key) {
-                    if let Ok(amm) = serde_json::from_slice::<serde_json::Value>(&data) {
-                        if let Some(creator_hex) = amm.get("Account").and_then(|a| a.as_str()) {
-                            if let Ok(creator_bytes) = hex::decode(creator_hex) {
-                                if creator_bytes.len() == 20 {
-                                    let mut creator = [0u8; 20];
-                                    creator.copy_from_slice(&creator_bytes);
-                                    decrement_owner_count(sandbox, &creator);
-                                }
-                            }
-                        }
-                    }
-                }
-                sandbox.delete(key);
-            }
-        }
+        // `deleteAMMAccount`, the same tear-down the last LP's withdrawal runs
+        // (delete_amm): every pool line, the AMM object, the pool account.
+        // rippled caps the lines removed per transaction at 512 and answers
+        // tecINCOMPLETE beyond that — unmodelled, no pool of that size seen.
+        let Some(key) = amm_key_from_asset_fields(tx) else { return TxResult::Malformed };
+        let Some(amm) = crate::tx::offer::json_at(sandbox, &key) else { return TxResult::NoAmm };
+        let Some(amm_acct) = amm
+            .get("Account")
+            .and_then(|a| a.as_str())
+            .and_then(|h| hex::decode(h).ok())
+            .and_then(|b| <[u8; 20]>::try_from(b.as_slice()).ok())
+        else {
+            return TxResult::Malformed;
+        };
+        delete_amm(sandbox, &key, &amm_acct, tx);
         TxResult::Success
     }
 }

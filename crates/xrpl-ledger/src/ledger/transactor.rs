@@ -116,6 +116,10 @@ pub enum TxResult {
     /// The pool's LPTokenBalance is zero — an emptied AMM awaiting deletion
     /// refuses votes/deposits-without-tfTwoAssetIfEmpty with tecAMM_EMPTY.
     AmmEmpty,
+    /// tecAMM_NOT_EMPTY — AMMDelete on a pool whose LPTokenBalance is not zero (finding 347).
+    AmmNotEmpty,
+    /// terNO_AMM — an AMM transaction naming a pool that does not exist (retry class, never in a ledger).
+    NoAmm,
     /// OracleSet's LastUpdateTime is below the ripple epoch, outside the
     /// ±300s window around the last close, or not newer than the stored one.
     InvalidUpdateTime,
@@ -305,6 +309,7 @@ impl TxResult {
             | TxResult::AmmBalance
             | TxResult::AmmInvalidTokens
             | TxResult::AmmEmpty
+            | TxResult::AmmNotEmpty
             | TxResult::InvalidUpdateTime
             | TxResult::NoLine
             | TxResult::Frozen
@@ -380,6 +385,8 @@ impl TxResult {
             TxResult::AmmBalance => "tecAMM_BALANCE",
             TxResult::AmmInvalidTokens => "tecAMM_INVALID_TOKENS",
             TxResult::AmmEmpty => "tecAMM_EMPTY",
+            TxResult::AmmNotEmpty => "tecAMM_NOT_EMPTY",
+            TxResult::NoAmm => "terNO_AMM",
             TxResult::InvalidUpdateTime => "tecINVALID_UPDATE_TIME",
             TxResult::NoLine => "tecNO_LINE",
             TxResult::Frozen => "tecFROZEN",
@@ -727,6 +734,7 @@ mod claim_tests {
         let all = [
             TxResult::LimitExceeded, TxResult::NoLine, TxResult::Frozen, TxResult::NoPermission,
             TxResult::PathDry, TxResult::PathPartial, TxResult::Killed, TxResult::Expired,
+            TxResult::AmmNotEmpty,
         ];
         for r in all {
             assert!(r.code_str().starts_with("tec"), "{:?}", r);
