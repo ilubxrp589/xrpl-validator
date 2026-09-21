@@ -264,7 +264,7 @@ impl Transactor for AMMCreateTransactor {
             // view.seq() is the ledger BEING BUILT — parent + 1; once
             // SingleAssetVault or LendingProtocol is enabled a pseudo-account
             // gets Sequence 0 (AccountRootHelpers.cpp:581-589; devnet
-            // #5488138 77C8DE46, finding 350 — mainnet has neither yet).
+            // #5488138 77C8DE46, Finding 350 — mainnet has neither yet).
             "Sequence": if crate::ledger::amendments::pseudo_account_sequence_is_zero(sandbox) { 0 } else { sandbox.base().header.sequence + 1 },
             "OwnerCount": 0,
             "Flags": 0x0110_0000u64 | 0x0080_0000,
