@@ -23,6 +23,9 @@ export function Navbar() {
   const { data, loading, status } = useValidatorData();
   const ledgerSeq = data?.engine.ledger_seq ?? 0;
   const peers = data?.peers ?? 0;
+  // Read the linked libxrpl version off the live FFI stats rather than hardcoding
+  // it — a pinned string silently lied about 3.2.0 for a day after the 3.2.1 bump.
+  const libxrplVersion = data?.engine.ffi_verifier?.libxrpl_version;
 
   return (
     <header className="sticky top-0 z-50 h-14 border-b border-halcyon-border bg-halcyon-bg/80 backdrop-blur-md">
@@ -109,9 +112,11 @@ export function Navbar() {
           >
             <Share2 className="h-4 w-4" />
           </button>
-          <span className="hidden rounded border border-halcyon-border bg-halcyon-card px-2 py-0.5 font-mono text-[10px] text-halcyon-muted sm:inline-block">
-            LIBXRPL 3.2.0
-          </span>
+          {libxrplVersion && (
+            <span className="hidden rounded border border-halcyon-border bg-halcyon-card px-2 py-0.5 font-mono text-[10px] text-halcyon-muted sm:inline-block">
+              LIBXRPL {libxrplVersion}
+            </span>
+          )}
           <div className="flex items-center gap-1.5">
             <Radio
               className={`h-4 w-4 ${
