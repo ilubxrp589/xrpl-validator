@@ -2225,6 +2225,36 @@ fn load_amm_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_ind
             }
         }
     }
+    // AMMBid: the bidder's LP-token line (ammLPHolds — a bidder with none is
+    // tecAMM_INVALID_TOKENS) and every AuthAccounts root; a fee-only tec
+    // names neither. Devnet campaign 7: four bids read tesSUCCESS unhydrated
+    // for the network's tecAMM_INVALID_TOKENS / tecAMM_FAILED.
+    if tt == Some("AMMBid") {
+        let asset_of = |v: Option<&Value>| -> Value {
+            match v {
+                Some(v) if v.get("issuer").is_some() => json!({"currency": v["currency"], "issuer": v["issuer"]}),
+                _ => json!({"currency": "XRP"}),
+            }
+        };
+        if let Some(res) = rpc(url, "ledger_entry", json!({"amm": {"asset": asset_of(txj.get("Asset")), "asset2": asset_of(txj.get("Asset2"))}, "ledger_index": ledger_index})) {
+            if let Some(node) = res.get("node") {
+                if let Some(k) = res.get("index").and_then(|v| v.as_str()) {
+                    load_object(state, url, k, ledger_index);
+                }
+                let pool = node.get("Account").and_then(|v| v.as_str()).and_then(decode_address);
+                let cur = node.get("LPTokenBalance").and_then(|v| v.get("currency")).and_then(|v| v.as_str())
+                    .and_then(|h| hex::decode(h).ok()).and_then(|b| <[u8; 20]>::try_from(b.as_slice()).ok());
+                if let (Some(pool), Some(cur), Some(bidder)) = (pool, cur, txj["Account"].as_str().and_then(decode_address)) {
+                    load_object(state, url, &hex::encode_upper(keylet::ripple_state_key(&bidder, &pool, &cur).0), ledger_index);
+                }
+            }
+        }
+        for a in txj.get("AuthAccounts").and_then(|v| v.as_array()).into_iter().flatten() {
+            if let Some(acct) = a.get("AuthAccount").and_then(|v| v.get("Account")).and_then(|v| v.as_str()).and_then(decode_address) {
+                load_object(state, url, &hex::encode_upper(keylet::account_root_key(&acct).0), ledger_index);
+            }
+        }
+    }
     if tt == Some("AMMCreate") {
         // No pool exists yet — the creator's and asset issuers' dir roots are
         // the walk anchors for the new trust lines.
