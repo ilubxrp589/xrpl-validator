@@ -646,6 +646,18 @@ impl Transactor for NFTokenCreateOfferTransactor {
         }
         // (`tefNFTOKEN_IS_NOT_TRANSFERABLE` for a non-transferable token offered
         // by a stranger is a tef — it never reaches a validated ledger.)
+        // NFTokenHelpers.cpp:866: `isFrozen(view, acct, currency, issuer)` reads
+        // the ISSUER's lsfGlobalFreeze even when acct is the issuer itself —
+        // tecFROZEN on an issuer offering in its own frozen IOU. fixCleanup3_4_0
+        // exempts the issuer (acctIsIouIssuer).
+        if !leg.xrp
+            && tx.account == leg.issuer
+            && !crate::ledger::amendments::fix_cleanup_3_4_0(sandbox)
+            && ox::json_at(sandbox, &keylet::account_root_key(&leg.issuer))
+                .is_some_and(|a| a["Flags"].as_u64().unwrap_or(0) & 0x0040_0000 != 0)
+        {
+            return TxResult::Frozen;
+        }
         if let Some(TxResult::Frozen) = ox::frozen_ter(sandbox, &leg, &tx.account) {
             return TxResult::Frozen;
         }
@@ -2076,4 +2088,43 @@ mod tests {
         );
         assert!(!sb.exists(&keylet::nft_offer_key(&minter, 7)));
     }
+
+    /// NFTokenHelpers.cpp:866: pre-amendment `isFrozen` applies the issuer's
+    /// own lsfGlobalFreeze to an offer the issuer makes in its own IOU
+    /// (tecFROZEN); fixCleanup3_4_0 exempts the issuer.
+    #[test]
+    fn an_issuer_offering_in_its_own_globally_frozen_iou_is_frozen_only_before_fixcleanup340() {
+        let issuer = [0x01u8; 20];
+        let state = make_state(&[(issuer, 500_000_000)]);
+        let mut sb = Sandbox::new(&state);
+        assert_eq!(NFTokenMintTransactor.do_apply(&mint_tx(issuer, 0), &mut sb), TxResult::Success);
+        let id = page_tokens(&sb, &issuer).first().expect("token minted").clone();
+        let tx = TxFields {
+            account: issuer,
+            tx_type: "NFTokenCreateOffer".into(),
+            fee: 12,
+            sequence: 8,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({
+                "NFTokenID": id,
+                "Amount": {"currency": "USD", "issuer": hex::encode(issuer), "value": "5"},
+                "Flags": 1,
+            }),
+            inner_batch: false,
+        };
+        assert_eq!(NFTokenCreateOfferTransactor.preclaim(&tx, &sb), TxResult::Success, "unfrozen issuer sells in its own IOU");
+        let akey = keylet::account_root_key(&issuer);
+        let mut acct: serde_json::Value = serde_json::from_slice(&sb.read(&akey).unwrap()).unwrap();
+        acct["Flags"] = serde_json::json!(0x0040_0000u64);
+        sb.write(akey, serde_json::to_vec(&acct).unwrap());
+        assert_eq!(NFTokenCreateOfferTransactor.preclaim(&tx, &sb), TxResult::Frozen, "its own global freeze bites pre-amendment");
+        let am = serde_json::json!({
+            "LedgerEntryType": "Amendments", "Flags": 0,
+            "Amendments": [crate::ledger::amendments::FIX_CLEANUP_3_4_0],
+        });
+        sb.write(keylet::amendments_key(), serde_json::to_vec(&am).unwrap());
+        assert_eq!(NFTokenCreateOfferTransactor.preclaim(&tx, &sb), TxResult::Success, "fixCleanup3_4_0 exempts the issuer");
+    }
+
 }

@@ -33,10 +33,18 @@ pub fn fix_cleanup_3_3_0(sandbox: &Sandbox) -> bool {
 }
 
 /// fixCleanup3_4_0 — in the 3.4.0 release (the vendored libxrpl snapshot
-/// predates it): MPT escrow fee floors the delivery (EscrowHelpers.h),
-/// plus OfferStream, CredentialHelpers, AMMBid/AMMClawback, Sign, apply and
-/// the invariants. Not enabled on mainnet as of 2026-09-18 (no majority);
-/// enabled on devnet.
+/// predates it; testnet and mainnet had it OFF as of 2026-09-21, so no
+/// oracle exists and every gated site rests on unit tests). Ported sites:
+/// MPT escrow fee floor (F338), escrow reserve recycling on Finish/Cancel,
+/// domain validDomain/verifyValidDomain with expired-credential deletion
+/// (OfferCreate, Payment), pseudo-account requireAuth, OfferCreate's
+/// DisallowIncomingTrustline, the NFT issuer's own-freeze exemption,
+/// MPTokenAuthorize's locked-token refusal, AMMBid's zero-fee floor.
+/// Deliberately unported: tem-only checks (zero CredentialIDs, badAsset),
+/// role signatures (Sponsor), Vault/Loan/Delegate, OfferStream's corrupt-
+/// domain-book throw, AMMClawback's three tweaks (the clawback model is
+/// uncalibrated — no mainnet specimen), AMMDeposit/Withdraw overflow →
+/// tecAMM_FAILED, the invariant changes.
 pub const FIX_CLEANUP_3_4_0: &str =
     "98433DD001A5737F773D74F8CA2A25A065089C73B2E611C760BAF369E4FECA76";
 

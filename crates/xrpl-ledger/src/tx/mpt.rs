@@ -641,6 +641,16 @@ impl Transactor for MPTokenAuthorizeTransactor {
                 if dec_field(&tok, "MPTAmount") != 0 || dec_field(&tok, "LockedAmount") != 0 {
                     return TxResult::HasObligations;
                 }
+                // fixCleanup3_4_0 (MPTokenAuthorize.cpp:79-83): a holder cannot
+                // drop a LOCKED MPToken while the issuance exists —
+                // tecNO_PERMISSION (pre-amendment only under SingleAssetVault,
+                // which mainnet lacks).
+                if crate::ledger::amendments::fix_cleanup_3_4_0(sandbox)
+                    && sandbox.exists(&ikey)
+                    && tok.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & LSF_MPT_LOCKED != 0
+                {
+                    return TxResult::NoPermission;
+                }
                 let hint = tok
                     .get("OwnerNode")
                     .and_then(|v| v.as_str())
@@ -828,5 +838,66 @@ impl Transactor for MPTokenIssuanceSetTransactor {
         }
         sandbox.write(target_key, serde_json::to_vec(&target).unwrap_or_default());
         TxResult::Success
+    }
+}
+
+#[cfg(test)]
+mod fixcleanup340_tests {
+    use super::*;
+    use crate::ledger::header::LedgerHeader;
+    use crate::ledger::state::LedgerState;
+
+    /// fixCleanup3_4_0 (MPTokenAuthorize.cpp:79-83): a holder cannot drop a
+    /// LOCKED MPToken while the issuance exists — tecNO_PERMISSION; before
+    /// the amendment (and without SingleAssetVault) the empty token goes.
+    #[test]
+    fn a_holder_cannot_unauthorize_a_locked_mptoken_under_fixcleanup340() {
+        let holder = [0x01u8; 20];
+        let issuer = [0x02u8; 20];
+        let header = LedgerHeader {
+            sequence: 100, total_coins: 100_000_000_000_000_000,
+            parent_hash: Hash256([0; 32]), transaction_hash: Hash256([0; 32]), account_hash: Hash256([0; 32]),
+            parent_close_time: 0, close_time: 10, close_time_resolution: 10, close_flags: 0,
+        };
+        let mut state = LedgerState::new_unverified(header);
+        for (id, oc) in [(holder, 1u64), (issuer, 1)] {
+            let acct = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": hex::encode(id), "Balance": "50000000",
+                "Sequence": 1, "OwnerCount": oc, "Flags": 0,
+            });
+            state.state_map.insert(keylet::account_root_key(&id), serde_json::to_vec(&acct).unwrap()).unwrap();
+        }
+        let mut id = [0u8; 24];
+        id[..4].copy_from_slice(&1u32.to_be_bytes());
+        id[4..].copy_from_slice(&issuer);
+        let ikey = keylet::mpt_issuance_key(&id);
+        let iss = serde_json::json!({
+            "LedgerEntryType": "MPTokenIssuance", "Issuer": hex::encode(issuer), "Flags": 0,
+            "Sequence": 1, "OutstandingAmount": "0", "OwnerNode": "0",
+        });
+        state.state_map.insert(ikey, serde_json::to_vec(&iss).unwrap()).unwrap();
+        let tkey = keylet::mptoken_key(&ikey, &holder);
+        let tok = serde_json::json!({
+            "LedgerEntryType": "MPToken", "Account": hex::encode(holder), "MPTokenIssuanceID": hex::encode_upper(id),
+            "MPTAmount": "0", "Flags": LSF_MPT_LOCKED, "OwnerNode": "0",
+        });
+        state.state_map.insert(tkey, serde_json::to_vec(&tok).unwrap()).unwrap();
+        let tx = TxFields {
+            account: holder, tx_type: "MPTokenAuthorize".to_string(), fee: 12, sequence: 1,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({"MPTokenIssuanceID": hex::encode_upper(id), "Flags": TF_MPT_UNAUTHORIZE}),
+            inner_batch: false,
+        };
+        let mut sb = Sandbox::new(&state);
+        assert_eq!(MPTokenAuthorizeTransactor.do_apply(&tx, &mut sb), TxResult::Success, "pre-amendment the empty token is dropped");
+        assert!(!sb.exists(&tkey));
+        let am = serde_json::json!({
+            "LedgerEntryType": "Amendments", "Flags": 0,
+            "Amendments": [crate::ledger::amendments::FIX_CLEANUP_3_4_0],
+        });
+        state.state_map.insert(keylet::amendments_key(), serde_json::to_vec(&am).unwrap()).unwrap();
+        let mut sb = Sandbox::new(&state);
+        assert_eq!(MPTokenAuthorizeTransactor.do_apply(&tx, &mut sb), TxResult::NoPermission, "locked: refused under fixCleanup3_4_0");
+        assert!(sb.exists(&tkey));
     }
 }

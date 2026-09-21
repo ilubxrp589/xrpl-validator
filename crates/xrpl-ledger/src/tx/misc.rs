@@ -1276,6 +1276,54 @@ mod tests {
         };
         assert_eq!(ClawbackTransactor.do_apply(&tx, &mut sandbox), TxResult::NoEntry);
     }
+
+    /// fixCleanup3_4_0's domain helpers: `valid_domain` (preclaim, read-only)
+    /// and `verify_valid_domain` (do_apply, deletes the expired credential).
+    #[test]
+    fn valid_domain_and_verify_valid_domain_under_fixcleanup340() {
+        let owner = [0x31u8; 20];
+        let issuer = [0x32u8; 20];
+        let holder = [0x33u8; 20];
+        let expired = [0x34u8; 20];
+        let stranger = [0x35u8; 20];
+        let mut state = make_state(&[(owner, 1_000_000_000), (expired, 1_000_000_000)]);
+        let dkey = Hash256([0x77u8; 32]);
+        let pd = serde_json::json!({
+            "LedgerEntryType": "PermissionedDomain", "Flags": 0, "Owner": hex::encode(owner), "Sequence": 1,
+            "AcceptedCredentials": [{"Credential": {"Issuer": hex::encode(issuer), "CredentialType": "ABCD"}}],
+        });
+        state.state_map.insert(dkey, serde_json::to_vec(&pd).unwrap()).unwrap();
+        let mut keys = std::collections::HashMap::new();
+        for (who, flags, exp) in [(holder, 0x0001_0000u64, None), (expired, 0x0001_0000, Some(5u64)), (stranger, 0, None)] {
+            let mut cred = serde_json::json!({
+                "LedgerEntryType": "Credential", "Subject": hex::encode(who), "Issuer": hex::encode(issuer),
+                "CredentialType": "ABCD", "Flags": flags,
+            });
+            if let Some(e) = exp {
+                cred["Expiration"] = serde_json::Value::from(e);
+            }
+            let key = crate::tx::credential::credential_key(&who, &issuer, &hex::decode("ABCD").unwrap());
+            state.state_map.insert(key, serde_json::to_vec(&cred).unwrap()).unwrap();
+            keys.insert(who, key);
+        }
+        let mut sb = Sandbox::new(&state); // close_time 10 > Expiration 5 ⇒ expired
+        assert_eq!(domain_owner(&sb, &dkey), Some(owner));
+        assert_eq!(valid_domain(&sb, &dkey, &holder), TxResult::Success);
+        assert_eq!(valid_domain(&sb, &dkey, &expired), TxResult::Expired);
+        assert_eq!(valid_domain(&sb, &dkey, &stranger), TxResult::NoAuth, "unaccepted credential");
+        assert_eq!(valid_domain(&sb, &Hash256([0x78u8; 32]), &holder), TxResult::ObjectNotFound);
+        assert_eq!(verify_valid_domain(&mut sb, &holder, &dkey), TxResult::Success);
+        assert!(sb.exists(&keys[&holder]), "a live credential is untouched");
+        assert_eq!(verify_valid_domain(&mut sb, &expired, &dkey), TxResult::Expired);
+        assert!(!sb.exists(&keys[&expired]), "the expired credential is deleted");
+        assert_eq!(verify_valid_domain(&mut sb, &stranger, &dkey), TxResult::NoPermission);
+        assert!(!is_pseudo_account(&sb, &owner));
+        let akey = keylet::account_root_key(&owner);
+        let mut a: serde_json::Value = serde_json::from_slice(&sb.read(&akey).unwrap()).unwrap();
+        a["AMMID"] = serde_json::Value::String("00".repeat(32));
+        sb.write(akey, serde_json::to_vec(&a).unwrap());
+        assert!(is_pseudo_account(&sb, &owner));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1541,6 +1589,89 @@ pub(crate) fn account_in_domain(sandbox: &Sandbox, account: &[u8; 20], domain: &
     })
 }
 
+/// The domain's Owner, when the PermissionedDomain object is in hand.
+pub(crate) fn domain_owner(sandbox: &Sandbox, domain: &xrpl_core::types::Hash256) -> Option<[u8; 20]> {
+    crate::tx::offer::json_at(sandbox, domain)?
+        .get("Owner")
+        .and_then(|v| v.as_str())
+        .and_then(crate::tx::offer::decode20)
+}
+
+/// The subject's credential key for each entry of the domain's AcceptedCredentials.
+fn domain_credential_keys(pd: &serde_json::Value, subject: &[u8; 20]) -> Vec<xrpl_core::types::Hash256> {
+    let Some(creds) = pd.get("AcceptedCredentials").and_then(|v| v.as_array()) else { return Vec::new() };
+    creds
+        .iter()
+        .filter_map(|c| {
+            let inner = c.get("Credential").unwrap_or(c);
+            let issuer = inner.get("Issuer").and_then(|v| v.as_str()).and_then(crate::tx::offer::decode20)?;
+            let ct = inner.get("CredentialType").and_then(|v| v.as_str()).and_then(|h| hex::decode(h).ok())?;
+            Some(crate::tx::credential::credential_key(subject, &issuer, &ct))
+        })
+        .collect()
+}
+
+/// rippled `credentials::validDomain` (CredentialHelpers.cpp:208) — the
+/// fixCleanup3_4_0 preclaim form: tecOBJECT_NOT_FOUND without the domain;
+/// for each listed credential type the subject's credential is read — an
+/// expired one (`parentCloseTime > Expiration`) is noted, an accepted
+/// unexpired one answers tesSUCCESS; else tecEXPIRED when an expired one was
+/// seen, tecNO_AUTH otherwise. Callers map tecEXPIRED → pass (so do_apply can
+/// delete) and tecNO_AUTH → tecNO_PERMISSION.
+pub(crate) fn valid_domain(sandbox: &Sandbox, domain: &xrpl_core::types::Hash256, subject: &[u8; 20]) -> TxResult {
+    let Some(pd) = crate::tx::offer::json_at(sandbox, domain) else { return TxResult::ObjectNotFound };
+    let now = sandbox.base().close_time() as u64;
+    let mut found_expired = false;
+    for key in domain_credential_keys(&pd, subject) {
+        let Some(cred) = crate::tx::offer::json_at(sandbox, &key) else { continue };
+        let exp = cred.get("Expiration").and_then(|v| v.as_u64()).unwrap_or(u64::MAX);
+        if now > exp {
+            found_expired = true;
+            continue;
+        }
+        if cred["Flags"].as_u64().unwrap_or(0) & 0x0001_0000 != 0 {
+            return TxResult::Success;
+        }
+    }
+    if found_expired { TxResult::Expired } else { TxResult::NoAuth }
+}
+
+/// rippled `verifyValidDomain` (CredentialHelpers.cpp:335) — the
+/// fixCleanup3_4_0 do_apply form on the mutable view: every EXPIRED credential
+/// of the subject that the domain lists is deleted (they survive a tecEXPIRED
+/// through `apply::settle_expired`, rippled's processPersistentChanges), then
+/// any accepted survivor is tesSUCCESS, else tecEXPIRED when something was
+/// deleted, else tecNO_PERMISSION.
+pub(crate) fn verify_valid_domain(sandbox: &mut Sandbox, subject: &[u8; 20], domain: &xrpl_core::types::Hash256) -> TxResult {
+    let Some(pd) = crate::tx::offer::json_at(sandbox, domain) else { return TxResult::ObjectNotFound };
+    let now = sandbox.base().close_time() as u64;
+    let keys = domain_credential_keys(&pd, subject);
+    let mut found_expired = false;
+    let mut survivors = Vec::new();
+    for key in keys {
+        let Some(cred) = crate::tx::offer::json_at(sandbox, &key) else { continue };
+        let exp = cred.get("Expiration").and_then(|v| v.as_u64()).unwrap_or(u64::MAX);
+        if now > exp {
+            crate::tx::credential::delete_credential_object(sandbox, &key);
+            found_expired = true;
+        } else {
+            survivors.push(cred);
+        }
+    }
+    if survivors.iter().any(|c| c["Flags"].as_u64().unwrap_or(0) & 0x0001_0000 != 0) {
+        return TxResult::Success;
+    }
+    if found_expired { TxResult::Expired } else { TxResult::NoPermission }
+}
+
+/// rippled `isPseudoAccount` — an AccountRoot carrying a designator field
+/// (sfAMMID / sfVaultID / sfLoanBrokerID); such an account cannot submit
+/// transactions and only stores assets for the object that owns it.
+pub(crate) fn is_pseudo_account(sandbox: &Sandbox, account: &[u8; 20]) -> bool {
+    crate::tx::offer::json_at(sandbox, &keylet::account_root_key(account))
+        .is_some_and(|a| a.get("AMMID").is_some() || a.get("VaultID").is_some() || a.get("LoanBrokerID").is_some())
+}
+
 pub struct PermissionedDomainDeleteTransactor;
 
 impl Transactor for PermissionedDomainDeleteTransactor {
@@ -1589,4 +1720,6 @@ impl Transactor for PermissionedDomainDeleteTransactor {
         }
         delete_owned_object(sandbox, &tx.account, key)
     }
+
+
 }

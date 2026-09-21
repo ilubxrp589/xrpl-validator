@@ -2623,7 +2623,17 @@ impl Transactor for AMMBidTransactor {
         let (bid_min, bid_max) = (bid_of("BidMin"), bid_of("BidMax"));
         // getPayPrice: range-check against BidMin/BidMax, then the bidder
         // must actually hold the price.
+        // fixCleanup3_4_0 (AMMBid.cpp:264-269): a zero-fee pool must not hand
+        // out its slot at zero or dust — the computed price is floored at
+        // `ammAuctionMinSlotPrice(lptAMMBalance, 1)` = lpt × (1/100000) / 25.
+        let zero_fee_floor: Option<crate::tx::offer::Me> =
+            (crate::ledger::amendments::fix_cleanup_3_4_0(sandbox) && tfee == 0)
+                .then(|| n_div(n_mul(lpt_amm, (1, -5), Rnd::Near), (25, 0), Rnd::Near));
         let get_pay_price = |computed: crate::tx::offer::Me| -> Result<crate::tx::offer::Me, TxResult> {
+            let computed = match zero_fee_floor {
+                Some(floor) if ox::me_cmp(computed, floor).is_lt() => floor,
+                _ => computed,
+            };
             let pay = match (bid_min, bid_max) {
                 (Some(mn), Some(mx)) => {
                     if !ox::me_cmp(computed, mx).is_gt() {

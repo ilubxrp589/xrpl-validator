@@ -873,7 +873,14 @@ impl Transactor for EscrowFinishTransactor {
                         ),
                         None => return TxResult::NoDst,
                     };
-                    if bal.saturating_add(tx.fee) < crate::ledger::fees::account_reserve(sandbox, oc + 1) {
+                    // fixCleanup3_4_0 (EscrowFinish.cpp:345-348): the escrow
+                    // being removed no longer counts against its owner's
+                    // reserve — `decreaseOwnerCountForObject(account)` runs
+                    // BEFORE the delivery, so when the destination IS the owner
+                    // the line's reserve is judged at OwnerCount (not + 1).
+                    let recycled = crate::ledger::amendments::fix_cleanup_3_4_0(sandbox) && dest_id == owner_id;
+                    let need = oc + 1 - u64::from(recycled);
+                    if bal.saturating_add(tx.fee) < crate::ledger::fees::account_reserve(sandbox, need) {
                         return TxResult::NoLineInsufReserve;
                     }
                     // `line_adjust` below creates the line as `trustCreate` does.
@@ -1134,6 +1141,21 @@ impl Transactor for EscrowCancelTransactor {
         // #106179351: EscrowCancel attempted=192, MATCH=0, every one of them
         // this shape. We returned nothing and unlinked nothing.
         if let Some((leg, want)) = escrow_iou(&escrow) {
+            // EscrowCancel.cpp:174-178 + escrowUnlockApplyHelper<Issue>: the
+            // owner cancelling its OWN token escrow (`createAsset = account ==
+            // accountID_`) re-creates a line it deleted meanwhile, against
+            // the reserve at OwnerCount + 1 on the pre-fee balance
+            // (tecNO_LINE_INSUF_RESERVE) — under fixCleanup3_4_0 the escrow's
+            // own count is recycled first, so the bar is OwnerCount.
+            if owner_id == tx.account
+                && owner_id != leg.issuer
+                && !sandbox.exists(&keylet::ripple_state_key(&owner_id, &leg.issuer, &leg.cur))
+            {
+                let need = if crate::ledger::amendments::fix_cleanup_3_4_0(sandbox) { oc } else { oc + 1 };
+                if owner_balance.saturating_add(tx.fee) < crate::ledger::fees::account_reserve(sandbox, need) {
+                    return TxResult::NoLineInsufReserve;
+                }
+            }
             crate::tx::offer::line_adjust(sandbox, &owner_id, &leg, want, true);
         }
         // Finding 332: an MPT escrow unlocks back onto the owner's own token
@@ -1888,4 +1910,95 @@ mod tests {
         };
         assert_eq!(EscrowCancelTransactor.preflight(&tx), TxResult::Malformed);
     }
+
+    fn enable_fix340(state: &mut LedgerState) {
+        let am = serde_json::json!({
+            "LedgerEntryType": "Amendments", "Flags": 0,
+            "Amendments": [crate::ledger::amendments::FIX_CLEANUP_3_4_0],
+        });
+        state.state_map.insert(crate::ledger::keylet::amendments_key(), serde_json::to_vec(&am).unwrap()).unwrap();
+    }
+
+    /// fixCleanup3_4_0 (EscrowFinish.cpp:345-348): finishing one's OWN
+    /// self-escrow onto a line deleted meanwhile — the escrow's reserve is
+    /// recycled first, so the new line is judged at OwnerCount, not + 1.
+    #[test]
+    fn escrow_finish_self_escrow_reserve_is_recycled_under_fixcleanup340() {
+        let sender = [0x01u8; 20];
+        let issuer = [0x03u8; 20];
+        let cur = crate::tx::offer::amount_currency20(
+            &serde_json::json!({"currency": "STS", "issuer": hex::encode(issuer), "value": "1"}),
+        )
+        .unwrap();
+        let mut state = make_state();
+        add_account(&mut state, &sender, 50_000_000, 1);
+        add_account(&mut state, &issuer, 50_000_000, 1);
+        {
+            let ikey = keylet::account_root_key(&issuer);
+            let mut ia: serde_json::Value = serde_json::from_slice(&Sandbox::new(&state).read(&ikey).unwrap()).unwrap();
+            ia["Flags"] = serde_json::json!(0x4000_0000u64);
+            state.state_map.insert(ikey, serde_json::to_vec(&ia).unwrap()).unwrap();
+        }
+        let (lo, hi) = if sender < issuer { (sender, issuer) } else { (issuer, sender) };
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+            "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000",
+                        "value": if sender < issuer { "100" } else { "-100" }},
+            "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "1000000"},
+            "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "1000000"},
+        });
+        let lkey = keylet::ripple_state_key(&sender, &issuer, &cur);
+        state.state_map.insert(lkey, serde_json::to_vec(&line).unwrap()).unwrap();
+        let create = TxFields {
+            account: sender, tx_type: "EscrowCreate".to_string(), fee: 12, sequence: 1,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Destination": hex::encode(sender),
+                "Amount": {"currency": "STS", "issuer": hex::encode(issuer), "value": "30"},
+                "FinishAfter": 15,
+            }),
+            inner_batch: false,
+        };
+        let (r, sb) = run_tx(&state, &EscrowCreateTransactor, &create);
+        assert_eq!(r, TxResult::Success);
+        let mods = sb.modifications().clone();
+        drop(sb);
+        // The finish happens in a later ledger: past FinishAfter.
+        state.header.close_time = 20;
+        // Fold the create into the base, then delete the line (the owner
+        // dropped it while the escrow was pending) and pin the XRP balance at
+        // exactly the reserve for ONE object plus the fee.
+        for (k, e) in mods {
+            match e {
+                crate::ledger::sandbox::SandboxEntry::Created(b) | crate::ledger::sandbox::SandboxEntry::Modified(b) => {
+                    state.state_map.insert(k, b).unwrap();
+                }
+                crate::ledger::sandbox::SandboxEntry::Deleted => {
+                    state.state_map.delete(&k).unwrap();
+                }
+            }
+        }
+        state.state_map.delete(&lkey).unwrap();
+        let reserve_one = crate::ledger::fees::account_reserve(&Sandbox::new(&state), 1);
+        {
+            let akey = keylet::account_root_key(&sender);
+            let mut a: serde_json::Value = serde_json::from_slice(&Sandbox::new(&state).read(&akey).unwrap()).unwrap();
+            assert_eq!(a["OwnerCount"].as_u64(), Some(1), "the escrow is the owner's one object");
+            a["Balance"] = serde_json::Value::String((reserve_one + 12).to_string());
+            state.state_map.insert(akey, serde_json::to_vec(&a).unwrap()).unwrap();
+        }
+        let finish = TxFields {
+            account: sender, tx_type: "EscrowFinish".to_string(), fee: 12, sequence: 2,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({"Owner": hex::encode(sender), "OfferSequence": 1}),
+            inner_batch: false,
+        };
+        let (r, _) = run_tx(&state, &EscrowFinishTransactor, &finish);
+        assert_eq!(r, TxResult::NoLineInsufReserve, "pre-amendment: the escrow still counts, the line needs reserve for two");
+        enable_fix340(&mut state);
+        let (r, sb) = run_tx(&state, &EscrowFinishTransactor, &finish);
+        assert_eq!(r, TxResult::Success, "recycled: the line takes the escrow's place");
+        assert!(sb.exists(&lkey), "the line was re-created");
+    }
+
 }

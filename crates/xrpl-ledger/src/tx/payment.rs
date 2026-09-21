@@ -2206,7 +2206,24 @@ impl Transactor for PaymentTransactor {
         // The flow then walks the DOMAIN books only (BookStep's `book_` carries
         // the domain; no AMM there), see the `cross_engine_to` call sites.
         if let Some(d) = crate::tx::offer::tx_domain(tx) {
-            if !crate::tx::misc::account_in_domain(sandbox, &tx.account, &d)
+            if crate::ledger::amendments::fix_cleanup_3_4_0(sandbox) {
+                // fixCleanup3_4_0 (Payment.cpp:480-520): the domain must exist
+                // (tecNO_PERMISSION); the owner is always in it; each other
+                // party passes `validDomain` with tecEXPIRED suppressed (so
+                // do_apply deletes) and tecNO_AUTH → tecNO_PERMISSION.
+                let Some(owner) = crate::tx::misc::domain_owner(sandbox, &d) else {
+                    return TxResult::NoPermission;
+                };
+                for party in [tx.account, dest] {
+                    if party == owner {
+                        continue;
+                    }
+                    match crate::tx::misc::valid_domain(sandbox, &d, &party) {
+                        TxResult::Success | TxResult::Expired => {}
+                        _ => return TxResult::NoPermission,
+                    }
+                }
+            } else if !crate::tx::misc::account_in_domain(sandbox, &tx.account, &d)
                 || !crate::tx::misc::account_in_domain(sandbox, &dest, &d)
             {
                 return TxResult::NoPermission;
@@ -2227,6 +2244,25 @@ impl Transactor for PaymentTransactor {
             Some(d) => d,
             None => return TxResult::Malformed,
         };
+        // fixCleanup3_4_0 (Payment.cpp:525-545): re-verify the domain for the
+        // sender AND the destination on the mutable view, deleting expired
+        // credentials of both; the sender's verdict is reported first.
+        if let Some(d) = crate::tx::offer::tx_domain(tx) {
+            if crate::ledger::amendments::fix_cleanup_3_4_0(sandbox) {
+                let owner = crate::tx::misc::domain_owner(sandbox, &d);
+                let mut verdicts = [TxResult::Success, TxResult::Success];
+                for (i, party) in [tx.account, dest_id].iter().enumerate() {
+                    if Some(*party) != owner {
+                        verdicts[i] = crate::tx::misc::verify_valid_domain(sandbox, party, &d);
+                    }
+                }
+                for v in verdicts {
+                    if v != TxResult::Success {
+                        return v;
+                    }
+                }
+            }
+        }
         // A pseudo-account (AMM, Vault, LoanBroker) cannot receive an ordinary
         // Payment — value enters it only through its own transaction type.
         // rippled: `isPseudoAccount(sleDst) => tecNO_PERMISSION` (Payment.cpp
@@ -5082,4 +5118,47 @@ mod tests {
         f.inner_batch = true;
         assert_ne!(PaymentTransactor.preflight(&f), TxResult::BadFee, "inner: Fee 0 is the rule");
     }
+
+    fn enable_fix340(state: &mut LedgerState) {
+        let am = serde_json::json!({
+            "LedgerEntryType": "Amendments", "Flags": 0,
+            "Amendments": [crate::ledger::amendments::FIX_CLEANUP_3_4_0],
+        });
+        state.state_map.insert(crate::ledger::keylet::amendments_key(), serde_json::to_vec(&am).unwrap()).unwrap();
+    }
+
+    /// fixCleanup3_4_0 (Payment.cpp:480-520): a party whose only credential is
+    /// EXPIRED passes preclaim (do_apply deletes it and answers tecEXPIRED);
+    /// a missing domain is tecNO_PERMISSION. Pre-amendment the expired party
+    /// is simply outside the domain (finding 333).
+    #[test]
+    fn preclaim_domain_under_fixcleanup340_suppresses_expired_and_refuses_a_missing_domain() {
+        let sender = [0x01u8; 20];
+        let dest = [0x02u8; 20];
+        let issuer = [0x03u8; 20];
+        let mut state = make_state();
+        add_account(&mut state, &sender, 50_000_000, 1);
+        add_account(&mut state, &dest, 50_000_000, 1);
+        let dkey = Hash256([0x66u8; 32]);
+        let pd = serde_json::json!({
+            "LedgerEntryType": "PermissionedDomain", "Flags": 0, "Owner": hex::encode(sender), "Sequence": 1,
+            "AcceptedCredentials": [{"Credential": {"Issuer": hex::encode(issuer), "CredentialType": "AB"}}],
+        });
+        state.state_map.insert(dkey, serde_json::to_vec(&pd).unwrap()).unwrap();
+        let cred = serde_json::json!({
+            "LedgerEntryType": "Credential", "Subject": hex::encode(dest), "Issuer": hex::encode(issuer),
+            "CredentialType": "AB", "Flags": 0x0001_0000u64, "Expiration": 5u64,
+        });
+        let ckey = crate::tx::credential::credential_key(&dest, &issuer, &hex::decode("AB").unwrap());
+        state.state_map.insert(ckey, serde_json::to_vec(&cred).unwrap()).unwrap();
+        let mut tx = payment_tx(sender, dest, 1_000_000, 12, 1);
+        tx.fields["DomainID"] = serde_json::Value::String(hex::encode_upper(dkey.0));
+        assert_eq!(PaymentTransactor.preclaim(&tx, &Sandbox::new(&state)), TxResult::NoPermission, "pre-amendment: expired = outside");
+        enable_fix340(&mut state);
+        let sandbox = Sandbox::new(&state);
+        assert_eq!(PaymentTransactor.preclaim(&tx, &sandbox), TxResult::Success, "tecEXPIRED suppressed for do_apply");
+        tx.fields["DomainID"] = serde_json::Value::String(hex::encode_upper([0x67u8; 32]));
+        assert_eq!(PaymentTransactor.preclaim(&tx, &sandbox), TxResult::NoPermission, "missing domain");
+    }
+
 }

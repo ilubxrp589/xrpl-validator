@@ -1159,7 +1159,18 @@ pub(crate) fn require_auth_ter(
         return Some(match line {
             Some(l) => {
                 let bit = if account > &leg.issuer { LSF_LOW_AUTH } else { LSF_HIGH_AUTH };
-                if l["Flags"].as_u64().unwrap_or(0) & bit != 0 { TxResult::Success } else { TxResult::NoAuth }
+                if l["Flags"].as_u64().unwrap_or(0) & bit != 0 {
+                    TxResult::Success
+                } else if crate::ledger::amendments::fix_cleanup_3_4_0(sandbox)
+                    && crate::tx::misc::is_pseudo_account(sandbox, account)
+                {
+                    // fixCleanup3_4_0 (RippleStateHelpers.cpp:592): a
+                    // pseudo-account (AMM, Vault) cannot submit transactions
+                    // and only holds for its object — implicitly authorized.
+                    TxResult::Success
+                } else {
+                    TxResult::NoAuth
+                }
             }
             None => TxResult::NoLine,
         });
@@ -9530,6 +9541,16 @@ impl Transactor for OfferCreateTransactor {
                 let Some(iss) = json_at(sandbox, &keylet::account_root_key(&pays.issuer)) else {
                     return TxResult::NoIssuer;
                 };
+                // fixCleanup3_4_0 (OfferCreate.cpp:314-322): an issuer with
+                // lsfDisallowIncomingTrustline can only pay a taker who already
+                // holds a line — tecNO_LINE.
+                const LSF_DISALLOW_INCOMING_TRUSTLINE: u64 = 0x2000_0000;
+                if crate::ledger::amendments::fix_cleanup_3_4_0(sandbox)
+                    && iss["Flags"].as_u64().unwrap_or(0) & LSF_DISALLOW_INCOMING_TRUSTLINE != 0
+                    && !sandbox.exists(&keylet::ripple_state_key(&tx.account, &pays.issuer, &pays.cur))
+                {
+                    return TxResult::NoLine;
+                }
                 if iss["Flags"].as_u64().unwrap_or(0) & LSF_REQUIRE_AUTH != 0 {
                     let lkey = keylet::ripple_state_key(&tx.account, &pays.issuer, &pays.cur);
                     let Some(line) = json_at(sandbox, &lkey) else {
@@ -9546,7 +9567,21 @@ impl Transactor for OfferCreateTransactor {
         // creator must belong to — owner, or holder of an accepted unexpired
         // credential the domain lists — else tecNO_PERMISSION, judged LAST.
         if let Some(d) = tx_domain(tx) {
-            if !crate::tx::misc::account_in_domain(sandbox, &tx.account, &d) {
+            if crate::ledger::amendments::fix_cleanup_3_4_0(sandbox) {
+                // fixCleanup3_4_0 (OfferCreate.cpp:245-262): the domain must
+                // exist (tecNO_PERMISSION); its owner is always in it; anyone
+                // else passes `validDomain`, tecEXPIRED suppressed here so
+                // do_apply can delete the expired credentials, tecNO_AUTH
+                // mapped to tecNO_PERMISSION.
+                match crate::tx::misc::domain_owner(sandbox, &d) {
+                    None => return TxResult::NoPermission,
+                    Some(o) if o == tx.account => {}
+                    Some(_) => match crate::tx::misc::valid_domain(sandbox, &d, &tx.account) {
+                        TxResult::Success | TxResult::Expired => {}
+                        _ => return TxResult::NoPermission,
+                    },
+                }
+            } else if !crate::tx::misc::account_in_domain(sandbox, &tx.account, &d) {
                 return TxResult::NoPermission;
             }
         }
@@ -9557,6 +9592,20 @@ impl Transactor for OfferCreateTransactor {
         // rippled's AMMContext lives for the whole flow of ONE transaction.
         let _amm_ctx = crate::tx::amm_swap::AmmCtxGuard::new();
         soft_stale_clear();
+        // fixCleanup3_4_0 (OfferCreate.cpp:1032-1045): re-verify the domain on
+        // the mutable view and delete the creator's expired credentials —
+        // tecEXPIRED when only expired ones were found (the deletions stand),
+        // tecNO_PERMISSION when none. The owner needs no credential.
+        if let Some(d) = tx_domain(tx) {
+            if crate::ledger::amendments::fix_cleanup_3_4_0(sandbox)
+                && crate::tx::misc::domain_owner(sandbox, &d) != Some(tx.account)
+            {
+                let r = crate::tx::misc::verify_valid_domain(sandbox, &tx.account, &d);
+                if r != TxResult::Success {
+                    return r;
+                }
+            }
+        }
         // rippled's `preFeeBalance_` (Transactor.cpp:896): the creator's XRP
         // balance as of BEFORE this transaction's fee was taken. Captured here,
         // ahead of the OfferSequence cancel and the crossing, because the
@@ -13273,4 +13322,43 @@ mod tests {
         let mods = sandbox.into_modifications();
         assert!(mods.contains_key(&lkey), "a representable move still writes");
     }
+
+    /// fixCleanup3_4_0 (RippleStateHelpers.cpp:592): a pseudo-account's
+    /// unauthorized line under a RequireAuth issuer is implicitly authorized.
+    #[test]
+    fn require_auth_admits_a_pseudo_account_under_fixcleanup340() {
+        let pool = [0x11u8; 20];
+        let issuer = [0x22u8; 20];
+        let mut state = make_state_with_account(&pool, 100_000_000);
+        let ikey = keylet::account_root_key(&issuer);
+        let iss = serde_json::json!({
+            "LedgerEntryType": "AccountRoot", "Account": hex::encode(issuer), "Balance": "100000000",
+            "Sequence": 1, "OwnerCount": 0, "Flags": 0x0004_0000u64,
+        });
+        state.state_map.insert(ikey, serde_json::to_vec(&iss).unwrap()).unwrap();
+        let cur = amount_currency20(&serde_json::json!({"currency": "USD", "issuer": hex::encode(issuer), "value": "1"})).unwrap();
+        let (lo, hi) = if pool < issuer { (pool, issuer) } else { (issuer, pool) };
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState", "Flags": 0u64,
+            "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000", "value": "0"},
+            "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "0"},
+            "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "0"},
+        });
+        state.state_map.insert(keylet::ripple_state_key(&pool, &issuer, &cur), serde_json::to_vec(&line).unwrap()).unwrap();
+        let leg = Leg { xrp: false, cur, issuer };
+        let mut sb = Sandbox::new(&state);
+        assert_eq!(require_auth_ter(&sb, &leg, &pool, false), Some(TxResult::NoAuth), "an ordinary account needs the auth bit");
+        let pkey = keylet::account_root_key(&pool);
+        let mut p: serde_json::Value = serde_json::from_slice(&sb.read(&pkey).unwrap()).unwrap();
+        p["AMMID"] = serde_json::Value::String("11".repeat(32));
+        sb.write(pkey, serde_json::to_vec(&p).unwrap());
+        assert_eq!(require_auth_ter(&sb, &leg, &pool, false), Some(TxResult::NoAuth), "so does a pseudo-account pre-amendment");
+        let am = serde_json::json!({
+            "LedgerEntryType": "Amendments", "Flags": 0,
+            "Amendments": [crate::ledger::amendments::FIX_CLEANUP_3_4_0],
+        });
+        sb.write(keylet::amendments_key(), serde_json::to_vec(&am).unwrap());
+        assert_eq!(require_auth_ter(&sb, &leg, &pool, false), Some(TxResult::Success), "implicitly authorized under fixCleanup3_4_0");
+    }
+
 }
