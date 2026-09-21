@@ -154,3 +154,24 @@ fn deposit_preauth_unauthorize_drops_the_emptied_owner_directory_106869297() {
 fn deposit_preauth_needs_the_owner_reserve_106919118() {
     run_bundle(include_str!("vectors/deposit_preauth_needs_the_owner_reserve_106919118.json"));
 }
+
+/// Campaign 14 (testnet PayChan / Check / DepositAuth depth, 2026-09-21) 3-2: t1 pays t3 1 XRP under DepositAuth.
+/// Testnet's verdict, byte-exact.
+#[test]
+fn deposit_c14_payment_into_deposit_auth_is_tec_no_permission_3720aefa4ea7() {
+    run_bundle(include_str!("vectors/deposit_c14_payment_into_deposit_auth_is_tec_no_permission_3720AEFA4EA7.json"));
+}
+
+/// Campaign 14 (testnet PayChan / Check / DepositAuth depth, 2026-09-21) 3-4: t1 pays t3 after DepositPreauth.
+/// Testnet's verdict, byte-exact.
+#[test]
+fn deposit_c14_preauthorized_payment_473859fa8af3() {
+    run_bundle(include_str!("vectors/deposit_c14_preauthorized_payment_473859FA8AF3.json"));
+}
+
+/// Campaign 14 (testnet PayChan / Check / DepositAuth depth, 2026-09-21) 3-12: t1 pays t3 after the preauth was removed.
+/// Testnet's verdict, byte-exact.
+#[test]
+fn deposit_c14_payment_after_revocation_is_tec_no_permission_3123e7f76b12() {
+    run_bundle(include_str!("vectors/deposit_c14_payment_after_revocation_is_tec_no_permission_3123E7F76B12.json"));
+}

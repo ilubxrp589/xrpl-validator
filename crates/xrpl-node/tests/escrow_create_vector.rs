@@ -299,3 +299,31 @@ fn escrow_finish_with_a_pair_on_an_unconditioned_escrow_is_cryptocondition_error
 fn escrow_finish_with_the_right_fulfillment_testnet_20937667() {
     run_bundle(include_str!("vectors/escrow_finish_with_the_right_fulfillment_testnet_20937667.json"));
 }
+
+/// Campaign 14 (testnet PayChan / Check / DepositAuth depth, 2026-09-21) 3-6: t2 escrows 1 XRP to t3 under DepositAuth.
+/// Testnet's verdict, byte-exact.
+#[test]
+fn escrow_c14_create_into_a_deposit_auth_destination_is_tec_no_permission_8ff0c388bfb1() {
+    run_bundle(include_str!("vectors/escrow_c14_create_into_a_deposit_auth_destination_is_tec_no_permission_8FF0C388BFB1.json"));
+}
+
+/// Campaign 14 (testnet PayChan / Check / DepositAuth depth, 2026-09-21) 3-6c: t3 escrows to itself under its own DepositAuth.
+/// Testnet's verdict, byte-exact.
+#[test]
+fn escrow_c14_self_escrow_under_deposit_auth_is_tec_no_permission_a0bc073218e0() {
+    run_bundle(include_str!("vectors/escrow_c14_self_escrow_under_deposit_auth_is_tec_no_permission_A0BC073218E0.json"));
+}
+
+/// Campaign 14 (testnet PayChan / Check / DepositAuth depth, 2026-09-21) 3-7: t2 finishes t1's escrow into t3 under DepositAuth (finding 356).
+/// Testnet's verdict, byte-exact.
+#[test]
+fn escrow_c14_finish_into_a_deposit_auth_destination_needs_preauth_cfd60cb8ba7a() {
+    run_bundle(include_str!("vectors/escrow_c14_finish_into_a_deposit_auth_destination_needs_preauth_CFD60CB8BA7A.json"));
+}
+
+/// Campaign 14 (testnet PayChan / Check / DepositAuth depth, 2026-09-21) 3-8: t1 (preauthorized) finishes.
+/// Testnet's verdict, byte-exact.
+#[test]
+fn escrow_c14_preauthorized_finisher_into_a_deposit_auth_destination_6b53bcc7bf3f() {
+    run_bundle(include_str!("vectors/escrow_c14_preauthorized_finisher_into_a_deposit_auth_destination_6B53BCC7BF3F.json"));
+}

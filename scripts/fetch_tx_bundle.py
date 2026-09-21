@@ -621,6 +621,27 @@ def main():
             if tt == "NFTokenMint" and tx.get("Issuer"):
                 _root(acct_id(tx["Issuer"]))
             if tx.get("Destination"): _root(acct_id(tx["Destination"]))
+        # Finding 356 / campaign 14: verifyDepositPreauth reads the
+        # destination's root and DepositPreauth(dst, src) — a fee-only
+        # tecNO_PERMISSION names neither, and a preauthorized tesSUCCESS
+        # never touches the preauth object. The destination comes from the
+        # tx (Payment), the escrow (EscrowFinish) or the channel
+        # (PaymentChannelClaim).
+        if tt in ("Payment", "EscrowFinish", "PaymentChannelClaim", "CheckCash"):
+            import hashlib as _hl2
+            dst = None
+            if tt == "Payment":
+                dst = tx.get("Destination")
+            elif tt == "EscrowFinish" and tx.get("Owner") and tx.get("OfferSequence") is not None:
+                k = _hl2.sha512(b"\x00u" + bytes.fromhex(acct_id(tx["Owner"])) + int(tx["OfferSequence"]).to_bytes(4, "big")).digest()[:32].hex().upper()
+                dst = (rpc("ledger_entry", {"index": k, "ledger_index": seq - 1}).get("node") or {}).get("Destination")
+            elif tt == "PaymentChannelClaim" and isinstance(tx.get("Channel"), str):
+                dst = (rpc("ledger_entry", {"index": tx["Channel"], "ledger_index": seq - 1}).get("node") or {}).get("Destination")
+            elif tt == "CheckCash" and isinstance(tx.get("CheckID"), str):
+                dst = (rpc("ledger_entry", {"index": tx["CheckID"], "ledger_index": seq - 1}).get("node") or {}).get("Account")
+            if dst:
+                _put(rpc("ledger_entry", {"account_root": dst, "ledger_index": seq - 1, "binary": True}))
+                _put(rpc("ledger_entry", {"deposit_preauth": {"owner": dst, "authorized": tx["Account"]}, "ledger_index": seq - 1, "binary": True}))
         if tt in ("CredentialCreate", "CredentialAccept", "CredentialDelete") and tx.get("CredentialType"):
             subj = tx.get("Subject") or (tx["Account"] if tt != "CredentialCreate" else tx["Account"])
             issr = tx.get("Issuer") or tx["Account"]

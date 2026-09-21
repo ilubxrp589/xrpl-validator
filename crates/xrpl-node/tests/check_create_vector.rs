@@ -114,3 +114,45 @@ fn run_bundle(bundle_json: &str) {
 fn check_create_refuses_a_frozen_send_max() {
     run_bundle(include_str!("vectors/check_create_frozen_sendmax_106708057.json"));
 }
+
+/// Campaign 14 (testnet PayChan / Check / DepositAuth depth, 2026-09-21) 2-9: t3 cancels an unexpired check.
+/// Testnet's verdict, byte-exact.
+#[test]
+fn check_c14_cancel_by_a_stranger_is_tec_no_permission_fd28df79ec52() {
+    run_bundle(include_str!("vectors/check_c14_cancel_by_a_stranger_is_tec_no_permission_FD28DF79EC52.json"));
+}
+
+/// Campaign 14 (testnet PayChan / Check / DepositAuth depth, 2026-09-21) 2-10: t2 cancels.
+/// Testnet's verdict, byte-exact.
+#[test]
+fn check_c14_cancel_by_the_destination_e6ee3c370fc9() {
+    run_bundle(include_str!("vectors/check_c14_cancel_by_the_destination_E6EE3C370FC9.json"));
+}
+
+/// Campaign 14 (testnet PayChan / Check / DepositAuth depth, 2026-09-21) 2-13: t3 cancels after Expiration.
+/// Testnet's verdict, byte-exact.
+#[test]
+fn check_c14_stranger_cancels_an_expired_check_09ba231ab8bf() {
+    run_bundle(include_str!("vectors/check_c14_stranger_cancels_an_expired_check_09BA231AB8BF.json"));
+}
+
+/// Campaign 14 (testnet PayChan / Check / DepositAuth depth, 2026-09-21) 2-15: t1 cancels.
+/// Testnet's verdict, byte-exact.
+#[test]
+fn check_c14_cancel_by_the_owner_038327f5e91c() {
+    run_bundle(include_str!("vectors/check_c14_cancel_by_the_owner_038327F5E91C.json"));
+}
+
+/// Campaign 14 (testnet PayChan / Check / DepositAuth depth, 2026-09-21) 2-27: t1 cancels a check already cashed.
+/// Testnet's verdict, byte-exact.
+#[test]
+fn check_c14_cancel_of_a_cashed_check_is_tec_no_entry_591b1fa15c10() {
+    run_bundle(include_str!("vectors/check_c14_cancel_of_a_cashed_check_is_tec_no_entry_591B1FA15C10.json"));
+}
+
+/// Campaign 14 (testnet PayChan / Check / DepositAuth depth, 2026-09-21) 2-18: t1 writes t2 a check without a tag.
+/// Testnet's verdict, byte-exact.
+#[test]
+fn check_c14_create_to_a_require_dest_account_is_tec_dst_tag_needed_1d431861a64c() {
+    run_bundle(include_str!("vectors/check_c14_create_to_a_require_dest_account_is_tec_dst_tag_needed_1D431861A64C.json"));
+}

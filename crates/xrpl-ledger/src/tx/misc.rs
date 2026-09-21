@@ -1719,6 +1719,84 @@ pub(crate) fn verify_valid_domain(sandbox: &mut Sandbox, subject: &[u8; 20], dom
 /// rippled `isPseudoAccount` — an AccountRoot carrying a designator field
 /// (sfAMMID / sfVaultID / sfLoanBrokerID); such an account cannot submit
 /// transactions and only stores assets for the object that owns it.
+/// Finding 356 — rippled `verifyDepositPreauth` (CredentialHelpers.cpp:419):
+/// `cleanupExpiredCredentials` first — every CredentialIDs entry whose
+/// Expiration is at or before the parent close time is DELETED and the
+/// transaction is tecEXPIRED (the deletions stand: a tec keeps them) — then
+/// `checkDepositPreauth`: a destination flagged lsfDepositAuth admits `src`
+/// only when src == dst, a DepositPreauth(dst, src) object exists, or the
+/// transaction's credentials name a DepositPreauth(dst, sorted (Issuer,
+/// CredentialType)) object; otherwise tecNO_PERMISSION. EscrowFinish
+/// (EscrowFinish.cpp:316) and PaymentChannelClaim
+/// (PaymentChannelClaim.cpp:167) call it right after the destination is
+/// known to exist; Payment keeps its own copy (it carries the base-reserve
+/// XRP exception). EscrowFinish never asked (campaign 14, testnet
+/// CFD60CB8BA7A: rLwpxA2x finishes rFSyfuyX's escrow into rfbxt9z4 under
+/// DepositAuth without a preauth — testnet tecNO_PERMISSION, ours paid).
+pub(crate) fn verify_deposit_preauth(
+    sandbox: &mut Sandbox,
+    tx: &TxFields,
+    src: &[u8; 20],
+    dst: &[u8; 20],
+    dst_root: &serde_json::Value,
+) -> TxResult {
+    let cred_ids: Vec<xrpl_core::types::Hash256> = tx
+        .fields
+        .get("CredentialIDs")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .filter_map(|h| hex::decode(h).ok())
+                .filter_map(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                .map(xrpl_core::types::Hash256)
+                .collect()
+        })
+        .unwrap_or_default();
+    if !cred_ids.is_empty() {
+        let now = sandbox.base().close_time() as u64;
+        let mut expired = false;
+        for k in &cred_ids {
+            let exp = crate::tx::offer::json_at(sandbox, k).and_then(|c| c.get("Expiration").and_then(|v| v.as_u64()));
+            if exp.is_some_and(|e| now > e) {
+                crate::tx::credential::delete_credential_object(sandbox, k);
+                expired = true;
+            }
+        }
+        if expired {
+            return TxResult::Expired;
+        }
+    }
+    if dst_root["Flags"].as_u64().unwrap_or(0) & 0x0100_0000 == 0 || src == dst {
+        return TxResult::Success;
+    }
+    if sandbox.read(&keylet::deposit_preauth_key(dst, src)).is_some() {
+        return TxResult::Success;
+    }
+    if cred_ids.is_empty() {
+        return TxResult::NoPermission;
+    }
+    // `authorizedDepositPreauth`: the credentials' (Issuer, CredentialType)
+    // pairs, sorted and unique, name the preauth object.
+    let mut sorted: Vec<([u8; 20], Vec<u8>)> = Vec::new();
+    for k in &cred_ids {
+        let Some(c) = crate::tx::offer::json_at(sandbox, k) else { return TxResult::NoPermission };
+        let (Some(issuer), Some(ct)) = (
+            c.get("Issuer").and_then(|v| v.as_str()).and_then(crate::tx::offer::decode20),
+            c.get("CredentialType").and_then(|v| v.as_str()).and_then(|h| hex::decode(h).ok()),
+        ) else {
+            return TxResult::NoPermission;
+        };
+        sorted.push((issuer, ct));
+    }
+    sorted.sort();
+    sorted.dedup();
+    if sandbox.read(&keylet::deposit_preauth_credentials_key(dst, &sorted)).is_none() {
+        return TxResult::NoPermission;
+    }
+    TxResult::Success
+}
+
 pub(crate) fn is_pseudo_account(sandbox: &Sandbox, account: &[u8; 20]) -> bool {
     crate::tx::offer::json_at(sandbox, &keylet::account_root_key(account))
         .is_some_and(|a| a.get("AMMID").is_some() || a.get("VaultID").is_some() || a.get("LoanBrokerID").is_some())

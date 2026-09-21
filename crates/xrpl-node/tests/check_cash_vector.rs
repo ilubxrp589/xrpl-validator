@@ -171,3 +171,73 @@ fn check_cancel_of_an_expired_check_by_a_stranger_106900377() {
 fn check_cash_onto_a_line_the_issuer_froze_is_frozen_devnet_5488076() {
     run_bundle(include_str!("vectors/check_cash_onto_a_line_the_issuer_froze_is_frozen_devnet_5488076.json"));
 }
+
+/// Campaign 14 (testnet PayChan / Check / DepositAuth depth, 2026-09-21) 2-2: t2 cashes exactly 1 XRP.
+/// Testnet's verdict, byte-exact.
+#[test]
+fn check_c14_cash_exact_xrp_367f84648f92() {
+    run_bundle(include_str!("vectors/check_c14_cash_exact_xrp_367F84648F92.json"));
+}
+
+/// Campaign 14 (testnet PayChan / Check / DepositAuth depth, 2026-09-21) 2-3: the same check again.
+/// Testnet's verdict, byte-exact.
+#[test]
+fn check_c14_cash_twice_is_tec_no_entry_b2d1e9804441() {
+    run_bundle(include_str!("vectors/check_c14_cash_twice_is_tec_no_entry_B2D1E9804441.json"));
+}
+
+/// Campaign 14 (testnet PayChan / Check / DepositAuth depth, 2026-09-21) 2-5: t3 cashes t2's check.
+/// Testnet's verdict, byte-exact.
+#[test]
+fn check_c14_cash_by_a_non_destination_is_tec_no_permission_ea1adcdababe() {
+    run_bundle(include_str!("vectors/check_c14_cash_by_a_non_destination_is_tec_no_permission_EA1ADCDABABE.json"));
+}
+
+/// Campaign 14 (testnet PayChan / Check / DepositAuth depth, 2026-09-21) 2-6: 3 XRP against SendMax 2.
+/// Testnet's verdict, byte-exact.
+#[test]
+fn check_c14_cash_over_send_max_is_tec_path_partial_7b28a418d71c() {
+    run_bundle(include_str!("vectors/check_c14_cash_over_send_max_is_tec_path_partial_7B28A418D71C.json"));
+}
+
+/// Campaign 14 (testnet PayChan / Check / DepositAuth depth, 2026-09-21) 2-7: DeliverMin 1.5 on a 2 XRP check.
+/// Testnet's verdict, byte-exact.
+#[test]
+fn check_c14_cash_deliver_min_takes_all_of_send_max_c7bdb454d66c() {
+    run_bundle(include_str!("vectors/check_c14_cash_deliver_min_takes_all_of_send_max_C7BDB454D66C.json"));
+}
+
+/// Campaign 14 (testnet PayChan / Check / DepositAuth depth, 2026-09-21) 2-12: cashed after Expiration.
+/// Testnet's verdict, byte-exact.
+#[test]
+fn check_c14_cash_expired_is_tec_expired_3ae972ad6938() {
+    run_bundle(include_str!("vectors/check_c14_cash_expired_is_tec_expired_3AE972AD6938.json"));
+}
+
+/// Campaign 14 (testnet PayChan / Check / DepositAuth depth, 2026-09-21) 2-21: t5 cashes 2 USD of a 3 USD check.
+/// Testnet's verdict, byte-exact.
+#[test]
+fn check_c14_cash_iou_exact_e9489509a268() {
+    run_bundle(include_str!("vectors/check_c14_cash_iou_exact_E9489509A268.json"));
+}
+
+/// Campaign 14 (testnet PayChan / Check / DepositAuth depth, 2026-09-21) 2-23: t5 cashes 50 USD.
+/// Testnet's verdict, byte-exact.
+#[test]
+fn check_c14_cash_iou_fifty_ee77bca7e3db() {
+    run_bundle(include_str!("vectors/check_c14_cash_iou_fifty_EE77BCA7E3DB.json"));
+}
+
+/// Campaign 14 (testnet PayChan / Check / DepositAuth depth, 2026-09-21) 2-26: t3 cashes 1 USD with no line of its own.
+/// Testnet's verdict, byte-exact.
+#[test]
+fn check_c14_cash_iou_creates_the_cashers_line_37dcf13e4e57() {
+    run_bundle(include_str!("vectors/check_c14_cash_iou_creates_the_cashers_line_37DCF13E4E57.json"));
+}
+
+/// Campaign 14 (testnet PayChan / Check / DepositAuth depth, 2026-09-21) 3-10: t3 (DepositAuth) cashes t2's check.
+/// Testnet's verdict, byte-exact.
+#[test]
+fn check_c14_destination_cashes_under_its_own_deposit_auth_e6192bf5b148() {
+    run_bundle(include_str!("vectors/check_c14_destination_cashes_under_its_own_deposit_auth_E6192BF5B148.json"));
+}

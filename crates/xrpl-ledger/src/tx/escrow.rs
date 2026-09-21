@@ -967,6 +967,14 @@ impl Transactor for EscrowFinishTransactor {
             Ok(v) => v,
             Err(_) => return TxResult::Malformed,
         };
+        // Finding 356: verifyDepositPreauth (EscrowFinish.cpp:316) — right
+        // after tecNO_DST, before any delivery.
+        {
+            let r = crate::tx::misc::verify_deposit_preauth(sandbox, tx, &tx.account, &dest_id, &dest);
+            if !matches!(r, TxResult::Success) {
+                return r;
+            }
+        }
 
         // Finding 164: a token escrow's delivery, `escrowUnlockApplyHelper`
         // (EscrowHelpers.h). The receiver must hold a line unless it is the
@@ -2193,5 +2201,61 @@ mod tests {
         let mut fbig = vec![0xA0, 0x81, 0x83, 0x80, 0x81, 0x81];
         fbig.extend_from_slice(&big);
         assert!(parse_preimage_fulfillment(&fbig).is_none());
+    }
+
+    /// Finding 356: an EscrowFinish into a destination under lsfDepositAuth
+    /// by anyone but the destination or a preauthorized account is
+    /// tecNO_PERMISSION (verifyDepositPreauth, EscrowFinish.cpp:316).
+    #[test]
+    fn escrow_finish_into_a_deposit_auth_destination_needs_preauth() {
+        let owner = [0x11u8; 20];
+        let dest = [0x22u8; 20];
+        let finisher = [0x33u8; 20];
+        let mut state = make_state();
+        add_account(&mut state, &owner, 50_000_000, 1);
+        add_account(&mut state, &dest, 50_000_000, 1);
+        add_account(&mut state, &finisher, 50_000_000, 1);
+        {
+            let dkey = keylet::account_root_key(&dest);
+            let mut d: serde_json::Value = serde_json::from_slice(&Sandbox::new(&state).read(&dkey).unwrap()).unwrap();
+            d["Flags"] = serde_json::json!(0x0100_0000u64);
+            state.state_map.insert(dkey, serde_json::to_vec(&d).unwrap()).unwrap();
+        }
+        let create = TxFields {
+            account: owner, tx_type: "EscrowCreate".to_string(), fee: 12, sequence: 1,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({"Destination": hex::encode(dest), "Amount": "1000000", "FinishAfter": 15}),
+            inner_batch: false,
+        };
+        let (r, sb) = run_tx(&state, &EscrowCreateTransactor, &create);
+        assert_eq!(r, TxResult::Success);
+        let mods = sb.modifications().clone();
+        drop(sb);
+        state.header.close_time = 20;
+        for (k, e) in mods {
+            match e {
+                crate::ledger::sandbox::SandboxEntry::Created(b) | crate::ledger::sandbox::SandboxEntry::Modified(b) => {
+                    state.state_map.insert(k, b).unwrap();
+                }
+                crate::ledger::sandbox::SandboxEntry::Deleted => {
+                    state.state_map.delete(&k).unwrap();
+                }
+            }
+        }
+        let finish = |who: [u8; 20]| TxFields {
+            account: who, tx_type: "EscrowFinish".to_string(), fee: 12, sequence: 2,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({"Owner": hex::encode(owner), "OfferSequence": 1}),
+            inner_batch: false,
+        };
+        let (r, _) = run_tx(&state, &EscrowFinishTransactor, &finish(finisher));
+        assert_eq!(r, TxResult::NoPermission, "a stranger cannot push funds into a DepositAuth account");
+        let (r, _) = run_tx(&state, &EscrowFinishTransactor, &finish(owner));
+        assert_eq!(r, TxResult::NoPermission, "nor can the owner");
+        let (r, _) = run_tx(&state, &EscrowFinishTransactor, &finish(dest));
+        assert_eq!(r, TxResult::Success, "the destination itself may");
+        state.state_map.insert(keylet::deposit_preauth_key(&dest, &finisher), serde_json::to_vec(&serde_json::json!({"LedgerEntryType": "DepositPreauth", "Account": hex::encode(dest), "Authorize": hex::encode(finisher), "Flags": 0, "OwnerNode": "0"})).unwrap()).unwrap();
+        let (r, _) = run_tx(&state, &EscrowFinishTransactor, &finish(finisher));
+        assert_eq!(r, TxResult::Success, "a preauthorized finisher may");
     }
 }

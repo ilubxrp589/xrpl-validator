@@ -464,13 +464,14 @@ impl Transactor for PaymentChannelClaimTransactor {
                 return TxResult::NoDst;
             };
 
-            // verifyDepositPreauth, basic arm (credential-granted preauth is
-            // unported — no specimen exercises it).
-            if dest_acct["Flags"].as_u64().unwrap_or(0) & 0x0100_0000 != 0
-                && tx.account != dest
-                && sandbox.read(&keylet::deposit_preauth_key(&dest, &tx.account)).is_none()
+            // verifyDepositPreauth (PaymentChannelClaim.cpp:167) — finding
+            // 356's shared port: by-account preauth, credential-named preauth,
+            // expired-credential cleanup.
             {
-                return TxResult::NoPermission;
+                let r = crate::tx::misc::verify_deposit_preauth(sandbox, tx, &tx.account, &dest, &dest_acct);
+                if !matches!(r, TxResult::Success) {
+                    return r;
+                }
             }
 
             channel["Balance"] = serde_json::Value::String(req_balance.to_string());
