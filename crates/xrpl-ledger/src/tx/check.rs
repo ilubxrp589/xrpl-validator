@@ -361,6 +361,45 @@ impl Transactor for CheckCashTransactor {
                 return TxResult::PathPartial;
             }
         }
+        // Finding 348 (devnet #5488076 2D0C412F, cashing a USD check onto a
+        // casher line the issuer froze): CheckCash.cpp:224-252, after the
+        // funds test — for a non-native SendMax whose issuer is not the
+        // casher: the issuer must exist (tecNO_ISSUER); under its
+        // lsfRequireAuth the casher's line must exist and carry the
+        // issuer-side auth bit (tecNO_AUTH, not tecNO_LINE); and
+        // `isFrozen(casher, currency, issuer)` — the issuer's global freeze
+        // or its freeze bit on the casher's line — is tecFROZEN. We ran the
+        // flow and answered tecPATH_PARTIAL.
+        if !leg.xrp && leg.issuer != tx.account {
+            const LSF_REQUIRE_AUTH: u64 = 0x0004_0000;
+            const LSF_GLOBAL_FREEZE: u64 = 0x0040_0000;
+            const LSF_LOW_AUTH: u64 = 0x0004_0000;
+            const LSF_HIGH_AUTH: u64 = 0x0008_0000;
+            const LSF_LOW_FREEZE: u64 = 0x0040_0000;
+            const LSF_HIGH_FREEZE: u64 = 0x0080_0000;
+            let Some(iss) = ox::json_at(sandbox, &crate::ledger::keylet::account_root_key(&leg.issuer)) else {
+                return TxResult::NoIssuer;
+            };
+            let iflags = iss["Flags"].as_u64().unwrap_or(0);
+            let line = ox::json_at(sandbox, &crate::ledger::keylet::ripple_state_key(&tx.account, &leg.issuer, &leg.cur));
+            let lflags = line.as_ref().map(|l| l["Flags"].as_u64().unwrap_or(0));
+            if iflags & LSF_REQUIRE_AUTH != 0 {
+                let Some(lf) = lflags else { return TxResult::NoAuth };
+                let bit = if tx.account > leg.issuer { LSF_LOW_AUTH } else { LSF_HIGH_AUTH };
+                if lf & bit == 0 {
+                    return TxResult::NoAuth;
+                }
+            }
+            if iflags & LSF_GLOBAL_FREEZE != 0 {
+                return TxResult::Frozen;
+            }
+            let fbit = if leg.issuer > tx.account { LSF_HIGH_FREEZE } else { LSF_LOW_FREEZE };
+            if lflags.is_some_and(|lf| lf & fbit != 0) {
+                return TxResult::Frozen;
+            }
+        }
+        {
+        }
         // Finding 234 (#106849342 0B8830B868D4): a check is cashed by rippled's
         // PAYMENT ENGINE, not by a transfer of the requested amount
         // (CheckCash.cpp:331-577). XRP: `xrpDeliver = DeliverMin ?

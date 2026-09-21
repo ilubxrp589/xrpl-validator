@@ -714,6 +714,14 @@ impl Transactor for EscrowFinishTransactor {
 
     /// val-074: State validation — escrow must exist.
     fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        // Finding 349 (devnet #5488110 32C544D4, an EscrowFinish naming a
+        // credential that does not exist): `credentials::valid` is the FIRST
+        // thing EscrowFinish::preclaim does (EscrowFinish.cpp:196-201) —
+        // tecBAD_CREDENTIALS, where we fell through to tecNO_PERMISSION.
+        let cv = crate::tx::credential::credentials_valid(sandbox, tx, &tx.account);
+        if cv != TxResult::Success {
+            return cv;
+        }
         let owner_id = match Self::owner(tx) {
             Some(id) => id,
             None => return TxResult::Malformed,

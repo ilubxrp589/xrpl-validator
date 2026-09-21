@@ -162,3 +162,12 @@ fn check_cash_writer_shortfall_is_path_partial_in_preclaim_106868992() {
 fn check_cancel_of_an_expired_check_by_a_stranger_106900377() {
     run_bundle(include_str!("vectors/check_cancel_of_an_expired_check_by_a_stranger_106900377.json"));
 }
+
+/// Finding 348 — devnet #5488076 2D0C412F: cashing a USD check while the
+/// issuer has frozen the casher's line. CheckCash::preclaim judges the
+/// casher's line (RequireAuth, then isFrozen) after the funds test —
+/// tecFROZEN; we ran the flow and said tecPATH_PARTIAL.
+#[test]
+fn check_cash_onto_a_line_the_issuer_froze_is_frozen_devnet_5488076() {
+    run_bundle(include_str!("vectors/check_cash_onto_a_line_the_issuer_froze_is_frozen_devnet_5488076.json"));
+}

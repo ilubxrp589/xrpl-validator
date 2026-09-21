@@ -511,6 +511,12 @@ impl Transactor for AccountDeleteTransactor {
         {
             return TxResult::DstTagNeeded; // lsfRequireDestTag
         }
+        // Finding 349: "If credentials are provided - check them anyway"
+        // (AccountDelete.cpp:236-238), right after the tag test.
+        let cv = crate::tx::credential::credentials_valid(sandbox, tx, &tx.account);
+        if cv != TxResult::Success {
+            return cv;
+        }
 
         let dest_balance = dest["Balance"]
             .as_str()

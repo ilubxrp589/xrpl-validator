@@ -511,6 +511,46 @@ def main():
         v = tx.get(f)
         if isinstance(v, str) and len(v) == 64:
             named_keys.append(v.upper())
+    # Findings 348/349 + campaign 7 (devnet): objects a fee-only tec never
+    # names in its meta but the transactor READS.
+    #  - CheckCash: the Check's creator root + the creator's and casher's lines
+    #    with the SendMax issuer + that issuer's root (funds, RequireAuth, freeze).
+    #  - MPTokenAuthorize / MPTokenIssuanceSet / MPTokenIssuanceDestroy: the
+    #    issuance and the Account's / Holder's MPTokens.
+    #  - CredentialCreate / CredentialAccept / CredentialDelete: the credential
+    #    itself (tecDUPLICATE / tecNO_ENTRY read it).
+    def _put(r):
+        if r.get("node_binary") and r.get("index"):
+            pre[r["index"].upper()] = r["node_binary"]
+    try:
+        tt = tx.get("TransactionType")
+        if tt == "CheckCash" and isinstance(tx.get("CheckID"), str):
+            chk = rpc("ledger_entry", {"index": tx["CheckID"], "ledger_index": seq - 1}).get("node") or {}
+            sm = chk.get("SendMax")
+            if chk.get("Account"):
+                _put(rpc("ledger_entry", {"account_root": chk["Account"], "ledger_index": seq - 1, "binary": True}))
+                if isinstance(sm, dict) and sm.get("currency") and sm.get("issuer"):
+                    for who in (chk["Account"], tx["Account"]):
+                        if who != sm["issuer"]:
+                            _put(rpc("ledger_entry", {"ripple_state": {"accounts": [who, sm["issuer"]], "currency": sm["currency"]}, "ledger_index": seq - 1, "binary": True}))
+                    _put(rpc("ledger_entry", {"account_root": sm["issuer"], "ledger_index": seq - 1, "binary": True}))
+        if tt in ("MPTokenAuthorize", "MPTokenIssuanceSet", "MPTokenIssuanceDestroy") and isinstance(tx.get("MPTokenIssuanceID"), str):
+            mid = tx["MPTokenIssuanceID"]
+            _put(rpc("ledger_entry", {"mpt_issuance": mid, "ledger_index": seq - 1, "binary": True}))
+            for who in {tx.get("Account"), tx.get("Holder")} - {None}:
+                _put(rpc("ledger_entry", {"mptoken": {"mpt_issuance_id": mid, "account": who}, "ledger_index": seq - 1, "binary": True}))
+        if tt in ("CredentialCreate", "CredentialAccept", "CredentialDelete") and tx.get("CredentialType"):
+            subj = tx.get("Subject") or (tx["Account"] if tt != "CredentialCreate" else tx["Account"])
+            issr = tx.get("Issuer") or tx["Account"]
+            if tt == "CredentialCreate":
+                subj, issr = tx.get("Subject", tx["Account"]), tx["Account"]
+            elif tt == "CredentialAccept":
+                subj, issr = tx["Account"], tx["Issuer"]
+            else:
+                subj, issr = tx.get("Subject", tx["Account"]), tx.get("Issuer", tx["Account"])
+            _put(rpc("ledger_entry", {"credential": {"subject": subj, "issuer": issr, "credential_type": tx["CredentialType"]}, "ledger_index": seq - 1, "binary": True}))
+    except Exception as e:
+        print(f"note: read-set hydration: {e}", file=sys.stderr)
     # Finding 332/338: an MPT escrow's Finish/Cancel reads the issuance and
     # the owner's, destination's and finisher's MPTokens off the ESCROW's
     # amount; an MPT EscrowCreate reads them off its own Amount. A fee-only

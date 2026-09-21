@@ -367,6 +367,11 @@ impl Transactor for PaymentChannelClaimTransactor {
         if !sandbox.exists(&acct_key) {
             return TxResult::NoAccount;
         }
+        // Finding 349: `credentials::valid` (PaymentChannelClaim.cpp:97-104).
+        let cv = crate::tx::credential::credentials_valid(sandbox, tx, &tx.account);
+        if cv != TxResult::Success {
+            return cv;
+        }
         TxResult::Success
     }
 

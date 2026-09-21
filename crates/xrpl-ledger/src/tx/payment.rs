@@ -2094,39 +2094,9 @@ impl Transactor for PaymentTransactor {
         // Subject and carry lsfAccepted, else tecBAD_CREDENTIALS. Expiry is
         // judged in doApply (removeExpiredCredentials → tecEXPIRED), not here.
         // `checkFields` (preflight): non-empty, at most 8, no duplicates.
-        if let Some(ids) = tx.fields.get("CredentialIDs").and_then(|v| v.as_array()) {
-            if ids.is_empty() || ids.len() > 8 {
-                return TxResult::Malformed;
-            }
-            let mut seen = std::collections::HashSet::new();
-            for id in ids {
-                let Some(hex_id) = id.as_str() else { return TxResult::Malformed };
-                let Ok(raw) = hex::decode(hex_id) else { return TxResult::Malformed };
-                let Ok(key) = <[u8; 32]>::try_from(raw.as_slice()) else { return TxResult::Malformed };
-                if !seen.insert(key) {
-                    return TxResult::Malformed;
-                }
-                let Some(cred) = sandbox
-                    .read(&xrpl_core::types::Hash256(key))
-                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-                else {
-                    return TxResult::BadCredentials;
-                };
-                if cred.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Credential") {
-                    return TxResult::BadCredentials;
-                }
-                let subject_is_sender = cred
-                    .get("Subject")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|s| s.eq_ignore_ascii_case(&hex::encode(tx.account)));
-                if !subject_is_sender {
-                    return TxResult::BadCredentials;
-                }
-                const LSF_ACCEPTED: u64 = 0x0001_0000;
-                if cred.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & LSF_ACCEPTED == 0 {
-                    return TxResult::BadCredentials;
-                }
-            }
+        let cv = crate::tx::credential::credentials_valid(sandbox, tx, &tx.account);
+        if cv != TxResult::Success {
+            return cv;
         }
 
         // If destination doesn't exist, amount must meet reserve

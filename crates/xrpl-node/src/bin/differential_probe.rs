@@ -2010,6 +2010,48 @@ fn load_did_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_ind
     load_object(state, url, &hex::encode_upper(k.0), ledger_index);
 }
 
+/// CheckCash: the Check's creator root and the creator's and casher's lines
+/// with the SendMax issuer, plus that issuer's root — CheckCash::preclaim
+/// judges the creator's funds (ZeroIfFrozen) and then the casher's line
+/// (RequireAuth, isFrozen) before anything is written, and a tec names none
+/// of them. Devnet #5488076 2D0C412F (finding 348): unhydrated, the creator's
+/// funds read as zero and we answered tecPATH_PARTIAL for tecFROZEN.
+fn load_check_cash_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
+    if txj["TransactionType"].as_str() != Some("CheckCash") {
+        return;
+    }
+    let Some(cid) = txj["CheckID"].as_str() else { return };
+    load_object(state, url, cid, ledger_index);
+    let Ok(raw) = hex::decode(cid) else { return };
+    let Ok(k32) = <[u8; 32]>::try_from(raw.as_slice()) else { return };
+    let Some(chk) = state.state_map.lookup(&Hash256(k32)).and_then(|b| serde_json::from_slice::<Value>(b).ok()) else {
+        return;
+    };
+    let addr20 = |s: &str| -> Option<[u8; 20]> {
+        if s.len() == 40 {
+            hex::decode(s).ok().and_then(|b| b.try_into().ok())
+        } else {
+            decode_address(s)
+        }
+    };
+    let Some(creator) = chk.get("Account").and_then(|v| v.as_str()).and_then(addr20) else { return };
+    load_object(state, url, &hex::encode_upper(keylet::account_root_key(&creator).0), ledger_index);
+    let Some(casher) = txj["Account"].as_str().and_then(decode_address) else { return };
+    if let Some(sm) = chk.get("SendMax").filter(|a| a.is_object() && a.get("mpt_issuance_id").is_none()) {
+        if let (Some(cur), Some(iss)) = (
+            sm.get("currency").and_then(|v| v.as_str()).map(currency_code),
+            sm.get("issuer").and_then(|v| v.as_str()).and_then(addr20),
+        ) {
+            for who in [creator, casher] {
+                if who != iss {
+                    load_object(state, url, &hex::encode_upper(keylet::ripple_state_key(&who, &iss, &cur).0), ledger_index);
+                }
+            }
+            load_object(state, url, &hex::encode_upper(keylet::account_root_key(&iss).0), ledger_index);
+        }
+    }
+}
+
 fn load_escrow_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
     if !matches!(txj["TransactionType"].as_str(), Some("EscrowFinish") | Some("EscrowCancel")) {
         return;
@@ -2876,6 +2918,7 @@ fn run() -> i32 {
         load_mpt_prestate(&mut state, &rpc_url, txj, seq - 1);
         load_escrow_prestate(&mut state, &rpc_url, txj, seq - 1);
         load_did_prestate(&mut state, &rpc_url, txj, seq - 1); // campaign 6 #20909840
+        load_check_cash_prestate(&mut state, &rpc_url, txj, seq - 1); // finding 348
     }
     // FLAG-LEDGER OPEN: rotate the NegativeUNL pending fields into
     // DisabledValidators before any transaction applies — a ledger-level

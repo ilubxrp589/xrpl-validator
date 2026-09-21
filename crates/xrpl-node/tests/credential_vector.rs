@@ -166,3 +166,12 @@ fn credential_accept_subject_below_reserve_is_insufficient_reserve_testnet_20909
 fn credential_accept_twice_is_duplicate_testnet_20910018() {
     run_bundle(include_str!("vectors/credential_accept_twice_is_duplicate_testnet_20910018.json"));
 }
+
+/// Finding 349 — devnet #5488110 32C544D4: an EscrowFinish carrying a
+/// CredentialIDs entry that names no ledger object. `credentials::valid`
+/// runs first in EscrowFinish::preclaim (also PaymentChannelClaim and
+/// AccountDelete) — tecBAD_CREDENTIALS; we fell through to tecNO_PERMISSION.
+#[test]
+fn escrow_finish_with_a_missing_credential_is_bad_credentials_devnet_5488110() {
+    run_bundle(include_str!("vectors/escrow_finish_with_a_missing_credential_is_bad_credentials_devnet_5488110.json"));
+}
