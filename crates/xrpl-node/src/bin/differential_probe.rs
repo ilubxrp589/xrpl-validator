@@ -2052,6 +2052,26 @@ fn load_check_cash_prestate(state: &mut LedgerState, url: &str, txj: &Value, led
     }
 }
 
+/// Clawback: the holder's line with the issuer is the whole read-set of
+/// Clawback::preclaim (tecNO_LINE / the balance sign / tecINSUFFICIENT_FUNDS),
+/// and a fee-only tec never names it. Testnet campaign 9 #20936576 1C62D9CA:
+/// a zero line read unhydrated as tecNO_LINE for the network's
+/// tecINSUFFICIENT_FUNDS.
+fn load_clawback_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
+    if txj["TransactionType"].as_str() != Some("Clawback") {
+        return;
+    }
+    let Some(issuer) = txj["Account"].as_str().and_then(decode_address) else { return };
+    let a = &txj["Amount"];
+    if let (Some(cur), Some(holder)) = (
+        a.get("currency").and_then(|v| v.as_str()).filter(|c| *c != "XRP").map(currency_code),
+        a.get("issuer").and_then(|v| v.as_str()).and_then(decode_address),
+    ) {
+        load_object(state, url, &hex::encode_upper(keylet::account_root_key(&holder).0), ledger_index);
+        load_object(state, url, &hex::encode_upper(keylet::ripple_state_key(&holder, &issuer, &cur).0), ledger_index);
+    }
+}
+
 fn load_escrow_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
     if !matches!(txj["TransactionType"].as_str(), Some("EscrowFinish") | Some("EscrowCancel")) {
         return;
@@ -2938,6 +2958,7 @@ fn run() -> i32 {
         load_escrow_prestate(&mut state, &rpc_url, txj, seq - 1);
         load_did_prestate(&mut state, &rpc_url, txj, seq - 1); // campaign 6 #20909840
         load_check_cash_prestate(&mut state, &rpc_url, txj, seq - 1); // finding 348
+        load_clawback_prestate(&mut state, &rpc_url, txj, seq - 1); // finding 351
     }
     // FLAG-LEDGER OPEN: rotate the NegativeUNL pending fields into
     // DisabledValidators before any transaction applies — a ledger-level
