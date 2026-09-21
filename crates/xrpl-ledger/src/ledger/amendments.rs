@@ -52,6 +52,21 @@ pub fn fix_cleanup_3_4_0(sandbox: &Sandbox) -> bool {
     enabled(sandbox, FIX_CLEANUP_3_4_0)
 }
 
+/// SingleAssetVault / LendingProtocol — enabled on devnet, NOT on mainnet as
+/// of 2026-09-21. Their one effect on the transactors we dispatch: a
+/// pseudo-account (AMM, Vault, LoanBroker) is created with Sequence 0
+/// instead of the ledger sequence (AccountRootHelpers.cpp:581-589).
+pub const SINGLE_ASSET_VAULT: &str =
+    "81BD2619B6B3C8625AC5D0BC01DE17F06C3F0AB95C7C87C93715B87A4FD240D8";
+pub const LENDING_PROTOCOL: &str =
+    "565B90CA1AB2B9D42208ED10884188C64F9E19083DECB9634AAF06EB03299509";
+
+/// rippled `createPseudoAccount`'s sequence rule: 0 once SingleAssetVault or
+/// LendingProtocol is enabled, else the sequence of the ledger being built.
+pub fn pseudo_account_sequence_is_zero(sandbox: &Sandbox) -> bool {
+    enabled(sandbox, SINGLE_ASSET_VAULT) || enabled(sandbox, LENDING_PROTOCOL)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -104,3 +104,4 @@ fn amm_create_objects_are_byte_exact() {
         );
     }
 }
+

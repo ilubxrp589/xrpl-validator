@@ -143,3 +143,12 @@ fn run_bundle(bundle_json: &str) {
 fn amm_vote_fee_rounds_to_nearest_on_the_exact_fraction() {
     run_bundle(include_str!("vectors/amm_vote_fee_nearest_106698734.json"));
 }
+
+/// Finding 350 — devnet #5488138 77C8DE46 (SingleAssetVault enabled there):
+/// the AMM pseudo-account is created with Sequence 0, not the ledger
+/// sequence (AccountRootHelpers.cpp:581-589). Mainnet has neither
+/// SingleAssetVault nor LendingProtocol yet, so it still writes the seq.
+#[test]
+fn amm_create_pseudo_account_sequence_is_zero_under_single_asset_vault_devnet_5488138() {
+    run_bundle(include_str!("vectors/amm_create_pseudo_account_sequence_is_zero_under_single_asset_vault_devnet_5488138.json"));
+}
