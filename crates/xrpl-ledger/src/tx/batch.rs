@@ -422,7 +422,12 @@ impl Transactor for BatchTransactor {
                 results.push(TxResult::Malformed.code_str().to_string());
                 touched.push(Vec::new()); // never applied
                 if flags & TF_ALL_OR_NOTHING != 0 {
+                    // An AllOrNothing revert files NO inner: rippled discards
+                    // the batch view and records no inner metadata at all
+                    // (campaign 8, devnet #5489428 7B08C19A — the outer alone).
                     sandbox.restore_snapshot(batch_snap.clone());
+                    results.clear();
+                    touched.clear();
                     break;
                 }
                 if flags & TF_UNTIL_FAILURE != 0 {
@@ -438,6 +443,8 @@ impl Transactor for BatchTransactor {
             if !r.is_success() {
                 if flags & TF_ALL_OR_NOTHING != 0 {
                     sandbox.restore_snapshot(batch_snap.clone());
+                    results.clear();
+                    touched.clear();
                     break;
                 }
                 if flags & TF_UNTIL_FAILURE != 0 {
@@ -727,7 +734,8 @@ mod tests {
         o["RawTransactions"][1]["RawTransaction"]["Sequence"] = json!(99);
         let (sb, r, inners) = run(&o, &state);
         assert_eq!(r, "tesSUCCESS", "the outer itself succeeds");
-        assert_eq!(inners, vec!["tesSUCCESS", "temBAD_SEQUENCE"]);
+        // An AllOrNothing revert files no inner at all (campaign 8, devnet #5489428).
+        assert!(inners.is_empty(), "no inner is filed after an AllOrNothing revert: {inners:?}");
         assert_eq!(balance_seq(&sb, 1), (50_000_000 - 1000, 6), "only the outer's fee and sequence remain");
         assert_eq!(balance_seq(&sb, 2), (20_000_000, 1));
         // The touched sets describe what each inner touched BEFORE the
@@ -735,10 +743,7 @@ mod tests {
         // rolled back inside apply_on_sandbox (its sequence never matched)
         // and so touched nothing. Both inners are reported either way.
         let touched = take_inner_touched();
-        assert_eq!(touched.len(), 2, "one touched set per attempted inner, discard or not");
-        assert!(touched[0].contains(&keylet::account_root_key(&acct(1))));
-        assert!(touched[0].contains(&keylet::account_root_key(&acct(2))));
-        assert!(touched[1].is_empty(), "apply_on_sandbox restored the sandbox for the failing inner");
+        assert!(touched.is_empty(), "nothing is attributed to inners the ledger never filed");
     }
 
     #[test]

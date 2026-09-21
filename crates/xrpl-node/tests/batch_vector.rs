@@ -161,3 +161,45 @@ fn batch_until_failure_two_payments_devnet_5309584() {
     run_batch_bundle(include_str!("vectors/batch_until_failure_two_payments_devnet_5309584.json"));
 }
 
+
+/// Campaign 8 (devnet, 2026-09-21): tfOnlyOne: inner 1 tesSUCCESS then stop; inners 2 and 3 never filed.
+#[test]
+fn batch_onlyone_fails_in_the_middle_devnet_5489437() {
+    run_batch_bundle(include_str!("vectors/batch_onlyone_fails_in_the_middle_devnet_5489437.json"));
+}
+
+/// Campaign 8 (devnet, 2026-09-21): tfUntilFailure: inner 1 tes, inner 2 tecUNFUNDED_PAYMENT filed, inner 3 not attempted.
+#[test]
+fn batch_untilfailure_fails_in_the_middle_devnet_5489449() {
+    run_batch_bundle(include_str!("vectors/batch_untilfailure_fails_in_the_middle_devnet_5489449.json"));
+}
+
+/// Campaign 8 (devnet, 2026-09-21): tfIndependent: inner 2 tecUNFUNDED_PAYMENT, inners 1 and 3 tes.
+#[test]
+fn batch_independent_fails_in_the_middle_devnet_5489460() {
+    run_batch_bundle(include_str!("vectors/batch_independent_fails_in_the_middle_devnet_5489460.json"));
+}
+
+/// Campaign 8 (devnet, 2026-09-21): two accounts, BatchSigners: both inners tes.
+#[test]
+fn batch_multi_account_allornothing_with_batchsigners_devnet_5489526() {
+    run_batch_bundle(include_str!("vectors/batch_multi_account_allornothing_with_batchsigners_devnet_5489526.json"));
+}
+
+/// Campaign 8 (devnet, 2026-09-21): OfferCreate, OfferCancel of that inner, OfferCancel of an old offer.
+#[test]
+fn batch_untilfailure_offer_create_then_cancel_devnet_5489473() {
+    run_batch_bundle(include_str!("vectors/batch_untilfailure_offer_create_then_cancel_devnet_5489473.json"));
+}
+
+/// Campaign 8 (devnet, 2026-09-21): tfAllOrNothing: three payments, all tes.
+#[test]
+fn batch_allornothing_three_payments_devnet_5489422() {
+    run_batch_bundle(include_str!("vectors/batch_allornothing_three_payments_devnet_5489422.json"));
+}
+
+/// Campaign 8 (devnet, 2026-09-21): tfAllOrNothing: inner 1 tecUNFUNDED_PAYMENT → no inner filed, outer tes with its fee alone.
+#[test]
+fn batch_allornothing_first_inner_fails_everything_reverts_devnet_5489428() {
+    run_batch_bundle(include_str!("vectors/batch_allornothing_first_inner_fails_everything_reverts_devnet_5489428.json"));
+}

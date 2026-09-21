@@ -749,12 +749,34 @@ impl Transactor for ClawbackTransactor {
             code
         };
 
+        // Finding 351 (devnet #5489422 953947B4, a fuzzer's Clawback from an
+        // issuer that never enabled clawback): Clawback::preclaim's order
+        // (Clawback.cpp:99-145) — the issuer must carry
+        // lsfAllowTrustLineClawback and not lsfNoFreeze (tecNO_PERMISSION),
+        // the holder must exist (terNO_ACCOUNT), the line must exist
+        // (tecNO_LINE, not tecNO_ENTRY), the balance must sit on the holder's
+        // side (tecNO_PERMISSION), and the holder must hold something
+        // (tecINSUFFICIENT_FUNDS). We read the line first and said
+        // tecNO_ENTRY / tesSUCCESS.
+        {
+            const LSF_ALLOW_TRUSTLINE_CLAWBACK: u64 = 0x8000_0000;
+            const LSF_NO_FREEZE: u64 = 0x0020_0000;
+            let iflags = crate::tx::offer::json_at(sandbox, &keylet::account_root_key(&tx.account))
+                .and_then(|a| a["Flags"].as_u64())
+                .unwrap_or(0);
+            if iflags & LSF_ALLOW_TRUSTLINE_CLAWBACK == 0 || iflags & LSF_NO_FREEZE != 0 {
+                return TxResult::NoPermission;
+            }
+            if !sandbox.exists(&keylet::account_root_key(&holder)) {
+                return TxResult::NoAccount;
+            }
+        }
         // The issuer (sender of clawback) and the holder define the trust line
         let line_key = keylet::ripple_state_key(&tx.account, &holder, &currency);
 
         let line_data = match sandbox.read(&line_key) {
             Some(d) => d,
-            None => return TxResult::NoEntry,
+            None => return TxResult::NoLine,
         };
 
         let mut line: serde_json::Value = match serde_json::from_slice(&line_data) {
@@ -773,9 +795,13 @@ impl Transactor for ClawbackTransactor {
         let issuer_is_low = tx.account < holder;
         let holder_balance = if issuer_is_low { -balance } else { balance };
 
+        if holder_balance < 0.0 {
+            // The balance sits on the ISSUER's side: tecNO_PERMISSION (Clawback.cpp:117-125).
+            return TxResult::NoPermission;
+        }
         if holder_balance <= 0.0 {
-            // Holder has no tokens to claw back
-            return TxResult::NoEntry;
+            // Holder has no tokens to claw back: tecINSUFFICIENT_FUNDS (:142).
+            return TxResult::InsufficientFunds;
         }
 
         // Claw back up to the holder's balance
@@ -1143,7 +1169,15 @@ mod tests {
     fn clawback_reduces_trust_line_balance() {
         let issuer = [0x01u8; 20]; // low account
         let holder = [0x02u8; 20]; // high account
-        let state = make_state(&[(issuer, 50_000_000), (holder, 50_000_000)]);
+        let mut state = make_state(&[(issuer, 50_000_000), (holder, 50_000_000)]);
+
+        {
+            // The issuer enabled clawback (lsfAllowTrustLineClawback).
+            let k = keylet::account_root_key(&issuer);
+            let mut a: serde_json::Value = serde_json::from_slice(&Sandbox::new(&state).read(&k).unwrap()).unwrap();
+            a["Flags"] = serde_json::json!(0x8000_0000u64);
+            state.state_map.insert(k, serde_json::to_vec(&a).unwrap()).unwrap();
+        }
 
         let mut sandbox = Sandbox::new(&state);
 
@@ -1206,7 +1240,15 @@ mod tests {
         let holder_addr = "rNR6vtb85KWJyTs86mcHB2UqNVwgnaBGRF";
         let holder =
             crate::tx::offer::decode20(holder_addr).expect("base58 holder must decode");
-        let state = make_state(&[(issuer, 50_000_000), (holder, 50_000_000)]);
+        let mut state = make_state(&[(issuer, 50_000_000), (holder, 50_000_000)]);
+
+        {
+            // The issuer enabled clawback (lsfAllowTrustLineClawback).
+            let k = keylet::account_root_key(&issuer);
+            let mut a: serde_json::Value = serde_json::from_slice(&Sandbox::new(&state).read(&k).unwrap()).unwrap();
+            a["Flags"] = serde_json::json!(0x8000_0000u64);
+            state.state_map.insert(k, serde_json::to_vec(&a).unwrap()).unwrap();
+        }
         let mut sandbox = Sandbox::new(&state);
 
         let currency_code = {
@@ -1255,7 +1297,16 @@ mod tests {
     #[test]
     fn clawback_no_trust_line_fails() {
         let issuer = [0x01u8; 20];
-        let state = make_state(&[(issuer, 50_000_000)]);
+        // The holder exists (else terNO_ACCOUNT); only its line is missing.
+        let mut state = make_state(&[(issuer, 50_000_000), ([0x02u8; 20], 50_000_000)]);
+
+        {
+            // The issuer enabled clawback (lsfAllowTrustLineClawback).
+            let k = keylet::account_root_key(&issuer);
+            let mut a: serde_json::Value = serde_json::from_slice(&Sandbox::new(&state).read(&k).unwrap()).unwrap();
+            a["Flags"] = serde_json::json!(0x8000_0000u64);
+            state.state_map.insert(k, serde_json::to_vec(&a).unwrap()).unwrap();
+        }
 
         let mut sandbox = Sandbox::new(&state);
         let tx = TxFields {
@@ -1274,7 +1325,8 @@ mod tests {
             }),
             inner_batch: false,
         };
-        assert_eq!(ClawbackTransactor.do_apply(&tx, &mut sandbox), TxResult::NoEntry);
+        // Finding 351: a missing line is tecNO_LINE (Clawback.cpp:114).
+        assert_eq!(ClawbackTransactor.do_apply(&tx, &mut sandbox), TxResult::NoLine);
     }
 
     /// fixCleanup3_4_0's domain helpers: `valid_domain` (preclaim, read-only)
