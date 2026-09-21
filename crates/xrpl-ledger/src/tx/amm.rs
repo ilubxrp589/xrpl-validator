@@ -551,6 +551,9 @@ fn amendment_enabled(sandbox: &Sandbox, id_hex: &str) -> bool {
 
 #[allow(dead_code)]
 const FIX_AMM_V1_3: &str = "7CA70A7674A26FA517412858659EBC7EDEEF7D2D608824464E6FDEFD06854E14";
+/// fixAMMClawbackRounding — mainnet since 2026-01-27: AMMClawback rounds like
+/// AMMWithdraw (getRoundedLPTokens / getRoundedAsset) and snaps the last LP.
+const FIX_AMM_CLAWBACK_ROUNDING: &str = "5E9586DB3D765B4C5794658FB6BB385071E9838DF4016027E6E26820C8526724";
 
 
 fn mul_directed(a: ox::Me, b: ox::Me, up: bool, xrp: bool) -> ox::Me {
@@ -3707,61 +3710,142 @@ impl Transactor for AMMClawbackTransactor {
         if lp_bal.0 == 0 {
             return TxResult::AmmBalance;
         }
-        let Some(total_lp) = ox::json_at(sandbox, &amm_key)
-            .and_then(|o| o["LPTokenBalance"]["value"].as_str().map(str::to_string))
-            .and_then(|s| keylet::amount_mant_exp(&serde_json::Value::String(s)))
-        else {
+        // Finding 352 (testnet campaign 9, six specimens): rippled
+        // AMMClawback::applyGuts (AMMClawback.cpp:168-263) and
+        // equalWithdrawMatchingOneAmount (:266-370), on top of AMMWithdraw's
+        // withdraw core (AMMWithdraw.cpp:503-700, WithdrawAll::No under
+        // fixAMMv1_3 = identity) and equalWithdrawTokens (:903-990):
+        //   no Amount  -> withdraw-all of the holder's LP tokens
+        //   Amount     -> frac = Amount / assetBalance (Number division);
+        //                 lptWithdraw = lpt * frac (to nearest); at or past the
+        //                 holding (>= under fixCleanup3_4_0, > before) it is a
+        //                 withdraw-all; else (fixAMMClawbackRounding, mainnet
+        //                 since 2026-01-27) tokensAdj = adjustLPTokens(lpt,
+        //                 multiply(lpt, frac, UPWARD)), frac = tokensAdj / lpt,
+        //                 both assets rounded DOWN by that fraction.
+        //   withdraw-all with other LPs left -> frac = divide(hold, lpt)
+        //                 (STAmount division), both assets rounded DOWN, a zero
+        //                 side is tecAMM_FAILED; the last LP takes the balances.
+        //   then: pay both assets pool -> holder, burn the LP tokens, delete
+        //   the pool at zero LPT, the fixCleanup3_3_0 precision test, and the
+        //   claw itself: Asset (and Asset2 under tfClawTwoAssets) holder ->
+        //   issuer with no transfer fee (directSendNoFee).
+        // The old model burned `lpt × frac` and paid the proportional payout,
+        // which misrounded every partial specimen and mis-sized withdraw-all.
+        use crate::tx::amm_swap::{n_cmp, n_mul, n_sqrt, n_sub, Rnd};
+        let fix340 = crate::ledger::amendments::fix_cleanup_3_4_0(sandbox);
+        let claw_rounding = crate::ledger::amendments::enabled(sandbox, FIX_AMM_CLAWBACK_ROUNDING);
+        let v13 = crate::ledger::amendments::enabled(sandbox, FIX_AMM_V1_3);
+        if claw_rounding {
+            // fixAMMv1_1 verifyAndAdjustLPTokenBalance: the only LP's holding
+            // becomes the pool's LPTokenBalance of record.
+            if let Err(e) = verify_and_adjust_lp_token_balance(sandbox, &amm_key, &amm_acct, &holder, &lp_leg, lp_bal) {
+                sandbox.restore_snapshot(snap);
+                return e;
+            }
+        }
+        let read_lpt = |sandbox: &Sandbox| -> Option<ox::Me> {
+            ox::json_at(sandbox, &amm_key)
+                .and_then(|o| o["LPTokenBalance"]["value"].as_str().map(str::to_string))
+                .and_then(|s| keylet::amount_mant_exp(&serde_json::Value::String(s)))
+        };
+        let Some(total_lp) = read_lpt(sandbox) else {
+            sandbox.restore_snapshot(snap);
             return TxResult::AmmBalance;
         };
-
-        // Withdraw size: full position without Amount; with Amount, the
-        // fraction that makes the ASSET side equal Amount — falling back to
-        // the full position when that would burn more LP than held
-        // (equalWithdrawMatchingOneAmount).
-        let asset_leg = tx.fields.get("Asset").and_then(|v| {
+        let asset_of = |f: &str| -> Option<ox::Leg> {
+            let v = tx.fields.get(f)?;
             if v.get("currency").and_then(|c| c.as_str()) == Some("XRP") {
                 return Some(ox::Leg { xrp: true, cur: [0u8; 20], issuer: [0u8; 20] });
             }
             let mut amt = v.clone();
             amt["value"] = serde_json::json!("0");
             ox::leg_of(&amt)
-        });
-        let tokens = match tx.fields.get("Amount").and_then(keylet::amount_mant_exp) {
-            None => lp_bal,
+        };
+        let (Some(a1), Some(a2)) = (asset_of("Asset"), asset_of("Asset2")) else {
+            sandbox.restore_snapshot(snap);
+            return TxResult::Malformed;
+        };
+        let bal1 = crate::tx::amm_swap::holds(sandbox, &amm_acct, &a1);
+        let bal2 = crate::tx::amm_swap::holds(sandbox, &amm_acct, &a2);
+        let hold = lp_bal;
+        let eq = |x: ox::Me, y: ox::Me| ox::me_cmp(x, y).is_eq();
+        enum Plan {
+            All,
+            Partial(ox::Me, ox::Me, ox::Me),
+        }
+        let plan = match tx.fields.get("Amount").and_then(keylet::amount_mant_exp) {
+            None => Plan::All,
             Some(amount) => {
-                let Some(leg) = asset_leg.as_ref() else { return TxResult::Malformed };
-                let pool = crate::tx::amm_swap::holds(sandbox, &amm_acct, leg);
-                if pool.0 == 0 {
+                if bal1.0 == 0 {
+                    sandbox.restore_snapshot(snap);
                     return TxResult::AmmBalance;
                 }
-                // frac = amount/pool, 16-digit steps as everywhere in the
-                // AMM lane; LP burn = total_lp x frac (round DOWN).
-                let frac = ox::st_divide(amount, pool, false);
-                let burn = mul_directed(total_lp, frac, false, false);
-                if ox::me_cmp(burn, lp_bal) == std::cmp::Ordering::Greater {
-                    lp_bal
+                let frac = ox::st_divide(amount, bal1, false);
+                let lp_w = n_mul(total_lp, frac, Rnd::Near);
+                let all = if fix340 { ox::me_cmp(lp_w, hold).is_ge() } else { ox::me_cmp(lp_w, hold).is_gt() };
+                if all {
+                    Plan::All
+                } else if claw_rounding {
+                    let tokens_adj =
+                        crate::tx::amm_swap::adjust_lp_tokens(total_lp, mul_directed(total_lp, frac, true, false), false);
+                    if tokens_adj.0 == 0 {
+                        sandbox.restore_snapshot(snap);
+                        return TxResult::AmmInvalidTokens;
+                    }
+                    let frac2 = if v13 { ox::st_divide(tokens_adj, total_lp, false) } else { frac };
+                    let w2 = mul_directed(bal2, frac2, false, a2.xrp);
+                    let w1 = mul_directed(bal1, frac2, false, a1.xrp);
+                    if fix340 && (w1.0 == 0 || w2.0 == 0) {
+                        sandbox.restore_snapshot(snap);
+                        return TxResult::AmmFailed;
+                    }
+                    Plan::Partial(w1, w2, tokens_adj)
                 } else {
-                    burn
+                    Plan::Partial(amount, n_mul(bal2, frac, Rnd::Near), n_mul(total_lp, frac, Rnd::Near))
                 }
             }
         };
-
-        let Some(shares) =
-            // Clawback: partial semantics until a specimen calibrates the
-            // claw-all arm (rippled threads WithdrawAll there too).
-            payout_proportional_to(sandbox, tx, &amm_acct, &holder, tokens, total_lp, false)
-        else {
-            sandbox.restore_snapshot(snap);
-            return TxResult::AmmFailed;
+        let (w1, w2, tokens) = match plan {
+            Plan::All => {
+                if eq(hold, total_lp) {
+                    (bal1, bal2, hold)
+                } else {
+                    let frac = ox::st_divide_legacy(hold, total_lp);
+                    let w1 = mul_directed(bal1, frac, false, a1.xrp);
+                    let w2 = mul_directed(bal2, frac, false, a2.xrp);
+                    if w1.0 == 0 || w2.0 == 0 {
+                        sandbox.restore_snapshot(snap);
+                        return TxResult::AmmFailed;
+                    }
+                    (w1, w2, hold)
+                }
+            }
+            Plan::Partial(w1, w2, t) => (w1, w2, t),
         };
-
-        // Burn the LP tokens: full burn tears the line down, partial burns
-        // adjust it — the ordinary-withdraw machinery.
-        if ox::me_cmp(tokens, lp_bal) == std::cmp::Ordering::Equal {
+        // AMMWithdraw::withdraw's guards (:576-640).
+        if tokens.0 == 0 || ox::me_cmp(tokens, hold).is_gt() {
+            sandbox.restore_snapshot(snap);
+            return TxResult::AmmInvalidTokens;
+        }
+        if (eq(w1, bal1) && !eq(w2, bal2))
+            || (eq(w2, bal2) && !eq(w1, bal1))
+            || (eq(tokens, total_lp) && (!eq(w1, bal1) || !eq(w2, bal2)))
+            || ox::me_cmp(w1, bal1).is_gt()
+            || ox::me_cmp(w2, bal2).is_gt()
+        {
+            sandbox.restore_snapshot(snap);
+            return TxResult::AmmBalance;
+        }
+        // Pay the holder both sides (accountSend, no transfer fee).
+        ox::move_leg(sandbox, &amm_acct, &holder, &a1, w1);
+        ox::move_leg(sandbox, &amm_acct, &holder, &a2, w2);
+        // Burn the LP tokens.
+        if eq(tokens, hold) {
             tear_down_lp_line(sandbox, &holder, &amm_acct, lp_key, &lp_line);
         } else {
             let mut line = lp_line.clone();
-            let rest = ox::me_sub(lp_bal, tokens);
+            let rest = ox::me_sub(hold, tokens);
             let neg = holder >= amm_acct;
             line["Balance"]["value"] = serde_json::Value::String(if neg {
                 format!("-{}", ox::me_to_value_string(rest))
@@ -3771,23 +3855,28 @@ impl Transactor for AMMClawbackTransactor {
             sandbox.write(lp_key, serde_json::to_vec(&line).unwrap_or_default());
         }
         bump_lp_balance(sandbox, &amm_key, tokens, false);
-        let lpt_zero = ox::json_at(sandbox, &amm_key)
-            .and_then(|o| o["LPTokenBalance"]["value"].as_str().map(|v| v == "0"))
-            .unwrap_or(false);
-        if lpt_zero {
+        let new_lpt = read_lpt(sandbox).unwrap_or((0, 0));
+        if new_lpt.0 == 0 {
             delete_amm(sandbox, &amm_key, &amm_acct, tx);
-        }
-
-        // The claw: the ASSET share moves holder -> issuer (redemption);
-        // Asset2's share moves too only under tfClawTwoAssets — otherwise
-        // the holder keeps it.
-        let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
-        for (leg, share) in &shares {
-            let ours = leg.issuer == tx.account && !leg.xrp;
-            let is_asset = asset_leg.as_ref().map(|a| a.cur == leg.cur && a.issuer == leg.issuer).unwrap_or(false);
-            if ours && (is_asset || flags & TF_CLAW_TWO_ASSETS != 0) {
-                ox::move_leg(sandbox, &holder, &tx.account, leg, *share);
+        } else if crate::ledger::amendments::fix_cleanup_3_3_0(sandbox) && v13 {
+            // Finding 259's precision test, as AMMWithdraw runs it.
+            let p1 = crate::tx::amm_swap::holds(sandbox, &amm_acct, &a1);
+            let p2 = crate::tx::amm_swap::holds(sandbox, &amm_acct, &a2);
+            let mean = n_sqrt(n_mul(p1, p2, Rnd::Near));
+            if n_cmp(mean, new_lpt) == std::cmp::Ordering::Less {
+                let short = n_sub(new_lpt, mean, Rnd::Near);
+                let tol = n_mul(new_lpt, (1, -11), Rnd::Near);
+                if n_cmp(short, tol) == std::cmp::Ordering::Greater {
+                    sandbox.restore_snapshot(snap);
+                    return TxResult::PrecisionLoss;
+                }
             }
+        }
+        // The claw: Asset (and Asset2 under tfClawTwoAssets) holder -> issuer.
+        let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+        ox::move_leg(sandbox, &holder, &tx.account, &a1, w1);
+        if flags & TF_CLAW_TWO_ASSETS != 0 {
+            ox::move_leg(sandbox, &holder, &tx.account, &a2, w2);
         }
         TxResult::Success
     }

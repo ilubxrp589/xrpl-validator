@@ -2160,9 +2160,28 @@ fn load_amm_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_ind
     let tt = txj["TransactionType"].as_str();
     if !matches!(
         tt,
-        Some("AMMDeposit") | Some("AMMWithdraw") | Some("AMMCreate") | Some("AMMVote") | Some("AMMDelete")
+        Some("AMMDeposit") | Some("AMMWithdraw") | Some("AMMCreate") | Some("AMMVote") | Some("AMMDelete") | Some("AMMClawback")
     ) {
         return;
+    }
+    // Finding 352: AMMClawback pays the HOLDER from the pool and claws it
+    // straight back, so the holder's Asset/Asset2 lines end unchanged and the
+    // meta never names them — load the holder's root and those lines.
+    if tt == Some("AMMClawback") {
+        if let Some(holder) = txj["Holder"].as_str().and_then(decode_address) {
+            load_object(state, url, &hex::encode_upper(keylet::account_root_key(&holder).0), ledger_index);
+            for f in ["Asset", "Asset2"] {
+                let a = &txj[f];
+                if let (Some(cur), Some(iss)) = (
+                    a.get("currency").and_then(|v| v.as_str()).filter(|c| *c != "XRP").map(currency_code),
+                    a.get("issuer").and_then(|v| v.as_str()).and_then(decode_address),
+                ) {
+                    if iss != holder {
+                        load_object(state, url, &hex::encode_upper(keylet::ripple_state_key(&holder, &iss, &cur).0), ledger_index);
+                    }
+                }
+            }
+        }
     }
     if let Some(acct) = txj["Account"].as_str().and_then(decode_address) {
         let droot = keylet::owner_dir_key(&acct);

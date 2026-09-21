@@ -539,6 +539,15 @@ def main():
             _put(rpc("ledger_entry", {"mpt_issuance": mid, "ledger_index": seq - 1, "binary": True}))
             for who in {tx.get("Account"), tx.get("Holder")} - {None}:
                 _put(rpc("ledger_entry", {"mptoken": {"mpt_issuance_id": mid, "account": who}, "ledger_index": seq - 1, "binary": True}))
+        if tt == "AMMClawback" and tx.get("Holder"):
+            # Finding 352: the holder's own lines for Asset / Asset2 end the tx
+            # unchanged (paid by the pool, then clawed), so the meta never
+            # names them — without them the engine creates and deletes a line.
+            _put(rpc("ledger_entry", {"account_root": tx["Holder"], "ledger_index": seq - 1, "binary": True}))
+            for f in ("Asset", "Asset2"):
+                a = tx.get(f) or {}
+                if isinstance(a, dict) and a.get("currency") and a.get("currency") != "XRP" and a.get("issuer") and a["issuer"] != tx["Holder"]:
+                    _put(rpc("ledger_entry", {"ripple_state": {"accounts": [tx["Holder"], a["issuer"]], "currency": a["currency"]}, "ledger_index": seq - 1, "binary": True}))
         if tt in ("CredentialCreate", "CredentialAccept", "CredentialDelete") and tx.get("CredentialType"):
             subj = tx.get("Subject") or (tx["Account"] if tt != "CredentialCreate" else tx["Account"])
             issr = tx.get("Issuer") or tx["Account"]
