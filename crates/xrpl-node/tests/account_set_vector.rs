@@ -193,3 +193,9 @@ fn signer_list_set_unreachable_quorum_is_bad_quorum_fuzz_testnet_20864035() {
 fn account_set_authorized_minter_without_minter_is_malformed_second_fuzz_107009438() {
     run_bundle(include_str!("vectors/account_set_authorized_minter_without_minter_is_malformed_second_fuzz_107009438.json"));
 }
+
+/// Campaign 12 (testnet TrustSet depth, 2026-09-21): clearing GlobalFreeze with NoFreeze set is a silent no-op (finding 355): tesSUCCESS, flags untouched.
+#[test]
+fn account_set_clear_globalfreeze_under_nofreeze_is_ignored_testnet_20938476() {
+    run_bundle(include_str!("vectors/account_set_clear_globalfreeze_under_nofreeze_is_ignored_testnet_20938476.json"));
+}

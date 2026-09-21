@@ -176,8 +176,18 @@ impl Transactor for AccountSetTransactor {
             if flag >= 32 {
                 return TxResult::Malformed;
             }
-            if let Some(bit) = asf_lsf(flag) {
-                let current = acct["Flags"].as_u64().unwrap_or(0);
+            // Finding 355 (testnet campaign 12, #20938476 2202F8FD): an issuer
+            // that set NoFreeze cannot clear GlobalFreeze — SetAccount.cpp:
+            // 367-375 applies the clear only when lsfNoFreeze is off (and the
+            // same tx is not also setting it); NoFreeze itself has no clear
+            // branch at all (:346-358, permanent like clawback). Both were
+            // plain bit clears here.
+            let set_flag_now = tx.fields.get("SetFlag").and_then(|f| f.as_u64());
+            let current = acct["Flags"].as_u64().unwrap_or(0);
+            let ignored = flag == 6 || (flag == 7 && (set_flag_now == Some(7) || current & 0x0020_0000 != 0));
+            if ignored {
+                // rippled's silent no-op.
+            } else if let Some(bit) = asf_lsf(flag) {
                 acct["Flags"] = serde_json::Value::Number((current & !bit).into());
             } else if flag == 5 {
                 if let Some(o) = acct.as_object_mut() {

@@ -158,3 +158,51 @@ fn trust_set_insert_sorts_the_whole_owner_directory_page_106860967() {
 fn trust_set_setfauth_without_require_auth_is_tefno_auth_required_fuzz_107060755() {
     run_bundle(include_str!("vectors/trust_set_setfauth_without_require_auth_is_tefno_auth_required_fuzz_107060755.json"));
 }
+
+/// Campaign 12 (testnet TrustSet depth, 2026-09-21): tfSetDeepFreeze on an already frozen line.
+#[test]
+fn trust_set_deep_freeze_on_a_frozen_line_testnet_20938452() {
+    run_bundle(include_str!("vectors/trust_set_deep_freeze_on_a_frozen_line_testnet_20938452.json"));
+}
+
+/// Campaign 12 (testnet TrustSet depth, 2026-09-21): tfSetDeepFreeze without the regular freeze: tecNO_PERMISSION.
+#[test]
+fn trust_set_deep_freeze_without_freeze_is_no_permission_testnet() {
+    run_bundle(include_str!("vectors/trust_set_deep_freeze_without_freeze_is_no_permission_testnet.json"));
+}
+
+/// Campaign 12 (testnet TrustSet depth, 2026-09-21): tfSetFreeze | tfSetDeepFreeze in one transaction.
+#[test]
+fn trust_set_freeze_and_deep_freeze_together_testnet_20938462() {
+    run_bundle(include_str!("vectors/trust_set_freeze_and_deep_freeze_together_testnet_20938462.json"));
+}
+
+/// Campaign 12 (testnet TrustSet depth, 2026-09-21): an issuer under NoFreeze cannot freeze a line: tecNO_PERMISSION.
+#[test]
+fn trust_set_freeze_after_nofreeze_is_no_permission_testnet() {
+    run_bundle(include_str!("vectors/trust_set_freeze_after_nofreeze_is_no_permission_testnet.json"));
+}
+
+/// Campaign 12 (testnet TrustSet depth, 2026-09-21): tfSetfAuth from the issuer with no line yet creates it.
+#[test]
+fn trust_set_auth_creates_the_line_issuer_side_testnet_20938497() {
+    run_bundle(include_str!("vectors/trust_set_auth_creates_the_line_issuer_side_testnet_20938497.json"));
+}
+
+/// Campaign 12 (testnet TrustSet depth, 2026-09-21): a new line into an issuer with DisallowIncomingTrustline: tecNO_PERMISSION.
+#[test]
+fn trust_set_into_a_disallow_incoming_issuer_is_no_permission_testnet() {
+    run_bundle(include_str!("vectors/trust_set_into_a_disallow_incoming_issuer_is_no_permission_testnet.json"));
+}
+
+/// Campaign 12 (testnet TrustSet depth, 2026-09-21): limit 0 while holding 40: the line stays.
+#[test]
+fn trust_set_limit_zero_with_a_balance_keeps_the_line_testnet_20938435() {
+    run_bundle(include_str!("vectors/trust_set_limit_zero_with_a_balance_keeps_the_line_testnet_20938435.json"));
+}
+
+/// Campaign 12 (testnet TrustSet depth, 2026-09-21): limit 0 on a zero, default-state line deletes it.
+#[test]
+fn trust_set_limit_zero_on_a_zero_line_deletes_it_testnet_20938441() {
+    run_bundle(include_str!("vectors/trust_set_limit_zero_on_a_zero_line_deletes_it_testnet_20938441.json"));
+}
