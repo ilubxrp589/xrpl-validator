@@ -562,6 +562,65 @@ def main():
                 a = tx.get(f) or {}
                 if isinstance(a, dict) and a.get("currency") and a.get("currency") != "XRP" and a.get("issuer") and a["issuer"] != tx["Holder"]:
                     _put(rpc("ledger_entry", {"ripple_state": {"accounts": [tx["Holder"], a["issuer"]], "currency": a["currency"]}, "ledger_index": seq - 1, "binary": True}))
+        # Campaign 13 (testnet NFT depth): the NFT transactors READ objects a
+        # fee-only tec never names — the offers an NFTokenAcceptOffer judges
+        # (tecINSUFFICIENT_PAYMENT / tecNO_PERMISSION on Destination), the
+        # offer owners' roots and NFTokenPages (findToken), and for an
+        # IOU-priced offer on a transfer-fee token the NFT issuer's root and
+        # its line with the IOU issuer (tokenOfferCreatePreclaim). Without
+        # them the engine answers tecOBJECT_NOT_FOUND / tecNO_ISSUER.
+        if tt in ("NFTokenCreateOffer", "NFTokenAcceptOffer", "NFTokenMint", "NFTokenBurn", "NFTokenCancelOffer"):
+            import hashlib as _hl
+            def _h(b): return _hl.sha512(b).digest()[:32].hex().upper()
+            def _cur160(c):
+                return bytes.fromhex(c) if len(c) == 40 else (b"\x00" * 12 + c.encode() + b"\x00" * 5)
+            def _addr(aid_hex):
+                raw = b"\x00" + bytes.fromhex(aid_hex)
+                chk = _hl.sha256(_hl.sha256(raw).digest()).digest()[:4]
+                n = int.from_bytes(raw + chk, "big"); out = ""
+                while n: n, r = divmod(n, 58); out = ALPHABET[r] + out
+                return "r" * (len(raw + chk) - len((raw + chk).lstrip(b"\x00"))) + out
+            def _putk(idx):
+                nb = fetch_key(idx)
+                if nb: pre[idx.upper()] = nb
+            def _root(aid_hex): _putk(_h(b"\x00a" + bytes.fromhex(aid_hex)))
+            def _line(a_hex, b_hex, cur):
+                lo, hi = sorted((bytes.fromhex(a_hex), bytes.fromhex(b_hex)))
+                _putk(_h(b"\x00r" + lo + hi + _cur160(cur)))
+            def _pages(aid_hex):
+                r = rpc("account_objects", {"account": _addr(aid_hex), "type": "nft_page", "ledger_index": seq - 1, "limit": 400})
+                for o in r.get("account_objects", []):
+                    if o.get("index"): _putk(o["index"])
+            def _amount_side(amt, parties):
+                if isinstance(amt, dict) and amt.get("currency") and amt.get("issuer"):
+                    iss = acct_id(amt["issuer"]); _root(iss)
+                    for p in parties:
+                        if p and p != iss: _line(p, iss, amt["currency"])
+            me = acct_id(tx["Account"])
+            offers = []
+            for f in ("NFTokenSellOffer", "NFTokenBuyOffer"):
+                if isinstance(tx.get(f), str) and len(tx[f]) == 64: offers.append(tx[f].upper())
+            for o in tx.get("NFTokenOffers", []) or []:
+                if isinstance(o, str) and len(o) == 64: offers.append(o.upper())
+            for k in offers:
+                _putk(k)
+                nd = rpc("ledger_entry", {"index": k, "ledger_index": seq - 1}).get("node") or {}
+                own = acct_id(nd["Owner"]) if nd.get("Owner") else None
+                if own: _root(own); _pages(own)
+                if nd.get("Destination"): _root(acct_id(nd["Destination"]))
+                nid = nd.get("NFTokenID") or ""
+                nft_iss = nid[8:48] if len(nid) == 64 else None
+                if nft_iss: _root(nft_iss)
+                _amount_side(nd.get("Amount"), [own, me, nft_iss])
+            nid = tx.get("NFTokenID") or ""
+            if len(nid) == 64:
+                nft_iss = nid[8:48]; _root(nft_iss)
+                own = acct_id(tx["Owner"]) if tx.get("Owner") else me
+                _root(own); _pages(own)
+                _amount_side(tx.get("Amount"), [own, me, nft_iss])
+            if tt == "NFTokenMint" and tx.get("Issuer"):
+                _root(acct_id(tx["Issuer"]))
+            if tx.get("Destination"): _root(acct_id(tx["Destination"]))
         if tt in ("CredentialCreate", "CredentialAccept", "CredentialDelete") and tx.get("CredentialType"):
             subj = tx.get("Subject") or (tx["Account"] if tt != "CredentialCreate" else tx["Account"])
             issr = tx.get("Issuer") or tx["Account"]

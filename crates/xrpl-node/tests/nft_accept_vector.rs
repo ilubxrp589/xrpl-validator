@@ -281,3 +281,108 @@ fn nft_accept_buy_offer_priced_in_iou_needs_the_buyer_funded_107063938() {
         "vectors/nft_accept_buy_offer_priced_in_iou_needs_the_buyer_funded_107063938.json"
     ));
 }
+
+/// Campaign 13 (testnet NFT depth, 2026-09-21) 3-2: t6 accepts t5's 4 XRP sell of a 5% transfer-fee token; 0.2 XRP goes to the issuer t4. Testnet
+/// ledger's verdict, byte-exact under the port.
+#[test]
+fn nft_c13_resale_pays_the_issuer_its_transfer_fee_in_xrp_117af51b7531() {
+    run_bundle(include_str!("vectors/nft_c13_resale_pays_the_issuer_its_transfer_fee_in_xrp_117AF51B7531.json"));
+}
+
+/// Campaign 13 (testnet NFT depth, 2026-09-21) 4-3: broker fee 0.6 XRP against a 0.5 XRP spread (sell 3 / buy 3.5). Testnet
+/// ledger's verdict, byte-exact under the port.
+#[test]
+fn nft_c13_brokered_accept_with_a_fee_above_the_spread_is_tec_insufficient_payment_e27546e80d1d() {
+    run_bundle(include_str!("vectors/nft_c13_brokered_accept_with_a_fee_above_the_spread_is_tec_insufficient_payment_E27546E80D1D.json"));
+}
+
+/// Campaign 13 (testnet NFT depth, 2026-09-21) 4-4: broker fee 0.25 XRP, 5% royalty to the issuer, remainder to the seller t6. Testnet
+/// ledger's verdict, byte-exact under the port.
+#[test]
+fn nft_c13_brokered_accept_splits_broker_fee_and_issuer_royalty_0bbc76237301() {
+    run_bundle(include_str!("vectors/nft_c13_brokered_accept_splits_broker_fee_and_issuer_royalty_0BBC76237301.json"));
+}
+
+/// Campaign 13 (testnet NFT depth, 2026-09-21) 5-3: t5 sells B for 6 USD; preclaim reads the NFT issuer's USD line (tecNO_ISSUER without it). Testnet
+/// ledger's verdict, byte-exact under the port.
+#[test]
+fn nft_c13_iou_priced_sell_of_a_transfer_fee_token_needs_the_issuer_line_3537e0343c25() {
+    run_bundle(include_str!("vectors/nft_c13_iou_priced_sell_of_a_transfer_fee_token_needs_the_issuer_line_3537E0343C25.json"));
+}
+
+/// Campaign 13 (testnet NFT depth, 2026-09-21) 5-4: t6 accepts B for 6 USD; 0.3 USD royalty to t4 over trust lines. Testnet
+/// ledger's verdict, byte-exact under the port.
+#[test]
+fn nft_c13_iou_priced_accept_pays_the_royalty_in_usd_1c8636548a57() {
+    run_bundle(include_str!("vectors/nft_c13_iou_priced_accept_pays_the_royalty_in_usd_1C8636548A57.json"));
+}
+
+/// Campaign 13 (testnet NFT depth, 2026-09-21) 6-2: t6 offers A after the brokered sale moved it to t5. Testnet
+/// ledger's verdict, byte-exact under the port.
+#[test]
+fn nft_c13_sell_offer_on_a_token_one_no_longer_owns_is_tec_no_entry_fdf8b380064c() {
+    run_bundle(include_str!("vectors/nft_c13_sell_offer_on_a_token_one_no_longer_owns_is_tec_no_entry_FDF8B380064C.json"));
+}
+
+/// Campaign 13 (testnet NFT depth, 2026-09-21) 6-3: t6 burns A it no longer holds. Testnet
+/// ledger's verdict, byte-exact under the port.
+#[test]
+fn nft_c13_burn_by_a_former_owner_is_tec_no_entry_5cc2a8a01584() {
+    run_bundle(include_str!("vectors/nft_c13_burn_by_a_former_owner_is_tec_no_entry_5CC2A8A01584.json"));
+}
+
+/// Campaign 13 (testnet NFT depth, 2026-09-21) 6-3b: t5 burns A while its own sell offer is open. Testnet
+/// ledger's verdict, byte-exact under the port.
+#[test]
+fn nft_c13_owner_burn_removes_the_token_and_its_sell_offer_ab3619057e42() {
+    run_bundle(include_str!("vectors/nft_c13_owner_burn_removes_the_token_and_its_sell_offer_AB3619057E42.json"));
+}
+
+/// Campaign 13 (testnet NFT depth, 2026-09-21) 6-4: t6 accepts the sell offer the burn deleted. Testnet
+/// ledger's verdict, byte-exact under the port.
+#[test]
+fn nft_c13_accept_of_an_offer_deleted_by_a_burn_is_tec_object_not_found_770d0b750910() {
+    run_bundle(include_str!("vectors/nft_c13_accept_of_an_offer_deleted_by_a_burn_is_tec_object_not_found_770D0B750910.json"));
+}
+
+/// Campaign 13 (testnet NFT depth, 2026-09-21) 7-1: t4 (issuer, tfBurnable) burns B with Owner t6. Testnet
+/// ledger's verdict, byte-exact under the port.
+#[test]
+fn nft_c13_issuer_burns_a_burnable_token_held_by_another_account_be9e0306e1e1() {
+    run_bundle(include_str!("vectors/nft_c13_issuer_burns_a_burnable_token_held_by_another_account_BE9E0306E1E1.json"));
+}
+
+/// Campaign 13 (testnet NFT depth, 2026-09-21) 8-2: t6 accepts a sell offer destined to t5. Testnet
+/// ledger's verdict, byte-exact under the port.
+#[test]
+fn nft_c13_accept_by_someone_other_than_the_destination_is_tec_no_permission_3ce35b273c38() {
+    run_bundle(include_str!("vectors/nft_c13_accept_by_someone_other_than_the_destination_is_tec_no_permission_3CE35B273C38.json"));
+}
+
+/// Campaign 13 (testnet NFT depth, 2026-09-21) 8-3: t5 accepts the issuer's sell of a non-transferable token. Testnet
+/// ledger's verdict, byte-exact under the port.
+#[test]
+fn nft_c13_issuer_transfers_a_non_transferable_token_5ee3d06e53d1() {
+    run_bundle(include_str!("vectors/nft_c13_issuer_transfers_a_non_transferable_token_5EE3D06E53D1.json"));
+}
+
+/// Campaign 13 (testnet NFT depth, 2026-09-21) 9-2: t6 (NFTokenMinter of t4) mints with Issuer t4. Testnet
+/// ledger's verdict, byte-exact under the port.
+#[test]
+fn nft_c13_authorized_minter_mints_on_behalf_of_the_issuer_394ef4194644() {
+    run_bundle(include_str!("vectors/nft_c13_authorized_minter_mints_on_behalf_of_the_issuer_394EF4194644.json"));
+}
+
+/// Campaign 13 (testnet NFT depth, 2026-09-21) 9-3: t5 mints with Issuer t4 without being its minter. Testnet
+/// ledger's verdict, byte-exact under the port.
+#[test]
+fn nft_c13_mint_with_issuer_by_a_non_minter_is_tec_no_permission_6ca753295790() {
+    run_bundle(include_str!("vectors/nft_c13_mint_with_issuer_by_a_non_minter_is_tec_no_permission_6CA753295790.json"));
+}
+
+/// Campaign 13 (testnet NFT depth, 2026-09-21) 9-5: t5 accepts a sell offer whose Expiration passed. Testnet
+/// ledger's verdict, byte-exact under the port.
+#[test]
+fn nft_c13_accept_of_an_expired_offer_is_tec_expired_ecf3f4863cb3() {
+    run_bundle(include_str!("vectors/nft_c13_accept_of_an_expired_offer_is_tec_expired_ECF3F4863CB3.json"));
+}
