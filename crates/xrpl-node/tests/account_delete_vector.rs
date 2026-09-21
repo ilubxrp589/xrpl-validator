@@ -135,3 +135,39 @@ fn account_delete_refuses_an_nft_holder_106605216() {
 fn account_delete_refuses_a_holder_of_one_nft_106845267() {
     run_bundle(include_str!("vectors/account_delete_refuses_a_holder_of_one_nft_106845267.json"));
 }
+
+/// Campaign 11 (testnet, 2026-09-21): an account holding an accepted credential and having issued one: both removed (finding 354), tesSUCCESS.
+#[test]
+fn account_delete_cascades_credentials_as_subject_and_issuer_testnet_20938045() {
+    run_bundle(include_str!("vectors/account_delete_cascades_credentials_as_subject_and_issuer_testnet_20938045.json"));
+}
+
+/// Campaign 11 (testnet, 2026-09-21): SignerList removed, RegularKey irrelevant: tesSUCCESS.
+#[test]
+fn account_delete_with_a_signer_list_and_regular_key_testnet_20938043() {
+    run_bundle(include_str!("vectors/account_delete_with_a_signer_list_and_regular_key_testnet_20938043.json"));
+}
+
+/// Campaign 11 (testnet, 2026-09-21): an Escrow is an obligation: tecHAS_OBLIGATIONS.
+#[test]
+fn account_delete_refuses_an_escrow_owner_testnet_20938033() {
+    run_bundle(include_str!("vectors/account_delete_refuses_an_escrow_owner_testnet_20938033.json"));
+}
+
+/// Campaign 11 (testnet, 2026-09-21): a Check (written or received) is an obligation: tecHAS_OBLIGATIONS.
+#[test]
+fn account_delete_refuses_a_check_writer_testnet_20938037() {
+    run_bundle(include_str!("vectors/account_delete_refuses_a_check_writer_testnet_20938037.json"));
+}
+
+/// Campaign 11 (testnet, 2026-09-21): an MPTokenIssuance is an obligation: tecHAS_OBLIGATIONS.
+#[test]
+fn account_delete_refuses_an_mpt_issuer_testnet_20938041() {
+    run_bundle(include_str!("vectors/account_delete_refuses_an_mpt_issuer_testnet_20938041.json"));
+}
+
+/// Campaign 11 (testnet, 2026-09-21): a RippleState is an obligation even beside deletable offers, tickets, preauths and a DID: tecHAS_OBLIGATIONS.
+#[test]
+fn account_delete_refuses_a_funded_trust_line_testnet_20938031() {
+    run_bundle(include_str!("vectors/account_delete_refuses_a_funded_trust_line_testnet_20938031.json"));
+}

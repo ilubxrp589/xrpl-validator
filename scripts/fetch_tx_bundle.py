@@ -539,6 +539,20 @@ def main():
             _put(rpc("ledger_entry", {"mpt_issuance": mid, "ledger_index": seq - 1, "binary": True}))
             for who in {tx.get("Account"), tx.get("Holder")} - {None}:
                 _put(rpc("ledger_entry", {"mptoken": {"mpt_issuance_id": mid, "account": who}, "ledger_index": seq - 1, "binary": True}))
+        if tt == "AccountDelete":
+            # Finding 354 / campaign 11: the blocker test walks the WHOLE owner
+            # directory; a tecHAS_OBLIGATIONS names only the root.
+            page = rpc("ledger_entry", {"directory": {"owner": tx["Account"]}, "ledger_index": seq - 1, "binary": False})
+            root = page.get("index"); hops = 0
+            while page.get("node") and hops < 64:
+                nd = page["node"]; hops += 1
+                _put(rpc("ledger_entry", {"index": page["index"], "ledger_index": seq - 1, "binary": True}))
+                for ix in nd.get("Indexes", []):
+                    _put(rpc("ledger_entry", {"index": ix, "ledger_index": seq - 1, "binary": True}))
+                nxt = nd.get("IndexNext")
+                if not nxt or not root:
+                    break
+                page = rpc("ledger_entry", {"directory": {"owner": tx["Account"], "sub_index": int(nxt, 16) if isinstance(nxt, str) else int(nxt)}, "ledger_index": seq - 1, "binary": False})
         if tt == "AMMClawback" and tx.get("Holder"):
             # Finding 352: the holder's own lines for Asset / Asset2 end the tx
             # unchanged (paid by the pool, then clawed), so the meta never

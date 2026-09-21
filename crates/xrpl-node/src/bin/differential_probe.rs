@@ -1171,6 +1171,32 @@ fn load_owner_dir_chain(state: &mut LedgerState, url: &str, owner: &[u8; 20], le
 /// type below).
 const PARTY_FIELDS: [&str; 7] = ["Account", "Destination", "Owner", "Issuer", "Subject", "Holder", "Authorize"];
 
+/// AccountDelete: the blocker test walks the WHOLE owner directory and reads
+/// every object in it (finding 354 / campaign 11) — every page, every index.
+fn load_account_delete_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
+    if txj["TransactionType"].as_str() != Some("AccountDelete") {
+        return;
+    }
+    let Some(acct) = txj["Account"].as_str().and_then(decode_address) else { return };
+    let root = keylet::owner_dir_key(&acct);
+    let mut page = root;
+    for _ in 0..64 {
+        let k = hex::encode_upper(page.0);
+        load_object(state, url, &k, ledger_index);
+        let Some(pj) = state.state_map.lookup(&page).and_then(|b| serde_json::from_slice::<Value>(b).ok()) else { break };
+        for ix in pj.get("Indexes").and_then(|v| v.as_array()).into_iter().flatten() {
+            if let Some(h) = ix.as_str() {
+                load_object(state, url, h, ledger_index);
+            }
+        }
+        let next = pj.get("IndexNext").and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| u64::from_str_radix(s, 16).ok()))).unwrap_or(0);
+        if next == 0 {
+            break;
+        }
+        page = keylet::dir_page_key(&root, next);
+    }
+}
+
 fn load_owner_dir_tail(state: &mut LedgerState, url: &str, txj: &Value, ledger_index: u32) {
     if txj["TransactionType"].as_str() == Some("AccountDelete") {
         if let Some(a) = txj["Account"].as_str().and_then(decode_address) {
@@ -2989,6 +3015,7 @@ fn run() -> i32 {
         load_did_prestate(&mut state, &rpc_url, txj, seq - 1); // campaign 6 #20909840
         load_check_cash_prestate(&mut state, &rpc_url, txj, seq - 1); // finding 348
         load_clawback_prestate(&mut state, &rpc_url, txj, seq - 1); // finding 351
+        load_account_delete_prestate(&mut state, &rpc_url, txj, seq - 1); // finding 354
     }
     // FLAG-LEDGER OPEN: rotate the NegativeUNL pending fields into
     // DisabledValidators before any transaction applies — a ledger-level

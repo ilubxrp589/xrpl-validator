@@ -624,6 +624,21 @@ impl Transactor for AccountDeleteTransactor {
                         );
                         sandbox.delete(*kh);
                     }
+                    // Finding 354 (testnet campaign 11, #20938045 6B90AAED): rippled's
+                    // nonObligationDeleter (AccountDelete.cpp:192-214) also removes
+                    // DID, Oracle, Delegate and Credential objects — each by its own
+                    // removeFromLedger (the owner-directory entry and the object; a
+                    // Credential leaves BOTH parties' directories, credentials::
+                    // deleteSLE). We answered tecNO_PERMISSION for any of them.
+                    Some("DID") | Some("Oracle") | Some("Delegate") => {
+                        crate::ledger::directory::owner_dir_remove(
+                            sandbox, &tx.account, kh, hint_of(obj, "OwnerNode"), true,
+                        );
+                        sandbox.delete(*kh);
+                    }
+                    Some("Credential") => {
+                        crate::tx::credential::delete_credential_object(sandbox, kh);
+                    }
                     _ => return TxResult::NoPermission,
                 }
             }
