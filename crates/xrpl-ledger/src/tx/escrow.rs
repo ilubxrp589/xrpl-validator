@@ -679,6 +679,119 @@ fn escrow_dir_teardown(
     }
 }
 
+/// rippled's crypto-conditions, PREIMAGE-SHA-256 only (`Condition::deserialize`,
+/// `Fulfillment::deserialize`, `PreimageSha256`, `validate` — Condition.cpp,
+/// Fulfillment.cpp, detail/PreimageSha256.h, detail/utils.h). Every other type
+/// (prefix, threshold, RSA, ed25519) is unsupported by rippled too.
+///
+/// DER as rippled parses it: a preamble byte (class bits, constructed bit,
+/// tag < 31) and a length (short, or long-form with a byte count).
+///   condition   = A0 <len> 80 20 <32-byte fingerprint> 81 <n> <cost>, at
+///                 most 128 bytes, cost at most 128, nothing trailing;
+///   fulfillment = A0 <len> 80 <n> <preimage>, at most 256 bytes, the outer
+///                 length exactly the buffer, the preimage at most 128 bytes.
+/// A fulfillment satisfies a condition when sha256(preimage) is the
+/// fingerprint and the preimage's length is the cost.
+fn der_preamble(s: &mut &[u8]) -> Option<(u8, u8, usize)> {
+    if s.len() < 2 {
+        return None;
+    }
+    let ty = s[0] & 0xE0;
+    let tag = s[0] & 0x1F;
+    if tag == 0x1F {
+        return None; // long tag form: unsupported
+    }
+    let mut len = s[1] as usize;
+    *s = &s[2..];
+    if len & 0x80 != 0 {
+        let cnt = len & 0x7F;
+        if cnt == 0 || cnt > 8 || cnt > s.len() {
+            return None;
+        }
+        len = 0;
+        for &b in &s[..cnt] {
+            len = (len << 8) | b as usize;
+        }
+        *s = &s[cnt..];
+    }
+    Some((ty, tag, len))
+}
+
+fn der_context_primitive(ty: u8) -> bool {
+    ty & 0x20 == 0 && ty & 0xC0 == 0x80
+}
+
+/// The fingerprint and cost of a PREIMAGE-SHA-256 condition, or None when
+/// rippled's `Condition::deserialize` would fail.
+pub(crate) fn parse_preimage_condition(c: &[u8]) -> Option<([u8; 32], u32)> {
+    if c.is_empty() || c.len() > 128 {
+        return None;
+    }
+    let mut s = c;
+    let (ty, tag, len) = der_preamble(&mut s)?;
+    if ty & 0x20 == 0 || ty & 0xC0 != 0x80 || tag != 0 || len > s.len() {
+        return None;
+    }
+    let (mut payload, rest) = s.split_at(len);
+    if !rest.is_empty() {
+        return None; // trailing garbage
+    }
+    let (ty, tag, len) = der_preamble(&mut payload)?;
+    if !der_context_primitive(ty) || tag != 0 || len != 32 || payload.len() < 32 {
+        return None;
+    }
+    let mut fp = [0u8; 32];
+    fp.copy_from_slice(&payload[..32]);
+    payload = &payload[32..];
+    let (ty, tag, len) = der_preamble(&mut payload)?;
+    if !der_context_primitive(ty) || tag != 1 || len == 0 || len > 5 || len > payload.len() {
+        return None;
+    }
+    let int = &payload[..len];
+    if int[0] & 0x80 != 0 || (len == 5 && int[0] != 0) {
+        return None;
+    }
+    let mut cost: u64 = 0;
+    for &b in int {
+        cost = (cost << 8) | b as u64;
+    }
+    if !payload[len..].is_empty() || cost > 128 {
+        return None;
+    }
+    Some((fp, cost as u32))
+}
+
+/// The preimage of a PREIMAGE-SHA-256 fulfillment, or None when rippled's
+/// `Fulfillment::deserialize` would fail.
+pub(crate) fn parse_preimage_fulfillment(f: &[u8]) -> Option<Vec<u8>> {
+    if f.is_empty() {
+        return None;
+    }
+    let mut s = f;
+    let (ty, tag, len) = der_preamble(&mut s)?;
+    if ty & 0x20 == 0 || ty & 0xC0 != 0x80 || tag != 0 || len != s.len() || len > 256 {
+        return None;
+    }
+    let (ty, tag, len) = der_preamble(&mut s)?;
+    if !der_context_primitive(ty) || tag != 0 || len != s.len() || len > 128 {
+        return None;
+    }
+    Some(s.to_vec())
+}
+
+/// rippled `checkCondition(fulfillment, condition)` (EscrowFinish.cpp:48-61):
+/// both parse, and `validate` — same type, the fulfillment's derived
+/// condition (fingerprint = sha256(preimage), cost = its length) equals the
+/// stated one.
+pub(crate) fn check_condition(fulfillment: &[u8], condition: &[u8]) -> bool {
+    use sha2::{Digest, Sha256};
+    let (Some((fp, cost)), Some(preimage)) = (parse_preimage_condition(condition), parse_preimage_fulfillment(fulfillment)) else {
+        return false;
+    };
+    let digest: [u8; 32] = Sha256::digest(&preimage).into();
+    digest == fp && cost as usize == preimage.len()
+}
+
 pub struct EscrowFinishTransactor;
 
 impl EscrowFinishTransactor {
@@ -707,6 +820,10 @@ impl Transactor for EscrowFinishTransactor {
             return TxResult::Malformed;
         }
         if Self::offer_sequence(tx).is_none() {
+            return TxResult::Malformed;
+        }
+        // A Condition needs a Fulfillment and vice versa (EscrowFinish.cpp:74-80).
+        if tx.fields.get("Condition").is_some() != tx.fields.get("Fulfillment").is_some() {
             return TxResult::Malformed;
         }
         TxResult::Success
@@ -797,10 +914,34 @@ impl Transactor for EscrowFinishTransactor {
         }
 
         // Bug 2 fix: If escrow has FinishAfter, close_time must be past it.
-        // TODO: Also verify Condition/Fulfillment crypto (cryptoconditions) when present.
         if let Some(finish_after) = escrow.get("FinishAfter").and_then(|v| v.as_u64()) {
             if close_time <= finish_after {
                 return TxResult::NoPermission;
+            }
+        }
+        // Finding 353 — the crypto-condition (EscrowFinish.cpp:255-306): a
+        // Fulfillment that does not satisfy the transaction's Condition, a
+        // Condition on a finish of an escrow created without one, or a
+        // Condition that differs from the escrow's — all tecCRYPTOCONDITION_ERROR.
+        // We never looked at either field.
+        {
+            let cb = tx.fields.get("Condition").and_then(|v| v.as_str());
+            let fb = tx.fields.get("Fulfillment").and_then(|v| v.as_str());
+            if let (Some(c), Some(f)) = (cb, fb) {
+                let (Ok(cbytes), Ok(fbytes)) = (hex::decode(c), hex::decode(f)) else {
+                    return TxResult::CryptoConditionError;
+                };
+                if !check_condition(&fbytes, &cbytes) {
+                    return TxResult::CryptoConditionError;
+                }
+            }
+            let cond = escrow.get("Condition").and_then(|v| v.as_str());
+            match (cond, cb) {
+                (None, Some(_)) => return TxResult::CryptoConditionError,
+                (Some(cond), cb) if cb.map(|c| c.eq_ignore_ascii_case(cond)) != Some(true) => {
+                    return TxResult::CryptoConditionError;
+                }
+                _ => {}
             }
         }
 
@@ -2009,4 +2150,48 @@ mod tests {
         assert!(sb.exists(&lkey), "the line was re-created");
     }
 
+
+
+    /// Finding 353: PREIMAGE-SHA-256 parsing and matching as rippled does it.
+    #[test]
+    fn preimage_sha256_conditions_parse_and_match() {
+        use sha2::{Digest, Sha256};
+        // the empty preimage: fulfillment A0 02 80 00; condition A0 25 80 20 <sha256("")> 81 01 00
+        let fp: [u8; 32] = Sha256::digest(b"").into();
+        let mut cond = vec![0xA0, 0x25, 0x80, 0x20];
+        cond.extend_from_slice(&fp);
+        cond.extend_from_slice(&[0x81, 0x01, 0x00]);
+        let ful = vec![0xA0, 0x02, 0x80, 0x00];
+        assert_eq!(parse_preimage_condition(&cond), Some((fp, 0)));
+        assert_eq!(parse_preimage_fulfillment(&ful), Some(Vec::new()));
+        assert!(check_condition(&ful, &cond));
+        // a 32-byte preimage
+        let pre = [0x42u8; 32];
+        let fp2: [u8; 32] = Sha256::digest(pre).into();
+        let mut cond2 = vec![0xA0, 0x25, 0x80, 0x20];
+        cond2.extend_from_slice(&fp2);
+        cond2.extend_from_slice(&[0x81, 0x01, 0x20]);
+        let mut ful2 = vec![0xA0, 0x22, 0x80, 0x20];
+        ful2.extend_from_slice(&pre);
+        assert!(check_condition(&ful2, &cond2));
+        assert!(!check_condition(&ful, &cond2), "wrong preimage");
+        assert!(!check_condition(&ful2, &cond), "wrong condition");
+        // cost must equal the preimage length
+        let mut cond3 = cond2.clone();
+        *cond3.last_mut().unwrap() = 0x21;
+        assert!(!check_condition(&ful2, &cond3));
+        // malformed: a primitive outer tag, trailing garbage, a long-tag form
+        let mut bad = cond2.clone();
+        bad[0] = 0x80;
+        assert!(parse_preimage_condition(&bad).is_none());
+        let mut trailing = cond2.clone();
+        trailing.push(0x00);
+        assert!(parse_preimage_condition(&trailing).is_none());
+        assert!(parse_preimage_fulfillment(&[0xBF, 0x02, 0x80, 0x00]).is_none());
+        // a preimage past 128 bytes is refused even when it would hash right
+        let big = vec![0x01u8; 129];
+        let mut fbig = vec![0xA0, 0x81, 0x83, 0x80, 0x81, 0x81];
+        fbig.extend_from_slice(&big);
+        assert!(parse_preimage_fulfillment(&fbig).is_none());
+    }
 }

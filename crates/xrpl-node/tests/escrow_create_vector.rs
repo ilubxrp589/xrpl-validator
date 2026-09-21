@@ -269,3 +269,33 @@ fn escrow_cancel_mpt_before_cancel_after_by_a_stranger_is_no_permission() {
 fn escrow_finish_self_escrow_without_a_line_needs_the_reserve_107088326() {
     run_bundle(include_str!("vectors/escrow_finish_self_escrow_without_a_line_needs_the_reserve_107088326.json"));
 }
+
+/// Finding 353 — testnet campaign 10, the right Condition with a fulfillment for a different preimage.
+#[test]
+fn escrow_finish_wrong_fulfillment_is_cryptocondition_error_testnet_20937660() {
+    run_bundle(include_str!("vectors/escrow_finish_wrong_fulfillment_is_cryptocondition_error_testnet_20937660.json"));
+}
+
+/// Finding 353 — testnet campaign 10, no Condition/Fulfillment on a finish of a conditioned escrow.
+#[test]
+fn escrow_finish_without_the_pair_on_a_conditioned_escrow_is_cryptocondition_error_testnet_20937662() {
+    run_bundle(include_str!("vectors/escrow_finish_without_the_pair_on_a_conditioned_escrow_is_cryptocondition_error_testnet_20937662.json"));
+}
+
+/// Finding 353 — testnet campaign 10, a valid pair whose Condition is not the escrow's.
+#[test]
+fn escrow_finish_with_a_different_condition_is_cryptocondition_error_testnet_20937664() {
+    run_bundle(include_str!("vectors/escrow_finish_with_a_different_condition_is_cryptocondition_error_testnet_20937664.json"));
+}
+
+/// Finding 353 — testnet campaign 10, a Condition on a finish of an escrow created without one.
+#[test]
+fn escrow_finish_with_a_pair_on_an_unconditioned_escrow_is_cryptocondition_error_testnet_20937669() {
+    run_bundle(include_str!("vectors/escrow_finish_with_a_pair_on_an_unconditioned_escrow_is_cryptocondition_error_testnet_20937669.json"));
+}
+
+/// Finding 353 — testnet campaign 10, the matching PREIMAGE-SHA-256 pair: tesSUCCESS, the fulfillment fee paid.
+#[test]
+fn escrow_finish_with_the_right_fulfillment_testnet_20937667() {
+    run_bundle(include_str!("vectors/escrow_finish_with_the_right_fulfillment_testnet_20937667.json"));
+}

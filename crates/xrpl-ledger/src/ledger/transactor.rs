@@ -70,6 +70,9 @@ pub enum TxResult {
     /// already reached. rippled: `hasExpired(view, exp)` is
     /// `parentCloseTime() >= exp` (View.cpp:48-54).
     Expired,
+    /// tecCRYPTOCONDITION_ERROR — an EscrowFinish whose fulfillment does not satisfy the
+    /// condition, or whose Condition disagrees with the escrow's (finding 353).
+    CryptoConditionError,
     /// AccountDelete: the account's Sequence is too recent —
     /// `sequence + 255 > view.seq()` (AccountDelete.cpp kSeqDelta).
     TooSoon,
@@ -296,6 +299,7 @@ impl TxResult {
             | TxResult::InsufReserveOffer
             | TxResult::UnfundedOffer
             | TxResult::Expired
+            | TxResult::CryptoConditionError
             | TxResult::TooSoon
             | TxResult::PathPartial
             | TxResult::DstTagNeeded
@@ -373,6 +377,7 @@ impl TxResult {
             TxResult::InsufReserveOffer => "tecINSUF_RESERVE_OFFER",
             TxResult::UnfundedOffer => "tecUNFUNDED_OFFER",
             TxResult::Expired => "tecEXPIRED",
+            TxResult::CryptoConditionError => "tecCRYPTOCONDITION_ERROR",
             TxResult::PathPartial => "tecPATH_PARTIAL",
             TxResult::DstTagNeeded => "tecDST_TAG_NEEDED",
             TxResult::ArrayTooLarge => "tecARRAY_TOO_LARGE",
@@ -734,7 +739,7 @@ mod claim_tests {
         let all = [
             TxResult::LimitExceeded, TxResult::NoLine, TxResult::Frozen, TxResult::NoPermission,
             TxResult::PathDry, TxResult::PathPartial, TxResult::Killed, TxResult::Expired,
-            TxResult::AmmNotEmpty,
+            TxResult::AmmNotEmpty, TxResult::CryptoConditionError,
         ];
         for r in all {
             assert!(r.code_str().starts_with("tec"), "{:?}", r);
