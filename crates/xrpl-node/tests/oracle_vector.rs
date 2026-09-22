@@ -117,3 +117,13 @@ fn permissioned_domain_refile_of_the_same_list_is_not_a_change_fuzz_testnet_2086
         "vectors/permissioned_domain_refile_of_the_same_list_is_not_a_change_fuzz_testnet_20863999.json"
     ));
 }
+
+/// Finding 358 (soak #24 receipt, #107159929 B88A96E280D3): raQWZPjc updates
+/// 9 of its oracle's 10 pairs. rippled rebuilds the series from the asset
+/// names alone and re-applies the update, so the unnamed pair (CLEARPOOL_AUM)
+/// loses its AssetPrice and Scale — 13 bytes we kept. Byte-exact against
+/// mainnet's post-state.
+#[test]
+fn oracle_set_strips_unnamed_pairs_to_their_asset_names_107159929() {
+    run_bundle(include_str!("vectors/oracle_set_strips_unnamed_pairs_to_their_asset_names_107159929.json"));
+}

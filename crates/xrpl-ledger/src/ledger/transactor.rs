@@ -136,6 +136,10 @@ pub enum TxResult {
     DirFull,
     /// Creating the owned object(s) would breach the account's owner reserve.
     InsufficientReserve,
+    /// tecARRAY_EMPTY — OracleSet: the merged PriceDataSeries would be empty (finding 358).
+    TecArrayEmpty,
+    /// tecTOKEN_PAIR_NOT_FOUND — OracleSet: a pair sent without AssetPrice that the oracle does not hold (finding 358).
+    TokenPairNotFound,
     /// Modifying a trust line into a reserved state, but the owner can't afford
     /// the incremental reserve.
     InsufReserveLine,
@@ -304,6 +308,8 @@ impl TxResult {
             | TxResult::PathPartial
             | TxResult::DstTagNeeded
             | TxResult::ArrayTooLarge
+            | TxResult::TecArrayEmpty
+            | TxResult::TokenPairNotFound
             | TxResult::Duplicate
             | TxResult::ObjectNotFound
             | TxResult::CantAcceptOwnNftOffer
@@ -398,6 +404,8 @@ impl TxResult {
             TxResult::HasObligations => "tecHAS_OBLIGATIONS",
             TxResult::DirFull => "tecDIR_FULL",
             TxResult::InsufficientReserve => "tecINSUFFICIENT_RESERVE",
+            TxResult::TecArrayEmpty => "tecARRAY_EMPTY",
+            TxResult::TokenPairNotFound => "tecTOKEN_PAIR_NOT_FOUND",
             TxResult::InsufReserveLine => "tecINSUF_RESERVE_LINE",
             TxResult::UnfundedAmm => "tecUNFUNDED_AMM",
             TxResult::AmmFailed => "tecAMM_FAILED",
@@ -739,7 +747,7 @@ mod claim_tests {
         let all = [
             TxResult::LimitExceeded, TxResult::NoLine, TxResult::Frozen, TxResult::NoPermission,
             TxResult::PathDry, TxResult::PathPartial, TxResult::Killed, TxResult::Expired,
-            TxResult::AmmNotEmpty, TxResult::CryptoConditionError,
+            TxResult::AmmNotEmpty, TxResult::CryptoConditionError, TxResult::TecArrayEmpty, TxResult::TokenPairNotFound,
         ];
         for r in all {
             assert!(r.code_str().starts_with("tec"), "{:?}", r);

@@ -34,6 +34,57 @@ fn pair_of(item: &serde_json::Value) -> (serde_json::Value, serde_json::Value) {
     (pd["BaseAsset"].clone(), pd["QuoteAsset"].clone())
 }
 
+/// fixPriceOracleOrder (mainnet-enabled): a created oracle's series is sorted
+/// by token pair, as an updated one always is.
+const FIX_PRICE_ORACLE_ORDER: &str = "FF2D1E13CF6D22427111B967BD504917F63A900CECD320D6FD3AC9FA90344631";
+
+/// rippled `tokenPairKey`: the (BaseAsset, QuoteAsset) Currency pair, as the
+/// 160-bit values a `std::map` orders by.
+fn pair_key(item: &serde_json::Value) -> ([u8; 20], [u8; 20]) {
+    let pd = &item["PriceData"];
+    let c = |v: &serde_json::Value| {
+        crate::tx::offer::amount_currency20(&serde_json::json!({"currency": v.as_str().unwrap_or("")})).unwrap_or([0u8; 20])
+    };
+    (c(&pd["BaseAsset"]), c(&pd["QuoteAsset"]))
+}
+
+/// Finding 358 (soak #24 receipt, #107159929 B88A96E280D3 — an OracleSet
+/// naming 9 of the oracle's 10 pairs): rippled's OracleSet::doApply rebuilds
+/// the series from scratch — every pair the oracle already holds is collected
+/// as BaseAsset + QuoteAsset ONLY ("the token pair that doesn't have their
+/// price updated will not include neither price nor scale"), then the
+/// transaction's entries delete (no AssetPrice), update (AssetPrice, and Scale
+/// only when sent) or add pairs, and the result is emitted in std::map order
+/// of (BaseAsset, QuoteAsset). We kept the unnamed pair's old price and scale
+/// (13 bytes mainnet dropped) and appended new pairs unsorted.
+fn merge_series(existing: &[serde_json::Value], tx_series: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut pairs: std::collections::BTreeMap<([u8; 20], [u8; 20]), serde_json::Value> = std::collections::BTreeMap::new();
+    for e in existing {
+        let pd = &e["PriceData"];
+        pairs.insert(pair_key(e), serde_json::json!({"PriceData": {"BaseAsset": pd["BaseAsset"], "QuoteAsset": pd["QuoteAsset"]}}));
+    }
+    for item in tx_series {
+        let key = pair_key(item);
+        let pd = &item["PriceData"];
+        match pd.get("AssetPrice") {
+            None => {
+                pairs.remove(&key);
+            }
+            Some(price) => {
+                if let Some(cur) = pairs.get_mut(&key) {
+                    cur["PriceData"]["AssetPrice"] = price.clone();
+                    if let Some(sc) = pd.get("Scale") {
+                        cur["PriceData"]["Scale"] = sc.clone();
+                    }
+                } else {
+                    pairs.insert(key, item.clone());
+                }
+            }
+        }
+    }
+    pairs.into_values().collect()
+}
+
 fn bump_owner_count(sandbox: &mut Sandbox, account: &[u8; 20], delta: i64) {
     if delta == 0 {
         return;
@@ -107,14 +158,49 @@ impl Transactor for OracleSetTransactor {
         {
             return TxResult::InvalidUpdateTime;
         }
-        if let Some(id) = doc_id(tx) {
-            if let Some(d) = sandbox.read(&keylet::oracle_key(&tx.account, id)) {
-                if let Ok(sle) = serde_json::from_slice::<serde_json::Value>(&d) {
-                    if let Some(stored) = sle.get("LastUpdateTime").and_then(|v| v.as_u64()) {
-                        if lut <= stored {
-                            return TxResult::InvalidUpdateTime;
-                        }
-                    }
+        let existing: Option<serde_json::Value> = doc_id(tx)
+            .and_then(|id| sandbox.read(&keylet::oracle_key(&tx.account, id)))
+            .and_then(|d| serde_json::from_slice(&d).ok());
+        if let Some(sle) = &existing {
+            if let Some(stored) = sle.get("LastUpdateTime").and_then(|v| v.as_u64()) {
+                if lut <= stored {
+                    return TxResult::InvalidUpdateTime;
+                }
+            }
+        }
+        // Finding 358 — OracleSet::preclaim (OracleSet.cpp:86-150): the pair
+        // bookkeeping. A pair sent WITHOUT AssetPrice must exist in the oracle
+        // (tecTOKEN_PAIR_NOT_FOUND); the merged set may not be empty
+        // (tecARRAY_EMPTY) nor exceed ten (tecARRAY_TOO_LARGE); and the
+        // pre-fee balance must cover the reserve at the new pair count
+        // (tecINSUFFICIENT_RESERVE). Before this the empty merge was a tem.
+        let tx_series: Vec<serde_json::Value> = tx.fields["PriceDataSeries"].as_array().cloned().unwrap_or_default();
+        let old_series: Vec<serde_json::Value> = existing
+            .as_ref()
+            .and_then(|o| o["PriceDataSeries"].as_array().cloned())
+            .unwrap_or_default();
+        if existing.is_some() {
+            let held: std::collections::BTreeSet<([u8; 20], [u8; 20])> = old_series.iter().map(pair_key).collect();
+            for item in &tx_series {
+                if item["PriceData"].get("AssetPrice").is_none() && !held.contains(&pair_key(item)) {
+                    return TxResult::TokenPairNotFound;
+                }
+            }
+        }
+        let merged = merge_series(&old_series, &tx_series);
+        if merged.is_empty() {
+            return TxResult::TecArrayEmpty;
+        }
+        if merged.len() > 10 {
+            return TxResult::ArrayTooLarge;
+        }
+        let adjust = reserve_units(&serde_json::Value::Array(merged)) - if existing.is_some() { reserve_units(&serde_json::Value::Array(old_series)) } else { 0 };
+        if adjust > 0 {
+            if let Some(a) = sandbox.read(&k).and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok()) {
+                let bal = a["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                let oc = a["OwnerCount"].as_u64().unwrap_or(0);
+                if bal < crate::ledger::fees::account_reserve(sandbox, oc + adjust as u64) {
+                    return TxResult::InsufficientReserve;
                 }
             }
         }
@@ -133,26 +219,14 @@ impl Transactor for OracleSetTransactor {
 
         if let Some(mut oracle) = existing {
             let old_units = reserve_units(&oracle["PriceDataSeries"]);
-            let mut series = oracle["PriceDataSeries"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            for item in tx.fields["PriceDataSeries"].as_array().into_iter().flatten() {
-                let tx_pair = pair_of(item);
-                let pos = series.iter().position(|e| pair_of(e) == tx_pair);
-                if item["PriceData"].get("AssetPrice").is_none() {
-                    // Pair named without a price → delete it from the object.
-                    if let Some(p) = pos {
-                        series.remove(p);
-                    }
-                } else if let Some(p) = pos {
-                    series[p] = item.clone();
-                } else {
-                    series.push(item.clone());
-                }
-            }
+            // Finding 358: rippled rebuilds the series (merge_series) — unnamed
+            // pairs keep only their asset names; output in token-pair order.
+            let series = merge_series(
+                oracle["PriceDataSeries"].as_array().map(Vec::as_slice).unwrap_or(&[]),
+                tx.fields["PriceDataSeries"].as_array().map(Vec::as_slice).unwrap_or(&[]),
+            );
             if series.is_empty() {
-                return TxResult::Malformed;
+                return TxResult::TecArrayEmpty;
             }
             // Overflowing the ten-entry limit by MERGING is a tec, not a tem:
             // the transaction is well formed and only the resulting object is
@@ -185,7 +259,13 @@ impl Transactor for OracleSetTransactor {
                 "Flags": 0,
                 "Owner": hex::encode(tx.account),
                 "OracleDocumentID": id,
-                "PriceDataSeries": tx.fields["PriceDataSeries"].clone(),
+                "PriceDataSeries": if crate::ledger::amendments::enabled(sandbox, FIX_PRICE_ORACLE_ORDER) {
+                    // fixPriceOracleOrder: the created series is emitted in
+                    // token-pair order (OracleSet.cpp:307-318), like an update.
+                    serde_json::Value::Array(merge_series(&[], tx.fields["PriceDataSeries"].as_array().map(Vec::as_slice).unwrap_or(&[])))
+                } else {
+                    tx.fields["PriceDataSeries"].clone()
+                },
                 "OwnerNode": 0,
             });
             for f in ["LastUpdateTime", "Provider", "AssetClass", "URI"] {
@@ -331,9 +411,11 @@ mod tests {
         let oracle: serde_json::Value = serde_json::from_slice(&sb.read(&key).unwrap()).unwrap();
         let series = oracle["PriceDataSeries"].as_array().unwrap();
         assert_eq!(series.len(), 2);
-        assert_eq!(series[0]["PriceData"]["BaseAsset"], "BTC");
-        assert_eq!(series[0]["PriceData"]["AssetPrice"], "99");
-        assert_eq!(series[1]["PriceData"]["BaseAsset"], "XRP");
+        // Finding 358: token-pair order — XRP (the zero currency) sorts first.
+        assert_eq!(series[0]["PriceData"]["BaseAsset"], "XRP");
+        assert_eq!(series[0]["PriceData"]["AssetPrice"], "3");
+        assert_eq!(series[1]["PriceData"]["BaseAsset"], "BTC");
+        assert_eq!(series[1]["PriceData"]["AssetPrice"], "99");
     }
 
     #[test]
@@ -360,5 +442,40 @@ mod tests {
         let acct: serde_json::Value =
             serde_json::from_slice(&sb.read(&keylet::account_root_key(&id)).unwrap()).unwrap();
         assert_eq!(acct["OwnerCount"], 0);
+    }
+
+    /// Finding 358: pairs the update does not name keep only their asset
+    /// names; the series comes out in token-pair order; deleting a pair the
+    /// oracle does not hold is tecTOKEN_PAIR_NOT_FOUND; an empty merge is
+    /// tecARRAY_EMPTY (a tec, the fee is claimed).
+    #[test]
+    fn update_strips_unnamed_pairs_and_sorts() {
+        let id = [0x53u8; 20];
+        let state = state_with_account(&id);
+        let tr = OracleSetTransactor;
+        let key = keylet::oracle_key(&id, 1);
+        let mut sb = Sandbox::new(&state);
+        let create = set_tx(id, vec![pd("ETH", Some("22")), pd("BTC", Some("11"))]);
+        assert_eq!(tr.do_apply(&create, &mut sb), TxResult::Success);
+        // Name only BTC (new price, no Scale) and add AAA: ETH keeps its
+        // names alone, BTC's Scale is gone, order is AAA, BTC, ETH.
+        let mut update = set_tx(id, vec![pd("BTC", Some("99")), pd("AAA", Some("1"))]);
+        update.fields["PriceDataSeries"][0]["PriceData"].as_object_mut().unwrap().remove("Scale");
+        update.fields["LastUpdateTime"] = serde_json::json!(1_780_000_100u64);
+        assert_eq!(tr.preclaim(&update, &sb), TxResult::Success);
+        assert_eq!(tr.do_apply(&update, &mut sb), TxResult::Success);
+        let oracle: serde_json::Value = serde_json::from_slice(&sb.read(&key).unwrap()).unwrap();
+        let series = oracle["PriceDataSeries"].as_array().unwrap();
+        let bases: Vec<&str> = series.iter().map(|e| e["PriceData"]["BaseAsset"].as_str().unwrap()).collect();
+        assert_eq!(bases, ["AAA", "BTC", "ETH"]);
+        assert_eq!(series[1]["PriceData"]["AssetPrice"], "99");
+        assert!(series[1]["PriceData"].get("Scale").is_none(), "Scale only when the update sends it");
+        assert!(series[2]["PriceData"].get("AssetPrice").is_none() && series[2]["PriceData"].get("Scale").is_none(), "an unnamed pair keeps its names only");
+        let mut bad = set_tx(id, vec![pd("ZZZ", None)]);
+        bad.fields["LastUpdateTime"] = serde_json::json!(1_780_000_200u64);
+        assert_eq!(tr.preclaim(&bad, &sb), TxResult::TokenPairNotFound);
+        let mut empty = set_tx(id, vec![pd("AAA", None), pd("BTC", None), pd("ETH", None)]);
+        empty.fields["LastUpdateTime"] = serde_json::json!(1_780_000_200u64);
+        assert_eq!(tr.preclaim(&empty, &sb), TxResult::TecArrayEmpty);
     }
 }
