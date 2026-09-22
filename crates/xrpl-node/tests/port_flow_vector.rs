@@ -157,3 +157,18 @@ fn payment_partial_delivermin_bst_to_usd_default_paths_testnet_20910353() {
     port();
     run_bundle(include_str!("vectors/payment_partial_delivermin_bst_to_usd_default_paths_testnet_20910353.json"));
 }
+
+/// Finding 357 (soak #23 receipt, #107155576 E70334ED9A24): rKVBZwTW buys 175
+/// XLM for 37.301075 USD (both GateHub) with 0.958 XRP against a 1.6 XRP
+/// reserve. flowCross moved nothing the ledger could see, but reported a
+/// dust output — rippled's `crossed` is `takerAmount != placeOffer` (the
+/// amounts, OfferCreate.cpp:794), so it claimed tecINSUF_RESERVE_OFFER; we
+/// read `actual_out > 0` and answered tesSUCCESS. Pre-images are the
+/// in-ledger state (ledger-start pre merged with the metas of txs 0..137 —
+/// at ledger start the book still held a crossable offer). Port-only: the
+/// fallback model keeps its own crossed test.
+#[test]
+fn offer_crossed_is_judged_by_the_amounts_not_by_a_dust_output_107155576() {
+    port();
+    run_bundle(include_str!("vectors/offer_crossed_is_judged_by_the_amounts_not_by_a_dust_output_107155576.json"));
+}

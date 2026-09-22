@@ -9902,7 +9902,16 @@ impl Transactor for OfferCreateTransactor {
                     stale.push(*k);
                 }
             }
-            let crossed = if r.actual_out.signum() > 0 { 1 } else { 0 };
+            // Finding 357 (soak #23 receipt, #107155576 E70334ED9A24): rippled
+            // judges "crossed" by the AMOUNTS — `if (takerAmount != placeOffer)
+            // crossed = true` (OfferCreate.cpp:794), placeOffer being flowCross's
+            // afterCross pair — not by whether flow() reported any output. A
+            // dust fill that rounds back to the original amounts (175 XLM for
+            // 37.301075 USD, unchanged after crossing) is NOT a cross: with the
+            // taker under reserve mainnet claimed tecINSUF_RESERVE_OFFER; we
+            // read `actual_out > 0`, called it crossed, and answered tesSUCCESS
+            // with the identical fee-only mutation set.
+            let crossed = if r.after_in != amt_of(&gets_leg, tg0) || r.after_out != amt_of(&pays_leg, tp0) { 1 } else { 0 };
             port_after_in = Some(r.after_in.mantissa_exp());
             (r.after_out.mantissa_exp(), r.after_in.mantissa_exp(), crossed)
         } else if book_refused || freeze_refused {
