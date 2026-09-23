@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""build_batch.py <outer_hash> <ledger> <outdir>  — campaign 23's Batch bundle builder.
+"""build_batch.py <outer_hash|prefix> <ledger> <outdir>  — campaign 23's Batch bundle builder.
 
 Campaign 8's recipe (fetch the OUTER's bundle and each FILED inner's bundle with fetch_tx_bundle.py,
 merge them in apply order: pre = first occurrence, expect = last occurrence) plus three repairs the
@@ -68,7 +68,9 @@ def main():
     os.makedirs(outdir, exist_ok=True)
     led = rpc('ledger', {'ledger_index': seq, 'transactions': True, 'expand': True})['ledger']
     txs = led['transactions']
-    outer = next(t for t in txs if t.get('hash', '').upper() == outer_hash)
+    # a receipt names a 12-hex prefix: resolve it to the full id (ParentBatchID holds the full one)
+    outer = next(t for t in txs if t.get('hash', '').upper().startswith(outer_hash))
+    outer_hash = outer['hash'].upper()
     om = outer.get('metaData') or outer.get('meta')
     outer_index = om['TransactionIndex']
     filed = []
