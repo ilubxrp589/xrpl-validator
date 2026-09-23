@@ -80,6 +80,9 @@ pub enum TxResult {
     TecPseudoAccount,
     /// tecAMM_ACCOUNT — Clawback from an AMM account.
     TecAmmAccount,
+    /// terNO_DELEGATE_PERMISSION — a delegated transaction the Delegate
+    /// object does not authorize (never filed; a refused Batch inner).
+    NoDelegatePermission,
     /// AccountDelete: the account's Sequence is too recent —
     /// `sequence + 255 > view.seq()` (AccountDelete.cpp kSeqDelta).
     TooSoon,
@@ -469,6 +472,7 @@ impl TxResult {
             TxResult::MaxLedger => "tefMAX_LEDGER",
             TxResult::NoTicket => "tefNO_TICKET",
             TxResult::WrongPrior => "tefWRONG_PRIOR",
+            TxResult::NoDelegatePermission => "terNO_DELEGATE_PERMISSION",
             TxResult::NoAuthRequired => "tefNO_AUTH_REQUIRED",
             TxResult::PreSeq => "terPRE_SEQ",
             TxResult::PreTicket => "terPRE_TICKET",
@@ -636,6 +640,16 @@ pub fn stamp_account_txn_id(tx: &TxFields, sandbox: &mut Sandbox, armed_before: 
     if let Ok(bytes) = serde_json::to_vec(&acct) {
         sandbox.write(key, bytes);
     }
+}
+
+/// Finding 390: rippled stamps sfAccountTxnID in `Transactor::apply`, AHEAD of
+/// doApply (Transactor.cpp:906-909). For every transaction but a Batch outer
+/// the position is invisible — doApply never reads the field and a tec
+/// discards the stamp with the rest — so the pipelines stamp after a
+/// successful do_apply. A Batch outer's doApply runs its inners, each of which
+/// stamps its OWN id; the outer's stamp must land first or it overwrites them.
+pub fn stamps_before_apply(tx: &TxFields) -> bool {
+    tx.tx_type == "Batch"
 }
 
 /// Whether the sender's root carries AccountTxnID right now — read before

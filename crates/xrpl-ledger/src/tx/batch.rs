@@ -8,6 +8,7 @@
 //! signatures today (validated ledgers carry only verified transactions);
 //! the structural checks on the signer set are enforced.
 use crate::ledger::sandbox::{Sandbox, SandboxEntry, AUX_KEY};
+use crate::ledger::threading::InnerTouch;
 use crate::ledger::transactor::{Transactor, TxFields, TxResult};
 use crate::tx::dispatch::{apply_on_sandbox, is_pseudo};
 use serde_json::Value;
@@ -60,7 +61,7 @@ pub const DISABLED_INNER_TYPES: &[&str] = &[
 
 thread_local! {
     static INNER_RESULTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-    static INNER_TOUCHED: RefCell<Vec<Vec<Hash256>>> = const { RefCell::new(Vec::new()) };
+    static INNER_TOUCHED: RefCell<Vec<Vec<InnerTouch>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// The per-inner results of the last `do_apply` on this thread, in
@@ -92,44 +93,72 @@ pub fn take_inner_results() -> Vec<String> {
 /// not hash transactions; the caller knows the inner hashes from the ledger
 /// and pairs them with these sets in
 /// `ledger::threading::stamp_batch_threading`.
-pub fn take_inner_touched() -> Vec<Vec<Hash256>> {
+pub fn take_inner_touched() -> Vec<Vec<InnerTouch>> {
     INNER_TOUCHED.with(|r| std::mem::take(&mut *r.borrow_mut()))
 }
 
-/// Same key, same state — the pair a sandbox diff must NOT report.
-fn entries_agree(a: &SandboxEntry, b: &SandboxEntry) -> bool {
-    match (a, b) {
-        (SandboxEntry::Deleted, SandboxEntry::Deleted) => true,
-        (SandboxEntry::Created(x), SandboxEntry::Created(y)) => x == y,
-        (SandboxEntry::Modified(x), SandboxEntry::Modified(y)) => x == y,
-        _ => false,
-    }
-}
 
-/// The keys whose sandbox state differs between two snapshots: present in
-/// one and not the other, or written differently. `AUX_KEY` is excluded —
-/// it is the sandbox's own transaction-scoped bookkeeping (finding 165),
-/// never a ledger object, and `into_modifications` drops it.
+/// The keys ONE inner changed, each with the action its own ApplyStateTable
+/// records. Finding 392 (campaign 23 6-2): judged on each key's effective
+/// value before and after the inner — the sandbox entry, else the base
+/// ledger's — and content equality, as rippled elides `curNode == origNode`
+/// per inner (ApplyStateTable.cpp:150-153). A write-back of the same bytes is
+/// not a change; a change a LATER inner undoes still is (it gets threaded by
+/// both). `AUX_KEY` is excluded — the sandbox's own transaction-scoped
+/// bookkeeping (finding 165), never a ledger object.
 fn touched_keys(
     before: &HashMap<Hash256, SandboxEntry>,
     after: &HashMap<Hash256, SandboxEntry>,
-) -> Vec<Hash256> {
-    let mut out: Vec<Hash256> = Vec::new();
-    for (k, a) in after {
-        if *k == AUX_KEY {
-            continue;
+    base: &dyn Fn(&Hash256) -> Option<Vec<u8>>,
+) -> Vec<InnerTouch> {
+    let effective = |m: &HashMap<Hash256, SandboxEntry>, k: &Hash256| -> Option<Vec<u8>> {
+        match m.get(k) {
+            Some(SandboxEntry::Created(b)) | Some(SandboxEntry::Modified(b)) => Some(b.clone()),
+            Some(SandboxEntry::Deleted) => None,
+            None => base(k),
         }
-        if !before.get(k).map(|b| entries_agree(a, b)).unwrap_or(false) {
-            out.push(*k);
+    };
+    let mut keys: Vec<Hash256> = before.keys().chain(after.keys()).filter(|k| **k != AUX_KEY).copied().collect();
+    keys.sort_unstable_by_key(|h| h.0);
+    keys.dedup();
+    // The action in the inner's own table (finding 394): what it created or
+    // erased — not what the batch as a whole did — is what threads owners.
+    keys.into_iter()
+        .filter_map(|k| match (effective(before, &k), effective(after, &k)) {
+            (None, None) => None,
+            (Some(b), Some(a)) => {
+                (!crate::ledger::threading::semantically_equal(&b, &a)).then_some(InnerTouch::Modified(k))
+            }
+            (None, Some(a)) => Some(InnerTouch::Created(k, a)),
+            (Some(b), None) => Some(InnerTouch::Deleted(k, b)),
+        })
+        .collect()
+}
+
+/// An inner's transaction id: sha512Half('TXN\0' ‖ its full serialization),
+/// as rippled's STTx::getTransactionID. RawTransactions arrive in rippled's
+/// API spelling on every live and bundle path; an engine-dialect copy (hex
+/// AccountIDs, as unit tests write them) is re-spelled first so both hash
+/// alike. None when the inner cannot be serialized.
+fn inner_txn_id(inner: &Value) -> Option<String> {
+    let mut v = inner.clone();
+    if let Some(o) = v.as_object_mut() {
+        for (k, val) in o.iter_mut() {
+            let is_account = xrpl_core::codec::lookup_field_def(k).is_some_and(|d| d.type_code == 8);
+            if let (true, Some(s)) = (is_account, val.as_str()) {
+                if s.len() == 40 {
+                    if let Some(id) = hex::decode(s).ok().and_then(|b| <[u8; 20]>::try_from(b.as_slice()).ok()) {
+                        *val = Value::String(xrpl_core::address::encode_account_id(&id));
+                    }
+                }
+            }
         }
     }
-    for k in before.keys() {
-        if *k != AUX_KEY && !after.contains_key(k) {
-            out.push(*k);
-        }
-    }
-    out.sort_unstable_by_key(|h| h.0);
-    out
+    let blob = xrpl_core::codec::encode::encode_transaction_json(&v, false).ok()?;
+    let mut buf = Vec::with_capacity(blob.len() + 4);
+    buf.extend_from_slice(&[0x54, 0x58, 0x4E, 0x00]);
+    buf.extend(blob);
+    Some(hex::encode_upper(crate::shamap::hash::sha512_half(&buf).0))
 }
 
 fn flags_of(v: &Value) -> u64 {
@@ -414,7 +443,7 @@ impl Transactor for BatchTransactor {
         // Per inner, the keys it changed — rippled threads each of those
         // objects with the INNER's transaction id, so the caller needs to
         // know which inner touched what (`take_inner_touched`).
-        let mut touched: Vec<Vec<Hash256>> = Vec::new();
+        let mut touched: Vec<Vec<InnerTouch>> = Vec::new();
         for inner in inner_jsons(&tx.fields) {
             // rippled gives every inner its own `perTxBatchView` over the
             // batch view, and the deferred-credits table lives IN that view —
@@ -444,9 +473,16 @@ impl Transactor for BatchTransactor {
                 continue;
             };
             f.inner_batch = true;
+            // Finding 390 (campaign 23 6-8 / 6-9): an applied inner stamps its
+            // OWN id into an armed AccountTxnID (Transactor::apply), which
+            // `stamp_account_txn_id` reads from the fields' "hash".
+            if let Some(id) = inner_txn_id(inner) {
+                f.fields["hash"] = Value::String(id);
+            }
             let before = sandbox.snapshot();
             let (r, _applied) = apply_on_sandbox(&f, sandbox);
-            touched.push(touched_keys(&before, &sandbox.snapshot()));
+            let base = |k: &Hash256| sandbox.base().state_map.lookup(k).map(|b| b.to_vec());
+            touched.push(touched_keys(&before, &sandbox.snapshot(), &base));
             results.push(r.code_str().to_string());
             if !r.is_success() {
                 if flags & TF_ALL_OR_NOTHING != 0 {
@@ -711,6 +747,94 @@ mod tests {
         (sb, r, take_inner_results())
     }
 
+    fn inner_account_set(from: u8, seq: u32, extra: Value) -> Value {
+        let mut t = json!({ "TransactionType": "AccountSet", "Account": hexa(from), "Fee": "0",
+            "Sequence": seq, "Flags": 0x4000_0000u64, "SigningPubKey": "" });
+        for (k, v) in extra.as_object().unwrap() {
+            t[k] = v.clone();
+        }
+        json!({ "RawTransaction": t })
+    }
+
+    fn apply_outer<'a>(o: &Value, state: &'a LedgerState) -> (Sandbox<'a>, String, Vec<String>) {
+        let f = TxFields::from_json(o).expect("fields");
+        let mut sb = Sandbox::new(state);
+        let (r, _) = crate::tx::dispatch::apply_on_sandbox(&f, &mut sb);
+        (sb, r.code_str().to_string(), take_inner_results())
+    }
+
+    /// Finding 389 (campaign 23, devnet 6-5 / 6-6 / 6-7): every inner runs
+    /// rippled's common preclaim — checkSeqProxy and
+    /// checkPriorTxAndLastLedger (applySteps.cpp:179-183) — so an inner with
+    /// a future / past sequence, a missing ticket or a passed
+    /// LastLedgerSequence is NOT applied (a ter / tef, never filed), and the
+    /// account's sequence does not move for it.
+    #[test]
+    fn an_inner_failing_the_common_preclaim_is_not_applied() {
+        let state = state_with_accounts(&[(1, 50_000_000, 5), (2, 20_000_000, 1)]);
+        let cases = [
+            (inner_account_set(1, 99, json!({"Domain": "AB"})), "terPRE_SEQ"),
+            (inner_account_set(1, 3, json!({"Domain": "AB"})), "tefPAST_SEQ"),
+            (inner_account_set(1, 0, json!({"TicketSequence": 4_000_000_000u64, "Domain": "AB"})), "terPRE_TICKET"),
+            (inner_account_set(1, 6, json!({"LastLedgerSequence": 1, "Domain": "AB"})), "tefMAX_LEDGER"),
+        ];
+        for (bad, code) in cases {
+            let o = outer(TF_INDEPENDENT, vec![bad, inner_payment(1, 2, 1_000_000, 6)], None);
+            let (sb, r, inners) = apply_outer(&o, &state);
+            assert_eq!(r, "tesSUCCESS");
+            assert_eq!(inners, vec![code.to_string(), "tesSUCCESS".to_string()], "{code}");
+            assert_eq!(balance_seq(&sb, 1), (50_000_000 - 1000 - 1_000_000, 7), "{code}: only the outer and the payment moved it");
+            let root: Value = serde_json::from_slice(&sb.read(&keylet::account_root_key(&acct(1))).unwrap()).unwrap();
+            assert!(root.get("Domain").is_none(), "{code}: the refused AccountSet wrote nothing");
+        }
+    }
+
+    /// Finding 390 (campaign 23 6-8 / 6-9): each applied inner stamps its OWN
+    /// id into an armed AccountTxnID, and the outer's stamp comes FIRST —
+    /// rippled stamps in Transactor::apply, ahead of doApply, where the
+    /// inners run. The last applied inner's id is what the ledger keeps.
+    #[test]
+    fn inners_stamp_their_own_ids_into_account_txn_id_after_the_outer() {
+        let mut state = state_with_accounts(&[(1, 50_000_000, 5), (2, 20_000_000, 1)]);
+        let k = keylet::account_root_key(&acct(1));
+        let mut root: Value = serde_json::from_slice(state.state_map.lookup(&k).unwrap()).unwrap();
+        root["AccountTxnID"] = json!("0".repeat(64));
+        state.state_map.insert(k, serde_json::to_vec(&root).unwrap()).unwrap();
+        // RawTransactions arrive in rippled's API spelling: base58 accounts.
+        let b58 = |n: u8| xrpl_core::address::encode_account_id(&acct(n));
+        let pay = |drops: u64, seq: u32| json!({ "RawTransaction": {
+            "TransactionType": "Payment", "Account": b58(1), "Destination": b58(2),
+            "Amount": drops.to_string(), "Fee": "0", "Sequence": seq, "Flags": 0x4000_0000u64,
+            "SigningPubKey": "" } });
+        let (i1, i2) = (pay(1_000_000, 6), pay(2_000_000, 7));
+        let mut o = outer(TF_INDEPENDENT, vec![i1, i2.clone()], None);
+        o["hash"] = json!("AB".repeat(32));
+        let (sb, r, _) = apply_outer(&o, &state);
+        assert_eq!(r, "tesSUCCESS");
+        let blob = xrpl_core::codec::encode::encode_transaction_json(&i2["RawTransaction"], false).unwrap();
+        let mut buf = vec![0x54, 0x58, 0x4E, 0x00];
+        buf.extend(blob);
+        let want = hex::encode_upper(crate::shamap::hash::sha512_half(&buf).0);
+        let got: Value = serde_json::from_slice(&sb.read(&k).unwrap()).unwrap();
+        assert_eq!(got["AccountTxnID"].as_str().unwrap().to_uppercase(), want, "the last inner's id, not the outer's");
+    }
+
+    /// Finding 391 (campaign 23 9-1 / 9-2 / 9-3): an AccountDelete inner
+    /// carries Fee "0" like every inner; its owner-reserve fee only raises the
+    /// OUTER's required fee, judged while the ledger is open. It applies.
+    #[test]
+    fn an_account_delete_inner_with_its_zero_fee_applies() {
+        let mut state = state_with_accounts(&[(1, 50_000_000, 5), (3, 30_000_000, 1)]);
+        state.header.sequence = 1_000; // AccountDelete wants Sequence + 255 behind the ledger
+        let del = json!({ "RawTransaction": { "TransactionType": "AccountDelete", "Account": hexa(3),
+            "Destination": hexa(1), "Fee": "0", "Sequence": 1, "Flags": 0x4000_0000u64, "SigningPubKey": "" } });
+        let o = outer(TF_INDEPENDENT, vec![del, inner_payment(1, 1, 1, 6)], Some(vec![3]));
+        let (sb, r, inners) = apply_outer(&o, &state);
+        assert_eq!(r, "tesSUCCESS");
+        assert_eq!(inners[0], "tesSUCCESS", "{inners:?}");
+        assert!(sb.read(&keylet::account_root_key(&acct(3))).is_none(), "account 3 deleted");
+    }
+
     #[test]
     fn until_failure_applies_both_inners_and_the_outer_fee_and_sequence() {
         let state = state_with_accounts(&[(1, 50_000_000, 5), (2, 20_000_000, 1)]);
@@ -726,8 +850,11 @@ mod tests {
         let touched = take_inner_touched();
         assert_eq!(touched.len(), 2, "one touched set per attempted inner");
         for (i, t) in touched.iter().enumerate() {
-            assert!(t.contains(&keylet::account_root_key(&acct(1))), "inner {i} touched the sender's root");
-            assert!(t.contains(&keylet::account_root_key(&acct(2))), "inner {i} touched the destination's root");
+            assert!(t.contains(&InnerTouch::Modified(keylet::account_root_key(&acct(1)))), "inner {i} modified the sender's root");
+            assert!(
+                t.contains(&InnerTouch::Modified(keylet::account_root_key(&acct(2)))),
+                "inner {i} modified the destination's root"
+            );
         }
         assert!(take_inner_touched().is_empty(), "drained on read, like the results");
     }

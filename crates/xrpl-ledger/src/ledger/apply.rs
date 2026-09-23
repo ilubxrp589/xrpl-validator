@@ -225,12 +225,18 @@ pub fn apply_transaction_set(
                     // Finding 253: the stamp answers the field's presence
                     // BEFORE do_apply (rippled stamps ahead of doApply).
                     let txn_id_armed = super::transactor::account_txn_id_armed(tx, &sandbox);
+                    let early = super::transactor::stamps_before_apply(tx);
+                    if early {
+                        super::transactor::stamp_account_txn_id(tx, &mut sandbox, txn_id_armed);
+                    }
 
                     let apply_result = transactor.do_apply(tx, &mut sandbox);
                     if apply_result.is_success() {
                         // Success-only (Transactor.cpp:660; a tec rolls the
                         // stamp back with the rest of doApply's writes).
-                        super::transactor::stamp_account_txn_id(tx, &mut sandbox, txn_id_armed);
+                        if !early {
+                            super::transactor::stamp_account_txn_id(tx, &mut sandbox, txn_id_armed);
+                        }
                         let mods = sandbox.into_modifications();
                         apply_modifications(&mut new_state, mods)?;
                         (TxResult::Success, tx.fee)

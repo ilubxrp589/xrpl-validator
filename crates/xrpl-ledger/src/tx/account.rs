@@ -337,15 +337,14 @@ impl Transactor for AccountDeleteTransactor {
 
     fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
         // "The fee required for AccountDelete is one owner reserve"
-        // (AccountDelete::calculateBaseFee -> calculateOwnerReserveFee). That
-        // is read from the ledger's fee settings, not fixed: the 2024 vote cut
-        // the increment from 2 XRP to 0.2, so a hardcoded 2_000_000 rejects
-        // every present-day AccountDelete (#105764469 2A99D114 pays exactly
-        // the 200000-drop increment — mainnet tesSUCCESS, we said temBAD_FEE).
-        // Needs the view, so it belongs here rather than in preflight.
-        if tx.fee < crate::ledger::fees::reserve_inc(sandbox) {
-            return TxResult::BadFee;
-        }
+        // (AccountDelete::calculateBaseFee -> calculateOwnerReserveFee) — but
+        // the fee LEVEL is Transactor::checkFee's business, judged only while
+        // the ledger is open (telINSUF_FEE_P, Transactor.cpp:536; finding
+        // 313's rule), never when a closed ledger is applied. Finding 391
+        // (campaign 23 9-1 / 9-2 / 9-3): a Batch inner carries Fee "0" by rule
+        // and its owner-reserve fee only raises the OUTER's required fee
+        // (Batch.cpp:73-93); the reserve-inc gate here refused every
+        // AccountDelete inner as temBAD_FEE.
         let acct_key = keylet::account_root_key(&tx.account);
         let data = match sandbox.read(&acct_key) {
             Some(d) => d,

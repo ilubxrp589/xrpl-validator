@@ -190,6 +190,38 @@ pub fn stamp_threading_keys(
     ledger_seq: u32,
     only: Option<&HashSet<Hash256>>,
 ) {
+    stamp_threading_keys_only(mods, pre, tx_hash_hex, ledger_seq, only);
+    let hash_upper = tx_hash_hex.to_uppercase();
+    let visit = |k: &Hash256| only.map(|s| s.contains(k)).unwrap_or(true);
+    // `threadOwners` (ApplyStateTable.cpp:640-668) for every node this
+    // transaction CREATED (its post-image) or DELETED (its pre-image).
+    let mut owners: Vec<[u8; 20]> = Vec::new();
+    for (k, ent) in mods.iter() {
+        if !visit(k) {
+            continue;
+        }
+        match ent {
+            SandboxEntry::Created(b) => collect_owners(b, &mut owners),
+            SandboxEntry::Deleted => {
+                if let Some(pb) = pre(k) {
+                    collect_owners(&pb, &mut owners);
+                }
+            }
+            SandboxEntry::Modified(_) => {}
+        }
+    }
+    thread_owner_roots(mods, pre, &hash_upper, ledger_seq, owners);
+}
+
+/// The materially-changed writes among `only` (all of `mods` when None),
+/// stamped with this transaction — no `threadOwners`.
+fn stamp_threading_keys_only(
+    mods: &mut HashMap<Hash256, SandboxEntry>,
+    pre: &dyn Fn(&Hash256) -> Option<Vec<u8>>,
+    tx_hash_hex: &str,
+    ledger_seq: u32,
+    only: Option<&HashSet<Hash256>>,
+) {
     let hash_upper = tx_hash_hex.to_uppercase();
     let visit = |k: &Hash256| only.map(|s| s.contains(k)).unwrap_or(true);
     for (k, ent) in mods.iter_mut() {
@@ -207,10 +239,14 @@ pub fn stamp_threading_keys(
         if v.get("LedgerEntryType").and_then(|t| t.as_str()) == Some("LedgerHashes") {
             continue;
         }
-        if modified {
+        // A write-back against the pre-image is no change — rippled never
+        // threads it. A batch inner's touched set was judged against the state
+        // BEFORE that inner (finding 392), so the test is the whole
+        // transaction's only; an inner may legitimately restore a pre-image.
+        if modified && only.is_none() {
             if let Some(pb) = pre(k) {
                 if semantically_equal(&pb, bytes) {
-                    continue; // write-back, not a change — rippled never threads it
+                    continue;
                 }
             }
         }
@@ -218,70 +254,59 @@ pub fn stamp_threading_keys(
         v["PreviousTxnLgrSeq"] = serde_json::Value::Number(ledger_seq.into());
         *bytes = serde_json::to_vec(&v).unwrap_or_default();
     }
+}
 
-    // `threadOwners` (ApplyStateTable.cpp:640-668): every CREATED or DELETED
-    // node also threads the transaction to its owner accounts' roots — both
-    // limit issuers for a RippleState, else sfAccount and sfDestination when
-    // present, nothing for an AccountRoot. Those roots become the meta's
-    // pure-threading ModifiedNodes (the FinalFields==pre refreshes the
-    // expected-side filter drops). #106124864 E969E24F: EscrowCreate
-    // EB5DF108 threads the escrow DESTINATION's root — an account the
-    // transaction itself never writes.
-    let mut owners: Vec<[u8; 20]> = Vec::new();
-    let mut collect = |v: &serde_json::Value| {
-        let ty = v.get("LedgerEntryType").and_then(|t| t.as_str()).unwrap_or("");
-        match ty {
-            "AccountRoot" => {}
-            "RippleState" => {
-                for side in ["LowLimit", "HighLimit"] {
-                    if let Some(a) = v
-                        .get(side)
-                        .and_then(|l| l.get("issuer"))
-                        .and_then(|i| i.as_str())
-                        .and_then(crate::tx::offer::decode20)
-                    {
-                        owners.push(a);
-                    }
-                }
-            }
-            _ => {
-                for f in ["Account", "Destination"] {
-                    if let Some(a) =
-                        v.get(f).and_then(|x| x.as_str()).and_then(crate::tx::offer::decode20)
-                    {
-                        owners.push(a);
-                    }
-                }
-            }
-        }
+/// `threadOwners` (ApplyStateTable.cpp:640-668): a CREATED or DELETED node
+/// also threads the transaction to its owner accounts' roots — both limit
+/// issuers for a RippleState, else sfAccount and sfDestination when present,
+/// nothing for an AccountRoot. Those roots become the meta's pure-threading
+/// ModifiedNodes (the FinalFields==pre refreshes the expected-side filter
+/// drops). #106124864 E969E24F: EscrowCreate EB5DF108 threads the escrow
+/// DESTINATION's root — an account the transaction itself never writes.
+fn collect_owners(image: &[u8], owners: &mut Vec<[u8; 20]>) {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(image) else {
+        return;
     };
-    for (k, ent) in mods.iter() {
-        if !visit(k) {
-            continue;
+    let ty = v.get("LedgerEntryType").and_then(|t| t.as_str()).unwrap_or("");
+    match ty {
+        "AccountRoot" => {}
+        "RippleState" => {
+            for side in ["LowLimit", "HighLimit"] {
+                if let Some(a) = v
+                    .get(side)
+                    .and_then(|l| l.get("issuer"))
+                    .and_then(|i| i.as_str())
+                    .and_then(crate::tx::offer::decode20)
+                {
+                    owners.push(a);
+                }
+            }
         }
-        match ent {
-            SandboxEntry::Created(b) => {
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(b) {
-                    collect(&v);
+        _ => {
+            for f in ["Account", "Destination"] {
+                if let Some(a) = v.get(f).and_then(|x| x.as_str()).and_then(crate::tx::offer::decode20) {
+                    owners.push(a);
                 }
             }
-            SandboxEntry::Deleted => {
-                if let Some(pb) = pre(k) {
-                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&pb) {
-                        collect(&v);
-                    }
-                }
-            }
-            SandboxEntry::Modified(_) => {}
         }
     }
+}
+
+/// Thread `hash_upper` onto each owner's AccountRoot, wherever it lives.
+fn thread_owner_roots(
+    mods: &mut HashMap<Hash256, SandboxEntry>,
+    pre: &dyn Fn(&Hash256) -> Option<Vec<u8>>,
+    hash_upper: &str,
+    ledger_seq: u32,
+    mut owners: Vec<[u8; 20]>,
+) {
     owners.sort_unstable();
     owners.dedup();
     for acct in owners {
         let rk = super::keylet::account_root_key(&acct);
         let stamped = |b: &[u8]| -> Option<Vec<u8>> {
             let mut v = serde_json::from_slice::<serde_json::Value>(b).ok()?;
-            v["PreviousTxnID"] = serde_json::Value::String(hash_upper.clone());
+            v["PreviousTxnID"] = serde_json::Value::String(hash_upper.to_string());
             v["PreviousTxnLgrSeq"] = serde_json::Value::Number(ledger_seq.into());
             serde_json::to_vec(&v).ok()
         };
@@ -306,6 +331,31 @@ pub fn stamp_threading_keys(
     }
 }
 
+/// How ONE `Batch` inner changed one key, in that inner's own ApplyStateTable
+/// (`tx::batch::take_inner_touched`). The action decides `threadOwners`:
+/// rippled threads owner roots only for the nodes an inner itself INSERTED
+/// or ERASED. Finding 394 (campaign 23 4-1): an MPToken inner 1 created and
+/// inner 2 then paid into is a MODIFY in inner 2's table, so inner 2 leaves
+/// the holder's root alone — the batch-wide mutation map, which still calls
+/// the MPToken "created", cannot tell the two apart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InnerTouch {
+    /// Present before and after the inner, content changed.
+    Modified(Hash256),
+    /// Absent before the inner: its post-inner image.
+    Created(Hash256, Vec<u8>),
+    /// Present before the inner, gone after it: its pre-inner image.
+    Deleted(Hash256, Vec<u8>),
+}
+
+impl InnerTouch {
+    pub fn key(&self) -> Hash256 {
+        match self {
+            InnerTouch::Modified(k) | InnerTouch::Created(k, _) | InnerTouch::Deleted(k, _) => *k,
+        }
+    }
+}
+
 /// Thread a `Batch` outer and its inners the way rippled's
 /// `ApplyStateTable` ends up doing it: the outer's own application is
 /// stamped with the outer's id first (its fee and sequence on its own
@@ -325,7 +375,7 @@ pub fn stamp_batch_threading(
     outer_hash_hex: &str,
     ledger_seq: u32,
     inner_hashes: &[String],
-    inner_touched: &[Vec<Hash256>],
+    inner_touched: &[Vec<InnerTouch>],
 ) {
     stamp_threading_keys(mods, pre, outer_hash_hex, ledger_seq, None);
     if inner_hashes.len() != inner_touched.len() {
@@ -336,12 +386,38 @@ pub fn stamp_batch_threading(
         );
         return;
     }
+    // Finding 392 (campaign 23 6-2): each inner has its own ApplyStateTable,
+    // so a node inner 1 changed and a later inner changed BACK is modified in
+    // both tables and threaded by the last — even though the batch as a whole
+    // leaves it content-equal to its pre-image and the sandbox elided it. Such
+    // a node returns here (its content is the pre-image) to be threaded.
+    for touched in inner_touched {
+        for t in touched {
+            let k = t.key();
+            if let std::collections::hash_map::Entry::Vacant(slot) = mods.entry(k) {
+                if let Some(pb) = pre(&k) {
+                    slot.insert(SandboxEntry::Modified(pb));
+                }
+            }
+        }
+    }
     for (hash, touched) in inner_hashes.iter().zip(inner_touched.iter()) {
         if touched.is_empty() {
             continue; // not applied, or applied and rolled back — touched nothing
         }
-        let only: HashSet<Hash256> = touched.iter().copied().collect();
-        stamp_threading_keys(mods, pre, hash, ledger_seq, Some(&only));
+        // The inner's own writes, then `threadOwners` for exactly the nodes
+        // it inserted or erased (finding 394) — not for whatever the batch
+        // as a whole created, as the whole-transaction pass would.
+        let only: HashSet<Hash256> = touched.iter().map(InnerTouch::key).collect();
+        stamp_threading_keys_only(mods, pre, hash, ledger_seq, Some(&only));
+        let mut owners: Vec<[u8; 20]> = Vec::new();
+        for t in touched {
+            match t {
+                InnerTouch::Created(_, image) | InnerTouch::Deleted(_, image) => collect_owners(image, &mut owners),
+                InnerTouch::Modified(_) => {}
+            }
+        }
+        thread_owner_roots(mods, pre, &hash.to_uppercase(), ledger_seq, owners);
     }
 }
 
@@ -398,7 +474,10 @@ mod tests {
         let mut mods = three_roots();
         let inner_hashes = ["INNER1".to_string(), "INNER2".to_string()];
         // inner 1 touched B; inner 2 touched C and B again.
-        let touched = [vec![k(2)], vec![k(3), k(2)]];
+        let touched = [
+            vec![InnerTouch::Modified(k(2))],
+            vec![InnerTouch::Modified(k(3)), InnerTouch::Modified(k(2))],
+        ];
         stamp_batch_threading(&mut mods, &pre, "OUTER", 7, &inner_hashes, &touched);
         assert_eq!(threading_of(&mods, k(1)), ("OUTER".into(), 7), "no inner touched A");
         assert_eq!(threading_of(&mods, k(2)), ("INNER2".into(), 7), "the last inner to touch B wins");
@@ -409,11 +488,27 @@ mod tests {
     fn stamp_batch_threading_falls_back_to_the_outer_on_a_length_mismatch() {
         let mut mods = three_roots();
         let inner_hashes = ["INNER1".to_string(), "INNER2".to_string()];
-        let touched = [vec![k(2)]];
+        let touched = [vec![InnerTouch::Modified(k(2))]];
         stamp_batch_threading(&mut mods, &pre, "OUTER", 7, &inner_hashes, &touched);
         for n in 1..=3 {
             assert_eq!(threading_of(&mods, k(n)), ("OUTER".into(), 7), "key {n}");
         }
+    }
+
+    /// Finding 392 (campaign 23 6-2): a node inner 1 changed and inner 2
+    /// changed BACK ends the batch content-equal to its pre-image, so the
+    /// sandbox elides it — but each inner runs in its own ApplyStateTable,
+    /// where it WAS modified (ApplyStateTable.cpp:150-153, 199), so rippled
+    /// threads it with the last inner that touched it.
+    #[test]
+    fn a_node_restored_by_a_later_inner_is_still_threaded_by_it() {
+        let mut mods: HashMap<Hash256, SandboxEntry> = HashMap::new();
+        let h1 = "11".repeat(32);
+        let h2 = "22".repeat(32);
+        let restored = k(9); // net-unchanged: absent from mods
+        stamp_batch_threading(&mut mods, &pre, &"AA".repeat(32), 77, &[h1, h2.clone()], &[vec![InnerTouch::Modified(restored)], vec![InnerTouch::Modified(restored)]]);
+        let (id, seq) = threading_of(&mods, restored);
+        assert_eq!((id.as_str(), seq), (h2.to_uppercase().as_str(), 77), "threaded by the inner that restored it");
     }
 
     #[test]
@@ -450,10 +545,10 @@ mod tests {
         }))
         .expect("json");
         let mut mods = HashMap::new();
-        mods.insert(offer_key, SandboxEntry::Created(offer));
+        mods.insert(offer_key, SandboxEntry::Created(offer.clone()));
         mods.insert(root_key, SandboxEntry::Modified(root(7, 10)));
 
-        stamp_batch_threading(&mut mods, &pre, "OUTER", 7, &["INNER1".to_string()], &[vec![offer_key]]);
+        stamp_batch_threading(&mut mods, &pre, "OUTER", 7, &["INNER1".to_string()], &[vec![InnerTouch::Created(offer_key, offer)]]);
 
         assert_eq!(threading_of(&mods, offer_key), ("INNER1".into(), 7), "the created node itself");
         assert_eq!(
@@ -461,6 +556,64 @@ mod tests {
             ("INNER1".into(), 7),
             "threadOwners reaches the owner root even outside the inner's touched set"
         );
+    }
+
+    /// Finding 394 (campaign 23 4-1): an MPToken inner 1 CREATED and inner 2
+    /// then paid into is a modify in inner 2's own ApplyStateTable, so only
+    /// inner 1's `threadOwners` reaches the holder's root — although the
+    /// batch-wide mutation map still calls the MPToken created.
+    #[test]
+    fn only_the_inner_that_created_a_node_threads_its_owner() {
+        let holder = [7u8; 20];
+        let token_key = k(9);
+        let root_key = crate::ledger::keylet::account_root_key(&holder);
+        let token = |amount: &str| {
+            serde_json::to_vec(&json!({
+                "LedgerEntryType": "MPToken",
+                "Account": hex::encode(holder),
+                "MPTokenIssuanceID": "00".repeat(24),
+                "MPTAmount": amount,
+            }))
+            .expect("json")
+        };
+        let mut mods = HashMap::new();
+        mods.insert(token_key, SandboxEntry::Created(token("5000")));
+        mods.insert(root_key, SandboxEntry::Modified(root(7, 10)));
+        let touched = [
+            vec![InnerTouch::Created(token_key, token("0")), InnerTouch::Modified(root_key)],
+            vec![InnerTouch::Modified(token_key)],
+        ];
+        stamp_batch_threading(&mut mods, &pre, "OUTER", 7, &["INNER1".to_string(), "INNER2".to_string()], &touched);
+        assert_eq!(threading_of(&mods, token_key), ("INNER2".into(), 7), "the token's last writer");
+        assert_eq!(
+            threading_of(&mods, root_key),
+            ("INNER1".into(), 7),
+            "the holder's root: the inner that created the token, not the one that paid into it"
+        );
+    }
+
+    /// The mirror image: a node inner 2 ERASES threads its owners with inner
+    /// 2 (its pre-inner image names them), even when inner 2 never wrote the
+    /// owner's root itself.
+    #[test]
+    fn the_inner_that_deletes_a_node_threads_its_owner() {
+        let owner = [7u8; 20];
+        let offer_key = k(9);
+        let root_key = crate::ledger::keylet::account_root_key(&owner);
+        let offer = serde_json::to_vec(&json!({
+            "LedgerEntryType": "Offer",
+            "Account": hex::encode(owner),
+            "BookDirectory": "AB".repeat(32),
+            "TakerPays": "1000",
+            "TakerGets": "2000",
+        }))
+        .expect("json");
+        let mut mods = HashMap::new();
+        mods.insert(offer_key, SandboxEntry::Deleted);
+        mods.insert(root_key, SandboxEntry::Modified(root(7, 10)));
+        let touched = [vec![InnerTouch::Modified(root_key)], vec![InnerTouch::Deleted(offer_key, offer)]];
+        stamp_batch_threading(&mut mods, &pre, "OUTER", 7, &["INNER1".to_string(), "INNER2".to_string()], &touched);
+        assert_eq!(threading_of(&mods, root_key), ("INNER2".into(), 7));
     }
 }
 

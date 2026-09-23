@@ -519,7 +519,7 @@ pub(crate) fn mpt_divide_round_up_legacy(v: u64, rate: u64) -> Option<u64> {
         no -= 1;
     }
     let (dv, doff) = rate_as_iou(rate);
-    let mut amount = (nv.checked_mul(100_000_000_000_000_000)? + (dv - 1)) / dv;
+    let mut amount = nv.checked_mul(100_000_000_000_000_000)?.div_ceil(dv);
     let mut offset = no - doff - 17;
     if offset < 0 {
         let mut loops = 0;

@@ -132,10 +132,17 @@ pub fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<
     let snap = sb.snapshot();
     // Finding 253: presence BEFORE do_apply is what rippled's stamp sees.
     let txn_id_armed = xrpl_ledger::ledger::transactor::account_txn_id_armed(tx, &sb);
+    // Finding 390: a Batch outer stamps before its inners run.
+    let early = xrpl_ledger::ledger::transactor::stamps_before_apply(tx);
+    if early {
+        xrpl_ledger::ledger::transactor::stamp_account_txn_id(tx, &mut sb, txn_id_armed);
+    }
     let applied = transactor.do_apply(tx, &mut sb);
     if applied.is_success() {
         // Success-only (Transactor.cpp:660; tec rolls the stamp back).
-        xrpl_ledger::ledger::transactor::stamp_account_txn_id(tx, &mut sb, txn_id_armed);
+        if !early {
+            xrpl_ledger::ledger::transactor::stamp_account_txn_id(tx, &mut sb, txn_id_armed);
+        }
         (TxResult::Success.code_str().to_string(), sb.into_modifications())
     } else if applied.is_claimed() {
         // tecEXPIRED keeps its NFTokenOffer / Credential erasures (finding 245,

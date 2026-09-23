@@ -186,6 +186,26 @@ pub fn apply_on_sandbox(tx: &TxFields, sb: &mut Sandbox) -> (TxResult, bool) {
         }
         return (preflight, false);
     }
+    // Finding 389 (campaign 23 6-2 / 6-5 / 6-6 / 6-7 / 6-9): a Batch inner runs
+    // rippled's whole per-transaction pipeline, common preclaim included —
+    // checkSeqProxy and checkPriorTxAndLastLedger (applySteps.cpp:179-183) —
+    // so an inner with a future / past sequence, a missing ticket, a wrong
+    // AccountTxnID prior or a passed LastLedgerSequence is not applied (a ter
+    // or tef the ledger never files). Standalone transactions get the same
+    // gate from their caller (native_apply_one); inners only pass through here.
+    if tx.inner_batch {
+        let gate = crate::ledger::transactor::preclaim_common(tx, sb, sb.base().header.sequence.saturating_add(1));
+        if !gate.is_success() {
+            return (gate, false);
+        }
+        // Finding 393: then checkPermission (applySteps.cpp:188-190) — a
+        // delegated inner its Delegate object does not authorize is refused
+        // terNO_DELEGATE_PERMISSION and not applied.
+        let perm = crate::tx::delegate::check_delegate_permission(tx, sb);
+        if !perm.is_success() {
+            return (perm, false);
+        }
+    }
     let preclaim = transactor.preclaim(tx, sb);
     if !preclaim.is_success() && !preclaim.is_claimed() {
         return (preclaim, false);
@@ -205,9 +225,15 @@ pub fn apply_on_sandbox(tx: &TxFields, sb: &mut Sandbox) -> (TxResult, bool) {
     }
     let post_common = sb.snapshot();
     let txn_id_armed = account_txn_id_armed(tx, sb);
+    let early = crate::ledger::transactor::stamps_before_apply(tx);
+    if early {
+        stamp_account_txn_id(tx, sb, txn_id_armed);
+    }
     let applied = transactor.do_apply(tx, sb);
     if applied.is_success() {
-        stamp_account_txn_id(tx, sb, txn_id_armed);
+        if !early {
+            stamp_account_txn_id(tx, sb, txn_id_armed);
+        }
         (TxResult::Success, true)
     } else if applied.is_claimed() {
         if applied == TxResult::Expired {
