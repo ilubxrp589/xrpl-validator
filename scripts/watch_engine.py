@@ -310,6 +310,13 @@ def render():
             km = ns.get("key_missing", 0); ke = ns.get("key_extra", 0); kb = ns.get("byte_mismatch", 0)
             if km or ke or kb:
                 out.append(f"    {colored(f'key diffs: missing={km} extra={ke} bytes={kb}', '1;31')}")
+            # The receipt canary (scripts/receipt_canary.py): planted 1-drop
+            # diffs, kept out of every counter above. All must be flagged.
+            cf = ns.get("canary_fired", 0); cd = ns.get("canary_detected", 0)
+            if cf:
+                blind = cd < cf
+                out.append(f"    receipt canary: {colored(f'{cd}/{cf} plants flagged', '1;31' if blind else '32')}"
+                           + (colored("  — THE COMPARE IS BLIND", "1;31") if blind else ""))
             # WHICH transactions are ter-missing. The counter alone cannot say,
             # and a wrong result code writes identical state, so the overlay
             # never shows it (F241: 292 CheckCash rode through cycle 108 green).

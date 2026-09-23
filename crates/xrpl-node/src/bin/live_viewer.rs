@@ -1706,6 +1706,10 @@ async fn main() {
                             "key_noop_missing": s.key_noop_missing.load(Relaxed),
                             "key_noop_extra": s.key_noop_extra.load(Relaxed),
                             "byte_mismatch": s.byte_mismatch.load(Relaxed),
+                            // The receipt canary: plants and how many the
+                            // compare flagged (fired > detected = blind).
+                            "canary_fired": s.canary_fired.load(Relaxed),
+                            "canary_detected": s.canary_detected.load(Relaxed),
                             "skipped_gap": s.skipped_gap.load(Relaxed),
                             "hydrate_skipped_lowmem": s.hydrate_skipped_lowmem.load(Relaxed),
                             "hydrate_reencode_bad": s.hydrate_reencode_bad.load(Relaxed),

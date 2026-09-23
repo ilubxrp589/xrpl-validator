@@ -73,6 +73,11 @@ pub struct ShadowStats {
     pub byte_mismatch: AtomicU64,
     pub skipped_gap: AtomicU64,
     pub apply_ms_last: AtomicU64,
+    /// The receipt canary ([`NativeShadow::arm_canary`]): injections made, and
+    /// how many of them the compare flagged. Fired above detected means the
+    /// compare has gone blind, and a zero-receipt soak proves nothing.
+    pub canary_fired: AtomicU64,
+    pub canary_detected: AtomicU64,
 }
 
 pub fn stats() -> &'static ShadowStats {
@@ -219,6 +224,9 @@ pub struct NativeShadow {
     /// project_validator_wssync_lag_2026_09_01).
     hydrating: Option<std::thread::JoinHandle<Option<HydrateOutcome>>>,
     pending: Vec<PendingLedger>,
+    /// The receipt canary's trigger file (`XRPL_NATIVE_SHADOW_CANARY`, else
+    /// `native_shadow.canary` beside the receipt log).
+    canary: Option<std::path::PathBuf>,
 }
 
 /// What the hydrate thread hands back.
@@ -291,7 +299,14 @@ impl NativeShadow {
         let path = std::env::var("XRPL_NATIVE_SHADOW_LOG")
             .unwrap_or_else(|_| "/mnt/xrpl-data/native_shadow.jsonl".to_string());
         let log = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
-        eprintln!("[native-shadow] ENABLED — hydrates on first steady ledger; receipts -> {path}");
+        let canary = std::env::var("XRPL_NATIVE_SHADOW_CANARY")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::path::Path::new(&path).parent().map(|d| d.join("native_shadow.canary")));
+        eprintln!(
+            "[native-shadow] ENABLED — hydrates on first steady ledger; receipts -> {path}; canary trigger {}",
+            canary.as_ref().map_or("off".to_string(), |p| p.display().to_string())
+        );
         // Placeholder header — on_ledger installs the real per-ledger header
         // (the replay's exact recipe) before every apply.
         let header = LedgerHeader {
@@ -313,7 +328,54 @@ impl NativeShadow {
             log,
             hydrating: None,
             pending: Vec::new(),
+            canary,
         })
+    }
+
+    /// The receipt canary (2026-09-23). A zero-receipt soak proves nothing
+    /// unless the compare can still see a divergence, so while the trigger
+    /// file exists the shadow plants one: the lowest-keyed AccountRoot this
+    /// ledger wrote that currently encodes EQUAL to the FFI leg's bytes gets
+    /// one drop added to its Balance in the mirror — a simulated engine miss,
+    /// planted after the apply and before the compare so it travels the real
+    /// path. Choosing an agreeing entry means the plant never lands on (or
+    /// hides) a real divergence. The compare must flag it; `on_ledger` keeps
+    /// it out of every divergence counter, writes it as a `canary` line, and
+    /// removes the trigger. The reconcile then restores the entry like any
+    /// other native write (the key is dirty, so its pre-image is in `undo`).
+    /// Returns the planted key; None when disarmed or when this ledger wrote
+    /// no suitable entry (the trigger stays for the next ledger).
+    fn arm_canary(&mut self, dirty: &HashSet<Hash256>, ffi_overlay: &LedgerOverlay, seq: u32) -> Option<Hash256> {
+        if !self.canary.as_ref()?.exists() {
+            return None;
+        }
+        let mut keys: Vec<Hash256> = dirty
+            .iter()
+            .filter(|k| !is_singleton_key(k, seq) && matches!(ffi_overlay.get(&k.0), Some(Some(_))))
+            .copied()
+            .collect();
+        keys.sort_by(|a, b| a.0.cmp(&b.0));
+        for k in keys {
+            let Some(Some(fb)) = ffi_overlay.get(&k.0) else { continue };
+            let Some(mut v) = self.state.state_map.lookup(&k).and_then(|b| serde_json::from_slice::<Value>(b).ok())
+            else {
+                continue;
+            };
+            if v["LedgerEntryType"].as_str() != Some("AccountRoot") {
+                continue;
+            }
+            let mut canon = v.clone();
+            canon_for_encode(&mut canon);
+            if xrpl_core::codec::encode::encode_transaction_json(&canon, false).ok().as_ref() != Some(fb) {
+                continue;
+            }
+            let Some(drops) = v["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()) else { continue };
+            v["Balance"] = Value::String((drops + 1).to_string());
+            let Ok(bytes) = serde_json::to_vec(&v) else { continue };
+            note_map_op(self.state.state_map.insert(k, bytes));
+            return Some(k);
+        }
+        None
     }
 
     /// Full-scan `state.rocks` into the in-RAM mirror, decoding every binary
@@ -807,6 +869,7 @@ impl NativeShadow {
             }
         }
         update_skip_list(&mut self.state, &mut dirty, seq, &parent_hash_hex);
+        let canary = self.arm_canary(&dirty, ffi_overlay, seq);
 
         // ---- Compare native overlay vs FFI overlay (singletons excluded) ----
         let mut missing: Vec<String> = Vec::new(); // FFI wrote, we didn't
@@ -927,6 +990,13 @@ impl NativeShadow {
                 extra.push(hex::encode_upper(k.0));
             }
         }
+        // The canary's own diff leaves the tallies here: `clean` and every
+        // counter below describe the engine alone.
+        let canary_hit = canary.map(|k| {
+            let key = hex::encode_upper(k.0);
+            let diff = byte_diff.iter().position(|d| d.starts_with(&key)).map(|i| byte_diff.remove(i));
+            (key, diff)
+        });
 
         let clean = missing.is_empty() && extra.is_empty() && byte_diff.is_empty();
         st.ledgers.fetch_add(1, Ordering::Relaxed);
@@ -988,6 +1058,27 @@ impl NativeShadow {
                         "noop_extra": noop_extra,
                     })
                 );
+            }
+        }
+        // Its own line, never folded into a receipt: every reader of the
+        // receipt log skips `canary` lines when it counts receipts.
+        if let Some((key, diff)) = canary_hit {
+            let detected = diff.is_some();
+            st.canary_fired.fetch_add(1, Ordering::Relaxed);
+            if detected {
+                st.canary_detected.fetch_add(1, Ordering::Relaxed);
+            }
+            eprintln!("[native-shadow] #{seq} CANARY planted on {key}: detected={detected}");
+            let wrote = self.log.as_mut().is_some_and(|f| {
+                writeln!(f, "{}", json!({ "seq": seq, "canary": { "key": key, "detected": detected, "diff": diff } }))
+                    .is_ok()
+            });
+            // Disarm only once the line is down; a failed write leaves the
+            // trigger armed and the next ledger plants again.
+            if wrote {
+                if let Some(p) = &self.canary {
+                    let _ = std::fs::remove_file(p);
+                }
             }
         }
         st.apply_ms_last.store(t0.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -1257,4 +1348,134 @@ fn build_mirror(
         return None;
     }
     Some(HydrateOutcome { state, at_seq: as_of, objects: n, undecodable: bad, reencode_bad: bad_rt, ms })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real testnet ledger with one XRP payment (campaign 14, #20939579),
+    /// fed to the shadow the way ws-sync feeds it: the mirror hydrated from
+    /// the bundle's pre-images, the FFI overlay = the network's post bytes.
+    fn payment_ledger() -> (u32, [u8; 32], u32, u64, Value, LedgerState, LedgerOverlay) {
+        let b: Value = serde_json::from_str(include_str!(
+            "../tests/vectors/deposit_c14_preauthorized_payment_473859FA8AF3.json"
+        ))
+        .unwrap();
+        let seq = b["seq"].as_u64().unwrap() as u32;
+        let parent: [u8; 32] = hex::decode(b["parent_hash"].as_str().unwrap()).unwrap().try_into().unwrap();
+        let mut state = LedgerState::new_unverified(LedgerHeader {
+            sequence: seq - 1,
+            total_coins: 0,
+            parent_hash: Hash256(parent),
+            transaction_hash: Hash256([0; 32]),
+            account_hash: Hash256([0; 32]),
+            parent_close_time: 0,
+            close_time: 0,
+            close_time_resolution: 10,
+            close_flags: 0,
+        });
+        for (k, v) in b["pre"].as_object().unwrap() {
+            let mut jv = xrpl_core::codec::decode::decode_transaction_binary(&hex::decode(v.as_str().unwrap()).unwrap())
+                .unwrap();
+            crate::native_apply::hexify_addresses(&mut jv);
+            let key: [u8; 32] = hex::decode(k).unwrap().try_into().unwrap();
+            state.state_map.insert(Hash256(key), serde_json::to_vec(&jv).unwrap()).unwrap();
+        }
+        let mut tx = b["tx"].clone();
+        tx["metaData"] = json!({ "TransactionResult": b["result"], "TransactionIndex": 0, "AffectedNodes": [] });
+        let overlay: LedgerOverlay = b["expect"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| {
+                let key: [u8; 32] = hex::decode(k).unwrap().try_into().unwrap();
+                (key, v.as_str().map(|h| hex::decode(h).unwrap()))
+            })
+            .collect();
+        let pct = b["parent_close_time"].as_u64().unwrap() as u32;
+        (seq, parent, pct, b["total_coins"].as_u64().unwrap(), tx, state, overlay)
+    }
+
+    fn shadow(state: LedgerState, at_seq: u32, log: &std::path::Path, trigger: &std::path::Path) -> NativeShadow {
+        NativeShadow {
+            state,
+            at_seq,
+            hydrated: true,
+            last_hydrate: None,
+            log: Some(std::fs::OpenOptions::new().create(true).append(true).open(log).unwrap()),
+            hydrating: None,
+            pending: Vec::new(),
+            canary: Some(trigger.to_path_buf()),
+        }
+    }
+
+    fn lines(log: &std::path::Path) -> Vec<Value> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_clean_ledger_without_the_trigger_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, trigger) = (dir.path().join("receipts.jsonl"), dir.path().join("native_shadow.canary"));
+        let (seq, parent, pct, drops, tx, state, overlay) = payment_ledger();
+        let mut sh = shadow(state, seq - 1, &log, &trigger);
+        sh.on_ledger(seq, &parent, pct, drops, &[tx], &overlay);
+        assert_eq!(sh.at_seq, seq, "the ledger was applied");
+        assert!(lines(&log).is_empty(), "a clean ledger leaves no receipt: {:?}", lines(&log));
+    }
+
+    #[test]
+    fn the_canary_plants_one_drop_the_compare_flags_it_and_the_mirror_heals() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, trigger) = (dir.path().join("receipts.jsonl"), dir.path().join("native_shadow.canary"));
+        std::fs::write(&trigger, b"").unwrap();
+        let (seq, parent, pct, drops, tx, state, overlay) = payment_ledger();
+        let mut sh = shadow(state, seq - 1, &log, &trigger);
+        let fired = stats().canary_fired.load(Ordering::Relaxed);
+        sh.on_ledger(seq, &parent, pct, drops, &[tx], &overlay);
+
+        let got = lines(&log);
+        assert_eq!(got.len(), 1, "exactly one line, the canary's — no receipt: {got:?}");
+        let c = &got[0]["canary"];
+        assert_eq!(got[0]["seq"], json!(seq));
+        assert_eq!(c["detected"], json!(true), "the compare must flag the planted drop: {c}");
+        let key = c["key"].as_str().unwrap();
+        let lowest_account_root = overlay
+            .keys()
+            .filter(|k| {
+                let raw = overlay[*k].as_ref().unwrap();
+                xrpl_core::codec::decode::decode_transaction_binary(raw).unwrap()["LedgerEntryType"] == "AccountRoot"
+            })
+            .min()
+            .map(hex::encode_upper)
+            .unwrap();
+        assert_eq!(key, lowest_account_root, "the plant lands on the lowest agreeing AccountRoot");
+        assert!(c["diff"].as_str().unwrap().starts_with(key), "the diff names the planted key: {c}");
+        assert!(!trigger.exists(), "the trigger is consumed once the line is down");
+        assert!(stats().canary_fired.load(Ordering::Relaxed) > fired);
+
+        // The reconcile put the planted entry back on the canonical bytes.
+        let k: [u8; 32] = hex::decode(key).unwrap().try_into().unwrap();
+        let mut mine: Value = serde_json::from_slice(sh.state.state_map.lookup(&Hash256(k)).unwrap()).unwrap();
+        canon_for_encode(&mut mine);
+        let enc = xrpl_core::codec::encode::encode_transaction_json(&mine, false).unwrap();
+        assert_eq!(Some(&enc), overlay[&k].as_ref(), "the mirror healed to the FFI bytes");
+    }
+
+    #[test]
+    fn a_ledger_with_no_account_root_write_keeps_the_trigger_armed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, trigger) = (dir.path().join("receipts.jsonl"), dir.path().join("native_shadow.canary"));
+        std::fs::write(&trigger, b"").unwrap();
+        let (seq, parent, pct, drops, _tx, state, _overlay) = payment_ledger();
+        let mut sh = shadow(state, seq - 1, &log, &trigger);
+        sh.on_ledger(seq, &parent, pct, drops, &[], &LedgerOverlay::new());
+        assert!(lines(&log).is_empty(), "nothing to plant on, nothing written");
+        assert!(trigger.exists(), "the trigger waits for the next ledger");
+    }
 }
