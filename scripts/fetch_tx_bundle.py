@@ -219,6 +219,10 @@ _ALWAYS_SET = {
     0x0054: [(2, 2), (3, 4)],  # Ticket: Flags, OwnerNode
     0x0070: [(2, 2), (3, 4)],  # DepositPreauth: Flags, OwnerNode
     0x0037: [(2, 2), (3, 4), (3, 12)],  # NFTokenOffer: Flags, OwnerNode, NFTokenOfferNode
+    # Campaign 23: MPT entries created in-ledger (a Batch's MPTokenIssuanceCreate / holder
+    # MPTokenAuthorize read or paid by a later inner) — soeREQUIRED zeros NewFields omits.
+    0x007E: [(2, 2), (3, 4), (3, 25)],  # MPTokenIssuance: Flags, OwnerNode, OutstandingAmount
+    0x007F: [(2, 2), (3, 4)],  # MPToken: Flags, OwnerNode
 }
 
 
@@ -357,6 +361,14 @@ def rebuild_from_meta(kind, node, tx_hash, seq, pre_hex):
     # decode failure here used to abort the whole fetch (#106825804).
     obj = dict(fields)
     obj["LedgerEntryType"] = ty
+    if kind == "CreatedNode":
+        # Campaign 23: NewFields omits default-valued fields, but sfFlags is soeREQUIRED on every
+        # entry and an AccountRoot always carries sfOwnerCount — a target CREATED here and touched
+        # by a LATER tx (a Ticket made and used in one Batch, an account funded by inner 1 and
+        # acting in inner 2) was rebuilt without them.
+        obj.setdefault("Flags", 0)
+        if ty == "AccountRoot":
+            obj.setdefault("OwnerCount", 0)
     for f in _META_REBUILD[ty]:
         obj.setdefault(f, "0000000000000000")
     obj["PreviousTxnID"] = tx_hash
@@ -372,10 +384,22 @@ def main():
     want_targets = [t.upper() for t in sys.argv[4:]]
 
     led = rpc("ledger", {"ledger_index": seq, "transactions": True, "expand": True})
-    txs = [t for t in led["ledger"]["transactions"] if t.get("hash", "").startswith(pfx)]
-    if len(txs) != 1:
-        sys.exit(f"tx prefix {pfx} matched {len(txs)} txs in #{seq}")
-    tx = txs[0]
+    # Campaign 23: SYNTH_TX=<inner.json> SYNTH_INDEX=<n> hydrates the READ-SET of a Batch inner
+    # the ledger did NOT file (rippled refused it per-inner: ter/tef, or an AllOrNothing discard),
+    # as if it sat at TransactionIndex n (the outer's index -> pre-batch images). It has no meta,
+    # so the bundle's pre is its read-set alone and its expect is empty; build_batch.py merges it
+    # and pins those keys untouched.
+    synth = os.environ.get("SYNTH_TX")
+    if synth:
+        tx = json.load(open(synth))
+        tx.setdefault("hash", "00" * 32)
+        tx["metaData"] = {"AffectedNodes": [], "TransactionIndex": int(os.environ.get("SYNTH_INDEX", "0")),
+                          "TransactionResult": "(not filed)"}
+    else:
+        txs = [t for t in led["ledger"]["transactions"] if t.get("hash", "").startswith(pfx)]
+        if len(txs) != 1:
+            sys.exit(f"tx prefix {pfx} matched {len(txs)} txs in #{seq}")
+        tx = txs[0]
     meta = tx["metaData"]
 
     # A target is only honest when THIS tx is the key's LAST toucher in the
@@ -798,6 +822,22 @@ def main():
     # (fixCleanup3_3_0, fixCleanup3_4_0 — finding 338), and a bundle without
     # it answers "not enabled" for everything.
     named_keys.append("7DB0788C020F02780A673DC74757F23823FA3014C1866E72CC4CD8B226CD6EF4")
+    # Campaign 23: a DELEGATED transaction is judged by checkPermission, which READS
+    # keylet::delegate(Account, Delegate) = sha512half(0x0045 'E' + Account + Delegate)
+    # (Transactor.cpp:382-399) and never writes it — no meta names it. Inside a Batch a
+    # missing/insufficient Delegate is a per-inner terNO_DELEGATE_PERMISSION the batch survives.
+    if tx.get("Delegate") and tx.get("Account"):
+        try:
+            named_keys.append(hashlib.sha512(b"\x00E" + bytes.fromhex(acct_id(tx["Account"])) + bytes.fromhex(acct_id(tx["Delegate"]))).digest()[:32].hex().upper())
+        except Exception as e:
+            print(f"note: delegate key: {e}", file=sys.stderr)
+    # Campaign 23: a ticketed tx READS its Ticket (checkSeqProxy); a refused one never names it.
+    # keylet::ticket = sha512half(0x0054 'T' + Account + TicketSequence be32).
+    if tx.get("TicketSequence") is not None and tx.get("Account"):
+        try:
+            named_keys.append(hashlib.sha512(b"\x00T" + bytes.fromhex(acct_id(tx["Account"])) + int(tx["TicketSequence"]).to_bytes(4, "big")).digest()[:32].hex().upper())
+        except Exception as e:
+            print(f"note: ticket key: {e}", file=sys.stderr)
     # Finding 333: a DomainID transaction is judged by accountInDomain — the
     # domain object plus, per party, the Credential objects its
     # AcceptedCredentials name (keylet credential(subject, issuer, type)).
