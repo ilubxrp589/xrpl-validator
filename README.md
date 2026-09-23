@@ -14,11 +14,9 @@ Two things live in this repo:
    `account_hash` matches with zero mismatches.**
 2. **A native Rust transaction engine** that runs as a **live shadow next to
    rippled on mainnet**: every ledger's transactions are applied natively and
-   compared byte-for-byte with libxrpl's results. It has completed a **full
-   24-hour mainnet run with zero divergences** (2026-09-20/21: 22,985 ledgers
-   compared, every one exact, 2.2M transactions); the run started 2026-09-22
-   stood at 15,821 consecutive exact ledgers (1.79M transactions) on
-   2026-09-23 05:30. The findings log (F-numbers) reached **F396** on
+   compared byte-for-byte with libxrpl's results. It has completed **two full
+   24-hour mainnet runs with zero divergences**: 2026-09-20/21 (22,985 ledgers
+   compared, every one exact, 2.2M transactions) and 2026-09-22/23. The findings log (F-numbers) reached **F396** on
    2026-09-23: divergences from rippled caught by the live shadow, replay
    windows and crafted campaigns, each fixed and most pinned as byte-exact
    regression vectors. See [Progress history](#progress-history).
@@ -67,13 +65,15 @@ after a run of consecutive clean 24-hour live soaks.
 | Independent every-ledger state-hash verification | **Working** — 28.5K+ consecutive mainnet matches (documented run) |
 | Validation signing + relay | Working; **signing does not yet strictly gate on local verification** (hardening in progress) |
 | Production transaction apply | **Hybrid** — libxrpl via FFI |
-| Native Rust transaction engine (`xrpl-ledger`) | **Live mainnet shadow, byte-exact**: a full 24-hour run with zero divergences (22,985 ledgers, 2.2M txs); not yet production |
+| Native Rust transaction engine (`xrpl-ledger`) | **Live mainnet shadow, byte-exact**: two full 24-hour runs with zero divergences; not yet production |
 | Differential harness (`differential_probe` + `scripts/corpus.sh`) | Working; the regression gate for engine changes |
 | Security review (Fable 5 model, AI) | **In progress** — findings being addressed; specifics withheld |
 
 ## Progress history
 
-Every number below is from the git history or the logged runs.
+Every number below is from the git history or the logged runs. **Daily reports**
+(Markdown + PDF, compiled automatically each day):
+[xrpl-validator-reports](https://github.com/ilubxrp589/xrpl-validator-reports).
 
 | Date (2026) | Milestone |
 |---|---|
@@ -89,7 +89,7 @@ Every number below is from the git history or the logged runs.
 | Sep 20 | The ported flow engine goes live in the shadow |
 | Sep 20 → 21 | **First full 24-hour run with zero divergences**: 22,985 ledgers compared, every one exact; 2,200,747 transactions |
 | Sep 18 → 23 | Crafted testnet/devnet transaction campaigns for what mainnet rarely exercises, every bundle byte-exact, including Batch ahead of its ~Sep 29 mainnet activation; findings log reaches **F396** on Sep 23 |
-| Sep 23 | Second 24-hour run in progress: 15,821 consecutive exact ledgers (1.79M transactions) at 05:30 |
+| Sep 22 → 23 | **Second full 24-hour run with zero divergences** (started Sep 22 11:38 EDT; no engine receipts) |
 
 ## Native engine — transaction coverage
 
