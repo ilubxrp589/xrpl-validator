@@ -13,6 +13,7 @@ pub mod credential;
 pub mod direct_step;
 pub mod dispatch;
 pub mod escrow;
+pub mod ledger_state_fix;
 pub mod misc;
 pub mod mpt;
 pub mod nftoken;

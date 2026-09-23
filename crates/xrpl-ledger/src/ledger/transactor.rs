@@ -73,6 +73,9 @@ pub enum TxResult {
     /// tecCRYPTOCONDITION_ERROR — an EscrowFinish whose fulfillment does not satisfy the
     /// condition, or whose Condition disagrees with the escrow's (finding 353).
     CryptoConditionError,
+    /// tecFAILED_PROCESSING — LedgerStateFix found nothing to repair
+    /// (LedgerStateFix.cpp doApply). Not the tel code below.
+    TecFailedProcessing,
     /// AccountDelete: the account's Sequence is too recent —
     /// `sequence + 255 > view.seq()` (AccountDelete.cpp kSeqDelta).
     TooSoon,
@@ -304,6 +307,7 @@ impl TxResult {
             | TxResult::UnfundedOffer
             | TxResult::Expired
             | TxResult::CryptoConditionError
+            | TxResult::TecFailedProcessing
             | TxResult::TooSoon
             | TxResult::PathPartial
             | TxResult::DstTagNeeded
@@ -384,6 +388,7 @@ impl TxResult {
             TxResult::UnfundedOffer => "tecUNFUNDED_OFFER",
             TxResult::Expired => "tecEXPIRED",
             TxResult::CryptoConditionError => "tecCRYPTOCONDITION_ERROR",
+            TxResult::TecFailedProcessing => "tecFAILED_PROCESSING",
             TxResult::PathPartial => "tecPATH_PARTIAL",
             TxResult::DstTagNeeded => "tecDST_TAG_NEEDED",
             TxResult::ArrayTooLarge => "tecARRAY_TOO_LARGE",
@@ -748,6 +753,7 @@ mod claim_tests {
             TxResult::LimitExceeded, TxResult::NoLine, TxResult::Frozen, TxResult::NoPermission,
             TxResult::PathDry, TxResult::PathPartial, TxResult::Killed, TxResult::Expired,
             TxResult::AmmNotEmpty, TxResult::CryptoConditionError, TxResult::TecArrayEmpty, TxResult::TokenPairNotFound,
+            TxResult::TecFailedProcessing,
         ];
         for r in all {
             assert!(r.code_str().starts_with("tec"), "{:?}", r);

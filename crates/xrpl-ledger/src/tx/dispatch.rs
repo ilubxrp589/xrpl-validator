@@ -45,6 +45,7 @@ use super::misc::{
 use super::pseudo::{EnableAmendmentTransactor, SetFeeTransactor, UNLModifyTransactor};
 use super::oracle::{OracleDeleteTransactor, OracleSetTransactor};
 use super::ticket::TicketCreateTransactor;
+use super::ledger_state_fix::LedgerStateFixTransactor;
 use super::nftoken::{
     NFTokenAcceptOfferTransactor, NFTokenBurnTransactor, NFTokenCancelOfferTransactor,
     NFTokenCreateOfferTransactor, NFTokenMintTransactor, NFTokenModifyTransactor,
@@ -107,6 +108,7 @@ pub fn get_transactor(tx_type: &str) -> Option<Box<dyn Transactor>> {
         "AMMDelete" => Some(Box::new(AMMDeleteTransactor)),
         "AMMClawback" => Some(Box::new(AMMClawbackTransactor)),
         "TicketCreate" => Some(Box::new(TicketCreateTransactor)),
+        "LedgerStateFix" => Some(Box::new(LedgerStateFixTransactor)),
         "OracleSet" => Some(Box::new(OracleSetTransactor)),
         "OracleDelete" => Some(Box::new(OracleDeleteTransactor)),
         "DIDSet" => Some(Box::new(DIDSetTransactor)),
@@ -236,7 +238,7 @@ mod tests {
             "CredentialCreate", "CredentialDelete", "CredentialAccept",
             "AMMCreate", "AMMDeposit", "AMMWithdraw", "AMMVote", "AMMBid", "AMMDelete",
             "AMMClawback",
-            "TicketCreate",
+            "TicketCreate", "LedgerStateFix",
             "OracleSet", "OracleDelete",
             "DIDSet", "DIDDelete",
             "XChainCreateBridge", "XChainCreateClaimID", "XChainCommit",

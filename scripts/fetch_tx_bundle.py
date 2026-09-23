@@ -507,7 +507,8 @@ def main():
             named_keys.append(hashlib.sha512(b"\x00u" + bytes.fromhex(acct_id(tx["Owner"])) + int(tx["OfferSequence"]).to_bytes(4, "big")).digest()[:32].hex().upper())
         except Exception as e:
             print(f"note: escrow key: {e}", file=sys.stderr)
-    for f in ("Channel", "CheckID", "DomainID"):
+    # LedgerStateFix BookExchangeRate (F359) names the directory it judges.
+    for f in ("Channel", "CheckID", "DomainID", "BookDirectory"):
         v = tx.get(f)
         if isinstance(v, str) and len(v) == 64:
             named_keys.append(v.upper())
@@ -562,6 +563,22 @@ def main():
                 a = tx.get(f) or {}
                 if isinstance(a, dict) and a.get("currency") and a.get("currency") != "XRP" and a.get("issuer") and a["issuer"] != tx["Holder"]:
                     _put(rpc("ledger_entry", {"ripple_state": {"accounts": [tx["Holder"], a["issuer"]], "currency": a["currency"]}, "ledger_index": seq - 1, "binary": True}))
+        # Finding 359 (campaign 21): LedgerStateFix NfTokenPageLink walks EVERY
+        # NFTokenPage of the Owner; a tecFAILED_PROCESSING (nothing to repair)
+        # names none of them, and a bundle without them repairs nothing either.
+        if tt == "LedgerStateFix" and tx.get("Owner"):
+            _put(rpc("ledger_entry", {"account_root": tx["Owner"], "ledger_index": seq - 1, "binary": True}))
+            marker = None
+            while True:
+                q = {"account": tx["Owner"], "type": "nft_page", "ledger_index": seq - 1, "limit": 400}
+                if marker:
+                    q["marker"] = marker
+                ao = rpc("account_objects", q)
+                for o in ao.get("account_objects", []):
+                    _put(rpc("ledger_entry", {"index": o["index"], "ledger_index": seq - 1, "binary": True}))
+                marker = ao.get("marker")
+                if not marker:
+                    break
         # Campaign 13 (testnet NFT depth): the NFT transactors READ objects a
         # fee-only tec never names — the offers an NFTokenAcceptOffer judges
         # (tecINSUFFICIENT_PAYMENT / tecNO_PERMISSION on Destination), the

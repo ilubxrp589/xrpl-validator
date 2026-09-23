@@ -28,6 +28,15 @@ pub fn enabled(sandbox: &Sandbox, id_hex: &str) -> bool {
         .is_some_and(|a| a.iter().any(|x| x.as_str().is_some_and(|s| s.eq_ignore_ascii_case(id_hex))))
 }
 
+/// fixCleanup3_2_0 — enabled on mainnet. Gates LedgerStateFix's
+/// BookExchangeRate fix type (among other 3.2.0 cleanups ported earlier).
+pub const FIX_CLEANUP_3_2_0: &str =
+    "21B8D2F76F68E11E9C077A43BBBC394136E9987E99DDB73966DD68419467E431";
+
+pub fn fix_cleanup_3_2_0(sandbox: &Sandbox) -> bool {
+    enabled(sandbox, FIX_CLEANUP_3_2_0)
+}
+
 pub fn fix_cleanup_3_3_0(sandbox: &Sandbox) -> bool {
     enabled(sandbox, FIX_CLEANUP_3_3_0)
 }
