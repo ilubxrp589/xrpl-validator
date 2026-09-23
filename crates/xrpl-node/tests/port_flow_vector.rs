@@ -172,3 +172,17 @@ fn offer_crossed_is_judged_by_the_amounts_not_by_a_dust_output_107155576() {
     port();
     run_bundle(include_str!("vectors/offer_crossed_is_judged_by_the_amounts_not_by_a_dust_output_107155576.json"));
 }
+
+/// Campaign 17 7b-7 (B345C16754F2, network tecKILLED): the maker whose line for the asset it receives is deep-frozen is removed (OfferStream.cpp:255); read-set gap fixed too. The model misses it by policy.
+#[test]
+fn c17_port_7b_7_tk_ioc_asks_5_usd_for_1500000d_0_30_only_bid_is_f2_owner_testnet_20976788() {
+    port();
+    run_bundle(include_str!("vectors/c17_port_7b_7_tk_ioc_asks_5_usd_for_1500000d_0_30_only_bid_is_f2_owner_testnet_20976788.json"));
+}
+
+/// Campaign 17 3-2 (D564FAE830A2, network tecKILLED): an IoC whose only cross is a 1e-15 fill is tecKILLED (F357 shape). The model misses it by policy.
+#[test]
+fn c17_port_3_2_tk_ioc_bid_40_usd_for_50_eur_dust_cross_only_testnet_20976551() {
+    port();
+    run_bundle(include_str!("vectors/c17_port_3_2_tk_ioc_bid_40_usd_for_50_eur_dust_cross_only_testnet_20976551.json"));
+}

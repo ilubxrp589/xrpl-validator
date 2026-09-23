@@ -9498,6 +9498,24 @@ impl Transactor for OfferCreateTransactor {
             return TxResult::NoAccount;
         }
 
+        // Finding 381 (campaign 17 8-2 / 8-3 / 8-4 / 8b-2 / 8b-3): the first
+        // test after the account is checkGlobalFrozen on the TakerPays asset,
+        // then the TakerGets asset — an issuer under lsfGlobalFreeze makes
+        // the offer tecFROZEN, the issuer's own offer included, ahead of the
+        // funding and expiry tests (OfferCreate.cpp:191-200). Ours had none:
+        // a frozen sell answered tecUNFUNDED_OFFER, a frozen buy rested.
+        for side in ["TakerPays", "TakerGets"] {
+            if let Some(leg) = leg_of(&tx.fields[side]) {
+                const LSF_GLOBAL_FREEZE: u64 = 0x0040_0000;
+                if !leg.xrp
+                    && json_at(sandbox, &keylet::account_root_key(&leg.issuer))
+                        .is_some_and(|i| i["Flags"].as_u64().unwrap_or(0) & LSF_GLOBAL_FREEZE != 0)
+                {
+                    return TxResult::Frozen;
+                }
+            }
+        }
+
         // rippled CreateOffer::preclaim: an offer is unfunded when
         // accountFunds(TakerGets) <= 0 — for XRP that is balance minus
         // reserve, NOT the full sell amount (partially funded offers still
@@ -9566,6 +9584,16 @@ impl Transactor for OfferCreateTransactor {
                     if line["Flags"].as_u64().unwrap_or(0) & auth_bit == 0 {
                         return TxResult::NoAuth;
                     }
+                }
+                // Finding 381 (campaign 17 7-14 / 8b-6): checkAcceptAsset's
+                // last test — a line deep-frozen by EITHER side refuses the
+                // asset, tecFROZEN (OfferCreate.cpp:349-356).
+                const LSF_LOW_DEEP_FREEZE: u64 = 0x0200_0000;
+                const LSF_HIGH_DEEP_FREEZE: u64 = 0x0400_0000;
+                if json_at(sandbox, &keylet::ripple_state_key(&tx.account, &pays.issuer, &pays.cur))
+                    .is_some_and(|l| l["Flags"].as_u64().unwrap_or(0) & (LSF_LOW_DEEP_FREEZE | LSF_HIGH_DEEP_FREEZE) != 0)
+                {
+                    return TxResult::Frozen;
                 }
             }
         }

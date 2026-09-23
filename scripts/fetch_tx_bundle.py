@@ -1176,13 +1176,18 @@ def main():
                     # book head reads as unfunded and the whole leg vanishes
                     # (#106701383 644B3509: the XRP→USD dust tip 97C11ACC kept
                     # rippled's bridge strand active; ours saw no leg).
-                    tgets = oj.get("TakerGets")
-                    if isinstance(tgets, dict) and oj.get("Account") and tgets.get("issuer") != oj.get("Account"):
-                        rl = rpc("ledger_entry", {"ripple_state": {"currency": tgets["currency"], "accounts": [oj["Account"], tgets["issuer"]]},
-                                                  "ledger_index": seq - 1, "binary": True})
-                        li4 = (rl.get("index") or "").upper()
-                        if rl.get("node_binary") and li4 and li4 not in pre:
-                            pre[li4] = rl["node_binary"]
+                    # The maker's RECEIVING line too (campaign 17, 7b-7): OfferStream::step
+                    # removes an offer whose owner's line for the asset it RECEIVES is deep
+                    # frozen — isDeepFrozen(view, owner, assetIn) (OfferStream.cpp:255) — and
+                    # BookStep's requireAuth(assetIn, owner) reads the same line.
+                    for side in ("TakerGets", "TakerPays"):
+                        tamt = oj.get(side)
+                        if isinstance(tamt, dict) and "currency" in tamt and oj.get("Account") and tamt.get("issuer") != oj.get("Account"):
+                            rl = rpc("ledger_entry", {"ripple_state": {"currency": tamt["currency"], "accounts": [oj["Account"], tamt["issuer"]]},
+                                                      "ledger_index": seq - 1, "binary": True})
+                            li4 = (rl.get("index") or "").upper()
+                            if rl.get("node_binary") and li4 and li4 not in pre:
+                                pre[li4] = rl["node_binary"]
                 nxt = node.get("IndexNext")
                 if not nxt or int(str(nxt), 16) == 0:
                     break
