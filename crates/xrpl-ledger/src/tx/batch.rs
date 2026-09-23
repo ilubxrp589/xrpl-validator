@@ -136,24 +136,15 @@ fn touched_keys(
 }
 
 /// An inner's transaction id: sha512Half('TXN\0' ‖ its full serialization),
-/// as rippled's STTx::getTransactionID. RawTransactions arrive in rippled's
-/// API spelling on every live and bundle path; an engine-dialect copy (hex
-/// AccountIDs, as unit tests write them) is re-spelled first so both hash
-/// alike. None when the inner cannot be serialized.
+/// as rippled's STTx::getTransactionID. The inner is re-spelled by the same
+/// `ledger::canon::canon_for_encode` that `native_apply::batch_inner_ids` uses
+/// (finding 396): rippled's JSON prints the MPT amounts in DECIMAL and
+/// AssetPrice as short hex, which the codec rejects — the id came back None
+/// and the inner's AccountTxnID stamp was silently skipped. None when the
+/// inner cannot be serialized.
 fn inner_txn_id(inner: &Value) -> Option<String> {
     let mut v = inner.clone();
-    if let Some(o) = v.as_object_mut() {
-        for (k, val) in o.iter_mut() {
-            let is_account = xrpl_core::codec::lookup_field_def(k).is_some_and(|d| d.type_code == 8);
-            if let (true, Some(s)) = (is_account, val.as_str()) {
-                if s.len() == 40 {
-                    if let Some(id) = hex::decode(s).ok().and_then(|b| <[u8; 20]>::try_from(b.as_slice()).ok()) {
-                        *val = Value::String(xrpl_core::address::encode_account_id(&id));
-                    }
-                }
-            }
-        }
-    }
+    crate::ledger::canon::canon_for_encode(&mut v);
     let blob = xrpl_core::codec::encode::encode_transaction_json(&v, false).ok()?;
     let mut buf = Vec::with_capacity(blob.len() + 4);
     buf.extend_from_slice(&[0x54, 0x58, 0x4E, 0x00]);
@@ -481,7 +472,9 @@ impl Transactor for BatchTransactor {
             }
             let before = sandbox.snapshot();
             let (r, _applied) = apply_on_sandbox(&f, sandbox);
-            let base = |k: &Hash256| sandbox.base().state_map.lookup(k).map(|b| b.to_vec());
+            // Decoded, as every other reader (finding 395): state_replay keeps
+            // its leaves binary behind a `leaf_decoder`.
+            let base = |k: &Hash256| sandbox.base().read_json(k);
             touched.push(touched_keys(&before, &sandbox.snapshot(), &base));
             results.push(r.code_str().to_string());
             if !r.is_success() {
@@ -731,6 +724,80 @@ mod tests {
             state.state_map.insert(keylet::account_root_key(&id), serde_json::to_vec(&j).unwrap()).unwrap();
         }
         state
+    }
+
+    /// Finding 395 (review of F392): an inner's touched set reads the
+    /// pre-batch value of a key its snapshot does not hold DECODED
+    /// (`LedgerState::read_json`), as every other reader does. state_replay
+    /// keeps its leaves binary behind a `leaf_decoder`; a raw
+    /// `state_map.lookup` compared that binary with the sandbox's JSON, so an
+    /// unchanged write-back looked like a change — here a delegated inner's
+    /// Fee-0 write-back of the delegate's root, which rippled's payFee never
+    /// makes (Transactor.cpp:635) — and the inner's id was stamped on it.
+    #[test]
+    fn a_write_back_on_binary_leaves_is_not_a_touch() {
+        fn decode(_: &Hash256, d: &[u8]) -> Option<Vec<u8>> {
+            d.get(1..).map(<[u8]>::to_vec)
+        }
+        let json_state = {
+            let mut st = state_with_accounts(&[(1, 50_000_000, 5), (2, 20_000_000, 1), (3, 20_000_000, 7)]);
+            let d = json!({"LedgerEntryType": "Delegate", "Account": hexa(3), "Authorize": hexa(2), "Flags": 0,
+                           "OwnerNode": "0", "Permissions": [{"Permission": {"PermissionValue": 1}}]});
+            st.state_map.insert(keylet::delegate_key(&acct(3), &acct(2)), serde_json::to_vec(&d).unwrap()).unwrap();
+            st
+        };
+        // The same entries, stored as 0x00 ‖ JSON — "binary" to everything but the decoder.
+        let mut bin_state = state_with_accounts(&[]);
+        for k in [acct(1), acct(2), acct(3)].map(|a| keylet::account_root_key(&a)).into_iter()
+            .chain([keylet::delegate_key(&acct(3), &acct(2))])
+        {
+            let mut leaf = vec![0u8];
+            leaf.extend(json_state.state_map.lookup(&k).unwrap());
+            bin_state.state_map.insert(k, leaf).unwrap();
+        }
+        bin_state.leaf_decoder = Some(decode);
+        let mut inner = inner_payment(3, 1, 1, 7);
+        inner["RawTransaction"]["Delegate"] = json!(hexa(2));
+        // A Batch carries at least two inners; the second is the outer's own.
+        let o = outer(TF_INDEPENDENT, vec![inner, inner_payment(1, 3, 1, 6)], Some(vec![2]));
+        let delegate_root = keylet::account_root_key(&acct(2));
+        for (name, state) in [("json", &json_state), ("binary", &bin_state)] {
+            let (_sb, r, inners) = run(&o, state);
+            assert_eq!((r.as_str(), inners), ("tesSUCCESS", vec!["tesSUCCESS".to_string(); 2]), "{name}");
+            let touched = take_inner_touched();
+            assert!(
+                !touched[0].iter().any(|t| t.key() == delegate_root),
+                "{name} leaves: the delegate's unchanged root is not a touch: {:?}",
+                touched[0]
+            );
+            assert!(touched[0].contains(&InnerTouch::Modified(keylet::account_root_key(&acct(3)))), "{name}");
+        }
+    }
+
+    /// Finding 396 (review of F390): an inner's own id — stamped into its
+    /// account's AccountTxnID — is hashed from the inner re-spelled exactly as
+    /// `native_apply::batch_inner_ids` re-spells it: rippled's JSON prints the
+    /// MPT amounts in DECIMAL and AssetPrice as short hex, and the codec wants
+    /// 16 hex digits. Both inners are devnet originals with their ledger ids.
+    #[test]
+    fn inner_txn_id_matches_the_ledger_for_u64_fields() {
+        let mpt = json!({"Account": "rnCSiC5DEnggZ5Ai2wrjkGgVCnyUhERGPd", "AssetScale": 2, "Fee": "0",
+            "Flags": 1073741922u64, "MaximumAmount": "100000000", "Sequence": 5533528, "SigningPubKey": "",
+            "TransactionType": "MPTokenIssuanceCreate"});
+        assert_eq!(
+            inner_txn_id(&mpt).as_deref(),
+            Some("B5A203D28D9B2F03DCB1FB2A241F0DAF75F016175B4A94BAC673C10A958A9201"),
+            "campaign 23 4-1 inner 0 (MaximumAmount in decimal)"
+        );
+        let oracle = json!({"Account": "rHdsKxYsYQ9rGDu7fhWgC7KT7xh4cDJeFz", "AssetClass": "63757272656E6379",
+            "Fee": "0", "Flags": 1073741824u64, "LastUpdateTime": 1790149201u64, "OracleDocumentID": 1,
+            "PriceDataSeries": [{"PriceData": {"AssetPrice": "2e4", "BaseAsset": "XRP", "QuoteAsset": "USD", "Scale": 3}}],
+            "Provider": "633234", "Sequence": 5536987, "SigningPubKey": "", "TransactionType": "OracleSet"});
+        assert_eq!(
+            inner_txn_id(&oracle).as_deref(),
+            Some("0A4C2DBD4658B71284E9ABA31FC6B037FD0207B28C55F993129C87998C4866A0"),
+            "campaign 24 6-1 inner 0 (AssetPrice as short hex)"
+        );
     }
 
     fn balance_seq(sb: &Sandbox, n: u8) -> (u64, u32) {

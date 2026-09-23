@@ -7,6 +7,7 @@
 
 pub mod amendments;
 pub mod apply;
+pub mod canon;
 pub mod close;
 pub mod directory;
 pub mod fees;
