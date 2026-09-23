@@ -519,6 +519,11 @@ def main():
         # OracleSet update (tecINVALID_UPDATE_TIME on the stored time, tecTOKEN_PAIR_NOT_FOUND, tecARRAY_EMPTY,
         # tecARRAY_TOO_LARGE, tecINSUFFICIENT_RESERVE) judged the oracle but never names it in the meta.
         named_keys.append(hashlib.sha512(b"\x00R" + bytes.fromhex(acct_id(tx["Account"])) + int(tx["OracleDocumentID"]).to_bytes(4, "big")).digest()[:32].hex().upper())
+    # Finding 360 (campaign 22, devnet): DelegateSet's preclaim reads the Delegate object
+    # keylet::delegate = sha512half(0x0045 'E' + Account + Authorize) (tecNO_ENTRY on a delete
+    # that finds none); a fee-only tec never names it. The Authorize root is hydrated below.
+    if tx.get("TransactionType") == "DelegateSet" and tx.get("Authorize"):
+        named_keys.append(hashlib.sha512(b"\x00E" + bytes.fromhex(acct_id(tx["Account"])) + bytes.fromhex(acct_id(tx["Authorize"]))).digest()[:32].hex().upper())
     # LedgerStateFix BookExchangeRate (F359) names the directory it judges.
     for f in ("Channel", "CheckID", "DomainID", "BookDirectory"):
         v = tx.get(f)
@@ -575,6 +580,10 @@ def main():
                 a = tx.get(f) or {}
                 if isinstance(a, dict) and a.get("currency") and a.get("currency") != "XRP" and a.get("issuer") and a["issuer"] != tx["Holder"]:
                     _put(rpc("ledger_entry", {"ripple_state": {"accounts": [tx["Holder"], a["issuer"]], "currency": a["currency"]}, "ledger_index": seq - 1, "binary": True}))
+        # Finding 360: DelegateSet judges the Authorize root (tecNO_TARGET when absent,
+        # tecPSEUDO_ACCOUNT for an AMM/vault account) without writing it.
+        if tt == "DelegateSet" and tx.get("Authorize"):
+            _put(rpc("ledger_entry", {"account_root": tx["Authorize"], "ledger_index": seq - 1, "binary": True}))
         # Finding 359 (campaign 21): LedgerStateFix NfTokenPageLink walks EVERY
         # NFTokenPage of the Owner; a tecFAILED_PROCESSING (nothing to repair)
         # names none of them, and a bundle without them repairs nothing either.
