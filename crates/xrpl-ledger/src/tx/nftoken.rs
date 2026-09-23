@@ -861,6 +861,68 @@ fn nft_funds_short(sandbox: &Sandbox, payer: &[u8; 20], amount: &serde_json::Val
 ///
 /// Keys are collected per directory BEFORE deleting any of them: `delete_offer`
 /// relinks and can drop the very pages the walk is standing on.
+fn nft_is_xrp(amount: &serde_json::Value) -> bool {
+    amount.is_string()
+}
+
+fn json_at(sandbox: &Sandbox, key: &Hash256) -> Option<serde_json::Value> {
+    sandbox.read(key).and_then(|b| serde_json::from_slice(&b).ok())
+}
+
+/// `nft::checkTrustlineAuthorized` (NFTokenHelpers.cpp:997-1046; fixEnforceNFTokenTrustlineV2, live on mainnet):
+/// an IOU's issuer must exist (tecNO_ISSUER); the issuer may always receive its own issuance; under the issuer's
+/// RequireAuth the account's line must exist (tecNO_LINE) and carry the account's side of the auth flag
+/// (tecNO_AUTH). XRP always passes.
+fn nft_trustline_authorized(sandbox: &Sandbox, id: &[u8; 20], amount: &serde_json::Value) -> TxResult {
+    const LSF_REQUIRE_AUTH: u64 = 0x0004_0000;
+    const LSF_LOW_AUTH: u64 = 0x0004_0000;
+    const LSF_HIGH_AUTH: u64 = 0x0008_0000;
+    let Some(leg) = crate::tx::offer::leg_of(amount) else { return TxResult::Success };
+    if leg.xrp {
+        return TxResult::Success;
+    }
+    let Some(issuer) = json_at(sandbox, &keylet::account_root_key(&leg.issuer)) else {
+        return TxResult::NoIssuer;
+    };
+    if leg.issuer == *id {
+        return TxResult::Success;
+    }
+    if issuer["Flags"].as_u64().unwrap_or(0) & LSF_REQUIRE_AUTH != 0 {
+        let Some(line) = json_at(sandbox, &keylet::ripple_state_key(id, &leg.issuer, &leg.cur)) else {
+            return TxResult::NoLine;
+        };
+        let bit = if *id > leg.issuer { LSF_LOW_AUTH } else { LSF_HIGH_AUTH };
+        if line["Flags"].as_u64().unwrap_or(0) & bit == 0 {
+            return TxResult::NoAuth;
+        }
+    }
+    TxResult::Success
+}
+
+/// `nft::checkTrustlineDeepFrozen` (NFTokenHelpers.cpp:1049-1096; DeepFreeze, live): the IOU's issuer must exist
+/// (tecNO_ISSUER); the issuer's own issuance passes; no line passes; a line deep-frozen from either side refuses
+/// the IOU (tecFROZEN). XRP always passes.
+fn nft_trustline_deep_frozen(sandbox: &Sandbox, id: &[u8; 20], amount: &serde_json::Value) -> TxResult {
+    const LSF_LOW_DEEP_FREEZE: u64 = 0x0200_0000;
+    const LSF_HIGH_DEEP_FREEZE: u64 = 0x0400_0000;
+    let Some(leg) = crate::tx::offer::leg_of(amount) else { return TxResult::Success };
+    if leg.xrp {
+        return TxResult::Success;
+    }
+    if !sandbox.exists(&keylet::account_root_key(&leg.issuer)) {
+        return TxResult::NoIssuer;
+    }
+    if leg.issuer == *id {
+        return TxResult::Success;
+    }
+    match json_at(sandbox, &keylet::ripple_state_key(id, &leg.issuer, &leg.cur)) {
+        Some(line) if line["Flags"].as_u64().unwrap_or(0) & (LSF_LOW_DEEP_FREEZE | LSF_HIGH_DEEP_FREEZE) != 0 => {
+            TxResult::Frozen
+        }
+        _ => TxResult::Success,
+    }
+}
+
 fn burn_token_offers(sandbox: &mut Sandbox, id: &Hash256) {
     const MAX_DELETABLE: usize = 500;
     let mut budget = MAX_DELETABLE;
@@ -1218,16 +1280,112 @@ impl Transactor for NFTokenAcceptOfferTransactor {
                     }
                     return TxResult::InsufficientPayment;
                 }
+                // The broker must be able to receive the fee (NFTokenAcceptOffer.cpp:153-165).
+                if !nft_is_xrp(fee) {
+                    for r in [
+                        nft_trustline_authorized(sandbox, &tx.account, fee),
+                        nft_trustline_deep_frozen(sandbox, &tx.account, fee),
+                    ] {
+                        if !r.is_success() {
+                            return r;
+                        }
+                    }
+                }
             }
         }
+        // Finding 397 (soak #26 receipt, mainnet #107190696 072B81D6348C): rippled's per-offer blocks
+        // (NFTokenAcceptOffer.cpp:169-296), in its order and in BOTH modes — the offer's type, "an account can't
+        // accept an offer it placed", the token-ownership test, the Destination test (direct mode), then the funds
+        // test and the trust-line tests — and then the transfer-fee tail (:298-334). All of it is preclaim, so it
+        // answers before do_apply deletes an expired offer. We ran only the funds tests here and the rest in
+        // do_apply: a direct accept of a sell offer naming another Destination, by an acceptor short of the price,
+        // answered tecINSUFFICIENT_FUNDS where mainnet says tecNO_PERMISSION.
         if let Some(b) = &bo {
+            if b.is_sell {
+                return TxResult::NftokenOfferTypeMismatch;
+            }
+            if b.owner == tx.account {
+                return TxResult::CantAcceptOwnNftOffer;
+            }
+            if so.is_none() {
+                // Direct mode: the acceptor sells, so it must hold the token and, if the offer names one, be
+                // its Destination.
+                if nftpage::locate_token(sandbox, &tx.account, &b.nft_id).is_none() {
+                    return TxResult::NoPermission;
+                }
+                if b.destination.is_some_and(|d| d != tx.account) {
+                    return TxResult::NoPermission;
+                }
+            }
             if nft_funds_short(sandbox, &b.owner, &b.amount) {
                 return TxResult::InsufficientFunds;
             }
+            if !nft_is_xrp(&b.amount) {
+                let mut checks = vec![nft_trustline_authorized(sandbox, &b.owner, &b.amount)];
+                if so.is_none() {
+                    checks.push(nft_trustline_authorized(sandbox, &tx.account, &b.amount));
+                    checks.push(nft_trustline_deep_frozen(sandbox, &tx.account, &b.amount));
+                }
+                if let Some(r) = checks.into_iter().find(|r| !r.is_success()) {
+                    return r;
+                }
+            }
         }
         if let Some(s) = &so {
-            if bo.is_none() && nft_funds_short(sandbox, &tx.account, &s.amount) {
-                return TxResult::InsufficientFunds;
+            if !s.is_sell {
+                return TxResult::NftokenOfferTypeMismatch;
+            }
+            if s.owner == tx.account {
+                return TxResult::CantAcceptOwnNftOffer;
+            }
+            // The seller must own the token.
+            if nftpage::locate_token(sandbox, &s.owner, &s.nft_id).is_none() {
+                return TxResult::NoPermission;
+            }
+            if bo.is_none() {
+                if s.destination.is_some_and(|d| d != tx.account) {
+                    return TxResult::NoPermission;
+                }
+                if nft_funds_short(sandbox, &tx.account, &s.amount) {
+                    return TxResult::InsufficientFunds;
+                }
+            }
+            if !nft_is_xrp(&s.amount) {
+                let mut checks = vec![nft_trustline_authorized(sandbox, &s.owner, &s.amount)];
+                if bo.is_none() {
+                    checks.push(nft_trustline_authorized(sandbox, &tx.account, &s.amount));
+                }
+                checks.push(nft_trustline_deep_frozen(sandbox, &s.owner, &s.amount));
+                if let Some(r) = checks.into_iter().find(|r| !r.is_success()) {
+                    return r;
+                }
+            }
+        }
+        // The transfer-fee tail: an IOU-priced NFT with a transfer fee pays its minter a cut, so the minter needs
+        // a line for that IOU unless the token may create one or the minter issues it (fixEnforceNFTokenTrustline),
+        // and must be authorized for it and not deep-frozen on it (fixEnforceNFTokenTrustlineV2).
+        if let Some(offer) = bo.as_ref().or(so.as_ref()) {
+            const K_FLAG_CREATE_TRUST_LINES: u16 = 0x0004;
+            let id = offer.nft_id;
+            let xfer_fee = u16::from_be_bytes([id.0[2], id.0[3]]);
+            if xfer_fee != 0 && !nft_is_xrp(&offer.amount) {
+                if let Some(leg) = crate::tx::offer::leg_of(&offer.amount) {
+                    let minter = nftpage::issuer_of(&id);
+                    if nftpage::flags_of(&id) & K_FLAG_CREATE_TRUST_LINES == 0
+                        && minter != leg.issuer
+                        && !sandbox.exists(&keylet::ripple_state_key(&minter, &leg.issuer, &leg.cur))
+                    {
+                        return TxResult::NoLine;
+                    }
+                    for r in [
+                        nft_trustline_authorized(sandbox, &minter, &offer.amount),
+                        nft_trustline_deep_frozen(sandbox, &minter, &offer.amount),
+                    ] {
+                        if !r.is_success() {
+                            return r;
+                        }
+                    }
+                }
             }
         }
         TxResult::Success
@@ -1344,40 +1502,14 @@ impl Transactor for NFTokenAcceptOfferTransactor {
             // reports tecOBJECT_NOT_FOUND for it.
             return TxResult::ObjectNotFound;
         };
-        if offer.owner == tx.account {
-            return TxResult::NoPermission;
-        }
-        if let Some(dest) = offer.destination {
-            if dest != tx.account {
-                return TxResult::NoPermission;
-            }
-        }
-        // "An account can't accept an offer it placed"
-        // (NFTokenAcceptOffer.cpp:165-167 buy, :224-226 sell) — finding 100.
-        if offer.owner == tx.account {
-            return TxResult::CantAcceptOwnNftOffer;
-        }
+        // The offer's type, "an account can't accept an offer it placed" (finding 100), the ownership test
+        // (#106333939 2FEB03EC: a stale sell offer is tecNO_PERMISSION) and the Destination test are preclaim's,
+        // in rippled's order (finding 397).
         let (seller, buyer) = if offer.is_sell {
             (offer.owner, tx.account)
         } else {
             (tx.account, offer.owner)
         };
-        // Ownership precondition, rippled's order (NFTokenAcceptOffer.cpp:170,
-        // :229): accepting a SELL offer requires the OFFER OWNER to still
-        // hold the token; accepting a BUY offer requires the ACCEPTOR to.
-        // Either miss is tecNO_PERMISSION — #106333939 2FEB03EC accepts a
-        // stale sell offer (rpApJk4e no longer holds 00081B58…0100) and
-        // mainnet claims the fee with NO_PERMISSION where we said NO_ENTRY.
-        if nftpage::locate_token(sandbox, &seller, &offer.nft_id).is_none() {
-            if std::env::var("DX_NFT").is_ok() {
-                eprintln!(
-                    "DX_NFT accept-direct REFUSE owns-token: seller={} nft={}",
-                    hex::encode(seller),
-                    hex::encode(offer.nft_id.0)
-                );
-            }
-            return TxResult::NoPermission;
-        }
         // Offer deleted FIRST — same order as rippled's doApply (see the
         // brokered arm's note): a buy-offer accept must not count the
         // buyer's own offer toward the reserve judged in transfer_token.
@@ -1936,6 +2068,89 @@ mod tests {
         let sacct: serde_json::Value =
             serde_json::from_slice(&sb.read(&keylet::account_root_key(&seller)).unwrap()).unwrap();
         assert_eq!(sacct["Balance"], "1000000500");
+    }
+
+    /// A sell offer on a freshly minted token, hand-built with the given extra fields.
+    fn sell_offer_on_new_token(sb: &mut Sandbox, seller: [u8; 20], seq: u32, extra: serde_json::Value) -> Hash256 {
+        NFTokenMintTransactor.do_apply(&mint_tx(seller, seq), sb);
+        let id_hex = page_tokens(sb, &seller).last().cloned().unwrap();
+        let key = keylet::nft_offer_key(&seller, 90 + seq);
+        let mut offer = serde_json::json!({
+            "LedgerEntryType": "NFTokenOffer", "Owner": hex::encode(seller), "NFTokenID": id_hex,
+            "Amount": "500", "Flags": 1,
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            offer[k] = v.clone();
+        }
+        sb.write(key, serde_json::to_vec(&offer).unwrap());
+        key
+    }
+
+    fn accept_tx(account: [u8; 20], field: &str, key: &Hash256) -> TxFields {
+        TxFields {
+            account,
+            tx_type: "NFTokenAcceptOffer".into(),
+            fee: 12,
+            sequence: 7,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({ field: hex::encode_upper(key.0) }),
+            inner_batch: false,
+        }
+    }
+
+    /// Finding 397 (mainnet #107190696 072B81D6348C): the Destination test comes before the funds test
+    /// (NFTokenAcceptOffer.cpp:239-263) — an acceptor who is neither the Destination nor able to pay is
+    /// tecNO_PERMISSION, not tecINSUFFICIENT_FUNDS.
+    #[test]
+    fn an_accept_by_a_non_destination_short_of_funds_is_no_permission() {
+        let (seller, broke, dest) = ([0x31u8; 20], [0x32u8; 20], [0x33u8; 20]);
+        let state = make_state(&[(seller, 1_000_000_000), (broke, 1_000_100), (dest, 1_000_000_000)]);
+        let mut sb = Sandbox::new(&state);
+        let key = sell_offer_on_new_token(&mut sb, seller, 1, serde_json::json!({"Destination": hex::encode(dest)}));
+        let tx = accept_tx(broke, "NFTokenSellOffer", &key);
+        assert_eq!(NFTokenAcceptOfferTransactor.preclaim(&tx, &sb), TxResult::NoPermission);
+    }
+
+    /// "An account can't accept an offer it placed" is tecCANT_ACCEPT_OWN_NFTOKEN_OFFER (:233-235); the direct
+    /// path used to answer tecNO_PERMISSION first.
+    #[test]
+    fn accepting_your_own_sell_offer_is_cant_accept_own() {
+        let seller = [0x34u8; 20];
+        let state = make_state(&[(seller, 1_000_000_000)]);
+        let mut sb = Sandbox::new(&state);
+        let key = sell_offer_on_new_token(&mut sb, seller, 1, serde_json::json!({}));
+        let tx = accept_tx(seller, "NFTokenSellOffer", &key);
+        assert_eq!(NFTokenAcceptOfferTransactor.preclaim(&tx, &sb), TxResult::CantAcceptOwnNftOffer);
+    }
+
+    /// A sell offer named as the buy offer is tecNFTOKEN_OFFER_TYPE_MISMATCH (:171-172).
+    #[test]
+    fn a_sell_offer_named_as_the_buy_offer_is_an_offer_type_mismatch() {
+        let (seller, other) = ([0x35u8; 20], [0x36u8; 20]);
+        let state = make_state(&[(seller, 1_000_000_000), (other, 1_000_000_000)]);
+        let mut sb = Sandbox::new(&state);
+        let key = sell_offer_on_new_token(&mut sb, seller, 1, serde_json::json!({}));
+        let tx = accept_tx(other, "NFTokenBuyOffer", &key);
+        assert_eq!(NFTokenAcceptOfferTransactor.preclaim(&tx, &sb), TxResult::NftokenOfferTypeMismatch);
+    }
+
+    /// Preclaim's verdicts come before do_apply's expired-offer deletion: an expired offer accepted by someone
+    /// other than its Destination is tecNO_PERMISSION, and the offer stays.
+    #[test]
+    fn an_expired_offer_accepted_by_a_non_destination_is_no_permission_and_stays() {
+        let (seller, other, dest) = ([0x37u8; 20], [0x38u8; 20], [0x39u8; 20]);
+        let state = make_state(&[(seller, 1_000_000_000), (other, 1_000_000_000), (dest, 1_000_000_000)]);
+        let mut sb = Sandbox::new(&state);
+        let key = sell_offer_on_new_token(
+            &mut sb,
+            seller,
+            1,
+            serde_json::json!({"Destination": hex::encode(dest), "Expiration": 5}),
+        );
+        let tx = accept_tx(other, "NFTokenSellOffer", &key);
+        assert_eq!(NFTokenAcceptOfferTransactor.preclaim(&tx, &sb), TxResult::NoPermission);
+        assert!(sb.read(&key).is_some(), "preclaim deletes nothing");
     }
 
     #[test]

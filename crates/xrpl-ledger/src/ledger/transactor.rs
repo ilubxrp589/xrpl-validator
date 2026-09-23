@@ -112,6 +112,9 @@ pub enum TxResult {
     /// Brokered NFT accept: the two offers name different tokens or assets,
     /// or the broker fee is in another asset — tecNFTOKEN_BUY_SELL_MISMATCH.
     NftokenBuySellMismatch,
+    /// tecNFTOKEN_OFFER_TYPE_MISMATCH — an NFTokenAcceptOffer names a buy offer as
+    /// its sell offer or the reverse (NFTokenAcceptOffer.cpp:171, :230).
+    NftokenOfferTypeMismatch,
     /// An AMM pool cannot cover the requested amount, or the account holds no
     /// LP tokens in it.
     AmmBalance,
@@ -329,6 +332,7 @@ impl TxResult {
             | TxResult::InsufficientFunds
             | TxResult::InsufficientPayment
             | TxResult::NftokenBuySellMismatch
+            | TxResult::NftokenOfferTypeMismatch
             | TxResult::AmmBalance
             | TxResult::AmmInvalidTokens
             | TxResult::AmmEmpty
@@ -409,6 +413,7 @@ impl TxResult {
             TxResult::InsufficientFunds => "tecINSUFFICIENT_FUNDS",
             TxResult::InsufficientPayment => "tecINSUFFICIENT_PAYMENT",
             TxResult::NftokenBuySellMismatch => "tecNFTOKEN_BUY_SELL_MISMATCH",
+            TxResult::NftokenOfferTypeMismatch => "tecNFTOKEN_OFFER_TYPE_MISMATCH",
             TxResult::AmmBalance => "tecAMM_BALANCE",
             TxResult::AmmInvalidTokens => "tecAMM_INVALID_TOKENS",
             TxResult::AmmEmpty => "tecAMM_EMPTY",

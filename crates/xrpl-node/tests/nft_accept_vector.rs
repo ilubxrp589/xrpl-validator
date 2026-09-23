@@ -386,3 +386,12 @@ fn nft_c13_mint_with_issuer_by_a_non_minter_is_tec_no_permission_6ca753295790() 
 fn nft_c13_accept_of_an_expired_offer_is_tec_expired_ecf3f4863cb3() {
     run_bundle(include_str!("vectors/nft_c13_accept_of_an_expired_offer_is_tec_expired_ECF3F4863CB3.json"));
 }
+
+/// Finding 397 (soak #26 receipt, mainnet #107190696 072B81D6348C): a direct accept of a sell offer whose
+/// Destination names another account, by an acceptor who is also short of the price, is tecNO_PERMISSION —
+/// rippled's preclaim tests the Destination before the funds (NFTokenAcceptOffer.cpp:239-263). We answered
+/// tecINSUFFICIENT_FUNDS: the funds test ran in preclaim, the Destination test only in do_apply.
+#[test]
+fn nftaccept_destination_before_funds_107190696() {
+    run_bundle(include_str!("vectors/nftaccept_destination_before_funds_107190696.json"));
+}
