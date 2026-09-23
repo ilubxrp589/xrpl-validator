@@ -845,6 +845,28 @@ def main():
         except Exception:
             pass
 
+    # Campaign 16: AMMCreate names its pair through Amount/Amount2, not
+    # Asset/Asset2, so neither AMM block here fetches the pool. A tecDUPLICATE
+    # is fee-only — its meta never names the existing pool — yet preclaim
+    # reads it FIRST (AMMCreate.cpp:100-105 `ctx.view.read(ammKeylet)`). Without
+    # it the probe walks on to the funding checks (testnet 20976145 8A61CF0C:
+    # ours tecUNFUNDED_AMM, network tecDUPLICATE).
+    if tx.get("TransactionType") == "AMMCreate" and tx.get("Amount") is not None and tx.get("Amount2") is not None:
+        try:
+            def ap3(v):
+                if isinstance(v, str):
+                    return {"currency": "XRP"}
+                if "mpt_issuance_id" in v:
+                    return {"mpt_issuance_id": v["mpt_issuance_id"]}
+                return {"currency": v["currency"], "issuer": v["issuer"]}
+            r = rpc("ledger_entry", {"amm": {"asset": ap3(tx["Amount"]), "asset2": ap3(tx["Amount2"])},
+                                     "ledger_index": seq - 1, "binary": True})
+            idx = (r.get("index") or "").upper()
+            if r.get("node_binary") and idx and idx not in pre:
+                pre[idx] = r["node_binary"]
+        except Exception as e:
+            print(f"note: AMMCreate pool: {e}", file=sys.stderr)
+
     # Asset/Asset2 transactors (AMMBid/Vote/Deposit/Withdraw/Delete) read the
     # AMM object, the bidder/voter's LP line and every slot-holder's LP line —
     # none of which a tec's meta shows (it touches only the fee). The F49
@@ -908,6 +930,44 @@ def main():
             accts.add(v["issuer"])
         except Exception:
             pass
+
+    # Campaign 16: a fee-only tec Payment (tecPATH_PARTIAL through a frozen
+    # pool, testnet 20976340 092BB64D2C93) names only the sender's root in its
+    # meta, yet strand construction READS the last DirectStep's line — the
+    # destination's line with the Amount issuer (DirectStepI::check). Without
+    # it toStrand answers terNO_LINE and the probe says tecPATH_DRY.
+    if tx.get("TransactionType") == "Payment" and tx.get("Destination"):
+        v = tx.get("Amount")
+        if isinstance(v, dict) and v.get("issuer") and v.get("currency") and v["issuer"] != tx["Destination"]:
+            try:
+                rr = rpc("ledger_entry", {"ripple_state": {"currency": v["currency"], "accounts": [tx["Destination"], v["issuer"]]},
+                                          "ledger_index": seq - 1, "binary": True})
+                li = (rr.get("index") or "").upper()
+                if rr.get("node_binary") and li and li not in pre:
+                    pre[li] = rr["node_binary"]
+            except Exception as e:
+                print(f"note: destination line: {e}", file=sys.stderr)
+
+    # Campaign 16: AMMDeposit/AMMWithdraw run their freeze/auth checks on BOTH
+    # pool assets (fixCleanup3_3_0: AMMDeposit.cpp:259-283 checkDepositFreeze;
+    # AMMWithdraw.cpp:307-313 checkWithdrawFreeze for tfLPToken/tfWithdrawAll),
+    # so the account's line for an asset the tx names only in Asset/Asset2 is
+    # READ. A fee-only tecFROZEN never names it (testnet 20976309 6CF8257C40B0:
+    # XRP deposit refused for the depositor's frozen USD line).
+    if tx.get("TransactionType") in ("AMMDeposit", "AMMWithdraw"):
+        for f_ in ("Asset", "Asset2"):
+            v = tx.get(f_)
+            if not isinstance(v, dict) or not v.get("issuer") or v.get("currency") in (None, "XRP") or v["issuer"] == tx["Account"]:
+                continue
+            try:
+                rr = rpc("ledger_entry", {"ripple_state": {"currency": v["currency"], "accounts": [tx["Account"], v["issuer"]]},
+                                          "ledger_index": seq - 1, "binary": True})
+                li = (rr.get("index") or "").upper()
+                if rr.get("node_binary") and li and li not in pre:
+                    pre[li] = rr["node_binary"]
+                accts.add(v["issuer"])
+            except Exception as e:
+                print(f"note: pool-asset line: {e}", file=sys.stderr)
 
     # An OfferCreate READS book heads it never writes: the direct book's tip
     # prices strand admission (multi-strand vs single), and the two XRP

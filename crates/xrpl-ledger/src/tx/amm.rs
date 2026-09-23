@@ -726,6 +726,367 @@ fn equal_withdraw_limit(
     None
 }
 
+// ─── Campaign 16 (testnet, rippled 3.4.0): structural ports ───
+//
+// Findings 383-388. Each helper below is the rippled function it names,
+// translated line for line: the same operation order, the same `Number`
+// rounding modes, the same result codes in the same order, on the SIGNED
+// `Number` port (`tx::number`). The unsigned `n_*` helpers of `amm_swap`
+// clamp a negative intermediate to zero, which is exactly how finding 384
+// died — `singleDepositEPrice`'s `c1` is negative in every binding case.
+// fixAMMv1_3 is taken as enabled, as everywhere else in this file (mainnet
+// and testnet both run it).
+
+use crate::tx::number::{Number, NumberError, Rounding};
+
+/// A `Number` throw inside AMMDeposit/AMMWithdraw `applyGuts` is caught as
+/// `std::runtime_error` and answered tecAMM_FAILED (the fixCleanup3_4_0
+/// arm; before it the exception escapes as tefEXCEPTION, which no ledger
+/// records). Only degenerate inputs reach it.
+fn nerr(_: NumberError) -> TxResult {
+    TxResult::AmmFailed
+}
+
+/// `Number{STAmount}` of a non-negative engine amount (XRP counts in drops,
+/// as `XRPAmount`'s conversion does).
+fn num(m: ox::Me) -> Result<Number, NumberError> {
+    Number::from_parts(false, m.0, m.1, Rounding::ToNearest)
+}
+
+/// `Number{rep}` of a small integer constant.
+fn num_i(v: i64) -> Number {
+    Number::new(v, 0, Rounding::ToNearest).unwrap_or(Number::ZERO)
+}
+
+/// The engine magnitude of a `Number` (callers have ruled out negatives).
+fn me_of(n: Number) -> ox::Me {
+    if n.is_zero() || n.negative {
+        (0, 0)
+    } else {
+        (n.mantissa as u128, n.exponent)
+    }
+}
+
+/// An asset amount back in the engine's shape: whole drops at exponent 0
+/// for XRP (the Number is already integral, `to_st_amount`), else `me_of`.
+fn me_amount(n: Number, xrp: bool) -> ox::Me {
+    if !xrp {
+        return me_of(n);
+    }
+    match n.to_drops(Rounding::ToNearest) {
+        Ok(d) if d > 0 => (d as u128, 0),
+        _ => (0, 0),
+    }
+}
+
+/// `Number`'s ordering (`operator<`): sign, then exponent, then mantissa.
+fn ncmp(a: Number, b: Number) -> std::cmp::Ordering {
+    let sign = |n: Number| if n.is_zero() { 0 } else if n.negative { -1 } else { 1 };
+    let (sa, sb) = (sign(a), sign(b));
+    if sa != sb || sa == 0 {
+        return sa.cmp(&sb);
+    }
+    let mag = (a.exponent, a.mantissa).cmp(&(b.exponent, b.mantissa));
+    if sa > 0 { mag } else { mag.reverse() }
+}
+
+/// `getFee(tfee)` = `Number{tfee} / kAuctionSlotFeeScaleFactor` (AMMCore.h:88-92).
+fn get_fee(tfee: u16) -> Result<Number, NumberError> {
+    num_i(i64::from(tfee)).div(num_i(100_000), Rounding::ToNearest)
+}
+
+/// `feeMult(tfee)` = `1 - getFee(tfee)` (AMMCore.h:109-113).
+fn fee_mult(tfee: u16) -> Result<Number, NumberError> {
+    num_i(1).sub(get_fee(tfee)?, Rounding::ToNearest)
+}
+
+/// `feeMultHalf(tfee)` = `1 - getFee(tfee) / 2` (AMMCore.h:119-123).
+fn fee_mult_half(tfee: u16) -> Result<Number, NumberError> {
+    let r = Rounding::ToNearest;
+    num_i(1).sub(get_fee(tfee)?.div(num_i(2), r)?, r)
+}
+
+/// `solveQuadraticEq(a, b, c)` = `(-b + root2(b * b - 4 * a * c)) / (2 * a)`
+/// (AMMHelpers.cpp:269-273).
+fn solve_quadratic_eq(a: Number, b: Number, c: Number) -> Result<Number, NumberError> {
+    let r = Rounding::ToNearest;
+    let disc = b.mul(b, r)?.sub(num_i(4).mul(a, r)?.mul(c, r)?, r)?;
+    b.negated().add(disc.root2(r)?, r)?.div(num_i(2).mul(a, r)?, r)
+}
+
+/// `toSTAmount(asset, n, rm)` (AmountConversions.h:152-183): an IOU keeps the
+/// `Number`; XRP becomes whole drops through `operator rep()` under `rm`.
+fn to_st_amount(n: Number, rm: Rounding, xrp: bool) -> Result<Number, NumberError> {
+    if xrp {
+        Number::new(n.to_drops(rm)?, 0, rm)
+    } else {
+        Ok(n)
+    }
+}
+
+/// `multiply(amount, frac, rm)` (AMMHelpers.cpp:292-298): the product under
+/// `rm`, then `toSTAmount` under `rm`.
+fn multiply_n(amount: Number, frac: Number, rm: Rounding, xrp: bool) -> Result<Number, NumberError> {
+    to_st_amount(amount.mul(frac, rm)?, rm, xrp)
+}
+
+/// `adjustLPTokens(lptAMMBalance, lpTokens, isDeposit)` (AMMHelpers.cpp:
+/// 181-190), signed: `(lpt + t) - lpt` on a deposit, `(t - lpt) + lpt` on a
+/// withdrawal, both under Downward.
+fn adjust_lp_tokens_n(lpt: Number, tokens: Number, deposit: bool) -> Result<Number, NumberError> {
+    let d = Rounding::Downward;
+    if deposit {
+        lpt.add(tokens, d)?.sub(lpt, d)
+    } else {
+        tokens.sub(lpt, d)?.add(lpt, d)
+    }
+}
+
+/// Finding 383 — rippled `AMMDeposit::equalDepositTokens` (AMMDeposit.cpp:
+/// 709-751), the tfLPToken sizing: the ADJUSTED tokens decide a fraction of
+/// the pool and both assets are deposited in that proportion.
+///
+///   tokensAdj = adjustLPTokensOut(lpt, LPTokenOut)          (== 0 → tecAMM_INVALID_TOKENS)
+///   frac      = divide(tokensAdj, lpt, lpt.asset())         (STAmount divide: `st_divide_legacy`)
+///   amount_i  = getRoundedAsset(balance_i, frac, IsDeposit::Yes) = multiply(balance_i, frac, upward)
+///
+/// We moved the transaction's Amount/Amount2 verbatim (they are only
+/// MINIMA here) or nothing at all while minting LPTokenOut. Testnet 2-5
+/// (5C9A096BB7B3, LPTokenOut 333.333 alone): the network deposits 169996
+/// drops and 0.6537074068943435 USD.
+fn equal_deposit_tokens(
+    amount_balance: ox::Me,
+    amount2_balance: ox::Me,
+    lpt: ox::Me,
+    lp_tokens: ox::Me,
+    xrp: bool,
+    xrp2: bool,
+) -> Result<(ox::Me, ox::Me, ox::Me), TxResult> {
+    let tokens_adj = crate::tx::amm_swap::adjust_lp_tokens_out(lpt, lp_tokens);
+    if tokens_adj.0 == 0 {
+        return Err(TxResult::AmmInvalidTokens);
+    }
+    let frac = ox::st_divide_legacy(tokens_adj, lpt);
+    let amount = mul_directed(amount_balance, frac, true, xrp);
+    let amount2 = mul_directed(amount2_balance, frac, true, xrp2);
+    Ok((amount, amount2, tokens_adj))
+}
+
+/// Finding 384 — the solving half of rippled `AMMDeposit::singleDepositEPrice`
+/// (AMMDeposit.cpp:1016-1068), reached when the full Amount would buy LP
+/// tokens above EPrice (or Amount is zero): the deposit whose effective price
+/// is exactly EPrice.
+///
+///   f1 = feeMult(tfee), f2 = feeMultHalf(tfee) / f1
+///   c  = f1 * B / (E * T),  d = f1 + c*f2 - c
+///   a1 = c*c,  b1 = c*c*f2*f2 + 2*c - d*d,  c1 = 2*c*f2*f2 + 1 - 2*d*f2
+///   amountDeposit = multiply(B, f1 * solveQuadraticEq(a1, b1, c1), upward)
+///   tokens        = adjustLPTokens(T, amountDeposit / E under downward)
+///   (tokensAdj, amountDepositAdj) = adjustAssetInByTokens(...)
+///
+/// `c1` is NEGATIVE whenever EPrice binds (−0.00596 on testnet 2-11
+/// 39255C5387B6); the old unsigned `n_sub` clamped it — and the
+/// discriminant with it — to zero, found no root and refused
+/// tecAMM_INVALID_TOKENS where the network deposited 811628 drops.
+/// Returns (amountDepositAdj, tokensAdj) for `deposit()`, or the verdict.
+fn single_deposit_eprice_solve(
+    amount_balance: ox::Me,
+    lpt: ox::Me,
+    eprice: ox::Me,
+    tfee: u16,
+    xrp: bool,
+) -> Result<(ox::Me, ox::Me), TxResult> {
+    let r = Rounding::ToNearest;
+    let (b, t, e) = (num(amount_balance).map_err(nerr)?, num(lpt).map_err(nerr)?, num(eprice).map_err(nerr)?);
+    let solved = (|| -> Result<Number, NumberError> {
+        let f1 = fee_mult(tfee)?;
+        let f2 = fee_mult_half(tfee)?.div(f1, r)?;
+        let c = f1.mul(b, r)?.div(e.mul(t, r)?, r)?;
+        let d = f1.add(c.mul(f2, r)?, r)?.sub(c, r)?;
+        let a1 = c.mul(c, r)?;
+        let b1 = c.mul(c, r)?.mul(f2, r)?.mul(f2, r)?.add(num_i(2).mul(c, r)?, r)?.sub(d.mul(d, r)?, r)?;
+        let c1 = num_i(2)
+            .mul(c, r)?
+            .mul(f2, r)?
+            .mul(f2, r)?
+            .add(num_i(1), r)?
+            .sub(num_i(2).mul(d, r)?.mul(f2, r)?, r)?;
+        // amtProdCb, evaluated before `multiply` installs its guard.
+        let frac = f1.mul(solve_quadratic_eq(a1, b1, c1)?, r)?;
+        // getRoundedAsset(IsDeposit::Yes) = multiply(balance, frac, upward).
+        multiply_n(b, frac, Rounding::Upward, xrp)
+    })()
+    .map_err(nerr)?;
+    if ncmp(solved, Number::ZERO) != std::cmp::Ordering::Greater {
+        return Err(TxResult::AmmFailed);
+    }
+    let amount_deposit = me_amount(solved, xrp);
+    // getRoundedLPTokens(IsDeposit::Yes): tokProdCb = amountDeposit / ePrice
+    // under the Downward guard, toSTAmount (an IOU keeps the Number), then
+    // adjustLPTokens. (Zero tokens come back from adjustAssetInByTokens as
+    // zero, the tecAMM_INVALID_TOKENS below.)
+    let tokens = solved.div(e, Rounding::Downward).map_err(nerr)?;
+    let tokens = adjust_lp_tokens_n(t, tokens, true).map_err(nerr)?;
+    let (tokens_adj, amount_deposit_adj) = crate::tx::amm_swap::adjust_asset_in_by_tokens(
+        amount_balance,
+        amount_deposit,
+        lpt,
+        me_of(tokens),
+        tfee,
+        xrp,
+    );
+    if tokens_adj.0 == 0 {
+        return Err(TxResult::AmmInvalidTokens);
+    }
+    Ok((amount_deposit_adj, tokens_adj))
+}
+
+/// Finding 388 — rippled `AMMWithdraw::singleWithdrawEPrice` (AMMWithdraw.cpp:
+/// 1196-1255), the tfLimitLPToken withdrawal. With E the LP-token price of
+/// one unit of the asset (t = a·E):
+///
+///   ae    = A * E,  f = getFee(tfee),  denom = T*f - ae   (fixCleanup3_3_0: 0 → tecAMM_FAILED)
+///   tokensAdj = adjustLPTokens(T, multiply(T, (T + ae*(f - 2)) / denom, upward), No)
+///   amount    = tokensAdj / E under downward (whole drops, rounded down, for XRP)
+///   tokensAdj <= 0 → tecAMM_INVALID_TOKENS; 0 < amount < Amount → tecAMM_FAILED
+///
+/// The mode fell into our tfSingleAsset arm and paid out the Amount
+/// verbatim — testnet 7-19 (8626B1D3935D) took 0.05 EUR where the network
+/// pays 0.9107238298330052 EUR for 0.50386203133886 LP. Returns (amount,
+/// tokensAdj) for `withdraw()`, which still judges the burn against the
+/// LP's holding (7-8 24F48BDDD861: 563.9 LP of 556.7 held,
+/// tecAMM_INVALID_TOKENS).
+#[allow(clippy::too_many_arguments)]
+fn single_withdraw_eprice(
+    amount_balance: ox::Me,
+    lpt: ox::Me,
+    amount: ox::Me,
+    eprice: ox::Me,
+    tfee: u16,
+    xrp: bool,
+    fix330: bool,
+) -> Result<(ox::Me, ox::Me), TxResult> {
+    let r = Rounding::ToNearest;
+    let (a, t, e) = (num(amount_balance).map_err(nerr)?, num(lpt).map_err(nerr)?, num(eprice).map_err(nerr)?);
+    let ae = a.mul(e, r).map_err(nerr)?;
+    let f = get_fee(tfee).map_err(nerr)?;
+    let denom = t.mul(f, r).and_then(|tf| tf.sub(ae, r)).map_err(nerr)?;
+    if fix330 && denom.is_zero() {
+        return Err(TxResult::AmmFailed);
+    }
+    let tokens_adj = (|| -> Result<Number, NumberError> {
+        // tokProdCb, evaluated before `multiply` installs its guard.
+        let prod = t.add(ae.mul(f.sub(num_i(2), r)?, r)?, r)?.div(denom, r)?;
+        // getRoundedLPTokens(IsDeposit::No) = adjustLPTokens(T, multiply(T, prod, upward), No).
+        adjust_lp_tokens_n(t, multiply_n(t, prod, Rounding::Upward, false)?, false)
+    })()
+    .map_err(nerr)?;
+    if ncmp(tokens_adj, Number::ZERO) != std::cmp::Ordering::Greater {
+        return Err(TxResult::AmmInvalidTokens);
+    }
+    // getRoundedAsset(IsDeposit::No): amtProdCb under the Downward guard.
+    let amount_withdraw = tokens_adj
+        .div(e, Rounding::Downward)
+        .and_then(|q| to_st_amount(q, Rounding::Downward, xrp))
+        .map_err(nerr)?;
+    let amount_withdraw = me_amount(amount_withdraw, xrp);
+    if amount.0 == 0 || ox::me_cmp(amount_withdraw, amount).is_ge() {
+        return Ok((amount_withdraw, me_of(tokens_adj)));
+    }
+    Err(TxResult::AmmFailed)
+}
+
+/// rippled `checkWithdrawFreeze(view, pseudoAcct, submitterAcct, dstAcct,
+/// asset)` (TokenHelpers.cpp:160-216), the IOU arm (XRP freezes nothing):
+/// funds can always go to the issuer; otherwise the issuer's global freeze,
+/// the POOL's individual freeze, the submitter's individual freeze (only
+/// when it is not the destination — a plain freeze does not block a
+/// self-withdrawal) and finally the DESTINATION's deep freeze each refuse
+/// tecFROZEN. Finding 386: we checked the pool's line alone, so a deep-frozen
+/// withdrawer took its USD out (testnet 6-6 935F0BA9D554).
+fn check_withdraw_freeze(
+    sandbox: &Sandbox,
+    pseudo: &[u8; 20],
+    submitter: &[u8; 20],
+    dst: &[u8; 20],
+    leg: &ox::Leg,
+) -> TxResult {
+    const LSF_GLOBAL_FREEZE: u64 = 0x0040_0000;
+    const LSF_LOW_FREEZE: u64 = 0x0040_0000;
+    const LSF_HIGH_FREEZE: u64 = 0x0080_0000;
+    const LSF_LOW_DEEP_FREEZE: u64 = 0x0200_0000;
+    const LSF_HIGH_DEEP_FREEZE: u64 = 0x0400_0000;
+    if leg.xrp || dst == &leg.issuer {
+        return TxResult::Success;
+    }
+    let line_flags = |who: &[u8; 20]| {
+        ox::json_at(sandbox, &keylet::ripple_state_key(who, &leg.issuer, &leg.cur))
+            .map(|l| l["Flags"].as_u64().unwrap_or(0))
+    };
+    // isIndividualFrozen: the ISSUER's side of `who`'s line carries the bit.
+    let individually_frozen = |who: &[u8; 20]| {
+        who != &leg.issuer
+            && line_flags(who).is_some_and(|f| {
+                f & (if &leg.issuer > who { LSF_HIGH_FREEZE } else { LSF_LOW_FREEZE }) != 0
+            })
+    };
+    // checkGlobalFrozen
+    if ox::json_at(sandbox, &keylet::account_root_key(&leg.issuer))
+        .is_some_and(|a| a["Flags"].as_u64().unwrap_or(0) & LSF_GLOBAL_FREEZE != 0)
+    {
+        return TxResult::Frozen;
+    }
+    if individually_frozen(pseudo) {
+        return TxResult::Frozen;
+    }
+    if submitter != dst && individually_frozen(submitter) {
+        return TxResult::Frozen;
+    }
+    // checkDeepFrozen: either side's deep-freeze bit on the destination's line.
+    if dst != &leg.issuer
+        && line_flags(dst).is_some_and(|f| f & (LSF_LOW_DEEP_FREEZE | LSF_HIGH_DEEP_FREEZE) != 0)
+    {
+        return TxResult::Frozen;
+    }
+    TxResult::Success
+}
+
+/// rippled `AMMDeposit::deposit` (AMMDeposit.cpp:564-692) under fixAMMv1_3,
+/// where `adjustAmountsByLPTokens` hands the amounts back unchanged:
+/// adjusted tokens of zero are tecAMM_INVALID_TOKENS; any actual amount
+/// below its minimum (or the tokens below theirs) is tecAMM_FAILED before
+/// anything moves; then each amount is funded (`checkBalance`, the same
+/// test as preclaim's but on the ACTUAL amount and the post-fee balance)
+/// and sent, in order. The LP-token leg is minted by the caller.
+fn deposit_core(
+    sandbox: &mut Sandbox,
+    tx: &TxFields,
+    amm_acct: &[u8; 20],
+    lp_leg: &ox::Leg,
+    deposits: &[(ox::Leg, ox::Me, Option<ox::Me>)],
+    tokens: ox::Me,
+    tokens_min: Option<ox::Me>,
+) -> Result<(), TxResult> {
+    if tokens.0 == 0 {
+        return Err(TxResult::AmmInvalidTokens);
+    }
+    if deposits.iter().any(|(_, amt, min)| min.is_some_and(|m| ox::me_cmp(*amt, m).is_lt()))
+        || tokens_min.is_some_and(|m| ox::me_cmp(tokens, m).is_lt())
+    {
+        return Err(TxResult::AmmFailed);
+    }
+    for (leg, amt, _) in deposits {
+        if amt.0 == 0 {
+            return Err(TxResult::BadAmount);
+        }
+        if !deposit_leg_funded(sandbox, &tx.account, leg, *amt, amm_acct, &lp_leg.cur) {
+            return Err(TxResult::UnfundedAmm);
+        }
+        ox::move_leg(sandbox, &tx.account, amm_acct, leg, *amt);
+    }
+    Ok(())
+}
+
 // ─── AMMDeposit ───
 
 /// One leg of rippled's AMMDeposit funds test — the `balance` lambda in
@@ -835,11 +1196,37 @@ impl Transactor for AMMDepositTransactor {
         let acct_key = keylet::account_root_key(&tx.account);
         if !sandbox.exists(&acct_key) { return TxResult::NoAccount; }
         // Check AMM exists
-        match amm_key_from_asset_fields(tx) {
+        let amm_key = match amm_key_from_asset_fields(tx) {
             Some(key) => {
                 if !sandbox.exists(&key) { return TxResult::NoEntry; }
+                key
             }
             None => return TxResult::Malformed,
+        };
+        const TF_LP_TOKEN: u64 = 0x0001_0000;
+        const TF_TWO_ASSET_IF_EMPTY: u64 = 0x0080_0000;
+        let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+        // Finding 385 — the pool's emptiness is judged FIRST, straight off
+        // `ammHolds` (AMMDeposit.cpp:188-224): tfTwoAssetIfEmpty into a pool
+        // with LP tokens outstanding is tecAMM_NOT_EMPTY, and every other
+        // mode into an emptied pool is tecAMM_EMPTY — before any auth,
+        // freeze or funds check. Testnet 2-13 7949F6C5FC6B / 2-14
+        // 49F7207A646F: 1 XRP + 1 USD (and an unfunded 900 + 900) into the
+        // live P1 — the network answers tecAMM_NOT_EMPTY, we deposited the
+        // first and called the second tecUNFUNDED_AMM.
+        // (An object without the soeREQUIRED LPTokenBalance is a synthetic
+        // fixture, never a ledger; it is judged as before.)
+        let lpt = ox::json_at(sandbox, &amm_key)
+            .and_then(|o| o["LPTokenBalance"]["value"].as_str().map(str::to_string))
+            .and_then(|s| keylet::amount_mant_exp(&serde_json::Value::String(s)));
+        if let Some(lpt) = lpt {
+            if flags & TF_TWO_ASSET_IF_EMPTY != 0 {
+                if lpt.0 != 0 {
+                    return TxResult::AmmNotEmpty;
+                }
+            } else if lpt.0 == 0 {
+                return TxResult::AmmEmpty;
+            }
         }
         // featureAMMClawback (AMMDeposit.cpp:255-283): BOTH pool assets pass
         // requireAuth(WeakAuth) then checkFrozen for the depositor, before
@@ -882,9 +1269,14 @@ impl Transactor for AMMDepositTransactor {
         // 490.5611178 RLUSD deposit with NO RLUSD line and a permissive
         // issuer — mainnet tecUNFUNDED_AMM, we claimed tecNO_LINE. Fee-only
         // either way; a ter-mismatch receipt.
-        for f in ["Amount", "Amount2"] {
-            let Some(leg) = tx.fields.get(f).and_then(ox::leg_of) else { continue };
-            if let Some(t) = ox::require_auth_ter(sandbox, &leg, &tx.account, false) {
+        let lp_token_mode = flags & TF_LP_TOKEN != 0;
+        let amm_parts = amm_ctx(tx, sandbox);
+        // rippled's `checkAmount(amount, checkBalance)` lambda
+        // (AMMDeposit.cpp:316-362), one amount at a time: requireAuth, the
+        // pre-fixCleanup3_3_0 pool freeze, then the funds test — for Amount
+        // wholly before Amount2, as rippled calls it.
+        let check_amount = |leg: &ox::Leg, amt: Option<ox::Me>| -> TxResult {
+            if let Some(t) = ox::require_auth_ter(sandbox, leg, &tx.account, false) {
                 if t != TxResult::Success { return t; }
             }
             // AMMDeposit.cpp:330-346 `checkAmount`, while fixCleanup3_3_0 is
@@ -898,65 +1290,82 @@ impl Transactor for AMMDepositTransactor {
             // checkIndividualFrozen that follows it is subsumed by the Asset
             // loop above.
             if !fix330 {
-                if let Some((_, amm_acct, _)) = amm_ctx(tx, sandbox) {
-                    if let Some(t) = ox::frozen_ter(sandbox, &leg, &amm_acct) {
+                if let Some((_, amm_acct, _)) = amm_parts.as_ref() {
+                    if let Some(t) = ox::frozen_ter(sandbox, leg, amm_acct) {
                         if t != TxResult::Success { return t; }
                     }
                 }
             }
-        }
-        // The depositor must be able to FUND an XRP side, and rippled measures
-        // that against the reserve it will owe AFTER the deposit: `xrpLiquid`
-        // is taken with the owner count bumped by one when the depositor has no
-        // LPToken line yet, because the deposit is about to open one
-        // (AMMDeposit.cpp:230-244 `balance`). Falling short is tecUNFUNDED_AMM
-        // when that line already exists and tecINSUF_RESERVE_LINE when it does
-        // not — the shortfall is a missing reserve, not missing funds.
-        //
-        // This is a different rule from the reserve guard in do_apply below,
-        // which only asks whether the depositor clears the reserve at all.
-        // #105893158 85C32164 deposits 446527 drops holding 5646527 at
-        // OwnerCount 21: the reserve guard passes (liquid 246527 > 0) but the
-        // deposit needs 446527, and with no LP line mainnet claims the fee and
-        // returns tecINSUF_RESERVE_LINE.
-        if let Some((_, amm_acct, lp_leg)) = amm_ctx(tx, sandbox) {
+            // The depositor must be able to FUND an XRP side, and rippled measures
+            // that against the reserve it will owe AFTER the deposit: `xrpLiquid`
+            // is taken with the owner count bumped by one when the depositor has no
+            // LPToken line yet, because the deposit is about to open one
+            // (AMMDeposit.cpp:230-244 `balance`). Falling short is tecUNFUNDED_AMM
+            // when that line already exists and tecINSUF_RESERVE_LINE when it does
+            // not — the shortfall is a missing reserve, not missing funds.
+            //
+            // This is a different rule from the reserve guard in do_apply below,
+            // which only asks whether the depositor clears the reserve at all.
+            // #105893158 85C32164 deposits 446527 drops holding 5646527 at
+            // OwnerCount 21: the reserve guard passes (liquid 246527 > 0) but the
+            // deposit needs 446527, and with no LP line mainnet claims the fee and
+            // returns tecINSUF_RESERVE_LINE.
+            let (Some(amt), Some((_, amm_acct, lp_leg))) = (amt, amm_parts.as_ref()) else {
+                return TxResult::Success;
+            };
+            if amt.0 == 0 {
+                return TxResult::Success;
+            }
             let lp_line_exists =
-                sandbox.exists(&keylet::ripple_state_key(&tx.account, &amm_acct, &lp_leg.cur));
-            let adj = u64::from(!lp_line_exists);
+                sandbox.exists(&keylet::ripple_state_key(&tx.account, amm_acct, &lp_leg.cur));
+            if !leg.xrp {
+                // The IOU arm of the same `balance` lambda
+                // (AMMDeposit.cpp:245-252): accountFunds under
+                // IgnoreFreeze must cover the STATED amount, else
+                // tecUNFUNDED_AMM — no INSUF_RESERVE_LINE split on this
+                // side, that verdict is the XRP branch's alone.
+                if !deposit_leg_funded(sandbox, &tx.account, leg, amt, amm_acct, &lp_leg.cur) {
+                    return TxResult::UnfundedAmm;
+                }
+                return TxResult::Success;
+            }
+            let Some(acct) = ox::json_at(sandbox, &acct_key) else { return TxResult::Success };
+            let oc = acct["OwnerCount"].as_u64().unwrap_or(0);
+            let bal = acct["Balance"].as_str().and_then(|s| s.parse::<u128>().ok()).unwrap_or(0);
+            let liquid = bal.saturating_sub(
+                crate::ledger::fees::account_reserve(sandbox, oc + u64::from(!lp_line_exists)) as u128,
+            );
+            if liquid < ox::me_rescale(amt, 0, false) {
+                return if lp_line_exists { TxResult::UnfundedAmm } else { TxResult::InsufReserveLine };
+            }
+            TxResult::Success
+        };
+        // Finding 383 — under tfLPToken Amount/Amount2 are deposit MINIMA,
+        // so `checkAmount` runs on the two POOL balances instead, with
+        // `checkBalance = false` (AMMDeposit.cpp:364-378): the same auth and
+        // (pre-fixCleanup3_3_0) freeze tests, never a funds test — the
+        // actual deposit is funded in deposit(). Testnet 2-6 F5A5214E7BE6
+        // names a 50 USD minimum against 48.11 USD held: the network sizes
+        // 0.196 USD and answers tecAMM_FAILED, where funding the minimum here
+        // said tecUNFUNDED_AMM.
+        if lp_token_mode {
+            // amountBalance / amount2Balance: `ammHolds(view, ammSle,
+            // nullopt, nullopt, ...)`, i.e. the pool object's Asset/Asset2
+            // order.
+            let pool = ox::json_at(sandbox, &amm_key);
+            for f in ["Asset", "Asset2"] {
+                let Some(leg) = pool.as_ref().and_then(|o| o.get(f)).and_then(asset_leg) else { continue };
+                let t = check_amount(&leg, None);
+                if t != TxResult::Success { return t; }
+            }
+        } else {
             for f in ["Amount", "Amount2"] {
                 let Some(v) = tx.fields.get(f) else { continue };
                 let (Some(leg), Some(amt)) = (ox::leg_of(v), keylet::amount_mant_exp(v)) else {
                     continue;
                 };
-                if amt.0 == 0 {
-                    continue;
-                }
-                if !leg.xrp {
-                    // The IOU arm of the same `balance` lambda
-                    // (AMMDeposit.cpp:245-252): accountFunds under
-                    // IgnoreFreeze must cover the STATED amount, else
-                    // tecUNFUNDED_AMM — no INSUF_RESERVE_LINE split on this
-                    // side, that verdict is the XRP branch's alone.
-                    if !deposit_leg_funded(sandbox, &tx.account, &leg, amt, &amm_acct, &lp_leg.cur)
-                    {
-                        return TxResult::UnfundedAmm;
-                    }
-                    continue;
-                }
-                let Some(acct) = ox::json_at(sandbox, &acct_key) else { continue };
-                let oc = acct["OwnerCount"].as_u64().unwrap_or(0);
-                let bal = acct["Balance"].as_str().and_then(|s| s.parse::<u128>().ok()).unwrap_or(0);
-                let liquid = bal.saturating_sub(
-                    crate::ledger::fees::account_reserve(sandbox, oc + adj) as u128,
-                );
-                let want = ox::me_rescale(amt, 0, false);
-                if liquid < want {
-                    return if lp_line_exists {
-                        TxResult::UnfundedAmm
-                    } else {
-                        TxResult::InsufReserveLine
-                    };
-                }
+                let t = check_amount(&leg, Some(amt));
+                if t != TxResult::Success { return t; }
             }
         }
         TxResult::Success
@@ -994,6 +1403,69 @@ impl Transactor for AMMDepositTransactor {
                     return TxResult::InsufReserveLine;
                 }
             }
+        }
+
+        // Finding 383 — tfLPToken dispatches to `equalDepositTokens`
+        // (AMMDeposit.cpp:473-484). `ammHolds` orders the balances by the
+        // transaction's Amount/Amount2 when it names them (those are the
+        // minima, compared side by side in deposit()), else by the pool
+        // object's Asset/Asset2.
+        const TF_LP_TOKEN: u64 = 0x0001_0000;
+        if tx.fields.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & TF_LP_TOKEN != 0 {
+            let named = match (tx.fields.get("Amount"), tx.fields.get("Amount2")) {
+                (Some(a), Some(b)) => (|| {
+                    Some((
+                        (ox::leg_of(a)?, keylet::amount_mant_exp(a)?),
+                        (ox::leg_of(b)?, keylet::amount_mant_exp(b)?),
+                    ))
+                })(),
+                _ => None,
+            };
+            let ((leg1, min1), (leg2, min2)) = match named {
+                Some(((l1, m1), (l2, m2))) => ((l1, Some(m1)), (l2, Some(m2))),
+                None => {
+                    let pool = ox::json_at(sandbox, &amm_key);
+                    let pool_leg = |f: &str| pool.as_ref().and_then(|o| o.get(f)).and_then(asset_leg);
+                    let (Some(l1), Some(l2)) = (pool_leg("Asset"), pool_leg("Asset2")) else {
+                        return TxResult::Malformed;
+                    };
+                    ((l1, None), (l2, None))
+                }
+            };
+            let (Some(lpt), Some(lp_tokens)) = (
+                ox::json_at(sandbox, &amm_key)
+                    .and_then(|o| o["LPTokenBalance"]["value"].as_str().map(str::to_string))
+                    .and_then(|s| keylet::amount_mant_exp(&serde_json::Value::String(s))),
+                tx.fields.get("LPTokenOut").and_then(keylet::amount_mant_exp),
+            ) else {
+                return TxResult::Malformed;
+            };
+            let sized = equal_deposit_tokens(
+                crate::tx::amm_swap::holds(sandbox, &amm_acct, &leg1),
+                crate::tx::amm_swap::holds(sandbox, &amm_acct, &leg2),
+                lpt,
+                lp_tokens,
+                leg1.xrp,
+                leg2.xrp,
+            );
+            let (a1, a2, tokens) = match sized {
+                Ok(t) => t,
+                Err(verdict) => return verdict,
+            };
+            if let Err(verdict) = deposit_core(
+                sandbox,
+                tx,
+                &amm_acct,
+                &lp_leg,
+                &[(leg1, a1, min1), (leg2, a2, min2)],
+                tokens,
+                None,
+            ) {
+                return verdict;
+            }
+            ox::move_leg(sandbox, &amm_acct, &tx.account, &lp_leg, tokens);
+            bump_lp_balance(sandbox, &amm_key, tokens, true);
+            return TxResult::Success;
         }
 
         // tfTwoAsset: Amount and Amount2 are MAXIMA, not the amounts deposited.
@@ -1104,8 +1576,7 @@ impl Transactor for AMMDepositTransactor {
         // stated amount with tesSUCCESS — the exact live shadow catch (3 extra
         // keys, PRE-OK byte diff, ter flip). Err carries the refusal past the
         // "not a single-asset deposit" meaning of None.
-        let mut one_asset_lp_token_over = false;
-        let single_adj: Option<Result<(ox::Me, ox::Me), ()>> =
+        let single_adj: Option<Result<(ox::Me, ox::Me), TxResult>> =
             single_pre.and_then(|(pool_pre, amt)| {
                 let obj = ox::json_at(sandbox, &amm_key)?;
                 let lpt = keylet::amount_mant_exp(&serde_json::Value::String(
@@ -1117,82 +1588,75 @@ impl Transactor for AMMDepositTransactor {
                 if let Some(want_tokens) = lp_token_out {
                     let tokens_adj = crate::tx::amm_swap::adjust_lp_tokens_out(lpt, want_tokens);
                     if tokens_adj.0 == 0 {
-                        return Some(Err(()));
+                        return Some(Err(TxResult::AmmInvalidTokens));
                     }
                     let Some(amount_dep) = crate::tx::amm_swap::amm_asset_in(pool_pre, lpt, tokens_adj, tfee, xrp) else {
-                        return Some(Err(()));
+                        return Some(Err(TxResult::AmmInvalidTokens));
                     };
                     if crate::tx::amm_swap::n_cmp(amount_dep, amt) == std::cmp::Ordering::Greater {
-                        one_asset_lp_token_over = true;
-                        return Some(Err(()));
+                        return Some(Err(TxResult::AmmFailed));
                     }
                     return Some(Ok((amount_dep, tokens_adj)));
                 }
-                let t0 = crate::tx::amm_swap::adjust_lp_tokens(
-                    lpt,
-                    crate::tx::amm_swap::lp_tokens_out(pool_pre, amt, lpt, tfee),
-                    true,
-                );
-                if t0.0 == 0 {
-                    return Some(Err(()));
+                // singleDepositEPrice (AMMDeposit.cpp:971-1068) prices the
+                // full Amount first only when there IS one: `amount != 0`
+                // (an EPrice deposit may leave Amount zero, preflight's
+                // validZero); otherwise it goes straight to the solve.
+                if eprice.is_none() || amt.0 != 0 {
+                    let t0 = crate::tx::amm_swap::adjust_lp_tokens(
+                        lpt,
+                        crate::tx::amm_swap::lp_tokens_out(pool_pre, amt, lpt, tfee),
+                        true,
+                    );
+                    if t0.0 == 0 {
+                        return Some(Err(TxResult::AmmInvalidTokens));
+                    }
+                    let (tokens, deposited) = crate::tx::amm_swap::adjust_asset_in_by_tokens(
+                        pool_pre, amt, lpt, t0, tfee, xrp,
+                    );
+                    if tokens.0 == 0 || deposited.0 == 0 {
+                        return Some(Err(TxResult::AmmInvalidTokens));
+                    }
+                    let Some(ep_max) = eprice else {
+                        return Some(Ok((deposited, tokens)));
+                    };
+                    // `ep = Number{amountDepositAdj} / tokensAdj; if (ep <= ePrice)`.
+                    let ep = crate::tx::amm_swap::n_div(deposited, tokens, crate::tx::amm_swap::Rnd::Near);
+                    if crate::tx::amm_swap::n_cmp(ep, ep_max) != std::cmp::Ordering::Greater {
+                        return Some(Ok((deposited, tokens)));
+                    }
                 }
-                let (tokens, deposited) = crate::tx::amm_swap::adjust_asset_in_by_tokens(
-                    pool_pre, amt, lpt, t0, tfee, xrp,
-                );
-                if tokens.0 == 0 || deposited.0 == 0 {
-                    return Some(Err(()));
-                }
-                let Some(ep_max) = eprice else {
-                    return Some(Ok((deposited, tokens)));
-                };
-                use crate::tx::amm_swap::{n_add, n_div, n_mul, n_sqrt, n_sub, Rnd};
-                let ep = n_div(deposited, tokens, Rnd::Near);
-                if crate::tx::amm_swap::n_cmp(ep, ep_max) != std::cmp::Ordering::Greater {
-                    return Some(Ok((deposited, tokens)));
-                }
-                // Past the ceiling: the amount whose price is exactly EPrice.
-                // R = (-b1 + sqrt(b1^2 - 4*a1*c1)) / (2*a1) with
-                //   f1 = 1 - fee, f2 = (1 - fee/2) / f1, c = f1*B / (E*T),
-                //   d = f1 + c*f2 - c, a1 = c^2, b1 = (c*f2)^2 + 2c - d^2,
-                //   c1 = 2c*f2^2 + 1 - 2*d*f2   (AMMDeposit.cpp, singleDepositEPrice)
-                let one: ox::Me = (1_000_000_000_000_000, -15);
-                let fee = (tfee as u128, -5);
-                let f1 = n_sub(one, fee, Rnd::Near);
-                let f2 = n_div(n_sub(one, (tfee as u128 * 5, -6), Rnd::Near), f1, Rnd::Near);
-                let c = n_div(n_mul(f1, pool_pre, Rnd::Near), n_mul(ep_max, lpt, Rnd::Near), Rnd::Near);
-                let d = n_sub(n_add(f1, n_mul(c, f2, Rnd::Near), Rnd::Near), c, Rnd::Near);
-                let a1 = n_mul(c, c, Rnd::Near);
-                let cf2 = n_mul(c, f2, Rnd::Near);
-                let b1 = n_sub(n_add(n_mul(cf2, cf2, Rnd::Near), n_mul((2, 0), c, Rnd::Near), Rnd::Near), n_mul(d, d, Rnd::Near), Rnd::Near);
-                let c1 = n_sub(
-                    n_add(n_mul((2, 0), n_mul(c, n_mul(f2, f2, Rnd::Near), Rnd::Near), Rnd::Near), one, Rnd::Near),
-                    n_mul((2, 0), n_mul(d, f2, Rnd::Near), Rnd::Near),
-                    Rnd::Near,
-                );
-                let disc = n_sub(n_mul(b1, b1, Rnd::Near), n_mul((4, 0), n_mul(a1, c1, Rnd::Near), Rnd::Near), Rnd::Near);
-                if disc.0 == 0 && b1.0 != 0 {
-                    return Some(Err(()));
-                }
-                let r = n_div(n_sub(n_sqrt(disc), b1, Rnd::Near), n_mul((2, 0), a1, Rnd::Near), Rnd::Near);
-                // getRoundedAsset(deposit): multiply(balance, f1*R, upward)
-                let amount_dep = crate::tx::amm_swap::to_amount(n_mul(pool_pre, n_mul(f1, r, Rnd::Near), Rnd::Up), xrp, Rnd::Up);
-                if amount_dep.0 == 0 {
-                    return Some(Err(()));
-                }
-                // getRoundedLPTokens(deposit): tokens = amount / EPrice rounded DOWN, then adjustLPTokens
-                let tok = crate::tx::amm_swap::adjust_lp_tokens(lpt, n_div(amount_dep, ep_max, Rnd::Down), true);
-                if tok.0 == 0 {
-                    return Some(Err(()));
-                }
-                let (tokens2, deposited2) = crate::tx::amm_swap::adjust_asset_in_by_tokens(
-                    pool_pre, amount_dep, lpt, tok, tfee, xrp,
-                );
-                Some(if tokens2.0 > 0 && deposited2.0 > 0 { Ok((deposited2, tokens2)) } else { Err(()) })
+                // Past the ceiling: the amount whose price is exactly EPrice —
+                // finding 384's signed-Number port (`single_deposit_eprice_solve`).
+                let ep_max = eprice?;
+                Some(single_deposit_eprice_solve(pool_pre, lpt, ep_max, tfee, xrp))
             });
-        if matches!(single_adj, Some(Err(()))) {
-            return if one_asset_lp_token_over { TxResult::AmmFailed } else { TxResult::AmmInvalidTokens };
+        if let Some(Err(verdict)) = single_adj {
+            return verdict;
         }
         let single_adj: Option<(ox::Me, ox::Me)> = single_adj.and_then(|r| r.ok());
+        // tfTwoAssetIfEmpty (reachable now that preclaim refuses a live pool,
+        // finding 385) is `equalDepositInEmptyState` (AMMDeposit.cpp:
+        // 1070-1088): both amounts verbatim, minting `ammLPTokens(amount,
+        // amount2)` — never the placeholder below. deposit() refuses zero
+        // tokens first. No specimen yet (campaign 16 only reached the
+        // not-empty refusal).
+        const TF_TWO_ASSET_IF_EMPTY: u64 = 0x0080_0000;
+        let empty_state_tokens = if flags_dep & TF_TWO_ASSET_IF_EMPTY != 0 {
+            let (Some(a), Some(b)) = (
+                tx.fields.get("Amount").and_then(keylet::amount_mant_exp),
+                tx.fields.get("Amount2").and_then(keylet::amount_mant_exp),
+            ) else {
+                return TxResult::Malformed;
+            };
+            let t = crate::tx::amm_swap::amm_lp_tokens(a, b);
+            if t.0 == 0 {
+                return TxResult::AmmInvalidTokens;
+            }
+            Some(t)
+        } else {
+            None
+        };
 
         // Move the deposited side(s) depositor → AMM account (XRP or IOU
         // lines — move_leg handles both).
@@ -1248,6 +1712,7 @@ impl Transactor for AMMDepositTransactor {
         let minted = sized
             .map(|(_, _, t)| t)
             .filter(|t| t.0 > 0)
+            .or(empty_state_tokens)
             .or_else(|| tx.fields.get("LPTokenOut").and_then(keylet::amount_mant_exp).filter(|m| m.0 > 0))
             .or_else(|| single_adj.map(|(_, t)| t))
             .unwrap_or((1_000_000_000_000_000, -8));
@@ -1704,14 +2169,102 @@ impl Transactor for AMMWithdrawTransactor {
         TxResult::Success
     }
 
+    /// rippled `AMMWithdraw::preclaim` (AMMWithdraw.cpp:184-317), line for
+    /// line. The balances come from `ammHolds` under IgnoreFreeze — a frozen
+    /// asset is refused by the freeze test, not read as an empty pool.
     fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        use crate::tx::offer as ox;
         let acct_key = keylet::account_root_key(&tx.account);
         if !sandbox.exists(&acct_key) { return TxResult::NoAccount; }
-        match amm_key_from_asset_fields(tx) {
+        let amm_key = match amm_key_from_asset_fields(tx) {
             Some(key) => {
                 if !sandbox.exists(&key) { return TxResult::NoEntry; }
+                key
             }
             None => return TxResult::Malformed,
+        };
+        let Some((_, amm_acct, lp_leg)) = amm_ctx(tx, sandbox) else { return TxResult::NoEntry };
+        let Some(amm) = ox::json_at(sandbox, &amm_key) else { return TxResult::NoEntry };
+        let lpt = amm["LPTokenBalance"]["value"]
+            .as_str()
+            .and_then(|s| keylet::amount_mant_exp(&serde_json::Value::String(s.to_string())));
+        if lpt.is_some_and(|m| m.0 == 0) {
+            return TxResult::AmmEmpty;
+        }
+        let fix330 = crate::ledger::amendments::fix_cleanup_3_3_0(sandbox);
+        // `checkAmount(amount, balance)`: more than the pool holds is
+        // tecAMM_BALANCE, then requireAuth (WeakAuth), then the era's freeze
+        // test — fixCleanup3_3_0's `checkWithdrawFreeze` with the withdrawer as
+        // both submitter and destination (finding 386: its deep-freeze test
+        // was missing), else checkFrozen on the pool account and
+        // checkIndividualFrozen on the withdrawer.
+        let check_amount = |leg: &ox::Leg, amt: ox::Me, balance: ox::Me| -> TxResult {
+            if ox::me_cmp(amt, balance).is_gt() {
+                return TxResult::AmmBalance;
+            }
+            if let Some(t) = ox::require_auth_ter(sandbox, leg, &tx.account, false) {
+                if t != TxResult::Success { return t; }
+            }
+            if fix330 {
+                return check_withdraw_freeze(sandbox, &amm_acct, &tx.account, &tx.account, leg);
+            }
+            for who in [&amm_acct, &tx.account] {
+                if let Some(t) = ox::frozen_ter(sandbox, leg, who) {
+                    if t != TxResult::Success { return t; }
+                }
+            }
+            TxResult::Success
+        };
+        // A pool cannot pay out more of an asset than it holds (#105763689
+        // 740D41D6 asks for 50950 drops from a pool holding 43921).
+        for f in ["Amount", "Amount2"] {
+            let Some(v) = tx.fields.get(f) else { continue };
+            let (Some(leg), Some(amt)) = (ox::leg_of(v), keylet::amount_mant_exp(v)) else { continue };
+            let t = check_amount(&leg, amt, crate::tx::amm_swap::holds(sandbox, &amm_acct, &leg));
+            if t != TxResult::Success { return t; }
+        }
+        // Then the LP position, in rippled's order and with rippled's split
+        // (AMMWithdraw.cpp:283-299):
+        //     if (lpTokens <= beast::kZero)              return tecAMM_BALANCE;
+        //     if (*lpTokensWithdraw > lpTokens)          return tecAMM_INVALID_TOKENS;
+        // Holding NONE is a balance failure; holding SOME BUT TOO FEW is an
+        // invalid-tokens one, and the two are different result codes.
+        //
+        // #106308202 4D96E855: tfOneAssetLPToken burning 100000 LP against a
+        // position of 40000, so mainnet answers tecAMM_INVALID_TOKENS. We had
+        // no LP check at all and answered tecAMM_BALANCE — from the POOL check
+        // above, because the pool's HONEY line was unhydrated and read as zero,
+        // so `Amount 1 > 0` tripped first. Right code by luck, wrong reason.
+        let lp_tokens = crate::tx::amm_swap::holds(sandbox, &tx.account, &lp_leg);
+        if ox::me_is_zero(lp_tokens) {
+            return TxResult::AmmBalance;
+        }
+        const TF_LP_TOKEN: u64 = 0x0001_0000;
+        const TF_WITHDRAW_ALL: u64 = 0x0002_0000;
+        const TF_ONE_ASSET_WITHDRAW_ALL: u64 = 0x0004_0000;
+        let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+        // tokensWithdraw(): the whole position under either WithdrawAll flag.
+        if flags & (TF_WITHDRAW_ALL | TF_ONE_ASSET_WITHDRAW_ALL) == 0 {
+            if let Some(want) = tx.fields.get("LPTokenIn").and_then(keylet::amount_mant_exp) {
+                if ox::me_cmp(want, lp_tokens).is_gt() {
+                    return TxResult::AmmInvalidTokens;
+                }
+            }
+        }
+        // Finding 387 — tfLPToken and tfWithdrawAll pay out BOTH pool assets
+        // without naming either, so `checkAmount` runs on the two pool
+        // balances themselves (AMMWithdraw.cpp:307-313, in the pool's
+        // Asset/Asset2 order): the freeze and auth tests the named-amount loop
+        // above never reached. Testnet 6-13 F5FEFEF3A863 (P1's USD line
+        // frozen) and 6-8 7440618478C3 (the withdrawer deep frozen for USD)
+        // are tecFROZEN on the network; we paid both sides out.
+        if flags & (TF_LP_TOKEN | TF_WITHDRAW_ALL) != 0 {
+            for f in ["Asset", "Asset2"] {
+                let Some(leg) = amm.get(f).and_then(asset_leg) else { continue };
+                let balance = crate::tx::amm_swap::holds(sandbox, &amm_acct, &leg);
+                let t = check_amount(&leg, balance, balance);
+                if t != TxResult::Success { return t; }
+            }
         }
         TxResult::Success
     }
@@ -1731,79 +2284,16 @@ impl Transactor for AMMWithdrawTransactor {
             .and_then(|a| a["Balance"].as_str().and_then(|b| b.parse::<u128>().ok()))
             .unwrap_or(0)
             + tx.account_fee() as u128;
-        // A pool cannot pay out more of an asset than it holds:
-        // AMMWithdraw::preclaim's checkAmount rejects amount > balance with
-        // tecAMM_BALANCE before anything moves (AMMWithdraw.cpp:232).
-        // #105763689 740D41D6 asks for 50950 drops from a pool holding 43921.
-        // Finding 259: that balance is `ammHolds` under ZeroIfFrozen — a
-        // globally frozen asset, or a pool line the issuer froze, reads as
-        // nothing to pay out — except (fixCleanup3_3_0, AMMWithdraw.cpp:322)
-        // for the ISSUER of that asset, who can always take its own token
-        // back. Each named amount then passes `requireAuth(WeakAuth)` and the
-        // era's freeze check: pre-amendment `checkFrozen(ammAccount)` then
-        // `checkIndividualFrozen(account)`; post, `checkWithdrawFreeze` —
-        // nothing when the withdrawer is the issuer, else the global freeze
-        // and the POOL account's frozen line (the withdrawer's own frozen
-        // line no longer blocks: a regular freeze stops sending, not
-        // receiving). AMMWithdraw.cpp:218-262.
-        let fix330 = crate::ledger::amendments::fix_cleanup_3_3_0(sandbox);
-        for f in ["Amount", "Amount2"] {
-            if let Some(v) = tx.fields.get(f) {
-                if let (Some(leg), Some(amt)) = (ox::leg_of(v), keylet::amount_mant_exp(v)) {
-                    let held = if fix330 && !leg.xrp && tx.account == leg.issuer {
-                        crate::tx::amm_swap::holds(sandbox, &amm_acct, &leg)
-                    } else {
-                        crate::tx::amm_swap::holds_for_offer(sandbox, &amm_acct, &leg)
-                    };
-                    if ox::me_cmp(amt, held).is_gt() {
-                        return TxResult::AmmBalance;
-                    }
-                    if let Some(t) = ox::require_auth_ter(sandbox, &leg, &tx.account, false) {
-                        if t != TxResult::Success { return t; }
-                    }
-                    if fix330 {
-                        if !leg.xrp && tx.account != leg.issuer {
-                            if let Some(t) = ox::frozen_ter(sandbox, &leg, &amm_acct) {
-                                if t != TxResult::Success { return t; }
-                            }
-                        }
-                    } else {
-                        for who in [&amm_acct, &tx.account] {
-                            if let Some(t) = ox::frozen_ter(sandbox, &leg, who) {
-                                if t != TxResult::Success { return t; }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // Then the LP position, in rippled's order and with rippled's split
-        // (AMMWithdraw.cpp:272-288):
-        //     if (lpTokens <= beast::kZero)              return tecAMM_BALANCE;
-        //     if (*lpTokensWithdraw > lpTokens)          return tecAMM_INVALID_TOKENS;
-        // Holding NONE is a balance failure; holding SOME BUT TOO FEW is an
-        // invalid-tokens one, and the two are different result codes.
-        //
-        // #106308202 4D96E855: tfOneAssetLPToken burning 100000 LP against a
-        // position of 40000, so mainnet answers tecAMM_INVALID_TOKENS. We had
-        // no LP check at all and answered tecAMM_BALANCE — from the POOL check
-        // above, because the pool's HONEY line was unhydrated and read as zero,
-        // so `Amount 1 > 0` tripped first. Right code by luck, wrong reason.
+        // The pool-balance, auth and freeze checks of every named amount, and
+        // the LP position's zero / over-ask verdicts, are preclaim's now
+        // (rippled's order: all before verifyAndAdjustLPTokenBalance).
         let lp_held = crate::tx::amm_swap::holds(sandbox, &tx.account, &lp_leg);
-        if ox::me_is_zero(lp_held) {
-            return TxResult::AmmBalance;
-        }
         // fixAMMv1_1: the sole LP's line is the LPTokenBalance of record.
         if let Err(e) =
             verify_and_adjust_lp_token_balance(sandbox, &amm_key, &amm_acct, &tx.account, &lp_leg, lp_held)
         {
             sandbox.restore_snapshot(snap);
             return e;
-        }
-        if let Some(want) = tx.fields.get("LPTokenIn").and_then(keylet::amount_mant_exp) {
-            if ox::me_cmp(want, lp_held).is_gt() {
-                return TxResult::AmmInvalidTokens;
-            }
         }
         // tfWithdrawAll: redeem the LP's ENTIRE position — both pool assets out
         // in proportion to their LPToken share, ALL their LPTokens burned, and
@@ -1947,7 +2437,8 @@ impl Transactor for AMMWithdrawTransactor {
         // tfSingleAsset withdrawals name an Amount and NO LPTokenIn: the LP
         // tokens burned are DERIVED from what is taken out, and the pool
         // balance that derivation needs is the one BEFORE the payout below.
-        let single_asset_burn = if tx.fields.get("LPTokenIn").is_none() {
+        const TF_LIMIT_LP_TOKEN_W: u64 = 0x0040_0000;
+        let single_asset_burn = if tx.fields.get("LPTokenIn").is_none() && wd_flags & TF_LIMIT_LP_TOKEN_W == 0 {
             (|| {
                 let v = tx.fields.get("Amount")?;
                 let leg = ox::leg_of(v)?;
@@ -1991,6 +2482,47 @@ impl Transactor for AMMWithdrawTransactor {
             keylet::amount_mant_exp(&serde_json::Value::String(
                 o["LPTokenBalance"]["value"].as_str()?.to_string(),
             ))
+        };
+        // Finding 388 — tfLimitLPToken (Amount + EPrice) is
+        // `singleWithdrawEPrice` (AMMWithdraw.cpp:1196-1255), priced against
+        // the pool BEFORE the payout; it used to fall into the tfSingleAsset
+        // arm above and pay the Amount out verbatim. Its own verdicts
+        // (tecAMM_INVALID_TOKENS for non-positive tokens, tecAMM_FAILED below
+        // the Amount floor) precede withdraw()'s holdings and pool guards,
+        // which the derived burn meets below with every other mode's.
+        let limit_lp: Option<(ox::Me, ox::Me)> = if wd_flags & TF_LIMIT_LP_TOKEN_W != 0 {
+            let sized = (|| {
+                let v = tx.fields.get("Amount")?;
+                let leg = ox::leg_of(v)?;
+                let amount = keylet::amount_mant_exp(v)?;
+                let eprice = tx.fields.get("EPrice").and_then(keylet::amount_mant_exp)?;
+                let obj = ox::json_at(sandbox, &amm_key)?;
+                // F66: the slot holder (and its AuthAccounts) withdraw at the
+                // DISCOUNTED fee (getTradingFee) — 7-8's withdrawer is one.
+                let tfee = crate::tx::amm_swap::effective_trading_fee(sandbox, &obj, &tx.account);
+                Some(single_withdraw_eprice(
+                    crate::tx::amm_swap::holds(sandbox, &amm_acct, &leg),
+                    pool_lpt(sandbox)?,
+                    amount,
+                    eprice,
+                    tfee,
+                    leg.xrp,
+                    crate::ledger::amendments::fix_cleanup_3_3_0(sandbox),
+                ))
+            })();
+            match sized {
+                Some(Ok(t)) => Some(t),
+                Some(Err(verdict)) => {
+                    sandbox.restore_snapshot(snap);
+                    return verdict;
+                }
+                None => {
+                    sandbox.restore_snapshot(snap);
+                    return TxResult::Malformed;
+                }
+            }
+        } else {
+            None
         };
         // tfTwoAsset: Amount/Amount2 are MAXIMA and the pool ratio picks the
         // pair — moving them verbatim withdraws whatever was asked for.
@@ -2073,8 +2605,10 @@ impl Transactor for AMMWithdrawTransactor {
         // 538.5 XRP derives a burn of 396924.53 LP against 369936.01 held —
         // rippled's trace prints exactly that triple ("failed to withdraw,
         // invalid LP tokens"). #106290427 CCD6E831 is the tfTwoAsset twin.
-        let derived_burn =
-            wd_sized.map(|(_, _, t)| t).or(single_asset_burn.map(|(_, t)| t));
+        let derived_burn = wd_sized
+            .map(|(_, _, t)| t)
+            .or(single_asset_burn.map(|(_, t)| t))
+            .or(limit_lp.map(|(_, t)| t));
         if let Some(t) = derived_burn {
             if t.0 == 0 || ox::me_cmp(t, lp_held).is_gt() {
                 sandbox.restore_snapshot(snap);
@@ -2095,11 +2629,12 @@ impl Transactor for AMMWithdrawTransactor {
             }
         }
 
-        let actual = |i: usize, amt0: ox::Me| match (wd_sized, one_asset, single_asset_burn) {
+        let actual = |i: usize, amt0: ox::Me| match (wd_sized, one_asset, single_asset_burn.or(limit_lp)) {
             (Some((a, _, _)), _, _) if i == 0 => a,
             (Some((_, b, _)), _, _) => b,
             (None, Some((a, _)), _) if i == 0 => a,
-            // tfSingleAsset pays what the ADJUSTED tokens are worth.
+            // tfSingleAsset pays what the ADJUSTED tokens are worth;
+            // tfLimitLPToken what singleWithdrawEPrice sized (finding 388).
             (None, None, Some((a, _))) if i == 0 => a,
             _ => amt0,
         };
@@ -2174,6 +2709,7 @@ impl Transactor for AMMWithdrawTransactor {
                     })
             })
             .or(single_asset_burn.map(|(_, t)| t))
+            .or(limit_lp.map(|(_, t)| t))
             .unwrap_or((1_000_000_000_000_000, -8));
         ox::move_leg(sandbox, &tx.account, &amm_acct, &lp_leg, burned);
         bump_lp_balance(sandbox, &amm_key, burned, false);
@@ -3879,5 +4415,382 @@ impl Transactor for AMMClawbackTransactor {
             ox::move_leg(sandbox, &holder, &tx.account, &a2, w2);
         }
         TxResult::Success
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Campaign 16 (testnet, rippled 3.4.0): findings 383-388, rule by rule, on
+// synthetic pools seeded with the specimens' own numbers. The byte-exact pins
+// are the bundles in xrpl-node's `campaign16_vector.rs`.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod campaign16_tests {
+    use super::*;
+    use crate::ledger::header::LedgerHeader;
+    use crate::ledger::state::LedgerState;
+    use xrpl_core::types::Hash256;
+
+    const ISS: [u8; 20] = [0x02; 20];
+    const AMM: [u8; 20] = [0x05; 20];
+    const LP: [u8; 20] = [0x0A; 20];
+    const LP2: [u8; 20] = [0x0B; 20];
+    const LSF_LOW_FREEZE: u64 = 0x0040_0000;
+    const LSF_LOW_DEEP_FREEZE: u64 = 0x0200_0000;
+
+    fn cur(code: &str) -> [u8; 20] {
+        let mut c = [0u8; 20];
+        c[12..15].copy_from_slice(code.as_bytes());
+        c
+    }
+
+    fn blank(fix330: bool) -> LedgerState {
+        let header = LedgerHeader {
+            sequence: 100,
+            total_coins: 100_000_000_000_000_000,
+            parent_hash: Hash256([0; 32]),
+            transaction_hash: Hash256([0; 32]),
+            account_hash: Hash256([0; 32]),
+            parent_close_time: 10,
+            close_time: 10,
+            close_time_resolution: 10,
+            close_flags: 0,
+        };
+        let mut st = LedgerState::new_unverified(header);
+        if fix330 {
+            put(
+                &mut st,
+                keylet::amendments_key(),
+                serde_json::json!({
+                    "LedgerEntryType": "Amendments",
+                    "Amendments": [crate::ledger::amendments::FIX_CLEANUP_3_3_0],
+                }),
+            );
+        }
+        for id in [ISS, AMM, LP, LP2] {
+            root(&mut st, &id, 100_000_000, 0);
+        }
+        st
+    }
+
+    fn put(st: &mut LedgerState, k: Hash256, v: serde_json::Value) {
+        st.state_map.insert(k, serde_json::to_vec(&v).unwrap()).unwrap();
+    }
+
+    fn root(st: &mut LedgerState, id: &[u8; 20], drops: u64, flags: u64) {
+        put(
+            st,
+            keylet::account_root_key(id),
+            serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": hex::encode(id),
+                "Balance": drops.to_string(), "Sequence": 1, "OwnerCount": 2, "Flags": flags,
+            }),
+        );
+    }
+
+    /// `holder` holds `value` of `c` issued by `issuer` (Balance stored from
+    /// the LOW account's side).
+    fn line(st: &mut LedgerState, holder: &[u8; 20], issuer: &[u8; 20], c: [u8; 20], value: &str, flags: u64) {
+        let (lo, hi) = if holder < issuer { (holder, issuer) } else { (issuer, holder) };
+        let v = if holder < issuer || value == "0" { value.to_string() } else { format!("-{value}") };
+        let code = hex::encode_upper(c);
+        put(
+            st,
+            keylet::ripple_state_key(holder, issuer, &c),
+            serde_json::json!({
+                "LedgerEntryType": "RippleState", "Flags": flags,
+                "Balance": {"currency": code, "issuer": "0000000000000000000000000000000000000000", "value": v},
+                "LowLimit": {"currency": code, "issuer": hex::encode(lo), "value": "0"},
+                "HighLimit": {"currency": code, "issuer": hex::encode(hi), "value": "0"},
+            }),
+        );
+    }
+
+    fn asset_json(code: Option<&str>) -> serde_json::Value {
+        match code {
+            None => serde_json::json!({"currency": "XRP"}),
+            Some(c) => serde_json::json!({"currency": c, "issuer": hex::encode(ISS)}),
+        }
+    }
+
+    fn leg(code: Option<&str>) -> ox::Leg {
+        match code {
+            None => ox::Leg { xrp: true, cur: [0; 20], issuer: [0; 20] },
+            Some(c) => ox::Leg { xrp: false, cur: cur(c), issuer: ISS },
+        }
+    }
+
+    /// A pool of `a1`/`a2` (None = XRP) holding `b1`/`b2`, `lpt` outstanding,
+    /// `tfee`; LP holds `lp` of the LP token and LP2 the rest (so LP is never
+    /// the sole provider). Returns the LP-token leg.
+    #[allow(clippy::too_many_arguments)]
+    fn pool(
+        st: &mut LedgerState,
+        a1: Option<&str>,
+        b1: &str,
+        a2: Option<&str>,
+        b2: &str,
+        lpt: &str,
+        lp: &str,
+        tfee: u16,
+        slot: Option<([u8; 20], u16)>,
+    ) -> ox::Leg {
+        for (a, b) in [(a1, b1), (a2, b2)] {
+            match a {
+                None => root(st, &AMM, b.parse().unwrap(), 0),
+                Some(c) => line(st, &AMM, &ISS, cur(c), b, 0),
+            }
+        }
+        let (l1, l2) = (leg(a1), leg(a2));
+        let lp_cur = keylet::amm_lpt_currency(&l1.cur, &l2.cur);
+        let mut amm = serde_json::json!({
+            "LedgerEntryType": "AMM", "Account": hex::encode(AMM),
+            "Asset": asset_json(a1), "Asset2": asset_json(a2),
+            "LPTokenBalance": {"currency": hex::encode_upper(lp_cur), "issuer": hex::encode(AMM), "value": lpt},
+            "TradingFee": tfee,
+        });
+        if let Some((who, dfee)) = slot {
+            amm["AuctionSlot"] = serde_json::json!({
+                "Account": hex::encode(who), "Expiration": 1_000_000u64, "DiscountedFee": dfee,
+                "Price": {"currency": hex::encode_upper(lp_cur), "issuer": hex::encode(AMM), "value": "0"},
+            });
+        }
+        put(st, keylet::amm_key(&l1.cur, &l1.issuer, &l2.cur, &l2.issuer), amm);
+        line(st, &LP, &AMM, lp_cur, lp, 0);
+        line(st, &LP2, &AMM, lp_cur, "1000", 0);
+        let lp2_line = keylet::ripple_state_key(&LP2, &AMM, &lp_cur);
+        put(
+            st,
+            keylet::owner_dir_key(&AMM),
+            serde_json::json!({
+                "LedgerEntryType": "DirectoryNode", "Owner": hex::encode(AMM),
+                "RootIndex": hex::encode_upper(keylet::owner_dir_key(&AMM).0),
+                "Indexes": [hex::encode_upper(lp2_line.0)],
+            }),
+        );
+        ox::Leg { xrp: false, cur: lp_cur, issuer: AMM }
+    }
+
+    fn tx(kind: &str, who: [u8; 20], a1: Option<&str>, a2: Option<&str>, flags: u64, extra: serde_json::Value) -> TxFields {
+        let mut fields = serde_json::json!({"Asset": asset_json(a1), "Asset2": asset_json(a2), "Flags": flags});
+        for (k, v) in extra.as_object().unwrap() {
+            fields[k] = v.clone();
+        }
+        TxFields {
+            account: who,
+            tx_type: kind.to_string(),
+            fee: 10,
+            sequence: 1,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields,
+            inner_batch: false,
+        }
+    }
+
+    fn usd(v: &str) -> serde_json::Value {
+        serde_json::json!({"currency": "USD", "issuer": hex::encode(ISS), "value": v})
+    }
+    fn eur(v: &str) -> serde_json::Value {
+        serde_json::json!({"currency": "EUR", "issuer": hex::encode(ISS), "value": v})
+    }
+    fn lpt_amt(lp: &ox::Leg, v: &str) -> serde_json::Value {
+        serde_json::json!({"currency": hex::encode_upper(lp.cur), "issuer": hex::encode(AMM), "value": v})
+    }
+
+    /// preclaim, then do_apply on the same sandbox — the engine's order.
+    fn run<'a>(t: &dyn Transactor, tx: &TxFields, st: &'a LedgerState) -> (TxResult, Sandbox<'a>) {
+        let mut sb = Sandbox::new(st);
+        let pc = t.preclaim(tx, &sb);
+        if pc != TxResult::Success {
+            return (pc, sb);
+        }
+        let r = t.do_apply(tx, &mut sb);
+        (r, sb)
+    }
+
+    fn val(m: ox::Me) -> String {
+        ox::me_to_value_string(m)
+    }
+    fn holds(sb: &Sandbox, who: &[u8; 20], l: &ox::Leg) -> String {
+        val(crate::tx::amm_swap::holds(sb, who, l))
+    }
+    fn lpt_of(sb: &Sandbox, a1: Option<&str>, a2: Option<&str>) -> String {
+        let (l1, l2) = (leg(a1), leg(a2));
+        let o = ox::json_at(sb, &keylet::amm_key(&l1.cur, &l1.issuer, &l2.cur, &l2.issuer)).unwrap();
+        o["LPTokenBalance"]["value"].as_str().unwrap().to_string()
+    }
+
+    /// Finding 385 (specimens 2-13, 2-14): tfTwoAssetIfEmpty into a pool that
+    /// still has LP tokens outstanding is tecAMM_NOT_EMPTY — AMMDeposit's
+    /// preclaim decides it from ammHolds before any auth, freeze or funds
+    /// check (AMMDeposit.cpp:200-203); 2-14 is unfunded as well and still
+    /// answers NOT_EMPTY. The mirror arm (:213-215): any other mode into an
+    /// EMPTY pool is tecAMM_EMPTY.
+    #[test]
+    fn f385_two_asset_if_empty_into_a_live_pool_is_not_empty() {
+        let mut st = blank(true);
+        pool(&mut st, None, "30000000", Some("USD"), "100", "50000", "10", 500, None);
+        let dep = tx("AMMDeposit", LP, None, Some("USD"), 0x0080_0000,
+            serde_json::json!({"Amount": "900000000", "Amount2": usd("900")}));
+        assert_eq!(AMMDepositTransactor.preclaim(&dep, &Sandbox::new(&st)), TxResult::AmmNotEmpty);
+
+        let mut empty = blank(true);
+        pool(&mut empty, None, "0", Some("USD"), "0", "0", "0", 500, None);
+        let single = tx("AMMDeposit", LP, None, Some("USD"), 0x0008_0000, serde_json::json!({"Amount": "1000000"}));
+        assert_eq!(AMMDepositTransactor.preclaim(&single, &Sandbox::new(&empty)), TxResult::AmmEmpty);
+    }
+
+    /// Finding 386 (specimen 6-6): under fixCleanup3_3_0 `checkWithdrawFreeze`
+    /// refuses a withdrawal whose DESTINATION (the withdrawer) is deep frozen
+    /// for the asset — a deep freeze blocks receiving, where a plain freeze
+    /// does not (6-4 withdrew through a plain freeze). An XRP withdrawal by
+    /// the same account is untouched (6-7).
+    #[test]
+    fn f386_a_withdrawal_into_a_deep_frozen_line_is_frozen() {
+        let mut st = blank(true);
+        pool(&mut st, None, "36388184", Some("USD"), "123.9456143526877", "67059.05325239524", "602.77422608129", 496, None);
+        line(&mut st, &LP, &ISS, cur("USD"), "27.7", LSF_LOW_FREEZE | LSF_LOW_DEEP_FREEZE);
+        let wd = tx("AMMWithdraw", LP, None, Some("USD"), 0x0008_0000, serde_json::json!({"Amount": usd("0.2")}));
+        assert_eq!(run(&AMMWithdrawTransactor, &wd, &st).0, TxResult::Frozen);
+
+        let xrp = tx("AMMWithdraw", LP, None, Some("USD"), 0x0008_0000, serde_json::json!({"Amount": "50000"}));
+        assert_eq!(run(&AMMWithdrawTransactor, &xrp, &st).0, TxResult::Success);
+    }
+
+    /// Finding 387 (specimens 6-8, 6-13): tfLPToken / tfWithdrawAll run
+    /// `checkAmount` on BOTH pool assets (AMMWithdraw.cpp:307-313), so a
+    /// frozen pool line or a deep-frozen withdrawer refuses a proportional
+    /// withdrawal the tx names no Amount for. The issuer is exempt from the
+    /// freeze of its own token (6-14: dst == issuer).
+    #[test]
+    fn f387_an_lp_token_withdrawal_checks_both_pool_assets() {
+        // 6-13: the issuer froze the POOL's USD line (issuer low: LowFreeze).
+        let mut st = blank(true);
+        let lp = pool(&mut st, None, "36288185", Some("USD"), "123.9456143526877", "66966.82329173582", "746.3683589518462", 496, None);
+        line(&mut st, &AMM, &ISS, cur("USD"), "123.9456143526877", LSF_LOW_FREEZE);
+        line(&mut st, &LP, &ISS, cur("USD"), "48", 0);
+        let wd = tx("AMMWithdraw", LP, None, Some("USD"), 0x0001_0000, serde_json::json!({"LPTokenIn": lpt_amt(&lp, "5")}));
+        assert_eq!(run(&AMMWithdrawTransactor, &wd, &st).0, TxResult::Frozen);
+        let all = tx("AMMWithdraw", LP, None, Some("USD"), 0x0002_0000, serde_json::json!({}));
+        assert_eq!(run(&AMMWithdrawTransactor, &all, &st).0, TxResult::Frozen);
+
+        // 6-14: the issuer's own tfLPToken withdrawal from the frozen pool.
+        line(&mut st, &ISS, &AMM, lp.cur, "1468.91921001776", 0);
+        let by_issuer = tx("AMMWithdraw", ISS, None, Some("USD"), 0x0001_0000, serde_json::json!({"LPTokenIn": lpt_amt(&lp, "3")}));
+        assert_eq!(run(&AMMWithdrawTransactor, &by_issuer, &st).0, TxResult::Success);
+
+        // 6-8: pool unfrozen, the withdrawer's own USD line deep frozen.
+        let mut st = blank(true);
+        let lp = pool(&mut st, None, "36338185", Some("USD"), "123.9456143526877", "67012.9541306754", "556.67510436145", 496, None);
+        line(&mut st, &LP, &ISS, cur("USD"), "27.7", LSF_LOW_FREEZE | LSF_LOW_DEEP_FREEZE);
+        let wd = tx("AMMWithdraw", LP, None, Some("USD"), 0x0001_0000, serde_json::json!({"LPTokenIn": lpt_amt(&lp, "1")}));
+        assert_eq!(run(&AMMWithdrawTransactor, &wd, &st).0, TxResult::Frozen);
+    }
+
+    /// Finding 383 (specimens 2-5, 2-6, 2-7): tfLPToken is
+    /// `equalDepositTokens` — both pool assets in proportion to the ADJUSTED
+    /// tokens, `frac = divide(tokensAdj, lptAMMBalance)` (STAmount divide),
+    /// each side `multiply(balance, frac, upward)`. Amount/Amount2 are
+    /// MINIMA (tecAMM_FAILED when a side comes up short) and preclaim does
+    /// not funding-check them (2-6's 50 USD minimum exceeds the 48.11 USD the
+    /// depositor holds, and the network answers tecAMM_FAILED, not
+    /// tecUNFUNDED_AMM).
+    #[test]
+    fn f383_an_lp_token_deposit_pays_both_sides_in_proportion() {
+        let (xl, ul) = (leg(None), leg(Some("USD")));
+        // 2-5: LPTokenOut 333.333 alone.
+        let mut st = blank(true);
+        let lp = pool(&mut st, None, "30484776", Some("USD"), "117.2271729591372", "59775.49715954764", "314.93791209084", 500, None);
+        line(&mut st, &LP, &ISS, cur("USD"), "48.76543300000004", 0);
+        let dep = tx("AMMDeposit", LP, None, Some("USD"), 0x0001_0000, serde_json::json!({"LPTokenOut": lpt_amt(&lp, "333.333")}));
+        let (r, sb) = run(&AMMDepositTransactor, &dep, &st);
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(holds(&sb, &AMM, &xl), "30654772", "169996 drops in (30484776 x frac, rounded up)");
+        assert_eq!(holds(&sb, &AMM, &ul), "117.8808803660315");
+        assert_eq!(holds(&sb, &LP, &ul), "48.1117255931057");
+        assert_eq!(holds(&sb, &LP, &lp), "648.27091209084");
+        assert_eq!(lpt_of(&sb, None, Some("USD")), "60108.83015954764");
+
+        // 2-6 / 2-7: the pool after 2-5, LPTokenOut 100 with minima.
+        let mut st = blank(true);
+        let lp = pool(&mut st, None, "30654772", Some("USD"), "117.8808803660315", "60108.83015954764", "648.27091209084", 500, None);
+        line(&mut st, &LP, &ISS, cur("USD"), "48.1117255931057", 0);
+        let binds = tx("AMMDeposit", LP, None, Some("USD"), 0x0001_0000,
+            serde_json::json!({"LPTokenOut": lpt_amt(&lp, "100"), "Amount": usd("50"), "Amount2": "1"}));
+        assert_eq!(AMMDepositTransactor.preclaim(&binds, &Sandbox::new(&st)), TxResult::Success, "minima are not funding-checked");
+        assert_eq!(run(&AMMDepositTransactor, &binds, &st).0, TxResult::AmmFailed, "0.196 USD < the 50 USD minimum");
+        let fits = tx("AMMDeposit", LP, None, Some("USD"), 0x0001_0000,
+            serde_json::json!({"LPTokenOut": lpt_amt(&lp, "100"), "Amount": usd("0.001"), "Amount2": "1000"}));
+        let (r, sb) = run(&AMMDepositTransactor, &fits, &st);
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(holds(&sb, &AMM, &xl), "30705771");
+        assert_eq!(holds(&sb, &AMM, &ul), "118.0769927842122");
+        assert_eq!(holds(&sb, &LP, &ul), "47.91561317492498");
+        assert_eq!(lpt_of(&sb, None, Some("USD")), "60208.83015954764");
+    }
+
+    /// Finding 384 (specimens 2-11, 2-12, 2-27): a tfLimitLPToken deposit
+    /// whose EPrice binds solves `singleDepositEPrice`'s quadratic, and its
+    /// `c1 = 2c·f2² + 1 − 2d·f2` is NEGATIVE (−0.00596 in 2-11) — signed
+    /// Number arithmetic, where the unsigned helpers saturated it to zero,
+    /// found no root and refused tecAMM_INVALID_TOKENS.
+    #[test]
+    fn f384_a_binding_eprice_deposit_solves_the_signed_quadratic() {
+        let (xl, ul) = (leg(None), leg(Some("USD")));
+        // 2-11: 2.5 XRP offered, EPrice 1074 drops/LP.
+        let mut st = blank(true);
+        let lp = pool(&mut st, None, "33462452", Some("USD"), "118.0769927842122", "62846.78848504801", "2387.45832550037", 500, None);
+        let dep = tx("AMMDeposit", LP, None, Some("USD"), 0x0040_0000, serde_json::json!({"Amount": "2500000", "EPrice": "1074"}));
+        let (r, sb) = run(&AMMDepositTransactor, &dep, &st);
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(holds(&sb, &AMM, &xl), "34274080", "811628 drops in");
+        assert_eq!(holds(&sb, &LP, &lp), "3143.16410003777");
+        assert_eq!(lpt_of(&sb, None, Some("USD")), "63602.49425958541");
+
+        // 2-12: the IOU side, 1.111111 USD offered at EPrice 0.003725446176.
+        let mut st = blank(true);
+        let lp = pool(&mut st, None, "34274080", Some("USD"), "118.0769927842122", "63602.49425958541", "250.5", 500, None);
+        line(&mut st, &LP, &ISS, cur("USD"), "20", 0);
+        let dep = tx("AMMDeposit", LP, None, Some("USD"), 0x0040_0000,
+            serde_json::json!({"Amount": usd("1.111111"), "EPrice": usd("0.003725446176")}));
+        let (r, sb) = run(&AMMDepositTransactor, &dep, &st);
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(holds(&sb, &AMM, &ul), "118.4769927777998");
+        assert_eq!(holds(&sb, &LP, &ul), "19.60000000641243");
+        assert_eq!(holds(&sb, &LP, &lp), "357.86968800258");
+        assert_eq!(lpt_of(&sb, None, Some("USD")), "63709.86394758799");
+    }
+
+    /// Finding 388 (specimens 7-8, 7-9, 7-19): tfLimitLPToken withdraws by
+    /// `singleWithdrawEPrice` — t = T·(T + A·E·(f−2))/(T·f − A·E) rounded up,
+    /// the amount t/E rounded down — not by the tfSingleAsset formula it fell
+    /// into. The Amount is a MINIMUM (7-9: tecAMM_FAILED) and the derived burn
+    /// still faces withdraw()'s holdings test (7-8: 563.9 LP wanted of 556.7
+    /// held, tecAMM_INVALID_TOKENS — the withdrawer is an AuthAccount, so the
+    /// discounted fee 49 applies).
+    #[test]
+    fn f388_an_eprice_withdrawal_follows_single_withdraw_eprice() {
+        // 7-19: EUR/USD pool, the withdrawer holds the slot (fee 97).
+        let el = leg(Some("EUR"));
+        let mut st = blank(true);
+        let lp = pool(&mut st, Some("EUR"), "43.53838135189398", Some("USD"), "52.78099708891564", "47.89934789025996", "2.81470527217991", 977, Some((LP, 97)));
+        line(&mut st, &LP, &ISS, cur("EUR"), "56.71161864810602", 0);
+        let wd = tx("AMMWithdraw", LP, Some("EUR"), Some("USD"), 0x0040_0000,
+            serde_json::json!({"Amount": eur("0.05"), "EPrice": lpt_amt(&lp, "0.5532544717")}));
+        let (r, sb) = run(&AMMWithdrawTransactor, &wd, &st);
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(holds(&sb, &AMM, &el), "42.62765752206097");
+        assert_eq!(holds(&sb, &LP, &el), "57.62234247793903");
+        assert_eq!(holds(&sb, &LP, &lp), "2.31084324084105");
+        assert_eq!(lpt_of(&sb, Some("EUR"), Some("USD")), "47.3954858589211");
+
+        // 7-8 / 7-9: XRP/USD pool, the withdrawer an AuthAccount at fee 49.
+        let mut st = blank(true);
+        let lp = pool(&mut st, None, "31855840", Some("USD"), "119.2219494315543", "61535.44746418609", "556.67510436145", 496, Some((LP, 49)));
+        let e = lpt_amt(&lp, "0.0009705227455");
+        let min_01 = tx("AMMWithdraw", LP, None, Some("USD"), 0x0040_0000, serde_json::json!({"Amount": "100000", "EPrice": e}));
+        assert_eq!(run(&AMMWithdrawTransactor, &min_01, &st).0, TxResult::AmmInvalidTokens);
+        let min_2 = tx("AMMWithdraw", LP, None, Some("USD"), 0x0040_0000, serde_json::json!({"Amount": "2000000", "EPrice": e}));
+        assert_eq!(run(&AMMWithdrawTransactor, &min_2, &st).0, TxResult::AmmFailed);
     }
 }
