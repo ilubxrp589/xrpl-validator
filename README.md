@@ -12,11 +12,16 @@ Two things live in this repo:
    state hashes every ledger, signs validations, and relays them to the
    network. In a multi-week mainnet run it held **28,500+ consecutive
    `account_hash` matches with zero mismatches.**
-2. **A native Rust transaction engine** under active development, checked for
-   exactness against rippled through a differential harness — it reached
-   **100% attempted-transaction parity on a 19-ledger mainnet corpus** and
-   every change since is gated on not regressing it (reproducible via
-   `scripts/corpus.sh`).
+2. **A native Rust transaction engine** that runs as a **live shadow next to
+   rippled on mainnet**: every ledger's transactions are applied natively and
+   compared byte-for-byte with libxrpl's results. It has completed a **full
+   24-hour mainnet run with zero divergences** (2026-09-20/21: 22,985 ledgers
+   compared, every one exact, 2.2M transactions); the run started 2026-09-22
+   stood at 15,821 consecutive exact ledgers (1.79M transactions) on
+   2026-09-23 05:30. The findings log (F-numbers) reached **F396** on
+   2026-09-23: divergences from rippled caught by the live shadow, replay
+   windows and crafted campaigns, each fixed and most pinned as byte-exact
+   regression vectors. See [Progress history](#progress-history).
 
 ## Honest architecture (read this first)
 
@@ -47,9 +52,13 @@ engine** — the long-term path to a fully independent validator. Rather than
 trust it, every change is checked against rippled: the differential harness
 replays real mainnet transactions through the native engine and compares
 each result to the canonical outcome (the FFI/libxrpl path, which already
-matches mainnet, is the oracle). A change ships only if the corpus match
-count does not drop. It is **not yet the production apply path** — it earns
-that once it holds at parity on a much larger corpus.
+matches mainnet, is the oracle). Crafted campaigns on testnet/devnet cover what
+mainnet rarely exercises — AccountSet / SignerListSet / multisign, AMM
+deposit / withdraw / bid / vote, the OfferCreate flag matrix, MPT, NFT modify /
+cancel, Oracle / DID, credential-based DepositAuth, LedgerStateFix, permission
+delegation, and Batch (BatchV1_1 activates on mainnet ~2026-09-29) — with every
+bundle byte-exact. It is **not yet the production apply path** — it earns that
+after a run of consecutive clean 24-hour live soaks.
 
 ## Status — what's what, where things are at
 
@@ -58,9 +67,29 @@ that once it holds at parity on a much larger corpus.
 | Independent every-ledger state-hash verification | **Working** — 28.5K+ consecutive mainnet matches (documented run) |
 | Validation signing + relay | Working; **signing does not yet strictly gate on local verification** (hardening in progress) |
 | Production transaction apply | **Hybrid** — libxrpl via FFI |
-| Native Rust transaction engine (`xrpl-ledger`) | reached **100% attempted-tx parity** on a 19-ledger mainnet corpus (regression-gated); not yet production |
+| Native Rust transaction engine (`xrpl-ledger`) | **Live mainnet shadow, byte-exact**: a full 24-hour run with zero divergences (22,985 ledgers, 2.2M txs); not yet production |
 | Differential harness (`differential_probe` + `scripts/corpus.sh`) | Working; the regression gate for engine changes |
 | Security review (Fable 5 model, AI) | **In progress** — findings being addressed; specifics withheld |
+
+## Progress history
+
+Every number below is from the git history or the logged runs.
+
+| Date (2026) | Milestone |
+|---|---|
+| Mar 21 | Project start (first commit: the `xrpl-ledger` and `xrpl-node` crates) |
+| by Apr 1 | Validator: **28,500+ consecutive `account_hash` matches** against mainnet, zero mismatches |
+| Apr 5 | Production apply path: libxrpl via FFI reaches 100% mainnet agreement |
+| Jul 24 → Jul 30 | Native engine on unselected fresh mainnet ledgers: **18.14 → 2.39 divergences per 1,000 transactions** (clean ledgers 63% → 82%) |
+| by Jul 26 | 100% attempted-transaction parity on a 19-ledger mainnet corpus, regression-gated |
+| Aug 29 | **Live shadow** lands: every mainnet ledger applied natively and compared with libxrpl |
+| Aug 31 → Sep 1 | Overnight: **98.51%** of 9,463 ledgers fully matched (divergence trend 2.9% → 2.3% → 1.49%) |
+| Sep 7 → Sep 10 | Findings log passes F200, then F250 |
+| Sep 14 | Structural port begins: rippled's Number/STAmount arithmetic and flow engine translated function for function. The same morning a 21-hour run reached 20,347 clean ledgers (**99.93%**) |
+| Sep 20 | The ported flow engine goes live in the shadow |
+| Sep 20 → 21 | **First full 24-hour run with zero divergences**: 22,985 ledgers compared, every one exact; 2,200,747 transactions |
+| Sep 18 → 23 | Crafted testnet/devnet transaction campaigns for what mainnet rarely exercises, every bundle byte-exact, including Batch ahead of its ~Sep 29 mainnet activation; findings log reaches **F396** on Sep 23 |
+| Sep 23 | Second 24-hour run in progress: 15,821 consecutive exact ledgers (1.79M transactions) at 05:30 |
 
 ## Native engine — transaction coverage
 
@@ -73,7 +102,9 @@ differential-tests against rippled:
 - **Checks** — create / cash / cancel
 - **Escrow**, **PayChannel**, **Tickets**, **TrustSet**
 - **NFTokens** — mint / offers / pages
-- **Credentials**, **Oracles**, **AccountSet / AccountDelete**
+- **Credentials**, **Oracles**, **DID**, **AccountSet / AccountDelete**, **SignerListSet** / multisign
+- **MPT** (Multi-Purpose Tokens), **Clawback / AMMClawback**, **LedgerStateFix**
+- **Permission delegation** (DelegateSet) and **Batch** (all four modes)
 
 Each of those has a git-anchored history of specific parity fixes against
 rippled (e.g. issuer `TransferRate` on delivery, `keepRoot` on directory
