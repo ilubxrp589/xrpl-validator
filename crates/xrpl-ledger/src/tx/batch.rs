@@ -322,20 +322,28 @@ impl Transactor for BatchTransactor {
                 return TxResult::Redundant;
             }
             seen_seq.push((acct, seq_or_ticket));
-            // rippled builds this set from `rb.getInitiator()`, not
-            // `sfAccount` (`Batch.cpp:405-440`): when an inner carries
-            // `sfDelegate`, the DELEGATE is the required signer, because the
-            // delegate is who signed it. The engine does not model delegation
-            // (nor the two other members rippled adds here, `sfCounterparty`
-            // and a fee-sponsoring `sfSponsor` with an `sfSponsorSignature`),
-            // so a delegated inner would demand a signer for the account
-            // holder where rippled demands one for the delegate. Harmless
-            // today — the engine verifies no signatures, and every validated
-            // Batch reaching it has already satisfied rippled's real rule —
-            // but this preflight would reject such a batch for the wrong
-            // reason if it were ever fed an unvalidated one.
-            if acct != tx.account && !inner_accounts.contains(&acct) {
-                inner_accounts.push(acct);
+            // Finding 382: rippled builds the required signers from
+            // `rb.getInitiator()` — the inner's DELEGATE when it carries one,
+            // because the delegate signed it — plus an `sfCounterparty` and a
+            // fee-sponsoring `sfSponsor` that co-signed (`sfSponsorSignature`),
+            // each unless it is the outer account (Batch.cpp:423-445). We used
+            // the inner's Account, so a validated batch with a delegated inner
+            // (possible once PermissionDelegationV1_1 is live, ~10-05) would
+            // have been refused here as temBAD_SIGNER.
+            let mut require = |who: [u8; 20]| {
+                if who != tx.account && !inner_accounts.contains(&who) {
+                    inner_accounts.push(who);
+                }
+            };
+            let authorizer = inner.get("Delegate").and_then(|d| d.as_str()).and_then(decode_account).unwrap_or(acct);
+            require(authorizer);
+            if let Some(cp) = inner.get("Counterparty").and_then(|d| d.as_str()).and_then(decode_account) {
+                require(cp);
+            }
+            if inner.get("SponsorSignature").is_some() {
+                if let Some(sp) = inner.get("Sponsor").and_then(|d| d.as_str()).and_then(decode_account) {
+                    require(sp);
+                }
             }
         }
         // BatchSigners: sorted, unique, none the outer account, exactly the
@@ -494,6 +502,19 @@ mod tests {
 
     fn pf(o: &Value) -> String {
         BatchTransactor.preflight(&TxFields::from_json(o).expect("fields")).code_str().to_string()
+    }
+
+    /// Finding 382: a delegated inner is signed by its DELEGATE, so the
+    /// delegate — not the inner's Account — is the required batch signer
+    /// (`rb.getInitiator()`, Batch.cpp:430). Reachable once
+    /// PermissionDelegationV1_1 (~10-05) and BatchV1_1 (~09-29) are both live.
+    #[test]
+    fn a_delegated_inner_requires_its_delegate_as_batch_signer() {
+        let mut d = inner_payment(3, 2, 1, 6);
+        d["RawTransaction"]["Delegate"] = json!(hexa(4));
+        let o = |s: u8| outer(TF_INDEPENDENT, vec![inner_payment(1, 2, 1, 6), d.clone()], Some(vec![s]));
+        assert_eq!(pf(&o(4)), "tesSUCCESS", "the delegate signs");
+        assert_eq!(pf(&o(3)), "temBAD_SIGNER", "the account holder did not sign it");
     }
 
     #[test]
