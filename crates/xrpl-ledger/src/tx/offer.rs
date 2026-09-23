@@ -59,6 +59,12 @@ pub(crate) fn amount_currency20(v: &serde_json::Value) -> Option<[u8; 20]> {
             if c == "XRP" {
                 return Some([0u8; 20]);
             }
+            // Finding 369: rippled spells noCurrency (0x00…01) "1" in JSON.
+            if c == "1" {
+                let mut b = [0u8; 20];
+                b[19] = 1;
+                return Some(b);
+            }
             if c.len() == 40 {
                 let b = hex::decode(c).ok()?;
                 return <[u8; 20]>::try_from(b.as_slice()).ok();

@@ -514,6 +514,11 @@ def main():
     # keylet::signers = SHA512Half(0x0053 'S' || AccountID || u32 SignerListID 0).
     if tx.get("TransactionType") in ("AccountSet", "SetRegularKey", "SignerListSet"):
         named_keys.append(hashlib.sha512(b"\x00S" + bytes.fromhex(acct_id(tx["Account"])) + b"\x00\x00\x00\x00").digest()[:32].hex().upper())
+    if tx.get("TransactionType") in ("OracleSet", "OracleDelete") and tx.get("OracleDocumentID") is not None:
+        # Campaign 19: keylet::oracle = sha512half(0x0052 'R' + AccountID + OracleDocumentID be32). A fee-only tec
+        # OracleSet update (tecINVALID_UPDATE_TIME on the stored time, tecTOKEN_PAIR_NOT_FOUND, tecARRAY_EMPTY,
+        # tecARRAY_TOO_LARGE, tecINSUFFICIENT_RESERVE) judged the oracle but never names it in the meta.
+        named_keys.append(hashlib.sha512(b"\x00R" + bytes.fromhex(acct_id(tx["Account"])) + int(tx["OracleDocumentID"]).to_bytes(4, "big")).digest()[:32].hex().upper())
     # LedgerStateFix BookExchangeRate (F359) names the directory it judges.
     for f in ("Channel", "CheckID", "DomainID", "BookDirectory"):
         v = tx.get(f)
@@ -593,7 +598,10 @@ def main():
         # IOU-priced offer on a transfer-fee token the NFT issuer's root and
         # its line with the IOU issuer (tokenOfferCreatePreclaim). Without
         # them the engine answers tecOBJECT_NOT_FOUND / tecNO_ISSUER.
-        if tt in ("NFTokenCreateOffer", "NFTokenAcceptOffer", "NFTokenMint", "NFTokenBurn", "NFTokenCancelOffer"):
+        # Campaign 19: NFTokenModify::preclaim reads the ISSUER's root (sfNFTokenMinter) whenever the
+        # submitter is not the issuer; the issuer lives only inside the NFTokenID, so neither the meta nor
+        # the r-address sweep ever fetches it (a fee-only tecNO_PERMISSION names nothing).
+        if tt in ("NFTokenCreateOffer", "NFTokenAcceptOffer", "NFTokenMint", "NFTokenBurn", "NFTokenCancelOffer", "NFTokenModify"):
             import hashlib as _hl
             def _h(b): return _hl.sha512(b).digest()[:32].hex().upper()
             def _cur160(c):

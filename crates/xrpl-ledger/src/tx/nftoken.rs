@@ -1649,6 +1649,17 @@ impl Transactor for NFTokenModifyTransactor {
         // is rKqqb5QZXVAL3VqXJL6obfRGeHou1DtyBV — a THIRD account. Mainnet
         // claims the fee with tecNO_PERMISSION; we rewrote the URI (2 muts v 1).
         let id_hex = tx.fields.get("NFTokenID").and_then(|v| v.as_str()).unwrap_or("");
+        // Finding 368 (campaign 19 1-14 / 1-15 / 1-29): the token must be
+        // FOUND in the owner's pages first — `findToken(owner) → tecNO_ENTRY`
+        // precedes both permission tests (NFTokenModify.cpp:40-41). A modify
+        // of a burned or elsewhere-held NFT is tecNO_ENTRY, not the
+        // tecNO_PERMISSION its flags would earn.
+        if let Some(id) = tx.fields.get("NFTokenID").and_then(hash256_from) {
+            let owner = tx.fields.get("Owner").and_then(decode_account_id).unwrap_or(tx.account);
+            if nftpage::locate_token(sandbox, &owner, &id).is_none() {
+                return TxResult::NoEntry;
+            }
+        }
         if id_hex.len() == 64 {
             if let Ok(flags) = u16::from_str_radix(&id_hex[0..4], 16) {
                 if flags & 0x0010 == 0 {

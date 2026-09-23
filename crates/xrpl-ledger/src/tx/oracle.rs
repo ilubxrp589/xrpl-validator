@@ -152,7 +152,15 @@ impl Transactor for OracleSetTransactor {
             return TxResult::InvalidUpdateTime;
         }
         let lut_ripple = lut - EPOCH_OFFSET;
-        let close = sandbox.base().close_time() as u64;
+        // Finding 366 (campaign 19 3-25 / 3-26, testnet 34EAA88840C0 and
+        // 012EB6081351): the window is centred on `view.header().closeTime`
+        // of the ledger BEING BUILT — `prev.closeTime + closeTimeResolution`
+        // (the Ledger(prev, closeTime) constructor) — not the parent's close,
+        // which every hasExpired test uses and which our header carries as
+        // `close_time`. -296 s from the parent close is -306 s from the
+        // provisional one: mainnet tec, ours tes (and the mirror at +308).
+        let h = &sandbox.base().header;
+        let close = h.parent_close_time as u64 + h.close_time_resolution as u64;
         if close >= MAX_DELTA
             && (lut_ripple < close - MAX_DELTA || lut_ripple > close + MAX_DELTA)
         {
@@ -195,13 +203,16 @@ impl Transactor for OracleSetTransactor {
             return TxResult::ArrayTooLarge;
         }
         let adjust = reserve_units(&serde_json::Value::Array(merged)) - if existing.is_some() { reserve_units(&serde_json::Value::Array(old_series)) } else { 0 };
-        if adjust > 0 {
-            if let Some(a) = sandbox.read(&k).and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok()) {
-                let bal = a["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-                let oc = a["OwnerCount"].as_u64().unwrap_or(0);
-                if bal < crate::ledger::fees::account_reserve(sandbox, oc + adjust as u64) {
-                    return TxResult::InsufficientReserve;
-                }
+        // Finding 367 (campaign 19 4-3 / 4-5 / 4-6): the reserve test runs for
+        // EVERY adjustment — +2, +1, 0 or -1 (OracleSet.cpp:175-180) — against
+        // accountReserve(OwnerCount + adjust). A balance already under its
+        // reserve is refused an update that frees nothing; ours only tested
+        // growth.
+        if let Some(a) = sandbox.read(&k).and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok()) {
+            let bal = a["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            let oc = a["OwnerCount"].as_u64().unwrap_or(0) as i64;
+            if bal < crate::ledger::fees::account_reserve(sandbox, (oc + adjust).max(0) as u64) {
+                return TxResult::InsufficientReserve;
             }
         }
         TxResult::Success
