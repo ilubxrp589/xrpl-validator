@@ -699,6 +699,18 @@ def main():
             if dst:
                 _put(rpc("ledger_entry", {"account_root": dst, "ledger_index": seq - 1, "binary": True}))
                 _put(rpc("ledger_entry", {"deposit_preauth": {"owner": dst, "authorized": tx["Account"]}, "ledger_index": seq - 1, "binary": True}))
+        # Campaign 20: DepositPreauth READS the entry it would create or remove
+        # (tecDUPLICATE / tecNO_ENTRY) — a fee-only tec never names it. The
+        # credential form goes through the RPC's authorized_credentials.
+        if tt == "DepositPreauth":
+            for f in ("Authorize", "Unauthorize"):
+                if isinstance(tx.get(f), str):
+                    _put(rpc("ledger_entry", {"deposit_preauth": {"owner": tx["Account"], "authorized": tx[f]}, "ledger_index": seq - 1, "binary": True}))
+            for f in ("AuthorizeCredentials", "UnauthorizeCredentials"):
+                ac = [e.get("Credential", e) for e in (tx.get(f) or []) if isinstance(e, dict)]
+                ac = [{"issuer": c["Issuer"], "credential_type": c["CredentialType"]} for c in ac if c.get("Issuer") and c.get("CredentialType")]
+                if ac:
+                    _put(rpc("ledger_entry", {"deposit_preauth": {"owner": tx["Account"], "authorized_credentials": ac}, "ledger_index": seq - 1, "binary": True}))
         if tt in ("CredentialCreate", "CredentialAccept", "CredentialDelete") and tx.get("CredentialType"):
             subj = tx.get("Subject") or (tx["Account"] if tt != "CredentialCreate" else tx["Account"])
             issr = tx.get("Issuer") or tx["Account"]
@@ -768,8 +780,16 @@ def main():
             rb = rpc("ledger_entry", {"index": cid, "ledger_index": seq - 1, "binary": True})
             if rb.get("node_binary"):
                 pre[cid.upper()] = rb["node_binary"]
-        if creds and tx.get("Destination"):
-            dp = rpc("ledger_entry", {"deposit_preauth": {"owner": tx["Destination"], "authorized_credentials": creds}, "ledger_index": seq - 1, "binary": True})
+        # Campaign 20: EscrowFinish / PaymentChannelClaim carry no Destination —
+        # verifyDepositPreauth's dst is the escrow's / the channel's, and a
+        # credential-authorized tesSUCCESS only READS DepositPreauth(dst, set).
+        cdst = tx.get("Destination")
+        if not cdst and tx.get("TransactionType") == "EscrowFinish" and tx.get("Owner") and tx.get("OfferSequence") is not None:
+            cdst = (rpc("ledger_entry", {"escrow": {"owner": tx["Owner"], "seq": int(tx["OfferSequence"])}, "ledger_index": seq - 1}).get("node") or {}).get("Destination")
+        if not cdst and tx.get("TransactionType") == "PaymentChannelClaim" and isinstance(tx.get("Channel"), str):
+            cdst = (rpc("ledger_entry", {"index": tx["Channel"], "ledger_index": seq - 1}).get("node") or {}).get("Destination")
+        if creds and cdst:
+            dp = rpc("ledger_entry", {"deposit_preauth": {"owner": cdst, "authorized_credentials": creds}, "ledger_index": seq - 1, "binary": True})
             if dp.get("node_binary") and dp.get("index"):
                 pre[dp["index"].upper()] = dp["node_binary"]
     except Exception as e:

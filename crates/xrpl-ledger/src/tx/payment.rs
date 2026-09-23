@@ -2314,69 +2314,28 @@ impl Transactor for PaymentTransactor {
         // DepositPreauth(dst, sorted (Issuer, CredentialType) of those
         // credentials) exists — else tecNO_PERMISSION. We knew only the
         // by-account object and refused all twenty-one.
-        let cred_ids: Vec<xrpl_core::types::Hash256> = tx
-            .fields
-            .get("CredentialIDs")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str())
-                    .filter_map(|h| hex::decode(h).ok())
-                    .filter_map(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
-                    .map(xrpl_core::types::Hash256)
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !cred_ids.is_empty() {
-            let now = sandbox.base().close_time() as u64;
-            let mut expired = false;
-            for k in &cred_ids {
-                let exp = crate::tx::offer::json_at(sandbox, k)
-                    .and_then(|c| c.get("Expiration").and_then(|v| v.as_u64()));
-                if exp.is_some_and(|e| now > e) {
-                    crate::tx::credential::delete_credential_object(sandbox, k);
-                    expired = true;
-                }
-            }
-            if expired {
-                return TxResult::Expired;
-            }
-        }
-        if let Some(dst) = crate::tx::offer::json_at(sandbox, &keylet::account_root_key(&dest_id)) {
-            if dst["Flags"].as_u64().unwrap_or(0) & 0x0100_0000 != 0 && dest_id != tx.account {
-                let ripple = cross_currency || !amt_json.is_string() || sendmax.is_some();
-                let gated = ripple || {
-                    let reserve = crate::ledger::fees::reserve_base(sandbox);
-                    let dst_bal =
-                        dst["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-                    Self::amount_drops(tx).unwrap_or(0) > reserve || dst_bal > reserve
-                };
-                if gated
-                    && sandbox
-                        .read(&keylet::deposit_preauth_key(&dest_id, &tx.account))
-                        .is_none()
-                {
-                    if cred_ids.is_empty() {
-                        return TxResult::NoPermission;
-                    }
-                    // `authorizedDepositPreauth`: the credentials' (Issuer,
-                    // CredentialType) pairs, sorted, name the preauth object.
-                    let mut sorted: Vec<([u8; 20], Vec<u8>)> = Vec::new();
-                    for k in &cred_ids {
-                        let Some(c) = crate::tx::offer::json_at(sandbox, k) else { return TxResult::NoPermission };
-                        let (Some(issuer), Some(ct)) = (
-                            c.get("Issuer").and_then(|v| v.as_str()).and_then(crate::tx::offer::decode20),
-                            c.get("CredentialType").and_then(|v| v.as_str()).and_then(|h| hex::decode(h).ok()),
-                        ) else {
-                            return TxResult::NoPermission;
-                        };
-                        sorted.push((issuer, ct));
-                    }
-                    sorted.sort();
-                    sorted.dedup();
-                    if sandbox.read(&keylet::deposit_preauth_credentials_key(&dest_id, &sorted)).is_none() {
-                        return TxResult::NoPermission;
-                    }
+        // Finding 376 (campaign 20 X-9 / X-10, testnet 3A88EBE4F58B,
+        // EFCD8E552A36): verifyDepositPreauth — the expired-credential cleanup
+        // with it — runs unconditionally on the "ripple" route, but on a
+        // direct XRP payment only when the amount or the destination's balance
+        // (0 for an account being created) exceeds the base reserve
+        // (Payment.cpp:820), whether or not the destination requires
+        // DepositAuth. We ran the cleanup for every payment carrying
+        // credentials, so a reserve-sized funding answered tecEXPIRED and
+        // deleted a credential the network kept.
+        {
+            let ripple = cross_currency || !amt_json.is_string() || sendmax.is_some();
+            let dst_root = crate::tx::offer::json_at(sandbox, &keylet::account_root_key(&dest_id))
+                .unwrap_or_else(|| serde_json::json!({}));
+            let gated = ripple || {
+                let reserve = crate::ledger::fees::reserve_base(sandbox);
+                let dst_bal = dst_root["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                Self::amount_drops(tx).unwrap_or(0) > reserve || dst_bal > reserve
+            };
+            if gated {
+                let r = crate::tx::misc::verify_deposit_preauth(sandbox, tx, &tx.account, &dest_id, &dst_root);
+                if r != TxResult::Success {
+                    return r;
                 }
             }
         }

@@ -355,6 +355,39 @@ impl Transactor for AccountDeleteTransactor {
             Ok(v) => v,
             Err(_) => return TxResult::Malformed,
         };
+        // Finding 378 (campaign 20 D-1 / D-2 / D-3, testnet 26715285ED60,
+        // 58AA68E3AAB9, 61CE5312CE89): AccountDelete::preclaim judges the
+        // DESTINATION first (AccountDelete.cpp:229-251) — tecNO_DST,
+        // tecDST_TAG_NEEDED, credentials::valid — and, for a transaction
+        // without CredentialIDs, refuses a destination under lsfDepositAuth
+        // that has not preauthorized the account (tecNO_PERMISSION; pseudo-
+        // accounts carry the flag by default). With CredentialIDs the test is
+        // doApply's verifyDepositPreauth (below, in do_apply). We had no
+        // DepositAuth test at all: we destroyed the account and paid its
+        // balance into a destination that refuses it.
+        {
+            let Some(dst_id) = tx.fields.get("Destination").and_then(|v| v.as_str()).and_then(crate::tx::offer::decode20)
+            else {
+                return TxResult::Malformed;
+            };
+            let Some(dst) = crate::tx::offer::json_at(sandbox, &keylet::account_root_key(&dst_id)) else {
+                return TxResult::NoDst;
+            };
+            let dflags = dst["Flags"].as_u64().unwrap_or(0);
+            if dflags & 0x0002_0000 != 0 && tx.fields.get("DestinationTag").is_none() {
+                return TxResult::DstTagNeeded;
+            }
+            let cv = crate::tx::credential::credentials_valid(sandbox, tx, &tx.account);
+            if cv != TxResult::Success {
+                return cv;
+            }
+            if tx.fields.get("CredentialIDs").is_none()
+                && dflags & 0x0100_0000 != 0
+                && !sandbox.exists(&keylet::deposit_preauth_key(&dst_id, &tx.account))
+            {
+                return TxResult::NoPermission;
+            }
+        }
         // AccountDelete.cpp:256-303, in rippled's order and all BEFORE the
         // directory walk (an NFT-holding or too-young account answers here
         // even when its directory also holds obligations):
@@ -529,6 +562,16 @@ impl Transactor for AccountDeleteTransactor {
         let cv = crate::tx::credential::credentials_valid(sandbox, tx, &tx.account);
         if cv != TxResult::Success {
             return cv;
+        }
+        // Finding 378: with CredentialIDs, doApply's verifyDepositPreauth
+        // (AccountDelete.cpp:366-371) — expired credentials deleted and
+        // tecEXPIRED, else the credential-set authorization — before anything
+        // moves.
+        if tx.fields.get("CredentialIDs").is_some() {
+            let r = crate::tx::misc::verify_deposit_preauth(sandbox, tx, &tx.account, &dest_id, &dest);
+            if r != TxResult::Success {
+                return r;
+            }
         }
 
         let dest_balance = dest["Balance"]

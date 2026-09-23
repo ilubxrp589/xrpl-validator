@@ -353,13 +353,15 @@ pub fn apply_mpt_payment(
         return TxResult::NoAuth;
     }
 
-    // verifyDepositPreauth — unconditional on this arm (Payment.cpp:533).
+    // verifyDepositPreauth — unconditional on this arm (Payment.cpp:693).
+    // Finding 375 (campaign 20 M-17 / X-3, testnet E33A9793F637,
+    // D25509AD2D3D): the WHOLE of it — expired-credential cleanup
+    // (tecEXPIRED, deletions kept) and the credential-set authorization —
+    // not only the by-account preauth.
     if let Some(dst_root) = json_at(sandbox, &keylet::account_root_key(dest)) {
-        if dst_root["Flags"].as_u64().unwrap_or(0) & 0x0100_0000 != 0
-            && tx.account != *dest
-            && sandbox.read(&keylet::deposit_preauth_key(dest, &tx.account)).is_none()
-        {
-            return TxResult::NoPermission;
+        let r = crate::tx::misc::verify_deposit_preauth(sandbox, tx, &tx.account, dest, &dst_root);
+        if r != TxResult::Success {
+            return r;
         }
     }
 

@@ -316,12 +316,19 @@ impl Transactor for CredentialDeleteTransactor {
             return TxResult::NoEntry;
         }
 
-        // Permission check: sender must be subject or issuer
-        let sender_hex = hex::encode(tx.account);
-        let subject_hex = hex::encode(subject);
-        let issuer_hex = hex::encode(issuer);
-        if sender_hex != subject_hex && sender_hex != issuer_hex {
-            return TxResult::NoPermission;
+        // Permission check: sender must be subject or issuer — or anyone at
+        // all once the credential has EXPIRED (CredentialDelete.cpp:87-92,
+        // checkExpired = parentCloseTime > Expiration). Finding 377 (campaign
+        // 20 X-13 / E-5, testnet F5D3209D0338, 7D1515D87CF4): a stranger's
+        // delete of an expired credential lands tesSUCCESS.
+        if tx.account != subject && tx.account != issuer {
+            let now = sandbox.base().close_time() as u64;
+            let expired = crate::tx::offer::json_at(sandbox, &cred_key)
+                .and_then(|c| c.get("Expiration").and_then(|v| v.as_u64()))
+                .is_some_and(|e| now > e);
+            if !expired {
+                return TxResult::NoPermission;
+            }
         }
 
         // A CREDENTIAL SITS IN **TWO** OWNER DIRECTORIES, and which party pays
@@ -668,6 +675,12 @@ impl Transactor for CredentialAcceptTransactor {
 
         let cred_key = credential_key(&subject, &issuer, &cred_type_bytes(cred_type_str));
 
+        // Finding 379 (campaign 20 E-1, testnet 967546A20D4D): preclaim asks
+        // for the ISSUER's account before the credential — tecNO_ISSUER, not
+        // tecNO_ENTRY (CredentialAccept.cpp:60-64).
+        if !sandbox.exists(&keylet::account_root_key(&issuer)) {
+            return TxResult::NoIssuer;
+        }
         let cred_data = match sandbox.read(&cred_key) {
             Some(d) => d,
             None => return TxResult::NoEntry,
@@ -688,26 +701,10 @@ impl Transactor for CredentialAcceptTransactor {
             return TxResult::Duplicate;
         }
 
-        // Expired credentials are deleted even though the accept fails —
-        // rippled checkExpired against parentCloseTime, then deleteSLE and
-        // tecEXPIRED (CredentialAccept.cpp:110-117).
-        if let Some(exp) = cred.get("Expiration").and_then(|v| v.as_u64()) {
-            if exp != 0 && sandbox.base().header.close_time as u64 >= exp {
-                let issuer_hint = cred.get("IssuerNode").and_then(|v| v.as_str())
-                    .and_then(|h| u64::from_str_radix(h, 16).ok());
-                let subject_hint = cred.get("SubjectNode").and_then(|v| v.as_str())
-                    .and_then(|h| u64::from_str_radix(h, 16).ok());
-                sandbox.delete(cred_key);
-                crate::ledger::directory::owner_dir_remove(sandbox, &issuer, &cred_key, issuer_hint, false);
-                if subject != issuer {
-                    crate::ledger::directory::owner_dir_remove(sandbox, &subject, &cred_key, subject_hint, false);
-                }
-                // Unaccepted: the ISSUER still owns the reserve.
-                crate::tx::offer::owner_count_add(sandbox, &issuer, -1);
-                return TxResult::Expired;
-            }
-        }
-
+        // Finding 380 (campaign 20 E-4, testnet 2BF90D2E1DB3): the reserve is
+        // judged BEFORE the expiry (CredentialAccept.cpp:100 checkReserve,
+        // :116 checkExpired) — an expired credential under a subject short of
+        // reserve stays, tecINSUFFICIENT_RESERVE.
         // Finding 345 (testnet campaign 6, #20909796 91B4ACF7): the SUBJECT
         // must hold the reserve for the object it is about to own —
         // `accountReserve(sleSubject OwnerCount + 1)` against mPriorBalance
@@ -729,6 +726,27 @@ impl Transactor for CredentialAcceptTransactor {
             };
             if bal.saturating_add(tx.account_fee()) < crate::ledger::fees::account_reserve(sandbox, oc + 1) {
                 return TxResult::InsufficientReserve;
+            }
+        }
+
+        // Expired credentials are deleted even though the accept fails —
+        // rippled checkExpired against parentCloseTime, then deleteSLE and
+        // tecEXPIRED (CredentialAccept.cpp:110-117).
+        if let Some(exp) = cred.get("Expiration").and_then(|v| v.as_u64()) {
+            // checkExpired is STRICT: parentCloseTime > Expiration.
+            if sandbox.base().header.close_time as u64 > exp {
+                let issuer_hint = cred.get("IssuerNode").and_then(|v| v.as_str())
+                    .and_then(|h| u64::from_str_radix(h, 16).ok());
+                let subject_hint = cred.get("SubjectNode").and_then(|v| v.as_str())
+                    .and_then(|h| u64::from_str_radix(h, 16).ok());
+                sandbox.delete(cred_key);
+                crate::ledger::directory::owner_dir_remove(sandbox, &issuer, &cred_key, issuer_hint, false);
+                if subject != issuer {
+                    crate::ledger::directory::owner_dir_remove(sandbox, &subject, &cred_key, subject_hint, false);
+                }
+                // Unaccepted: the ISSUER still owns the reserve.
+                crate::tx::offer::owner_count_add(sandbox, &issuer, -1);
+                return TxResult::Expired;
             }
         }
 
@@ -960,7 +978,23 @@ mod tests {
     #[test]
     fn credential_accept_nonexistent_fails() {
         let subject = [0x02u8; 20];
-        let state = make_state(&[(subject, 50_000_000)]);
+        // Finding 379: with the issuer's account missing the answer is
+        // tecNO_ISSUER, judged before the credential lookup.
+        let no_issuer = make_state(&[(subject, 50_000_000)]);
+        let mut sb = Sandbox::new(&no_issuer);
+        let t = TxFields {
+            account: subject,
+            tx_type: "CredentialAccept".to_string(),
+            fee: 12,
+            sequence: 1,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({"Issuer": hex::encode([0x01u8; 20]), "CredentialType": "KYC"}),
+            inner_batch: false,
+        };
+        assert_eq!(CredentialAcceptTransactor.do_apply(&t, &mut sb), TxResult::NoIssuer);
+        // With the issuer present and no credential: tecNO_ENTRY.
+        let state = make_state(&[(subject, 50_000_000), ([0x01u8; 20], 50_000_000)]);
 
         let mut sandbox = Sandbox::new(&state);
         let tx = TxFields {
