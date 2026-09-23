@@ -21,6 +21,18 @@ use crate::ledger::sandbox::Sandbox;
 use crate::ledger::transactor::{Transactor, TxFields, TxResult};
 
 /// AccountSet transactor.
+/// rippled `dirIsEmpty(view, keylet::ownerDir(id))`: no root page, or a
+/// root with no entries and no next page.
+fn owner_dir_is_empty(sandbox: &Sandbox, id: &[u8; 20]) -> bool {
+    let Some(root) = crate::tx::offer::json_at(sandbox, &keylet::owner_dir_key(id)) else { return true };
+    let entries = root.get("Indexes").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty());
+    let next = root
+        .get("IndexNext")
+        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|x| u64::from_str_radix(x, 16).ok())))
+        .unwrap_or(0);
+    !entries && next == 0
+}
+
 pub struct AccountSetTransactor;
 
 impl Transactor for AccountSetTransactor {
@@ -33,8 +45,10 @@ impl Transactor for AccountSetTransactor {
         }
         // Finding 314 (fuzz setflag:10 on 107060755 3BF114A758BD): SetAccount
         // preflight — asfAuthorizedNFTokenMinter must come with NFTokenMinter,
-        // clearing it must not, and NFTokenMinter without the flag is
-        // malformed (SetAccount.cpp:176-224).
+        // and clearing it must not (SetAccount.cpp:176-224). Finding 364
+        // (campaign 15 G-25, testnet 29318A81B45B): that is ALL preflight
+        // says — NFTokenMinter without SetFlag 10 lands tesSUCCESS and the
+        // field is simply ignored (doApply writes it only under SetFlag 10).
         let set_flag = tx.fields.get("SetFlag").and_then(|f| f.as_u64());
         let clear_flag = tx.fields.get("ClearFlag").and_then(|f| f.as_u64());
         let has_minter = tx.fields.get("NFTokenMinter").is_some();
@@ -42,9 +56,6 @@ impl Transactor for AccountSetTransactor {
             return TxResult::Malformed;
         }
         if clear_flag == Some(10) && has_minter {
-            return TxResult::Malformed;
-        }
-        if has_minter && set_flag != Some(10) {
             return TxResult::Malformed;
         }
         // Finding 321 (testnet 20864013 fuzz transferrate:overmax): a
@@ -63,15 +74,37 @@ impl Transactor for AccountSetTransactor {
         let Some(acct) = crate::tx::offer::json_at(sandbox, &acct_key) else {
             return TxResult::NoAccount;
         };
-        // Finding 323 (testnet 20864015 fuzz setflag:6): NoFreeze cannot be
-        // set once clawback is enabled, and clawback cannot be set once
-        // NoFreeze is (SetAccount.cpp:276-300, featureClawback).
+        // AccountSet::preclaim (AccountSet.cpp:168-221), in its order.
+        // Finding 363 (campaign 15 R-16 / R-19 / E-6, testnet B2729B55BFFF,
+        // B6030DD7D279, 3FD3C715789B): the RequireAuth and clawback owner
+        // tests lived in do_apply, AFTER the master-key tests, and the clawback
+        // one was skipped when the flag was already on. rippled judges all
+        // three here, before doApply ever looks at the signature:
+        //   1. RequireAuth (tf or asf) not yet set and the owner directory is
+        //      not empty → tecOWNERS;
+        //   2. SetFlag 16: NoFreeze set → tecNO_PERMISSION, else a non-empty
+        //      owner directory → tecOWNERS — whether or not clawback is
+        //      already on (F86's gate, #106703565 9709366F);
+        //   3. SetFlag 6 with clawback on → tecNO_PERMISSION (F323).
+        const LSF_REQUIRE_AUTH: u64 = 0x0004_0000;
+        const LSF_NO_FREEZE: u64 = 0x0020_0000;
+        const LSF_CLAWBACK: u64 = 0x8000_0000;
+        const TF_REQUIRE_AUTH: u64 = 0x0004_0000;
         let flags_in = acct["Flags"].as_u64().unwrap_or(0);
         let set_flag = tx.fields.get("SetFlag").and_then(|f| f.as_u64());
-        if set_flag == Some(6) && flags_in & 0x8000_0000 != 0 {
-            return TxResult::NoPermission;
+        let tf = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+        let set_require_auth = tf & TF_REQUIRE_AUTH != 0 || set_flag == Some(2);
+        if set_require_auth && flags_in & LSF_REQUIRE_AUTH == 0 && !owner_dir_is_empty(sandbox, &tx.account) {
+            return TxResult::Owners;
         }
-        if set_flag == Some(16) && flags_in & 0x0020_0000 != 0 {
+        if set_flag == Some(16) {
+            if flags_in & LSF_NO_FREEZE != 0 {
+                return TxResult::NoPermission;
+            }
+            if !owner_dir_is_empty(sandbox, &tx.account) {
+                return TxResult::Owners;
+            }
+        } else if set_flag == Some(6) && flags_in & LSF_CLAWBACK != 0 {
             return TxResult::NoPermission;
         }
         TxResult::Success
@@ -149,10 +182,11 @@ impl Transactor for AccountSetTransactor {
         }
 
         // Apply SetFlag
+        // Finding 361 (campaign 15 A-31 / A-32, testnet 243548C0FC8C
+        // SetFlag 32, A43E9649A176 ClearFlag 99): rippled has no range check —
+        // an asf value it does not know is a silent no-op (fee and sequence
+        // only). The `>= 32 → temMALFORMED` rule had no specimen behind it.
         if let Some(flag) = tx.fields.get("SetFlag").and_then(|f| f.as_u64()) {
-            if flag >= 32 {
-                return TxResult::Malformed;
-            }
             if let Some(bit) = asf_lsf(flag) {
                 let current = acct["Flags"].as_u64().unwrap_or(0);
                 acct["Flags"] = serde_json::Value::Number((current | bit).into());
@@ -173,9 +207,6 @@ impl Transactor for AccountSetTransactor {
         // asfAllowTrustLineClawback has no clear branch in SetAccount — the
         // flag is permanent, and clearing it is a no-op.
         if let Some(flag) = tx.fields.get("ClearFlag").and_then(|f| f.as_u64()).filter(|f| *f != 16) {
-            if flag >= 32 {
-                return TxResult::Malformed;
-            }
             // Finding 355 (testnet campaign 12, #20938476 2202F8FD): an issuer
             // that set NoFreeze cannot clear GlobalFreeze — SetAccount.cpp:
             // 367-375 applies the clear only when lsfNoFreeze is off (and the
@@ -223,36 +254,8 @@ impl Transactor for AccountSetTransactor {
             // nothing (tecOWNERS, SetAccount.cpp preclaim). `flags_in` is
             // the pre-tx word — the SetFlag path above may already have
             // set the bit, so judge on the transaction's intent.
-            let flags_in = serde_json::from_slice::<serde_json::Value>(&data)
-                .ok()
-                .and_then(|v| v["Flags"].as_u64())
-                .unwrap_or(0);
-            let wants_require_auth = tf & TF_REQUIRE_AUTH != 0
-                || tx.fields.get("SetFlag").and_then(|f| f.as_u64()) == Some(2);
-            // F86 — asfAllowTrustLineClawback (16) has the same "owns nothing"
-            // gate (SetAccount.cpp:278-292): refused tecNO_PERMISSION while
-            // lsfNoFreeze is set, tecOWNERS while the owner directory holds
-            // anything. #106703565 9709366F: SetFlag 16 by an account with 96
-            // objects — mainnet tecOWNERS, we set the bit.
-            let wants_clawback = tx.fields.get("SetFlag").and_then(|f| f.as_u64()) == Some(16)
-                && flags_in & 0x8000_0000 == 0;
-            if wants_clawback && flags_in & 0x0020_0000 != 0 {
-                return TxResult::NoPermission;
-            }
-            if (wants_require_auth && flags_in & 0x0004_0000 == 0) || wants_clawback {
-                let dir_key = keylet::owner_dir_key(&tx.account);
-                let owns_something = sandbox
-                    .read(&dir_key)
-                    .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok())
-                    .map(|root| {
-                        root.get("Indexes").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty())
-                            || root.get("IndexNext").and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|x| u64::from_str_radix(x, 16).ok()))).unwrap_or(0) != 0
-                    })
-                    .unwrap_or(false);
-                if owns_something {
-                    return TxResult::Owners;
-                }
-            }
+            // The RequireAuth / clawback owner gates (F86) are preclaim's now
+            // (Finding 363).
             for (set_bit, clear_bit, lsf) in [
                 (TF_REQUIRE_DEST_TAG, TF_OPTIONAL_DEST_TAG, 0x0002_0000u64),
                 (TF_REQUIRE_AUTH, TF_OPTIONAL_AUTH, 0x0004_0000u64),

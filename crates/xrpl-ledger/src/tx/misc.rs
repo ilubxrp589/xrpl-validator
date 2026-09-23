@@ -206,7 +206,18 @@ impl Transactor for SignerListSetTransactor {
             + tx.account_fee() as u128;
 
         if quorum == 0 {
-            // Quorum of 0 means delete the signer list
+            // Quorum of 0 means delete the signer list. Finding 365 (campaign
+            // 15 M-16, testnet 6E73BEFE2EAE, multi-signed): destroySignerList
+            // refuses while the master key is disabled and there is no
+            // regular key — the list is the account's last key — with
+            // tecNO_ALTERNATIVE_KEY, list or no list (SignerListSet.cpp:357-
+            // 368). We deleted it and locked the account out for good.
+            if let Some(a) = crate::tx::offer::json_at(sandbox, &acct_key) {
+                const LSF_DISABLE_MASTER: u64 = 0x0010_0000;
+                if a["Flags"].as_u64().unwrap_or(0) & LSF_DISABLE_MASTER != 0 && a.get("RegularKey").is_none() {
+                    return TxResult::NoAlternativeKey;
+                }
+            }
             if let Some(data) = sandbox.read(&signer_list_key) {
                 let node_hint = serde_json::from_slice::<serde_json::Value>(&data)
                     .ok()

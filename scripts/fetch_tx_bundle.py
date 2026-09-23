@@ -507,6 +507,13 @@ def main():
             named_keys.append(hashlib.sha512(b"\x00u" + bytes.fromhex(acct_id(tx["Owner"])) + int(tx["OfferSequence"]).to_bytes(4, "big")).digest()[:32].hex().upper())
         except Exception as e:
             print(f"note: escrow key: {e}", file=sys.stderr)
+    # Campaign 15: the account's SignerList is READ as the "alternative key" by AccountSet
+    # asfDisableMaster (AccountSet.cpp:315) and by a SetRegularKey that removes the key
+    # (SetRegularKey.cpp:70) — neither writes it, so a tes meta never names it — and a
+    # fee-only tec SignerListSet never names the list it judged.
+    # keylet::signers = SHA512Half(0x0053 'S' || AccountID || u32 SignerListID 0).
+    if tx.get("TransactionType") in ("AccountSet", "SetRegularKey", "SignerListSet"):
+        named_keys.append(hashlib.sha512(b"\x00S" + bytes.fromhex(acct_id(tx["Account"])) + b"\x00\x00\x00\x00").digest()[:32].hex().upper())
     # LedgerStateFix BookExchangeRate (F359) names the directory it judges.
     for f in ("Channel", "CheckID", "DomainID", "BookDirectory"):
         v = tx.get(f)

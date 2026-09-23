@@ -672,7 +672,12 @@ pub fn preclaim_common(tx: &TxFields, sandbox: &Sandbox, ledger_seq: u32) -> TxR
         }
     }
     if let Some(want) = tx.fields.get("AccountTxnID").and_then(|v| v.as_str()) {
-        let have = acct.get("AccountTxnID").and_then(|v| v.as_str()).unwrap_or("");
+        // Finding 362 (campaign 15 A-36, testnet 17BD6EF1A614): rippled reads
+        // `sle->getFieldH256(sfAccountTxnID)`, and an absent optional field
+        // reads as ZERO (STObject.h:1184) — a tx naming the zero hash as its
+        // prior matches an account that never armed the field.
+        const ZERO: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+        let have = acct.get("AccountTxnID").and_then(|v| v.as_str()).unwrap_or(ZERO);
         if !have.eq_ignore_ascii_case(want) {
             return TxResult::WrongPrior;
         }
