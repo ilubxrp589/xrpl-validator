@@ -9613,7 +9613,7 @@ impl Transactor for OfferCreateTransactor {
         let pre_fee_xrp: u128 = json_at(sandbox, &keylet::account_root_key(&tx.account))
             .and_then(|a| a["Balance"].as_str().and_then(|s| s.parse::<u128>().ok()))
             .unwrap_or(0)
-            + tx.fee as u128;
+            + tx.account_fee() as u128;
         let tp_json = tx.fields["TakerPays"].clone();
         let tg_json = tx.fields["TakerGets"].clone();
         let (Some(tp0), Some(tg0)) =

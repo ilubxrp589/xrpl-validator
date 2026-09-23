@@ -451,7 +451,7 @@ fn prior_balance(sandbox: &Sandbox, tx: &TxFields) -> u64 {
     read_json(sandbox, &keylet::account_root_key(&tx.account))
         .and_then(|a| a["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()))
         .unwrap_or(0)
-        .saturating_add(tx.fee)
+        .saturating_add(tx.account_fee())
 }
 
 fn owner_count(sandbox: &Sandbox, acct: &[u8; 20]) -> u64 {

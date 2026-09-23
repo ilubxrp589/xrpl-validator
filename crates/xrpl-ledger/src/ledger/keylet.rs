@@ -34,6 +34,7 @@ const SPACE_ESCROW: [u8; 2] = [0x00, 0x75];       // 'u'
 const SPACE_PAY_CHANNEL: [u8; 2] = [0x00, 0x78];  // 'x'
 const SPACE_CHECK: [u8; 2] = [0x00, 0x43];        // 'C'
 const SPACE_DEPOSIT_PREAUTH: [u8; 2] = [0x00, 0x70]; // 'p'
+const SPACE_DELEGATE: [u8; 2] = [0x00, 0x45]; // 'E'
 const SPACE_DEPOSIT_PREAUTH_CREDENTIALS: [u8; 2] = [0x00, 0x50]; // 'P'
 
 /// Compute the state tree key for an AccountRoot.
@@ -583,6 +584,17 @@ pub fn deposit_preauth_credentials_key(account_id: &[u8; 20], sorted: &[([u8; 20
     // tecNO_ENTRY on the entry 20864003 had just filed; verified against
     // that entry's key 61EEB051… by brute force over the variants.
     buf.extend_from_slice(&(sorted.len() as u64).to_be_bytes());
+    sha512_half(&buf)
+}
+
+/// rippled `keylet::delegate(account, authorizedAccount)` — the Delegate
+/// object granting `authorized` permissions over `account`
+/// (PermissionDelegationV1_1).
+pub fn delegate_key(account_id: &[u8; 20], authorized: &[u8; 20]) -> Hash256 {
+    let mut buf = [0u8; 42];
+    buf[..2].copy_from_slice(&SPACE_DELEGATE);
+    buf[2..22].copy_from_slice(account_id);
+    buf[22..42].copy_from_slice(authorized);
     sha512_half(&buf)
 }
 

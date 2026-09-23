@@ -76,6 +76,8 @@ pub enum TxResult {
     /// tecFAILED_PROCESSING — LedgerStateFix found nothing to repair
     /// (LedgerStateFix.cpp doApply). Not the tel code below.
     TecFailedProcessing,
+    /// tecPSEUDO_ACCOUNT — DelegateSet authorizing a pseudo-account.
+    TecPseudoAccount,
     /// AccountDelete: the account's Sequence is too recent —
     /// `sequence + 255 > view.seq()` (AccountDelete.cpp kSeqDelta).
     TooSoon,
@@ -308,6 +310,7 @@ impl TxResult {
             | TxResult::Expired
             | TxResult::CryptoConditionError
             | TxResult::TecFailedProcessing
+            | TxResult::TecPseudoAccount
             | TxResult::TooSoon
             | TxResult::PathPartial
             | TxResult::DstTagNeeded
@@ -389,6 +392,7 @@ impl TxResult {
             TxResult::Expired => "tecEXPIRED",
             TxResult::CryptoConditionError => "tecCRYPTOCONDITION_ERROR",
             TxResult::TecFailedProcessing => "tecFAILED_PROCESSING",
+            TxResult::TecPseudoAccount => "tecPSEUDO_ACCOUNT",
             TxResult::PathPartial => "tecPATH_PARTIAL",
             TxResult::DstTagNeeded => "tecDST_TAG_NEEDED",
             TxResult::ArrayTooLarge => "tecARRAY_TOO_LARGE",
@@ -497,6 +501,26 @@ pub struct TxFields {
 }
 
 impl TxFields {
+    /// The account that signed on `account`'s behalf (`sfDelegate`,
+    /// PermissionDelegationV1_1): the transaction's initiator, and so its
+    /// FEE PAYER (`STTx::getInitiator`, `Transactor::getFeePayer`).
+    pub fn delegate(&self) -> Option<[u8; 20]> {
+        crate::tx::offer::decode20(self.fields.get("Delegate")?.as_str()?)
+    }
+
+    /// The part of the fee drawn from `account` itself: all of it, or none
+    /// when a delegate pays. Finding 360: rippled's `preFeeBalance_` is the
+    /// ACCOUNT's balance before the fee; every site that rebuilds it as
+    /// "post-fee balance + fee" must add this, not `fee` — a delegated
+    /// transaction leaves the account's balance untouched.
+    pub fn account_fee(&self) -> u64 {
+        if self.delegate().is_some() {
+            0
+        } else {
+            self.fee
+        }
+    }
+
     /// Whether this transaction uses a Ticket instead of a regular Sequence.
     pub fn uses_ticket(&self) -> bool {
         self.sequence == 0 && self.ticket_seq.is_some()
@@ -676,18 +700,30 @@ pub fn apply_common(tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
         Err(_) => return TxResult::Malformed,
     };
 
-    // Check balance >= fee
-    let balance = acct["Balance"]
-        .as_str()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-
-    if balance < tx.fee {
-        return TxResult::InsufficientFee;
+    // Finding 360 (PermissionDelegationV1_1, majority on mainnet 2026-09-21):
+    // `Transactor::apply` consumes the ACCOUNT's sequence or ticket, but
+    // `payFee` charges the fee payer — the delegate when `sfDelegate` is
+    // present (`getFeePayer` → `getInitiator`, Transactor.cpp:1414).
+    let fee_bal = |v: &serde_json::Value| v["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    if let Some(d) = tx.delegate() {
+        let dk = keylet::account_root_key(&d);
+        let Some(mut payer) = sandbox.read(&dk).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        else {
+            return TxResult::NoAccount;
+        };
+        let balance = fee_bal(&payer);
+        if balance < tx.fee {
+            return TxResult::InsufficientFee;
+        }
+        payer["Balance"] = serde_json::Value::String((balance - tx.fee).to_string());
+        sandbox.write(dk, serde_json::to_vec(&payer).unwrap_or_default());
+    } else {
+        let balance = fee_bal(&acct);
+        if balance < tx.fee {
+            return TxResult::InsufficientFee;
+        }
+        acct["Balance"] = serde_json::Value::String((balance - tx.fee).to_string());
     }
-
-    // Deduct fee
-    acct["Balance"] = serde_json::Value::String((balance - tx.fee).to_string());
 
 
     // Increment sequence only for non-ticket transactions.
@@ -753,7 +789,7 @@ mod claim_tests {
             TxResult::LimitExceeded, TxResult::NoLine, TxResult::Frozen, TxResult::NoPermission,
             TxResult::PathDry, TxResult::PathPartial, TxResult::Killed, TxResult::Expired,
             TxResult::AmmNotEmpty, TxResult::CryptoConditionError, TxResult::TecArrayEmpty, TxResult::TokenPairNotFound,
-            TxResult::TecFailedProcessing,
+            TxResult::TecFailedProcessing, TxResult::TecPseudoAccount,
         ];
         for r in all {
             assert!(r.code_str().starts_with("tec"), "{:?}", r);

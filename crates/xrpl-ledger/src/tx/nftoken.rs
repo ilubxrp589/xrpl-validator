@@ -418,7 +418,7 @@ impl Transactor for NFTokenMintTransactor {
             if let Some(d) = sandbox.read(&acct_key) {
                 if let Ok(a) = serde_json::from_slice::<serde_json::Value>(&d) {
                     let bal: u64 = a["Balance"].as_str().and_then(|v| v.parse().ok()).unwrap_or(0);
-                    if bal + tx.fee < crate::ledger::fees::account_reserve(sandbox, owner_count_after) {
+                    if bal + tx.account_fee() < crate::ledger::fees::account_reserve(sandbox, owner_count_after) {
                         return TxResult::InsufficientReserve;
                     }
                 }
@@ -734,7 +734,7 @@ impl Transactor for NFTokenCreateOfferTransactor {
             if let Some(d) = sandbox.read(&acct_key) {
                 if let Ok(a) = serde_json::from_slice::<serde_json::Value>(&d) {
                     let bal: u64 = a["Balance"].as_str().and_then(|v| v.parse().ok()).unwrap_or(0);
-                    if bal + tx.fee < crate::ledger::fees::account_reserve(sandbox, owner_count_after) {
+                    if bal + tx.account_fee() < crate::ledger::fees::account_reserve(sandbox, owner_count_after) {
                         return TxResult::InsufficientReserve;
                     }
                 }

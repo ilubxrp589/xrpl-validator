@@ -375,7 +375,7 @@ impl Transactor for EscrowCreateTransactor {
         // The destination tests (tag) come after both. #106703533 F84D3EB3:
         // 1000 drops from an account with 96 objects and 20274654 drops —
         // reserve(97) = 20400000, mainnet refuses; we escrowed it.
-        let post_fee = balance_of(&acct).saturating_sub(tx.fee);
+        let post_fee = balance_of(&acct).saturating_sub(tx.account_fee());
         let oc = acct["OwnerCount"].as_u64().unwrap_or(0);
         let reserve = crate::ledger::fees::account_reserve(sandbox, oc + 1);
         if post_fee < reserve {
@@ -1037,7 +1037,7 @@ impl Transactor for EscrowFinishTransactor {
                     // the line's reserve is judged at OwnerCount (not + 1).
                     let recycled = crate::ledger::amendments::fix_cleanup_3_4_0(sandbox) && dest_id == owner_id;
                     let need = oc + 1 - u64::from(recycled);
-                    if bal.saturating_add(tx.fee) < crate::ledger::fees::account_reserve(sandbox, need) {
+                    if bal.saturating_add(tx.account_fee()) < crate::ledger::fees::account_reserve(sandbox, need) {
                         return TxResult::NoLineInsufReserve;
                     }
                     // `line_adjust` below creates the line as `trustCreate` does.
@@ -1096,7 +1096,7 @@ impl Transactor for EscrowFinishTransactor {
                 let locked_rate = escrow.get("TransferRate").and_then(|v| v.as_u64()).unwrap_or(1_000_000_000);
                 // mPriorBalance is the FINISHER's pre-fee balance; the token is
                 // created only when the finisher IS the destination.
-                let prior = balance_of(&dest).saturating_add(tx.fee);
+                let prior = balance_of(&dest).saturating_add(tx.account_fee());
                 match mpt_unlock_plan(
                     sandbox, &escrow, mptid, want, &owner_id, &dest_id, &mut dest,
                     dest_id == tx.account, prior, locked_rate,
@@ -1309,7 +1309,7 @@ impl Transactor for EscrowCancelTransactor {
                 && !sandbox.exists(&keylet::ripple_state_key(&owner_id, &leg.issuer, &leg.cur))
             {
                 let need = if crate::ledger::amendments::fix_cleanup_3_4_0(sandbox) { oc } else { oc + 1 };
-                if owner_balance.saturating_add(tx.fee) < crate::ledger::fees::account_reserve(sandbox, need) {
+                if owner_balance.saturating_add(tx.account_fee()) < crate::ledger::fees::account_reserve(sandbox, need) {
                     return TxResult::NoLineInsufReserve;
                 }
             }
@@ -1319,7 +1319,7 @@ impl Transactor for EscrowCancelTransactor {
         // at parity — sender and receiver are the same (Escrow.cpp:1407-1424).
         if let Some((mptid, want)) = escrow_mpt(&escrow) {
             let mut owner_json = crate::tx::offer::json_at(sandbox, &owner_key).unwrap_or_default();
-            let prior = balance_of(&owner_json).saturating_add(tx.fee);
+            let prior = balance_of(&owner_json).saturating_add(tx.account_fee());
             match mpt_unlock_plan(
                 sandbox, &escrow, mptid, want, &owner_id, &owner_id, &mut owner_json,
                 owner_id == tx.account, prior, 1_000_000_000,

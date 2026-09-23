@@ -10,6 +10,7 @@ pub mod batch;
 pub mod number;
 pub mod check;
 pub mod credential;
+pub mod delegate;
 pub mod direct_step;
 pub mod dispatch;
 pub mod escrow;

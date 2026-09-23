@@ -1730,7 +1730,7 @@ impl Transactor for AMMWithdrawTransactor {
         let pre_fee_xrp: u128 = ox::json_at(sandbox, &keylet::account_root_key(&tx.account))
             .and_then(|a| a["Balance"].as_str().and_then(|b| b.parse::<u128>().ok()))
             .unwrap_or(0)
-            + tx.fee as u128;
+            + tx.account_fee() as u128;
         // A pool cannot pay out more of an asset than it holds:
         // AMMWithdraw::preclaim's checkAmount rejects amount > balance with
         // tecAMM_BALANCE before anything moves (AMMWithdraw.cpp:232).

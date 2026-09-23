@@ -191,7 +191,7 @@ impl Transactor for CheckCreateTransactor {
                 None => return TxResult::NoAccount,
             };
             let reserve = crate::ledger::fees::account_reserve(sandbox, oc + 1);
-            if bal.saturating_add(tx.fee) < reserve {
+            if bal.saturating_add(tx.account_fee()) < reserve {
                 return TxResult::InsufficientReserve;
             }
         }
@@ -445,7 +445,7 @@ impl Transactor for CheckCashTransactor {
                         let oc = a["OwnerCount"].as_u64().unwrap_or(0);
                         let bal = a["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
                         // CheckCash.cpp:403-421 `checkReserve(preFeeBalance_, ownerCountDelta 1)`.
-                        let pre_fee = bal.saturating_add(tx.fee);
+                        let pre_fee = bal.saturating_add(tx.account_fee());
                         if pre_fee < crate::ledger::fees::account_reserve(sandbox, oc + 1) {
                             return TxResult::NoLineInsufReserve;
                         }

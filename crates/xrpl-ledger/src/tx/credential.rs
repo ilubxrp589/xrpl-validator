@@ -148,7 +148,7 @@ impl Transactor for CredentialCreateTransactor {
                 ),
                 None => return TxResult::NoAccount,
             };
-            if bal.saturating_add(tx.fee) < crate::ledger::fees::account_reserve(sandbox, oc + 1) {
+            if bal.saturating_add(tx.account_fee()) < crate::ledger::fees::account_reserve(sandbox, oc + 1) {
                 return TxResult::InsufficientReserve;
             }
         }
@@ -727,7 +727,7 @@ impl Transactor for CredentialAcceptTransactor {
                 ),
                 None => return TxResult::NoAccount,
             };
-            if bal.saturating_add(tx.fee) < crate::ledger::fees::account_reserve(sandbox, oc + 1) {
+            if bal.saturating_add(tx.account_fee()) < crate::ledger::fees::account_reserve(sandbox, oc + 1) {
                 return TxResult::InsufficientReserve;
             }
         }

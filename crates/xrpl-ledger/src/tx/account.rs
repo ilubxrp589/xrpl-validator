@@ -640,11 +640,19 @@ impl Transactor for AccountDeleteTransactor {
                     // removeFromLedger (the owner-directory entry and the object; a
                     // Credential leaves BOTH parties' directories, credentials::
                     // deleteSLE). We answered tecNO_PERMISSION for any of them.
-                    Some("DID") | Some("Oracle") | Some("Delegate") => {
+                    Some("DID") | Some("Oracle") => {
                         crate::ledger::directory::owner_dir_remove(
                             sandbox, &tx.account, kh, hint_of(obj, "OwnerNode"), true,
                         );
                         sandbox.delete(*kh);
+                    }
+                    // Finding 360: a Delegate sits in BOTH parties' directories
+                    // (OwnerNode / DestinationNode) and the account being
+                    // deleted may be either party — rippled removes it through
+                    // DelegateSet::deleteDelegate (AccountDelete.cpp:177-185):
+                    // both directories, keepRoot false, the delegator's count.
+                    Some("Delegate") => {
+                        crate::tx::delegate::delete_delegate_object(sandbox, kh);
                     }
                     Some("Credential") => {
                         crate::tx::credential::delete_credential_object(sandbox, kh);

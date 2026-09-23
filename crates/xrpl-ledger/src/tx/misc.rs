@@ -203,7 +203,7 @@ impl Transactor for SignerListSetTransactor {
         let pre_fee_xrp: u128 = crate::tx::offer::json_at(sandbox, &acct_key)
             .and_then(|a| a["Balance"].as_str().and_then(|b| b.parse::<u128>().ok()))
             .unwrap_or(0)
-            + tx.fee as u128;
+            + tx.account_fee() as u128;
 
         if quorum == 0 {
             // Quorum of 0 means delete the signer list
@@ -497,7 +497,7 @@ impl Transactor for DepositPreauthTransactor {
                     ),
                     None => return TxResult::NoAccount,
                 };
-                if bal.saturating_add(tx.fee) < crate::ledger::fees::account_reserve(sandbox, oc + 1) {
+                if bal.saturating_add(tx.account_fee()) < crate::ledger::fees::account_reserve(sandbox, oc + 1) {
                     return TxResult::InsufficientReserve;
                 }
             }
@@ -558,7 +558,7 @@ impl Transactor for DepositPreauthTransactor {
                     ),
                     None => return TxResult::NoAccount,
                 };
-                if bal.saturating_add(tx.fee) < crate::ledger::fees::account_reserve(sandbox, oc + 1) {
+                if bal.saturating_add(tx.account_fee()) < crate::ledger::fees::account_reserve(sandbox, oc + 1) {
                     return TxResult::InsufficientReserve;
                 }
             }
