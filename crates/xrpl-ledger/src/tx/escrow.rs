@@ -572,16 +572,6 @@ fn escrow_mpt(escrow: &serde_json::Value) -> Option<([u8; 24], u64)> {
     crate::tx::mpt::parse_mpt_amount(amt)
 }
 
-/// `divideRound(amount, rate, asset, roundUp=true)` for an integral (MPT)
-/// asset: amount / (rate / 1e9), rounded away from zero (STAmount.cpp
-/// divRoundImpl, canonicalizeRound on an integral result).
-fn mpt_divide_round_up(amount: u64, rate: u64) -> u64 {
-    if rate == 1_000_000_000 {
-        return amount;
-    }
-    ((amount as u128 * 1_000_000_000u128).div_ceil(rate as u128)) as u64
-}
-
 /// Finding 332 — `escrowUnlockApplyHelper<MPTIssue>` (Escrow.cpp:955-1017),
 /// the part that DECIDES before anything is written: the receiver's MPToken
 /// is created when the destination finishes its own escrow (reserve at
@@ -641,7 +631,10 @@ fn mpt_unlock_plan(
         if crate::ledger::amendments::fix_cleanup_3_4_0(sandbox) {
             ((want as u128 * 1_000_000_000u128) / locked as u128) as u64
         } else {
-            mpt_divide_round_up(want, locked)
+            // Finding 371 (campaign 18 6-12 / 6-14): divideRound's legacy
+            // canonicalizeRound, not a ceiling — 73 @1.25% delivers 72, and
+            // 1.5e15 @50% delivers 1e15 + 1.
+            crate::tx::mpt::mpt_divide_round_up_legacy(want, locked).unwrap_or(want)
         }
     } else {
         want

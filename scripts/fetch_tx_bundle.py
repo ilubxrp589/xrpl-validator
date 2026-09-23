@@ -557,6 +557,22 @@ def main():
             _put(rpc("ledger_entry", {"mpt_issuance": mid, "ledger_index": seq - 1, "binary": True}))
             for who in {tx.get("Account"), tx.get("Holder")} - {None}:
                 _put(rpc("ledger_entry", {"mptoken": {"mpt_issuance_id": mid, "account": who}, "ledger_index": seq - 1, "binary": True}))
+        # Campaign 18 (testnet MPT depth): a direct MPT Payment (MPTokensV1
+        # arm) and an MPT Clawback READ the issuance and every party's
+        # MPToken (requireAuth, canTransfer, isAnyFrozen, transferRate, the
+        # MaximumAmount cap, accountHolds) — a fee-only tec (tecNO_AUTH,
+        # tecLOCKED, tecPATH_PARTIAL, tecINSUFFICIENT_FUNDS, ...) names none,
+        # and a tes whose fee rounds to zero leaves the issuance net-unchanged.
+        c18_mid = None
+        for f18 in ("Amount", "SendMax", "DeliverMin"):
+            v18 = tx.get(f18)
+            if isinstance(v18, dict) and v18.get("mpt_issuance_id"):
+                c18_mid = v18["mpt_issuance_id"]
+                break
+        if tt in ("Payment", "Clawback") and c18_mid:
+            _put(rpc("ledger_entry", {"mpt_issuance": c18_mid, "ledger_index": seq - 1, "binary": True}))
+            for who in {tx.get("Account"), tx.get("Destination"), tx.get("Holder")} - {None}:
+                _put(rpc("ledger_entry", {"mptoken": {"mpt_issuance_id": c18_mid, "account": who}, "ledger_index": seq - 1, "binary": True}))
         if tt == "AccountDelete":
             # Finding 354 / campaign 11: the blocker test walks the WHOLE owner
             # directory; a tecHAS_OBLIGATIONS names only the root.

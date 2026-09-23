@@ -654,6 +654,30 @@ impl Transactor for ClawbackTransactor {
             Some(a) => a,
             None => return TxResult::Malformed,
         };
+        // Finding 373 (campaign 18 5-10 MPT / 9-1 IOU, testnet A6F33689C9FF,
+        // EB4860F45631): Clawback::preclaim refuses an AMM account as the
+        // holder — tecPSEUDO_ACCOUNT for any pseudo-account once
+        // SingleAssetVault is on, else tecAMM_ACCOUNT on sfAMMID — before
+        // either arm's own checks (Clawback.cpp:196-203). The holder is
+        // `Holder` for an MPT, the amount's issuer field for an IOU.
+        {
+            let holder = if amount.get("mpt_issuance_id").is_some() {
+                tx.fields.get("Holder").and_then(decode_account_id)
+            } else {
+                amount.get("issuer").and_then(decode_account_id)
+            };
+            if let Some(h) = holder {
+                if let Some(root) = crate::tx::offer::json_at(sandbox, &keylet::account_root_key(&h)) {
+                    let sav = crate::ledger::amendments::enabled(sandbox, crate::ledger::amendments::SINGLE_ASSET_VAULT);
+                    if sav && is_pseudo_account(sandbox, &h) {
+                        return TxResult::TecPseudoAccount;
+                    }
+                    if root.get("AMMID").is_some() {
+                        return TxResult::TecAmmAccount;
+                    }
+                }
+            }
+        }
 
         // MPT arm (Clawback.cpp preclaimHelper<MPTIssue> + applyHelper).
         // rippled's preclaim order decides the code: missing issuance or
@@ -661,7 +685,7 @@ impl Transactor for ClawbackTransactor {
         // or wrong issuer → tecNO_PERMISSION; a holder whose spendable
         // balance is zero → tecINSUFFICIENT_FUNDS (3EC225FD, l106259185 —
         // the tx still consumes its Ticket, which is all its meta shows).
-        // Unported, no specimen: tecPSEUDO_ACCOUNT / tecAMM_ACCOUNT holders.
+        // (tecPSEUDO_ACCOUNT / tecAMM_ACCOUNT holders: judged above, F373.)
         if let Some((mptid, value)) = crate::tx::mpt::parse_mpt_amount(amount) {
             let holder = match tx.fields.get("Holder").and_then(|h| decode_account_id(h)) {
                 Some(h) => h,

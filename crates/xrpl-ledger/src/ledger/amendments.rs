@@ -61,6 +61,11 @@ pub fn fix_cleanup_3_4_0(sandbox: &Sandbox) -> bool {
     enabled(sandbox, FIX_CLEANUP_3_4_0)
 }
 
+/// DynamicMPT — not enabled on mainnet or testnet (2026-09-23). Widens what
+/// an MPTokenIssuanceSet may do on an issuance without lsfMPTCanLock.
+pub const DYNAMIC_MPT: &str =
+    "58E92F338758479C06084E1B6BA366BAD8F75E5329A7F0EEAFFFDA51E5106B7F";
+
 /// SingleAssetVault / LendingProtocol — enabled on devnet, NOT on mainnet as
 /// of 2026-09-21. Their one effect on the transactors we dispatch: a
 /// pseudo-account (AMM, Vault, LoanBroker) is created with Sequence 0

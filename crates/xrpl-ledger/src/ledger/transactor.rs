@@ -78,6 +78,8 @@ pub enum TxResult {
     TecFailedProcessing,
     /// tecPSEUDO_ACCOUNT — DelegateSet authorizing a pseudo-account.
     TecPseudoAccount,
+    /// tecAMM_ACCOUNT — Clawback from an AMM account.
+    TecAmmAccount,
     /// AccountDelete: the account's Sequence is too recent —
     /// `sequence + 255 > view.seq()` (AccountDelete.cpp kSeqDelta).
     TooSoon,
@@ -311,6 +313,7 @@ impl TxResult {
             | TxResult::CryptoConditionError
             | TxResult::TecFailedProcessing
             | TxResult::TecPseudoAccount
+            | TxResult::TecAmmAccount
             | TxResult::TooSoon
             | TxResult::PathPartial
             | TxResult::DstTagNeeded
@@ -393,6 +396,7 @@ impl TxResult {
             TxResult::CryptoConditionError => "tecCRYPTOCONDITION_ERROR",
             TxResult::TecFailedProcessing => "tecFAILED_PROCESSING",
             TxResult::TecPseudoAccount => "tecPSEUDO_ACCOUNT",
+            TxResult::TecAmmAccount => "tecAMM_ACCOUNT",
             TxResult::PathPartial => "tecPATH_PARTIAL",
             TxResult::DstTagNeeded => "tecDST_TAG_NEEDED",
             TxResult::ArrayTooLarge => "tecARRAY_TOO_LARGE",
@@ -794,7 +798,7 @@ mod claim_tests {
             TxResult::LimitExceeded, TxResult::NoLine, TxResult::Frozen, TxResult::NoPermission,
             TxResult::PathDry, TxResult::PathPartial, TxResult::Killed, TxResult::Expired,
             TxResult::AmmNotEmpty, TxResult::CryptoConditionError, TxResult::TecArrayEmpty, TxResult::TokenPairNotFound,
-            TxResult::TecFailedProcessing, TxResult::TecPseudoAccount,
+            TxResult::TecFailedProcessing, TxResult::TecPseudoAccount, TxResult::TecAmmAccount,
         ];
         for r in all {
             assert!(r.code_str().starts_with("tec"), "{:?}", r);

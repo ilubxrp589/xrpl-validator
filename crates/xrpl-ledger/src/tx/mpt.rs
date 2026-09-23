@@ -383,14 +383,20 @@ pub fn apply_mpt_payment(
         .map(|(_, v)| v)
         .unwrap_or(value);
 
-    // "No rounding. It'll change once MPT integrated into DEX" — the cost is
-    // value×rate/1e9 in exact integer arithmetic (u128 intermediate).
-    let cost_of = |v: u64| -> u64 { ((v as u128) * (rate as u128) / 1_000_000_000u128) as u64 };
+    // Finding 370 (campaign 18, 10 testnet specimens): "No rounding" in the
+    // source means no rounding MODE argument — not exact arithmetic. The cost
+    // is `multiply(dstAmount, rate)`: a Number product (16-digit mantissa,
+    // to nearest) cast to an integer (to nearest, ties even); a partial
+    // delivery is `divide(SendMax, rate)` (muldiv + 5, then to nearest); and
+    // the sender is debited `multiply(amountDeliver, rate)` recomputed in
+    // accountSend — which may exceed SendMax (3-19). We floored all three and
+    // debited `required`.
+    let Some(mut required) = mpt_multiply_rate(value, rate) else { return TxResult::PathPartial };
     let mut deliver = value;
-    let mut required = cost_of(value);
     if partial && required > max_source {
         required = max_source;
-        deliver = ((max_source as u128) * 1_000_000_000u128 / (rate as u128)) as u64;
+        let Some(d) = mpt_divide_rate(max_source, rate) else { return TxResult::PathPartial };
+        deliver = d;
     }
     let deliver_min = tx.fields.get("DeliverMin").and_then(parse_mpt_amount).map(|(_, v)| v);
     if required > max_source || deliver_min.is_some_and(|m| deliver < m) {
@@ -417,7 +423,8 @@ pub fn apply_mpt_payment(
         if leg != TxResult::Success {
             leg
         } else {
-            direct_send_no_fee(sandbox, &issuance_key, &tx.account, &issuer, required)
+            let Some(debit) = mpt_multiply_rate(deliver, rate) else { return TxResult::PathPartial };
+            direct_send_no_fee(sandbox, &issuance_key, &tx.account, &issuer, debit)
         }
     };
 
@@ -439,6 +446,95 @@ use crate::ledger::transactor::Transactor;
 fn issuance_id_of(tx: &TxFields) -> Option<[u8; 24]> {
     let s = tx.fields.get("MPTokenIssuanceID")?.as_str()?;
     hex::decode(s).ok()?.as_slice().try_into().ok()
+}
+
+/// A transfer `Rate` (1e9 = parity) as rippled's `detail::as_amount`:
+/// `STAmount(noIssue(), rate, -9)`, IOU-normalised to a mantissa in
+/// [1e15, 1e16).
+fn rate_as_iou(rate: u64) -> (u128, i32) {
+    let (mut m, mut e) = (rate as u128, -9i32);
+    while m < 1_000_000_000_000_000 {
+        m *= 10;
+        e -= 1;
+    }
+    while m >= 10_000_000_000_000_000 {
+        m /= 10;
+        e += 1;
+    }
+    (m, e)
+}
+
+/// rippled `multiply(STAmount mpt, Rate)` (Rate2.cpp:34 → STAmount.cpp
+/// multiply → `Number{v1} * Number{v2}` → `STAmount{asset, Number}` =
+/// fromNumber's `static_cast<int64>`): the product rounded to Number's
+/// 16-digit mantissa, then to an integer, both to nearest (ties even).
+/// Parity returns the amount untouched.
+pub(crate) fn mpt_multiply_rate(v: u64, rate: u64) -> Option<u64> {
+    use crate::tx::number::{Number, Rounding::ToNearest};
+    if rate == 1_000_000_000 || v == 0 {
+        return Some(v);
+    }
+    let (rm, re) = rate_as_iou(rate);
+    let a = Number::from_parts(false, v as u128, 0, ToNearest).ok()?;
+    let r = Number::from_parts(false, rm, re, ToNearest).ok()?;
+    let p = a.mul(r, ToNearest).ok()?.to_drops(ToNearest).ok()?;
+    u64::try_from(p).ok()
+}
+
+/// rippled `divide(STAmount mpt, Rate)` (Rate2.cpp → STAmount.cpp divide):
+/// the integral numerator scaled up to >= 1e15, `muldiv(num, 1e17, den) + 5`
+/// at offset `num − den − 17`, canonicalised through
+/// `MPTAmount{Number{…, Unchecked}}` — operator rep, to nearest.
+pub(crate) fn mpt_divide_rate(v: u64, rate: u64) -> Option<u64> {
+    use crate::tx::number::{Number, Rounding::ToNearest};
+    if rate == 1_000_000_000 || v == 0 {
+        return Some(v);
+    }
+    let (mut nv, mut no) = (v as u128, 0i32);
+    while nv < 1_000_000_000_000_000 {
+        nv *= 10;
+        no -= 1;
+    }
+    let (dv, doff) = rate_as_iou(rate);
+    let q = nv.checked_mul(100_000_000_000_000_000)? / dv + 5;
+    let r = Number::rep_from_raw(false, q, no - doff - 17, ToNearest).ok()?;
+    u64::try_from(r).ok()
+}
+
+/// rippled `divideRound(mpt, Rate, asset, roundUp = true)` on the LEGACY
+/// path (divRoundImpl without MPTokensV2): `muldivRound` rounding up, then
+/// `canonicalizeRound` for an integral asset — cut to one decimal and add 9
+/// (two or more digits dropped) or 10 (one dropped) before the last divide.
+/// So a tenths digit of 0 does NOT round up, and an exact quotient still
+/// gains one when only one digit is dropped. A zero result is 1.
+pub(crate) fn mpt_divide_round_up_legacy(v: u64, rate: u64) -> Option<u64> {
+    if rate == 1_000_000_000 || v == 0 {
+        return Some(v);
+    }
+    let (mut nv, mut no) = (v as u128, 0i32);
+    while nv < 1_000_000_000_000_000 {
+        nv *= 10;
+        no -= 1;
+    }
+    let (dv, doff) = rate_as_iou(rate);
+    let mut amount = (nv.checked_mul(100_000_000_000_000_000)? + (dv - 1)) / dv;
+    let mut offset = no - doff - 17;
+    if offset < 0 {
+        let mut loops = 0;
+        while offset < -1 {
+            amount /= 10;
+            offset += 1;
+            loops += 1;
+        }
+        amount += if loops >= 2 { 9 } else { 10 };
+        amount /= 10;
+        offset += 1;
+    }
+    while offset > 0 {
+        amount = amount.checked_mul(10)?;
+        offset -= 1;
+    }
+    u64::try_from(amount.max(1)).ok()
 }
 
 fn read_json(sandbox: &Sandbox, k: &Hash256) -> Option<serde_json::Value> {
@@ -505,7 +601,11 @@ impl Transactor for MPTokenIssuanceCreateTransactor {
         mptid[4..].copy_from_slice(&tx.account);
         let ikey = keylet::mpt_issuance_key(&mptid);
         let node = crate::ledger::directory::owner_dir_insert(sandbox, &tx.account, &ikey);
-        let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & !0x8000_0000;
+        // Finding 374: `args.flags & ~tfUniversal` (MPTokenIssuanceCreate.cpp
+        // :158), and tfUniversal is tfFullyCanonicalSig | tfInnerBatchTxn —
+        // 0xC0000000. Stripping only 0x80000000 would store 0x40000000 on an
+        // issuance created inside a Batch (BatchV1_1 activates ~2026-09-29).
+        let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & !0xC000_0000;
         let mut obj = serde_json::json!({
             "LedgerEntryType": "MPTokenIssuance",
             "Flags": flags,
@@ -778,8 +878,17 @@ impl Transactor for MPTokenIssuanceSetTransactor {
         let Some(iss) = read_json(sandbox, &ikey) else { return TxResult::ObjectNotFound };
         let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
         let iflags = iss.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
-        if iflags & LSF_MPT_CAN_LOCK == 0 && flags & (TF_MPT_LOCK | TF_MPT_UNLOCK) != 0 {
-            return TxResult::NoPermission;
+        // Finding 372 (campaign 18 4-19, testnet 6F5A4B7BDA4B): on an
+        // issuance without lsfMPTCanLock, EVERY IssuanceSet is
+        // tecNO_PERMISSION until SingleAssetVault or DynamicMPT is enabled;
+        // only then does the refusal narrow to lock/unlock
+        // (MPTokenIssuanceSet.cpp:142-154). A Flags-0 set landed tes here.
+        if iflags & LSF_MPT_CAN_LOCK == 0 {
+            use crate::ledger::amendments::{enabled, DYNAMIC_MPT, SINGLE_ASSET_VAULT};
+            let widened = enabled(sandbox, SINGLE_ASSET_VAULT) || enabled(sandbox, DYNAMIC_MPT);
+            if !widened || flags & (TF_MPT_LOCK | TF_MPT_UNLOCK) != 0 {
+                return TxResult::NoPermission;
+            }
         }
         let is_issuer = iss
             .get("Issuer")
@@ -899,5 +1008,41 @@ mod fixcleanup340_tests {
         let mut sb = Sandbox::new(&state);
         assert_eq!(MPTokenAuthorizeTransactor.do_apply(&tx, &mut sb), TxResult::NoPermission, "locked: refused under fixCleanup3_4_0");
         assert!(sb.exists(&tkey));
+    }
+}
+
+#[cfg(test)]
+mod f374_tests {
+    use super::*;
+    use crate::ledger::header::LedgerHeader;
+    use crate::ledger::state::LedgerState;
+
+    /// Finding 374: an issuance created by a Batch inner (Flags carry
+    /// tfInnerBatchTxn 0x40000000) stores its flags without EITHER universal
+    /// bit — `args.flags & ~tfUniversal`, tfUniversal = 0xC0000000.
+    #[test]
+    fn an_issuance_created_inside_a_batch_drops_tf_inner_batch_txn() {
+        let issuer = [0x07u8; 20];
+        let mut state = LedgerState::new_unverified(LedgerHeader {
+            sequence: 100, total_coins: 100_000_000_000_000_000,
+            parent_hash: Hash256([0; 32]), transaction_hash: Hash256([0; 32]), account_hash: Hash256([0; 32]),
+            parent_close_time: 0, close_time: 10, close_time_resolution: 10, close_flags: 0,
+        });
+        let acct = serde_json::json!({"LedgerEntryType": "AccountRoot", "Account": hex::encode(issuer),
+            "Balance": "50000000", "Sequence": 5, "OwnerCount": 0, "Flags": 0});
+        state.state_map.insert(keylet::account_root_key(&issuer), serde_json::to_vec(&acct).unwrap()).unwrap();
+        let tx = TxFields {
+            account: issuer, tx_type: "MPTokenIssuanceCreate".to_string(), fee: 0, sequence: 5,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({"Flags": 0x4000_0000u64 | 0x8000_0000 | 0x20 | 0x02}),
+            inner_batch: true,
+        };
+        let mut sb = Sandbox::new(&state);
+        assert_eq!(MPTokenIssuanceCreateTransactor.do_apply(&tx, &mut sb), TxResult::Success);
+        let mut id = [0u8; 24];
+        id[..4].copy_from_slice(&5u32.to_be_bytes());
+        id[4..].copy_from_slice(&issuer);
+        let iss: serde_json::Value = serde_json::from_slice(&sb.read(&keylet::mpt_issuance_key(&id)).unwrap()).unwrap();
+        assert_eq!(iss["Flags"].as_u64(), Some(0x22), "only the issuance flags survive: {iss}");
     }
 }
