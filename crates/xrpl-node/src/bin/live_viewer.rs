@@ -461,7 +461,7 @@ async fn main() {
     // clean and state.rocks is consistent. Marker absent while state.rocks exists =>
     // unclean shutdown (OOM/SIGKILL/power) => state may be torn => refuse to start
     // (no auto-recovery by design). Operator wipes+resyncs, or sets XRPL_FORCE_START=1.
-    {
+    let startup_integrity = {
         let marker_path = xrpl_node::paths::clean_shutdown_marker_path();
         let rocks_exists = std::path::Path::new(&rocks_db_path)
             .read_dir()
@@ -470,7 +470,8 @@ async fn main() {
         let marker_exists = std::path::Path::new(&marker_path).exists();
         let force_start = std::env::var("XRPL_FORCE_START").map(|v| v == "1").unwrap_or(false);
         use xrpl_node::startup::StartupIntegrity::*;
-        match xrpl_node::startup::assess_startup_integrity(rocks_exists, marker_exists, force_start) {
+        let integrity = xrpl_node::startup::assess_startup_integrity(rocks_exists, marker_exists, force_start);
+        match &integrity {
             FreshStart => eprintln!("[validator] startup integrity (F5): no prior state — will bulk-sync"),
             CleanResume => eprintln!("[validator] startup integrity (F5): clean prior shutdown — resuming"),
             ForcedResume => eprintln!("[validator] startup integrity (F5): WARNING — unclean prior shutdown, XRPL_FORCE_START=1 set — resuming on possibly-torn state.rocks"),
@@ -482,7 +483,8 @@ async fn main() {
         // Consume the marker: until the next clean shutdown rewrites it, its absence
         // means this session did not exit cleanly.
         let _ = std::fs::remove_file(&marker_path);
-    }
+        integrity
+    };
 
     let live_engine: Arc<Mutex<Option<xrpl_node::engine::LiveEngine>>> = Arc::new(Mutex::new(
         match xrpl_node::engine::LiveEngine::open(std::path::Path::new(&rocks_db_path)) {
@@ -617,22 +619,51 @@ async fn main() {
         Arc::new(parking_lot::Mutex::new(store))
     };
 
-    // Save cache on SIGTERM for instant restart (works with nohup/background)
+    // SIGTERM: park ws-sync at a ledger boundary, flush state.rocks, write the warm-restart resume
+    // ticket when it parked at a verified ledger, then the F5 clean-shutdown marker. The leaf cache
+    // is no longer saved here: nothing reads it, and the save held the hasher lock while a ledger
+    // could land unverified (docs/superpowers/specs/2026-09-24-warm-restart-design.md).
     {
-        let shc = state_hash_computer.clone();
+        let stop_db = live_engine.lock().as_ref().map(|e| e.db_arc());
         tokio::spawn(async move {
             let mut sigterm = tokio::signal::unix::signal(
                 tokio::signal::unix::SignalKind::terminate()
             ).expect("failed to register SIGTERM handler");
             sigterm.recv().await;
-            eprintln!("[shutdown] SIGTERM received — saving leaf cache...");
-            shc.save_cache();
+            eprintln!("[shutdown] SIGTERM received — parking ws-sync at a ledger boundary...");
+            let parked = xrpl_node::sync_stop::SYNC_STOP
+                .request_stop_and_park(Duration::from_secs(20))
+                .await;
+            if let Some(db) = stop_db.as_ref() {
+                match db.flush() {
+                    Ok(()) => eprintln!("[shutdown] state.rocks flushed"),
+                    Err(e) => eprintln!("[shutdown] state.rocks flush failed: {e}"),
+                }
+            }
+            match parked {
+                Some((seq, account_hash)) => {
+                    let ticket = xrpl_node::resume::ResumeTicket {
+                        seq,
+                        account_hash,
+                        written_at_unix: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
+                    };
+                    let path = xrpl_node::paths::resume_ticket_path();
+                    match xrpl_node::resume::write_ticket(std::path::Path::new(&path), &ticket) {
+                        Ok(()) => eprintln!("[shutdown] resume ticket written: #{seq}"),
+                        Err(e) => eprintln!("[shutdown] resume ticket write failed ({e}) — the next start will be cold"),
+                    }
+                }
+                None => eprintln!("[shutdown] ws-sync did not park at a verified ledger within 20 s — no resume ticket; the next start will be cold"),
+            }
             // Reaudit F5: record a clean shutdown so the next boot knows state.rocks
             // is consistent and may be resumed (rather than treated as torn).
             let marker = xrpl_node::paths::clean_shutdown_marker_path();
             match std::fs::write(&marker, "clean") {
-                Ok(()) => eprintln!("[shutdown] Cache saved, clean-shutdown marker written. Exiting."),
-                Err(e) => eprintln!("[shutdown] Cache saved, but FAILED to write clean-shutdown marker ({e}) — next boot will treat this as unclean. Exiting."),
+                Ok(()) => eprintln!("[shutdown] clean-shutdown marker written. Exiting."),
+                Err(e) => eprintln!("[shutdown] FAILED to write clean-shutdown marker ({e}) — next boot will treat this as unclean. Exiting."),
             }
             std::process::exit(0);
         });
@@ -666,7 +697,40 @@ async fn main() {
             let marker_path = xrpl_node::paths::sync_complete_marker_path();
             let sync_done = std::path::Path::new(&marker_path).exists();
 
-            if sync_done {
+            let warm_requested = std::env::var("XRPL_WARM_RESUME").map(|v| v == "1").unwrap_or(false);
+            if warm_requested {
+                // Warm restart (docs/superpowers/specs/2026-09-24-warm-restart-design.md). Step 0: the
+                // peer-driven legacy incremental syncer stays off for good, as in the bulk branch — it
+                // would otherwise write later ledgers into state.rocks while the checks run.
+                incremental_syncer.backfilling.store(true, std::sync::atomic::Ordering::SeqCst);
+                let clean = startup_integrity == xrpl_node::startup::StartupIntegrity::CleanResume;
+                let warm_db = db.clone();
+                let warm_hash = state_hash_computer.clone();
+                let warm_hist = history_store.clone();
+                #[cfg(feature = "ffi")]
+                let warm_ffi = Some(ffi_verifier.clone());
+                #[cfg(not(feature = "ffi"))]
+                let warm_ffi: Option<Arc<()>> = None;
+                tokio::spawn(async move {
+                    let net = xrpl_node::resume::RpcNetwork::new();
+                    let ticket_path = xrpl_node::paths::resume_ticket_path();
+                    match xrpl_node::resume::run_warm_resume(&net, &warm_db, &warm_hash, clean, std::path::Path::new(&ticket_path)).await {
+                        Ok(v) => {
+                            let _ = std::fs::write(xrpl_node::paths::sync_complete_marker_path(), v.entries.to_string());
+                            eprintln!(
+                                "[resume] OK: #{} verified (root {}) — rebuilt in {:.1}s, {} ledgers behind — ws-sync from #{}",
+                                v.seq, &v.root[..16.min(v.root.len())], v.build_secs, v.gap, v.seq + 1
+                            );
+                            let ws_last = Arc::new(std::sync::atomic::AtomicU32::new(v.seq));
+                            xrpl_node::ws_sync::start_ws_sync(warm_db, warm_hash, ws_last, Some(warm_hist), warm_ffi).await;
+                        }
+                        Err(reason) => {
+                            eprintln!("[resume] FALLBACK: {reason}");
+                            std::process::exit(xrpl_node::resume::FALLBACK_EXIT_CODE);
+                        }
+                    }
+                });
+            } else if sync_done {
                 eprintln!("[startup] Sync already completed — building SHAMap directly (~{estimated} entries)");
 
                 // Suppress inc-sync IMMEDIATELY — before SHAMap build starts.
