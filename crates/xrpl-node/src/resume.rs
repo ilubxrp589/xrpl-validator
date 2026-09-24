@@ -8,6 +8,10 @@
 //! `FALLBACK_EXIT_CODE` and the operator tooling relaunches with a full wipe and resync.
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use crate::state_hash::StateHashComputer;
+use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Exit status of a refused warm start; the deploy step relaunches cold on it.
 pub const FALLBACK_EXIT_CODE: i32 = 75;
@@ -88,6 +92,111 @@ fn short(hash: &str) -> &str {
     &hash[..hash.len().min(16)]
 }
 
+/// The network facts a warm start is checked against.
+pub trait Network {
+    fn validated_seq(&self) -> impl Future<Output = Option<u32>> + Send;
+    fn account_hash(&self, seq: u32) -> impl Future<Output = Option<String>> + Send;
+}
+
+/// The RPC source ws-sync uses (`XRPL_RPC_URL`, with the client's failover).
+pub struct RpcNetwork {
+    rpc: crate::rippled_client::RippledClient,
+}
+
+impl RpcNetwork {
+    pub fn new() -> Self {
+        Self { rpc: crate::rippled_client::RippledClient::new() }
+    }
+}
+
+impl Default for RpcNetwork {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Network for RpcNetwork {
+    async fn validated_seq(&self) -> Option<u32> {
+        let body = self.rpc.call("ledger", serde_json::json!({"ledger_index": "validated"})).await.ok()?;
+        body["result"]["ledger_index"]
+            .as_u64()
+            .map(|v| v as u32)
+            .or_else(|| body["result"]["ledger"]["ledger_index"].as_str().and_then(|s| s.parse().ok()))
+    }
+
+    async fn account_hash(&self, seq: u32) -> Option<String> {
+        crate::ws_sync::fetch_account_hash(&self.rpc, seq).await
+    }
+}
+
+/// What a successful check verified.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Verified {
+    pub seq: u32,
+    pub root: String,
+    pub gap: u32,
+    pub entries: u64,
+    pub build_secs: f64,
+}
+
+/// Build the ws-sync hasher from `state.rocks` (installing it in `hash_comp`) and take its root.
+/// Returns the root (hex), the entry count and the build time in seconds.
+pub async fn rebuild_root(db: &Arc<rocksdb::DB>, hash_comp: &Arc<StateHashComputer>) -> Result<(String, u64, f64), String> {
+    let (d, hc) = (db.clone(), hash_comp.clone());
+    let t0 = std::time::Instant::now();
+    let root = tokio::task::spawn_blocking(move || hc.update_and_hash(&d, &[]))
+        .await
+        .map_err(|e| format!("hasher build task failed: {e}"))?
+        .ok_or("hasher produced no root")?;
+    let entries = hash_comp.hasher_entries().unwrap_or(0) as u64;
+    Ok((hex::encode(root.0), entries, t0.elapsed().as_secs_f64()))
+}
+
+/// The network's account hash for `seq`, three attempts two seconds apart.
+async fn account_hash_with_retries<N: Network>(net: &N, seq: u32) -> Option<String> {
+    for attempt in 0..3 {
+        if let Some(h) = net.account_hash(seq).await {
+            return Some(h);
+        }
+        if attempt < 2 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+    None
+}
+
+/// The rehearsal check (no ticket): the bookmark's rebuilt root against the network's account
+/// hash. The gap is reported, not capped.
+pub async fn verify_state_at_bookmark<N: Network>(net: &N, db: &Arc<rocksdb::DB>, hash_comp: &Arc<StateHashComputer>) -> Result<Verified, String> {
+    let seq = read_bookmark(db).ok_or("state.rocks has no meta:last_seq bookmark")?;
+    let gap = net.validated_seq().await.map(|v| v.saturating_sub(seq)).unwrap_or(0);
+    let (root, entries, build_secs) = rebuild_root(db, hash_comp).await?;
+    check_root(seq, &root, account_hash_with_retries(net, seq).await.as_deref(), None)?;
+    Ok(Verified { seq, root, gap, entries, build_secs })
+}
+
+/// The warm start (spec §2, steps 1-6; step 0 — the incremental syncer — is the caller's).
+/// Any `Err` is a fallback reason. On `Ok` the hasher in `hash_comp` holds the verified state and
+/// ws-sync may start with `last_synced = seq`.
+pub async fn run_warm_resume<N: Network>(
+    net: &N,
+    db: &Arc<rocksdb::DB>,
+    hash_comp: &Arc<StateHashComputer>,
+    clean: bool,
+    ticket_path: &Path,
+) -> Result<Verified, String> {
+    let ticket = take_ticket(ticket_path);
+    if !clean {
+        return Err("the F5 integrity check did not report a clean prior shutdown".to_string());
+    }
+    let seq = check_ticket(ticket.as_ref(), read_bookmark(db))?;
+    let gap = check_gap(seq, net.validated_seq().await)?;
+    let (root, entries, build_secs) = rebuild_root(db, hash_comp).await?;
+    let network_hash = account_hash_with_retries(net, seq).await;
+    check_root(seq, &root, network_hash.as_deref(), ticket.as_ref().map(|t| t.account_hash.as_str()))?;
+    Ok(Verified { seq, root, gap, entries, build_secs })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,5 +263,115 @@ mod tests {
         assert_eq!(check_root(500, &root, Some(&root.to_lowercase()), None), Ok(()), "hex case does not matter");
         assert!(check_root(500, &root, Some(&root), Some(&"11".repeat(32))).unwrap_err().contains("ticket"));
         assert_eq!(check_root(500, &root, Some(&root), Some(&root)), Ok(()));
+    }
+
+    use crate::state_hash::StateHashComputer;
+    use std::sync::Arc;
+
+    struct FakeNet {
+        validated: Option<u32>,
+        hash: Option<String>,
+    }
+    impl Network for FakeNet {
+        async fn validated_seq(&self) -> Option<u32> {
+            self.validated
+        }
+        async fn account_hash(&self, _seq: u32) -> Option<String> {
+            self.hash.clone()
+        }
+    }
+
+    /// A tiny state.rocks at ledger #500 and its true root (computed by an independent hasher).
+    fn store_at_500() -> (tempfile::TempDir, Arc<rocksdb::DB>, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(rocksdb::DB::open_default(dir.path().join("state.rocks")).unwrap());
+        for b in [0x11u8, 0x5A, 0xC3] {
+            db.put([b; 32], vec![b; 40]).unwrap();
+        }
+        db.put(b"meta:last_seq", 500u32.to_le_bytes()).unwrap();
+        let root = StateHashComputer::new().update_and_hash(&db, &[]).map(|r| hex::encode(r.0)).unwrap();
+        (dir, db, root)
+    }
+
+    fn net(validated: u32, hash: &str) -> FakeNet {
+        FakeNet { validated: Some(validated), hash: Some(hash.to_string()) }
+    }
+
+    #[tokio::test]
+    async fn warm_resume_accepts_the_verified_store() {
+        let (dir, db, root) = store_at_500();
+        let path = dir.path().join("resume_ticket.json");
+        write_ticket(&path, &ticket(500, &root)).unwrap();
+        let hc = Arc::new(StateHashComputer::new());
+        let v = run_warm_resume(&net(510, &root), &db, &hc, true, &path).await.unwrap();
+        assert_eq!((v.seq, v.gap, v.entries), (500, 10, 3));
+        assert!(v.root.eq_ignore_ascii_case(&root));
+        assert!(!path.exists(), "the ticket is consumed");
+        assert_eq!(hc.hasher_entries(), Some(3), "the verified hasher is installed for ws-sync");
+    }
+
+    #[tokio::test]
+    async fn unclean_start_falls_back_and_consumes_the_ticket() {
+        let (dir, db, root) = store_at_500();
+        let path = dir.path().join("resume_ticket.json");
+        write_ticket(&path, &ticket(500, &root)).unwrap();
+        let e = run_warm_resume(&net(510, &root), &db, &Arc::new(StateHashComputer::new()), false, &path).await.unwrap_err();
+        assert!(e.contains("clean"), "{e}");
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn bookmark_missing_falls_back() {
+        let (dir, db, root) = store_at_500();
+        db.delete(b"meta:last_seq").unwrap();
+        let path = dir.path().join("resume_ticket.json");
+        write_ticket(&path, &ticket(500, &root)).unwrap();
+        let e = run_warm_resume(&net(510, &root), &db, &Arc::new(StateHashComputer::new()), true, &path).await.unwrap_err();
+        assert!(e.contains("meta:last_seq"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn stale_ticket_falls_back() {
+        let (dir, db, root) = store_at_500();
+        let path = dir.path().join("resume_ticket.json");
+        write_ticket(&path, &ticket(499, &root)).unwrap();
+        let e = run_warm_resume(&net(510, &root), &db, &Arc::new(StateHashComputer::new()), true, &path).await.unwrap_err();
+        assert!(e.contains("does not match"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn over_the_gap_cap_falls_back() {
+        let (dir, db, root) = store_at_500();
+        let path = dir.path().join("resume_ticket.json");
+        write_ticket(&path, &ticket(500, &root)).unwrap();
+        let e = run_warm_resume(&net(1_501, &root), &db, &Arc::new(StateHashComputer::new()), true, &path).await.unwrap_err();
+        assert!(e.contains("ledgers behind"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn wrong_root_falls_back() {
+        let (dir, db, root) = store_at_500();
+        let path = dir.path().join("resume_ticket.json");
+        write_ticket(&path, &ticket(500, &root)).unwrap();
+        let other = "00".repeat(32);
+        let e = run_warm_resume(&net(510, &other), &db, &Arc::new(StateHashComputer::new()), true, &path).await.unwrap_err();
+        assert!(e.contains("network account_hash"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn network_unavailable_falls_back() {
+        let (dir, db, root) = store_at_500();
+        let path = dir.path().join("resume_ticket.json");
+        write_ticket(&path, &ticket(500, &root)).unwrap();
+        let n = FakeNet { validated: Some(510), hash: None };
+        let e = run_warm_resume(&n, &db, &Arc::new(StateHashComputer::new()), true, &path).await.unwrap_err();
+        assert!(e.contains("unavailable"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn rehearsal_check_needs_no_ticket() {
+        let (_dir, db, root) = store_at_500();
+        let v = verify_state_at_bookmark(&net(900, &root), &db, &Arc::new(StateHashComputer::new())).await.unwrap();
+        assert_eq!((v.seq, v.gap), (500, 400));
     }
 }

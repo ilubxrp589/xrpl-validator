@@ -695,6 +695,11 @@ impl StateHashComputer {
         self.shamap.lock().as_ref().map(|m| m.root_hash())
     }
 
+    /// Entry count of the ws-sync hasher, once built.
+    pub fn hasher_entries(&self) -> Option<usize> {
+        self.hasher.lock().as_ref().map(|h| h.total)
+    }
+
     /// Flat bucketed hash — O(log n) updates, only dirty buckets recomputed.
     /// Build: ~10s from RocksDB. Incremental: ~50-100ms per ledger.
     /// Update the hasher with the latest values for `modified_keys` from
