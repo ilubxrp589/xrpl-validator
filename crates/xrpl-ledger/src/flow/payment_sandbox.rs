@@ -355,29 +355,27 @@ impl<'a, 'b> PaymentSandbox<'a, 'b> {
         self.layers.iter().rev().map(|l| &l.tab).chain(std::iter::once(&self.root_tab))
     }
 
+    /// The tables an `afView` read walks. A strand opens `PaymentSandbox
+    /// afView(&baseView)` BESIDE its own sandbox (StrandFlow.h:133), so the
+    /// afView's `ps_` chain is its own table (never credited: the offer
+    /// stream only reads it) and then the flow's tables — every table but
+    /// the innermost layer's, which is the strand trial itself.
+    fn af_tabs(&self) -> impl Iterator<Item = &DeferredCredits> {
+        self.layers.iter().rev().skip(1).map(|l| &l.tab).chain(std::iter::once(&self.root_tab))
+    }
+
     /// `balanceHookIOU(account, issuer, amount)`: `amount` is the account's
     /// current balance on the line with `issuer` (from the account's side);
     /// the answer is what it may SPEND — `min(amount, lastOrig − Σdebits,
     /// min orig)` across the stack; a negative XRP-issuer result clears.
     pub fn balance_hook_iou(&self, account: &[u8; 20], issuer: &[u8; 20], currency: &[u8; 20], amount: IouAmount) -> IouAmount {
-        let mut delta = IouAmount::ZERO;
-        let mut last_bal = amount;
-        let mut min_bal = amount;
-        for tab in self.tabs() {
-            if let Some(adj) = tab.adjustments_iou(account, issuer, currency) {
-                delta = delta.add(adj.debits);
-                last_bal = adj.orig_balance;
-                if last_bal < min_bal {
-                    min_bal = last_bal;
-                }
-            }
-        }
-        let candidates = [amount, last_bal.sub(delta), min_bal];
-        let adjusted = candidates.iter().copied().min().unwrap_or(amount);
-        if issuer == &[0u8; 20] && adjusted < IouAmount::ZERO {
-            return IouAmount::ZERO;
-        }
-        adjusted
+        hook_iou(self.tabs(), account, issuer, currency, amount)
+    }
+
+    /// `balanceHookIOU` as the strand's `afView` answers it (`af_tabs`):
+    /// the "original funds" an OfferStream compares with `ownerFunds_`.
+    pub fn af_balance_hook_iou(&self, account: &[u8; 20], issuer: &[u8; 20], currency: &[u8; 20], amount: IouAmount) -> IouAmount {
+        hook_iou(self.af_tabs(), account, issuer, currency, amount)
     }
 
     /// `creditHookIOU(from, to, amount, preCreditBalance)`.
@@ -389,21 +387,12 @@ impl<'a, 'b> PaymentSandbox<'a, 'b> {
     /// credits with `xrpAccount()` as the other party): the same
     /// min-of-three rule as the IOU hook, floored at zero.
     pub fn balance_hook_xrp(&self, account: &[u8; 20], amount: i128) -> i128 {
-        let other = [0u8; 20];
-        let mut delta: i128 = 0;
-        let mut last_bal = amount;
-        let mut min_bal = amount;
-        for tab in self.tabs() {
-            if let Some(adj) = tab.adjustments_xrp(account, &other) {
-                delta += adj.debits;
-                last_bal = adj.orig_balance;
-                if last_bal < min_bal {
-                    min_bal = last_bal;
-                }
-            }
-        }
-        let adjusted = amount.min(last_bal - delta).min(min_bal);
-        adjusted.max(0)
+        hook_xrp(self.tabs(), account, amount)
+    }
+
+    /// The XRP `balanceHook` as the strand's `afView` answers it.
+    pub fn af_balance_hook_xrp(&self, account: &[u8; 20], amount: i128) -> i128 {
+        hook_xrp(self.af_tabs(), account, amount)
     }
 
     /// `creditHook` for XRP.
@@ -418,14 +407,68 @@ impl<'a, 'b> PaymentSandbox<'a, 'b> {
 
     /// `ownerCountHook(account, count)`: the largest count on record.
     pub fn owner_count_hook(&self, account: &[u8; 20], count: OwnerCounts) -> OwnerCounts {
-        let mut result = count;
-        for tab in self.tabs() {
-            if let Some(c) = tab.owner_count(account) {
-                result = std::cmp::max(result, c);
+        hook_owner_count(self.tabs(), account, count)
+    }
+
+    /// `ownerCountHook` as the strand's `afView` answers it.
+    pub fn af_owner_count_hook(&self, account: &[u8; 20], count: OwnerCounts) -> OwnerCounts {
+        hook_owner_count(self.af_tabs(), account, count)
+    }
+}
+
+/// The `balanceHookIOU` walk over `tabs`, innermost first:
+/// `min(amount, lastOrig − Σdebits, min orig)`; a negative XRP-issuer
+/// result clears.
+fn hook_iou<'t>(tabs: impl Iterator<Item = &'t DeferredCredits>, account: &[u8; 20], issuer: &[u8; 20], currency: &[u8; 20], amount: IouAmount) -> IouAmount {
+    let mut delta = IouAmount::ZERO;
+    let mut last_bal = amount;
+    let mut min_bal = amount;
+    for tab in tabs {
+        if let Some(adj) = tab.adjustments_iou(account, issuer, currency) {
+            delta = delta.add(adj.debits);
+            last_bal = adj.orig_balance;
+            if last_bal < min_bal {
+                min_bal = last_bal;
             }
         }
-        result
     }
+    let candidates = [amount, last_bal.sub(delta), min_bal];
+    let adjusted = candidates.iter().copied().min().unwrap_or(amount);
+    if issuer == &[0u8; 20] && adjusted < IouAmount::ZERO {
+        return IouAmount::ZERO;
+    }
+    adjusted
+}
+
+/// The XRP `balanceHook` walk over `tabs` (credits recorded against
+/// `xrpAccount()`), floored at zero.
+fn hook_xrp<'t>(tabs: impl Iterator<Item = &'t DeferredCredits>, account: &[u8; 20], amount: i128) -> i128 {
+    let other = [0u8; 20];
+    let mut delta: i128 = 0;
+    let mut last_bal = amount;
+    let mut min_bal = amount;
+    for tab in tabs {
+        if let Some(adj) = tab.adjustments_xrp(account, &other) {
+            delta += adj.debits;
+            last_bal = adj.orig_balance;
+            if last_bal < min_bal {
+                min_bal = last_bal;
+            }
+        }
+    }
+    let adjusted = amount.min(last_bal - delta).min(min_bal);
+    adjusted.max(0)
+}
+
+/// The `ownerCountHook` walk over `tabs`: the largest count on record.
+fn hook_owner_count<'t>(tabs: impl Iterator<Item = &'t DeferredCredits>, account: &[u8; 20], count: OwnerCounts) -> OwnerCounts {
+    let mut result = count;
+    for tab in tabs {
+        if let Some(c) = tab.owner_count(account) {
+            result = std::cmp::max(result, c);
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -495,5 +538,46 @@ mod tests {
         assert_eq!(ps.owner_count_hook(&A, c(7)), c(7));
         ps.discard();
         assert_eq!(ps.owner_count_hook(&A, c(4)), c(5));
+    }
+
+    /// Finding 398: a strand's `afView` is a PaymentSandbox over the flow's
+    /// view, beside the strand's own — its hooks walk the flow's tables and
+    /// the root, never the strand trial's.
+    #[test]
+    fn the_af_view_walks_every_table_but_the_strand_trials_own() {
+        let state = LedgerState::new_unverified(header());
+        let mut sb = Sandbox::new(&state);
+        let mut ps = PaymentSandbox::new(&mut sb);
+        let c = |n: u32| OwnerCounts { owner: n, ..Default::default() };
+        let xrp = [0u8; 20];
+        // Outside any layer the afView is the live view.
+        ps.credit_hook_iou(&A, &B, &USD, iou(5), iou(200));
+        assert_eq!(ps.af_balance_hook_iou(&A, &B, &USD, iou(195)), ps.balance_hook_iou(&A, &B, &USD, iou(195)));
+        // The flow's view; an earlier iteration's winning strand debited A
+        // 30 USD of 195, 30 drops of 100, and deleted one of A's 5 objects.
+        ps.push();
+        ps.push();
+        ps.credit_hook_iou(&A, &B, &USD, iou(30), iou(195));
+        ps.credit_hook_xrp(&A, &xrp, 30, 100);
+        ps.adjust_owner_count_hook(&A, c(5), c(4));
+        assert!(ps.apply_to_parent());
+        // This iteration's trial debits A again and creates two objects.
+        ps.push();
+        ps.credit_hook_iou(&A, &B, &USD, iou(20), iou(165));
+        ps.credit_hook_xrp(&A, &xrp, 20, 70);
+        ps.adjust_owner_count_hook(&A, c(4), c(6));
+        // The strand's own view counts the trial: 200 − 55, 100 − 50, 6.
+        assert_eq!(ps.balance_hook_iou(&A, &B, &USD, iou(145)), iou(145));
+        assert_eq!(ps.balance_hook_xrp(&A, 50), 50);
+        assert_eq!(ps.owner_count_hook(&A, c(6)), c(6));
+        // The afView reads the entries as the trial opened (165 USD, 70
+        // drops, 4 objects) through the flow's tables and the root only.
+        assert_eq!(ps.af_balance_hook_iou(&A, &B, &USD, iou(165)), iou(165));
+        assert_eq!(ps.af_balance_hook_xrp(&A, 70), 70);
+        assert_eq!(ps.af_owner_count_hook(&A, c(4)), c(5));
+        // A raw read above what the tables allow is clamped by them — the
+        // mainnet shape (#107194228: the line read 1.5e-14, the hook 1e-14).
+        assert_eq!(ps.af_balance_hook_iou(&A, &B, &USD, iou(166)), iou(165));
+        assert_eq!(ps.af_balance_hook_xrp(&A, 71), 70);
     }
 }

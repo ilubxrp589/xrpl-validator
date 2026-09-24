@@ -186,3 +186,16 @@ fn c17_port_3_2_tk_ioc_bid_40_usd_for_50_eur_dust_cross_only_testnet_20976551() 
     port();
     run_bundle(include_str!("vectors/c17_port_3_2_tk_ioc_bid_40_usd_for_50_eur_dust_cross_only_testnet_20976551.json"));
 }
+
+/// Finding 398 (soak #27 receipt, mainnet #107194228 16D371B9DA8A): an IoC OfferCreate sells 942.58 XRP for
+/// RLUSD. Iteration 0 consumed four of the maker's five offers at one quality and left the fifth's funds at dust;
+/// iteration 1 finds it tiny (`shouldRmSmallIncreasedQOffer`). rippled compares `ownerFunds_` with
+/// `accountFundsHelper(cancelView_)`, and the cancelView is the strand's `afView` — a PaymentSandbox over the
+/// flow's sandbox, so `accountHolds` ends in `balanceHook` over the flow's deferred-credit tables. Both reads saw
+/// the same hooked 1e-14, so the offer was "found" tiny and removed (OwnerCount 7 to 2). We read the afView's raw
+/// line balance (1.5e-14) without the hook, judged it "became" tiny, and kept the offer.
+#[test]
+fn offer_found_tiny_is_judged_through_the_af_view_balance_hook_107194228() {
+    port();
+    run_bundle(include_str!("vectors/offer_found_tiny_is_judged_through_the_af_view_balance_hook_107194228.json"));
+}

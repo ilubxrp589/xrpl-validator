@@ -561,9 +561,14 @@ impl FlowOfferStream {
 }
 
 /// The two `original_funds` reads: `accountFundsHelper(cancelView_, …)`.
-/// The cancelView is the view the flow opened with — the base ledger plus
-/// what THIS transaction wrote before the flow (fee, sequence): for an
-/// offer owner other than the taker, the base ledger's own balance.
+/// The cancelView is the strand's `afView`: the entries as the flow's view
+/// holds them when the strand opened (`af_json`), and — because it is a
+/// PaymentSandbox over the flow's — `accountHolds` ends in `balanceHookIOU`
+/// over the flow's deferred-credit tables (`af_balance_hook_iou`). Without
+/// the hook an owner an earlier iteration debited reads the raw line where
+/// `ownerFunds_` reads the hooked one: unequal, so an offer rippled finds
+/// tiny or unfunded (and removes) looks like one that merely became so
+/// (finding 398, mainnet #107194228: raw 1.5e-14 against hooked 1e-14).
 fn account_funds_iou_original(ps: &PaymentSandbox, owner: &[u8; 20], asset: &Asset, amt_default: IouAmount) -> IouAmount {
     let Some(issuer) = asset.issuer else { return IouAmount::ZERO };
     if issuer == *owner {
@@ -584,7 +589,12 @@ fn account_funds_iou_original(ps: &PaymentSandbox, owner: &[u8; 20], asset: &Ass
     let party_low = *owner < issuer;
     let holder_neg = if party_low { neg && bal.0 > 0 } else { !neg && bal.0 > 0 };
     let b = IouAmount::from_me(holder_neg, bal);
-    if b <= IouAmount::ZERO { IouAmount::ZERO } else { b }
+    // `account_holds_iou`'s shape, on the afView: a line with nothing to
+    // spend reads zero; otherwise the hooked balance.
+    if b <= IouAmount::ZERO {
+        return IouAmount::ZERO;
+    }
+    ps.af_balance_hook_iou(owner, &issuer, &asset.currency, b)
 }
 
 fn xrp_liquid_original(ps: &PaymentSandbox, owner: &[u8; 20]) -> i128 {
@@ -606,10 +616,16 @@ fn xrp_liquid_original(ps: &PaymentSandbox, owner: &[u8; 20]) -> i128 {
     // saved_iteration_ins: the maker's first offer went at iteration 2, its
     // root read 73 at iteration 8, the reserve fell 0.2 XRP short and
     // "original" 200000 ≠ current 0 made a found-unfunded offer look like
-    // one that merely became so — mainnet removed it (OwnerCount 72).
-    let counts = ps.owner_count_hook(owner, raw);
+    // one that merely became so — mainnet removed it (OwnerCount 72). The
+    // chain stops at the flow's tables: the strand trial's own layer is not
+    // in it (`af_owner_count_hook`).
+    let counts = ps.af_owner_count_hook(owner, raw);
     let reserve = crate::ledger::fees::account_reserve(ps.sandbox(), counts.count() as u64) as i128;
-    (balance - reserve).max(0)
+    // Then `balance = balanceHookIOU(id, xrpAccount(), fullBalance)` on the
+    // same view, and `balance < reserve ? 0 : balance − reserve` — the live
+    // read's order (`xrp_liquid`).
+    let hooked = ps.af_balance_hook_xrp(owner, balance);
+    if hooked < reserve { 0 } else { hooked - reserve }
 }
 
 /// `TOfferStreamBase::erase`: drop a dangling directory entry.
