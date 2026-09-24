@@ -63,6 +63,12 @@ pub fn clean_shutdown_marker_path() -> String {
     format!("{}/clean_shutdown.marker", sync_dir())
 }
 
+/// Warm-restart resume ticket, written by a clean stop that parked ws-sync at a verified ledger
+/// (see `resume.rs`).
+pub fn resume_ticket_path() -> String {
+    format!("{}/resume_ticket.json", sync_dir())
+}
+
 /// Validator's signing key file (Ed25519 seed in hex). Honors
 /// `XRPL_SEED_PATH` if set.
 pub fn seed_path() -> String {
@@ -188,6 +194,7 @@ mod tests {
         assert_eq!(state_rocks_path(), "/mnt/xrpl-data/sync/state.rocks");
         assert_eq!(dl_done_path(), "/mnt/xrpl-data/sync/dl_done.txt");
         assert_eq!(sync_complete_marker_path(), "/mnt/xrpl-data/sync/sync_complete.marker");
+        assert_eq!(resume_ticket_path(), "/mnt/xrpl-data/sync/resume_ticket.json");
         assert_eq!(seed_path(), "/mnt/xrpl-data/validator_seed.hex");
         assert_eq!(engine_state_path(), "/mnt/xrpl-data/engine_state.json");
     }
@@ -203,6 +210,7 @@ mod tests {
         assert_eq!(state_rocks_path(), "/home/m3060/xrpl-data/sync/state.rocks");
         assert_eq!(dl_done_path(), "/home/m3060/xrpl-data/sync/dl_done.txt");
         assert_eq!(sync_complete_marker_path(), "/home/m3060/xrpl-data/sync/sync_complete.marker");
+        assert_eq!(resume_ticket_path(), "/home/m3060/xrpl-data/sync/resume_ticket.json");
         assert_eq!(seed_path(), "/home/m3060/xrpl-data/validator_seed.hex");
         assert_eq!(engine_state_path(), "/home/m3060/xrpl-data/engine_state.json");
 

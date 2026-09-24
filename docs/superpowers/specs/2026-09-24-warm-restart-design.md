@@ -39,7 +39,7 @@ It is the bookmark this design uses.
 - The shutdown path no longer saves `leaf_cache.bin`: nothing reads it, and the save holds the hasher lock while about
   1.3 GB is written — the window in which a ledger could land without being verified before exit.
 
-**Resume ticket:** `{sync}/resume_ticket.json`, `{"seq": N, "account_hash": "<hex>", "written_at": "<RFC 3339>"}`,
+**Resume ticket:** `{sync}/resume_ticket.json`, `{"seq": N, "account_hash": "<hex>", "written_at_unix": <seconds>}`,
 written atomically (temporary file, then rename). No ticket means no warm restart.
 
 ### 2. Proven resume
