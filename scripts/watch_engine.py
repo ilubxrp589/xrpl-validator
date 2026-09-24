@@ -317,6 +317,20 @@ def render():
                 blind = cd < cf
                 out.append(f"    receipt canary: {colored(f'{cd}/{cf} plants flagged', '1;31' if blind else '32')}"
                            + (colored("  — THE COMPARE IS BLIND", "1;31") if blind else ""))
+            # Receipts THIS soak: soak_start archives + truncates the file at each soak start, so its line count
+            # is the soak's receipt total (engine and mirror kinds; auto_triage classifies them). Canary lines are
+            # not receipts — they are counted apart.
+            try:
+                with open(SHADOW_RECEIPTS, "rb") as fh:
+                    lines = fh.read().splitlines()
+                n_can = sum(1 for ln in lines if b'"canary"' in ln)
+                n_rec = len(lines) - n_can
+                age_h = (time.time() - os.path.getmtime(SHADOW_RECEIPTS)) / 3600
+                can = f" + {n_can} canary check{'s' if n_can != 1 else ''} (not receipts)" if n_can else ""
+                out.append(f"    {colored(f'receipts this soak: {n_rec}', '1;32' if n_rec == 0 else '1;33')}{can}"
+                           f"  (last written {age_h:.1f}h ago; 0 = every ledger agreed byte-for-byte)")
+            except OSError:
+                pass
             # WHICH transactions are ter-missing. The counter alone cannot say,
             # and a wrong result code writes identical state, so the overlay
             # never shows it (F241: 292 CheckCash rode through cycle 108 green).

@@ -910,28 +910,38 @@ async fn main() {
     {
         let consensus_for_unl = consensus.clone();
         tokio::spawn(async move {
-            match xrpl_node::unl_fetch::fetch_default_unl_verified().await {
-                Ok(entries) => {
-                    let mut eng = consensus_for_unl.lock();
-                    // TMProposeSet messages are signed with EPHEMERAL signing keys, not master keys.
-                    // So we trust the signing keys in our UNL (extracted from each validator's manifest).
-                    // Fall back to master key if no signing key available (manifest rotation not tracked yet).
-                    let mut with_signing = 0;
-                    for e in &entries {
-                        if let Some(ref sk) = e.signing_key {
-                            eng.unl.add_trusted(sk.clone());
-                            with_signing += 1;
-                        } else {
-                            eng.unl.add_trusted(e.public_key.clone());
+            // Retried until a list loads (unl_fetch::unl_retry_delay): a publisher outage or a certificate fault
+            // on its side must delay consensus tracking, not disable it for the life of the process — on
+            // 2026-09-23 every restart since 09-21 had come up with the monitor frozen at round 1.
+            let mut attempt = 0u32;
+            loop {
+                match xrpl_node::unl_fetch::fetch_default_unl_verified().await {
+                    Ok(entries) => {
+                        let mut eng = consensus_for_unl.lock();
+                        // TMProposeSet messages are signed with EPHEMERAL signing keys, not master keys.
+                        // So we trust the signing keys in our UNL (extracted from each validator's manifest).
+                        // Fall back to master key if no signing key available (manifest rotation not tracked yet).
+                        let mut with_signing = 0;
+                        for e in &entries {
+                            if let Some(ref sk) = e.signing_key {
+                                eng.unl.add_trusted(sk.clone());
+                                with_signing += 1;
+                            } else {
+                                eng.unl.add_trusted(e.public_key.clone());
+                            }
                         }
+                        eprintln!(
+                            "[consensus] UNL loaded: {} validators, {} with signing keys, trust_count={}",
+                            entries.len(), with_signing, eng.unl.trusted_count()
+                        );
+                        break;
                     }
-                    eprintln!(
-                        "[consensus] UNL loaded: {} validators, {} with signing keys, trust_count={}",
-                        entries.len(), with_signing, eng.unl.trusted_count()
-                    );
-                }
-                Err(e) => {
-                    eprintln!("[consensus] UNL fetch failed: {e} — consensus disabled");
+                    Err(e) => {
+                        let wait = xrpl_node::unl_fetch::unl_retry_delay(attempt);
+                        eprintln!("[consensus] UNL fetch failed: {e} — consensus idle, retrying in {}s", wait.as_secs());
+                        tokio::time::sleep(wait).await;
+                        attempt = attempt.saturating_add(1);
+                    }
                 }
             }
         });

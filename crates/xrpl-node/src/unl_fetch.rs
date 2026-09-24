@@ -25,11 +25,24 @@
 
 use std::time::Duration;
 
-/// Default UNL sources (tried in order).
+/// Default UNL sources (tried in order) — rippled's own `validator_list_sites`.
+/// The XRPL Foundation's list is served at `unl.xrplf.org`: its certificate
+/// (renewed 2026-09-09) names `unl.xrplf.org` and `unl.xrpl.foundation` only,
+/// so the older `vl.xrplf.org` alias fails TLS on the hostname. Every list is
+/// verified on its own publisher signature (`unl_verify`), not on TLS.
 pub const DEFAULT_UNL_SOURCES: &[&str] = &[
     "https://vl.ripple.com/",
-    "https://vl.xrplf.org/",
+    "https://unl.xrplf.org/",
 ];
+
+/// How long the consensus monitor waits before retrying a failed UNL fetch:
+/// one minute, doubling, capped at fifteen. A publisher outage — or a
+/// certificate fault on its side, as on 2026-09-23 when vl.ripple.com served
+/// its leaf without the intermediate — must delay consensus tracking, not
+/// disable it for the life of the process.
+pub fn unl_retry_delay(attempt: u32) -> Duration {
+    Duration::from_secs((60u64 << attempt.min(4)).min(900))
+}
 
 /// A trusted validator's public key + current ephemeral signing key.
 #[derive(Debug, Clone)]
@@ -277,4 +290,19 @@ pub async fn fetch_default_unl() -> Result<Vec<UnlEntry>, String> {
         }
     }
     Err(format!("all UNL sources failed: {last_err}"))
+}
+
+#[cfg(test)]
+mod retry_tests {
+    #[test]
+    fn the_foundation_list_is_fetched_from_its_canonical_host() {
+        assert!(super::DEFAULT_UNL_SOURCES.contains(&"https://unl.xrplf.org/"));
+        assert!(!super::DEFAULT_UNL_SOURCES.contains(&"https://vl.xrplf.org/"));
+    }
+
+    #[test]
+    fn a_failed_unl_fetch_is_retried_with_capped_backoff() {
+        let secs: Vec<u64> = (0..7).map(|a| super::unl_retry_delay(a).as_secs()).collect();
+        assert_eq!(secs, vec![60, 120, 240, 480, 900, 900, 900]);
+    }
 }
