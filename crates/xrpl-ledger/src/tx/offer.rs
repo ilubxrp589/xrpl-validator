@@ -2109,7 +2109,7 @@ pub(crate) fn st_divide_legacy(num: Me, den: Me) -> Me {
 /// TakerPays = 1250001266.5 → mainnet files 1250001266 (even); `+7` filed
 /// 1250001267 and rested the offer one book level off (`…22D4AD189` for
 /// `…22CEF8678`).
-fn st_multiply(a: Me, b: Me, xrp: bool) -> Me {
+pub(crate) fn st_multiply(a: Me, b: Me, xrp: bool) -> Me {
     if a.0 == 0 || b.0 == 0 {
         return (0, 0);
     }

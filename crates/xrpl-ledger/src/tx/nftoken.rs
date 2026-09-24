@@ -1608,8 +1608,15 @@ fn pay_iou_with_transfer_fee(
         if net.0 == 0 || to == buyer {
             return;
         }
-        let r = if *buyer == leg.issuer || *to == leg.issuer { None } else { rate };
-        ox::move_leg_gross(sandbox, buyer, to, &leg, net, ox::gross_in(r, net));
+        // Finding 400: accountSend grosses with `multiply(saAmount, transferRate)` (TokenHelpers.cpp:869) —
+        // STAmount multiply, `Number{v1} * Number{v2}`, NEAREST at 16 digits — not the payment engine's
+        // round-up `mulRatio` that `gross_in` models. #107211701 AFDE9336FA6F: 211299.047746283 SOLO at the
+        // issuer's 1.0001 is …0576|283; mainnet debits …0576, the round-up debited …0577 (buyer line 1 ulp low).
+        let gross = match (*buyer == leg.issuer || *to == leg.issuer, rate) {
+            (false, Some(r)) => ox::st_multiply(net, (r as u128, -9), false),
+            _ => net,
+        };
+        ox::move_leg_gross(sandbox, buyer, to, &leg, net, gross);
     };
     if let Some((br, _)) = broker {
         if broker_cut.0 > 0 {

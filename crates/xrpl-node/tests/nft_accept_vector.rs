@@ -395,3 +395,12 @@ fn nft_c13_accept_of_an_expired_offer_is_tec_expired_ecf3f4863cb3() {
 fn nftaccept_destination_before_funds_107190696() {
     run_bundle(include_str!("vectors/nftaccept_destination_before_funds_107190696.json"));
 }
+
+/// Finding 400 (soak #28 receipt, mainnet #107211701 AFDE9336FA6F): a direct accept of a BUY offer priced 211,299.047746283
+/// SOLO under the SOLO issuer's TransferRate 1.0001 (the NFT's issuer is the seller, so no royalty). rippled's
+/// accountSend grosses the buyer's debit with `multiply(amount, rate)` — NEAREST at 16 digits: …0576|283 → …0576,
+/// buyer line −211.53170936. The engine used the payment engine's round-up `mulRatio` and debited …0577 (−211.5317093599).
+#[test]
+fn nftaccept_iou_transfer_fee_grosses_to_nearest_107211701() {
+    run_bundle(include_str!("vectors/nftaccept_iou_transfer_fee_grosses_to_nearest_107211701.json"));
+}
