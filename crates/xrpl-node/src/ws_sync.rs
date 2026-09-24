@@ -204,6 +204,14 @@ pub async fn start_ws_sync(
                 }
 
                 for process_seq in start_seq..=closed_seq {
+                    // Warm restart: hold the stop gate for the whole ledger. After a SIGTERM stop
+                    // request, park here — at a ledger boundary — and process nothing more.
+                    let Some(_ledger_gate) = crate::sync_stop::SYNC_STOP.enter_ledger().await else {
+                        eprintln!("[ws-sync] stop requested — parked after #{}", last_synced.load(Ordering::Acquire));
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                        }
+                    };
                     // Fetch account_hash for EVERY ledger so every one can be
                     // hash-verified (not just the latest in a gap-fill batch).
                     let account_hash = fetch_account_hash(&rpc, process_seq).await.unwrap_or_default();
@@ -1375,6 +1383,8 @@ async fn process_ledger(
                     let hash_ms = total_ms.saturating_sub(fetch_ms);
                     // Reset mismatch streak on every clean ledger (Part 1).
                     MISMATCH_STREAK.store(0, Ordering::Relaxed);
+                    // Warm restart: the ledger a clean stop can hand to the next process.
+                    crate::sync_stop::SYNC_STOP.record_verified(seq, account_hash);
                     eprintln!("[ws-sync] #{seq}: MATCH ({tx_count} txs, {} objs) fetch={}ms hash+write={}ms total={}ms",
                         fetched_data.len(), fetch_ms, hash_ms, total_ms);
                     // Lag breadcrumb (Part 3): emit detailed per-stage timings
@@ -1391,18 +1401,11 @@ async fn process_ledger(
                     // db.write. Then re-update the hasher so its in-memory state
                     // matches the restored DB. State.rocks ends up exactly as it
                     // was before this ledger touched it.
-                    let mut undo_batch = rocksdb::WriteBatch::default();
-                    for (key, old_val) in &undo_pairs {
-                        match old_val {
-                            Some(v) => undo_batch.put(&key.0, v),
-                            None => undo_batch.delete(&key.0),
-                        }
-                    }
                     let undo_keys: Vec<Hash256> = undo_pairs.iter().map(|(k, _)| *k).collect();
                     // The rollback returns the store to the pre-ledger state;
-                    // the stamp must travel back with it.
-                    undo_batch.put(b"meta:last_seq", (seq - 1).to_le_bytes());
-                    if let Err(e) = db.write(undo_batch) {
+                    // the stamp travels back with it (`undo_batch`).
+                    let undo = undo_batch(&undo_pairs, seq);
+                    if let Err(e) = db.write(undo) {
                         eprintln!("[ws-sync] #{seq}: FATAL — undo batch write failed: {e}. State.rocks is now in an unknown state. Halting.");
                         std::process::exit(1);
                     }
@@ -1590,14 +1593,8 @@ async fn process_ledger(
             // always means "state untouched" — a kept-but-unverified write
             // makes the re-drive replay the ledger onto its own effects
             // (false tef* divergence burst from the FFI verify lane).
-            let mut undo_batch = rocksdb::WriteBatch::default();
-            for (key, old_val) in &undo_pairs {
-                match old_val {
-                    Some(v) => undo_batch.put(&key.0, v),
-                    None => undo_batch.delete(&key.0),
-                }
-            }
-            if let Err(e) = db.write(undo_batch) {
+            let undo = undo_batch(&undo_pairs, seq);
+            if let Err(e) = db.write(undo) {
                 eprintln!("[ws-sync] #{seq}: FATAL — undo batch write failed: {e}. State.rocks is now in an unknown state. Halting.");
                 std::process::exit(1);
             }
@@ -1648,7 +1645,21 @@ async fn process_ledger(
     false
 }
 
-async fn fetch_account_hash(rpc: &RippledClient, seq: u32) -> Option<String> {
+/// Undo batch for a rolled-back ledger: restore each touched key's pre-image and rewind the
+/// `meta:last_seq` bookmark to the previous ledger, so the store and its bookmark always agree.
+fn undo_batch(undo_pairs: &[(Hash256, Option<Vec<u8>>)], seq: u32) -> rocksdb::WriteBatch {
+    let mut batch = rocksdb::WriteBatch::default();
+    for (key, old_val) in undo_pairs {
+        match old_val {
+            Some(v) => batch.put(key.0, v),
+            None => batch.delete(key.0),
+        }
+    }
+    batch.put(b"meta:last_seq", seq.saturating_sub(1).to_le_bytes());
+    batch
+}
+
+pub(crate) async fn fetch_account_hash(rpc: &RippledClient, seq: u32) -> Option<String> {
     let body = rpc.call("ledger", serde_json::json!({"ledger_index": seq})).await.ok()?;
     body["result"]["ledger"]["account_hash"].as_str().map(String::from)
 }
@@ -1772,5 +1783,34 @@ mod tests {
 
         let overlay = build_shadow_overlay(&rpc_objects, &deleted);
         assert_eq!(overlay.len(), 1, "only the well-formed key survives");
+    }
+}
+
+#[cfg(test)]
+mod undo_tests {
+    use super::*;
+
+    /// Both rollbacks restore the ledger's pre-images AND rewind the bookmark, so a warm restart
+    /// never trusts a `meta:last_seq` one ledger ahead of the state (the "no hash root" rollback
+    /// used to leave it at `seq`).
+    #[test]
+    fn undo_batch_restores_pre_images_and_rewinds_the_bookmark() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = rocksdb::DB::open_default(dir.path()).unwrap();
+        let a = Hash256([0xAA; 32]);
+        let b = Hash256([0xBB; 32]);
+        db.put(a.0, b"old").unwrap();
+        db.put(b"meta:last_seq", 99u32.to_le_bytes()).unwrap();
+        // Ledger #100 lands: modifies A, creates B, stamps the bookmark.
+        let mut w = rocksdb::WriteBatch::default();
+        w.put(a.0, b"new");
+        w.put(b.0, b"created");
+        w.put(b"meta:last_seq", 100u32.to_le_bytes());
+        db.write(w).unwrap();
+        // Roll it back.
+        db.write(undo_batch(&[(a, Some(b"old".to_vec())), (b, None)], 100)).unwrap();
+        assert_eq!(db.get(a.0).unwrap().as_deref(), Some(&b"old"[..]));
+        assert_eq!(db.get(b.0).unwrap(), None);
+        assert_eq!(db.get(b"meta:last_seq").unwrap().as_deref(), Some(&99u32.to_le_bytes()[..]));
     }
 }
