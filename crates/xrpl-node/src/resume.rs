@@ -176,8 +176,9 @@ pub async fn verify_state_at_bookmark<N: Network>(net: &N, db: &Arc<rocksdb::DB>
 }
 
 /// The warm start (spec §2, steps 1-6; step 0 — the incremental syncer — is the caller's).
-/// Any `Err` is a fallback reason. On `Ok` the hasher in `hash_comp` holds the verified state and
-/// ws-sync may start with `last_synced = seq`.
+/// Any `Err` is a fallback reason. On `Ok` the hasher in `hash_comp` holds the verified state, its
+/// wallet count is scanned (as both cold branches do before ws-sync adjusts it), and ws-sync may
+/// start with `last_synced = seq`.
 pub async fn run_warm_resume<N: Network>(
     net: &N,
     db: &Arc<rocksdb::DB>,
@@ -191,7 +192,12 @@ pub async fn run_warm_resume<N: Network>(
     }
     let seq = check_ticket(ticket.as_ref(), read_bookmark(db))?;
     let gap = check_gap(seq, net.validated_seq().await)?;
+    // The wallet-count scan runs beside the (longer) hasher rebuild: no added restart time, and
+    // ws-sync never adjusts an unscanned counter (a first deletion would wrap it to 2^64 - 1).
+    let (wdb, whc) = (db.clone(), hash_comp.clone());
+    let wallets = tokio::task::spawn_blocking(move || whc.scan_wallet_count(wdb.as_ref()));
     let (root, entries, build_secs) = rebuild_root(db, hash_comp).await?;
+    wallets.await.map_err(|e| format!("wallet-count scan task failed: {e}"))?;
     let network_hash = account_hash_with_retries(net, seq).await;
     check_root(seq, &root, network_hash.as_deref(), ticket.as_ref().map(|t| t.account_hash.as_str()))?;
     Ok(Verified { seq, root, gap, entries, build_secs })
@@ -373,5 +379,29 @@ mod tests {
         let (_dir, db, root) = store_at_500();
         let v = verify_state_at_bookmark(&net(900, &root), &db, &Arc::new(StateHashComputer::new())).await.unwrap();
         assert_eq!((v.seq, v.gap), (500, 400));
+    }
+
+    /// Final-review finding (2026-09-24): both cold branches scan the wallet count before ws-sync
+    /// adjusts it; a warm start that skipped the scan left it at 0, and the first deleted
+    /// AccountRoot wrapped the counter to 2^64 - 1 on the dashboard.
+    #[tokio::test]
+    async fn warm_resume_scans_the_wallet_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(rocksdb::DB::open_default(dir.path().join("state.rocks")).unwrap());
+        let account_root = |b: u8| {
+            let mut v = vec![0x11, 0x00, 0x61];
+            v.extend_from_slice(&[b; 37]);
+            v
+        };
+        db.put([0x21u8; 32], account_root(0x21)).unwrap();
+        db.put([0x42u8; 32], account_root(0x42)).unwrap();
+        db.put([0x77u8; 32], vec![0x11, 0x00, 0x64, 7, 7]).unwrap(); // a DirectoryNode, not a wallet
+        db.put(b"meta:last_seq", 500u32.to_le_bytes()).unwrap();
+        let root = StateHashComputer::new().update_and_hash(&db, &[]).map(|r| hex::encode(r.0)).unwrap();
+        let path = dir.path().join("resume_ticket.json");
+        write_ticket(&path, &ticket(500, &root)).unwrap();
+        let hc = Arc::new(StateHashComputer::new());
+        run_warm_resume(&net(510, &root), &db, &hc, true, &path).await.unwrap();
+        assert_eq!(hc.wallet_count.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 }
