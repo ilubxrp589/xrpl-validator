@@ -48,12 +48,17 @@ A new startup branch, taken only when `XRPL_WARM_RESUME=1` is set (checked befor
 `sync_complete.marker` branch never runs in warm mode). If the F5 integrity check did not return `CleanResume`, it falls
 back at once. Otherwise:
 
+0. Disable the legacy incremental syncer first, exactly as the bulk branch does before it touches the state: it is
+   triggered by peer messages and would otherwise write later ledgers into `state.rocks` while the checks run.
 1. Read the ticket, then delete it (a crash during the resume leaves no ticket, so the next start is cold).
 2. Read `meta:last_seq` from `state.rocks`; it must equal the ticket's `seq`.
 3. Build the ws-sync hasher (`FlatHasher`) from `state.rocks` once and take its root.
 4. Fetch the network's `account_hash` for ledger `seq` from the RPC source (three attempts).
-5. The root must equal the network hash and the ticket's hash. Only then: disable the legacy incremental syncer (as the
-   bulk branch does), rewrite `sync_complete.marker` with the current entry count, log
+5. The network's validated ledger must be no more than 1,000 ledgers past `seq` (about an hour). A warm catch-up
+   costs about 80 ms per ledger, one ledger at a time; past that gap the cold download is faster and lighter on the
+   source node.
+6. The root must equal the network hash and the ticket's hash. Only then: rewrite `sync_complete.marker` with the
+   current entry count, log
    `[resume] OK: #N verified (root …) — ws-sync from #N+1`, and start ws-sync with `last_synced = N`.
 
 From there the node runs the same catch-up code every cold start uses after its bulk download: each ledger from `N+1`
@@ -67,8 +72,9 @@ lives in a new module (`resume.rs`) as functions over an injected hash fetcher, 
 - The production launcher gains `--warm`: if the sync directory holds both a resume ticket and the clean-shutdown
   marker, it keeps the directory and sets `XRPL_WARM_RESUME=1`; otherwise it takes the cold path. Without `--warm` the
   launcher is unchanged — a full wipe and resync — and remains the recovery path after any crash or halt.
-- The deploy step launches with `--warm`, accepts `[resume] OK` as its start-up verdict, and on `[resume] FALLBACK` (or
-  if the process exits) relaunches cold. The existing retry for the bulk-sync seed race is kept.
+- The deploy step launches with `--warm` and waits up to 180 s for `[resume] OK` (its start-up verdict) or
+  `[resume] FALLBACK`. On a fallback, on the process exiting, or on neither line appearing in time, it stops the process
+  if it is still running and relaunches cold. The existing retry for the bulk-sync seed race is kept.
 
 ### 4. Fix found on the way
 
@@ -78,7 +84,7 @@ The "no hash root after write" rollback in `process_ledger` restores the pre-ima
 ## Testing
 
 - **Unit:** ticket round-trip and atomic write; every resume decision (no ticket, bookmark ≠ ticket, root ≠ network
-  hash, network unavailable, success); the stop control (request, park, parked slot); both rollbacks rewind the bookmark.
+  hash, network unavailable, gap over 1,000 ledgers, success); the stop control (request, park, parked slot); both rollbacks rewind the bookmark.
 - **Synthetic database:** a temporary `state.rocks` with a few ledger objects and a bookmark — the resume check accepts
   the true root and rejects any other.
 - **Rehearsal on real data (before any deploy):** a small `resume_check` binary opens a kept `state.rocks` read-only,
