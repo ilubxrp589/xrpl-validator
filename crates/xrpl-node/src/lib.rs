@@ -41,6 +41,7 @@ pub mod resume;
 pub mod peer;
 pub mod rpc;
 pub mod state_hash;
+pub mod sync_stop;
 pub mod succ_walk;
 pub mod unl_fetch;
 pub mod unl_verify;
