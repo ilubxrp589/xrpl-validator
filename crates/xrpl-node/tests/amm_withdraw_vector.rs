@@ -289,3 +289,13 @@ fn amm_withdraw_refuses_burning_the_supply_for_one_side_106833279() {
 fn amm_withdraw_last_lp_by_lptoken_deletes_the_amm_106909010() {
     run_bundle(include_str!("vectors/amm_withdraw_last_lp_by_lptoken_deletes_the_amm_106909010.json"));
 }
+
+/// Finding 399 (soak #28 receipt, mainnet #107210679 D214A6C8C464): a tfWithdrawAll from the BTC/xSPECTAR pool by an
+/// account holding 2.799986 XRP at OwnerCount 9 with no trust line for either asset. rippled's `withdraw()` runs
+/// `sufficientReserve` before EACH asset's send in every mode (AMMWithdraw.cpp:765/785) — a new line at OwnerCount 9
+/// needs 3 XRP — so mainnet returns tecINSUFFICIENT_RESERVE (fee only). The two-asset equal withdrawals
+/// (tfWithdrawAll, tfLPToken) went through `payout_proportional_to`, which paid both sides with no reserve check.
+#[test]
+fn amm_withdraw_all_checks_the_reserve_for_each_new_line_107210679() {
+    run_bundle(include_str!("vectors/amm_withdraw_all_checks_the_reserve_for_each_new_line_107210679.json"));
+}

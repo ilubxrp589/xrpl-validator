@@ -2029,13 +2029,18 @@ fn payout_proportional(
     tokens: (u128, i32),
     total_lp: (u128, i32),
     withdraw_all: bool,
-) -> bool {
-    payout_proportional_to(sandbox, tx, amm_acct, &tx.account, tokens, total_lp, withdraw_all).is_some()
+    pre_fee_xrp: u128,
+) -> Result<(), TxResult> {
+    payout_proportional_to(sandbox, tx, amm_acct, &tx.account, tokens, total_lp, withdraw_all, pre_fee_xrp).map(|_| ())
 }
 
 /// Same proportional two-asset payout, but to an arbitrary beneficiary
 /// (AMMClawback withdraws FOR THE HOLDER), returning the paid shares so the
 /// clawback can move them on to the issuer.
+/// Each pool asset paid out by a proportional withdrawal, with its share.
+type LegShares = Vec<(crate::tx::offer::Leg, (u128, i32))>;
+
+#[allow(clippy::too_many_arguments)]
 fn payout_proportional_to(
     sandbox: &mut Sandbox,
     tx: &TxFields,
@@ -2044,7 +2049,8 @@ fn payout_proportional_to(
     tokens: (u128, i32),
     total_lp: (u128, i32),
     withdraw_all: bool,
-) -> Option<Vec<(crate::tx::offer::Leg, (u128, i32))>> {
+    pre_fee_xrp: u128,
+) -> Result<LegShares, TxResult> {
     use crate::tx::offer as ox;
     let asset_leg = |v: &serde_json::Value| -> Option<ox::Leg> {
         if v.get("currency").and_then(|c| c.as_str()) == Some("XRP") {
@@ -2124,12 +2130,20 @@ fn payout_proportional_to(
     }
     // A side that rounded to zero fails the whole withdrawal — nothing written.
     if shares.iter().any(|(_, sh)| sh.0 == 0) {
-        return None;
+        return Err(TxResult::AmmFailed);
     }
+    // Finding 399: rippled's `withdraw()` runs `sufficientReserve` for EACH asset right before its
+    // send, in every mode (AMMWithdraw.cpp:765/785) — these two-asset equal withdrawals included.
+    // #107210679 D214A6C8C464: a tfWithdrawAll at OwnerCount 9 with 2.799986 XRP and no line for
+    // either asset; mainnet tecINSUFFICIENT_RESERVE, we paid both sides. The caller restores the
+    // snapshot, so a failure on the second asset also undoes the first.
     for (leg, share) in &shares {
+        if !withdraw_reserve_ok(sandbox, who, leg, pre_fee_xrp) {
+            return Err(TxResult::InsufficientReserve);
+        }
         ox::move_leg(sandbox, amm_acct, who, leg, *share);
     }
-    Some(shares)
+    Ok(shares)
 }
 
 // ─── AMMWithdraw ───
@@ -2373,9 +2387,9 @@ impl Transactor for AMMWithdrawTransactor {
                 }
             } else {
                 // Both assets out, proportional to the redeemed LPToken share.
-                if !payout_proportional(sandbox, tx, &amm_acct, lp_bal, total_lp, true) {
+                if let Err(t) = payout_proportional(sandbox, tx, &amm_acct, lp_bal, total_lp, true, pre_fee_xrp) {
                     sandbox.restore_snapshot(snap);
-                    return TxResult::AmmFailed;
+                    return t;
                 }
             }
             tear_down_lp_line(sandbox, &tx.account, &amm_acct, lp_key, &lp_line);
@@ -2426,9 +2440,9 @@ impl Transactor for AMMWithdrawTransactor {
                         sandbox.restore_snapshot(snap);
                         return TxResult::AmmInvalidTokens;
                     }
-                    if !payout_proportional(sandbox, tx, &amm_acct, tokens_adj, total_lp, false) {
+                    if let Err(t) = payout_proportional(sandbox, tx, &amm_acct, tokens_adj, total_lp, false, pre_fee_xrp) {
                         sandbox.restore_snapshot(snap);
-                        return TxResult::AmmFailed;
+                        return t;
                     }
                 }
             }
