@@ -32,6 +32,7 @@ use xrpl_node::peer::codec::MessageCodec;
 use xrpl_node::peer::handshake;
 use xrpl_node::peer::identity::NodeIdentity;
 use xrpl_node::peer::message::PeerMessage;
+use xrpl_node::peer::relay;
 
 const MAINNET_PEERS: &[&str] = &[
     "s1.ripple.com:51235",
@@ -380,6 +381,8 @@ async fn main() {
         let val_send_outbound = outbound_tx.clone();
         let val_send_manifest = manifest_frame.clone();
         tokio::spawn(async move {
+        // Carried across reconnects: the last validation this relay forwarded
+        let mut memory = relay::RelayMemory::default();
         loop {
             eprintln!("[val-sender] Connecting to {peer} for validation relay...");
             let id = match NodeIdentity::generate() {
@@ -398,45 +401,37 @@ async fn main() {
             eprintln!("[val-sender] Connected! Sending manifest + validations...");
             let mut stream = hs.stream;
 
-            // Send manifest so peers know our validator identity
-            {
-                use tokio::io::AsyncWriteExt;
-                if let Err(e) = stream.write_all(&val_send_manifest).await {
+            // Send manifest so peers know our validator identity, then the validation the last
+            // connection may have lost
+            match relay::open_session(&mut stream, &val_send_manifest, &memory).await {
+                Ok(resent) => {
+                    eprintln!("[val-sender] Manifest sent ({} bytes)", val_send_manifest.len());
+                    if resent {
+                        eprintln!("[val-sender] Re-sent the last validation to {peer}");
+                    }
+                }
+                Err(e) => {
                     eprintln!("[val-sender] Manifest write failed: {e}");
                     tokio::time::sleep(Duration::from_secs(10)).await;
                     continue;
                 }
-                eprintln!("[val-sender] Manifest sent ({} bytes)", val_send_manifest.len());
             }
-            // Split into read (drain) + write (validations)
-            let (mut reader, mut writer) = tokio::io::split(stream);
 
-            // Drain incoming messages so the connection doesn't stall
-            let drain = tokio::spawn(async move {
-                let mut buf = [0u8; 8192];
-                loop {
-                    match reader.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {} // discard
-                    }
+            // Forward validations, answering the peer's keep-alive pings, until the connection ends
+            let report = relay::run_session(stream, hs.remaining_bytes, val_send_outbound.subscribe(), &mut memory).await;
+            let pongs = report.pongs;
+            match report.end {
+                relay::SessionEnd::WriteFailed(e) => {
+                    eprintln!("[val-sender] Write failed: {e}, reconnecting... ({pongs} pings answered)");
                 }
-            });
-
-            let mut rx = val_send_outbound.subscribe();
-            loop {
-                match rx.recv().await {
-                    Ok(frame) => {
-                        use tokio::io::AsyncWriteExt;
-                        if let Err(e) = writer.write_all(&frame).await {
-                            eprintln!("[val-sender] Write failed: {e}, reconnecting...");
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(_) => break,
+                relay::SessionEnd::ReadFailed(e) => {
+                    eprintln!("[val-sender] Read failed: {e}, reconnecting... ({pongs} pings answered)");
                 }
+                relay::SessionEnd::PeerClosed => {
+                    eprintln!("[val-sender] {peer} closed the connection, reconnecting... ({pongs} pings answered)");
+                }
+                relay::SessionEnd::Shutdown => return,
             }
-            drain.abort();
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });

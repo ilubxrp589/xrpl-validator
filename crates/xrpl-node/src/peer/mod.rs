@@ -26,3 +26,4 @@ pub mod manager;
 pub mod message;
 #[allow(clippy::all)]
 pub mod protocol;
+pub mod relay;

@@ -139,6 +139,30 @@ impl Encoder<PeerMessage> for MessageCodec {
     }
 }
 
+/// The pong a peer owes for a keep-alive ping: `Some(frame)` — header and payload, ready to write — when
+/// `msg` is a `ptPING`, echoing its `seq` and `ping_time`; `None` otherwise. rippled drops a peer that has not
+/// answered its previous ping by the next 60-second timer tick; see [`super::relay`].
+pub fn pong_frame_for(msg: &PeerMessage) -> Option<Vec<u8>> {
+    let PeerMessage::Ping(ping) = msg else { return None };
+    if ping.r#type != super::protocol::tm_ping::PingType::PtPing as i32 {
+        return None;
+    }
+    let pong = PeerMessage::Ping(super::protocol::TmPing {
+        r#type: super::protocol::tm_ping::PingType::PtPong as i32,
+        seq: ping.seq,
+        ping_time: ping.ping_time,
+        net_time: None,
+    });
+    let mut buf = BytesMut::new();
+    MessageCodec.encode(pong, &mut buf).ok()?;
+    Some(buf.to_vec())
+}
+
+/// `mtVALIDATION` (41) in a raw frame's type field.
+pub fn is_validation_frame(frame: &[u8]) -> bool {
+    frame.len() >= HEADER_SIZE && u16::from_be_bytes([frame[4], frame[5]]) == 41
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,5 +327,50 @@ mod tests {
         assert_eq!(type_code, 3); // TMPing
         // Protobuf data starts at byte 6
         assert!(payload_len > 0);
+    }
+
+    /// The validation relay (live_viewer's val-sender) read and discarded everything, including the hubs'
+    /// keep-alive pings, so each hub dropped its relay connection about two minutes after it opened: 87
+    /// reconnects across the four relays in one hour (2026-09-24), each able to lose a validation.
+    #[test]
+    fn pong_frame_answers_a_ping_with_its_seq_and_time() {
+        let ping = PeerMessage::Ping(protocol::TmPing {
+            r#type: protocol::tm_ping::PingType::PtPing as i32,
+            seq: Some(42),
+            ping_time: Some(7),
+            net_time: None,
+        });
+        let frame = pong_frame_for(&ping).expect("a ping is answered");
+        let mut buf = BytesMut::from(&frame[..]);
+        let decoded = MessageCodec.decode(&mut buf).expect("decodes").expect("one whole frame");
+        assert!(buf.is_empty(), "exactly one frame");
+        match decoded {
+            PeerMessage::Ping(p) => {
+                assert_eq!(p.r#type, protocol::tm_ping::PingType::PtPong as i32);
+                assert_eq!((p.seq, p.ping_time), (Some(42), Some(7)));
+            }
+            other => panic!("expected a pong, got {}", other.name()),
+        }
+    }
+
+    #[test]
+    fn pong_frame_ignores_pongs() {
+        let pong = PeerMessage::Ping(protocol::TmPing {
+            r#type: protocol::tm_ping::PingType::PtPong as i32,
+            seq: Some(1),
+            ping_time: None,
+            net_time: None,
+        });
+        assert_eq!(pong_frame_for(&pong), None);
+    }
+
+    #[test]
+    fn validation_frames_are_recognised_by_their_type() {
+        let mut v = vec![0, 0, 0, 3, 0, 41];
+        v.extend_from_slice(&[1, 2, 3]);
+        assert!(is_validation_frame(&v));
+        let manifest = [0u8, 0, 0, 1, 0, 2, 9];
+        assert!(!is_validation_frame(&manifest));
+        assert!(!is_validation_frame(&[0, 0, 41]));
     }
 }
