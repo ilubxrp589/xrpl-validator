@@ -2153,12 +2153,17 @@ pub struct AMMWithdrawTransactor;
 /// Finding 156 — `AMMWithdraw::withdraw`'s `sufficientReserve` (fixAMMv1_2):
 /// an IOU the account holds NO trust line for costs a new object, and the
 /// check is TrustSet's — nothing owed while the account owns fewer than two
-/// objects, else base + increment × (OwnerCount + 1) — against the balance
-/// BEFORE the fee (`max(priorBalance, balance)`). Run for every asset
-/// delivered, right before its send, so a line created for the first asset
-/// raises the second asset's bar. #106752895 BFEB6847B8E9 (rJd4HMcu, a
-/// single-asset withdraw of 22,222,222 FUZZY with no FUZZY line): mainnet
-/// returns tecINSUFFICIENT_RESERVE; we created the line and paid out.
+/// objects, else base + increment × (OwnerCount + 1) — against
+/// `max(priorBalance, balance)` (AMMWithdraw.cpp:705): the balance before the
+/// fee, or the live balance if that is higher. Run for every asset delivered,
+/// right before its send, so a line created for the first asset raises the
+/// second asset's bar. #106752895 BFEB6847B8E9 (rJd4HMcu, a single-asset
+/// withdraw of 22,222,222 FUZZY with no FUZZY line): mainnet returns
+/// tecINSUFFICIENT_RESERVE; we created the line and paid out.
+/// Finding 401 — #107219029 A64B897016E6: the live balance matters when the
+/// XRP side is sent first (Asset = XRP): the IOU side's check then sees the
+/// XRP already withdrawn. Comparing the pre-fee balance alone refused a
+/// withdrawal mainnet accepted.
 fn withdraw_reserve_ok(sandbox: &Sandbox, account: &[u8; 20], leg: &crate::tx::offer::Leg, pre_fee_xrp: u128) -> bool {
     use crate::tx::offer as ox;
     if leg.xrp || account == &leg.issuer {
@@ -2170,7 +2175,8 @@ fn withdraw_reserve_ok(sandbox: &Sandbox, account: &[u8; 20], leg: &crate::tx::o
     let Some(root) = ox::json_at(sandbox, &keylet::account_root_key(account)) else { return true };
     let oc = root["OwnerCount"].as_u64().unwrap_or(0) as u128;
     let reserve = if oc < 2 { 0 } else { ox::XRP_RESERVE_BASE + ox::XRP_RESERVE_INC * (oc + 1) };
-    pre_fee_xrp >= reserve
+    let balance: u128 = root["Balance"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+    pre_fee_xrp.max(balance) >= reserve
 }
 
 impl Transactor for AMMWithdrawTransactor {

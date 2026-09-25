@@ -299,3 +299,14 @@ fn amm_withdraw_last_lp_by_lptoken_deletes_the_amm_106909010() {
 fn amm_withdraw_all_checks_the_reserve_for_each_new_line_107210679() {
     run_bundle(include_str!("vectors/amm_withdraw_all_checks_the_reserve_for_each_new_line_107210679.json"));
 }
+
+/// Finding 401 (soak #29 receipt, mainnet #107219029 A64B897016E6): a tfWithdrawAll from the XRP/DROP pool by an
+/// account holding 2.310461 XRP at OwnerCount 6 with no DROP trust line, which needs a 2.4 XRP reserve. rippled's
+/// `sufficientReserve` compares the reserve with `max(priorBalance, balance)` (AMMWithdraw.cpp:705), where `balance` is
+/// the account's live balance: the XRP side (Asset) has already been sent when Asset2's check runs, so the check sees
+/// 4.753549 XRP and mainnet succeeds. The F399 check compared the pre-fee balance alone and returned
+/// tecINSUFFICIENT_RESERVE.
+#[test]
+fn amm_withdraw_all_counts_the_paid_xrp_toward_the_new_line_reserve_107219029() {
+    run_bundle(include_str!("vectors/amm_withdraw_all_counts_the_paid_xrp_toward_the_new_line_reserve_107219029.json"));
+}
