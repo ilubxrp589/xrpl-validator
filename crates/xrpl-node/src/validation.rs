@@ -116,9 +116,21 @@ fn process_cookie() -> u64 {
     })
 }
 
+/// A validation's fields without its signature, split where `sfSignature` (VL,
+/// field 6) falls in canonical order: `head` holds the fields that sort before
+/// it, `tail` those after it (the Amendments vector, type 19). rippled 3.3.0+
+/// drops a peer's validation whose fields are out of canonical order
+/// (`STObject::set` with `requireCanonicalOrder`), so the signature must go
+/// between the two, not at the end.
+struct UnsignedValidation {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+}
+
 /// Build the serialized validation object (without signature) for signing.
 /// `voting` is the cadence switch (see `sign_validation`): ServerVersion and
-/// the Amendments vote are emitted only when it is set.
+/// the Amendments vote are emitted only when it is set. `None` if the signing
+/// key is too long to serialize.
 #[allow(clippy::too_many_arguments)] // one field per parameter; the caller is `sign_validation` alone
 fn build_validation_for_signing(
     ledger_seq: u32,
@@ -129,7 +141,7 @@ fn build_validation_for_signing(
     flags: u32,
     voting: bool,
     amendments: Option<&[Hash256]>,
-) -> Vec<u8> {
+) -> Option<UnsignedValidation> {
     let mut buf = Vec::with_capacity(128);
 
     // Fields must be in canonical order (sorted by type_code, then field_code)
@@ -178,27 +190,30 @@ fn build_validation_for_signing(
     let spk_len = signing_pub_key.len();
     if spk_len > 192 {
         eprintln!("[validation] signing pub key too long ({spk_len} bytes, max 192)");
-        return Vec::new();
+        return None;
     }
     buf.push(spk_len as u8);
     buf.extend_from_slice(signing_pub_key);
 
+    // Type 7 (VL) Signature(6) sorts here; `sign_validation` inserts it.
+
     // Type 19 (VECTOR256): Amendments(3) — only on the VOTING ledger
     // (seq % 256 == 255), the same ledger that carries the fee vote in
     // rippled; the flag ledger itself (seq % 256 == 0) tallies them.
+    let mut tail = Vec::new();
     if let (true, Some(amends)) = (voting, amendments) {
         if !amends.is_empty() {
-            buf.extend_from_slice(&field::AMENDMENTS);
+            tail.extend_from_slice(&field::AMENDMENTS);
             // VL length: total bytes = num_amendments * 32
             let total_bytes = amends.len() * 32;
-            encode_vl_length(&mut buf, total_bytes);
+            encode_vl_length(&mut tail, total_bytes);
             for h in amends {
-                buf.extend_from_slice(&h.0);
+                tail.extend_from_slice(&h.0);
             }
         }
     }
 
-    buf
+    Some(UnsignedValidation { head: buf, tail })
 }
 
 /// Encode a VL (variable length) prefix into the buffer.
@@ -262,15 +277,18 @@ pub fn sign_validation(
     }
 
     // Build the validation object without signature
-    let unsigned = build_validation_for_signing(
+    let Some(unsigned) = build_validation_for_signing(
         ledger_seq, ledger_hash, Some(ledger_hash), signing_time, pub_key, flags, voting, amendments,
-    );
+    ) else {
+        return Vec::new();
+    };
 
-    // Hash for signing: SHA512Half(VAL\0 || unsigned_validation)
+    // Hash for signing: SHA512Half(VAL\0 || every field but the signature, in canonical order)
     let prefix: [u8; 4] = [0x56, 0x41, 0x4C, 0x00]; // "VAL\0"
     let mut hasher = Sha512::new();
     hasher.update(&prefix);
-    hasher.update(&unsigned);
+    hasher.update(&unsigned.head);
+    hasher.update(&unsigned.tail);
     let full_hash = hasher.finalize();
     let sign_hash: [u8; 32] = full_hash[..32]
         .try_into()
@@ -285,8 +303,9 @@ pub fn sign_validation(
         }
     };
 
-    // Build the full validation with signature appended
-    let mut full = unsigned;
+    // Build the full validation: the signature takes its canonical place,
+    // after the head and before the tail
+    let mut full = unsigned.head;
     full.extend_from_slice(&field::SIGNATURE);
     // VL length encoding for signature (typically 72 bytes)
     let sig_len = signature.len();
@@ -298,6 +317,7 @@ pub fn sign_validation(
         full.push(((sig_len - 193) % 256) as u8);
     }
     full.extend_from_slice(&signature);
+    full.extend_from_slice(&unsigned.tail);
 
     full
 }
@@ -451,9 +471,15 @@ mod tests {
     /// a substring search would false-positive on header-looking bytes inside
     /// a random public key or signature.
     fn fields_of(bytes: &[u8]) -> Vec<(u8, u8)> {
+        field_spans(bytes).into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// Each field's (type, field) header with the byte range it occupies, header included.
+    fn field_spans(bytes: &[u8]) -> Vec<((u8, u8), std::ops::Range<usize>)> {
         let mut out = Vec::new();
         let mut i = 0;
         while i < bytes.len() {
+            let start = i;
             let b = bytes[i];
             i += 1;
             let mut ty = b >> 4;
@@ -489,10 +515,61 @@ mod tests {
                 }
                 t => panic!("unexpected field type {t} at {i}"),
             };
-            out.push((ty, fld));
             i += size;
+            out.push(((ty, fld), start..i));
         }
         out
+    }
+
+    /// rippled's sort key for a field: `SField::fieldCode`, type in the high half.
+    fn field_code((ty, fld): (u8, u8)) -> u32 {
+        (ty as u32) << 16 | fld as u32
+    }
+
+    /// rippled 3.3.0+ reads a peer's validation with `requireCanonicalOrder`
+    /// (`PeerImp::onMessage(TMValidation)` → `STObject::set`): each field's code must exceed
+    /// the one before it, or the validation is dropped ("Fields in object are not in
+    /// canonical order") and the sender charged for invalid data. The signature used to be
+    /// appended after the Amendments vector (type 19), so every voting-ledger validation broke
+    /// the order and never reached the network: 41 of 41 voting ledgers were missing at the
+    /// reference node on 2026-09-24/25.
+    #[test]
+    fn every_validation_is_serialized_in_canonical_field_order() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let identity = NodeIdentity::generate().unwrap();
+        let hash = [0x33u8; 32];
+        let amends = supported_amendments();
+        // An ordinary ledger, the voting ledger (seq % 256 == 255), the flag ledger.
+        for seq in [106664651u32, 106664703, 106664704] {
+            let v = sign_validation(&identity, seq, &hash, Some(&amends));
+            let codes: Vec<u32> = fields_of(&v).into_iter().map(field_code).collect();
+            assert!(codes.windows(2).all(|w| w[0] < w[1]), "#{seq}: field codes out of order: {codes:?}");
+        }
+    }
+
+    /// rippled checks the signature against SHA512Half("VAL\0" || every field but the
+    /// signature, in canonical order) — `STObject::getSigningHash`, `omitSigningFields`.
+    #[test]
+    fn the_signature_covers_the_canonical_fields_without_it() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let identity = NodeIdentity::generate().unwrap();
+        let hash = [0x44u8; 32];
+        let amends = supported_amendments();
+        for seq in [106664651u32, 106664703] {
+            let v = sign_validation(&identity, seq, &hash, Some(&amends));
+            let mut spans = field_spans(&v);
+            let sig = spans.iter().position(|(id, _)| *id == (7, 6)).expect("a Signature field");
+            let (_, sig_span) = spans.remove(sig);
+            spans.sort_by_key(|(id, _)| field_code(*id));
+            let mut hasher = Sha512::new();
+            hasher.update(b"VAL\0");
+            for (_, span) in &spans {
+                hasher.update(&v[span.clone()]);
+            }
+            let digest = &hasher.finalize()[..32];
+            let sig_bytes = &v[sig_span][2..]; // header 0x76, one length byte (DER ≤ 72 bytes)
+            assert!(identity.verify(digest, sig_bytes).unwrap(), "#{seq}: signature does not cover the canonical fields");
+        }
     }
 
     fn has_field(bytes: &[u8], hdr: &[u8]) -> bool {
