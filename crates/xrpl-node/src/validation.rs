@@ -60,10 +60,13 @@ pub fn supported_amendments() -> Vec<Hash256> {
         "BatchV1_1",
         // fixCleanup3_3_0: ported (finding 259); added to the vote 2026-09-14.
         "fixCleanup3_3_0",
-        "fixCleanup3_2_0", "fixCleanup3_1_3", "LendingProtocol", "fixDirectoryLimit",
+        // SingleAssetVault and LendingProtocol: no yes vote (James, 2026-09-25). Either one switches
+        // rippled's `Number` to its 19-digit mantissa for every transaction; the engine models the
+        // 16-digit scale only.
+        "fixCleanup3_2_0", "fixCleanup3_1_3", "fixDirectoryLimit",
         "fixIncludeKeyletFields", "fixTokenEscrowV1", "fixPriceOracleOrder", "fixMPTDeliveredAmount",
         "fixAMMClawbackRounding", "TokenEscrow", "fixEnforceNFTokenTrustlineV2", "fixAMMv1_3",
-        "PermissionedDEX", "SingleAssetVault", "fixPayChanCancelAfter", "fixInvalidTxFlags",
+        "PermissionedDEX", "fixPayChanCancelAfter", "fixInvalidTxFlags",
         "fixFrozenLPTokenTransfer", "DeepFreeze", "PermissionedDomains", "DynamicNFT",
         "Credentials", "AMMClawback", "fixAMMv1_2", "MPTokensV1",
         "fixNFTokenPageLinks", "fixInnerObjTemplate2", "fixEnforceNFTokenTrustline", "fixReducedOffersV2",
@@ -616,5 +619,16 @@ mod tests {
         let vh = f.iter().position(|x| *x == (5, 25)).unwrap();
         assert!(lh < vh, "LedgerHash(1) precedes ValidatedHash(25)");
         assert_eq!(f.iter().filter(|x| x.0 == 5).count(), 2, "exactly LedgerHash and ValidatedHash");
+    }
+
+    /// No yes vote for SingleAssetVault or LendingProtocol (James, 2026-09-25): either amendment
+    /// switches rippled's `Number` to its 19-digit mantissa for every transaction
+    /// (`Rules.cpp` `setCurrentTransactionRules`), and the engine models the 16-digit scale only.
+    #[test]
+    fn no_yes_vote_for_the_amendments_that_widen_number() {
+        let votes = supported_amendments();
+        for name in ["SingleAssetVault", "LendingProtocol"] {
+            assert!(!votes.contains(&amendment_hash(name)), "{name} must not be voted for");
+        }
     }
 }
