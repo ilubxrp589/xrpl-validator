@@ -45,19 +45,26 @@ impl Transactor for TicketCreateTransactor {
         let Ok(acct) = serde_json::from_slice::<serde_json::Value>(&data) else {
             return TxResult::Malformed;
         };
-        // An account may hold at most 250 outstanding tickets (tecDIR_FULL).
+        // Finding 402 — a ticket-funded TicketCreate spends one of the account's tickets before
+        // anything else: rippled's `Transactor::apply` runs `consumeSeqProxy`
+        // (deleting that ticket, OwnerCount and TicketCount - 1) before `doApply`.
+        let spent = u64::from(tx.uses_ticket());
+        // An account may hold at most 250 outstanding tickets (tecDIR_FULL):
+        // rippled TicketCreate::preclaim, curTicketCount + addedTickets -
+        // consumedTickets > 250.
         let have = acct["TicketCount"].as_u64().unwrap_or(0);
         let count = ticket_count(tx).unwrap_or(0);
-        if have + count > 250 {
+        if (have + count).saturating_sub(spent) > 250 {
             return TxResult::DirFull;
         }
         // Each ticket is an owned object and costs an incremental owner reserve.
         // rippled CreateTicket::doApply: preFeeBalance_ <
-        // accountReserve(ownerCount + ticketCount) → tecINSUFFICIENT_RESERVE.
+        // accountReserve(ownerCount + ticketCount) → tecINSUFFICIENT_RESERVE, the
+        // owner count read after the spent ticket is gone (#107227378 9FC9DE61C19F).
         // preclaim runs before apply_common deducts the fee, so the sandbox
         // balance here IS preFeeBalance_ (#105762093 B03E3974, #105779059).
         let balance = acct["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-        let oc = acct["OwnerCount"].as_u64().unwrap_or(0);
+        let oc = acct["OwnerCount"].as_u64().unwrap_or(0).saturating_sub(spent);
         let reserve = crate::ledger::fees::account_reserve(sandbox, oc + count);
         if balance < reserve {
             return TxResult::InsufficientReserve;
@@ -116,6 +123,30 @@ mod tests {
     use xrpl_core::types::Hash256;
 
     fn state_with_account(id: &[u8; 20], seq: u32) -> LedgerState {
+        state_with(id, serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": hex::encode(id),
+            "Balance": "1000000000",
+            "Sequence": seq,
+            "OwnerCount": 0,
+            "Flags": 0,
+        }))
+    }
+
+    /// An account holding `balance` drops, `owners` owned objects of which `tickets` are Tickets.
+    fn account(id: &[u8; 20], balance: u64, owners: u64, tickets: u64) -> LedgerState {
+        state_with(id, serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": hex::encode(id),
+            "Balance": balance.to_string(),
+            "Sequence": 500,
+            "OwnerCount": owners,
+            "TicketCount": tickets,
+            "Flags": 0,
+        }))
+    }
+
+    fn state_with(id: &[u8; 20], acct: serde_json::Value) -> LedgerState {
         let header = LedgerHeader {
             sequence: 100,
             total_coins: 100_000_000_000_000_000,
@@ -128,14 +159,6 @@ mod tests {
             close_flags: 0,
         };
         let mut state = LedgerState::new_unverified(header);
-        let acct = serde_json::json!({
-            "LedgerEntryType": "AccountRoot",
-            "Account": hex::encode(id),
-            "Balance": "1000000000",
-            "Sequence": seq,
-            "OwnerCount": 0,
-            "Flags": 0,
-        });
         state.state_map.insert(
             keylet::account_root_key(id),
             serde_json::to_vec(&acct).unwrap(),
@@ -175,6 +198,40 @@ mod tests {
         assert_eq!(acct["Sequence"], 704);
         assert_eq!(acct["TicketCount"], 3);
         assert_eq!(acct["OwnerCount"], 3);
+    }
+
+    /// The same TicketCreate paid for with Ticket `ticket` instead of a Sequence.
+    fn on_ticket(mut t: TxFields, ticket: u32) -> TxFields {
+        t.sequence = 0;
+        t.ticket_seq = Some(ticket);
+        t
+    }
+
+    /// rippled `TicketCreate::preclaim`: `curTicketCount + addedTickets - consumedTickets > 250` is
+    /// tecDIR_FULL; the ticket a ticket-funded TicketCreate spends frees its slot first.
+    #[test]
+    fn the_ticket_limit_does_not_count_the_ticket_being_spent() {
+        let id = [0x43u8; 20];
+        let state = account(&id, 1_000_000_000, 241, 241);
+        let sb = Sandbox::new(&state);
+        let tr = TicketCreateTransactor;
+        assert_eq!(tr.preclaim(&on_ticket(tx(id, 0, 10), 400), &sb), TxResult::Success, "241 + 10 - 1 = 250");
+        assert_eq!(tr.preclaim(&tx(id, 500, 10), &sb), TxResult::DirFull, "241 + 10 = 251");
+        assert_eq!(tr.preclaim(&on_ticket(tx(id, 0, 11), 400), &sb), TxResult::DirFull, "241 + 11 - 1 = 251");
+    }
+
+    /// rippled checks TicketCreate's reserve in `doApply`, after `Transactor::apply`'s
+    /// `consumeSeqProxy` has deleted the ticket being spent: 3.398367 XRP at OwnerCount 2 covers ten
+    /// more tickets when one of the two owned objects is that ticket (1 + 0.2 x 11 = 3.2 XRP), not
+    /// otherwise (1 + 0.2 x 12 = 3.4 XRP). Mainnet #107227378 9FC9DE61C19F.
+    #[test]
+    fn the_reserve_does_not_count_the_ticket_being_spent() {
+        let id = [0x44u8; 20];
+        let state = account(&id, 3_398_367, 2, 2);
+        let sb = Sandbox::new(&state);
+        let tr = TicketCreateTransactor;
+        assert_eq!(tr.preclaim(&on_ticket(tx(id, 0, 10), 400), &sb), TxResult::Success);
+        assert_eq!(tr.preclaim(&tx(id, 500, 10), &sb), TxResult::InsufficientReserve);
     }
 
     #[test]

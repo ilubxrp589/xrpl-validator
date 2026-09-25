@@ -101,3 +101,15 @@ fn run_bundle(bundle_json: &str) {
 fn ticket_create_28_tickets_107113839() {
     run_bundle(include_str!("vectors/ticket_create_28_tickets_107113839.json"));
 }
+
+/// Finding 402 (receipt on the cycle-155 build, mainnet #107227378 9FC9DE61C19F): a TicketCreate of 10
+/// tickets paid for with a Ticket, by an account holding 3.398367 XRP at OwnerCount 2. rippled's
+/// `Transactor::apply` deletes the ticket being spent (`consumeSeqProxy`: OwnerCount 2 -> 1) before
+/// `TicketCreate::doApply` checks the reserve, so ten more tickets need 1 + 0.2 x 11 = 3.2 XRP and mainnet
+/// succeeds; the engine counted the spent ticket (3.4 XRP) and returned tecINSUFFICIENT_RESERVE.
+#[test]
+fn ticket_create_on_a_ticket_counts_the_owner_count_after_the_spent_ticket_107227378() {
+    run_bundle(include_str!(
+        "vectors/ticket_create_on_a_ticket_counts_the_owner_count_after_the_spent_ticket_107227378.json"
+    ));
+}
