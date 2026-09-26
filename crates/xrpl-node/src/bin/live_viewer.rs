@@ -371,19 +371,16 @@ async fn main() {
     eprintln!("[validator] Manifest built ({} bytes)", manifest_bytes.len());
 
     // Dedicated validation senders — multiple peers for redundancy
-    for relay_peer in &[
-        "s1.ripple.com:51235",
-        "s2.ripple.com:51235",
-        "xrplcluster.com:51235",
-        "r.ripple.com:51235",
-    ] {
-        let peer = relay_peer.to_string();
+    for hubs in relay::RELAY_HUBS {
         let val_send_outbound = outbound_tx.clone();
         let val_send_manifest = manifest_frame.clone();
         tokio::spawn(async move {
         // Carried across reconnects: the last validation this relay forwarded
         let mut memory = relay::RelayMemory::default();
+        // Attempts in a row that did not open a session; sets the wait before the next one
+        let mut failures: u32 = 0;
         loop {
+            let peer = relay::hub_for_attempt(hubs, failures);
             eprintln!("[val-sender] Connecting to {peer} for validation relay...");
             let id = match NodeIdentity::generate() {
                 Ok(i) => i,
@@ -392,10 +389,23 @@ async fn main() {
 
             let hs = match timeout(
                 Duration::from_secs(15),
-                handshake::outbound_handshake(&peer, &id, handshake::NETWORK_ID_MAINNET),
+                handshake::outbound_handshake(peer, &id, handshake::NETWORK_ID_MAINNET),
             ).await {
                 Ok(Ok(h)) => h,
-                _ => { tokio::time::sleep(Duration::from_secs(10)).await; continue; }
+                attempt => {
+                    failures += 1;
+                    let wait = relay::retry_delay(failures);
+                    let why = match attempt {
+                        Ok(Err(e)) => e.to_string(),
+                        _ => "no answer within 15s".to_string(),
+                    };
+                    eprintln!(
+                        "[val-sender] Handshake with {peer} failed ({why}); {failures} in a row, next attempt in {}s",
+                        wait.as_secs()
+                    );
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
             };
 
             eprintln!("[val-sender] Connected! Sending manifest + validations...");
@@ -405,14 +415,17 @@ async fn main() {
             // connection may have lost
             match relay::open_session(&mut stream, &val_send_manifest, &memory).await {
                 Ok(resent) => {
+                    failures = 0;
                     eprintln!("[val-sender] Manifest sent ({} bytes)", val_send_manifest.len());
                     if resent {
                         eprintln!("[val-sender] Re-sent the last validation to {peer}");
                     }
                 }
                 Err(e) => {
-                    eprintln!("[val-sender] Manifest write failed: {e}");
-                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    failures += 1;
+                    let wait = relay::retry_delay(failures);
+                    eprintln!("[val-sender] Manifest write failed: {e}; next attempt in {}s", wait.as_secs());
+                    tokio::time::sleep(wait).await;
                     continue;
                 }
             }
@@ -435,7 +448,7 @@ async fn main() {
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
-    } // end for relay_peer
+    } // end for hubs
 
     // Periodically broadcast manifest so all peers get it
     let manifest_broadcast = manifest_frame.clone();

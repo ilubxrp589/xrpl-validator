@@ -22,6 +22,36 @@ use crate::NodeError;
 /// useless data (rippled `ValidationParms::validationCurrentEarly`, `isCurrent`).
 pub const RESEND_WITHIN: Duration = Duration::from_secs(60);
 
+/// The hubs that carry our validations, beside the regular peer connections: one relay per slot,
+/// on the slot's hubs in turn (the next one after each attempt that fails). On 2026-09-26:
+/// - xrplcluster.com was dropped: the name leads to a web proxy with no peer port, and every
+///   handshake with it failed.
+/// - hub.xrpl-commons.org (on rippled's bootstrap list, `OverlayImpl::start`) answered 400 "Failed to
+///   verify session" to the handshake the Ripple hubs accept, so it is not used.
+/// - hubs.xrpkuwait.com (also on that list) and zaphod.alloy.ee answered 503: full. The fourth relay
+///   alternates between them until one has a free slot.
+///
+/// Check the list with `cargo test -p xrpl-node --lib every_relay_hub_answers -- --ignored`.
+pub const RELAY_HUBS: [&[&str]; 4] = [
+    &["s1.ripple.com:51235"],
+    &["s2.ripple.com:51235"],
+    &["r.ripple.com:51235"],
+    &["hubs.xrpkuwait.com:51235", "zaphod.alloy.ee:51235"],
+];
+
+/// The hub of a slot to try after `failures` failed attempts in a row.
+pub fn hub_for_attempt<'a>(hubs: &[&'a str], failures: u32) -> &'a str {
+    hubs[failures as usize % hubs.len()]
+}
+
+/// How long a relay waits after `failures` attempts in a row that did not open a session: 10 s,
+/// doubling, at most 10 minutes. A hub that keeps refusing is then tried six times an hour instead
+/// of every 25 seconds.
+pub fn retry_delay(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(6);
+    Duration::from_secs((10u64 << doublings).min(600))
+}
+
 /// What a relay carries from one session to the next.
 #[derive(Debug, Default)]
 pub struct RelayMemory {
@@ -306,5 +336,48 @@ mod tests {
         drop(tx);
         let report = run_session(ours, Vec::new(), rx, &mut RelayMemory::default()).await;
         assert!(matches!(report.end, SessionEnd::Shutdown), "{:?}", report.end);
+    }
+
+    #[test]
+    fn a_refusing_hub_is_tried_less_and_less_often() {
+        let secs: Vec<u64> = (1..=8).map(|n| retry_delay(n).as_secs()).collect();
+        assert_eq!(secs, [10, 20, 40, 80, 160, 320, 600, 600]);
+    }
+
+    #[test]
+    fn the_retry_delay_stays_capped_for_any_failure_count() {
+        assert_eq!(retry_delay(u32::MAX), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn a_slot_moves_to_its_next_hub_after_each_failed_attempt() {
+        let hubs = ["a:51235", "b:51235"];
+        let tried: Vec<&str> = (0..4).map(|n| hub_for_attempt(&hubs, n)).collect();
+        assert_eq!(tried, ["a:51235", "b:51235", "a:51235", "b:51235"]);
+        assert_eq!(hub_for_attempt(&["only:51235"], 7), "only:51235");
+    }
+
+    /// A real handshake with every hub — run by hand after changing the list. A hub must take the
+    /// connection or answer 503 (full, which a later attempt can get past); anything else means
+    /// the hub cannot carry our validations.
+    #[tokio::test]
+    #[ignore = "network: opens a peer handshake to every relay hub"]
+    async fn every_relay_hub_answers_a_peer_handshake() {
+        use crate::peer::{handshake, identity::NodeIdentity};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for hub in RELAY_HUBS.iter().flat_map(|slot| slot.iter()) {
+            let id = NodeIdentity::generate().unwrap();
+            let attempt = tokio::time::timeout(
+                Duration::from_secs(15),
+                handshake::outbound_handshake(hub, &id, handshake::NETWORK_ID_MAINNET),
+            )
+            .await;
+            match attempt {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) if e.to_string().contains(" 503 ") => {}
+                Ok(Err(e)) => panic!("{hub}: handshake failed: {e}"),
+                Err(_) => panic!("{hub}: no answer within 15 s"),
+            }
+        }
     }
 }
