@@ -52,6 +52,13 @@ type FfiVerifierHandle = Arc<crate::ffi_verifier::FfiVerifier>;
 #[cfg(not(feature = "ffi"))]
 type FfiVerifierHandle = Arc<()>;
 
+/// The RPC/WebSocket client ws-sync uses — one per process, shared so the validator's `/api/connections`
+/// can report which endpoints it is on.
+pub fn client() -> &'static RippledClient {
+    static CLIENT: std::sync::OnceLock<RippledClient> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(RippledClient::new)
+}
+
 pub async fn start_ws_sync(
     db: Arc<rocksdb::DB>,
     hash_comp: Arc<crate::state_hash::StateHashComputer>,
@@ -59,7 +66,7 @@ pub async fn start_ws_sync(
     history: Option<Arc<parking_lot::Mutex<crate::history::HistoryStore>>>,
     ffi_verifier: Option<FfiVerifierHandle>,
 ) {
-    let rpc = RippledClient::new();
+    let rpc = client().clone();
 
     // Drift watchdog: independent poller of rippled's validated_ledger.seq.
     // The WebSocket subscription can silently buffer/lag and we wouldn't know

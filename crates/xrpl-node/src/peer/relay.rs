@@ -52,6 +52,57 @@ pub fn retry_delay(failures: u32) -> Duration {
     Duration::from_secs((10u64 << doublings).min(600))
 }
 
+/// What one relay slot is doing, for the validator's `/api/connections`.
+#[derive(Debug, Default)]
+pub struct RelayStatus {
+    /// The hub holding the current session, and when it opened.
+    session: Option<(&'static str, Instant)>,
+    /// Sessions opened since the process started.
+    sessions: u32,
+    /// Attempts in a row that did not open a session.
+    failures: u32,
+    /// The hub and the reason of the last attempt that failed.
+    last_failure: Option<String>,
+}
+
+impl RelayStatus {
+    /// Attempts in a row that did not open a session.
+    pub fn failures(&self) -> u32 {
+        self.failures
+    }
+
+    /// A session opened with `hub` at `at`.
+    pub fn opened(&mut self, hub: &'static str, at: Instant) {
+        self.session = Some((hub, at));
+        self.sessions += 1;
+        self.failures = 0;
+    }
+
+    /// An attempt at `hub` failed for `why`.
+    pub fn failed(&mut self, hub: &str, why: &str) {
+        self.session = None;
+        self.failures += 1;
+        self.last_failure = Some(format!("{hub}: {why}"));
+    }
+
+    /// The session ended.
+    pub fn ended(&mut self) {
+        self.session = None;
+    }
+
+    /// The slot's status at `now`, given its hubs.
+    pub fn to_json(&self, hubs: &[&str], now: Instant) -> serde_json::Value {
+        serde_json::json!({
+            "hubs": hubs,
+            "connected": self.session.map(|(hub, _)| hub),
+            "connected_secs": self.session.map(|(_, at)| now.saturating_duration_since(at).as_secs()),
+            "sessions": self.sessions,
+            "failures_in_a_row": self.failures,
+            "last_failure": self.last_failure,
+        })
+    }
+}
+
 /// What a relay carries from one session to the next.
 #[derive(Debug, Default)]
 pub struct RelayMemory {
@@ -355,6 +406,31 @@ mod tests {
         let tried: Vec<&str> = (0..4).map(|n| hub_for_attempt(&hubs, n)).collect();
         assert_eq!(tried, ["a:51235", "b:51235", "a:51235", "b:51235"]);
         assert_eq!(hub_for_attempt(&["only:51235"], 7), "only:51235");
+    }
+
+    #[test]
+    fn a_relay_reports_its_session_and_its_failures() {
+        let t0 = Instant::now();
+        let hubs = ["a:51235", "b:51235"];
+        let mut status = RelayStatus::default();
+        status.failed("a:51235", "HTTP/1.1 503 Service Unavailable");
+        status.failed("b:51235", "no answer within 15s");
+        let j = status.to_json(&hubs, t0);
+        assert_eq!(j["hubs"], serde_json::json!(hubs));
+        assert!(j["connected"].is_null());
+        assert_eq!(j["failures_in_a_row"], 2);
+        assert_eq!(j["last_failure"], "b:51235: no answer within 15s");
+
+        status.opened("a:51235", t0);
+        let j = status.to_json(&hubs, t0 + Duration::from_secs(90));
+        assert_eq!(j["connected"], "a:51235");
+        assert_eq!(j["connected_secs"], 90);
+        assert_eq!(j["sessions"], 1);
+        assert_eq!(j["failures_in_a_row"], 0);
+
+        status.ended();
+        assert!(status.to_json(&hubs, t0)["connected"].is_null());
+        assert_eq!(status.to_json(&hubs, t0)["sessions"], 1);
     }
 
     /// A real handshake with every hub — run by hand after changing the list. A hub must take the

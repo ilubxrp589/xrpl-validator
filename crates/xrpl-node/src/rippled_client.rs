@@ -54,6 +54,10 @@ pub struct RippledClient {
     /// Set when the client has flipped back to the primary and is waiting for
     /// its first answer — the next primary success reports the recovery.
     probing_primary: Arc<AtomicBool>,
+    /// Unix millis when the WebSocket's current fallback stint began (0 = on the primary).
+    ws_fallback_since: Arc<AtomicU64>,
+    /// WebSocket fallback stints since start.
+    ws_fallback_stints: Arc<AtomicU64>,
     /// Optional env-var override for primary RPC URL.
     rpc_override: Option<String>,
     /// Optional env-var override for primary WS URL.
@@ -84,6 +88,8 @@ impl RippledClient {
             consecutive_ok: Arc::new(AtomicU64::new(0)),
             fallback_since: Arc::new(AtomicU64::new(0)),
             probing_primary: Arc::new(AtomicBool::new(false)),
+            ws_fallback_since: Arc::new(AtomicU64::new(0)),
+            ws_fallback_stints: Arc::new(AtomicU64::new(0)),
             rpc_override,
             ws_override,
         }
@@ -203,6 +209,12 @@ impl RippledClient {
         self.active_ws.store(new_idx as u64, Ordering::Relaxed);
         self.on_fallback.store(new_idx > 0, Ordering::Relaxed);
         if new_idx == 0 {
+            self.ws_fallback_since.store(0, Ordering::Relaxed);
+        } else if old == 0 {
+            self.ws_fallback_since.store(now_millis(), Ordering::Relaxed);
+            self.ws_fallback_stints.fetch_add(1, Ordering::Relaxed);
+        }
+        if new_idx == 0 {
             if let Some(ref url) = self.ws_override {
                 return url.as_str();
             }
@@ -213,8 +225,33 @@ impl RippledClient {
     /// Reset WS endpoint to primary.
     pub fn reset_ws(&self) {
         self.active_ws.store(0, Ordering::Relaxed);
+        self.ws_fallback_since.store(0, Ordering::Relaxed);
         // `on_fallback` is shared with the RPC side: leave it saying where the RPC is.
         self.on_fallback.store(self.active_rpc.load(Ordering::Relaxed) != 0, Ordering::Relaxed);
+    }
+
+    /// The endpoints in use, for the validator's `/api/connections`: "primary", or the public fallback's
+    /// URL. The primary's own URL (an override naming a private host) is never echoed.
+    pub fn status_json(&self) -> serde_json::Value {
+        let label = |idx: u64, list: &[&str]| {
+            if idx == 0 { "primary".to_string() } else { list[(idx as usize).min(list.len() - 1)].to_string() }
+        };
+        let ws = self.active_ws.load(Ordering::Relaxed);
+        let rpc = self.active_rpc.load(Ordering::Relaxed);
+        serde_json::json!({
+            "ws": {
+                "endpoint": label(ws, WS_ENDPOINTS),
+                "on_fallback": ws != 0,
+                "fallback_secs": stint_secs(self.ws_fallback_since.load(Ordering::Relaxed)).round() as u64,
+                "fallback_stints": self.ws_fallback_stints.load(Ordering::Relaxed),
+            },
+            "rpc": {
+                "endpoint": label(rpc, ENDPOINTS),
+                "on_fallback": rpc != 0,
+                "fallback_secs": if rpc != 0 { stint_secs(self.fallback_since.load(Ordering::Relaxed)).round() as u64 } else { 0 },
+                "failovers": self.total_failovers.load(Ordering::Relaxed),
+            },
+        })
     }
 
     /// Whether the WebSocket is on a fallback endpoint.
@@ -369,6 +406,25 @@ mod tests {
     fn without_a_live_edge_the_primary_needs_a_fresh_validated_ledger() {
         assert!(primary_ready(&info("full", 107_243_500, 3), 0));
         assert!(!primary_ready(&info("full", 107_243_500, 60), 0));
+    }
+
+    #[test]
+    fn the_status_names_a_fallback_by_its_public_url_and_the_primary_as_primary() {
+        let rpc = RippledClient::new();
+        let s = rpc.status_json();
+        assert_eq!(s["ws"]["endpoint"], "primary");
+        assert_eq!(s["ws"]["on_fallback"], false);
+        assert_eq!(s["rpc"]["endpoint"], "primary");
+        rpc.next_ws_endpoint();
+        let s = rpc.status_json();
+        assert_eq!(s["ws"]["endpoint"], WS_ENDPOINTS[1]);
+        assert_eq!(s["ws"]["on_fallback"], true);
+        assert_eq!(s["ws"]["fallback_stints"], 1);
+        rpc.reset_ws();
+        let s = rpc.status_json();
+        assert_eq!(s["ws"]["endpoint"], "primary");
+        assert_eq!(s["ws"]["fallback_secs"], 0);
+        assert_eq!(s["ws"]["fallback_stints"], 1, "the stint stays counted after the return");
     }
 
     #[test]

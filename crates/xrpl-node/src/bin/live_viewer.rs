@@ -370,17 +370,17 @@ async fn main() {
     });
     eprintln!("[validator] Manifest built ({} bytes)", manifest_bytes.len());
 
-    // Dedicated validation senders — multiple peers for redundancy
-    for hubs in relay::RELAY_HUBS {
+    // Dedicated validation senders — multiple peers for redundancy. Each slot's status is shared with
+    // /api/connections.
+    let relay_status: Vec<Arc<Mutex<relay::RelayStatus>>> = relay::RELAY_HUBS.iter().map(|_| Arc::default()).collect();
+    for (hubs, status) in relay::RELAY_HUBS.into_iter().zip(relay_status.iter().cloned()) {
         let val_send_outbound = outbound_tx.clone();
         let val_send_manifest = manifest_frame.clone();
         tokio::spawn(async move {
         // Carried across reconnects: the last validation this relay forwarded
         let mut memory = relay::RelayMemory::default();
-        // Attempts in a row that did not open a session; sets the wait before the next one
-        let mut failures: u32 = 0;
         loop {
-            let peer = relay::hub_for_attempt(hubs, failures);
+            let peer = relay::hub_for_attempt(hubs, status.lock().failures());
             eprintln!("[val-sender] Connecting to {peer} for validation relay...");
             let id = match NodeIdentity::generate() {
                 Ok(i) => i,
@@ -393,12 +393,16 @@ async fn main() {
             ).await {
                 Ok(Ok(h)) => h,
                 attempt => {
-                    failures += 1;
-                    let wait = relay::retry_delay(failures);
                     let why = match attempt {
                         Ok(Err(e)) => e.to_string(),
                         _ => "no answer within 15s".to_string(),
                     };
+                    let failures = {
+                        let mut s = status.lock();
+                        s.failed(peer, &why);
+                        s.failures()
+                    };
+                    let wait = relay::retry_delay(failures);
                     eprintln!(
                         "[val-sender] Handshake with {peer} failed ({why}); {failures} in a row, next attempt in {}s",
                         wait.as_secs()
@@ -415,14 +419,18 @@ async fn main() {
             // connection may have lost
             match relay::open_session(&mut stream, &val_send_manifest, &memory).await {
                 Ok(resent) => {
-                    failures = 0;
+                    status.lock().opened(peer, std::time::Instant::now());
                     eprintln!("[val-sender] Manifest sent ({} bytes)", val_send_manifest.len());
                     if resent {
                         eprintln!("[val-sender] Re-sent the last validation to {peer}");
                     }
                 }
                 Err(e) => {
-                    failures += 1;
+                    let failures = {
+                        let mut s = status.lock();
+                        s.failed(peer, &format!("manifest write failed: {e}"));
+                        s.failures()
+                    };
                     let wait = relay::retry_delay(failures);
                     eprintln!("[val-sender] Manifest write failed: {e}; next attempt in {}s", wait.as_secs());
                     tokio::time::sleep(wait).await;
@@ -432,6 +440,7 @@ async fn main() {
 
             // Forward validations, answering the peer's keep-alive pings, until the connection ends
             let report = relay::run_session(stream, hs.remaining_bytes, val_send_outbound.subscribe(), &mut memory).await;
+            status.lock().ended();
             let pongs = report.pongs;
             match report.end {
                 relay::SessionEnd::WriteFailed(e) => {
@@ -1931,6 +1940,24 @@ async fn main() {
             "note": "Build with --features ffi to enable libxrpl integration"
         }))
     }));
+
+    // Which endpoints ws-sync and its RPC use, and the relay slots (for the ops copilot).
+    let app = app.route("/api/connections", get({
+        let relays = relay_status.clone();
+        move || {
+            let relays = relays.clone();
+            async move {
+                let now = std::time::Instant::now();
+                let mut json = xrpl_node::ws_sync::client().status_json();
+                json["relays"] = relay::RELAY_HUBS.iter().zip(relays.iter())
+                    .map(|(hubs, status)| status.lock().to_json(hubs, now))
+                    .collect();
+                axum::Json(json)
+            }
+        }
+    }));
+    // This validator's amendment votes, and the pending amendments its engine implements.
+    let app = app.route("/api/amendments", get(|| async { axum::Json(xrpl_node::validation::amendments_json()) }));
 
     // SECURITY(10.3): All /api/* endpoints are read-only (sync-status, engine, peers,
     // state-hash, history, consensus). There is no submit/transaction endpoint.

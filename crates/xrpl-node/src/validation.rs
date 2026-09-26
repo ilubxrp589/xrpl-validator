@@ -53,7 +53,11 @@ fn amendment_hash(name: &str) -> Hash256 {
 /// (MPTokensV2, Batch, PermissionDelegationV1_1, DynamicMPT, fixBatchInnerSigs) that
 /// 3.2.0 declares but does not yet implement. Regenerate at each upgrade (PORT-3.2.0.md).
 pub fn supported_amendments() -> Vec<Hash256> {
-    let names = [
+    SUPPORTED_AMENDMENT_NAMES.iter().map(|n| amendment_hash(n)).collect()
+}
+
+/// The names behind [`supported_amendments`].
+pub const SUPPORTED_AMENDMENT_NAMES: &[&str] = &[
         // BatchV1_1: voted yes 2026-09-14 (James) — support for the amendment; the
         // FFI leg that keeps the state-hash matching once it activates is in
         // (docs/superpowers/specs/2026-09-14-batch-support-design.md).
@@ -75,8 +79,26 @@ pub fn supported_amendments() -> Vec<Hash256> {
         "fixNFTokenReserve", "fixFillOrKill", "DID", "fixDisallowIncomingV1",
         "XChainBridge", "AMM", "Clawback", "fixUniversalNumber",
         "XRPFees", "fixRemoveNFTokenAutoTrustLine",
-    ];
-    names.iter().map(|n| amendment_hash(n)).collect()
+];
+
+/// Amendments not yet enabled on mainnet whose rules this engine already implements, with the evidence.
+/// An amendment enabled on mainnet is implemented by construction (the engine matches mainnet ledger for
+/// ledger), so only pending ones are listed. The ops copilot reads this from `/api/amendments` and warns
+/// when an amendment gains majority on mainnet without being here: a missing amendment counts as not
+/// implemented, so add one only with its evidence. (Not the vote list above, which follows rippled's
+/// supported set and has not been reconciled with the engine.)
+pub const IMPLEMENTED_PENDING: &[(&str, &str)] = &[
+    ("BatchV1_1", "Batch support (2026-09-14 design); devnet campaigns 22 to 25 byte-exact"),
+    ("PermissionDelegationV1_1", "finding 360 (tx/delegate.rs); devnet campaign 22"),
+];
+
+/// The body of `/api/amendments`: this validator's votes and the pending amendments its engine implements.
+pub fn amendments_json() -> serde_json::Value {
+    let implemented: Vec<serde_json::Value> = IMPLEMENTED_PENDING
+        .iter()
+        .map(|(name, evidence)| serde_json::json!({"name": name, "hash": amendment_hash(name).to_string(), "evidence": evidence}))
+        .collect();
+    serde_json::json!({"votes": SUPPORTED_AMENDMENT_NAMES, "implemented_pending": implemented})
 }
 
 /// `sfServerVersion`, laid out per rippled `BuildInfo::encodeSoftwareVersion`
@@ -624,6 +646,20 @@ mod tests {
     /// No yes vote for SingleAssetVault or LendingProtocol (James, 2026-09-25): either amendment
     /// switches rippled's `Number` to its 19-digit mantissa for every transaction
     /// (`Rules.cpp` `setCurrentTransactionRules`), and the engine models the 16-digit scale only.
+    #[test]
+    fn the_api_names_the_pending_amendments_the_engine_implements() {
+        let json = amendments_json();
+        let implemented = json["implemented_pending"].as_array().expect("implemented_pending");
+        let entry = |name: &str| implemented.iter().find(|a| a["name"] == name).cloned();
+        // hashes as mainnet's `feature` RPC lists them
+        assert_eq!(entry("BatchV1_1").expect("BatchV1_1")["hash"], "9F287AED3CDB50A7BD1ACEC24296A30C9B5230CCD136219317AC790E3B884377");
+        assert_eq!(entry("PermissionDelegationV1_1").expect("PermissionDelegationV1_1")["hash"], "0F48FF561C709540328F31F1C97FD512ACC8B4E42138A161CB0E21ECA292540B");
+        for name in ["fixBatchV1_2", "SingleAssetVault", "LendingProtocol", "fixCleanup3_4_0"] {
+            assert!(entry(name).is_none(), "{name} is not implemented");
+        }
+        assert!(json["votes"].as_array().expect("votes").iter().any(|v| v == "BatchV1_1"));
+    }
+
     #[test]
     fn no_yes_vote_for_the_amendments_that_widen_number() {
         let votes = supported_amendments();
