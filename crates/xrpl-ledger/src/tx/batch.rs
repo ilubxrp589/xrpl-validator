@@ -348,7 +348,7 @@ impl Transactor for BatchTransactor {
             // fee-sponsoring `sfSponsor` that co-signed (`sfSponsorSignature`),
             // each unless it is the outer account (Batch.cpp:423-445). We used
             // the inner's Account, so a validated batch with a delegated inner
-            // (possible once PermissionDelegationV1_1 is live, ~10-05) would
+            // (possible once PermissionDelegationV1_1 is live, ~2026-10-08) would
             // have been refused here as temBAD_SIGNER.
             let mut require = |who: [u8; 20]| {
                 if who != tx.account && !inner_accounts.contains(&who) {

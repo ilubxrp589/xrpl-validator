@@ -1,5 +1,5 @@
 //! Campaign 22 (devnet, 2026-09-23) byte-exact vectors — Finding 360,
-//! PermissionDelegationV1_1 (majority on mainnet 2026-09-21, active ~10-05):
+//! PermissionDelegationV1_1 (majority on mainnet from 2026-09-21, restarted 2026-09-24; active ~2026-10-08):
 //! DelegateSet create / replace / delete / refusals; delegated Payment (XRP,
 //! IOU, tec, Ticket), TrustSet, TicketCreate, DepositPreauth — the DELEGATE
 //! pays the fee, the ACCOUNT's sequence moves; the pre-fee reserve boundary;

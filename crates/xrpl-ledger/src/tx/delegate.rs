@@ -2,8 +2,9 @@
 //! sign transactions on this one's behalf (rippled 3.4.0
 //! `transactors/delegate/DelegateSet.cpp`, PermissionDelegationV1_1).
 //!
-//! Finding 360: the amendment reached majority on mainnet 2026-09-21 (active
-//! ~10-05) and the engine had neither the transactor nor the delegated fee
+//! Finding 360: the amendment reached majority on mainnet 2026-09-21 (then due
+//! ~10-05; the majority restarted on 2026-09-24, so it is due ~2026-10-08) and the
+//! engine had neither the transactor nor the delegated fee
 //! path. Three parts, all here or wired from here:
 //!   * DelegateSet: one `Delegate` object per (account, authorized) pair,
 //!     keyed `keylet::delegate`, linked into BOTH owner directories
