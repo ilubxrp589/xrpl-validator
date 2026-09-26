@@ -51,7 +51,8 @@ fn amendment_hash(name: &str) -> Hash256 {
 /// 2026-06-15 for the 3.2.0 port: drops amendments 3.2.0 retired into baseline,
 /// adds the new 3.2.0 amendments, and excludes `Supported::No` placeholders
 /// (MPTokensV2, Batch, PermissionDelegationV1_1, DynamicMPT, fixBatchInnerSigs) that
-/// 3.2.0 declares but does not yet implement. Regenerate at each upgrade (PORT-3.2.0.md).
+/// 3.2.0 declares but does not yet implement. Regenerate at each upgrade (PORT-3.2.0.md). Reconciled with the
+/// engine on 2026-09-26: a pending amendment gets a yes vote only if the engine is ready for it (READY_PENDING).
 pub fn supported_amendments() -> Vec<Hash256> {
     SUPPORTED_AMENDMENT_NAMES.iter().map(|n| amendment_hash(n)).collect()
 }
@@ -64,6 +65,10 @@ pub const SUPPORTED_AMENDMENT_NAMES: &[&str] = &[
         "BatchV1_1",
         // fixCleanup3_3_0: ported (finding 259); added to the vote 2026-09-14.
         "fixCleanup3_3_0",
+        // PermissionDelegationV1_1: voted yes 2026-09-26 (James) — ready: finding 360, devnet campaign 22.
+        "PermissionDelegationV1_1",
+        // XChainBridge and fixXChainRewardRounding: no yes vote since 2026-09-26 (James) — the XChain
+        // transactors are a blind source port with no specimen (see READY_PENDING).
         // SingleAssetVault and LendingProtocol: no yes vote (James, 2026-09-25). Either one switches
         // rippled's `Number` to its 19-digit mantissa for every transaction; the engine models the
         // 16-digit scale only.
@@ -74,31 +79,31 @@ pub const SUPPORTED_AMENDMENT_NAMES: &[&str] = &[
         "fixFrozenLPTokenTransfer", "DeepFreeze", "PermissionedDomains", "DynamicNFT",
         "Credentials", "AMMClawback", "fixAMMv1_2", "MPTokensV1",
         "fixNFTokenPageLinks", "fixInnerObjTemplate2", "fixEnforceNFTokenTrustline", "fixReducedOffersV2",
-        "NFTokenMintOffer", "fixAMMv1_1", "fixPreviousTxnID", "fixXChainRewardRounding",
+        "NFTokenMintOffer", "fixAMMv1_1", "fixPreviousTxnID",
         "fixEmptyDID", "PriceOracle", "fixAMMOverflowOffer", "fixInnerObjTemplate",
         "fixNFTokenReserve", "fixFillOrKill", "DID", "fixDisallowIncomingV1",
-        "XChainBridge", "AMM", "Clawback", "fixUniversalNumber",
+        "AMM", "Clawback", "fixUniversalNumber",
         "XRPFees", "fixRemoveNFTokenAutoTrustLine",
 ];
 
-/// Amendments not yet enabled on mainnet whose rules this engine already implements, with the evidence.
-/// An amendment enabled on mainnet is implemented by construction (the engine matches mainnet ledger for
-/// ledger), so only pending ones are listed. The ops copilot reads this from `/api/amendments` and warns
-/// when an amendment gains majority on mainnet without being here: a missing amendment counts as not
-/// implemented, so add one only with its evidence. (Not the vote list above, which follows rippled's
-/// supported set and has not been reconciled with the engine.)
-pub const IMPLEMENTED_PENDING: &[(&str, &str)] = &[
+/// Amendments not yet enabled on mainnet that this engine is ready for — implemented AND verified — with the
+/// evidence. An amendment enabled on mainnet is covered by construction (the engine matches mainnet ledger
+/// for ledger), so only pending ones are listed. We vote for each of them, and the ops copilot reads the list
+/// from `/api/amendments` and warns when an amendment gains majority on mainnet without being here: a
+/// missing amendment counts as not ready, so add one only with its evidence. Implemented is not enough:
+/// the XChain transactors (tx/xchain.rs) are a blind source port with no specimen, so XChainBridge is not.
+pub const READY_PENDING: &[(&str, &str)] = &[
     ("BatchV1_1", "Batch support (2026-09-14 design); devnet campaigns 22 to 25 byte-exact"),
     ("PermissionDelegationV1_1", "finding 360 (tx/delegate.rs); devnet campaign 22"),
 ];
 
 /// The body of `/api/amendments`: this validator's votes and the pending amendments its engine implements.
 pub fn amendments_json() -> serde_json::Value {
-    let implemented: Vec<serde_json::Value> = IMPLEMENTED_PENDING
+    let implemented: Vec<serde_json::Value> = READY_PENDING
         .iter()
         .map(|(name, evidence)| serde_json::json!({"name": name, "hash": amendment_hash(name).to_string(), "evidence": evidence}))
         .collect();
-    serde_json::json!({"votes": SUPPORTED_AMENDMENT_NAMES, "implemented_pending": implemented})
+    serde_json::json!({"votes": SUPPORTED_AMENDMENT_NAMES, "ready_pending": implemented})
 }
 
 /// `sfServerVersion`, laid out per rippled `BuildInfo::encodeSoftwareVersion`
@@ -649,7 +654,7 @@ mod tests {
     #[test]
     fn the_api_names_the_pending_amendments_the_engine_implements() {
         let json = amendments_json();
-        let implemented = json["implemented_pending"].as_array().expect("implemented_pending");
+        let implemented = json["ready_pending"].as_array().expect("ready_pending");
         let entry = |name: &str| implemented.iter().find(|a| a["name"] == name).cloned();
         // hashes as mainnet's `feature` RPC lists them
         assert_eq!(entry("BatchV1_1").expect("BatchV1_1")["hash"], "9F287AED3CDB50A7BD1ACEC24296A30C9B5230CCD136219317AC790E3B884377");
@@ -658,6 +663,23 @@ mod tests {
             assert!(entry(name).is_none(), "{name} is not implemented");
         }
         assert!(json["votes"].as_array().expect("votes").iter().any(|v| v == "BatchV1_1"));
+    }
+
+    /// 2026-09-26 (James): vote for exactly the pending amendments the engine is ready for. The vote list
+    /// came from rippled 3.2.0's supported set: it voted for XChainBridge and fixXChainRewardRounding,
+    /// which the engine has not verified, and not for PermissionDelegationV1_1, which it has (finding 360).
+    #[test]
+    fn we_vote_for_the_pending_amendments_the_engine_is_ready_for_and_no_others() {
+        for (name, _) in READY_PENDING {
+            assert!(SUPPORTED_AMENDMENT_NAMES.contains(name), "{name} is ready and must be voted for");
+        }
+        // pending on mainnet on 2026-09-26 and not ready in this engine
+        for name in [
+            "XChainBridge", "fixXChainRewardRounding", "fixBatchV1_2", "fixCleanup3_4_0", "DynamicMPT",
+            "SingleAssetVault", "LendingProtocol", "LendingProtocolV1_1", "Sponsor", "ConfidentialTransfer",
+        ] {
+            assert!(!SUPPORTED_AMENDMENT_NAMES.contains(&name), "{name} is not ready and must not be voted for");
+        }
     }
 
     #[test]
