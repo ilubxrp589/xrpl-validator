@@ -125,6 +125,11 @@ pub async fn start_ws_sync(
     // WebSocket reconnect. Prevents reconnect-spam if rippled momentarily
     // stutters or we're catching up after a real fault. 30s minimum gap.
     let mut last_watchdog_reconnect_ms: u64 = 0;
+    // While the WebSocket is on a fallback, the primary is looked at once a minute, and ws-sync goes
+    // back to it as soon as it serves the live edge. A fallback stint used to last until the next
+    // restart: on 2026-09-25 the reference node's xrpld upgrade left ws-sync on a public WebSocket
+    // until a warm restart moved it back.
+    let mut last_primary_probe_ms: u64 = 0;
 
     loop {
         let ws_url = rpc.ws_url();
@@ -726,6 +731,26 @@ pub async fn start_ws_sync(
                             );
                             last_watchdog_reconnect_ms = now_ms;
                             break; // exits the while-let, outer loop reconnects fresh
+                        }
+                    }
+                }
+
+                if rpc.ws_on_fallback() {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    if now_ms.saturating_sub(last_primary_probe_ms) >= 60_000 {
+                        last_primary_probe_ms = now_ms;
+                        if let Some(info) = rpc.primary_server_info(std::time::Duration::from_secs(3)).await {
+                            if crate::rippled_client::primary_ready(&info, watchdog_live_edge.load(Ordering::Acquire)) {
+                                eprintln!(
+                                    "[ws-sync] Primary is serving the live edge again (validated #{}) — moving the WebSocket back to it",
+                                    info["validated_ledger"]["seq"]
+                                );
+                                rpc.reset_ws();
+                                break; // like the watchdog: the outer loop reconnects, now to the primary
+                            }
                         }
                     }
                 }

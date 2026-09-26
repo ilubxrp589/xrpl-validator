@@ -213,7 +213,41 @@ impl RippledClient {
     /// Reset WS endpoint to primary.
     pub fn reset_ws(&self) {
         self.active_ws.store(0, Ordering::Relaxed);
+        // `on_fallback` is shared with the RPC side: leave it saying where the RPC is.
+        self.on_fallback.store(self.active_rpc.load(Ordering::Relaxed) != 0, Ordering::Relaxed);
     }
+
+    /// Whether the WebSocket is on a fallback endpoint.
+    pub fn ws_on_fallback(&self) -> bool {
+        self.active_ws.load(Ordering::Relaxed) != 0
+    }
+
+    /// `server_info` straight from the primary RPC endpoint, bypassing failover: its `info` object,
+    /// or `None` if the primary did not answer within `wait`.
+    pub async fn primary_server_info(&self, wait: std::time::Duration) -> Option<serde_json::Value> {
+        let url = self.rpc_override.as_deref().unwrap_or(ENDPOINTS[0]);
+        let body = serde_json::json!({"method": "server_info", "params": [{}]});
+        let resp = self.client.post(url).json(&body).timeout(wait).send().await.ok()?;
+        let json: serde_json::Value = resp.json().await.ok()?;
+        let info = json["result"]["info"].clone();
+        info.is_object().then_some(info)
+    }
+}
+
+/// Whether the primary rippled is fit to feed ws-sync again after a fallback stint, from its
+/// `server_info` `info`: following the network (`full`, `proposing` or `validating`) with a validated
+/// ledger at most two behind `live_edge`, the network's validated sequence — or, when that is not
+/// known (0), a validated ledger at most 10 seconds old.
+pub fn primary_ready(info: &serde_json::Value, live_edge: u32) -> bool {
+    let following = matches!(info["server_state"].as_str(), Some("full" | "proposing" | "validating"));
+    let validated = &info["validated_ledger"];
+    let Some(seq) = validated["seq"].as_u64() else { return false };
+    following
+        && if live_edge > 0 {
+            seq + 2 >= u64::from(live_edge)
+        } else {
+            validated["age"].as_u64().is_some_and(|age| age <= 10)
+        }
 }
 
 /// Reaudit 2026-06-10 finding F7 — guard against silently verifying mainnet state
@@ -305,5 +339,48 @@ mod tests {
     fn explicit_opt_in_allows_default_endpoints_even_when_signing() {
         // XRPL_ALLOW_DEFAULT_ENDPOINTS=1 escape hatch for dev/localhost runs.
         assert!(check_signing_endpoints(true, None, None, true).is_ok());
+    }
+
+    fn info(state: &str, seq: u64, age: u64) -> serde_json::Value {
+        serde_json::json!({"server_state": state, "validated_ledger": {"seq": seq, "age": age}})
+    }
+
+    #[test]
+    fn a_primary_at_the_live_edge_is_ready() {
+        assert!(primary_ready(&info("full", 107_243_500, 2), 107_243_500));
+        assert!(primary_ready(&info("proposing", 107_243_498, 2), 107_243_500));
+        assert!(primary_ready(&info("validating", 107_243_501, 1), 107_243_500));
+    }
+
+    #[test]
+    fn a_primary_behind_the_live_edge_is_not_ready() {
+        assert!(!primary_ready(&info("full", 107_243_497, 2), 107_243_500));
+    }
+
+    #[test]
+    fn a_primary_not_following_the_network_is_not_ready() {
+        for state in ["disconnected", "connected", "syncing", "tracking"] {
+            assert!(!primary_ready(&info(state, 107_243_500, 2), 107_243_500), "{state}");
+        }
+        assert!(!primary_ready(&serde_json::json!({"server_state": "full"}), 107_243_500));
+    }
+
+    #[test]
+    fn without_a_live_edge_the_primary_needs_a_fresh_validated_ledger() {
+        assert!(primary_ready(&info("full", 107_243_500, 3), 0));
+        assert!(!primary_ready(&info("full", 107_243_500, 60), 0));
+    }
+
+    #[test]
+    fn resetting_the_websocket_returns_it_from_a_fallback_to_the_primary() {
+        let rpc = RippledClient::new();
+        let primary = rpc.ws_url().to_string();
+        assert!(!rpc.ws_on_fallback());
+        rpc.next_ws_endpoint();
+        assert!(rpc.ws_on_fallback());
+        assert_ne!(rpc.ws_url(), primary);
+        rpc.reset_ws();
+        assert!(!rpc.ws_on_fallback());
+        assert_eq!(rpc.ws_url(), primary);
     }
 }
