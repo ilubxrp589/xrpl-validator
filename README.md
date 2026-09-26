@@ -54,7 +54,7 @@ matches mainnet, is the oracle). Crafted campaigns on testnet/devnet cover what
 mainnet rarely exercises — AccountSet / SignerListSet / multisign, AMM
 deposit / withdraw / bid / vote, the OfferCreate flag matrix, MPT, NFT modify /
 cancel, Oracle / DID, credential-based DepositAuth, LedgerStateFix, permission
-delegation, and Batch (BatchV1_1 activates on mainnet ~2026-09-29) — with every
+delegation, and Batch (BatchV1_1 activates on mainnet ~2026-10-09) — with every
 bundle byte-exact. It is **not yet the production apply path** — it earns that
 after a run of consecutive clean 24-hour live soaks.
 

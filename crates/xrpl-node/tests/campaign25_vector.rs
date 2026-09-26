@@ -1,4 +1,4 @@
-//! Campaign 25 (devnet, 2026-09-25) byte-exact vectors: Batch (BatchV1_1, active on mainnet ~09-29) x
+//! Campaign 25 (devnet, 2026-09-25) byte-exact vectors: Batch (BatchV1_1, activation due on mainnet ~2026-10-09) x
 //! Clawback, AMMClawback and token escrow, all already enabled on mainnet. Trust-line and MPT clawback inside
 //! batches (a holder clawed to zero, then removing its line or MPToken in a later inner; untilfailure and onlyone
 //! across a holder with no line), AMMClawback (partial; a fresh LP clawed whole; the last LP clawed so the pool is

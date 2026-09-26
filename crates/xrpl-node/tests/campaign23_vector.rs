@@ -1,5 +1,5 @@
 //! Campaign 23 (devnet, 2026-09-23) byte-exact vectors: Batch (BatchV1_1,
-//! active on mainnet ~09-29) combined with delegation, MPT, credentials,
+//! activation due on mainnet ~2026-10-09) combined with delegation, MPT, credentials,
 //! tickets, AccountDelete and LedgerStateFix inners — findings 389-393.
 //!
 //! A Batch bundle carries every inner's id (`raw_inner_hashes`, RawTransactions

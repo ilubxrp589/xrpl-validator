@@ -536,7 +536,7 @@ mod tests {
     /// Finding 382: a delegated inner is signed by its DELEGATE, so the
     /// delegate — not the inner's Account — is the required batch signer
     /// (`rb.getInitiator()`, Batch.cpp:430). Reachable once
-    /// PermissionDelegationV1_1 (~10-05) and BatchV1_1 (~09-29) are both live.
+    /// PermissionDelegationV1_1 (~2026-10-08) and BatchV1_1 (~2026-10-09) are both live.
     #[test]
     fn a_delegated_inner_requires_its_delegate_as_batch_signer() {
         let mut d = inner_payment(3, 2, 1, 6);

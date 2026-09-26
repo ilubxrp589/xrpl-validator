@@ -1,5 +1,5 @@
 //! Campaign 24 (devnet, 2026-09-23) byte-exact vectors: Batch (BatchV1_1, active on mainnet
-//! ~09-29) x the inner types campaigns 8 and 23 never put inside a Batch — NFToken, OfferCreate,
+//! ~2026-10-09) x the inner types campaigns 8 and 23 never put inside a Batch — NFToken, OfferCreate,
 //! Check, PaymentChannel, Escrow, Oracle, DID, AMM, TrustSet, AccountSet. Each shape has an inner
 //! create or change an object a LATER inner uses or deletes (the per-inner threading and
 //! owner-threading rules, F392 / F394), plus AllOrNothing discards of complex creations. No engine

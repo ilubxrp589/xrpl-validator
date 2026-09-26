@@ -606,7 +606,7 @@ impl Transactor for MPTokenIssuanceCreateTransactor {
         // Finding 374: `args.flags & ~tfUniversal` (MPTokenIssuanceCreate.cpp
         // :158), and tfUniversal is tfFullyCanonicalSig | tfInnerBatchTxn —
         // 0xC0000000. Stripping only 0x80000000 would store 0x40000000 on an
-        // issuance created inside a Batch (BatchV1_1 activates ~2026-09-29).
+        // issuance created inside a Batch (BatchV1_1 activates ~2026-10-09).
         let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & !0xC000_0000;
         let mut obj = serde_json::json!({
             "LedgerEntryType": "MPTokenIssuance",
