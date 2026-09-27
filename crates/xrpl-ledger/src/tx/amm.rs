@@ -2164,9 +2164,14 @@ pub struct AMMWithdrawTransactor;
 /// XRP side is sent first (Asset = XRP): the IOU side's check then sees the
 /// XRP already withdrawn. Comparing the pre-fee balance alone refused a
 /// withdrawal mainnet accepted.
+/// Finding 405 — #107278773 784FE06097CB: no exemption for the issuer. The
+/// check asks only whether `keylet::trustLine(account, issue)` exists, and an
+/// issuer never has a line to itself, so its own currency is checked too
+/// (rJENNivB, 1.41 XRP at OwnerCount 2, withdrawing its 001: mainnet
+/// tecINSUFFICIENT_RESERVE; we exempted it and paid out).
 fn withdraw_reserve_ok(sandbox: &Sandbox, account: &[u8; 20], leg: &crate::tx::offer::Leg, pre_fee_xrp: u128) -> bool {
     use crate::tx::offer as ox;
-    if leg.xrp || account == &leg.issuer {
+    if leg.xrp {
         return true;
     }
     if ox::json_at(sandbox, &keylet::ripple_state_key(account, &leg.issuer, &leg.cur)).is_some() {

@@ -310,3 +310,13 @@ fn amm_withdraw_all_checks_the_reserve_for_each_new_line_107210679() {
 fn amm_withdraw_all_counts_the_paid_xrp_toward_the_new_line_reserve_107219029() {
     run_bundle(include_str!("vectors/amm_withdraw_all_counts_the_paid_xrp_toward_the_new_line_reserve_107219029.json"));
 }
+
+/// Finding 405 (soak #33 receipt, mainnet #107278773 784FE06097CB): a tfWithdrawAll from an XRP/001 pool by the account
+/// that issues 001, holding 1.41 XRP at OwnerCount 2. rippled's `sufficientReserve` asks only whether
+/// `keylet::trustLine(account, issue)` exists, and an issuer never has a line to itself, so the check runs for the
+/// issuer too: a third object needs 1 + 0.2 x 3 = 1.6 XRP, and with the pool's whole 0.1 XRP the account has at most
+/// 1.50999 XRP, so mainnet returns tecINSUFFICIENT_RESERVE (fee only). The F156 check exempted the issuer and paid out.
+#[test]
+fn amm_withdraw_by_the_issuer_checks_the_reserve_for_its_own_currency_107278773() {
+    run_bundle(include_str!("vectors/amm_withdraw_by_the_issuer_checks_the_reserve_for_its_own_currency_107278773.json"));
+}
