@@ -66,14 +66,19 @@ fn collect_conan_libs(conan_gen: &std::path::Path) {
     let mut lib_dirs: HashSet<String> = HashSet::new();
     let mut libs: Vec<String> = Vec::new();
 
-    let entries = match fs::read_dir(conan_gen) {
-        Ok(e) => e,
+    // Sorted by name: read_dir gives the filesystem's order (hash order on ext4), so the link order, and with it which
+    // archive member supplies a duplicated C++ symbol, differed between hosts. Sorted, every host links the same.
+    let mut entries: Vec<_> = match fs::read_dir(conan_gen) {
+        Ok(e) => e.flatten().collect(),
         Err(_) => return,
     };
+    entries.sort_by_key(|e| e.file_name());
 
-    let skip_packages = ["OpenSSL", "openssl"];
+    // gRPC: nothing in the shim or libxrpl calls it; linked, its objects got picked as the first provider of plain
+    // std::string instantiations and dragged in upb (undefined __start_linkarr_upb_AllExts on .220).
+    let skip_packages = ["OpenSSL", "openssl", "gRPC"];
 
-    for entry in entries.flatten() {
+    for entry in entries {
         let name = entry.file_name().to_string_lossy().into_owned();
         if !name.ends_with("-release-x86_64-data.cmake") {
             continue;
