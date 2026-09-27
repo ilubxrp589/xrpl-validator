@@ -762,10 +762,11 @@ impl Transactor for ClawbackTransactor {
             Some(id) => id,
             None => return TxResult::Malformed,
         };
-        let clawback_value: f64 = match amount.get("value").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()) {
-            Some(v) if v > 0.0 => v,
+        // The amount must be positive (temBAD_AMOUNT); the exact value is read where it is moved.
+        match amount.get("value").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()) {
+            Some(v) if v > 0.0 => {}
             _ => return TxResult::BadAmount,
-        };
+        }
 
         // Build the currency code (20 bytes)
         let currency = {
@@ -814,7 +815,7 @@ impl Transactor for ClawbackTransactor {
             None => return TxResult::NoLine,
         };
 
-        let mut line: serde_json::Value = match serde_json::from_slice(&line_data) {
+        let line: serde_json::Value = match serde_json::from_slice(&line_data) {
             Ok(v) => v,
             Err(_) => return TxResult::Malformed,
         };
@@ -839,14 +840,23 @@ impl Transactor for ClawbackTransactor {
             return TxResult::InsufficientFunds;
         }
 
-        // Claw back up to the holder's balance
-        let actual_clawback = clawback_value.min(holder_balance);
-        let new_holder_balance = holder_balance - actual_clawback;
-
-        let new_balance = if issuer_is_low { -new_holder_balance } else { new_holder_balance };
-        line["Balance"]["value"] = serde_json::Value::String(format!("{}", new_balance));
-
-        sandbox.write(line_key, serde_json::to_vec(&line).unwrap());
+        // Finding 403 (mainnet #107263299 DC750F7C1704): rippled moves min(accountHolds, Amount) from the
+        // holder to the issuer with `directSendNoFee` (Clawback.cpp `applyHelper<Issue>`): exact decimal
+        // amounts, and `rippleCredit`'s line mechanics. The engine subtracted in f64 and wrote
+        // 0.00000000049476… where 200,000.0000000005 − 200,000 is 0.0000000005. The sign checks above can
+        // stay in f64: parsing keeps the sign and the non-zero-ness of every IOU value.
+        let asset = crate::flow::steps::Asset { currency, issuer: Some(tx.account) };
+        let (claw_negative, claw_me) = crate::tx::offer::signed_value(amount);
+        let claw = crate::flow::amounts::IouAmount::from_me(claw_negative, claw_me);
+        let mut ps = crate::flow::payment_sandbox::PaymentSandbox::new(sandbox);
+        let spendable = crate::flow::view::account_holds_iou(
+            &ps,
+            &holder,
+            &asset,
+            crate::flow::view::FreezeHandling::IgnoreFreeze,
+            crate::flow::view::AuthHandling::IgnoreAuth,
+        );
+        crate::flow::view::ripple_credit_pub(&mut ps, &holder, &tx.account, &asset, spendable.min(claw));
 
         TxResult::Success
     }

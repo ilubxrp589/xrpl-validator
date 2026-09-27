@@ -101,3 +101,12 @@ fn run_bundle(bundle_json: &str) {
 fn clawback_from_an_issuer_without_the_flag_is_no_permission_devnet_5489422() {
     run_bundle(include_str!("vectors/clawback_from_an_issuer_without_the_flag_is_no_permission_devnet_5489422.json"));
 }
+
+/// Finding 403 — mainnet #107263299 DC750F7C1704: an IOU Clawback of 200,000 from a line holding
+/// 200,000.0000000005. rippled moves min(accountHolds, Amount) with `directSendNoFee`
+/// (Clawback.cpp `applyHelper<Issue>`), exact decimal amounts, and leaves 0.0000000005; the engine
+/// subtracted in f64 and wrote 0.00000000049476…
+#[test]
+fn clawback_leaves_the_exact_decimal_remainder_107263299() {
+    run_bundle(include_str!("vectors/clawback_leaves_the_exact_decimal_remainder_107263299.json"));
+}
