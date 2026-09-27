@@ -2162,7 +2162,10 @@ impl Transactor for PaymentTransactor {
             let amount = Self::amount_drops(tx).unwrap_or(0);
             // rippled: mPriorBalance < amount + accountReserve(OwnerCount) —
             // the sender's reserve is untouchable (#105035381 D21350B6).
-            let oc = acct["OwnerCount"].as_u64().unwrap_or(0);
+            // Finding 404 — mainnet #107266300 F31123B49AFE: rippled makes that check in doApply, after
+            // `Transactor::apply` has deleted the ticket being spent (`consumeSeqProxy`); this preclaim
+            // runs before, so a ticket-funded payment must not count the ticket it spends.
+            let oc = acct["OwnerCount"].as_u64().unwrap_or(0).saturating_sub(u64::from(tx.uses_ticket()));
             let reserve = Self::reserve_base(sandbox)
                 .saturating_add(Self::reserve_inc(sandbox).saturating_mul(oc));
             if balance < amount.saturating_add(reserve) {

@@ -1055,3 +1055,14 @@ fn payment_with_credentials_into_a_deposit_auth_destination_107093959() {
 fn payment_pool_dry_iteration_ends_the_flow_107093372() {
     run_bundle(include_str!("vectors/payment_pool_dry_iteration_ends_the_flow_107093372.json"));
 }
+
+/// Finding 404 (soak #32, mainnet #107266300 F31123B49AFE): a 5,877-drop XRP Payment paid for with a
+/// Ticket, from an account holding 3.002177 XRP at OwnerCount 10 (ten tickets). rippled's
+/// `Transactor::apply` deletes the ticket being spent (`consumeSeqProxy`: OwnerCount 10 -> 9) before
+/// `Payment::doApply`'s funding guard (`mPriorBalance < amount + max(reserve, fee)`), so the reserve
+/// is 1 + 0.2 x 9 = 2.8 XRP and mainnet succeeds; the engine checked in preclaim, counted the spent
+/// ticket (3.0 XRP) and returned tecUNFUNDED_PAYMENT. The same class as Finding 402 (TicketCreate).
+#[test]
+fn xrp_payment_on_a_ticket_counts_the_reserve_after_the_spent_ticket_107266300() {
+    run_bundle(include_str!("vectors/xrp_payment_on_a_ticket_counts_the_reserve_after_the_spent_ticket_107266300.json"));
+}
