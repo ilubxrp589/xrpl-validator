@@ -2076,9 +2076,18 @@ fn payout_proportional_to(
     // 34347264193-drop pool comes to 0.000023 drops — ZERO — while the XRG side
     // is 4.781e-08. Mainnet claims the fee with tecAMM_FAILED; we paid out the
     // XRG side alone in 8 mutations.
+    //
+    // Finding 406: the sides in the pool object's Asset/Asset2 order, which is the order they are paid
+    // and each one's reserve checked. Only tfWithdrawAll and tfLPToken come here, and neither carries
+    // Amount or Amount2, so `AMMWithdraw::applyGuts` calls `ammHolds(view, ammSle, nullopt, nullopt,
+    // ...)`, which answers in the object's order, not the transaction's (AMMDeposit's LP-token mode
+    // reads it the same way). #107299319 1E5C6C1A9257: the transaction named BCFT/XRP, the object
+    // stores XRP/BCFT; rippled paid the XRP side first and the BCFT side's reserve check saw it.
+    let pool_obj = amm_key_from_asset_fields(tx).and_then(|k| ox::json_at(sandbox, &k));
     let mut shares: Vec<(ox::Leg, (u128, i32))> = Vec::new();
     for f in ["Asset", "Asset2"] {
-        let Some(v) = tx.fields.get(f) else { continue };
+        let side = match &pool_obj { Some(o) => o.get(f), None => tx.fields.get(f) };
+        let Some(v) = side else { continue };
         let Some(leg) = asset_leg(v) else { continue };
         let pool = crate::tx::amm_swap::holds(sandbox, amm_acct, &leg);
         // TWO separate 16-digit steps, not a fused muldiv. rippled's

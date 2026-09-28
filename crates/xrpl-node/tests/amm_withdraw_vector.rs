@@ -320,3 +320,14 @@ fn amm_withdraw_all_counts_the_paid_xrp_toward_the_new_line_reserve_107219029() 
 fn amm_withdraw_by_the_issuer_checks_the_reserve_for_its_own_currency_107278773() {
     run_bundle(include_str!("vectors/amm_withdraw_by_the_issuer_checks_the_reserve_for_its_own_currency_107278773.json"));
 }
+
+/// Finding 406 (soak #34 receipt, mainnet #107299319 1E5C6C1A9257): a tfLPToken withdrawal from the XRP/BCFT pool by an
+/// account holding 9.381031 XRP at OwnerCount 41 with no BCFT trust line, whose transaction names the pool as
+/// Asset = BCFT, Asset2 = XRP. The AMM object stores it as Asset = XRP, Asset2 = BCFT, and with no Amount or Amount2
+/// `AMMWithdraw::applyGuts` asks `ammHolds` for the pool in the object's order, so rippled pays the XRP side first:
+/// the BCFT side's `sufficientReserve` then sees the withdrawn XRP (F401) and the 9.4 XRP reserve for a 42nd object is
+/// met; mainnet succeeds. The engine paid the sides in the transaction's order and returned tecINSUFFICIENT_RESERVE.
+#[test]
+fn amm_withdraw_pays_the_sides_in_the_pools_order_107299319() {
+    run_bundle(include_str!("vectors/amm_withdraw_pays_the_sides_in_the_pools_order_107299319.json"));
+}
