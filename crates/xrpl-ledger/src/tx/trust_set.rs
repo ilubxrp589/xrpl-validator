@@ -551,7 +551,16 @@ impl Transactor for TrustSetTransactor {
                 let bal_pos = !bal_zero && !bal.starts_with('-');
                 let bal_neg = !bal_zero && bal.starts_with('-');
                 let limit_zero = |side: &str| line[side]["value"].as_str().unwrap_or("0") == "0";
-                let quality = |f: &str| line.get(f).and_then(|v| v.as_u64()).unwrap_or(0) != 0;
+                // Finding 407: a stored quality of QUALITY_ONE is no quality. rippled reads the line's qualities and
+                // zeroes QUALITY_ONE before this decision (TrustSet.cpp: `if (QUALITY_ONE == uHighQualityIn)
+                // uHighQualityIn = 0`, the same for Low and for QualityOut). A TrustSet with QualityIn = 1e9 STORES
+                // it, so a line can carry it; counting it as an interest kept #107311328 59262A2D67A7's line (and
+                // its reserve) that mainnet deleted.
+                const QUALITY_ONE: u64 = 1_000_000_000;
+                let quality = |f: &str| {
+                    let q = line.get(f).and_then(|v| v.as_u64()).unwrap_or(0);
+                    q != 0 && q != QUALITY_ONE
+                };
                 let (low_id, high_id) = if tx.account < issuer {
                     (tx.account, issuer)
                 } else {

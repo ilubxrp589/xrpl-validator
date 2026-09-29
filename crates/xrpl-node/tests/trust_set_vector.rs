@@ -206,3 +206,15 @@ fn trust_set_limit_zero_with_a_balance_keeps_the_line_testnet_20938435() {
 fn trust_set_limit_zero_on_a_zero_line_deletes_it_testnet_20938441() {
     run_bundle(include_str!("vectors/trust_set_limit_zero_on_a_zero_line_deletes_it_testnet_20938441.json"));
 }
+
+/// Finding 407 (soak #35 receipt, mainnet #107311328 59262A2D67A7): a TrustSet (limit 0, tfSetNoRipple + tfClearFreeze)
+/// on a CNY line whose holder's side stores HighQualityIn = 1,000,000,000 (QUALITY_ONE) and otherwise has no interest:
+/// limit 0, balance 0, NoRipple set on a holder without lsfDefaultRipple. rippled's SetTrust reads the stored qualities
+/// and treats QUALITY_ONE as 0 (TrustSet.cpp `if (QUALITY_ONE == uHighQualityIn) uHighQualityIn = 0`, the same for
+/// QualityOut), so both sides are at their defaults and mainnet deletes the line: the line and the issuer's directory
+/// page go, the holder's directory page shrinks, and the holder's OwnerCount drops 1 → 0. The engine counted the stored
+/// QUALITY_ONE as a quality interest and kept the line.
+#[test]
+fn trust_set_quality_in_at_quality_one_is_no_interest_the_line_is_deleted_107311328() {
+    run_bundle(include_str!("vectors/trust_set_quality_in_at_quality_one_is_no_interest_the_line_is_deleted_107311328.json"));
+}
