@@ -1710,14 +1710,22 @@ impl Default for DivergenceLog {
 /// sfTxnSignature in the binary tx, so the first hit when scanning forward
 /// is overwhelmingly the real fee. Returns the fee in drops, or `None` if
 /// no plausible match is found.
-/// Scan a serialized AccountRoot SLE for the `Sequence` field. UInt32 field 4
-/// is encoded as byte `0x24` followed by 4 big-endian bytes. Used by debug
-/// tooling and tests to pull the Sequence out of raw overlay bytes without a
-/// full SLE parse.
+/// Scan a serialized AccountRoot SLE for the `Sequence` field (UInt32 field 4,
+/// `0x24` then 4 big-endian bytes) without a full SLE parse. Walks the
+/// canonical field prefix — LedgerEntryType (0x11), then the UInt32 fields
+/// before it (Flags, 0x22) — exactly as `scan_sequence_in_tx` walks a
+/// transaction's, and returns None on any other field or truncation. A byte
+/// search for 0x24 read the Flags instead whenever they carry that byte
+/// (2026-09-29, #107314806: Flags 0x24000000 read as Sequence 36, a false era
+/// mismatch). Used by the era sentinel and the ffi-diag sequence lines.
 pub fn scan_sequence_in_account_root(data: &[u8]) -> Option<u32> {
-    for i in 0..data.len().saturating_sub(5) {
-        if data[i] == 0x24 {
-            return Some(u32::from_be_bytes(data[i + 1..i + 5].try_into().ok()?));
+    let mut i = 0usize;
+    while i < data.len() {
+        match data[i] {
+            0x11 => i += 3,               // LedgerEntryType: u16
+            0x21 | 0x22 | 0x23 => i += 5, // UInt32 fields 1-3 (Flags): u32
+            0x24 => return Some(u32::from_be_bytes(data.get(i + 1..i + 5)?.try_into().ok()?)),
+            _ => return None, // unexpected field before Sequence — inconclusive
         }
     }
     None

@@ -1802,6 +1802,7 @@ async fn main() {
                             "canary_fired": s.canary_fired.load(Relaxed),
                             "canary_detected": s.canary_detected.load(Relaxed),
                             "skipped_gap": s.skipped_gap.load(Relaxed),
+                            "skipped_unverified": s.skipped_unverified.load(Relaxed),
                             "hydrate_skipped_lowmem": s.hydrate_skipped_lowmem.load(Relaxed),
                             "hydrate_reencode_bad": s.hydrate_reencode_bad.load(Relaxed),
                             "reconcile_leaks": s.reconcile_leaks.load(Relaxed),

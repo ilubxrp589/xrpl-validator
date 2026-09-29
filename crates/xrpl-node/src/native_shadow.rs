@@ -72,6 +72,9 @@ pub struct ShadowStats {
     pub key_extra: AtomicU64,
     pub byte_mismatch: AtomicU64,
     pub skipped_gap: AtomicU64,
+    /// Ledgers the FFI leg did not verify (an empty overlay under real
+    /// transactions): no compare, the mirror dropped for re-hydration.
+    pub skipped_unverified: AtomicU64,
     pub apply_ms_last: AtomicU64,
     /// The receipt canary ([`NativeShadow::arm_canary`]): injections made, and
     /// how many of them the compare flagged. Fired above detected means the
@@ -253,6 +256,10 @@ struct PendingLedger {
 /// attempt (the caller's cooldown re-arms it) rather than hold ~GBs of
 /// buffered ledgers.
 const PENDING_CAP: usize = 400;
+
+/// Pseudo-transactions: they touch only the singletons the FFI overlay never
+/// carries, so a ledger of nothing else legitimately yields an empty overlay.
+const PSEUDO_TX_TYPES: [&str; 3] = ["EnableAmendment", "SetFee", "UNLModify"];
 
 impl NativeShadow {
     /// Free the mirror NOW. A stale 19.8M-object map is ~14GB of dead weight,
@@ -556,6 +563,23 @@ impl NativeShadow {
             st.skipped_gap.fetch_add(1, Ordering::Relaxed);
             eprintln!("[native-shadow] gap: mirror at #{}, asked for #{seq} — will re-hydrate", self.at_seq);
             self.drop_mirror("gap");
+            return;
+        }
+        // An EMPTY FFI overlay under a real transaction is no trajectory: the
+        // FFI leg did not verify this ledger (the era sentinel's skip returns
+        // an empty overlay; every applied transaction writes at least its fee
+        // payer). Compared against, every native write reads as "extra";
+        // reconciled to, the ledger vanishes from the mirror and every later
+        // ledger diverges (2026-09-29, #107314806, after a false era skip).
+        // Treat it as a gap: drop the mirror, the caller re-hydrates from
+        // state.rocks, and no receipt is written.
+        let real_tx = txs
+            .iter()
+            .any(|t| !PSEUDO_TX_TYPES.contains(&t["TransactionType"].as_str().unwrap_or("")));
+        if ffi_overlay.is_empty() && real_tx {
+            st.skipped_unverified.fetch_add(1, Ordering::Relaxed);
+            eprintln!("[native-shadow] #{seq}: the FFI leg did not verify this ledger (empty overlay) — will re-hydrate");
+            self.drop_mirror("unverified ledger");
             return;
         }
         let t0 = std::time::Instant::now();
@@ -1465,6 +1489,24 @@ mod tests {
         canon_for_encode(&mut mine);
         let enc = xrpl_core::codec::encode::encode_transaction_json(&mine, false).unwrap();
         assert_eq!(Some(&enc), overlay[&k].as_ref(), "the mirror healed to the FFI bytes");
+    }
+
+    /// 2026-09-29, #107314806: the FFI leg skipped its verify (a false era
+    /// mismatch) and handed over an EMPTY overlay. Compared against, every
+    /// native write read as "extra"; reconciled to, the ledger vanished from
+    /// the mirror and every later ledger diverged. No compare, no receipt: the
+    /// mirror is dropped and the caller re-hydrates from state.rocks.
+    #[test]
+    fn an_unverified_ledger_drops_the_mirror_and_writes_no_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, trigger) = (dir.path().join("receipts.jsonl"), dir.path().join("native_shadow.canary"));
+        let (seq, parent, pct, drops, tx, state, _overlay) = payment_ledger();
+        let mut sh = shadow(state, seq - 1, &log, &trigger);
+        let before = stats().skipped_unverified.load(Ordering::Relaxed);
+        sh.on_ledger(seq, &parent, pct, drops, &[tx], &LedgerOverlay::new());
+        assert!(lines(&log).is_empty(), "no compare against a ledger the FFI leg did not verify: {:?}", lines(&log));
+        assert!(!sh.hydrated, "the mirror is dropped; the caller re-hydrates from state.rocks");
+        assert!(stats().skipped_unverified.load(Ordering::Relaxed) > before);
     }
 
     #[test]

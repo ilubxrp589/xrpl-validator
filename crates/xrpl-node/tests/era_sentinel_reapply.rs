@@ -29,7 +29,7 @@
 #![cfg(feature = "ffi")]
 
 use xrpl_node::ffi_engine::{
-    apply_ledger_in_order, fetch_mainnet_amendments, new_stats, scan_sequence_in_tx,
+    apply_ledger_in_order, fetch_mainnet_amendments, new_stats, scan_sequence_in_account_root, scan_sequence_in_tx,
 };
 
 /// All 67 tx blobs from ledger 103515367, sorted by TransactionIndex.
@@ -102,6 +102,40 @@ fn scan_sequence_in_tx_walks_uint_prefix() {
 
     // Empty blob → None.
     assert_eq!(scan_sequence_in_tx(&[]), None);
+}
+
+/// Pure unit test — no network. The sentinel reads the sender's Sequence out
+/// of the AccountRoot SLE by walking its field prefix, never by searching for
+/// the byte 0x24. 2026-09-29, #107314806: the first seq-bearing transaction
+/// (Payment C4F7C77C779F, Sequence 62,037,183) came from an account whose
+/// Flags are 0x24000000 (lsfDisallowIncomingTrustline |
+/// lsfDisallowIncomingNFTokenOffer). A byte search hit the Flags' first byte
+/// and read Sequence 36: a false era mismatch that skipped the verify and
+/// handed the native shadow an empty overlay.
+#[test]
+fn scan_sequence_in_account_root_walks_the_sle_prefix_107314806() {
+    // The sender's AccountRoot at #107314805, binary as rippled serves it.
+    let sle = hex_to_bytes(
+        "11006122240000002403B29CBF2506657E1F2D0000000A55A5DDA45F8FE405CF72A5AD2D821C0D1E05EA76B59BDA86C9A0D0E70C\
+         3624F2D9624000000000392CC18114AE9F0420F1022AADC01C56759A1773FDC5FF4D45",
+    );
+    assert_eq!(scan_sequence_in_account_root(&sle), Some(62_037_183));
+
+    // A 0x24 in any byte of Flags, and none: the Sequence is always the field's.
+    for flags in [0x2400_0000u32, 0x0024_0000, 0x0000_2400, 0x0000_0024, 0] {
+        let mut b = vec![0x11, 0x00, 0x61, 0x22];
+        b.extend_from_slice(&flags.to_be_bytes());
+        b.push(0x24);
+        b.extend_from_slice(&7u32.to_be_bytes());
+        b.extend_from_slice(&[0x25, 0x06, 0x65, 0x7E, 0x1F]);
+        assert_eq!(scan_sequence_in_account_root(&b), Some(7), "Flags {flags:#010x}");
+    }
+
+    // An unexpected leading field, a truncated Sequence, nothing: None, which
+    // the sentinel treats as inconclusive — never as a mismatch.
+    assert_eq!(scan_sequence_in_account_root(&[0x73, 0x21, 0x00]), None);
+    assert_eq!(scan_sequence_in_account_root(&[0x11, 0x00, 0x61, 0x22, 0, 0, 0, 0, 0x24, 0x00]), None);
+    assert_eq!(scan_sequence_in_account_root(&[]), None);
 }
 
 /// The incident in a test tube: pre-state pinned at L (post-state for L's
