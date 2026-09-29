@@ -208,3 +208,14 @@ fn amm_deposit_lp_token_mode_needs_lptokenout_fuzz_107075103() {
 fn amm_deposit_two_asset_if_empty_mode_needs_both_amounts_fuzz_107075103() {
     run_bundle(include_str!("vectors/amm_deposit_two_asset_if_empty_mode_needs_both_amounts_fuzz_107075103.json"));
 }
+
+/// Finding 408 (soak #35 receipt, mainnet #107314214 5FC90948A0CD): a tfSingleAsset AMMDeposit of 1,021,192 drops into
+/// an XRP/FUZZY pool with an LPTokenOut of 56,639.2869999. In tfSingleAsset mode LPTokenOut is an optional MINIMUM
+/// (AMMDeposit.cpp preflight: "tfSingleAsset: Amount, [LPTokenOut]"; singleDeposit passes it to deposit() as
+/// lpTokensDepositMin, which refuses tecAMM_FAILED only when the minted tokens fall below it): the tokens minted are
+/// what the Amount buys, adjustLPTokensOut(lpTokensOut(...)). Mainnet mints 57,211.40098 (LPTokenBalance
+/// 55,294,986,190.0249 → 55,295,043,401.42588); the engine minted the minimum, 56,639.2869999, for the same XRP.
+#[test]
+fn amm_deposit_single_asset_mints_what_the_amount_buys_lptokenout_is_a_minimum_107314214() {
+    run_bundle(include_str!("vectors/amm_deposit_single_asset_mints_what_the_amount_buys_lptokenout_is_a_minimum_107314214.json"));
+}

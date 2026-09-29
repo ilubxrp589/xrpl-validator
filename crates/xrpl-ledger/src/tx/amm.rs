@@ -1635,6 +1635,24 @@ impl Transactor for AMMDepositTransactor {
             return verdict;
         }
         let single_adj: Option<(ox::Me, ox::Me)> = single_adj.and_then(|r| r.ok());
+        // Finding 408: in tfSingleAsset mode `LPTokenOut` is an optional
+        // MINIMUM ("tfSingleAsset: Amount, [LPTokenOut]"; singleDeposit hands
+        // it to deposit() as lpTokensDepositMin, and `lpTokensDepositActual <
+        // lpTokensDepositMin` → tecAMM_FAILED, before anything moves). The
+        // tokens minted are what the Amount buys, never the field.
+        // #107314214 5FC90948A0CD: 1,021,192 drops into XRP/FUZZY with
+        // LPTokenOut 56,639.2869999 — mainnet mints 57,211.40098; we minted
+        // the minimum.
+        if flags_dep & TF_SINGLE_ASSET != 0 {
+            if let (Some((_, t)), Some(min)) = (
+                single_adj,
+                tx.fields.get("LPTokenOut").and_then(keylet::amount_mant_exp).filter(|m| m.0 > 0),
+            ) {
+                if ox::me_cmp(t, min).is_lt() {
+                    return TxResult::AmmFailed;
+                }
+            }
+        }
         // tfTwoAssetIfEmpty (reachable now that preclaim refuses a live pool,
         // finding 385) is `equalDepositInEmptyState` (AMMDeposit.cpp:
         // 1070-1088): both amounts verbatim, minting `ammLPTokens(amount,
@@ -1698,23 +1716,21 @@ impl Transactor for AMMDepositTransactor {
                 }
             }
         }
-        // Mint LP tokens to the depositor: an explicit `LPTokenOut` when the
-        // sender named one, else `lpTokensOut` (Equation 3) for a single-asset
-        // deposit.
-        //
-        // ⚠ The remaining modes — two-asset without LPTokenOut, tfOneAssetLPToken
-        // — still fall back to the 1e7 PLACEHOLDER this used to use
-        // unconditionally. That is deliberate: the line KEY is what the
-        // key-level gate needs, and the magnitude shows up under DX_VALCHECK
-        // until each mode's formula lands.
-        // Finding 155: a two-asset deposit mints its SIZED tokens; the field
-        // is a floor there (checked above). The other modes keep the field.
+        // Mint LP tokens to the depositor: the tokens the mode's own sizing
+        // computed, never the `LPTokenOut` field itself. Finding 155: a
+        // two-asset deposit mints its SIZED tokens; the field is a floor there
+        // (checked above). Finding 408: every single-asset mode likewise —
+        // tfSingleAsset mints what the Amount buys (the field is a minimum,
+        // checked above) and tfOneAssetLPToken mints `adjustLPTokensOut(
+        // LPTokenOut)`, the request rounded against the pool's balance. The
+        // raw field and the 1e7 placeholder are left only for a pool with no
+        // LPTokenBalance to size against.
         let minted = sized
             .map(|(_, _, t)| t)
             .filter(|t| t.0 > 0)
             .or(empty_state_tokens)
-            .or_else(|| tx.fields.get("LPTokenOut").and_then(keylet::amount_mant_exp).filter(|m| m.0 > 0))
             .or_else(|| single_adj.map(|(_, t)| t))
+            .or_else(|| tx.fields.get("LPTokenOut").and_then(keylet::amount_mant_exp).filter(|m| m.0 > 0))
             .unwrap_or((1_000_000_000_000_000, -8));
         // Finding 36 (#106644320 749D3E45): a deposit into an EMPTY pool
         // (every LP previously withdrew) revives it — rippled runs
@@ -4761,6 +4777,45 @@ mod campaign16_tests {
         assert_eq!(holds(&sb, &AMM, &ul), "118.0769927842122");
         assert_eq!(holds(&sb, &LP, &ul), "47.91561317492498");
         assert_eq!(lpt_of(&sb, None, Some("USD")), "60208.83015954764");
+    }
+
+    /// Finding 408: in tfSingleAsset mode LPTokenOut is only a MINIMUM (AMMDeposit.cpp: "tfSingleAsset: Amount,
+    /// [LPTokenOut]"; `deposit()`: `lpTokensDepositActual < lpTokensDepositMin` → tecAMM_FAILED). The tokens minted
+    /// are what the Amount buys, so a met minimum changes nothing and an unmet one refuses the deposit.
+    #[test]
+    fn f408_a_single_asset_deposit_mints_what_the_amount_buys_and_lptokenout_is_a_minimum() {
+        let mut st = blank(true);
+        let lp = pool(&mut st, None, "30484776", Some("USD"), "117.2271729591372", "59775.49715954764", "314.93791209084", 500, None);
+        let plain = tx("AMMDeposit", LP, None, Some("USD"), 0x0008_0000, serde_json::json!({"Amount": "100000"}));
+        let (r, sb_plain) = run(&AMMDepositTransactor, &plain, &st);
+        assert_eq!(r, TxResult::Success);
+        let met = tx("AMMDeposit", LP, None, Some("USD"), 0x0008_0000,
+            serde_json::json!({"Amount": "100000", "LPTokenOut": lpt_amt(&lp, "50")}));
+        let (r, sb_met) = run(&AMMDepositTransactor, &met, &st);
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(lpt_of(&sb_met, None, Some("USD")), lpt_of(&sb_plain, None, Some("USD")),
+            "a met minimum mints what the Amount buys, the same as no LPTokenOut at all");
+        assert_eq!(holds(&sb_met, &LP, &lp), holds(&sb_plain, &LP, &lp));
+        let unmet = tx("AMMDeposit", LP, None, Some("USD"), 0x0008_0000,
+            serde_json::json!({"Amount": "100000", "LPTokenOut": lpt_amt(&lp, "200")}));
+        assert_eq!(run(&AMMDepositTransactor, &unmet, &st).0, TxResult::AmmFailed,
+            "0.1 XRP buys about 98 tokens, under the 200 minimum");
+    }
+
+    /// Finding 408, the same line's other mode: tfOneAssetLPToken mints `adjustLPTokensOut(LPTokenOut)`
+    /// (`singleDepositTokens` → `deposit(…, tokensAdj, …)`), never the raw request. Against a 16-digit
+    /// LPTokenBalance of 59775.49715954764, a request of 1.23456789012345 adjusts (downward) to
+    /// (59775.49715954764 + 1.23456789012345 → 59776.73172743776) − 59775.49715954764 = 1.23456789012.
+    #[test]
+    fn f408_a_one_asset_lp_token_deposit_mints_the_adjusted_tokens_not_the_raw_request() {
+        let mut st = blank(true);
+        let lp = pool(&mut st, None, "30484776", Some("USD"), "117.2271729591372", "59775.49715954764", "314.93791209084", 500, None);
+        let dep = tx("AMMDeposit", LP, None, Some("USD"), 0x0020_0000,
+            serde_json::json!({"Amount": "100000", "LPTokenOut": lpt_amt(&lp, "1.23456789012345")}));
+        let (r, sb) = run(&AMMDepositTransactor, &dep, &st);
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(holds(&sb, &LP, &lp), "316.17247998096", "314.93791209084 + the ADJUSTED 1.23456789012");
+        assert_eq!(lpt_of(&sb, None, Some("USD")), "59776.73172743776");
     }
 
     /// Finding 384 (specimens 2-11, 2-12, 2-27): a tfLimitLPToken deposit
