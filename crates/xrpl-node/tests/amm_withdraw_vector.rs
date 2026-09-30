@@ -331,3 +331,14 @@ fn amm_withdraw_by_the_issuer_checks_the_reserve_for_its_own_currency_107278773(
 fn amm_withdraw_pays_the_sides_in_the_pools_order_107299319() {
     run_bundle(include_str!("vectors/amm_withdraw_pays_the_sides_in_the_pools_order_107299319.json"));
 }
+
+/// Finding 409 (soak #36 receipt, mainnet #107330165 01DF0E1D0AE0): the last LP's tfWithdrawAll empties the BTC/BTC
+/// pool and rippled's `deleteAMMAccount` runs `deleteAMMTrustLines`, which walks the pool's WHOLE owner directory
+/// (`cleanupOnAccountDelete`) and deletes every trust line in it with `deleteAMMTrustLine`, not only the two asset
+/// lines. The directory still held another account's zero-balance LP-token line (rGoLdHQ7, limit 1,000,000): mainnet
+/// deletes it, removes it from that holder's directory, takes the holder's OwnerCount 114 → 113, and then the pool's
+/// emptied root page. The engine removed the two asset lines alone and left the pool's directory standing.
+#[test]
+fn amm_withdraw_last_lp_teardown_deletes_every_line_in_the_pools_directory_107330165() {
+    run_bundle(include_str!("vectors/amm_withdraw_last_lp_teardown_deletes_every_line_in_the_pools_directory_107330165.json"));
+}

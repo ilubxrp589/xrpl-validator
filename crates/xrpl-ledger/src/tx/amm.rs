@@ -1862,53 +1862,62 @@ fn tear_down_lp_line(
 }
 
 /// `deleteAMMAccount` — the last LP's withdrawal leaves LPTokenBalance at
-/// zero and the whole AMM is dismantled: every pool asset trust line is
-/// deleted UNCONDITIONALLY (`deleteAMMTrustLine` — reserve-side OwnerCounts
-/// adjusted per the line's lsfLow/HighReserve flags, rippled trustDelete's
-/// rule), the AMM object leaves the pool's owner directory, and the pool
-/// AccountRoot itself is erased. An XRP pool side has no line to remove; the
-/// pool's XRP disposition on deletion is unmodeled (no specimen — 419A5D2C
-/// is IOU/IOU).
-fn delete_amm(
-    sandbox: &mut Sandbox,
-    amm_key: &xrpl_core::types::Hash256,
-    amm_acct: &[u8; 20],
-    tx: &TxFields,
-) {
+/// zero and the whole AMM is dismantled. `deleteAMMTrustLines`
+/// (AMMUtils.cpp:237-280) walks the pool's WHOLE owner directory through
+/// `cleanupOnAccountDelete` and deletes every trust line in it with
+/// `deleteAMMTrustLine` (View.cpp:3485-3528): the pool's asset lines and any
+/// other account's zero-balance LP-token line alike, each unlinked from both
+/// owner directories, reserve-side OwnerCounts adjusted per the line's
+/// lsfLow/HighReserve flags (rippled trustDelete's rule). Then the AMM object
+/// leaves the pool's owner directory, which is now empty and goes with it,
+/// and the pool AccountRoot itself is erased. An XRP pool side has no line to
+/// remove; the pool's XRP disposition on deletion is unmodeled (no specimen —
+/// 419A5D2C is IOU/IOU). Finding 409 (#107330165 01DF0E1D0AE0): walking only
+/// the two asset lines left a holder's LP-token line, its OwnerCount and the
+/// pool's root page standing. rippled's 512-line cap (tecINCOMPLETE beyond,
+/// Finding 347's sibling) is not modeled.
+fn delete_amm(sandbox: &mut Sandbox, amm_key: &xrpl_core::types::Hash256, amm_acct: &[u8; 20]) {
     use crate::tx::offer as ox;
-    let leg_of_asset = |v: Option<&serde_json::Value>| -> Option<ox::Leg> {
-        let v = v?;
-        if v.get("currency").and_then(|c| c.as_str()) == Some("XRP") {
-            return Some(ox::Leg { xrp: true, cur: [0u8; 20], issuer: [0u8; 20] });
+    let dir_root = keylet::owner_dir_key(amm_acct);
+    let mut lines = Vec::new();
+    let mut page_key = dir_root;
+    for _ in 0..1000 {
+        let Some(page) = ox::json_at(sandbox, &page_key) else { break };
+        for idx in page.get("Indexes").and_then(|v| v.as_array()).into_iter().flatten() {
+            let Some(k) = idx
+                .as_str()
+                .and_then(|s| hex::decode(s).ok())
+                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+            else {
+                continue;
+            };
+            let k = xrpl_core::types::Hash256(k);
+            if ox::json_at(sandbox, &k).is_some_and(|o| o["LedgerEntryType"].as_str() == Some("RippleState")) {
+                lines.push(k);
+            }
         }
-        let mut amt = v.clone();
-        amt["value"] = serde_json::json!("0");
-        ox::leg_of(&amt)
-    };
-    for f in ["Asset", "Asset2"] {
-        let Some(leg) = leg_of_asset(tx.fields.get(f)) else { continue };
-        if leg.xrp {
-            continue;
+        let next = page.get("IndexNext").map(ox::dirnum).unwrap_or(0);
+        if next == 0 {
+            break;
         }
-        let lkey = keylet::ripple_state_key(amm_acct, &leg.issuer, &leg.cur);
+        page_key = keylet::dir_page_key(&dir_root, next);
+    }
+    for lkey in lines {
         let Some(line) = ox::json_at(sandbox, &lkey) else { continue };
         let flags = line["Flags"].as_u64().unwrap_or(0);
         let node = |field: &str| {
             line.get(field).and_then(|v| v.as_str()).and_then(|s| u64::from_str_radix(s, 16).ok())
         };
-        let (low, high) = if amm_acct < &leg.issuer {
-            (amm_acct, &leg.issuer)
-        } else {
-            (&leg.issuer, amm_acct)
-        };
+        let party = |side: &str| line[side]["issuer"].as_str().and_then(ox::decode20);
+        let (Some(low), Some(high)) = (party("LowLimit"), party("HighLimit")) else { continue };
         sandbox.delete(lkey);
-        crate::ledger::directory::owner_dir_remove(sandbox, low, &lkey, node("LowNode"), false);
-        crate::ledger::directory::owner_dir_remove(sandbox, high, &lkey, node("HighNode"), false);
+        crate::ledger::directory::owner_dir_remove(sandbox, &low, &lkey, node("LowNode"), false);
+        crate::ledger::directory::owner_dir_remove(sandbox, &high, &lkey, node("HighNode"), false);
         if flags & 0x0001_0000 != 0 {
-            crate::tx::offer::owner_count_add(sandbox, low, -1); // lsfLowReserve
+            crate::tx::offer::owner_count_add(sandbox, &low, -1); // lsfLowReserve
         }
         if flags & 0x0002_0000 != 0 {
-            crate::tx::offer::owner_count_add(sandbox, high, -1); // lsfHighReserve
+            crate::tx::offer::owner_count_add(sandbox, &high, -1); // lsfHighReserve
         }
     }
     let amm_hint = ox::json_at(sandbox, amm_key)
@@ -2442,7 +2451,7 @@ impl Transactor for AMMWithdrawTransactor {
                 .and_then(|o| o["LPTokenBalance"]["value"].as_str().map(|v| v == "0"))
                 .unwrap_or(false);
             if lpt_zero {
-                delete_amm(sandbox, &amm_key, &amm_acct, tx);
+                delete_amm(sandbox, &amm_key, &amm_acct);
             }
             return TxResult::Success;
         }
@@ -2821,7 +2830,7 @@ impl Transactor for AMMWithdrawTransactor {
             .and_then(|o| o["LPTokenBalance"]["value"].as_str().map(|v| v == "0"))
             .unwrap_or(false);
         if lpt_zero {
-            delete_amm(sandbox, &amm_key, &amm_acct, tx);
+            delete_amm(sandbox, &amm_key, &amm_acct);
         }
         TxResult::Success
     }
@@ -3383,7 +3392,7 @@ impl Transactor for AMMDeleteTransactor {
         else {
             return TxResult::Malformed;
         };
-        delete_amm(sandbox, &key, &amm_acct, tx);
+        delete_amm(sandbox, &key, &amm_acct);
         TxResult::Success
     }
 }
@@ -4443,7 +4452,7 @@ impl Transactor for AMMClawbackTransactor {
         bump_lp_balance(sandbox, &amm_key, tokens, false);
         let new_lpt = read_lpt(sandbox).unwrap_or((0, 0));
         if new_lpt.0 == 0 {
-            delete_amm(sandbox, &amm_key, &amm_acct, tx);
+            delete_amm(sandbox, &amm_key, &amm_acct);
         } else if crate::ledger::amendments::fix_cleanup_3_3_0(sandbox) && v13 {
             // Finding 259's precision test, as AMMWithdraw runs it.
             let p1 = crate::tx::amm_swap::holds(sandbox, &amm_acct, &a1);
