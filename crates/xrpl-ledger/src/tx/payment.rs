@@ -2456,6 +2456,21 @@ impl PaymentTransactor {
         dest: &[u8; 20],
         partial: bool,
     ) -> TxResult {
+        self.apply_iou_direct_out(tx, sandbox, amt_json, dest, partial, &mut None)
+    }
+
+    /// `apply_iou_direct`, also reporting what the flow delivered to `dest` (rippled's `result.actualAmountOut`).
+    /// Finding 410: CheckCash judges DeliverMin on it, never on the destination's balance difference, which the
+    /// 16-digit rounding of the new balance can leave one unit short.
+    pub(crate) fn apply_iou_direct_out(
+        &self,
+        tx: &TxFields,
+        sandbox: &mut Sandbox,
+        amt_json: &serde_json::Value,
+        dest: &[u8; 20],
+        partial: bool,
+        delivered: &mut Option<crate::tx::offer::Me>,
+    ) -> TxResult {
         use crate::tx::offer as ox;
         let (Some(leg), Some(want)) = (ox::leg_of(amt_json), crate::ledger::keylet::amount_mant_exp(amt_json)) else {
             return TxResult::Malformed;
@@ -2672,6 +2687,7 @@ impl PaymentTransactor {
                 ox::line_adjust(sandbox, dest, &leg, deliver, true);
             }
         }
+        *delivered = Some(deliver);
         TxResult::Success
     }
 

@@ -241,3 +241,13 @@ fn check_c14_cash_iou_creates_the_cashers_line_37dcf13e4e57() {
 fn check_c14_destination_cashes_under_its_own_deposit_auth_e6192bf5b148() {
     run_bundle(include_str!("vectors/check_c14_destination_cashes_under_its_own_deposit_auth_E6192BF5B148.json"));
 }
+
+/// Finding 410 (soak #36 receipt, mainnet #107344641 48AADD252342): rw13qV1w cashes rKedDTMd's check for 1,034,740
+/// "589" (DeliverMin = the check's SendMax = 1,034,740, no transfer fee) onto a line holding 112,178.5615725964. The
+/// new balance rounds to 16 digits, 1,146,918.561572596, so after − before is 1,034,739.9999999996, under DeliverMin;
+/// rippled judges DeliverMin against the flow's delivered amount (`result.actualAmountOut`, CheckCash.cpp), exactly
+/// 1,034,740, and mainnet cashes it (tesSUCCESS). We read the balance difference and claimed tecPATH_PARTIAL.
+#[test]
+fn check_cash_deliver_min_is_judged_on_what_the_flow_delivered_107344641() {
+    run_bundle(include_str!("vectors/check_cash_deliver_min_is_judged_on_what_the_flow_delivered_107344641.json"));
+}

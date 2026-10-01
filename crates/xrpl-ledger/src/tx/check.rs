@@ -465,13 +465,6 @@ impl Transactor for CheckCashTransactor {
                 } else {
                     None
                 };
-                let holding = |sandbox: &Sandbox| -> ox::Me {
-                    let Some(l) = ox::json_at(sandbox, &line_key) else { return (0, 0) };
-                    let (neg, mag) = ox::signed_value(&l["Balance"]);
-                    let truster_low = truster < leg.issuer;
-                    let holds = if truster_low { !neg } else { neg };
-                    if holds && mag.0 > 0 { mag } else { (0, 0) }
-                };
                 let partial = deliver_min.is_some();
                 let flow_amt = if partial {
                     serde_json::json!({
@@ -496,8 +489,9 @@ impl Transactor for CheckCashTransactor {
                     }),
                     inner_batch: false,
                 };
-                let before = holding(sandbox);
-                let r = crate::tx::payment::PaymentTransactor.apply_iou_direct(&synth, sandbox, &flow_amt, &casher, partial);
+                let mut delivered = None;
+                let r = crate::tx::payment::PaymentTransactor
+                    .apply_iou_direct_out(&synth, sandbox, &flow_amt, &casher, partial, &mut delivered);
                 if let Some(old) = saved_limit {
                     if let Some(mut l) = ox::json_at(sandbox, &line_key) {
                         l[limit_field]["value"] = old;
@@ -507,14 +501,13 @@ impl Transactor for CheckCashTransactor {
                 if !matches!(r, TxResult::Success) {
                     return r;
                 }
+                // Finding 410: DeliverMin is judged on what the flow delivered (`result.actualAmountOut`,
+                // CheckCash.cpp), not on the casher's balance difference. #107344641 48AADD252342: 1,034,740
+                // onto a line holding 112,178.5615725964 rounds the new balance to 1,146,918.561572596, so the
+                // difference was 1,034,739.9999999996, under DeliverMin 1,034,740; mainnet cashed it, we claimed
+                // tecPATH_PARTIAL.
                 if let Some(dm) = deliver_min.as_ref().and_then(crate::ledger::keylet::amount_mant_exp) {
-                    let after = holding(sandbox);
-                    let delivered = if ox::me_cmp(after, before).is_ge() {
-                        ox::me_sub(after, before)
-                    } else {
-                        ox::me_sub(before, after)
-                    };
-                    if ox::me_cmp(delivered, dm).is_lt() {
+                    if ox::me_cmp(delivered.unwrap_or((0, 0)), dm).is_lt() {
                         return TxResult::PathPartial;
                     }
                 }
