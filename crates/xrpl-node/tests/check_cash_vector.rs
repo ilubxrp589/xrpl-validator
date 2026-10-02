@@ -251,3 +251,12 @@ fn check_c14_destination_cashes_under_its_own_deposit_auth_e6192bf5b148() {
 fn check_cash_deliver_min_is_judged_on_what_the_flow_delivered_107344641() {
     run_bundle(include_str!("vectors/check_cash_deliver_min_is_judged_on_what_the_flow_delivered_107344641.json"));
 }
+
+/// Finding 410 again (soak #37 receipt, mainnet #107368552 787BF6BD3D60): rLFpNiNe cashes rfxeWkhQ's check for 998.8
+/// RLUSD (DeliverMin = the check's SendMax = 998.8, no transfer fee) onto a line holding 11.24387575898908. The new
+/// balance rounds to 16 digits, 1,010.043875758989, so after − before is 998.79999999999992, under DeliverMin; mainnet
+/// judges the flow's delivered 998.8 and cashes it (tesSUCCESS). The live engine (32a6397) claimed tecPATH_PARTIAL.
+#[test]
+fn check_cash_deliver_min_rlusd_rounds_under_the_balance_difference_107368552() {
+    run_bundle(include_str!("vectors/check_cash_deliver_min_rlusd_rounds_under_the_balance_difference_107368552.json"));
+}
