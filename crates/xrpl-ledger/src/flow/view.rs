@@ -378,7 +378,10 @@ pub fn dir_first(sb: &Sandbox, root: &Hash256) -> Option<(Hash256, Hash256)> {
             let k = first.as_str().and_then(|s| hex::decode(s).ok()).and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())?;
             return Some((page_key, Hash256(k)));
         }
-        let next = page.get("IndexNext").and_then(|v| v.as_str()).and_then(|s| u64::from_str_radix(s, 16).ok()).unwrap_or(0);
+        // Finding 411: a link the apply relinked is a number (`set_link`), one
+        // read from the ledger a hex string; `dirnum` reads both. Hex-only, a
+        // root relinked past a deleted page read 0 and the level ended there.
+        let next = page.get("IndexNext").map(crate::tx::offer::dirnum).unwrap_or(0);
         if next == 0 {
             return None;
         }

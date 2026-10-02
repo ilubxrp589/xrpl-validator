@@ -1630,3 +1630,16 @@ fn offer_sell_budget_is_the_legacy_mulround_of_the_rate_107105811() {
 fn offer_cancel_of_a_live_offer_107113838() {
     run_bundle(include_str!("vectors/offer_cancel_of_a_live_offer_107113838.json"));
 }
+
+/// Finding 411 (soak #38 receipt, mainnet #107381776 DC4F4F76FD26): rGqo7tmV's
+/// tfSell|tfIoC sells 1,004.58 RLUSD for at least 647.04 XRP. One quality
+/// level spans three book pages (32, 32 and 16 offers). Emptying page 1
+/// deletes it and relinks the root to page 2; `set_link` writes that link as
+/// a number, and the flow's `dir_first` read IndexNext as a hex string only,
+/// so the level looked empty after page 1 and the cross never reached page 2:
+/// 15 unfunded rLA56aKW offers left in the book and rnzjcGVr's 1 XRP for
+/// 1.5525 RLUSD never crossed. rippled's `dirFirst` walks the relinked chain.
+#[test]
+fn offer_book_walk_follows_a_page_link_relinked_mid_cross_107381776() {
+    run_bundle(include_str!("vectors/offer_book_walk_follows_a_page_link_relinked_mid_cross_107381776.json"));
+}
