@@ -376,7 +376,13 @@ impl Transactor for EscrowCreateTransactor {
         // 1000 drops from an account with 96 objects and 20274654 drops —
         // reserve(97) = 20400000, mainnet refuses; we escrowed it.
         let post_fee = balance_of(&acct).saturating_sub(tx.account_fee());
-        let oc = acct["OwnerCount"].as_u64().unwrap_or(0);
+        // Finding 416 — doApply peeks the AccountRoot after consumeSeqProxy
+        // has deleted a spending Ticket (EscrowCreate.cpp:431-445); judged
+        // here in preclaim, the spent ticket comes off first. Testnet campaign
+        // 26 B esc1-esc3: OC 4/5 with a ticket needs reserve(OC), not
+        // reserve(OC + 1) — the network escrows (or, short of reserve +
+        // amount, answers tecUNFUNDED) where we said tecINSUFFICIENT_RESERVE.
+        let oc = acct["OwnerCount"].as_u64().unwrap_or(0).saturating_sub(u64::from(tx.uses_ticket()));
         let reserve = crate::ledger::fees::account_reserve(sandbox, oc + 1);
         if post_fee < reserve {
             return TxResult::InsufficientReserve;

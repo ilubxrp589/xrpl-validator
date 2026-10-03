@@ -5,7 +5,12 @@
 //! non-LP reserve gate is preclaim's, on the pre-fee balance), 413 (AMMClawback's holder reserve test
 //! before fixCleanup3_4_0, measured by the issuer's pre-fee balance) and 414 (single-asset withdrawals
 //! whose tokens adjust to zero are refused; an asset that adjusts to zero is withdrawn as zero), all in
-//! tx/amm.rs. Testnet runs mainnet's rules (no testnet-only amendments; 16-digit Number). Same harness
+//! tx/amm.rs. Agent B: reserve edges outside AMM — ticket-paid transactions of every object-creating type
+//! at the reserve (−1 / exact), multisigned variants, AccountDelete with a full owner directory — and 16-digit
+//! rounding on long-mantissa IOU balances (CheckCash DeliverMin, partial payments, SendMax at the gross,
+//! clawback remainders, NFT royalties with transfer rates, full trust lines, QualityIn/Out, IOU escrows).
+//! Findings 415 (TrustSet) and 416 (EscrowCreate): doApply's reserve counts OwnerCount after the spending
+//! Ticket is gone; we judge in preclaim and charged the ticket. Testnet runs mainnet's rules (no testnet-only amendments; 16-digit Number). Same harness
 //! as campaign16_vector.rs.
 use serde_json::Value;
 use xrpl_core::types::Hash256;
@@ -385,3 +390,926 @@ fn c26a_6_12_c1_tfoneassetlptoken_0_0000000000001_lp_as_xrp_from_p_testnet_21249
     run_bundle(include_str!("vectors/c26a_6_12_c1_tfoneassetlptoken_0_0000000000001_lp_as_xrp_from_p_testnet_21249047.json"));
 }
 
+/// tc1_ticketTC_cnt2_at_R(oc-1+2)-1 TicketCreate (F84FAC18E7D5, network tecINSUFFICIENT_RESERVE).
+#[test]
+fn c26b_tc1_tickettc_cnt2_at_r_oc_1_2_1_testnet_21248756() {
+    run_bundle(include_str!("vectors/c26b_tc1_tickettc_cnt2_at_r_oc_1_2_1_testnet_21248756.json"));
+}
+
+/// tc2_ticketTC_cnt2_at_R(oc-1+2)_exact TicketCreate (D6566EA56F37, network tesSUCCESS).
+#[test]
+fn c26b_tc2_tickettc_cnt2_at_r_oc_1_2_exact_testnet_21248760() {
+    run_bundle(include_str!("vectors/c26b_tc2_tickettc_cnt2_at_r_oc_1_2_exact_testnet_21248760.json"));
+}
+
+/// tc3_seqTC_cnt2_at_R(oc+2)-1 TicketCreate (49617E417B65, network tecINSUFFICIENT_RESERVE).
+#[test]
+fn c26b_tc3_seqtc_cnt2_at_r_oc_2_1_testnet_21248764() {
+    run_bundle(include_str!("vectors/c26b_tc3_seqtc_cnt2_at_r_oc_2_1_testnet_21248764.json"));
+}
+
+/// tc4_seqTC_cnt2_at_R(oc+2)_exact TicketCreate (069512E943F7, network tesSUCCESS).
+#[test]
+fn c26b_tc4_seqtc_cnt2_at_r_oc_2_exact_testnet_21248768() {
+    run_bundle(include_str!("vectors/c26b_tc4_seqtc_cnt2_at_r_oc_2_exact_testnet_21248768.json"));
+}
+
+/// pay1_ticketPay_at_amt+R(oc-1)-1 Payment (0175B15546F5, network tecUNFUNDED_PAYMENT).
+#[test]
+fn c26b_pay1_ticketpay_at_amt_r_oc_1_1_testnet_21248776() {
+    run_bundle(include_str!("vectors/c26b_pay1_ticketpay_at_amt_r_oc_1_1_testnet_21248776.json"));
+}
+
+/// pay2_ticketPay_at_amt+R(oc-1)_exact Payment (83440314781C, network tesSUCCESS).
+#[test]
+fn c26b_pay2_ticketpay_at_amt_r_oc_1_exact_testnet_21248780() {
+    run_bundle(include_str!("vectors/c26b_pay2_ticketpay_at_amt_r_oc_1_exact_testnet_21248780.json"));
+}
+
+/// pay3 Payment (1F1A94B8137F, network tecUNFUNDED_PAYMENT).
+#[test]
+fn c26b_pay3_testnet_21248786() {
+    run_bundle(include_str!("vectors/c26b_pay3_testnet_21248786.json"));
+}
+
+/// pay4_Fee1.5XRP>reserve_at_amt+fee_exact Payment (0E21756A9AE4, network tesSUCCESS).
+#[test]
+fn c26b_pay4_fee1_5xrp_reserve_at_amt_fee_exact_testnet_21248790() {
+    run_bundle(include_str!("vectors/c26b_pay4_fee1_5xrp_reserve_at_amt_fee_exact_testnet_21248790.json"));
+}
+
+/// pay5 Payment (3B7CAD770BE0, network tecUNFUNDED_PAYMENT).
+#[test]
+fn c26b_pay5_testnet_21248799() {
+    run_bundle(include_str!("vectors/c26b_pay5_testnet_21248799.json"));
+}
+
+/// Finding 415 — ts1_ticketTrust_OC2->1_free-tier_at_1.2XRP TrustSet (30D7811B8169, network tesSUCCESS).
+#[test]
+fn c26b_ts1_tickettrust_oc2_1_free_tier_at_1_2xrp_testnet_21248810() {
+    run_bundle(include_str!("vectors/c26b_ts1_tickettrust_oc2_1_free_tier_at_1_2xrp_testnet_21248810.json"));
+}
+
+/// Finding 415 — ts2_ticketTrust_new_line_at_R(oc)-1 TrustSet (C104194ECD48, network tecNO_LINE_INSUF_RESERVE).
+#[test]
+fn c26b_ts2_tickettrust_new_line_at_r_oc_1_testnet_21248818() {
+    run_bundle(include_str!("vectors/c26b_ts2_tickettrust_new_line_at_r_oc_1_testnet_21248818.json"));
+}
+
+/// Finding 415 — ts3_ticketTrust_new_line_at_R(oc)_exact TrustSet (1BD8DCCABB0A, network tesSUCCESS).
+#[test]
+fn c26b_ts3_tickettrust_new_line_at_r_oc_exact_testnet_21248822() {
+    run_bundle(include_str!("vectors/c26b_ts3_tickettrust_new_line_at_r_oc_exact_testnet_21248822.json"));
+}
+
+/// Finding 415 — ts4_ticketTrust_reserveIncrease_at_R(oc)-1 TrustSet (3F83871B35DC, network tecINSUF_RESERVE_LINE).
+#[test]
+fn c26b_ts4_tickettrust_reserveincrease_at_r_oc_1_testnet_21248832() {
+    run_bundle(include_str!("vectors/c26b_ts4_tickettrust_reserveincrease_at_r_oc_1_testnet_21248832.json"));
+}
+
+/// Finding 415 — ts5_ticketTrust_reserveIncrease_at_R(oc)_exact TrustSet (DAA3DDC1AB96, network tesSUCCESS).
+#[test]
+fn c26b_ts5_tickettrust_reserveincrease_at_r_oc_exact_testnet_21248836() {
+    run_bundle(include_str!("vectors/c26b_ts5_tickettrust_reserveincrease_at_r_oc_exact_testnet_21248836.json"));
+}
+
+/// ts6_seqTrust_at_R(oc+1)-1 TrustSet (DE3522863211, network tecNO_LINE_INSUF_RESERVE).
+#[test]
+fn c26b_ts6_seqtrust_at_r_oc_1_1_testnet_21248844() {
+    run_bundle(include_str!("vectors/c26b_ts6_seqtrust_at_r_oc_1_1_testnet_21248844.json"));
+}
+
+/// ts7_seqTrust_at_R(oc+1)_exact TrustSet (3F3F0838B4A7, network tesSUCCESS).
+#[test]
+fn c26b_ts7_seqtrust_at_r_oc_1_exact_testnet_21248849() {
+    run_bundle(include_str!("vectors/c26b_ts7_seqtrust_at_r_oc_1_exact_testnet_21248849.json"));
+}
+
+/// Finding 415 — ts8_msig_ticketTrust_at_R(oc)_exact TrustSet (4762026B61AC, network tesSUCCESS).
+#[test]
+fn c26b_ts8_msig_tickettrust_at_r_oc_exact_testnet_21248860() {
+    run_bundle(include_str!("vectors/c26b_ts8_msig_tickettrust_at_r_oc_exact_testnet_21248860.json"));
+}
+
+/// Finding 415 — ts9_msig_ticketTrust_at_R(oc)-1 TrustSet (90007F00BF90, network tecNO_LINE_INSUF_RESERVE).
+#[test]
+fn c26b_ts9_msig_tickettrust_at_r_oc_1_testnet_21248865() {
+    run_bundle(include_str!("vectors/c26b_ts9_msig_tickettrust_at_r_oc_1_testnet_21248865.json"));
+}
+
+/// Finding 416 — esc1_ticketEscrow_XRP_at_R(oc)+amt+fee-1 EscrowCreate (9C8CE34B48A0, network tecUNFUNDED).
+#[test]
+fn c26b_esc1_ticketescrow_xrp_at_r_oc_amt_fee_1_testnet_21248878() {
+    run_bundle(include_str!("vectors/c26b_esc1_ticketescrow_xrp_at_r_oc_amt_fee_1_testnet_21248878.json"));
+}
+
+/// Finding 416 — esc2_ticketEscrow_XRP_at_R(oc)+amt+fee_exact EscrowCreate (2E52F2F7FB6B, network tesSUCCESS).
+#[test]
+fn c26b_esc2_ticketescrow_xrp_at_r_oc_amt_fee_exact_testnet_21248882() {
+    run_bundle(include_str!("vectors/c26b_esc2_ticketescrow_xrp_at_r_oc_amt_fee_exact_testnet_21248882.json"));
+}
+
+/// Finding 416 — esc3_ticketEscrow_IOU_at_R(oc)+fee_exact EscrowCreate (8C653BC843A2, network tesSUCCESS).
+#[test]
+fn c26b_esc3_ticketescrow_iou_at_r_oc_fee_exact_testnet_21248887() {
+    run_bundle(include_str!("vectors/c26b_esc3_ticketescrow_iou_at_r_oc_fee_exact_testnet_21248887.json"));
+}
+
+/// Finding 416 — esc4_ticketEscrow_IOU_at_R(oc)+fee-1 EscrowCreate (029E72F0FA41, network tecINSUFFICIENT_RESERVE).
+#[test]
+fn c26b_esc4_ticketescrow_iou_at_r_oc_fee_1_testnet_21248892() {
+    run_bundle(include_str!("vectors/c26b_esc4_ticketescrow_iou_at_r_oc_fee_1_testnet_21248892.json"));
+}
+
+/// Finding 416 — esc5_seqEscrow_XRP_at_R(oc+1)+amt+fee_exact EscrowCreate (B97BC997BC84, network tesSUCCESS).
+#[test]
+fn c26b_esc5_seqescrow_xrp_at_r_oc_1_amt_fee_exact_testnet_21248897() {
+    run_bundle(include_str!("vectors/c26b_esc5_seqescrow_xrp_at_r_oc_1_amt_fee_exact_testnet_21248897.json"));
+}
+
+/// pc1_ticketPayChan_at_R(oc)+amt_(ticket_excluded) PaymentChannelCreate (ED4E9EC91AA2, network tecINSUFFICIENT_RESERVE).
+#[test]
+fn c26b_pc1_ticketpaychan_at_r_oc_amt_ticket_excluded_testnet_21248907() {
+    run_bundle(include_str!("vectors/c26b_pc1_ticketpaychan_at_r_oc_amt_ticket_excluded_testnet_21248907.json"));
+}
+
+/// pc2_ticketPayChan_at_R(oc+1)+amt-1 PaymentChannelCreate (EF0EF33B2204, network tecUNFUNDED).
+#[test]
+fn c26b_pc2_ticketpaychan_at_r_oc_1_amt_1_testnet_21248912() {
+    run_bundle(include_str!("vectors/c26b_pc2_ticketpaychan_at_r_oc_1_amt_1_testnet_21248912.json"));
+}
+
+/// pc3_ticketPayChan_at_R(oc+1)+amt_exact PaymentChannelCreate (DF25B4663919, network tesSUCCESS).
+#[test]
+fn c26b_pc3_ticketpaychan_at_r_oc_1_amt_exact_testnet_21248917() {
+    run_bundle(include_str!("vectors/c26b_pc3_ticketpaychan_at_r_oc_1_amt_exact_testnet_21248917.json"));
+}
+
+/// or1_ticketOracle_create_at_R(oc)_(ticket_exclude OracleSet (BDFC7B8785AE, network tecINSUFFICIENT_RESERVE).
+#[test]
+fn c26b_or1_ticketoracle_create_at_r_oc_ticket_exclude_testnet_21248926() {
+    run_bundle(include_str!("vectors/c26b_or1_ticketoracle_create_at_r_oc_ticket_exclude_testnet_21248926.json"));
+}
+
+/// or2_ticketOracle_create_at_R(oc+1)_exact OracleSet (CFE8100CCF1D, network tesSUCCESS).
+#[test]
+fn c26b_or2_ticketoracle_create_at_r_oc_1_exact_testnet_21248931() {
+    run_bundle(include_str!("vectors/c26b_or2_ticketoracle_create_at_r_oc_1_exact_testnet_21248931.json"));
+}
+
+/// or3_ticketOracle_update_1->6_pairs_at_R(oc+1)-1 OracleSet (83861C4265AB, network tecINSUFFICIENT_RESERVE).
+#[test]
+fn c26b_or3_ticketoracle_update_1_6_pairs_at_r_oc_1_1_testnet_21248936() {
+    run_bundle(include_str!("vectors/c26b_or3_ticketoracle_update_1_6_pairs_at_r_oc_1_1_testnet_21248936.json"));
+}
+
+/// ob1_ticketCheckCreate_at_R(oc)_exact CheckCreate (5D833C6BFBD0, network tesSUCCESS).
+#[test]
+fn c26b_ob1_ticketcheckcreate_at_r_oc_exact_testnet_21248954() {
+    run_bundle(include_str!("vectors/c26b_ob1_ticketcheckcreate_at_r_oc_exact_testnet_21248954.json"));
+}
+
+/// ob2_ticketDIDSet_at_R(oc)+fee-1_(post-fee) DIDSet (DAB59589964C, network tecINSUFFICIENT_RESERVE).
+#[test]
+fn c26b_ob2_ticketdidset_at_r_oc_fee_1_post_fee_testnet_21248959() {
+    run_bundle(include_str!("vectors/c26b_ob2_ticketdidset_at_r_oc_fee_1_post_fee_testnet_21248959.json"));
+}
+
+/// ob3_ticketDIDSet_at_R(oc)+fee_exact_(post-fee) DIDSet (9C54ABC0AD1F, network tesSUCCESS).
+#[test]
+fn c26b_ob3_ticketdidset_at_r_oc_fee_exact_post_fee_testnet_21248963() {
+    run_bundle(include_str!("vectors/c26b_ob3_ticketdidset_at_r_oc_fee_exact_post_fee_testnet_21248963.json"));
+}
+
+/// ob4_ticketNFTokenMint_newpage_at_R(oc)-1 NFTokenMint (3D358698BF9B, network tecINSUFFICIENT_RESERVE).
+#[test]
+fn c26b_ob4_ticketnftokenmint_newpage_at_r_oc_1_testnet_21248970() {
+    run_bundle(include_str!("vectors/c26b_ob4_ticketnftokenmint_newpage_at_r_oc_1_testnet_21248970.json"));
+}
+
+/// ob5_ticketNFTokenMint_newpage_at_R(oc)_exact NFTokenMint (E541D3A2F945, network tesSUCCESS).
+#[test]
+fn c26b_ob5_ticketnftokenmint_newpage_at_r_oc_exact_testnet_21248974() {
+    run_bundle(include_str!("vectors/c26b_ob5_ticketnftokenmint_newpage_at_r_oc_exact_testnet_21248974.json"));
+}
+
+/// ob6_ticketNFTokenMint_samepage_at_R(oc)-1_(no_re NFTokenMint (F456DF196592, network tesSUCCESS).
+#[test]
+fn c26b_ob6_ticketnftokenmint_samepage_at_r_oc_1_no_re_testnet_21248980() {
+    run_bundle(include_str!("vectors/c26b_ob6_ticketnftokenmint_samepage_at_r_oc_1_no_re_testnet_21248980.json"));
+}
+
+/// ob7_ticketNFTokenCreateOffer_sell_at_R(oc)_exact NFTokenCreateOffer (E253AA29CD7B, network tesSUCCESS).
+#[test]
+fn c26b_ob7_ticketnftokencreateoffer_sell_at_r_oc_exact_testnet_21248984() {
+    run_bundle(include_str!("vectors/c26b_ob7_ticketnftokencreateoffer_sell_at_r_oc_exact_testnet_21248984.json"));
+}
+
+/// ob8_ticketSignerListSet_at_R(oc)-1 SignerListSet (048956264FC0, network tecINSUFFICIENT_RESERVE).
+#[test]
+fn c26b_ob8_ticketsignerlistset_at_r_oc_1_testnet_21248989() {
+    run_bundle(include_str!("vectors/c26b_ob8_ticketsignerlistset_at_r_oc_1_testnet_21248989.json"));
+}
+
+/// ob9_ticketSignerListSet_at_R(oc)_exact SignerListSet (46529215AFB3, network tesSUCCESS).
+#[test]
+fn c26b_ob9_ticketsignerlistset_at_r_oc_exact_testnet_21248993() {
+    run_bundle(include_str!("vectors/c26b_ob9_ticketsignerlistset_at_r_oc_exact_testnet_21248993.json"));
+}
+
+/// ob10_ticketSignerListSet_replace_at_R(oc-1) SignerListSet (42E0572A6FF4, network tesSUCCESS).
+#[test]
+fn c26b_ob10_ticketsignerlistset_replace_at_r_oc_1_testnet_21248997() {
+    run_bundle(include_str!("vectors/c26b_ob10_ticketsignerlistset_replace_at_r_oc_1_testnet_21248997.json"));
+}
+
+/// ob11_ticketDepositPreauth_at_R(oc)_exact DepositPreauth (BB7F6DB570DF, network tesSUCCESS).
+#[test]
+fn c26b_ob11_ticketdepositpreauth_at_r_oc_exact_testnet_21249003() {
+    run_bundle(include_str!("vectors/c26b_ob11_ticketdepositpreauth_at_r_oc_exact_testnet_21249003.json"));
+}
+
+/// ob12_ticketCredentialCreate_at_R(oc)-1 CredentialCreate (0E7066A42D52, network tecINSUFFICIENT_RESERVE).
+#[test]
+fn c26b_ob12_ticketcredentialcreate_at_r_oc_1_testnet_21249009() {
+    run_bundle(include_str!("vectors/c26b_ob12_ticketcredentialcreate_at_r_oc_1_testnet_21249009.json"));
+}
+
+/// ob13_ticketCredentialCreate_at_R(oc)_exact CredentialCreate (8FC642EDB15A, network tesSUCCESS).
+#[test]
+fn c26b_ob13_ticketcredentialcreate_at_r_oc_exact_testnet_21249013() {
+    run_bundle(include_str!("vectors/c26b_ob13_ticketcredentialcreate_at_r_oc_exact_testnet_21249013.json"));
+}
+
+/// ob14_ticketCredentialAccept_at_R(oc)_exact CredentialAccept (2CEC259D7D9A, network tesSUCCESS).
+#[test]
+fn c26b_ob14_ticketcredentialaccept_at_r_oc_exact_testnet_21249018() {
+    run_bundle(include_str!("vectors/c26b_ob14_ticketcredentialaccept_at_r_oc_exact_testnet_21249018.json"));
+}
+
+/// ob15_ticketMPTokenAuthorize_at_R(oc)-1 MPTokenAuthorize (58315889A6C0, network tecINSUFFICIENT_RESERVE).
+#[test]
+fn c26b_ob15_ticketmptokenauthorize_at_r_oc_1_testnet_21249023() {
+    run_bundle(include_str!("vectors/c26b_ob15_ticketmptokenauthorize_at_r_oc_1_testnet_21249023.json"));
+}
+
+/// ob16_ticketMPTokenAuthorize_at_R(oc)_exact MPTokenAuthorize (A531D1E5563D, network tesSUCCESS).
+#[test]
+fn c26b_ob16_ticketmptokenauthorize_at_r_oc_exact_testnet_21249027() {
+    run_bundle(include_str!("vectors/c26b_ob16_ticketmptokenauthorize_at_r_oc_exact_testnet_21249027.json"));
+}
+
+/// ob2_tickets TicketCreate (7BE089EA9CD5, network tesSUCCESS).
+#[test]
+fn c26b_ob2_tickets_testnet_21249031() {
+    run_bundle(include_str!("vectors/c26b_ob2_tickets_testnet_21249031.json"));
+}
+
+/// ob17_ticketOffer_own-IOU_at_R(oc)-1 OfferCreate (D0268C03194C, network tecINSUF_RESERVE_OFFER).
+#[test]
+fn c26b_ob17_ticketoffer_own_iou_at_r_oc_1_testnet_21249035() {
+    run_bundle(include_str!("vectors/c26b_ob17_ticketoffer_own_iou_at_r_oc_1_testnet_21249035.json"));
+}
+
+/// ob18_ticketOffer_own-IOU_at_R(oc)_exact OfferCreate (A223B19B5880, network tesSUCCESS).
+#[test]
+fn c26b_ob18_ticketoffer_own_iou_at_r_oc_exact_testnet_21249039() {
+    run_bundle(include_str!("vectors/c26b_ob18_ticketoffer_own_iou_at_r_oc_exact_testnet_21249039.json"));
+}
+
+/// ob19_ticketOffer_sellXRP_at_R(oc)_(preclaim_liqu OfferCreate (1D1FC7CFBF90, network tecUNFUNDED_OFFER).
+#[test]
+fn c26b_ob19_ticketoffer_sellxrp_at_r_oc_preclaim_liqu_testnet_21249044() {
+    run_bundle(include_str!("vectors/c26b_ob19_ticketoffer_sellxrp_at_r_oc_preclaim_liqu_testnet_21249044.json"));
+}
+
+/// ob20_ticketOffer_sellXRP_at_R(oc)+1 OfferCreate (EA789177BD44, network tesSUCCESS).
+#[test]
+fn c26b_ob20_ticketoffer_sellxrp_at_r_oc_1_testnet_21249048() {
+    run_bundle(include_str!("vectors/c26b_ob20_ticketoffer_sellxrp_at_r_oc_1_testnet_21249048.json"));
+}
+
+/// ob21_seqOffer_sellXRP_at_R(oc)+fee_(post-fee_liq OfferCreate (C669C10480FC, network tecUNFUNDED_OFFER).
+#[test]
+fn c26b_ob21_seqoffer_sellxrp_at_r_oc_fee_post_fee_liq_testnet_21249052() {
+    run_bundle(include_str!("vectors/c26b_ob21_seqoffer_sellxrp_at_r_oc_fee_post_fee_liq_testnet_21249052.json"));
+}
+
+/// ob22_ticketMPTIssuanceCreate_at_R(oc)_exact MPTokenIssuanceCreate (4EE0393152D4, network tesSUCCESS).
+#[test]
+fn c26b_ob22_ticketmptissuancecreate_at_r_oc_exact_testnet_21249054() {
+    run_bundle(include_str!("vectors/c26b_ob22_ticketmptissuancecreate_at_r_oc_exact_testnet_21249054.json"));
+}
+
+/// ob23_ticketNFTokenMint+Amount_samepage_at_R(oc)- NFTokenMint (65FAE6F36F58, network tecINSUFFICIENT_RESERVE).
+#[test]
+fn c26b_ob23_ticketnftokenmint_amount_samepage_at_r_oc_testnet_21249059() {
+    run_bundle(include_str!("vectors/c26b_ob23_ticketnftokenmint_amount_samepage_at_r_oc_testnet_21249059.json"));
+}
+
+/// mp1_ticketMPTokenAuthorize_OC2->1_free-tier_at_R MPTokenAuthorize (2A65F544438D, network tesSUCCESS).
+#[test]
+fn c26b_mp1_ticketmptokenauthorize_oc2_1_free_tier_at_r_testnet_21249069() {
+    run_bundle(include_str!("vectors/c26b_mp1_ticketmptokenauthorize_oc2_1_free_tier_at_r_testnet_21249069.json"));
+}
+
+/// of1_tickets TicketCreate (FC60DBD9D38E, network tesSUCCESS).
+#[test]
+fn c26b_of1_tickets_testnet_21249079() {
+    run_bundle(include_str!("vectors/c26b_of1_tickets_testnet_21249079.json"));
+}
+
+/// of1_seqOffer_cross+newline,_remainder_at_R(oc+2) OfferCreate (C04C35792264, network tesSUCCESS).
+#[test]
+fn c26b_of1_seqoffer_cross_newline_remainder_at_r_oc_2_testnet_21249084() {
+    run_bundle(include_str!("vectors/c26b_of1_seqoffer_cross_newline_remainder_at_r_oc_2_testnet_21249084.json"));
+}
+
+/// of2_tickets TicketCreate (449581D35661, network tesSUCCESS).
+#[test]
+fn c26b_of2_tickets_testnet_21249089() {
+    run_bundle(include_str!("vectors/c26b_of2_tickets_testnet_21249089.json"));
+}
+
+/// of2_seqOffer_cross+newline,_remainder_at_R(oc+2) OfferCreate (F282F4F22442, network tesSUCCESS).
+#[test]
+fn c26b_of2_seqoffer_cross_newline_remainder_at_r_oc_2_testnet_21249094() {
+    run_bundle(include_str!("vectors/c26b_of2_seqoffer_cross_newline_remainder_at_r_oc_2_testnet_21249094.json"));
+}
+
+/// of3_tickets TicketCreate (FEB1986CB6C7, network tesSUCCESS).
+#[test]
+fn c26b_of3_tickets_testnet_21249098() {
+    run_bundle(include_str!("vectors/c26b_of3_tickets_testnet_21249098.json"));
+}
+
+/// of3_ticketOffer_cross+newline,_remainder_at_R(oc OfferCreate (609F60FA5A22, network tesSUCCESS).
+#[test]
+fn c26b_of3_ticketoffer_cross_newline_remainder_at_r_oc_testnet_21249103() {
+    run_bundle(include_str!("vectors/c26b_of3_ticketoffer_cross_newline_remainder_at_r_oc_testnet_21249103.json"));
+}
+
+/// ck1_CheckCash_0.5XRP_writer_at_R(oc-1)+v-1 CheckCash (600FEEABD17E, network tecPATH_PARTIAL).
+#[test]
+fn c26b_ck1_checkcash_0_5xrp_writer_at_r_oc_1_v_1_testnet_21249114() {
+    run_bundle(include_str!("vectors/c26b_ck1_checkcash_0_5xrp_writer_at_r_oc_1_v_1_testnet_21249114.json"));
+}
+
+/// ck2_CheckCash_0.5XRP_writer_at_R(oc-1)+v_exact CheckCash (CD041AADCCB4, network tesSUCCESS).
+#[test]
+fn c26b_ck2_checkcash_0_5xrp_writer_at_r_oc_1_v_exact_testnet_21249119() {
+    run_bundle(include_str!("vectors/c26b_ck2_checkcash_0_5xrp_writer_at_r_oc_1_v_exact_testnet_21249119.json"));
+}
+
+/// ck3_CheckCash_DeliverMin_writer_liquid_0.3XRP CheckCash (BC1F403F3BED, network tesSUCCESS).
+#[test]
+fn c26b_ck3_checkcash_delivermin_writer_liquid_0_3xrp_testnet_21249123() {
+    run_bundle(include_str!("vectors/c26b_ck3_checkcash_delivermin_writer_liquid_0_3xrp_testnet_21249123.json"));
+}
+
+/// cl1_CheckCreate CheckCreate (1BA9C89EE90A, network tesSUCCESS).
+#[test]
+fn c26b_cl1_checkcreate_testnet_21249130() {
+    run_bundle(include_str!("vectors/c26b_cl1_checkcreate_testnet_21249130.json"));
+}
+
+/// cl1_CheckCash_newline_at_R(oc+1)-1 CheckCash (24F67D114680, network tecNO_LINE_INSUF_RESERVE).
+#[test]
+fn c26b_cl1_checkcash_newline_at_r_oc_1_1_testnet_21249135() {
+    run_bundle(include_str!("vectors/c26b_cl1_checkcash_newline_at_r_oc_1_1_testnet_21249135.json"));
+}
+
+/// cl2_CheckCash_newline_at_R(oc+1)_exact CheckCash (E191E4CC35A7, network tesSUCCESS).
+#[test]
+fn c26b_cl2_checkcash_newline_at_r_oc_1_exact_testnet_21249140() {
+    run_bundle(include_str!("vectors/c26b_cl2_checkcash_newline_at_r_oc_1_exact_testnet_21249140.json"));
+}
+
+/// cl2_tickets TicketCreate (2798AA303B8A, network tesSUCCESS).
+#[test]
+fn c26b_cl2_tickets_testnet_21249145() {
+    run_bundle(include_str!("vectors/c26b_cl2_tickets_testnet_21249145.json"));
+}
+
+/// cl3_CheckCreate CheckCreate (A94FBCC0ADA9, network tesSUCCESS).
+#[test]
+fn c26b_cl3_checkcreate_testnet_21249147() {
+    run_bundle(include_str!("vectors/c26b_cl3_checkcreate_testnet_21249147.json"));
+}
+
+/// cl3_ticketCheckCash_newline_at_R(oc)_exact CheckCash (FD2B4E39816C, network tesSUCCESS).
+#[test]
+fn c26b_cl3_ticketcheckcash_newline_at_r_oc_exact_testnet_21249151() {
+    run_bundle(include_str!("vectors/c26b_cl3_ticketcheckcash_newline_at_r_oc_exact_testnet_21249151.json"));
+}
+
+/// cl4_CheckCreate CheckCreate (647D53BD4D9D, network tesSUCCESS).
+#[test]
+fn c26b_cl4_checkcreate_testnet_21249156() {
+    run_bundle(include_str!("vectors/c26b_cl4_checkcreate_testnet_21249156.json"));
+}
+
+/// cl4_CheckCash_newline_OC0_at_R(1)-1_(no_free_tie CheckCash (9D03CC9F8C1B, network tecNO_LINE_INSUF_RESERVE).
+#[test]
+fn c26b_cl4_checkcash_newline_oc0_at_r_1_1_no_free_tie_testnet_21249160() {
+    run_bundle(include_str!("vectors/c26b_cl4_checkcash_newline_oc0_at_r_1_1_no_free_tie_testnet_21249160.json"));
+}
+
+/// ob3_tickets TicketCreate (D93F51B9B4E8, network tesSUCCESS).
+#[test]
+fn c26b_ob3_tickets_testnet_21249173() {
+    run_bundle(include_str!("vectors/c26b_ob3_tickets_testnet_21249173.json"));
+}
+
+/// ob24_ticketNFTokenMint+Amount_samepage_at_R(oc)_ NFTokenMint (7DE534E47B66, network tesSUCCESS).
+#[test]
+fn c26b_ob24_ticketnftokenmint_amount_samepage_at_r_oc_testnet_21249177() {
+    run_bundle(include_str!("vectors/c26b_ob24_ticketnftokenmint_amount_samepage_at_r_oc_testnet_21249177.json"));
+}
+
+/// del1_AccountDelete_seq_(tickets+list+offer+preau AccountDelete (7F6BD9A7B0B5, network tesSUCCESS).
+#[test]
+fn c26b_del1_accountdelete_seq_tickets_list_offer_preau_testnet_21249180() {
+    run_bundle(include_str!("vectors/c26b_del1_accountdelete_seq_tickets_list_offer_preau_testnet_21249180.json"));
+}
+
+/// del2_AccountDelete_ticket-funded AccountDelete (29708098178F, network tesSUCCESS).
+#[test]
+fn c26b_del2_accountdelete_ticket_funded_testnet_21249182() {
+    run_bundle(include_str!("vectors/c26b_del2_accountdelete_ticket_funded_testnet_21249182.json"));
+}
+
+/// rc0_issue_H1_CLW_11.24387575898908 Payment (1ACB5DF223FA, network tesSUCCESS).
+#[test]
+fn c26b_rc0_issue_h1_clw_11_24387575898908_testnet_21249184() {
+    run_bundle(include_str!("vectors/c26b_rc0_issue_h1_clw_11_24387575898908_testnet_21249184.json"));
+}
+
+/// rc0_issue_H2_CLW Payment (31A5F9FA9BF0, network tesSUCCESS).
+#[test]
+fn c26b_rc0_issue_h2_clw_testnet_21249186() {
+    run_bundle(include_str!("vectors/c26b_rc0_issue_h2_clw_testnet_21249186.json"));
+}
+
+/// rc0_issue_H2_RND Payment (FE594C8305A0, network tesSUCCESS).
+#[test]
+fn c26b_rc0_issue_h2_rnd_testnet_21249188() {
+    run_bundle(include_str!("vectors/c26b_rc0_issue_h2_rnd_testnet_21249188.json"));
+}
+
+/// rc0_issue_H1_RND Payment (D6158D45C8CC, network tesSUCCESS).
+#[test]
+fn c26b_rc0_issue_h1_rnd_testnet_21249190() {
+    run_bundle(include_str!("vectors/c26b_rc0_issue_h1_rnd_testnet_21249190.json"));
+}
+
+/// rc1_CheckCreate CheckCreate (01A407299E30, network tesSUCCESS).
+#[test]
+fn c26b_rc1_checkcreate_testnet_21249192() {
+    run_bundle(include_str!("vectors/c26b_rc1_checkcreate_testnet_21249192.json"));
+}
+
+/// rc1_CheckCash_DeliverMin=998.8_onto_11.243875758 CheckCash (B08D69F1DBB7, network tesSUCCESS).
+#[test]
+fn c26b_rc1_checkcash_delivermin_998_8_onto_11_243875758_testnet_21249194() {
+    run_bundle(include_str!("vectors/c26b_rc1_checkcash_delivermin_998_8_onto_11_243875758_testnet_21249194.json"));
+}
+
+/// rc2_CheckCreate CheckCreate (F93E4EA1AD88, network tesSUCCESS).
+#[test]
+fn c26b_rc2_checkcreate_testnet_21249196() {
+    run_bundle(include_str!("vectors/c26b_rc2_checkcreate_testnet_21249196.json"));
+}
+
+/// rc2_CheckCash_Amount=0.1234567890123456_onto_101 CheckCash (2A7590DD0EA1, network tesSUCCESS).
+#[test]
+fn c26b_rc2_checkcash_amount_0_1234567890123456_onto_101_testnet_21249198() {
+    run_bundle(include_str!("vectors/c26b_rc2_checkcash_amount_0_1234567890123456_onto_101_testnet_21249198.json"));
+}
+
+/// rc3_CheckCreate CheckCreate (EBF159413A24, network tesSUCCESS).
+#[test]
+fn c26b_rc3_checkcreate_testnet_21249200() {
+    run_bundle(include_str!("vectors/c26b_rc3_checkcreate_testnet_21249200.json"));
+}
+
+/// rc3_CheckCash_Amount_1.23456789e-11_onto_1010.16 CheckCash (542EFFC59374, network tesSUCCESS).
+#[test]
+fn c26b_rc3_checkcash_amount_1_23456789e_11_onto_1010_16_testnet_21249203() {
+    run_bundle(include_str!("vectors/c26b_rc3_checkcash_amount_1_23456789e_11_onto_1010_16_testnet_21249203.json"));
+}
+
+/// rc4_CheckCreate CheckCreate (0449D4ABD85E, network tesSUCCESS).
+#[test]
+fn c26b_rc4_checkcreate_testnet_21249205() {
+    run_bundle(include_str!("vectors/c26b_rc4_checkcreate_testnet_21249205.json"));
+}
+
+/// rc4_CheckCash_RND_DeliverMin=1_(observe_delivera CheckCash (28C06858D1D1, network tesSUCCESS).
+#[test]
+fn c26b_rc4_checkcash_rnd_delivermin_1_observe_delivera_testnet_21249207() {
+    run_bundle(include_str!("vectors/c26b_rc4_checkcash_rnd_delivermin_1_observe_delivera_testnet_21249207.json"));
+}
+
+/// rc5_CheckCreate CheckCreate (87366EC0FE50, network tesSUCCESS).
+#[test]
+fn c26b_rc5_checkcreate_testnet_21249209() {
+    run_bundle(include_str!("vectors/c26b_rc5_checkcreate_testnet_21249209.json"));
+}
+
+/// rc5_CheckCash_RND_DeliverMin=deliverable+1ulp CheckCash (A59B9532FDBA, network tecPATH_PARTIAL).
+#[test]
+fn c26b_rc5_checkcash_rnd_delivermin_deliverable_1ulp_testnet_21249211() {
+    run_bundle(include_str!("vectors/c26b_rc5_checkcash_rnd_delivermin_deliverable_1ulp_testnet_21249211.json"));
+}
+
+/// rc6_CheckCash_RND_DeliverMin=deliverable_exact CheckCash (3B9ACA9A0D5E, network tesSUCCESS).
+#[test]
+fn c26b_rc6_checkcash_rnd_delivermin_deliverable_exact_testnet_21249213() {
+    run_bundle(include_str!("vectors/c26b_rc6_checkcash_rnd_delivermin_deliverable_exact_testnet_21249213.json"));
+}
+
+/// rc7_CheckCreate CheckCreate (F62B03075A84, network tesSUCCESS).
+#[test]
+fn c26b_rc7_checkcreate_testnet_21249215() {
+    run_bundle(include_str!("vectors/c26b_rc7_checkcreate_testnet_21249215.json"));
+}
+
+/// rc7_CheckCash_RND_Amount=deliverable_(gross_must CheckCash (BB645C2FCA1B, network tesSUCCESS).
+#[test]
+fn c26b_rc7_checkcash_rnd_amount_deliverable_gross_must_testnet_21249217() {
+    run_bundle(include_str!("vectors/c26b_rc7_checkcash_rnd_amount_deliverable_gross_must_testnet_21249217.json"));
+}
+
+/// rc8_CheckCreate CheckCreate (D992D9CF0707, network tesSUCCESS).
+#[test]
+fn c26b_rc8_checkcreate_testnet_21249219() {
+    run_bundle(include_str!("vectors/c26b_rc8_checkcreate_testnet_21249219.json"));
+}
+
+/// rc8_CheckCash_RND_Amount=deliverable+1ulp CheckCash (527C2C0F5F57, network tecPATH_PARTIAL).
+#[test]
+fn c26b_rc8_checkcash_rnd_amount_deliverable_1ulp_testnet_21249221() {
+    run_bundle(include_str!("vectors/c26b_rc8_checkcash_rnd_amount_deliverable_1ulp_testnet_21249221.json"));
+}
+
+/// rp1_partial_SendMax_777.77.._(observe_delivered) Payment (9CAB9D25CCAE, network tesSUCCESS).
+#[test]
+fn c26b_rp1_partial_sendmax_777_77_observe_delivered_testnet_21249223() {
+    run_bundle(include_str!("vectors/c26b_rp1_partial_sendmax_777_77_observe_delivered_testnet_21249223.json"));
+}
+
+/// rp2_partial_DeliverMin=delivered+1ulp Payment (3D77A347F556, network tecPATH_PARTIAL).
+#[test]
+fn c26b_rp2_partial_delivermin_delivered_1ulp_testnet_21249225() {
+    run_bundle(include_str!("vectors/c26b_rp2_partial_delivermin_delivered_1ulp_testnet_21249225.json"));
+}
+
+/// rp3_partial_DeliverMin=delivered_exact Payment (CBF047CE7ABE, network tesSUCCESS).
+#[test]
+fn c26b_rp3_partial_delivermin_delivered_exact_testnet_21249227() {
+    run_bundle(include_str!("vectors/c26b_rp3_partial_delivermin_delivered_exact_testnet_21249227.json"));
+}
+
+/// rp4_pay_0.3333333333333333_SendMax_1_(observe_gr Payment (9354DD71F03E, network tesSUCCESS).
+#[test]
+fn c26b_rp4_pay_0_3333333333333333_sendmax_1_observe_gr_testnet_21249229() {
+    run_bundle(include_str!("vectors/c26b_rp4_pay_0_3333333333333333_sendmax_1_observe_gr_testnet_21249229.json"));
+}
+
+/// rp5_pay_same_SendMax=gross_exact Payment (118BBA9C3E60, network tesSUCCESS).
+#[test]
+fn c26b_rp5_pay_same_sendmax_gross_exact_testnet_21249231() {
+    run_bundle(include_str!("vectors/c26b_rp5_pay_same_sendmax_gross_exact_testnet_21249231.json"));
+}
+
+/// rp6_pay_same_SendMax=gross-1ulp Payment (8CB2069C5EF1, network tesSUCCESS).
+#[test]
+fn c26b_rp6_pay_same_sendmax_gross_1ulp_testnet_21249233() {
+    run_bundle(include_str!("vectors/c26b_rp6_pay_same_sendmax_gross_1ulp_testnet_21249233.json"));
+}
+
+/// rp7_pay_9999.999999999999_through_G1 Payment (18BBD49CA65A, network tesSUCCESS).
+#[test]
+fn c26b_rp7_pay_9999_999999999999_through_g1_testnet_21249235() {
+    run_bundle(include_str!("vectors/c26b_rp7_pay_9999_999999999999_through_g1_testnet_21249235.json"));
+}
+
+/// rw0_issue_H3_200000.0000000005 Payment (CA0267A08488, network tesSUCCESS).
+#[test]
+fn c26b_rw0_issue_h3_200000_0000000005_testnet_21249237() {
+    run_bundle(include_str!("vectors/c26b_rw0_issue_h3_200000_0000000005_testnet_21249237.json"));
+}
+
+/// rw1_claw_200000_of_200000.0000000005_(F403) Clawback (CC73CD51A332, network tesSUCCESS).
+#[test]
+fn c26b_rw1_claw_200000_of_200000_0000000005_f403_testnet_21249239() {
+    run_bundle(include_str!("vectors/c26b_rw1_claw_200000_of_200000_0000000005_f403_testnet_21249239.json"));
+}
+
+/// rw0_issue_H4_9999999999.999999 Payment (DA61E72FD9F9, network tesSUCCESS).
+#[test]
+fn c26b_rw0_issue_h4_9999999999_999999_testnet_21249241() {
+    run_bundle(include_str!("vectors/c26b_rw0_issue_h4_9999999999_999999_testnet_21249241.json"));
+}
+
+/// rw2_claw_9999999999.999998_of_9999999999.999999 Clawback (98A3EB3B80EC, network tesSUCCESS).
+#[test]
+fn c26b_rw2_claw_9999999999_999998_of_9999999999_999999_testnet_21249244() {
+    run_bundle(include_str!("vectors/c26b_rw2_claw_9999999999_999998_of_9999999999_999999_testnet_21249244.json"));
+}
+
+/// rw0_issue_H4_1e9_onto_0.000001 Payment (1230C01CFC55, network tesSUCCESS).
+#[test]
+fn c26b_rw0_issue_h4_1e9_onto_0_000001_testnet_21249246() {
+    run_bundle(include_str!("vectors/c26b_rw0_issue_h4_1e9_onto_0_000001_testnet_21249246.json"));
+}
+
+/// rw3_claw_1e-8_of_1000000000.000001_(below_16_dig Clawback (0487B65B8170, network tesSUCCESS).
+#[test]
+fn c26b_rw3_claw_1e_8_of_1000000000_000001_below_16_dig_testnet_21249248() {
+    run_bundle(include_str!("vectors/c26b_rw3_claw_1e_8_of_1000000000_000001_below_16_dig_testnet_21249248.json"));
+}
+
+/// rw4_claw_0.0000005_of_1000000000.000001 Clawback (2732E5723263, network tesSUCCESS).
+#[test]
+fn c26b_rw4_claw_0_0000005_of_1000000000_000001_testnet_21249250() {
+    run_bundle(include_str!("vectors/c26b_rw4_claw_0_0000005_of_1000000000_000001_testnet_21249250.json"));
+}
+
+/// rp8_P_pays_0.3333333333333333_from_exactly_1_(ob Payment (61B28BC52F57, network tesSUCCESS).
+#[test]
+fn c26b_rp8_p_pays_0_3333333333333333_from_exactly_1_ob_testnet_21249269() {
+    run_bundle(include_str!("vectors/c26b_rp8_p_pays_0_3333333333333333_from_exactly_1_ob_testnet_21249269.json"));
+}
+
+/// rp9_SendMax=gross-1ulp Payment (4CA088206F7B, network tesSUCCESS).
+#[test]
+fn c26b_rp9_sendmax_gross_1ulp_testnet_21249273() {
+    run_bundle(include_str!("vectors/c26b_rp9_sendmax_gross_1ulp_testnet_21249273.json"));
+}
+
+/// rp10_SendMax=gross_exact Payment (87E55652D2DD, network tesSUCCESS).
+#[test]
+fn c26b_rp10_sendmax_gross_exact_testnet_21249275() {
+    run_bundle(include_str!("vectors/c26b_rp10_sendmax_gross_exact_testnet_21249275.json"));
+}
+
+/// rn0_issue_r3JDbW_RND Payment (9BB1F999A013, network tesSUCCESS).
+#[test]
+fn c26b_rn0_issue_r3jdbw_rnd_testnet_21249277() {
+    run_bundle(include_str!("vectors/c26b_rn0_issue_r3jdbw_rnd_testnet_21249277.json"));
+}
+
+/// rn0_issue_rGGXCC_RND Payment (329B34539F6F, network tesSUCCESS).
+#[test]
+fn c26b_rn0_issue_rggxcc_rnd_testnet_21249279() {
+    run_bundle(include_str!("vectors/c26b_rn0_issue_rggxcc_rnd_testnet_21249279.json"));
+}
+
+/// rn0_issue_rHEZjx_RND Payment (6D5F743DFFE5, network tesSUCCESS).
+#[test]
+fn c26b_rn0_issue_rhezjx_rnd_testnet_21249281() {
+    run_bundle(include_str!("vectors/c26b_rn0_issue_rhezjx_rnd_testnet_21249281.json"));
+}
+
+/// rn0_issue_rBprTM_RND Payment (30DF52F07EB2, network tesSUCCESS).
+#[test]
+fn c26b_rn0_issue_rbprtm_rnd_testnet_21249283() {
+    run_bundle(include_str!("vectors/c26b_rn0_issue_rbprtm_rnd_testnet_21249283.json"));
+}
+
+/// rn1_mint_TransferFee_3333 NFTokenMint (E37182D99438, network tesSUCCESS).
+#[test]
+fn c26b_rn1_mint_transferfee_3333_testnet_21249285() {
+    run_bundle(include_str!("vectors/c26b_rn1_mint_transferfee_3333_testnet_21249285.json"));
+}
+
+/// rn2_M_sells_211299.0477462831 NFTokenCreateOffer (1E3635A655CA, network tesSUCCESS).
+#[test]
+fn c26b_rn2_m_sells_211299_0477462831_testnet_21249287() {
+    run_bundle(include_str!("vectors/c26b_rn2_m_sells_211299_0477462831_testnet_21249287.json"));
+}
+
+/// rn3_H1_accepts_(issuer_seller,_rate_grossing) NFTokenAcceptOffer (B4C484B4A54A, network tesSUCCESS).
+#[test]
+fn c26b_rn3_h1_accepts_issuer_seller_rate_grossing_testnet_21249289() {
+    run_bundle(include_str!("vectors/c26b_rn3_h1_accepts_issuer_seller_rate_grossing_testnet_21249289.json"));
+}
+
+/// rn4_H1_sells_98765.43210987654 NFTokenCreateOffer (E8C7C0B06596, network tesSUCCESS).
+#[test]
+fn c26b_rn4_h1_sells_98765_43210987654_testnet_21249291() {
+    run_bundle(include_str!("vectors/c26b_rn4_h1_sells_98765_43210987654_testnet_21249291.json"));
+}
+
+/// rn5_H2_accepts_(royalty_3.333__+_rate) NFTokenAcceptOffer (B5BBB914749A, network tesSUCCESS).
+#[test]
+fn c26b_rn5_h2_accepts_royalty_3_333_rate_testnet_21249294() {
+    run_bundle(include_str!("vectors/c26b_rn5_h2_accepts_royalty_3_333_rate_testnet_21249294.json"));
+}
+
+/// rn6_H3_buy_offer_12345.67890123456 NFTokenCreateOffer (E01C0E838B9E, network tesSUCCESS).
+#[test]
+fn c26b_rn6_h3_buy_offer_12345_67890123456_testnet_21249296() {
+    run_bundle(include_str!("vectors/c26b_rn6_h3_buy_offer_12345_67890123456_testnet_21249296.json"));
+}
+
+/// rn7_H2_accepts_buy_offer NFTokenAcceptOffer (0A394C012C81, network tesSUCCESS).
+#[test]
+fn c26b_rn7_h2_accepts_buy_offer_testnet_21249298() {
+    run_bundle(include_str!("vectors/c26b_rn7_h2_accepts_buy_offer_testnet_21249298.json"));
+}
+
+/// rn8_H3_sells_1000.000000000001 NFTokenCreateOffer (E70E516D9C3A, network tesSUCCESS).
+#[test]
+fn c26b_rn8_h3_sells_1000_000000000001_testnet_21249300() {
+    run_bundle(include_str!("vectors/c26b_rn8_h3_sells_1000_000000000001_testnet_21249300.json"));
+}
+
+/// rn9_H4_buy_offer_1234.567890123457 NFTokenCreateOffer (7EDBAF7523C1, network tesSUCCESS).
+#[test]
+fn c26b_rn9_h4_buy_offer_1234_567890123457_testnet_21249302() {
+    run_bundle(include_str!("vectors/c26b_rn9_h4_buy_offer_1234_567890123457_testnet_21249302.json"));
+}
+
+/// rn10_H1_brokers_fee_0.1234567890123456 NFTokenAcceptOffer (60A1F318AB27, network tesSUCCESS).
+#[test]
+fn c26b_rn10_h1_brokers_fee_0_1234567890123456_testnet_21249304() {
+    run_bundle(include_str!("vectors/c26b_rn10_h1_brokers_fee_0_1234567890123456_testnet_21249304.json"));
+}
+
+/// rl0_H4_RND_limit_1000.000000000001 TrustSet (F61F2E146519, network tesSUCCESS).
+#[test]
+fn c26b_rl0_h4_rnd_limit_1000_000000000001_testnet_21249306() {
+    run_bundle(include_str!("vectors/c26b_rl0_h4_rnd_limit_1000_000000000001_testnet_21249306.json"));
+}
+
+/// rl0_H4_returns_RND Payment (3B656098EA2F, network tesSUCCESS).
+#[test]
+fn c26b_rl0_h4_returns_rnd_testnet_21249308() {
+    run_bundle(include_str!("vectors/c26b_rl0_h4_returns_rnd_testnet_21249308.json"));
+}
+
+/// rl0_issue_H4_0.1234567890123456 Payment (219CDF0AFF99, network tesSUCCESS).
+#[test]
+fn c26b_rl0_issue_h4_0_1234567890123456_testnet_21249310() {
+    run_bundle(include_str!("vectors/c26b_rl0_issue_h4_0_1234567890123456_testnet_21249310.json"));
+}
+
+/// rl1_issuer_pays_room+1ulp Payment (98BD2423EB44, network tecPATH_PARTIAL).
+#[test]
+fn c26b_rl1_issuer_pays_room_1ulp_testnet_21249312() {
+    run_bundle(include_str!("vectors/c26b_rl1_issuer_pays_room_1ulp_testnet_21249312.json"));
+}
+
+/// rl2_issuer_pays_round16(room) Payment (0548ED91BB89, network tesSUCCESS).
+#[test]
+fn c26b_rl2_issuer_pays_round16_room_testnet_21249314() {
+    run_bundle(include_str!("vectors/c26b_rl2_issuer_pays_round16_room_testnet_21249314.json"));
+}
+
+/// rl3_H2_pays_1e-12_into_full_line_(via_G1,_fee) Payment (A46B7E963708, network tecPATH_DRY).
+#[test]
+fn c26b_rl3_h2_pays_1e_12_into_full_line_via_g1_fee_testnet_21249316() {
+    run_bundle(include_str!("vectors/c26b_rl3_h2_pays_1e_12_into_full_line_via_g1_fee_testnet_21249316.json"));
+}
+
+/// rl4_H2_partial_into_full_line Payment (80C868ED84BC, network tecPATH_DRY).
+#[test]
+fn c26b_rl4_h2_partial_into_full_line_testnet_21249319() {
+    run_bundle(include_str!("vectors/c26b_rl4_h2_partial_into_full_line_testnet_21249319.json"));
+}
+
+/// rq0_H3_QualityIn_0.95 TrustSet (818F48A50DDD, network tesSUCCESS).
+#[test]
+fn c26b_rq0_h3_qualityin_0_95_testnet_21249321() {
+    run_bundle(include_str!("vectors/c26b_rq0_h3_qualityin_0_95_testnet_21249321.json"));
+}
+
+/// rq0_H2_QualityOut_1.05 TrustSet (4129FDA9EFA6, network tesSUCCESS).
+#[test]
+fn c26b_rq0_h2_qualityout_1_05_testnet_21249323() {
+    run_bundle(include_str!("vectors/c26b_rq0_h2_qualityout_1_05_testnet_21249323.json"));
+}
+
+/// rq1_H2->H3_123.4567890123456_(QOut_1.05,_rate,_Q Payment (C7E966379F38, network tesSUCCESS).
+#[test]
+fn c26b_rq1_h2_h3_123_4567890123456_qout_1_05_rate_q_testnet_21249325() {
+    run_bundle(include_str!("vectors/c26b_rq1_h2_h3_123_4567890123456_qout_1_05_rate_q_testnet_21249325.json"));
+}
+
+/// rq2_G1->H3_direct_7.777777777777777_(QIn_0.95) Payment (98910B4C79B0, network tecPATH_PARTIAL).
+#[test]
+fn c26b_rq2_g1_h3_direct_7_777777777777777_qin_0_95_testnet_21249327() {
+    run_bundle(include_str!("vectors/c26b_rq2_g1_h3_direct_7_777777777777777_qin_0_95_testnet_21249327.json"));
+}
+
+/// rq3_H3->H1_partial_SendMax_0.1111111111111111 Payment (F27F83132A74, network tesSUCCESS).
+#[test]
+fn c26b_rq3_h3_h1_partial_sendmax_0_1111111111111111_testnet_21249329() {
+    run_bundle(include_str!("vectors/c26b_rq3_h3_h1_partial_sendmax_0_1111111111111111_testnet_21249329.json"));
+}
+
+/// rq4_H2->G1_redeem_3.141592653589793_(QOut_1.05) Payment (AAF832BE9910, network tesSUCCESS).
+#[test]
+fn c26b_rq4_h2_g1_redeem_3_141592653589793_qout_1_05_testnet_21249331() {
+    run_bundle(include_str!("vectors/c26b_rq4_h2_g1_redeem_3_141592653589793_qout_1_05_testnet_21249331.json"));
+}
+
+/// re1_H1_escrows_1234.567890123456_RND_to_H2 EscrowCreate (1E4EED19D02A, network tesSUCCESS).
+#[test]
+fn c26b_re1_h1_escrows_1234_567890123456_rnd_to_h2_testnet_21249333() {
+    run_bundle(include_str!("vectors/c26b_re1_h1_escrows_1234_567890123456_rnd_to_h2_testnet_21249333.json"));
+}
+
+/// re2_H1_escrows_0.9999999999999999_RND_to_H2 EscrowCreate (3C2A95ED22BC, network tesSUCCESS).
+#[test]
+fn c26b_re2_h1_escrows_0_9999999999999999_rnd_to_h2_testnet_21249335() {
+    run_bundle(include_str!("vectors/c26b_re2_h1_escrows_0_9999999999999999_rnd_to_h2_testnet_21249335.json"));
+}
+
+/// re3_H1_escrows_777.7777777777777_RND_to_H2 EscrowCreate (03A1CFD1F79F, network tesSUCCESS).
+#[test]
+fn c26b_re3_h1_escrows_777_7777777777777_rnd_to_h2_testnet_21249337() {
+    run_bundle(include_str!("vectors/c26b_re3_h1_escrows_777_7777777777777_rnd_to_h2_testnet_21249337.json"));
+}
+
+/// re4_H2_finishes__1_(rate_1.001234567_locked) EscrowFinish (44C730E987B9, network tesSUCCESS).
+#[test]
+fn c26b_re4_h2_finishes_1_rate_1_001234567_locked_testnet_21249341() {
+    run_bundle(include_str!("vectors/c26b_re4_h2_finishes_1_rate_1_001234567_locked_testnet_21249341.json"));
+}
+
+/// re5_H1_(owner)_finishes__2_0.9999999999999999 EscrowFinish (8914F8B79F1D, network tesSUCCESS).
+#[test]
+fn c26b_re5_h1_owner_finishes_2_0_9999999999999999_testnet_21249343() {
+    run_bundle(include_str!("vectors/c26b_re5_h1_owner_finishes_2_0_9999999999999999_testnet_21249343.json"));
+}
+
+/// re6_G1_lowers_TransferRate_to_1.000000001 AccountSet (F18729BD9412, network tesSUCCESS).
+#[test]
+fn c26b_re6_g1_lowers_transferrate_to_1_000000001_testnet_21249345() {
+    run_bundle(include_str!("vectors/c26b_re6_g1_lowers_transferrate_to_1_000000001_testnet_21249345.json"));
+}
+
+/// re7_H2_finishes__3_at_the_lower_rate EscrowFinish (E19A9741B551, network tesSUCCESS).
+#[test]
+fn c26b_re7_h2_finishes_3_at_the_lower_rate_testnet_21249347() {
+    run_bundle(include_str!("vectors/c26b_re7_h2_finishes_3_at_the_lower_rate_testnet_21249347.json"));
+}
+
+/// re8_G1_restores_TransferRate AccountSet (42AC000BA814, network tesSUCCESS).
+#[test]
+fn c26b_re8_g1_restores_transferrate_testnet_21249349() {
+    run_bundle(include_str!("vectors/c26b_re8_g1_restores_transferrate_testnet_21249349.json"));
+}
+
+/// rw5_claw_1e16_(more_than_held)_->_all Clawback (9CA7756882AE, network tesSUCCESS).
+#[test]
+fn c26b_rw5_claw_1e16_more_than_held_all_testnet_21249378() {
+    run_bundle(include_str!("vectors/c26b_rw5_claw_1e16_more_than_held_all_testnet_21249378.json"));
+}
+
+/// rw6_claw_0.0000000005_remainder_exactly Clawback (14368FE1F21D, network tesSUCCESS).
+#[test]
+fn c26b_rw6_claw_0_0000000005_remainder_exactly_testnet_21249380() {
+    run_bundle(include_str!("vectors/c26b_rw6_claw_0_0000000005_remainder_exactly_testnet_21249380.json"));
+}
+
+/// ofc1_ticketOffer+cancel_own_offer_at_R(oc-1-canc OfferCreate (98FFA83B5062, network tecINSUF_RESERVE_OFFER).
+#[test]
+fn c26b_ofc1_ticketoffer_cancel_own_offer_at_r_oc_1_canc_testnet_21249392() {
+    run_bundle(include_str!("vectors/c26b_ofc1_ticketoffer_cancel_own_offer_at_r_oc_1_canc_testnet_21249392.json"));
+}
+
+/// ofc2_ticketOffer+cancel_own_offer_at_R(oc-1-canc OfferCreate (74DF2C4739AB, network tesSUCCESS).
+#[test]
+fn c26b_ofc2_ticketoffer_cancel_own_offer_at_r_oc_1_canc_testnet_21249396() {
+    run_bundle(include_str!("vectors/c26b_ofc2_ticketoffer_cancel_own_offer_at_r_oc_1_canc_testnet_21249396.json"));
+}
+
+/// pd1_ticketPermissionedDomainSet_at_R(oc)+fee-1 PermissionedDomainSet (F81E6E7A85D3, network tecINSUFFICIENT_RESERVE).
+#[test]
+fn c26b_pd1_ticketpermissioneddomainset_at_r_oc_fee_1_testnet_21249405() {
+    run_bundle(include_str!("vectors/c26b_pd1_ticketpermissioneddomainset_at_r_oc_fee_1_testnet_21249405.json"));
+}
+
+/// pd2_ticketPermissionedDomainSet_at_R(oc)+fee_exa PermissionedDomainSet (F5FE6DACAD23, network tesSUCCESS).
+#[test]
+fn c26b_pd2_ticketpermissioneddomainset_at_r_oc_fee_exa_testnet_21249410() {
+    run_bundle(include_str!("vectors/c26b_pd2_ticketpermissioneddomainset_at_r_oc_fee_exa_testnet_21249410.json"));
+}
+
+/// nb1_ticketAccept_liquid(price)_counts_ticket:_R( NFTokenAcceptOffer (7189A19DEAE7, network tecINSUFFICIENT_FUNDS).
+#[test]
+fn c26b_nb1_ticketaccept_liquid_price_counts_ticket_r_testnet_21249422() {
+    run_bundle(include_str!("vectors/c26b_nb1_ticketaccept_liquid_price_counts_ticket_r_testnet_21249422.json"));
+}
+
+/// nb2_ticketAccept_newpage_post-fee-post-price_at_ NFTokenAcceptOffer (0E37F468C776, network tesSUCCESS).
+#[test]
+fn c26b_nb2_ticketaccept_newpage_post_fee_post_price_at_testnet_21249426() {
+    run_bundle(include_str!("vectors/c26b_nb2_ticketaccept_newpage_post_fee_post_price_at_testnet_21249426.json"));
+}

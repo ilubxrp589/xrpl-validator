@@ -1035,6 +1035,26 @@ pub(crate) fn amm_asset_out(
 }
 
 pub(crate) fn lp_tokens_in(balance: Me, withdraw: Me, total_lp: Me, tfee: u16) -> Option<Me> {
+    let frac = lp_tokens_in_frac(balance, withdraw, total_lp, tfee)?;
+    if frac.0 == 0 {
+        return None;
+    }
+    Some(n_mul(total_lp, frac, Rnd::Up))
+}
+
+/// `lpTokensIn` as rippled returns it: a withdrawal too small for the
+/// fraction to register is ZERO tokens, which `singleWithdraw` then refuses
+/// (finding 414: 1e-15 USD from a 63950-LP pool is tecAMM_INVALID_TOKENS),
+/// not "no answer".
+pub(crate) fn lp_tokens_in_or_zero(balance: Me, withdraw: Me, total_lp: Me, tfee: u16) -> Option<Me> {
+    let frac = lp_tokens_in_frac(balance, withdraw, total_lp, tfee)?;
+    if frac.0 == 0 {
+        return Some((0, 0));
+    }
+    Some(n_mul(total_lp, frac, Rnd::Up))
+}
+
+fn lp_tokens_in_frac(balance: Me, withdraw: Me, total_lp: Me, tfee: u16) -> Option<Me> {
     if balance.0 == 0 || total_lp.0 == 0 || withdraw.0 == 0 {
         return None;
     }
@@ -1046,11 +1066,7 @@ pub(crate) fn lp_tokens_in(balance: Me, withdraw: Me, total_lp: Me, tfee: u16) -
     if n_cmp(c2, four_fr) == Ordering::Less {
         return None;
     }
-    let frac = n_div(n_sub(c, n_sqrt(n_sub(c2, four_fr, Rnd::Near)), Rnd::Near), N_TWO, Rnd::Near);
-    if frac.0 == 0 {
-        return None;
-    }
-    Some(n_mul(total_lp, frac, Rnd::Up))
+    Some(n_div(n_sub(c, n_sqrt(n_sub(c2, four_fr, Rnd::Near)), Rnd::Near), N_TWO, Rnd::Near))
 }
 
 /// `changeSpotPriceQuality` — the generated offer, or None when it cannot

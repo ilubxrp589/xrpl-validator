@@ -333,7 +333,14 @@ impl Transactor for TrustSetTransactor {
         // Owner reserve required to gain a trust line. rippled SetTrust:
         // reserve is NOT enforced until the account owns >= 2 objects — the
         // gateway-funding carve-out — otherwise accountReserve(ownerCount + 1).
-        let oc = acct["OwnerCount"].as_u64().unwrap_or(0);
+        // Finding 415 — rippled reads ownerCount in doApply (TrustSet.cpp:330),
+        // after consumeSeqProxy has deleted a spending Ticket; we judge here in
+        // preclaim, so the spent ticket comes off first (the F402/F404 class).
+        // Testnet campaign 26 B ts1/ts3/ts5/ts8: OC 2 → 1 is the free tier
+        // (tes at 1.2 XRP), OC 3 needs reserve(3) not reserve(4) — the network
+        // creates the line where we answered tecNO_LINE_INSUF_RESERVE /
+        // tecINSUF_RESERVE_LINE.
+        let oc = acct["OwnerCount"].as_u64().unwrap_or(0).saturating_sub(u64::from(tx.uses_ticket()));
         let reserve_create = if oc < 2 {
             0
         } else {

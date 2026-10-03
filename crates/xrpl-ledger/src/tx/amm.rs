@@ -2525,7 +2525,7 @@ impl Transactor for AMMWithdrawTransactor {
                 //
                 // tfWithdrawAll skips the adjustment (`isWithdrawAll`), and it
                 // returns earlier, so this path never sees it.
-                let t0 = crate::tx::amm_swap::lp_tokens_in(balance, withdraw, total_lp, tfee)?;
+                let t0 = crate::tx::amm_swap::lp_tokens_in_or_zero(balance, withdraw, total_lp, tfee)?;
                 let t0 = crate::tx::amm_swap::adjust_lp_tokens(total_lp, t0, false);
                 // Finding 414 — tokens that adjust to zero are singleWithdraw's
                 // refusal (AMMWithdraw.cpp:1104-1111, and :1115-1116 for the
