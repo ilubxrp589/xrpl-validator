@@ -4226,16 +4226,18 @@ mod tests {
         };
 
         // Broke depositor, no LPTokens: 1 XRP <= accountReserve(1) = 1.2 XRP → fail.
+        // The gate is preclaim's (finding 412), judged on the pre-fee balance.
         let broke = [0x03u8; 20];
         put_acct(&mut sandbox, &broke, "1000000");
         assert_eq!(
-            AMMDepositTransactor.do_apply(&deposit(broke), &mut sandbox),
+            AMMDepositTransactor.preclaim(&deposit(broke), &sandbox),
             TxResult::InsufReserveLine
         );
 
         // Funded depositor, no LPTokens: well above reserve → deposit proceeds.
         let rich = [0x04u8; 20];
         put_acct(&mut sandbox, &rich, "100000000");
+        assert_eq!(AMMDepositTransactor.preclaim(&deposit(rich), &sandbox), TxResult::Success);
         assert_eq!(
             AMMDepositTransactor.do_apply(&deposit(rich), &mut sandbox),
             TxResult::Success
