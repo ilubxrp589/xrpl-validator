@@ -10,7 +10,12 @@
 //! rounding on long-mantissa IOU balances (CheckCash DeliverMin, partial payments, SendMax at the gross,
 //! clawback remainders, NFT royalties with transfer rates, full trust lines, QualityIn/Out, IOU escrows).
 //! Findings 415 (TrustSet) and 416 (EscrowCreate): doApply's reserve counts OwnerCount after the spending
-//! Ticket is gone; we judge in preclaim and charged the ticket. Testnet runs mainnet's rules (no testnet-only amendments; 16-digit Number). Same harness
+//! Ticket is gone; we judge in preclaim and charged the ticket. Agent C: book quality levels spanning
+//! pages (32/32/16, 64, 65, 80 offers) crossed so pages empty, the root relinks and the next crossing
+//! starts from the relinked chain (F411's shape and its relatives), middle pages emptied by cancels,
+//! AccountDelete, freezes, deep freeze and unfunding; expired and self-owned offers inside a level;
+//! auto-bridged crossings over many flow passes; one pool beside a deep level — 358 of 358 byte-exact,
+//! no finding. Testnet runs mainnet's rules (no testnet-only amendments; 16-digit Number). Same harness
 //! as campaign16_vector.rs.
 use serde_json::Value;
 use xrpl_core::types::Hash256;
@@ -1294,4 +1299,352 @@ fn c26b_nb1_ticketaccept_liquid_price_counts_ticket_r_testnet_21249422() {
 #[test]
 fn c26b_nb2_ticketaccept_newpage_post_fee_post_price_at_testnet_21249426() {
     run_bundle(include_str!("vectors/c26b_nb2_ticketaccept_newpage_post_fee_post_price_at_testnet_21249426.json"));
+}
+
+/// p1.x1.plain_buy32_empties_page0_exactly OfferCreate (855E7EF0A002, network tesSUCCESS).
+#[test]
+fn c26c_p1_x1_plain_buy32_empties_page0_exactly_testnet_21248717() {
+    run_bundle(include_str!("vectors/c26c_p1_x1_plain_buy32_empties_page0_exactly_testnet_21248717.json"));
+}
+
+/// p1.x2.ioc_buy1_walks_empty_root_into_page1 OfferCreate (6843BC725880, network tesSUCCESS).
+#[test]
+fn c26c_p1_x2_ioc_buy1_walks_empty_root_into_page1_testnet_21248719() {
+    run_bundle(include_str!("vectors/c26c_p1_x2_ioc_buy1_walks_empty_root_into_page1_testnet_21248719.json"));
+}
+
+/// p1.x3.sell_ioc_36_empties_page1_relinks_root_into_page2 OfferCreate (E4E5BC3A1EAB, network tesSUCCESS).
+#[test]
+fn c26c_p1_x3_sell_ioc_36_empties_page1_relinks_root_into_page2_testnet_21248721() {
+    run_bundle(include_str!("vectors/c26c_p1_x3_sell_ioc_36_empties_page1_relinks_root_into_page2_testnet_21248721.json"));
+}
+
+/// p1.x4.fok_buy20_finishes_A100_then_A101 OfferCreate (E4C300B808E5, network tesSUCCESS).
+#[test]
+fn c26c_p1_x4_fok_buy20_finishes_a100_then_a101_testnet_21248723() {
+    run_bundle(include_str!("vectors/c26c_p1_x4_fok_buy20_finishes_a100_then_a101_testnet_21248723.json"));
+}
+
+/// p1.x5.fok_buy30_killed_24_left OfferCreate (F07F4345667B, network tecKILLED).
+#[test]
+fn c26c_p1_x5_fok_buy30_killed_24_left_testnet_21248725() {
+    run_bundle(include_str!("vectors/c26c_p1_x5_fok_buy30_killed_24_left_testnet_21248725.json"));
+}
+
+/// p1.x6.passive_at_equal_quality_rests OfferCreate (23EA6EBF370A, network tesSUCCESS).
+#[test]
+fn c26c_p1_x6_passive_at_equal_quality_rests_testnet_21248727() {
+    run_bundle(include_str!("vectors/c26c_p1_x6_passive_at_equal_quality_rests_testnet_21248727.json"));
+}
+
+/// p1.x7.passive_better_limit_crosses_A101 OfferCreate (A3C2136F249E, network tesSUCCESS).
+#[test]
+fn c26c_p1_x7_passive_better_limit_crosses_a101_testnet_21248731() {
+    run_bundle(include_str!("vectors/c26c_p1_x7_passive_better_limit_crosses_a101_testnet_21248731.json"));
+}
+
+/// p1.x8.F411_replica_sell_ioc_70_pages0and1_into_page2 OfferCreate (9E3E8D066CD6, network tesSUCCESS).
+#[test]
+fn c26c_p1_x8_f411_replica_sell_ioc_70_pages0and1_into_page2_testnet_21248755() {
+    run_bundle(include_str!("vectors/c26c_p1_x8_f411_replica_sell_ioc_70_pages0and1_into_page2_testnet_21248755.json"));
+}
+
+/// p1.x9.ioc_buy5_crosses_relinked_state OfferCreate (967345615AD4, network tesSUCCESS).
+#[test]
+fn c26c_p1_x9_ioc_buy5_crosses_relinked_state_testnet_21248757() {
+    run_bundle(include_str!("vectors/c26c_p1_x9_ioc_buy5_crosses_relinked_state_testnet_21248757.json"));
+}
+
+/// p1.x10.payment_xrp_to_usd_deletes_A100_midpath Payment (EE80C8829290, network tesSUCCESS).
+#[test]
+fn c26c_p1_x10_payment_xrp_to_usd_deletes_a100_midpath_testnet_21248759() {
+    run_bundle(include_str!("vectors/c26c_p1_x10_payment_xrp_to_usd_deletes_a100_midpath_testnet_21248759.json"));
+}
+
+/// p2.x1.sell_exactly64_empties_pages0and1_root_kept_relinked_to_page2 OfferCreate (33270FC4451A, network tesSUCCESS).
+#[test]
+fn c26c_p2_x1_sell_exactly64_empties_pages0and1_root_kept_relinked_to_page2_testnet_21248798() {
+    run_bundle(include_str!("vectors/c26c_p2_x1_sell_exactly64_empties_pages0and1_root_kept_relinked_to_page2_testnet_21248798.json"));
+}
+
+/// p2.x2.ioc_buy3_empty_root_to_page2 OfferCreate (AF29B659AF37, network tesSUCCESS).
+#[test]
+fn c26c_p2_x2_ioc_buy3_empty_root_to_page2_testnet_21248805() {
+    run_bundle(include_str!("vectors/c26c_p2_x2_ioc_buy3_empty_root_to_page2_testnet_21248805.json"));
+}
+
+/// p2.x3.plain_buy67_deletes_A098_and_A099_whole OfferCreate (20B9558CB510, network tesSUCCESS).
+#[test]
+fn c26c_p2_x3_plain_buy67_deletes_a098_and_a099_whole_testnet_21248807() {
+    run_bundle(include_str!("vectors/c26c_p2_x3_plain_buy67_deletes_a098_and_a099_whole_testnet_21248807.json"));
+}
+
+/// p2.x4.cancel_the_33rd_deletes_page1_zeroes_root_links OfferCancel (8DD7934529B2, network tesSUCCESS).
+#[test]
+fn c26c_p2_x4_cancel_the_33rd_deletes_page1_zeroes_root_links_testnet_21248820() {
+    run_bundle(include_str!("vectors/c26c_p2_x4_cancel_the_33rd_deletes_page1_zeroes_root_links_testnet_21248820.json"));
+}
+
+/// p2.x5.fok_buy34_killed_33_at_level OfferCreate (EF4B9D96F624, network tecKILLED).
+#[test]
+fn c26c_p2_x5_fok_buy34_killed_33_at_level_testnet_21248826() {
+    run_bundle(include_str!("vectors/c26c_p2_x5_fok_buy34_killed_33_at_level_testnet_21248826.json"));
+}
+
+/// p2.x6.ioc_buy33_deletes_both_pages OfferCreate (1E4D20E81A9D, network tesSUCCESS).
+#[test]
+fn c26c_p2_x6_ioc_buy33_deletes_both_pages_testnet_21248828() {
+    run_bundle(include_str!("vectors/c26c_p2_x6_ioc_buy33_deletes_both_pages_testnet_21248828.json"));
+}
+
+/// p3.x1.payment_xrp_usd_35_page0_then_relinked_page2 Payment (B26ED60414FA, network tesSUCCESS).
+#[test]
+fn c26c_p3_x1_payment_xrp_usd_35_page0_then_relinked_page2_testnet_21248859() {
+    run_bundle(include_str!("vectors/c26c_p3_x1_payment_xrp_usd_35_page0_then_relinked_page2_testnet_21248859.json"));
+}
+
+/// p3.x2.cancel_one_in_middle_of_last_page OfferCancel (0BB79FD461D3, network tesSUCCESS).
+#[test]
+fn c26c_p3_x2_cancel_one_in_middle_of_last_page_testnet_21248861() {
+    run_bundle(include_str!("vectors/c26c_p3_x2_cancel_one_in_middle_of_last_page_testnet_21248861.json"));
+}
+
+/// p3.x3.partial_limitquality_payment_takes_rest_delivermin Payment (1A7149FF9614, network tesSUCCESS).
+#[test]
+fn c26c_p3_x3_partial_limitquality_payment_takes_rest_delivermin_testnet_21248863() {
+    run_bundle(include_str!("vectors/c26c_p3_x3_partial_limitquality_payment_takes_rest_delivermin_testnet_21248863.json"));
+}
+
+/// p4.f.accountdelete_mx_deletes_middle_page_of_B140 AccountDelete (CEC5847F847E, network tesSUCCESS).
+#[test]
+fn c26c_p4_f_accountdelete_mx_deletes_middle_page_of_b140_testnet_21248865() {
+    run_bundle(include_str!("vectors/c26c_p4_f_accountdelete_mx_deletes_middle_page_of_b140_testnet_21248865.json"));
+}
+
+/// p4.f.x.sell_usd_40_crosses_B140_root_then_relinked_page2 OfferCreate (6A560AB792DE, network tesSUCCESS).
+#[test]
+fn c26c_p4_f_x_sell_usd_40_crosses_b140_root_then_relinked_page2_testnet_21248868() {
+    run_bundle(include_str!("vectors/c26c_p4_f_x_sell_usd_40_crosses_b140_root_then_relinked_page2_testnet_21248868.json"));
+}
+
+/// p4.a.x.ioc_buy40_frozen_middle_page_reaped OfferCreate (48380F1CA885, network tesSUCCESS).
+#[test]
+fn c26c_p4_a_x_ioc_buy40_frozen_middle_page_reaped_testnet_21248894() {
+    run_bundle(include_str!("vectors/c26c_p4_a_x_ioc_buy40_frozen_middle_page_reaped_testnet_21248894.json"));
+}
+
+/// p4.b.x.payment_xrp_usd_40_through_unfunded_page1 Payment (48B5CB2630D0, network tesSUCCESS).
+#[test]
+fn c26c_p4_b_x_payment_xrp_usd_40_through_unfunded_page1_testnet_21248923() {
+    run_bundle(include_str!("vectors/c26c_p4_b_x_payment_xrp_usd_40_through_unfunded_page1_testnet_21248923.json"));
+}
+
+/// p4.c.x.sell_fok_40_through_no_line_page1 OfferCreate (5E2288E4DB01, network tesSUCCESS).
+#[test]
+fn c26c_p4_c_x_sell_fok_40_through_no_line_page1_testnet_21248953() {
+    run_bundle(include_str!("vectors/c26c_p4_c_x_sell_fok_40_through_no_line_page1_testnet_21248953.json"));
+}
+
+/// p4.d.x.sell_usd_40_through_deepfrozen_page1 OfferCreate (C3387367EC99, network tesSUCCESS).
+#[test]
+fn c26c_p4_d_x_sell_usd_40_through_deepfrozen_page1_testnet_21248984() {
+    run_bundle(include_str!("vectors/c26c_p4_d_x_sell_usd_40_through_deepfrozen_page1_testnet_21248984.json"));
+}
+
+/// p4.e.x.sell_usd_through_reserve_bound_xrp_maker_line_created OfferCreate (51953186B7A7, network tesSUCCESS).
+#[test]
+fn c26c_p4_e_x_sell_usd_through_reserve_bound_xrp_maker_line_created_testnet_21249011() {
+    run_bundle(include_str!("vectors/c26c_p4_e_x_sell_usd_through_reserve_bound_xrp_maker_line_created_testnet_21249011.json"));
+}
+
+/// p5.x1.sell_across_three_multipage_levels_expired_and_own_offers OfferCreate (2E20461BAEEA, network tesSUCCESS).
+#[test]
+fn c26c_p5_x1_sell_across_three_multipage_levels_expired_and_own_offers_testnet_21249058() {
+    run_bundle(include_str!("vectors/c26c_p5_x1_sell_across_three_multipage_levels_expired_and_own_offers_testnet_21249058.json"));
+}
+
+/// p5.x2.passive_ioc_buy_at_A091_equal_quality_crosses_nothing OfferCreate (0B7A2A357956, network tecKILLED).
+#[test]
+fn c26c_p5_x2_passive_ioc_buy_at_a091_equal_quality_crosses_nothing_testnet_21249060() {
+    run_bundle(include_str!("vectors/c26c_p5_x2_passive_ioc_buy_at_a091_equal_quality_crosses_nothing_testnet_21249060.json"));
+}
+
+/// p5.x3.passive_ioc_buy_strictly_better_crosses_A091 OfferCreate (AF938B4A4D20, network tesSUCCESS).
+#[test]
+fn c26c_p5_x3_passive_ioc_buy_strictly_better_crosses_a091_testnet_21249062() {
+    run_bundle(include_str!("vectors/c26c_p5_x3_passive_ioc_buy_strictly_better_crosses_a091_testnet_21249062.json"));
+}
+
+/// p6.x1.autobridged_sell_usd_for_eur_bridge_then_direct_pages0_1_into_2 OfferCreate (6AEBBDBFCC68, network tesSUCCESS).
+#[test]
+fn c26c_p6_x1_autobridged_sell_usd_for_eur_bridge_then_direct_pages0_1_into_2_testnet_21249107() {
+    run_bundle(include_str!("vectors/c26c_p6_x1_autobridged_sell_usd_for_eur_bridge_then_direct_pages0_1_into_2_testnet_21249107.json"));
+}
+
+/// p6.x2.payment_usd_eur_xrp_path_partial_delivermin Payment (88DF3D48A9B1, network tesSUCCESS).
+#[test]
+fn c26c_p6_x2_payment_usd_eur_xrp_path_partial_delivermin_testnet_21249109() {
+    run_bundle(include_str!("vectors/c26c_p6_x2_payment_usd_eur_xrp_path_partial_delivermin_testnet_21249109.json"));
+}
+
+/// p6.x3.payment_partial_below_delivermin Payment (D6A14738BF0A, network tecPATH_PARTIAL).
+#[test]
+fn c26c_p6_x3_payment_partial_below_delivermin_testnet_21249123() {
+    run_bundle(include_str!("vectors/c26c_p6_x3_payment_partial_below_delivermin_testnet_21249123.json"));
+}
+
+/// p6.x4.payment_exact_33_deletes_both_pages Payment (F32348D4351C, network tesSUCCESS).
+#[test]
+fn c26c_p6_x4_payment_exact_33_deletes_both_pages_testnet_21249125() {
+    run_bundle(include_str!("vectors/c26c_p6_x4_payment_exact_33_deletes_both_pages_testnet_21249125.json"));
+}
+
+/// p7.x1.ioc_buy30_limit_at_book_quality_pool_beside_book OfferCreate (7121B69E6187, network tesSUCCESS).
+#[test]
+fn c26c_p7_x1_ioc_buy30_limit_at_book_quality_pool_beside_book_testnet_21249146() {
+    run_bundle(include_str!("vectors/c26c_p7_x1_ioc_buy30_limit_at_book_quality_pool_beside_book_testnet_21249146.json"));
+}
+
+/// p7.x2.sell_ioc_at_book_quality_pool_beside_book OfferCreate (B731139CB7BC, network tecKILLED).
+#[test]
+fn c26c_p7_x2_sell_ioc_at_book_quality_pool_beside_book_testnet_21249148() {
+    run_bundle(include_str!("vectors/c26c_p7_x2_sell_ioc_at_book_quality_pool_beside_book_testnet_21249148.json"));
+}
+
+/// p7.x3.payment_xrp_usd_through_pool_and_book Payment (E20023102251, network tecPATH_PARTIAL).
+#[test]
+fn c26c_p7_x3_payment_xrp_usd_through_pool_and_book_testnet_21249150() {
+    run_bundle(include_str!("vectors/c26c_p7_x3_payment_xrp_usd_through_pool_and_book_testnet_21249150.json"));
+}
+
+/// p8.x1.ioc_buy_killed_reaps_frozen_and_expired_across_pages OfferCreate (58D7280FF123, network tecKILLED).
+#[test]
+fn c26c_p8_x1_ioc_buy_killed_reaps_frozen_and_expired_across_pages_testnet_21249179() {
+    run_bundle(include_str!("vectors/c26c_p8_x1_ioc_buy_killed_reaps_frozen_and_expired_across_pages_testnet_21249179.json"));
+}
+
+/// p8.x2.ioc_buy3_funded_crosses_root_then_relinked_page OfferCreate (EC0573B0114D, network tesSUCCESS).
+#[test]
+fn c26c_p8_x2_ioc_buy3_funded_crosses_root_then_relinked_page_testnet_21249181() {
+    run_bundle(include_str!("vectors/c26c_p8_x2_ioc_buy3_funded_crosses_root_then_relinked_page_testnet_21249181.json"));
+}
+
+/// p7b.x1.ioc_buy30_limit_at_book_quality_pool_beside_book OfferCreate (8E1741A00A9E, network tesSUCCESS).
+#[test]
+fn c26c_p7b_x1_ioc_buy30_limit_at_book_quality_pool_beside_book_testnet_21249238() {
+    run_bundle(include_str!("vectors/c26c_p7b_x1_ioc_buy30_limit_at_book_quality_pool_beside_book_testnet_21249238.json"));
+}
+
+/// p7b.x2.sell_ioc_at_book_quality_pool_tied_with_tip OfferCreate (43B08C5F0F40, network tesSUCCESS).
+#[test]
+fn c26c_p7b_x2_sell_ioc_at_book_quality_pool_tied_with_tip_testnet_21249240() {
+    run_bundle(include_str!("vectors/c26c_p7b_x2_sell_ioc_at_book_quality_pool_tied_with_tip_testnet_21249240.json"));
+}
+
+/// p7b.x3.payment_xrp_usd_through_pool_and_book Payment (84A7C262D0DB, network tesSUCCESS).
+#[test]
+fn c26c_p7b_x3_payment_xrp_usd_through_pool_and_book_testnet_21249242() {
+    run_bundle(include_str!("vectors/c26c_p7b_x3_payment_xrp_usd_through_pool_and_book_testnet_21249242.json"));
+}
+
+/// p7b.x4.payment_partial_limitquality_at_book_quality Payment (0C55E6170537, network tesSUCCESS).
+#[test]
+fn c26c_p7b_x4_payment_partial_limitquality_at_book_quality_testnet_21249244() {
+    run_bundle(include_str!("vectors/c26c_p7b_x4_payment_partial_limitquality_at_book_quality_testnet_21249244.json"));
+}
+
+/// p9.a.x.ioc_buy64_root_then_page1_with_explicit_zero_next OfferCreate (7D151251A643, network tesSUCCESS).
+#[test]
+fn c26c_p9_a_x_ioc_buy64_root_then_page1_with_explicit_zero_next_testnet_21249268() {
+    run_bundle(include_str!("vectors/c26c_p9_a_x_ioc_buy64_root_then_page1_with_explicit_zero_next_testnet_21249268.json"));
+}
+
+/// p9.b.x.ioc_buy98_crosses_C096_and_C0965_whole OfferCreate (2F4F040E6DC8, network tesSUCCESS).
+#[test]
+fn c26c_p9_b_x_ioc_buy98_crosses_c096_and_c0965_whole_testnet_21249304() {
+    run_bundle(include_str!("vectors/c26c_p9_b_x_ioc_buy98_crosses_c096_and_c0965_whole_testnet_21249304.json"));
+}
+
+/// p9.c.x.ioc_buy3_reaps_unfunded_root_and_page1_crosses_page2 OfferCreate (79F212FEB983, network tesSUCCESS).
+#[test]
+fn c26c_p9_c_x_ioc_buy3_reaps_unfunded_root_and_page1_crosses_page2_testnet_21249330() {
+    run_bundle(include_str!("vectors/c26c_p9_c_x_ioc_buy3_reaps_unfunded_root_and_page1_crosses_page2_testnet_21249330.json"));
+}
+
+/// p9.d.x.sell_fok_xrp_for_eur_70_pages0and1_into_page2 OfferCreate (2EE2CFE5580A, network tesSUCCESS).
+#[test]
+fn c26c_p9_d_x_sell_fok_xrp_for_eur_70_pages0and1_into_page2_testnet_21249357() {
+    run_bundle(include_str!("vectors/c26c_p9_d_x_sell_fok_xrp_for_eur_70_pages0and1_into_page2_testnet_21249357.json"));
+}
+
+/// p9.d.x2.payment_xrp_eur_4_on_relinked_state Payment (F5DC9A610C0E, network tesSUCCESS).
+#[test]
+fn c26c_p9_d_x2_payment_xrp_eur_4_on_relinked_state_testnet_21249359() {
+    run_bundle(include_str!("vectors/c26c_p9_d_x2_payment_xrp_eur_4_on_relinked_state_testnet_21249359.json"));
+}
+
+/// p10.a.x.F411_shape_sell_ioc_pages0and1_relinked_unfunded_page2 OfferCreate (F8C4956A89A8, network tecKILLED).
+#[test]
+fn c26c_p10_a_x_f411_shape_sell_ioc_pages0and1_relinked_unfunded_page2_testnet_21249501() {
+    run_bundle(include_str!("vectors/c26c_p10_a_x_f411_shape_sell_ioc_pages0and1_relinked_unfunded_page2_testnet_21249501.json"));
+}
+
+/// p10.b.x.ioc_buy38_dust_funded_offer_at_page_boundary OfferCreate (7ED482125FD5, network tesSUCCESS).
+#[test]
+fn c26c_p10_b_x_ioc_buy38_dust_funded_offer_at_page_boundary_testnet_21249524() {
+    run_bundle(include_str!("vectors/c26c_p10_b_x_ioc_buy38_dust_funded_offer_at_page_boundary_testnet_21249524.json"));
+}
+
+/// p10.b.x2.sell_ioc_finishes_C093 OfferCreate (2FFCAD60A143, network tesSUCCESS).
+#[test]
+fn c26c_p10_b_x2_sell_ioc_finishes_c093_testnet_21249526() {
+    run_bundle(include_str!("vectors/c26c_p10_b_x2_sell_ioc_finishes_c093_testnet_21249526.json"));
+}
+
+/// p10c.x.F411_shape_sell_ioc_90usd_pool_and_pages0_1_relinked_unfunded_page2 OfferCreate (2B09015DF49C, network tesSUCCESS).
+#[test]
+fn c26c_p10c_x_f411_shape_sell_ioc_90usd_pool_and_pages0_1_relinked_unfunded_pag_testnet_21249576() {
+    run_bundle(include_str!("vectors/c26c_p10c_x_f411_shape_sell_ioc_90usd_pool_and_pages0_1_relinked_unfunded_pag_testnet_21249576.json"));
+}
+
+/// p11.a.x1.ioc_buy32_empties_root OfferCreate (4325F32A3632, network tesSUCCESS).
+#[test]
+fn c26c_p11_a_x1_ioc_buy32_empties_root_testnet_21250263() {
+    run_bundle(include_str!("vectors/c26c_p11_a_x1_ioc_buy32_empties_root_testnet_21250263.json"));
+}
+
+/// p11.a.x2.fok_buy33_page1_and_new_page2_behind_empty_root OfferCreate (5CED2B19A59D, network tesSUCCESS).
+#[test]
+fn c26c_p11_a_x2_fok_buy33_page1_and_new_page2_behind_empty_root_testnet_21250269() {
+    run_bundle(include_str!("vectors/c26c_p11_a_x2_fok_buy33_page1_and_new_page2_behind_empty_root_testnet_21250269.json"));
+}
+
+/// p11.b.x.sell_eur_ioc_40_through_one_drop_funded_maker OfferCreate (362432293C46, network tesSUCCESS).
+#[test]
+fn c26c_p11_b_x_sell_eur_ioc_40_through_one_drop_funded_maker_testnet_21250288() {
+    run_bundle(include_str!("vectors/c26c_p11_b_x_sell_eur_ioc_40_through_one_drop_funded_maker_testnet_21250288.json"));
+}
+
+/// p11.c.x.ioc_buy36_transfer_fee_funds_exactly_3_of_4 OfferCreate (65BAE35A1709, network tesSUCCESS).
+#[test]
+fn c26c_p11_c_x_ioc_buy36_transfer_fee_funds_exactly_3_of_4_testnet_21250311() {
+    run_bundle(include_str!("vectors/c26c_p11_c_x_ioc_buy36_transfer_fee_funds_exactly_3_of_4_testnet_21250311.json"));
+}
+
+/// p11.d.x.sell_ioc_through_issuer_offers_middle_page OfferCreate (AAE2D71FEA58, network tesSUCCESS).
+#[test]
+fn c26c_p11_d_x_sell_ioc_through_issuer_offers_middle_page_testnet_21250334() {
+    run_bundle(include_str!("vectors/c26c_p11_d_x_sell_ioc_through_issuer_offers_middle_page_testnet_21250334.json"));
+}
+
+/// p11e.x.plain_buy27_empty_root_issuer_page_then_last_page OfferCreate (EE8EE9BE45A2, network tesSUCCESS).
+#[test]
+fn c26c_p11e_x_plain_buy27_empty_root_issuer_page_then_last_page_testnet_21250348() {
+    run_bundle(include_str!("vectors/c26c_p11e_x_plain_buy27_empty_root_issuer_page_then_last_page_testnet_21250348.json"));
+}
+
+/// p12.x.autobridged_buy80_gbp_six_iterations_over_one_multipage_eur_xrp_level OfferCreate (F690075FDE40, network tesSUCCESS).
+#[test]
+fn c26c_p12_x_autobridged_buy80_gbp_six_iterations_over_one_multipage_eur_xrp_le_testnet_21250773() {
+    run_bundle(include_str!("vectors/c26c_p12_x_autobridged_buy80_gbp_six_iterations_over_one_multipage_eur_xrp_le_testnet_21250773.json"));
 }
