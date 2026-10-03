@@ -1368,26 +1368,19 @@ impl Transactor for AMMDepositTransactor {
                 if t != TxResult::Success { return t; }
             }
         }
-        TxResult::Success
-    }
-
-    fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
-        use crate::tx::offer as ox;
-        let Some((amm_key, amm_acct, lp_leg)) = amm_ctx(tx, sandbox) else {
-            return TxResult::NoEntry;
-        };
-
-        // rippled AMMDeposit apply-side reserve guard (AMMDeposit.cpp): a
-        // depositor who holds ZERO LPTokens is about to open (or fund) an
-        // LPToken trust line, so it must keep XRP above accountReserve(oc + 1).
-        // Note this keys off the LP *balance*, not line existence — a line that
-        // already exists with a zero balance (a prior full withdraw) still
-        // counts as holding none, so the +1 reserve still applies (#105770848,
-        // #105783986: bal 2529949 <= reserve(8) 2600000 → tecINSUF_RESERVE_LINE
-        // even though the zero-balance LP line is present). Runs in do_apply on
-        // the post-fee balance, exactly as rippled does; the claimed tec rolls
-        // back to just the fee mutation (net_muts=1).
-        let lp_line = keylet::ripple_state_key(&tx.account, &amm_acct, &lp_leg.cur);
+        // Finding 412 — the non-LP reserve gate is PRECLAIM's
+        // (AMMDeposit.cpp:389-399): a depositor holding ZERO LPTokens is about
+        // to open (or fund) an LPToken trust line, so xrpLiquid(acct, +1) must
+        // be positive, i.e. Balance > accountReserve(oc + 1). It keys off the
+        // LP *balance*, not line existence — a zero-balance LP line left by a
+        // full withdraw still counts as holding none (#105770848, #105783986:
+        // bal 2529949 <= reserve(8) 2600000). Preclaim reads the PRE-FEE
+        // balance; we ran it in do_apply after the fee, so a depositor in
+        // (reserve, reserve + fee] was refused where the network deposits —
+        // testnet campaign 26 2-3/2-4/2-6/2-7 (R(2)+1 .. R(2)+fee: tes on the
+        // network, tecINSUF_RESERVE_LINE here; R(2) exact is tec on both).
+        let Some((_, amm_acct, lp_leg)) = amm_parts.as_ref() else { return TxResult::Success };
+        let lp_line = keylet::ripple_state_key(&tx.account, amm_acct, &lp_leg.cur);
         let lp_balance_zero = match sandbox.read(&lp_line) {
             None => true,
             Some(d) => serde_json::from_slice::<serde_json::Value>(&d)
@@ -1396,7 +1389,7 @@ impl Transactor for AMMDepositTransactor {
                 .unwrap_or(true),
         };
         if lp_balance_zero {
-            if let Some(acct) = ox::json_at(sandbox, &keylet::account_root_key(&tx.account)) {
+            if let Some(acct) = ox::json_at(sandbox, &acct_key) {
                 let oc = acct["OwnerCount"].as_u64().unwrap_or(0);
                 let bal = acct["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
                 if bal <= crate::ledger::fees::account_reserve(sandbox, oc + 1) {
@@ -1404,6 +1397,14 @@ impl Transactor for AMMDepositTransactor {
                 }
             }
         }
+        TxResult::Success
+    }
+
+    fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        use crate::tx::offer as ox;
+        let Some((amm_key, amm_acct, lp_leg)) = amm_ctx(tx, sandbox) else {
+            return TxResult::NoEntry;
+        };
 
         // Finding 383 — tfLPToken dispatches to `equalDepositTokens`
         // (AMMDeposit.cpp:473-484). `ammHolds` orders the balances by the
@@ -2497,6 +2498,8 @@ impl Transactor for AMMWithdrawTransactor {
         // tokens burned are DERIVED from what is taken out, and the pool
         // balance that derivation needs is the one BEFORE the payout below.
         const TF_LIMIT_LP_TOKEN_W: u64 = 0x0040_0000;
+        let v13 = crate::ledger::amendments::enabled(sandbox, FIX_AMM_V1_3);
+        let mut single_zero_tokens: Option<TxResult> = None;
         let single_asset_burn = if tx.fields.get("LPTokenIn").is_none() && wd_flags & TF_LIMIT_LP_TOKEN_W == 0 {
             (|| {
                 let v = tx.fields.get("Amount")?;
@@ -2524,17 +2527,35 @@ impl Transactor for AMMWithdrawTransactor {
                 // returns earlier, so this path never sees it.
                 let t0 = crate::tx::amm_swap::lp_tokens_in(balance, withdraw, total_lp, tfee)?;
                 let t0 = crate::tx::amm_swap::adjust_lp_tokens(total_lp, t0, false);
+                // Finding 414 — tokens that adjust to zero are singleWithdraw's
+                // refusal (AMMWithdraw.cpp:1104-1111, and :1115-1116 for the
+                // adjusted tokens), not a fall-through to the raw Amount and a
+                // placeholder burn. Only the TOKENS are judged: an asset that
+                // adjusts to zero with tokens left is withdrawn as zero while
+                // the tokens are redeemed. Testnet campaign 26: 6-9 takes 1
+                // drop and the network burns 0.00099547009 LP for 0 drops
+                // (tes); 6-10 asks 1e-15 USD, tokens 0 → tecAMM_INVALID_TOKENS.
+                // We answered tecPRECISION_LOSS to both.
                 if t0.0 == 0 {
+                    single_zero_tokens = Some(if v13 { TxResult::AmmInvalidTokens } else { TxResult::AmmFailed });
                     return None;
                 }
                 let (tokens, out) = crate::tx::amm_swap::adjust_asset_out_by_tokens(
                     balance, withdraw, total_lp, t0, tfee, leg.xrp,
                 );
-                (tokens.0 > 0 && out.0 > 0).then_some((out, tokens))
+                if tokens.0 == 0 {
+                    single_zero_tokens = Some(TxResult::AmmInvalidTokens);
+                    return None;
+                }
+                Some((out, tokens))
             })()
         } else {
             None
         };
+        if let Some(t) = single_zero_tokens {
+            sandbox.restore_snapshot(snap);
+            return t;
+        }
 
         let pool_lpt = |sandbox: &Sandbox| -> Option<ox::Me> {
             let o = ox::json_at(sandbox, &amm_key)?;
@@ -2618,6 +2639,7 @@ impl Transactor for AMMWithdrawTransactor {
         // rippled `singleWithdrawTokens` (AMMWithdraw.cpp:1020).
         // F68: `Amount` is a FLOOR in this mode too (singleWithdrawTokens).
         let mut one_asset_floor_unmet = false;
+        let mut one_asset_zero_tokens = false;
         let one_asset: Option<(ox::Me, ox::Me)> = if wd_sized.is_none() {
             (|| {
                 let lp_in = tx
@@ -2633,6 +2655,14 @@ impl Transactor for AMMWithdrawTransactor {
                     .map(|o| crate::tx::amm_swap::effective_trading_fee(sandbox, &o, &tx.account))
                     .unwrap_or(0);
                 let tokens = crate::tx::amm_swap::adjust_lp_tokens(lpt, lp_in, false);
+                // Finding 414 — singleWithdrawTokens refuses tokens that adjust
+                // to zero (AMMWithdraw.cpp:1152-1155, fixAMMv1_3) before the
+                // Amount floor. Testnet campaign 26 6-12: 1e-13 LP as XRP is
+                // tecAMM_INVALID_TOKENS; we took the fee and moved nothing.
+                if tokens.0 == 0 && v13 {
+                    one_asset_zero_tokens = true;
+                    return None;
+                }
                 let out = crate::tx::amm_swap::amm_asset_out(
                     crate::tx::amm_swap::holds(sandbox, &amm_acct, &leg),
                     lpt,
@@ -2650,6 +2680,10 @@ impl Transactor for AMMWithdrawTransactor {
         } else {
             None
         };
+        if one_asset_zero_tokens {
+            sandbox.restore_snapshot(snap);
+            return TxResult::AmmInvalidTokens;
+        }
         if one_asset_floor_unmet {
             sandbox.restore_snapshot(snap);
             return TxResult::AmmFailed;
@@ -2734,11 +2768,14 @@ impl Transactor for AMMWithdrawTransactor {
             if let Some(v) = tx.fields.get(*f) {
                 if let (Some(leg), Some(amt0)) = (ox::leg_of(v), keylet::amount_mant_exp(v)) {
                     let amt = actual(i, amt0);
+                    // withdraw() tests the reserve before each send whatever
+                    // the amount (finding 414: a zero payout still faces it);
+                    // a zero accountSend moves nothing.
+                    if !withdraw_reserve_ok(sandbox, &tx.account, &leg, pre_fee_xrp) {
+                        sandbox.restore_snapshot(snap);
+                        return TxResult::InsufficientReserve; // finding 156
+                    }
                     if amt.0 > 0 {
-                        if !withdraw_reserve_ok(sandbox, &tx.account, &leg, pre_fee_xrp) {
-                            sandbox.restore_snapshot(snap);
-                            return TxResult::InsufficientReserve; // finding 156
-                        }
                         ox::move_leg(sandbox, &amm_acct, &tx.account, &leg, amt);
                     }
                 }
@@ -4273,6 +4310,12 @@ impl Transactor for AMMClawbackTransactor {
         if !sandbox.exists(&keylet::account_root_key(&holder)) {
             return TxResult::NoAccount;
         }
+        // rippled's preFeeBalance_ of the clawing issuer (do_apply runs after
+        // the fee): finding 413's reserve test measures the holder by it.
+        let issuer_pre_fee: u128 = ox::json_at(sandbox, &keylet::account_root_key(&tx.account))
+            .and_then(|a| a["Balance"].as_str().and_then(|s| s.parse::<u128>().ok()))
+            .unwrap_or(0)
+            + u128::from(tx.account_fee());
         let snap = sandbox.snapshot();
         let Some((amm_key, amm_acct, _lp_leg)) = amm_ctx(tx, sandbox) else {
             // terNO_AMM is a ter retry code our enum lacks; NoEntry is the
@@ -4433,8 +4476,24 @@ impl Transactor for AMMClawbackTransactor {
             return TxResult::AmmBalance;
         }
         // Pay the holder both sides (accountSend, no transfer fee).
-        ox::move_leg(sandbox, &amm_acct, &holder, &a1, w1);
-        ox::move_leg(sandbox, &amm_acct, &holder, &a2, w2);
+        // Finding 413 — withdraw()'s sufficientReserve runs before EACH send
+        // (AMMWithdraw.cpp:765, :785). AMMClawback passes IgnoreReserve, but
+        // that is honoured only under fixCleanup3_4_0 (:690); until then a
+        // holder with no line for the asset owes accountReserve(oc + 1) when
+        // it holds 2+ objects, measured against max(priorBalance, its own
+        // balance) — and priorBalance is the CLAWING ISSUER's pre-fee balance
+        // (AMMClawback.cpp:240-242 pass preFeeBalance_). Testnet campaign 26
+        // 5-3/5-5: holder h1 at OC 9 with 2,900,000 drops and no CLW line,
+        // issuer prior 2,999,987 / 2,999,999 → tecINSUFFICIENT_RESERVE on the
+        // network, where we clawed; at 3,000,000 = R(10) (5-7) both succeed.
+        let reserve_applies = !crate::ledger::amendments::fix_cleanup_3_4_0(sandbox);
+        for (leg, amt) in [(&a1, w1), (&a2, w2)] {
+            if reserve_applies && !withdraw_reserve_ok(sandbox, &holder, leg, issuer_pre_fee) {
+                sandbox.restore_snapshot(snap);
+                return TxResult::InsufficientReserve;
+            }
+            ox::move_leg(sandbox, &amm_acct, &holder, leg, amt);
+        }
         // Burn the LP tokens.
         if eq(tokens, hold) {
             tear_down_lp_line(sandbox, &holder, &amm_acct, lp_key, &lp_line);
