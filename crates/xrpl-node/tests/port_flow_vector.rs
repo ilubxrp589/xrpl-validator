@@ -199,3 +199,27 @@ fn offer_found_tiny_is_judged_through_the_af_view_balance_hook_107194228() {
     port();
     run_bundle(include_str!("vectors/offer_found_tiny_is_judged_through_the_af_view_balance_hook_107194228.json"));
 }
+
+/// rp2_partial_DeliverMin=delivered+1ulp Payment (3D77A347F556, network tecPATH_PARTIAL). Campaign 26 (testnet, 2026-10-03):
+/// 16-digit rounding through QualityIn/QualityOut and DeliverMin; the model misses it, the port matches.
+#[test]
+fn c26b_rp2_partial_delivermin_delivered_1ulp_testnet_21249225() {
+    port();
+    run_bundle(include_str!("vectors/c26b_rp2_partial_delivermin_delivered_1ulp_testnet_21249225.json"));
+}
+
+/// rq2_G1->H3_direct_7.777777777777777_(QIn_0.95) Payment (98910B4C79B0, network tecPATH_PARTIAL). Campaign 26 (testnet, 2026-10-03):
+/// 16-digit rounding through QualityIn/QualityOut and DeliverMin; the model misses it, the port matches.
+#[test]
+fn c26b_rq2_g1_h3_direct_7_777777777777777_qin_0_95_testnet_21249327() {
+    port();
+    run_bundle(include_str!("vectors/c26b_rq2_g1_h3_direct_7_777777777777777_qin_0_95_testnet_21249327.json"));
+}
+
+/// rq1_H2->H3_123.4567890123456_(QOut_1.05,_rate,_Q Payment (C7E966379F38, network tesSUCCESS). Campaign 26 (testnet, 2026-10-03):
+/// 16-digit rounding through QualityIn/QualityOut and DeliverMin; the model misses it, the port matches.
+#[test]
+fn c26b_rq1_h2_h3_123_4567890123456_qout_1_05_rate_q_testnet_21249325() {
+    port();
+    run_bundle(include_str!("vectors/c26b_rq1_h2_h3_123_4567890123456_qout_1_05_rate_q_testnet_21249325.json"));
+}

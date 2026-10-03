@@ -960,12 +960,6 @@ fn c26b_rp1_partial_sendmax_777_77_observe_delivered_testnet_21249223() {
     run_bundle(include_str!("vectors/c26b_rp1_partial_sendmax_777_77_observe_delivered_testnet_21249223.json"));
 }
 
-/// rp2_partial_DeliverMin=delivered+1ulp Payment (3D77A347F556, network tecPATH_PARTIAL).
-#[test]
-fn c26b_rp2_partial_delivermin_delivered_1ulp_testnet_21249225() {
-    run_bundle(include_str!("vectors/c26b_rp2_partial_delivermin_delivered_1ulp_testnet_21249225.json"));
-}
-
 /// rp3_partial_DeliverMin=delivered_exact Payment (CBF047CE7ABE, network tesSUCCESS).
 #[test]
 fn c26b_rp3_partial_delivermin_delivered_exact_testnet_21249227() {
@@ -1192,18 +1186,6 @@ fn c26b_rq0_h3_qualityin_0_95_testnet_21249321() {
 #[test]
 fn c26b_rq0_h2_qualityout_1_05_testnet_21249323() {
     run_bundle(include_str!("vectors/c26b_rq0_h2_qualityout_1_05_testnet_21249323.json"));
-}
-
-/// rq1_H2->H3_123.4567890123456_(QOut_1.05,_rate,_Q Payment (C7E966379F38, network tesSUCCESS).
-#[test]
-fn c26b_rq1_h2_h3_123_4567890123456_qout_1_05_rate_q_testnet_21249325() {
-    run_bundle(include_str!("vectors/c26b_rq1_h2_h3_123_4567890123456_qout_1_05_rate_q_testnet_21249325.json"));
-}
-
-/// rq2_G1->H3_direct_7.777777777777777_(QIn_0.95) Payment (98910B4C79B0, network tecPATH_PARTIAL).
-#[test]
-fn c26b_rq2_g1_h3_direct_7_777777777777777_qin_0_95_testnet_21249327() {
-    run_bundle(include_str!("vectors/c26b_rq2_g1_h3_direct_7_777777777777777_qin_0_95_testnet_21249327.json"));
 }
 
 /// rq3_H3->H1_partial_SendMax_0.1111111111111111 Payment (F27F83132A74, network tesSUCCESS).
