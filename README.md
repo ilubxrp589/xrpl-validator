@@ -160,7 +160,9 @@ line-level write-ups are published; specifics of unfixed findings are withheld.
 
 ## License
 
-[MIT](LICENSE). The optional `ffi` feature links
+MIT, with an attribution requirement: if you use, copy or modify this code, credit James Turner with a link to https://github.com/ilubxrp589/xrpl-validator. See [LICENSE](LICENSE).
+
+The optional `ffi` feature links
 [`libxrpl`](https://github.com/XRPLF/rippled) (ISC, compatible with MIT).
 This repository contains no rippled source code.
 
