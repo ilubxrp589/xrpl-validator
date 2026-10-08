@@ -117,15 +117,38 @@ pub async fn start_ws_sync(
     // compares against; without Stage 3 it simply never fires.
     #[cfg(feature = "ffi")]
     let mut native_shadow = crate::native_shadow::NativeShadow::maybe_new();
+    // Stage 4 Phase B: the native writer (XRPL_NATIVE_WRITER=1, needs the
+    // shadow). Our overlay becomes the authoritative source for state.rocks;
+    // the FFI leg is a comparison only, so XRPL_FFI_STAGE3 is ignored. A
+    // ledger the engine cannot vouch for is written from the network's bytes.
     #[cfg(feature = "ffi")]
-    if native_shadow.is_some() && !stage3_cfg.enabled {
+    let native_writer = std::env::var("XRPL_NATIVE_WRITER")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    #[cfg(feature = "ffi")]
+    let native_writer = match native_shadow.as_mut() {
+        Some(shadow) if native_writer => {
+            shadow.enable_writer();
+            if stage3_cfg.enabled {
+                eprintln!("[native-writer] XRPL_FFI_STAGE3 ignored: the native overlay writes state.rocks, the FFI leg compares");
+            }
+            true
+        }
+        None if native_writer => {
+            eprintln!("[native-writer] WARNING: XRPL_NATIVE_WRITER set without XRPL_NATIVE_SHADOW — writer OFF");
+            false
+        }
+        _ => false,
+    };
+    #[cfg(feature = "ffi")]
+    if native_shadow.is_some() && !stage3_cfg.enabled && !native_writer {
         eprintln!("[native-shadow] WARNING: XRPL_NATIVE_SHADOW set but Stage 3 is OFF — shadow will never run");
     }
     // Publish stage3 state to FfiStats so /api/engine can expose it for
     // dashboards + watch_engine.py. Only when the ffi verifier is present.
     #[cfg(feature = "ffi")]
     if let Some(ref verifier) = ffi_verifier {
-        verifier.shared_stats().lock().stage3_enabled = stage3_cfg.enabled;
+        verifier.shared_stats().lock().stage3_enabled = stage3_cfg.enabled && !native_writer;
     }
 
     // Watchdog hysteresis state: tracks the last time the watchdog forced a
@@ -326,9 +349,12 @@ pub async fn start_ws_sync(
                     // out any hydration wake with margin; a catch-up deeper
                     // than that gaps the mirror and the drop/re-hydrate path
                     // handles it as before.
+                    // The native writer's mirror follows what ws-sync writes, not
+                    // the FFI overlay, so under Phase B the FFI compare is
+                    // optional and keeps the plain 25.
                     #[cfg(feature = "ffi")]
                     let ffi_catchup_budget: u32 =
-                        if native_shadow.as_ref().map_or(false, |s| s.is_active()) { 200 } else { 25 };
+                        if !native_writer && native_shadow.as_ref().map_or(false, |s| s.is_active()) { 200 } else { 25 };
                     #[cfg(feature = "ffi")]
                     let skip_shadow_for_catchup =
                         closed_seq.saturating_sub(process_seq) > ffi_catchup_budget;
@@ -553,11 +579,23 @@ pub async fn start_ws_sync(
                                         overlay
                                     })
                                 };
-                                if stage3_cfg.enabled {
+                                if stage3_cfg.enabled && !native_writer {
                                     match task.await {
                                         Ok(o) => ffi_overlay_opt = Some(o),
                                         Err(e) => eprintln!("[stage3] FFI verify task join failed for #{seq}: {e}"),
                                     }
+                                } else if native_writer {
+                                    // Phase B: the FFI overlay is a comparison only, so a stalled
+                                    // libxrpl must not stall ws-sync. Past the deadline the task runs
+                                    // on detached (as it always did without Stage 3) and this ledger
+                                    // goes uncompared.
+                                    match tokio::time::timeout(std::time::Duration::from_secs(3), task).await {
+                                        Ok(Ok(o)) => ffi_overlay_opt = Some(o),
+                                        Ok(Err(e)) => eprintln!("[native-writer] FFI compare task join failed for #{seq}: {e}"),
+                                        Err(_) => eprintln!("[native-writer] FFI compare for #{seq} took over 3s — not compared"),
+                                    }
+                                }
+                                if stage3_cfg.enabled && !native_writer {
                                     // Stage 4 Phase A: the native Rust engine shadows the
                                     // FFI leg — same txs, in-RAM mirror, overlay-vs-overlay
                                     // compare. Requires Stage 3 (the awaited overlay IS the
@@ -687,18 +725,106 @@ pub async fn start_ws_sync(
                         }
                     }
 
+                    // Stage 4 Phase B: the native engine proposes this ledger's
+                    // writes. It must agree with the metadata on every result and
+                    // on exactly which objects changed, or the ledger is written
+                    // from the network's bytes — counted, never a strike.
+                    #[cfg(feature = "ffi")]
+                    let mut wrote_native = false;
+                    #[cfg(feature = "ffi")]
+                    let authoritative = if native_writer {
+                        let ffi_cmp = ffi_overlay_opt.take();
+                        match native_shadow.as_mut() {
+                            Some(shadow) => {
+                                let lag_now = closed_seq.saturating_sub(process_seq);
+                                if !shadow.is_active() && !shadow.writer_tripped() && shadow.can_hydrate(lag_now) {
+                                    shadow.hydrate(&db, process_seq - 1);
+                                }
+                                let key = |h: &String| -> Option<[u8; 32]> {
+                                    hex::decode(h).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                                };
+                                let meta_deleted: HashSet<[u8; 32]> = acc_deleted.iter().filter_map(key).collect();
+                                let mut meta_keys: HashSet<[u8; 32]> = acc_modified.iter().filter_map(key).collect();
+                                meta_keys.extend(meta_deleted.iter().copied());
+                                match shadow.propose(
+                                    process_seq,
+                                    &ledger_header.parent_hash,
+                                    ledger_header.parent_close_time,
+                                    ledger_header.total_drops,
+                                    &sorted_txs,
+                                    &meta_keys,
+                                    &meta_deleted,
+                                    ffi_cmp.as_ref(),
+                                ) {
+                                    Some(p) => match p.refusal {
+                                        None => {
+                                            wrote_native = true;
+                                            Some(p.overlay)
+                                        }
+                                        Some(why) => {
+                                            eprintln!("[native-writer] #{process_seq}: network bytes — {why}");
+                                            None
+                                        }
+                                    },
+                                    None => None,
+                                }
+                            }
+                            None => None,
+                        }
+                    } else {
+                        ffi_overlay_opt.take()
+                    };
+
                     // Hash-check EVERY ledger (gap or tip). Validation count requires it,
                     // and root recompute is only ~50ms per ledger (dirty-bucket parallel).
                     let compute_hash = true;
                     let _ = closed_seq;
-                    let result = process_ledger(
+                    #[cfg(feature = "ffi")]
+                    let mut landed = LedgerWrite { keep: native_writer, trial: wrote_native, ..LedgerWrite::default() };
+                    #[cfg(not(feature = "ffi"))]
+                    let mut landed = LedgerWrite::default();
+                    #[allow(unused_mut)]
+                    let mut result = process_ledger(
                         &rpc, &db, &hash_comp,
                         process_seq, &acc_modified, &acc_deleted,
                         &account_hash, acc_tx_count, compute_hash,
                         &history,
-                        #[cfg(feature = "ffi")] ffi_overlay_opt.take(),
+                        #[cfg(feature = "ffi")] authoritative,
                         &watchdog_live_edge,
+                        &mut landed,
                     ).await;
+                    // Phase B: our bytes failed the state hash and were rolled back
+                    // quietly. Drop the mirror's proposal and redo this same ledger
+                    // from the network's bytes now, through the ordinary path.
+                    #[cfg(feature = "ffi")]
+                    if native_writer && wrote_native && !result && landed.mismatched {
+                        if let Some(shadow) = native_shadow.as_mut() {
+                            shadow.abort(process_seq, true);
+                        }
+                        wrote_native = false;
+                        landed = LedgerWrite { keep: true, ..LedgerWrite::default() };
+                        result = process_ledger(
+                            &rpc, &db, &hash_comp,
+                            process_seq, &acc_modified, &acc_deleted,
+                            &account_hash, acc_tx_count, compute_hash,
+                            &history,
+                            None,
+                            &watchdog_live_edge,
+                            &mut landed,
+                        ).await;
+                    }
+                    // Phase B: the mirror follows what was written, or undoes
+                    // its own writes when nothing landed.
+                    #[cfg(feature = "ffi")]
+                    if native_writer {
+                        if let Some(shadow) = native_shadow.as_mut() {
+                            if result {
+                                shadow.commit(process_seq, &landed.written, wrote_native);
+                            } else {
+                                shadow.abort(process_seq, wrote_native && landed.mismatched);
+                            }
+                        }
+                    }
 
                     if !result {
                         // process_ledger did not land this ledger (aborted fetch,
@@ -1143,6 +1269,23 @@ async fn fetch_ledger_tx_meta_all(rpc: &RippledClient, seq: u32) -> Vec<(Vec<u8>
     out
 }
 
+/// What `process_ledger` wrote, for the native writer's mirror (Stage 4 Phase B).
+#[derive(Default)]
+#[cfg_attr(not(feature = "ffi"), allow(dead_code))]
+struct LedgerWrite {
+    /// Collect `written` (off unless the native writer needs it).
+    keep: bool,
+    /// The overlay is our engine's proposal. A hash failure is then rolled back
+    /// QUIETLY — no strike, no reset of the signing streak, no sync-log or history
+    /// entry — and the caller redoes the same ledger from the network's bytes. The
+    /// state stays verified for every ledger, so the signing gate stays honest.
+    trial: bool,
+    /// Every key the landed batch put (Some) or deleted (None).
+    written: std::collections::HashMap<[u8; 32], Option<Vec<u8>>>,
+    /// The batch was written, failed the state hash, and was rolled back.
+    mismatched: bool,
+}
+
 async fn process_ledger(
     rpc: &RippledClient,
     db: &Arc<rocksdb::DB>,
@@ -1156,6 +1299,7 @@ async fn process_ledger(
     history: &Option<Arc<parking_lot::Mutex<crate::history::HistoryStore>>>,
     #[cfg(feature = "ffi")] ffi_overlay: Option<crate::ffi_engine::LedgerOverlay>,
     watchdog_live_edge: &Arc<AtomicU32>,
+    landed: &mut LedgerWrite,
 ) -> bool {
     let ledger_start = std::time::Instant::now();
     // Lag breadcrumb: if the live-edge poller says we're already behind,
@@ -1182,6 +1326,8 @@ async fn process_ledger(
     // FFI mutation overlay is the authoritative source for mutated SLEs. Only
     // keys NOT covered by libxrpl (the 5 protocol singletons mutated by
     // pseudo-txs, which apply_ledger_in_order filters out) fall back to RPC.
+    // Stage 4 Phase B passes the native overlay here instead (same contract:
+    // singletons left out, so they come from RPC).
     let mut fetched_data: Vec<([u8; 32], Vec<u8>)> = Vec::new();
     let mut failed = 0u32;
     let mut stage3_used = false;
@@ -1329,6 +1475,7 @@ async fn process_ledger(
     let mut batch = rocksdb::WriteBatch::default();
     let mut keys: Vec<Hash256> = Vec::new();
 
+    landed.written.clear();
     for (key, data) in &fetched_data {
         if data.is_empty() {
             // entryNotFound on both local + public — delete stale entry
@@ -1337,6 +1484,9 @@ async fn process_ledger(
             batch.put(key, data);
         }
         keys.push(Hash256(*key));
+        if landed.keep {
+            landed.written.insert(*key, (!data.is_empty()).then(|| data.clone()));
+        }
     }
     if !stage3_used {
         for index_hex in deleted {
@@ -1346,6 +1496,9 @@ async fn process_ledger(
                     let mut k = Hash256([0u8; 32]);
                     k.0.copy_from_slice(&kb);
                     keys.push(k);
+                    if landed.keep {
+                        landed.written.insert(k.0, None);
+                    }
                 }
             }
         }
@@ -1395,6 +1548,25 @@ async fn process_ledger(
             let ours = hex::encode(root.0);
             if !account_hash.is_empty() {
                 let matched = ours.to_uppercase() == account_hash.to_uppercase();
+                if !matched && landed.trial {
+                    // Our engine's bytes were wrong: undo them exactly as the mismatch path
+                    // below does, then hand the ledger back for the network's bytes.
+                    let undo_keys: Vec<Hash256> = undo_pairs.iter().map(|(k, _)| *k).collect();
+                    let undo = undo_batch(&undo_pairs, seq);
+                    if let Err(e) = db.write(undo) {
+                        eprintln!("[ws-sync] #{seq}: FATAL — undo batch write failed: {e}. State.rocks is now in an unknown state. Halting.");
+                        std::process::exit(1);
+                    }
+                    let hc_undo = hash_comp.clone();
+                    let d_undo = db.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        hc_undo.update_only(&d_undo, &undo_keys);
+                    }).await;
+                    landed.mismatched = true;
+                    eprintln!("[native-writer] #{seq}: our bytes hashed to {} vs the network's {} — ROLLED BACK ({} keys restored), redoing from the network's bytes",
+                        &ours[..16], &account_hash[..16.min(account_hash.len())], undo_pairs.len());
+                    return false;
+                }
                 hash_comp.set_network_hash(account_hash, seq);
                 let round_time = ledger_start.elapsed().as_secs_f64();
                 hash_comp.push_sync_log(crate::state_hash::SyncLogEntry {
@@ -1454,6 +1626,7 @@ async fn process_ledger(
                         eprintln!("[ws-sync] LAG_BREADCRUMB #{seq}: lag_at_start={lag_at_start} (MISMATCH) fetch={fetch_ms}ms write={write_ms}ms hash={hash_ms_only}ms n_modified={} n_deleted={} n_keys={}",
                             modified.len(), deleted.len(), n_keys);
                     }
+                    landed.mismatched = true;
                     // PART 1: bump streak; hard-stop after MAX_MISMATCH_STREAK.
                     let streak = MISMATCH_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
                     if streak >= MAX_MISMATCH_STREAK {

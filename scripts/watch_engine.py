@@ -73,7 +73,12 @@ def tag_ours():
 def tag_rippled(note="rippled"):
     return colored(f"[{note}]", "1;94")
 
-def verdict_line(sh, ffi, up, stage3):
+def writer_of(eng):
+    """Stage 4 Phase B (XRPL_NATIVE_WRITER=1): the native writer's counters, or {} when it is off."""
+    w = ((eng.get("native_shadow") or {}).get("writer") or {}) if isinstance(eng, dict) else {}
+    return w if w.get("enabled") else {}
+
+def verdict_line(sh, ffi, up, stage3, writer=None):
     """One line that answers 'is everything OK?' — same signals as the panels."""
     problems = []
     if not up:
@@ -83,17 +88,24 @@ def verdict_line(sh, ffi, up, stage3):
     mism = sh.get("total_mismatches", 0) if isinstance(sh, dict) else 0
     if mism:
         problems.append(f"{mism} state-hash MISMATCH")
+    # Under the Rust writer the C++ core is a comparison only: its disagreements with mainnet
+    # (a libxrpl older than the network refuses new amendments) are shown in its panel, not here.
     div = ffi.get("live_apply_diverged", 0) if isinstance(ffi, dict) else 0
-    if div:
+    if div and not writer:
         problems.append(f"{div} tx diverged")
     sha_mm = ffi.get("shadow_hash_mismatched", 0) if isinstance(ffi, dict) else 0
-    if sha_mm:
+    if sha_mm and not writer:
         problems.append(f"{sha_mm} shadow-hash mismatch")
+    if writer and writer.get("breaker"):
+        problems.append("Rust writer BREAKER tripped — state comes from .39 until restart")
+    elif writer and writer.get("mismatch"):
+        problems.append(f"{writer['mismatch']} ledger(s) where our engine's bytes failed the state hash")
     if problems:
         return colored("  ✗ ATTENTION: " + "; ".join(problems), "1;31")
     consec = sh.get("consecutive_matches", 0) if isinstance(sh, dict) else 0
     ready = sh.get("ready_to_sign", False) if isinstance(sh, dict) else False
-    mode = "engine-written state (Stage 3)" if stage3 else "shadow mode"
+    mode = ("Rust-engine-written state (Stage 4)" if writer
+            else "engine-written state (Stage 3)" if stage3 else "shadow mode")
     if ready:
         return colored(f"  ✓ ALL GOOD — signing, {consec:,} clean ledgers in a row, {mode}", "1;32")
     return colored(f"  … warming up — verifying ledgers before signing resumes ({mode})", "33")
@@ -112,12 +124,16 @@ def render():
     # Stage 3 banner — highly visible so operators know when the FFI overlay
     # is the source of truth for state.rocks.
     stage3 = ffi.get("stage3_enabled", False) if isinstance(ffi, dict) else False
-    if stage3:
+    writer = writer_of(eng)
+    if writer:
+        out.append(colored("  ★ STAGE 4: ACTIVE — our RUST engine WRITES the ledger database ★", "1;30;42"))
+        out.append(subtitle("state.rocks bytes come from our own Rust tx engine; rippled's C++ core only compares"))
+    elif stage3:
         out.append(colored("  ★ STAGE 3: ACTIVE — our engine WRITES the ledger database ★", "1;30;42"))
         out.append(subtitle("state.rocks bytes come from our own tx engine, not copied from rippled"))
     else:
         out.append(colored("  STAGE 3: inactive — shadow mode (we verify but rippled's bytes are used)", "90"))
-    out.append(verdict_line(sh, ffi, up, stage3))
+    out.append(verdict_line(sh, ffi, up, stage3, writer))
     out.append(subtitle(f"who owns what: {tag_ours()}" + colored(" = our Rust code   ", "90")
                + tag_rippled("RIPPLED") + colored(" = rippled's code (their node, or their C++ core linked into ours)", "90")))
     out.append("")
@@ -293,11 +309,32 @@ def render():
     # Stage 4 Phase A: the native Rust engine shadowing the C++ core in-process.
     ns = eng.get("native_shadow", {}) if isinstance(eng, dict) else {}
     if isinstance(ns, dict) and ns.get("enabled"):
-        out.append(colored("── Native Engine Shadow (Stage 4) ──", "1;32") + "  " + tag_ours())
-        out.append(subtitle("our own Rust tx engine applies every ledger beside the C++ core — do the overlays agree byte-for-byte?"))
+        if writer:
+            out.append(colored("── Native Rust Engine (Stage 4 — WRITING state) ──", "1;32") + "  " + tag_ours())
+            out.append(subtitle("our Rust tx engine computes every ledger and its bytes are what state.rocks stores"))
+        else:
+            out.append(colored("── Native Engine Shadow (Stage 4) ──", "1;32") + "  " + tag_ours())
+            out.append(subtitle("our own Rust tx engine applies every ledger beside the C++ core — do the overlays agree byte-for-byte?"))
         if not ns.get("hydrated"):
             gaps = ns.get("skipped_gap", 0)
             out.append(f"  {colored('hydrating…', '33')} (mirror loads from state.rocks on the next steady ledger; gaps so far: {gaps})")
+        if writer:
+            # Every ledger is written either from our engine's bytes or, when it cannot vouch for one, from the
+            # network's (counted by reason). A hash failure on our bytes is the one that matters: it is rolled back
+            # and that ledger's retry uses the network's bytes.
+            wn = writer.get("native", 0); wu = writer.get("unready", 0); wr = writer.get("refused", 0)
+            wd = writer.get("distrusted", 0); wm = writer.get("mismatch", 0)
+            tot = wn + wu + wr + wd
+            pct_w = wn / tot * 100 if tot else 0
+            col_w = "1;31" if wm else ("1;32" if wr == 0 else "1;33")
+            out.append(f"  {colored('RUST WRITER:', '1')} {colored(f'{pct_w:.2f}%', col_w)} of ledgers written by our engine"
+                       f"   ({wn:,}/{tot:,})")
+            out.append(f"    from .39 instead: {colored(f'loading {wu:,}', '90')}  "
+                       f"{colored(f'engine disagreed {wr:,}', '1;33' if wr else '32')}  "
+                       f"{colored(f'retries {wd:,}', '90')}  |  "
+                       f"{colored(f'hash failures on our bytes: {wm}', '1;31' if wm else '32')}")
+            if writer.get("breaker"):
+                out.append(f"    {colored('BREAKER TRIPPED: repeated hash failures turned the writer off until restart', '1;31')}")
         led = ns.get("ledgers", 0)
         if led:
             fm = ns.get("full_match", 0)

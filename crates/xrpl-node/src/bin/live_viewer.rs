@@ -1809,6 +1809,18 @@ async fn main() {
                             "leak_retry_fixed": s.leak_retry_fixed.load(Relaxed),
                             "map_op_err": s.map_op_err.load(Relaxed),
                             "apply_ms_last": s.apply_ms_last.load(Relaxed),
+                            // Stage 4 Phase B: ledgers our overlay wrote, and
+                            // why the others were written from the network.
+                            "writer": {
+                                "enabled": s.writer_enabled.load(Relaxed) == 1,
+                                "native": s.writer_native.load(Relaxed),
+                                "unready": s.writer_unready.load(Relaxed),
+                                "refused": s.writer_refused.load(Relaxed),
+                                "distrusted": s.writer_distrusted.load(Relaxed),
+                                "mismatch": s.writer_mismatch.load(Relaxed),
+                                // 1: repeated hash failures turned the writer off until restart.
+                                "breaker": s.writer_breaker.load(Relaxed) == 1,
+                            },
                         });
                     }
                     axum::Json(json)

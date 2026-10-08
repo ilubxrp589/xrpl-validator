@@ -22,6 +22,20 @@
 //! Enabled by `XRPL_NATIVE_SHADOW=1`. Compare receipts append to
 //! `XRPL_NATIVE_SHADOW_LOG` (default `/mnt/xrpl-data/native_shadow.jsonl`).
 //! Counters are exposed process-wide via [`stats`] for `/api/engine`.
+//!
+//! Stage 4 Phase B, the native writer (`XRPL_NATIVE_WRITER=1`, 2026-10-08):
+//! the native overlay becomes the authoritative source for `state.rocks` and
+//! the FFI leg a comparison only. ws-sync asks [`NativeShadow::propose`] for a
+//! ledger's writes, then reports what it wrote ([`NativeShadow::commit`]) or
+//! that nothing landed ([`NativeShadow::abort`]); the mirror follows the bytes
+//! that were written and verified, never its own guess. The engine vouches
+//! for a ledger only when every result matches the network's metadata and its
+//! writes cover exactly the objects the metadata names; otherwise that
+//! ledger's bytes come from the network, counted. The state hash stays the
+//! final check, and a mismatch on our bytes hands the retry to the network's.
+//! Why (2026-10-08 #107525002): libxrpl 3.4.0 refused PermissionDelegationV1_1
+//! transactions the network applied, and under Stage 3 its overlay was what
+//! got written — the validator halted while this engine had it right.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
@@ -81,6 +95,21 @@ pub struct ShadowStats {
     /// compare has gone blind, and a zero-receipt soak proves nothing.
     pub canary_fired: AtomicU64,
     pub canary_detected: AtomicU64,
+    /// Phase B, the native writer. `writer_native`: ledgers whose state.rocks
+    /// bytes came from our overlay. The rest name why a ledger's bytes came
+    /// from the network instead: no mirror yet or a gap (`writer_unready`), the
+    /// engine disagreed with the metadata (`writer_refused`), or the retry of a
+    /// ledger our bytes failed the state hash on (`writer_distrusted`, one per
+    /// `writer_mismatch`).
+    pub writer_enabled: AtomicU64,
+    pub writer_native: AtomicU64,
+    pub writer_unready: AtomicU64,
+    pub writer_refused: AtomicU64,
+    pub writer_distrusted: AtomicU64,
+    pub writer_mismatch: AtomicU64,
+    /// 1 once BREAKER_FAILS hash failures on our bytes landed within
+    /// BREAKER_WINDOW ledgers: the writer is off until the next restart.
+    pub writer_breaker: AtomicU64,
 }
 
 pub fn stats() -> &'static ShadowStats {
@@ -230,6 +259,66 @@ pub struct NativeShadow {
     /// The receipt canary's trigger file (`XRPL_NATIVE_SHADOW_CANARY`, else
     /// `native_shadow.canary` beside the receipt log).
     canary: Option<std::path::PathBuf>,
+    /// Phase B: the proposal ws-sync has not settled yet (commit or abort).
+    held: Option<Held>,
+    /// Phase B: a ledger our bytes failed the state hash on. Its retry is
+    /// written from the network's bytes; the commit clears it.
+    distrust: Option<u32>,
+    /// Phase B: the writer's own decisions (`XRPL_NATIVE_WRITER_LOG`, else
+    /// `native_writer.jsonl` beside the receipt log). Never receipts: those
+    /// stay the overlay-vs-overlay compare's.
+    writer_log: Option<std::fs::File>,
+    /// Phase B on (enable_writer).
+    writer: bool,
+    /// Keys the mirror may hold wrong: the hydrate could not load them cleanly,
+    /// or a reconcile could not make them re-encode to the written bytes. The
+    /// writer never vouches for a ledger that writes one.
+    bad_keys: HashSet<[u8; 32]>,
+    /// More bad keys than BAD_KEYS_CAP: vouch for nothing until a re-hydrate.
+    bad_overflow: bool,
+    /// Ledgers whose writes from our bytes failed the state hash (the breaker's window).
+    writer_fails: Vec<u32>,
+    writer_tripped: bool,
+}
+
+/// What the writer hands ws-sync for one ledger.
+pub struct Proposal {
+    /// Our writes in canonical binary, singletons left out: ws-sync fetches
+    /// those from the network, as Stage 3 did.
+    pub overlay: LedgerOverlay,
+    /// Why the engine cannot vouch for this ledger; ws-sync then writes the
+    /// network's bytes. None: write `overlay`.
+    pub refusal: Option<String>,
+}
+
+/// A proposal's pre-images, kept until ws-sync says whether the ledger landed.
+struct Held {
+    seq: u32,
+    undo: HashMap<Hash256, Option<Vec<u8>>>,
+}
+
+/// One ledger applied to the mirror: what it touched, the pre-images, and the
+/// result codes that disagreed with the ledger's metadata.
+struct Applied {
+    dirty: HashSet<Hash256>,
+    undo: HashMap<Hash256, Option<Vec<u8>>>,
+    ter_mm: Vec<String>,
+    /// Transactions the engine could not even parse (build_txfields None): applied by nobody.
+    skipped: usize,
+}
+
+/// The ledger's transactions in apply order (TransactionIndex), as the replay does.
+fn apply_order(txs: &[Value]) -> Vec<&Value> {
+    let mut ordered: Vec<&Value> = txs.iter().collect();
+    ordered.sort_by_key(|t| t["metaData"]["TransactionIndex"].as_u64().unwrap_or(u64::MAX));
+    ordered
+}
+
+/// Engine JSON -> the canonical binary the network stores.
+fn encode_entry(jb: &[u8]) -> Result<Vec<u8>, String> {
+    let mut v: Value = serde_json::from_slice(jb).map_err(|e| format!("parse: {e}"))?;
+    canon_for_encode(&mut v);
+    xrpl_core::codec::encode::encode_transaction_json(&v, false).map_err(|e| format!("encode: {e:?}"))
 }
 
 /// What the hydrate thread hands back.
@@ -240,16 +329,42 @@ struct HydrateOutcome {
     undecodable: u64,
     reencode_bad: u64,
     ms: u64,
+    /// The keys behind `undecodable` and `reencode_bad` (at most BAD_KEYS_CAP;
+    /// `bad_overflow` when there were more).
+    bad_keys: HashSet<[u8; 32]>,
+    bad_overflow: bool,
 }
 
+/// Phase B keeps the keys a hydrate could not load cleanly and never vouches
+/// for a ledger that writes one; past this many it vouches for nothing.
+const BAD_KEYS_CAP: usize = 4096;
+
+/// Phase B breaker: this many hash failures on our bytes within
+/// BREAKER_WINDOW ledgers turns the writer off until the next restart.
+const BREAKER_FAILS: usize = 3;
+const BREAKER_WINDOW: u32 = 1000;
+
 /// A ledger the sync loop processed while the mirror was still building.
-struct PendingLedger {
-    seq: u32,
-    parent_hash: [u8; 32],
-    parent_close_time: u32,
-    total_drops: u64,
-    txs: Vec<Value>,
-    overlay: LedgerOverlay,
+enum PendingLedger {
+    /// Phase A: apply it and compare against its FFI overlay.
+    Shadow {
+        seq: u32,
+        parent_hash: [u8; 32],
+        parent_close_time: u32,
+        total_drops: u64,
+        txs: Vec<Value>,
+        overlay: LedgerOverlay,
+    },
+    /// Phase B: the bytes ws-sync wrote for it; the mirror only follows them.
+    Written { seq: u32, written: LedgerOverlay },
+}
+
+impl PendingLedger {
+    fn seq(&self) -> u32 {
+        match self {
+            PendingLedger::Shadow { seq, .. } | PendingLedger::Written { seq, .. } => *seq,
+        }
+    }
 }
 
 /// Deeper than this and the wait is not a hydration any more — drop the
@@ -275,6 +390,9 @@ impl NativeShadow {
         // it lands (the JoinHandle is gone), and the buffer with it.
         self.hydrating = None;
         self.pending.clear();
+        self.held = None;
+        self.bad_keys.clear();
+        self.bad_overflow = false;
         // Keep the dashboard honest: the stats twin of `hydrated` stayed 1
         // through drops until 2026-08-31 (API said True over a dropped mirror).
         stats().hydrated.store(0, Ordering::Relaxed);
@@ -336,7 +454,37 @@ impl NativeShadow {
             hydrating: None,
             pending: Vec::new(),
             canary,
+            held: None,
+            distrust: None,
+            writer_log: None,
+            writer: false,
+            bad_keys: HashSet::new(),
+            bad_overflow: false,
+            writer_fails: Vec::new(),
+            writer_tripped: false,
         })
+    }
+
+    /// Phase B on: open the writer's log and mark it in the stats.
+    pub fn enable_writer(&mut self) {
+        self.writer = true;
+        stats().writer_enabled.store(1, Ordering::Relaxed);
+        let path = std::env::var("XRPL_NATIVE_WRITER_LOG").unwrap_or_else(|_| {
+            let receipts = std::env::var("XRPL_NATIVE_SHADOW_LOG")
+                .unwrap_or_else(|_| "/mnt/xrpl-data/native_shadow.jsonl".to_string());
+            std::path::Path::new(&receipts)
+                .parent()
+                .map(|d| d.join("native_writer.jsonl").display().to_string())
+                .unwrap_or_else(|| "native_writer.jsonl".to_string())
+        });
+        self.writer_log = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
+        eprintln!("[native-writer] ENABLED — our overlay writes state.rocks once the mirror is hydrated; decisions -> {path}");
+    }
+
+    fn writer_note(&mut self, line: Value) {
+        if let Some(f) = &mut self.writer_log {
+            let _ = writeln!(f, "{line}");
+        }
     }
 
     /// The receipt canary (2026-09-23). A zero-receipt soak proves nothing
@@ -457,6 +605,11 @@ impl NativeShadow {
         self.hydrated || self.hydrating.is_some()
     }
 
+    /// Phase B: the breaker turned the writer off; the mirror has no further use.
+    pub fn writer_tripped(&self) -> bool {
+        self.writer_tripped
+    }
+
     /// Land a finished build: install the mirror and replay everything the
     /// loop processed meanwhile, in order. Cheap when nothing is in flight.
     fn poll_hydrate(&mut self) {
@@ -480,13 +633,26 @@ impl NativeShadow {
             return;
         }
         let mut queued = std::mem::take(&mut self.pending);
-        queued.sort_by_key(|p| p.seq);
+        queued.sort_by_key(|p| p.seq());
         let n = queued.len();
         for p in queued {
-            if p.seq <= self.at_seq {
+            if p.seq() <= self.at_seq {
                 continue;
             }
-            self.on_ledger(p.seq, &p.parent_hash, p.parent_close_time, p.total_drops, &p.txs, &p.overlay);
+            match p {
+                PendingLedger::Shadow { seq, parent_hash, parent_close_time, total_drops, txs, overlay } => {
+                    self.on_ledger(seq, &parent_hash, parent_close_time, total_drops, &txs, &overlay);
+                }
+                PendingLedger::Written { seq, written } => {
+                    if self.at_seq + 1 != seq {
+                        stats().skipped_gap.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("[native-shadow] gap in the hydration backlog: mirror at #{}, next #{seq}", self.at_seq);
+                        self.drop_mirror("gap");
+                    } else {
+                        self.reconcile(seq, HashMap::new(), &written, true);
+                    }
+                }
+            }
             if !self.hydrated {
                 break; // a gap dropped the mirror mid-replay
             }
@@ -497,7 +663,10 @@ impl NativeShadow {
     }
 
     fn install_hydrate(&mut self, out: HydrateOutcome) {
-        let HydrateOutcome { state, at_seq, objects: n, undecodable: bad, reencode_bad: bad_rt, ms } = out;
+        let HydrateOutcome { state, at_seq, objects: n, undecodable: bad, reencode_bad: bad_rt, ms, bad_keys, bad_overflow } =
+            out;
+        self.bad_keys = bad_keys;
+        self.bad_overflow = bad_overflow;
         let as_of = at_seq;
         self.state = state;
         self.at_seq = as_of;
@@ -546,7 +715,7 @@ impl NativeShadow {
                     self.drop_mirror("hydrate backlog");
                     return;
                 }
-                self.pending.push(PendingLedger {
+                self.pending.push(PendingLedger::Shadow {
                     seq,
                     parent_hash: *parent_hash,
                     parent_close_time,
@@ -583,6 +752,22 @@ impl NativeShadow {
             return;
         }
         let t0 = std::time::Instant::now();
+        let ordered = apply_order(txs);
+        let applied = self.apply_ledger(seq, parent_hash, parent_close_time, total_drops, &ordered);
+        self.compare_and_report(seq, &ordered, &applied, ffi_overlay, t0);
+        self.reconcile(seq, applied.undo, ffi_overlay, false);
+    }
+
+    /// Apply ledger `seq`'s transactions (in apply order) to the mirror.
+    fn apply_ledger(
+        &mut self,
+        seq: u32,
+        parent_hash: &[u8; 32],
+        parent_close_time: u32,
+        total_drops: u64,
+        ordered: &[&Value],
+    ) -> Applied {
+        let st = stats();
         // The engine reads the BASE header: sequence/close_time of the PARENT
         // ledger (BookStep streams price expiry off sb.parentCloseTime) —
         // byte-identical recipe to state_replay's per-ledger header.
@@ -599,17 +784,13 @@ impl NativeShadow {
         };
         let parent_hash_hex = hex::encode_upper(parent_hash);
 
-        // Sort by TransactionIndex, exactly as the replay does.
-        let mut ordered: Vec<&Value> = txs.iter().collect();
-        ordered.sort_by_key(|t| t["metaData"]["TransactionIndex"].as_u64().unwrap_or(u64::MAX));
-
         // Batch (BatchV1_1): the ledger records every inner transaction as its
         // own entry (own hash, own meta carrying ParentBatchID, the indices
         // right after its outer) but rippled APPLIES it inside the outer's
         // application — and so does BatchTransactor::do_apply. The inner
         // entries are therefore skipped in the replay below and their metadata
         // is folded into the outer's, which is where our overlay reports them.
-        let attribution = crate::native_apply::batch_attribution(&ordered);
+        let attribution = crate::native_apply::batch_attribution(ordered);
         let by_hash: HashMap<String, &Value> = ordered
             .iter()
             .map(|t| (t["hash"].as_str().unwrap_or("").to_uppercase(), *t))
@@ -638,12 +819,16 @@ impl NativeShadow {
         }
 
         let mut ter_mm: Vec<String> = Vec::new();
-        for tx in &ordered {
+        let mut skipped = 0usize;
+        for tx in ordered {
             let this_hash = tx["hash"].as_str().unwrap_or("").to_uppercase();
             if attribution.skip.contains(&this_hash) {
                 continue; // applied inside its outer Batch
             }
-            let Some(txf) = build_txfields(tx) else { continue };
+            let Some(txf) = build_txfields(tx) else {
+                skipped += 1;
+                continue;
+            };
             let expected_ter = tx["metaData"]["TransactionResult"].as_str().unwrap_or("?");
             let tx_hash = tx["hash"].as_str().unwrap_or("").to_string();
             let (our_ter, mut mods) = native_apply_one(&self.state, &txf);
@@ -892,8 +1077,34 @@ impl NativeShadow {
                 dirty.insert(k);
             }
         }
+        // The skip list's pre-images, so an undo restores them too (update_skip_list
+        // writes the map and `dirty` but keeps no undo). Phase A's reconcile skips
+        // singleton undo entries, so this changes nothing there.
+        let mut skip_keys = vec![keylet::skip_list_key()];
+        if (seq - 1) & 0xff == 0 {
+            skip_keys.push(crate::native_apply::skip_every_key(seq - 1));
+        }
+        for k in skip_keys {
+            undo.entry(k).or_insert_with(|| self.state.state_map.lookup(&k).map(|b| b.to_vec()));
+        }
         update_skip_list(&mut self.state, &mut dirty, seq, &parent_hash_hex);
-        let canary = self.arm_canary(&dirty, ffi_overlay, seq);
+        Applied { dirty, undo, ter_mm, skipped }
+    }
+
+    /// Compare the applied ledger against the FFI overlay: receipts, counters
+    /// and the canary. The mirror keeps the native writes (plus a planted
+    /// canary) until the reconcile.
+    fn compare_and_report(
+        &mut self,
+        seq: u32,
+        ordered: &[&Value],
+        applied: &Applied,
+        ffi_overlay: &LedgerOverlay,
+        t0: std::time::Instant,
+    ) {
+        let st = stats();
+        let (dirty, undo, ter_mm) = (&applied.dirty, &applied.undo, &applied.ter_mm);
+        let canary = self.arm_canary(dirty, ffi_overlay, seq);
 
         // ---- Compare native overlay vs FFI overlay (singletons excluded) ----
         let mut missing: Vec<String> = Vec::new(); // FFI wrote, we didn't
@@ -963,7 +1174,7 @@ impl NativeShadow {
                             // died unclassifiable for want of this line.
                             let audit = pre_stale_audit(
                                 undo.get(&kh).and_then(|o| o.as_deref()),
-                                &ordered,
+                                ordered,
                                 &hex::encode_upper(k),
                             );
                             byte_diff.push(format!("{}:@{off} ours-len {} ffi-len {}{audit}", hex::encode_upper(k), ob.len(), fb.len()));
@@ -998,7 +1209,7 @@ impl NativeShadow {
                 }
             }
         }
-        for k in &dirty {
+        for k in dirty {
             if is_singleton_key(k, seq) {
                 continue;
             }
@@ -1106,14 +1317,25 @@ impl NativeShadow {
             }
         }
         st.apply_ms_last.store(t0.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
 
-        // ---- Reconcile the mirror onto the canonical trajectory ----
-        // Every non-singleton native write reverts to its pre-ledger value,
-        // then the FFI overlay's bytes (decoded to engine JSON) are applied.
-        // Singleton/skip-list writes stay native — the replay proved them and
-        // the FFI overlay never carries them.
+    /// Put the mirror back on the canonical trajectory and advance it to `seq`.
+    /// Every native write reverts to its pre-ledger value, then `canonical`'s
+    /// bytes (decoded to engine JSON) are applied. Phase A (`singletons_too`
+    /// false): singleton/skip-list writes stay native — the replay proved them
+    /// and the FFI overlay never carries them. Phase B (true): `canonical` is
+    /// everything ws-sync wrote, singletons included, so the mirror ends equal
+    /// to state.rocks.
+    fn reconcile(
+        &mut self,
+        seq: u32,
+        undo: HashMap<Hash256, Option<Vec<u8>>>,
+        canonical: &LedgerOverlay,
+        singletons_too: bool,
+    ) {
+        let st = stats();
         for (k, old) in undo {
-            if is_singleton_key(&k, seq) {
+            if !singletons_too && is_singleton_key(&k, seq) {
                 continue;
             }
             match old {
@@ -1125,9 +1347,9 @@ impl NativeShadow {
                 }
             }
         }
-        for (k, ffi_val) in ffi_overlay {
+        for (k, ffi_val) in canonical {
             let kh = Hash256(*k);
-            if is_singleton_key(&kh, seq) {
+            if !singletons_too && is_singleton_key(&kh, seq) {
                 continue;
             }
             match ffi_val {
@@ -1172,9 +1394,9 @@ impl NativeShadow {
                 .map_err(|e| format!("encode: {e:?}"))
         };
         let mut leak = 0u32;
-        for (k, ffi_val) in ffi_overlay {
+        for (k, ffi_val) in canonical {
             let kh = Hash256(*k);
-            if is_singleton_key(&kh, seq) {
+            if !singletons_too && is_singleton_key(&kh, seq) {
                 continue;
             }
             let mine = self.state.state_map.lookup(&kh).map(|b| b.to_vec());
@@ -1234,6 +1456,13 @@ impl NativeShadow {
             }
             if retry_fixed {
                 st.leak_retry_fixed.fetch_add(1, Ordering::Relaxed);
+            } else if self.writer {
+                // Phase B: the mirror cannot hold this entry right; never vouch for writing it.
+                if self.bad_keys.len() < BAD_KEYS_CAP {
+                    self.bad_keys.insert(*k);
+                } else {
+                    self.bad_overflow = true;
+                }
             }
             if leak <= 3 {
                 eprintln!(
@@ -1276,6 +1505,262 @@ impl NativeShadow {
         }
         self.at_seq = seq;
     }
+
+    // ---- Stage 4 Phase B: the native writer ---------------------------------
+
+    /// Apply ledger `seq` and offer its writes for state.rocks. None: no mirror
+    /// to apply on (still hydrating, a gap, or the retry of a ledger our bytes
+    /// failed the state hash on); ws-sync writes the network's bytes and the
+    /// commit brings the mirror along. `meta_keys` is every object the
+    /// metadata names (modified, created or deleted), `meta_deleted` the
+    /// deleted ones; `ffi_overlay`, when the FFI leg verified this ledger,
+    /// keeps the overlay-vs-overlay compare (receipts, canary) running.
+    /// Every Some must be settled with [`commit`](Self::commit) or
+    /// [`abort`](Self::abort) before the next call.
+    pub fn propose(
+        &mut self,
+        seq: u32,
+        parent_hash: &[u8; 32],
+        parent_close_time: u32,
+        total_drops: u64,
+        txs: &[Value],
+        meta_keys: &HashSet<[u8; 32]>,
+        meta_deleted: &HashSet<[u8; 32]>,
+        ffi_overlay: Option<&LedgerOverlay>,
+    ) -> Option<Proposal> {
+        let st = stats();
+        self.poll_hydrate();
+        if let Some(h) = self.held.take() {
+            eprintln!("[native-writer] #{}: proposal never settled — undone", h.seq);
+            self.revert(h.undo);
+        }
+        if !self.hydrated {
+            st.writer_unready.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        if self.at_seq + 1 != seq {
+            st.skipped_gap.fetch_add(1, Ordering::Relaxed);
+            st.writer_unready.fetch_add(1, Ordering::Relaxed);
+            eprintln!("[native-shadow] gap: mirror at #{}, asked for #{seq} — will re-hydrate", self.at_seq);
+            self.drop_mirror("gap");
+            return None;
+        }
+        if self.distrust == Some(seq) {
+            st.writer_distrusted.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        if self.writer_tripped {
+            st.writer_unready.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let t0 = std::time::Instant::now();
+        let ordered = apply_order(txs);
+        let applied = self.apply_ledger(seq, parent_hash, parent_close_time, total_drops, &ordered);
+        // Taken BEFORE the compare: a planted canary must never be written.
+        let (overlay, refusal) = self.vouch(seq, &applied, meta_keys, meta_deleted);
+        let real_tx = txs
+            .iter()
+            .any(|t| !PSEUDO_TX_TYPES.contains(&t["TransactionType"].as_str().unwrap_or("")));
+        match ffi_overlay {
+            // An empty overlay under real transactions: the FFI leg did not
+            // verify this ledger. Nothing to compare against; the mirror is
+            // unaffected, it follows what gets written.
+            Some(ffi) if !(ffi.is_empty() && real_tx) => self.compare_and_report(seq, &ordered, &applied, ffi, t0),
+            _ => st.apply_ms_last.store(t0.elapsed().as_millis() as u64, Ordering::Relaxed),
+        }
+        if let Some(why) = &refusal {
+            st.writer_refused.fetch_add(1, Ordering::Relaxed);
+            self.writer_note(json!({ "seq": seq, "refused": why }));
+        }
+        self.held = Some(Held { seq, undo: applied.undo });
+        Some(Proposal { overlay, refusal })
+    }
+
+    /// Our writes for the ledger, and the reason we cannot vouch for them, if
+    /// any: a result that disagrees with the metadata, an entry that will not
+    /// encode, or a key set that is not the metadata's exactly (a created or
+    /// modified object must be present, a deleted one absent).
+    fn vouch(
+        &self,
+        seq: u32,
+        applied: &Applied,
+        meta_keys: &HashSet<[u8; 32]>,
+        meta_deleted: &HashSet<[u8; 32]>,
+    ) -> (LedgerOverlay, Option<String>) {
+        let mut overlay = LedgerOverlay::new();
+        let mut refusal = applied.ter_mm.first().map(|m| format!("result {}", m.chars().take(160).collect::<String>()));
+        if applied.skipped > 0 {
+            refusal.get_or_insert_with(|| format!("{} transaction(s) the engine could not parse", applied.skipped));
+        }
+        if self.bad_overflow {
+            refusal.get_or_insert_with(|| format!("the mirror holds over {BAD_KEYS_CAP} entries it could not load cleanly"));
+        }
+        for k in &applied.dirty {
+            if is_singleton_key(k, seq) {
+                continue;
+            }
+            let pre = applied.undo.get(k).and_then(|o| o.as_deref());
+            let post = self.state.state_map.lookup(k);
+            if pre == post {
+                continue; // wrote back the pre-state: the network elides it too
+            }
+            // Different engine JSON, same canonical bytes: still no change.
+            if let (Some(a), Some(b)) = (pre, post) {
+                if matches!((encode_entry(a), encode_entry(b)), (Ok(x), Ok(y)) if x == y) {
+                    continue;
+                }
+            }
+            match post {
+                None => {
+                    overlay.insert(k.0, None);
+                }
+                Some(jb) => match encode_entry(jb) {
+                    Ok(b) => {
+                        overlay.insert(k.0, Some(b));
+                    }
+                    Err(e) => {
+                        refusal.get_or_insert_with(|| format!("encode {}: {e}", hex::encode_upper(k.0)));
+                    }
+                },
+            }
+        }
+        // Created and deleted inside the ledger: the metadata files it as
+        // deleted and our write nets to nothing. Agreed — delete it.
+        for k in meta_deleted {
+            if !is_singleton_key(&Hash256(*k), seq)
+                && !overlay.contains_key(k)
+                && self.state.state_map.lookup(&Hash256(*k)).is_none()
+            {
+                overlay.insert(*k, None);
+            }
+        }
+        if refusal.is_none() {
+            if let Some(k) = overlay.keys().chain(meta_keys.iter()).find(|k| self.bad_keys.contains(*k)) {
+                refusal = Some(format!("{} is an entry the mirror could not load cleanly", hex::encode_upper(k)));
+            }
+        }
+        if refusal.is_none() {
+            // ws-sync names the singletons by its own rule (the group key from seq / 65536); leave
+            // out both its set and ours, so the two rules never disagree into a false refusal.
+            let ws_singletons: HashSet<[u8; 32]> = crate::stage3::singleton_keys_for(seq)
+                .iter()
+                .filter_map(|h| hex::decode(h).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()))
+                .collect();
+            let theirs: HashSet<[u8; 32]> = meta_keys
+                .iter()
+                .filter(|k| !is_singleton_key(&Hash256(**k), seq) && !ws_singletons.contains(*k))
+                .copied()
+                .collect();
+            let ours: HashSet<[u8; 32]> = overlay.keys().copied().collect();
+            let only_ours: Vec<&[u8; 32]> = ours.difference(&theirs).collect();
+            let only_theirs: Vec<&[u8; 32]> = theirs.difference(&ours).collect();
+            let wrong_kind: Vec<&[u8; 32]> = overlay
+                .iter()
+                .filter(|(k, v)| meta_deleted.contains(*k) == v.is_some())
+                .map(|(k, _)| k)
+                .collect();
+            if !only_ours.is_empty() || !only_theirs.is_empty() || !wrong_kind.is_empty() {
+                let first = only_ours.first().or(only_theirs.first()).or(wrong_kind.first()).map(|k| hex::encode_upper(k));
+                refusal = Some(format!(
+                    "keys: {} ours only, {} network only, {} present/deleted the wrong way (first {})",
+                    only_ours.len(),
+                    only_theirs.len(),
+                    wrong_kind.len(),
+                    first.unwrap_or_default()
+                ));
+            }
+        }
+        (overlay, refusal)
+    }
+
+    /// The ledger landed: `written` is every key ws-sync put (Some) or deleted
+    /// (None), verified by the state hash. The mirror drops its own writes for
+    /// these and takes the written bytes, so it stays equal to state.rocks.
+    /// `ours`: the bytes were our proposal's.
+    pub fn commit(&mut self, seq: u32, written: &LedgerOverlay, ours: bool) {
+        let st = stats();
+        if ours {
+            st.writer_native.fetch_add(1, Ordering::Relaxed);
+        }
+        self.poll_hydrate();
+        if !self.hydrated {
+            self.held = None;
+            if self.distrust == Some(seq) {
+                self.distrust = None;
+            }
+            if self.hydrating.is_some() {
+                if self.pending.len() >= PENDING_CAP {
+                    eprintln!("[native-shadow] {PENDING_CAP} ledgers queued behind the hydrate — dropping the attempt");
+                    self.drop_mirror("hydrate backlog");
+                    return;
+                }
+                self.pending.push(PendingLedger::Written { seq, written: written.clone() });
+            }
+            return;
+        }
+        let undo = match self.held.take() {
+            Some(h) if h.seq == seq => h.undo,
+            Some(h) => {
+                eprintln!("[native-writer] #{seq} committed over an unsettled proposal for #{} — undone", h.seq);
+                self.revert(h.undo);
+                HashMap::new()
+            }
+            None => HashMap::new(),
+        };
+        if self.at_seq + 1 != seq {
+            st.skipped_gap.fetch_add(1, Ordering::Relaxed);
+            eprintln!("[native-shadow] gap: mirror at #{}, #{seq} written — will re-hydrate", self.at_seq);
+            self.drop_mirror("gap");
+            return;
+        }
+        self.reconcile(seq, undo, written, true);
+        if self.distrust == Some(seq) {
+            self.distrust = None;
+        }
+    }
+
+    /// Nothing landed for `seq` (the write was held back or rolled back):
+    /// undo our writes so the mirror is the parent ledger again.
+    /// `mismatch_on_ours`: our bytes were written and failed the state hash.
+    /// The retry is written from the network's bytes; the mirror is dropped
+    /// (a stale entry the engine only READ would repeat the failure) and
+    /// re-hydrates after the cooldown; BREAKER_FAILS of these within
+    /// BREAKER_WINDOW ledgers turn the writer off until the next restart.
+    pub fn abort(&mut self, seq: u32, mismatch_on_ours: bool) {
+        if let Some(h) = self.held.take() {
+            self.revert(h.undo);
+        }
+        if mismatch_on_ours {
+            let st = stats();
+            st.writer_mismatch.fetch_add(1, Ordering::Relaxed);
+            self.distrust = Some(seq);
+            self.writer_fails.retain(|s| seq.saturating_sub(*s) < BREAKER_WINDOW);
+            self.writer_fails.push(seq);
+            let tripped = self.writer_fails.len() >= BREAKER_FAILS && !self.writer_tripped;
+            eprintln!("[native-writer] #{seq}: our bytes failed the state hash — rolled back; the retry uses the network's");
+            self.writer_note(json!({ "seq": seq, "mismatch": true, "recent": self.writer_fails }));
+            if tripped {
+                self.writer_tripped = true;
+                st.writer_breaker.store(1, Ordering::Relaxed);
+                eprintln!(
+                    "[native-writer] BREAKER: {} hash failures on our bytes within {BREAKER_WINDOW} ledgers — writer OFF until restart; state comes from the network",
+                    self.writer_fails.len()
+                );
+                self.writer_note(json!({ "seq": seq, "breaker": true, "fails": self.writer_fails }));
+            }
+            self.drop_mirror("hash failure on our bytes");
+        }
+    }
+
+    /// Restore pre-images, singletons included.
+    fn revert(&mut self, undo: HashMap<Hash256, Option<Vec<u8>>>) {
+        for (k, old) in undo {
+            match old {
+                Some(b) => note_map_op(self.state.state_map.insert(k, b)),
+                None => note_map_op(self.state.state_map.delete(&k)),
+            }
+        }
+    }
 }
 
 /// The hydrate scan, on its own thread: every binary SLE in the snapshot
@@ -1299,6 +1784,16 @@ fn build_mirror(
     // failures are counted and the first few named. Costs roughly half
     // the scan time again; XRPL_SHADOW_HYDRATE_AUDIT=0 disables.
     let mut bad_rt = 0u64;
+    // Phase B: which keys those were (the writer never vouches for writing one).
+    let mut bad_keys: HashSet<[u8; 32]> = HashSet::new();
+    let mut bad_overflow = false;
+    let mut note_bad = |key: [u8; 32]| {
+        if bad_keys.len() < BAD_KEYS_CAP {
+            bad_keys.insert(key);
+        } else {
+            bad_overflow = true;
+        }
+    };
     // Trust the store's own stamp over the caller's belief: the writer
     // stamps last-written-seq inside each ledger's atomic batch, and the
     // sync loop is frozen while we scan, so the stamp IS the scan's
@@ -1340,6 +1835,7 @@ fn build_mirror(
                         .unwrap_or(false);
                     if !ok {
                         bad_rt += 1;
+                        note_bad(key);
                         if bad_rt <= 5 {
                             eprintln!(
                                 "[native-shadow] hydrate REENCODE-BAD {} ({} bytes)",
@@ -1364,6 +1860,7 @@ fn build_mirror(
             }
             Err(_) => {
                 bad += 1;
+                note_bad(key);
             }
         }
     }
@@ -1371,7 +1868,16 @@ fn build_mirror(
     if n == 0 {
         return None;
     }
-    Some(HydrateOutcome { state, at_seq: as_of, objects: n, undecodable: bad, reencode_bad: bad_rt, ms })
+    Some(HydrateOutcome {
+        state,
+        at_seq: as_of,
+        objects: n,
+        undecodable: bad,
+        reencode_bad: bad_rt,
+        ms,
+        bad_keys,
+        bad_overflow,
+    })
 }
 
 #[cfg(test)]
@@ -1431,6 +1937,216 @@ mod tests {
             hydrating: None,
             pending: Vec::new(),
             canary: Some(trigger.to_path_buf()),
+            held: None,
+            distrust: None,
+            writer_log: None,
+            writer: false,
+            bad_keys: HashSet::new(),
+            bad_overflow: false,
+            writer_fails: Vec::new(),
+            writer_tripped: false,
+        }
+    }
+
+    // ---- Phase B: the native writer ----
+
+    /// The keys the network's metadata names for the payment ledger: exactly
+    /// the bundle's post-state keys (its `expect`), singletons aside.
+    fn meta_of(overlay: &LedgerOverlay) -> (HashSet<[u8; 32]>, HashSet<[u8; 32]>) {
+        let keys = overlay.keys().copied().collect();
+        let deleted = overlay.iter().filter(|(_, v)| v.is_none()).map(|(k, _)| *k).collect();
+        (keys, deleted)
+    }
+
+    fn reencoded(sh: &NativeShadow, k: &[u8; 32]) -> Option<Vec<u8>> {
+        sh.state.state_map.lookup(&Hash256(*k)).map(|jb| encode_entry(jb).unwrap())
+    }
+
+    #[test]
+    fn the_writer_vouches_for_a_ledger_it_matches_and_offers_the_networks_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, trigger) = (dir.path().join("receipts.jsonl"), dir.path().join("native_shadow.canary"));
+        let (seq, parent, pct, drops, tx, state, overlay) = payment_ledger();
+        let (keys, deleted) = meta_of(&overlay);
+        let mut sh = shadow(state, seq - 1, &log, &trigger);
+        let p = sh.propose(seq, &parent, pct, drops, &[tx], &keys, &deleted, Some(&overlay)).unwrap();
+        assert_eq!(p.refusal, None, "every result and every key agrees");
+        assert_eq!(p.overlay, overlay, "our writes are the network's post-state bytes, byte for byte");
+        sh.commit(seq, &p.overlay, true);
+        assert_eq!(sh.at_seq, seq);
+        for (k, v) in &overlay {
+            assert_eq!(&reencoded(&sh, k), v, "the mirror holds what was written");
+        }
+        assert!(lines(&log).is_empty(), "a clean ledger leaves no receipt");
+    }
+
+    #[test]
+    fn the_writer_refuses_a_key_set_the_metadata_does_not_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, trigger) = (dir.path().join("receipts.jsonl"), dir.path().join("native_shadow.canary"));
+        let (seq, parent, pct, drops, tx, state, overlay) = payment_ledger();
+        let (mut keys, deleted) = meta_of(&overlay);
+        let dropped = *keys.iter().min().unwrap();
+        keys.remove(&dropped);
+        let mut sh = shadow(state, seq - 1, &log, &trigger);
+        let p = sh.propose(seq, &parent, pct, drops, &[tx], &keys, &deleted, None).unwrap();
+        let why = p.refusal.expect("one object the network never touched: no vouch");
+        assert!(why.starts_with("keys: 1 ours only"), "{why}");
+        // ws-sync writes the network's bytes instead; the mirror follows them.
+        sh.commit(seq, &overlay, false);
+        assert_eq!(sh.at_seq, seq);
+        for (k, v) in &overlay {
+            assert_eq!(&reencoded(&sh, k), v);
+        }
+    }
+
+    #[test]
+    fn the_writer_refuses_a_result_the_metadata_disagrees_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, trigger) = (dir.path().join("receipts.jsonl"), dir.path().join("native_shadow.canary"));
+        let (seq, parent, pct, drops, mut tx, state, overlay) = payment_ledger();
+        tx["metaData"]["TransactionResult"] = json!("tecUNFUNDED_PAYMENT");
+        let (keys, deleted) = meta_of(&overlay);
+        let mut sh = shadow(state, seq - 1, &log, &trigger);
+        let p = sh.propose(seq, &parent, pct, drops, &[tx], &keys, &deleted, None).unwrap();
+        let why = p.refusal.expect("a result that disagrees: no vouch");
+        assert!(why.starts_with("result ") && why.contains("tecUNFUNDED_PAYMENT"), "{why}");
+    }
+
+    #[test]
+    fn an_abort_restores_the_parent_skip_list_included() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, trigger) = (dir.path().join("receipts.jsonl"), dir.path().join("native_shadow.canary"));
+        let (seq, parent, pct, drops, tx, state, overlay) = payment_ledger();
+        let (keys, deleted) = meta_of(&overlay);
+        let mut sh = shadow(state, seq - 1, &log, &trigger);
+        let mut watched: Vec<Hash256> = overlay.keys().map(|k| Hash256(*k)).collect();
+        watched.push(keylet::skip_list_key());
+        let before: Vec<Option<Vec<u8>>> = watched.iter().map(|k| sh.state.state_map.lookup(k).map(|b| b.to_vec())).collect();
+        let txs = [tx];
+        sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).unwrap();
+        sh.abort(seq, false);
+        assert_eq!(sh.at_seq, seq - 1, "nothing landed: still the parent");
+        let after: Vec<Option<Vec<u8>>> = watched.iter().map(|k| sh.state.state_map.lookup(k).map(|b| b.to_vec())).collect();
+        assert_eq!(after, before, "every pre-image restored, the skip list's too");
+        let p = sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).unwrap();
+        assert_eq!(p.refusal, None, "a plain abort leaves the retry to us");
+        assert_eq!(p.overlay, overlay, "and the retry offers the same bytes");
+    }
+
+    #[test]
+    fn a_hash_failure_on_our_bytes_drops_the_mirror_and_the_retry_is_the_networks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, trigger) = (dir.path().join("receipts.jsonl"), dir.path().join("native_shadow.canary"));
+        let (seq, parent, pct, drops, tx, state, overlay) = payment_ledger();
+        let (keys, deleted) = meta_of(&overlay);
+        let mut sh = shadow(state, seq - 1, &log, &trigger);
+        let failed = stats().writer_mismatch.load(Ordering::Relaxed);
+        let txs = [tx];
+        sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).unwrap();
+        sh.abort(seq, true);
+        assert!(stats().writer_mismatch.load(Ordering::Relaxed) > failed);
+        assert!(!sh.hydrated, "a mirror that produced wrong bytes is not trusted again: re-hydrate");
+        assert_eq!(sh.distrust, Some(seq));
+        assert!(sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).is_none());
+        sh.commit(seq, &overlay, false);
+        assert_eq!(sh.distrust, None, "the network's write clears it");
+    }
+
+    #[test]
+    fn the_breaker_turns_the_writer_off_after_repeated_hash_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, trigger) = (dir.path().join("receipts.jsonl"), dir.path().join("native_shadow.canary"));
+        let (seq, parent, pct, drops, tx, state, overlay) = payment_ledger();
+        let (keys, deleted) = meta_of(&overlay);
+        let mut sh = shadow(LedgerState::new_unverified(state.header.clone()), 0, &log, &trigger);
+        let txs = [tx];
+        for n in 0..BREAKER_FAILS {
+            let (_, _, _, _, _, fresh, _) = payment_ledger();
+            sh.state = fresh;
+            sh.hydrated = true;
+            sh.at_seq = seq - 1;
+            sh.distrust = None;
+            assert!(!sh.writer_tripped(), "not yet, after {n}");
+            sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).unwrap();
+            sh.abort(seq, true);
+        }
+        assert!(sh.writer_tripped(), "{BREAKER_FAILS} failures inside the window");
+        assert_eq!(stats().writer_breaker.load(Ordering::Relaxed), 1);
+        sh.state = state;
+        sh.hydrated = true;
+        sh.at_seq = seq - 1;
+        sh.distrust = None;
+        assert!(sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).is_none(), "the writer stays off");
+    }
+
+    #[test]
+    fn the_writer_never_vouches_for_writing_an_entry_the_mirror_could_not_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, trigger) = (dir.path().join("receipts.jsonl"), dir.path().join("native_shadow.canary"));
+        let (seq, parent, pct, drops, tx, state, overlay) = payment_ledger();
+        let (keys, deleted) = meta_of(&overlay);
+        let mut sh = shadow(state, seq - 1, &log, &trigger);
+        let bad = *overlay.keys().min().unwrap();
+        sh.bad_keys.insert(bad);
+        let p = sh.propose(seq, &parent, pct, drops, &[tx], &keys, &deleted, None).unwrap();
+        let why = p.refusal.expect("a bad entry in the write set: no vouch");
+        assert!(why.contains(&hex::encode_upper(bad)) && why.contains("could not load cleanly"), "{why}");
+    }
+
+    #[test]
+    fn a_planted_canary_is_compared_but_never_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, trigger) = (dir.path().join("receipts.jsonl"), dir.path().join("native_shadow.canary"));
+        std::fs::write(&trigger, b"").unwrap();
+        let (seq, parent, pct, drops, tx, state, overlay) = payment_ledger();
+        let (keys, deleted) = meta_of(&overlay);
+        let mut sh = shadow(state, seq - 1, &log, &trigger);
+        let p = sh.propose(seq, &parent, pct, drops, &[tx], &keys, &deleted, Some(&overlay)).unwrap();
+        assert_eq!(p.overlay, overlay, "the offered bytes carry no plant");
+        let got = lines(&log);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0]["canary"]["detected"], json!(true), "the compare still sees it");
+        sh.commit(seq, &p.overlay, true);
+        for (k, v) in &overlay {
+            assert_eq!(&reencoded(&sh, k), v, "and the mirror healed");
+        }
+    }
+
+    #[test]
+    fn ledgers_written_while_the_mirror_builds_replay_onto_it_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, trigger) = (dir.path().join("receipts.jsonl"), dir.path().join("native_shadow.canary"));
+        let (seq, parent, pct, drops, tx, state, overlay) = payment_ledger();
+        let (keys, deleted) = meta_of(&overlay);
+        let mut sh = shadow(LedgerState::new_unverified(state.header.clone()), 0, &log, &trigger);
+        sh.hydrated = false;
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        sh.hydrating = Some(std::thread::spawn(move || {
+            wait.recv().unwrap();
+            Some(HydrateOutcome {
+                state,
+                at_seq: seq - 1,
+                objects: 1,
+                undecodable: 0,
+                reencode_bad: 0,
+                ms: 0,
+                bad_keys: HashSet::new(),
+                bad_overflow: false,
+            })
+        }));
+        assert!(sh.propose(seq, &parent, pct, drops, &[tx], &keys, &deleted, None).is_none(), "no mirror yet");
+        sh.commit(seq, &overlay, false);
+        assert_eq!(sh.pending.len(), 1, "queued behind the build");
+        go.send(()).unwrap();
+        while !sh.hydrating.as_ref().unwrap().is_finished() {
+            std::thread::yield_now();
+        }
+        sh.poll_hydrate();
+        assert!(sh.hydrated);
+        assert_eq!(sh.at_seq, seq, "the written ledger replayed onto the fresh mirror");
+        for (k, v) in &overlay {
+            assert_eq!(&reencoded(&sh, k), v);
         }
     }
 
