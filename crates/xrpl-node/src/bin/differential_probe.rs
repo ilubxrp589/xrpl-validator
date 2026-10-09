@@ -2623,7 +2623,14 @@ fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<Hash
     } else if applied.is_claimed() {
         // See apply.rs: tecKILLED carries OfferCreate's stale-offer cleanup,
         // which the transactor has already rolled its fills back around.
-        if applied != TxResult::Killed {
+        // tecEXPIRED keeps its NFTokenOffer / Credential erasures (finding
+        // 245), as the node's native_apply_one does: this copy restored the
+        // snapshot instead, so a Payment naming an expired credential
+        // (campaign 23, devnet #5533675 7E7F5D06640B) kept the credential
+        // the network deleted.
+        if applied == TxResult::Expired {
+            xrpl_ledger::ledger::apply::settle_expired(&mut sb, snap);
+        } else if applied != TxResult::Killed {
             sb.restore_snapshot(snap);
         }
         (applied.code_str().to_string(), sb.into_modifications())
