@@ -8,19 +8,19 @@
 //!   * RUST ENGINE and C++ COPY — the two transaction engines, each against mainnet and against each other;
 //!   * UPSTREAM + AMENDMENTS — the xrpld we pull from, and the amendments on their way to activation;
 //!   * CONSENSUS — the UNL's votes, one dot per trusted validator;
-//!   * EVENTS — what changed: receipts, writer decisions, disagreements, milestones.
+//!   * EVERY TRANSACTION TYPE and EVERY RESULT CODE since the validator started, and THIS LEDGER's mix;
+//!   * the latest event, one line: receipts, writer decisions, disagreements, milestones.
 //!
 //! It reads the validator's API (VALIDATOR_BASE, default http://localhost:3777), the upstream's server_info and
 //! feature (UPSTREAM_RPC, else the validator's XRPL_RPC_URL), and two files on the validator host: the native
 //! shadow's receipts and the writer's decisions. It writes nothing.
 //!
-//!   xrpl-watch                         the live screen (q quits, p pauses, c clears events)
+//!   xrpl-watch                         the live screen (q quits, p pauses)
 //!   xrpl-watch --once [--size 160x48]  one frame as ANSI text on stdout
 //!   xrpl-watch --record DIR [--frames N] [--interval S] [--size WxH]
 //!                                      N frames, one every S seconds, as DIR/frame_00001.ans … (for videos)
-//!   --view types                       with --once/--record: the every-type-and-result page
 //!   --basic                            16 colours instead of 24-bit (old terminals)
-//!   keys: q quit · t every type & result · p pause · c clear events
+//!   keys: q quit · p pause
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
@@ -821,31 +821,19 @@ fn problems(sn: &Snap) -> Vec<String> {
 // ---------------------------------------------------------------------------------------------------------------
 // The screen
 
-#[derive(Clone, Copy, PartialEq)]
-enum View {
-    Main,
-    Types,
-}
-
-fn draw(f: &mut Frame, g: &Shared, paused: bool, view: View) {
+fn draw(f: &mut Frame, g: &Shared, paused: bool) {
     let p = pal();
     let area = f.area();
     f.render_widget(Block::new().style(Style::new().bg(p.bg)), area);
-    if view == View::Types {
-        let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(5), Constraint::Length(1)]).split(area);
-        draw_header(f, rows[0], &g.snap);
-        draw_types_page(f, rows[1], &g.snap);
-        draw_footer(f, rows[2], &g.snap, paused, view);
-        return;
-    }
     let rows = Layout::vertical([
-        Constraint::Length(1), // header
-        Constraint::Length(4), // ledger tape
-        Constraint::Length(8), // who writes + signing gate
+        Constraint::Length(1),  // header
+        Constraint::Length(4),  // ledger tape
+        Constraint::Length(8),  // who writes + signing gate
         Constraint::Length(11), // rust engine + C++ copy
-        Constraint::Length(7), // upstream + amendments, consensus
-        Constraint::Min(4),    // events
-        Constraint::Length(1), // footer
+        Constraint::Length(7),  // upstream + amendments, consensus
+        Constraint::Min(5),     // every type, every result, this ledger
+        Constraint::Length(1),  // the latest event
+        Constraint::Length(1),  // footer
     ])
     .split(area);
     draw_header(f, rows[0], &g.snap);
@@ -859,10 +847,12 @@ fn draw(f: &mut Frame, g: &Shared, paused: bool, view: View) {
     let low = Layout::horizontal([Constraint::Percentage(56), Constraint::Percentage(44)]).split(rows[4]);
     draw_upstream(f, low[0], &g.snap);
     draw_consensus(f, low[1], &g.snap);
-    let bottom = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).split(rows[5]);
-    draw_events(f, bottom[0], g);
-    draw_ledger_mix(f, bottom[1], &g.snap);
-    draw_footer(f, rows[6], &g.snap, paused, view);
+    let bottom = Layout::horizontal([Constraint::Percentage(36), Constraint::Percentage(44), Constraint::Percentage(20)]).split(rows[5]);
+    draw_counts(f, bottom[0], &g.snap, true);
+    draw_counts(f, bottom[1], &g.snap, false);
+    draw_ledger_mix(f, bottom[2], &g.snap);
+    draw_ticker(f, rows[6], g);
+    draw_footer(f, rows[7], &g.snap, paused);
 }
 
 fn draw_header(f: &mut Frame, r: Rect, sn: &Snap) {
@@ -1272,16 +1262,8 @@ fn draw_cpp(f: &mut Frame, r: Rect, sn: &Snap) {
     ]));
     let (hits, fb) = (u(ffi, &["db_hits"]), u(ffi, &["db_rpc_fallbacks"]));
     lines.push(Line::from(vec![label("reads"), ink(format!("{:.2}% over RPC", pct(fb, hits + fb))), dim(" — keys our DB lacked")]));
-    let width = (r.width as usize).saturating_sub(2 + 11);
-    for (name, key) in [("types", "apply_by_type"), ("results", "live_apply_ter_counts")] {
-        let rows = fit_rows(&counts(&ffi[key]), width, 2);
-        for (i, row) in rows.into_iter().enumerate() {
-            let mut v = vec![label(if i == 0 { name } else { "" })];
-            v.extend(row);
-            lines.push(Line::from(v));
-        }
-    }
-    f.render_widget(Paragraph::new(lines).block(block), r);
+    lines.push(Line::from(vec![label("ledgers"), ink(format!("{} applied since start", commas(u(ffi, &["ledgers_applied"]))))]));
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(block), r);
 }
 
 /// A JSON {name: count} map, largest first.
@@ -1291,63 +1273,52 @@ fn counts(v: &Value) -> Vec<(String, u64)> {
     out
 }
 
-/// "Name 1,234 · Name 567 · …" packed into `rows` lines of `width` cells; the last line ends "+N more · t" when
-/// some did not fit.
-fn fit_rows(items: &[(String, u64)], width: usize, rows: usize) -> Vec<Vec<Span<'static>>> {
-    let p = pal();
-    let mut out: Vec<Vec<Span<'static>>> = vec![Vec::new()];
-    let mut used = 0usize;
-    for (i, (k, n)) in items.iter().enumerate() {
-        let piece = format!("{k} {}", commas(*n));
-        let sep = if used == 0 { 0 } else { 3 };
-        let last_row = out.len() == rows;
-        let left = items.len() - i;
-        let more = format!("+{left} more · t");
-        let need = sep + piece.chars().count() + if last_row && left > 1 { 3 + more.chars().count() } else { 0 };
-        if used + need > width {
-            if last_row {
-                let row = out.last_mut().unwrap();
-                row.push(Span::styled(format!("{}{more}", if used == 0 { "" } else { " · " }), Style::new().fg(p.violet)));
-                return out;
-            }
-            out.push(Vec::new());
-            used = 0;
+/// A name made to fit `w` cells: long words shortened, then the middle elided.
+fn fit_name(k: &str, w: usize) -> String {
+    let mut n = k.to_string();
+    for (a, b) in [("Permissioned", "Perm"), ("Issuance", "Iss"), ("Authorize", "Auth"), ("INSUFFICIENT", "INSUF"), ("Credential", "Cred")] {
+        if n.chars().count() > w {
+            n = n.replace(a, b);
         }
-        let row = out.last_mut().unwrap();
-        if used > 0 {
-            row.push(Span::styled(" · ", Style::new().fg(p.dim)));
-            used += 3;
-        }
-        row.push(Span::styled(format!("{k} "), Style::new().fg(p.dim)));
-        row.push(Span::styled(commas(*n), Style::new().fg(p.ink)));
-        used += piece.chars().count();
     }
-    out
+    let len = n.chars().count();
+    if len <= w || w < 4 {
+        return n.chars().take(w).collect();
+    }
+    let head = (w - 1) / 2;
+    let tail = w - 1 - head;
+    let c: Vec<char> = n.chars().collect();
+    format!("{}…{}", c[..head].iter().collect::<String>(), c[len - tail..].iter().collect::<String>())
 }
 
-/// The `t` page: every transaction type and every result code since the validator started, with log-scaled bars.
-fn draw_types_page(f: &mut Frame, r: Rect, sn: &Snap) {
+/// Every transaction type (or every result code) since the validator started, packed in columns: a magnitude
+/// glyph (log-scaled), the name, the count. When they outgrow the panel, the last cell says how many are left.
+fn draw_counts(f: &mut Frame, r: Rect, sn: &Snap, types: bool) {
     let p = pal();
     let ffi = &sn.eng["ffi_verifier"];
-    let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(r);
-    let types = counts(&ffi["apply_by_type"]);
-    let ters = counts(&ffi["live_apply_ter_counts"]);
-    let n_tx: u64 = types.iter().map(|x| x.1).sum();
-    let n_ok = ters.iter().find(|x| x.0 == "tesSUCCESS").map(|x| x.1).unwrap_or(0);
-    let n_res: u64 = ters.iter().map(|x| x.1).sum();
-    let type_color = |k: &str| {
-        if k.starts_with("Offer") || k.starts_with("AMM") {
-            p.pink
-        } else if k.starts_with("Payment") || k.starts_with("Check") {
-            p.feed
-        } else if k.starts_with("NFToken") {
-            p.violet
-        } else {
-            p.gold
-        }
+    let items = counts(&ffi[if types { "apply_by_type" } else { "live_apply_ter_counts" }]);
+    let total: u64 = items.iter().map(|x| x.1).sum();
+    let (title, sub, col) = if types {
+        ("EVERY TX TYPE", format!(" {} · {} txs since start", items.len(), commas(total)), p.feed)
+    } else {
+        let ok = items.iter().find(|x| x.0 == "tesSUCCESS").map(|x| x.1).unwrap_or(0);
+        ("EVERY RESULT CODE", format!(" {} · {:.1}% tesSUCCESS · tec = failed, fee paid", items.len(), pct(ok, total)), p.good)
     };
-    let ter_color = |k: &str| {
-        if k == "tesSUCCESS" {
+    let block = panel(vec![bold(title, col), dim(sub)], col);
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    let color = |k: &str| {
+        if types {
+            if k.starts_with("Offer") || k.starts_with("AMM") {
+                p.pink
+            } else if k.starts_with("Payment") || k.starts_with("Check") {
+                p.feed
+            } else if k.starts_with("NFToken") {
+                p.violet
+            } else {
+                p.gold
+            }
+        } else if k == "tesSUCCESS" {
             p.good
         } else if k.starts_with("tec") {
             p.warn
@@ -1355,45 +1326,57 @@ fn draw_types_page(f: &mut Frame, r: Rect, sn: &Snap) {
             p.bad
         }
     };
-    let pages: [(&str, String, &Vec<(String, u64)>, Color, &dyn Fn(&str) -> Color); 2] = [
-        ("TRANSACTION TYPES", format!(" {} types · {} transactions since start", types.len(), commas(n_tx)), &types, p.feed, &type_color),
-        (
-            "RESULT CODES",
-            format!(" {} codes · {:.1}% tesSUCCESS · tec = failed but fee charged", ters.len(), pct(n_ok, n_res)),
-            &ters,
-            p.good,
-            &ter_color,
-        ),
-    ];
-    for (i, (title, sub, items, col, colorer)) in pages.iter().enumerate() {
-        let block = panel(vec![bold(*title, *col), dim(sub.clone())], *col);
-        let inner = block.inner(cols[i]);
-        f.render_widget(block, cols[i]);
-        let rows = inner.height as usize;
-        let ncol = items.len().div_ceil(rows.max(1)).max(1);
-        let colw = inner.width as usize / ncol;
-        let max = items.first().map(|x| x.1).unwrap_or(1).max(1) as f64;
-        let name_w = items.iter().map(|x| x.0.chars().count()).max().unwrap_or(8).min(colw.saturating_sub(16));
-        let bar_w = colw.saturating_sub(name_w + 10);
-        let sub_cols = Layout::horizontal(vec![Constraint::Length(colw as u16); ncol]).split(inner);
-        for c in 0..ncol {
-            let lines: Vec<Line> = items
-                .iter()
-                .skip(c * rows)
-                .take(rows)
-                .map(|(k, n)| {
-                    let len = (((*n as f64).ln_1p() / max.ln_1p()) * bar_w as f64).round().max(1.0) as usize;
-                    let kc = colorer(k);
-                    Line::from(vec![
-                        Span::styled(format!("{:<w$} ", k.chars().take(name_w).collect::<String>(), w = name_w), Style::new().fg(kc)),
-                        Span::styled(format!("{:>8} ", commas(*n)), Style::new().fg(p.ink)),
-                        Span::styled("▆".repeat(len), Style::new().fg(kc)),
-                    ])
-                })
-                .collect();
-            f.render_widget(Paragraph::new(lines), sub_cols[c]);
+    const GLYPH: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+    let max = items.first().map(|x| x.1).unwrap_or(1).max(1) as f64;
+    let count_w = items.iter().map(|x| commas(x.1).chars().count()).max().unwrap_or(1);
+    let rows = (inner.height as usize).max(1);
+    let min_col = 2 + 12 + 1 + count_w + 1;
+    let ncol = ((inner.width as usize) / min_col).clamp(1, items.len().div_ceil(rows).max(1));
+    let colw = inner.width as usize / ncol;
+    let name_w = colw.saturating_sub(2 + 1 + count_w + 1);
+    let cap = ncol * rows;
+    let cols = Layout::horizontal(vec![Constraint::Length(colw as u16); ncol]).split(inner);
+    for c in 0..ncol {
+        let mut lines: Vec<Line> = Vec::new();
+        for i in c * rows..((c + 1) * rows).min(items.len()) {
+            if items.len() > cap && i == cap - 1 {
+                lines.push(Line::from(Span::styled(format!("  +{} more", items.len() - i), Style::new().fg(p.violet))));
+                break;
+            }
+            let (k, n) = &items[i];
+            let g = ((((*n as f64).ln_1p() / max.ln_1p()) * 7.0).round() as usize).min(7);
+            let kc = color(k);
+            lines.push(Line::from(vec![
+                Span::styled(format!("{} ", GLYPH[g]), Style::new().fg(kc)),
+                Span::styled(format!("{:<w$} ", fit_name(k, name_w), w = name_w), Style::new().fg(kc)),
+                Span::styled(format!("{:>w$}", commas(*n), w = count_w), Style::new().fg(p.ink)),
+            ]));
         }
+        f.render_widget(Paragraph::new(lines), cols[c]);
     }
+}
+
+/// The event feed, cut to its newest line.
+fn draw_ticker(f: &mut Frame, r: Rect, g: &Shared) {
+    let p = pal();
+    let line = match g.events.front() {
+        Some(e) => {
+            let (c, mark) = match e.tone {
+                Tone::Good => (p.good, "✓"),
+                Tone::Info => (p.ink, "·"),
+                Tone::Warn => (p.warn, "!"),
+                Tone::Bad => (p.bad, "✗"),
+            };
+            Line::from(vec![
+                Span::styled(" ▸ latest ", Style::new().fg(p.violet).add_modifier(Modifier::BOLD)),
+                dim(format!("{} ", e.at)),
+                bold(format!("{mark} "), c),
+                sp(e.text.clone(), c),
+            ])
+        }
+        None => Line::from(dim(" ▸ latest — nothing yet")),
+    };
+    f.render_widget(Paragraph::new(line), r);
 }
 
 fn draw_upstream(f: &mut Frame, r: Rect, sn: &Snap) {
@@ -1481,7 +1464,8 @@ fn draw_ledger_mix(f: &mut Frame, r: Rect, sn: &Snap) {
     let ffi = &sn.eng["ffi_verifier"];
     let seq = u(ffi, &["round_ledger_seq"]);
     let n = u(ffi, &["round_tx_count"]);
-    let block = panel(vec![bold("THIS LEDGER", p.gold), dim(format!(" #{} · {} transactions", commas(seq), n))], p.gold);
+    let block = panel(vec![bold("THIS LEDGER", p.gold), dim(format!(" {n} txs"))], p.gold);
+    let _ = seq;
     let inner = block.inner(r);
     f.render_widget(block, r);
     let mut v: Vec<(String, u64)> = ffi["round_tx_types"]
@@ -1492,8 +1476,9 @@ fn draw_ledger_mix(f: &mut Frame, r: Rect, sn: &Snap) {
         .collect();
     v.sort_by(|a, b| b.1.cmp(&a.1));
     let max = v.first().map(|x| x.1).unwrap_or(1).max(1);
-    let bar_w = (inner.width as usize).saturating_sub(24);
-    let rows = (inner.height as usize).saturating_sub(1);
+    let name_w = v.iter().map(|x| x.0.chars().count()).max().unwrap_or(8).min((inner.width as usize).saturating_sub(10));
+    let bar_w = (inner.width as usize).saturating_sub(name_w + 5);
+    let rows = (inner.height as usize).saturating_sub(2);
     let mut lines: Vec<Line> = v
         .iter()
         .take(rows)
@@ -1509,7 +1494,7 @@ fn draw_ledger_mix(f: &mut Frame, r: Rect, sn: &Snap) {
             };
             let len = ((*c as f64 / max as f64) * bar_w as f64).ceil() as usize;
             Line::from(vec![
-                Span::styled(format!("{k:<18}"), Style::new().fg(col)),
+                Span::styled(format!("{:<w$}", fit_name(k, name_w), w = name_w), Style::new().fg(col)),
                 Span::styled(format!("{c:>3} "), Style::new().fg(p.ink)),
                 Span::styled("▆".repeat(len.max(1)), Style::new().fg(col)),
             ])
@@ -1520,42 +1505,14 @@ fn draw_ledger_mix(f: &mut Frame, r: Rect, sn: &Snap) {
     }
     let fees = u(ffi, &["round_fees_drops"]);
     let total = u(ffi, &["total_fees_burned_drops"]);
-    lines.push(Line::from(vec![
-        dim("fees burned "),
-        sp(format!("{} drops", commas(fees)), p.gold),
-        dim(format!(" · {:.3} XRP since start", total as f64 / 1e6)),
-    ]));
+    lines.push(Line::from(vec![dim("burned "), sp(format!("{} drops", commas(fees)), p.gold)]));
+    lines.push(Line::from(dim(format!("{:.3} XRP since start", total as f64 / 1e6))));
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_events(f: &mut Frame, r: Rect, g: &Shared) {
+fn draw_footer(f: &mut Frame, r: Rect, sn: &Snap, paused: bool) {
     let p = pal();
-    let block = panel(vec![bold("EVENTS", p.ink), dim(" newest first")], p.dim);
-    let n = r.height.saturating_sub(2) as usize;
-    let lines: Vec<Line> = g
-        .events
-        .iter()
-        .take(n)
-        .map(|e| {
-            let (c, mark) = match e.tone {
-                Tone::Good => (p.good, "✓"),
-                Tone::Info => (p.ink, "·"),
-                Tone::Warn => (p.warn, "!"),
-                Tone::Bad => (p.bad, "✗"),
-            };
-            Line::from(vec![dim(format!("{} ", e.at)), bold(format!("{mark} "), c), sp(e.text.clone(), c)])
-        })
-        .collect();
-    f.render_widget(Paragraph::new(lines).block(block), r);
-}
-
-fn draw_footer(f: &mut Frame, r: Rect, sn: &Snap, paused: bool, view: View) {
-    let p = pal();
-    let mut v = vec![dim(if view == View::Types {
-        " t back to the dashboard · q quit · p pause · counts since the validator started · xrpl-watch"
-    } else {
-        " q quit · t every type & result · p pause · c clear events · 1 s refresh · xrpl-watch, the Rust dashboard"
-    })];
+    let mut v = vec![dim(" q quit · p pause · 1 s refresh · counts since the validator started · xrpl-watch, the Rust dashboard")];
     if paused {
         v.push(bold("   ⏸ PAUSED", p.warn));
     }
@@ -1674,7 +1631,6 @@ fn main() -> io::Result<()> {
             std::thread::spawn(move || collect(c, s2, Some(l)));
         }
         let mut term = Terminal::new(TestBackend::new(w, h)).map_err(io::Error::other)?;
-        let rec_view = if arg_value(&args, "--view").as_deref() == Some("types") { View::Types } else { View::Main };
         if let Some(dir) = &record {
             fs::create_dir_all(dir)?;
         }
@@ -1686,7 +1642,7 @@ fn main() -> io::Result<()> {
             let tick = Instant::now();
             {
                 let g = shared.lock().unwrap();
-                term.draw(|f| draw(f, &g, false, rec_view)).map_err(io::Error::other)?;
+                term.draw(|f| draw(f, &g, false)).map_err(io::Error::other)?;
             }
             let ansi = buffer_to_ansi(term.backend().buffer());
             match &record {
@@ -1716,7 +1672,6 @@ fn main() -> io::Result<()> {
     }
     let mut terminal = ratatui::init();
     let mut paused = false;
-    let mut view = View::Main;
     let mut frozen: Option<Shared> = None;
     let res = (|| -> io::Result<()> {
         loop {
@@ -1724,10 +1679,10 @@ fn main() -> io::Result<()> {
                 let g = shared.lock().unwrap();
                 if paused {
                     let fz = frozen.get_or_insert_with(|| g.clone());
-                    terminal.draw(|f| draw(f, fz, true, view))?;
+                    terminal.draw(|f| draw(f, fz, true))?;
                 } else {
                     frozen = None;
-                    terminal.draw(|f| draw(f, &g, false, view))?;
+                    terminal.draw(|f| draw(f, &g, false))?;
                 }
             }
             if event::poll(Duration::from_millis(250))? {
@@ -1736,8 +1691,6 @@ fn main() -> io::Result<()> {
                         match k.code {
                             KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                             KeyCode::Char('p') => paused = !paused,
-                            KeyCode::Char('c') => shared.lock().unwrap().events.clear(),
-                            KeyCode::Char('t') => view = if view == View::Types { View::Main } else { View::Types },
                             _ => {}
                         }
                     }
