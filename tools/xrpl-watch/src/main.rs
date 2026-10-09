@@ -15,7 +15,8 @@
 //! feature (UPSTREAM_RPC, else the validator's XRPL_RPC_URL), and two files on the validator host: the native
 //! shadow's receipts and the writer's decisions. It writes nothing.
 //!
-//!   xrpl-watch                         the live screen (q quits, p pauses)
+//!   xrpl-watch [--interval S]          the live screen (q quits, p pauses): ~30 fps, the validator read every
+//!                                      0.25 s (the upstream every 1 s, amendments every minute)
 //!   xrpl-watch --once [--size 160x48]  one frame as ANSI text on stdout
 //!   xrpl-watch --record DIR [--frames N] [--interval S] [--size WxH]
 //!                                      N frames, one every S seconds, as DIR/frame_00001.ans … (for videos)
@@ -135,7 +136,7 @@ impl Cfg {
             upstream,
             receipts,
             writer_log,
-            interval: Duration::from_secs(1),
+            interval: Duration::from_millis(250),
         }
     }
 }
@@ -302,6 +303,8 @@ enum Who {
 
 #[derive(Clone, Copy)]
 struct Cell {
+    /// When this screen saw it land (None for the seeded history): the newest column glows for a moment.
+    at: Option<Instant>,
     seq: u64,
     who: Who,
     /// Our bytes failed the hash and the ledger was redone from the network's (Phase B's quiet retry).
@@ -342,6 +345,55 @@ struct Shared {
     tape: VecDeque<Cell>,
     /// When each new ledger was first seen, for the ledger cadence.
     closes: VecDeque<Instant>,
+    /// One beat per ledger for the pulse: when it closed, whether its hash missed, whether it was redone.
+    beats: VecDeque<(Instant, bool, bool)>,
+    /// Counters that roll to their new value instead of jumping.
+    tweens: BTreeMap<&'static str, Tw>,
+}
+
+/// A counter rolling from `from` to `to`, starting `at` (ease-out, 0.7 s).
+#[derive(Clone, Copy)]
+struct Tw {
+    from: f64,
+    to: f64,
+    at: Instant,
+}
+
+impl Tw {
+    fn now(&self) -> f64 {
+        let u = (self.at.elapsed().as_secs_f64() / 0.7).min(1.0);
+        self.from + (self.to - self.from) * (1.0 - (1.0 - u).powi(3))
+    }
+}
+
+fn tween_set(g: &mut Shared, key: &'static str, target: u64) {
+    let t = target as f64;
+    match g.tweens.get(key) {
+        Some(tw) if tw.to == t => {}
+        Some(tw) => {
+            let from = tw.now();
+            g.tweens.insert(key, Tw { from, to: t, at: Instant::now() });
+        }
+        None => {
+            g.tweens.insert(key, Tw { from: t, to: t, at: Instant::now() });
+        }
+    }
+}
+
+/// A rolling counter's value right now (the plain value when it has none).
+fn tv(g: &Shared, key: &str, plain: u64) -> u64 {
+    g.tweens.get(key).map(|t| t.now().round().max(0.0) as u64).unwrap_or(plain)
+}
+
+/// Mix two colours (24-bit only): f = 0 gives `a`, 1 gives `b`.
+fn blend(a: Color, b: Color, f: f64) -> Color {
+    match (a, b) {
+        (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => {
+            let m = |x: u8, y: u8| (x as f64 + (y as f64 - x as f64) * f.clamp(0.0, 1.0)).round() as u8;
+            Color::Rgb(m(r1, r2), m(g1, g2), m(b1, b2))
+        }
+        _ => if f < 0.5 { a } else { b },
+    }
 }
 
 const EVENTS_MAX: usize = 200;
@@ -434,6 +486,13 @@ fn collect(cfg: Arc<Cfg>, shared: Arc<Mutex<Shared>>, frames_left: Option<Arc<Mu
     let mut last_decision: Option<String> = None;
     let mut amendments: Vec<(String, i64, bool)> = Vec::new();
     let mut amend_at: Option<Instant> = None;
+    // Slower things than the validator's own counters: the upstream (1 s), the process scan (5 s), the receipts
+    // file (re-read only when it changes).
+    let mut up_at: Option<Instant> = None;
+    let mut proc_at: Option<Instant> = None;
+    let mut vproc: Option<ValidatorProc> = None;
+    let mut receipts_sig: Option<(u64, SystemTime)> = None;
+    let mut receipts_at: Option<Instant> = None;
     loop {
         let t0 = Instant::now();
         let mut sn = Snap::default();
@@ -443,9 +502,15 @@ fn collect(cfg: Arc<Cfg>, shared: Arc<Mutex<Shared>>, frames_left: Option<Arc<Mu
         }
         sn.cons = get_json(&format!("{}/api/consensus", cfg.base)).unwrap_or(Value::Null);
         sn.sh = get_json(&format!("{}/api/state-hash", cfg.base)).unwrap_or(Value::Null);
-        match rpc(&cfg.upstream, "server_info") {
-            Ok(v) => sn.up = v["info"].clone(),
-            Err(e) => sn.up_err = Some(e),
+        if up_at.map_or(true, |t| t.elapsed() >= Duration::from_millis(950)) {
+            match rpc(&cfg.upstream, "server_info") {
+                Ok(v) => sn.up = v["info"].clone(),
+                Err(e) => sn.up_err = Some(e),
+            }
+            up_at = Some(Instant::now());
+        } else if let Some(p) = &prev {
+            sn.up = p.up.clone();
+            sn.up_err = p.up_err.clone();
         }
         if amend_at.map_or(true, |t| t.elapsed() > Duration::from_secs(60)) {
             if let Ok(v) = rpc(&cfg.upstream, "feature") {
@@ -456,17 +521,31 @@ fn collect(cfg: Arc<Cfg>, shared: Arc<Mutex<Shared>>, frames_left: Option<Arc<Mu
         // Count down between fetches.
         let since = amend_at.map(|t| t.elapsed().as_secs() as i64).unwrap_or(0);
         sn.amendments = amendments.iter().map(|(n, e, s)| (n.clone(), e - since, *s)).collect();
-        if let Some(p) = validator_proc() {
+        if proc_at.map_or(true, |t| t.elapsed() >= Duration::from_secs(5)) {
+            vproc = validator_proc();
+            proc_at = Some(Instant::now());
+        }
+        if let Some(p) = &vproc {
             sn.pid = Some(p.pid);
             sn.rss_gb = p.rss_gb();
             sn.flow_engine = p.env("XRPL_FLOW_ENGINE");
         }
         let led = u(&sn.eng, &["native_shadow", "ledgers"]);
         let run_start = u(&sn.eng, &["ledger_seq"]).saturating_sub(led + 2);
-        let (rc, age, top) = receipts_summary(&cfg.receipts, run_start);
-        sn.receipts = rc;
-        sn.receipts_age_h = age;
-        sn.ter_miss_top = top;
+        let sig = fs::metadata(&cfg.receipts).ok().and_then(|m| Some((m.len(), m.modified().ok()?)));
+        let stale = receipts_at.map_or(true, |t| t.elapsed() >= Duration::from_secs(30));
+        if sig != receipts_sig || stale || prev.is_none() {
+            let (rc, age, top) = receipts_summary(&cfg.receipts, run_start);
+            sn.receipts = rc;
+            sn.receipts_age_h = age;
+            sn.ter_miss_top = top;
+            receipts_sig = sig;
+            receipts_at = Some(Instant::now());
+        } else if let Some(p) = &prev {
+            sn.receipts = p.receipts;
+            sn.receipts_age_h = p.receipts_age_h;
+            sn.ter_miss_top = p.ter_miss_top.clone();
+        }
         sn.at = Some(SystemTime::now());
 
         let mut g = shared.lock().unwrap();
@@ -495,7 +574,15 @@ fn collect(cfg: Arc<Cfg>, shared: Arc<Mutex<Shared>>, frames_left: Option<Arc<Mu
                     } else {
                         Who::Before
                     };
-                    g.tape.push_back(Cell { seq, who, redone: false, missed: !ok });
+                    g.tape.push_back(Cell { at: None, seq, who, redone: false, missed: !ok });
+                }
+                // The pulse starts with the newest ledgers at the usual ~3.9 s spacing; real beats follow.
+                let now = Instant::now();
+                let recent: Vec<(bool, bool)> = g.tape.iter().rev().take(16).map(|c| (c.missed, c.redone)).collect();
+                for (i, (m, r)) in recent.into_iter().enumerate().rev() {
+                    if let Some(t) = now.checked_sub(Duration::from_secs_f64(0.5 + 3.9 * i as f64)) {
+                        g.beats.push_back((t, m, r));
+                    }
                 }
             }
             Some(p) => {
@@ -526,14 +613,19 @@ fn collect(cfg: Arc<Cfg>, shared: Arc<Mutex<Shared>>, frames_left: Option<Arc<Mu
                             redone -= 1;
                         }
                         let missed = verdicts.get(&seq).map(|v| !v.0).unwrap_or(false);
-                        g.tape.push_back(Cell { seq, who, redone: r, missed });
-                        g.closes.push_back(Instant::now());
+                        let now = Instant::now();
+                        g.tape.push_back(Cell { at: Some(now), seq, who, redone: r, missed });
+                        g.closes.push_back(now);
+                        g.beats.push_back((now, missed, r));
                     }
                     while g.tape.len() > TAPE_MAX {
                         g.tape.pop_front();
                     }
                     while g.closes.len() > 40 {
                         g.closes.pop_front();
+                    }
+                    while g.beats.len() > 64 {
+                        g.beats.pop_front();
                     }
                 }
             }
@@ -652,6 +744,23 @@ fn collect(cfg: Arc<Cfg>, shared: Arc<Mutex<Shared>>, frames_left: Option<Arc<Mu
             g.apply_ms.push_back(ms);
             while g.apply_ms.len() > SPARK_MAX {
                 g.apply_ms.pop_front();
+            }
+        }
+        {
+            let ns = &sn.eng["native_shadow"];
+            let ffi = &sn.eng["ffi_verifier"];
+            let pairs: [(&'static str, u64); 8] = [
+                ("wn", u(ns, &["writer", "native"])),
+                ("consec", u(&sn.sh, &["consecutive_matches"])),
+                ("matched", u(&sn.sh, &["total_matches"])),
+                ("tm", u(ns, &["ter_matched"])),
+                ("ta", u(ns, &["txs_applied"])),
+                ("c_agreed", u(ffi, &["live_apply_ok"]) + u(ffi, &["live_apply_claimed"])),
+                ("c_attempted", u(ffi, &["live_apply_attempted"])),
+                ("fm", u(ns, &["full_match"])),
+            ];
+            for (k, v) in pairs {
+                tween_set(&mut g, k, v);
             }
         }
         g.snap = sn.clone();
@@ -839,11 +948,11 @@ fn draw(f: &mut Frame, g: &Shared, paused: bool) {
     draw_header(f, rows[0], &g.snap);
     draw_tape(f, rows[1], g);
     let top = Layout::horizontal([Constraint::Percentage(64), Constraint::Percentage(36)]).split(rows[2]);
-    draw_roles(f, top[0], &g.snap);
+    draw_roles(f, top[0], g);
     draw_gate(f, top[1], g);
     let mid = Layout::horizontal([Constraint::Percentage(56), Constraint::Percentage(44)]).split(rows[3]);
     draw_rust(f, mid[0], g);
-    draw_cpp(f, mid[1], &g.snap);
+    draw_cpp(f, mid[1], g);
     let low = Layout::horizontal([Constraint::Percentage(56), Constraint::Percentage(44)]).split(rows[4]);
     draw_upstream(f, low[0], &g.snap);
     draw_consensus(f, low[1], &g.snap);
@@ -899,7 +1008,8 @@ fn draw_header(f: &mut Frame, r: Rect, sn: &Snap) {
 fn logo_spans(at: Option<SystemTime>) -> Vec<Span<'static>> {
     let p = pal();
     let ramp = [p.pink, p.violet, p.feed, p.good, p.feed, p.violet];
-    let step = at.and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| (d.as_millis() / 500) as usize).unwrap_or(0);
+    let _ = at;
+    let step = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| (d.as_millis() / 160) as usize).unwrap_or(0);
     "HALCYON"
         .chars()
         .enumerate()
@@ -952,7 +1062,11 @@ fn draw_tape(f: &mut Frame, r: Rect, g: &Shared) {
     let mut ticks = vec![' '; w];
     for (i, c) in cells.iter().enumerate() {
         let glyph = if c.missed { "▼" } else if c.redone { "▲" } else { "▊" };
-        top.push(Span::styled(glyph, Style::new().fg(who_color(c))));
+        let col = match c.at.map(|t| t.elapsed().as_secs_f64()) {
+            Some(age) if age < 1.2 => blend(Color::Rgb(255, 255, 255), who_color(c), age / 1.2),
+            _ => who_color(c),
+        };
+        top.push(Span::styled(glyph, Style::new().fg(col).add_modifier(if c.at.is_some_and(|t| t.elapsed().as_secs_f64() < 1.2) { Modifier::BOLD } else { Modifier::empty() })));
         if c.seq % 50 == 0 {
             let lab = format!("┊{}", commas(c.seq));
             for (j, ch) in lab.chars().enumerate() {
@@ -966,8 +1080,9 @@ fn draw_tape(f: &mut Frame, r: Rect, g: &Shared) {
     f.render_widget(Paragraph::new(vec![Line::from(top), tick_line]), inner);
 }
 
-fn draw_roles(f: &mut Frame, r: Rect, sn: &Snap) {
+fn draw_roles(f: &mut Frame, r: Rect, g: &Shared) {
     let p = pal();
+    let sn = &g.snap;
     let ns = &sn.eng["native_shadow"];
     let ffi = &sn.eng["ffi_verifier"];
     let w = writer_mode(sn);
@@ -1023,9 +1138,9 @@ fn draw_roles(f: &mut Frame, r: Rect, sn: &Snap) {
 
     // The big counter: ledgers written by the Rust engine (or the signing streak when it does not write).
     let (n, cap1, cap2, col) = if b(ns, &["writer", "enabled"]) {
-        (wn, "LEDGERS WRITTEN", "BY OUR RUST ENGINE", p.rust)
+        (tv(g, "wn", wn), "LEDGERS WRITTEN", "BY OUR RUST ENGINE", p.rust)
     } else {
-        (u(&sn.sh, &["consecutive_matches"]), "LEDGERS IN A ROW", "STATE HASH = MAINNET", p.feed)
+        (tv(g, "consec", u(&sn.sh, &["consecutive_matches"])), "LEDGERS IN A ROW", "STATE HASH = MAINNET", p.feed)
     };
     let digits = big_digits(&commas(n));
     let big: Vec<Line> = vec![
@@ -1038,26 +1153,78 @@ fn draw_roles(f: &mut Frame, r: Rect, sn: &Snap) {
     f.render_widget(Paragraph::new(big), cols[1]);
 }
 
-/// The validator's pulse: one beat per ledger, newest at the right, red where the hash failed.
-fn pulse_lines(cells: &[&Cell], width: usize, color_ok: Color) -> [Line<'static>; 2] {
+/// The validator's pulse, in real time: each ledger is a beat drawn where it closed on a time axis that
+/// scrolls left; the newest beat is bright and older ones fade. Red ╳ where the hash missed.
+fn pulse_lines(g: &Shared, width: usize, cadence: f64) -> [Line<'static>; 2] {
     let p = pal();
-    const BEAT: usize = 5;
-    let n = (width / BEAT).max(1);
-    let shown: Vec<&&Cell> = cells.iter().rev().take(n).collect::<Vec<_>>().into_iter().rev().collect();
-    let pad = width.saturating_sub(shown.len() * BEAT);
-    let mut top: Vec<Span<'static>> = vec![Span::raw(" ".repeat(pad))];
-    let mut bot: Vec<Span<'static>> = vec![Span::styled("─".repeat(pad), Style::new().fg(p.dim))];
-    for c in shown {
-        let col = if c.missed { p.bad } else if c.redone { p.warn } else { color_ok };
-        if c.missed {
-            top.push(Span::styled("  ╳  ", Style::new().fg(col).add_modifier(Modifier::BOLD)));
-            bot.push(Span::styled("──┴──", Style::new().fg(col)));
+    let col_secs = (cadence / 6.0).max(0.2);
+    let span = width as f64 * col_secs;
+    let mut top: Vec<(char, Color)> = vec![(' ', p.dim); width];
+    let mut bot: Vec<(char, Color)> = vec![('─', blend(p.dim, p.bg, 0.35)); width];
+    for (t, missed, redone) in g.beats.iter() {
+        let age = t.elapsed().as_secs_f64();
+        let x = width as f64 - 3.0 - age / col_secs;
+        if x < 0.0 {
+            continue;
+        }
+        let xi = x.round() as usize;
+        if xi + 1 >= width {
+            continue;
+        }
+        let base = if *missed { p.bad } else if *redone { p.warn } else { p.good };
+        let c = blend(base, p.dim, (age / span).powf(0.8));
+        if *missed {
+            top[xi] = ('╳', c);
+            bot[xi] = ('┴', c);
         } else {
-            top.push(Span::styled("  ╭╮ ", Style::new().fg(col)));
-            bot.push(Span::styled("──╯╰─", Style::new().fg(col)));
+            top[xi] = ('╭', c);
+            top[xi + 1] = ('╮', c);
+            bot[xi] = ('╯', c);
+            bot[xi + 1] = ('╰', c);
         }
     }
-    [Line::from(top), Line::from(bot)]
+    // "now": a cursor at the right edge, where the next beat will land
+    if width >= 2 {
+        bot[width - 2] = ('●', p.pink);
+    }
+    let to_line = |v: Vec<(char, Color)>| {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut cur = String::new();
+        let mut cc: Option<Color> = None;
+        for (ch, c) in v {
+            if cc != Some(c) && !cur.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut cur), Style::new().fg(cc.unwrap())));
+            }
+            cc = Some(c);
+            cur.push(ch);
+        }
+        if let Some(c) = cc {
+            spans.push(Span::styled(cur, Style::new().fg(c)));
+        }
+        Line::from(spans)
+    };
+    [to_line(top), to_line(bot)]
+}
+
+/// "next ledger" — time since the last close against the usual cadence, filled in eighths of a cell.
+fn next_ledger_line(g: &Shared, width: usize, cadence: f64) -> Line<'static> {
+    let p = pal();
+    let Some(last) = g.closes.back() else { return Line::from(dim("next ledger …")) };
+    let since = last.elapsed().as_secs_f64();
+    let frac = since / cadence;
+    let bw = width.saturating_sub(20).max(4);
+    let eighths = ((frac.min(1.0)) * (bw * 8) as f64).round() as usize;
+    const PART: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+    let mut bar = "█".repeat(eighths / 8);
+    bar.push_str(PART[eighths % 8]);
+    let filled = bar.chars().count();
+    let col = if frac < 1.0 { p.feed } else if frac < 1.6 { p.warn } else { p.bad };
+    Line::from(vec![
+        dim("next ledger "),
+        Span::styled(bar, Style::new().fg(col)),
+        Span::styled("·".repeat(bw.saturating_sub(filled)), Style::new().fg(blend(p.dim, p.bg, 0.5))),
+        Span::styled(format!(" {since:>4.1}s"), Style::new().fg(col)),
+    ])
 }
 
 fn draw_gate(f: &mut Frame, r: Rect, g: &Shared) {
@@ -1078,9 +1245,10 @@ fn draw_gate(f: &mut Frame, r: Rect, g: &Shared) {
     } else {
         None
     };
+    let cad = cadence.unwrap_or(3.9).clamp(1.0, 20.0);
     let mut lines = vec![
         Line::from(vec![
-            bold(format!("{} in a row", commas(consec)), if mm == 0 { p.good } else { p.warn }),
+            bold(format!("{} in a row", commas(tv(g, "consec", consec))), if mm == 0 { p.good } else { p.warn }),
             Span::raw("  "),
             if ready { bold("✓ SIGNING", p.good) } else { bold("not signing yet", p.warn) },
             dim(match cadence {
@@ -1089,16 +1257,15 @@ fn draw_gate(f: &mut Frame, r: Rect, g: &Shared) {
             }),
         ]),
         Line::from(vec![
-            sp(format!("{} matched", commas(m)), p.good),
+            sp(format!("{} matched", commas(tv(g, "matched", m))), p.good),
             dim(" · "),
             sp(format!("{} missed", commas(mm)), if mm > 0 { p.bad } else { p.good }),
             dim(format!(" · {} warm-up skips", commas(nr))),
             if zh > 0 { sp(format!(" + {zh} zero-hash"), p.bad) } else { dim("") },
         ]),
-        Line::from(""),
+        next_ledger_line(g, inner.width as usize, cad),
     ];
-    let cells: Vec<&Cell> = g.tape.iter().collect();
-    let [a, b2] = pulse_lines(&cells, inner.width as usize, p.good);
+    let [a, b2] = pulse_lines(g, inner.width as usize, cad);
     lines.push(a);
     lines.push(b2);
     lines.push(Line::from(dim("one beat per ledger: our whole database hashed = mainnet's")));
@@ -1151,7 +1318,7 @@ fn draw_rust(f: &mut Frame, r: Rect, g: &Shared) {
     }
     lines.push(Line::from(vec![
         label("vs MAINNET"),
-        sp(format!("{}/{} results match", commas(tm), commas(ta)), if tmm > 0 { p.bad } else { p.good }),
+        sp(format!("{}/{} results match", commas(tv(g, "tm", tm)), commas(tv(g, "ta", ta))), if tmm > 0 { p.bad } else { p.good }),
         dim(" · "),
         sp(format!("ter-miss {tmm}"), if tmm > 0 { p.bad } else { p.good }),
         if bim > 0 { sp(format!(" · batch-inner {bim}"), p.bad) } else { dim("") },
@@ -1161,7 +1328,7 @@ fn draw_rust(f: &mut Frame, r: Rect, g: &Shared) {
     }
     lines.push(Line::from(vec![
         label("vs C++"),
-        sp(format!("{}/{} ledgers agree byte-for-byte", commas(fm), commas(led)), if dv > 0 { p.warn } else { p.good }),
+        sp(format!("{}/{} ledgers agree byte-for-byte", commas(tv(g, "fm", fm)), commas(led)), if dv > 0 { p.warn } else { p.good }),
         if km + ke + kb > 0 { sp(format!(" · keys −{km} +{ke} ≠{kb}"), p.warn) } else { dim("") },
     ]));
     match sn.receipts {
@@ -1215,8 +1382,9 @@ fn draw_rust(f: &mut Frame, r: Rect, g: &Shared) {
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(block), r);
 }
 
-fn draw_cpp(f: &mut Frame, r: Rect, sn: &Snap) {
+fn draw_cpp(f: &mut Frame, r: Rect, g: &Shared) {
     let p = pal();
+    let sn = &g.snap;
     let ffi = &sn.eng["ffi_verifier"];
     let w = writer_mode(sn);
     let ver = s(ffi, &["libxrpl_version"]);
@@ -1235,7 +1403,7 @@ fn draw_cpp(f: &mut Frame, r: Rect, sn: &Snap) {
     lines.push(Line::from(vec![
         label("vs MAINNET"),
         sp(format!("{:.2}%", pct(agreed, attempted)), if div > 0 { p.warn } else { p.good }),
-        ink(format!(" ({}/{})", commas(agreed), commas(attempted))),
+        ink(format!(" ({}/{})", commas(tv(g, "c_agreed", agreed)), commas(tv(g, "c_attempted", attempted)))),
         sp(format!(" diverged {div}"), if div > 0 { p.warn } else { p.good }),
     ]));
     lines.push(Line::from(vec![
@@ -1618,6 +1786,8 @@ fn main() -> io::Result<()> {
         apply_ms: VecDeque::new(),
         tape: VecDeque::new(),
         closes: VecDeque::new(),
+        beats: VecDeque::new(),
+        tweens: BTreeMap::new(),
     }));
 
     let once = args.iter().any(|a| a == "--once");
@@ -1685,7 +1855,7 @@ fn main() -> io::Result<()> {
                     terminal.draw(|f| draw(f, &g, false))?;
                 }
             }
-            if event::poll(Duration::from_millis(250))? {
+            if event::poll(Duration::from_millis(33))? {
                 if let Event::Key(k) = event::read()? {
                     if k.kind == KeyEventKind::Press {
                         match k.code {
