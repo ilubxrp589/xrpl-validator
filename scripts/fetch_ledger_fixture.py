@@ -140,6 +140,12 @@ def fetch_one(url, seq, outdir):
                             post["LedgerEntryType"] = let
                 nodes.append([li.upper(), kind, post])
         txs[h] = {"ter": ter, "nodes": nodes}
+        # A Batch inner's meta names the outer that APPLIED it. Several outers
+        # can carry the very same inner (mainnet 2026-10-09 #107541023: four
+        # outers wrap one ticketed pair; the first is discarded, a later one
+        # files it), so the inner's id alone does not say whose it is.
+        if md.get("ParentBatchID"):
+            txs[h]["parent_batch"] = md["ParentBatchID"].upper()
         fields = {k: v for k, v in tx.items() if k not in ("metaData", "meta", "hash")}
         tx_json[h] = fields
         ordered_hashes.append((md.get("TransactionIndex", 0), h))

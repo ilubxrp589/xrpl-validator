@@ -669,6 +669,27 @@ fn native_read_keys(txj: &Value) -> Vec<String> {
     if let Some(a) = txj.get("Account").and_then(|v| v.as_str()).and_then(decode_address) {
         keys.push(hex::encode_upper(keylet::signers_key(&a).0));
     }
+    // PermissionDelegationV1_1 (mainnet 2026-10-08). A transaction sent by a
+    // delegate is judged against keylet::delegate(Account, Delegate) — READ,
+    // never written when it allows the transaction, so it is in no metadata
+    // and a sandbox without it answers terNO_DELEGATE_PERMISSION on a
+    // transaction mainnet applied. The delegate pays the fee, so its root is
+    // read too. The same holds for every inner of a Batch.
+    let account = txj.get("Account").and_then(|v| v.as_str()).and_then(decode_address);
+    if let (Some(a), Some(d)) = (account, txj.get("Delegate").and_then(|v| v.as_str()).and_then(decode_address)) {
+        keys.push(hex::encode_upper(keylet::delegate_key(&a, &d).0));
+        keys.push(hex::encode_upper(keylet::account_root_key(&d).0));
+    }
+    // DelegateSet replaces or deletes keylet::delegate(Account, Authorize)
+    // when one exists: a refusal (or a no-op) leaves it out of the meta, and
+    // native would then create an object that is already there (Finding 360's
+    // read, which fetch_tx_bundle.py hydrates and this probe did not). The
+    // Authorize root and owner directory come in through PARTY_FIELDS.
+    if txj["TransactionType"].as_str() == Some("DelegateSet") {
+        if let (Some(a), Some(z)) = (account, txj.get("Authorize").and_then(|v| v.as_str()).and_then(decode_address)) {
+            keys.push(hex::encode_upper(keylet::delegate_key(&a, &z).0));
+        }
+    }
     // Every 32-byte hex field names a ledger object the transactor will
     // READ (DomainID, CheckID, Channel, NFTokenBuyOffer/SellOffer, VaultID,
     // CredentialIDs…) — a modification that leaves the object byte-identical
@@ -3001,8 +3022,23 @@ fn run() -> i32 {
     // DX_THREADCHECK: every key still live that any tx materially wrote —
     // verified against the true post-state after the loop.
     let mut thread_touched_keys: HashSet<Hash256> = HashSet::new();
+    // A Batch's inners read state too, and an inner that never applied (a
+    // tfAllOrNothing rollback, an early stop under tfUntilFailure) is not in
+    // the ledger at all: only the outer's RawTransactions carries it, so its
+    // read-set was never hydrated. Take every inner from there; the ones the
+    // ledger did file are seen twice, harmlessly (`obj_seen`, idempotent
+    // pre-state loads).
+    let mut read_txs: Vec<&Value> = Vec::new();
     for h in &order {
         let Some(txj) = txjson_map.get(h) else { continue };
+        read_txs.push(txj);
+        for raw in txj.get("RawTransactions").and_then(|v| v.as_array()).into_iter().flatten() {
+            if let Some(inner) = raw.get("RawTransaction") {
+                read_txs.push(inner);
+            }
+        }
+    }
+    for txj in read_txs {
         for key_hex in native_read_keys(txj) {
             if obj_seen.insert(key_hex.clone()) {
                 load_object(&mut state, &rpc_url, &key_hex, seq - 1);
@@ -3081,8 +3117,20 @@ fn run() -> i32 {
         // is its own node list, unchanged.
         let mut net_nodes: Vec<&Value> =
             net["nodes"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
+        // An inner the ledger filed is THIS outer's only when its meta names
+        // this outer (`parent_batch`): several outers can carry the very same
+        // inner, and only one of them applies it (mainnet #107541023: four
+        // outers wrap one ticketed pair; the first is discarded and the third
+        // files it). Crediting it to the first outer by id moved its effects
+        // eight entries early and charged the discarded outer with a verdict
+        // it never had. A fixture without the field falls back to the id.
+        let filed_under = |id: &str| -> bool {
+            txmap.get(id).map_or(false, |t| {
+                t.get("parent_batch").and_then(|p| p.as_str()).map_or(true, |p| p.eq_ignore_ascii_case(h))
+            })
+        };
         for ih in batch_inners.get(&h.to_uppercase()).map(Vec::as_slice).unwrap_or(&[]) {
-            if let Some(inner_net) = txmap.get(ih.as_str()) {
+            if let Some(inner_net) = txmap.get(ih.as_str()).filter(|_| filed_under(ih)) {
                 net_nodes.extend(inner_net["nodes"].as_array().into_iter().flatten());
             }
         }
@@ -3239,6 +3287,19 @@ fn run() -> i32 {
         if inner_touched.len() < inner_ids.len() {
             inner_touched.resize(inner_ids.len(), Vec::new());
         }
+        if std::env::var("DX_BATCH").is_ok() && !inner_ids.is_empty() {
+            for (i, t) in inner_touched.iter().enumerate() {
+                let ks: Vec<String> = t
+                    .iter()
+                    .map(|x| {
+                        let k = x.key();
+                        let state_has = state.state_map.lookup(&k).is_some();
+                        format!("{}{}{}", hex::encode_upper(&k.0[..4]), if mods.contains_key(&k) { "" } else { "~" }, if state_has { "" } else { "!" })
+                    })
+                    .collect();
+                eprintln!("DX_BATCH {} touched[{i}] {}", &h[..12], ks.join(" "));
+            }
+        }
         if inner_ids.is_empty() {
             xrpl_ledger::ledger::threading::stamp_threading(
                 &mut mods,
@@ -3292,6 +3353,7 @@ fn run() -> i32 {
             // which any tes or tec of ours is the mismatch.
             let filed: HashMap<String, String> = inner_ids
                 .iter()
+                .filter(|id| filed_under(id))
                 .filter_map(|id| {
                     let t = txmap.get(id.as_str())?["ter"].as_str()?;
                     Some((id.clone(), t.to_string()))
@@ -3328,10 +3390,25 @@ fn run() -> i32 {
                 }
             }
         }
-        let our_mut: HashSet<(String, u8)> = native_mutset(&state, &mods)
+        let mut our_mut: HashSet<(String, u8)> = native_mutset(&state, &mods)
             .into_iter()
             .filter(|(k, _)| !touched_only.contains(k))
             .collect();
+        // A key one inner materially changed and a later inner changed BACK
+        // nets to a no-op across the batch, so `native_mutset` drops it. But
+        // each inner's own table records it (and threads it, finding 392), so
+        // both inners' metadata carry it as modified, and the expected side
+        // keeps any key a source materially changed. Ours must too: mainnet
+        // #107541023 10094F0E, the bot's FLIP line 0 → 0.3909 → 0.
+        for t in inner_touched.iter().flatten() {
+            let k = t.key();
+            if matches!(mods.get(&k), Some(SandboxEntry::Modified(_))) {
+                let kh = hex::encode_upper(k.0);
+                if !touched_only.contains(&kh) {
+                    our_mut.insert((kh, 1));
+                }
+            }
+        }
         // DX_DUMP=<hash prefix>: print the VALUES this tx wrote. The mutation
         // set compares keys only, so a value-level divergence (an offer
         // residual, a line balance) is otherwise invisible — quality is the

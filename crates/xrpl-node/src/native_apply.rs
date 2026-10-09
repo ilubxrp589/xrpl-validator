@@ -440,6 +440,32 @@ pub fn pair_inner_verdicts(
     out
 }
 
+/// The ledger's verdict for each of ONE outer's inners it filed, by id: the
+/// ids among `ids` whose entry names this outer as its ParentBatchID
+/// (`attributed`, from `BatchAttribution::inners_of`), with each entry's
+/// TransactionResult — the `filed` side of `pair_inner_verdicts`.
+///
+/// The id alone is not enough. Several outers can carry the very same inner
+/// and only one of them applies it: mainnet #107541023 (2026-10-09) has four
+/// outers wrapping one ticketed pair of payments; the first is discarded
+/// (tfAllOrNothing), the third files the pair. Matched by id, the discarded
+/// outer was charged with the filed tesSUCCESS verdicts and the writer
+/// refused a ledger the engine had right.
+pub fn filed_inner_verdicts(
+    ids: &[String],
+    attributed: Option<&[String]>,
+    by_hash: &HashMap<String, &Value>,
+) -> HashMap<String, String> {
+    let mine: HashSet<&String> = attributed.into_iter().flatten().collect();
+    ids.iter()
+        .filter(|id| mine.contains(id))
+        .filter_map(|id| {
+            let t = by_hash.get(id)?["metaData"]["TransactionResult"].as_str()?;
+            Some((id.clone(), t.to_string()))
+        })
+        .collect()
+}
+
 /// One key touched by several entries of the same Batch: the expected side
 /// reports the NET effect. The rules are leg A's, verbatim
 /// (`ffi_engine.rs` `merged_expected`): Created wins over Modified, and a key
@@ -750,6 +776,37 @@ mod batch_attribution_tests {
         assert!(a.skip.contains("BB") && a.skip.contains("CC"));
         assert_eq!(a.inners_of.get("AA").cloned().unwrap_or_default(), vec!["BB".to_string(), "CC".to_string()]);
         assert!(!a.skip.contains("DD"));
+    }
+
+    /// Mainnet #107541023: outers A (discarded) and B (applied) carry the same
+    /// inner pair. Only B is charged with the filed verdicts; A expects none,
+    /// so A's discard pairs as "not applied" on both inners.
+    #[test]
+    fn a_shared_inner_is_filed_only_under_the_outer_its_parent_batch_id_names() {
+        let a = json!({"hash": "AA", "TransactionType": "Batch", "Flags": 0x0001_0000u64,
+                       "metaData": {"TransactionIndex": 7, "TransactionResult": "tesSUCCESS", "AffectedNodes": []}});
+        let b = json!({"hash": "BB", "TransactionType": "Batch", "Flags": 0x0001_0000u64,
+                       "metaData": {"TransactionIndex": 15, "TransactionResult": "tesSUCCESS", "AffectedNodes": []}});
+        let i1 = entry("C1", 16, 0x4000_0000, Some("BB"));
+        let i2 = entry("C2", 17, 0x4000_0000, Some("BB"));
+        let ordered: Vec<&Value> = vec![&a, &b, &i1, &i2];
+        let at = batch_attribution(&ordered);
+        let by_hash: HashMap<String, &Value> =
+            ordered.iter().map(|t| (t["hash"].as_str().unwrap().to_string(), *t)).collect();
+        let ids = vec!["C1".to_string(), "C2".to_string()];
+
+        let for_a = filed_inner_verdicts(&ids, at.inners_of.get("AA").map(Vec::as_slice), &by_hash);
+        assert!(for_a.is_empty(), "A discarded its batch: nothing is filed under it");
+        // Our engine discarded A too (results cleared): no disagreement.
+        assert!(pair_inner_verdicts(&ids, &[], &for_a, true).iter().all(|(_, _, _, mm)| !mm));
+
+        let for_b = filed_inner_verdicts(&ids, at.inners_of.get("BB").map(Vec::as_slice), &by_hash);
+        assert_eq!(for_b.get("C1").map(String::as_str), Some("tesSUCCESS"));
+        assert_eq!(for_b.get("C2").map(String::as_str), Some("tesSUCCESS"));
+        let ours = vec!["tesSUCCESS".to_string(), "tesSUCCESS".to_string()];
+        assert!(pair_inner_verdicts(&ids, &ours, &for_b, true).iter().all(|(_, _, _, mm)| !mm));
+        // And had our engine discarded B, both inners would be the receipt.
+        assert!(pair_inner_verdicts(&ids, &[], &for_b, true).iter().all(|(_, _, _, mm)| *mm));
     }
 
     #[test]

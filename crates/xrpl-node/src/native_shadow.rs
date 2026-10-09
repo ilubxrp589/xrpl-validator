@@ -1033,14 +1033,14 @@ impl NativeShadow {
                 } else {
                     // Paired BY ID against what the ledger FILED: an inner
                     // with no entry was not applied, and any tes or tec of
-                    // ours for it is the disagreement.
-                    let filed: HashMap<String, String> = inner_ids
-                        .iter()
-                        .filter_map(|id| {
-                            let t = by_hash.get(id)?["metaData"]["TransactionResult"].as_str()?;
-                            Some((id.clone(), t.to_string()))
-                        })
-                        .collect();
+                    // ours for it is the disagreement. Filed for THIS outer:
+                    // its ParentBatchID, never the id alone — several outers
+                    // can carry one inner (`filed_inner_verdicts`).
+                    let filed = crate::native_apply::filed_inner_verdicts(
+                        &inner_ids,
+                        attribution.inners_of.get(&this_hash).map(Vec::as_slice),
+                        &by_hash,
+                    );
                     for (i, ih, want, mismatch) in crate::native_apply::pair_inner_verdicts(
                         &inner_ids,
                         &inner_results,

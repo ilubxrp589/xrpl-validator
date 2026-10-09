@@ -554,14 +554,13 @@ fn run() -> i32 {
                     );
                     ter_mismatch += 1;
                 } else {
-                    // The ledger's verdict for every inner it FILED, by id.
-                    let filed: HashMap<String, String> = inner_ids
-                        .iter()
-                        .filter_map(|id| {
-                            let t = by_hash.get(id)?["metaData"]["TransactionResult"].as_str()?;
-                            Some((id.clone(), t.to_string()))
-                        })
-                        .collect();
+                    // The ledger's verdict for every inner it FILED under
+                    // THIS outer (its ParentBatchID, never the id alone).
+                    let filed = xrpl_node::native_apply::filed_inner_verdicts(
+                        &inner_ids,
+                        attribution.inners_of.get(&h_up).map(Vec::as_slice),
+                        &by_hash,
+                    );
                     for (i, ih, want, mismatch) in xrpl_node::native_apply::pair_inner_verdicts(
                         &inner_ids,
                         &inner_results,
