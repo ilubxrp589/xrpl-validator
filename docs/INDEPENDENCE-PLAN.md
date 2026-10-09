@@ -1,109 +1,287 @@
-# Plan: a fully independent validator — 2026-10-09
+# The plan: a fully independent validator
 
-Supersedes the roadmap section of `docs/STATE-2026-07.md` (approved 2026-07-04). Same goal, updated for
-where the work actually is: m3060 signs a ledger hash **it computed itself**, from data **it got from
-peers**, with the upstream xrpld (.39) only watching.
+*Updated 9 October 2026. Replaces the July roadmap in `docs/STATE-2026-07.md`. Numbers measured on m3060 at
+18:49 EDT that day.*
 
-## Where we are (measured 2026-10-09)
+## 1. What "fully independent" means
 
-- **The Rust engine writes the state.** Stage 4 Phase B (cycle 166, 10-08): `XRPL_NATIVE_WRITER=1`,
-  state.rocks bytes come from our engine. Since the F417 deploy (cycle 167, 12:39): 5,343 ledgers written
-  natively, 0 refused, 0 hash failures; 5,645 consecutive state-hash matches. Apply time ≈ 30 ms a ledger
-  (`apply_ms_last`).
-- **Built and observing, not enforcing:** S1/S2 signature checks (since the 12:39 restart: 450,670 proposals and
-  626,521 validations verified, 0 failures); S3 tx-set hash as a SHAMap root (`43fdc99`); va-06
-  publisher-verified UNL (`c258ed6`; no pin set, unverified fallback allowed); lockstep M1 ledger-hash
-  shadow (gauge 1.000000).
-- **Peer layer exists:** about 55 direct peer connections carry proposals and validations, and our
-  validations go out through them.
-- **Amendments:** refreshed every flag ledger. Every live rule is ported except **fixBatchV1_2**: the
-  3.4.1 source is still unpublished, so it stays quarantined until the source lands.
+Today m3060 checks its own work and then signs **the network's** hash. When it's fully independent, it will sign
+**a ledger hash it worked out itself**, from data **it got from the network's peers**, with .39 only watching.
 
-## What m3060 still borrows
+That's the money shot. At that point m3060's validation is a real second opinion: it agrees with mainnet because it
+computed the same answer, not because it copied it.
 
-| Borrowed today | From | Replaced in |
+**Done means** 30 days of m3060 signing hashes it computed itself, from peer data, with .39 only watching.
+
+## 2. How a ledger gets its hash
+
+Every ledger has a short header, and the ledger's hash is the fingerprint of that header. To sign its own hash,
+m3060 has to produce every line of the header itself:
+
+```
+LEDGER HASH  =  fingerprint of the header:
+  sequence number ............................. known
+  total XRP in existence (after fees burned) .. borrowed today   -> Step 3
+  parent ledger's hash ........................ borrowed today   -> Step 5
+  TRANSACTION TREE root ....................... borrowed today   -> Step 2
+      (every transaction + its record of what it changed)
+  STATE TREE root ............................. OURS since 10-08 (Stage 4 Phase B)
+      (every account, trust line, offer, AMM, ...)
+  parent close time / close time / resolution / flags
+                                              . borrowed today   -> Step 5
+```
+
+The state tree is the hard part, and it's done: the Rust engine writes it. The rest is either a different kind of
+work (metadata, ordering) or plumbing (data from peers, close time, the switch).
+
+## 3. Where we are today
+
+| Measure (9 Oct, 18:49) | Value |
+|---|---|
+| Ledgers the Rust engine wrote since the 12:39 fix | **5,690**, with 0 refused and 0 hash failures |
+| State hash matching mainnet, in a row | **5,764**, with 0 mismatches |
+| Time to apply one ledger | **15–30 ms** |
+| Signatures checked from other validators since 12:39 | **about 1.1 million**, with 0 failures |
+| Direct peer connections | **about 55** |
+| Validator list | **verified** against Ripple's publisher key (list #85, 35 validators, 0 rejected) |
+| Voting | says yes **only** to rules the engine has built (since 26 Sep) |
+| Live rules not yet in the engine | **fixBatchV1_2** only (waits for the 3.4.1 source) |
+
+**Built and running, but only observing (not enforcing):**
+- signature checks on proposals and validations (S1/S2);
+- the transaction-set fingerprint, done the way rippled does it (S3);
+- validator-list verification (va-06);
+- the July "lockstep" check, which rebuilds the ledger hash from the network's header plus our state root. It
+  reads 100%.
+
+## 4. What m3060 still borrows
+
+| m3060 borrows | From | Fixed in |
 |---|---|---|
-| Transactions, metadata, ledger header | .39's RPC/WS (ws-sync) | Steps 2, 4, 5 |
-| The order transactions apply in | each tx's `TransactionIndex` in the network's metadata (`native_shadow::apply_order`) | Step 3 |
-| Each tx's result, and the check on our state change | the network's metadata (the writer's `vouch`) | Step 3 |
-| The ledger hash it signs | the network's announced hash, after 3 consecutive account-hash matches (Phase-3 gate) | Step 5 |
-| A safe copy when it doubts | .39's bytes (writer refusal) | Step 5 (stop on doubt) |
-| Trust in the UNL | fetched and verified, but an unverified fallback is allowed | Step 1 |
-| The C++ engine | libxrpl via FFI, comparison only; the native writer still builds only with the `ffi` feature | Step 6 |
+| Every ledger's transactions, their records (metadata) and the header | .39, over its RPC and websocket | Steps 2, 4, 5 |
+| The order transactions apply in | the position number in .39's metadata (`TransactionIndex`) | Step 3 |
+| Each transaction's result, and the check on our state change | .39's metadata (the writer's `vouch`) | Step 3 |
+| The hash m3060 signs | the network's announced hash, after 3 state-hash matches in a row | Step 5 |
+| A safe copy when it's unsure | .39's version of the ledger (a writer refusal) | Step 5 |
+| The C++ library | linked in for comparison only, but the writer can't build without it yet | Step 6 |
 
-## The steps
+```
+TODAY
+  mainnet peers --(proposals, validations)--------------> m3060 --(signs network's hash)--> peers
+  .39 (stock xrpld) --(every ledger: txs, metadata, header)--> m3060 --(Rust engine)--> state
+                                                         checked against .39's metadata
 
-### Step 1: arm what's built (small, one cycle)
-- `XRPL_SIG_ENFORCE=1`: drop proposals and validations whose signatures fail (over 1 million checks, 0 failures).
-- va-06: set `XRPL_UNL_PINNED_KEY` to the publisher's master key. Watch several flag-ledger refreshes verify,
-  then `XRPL_UNL_ENFORCE=1` (fail closed, keep the last good list).
-- **Amendment guard (new, small):** a list of the amendments the Rust engine implements. If the network
-  enables one that isn't on it, alarm at once. From Step 5 on, the guard also stops signing; that is our own
-  amendment block.
-- Port fixBatchV1_2 when the 3.4.1 source is public. This is a hard prerequisite for the Step 5 flip.
+TARGET
+  mainnet peers --(proposals, validations, tx sets, ledger data)--> m3060
+  m3060 --(Rust engine: order, results, metadata, state, header)--> OUR hash --(signs)--> peers
+  .39 --(witness only: compared after the fact)
+```
 
-### Step 2: our own metadata (large; the biggest build)
-- **Why:** the ledger hash covers the transaction tree, and every leaf is a transaction plus its metadata.
-  Without our own metadata we have no ledger hash of our own.
-- **Build:** produce rippled's metadata from the engine's before and after entries, byte-exact:
-  - AffectedNodes in key order: CreatedNode/NewFields, ModifiedNode/FinalFields + PreviousFields, and
-    DeletedNode/FinalFields (+ PreviousFields), chosen by each field's metadata flags.
-  - The threading fields.
-  - `TransactionIndex`, `TransactionResult`, `DeliveredAmount`, and `ParentBatchID` on Batch inners.
-- **Check (trailing, no risk):** every ledger, compare our tx-tree root (`shamap::tx_tree::compute_tx_tree_root`,
-  already tested against mainnet) with the header's `transaction_hash`, and each tx's metadata bytes with the
-  network's. The dp, fixture and campaign loop we use for state today carries over unchanged.
-- **Exit:** weeks of every ledger matching, with receipts drilled the same way as today.
+## 5. The steps
 
-### Step 3: our own order and results (medium)
-- Rippled's consensus order: CanonicalTXSet sorts by account XORed with a salt taken from the set hash,
-  then sequence or ticket, then id. Then come the retry passes: a retryable result goes again on the next
-  pass, and after the last pass it is left out of the ledger. Today's `close::canonical_order` is a plain sort.
-- The writer stops reading `TransactionIndex` and `TransactionResult` and computes them itself. A refusal
-  becomes "our metadata or hash differs from the network's".
-- Pseudo-transactions (`tx/pseudo.rs`) are taken from the set, and fees burned are computed (the header's
-  `total_drops`).
-- **Check:** trailing shadow against the network every ledger. Still no risk.
+### Step 1: switch on what's already built
+*Size: small, one deploy cycle. Your taps: two switch-ons.*
 
-### Step 4: data from peers (medium to large)
-- **M2a:**
-  - Read the agreed tx-set hash from trusted proposals.
-  - Fetch the set over gossip first, then `TMGetLedger liTS_CANDIDATE`.
-  - Verify its SHAMap root with the S3 code.
-- Fill gaps and recover after a restart from peers (ledger and state fetch), not from .39.
-- **Check:** every ledger, compare the peer-fed set with the .39-fed one, then switch the source. .39 becomes
-  a witness that is compared after the fact. A local xrpld on m3060 (old Track 3) becomes optional backup,
-  not a requirement.
+- **Signatures (enforce).** Throw out proposals whose signatures fail. About 1.1 million checks so far, 0 failures.
+  Today nothing makes decisions from validations, so their check moves into Steps 4 and 5, where they will.
+- **Validator list (fail closed).** It already verifies against Ripple's publisher key. We pin that key and refuse
+  an unverified list, keeping the last good one if a fetch fails.
+- **Amendment guard (new).** The voting side already says yes only to rules the engine has built. The guard watches
+  the other side: what mainnet has actually switched on.
+  - If mainnet switches on a rule the engine hasn't built, you get an alarm at once.
+  - From Step 5 on, the guard also stops m3060 signing its own hash. It's our own version of "amendment blocked".
+  - fixBatchV1_2 is the first entry: it's on, and we can't build it until the source is out.
+- **fixBatchV1_2.** Port it the day the 3.4.1 source is published. It must be done before Step 5 goes live.
 
-### Step 5: compute at the live edge and sign our own hash (medium; the flip)
-- As soon as consensus closes, apply the agreed set and build our header:
-  - the parent is our previous ledger;
-  - the close time comes from the round's proposals, by rippled's rule;
-  - the tx root comes from Step 2;
-  - the account hash and total drops are ours.
-  That gives **our ledger hash**.
-- **Shadow:** compare our in-round hash with the network's validated hash, for weeks at 1.0 (the M1 gauge,
-  now with every input ours).
-- **Flip (James's tap):** sign our hash, using va-05 in the in-round form; this replaces the trailing form
-  that failed on 05-31.
-- **On any doubt, skip that validation:** a missing tx, an unported amendment, a refusal, an unready engine.
-  Never sign a hash we didn't compute. Phase-3 signing stays as the instant rollback flag.
+### Step 2: our own transaction records (metadata)
+*Size: large, the biggest build. No live risk: it runs alongside, checked against mainnet.*
 
-### Step 6: later (not needed to call it independent)
-- A Rust-only build: decouple the native shadow and writer from the `ffi` feature, and keep libxrpl as a
-  test oracle in the gate.
-- Propose tx sets in consensus (deferred: non-UNL proposals barely count).
-- Vote yes only on amendments we've ported.
+**What metadata is.** Every transaction in a ledger carries a record of what it did: its result, its position, and
+every ledger object it created, changed or deleted, with old and new values. A simple payment looks like this:
 
-## Order and rules
+```
+TransactionResult  tesSUCCESS          TransactionIndex  12
+AffectedNodes:
+  ModifiedNode  AccountRoot (sender)     Balance  100.000000 -> 89.999988   (fee + amount)
+  ModifiedNode  AccountRoot (receiver)   Balance   50.000000 -> 60.000000
+DeliveredAmount  10 XRP
+```
 
-- **Order:** Step 1 now. Steps 2 → 3 and Step 4 run in parallel. Step 5 last.
-- **Why this order:** Steps 2 and 3 are checked against mainnet on every ledger while still trailing, so most
-  of the correctness is proven before anything live changes.
-- **Standing rules:**
-  - Every new path is env-gated and off by default.
-  - Shadow before enforce.
-  - A 1-day soak, shipping fixes together.
-  - James taps each enforce flip.
-  - The fixBatchV1_2 quarantine stands.
-- **Done means:** 30 days of m3060 signing hashes it computed itself, from peer data, with .39 only watching.
+**Why it matters.** The transaction tree holds every transaction **together with its metadata**. One wrong byte in
+one record changes the tree's root, and with it the ledger hash. No metadata of our own means no hash of our own.
+
+**How we build it.** The engine already applies each transaction in its own sandbox, so the before and after of
+every object it touches already exists. We add rippled's rules for turning that into a record:
+- **Which fields go where.**
+  - "PreviousFields" lists only the fields that changed and are marked to be recorded.
+  - "FinalFields" lists the fields marked "always" or "on change".
+  - A new object's "NewFields" lists its non-default fields.
+- **The order.** Objects are listed in order of their ledger key.
+- **Threading.** The link from each object to the last transaction that touched it.
+- **The extras.** DeliveredAmount, and ParentBatchID on Batch inner transactions.
+- **The encoding.** Everything is written in the network's exact binary format.
+
+**How we check it.** Mainnet's own metadata is the answer key for every transaction:
+- **Per transaction:** our record against mainnet's, byte for byte. A mismatch names the exact field.
+- **Per ledger:** our transaction-tree root against the header's. The code that builds that root is already
+  tested against mainnet.
+- It runs trailing, next to the writer, so nothing live changes. The probe, the fixtures and the campaigns we use
+  for state today work the same way here.
+
+**What can go wrong.** Many small rules: when an unchanged field still appears, how amounts are written, odd cases
+like Batch and deletions. Each mismatch becomes a receipt, drilled like today's.
+
+**Done when** weeks of every transaction's record match byte for byte.
+
+### Step 3: our own order and results
+*Size: medium. No live risk: checked against mainnet.*
+
+**Today** the engine reads the order off .39 (each transaction's position number in its metadata). The writer then
+checks each result against .39's.
+
+**Rippled's rule** for building a ledger from the agreed set of transactions:
+1. **Sort them in "canonical" order.** Rippled sorts by account, but first scrambles each account with a salt taken
+   from the set's own fingerprint, so nobody can buy a good position. Within an account the sort goes by sequence
+   number or ticket, then by transaction id.
+2. **Apply them in up to 3 passes.** A transaction that can't apply yet gets a "retry" result, for example when
+   it's waiting on an earlier one, and goes again in the next pass. Anything still stuck after the last pass is
+   left out of the ledger.
+
+Our `close::canonical_order` is a plain sort today, with no salt and no passes.
+
+**Also in this step:**
+- System transactions on flag ledgers (fee votes, amendment votes, the negative UNL) come from the set. The engine
+  already applies them.
+- Fees burned give the header's "total XRP", worked out by us.
+
+**How we check it.** Every ledger, our order against mainnet's position numbers, and our results against mainnet's.
+Both are exact answer keys. The rare retry cases will be the interesting receipts.
+
+**Done when** weeks of every ledger's order and results match.
+
+### Step 4: data from peers, not .39
+*Size: medium to large. No live risk until the source switches, after weeks of comparing.*
+
+**Today** every ledger's contents come from .39's RPC and websocket, and so does catch-up after a restart. The 55
+peer connections carry the consensus chatter (proposals, validations, status), but m3060 fetches no ledger
+contents over them yet.
+
+**The peer protocol already allows this.** Any node can ask peers for a ledger's pieces by fingerprint
+(`TMGetLedger`): the header, the transaction tree, pieces of the state tree, or a candidate transaction set while
+consensus is running. Everything comes back checkable against its fingerprint, so a peer can't feed us a fake. It
+can only refuse or be slow.
+
+**Two uses:**
+- **(a) Trailing:** for each validated ledger, fetch its header and transaction tree from peers. This replaces .39's
+  feed.
+- **(b) In the round (needed for Step 5):** the trusted validators' proposals name the transaction set they're
+  agreeing on (S3 already computes those fingerprints the way rippled does). We fetch that set while consensus finishes.
+
+**Catch-up.**
+- A warm restart keeps the state, so only the few ledgers missed while down need fetching, and peers can supply
+  them.
+- A full rebuild from nothing (20 million objects) can still come from .39 or a peer. It's checked against the
+  validated state fingerprint either way, so it doesn't weaken independence.
+
+**What can go wrong: being throttled.** xrpld charges every requester a "resource fee" and cuts off any that ask too
+much. .39's limits throttled m3060 that way on 4 Aug (over RPC, same mechanism). So we pace requests, spread them over many peers, and answer
+requests too.
+
+**How we check it.** For weeks the peer-fed copy and .39's copy are compared on every ledger. Then the source
+switches, and .39 becomes the witness and backup. That also helps .39, whose ledger SSD is 45% worn.
+
+### Step 5: build at the live edge and sign our own hash
+*Size: a medium build, then weeks of shadow. Your taps: 5a, then later 5b.*
+
+**Today** m3060 applies each ledger after mainnet has validated it. It checks its state hash, and once 3 in a row
+match it signs the hash the network announced.
+
+**Target.** As soon as consensus agrees on ledger N, m3060:
+1. has the agreed transaction set (Step 4b);
+2. applies it in canonical order with our own results and records (Steps 2 and 3), taking about 15–30 ms today;
+3. builds the header:
+   - the parent is our own hash for N−1;
+   - the close time is the round's agreed close time (rippled rounds the validators' close-time votes to the
+     current resolution, and marks the ledger "no agreed time" when they don't agree);
+   - total XRP, the transaction root and the state root are ours;
+4. takes its fingerprint. That's **our ledger hash**.
+
+A round takes about 3–4 seconds, and our build takes well under one, so timing isn't the problem.
+
+**Shadow first.** For weeks m3060 computes its in-round hash and only logs it, comparing with the hash mainnet
+validates a moment later. The July lockstep gauge does this today with borrowed inputs. Here every input is ours.
+
+**Then the switch, in two stages (my recommendation):**
+
+| Stage | What m3060 signs | What the world sees if we're wrong |
+|---|---|---|
+| **5a: verify, then sign** | our own hash, but only once it also matches what the trusted validators are signing for N (about a second's wait) | nothing: we skip that ledger |
+| **5b: sign on compute** | our own hash the moment it's built, like a stock validator | a public validation that disagrees with mainnet (tracking sites show agreement %) |
+
+With 5a every signature is our own computation, but we never publish a hash mainnet disagrees with. 5b is the full
+money shot and comes after a clean month of 5a.
+
+**Stop on doubt (both stages).** Skip the validation if:
+- the transaction set is incomplete;
+- the engine refuses or errors;
+- the amendment guard fires;
+- the build runs out of time.
+
+Never sign a hash we didn't compute. A breaker drops back to today's signing after repeated misses, and today's way
+stays one switch away.
+
+**Why the 31 May attempt failed and this won't.** The old "va-05" gate compared our state, which ran a few ledgers
+behind, with the live header, so it mismatched every ledger. In the in-round form every input belongs to the same
+ledger.
+
+### Step 6: later, and not needed to call it independent
+- **A Rust-only build:** the writer still needs the C++ library at compile time (the `ffi` feature). We decouple
+  it and keep the C++ library as a test oracle in the gate, not in the shipped binary.
+- **Proposing transaction sets** in consensus: deferred. As a non-UNL validator its proposals barely count.
+- **Already done:** voting yes only on rules the engine has built.
+
+## 6. Order, size and proof
+
+| Step | Size | Live risk while building | Done when | Your tap |
+|---|---|---|---|---|
+| 1. Switch on what's built | small | low (one cycle) | 1-day soak clean | 2 switch-ons |
+| 2. Our own metadata | **large** | none (trailing check) | weeks of byte-exact records | — |
+| 3. Our own order and results | medium | none (trailing check) | weeks of matching order and results | — |
+| 4. Data from peers | medium to large | none until the source switch | weeks of peer = .39, then the switch | source switch |
+| 5. Build live and sign our own | medium + weeks of shadow | none in shadow | 5a clean month, then 5b | 5a, 5b |
+| 6. Rust-only build | medium | none | the gate passes without the C++ library | — |
+
+```
+Step 1 --> ships after soak #42
+Step 2 --> Step 3 ---+
+Step 4 --------------+--> Step 5 shadow --> 5a live --> (clean month) --> 5b live
+                       fixBatchV1_2 ported --^
+```
+
+Steps 2 and 3 can be built while Step 4 is built. Most of the correctness is proven by trailing checks
+**before anything live changes**.
+
+## 7. Risks and how we handle them
+
+| Risk | Handling |
+|---|---|
+| Mainnet switches on a rule before we've built it, or before its source is out (like fixBatchV1_2) | The amendment guard alarms and skips signing. A rule needs 2 weeks of majority to switch on, and that's our porting deadline. |
+| A wrong public validation | 5a never publishes a hash the trusted validators disagree with. 5b only after a clean month. |
+| Peers throttle our requests | Pace, spread across peers, serve back. .39 stays as backup. |
+| Tiny metadata rules | Mainnet's records are an answer key for every transaction, and each mismatch names the field. |
+| Close-time edge cases ("no agreed time" ledgers, resolution changes) | Shadow catches them, and stop-on-doubt skips. |
+| m3060 goes down | Same as today: it's one validator, and the network doesn't notice. Warm restart. |
+| .39 fails (worn SSD) before Step 4 | Until Step 4, .39 is still a single point of failure. Step 4 removes that. |
+
+## 8. What stays the same
+
+- Every new path ships switched off and runs in shadow before it enforces.
+- 1-day soak, and fixes ship together.
+- You tap Yes before each switch-on.
+- The fixBatchV1_2 quarantine stands until the source is public.
+- Today's signing stays the instant rollback.
+
+## 9. What I need from you
+
+Nothing yet. **Step 1 is next.** It can be built now and ship when the current soak ends. You'll get a Yes/No tap for
+each switch-on.
