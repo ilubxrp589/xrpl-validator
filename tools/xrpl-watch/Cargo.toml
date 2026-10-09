@@ -1,0 +1,18 @@
+[package]
+name = "xrpl-watch"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal dashboard for the live validator: who writes the ledger database, the signing gate, the Rust engine, the C++ comparison copy, the upstream feed and consensus."
+license = "MIT"
+
+# Its own workspace: the validator's build and Cargo.lock never see this tool's dependencies.
+[workspace]
+
+[dependencies]
+ratatui = "0.30"
+serde_json = "1"
+ureq = { version = "2", default-features = false, features = ["json"] }
+
+[profile.release]
+opt-level = 3
+strip = true
