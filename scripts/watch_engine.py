@@ -78,6 +78,29 @@ def writer_of(eng):
     w = ((eng.get("native_shadow") or {}).get("writer") or {}) if isinstance(eng, dict) else {}
     return w if w.get("enabled") else {}
 
+def writer_roles(writer, eng, ffi):
+    """Under the Rust writer: one line per engine saying what it is doing right now — who writes state.rocks,
+    who only compares, and what .39 contributes."""
+    ns = (eng.get("native_shadow") or {}) if isinstance(eng, dict) else {}
+    wn = writer.get("native", 0); wu = writer.get("unready", 0); wr = writer.get("refused", 0); wd = writer.get("distrusted", 0)
+    tot = wn + wu + wr + wd
+    if writer.get("breaker"):
+        rust = colored("OFF — the breaker tripped (repeated hash failures); .39 writes until restart", "1;31")
+    elif not ns.get("hydrated"):
+        rust = colored("LOADING its copy of the state — starts writing when loaded (~4 min after a start)", "1;33")
+    else:
+        live = wn + wr + wd                      # ledgers since its copy loaded (loading ones are not misses)
+        pct = wn / live * 100 if live else 0
+        rust = colored("● ACTIVELY WRITING", "1;32") + colored(f"  — {wn:,} ledgers, {pct:.1f}% of all since it loaded", "32")
+    ver = ffi.get("libxrpl_version", "?") if isinstance(ffi, dict) else "?"
+    cpp = colored("○ COMPARING ONLY", "1;35") + colored(f"  — runs beside ours as a second opinion; nothing it computes is written", "90")
+    net = colored("◐ DATA FEED", "1;36") + colored(f"  — ledgers + the hash we must match; wrote {wu + wr + wd:,} ledgers our engine could not vouch for"
+                                                     f" (loading {wu:,}, disagreed {wr:,}, retries {wd:,})", "90")
+    return [colored("  WHO WRITES THE LEDGER DATABASE (state.rocks):", "1"),
+            f"    Rust engine (ours) ......... {rust}",
+            f"    libxrpl {ver} (C++ core) .. {cpp}",
+            f"    xrpld .39 (rippled) ........ {net}"]
+
 def verdict_line(sh, ffi, up, stage3, writer=None):
     """One line that answers 'is everything OK?' — same signals as the panels."""
     problems = []
@@ -134,6 +157,8 @@ def render():
     else:
         out.append(colored("  STAGE 3: inactive — shadow mode (we verify but rippled's bytes are used)", "90"))
     out.append(verdict_line(sh, ffi, up, stage3, writer))
+    if writer:
+        out.extend(writer_roles(writer, eng, ffi))
     out.append(subtitle(f"who owns what: {tag_ours()}" + colored(" = our Rust code   ", "90")
                + tag_rippled("RIPPLED") + colored(" = rippled's code (their node, or their C++ core linked into ours)", "90")))
     out.append("")
@@ -229,8 +254,12 @@ def render():
 
     # FFI (libxrpl integration — integrated into validator)
     if isinstance(ffi, dict) and ffi.get("enabled") is not False:
-        out.append(colored("── Transaction Engine (libxrpl via FFI) ──", "1;35") + "  " + tag_rippled("RIPPLED'S C++ CORE — inside our process"))
-        out.append(subtitle("rippled's own apply code, statically linked, driven by our Rust — the part the native Rust engine replaces next"))
+        if writer_of(eng):
+            out.append(colored("── libxrpl via FFI — COMPARISON ONLY (not writing) ──", "1;35") + "  " + tag_rippled("RIPPLED'S C++ CORE — inside our process"))
+            out.append(subtitle("rippled's own apply code runs beside our Rust engine as a second opinion; nothing it computes is written"))
+        else:
+            out.append(colored("── Transaction Engine (libxrpl via FFI) ──", "1;35") + "  " + tag_rippled("RIPPLED'S C++ CORE — inside our process"))
+            out.append(subtitle("rippled's own apply code, statically linked, driven by our Rust — the part the native Rust engine replaces next"))
         ver = ffi.get("libxrpl_version", "?")
         apply_attempted = ffi.get("live_apply_attempted", 0)
         apply_ok = ffi.get("live_apply_ok", 0)
@@ -309,15 +338,24 @@ def render():
     # Stage 4 Phase A: the native Rust engine shadowing the C++ core in-process.
     ns = eng.get("native_shadow", {}) if isinstance(eng, dict) else {}
     if isinstance(ns, dict) and ns.get("enabled"):
-        if writer:
-            out.append(colored("── Native Rust Engine (Stage 4 — WRITING state) ──", "1;32") + "  " + tag_ours())
+        if writer and not ns.get("hydrated"):
+            out.append(colored("── Native Rust Engine — LOADING (writing starts when loaded) ──", "1;33") + "  " + tag_ours())
+            out.append(subtitle("our Rust tx engine is loading its copy of the state; until then each ledger's bytes come from .39"))
+        elif writer and writer.get("breaker"):
+            out.append(colored("── Native Rust Engine — WRITER OFF (breaker) ──", "1;31") + "  " + tag_ours())
+            out.append(subtitle("repeated hash failures on our bytes turned the writer off until restart; .39's bytes are written"))
+        elif writer:
+            out.append(colored("── Native Rust Engine — ACTIVELY WRITING state ──", "1;32") + "  " + tag_ours())
             out.append(subtitle("our Rust tx engine computes every ledger and its bytes are what state.rocks stores"))
         else:
             out.append(colored("── Native Engine Shadow (Stage 4) ──", "1;32") + "  " + tag_ours())
             out.append(subtitle("our own Rust tx engine applies every ledger beside the C++ core — do the overlays agree byte-for-byte?"))
         if not ns.get("hydrated"):
             gaps = ns.get("skipped_gap", 0)
-            out.append(f"  {colored('hydrating…', '33')} (mirror loads from state.rocks on the next steady ledger; gaps so far: {gaps})")
+            if writer:
+                out.append(f"  {colored('loading…', '33')} (its copy of the state loads from state.rocks in ~4 min; gaps so far: {gaps})")
+            else:
+                out.append(f"  {colored('hydrating…', '33')} (mirror loads from state.rocks on the next steady ledger; gaps so far: {gaps})")
         if writer:
             # Every ledger is written either from our engine's bytes or, when it cannot vouch for one, from the
             # network's (counted by reason). A hash failure on our bytes is the one that matters: it is rolled back
@@ -325,10 +363,11 @@ def render():
             wn = writer.get("native", 0); wu = writer.get("unready", 0); wr = writer.get("refused", 0)
             wd = writer.get("distrusted", 0); wm = writer.get("mismatch", 0)
             tot = wn + wu + wr + wd
-            pct_w = wn / tot * 100 if tot else 0
+            live = wn + wr + wd                  # since its copy of the state loaded
+            pct_w = wn / live * 100 if live else 0
             col_w = "1;31" if wm else ("1;32" if wr == 0 else "1;33")
-            out.append(f"  {colored('RUST WRITER:', '1')} {colored(f'{pct_w:.2f}%', col_w)} of ledgers written by our engine"
-                       f"   ({wn:,}/{tot:,})")
+            out.append(f"  {colored('RUST WRITER:', '1')} {colored(f'{pct_w:.2f}%', col_w)} of ledgers since it loaded written by our engine"
+                       f"   ({wn:,}/{live:,}; {wn:,}/{tot:,} since the restart)")
             out.append(f"    from .39 instead: {colored(f'loading {wu:,}', '90')}  "
                        f"{colored(f'engine disagreed {wr:,}', '1;33' if wr else '32')}  "
                        f"{colored(f'retries {wd:,}', '90')}  |  "
@@ -341,7 +380,8 @@ def render():
             dv = ns.get("overlay_diverged", 0)
             pct = fm / led * 100 if led else 0
             col = "1;32" if dv == 0 else "1;31"
-            out.append(f"  {colored('OVERLAY AGREEMENT:', '1')} {colored(f'{pct:.2f}%', col)}   ({fm:,}/{led:,} ledgers  diverged={dv})")
+            vs = "  ours vs the C++ core" if writer else ""
+            out.append(f"  {colored('OVERLAY AGREEMENT:', '1')} {colored(f'{pct:.2f}%', col)}   ({fm:,}/{led:,} ledgers  diverged={dv}){colored(vs, '90')}")
             ta = ns.get("txs_applied", 0); tm = ns.get("ter_matched", 0); tmm = ns.get("ter_mismatched", 0)
             out.append(f"    txs applied: {colored(f'{ta:,}', '36')}  ter-match: {colored(f'{tm:,}', '32')}  ter-miss: {colored(str(tmm), '31' if tmm else '32')}  |  last apply: {ns.get('apply_ms_last', 0)}ms")
             km = ns.get("key_missing", 0); ke = ns.get("key_extra", 0); kb = ns.get("byte_mismatch", 0)
