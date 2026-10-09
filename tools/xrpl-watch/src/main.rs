@@ -19,7 +19,8 @@
 //!                                      0.25 s (the upstream every 1 s, amendments every minute)
 //!   xrpl-watch --once [--size 160x48]  one frame as ANSI text on stdout
 //!   xrpl-watch --record DIR [--frames N] [--interval S] [--size WxH]
-//!                                      N frames, one every S seconds, as DIR/frame_00001.ans … (for videos)
+//!                                      N frames, one every S seconds, as DIR/frame_00001.ans … (for videos);
+//!                                      --fps F records F frames a second while the data is read every S
 //!   --basic                            16 colours instead of 24-bit (old terminals)
 //!   keys: q quit · p pause
 
@@ -1680,7 +1681,7 @@ fn draw_ledger_mix(f: &mut Frame, r: Rect, sn: &Snap) {
 
 fn draw_footer(f: &mut Frame, r: Rect, sn: &Snap, paused: bool) {
     let p = pal();
-    let mut v = vec![dim(" q quit · p pause · 1 s refresh · counts since the validator started · xrpl-watch, the Rust dashboard")];
+    let mut v = vec![dim(" q quit · p pause · real time: ~30 fps, the validator read 4× a second · counts since the validator started · xrpl-watch")];
     if paused {
         v.push(bold("   ⏸ PAUSED", p.warn));
     }
@@ -1795,6 +1796,12 @@ fn main() -> io::Result<()> {
     if once || record.is_some() {
         let (w, h) = parse_size(&args);
         let frames: usize = if once { 1 } else { arg_value(&args, "--frames").and_then(|v| v.parse().ok()).unwrap_or(60) };
+        // Frames come at --fps (default: one per data read); the data is still read every --interval.
+        let frame_dt = arg_value(&args, "--fps")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|f| *f > 0.0)
+            .map(|f| Duration::from_secs_f64(1.0 / f))
+            .unwrap_or(cfg.interval);
         let left = Arc::new(Mutex::new(frames));
         {
             let (c, s2, l) = (cfg.clone(), shared.clone(), left.clone());
@@ -1825,8 +1832,8 @@ fn main() -> io::Result<()> {
             *left.lock().unwrap() -= 1;
             if i < frames {
                 let spent = tick.elapsed();
-                if spent < cfg.interval {
-                    std::thread::sleep(cfg.interval - spent);
+                if spent < frame_dt {
+                    std::thread::sleep(frame_dt - spent);
                 }
             }
         }
