@@ -92,7 +92,15 @@ fn canon_nested(v: &mut serde_json::Value) {
             }
         }
         serde_json::Value::Object(o) => {
-            for (_, f) in o.iter_mut() {
+            for (k, f) in o.iter_mut() {
+                // Finding 418 (mainnet #107570369 EE825DEED447): the decoder spells a stored PermissionValue as
+                // its number, and live JSON names it ("OfferCreate"). A DelegateSet re-filing the same
+                // permissions read as material and was threaded. Name and number are one permission.
+                if k == "PermissionValue" {
+                    if let Some(c) = f.as_str().and_then(|s| xrpl_core::codec::definitions::permission_value_code(s).ok()) {
+                        *f = serde_json::Value::from(c);
+                    }
+                }
                 canon_amount(f);
                 canon_nested(f);
             }
@@ -632,5 +640,15 @@ mod writeback_tests {
         assert!(!semantically_equal(pre, fresh));
         let changed = br#"{"LedgerEntryType":"PermissionedDomain","Owner":"08F93A124EDA9FA269D6BD7557873350B7522ABC","AcceptedCredentials":[{"Credential":{"Issuer":"08F93A124EDA9FA269D6BD7557873350B7522ABC","CredentialType":"4B5944"}}]}"#;
         assert!(!semantically_equal(pre, changed));
+    }
+
+    #[test]
+    fn a_permission_by_name_and_by_number_is_not_material() {
+        // Finding 418: OfferCreate is tx type 7, so its PermissionValue is 8.
+        let pre = br#"{"LedgerEntryType":"Delegate","PreviousTxnID":"AA","PreviousTxnLgrSeq":1,"Permissions":[{"Permission":{"PermissionValue":8}},{"Permission":{"PermissionValue":9}}]}"#;
+        let named = br#"{"LedgerEntryType":"Delegate","PreviousTxnID":"AA","PreviousTxnLgrSeq":1,"Permissions":[{"Permission":{"PermissionValue":"OfferCreate"}},{"Permission":{"PermissionValue":"OfferCancel"}}]}"#;
+        assert!(semantically_equal(pre, named));
+        let other = br#"{"LedgerEntryType":"Delegate","PreviousTxnID":"AA","PreviousTxnLgrSeq":1,"Permissions":[{"Permission":{"PermissionValue":"OfferCreate"}},{"Permission":{"PermissionValue":"Payment"}}]}"#;
+        assert!(!semantically_equal(pre, other));
     }
 }

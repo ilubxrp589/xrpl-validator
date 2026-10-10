@@ -510,6 +510,38 @@ mod tests {
         assert_eq!(field(&sb, A, "OwnerCount"), 1);
     }
 
+    /// Finding 418 (mainnet #107570369 EE825DEED447): a DelegateSet re-filing the permissions the object already
+    /// holds. The decoder spells a stored PermissionValue as its number, and live JSON names it ("OfferCreate"), so
+    /// the write-back read as a change, was threaded, and the writer refused the ledger. rippled's metadata shows
+    /// only the AccountRoot: an unchanged node is never emitted.
+    #[test]
+    fn delegate_set_refiling_the_same_permissions_by_name_changes_nothing() {
+        use xrpl_core::codec::definitions::permission_value_code;
+        let mut st = state(&[(A, 50_000_000, 1), (B, 50_000_000, 0)]);
+        let (oc, ox) = (permission_value_code("OfferCreate").unwrap(), permission_value_code("OfferCancel").unwrap());
+        let key = keylet::delegate_key(&A, &B);
+        let stored = json!({"LedgerEntryType": "Delegate", "Flags": 0, "Account": hex::encode_upper(A),
+                            "Authorize": hex::encode_upper(B), "Permissions": perms(&[oc, ox]),
+                            "OwnerNode": "0", "DestinationNode": "0",
+                            "PreviousTxnID": "4250B72A5AB63CEB5501CFDDA3B4C9765B85941BB6AECE9720FC6C0D5F524B66",
+                            "PreviousTxnLgrSeq": 107558036});
+        st.state_map.insert(key, serde_json::to_vec(&stored).unwrap()).unwrap();
+        let named = json!([{"Permission": {"PermissionValue": "OfferCreate"}}, {"Permission": {"PermissionValue": "OfferCancel"}}]);
+        for fields in [json!({"Authorize": hex::encode(B), "Permissions": named}),
+                       json!({"Authorize": hex::encode(B), "Permissions": perms(&[oc, ox])})] {
+            let mut sb = Sandbox::new(&st);
+            let (r, _) = apply_on_sandbox(&txf(A, "DelegateSet", fields.clone()), &mut sb);
+            assert_eq!(r.code_str(), "tesSUCCESS");
+            assert!(!sb.into_modifications().contains_key(&key), "the same permissions are no change: {fields}");
+        }
+        // A real change is still a change.
+        let mut sb = Sandbox::new(&st);
+        let (r, _) = apply_on_sandbox(&txf(A, "DelegateSet", json!({"Authorize": hex::encode(B),
+            "Permissions": [{"Permission": {"PermissionValue": "OfferCreate"}}]})), &mut sb);
+        assert_eq!(r.code_str(), "tesSUCCESS");
+        assert!(sb.into_modifications().contains_key(&key), "dropping OfferCancel is a change");
+    }
+
     #[test]
     fn delegate_set_with_no_permissions_deletes_it_from_both_directories() {
         let st = state(&[(A, 50_000_000, 0), (B, 50_000_000, 0)]);
