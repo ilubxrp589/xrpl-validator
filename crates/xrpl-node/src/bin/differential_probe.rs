@@ -106,16 +106,46 @@ fn cache_key(url: &str, method: &str, params: &Value) -> String {
     format!("{method}-{:016x}", h.finish())
 }
 
-/// Fetches that failed on the NETWORK, as opposed to objects that genuinely do
-/// not exist. Every caller treats `None` as "absent", so without this a dropped
-/// fetch becomes an incomplete pre-state and then a plausible-looking
-/// divergence — and these results feed `loop/rate.py`, the honest score.
-/// See the same fix on the FFI leg (`ffi_engine::RPC_EXHAUSTED`), prompted by
-/// #106099077 where a phantom `tecPATH_DRY` came with a triage note blaming the
-/// offer-book walk; the fixture replayed CLEAN on re-run.
+/// Fetches that FAILED, as opposed to objects that genuinely do not exist.
+/// Every caller treats `None` as "absent", so without this a dropped fetch
+/// becomes an incomplete pre-state and then a plausible-looking divergence —
+/// and these results feed `loop/rate.py`, the honest score. See the same fix
+/// on the FFI leg (`ffi_engine::RPC_EXHAUSTED`), prompted by #106099077 where
+/// a phantom `tecPATH_DRY` came with a triage note blaming the offer-book
+/// walk; the fixture replayed CLEAN on re-run.
 static RPC_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Whether an answer settles a lookup: a result with no `error`, or one of the
+/// two DETERMINISTIC negatives. For a fixed ledger_index, `entryNotFound` and
+/// `actNotFound` say the object is not in that ledger. Any other JSON error
+/// (`internal`, `lgrNotFound`, `tooBusy`, `slowDown`, …) says nothing about
+/// the object: it is retried, and if it never settles the fetch FAILED.
+/// #107541732 (2026-10-10): s2 answered the PLX/mXRP pool's
+/// `ledger_entry {amm}` with an error in three runs. The error came back as
+/// data, every loader read it as "no pool", and the replay reported a phantom
+/// tecPATH_DRY instead of HYDRATION-FAILED (one DX_RPCLOG re-run: 108/108).
+fn settled(result: &Value) -> bool {
+    match result.get("error").and_then(|e| e.as_str()) {
+        None => !result.is_null(),
+        Some("entryNotFound") | Some("actNotFound") => true,
+        Some(_) => false,
+    }
+}
+
+/// One lookup: the answer when it settles (`settled`), `None` when it failed.
+/// The failure is counted in `RPC_FAILED`, so the verdict is withheld.
 fn rpc(url: &str, method: &str, params: Value) -> Option<Value> {
+    let answer = rpc_answer(url, method, params);
+    if answer.is_none() {
+        RPC_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    answer
+}
+
+/// `rpc` for a caller with its own way to recover (`load_account`, the book
+/// walk's base-seeded first page): the failure is NOT counted here. If the
+/// recovery fails too, it goes through `rpc` and is counted there.
+fn rpc_answer(url: &str, method: &str, params: Value) -> Option<Value> {
     let dir = cache_dir();
     let path = dir.as_ref().map(|d| d.join(cache_key(url, method, &params)));
     let dxlog = std::env::var("DX_RPCLOG").is_ok();
@@ -152,19 +182,19 @@ fn rpc(url: &str, method: &str, params: Value) -> Option<Value> {
             .ok()
     }) {
         Some(c) => c.clone(),
-        None => {
-            RPC_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return None;
-        }
+        None => return None,
     };
-    // Retry a transient failure before giving up. `None` from this function is
+    let fallback = std::env::var("XRPL_PROBE_FALLBACK").ok().filter(|fb| !fb.is_empty() && fb != url);
+    // Retry before giving up: a dropped connection, an unparsable body, or an
+    // answer that does not settle the lookup (`settled`). `None` from `rpc` is
     // indistinguishable downstream from "the object is not there" — every
-    // caller does `else { return }` — so one dropped fetch silently hydrates an
-    // incomplete pre-state and the replay then diverges for real-looking
-    // reasons. `entryNotFound` does NOT come through here: rippled answers it
-    // with a result carrying an `error` field, so it returns Some.
-    let mut body = None;
-    for attempt in 0..3 {
+    // caller does `else { return }` — so a failed lookup is counted, never
+    // returned as data: one dropped fetch would silently hydrate an incomplete
+    // pre-state and the replay then diverges for real-looking reasons.
+    // `entryNotFound` settles: rippled answers it with a result carrying an
+    // `error` field, returned as Some.
+    let mut answer: Option<Value> = None;
+    for attempt in 0..3u64 {
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(250 * attempt));
         }
@@ -174,16 +204,20 @@ fn rpc(url: &str, method: &str, params: Value) -> Option<Value> {
             .send()
         {
             if let Ok(v) = resp.json::<Value>() {
-                body = Some(v);
-                break;
+                let r = v["result"].clone();
+                // With a fallback set, the not-in-window answers go to it at
+                // once (below): the primary will not change its mind.
+                let to_fallback = fallback.is_some()
+                    && matches!(r.get("error").and_then(|e| e.as_str()), Some("lgrNotFound") | Some("internal"));
+                let done = settled(&r) || to_fallback;
+                answer = Some(r);
+                if done {
+                    break;
+                }
             }
         }
     }
-    let Some(body) = body else {
-        RPC_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return None;
-    };
-    let mut result = body["result"].clone();
+    let Some(mut result) = answer else { return None };
     // XRPL_PROBE_FALLBACK=<url>: a PRE-WINDOW ledger answers `lgrNotFound` on
     // the primary (.39's online_delete floor moves forward); retry those on a
     // full-history server. Spot-probe tool only — gates leave it unset (public
@@ -198,43 +232,39 @@ fn rpc(url: &str, method: &str, params: Value) -> Option<Value> {
         result.get("error").and_then(|e| e.as_str()),
         Some("lgrNotFound") | Some("internal")
     ) {
-        if let Ok(fb) = std::env::var("XRPL_PROBE_FALLBACK") {
-            if !fb.is_empty() && fb != url {
-                // Public full-history infra sheds load under fleet pressure: a
-                // single dropped attempt leaves the primary's lgrNotFound in
-                // place and hydration silently thins (l106281182 re-probed
-                // 52/57 while sweep workers shared the s2 pipe — 2428
-                // permanently-uncacheable misses). Retry like the primary
-                // does, and treat rate-limit answers (slowDown/tooBusy — a
-                // well-formed JSON error) as transient too. lgrNotFound FROM
-                // the full-history server is settled: the seq itself is bad.
-                for attempt in 0..3u64 {
-                    if attempt > 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(500 * attempt));
-                    }
-                    if let Ok(resp) = client
-                        .post(&fb)
-                        .json(&json!({"method": method, "params": [params]}))
-                        .send()
-                    {
-                        if let Ok(v) = resp.json::<Value>() {
-                            let r = v["result"].clone();
-                            let settled = match r.get("error").and_then(|e| e.as_str()) {
-                                None => !r.is_null(),
-                                Some("entryNotFound") | Some("actNotFound") | Some("lgrNotFound") => true,
-                                Some(_) => false,
-                            };
-                            result = r;
-                            if settled {
-                                break;
-                            }
+        if let Some(fb) = &fallback {
+            // Public full-history infra sheds load under fleet pressure: a
+            // single dropped attempt leaves the primary's lgrNotFound in
+            // place and hydration silently thins (l106281182 re-probed
+            // 52/57 while sweep workers shared the s2 pipe — 2428
+            // permanently-uncacheable misses). Retry like the primary
+            // does, and treat rate-limit answers (slowDown/tooBusy — a
+            // well-formed JSON error) as transient too. lgrNotFound FROM
+            // the full-history server ends the retries (the seq itself is
+            // bad), and like any unsettled answer it is a failed fetch.
+            for attempt in 0..3u64 {
+                if attempt > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(500 * attempt));
+                }
+                if let Ok(resp) = client
+                    .post(fb)
+                    .json(&json!({"method": method, "params": [params]}))
+                    .send()
+                {
+                    if let Ok(v) = resp.json::<Value>() {
+                        let r = v["result"].clone();
+                        let done = settled(&r)
+                            || r.get("error").and_then(|e| e.as_str()) == Some("lgrNotFound");
+                        result = r;
+                        if done {
+                            break;
                         }
                     }
                 }
-                if dxlog {
-                    let err = result.get("error").and_then(|e| e.as_str()).unwrap_or("-");
-                    eprintln!("DX_RPCLOG {method} {} FALLBACK-> err={err}", brief());
-                }
+            }
+            if dxlog {
+                let err = result.get("error").and_then(|e| e.as_str()).unwrap_or("-");
+                eprintln!("DX_RPCLOG {method} {} FALLBACK-> err={err}", brief());
             }
         }
     }
@@ -253,20 +283,22 @@ fn rpc(url: &str, method: &str, params: Value) -> Option<Value> {
     // `lgrNotFound` stays uncached: it depends on the server's history
     // window (and on whether XRPL_PROBE_FALLBACK was set), not the ledger.
     // Other errors stay uncached so a transient failure can't poison the
-    // key.
+    // key: exactly the answers that settle the lookup are cached.
+    let ok = settled(&result);
     if let (Some(p), Some(dir)) = (&path, &dir) {
-        let err_name = result.get("error").and_then(|e| e.as_str());
-        let cacheable = match err_name {
-            None => !result.is_null(),
-            Some("entryNotFound") | Some("actNotFound") => true,
-            Some(_) => false,
-        };
-        if cacheable {
+        if ok {
             let _ = std::fs::create_dir_all(dir);
             if let Ok(bytes) = serde_json::to_vec(&result) {
                 let _ = std::fs::write(p, bytes);
             }
         }
+    }
+    if !ok {
+        if dxlog {
+            let err = result.get("error").and_then(|e| e.as_str()).unwrap_or("no result");
+            eprintln!("DX_RPCLOG {method} {} UNSETTLED err={err} after retries", brief());
+        }
+        return None;
     }
     Some(result)
 }
@@ -275,12 +307,27 @@ fn rpc(url: &str, method: &str, params: Value) -> Option<Value> {
 /// field converted to hex; other fields preserved for transactor fidelity).
 fn load_account(state: &mut LedgerState, url: &str, addr: &str, ledger_index: u32) {
     let Some(id) = decode_address(addr) else { return };
-    let Some(res) = rpc(url, "account_info",
-        json!({"account": addr, "ledger_index": ledger_index})) else { return };
-    let Some(data) = res.get("account_data") else { return };
-    let mut obj = data.clone();
-    obj["Account"] = json!(hex::encode(id));
     let key = keylet::account_root_key(&id);
+    let data = match rpc_answer(url, "account_info", json!({"account": addr, "ledger_index": ledger_index})) {
+        // Settled: the root, or actNotFound (no account_data: absent).
+        Some(res) => {
+            let Some(data) = res.get("account_data") else { return };
+            data.clone()
+        }
+        // Unsettled: read the same AccountRoot by its ledger index. The failure
+        // counts only if that read fails too (`rpc`). s2 answers `internal` for
+        // account_info on an AMM pool's account every time (rhgzn5joWe4B…, at
+        // #107541731 and at the validated ledger, 2026-10-10) yet serves the
+        // root by ledger_entry; .39 answers both.
+        None => {
+            let Some(res) = rpc(url, "ledger_entry",
+                json!({"index": hex::encode_upper(key.0), "ledger_index": ledger_index})) else { return };
+            let Some(node) = res.get("node") else { return }; // entryNotFound: absent
+            node.clone()
+        }
+    };
+    let mut obj = data;
+    obj["Account"] = json!(hex::encode(id));
     let _ = state.state_map.insert(key, serde_json::to_vec(&obj).unwrap_or_default());
 }
 
@@ -1825,13 +1872,18 @@ fn load_book_pair(
         let page_cap: usize = if deep { 100_000 } else { 400 };
         let mut deep_offer_budget: i32 = if deep { i32::MAX } else { 256 };
         'sweep: while pages_done < page_cap {
-            let Some(res) = rpc(url, "ledger_data", json!({
+            let params = json!({
                 "ledger_index": ledger_index,
                 "marker": marker.clone(),
                 "limit": 96,
                 "binary": false,
-            })) else {
-                if !seeded_fallback && pages_done == 0 {
+            });
+            // The base-seeded first page recovers by reseeding at bd0, so its
+            // failure is not counted (`rpc_answer`). The reseeded walk's is (`rpc`).
+            let first = !seeded_fallback && pages_done == 0;
+            let answer = if first { rpc_answer(url, "ledger_data", params) } else { rpc(url, "ledger_data", params) };
+            let Some(res) = answer else {
+                if first {
                     seeded_fallback = true;
                     marker = serde_json::Value::String(bd0.clone());
                     continue;
@@ -3826,18 +3878,30 @@ fn run() -> i32 {
         }
     }
     eprintln!("SUMMARY: {total_matched}/{total_attempted} attempted txs MATCH mainnet (native engine)");
-    if total_attempted == 0 {
-        return 2;
-    }
     let failed = RPC_FAILED.load(std::sync::atomic::Ordering::Relaxed);
-    if failed > 0 {
+    let code = exit_code(total_attempted, failed, any_diverge);
+    if code == 3 {
         eprintln!(
             "PROBE: HYDRATION-FAILED ({failed} fetch(es) failed after retries) \
              — verdict withheld, the pre-state is incomplete"
         );
-        return 3;
     }
-    if any_diverge { 1 } else { 0 }
+    code
+}
+
+/// The probe's exit code, in this order: 2 nothing was attempted; 3
+/// HYDRATION-FAILED (a fetch failed, so the pre-state is incomplete and a
+/// divergence proves nothing: the verdict is withheld); 1 a divergence; 0 clean.
+fn exit_code(total_attempted: u32, failed: u64, any_diverge: bool) -> i32 {
+    if total_attempted == 0 {
+        2
+    } else if failed > 0 {
+        3
+    } else if any_diverge {
+        1
+    } else {
+        0
+    }
 }
 
 #[cfg(test)]
@@ -3866,5 +3930,194 @@ mod cache_key_tests {
             cache_key("https://s2.ripple.com:51234", "account_objects", &params),
             cache_key("https://s2.ripple.com:51234", "account_objects", &p2),
         );
+    }
+}
+
+/// A JSON error that is not a deterministic negative is a FAILED fetch, never
+/// "absent". #107541732: an error answer to the PLX/mXRP pool's
+/// `ledger_entry {amm}` was read as "no pool", and the replay reported a
+/// phantom tecPATH_DRY instead of HYDRATION-FAILED.
+#[cfg(test)]
+mod rpc_failure_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// `RPC_FAILED` and `DX_CACHE` are process-wide: these tests run one at a time.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    type Calls = Arc<Mutex<Vec<(String, Value)>>>;
+
+    /// A JSON-RPC server on 127.0.0.1. `answer(method, params)` is the `result`
+    /// of each reply. Returns its url and the calls it received.
+    fn mock(answer: impl Fn(&str, &Value) -> Value + Send + 'static) -> (String, Calls) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let calls: Calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let line = line.trim_end();
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = line.split_once(':') {
+                        if k.eq_ignore_ascii_case("content-length") {
+                            len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                let mut body = vec![0u8; len];
+                if reader.read_exact(&mut body).is_err() {
+                    continue;
+                }
+                let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let method = req["method"].as_str().unwrap_or("").to_string();
+                let params = req["params"][0].clone();
+                let result = answer(&method, &params);
+                seen.lock().unwrap().push((method, params));
+                let reply = serde_json::to_vec(&json!({"result": result})).unwrap();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    reply.len()
+                );
+                let _ = stream.write_all(&reply);
+            }
+        });
+        (url, calls)
+    }
+
+    fn error(name: &str) -> Value {
+        json!({"error": name, "status": "error"})
+    }
+
+    fn failed() -> u64 {
+        RPC_FAILED.load(Ordering::Relaxed)
+    }
+
+    fn count(calls: &Calls, method: &str, amm: bool) -> usize {
+        calls.lock().unwrap().iter().filter(|(m, p)| m == method && p.get("amm").is_some() == amm).count()
+    }
+
+    fn empty_state() -> LedgerState {
+        LedgerState::new_unverified(LedgerHeader {
+            sequence: 107541731, total_coins: 100_000_000_000_000_000, parent_hash: Hash256([0; 32]),
+            transaction_hash: Hash256([0; 32]), account_hash: Hash256([0; 32]),
+            parent_close_time: 0, close_time: 10, close_time_resolution: 10, close_flags: 0,
+        })
+    }
+
+    /// #107541732's first hop: PLX.rGLEg -> mXRP.rfmS3z.
+    fn plx() -> Value {
+        json!({"currency": "PLX", "issuer": "rGLEgQdktoN4Be5thhk6seg1HifGPBxY5Q"})
+    }
+    fn mxrp() -> Value {
+        json!({"currency": "6D58525000000000000000000000000000000000", "issuer": "rfmS3zqrQrka8wVyhXifEeyTwe8AMz2Yhw"})
+    }
+
+    #[test]
+    fn an_amm_lookup_answering_internal_withholds_the_verdict() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("DX_CACHE", "");
+        let (url, calls) = mock(|method, params| match method {
+            "ledger_entry" if params.get("amm").is_some() => error("internal"),
+            "book_offers" => json!({"offers": []}),
+            _ => error("entryNotFound"),
+        });
+        let before = failed();
+        let mut seen = HashSet::new();
+        load_book_pair(&mut empty_state(), &url, &plx(), &mxrp(), 107541731, &mut seen);
+        assert_eq!(count(&calls, "ledger_entry", true), 3, "an unsettled answer is retried: 3 tries");
+        assert_eq!(failed() - before, 1, "the pool lookup that never settled is a failed fetch");
+        // Without the pool the replay reads the hop as dry and diverges; the verdict is withheld instead.
+        assert_eq!(exit_code(108, failed() - before, true), 3, "HYDRATION-FAILED, not a divergence");
+    }
+
+    #[test]
+    fn an_amm_lookup_answering_entry_not_found_still_reads_as_absent() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("DX_CACHE", "");
+        let (url, calls) = mock(|method, params| match method {
+            "ledger_entry" if params.get("amm").is_some() => error("entryNotFound"),
+            "book_offers" => json!({"offers": []}),
+            _ => error("entryNotFound"),
+        });
+        let before = failed();
+        let mut seen = HashSet::new();
+        load_book_pair(&mut empty_state(), &url, &plx(), &mxrp(), 107541731, &mut seen);
+        assert_eq!(count(&calls, "ledger_entry", true), 1, "a deterministic negative settles at once");
+        assert_eq!(failed() - before, 0, "no pool is an answer, not a failure");
+        let r = rpc(&url, "ledger_entry", json!({"amm": {"asset": plx(), "asset2": mxrp()}, "ledger_index": 107541731}))
+            .expect("entryNotFound comes back as an answer");
+        assert_eq!(r["error"], "entryNotFound");
+        assert!(r.get("node").is_none(), "absent: nothing to load");
+        assert_eq!(failed() - before, 0);
+        assert_eq!(exit_code(108, failed() - before, true), 1, "a divergence stays a divergence");
+    }
+
+    #[test]
+    fn an_account_info_answering_internal_loads_the_root_by_ledger_entry() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("DX_CACHE", "");
+        // s2's answer for the PLX/mXRP pool's account, every time.
+        let addr = "rhgzn5joWe4BpQunGZVJypT1T3aCGus8FK";
+        let id = decode_address(addr).unwrap();
+        let key = keylet::account_root_key(&id);
+        let khex = hex::encode_upper(key.0);
+        let k = khex.clone();
+        let (url, calls) = mock(move |method, params| match method {
+            "account_info" => error("internal"),
+            "ledger_entry" if params["index"] == k.as_str() => json!({"index": k, "node": {
+                "LedgerEntryType": "AccountRoot", "Account": addr, "Balance": "1000000", "Flags": 26214400,
+                "OwnerCount": 1, "Sequence": 0, "AMMID": "37248E8FAC32BC65A06AB49E8E1EF3E0C1F94A6BE8A75D4B1B7C9A9F9F0E8D21",
+                "index": k}}),
+            _ => error("entryNotFound"),
+        });
+        let before = failed();
+        let mut st = empty_state();
+        load_account(&mut st, &url, addr, 107541731);
+        assert_eq!(count(&calls, "account_info", false), 3, "account_info is retried before the fallback");
+        assert_eq!(count(&calls, "ledger_entry", false), 1, "then the root is read by its ledger index");
+        assert_eq!(failed() - before, 0, "the fallback loaded it: nothing to count");
+        let root: Value = state_root(&st, &key);
+        assert_eq!(root["Account"], hex::encode(id), "load_account's format: Account in hex");
+        assert_eq!(root["Balance"], "1000000");
+        assert_eq!(root["Flags"], 26214400);
+    }
+
+    #[test]
+    fn a_transient_error_is_retried_and_not_counted() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("DX_CACHE", "");
+        let tries = Arc::new(AtomicUsize::new(0));
+        let t = tries.clone();
+        let (url, _calls) = mock(move |method, _| {
+            if method == "account_info" && t.fetch_add(1, Ordering::SeqCst) == 0 {
+                error("tooBusy")
+            } else {
+                json!({"account_data": {"Account": "rGLEgQdktoN4Be5thhk6seg1HifGPBxY5Q", "Balance": "5"}})
+            }
+        });
+        let before = failed();
+        let r = rpc(&url, "account_info", json!({"account": "rGLEgQdktoN4Be5thhk6seg1HifGPBxY5Q", "ledger_index": 1}));
+        assert_eq!(r.and_then(|v| v["account_data"]["Balance"].as_str().map(str::to_string)).as_deref(), Some("5"));
+        assert_eq!(tries.load(Ordering::SeqCst), 2, "the second try settled");
+        assert_eq!(failed() - before, 0);
+    }
+
+    fn state_root(st: &LedgerState, key: &Hash256) -> Value {
+        let bytes = st.state_map.lookup(key).expect("the AccountRoot was loaded");
+        serde_json::from_slice(&bytes).unwrap()
     }
 }
