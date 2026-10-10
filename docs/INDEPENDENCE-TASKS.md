@@ -56,18 +56,19 @@ Step 2's receipts and the live-edge change (5.4) are where it can stretch.
 | 1.2 | Enforce proposal signatures (**tap**) | S |
 | 1.3 | Validator list fails closed (**tap**) | S |
 | 1.4 | Ship as one cycle | S |
-| 1.5 | Port fixBatchV1_2 (blocked on the source) | M? |
+| 1.5 | Port fixBatchV1_2 (**done**, cycle 168, 10 Oct) | — |
 
 **1.1 Amendment guard.**
 - **What:**
   - On every flag ledger, read the ledger's Amendments object (the engine already reads it) and compare it with a
     `ENGINE_KNOWN` list.
   - `ENGINE_KNOWN` is every amendment live on mainnet at deploy time, plus each new one as it's ported.
-  - fixBatchV1_2 goes on a short "known gap" list until it's ported.
+  - A short "known gap" list holds a rule that's live but not ported yet. It starts empty, since fixBatchV1_2 is
+    ported.
   - Anything enabled that's on neither list sends a ⚠️ ALARM to Telegram and shows in the API, the metrics and the TUI.
   - From Step 5 on, it also blocks signing our own hash.
 - **Check:** unit tests with made-up Amendments objects. Replaying 9 October's activation ledger with fixBatchV1_2
-  taken off the known-gap list must raise the alarm.
+  taken off `ENGINE_KNOWN` must raise the alarm.
 
 **1.2 Enforce proposal signatures.**
 - **What:** set `XRPL_SIG_ENFORCE=1`, which drops proposals whose signatures fail, and show the dropped count.
@@ -82,11 +83,13 @@ Step 2's receipts and the live-edge change (5.4) are where it can stretch.
 
 **1.4 Ship.** One cycle (gate, windows, deploy, soak). The two switch-ons are your taps.
 
-**1.5 Port fixBatchV1_2.**
-- **What:** when the 3.4.1 source is public, read the change, port it, and check it with the probe against every
-  Batch ledger since 9 October.
-- **Size:** unknown until we see the source.
-- This must be done before 5a.
+**1.5 Port fixBatchV1_2. Done.**
+- The 3.4.1 source was published on 9 October. The rule was ported that night and went live in cycle 168 (commit
+  `863651f`, 10 October 00:45), with 3.4.1's overflow checks in the payment engine and a Batch attribution fix in
+  the C++ comparison leg. The C++ library was relinked to 3.4.1 the same night.
+- **Checked by:** the gate, the two history windows (158 ledgers, 0 mismatches), and 63 of the ledgers the writer
+  had refused, all matching. One more differs on an AMM-only payment that the previous engine gets wrong too, so
+  it isn't from the port; it's being looked into.
 
 ## Step 2: our own transaction records (metadata)
 

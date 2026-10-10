@@ -45,7 +45,7 @@ work (metadata, ordering) or plumbing (data from peers, close time, the switch).
 | Direct peer connections | **about 55** |
 | Validator list | **verified** against Ripple's publisher key (list #85, 35 validators, 0 rejected) |
 | Voting | says yes **only** to rules the engine has built (since 26 Sep) |
-| Live rules not yet in the engine | **fixBatchV1_2** only (waits for the 3.4.1 source) |
+| Live rules not yet in the engine | **none**: fixBatchV1_2 was ported in cycle 168 (live 10 Oct) |
 
 **Built and running, but only observing (not enforcing):**
 - signature checks on proposals and validations (S1/S2);
@@ -90,8 +90,8 @@ TARGET
   the other side: what mainnet has actually switched on.
   - If mainnet switches on a rule the engine hasn't built, you get an alarm at once.
   - From Step 5 on, the guard also stops m3060 signing its own hash. It's our own version of "amendment blocked".
-  - fixBatchV1_2 is the first entry: it's on, and we can't build it until the source is out.
-- **fixBatchV1_2.** Port it the day the 3.4.1 source is published. It must be done before Step 5 goes live.
+  - Its known-gap list starts empty: fixBatchV1_2, the rule that would have been on it, is ported.
+- **fixBatchV1_2. Done.** Ported in cycle 168 (live 10 Oct 00:45), the night the 3.4.1 source was published.
 
 ### Step 2: our own transaction records (metadata)
 *Size: large, the biggest build. No live risk: it runs alongside, checked against mainnet.*
@@ -252,10 +252,10 @@ ledger.
 | 6. Rust-only build | medium | none | the gate passes without the C++ library | — |
 
 ```
-Step 1 --> ships after soak #42
+Step 1 --> ships after the soak running at the push
 Step 2 --> Step 3 ---+
 Step 4 --------------+--> Step 5 shadow --> 5a live --> (clean month) --> 5b live
-                       fixBatchV1_2 ported --^
+         fixBatchV1_2 ported (done 10 Oct) --^
 ```
 
 Steps 2 and 3 can be built while Step 4 is built. Most of the correctness is proven by trailing checks
@@ -265,7 +265,7 @@ Steps 2 and 3 can be built while Step 4 is built. Most of the correctness is pro
 
 | Risk | Handling |
 |---|---|
-| Mainnet switches on a rule before we've built it, or before its source is out (like fixBatchV1_2) | The amendment guard alarms and skips signing. A rule needs 2 weeks of majority to switch on, and that's our porting deadline. |
+| Mainnet switches on a rule before we've built it, or before its source is out (as fixBatchV1_2 was, 9–10 Oct) | The amendment guard alarms and skips signing. A rule needs 2 weeks of majority to switch on, and that's our porting deadline. |
 | A wrong public validation | 5a never publishes a hash the trusted validators disagree with. 5b only after a clean month. |
 | Peers throttle our requests | Pace, spread across peers, serve back. .39 stays as backup. |
 | Tiny metadata rules | Mainnet's records are an answer key for every transaction, and each mismatch names the field. |
@@ -278,7 +278,8 @@ Steps 2 and 3 can be built while Step 4 is built. Most of the correctness is pro
 - Every new path ships switched off and runs in shadow before it enforces.
 - 1-day soak, and fixes ship together.
 - You tap Yes before each switch-on.
-- The fixBatchV1_2 quarantine stands until the source is public.
+- A live rule whose source isn't public yet is quarantined: its cases are logged by sequence and hash only, and never
+  examined or posted, until the source is out.
 - Today's signing stays the instant rollback.
 
 ## 9. What I need from you
