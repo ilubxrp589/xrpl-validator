@@ -329,17 +329,26 @@ pub struct FlowResult {
     pub ter: TxResult,
 }
 
-fn sum(col: &[EitherAmount], xrp: bool) -> EitherAmount {
+/// `sum(col)` (rippled 3.4.1 StrandFlow.h:648-663): the ascending fold of a
+/// `flat_multiset` through `checkedStepAddOpt`, None when an XRP aggregate
+/// leaves rippled's int64 range. Callers treat that as a dry path.
+fn sum(col: &[EitherAmount], xrp: bool) -> Option<EitherAmount> {
     if col.is_empty() {
-        return EitherAmount::zero(xrp);
+        return Some(EitherAmount::zero(xrp));
     }
     let mut v = col.to_vec();
     v.sort_by(|a, b| a.cmp_like(b));
     let mut acc = v[0];
     for x in &v[1..] {
-        acc = acc.add(*x);
+        acc = acc.checked_step_add(*x)?;
     }
-    acc
+    Some(acc)
+}
+
+/// `{tecPATH_DRY, std::move(ofrsToRmOnFail)}`: no amounts, the offers found
+/// dead so far.
+fn path_dry(in_xrp: bool, out_xrp: bool, removable_offers: OffersToRemove) -> FlowResult {
+    FlowResult { input: EitherAmount::zero(in_xrp), out: EitherAmount::zero(out_xrp), removable_offers, ter: TxResult::PathDry }
 }
 
 /// `Quality{out, in}` of a strand's realised amounts.
@@ -454,9 +463,23 @@ pub fn flow_strands(
         if let Some((bin, bout, _si, _q)) = best {
             saved_ins.push(bin);
             saved_outs.push(bout);
-            remaining_out = out_req.sub(sum(&saved_outs, out_xrp));
+            // rippled 3.4.1: an aggregate that overflows is a dry path,
+            // returned before the winner's view is applied and before this
+            // iteration's dead offers join ofrsToRmOnFail. rippled destroys
+            // `best` with its sandbox; here the winner's layer is still open
+            // on `sb`, so it is discarded and the caller's flow layer is
+            // back on top.
+            let Some(sum_out) = sum(&saved_outs, out_xrp) else {
+                sb.discard();
+                return path_dry(in_xrp, out_xrp, ofrs_to_rm_on_fail);
+            };
+            remaining_out = out_req.sub(sum_out);
             if let Some(m) = send_max {
-                remaining_in = Some(m.sub(sum(&saved_ins, in_xrp)));
+                let Some(sum_in) = sum(&saved_ins, in_xrp) else {
+                    sb.discard();
+                    return path_dry(in_xrp, out_xrp, ofrs_to_rm_on_fail);
+                };
+                remaining_in = Some(m.sub(sum_in));
             }
             // `best->sb.apply(sb)`: fold the strand's layer into the flow's view.
             sb.apply_to_parent();
@@ -472,8 +495,11 @@ pub fn flow_strands(
             break;
         }
     }
-    let actual_out = sum(&saved_outs, out_xrp);
-    let actual_in = sum(&saved_ins, in_xrp);
+    // Both totals, then the check (rippled 3.4.1): savedIns is first summed
+    // here when there is no sendMax.
+    let (Some(actual_out), Some(actual_in)) = (sum(&saved_outs, out_xrp), sum(&saved_ins, in_xrp)) else {
+        return path_dry(in_xrp, out_xrp, ofrs_to_rm_on_fail);
+    };
     // fixFillOrKill is live.
     if actual_out != out_req {
         if actual_out.gt(&out_req) {
@@ -498,4 +524,136 @@ pub fn flow_strands(
 #[allow(dead_code)]
 fn _unused(_: &AmmContext, _: fn(&EitherAmount, &EitherAmount) -> bool) {
     let _ = check_near;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::flow::amounts::IouAmount;
+    use crate::flow::steps::{Step, StrandDirection};
+    use crate::ledger::header::LedgerHeader;
+    use crate::ledger::sandbox::Sandbox;
+    use crate::ledger::state::LedgerState;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    const MAX: i128 = i64::MAX as i128;
+
+    /// A one-step strand that hands back one scripted (in, out) pair per
+    /// flow iteration and reports one dead offer per iteration, `[k; 32]`
+    /// for iteration k (from 1). A real XRP strand never delivers more than
+    /// it is asked; this one may, which is how it reaches flow()'s aggregate
+    /// check at amounts that are each a valid int64 (in rippled, MPT reaches
+    /// it; the engine has no MPT strands).
+    struct Scripted {
+        plan: Vec<(EitherAmount, EitherAmount)>,
+        next: usize,
+        cached: Option<(EitherAmount, EitherAmount)>,
+    }
+
+    impl Scripted {
+        fn strand(plan: Vec<(EitherAmount, EitherAmount)>) -> Strand {
+            vec![Box::new(Scripted { plan, next: 0, cached: None })]
+        }
+    }
+
+    impl Step for Scripted {
+        fn rev(&mut self, _sb: &mut PaymentSandbox, ofrs_to_rm: &mut OffersToRemove, out: &EitherAmount) -> Result<(EitherAmount, EitherAmount), FlowError> {
+            // flow_strand re-runs a limiting step at the out it gave: the same pair.
+            if let Some(c) = self.cached.filter(|c| c.1 == *out) {
+                return Ok(c);
+            }
+            let pair = self.plan[self.next.min(self.plan.len() - 1)];
+            self.next += 1;
+            ofrs_to_rm.insert([self.next as u8; 32]);
+            self.cached = Some(pair);
+            Ok(pair)
+        }
+        fn fwd(&mut self, _sb: &mut PaymentSandbox, _ofrs_to_rm: &mut OffersToRemove, _input: &EitherAmount) -> Result<(EitherAmount, EitherAmount), FlowError> {
+            self.cached.ok_or(FlowError(TxResult::PathDry))
+        }
+        fn cached_in(&self) -> Option<EitherAmount> {
+            self.cached.map(|c| c.0)
+        }
+        fn cached_out(&self) -> Option<EitherAmount> {
+            self.cached.map(|c| c.1)
+        }
+        fn debt_direction(&self, _sb: &PaymentSandbox, _dir: StrandDirection) -> DebtDirection {
+            DebtDirection::Issues
+        }
+        fn quality_upper_bound(&self, _sb: &PaymentSandbox, _prev_step_dir: DebtDirection) -> (Option<Quality>, DebtDirection) {
+            (None, DebtDirection::Issues)
+        }
+        fn valid_fwd(&mut self, _sb: &mut PaymentSandbox, _input: &EitherAmount) -> Result<(bool, EitherAmount), FlowError> {
+            Ok((true, EitherAmount::zero(true)))
+        }
+        fn equal(&self, _other: &dyn Step) -> bool {
+            false
+        }
+        fn log_string(&self) -> String {
+            "Scripted".to_string()
+        }
+    }
+
+    fn iou(m: u128) -> EitherAmount {
+        EitherAmount::Iou(IouAmount::from_me(false, (m, 0)))
+    }
+
+    /// flow_strands as `payment_flow::flow` runs it, inside the flow's own
+    /// layer. Returns the result and the layer depth it left behind.
+    fn run(strand: Strand, out_req: EitherAmount, send_max: Option<EitherAmount>) -> (FlowResult, usize) {
+        let header = LedgerHeader {
+            sequence: 100, total_coins: 0, parent_hash: Hash256([0; 32]), transaction_hash: Hash256([0; 32]),
+            account_hash: Hash256([0; 32]), parent_close_time: 0, close_time: 10, close_time_resolution: 10, close_flags: 0,
+        };
+        let state = LedgerState::new_unverified(header);
+        let mut sandbox = Sandbox::new(&state);
+        let mut ps = PaymentSandbox::new(&mut sandbox);
+        let amm: SharedAmmContext = Rc::new(RefCell::new(AmmContext::new([0; 20], false)));
+        ps.push();
+        let mut strands = vec![strand];
+        let r = flow_strands(&mut ps, &mut strands, out_req, false, OfferCrossing::No, None, send_max, &amm);
+        (r, ps.depth())
+    }
+
+    /// rippled 3.4.1 StrandFlow.h:760-762: when savedOuts' total leaves
+    /// int64, flow() returns {tecPATH_DRY, ofrsToRmOnFail} — no amounts, and
+    /// only the dead offers of the iterations before this one — without
+    /// applying the winner's view. In i128 the engine summed on and failed
+    /// later, on actualOut > outReq: telFAILED_PROCESSING.
+    #[test]
+    fn an_out_total_past_int64_is_a_dry_path() {
+        let strand = Scripted::strand(vec![(iou(1), EitherAmount::Xrp(MAX - 10)), (iou(1), EitherAmount::Xrp(20))]);
+        let (r, depth) = run(strand, EitherAmount::Xrp(MAX), None);
+        assert_eq!(r.ter, TxResult::PathDry);
+        assert_eq!((r.input, r.out), (EitherAmount::zero(false), EitherAmount::zero(true)), "no amounts");
+        assert_eq!(r.removable_offers.iter().copied().collect::<Vec<_>>(), vec![[1u8; 32]], "iteration 1's, not 2's");
+        assert_eq!(depth, 1, "the winner's layer is dropped; the flow's own is left to the caller");
+    }
+
+    /// The same check on actualIn (StrandFlow.h:806-809): with no sendMax the
+    /// loop never sums savedIns, so the final total is where it shows. Seven
+    /// passes of 1.4e18 drops: 9.8e18 in all. (Each in stays small enough for
+    /// `quality_of`: `rate_encode_native` cannot take a native amount whose
+    /// rate mantissa passes 2^64, which no ledger amount reaches.)
+    #[test]
+    fn an_in_total_past_int64_without_send_max_is_a_dry_path() {
+        let d = EitherAmount::Xrp(1_400_000_000_000_000_000);
+        let mut plan = vec![(d, iou(9)); 6];
+        plan.push((d, iou(8)));
+        let (r, depth) = run(Scripted::strand(plan), iou(62), None);
+        assert_eq!(r.ter, TxResult::PathDry);
+        assert_eq!(r.removable_offers.len(), 7, "every iteration completed, so all seven iterations' dead offers");
+        assert_eq!(depth, 1);
+    }
+
+    /// The control: totals that end exactly on i64::MAX are not an overflow.
+    #[test]
+    fn an_out_total_of_exactly_i64_max_flows() {
+        let strand = Scripted::strand(vec![(iou(1), EitherAmount::Xrp(MAX - 10)), (iou(1), EitherAmount::Xrp(10))]);
+        let (r, depth) = run(strand, EitherAmount::Xrp(MAX), None);
+        assert_eq!(r.ter, TxResult::Success);
+        assert_eq!(r.out, EitherAmount::Xrp(MAX));
+        assert_eq!(depth, 1);
+    }
 }

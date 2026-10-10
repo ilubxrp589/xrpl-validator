@@ -205,6 +205,26 @@ impl EitherAmount {
             _ => panic!("EitherAmount: mixed XRP/IOU addition"),
         }
     }
+    /// rippled 3.4.1 `checkedStepAddOpt` (Steps.h): the add `flow()` and
+    /// `BookStep` fold `savedIns` / `savedOuts` with. XRP adds in rippled's
+    /// int64 drops (`checkedAdd`, MathUtilities.h): None when the exact sum
+    /// is outside that range. The engine holds drops in i128, where such a
+    /// sum does not wrap at all, so the bound is checked explicitly: without
+    /// it the engine carried on where rippled now stops. An IOU adds through
+    /// `Number`, unchanged by 3.4.1 (rippled's throws past the IOU range; see
+    /// `IouAmount::from_number` for the engine's side). MPT has no variant
+    /// here (MPT strands are not ported), so rippled's MPT arm has nothing to
+    /// mirror.
+    pub fn checked_step_add(self, other: EitherAmount) -> Option<EitherAmount> {
+        match (self, other) {
+            (EitherAmount::Xrp(a), EitherAmount::Xrp(b)) => a
+                .checked_add(b)
+                .filter(|s| (i64::MIN as i128..=i64::MAX as i128).contains(s))
+                .map(EitherAmount::Xrp),
+            (EitherAmount::Iou(a), EitherAmount::Iou(b)) => Some(EitherAmount::Iou(a.add(b))),
+            _ => panic!("EitherAmount: mixed XRP/IOU addition"),
+        }
+    }
     pub fn cmp_like(&self, other: &EitherAmount) -> core::cmp::Ordering {
         match (self, other) {
             (EitherAmount::Xrp(a), EitherAmount::Xrp(b)) => a.cmp(b),
@@ -271,6 +291,30 @@ mod tests {
         assert!(iou(-3, 0) < iou(2, 0));
         assert!(iou(3, 0) > IouAmount::ZERO);
         assert!(iou(-3, 0) < IouAmount::ZERO);
+    }
+
+    /// rippled 3.4.1 MathUtilities.h `checkedAdd`'s static_asserts, on the
+    /// XRP arm of `checkedStepAddOpt`.
+    #[test]
+    fn checked_step_add_is_int64_checked_add_on_xrp() {
+        let x = |d: i128| EitherAmount::Xrp(d);
+        let add = |a: i128, b: i128| x(a).checked_step_add(x(b));
+        let (max, min) = (i64::MAX as i128, i64::MIN as i128);
+        assert_eq!(add(0, 0), Some(x(0)));
+        assert_eq!(add(1, -1), Some(x(0)));
+        assert_eq!(add(-5, 2), Some(x(-3)));
+        assert_eq!(add(max, 1), None);
+        assert_eq!(add(min, -1), None);
+        assert_eq!(add(max - 1, 1), Some(x(max)));
+        assert_eq!(add(min, max), Some(x(-1)));
+        assert_eq!(add(max, min), Some(x(-1)));
+        assert_eq!(add(max, max), None);
+        assert_eq!(add(min, min), None);
+        // The plain add, in i128, carries straight past rippled's range.
+        assert_eq!(x(max).add(x(1)), x(max + 1));
+        // An IOU still adds through Number.
+        let i = |m: i64| EitherAmount::Iou(iou(m, 0));
+        assert_eq!(i(2).checked_step_add(i(3)), Some(i(5)));
     }
 }
 

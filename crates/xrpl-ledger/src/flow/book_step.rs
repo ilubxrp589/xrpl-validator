@@ -405,7 +405,7 @@ impl BookStep {
             if stp_amt.output.le(&remaining_out) {
                 saved_ins.push(stp_amt.input);
                 saved_outs.push(stp_amt.output);
-                result = (sum(&saved_ins, in_xrp), sum(&saved_outs, out_xrp));
+                result = (sum(&saved_ins, in_xrp)?, sum(&saved_outs, out_xrp)?);
                 remaining_out = out.sub(result.1);
                 this.consume_offer(sb, offer, ofr_amt, stp_amt, owner_gives)?;
                 // Even if the payment is satisfied, we need to consume the
@@ -416,7 +416,7 @@ impl BookStep {
                 remaining_out = EitherAmount::zero(out_xrp);
                 saved_ins.push(stp_adj.input);
                 saved_outs.push(remaining_out);
-                result = (sum(&saved_ins, in_xrp), out);
+                result = (sum(&saved_ins, in_xrp)?, out);
                 this.consume_offer(sb, offer, ofr_adj, stp_adj, owner_gives_adj)?;
                 // Given stpAmt.out > remainingOut the offer is usually still
                 // funded — but two IOU mantissas within ten of each other
@@ -472,7 +472,7 @@ impl BookStep {
                 saved_ins.push(stp_amt.input);
                 saved_outs.push(stp_amt.output);
                 last_out_idx = saved_outs.len() - 1;
-                result = (sum(&saved_ins, in_xrp), sum(&saved_outs, out_xrp));
+                result = (sum(&saved_ins, in_xrp)?, sum(&saved_outs, out_xrp)?);
                 // Consume the offer even if stepAmt.in == remainingIn.
                 process_more = true;
             } else {
@@ -483,7 +483,7 @@ impl BookStep {
                 saved_ins.push(remaining_in);
                 saved_outs.push(stp_adj.output);
                 last_out_idx = saved_outs.len() - 1;
-                result.1 = sum(&saved_outs, out_xrp);
+                result.1 = sum(&saved_outs, out_xrp)?;
                 result.0 = input;
                 process_more = false;
             }
@@ -493,7 +493,7 @@ impl BookStep {
                 // reverse output needs and, when it equals what is left,
                 // deliver exactly the cached output.
                 let last_out_amt = saved_outs.remove(last_out_idx);
-                let remaining_out = cache.1.sub(sum(&saved_outs, out_xrp));
+                let remaining_out = cache.1.sub(sum(&saved_outs, out_xrp)?);
                 let (ofr_rev, stp_rev, gives_rev) = limit_step_out(offer, ofr_amt, stp_amt, owner_gives, tr_in, tr_out, remaining_out);
                 if stp_rev.input == remaining_in {
                     result = (input, cache.1);
@@ -545,18 +545,23 @@ impl BookStep {
 }
 
 /// `sum(col)` over a `flat_multiset`: ascending order, `accumulate` from
-/// the second element onto the first.
-fn sum(col: &[EitherAmount], xrp: bool) -> EitherAmount {
+/// the second element onto the first through `checkedStepAdd` (rippled
+/// 3.4.1 BookStep.cpp:1056-1067), which throws `FlowException(tecPATH_DRY)`
+/// when an XRP total leaves rippled's int64 range. Here that is the
+/// `FlowError` each call site's `?` carries out of `forEachOffer` and the
+/// pass, before the offer is consumed; `flow_strand` then fails the strand,
+/// as StrandFlow.h's `catch (FlowException const&)` does.
+fn sum(col: &[EitherAmount], xrp: bool) -> Result<EitherAmount, FlowError> {
     if col.is_empty() {
-        return EitherAmount::zero(xrp);
+        return Ok(EitherAmount::zero(xrp));
     }
     let mut v = col.to_vec();
     v.sort_by(|a, b| a.cmp_like(b));
     let mut acc = v[0];
     for x in &v[1..] {
-        acc = acc.add(*x);
+        acc = acc.checked_step_add(*x).ok_or(FlowError(crate::ledger::transactor::TxResult::PathDry))?;
     }
-    acc
+    Ok(acc)
 }
 
 /// `limitStepIn(offer, ofrAmt, stpAmt, ownerGives, trIn, trOut, limit)`.
@@ -715,3 +720,144 @@ impl Step for BookStep {
 
 #[allow(dead_code)]
 fn _unused(_: IouAmount) {}
+
+#[cfg(test)]
+mod tests {
+    use crate::ledger::header::LedgerHeader;
+    use crate::ledger::keylet;
+    use crate::ledger::sandbox::{apply_modifications, Sandbox};
+    use crate::ledger::state::LedgerState;
+    use crate::ledger::transactor::{Transactor, TxFields, TxResult};
+    use serde_json::{json, Value};
+    use xrpl_core::types::Hash256;
+
+    const ISSUER: [u8; 20] = [0xA0; 20];
+    const SRC: [u8; 20] = [0xB0; 20];
+    const DST: [u8; 20] = [0xC0; 20];
+    /// STAmount's cap on an XRP amount (cMaxNativeN): 1e17 drops.
+    const MAX_NATIVE: u64 = 100_000_000_000_000_000;
+    const OWNER_XRP: u64 = 100_000_000;
+
+    fn usd() -> [u8; 20] {
+        let mut c = [0u8; 20];
+        c[12..15].copy_from_slice(b"USD");
+        c
+    }
+
+    fn owner(k: usize) -> [u8; 20] {
+        let mut id = [0x10u8; 20];
+        id[18] = (k >> 8) as u8;
+        id[19] = k as u8;
+        id
+    }
+
+    fn account(state: &mut LedgerState, id: &[u8; 20], drops: u64) {
+        let a = json!({"LedgerEntryType": "AccountRoot", "Account": hex::encode(id), "Balance": drops.to_string(),
+                       "Sequence": 1, "OwnerCount": 0, "Flags": 0});
+        state.state_map.insert(keylet::account_root_key(id), serde_json::to_vec(&a).unwrap()).unwrap();
+    }
+
+    /// `holder`'s USD line to ISSUER, holding `held` under `limit`.
+    fn line(state: &mut LedgerState, holder: &[u8; 20], held: &str, limit: &str) {
+        let cur = hex::encode_upper(usd());
+        let low = holder < &ISSUER;
+        let (lo, hi) = if low { (*holder, ISSUER) } else { (ISSUER, *holder) };
+        let balance = if low || held == "0" { held.to_string() } else { format!("-{held}") };
+        let v = json!({
+            "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+            "Balance": {"currency": cur, "issuer": "0000000000000000000000000000000000000000", "value": balance},
+            "LowLimit": {"currency": cur, "issuer": hex::encode(lo), "value": if low { limit } else { "0" }},
+            "HighLimit": {"currency": cur, "issuer": hex::encode(hi), "value": if low { "0" } else { limit }},
+        });
+        state.state_map.insert(keylet::ripple_state_key(holder, &ISSUER, &usd()), serde_json::to_vec(&v).unwrap()).unwrap();
+    }
+
+    /// An XRP -> USD book of `n` offers at one quality, each from its own
+    /// owner: 10 USD for 1e17 - 1e8 drops. The taker pays the XRP, so no
+    /// owner needs it, and each owner's 1e8 drops plus what it is paid is
+    /// exactly STAmount's 1e17 cap: a book a real ledger can hold. 92 of them
+    /// ask 9.19999999908e18 drops in all, inside int64; 93 ask 9.3e18, past
+    /// i64::MAX (9.223e18).
+    fn state_with_book(n: usize) -> LedgerState {
+        let header = LedgerHeader {
+            sequence: 100, total_coins: MAX_NATIVE, parent_hash: Hash256([0; 32]),
+            transaction_hash: Hash256([0; 32]), account_hash: Hash256([0; 32]),
+            parent_close_time: 0, close_time: 10, close_time_resolution: 10, close_flags: 0,
+        };
+        let mut state = LedgerState::new_unverified(header);
+        account(&mut state, &ISSUER, 1_000_000_000);
+        account(&mut state, &SRC, 1_000_000_000);
+        account(&mut state, &DST, 1_000_000_000);
+        line(&mut state, &DST, "0", "100000");
+        for k in 0..n {
+            account(&mut state, &owner(k), OWNER_XRP);
+            line(&mut state, &owner(k), "10", "1000");
+        }
+        let mut sb = Sandbox::new(&state);
+        for k in 0..n {
+            let offer = TxFields {
+                account: owner(k), tx_type: "OfferCreate".to_string(), fee: 10, sequence: 1,
+                ticket_seq: None, last_ledger_seq: None,
+                fields: json!({
+                    "TakerPays": (MAX_NATIVE - OWNER_XRP).to_string(),
+                    "TakerGets": {"currency": "USD", "issuer": hex::encode(ISSUER), "value": "10"},
+                }),
+                inner_batch: false,
+            };
+            assert_eq!(crate::tx::offer::OfferCreateTransactor.do_apply(&offer, &mut sb), TxResult::Success, "offer {k}");
+        }
+        let mods = sb.into_modifications();
+        apply_modifications(&mut state, mods).unwrap();
+        state
+    }
+
+    /// 1000 USD to DST for at most 1e17 drops of SRC's XRP: the book's 920 or
+    /// 930 USD is the whole of what it could get.
+    fn pay(partial: bool) -> TxFields {
+        TxFields {
+            account: SRC, tx_type: "Payment".to_string(), fee: 10, sequence: 1,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: json!({
+                "Destination": hex::encode(DST),
+                "Amount": {"currency": "USD", "issuer": hex::encode(ISSUER), "value": "1000"},
+                "SendMax": MAX_NATIVE.to_string(),
+                "Flags": if partial { 0x0002_0000u64 } else { 0 },
+            }),
+            inner_batch: false,
+        }
+    }
+
+    fn dst_usd(sb: &Sandbox) -> String {
+        let b = sb.read(&keylet::ripple_state_key(&DST, &ISSUER, &usd())).unwrap();
+        let v: Value = serde_json::from_slice(&b).unwrap();
+        v["Balance"]["value"].as_str().unwrap().trim_start_matches('-').to_string()
+    }
+
+    /// rippled 3.4.1 BookStep.cpp:1056-1067: revImp sums the IN of every offer
+    /// it takes through checkedStepAdd, which throws FlowException(tecPATH_DRY)
+    /// once the XRP total leaves int64, before the offer is consumed. The strand
+    /// fails (StrandFlow.h's catch), no other strand flows, and the payment is
+    /// tecPATH_DRY (partial) or tecPATH_PARTIAL. The engine's drops are i128,
+    /// so its total carried on to 9.3e18: the source's XRP then limited the
+    /// strand, and the partial payment delivered a sliver as tesSUCCESS.
+    #[test]
+    fn a_reverse_pass_whose_xrp_total_leaves_int64_fails_the_strand() {
+        let state = state_with_book(93);
+        let mut sb = Sandbox::new(&state);
+        assert_eq!(crate::flow::payment_flow::apply_ripple_payment(&pay(true), &mut sb), TxResult::PathDry);
+        assert_eq!(dst_usd(&sb), "0", "nothing delivered");
+        let mut sb = Sandbox::new(&state);
+        assert_eq!(crate::flow::payment_flow::apply_ripple_payment(&pay(false), &mut sb), TxResult::PathPartial);
+    }
+
+    /// The control: 92 offers ask 9.19999999908e18 drops, inside int64, so
+    /// the pass completes and the partial payment delivers what the source's
+    /// XRP buys.
+    #[test]
+    fn a_reverse_pass_inside_int64_still_flows() {
+        let state = state_with_book(92);
+        let mut sb = Sandbox::new(&state);
+        assert_eq!(crate::flow::payment_flow::apply_ripple_payment(&pay(true), &mut sb), TxResult::Success);
+        assert_ne!(dst_usd(&sb), "0", "the partial payment delivered");
+    }
+}
