@@ -61,6 +61,18 @@ pub fn fix_cleanup_3_4_0(sandbox: &Sandbox) -> bool {
     enabled(sandbox, FIX_CLEANUP_3_4_0)
 }
 
+/// fixBatchV1_2 — rippled 3.4.1 (`features.macro`: `XRPL_FIX(BatchV1_2, …)`,
+/// so the name hashed is "fixBatchV1_2"). ON on mainnet by #107540484
+/// (2026-10-09), ahead of BatchV1_1 (#107540996), so no mainnet ledger ever
+/// ran Batch without it; devnet and testnet did. Gates one rule:
+/// `Batch::preflight`'s RawTransaction wrapper check (tx/batch.rs).
+pub const FIX_BATCH_V1_2: &str =
+    "14A2B45E48A4A124D1BBA657AC7B0DC3D5EA8C256C89E8F0D8142D32960A7944";
+
+pub fn fix_batch_v1_2(sandbox: &Sandbox) -> bool {
+    enabled(sandbox, FIX_BATCH_V1_2)
+}
+
 /// DynamicMPT — not enabled on mainnet or testnet (2026-09-23). Widens what
 /// an MPTokenIssuanceSet may do on an issuance without lsfMPTCanLock.
 pub const DYNAMIC_MPT: &str =
@@ -115,5 +127,13 @@ mod tests {
         state.state_map.insert(keylet::amendments_key(), serde_json::to_vec(&obj).unwrap()).unwrap();
         assert!(fix_cleanup_3_3_0(&Sandbox::new(&state)));
         assert!(!enabled(&Sandbox::new(&state), "00000000000000000000000000000000000000000000000000000000000000BB"));
+    }
+
+    /// An amendment's ID is SHA-512Half of its registered name; fixBatchV1_2's
+    /// is the one mainnet's `feature` RPC reported when it activated.
+    #[test]
+    fn fix_batch_v1_2_is_the_hash_of_its_name() {
+        let id = crate::shamap::hash::sha512_half(b"fixBatchV1_2");
+        assert_eq!(hex::encode_upper(id.0), FIX_BATCH_V1_2);
     }
 }

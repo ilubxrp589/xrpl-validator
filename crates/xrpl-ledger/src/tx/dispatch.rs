@@ -163,7 +163,7 @@ pub fn apply_on_sandbox(tx: &TxFields, sb: &mut Sandbox) -> (TxResult, bool) {
         return (common, false);
     };
     if is_pseudo(&tx.tx_type) {
-        let pf = transactor.preflight(tx);
+        let pf = transactor.preflight_in(tx, sb);
         if !pf.is_success() {
             return (pf, false);
         }
@@ -174,7 +174,7 @@ pub fn apply_on_sandbox(tx: &TxFields, sb: &mut Sandbox) -> (TxResult, bool) {
         sb.restore_snapshot(entry);
         return (applied, false);
     }
-    let preflight = transactor.preflight(tx);
+    let preflight = transactor.preflight_in(tx, sb);
     if !preflight.is_success() {
         if preflight.is_claimed() {
             let common = apply_common(tx, sb);

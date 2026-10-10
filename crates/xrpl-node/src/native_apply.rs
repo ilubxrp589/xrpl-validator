@@ -83,7 +83,7 @@ pub fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<
         }
     };
     if xrpl_ledger::tx::dispatch::is_pseudo(&tx.tx_type) {
-        let pf = transactor.preflight(tx);
+        let pf = transactor.preflight_in(tx, &Sandbox::new(state));
         if !pf.is_success() {
             return (pf.code_str().to_string(), HashMap::new());
         }
@@ -94,7 +94,7 @@ pub fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<
         }
         return (applied.code_str().to_string(), HashMap::new());
     }
-    let preflight = transactor.preflight(tx);
+    let preflight = transactor.preflight_in(tx, &Sandbox::new(state));
     if !preflight.is_success() {
         if preflight.is_claimed() {
             let mut sb = Sandbox::new(state);
@@ -296,7 +296,10 @@ pub fn update_skip_list(
 pub fn batch_inner_ids(outer: &Value) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
     for raw in outer.get("RawTransactions").and_then(|v| v.as_array()).into_iter().flatten() {
-        let Some(inner) = raw.get("RawTransaction") else { continue };
+        // Any STObject wrapper, not only RawTransaction: before fixBatchV1_2
+        // rippled seated and filed an inner under whichever it came in, and
+        // the id hashes the inner alone (`tx::batch::raw_entry`).
+        let Some((_, inner)) = xrpl_ledger::tx::batch::raw_entry(raw) else { continue };
         let mut v = inner.clone();
         // Idempotent on API-form JSON (addresses already base58): the
         // re-spelling only bites when the caller holds the mirror dialect.
@@ -629,6 +632,27 @@ mod batch_fold_tests {
     #[test]
     fn a_transaction_without_raw_transactions_has_no_inner_ids() {
         assert!(batch_inner_ids(&json!({"TransactionType": "Payment"})).is_empty());
+    }
+
+    /// Before fixBatchV1_2 rippled seated and filed an inner under any
+    /// STObject wrapper (3.4.1 `testWrappedInnerSubmission`), and its id
+    /// hashes the inner alone: the devnet inner above under Memo keeps its
+    /// ledger id and its position.
+    #[test]
+    fn an_inner_under_another_wrapper_keeps_its_id_and_position() {
+        let inner = json!({
+            "Account": "rJB72TyLVYfTHS7iPC2MBMPRHN7PqJms7D", "Amount": "1000000",
+            "Destination": "rsvXCjhcBetR4fdpJWXf6DhJdy3KEbRRmw", "Fee": "0", "Flags": 1073741824u64,
+            "Sequence": 5309666, "SigningPubKey": "", "TransactionType": "Payment"
+        });
+        let other = json!({"TransactionType": "Payment", "Account": "rrrrrrrrrrrrrrrrrrrrBZbvji", "Destination": "rrrrrrrrrrrrrrrrrrrrBZbvji", "Amount": "2", "Fee": "0", "Sequence": 2, "SigningPubKey": "", "Flags": 1073741824});
+        let outer = json!({"TransactionType": "Batch", "RawTransactions": [
+            {"RawTransaction": other.clone()}, {"Memo": inner}, {"CreatedNode": other}
+        ]});
+        let ids = batch_inner_ids(&outer);
+        assert_eq!(ids.len(), 3, "{ids:?}");
+        assert_eq!(ids[1], "F835E19C2C403DD7B5BC54E69D995CC06D0CB9ED34B5CC419182BC1146EE4AB3");
+        assert_eq!(ids[0], ids[2], "the same inner under two wrappers is one id");
     }
 }
 

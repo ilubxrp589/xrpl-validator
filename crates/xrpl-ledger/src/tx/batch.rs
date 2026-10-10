@@ -156,12 +156,56 @@ fn flags_of(v: &Value) -> u64 {
     v.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0)
 }
 
-fn inner_jsons(outer: &Value) -> Vec<&Value> {
+/// rippled's `STI_OBJECT` serialized type code.
+const STI_OBJECT: u16 = 14;
+
+/// The STObject fields with an InnerObjectFormats template (rippled 3.4.1
+/// InnerObjectFormats.cpp). Deserialization applies an array entry's
+/// template (STArray.cpp `applyTemplateFromSField`, "May throw"), and a
+/// transaction's own fields — TransactionType first — are in none of them
+/// and are not discardable, so an inner under one of these never builds.
+const TEMPLATED_OBJECTS: &[&str] = &[
+    "SignerEntry", "Signer", "Majority", "DisabledValidator", "NFToken", "VoteEntry", "AuctionSlot",
+    "XChainClaimAttestationCollectionElement", "XChainCreateAccountAttestationCollectionElement",
+    "XChainClaimProofSig", "XChainCreateAccountProofSig", "AuthAccount", "PriceData", "Credential",
+    "Permission", "BatchSigner", "Book", "CounterpartySignature", "SponsorSignature",
+];
+
+/// One `RawTransactions` entry as deserialization admits it: an object with
+/// exactly one key, naming an STObject field without an inner template, that
+/// holds an object (STArray.cpp "Non-object in array" and
+/// `applyTemplateFromSField`; STParsedJSON.cpp:1179). Returns the wrapper's
+/// field name and the inner transaction.
+///
+/// The wrapper is normally `RawTransaction`, but neither deserialization nor
+/// `STTx::buildBatchTxns` requires it: before fixBatchV1_2 an inner under ANY
+/// STObject field was seated and executed (rippled 3.4.1 Batch_test.cpp
+/// `testWrappedInnerSubmission`: CreatedNode, Memo, TransactionMetaData, …).
+/// None for an entry rippled could not deserialize.
+pub fn raw_entry(entry: &Value) -> Option<(&str, &Value)> {
+    let m = entry.as_object()?;
+    if m.len() != 1 {
+        return None;
+    }
+    let (name, inner) = m.iter().next()?;
+    let def = xrpl_core::codec::lookup_field_def(name)?;
+    let untemplated = !TEMPLATED_OBJECTS.contains(&name.as_str());
+    (def.type_code == STI_OBJECT && untemplated && inner.is_object()).then_some((name.as_str(), inner))
+}
+
+/// Every inner of a Batch outer with its wrapper's name, in RawTransactions
+/// order. `buildBatchTxns` seats every entry whatever its wrapper; an entry
+/// `raw_entry` refuses is left out (preflight refuses its outer).
+pub fn raw_inners(outer: &Value) -> Vec<(&str, &Value)> {
     outer
         .get("RawTransactions")
         .and_then(|a| a.as_array())
-        .map(|a| a.iter().filter_map(|e| e.get("RawTransaction")).collect())
+        .map(|a| a.iter().filter_map(raw_entry).collect())
         .unwrap_or_default()
+}
+
+fn inner_jsons(outer: &Value) -> Vec<&Value> {
+    raw_inners(outer).into_iter().map(|(_, inner)| inner).collect()
 }
 
 fn signer_accounts(outer: &Value) -> Option<Vec<[u8; 20]>> {
@@ -221,12 +265,10 @@ pub fn batch_base_fee(outer: &Value, base_fee_drops: u64) -> u64 {
 pub struct BatchTransactor;
 
 impl BatchTransactor {
-    /// Per-inner checks, in rippled 3.3.0's order (`Batch.cpp:278-398`):
+    /// Per-inner checks, in rippled 3.3.0's order (`Batch.cpp:278-398`),
+    /// after the wrapper and uniqueness checks the caller makes:
     /// a `kDisabledTxTypes` inner (the Vault/Loan family) →
-    /// `temINVALID_INNER_BATCH`, FIRST; a nested `Batch` → `temINVALID`
-    /// (rippled never gets here — `STTx`'s constructor rejects a `Batch`
-    /// inside `sfRawTransactions` outright — so the code is the construction
-    /// failure's, not a preflight verdict); missing `tfInnerBatchTxn` →
+    /// `temINVALID_INNER_BATCH`, FIRST; missing `tfInnerBatchTxn` →
     /// `temINVALID_FLAG`; `checkSignatureFields` split three ways
     /// (`TxnSignature` → `temBAD_SIGNATURE`, `Signers` → `temBAD_SIGNER`,
     /// non-empty `SigningPubKey` → `temBAD_REGKEY`); a non-zero `Fee` →
@@ -244,9 +286,6 @@ impl BatchTransactor {
         let ty = inner.get("TransactionType").and_then(|t| t.as_str()).unwrap_or("");
         if DISABLED_INNER_TYPES.contains(&ty) {
             return TxResult::InvalidInnerBatch;
-        }
-        if ty == "Batch" {
-            return TxResult::InvalidTx;
         }
         if flags_of(inner) & TF_INNER_BATCH_TXN == 0 {
             return TxResult::InvalidFlag;
@@ -277,37 +316,44 @@ impl BatchTransactor {
         }
         TxResult::Success
     }
-}
 
-impl Transactor for BatchTransactor {
-    fn preflight(&self, tx: &TxFields) -> TxResult {
+    /// `Batch::preflight` (rippled 3.4.1 Batch.cpp:219-406) with fixBatchV1_2
+    /// as the ledger's rules have it, behind the construction failures that
+    /// stop rippled from building the transaction at all.
+    fn preflight_rules(tx: &TxFields, fix_batch_v1_2: bool) -> TxResult {
         if tx.tx_type != "Batch" {
             return TxResult::Malformed;
         }
+        // Construction first: a transaction rippled cannot build is never
+        // preflighted. The engine's stand-ins, in the order rippled meets
+        // them (STParsedJSON / STArray, then `STTx::buildBatchTxns`):
+        // `RawTransactions` present; every entry an STObject (`raw_entry`),
+        // checked BEFORE counting, since silently dropping a malformed entry
+        // could let a too-large array slip under the cap; at most
+        // kMaxBatchTxCount entries; no nested Batch, under any wrapper.
+        let Some(raw_arr) = tx.fields.get("RawTransactions").and_then(|v| v.as_array()) else {
+            return TxResult::ArrayEmpty;
+        };
+        if !raw_arr.iter().all(|e| raw_entry(e).is_some()) {
+            return TxResult::Malformed;
+        }
+        let inners = raw_inners(&tx.fields);
+        if inners.len() > MAX_BATCH_TX_COUNT {
+            return TxResult::TemArrayTooLarge;
+        }
+        if inners.iter().any(|(_, inner)| inner.get("TransactionType").and_then(|t| t.as_str()) == Some("Batch")) {
+            return TxResult::InvalidTx;
+        }
+        // preflight1's flag mask (tfInnerBatchTxn is not a Batch flag), then
+        // Batch::preflight's mode count.
         let flags = flags_of(&tx.fields);
         if (flags & MODE_MASK).count_ones() != 1 || flags & TF_INNER_BATCH_TXN != 0 {
             return TxResult::InvalidFlag;
         }
-        // `RawTransactions` must be present and, if so, every element must
-        // be `{"RawTransaction": {…object…}}` — rippled fails
-        // deserialization on anything else, before `Batch::preflight` ever
-        // runs. Checked structurally *before* counting inners: silently
-        // dropping a malformed element (as a naive filter_map would) could
-        // let a too-large array slip under the inner-count cap.
-        let Some(raw_arr) = tx.fields.get("RawTransactions").and_then(|v| v.as_array()) else {
-            return TxResult::ArrayEmpty;
-        };
-        if !raw_arr.iter().all(|e| matches!(e.get("RawTransaction"), Some(Value::Object(_)))) {
-            return TxResult::Malformed;
-        }
-        let inners = inner_jsons(&tx.fields);
         // rippled: `if (rawTxns.size() <= 1) return temARRAY_EMPTY;` — a
         // single-inner batch is rejected, not just an empty one.
         if inners.len() <= 1 {
             return TxResult::ArrayEmpty;
-        }
-        if inners.len() > MAX_BATCH_TX_COUNT {
-            return TxResult::TemArrayTooLarge;
         }
         // BatchSigners' size cap (kMaxBatchSigners = kMaxBatchTxCount * 3),
         // checked before the inner loop, same as rippled.
@@ -322,15 +368,25 @@ impl Transactor for BatchTransactor {
         let mut seen_seq: Vec<([u8; 20], u64)> = Vec::with_capacity(inners.len());
         let seq_unique = flags & (TF_ALL_OR_NOTHING | TF_UNTIL_FAILURE) != 0;
         let mut inner_accounts: Vec<[u8; 20]> = Vec::new();
-        for inner in &inners {
+        for (wrapper, inner) in &inners {
+            // fixBatchV1_2 (3.4.1 Batch.cpp:293-298): every entry must be a
+            // RawTransaction object, or temMALFORMED. FIRST in the per-inner
+            // loop, ahead of the uniqueness check.
+            if fix_batch_v1_2 && *wrapper != "RawTransaction" {
+                return TxResult::Malformed;
+            }
+            // `uniqueHashes` (:300-307), ahead of every per-inner rule. The
+            // id hashes the inner's fields, not its wrapper's name
+            // (STObject::getHash), so one inner under two wrappers is a
+            // duplicate.
+            if seen_json.contains(inner) {
+                return TxResult::Redundant;
+            }
+            seen_json.push(*inner);
             let r = Self::preflight_inner(inner);
             if !r.is_success() {
                 return r;
             }
-            if seen_json.contains(inner) {
-                return TxResult::Redundant;
-            }
-            seen_json.push(inner);
             let Some(acct) = inner.get("Account").and_then(|a| a.as_str()).and_then(decode_account) else {
                 return TxResult::Malformed;
             };
@@ -393,6 +449,19 @@ impl Transactor for BatchTransactor {
         // nothing about the outer (Batch.cpp:326-334). Finding 313's rule.
         let _ = batch_base_fee;
         TxResult::Success
+    }
+}
+
+impl Transactor for BatchTransactor {
+    /// The rules-free form: no amendment enabled, the engine's default for
+    /// a ledger without an Amendments object (amendments.rs). The apply
+    /// pipelines call `preflight_in`.
+    fn preflight(&self, tx: &TxFields) -> TxResult {
+        Self::preflight_rules(tx, false)
+    }
+
+    fn preflight_in(&self, tx: &TxFields, rules: &Sandbox) -> TxResult {
+        Self::preflight_rules(tx, crate::ledger::amendments::fix_batch_v1_2(rules))
     }
 
     fn preclaim(&self, _tx: &TxFields, _sandbox: &Sandbox) -> TxResult {
@@ -648,6 +717,158 @@ mod tests {
             "temBAD_FEE",
             "Batch.cpp checks the inner Fee (line 329) before calling the inner's preflight (line 342)"
         );
+    }
+
+    // ---- fixBatchV1_2 (rippled 3.4.1) ----
+
+    /// The wrappers rippled 3.4.1's `testWrappedInnerSubmission` poisons a
+    /// batch with: STObject fields with no InnerObjectFormats template.
+    const POISONED_WRAPPERS: [&str; 10] = [
+        "CreatedNode", "ModifiedNode", "DeletedNode", "TemplateEntry", "EmitDetails",
+        "Memo", "FinalFields", "NewFields", "PreviousFields", "TransactionMetaData",
+    ];
+
+    fn with_fix_batch_v1_2(mut state: LedgerState) -> LedgerState {
+        let obj = json!({"LedgerEntryType": "Amendments", "Flags": 0,
+                         "Amendments": [crate::ledger::amendments::FIX_BATCH_V1_2]});
+        state.state_map.insert(keylet::amendments_key(), serde_json::to_vec(&obj).unwrap()).unwrap();
+        state
+    }
+
+    /// One `inner_payment` entry moved under another wrapper.
+    fn wrapped(entry: Value, wrapper: &str) -> Value {
+        let mut m = serde_json::Map::new();
+        m.insert(wrapper.to_string(), entry["RawTransaction"].clone());
+        Value::Object(m)
+    }
+
+    /// Preflight under the rules of `state`'s ledger, as every pipeline runs it.
+    fn pf_in(o: &Value, state: &LedgerState) -> String {
+        BatchTransactor.preflight_in(&TxFields::from_json(o).expect("fields"), &Sandbox::new(state)).code_str().to_string()
+    }
+
+    /// rippled 3.4.1 Batch.cpp:293: with fixBatchV1_2 every entry must be a
+    /// RawTransaction object or the batch is temMALFORMED; without it each
+    /// of the poisoned wrappers passes, as it did in 3.4.0.
+    #[test]
+    fn fix_batch_v1_2_admits_only_raw_transaction_wrappers() {
+        let on = with_fix_batch_v1_2(state_with_accounts(&[]));
+        let off = state_with_accounts(&[]);
+        let pair = |w: &str| {
+            outer(TF_ALL_OR_NOTHING, vec![wrapped(inner_payment(1, 2, 1_000_000, 6), w), wrapped(inner_payment(1, 2, 1_000_000, 7), w)], None)
+        };
+        assert_eq!(pf_in(&pair("RawTransaction"), &on), "tesSUCCESS", "a well-formed batch passes with the fix");
+        assert_eq!(pf_in(&pair("RawTransaction"), &off), "tesSUCCESS");
+        for w in POISONED_WRAPPERS {
+            assert_eq!(pf_in(&pair(w), &on), "temMALFORMED", "{w} with fixBatchV1_2");
+            assert_eq!(pf_in(&pair(w), &off), "tesSUCCESS", "{w} without fixBatchV1_2: the old behaviour stands");
+        }
+        // One poisoned entry among good ones is enough.
+        let one = outer(TF_INDEPENDENT, vec![inner_payment(1, 2, 1, 6), wrapped(inner_payment(1, 2, 1, 7), "Memo")], None);
+        assert_eq!(pf_in(&one, &on), "temMALFORMED");
+        // The rules-free form is the engine's no-amendment default.
+        assert_eq!(pf(&one), "tesSUCCESS");
+    }
+
+    /// The test vector itself (rippled 3.4.1 `testWrappedInnerSubmission`):
+    /// alice pays bob 1 XRP twice in a tfAllOrNothing batch, each inner under
+    /// the wrapper. Without fixBatchV1_2 every wrapper EXECUTES and bob gets
+    /// 2 XRP; with it only RawTransaction does, and a poisoned batch is
+    /// temMALFORMED, not applied at all.
+    #[test]
+    fn without_fix_batch_v1_2_every_wrapper_executes() {
+        let accounts = [(1, 50_000_000, 5), (2, 20_000_000, 1)];
+        for w in std::iter::once("RawTransaction").chain(POISONED_WRAPPERS) {
+            let o = outer(
+                TF_ALL_OR_NOTHING,
+                vec![wrapped(inner_payment(1, 2, 1_000_000, 6), w), wrapped(inner_payment(1, 2, 1_000_000, 7), w)],
+                None,
+            );
+            let off = state_with_accounts(&accounts);
+            let (sb, r, inners) = apply_outer(&o, &off);
+            assert_eq!((r.as_str(), inners), ("tesSUCCESS", vec!["tesSUCCESS".to_string(); 2]), "{w} without the fix");
+            assert_eq!(balance_seq(&sb, 2), (22_000_000, 1), "{w} without the fix: bob got 2 XRP");
+            assert_eq!(balance_seq(&sb, 1), (50_000_000 - 1000 - 2_000_000, 8), "{w}: the outer and both inners");
+
+            let on = with_fix_batch_v1_2(state_with_accounts(&accounts));
+            let (sb, r, _) = apply_outer(&o, &on);
+            if w == "RawTransaction" {
+                assert_eq!(r, "tesSUCCESS");
+                assert_eq!(balance_seq(&sb, 2), (22_000_000, 1), "the well-formed batch delivers with the fix");
+            } else {
+                assert_eq!(r, "temMALFORMED", "{w} with the fix");
+                assert_eq!(balance_seq(&sb, 2), (20_000_000, 1), "{w} with the fix: nothing delivered");
+                assert_eq!(balance_seq(&sb, 1), (50_000_000, 5), "{w} with the fix: a tem charges no fee");
+            }
+        }
+    }
+
+    /// The order (rippled 3.4.1 Batch.cpp:289-307): the wrapper check is the
+    /// FIRST per-inner rule, ahead of the uniqueness check and the inner's
+    /// own checks; the outer's own checks, and the inners before it, come
+    /// first.
+    #[test]
+    fn the_wrapper_check_is_first_in_the_per_inner_loop() {
+        let on = with_fix_batch_v1_2(state_with_accounts(&[]));
+        let off = state_with_accounts(&[]);
+        // The same inner twice, the second under Memo: one id (the wrapper's
+        // name is not hashed), but the wrapper check runs first.
+        let dup = outer(TF_INDEPENDENT, vec![inner_payment(1, 2, 1, 6), wrapped(inner_payment(1, 2, 1, 6), "Memo")], None);
+        assert_eq!(pf_in(&dup, &on), "temMALFORMED", "ahead of the uniqueness check");
+        assert_eq!(pf_in(&dup, &off), "temREDUNDANT", "without the fix: a duplicate by id");
+        // A poisoned inner that also breaks one of its own rules.
+        let mut fee = inner_payment(1, 2, 1, 7);
+        fee["RawTransaction"]["Fee"] = json!("10");
+        let both = outer(TF_INDEPENDENT, vec![inner_payment(1, 2, 1, 6), wrapped(fee, "CreatedNode")], None);
+        assert_eq!(pf_in(&both, &on), "temMALFORMED", "ahead of the inner's own checks");
+        assert_eq!(pf_in(&both, &off), "temBAD_FEE");
+        let mut vault = inner_payment(1, 2, 1, 7);
+        vault["RawTransaction"]["TransactionType"] = json!("VaultDeposit");
+        let disabled = outer(TF_INDEPENDENT, vec![inner_payment(1, 2, 1, 6), wrapped(vault, "Memo")], None);
+        assert_eq!(pf_in(&disabled, &on), "temMALFORMED", "ahead of kDisabledTxTypes");
+        assert_eq!(pf_in(&disabled, &off), "temINVALID_INNER_BATCH");
+        // An EARLIER inner's own failure is met before a later inner's wrapper.
+        let mut bad = inner_payment(1, 2, 1, 6);
+        bad["RawTransaction"]["Fee"] = json!("10");
+        let earlier = outer(TF_INDEPENDENT, vec![bad, wrapped(inner_payment(1, 2, 1, 7), "Memo")], None);
+        assert_eq!(pf_in(&earlier, &on), "temBAD_FEE");
+        // The outer's own checks come before the loop.
+        let lone = outer(TF_INDEPENDENT, vec![wrapped(inner_payment(1, 2, 1, 6), "Memo")], None);
+        assert_eq!(pf_in(&lone, &on), "temARRAY_EMPTY");
+        let two_modes = outer(
+            TF_INDEPENDENT | TF_ONLY_ONE,
+            vec![wrapped(inner_payment(1, 2, 1, 6), "Memo"), wrapped(inner_payment(1, 2, 1, 7), "Memo")],
+            None,
+        );
+        assert_eq!(pf_in(&two_modes, &on), "temINVALID_FLAG");
+    }
+
+    /// What rippled cannot even build is refused with or without the fix,
+    /// before preflight: an entry that is not an STObject field holding an
+    /// object (STArray "Non-object in array"), and a nested Batch under any
+    /// wrapper (`STTx::buildBatchTxns`), which the wrapper check never sees.
+    #[test]
+    fn an_entry_rippled_cannot_build_is_refused_with_or_without_the_fix() {
+        let on = with_fix_batch_v1_2(state_with_accounts(&[]));
+        let off = state_with_accounts(&[]);
+        let body = inner_payment(1, 2, 1, 7)["RawTransaction"].clone();
+        for (what, entry) in [
+            ("an Amount field", json!({"Fee": body.clone()})),
+            ("an unknown field", json!({"NotAField": body.clone()})),
+            ("two wrappers", json!({"RawTransaction": body.clone(), "Memo": body.clone()})),
+            ("a wrapper holding no object", json!({"RawTransaction": "1200"})),
+            ("a templated wrapper (Signer)", json!({"Signer": body.clone()})),
+            ("a templated wrapper (BatchSigner)", json!({"BatchSigner": body.clone()})),
+        ] {
+            let o = outer(TF_INDEPENDENT, vec![inner_payment(1, 2, 1, 6), entry], None);
+            assert_eq!(pf_in(&o, &on), "temMALFORMED", "{what}, with the fix");
+            assert_eq!(pf_in(&o, &off), "temMALFORMED", "{what}, without the fix");
+        }
+        let mut nested = inner_payment(1, 2, 1, 7);
+        nested["RawTransaction"]["TransactionType"] = json!("Batch");
+        let o = outer(TF_INDEPENDENT, vec![inner_payment(1, 2, 1, 6), wrapped(nested, "Memo")], None);
+        assert_eq!(pf_in(&o, &on), "temINVALID", "a nested Batch fails construction, ahead of the wrapper check");
+        assert_eq!(pf_in(&o, &off), "temINVALID");
     }
 
     #[test]

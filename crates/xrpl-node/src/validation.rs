@@ -659,9 +659,12 @@ mod tests {
         // hashes as mainnet's `feature` RPC lists them
         assert_eq!(entry("BatchV1_1").expect("BatchV1_1")["hash"], "9F287AED3CDB50A7BD1ACEC24296A30C9B5230CCD136219317AC790E3B884377");
         assert_eq!(entry("PermissionDelegationV1_1").expect("PermissionDelegationV1_1")["hash"], "0F48FF561C709540328F31F1C97FD512ACC8B4E42138A161CB0E21ECA292540B");
-        for name in ["fixBatchV1_2", "SingleAssetVault", "LendingProtocol", "fixCleanup3_4_0"] {
+        for name in ["SingleAssetVault", "LendingProtocol", "fixCleanup3_4_0"] {
             assert!(entry(name).is_none(), "{name} is not implemented");
         }
+        // Implemented (tx/batch.rs, rippled 3.4.1) but no longer pending: ON on
+        // mainnet by #107540484 (2026-10-09), and this list holds pending ones.
+        assert!(entry("fixBatchV1_2").is_none(), "fixBatchV1_2 is enabled on mainnet, not pending");
         assert!(json["votes"].as_array().expect("votes").iter().any(|v| v == "BatchV1_1"));
     }
 

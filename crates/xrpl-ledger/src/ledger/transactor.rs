@@ -601,6 +601,17 @@ pub trait Transactor {
     /// Format validation — no state access.
     fn preflight(&self, tx: &TxFields) -> TxResult;
 
+    /// `preflight` under the rules of the ledger being built (rippled's
+    /// `PreflightContext::rules`). The engine reads amendment state from the
+    /// ledger itself (`amendments::enabled`), so the rules arrive as a view
+    /// of it; a preflight reads nothing else there. Every apply pipeline
+    /// calls this one. The default ignores the rules; a transactor whose
+    /// format checks an amendment gates overrides it (Batch: fixBatchV1_2).
+    fn preflight_in(&self, tx: &TxFields, rules: &Sandbox) -> TxResult {
+        let _ = rules;
+        self.preflight(tx)
+    }
+
     /// Read-only state validation.
     fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult;
 

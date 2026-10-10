@@ -2564,7 +2564,7 @@ fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<Hash
     // transactor overrides the fee/sequence machinery away, so skip
     // preclaim/apply_common entirely (there is no account to charge).
     if xrpl_ledger::tx::dispatch::is_pseudo(&tx.tx_type) {
-        let pf = transactor.preflight(tx);
+        let pf = transactor.preflight_in(tx, &Sandbox::new(state));
         if !pf.is_success() {
             return (pf.code_str().to_string(), HashMap::new());
         }
@@ -2575,8 +2575,8 @@ fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<Hash
         }
         return (applied.code_str().to_string(), HashMap::new());
     }
-    // Phase 1: preflight
-    let preflight = transactor.preflight(tx);
+    // Phase 1: preflight (the ledger's rules only)
+    let preflight = transactor.preflight_in(tx, &Sandbox::new(state));
     if !preflight.is_success() {
         if preflight.is_claimed() {
             let mut sb = Sandbox::new(state);
@@ -3040,7 +3040,7 @@ fn run() -> i32 {
         let Some(txj) = txjson_map.get(h) else { continue };
         read_txs.push(txj);
         for raw in txj.get("RawTransactions").and_then(|v| v.as_array()).into_iter().flatten() {
-            if let Some(inner) = raw.get("RawTransaction") {
+            if let Some((_, inner)) = xrpl_ledger::tx::batch::raw_entry(raw) {
                 read_txs.push(inner);
             }
         }

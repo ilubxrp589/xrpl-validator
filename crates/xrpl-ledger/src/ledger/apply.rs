@@ -157,8 +157,8 @@ pub fn apply_transaction_set(
             }
         };
 
-        // Phase 1: Preflight (no state)
-        let preflight = transactor.preflight(tx);
+        // Phase 1: Preflight (no state; the ledger's rules only)
+        let preflight = transactor.preflight_in(tx, &Sandbox::new(&new_state));
         if !preflight.is_success() {
             if preflight.is_claimed() {
                 // Claimed preflight failure (e.g. Unsupported IOU) — deduct fee
