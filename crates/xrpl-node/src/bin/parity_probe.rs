@@ -119,6 +119,9 @@ fn run() -> i32 {
     // Mainnet's FinalFields per node, for DX_VALCHECK on the oracle leg. The
     // mutation map above deliberately drops them — it only ever compared keys.
     let mut expected_fields: HashMap<String, HashMap<String, serde_json::Value>> = HashMap::new();
+    // Each Batch inner entry's ParentBatchID (fetch_ledger_fixture.py `parent_batch`):
+    // the outer that filed it, where several outers carry it (F417).
+    let mut batch_parents: HashMap<String, String> = HashMap::new();
     let Some(txmap) = exp["txs"].as_object() else {
         eprintln!("expected json missing txs");
         return 2;
@@ -126,6 +129,9 @@ fn run() -> i32 {
     for (hash, v) in txmap {
         if let Some(ter) = v["ter"].as_str() {
             expected_outcomes.insert(hash.clone(), ter.to_string());
+        }
+        if let Some(parent) = v["parent_batch"].as_str() {
+            batch_parents.insert(hash.to_uppercase(), parent.to_uppercase());
         }
         let nodes: Vec<(String, u8)> = v["nodes"]
             .as_array()
@@ -183,6 +189,7 @@ fn run() -> i32 {
         Some(&expected_outcomes),
         None,
         Some(&expected_mutations),
+        Some(&batch_parents),
         Some(&expected_fields),
         &net,
     );

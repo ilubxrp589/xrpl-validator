@@ -2149,6 +2149,8 @@ impl Default for NetParams {
 }
 
 /// Mainnet-parameter wrapper — every existing caller keeps this signature.
+/// It has no inner entries' ParentBatchIDs to pass, so a Batch's filed inners
+/// are attributed by ledger order (`native_apply::batch_inner_owners`).
 #[allow(clippy::too_many_arguments)]
 pub fn apply_ledger_in_order(
     stats: &SharedFfiStats,
@@ -2170,7 +2172,7 @@ pub fn apply_ledger_in_order(
         stats, txs_in_order, ledger_seq, rpc_urls, amendments, parent_hash,
         parent_close_time, total_drops, divergence_log, db_snapshot,
         silent_divergence_log, expected_outcomes, mutation_divergence_log,
-        expected_mutations, None, &NetParams::default(),
+        expected_mutations, None, None, &NetParams::default(),
     )
 }
 
@@ -2190,6 +2192,10 @@ pub fn apply_ledger_in_order_with_net(
     expected_outcomes: Option<&std::collections::HashMap<String, String>>,
     mutation_divergence_log: Option<&DivergenceLog>,
     expected_mutations: Option<&std::collections::HashMap<String, Vec<(String, u8)>>>,
+    // Each Batch inner entry's ParentBatchID (inner hash -> outer hash, upper-case
+    // hex), from the same metadata as `expected_mutations`: which outer FILED the
+    // inner, where several outers carry it. `None` falls back to ledger order.
+    batch_parents: Option<&std::collections::HashMap<String, String>>,
     // DX_VALCHECK for the ORACLE leg: tx hash -> node key -> mainnet FinalFields.
     // Lets the value comparison run against what libxrpl itself produced, which
     // is the only way to tell an engine defect from a pre-state one at value
@@ -2291,17 +2297,28 @@ pub fn apply_ledger_in_order_with_net(
     // skipped here exactly as rippled's OpenLedger skips tfInnerBatchTxn
     // entries; their expected mutation sets fold into their outer's, which is
     // where our collector reports them.
-    let mut inner_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for blob in txs_in_order {
-        let ids = xrpl_ffi::batch_inner_ids(blob);
-        if ids.is_empty() {
-            continue;
-        }
-        let outer = xrpl_ffi::parse_tx(blob).map(|p| hex::encode_upper(p.hash)).unwrap_or_default();
-        for id in ids {
-            inner_of.insert(hex::encode_upper(id), outer.clone());
-        }
-    }
+    //
+    // Every id an outer carries is skipped below (`inner_ids`). Which outer a
+    // FILED inner's expected mutations fold into is `inner_of`: the outer its
+    // ParentBatchID names (F417's rule, `native_apply::batch_inner_owners`).
+    // Several outers can carry the same inner and only one files it; this map
+    // used to be filled in ledger order, crediting the inner to the LAST
+    // carrier (mainnet #107541023's discarded fourth outer).
+    let carried: Vec<Vec<String>> = txs_in_order
+        .iter()
+        .map(|blob| xrpl_ffi::batch_inner_ids(blob).into_iter().map(hex::encode_upper).collect())
+        .collect();
+    let inner_ids: std::collections::HashSet<String> = carried.iter().flatten().cloned().collect();
+    let inner_of: std::collections::HashMap<String, String> = if inner_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        let ledger: Vec<(String, Vec<String>)> = txs_in_order
+            .iter()
+            .zip(carried)
+            .map(|(blob, ids)| (xrpl_ffi::parse_tx(blob).map(|p| hex::encode_upper(p.hash)).unwrap_or_default(), ids))
+            .collect();
+        crate::native_apply::batch_inner_owners(&ledger, batch_parents)
+    };
     let merged_expected: Option<std::collections::HashMap<String, Vec<(String, u8)>>> =
         match (expected_mutations, inner_of.is_empty()) {
             (Some(m), false) => {
@@ -2362,7 +2379,7 @@ pub fn apply_ledger_in_order_with_net(
         let (tx_type, tx_hash) = xrpl_ffi::parse_tx(tx_bytes)
             .map(|p| (p.tx_type, hex::encode_upper(p.hash)))
             .unwrap_or_else(|| ("Unknown".to_string(), String::new()));
-        if inner_of.contains_key(&tx_hash) {
+        if inner_ids.contains(&tx_hash) {
             skipped_inner += 1;
             stats.lock().live_apply_batch_inner_skipped += 1;
             continue;

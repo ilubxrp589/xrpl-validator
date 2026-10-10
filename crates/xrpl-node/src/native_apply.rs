@@ -469,6 +469,46 @@ pub fn filed_inner_verdicts(
         .collect()
 }
 
+/// Leg A's Batch attribution (`ffi_engine`'s `inner_of`): each inner ENTRY
+/// the ledger filed, mapped to the outer that filed it.
+///
+/// `ledger` is every transaction in `TransactionIndex` order with the inner
+/// ids it carries (none for a non-Batch); `parents` maps an inner entry's
+/// hash to the `ParentBatchID` its metadata records (upper-case hex). An
+/// entry is an inner when some outer carries its id, and it belongs to the
+/// outer its ParentBatchID names — the rule `filed_inner_verdicts` applies
+/// (F417). Without a recorded link (a caller with no metadata) it belongs to
+/// the nearest outer before it that carries its id: rippled files an applied
+/// outer's inners right after it (apply.cpp `applyBatchTransactions`), which
+/// is what ParentBatchID records.
+///
+/// The id alone does not say which outer: mainnet #107541023 has four outers
+/// carrying one ticketed pair of payments, the first discarded and the third
+/// filing it, and a map filled in ledger order credited the pair to the LAST.
+pub fn batch_inner_owners(
+    ledger: &[(String, Vec<String>)],
+    parents: Option<&HashMap<String, String>>,
+) -> HashMap<String, String> {
+    let carried: HashSet<&String> = ledger.iter().flat_map(|(_, ids)| ids.iter()).collect();
+    let mut nearest: HashMap<&String, &String> = HashMap::new();
+    let mut owners: HashMap<String, String> = HashMap::new();
+    for (hash, ids) in ledger {
+        if carried.contains(hash) {
+            let filed_by = parents
+                .and_then(|p| p.get(hash))
+                .cloned()
+                .or_else(|| nearest.get(hash).map(|o| (*o).clone()));
+            if let Some(outer) = filed_by {
+                owners.insert(hash.clone(), outer);
+            }
+        }
+        for id in ids {
+            nearest.insert(id, hash);
+        }
+    }
+    owners
+}
+
 /// One key touched by several entries of the same Batch: the expected side
 /// reports the NET effect. The rules are leg A's, verbatim
 /// (`ffi_engine.rs` `merged_expected`): Created wins over Modified, and a key
@@ -839,5 +879,32 @@ mod batch_attribution_tests {
         let ordered: Vec<&Value> = vec![&lone];
         let a = batch_attribution(&ordered);
         assert!(a.skip.is_empty());
+    }
+
+    /// F417's ledger shape, mainnet #107541023: four outers carry the same
+    /// ticketed pair, the first is discarded, the third files the pair right
+    /// after itself, the fourth comes after the entries (tefNO_TICKET). Leg
+    /// A's `inner_of` filled a map in ledger order and credited the pair to
+    /// the LAST carrier; the pair belongs to the outer its ParentBatchID names.
+    #[test]
+    fn leg_a_credits_a_shared_inner_to_the_outer_that_filed_it() {
+        let pair = || vec!["C1".to_string(), "C2".to_string()];
+        let s = |h: &str| h.to_string();
+        let ledger: Vec<(String, Vec<String>)> = vec![
+            (s("O1"), pair()), (s("PAY"), vec![]), (s("O2"), pair()), (s("O3"), pair()),
+            (s("C1"), vec![]), (s("C2"), vec![]), (s("O4"), pair()),
+        ];
+        let parents = HashMap::from([(s("C1"), s("O3")), (s("C2"), s("O3"))]);
+        let owners = batch_inner_owners(&ledger, Some(&parents));
+        assert_eq!(owners, HashMap::from([(s("C1"), s("O3")), (s("C2"), s("O3"))]), "ParentBatchID, not the last carrier (O4)");
+        // With no metadata to read, the order rippled files in says the same.
+        assert_eq!(batch_inner_owners(&ledger, None), owners);
+        // The recorded link is the authority where the two could part.
+        let named_o1 = HashMap::from([(s("C1"), s("O1")), (s("C2"), s("O1"))]);
+        assert_eq!(batch_inner_owners(&ledger, Some(&named_o1)).get("C1"), Some(&s("O1")));
+        // Only filed entries are attributed: an inner no outer filed has no
+        // entry in the ledger and so no owner.
+        let unfiled: Vec<(String, Vec<String>)> = vec![(s("O1"), pair()), (s("PAY"), vec![])];
+        assert!(batch_inner_owners(&unfiled, None).is_empty());
     }
 }

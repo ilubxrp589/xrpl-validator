@@ -35,8 +35,8 @@ use std::any::Any;
 use std::sync::Arc;
 
 use crate::ffi_engine::{
-    apply_ledger_in_order, fetch_mainnet_amendments, new_stats,
-    DivergenceLog, FfiStats, LedgerOverlay, OwnedSnapshot, SharedFfiStats,
+    apply_ledger_in_order_with_net, fetch_mainnet_amendments, new_stats,
+    DivergenceLog, FfiStats, LedgerOverlay, NetParams, OwnedSnapshot, SharedFfiStats,
 };
 
 /// FFI-based per-ledger tx verifier. Send + Sync, cheap to `Arc`-clone.
@@ -148,10 +148,11 @@ impl FfiVerifier {
         total_drops: u64,
         expected_outcomes: Option<&std::collections::HashMap<String, String>>,
         expected_mutations: Option<&std::collections::HashMap<String, Vec<(String, u8)>>>,
+        batch_parents: Option<&std::collections::HashMap<String, String>>,
     ) -> LedgerOverlay {
         self.maybe_refresh_amendments(ledger_seq);
         let amendments = self.amendments.read().clone();
-        apply_ledger_in_order(
+        apply_ledger_in_order_with_net(
             &self.stats,
             sorted_tx_blobs,
             ledger_seq,
@@ -166,6 +167,9 @@ impl FfiVerifier {
             expected_outcomes,
             Some(self.mutation_divergence_log.as_ref()),
             expected_mutations,
+            batch_parents,
+            None,
+            &NetParams::default(),
         )
     }
 
@@ -184,10 +188,11 @@ impl FfiVerifier {
         snapshot: Option<&OwnedSnapshot>,
         expected_outcomes: Option<&std::collections::HashMap<String, String>>,
         expected_mutations: Option<&std::collections::HashMap<String, Vec<(String, u8)>>>,
+        batch_parents: Option<&std::collections::HashMap<String, String>>,
     ) -> LedgerOverlay {
         self.maybe_refresh_amendments(ledger_seq);
         let amendments = self.amendments.read().clone();
-        apply_ledger_in_order(
+        apply_ledger_in_order_with_net(
             &self.stats,
             sorted_tx_blobs,
             ledger_seq,
@@ -202,6 +207,9 @@ impl FfiVerifier {
             expected_outcomes,
             Some(self.mutation_divergence_log.as_ref()),
             expected_mutations,
+            batch_parents,
+            None,
+            &NetParams::default(),
         )
     }
 

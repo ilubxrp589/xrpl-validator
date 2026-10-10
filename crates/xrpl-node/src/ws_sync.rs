@@ -382,6 +382,10 @@ pub async fn start_ws_sync(
                                     std::collections::HashMap::new();
                                 let mut expected_mutations: std::collections::HashMap<String, Vec<(String, u8)>> =
                                     std::collections::HashMap::new();
+                                // Each Batch inner entry's ParentBatchID: the outer that
+                                // filed it, where several outers carry the same inner.
+                                let mut batch_parents: std::collections::HashMap<String, String> =
+                                    std::collections::HashMap::new();
                                 for tx in &sorted_txs {
                                     let hash = match tx["hash"].as_str() {
                                         Some(h) => h.to_uppercase(),
@@ -389,6 +393,9 @@ pub async fn start_ws_sync(
                                     };
                                     if let Some(result) = tx["metaData"]["TransactionResult"].as_str() {
                                         expected_outcomes.insert(hash.clone(), result.to_string());
+                                    }
+                                    if let Some(parent) = tx["metaData"]["ParentBatchID"].as_str() {
+                                        batch_parents.insert(hash.clone(), parent.to_uppercase());
                                     }
                                     if let Some(nodes) = tx["metaData"]["AffectedNodes"].as_array() {
                                         let mut entries: Vec<(String, u8)> = Vec::with_capacity(nodes.len());
@@ -502,6 +509,7 @@ pub async fn start_ws_sync(
                                     );
                                     let expected = if expected_outcomes.is_empty() { None } else { Some(expected_outcomes) };
                                     let expected_mut = if expected_mutations.is_empty() { None } else { Some(expected_mutations) };
+                                    let parents = if batch_parents.is_empty() { None } else { Some(batch_parents) };
                                     tokio::task::spawn_blocking(move || {
                                         let overlay = v.verify_ledger_with_snapshot(
                                             seq, &tx_blobs,
@@ -509,6 +517,7 @@ pub async fn start_ws_sync(
                                             Some(snap.as_ref()),
                                             expected.as_ref(),
                                             expected_mut.as_ref(),
+                                            parents.as_ref(),
                                         );
                                         if shadow_ok && !shadow_ah.is_empty() && !shadow_overlay.is_empty() {
                                             if let Some(hs) = hasher_snap {
@@ -542,12 +551,14 @@ pub async fn start_ws_sync(
                                 } else {
                                     let expected = if expected_outcomes.is_empty() { None } else { Some(expected_outcomes) };
                                     let expected_mut = if expected_mutations.is_empty() { None } else { Some(expected_mutations) };
+                                    let parents = if batch_parents.is_empty() { None } else { Some(batch_parents) };
                                     tokio::task::spawn_blocking(move || {
                                         let overlay = v.verify_ledger(
                                             seq, &tx_blobs,
                                             hdr.parent_hash, hdr.parent_close_time, hdr.total_drops,
                                             expected.as_ref(),
                                             expected_mut.as_ref(),
+                                            parents.as_ref(),
                                         );
                                         if shadow_ok && !shadow_ah.is_empty() && !shadow_overlay.is_empty() {
                                             if let Some(hs) = hasher_snap {
