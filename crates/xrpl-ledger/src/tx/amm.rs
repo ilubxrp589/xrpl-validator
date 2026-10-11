@@ -272,29 +272,6 @@ impl Transactor for AMMCreateTransactor {
         });
         sandbox.write(amm_acct_key, serde_json::to_vec(&amm_root).unwrap_or_default());
 
-        // Fund the pool: both amounts creator → AMM account (XRP moves the
-        // Balance, IOUs create the AMM's trust lines + directory entries).
-        for v in [amount1, amount2] {
-            if let (Some(leg), Some(amt)) = (ox::leg_of(v), keylet::amount_mant_exp(v)) {
-                if amt.0 > 0 {
-                    ox::move_leg(sandbox, &tx.account, &amm_acct, &leg, amt);
-                    // rippled AMMCreate sendAndTrustSet: every non-XRP asset
-                    // line of the pool is stamped lsfAMMNode (AMMCreate.cpp:
-                    // 288-300). The LP-token line is NOT stamped — the live
-                    // shadow's #106674486 gate showed both asset lines a bit
-                    // short (0x00010000 vs 0x01010000) and the LP line clean.
-                    if !leg.xrp {
-                        let lk = keylet::ripple_state_key(&amm_acct, &leg.issuer, &leg.cur);
-                        if let Some(mut line) = ox::json_at(sandbox, &lk) {
-                            let f = line["Flags"].as_u64().unwrap_or(0) | 0x0100_0000;
-                            line["Flags"] = serde_json::json!(f);
-                            ox::put_json(sandbox, lk, &line);
-                        }
-                    }
-                }
-            }
-        }
-
         // Mint the creator's LP tokens: `ammLPTokens` = sqrt(Amount * Amount2),
         // XRP counted in DROPS. This was a hardcoded 1e7 placeholder, which
         // every later deposit and withdrawal on the pool then inherited — 23 of
@@ -307,7 +284,6 @@ impl Transactor for AMMCreateTransactor {
                 (Some(a), Some(b)) => crate::tx::amm_swap::amm_lp_tokens(a, b),
                 _ => (0, 0),
             };
-        ox::move_leg(sandbox, &amm_acct, &tx.account, &lp_leg, minted);
 
         // Create AMM ledger entry. rippled dirLinks the AMM object into the
         // AMM account's own owner directory (AMMCreate.cpp:263, no reserve /
@@ -341,6 +317,34 @@ impl Transactor for AMMCreateTransactor {
         // faithful port for the deposit-revival path.
         let tfee = tx.fields.get("TradingFee").and_then(|f| f.as_u64()).unwrap_or(0) as u16;
         initialize_fee_auction_vote(sandbox, &amm_hash, &tx.account, tfee, &lp_leg);
+
+        // Finding 419 (#107572028 AC9F1F115224): rippled's applyCreate links the AMM object into the AMM
+        // account's directory, sends the creator its LP tokens, then Amount, then Amount2 (AMMCreate.cpp).
+        // The order decides the pages when the lines share a directory: an issuer pooling its own tokens
+        // files all three in its own, and at a page's last slot the LP line must be the one that takes it.
+        ox::move_leg(sandbox, &amm_acct, &tx.account, &lp_leg, minted);
+        // Fund the pool: both amounts creator → AMM account (XRP moves the
+        // Balance, IOUs create the AMM's trust lines + directory entries).
+        for v in [amount1, amount2] {
+            if let (Some(leg), Some(amt)) = (ox::leg_of(v), keylet::amount_mant_exp(v)) {
+                if amt.0 > 0 {
+                    ox::move_leg(sandbox, &tx.account, &amm_acct, &leg, amt);
+                    // rippled AMMCreate sendAndTrustSet: every non-XRP asset
+                    // line of the pool is stamped lsfAMMNode (AMMCreate.cpp:
+                    // 288-300). The LP-token line is NOT stamped — the live
+                    // shadow's #106674486 gate showed both asset lines a bit
+                    // short (0x00010000 vs 0x01010000) and the LP line clean.
+                    if !leg.xrp {
+                        let lk = keylet::ripple_state_key(&amm_acct, &leg.issuer, &leg.cur);
+                        if let Some(mut line) = ox::json_at(sandbox, &lk) {
+                            let f = line["Flags"].as_u64().unwrap_or(0) | 0x0100_0000;
+                            line["Flags"] = serde_json::json!(f);
+                            ox::put_json(sandbox, lk, &line);
+                        }
+                    }
+                }
+            }
+        }
 
         TxResult::Success
     }
@@ -3734,6 +3738,49 @@ mod tests {
             TxResult::UnfundedAmm,
             "short with the line already there is funds, not reserve",
         );
+    }
+
+    /// Finding 419 (mainnet #107572028 AC9F1F115224): an issuer pooling two of its own tokens files all three new
+    /// lines in its own owner directory, so their order decides the pages. rippled sends the LP tokens first, then
+    /// Amount, then Amount2 (AMMCreate.cpp applyCreate). With one slot left on the last page, the LP line takes it
+    /// and both asset lines open the next page; ours funded the pool first and minted last, so the LP line landed on
+    /// the new page and two lines carried the wrong page number.
+    #[test]
+    fn amm_create_files_the_lp_line_before_the_asset_lines() {
+        let issuer = [0x01u8; 20];
+        let mut state = make_state(&issuer, 100_000_000);
+        let root_key = keylet::owner_dir_key(&issuer);
+        let filler: Vec<String> = (1..=31u8).map(|i| hex::encode_upper([i; 32])).collect();
+        let root = serde_json::json!({"LedgerEntryType": "DirectoryNode", "Flags": 0, "Owner": hex::encode(issuer),
+                                      "RootIndex": hex::encode_upper(root_key.0), "Indexes": filler});
+        state.state_map.insert(root_key, serde_json::to_vec(&root).unwrap()).unwrap();
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: issuer, tx_type: "AMMCreate".to_string(), fee: 12, sequence: 1,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Amount": {"currency": "AAA", "issuer": hex::encode(issuer), "value": "5000"},
+                "Amount2": {"currency": "BBB", "issuer": hex::encode(issuer), "value": "500"},
+                "TradingFee": 0,
+            }),
+            inner_batch: false,
+        };
+        assert_eq!(AMMCreateTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+        let page = |k: &Hash256| -> Vec<String> {
+            let v: serde_json::Value = serde_json::from_slice(&sandbox.read(k).unwrap()).unwrap();
+            v["Indexes"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_uppercase()).collect()
+        };
+        let line_currency = |key: &str| -> String {
+            let k = Hash256(<[u8; 32]>::try_from(hex::decode(key).unwrap().as_slice()).unwrap());
+            let v: serde_json::Value = serde_json::from_slice(&sandbox.read(&k).unwrap()).unwrap();
+            v["Balance"]["currency"].as_str().unwrap().to_uppercase()
+        };
+        let new_on_root: Vec<String> = page(&root_key).into_iter().filter(|k| !filler.contains(k)).collect();
+        assert_eq!(new_on_root.len(), 1, "one slot was left on the root page");
+        assert!(line_currency(&new_on_root[0]).starts_with("03"), "the LP-token line takes the last slot");
+        let page1 = page(&keylet::dir_page_key(&root_key, 1));
+        assert_eq!(page1.len(), 2, "both asset lines open page 1");
+        assert!(page1.iter().all(|k| !line_currency(k).starts_with("03")), "page 1 holds the asset lines");
     }
 
     #[test]
