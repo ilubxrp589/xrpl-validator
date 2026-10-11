@@ -41,19 +41,23 @@ pub fn fix_cleanup_3_3_0(sandbox: &Sandbox) -> bool {
     enabled(sandbox, FIX_CLEANUP_3_3_0)
 }
 
-/// fixCleanup3_4_0 — in the 3.4.0 release (the vendored libxrpl snapshot
-/// predates it; testnet and mainnet had it OFF as of 2026-09-21, so no
-/// oracle exists and every gated site rests on unit tests). Ported sites:
-/// MPT escrow fee floor (F338), escrow reserve recycling on Finish/Cancel,
-/// domain validDomain/verifyValidDomain with expired-credential deletion
-/// (OfferCreate, Payment), pseudo-account requireAuth, OfferCreate's
-/// DisallowIncomingTrustline, the NFT issuer's own-freeze exemption,
-/// MPTokenAuthorize's locked-token refusal, AMMBid's zero-fee floor.
+/// fixCleanup3_4_0 — in the 3.4.0 release, unchanged in 3.4.1 (the vendored
+/// libxrpl snapshot predates it; mainnet majority 2026-10-09 09:34 UTC, so
+/// activation ~2026-10-23, and until then every gated site rests on unit
+/// tests). Ported sites: MPT escrow fee floor (F338), escrow reserve
+/// recycling on Finish/Cancel, domain validDomain/verifyValidDomain with
+/// expired-credential deletion (OfferCreate, Payment), pseudo-account
+/// requireAuth — in `require_auth_ter`, the model's `require_auth_known` and
+/// the port's `flow::view::is_authorized` (F420: the book walk asks by the
+/// last two) — OfferCreate's DisallowIncomingTrustline, the NFT issuer's
+/// own-freeze exemption, MPTokenAuthorize's locked-token refusal, AMMBid's
+/// zero-fee floor, AMMClawback's three tweaks (amm.rs), a delegate's
+/// PaymentBurn cap (delegate.rs). AMMDeposit/Withdraw's overflow →
+/// tecAMM_FAILED is the engine's behaviour ungated (amm.rs `nerr`).
 /// Deliberately unported: tem-only checks (zero CredentialIDs, badAsset),
-/// role signatures (Sponsor), Vault/Loan/Delegate, OfferStream's corrupt-
-/// domain-book throw, AMMClawback's three tweaks (the clawback model is
-/// uncalibrated — no mainnet specimen), AMMDeposit/Withdraw overflow →
-/// tecAMM_FAILED, the invariant changes.
+/// role signatures (Sponsor), Vault/Loan (both OFF on mainnet), OfferStream's
+/// corrupt-domain-book throw, the invariant changes (no invariant layer; the
+/// loosened ones already read post-fix).
 pub const FIX_CLEANUP_3_4_0: &str =
     "98433DD001A5737F773D74F8CA2A25A065089C73B2E611C760BAF369E4FECA76";
 

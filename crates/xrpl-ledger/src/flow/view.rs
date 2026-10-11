@@ -81,7 +81,11 @@ pub fn is_authorized(sb: &Sandbox, asset: &Asset, account: &[u8; 20]) -> bool {
     match json_at(sb, &keylet::ripple_state_key(account, &issuer, &asset.currency)) {
         Some(line) => {
             let bit = if issuer < *account { LSF_LOW_AUTH } else { LSF_HIGH_AUTH };
+            // Finding 420: fixCleanup3_4_0 (RippleStateHelpers.cpp:592) — a
+            // pseudo-account (an AMM pool, as a book's offer owner) holds
+            // only for its object and is implicitly authorized.
             line["Flags"].as_u64().unwrap_or(0) & bit != 0
+                || (crate::ledger::amendments::fix_cleanup_3_4_0(sb) && crate::tx::misc::is_pseudo_account(sb, account))
         }
         None => false,
     }

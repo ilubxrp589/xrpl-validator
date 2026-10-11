@@ -1125,7 +1125,13 @@ pub(crate) fn require_auth_known(sandbox: &Sandbox, leg: &Leg, owner: &[u8; 20])
     match line {
         Some(line) => {
             let auth_bit = if &leg.issuer < owner { LSF_LOW_AUTH } else { LSF_HIGH_AUTH };
-            Some(line["Flags"].as_u64().unwrap_or(0) & auth_bit != 0)
+            // Finding 420: fixCleanup3_4_0 (RippleStateHelpers.cpp:592)
+            // reaches the pool here too — an AMM is implicitly authorized.
+            Some(
+                line["Flags"].as_u64().unwrap_or(0) & auth_bit != 0
+                    || (crate::ledger::amendments::fix_cleanup_3_4_0(sandbox)
+                        && crate::tx::misc::is_pseudo_account(sandbox, owner)),
+            )
         }
         None => json_at(sandbox, &keylet::account_root_key(owner)).map(|_| false),
     }
@@ -13367,7 +13373,8 @@ mod tests {
     }
 
     /// fixCleanup3_4_0 (RippleStateHelpers.cpp:592): a pseudo-account's
-    /// unauthorized line under a RequireAuth issuer is implicitly authorized.
+    /// unauthorized line under a RequireAuth issuer is implicitly authorized,
+    /// through every door the engine asks it by (Finding 420).
     #[test]
     fn require_auth_admits_a_pseudo_account_under_fixcleanup340() {
         let pool = [0x11u8; 20];
@@ -13389,19 +13396,46 @@ mod tests {
         });
         state.state_map.insert(keylet::ripple_state_key(&pool, &issuer, &cur), serde_json::to_vec(&line).unwrap()).unwrap();
         let leg = Leg { xrp: false, cur, issuer };
+        // Finding 420: the book walk asks the same question through two more
+        // doors — the model's `require_auth_known` (an AMM pool, amm_swap.rs)
+        // and the port's `is_authorized` (BookStep.cpp:768, book_step.rs) —
+        // and both must answer as `requireAuth` does at every stage.
+        let asset = crate::flow::steps::Asset { currency: cur, issuer: Some(issuer) };
+        let all = |sb: &Sandbox| {
+            (require_auth_ter(sb, &leg, &pool, false), require_auth_known(sb, &leg, &pool), crate::flow::view::is_authorized(sb, &asset, &pool))
+        };
         let mut sb = Sandbox::new(&state);
-        assert_eq!(require_auth_ter(&sb, &leg, &pool, false), Some(TxResult::NoAuth), "an ordinary account needs the auth bit");
+        assert_eq!(all(&sb), (Some(TxResult::NoAuth), Some(false), false), "an ordinary account needs the auth bit");
         let pkey = keylet::account_root_key(&pool);
         let mut p: serde_json::Value = serde_json::from_slice(&sb.read(&pkey).unwrap()).unwrap();
         p["AMMID"] = serde_json::Value::String("11".repeat(32));
         sb.write(pkey, serde_json::to_vec(&p).unwrap());
-        assert_eq!(require_auth_ter(&sb, &leg, &pool, false), Some(TxResult::NoAuth), "so does a pseudo-account pre-amendment");
+        assert_eq!(all(&sb), (Some(TxResult::NoAuth), Some(false), false), "so does a pseudo-account pre-amendment");
         let am = serde_json::json!({
             "LedgerEntryType": "Amendments", "Flags": 0,
             "Amendments": [crate::ledger::amendments::FIX_CLEANUP_3_4_0],
         });
         sb.write(keylet::amendments_key(), serde_json::to_vec(&am).unwrap());
-        assert_eq!(require_auth_ter(&sb, &leg, &pool, false), Some(TxResult::Success), "implicitly authorized under fixCleanup3_4_0");
+        assert_eq!(all(&sb), (Some(TxResult::Success), Some(true), true), "implicitly authorized under fixCleanup3_4_0");
+        // the exemption is the pseudo-account's alone: an ordinary account
+        // under the amendment still needs the bit
+        let other = [0x33u8; 20];
+        let okey = keylet::account_root_key(&other);
+        let o = serde_json::json!({
+            "LedgerEntryType": "AccountRoot", "Account": hex::encode(other), "Balance": "100000000",
+            "Sequence": 1, "OwnerCount": 0, "Flags": 0u64,
+        });
+        sb.write(okey, serde_json::to_vec(&o).unwrap());
+        let (lo, hi) = if other < issuer { (other, issuer) } else { (issuer, other) };
+        let oline = serde_json::json!({
+            "LedgerEntryType": "RippleState", "Flags": 0u64,
+            "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000000", "value": "0"},
+            "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "0"},
+            "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "0"},
+        });
+        sb.write(keylet::ripple_state_key(&other, &issuer, &cur), serde_json::to_vec(&oline).unwrap());
+        assert_eq!(require_auth_known(&sb, &leg, &other), Some(false));
+        assert!(!crate::flow::view::is_authorized(&sb, &asset, &other));
     }
 
 }
