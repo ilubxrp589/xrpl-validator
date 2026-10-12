@@ -8,6 +8,7 @@
 //! `meta` in hex.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::LazyLock;
 
 use serde_json::{json, Value};
 
@@ -30,15 +31,32 @@ pub fn load_ledger(dir: &str, seq: u64) -> Option<HashMap<String, Vec<u8>>> {
 /// Our metadata for one transaction, in engine JSON: the AffectedNodes our engine's changes give, our result
 /// and delivered amount, and mainnet's TransactionIndex (Step 3 makes the position ours).
 pub fn our_meta(tc: &crate::native_apply::TxChanges, tx_index: u64) -> Value {
+    // The codec writes TransactionResult (a UInt8) from its number; an unknown name stays a string and the
+    // encode error then names it.
+    let result = result_code(&tc.result).map_or_else(|| json!(tc.result), |c| json!(c));
     let mut m = json!({
         "AffectedNodes": xrpl_ledger::ledger::tx_meta::affected_nodes(&tc.changes),
         "TransactionIndex": tx_index,
-        "TransactionResult": tc.result,
+        "TransactionResult": result,
     });
     if let Some(d) = &tc.delivered {
         m["DeliveredAmount"] = d.clone();
     }
     m
+}
+
+/// Result name → its number, from the codec's own definitions (the workspace's xrpl-core checkout, as the
+/// path dependency names it). tes and tec only: nothing else reaches a ledger.
+static RESULTS: LazyLock<HashMap<String, u64>> = LazyLock::new(|| {
+    let defs: Value = serde_json::from_str(include_str!("../../../../XRPL Rust SDK/tests/vectors/definitions.json")).unwrap_or_default();
+    defs["TRANSACTION_RESULTS"]
+        .as_object()
+        .map(|o| o.iter().filter_map(|(k, v)| Some((k.clone(), u64::try_from(v.as_i64()?).ok()?))).collect())
+        .unwrap_or_default()
+});
+
+pub fn result_code(name: &str) -> Option<u64> {
+    RESULTS.get(name).copied()
 }
 
 /// The TransactionIndex in mainnet's metadata bytes.
@@ -167,6 +185,13 @@ mod tests {
         let mut o = t.clone();
         o["TransactionResult"] = json!("tecPATH_DRY");
         assert!(first_difference(&o, &t).unwrap().starts_with("TransactionResult"));
+    }
+
+    #[test]
+    fn results_encode_by_number() {
+        assert_eq!(result_code("tesSUCCESS"), Some(0));
+        assert_eq!(result_code("tecPATH_DRY"), Some(128));
+        assert_eq!(result_code("tecNO_SUCH_THING"), None);
     }
 
     #[test]
