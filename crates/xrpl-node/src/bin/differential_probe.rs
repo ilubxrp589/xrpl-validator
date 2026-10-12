@@ -2699,16 +2699,18 @@ fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<Hash
 fn run_passes(
     pre: &LedgerState,
     order: &[String],
-    tx_json: &dyn Fn(&str) -> Option<&Value>,
-    net_ter: &dyn Fn(&str) -> Option<String>,
+    tx_map: &serde_json::Map<String, Value>,
+    net_map: &serde_json::Map<String, Value>,
     batch_skip: &HashSet<String>,
     seq: u32,
 ) {
+    let tx_json = |h: &str| tx_map.get(h).or_else(|| tx_map.get(&h.to_lowercase()));
+    let net_ter = |h: &str| net_map.get(h).or_else(|| net_map.get(&h.to_lowercase())).and_then(|t| t["ter"].as_str()).map(str::to_string);
     use xrpl_ledger::ledger::close::{apply_in_passes, canonical_order, consensus_salt, ApplyOutcome, SeqProxy, TransactionEntry, ALWAYS_CLAIMED};
     let mainnet: Vec<String> = order.iter().filter(|h| !batch_skip.contains(&h.to_uppercase())).map(|h| h.to_uppercase()).collect();
     let mut entries: Vec<TransactionEntry> = Vec::new();
     for h in &mainnet {
-        let Some(t) = tx_json(h).or_else(|| tx_json(&h.to_lowercase())) else { continue };
+        let Some(t) = tx_json(h) else { continue };
         let Ok(hb) = hex::decode(h) else { continue };
         let Ok(hash) = <[u8; 32]>::try_from(hb.as_slice()) else { continue };
         let account = t["Account"].as_str().and_then(xrpl_node::native_apply::decode_address).unwrap_or([0u8; 20]);
@@ -2722,7 +2724,7 @@ fn run_passes(
     let mut ours: HashMap<String, String> = HashMap::new();
     let passes = apply_in_passes(entries, |e, certain_retry| {
         let h = hex::encode_upper(e.hash.0);
-        let Some(txf) = tx_json(&h).or_else(|| tx_json(&h.to_lowercase())).and_then(build_txfields) else { return ApplyOutcome::Fail };
+        let Some(txf) = tx_json(&h).and_then(build_txfields) else { return ApplyOutcome::Fail };
         let (code, mods, from_do_apply) = xrpl_node::native_apply::native_apply_one_staged(&st, &txf);
         let outcome = match &code[..3.min(code.len())] {
             "tes" => ApplyOutcome::Success,
@@ -2742,7 +2744,7 @@ fn run_passes(
     let first_order = got.iter().zip(&mainnet).position(|(a, b)| a != b).or(if got.len() != mainnet.len() { Some(got.len().min(mainnet.len())) } else { None });
     let mut ter_mm: Vec<String> = Vec::new();
     for h in &mainnet {
-        let theirs = net_ter(h).or_else(|| net_ter(&h.to_lowercase())).unwrap_or_default();
+        let theirs = net_ter(h).unwrap_or_default();
         let mine = ours.get(h).cloned().unwrap_or_else(|| "(not applied)".into());
         if mine != theirs {
             ter_mm.push(format!("{} ours={mine} mainnet={theirs}", &h[..12]));
@@ -3242,7 +3244,7 @@ fn run() -> i32 {
     // rippled's canonical order (3.1) and apply passes (3.2), each attempt judged by the engine's own result,
     // against mainnet's positions and results.
     if std::env::var("DX_PASSES").is_ok() {
-        run_passes(&state, &order, &|h| txjson_map.get(h), &|h| txmap.get(h).and_then(|t| t["ter"].as_str()).map(str::to_string), &batch_skip, seq);
+        run_passes(&state, &order, txjson_map, txmap, &batch_skip, seq);
     }
 
     // Per-tx native replay + compare to mainnet.
