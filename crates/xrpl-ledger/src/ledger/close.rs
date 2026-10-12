@@ -197,7 +197,13 @@ mod tests {
                 .iter()
                 .map(|t| TransactionEntry {
                     hash: id(t),
-                    account: crate::tx::offer::decode20(t["Account"].as_str().unwrap()).unwrap(),
+                    // A pseudo-transaction's account is zero: EnableAmendment spells it rrrrrrrrrrrrrrrrrrrrrhoLvTp,
+                    // UNLModify as "" (an STAccount never set, serialized empty).
+                    account: match t["Account"].as_str() {
+                        Some("") => [0u8; 20],
+                        Some(a) => crate::tx::offer::decode20(a).unwrap(),
+                        None => panic!("#{seq} {} has no Account", t["hash"]),
+                    },
                     seq_proxy: SeqProxy::of(
                         t["Sequence"].as_u64().unwrap_or(0) as u32,
                         t.get("TicketSequence").and_then(Value::as_u64).map(|v| v as u32),
