@@ -28,6 +28,7 @@ pub mod startup;
 pub mod config;
 pub mod consensus;
 pub mod consensus_engine;
+pub mod consensus_record;
 pub mod engine;
 pub mod history;
 pub mod incremental_sync;
