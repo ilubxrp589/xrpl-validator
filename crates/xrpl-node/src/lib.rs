@@ -15,6 +15,7 @@
 //! - **Validator** — full consensus participation with validation signing
 
 pub mod native_apply;
+pub mod meta_check;
 #[cfg(feature = "ffi")]
 pub mod native_shadow;
 pub mod amendments;

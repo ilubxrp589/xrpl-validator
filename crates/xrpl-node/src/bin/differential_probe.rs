@@ -2926,6 +2926,15 @@ fn run() -> i32 {
         Some(s) => s as u32,
         None => { eprintln!("missing ledger_seq"); return 2; }
     };
+    // Independence 2.6: mainnet's metadata for this ledger, when DX_META names the s2 answer-key store.
+    let meta_key = std::env::var("DX_META").ok().and_then(|d| {
+        let m = xrpl_node::meta_check::load_ledger(&d, u64::from(seq));
+        if m.is_none() {
+            eprintln!("DX_META: no answer key for #{seq} in {d}");
+        }
+        m
+    });
+    let mut meta_tally = xrpl_node::meta_check::Tally::default();
     // Every hydration targets seq-1, so the node is chosen once, per run.
     let rpc_url = xrpl_node::rpc_select::select_rpc(rpc_pref, seq - 1);
     let txmap = match exp["txs"].as_object() {
@@ -3308,6 +3317,21 @@ fn run() -> i32 {
             }
         }
         fuzz_idx += 1;
+        // Independence 2.6 (DX_META=<s2 store>): this transaction's metadata from our engine's own changes,
+        // byte for byte against mainnet's. A Batch outer threads per inner and is not built yet.
+        if let Some(key) = meta_key.as_ref() {
+            if tx_type != "Batch" {
+                if let Some(theirs) = key.get(&h.to_uppercase()) {
+                    let tc = xrpl_node::native_apply::native_apply_one_changes(&state, &txf, h, seq as u32);
+                    let idx = xrpl_node::meta_check::tx_index(theirs).unwrap_or(0);
+                    let r = xrpl_node::meta_check::compare(&xrpl_node::meta_check::our_meta(&tc, idx), theirs);
+                    meta_tally.add(&tx_type, r.is_ok());
+                    if let Err(d) = r {
+                        eprintln!("META-DIFF #{seq} {} {tx_type}: {d}", &h[..12.min(h.len())]);
+                    }
+                }
+            }
+        }
         let (our_ter, mut mods) = native_apply_one(&state, &txf);
         if dx_armed {
             if let Ok(list) = std::env::var("DX_REPLAY_SET") {
@@ -3878,6 +3902,9 @@ fn run() -> i32 {
         }
     }
     eprintln!("SUMMARY: {total_matched}/{total_attempted} attempted txs MATCH mainnet (native engine)");
+    if meta_key.is_some() {
+        eprintln!("{}", meta_tally.summary());
+    }
     let failed = RPC_FAILED.load(std::sync::atomic::Ordering::Relaxed);
     let code = exit_code(total_attempted, failed, any_diverge);
     if code == 3 {
