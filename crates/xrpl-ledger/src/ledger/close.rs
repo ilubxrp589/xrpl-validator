@@ -135,8 +135,10 @@ pub fn apply_in_passes<T>(set: Vec<T>, mut apply: impl FnMut(&T, bool) -> ApplyO
     Passes { applied, failed, left: set }
 }
 
-/// The tec results rippled claims even while a retry is certain (Transactor.cpp: tecOVERSIZE, tecKILLED,
-/// tecINCOMPLETE and tecEXPIRED go to processPersistentChanges whatever the flags).
+/// The tec results rippled claims even while a retry is certain, when a transactor's doApply returns them
+/// (Transactor.cpp: tecOVERSIZE, tecKILLED, tecINCOMPLETE and tecEXPIRED go to processPersistentChanges
+/// whatever the flags). The same code from preclaim waits like any tec: preclaim's `likelyToClaimFee` is
+/// false under tapRETRY (applySteps.h), so the transaction is not applied and is retried.
 pub const ALWAYS_CLAIMED: [&str; 4] = ["tecOVERSIZE", "tecKILLED", "tecINCOMPLETE", "tecEXPIRED"];
 
 #[cfg(test)]
@@ -419,6 +421,22 @@ mod tests {
             meta: &'a Value,
         }
 
+        /// Where rippled 3.4.1 returns one of the ALWAYS_CLAIMED codes from preclaim, which waits under tapRETRY
+        /// like any tec (found by searching the transactors for those returns; mainnet #106793245's
+        /// NFTokenCreateOffer tecEXPIRED is one).
+        const PRECLAIM_TEC: [(&str, &str); 10] = [
+            ("OfferCreate", "tecEXPIRED"),
+            ("NFTokenMint", "tecEXPIRED"),
+            ("NFTokenCreateOffer", "tecEXPIRED"),
+            ("CheckCreate", "tecEXPIRED"),
+            ("CheckCash", "tecEXPIRED"),
+            ("VaultCreate", "tecEXPIRED"),
+            ("VaultDeposit", "tecEXPIRED"),
+            ("LoanSet", "tecEXPIRED"),
+            ("LoanSet", "tecKILLED"),
+            ("LoanPay", "tecKILLED"),
+        ];
+
         /// The account's sequence after `t` applied (a TicketCreate also skips the tickets it made).
         fn advance(t: &Tx, seq: &mut HashMap<[u8; 20], u32>) {
             let made = if t.kind == "TicketCreate" && t.result == "tesSUCCESS" { t.tickets } else { 0 };
@@ -547,7 +565,8 @@ mod tests {
                             _ => {}
                         }
                     }
-                    let claims = t.result.starts_with("tes") || ALWAYS_CLAIMED.contains(&t.result) || !certain;
+                    let from_apply = ALWAYS_CLAIMED.contains(&t.result) && !PRECLAIM_TEC.contains(&(t.kind, t.result));
+                    let claims = t.result.starts_with("tes") || from_apply || !certain;
                     if !claims {
                         return ApplyOutcome::Retry;
                     }
