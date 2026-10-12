@@ -167,6 +167,12 @@ mod tests {
         assert!(!paths.is_empty(), "no ledgers in {dir:?}");
         let (mut txs_seen, mut exact, mut retried, mut pseudo_ledgers) = (0usize, 0usize, Vec::new(), 0usize);
         let (mut unexplained, mut inner_misplaced, mut inners) = (Vec::new(), Vec::new(), 0usize);
+        // For task 3.2: how many runs, which results apply after the first run, and how often mainnet's order is
+        // simply every non-tec transaction in our order followed by every tec one (rippled defers a tec claim
+        // while it can still retry, tapRETRY).
+        let mut runs_seen = std::collections::BTreeMap::<usize, usize>::new();
+        let mut later_results = std::collections::BTreeMap::<String, usize>::new();
+        let mut tec_last = 0usize;
         for path in &paths {
             let doc: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
             let doc = doc.get("result").unwrap_or(&doc);
@@ -222,12 +228,27 @@ mod tests {
             theirs.sort_by_key(|t| index_of(t));
             let ranks: Vec<usize> = theirs.iter().map(|t| rank[&id(t).0]).collect();
             let runs = 1 + ranks.windows(2).filter(|w| w[1] < w[0]).count();
+            *runs_seen.entry(runs).or_default() += 1;
+            let result_of = |h: &Hash256| {
+                let t = by_id[&hex::encode_upper(h.0)];
+                t["metaData"]["TransactionResult"].as_str().unwrap_or("?").to_string()
+            };
+            let (claims, rest): (Vec<Hash256>, Vec<Hash256>) =
+                entries.iter().map(|e| e.hash).partition(|h| result_of(h).starts_with("tec"));
+            let tec_last_order: Vec<Hash256> = rest.into_iter().chain(claims).collect();
+            if theirs.iter().map(|t| id(t)).eq(tec_last_order) {
+                tec_last += 1;
+            }
             if runs == 1 {
                 exact += 1;
                 continue;
             }
             // The transactions after the first run: the ones a later pass applied.
             let first_break = ranks.windows(2).position(|w| w[1] < w[0]).unwrap() + 1;
+            for t in &theirs[first_break..] {
+                let result = t["metaData"]["TransactionResult"].as_str().unwrap_or("?");
+                *later_results.entry(result[..3.min(result.len())].to_string()).or_default() += 1;
+            }
             let later: Vec<String> = theirs[first_break..]
                 .iter()
                 .map(|t| format!("{} {} {}", t["TransactionType"].as_str().unwrap_or("?"),
@@ -244,6 +265,10 @@ mod tests {
             "canonical order: {} ledgers, {txs_seen} transactions ({inners} Batch inners); {exact} exact, {} by retry passes, \
              {} unexplained; {pseudo_ledgers} ledgers hold pseudo-transactions; {} inner placements wrong",
             paths.len(), retried.len(), unexplained.len(), inner_misplaced.len()
+        );
+        eprintln!(
+            "  runs per ledger {runs_seen:?}; results applied after the first run {later_results:?}; \
+             {tec_last} ledgers are exactly every non-tec transaction in our order, then every tec one"
         );
         for l in retried.iter().chain(&unexplained).chain(&inner_misplaced).take(60) {
             eprintln!("  {l}");
