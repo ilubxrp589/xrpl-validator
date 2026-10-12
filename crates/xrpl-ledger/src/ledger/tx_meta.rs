@@ -623,7 +623,7 @@ mod affected_nodes_tests {
             "PreviousFields": {"Balance": "1000000"},
             "PreviousTxnID": txn(0xCD), "PreviousTxnLgrSeq": 100}));
         assert_ne!(ours, theirs("999988"));
-        assert_eq!(canonical_affected_nodes(&[ours.clone()]), canonical_affected_nodes(&[theirs("999988")]));
+        assert_eq!(canonical_affected_nodes(std::slice::from_ref(&ours)), canonical_affected_nodes(&[theirs("999988")]));
         assert_ne!(canonical_affected_nodes(&[ours]), canonical_affected_nodes(&[theirs("999989")]));
     }
 
