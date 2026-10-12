@@ -148,16 +148,26 @@ pub fn verify_manifest(bytes: &[u8]) -> Result<SplitManifest, String> {
 }
 
 /// Verify one fetched validator-list document end to end (checks 1-5 above).
-/// `pinned_master_hex` = the operator's pin; None still verifies everything
-/// except the pin itself.
+/// `pinned_master_hex` = the operator's pin, one publisher master key or several
+/// separated by commas (vl.ripple.com and unl.xrplf.org sign with different
+/// keys); None still verifies everything except the pin itself.
 pub fn verify_vl(body: &Value, pinned_master_hex: Option<&str>) -> Result<VerifiedUnl, String> {
+    let now_ripple = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().saturating_sub(RIPPLE_EPOCH))
+        .unwrap_or(0);
+    verify_vl_at(body, pinned_master_hex, now_ripple)
+}
+
+/// [`verify_vl`] at a given time (seconds since the Ripple epoch), for the expiry check.
+pub fn verify_vl_at(body: &Value, pinned_master_hex: Option<&str>, now_ripple: u64) -> Result<VerifiedUnl, String> {
     let publisher = body
         .get("public_key")
         .and_then(|v| v.as_str())
         .ok_or("vl: no public_key")?
         .to_uppercase();
     if let Some(pin) = pinned_master_hex {
-        if !pin.eq_ignore_ascii_case(&publisher) {
+        if !pin.split(',').map(str::trim).any(|p| p.eq_ignore_ascii_case(&publisher)) {
             return Err(format!(
                 "vl: publisher {} does not match pinned key {}",
                 &publisher[..12.min(publisher.len())],
@@ -185,10 +195,6 @@ pub fn verify_vl(body: &Value, pinned_master_hex: Option<&str>) -> Result<Verifi
     let blob: Value = serde_json::from_slice(&blob_bytes).map_err(|e| format!("vl: blob JSON: {e}"))?;
     let sequence = blob.get("sequence").and_then(|v| v.as_u64()).ok_or("vl: blob has no sequence")?;
     let expiration = blob.get("expiration").and_then(|v| v.as_u64()).unwrap_or(0);
-    let now_ripple = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs().saturating_sub(RIPPLE_EPOCH))
-        .unwrap_or(0);
     if expiration != 0 && expiration <= now_ripple {
         return Err(format!("vl: list expired (expiration {expiration} <= now {now_ripple})"));
     }
@@ -301,6 +307,22 @@ mod tests {
         assert_eq!(s.master_key[0], 0xED);
         assert!(s.signing_key.is_some());
         assert!(s.sequence > 0 && s.sequence != u32::MAX);
+    }
+
+    #[test]
+    fn an_expired_list_fails() {
+        let exp = verify_vl(&body(), None).unwrap().expiration;
+        verify_vl_at(&body(), None, exp - 1).expect("one second before its expiration it verifies");
+        let err = verify_vl_at(&body(), None, exp).unwrap_err();
+        assert!(err.contains("expired"), "{err}");
+    }
+
+    #[test]
+    fn a_pin_may_name_both_publishers() {
+        let ripple = body()["public_key"].as_str().unwrap().to_string();
+        let xrplf = "ED42AEC58B701EEBB77356FFFEC26F83C1F0407263530F068C7C73D392C7E06FD1";
+        verify_vl(&body(), Some(&format!("{xrplf}, {ripple}"))).expect("either pinned publisher verifies");
+        assert!(verify_vl(&body(), Some(xrplf)).unwrap_err().contains("pinned"));
     }
 
     #[test]

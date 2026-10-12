@@ -52,10 +52,10 @@ Step 2's receipts and the live-edge change (5.4) are where it can stretch.
 
 | # | Task | Size |
 |---|---|---|
-| 1.1 | Amendment guard | S |
-| 1.2 | Enforce proposal signatures (**tap**) | S |
-| 1.3 | Validator list fails closed (**tap**) | S |
-| 1.4 | Ship as one cycle | S |
+| 1.1 | Amendment guard (**built 12 Oct**, cycle 171) | S |
+| 1.2 | Enforce proposal signatures (**tap**; dropped count built 12 Oct) | S |
+| 1.3 | Validator list fails closed (**tap**; built 12 Oct) | S |
+| 1.4 | Ship as one cycle (cycle 171, after soak #45) | S |
 | 1.5 | Port fixBatchV1_2 (**done**, cycle 168, 10 Oct) | — |
 
 **1.1 Amendment guard.**
@@ -82,6 +82,23 @@ Step 2's receipts and the live-edge change (5.4) are where it can stretch.
   older sequence number. All three must be refused and keep the last good list.
 
 **1.4 Ship.** One cycle (gate, windows, deploy, soak). The two switch-ons are your taps.
+
+**Built 12 October (cycle 171; both switches ship OFF):**
+- **1.1** `xrpl-node/src/amendment_guard.rs`. `ENGINE_KNOWN` holds the 97 amendments enabled at ledger 107,606,611
+  plus fixCleanup3_4_0 (ported; activation ~23 Oct), and `KNOWN_GAP` is empty. The native shadow hands it every
+  ledger's Amendments object.
+  - It reports in `/api/amendments` (`guard`) and the metrics (`xrpl_amendment_guard_*`).
+  - The copilot pages an unbuilt enabled amendment as DEGRADED.
+  - `blocks_own_hash()` waits for Step 5.
+  - The TUI line is not built yet.
+  - Tests: the live object reads all-known, and taking fixBatchV1_2 off the list raises the alarm.
+- **1.2** `xrpl_sig_enforce` and `xrpl_proposal_sig_dropped_total` on the metrics.
+- **1.3** `XRPL_UNL_PINNED_KEY` takes several keys, comma-separated: vl.ripple.com and unl.xrplf.org sign with
+  different keys.
+  - Every verified list is kept beside the last-good file.
+  - When every source fails, enforce mode serves that stored list, verified again: pin, signatures, expiry and
+    sequence. It never serves an unverified one.
+  - Tests: expired, both pins, a tampered or older stored list, no stored list.
 
 **1.5 Port fixBatchV1_2. Done.**
 - The 3.4.1 source was published on 9 October. The rule was ported that night and went live in cycle 168 (commit

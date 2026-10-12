@@ -1637,6 +1637,7 @@ async fn main() {
                     };
                     let mut body = xrpl_node::rpc::metrics::render_prometheus(&snap);
                     body.push_str(&xrpl_node::consensus::sig_verify::metrics_text());
+                    body.push_str(&xrpl_node::amendment_guard::metrics_text());
                     (
                         axum::http::StatusCode::OK,
                         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
@@ -2219,6 +2220,8 @@ async fn run_peer_connection(
                                     close_time: p.close_time,
                                     previous_ledger: p.previousledger.clone(),
                                 });
+                            } else {
+                                sig_verify::PROPOSALS_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
                     }

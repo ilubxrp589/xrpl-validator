@@ -18,6 +18,7 @@ pub mod native_apply;
 #[cfg(feature = "ffi")]
 pub mod native_shadow;
 pub mod amendments;
+pub mod amendment_guard;
 pub mod bulk_sync;
 pub mod rippled_client;
 pub mod rpc_select;

@@ -68,6 +68,9 @@ impl SigCounters {
 pub static PROPOSAL_SIG: SigCounters = SigCounters::new();
 /// Process-wide validation-verification counters (S2 wires these).
 pub static VALIDATION_SIG: SigCounters = SigCounters::new();
+/// Proposals dropped because their signature failed while `XRPL_SIG_ENFORCE=1` (Step 1.2). Observe mode drops
+/// none, so this reads 0 until the switch is on; then it must track `fail`.
+pub static PROPOSALS_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// `XRPL_SIG_ENFORCE=1` → callers drop messages that fail verification. Default observe-only.
 pub fn enforce() -> bool {
@@ -293,6 +296,7 @@ fn verify_validation_inner(blob: &[u8]) -> SigOutcome {
 pub fn metrics_text() -> String {
     let (p_ok, p_fail, p_unsup) = PROPOSAL_SIG.snapshot();
     let (v_ok, v_fail, v_unsup) = VALIDATION_SIG.snapshot();
+    let (enforcing, dropped) = (u8::from(enforce()), PROPOSALS_DROPPED.load(Ordering::Relaxed));
     format!(
         "# HELP xrpl_proposal_sig_ok_total Peer proposals whose signature verified.\n\
          # TYPE xrpl_proposal_sig_ok_total counter\n\
@@ -311,7 +315,13 @@ pub fn metrics_text() -> String {
          xrpl_validation_sig_fail_total {v_fail}\n\
          # HELP xrpl_validation_sig_unsupported_total Validations with unsupported key types.\n\
          # TYPE xrpl_validation_sig_unsupported_total counter\n\
-         xrpl_validation_sig_unsupported_total {v_unsup}\n"
+         xrpl_validation_sig_unsupported_total {v_unsup}\n\
+         # HELP xrpl_sig_enforce 1 when XRPL_SIG_ENFORCE=1: proposals whose signature fails are dropped.\n\
+         # TYPE xrpl_sig_enforce gauge\n\
+         xrpl_sig_enforce {enforcing}\n\
+         # HELP xrpl_proposal_sig_dropped_total Peer proposals dropped for a failed signature (enforce mode only).\n\
+         # TYPE xrpl_proposal_sig_dropped_total counter\n\
+         xrpl_proposal_sig_dropped_total {dropped}\n"
     )
 }
 

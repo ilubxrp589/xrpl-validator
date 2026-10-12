@@ -97,13 +97,14 @@ pub const READY_PENDING: &[(&str, &str)] = &[
     ("PermissionDelegationV1_1", "finding 360 (tx/delegate.rs); devnet campaign 22"),
 ];
 
-/// The body of `/api/amendments`: this validator's votes and the pending amendments its engine implements.
+/// The body of `/api/amendments`: this validator's votes, the pending amendments its engine implements, and the
+/// amendment guard's reading of what mainnet has enabled (`amendment_guard`).
 pub fn amendments_json() -> serde_json::Value {
     let implemented: Vec<serde_json::Value> = READY_PENDING
         .iter()
         .map(|(name, evidence)| serde_json::json!({"name": name, "hash": amendment_hash(name).to_string(), "evidence": evidence}))
         .collect();
-    serde_json::json!({"votes": SUPPORTED_AMENDMENT_NAMES, "ready_pending": implemented})
+    serde_json::json!({"votes": SUPPORTED_AMENDMENT_NAMES, "ready_pending": implemented, "guard": crate::amendment_guard::json()})
 }
 
 /// `sfServerVersion`, laid out per rippled `BuildInfo::encodeSoftwareVersion`

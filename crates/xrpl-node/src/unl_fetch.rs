@@ -247,6 +247,7 @@ pub async fn fetch_default_unl_verified() -> Result<Vec<UnlEntry>, String> {
                     continue;
                 }
                 write_last_good(&state_path, &v.publisher, v.sequence);
+                write_last_good_body(&state_path, &body);
                 eprintln!(
                     "[unl] VERIFIED {url}: publisher {}… seq {} validators {} (manifests rejected: {})",
                     &v.publisher[..12.min(v.publisher.len())],
@@ -263,12 +264,46 @@ pub async fn fetch_default_unl_verified() -> Result<Vec<UnlEntry>, String> {
         }
     }
     if enforce {
-        return Err(format!("all UNL sources failed verification (fail-closed): {last_err}"));
+        // Fail closed: never an unverified list. The last list that verified, verified again (pin, signatures,
+        // expiry, sequence), is the one fallback.
+        return match last_good_list(&state_path, pinned.as_deref()) {
+            Ok(entries) => {
+                eprintln!("[unl] ⚠ every source failed verification ({last_err}); enforce mode keeps the LAST GOOD list ({} validators, verified again)", entries.len());
+                Ok(entries)
+            }
+            Err(e) => Err(format!("all UNL sources failed verification (fail-closed): {last_err}; last good list: {e}")),
+        };
     }
     eprintln!(
         "[unl] ⚠ every source failed verification — observe mode falls back to the UNVERIFIED parse ({last_err})"
     );
     fetch_default_unl().await
+}
+
+/// Where the last verified list document is kept: beside the last-good state file.
+fn last_good_body_path(state_path: &str) -> String {
+    format!("{}.body.json", state_path.trim_end_matches(".json"))
+}
+
+fn write_last_good_body(state_path: &str, body: &serde_json::Value) {
+    let path = last_good_body_path(state_path);
+    if let Err(e) = std::fs::write(&path, body.to_string()) {
+        eprintln!("[unl] last-good list persist failed ({path}): {e}");
+    }
+}
+
+/// Step 1.3: the last list that verified, read back and verified again, as enforce mode's only fallback. It
+/// must still match the pin, verify, be unexpired, and be no older than the last-good sequence.
+pub fn last_good_list(state_path: &str, pinned: Option<&str>) -> Result<Vec<UnlEntry>, String> {
+    let path = last_good_body_path(state_path);
+    let body: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?)
+        .map_err(|e| format!("{path}: {e}"))?;
+    let v = crate::unl_verify::verify_vl(&body, pinned)?;
+    let last = read_last_good(state_path).filter(|(p, _)| *p == v.publisher).map(|(_, s)| s);
+    if !crate::unl_verify::sequence_acceptable(last, v.sequence) {
+        return Err(format!("stored list sequence {} is older than last-good {}", v.sequence, last.unwrap_or(0)));
+    }
+    Ok(v.entries)
 }
 
 /// Try multiple UNL sources, return the first successful one.
@@ -290,6 +325,45 @@ pub async fn fetch_default_unl() -> Result<Vec<UnlEntry>, String> {
         }
     }
     Err(format!("all UNL sources failed: {last_err}"))
+}
+
+#[cfg(test)]
+mod last_good_tests {
+    use super::*;
+
+    const VL: &str = include_str!("../tests/vectors/vl_ripple_2026-08-31.json");
+
+    fn seeded(sequence: u64) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("unl-last-good.json").to_string_lossy().into_owned();
+        let body: serde_json::Value = serde_json::from_str(VL).unwrap();
+        write_last_good(&state, body["public_key"].as_str().unwrap(), sequence);
+        write_last_good_body(&state, &body);
+        (dir, state)
+    }
+
+    #[test]
+    fn enforce_mode_falls_back_to_the_last_good_list_verified_again() {
+        let (_d, state) = seeded(85);
+        assert_eq!(last_good_list(&state, None).expect("stored list verifies").len(), 35);
+        let ripple = "ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734";
+        assert_eq!(last_good_list(&state, Some(ripple)).unwrap().len(), 35);
+        assert!(last_good_list(&state, Some("ED42AEC58B701EEBB77356FFFEC26F83C1F0407263530F068C7C73D392C7E06FD1")).is_err());
+    }
+
+    #[test]
+    fn a_tampered_or_older_stored_list_is_refused() {
+        let (_d, state) = seeded(86);
+        assert!(last_good_list(&state, None).unwrap_err().contains("older"), "a newer list was seen since");
+        let (_d2, state) = seeded(85);
+        let path = last_good_body_path(&state);
+        let tampered = std::fs::read_to_string(&path).unwrap().replacen("\"blob\":\"", "\"blob\":\"AA", 1);
+        std::fs::write(&path, tampered).unwrap();
+        assert!(last_good_list(&state, None).is_err());
+        let (_d3, state) = seeded(85);
+        std::fs::remove_file(last_good_body_path(&state)).unwrap();
+        assert!(last_good_list(&state, None).is_err(), "no stored list: nothing to fall back to");
+    }
 }
 
 #[cfg(test)]

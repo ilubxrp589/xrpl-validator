@@ -756,6 +756,14 @@ impl NativeShadow {
         let applied = self.apply_ledger(seq, parent_hash, parent_close_time, total_drops, &ordered);
         self.compare_and_report(seq, &ordered, &applied, ffi_overlay, t0);
         self.reconcile(seq, applied.undo, ffi_overlay, false);
+        self.read_amendments(seq);
+    }
+
+    /// Step 1.1: hand ledger `seq`'s Amendments object, as the mirror now holds it, to the amendment guard.
+    fn read_amendments(&self, seq: u32) {
+        if self.hydrated && self.at_seq == seq {
+            crate::amendment_guard::observe(seq, self.state.state_map.lookup(&keylet::amendments_key()));
+        }
     }
 
     /// Apply ledger `seq`'s transactions (in apply order) to the mirror.
@@ -1717,6 +1725,7 @@ impl NativeShadow {
         if self.distrust == Some(seq) {
             self.distrust = None;
         }
+        self.read_amendments(seq);
     }
 
     /// Nothing landed for `seq` (the write was held back or rolled back):
