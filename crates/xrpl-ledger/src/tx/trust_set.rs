@@ -609,6 +609,10 @@ impl Transactor for TrustSetTransactor {
                     };
                     let low_hint = hint(&line["LowNode"]);
                     let high_hint = hint(&line["HighNode"]);
+                    // rippled updates the line's SLE, then trustDelete erases that version: the metadata's
+                    // DeletedNode FinalFields carry the new limit and flags (as #107541106's payment shows for
+                    // rippleCreditIOU's delete).
+                    sandbox.write(line_key, serde_json::to_vec(&line).unwrap_or_default());
                     sandbox.delete(line_key);
                     crate::ledger::directory::owner_dir_remove(sandbox, &low_id, &line_key, low_hint, false);
                     crate::ledger::directory::owner_dir_remove(sandbox, &high_id, &line_key, high_hint, false);
