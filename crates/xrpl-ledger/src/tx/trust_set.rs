@@ -612,7 +612,12 @@ impl Transactor for TrustSetTransactor {
                     // rippled updates the line's SLE, then trustDelete erases that version: the metadata's
                     // DeletedNode FinalFields carry the new limit and flags (as #107541106's payment shows for
                     // rippleCreditIOU's delete).
-                    sandbox.write(line_key, serde_json::to_vec(&line).unwrap_or_default());
+                    // The reserve-clear blocks run first (SetTrust.cpp:645-665: `uFlagsOut &= ~lsf*Reserve` for a
+                    // reserved side with no interest, which on a delete is every reserved side), so the erased
+                    // version carries neither reserve bit (#107541200: 0x220000 → mainnet's 0x200000).
+                    let mut erased = line.clone();
+                    erased["Flags"] = serde_json::Value::from(flags & !(LSF_LOW_RESERVE | LSF_HIGH_RESERVE));
+                    sandbox.write(line_key, serde_json::to_vec(&erased).unwrap_or_default());
                     sandbox.delete(line_key);
                     crate::ledger::directory::owner_dir_remove(sandbox, &low_id, &line_key, low_hint, false);
                     crate::ledger::directory::owner_dir_remove(sandbox, &high_id, &line_key, high_hint, false);
