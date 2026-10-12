@@ -422,7 +422,7 @@ mod tests {
         unsigned.extend_from_slice(&0xDEAD_BEEF_u64.to_be_bytes());
         unsigned.extend_from_slice(&[0x51]); // LedgerHash (Hash256 f1)
         unsigned.extend_from_slice(&[0x42_u8; 32]);
-        unsigned.extend_from_slice(&[0x52]); // ConsensusHash (Hash256 f2)
+        unsigned.extend_from_slice(&[0x50, 0x17]); // ConsensusHash (Hash256 f23; 0x52 would be ParentHash)
         unsigned.extend_from_slice(&[0x43_u8; 32]);
         unsigned.extend_from_slice(&[0x73, 33]); // SigningPubKey (VL f3)
         unsigned.extend_from_slice(pubkey);

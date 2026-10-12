@@ -285,6 +285,8 @@ pub async fn start_ws_sync(
                         match fetch_ledger_metadata(&rpc, process_seq, &mut acc_modified, &mut acc_deleted, &mut acc_tx_count).await {
                             Ok((_txs, hdr, wallet_delta)) => {
                                 ledger_header = hdr;
+                                // 5.2(a): one channel send, and nothing at all unless XRPL_CONSENSUS_RECORD=1.
+                                crate::consensus_record::record_header(process_seq, &ledger_header);
                                 #[cfg(feature = "ffi")]
                                 { sorted_txs = _txs; }
                                 if wallet_delta != 0 {
