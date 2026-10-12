@@ -35,12 +35,13 @@ pub fn next_resolution(previous: u32, previous_agreed: bool, seq: u32) -> u32 {
     let Some(i) = RESOLUTIONS.iter().position(|&r| r == previous) else {
         return previous;
     };
-    if !previous_agreed && seq % DECREASE_EVERY == 0 {
+    // rippled's `ledgerSeq % kDecreaseLedgerTimeResolutionEvery == 0`: with an every of 1, always.
+    if !previous_agreed && seq.is_multiple_of(DECREASE_EVERY) {
         if let Some(&coarser) = RESOLUTIONS.get(i + 1) {
             return coarser;
         }
     }
-    if previous_agreed && seq % INCREASE_EVERY == 0 && i > 0 {
+    if previous_agreed && seq.is_multiple_of(INCREASE_EVERY) && i > 0 {
         return RESOLUTIONS[i - 1];
     }
     previous
@@ -301,9 +302,9 @@ mod tests {
                 if h.close_time != parent.close_time + 1 {
                     miss(format!("no consensus, close time {} != parent + 1 ({})", h.close_time, parent.close_time + 1));
                 }
-            } else if h.close_time == parent.close_time + 1 && h.close_time % res != 0 {
+            } else if h.close_time == parent.close_time + 1 && !h.close_time.is_multiple_of(res) {
                 floored += 1;
-            } else if h.close_time % res == 0 && h.close_time > parent.close_time {
+            } else if h.close_time.is_multiple_of(res) && h.close_time > parent.close_time {
                 rounded += 1;
             } else {
                 miss(format!("close time {} is neither a multiple of {res} after {} nor its + 1", h.close_time, parent.close_time));
