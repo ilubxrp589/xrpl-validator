@@ -579,6 +579,7 @@ impl Transactor for AccountDeleteTransactor {
             .unwrap_or(0);
         dest["Balance"] =
             serde_json::Value::String(dest_balance.checked_add(balance).unwrap_or(u64::MAX).to_string());
+        crate::tx::deliver(serde_json::Value::String(balance.to_string())); // AccountDelete.cpp:405
         // F80 — "Re-arm the password change fee": a positive credit clears the
         // destination's lsfPasswordSpent (DeleteAccount.cpp:436-437), exactly
         // as an XRP Payment does (Payment.cpp:715-717, mirrored in payment.rs).
@@ -836,7 +837,10 @@ mod tests {
             inner_batch: false,
         };
 
+        crate::tx::reset_thread_state();
         assert_eq!(AccountDeleteTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+        // Independence 2.4: the metadata's DeliveredAmount is the balance handed over (AccountDelete.cpp:405).
+        assert_eq!(crate::tx::take_delivered(), Some(serde_json::json!("50000000")));
 
         // Alice should be gone
         assert!(!sandbox.exists(&keylet::account_root_key(&alice)));

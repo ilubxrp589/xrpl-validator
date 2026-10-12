@@ -69,7 +69,47 @@ pub fn build_txfields(txjson: &Value) -> Option<TxFields> {
 
 /// Native per-tx apply — identical branching to differential_probe's copy
 /// (which mirrors apply.rs::apply_transaction_set). Returns (ter, mods).
+/// One transaction's verdict and its finished sandbox.
+type Applied = (String, xrpl_ledger::ledger::sandbox::SandboxChanges);
+
+fn with_changes(code: String, sb: Sandbox) -> Applied {
+    (code, sb.into_changes())
+}
+
 pub fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<Hash256, SandboxEntry>) {
+    let (code, c) = apply_core(state, tx);
+    (code, c.mods)
+}
+
+/// What one transaction did, as its metadata will record it (independence tasks 2.2 and 2.4).
+pub struct TxChanges {
+    /// The result code ("tesSUCCESS", "tecPATH_DRY", ...).
+    pub result: String,
+    /// The modifications, unstamped: what [`native_apply_one`] returns.
+    pub mods: HashMap<Hash256, SandboxEntry>,
+    /// Each changed object with its content before and after (threading stamped), in key order; the
+    /// threadOwners roots included.
+    pub changes: Vec<xrpl_ledger::ledger::tx_meta::NodeChange>,
+    /// The metadata's DeliveredAmount, on a tesSUCCESS of a type that records one (Payment, CheckCash,
+    /// AccountDelete; `ctx_.deliver`).
+    pub delivered: Option<Value>,
+}
+
+/// [`native_apply_one`], plus what the transaction changed object by object, each with its content before
+/// and after, and what it delivered: the inputs of its metadata. `tx_hash_hex` and `ledger_seq` (the ledger
+/// being built) stamp the threading. Not for a Batch outer: its inners thread with their own ids
+/// (`stamp_batch_threading`).
+pub fn native_apply_one_changes(state: &LedgerState, tx: &TxFields, tx_hash_hex: &str, ledger_seq: u32) -> TxChanges {
+    let (result, own) = apply_core(state, tx);
+    let delivered = xrpl_ledger::tx::take_delivered()
+        .filter(|_| result == "tesSUCCESS" && matches!(tx.tx_type.as_str(), "Payment" | "CheckCash" | "AccountDelete"));
+    let mut stamped = own.mods.clone();
+    xrpl_ledger::ledger::threading::stamp_threading(&mut stamped, &|k| state.read_json(k), tx_hash_hex, ledger_seq);
+    let changes = xrpl_ledger::ledger::tx_meta::node_changes(state, &stamped, &own);
+    TxChanges { result, mods: own.mods, changes, delivered }
+}
+
+fn apply_core(state: &LedgerState, tx: &TxFields) -> Applied {
     xrpl_ledger::tx::reset_thread_state();
     let transactor = match get_transactor(&tx.tx_type) {
         Some(t) => t,
@@ -77,22 +117,22 @@ pub fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<
             let mut sb = Sandbox::new(state);
             let r = apply_common(tx, &mut sb);
             if r.is_success() {
-                return (TxResult::Unsupported.code_str().to_string(), sb.into_modifications());
+                return with_changes(TxResult::Unsupported.code_str().to_string(), sb);
             }
-            return (r.code_str().to_string(), HashMap::new());
+            return (r.code_str().to_string(), xrpl_ledger::ledger::sandbox::SandboxChanges::default());
         }
     };
     if xrpl_ledger::tx::dispatch::is_pseudo(&tx.tx_type) {
         let pf = transactor.preflight_in(tx, &Sandbox::new(state));
         if !pf.is_success() {
-            return (pf.code_str().to_string(), HashMap::new());
+            return (pf.code_str().to_string(), xrpl_ledger::ledger::sandbox::SandboxChanges::default());
         }
         let mut sb = Sandbox::new(state);
         let applied = transactor.do_apply(tx, &mut sb);
         if applied.is_success() {
-            return (TxResult::Success.code_str().to_string(), sb.into_modifications());
+            return with_changes(TxResult::Success.code_str().to_string(), sb);
         }
-        return (applied.code_str().to_string(), HashMap::new());
+        return (applied.code_str().to_string(), xrpl_ledger::ledger::sandbox::SandboxChanges::default());
     }
     let preflight = transactor.preflight_in(tx, &Sandbox::new(state));
     if !preflight.is_success() {
@@ -100,11 +140,11 @@ pub fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<
             let mut sb = Sandbox::new(state);
             let common = apply_common(tx, &mut sb);
             if common.is_success() {
-                return (preflight.code_str().to_string(), sb.into_modifications());
+                return with_changes(preflight.code_str().to_string(), sb);
             }
-            return (common.code_str().to_string(), HashMap::new());
+            return (common.code_str().to_string(), xrpl_ledger::ledger::sandbox::SandboxChanges::default());
         }
-        return (preflight.code_str().to_string(), HashMap::new());
+        return (preflight.code_str().to_string(), xrpl_ledger::ledger::sandbox::SandboxChanges::default());
     }
     let mut sb = Sandbox::new(state);
     // rippled's Transactor::preclaim runs the sequence / ticket / prior-tx /
@@ -112,22 +152,22 @@ pub fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<
     // The state is the parent ledger's; the ledger being built is one on.
     let gate = xrpl_ledger::ledger::transactor::preclaim_common(tx, &sb, state.header.sequence + 1);
     if !gate.is_success() {
-        return (gate.code_str().to_string(), HashMap::new());
+        return (gate.code_str().to_string(), xrpl_ledger::ledger::sandbox::SandboxChanges::default());
     }
     let preclaim = transactor.preclaim(tx, &sb);
     if !preclaim.is_success() && !preclaim.is_claimed() {
-        return (preclaim.code_str().to_string(), HashMap::new());
+        return (preclaim.code_str().to_string(), xrpl_ledger::ledger::sandbox::SandboxChanges::default());
     }
     if !preclaim.is_success() {
         let common = apply_common(tx, &mut sb);
         if common.is_success() {
-            return (preclaim.code_str().to_string(), sb.into_modifications());
+            return with_changes(preclaim.code_str().to_string(), sb);
         }
-        return (common.code_str().to_string(), HashMap::new());
+        return (common.code_str().to_string(), xrpl_ledger::ledger::sandbox::SandboxChanges::default());
     }
     let common = apply_common(tx, &mut sb);
     if !common.is_success() {
-        return (common.code_str().to_string(), HashMap::new());
+        return (common.code_str().to_string(), xrpl_ledger::ledger::sandbox::SandboxChanges::default());
     }
     let snap = sb.snapshot();
     // Finding 253: presence BEFORE do_apply is what rippled's stamp sees.
@@ -143,7 +183,7 @@ pub fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<
         if !early {
             xrpl_ledger::ledger::transactor::stamp_account_txn_id(tx, &mut sb, txn_id_armed);
         }
-        (TxResult::Success.code_str().to_string(), sb.into_modifications())
+        with_changes(TxResult::Success.code_str().to_string(), sb)
     } else if applied.is_claimed() {
         // tecEXPIRED keeps its NFTokenOffer / Credential erasures (finding 245,
         // rippled's processPersistentChanges) — same settlement as apply.rs.
@@ -152,9 +192,9 @@ pub fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<
         } else if applied != TxResult::Killed {
             sb.restore_snapshot(snap);
         }
-        (applied.code_str().to_string(), sb.into_modifications())
+        with_changes(applied.code_str().to_string(), sb)
     } else {
-        (applied.code_str().to_string(), HashMap::new())
+        (applied.code_str().to_string(), xrpl_ledger::ledger::sandbox::SandboxChanges::default())
     }
 }
 

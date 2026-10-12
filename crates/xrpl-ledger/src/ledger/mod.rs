@@ -20,6 +20,7 @@ pub mod sandbox;
 pub mod state;
 pub mod threading;
 pub mod transactor;
+pub mod tx_meta;
 
 pub use header::LedgerHeader;
 pub use objects::{LedgerEntryType, LedgerObject};
