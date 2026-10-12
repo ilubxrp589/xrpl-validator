@@ -221,6 +221,21 @@ fn batch_changes(
     (outer, inners)
 }
 
+thread_local! {
+    /// Set when the transactor's doApply ran (independence 3.2): a tec from doApply and the same tec from
+    /// preclaim fare differently under tapRETRY.
+    static REACHED_DO_APPLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`native_apply_one`], plus whether its result came from the transactor's doApply (rather than preflight,
+/// preclaim or the common checks): rippled claims doApply's tecOVERSIZE / tecKILLED / tecINCOMPLETE /
+/// tecEXPIRED even while a retry is certain, and the same codes from preclaim wait (ledger::close).
+pub fn native_apply_one_staged(state: &LedgerState, tx: &TxFields) -> (String, HashMap<Hash256, SandboxEntry>, bool) {
+    REACHED_DO_APPLY.with(|r| r.set(false));
+    let (code, c) = apply_core(state, tx);
+    (code, c.mods, REACHED_DO_APPLY.with(|r| r.get()))
+}
+
 fn apply_core(state: &LedgerState, tx: &TxFields) -> Applied {
     xrpl_ledger::tx::reset_thread_state();
     let transactor = match get_transactor(&tx.tx_type) {
@@ -240,7 +255,7 @@ fn apply_core(state: &LedgerState, tx: &TxFields) -> Applied {
             return (pf.code_str().to_string(), xrpl_ledger::ledger::sandbox::SandboxChanges::default());
         }
         let mut sb = Sandbox::new(state);
-        let applied = transactor.do_apply(tx, &mut sb);
+        let applied = { REACHED_DO_APPLY.with(|r| r.set(true)); transactor.do_apply(tx, &mut sb) };
         if applied.is_success() {
             return with_changes(TxResult::Success.code_str().to_string(), sb);
         }
@@ -289,7 +304,7 @@ fn apply_core(state: &LedgerState, tx: &TxFields) -> Applied {
     if early {
         xrpl_ledger::ledger::transactor::stamp_account_txn_id(tx, &mut sb, txn_id_armed);
     }
-    let applied = transactor.do_apply(tx, &mut sb);
+    let applied = { REACHED_DO_APPLY.with(|r| r.set(true)); transactor.do_apply(tx, &mut sb) };
     if applied.is_success() {
         // Success-only (Transactor.cpp:660; tec rolls the stamp back).
         if !early {

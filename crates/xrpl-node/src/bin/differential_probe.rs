@@ -2691,6 +2691,79 @@ fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<Hash
     }
 }
 
+/// Independence 3.2(b): apply the ledger's set (every entry but the Batch inners, which apply inside their
+/// outer) in rippled's canonical order and passes, judging each attempt as BuildLedger's applyTransactions
+/// does (tes Success; ter Retry; tef/tem/tel Fail; a tec Retry while a retry is certain unless doApply
+/// returned one of ALWAYS_CLAIMED, else claimed), and compare the order that results, and each result, with
+/// mainnet's. Threading is not stamped: it decides no result.
+fn run_passes(
+    pre: &LedgerState,
+    order: &[String],
+    tx_json: &dyn Fn(&str) -> Option<&Value>,
+    net_ter: &dyn Fn(&str) -> Option<String>,
+    batch_skip: &HashSet<String>,
+    seq: u32,
+) {
+    use xrpl_ledger::ledger::close::{apply_in_passes, canonical_order, consensus_salt, ApplyOutcome, SeqProxy, TransactionEntry, ALWAYS_CLAIMED};
+    let mainnet: Vec<String> = order.iter().filter(|h| !batch_skip.contains(&h.to_uppercase())).map(|h| h.to_uppercase()).collect();
+    let mut entries: Vec<TransactionEntry> = Vec::new();
+    for h in &mainnet {
+        let Some(t) = tx_json(h).or_else(|| tx_json(&h.to_lowercase())) else { continue };
+        let Ok(hb) = hex::decode(h) else { continue };
+        let Ok(hash) = <[u8; 32]>::try_from(hb.as_slice()) else { continue };
+        let account = t["Account"].as_str().and_then(xrpl_node::native_apply::decode_address).unwrap_or([0u8; 20]);
+        let sequence = t["Sequence"].as_u64().unwrap_or(0) as u32;
+        let ticket = t["TicketSequence"].as_u64().map(|v| v as u32);
+        entries.push(TransactionEntry { hash: Hash256(hash), account, seq_proxy: SeqProxy::of(sequence, ticket), blob: Vec::new() });
+    }
+    let salt = consensus_salt(&entries.iter().map(|e| e.hash).collect::<Vec<_>>());
+    canonical_order(&mut entries, &salt);
+    let mut st = pre.clone();
+    let mut ours: HashMap<String, String> = HashMap::new();
+    let passes = apply_in_passes(entries, |e, certain_retry| {
+        let h = hex::encode_upper(e.hash.0);
+        let Some(txf) = tx_json(&h).or_else(|| tx_json(&h.to_lowercase())).and_then(build_txfields) else { return ApplyOutcome::Fail };
+        let (code, mods, from_do_apply) = xrpl_node::native_apply::native_apply_one_staged(&st, &txf);
+        let outcome = match &code[..3.min(code.len())] {
+            "tes" => ApplyOutcome::Success,
+            "ter" => ApplyOutcome::Retry,
+            "tec" if certain_retry && !(from_do_apply && ALWAYS_CLAIMED.contains(&code.as_str())) => ApplyOutcome::Retry,
+            "tec" => ApplyOutcome::Success,
+            _ => ApplyOutcome::Fail,
+        };
+        if outcome == ApplyOutcome::Success {
+            let _ = apply_modifications(&mut st, mods);
+            ours.insert(h, code);
+        }
+        outcome
+    });
+    let got: Vec<String> = passes.applied.iter().map(|(_, e)| hex::encode_upper(e.hash.0)).collect();
+    let per_pass: Vec<usize> = (0..xrpl_ledger::ledger::close::LEDGER_TOTAL_PASSES).map(|p| passes.applied.iter().filter(|(q, _)| *q == p).count()).collect();
+    let first_order = got.iter().zip(&mainnet).position(|(a, b)| a != b).or(if got.len() != mainnet.len() { Some(got.len().min(mainnet.len())) } else { None });
+    let mut ter_mm: Vec<String> = Vec::new();
+    for h in &mainnet {
+        let theirs = net_ter(h).or_else(|| net_ter(&h.to_lowercase())).unwrap_or_default();
+        let mine = ours.get(h).cloned().unwrap_or_else(|| "(not applied)".into());
+        if mine != theirs {
+            ter_mm.push(format!("{} ours={mine} mainnet={theirs}", &h[..12]));
+        }
+    }
+    match first_order {
+        None if ter_mm.is_empty() => eprintln!("PASSES #{seq}: order MATCH, results MATCH ({} txs; per pass {per_pass:?})", got.len()),
+        None => eprintln!("PASSES #{seq}: order MATCH, {} result(s) differ: {}", ter_mm.len(), ter_mm.iter().take(3).cloned().collect::<Vec<_>>().join("; ")),
+        Some(i) => eprintln!(
+            "PASSES #{seq}: order DIFFERS at position {i} (ours {} vs mainnet {}; {} txs ours, {} mainnet; per pass {per_pass:?}; failed {}, left {}); {} result(s) differ",
+            got.get(i).map(|h| &h[..12]).unwrap_or("-"),
+            mainnet.get(i).map(|h| &h[..12]).unwrap_or("-"),
+            got.len(),
+            mainnet.len(),
+            passes.failed.len(),
+            passes.left.len(),
+            ter_mm.len()
+        ),
+    }
+}
+
 /// Re-spell engine-internal JSON into the canonical forms the binary codec
 /// demands, changing NO values: u64 fields to full-width hex (accepting
 /// numbers, unpadded hex, and — for the MPT amount family, which rippled
@@ -3164,6 +3237,13 @@ fn run() -> i32 {
         }
     }
     eprintln!("Loaded {} pre-state objects.", obj_seen.len());
+
+    // Independence 3.2(b) (DX_PASSES): the ledger rebuilt from its set alone, on a copy of the pre-state:
+    // rippled's canonical order (3.1) and apply passes (3.2), each attempt judged by the engine's own result,
+    // against mainnet's positions and results.
+    if std::env::var("DX_PASSES").is_ok() {
+        run_passes(&state, &order, &|h| txjson_map.get(h), &|h| txmap.get(h).and_then(|t| t["ter"].as_str()).map(str::to_string), &batch_skip, seq);
+    }
 
     // Per-tx native replay + compare to mainnet.
     let mut agg: HashMap<String, TypeAgg> = HashMap::new();
