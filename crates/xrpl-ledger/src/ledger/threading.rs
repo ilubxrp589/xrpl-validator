@@ -168,6 +168,40 @@ pub fn semantically_equal(pre: &[u8], post: &[u8]) -> bool {
     a == b
 }
 
+/// The spelling [`semantically_equal`] compares objects in (pointers as numbers, amounts by value, hex in upper
+/// case, accounts as hex, permissions by number), applied to one object in place.
+pub(crate) fn canon_object(v: &mut serde_json::Value) {
+    canon_material(v);
+}
+
+/// One field's value in two versions of an object, compared the way [`semantically_equal`] compares whole
+/// objects: rippled's `STObject::hasMatchingEntry`, which decides PreviousFields (independence task 2.3).
+pub(crate) fn same_field(name: &str, a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    let canon = |v: &serde_json::Value| {
+        let mut one = serde_json::Map::new();
+        one.insert(name.to_string(), v.clone());
+        let mut one = serde_json::Value::Object(one);
+        canon_material(&mut one);
+        one
+    };
+    canon(a) == canon(b)
+}
+
+/// Whether two versions of an object differ in nothing but their threading (PreviousTxnID, PreviousTxnLgrSeq):
+/// an object this transaction only re-threaded (independence task 2.3).
+pub(crate) fn equal_but_threading(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    let canon = |v: &serde_json::Value| {
+        let mut v = v.clone();
+        if let Some(o) = v.as_object_mut() {
+            o.remove("PreviousTxnID");
+            o.remove("PreviousTxnLgrSeq");
+        }
+        canon_material(&mut v);
+        v
+    };
+    canon(a) == canon(b)
+}
+
 /// Stamp `PreviousTxnID`/`PreviousTxnLgrSeq` onto this transaction's
 /// materially-changed writes. `pre` looks up the pre-transaction bytes of a
 /// key (None for created objects).
@@ -275,6 +309,18 @@ fn collect_owners(image: &[u8], owners: &mut Vec<[u8; 20]>) {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(image) else {
         return;
     };
+    owners_of(&v, owners);
+}
+
+/// The AccountRoot keys `threadOwners` threads for one created or deleted object (independence task 2.3: the
+/// AffectedNodes builder needs them to place an owner rippled re-threaded before reaching it).
+pub(crate) fn owner_root_keys(object: &serde_json::Value) -> Vec<Hash256> {
+    let mut owners = Vec::new();
+    owners_of(object, &mut owners);
+    owners.iter().map(super::keylet::account_root_key).collect()
+}
+
+fn owners_of(v: &serde_json::Value, owners: &mut Vec<[u8; 20]>) {
     let ty = v.get("LedgerEntryType").and_then(|t| t.as_str()).unwrap_or("");
     match ty {
         "AccountRoot" => {}
