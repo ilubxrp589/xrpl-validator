@@ -335,7 +335,8 @@ mod tests {
         }
         stamped.insert(key(4), SandboxEntry::Modified(th("BB", 40).to_string().into_bytes()));
         let ch = node_changes(&st, &stamped, &own);
-        let got: Vec<(u8, NodeKind, Option<i64>, i64, bool, Option<(String, u32)>)> = ch
+        type Row = (u8, NodeKind, Option<i64>, i64, bool, Option<(String, u32)>);
+        let got: Vec<Row> = ch
             .iter()
             .map(|c| (c.key.0[0], c.kind, c.before.as_ref().map(|b| b["v"].as_i64().unwrap()), c.after["v"].as_i64().unwrap(), c.written, c.thread_from.clone()))
             .collect();
