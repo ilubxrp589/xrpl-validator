@@ -16,6 +16,7 @@
 
 pub mod native_apply;
 pub mod meta_check;
+pub mod native_meta;
 #[cfg(feature = "ffi")]
 pub mod native_shadow;
 pub mod amendments;

@@ -109,6 +109,12 @@ pub fn take_inner_results() -> Vec<String> {
     INNER_RESULTS.with(|r| std::mem::take(&mut *r.borrow_mut()))
 }
 
+/// The per-inner results, left in place for `take_inner_results` (the metadata builder reads them beside
+/// the shadow, which drains them).
+pub fn inner_results() -> Vec<String> {
+    INNER_RESULTS.with(|r| r.borrow().clone())
+}
+
 /// The keys each inner of the last `do_apply` on this thread changed in the
 /// sandbox, in RawTransactions order and as long as `take_inner_results` —
 /// an inner that was not applied (or was applied and rolled back inside

@@ -679,11 +679,17 @@ pub async fn start_ws_sync(
                     // binary blobs are cheap. NOTE: issues one extra binary:true RPC per
                     // gated ledger — can be merged with the FFI shadow's tx_blobs fetch
                     // when promoting past shadow.
+                    // Independence 2.7: the gate's binary pairs, kept for the native records' check below.
+                    #[cfg(feature = "ffi")]
+                    let mut gate_pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
                     #[cfg(feature = "ffi")]
                     {
                         let gate = txgate_mode();
                         if gate != TxGate::Off && closed_seq.saturating_sub(process_seq) <= 25 {
                             let triples = fetch_ledger_tx_meta_all(&rpc, process_seq).await;
+                            if crate::native_meta::enabled() {
+                                gate_pairs = triples.clone();
+                            }
                             if !triples.is_empty() {
                                 let root =
                                     xrpl_ledger::shamap::tx_tree::compute_tx_tree_root(&triples);
@@ -831,6 +837,7 @@ pub async fn start_ws_sync(
                         if let Some(shadow) = native_shadow.as_mut() {
                             if result {
                                 shadow.commit(process_seq, &landed.written, wrote_native);
+                                crate::native_meta::check_ledger(process_seq, &gate_pairs, &ledger_header.transaction_hash);
                             } else {
                                 shadow.abort(process_seq, wrote_native && landed.mismatched);
                             }

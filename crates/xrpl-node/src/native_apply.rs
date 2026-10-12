@@ -116,7 +116,7 @@ pub fn native_apply_one_changes(state: &LedgerState, tx: &TxFields, tx_hash_hex:
         .filter(|_| result == "tesSUCCESS" && matches!(tx.tx_type.as_str(), "Payment" | "CheckCash" | "AccountDelete"));
     if tx.tx_type == "Batch" {
         if let Some(views) = xrpl_ledger::tx::batch::take_views() {
-            let results = xrpl_ledger::tx::batch::take_inner_results();
+            let results = xrpl_ledger::tx::batch::inner_results();
             let ids = batch_inner_ids(&tx.fields);
             let (changes, inners) = batch_changes(state, tx_hash_hex, ledger_seq, &views, &ids, &results);
             return TxChanges { result, mods: own.mods, changes, delivered: None, inners };

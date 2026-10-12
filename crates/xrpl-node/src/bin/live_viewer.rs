@@ -1638,6 +1638,7 @@ async fn main() {
                     let mut body = xrpl_node::rpc::metrics::render_prometheus(&snap);
                     body.push_str(&xrpl_node::consensus::sig_verify::metrics_text());
                     body.push_str(&xrpl_node::amendment_guard::metrics_text());
+                    body.push_str(&xrpl_node::native_meta::metrics_text());
                     (
                         axum::http::StatusCode::OK,
                         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
@@ -1771,6 +1772,8 @@ async fn main() {
                     {
                         json["ffi_verifier"] = serde_json::json!({"enabled": false, "note": "build with --features ffi"});
                     }
+                    // Independence 2.7: our own transaction records, in shadow.
+                    json["native_meta"] = xrpl_node::native_meta::json();
                     // Stage 4 Phase A: native-engine shadow counters.
                     #[cfg(feature = "ffi")]
                     {
