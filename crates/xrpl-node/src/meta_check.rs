@@ -31,16 +31,34 @@ pub fn load_ledger(dir: &str, seq: u64) -> Option<HashMap<String, Vec<u8>>> {
 /// Our metadata for one transaction, in engine JSON: the AffectedNodes our engine's changes give, our result
 /// and delivered amount, and mainnet's TransactionIndex (Step 3 makes the position ours).
 pub fn our_meta(tc: &crate::native_apply::TxChanges, tx_index: u64) -> Value {
+    meta_json(&tc.changes, &tc.result, tc.delivered.as_ref(), tx_index, None)
+}
+
+/// A Batch inner's metadata: its own changes and result, and the outer that applied it as ParentBatchID.
+pub fn inner_meta(inner: &crate::native_apply::InnerChanges, tx_index: u64, outer_hash: &str) -> Value {
+    meta_json(&inner.changes, &inner.result, inner.delivered.as_ref(), tx_index, Some(outer_hash))
+}
+
+fn meta_json(
+    changes: &[xrpl_ledger::ledger::tx_meta::NodeChange],
+    result: &str,
+    delivered: Option<&Value>,
+    tx_index: u64,
+    parent_batch: Option<&str>,
+) -> Value {
     // The codec writes TransactionResult (a UInt8) from its number; an unknown name stays a string and the
     // encode error then names it.
-    let result = result_code(&tc.result).map_or_else(|| json!(tc.result), |c| json!(c));
+    let result = result_code(result).map_or_else(|| json!(result), |c| json!(c));
     let mut m = json!({
-        "AffectedNodes": xrpl_ledger::ledger::tx_meta::affected_nodes(&tc.changes),
+        "AffectedNodes": xrpl_ledger::ledger::tx_meta::affected_nodes(changes),
         "TransactionIndex": tx_index,
         "TransactionResult": result,
     });
-    if let Some(d) = &tc.delivered {
+    if let Some(d) = delivered {
         m["DeliveredAmount"] = d.clone();
+    }
+    if let Some(p) = parent_batch {
+        m["ParentBatchID"] = json!(p.to_uppercase());
     }
     m
 }

@@ -93,20 +93,132 @@ pub struct TxChanges {
     /// The metadata's DeliveredAmount, on a tesSUCCESS of a type that records one (Payment, CheckCash,
     /// AccountDelete; `ctx_.deliver`).
     pub delivered: Option<Value>,
+    /// A Batch outer's applied inners, each with its own metadata's inputs (`changes` is then the outer's own:
+    /// its fee and sequence). Empty for any other transaction.
+    pub inners: Vec<InnerChanges>,
+}
+
+/// One applied Batch inner: its id, result, changes and delivered amount. Its metadata names the outer as
+/// ParentBatchID.
+pub struct InnerChanges {
+    pub id: String,
+    pub result: String,
+    pub changes: Vec<xrpl_ledger::ledger::tx_meta::NodeChange>,
+    pub delivered: Option<Value>,
 }
 
 /// [`native_apply_one`], plus what the transaction changed object by object, each with its content before
 /// and after, and what it delivered: the inputs of its metadata. `tx_hash_hex` and `ledger_seq` (the ledger
-/// being built) stamp the threading. Not for a Batch outer: its inners thread with their own ids
-/// (`stamp_batch_threading`).
+/// being built) stamp the threading. A Batch outer comes back with its own changes and each applied inner's.
 pub fn native_apply_one_changes(state: &LedgerState, tx: &TxFields, tx_hash_hex: &str, ledger_seq: u32) -> TxChanges {
     let (result, own) = apply_core(state, tx);
     let delivered = xrpl_ledger::tx::take_delivered()
         .filter(|_| result == "tesSUCCESS" && matches!(tx.tx_type.as_str(), "Payment" | "CheckCash" | "AccountDelete"));
+    if tx.tx_type == "Batch" {
+        if let Some(views) = xrpl_ledger::tx::batch::take_views() {
+            let results = xrpl_ledger::tx::batch::take_inner_results();
+            let ids = batch_inner_ids(&tx.fields);
+            let (changes, inners) = batch_changes(state, tx_hash_hex, ledger_seq, &views, &ids, &results);
+            return TxChanges { result, mods: own.mods, changes, delivered: None, inners };
+        }
+    }
     let mut stamped = own.mods.clone();
     xrpl_ledger::ledger::threading::stamp_threading(&mut stamped, &|k| state.read_json(k), tx_hash_hex, ledger_seq);
     let changes = xrpl_ledger::ledger::tx_meta::node_changes(state, &stamped, &own);
-    TxChanges { result, mods: own.mods, changes, delivered }
+    TxChanges { result, mods: own.mods, changes, delivered, inners: Vec::new() }
+}
+
+/// A Batch's metadata inputs (rippled's applyBatchTransactions): the outer applied first, over the parent
+/// state, then each inner over the batch view the outer and the earlier inners left, each threaded with its
+/// own id. The view each one starts on is kept STAMPED, so an inner sees the earlier applications' threading
+/// as rippled's does.
+fn batch_changes(
+    state: &LedgerState,
+    outer_hash: &str,
+    ledger_seq: u32,
+    views: &xrpl_ledger::tx::batch::BatchViews,
+    ids: &[String],
+    results: &[String],
+) -> (Vec<xrpl_ledger::ledger::tx_meta::NodeChange>, Vec<InnerChanges>) {
+    use xrpl_ledger::ledger::sandbox::{SandboxChanges, AUX_KEY};
+    use xrpl_ledger::ledger::threading::{semantically_equal, stamp_threading};
+    use xrpl_ledger::ledger::tx_meta::node_changes_over;
+    let base = |k: &Hash256| state.read_json(k);
+    let eff = |m: &HashMap<Hash256, SandboxEntry>, k: &Hash256| -> Option<Vec<u8>> {
+        match m.get(k) {
+            Some(SandboxEntry::Created(b)) | Some(SandboxEntry::Modified(b)) => Some(b.clone()),
+            Some(SandboxEntry::Deleted) => None,
+            None => base(k),
+        }
+    };
+    // The outer: its own changes, as the sandbox held them when the inners started.
+    let outer_own: HashMap<Hash256, SandboxEntry> = views
+        .outer
+        .iter()
+        .filter(|(k, e)| **k != AUX_KEY && !matches!(e, SandboxEntry::Modified(b) if base(k).is_some_and(|p| semantically_equal(&p, b))))
+        .map(|(k, e)| (*k, e.clone()))
+        .collect();
+    let mut stamped = outer_own.clone();
+    stamp_threading(&mut stamped, &base, outer_hash, ledger_seq);
+    let outer = node_changes_over(&base, &stamped, &SandboxChanges { mods: outer_own, ..Default::default() });
+    let mut overlay: HashMap<Hash256, Option<Vec<u8>>> = HashMap::new();
+    let lay = |overlay: &mut HashMap<Hash256, Option<Vec<u8>>>, m: &HashMap<Hash256, SandboxEntry>| {
+        for (k, e) in m {
+            overlay.insert(*k, match e {
+                SandboxEntry::Created(b) | SandboxEntry::Modified(b) => Some(b.clone()),
+                SandboxEntry::Deleted => None,
+            });
+        }
+    };
+    lay(&mut overlay, &stamped);
+    let mut inners = Vec::new();
+    for (i, v) in views.inners.iter().enumerate() {
+        let (Some(id), Some(result)) = (ids.get(i), results.get(i)) else { continue };
+        if v.before.is_empty() && v.after.is_empty() {
+            continue; // never applied
+        }
+        let before_of = |k: &Hash256| -> Option<Vec<u8>> { overlay.get(k).cloned().unwrap_or_else(|| base(k)) };
+        let threading = |b: &[u8]| -> Option<(Value, Value)> {
+            let v: Value = serde_json::from_slice(b).ok()?;
+            Some((v.get("PreviousTxnID")?.clone(), v.get("PreviousTxnLgrSeq")?.clone()))
+        };
+        let mut keys: Vec<Hash256> = v.before.keys().chain(v.after.keys()).filter(|k| **k != AUX_KEY).copied().collect();
+        keys.sort_unstable_by_key(|h| h.0);
+        keys.dedup();
+        let mut own: HashMap<Hash256, SandboxEntry> = HashMap::new();
+        for k in keys {
+            match (eff(&v.before, &k), eff(&v.after, &k)) {
+                (None, Some(a)) => {
+                    own.insert(k, SandboxEntry::Created(a));
+                }
+                (Some(_), None) => {
+                    own.insert(k, SandboxEntry::Deleted);
+                }
+                (Some(b), Some(a)) if !semantically_equal(&b, &a) => {
+                    // The sandbox holds no stamps: where the transactor kept the object's threading, the inner's
+                    // view carries the earlier applications' stamp instead.
+                    let mut a2 = a.clone();
+                    if let (Some(t_raw), Some(t_view), Some(t_after)) = (threading(&b), before_of(&k).as_deref().and_then(threading), threading(&a)) {
+                        if t_after == t_raw && t_view != t_raw {
+                            if let Ok(mut av) = serde_json::from_slice::<Value>(&a) {
+                                av["PreviousTxnID"] = t_view.0;
+                                av["PreviousTxnLgrSeq"] = t_view.1;
+                                a2 = serde_json::to_vec(&av).unwrap_or(a);
+                            }
+                        }
+                    }
+                    own.insert(k, SandboxEntry::Modified(a2));
+                }
+                _ => {}
+            }
+        }
+        let mut st = own.clone();
+        stamp_threading(&mut st, &before_of, id, ledger_seq);
+        let changes = node_changes_over(&before_of, &st, &SandboxChanges { mods: own, deleted_final: v.deleted_final.clone(), ..Default::default() });
+        lay(&mut overlay, &st);
+        inners.push(InnerChanges { id: id.clone(), result: result.clone(), changes, delivered: v.delivered.clone() });
+    }
+    (outer, inners)
 }
 
 fn apply_core(state: &LedgerState, tx: &TxFields) -> Applied {

@@ -55,12 +55,23 @@ fn threading_of(v: &Value) -> Option<(String, u32)> {
 /// state it applied on. Sorted by key. An entry whose bytes do not parse as JSON is left out (an engine
 /// sandbox only ever holds JSON).
 pub fn node_changes(base: &LedgerState, stamped: &HashMap<Hash256, SandboxEntry>, unstamped: &SandboxChanges) -> Vec<NodeChange> {
+    node_changes_over(&|k| base.read_json(k), stamped, unstamped)
+}
+
+/// [`node_changes`] over any view of the state the application started on (`before_of`: an object's bytes
+/// there, None when absent). A Batch inner starts on the batch view as the outer and the earlier inners left
+/// it, threading included.
+pub fn node_changes_over(
+    before_of: &dyn Fn(&Hash256) -> Option<Vec<u8>>,
+    stamped: &HashMap<Hash256, SandboxEntry>,
+    unstamped: &SandboxChanges,
+) -> Vec<NodeChange> {
     let parse = |b: &[u8]| serde_json::from_slice::<Value>(b).ok();
     let mut keys: Vec<&Hash256> = stamped.keys().collect();
     keys.sort_by(|a, b| a.0.cmp(&b.0));
     let mut out = Vec::with_capacity(keys.len());
     for key in keys {
-        let before = base.read_json(key).as_deref().and_then(parse);
+        let before = before_of(key).as_deref().and_then(parse);
         let (kind, after) = match &stamped[key] {
             SandboxEntry::Created(b) => (NodeKind::Created, parse(b)),
             SandboxEntry::Modified(b) => (NodeKind::Modified, parse(b)),

@@ -3318,16 +3318,27 @@ fn run() -> i32 {
         }
         fuzz_idx += 1;
         // Independence 2.6 (DX_META=<s2 store>): this transaction's metadata from our engine's own changes,
-        // byte for byte against mainnet's. A Batch outer threads per inner and is not built yet.
+        // byte for byte against mainnet's; a Batch outer's own, and each inner mainnet filed under it.
         if let Some(key) = meta_key.as_ref() {
-            if tx_type != "Batch" {
-                if let Some(theirs) = key.get(&h.to_uppercase()) {
-                    let tc = xrpl_node::native_apply::native_apply_one_changes(&state, &txf, h, seq as u32);
-                    let idx = xrpl_node::meta_check::tx_index(theirs).unwrap_or(0);
-                    let r = xrpl_node::meta_check::compare(&xrpl_node::meta_check::our_meta(&tc, idx), theirs);
-                    meta_tally.add(&tx_type, r.is_ok());
+            if let Some(theirs) = key.get(&h.to_uppercase()) {
+                use xrpl_node::meta_check::{compare, inner_meta, our_meta, tx_index};
+                let tc = xrpl_node::native_apply::native_apply_one_changes(&state, &txf, h, seq as u32);
+                let r = compare(&our_meta(&tc, tx_index(theirs).unwrap_or(0)), theirs);
+                meta_tally.add(&tx_type, r.is_ok());
+                if let Err(d) = r {
+                    eprintln!("META-DIFF #{seq} {} {tx_type}: {d}", &h[..12.min(h.len())]);
+                }
+                for inner in &tc.inners {
+                    let Some(theirs) = key.get(&inner.id.to_uppercase()) else { continue };
+                    // Filed under another outer (finding 417): not this outer's record.
+                    let parent = xrpl_core::codec::decode::decode_transaction_binary(theirs).ok().and_then(|m| m["ParentBatchID"].as_str().map(str::to_uppercase));
+                    if parent.as_deref() != Some(h.to_uppercase().as_str()) {
+                        continue;
+                    }
+                    let r = compare(&inner_meta(inner, tx_index(theirs).unwrap_or(0), h), theirs);
+                    meta_tally.add("BatchInner", r.is_ok());
                     if let Err(d) = r {
-                        eprintln!("META-DIFF #{seq} {} {tx_type}: {d}", &h[..12.min(h.len())]);
+                        eprintln!("META-DIFF #{seq} {} BatchInner of {}: {d}", &inner.id[..12.min(inner.id.len())], &h[..12.min(h.len())]);
                     }
                 }
             }

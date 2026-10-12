@@ -62,6 +62,32 @@ pub const DISABLED_INNER_TYPES: &[&str] = &[
 thread_local! {
     static INNER_RESULTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     static INNER_TOUCHED: RefCell<Vec<Vec<InnerTouch>>> = const { RefCell::new(Vec::new()) };
+    static VIEWS: RefCell<Option<BatchViews>> = const { RefCell::new(None) };
+}
+
+/// Independence task 2.4 (Batch): what each applied inner's own metadata is built from. rippled applies the
+/// outer first (its fee and sequence: the outer's metadata), then every inner as its own transaction over the
+/// batch view, each with its own metadata (applyBatchTransactions). Index-aligned with `take_inner_results`.
+#[derive(Debug, Default, Clone)]
+pub struct BatchViews {
+    /// The sandbox's modifications when the inners started: the outer's own changes.
+    pub outer: HashMap<Hash256, SandboxEntry>,
+    pub inners: Vec<InnerView>,
+}
+
+/// One inner's view: the sandbox's modifications before and after it, the content of each object it deleted
+/// at the deletion, and what it delivered (`ctx_.deliver`).
+#[derive(Debug, Default, Clone)]
+pub struct InnerView {
+    pub before: HashMap<Hash256, SandboxEntry>,
+    pub after: HashMap<Hash256, SandboxEntry>,
+    pub deleted_final: HashMap<Hash256, Vec<u8>>,
+    pub delivered: Option<Value>,
+}
+
+/// The views of the last Batch `do_apply` on this thread, drained on read (cleared with the thread state).
+pub fn take_views() -> Option<BatchViews> {
+    VIEWS.with(|v| v.borrow_mut().take())
 }
 
 /// The per-inner results of the last `do_apply` on this thread, in
@@ -76,6 +102,7 @@ thread_local! {
 pub(crate) fn thread_state_reset() {
     INNER_RESULTS.with(|r| r.borrow_mut().clear());
     INNER_TOUCHED.with(|t| t.borrow_mut().clear());
+    VIEWS.with(|v| v.borrow_mut().take());
 }
 
 pub fn take_inner_results() -> Vec<String> {
@@ -499,6 +526,7 @@ impl Transactor for BatchTransactor {
         INNER_TOUCHED.with(|r| r.borrow_mut().clear());
         let flags = flags_of(&tx.fields);
         let batch_snap = sandbox.snapshot();
+        let mut views = BatchViews { outer: batch_snap.clone(), inners: Vec::new() };
         let mut results: Vec<String> = Vec::new();
         // Per inner, the keys it changed — rippled threads each of those
         // objects with the INNER's transaction id, so the caller needs to
@@ -518,6 +546,7 @@ impl Transactor for BatchTransactor {
             let Some(mut f) = TxFields::from_json(inner) else {
                 results.push(TxResult::Malformed.code_str().to_string());
                 touched.push(Vec::new()); // never applied
+                views.inners.push(InnerView::default());
                 if flags & TF_ALL_OR_NOTHING != 0 {
                     // An AllOrNothing revert files NO inner: rippled discards
                     // the batch view and records no inner metadata at all
@@ -525,6 +554,7 @@ impl Transactor for BatchTransactor {
                     sandbox.restore_snapshot(batch_snap.clone());
                     results.clear();
                     touched.clear();
+                    views.inners.clear();
                     break;
                 }
                 if flags & TF_UNTIL_FAILURE != 0 {
@@ -540,11 +570,23 @@ impl Transactor for BatchTransactor {
                 f.fields["hash"] = Value::String(id);
             }
             let before = sandbox.snapshot();
+            let _ = crate::tx::take_delivered();
             let (r, _applied) = apply_on_sandbox(&f, sandbox);
+            let delivered = crate::tx::take_delivered().filter(|_| r.is_success());
             // Decoded, as every other reader (finding 395): state_replay keeps
             // its leaves binary behind a `leaf_decoder`.
             let base = |k: &Hash256| sandbox.base().read_json(k);
-            touched.push(touched_keys(&before, &sandbox.snapshot(), &base));
+            let after = sandbox.snapshot();
+            let t = touched_keys(&before, &after, &base);
+            let deleted_final = t
+                .iter()
+                .filter_map(|x| match x {
+                    InnerTouch::Deleted(k, _) => sandbox.deleted_content(k).map(|b| (*k, b.to_vec())),
+                    _ => None,
+                })
+                .collect();
+            touched.push(t);
+            views.inners.push(InnerView { before, after, deleted_final, delivered });
             // An AllOrNothing revert clears `results`, so the inner that sank
             // the batch is otherwise invisible to every caller.
             if std::env::var("DX_BATCH").is_ok() {
@@ -556,6 +598,7 @@ impl Transactor for BatchTransactor {
                     sandbox.restore_snapshot(batch_snap.clone());
                     results.clear();
                     touched.clear();
+                    views.inners.clear();
                     break;
                 }
                 if flags & TF_UNTIL_FAILURE != 0 {
@@ -567,6 +610,7 @@ impl Transactor for BatchTransactor {
         }
         INNER_RESULTS.with(|r| *r.borrow_mut() = results);
         INNER_TOUCHED.with(|r| *r.borrow_mut() = touched);
+        VIEWS.with(|v| *v.borrow_mut() = Some(views));
         TxResult::Success
     }
 }

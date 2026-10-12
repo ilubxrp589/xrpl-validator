@@ -196,6 +196,11 @@ impl<'a> Sandbox<'a> {
         }
     }
 
+    /// The content `key` had when this sandbox last deleted it (independence task 2.2).
+    pub fn deleted_content(&self, key: &Hash256) -> Option<&[u8]> {
+        self.deleted_final.get(key).map(Vec::as_slice)
+    }
+
     /// Check if a key exists (in modifications or base, and not deleted).
     pub fn exists(&self, key: &Hash256) -> bool {
         match self.modifications.get(key) {
