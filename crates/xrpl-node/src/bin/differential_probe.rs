@@ -2724,7 +2724,10 @@ fn run_passes(
     let mut ours: HashMap<String, String> = HashMap::new();
     let passes = apply_in_passes(entries, |e, certain_retry| {
         let h = hex::encode_upper(e.hash.0);
-        let Some(txf) = tx_json(&h).and_then(build_txfields) else { return ApplyOutcome::Fail };
+        let Some(mut txf) = tx_json(&h).and_then(build_txfields) else { return ApplyOutcome::Fail };
+        if txf.fields.get("hash").is_none() {
+            txf.fields["hash"] = Value::String(h.clone()); // the AccountTxnID stamp reads it
+        }
         let (code, mods, from_do_apply) = xrpl_node::native_apply::native_apply_one_staged(&st, &txf);
         let outcome = match &code[..3.min(code.len())] {
             "tes" => ApplyOutcome::Success,
@@ -3405,7 +3408,13 @@ fn run() -> i32 {
         if let Some(key) = meta_key.as_ref() {
             if let Some(theirs) = key.get(&h.to_uppercase()) {
                 use xrpl_node::meta_check::{compare_bytes, encode, inner_meta, our_meta, tx_index};
-                let tc = xrpl_node::native_apply::native_apply_one_changes(&state, &txf, h, seq as u32);
+                // The fixture's tx_json carries no "hash"; the live feed's does, and the AccountTxnID stamp reads
+                // it (stamp_account_txn_id).
+                let mut txf_m = txf.clone();
+                if txf_m.fields.get("hash").is_none() {
+                    txf_m.fields["hash"] = Value::String(h.to_uppercase());
+                }
+                let tc = xrpl_node::native_apply::native_apply_one_changes(&state, &txf_m, h, seq as u32);
                 let mut check = |ours: Value, id: &str, theirs: &[u8]| -> Result<(), String> {
                     let b = encode(&ours)?;
                     let r = compare_bytes(&b, theirs);
