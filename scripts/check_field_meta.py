@@ -13,9 +13,10 @@ reported as unknown. Every (source, node type, section, field) seen is counted, 
 
 Sources, in any mix:
   --txtree DIR      '<tx_blob>,<meta>' hex fixtures (crates/xrpl-ledger/tests/data/txtree): binary meta
-  --expected DIR    l<N>_expected.json from scripts/fetch_ledger_fixture.py, searched recursively. They
-                    keep only Created NewFields and Modified FinalFields, and LedgerEntryType there is
-                    the fixture script's own addition, so it is skipped
+  --expected DIR    l<N>_expected.json from scripts/fetch_ledger_fixture.py, searched recursively, mainnet
+                    ones only (header network_id 0). They keep only Created NewFields and Modified
+                    FinalFields, and LedgerEntryType there is the fixture script's own addition, so it
+                    is skipped
   --ledgers DIR     `ledger` answers with transactions + expand as JSON (scripts/fetch_meta_ledgers.py json/)
   --binledgers DIR  the same with binary:true, tx_blob + meta hex (scripts/fetch_meta_ledgers.py bin/)
 
@@ -251,6 +252,9 @@ def read_txtree(check, folder):
 def read_expected(check, folder):
     for path in sorted(Path(folder).rglob("l*_expected.json")):
         data = json.loads(path.read_text())
+        if data.get("header", {}).get("network_id", 0) != 0:
+            check.totals["fixture ledgers not mainnet, skipped"] += 1
+            continue
         check.totals["fixture ledgers"] += 1
         for h, tx in data.get("txs", {}).items():
             check.totals["fixture txs"] += 1
