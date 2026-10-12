@@ -12,20 +12,55 @@ use std::sync::LazyLock;
 
 use serde_json::{json, Value};
 
-/// Mainnet's metadata for one ledger, by transaction hash (upper hex).
-pub fn load_ledger(dir: &str, seq: u64) -> Option<HashMap<String, Vec<u8>>> {
+/// Mainnet's answer key for one ledger: each transaction's metadata and blob by hash (upper hex), and the
+/// header's transaction-tree root.
+pub struct LedgerKey {
+    pub metas: HashMap<String, Vec<u8>>,
+    pub blobs: HashMap<String, Vec<u8>>,
+    pub tx_root: Option<[u8; 32]>,
+}
+
+impl LedgerKey {
+    pub fn get(&self, hash: &str) -> Option<&Vec<u8>> {
+        self.metas.get(hash)
+    }
+
+    /// The transaction-tree root built from OUR metadata (`ours`, by hash) and the ledger's blobs, against
+    /// the header's (the first milestone of Step 2): Some(true) when they agree, None when ours does not
+    /// cover every transaction of the ledger.
+    pub fn our_tree_matches(&self, ours: &HashMap<String, Vec<u8>>) -> Option<bool> {
+        let mut pairs = Vec::with_capacity(self.blobs.len());
+        for (h, blob) in &self.blobs {
+            pairs.push((blob.clone(), ours.get(h)?.clone()));
+        }
+        let root = xrpl_ledger::shamap::tx_tree::compute_tx_tree_root(&pairs);
+        Some(Some(root.0) == self.tx_root)
+    }
+}
+
+/// Mainnet's answer key for one ledger (`<dir>/bin/<seq>.json`).
+pub fn load_ledger(dir: &str, seq: u64) -> Option<LedgerKey> {
     let text = std::fs::read_to_string(format!("{dir}/bin/{seq}.json")).ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
-    let txs = v.pointer("/result/ledger/transactions").or_else(|| v.pointer("/ledger/transactions"))?.as_array()?;
-    let mut out = HashMap::with_capacity(txs.len());
+    let ledger = v.pointer("/result/ledger").or_else(|| v.get("ledger"))?;
+    let txs = ledger["transactions"].as_array()?;
+    // The binary header: sequence (4), total coins (8), parent hash (32), then the transaction-tree root.
+    let tx_root = ledger["ledger_data"].as_str().and_then(|h| hex::decode(h).ok()).and_then(|b| b.get(44..76).map(|r| {
+        let mut a = [0u8; 32];
+        a.copy_from_slice(r);
+        a
+    }));
+    let mut key = LedgerKey { metas: HashMap::with_capacity(txs.len()), blobs: HashMap::with_capacity(txs.len()), tx_root };
     for t in txs {
         let (Some(blob), Some(meta)) = (t["tx_blob"].as_str(), t["meta"].as_str()) else { continue };
         let (Ok(blob), Ok(meta)) = (hex::decode(blob), hex::decode(meta)) else { continue };
         let mut pre = b"TXN\0".to_vec();
         pre.extend_from_slice(&blob);
-        out.insert(hex::encode_upper(xrpl_core::crypto::signing::sha512_half(&pre)), meta);
+        let h = hex::encode_upper(xrpl_core::crypto::signing::sha512_half(&pre));
+        key.metas.insert(h.clone(), meta);
+        key.blobs.insert(h, blob);
     }
-    Some(out)
+    Some(key)
 }
 
 /// Our metadata for one transaction, in engine JSON: the AffectedNodes our engine's changes give, our result
@@ -82,16 +117,25 @@ pub fn tx_index(theirs: &[u8]) -> Option<u64> {
     xrpl_core::codec::decode::decode_transaction_binary(theirs).ok()?["TransactionIndex"].as_u64()
 }
 
-/// Ok when our metadata encodes to mainnet's bytes; else the first difference.
-pub fn compare(ours: &Value, theirs: &[u8]) -> Result<(), String> {
+/// Our metadata in the network's binary form.
+pub fn encode(ours: &Value) -> Result<Vec<u8>, String> {
     let mut canon = ours.clone();
     xrpl_ledger::ledger::canon::canon_for_encode(&mut canon);
-    let our_bytes = xrpl_core::codec::encode::encode_transaction_json(&canon, false).map_err(|e| format!("encode: {e:?}"))?;
+    xrpl_core::codec::encode::encode_transaction_json(&canon, false).map_err(|e| format!("encode: {e:?}"))
+}
+
+/// Ok when our metadata encodes to mainnet's bytes; else the first difference.
+pub fn compare(ours: &Value, theirs: &[u8]) -> Result<(), String> {
+    compare_bytes(&encode(ours)?, theirs)
+}
+
+/// Ok when our encoded metadata is mainnet's; else the first difference.
+pub fn compare_bytes(our_bytes: &[u8], theirs: &[u8]) -> Result<(), String> {
     if our_bytes == theirs {
         return Ok(());
     }
     let dec = |b: &[u8]| xrpl_core::codec::decode::decode_transaction_binary(b).map_err(|e| format!("decode: {e:?}"));
-    let (o, t) = (dec(&our_bytes)?, dec(theirs)?);
+    let (o, t) = (dec(our_bytes)?, dec(theirs)?);
     Err(first_difference(&o, &t).unwrap_or_else(|| "same JSON, different bytes (field or node order)".into()))
 }
 

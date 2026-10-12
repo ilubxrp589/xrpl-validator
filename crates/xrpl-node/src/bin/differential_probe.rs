@@ -2935,6 +2935,7 @@ fn run() -> i32 {
         m
     });
     let mut meta_tally = xrpl_node::meta_check::Tally::default();
+    let mut our_meta_bytes: HashMap<String, Vec<u8>> = HashMap::new();
     // Every hydration targets seq-1, so the node is chosen once, per run.
     let rpc_url = xrpl_node::rpc_select::select_rpc(rpc_pref, seq - 1);
     let txmap = match exp["txs"].as_object() {
@@ -3321,9 +3322,15 @@ fn run() -> i32 {
         // byte for byte against mainnet's; a Batch outer's own, and each inner mainnet filed under it.
         if let Some(key) = meta_key.as_ref() {
             if let Some(theirs) = key.get(&h.to_uppercase()) {
-                use xrpl_node::meta_check::{compare, inner_meta, our_meta, tx_index};
+                use xrpl_node::meta_check::{compare_bytes, encode, inner_meta, our_meta, tx_index};
                 let tc = xrpl_node::native_apply::native_apply_one_changes(&state, &txf, h, seq as u32);
-                let r = compare(&our_meta(&tc, tx_index(theirs).unwrap_or(0)), theirs);
+                let mut check = |ours: Value, id: &str, theirs: &[u8]| -> Result<(), String> {
+                    let b = encode(&ours)?;
+                    let r = compare_bytes(&b, theirs);
+                    our_meta_bytes.insert(id.to_uppercase(), b);
+                    r
+                };
+                let r = check(our_meta(&tc, tx_index(theirs).unwrap_or(0)), h, theirs);
                 meta_tally.add(&tx_type, r.is_ok());
                 if let Err(d) = r {
                     eprintln!("META-DIFF #{seq} {} {tx_type}: {d}", &h[..12.min(h.len())]);
@@ -3335,7 +3342,7 @@ fn run() -> i32 {
                     if parent.as_deref() != Some(h.to_uppercase().as_str()) {
                         continue;
                     }
-                    let r = compare(&inner_meta(inner, tx_index(theirs).unwrap_or(0), h), theirs);
+                    let r = check(inner_meta(inner, tx_index(theirs).unwrap_or(0), h), &inner.id, theirs);
                     meta_tally.add("BatchInner", r.is_ok());
                     if let Err(d) = r {
                         eprintln!("META-DIFF #{seq} {} BatchInner of {}: {d}", &inner.id[..12.min(inner.id.len())], &h[..12.min(h.len())]);
@@ -3913,8 +3920,13 @@ fn run() -> i32 {
         }
     }
     eprintln!("SUMMARY: {total_matched}/{total_attempted} attempted txs MATCH mainnet (native engine)");
-    if meta_key.is_some() {
+    if let Some(key) = meta_key.as_ref() {
         eprintln!("{}", meta_tally.summary());
+        match key.our_tree_matches(&our_meta_bytes) {
+            Some(true) => eprintln!("TXTREE #{seq}: our transaction tree root == the header's ({} transactions, every record ours)", key.blobs.len()),
+            Some(false) => eprintln!("TXTREE #{seq}: our transaction tree root DIFFERS from the header's"),
+            None => eprintln!("TXTREE #{seq}: not built: {} of {} records are ours", our_meta_bytes.len(), key.blobs.len()),
+        }
     }
     let failed = RPC_FAILED.load(std::sync::atomic::Ordering::Relaxed);
     let code = exit_code(total_attempted, failed, any_diverge);
