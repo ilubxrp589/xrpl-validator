@@ -161,9 +161,98 @@ impl LedgerHeader {
     }
 }
 
+/// A closed ledger's total_coins (independence task 3.4): its parent's, less every fee its transactions burned.
+///
+/// rippled destroys the fee each applied transaction charged, a tec's included, at the end of
+/// `Transactor::operator()` (`ctx_.destroyXRP(fee)`, Transactor.cpp in 3.4.1), which reaches
+/// `Ledger::rawDestroyXRP`'s `header_.drops -= fee`. Nothing else destroys XRP. The fee charged is the
+/// transaction's Fee, unless `Transactor::reset` capped a tec's to what its payer could pay (tecINSUFF_FEE). A
+/// Batch's inner transactions carry Fee 0, since the outer pays for them, and a pseudo-transaction pays none.
+/// None on underflow.
+pub fn total_coins_after(parent_total: u64, fees_charged: impl IntoIterator<Item = u64>) -> Option<u64> {
+    fees_charged.into_iter().try_fold(parent_total, |total, fee| total.checked_sub(fee))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn total_coins_fall_by_every_fee_charged() {
+        assert_eq!(total_coins_after(1_000, [12, 10, 0, 15]), Some(963));
+        assert_eq!(total_coins_after(1_000, []), Some(1_000));
+        assert_eq!(total_coins_after(10, [6, 5]), None, "more fees than coins");
+    }
+
+    /// Independence task 3.4's check against mainnet: for every ledger N of a `ledger` answer store
+    /// (scripts/fetch_meta_ledgers.py: json/, bin/, and headers/ from --parents), N's total_coins must be its
+    /// parent's less the Fee of every transaction N holds. A ledger that misses is reported with any
+    /// tecINSUFF_FEE transaction in it, whose charged fee can be less than its Fee.
+    ///
+    ///   XRPL_META_CORPUS=<store>/json cargo test -p xrpl-ledger --lib total_coins_against -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn total_coins_against_mainnet() {
+        use serde_json::Value;
+        use std::path::{Path, PathBuf};
+        let json_dir = PathBuf::from(std::env::var_os("XRPL_META_CORPUS").expect("XRPL_META_CORPUS: <store>/json"));
+        let store = json_dir.parent().unwrap().to_path_buf();
+        let read = |p: &Path| -> Option<Value> { std::fs::read(p).ok().map(|b| serde_json::from_slice(&b).unwrap()) };
+        let header_of = |v: &Value| {
+            let ledger = v.get("result").unwrap_or(v);
+            LedgerHeader::deserialize(&hex::decode(ledger["ledger"]["ledger_data"].as_str().unwrap()).unwrap()).unwrap()
+        };
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(&json_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            .collect();
+        paths.sort();
+        let (mut checked, mut exact, mut no_parent, mut txs, mut burned) = (0usize, 0usize, 0usize, 0usize, 0u128);
+        let mut misses = Vec::new();
+        for path in &paths {
+            let seq: u32 = path.file_stem().unwrap().to_str().unwrap().parse().unwrap();
+            let Some(parent) = read(&store.join("headers").join(format!("{}.json", seq - 1))) else {
+                no_parent += 1;
+                continue;
+            };
+            let own = read(&store.join("bin").join(format!("{seq}.json"))).unwrap();
+            let (parent, own) = (header_of(&parent), header_of(&own));
+            assert_eq!(own.parent_hash, parent.hash(), "#{seq}: the stored header is not its parent's child");
+            let doc = read(path).unwrap();
+            let doc = doc.get("result").unwrap_or(&doc);
+            let all = doc["ledger"]["transactions"].as_array().unwrap();
+            let fees: Vec<u64> = all.iter().map(|t| t["Fee"].as_str().unwrap().parse().unwrap()).collect();
+            checked += 1;
+            txs += all.len();
+            burned += fees.iter().map(|&f| u128::from(f)).sum::<u128>();
+            match total_coins_after(parent.total_coins, fees.iter().copied()) {
+                Some(ours) if ours == own.total_coins => exact += 1,
+                ours => {
+                    let short: Vec<String> = all
+                        .iter()
+                        .filter(|t| t["metaData"]["TransactionResult"] == "tecINSUFF_FEE")
+                        .map(|t| format!("{} Fee {}", &t["hash"].as_str().unwrap()[..12], t["Fee"]))
+                        .collect();
+                    misses.push(format!(
+                        "#{seq}: ours {ours:?}, mainnet {} ({} drops apart); tecINSUFF_FEE: {short:?}",
+                        own.total_coins,
+                        ours.map_or(0, |o| i128::from(o) - i128::from(own.total_coins))
+                    ));
+                }
+            }
+        }
+        eprintln!(
+            "total coins: {checked} ledgers checked ({no_parent} without a parent header), {txs} transactions, \
+             {burned} drops burned; {exact} exact, {} differ",
+            misses.len()
+        );
+        for m in misses.iter().take(30) {
+            eprintln!("  {m}");
+        }
+        assert!(checked > 0, "no ledger had its parent header in {store:?}/headers");
+        assert!(misses.is_empty(), "{} ledgers' total_coins differ", misses.len());
+    }
 
     fn sample_header() -> LedgerHeader {
         LedgerHeader {

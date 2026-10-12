@@ -264,6 +264,8 @@ pub enum TxResult {
     BadQuorum,
     /// temINVALID — an inner of a disallowed type (Batch inside Batch, pseudo types).
     InvalidTx,
+    /// temBAD_SRC_ACCOUNT — a pseudo-transaction whose Account is not the zero account (Change::preflight).
+    BadSrcAccount,
 
     // tef — failed, not applied
     /// Sequence already past.
@@ -276,6 +278,9 @@ pub enum TxResult {
     WrongPrior,
     /// tefNO_AUTH_REQUIRED — tfSetfAuth on an account without lsfRequireAuth.
     NoAuthRequired,
+    /// tefALREADY — EnableAmendment: the amendment is already enabled, already has the majority it claims, or
+    /// lacks the one it loses (Change::applyAmendment).
+    Already,
     // ter — retry, not applied
     /// terPRE_SEQ — a future Sequence.
     PreSeq,
@@ -473,12 +478,14 @@ impl TxResult {
             TxResult::BadSignature => "temBAD_SIGNATURE",
             TxResult::BadRegKey => "temBAD_REGKEY",
             TxResult::InvalidTx => "temINVALID",
+            TxResult::BadSrcAccount => "temBAD_SRC_ACCOUNT",
             TxResult::PastSeq => "tefPAST_SEQ",
             TxResult::MaxLedger => "tefMAX_LEDGER",
             TxResult::NoTicket => "tefNO_TICKET",
             TxResult::WrongPrior => "tefWRONG_PRIOR",
             TxResult::NoDelegatePermission => "terNO_DELEGATE_PERMISSION",
             TxResult::NoAuthRequired => "tefNO_AUTH_REQUIRED",
+            TxResult::Already => "tefALREADY",
             TxResult::PreSeq => "terPRE_SEQ",
             TxResult::PreTicket => "terPRE_TICKET",
             TxResult::NoAccount => "tefNO_ACCOUNT",
@@ -984,10 +991,13 @@ mod tests {
         assert_eq!(TxResult::BadSignature.code_str(), "temBAD_SIGNATURE");
         assert_eq!(TxResult::BadRegKey.code_str(), "temBAD_REGKEY");
         assert_eq!(TxResult::InvalidTx.code_str(), "temINVALID");
+        assert_eq!(TxResult::BadSrcAccount.code_str(), "temBAD_SRC_ACCOUNT");
+        assert_eq!(TxResult::Already.code_str(), "tefALREADY");
         for r in [TxResult::InvalidFlag, TxResult::Redundant, TxResult::BadSigner,
                   TxResult::InvalidInnerBatch, TxResult::ArrayEmpty, TxResult::TemArrayTooLarge,
-                  TxResult::SeqAndTicket, TxResult::BadSignature, TxResult::BadRegKey, TxResult::InvalidTx] {
-            assert!(!r.is_claimed(), "{:?} is a tem code, never claimed", r);
+                  TxResult::SeqAndTicket, TxResult::BadSignature, TxResult::BadRegKey, TxResult::InvalidTx,
+                  TxResult::BadSrcAccount, TxResult::Already] {
+            assert!(!r.is_claimed(), "{:?} is a tem or tef code, never claimed", r);
             assert!(!r.is_success());
         }
     }

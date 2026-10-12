@@ -13,8 +13,13 @@ transaction tree root). The header carries no transaction count, so the root sta
 check, and it is the stronger check.
 
   python3 scripts/fetch_meta_ledgers.py --out DIR [--rpc URL] (SEQ... | --seqs-from-vectors DIR)
+  python3 scripts/fetch_meta_ledgers.py --out DIR --parents
+  python3 scripts/fetch_meta_ledgers.py --out DIR --range FIRST LAST
 Writes DIR/json/<seq>.json and DIR/bin/<seq>.json (the RPC result objects) and appends to
-DIR/fetch.log. A ledger already in both folders is not fetched again. Keep DIR out of git.
+DIR/fetch.log. A ledger already in both folders is not fetched again. --parents fetches only the
+header (binary, no transactions) of the ledger before each one stored, into DIR/headers/<seq>.json,
+kept when it is validated, hashes to its ledger_hash and is the stored ledger's parent_hash.
+Keep DIR out of git.
 """
 import argparse
 import hashlib
@@ -135,6 +140,69 @@ def write(path, result):
     tmp.rename(path)
 
 
+def verify_header(h, child=None):
+    """None when `h` (a binary `ledger` answer with no transactions) is a validated header that hashes to its
+    ledger_hash, and, given `child`, that child's parent."""
+    if not h.get("validated"):
+        return "not validated"
+    data = bytes.fromhex(h.get("ledger", {}).get("ledger_data", ""))
+    if len(data) != 118:
+        return f"ledger_data is {len(data)} bytes, not 118"
+    reported = str(h.get("ledger_hash", "")).upper()
+    if sha512half(b"LWR\x00", data).hex().upper() != reported:
+        return "ledger_data does not hash to ledger_hash"
+    if child is not None and reported != str(child.get("ledger", {}).get("parent_hash", "")).upper():
+        return "not the stored ledger's parent"
+    return None
+
+
+def fetch_range(server, out, first, last, note):
+    """The headers of ledgers first..=last (task 5.3's close-time run), into DIR/headers/. The links between
+    them (each parent_hash is the previous hash) are the check's to verify."""
+    (out / "headers").mkdir(parents=True, exist_ok=True)
+    kept = skipped = 0
+    for seq in range(first, last + 1):
+        hpath = out / "headers" / f"{seq}.json"
+        if hpath.exists():
+            kept += 1
+            continue
+        h, why = server.ledger({"ledger_index": seq, "transactions": False, "binary": True})
+        if h is not None:
+            why = verify_header(h)
+        if why:
+            skipped += 1
+            note(f"{seq} SKIP header: {why}")
+            continue
+        write(hpath, h)
+        kept += 1
+        if seq % 100 == 0:
+            note(f"{seq} OK header ({kept} kept)")
+    return kept, skipped
+
+
+def fetch_parents(server, out, note):
+    """The header of the ledger before each stored one (task 3.4 needs its total_coins), into DIR/headers/."""
+    (out / "headers").mkdir(exist_ok=True)
+    kept = skipped = 0
+    for path in sorted((out / "json").glob("*.json")):
+        seq = int(path.stem) - 1
+        hpath = out / "headers" / f"{seq}.json"
+        if hpath.exists():
+            kept += 1
+            continue
+        h, why = server.ledger({"ledger_index": seq, "transactions": False, "binary": True})
+        if h is not None:
+            why = verify_header(h, json.loads(path.read_text()))
+        if why:
+            skipped += 1
+            note(f"{seq} SKIP header: {why}")
+            continue
+        write(hpath, h)
+        kept += 1
+        note(f"{seq} OK header {h['ledger_hash'][:12]}")
+    return kept, skipped
+
+
 def seqs_from_vectors(folder):
     """The mainnet ledgers named in the vector file names (testnet and devnet ones left out)."""
     seqs = set()
@@ -150,10 +218,15 @@ def main():
     p.add_argument("--out", required=True)
     p.add_argument("--rpc", default=RPC)
     p.add_argument("--seqs-from-vectors")
+    p.add_argument("--parents", action="store_true",
+                   help="also fetch the header of the ledger before each stored one, into DIR/headers/ (verified "
+                        "by its hash and as the stored ledger's parent)")
+    p.add_argument("--range", nargs=2, type=int, metavar=("FIRST", "LAST"),
+                   help="fetch only the headers of ledgers FIRST..=LAST, into DIR/headers/")
     p.add_argument("seqs", nargs="*", type=int)
     a = p.parse_args()
     seqs = sorted(set(a.seqs) | set(seqs_from_vectors(a.seqs_from_vectors) if a.seqs_from_vectors else []))
-    if not seqs:
+    if not seqs and not a.parents and not a.range:
         p.error("no ledgers to fetch")
     out = Path(a.out).expanduser()
     (out / "json").mkdir(parents=True, exist_ok=True)
@@ -166,6 +239,16 @@ def main():
             log.write(line + "\n")
             log.flush()
 
+        if a.range:
+            note(f"start: headers {a.range[0]}..={a.range[1]} from {a.rpc}")
+            kept, skipped = fetch_range(server, out, a.range[0], a.range[1], note)
+            note(f"done: {kept} headers kept, {skipped} skipped")
+            return 0 if kept else 1
+        if a.parents and not seqs:
+            note(f"start: parent headers of the stored ledgers from {a.rpc}")
+            kept, skipped = fetch_parents(server, out, note)
+            note(f"done: {kept} headers kept, {skipped} skipped")
+            return 0 if kept else 1
         note(f"start: {len(seqs)} ledgers from {a.rpc}")
         for seq in seqs:
             jpath, bpath = out / "json" / f"{seq}.json", out / "bin" / f"{seq}.json"
