@@ -82,8 +82,14 @@
 //! ## Disk
 //!
 //! - **Writes:** one buffered write per line.
-//! - **Size:** a ledger with 35 validators sending 3 proposals each comes to about 5 KB, so about
-//!   110 MB a day at 3.9 s a ledger. The test `a_typical_ledger_line_is_about_5_kb` measures it.
+//! - **Size:** a line comes to 4,710 bytes when 35 validators send 3 proposals each, 35 trusted
+//!   validations arrive and 120 come from validators off the list. The test
+//!   `a_typical_ledger_line_is_about_5_kb` measures it.
+//!   - Mainnet closed the 3,000 ledgers from 107,596,001 at 3.865 s each, so 22,357 a day. That
+//!     makes about 105 MB a day.
+//!   - At 5 proposals per validator it would be about 150 MB a day.
+//!   - Each file also starts with the table (about 5 KB) and lists unknown validation keys once
+//!     (about 8 KB).
 //! - **Rotation:** at 200 MB the file becomes `.1`, and `.1` becomes `.2`. Two old files are
 //!   kept, so the recorder holds 600 MB at most.
 
@@ -1333,10 +1339,10 @@ mod tests {
         let mut noted = HashSet::new();
         let first = encode_round(&batch, Some(&header(107_600_001)), &table, &mut noted, 0, t + 4_000);
         let steady = encode_round(&batch, Some(&header(107_600_002)), &table, &mut noted, 0, t + 8_000);
-        let per_day_mb = steady.len() as f64 * 86_400.0 / 3.9 / 1e6;
+        let per_day_mb = steady.len() as f64 * 86_400.0 / 3.865 / 1e6;
         println!(
             "consensus_record sizes: table line {} B, a file's first round line {} B, \
-             a steady round line {} B, {per_day_mb:.0} MB a day at 3.9 s a ledger",
+             a steady round line {} B, {per_day_mb:.0} MB a day at 3.865 s a ledger",
             table.line(t).len(),
             first.len(),
             steady.len()
