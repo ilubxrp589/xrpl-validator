@@ -11,6 +11,7 @@ pub mod canon;
 pub mod close;
 pub mod directory;
 pub mod fees;
+pub mod field_meta;
 pub mod header;
 pub mod keylet;
 pub mod nftpage;
