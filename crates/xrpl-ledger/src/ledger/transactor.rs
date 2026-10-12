@@ -291,7 +291,12 @@ pub enum TxResult {
     /// terINSUF_FEE_B: the fee payer holds no XRP at all (rippled `Transactor::checkFee`). Not
     /// claimed: the transaction retries, and is left out if it never can pay.
     InsufficientFeeBalance,
-    /// Account not found.
+    /// terNO_ACCOUNT: the account, or the fee payer, does not exist (rippled `checkSeqProxy`,
+    /// `checkFee`; TER.h:213).
+    /// - Not claimed, and a retry rather than a failure: a transaction from an account a payment
+    ///   creates later in the same ledger applies in a later pass.
+    /// - It read "tefNO_ACCOUNT" until 2026-10-12. That isn't a rippled code, and the passes
+    ///   dropped such a transaction as a failure.
     NoAccount,
     /// Pseudo-transaction internal failure (tefFAILURE).
     Failure,
@@ -494,7 +499,7 @@ impl TxResult {
             TxResult::PreSeq => "terPRE_SEQ",
             TxResult::PreTicket => "terPRE_TICKET",
             TxResult::InsufficientFeeBalance => "terINSUF_FEE_B",
-            TxResult::NoAccount => "tefNO_ACCOUNT",
+            TxResult::NoAccount => "terNO_ACCOUNT",
             TxResult::Failure => "tefFAILURE",
             TxResult::FailedProcessing => "telFAILED_PROCESSING",
             TxResult::Unsupported => "tecUNSUPPORTED",
@@ -1037,6 +1042,9 @@ mod tests {
         assert!(!TxResult::Malformed.is_claimed());
         assert!(!TxResult::PastSeq.is_claimed());
         assert!(TxResult::NoDst.is_claimed()); // tec codes are claimed
+        // terNO_ACCOUNT, as rippled spells it: a retry the passes keep, not a tef they drop.
+        assert_eq!(TxResult::NoAccount.code_str(), "terNO_ACCOUNT");
+        assert!(!TxResult::NoAccount.is_claimed());
     }
 
     #[test]

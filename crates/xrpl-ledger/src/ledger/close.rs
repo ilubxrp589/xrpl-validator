@@ -462,6 +462,9 @@ mod tests {
         let mut classes = BTreeMap::<String, usize>::new();
         let mut examples = Vec::new();
         let mut pass_counts = BTreeMap::<usize, usize>::new();
+        // Ledgers where a new account's transaction comes up before the payment that creates it:
+        // the terNO_ACCOUNT wait (xrpl-node tests/new_account_passes.rs).
+        let mut waited_for_account = std::collections::BTreeSet::<String>::new();
         for path in &paths {
             let doc: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
             let doc = doc.get("result").unwrap_or(&doc);
@@ -555,6 +558,11 @@ mod tests {
                 let t = &txs[i];
                 if t.account != [0u8; 20] {
                     if missing.contains(&t.account) {
+                        waited_for_account.insert(format!(
+                            "#{seq_no}: {} {} waited for the transaction creating its account",
+                            t.kind,
+                            &hex::encode_upper(t.id.0)[..12]
+                        ));
                         return ApplyOutcome::Retry; // terNO_ACCOUNT
                     }
                     if let Some(&a) = seq.get(&t.account) {
@@ -614,6 +622,10 @@ mod tests {
             paths.len(), model_errors.len()
         );
         for line in model_errors.iter().chain(&examples).take(80) {
+            eprintln!("  {line}");
+        }
+        eprintln!("terNO_ACCOUNT waits (a new account's transaction ahead of its creator): {}", waited_for_account.len());
+        for line in waited_for_account.iter().take(40) {
             eprintln!("  {line}");
         }
         assert!(model_errors.is_empty(), "the model's sequence state went wrong");
