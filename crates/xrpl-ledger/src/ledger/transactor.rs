@@ -31,7 +31,9 @@ pub enum TxResult {
     Success,
 
     // tec — claimed cost, no state change beyond fee
-    /// Insufficient XRP to cover fee.
+    /// tecINSUFF_FEE: in a closed ledger, the fee payer holds some XRP but less than the Fee
+    /// (rippled `Transactor::checkFee`, [`check_fee`]). The claim takes what the payer holds
+    /// (`Transactor::reset`, [`apply_common`]).
     InsufficientFee,
     /// Insufficient funds for the payment.
     UnfundedPayment,
@@ -286,6 +288,9 @@ pub enum TxResult {
     PreSeq,
     /// terPRE_TICKET — a TicketSequence not yet created.
     PreTicket,
+    /// terINSUF_FEE_B: the fee payer holds no XRP at all (rippled `Transactor::checkFee`). Not
+    /// claimed: the transaction retries, and is left out if it never can pay.
+    InsufficientFeeBalance,
     /// Account not found.
     NoAccount,
     /// Pseudo-transaction internal failure (tefFAILURE).
@@ -385,7 +390,7 @@ impl TxResult {
     pub fn code_str(&self) -> &'static str {
         match self {
             TxResult::Success => "tesSUCCESS",
-            TxResult::InsufficientFee => "tecINSUFFICIENT_FEE",
+            TxResult::InsufficientFee => "tecINSUFF_FEE",
             TxResult::UnfundedPayment => "tecUNFUNDED_PAYMENT",
             TxResult::NoDst => "tecNO_DST",
             TxResult::NoDstInsufXrp => "tecNO_DST_INSUF_XRP",
@@ -488,6 +493,7 @@ impl TxResult {
             TxResult::Already => "tefALREADY",
             TxResult::PreSeq => "terPRE_SEQ",
             TxResult::PreTicket => "terPRE_TICKET",
+            TxResult::InsufficientFeeBalance => "terINSUF_FEE_B",
             TxResult::NoAccount => "tefNO_ACCOUNT",
             TxResult::Failure => "tefFAILURE",
             TxResult::FailedProcessing => "telFAILED_PROCESSING",
@@ -731,6 +737,47 @@ pub fn preclaim_common(tx: &TxFields, sandbox: &Sandbox, ledger_seq: u32) -> TxR
     TxResult::Success
 }
 
+/// The fee payer's XRP balance: the Delegate's when the transaction names one, the account's
+/// otherwise (rippled `getFeePayer` → `getInitiator`, Transactor.cpp:1413). `None` when the payer
+/// has no AccountRoot.
+fn fee_payer_balance(tx: &TxFields, sandbox: &Sandbox) -> Option<u64> {
+    let payer = tx.delegate().unwrap_or(tx.account);
+    let root = sandbox.read(&keylet::account_root_key(&payer))?;
+    let root: serde_json::Value = serde_json::from_slice(&root).ok()?;
+    Some(root["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0))
+}
+
+/// rippled `Transactor::checkFee` for a closed ledger (Transactor.cpp:549-619 in 3.4.1).
+/// `invokePreclaim` runs it after the sequence, prior-transaction and permission checks and
+/// before the transactor's own preclaim (applySteps.cpp:179-208).
+/// - A zero Fee passes.
+/// - A payer without an AccountRoot is [`TxResult::NoAccount`].
+/// - A payer holding less than the Fee is [`TxResult::InsufficientFee`] (tecINSUFF_FEE, claimed)
+///   when it holds some XRP, and [`TxResult::InsufficientFeeBalance`] (terINSUF_FEE_B, not
+///   claimed) when it holds none.
+pub fn check_fee(tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+    if tx.fee == 0 {
+        return TxResult::Success;
+    }
+    match fee_payer_balance(tx, sandbox) {
+        None => TxResult::NoAccount,
+        Some(balance) if balance >= tx.fee => TxResult::Success,
+        Some(0) => TxResult::InsufficientFeeBalance,
+        Some(_) => TxResult::InsufficientFee,
+    }
+}
+
+/// What claiming `tx`'s fee takes from its payer now: the Fee, capped at what the payer holds,
+/// as `Transactor::reset` caps it (Transactor.cpp:1347). The ledger's total XRP falls by this.
+pub fn fee_charged(tx: &TxFields, sandbox: &Sandbox) -> u64 {
+    fee_payer_balance(tx, sandbox).map_or(0, |balance| balance.min(tx.fee))
+}
+
+/// Charges the fee and consumes the sequence or ticket: rippled's `payFee`, and on a claimed tec
+/// its `reset`.
+/// - The charge is the Fee, capped at what the payer holds ([`fee_charged`]).
+/// - The cap only bites on a tecINSUFF_FEE claim: the pipelines run [`check_fee`] first, which
+///   stops every other payer short of the Fee.
 pub fn apply_common(tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
     let acct_key = keylet::account_root_key(&tx.account);
 
@@ -757,18 +804,13 @@ pub fn apply_common(tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
         else {
             return TxResult::NoAccount;
         };
+        // Capped at the balance: Transactor::reset (Transactor.cpp:1347).
         let balance = fee_bal(&payer);
-        if balance < tx.fee {
-            return TxResult::InsufficientFee;
-        }
-        payer["Balance"] = serde_json::Value::String((balance - tx.fee).to_string());
+        payer["Balance"] = serde_json::Value::String(balance.saturating_sub(tx.fee).to_string());
         sandbox.write(dk, serde_json::to_vec(&payer).unwrap_or_default());
     } else {
         let balance = fee_bal(&acct);
-        if balance < tx.fee {
-            return TxResult::InsufficientFee;
-        }
-        acct["Balance"] = serde_json::Value::String((balance - tx.fee).to_string());
+        acct["Balance"] = serde_json::Value::String(balance.saturating_sub(tx.fee).to_string());
     }
 
 
@@ -913,15 +955,67 @@ mod tests {
         assert_eq!(v["Sequence"].as_u64().unwrap(), 2);
     }
 
+    /// rippled `Transactor::reset` (Transactor.cpp:1347-1365): a claim takes what the payer holds
+    /// when that's less than the Fee, and still consumes the sequence. The pipelines only get here
+    /// short of the Fee on a tecINSUFF_FEE claim, after `check_fee`. (This test used to expect
+    /// InsufficientFee and no change, which is not what rippled does.)
     #[test]
-    fn apply_common_insufficient_fee() {
+    fn apply_common_caps_the_fee_at_what_the_payer_holds() {
         let acct = [0x02u8; 20];
         let state = test_state_with_account(&acct, 5, 1); // only 5 drops
 
         let mut sandbox = Sandbox::new(&state);
         let tx = test_tx(acct, 12, 1); // fee=12 > balance=5
-        let result = apply_common(&tx, &mut sandbox);
-        assert_eq!(result, TxResult::InsufficientFee);
+        assert_eq!(fee_charged(&tx, &sandbox), 5);
+        assert_eq!(apply_common(&tx, &mut sandbox), TxResult::Success);
+        let data = sandbox.read(&keylet::account_root_key(&acct)).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        assert_eq!(v["Balance"], "0");
+        assert_eq!(v["Sequence"], 2);
+    }
+
+    /// rippled `Transactor::checkFee` in a closed ledger (Transactor.cpp:549-619).
+    #[test]
+    fn check_fee_follows_rippled_in_a_closed_ledger() {
+        let acct = [0x04u8; 20];
+        let check = |balance: u64, fee: u64| {
+            let state = test_state_with_account(&acct, balance, 1);
+            check_fee(&test_tx(acct, fee, 1), &Sandbox::new(&state))
+        };
+        assert_eq!(check(12, 12), TxResult::Success, "exactly the fee");
+        assert_eq!(check(11, 12), TxResult::InsufficientFee, "some XRP, but short of the fee");
+        assert_eq!(check(0, 12), TxResult::InsufficientFeeBalance, "no XRP at all");
+        assert_eq!(check(0, 0), TxResult::Success, "a zero fee needs nothing");
+        let elsewhere = test_state_with_account(&[0xFF; 20], 1_000, 1);
+        assert_eq!(check_fee(&test_tx(acct, 12, 1), &Sandbox::new(&elsewhere)), TxResult::NoAccount);
+
+        assert_eq!(TxResult::InsufficientFee.code_str(), "tecINSUFF_FEE");
+        assert!(TxResult::InsufficientFee.is_claimed());
+        assert_eq!(TxResult::InsufficientFeeBalance.code_str(), "terINSUF_FEE_B");
+        assert!(!TxResult::InsufficientFeeBalance.is_claimed());
+    }
+
+    /// The Delegate pays when the transaction names one (`getFeePayer` → `getInitiator`).
+    #[test]
+    fn check_fee_and_the_charge_read_the_delegates_balance() {
+        let (acct, delegate) = ([0x05u8; 20], [0x06u8; 20]);
+        let mut state = test_state_with_account(&acct, 1_000_000, 1);
+        let root = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": hex::encode(delegate),
+            "Balance": "5",
+            "Sequence": 1,
+            "OwnerCount": 0,
+        });
+        state
+            .state_map
+            .insert(keylet::account_root_key(&delegate), serde_json::to_vec(&root).unwrap())
+            .unwrap();
+        let mut tx = test_tx(acct, 12, 1);
+        tx.fields = serde_json::json!({ "Delegate": hex::encode(delegate) });
+        let sandbox = Sandbox::new(&state);
+        assert_eq!(check_fee(&tx, &sandbox), TxResult::InsufficientFee);
+        assert_eq!(fee_charged(&tx, &sandbox), 5);
     }
 
     #[test]

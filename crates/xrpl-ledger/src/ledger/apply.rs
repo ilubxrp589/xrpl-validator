@@ -132,17 +132,18 @@ pub fn apply_transaction_set(
             Some(t) => t,
             None => {
                 // Unsupported tx type — deduct fee but skip apply
-                let fee_result = {
+                let (fee_result, charged) = {
                     let mut sandbox = Sandbox::new(&new_state);
+                    let charged = super::transactor::fee_charged(tx, &sandbox);
                     let r = apply_common(tx, &mut sandbox);
                     if r.is_success() {
                         let mods = sandbox.into_modifications();
                         apply_modifications(&mut new_state, mods)?;
-                        total_fees += tx.fee;
+                        total_fees += charged;
                     } else {
                         sandbox.discard();
                     }
-                    r
+                    (r, charged)
                 };
                 results.push(AppliedTx {
                     tx_hash: *tx_hash,
@@ -151,7 +152,7 @@ pub fn apply_transaction_set(
                     } else {
                         fee_result
                     },
-                    fee: if fee_result.is_success() { tx.fee } else { 0 },
+                    fee: if fee_result.is_success() { charged } else { 0 },
                 });
                 continue;
             }
@@ -163,15 +164,16 @@ pub fn apply_transaction_set(
             if preflight.is_claimed() {
                 // Claimed preflight failure (e.g. Unsupported IOU) — deduct fee
                 let mut sandbox = Sandbox::new(&new_state);
+                let charged = super::transactor::fee_charged(tx, &sandbox);
                 let common = apply_common(tx, &mut sandbox);
                 if common.is_success() {
                     let mods = sandbox.into_modifications();
                     apply_modifications(&mut new_state, mods)?;
-                    total_fees += tx.fee;
+                    total_fees += charged;
                     results.push(AppliedTx {
                         tx_hash: *tx_hash,
                         result: preflight,
-                        fee: tx.fee,
+                        fee: charged,
                     });
                 } else {
                     sandbox.discard();
@@ -195,19 +197,24 @@ pub fn apply_transaction_set(
         let (result, fee_charged) = {
             let mut sandbox = Sandbox::new(&new_state);
 
-            // Preclaim (read-only check)
-            let preclaim = transactor.preclaim(tx, &sandbox);
+            // Preclaim (read-only check). rippled's checkFee runs ahead of the transactor's
+            // own (invokePreclaim, applySteps.cpp:204): a payer short of the Fee is
+            // tecINSUFF_FEE or terINSUF_FEE_B whatever the transactor would say.
+            let fee_check = super::transactor::check_fee(tx, &sandbox);
+            let preclaim =
+                if fee_check.is_success() { transactor.preclaim(tx, &sandbox) } else { fee_check };
             if !preclaim.is_success() && !preclaim.is_claimed() {
                 // tem/tef — not claimed, discard entirely
                 sandbox.discard();
                 (preclaim, 0u64)
             } else if !preclaim.is_success() {
-                // tec — claimed, deduct fee only
+                // tec — claimed, deduct fee only (capped at what the payer holds: tecINSUFF_FEE)
+                let charged = super::transactor::fee_charged(tx, &sandbox);
                 let common = apply_common(tx, &mut sandbox);
                 if common.is_success() {
                     let mods = sandbox.into_modifications();
                     apply_modifications(&mut new_state, mods)?;
-                    (preclaim, tx.fee)
+                    (preclaim, charged)
                 } else {
                     sandbox.discard();
                     (common, 0)

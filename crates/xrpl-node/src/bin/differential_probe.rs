@@ -2640,9 +2640,11 @@ fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<Hash
         }
         return (preflight.code_str().to_string(), HashMap::new());
     }
-    // Phase 2+3+4: preclaim → common → do_apply
+    // Phase 2+3+4: preclaim → common → do_apply. rippled's checkFee runs ahead of the
+    // transactor's own preclaim (invokePreclaim, applySteps.cpp:204), as in native_apply.rs.
     let mut sb = Sandbox::new(state);
-    let preclaim = transactor.preclaim(tx, &sb);
+    let fee = xrpl_ledger::ledger::transactor::check_fee(tx, &sb);
+    let preclaim = if fee.is_success() { transactor.preclaim(tx, &sb) } else { fee };
     if !preclaim.is_success() && !preclaim.is_claimed() {
         return (preclaim.code_str().to_string(), HashMap::new());
     }

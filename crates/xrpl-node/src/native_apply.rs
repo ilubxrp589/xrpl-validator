@@ -281,6 +281,20 @@ fn apply_core(state: &LedgerState, tx: &TxFields) -> Applied {
     if !gate.is_success() {
         return (gate.code_str().to_string(), xrpl_ledger::ledger::sandbox::SandboxChanges::default());
     }
+    // rippled's checkFee runs next, ahead of the transactor's own preclaim (invokePreclaim,
+    // applySteps.cpp:204). A payer short of the Fee is tecINSUFF_FEE, claimed at what it holds
+    // (Transactor::reset), or terINSUF_FEE_B, not applied, if it holds nothing.
+    let fee = xrpl_ledger::ledger::transactor::check_fee(tx, &sb);
+    if !fee.is_success() {
+        if fee.is_claimed() {
+            let common = apply_common(tx, &mut sb);
+            if common.is_success() {
+                return with_changes(fee.code_str().to_string(), sb);
+            }
+            return (common.code_str().to_string(), xrpl_ledger::ledger::sandbox::SandboxChanges::default());
+        }
+        return (fee.code_str().to_string(), xrpl_ledger::ledger::sandbox::SandboxChanges::default());
+    }
     let preclaim = transactor.preclaim(tx, &sb);
     if !preclaim.is_success() && !preclaim.is_claimed() {
         return (preclaim.code_str().to_string(), xrpl_ledger::ledger::sandbox::SandboxChanges::default());
