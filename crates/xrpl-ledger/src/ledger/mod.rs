@@ -9,6 +9,7 @@ pub mod amendments;
 pub mod apply;
 pub mod canon;
 pub mod close;
+pub mod close_time;
 pub mod directory;
 pub mod fees;
 pub mod field_meta;
