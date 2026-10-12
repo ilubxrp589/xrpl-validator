@@ -512,7 +512,8 @@ mod tests {
         key.extend_from_slice(&[1_u8; 32]);
         verify_proposal(&key, &[], 1, 2, &[0_u8; 32], &[0_u8; 32]);
         let after = PROPOSAL_SIG.snapshot();
-        assert_eq!(after.2, before.2 + 1);
+        // The counters are process-wide and the other tests run beside this one: at least ours landed.
+        assert!(after.2 > before.2, "{before:?} -> {after:?}");
         assert!(metrics_text().contains("xrpl_proposal_sig_unsupported_total"));
     }
 }
