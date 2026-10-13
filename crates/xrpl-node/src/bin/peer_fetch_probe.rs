@@ -56,6 +56,7 @@ fn frame(msg: &PeerMessage) -> Vec<u8> {
 
 #[tokio::main]
 async fn main() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let peer = arg("--peer").unwrap_or_else(|| "s1.ripple.com:51235".into());
     let url = arg("--rpc").unwrap_or_else(|| "https://s2.ripple.com:51234".into());
     let count: u32 = arg("--count").and_then(|c| c.parse().ok()).unwrap_or(5);
