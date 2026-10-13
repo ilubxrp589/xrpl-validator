@@ -23,6 +23,8 @@ pub struct LedgerState {
     /// (key, blob) to this hook to produce the JSON bytes on demand. Lets a
     /// full-state replay keep ~150 B raw leaves instead of ~1.5 KB JSON.
     pub leaf_decoder: Option<fn(&Hash256, &[u8]) -> Option<Vec<u8>>>,
+    /// Every object of the ledger is present (a full scan of state.rocks), not "the parts loaded are right"; false from every constructor.
+    pub complete: bool,
 }
 
 impl LedgerState {
@@ -38,6 +40,7 @@ impl LedgerState {
             tx_map,
             validated: false,
             leaf_decoder: None,
+            complete: false,
         };
 
         state.verify()?;
@@ -52,6 +55,7 @@ impl LedgerState {
             tx_map: SHAMap::new(TreeType::Transaction),
             validated: false,
             leaf_decoder: None,
+            complete: false,
         }
     }
 
