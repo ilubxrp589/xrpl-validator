@@ -1644,6 +1644,7 @@ async fn main() {
                     body.push_str(&xrpl_node::consensus::sig_verify::metrics_text());
                     body.push_str(&xrpl_node::amendment_guard::metrics_text());
                     body.push_str(&xrpl_node::native_meta::metrics_text());
+                    body.push_str(&xrpl_node::native_order::metrics_text());
                     (
                         axum::http::StatusCode::OK,
                         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
@@ -1779,6 +1780,8 @@ async fn main() {
                     }
                     // Independence 2.7: our own transaction records, in shadow.
                     json["native_meta"] = xrpl_node::native_meta::json();
+                    // Independence 3.3: our own order and passes.
+                    json["native_order"] = xrpl_node::native_order::json();
                     // Stage 4 Phase A: native-engine shadow counters.
                     #[cfg(feature = "ffi")]
                     {
