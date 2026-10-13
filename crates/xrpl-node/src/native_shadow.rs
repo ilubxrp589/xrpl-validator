@@ -484,6 +484,40 @@ impl NativeShadow {
 }
 
 impl NativeShadow {
+    /// A hydrated writer over `state` (the post-state of `at_seq`), for offline replays of the live code
+    /// (differential_probe's DX_SHADOW): our order in `order_mode`, its receipts to `order_log`, and the
+    /// parent's total XRP when it is known.
+    #[doc(hidden)]
+    pub fn replay(
+        state: LedgerState,
+        at_seq: u32,
+        order_mode: crate::native_order::Mode,
+        order_log: std::path::PathBuf,
+        parent_total: Option<u64>,
+    ) -> Self {
+        Self {
+            state,
+            at_seq,
+            hydrated: true,
+            last_hydrate: None,
+            log: None,
+            hydrating: None,
+            pending: Vec::new(),
+            canary: None,
+            held: None,
+            distrust: None,
+            writer_log: None,
+            writer: true,
+            bad_keys: HashSet::new(),
+            bad_overflow: false,
+            writer_fails: Vec::new(),
+            writer_tripped: false,
+            order_mode,
+            order_log,
+            totals: [(0, 0), parent_total.map_or((0, 0), |t| (at_seq, t))],
+        }
+    }
+
     /// Build the (unhydrated) shadow if `XRPL_NATIVE_SHADOW=1`.
     pub fn maybe_new() -> Option<Self> {
         let on = std::env::var("XRPL_NATIVE_SHADOW")

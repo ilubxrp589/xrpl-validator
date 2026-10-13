@@ -2771,6 +2771,72 @@ fn run_passes(
     }
 }
 
+/// Independence 3.3: NativeShadow::propose (the live writer) over `pre`, the ledger's pre-state, in our order's shadow
+/// and on modes. Prints each mode's refusal and order receipt, and whether the two modes offered the same bytes.
+fn run_shadow(pre: &LedgerState, store: &str, seq: u32) {
+    use xrpl_node::native_order::Mode;
+    let read = |dir: &str, s: u32| -> Option<Value> {
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(format!("{store}/{dir}/{s}.json")).ok()?).ok()?;
+        Some(v.pointer("/result/ledger").or_else(|| v.get("ledger"))?.clone())
+    };
+    let Some(ledger) = read("json", seq) else {
+        eprintln!("DX_SHADOW: no {store}/json/{seq}.json");
+        return;
+    };
+    let total = |l: &Value| -> Option<u64> {
+        l["total_coins"].as_str().and_then(|t| t.parse().ok()).or_else(|| {
+            let b = hex::decode(l["ledger_data"].as_str()?).ok()?;
+            Some(u64::from_be_bytes(b.get(4..12)?.try_into().ok()?))
+        })
+    };
+    let parent_total = read("headers", seq - 1).as_ref().and_then(total);
+    let txs: Vec<Value> = ledger["transactions"].as_array().cloned().unwrap_or_default();
+    let mut keys: HashSet<[u8; 32]> = HashSet::new();
+    let mut deleted: HashSet<[u8; 32]> = HashSet::new();
+    for t in &txs {
+        for node in t["metaData"]["AffectedNodes"].as_array().into_iter().flatten() {
+            let Some((kind, body)) = node.as_object().and_then(|o| o.iter().next()) else { continue };
+            let Some(k) = body["LedgerIndex"].as_str().and_then(|h| hex::decode(h).ok()).and_then(|b| <[u8; 32]>::try_from(b).ok()) else { continue };
+            keys.insert(k);
+            if kind == "DeletedNode" {
+                deleted.insert(k);
+            } else {
+                deleted.remove(&k);
+            }
+        }
+    }
+    let parent_hash: [u8; 32] = ledger["parent_hash"].as_str().and_then(|h| hex::decode(h).ok()).and_then(|b| b.try_into().ok()).unwrap_or([0; 32]);
+    let pct = ledger["parent_close_time"].as_u64().unwrap_or(0) as u32;
+    let drops = total(&ledger).unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("dx-shadow-{seq}-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let mut offered = Vec::new();
+    for mode in [Mode::Shadow, Mode::On] {
+        let log = dir.join(format!("{mode:?}.jsonl"));
+        let mut sh = xrpl_node::native_shadow::NativeShadow::replay(pre.clone(), seq - 1, mode, log.clone(), parent_total);
+        let t0 = std::time::Instant::now();
+        let Some(p) = sh.propose(seq, &parent_hash, pct, drops, &txs, &keys, &deleted, None) else {
+            eprintln!("SHADOW #{seq} {mode:?}: no proposal");
+            continue;
+        };
+        let receipt = std::fs::read_to_string(&log).unwrap_or_default();
+        eprintln!(
+            "SHADOW #{seq} {mode:?}: {} ms; refusal {}; order receipt {}",
+            t0.elapsed().as_millis(),
+            p.refusal.as_deref().map(|r| r.chars().take(200).collect::<String>()).unwrap_or_else(|| "none".into()),
+            if receipt.trim().is_empty() { "none (order, results, bytes and total XRP the network's)".to_string() } else { receipt.trim().chars().take(600).collect() }
+        );
+        let mut o: Vec<([u8; 32], Option<Vec<u8>>)> = p.overlay.into_iter().collect();
+        o.sort();
+        offered.push(o);
+    }
+    if offered.len() == 2 {
+        eprintln!("SHADOW #{seq}: shadow and on offered {} bytes ({} objects)", if offered[0] == offered[1] { "the same" } else { "DIFFERENT" }, offered[0].len());
+    }
+    eprintln!("SHADOW #{seq} counters: {}", xrpl_node::native_order::summary());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Re-spell engine-internal JSON into the canonical forms the binary codec
 /// demands, changing NO values: u64 fields to full-width hex (accepting
 /// numbers, unpadded hex, and — for the MPT amount family, which rippled
@@ -3250,6 +3316,11 @@ fn run() -> i32 {
     // against mainnet's positions and results.
     if std::env::var("DX_PASSES").is_ok() {
         run_passes(&state, &order, txjson_map, txmap, &batch_skip, seq);
+    }
+    // Independence 3.3 (DX_SHADOW=<s2 store>): the live writer's own code over the same pre-state: propose() in
+    // XRPL_NATIVE_ORDER shadow and on, with the ledger as ws-sync hands it (the store's json/<seq>.json).
+    if let Ok(store) = std::env::var("DX_SHADOW") {
+        run_shadow(&state, &store, seq);
     }
 
     // Per-tx native replay + compare to mainnet.
