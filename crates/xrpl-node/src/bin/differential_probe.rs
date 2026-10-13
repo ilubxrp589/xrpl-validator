@@ -2791,20 +2791,32 @@ fn run_shadow(pre: &LedgerState, store: &str, seq: u32) {
     };
     let parent_total = read("headers", seq - 1).as_ref().and_then(total);
     let txs: Vec<Value> = ledger["transactions"].as_array().cloned().unwrap_or_default();
-    let mut keys: HashSet<[u8; 32]> = HashSet::new();
-    let mut deleted: HashSet<[u8; 32]> = HashSet::new();
-    for t in &txs {
+    // The key sets as ws-sync builds them (extract_affected_nodes, in TransactionIndex order): a created key
+    // is modified and not deleted; a modified one stays out once deleted; a deleted one leaves the modified.
+    let mut by_index: Vec<&Value> = txs.iter().collect();
+    by_index.sort_by_key(|t| t["metaData"]["TransactionIndex"].as_u64().unwrap_or(u64::MAX));
+    let (mut modified, mut deleted): (HashSet<[u8; 32]>, HashSet<[u8; 32]>) = (HashSet::new(), HashSet::new());
+    for t in by_index {
         for node in t["metaData"]["AffectedNodes"].as_array().into_iter().flatten() {
             let Some((kind, body)) = node.as_object().and_then(|o| o.iter().next()) else { continue };
             let Some(k) = body["LedgerIndex"].as_str().and_then(|h| hex::decode(h).ok()).and_then(|b| <[u8; 32]>::try_from(b).ok()) else { continue };
-            keys.insert(k);
-            if kind == "DeletedNode" {
-                deleted.insert(k);
-            } else {
-                deleted.remove(&k);
+            match kind.as_str() {
+                "CreatedNode" => {
+                    modified.insert(k);
+                    deleted.remove(&k);
+                }
+                "ModifiedNode" if !deleted.contains(&k) => {
+                    modified.insert(k);
+                }
+                "DeletedNode" => {
+                    deleted.insert(k);
+                    modified.remove(&k);
+                }
+                _ => {}
             }
         }
     }
+    let keys: HashSet<[u8; 32]> = modified.union(&deleted).copied().collect();
     let parent_hash: [u8; 32] = ledger["parent_hash"].as_str().and_then(|h| hex::decode(h).ok()).and_then(|b| b.try_into().ok()).unwrap_or([0; 32]);
     let pct = ledger["parent_close_time"].as_u64().unwrap_or(0) as u32;
     let drops = total(&ledger).unwrap_or(0);
