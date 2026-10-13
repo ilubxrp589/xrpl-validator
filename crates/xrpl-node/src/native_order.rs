@@ -62,6 +62,9 @@ pub struct OrderStats {
     pub exact: AtomicU64,
     pub order_differ: AtomicU64,
     pub result_differ: AtomicU64,
+    /// Task 3.4 live: the parent's total XRP less what our walk burned, against the header's.
+    pub coins_match: AtomicU64,
+    pub coins_differ: AtomicU64,
     pub bytes_differ: AtomicU64,
     /// `on`: ledgers our order refused.
     pub refused: AtomicU64,
@@ -143,6 +146,10 @@ pub struct Verdict {
     /// Our result against the network's, for each transaction they differ on (and each one we left out).
     pub results: Vec<String>,
     pub per_pass: Vec<usize>,
+    /// The header's total XRP against the parent's less what we burned, when they differ (the caller sets it).
+    pub coins: Option<String>,
+    /// Whether the total was checked (the parent's total is known only after a consecutive ledger).
+    pub coins_checked: bool,
 }
 
 pub fn verdict(walked: &Walked, network: &[String], network_result: &dyn Fn(&str) -> Option<String>) -> Verdict {
@@ -173,7 +180,15 @@ pub fn verdict(walked: &Walked, network: &[String], network_result: &dyn Fn(&str
         }
     }
     let per_pass = (0..LEDGER_TOTAL_PASSES).map(|p| walked.applied.iter().filter(|(q, _, _)| *q == p).count()).collect();
-    Verdict { order, results, per_pass }
+    Verdict { order, results, per_pass, coins: None, coins_checked: false }
+}
+
+/// Task 3.4 live: the parent's total XRP less the fees our walk burned, against the header's. None: it holds.
+pub fn coins_verdict(parent_total: u64, burned: u64, header_total: u64) -> Option<String> {
+    let ours = parent_total.checked_sub(burned);
+    (ours != Some(header_total)).then(|| {
+        format!("total XRP: ours {} (parent {parent_total} less {burned} burned) vs header {header_total}", ours.map_or("-".into(), |o| o.to_string()))
+    })
 }
 
 /// A ledger's comparison, counted: the refusal `on` makes of it, and the receipt line to log when anything
@@ -204,7 +219,12 @@ pub fn judge(seq: u32, mode: Mode, v: &Verdict, walked: &Walked, bytes: Option<(
     if bytes_n > 0 {
         st.bytes_differ.fetch_add(1, Ordering::Relaxed);
     }
-    let exact = v.order.is_none() && v.results.is_empty() && bytes_n == 0;
+    if v.coins.is_some() {
+        st.coins_differ.fetch_add(1, Ordering::Relaxed);
+    } else if v.coins_checked {
+        st.coins_match.fetch_add(1, Ordering::Relaxed);
+    }
+    let exact = v.order.is_none() && v.results.is_empty() && bytes_n == 0 && v.coins.is_none();
     let mut receipt = None;
     if exact {
         st.exact.fetch_add(1, Ordering::Relaxed);
@@ -213,6 +233,9 @@ pub fn judge(seq: u32, mode: Mode, v: &Verdict, walked: &Walked, bytes: Option<(
             "seq": seq, "mode": mode.name(), "order": v.order, "results": v.results.iter().take(5).collect::<Vec<_>>(),
             "results_n": v.results.len(), "passes": v.per_pass, "attempts": walked.attempts, "ms": ms,
         });
+        if let Some(c) = &v.coins {
+            line["coins"] = json!(c);
+        }
         if let Some((n, first)) = bytes {
             line["bytes"] = json!({ "differ": n, "first": first.map(|k| hex::encode_upper(k.0)) });
         }
@@ -251,8 +274,8 @@ pub fn summary() -> String {
     let st = stats();
     let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
     format!(
-        "ledgers {} exact {} | order differ {} results differ {} bytes differ {} refused {} | txs {} applied after pass 1 {} attempts {}",
-        l(&st.ledgers), l(&st.exact), l(&st.order_differ), l(&st.result_differ), l(&st.bytes_differ), l(&st.refused),
+        "ledgers {} exact {} | order differ {} results differ {} bytes differ {} total XRP match {} differ {} refused {} | txs {} applied after pass 1 {} attempts {}",
+        l(&st.ledgers), l(&st.exact), l(&st.order_differ), l(&st.result_differ), l(&st.bytes_differ), l(&st.coins_match), l(&st.coins_differ), l(&st.refused),
         l(&st.txs), l(&st.retried), l(&st.attempts)
     )
 }
@@ -264,7 +287,7 @@ pub fn json() -> Value {
     json!({
         "mode": mode().name(), "last_seq": l(&st.last_seq), "ledgers": l(&st.ledgers), "exact": l(&st.exact),
         "order_differ": l(&st.order_differ), "result_differ": l(&st.result_differ), "bytes_differ": l(&st.bytes_differ),
-        "refused": l(&st.refused), "txs": l(&st.txs), "retried": l(&st.retried), "attempts": l(&st.attempts),
+        "coins_match": l(&st.coins_match), "coins_differ": l(&st.coins_differ), "refused": l(&st.refused), "txs": l(&st.txs), "retried": l(&st.retried), "attempts": l(&st.attempts),
         "ms_last": l(&st.ms_last),
     })
 }
@@ -288,6 +311,8 @@ pub fn metrics_text() -> String {
         ("xrpl_native_order_order_differ_total", "Ledgers where our order differed from the network's.", l(&st.order_differ)),
         ("xrpl_native_order_result_differ_total", "Ledgers where a result of ours differed from the network's.", l(&st.result_differ)),
         ("xrpl_native_order_bytes_differ_total", "Ledgers where our order left bytes different from the network order's.", l(&st.bytes_differ)),
+        ("xrpl_native_order_coins_match_total", "Ledgers whose total XRP, the parent's less our burn, matched the header's.", l(&st.coins_match)),
+        ("xrpl_native_order_coins_differ_total", "Ledgers whose total XRP, the parent's less our burn, differed from the header's.", l(&st.coins_differ)),
         ("xrpl_native_order_refused_total", "Ledgers the writer refused because our order differed (mode on).", l(&st.refused)),
         ("xrpl_native_order_retried_total", "Transactions applied after the first pass.", l(&st.retried)),
     ] {
@@ -364,6 +389,14 @@ mod tests {
         assert!(o.starts_with("differs at position 0: ours BBBBBBBBBBBB vs network AAAAAAAAAAAA"), "{o}");
         assert!(o.contains("2 ours, 3 network; 0 failed, 1 left"), "{o}");
         assert_eq!(v.results, vec!["CCCCCCCCCCCC not applied by us, network=tecPATH_DRY".to_string()]);
+    }
+
+    #[test]
+    fn total_xrp_is_the_parents_less_the_burn() {
+        assert_eq!(coins_verdict(1_000, 12, 988), None);
+        let c = coins_verdict(1_000, 10, 988).unwrap();
+        assert_eq!(c, "total XRP: ours 990 (parent 1000 less 10 burned) vs header 988");
+        assert!(coins_verdict(5, 10, 0).unwrap().starts_with("total XRP: ours - "), "a burn above the total never matches");
     }
 
     #[test]

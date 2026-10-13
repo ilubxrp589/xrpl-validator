@@ -282,6 +282,8 @@ pub struct NativeShadow {
     /// Independence 3.3: `XRPL_NATIVE_ORDER` (off, shadow, on), and where its receipts go.
     order_mode: crate::native_order::Mode,
     order_log: std::path::PathBuf,
+    /// The last two ledgers applied and their header's total XRP: the parent's total for task 3.4's check.
+    totals: [(u32, u64); 2],
 }
 
 /// What the writer hands ws-sync for one ledger.
@@ -312,6 +314,7 @@ struct Applied {
     walked: Option<crate::native_order::Walked>,
     /// `XRPL_NATIVE_ORDER=on`: where our order left the network's, a writer refusal.
     order_mm: Option<String>,
+    burned: u64,
 }
 
 /// What every walk over one ledger shares (independence 3.3 walks a ledger twice in shadow).
@@ -331,6 +334,8 @@ struct Run {
     ter_mm: Vec<String>,
     skipped: usize,
     tally: Tally,
+    /// The fees this walk burned: each applied transaction's charge, the Fee capped at what its payer held.
+    burned: u64,
 }
 
 #[derive(Default)]
@@ -538,6 +543,7 @@ impl NativeShadow {
             writer_tripped: false,
             order_mode: crate::native_order::mode(),
             order_log: crate::native_order::log_path(),
+            totals: [(0, 0); 2],
         })
     }
 
@@ -901,13 +907,22 @@ impl NativeShadow {
         if mode == Mode::Off {
             return self.run_ledger(&cx, ordered, false, true);
         }
+        let parent_total = self.totals.iter().find(|(s, _)| *s + 1 == seq && *s != 0).map(|(_, t)| *t);
+        self.totals = [self.totals[1], (seq, total_drops)];
+        let coins = |burned: u64, v: &mut order::Verdict| {
+            if let Some(p) = parent_total {
+                v.coins_checked = true;
+                v.coins = order::coins_verdict(p, burned, total_drops);
+            }
+        };
         let network = order::network_order(ordered, &cx.attribution.skip);
         let network_result = |h: &str| cx.by_hash.get(h).and_then(|t| t["metaData"]["TransactionResult"].as_str()).map(str::to_string);
         let t0 = std::time::Instant::now();
         if mode == Mode::On {
             let mut ours = self.run_ledger(&cx, ordered, true, true);
             let walked = ours.walked.take().unwrap_or_default();
-            let v = order::verdict(&walked, &network, &network_result);
+            let mut v = order::verdict(&walked, &network, &network_result);
+            coins(ours.burned, &mut v);
             let j = order::judge(seq, mode, &v, &walked, None, t0.elapsed().as_millis() as u64);
             if let Some(line) = &j.receipt {
                 order::log_receipt(&self.order_log, line);
@@ -921,10 +936,12 @@ impl NativeShadow {
         let ours_post: HashMap<Hash256, Option<Vec<u8>>> =
             ours.dirty.iter().map(|k| (*k, self.state.state_map.lookup(k).map(|b| b.to_vec()))).collect();
         let walked = ours.walked.unwrap_or_default();
+        let burned = ours.burned;
         self.revert(ours.undo);
         let theirs = self.run_ledger(&cx, ordered, false, true);
         let bytes = bytes_differ(&ours_post, &theirs, |k| self.state.state_map.lookup(k));
-        let v = order::verdict(&walked, &network, &network_result);
+        let mut v = order::verdict(&walked, &network, &network_result);
+        coins(burned, &mut v);
         if let Some(line) = order::judge(seq, mode, &v, &walked, Some(bytes), ms).receipt {
             order::log_receipt(&self.order_log, &line);
         }
@@ -1034,7 +1051,7 @@ impl NativeShadow {
             st.ter_mismatched.fetch_add(t.ter_mismatched, Ordering::Relaxed);
             st.batch_inner_ter_mm.fetch_add(t.batch_inner_ter_mm, Ordering::Relaxed);
         }
-        Applied { dirty: run.dirty, undo: run.undo, ter_mm: run.ter_mm, skipped: run.skipped, walked, order_mm: None }
+        Applied { dirty: run.dirty, undo: run.undo, ter_mm: run.ter_mm, skipped: run.skipped, walked, order_mm: None, burned: run.burned }
     }
 
     /// Apply one transaction to the mirror's current state, writing nothing: its result, its writes, its
@@ -1078,6 +1095,8 @@ impl NativeShadow {
         if let Some(tc) = &tc {
             crate::native_meta::record(seq, &tx_hash, tc, &|h| cx.positions.get(h).cloned());
         }
+        // Task 3.4: what claiming the fee took, read before this transaction's writes land.
+        run.burned += xrpl_ledger::ledger::transactor::fee_charged(txf, &xrpl_ledger::ledger::sandbox::Sandbox::new(&self.state));
         // Threading stamps (PreviousTxnID/PreviousTxnLgrSeq) — the replay
         // applies them after every tx; first live ledger without them read
         // 175 byte-diffs at zero TER mismatches (#106628655).
@@ -2185,6 +2204,7 @@ mod tests {
             writer_tripped: false,
             order_mode: crate::native_order::Mode::Off,
             order_log: log.with_file_name("native_order.jsonl"),
+            totals: [(0, 0); 2],
         }
     }
 
@@ -2500,6 +2520,9 @@ mod tests {
             let (keys, deleted) = meta_of(&overlay);
             let mut sh = shadow(state, seq - 1, &log, &trigger);
             sh.order_mode = mode;
+            // The parent's total XRP: this ledger's plus the one fee it burned (task 3.4's check).
+            let fee: u64 = tx["Fee"].as_str().unwrap().parse().unwrap();
+            sh.totals = [(0, 0), (seq - 1, drops + fee)];
             let p = sh.propose(seq, &parent, pct, drops, &[tx], &keys, &deleted, Some(&overlay)).unwrap();
             assert_eq!(p.refusal, None, "{mode:?}");
             assert_eq!(p.overlay, overlay, "{mode:?}: the network's post-state bytes");
@@ -2531,6 +2554,23 @@ mod tests {
         assert_eq!(got[0]["results"][0], json!("ABABABABABAB not applied by us, network=tefPAST_SEQ"));
         assert_eq!(got[0]["bytes"]["differ"], json!(0), "the copy changes nothing either way");
         assert_eq!(got[0]["passes"], json!([1, 0, 0]));
+    }
+
+    #[test]
+    fn a_total_xrp_that_is_not_the_parents_less_the_burn_is_a_receipt_never_a_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, trigger) = (dir.path().join("receipts.jsonl"), dir.path().join("native_shadow.canary"));
+        let (seq, parent, pct, drops, tx, state, overlay) = payment_ledger();
+        let (keys, deleted) = meta_of(&overlay);
+        let mut sh = shadow(state, seq - 1, &log, &trigger);
+        sh.order_mode = crate::native_order::Mode::On;
+        sh.totals = [(0, 0), (seq - 1, drops + 1_000_000)];
+        let p = sh.propose(seq, &parent, pct, drops, &[tx], &keys, &deleted, None).unwrap();
+        assert_eq!(p.refusal, None, "the total is the header's, not the state's: the state hash judges the writes");
+        let got = lines(&dir.path().join("native_order.jsonl"));
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0]["coins"].as_str().unwrap().starts_with("total XRP: ours "), "{got:?}");
+        assert!(got[0]["order"].is_null());
     }
 
     #[test]
