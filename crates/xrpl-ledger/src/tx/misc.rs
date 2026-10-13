@@ -1586,6 +1586,18 @@ impl Transactor for PermissionedDomainSetTransactor {
         if !sandbox.exists(&keylet::account_root_key(&tx.account)) {
             return TxResult::NoAccount;
         }
+        // rippled PermissionedDomainSet::preclaim (PermissionedDomainSet.cpp:57-62): every
+        // accepted credential's issuer must have an AccountRoot, else tecNO_ISSUER. This runs
+        // ahead of the DomainID checks (missing → tecNO_ENTRY, not the owner → tecNO_PERMISSION,
+        // :64-72), which do_apply below makes in that order.
+        for cred in tx.fields.get("AcceptedCredentials").and_then(|v| v.as_array()).into_iter().flatten() {
+            let Some(issuer) = cred["Credential"].get("Issuer").and_then(decode_account_id) else {
+                return TxResult::Malformed; // rippled's preflight (credentials::checkArray) refuses it
+            };
+            if !sandbox.exists(&keylet::account_root_key(&issuer)) {
+                return TxResult::NoIssuer;
+            }
+        }
         TxResult::Success
     }
 
