@@ -141,6 +141,20 @@ pub fn flow(
     r
 }
 
+/// An amount spelled like `like` (its currency and issuer) carrying `out`'s value: what the flow delivered.
+pub fn delivered_json(like: &serde_json::Value, out: &EitherAmount) -> serde_json::Value {
+    match out {
+        EitherAmount::Xrp(d) => serde_json::Value::String(d.to_string()),
+        EitherAmount::Iou(v) => {
+            let mut a = like.clone();
+            if a.is_object() {
+                a["value"] = serde_json::Value::String(v.to_decimal_string());
+            }
+            a
+        }
+    }
+}
+
 /// `RippleCalc::rippleCalculate` + the flow half of `Payment::doApply`.
 /// Returns the TER and, on success, delivers into `sandbox`.
 pub fn apply_ripple_payment(tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
@@ -183,8 +197,12 @@ pub fn apply_ripple_payment(tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
                 ter = TxResult::PathPartial;
             }
         }
-        // `ctx_.deliver(actualAmountOut)`: the metadata's delivered_amount
-        // — recorded by the transactor from the sandbox's writes.
+        // `ctx_.deliver(actualAmountOut)` (Payment.cpp:664): the metadata's DeliveredAmount.
+        if ter == TxResult::Success {
+            if let Some(amount) = tx.fields.get("Amount") {
+                crate::tx::deliver(delivered_json(amount, &r.out));
+            }
+        }
     }
     // A ter (retry) from the flow is tecPATH_DRY once the ledger closes.
     if matches!(ter, TxResult::NoLine | TxResult::NoRipple | TxResult::NoAccount | TxResult::NoAuth) {

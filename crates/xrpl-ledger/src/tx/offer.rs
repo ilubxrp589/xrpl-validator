@@ -1462,6 +1462,10 @@ pub(crate) fn line_adjust(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, am
                     } else {
                         (hint(&line["HighNode"]), hint(&line["LowNode"]))
                     };
+                    // rippled erases the line it just credited (rippleCreditIOU sets the balance and flags on
+                    // the SLE, then trustDelete), so the metadata's DeletedNode FinalFields carry the zero
+                    // balance (#107541106 F3DC8E3560FD): the deletion takes the updated line, not the old one.
+                    sandbox.write(lkey, serde_json::to_vec(&line).unwrap_or_default());
                     sandbox.delete(lkey);
                     crate::ledger::directory::owner_dir_remove(sandbox, party, &lkey, party_node, false);
                     crate::ledger::directory::owner_dir_remove(

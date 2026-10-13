@@ -799,6 +799,21 @@ impl NativeShadow {
         // entries are therefore skipped in the replay below and their metadata
         // is folded into the outer's, which is where our overlay reports them.
         let attribution = crate::native_apply::batch_attribution(ordered);
+        // Independence 2.7 (XRPL_NATIVE_META=1): build every record of this ledger beside the apply. The
+        // positions and Batch parents are the ledger's own.
+        let meta_on = crate::native_meta::enabled();
+        let positions: HashMap<String, (u64, Option<String>)> = if meta_on {
+            crate::native_meta::begin(seq);
+            ordered
+                .iter()
+                .filter_map(|t| {
+                    let m = &t["metaData"];
+                    Some((t["hash"].as_str()?.to_uppercase(), (m["TransactionIndex"].as_u64()?, m["ParentBatchID"].as_str().map(str::to_uppercase))))
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
         let by_hash: HashMap<String, &Value> = ordered
             .iter()
             .map(|t| (t["hash"].as_str().unwrap_or("").to_uppercase(), *t))
@@ -839,7 +854,13 @@ impl NativeShadow {
             };
             let expected_ter = tx["metaData"]["TransactionResult"].as_str().unwrap_or("?");
             let tx_hash = tx["hash"].as_str().unwrap_or("").to_string();
-            let (our_ter, mut mods) = native_apply_one(&self.state, &txf);
+            let (our_ter, mut mods) = if meta_on {
+                let tc = crate::native_apply::native_apply_one_changes(&self.state, &txf, &tx_hash, seq);
+                crate::native_meta::record(seq, &tx_hash, &tc, &|h| positions.get(h).cloned());
+                (tc.result, tc.mods)
+            } else {
+                native_apply_one(&self.state, &txf)
+            };
             // Threading stamps (PreviousTxnID/PreviousTxnLgrSeq) — the replay
             // applies them after every tx; first live ledger without them read
             // 175 byte-diffs at zero TER mismatches (#106628655).

@@ -432,6 +432,12 @@ impl Transactor for CheckCashTransactor {
                     return TxResult::UnfundedPayment;
                 }
                 ox::move_leg(sandbox, &creator, &tx.account, &leg, deliver);
+                // "Set the DeliveredAmount metadata" — XRP, only with DeliverMin (CheckCash.cpp:361-366).
+                if deliver_min.is_some() {
+                    let (m, e) = deliver;
+                    let drops = if e >= 0 { m.saturating_mul(10u128.saturating_pow(e as u32)) } else { m / 10u128.pow((-e) as u32) };
+                    crate::tx::deliver(serde_json::Value::String(drops.to_string()));
+                }
             } else {
                 let casher = tx.account;
                 let truster = if leg.issuer == casher { creator } else { casher };
@@ -510,6 +516,14 @@ impl Transactor for CheckCashTransactor {
                     if ox::me_cmp(delivered.unwrap_or((0, 0)), dm).is_lt() {
                         return TxResult::PathPartial;
                     }
+                }
+                // "Set the delivered amount metadata in all cases" (CheckCash.cpp:593-595).
+                if let Some(d) = delivered {
+                    crate::tx::deliver(serde_json::json!({
+                        "currency": value_json["currency"].clone(),
+                        "issuer": value_json["issuer"].clone(),
+                        "value": ox::me_to_value_string(d),
+                    }));
                 }
             }
         }

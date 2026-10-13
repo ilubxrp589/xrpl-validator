@@ -91,6 +91,11 @@ pub const SINGLE_ASSET_VAULT: &str =
 pub const LENDING_PROTOCOL: &str =
     "565B90CA1AB2B9D42208ED10884188C64F9E19083DECB9634AAF06EB03299509";
 
+/// XRPFees — on mainnet: fees and reserves in drops (BaseFeeDrops, ReserveBaseDrops, ReserveIncrementDrops)
+/// replace the legacy fee units. Gates SetFee's fields (Change::preclaim, Change::applyFee).
+pub const XRP_FEES: &str =
+    "93E516234E35E08CA689FA33A6D38E103881F8DCB53023F728C307AA89D515A7";
+
 /// rippled `createPseudoAccount`'s sequence rule: 0 once SingleAssetVault or
 /// LendingProtocol is enabled, else the sequence of the ledger being built.
 pub fn pseudo_account_sequence_is_zero(sandbox: &Sandbox) -> bool {

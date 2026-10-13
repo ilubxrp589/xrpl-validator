@@ -41,4 +41,24 @@ pub fn reset_thread_state() {
     offer::thread_state_reset();
     amm_swap::thread_state_reset();
     batch::thread_state_reset();
+    DELIVERED.with(|d| d.borrow_mut().take());
+}
+
+thread_local! {
+    /// Independence task 2.4: the amount this transaction delivered, where rippled records one
+    /// (`ctx_.deliver`, the metadata's DeliveredAmount): a flow Payment or a CheckCash through the flow, a
+    /// Payment's MPT delivery under fixMPTDeliveredAmount when it differs from Amount, AccountDelete's
+    /// remaining balance, and an XRP CheckCash with DeliverMin. In engine JSON (an amount, as the
+    /// transaction spells it). Read on success only: a tec discards rippled's apply view, deliver included.
+    static DELIVERED: std::cell::RefCell<Option<serde_json::Value>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `ApplyContext::deliver`: the amount the metadata's DeliveredAmount will carry. The last call wins.
+pub fn deliver(amount: serde_json::Value) {
+    DELIVERED.with(|d| *d.borrow_mut() = Some(amount));
+}
+
+/// The delivered amount recorded since the last [`reset_thread_state`], taken.
+pub fn take_delivered() -> Option<serde_json::Value> {
+    DELIVERED.with(|d| d.borrow_mut().take())
 }

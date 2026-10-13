@@ -74,9 +74,26 @@ pub enum SandboxEntry {
 /// Reserved key for `aux_get`/`aux_set` (finding 165); no ledger object hashes to it.
 pub const AUX_KEY: Hash256 = Hash256([0xFF; 32]);
 
+/// A finished sandbox, as a transaction's metadata needs it (independence task 2.2).
+#[derive(Debug, Default)]
+pub struct SandboxChanges {
+    /// What [`Sandbox::into_modifications`] returns.
+    pub mods: HashMap<Hash256, SandboxEntry>,
+    /// Each deleted object's content at its deletion, for the keys whose final entry is a deletion.
+    pub deleted_final: HashMap<Hash256, Vec<u8>>,
+    /// Keys the transactor wrote back unchanged (finding 335 drops them from `mods`). rippled still holds
+    /// them in its table, which decides whether a threadOwners root gets FinalFields.
+    pub unchanged: HashSet<Hash256>,
+}
+
 pub struct Sandbox<'a> {
     base: &'a LedgerState,
     modifications: HashMap<Hash256, SandboxEntry>,
+    /// Independence task 2.2: each deleted object's content as this sandbox saw it at the moment of its
+    /// deletion. rippled's DeletedNode FinalFields come from that version, not from the base: an offer
+    /// consumed and then deleted shows the consumed amounts. Kept beside the modifications rather than
+    /// inside `SandboxEntry::Deleted`, so snapshots stay as they are; the last deletion of a key wins.
+    deleted_final: HashMap<Hash256, Vec<u8>>,
 }
 
 impl<'a> Sandbox<'a> {
@@ -85,6 +102,7 @@ impl<'a> Sandbox<'a> {
         Self {
             base,
             modifications: HashMap::new(),
+            deleted_final: HashMap::new(),
         }
     }
 
@@ -165,8 +183,22 @@ impl<'a> Sandbox<'a> {
         {
             self.modifications.remove(&key);
         } else {
+            // Read without the read log: the delete is not a read of the transactor's.
+            let last = match self.modifications.get(&key) {
+                Some(SandboxEntry::Created(d)) | Some(SandboxEntry::Modified(d)) => Some(d.clone()),
+                Some(SandboxEntry::Deleted) => None,
+                None => self.base.read_json(&key),
+            };
+            if let Some(last) = last {
+                self.deleted_final.insert(key, last);
+            }
             self.modifications.insert(key, SandboxEntry::Deleted);
         }
+    }
+
+    /// The content `key` had when this sandbox last deleted it (independence task 2.2).
+    pub fn deleted_content(&self, key: &Hash256) -> Option<&[u8]> {
+        self.deleted_final.get(key).map(Vec::as_slice)
     }
 
     /// Check if a key exists (in modifications or base, and not deleted).
@@ -196,7 +228,23 @@ impl<'a> Sandbox<'a> {
     /// Extract all modifications, consuming the sandbox.
     /// This drops the borrow on base so the caller can then mutate the state.
     pub fn into_modifications(self) -> HashMap<Hash256, SandboxEntry> {
-        let mut m = self.modifications;
+        self.into_changes().mods
+    }
+
+    /// [`Self::into_modifications`], plus what a transaction's metadata also needs (independence task 2.2).
+    pub fn into_changes(self) -> SandboxChanges {
+        let Sandbox { base, modifications, mut deleted_final } = self;
+        let (mods, unchanged) = Self::changed_only(base, modifications);
+        deleted_final.retain(|k, _| matches!(mods.get(k), Some(SandboxEntry::Deleted)));
+        SandboxChanges { mods, deleted_final, unchanged }
+    }
+
+    fn changed_only(
+        base: &LedgerState,
+        modifications: HashMap<Hash256, SandboxEntry>,
+    ) -> (HashMap<Hash256, SandboxEntry>, HashSet<Hash256>) {
+        let mut m = modifications;
+        let mut unchanged = HashSet::new();
         m.remove(&AUX_KEY);
         // Finding 335: rippled's ApplyStateTable emits a modified node only
         // when `*curNode != *origNode` (ApplyStateTable.cpp:155) — a
@@ -205,15 +253,17 @@ impl<'a> Sandbox<'a> {
         // list on its domain: libxrpl's set had the root alone, ours the root
         // and the domain. The comparison is `threading::semantically_equal`,
         // the one the stamp already applies.
-        let base = &self.base;
         m.retain(|k, e| match e {
             SandboxEntry::Modified(b) => match base.read_json(k) {
-                Some(pre) => !super::threading::semantically_equal(&pre, b),
-                None => true,
+                Some(pre) if super::threading::semantically_equal(&pre, b) => {
+                    unchanged.insert(*k);
+                    false
+                }
+                _ => true,
             },
             _ => true,
         });
-        m
+        (m, unchanged)
     }
 
     /// Finding 165 — transaction-scoped bookkeeping that must roll back with
@@ -355,6 +405,56 @@ mod tests {
 
         // Base still has it
         assert!(state.state_map.lookup(&k).is_some());
+    }
+
+    #[test]
+    fn a_deleted_object_keeps_its_content_at_the_deletion() {
+        // Independence task 2.2: a DeletedNode's FinalFields come from the object as the transaction last
+        // left it, so a modify-then-delete keeps the modified bytes, and a plain delete the base bytes.
+        let mut state = test_state();
+        let (kept, changed, fresh) = (key(1), key(2), key(3));
+        state.state_map.insert(kept, br#"{"v":1}"#.to_vec()).unwrap();
+        state.state_map.insert(changed, br#"{"v":2}"#.to_vec()).unwrap();
+        let mut sb = Sandbox::new(&state);
+        sb.delete(kept);
+        sb.write(changed, br#"{"v":20}"#.to_vec());
+        sb.delete(changed);
+        sb.write(fresh, br#"{"v":3}"#.to_vec());
+        sb.delete(fresh); // created and deleted in one apply: nothing at all
+        let SandboxChanges { mods: m, deleted_final: finals, .. } = sb.into_changes();
+        assert!(matches!(m.get(&kept), Some(SandboxEntry::Deleted)));
+        assert!(m.get(&fresh).is_none());
+        assert_eq!(finals.get(&kept).map(Vec::as_slice), Some(&br#"{"v":1}"#[..]));
+        assert_eq!(finals.get(&changed).map(Vec::as_slice), Some(&br#"{"v":20}"#[..]));
+        assert_eq!(finals.len(), 2);
+    }
+
+    #[test]
+    fn a_deletion_undone_by_a_snapshot_leaves_no_final() {
+        let mut state = test_state();
+        let k = key(1);
+        state.state_map.insert(k, br#"{"v":1}"#.to_vec()).unwrap();
+        let mut sb = Sandbox::new(&state);
+        let snap = sb.snapshot();
+        sb.delete(k);
+        sb.restore_snapshot(snap);
+        let SandboxChanges { mods: m, deleted_final: finals, .. } = sb.into_changes();
+        assert!(m.is_empty());
+        assert!(finals.is_empty(), "the key is not deleted, so it has no final content");
+    }
+
+    #[test]
+    fn an_unchanged_write_back_is_reported_beside_the_changes() {
+        let mut state = test_state();
+        let (same, other) = (key(1), key(2));
+        state.state_map.insert(same, br#"{"v":1}"#.to_vec()).unwrap();
+        state.state_map.insert(other, br#"{"v":2}"#.to_vec()).unwrap();
+        let mut sb = Sandbox::new(&state);
+        sb.write(same, br#"{"v":1}"#.to_vec());
+        sb.write(other, br#"{"v":3}"#.to_vec());
+        let c = sb.into_changes();
+        assert!(!c.mods.contains_key(&same) && c.mods.contains_key(&other));
+        assert_eq!(c.unchanged.into_iter().collect::<Vec<_>>(), vec![same]);
     }
 
     #[test]

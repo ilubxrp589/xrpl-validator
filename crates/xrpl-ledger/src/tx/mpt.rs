@@ -430,11 +430,22 @@ pub fn apply_mpt_payment(
         }
     };
 
+    // fixMPTDeliveredAmount (Payment.cpp:741-746): a delivery other than Amount (partial, or a transfer fee
+    // the SendMax covers) is the metadata's DeliveredAmount.
+    if res == TxResult::Success && deliver != value && crate::ledger::amendments::enabled(sandbox, FIX_MPT_DELIVERED_AMOUNT) {
+        if let Some(mut amount) = tx.fields.get("Amount").cloned() {
+            amount["value"] = serde_json::Value::String(deliver.to_string());
+            crate::tx::deliver(amount);
+        }
+    }
     match res {
         TxResult::InsufficientFunds | TxResult::PathDry => TxResult::PathPartial,
         other => other,
     }
 }
+
+/// fixMPTDeliveredAmount (enabled on mainnet).
+const FIX_MPT_DELIVERED_AMOUNT: &str = "AB8D932A5F338903FE5BCBD80B611FFED70839ABA3170E9CE01D947C0EDEDCF2";
 
 // ---------------------------------------------------------------------------
 // MPT issuance lifecycle — MPTokenIssuanceCreate / Destroy / Set, and

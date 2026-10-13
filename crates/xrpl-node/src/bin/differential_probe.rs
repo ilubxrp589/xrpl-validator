@@ -2640,9 +2640,11 @@ fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<Hash
         }
         return (preflight.code_str().to_string(), HashMap::new());
     }
-    // Phase 2+3+4: preclaim → common → do_apply
+    // Phase 2+3+4: preclaim → common → do_apply. rippled's checkFee runs ahead of the
+    // transactor's own preclaim (invokePreclaim, applySteps.cpp:204), as in native_apply.rs.
     let mut sb = Sandbox::new(state);
-    let preclaim = transactor.preclaim(tx, &sb);
+    let fee = xrpl_ledger::ledger::transactor::check_fee(tx, &sb);
+    let preclaim = if fee.is_success() { transactor.preclaim(tx, &sb) } else { fee };
     if !preclaim.is_success() && !preclaim.is_claimed() {
         return (preclaim.code_str().to_string(), HashMap::new());
     }
@@ -2688,6 +2690,84 @@ fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<Hash
         (applied.code_str().to_string(), sb.into_modifications())
     } else {
         (applied.code_str().to_string(), HashMap::new())
+    }
+}
+
+/// Independence 3.2(b): apply the ledger's set (every entry but the Batch inners, which apply inside their
+/// outer) in rippled's canonical order and passes, judging each attempt as BuildLedger's applyTransactions
+/// does (tes Success; ter Retry; tef/tem/tel Fail; a tec Retry while a retry is certain unless doApply
+/// returned one of ALWAYS_CLAIMED, else claimed), and compare the order that results, and each result, with
+/// mainnet's. Threading is not stamped: it decides no result.
+fn run_passes(
+    pre: &LedgerState,
+    order: &[String],
+    tx_map: &serde_json::Map<String, Value>,
+    net_map: &serde_json::Map<String, Value>,
+    batch_skip: &HashSet<String>,
+    seq: u32,
+) {
+    let tx_json = |h: &str| tx_map.get(h).or_else(|| tx_map.get(&h.to_lowercase()));
+    let net_ter = |h: &str| net_map.get(h).or_else(|| net_map.get(&h.to_lowercase())).and_then(|t| t["ter"].as_str()).map(str::to_string);
+    use xrpl_ledger::ledger::close::{apply_in_passes, canonical_order, consensus_salt, ApplyOutcome, SeqProxy, TransactionEntry, ALWAYS_CLAIMED};
+    let mainnet: Vec<String> = order.iter().filter(|h| !batch_skip.contains(&h.to_uppercase())).map(|h| h.to_uppercase()).collect();
+    let mut entries: Vec<TransactionEntry> = Vec::new();
+    for h in &mainnet {
+        let Some(t) = tx_json(h) else { continue };
+        let Ok(hb) = hex::decode(h) else { continue };
+        let Ok(hash) = <[u8; 32]>::try_from(hb.as_slice()) else { continue };
+        let account = t["Account"].as_str().and_then(xrpl_node::native_apply::decode_address).unwrap_or([0u8; 20]);
+        let sequence = t["Sequence"].as_u64().unwrap_or(0) as u32;
+        let ticket = t["TicketSequence"].as_u64().map(|v| v as u32);
+        entries.push(TransactionEntry { hash: Hash256(hash), account, seq_proxy: SeqProxy::of(sequence, ticket), blob: Vec::new() });
+    }
+    let salt = consensus_salt(&entries.iter().map(|e| e.hash).collect::<Vec<_>>());
+    canonical_order(&mut entries, &salt);
+    let mut st = pre.clone();
+    let mut ours: HashMap<String, String> = HashMap::new();
+    let passes = apply_in_passes(entries, |e, certain_retry| {
+        let h = hex::encode_upper(e.hash.0);
+        let Some(mut txf) = tx_json(&h).and_then(build_txfields) else { return ApplyOutcome::Fail };
+        if txf.fields.get("hash").is_none() {
+            txf.fields["hash"] = Value::String(h.clone()); // the AccountTxnID stamp reads it
+        }
+        let (code, mods, from_do_apply) = xrpl_node::native_apply::native_apply_one_staged(&st, &txf);
+        let outcome = match &code[..3.min(code.len())] {
+            "tes" => ApplyOutcome::Success,
+            "ter" => ApplyOutcome::Retry,
+            "tec" if certain_retry && !(from_do_apply && ALWAYS_CLAIMED.contains(&code.as_str())) => ApplyOutcome::Retry,
+            "tec" => ApplyOutcome::Success,
+            _ => ApplyOutcome::Fail,
+        };
+        if outcome == ApplyOutcome::Success {
+            let _ = apply_modifications(&mut st, mods);
+            ours.insert(h, code);
+        }
+        outcome
+    });
+    let got: Vec<String> = passes.applied.iter().map(|(_, e)| hex::encode_upper(e.hash.0)).collect();
+    let per_pass: Vec<usize> = (0..xrpl_ledger::ledger::close::LEDGER_TOTAL_PASSES).map(|p| passes.applied.iter().filter(|(q, _)| *q == p).count()).collect();
+    let first_order = got.iter().zip(&mainnet).position(|(a, b)| a != b).or(if got.len() != mainnet.len() { Some(got.len().min(mainnet.len())) } else { None });
+    let mut ter_mm: Vec<String> = Vec::new();
+    for h in &mainnet {
+        let theirs = net_ter(h).unwrap_or_default();
+        let mine = ours.get(h).cloned().unwrap_or_else(|| "(not applied)".into());
+        if mine != theirs {
+            ter_mm.push(format!("{} ours={mine} mainnet={theirs}", &h[..12]));
+        }
+    }
+    match first_order {
+        None if ter_mm.is_empty() => eprintln!("PASSES #{seq}: order MATCH, results MATCH ({} txs; per pass {per_pass:?})", got.len()),
+        None => eprintln!("PASSES #{seq}: order MATCH, {} result(s) differ: {}", ter_mm.len(), ter_mm.iter().take(3).cloned().collect::<Vec<_>>().join("; ")),
+        Some(i) => eprintln!(
+            "PASSES #{seq}: order DIFFERS at position {i} (ours {} vs mainnet {}; {} txs ours, {} mainnet; per pass {per_pass:?}; failed {}, left {}); {} result(s) differ",
+            got.get(i).map(|h| &h[..12]).unwrap_or("-"),
+            mainnet.get(i).map(|h| &h[..12]).unwrap_or("-"),
+            got.len(),
+            mainnet.len(),
+            passes.failed.len(),
+            passes.left.len(),
+            ter_mm.len()
+        ),
     }
 }
 
@@ -2926,6 +3006,16 @@ fn run() -> i32 {
         Some(s) => s as u32,
         None => { eprintln!("missing ledger_seq"); return 2; }
     };
+    // Independence 2.6: mainnet's metadata for this ledger, when DX_META names the s2 answer-key store.
+    let meta_key = std::env::var("DX_META").ok().and_then(|d| {
+        let m = xrpl_node::meta_check::load_ledger(&d, u64::from(seq));
+        if m.is_none() {
+            eprintln!("DX_META: no answer key for #{seq} in {d}");
+        }
+        m
+    });
+    let mut meta_tally = xrpl_node::meta_check::Tally::default();
+    let mut our_meta_bytes: HashMap<String, Vec<u8>> = HashMap::new();
     // Every hydration targets seq-1, so the node is chosen once, per run.
     let rpc_url = xrpl_node::rpc_select::select_rpc(rpc_pref, seq - 1);
     let txmap = match exp["txs"].as_object() {
@@ -3155,6 +3245,13 @@ fn run() -> i32 {
     }
     eprintln!("Loaded {} pre-state objects.", obj_seen.len());
 
+    // Independence 3.2(b) (DX_PASSES): the ledger rebuilt from its set alone, on a copy of the pre-state:
+    // rippled's canonical order (3.1) and apply passes (3.2), each attempt judged by the engine's own result,
+    // against mainnet's positions and results.
+    if std::env::var("DX_PASSES").is_ok() {
+        run_passes(&state, &order, txjson_map, txmap, &batch_skip, seq);
+    }
+
     // Per-tx native replay + compare to mainnet.
     let mut agg: HashMap<String, TypeAgg> = HashMap::new();
     let mut per_tx: Vec<Value> = Vec::new();
@@ -3308,6 +3405,44 @@ fn run() -> i32 {
             }
         }
         fuzz_idx += 1;
+        // Independence 2.6 (DX_META=<s2 store>): this transaction's metadata from our engine's own changes,
+        // byte for byte against mainnet's; a Batch outer's own, and each inner mainnet filed under it.
+        if let Some(key) = meta_key.as_ref() {
+            if let Some(theirs) = key.get(&h.to_uppercase()) {
+                use xrpl_node::meta_check::{compare_bytes, encode, inner_meta, our_meta, tx_index};
+                // The fixture's tx_json carries no "hash"; the live feed's does, and the AccountTxnID stamp reads
+                // it (stamp_account_txn_id).
+                let mut txf_m = txf.clone();
+                if txf_m.fields.get("hash").is_none() {
+                    txf_m.fields["hash"] = Value::String(h.to_uppercase());
+                }
+                let tc = xrpl_node::native_apply::native_apply_one_changes(&state, &txf_m, h, seq as u32);
+                let mut check = |ours: Value, id: &str, theirs: &[u8]| -> Result<(), String> {
+                    let b = encode(&ours)?;
+                    let r = compare_bytes(&b, theirs);
+                    our_meta_bytes.insert(id.to_uppercase(), b);
+                    r
+                };
+                let r = check(our_meta(&tc, tx_index(theirs).unwrap_or(0)), h, theirs);
+                meta_tally.add(&tx_type, r.is_ok());
+                if let Err(d) = r {
+                    eprintln!("META-DIFF #{seq} {} {tx_type}: {d}", &h[..12.min(h.len())]);
+                }
+                for inner in &tc.inners {
+                    let Some(theirs) = key.get(&inner.id.to_uppercase()) else { continue };
+                    // Filed under another outer (finding 417): not this outer's record.
+                    let parent = xrpl_core::codec::decode::decode_transaction_binary(theirs).ok().and_then(|m| m["ParentBatchID"].as_str().map(str::to_uppercase));
+                    if parent.as_deref() != Some(h.to_uppercase().as_str()) {
+                        continue;
+                    }
+                    let r = check(inner_meta(inner, tx_index(theirs).unwrap_or(0), h), &inner.id, theirs);
+                    meta_tally.add("BatchInner", r.is_ok());
+                    if let Err(d) = r {
+                        eprintln!("META-DIFF #{seq} {} BatchInner of {}: {d}", &inner.id[..12.min(inner.id.len())], &h[..12.min(h.len())]);
+                    }
+                }
+            }
+        }
         let (our_ter, mut mods) = native_apply_one(&state, &txf);
         if dx_armed {
             if let Ok(list) = std::env::var("DX_REPLAY_SET") {
@@ -3878,6 +4013,14 @@ fn run() -> i32 {
         }
     }
     eprintln!("SUMMARY: {total_matched}/{total_attempted} attempted txs MATCH mainnet (native engine)");
+    if let Some(key) = meta_key.as_ref() {
+        eprintln!("{}", meta_tally.summary());
+        match key.our_tree_matches(&our_meta_bytes) {
+            Some(true) => eprintln!("TXTREE #{seq}: our transaction tree root == the header's ({} transactions, every record ours)", key.blobs.len()),
+            Some(false) => eprintln!("TXTREE #{seq}: our transaction tree root DIFFERS from the header's"),
+            None => eprintln!("TXTREE #{seq}: not built: {} of {} records are ours", our_meta_bytes.len(), key.blobs.len()),
+        }
+    }
     let failed = RPC_FAILED.load(std::sync::atomic::Ordering::Relaxed);
     let code = exit_code(total_attempted, failed, any_diverge);
     if code == 3 {

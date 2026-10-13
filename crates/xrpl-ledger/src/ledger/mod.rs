@@ -9,8 +9,10 @@ pub mod amendments;
 pub mod apply;
 pub mod canon;
 pub mod close;
+pub mod close_time;
 pub mod directory;
 pub mod fees;
+pub mod field_meta;
 pub mod header;
 pub mod keylet;
 pub mod nftpage;
@@ -19,6 +21,7 @@ pub mod sandbox;
 pub mod state;
 pub mod threading;
 pub mod transactor;
+pub mod tx_meta;
 
 pub use header::LedgerHeader;
 pub use objects::{LedgerEntryType, LedgerObject};

@@ -15,6 +15,8 @@
 //! - **Validator** — full consensus participation with validation signing
 
 pub mod native_apply;
+pub mod meta_check;
+pub mod native_meta;
 #[cfg(feature = "ffi")]
 pub mod native_shadow;
 pub mod amendments;
@@ -26,6 +28,7 @@ pub mod startup;
 pub mod config;
 pub mod consensus;
 pub mod consensus_engine;
+pub mod consensus_record;
 pub mod engine;
 pub mod history;
 pub mod incremental_sync;

@@ -109,6 +109,9 @@ struct Cfg {
     upstream: String,
     receipts: String,
     writer_log: String,
+    /// Writer events whose cause has a shipped fix: `{"<seq>": "F419, live since cycle 170"}`, kept by the
+    /// maintainers beside the writer log (receipts_fixed.json).
+    fixed_log: String,
     interval: Duration,
 }
 
@@ -132,11 +135,18 @@ impl Cfg {
                     .map(|d| d.join("native_writer.jsonl").display().to_string())
                     .unwrap_or_else(|| "native_writer.jsonl".to_string())
             });
+        let fixed_log = env("FIXED_RECEIPTS").unwrap_or_else(|| {
+            std::path::Path::new(&writer_log)
+                .parent()
+                .map(|d| d.join("receipts_fixed.json").display().to_string())
+                .unwrap_or_else(|| "receipts_fixed.json".to_string())
+        });
         Cfg {
             base: env("VALIDATOR_BASE").unwrap_or_else(|| "http://localhost:3777".to_string()),
             upstream,
             receipts,
             writer_log,
+            fixed_log,
             interval: Duration::from_millis(250),
         }
     }
@@ -196,7 +206,8 @@ struct Snap {
     flow_engine: Option<String>,
     receipts: Option<(usize, usize)>, // (receipts, canary lines) this soak
     receipts_age_h: Option<f64>,
-    last_decision: Option<String>,
+    /// The writer's last refusal or failure: when this screen saw it, its ledger, the text, and its fix if one shipped.
+    last_decision: Option<(SystemTime, u64, String, Option<String>)>,
     ter_miss_top: Vec<(String, usize)>,
     amendments: Vec<(String, i64, bool)>, // (name, seconds to activation, supported upstream)
     at: Option<SystemTime>,
@@ -312,6 +323,18 @@ struct Cell {
     redone: bool,
     /// The final hash check of the ledger failed (a rolled-back mismatch that never matched).
     missed: bool,
+}
+
+/// "3 min", "5 h 12 min", "2 d 15 h".
+fn ago(secs: u64) -> String {
+    let (d, h, m) = (secs / 86_400, (secs / 3600) % 24, (secs / 60) % 60);
+    if d > 0 {
+        format!("{d} d {h} h")
+    } else if h > 0 {
+        format!("{h} h {m} min")
+    } else {
+        format!("{m} min")
+    }
 }
 
 fn hhmmss(t: SystemTime) -> String {
@@ -484,7 +507,9 @@ fn collect(cfg: Arc<Cfg>, shared: Arc<Mutex<Shared>>, frames_left: Option<Arc<Mu
     let mut receipts_tail = Tail::new(&cfg.receipts);
     let mut writer_tail = Tail::new(&cfg.writer_log);
     let mut prev: Option<Snap> = None;
-    let mut last_decision: Option<String> = None;
+    let mut last_decision: Option<(SystemTime, u64, String, Option<String>)> = None;
+    let mut fixed: BTreeMap<u64, String> = BTreeMap::new();
+    let mut fixed_sig: Option<SystemTime> = None;
     let mut amendments: Vec<(String, i64, bool)> = Vec::new();
     let mut amend_at: Option<Instant> = None;
     // Slower things than the validator's own counters: the upstream (1 s), the process scan (5 s), the receipts
@@ -672,8 +697,22 @@ fn collect(cfg: Arc<Cfg>, shared: Arc<Mutex<Shared>>, frames_left: Option<Arc<Mu
             } else {
                 (Tone::Info, format!("#{seq}: {}", ln.chars().take(100).collect::<String>()))
             };
-            last_decision = Some(format!("{} {}", hhmmss(SystemTime::now()), text));
+            last_decision = Some((SystemTime::now(), seq, text.clone(), None));
             push_ev(&mut g, tone, text);
+        }
+        // The fixes file, re-read when it changes: a refusal whose cause has shipped says so.
+        let sig = fs::metadata(&cfg.fixed_log).and_then(|m| m.modified()).ok();
+        if sig != fixed_sig {
+            fixed_sig = sig;
+            fixed = fs::read_to_string(&cfg.fixed_log)
+                .ok()
+                .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                .and_then(|v| v.as_object().cloned())
+                .map(|o| o.into_iter().filter_map(|(k, v)| Some((k.parse().ok()?, v.as_str()?.to_string()))).collect())
+                .unwrap_or_default();
+        }
+        if let Some(d) = last_decision.as_mut() {
+            d.3 = fixed.get(&d.1).cloned();
         }
         sn.last_decision = last_decision.clone();
 
@@ -1370,7 +1409,16 @@ fn draw_rust(f: &mut Frame, r: Rect, g: &Shared) {
     lines.push(Line::from(vec![
         label("last"),
         match &sn.last_decision {
-            Some(d) => ink(d.clone()),
+            // A refusal whose cause has shipped reads as settled, with its age: an old, fixed event must not
+            // look like a live problem (James, 2026-10-13).
+            Some((at, seq, _, Some(fix))) => {
+                let age = SystemTime::now().duration_since(*at).map(|d| d.as_secs()).unwrap_or(0);
+                sp(format!("{} #{seq} — FIXED: {fix} · {} ago", hhmmss(*at), ago(age)), p.good)
+            }
+            Some((at, _, text, None)) => {
+                let age = SystemTime::now().duration_since(*at).map(|d| d.as_secs()).unwrap_or(0);
+                ink(format!("{} {text} · {} ago", hhmmss(*at), ago(age)))
+            }
             None => dim("no refusals or failures since this screen started"),
         },
     ]));

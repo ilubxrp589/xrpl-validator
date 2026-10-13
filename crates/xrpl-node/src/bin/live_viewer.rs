@@ -987,6 +987,10 @@ async fn main() {
     // RPCA consensus engine
     let consensus = Arc::new(Mutex::new(xrpl_node::consensus_engine::ConsensusEngine::new()));
 
+    // Independence 5.2(a): the shadow recorder for consensus rounds. It's off unless
+    // XRPL_CONSENSUS_RECORD=1, and it only observes.
+    xrpl_node::consensus_record::init();
+
     // Fetch UNL (trusted validators) from published sources — required for consensus threshold math
     {
         let consensus_for_unl = consensus.clone();
@@ -998,6 +1002,7 @@ async fn main() {
             loop {
                 match xrpl_node::unl_fetch::fetch_default_unl_verified().await {
                     Ok(entries) => {
+                        xrpl_node::consensus_record::record_unl(&entries);
                         let mut eng = consensus_for_unl.lock();
                         // TMProposeSet messages are signed with EPHEMERAL signing keys, not master keys.
                         // So we trust the signing keys in our UNL (extracted from each validator's manifest).
@@ -1638,6 +1643,7 @@ async fn main() {
                     let mut body = xrpl_node::rpc::metrics::render_prometheus(&snap);
                     body.push_str(&xrpl_node::consensus::sig_verify::metrics_text());
                     body.push_str(&xrpl_node::amendment_guard::metrics_text());
+                    body.push_str(&xrpl_node::native_meta::metrics_text());
                     (
                         axum::http::StatusCode::OK,
                         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
@@ -1771,6 +1777,8 @@ async fn main() {
                     {
                         json["ffi_verifier"] = serde_json::json!({"enabled": false, "note": "build with --features ffi"});
                     }
+                    // Independence 2.7: our own transaction records, in shadow.
+                    json["native_meta"] = xrpl_node::native_meta::json();
                     // Stage 4 Phase A: native-engine shadow counters.
                     #[cfg(feature = "ffi")]
                     {
@@ -2212,6 +2220,15 @@ async fn run_peer_connection(
                                     );
                                 }
                             }
+                            if outcome == SigOutcome::Valid {
+                                xrpl_node::consensus_record::record_proposal(
+                                    &p.node_pub_key,
+                                    &p.previousledger,
+                                    p.propose_seq,
+                                    p.close_time,
+                                    &p.current_tx_hash,
+                                );
+                            }
                             if outcome != SigOutcome::Invalid || !sig_verify::enforce() {
                                 let _ = proposal_tx.send(PeerProposal {
                                     validator_key: p.node_pub_key.clone(),
@@ -2241,6 +2258,9 @@ async fn run_peer_connection(
                                     v.validation.len()
                                 );
                             }
+                        }
+                        if outcome == SigOutcome::Valid {
+                            xrpl_node::consensus_record::record_validation(&v.validation);
                         }
                     }
 

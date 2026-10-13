@@ -112,14 +112,38 @@ Step 2's receipts and the live-edge change (5.4) are where it can stretch.
 
 | # | Task | Size |
 |---|---|---|
-| 2.1 | Field metadata table | S–M |
-| 2.2 | Before-and-after capture per transaction | S–M |
-| 2.3 | The AffectedNodes builder | M |
-| 2.4 | Result fields: result, position, DeliveredAmount, ParentBatchID | M |
-| 2.5 | Binary encoding of the record | S |
-| 2.6 | Probe comparison over the fixture library | M |
-| 2.7 | Shadow leg on m3060 (`XRPL_NATIVE_META=1`) | M |
+| 2.1 | Field metadata table (**done 12 Oct**) | S–M |
+| 2.2 | Before-and-after capture per transaction (**done 12 Oct**) | S–M |
+| 2.3 | The AffectedNodes builder (**done 12 Oct**) | M |
+| 2.4 | Result fields: result, position, DeliveredAmount, ParentBatchID (**done 12 Oct**) | M |
+| 2.5 | Binary encoding of the record (**done 12 Oct**: the codec already knew the fields) | S |
+| 2.6 | Probe comparison over the fixture library (**built 12 Oct**; the sweep is running) | M |
+| 2.7 | Shadow leg on m3060 (`XRPL_NATIVE_META=1`) (**built 12 Oct**, ships in cycle 172) | M |
 | 2.8 | Drill the receipts | ongoing |
+
+**Status, 12 October (built with 5b; on branches, shipping in cycle 172):**
+- **2.1:** `ledger/field_meta`, generated from rippled 3.4.1 (349 fields). Mainnet's records never break it: 70,129
+  transactions, 455 ledgers.
+- **2.2 + 2.4:** `ledger/tx_meta` NodeChange (before, after, written, thread_from), `native_apply_one_changes`.
+  DeliveredAmount is filled where rippled calls `ctx_.deliver`. Batch: the outer's own record, plus each inner's
+  with ParentBatchID.
+- **2.3:** `tx_meta::affected_nodes`. The round trip over 391 ledgers (58,939 transactions) reproduces mainnet's
+  sections exactly.
+- **2.5:** the existing codec encodes the records.
+- **2.6:** `differential_probe` with `DX_META=<store>` compares each record byte for byte, and TXTREE builds the
+  transaction tree from our records. The first ledgers match exactly: #107541029/030/031, #107541065/106/125/185,
+  and the four system-transaction ledgers.
+- **2.7:** `native_meta`, switched OFF by default.
+- **Receipt so far:** one class, a deleted trust line recorded with its old balance. Fixed: write the updated
+  line, then delete it.
+- **3.1 + 3.2:** `ledger::close` holds CanonicalTXSet and apply_in_passes. `DX_PASSES` rebuilds a ledger from its
+  set alone, with the engine's own result per attempt. The order and every result matched mainnet on every ledger
+  run so far, the 1,015-transaction #107541106 included. Offline, the salt is `compute_tx_set_root`: 391/391 ledgers.
+- **3.4:** total_coins(N) == total_coins(N−1) − fees on 391/391 ledgers. The capped-fee (tecINSUFF_FEE) path is
+  still to be checked before 3.3.
+- **3.5:** the system transactions' records and order match on 4 mainnet ledgers. Change::preflight/preclaim
+  checks are ported; they can't change today's results. The SDK codec's empty AccountID (UNLModify) is fixed on
+  an SDK branch.
 
 **2.1 Field metadata table.**
 - **What:**
@@ -186,11 +210,11 @@ Step 2's receipts and the live-edge change (5.4) are where it can stretch.
 
 | # | Task | Size |
 |---|---|---|
-| 3.1 | Canonical order | S–M |
-| 3.2 | The retry passes | M |
+| 3.1 | Canonical order (**done 12 Oct**) | S–M |
+| 3.2 | The retry passes (**done 12 Oct**, offline) | M |
 | 3.3 | Writer uses our order and results (shadow, then on) | S–M |
-| 3.4 | Fees burned and total XRP | S |
-| 3.5 | System transactions taken from the set | S |
+| 3.4 | Fees burned and total XRP (**done 12 Oct**, offline) | S |
+| 3.5 | System transactions taken from the set (**done 12 Oct**, offline) | S |
 
 **3.1 Canonical order.**
 - **What:** port rippled's sort:
@@ -277,7 +301,7 @@ Step 2's receipts and the live-edge change (5.4) are where it can stretch.
 |---|---|---|
 | 5.1 | Audit the March consensus code | S–M |
 | 5.2 | Agreed-set tracker | M |
-| 5.3 | Close time: the answer key and the code | M |
+| 5.3 | Close time: the answer key and the code (**in progress 12 Oct**) | M |
 | 5.4 | Build in the round | **M–L** |
 | 5.5 | Shadow gauge | S |
 | 5.6 | 5a: verify, then sign, with stop-on-doubt and a breaker (**tap**) | M |
