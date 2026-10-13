@@ -2279,7 +2279,13 @@ fn load_amm_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_ind
     let tt = txj["TransactionType"].as_str();
     if !matches!(
         tt,
-        Some("AMMDeposit") | Some("AMMWithdraw") | Some("AMMCreate") | Some("AMMVote") | Some("AMMDelete") | Some("AMMClawback")
+        Some("AMMDeposit")
+            | Some("AMMWithdraw")
+            | Some("AMMCreate")
+            | Some("AMMVote")
+            | Some("AMMDelete")
+            | Some("AMMClawback")
+            | Some("AMMBid") // its block below (the LP line, every AuthAccounts root) never ran without this
     ) {
         return;
     }

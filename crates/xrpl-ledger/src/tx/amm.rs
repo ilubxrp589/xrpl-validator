@@ -3172,6 +3172,18 @@ impl Transactor for AMMBidTransactor {
         if lpt_amm.0 == 0 {
             return TxResult::AmmEmpty;
         }
+        // AMMBid.cpp:118-127, next: every AuthAccounts[].Account must have an AccountRoot,
+        // else terNO_ACCOUNT. We had no such check; the 3.3 NoAccount audit found it (10-13).
+        // An account that doesn't decode is rippled's preflight temMALFORMED.
+        for e in tx.fields.get("AuthAccounts").and_then(|v| v.as_array()).into_iter().flatten() {
+            let Some(a) = e.get("AuthAccount").and_then(|o| o.get("Account")).and_then(|v| v.as_str()).and_then(ox::decode20)
+            else {
+                return TxResult::Malformed;
+            };
+            if !sandbox.exists(&keylet::account_root_key(&a)) {
+                return TxResult::NoAccount;
+            }
+        }
         let lkey = keylet::ripple_state_key(&tx.account, &lp_leg.issuer, &lp_leg.cur);
         let lp_tokens = match ox::json_at(sandbox, &lkey) {
             Some(l) => {
