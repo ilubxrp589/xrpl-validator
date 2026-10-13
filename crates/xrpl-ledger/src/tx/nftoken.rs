@@ -273,15 +273,30 @@ impl Transactor for NFTokenMintTransactor {
                     return TxResult::Expired;
                 }
             }
-            if let Some(dest) = tx.fields.get("Destination").and_then(decode_account_id) {
-                if let Some(d) = sandbox
-                    .read(&keylet::account_root_key(&dest))
-                    .and_then(|v| serde_json::from_slice::<serde_json::Value>(&v).ok())
-                {
-                    if d["Flags"].as_u64().unwrap_or(0) & 0x0400_0000 != 0 {
-                        return TxResult::NoPermission; // lsfDisallowIncomingNFTokenOffer
-                    }
-                }
+            // Then the whole of `nft::tokenOfferCreatePreclaim` (NFTokenMint.cpp:207-217), as
+            // NFTokenCreateOffer runs it, for the token being minted:
+            // - its issuer: `Issuer`, else the minter;
+            // - its flags: the transaction's low 16 bits, `extractNFTokenFlagsFromTxFlags`;
+            // - its TransferFee;
+            // - a SELL offer, with no Owner.
+            // A missing Destination is tecNO_DST here; we used to skip it and mint. An IOU price
+            // runs the issuer, trust-line and freeze checks too.
+            let nft_issuer = tx.fields.get("Issuer").and_then(decode_account_id).unwrap_or(tx.account);
+            let nft_flags = (tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & 0xFFFF) as u16;
+            let xfer_fee = tx.fields.get("TransferFee").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+            let offer = token_offer_create_preclaim(
+                sandbox,
+                &tx.account,
+                &nft_issuer,
+                &tx.fields["Amount"],
+                tx.fields.get("Destination").and_then(decode_account_id),
+                nft_flags,
+                xfer_fee,
+                None,
+                true,
+            );
+            if !offer.is_success() {
+                return offer;
             }
         }
         TxResult::Success
@@ -542,6 +557,103 @@ impl Transactor for NFTokenBurnTransactor {
 
 pub struct NFTokenCreateOfferTransactor;
 
+/// rippled `nft::tokenOfferCreatePreclaim` (NFTokenHelpers.cpp:819-925 in 3.4.1): the checks an
+/// NFT offer must pass, in rippled's order. It has two callers:
+/// - **NFTokenCreateOffer's preclaim:** the token's issuer, flags and transfer fee, and the tx's
+///   Destination, Owner and sell flag.
+/// - **NFTokenMint's preclaim when it carries `Amount`** (NFTokenMint.cpp:207-217): the token
+///   being minted, as a sell offer with no Owner.
+///
+/// Finding 235 (#106850559 CF28C7C9E016): rwM46RCWpQ bids 10 NOIR.rhdbs6zj for an NFT it does not
+/// own while its NOIR line holds 0.
+/// - Mainnet refuses with tecUNFUNDED_OFFER: `accountFunds(acct, amount, ZeroIfFrozen).signum()
+///   <= 0`. We had rested the offer (offer, directory page, OwnerCount).
+/// - Any POSITIVE balance passes; the amount itself is not required. The IOU's own issuer always
+///   passes, and XRP counts what sits above the reserve.
+#[allow(clippy::too_many_arguments)]
+fn token_offer_create_preclaim(
+    sandbox: &Sandbox,
+    acct: &[u8; 20],
+    nft_issuer: &[u8; 20],
+    amount: &serde_json::Value,
+    dest: Option<[u8; 20]>,
+    nft_flags: u16,
+    xfer_fee: u16,
+    owner: Option<[u8; 20]>,
+    is_sell: bool,
+) -> TxResult {
+    use crate::tx::offer as ox;
+    const K_FLAG_CREATE_TRUST_LINES: u16 = 0x0004;
+    let (acct, nft_issuer) = (*acct, *nft_issuer);
+    let Some(leg) = ox::leg_of(amount) else {
+        return TxResult::Malformed;
+    };
+    // A transfer-fee NFT priced in an IOU needs its issuer able to take
+    // the royalty: the issuer must exist, hold a line for that IOU unless
+    // it issues it (NFTokenMintOffer), and not be frozen on it.
+    if nft_flags & K_FLAG_CREATE_TRUST_LINES == 0 && !leg.xrp && xfer_fee != 0 {
+        if !sandbox.exists(&keylet::account_root_key(&nft_issuer)) {
+            return TxResult::NoIssuer;
+        }
+        if nft_issuer != leg.issuer
+            && !sandbox.exists(&keylet::ripple_state_key(&nft_issuer, &leg.issuer, &leg.cur))
+        {
+            return TxResult::NoLine;
+        }
+        if let Some(TxResult::Frozen) = ox::frozen_ter(sandbox, &leg, &nft_issuer) {
+            return TxResult::Frozen;
+        }
+    }
+    // (`tefNFTOKEN_IS_NOT_TRANSFERABLE` for a non-transferable token offered
+    // by a stranger is a tef — it never reaches a validated ledger.)
+    // NFTokenHelpers.cpp:866: `isFrozen(view, acct, currency, issuer)` reads
+    // the ISSUER's lsfGlobalFreeze even when acct is the issuer itself —
+    // tecFROZEN on an issuer offering in its own frozen IOU. fixCleanup3_4_0
+    // exempts the issuer (acctIsIouIssuer).
+    if !leg.xrp
+        && acct == leg.issuer
+        && !crate::ledger::amendments::fix_cleanup_3_4_0(sandbox)
+        && ox::json_at(sandbox, &keylet::account_root_key(&leg.issuer))
+            .is_some_and(|a| a["Flags"].as_u64().unwrap_or(0) & 0x0040_0000 != 0)
+    {
+        return TxResult::Frozen;
+    }
+    if let Some(TxResult::Frozen) = ox::frozen_ter(sandbox, &leg, &acct) {
+        return TxResult::Frozen;
+    }
+    if !is_sell && ox::me_is_zero(ox::available(sandbox, &acct, &leg)) {
+        return TxResult::UnfundedOffer;
+    }
+    if let Some(dest) = dest {
+        match disallows_incoming_nft_offer(sandbox, &dest) {
+            None => return TxResult::NoDst,
+            Some(true) => return TxResult::NoPermission,
+            Some(false) => {}
+        }
+    }
+    if let Some(owner) = owner {
+        match disallows_incoming_nft_offer(sandbox, &owner) {
+            None => return TxResult::NoTarget,
+            Some(true) => return TxResult::NoPermission,
+            Some(false) => {}
+        }
+    }
+    // fixEnforceNFTokenTrustlineV2 (live): `checkTrustlineAuthorized` — the
+    // IOU's issuer must exist, and under RequireAuth the account's line
+    // must exist and be authorized.
+    if !leg.xrp {
+        if !sandbox.exists(&keylet::account_root_key(&leg.issuer)) {
+            return TxResult::NoIssuer;
+        }
+        if let Some(r) = ox::require_auth_ter(sandbox, &leg, &acct, false) {
+            if !matches!(r, TxResult::Success) {
+                return r;
+            }
+        }
+    }
+    TxResult::Success
+}
+
 impl Transactor for NFTokenCreateOfferTransactor {
     fn preflight(&self, tx: &TxFields) -> TxResult {
         if tx.tx_type != "NFTokenCreateOffer" {
@@ -611,87 +723,19 @@ impl Transactor for NFTokenCreateOfferTransactor {
             return TxResult::NoEntry;
         }
         // Finding 235 (#106850559 CF28C7C9E016): the rest of the preclaim is
-        // rippled's `nft::tokenOfferCreatePreclaim` (NFTokenHelpers.cpp:811-882),
-        // in its order. rwM46RCWpQ bids 10 NOIR.rhdbs6zj for an NFT it does not
-        // own while its NOIR line holds 0: mainnet refuses with
-        // tecUNFUNDED_OFFER — `accountFunds(acct, amount, ZeroIfFrozen).signum()
-        // <= 0` — and we rested the offer (offer, directory page, OwnerCount).
-        // Any POSITIVE balance passes (the amount itself is not required), the
-        // IOU's own issuer always does, and XRP counts what sits above the
-        // reserve.
-        use crate::tx::offer as ox;
-        const K_FLAG_CREATE_TRUST_LINES: u16 = 0x0004;
-        let amt_json = tx.fields.get("Amount").cloned().unwrap_or_default();
-        let Some(leg) = ox::leg_of(&amt_json) else {
-            return TxResult::Malformed;
-        };
-        let nft_flags = nftpage::flags_of(&id);
-        let xfer_fee = u16::from_be_bytes([id.0[2], id.0[3]]);
-        let nft_issuer = nftpage::issuer_of(&id);
-        // A transfer-fee NFT priced in an IOU needs its issuer able to take
-        // the royalty: the issuer must exist, hold a line for that IOU unless
-        // it issues it (NFTokenMintOffer), and not be frozen on it.
-        if nft_flags & K_FLAG_CREATE_TRUST_LINES == 0 && !leg.xrp && xfer_fee != 0 {
-            if !sandbox.exists(&keylet::account_root_key(&nft_issuer)) {
-                return TxResult::NoIssuer;
-            }
-            if nft_issuer != leg.issuer
-                && !sandbox.exists(&keylet::ripple_state_key(&nft_issuer, &leg.issuer, &leg.cur))
-            {
-                return TxResult::NoLine;
-            }
-            if let Some(TxResult::Frozen) = ox::frozen_ter(sandbox, &leg, &nft_issuer) {
-                return TxResult::Frozen;
-            }
-        }
-        // (`tefNFTOKEN_IS_NOT_TRANSFERABLE` for a non-transferable token offered
-        // by a stranger is a tef — it never reaches a validated ledger.)
-        // NFTokenHelpers.cpp:866: `isFrozen(view, acct, currency, issuer)` reads
-        // the ISSUER's lsfGlobalFreeze even when acct is the issuer itself —
-        // tecFROZEN on an issuer offering in its own frozen IOU. fixCleanup3_4_0
-        // exempts the issuer (acctIsIouIssuer).
-        if !leg.xrp
-            && tx.account == leg.issuer
-            && !crate::ledger::amendments::fix_cleanup_3_4_0(sandbox)
-            && ox::json_at(sandbox, &keylet::account_root_key(&leg.issuer))
-                .is_some_and(|a| a["Flags"].as_u64().unwrap_or(0) & 0x0040_0000 != 0)
-        {
-            return TxResult::Frozen;
-        }
-        if let Some(TxResult::Frozen) = ox::frozen_ter(sandbox, &leg, &tx.account) {
-            return TxResult::Frozen;
-        }
-        if !is_sell && ox::me_is_zero(ox::available(sandbox, &tx.account, &leg)) {
-            return TxResult::UnfundedOffer;
-        }
-        if let Some(dest) = tx.fields.get("Destination").and_then(decode_account_id) {
-            match disallows_incoming_nft_offer(sandbox, &dest) {
-                None => return TxResult::NoDst,
-                Some(true) => return TxResult::NoPermission,
-                Some(false) => {}
-            }
-        }
-        if let Some(owner) = tx.fields.get("Owner").and_then(decode_account_id) {
-            match disallows_incoming_nft_offer(sandbox, &owner) {
-                None => return TxResult::NoTarget,
-                Some(true) => return TxResult::NoPermission,
-                Some(false) => {}
-            }
-        }
-        // fixEnforceNFTokenTrustlineV2 (live): `checkTrustlineAuthorized` — the
-        // IOU's issuer must exist, and under RequireAuth the account's line
-        // must exist and be authorized.
-        if !leg.xrp {
-            if !sandbox.exists(&keylet::account_root_key(&leg.issuer)) {
-                return TxResult::NoIssuer;
-            }
-            if let Some(r) = ox::require_auth_ter(sandbox, &leg, &tx.account, false) {
-                if !matches!(r, TxResult::Success) {
-                    return r;
-                }
-            }
-        }
-        TxResult::Success
+        // rippled's `nft::tokenOfferCreatePreclaim`, which NFTokenMint's `Amount`
+        // runs as well: see [`token_offer_create_preclaim`].
+        token_offer_create_preclaim(
+            sandbox,
+            &tx.account,
+            &nftpage::issuer_of(&id),
+            &tx.fields.get("Amount").cloned().unwrap_or_default(),
+            tx.fields.get("Destination").and_then(decode_account_id),
+            nftpage::flags_of(&id),
+            u16::from_be_bytes([id.0[2], id.0[3]]),
+            tx.fields.get("Owner").and_then(decode_account_id),
+            is_sell,
+        )
     }
 
     fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
