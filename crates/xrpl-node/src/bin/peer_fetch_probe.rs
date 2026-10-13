@@ -9,6 +9,12 @@
 //! --count ledgers counting back from the latest validated one (or from --ledger), one at a time and at
 //! most one request every 2 s, so a peer's resource charge (250 a request, warning at 5,000 over its 32 s
 //! window) stays near 4,000 at worst. --record writes each reply, as protobuf, for test fixtures.
+//!
+//!   peer_fetch_probe --driver MINUTES [--peers a:51235,b:51235] [--rpc URL] [--log FILE]
+//!
+//! The live driver itself (peer_fetch::start, register, on_ledger_data, offer_network: its pacing, retries
+//! and peer rotation) over sessions to each of --peers, fed every validated ledger the RPC server reports,
+//! for MINUTES. Prints the driver's counters every minute.
 
 use std::time::{Duration, Instant};
 
@@ -54,9 +60,112 @@ fn frame(msg: &PeerMessage) -> Vec<u8> {
     f
 }
 
+/// One peer session for the driver: register it, write the driver's frames, hand it every mtLEDGER_DATA.
+async fn driver_session(addr: String) {
+    let identity = match xrpl_node::peer::identity::NodeIdentity::generate() {
+        Ok(i) => i,
+        Err(_) => return,
+    };
+    let hs = match tokio::time::timeout(
+        Duration::from_secs(20),
+        xrpl_node::peer::handshake::outbound_handshake(&addr, &identity, xrpl_node::peer::handshake::NETWORK_ID_MAINNET),
+    )
+    .await
+    {
+        Ok(Ok(h)) => h,
+        other => {
+            eprintln!("{addr}: no session ({})", match other { Ok(Err(e)) => e.to_string(), _ => "timeout".into() });
+            return;
+        }
+    };
+    eprintln!("{addr}: connected");
+    let (mut rd, wr) = tokio::io::split(hs.stream);
+    let wr = std::sync::Arc::new(tokio::sync::Mutex::new(wr));
+    if let Some(mut frames) = xrpl_node::peer_fetch::register(&addr) {
+        let w = wr.clone();
+        tokio::spawn(async move {
+            while let Some(f) = frames.recv().await {
+                if w.lock().await.write_all(&f).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    let mut buf = BytesMut::from(&hs.remaining_bytes[..]);
+    let mut codec = MessageCodec;
+    loop {
+        match codec.decode(&mut buf) {
+            Ok(Some(PeerMessage::LedgerData(d))) => xrpl_node::peer_fetch::on_ledger_data(&addr, &d),
+            Ok(Some(PeerMessage::Ping(p))) if p.r#type == 0 => {
+                let mut pong = p;
+                pong.r#type = 1;
+                let _ = wr.lock().await.write_all(&frame(&PeerMessage::Ping(pong))).await;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => match rd.read_buf(&mut buf).await {
+                Ok(n) if n > 0 => {}
+                _ => break,
+            },
+            Err(_) => break,
+        }
+    }
+    eprintln!("{addr}: session ended");
+    xrpl_node::peer_fetch::unregister(&addr);
+}
+
+async fn run_driver(url: &str, minutes: u64) -> i32 {
+    if !xrpl_node::peer_fetch::start() {
+        eprintln!("the driver did not start (XRPL_PEER_FETCH)");
+        return 2;
+    }
+    let peers = arg("--peers").unwrap_or_else(|| "s1.ripple.com:51235,s2.ripple.com:51235".into());
+    for p in peers.split(',').filter(|p| !p.is_empty()) {
+        tokio::spawn(driver_session(p.to_string()));
+    }
+    let end = Instant::now() + Duration::from_secs(60 * minutes);
+    let (mut last, mut said) = (0u32, Instant::now());
+    while Instant::now() < end {
+        let v = rpc(url, json!({"method": "ledger", "params": [{"ledger_index": "validated"}]}))
+            .await
+            .ok()
+            .and_then(|r| r["ledger_index"].as_u64())
+            .unwrap_or(0) as u32;
+        if v > last {
+            let from = if last == 0 { v } else { last + 1 };
+            for seq in from..=v {
+                match their_copy(url, seq).await {
+                    Ok((h, pairs)) => {
+                        if let Some(hash) = hex::decode(&h).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()) {
+                            xrpl_node::peer_fetch::offer_network(seq, hash, &pairs);
+                        }
+                    }
+                    Err(e) => eprintln!("#{seq}: RPC copy: {e}"),
+                }
+            }
+            last = v;
+        }
+        if said.elapsed() >= Duration::from_secs(60) {
+            eprintln!("DRIVER {}", xrpl_node::peer_fetch::summary());
+            said = Instant::now();
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(15)).await; // the last fetch finishes
+    let st = xrpl_node::peer_fetch::stats();
+    let l = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!("DRIVER SUMMARY: {}", xrpl_node::peer_fetch::summary());
+    i32::from(l(&st.differ) > 0 || l(&st.fetched) == 0)
+}
+
 #[tokio::main]
 async fn main() {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    if let Some(minutes) = arg("--driver").and_then(|m| m.parse::<u64>().ok()) {
+        std::env::set_var("XRPL_PEER_FETCH", "1");
+        std::env::set_var("XRPL_PEER_FETCH_LOG", arg("--log").unwrap_or_else(|| "/tmp/peer_fetch_probe.jsonl".into()));
+        let url = arg("--rpc").unwrap_or_else(|| "https://s2.ripple.com:51234".into());
+        std::process::exit(run_driver(&url, minutes).await);
+    }
     let peer = arg("--peer").unwrap_or_else(|| "s1.ripple.com:51235".into());
     let url = arg("--rpc").unwrap_or_else(|| "https://s2.ripple.com:51234".into());
     let count: u32 = arg("--count").and_then(|c| c.parse().ok()).unwrap_or(5);

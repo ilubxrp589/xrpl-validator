@@ -298,6 +298,8 @@ async fn main() {
 
     // Outbound message channel — validation + transaction relay to broadcast to all peers
     let (outbound_tx, _) = broadcast::channel::<Vec<u8>>(2000);
+    // Independence 4.1 (XRPL_PEER_FETCH=1): each validated ledger fetched from peers too, and compared.
+    xrpl_node::peer_fetch::start();
     let outbound_tx2 = outbound_tx.clone();
 
     // Message dedup: hash of recent messages to avoid duplicates from multiple peers
@@ -1645,6 +1647,7 @@ async fn main() {
                     body.push_str(&xrpl_node::amendment_guard::metrics_text());
                     body.push_str(&xrpl_node::native_meta::metrics_text());
                     body.push_str(&xrpl_node::native_order::metrics_text());
+                    body.push_str(&xrpl_node::peer_fetch::metrics_text());
                     (
                         axum::http::StatusCode::OK,
                         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
@@ -1782,6 +1785,8 @@ async fn main() {
                     json["native_meta"] = xrpl_node::native_meta::json();
                     // Independence 3.3: our own order and passes.
                     json["native_order"] = xrpl_node::native_order::json();
+                    // Independence 4.1: ledgers fetched from peers.
+                    json["peer_fetch"] = xrpl_node::peer_fetch::json();
                     // Stage 4 Phase A: native-engine shadow counters.
                     #[cfg(feature = "ffi")]
                     {
@@ -2039,6 +2044,7 @@ fn spawn_peer_connection(
                     }
                 }
             }
+            xrpl_node::peer_fetch::unregister(&peer);
             active_peers.lock().remove(&peer);
             connected_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             // 10 s, 20, 40, 80, 160, 320, then 600 s (capped).
@@ -2088,6 +2094,18 @@ async fn run_peer_connection(
     // Split stream for read + write (needed to respond to GetLedger/GetObjects)
     let (mut reader, writer) = tokio::io::split(hs.stream);
     let writer = Arc::new(tokio::sync::Mutex::new(writer));
+    // Independence 4.1: this peer can be asked for ledgers (XRPL_PEER_FETCH=1); the driver's frames go out here.
+    if let Some(mut frames) = xrpl_node::peer_fetch::register(peer_addr) {
+        let w = writer.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            while let Some(f) = frames.recv().await {
+                if w.lock().await.write_all(&f).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     let mut codec = MessageCodec;
     let mut buf = BytesMut::with_capacity(65536);
@@ -2103,6 +2121,12 @@ async fn run_peer_connection(
                 Ok(Some(msg)) => {
                     msg_seq += 1;
                     let elapsed = start.elapsed().as_secs_f64();
+
+                    // Independence 4.1: a reply to our ledger fetch, before the duplicate filter below (two
+                    // peers' replies for one ledger are byte-identical).
+                    if let PeerMessage::LedgerData(ref d) = msg {
+                        xrpl_node::peer_fetch::on_ledger_data(peer_addr, d);
+                    }
 
                     // Auto-discover peers from Endpoints messages
                     if let PeerMessage::Endpoints(ref ep) = msg {

@@ -711,6 +711,9 @@ pub async fn start_ws_sync(
                                     .collect();
                                 let ids_ok = blob_ids == meta_ids;
                                 if root_ok && ids_ok {
+                                    // Independence 4.1: the same ledger, fetched from peers, is compared with
+                                    // this proven copy (XRPL_PEER_FETCH=1; nothing when off).
+                                    crate::peer_fetch::offer_network(process_seq, ledger_header.ledger_hash, &triples);
                                     let v = TXGATE_VERIFIED.fetch_add(1, Ordering::Relaxed) + 1;
                                     // Heartbeat every 256 ledgers so burn-in can confirm the gate
                                     // is live and read the running tallies (the happy path is

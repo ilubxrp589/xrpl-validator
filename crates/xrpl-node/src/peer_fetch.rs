@@ -13,9 +13,11 @@
 //! at the peer, which warns at 5,000 and disconnects at 25,000, decaying over 32 s. The driver paces
 //! itself well under that.
 
+use std::collections::{HashMap, VecDeque};
 use std::io::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use xrpl_ledger::ledger::header::LedgerHeader;
@@ -198,6 +200,10 @@ pub struct FetchStats {
     pub requests: AtomicU64,
     pub rejected_nodes: AtomicU64,
     pub bad_headers: AtomicU64,
+    /// Ledgers dropped from the queue to stay at the live edge.
+    pub skipped: AtomicU64,
+    /// Peers that can be asked now (a gauge).
+    pub peers: AtomicU64,
     pub last_seq: AtomicU64,
     pub ms_last: AtomicU64,
 }
@@ -226,9 +232,9 @@ pub fn summary() -> String {
     let st = stats();
     let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
     format!(
-        "wanted {} fetched {} | match {} differ {} | failed {} | requests {} rejected nodes {} bad headers {}",
-        l(&st.wanted), l(&st.fetched), l(&st.matched), l(&st.differ), l(&st.failed), l(&st.requests),
-        l(&st.rejected_nodes), l(&st.bad_headers)
+        "wanted {} fetched {} | match {} differ {} | failed {} skipped {} | requests {} rejected nodes {} bad headers {} | peers {}",
+        l(&st.wanted), l(&st.fetched), l(&st.matched), l(&st.differ), l(&st.failed), l(&st.skipped), l(&st.requests),
+        l(&st.rejected_nodes), l(&st.bad_headers), l(&st.peers)
     )
 }
 
@@ -239,7 +245,8 @@ pub fn json() -> Value {
     json!({
         "enabled": enabled(), "last_seq": l(&st.last_seq), "wanted": l(&st.wanted), "fetched": l(&st.fetched),
         "matched": l(&st.matched), "differ": l(&st.differ), "failed": l(&st.failed), "requests": l(&st.requests),
-        "rejected_nodes": l(&st.rejected_nodes), "bad_headers": l(&st.bad_headers), "ms_last": l(&st.ms_last),
+        "rejected_nodes": l(&st.rejected_nodes), "bad_headers": l(&st.bad_headers), "skipped": l(&st.skipped),
+        "peers": l(&st.peers), "ms_last": l(&st.ms_last),
     })
 }
 
@@ -259,6 +266,292 @@ pub fn metrics_text() -> String {
         s.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n{name} {v}\n"));
     }
     s
+}
+
+// ---- the live driver (XRPL_PEER_FETCH=1) -------------------------------------------------------------------
+
+/// Gap between two requests to one peer. About three requests a ledger, spread over the peers, keep each
+/// one's rippled resource balance near 250 × 32 s / 8 s = 1,000 at worst: a fifth of its warning level.
+pub const PEER_GAP: Duration = Duration::from_secs(8);
+/// A request no reply answered in this long goes to another peer.
+pub const REPLY_TIMEOUT: Duration = Duration::from_secs(6);
+/// A ledger still incomplete after this long is given up.
+pub const LEDGER_DEADLINE: Duration = Duration::from_secs(45);
+/// A peer that misses this many replies in a row rests for [`BENCH`].
+pub const MISSES_TO_BENCH: u32 = 3;
+pub const BENCH: Duration = Duration::from_secs(300);
+/// Ledgers waiting beyond this are dropped, oldest first: the fetch stays at the live edge.
+pub const QUEUE_CAP: usize = 4;
+
+#[derive(Debug, Default, Clone)]
+struct PeerState {
+    last: Option<Instant>,
+    misses: u32,
+    benched_until: Option<Instant>,
+}
+
+/// Which peer gets the next request.
+#[derive(Debug, Default)]
+pub struct Pacer {
+    peers: HashMap<String, PeerState>,
+}
+
+impl Pacer {
+    pub fn add(&mut self, addr: &str) {
+        self.peers.entry(addr.to_string()).or_default();
+    }
+
+    pub fn remove(&mut self, addr: &str) {
+        self.peers.remove(addr);
+    }
+
+    pub fn len(&self) -> usize {
+        self.peers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.peers.is_empty()
+    }
+
+    /// The peer rested longest, not benched, not asked within [`PEER_GAP`], and not `avoid` while another
+    /// one qualifies. Marks it asked now.
+    pub fn pick(&mut self, now: Instant, avoid: Option<&str>) -> Option<String> {
+        let ready = |st: &PeerState| {
+            st.benched_until.is_none_or(|t| now >= t) && st.last.is_none_or(|t| now.duration_since(t) >= PEER_GAP)
+        };
+        let mut cands: Vec<(&String, &PeerState)> = self.peers.iter().filter(|(_, st)| ready(st)).collect();
+        if cands.len() > 1 {
+            cands.retain(|(a, _)| Some(a.as_str()) != avoid);
+        }
+        // Never asked first, then the longest rested; the address breaks ties so the choice is stable.
+        let pick = cands.into_iter().min_by(|x, y| x.1.last.cmp(&y.1.last).then(x.0.cmp(y.0)))?.0.clone();
+        if let Some(st) = self.peers.get_mut(&pick) {
+            st.last = Some(now);
+            st.benched_until = None;
+        }
+        Some(pick)
+    }
+
+    pub fn answered(&mut self, addr: &str) {
+        if let Some(st) = self.peers.get_mut(addr) {
+            st.misses = 0;
+        }
+    }
+
+    /// A reply that never came, or one that was wrong (`strikes` at once).
+    pub fn missed(&mut self, addr: &str, now: Instant, strikes: u32) {
+        if let Some(st) = self.peers.get_mut(addr) {
+            st.misses += strikes;
+            if st.misses >= MISSES_TO_BENCH {
+                st.misses = 0;
+                st.benched_until = Some(now + BENCH);
+            }
+        }
+    }
+}
+
+enum Event {
+    Peer { addr: String, frames: Option<tokio::sync::mpsc::Sender<Vec<u8>>> },
+    Data { addr: String, data: TmLedgerData },
+    Want { seq: u32, hash: [u8; 32], theirs: Vec<(Vec<u8>, Vec<u8>)> },
+}
+
+static EVENTS: OnceLock<tokio::sync::mpsc::UnboundedSender<Event>> = OnceLock::new();
+
+fn send(ev: Event) {
+    if let Some(tx) = EVENTS.get() {
+        let _ = tx.send(ev);
+    }
+}
+
+/// Start the driver when `XRPL_PEER_FETCH=1` (inside the tokio runtime). True when it runs.
+pub fn start() -> bool {
+    if !enabled() || EVENTS.get().is_some() {
+        return EVENTS.get().is_some();
+    }
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    if EVENTS.set(tx).is_err() {
+        return true;
+    }
+    tokio::spawn(drive(rx, log_path()));
+    eprintln!("[peer-fetch] ON — each validated ledger fetched from peers and compared with .39's copy; receipts -> {}", log_path().display());
+    true
+}
+
+/// A peer connection that can be asked for ledgers: the frames to write to it. None while the driver is off.
+pub fn register(addr: &str) -> Option<tokio::sync::mpsc::Receiver<Vec<u8>>> {
+    EVENTS.get()?;
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    send(Event::Peer { addr: addr.to_string(), frames: Some(tx) });
+    Some(rx)
+}
+
+pub fn unregister(addr: &str) {
+    send(Event::Peer { addr: addr.to_string(), frames: None });
+}
+
+/// A peer's mtLEDGER_DATA (read before the overlay's duplicate filter: two peers' replies are byte-identical).
+pub fn on_ledger_data(addr: &str, d: &TmLedgerData) {
+    if EVENTS.get().is_some() {
+        send(Event::Data { addr: addr.to_string(), data: d.clone() });
+    }
+}
+
+/// .39's copy of validated ledger `seq` (its hash, and every transaction with its metadata, already checked
+/// against the header's transaction root): fetch the same ledger from peers and compare.
+pub fn offer_network(seq: u32, hash: [u8; 32], theirs: &[(Vec<u8>, Vec<u8>)]) {
+    if EVENTS.get().is_some() && hash != [0; 32] {
+        stats().wanted.fetch_add(1, Ordering::Relaxed);
+        send(Event::Want { seq, hash, theirs: theirs.to_vec() });
+    }
+}
+
+/// mtGET_LEDGER on the wire: length, type, payload.
+pub fn frame(req: &TmGetLedger) -> Vec<u8> {
+    use prost::Message as _;
+    let p = req.encode_to_vec();
+    let mut f = Vec::with_capacity(6 + p.len());
+    f.extend_from_slice(&(p.len() as u32).to_be_bytes());
+    f.extend_from_slice(&31u16.to_be_bytes());
+    f.extend_from_slice(&p);
+    f
+}
+
+struct Active {
+    seq: u32,
+    fetch: LedgerFetch,
+    theirs: Vec<(Vec<u8>, Vec<u8>)>,
+    started: Instant,
+    /// The peer last asked, and when; None when the next request is due.
+    asked: Option<(String, Instant)>,
+    peers_used: Vec<String>,
+}
+
+async fn drive(mut rx: tokio::sync::mpsc::UnboundedReceiver<Event>, log: std::path::PathBuf) {
+    let st = stats();
+    let mut pacer = Pacer::default();
+    let mut frames: HashMap<String, tokio::sync::mpsc::Sender<Vec<u8>>> = HashMap::new();
+    let mut queue: VecDeque<(u32, [u8; 32], Vec<(Vec<u8>, Vec<u8>)>)> = VecDeque::new();
+    let mut cur: Option<Active> = None;
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            ev = rx.recv() => match ev {
+                None => return,
+                Some(Event::Peer { addr, frames: Some(tx) }) => {
+                    pacer.add(&addr);
+                    frames.insert(addr, tx);
+                }
+                Some(Event::Peer { addr, frames: None }) => {
+                    pacer.remove(&addr);
+                    frames.remove(&addr);
+                }
+                Some(Event::Want { seq, hash, theirs }) => {
+                    queue.push_back((seq, hash, theirs));
+                    while queue.len() > QUEUE_CAP {
+                        queue.pop_front();
+                        st.skipped.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Some(Event::Data { addr, data }) => {
+                    if let Some(a) = cur.as_mut() {
+                        let now = Instant::now();
+                        match a.fetch.on_data(&data) {
+                            Step::Ignored => {}
+                            Step::Progress(_) | Step::Done => {
+                                pacer.answered(&addr);
+                                if a.asked.as_ref().is_some_and(|(p, _)| *p == addr) {
+                                    a.asked = None;
+                                }
+                            }
+                            Step::BadHeader(why) => {
+                                st.bad_headers.fetch_add(1, Ordering::Relaxed);
+                                pacer.missed(&addr, now, MISSES_TO_BENCH);
+                                eprintln!("[peer-fetch] #{}: {addr} sent a header that is not the ledger's ({why})", a.seq);
+                                a.asked = None;
+                            }
+                            Step::PeerError(_) => {
+                                pacer.missed(&addr, now, 1);
+                                a.asked = None;
+                            }
+                        }
+                    }
+                }
+            },
+            _ = tick.tick() => {}
+        }
+        st.peers.store(pacer.len() as u64, Ordering::Relaxed);
+        let now = Instant::now();
+        if cur.is_none() {
+            if let Some((seq, hash, theirs)) = queue.pop_front() {
+                cur = Some(Active { seq, fetch: LedgerFetch::new(hash), theirs, started: now, asked: None, peers_used: Vec::new() });
+            }
+        }
+        let Some(a) = cur.as_mut() else { continue };
+        if a.fetch.is_done() || now.duration_since(a.started) > LEDGER_DEADLINE {
+            let a = cur.take().expect("current fetch");
+            finish(a, &log);
+            continue;
+        }
+        if let Some((peer, at)) = a.asked.clone() {
+            if now.duration_since(at) < REPLY_TIMEOUT {
+                continue;
+            }
+            pacer.missed(&peer, now, 1);
+            a.asked = None;
+        }
+        let avoid = a.peers_used.last().cloned();
+        let Some(peer) = pacer.pick(now, avoid.as_deref()) else { continue };
+        let req = if a.fetch.header().is_none() { Some(a.fetch.base_request()) } else { a.fetch.next_request() };
+        let Some(req) = req else { continue };
+        match frames.get(&peer).map(|tx| tx.try_send(frame(&req))) {
+            Some(Ok(())) => {
+                st.requests.fetch_add(1, Ordering::Relaxed);
+                a.asked = Some((peer.clone(), now));
+                if !a.peers_used.contains(&peer) {
+                    a.peers_used.push(peer);
+                }
+            }
+            _ => pacer.missed(&peer, now, 1),
+        }
+    }
+}
+
+fn finish(a: Active, log: &std::path::Path) {
+    let st = stats();
+    let ms = a.started.elapsed().as_millis() as u64;
+    st.ms_last.store(ms, Ordering::Relaxed);
+    st.last_seq.store(u64::from(a.seq), Ordering::Relaxed);
+    st.rejected_nodes.fetch_add(a.fetch.rejected as u64, Ordering::Relaxed);
+    let (requests, peers) = (a.fetch.requests, a.peers_used.len());
+    let hash = hex::encode_upper(a.fetch.hash);
+    match a.fetch.into_result() {
+        Some((header, ours)) => {
+            let n = st.fetched.fetch_add(1, Ordering::Relaxed) + 1;
+            let verdict = if header.sequence != a.seq {
+                Some(format!("the proven header is #{}, not #{}", header.sequence, a.seq))
+            } else {
+                compare(&ours, &a.theirs)
+            };
+            match verdict {
+                None => {
+                    st.matched.fetch_add(1, Ordering::Relaxed);
+                }
+                Some(d) => {
+                    st.differ.fetch_add(1, Ordering::Relaxed);
+                    log_receipt(log, &json!({"seq": a.seq, "hash": hash, "differ": d, "requests": requests, "peers": peers, "ms": ms}));
+                }
+            }
+            if n % 256 == 1 {
+                eprintln!("[peer-fetch] heartbeat #{}: {}", a.seq, summary());
+            }
+        }
+        None => {
+            st.failed.fetch_add(1, Ordering::Relaxed);
+            log_receipt(log, &json!({"seq": a.seq, "hash": hash, "failed": "not complete within the deadline", "requests": requests, "peers": peers, "ms": ms}));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -390,6 +683,46 @@ mod tests {
         q[2].1[0] ^= 1;
         assert_eq!(compare(&p, &q).unwrap().split(" (first").next().unwrap(), "0 ours only, 0 theirs only, 1 with different bytes");
         assert!(compare(&p[..4], &p).unwrap().starts_with("0 ours only, 1 theirs only"));
+    }
+
+    #[test]
+    fn the_pacer_spreads_requests_and_rests_each_peer() {
+        let t0 = Instant::now();
+        let mut p = Pacer::default();
+        for a in ["a:1", "b:1", "c:1"] {
+            p.add(a);
+        }
+        let first: Vec<String> = (0..3).map(|_| p.pick(t0, None).unwrap()).collect();
+        assert_eq!(first, ["a:1", "b:1", "c:1"], "each once, in a stable order");
+        assert_eq!(p.pick(t0 + Duration::from_secs(1), None), None, "every peer was asked within the gap");
+        assert_eq!(p.pick(t0 + PEER_GAP, None).as_deref(), Some("a:1"), "the longest rested comes back first");
+        assert_eq!(p.pick(t0 + PEER_GAP, Some("b:1")).as_deref(), Some("c:1"), "the one to avoid is skipped while another qualifies");
+    }
+
+    #[test]
+    fn a_peer_that_keeps_missing_is_benched() {
+        let t0 = Instant::now();
+        let mut p = Pacer::default();
+        p.add("a:1");
+        p.add("b:1");
+        p.missed("a:1", t0, 1);
+        p.missed("a:1", t0, 1);
+        p.answered("a:1");
+        p.missed("a:1", t0, 1);
+        assert!(p.pick(t0, Some("b:1")).as_deref() == Some("a:1"), "an answer clears the misses");
+        p.missed("b:1", t0, MISSES_TO_BENCH);
+        assert_eq!(p.pick(t0 + PEER_GAP, None).as_deref(), Some("a:1"), "b is benched");
+        assert_eq!(p.pick(t0 + BENCH, Some("a:1")).as_deref(), Some("b:1"), "and comes back after the bench");
+        p.remove("a:1");
+        assert_eq!(p.len(), 1);
+    }
+
+    #[test]
+    fn a_request_frame_is_rippleds_header_then_the_message() {
+        let mut f = LedgerFetch::new([3; 32]);
+        let fr = frame(&f.base_request());
+        let len = u32::from_be_bytes(fr[..4].try_into().unwrap()) as usize;
+        assert_eq!((len + 6, u16::from_be_bytes([fr[4], fr[5]])), (fr.len(), 31));
     }
 
     #[test]
