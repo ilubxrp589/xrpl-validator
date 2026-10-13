@@ -281,6 +281,16 @@ fn apply_core(state: &LedgerState, tx: &TxFields) -> Applied {
     if !gate.is_success() {
         return (gate.code_str().to_string(), xrpl_ledger::ledger::sandbox::SandboxChanges::default());
     }
+    // rippled's checkPermission comes next (invokePreclaim, applySteps.cpp:188-190).
+    // - A delegated transaction (sfDelegate) needs a Delegate object that grants its type, or
+    //   granular permissions that admit it; else terNO_DELEGATE_PERMISSION, a retry, so it isn't
+    //   applied.
+    // - Until 10-13 only Batch inners ran it (tx/dispatch.rs); a standalone delegated
+    //   transaction skipped it (the 3.3 NoAccount audit, A2).
+    let perm = xrpl_ledger::tx::delegate::check_delegate_permission(tx, &sb);
+    if !perm.is_success() {
+        return (perm.code_str().to_string(), xrpl_ledger::ledger::sandbox::SandboxChanges::default());
+    }
     // rippled's checkFee runs next, ahead of the transactor's own preclaim (invokePreclaim,
     // applySteps.cpp:204). A payer short of the Fee is tecINSUFF_FEE, claimed at what it holds
     // (Transactor::reset), or terINSUF_FEE_B, not applied, if it holds nothing.

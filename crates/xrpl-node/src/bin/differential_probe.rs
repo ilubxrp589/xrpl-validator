@@ -2649,6 +2649,11 @@ fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<Hash
     // Phase 2+3+4: preclaim → common → do_apply. rippled's checkFee runs ahead of the
     // transactor's own preclaim (invokePreclaim, applySteps.cpp:204), as in native_apply.rs.
     let mut sb = Sandbox::new(state);
+    // checkPermission comes before checkFee (applySteps.cpp:188-204), as in native_apply.rs.
+    let perm = xrpl_ledger::tx::delegate::check_delegate_permission(tx, &sb);
+    if !perm.is_success() {
+        return (perm.code_str().to_string(), HashMap::new());
+    }
     let fee = xrpl_ledger::ledger::transactor::check_fee(tx, &sb);
     let preclaim = if fee.is_success() { transactor.preclaim(tx, &sb) } else { fee };
     if !preclaim.is_success() && !preclaim.is_claimed() {
