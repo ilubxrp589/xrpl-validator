@@ -237,10 +237,22 @@ fn a_bid_naming_a_missing_auth_account_is_ter_no_account() {
 
 // ---- A2: checkPermission for a standalone delegated transaction (applySteps.cpp:188-190) ----
 
-/// DAVE signs as ALICE's Delegate, but ALICE never made a Delegate object for him.
+/// DAVE signs as ALICE's Delegate, but ALICE's Delegate object for him grants TrustSet only
+/// (permission value 21: TrustSet's type 20 + 1), not Payment. The object is loaded, so even a
+/// partial state can judge it. tests/missing_pool.rs covers a missing object, which only a
+/// complete state can refuse.
 #[test]
-fn a_delegated_payment_without_a_delegate_object_is_ter_no_delegate_permission() {
-    let state = ledger(&[ALICE, BOB, DAVE]);
+fn a_delegated_payment_its_delegate_object_does_not_grant_is_ter_no_delegate_permission() {
+    let mut state = ledger(&[ALICE, BOB, DAVE]);
+    let delegate = json!({
+        "LedgerEntryType": "Delegate",
+        "Account": hex::encode(ALICE),
+        "Authorize": hex::encode(DAVE),
+        "Permissions": [{ "Permission": { "PermissionValue": 21 } }],
+        "OwnerNode": "0",
+        "Flags": 0,
+    });
+    put(&mut state, keylet::delegate_key(&ALICE, &DAVE), &delegate);
     let tx = json!({
         "TransactionType": "Payment",
         "Account": hex::encode(ALICE),

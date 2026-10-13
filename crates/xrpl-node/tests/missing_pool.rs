@@ -1,4 +1,7 @@
-//! A1 of the 3.3 NoAccount audit (10-13): rippled answers a missing AMM pool with terNO_AMM, a retry
+//! What `LedgerState::complete` changes. Its main use is A1 of the 3.3 NoAccount audit (10-13), and
+//! A2's partial-state guard (the last test) uses it too.
+//!
+//! A1: rippled answers a missing AMM pool with terNO_AMM, a retry
 //! (AMMDeposit.cpp:186, AMMWithdraw.cpp:192, AMMVote.cpp:65, AMMBid.cpp:111, AMMClawback.cpp:116).
 //! - **Complete state** (`LedgerState::complete`, the native shadow's hydrated mirror): an absent pool
 //!   is absent from the ledger, and we answer terNO_AMM.
@@ -19,6 +22,10 @@ const GATE: [u8; 20] = [0x6A; 20];
 
 /// ALICE and GATE, and no AMM pool anywhere.
 fn ledger() -> LedgerState {
+    ledger_with(&[ALICE, GATE])
+}
+
+fn ledger_with(accounts: &[[u8; 20]]) -> LedgerState {
     let mut state = LedgerState::new_unverified(LedgerHeader {
         sequence: 107_600_000,
         total_coins: 99_986_000_000_000_000,
@@ -30,7 +37,7 @@ fn ledger() -> LedgerState {
         close_time_resolution: 10,
         close_flags: 0,
     });
-    for id in [ALICE, GATE] {
+    for &id in accounts {
         let root = json!({
             "LedgerEntryType": "AccountRoot",
             "Account": hex::encode(id),
@@ -102,4 +109,31 @@ fn a_missing_pool_is_ter_no_amm_on_a_complete_state_and_unchanged_on_a_partial_o
         assert_eq!(ter, "terNO_AMM", "{kind} on a complete state");
         assert!(mods.is_empty(), "{kind}: a ter changes nothing: {mods:?}");
     }
+}
+
+/// A2's guard uses the same flag. With no Delegate object for DAVE, a payment DAVE signs as ALICE's
+/// Delegate is terNO_DELEGATE_PERMISSION on a complete state (absent means absent). A partial state
+/// can't tell a missing object from an unloaded one, so the payment goes through, as campaign 22's
+/// delegated fixtures (which carry no Delegate object) need.
+#[test]
+fn a_missing_delegate_object_refuses_only_on_a_complete_state() {
+    const DAVE: [u8; 20] = [0xD4; 20];
+    let mut state = ledger_with(&[ALICE, GATE, DAVE]);
+    let tx = json!({
+        "TransactionType": "Payment",
+        "Account": hex::encode(ALICE),
+        "Destination": hex::encode(GATE),
+        "Amount": "1000000",
+        "Delegate": hex::encode(DAVE),
+        "Fee": "12",
+        "Sequence": 7,
+        "Flags": 0,
+    });
+    let (ter, _) = apply(&state, &tx);
+    assert_eq!(ter, "tesSUCCESS", "partial: the check stands aside");
+
+    state.complete = true;
+    let (ter, mods) = apply(&state, &tx);
+    assert_eq!(ter, "terNO_DELEGATE_PERMISSION", "complete: absent means absent");
+    assert!(mods.is_empty(), "a ter changes nothing: {mods:?}");
 }

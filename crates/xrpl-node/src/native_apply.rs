@@ -287,8 +287,12 @@ fn apply_core(state: &LedgerState, tx: &TxFields) -> Applied {
     //   applied.
     // - Until 10-13 only Batch inners ran it (tx/dispatch.rs); a standalone delegated
     //   transaction skipped it (the 3.3 NoAccount audit, A2).
+    // - On a partial pre-state (a vector's, the probe's) a Delegate object that reads as missing
+    //   may just not be loaded (campaign 22's delegated fixtures carry none). So the check refuses
+    //   on a complete state (LedgerState::complete), or where the object is loaded and doesn't
+    //   admit the transaction.
     let perm = xrpl_ledger::tx::delegate::check_delegate_permission(tx, &sb);
-    if !perm.is_success() {
+    if !perm.is_success() && (state.complete || delegate_loaded(tx, &sb)) {
         return (perm.code_str().to_string(), xrpl_ledger::ledger::sandbox::SandboxChanges::default());
     }
     // rippled's checkFee runs next, ahead of the transactor's own preclaim (invokePreclaim,
@@ -347,6 +351,12 @@ fn apply_core(state: &LedgerState, tx: &TxFields) -> Applied {
     } else {
         (applied.code_str().to_string(), xrpl_ledger::ledger::sandbox::SandboxChanges::default())
     }
+}
+
+/// Whether the transaction's Delegate object (Account → Delegate) is in the state. On a partial
+/// pre-state, only a loaded object can refuse a delegated transaction (see apply_core).
+pub fn delegate_loaded(tx: &TxFields, sb: &Sandbox) -> bool {
+    tx.delegate().is_some_and(|d| sb.exists(&xrpl_ledger::ledger::keylet::delegate_key(&tx.account, &d)))
 }
 
 /// Re-spell engine-internal JSON into the canonical forms the binary codec
