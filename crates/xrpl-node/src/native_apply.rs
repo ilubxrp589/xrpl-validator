@@ -236,6 +236,14 @@ pub fn native_apply_one_staged(state: &LedgerState, tx: &TxFields) -> (String, H
     (code, c.mods, REACHED_DO_APPLY.with(|r| r.get()))
 }
 
+/// [`native_apply_one_changes`], plus whether its result came from doApply, as [`native_apply_one_staged`]
+/// reports it (the writer's own order and passes with the records on, task 3.3).
+pub fn native_apply_one_changes_staged(state: &LedgerState, tx: &TxFields, tx_hash_hex: &str, ledger_seq: u32) -> (TxChanges, bool) {
+    REACHED_DO_APPLY.with(|r| r.set(false));
+    let tc = native_apply_one_changes(state, tx, tx_hash_hex, ledger_seq);
+    (tc, REACHED_DO_APPLY.with(|r| r.get()))
+}
+
 fn apply_core(state: &LedgerState, tx: &TxFields) -> Applied {
     xrpl_ledger::tx::reset_thread_state();
     let transactor = match get_transactor(&tx.tx_type) {
