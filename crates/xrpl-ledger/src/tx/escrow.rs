@@ -1248,16 +1248,16 @@ impl Transactor for EscrowCancelTransactor {
             Err(_) => return TxResult::Malformed,
         };
 
-        // --- Time check: if escrow has CancelAfter, only allow anyone to cancel
-        // after CancelAfter has passed. Before that, only the escrow creator can cancel. ---
+        // --- Time check (rippled EscrowCancel::doApply, EscrowCancel.cpp:133-141): an escrow
+        // with no CancelAfter can't be cancelled at all, and none can before CancelAfter has
+        // passed (`after(now, CancelAfter)`, now = the parent ledger's close time), WHOEVER
+        // signs. (This used to let the owner cancel early, and anyone cancel an escrow with no
+        // CancelAfter; rippled refuses both with tecNO_PERMISSION.) ---
         let close_time = sandbox.base().header.close_time as u64;
-        if let Some(cancel_after) = escrow.get("CancelAfter").and_then(|v| v.as_u64()) {
-            if close_time <= cancel_after {
-                // CancelAfter hasn't passed yet — only the escrow creator may cancel
-                if tx.account != owner_id {
-                    return TxResult::NoPermission;
-                }
-            }
+        match escrow.get("CancelAfter").and_then(|v| v.as_u64()) {
+            None => return TxResult::NoPermission,
+            Some(cancel_after) if close_time <= cancel_after => return TxResult::NoPermission,
+            Some(_) => {}
         }
 
         // Parse Amount from escrow
