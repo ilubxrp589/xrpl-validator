@@ -667,14 +667,20 @@ impl Transactor for ClawbackTransactor {
                 amount.get("issuer").and_then(decode_account_id)
             };
             if let Some(h) = holder {
-                if let Some(root) = crate::tx::offer::json_at(sandbox, &keylet::account_root_key(&h)) {
-                    let sav = crate::ledger::amendments::enabled(sandbox, crate::ledger::amendments::SINGLE_ASSET_VAULT);
-                    if sav && is_pseudo_account(sandbox, &h) {
-                        return TxResult::TecPseudoAccount;
-                    }
-                    if root.get("AMMID").is_some() {
-                        return TxResult::TecAmmAccount;
-                    }
+                // First, Clawback.cpp:189-192: the holder must have an AccountRoot, else
+                // terNO_ACCOUNT. The issuer is the sender, which preclaim_common has already
+                // seen. This comes ahead of every other test, the issuer's clawback flags
+                // included; the IOU arm used to test the flags first, and the 3.3 NoAccount
+                // audit (10-13) found it.
+                let Some(root) = crate::tx::offer::json_at(sandbox, &keylet::account_root_key(&h)) else {
+                    return TxResult::NoAccount;
+                };
+                let sav = crate::ledger::amendments::enabled(sandbox, crate::ledger::amendments::SINGLE_ASSET_VAULT);
+                if sav && is_pseudo_account(sandbox, &h) {
+                    return TxResult::TecPseudoAccount;
+                }
+                if root.get("AMMID").is_some() {
+                    return TxResult::TecAmmAccount;
                 }
             }
         }
@@ -785,15 +791,16 @@ impl Transactor for ClawbackTransactor {
             code
         };
 
-        // Finding 351 (devnet #5489422 953947B4, a fuzzer's Clawback from an
-        // issuer that never enabled clawback): Clawback::preclaim's order
-        // (Clawback.cpp:99-145) — the issuer must carry
-        // lsfAllowTrustLineClawback and not lsfNoFreeze (tecNO_PERMISSION),
-        // the holder must exist (terNO_ACCOUNT), the line must exist
-        // (tecNO_LINE, not tecNO_ENTRY), the balance must sit on the holder's
-        // side (tecNO_PERMISSION), and the holder must hold something
-        // (tecINSUFFICIENT_FUNDS). We read the line first and said
-        // tecNO_ENTRY / tesSUCCESS.
+        // Finding 351 (devnet #5489422 953947B4, a fuzzer's Clawback from an issuer that never
+        // enabled clawback). The order is Clawback::preclaim's:
+        // - the holder must exist (terNO_ACCOUNT, Clawback.cpp:189-192, tested above ahead of
+        //   both arms);
+        // - then preclaimHelper<Issue> (Clawback.cpp:99-145): the issuer must carry
+        //   lsfAllowTrustLineClawback and not lsfNoFreeze (tecNO_PERMISSION);
+        // - the line must exist (tecNO_LINE, not tecNO_ENTRY);
+        // - the balance must sit on the holder's side (tecNO_PERMISSION);
+        // - the holder must hold something (tecINSUFFICIENT_FUNDS).
+        // We used to read the line first and say tecNO_ENTRY / tesSUCCESS.
         {
             const LSF_ALLOW_TRUSTLINE_CLAWBACK: u64 = 0x8000_0000;
             const LSF_NO_FREEZE: u64 = 0x0020_0000;
@@ -802,9 +809,6 @@ impl Transactor for ClawbackTransactor {
                 .unwrap_or(0);
             if iflags & LSF_ALLOW_TRUSTLINE_CLAWBACK == 0 || iflags & LSF_NO_FREEZE != 0 {
                 return TxResult::NoPermission;
-            }
-            if !sandbox.exists(&keylet::account_root_key(&holder)) {
-                return TxResult::NoAccount;
             }
         }
         // The issuer (sender of clawback) and the holder define the trust line
@@ -1585,6 +1589,18 @@ impl Transactor for PermissionedDomainSetTransactor {
     fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
         if !sandbox.exists(&keylet::account_root_key(&tx.account)) {
             return TxResult::NoAccount;
+        }
+        // rippled PermissionedDomainSet::preclaim (PermissionedDomainSet.cpp:57-62): every
+        // accepted credential's issuer must have an AccountRoot, else tecNO_ISSUER. This runs
+        // ahead of the DomainID checks (missing → tecNO_ENTRY, not the owner → tecNO_PERMISSION,
+        // :64-72), which do_apply below makes in that order.
+        for cred in tx.fields.get("AcceptedCredentials").and_then(|v| v.as_array()).into_iter().flatten() {
+            let Some(issuer) = cred["Credential"].get("Issuer").and_then(decode_account_id) else {
+                return TxResult::Malformed; // rippled's preflight (credentials::checkArray) refuses it
+            };
+            if !sandbox.exists(&keylet::account_root_key(&issuer)) {
+                return TxResult::NoIssuer;
+            }
         }
         TxResult::Success
     }

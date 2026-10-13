@@ -2279,7 +2279,13 @@ fn load_amm_prestate(state: &mut LedgerState, url: &str, txj: &Value, ledger_ind
     let tt = txj["TransactionType"].as_str();
     if !matches!(
         tt,
-        Some("AMMDeposit") | Some("AMMWithdraw") | Some("AMMCreate") | Some("AMMVote") | Some("AMMDelete") | Some("AMMClawback")
+        Some("AMMDeposit")
+            | Some("AMMWithdraw")
+            | Some("AMMCreate")
+            | Some("AMMVote")
+            | Some("AMMDelete")
+            | Some("AMMClawback")
+            | Some("AMMBid") // its block below (the LP line, every AuthAccounts root) never ran without this
     ) {
         return;
     }
@@ -2643,6 +2649,12 @@ fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<Hash
     // Phase 2+3+4: preclaim → common → do_apply. rippled's checkFee runs ahead of the
     // transactor's own preclaim (invokePreclaim, applySteps.cpp:204), as in native_apply.rs.
     let mut sb = Sandbox::new(state);
+    // checkPermission comes before checkFee (applySteps.cpp:188-204), as in native_apply.rs. On a
+    // partial state, only a loaded Delegate object can refuse.
+    let perm = xrpl_ledger::tx::delegate::check_delegate_permission(tx, &sb);
+    if !perm.is_success() && (state.complete || xrpl_node::native_apply::delegate_loaded(tx, &sb)) {
+        return (perm.code_str().to_string(), HashMap::new());
+    }
     let fee = xrpl_ledger::ledger::transactor::check_fee(tx, &sb);
     let preclaim = if fee.is_success() { transactor.preclaim(tx, &sb) } else { fee };
     if !preclaim.is_success() && !preclaim.is_claimed() {

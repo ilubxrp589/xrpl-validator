@@ -367,6 +367,20 @@ fn asset_currency20(v: &serde_json::Value) -> [u8; 20] {
     c
 }
 
+/// rippled answers a missing AMM pool with terNO_AMM, a retry (AMMDeposit.cpp:186, AMMWithdraw.cpp:192,
+/// AMMVote.cpp:65, AMMBid.cpp:111, AMMClawback.cpp:116).
+/// - We give that answer only on a complete state: the native shadow's mirror
+///   (`LedgerState::complete`).
+/// - On a partial pre-state (the probe's), a pool that reads as missing may just not be loaded, so
+///   each site keeps its older answer, `partial`.
+fn missing_pool(sandbox: &Sandbox, partial: TxResult) -> TxResult {
+    if sandbox.base().complete {
+        TxResult::NoAmm
+    } else {
+        partial
+    }
+}
+
 /// Resolve the AMM object key, its operating account, and the LP-token leg
 /// (0x03-currency issued by the AMM account) for a Deposit/Withdraw.
 fn amm_ctx(
@@ -1202,7 +1216,7 @@ impl Transactor for AMMDepositTransactor {
         // Check AMM exists
         let amm_key = match amm_key_from_asset_fields(tx) {
             Some(key) => {
-                if !sandbox.exists(&key) { return TxResult::NoEntry; }
+                if !sandbox.exists(&key) { return missing_pool(sandbox, TxResult::NoEntry); }
                 key
             }
             None => return TxResult::Malformed,
@@ -2242,7 +2256,7 @@ impl Transactor for AMMWithdrawTransactor {
         if !sandbox.exists(&acct_key) { return TxResult::NoAccount; }
         let amm_key = match amm_key_from_asset_fields(tx) {
             Some(key) => {
-                if !sandbox.exists(&key) { return TxResult::NoEntry; }
+                if !sandbox.exists(&key) { return missing_pool(sandbox, TxResult::NoEntry); }
                 key
             }
             None => return TxResult::Malformed,
@@ -2910,6 +2924,11 @@ impl Transactor for AMMVoteTransactor {
         // retry code no validated ledger carries. The probe hydrates the
         // pool and the voter's LP line for AMMVote (load_amm_prestate), the
         // AMMDeposit lesson: the check and its hydration land together.
+        // On a complete state a missing pool is terNO_AMM, first (AMMVote.cpp:62-66); on a partial
+        // one, the skip below ([`missing_pool`]).
+        if sandbox.base().complete && amm_key_from_asset_fields(tx).is_some_and(|k| !sandbox.exists(&k)) {
+            return TxResult::NoAmm;
+        }
         if let Some((amm_key, _amm_acct, lp_leg)) = amm_ctx(tx, sandbox) {
             if let Some(obj) = crate::tx::offer::json_at(sandbox, &amm_key) {
                 if matches!(obj["LPTokenBalance"]["value"].as_str(), Some("0") | Some("-0")) {
@@ -3161,7 +3180,9 @@ impl Transactor for AMMBidTransactor {
         let acct_key = keylet::account_root_key(&tx.account);
         if !sandbox.exists(&acct_key) { return TxResult::NoAccount; }
         let Some((amm_key, _amm_acct, lp_leg)) = amm_ctx(tx, sandbox) else {
-            return TxResult::Success; // unhydrated pool: never condemn (F49 rule)
+            // Complete state: terNO_AMM (AMMBid.cpp:108-112). Partial: an unhydrated pool, never
+            // condemn (F49 rule).
+            return missing_pool(sandbox, TxResult::Success);
         };
         let Some(amm) = ox::json_at(sandbox, &amm_key) else {
             return TxResult::Success;
@@ -3171,6 +3192,18 @@ impl Transactor for AMMBidTransactor {
         };
         if lpt_amm.0 == 0 {
             return TxResult::AmmEmpty;
+        }
+        // AMMBid.cpp:118-127, next: every AuthAccounts[].Account must have an AccountRoot,
+        // else terNO_ACCOUNT. We had no such check; the 3.3 NoAccount audit found it (10-13).
+        // An account that doesn't decode is rippled's preflight temMALFORMED.
+        for e in tx.fields.get("AuthAccounts").and_then(|v| v.as_array()).into_iter().flatten() {
+            let Some(a) = e.get("AuthAccount").and_then(|o| o.get("Account")).and_then(|v| v.as_str()).and_then(ox::decode20)
+            else {
+                return TxResult::Malformed;
+            };
+            if !sandbox.exists(&keylet::account_root_key(&a)) {
+                return TxResult::NoAccount;
+            }
         }
         let lkey = keylet::ripple_state_key(&tx.account, &lp_leg.issuer, &lp_leg.cur);
         let lp_tokens = match ox::json_at(sandbox, &lkey) {
@@ -4367,9 +4400,9 @@ impl Transactor for AMMClawbackTransactor {
             + u128::from(tx.account_fee());
         let snap = sandbox.snapshot();
         let Some((amm_key, amm_acct, _lp_leg)) = amm_ctx(tx, sandbox) else {
-            // terNO_AMM is a ter retry code our enum lacks; NoEntry is the
-            // closest honest stand-in until a specimen decides it.
-            return TxResult::NoEntry;
+            // Complete state: terNO_AMM (AMMClawback.cpp:116). Partial: NoEntry, the stand-in we used
+            // before the state could say it was whole.
+            return missing_pool(sandbox, TxResult::NoEntry);
         };
         // lsfAllowTrustLineClawback (0x80000000) required, lsfNoFreeze
         // (0x00200000) forbidden, on the clawing issuer.

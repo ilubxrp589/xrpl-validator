@@ -1248,16 +1248,16 @@ impl Transactor for EscrowCancelTransactor {
             Err(_) => return TxResult::Malformed,
         };
 
-        // --- Time check: if escrow has CancelAfter, only allow anyone to cancel
-        // after CancelAfter has passed. Before that, only the escrow creator can cancel. ---
+        // --- Time check (rippled EscrowCancel::doApply, EscrowCancel.cpp:133-141): an escrow
+        // with no CancelAfter can't be cancelled at all, and none can before CancelAfter has
+        // passed (`after(now, CancelAfter)`, now = the parent ledger's close time), WHOEVER
+        // signs. (This used to let the owner cancel early, and anyone cancel an escrow with no
+        // CancelAfter; rippled refuses both with tecNO_PERMISSION.) ---
         let close_time = sandbox.base().header.close_time as u64;
-        if let Some(cancel_after) = escrow.get("CancelAfter").and_then(|v| v.as_u64()) {
-            if close_time <= cancel_after {
-                // CancelAfter hasn't passed yet — only the escrow creator may cancel
-                if tx.account != owner_id {
-                    return TxResult::NoPermission;
-                }
-            }
+        match escrow.get("CancelAfter").and_then(|v| v.as_u64()) {
+            None => return TxResult::NoPermission,
+            Some(cancel_after) if close_time <= cancel_after => return TxResult::NoPermission,
+            Some(_) => {}
         }
 
         // Parse Amount from escrow
@@ -1849,6 +1849,10 @@ mod tests {
         let mods = sb.into_modifications();
         apply_modifications(&mut state, mods).unwrap();
 
+        // The cancel comes in a later ledger, past CancelAfter (20). rippled refuses a cancel before
+        // it, whoever signs (EscrowCancel.cpp:140-141); this test used to cancel in the same ledger,
+        // which only our old owner exception allowed.
+        state.header.close_time = 21;
         let cancel = TxFields {
             account: holder, tx_type: "EscrowCancel".into(), fee: 12, sequence: 4, last_ledger_seq: None, ticket_seq: None,
             fields: serde_json::json!({"Owner": hex::encode(holder), "OfferSequence": 3}),
@@ -1990,6 +1994,10 @@ mod tests {
             .state_map
             .insert(esc_key, serde_json::to_vec(&escrow_obj).unwrap())
             .unwrap();
+        // ...in a ledger past CancelAfter. rippled refuses a cancel before it, whoever signs
+        // (EscrowCancel.cpp:140-141). This test used to cancel at close time 10, which only our
+        // old owner exception allowed.
+        state.header.close_time = 500_000_001;
 
         // Alice cancels the escrow
         let tx = TxFields {

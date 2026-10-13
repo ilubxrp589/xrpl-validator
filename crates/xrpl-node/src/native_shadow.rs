@@ -785,6 +785,10 @@ impl NativeShadow {
         self.bad_overflow = bad_overflow;
         let as_of = at_seq;
         self.state = state;
+        // A finished full scan of state.rocks is the whole ledger: the engine may now treat an absent
+        // key as absent (LedgerState::complete; e.g. a missing AMM pool is terNO_AMM). drop_mirror
+        // and the re-hydrate reset rebuild the map with new_unverified, which clears it again.
+        self.state.complete = true;
         self.at_seq = as_of;
         self.hydrated = true;
         self.last_hydrate = Some(std::time::Instant::now());
@@ -2442,6 +2446,38 @@ mod tests {
         for (k, v) in &overlay {
             assert_eq!(&reencoded(&sh, k), v);
         }
+    }
+
+    /// LedgerState::complete follows the mirror. A finished full scan sets it (install_hydrate), and
+    /// drop_mirror clears it: what's left is no longer the whole ledger, so a missing AMM pool goes back
+    /// to reading as "not loaded".
+    #[test]
+    fn the_mirror_is_complete_once_hydrated_and_not_once_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, trigger) = (dir.path().join("receipts.jsonl"), dir.path().join("native_shadow.canary"));
+        let (seq, _parent, _pct, _drops, _tx, state, _overlay) = payment_ledger();
+        let mut sh = shadow(LedgerState::new_unverified(state.header.clone()), 0, &log, &trigger);
+        assert!(!sh.state.complete, "nothing hydrated yet");
+        sh.hydrated = false;
+        sh.hydrating = Some(std::thread::spawn(move || {
+            Some(HydrateOutcome {
+                state,
+                at_seq: seq - 1,
+                objects: 1,
+                undecodable: 0,
+                reencode_bad: 0,
+                ms: 0,
+                bad_keys: HashSet::new(),
+                bad_overflow: false,
+            })
+        }));
+        while !sh.hydrating.as_ref().unwrap().is_finished() {
+            std::thread::yield_now();
+        }
+        sh.poll_hydrate();
+        assert!(sh.hydrated && sh.state.complete, "a finished full scan is the whole ledger");
+        sh.drop_mirror("test");
+        assert!(!sh.state.complete, "a dropped mirror is not");
     }
 
     fn lines(log: &std::path::Path) -> Vec<Value> {
