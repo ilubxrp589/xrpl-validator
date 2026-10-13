@@ -18,7 +18,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use serde_json::{json, Value};
-use xrpl_core::types::Hash256;
 use xrpl_ledger::ledger::header::LedgerHeader;
 use xrpl_ledger::shamap::wire::{NodeId, Offered, TxTreeFetch};
 
@@ -154,8 +153,8 @@ impl LedgerFetch {
 
     /// The proven header and every transaction with its record, once done.
     pub fn into_result(self) -> Option<(LedgerHeader, Vec<(Vec<u8>, Vec<u8>)>)> {
-        let tree = self.tree?;
-        tree.is_complete().then(|| (self.header?, tree.into_pairs()))
+        let (tree, header) = (self.tree?, self.header?);
+        tree.is_complete().then(|| (header, tree.into_pairs()))
     }
 }
 
@@ -266,6 +265,7 @@ pub fn metrics_text() -> String {
 mod tests {
     use super::*;
     use crate::peer::protocol::TmLedgerNode;
+    use xrpl_core::types::Hash256;
     use xrpl_ledger::shamap::tx_tree::compute_tx_tree_root;
     use xrpl_ledger::shamap::wire::tx_tree_wire_nodes;
 
