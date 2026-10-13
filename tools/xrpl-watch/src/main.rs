@@ -21,8 +21,10 @@
 //!   xrpl-watch --record DIR [--frames N] [--interval S] [--size WxH]
 //!                                      N frames, one every S seconds, as DIR/frame_00001.ans … (for videos);
 //!                                      --fps F records F frames a second while the data is read every S
+//!   --page independence                start --once / --record (or the live screen) on the INDEPENDENCE page
 //!   --basic                            16 colours instead of 24-bit (old terminals)
-//!   keys: q quit · p pause
+//!   keys: q quit · p pause · i the INDEPENDENCE page (the road to a fully independent validator) · 1 the main
+//!         screen · Tab flips between them
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
@@ -39,6 +41,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use serde_json::{json, Value};
+
+mod independence;
 
 // ---------------------------------------------------------------------------------------------------------------
 // Palette: HALCYON synthwave (24-bit), or the 16 terminal colours with --basic
@@ -210,6 +214,8 @@ struct Snap {
     last_decision: Option<(SystemTime, u64, String, Option<String>)>,
     ter_miss_top: Vec<(String, usize)>,
     amendments: Vec<(String, i64, bool)>, // (name, seconds to activation, supported upstream)
+    /// The INDEPENDENCE page's slower sources.
+    ind: independence::Ind,
     at: Option<SystemTime>,
 }
 
@@ -519,6 +525,7 @@ fn collect(cfg: Arc<Cfg>, shared: Arc<Mutex<Shared>>, frames_left: Option<Arc<Mu
     let mut vproc: Option<ValidatorProc> = None;
     let mut receipts_sig: Option<(u64, SystemTime)> = None;
     let mut receipts_at: Option<Instant> = None;
+    let mut ind_at: Option<Instant> = None;
     loop {
         let t0 = Instant::now();
         let mut sn = Snap::default();
@@ -555,6 +562,14 @@ fn collect(cfg: Arc<Cfg>, shared: Arc<Mutex<Shared>>, frames_left: Option<Arc<Mu
             sn.pid = Some(p.pid);
             sn.rss_gb = p.rss_gb();
             sn.flow_engine = p.env("XRPL_FLOW_ENGINE");
+        }
+        // The INDEPENDENCE page's sources, every 5 s.
+        let prev_ind = prev.as_ref().map(|p| p.ind.clone()).unwrap_or_default();
+        if ind_at.map_or(true, |t| t.elapsed() >= Duration::from_secs(5)) {
+            sn.ind = independence::read(&cfg, vproc.as_ref(), &prev_ind);
+            ind_at = Some(Instant::now());
+        } else {
+            sn.ind = prev_ind;
         }
         let led = u(&sn.eng, &["native_shadow", "ledgers"]);
         let run_start = u(&sn.eng, &["ledger_seq"]).saturating_sub(led + 2);
@@ -970,7 +985,17 @@ fn problems(sn: &Snap) -> Vec<String> {
 // ---------------------------------------------------------------------------------------------------------------
 // The screen
 
-fn draw(f: &mut Frame, g: &Shared, paused: bool) {
+/// Which page is on screen.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Main,
+    Independence,
+}
+
+fn draw(f: &mut Frame, g: &Shared, paused: bool, page: Page) {
+    if page == Page::Independence {
+        return independence::draw(f, g, paused);
+    }
     let p = pal();
     let area = f.area();
     f.render_widget(Block::new().style(Style::new().bg(p.bg)), area);
@@ -1729,7 +1754,7 @@ fn draw_ledger_mix(f: &mut Frame, r: Rect, sn: &Snap) {
 
 fn draw_footer(f: &mut Frame, r: Rect, sn: &Snap, paused: bool) {
     let p = pal();
-    let mut v = vec![dim(" q quit · p pause · real time: ~30 fps, the validator read 4× a second · counts since the validator started · xrpl-watch")];
+    let mut v = vec![dim(" q quit · p pause · i independence · 1 main · real time: ~30 fps, the validator read 4× a second · counts since the validator started · xrpl-watch")];
     if paused {
         v.push(bold("   ⏸ PAUSED", p.warn));
     }
@@ -1839,6 +1864,7 @@ fn main() -> io::Result<()> {
         tweens: BTreeMap::new(),
     }));
 
+    let mut page = if arg_value(&args, "--page").as_deref() == Some("independence") { Page::Independence } else { Page::Main };
     let once = args.iter().any(|a| a == "--once");
     let record = arg_value(&args, "--record");
     if once || record.is_some() {
@@ -1867,7 +1893,7 @@ fn main() -> io::Result<()> {
             let tick = Instant::now();
             {
                 let g = shared.lock().unwrap();
-                term.draw(|f| draw(f, &g, false)).map_err(io::Error::other)?;
+                term.draw(|f| draw(f, &g, false, page)).map_err(io::Error::other)?;
             }
             let ansi = buffer_to_ansi(term.backend().buffer());
             match &record {
@@ -1904,10 +1930,10 @@ fn main() -> io::Result<()> {
                 let g = shared.lock().unwrap();
                 if paused {
                     let fz = frozen.get_or_insert_with(|| g.clone());
-                    terminal.draw(|f| draw(f, fz, true))?;
+                    terminal.draw(|f| draw(f, fz, true, page))?;
                 } else {
                     frozen = None;
-                    terminal.draw(|f| draw(f, &g, false))?;
+                    terminal.draw(|f| draw(f, &g, false, page))?;
                 }
             }
             if event::poll(Duration::from_millis(33))? {
@@ -1916,6 +1942,9 @@ fn main() -> io::Result<()> {
                         match k.code {
                             KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                             KeyCode::Char('p') => paused = !paused,
+                            KeyCode::Char('i') => page = Page::Independence,
+                            KeyCode::Char('1') => page = Page::Main,
+                            KeyCode::Tab => page = if page == Page::Main { Page::Independence } else { Page::Main },
                             _ => {}
                         }
                     }
