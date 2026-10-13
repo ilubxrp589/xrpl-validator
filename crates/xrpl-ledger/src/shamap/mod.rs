@@ -15,5 +15,6 @@ pub mod sync;
 pub mod tree;
 pub mod tx_set;
 pub mod tx_tree;
+pub mod wire;
 
 pub use tree::{SHAMap, TreeType};

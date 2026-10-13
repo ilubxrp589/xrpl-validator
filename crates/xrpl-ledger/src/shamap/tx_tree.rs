@@ -24,7 +24,7 @@ use xrpl_core::types::Hash256;
 /// Mirrors rippled `Serializer::addEncoded` exactly. tx/meta blobs never approach
 /// the 3-byte ceiling; the final branch clamps defensively (a wrong prefix can only
 /// cause a completeness mismatch, never silent corruption — the gate would re-pull).
-fn vl_prefix(len: usize) -> Vec<u8> {
+pub(super) fn vl_prefix(len: usize) -> Vec<u8> {
     if len <= 192 {
         vec![len as u8]
     } else if len <= 12480 {
