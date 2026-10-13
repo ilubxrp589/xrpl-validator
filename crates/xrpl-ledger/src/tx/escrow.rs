@@ -1849,6 +1849,10 @@ mod tests {
         let mods = sb.into_modifications();
         apply_modifications(&mut state, mods).unwrap();
 
+        // The cancel comes in a later ledger, past CancelAfter (20). rippled refuses a cancel before
+        // it, whoever signs (EscrowCancel.cpp:140-141); this test used to cancel in the same ledger,
+        // which only our old owner exception allowed.
+        state.header.close_time = 21;
         let cancel = TxFields {
             account: holder, tx_type: "EscrowCancel".into(), fee: 12, sequence: 4, last_ledger_seq: None, ticket_seq: None,
             fields: serde_json::json!({"Owner": hex::encode(holder), "OfferSequence": 3}),
@@ -1990,6 +1994,10 @@ mod tests {
             .state_map
             .insert(esc_key, serde_json::to_vec(&escrow_obj).unwrap())
             .unwrap();
+        // ...in a ledger past CancelAfter. rippled refuses a cancel before it, whoever signs
+        // (EscrowCancel.cpp:140-141). This test used to cancel at close time 10, which only our
+        // old owner exception allowed.
+        state.header.close_time = 500_000_001;
 
         // Alice cancels the escrow
         let tx = TxFields {
