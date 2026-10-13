@@ -166,9 +166,17 @@ pub fn metrics_text() -> String {
         None => (0, 0, 0, 0, 0),
         Some(r) => (1, r.unknown_enabled.len(), r.gap_enabled.len(), r.majority_unknown.len(), r.seq),
     };
-    format!(
-        "# HELP xrpl_amendment_guard_read 1 once the guard has read a ledger's Amendments object.\n         # TYPE xrpl_amendment_guard_read gauge\n         xrpl_amendment_guard_read {seen}\n         # HELP xrpl_amendment_guard_unknown_enabled Amendments enabled on mainnet that the engine has not built (the alarm).\n         # TYPE xrpl_amendment_guard_unknown_enabled gauge\n         xrpl_amendment_guard_unknown_enabled {alarm}\n         # HELP xrpl_amendment_guard_gap_enabled Enabled amendments on the known-gap list.\n         # TYPE xrpl_amendment_guard_gap_enabled gauge\n         xrpl_amendment_guard_gap_enabled {gap}\n         # HELP xrpl_amendment_guard_majority_unknown Amendments with majority that the engine has not built.\n         # TYPE xrpl_amendment_guard_majority_unknown gauge\n         xrpl_amendment_guard_majority_unknown {maj}\n         # HELP xrpl_amendment_guard_seq The ledger the guard last read.\n         # TYPE xrpl_amendment_guard_seq gauge\n         xrpl_amendment_guard_seq {seq}\n"
-    )
+    let mut out = String::new();
+    for (name, help, v) in [
+        ("xrpl_amendment_guard_read", "1 once the guard has read a ledger's Amendments object.", seen as u64),
+        ("xrpl_amendment_guard_unknown_enabled", "Amendments enabled on mainnet that the engine has not built (the alarm).", alarm as u64),
+        ("xrpl_amendment_guard_gap_enabled", "Enabled amendments on the known-gap list.", gap as u64),
+        ("xrpl_amendment_guard_majority_unknown", "Amendments with majority that the engine has not built.", maj as u64),
+        ("xrpl_amendment_guard_seq", "The ledger the guard last read.", u64::from(seq)),
+    ] {
+        out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n{name} {v}\n"));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -233,5 +241,14 @@ mod tests {
         }
         assert!(KNOWN_GAP.iter().all(|g| !ENGINE_KNOWN.contains(g)), "a gap is by definition not built");
         assert!(OTHER_NAMES.iter().all(|o| !ENGINE_KNOWN.contains(o)));
+    }
+
+    #[test]
+    fn every_metrics_line_starts_at_the_margin() {
+        // 2026-10-13: the first build's lines carried the source's indentation (a shell heredoc ate the
+        // string continuations), so every line after the first began with spaces.
+        let m = metrics_text();
+        assert!(m.lines().all(|l| l.starts_with("# ") || l.starts_with("xrpl_amendment_guard_")), "{m}");
+        assert_eq!(m.lines().count(), 15);
     }
 }
