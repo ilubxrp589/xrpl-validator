@@ -303,7 +303,7 @@ Step 2's receipts and the live-edge change (5.4) are where it can stretch.
 | 5.2 | Agreed-set tracker | M |
 | 5.3 | Close time: the answer key and the code (**in progress 12 Oct**) | M |
 | 5.4 | Build in the round | **M–L** |
-| 5.5 | Shadow gauge | S |
+| 5.5 | Shadow gauge (**first form built 13 Oct**, trailing the network; ships in cycle 173) | S |
 | 5.6 | 5a: verify, then sign, with stop-on-doubt and a breaker (**tap**) | M |
 | 5.7 | 5b: sign on compute (**tap**) | S |
 
@@ -340,6 +340,12 @@ Step 2's receipts and the live-edge change (5.4) are where it can stretch.
 **5.5 Shadow gauge.**
 - **What:** our in-round hash against the validated hash (from 4.5), every ledger, with a metric, a TUI line and
   receipts. It replaces the July lockstep gauge.
+- **First form (13 Oct, `own_hash.rs`, `XRPL_OWN_HASH=1`):** before the round exists, the same gauge trails the
+  network. Each landed ledger's header comes from our own parts: the state root (when every byte written was our
+  engine's, the skip list and singletons included), the tree of our own records (when our order matched), our total
+  XRP, our parent hash and the 5.3 resolution. Only the voted close time and its flag are the network's. Any part we
+  could not make is borrowed from the header and named. Offline, on 14 mainnet ledgers: our hash equal to the
+  network's on all 14, nothing borrowed. 5.4 moves it into the round.
 - **Done when** the gauge holds 100% for weeks.
 
 **5.6 5a: verify, then sign.**
