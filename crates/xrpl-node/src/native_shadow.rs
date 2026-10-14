@@ -284,6 +284,10 @@ pub struct NativeShadow {
     order_log: std::path::PathBuf,
     /// The last two ledgers applied and their header's total XRP: the parent's total for task 3.4's check.
     totals: [(u32, u64); 2],
+    /// Independence 5.5: the last ledger proposed, and the fees our engine burned applying it.
+    burned: Option<(u32, u64)>,
+    /// Independence 5.5: the last ledger committed, and why its bytes were not all ours (None: they were).
+    own_state: Option<(u32, Option<String>)>,
 }
 
 /// What the writer hands ws-sync for one ledger.
@@ -515,6 +519,8 @@ impl NativeShadow {
             order_mode,
             order_log,
             totals: [(0, 0), parent_total.map_or((0, 0), |t| (at_seq, t))],
+            burned: None,
+            own_state: None,
         }
     }
 
@@ -578,6 +584,8 @@ impl NativeShadow {
             order_mode: crate::native_order::mode(),
             order_log: crate::native_order::log_path(),
             totals: [(0, 0); 2],
+            burned: None,
+            own_state: None,
         })
     }
 
@@ -1846,6 +1854,7 @@ impl NativeShadow {
         let t0 = std::time::Instant::now();
         let ordered = apply_order(txs);
         let applied = self.apply_ledger(seq, parent_hash, parent_close_time, total_drops, &ordered);
+        self.burned = Some((seq, applied.burned));
         // Taken BEFORE the compare: a planted canary must never be written.
         let (overlay, refusal) = self.vouch(seq, &applied, meta_keys, meta_deleted);
         let real_tx = txs
@@ -1976,6 +1985,7 @@ impl NativeShadow {
         if ours {
             st.writer_native.fetch_add(1, Ordering::Relaxed);
         }
+        self.own_state = Some((seq, Some("no mirror to apply on".into())));
         self.poll_hydrate();
         if !self.hydrated {
             self.held = None;
@@ -2007,11 +2017,62 @@ impl NativeShadow {
             self.drop_mirror("gap");
             return;
         }
+        let not_ours = if ours { self.singletons_differ(seq, &undo, written) } else { Some("the network's bytes".into()) };
+        self.own_state = Some((seq, not_ours));
         self.reconcile(seq, undo, written, true);
         if self.distrust == Some(seq) {
             self.distrust = None;
         }
         self.read_amendments(seq);
+    }
+
+    /// Independence 5.5: ws-sync writes the skip list and the protocol singletons from the network's bytes. Held
+    /// against the mirror's own after our apply (before the reconcile takes the written ones), byte for byte, and
+    /// every singleton our apply changed must be among the written. None: they are all ours.
+    fn singletons_differ(&self, seq: u32, undo: &HashMap<Hash256, Option<Vec<u8>>>, written: &LedgerOverlay) -> Option<String> {
+        let ws: HashSet<[u8; 32]> = crate::stage3::singleton_keys_for(seq)
+            .iter()
+            .filter_map(|h| hex::decode(h).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()))
+            .collect();
+        let singleton = |k: &[u8; 32]| is_singleton_key(&Hash256(*k), seq) || ws.contains(k);
+        let ours = |k: &[u8; 32]| -> Result<Option<Vec<u8>>, String> {
+            self.state.state_map.lookup(&Hash256(*k)).map(encode_entry).transpose()
+        };
+        for (k, theirs) in written.iter().filter(|(k, _)| singleton(k)) {
+            match ours(k) {
+                Ok(mine) if mine == *theirs => {}
+                Ok(mine) => {
+                    let how = match (mine.is_some(), theirs.is_some()) {
+                        (true, true) => "bytes differ",
+                        (true, false) => "ours present, the network's absent",
+                        _ => "ours absent, the network's present",
+                    };
+                    return Some(format!("singleton {}: {how}", hex::encode_upper(k)));
+                }
+                Err(e) => return Some(format!("singleton {}: ours will not encode ({e})", hex::encode_upper(k))),
+            }
+        }
+        for (k, pre) in undo.iter().filter(|(k, _)| singleton(&k.0) && !written.contains_key(&k.0)) {
+            let before = pre.as_deref().map(encode_entry).transpose();
+            if before != ours(&k.0) {
+                return Some(format!("singleton {}: changed by us, not written", hex::encode_upper(k.0)));
+            }
+        }
+        None
+    }
+
+    /// Independence 5.5: why ledger `seq`'s bytes were not all our engine's. None: they were (the proposal was
+    /// written and the singletons equal ours); a ledger this writer did not commit says so.
+    pub fn state_not_ours(&self, seq: u32) -> Option<String> {
+        match &self.own_state {
+            Some((s, why)) if *s == seq => why.clone(),
+            _ => Some("not committed by the writer".into()),
+        }
+    }
+
+    /// Independence 5.5: the fees our engine burned applying ledger `seq` (None: not proposed here).
+    pub fn burned(&self, seq: u32) -> Option<u64> {
+        self.burned.filter(|(s, _)| *s == seq).map(|(_, b)| b)
     }
 
     /// Nothing landed for `seq` (the write was held back or rolled back):
@@ -2243,6 +2304,8 @@ mod tests {
             order_mode: crate::native_order::Mode::Off,
             order_log: log.with_file_name("native_order.jsonl"),
             totals: [(0, 0); 2],
+            burned: None,
+            own_state: None,
         }
     }
 
@@ -2276,6 +2339,50 @@ mod tests {
             assert_eq!(&reencoded(&sh, k), v, "the mirror holds what was written");
         }
         assert!(lines(&log).is_empty(), "a clean ledger leaves no receipt");
+    }
+
+    #[test]
+    fn the_commit_says_whether_the_state_was_all_ours_singletons_included() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, trigger) = (dir.path().join("receipts.jsonl"), dir.path().join("native_shadow.canary"));
+        let (seq, parent, pct, drops, tx, state, overlay) = payment_ledger();
+        let fee: u64 = tx["Fee"].as_str().unwrap().parse().unwrap();
+        let (keys, deleted) = meta_of(&overlay);
+        let skip = keylet::skip_list_key().0;
+        let txs = [tx];
+
+        // Our proposal, and the skip list ws-sync fetched equal to the one our apply built: all ours.
+        let mut sh = shadow(state.clone(), seq - 1, &log, &trigger);
+        let p = sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).unwrap();
+        assert_eq!(sh.burned(seq), Some(fee), "a plain payment burns its fee");
+        assert_eq!(sh.burned(seq + 1), None);
+        let mut written = p.overlay.clone();
+        written.insert(skip, reencoded(&sh, &skip));
+        assert!(written[&skip].is_some(), "the apply built the skip list");
+        sh.commit(seq, &written, true);
+        assert_eq!(sh.state_not_ours(seq), None);
+        assert_eq!(sh.state_not_ours(seq + 1).as_deref(), Some("not committed by the writer"));
+
+        // The network's skip list is not ours.
+        let mut sh = shadow(state.clone(), seq - 1, &log, &trigger);
+        let p = sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).unwrap();
+        let mut written = p.overlay.clone();
+        written.insert(skip, None);
+        sh.commit(seq, &written, true);
+        let why = sh.state_not_ours(seq).expect("ours present, the network's absent");
+        assert!(why.contains(&hex::encode_upper(skip)) && why.contains("the network's absent"), "{why}");
+
+        // A skip list our apply changed and nobody wrote.
+        let mut sh = shadow(state.clone(), seq - 1, &log, &trigger);
+        let p = sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).unwrap();
+        sh.commit(seq, &p.overlay, true);
+        assert!(sh.state_not_ours(seq).unwrap().contains("changed by us, not written"));
+
+        // The network's bytes written instead of ours.
+        let mut sh = shadow(state, seq - 1, &log, &trigger);
+        sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).unwrap();
+        sh.commit(seq, &overlay, false);
+        assert_eq!(sh.state_not_ours(seq).as_deref(), Some("the network's bytes"));
     }
 
     #[test]

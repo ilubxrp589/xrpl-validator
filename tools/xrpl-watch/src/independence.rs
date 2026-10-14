@@ -57,6 +57,7 @@ pub fn read(cfg: &Cfg, vproc: Option<&ValidatorProc>, prev: &Ind) -> Ind {
         ("native_meta", "XRPL_NATIVE_META_LOG", "native_meta.jsonl"),
         ("native_order", "XRPL_NATIVE_ORDER_LOG", "native_order.jsonl"),
         ("peer_fetch", "XRPL_PEER_FETCH_LOG", "peer_fetch.jsonl"),
+        ("own_hash", "XRPL_OWN_HASH_LOG", "own_hash.jsonl"),
     ] {
         let f = path(env, file);
         let Ok(m) = fs::metadata(&f) else { continue };
@@ -305,9 +306,36 @@ fn steps(sn: &Snap) -> Vec<Step> {
                 _ => vec![bold(if on(ind, "XRPL_CONSENSUS_RECORD") { "starting" } else { "off" }, p.warn)],
             },
         ));
+        // 5.5, first form: our own ledger hash from the parts we made, trailing the network.
+        let oh = get(e, &["own_hash"]);
+        let own = b(oh, &["enabled"]);
+        if own {
+            lines.push(kv(
+                "own hash",
+                vec![
+                    bold(commas(u(oh, &["own"])), p.good),
+                    dim(" = the network's · "),
+                    zero_good(u(oh, &["differ"])),
+                    dim(format!(" differ · {} partial · {} in a row", commas(u(oh, &["partial"])), commas(u(oh, &["streak"])))),
+                ],
+            ));
+            let borrowed: Vec<String> = ["state", "transactions", "order", "total", "parent", "times"]
+                .into_iter()
+                .filter(|k| u(oh, &["borrowed", k]) > 0)
+                .map(|k| format!("{k} {}", commas(u(oh, &["borrowed", k]))))
+                .collect();
+            if !borrowed.is_empty() {
+                lines.push(kv("borrowed", vec![dim(borrowed.join(" · "))]));
+            }
+            lines.push(kv("receipts", vec![zero_good(logs("own_hash").unwrap_or(0) as u64), dim(" lines in own_hash.jsonl")]));
+        }
         lines.push(kv("signing", vec![ink("the network's hash"), dim(format!(" · {} in a row", commas(u(&sn.sh, &["consecutive_matches"]))))]));
         lines.push(note("next: sign our own hash when it equals the UNL's"));
-        let hero = Some((u(&sn.sh, &["consecutive_matches"]), "state-hash matches in a row".to_string(), p.violet));
+        let hero = if own {
+            Some((u(oh, &["own"]), "ledgers whose own hash = the network's".to_string(), p.violet))
+        } else {
+            Some((u(&sn.sh, &["consecutive_matches"]), "state-hash matches in a row".to_string(), p.violet))
+        };
         out.push(Step { n: 5, name: "BUILD AND SIGN OUR OWN HASH", st: St::Started, lines, hero });
     }
 

@@ -2785,7 +2785,9 @@ fn run_passes(
 
 /// Independence 3.3: NativeShadow::propose (the live writer) over `pre`, the ledger's pre-state, in our order's shadow
 /// and on modes. Prints each mode's refusal and order receipt, and whether the two modes offered the same bytes.
-fn run_shadow(pre: &LedgerState, store: &str, seq: u32) {
+/// Independence 5.5 (DX_OWNHASH=1, with XRPL_NATIVE_META=1): the shadow mode's proposal is also committed the way
+/// ws-sync commits it, and our own ledger hash judged ([`own_hash_line`]).
+fn run_shadow(pre: &LedgerState, store: &str, seq: u32, rpc_url: &str) {
     use xrpl_node::native_order::Mode;
     let read = |dir: &str, s: u32| -> Option<Value> {
         let v: Value = serde_json::from_str(&std::fs::read_to_string(format!("{store}/{dir}/{s}.json")).ok()?).ok()?;
@@ -2834,6 +2836,16 @@ fn run_shadow(pre: &LedgerState, store: &str, seq: u32) {
     let drops = total(&ledger).unwrap_or(0);
     let dir = std::env::temp_dir().join(format!("dx-shadow-{seq}-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
+    // 5.5: the skip lists in the pre-state too (the live mirror holds them), so the apply updates the real ones.
+    let own_hash = std::env::var("DX_OWNHASH").is_ok();
+    let mut pre = pre.clone();
+    if own_hash {
+        let mut long = vec![0x00u8, 0x73];
+        long.extend_from_slice(&((seq - 1) >> 16).to_be_bytes());
+        for k in [keylet::skip_list_key(), xrpl_ledger::shamap::hash::sha512_half(&long)] {
+            load_object(&mut pre, rpc_url, &hex::encode_upper(k.0), seq - 1);
+        }
+    }
     let mut offered = Vec::new();
     for mode in [Mode::Shadow, Mode::On] {
         let log = dir.join(format!("{mode:?}.jsonl"));
@@ -2850,6 +2862,9 @@ fn run_shadow(pre: &LedgerState, store: &str, seq: u32) {
             p.refusal.as_deref().map(|r| r.chars().take(200).collect::<String>()).unwrap_or_else(|| "none".into()),
             if receipt.trim().is_empty() { "none (order, results, bytes and total XRP the network's)".to_string() } else { receipt.trim().chars().take(600).collect() }
         );
+        if own_hash && mode == Mode::Shadow {
+            eprintln!("{}", own_hash_line(&mut sh, &p, rpc_url, seq));
+        }
         let mut o: Vec<([u8; 32], Option<Vec<u8>>)> = p.overlay.into_iter().collect();
         o.sort();
         offered.push(o);
@@ -2859,6 +2874,79 @@ fn run_shadow(pre: &LedgerState, store: &str, seq: u32) {
     }
     eprintln!("SHADOW #{seq} counters: {}", xrpl_node::native_order::summary());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Independence 5.5 offline: commit `p` with the network's skip list and singletons as ws-sync fetches them, then
+/// judge our own hash of ledger `seq`, chained from the network's header of `seq - 1`. The probe holds no full
+/// state, so the state root stands in as the network's: whether its bytes were all ours is what is judged here
+/// (the live writer's state-hash check proves the root itself every ledger).
+fn own_hash_line(sh: &mut xrpl_node::native_shadow::NativeShadow, p: &xrpl_node::native_shadow::Proposal, rpc_url: &str, seq: u32) -> String {
+    use xrpl_node::own_hash::{Parts, Tracker};
+    let b32 = |v: &Value| -> [u8; 32] { v.as_str().and_then(|h| hex::decode(h).ok()).and_then(|b| b.try_into().ok()).unwrap_or([0; 32]) };
+    let header = |s: u32| -> Option<(xrpl_node::ws_sync::LedgerHeader, [u8; 32])> {
+        let r = rpc(rpc_url, "ledger", json!({"ledger_index": s}))?;
+        let l = &r["result"]["ledger"];
+        let n = |k: &str| l[k].as_u64().or_else(|| l[k].as_str().and_then(|t| t.parse().ok()));
+        Some((
+            xrpl_node::ws_sync::LedgerHeader {
+                parent_hash: b32(&l["parent_hash"]),
+                parent_close_time: n("parent_close_time")? as u32,
+                total_drops: n("total_coins")?,
+                transaction_hash: b32(&l["transaction_hash"]),
+                close_time: n("close_time")? as u32,
+                close_resolution: n("close_time_resolution")? as u8,
+                close_flags: n("close_flags")? as u8,
+                ledger_hash: b32(&l["ledger_hash"]),
+            },
+            b32(&l["account_hash"]),
+        ))
+    };
+    let (Some((h0, a0)), Some((h1, a1))) = (header(seq - 1), header(seq)) else {
+        return format!("OWNHASH #{seq}: headers unavailable");
+    };
+    // What ws-sync writes: the proposal (or nothing of ours), and the five singletons from the network.
+    let mut written = if p.refusal.is_none() { p.overlay.clone() } else { Default::default() };
+    for k in xrpl_node::stage3::singleton_keys_for(seq) {
+        let Some(r) = rpc(rpc_url, "ledger_entry", json!({"index": k, "binary": true, "ledger_index": seq})) else {
+            return format!("OWNHASH #{seq}: singleton {} unavailable", &k[..16]);
+        };
+        let v = r["result"]["node_binary"].as_str().and_then(|b| hex::decode(b).ok());
+        written.insert(b32(&json!(k)), v);
+    }
+    sh.commit(seq, &written, p.refusal.is_none());
+    // The network's (tx, meta) pairs, which Step 2's check holds our records against.
+    let pairs: Vec<(Vec<u8>, Vec<u8>)> = rpc(rpc_url, "ledger", json!({"ledger_index": seq, "transactions": true, "expand": true, "binary": true}))
+        .and_then(|r| r["result"]["ledger"]["transactions"].as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|t| Some((hex::decode(t["tx_blob"].as_str()?).ok()?, hex::decode(t["meta"].as_str()?).ok()?)))
+        .collect();
+    let tx_root = xrpl_node::native_meta::check_ledger(seq, &pairs, &h1.transaction_hash);
+    let parts = Parts {
+        state_root: Some(a1),
+        state_not_ours: sh.state_not_ours(seq),
+        tx_root,
+        order_ours: xrpl_node::native_order::exact_for(seq),
+        burned: sh.burned(seq),
+    };
+    let mut t = Tracker::default();
+    let seeded = t.judge(seq - 1, &h0, &a0, &Parts { state_root: Some(a0), tx_root: Some(h0.transaction_hash), order_ours: Some(true), ..Parts::default() }, None);
+    if !seeded.network {
+        return format!("OWNHASH #{seq}: #{}'s header does not hash to its own ledger hash", seq - 1);
+    }
+    let j = t.judge(seq, &h1, &a1, &parts, None);
+    format!(
+        "OWNHASH #{seq}: {} ours {} network {}; borrowed {:?}; differs in {:?}; state {}; tx tree {}; total ours {} header {}",
+        if j.network { "MATCH" } else { "DIFFER" },
+        &hex::encode_upper(j.ours)[..16],
+        &hex::encode_upper(h1.ledger_hash)[..16],
+        j.borrowed,
+        j.differs_in,
+        parts.state_not_ours.as_deref().unwrap_or("all ours (root: the network's, offline)"),
+        match tx_root { Some(r) if r == h1.transaction_hash => "ours = header".to_string(), Some(_) => "ours DIFFERS".into(), None => format!("incomplete ({} pairs)", pairs.len()) },
+        parts.burned.map_or("-".into(), |b| (h0.total_drops.saturating_sub(b)).to_string()),
+        h1.total_drops,
+    )
 }
 
 /// Re-spell engine-internal JSON into the canonical forms the binary codec
@@ -3344,7 +3432,7 @@ fn run() -> i32 {
     // Independence 3.3 (DX_SHADOW=<s2 store>): the live writer's own code over the same pre-state: propose() in
     // XRPL_NATIVE_ORDER shadow and on, with the ledger as ws-sync hands it (the store's json/<seq>.json).
     if let Ok(store) = std::env::var("DX_SHADOW") {
-        run_shadow(&state, &store, seq);
+        run_shadow(&state, &store, seq, &rpc_url);
     }
 
     // Per-tx native replay + compare to mainnet.

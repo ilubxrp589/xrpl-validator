@@ -257,6 +257,18 @@ pub fn on_validation(blob: &[u8]) {
     settle(judged);
 }
 
+/// The hash our own tally reached quorum on for ledger `seq`, if one did (None also when off). Independence 5.5
+/// holds our own ledger hash against it.
+pub fn quorum_hash(seq: u32) -> Option<[u8; 32]> {
+    if !enabled() {
+        return None;
+    }
+    let t = tally().lock().unwrap_or_else(|p| p.into_inner());
+    let s = t.seqs.get(&seq)?;
+    // Two hashes at quorum for one sequence (never on a healthy network): no single answer.
+    (s.reached.len() == 1).then(|| s.reached.keys().next().copied()).flatten()
+}
+
 /// .39 called ledger `seq` validated (ws-sync, as it takes the ledger).
 pub fn network_validated(seq: u32, hash: [u8; 32]) {
     if !enabled() || hash == [0; 32] {

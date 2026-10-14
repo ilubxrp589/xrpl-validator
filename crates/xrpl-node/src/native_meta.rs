@@ -77,11 +77,11 @@ pub fn record(
 }
 
 /// Ledger `seq` is applied: judge our records against the network's `(tx_blob, meta)` pairs and our tree
-/// against the header's root.
-pub fn check_ledger(seq: u32, network: &[(Vec<u8>, Vec<u8>)], header_root: &[u8; 32]) {
-    let Some((s, ours)) = RECORDS.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+/// against the header's root. Returns our tree's root when every record was built (independence 5.5 hashes it).
+pub fn check_ledger(seq: u32, network: &[(Vec<u8>, Vec<u8>)], header_root: &[u8; 32]) -> Option<[u8; 32]> {
+    let (s, ours) = RECORDS.lock().unwrap_or_else(|e| e.into_inner()).take()?;
     if s != seq || network.is_empty() {
-        return;
+        return None;
     }
     let st = stats();
     st.ledgers.fetch_add(1, Ordering::Relaxed);
@@ -111,15 +111,18 @@ pub fn check_ledger(seq: u32, network: &[(Vec<u8>, Vec<u8>)], header_root: &[u8;
             }
         }
     }
-    if pairs.len() == network.len() {
-        if xrpl_ledger::shamap::tx_tree::compute_tx_tree_root(&pairs).0 == *header_root {
+    let root = (pairs.len() == network.len()).then(|| xrpl_ledger::shamap::tx_tree::compute_tx_tree_root(&pairs).0);
+    match root {
+        Some(r) if r == *header_root => {
             st.tree_match.fetch_add(1, Ordering::Relaxed);
-        } else {
+        }
+        Some(_) => {
             st.tree_differ.fetch_add(1, Ordering::Relaxed);
             receipts.push(json!({"seq": seq, "tree": "our transaction tree root differs from the header's"}));
         }
-    } else {
-        st.tree_incomplete.fetch_add(1, Ordering::Relaxed);
+        None => {
+            st.tree_incomplete.fetch_add(1, Ordering::Relaxed);
+        }
     }
     if !receipts.is_empty() {
         log_receipts(&receipts);
@@ -128,6 +131,7 @@ pub fn check_ledger(seq: u32, network: &[(Vec<u8>, Vec<u8>)], header_root: &[u8;
     if n % 256 == 1 {
         eprintln!("[native-meta] heartbeat #{seq}: {}", summary());
     }
+    root
 }
 
 fn log_receipts(receipts: &[Value]) {

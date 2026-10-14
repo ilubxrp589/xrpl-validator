@@ -1651,6 +1651,7 @@ async fn main() {
                     body.push_str(&xrpl_node::native_order::metrics_text());
                     body.push_str(&xrpl_node::peer_fetch::metrics_text());
                     body.push_str(&xrpl_node::own_validated::metrics_text());
+                    body.push_str(&xrpl_node::own_hash::metrics_text());
                     (
                         axum::http::StatusCode::OK,
                         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
@@ -1792,6 +1793,8 @@ async fn main() {
                     json["peer_fetch"] = xrpl_node::peer_fetch::json();
                     // Independence 4.5: "validated" from our own count of trusted validations.
                     json["own_validated"] = xrpl_node::own_validated::json();
+                    // Independence 5.5: our own ledger hash, from the parts we made, trailing the network.
+                    json["own_hash"] = xrpl_node::own_hash::json();
                     // Stage 4 Phase A: native-engine shadow counters.
                     #[cfg(feature = "ffi")]
                     {

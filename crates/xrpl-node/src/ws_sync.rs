@@ -144,6 +144,20 @@ pub async fn start_ws_sync(
     if native_shadow.is_some() && !stage3_cfg.enabled && !native_writer {
         eprintln!("[native-shadow] WARNING: XRPL_NATIVE_SHADOW set but Stage 3 is OFF — shadow will never run");
     }
+    // Independence 5.5: our own ledger hash is judged at the writer's commit, so it needs the writer.
+    #[cfg(feature = "ffi")]
+    if crate::own_hash::enabled() {
+        if native_writer {
+            eprintln!(
+                "[own-hash] ON — our own ledger hash per ledger (records {}, order {:?}, validators {})",
+                if crate::native_meta::enabled() { "on" } else { "OFF: transactions borrowed" },
+                crate::native_order::mode(),
+                if crate::own_validated::enabled() { "on" } else { "off" }
+            );
+        } else {
+            eprintln!("[own-hash] WARNING: XRPL_OWN_HASH set without the native writer — nothing will be judged");
+        }
+    }
     // Publish stage3 state to FfiStats so /api/engine can expose it for
     // dashboards + watch_engine.py. Only when the ffi verifier is present.
     #[cfg(feature = "ffi")]
@@ -850,7 +864,19 @@ pub async fn start_ws_sync(
                         if let Some(shadow) = native_shadow.as_mut() {
                             if result {
                                 shadow.commit(process_seq, &landed.written, wrote_native);
-                                crate::native_meta::check_ledger(process_seq, &gate_pairs, &ledger_header.transaction_hash);
+                                let tx_root = crate::native_meta::check_ledger(process_seq, &gate_pairs, &ledger_header.transaction_hash);
+                                // Independence 5.5: our own hash of the ledger just landed, from the parts this
+                                // validator made itself (XRPL_OWN_HASH=1; nothing when off).
+                                if crate::own_hash::enabled() {
+                                    let parts = crate::own_hash::Parts {
+                                        state_root: hash_comp.current_hash().map(|h| h.0),
+                                        state_not_ours: shadow.state_not_ours(process_seq),
+                                        tx_root,
+                                        order_ours: crate::native_order::exact_for(process_seq),
+                                        burned: shadow.burned(process_seq),
+                                    };
+                                    crate::own_hash::ledger(process_seq, &ledger_header, &account_hash, &parts);
+                                }
                             } else {
                                 shadow.abort(process_seq, wrote_native && landed.mismatched);
                             }

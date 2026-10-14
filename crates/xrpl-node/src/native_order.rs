@@ -81,6 +81,16 @@ pub fn stats() -> &'static OrderStats {
     S.get_or_init(OrderStats::default)
 }
 
+/// The last ledger judged, and whether it was exact (independence 5.5 reads it when that ledger lands).
+static LAST: std::sync::Mutex<Option<(u32, bool)>> = std::sync::Mutex::new(None);
+
+/// Whether ledger `seq`'s order, results and (in shadow) bytes were the network's. None: not judged (order off,
+/// or another ledger judged since).
+pub fn exact_for(seq: u32) -> Option<bool> {
+    let last = *LAST.lock().unwrap_or_else(|e| e.into_inner());
+    last.filter(|(s, _)| *s == seq).map(|(_, e)| e)
+}
+
 /// The consensus set a ledger was built from, in rippled's canonical order: every transaction but the Batch
 /// inners (`skip`, which apply inside their outer), salted with the set's own root. A pseudo-transaction's
 /// account is zero (EnableAmendment spells it rrrrrrrrrrrrrrrrrrrrrhoLvTp, UNLModify as "").
@@ -225,6 +235,7 @@ pub fn judge(seq: u32, mode: Mode, v: &Verdict, walked: &Walked, bytes: Option<(
         st.coins_match.fetch_add(1, Ordering::Relaxed);
     }
     let exact = v.order.is_none() && v.results.is_empty() && bytes_n == 0 && v.coins.is_none();
+    *LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some((seq, exact));
     let mut receipt = None;
     if exact {
         st.exact.fetch_add(1, Ordering::Relaxed);
