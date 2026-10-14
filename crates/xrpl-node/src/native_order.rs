@@ -400,7 +400,8 @@ mod tests {
         let ordered: Vec<&Value> = txs.iter().collect();
         let order = |set: &[TransactionEntry]| set.iter().map(|e| e.hash.0[0]).collect::<Vec<u8>>();
         let mut want_own = canonical_set(&ordered, &HashSet::new(), None);
-        canonical_order(&mut want_own, &consensus_salt(&want_own.iter().map(|e| e.hash).collect::<Vec<_>>()));
+        let own_root = consensus_salt(&want_own.iter().map(|e| e.hash).collect::<Vec<_>>());
+        canonical_order(&mut want_own, &own_root);
         assert_eq!(order(&canonical_set(&ordered, &HashSet::new(), None)), order(&want_own));
         // Salts that order the four accounts differently (0x11 ^ 0x00 < 0x22 ^ 0x00, but 0x11 ^ 0x33 > 0x22 ^ 0x33).
         assert_ne!(order(&canonical_set(&ordered, &HashSet::new(), Some([0; 32]))), order(&canonical_set(&ordered, &HashSet::new(), Some([0x33; 32]))));
