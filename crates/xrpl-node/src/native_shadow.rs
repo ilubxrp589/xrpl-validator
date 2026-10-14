@@ -1029,7 +1029,7 @@ impl NativeShadow {
         let mut walked = None;
         if ours {
             use xrpl_ledger::ledger::close::{apply_in_passes, ApplyOutcome};
-            let set = crate::native_order::canonical_set(ordered, &cx.attribution.skip);
+            let set = crate::native_order::canonical_set(ordered, &cx.attribution.skip, crate::own_validated::agreed_set(cx.seq));
             let mut codes: HashMap<String, String> = HashMap::new();
             let mut attempts = 0u64;
             let passes = apply_in_passes(set, |e, certain_retry| {

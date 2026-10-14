@@ -74,6 +74,10 @@ pub struct OrderStats {
     pub attempts: AtomicU64,
     pub last_seq: AtomicU64,
     pub ms_last: AtomicU64,
+    /// Ledgers salted with the set a quorum of trusted validations accepted, and those salted with the root of the
+    /// ledger's own transactions (no quorum named a set yet).
+    pub salt_agreed: AtomicU64,
+    pub salt_own: AtomicU64,
 }
 
 pub fn stats() -> &'static OrderStats {
@@ -92,9 +96,16 @@ pub fn exact_for(seq: u32) -> Option<bool> {
 }
 
 /// The consensus set a ledger was built from, in rippled's canonical order: every transaction but the Batch
-/// inners (`skip`, which apply inside their outer), salted with the set's own root. A pseudo-transaction's
-/// account is zero (EnableAmendment spells it rrrrrrrrrrrrrrrrrrrrrhoLvTp, UNLModify as "").
-pub fn canonical_set(ordered: &[&Value], skip: &HashSet<String>) -> Vec<TransactionEntry> {
+/// inners (`skip`, which apply inside their outer). A pseudo-transaction's account is zero (EnableAmendment spells
+/// it rrrrrrrrrrrrrrrrrrrrrhoLvTp, UNLModify as "").
+///
+/// rippled salts with the consensus set's root (`CanonicalTXSet{result.txns.map_->getHash()}`), and that set can
+/// hold transactions the ledger never filed: a tef drops out, a ter still waiting after the last pass carries over.
+/// So `agreed`, the set a quorum of trusted validations named in their `sfConsensusHash`, is the salt when we have
+/// it; without it, the root of the ledger's own transactions, which is the same set whenever every one was filed.
+/// Mainnet #107652744, #107652745, #107652752 (soak #48): our order differed at position 0 on exactly the three
+/// ledgers whose own root was not the validators' set (13 neighbours agreed).
+pub fn canonical_set(ordered: &[&Value], skip: &HashSet<String>, agreed: Option<[u8; 32]>) -> Vec<TransactionEntry> {
     let mut entries: Vec<TransactionEntry> = ordered
         .iter()
         .filter_map(|t| {
@@ -111,7 +122,16 @@ pub fn canonical_set(ordered: &[&Value], skip: &HashSet<String>) -> Vec<Transact
             Some(TransactionEntry { hash: Hash256(hash), account, seq_proxy, blob: Vec::new() })
         })
         .collect();
-    let salt = xrpl_ledger::ledger::close::consensus_salt(&entries.iter().map(|e| e.hash).collect::<Vec<_>>());
+    let salt = match agreed {
+        Some(set) => {
+            stats().salt_agreed.fetch_add(1, Ordering::Relaxed);
+            Hash256(set)
+        }
+        None => {
+            stats().salt_own.fetch_add(1, Ordering::Relaxed);
+            xrpl_ledger::ledger::close::consensus_salt(&entries.iter().map(|e| e.hash).collect::<Vec<_>>())
+        }
+    };
     xrpl_ledger::ledger::close::canonical_order(&mut entries, &salt);
     entries
 }
@@ -299,7 +319,7 @@ pub fn json() -> Value {
         "mode": mode().name(), "last_seq": l(&st.last_seq), "ledgers": l(&st.ledgers), "exact": l(&st.exact),
         "order_differ": l(&st.order_differ), "result_differ": l(&st.result_differ), "bytes_differ": l(&st.bytes_differ),
         "coins_match": l(&st.coins_match), "coins_differ": l(&st.coins_differ), "refused": l(&st.refused), "txs": l(&st.txs), "retried": l(&st.retried), "attempts": l(&st.attempts),
-        "ms_last": l(&st.ms_last),
+        "ms_last": l(&st.ms_last), "salt_agreed": l(&st.salt_agreed), "salt_own": l(&st.salt_own),
     })
 }
 
@@ -362,6 +382,35 @@ mod tests {
         assert_eq!(classify("", false, false), ApplyOutcome::Fail);
     }
 
+    /// rippled salts with the consensus set's root, which the validators name; the ledger's own root stands in only
+    /// when no quorum named one (mainnet #107652744).
+    #[test]
+    fn the_salt_is_the_agreed_set_when_there_is_one() {
+        use xrpl_ledger::ledger::close::{canonical_order, consensus_salt};
+        let txs: Vec<Value> = [
+            ('A', "rpZNAnHcvr6TbaY7QJa9yrVfu6coDz9pPH"), // accounts 0x11…, 0x22…, 0x33…, 0x44…
+            ('B', "rhf7192NqpPvBUnAobBJAryNFQNbPKz11w"),
+            ('C', "rnC5oDiiksa4mHdRUtGTupTMjaiPXzGs18"),
+            ('D', "rfDxjJ97Cs8qMPwtcBMc1pA7do7B8J5trV"),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, (h, a))| tx(*h, a, 1, "tesSUCCESS", i as u64))
+        .collect();
+        let ordered: Vec<&Value> = txs.iter().collect();
+        let order = |set: &[TransactionEntry]| set.iter().map(|e| e.hash.0[0]).collect::<Vec<u8>>();
+        let mut want_own = canonical_set(&ordered, &HashSet::new(), None);
+        canonical_order(&mut want_own, &consensus_salt(&want_own.iter().map(|e| e.hash).collect::<Vec<_>>()));
+        assert_eq!(order(&canonical_set(&ordered, &HashSet::new(), None)), order(&want_own));
+        // Salts that order the four accounts differently (0x11 ^ 0x00 < 0x22 ^ 0x00, but 0x11 ^ 0x33 > 0x22 ^ 0x33).
+        assert_ne!(order(&canonical_set(&ordered, &HashSet::new(), Some([0; 32]))), order(&canonical_set(&ordered, &HashSet::new(), Some([0x33; 32]))));
+        for agreed in [[0u8; 32], [0xFF; 32], [0x33; 32]] {
+            let mut want = canonical_set(&ordered, &HashSet::new(), None);
+            canonical_order(&mut want, &Hash256(agreed));
+            assert_eq!(order(&canonical_set(&ordered, &HashSet::new(), Some(agreed))), order(&want));
+        }
+    }
+
     #[test]
     fn the_set_leaves_out_the_inners_and_gives_a_pseudo_transaction_account_zero() {
         let a = tx('A', "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh", 5, "tesSUCCESS", 0);
@@ -369,7 +418,7 @@ mod tests {
         let c = tx('C', "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh", 6, "tesSUCCESS", 2);
         let ordered = vec![&a, &b, &c];
         let skip: HashSet<String> = ["C".repeat(64)].into_iter().collect();
-        let set = canonical_set(&ordered, &skip);
+        let set = canonical_set(&ordered, &skip, None);
         assert_eq!(set.len(), 2);
         assert!(set.iter().any(|e| e.account == [0u8; 20] && e.hash.0 == [0xBB; 32]));
         assert_eq!(network_order(&ordered, &skip), vec!["A".repeat(64), "B".repeat(64)]);

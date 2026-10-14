@@ -43,6 +43,8 @@ struct SeqVotes {
     votes: HashMap<Vec<u8>, ([u8; 32], u64)>,
     /// When each hash first reached quorum here.
     reached: HashMap<[u8; 32], u64>,
+    /// Each trusted validator's `sfConsensusHash` for this sequence: the root of the transaction set it accepted.
+    sets: HashMap<Vec<u8>, [u8; 32]>,
 }
 
 /// The tally behind the verdicts.
@@ -140,6 +142,29 @@ impl Tally {
             self.seqs.pop_first();
         }
         self.judge_pending(None)
+    }
+
+    /// The transaction set a full, trusted validation for `seq` says its validator accepted (`sfConsensusHash`).
+    /// Kept beside the vote [`Self::vote`] just recorded, so only for a sequence the tally holds.
+    pub fn note_set(&mut self, signing_key: &[u8], seq: u32, set: [u8; 32]) {
+        let Some(master) = self.signer.get(signing_key).cloned() else { return };
+        if let Some(s) = self.seqs.get_mut(&seq) {
+            s.sets.insert(master, set);
+        }
+    }
+
+    /// The transaction set a quorum of trusted validators accepted for `seq`: the consensus set rippled salts its
+    /// canonical order with. None until a quorum names one.
+    pub fn agreed_set(&self, seq: u32) -> Option<[u8; 32]> {
+        let q = self.quorum();
+        let s = self.seqs.get(&seq)?;
+        let mut counts: HashMap<[u8; 32], usize> = HashMap::new();
+        for (m, set) in &s.sets {
+            if !self.negative.contains(m) {
+                *counts.entry(*set).or_default() += 1;
+            }
+        }
+        counts.into_iter().find(|(_, n)| q > 0 && *n >= q).map(|(set, _)| set)
     }
 
     /// .39 called ledger `seq` validated with `hash`. Judges it now if it can, and every pending ledger that is
@@ -253,7 +278,14 @@ pub fn on_validation(blob: &[u8]) {
     }
     let now = now_ms();
     let Some(v) = crate::consensus_record::parse_validation(blob, now) else { return };
-    let judged = tally().lock().unwrap_or_else(|p| p.into_inner()).vote(&v.signing_key, v.ledger_seq, v.ledger_hash, v.full, now);
+    let judged = {
+        let mut t = tally().lock().unwrap_or_else(|p| p.into_inner());
+        let judged = t.vote(&v.signing_key, v.ledger_seq, v.ledger_hash, v.full, now);
+        if let (true, Some(set)) = (v.full, v.consensus_hash) {
+            t.note_set(&v.signing_key, v.ledger_seq, set);
+        }
+        judged
+    };
     settle(judged);
 }
 
@@ -267,6 +299,16 @@ pub fn quorum_hash(seq: u32) -> Option<[u8; 32]> {
     let s = t.seqs.get(&seq)?;
     // Two hashes at quorum for one sequence (never on a healthy network): no single answer.
     (s.reached.len() == 1).then(|| s.reached.keys().next().copied()).flatten()
+}
+
+/// The transaction set a quorum of trusted validators accepted for ledger `seq` (None also when off). Independence
+/// 3.3 salts our canonical order with it, as rippled salts with the consensus set's root: a set can hold
+/// transactions the ledger never filed, so the root of the ledger's own transactions is not always that salt.
+pub fn agreed_set(seq: u32) -> Option<[u8; 32]> {
+    if !enabled() {
+        return None;
+    }
+    tally().lock().unwrap_or_else(|p| p.into_inner()).agreed_set(seq)
 }
 
 /// .39 called ledger `seq` validated (ws-sync, as it takes the ledger).
@@ -389,6 +431,29 @@ mod tests {
         assert_eq!(t.quorum(), 23, "0.8 × 28 = 22.4 → 23, above 0.6 × 35 = 21");
         t.set_negative_unl(vec![vec![99; 33]]);
         assert_eq!(t.negative_size(), 0, "a key not on our list does not shrink it");
+    }
+
+    /// Mainnet #107652744: the validators' sfConsensusHash, not the root of the ledger's own transactions, is the set
+    /// rippled salted its order with. A quorum of trusted validators must name it; an untrusted key never counts.
+    #[test]
+    fn the_agreed_set_is_the_consensus_hash_a_quorum_of_trusted_validations_names() {
+        let mut t = Tally::default();
+        t.set_unl(&unl(35));
+        let (ledger, set, other) = ([7u8; 32], [0xA5u8; 32], [0x5Au8; 32]);
+        for i in 1..=27 {
+            t.vote(&sk(i), 100, ledger, true, 0);
+            t.note_set(&sk(i), 100, set);
+        }
+        t.vote(&[200; 33], 100, ledger, true, 0);
+        t.note_set(&[200; 33], 100, set);
+        assert_eq!(t.agreed_set(100), None, "27 trusted of 28, and an untrusted key adds nothing");
+        t.vote(&sk(28), 100, ledger, true, 0);
+        t.note_set(&sk(28), 100, other);
+        assert_eq!(t.agreed_set(100), None, "28 voted, but only 27 named the set");
+        t.vote(&sk(29), 100, ledger, true, 0);
+        t.note_set(&sk(29), 100, set);
+        assert_eq!(t.agreed_set(100), Some(set));
+        assert_eq!(t.agreed_set(101), None);
     }
 
     #[test]
