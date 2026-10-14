@@ -267,6 +267,27 @@ fn steps(sn: &Snap) -> Vec<Step> {
         } else {
             lines.push(kv("switch", vec![bold("XRPL_PEER_FETCH off", p.warn)]));
         }
+        // 4.5: "validated" from our own count of trusted validations.
+        let ov = get(e, &["own_validated"]);
+        if b(ov, &["enabled"]) {
+            let lead = get(ov, &["lead_ms_median"]).as_i64();
+            lines.push(kv(
+                "validated",
+                vec![
+                    bold(commas(u(ov, &["agree"])), p.good),
+                    dim(" ours = .39's · "),
+                    zero_good(u(ov, &["differ"])),
+                    dim(" differ · "),
+                    zero_good(u(ov, &["short"])),
+                    dim(" short"),
+                    dim(match lead {
+                        Some(ms) if ms >= 0 => format!(" · {ms} ms ahead"),
+                        Some(ms) => format!(" · {} ms behind", -ms),
+                        None => String::new(),
+                    }),
+                ],
+            ));
+        }
         lines.push(kv("source", vec![ink(".39"), dim(" · peers are the witness until 4.3")]));
         let hero = enabled.then(|| (u(pf, &["matched"]), "ledgers from peers, same as .39's".to_string(), p.feed));
         out.push(Step { n: 4, name: "LEDGERS FROM PEERS", st: if enabled { St::Shadow } else { St::Built }, lines, hero });

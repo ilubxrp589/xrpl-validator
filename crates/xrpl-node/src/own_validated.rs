@@ -57,6 +57,8 @@ pub struct Tally {
     pending: BTreeMap<u32, ([u8; 32], u64)>,
     /// How many ms before .39 we reached quorum, for the last judged ledgers (negative: after).
     leads: VecDeque<i64>,
+    /// The first sequence a trusted validation named: ledgers before it closed before the tally listened.
+    first_seq: Option<u32>,
 }
 
 /// One judged ledger.
@@ -123,6 +125,7 @@ impl Tally {
                 return Vec::new(); // far too old to matter
             }
         }
+        self.first_seq.get_or_insert(seq);
         let q = self.quorum();
         let negative = self.negative.contains(&master);
         let s = self.seqs.entry(seq).or_default();
@@ -142,6 +145,12 @@ impl Tally {
     /// .39 called ledger `seq` validated with `hash`. Judges it now if it can, and every pending ledger that is
     /// now too old to wait for.
     pub fn network_validated(&mut self, seq: u32, hash: [u8; 32], now_ms: u64) -> Vec<(u32, Verdict)> {
+        // Nothing to judge against until the list has loaded and the first trusted validation arrived, and a
+        // ledger older than that first one was voted on before we listened.
+        if self.masters.is_empty() || self.first_seq.is_none_or(|f| seq <= f) {
+            stats().unjudged.fetch_add(1, Ordering::Relaxed);
+            return self.judge_pending(Some(seq));
+        }
         self.pending.insert(seq, (hash, now_ms));
         self.judge_pending(Some(seq))
     }
@@ -196,6 +205,8 @@ pub struct OwnStats {
     pub validations: AtomicU64,
     pub untrusted: AtomicU64,
     pub partial: AtomicU64,
+    /// Ledgers .39 validated before the list loaded or before the first trusted validation came in: not judged.
+    pub unjudged: AtomicU64,
     pub judged: AtomicU64,
     pub agree: AtomicU64,
     pub differ: AtomicU64,
@@ -322,6 +333,7 @@ pub fn json() -> Value {
         "differ": l(&st.differ), "short": l(&st.short), "lead_ms_median": t.median_lead(),
         "quorum": t.quorum(), "unl": t.unl_size(), "negative_unl": t.negative_size(),
         "validations": l(&st.validations), "untrusted": l(&st.untrusted), "partial": l(&st.partial),
+        "unjudged": l(&st.unjudged),
     })
 }
 
@@ -372,6 +384,7 @@ mod tests {
         let mut t = Tally::default();
         t.set_unl(&unl(35));
         let h = [7u8; 32];
+        t.vote(&sk(30), 99, [9; 32], true, 0); // listening since #99
         for i in 1..=27 {
             assert!(t.vote(&sk(i), 100, h, true, 1_000 + u64::from(i)).is_empty());
         }
@@ -405,11 +418,27 @@ mod tests {
         for i in 1..=28 {
             t.vote(&sk(i), 50, ours, true, 0);
         }
-        assert_eq!(t.network_validated(50, theirs, 10), vec![(50, Verdict::Differ { ours })]);
+        assert_eq!(t.network_validated(50, theirs, 10), vec![], "the first voted sequence itself is not judged");
+        for i in 1..=28 {
+            t.vote(&sk(i), 51, ours, true, 0);
+        }
+        assert_eq!(t.network_validated(51, theirs, 10), vec![(51, Verdict::Differ { ours })]);
         assert!(t.network_validated(60, theirs, 10).is_empty(), "nobody voted yet: wait");
         assert!(t.network_validated(60 + GIVE_UP - 1, theirs, 10).iter().all(|(s, _)| *s != 60));
         let late = t.network_validated(60 + GIVE_UP, theirs, 10);
         assert!(late.contains(&(60, Verdict::Short { count: 0, quorum: 28 })), "{late:?}");
+    }
+
+    #[test]
+    fn nothing_is_judged_before_the_list_loads_or_before_the_tally_listened() {
+        let mut t = Tally::default();
+        assert!(t.network_validated(10, [1; 32], 0).is_empty(), "no list yet");
+        t.set_unl(&unl(35));
+        assert!(t.network_validated(11, [1; 32], 0).is_empty(), "no trusted validation yet");
+        t.vote(&sk(1), 20, [1; 32], true, 0);
+        assert!(t.network_validated(19, [1; 32], 0).is_empty(), "voted on before we listened");
+        assert!(t.network_validated(19 + 2 * GIVE_UP, [1; 32], 0).is_empty(), "and never judged short later");
+        assert!(t.pending.is_empty() || !t.pending.contains_key(&19));
     }
 
     #[test]
