@@ -2885,7 +2885,7 @@ fn own_hash_line(sh: &mut xrpl_node::native_shadow::NativeShadow, p: &xrpl_node:
     let b32 = |v: &Value| -> [u8; 32] { v.as_str().and_then(|h| hex::decode(h).ok()).and_then(|b| b.try_into().ok()).unwrap_or([0; 32]) };
     let header = |s: u32| -> Option<(xrpl_node::ws_sync::LedgerHeader, [u8; 32])> {
         let r = rpc(rpc_url, "ledger", json!({"ledger_index": s}))?;
-        let l = &r["result"]["ledger"];
+        let l = &r["ledger"];
         let n = |k: &str| l[k].as_u64().or_else(|| l[k].as_str().and_then(|t| t.parse().ok()));
         Some((
             xrpl_node::ws_sync::LedgerHeader {
@@ -2910,13 +2910,13 @@ fn own_hash_line(sh: &mut xrpl_node::native_shadow::NativeShadow, p: &xrpl_node:
         let Some(r) = rpc(rpc_url, "ledger_entry", json!({"index": k, "binary": true, "ledger_index": seq})) else {
             return format!("OWNHASH #{seq}: singleton {} unavailable", &k[..16]);
         };
-        let v = r["result"]["node_binary"].as_str().and_then(|b| hex::decode(b).ok());
+        let v = r["node_binary"].as_str().and_then(|b| hex::decode(b).ok());
         written.insert(b32(&json!(k)), v);
     }
     sh.commit(seq, &written, p.refusal.is_none());
     // The network's (tx, meta) pairs, which Step 2's check holds our records against.
     let pairs: Vec<(Vec<u8>, Vec<u8>)> = rpc(rpc_url, "ledger", json!({"ledger_index": seq, "transactions": true, "expand": true, "binary": true}))
-        .and_then(|r| r["result"]["ledger"]["transactions"].as_array().cloned())
+        .and_then(|r| r["ledger"]["transactions"].as_array().cloned())
         .unwrap_or_default()
         .iter()
         .filter_map(|t| Some((hex::decode(t["tx_blob"].as_str()?).ok()?, hex::decode(t["meta"].as_str()?).ok()?)))
