@@ -541,6 +541,20 @@ mod tests {
         mods
     }
 
+    /// Mainnet #107645365 AF7743811680: an OracleSet that moved only LastUpdateTime. The stored series spells each
+    /// AssetPrice as the decoder does, the engine's as the transaction did; the same prices, so no PreviousFields
+    /// entry. The base-ten MPT amounts stay decimal: "100" is a hundred, not 0x100.
+    #[test]
+    fn a_uint64_compares_by_value_not_spelling() {
+        let stored = json!([{"PriceData": {"AssetPrice": "00000000016869A0", "BaseAsset": "ADA", "QuoteAsset": "USD", "Scale": 8}}]);
+        let engine = json!([{"PriceData": {"AssetPrice": "16869a0", "BaseAsset": "ADA", "QuoteAsset": "USD", "Scale": 8}}]);
+        assert!(same_field("PriceDataSeries", &stored, &engine));
+        let moved = json!([{"PriceData": {"AssetPrice": "16869a1", "BaseAsset": "ADA", "QuoteAsset": "USD", "Scale": 8}}]);
+        assert!(!same_field("PriceDataSeries", &stored, &moved));
+        assert!(same_field("OwnerNode", &json!("0000000000000003"), &json!("3")));
+        assert!(!same_field("OutstandingAmount", &json!("100"), &json!("256")));
+    }
+
     #[test]
     fn stamp_batch_threading_gives_every_key_to_its_last_toucher() {
         let mut mods = three_roots();

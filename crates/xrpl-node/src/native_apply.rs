@@ -182,39 +182,47 @@ fn batch_changes(
             let v: Value = serde_json::from_slice(b).ok()?;
             Some((v.get("PreviousTxnID")?.clone(), v.get("PreviousTxnLgrSeq")?.clone()))
         };
+        // The sandbox holds no stamps: where the transactor kept the object's threading (`out` threads as the raw
+        // `b` did), the inner's view carries the earlier applications' stamp instead. That includes an object an
+        // earlier inner CREATED, which the sandbox holds with no threading at all (mainnet #107645179 1A229E1B: a
+        // TrustSet inner's line, then a Payment inner's ModifiedNode with no PreviousTxnID), and an object a later
+        // inner DELETES, whose FinalFields then named the threading from before the ledger (#107645214 94479AEC).
+        let restamp = |k: &Hash256, b: &[u8], out: Vec<u8>| -> Vec<u8> {
+            let t_raw = threading(b);
+            let Some(t_view) = before_of(k).as_deref().and_then(threading) else { return out };
+            if threading(&out) != t_raw || Some(&t_view) == t_raw.as_ref() {
+                return out;
+            }
+            let Ok(mut ov) = serde_json::from_slice::<Value>(&out) else { return out };
+            ov["PreviousTxnID"] = t_view.0;
+            ov["PreviousTxnLgrSeq"] = t_view.1;
+            serde_json::to_vec(&ov).unwrap_or(out)
+        };
         let mut keys: Vec<Hash256> = v.before.keys().chain(v.after.keys()).filter(|k| **k != AUX_KEY).copied().collect();
         keys.sort_unstable_by_key(|h| h.0);
         keys.dedup();
         let mut own: HashMap<Hash256, SandboxEntry> = HashMap::new();
+        let mut deleted_final = v.deleted_final.clone();
         for k in keys {
             match (eff(&v.before, &k), eff(&v.after, &k)) {
                 (None, Some(a)) => {
                     own.insert(k, SandboxEntry::Created(a));
                 }
-                (Some(_), None) => {
+                (Some(b), None) => {
+                    if let Some(f) = deleted_final.remove(&k) {
+                        deleted_final.insert(k, restamp(&k, &b, f));
+                    }
                     own.insert(k, SandboxEntry::Deleted);
                 }
                 (Some(b), Some(a)) if !semantically_equal(&b, &a) => {
-                    // The sandbox holds no stamps: where the transactor kept the object's threading, the inner's
-                    // view carries the earlier applications' stamp instead.
-                    let mut a2 = a.clone();
-                    if let (Some(t_raw), Some(t_view), Some(t_after)) = (threading(&b), before_of(&k).as_deref().and_then(threading), threading(&a)) {
-                        if t_after == t_raw && t_view != t_raw {
-                            if let Ok(mut av) = serde_json::from_slice::<Value>(&a) {
-                                av["PreviousTxnID"] = t_view.0;
-                                av["PreviousTxnLgrSeq"] = t_view.1;
-                                a2 = serde_json::to_vec(&av).unwrap_or(a);
-                            }
-                        }
-                    }
-                    own.insert(k, SandboxEntry::Modified(a2));
+                    own.insert(k, SandboxEntry::Modified(restamp(&k, &b, a)));
                 }
                 _ => {}
             }
         }
         let mut st = own.clone();
         stamp_threading(&mut st, &before_of, id, ledger_seq);
-        let changes = node_changes_over(&before_of, &st, &SandboxChanges { mods: own, deleted_final: v.deleted_final.clone(), ..Default::default() });
+        let changes = node_changes_over(&before_of, &st, &SandboxChanges { mods: own, deleted_final, ..Default::default() });
         lay(&mut overlay, &st);
         inners.push(InnerChanges { id: id.clone(), result: result.clone(), changes, delivered: v.delivered.clone() });
     }
