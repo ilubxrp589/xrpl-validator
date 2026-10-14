@@ -60,9 +60,26 @@ fn canon_material(v: &mut serde_json::Value) {
     // side, its scientific form on the other), and a textual compare then
     // called an untouched bridge offer changed and threaded it. Compare
     // every amount by its canonical (mantissa, exponent).
-    for (_, f) in obj.iter_mut() {
+    for (k, f) in obj.iter_mut() {
+        canon_uint64(k, f);
         canon_amount(f);
         canon_nested(f);
+    }
+}
+
+/// A UInt64 field's value is a number, not a spelling: the decoder writes it as 16 upper-case hex digits and the
+/// engine keeps the transaction's ("00000000016869A0" against "16869a0"). An OracleSet that moved only its
+/// LastUpdateTime then listed an unchanged PriceDataSeries in PreviousFields (mainnet #107645365 AF7743811680 and 84 more, soak
+/// #47). The base-ten fields (MPT amounts) are spelled in decimal and left to `canon_amount`. Runs before it: an
+/// all-digit hex spelling would otherwise read as a decimal amount.
+fn canon_uint64(name: &str, f: &mut serde_json::Value) {
+    use super::field_meta::{self, SMD_BASE_TEN};
+    let Some(s) = f.as_str() else { return };
+    if !field_meta::by_name(name).is_some_and(|m| m.type_code == 3 && m.meta & SMD_BASE_TEN == 0) {
+        return;
+    }
+    if let Ok(n) = u64::from_str_radix(s, 16) {
+        *f = serde_json::Value::from(n);
     }
 }
 
@@ -101,6 +118,7 @@ fn canon_nested(v: &mut serde_json::Value) {
                         *f = serde_json::Value::from(c);
                     }
                 }
+                canon_uint64(k, f);
                 canon_amount(f);
                 canon_nested(f);
             }

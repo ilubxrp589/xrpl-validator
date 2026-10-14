@@ -742,7 +742,14 @@ impl Transactor for AccountDeleteTransactor {
             }
         }
 
-        // Delete the account
+        // Delete the account. rippled moves the balance out of the SLE it then erases
+        // (`(*src)[sfBalance] -= remainingBalance; … view().erase(src)`, AccountDelete.cpp:404/452), so the
+        // DeletedNode's FinalFields carry Balance 0, not what the account held before (mainnet #107645271
+        // 36B39129A459 and 22 more, soak #47). The state is the same either way; the record is not.
+        if let Some(mut src) = sandbox.read(&acct_key).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) {
+            src["Balance"] = serde_json::Value::String("0".into());
+            sandbox.write(acct_key, serde_json::to_vec(&src).unwrap_or_default());
+        }
         sandbox.delete(acct_key);
 
         TxResult::Success

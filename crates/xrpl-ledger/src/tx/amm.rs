@@ -1866,6 +1866,15 @@ fn tear_down_lp_line(
         lp_line.get(field).and_then(|v| v.as_str()).and_then(|s| u64::from_str_radix(s, 16).ok())
     };
     let (w_node, a_node) = if who < amm_acct { ("LowNode", "HighNode") } else { ("HighNode", "LowNode") };
+    // rippleCreditIOU zeroes the balance and clears the LP's reserve bit on the SLE, then trustDelete erases that
+    // SLE ("Want to reflect balance to zero even if we are deleting line", TokenHelpers.cpp:779), so the
+    // DeletedNode's FinalFields carry Balance 0 (mainnet #107645345 B261F6DA5A21 and 5 more, soak #47).
+    let mut line = lp_line.clone();
+    if let Some(b) = line.get_mut("Balance") {
+        b["value"] = serde_json::Value::String("0".to_string());
+    }
+    line["Flags"] = serde_json::Value::from(flags & !my_reserve);
+    sandbox.write(lp_key, serde_json::to_vec(&line).unwrap_or_default());
     sandbox.delete(lp_key);
     crate::ledger::directory::owner_dir_remove(sandbox, who, &lp_key, node(w_node), false);
     crate::ledger::directory::owner_dir_remove(sandbox, amm_acct, &lp_key, node(a_node), false);
