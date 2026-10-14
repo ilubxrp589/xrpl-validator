@@ -15,6 +15,12 @@
 //! The live driver itself (peer_fetch::start, register, on_ledger_data, offer_network: its pacing, retries
 //! and peer rotation) over sessions to each of --peers, fed every validated ledger the RPC server reports,
 //! for MINUTES. Prints the driver's counters every minute.
+//!
+//!   peer_fetch_probe --validated MINUTES [--peers ...] [--rpc URL] [--log FILE]
+//!
+//! Independence 4.5: own_validated's tally over the validations the --peers sessions relay (each signature
+//! checked, as the validator does), against the RPC server's validated ledgers, under the verified list and the
+//! RPC server's negative UNL. Prints the verdicts every minute.
 
 use std::time::{Duration, Instant};
 
@@ -58,6 +64,97 @@ fn frame(msg: &PeerMessage) -> Vec<u8> {
     f.extend_from_slice(&msg.type_code().to_be_bytes());
     f.extend_from_slice(&p);
     f
+}
+
+/// One peer session for --validated: every signature-checked validation into own_validated.
+async fn validation_session(addr: String) {
+    let identity = match xrpl_node::peer::identity::NodeIdentity::generate() {
+        Ok(i) => i,
+        Err(_) => return,
+    };
+    let Ok(Ok(hs)) = tokio::time::timeout(
+        Duration::from_secs(20),
+        xrpl_node::peer::handshake::outbound_handshake(&addr, &identity, xrpl_node::peer::handshake::NETWORK_ID_MAINNET),
+    )
+    .await
+    else {
+        eprintln!("{addr}: no session");
+        return;
+    };
+    eprintln!("{addr}: connected");
+    let (mut rd, mut wr) = tokio::io::split(hs.stream);
+    let mut buf = BytesMut::from(&hs.remaining_bytes[..]);
+    let mut codec = MessageCodec;
+    loop {
+        match codec.decode(&mut buf) {
+            Ok(Some(PeerMessage::Validation(v))) => {
+                if xrpl_node::consensus::sig_verify::verify_validation_blob(&v.validation) == xrpl_node::consensus::sig_verify::SigOutcome::Valid {
+                    xrpl_node::own_validated::on_validation(&v.validation);
+                }
+            }
+            Ok(Some(PeerMessage::Ping(p))) if p.r#type == 0 => {
+                let mut pong = p;
+                pong.r#type = 1;
+                let _ = wr.write_all(&frame(&PeerMessage::Ping(pong))).await;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => match rd.read_buf(&mut buf).await {
+                Ok(n) if n > 0 => {}
+                _ => break,
+            },
+            Err(_) => break,
+        }
+    }
+    eprintln!("{addr}: session ended");
+}
+
+async fn run_validated(url: &str, minutes: u64) -> i32 {
+    match xrpl_node::unl_fetch::fetch_default_unl_verified().await {
+        Ok(entries) => xrpl_node::own_validated::set_unl(&entries),
+        Err(e) => {
+            eprintln!("validator list: {e}");
+            return 2;
+        }
+    }
+    let peers = arg("--peers").unwrap_or_else(|| "s1.ripple.com:51235,s2.ripple.com:51235".into());
+    for p in peers.split(',').filter(|p| !p.is_empty()) {
+        tokio::spawn(validation_session(p.to_string()));
+    }
+    let end = Instant::now() + Duration::from_secs(60 * minutes);
+    let (mut last, mut said) = (0u32, Instant::now());
+    while Instant::now() < end {
+        // The negative UNL as the RPC server's validated ledger holds it.
+        let nunl = rpc(url, json!({"method": "ledger_entry", "params": [{"index": "2E8A59AA9D3B5B186B0B9E0F62E6C02587CA74A4D778938E957B6357D364B244", "ledger_index": "validated", "binary": true}]}))
+            .await
+            .ok()
+            .and_then(|r| r["node_binary"].as_str().and_then(|h| hex::decode(h).ok()));
+        xrpl_node::own_validated::set_negative_unl(nunl.as_deref());
+        let r = rpc(url, json!({"method": "ledger", "params": [{"ledger_index": "validated"}]})).await.ok();
+        let v = r.as_ref().and_then(|r| r["ledger_index"].as_u64()).unwrap_or(0) as u32;
+        if v > last {
+            let from = if last == 0 { v } else { last + 1 };
+            for seq in from..=v {
+                let hash = if seq == v {
+                    r.as_ref().and_then(|r| r["ledger_hash"].as_str().map(str::to_string))
+                } else {
+                    rpc(url, json!({"method": "ledger", "params": [{"ledger_index": seq}]})).await.ok().and_then(|x| x["ledger_hash"].as_str().map(str::to_string))
+                };
+                if let Some(h) = hash.and_then(|h| hex::decode(h).ok()).and_then(|b| <[u8; 32]>::try_from(b).ok()) {
+                    xrpl_node::own_validated::network_validated(seq, h);
+                }
+            }
+            last = v;
+        }
+        if said.elapsed() >= Duration::from_secs(60) {
+            eprintln!("VALIDATED {}", xrpl_node::own_validated::summary());
+            said = Instant::now();
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    eprintln!("VALIDATED SUMMARY: {}", xrpl_node::own_validated::summary());
+    let st = xrpl_node::own_validated::stats();
+    let l = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+    i32::from(l(&st.differ) + l(&st.short) > 0 || l(&st.agree) == 0)
 }
 
 /// One peer session for the driver: register it, write the driver's frames, hand it every mtLEDGER_DATA.
@@ -160,6 +257,12 @@ async fn run_driver(url: &str, minutes: u64) -> i32 {
 #[tokio::main]
 async fn main() {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    if let Some(minutes) = arg("--validated").and_then(|m| m.parse::<u64>().ok()) {
+        std::env::set_var("XRPL_OWN_VALIDATED", "1");
+        std::env::set_var("XRPL_OWN_VALIDATED_LOG", arg("--log").unwrap_or_else(|| "/tmp/own_validated_probe.jsonl".into()));
+        let url = arg("--rpc").unwrap_or_else(|| "https://s2.ripple.com:51234".into());
+        std::process::exit(run_validated(&url, minutes).await);
+    }
     if let Some(minutes) = arg("--driver").and_then(|m| m.parse::<u64>().ok()) {
         std::env::set_var("XRPL_PEER_FETCH", "1");
         std::env::set_var("XRPL_PEER_FETCH_LOG", arg("--log").unwrap_or_else(|| "/tmp/peer_fetch_probe.jsonl".into()));

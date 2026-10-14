@@ -1005,6 +1005,8 @@ async fn main() {
                 match xrpl_node::unl_fetch::fetch_default_unl_verified().await {
                     Ok(entries) => {
                         xrpl_node::consensus_record::record_unl(&entries);
+                        // Independence 4.5 (XRPL_OWN_VALIDATED=1): the list our own "validated" counts against.
+                        xrpl_node::own_validated::set_unl(&entries);
                         let mut eng = consensus_for_unl.lock();
                         // TMProposeSet messages are signed with EPHEMERAL signing keys, not master keys.
                         // So we trust the signing keys in our UNL (extracted from each validator's manifest).
@@ -1648,6 +1650,7 @@ async fn main() {
                     body.push_str(&xrpl_node::native_meta::metrics_text());
                     body.push_str(&xrpl_node::native_order::metrics_text());
                     body.push_str(&xrpl_node::peer_fetch::metrics_text());
+                    body.push_str(&xrpl_node::own_validated::metrics_text());
                     (
                         axum::http::StatusCode::OK,
                         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
@@ -1787,6 +1790,8 @@ async fn main() {
                     json["native_order"] = xrpl_node::native_order::json();
                     // Independence 4.1: ledgers fetched from peers.
                     json["peer_fetch"] = xrpl_node::peer_fetch::json();
+                    // Independence 4.5: "validated" from our own count of trusted validations.
+                    json["own_validated"] = xrpl_node::own_validated::json();
                     // Stage 4 Phase A: native-engine shadow counters.
                     #[cfg(feature = "ffi")]
                     {
@@ -2288,6 +2293,8 @@ async fn run_peer_connection(
                         }
                         if outcome == SigOutcome::Valid {
                             xrpl_node::consensus_record::record_validation(&v.validation);
+                            // Independence 4.5: our own tally of trusted validations, ledger by ledger.
+                            xrpl_node::own_validated::on_validation(&v.validation);
                         }
                     }
 

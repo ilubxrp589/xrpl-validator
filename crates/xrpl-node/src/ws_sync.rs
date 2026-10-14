@@ -287,6 +287,14 @@ pub async fn start_ws_sync(
                                 ledger_header = hdr;
                                 // 5.2(a): one channel send, and nothing at all unless XRPL_CONSENSUS_RECORD=1.
                                 crate::consensus_record::record_header(process_seq, &ledger_header);
+                                // Independence 4.5 (XRPL_OWN_VALIDATED=1): .39 calls this ledger validated; our own
+                                // tally of trusted validations is held against it, under the negative UNL the
+                                // newest written ledger carries.
+                                if crate::own_validated::enabled() {
+                                    let nunl = db.get(xrpl_ledger::ledger::keylet::negative_unl_key().0).ok().flatten();
+                                    crate::own_validated::set_negative_unl(nunl.as_deref());
+                                    crate::own_validated::network_validated(process_seq, ledger_header.ledger_hash);
+                                }
                                 #[cfg(feature = "ffi")]
                                 { sorted_txs = _txs; }
                                 if wallet_delta != 0 {
