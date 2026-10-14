@@ -727,34 +727,48 @@ pub fn batch_inner_owners(
 }
 
 /// One key touched by several entries of the same Batch: the expected side
-/// reports the NET effect. The rules are leg A's, verbatim
-/// (`ffi_engine.rs` `merged_expected`): Created wins over Modified, and a key
-/// Created and then Deleted inside the batch is no entry at all. `nodes` is
-/// the `(key, kind)` pairs of the outer's metadata followed by its inners' in
-/// TransactionIndex order, kinds as the fixtures spell them — 0 Created,
-/// 1 Modified, 2 Deleted.
+/// reports the NET effect over the whole batch, as the FFI leg's collector
+/// sees it. `nodes` is the `(key, kind)` pairs of the outer's metadata
+/// followed by its inners' in TransactionIndex order, kinds as the fixtures
+/// spell them — 0 Created, 1 Modified, 2 Deleted.
+/// - A key never deleted: Created wins over Modified.
+/// - A key deleted somewhere: the ORDER decides. It existed before the batch
+///   unless its first touch created it, and is there after unless its last
+///   touch deleted it — before and after is a Modified, before only a
+///   Deleted, after only a Created, neither no entry at all. So Created then
+///   Deleted vanishes, and Deleted then Created is a Modified: mainnet
+///   #107636230 (an order-book page an OfferCreate inner deleted and the next
+///   re-created, 129 times) and #107654753 C99C39B9 (an NFT offer directory,
+///   NFTokenCancelOffer then NFTokenCreateOffer) read as libxrpl's extra
+///   Modified while the fold dropped the key whatever the order.
 ///
 /// Inside ONE metadata a key appears exactly once, so for a non-Batch
 /// transaction this is the identity over its nodes.
 pub fn fold_batch_mutset(nodes: &[(String, u8)]) -> HashSet<(String, u8)> {
-    let mut kinds: HashMap<&str, (bool, bool, bool)> = HashMap::new();
+    // Per key: created anywhere, deleted anywhere, the first kind and the last kind.
+    let mut kinds: HashMap<&str, (bool, bool, u8, u8)> = HashMap::new();
     for (key, kind) in nodes {
-        let e = kinds.entry(key.as_str()).or_default();
-        match kind {
-            0 => e.0 = true,
-            2 => e.2 = true,
-            _ => e.1 = true,
-        }
+        let k = if *kind == 0 || *kind == 2 { *kind } else { 1 };
+        kinds
+            .entry(key.as_str())
+            .and_modify(|e| {
+                e.0 |= k == 0;
+                e.1 |= k == 2;
+                e.3 = k;
+            })
+            .or_insert((k == 0, k == 2, k, k));
     }
     let mut out: HashSet<(String, u8)> = HashSet::with_capacity(kinds.len());
-    for (key, (created, _modified, deleted)) in kinds {
-        if created && deleted {
-            continue; // created and destroyed inside the batch — no entry
-        }
-        let kind = if created {
+    for (key, (created, deleted, first, last)) in kinds {
+        let kind = if deleted {
+            match (first != 0, last != 2) {
+                (true, true) => 1,
+                (true, false) => 2,
+                (false, true) => 0,
+                (false, false) => continue, // created and destroyed inside the batch — no entry
+            }
+        } else if created {
             0
-        } else if deleted {
-            2
         } else {
             1
         };
@@ -781,7 +795,17 @@ mod batch_fold_tests {
     #[test]
     fn fold_batch_mutset_created_then_deleted_vanishes() {
         assert!(fold_batch_mutset(&[k("AA", 0), k("AA", 2)]).is_empty());
-        assert!(fold_batch_mutset(&[k("AA", 2), k("AA", 0)]).is_empty());
+        assert!(fold_batch_mutset(&[k("AA", 0), k("AA", 1), k("AA", 2)]).is_empty());
+    }
+
+    /// Mainnet #107654753 C99C39B9: an NFT offer directory one inner deleted and the next created again. It was
+    /// there before the batch and is there after: libxrpl's net view, and rippled's, is a Modified.
+    #[test]
+    fn fold_batch_mutset_deleted_then_created_is_modified() {
+        assert_eq!(fold_batch_mutset(&[k("AA", 2), k("AA", 0)]), HashSet::from([k("AA", 1)]));
+        assert_eq!(fold_batch_mutset(&[k("AA", 1), k("AA", 2), k("AA", 0), k("AA", 1)]), HashSet::from([k("AA", 1)]));
+        assert_eq!(fold_batch_mutset(&[k("AA", 2), k("AA", 0), k("AA", 2)]), HashSet::from([k("AA", 2)]));
+        assert_eq!(fold_batch_mutset(&[k("AA", 0), k("AA", 2), k("AA", 0)]), HashSet::from([k("AA", 0)]));
     }
 
     #[test]

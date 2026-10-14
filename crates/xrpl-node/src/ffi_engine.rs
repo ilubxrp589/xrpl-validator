@@ -2323,36 +2323,27 @@ pub fn apply_ledger_in_order_with_net(
         match (expected_mutations, inner_of.is_empty()) {
             (Some(m), false) => {
                 let mut mm = m.clone();
-                let mut outers: std::collections::HashSet<String> = std::collections::HashSet::new();
+                // Each outer's filed inners, in ledger (TransactionIndex) order: the outer's own nodes come first,
+                // then its inners', and the fold is order-aware (a key one inner deleted and a later one created
+                // again is a Modified, not nothing — `native_apply::fold_batch_mutset`).
+                let pos: std::collections::HashMap<String, usize> = txs_in_order
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, blob)| xrpl_ffi::parse_tx(blob).map(|p| (hex::encode_upper(p.hash), i)))
+                    .collect();
+                let mut by_outer: std::collections::HashMap<&String, Vec<&String>> = std::collections::HashMap::new();
                 for (inner, outer) in &inner_of {
-                    if let Some(v) = m.get(inner) {
-                        mm.entry(outer.clone()).or_default().extend(v.iter().cloned());
-                        outers.insert(outer.clone());
+                    if m.contains_key(inner) {
+                        by_outer.entry(outer).or_default().push(inner);
                     }
                 }
-                // One key touched by several inners: the collector reports the
-                // net effect — Created wins over Modified, Created-then-Deleted
-                // is no entry at all.
-                for outer in outers {
-                    if let Some(v) = mm.get_mut(&outer) {
-                        let mut kinds: std::collections::HashMap<String, (bool, bool, bool)> = Default::default();
-                        for (k, b) in v.iter() {
-                            let e = kinds.entry(k.clone()).or_default();
-                            match b {
-                                0 => e.0 = true,
-                                2 => e.2 = true,
-                                _ => e.1 = true,
-                            }
-                        }
-                        let mut out = Vec::with_capacity(kinds.len());
-                        for (k, (c, _m, d)) in kinds {
-                            if c && d {
-                                continue;
-                            }
-                            out.push((k, if c { 0 } else if d { 2 } else { 1 }));
-                        }
-                        *v = out;
+                for (outer, mut inners) in by_outer {
+                    inners.sort_by_key(|h| pos.get(*h).copied().unwrap_or(usize::MAX));
+                    let mut nodes: Vec<(String, u8)> = m.get(outer).cloned().unwrap_or_default();
+                    for inner in inners {
+                        nodes.extend(m[inner].iter().cloned());
                     }
+                    mm.insert(outer.clone(), crate::native_apply::fold_batch_mutset(&nodes).into_iter().collect());
                 }
                 Some(mm)
             }
