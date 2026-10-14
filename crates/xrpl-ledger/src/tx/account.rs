@@ -663,21 +663,49 @@ impl Transactor for AccountDeleteTransactor {
                             );
                         }
                         sandbox.delete(*kh);
-                        if let Some(dh) = obj.get("Destination").and_then(|v| v.as_str()) {
-                            if let Ok(db) = hex::decode(dh) {
-                                if let Ok(did) = <[u8; 20]>::try_from(db.as_slice()) {
-                                    let dk = keylet::account_root_key(&did);
-                                    if let Some(dv) = sandbox.read(&dk) {
-                                        sandbox.write(dk, dv);
-                                    }
-                                }
-                            }
-                        }
+                        // deleteTokenOffer (NFTokenHelpers.cpp:613-637): the owner's count. The offer's Destination is
+                        // re-threaded by threadOwners alone, never update()d: a threading-only node, no FinalFields.
+                        crate::tx::offer::owner_count_add(sandbox, &tx.account, -1);
                     }
-                    Some("Ticket") | Some("DepositPreauth") | Some("SignerList") => {
+                    // Each nonObligationDeleter lowers the deleted account's OwnerCount by the object's reserve units
+                    // (decreaseOwnerCountForObject), and removeTicketFromLedger also its TicketCount, the field
+                    // dropped at the last ticket (Transactor.cpp ticketDelete). The root is erased right after, so
+                    // its DeletedNode's FinalFields and PreviousFields carry those counts.
+                    Some("Ticket") => {
                         crate::ledger::directory::owner_dir_remove(
                             sandbox, &tx.account, kh, hint_of(obj, "OwnerNode"), true,
                         );
+                        if let Some(mut a) = sandbox.read(&acct_key).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) {
+                            match a.get("TicketCount").and_then(|v| v.as_u64()) {
+                                Some(1) => {
+                                    a.as_object_mut().map(|o| o.remove("TicketCount"));
+                                }
+                                Some(n) => a["TicketCount"] = serde_json::Value::from(n - 1),
+                                None => {}
+                            }
+                            sandbox.write(acct_key, serde_json::to_vec(&a).unwrap_or_default());
+                        }
+                        crate::tx::offer::owner_count_add(sandbox, &tx.account, -1);
+                        sandbox.delete(*kh);
+                    }
+                    Some("DepositPreauth") => {
+                        crate::ledger::directory::owner_dir_remove(
+                            sandbox, &tx.account, kh, hint_of(obj, "OwnerNode"), true,
+                        );
+                        crate::tx::offer::owner_count_add(sandbox, &tx.account, -1);
+                        sandbox.delete(*kh);
+                    }
+                    // removeSignersFromLedger: one unit with lsfOneOwnerCount, else a legacy list's 2 + entries.
+                    Some("SignerList") => {
+                        crate::ledger::directory::owner_dir_remove(
+                            sandbox, &tx.account, kh, hint_of(obj, "OwnerNode"), true,
+                        );
+                        let units = if obj["Flags"].as_u64().unwrap_or(0) & 0x0001_0000 != 0 {
+                            1
+                        } else {
+                            2 + obj["SignerEntries"].as_array().map_or(0, |a| a.len()) as i64
+                        };
+                        crate::tx::offer::owner_count_add(sandbox, &tx.account, -units);
                         sandbox.delete(*kh);
                     }
                     // Finding 354 (testnet campaign 11, #20938045 6B90AAED): rippled's
@@ -686,10 +714,13 @@ impl Transactor for AccountDeleteTransactor {
                     // removeFromLedger (the owner-directory entry and the object; a
                     // Credential leaves BOTH parties' directories, credentials::
                     // deleteSLE). We answered tecNO_PERMISSION for any of them.
+                    // DIDDelete::deleteSLE −1; removeOracleFromLedger −2 above five price pairs, else −1.
                     Some("DID") | Some("Oracle") => {
                         crate::ledger::directory::owner_dir_remove(
                             sandbox, &tx.account, kh, hint_of(obj, "OwnerNode"), true,
                         );
+                        let units = if obj["PriceDataSeries"].as_array().is_some_and(|a| a.len() > 5) { 2 } else { 1 };
+                        crate::tx::offer::owner_count_add(sandbox, &tx.account, -units);
                         sandbox.delete(*kh);
                     }
                     // Finding 360: a Delegate sits in BOTH parties' directories
@@ -857,5 +888,59 @@ mod tests {
         let bv: serde_json::Value = serde_json::from_slice(&bob_data).unwrap();
         // Bob had 10M, Alice had 50M (fee already deducted by apply_common before do_apply)
         assert_eq!(bv["Balance"].as_str().unwrap(), "60000000");
+    }
+
+    /// The deleted root's FinalFields are its content at the erase: the balance handed over, and the counts each
+    /// nonObligationDeleter lowered — two tickets give OwnerCount 2 → 0 and drop TicketCount (Transactor.cpp
+    /// ticketDelete). The Destination root is written (update(dst)), never the deleted account's NFT offers' others.
+    #[test]
+    fn account_delete_final_fields_carry_the_lowered_counts() {
+        let alice = [0x01u8; 20];
+        let bob = [0x02u8; 20];
+        let mut state = make_state(&alice, 50_000_000);
+        let ak = keylet::account_root_key(&alice);
+        let mut a: serde_json::Value = serde_json::from_slice(&state.state_map.lookup(&ak).unwrap().to_vec()).unwrap();
+        a["OwnerCount"] = serde_json::json!(2);
+        a["TicketCount"] = serde_json::json!(2);
+        state.state_map.insert(ak, serde_json::to_vec(&a).unwrap()).unwrap();
+        let bob_acct = serde_json::json!({
+            "LedgerEntryType": "AccountRoot", "Account": hex::encode(bob), "Balance": "10000000",
+            "Sequence": 1, "OwnerCount": 0, "Flags": 0,
+        });
+        state.state_map.insert(keylet::account_root_key(&bob), serde_json::to_vec(&bob_acct).unwrap()).unwrap();
+        let tickets = [keylet::ticket_key(&alice, 5), keylet::ticket_key(&alice, 6)];
+        for (i, tk) in tickets.iter().enumerate() {
+            let t = serde_json::json!({
+                "LedgerEntryType": "Ticket", "Account": hex::encode(alice), "TicketSequence": 5 + i,
+                "OwnerNode": "0", "Flags": 0,
+            });
+            state.state_map.insert(*tk, serde_json::to_vec(&t).unwrap()).unwrap();
+        }
+        let dir = keylet::owner_dir_key(&alice);
+        let page = serde_json::json!({
+            "LedgerEntryType": "DirectoryNode", "Owner": hex::encode(alice), "RootIndex": hex::encode_upper(dir.0),
+            "Indexes": tickets.iter().map(|k| hex::encode_upper(k.0)).collect::<Vec<_>>(), "Flags": 0,
+        });
+        state.state_map.insert(dir, serde_json::to_vec(&page).unwrap()).unwrap();
+
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: alice,
+            tx_type: "AccountDelete".to_string(),
+            fee: 2_000_000,
+            sequence: 1,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({"Destination": hex::encode(bob)}),
+            inner_batch: false,
+        };
+        crate::tx::reset_thread_state();
+        assert_eq!(AccountDeleteTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+        assert!(!sandbox.exists(&ak));
+        assert!(tickets.iter().all(|k| !sandbox.exists(k)));
+        let fin: serde_json::Value = serde_json::from_slice(sandbox.deleted_content(&ak).expect("deleted content")).unwrap();
+        assert_eq!(fin["Balance"], serde_json::json!("0"));
+        assert_eq!(fin["OwnerCount"], serde_json::json!(0));
+        assert!(fin.get("TicketCount").is_none(), "the last ticket drops the field: {fin}");
     }
 }
