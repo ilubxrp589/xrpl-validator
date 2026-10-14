@@ -298,12 +298,13 @@ fn try_remove_at(
                 .and_then(|v| v.as_array())
                 .map(|a| a.is_empty())
                 .unwrap_or(true);
+            // rippled drops the root's links first and then erases that page, so a deleted root's FinalFields
+            // carry IndexNext/IndexPrevious 0 (mainnet #107648066 D06392C67FFF: E24D65B4, links 3 → 0).
+            set_link(&mut root, "IndexNext", 0);
+            set_link(&mut root, "IndexPrevious", 0);
+            sandbox.write(*root_key, serde_json::to_vec(&root).unwrap_or_default());
             if root_empty && !keep_root {
                 sandbox.delete(*root_key);
-            } else {
-                set_link(&mut root, "IndexNext", 0);
-                set_link(&mut root, "IndexPrevious", 0);
-                sandbox.write(*root_key, serde_json::to_vec(&root).unwrap_or_default());
             }
         }
         return true;

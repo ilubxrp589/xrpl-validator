@@ -181,7 +181,13 @@ impl<'a> Sandbox<'a> {
         if matches!(self.modifications.get(&key), Some(SandboxEntry::Created(_)))
             && self.base.state_map.lookup(&key).is_none()
         {
-            self.modifications.remove(&key);
+            // Still its content at the deletion: a Batch shares one sandbox across its inners, and an object an
+            // earlier inner created is, to the inner deleting it, a DeletedNode with these FinalFields (mainnet
+            // #107646681 361A074C: a Payment inner deleting the line a TrustSet inner made, Balance 0; we wrote the
+            // created version's). A single transaction's `into_changes` drops it, as the key has no modification.
+            if let Some(SandboxEntry::Created(last)) = self.modifications.remove(&key) {
+                self.deleted_final.insert(key, last);
+            }
         } else {
             // Read without the read log: the delete is not a read of the transactor's.
             let last = match self.modifications.get(&key) {
@@ -427,6 +433,23 @@ mod tests {
         assert_eq!(finals.get(&kept).map(Vec::as_slice), Some(&br#"{"v":1}"#[..]));
         assert_eq!(finals.get(&changed).map(Vec::as_slice), Some(&br#"{"v":20}"#[..]));
         assert_eq!(finals.len(), 2);
+    }
+
+    #[test]
+    fn an_object_created_then_deleted_keeps_its_content_for_a_batch_view() {
+        // A Batch's inners share one sandbox: inner 1 creates the line, inner 2 deletes it, and inner 2's
+        // DeletedNode needs the line as inner 2 left it (mainnet #107646681 361A074C). The transaction's own
+        // changes still carry nothing for it.
+        let state = test_state();
+        let fresh = key(3);
+        let mut sb = Sandbox::new(&state);
+        sb.write(fresh, br#"{"v":3}"#.to_vec());
+        sb.write(fresh, br#"{"v":0}"#.to_vec());
+        sb.delete(fresh);
+        assert_eq!(sb.deleted_content(&fresh), Some(&br#"{"v":0}"#[..]));
+        let SandboxChanges { mods: m, deleted_final: finals, .. } = sb.into_changes();
+        assert!(m.get(&fresh).is_none());
+        assert!(finals.is_empty());
     }
 
     #[test]
