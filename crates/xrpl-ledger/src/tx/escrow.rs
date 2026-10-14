@@ -648,11 +648,14 @@ fn mpt_unlock_plan(
     Ok((ikey, net, want))
 }
 
+/// `mark_destination`: EscrowFinish's `view().update(sled)` (EscrowFinish.cpp, after the credit) marks the
+/// destination's root as modified whatever the credit did to it; EscrowCancel never touches it.
 fn escrow_dir_teardown(
     sandbox: &mut Sandbox,
     escrow: &serde_json::Value,
     escrow_key: &xrpl_core::types::Hash256,
     owner_id: &[u8; 20],
+    mark_destination: bool,
 ) {
     use crate::ledger::directory::owner_dir_remove;
     let dirnum = |k: &str| escrow.get(k).map(crate::tx::offer::dirnum);
@@ -662,12 +665,15 @@ fn escrow_dir_teardown(
     if let Some(d) = dest_id {
         if d != *owner_id {
             owner_dir_remove(sandbox, &d, escrow_key, dirnum("DestinationNode"), true);
-            // Creation records the destination's AccountRoot as a no-op
-            // Modified; the cancel/finish meta carries it too — #106179351's
-            // third AccountRoot is exactly this, with no FinalFields at all.
-            let dkey = keylet::account_root_key(&d);
-            if let Some(b) = sandbox.read(&dkey) {
-                sandbox.write(dkey, b);
+            // The destination's root is in the meta either way: threadOwners threads it for the deleted escrow
+            // (#106179351's third AccountRoot, no FinalFields). Only a finish also marks it written, which gives
+            // it FinalFields when that threading happens before rippled's loop reaches it; a cancel leaves it a
+            // threading-only node (mainnet #107656021 1458D55C06B4: C912D4EF, no FinalFields).
+            if mark_destination {
+                let dkey = keylet::account_root_key(&d);
+                if let Some(b) = sandbox.read(&dkey) {
+                    sandbox.write(dkey, b);
+                }
             }
         }
     }
@@ -1147,7 +1153,7 @@ impl Transactor for EscrowFinishTransactor {
         owner_acct["OwnerCount"] = serde_json::Value::Number(oc.saturating_sub(1).into());
         sandbox.write(owner_key, serde_json::to_vec(&owner_acct).expect("serializing valid JSON Value"));
 
-        escrow_dir_teardown(sandbox, &escrow, &esc_key, &owner_id);
+        escrow_dir_teardown(sandbox, &escrow, &esc_key, &owner_id, true);
 
         TxResult::Success
     }
@@ -1336,7 +1342,7 @@ impl Transactor for EscrowCancelTransactor {
 
         // --- Delete the Escrow object and unlink it everywhere ---
         sandbox.delete(esc_key);
-        escrow_dir_teardown(sandbox, &escrow, &esc_key, &owner_id);
+        escrow_dir_teardown(sandbox, &escrow, &esc_key, &owner_id, false);
 
         TxResult::Success
     }
