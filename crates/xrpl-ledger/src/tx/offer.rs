@@ -1424,10 +1424,15 @@ pub(crate) fn line_adjust(sandbox: &mut Sandbox, party: &[u8; 20], leg: &Leg, am
                 .and_then(|a| a["Flags"].as_u64())
                 .map(|f| f & 0x0080_0000 != 0)
                 .unwrap_or(false);
-            let quality_zero = line.get("LowQualityIn").is_none()
-                && line.get("LowQualityOut").is_none()
-                && line.get("HighQualityIn").is_none()
-                && line.get("HighQualityOut").is_none();
+            // The SENDER's quality settings only (TokenHelpers.cpp ~756-760: `bSenderHigh ? sfHighQualityIn :
+            // sfLowQualityIn`, and QualityOut the same): a counterparty's QualityIn/Out on its own side doesn't keep
+            // the sender's side out of its default state. Absent or 0 is zero (getFieldU32 of an absent field).
+            let q = |f: &str| line.get(f).and_then(|v| v.as_u64()).unwrap_or(0) == 0;
+            let quality_zero = if party_low {
+                q("LowQualityIn") && q("LowQualityOut")
+            } else {
+                q("HighQualityIn") && q("HighQualityOut")
+            };
             if flags & my_reserve != 0
                 && (flags & my_no_ripple != 0) != default_ripple
                 && flags & my_freeze == 0
