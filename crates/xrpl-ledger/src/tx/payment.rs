@@ -2236,6 +2236,16 @@ impl Transactor for PaymentTransactor {
                 }
             }
         }
+        // Payment.cpp:599-606: an existing destination is marked as about to change (`view().update(sleDst)`)
+        // whatever the payment then does to it, so it sits in rippled's apply table as modified. When nothing else
+        // changes it and a created or deleted node sorting before it threads it (threadOwners), rippled's loop then
+        // sees a change and writes its FinalFields: mainnet #107655399 3B2D251B5861 redeems CSC to its issuer and
+        // deletes the line, and the issuer's root D666EA6C carries FinalFields. Written back unchanged, it is
+        // recorded as written (`Sandbox::into_changes`'s `unchanged`) for the metadata; the state is untouched.
+        let dest_root_key = keylet::account_root_key(&dest_id);
+        if let Some(d) = sandbox.read(&dest_root_key) {
+            sandbox.write(dest_root_key, d);
+        }
         // A pseudo-account (AMM, Vault, LoanBroker) cannot receive an ordinary
         // Payment — value enters it only through its own transaction type.
         // rippled: `isPseudoAccount(sleDst) => tecNO_PERMISSION` (Payment.cpp
