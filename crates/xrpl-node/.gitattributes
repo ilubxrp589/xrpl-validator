@@ -1,0 +1,2 @@
+# git archive writes the commit into BUILD_COMMIT (deploy_stage.sh builds from an archive, which has no .git).
+BUILD_COMMIT export-subst

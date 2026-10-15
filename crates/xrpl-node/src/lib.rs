@@ -54,6 +54,7 @@ pub mod succ_walk;
 pub mod unl_fetch;
 pub mod unl_verify;
 pub mod validation;
+pub mod version;
 pub mod ws_sync;
 
 pub mod fuzz_mutants;

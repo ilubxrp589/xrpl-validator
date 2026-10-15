@@ -102,7 +102,7 @@ fn handle_server_info(state: &AppState) -> Value {
     json!({
         "status": "success",
         "info": {
-            "build_version": "xrpl-node-rs/0.1.0",
+            "build_version": crate::version::PEER_VERSION,
             "server_state": "connected",
             "peers": peers,
             "validated_ledger": {

@@ -89,6 +89,7 @@ pub async fn outbound_handshake(
     let pubkey_b58 = encode_node_public_key(identity.public_key());
 
     // Build HTTP upgrade request
+    let user_agent = crate::version::PEER_VERSION;
     let request = format!(
         "GET / HTTP/1.1\r\n\
          Upgrade: XRPL/2.2, XRPL/2.1, XRPL/2.0\r\n\
@@ -99,7 +100,7 @@ pub async fn outbound_handshake(
          Crawl: public\r\n\
          Network-ID: {network_id}\r\n\
          Server-Name: xrpl-rust-validator\r\n\
-         User-Agent: xrpl-rust-validator/0.1.0\r\n\
+         User-Agent: {user_agent}\r\n\
          \r\n"
     );
 
