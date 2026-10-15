@@ -1408,11 +1408,11 @@ git commit -m "test(xrpl-node): batch_vector — byte-exact devnet Batch vectors
 
 ```bash
 S=/tmp/claude-1000/-home-localai/d6509b21-22a5-467b-a51d-16eb8c7262a5/scratchpad; W=$S/wt244
-SSH="sshpass -p 1234qwer ssh -o PreferredAuthentications=password -o StrictHostKeyChecking=no m3060@10.0.0.97"
+SSH="ssh -o BatchMode=yes validator"   # the validator machine (an ssh alias, key login)
 for f in $(git -C $W diff --name-only main -- crates/); do
-  sshpass -p 1234qwer scp -q -o PreferredAuthentications=password $W/$f m3060@10.0.0.97:~/xrpl-drill/$f
+  scp -q $W/$f validator:~/xrpl-drill/$f
 done
-sshpass -p 1234qwer scp -q -o PreferredAuthentications=password $S/fixtriage/devnet/l5309670_* $S/fixtriage/devnet/l5309584_* m3060@10.0.0.97:/tmp/fixt/
+scp -q $S/fixtriage/devnet/l5309670_* $S/fixtriage/devnet/l5309584_* validator:/tmp/fixt/
 $SSH 'cd ~/xrpl-drill; PATH=$HOME/.cargo/bin:$PATH CARGO_BUILD_JOBS=3 nice -n 15 cargo build --release --features ffi --bin differential_probe > /tmp/dp_build.log 2>&1; echo BUILD_EXIT=$?; ls -la target/release/differential_probe | awk "{print \$6, \$7, \$8}"'
 ```
 

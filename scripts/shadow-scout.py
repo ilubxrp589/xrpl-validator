@@ -11,7 +11,7 @@ State: ~/.shadow-scout-state.json   Timer: hourly at :20 (clear of 03:00-15).
 """
 import json, os, subprocess, urllib.request
 
-M3060 = "m3060@10.0.0.97"
+M3060 = os.environ.get("VALIDATOR_SSH", "loop-m3060")   # an ssh alias for the validator machine
 JSONL = "/mnt/xrpl-data/native_shadow.jsonl"
 STAMP = os.path.expanduser("~/.shadow-scout-state.json")
 CREDS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "copilot", "config.local.json")
