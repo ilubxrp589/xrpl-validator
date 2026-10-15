@@ -1,7 +1,7 @@
 # The plan: a fully independent validator
 
 *Updated 9 October 2026. Replaces the July roadmap in `docs/STATE-2026-07.md`. Numbers measured on m3060 at
-18:49 EDT that day.*
+18:49 EDT that day. Steps 7-9 added 15 October 2026 (the whole validator, not only its hash).*
 
 ## 1. What "fully independent" means
 
@@ -12,6 +12,9 @@ That's the money shot. At that point m3060's validation is a real second opinion
 computed the same answer, not because it copied it.
 
 **Done means** 30 days of m3060 signing hashes it computed itself, from peer data, with .39 only watching.
+
+Steps 1-6 make the **hash** ours. Steps 7-9 (added 15 October) make the rest of the validator stand on its own: a
+proper peer the network keeps talking to, a start from nothing without .39, and its own clock, votes and list.
 
 ## 2. How a ledger gets its hash
 
@@ -240,6 +243,49 @@ ledger.
 - **Proposing transaction sets** in consensus: deferred. As a non-UNL validator its proposals barely count.
 - **Already done:** voting yes only on rules the engine has built.
 
+### Step 7: a proper peer
+*Size: small to medium, one piece per cycle. Your taps: a switch-on per piece.*
+
+Measured 15 October on cycle 176: the network barely keeps m3060 as a peer.
+
+- **7.1 Answer pings.** Regular peer sessions never answer the 60-second keep-alive ping, so every server drops
+  m3060 after about 2 minutes and it dials again: about 25,000 handshakes in 10 hours for some 80 peers. Only the 4
+  relay sessions answer (`peer::relay`). The fix answers on every session (`XRPL_PEER_PONG=1`). **Built
+  (branch peer-7).** Done when the handshake rate falls from ~2,500 an hour to a trickle.
+- **7.2 One node identity.** Each connection makes a fresh node key, so every server sees a stranger each time.
+  rippled keeps one node key (its `node_seed`), apart from the validator keys. We keep one too, on disk.
+- **7.3 A real inbound handshake.** Port 51235 accepts a connection, holds it 5 minutes and closes it, with no TLS
+  and no handshake. Nobody can peer *to* m3060. We do the same handshake rippled does, both ways.
+- **7.4 Relay like a peer.** Pass on other validators' proposals and validations (with squelching, so we don't
+  flood), share the peers we know (`TMEndpoints`), and check a transaction before relaying it (today it is
+  forwarded to the hubs unchecked).
+- **Why it matters:** today our validations reach the network only through 4 relay hubs (three of Ripple's, one
+  community hub). A validator the network keeps as a peer doesn't depend on any 4 servers.
+
+### Step 8: start from nothing without .39
+*Size: medium to large. Your tap: the source switch.*
+
+A cold start downloads the whole state (millions of objects) from .39's RPC (`ledger_data`, `bulk_sync.rs`); no
+path gets it from peers. Step 4 fetches each *new* ledger from peers, not the starting state. Step 8 fetches the
+state tree from peers (`TMGetLedger`, the state map, node by node, checked against the ledger's `account_hash`),
+in shadow first against .39's copy, then as the source. Until then, a cold start needs .39 alive.
+
+### Step 9: its own clock, its own votes, a fresh list
+*Size: small. Your taps: switch-ons.*
+
+- **Clock.** m3060 trusts its system clock with no check. rippled checks its offset against time servers. We
+  watch the offset and stop signing on doubt.
+- **Fee votes.** Validations carry amendment votes but no fee votes (`consensus/fee_vote.rs` is built, nothing
+  calls it). We vote the current fees.
+- **Amendment votes** only for rules still pending, not ones mainnet already switched on.
+- **The validator list** is fetched once, at start. It is refreshed while running, so a long uptime never
+  outlives it.
+
+### Later, only for a place on a trusted list
+- **The master key offline.** Today the master and signing keys come from one seed on m3060. rippled's way is a
+  master key kept offline and a validator token on the server that can be replaced if the box is lost.
+- **Proposing** (also in Step 6): only counts once trusted validators list us.
+
 ## 6. Order, size and proof
 
 | Step | Size | Live risk while building | Done when | Your tap |
@@ -250,6 +296,9 @@ ledger.
 | 4. Data from peers | medium to large | none until the source switch | weeks of peer = .39, then the switch | source switch |
 | 5. Build live and sign our own | medium + weeks of shadow | none in shadow | 5a clean month, then 5b | 5a, 5b |
 | 6. Rust-only build | medium | none | the gate passes without the C++ library | — |
+| 7. A proper peer | small to medium | low (peer sessions only) | handshakes a trickle, peers stay, inbound peers connect | a switch-on per piece |
+| 8. Start without .39 | medium to large | none in shadow | a cold start from peers matches .39's state | source switch |
+| 9. Clock, votes, list | small | low | offset watched, fee votes in, list refreshed | switch-ons |
 
 ```
 Step 1 --> ships after the soak running at the push
@@ -259,7 +308,7 @@ Step 4 --------------+--> Step 5 shadow --> 5a live --> (clean month) --> 5b liv
 ```
 
 Steps 2 and 3 can be built while Step 4 is built. Most of the correctness is proven by trailing checks
-**before anything live changes**.
+**before anything live changes**. Steps 7-9 don't depend on 2-5 and can go in any cycle; 7.1 first.
 
 ## 7. Risks and how we handle them
 

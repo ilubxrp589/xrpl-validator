@@ -300,6 +300,12 @@ async fn main() {
     let (outbound_tx, _) = broadcast::channel::<Vec<u8>>(2000);
     // Independence 4.1 (XRPL_PEER_FETCH=1): each validated ledger fetched from peers too, and compared.
     xrpl_node::peer_fetch::start();
+    // Independence 7.1 (XRPL_PEER_PONG=1): regular peers' pings answered.
+    if peer_pong_on() {
+        eprintln!("[peer] pings ANSWERED (XRPL_PEER_PONG=1): regular peers keep their sessions");
+    } else {
+        eprintln!("[peer] pings not answered (XRPL_PEER_PONG unset): regular peers drop us about every 2 min");
+    }
     let outbound_tx2 = outbound_tx.clone();
 
     // Message dedup: hash of recent messages to avoid duplicates from multiple peers
@@ -1859,6 +1865,9 @@ async fn main() {
                 "connected": connected_count,
                 "known": known,
                 "max": max_peers,
+                "handshakes": PEER_HANDSHAKES.load(std::sync::atomic::Ordering::Relaxed),
+                "pings_answered": PEER_PONGS.load(std::sync::atomic::Ordering::Relaxed),
+                "pong": peer_pong_on(),
                 "peers": active,
                 "peer_details": peer_details,
                 "discovered": discovered,
@@ -2047,6 +2056,19 @@ fn spawn_peer_connection(
     });
 }
 
+/// Independence 7.1 (XRPL_PEER_PONG=1): answer each regular peer's keep-alive pings, as the relay sessions already
+/// do (`peer::relay`). rippled drops a peer that has not answered its previous ping by its next 60-second tick
+/// (`PeerImp::onTimer`), so without pongs every peer session ends after about two minutes and is dialled again:
+/// about 25,000 handshakes in the first 10 hours of cycle 176, for some 80 peers.
+fn peer_pong_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XRPL_PEER_PONG").as_deref() == Ok("1"))
+}
+
+/// Regular peer sessions opened since the start, and the pings they answered (/api/peers).
+static PEER_HANDSHAKES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PEER_PONGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 async fn run_peer_connection(
     peer_addr: &str,
     tx: &broadcast::Sender<MessageEvent>,
@@ -2071,6 +2093,7 @@ async fn run_peer_connection(
     .map_err(|e| format!("handshake: {e}"))?;
 
     eprintln!("[peer] Handshake with {peer_addr} successful!");
+    PEER_HANDSHAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let _ = tx.send(MessageEvent {
         seq: 0,
@@ -2119,6 +2142,18 @@ async fn run_peer_connection(
                     // peers' replies for one ledger are byte-identical).
                     if let PeerMessage::LedgerData(ref d) = msg {
                         xrpl_node::peer_fetch::on_ledger_data(peer_addr, d);
+                    }
+
+                    // Independence 7.1: the peer's keep-alive ping is answered at once (two pings can be
+                    // byte-identical, so before the duplicate filter too).
+                    if peer_pong_on() {
+                        if let Some(pong) = xrpl_node::peer::codec::pong_frame_for(&msg) {
+                            use tokio::io::AsyncWriteExt;
+                            if writer.lock().await.write_all(&pong).await.is_err() {
+                                return Err("pong write failed".to_string());
+                            }
+                            PEER_PONGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
 
                     // Auto-discover peers from Endpoints messages
