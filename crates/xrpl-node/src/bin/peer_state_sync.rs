@@ -2,7 +2,7 @@
 //!
 //!   peer_state_sync --out DIR [--ledger-hash H | --seq N] [--limit NODES] [--peers a:51235,b:51235]
 //!                   [--max-peers 12] [--gap-ms 1500] [--timeout-s 30] [--max-minutes M]
-//!                   [--witness http://10.0.0.39:5005 | --witness none] [--fresh] [--no-recheck]
+//!                   [--witness URL | --witness none] [--fresh] [--no-recheck]
 //!
 //! 1. Dials mainnet peers itself, with one node identity for the run: live_viewer's bootstrap peers (and --peers),
 //!    then the peers they name in TMEndpoints. Pings are answered (a peer drops a session that leaves its ping
@@ -152,7 +152,14 @@ fn parse_args() -> Result<Args, String> {
     let witness = match arg("--witness").as_deref() {
         Some("none") | Some("") => None,
         Some(u) => Some(u.to_string()),
-        None => Some("http://10.0.0.39:5005".to_string()),
+        // no --witness: the validator's upstream (XRPL_RPC_URL's first), else a node on this machine
+        None => Some(
+            std::env::var("XRPL_RPC_URL")
+                .ok()
+                .and_then(|v| v.split(',').next().map(|s| s.trim().to_string()))
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "http://127.0.0.1:5005".to_string()),
+        ),
     };
     Ok(Args {
         out: PathBuf::from(arg("--out").unwrap_or_else(|| "peer_state_out".into())),

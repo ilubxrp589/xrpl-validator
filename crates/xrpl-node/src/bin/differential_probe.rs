@@ -87,8 +87,8 @@ fn cache_dir() -> Option<std::path::PathBuf> {
 ///
 /// ⚠ The SERVER is part of the key. One cache directory is shared by every
 /// probe run on the box, and they do not all talk to the same node: the
-/// nightly scout hydrates from our own .39 (`runner.sh diff <seq>
-/// http://10.0.0.39:5005`) while re-probes of older finds must use s2, whose
+/// nightly scout hydrates from our own upstream node (`runner.sh diff <seq>
+/// $DX_LAN_RPC`) while re-probes of older finds must use s2, whose
 /// ~17k-ledger window .39 has long since rolled past. Keying on
 /// method+params alone let one server's answers be served for the other's
 /// question, and for PAGINATED calls that is corrupting rather than merely
@@ -4246,7 +4246,7 @@ mod cache_key_tests {
         let params = json!({"account": "rAAA", "ledger_index": 1, "type": "nft_page"});
         assert_ne!(
             cache_key("https://s2.ripple.com:51234", "account_objects", &params),
-            cache_key("http://10.0.0.39:5005", "account_objects", &params),
+            cache_key("http://192.0.2.10:5005", "account_objects", &params),
             "two servers must not share a cache entry",
         );
         // Same server, different marker, still distinct.

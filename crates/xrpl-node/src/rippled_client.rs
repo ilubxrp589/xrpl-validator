@@ -343,8 +343,8 @@ mod tests {
     fn signing_with_both_overrides_is_ok() {
         assert!(check_signing_endpoints(
             true,
-            Some("http://10.0.0.39:5005"),
-            Some("ws://10.0.0.39:6006"),
+            Some("http://192.0.2.10:5005"),
+            Some("ws://192.0.2.10:6006"),
             false,
         )
         .is_ok());
@@ -352,7 +352,7 @@ mod tests {
 
     #[test]
     fn signing_without_rpc_override_is_refused() {
-        let err = check_signing_endpoints(true, None, Some("ws://10.0.0.39:6006"), false)
+        let err = check_signing_endpoints(true, None, Some("ws://192.0.2.10:6006"), false)
             .unwrap_err();
         assert!(err.contains("XRPL_RPC_URL"), "should name the missing RPC var: {err}");
         assert!(!err.contains("XRPL_WS_URL"), "must not flag WS when it is set: {err}");
@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn signing_without_ws_override_is_refused() {
-        let err = check_signing_endpoints(true, Some("http://10.0.0.39:5005"), None, false)
+        let err = check_signing_endpoints(true, Some("http://192.0.2.10:5005"), None, false)
             .unwrap_err();
         assert!(err.contains("XRPL_WS_URL"), "should name the missing WS var: {err}");
         assert!(!err.contains("XRPL_RPC_URL"), "must not flag RPC when it is set: {err}");

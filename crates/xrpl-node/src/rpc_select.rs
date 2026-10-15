@@ -25,10 +25,15 @@ use serde_json::{json, Value};
 /// Public history server. Reaches every ledger, at WAN latency.
 pub const DEFAULT_RPC: &str = "https://s2.ripple.com:51234";
 
-/// The LAN validator, preferred whenever it still holds the target ledger.
-/// Overridable via `DX_LAN_RPC`.
+/// The LAN node, preferred whenever it still holds the target ledger: `DX_LAN_RPC`, else the first of
+/// `XRPL_RPC_URL` (the validator's own upstream), else a node on this machine. The source names no
+/// machine; the operator's scripts set `DX_LAN_RPC`.
 pub fn lan_rpc() -> String {
-    std::env::var("DX_LAN_RPC").unwrap_or_else(|_| "http://10.0.0.39:5005".to_string())
+    let env = |k: &str| std::env::var(k).ok().map(|v| v.split(',').next().unwrap_or("").trim().to_string());
+    env("DX_LAN_RPC")
+        .filter(|v| !v.is_empty())
+        .or_else(|| env("XRPL_RPC_URL").filter(|v| !v.is_empty()))
+        .unwrap_or_else(|| "http://127.0.0.1:5005".to_string())
 }
 
 /// A node's `complete_ledgers`, UNCACHED — the window MOVES, so this is the one
