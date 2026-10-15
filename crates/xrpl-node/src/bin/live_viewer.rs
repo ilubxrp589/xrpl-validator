@@ -1564,22 +1564,7 @@ async fn main() {
                 let url = format!("https://{}:{}/crawl", ip, port);
                 if let Ok(resp) = client.get(&url).send().await {
                     if let Ok(body) = resp.json::<serde_json::Value>().await {
-                        let version = body.get("server")
-                            .and_then(|s| s.get("build_version"))
-                            .and_then(|v| v.as_str())
-                            .map(|v| format!("rippled-{}", v))
-                            .or_else(|| {
-                                body.get("overlay")
-                                    .and_then(|o| o.get("active"))
-                                    .and_then(|a| a.as_array())
-                                    .and_then(|a| a.first())
-                                    .and_then(|p| p.get("version"))
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from)
-                            });
-                        if let Some(v) = version {
-                            crawl_cache.lock().insert(addr.clone(), v);
-                        }
+                        crawl_cache.lock().insert(addr.clone(), xrpl_node::version::crawl_label(&body));
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1673,7 +1658,7 @@ async fn main() {
                     let connected = cc.load(std::sync::atomic::Ordering::Relaxed);
                     axum::Json(serde_json::json!({
                         "server": {
-                            "build_version": "xrpl-rust-validator/0.1.0",
+                            "build_version": xrpl_node::version::PEER_VERSION,
                             "server_state": "full",
                             "pubkey_node": pk,
                         },

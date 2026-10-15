@@ -137,7 +137,7 @@ pub fn render_prometheus(snap: &ValidatorMetricsSnapshot) -> String {
          \n\
          # HELP xrpl_validator_info Validator identity and version info\n\
          # TYPE xrpl_validator_info gauge\n\
-         xrpl_validator_info{{version=\"0.1.0\",implementation=\"rust\",domain=\"{domain}\"}} 1\n",
+         xrpl_validator_info{{version=\"{version}\",implementation=\"rust\",domain=\"{domain}\"}} 1\n",
         snap.uptime_secs,
         snap.ledger_seq,
         snap.consecutive_matches,
@@ -156,6 +156,7 @@ pub fn render_prometheus(snap: &ValidatorMetricsSnapshot) -> String {
         snap.ledger_hash_match_ratio,
         snap.lockstep_shadow_match_ratio,
         domain = domain,
+        version = crate::version::PEER_VERSION.trim_start_matches("xrpl-rust-validator/"),
     )
 }
 
