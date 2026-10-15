@@ -281,13 +281,30 @@ in shadow first against .39's copy, then as the source. Until then, a cold start
 ### Step 9: its own clock, its own votes, a fresh list
 *Size: small. Your taps: switch-ons.*
 
-- **Clock.** m3060 trusts its system clock with no check. rippled checks its offset against time servers. We
-  watch the offset and stop signing on doubt.
-- **Fee votes.** Validations carry amendment votes but no fee votes (`consensus/fee_vote.rs` is built, nothing
-  calls it). We vote the current fees.
-- **Amendment votes** only for rules still pending, not ones mainnet already switched on.
-- **The validator list** is fetched once, at start. It is refreshed while running, so a long uptime never
-  outlives it.
+- **Clock.** m3060 trusts its system clock with no check, and so does rippled 3.x: `TimeKeeper::now()` is the
+  system clock (ffi/vendor/rippled `src/xrpld/core/TimeKeeper.h:66`); the old SNTP client is gone and the host's
+  NTP keeps the time. We go past rippled: an SNTP check against time.google.com, time.cloudflare.com and
+  pool.ntp.org every 5 minutes, median offset, logged and in `/api/engine` (`clock`), `XRPL_CLOCK_CHECK=1`.
+  `XRPL_CLOCK_GATE=1` also skips signing while 2 or more servers agree the clock is over 1 s off; no answer, one
+  answer or a stale reading never stops signing. Peers accept a signing time 3 minutes early to 5 minutes late
+  (`Validations.h:162-163`), so 1 s is doubt, not harm. **Built (branch step-9).**
+- **Fee votes: nothing to build.** rippled puts a fee field in a voting-ledger validation only when its
+  configured target differs from the current fee (`FeeVoteImpl::doValidation`, FeeVoteImpl.cpp:135-141 in
+  ffi/vendor/rippled; the same in 3.3.0), and when it tallies, a trusted validation without the field counts as
+  a vote for the current value (`doVoting`, :230-233, `VotableValue::noVote`, :53-57). Our validations carry no
+  fee fields, so they already vote to keep the current fees, which is our stance. `consensus/fee_vote.rs` stays
+  uncalled: its median is not rippled's tally and its defaults are the old reserves. Build it only if we ever
+  want the fees changed.
+- **Amendment votes** only for rules still pending, as rippled's `AmendmentTable::doValidation` does
+  (AmendmentTable.cpp:813-836): `XRPL_VOTE_PENDING_ONLY=1` drops the amendments the ledger's Amendments object
+  lists as enabled, read from our own state by the amendment guard. Measured on mainnet's object at #107,606,611:
+  every one of our 45 yes votes is already enabled, so the voting-ledger validation carries no Amendments field,
+  as a rippled with nothing pending to support sends. **Built (branch step-9).**
+- **The validator list** is fetched once, at start. `XRPL_UNL_REFRESH=1` fetches and verifies it again every
+  hour (or the list's own `refresh_interval`, as rippled's `ValidatorSite` honours it, and by halfway to its
+  expiry), with the same pin, signatures, expiry and sequence checks; a failed or unverified fetch keeps the
+  current list. A changed list reaches the consensus engine, the own-validated tally and the round recorder.
+  **Built (branch step-9).**
 
 ### Later, only for a place on a trusted list
 - **The master key offline.** Today the master and signing keys come from one seed on m3060. rippled's way is a
@@ -306,7 +323,7 @@ in shadow first against .39's copy, then as the source. Until then, a cold start
 | 6. Rust-only build | medium | none | the gate passes without the C++ library | — |
 | 7. A proper peer | small | low (peer sessions only) | handshakes a trickle, one node key, checked relays | a switch-on per piece |
 | 8. Start without .39 | medium to large | none in shadow | a cold start from peers matches .39's state | source switch |
-| 9. Clock, votes, list | small | low | offset watched, fee votes in, list refreshed | switch-ons |
+| 9. Clock, votes, list | small | low | offset watched, votes only for pending amendments (no fee field already votes the current fees), list refreshed | switch-ons |
 
 ```
 Step 1 --> ships after the soak running at the push

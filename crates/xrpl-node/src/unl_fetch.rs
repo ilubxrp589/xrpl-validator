@@ -219,50 +219,12 @@ fn write_last_good(path: &str, publisher: &str, sequence: u64) {
 /// parse only after EVERY source fails verification, loudly; enforce mode
 /// fails closed instead — the caller keeps whatever UNL it already has.
 pub async fn fetch_default_unl_verified() -> Result<Vec<UnlEntry>, String> {
-    let pinned = std::env::var("XRPL_UNL_PINNED_KEY").ok();
+    let (pinned, state_path) = unl_env();
     let enforce = std::env::var("XRPL_UNL_ENFORCE").map(|v| v == "1").unwrap_or(false);
-    let state_path = std::env::var("XRPL_UNL_STATE")
-        .unwrap_or_else(|_| "/mnt/xrpl-data/unl-last-good.json".to_string());
-    let mut last_err = String::new();
-    for url in DEFAULT_UNL_SOURCES {
-        let body = match fetch_vl_body(url).await {
-            Ok(b) => b,
-            Err(e) => {
-                last_err = e;
-                continue;
-            }
-        };
-        match crate::unl_verify::verify_vl(&body, pinned.as_deref()) {
-            Ok(v) => {
-                let last = read_last_good(&state_path)
-                    .filter(|(p, _)| *p == v.publisher)
-                    .map(|(_, s)| s);
-                if !crate::unl_verify::sequence_acceptable(last, v.sequence) {
-                    last_err = format!(
-                        "{url}: sequence regression {} < last-good {}",
-                        v.sequence,
-                        last.unwrap_or(0)
-                    );
-                    eprintln!("[unl] VERIFY-REJECT {last_err}");
-                    continue;
-                }
-                write_last_good(&state_path, &v.publisher, v.sequence);
-                write_last_good_body(&state_path, &body);
-                eprintln!(
-                    "[unl] VERIFIED {url}: publisher {}… seq {} validators {} (manifests rejected: {})",
-                    &v.publisher[..12.min(v.publisher.len())],
-                    v.sequence,
-                    v.entries.len(),
-                    v.manifests_rejected
-                );
-                return Ok(v.entries);
-            }
-            Err(e) => {
-                last_err = format!("{url}: {e}");
-                eprintln!("[unl] VERIFY-FAIL {last_err}");
-            }
-        }
-    }
+    let last_err = match fetch_first_verified(pinned.as_deref(), &state_path).await {
+        Ok(f) => return Ok(f.list.entries),
+        Err(e) => e,
+    };
     if enforce {
         // Fail closed: never an unverified list. The last list that verified, verified again (pin, signatures,
         // expiry, sequence), is the one fallback.
@@ -278,6 +240,81 @@ pub async fn fetch_default_unl_verified() -> Result<Vec<UnlEntry>, String> {
         "[unl] ⚠ every source failed verification — observe mode falls back to the UNVERIFIED parse ({last_err})"
     );
     fetch_default_unl().await
+}
+
+/// The publisher pin (`XRPL_UNL_PINNED_KEY`) and the last-good state file (`XRPL_UNL_STATE`).
+fn unl_env() -> (Option<String>, String) {
+    let pinned = std::env::var("XRPL_UNL_PINNED_KEY").ok();
+    let state_path = std::env::var("XRPL_UNL_STATE")
+        .unwrap_or_else(|_| "/mnt/xrpl-data/unl-last-good.json".to_string());
+    (pinned, state_path)
+}
+
+/// A list that passed every check, where it came from, and the site's own refresh hint.
+pub struct FetchedList {
+    pub url: &'static str,
+    pub list: crate::unl_verify::VerifiedUnl,
+    /// The document's `refresh_interval` in minutes, when it gives one (rippled `ValidatorSite::parseJsonResponse`,
+    /// ValidatorSite.cpp:481-489).
+    pub refresh_interval_min: Option<u64>,
+}
+
+/// Independence Step 9 (`XRPL_UNL_REFRESH=1`, `unl_refresh`): one fetch for the running refresh, through the
+/// same sources, pin, verification, sequence gate and last-good persistence as the start, but never the
+/// unverified parse and never the stored list: on any failure the caller keeps the list it already trusts.
+pub async fn refresh_verified() -> Result<FetchedList, String> {
+    let (pinned, state_path) = unl_env();
+    fetch_first_verified(pinned.as_deref(), &state_path).await
+}
+
+/// Each default source in turn, verified (pin, signatures, expiry, per-validator manifests) and held to the
+/// persisted last-good sequence; the first that passes is persisted as the new last good. Err: why the last
+/// source failed.
+async fn fetch_first_verified(pinned: Option<&str>, state_path: &str) -> Result<FetchedList, String> {
+    let mut last_err = String::new();
+    for url in DEFAULT_UNL_SOURCES {
+        let body = match fetch_vl_body(url).await {
+            Ok(b) => b,
+            Err(e) => {
+                last_err = e;
+                continue;
+            }
+        };
+        match crate::unl_verify::verify_vl(&body, pinned) {
+            Ok(v) => {
+                let last = read_last_good(state_path)
+                    .filter(|(p, _)| *p == v.publisher)
+                    .map(|(_, s)| s);
+                if !crate::unl_verify::sequence_acceptable(last, v.sequence) {
+                    last_err = format!(
+                        "{url}: sequence regression {} < last-good {}",
+                        v.sequence,
+                        last.unwrap_or(0)
+                    );
+                    eprintln!("[unl] VERIFY-REJECT {last_err}");
+                    continue;
+                }
+                write_last_good(state_path, &v.publisher, v.sequence);
+                write_last_good_body(state_path, &body);
+                eprintln!(
+                    "[unl] VERIFIED {url}: publisher {}… seq {} validators {} (manifests rejected: {})",
+                    &v.publisher[..12.min(v.publisher.len())],
+                    v.sequence,
+                    v.entries.len(),
+                    v.manifests_rejected
+                );
+                let refresh_interval_min = body
+                    .get("refresh_interval")
+                    .and_then(|r| r.as_u64().or_else(|| r.as_f64().map(|f| f.max(0.0) as u64)));
+                return Ok(FetchedList { url, list: v, refresh_interval_min });
+            }
+            Err(e) => {
+                last_err = format!("{url}: {e}");
+                eprintln!("[unl] VERIFY-FAIL {last_err}");
+            }
+        }
+    }
+    Err(last_err)
 }
 
 /// Where the last verified list document is kept: beside the last-good state file.

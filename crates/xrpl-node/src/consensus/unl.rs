@@ -49,6 +49,14 @@ impl UNL {
         self.trusted.insert(pubkey_hex.to_uppercase());
     }
 
+    /// Replace the trusted keys with a new list's (Step 9, `unl_refresh`): a validator dropped from the
+    /// published list stops being trusted, as in rippled's `ValidatorList::updatePublisherList`
+    /// (ValidatorList.cpp:1080-1102), which takes the old list's keys out as it puts the new list's in.
+    /// Manifests are kept.
+    pub fn set_trusted<I: IntoIterator<Item = String>>(&mut self, keys: I) {
+        self.trusted = keys.into_iter().map(|k| k.to_uppercase()).collect();
+    }
+
     /// Number of trusted validators.
     pub fn trusted_count(&self) -> usize {
         self.trusted.len()
@@ -113,6 +121,17 @@ mod tests {
         let unl = UNL::empty();
         assert_eq!(unl.trusted_count(), 0);
         assert!(!unl.is_trusted("anything"));
+    }
+
+    #[test]
+    fn set_trusted_replaces_the_list_and_keeps_manifests() {
+        let mut unl = UNL::from_keys(&["AABB".into(), "CCDD".into()]);
+        unl.process_manifest(Manifest { master_key: vec![0xAA, 0xBB], signing_key: vec![0x11], sequence: 1 });
+        unl.set_trusted(["ccdd".to_string(), "EEFF".to_string()]);
+        assert_eq!(unl.trusted_count(), 2);
+        assert!(!unl.is_trusted("AABB"), "dropped from the new list");
+        assert!(unl.is_trusted("CCDD") && unl.is_trusted("eeff"));
+        assert_eq!(unl.resolve_signing_key("AABB"), Some(&[0x11][..]));
     }
 
     #[test]

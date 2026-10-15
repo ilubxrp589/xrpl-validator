@@ -119,12 +119,32 @@ pub fn assess(seq: u32, sle: &Value) -> GuardReport {
     assess_with(seq, sle, ENGINE_KNOWN, KNOWN_GAP)
 }
 
+/// The IDs an Amendments object lists as enabled (`sfAmendments`), as bytes; malformed entries are skipped.
+pub fn enabled_ids(sle: &Value) -> Vec<[u8; 32]> {
+    sle["Amendments"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|x| hex::decode(x.as_str()?).ok()?.try_into().ok())
+        .collect()
+}
+
 static LAST: Mutex<Option<GuardReport>> = Mutex::new(None);
+
+/// The enabled set of the last Amendments object read, and its ledger.
+static ENABLED: Mutex<Option<(u32, Vec<[u8; 32]>)>> = Mutex::new(None);
+
+/// Step 9 (`XRPL_VOTE_PENDING_ONLY=1`, `validation::amendment_votes`): what the validator's own state says
+/// mainnet has enabled, as of ledger `seq`. None until the native shadow has read a ledger.
+pub fn enabled() -> Option<(u32, Vec<[u8; 32]>)> {
+    ENABLED.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
 
 /// Record ledger `seq`'s Amendments object (its engine-JSON bytes, None when the state has none). Logs only
 /// when the verdict changes, so a reading every ledger costs one small parse.
 pub fn observe(seq: u32, sle_json: Option<&[u8]>) {
     let Some(sle) = sle_json.and_then(|b| serde_json::from_slice::<Value>(b).ok()) else { return };
+    *ENABLED.lock().unwrap_or_else(|e| e.into_inner()) = Some((seq, enabled_ids(&sle)));
     let r = assess(seq, &sle);
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
     let changed = last.as_ref().is_none_or(|l| (&l.unknown_enabled, &l.gap_enabled, &l.majority_unknown) != (&r.unknown_enabled, &r.gap_enabled, &r.majority_unknown));
@@ -241,6 +261,18 @@ mod tests {
         }
         assert!(KNOWN_GAP.iter().all(|g| !ENGINE_KNOWN.contains(g)), "a gap is by definition not built");
         assert!(OTHER_NAMES.iter().all(|o| !ENGINE_KNOWN.contains(o)));
+    }
+
+    #[test]
+    fn the_enabled_ids_are_read_as_bytes() {
+        let ids = enabled_ids(&live());
+        assert_eq!(ids.len(), 97);
+        assert!(ids.contains(&xrpl_core::crypto::signing::sha512_half(b"fixBatchV1_2")));
+        assert!(!ids.contains(&xrpl_core::crypto::signing::sha512_half(b"fixCleanup3_4_0")), "majority, not enabled");
+        let mut sle = live();
+        sle["Amendments"].as_array_mut().unwrap().push(json!("not hex"));
+        assert_eq!(enabled_ids(&sle).len(), 97, "a malformed entry is skipped");
+        assert!(enabled_ids(&json!({})).is_empty());
     }
 
     #[test]

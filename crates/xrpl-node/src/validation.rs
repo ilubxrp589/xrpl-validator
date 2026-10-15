@@ -104,7 +104,54 @@ pub fn amendments_json() -> serde_json::Value {
         .iter()
         .map(|(name, evidence)| serde_json::json!({"name": name, "hash": amendment_hash(name).to_string(), "evidence": evidence}))
         .collect();
-    serde_json::json!({"votes": SUPPORTED_AMENDMENT_NAMES, "ready_pending": implemented, "guard": crate::amendment_guard::json()})
+    serde_json::json!({"votes": SUPPORTED_AMENDMENT_NAMES, "pending_only": pending_only_on(), "ready_pending": implemented, "guard": crate::amendment_guard::json()})
+}
+
+/// Independence Step 9 (`XRPL_VOTE_PENDING_ONLY=1`): vote only for amendments mainnet has not yet enabled.
+pub fn pending_only_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XRPL_VOTE_PENDING_ONLY").as_deref() == Ok("1"))
+}
+
+/// The startup line for `XRPL_VOTE_PENDING_ONLY` (nothing when it is off).
+pub fn log_vote_switch() {
+    if pending_only_on() {
+        eprintln!("[votes] ON — amendment votes only for amendments the ledger's Amendments object does not list as enabled (XRPL_VOTE_PENDING_ONLY=1); the full list until the native shadow has read one");
+    }
+}
+
+/// The yes votes left once the enabled amendments are taken out, sorted: rippled
+/// `AmendmentTableImpl::doValidation` (AmendmentTable.cpp:813-836) votes for an amendment only when it is
+/// supported, voted up and `enabled.count(id) == 0`, then sorts the list. An empty list means no
+/// `sfAmendments` field at all (RCLConsensus.cpp:888-893; `build_validation_for_signing` omits an empty one).
+pub fn pending_votes(votes: &[Hash256], enabled: &[[u8; 32]]) -> Vec<Hash256> {
+    let mut v: Vec<Hash256> = votes.iter().filter(|h| !enabled.contains(&h.0)).copied().collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+/// The amendment votes for a voting ledger. Off (default): [`supported_amendments`], as always. With
+/// `XRPL_VOTE_PENDING_ONLY=1`: [`pending_votes`] against the enabled set the amendment guard last read from the
+/// validator's own state (the native shadow's mirror, every ledger it applies; `amendment_guard::enabled`). That
+/// reading may trail the voting ledger by a few ledgers, which is harmless: amendments are only ever added to
+/// the set, so an older set can only keep an extra vote for one just enabled, and rippled's `doVoting` skips
+/// votes for enabled amendments. With no reading yet, the full list, as before.
+pub fn amendment_votes() -> Vec<Hash256> {
+    let all = supported_amendments();
+    if !pending_only_on() {
+        return all;
+    }
+    match crate::amendment_guard::enabled() {
+        Some((seq, enabled)) => {
+            let v = pending_votes(&all, &enabled);
+            eprintln!("[votes] pending only: {} of our {} yes votes are for amendments not enabled at #{seq} ({} enabled)", v.len(), all.len(), enabled.len());
+            v
+        }
+        None => {
+            eprintln!("[votes] pending only, but no Amendments object read yet — voting the full list ({})", all.len());
+            all
+        }
+    }
 }
 
 /// `sfServerVersion`, laid out per rippled `BuildInfo::encodeSoftwareVersion`
@@ -684,6 +731,36 @@ mod tests {
         ] {
             assert!(!SUPPORTED_AMENDMENT_NAMES.contains(&name), "{name} is not ready and must not be voted for");
         }
+    }
+
+    /// Step 9: against mainnet's Amendments object at #107,606,611 (2026-10-12), every amendment we vote yes
+    /// for is already enabled, so a pending-only validation carries no `sfAmendments` at all.
+    #[test]
+    fn pending_only_votes_drop_what_mainnet_has_enabled() {
+        let sle: serde_json::Value =
+            serde_json::from_str::<serde_json::Value>(include_str!("../tests/vectors/amendments_107606611.json")).unwrap()["node"].clone();
+        let enabled = crate::amendment_guard::enabled_ids(&sle);
+        let all = supported_amendments();
+        assert_eq!(pending_votes(&all, &enabled), Vec::<Hash256>::new(), "every yes vote is enabled on mainnet");
+        // Take two out of the enabled set: those two are voted for again, sorted, nothing else.
+        let (a, b) = (amendment_hash("fixCleanup3_3_0"), amendment_hash("BatchV1_1"));
+        let fewer: Vec<[u8; 32]> = enabled.iter().copied().filter(|e| *e != a.0 && *e != b.0).collect();
+        let mut want = vec![a, b];
+        want.sort_by(|x, y| x.0.cmp(&y.0));
+        assert_eq!(pending_votes(&all, &fewer), want);
+        // Nothing enabled: the full list, in rippled's sorted order.
+        let p = pending_votes(&all, &[]);
+        assert_eq!(p.len(), all.len());
+        assert!(p.windows(2).all(|w| w[0].0 < w[1].0));
+    }
+
+    #[test]
+    fn an_empty_vote_list_puts_no_amendments_field_on_the_voting_ledger() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let identity = NodeIdentity::generate().unwrap();
+        let voting = sign_validation(&identity, 106664703, &[0x11u8; 32], Some(&[]));
+        assert!(has_field(&voting, &field::SERVER_VERSION));
+        assert!(!has_field(&voting, &field::AMENDMENTS));
     }
 
     #[test]

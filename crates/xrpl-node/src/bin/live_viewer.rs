@@ -1010,6 +1010,13 @@ async fn main() {
     // XRPL_CONSENSUS_RECORD=1, and it only observes.
     xrpl_node::consensus_record::init();
 
+    // Independence Step 9, each off unless switched on: the clock check (XRPL_CLOCK_CHECK=1, XRPL_CLOCK_GATE=1),
+    // amendment votes for pending amendments only (XRPL_VOTE_PENDING_ONLY=1) and the validator list refreshed
+    // while running (XRPL_UNL_REFRESH=1, after the first load below).
+    xrpl_node::clock_check::start();
+    xrpl_node::validation::log_vote_switch();
+    xrpl_node::unl_refresh::log_switch();
+
     // Fetch UNL (trusted validators) from published sources — required for consensus threshold math
     {
         let consensus_for_unl = consensus.clone();
@@ -1018,7 +1025,7 @@ async fn main() {
             // on its side must delay consensus tracking, not disable it for the life of the process — on
             // 2026-09-23 every restart since 09-21 had come up with the monitor frozen at round 1.
             let mut attempt = 0u32;
-            loop {
+            let loaded = loop {
                 match xrpl_node::unl_fetch::fetch_default_unl_verified().await {
                     Ok(entries) => {
                         xrpl_node::consensus_record::record_unl(&entries);
@@ -1041,7 +1048,7 @@ async fn main() {
                             "[consensus] UNL loaded: {} validators, {} with signing keys, trust_count={}",
                             entries.len(), with_signing, eng.unl.trusted_count()
                         );
-                        break;
+                        break entries;
                     }
                     Err(e) => {
                         let wait = xrpl_node::unl_fetch::unl_retry_delay(attempt);
@@ -1050,7 +1057,10 @@ async fn main() {
                         attempt = attempt.saturating_add(1);
                     }
                 }
-            }
+            };
+            // Independence Step 9 (XRPL_UNL_REFRESH=1): fetched and verified again while running; returns at once
+            // when the switch is off.
+            xrpl_node::unl_refresh::run(consensus_for_unl, loaded).await;
         });
     }
 
@@ -1498,12 +1508,27 @@ async fn main() {
                                 // Gate passed (ready_to_sign && non-zero hash) — proceed.
                                 {
 
+                                // Independence Step 9 (XRPL_CLOCK_GATE=1): no signature while the time servers
+                                // agree our clock is more than 1 s off. Never on "no answer" (clock_check).
+                                if let Some(why) = xrpl_node::clock_check::gate_skip() {
+                                    eprintln!("[validator] Declining to sign #{seq}: {why}");
+                                    let _ = val_sse.send(MessageEvent {
+                                        seq: 0, time: 0.0,
+                                        msg_type: "ValidationSkipped".into(),
+                                        detail: why,
+                                        ledger_seq: Some(seq),
+                                        ledger_hash: None, peers: None, validator: None, tx_info: None,
+                                    });
+                                    continue;
+                                }
+
                                 // Amendment votes ride the VOTING ledger — the one
                                 // directly before a flag ledger (seq % 256 == 255),
                                 // rippled `isVotingLedger()`; the flag ledger itself
-                                // (seq % 256 == 0) tallies them.
+                                // (seq % 256 == 0) tallies them. With XRPL_VOTE_PENDING_ONLY=1,
+                                // only those mainnet has not enabled (validation::amendment_votes).
                                 let amendments = if xrpl_node::consensus::amendment_vote::is_voting_ledger(seq) {
-                                    let a = xrpl_node::validation::supported_amendments();
+                                    let a = xrpl_node::validation::amendment_votes();
                                     eprintln!("[validator] Voting ledger #{seq} (flag ledger #{}) — voting on {} amendments", seq + 1, a.len());
                                     Some(a)
                                 } else {
@@ -1797,6 +1822,8 @@ async fn main() {
                     json["own_validated"] = xrpl_node::own_validated::json();
                     // Independence 5.5: our own ledger hash, from the parts we made, trailing the network.
                     json["own_hash"] = xrpl_node::own_hash::json();
+                    // Independence Step 9: the clock's offset from the time servers (XRPL_CLOCK_CHECK=1).
+                    json["clock"] = xrpl_node::clock_check::json();
                     // Stage 4 Phase A: native-engine shadow counters.
                     #[cfg(feature = "ffi")]
                     {
