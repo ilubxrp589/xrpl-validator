@@ -288,6 +288,20 @@ struct Slot {
     replies: u64,
 }
 
+/// What one peer did over the run (all its sessions).
+#[derive(Default)]
+struct PeerStats {
+    sessions: u32,
+    replies: u64,
+    nodes: u64,
+    bytes: u64,
+    max_nodes: usize,
+    max_bytes: u64,
+    latency_ms: u64,
+    timeouts: u64,
+    last_close: String,
+}
+
 #[derive(Default)]
 struct Tallies {
     req_state: u64,
@@ -310,6 +324,7 @@ struct Tallies {
     walk_steps: u32,
     validations: u64,
     bad_sigs: u64,
+    endpoints_msgs: u64,
 }
 
 enum Phase {
@@ -335,6 +350,7 @@ struct Run {
     cooldown: HashMap<String, Instant>,
     banned: HashSet<String>,
     used: HashSet<String>,
+    per_peer: HashMap<String, PeerStats>,
     t: Tallies,
     phase: Phase,
     tally: Tally,
@@ -440,6 +456,7 @@ impl Run {
                     return; // the kill sender drops here: the session ends
                 }
                 self.t.connected += 1;
+                self.per_peer.entry(addr.clone()).or_default().sessions += 1;
                 self.peers.insert(
                     addr.clone(),
                     Slot { frames, _kill: kill, asked: None, last_sent: None, strikes: 0, range: None, up_at: now, replies: 0 },
@@ -464,6 +481,7 @@ impl Run {
                             f.release(tk);
                         }
                     }
+                    self.per_peer.entry(addr.clone()).or_default().last_close = why.clone();
                     eprintln!(
                         "[peer] - {addr} closed after {}s and {} replies: {why} ({} up)",
                         now.duration_since(slot.up_at).as_secs(),
@@ -475,6 +493,7 @@ impl Run {
             }
             Ev::Data { addr, data } => self.on_data(&addr, data, now),
             Ev::Endpoints { list } => {
+                self.t.endpoints_msgs += 1;
                 for e in list {
                     if let Some(a) = peer_state::dialable(&e) {
                         if self.known.insert(a.clone()) {
@@ -608,8 +627,18 @@ impl Run {
             return;
         }
         let k = d.nodes.len();
+        let bytes = d.nodes.iter().map(|x| x.nodedata.len() as u64).sum::<u64>();
         self.t.replies_state += 1;
-        self.t.state_bytes += d.nodes.iter().map(|x| x.nodedata.len() as u64).sum::<u64>();
+        self.t.state_bytes += bytes;
+        let ps = self.per_peer.entry(addr.to_string()).or_default();
+        ps.replies += 1;
+        ps.nodes += k as u64;
+        ps.bytes += bytes;
+        ps.max_nodes = ps.max_nodes.max(k);
+        ps.max_bytes = ps.max_bytes.max(bytes);
+        if let Some((Ask::State(_), at)) = self.peers.get(addr).and_then(|s| s.asked) {
+            ps.latency_ms += now.duration_since(at).as_millis() as u64;
+        }
         if k >= SOFT_MAX_REPLY_NODES {
             self.t.full_replies += 1;
         }
@@ -687,6 +716,7 @@ impl Run {
             s.strikes += 1;
             let strikes = s.strikes;
             self.t.timeouts += 1;
+            self.per_peer.entry(addr.clone()).or_default().timeouts += 1;
             if let (Ask::State(tk), Some(f)) = (ask, self.fetch.as_mut()) {
                 f.release(tk);
             }
@@ -831,10 +861,10 @@ impl Run {
                 let rate = c.nodes().saturating_sub(self.last_nodes) as f64 / PROGRESS_EVERY.as_secs_f64();
                 self.last_nodes = c.nodes();
                 eprintln!(
-                    "{head} nodes {} (inner {} leaf {}) | wanted {} out {} stubborn {} | {:.0}/s | req {} rep {} full {} t/o {} | peers {up} up {} used {} dialing | in {} | rss {:.2} GB",
+                    "{head} nodes {} (inner {} leaf {}) | wanted {} out {} stubborn {} | {:.0}/s | req {} rep {} full {} t/o {} | peers {up} up {} used {} dialing {} known | in {} | rss {:.2} GB",
                     n(c.nodes()), n(c.inner), n(c.leaves), n(f.wanted() as u64), n(f.in_flight() as u64), f.stubborn(), rate,
                     n(self.t.req_state), n(self.t.replies_state), self.t.full_replies, self.t.timeouts, self.used.len(),
-                    self.dialing.len(), gb(self.bytes_in.load(Ordering::Relaxed)), rss_gb()
+                    self.dialing.len(), self.known.len(), gb(self.bytes_in.load(Ordering::Relaxed)), rss_gb()
                 );
             }
             None => eprintln!(
@@ -913,6 +943,16 @@ impl Run {
             _ => None,
         };
 
+        let mut table: Vec<(&String, &PeerStats)> = self.per_peer.iter().filter(|(_, p)| p.replies + p.timeouts > 0).collect();
+        table.sort_by(|a, b| b.1.nodes.cmp(&a.1.nodes).then(a.0.cmp(b.0)));
+        eprintln!("[peers] {:<24} {:>4} {:>8} {:>11} {:>9} {:>9} {:>10} {:>8} {:>5}  last close", "address", "sess", "replies", "nodes", "GB", "max nodes", "max MB", "avg ms", "t/o");
+        for (a, p) in &table {
+            eprintln!(
+                "[peers] {:<24} {:>4} {:>8} {:>11} {:>9.3} {:>9} {:>10.2} {:>8} {:>5}  {}",
+                a, p.sessions, p.replies, n(p.nodes), p.bytes as f64 / 1e9, p.max_nodes, p.max_bytes as f64 / 1e6,
+                p.latency_ms / p.replies.max(1), p.timeouts, p.last_close
+            );
+        }
         let el = self.started.elapsed();
         let st = self.state_started.map(|t| t.elapsed());
         println!("==== PEER STATE SYNC SUMMARY ====");
@@ -944,13 +984,15 @@ impl Run {
             gb(self.t.state_bytes)
         );
         println!(
-            "peers         {} used (answered state requests), {} connected in all ({} at the end), {} dialed, {} handshakes failed ({} full/503)",
+            "peers         {} used (answered state requests), {} connected in all ({} at the end), {} dialed, {} handshakes failed ({} full/503); {} addresses known from {} TMEndpoints",
             self.used.len(),
             self.t.connected,
             connected_at_end,
             self.t.dialed,
             self.t.handshake_failed,
-            self.t.handshake_full
+            self.t.handshake_full,
+            self.known.len(),
+            self.t.endpoints_msgs
         );
         println!(
             "              dropped: {} stalled, {} sent bad data, {} out of range; {} closed by the peer ({} with a request out)",
@@ -1080,6 +1122,7 @@ async fn main() {
         cooldown: HashMap::new(),
         banned: HashSet::new(),
         used: HashSet::new(),
+        per_peer: HashMap::new(),
         t: Tallies::default(),
         phase: Phase::Target,
         tally: Tally::default(),
