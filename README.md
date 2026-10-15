@@ -115,7 +115,7 @@ crates/
 docs/            the independence plan and its tasks, design notes
 ffi/             FFI architecture and state-marshalling specs
 scripts/         fixture and answer-key fetchers, the regression corpus
-tools/xrpl-watch the terminal dashboard
+tools/xrpl-watch the terminal dashboard, now its own repo: https://github.com/ilubxrp589/xrpl-watch
 proto/           protobuf definitions (from rippled's public .proto)
 ```
 
