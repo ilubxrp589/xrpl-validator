@@ -74,6 +74,10 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 tempfile = "3"
 
 [[bin]]
+name = "peer_state_sync"
+path = "src/bin/peer_state_sync.rs"
+
+[[bin]]
 name = "parity_probe"
 path = "src/bin/parity_probe.rs"
 required-features = ["ffi"]

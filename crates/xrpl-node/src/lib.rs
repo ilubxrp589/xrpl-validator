@@ -21,6 +21,7 @@ pub mod native_order;
 pub mod own_hash;
 pub mod own_validated;
 pub mod peer_fetch;
+pub mod peer_state;
 #[cfg(feature = "ffi")]
 pub mod native_shadow;
 pub mod amendments;
