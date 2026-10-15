@@ -2145,14 +2145,18 @@ async fn run_peer_connection(
                     }
 
                     // Independence 7.1: the peer's keep-alive ping is answered at once (two pings can be
-                    // byte-identical, so before the duplicate filter too).
+                    // byte-identical, so before the duplicate filter too). Written from its own task, as the
+                    // GetLedger replies are: one of those can hold the writer through a long write to a slow
+                    // peer, and this read loop must not wait for it. A failed write shows up as the read ending.
                     if peer_pong_on() {
                         if let Some(pong) = xrpl_node::peer::codec::pong_frame_for(&msg) {
-                            use tokio::io::AsyncWriteExt;
-                            if writer.lock().await.write_all(&pong).await.is_err() {
-                                return Err("pong write failed".to_string());
-                            }
-                            PEER_PONGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let w = writer.clone();
+                            tokio::spawn(async move {
+                                use tokio::io::AsyncWriteExt;
+                                if w.lock().await.write_all(&pong).await.is_ok() {
+                                    PEER_PONGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            });
                         }
                     }
 
