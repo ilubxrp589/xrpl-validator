@@ -24,7 +24,7 @@
 
 use serde_json::Value;
 
-use crate::consensus::sig_verify::{field_value_len, read_field_header, read_vl_length};
+use crate::consensus::sig_verify::{field_value_len, read_field_header};
 use crate::unl_fetch::UnlEntry;
 use xrpl_core::crypto::signing::sha512_half;
 
