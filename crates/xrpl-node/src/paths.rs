@@ -21,6 +21,7 @@
 //! | `XRPL_DATA_DIR`      | `/mnt/xrpl-data`                        | Root of all validator data      |
 //! | `XRPL_ROCKS_PATH`    | `${XRPL_DATA_DIR}/sync/state.rocks`     | RocksDB state directory         |
 //! | `XRPL_SEED_PATH`     | `${XRPL_DATA_DIR}/validator_seed.hex`   | Validator's signing key         |
+//! | `XRPL_NODE_SEED_PATH` | `${XRPL_DATA_DIR}/node_seed.hex`       | Peer-protocol node key (7.2)    |
 //! | `XRPL_ENGINE_STATE_PATH` | `${XRPL_DATA_DIR}/engine_state.json` | FFI engine state snapshot       |
 //!
 //! Setting `XRPL_DATA_DIR` cascades through all derived paths unless one of
@@ -73,6 +74,12 @@ pub fn resume_ticket_path() -> String {
 /// `XRPL_SEED_PATH` if set.
 pub fn seed_path() -> String {
     std::env::var("XRPL_SEED_PATH").unwrap_or_else(|_| format!("{}/validator_seed.hex", data_dir()))
+}
+
+/// The peer-protocol node key file (Independence 7.2): the key m3060 shows every peer session, kept apart from the
+/// validator's keys as rippled keeps its `node_seed`. Honors `XRPL_NODE_SEED_PATH` if set.
+pub fn node_seed_path() -> String {
+    std::env::var("XRPL_NODE_SEED_PATH").unwrap_or_else(|_| format!("{}/node_seed.hex", data_dir()))
 }
 
 /// Load the validator seed from disk, or create one with mode 0600 if absent.
@@ -180,9 +187,23 @@ mod tests {
             "XRPL_ROCKS_PATH",
             "XRPL_SEED_PATH",
             "XRPL_ENGINE_STATE_PATH",
+            "XRPL_NODE_SEED_PATH",
         ] {
             std::env::remove_var(v);
         }
+    }
+
+    #[test]
+    fn node_seed_is_its_own_file_beside_the_validator_seed() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unset_all();
+        assert_eq!(node_seed_path(), "/mnt/xrpl-data/node_seed.hex");
+        assert_ne!(node_seed_path(), seed_path());
+        std::env::set_var("XRPL_DATA_DIR", "/home/m3060/xrpl-data");
+        assert_eq!(node_seed_path(), "/home/m3060/xrpl-data/node_seed.hex");
+        std::env::set_var("XRPL_NODE_SEED_PATH", "/secrets/node.hex");
+        assert_eq!(node_seed_path(), "/secrets/node.hex");
+        unset_all();
     }
 
     #[test]

@@ -14,7 +14,8 @@ computed the same answer, not because it copied it.
 **Done means** 30 days of m3060 signing hashes it computed itself, from peer data, with .39 only watching.
 
 Steps 1-6 make the **hash** ours. Steps 7-9 (added 15 October) make the rest of the validator stand on its own: a
-proper peer the network keeps talking to, a start from nothing without .39, and its own clock, votes and list.
+proper (private) peer the network keeps talking to, a start from nothing without .39, and its own clock, votes
+and list.
 
 ## 2. How a ledger gets its hash
 
@@ -254,13 +255,20 @@ Measured 15 October on cycle 176: the network barely keeps m3060 as a peer.
   (branch peer-7).** Done when the handshake rate falls from ~2,500 an hour to a trickle.
 - **7.2 One node identity.** Each connection makes a fresh node key, so every server sees a stranger each time.
   rippled keeps one node key (its `node_seed`), apart from the validator keys. We keep one too, on disk.
-- **7.3 A real inbound handshake.** Port 51235 accepts a connection, holds it 5 minutes and closes it, with no TLS
-  and no handshake. Nobody can peer *to* m3060. We do the same handshake rippled does, both ways.
-- **7.4 Relay like a peer.** Pass on other validators' proposals and validations (with squelching, so we don't
-  flood), share the peers we know (`TMEndpoints`), and check a transaction before relaying it (today it is
-  forwarded to the hubs unchecked).
-- **Why it matters:** today our validations reach the network only through 4 relay hubs (three of Ripple's, one
-  community hub). A validator the network keeps as a peer doesn't depend on any 4 servers.
+- **7.3 Private on purpose.** *Changed 15 October, after checking.* A real inbound handshake is **not** wanted:
+  - The router sends port 51235 to .39's xrpld, so the internet can't reach m3060's port at all (0 inbound
+    connections in 10 hours of cycle 176).
+  - rippled's guidance for a validator is the opposite of public: run it private, connecting out only to a few
+    hubs (`peer_private`, `[ips_fixed]`), and don't advertise or relay for others. m3060's relay sessions are that
+    design.
+  - So 7.3 retires the placeholder listener, which accepts a connection and holds it 5 minutes with no handshake
+    (`XRPL_PEER_PRIVATE=1`). The resilience question becomes "enough hubs", and the 4 relay slots already rotate on
+    failure.
+- **7.4 Relay hygiene.** A transaction from a peer is forwarded to the hubs before any check. It is forwarded only
+  once its signature verifies (`XRPL_TX_RELAY_CHECKED=1`). Relaying other validators' messages and sharing peer
+  addresses (`TMEndpoints`) stay out: a private validator doesn't do either.
+- **Why it matters:** the network keeps m3060's sessions (7.1), knows it by one key (7.2), and never receives an
+  unchecked transaction from it (7.4).
 
 ### Step 8: start from nothing without .39
 *Size: medium to large. Your tap: the source switch.*
@@ -296,7 +304,7 @@ in shadow first against .39's copy, then as the source. Until then, a cold start
 | 4. Data from peers | medium to large | none until the source switch | weeks of peer = .39, then the switch | source switch |
 | 5. Build live and sign our own | medium + weeks of shadow | none in shadow | 5a clean month, then 5b | 5a, 5b |
 | 6. Rust-only build | medium | none | the gate passes without the C++ library | — |
-| 7. A proper peer | small to medium | low (peer sessions only) | handshakes a trickle, peers stay, inbound peers connect | a switch-on per piece |
+| 7. A proper peer | small | low (peer sessions only) | handshakes a trickle, one node key, checked relays | a switch-on per piece |
 | 8. Start without .39 | medium to large | none in shadow | a cold start from peers matches .39's state | source switch |
 | 9. Clock, votes, list | small | low | offset watched, fee votes in, list refreshed | switch-ons |
 

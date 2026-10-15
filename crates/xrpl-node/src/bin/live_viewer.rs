@@ -306,6 +306,11 @@ async fn main() {
     } else {
         eprintln!("[peer] pings not answered (XRPL_PEER_PONG unset): regular peers drop us about every 2 min");
     }
+    // Independence 7.2 (XRPL_NODE_IDENTITY=1): load the node key now, so its line comes at start-up.
+    let _ = node_identity();
+    if tx_relay_checked_on() {
+        eprintln!("[peer] peers' transactions relayed only once their signatures verify (XRPL_TX_RELAY_CHECKED=1)");
+    }
     let outbound_tx2 = outbound_tx.clone();
 
     // Message dedup: hash of recent messages to avoid duplicates from multiple peers
@@ -553,10 +558,16 @@ async fn main() {
         eprintln!("[inbound] Failed to generate identity");
         std::process::exit(1);
     });
-    let node_pubkey_web = hex::encode(inbound_identity.public_key());
+    // The key /crawl shows: the one node key when 7.2 is on.
+    let node_pubkey_web = hex::encode(node_identity().unwrap_or(&inbound_identity).public_key());
     let inbound_connected_web = connected_count.clone();
 
     tokio::spawn(async move {
+        // Independence 7.3: a private validator opens no placeholder listener (see `peer_private_on`).
+        if peer_private_on() {
+            eprintln!("[inbound] private (XRPL_PEER_PRIVATE=1): no listener on 51235; peers are dialled out only");
+            return;
+        }
         let listener = match tokio::net::TcpListener::bind("0.0.0.0:51235").await {
             Ok(l) => {
                 eprintln!("[inbound] Listening for peer connections on port 51235");
@@ -1868,6 +1879,10 @@ async fn main() {
                 "handshakes": PEER_HANDSHAKES.load(std::sync::atomic::Ordering::Relaxed),
                 "pings_answered": PEER_PONGS.load(std::sync::atomic::Ordering::Relaxed),
                 "pong": peer_pong_on(),
+                "node_key": node_identity().map(|id| id.public_key_hex()),
+                "private": peer_private_on(),
+                "tx_relay_checked": tx_relay_checked_on(),
+                "tx_relay_held": TX_RELAY_HELD.load(std::sync::atomic::Ordering::Relaxed),
                 "peers": active,
                 "peer_details": peer_details,
                 "discovered": discovered,
@@ -2065,6 +2080,56 @@ fn peer_pong_on() -> bool {
     *ON.get_or_init(|| std::env::var("XRPL_PEER_PONG").as_deref() == Ok("1"))
 }
 
+/// Independence 7.2 (XRPL_NODE_IDENTITY=1): one node key for every regular peer session, kept on disk apart from the
+/// validator's keys (`paths::node_seed_path`, rippled's `node_seed`). Without it each connection makes a fresh key,
+/// so every server meets a stranger each time m3060 dials it. `None` = today's key per connection; so is a seed
+/// that can't be used (this key signs only session handshakes, so failing open is safe).
+fn node_identity() -> Option<&'static NodeIdentity> {
+    static ID: std::sync::OnceLock<Option<NodeIdentity>> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        if std::env::var("XRPL_NODE_IDENTITY").as_deref() != Ok("1") {
+            return None;
+        }
+        let path = xrpl_node::paths::node_seed_path();
+        if path == xrpl_node::paths::seed_path() {
+            eprintln!("[peer] node seed path is the validator's seed ({path}): refused, a fresh key per connection");
+            return None;
+        }
+        match xrpl_node::paths::load_or_create_seed(&path).map_err(|e| e.to_string()).and_then(|(seed, created)| {
+            NodeIdentity::from_seed(&seed).map(|id| (id, created)).map_err(|e| e.to_string())
+        }) {
+            Ok((id, created)) => {
+                let new = if created { "NEW, " } else { "" };
+                eprintln!("[peer] one node key for every session (XRPL_NODE_IDENTITY=1): {} ({new}{path})", id.public_key_hex());
+                Some(id)
+            }
+            Err(e) => {
+                eprintln!("[peer] node seed {path}: {e}: a fresh key per connection");
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
+/// Independence 7.3 (XRPL_PEER_PRIVATE=1): no placeholder listener on 51235. It accepted a connection and held it
+/// 5 minutes with no TLS and no handshake, and the router sends 51235 to .39 anyway (0 inbound connections in 10 h
+/// of cycle 176). A validator runs private, dialling out to its hubs (rippled's `peer_private`).
+fn peer_private_on() -> bool {
+    std::env::var("XRPL_PEER_PRIVATE").as_deref() == Ok("1")
+}
+
+/// Independence 7.4 (XRPL_TX_RELAY_CHECKED=1): a peer's transaction is forwarded to the hubs only once its signature
+/// verifies, as rippled checks one before relaying it (`PeerImp::checkTransaction`) and charges a peer that relays
+/// bad ones.
+fn tx_relay_checked_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XRPL_TX_RELAY_CHECKED").as_deref() == Ok("1"))
+}
+
+/// Transactions held back by 7.4 (/api/peers).
+static TX_RELAY_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Regular peer sessions opened since the start, and the pings they answered (/api/peers).
 static PEER_HANDSHAKES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PEER_PONGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2082,11 +2147,19 @@ async fn run_peer_connection(
     rocks_db: &Arc<Mutex<Option<xrpl_node::engine::LiveEngine>>>,
     proposal_tx: &broadcast::Sender<PeerProposal>,
 ) -> Result<(), String> {
-    let identity = NodeIdentity::generate().map_err(|e| format!("identity: {e}"))?;
+    // Independence 7.2: the one node key, or (switch off) a fresh one for this connection.
+    let fresh;
+    let identity: &NodeIdentity = match node_identity() {
+        Some(id) => id,
+        None => {
+            fresh = NodeIdentity::generate().map_err(|e| format!("identity: {e}"))?;
+            &fresh
+        }
+    };
 
     let mut hs = timeout(
         Duration::from_secs(15),
-        handshake::outbound_handshake(peer_addr, &identity, handshake::NETWORK_ID_MAINNET),
+        handshake::outbound_handshake(peer_addr, identity, handshake::NETWORK_ID_MAINNET),
     )
     .await
     .map_err(|_| "handshake timeout".to_string())?
@@ -2209,7 +2282,22 @@ async fn run_peer_connection(
                     seen_msgs.insert(msg_hash, ());
 
                     // --- Transaction relay: forward to all relay peers ---
-                    if let PeerMessage::Transaction(_) = &msg {
+                    // Independence 7.4: with XRPL_TX_RELAY_CHECKED=1, only one whose signature verifies.
+                    let relay_tx = match &msg {
+                        PeerMessage::Transaction(t) if tx_relay_checked_on() => {
+                            let ok = matches!(
+                                xrpl_node::mempool::validate_transaction(&t.raw_transaction).0,
+                                xrpl_node::mempool::ValidationResult::Valid
+                            );
+                            if !ok {
+                                TX_RELAY_HELD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            ok
+                        }
+                        PeerMessage::Transaction(_) => true,
+                        _ => false,
+                    };
+                    if relay_tx {
                         let payload = msg.encode_to_vec();
                         let type_code: u16 = 30; // mtTRANSACTION
                         let len = payload.len() as u32;
