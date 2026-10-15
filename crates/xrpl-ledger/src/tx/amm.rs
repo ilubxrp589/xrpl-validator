@@ -2466,6 +2466,7 @@ impl Transactor for AMMWithdrawTransactor {
                 }
             }
             tear_down_lp_line(sandbox, &tx.account, &amm_acct, lp_key, &lp_line);
+            let amm_before = ox::json_at(sandbox, &amm_key);
             bump_lp_balance(sandbox, &amm_key, lp_bal, false);
             // LAST LP OUT — the AMM dies with the withdrawal. rippled runs
             // deleteAMMAccountIfEmpty once LPTokenBalance hits zero:
@@ -2479,6 +2480,13 @@ impl Transactor for AMMWithdrawTransactor {
                 .and_then(|o| o["LPTokenBalance"]["value"].as_str().map(|v| v == "0"))
                 .unwrap_or(false);
             if lpt_zero {
+                // deleteAMMAccountIfEmpty (AMMWithdraw.cpp:871-896) writes the new LPTokenBalance only when the AMM survives: a
+            // withdrawal that empties the pool deletes the AMM with the balance it had (mainnet #107662483
+            // 88C9F7289CD1: FinalFields.LPTokenBalance 135137.78…, no PreviousFields). So the AMM goes back to its
+            // content before the burn, then delete_amm erases it.
+                if let Some(b) = &amm_before {
+                    ox::put_json(sandbox, amm_key, b);
+                }
                 delete_amm(sandbox, &amm_key, &amm_acct);
             }
             return TxResult::Success;
@@ -2835,6 +2843,7 @@ impl Transactor for AMMWithdrawTransactor {
             .or(limit_lp.map(|(_, t)| t))
             .unwrap_or((1_000_000_000_000_000, -8));
         ox::move_leg(sandbox, &tx.account, &amm_acct, &lp_leg, burned);
+        let amm_before = ox::json_at(sandbox, &amm_key);
         bump_lp_balance(sandbox, &amm_key, burned, false);
 
         // A burn that empties the LP's position TEARS THE LINE DOWN — it is not
@@ -2894,6 +2903,10 @@ impl Transactor for AMMWithdrawTransactor {
             .and_then(|o| o["LPTokenBalance"]["value"].as_str().map(|v| v == "0"))
             .unwrap_or(false);
         if lpt_zero {
+            // As the tfWithdrawAll arm: the emptied AMM is erased with the balance it had.
+            if let Some(b) = &amm_before {
+                ox::put_json(sandbox, amm_key, b);
+            }
             delete_amm(sandbox, &amm_key, &amm_acct);
         }
         TxResult::Success
@@ -4599,9 +4612,14 @@ impl Transactor for AMMClawbackTransactor {
             });
             sandbox.write(lp_key, serde_json::to_vec(&line).unwrap_or_default());
         }
+        let amm_before = ox::json_at(sandbox, &amm_key);
         bump_lp_balance(sandbox, &amm_key, tokens, false);
         let new_lpt = read_lpt(sandbox).unwrap_or((0, 0));
         if new_lpt.0 == 0 {
+            // AMMClawback empties the pool through AMMWithdraw::deleteAMMAccountIfEmpty too: no balance write.
+            if let Some(b) = &amm_before {
+                ox::put_json(sandbox, amm_key, b);
+            }
             delete_amm(sandbox, &amm_key, &amm_acct);
         } else if crate::ledger::amendments::fix_cleanup_3_3_0(sandbox) && v13 {
             // Finding 259's precision test, as AMMWithdraw runs it.
