@@ -278,6 +278,13 @@ path gets it from peers. Step 4 fetches each *new* ledger from peers, not the st
 state tree from peers (`TMGetLedger`, the state map, node by node, checked against the ledger's `account_hash`),
 in shadow first against .39's copy, then as the source. Until then, a cold start needs .39 alive.
 
+**Built in shadow (branch step-8, `peer_state_sync`, no `ffi`).** Measured 15 October on .220: ledger #107674282, picked
+from a 28/28 quorum of the verified list's validations, header proven, then all 20,031,916 objects (28.4 million nodes,
+each proven against its parent) from 12 mainnet peers in 14 minutes. That was 5,436 requests, 7.0 GB in, 0.2 GB of
+memory, and no timeout, refusal or disconnect. The root was rebuilt bottom-up from the file and equals the
+`account_hash`, and .39 agreed as a witness. Left for the switch: write straight into `state.rocks`, and run it over
+live_viewer's own peer sessions.
+
 ### Step 9: its own clock, its own votes, a fresh list
 *Size: small. Your taps: switch-ons.*
 
