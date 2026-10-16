@@ -2194,6 +2194,21 @@ fn rate_of_me(pays: Me, gets: Me) -> Option<u64> {
     keylet::rate_encode(pays.0, pays.1, gets.0, gets.1)
 }
 
+/// `rate_of_me` with each side told whether it is NATIVE (drops), for the
+/// rate a crossed offer's remainder is repriced through (`flowCross`'s
+/// `Quality{takerAmount.out, takerAmount.in}.rate()`). rippled's `divide`
+/// never shrinks a native mantissa (Finding 240, keylet::rate_encode_native),
+/// so a seventeen-digit TakerPays reaches the muldiv whole: the quotient is
+/// then only sixteen digits and the `+ 5` lands on its last digit instead of
+/// rounding a seventeenth away. Finding 421 (#107696010 548165639AD7): a
+/// tfSell for 99997497183537090 drops (TakerGets 749999978876 IOU) crossed and
+/// rested; mainnet's rate is 7500187504687616 + 5 = …621 and the remainder
+/// 99997497175366980 drops, where the shrunk divisor gave …617 (nearest) and
+/// 99997497175367033 — 53 drops high, the book page (filed natively) right.
+fn rate_of_me_native(pays: Me, pays_native: bool, gets: Me, gets_native: bool) -> Option<u64> {
+    keylet::rate_encode_native(pays.0, pays.1, pays_native, gets.0, gets.1, gets_native)
+}
+
 /// Scale a mantissa/exponent to an integer drop count, rounding to nearest
 /// (rippled's `XRPAmount{Number}` conversion under the default round mode).
 fn me_rescale_nearest(x: Me) -> u128 {
@@ -10228,7 +10243,7 @@ impl Transactor for OfferCreateTransactor {
                     false,
                     crate::tx::amm_swap::Rnd::Near,
                 );
-                let p = match rate_of_me(tg0, tp0) {
+                let p = match rate_of_me_native(tg0, gets_leg.xrp, tp0, pays_leg.xrp) {
                     Some(q) if pays_leg.xrp => (div_round_drops_strict_floor(g16, rate_me(q)), 0),
                     Some(q) => div_round16_down(g16, rate_me(q)),
                     None => me_muldiv(g16, tp0, tg0, false),
@@ -10265,7 +10280,7 @@ impl Transactor for OfferCreateTransactor {
             // ledgers (105778999, 105843839, 105091578, 105847200) before the
             // guard went in, all of them offers nothing had touched.
             let derived = if me_cmp(rem_pays, tp0).is_lt() {
-                match rate_of_me(tg0, tp0) {
+                match rate_of_me_native(tg0, gets_leg.xrp, tp0, pays_leg.xrp) {
                     // An XRP gets side is an INTEGRAL asset, so rippled's
                     // `mulRound` canonicalises to whole drops itself — ceiling
                     // at a tenth of a drop — rather than producing a 16-digit
@@ -10339,7 +10354,7 @@ impl Transactor for OfferCreateTransactor {
         // …782 — one ULP, the class-B line-ULP costume on the offer itself.
         let (rem_pays, rem_gets) = if crossed > 0 && !me_is_zero(rem_pays) && !me_is_zero(rem_gets) {
             // `rate_of_me(a, b)` is a/b: in/out = TakerGets/TakerPays.
-            match rate_of_me(tg0, tp0) {
+            match rate_of_me_native(tg0, gets_leg.xrp, tp0, pays_leg.xrp) {
                 Some(q) => {
                     let rate = rate_me(q);
                     if sell {
@@ -10581,6 +10596,24 @@ mod ulp_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn f421_sell_remainder_reprices_through_the_unshrunk_native_rate() {
+        // Finding 421, #107696010 548165639AD7: tfSell, TakerPays 99997497183537090
+        // drops (seventeen digits) for 749999978876 IOU; it crossed and rested
+        // 749999978814.7231 IOU. rippled's rate keeps the drop count whole.
+        let (tg0, tp0) = ((7_499_999_788_760_000u128, -4), (99_997_497_183_537_090u128, 0));
+        let rest_in = (7_499_999_788_147_231u128, -4);
+        let q = super::rate_of_me_native(tg0, false, tp0, true).unwrap();
+        assert_eq!(super::rate_me(q), (7_500_187_504_687_621, -21));
+        assert_eq!(super::div_round_drops_strict_floor(rest_in, super::rate_me(q)), 99_997_497_175_366_980); // mainnet
+        // The shrunk divisor (the IOU rule) was the bug: …617, 53 drops high.
+        let shrunk = super::rate_of_me(tg0, tp0).unwrap();
+        assert_eq!(super::div_round_drops_strict_floor(rest_in, super::rate_me(shrunk)), 99_997_497_175_367_033);
+        // Below 1e16 drops both rules agree.
+        let small = (9_999_749_718_353_709u128, 0);
+        assert_eq!(super::rate_of_me_native(tg0, false, small, true), super::rate_of_me(tg0, small));
+    }
+
     #[test]
     fn value_string_keeps_an_exponent_80_amount_whole() {
         // Finding 258: 9999999999999999e80 is STAmount's largest value; the
