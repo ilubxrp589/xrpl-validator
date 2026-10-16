@@ -153,10 +153,14 @@ impl Tally {
         }
     }
 
-    /// The transaction set a quorum of trusted validators accepted for `seq`: the consensus set rippled salts its
-    /// canonical order with. None until a quorum names one.
+    /// The transaction set the trusted validators accepted for `seq` (their `sfConsensusHash`): the consensus set
+    /// rippled salts its canonical order with. More than half the trusted list (less the negative UNL) must name it,
+    /// not a full quorum: two sets can never both have that many, and when a few validations reach us late the ones
+    /// that do still name the one set (mainnet #107700728: only 27 of quorum 28 reached us on #107700727-734, so the
+    /// order fell back to the ledger's own root, and #107700728's set held a transaction the ledger never filed).
+    /// None until then.
     pub fn agreed_set(&self, seq: u32) -> Option<[u8; 32]> {
-        let q = self.quorum();
+        let effective = self.masters.len() - self.negative_size();
         let s = self.seqs.get(&seq)?;
         let mut counts: HashMap<[u8; 32], usize> = HashMap::new();
         for (m, set) in &s.sets {
@@ -164,7 +168,7 @@ impl Tally {
                 *counts.entry(*set).or_default() += 1;
             }
         }
-        counts.into_iter().find(|(_, n)| q > 0 && *n >= q).map(|(set, _)| set)
+        counts.into_iter().find(|(_, n)| effective > 0 && *n > effective / 2).map(|(set, _)| set)
     }
 
     /// .39 called ledger `seq` validated with `hash`. Judges it now if it can, and every pending ledger that is
@@ -301,8 +305,8 @@ pub fn quorum_hash(seq: u32) -> Option<[u8; 32]> {
     (s.reached.len() == 1).then(|| s.reached.keys().next().copied()).flatten()
 }
 
-/// The transaction set a quorum of trusted validators accepted for ledger `seq` (None also when off). Independence
-/// 3.3 salts our canonical order with it, as rippled salts with the consensus set's root: a set can hold
+/// The transaction set more than half the trusted validators accepted for ledger `seq` (None also when off).
+/// Independence 3.3 salts our canonical order with it, as rippled salts with the consensus set's root: a set can hold
 /// transactions the ledger never filed, so the root of the ledger's own transactions is not always that salt.
 pub fn agreed_set(seq: u32) -> Option<[u8; 32]> {
     if !enabled() {
@@ -434,26 +438,35 @@ mod tests {
     }
 
     /// Mainnet #107652744: the validators' sfConsensusHash, not the root of the ledger's own transactions, is the set
-    /// rippled salted its order with. A quorum of trusted validators must name it; an untrusted key never counts.
+    /// rippled salted its order with. More than half the trusted list must name it, short of a quorum if need be
+    /// (#107700728); an untrusted key, or one on the negative UNL, never counts.
     #[test]
-    fn the_agreed_set_is_the_consensus_hash_a_quorum_of_trusted_validations_names() {
+    fn the_agreed_set_is_the_consensus_hash_more_than_half_the_trusted_list_names() {
         let mut t = Tally::default();
         t.set_unl(&unl(35));
         let (ledger, set, other) = ([7u8; 32], [0xA5u8; 32], [0x5Au8; 32]);
-        for i in 1..=27 {
+        for i in 1..=17 {
             t.vote(&sk(i), 100, ledger, true, 0);
             t.note_set(&sk(i), 100, set);
         }
         t.vote(&[200; 33], 100, ledger, true, 0);
         t.note_set(&[200; 33], 100, set);
-        assert_eq!(t.agreed_set(100), None, "27 trusted of 28, and an untrusted key adds nothing");
-        t.vote(&sk(28), 100, ledger, true, 0);
-        t.note_set(&sk(28), 100, other);
-        assert_eq!(t.agreed_set(100), None, "28 voted, but only 27 named the set");
-        t.vote(&sk(29), 100, ledger, true, 0);
-        t.note_set(&sk(29), 100, set);
-        assert_eq!(t.agreed_set(100), Some(set));
+        assert_eq!(t.agreed_set(100), None, "17 trusted of 35 is not more than half, and an untrusted key adds nothing");
+        t.vote(&sk(18), 100, ledger, true, 0);
+        t.note_set(&sk(18), 100, other);
+        assert_eq!(t.agreed_set(100), None, "18 voted, but only 17 named the set");
+        t.vote(&sk(19), 100, ledger, true, 0);
+        t.note_set(&sk(19), 100, set);
+        assert_eq!(t.agreed_set(100), Some(set), "18 of 35 named it: more than half, though short of quorum 28");
         assert_eq!(t.agreed_set(101), None);
+        t.set_negative_unl(vec![vec![1; 33]]);
+        assert_eq!(t.agreed_set(100), None, "one of the 18 is on the negative UNL: 17 of 34 is not more than half");
+        t.set_negative_unl(Vec::new());
+        for i in 20..=35 {
+            t.vote(&sk(i), 100, ledger, true, 0);
+            t.note_set(&sk(i), 100, set);
+        }
+        assert_eq!(t.agreed_set(100), Some(set), "and a full quorum names it too");
     }
 
     #[test]

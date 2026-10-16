@@ -74,8 +74,8 @@ pub struct OrderStats {
     pub attempts: AtomicU64,
     pub last_seq: AtomicU64,
     pub ms_last: AtomicU64,
-    /// Ledgers salted with the set a quorum of trusted validations accepted, and those salted with the root of the
-    /// ledger's own transactions (no quorum named a set yet).
+    /// Ledgers salted with the set more than half the trusted validators accepted, and those salted with the root of
+    /// the ledger's own transactions (not enough of them had named a set yet).
     pub salt_agreed: AtomicU64,
     pub salt_own: AtomicU64,
 }
@@ -101,8 +101,8 @@ pub fn exact_for(seq: u32) -> Option<bool> {
 ///
 /// rippled salts with the consensus set's root (`CanonicalTXSet{result.txns.map_->getHash()}`), and that set can
 /// hold transactions the ledger never filed: a tef drops out, a ter still waiting after the last pass carries over.
-/// So `agreed`, the set a quorum of trusted validations named in their `sfConsensusHash`, is the salt when we have
-/// it; without it, the root of the ledger's own transactions, which is the same set whenever every one was filed.
+/// So `agreed`, the set more than half the trusted validators named in their `sfConsensusHash`, is the salt when we
+/// have it; without it, the root of the ledger's own transactions, which is the same set whenever every one was filed.
 /// Mainnet #107652744, #107652745, #107652752 (soak #48): our order differed at position 0 on exactly the three
 /// ledgers whose own root was not the validators' set (13 neighbours agreed).
 pub fn canonical_set(ordered: &[&Value], skip: &HashSet<String>, agreed: Option<[u8; 32]>) -> Vec<TransactionEntry> {
