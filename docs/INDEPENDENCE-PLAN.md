@@ -267,6 +267,12 @@ Measured 15 October on cycle 176: the network barely keeps m3060 as a peer.
 - **7.4 Relay hygiene.** A transaction from a peer is forwarded to the hubs before any check. It is forwarded only
   once its signature verifies (`XRPL_TX_RELAY_CHECKED=1`). Relaying other validators' messages and sharing peer
   addresses (`TMEndpoints`) stay out: a private validator doesn't do either.
+  - **Cycle 182 retired the transaction relay.** Every hub hears those transactions first-hand, and they rode the
+    queue our validations take to the hubs: a ledger of 1,000-2,000 transactions overflowed it and dropped our
+    validation (#107741340). The hubs also dropped our sessions 8 times an hour in cycle 181, several at once, and a
+    validation signed then reached no one (#107741306). So the queue carries only our validations and manifest, and
+    they go to every regular peer as well as the hubs (`XRPL_VALIDATIONS_TO_PEERS=0` keeps them on the hubs alone).
+    data.xrpl.org had counted 53 of 19,441 ledgers missed in a day, all of them signed.
 - **Why it matters:** the network keeps m3060's sessions (7.1), knows it by one key (7.2), and never receives an
   unchecked transaction from it (7.4).
 

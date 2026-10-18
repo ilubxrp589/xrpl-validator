@@ -296,8 +296,9 @@ async fn main() {
     let (proposal_tx, _) = broadcast::channel::<PeerProposal>(4000);
     let proposal_tx_for_handler = proposal_tx.clone();
 
-    // Outbound message channel — validation + transaction relay to broadcast to all peers
-    let (outbound_tx, _) = broadcast::channel::<Vec<u8>>(2000);
+    // Our own frames — validations and the manifest — to the hubs and (XRPL_VALIDATIONS_TO_PEERS, on unless =0)
+    // every regular peer. Nothing else rides this queue (cycle 182: see relay::OWN_FRAMES).
+    let (outbound_tx, _) = broadcast::channel::<Vec<u8>>(relay::OWN_FRAMES);
     // Independence 4.1 (XRPL_PEER_FETCH=1): each validated ledger fetched from peers too, and compared.
     xrpl_node::peer_fetch::start();
     // Independence 7.1 (XRPL_PEER_PONG=1): regular peers' pings answered.
@@ -308,8 +309,10 @@ async fn main() {
     }
     // Independence 7.2 (XRPL_NODE_IDENTITY=1): load the node key now, so its line comes at start-up.
     let _ = node_identity();
-    if tx_relay_checked_on() {
-        eprintln!("[peer] peers' transactions relayed only once their signatures verify (XRPL_TX_RELAY_CHECKED=1)");
+    if validations_to_peers_on() {
+        eprintln!("[peer] our validations go to the hubs and every regular peer; peers' transactions are not relayed");
+    } else {
+        eprintln!("[peer] our validations go to the hubs only (XRPL_VALIDATIONS_TO_PEERS=0); peers' transactions are not relayed");
     }
     let outbound_tx2 = outbound_tx.clone();
 
@@ -1908,8 +1911,8 @@ async fn main() {
                 "pong": peer_pong_on(),
                 "node_key": node_identity().map(|id| id.public_key_hex()),
                 "private": peer_private_on(),
-                "tx_relay_checked": tx_relay_checked_on(),
-                "tx_relay_held": TX_RELAY_HELD.load(std::sync::atomic::Ordering::Relaxed),
+                "validations_to_peers": validations_to_peers_on(),
+                "own_frames_to_peers": OWN_TO_PEERS.load(std::sync::atomic::Ordering::Relaxed),
                 "peers": active,
                 "peer_details": peer_details,
                 "discovered": discovered,
@@ -2146,16 +2149,26 @@ fn peer_private_on() -> bool {
     std::env::var("XRPL_PEER_PRIVATE").as_deref() == Ok("1")
 }
 
-/// Independence 7.4 (XRPL_TX_RELAY_CHECKED=1): a peer's transaction is forwarded to the hubs only once its signature
-/// verifies, as rippled checks one before relaying it (`PeerImp::checkTransaction`) and charges a peer that relays
-/// bad ones.
-fn tx_relay_checked_on() -> bool {
+/// Cycle 182: our validations and manifest go to every regular peer as well as the hubs, so they reach the network
+/// while every hub session is down (8 hub drops an hour in cycle 181, several at once). XRPL_VALIDATIONS_TO_PEERS=0
+/// keeps them on the hubs alone, as 7.3's private design had it. (7.4's transaction relay is gone: every hub hears
+/// those transactions first-hand, and on our validations' queue they pushed our validations out of it.)
+fn validations_to_peers_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XRPL_TX_RELAY_CHECKED").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("XRPL_VALIDATIONS_TO_PEERS").as_deref() != Ok("0"))
 }
 
-/// Transactions held back by 7.4 (/api/peers).
-static TX_RELAY_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Our own frames written to regular peers since the start (/api/peers).
+static OWN_TO_PEERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A task that stops when its owner is dropped: a peer session's forwarder ends with the session.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// Regular peer sessions opened since the start, and the pings they answered (/api/peers).
 static PEER_HANDSHAKES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2210,6 +2223,11 @@ async fn run_peer_connection(
     // Split stream for read + write (needed to respond to GetLedger/GetObjects)
     let (mut reader, writer) = tokio::io::split(hs.stream);
     let writer = Arc::new(tokio::sync::Mutex::new(writer));
+    // Cycle 182: our validations and manifest go to this peer too, from their own task like the pongs (a slow peer
+    // holds only its own writer); it stops when this session ends.
+    let _own_frames = validations_to_peers_on().then(|| {
+        AbortOnDrop(tokio::spawn(relay::forward_own(outbound.subscribe(), writer.clone(), &OWN_TO_PEERS)))
+    });
     // Independence 4.1: this peer can be asked for ledgers (XRPL_PEER_FETCH=1); the driver's frames go out here.
     if let Some(mut frames) = xrpl_node::peer_fetch::register(peer_addr) {
         let w = writer.clone();
@@ -2308,32 +2326,8 @@ async fn run_peer_connection(
                     }
                     seen_msgs.insert(msg_hash, ());
 
-                    // --- Transaction relay: forward to all relay peers ---
-                    // Independence 7.4: with XRPL_TX_RELAY_CHECKED=1, only one whose signature verifies.
-                    let relay_tx = match &msg {
-                        PeerMessage::Transaction(t) if tx_relay_checked_on() => {
-                            let ok = matches!(
-                                xrpl_node::mempool::validate_transaction(&t.raw_transaction).0,
-                                xrpl_node::mempool::ValidationResult::Valid
-                            );
-                            if !ok {
-                                TX_RELAY_HELD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            ok
-                        }
-                        PeerMessage::Transaction(_) => true,
-                        _ => false,
-                    };
-                    if relay_tx {
-                        let payload = msg.encode_to_vec();
-                        let type_code: u16 = 30; // mtTRANSACTION
-                        let len = payload.len() as u32;
-                        let mut frame = Vec::with_capacity(6 + payload.len());
-                        frame.extend_from_slice(&len.to_be_bytes());
-                        frame.extend_from_slice(&type_code.to_be_bytes());
-                        frame.extend_from_slice(&payload);
-                        let _ = outbound.send(frame);
-                    }
+                    // Peers' transactions are not relayed (cycle 182): every hub hears them first-hand, and on our
+                    // validations' queue a big ledger's worth pushed our validations out of it.
 
                     // --- Serve ledger data: respond to GetLedger / GetObjects ---
                     if let PeerMessage::GetLedger(ref req) = msg {

@@ -7,6 +7,8 @@
 //! next validation it writes fails. A session here reads the hub's messages and answers its pings,
 //! notices at once when the hub hangs up, and the next session re-sends the last validation.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -21,6 +23,12 @@ use crate::NodeError;
 /// after its signing time at which a peer discards it as not current and charges the sender for
 /// useless data (rippled `ValidationParms::validationCurrentEarly`, `isCurrent`).
 pub const RESEND_WITHIN: Duration = Duration::from_secs(60);
+
+/// Room in the queue of the validator's own frames, its validations and its manifest: about one a
+/// ledger, so it never fills. Until cycle 182 every transaction a peer sent rode the same queue to
+/// the hubs: a ledger of 1,000-2,000 transactions overflowed its 2,000 places, and a session that
+/// fell behind skipped the oldest frames, our validation among them (#107741340, 2026-10-18).
+pub const OWN_FRAMES: usize = 256;
 
 /// The hubs that carry our validations, beside the regular peer connections: one relay per slot,
 /// on the slot's hubs in turn (the next one after each attempt that fails). On 2026-09-26:
@@ -162,6 +170,28 @@ where
             Ok(true)
         }
         None => Ok(false),
+    }
+}
+
+/// Forward the validator's own frames to one regular peer until the queue closes or a write fails,
+/// counting each one written in `sent`. rippled sends a validator's validations to every peer it
+/// has; sent only to the hubs, ours were lost whenever every hub session had just dropped
+/// (#107741306, 2026-10-18).
+pub async fn forward_own<W>(mut own: broadcast::Receiver<Vec<u8>>, writer: Arc<tokio::sync::Mutex<W>>, sent: &AtomicU64)
+where
+    W: AsyncWrite + Unpin,
+{
+    loop {
+        match own.recv().await {
+            Ok(frame) => {
+                if writer.lock().await.write_all(&frame).await.is_err() {
+                    return;
+                }
+                sent.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
     }
 }
 
@@ -387,6 +417,35 @@ mod tests {
         drop(tx);
         let report = run_session(ours, Vec::new(), rx, &mut RelayMemory::default()).await;
         assert!(matches!(report.end, SessionEnd::Shutdown), "{:?}", report.end);
+    }
+
+    #[tokio::test]
+    async fn a_regular_peer_gets_our_manifest_and_validations_in_order() {
+        static SENT: AtomicU64 = AtomicU64::new(0);
+        let (ours, mut peer) = tokio::io::duplex(1 << 16);
+        let (tx, rx) = broadcast::channel::<Vec<u8>>(OWN_FRAMES);
+        let forwarding = tokio::spawn(forward_own(rx, Arc::new(tokio::sync::Mutex::new(ours)), &SENT));
+        for frame in [MANIFEST.to_vec(), validation(1), validation(2)] {
+            tx.send(frame).unwrap();
+        }
+        let got = [next_frame(&mut peer).await, next_frame(&mut peer).await, next_frame(&mut peer).await];
+        assert_eq!(got, [Some(MANIFEST.to_vec()), Some(validation(1)), Some(validation(2))]);
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(5), forwarding).await.expect("forwarding ends with the queue").unwrap();
+        assert_eq!(SENT.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn forwarding_to_a_regular_peer_stops_when_the_peer_is_gone() {
+        static SENT: AtomicU64 = AtomicU64::new(0);
+        let (ours, peer) = tokio::io::duplex(1 << 16);
+        drop(peer);
+        let (tx, rx) = broadcast::channel::<Vec<u8>>(OWN_FRAMES);
+        let forwarding = tokio::spawn(forward_own(rx, Arc::new(tokio::sync::Mutex::new(ours)), &SENT));
+        tx.send(validation(1)).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), forwarding).await.expect("forwarding ends on a failed write").unwrap();
+        assert_eq!(SENT.load(Ordering::Relaxed), 0);
+        assert_eq!(tx.receiver_count(), 0, "the peer's receiver is dropped with it");
     }
 
     #[test]
