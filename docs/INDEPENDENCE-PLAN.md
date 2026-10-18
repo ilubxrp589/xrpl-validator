@@ -65,7 +65,7 @@ work (metadata, ordering) or plumbing (data from peers, close time, the switch).
 | Every ledger's transactions, their records (metadata) and the header | .39, over its RPC and websocket | Steps 2, 4, 5 |
 | The order transactions apply in | the position number in .39's metadata (`TransactionIndex`) | Step 3 |
 | Each transaction's result, and the check on our state change | .39's metadata (the writer's `vouch`) | Step 3 |
-| The hash m3060 signs | the network's announced hash, after 3 state-hash matches in a row | Step 5 |
+| The hash m3060 signs | the network's hash, after 3 state-hash matches in a row (since cycle 183: the hash the trusted validators reached quorum on, not the first one a peer announces) | Step 5 |
 | A safe copy when it's unsure | .39's version of the ledger (a writer refusal) | Step 5 |
 | The C++ library | linked in for comparison only, but the writer can't build without it yet | Step 6 |
 

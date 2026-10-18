@@ -314,6 +314,13 @@ async fn main() {
     } else {
         eprintln!("[peer] our validations go to the hubs only (XRPL_VALIDATIONS_TO_PEERS=0); peers' transactions are not relayed");
     }
+    if sign_on_quorum() {
+        eprintln!("[validator] signs a ledger once the trusted validators reach quorum on its hash (XRPL_SIGN_ON_QUORUM)");
+    } else if std::env::var("XRPL_SIGN_ON_QUORUM").as_deref() == Ok("0") {
+        eprintln!("[validator] signs the first hash a peer announces as accepted (XRPL_SIGN_ON_QUORUM=0)");
+    } else {
+        eprintln!("[validator] signs the first hash a peer announces as accepted: the quorum gate needs XRPL_OWN_VALIDATED=1");
+    }
     let outbound_tx2 = outbound_tx.clone();
 
     // Message dedup: hash of recent messages to avoid duplicates from multiple peers
@@ -1152,6 +1159,8 @@ async fn main() {
     let inc_syncer = incremental_syncer.clone();
     let inc_hash_comp = state_hash_computer.clone();
     let mut last_validated_seq: u32 = 0;
+    // With the quorum gate: the hash the first peer announced as accepted, for the last ledgers, to compare.
+    let mut first_peer: std::collections::BTreeMap<u32, [u8; 32]> = std::collections::BTreeMap::new();
     // Buffer raw transactions per round for full ledger close
     let mut round_raw_txs: Vec<(xrpl_core::types::Hash256, Vec<u8>)> = Vec::new();
     tokio::spawn(async move {
@@ -1358,225 +1367,253 @@ async fn main() {
                         }
                     }
 
-                    // Sign and broadcast validation on ACCEPTED
-                    if event.msg_type == "StatusChange"
-                        && event.detail.contains("ACCEPTED")
-                    {
-                        if let Some(seq) = event.ledger_seq {
-                            if seq > last_validated_seq {
-                                last_validated_seq = seq;
-
-                                // Get network's ledger hash from StatusChange
-                                let network_hash_bytes: [u8; 32] = event.ledger_hash.as_ref()
-                                    .and_then(|h| hex::decode(h).ok())
-                                    .and_then(|b| if b.len() == 32 {
-                                        let mut arr = [0u8; 32];
-                                        arr.copy_from_slice(&b);
-                                        Some(arr)
-                                    } else { None })
-                                    .unwrap_or([0u8; 32]);
-
-                                // VALAUDIT Phase 3 (va-03) — Signing Gate, simple form.
-                                // Refuse to sign until our independently-computed
-                                // account_hash has matched the network's for at least
-                                // 3 consecutive ledgers (StateHashComputer::is_ready_to_sign).
-                                //
-                                // Pre-Phase-3 behavior: hash_source was just a log label;
-                                // the validator signed network_hash_bytes regardless of
-                                // whether we'd verified anything. Per the audit, that gate
-                                // was tautological and effectively a no-op security control.
-                                //
-                                // Post-Phase-3: skip categorically (no sign, no broadcast)
-                                // for either of two reasons, both counted for /metrics +
-                                // /api/state-hash visibility:
-                                //   - not_ready: consecutive_matches < 3
-                                //   - zero_hash: StatusChange arrived without ledger_hash
-                                //
-                                // Operational expectation: ~3 not_ready skips at warmup
-                                // after every restart, then a clean stream of VERIFIED
-                                // signs forever. Mainnet 7-day watch confirms this.
-                                use std::sync::atomic::Ordering;
-                                if network_hash_bytes == [0u8; 32] {
-                                    state_hash_for_close.validations_skipped_zero_hash
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    eprintln!("[validator] Declining to sign #{seq}: zero ledger_hash from StatusChange");
-                                    let _ = val_sse.send(MessageEvent {
-                                        seq: 0, time: 0.0,
-                                        msg_type: "ValidationSkipped".into(),
-                                        detail: format!("zero ledger_hash from StatusChange"),
-                                        ledger_seq: Some(seq),
-                                        ledger_hash: None, peers: None, validator: None, tx_info: None,
-                                    });
-                                    continue;
-                                }
-                                if !state_hash_for_close.is_ready_to_sign() {
-                                    let n = state_hash_for_close.consecutive_matches.load(Ordering::Acquire);
-                                    state_hash_for_close.validations_skipped_not_ready
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    eprintln!("[validator] Declining to sign #{seq}: only {n} consecutive matches (need 3)");
-                                    let _ = val_sse.send(MessageEvent {
-                                        seq: 0, time: 0.0,
-                                        msg_type: "ValidationSkipped".into(),
-                                        detail: format!("only {n} consecutive matches (need 3)"),
-                                        ledger_seq: Some(seq),
-                                        ledger_hash: None, peers: None, validator: None, tx_info: None,
-                                    });
-                                    continue;
-                                }
-                                // VALAUDIT Phase 5 (va-05) — Signing Gate, hard form.
-                                // DISARMED BY DEFAULT (reaudit 2026-06-10, finding F1)
-                                // — see the va05_enforce switch above the loop. When
-                                // off, this is byte-for-byte the pre-va05 production
-                                // path that has signed cleanly since 2026-05-31.
-                                let (ledger_hash_bytes, hash_source) = if !va05_enforce {
-                                    // Phase-3-only path: the 3-consecutive-match streak
-                                    // gate is open — sign the network's announced hash.
-                                    (network_hash_bytes, "VERIFIED")
-                                } else {
-                                    // Phase 3 above proved our account_hash matched the
-                                    // network's for 3+ ledgers. Now recompute the FULL
-                                    // ledger_hash from the header fields + OUR account_hash
-                                    // and sign it only if it equals the network's — so the
-                                    // signature proves independent verification of THIS
-                                    // ledger. Refuse on any divergence (or missing data).
-                                    // KNOWN UNSOUND against the live edge (account_hash
-                                    // trails) — re-arm only for testing.
-                                    let our_account_hash = match state_hash_for_close.current_hash() {
-                                        Some(h) => h,
-                                        None => {
-                                            eprintln!("[validator] Declining to sign #{seq}: no locally-computed account_hash");
-                                            let _ = val_sse.send(MessageEvent {
-                                                seq: 0, time: 0.0,
-                                                msg_type: "ValidationSkipped".into(),
-                                                detail: "no local account_hash".into(),
-                                                ledger_seq: Some(seq),
-                                                ledger_hash: None, peers: None, validator: None, tx_info: None,
-                                            });
-                                            continue;
-                                        }
-                                    };
-                                    let close_hdr = match fetch_close_header(&sign_rpc_client, &sign_rpc_url, seq).await {
-                                        Some(h) => h,
-                                        None => {
-                                            eprintln!("[validator] Declining to sign #{seq}: could not fetch ledger header for independent verification");
-                                            let _ = val_sse.send(MessageEvent {
-                                                seq: 0, time: 0.0,
-                                                msg_type: "ValidationSkipped".into(),
-                                                detail: "ledger header fetch failed".into(),
-                                                ledger_seq: Some(seq),
-                                                ledger_hash: None, peers: None, validator: None, tx_info: None,
-                                            });
-                                            continue;
-                                        }
-                                    };
-                                    let verified_hash = match xrpl_node::state_hash::verify_ledger_for_signing(
-                                        seq,
-                                        close_hdr.total_drops,
-                                        &close_hdr.parent_hash,
-                                        &close_hdr.tx_hash,
-                                        &our_account_hash.0,
-                                        close_hdr.parent_close_time,
-                                        close_hdr.close_time,
-                                        close_hdr.close_resolution,
-                                        close_hdr.close_flags,
-                                        &network_hash_bytes,
-                                    ) {
-                                        Some(our_hash) => {
-                                            state_hash_for_close.record_ledger_hash_result(true);
-                                            our_hash
-                                        }
-                                        None => {
-                                            state_hash_for_close.record_ledger_hash_result(false);
-                                            let ours = xrpl_node::state_hash::compute_ledger_hash(
-                                                seq, close_hdr.total_drops, &close_hdr.parent_hash,
-                                                &close_hdr.tx_hash, &our_account_hash.0, close_hdr.parent_close_time,
-                                                close_hdr.close_time, close_hdr.close_resolution, close_hdr.close_flags,
-                                            );
-                                            eprintln!("[SEV-1] [validator] Declining to sign #{seq}: ledger_hash MISMATCH ours={} network={}",
-                                                hex::encode(&ours.0[..8]), hex::encode(&network_hash_bytes[..8]));
-                                            let _ = val_sse.send(MessageEvent {
-                                                seq: 0, time: 0.0,
-                                                msg_type: "ValidationSkipped".into(),
-                                                detail: format!("ledger_hash_mismatch ours={} network={}",
-                                                    hex::encode(&ours.0[..8]), hex::encode(&network_hash_bytes[..8])),
-                                                ledger_seq: Some(seq),
-                                                ledger_hash: None, peers: None, validator: None, tx_info: None,
-                                            });
-                                            continue;
-                                        }
-                                    };
-                                    (verified_hash, "INDEPENDENT")
-                                };
-
-                                // Gate passed (ready_to_sign && non-zero hash) — proceed.
-                                {
-
-                                // Independence Step 9 (XRPL_CLOCK_GATE=1): no signature while the time servers
-                                // agree our clock is more than 1 s off. Never on "no answer" (clock_check).
-                                if let Some(why) = xrpl_node::clock_check::gate_skip() {
-                                    eprintln!("[validator] Declining to sign #{seq}: {why}");
-                                    let _ = val_sse.send(MessageEvent {
-                                        seq: 0, time: 0.0,
-                                        msg_type: "ValidationSkipped".into(),
-                                        detail: why,
-                                        ledger_seq: Some(seq),
-                                        ledger_hash: None, peers: None, validator: None, tx_info: None,
-                                    });
-                                    continue;
-                                }
-
-                                // Amendment votes ride the VOTING ledger — the one
-                                // directly before a flag ledger (seq % 256 == 255),
-                                // rippled `isVotingLedger()`; the flag ledger itself
-                                // (seq % 256 == 0) tallies them. With XRPL_VOTE_PENDING_ONLY=1,
-                                // only those mainnet has not enabled (validation::amendment_votes).
-                                let amendments = if xrpl_node::consensus::amendment_vote::is_voting_ledger(seq) {
-                                    let a = xrpl_node::validation::amendment_votes();
-                                    eprintln!("[validator] Voting ledger #{seq} (flag ledger #{}) — voting on {} amendments", seq + 1, a.len());
-                                    Some(a)
-                                } else {
-                                    None
-                                };
-
-                                let validation_bytes = xrpl_node::validation::sign_validation(
-                                    &val_identity, seq, &ledger_hash_bytes,
-                                    amendments.as_deref(),
-                                );
-
-                                if !validation_bytes.is_empty() {
-                                    // Wrap in TMValidation protobuf
-                                    use prost::Message;
-                                    let tm_val = xrpl_node::peer::protocol::TmValidation {
-                                        validation: validation_bytes,
-                                        checked_signature: None,
-                                        hops: Some(0),
-                                    };
-                                    // Encode as framed peer message: 4-byte len + 2-byte type + payload
-                                    let payload = tm_val.encode_to_vec();
-                                    let type_code: u16 = 41; // mtVALIDATION
-                                    let len = payload.len() as u32;
-                                    let mut frame = Vec::with_capacity(6 + payload.len());
-                                    frame.extend_from_slice(&len.to_be_bytes());
-                                    frame.extend_from_slice(&type_code.to_be_bytes());
-                                    frame.extend_from_slice(&payload);
-
-                                    // Broadcast to all connected peers via outbound channel
-                                    let _ = val_outbound.send(frame);
-
-                                    // Notify the frontend
-                                    let hash_short = hex::encode(&ledger_hash_bytes[..8]);
-                                    let _ = val_sse.send(MessageEvent {
-                                        seq: 0, time: 0.0,
-                                        msg_type: "OurValidation".into(),
-                                        detail: format!("Validated #{seq} hash={hash_short}..."),
-                                        ledger_seq: Some(seq),
-                                        ledger_hash: None, peers: None, validator: None, tx_info: None,
-                                    });
-                                    eprintln!("[validator] Signed validation for ledger #{seq} hash={hash_short}... (src={hash_source})");
-                                }
-                                } // gate-passed scope
+                    // The ledger to sign, and its hash. By default the first peer to announce a newer ledger as accepted names
+                    // both. With the quorum gate (cycle 183, XRPL_SIGN_ON_QUORUM) the trusted validators' quorum names them,
+                    // checked as each validation comes in; a peer's announcement is only kept to compare.
+                    let accepted = if event.msg_type == "StatusChange" && event.detail.contains("ACCEPTED") {
+                        event.ledger_seq.map(|seq| {
+                            // Get network's ledger hash from StatusChange
+                            let hash: [u8; 32] = event.ledger_hash.as_ref()
+                                .and_then(|h| hex::decode(h).ok())
+                                .and_then(|b| if b.len() == 32 {
+                                    let mut arr = [0u8; 32];
+                                    arr.copy_from_slice(&b);
+                                    Some(arr)
+                                } else { None })
+                                .unwrap_or([0u8; 32]);
+                            (seq, hash)
+                        })
+                    } else {
+                        None
+                    };
+                    let target = if sign_on_quorum() {
+                        if let Some((seq, hash)) = accepted {
+                            first_peer.entry(seq).or_insert(hash);
+                            while first_peer.len() > 32 {
+                                first_peer.pop_first();
                             }
                         }
+                        if event.msg_type == "Validation" {
+                            xrpl_node::own_validated::next_quorum_after(last_validated_seq)
+                        } else {
+                            None
+                        }
+                    } else {
+                        accepted.filter(|(seq, _)| *seq > last_validated_seq)
+                    };
+                    if let Some((seq, network_hash_bytes)) = target {
+                        use std::sync::atomic::Ordering;
+                        if sign_on_quorum() {
+                            if last_validated_seq > 0 && seq > last_validated_seq + 1 {
+                                SIGN_NO_QUORUM.fetch_add(u64::from(seq - last_validated_seq - 1), Ordering::Relaxed);
+                            }
+                            if let Some(peer) = first_peer.get(&seq).filter(|p| **p != network_hash_bytes) {
+                                SIGN_FIRST_PEER_DIFFERED.fetch_add(1, Ordering::Relaxed);
+                                eprintln!("[validator] #{seq}: the first peer to announce it named {}..., the trusted validators validated {}... (signing theirs)",
+                                    hex::encode(&peer[..8]), hex::encode(&network_hash_bytes[..8]));
+                            }
+                        }
+                        last_validated_seq = seq;
+
+                        // VALAUDIT Phase 3 (va-03) — Signing Gate, simple form.
+                        // Refuse to sign until our independently-computed
+                        // account_hash has matched the network's for at least
+                        // 3 consecutive ledgers (StateHashComputer::is_ready_to_sign).
+                        //
+                        // Pre-Phase-3 behavior: hash_source was just a log label;
+                        // the validator signed network_hash_bytes regardless of
+                        // whether we'd verified anything. Per the audit, that gate
+                        // was tautological and effectively a no-op security control.
+                        //
+                        // Post-Phase-3: skip categorically (no sign, no broadcast)
+                        // for either of two reasons, both counted for /metrics +
+                        // /api/state-hash visibility:
+                        //   - not_ready: consecutive_matches < 3
+                        //   - zero_hash: StatusChange arrived without ledger_hash
+                        //
+                        // Operational expectation: ~3 not_ready skips at warmup
+                        // after every restart, then a clean stream of VERIFIED
+                        // signs forever. Mainnet 7-day watch confirms this.
+                        if network_hash_bytes == [0u8; 32] {
+                            state_hash_for_close.validations_skipped_zero_hash
+                                .fetch_add(1, Ordering::Relaxed);
+                            eprintln!("[validator] Declining to sign #{seq}: zero ledger_hash from StatusChange");
+                            let _ = val_sse.send(MessageEvent {
+                                seq: 0, time: 0.0,
+                                msg_type: "ValidationSkipped".into(),
+                                detail: format!("zero ledger_hash from StatusChange"),
+                                ledger_seq: Some(seq),
+                                ledger_hash: None, peers: None, validator: None, tx_info: None,
+                            });
+                            continue;
+                        }
+                        if !state_hash_for_close.is_ready_to_sign() {
+                            let n = state_hash_for_close.consecutive_matches.load(Ordering::Acquire);
+                            state_hash_for_close.validations_skipped_not_ready
+                                .fetch_add(1, Ordering::Relaxed);
+                            eprintln!("[validator] Declining to sign #{seq}: only {n} consecutive matches (need 3)");
+                            let _ = val_sse.send(MessageEvent {
+                                seq: 0, time: 0.0,
+                                msg_type: "ValidationSkipped".into(),
+                                detail: format!("only {n} consecutive matches (need 3)"),
+                                ledger_seq: Some(seq),
+                                ledger_hash: None, peers: None, validator: None, tx_info: None,
+                            });
+                            continue;
+                        }
+                        // VALAUDIT Phase 5 (va-05) — Signing Gate, hard form.
+                        // DISARMED BY DEFAULT (reaudit 2026-06-10, finding F1)
+                        // — see the va05_enforce switch above the loop. When
+                        // off, this is byte-for-byte the pre-va05 production
+                        // path that has signed cleanly since 2026-05-31.
+                        let (ledger_hash_bytes, hash_source) = if !va05_enforce {
+                            // Phase-3-only path: the 3-consecutive-match streak
+                            // gate is open — sign the network's announced hash.
+                            (network_hash_bytes, if sign_on_quorum() { "QUORUM" } else { "VERIFIED" })
+                        } else {
+                            // Phase 3 above proved our account_hash matched the
+                            // network's for 3+ ledgers. Now recompute the FULL
+                            // ledger_hash from the header fields + OUR account_hash
+                            // and sign it only if it equals the network's — so the
+                            // signature proves independent verification of THIS
+                            // ledger. Refuse on any divergence (or missing data).
+                            // KNOWN UNSOUND against the live edge (account_hash
+                            // trails) — re-arm only for testing.
+                            let our_account_hash = match state_hash_for_close.current_hash() {
+                                Some(h) => h,
+                                None => {
+                                    eprintln!("[validator] Declining to sign #{seq}: no locally-computed account_hash");
+                                    let _ = val_sse.send(MessageEvent {
+                                        seq: 0, time: 0.0,
+                                        msg_type: "ValidationSkipped".into(),
+                                        detail: "no local account_hash".into(),
+                                        ledger_seq: Some(seq),
+                                        ledger_hash: None, peers: None, validator: None, tx_info: None,
+                                    });
+                                    continue;
+                                }
+                            };
+                            let close_hdr = match fetch_close_header(&sign_rpc_client, &sign_rpc_url, seq).await {
+                                Some(h) => h,
+                                None => {
+                                    eprintln!("[validator] Declining to sign #{seq}: could not fetch ledger header for independent verification");
+                                    let _ = val_sse.send(MessageEvent {
+                                        seq: 0, time: 0.0,
+                                        msg_type: "ValidationSkipped".into(),
+                                        detail: "ledger header fetch failed".into(),
+                                        ledger_seq: Some(seq),
+                                        ledger_hash: None, peers: None, validator: None, tx_info: None,
+                                    });
+                                    continue;
+                                }
+                            };
+                            let verified_hash = match xrpl_node::state_hash::verify_ledger_for_signing(
+                                seq,
+                                close_hdr.total_drops,
+                                &close_hdr.parent_hash,
+                                &close_hdr.tx_hash,
+                                &our_account_hash.0,
+                                close_hdr.parent_close_time,
+                                close_hdr.close_time,
+                                close_hdr.close_resolution,
+                                close_hdr.close_flags,
+                                &network_hash_bytes,
+                            ) {
+                                Some(our_hash) => {
+                                    state_hash_for_close.record_ledger_hash_result(true);
+                                    our_hash
+                                }
+                                None => {
+                                    state_hash_for_close.record_ledger_hash_result(false);
+                                    let ours = xrpl_node::state_hash::compute_ledger_hash(
+                                        seq, close_hdr.total_drops, &close_hdr.parent_hash,
+                                        &close_hdr.tx_hash, &our_account_hash.0, close_hdr.parent_close_time,
+                                        close_hdr.close_time, close_hdr.close_resolution, close_hdr.close_flags,
+                                    );
+                                    eprintln!("[SEV-1] [validator] Declining to sign #{seq}: ledger_hash MISMATCH ours={} network={}",
+                                        hex::encode(&ours.0[..8]), hex::encode(&network_hash_bytes[..8]));
+                                    let _ = val_sse.send(MessageEvent {
+                                        seq: 0, time: 0.0,
+                                        msg_type: "ValidationSkipped".into(),
+                                        detail: format!("ledger_hash_mismatch ours={} network={}",
+                                            hex::encode(&ours.0[..8]), hex::encode(&network_hash_bytes[..8])),
+                                        ledger_seq: Some(seq),
+                                        ledger_hash: None, peers: None, validator: None, tx_info: None,
+                                    });
+                                    continue;
+                                }
+                            };
+                            (verified_hash, "INDEPENDENT")
+                        };
+
+                        // Gate passed (ready_to_sign && non-zero hash) — proceed.
+                        {
+
+                        // Independence Step 9 (XRPL_CLOCK_GATE=1): no signature while the time servers
+                        // agree our clock is more than 1 s off. Never on "no answer" (clock_check).
+                        if let Some(why) = xrpl_node::clock_check::gate_skip() {
+                            eprintln!("[validator] Declining to sign #{seq}: {why}");
+                            let _ = val_sse.send(MessageEvent {
+                                seq: 0, time: 0.0,
+                                msg_type: "ValidationSkipped".into(),
+                                detail: why,
+                                ledger_seq: Some(seq),
+                                ledger_hash: None, peers: None, validator: None, tx_info: None,
+                            });
+                            continue;
+                        }
+
+                        // Amendment votes ride the VOTING ledger — the one
+                        // directly before a flag ledger (seq % 256 == 255),
+                        // rippled `isVotingLedger()`; the flag ledger itself
+                        // (seq % 256 == 0) tallies them. With XRPL_VOTE_PENDING_ONLY=1,
+                        // only those mainnet has not enabled (validation::amendment_votes).
+                        let amendments = if xrpl_node::consensus::amendment_vote::is_voting_ledger(seq) {
+                            let a = xrpl_node::validation::amendment_votes();
+                            eprintln!("[validator] Voting ledger #{seq} (flag ledger #{}) — voting on {} amendments", seq + 1, a.len());
+                            Some(a)
+                        } else {
+                            None
+                        };
+
+                        let validation_bytes = xrpl_node::validation::sign_validation(
+                            &val_identity, seq, &ledger_hash_bytes,
+                            amendments.as_deref(),
+                        );
+
+                        if !validation_bytes.is_empty() {
+                            // Wrap in TMValidation protobuf
+                            use prost::Message;
+                            let tm_val = xrpl_node::peer::protocol::TmValidation {
+                                validation: validation_bytes,
+                                checked_signature: None,
+                                hops: Some(0),
+                            };
+                            // Encode as framed peer message: 4-byte len + 2-byte type + payload
+                            let payload = tm_val.encode_to_vec();
+                            let type_code: u16 = 41; // mtVALIDATION
+                            let len = payload.len() as u32;
+                            let mut frame = Vec::with_capacity(6 + payload.len());
+                            frame.extend_from_slice(&len.to_be_bytes());
+                            frame.extend_from_slice(&type_code.to_be_bytes());
+                            frame.extend_from_slice(&payload);
+
+                            // Broadcast to all connected peers via outbound channel
+                            let _ = val_outbound.send(frame);
+
+                            // Notify the frontend
+                            let hash_short = hex::encode(&ledger_hash_bytes[..8]);
+                            let _ = val_sse.send(MessageEvent {
+                                seq: 0, time: 0.0,
+                                msg_type: "OurValidation".into(),
+                                detail: format!("Validated #{seq} hash={hash_short}..."),
+                                ledger_seq: Some(seq),
+                                ledger_hash: None, peers: None, validator: None, tx_info: None,
+                            });
+                            eprintln!("[validator] Signed validation for ledger #{seq} hash={hash_short}... (src={hash_source})");
+                            SIGNED.fetch_add(1, Ordering::Relaxed);
+                        }
+                        } // gate-passed scope
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -1823,6 +1860,13 @@ async fn main() {
                     json["peer_fetch"] = xrpl_node::peer_fetch::json();
                     // Independence 4.5: "validated" from our own count of trusted validations.
                     json["own_validated"] = xrpl_node::own_validated::json();
+                    // Cycle 183: what the validator signs, and how often the first peer's hash was another.
+                    json["signing"] = serde_json::json!({
+                        "on_quorum": sign_on_quorum(),
+                        "signed": SIGNED.load(std::sync::atomic::Ordering::Relaxed),
+                        "first_peer_differed": SIGN_FIRST_PEER_DIFFERED.load(std::sync::atomic::Ordering::Relaxed),
+                        "no_quorum": SIGN_NO_QUORUM.load(std::sync::atomic::Ordering::Relaxed),
+                    });
                     // Independence 5.5: our own ledger hash, from the parts we made, trailing the network.
                     json["own_hash"] = xrpl_node::own_hash::json();
                     // Independence Step 9: the clock's offset from the time servers (XRPL_CLOCK_CHECK=1).
@@ -2169,6 +2213,21 @@ impl Drop for AbortOnDrop {
         self.0.abort();
     }
 }
+
+/// Cycle 183: sign a ledger only once the trusted validators reach quorum on its hash (own_validated's tally), not
+/// on the first hash a peer announces as accepted. On mainnet #107746977 and #107747014 (18 Oct) the first peer to
+/// announce had built another ledger; we signed its hash, and data.xrpl.org scored both missed. Needs
+/// XRPL_OWN_VALIDATED=1; XRPL_SIGN_ON_QUORUM=0 goes back to the first peer's hash.
+fn sign_on_quorum() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XRPL_SIGN_ON_QUORUM").as_deref() != Ok("0") && xrpl_node::own_validated::enabled())
+}
+
+/// Since the start (/api/engine "signing"): ledgers signed; ledgers the first peer announced with another hash than
+/// the quorum's; ledgers passed over because no quorum was heard for them.
+static SIGNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SIGN_FIRST_PEER_DIFFERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SIGN_NO_QUORUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Regular peer sessions opened since the start, and the pings they answered (/api/peers).
 static PEER_HANDSHAKES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

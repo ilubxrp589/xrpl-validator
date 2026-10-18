@@ -214,6 +214,14 @@ impl Tally {
         out
     }
 
+    /// The oldest ledger after `after` that reached quorum here on one hash, with that hash. Only the last
+    /// [`GIVE_UP`] sequences heard count: a ledger older than that is not signed late.
+    pub fn next_quorum_after(&self, after: u32) -> Option<(u32, [u8; 32])> {
+        let newest = *self.seqs.keys().next_back()?;
+        let from = after.max(newest.saturating_sub(GIVE_UP)) + 1;
+        self.seqs.range(from..).find_map(|(seq, s)| (s.reached.len() == 1).then(|| s.reached.keys().next().map(|h| (*seq, *h))).flatten())
+    }
+
     /// The median of the recent leads (ms we were ahead of .39; negative: behind).
     pub fn median_lead(&self) -> Option<i64> {
         let mut v: Vec<i64> = self.leads.iter().copied().collect();
@@ -303,6 +311,15 @@ pub fn quorum_hash(seq: u32) -> Option<[u8; 32]> {
     let s = t.seqs.get(&seq)?;
     // Two hashes at quorum for one sequence (never on a healthy network): no single answer.
     (s.reached.len() == 1).then(|| s.reached.keys().next().copied()).flatten()
+}
+
+/// The oldest recent ledger after `after` that the trusted validators reached quorum on, and its hash (None also
+/// when off). With `XRPL_SIGN_ON_QUORUM` the validator signs that hash, not the first one a peer announces.
+pub fn next_quorum_after(after: u32) -> Option<(u32, [u8; 32])> {
+    if !enabled() {
+        return None;
+    }
+    tally().lock().unwrap_or_else(|p| p.into_inner()).next_quorum_after(after)
 }
 
 /// The transaction set more than half the trusted validators accepted for ledger `seq` (None also when off).
@@ -540,6 +557,48 @@ mod tests {
         assert_eq!(t.count(9, &[1; 32]), 1);
         t.vote(&sk(1), 9, [2; 32], true, 2);
         assert_eq!((t.count(9, &[1; 32]), t.count(9, &[2; 32])), (0, 1));
+    }
+
+    /// Mainnet #107746977 (16:37, 18 Oct): the first peer to announce it had built another ledger (0EFB756A…), and we
+    /// signed that; the trusted validators validated 686B488A…. The ledger to sign comes from their quorum instead.
+    #[test]
+    fn the_ledger_to_sign_is_the_one_the_trusted_validators_reached_quorum_on() {
+        let mut t = Tally::default();
+        t.set_unl(&unl(35));
+        let (peer_said, validated) = ([0x0Eu8; 32], [0x68u8; 32]);
+        assert_eq!(t.next_quorum_after(0), None, "nothing heard yet");
+        for i in 1..=3 {
+            t.vote(&sk(i), 100, peer_said, true, 0);
+        }
+        for i in 4..=30 {
+            t.vote(&sk(i), 100, validated, true, 0);
+        }
+        assert_eq!(t.next_quorum_after(99), None, "27 of quorum 28: not yet");
+        t.vote(&sk(31), 100, validated, true, 0);
+        assert_eq!(t.next_quorum_after(99), Some((100, validated)));
+        assert_eq!(t.next_quorum_after(100), None, "already taken");
+        t.vote(&[200; 33], 101, validated, true, 0);
+        assert_eq!(t.next_quorum_after(100), None, "an untrusted key brings no quorum");
+    }
+
+    #[test]
+    fn the_ledger_to_sign_is_the_oldest_recent_one_after_the_last() {
+        let mut t = Tally::default();
+        t.set_unl(&unl(35));
+        for seq in [200, 201, 203] {
+            for i in 1..=28 {
+                t.vote(&sk(i), seq, [seq as u8; 32], true, 0);
+            }
+        }
+        for i in 1..=10 {
+            t.vote(&sk(i), 202, [202u8; 32], true, 0); // short of quorum so far
+        }
+        assert_eq!(t.next_quorum_after(199), Some((200, [200; 32])));
+        assert_eq!(t.next_quorum_after(201), Some((203, [203; 32])), "#202 has no quorum: the next one that does");
+        for i in 1..=28 {
+            t.vote(&sk(i), 203 + GIVE_UP + 1, [9; 32], true, 0);
+        }
+        assert_eq!(t.next_quorum_after(0), Some((203 + GIVE_UP + 1, [9; 32])), "older than GIVE_UP behind the newest: not signed late");
     }
 
     #[test]
