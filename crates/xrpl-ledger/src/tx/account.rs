@@ -757,21 +757,8 @@ impl Transactor for AccountDeleteTransactor {
         // Guarded on emptiness because that is what `emptyDirDelete` means;
         // preclaim already requires OwnerCount == 0, so a non-empty directory
         // here would be a state we do not understand and must not silently
-        // discard.
-        let dir_key = keylet::owner_dir_key(&tx.account);
-        if let Some(d) = sandbox.read(&dir_key) {
-            let empty = serde_json::from_slice::<serde_json::Value>(&d)
-                .ok()
-                .map(|v| {
-                    v.get("Indexes")
-                        .and_then(|i| i.as_array())
-                        .is_none_or(|a| a.is_empty())
-                })
-                .unwrap_or(false);
-            if empty {
-                sandbox.delete(dir_key);
-            }
-        }
+        // discard. An old account's empty last page goes with it (#107787681).
+        crate::ledger::directory::empty_dir_delete(sandbox, &keylet::owner_dir_key(&tx.account));
 
         // Delete the account. rippled moves the balance out of the SLE it then erases
         // (`(*src)[sfBalance] -= remainingBalance; … view().erase(src)`, AccountDelete.cpp:404/452), so the
@@ -942,5 +929,56 @@ mod tests {
         assert_eq!(fin["Balance"], serde_json::json!("0"));
         assert_eq!(fin["OwnerCount"], serde_json::json!(0));
         assert!(fin.get("TicketCount").is_none(), "the last ticket drops the field: {fin}");
+    }
+
+    /// Mainnet #107787681 DE319724D91B: an account last touched in #60152829 kept an empty page 6 after its
+    /// root (links 6/6). rippled's emptyDirDelete drops the root's links, erases page 6, then the root.
+    #[test]
+    fn account_delete_takes_an_old_accounts_empty_last_page_with_its_directory() {
+        let alice = [0x01u8; 20];
+        let bob = [0x02u8; 20];
+        let mut state = make_state(&alice, 50_000_000);
+        let bob_acct = serde_json::json!({
+            "LedgerEntryType": "AccountRoot", "Account": hex::encode(bob), "Balance": "10000000",
+            "Sequence": 1, "OwnerCount": 0, "Flags": 0,
+        });
+        state.state_map.insert(keylet::account_root_key(&bob), serde_json::to_vec(&bob_acct).unwrap()).unwrap();
+        let dir = keylet::owner_dir_key(&alice);
+        let page6 = keylet::dir_page_key(&dir, 6);
+        let root = serde_json::json!({
+            "LedgerEntryType": "DirectoryNode", "Owner": hex::encode(alice), "RootIndex": hex::encode_upper(dir.0),
+            "Indexes": [], "IndexNext": "6", "IndexPrevious": "6", "Flags": 0,
+        });
+        let last = serde_json::json!({
+            "LedgerEntryType": "DirectoryNode", "Owner": hex::encode(alice), "RootIndex": hex::encode_upper(dir.0),
+            "Indexes": [], "IndexPrevious": "0", "Flags": 0,
+        });
+        state.state_map.insert(dir, serde_json::to_vec(&root).unwrap()).unwrap();
+        state.state_map.insert(page6, serde_json::to_vec(&last).unwrap()).unwrap();
+
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: alice,
+            tx_type: "AccountDelete".to_string(),
+            fee: 2_000_000,
+            sequence: 1,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({"Destination": hex::encode(bob)}),
+            inner_batch: false,
+        };
+        crate::tx::reset_thread_state();
+        assert_eq!(AccountDeleteTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+        assert!(!sandbox.exists(&page6), "the empty last page goes too");
+        assert!(!sandbox.exists(&dir));
+        let fin: serde_json::Value = serde_json::from_slice(sandbox.deleted_content(&dir).expect("deleted root")).unwrap();
+        assert_eq!((fin["IndexNext"].clone(), fin["IndexPrevious"].clone()), (serde_json::json!(0), serde_json::json!(0)));
+
+        let mut kept = Sandbox::new(&state);
+        let mut full = last.clone();
+        full["Indexes"] = serde_json::json!([hex::encode_upper([7u8; 32])]);
+        kept.write(page6, serde_json::to_vec(&full).unwrap());
+        assert!(!crate::ledger::directory::empty_dir_delete(&mut kept, &dir), "an entry on the last page: rippled's false");
+        assert!(kept.exists(&dir) && kept.exists(&page6));
     }
 }

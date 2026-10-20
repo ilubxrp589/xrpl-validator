@@ -385,6 +385,40 @@ pub fn owner_dir_remove(
     dir_remove(sandbox, &keylet::owner_dir_key(owner), object_key, hint, keep_root)
 }
 
+/// rippled `ApplyView::emptyDirDelete` (ApplyView.cpp:191-253): erase a directory whose root holds no entries.
+/// "Older versions of the code would, in some cases, allow the last page to be empty": when the root's links
+/// both name one other page and that page is empty too, the root's links drop to 0 (an update, so a deleted
+/// root's FinalFields carry IndexNext/IndexPrevious 0 against PreviousFields 6) and that page is erased first.
+/// Mainnet #107787681 DE319724D91B (AccountDelete of an account last touched in #60152829): root 96E903E4 with
+/// links 6/6 and the empty page 27BA7B2B; we erased the root and left the page standing. Returns false where
+/// rippled does: no root, entries on the root or the last page. A root still linked to other pages stays.
+pub fn empty_dir_delete(sandbox: &mut Sandbox, root_key: &Hash256) -> bool {
+    let Some(mut root) = read_dir(sandbox, root_key) else { return false };
+    let has_entries =
+        |p: &serde_json::Value| p.get("Indexes").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty());
+    if has_entries(&root) {
+        return false;
+    }
+    let mut prev = root.get("IndexPrevious").map(page_num).unwrap_or(0);
+    let mut next = root.get("IndexNext").map(page_num).unwrap_or(0);
+    if next == prev && next != 0 {
+        let last_key = page_key(root_key, next);
+        let Some(last) = read_dir(sandbox, &last_key) else { return false };
+        if has_entries(&last) {
+            return false;
+        }
+        set_link(&mut root, "IndexNext", 0);
+        set_link(&mut root, "IndexPrevious", 0);
+        sandbox.write(*root_key, serde_json::to_vec(&root).unwrap_or_default());
+        sandbox.delete(last_key);
+        (next, prev) = (0, 0);
+    }
+    if next == 0 && prev == 0 {
+        sandbox.delete(*root_key);
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

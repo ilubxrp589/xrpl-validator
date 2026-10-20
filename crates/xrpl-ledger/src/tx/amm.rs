@@ -1953,6 +1953,8 @@ fn delete_amm(sandbox: &mut Sandbox, amm_key: &xrpl_core::types::Hash256, amm_ac
         .and_then(|s| u64::from_str_radix(&s, 16).ok());
     sandbox.delete(*amm_key);
     crate::ledger::directory::owner_dir_remove(sandbox, amm_acct, amm_key, amm_hint, false);
+    // deleteAMMAccount (AMMHelpers.cpp:787): `if (sb.exists(ownerDirKeylet) && !sb.emptyDirDelete(ownerDirKeylet))`.
+    crate::ledger::directory::empty_dir_delete(sandbox, &dir_root);
     sandbox.delete(keylet::account_root_key(amm_acct));
 }
 
