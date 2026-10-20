@@ -88,6 +88,14 @@ pub enum Basis {
 /// past the newest it did land are heard (a stall).
 pub const STALL: u32 = 2;
 
+/// How far ws-sync may trail the newest ledger heard while the validator still waits to sign the older ledgers in
+/// order. Mainnet #107786761-772 (20 Oct): three heavy ledgers (1,001 to 1,536 transactions) and a burst of peer
+/// reconnects left ws-sync 11 ledgers behind and our tally short on them; the quorum on #107786773 came first, the
+/// validator signed it, and a validator cannot sign an older ledger after a newer one, so twelve went unsigned
+/// though our own hash and .39's agreed on each a few seconds later. Within this many, the window of ledgers it
+/// may still sign starts at the newest ws-sync landed, not the newest heard.
+pub const CATCH_UP: u32 = 64;
+
 /// One judged ledger.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -261,21 +269,38 @@ impl Tally {
     /// eight). Never a hash another quorum here contradicts. Only the last [`GIVE_UP`] sequences heard count.
     pub fn next_to_sign(&self, after: u32, witness: bool) -> Option<(u32, [u8; 32], Basis)> {
         let newest = self.seqs.keys().next_back().into_iter().chain(self.witnessed.keys().next_back()).max().copied()?;
-        let from = after.max(newest.saturating_sub(GIVE_UP)) + 1;
-        let quorum = self.next_quorum_after(after).filter(|(seq, _)| *seq >= from);
-        let witnessed = witness
-            .then(|| {
-                self.witnessed.range(from..).find(|(seq, hash)| {
-                    self.seqs.get(*seq).is_none_or(|s| s.reached.keys().all(|h| h == *hash))
-                })
-            })
-            .flatten();
-        match (quorum, witnessed) {
-            (Some((q, _)), Some((w, h))) if *w < q => Some((*w, *h, Basis::Witness)),
-            (Some((q, h)), _) => Some((q, h, Basis::Quorum)),
-            (None, Some((w, h))) => Some((*w, *h, Basis::Witness)),
-            (None, None) => None,
+        let from = self.window_from(after, newest);
+        // With the witness, a ledger ws-sync has not landed yet may still be signed on it: wait for it rather than
+        // pass it over for a newer quorum, unless ws-sync is more than CATCH_UP behind.
+        let wait = witness && self.own.keys().next_back().is_some_and(|l| newest <= l + CATCH_UP);
+        for seq in from..=newest {
+            let s = self.seqs.get(&seq);
+            if let Some(q) = s.and_then(|s| (s.reached.len() == 1).then(|| s.reached.keys().next().copied()).flatten()) {
+                return Some((seq, q, Basis::Quorum));
+            }
+            if !witness {
+                continue;
+            }
+            if let Some(w) = self.witnessed.get(&seq) {
+                if s.is_none_or(|s| s.reached.keys().all(|h| h == w)) {
+                    return Some((seq, *w, Basis::Witness));
+                }
+            }
+            if wait && !self.own.contains_key(&seq) {
+                return None;
+            }
         }
+        None
+    }
+
+    /// The first sequence after `after` the validator may still sign: the last [`GIVE_UP`] before the newest ledger
+    /// heard, or, while ws-sync trails by up to [`CATCH_UP`], before the newest it landed.
+    fn window_from(&self, after: u32, newest: u32) -> u32 {
+        let base = match self.own.keys().next_back() {
+            Some(&landed) if landed < newest => landed.max(newest.saturating_sub(CATCH_UP)),
+            _ => newest,
+        };
+        after.max(base.saturating_sub(GIVE_UP)) + 1
     }
 
     /// ws-sync landed ledger `seq`: our own hash of it, or None when a part of it was borrowed.
@@ -299,7 +324,7 @@ impl Tally {
             .flatten()
             .max()
             .copied()?;
-        let from = after.max(newest.saturating_sub(GIVE_UP)) + 1;
+        let from = self.window_from(after, newest);
         // ws-sync lands a ledger a few tens of ms after the quorum on it: hearing of ledgers well past the newest it
         // landed means it has stalled.
         let stalled = self.own.keys().next_back().is_none_or(|l| newest > l + STALL);
@@ -801,6 +826,35 @@ mod tests {
         t.witness(404 + GIVE_UP + 1, [9; 32]);
         assert_eq!(t.next_to_sign(403, true), Some((404 + GIVE_UP + 1, [9; 32], Basis::Witness)),
             "#404 is more than GIVE_UP behind the newest: not signed late");
+    }
+
+    /// Mainnet #107786761-772 (20 Oct): ws-sync 11 behind, our tally short, and the quorum on #107786773 first.
+    #[test]
+    fn while_ws_sync_catches_up_the_older_ledgers_are_waited_for_and_signed_in_order() {
+        let mut t = Tally::default();
+        t.set_unl(&unl(35));
+        own_and_quorum(&mut t, 760, [60; 32], Some([60; 32]));
+        for i in 1..=7 {
+            t.vote(&sk(i), 761, [61; 32], true, 0); // short: 7 of 28
+        }
+        quorum_on(&mut t, 773, [73; 32]);
+        assert_eq!(t.next_to_sign(760, true), None, "#761 not landed yet: wait, not #773");
+        assert_eq!(t.next_own_to_sign(760, true, false), None);
+        t.own_ledger(761, Some([61; 32]));
+        t.witness(761, [61; 32]);
+        assert_eq!(t.next_to_sign(760, true), Some((761, [61; 32], Basis::Witness)));
+        assert_eq!(t.next_own_to_sign(760, true, false), Some((761, [61; 32], Basis::Witness)));
+        assert_eq!(t.next_to_sign(760, false), Some((773, [73; 32], Basis::Quorum)), "without the witness: as before");
+        for seq in 762..=772 {
+            t.own_ledger(seq, None); // landed, a part borrowed: nothing to sign it on
+        }
+        assert_eq!(t.next_to_sign(761, true), Some((773, [73; 32], Basis::Quorum)), "then on to the quorum");
+        let mut far = Tally::default();
+        far.set_unl(&unl(35));
+        own_and_quorum(&mut far, 1_000, [1; 32], Some([1; 32]));
+        quorum_on(&mut far, 1_000 + CATCH_UP + 1, [2; 32]);
+        assert_eq!(far.next_to_sign(1_000, true), Some((1_000 + CATCH_UP + 1, [2; 32], Basis::Quorum)),
+            "ws-sync more than CATCH_UP behind: no waiting");
     }
 
     fn quorum_on(t: &mut Tally, seq: u32, hash: [u8; 32]) {
