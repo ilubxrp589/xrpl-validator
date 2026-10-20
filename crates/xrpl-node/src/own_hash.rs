@@ -24,7 +24,9 @@
 //! later hash differ. With 4.5 on, each hash is also held against the one the trusted validators reached
 //! quorum on ([`crate::own_validated::quorum_hash`]).
 //!
-//! It decides nothing. `XRPL_OWN_HASH=1` switches it on (off by default); differences go to
+//! It decides one thing: a hash .39 called validated that equals ours, made from every part, is a witness the
+//! validator may sign on when the trusted validations reaching us fall short of quorum (cycle 184,
+//! [`crate::own_validated::witness`]). `XRPL_OWN_HASH=1` switches it on (off by default); differences go to
 //! `XRPL_OWN_HASH_LOG` (default /mnt/xrpl-data/own_hash.jsonl, capped at 20 MB).
 
 use std::io::Write as _;
@@ -238,6 +240,11 @@ pub fn ledger(seq: u32, net: &LedgerHeader, net_account: &str, parts: &Parts) {
         let j = t.judge(seq, net, &acct, parts, validators);
         (j, t.streak, t.best_streak)
     };
+    // .39's validated hash, and ours from every part we make: the validator may sign it when the trusted
+    // validations reaching us fall short of quorum (cycle 184).
+    if j.network && j.borrowed.is_empty() {
+        crate::own_validated::witness(seq, j.ours);
+    }
     let st = stats();
     let n = st.ledgers.fetch_add(1, Ordering::Relaxed) + 1;
     st.last_seq.store(u64::from(seq), Ordering::Relaxed);

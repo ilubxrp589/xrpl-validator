@@ -321,6 +321,11 @@ async fn main() {
     } else {
         eprintln!("[validator] signs the first hash a peer announces as accepted: the quorum gate needs XRPL_OWN_VALIDATED=1");
     }
+    if sign_on_witness() {
+        eprintln!("[validator] short of quorum here, signs .39's validated hash when our own hash of the ledger is that hash (XRPL_SIGN_ON_WITNESS)");
+    } else if sign_on_quorum() {
+        eprintln!("[validator] short of quorum here, signs nothing (XRPL_SIGN_ON_WITNESS=0, or XRPL_OWN_HASH is off)");
+    }
     let outbound_tx2 = outbound_tx.clone();
 
     // Message dedup: hash of recent messages to avoid duplicates from multiple peers
@@ -1367,9 +1372,11 @@ async fn main() {
                         }
                     }
 
-                    // The ledger to sign, and its hash. By default the first peer to announce a newer ledger as accepted names
-                    // both. With the quorum gate (cycle 183, XRPL_SIGN_ON_QUORUM) the trusted validators' quorum names them,
-                    // checked as each validation comes in; a peer's announcement is only kept to compare.
+                    // The ledger to sign, its hash, and what named them. By default the first peer to announce a newer ledger
+                    // as accepted names both. With the quorum gate (cycle 183, XRPL_SIGN_ON_QUORUM) the trusted validators'
+                    // quorum names them, checked as each validation comes in; a peer's announcement is only kept to compare.
+                    // When that quorum falls short here, .39's validated hash names them if our own hash of the ledger is
+                    // that hash (cycle 184, XRPL_SIGN_ON_WITNESS).
                     let accepted = if event.msg_type == "StatusChange" && event.detail.contains("ACCEPTED") {
                         event.ledger_seq.map(|seq| {
                             // Get network's ledger hash from StatusChange
@@ -1394,14 +1401,16 @@ async fn main() {
                             }
                         }
                         if event.msg_type == "Validation" {
-                            xrpl_node::own_validated::next_quorum_after(last_validated_seq)
+                            xrpl_node::own_validated::next_to_sign(last_validated_seq, sign_on_witness()).map(|(seq, hash, basis)| {
+                                (seq, hash, if basis == xrpl_node::own_validated::Basis::Witness { "WITNESS" } else { "QUORUM" })
+                            })
                         } else {
                             None
                         }
                     } else {
-                        accepted.filter(|(seq, _)| *seq > last_validated_seq)
+                        accepted.filter(|(seq, _)| *seq > last_validated_seq).map(|(seq, hash)| (seq, hash, "VERIFIED"))
                     };
-                    if let Some((seq, network_hash_bytes)) = target {
+                    if let Some((seq, network_hash_bytes, named_by)) = target {
                         use std::sync::atomic::Ordering;
                         if sign_on_quorum() {
                             if last_validated_seq > 0 && seq > last_validated_seq + 1 {
@@ -1409,8 +1418,10 @@ async fn main() {
                             }
                             if let Some(peer) = first_peer.get(&seq).filter(|p| **p != network_hash_bytes) {
                                 SIGN_FIRST_PEER_DIFFERED.fetch_add(1, Ordering::Relaxed);
-                                eprintln!("[validator] #{seq}: the first peer to announce it named {}..., the trusted validators validated {}... (signing theirs)",
-                                    hex::encode(&peer[..8]), hex::encode(&network_hash_bytes[..8]));
+                                eprintln!("[validator] #{seq}: the first peer to announce it named {}..., the {} named {}... (signing that)",
+                                    hex::encode(&peer[..8]),
+                                    if named_by == "WITNESS" { ".39 and our own hash" } else { "trusted validators' quorum" },
+                                    hex::encode(&network_hash_bytes[..8]));
                             }
                         }
                         last_validated_seq = seq;
@@ -1469,7 +1480,7 @@ async fn main() {
                         let (ledger_hash_bytes, hash_source) = if !va05_enforce {
                             // Phase-3-only path: the 3-consecutive-match streak
                             // gate is open — sign the network's announced hash.
-                            (network_hash_bytes, if sign_on_quorum() { "QUORUM" } else { "VERIFIED" })
+                            (network_hash_bytes, named_by)
                         } else {
                             // Phase 3 above proved our account_hash matched the
                             // network's for 3+ ledgers. Now recompute the FULL
@@ -1612,6 +1623,9 @@ async fn main() {
                             });
                             eprintln!("[validator] Signed validation for ledger #{seq} hash={hash_short}... (src={hash_source})");
                             SIGNED.fetch_add(1, Ordering::Relaxed);
+                            if named_by == "WITNESS" {
+                                SIGN_WITNESSED.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                         } // gate-passed scope
                     }
@@ -1860,10 +1874,12 @@ async fn main() {
                     json["peer_fetch"] = xrpl_node::peer_fetch::json();
                     // Independence 4.5: "validated" from our own count of trusted validations.
                     json["own_validated"] = xrpl_node::own_validated::json();
-                    // Cycle 183: what the validator signs, and how often the first peer's hash was another.
+                    // Cycles 183-184: what the validator signs, and how often the first peer's hash was another.
                     json["signing"] = serde_json::json!({
                         "on_quorum": sign_on_quorum(),
+                        "on_witness": sign_on_witness(),
                         "signed": SIGNED.load(std::sync::atomic::Ordering::Relaxed),
+                        "witnessed": SIGN_WITNESSED.load(std::sync::atomic::Ordering::Relaxed),
                         "first_peer_differed": SIGN_FIRST_PEER_DIFFERED.load(std::sync::atomic::Ordering::Relaxed),
                         "no_quorum": SIGN_NO_QUORUM.load(std::sync::atomic::Ordering::Relaxed),
                     });
@@ -2223,9 +2239,21 @@ fn sign_on_quorum() -> bool {
     *ON.get_or_init(|| std::env::var("XRPL_SIGN_ON_QUORUM").as_deref() != Ok("0") && xrpl_node::own_validated::enabled())
 }
 
-/// Since the start (/api/engine "signing"): ledgers signed; ledgers the first peer announced with another hash than
-/// the quorum's; ledgers passed over because no quorum was heard for them.
+/// Cycle 184: when the trusted validations reaching us fall short of quorum on a ledger, sign the hash .39 called
+/// validated if our own hash of the ledger (own_hash, every part ours) is that hash. On mainnet #107783807-814
+/// (20 Oct) only 26 or 27 of quorum 28 reached us, so cycle 183 signed none of the eight, though .39 validated each.
+/// Needs the quorum gate and XRPL_OWN_HASH=1; XRPL_SIGN_ON_WITNESS=0 signs nothing short of quorum again.
+fn sign_on_witness() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("XRPL_SIGN_ON_WITNESS").as_deref() != Ok("0") && sign_on_quorum() && xrpl_node::own_hash::enabled()
+    })
+}
+
+/// Since the start (/api/engine "signing"): ledgers signed; of those, signed on .39's word and our own hash; ledgers
+/// the first peer announced with another hash than the one signed; ledgers passed over with nothing to sign them on.
 static SIGNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SIGN_WITNESSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SIGN_FIRST_PEER_DIFFERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SIGN_NO_QUORUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 

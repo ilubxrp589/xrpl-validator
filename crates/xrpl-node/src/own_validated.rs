@@ -15,7 +15,9 @@
 //! - **differ**: we reached quorum on another hash for that sequence (a healthy network never does);
 //! - **short**: we never reached quorum for that hash, judged once the ledger is [`GIVE_UP`] ledgers old.
 //!
-//! It decides nothing. `XRPL_OWN_VALIDATED=1` switches it on (off by default); differences go to
+//! The validator signs on it: on the quorum's hash (cycle 183, `XRPL_SIGN_ON_QUORUM`), or, when the quorum falls
+//! short here, on the hash .39 called validated and our own engine computed too (cycle 184, `XRPL_SIGN_ON_WITNESS`,
+//! [`Tally::next_to_sign`]). `XRPL_OWN_VALIDATED=1` switches it on (off by default); differences go to
 //! `XRPL_OWN_VALIDATED_LOG` (default /mnt/xrpl-data/own_validated.jsonl, capped at 20 MB).
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -61,6 +63,17 @@ pub struct Tally {
     leads: VecDeque<i64>,
     /// The first sequence a trusted validation named: ledgers before it closed before the tally listened.
     first_seq: Option<u32>,
+    /// Ledgers .39 called validated whose hash our own engine computed too (independence 5.5, [`Self::witness`]).
+    witnessed: BTreeMap<u32, [u8; 32]>,
+}
+
+/// Why the validator may sign a ledger ([`Tally::next_to_sign`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Basis {
+    /// The trusted validations reaching us reached quorum on its hash.
+    Quorum,
+    /// They fell short, but .39 called it validated and our own hash of it is that hash.
+    Witness,
 }
 
 /// One judged ledger.
@@ -222,6 +235,37 @@ impl Tally {
         self.seqs.range(from..).find_map(|(seq, s)| (s.reached.len() == 1).then(|| s.reached.keys().next().map(|h| (*seq, *h))).flatten())
     }
 
+    /// .39 called ledger `seq` validated with `hash`, and our own engine computed that same hash.
+    pub fn witness(&mut self, seq: u32, hash: [u8; 32]) {
+        self.witnessed.insert(seq, hash);
+        while self.witnessed.len() as u32 > KEEP {
+            self.witnessed.pop_first();
+        }
+    }
+
+    /// The oldest recent ledger after `after` the validator may sign, its hash and why: the quorum's, or with
+    /// `witness` the hash .39 and our own engine both have when the trusted validations reaching us fall short of
+    /// quorum (mainnet #107783807-814, 20 Oct: 26 or 27 of quorum 28 reached us, so cycle 183 signed none of the
+    /// eight). Never a hash another quorum here contradicts. Only the last [`GIVE_UP`] sequences heard count.
+    pub fn next_to_sign(&self, after: u32, witness: bool) -> Option<(u32, [u8; 32], Basis)> {
+        let newest = self.seqs.keys().next_back().into_iter().chain(self.witnessed.keys().next_back()).max().copied()?;
+        let from = after.max(newest.saturating_sub(GIVE_UP)) + 1;
+        let quorum = self.next_quorum_after(after).filter(|(seq, _)| *seq >= from);
+        let witnessed = witness
+            .then(|| {
+                self.witnessed.range(from..).find(|(seq, hash)| {
+                    self.seqs.get(*seq).is_none_or(|s| s.reached.keys().all(|h| h == *hash))
+                })
+            })
+            .flatten();
+        match (quorum, witnessed) {
+            (Some((q, _)), Some((w, h))) if *w < q => Some((*w, *h, Basis::Witness)),
+            (Some((q, h)), _) => Some((q, h, Basis::Quorum)),
+            (None, Some((w, h))) => Some((*w, *h, Basis::Witness)),
+            (None, None) => None,
+        }
+    }
+
     /// The median of the recent leads (ms we were ahead of .39; negative: behind).
     pub fn median_lead(&self) -> Option<i64> {
         let mut v: Vec<i64> = self.leads.iter().copied().collect();
@@ -320,6 +364,23 @@ pub fn next_quorum_after(after: u32) -> Option<(u32, [u8; 32])> {
         return None;
     }
     tally().lock().unwrap_or_else(|p| p.into_inner()).next_quorum_after(after)
+}
+
+/// .39 called ledger `seq` validated with `hash`, and our own engine computed that hash (independence 5.5, own_hash).
+pub fn witness(seq: u32, hash: [u8; 32]) {
+    if !enabled() {
+        return;
+    }
+    tally().lock().unwrap_or_else(|p| p.into_inner()).witness(seq, hash);
+}
+
+/// The oldest recent ledger after `after` the validator may sign, its hash and why (None also when off): the
+/// quorum's hash, or with `witness` the hash .39 and our own engine agree on when the quorum falls short here.
+pub fn next_to_sign(after: u32, witness: bool) -> Option<(u32, [u8; 32], Basis)> {
+    if !enabled() {
+        return None;
+    }
+    tally().lock().unwrap_or_else(|p| p.into_inner()).next_to_sign(after, witness)
 }
 
 /// The transaction set more than half the trusted validators accepted for ledger `seq` (None also when off).
@@ -599,6 +660,51 @@ mod tests {
             t.vote(&sk(i), 203 + GIVE_UP + 1, [9; 32], true, 0);
         }
         assert_eq!(t.next_quorum_after(0), Some((203 + GIVE_UP + 1, [9; 32])), "older than GIVE_UP behind the newest: not signed late");
+    }
+
+    /// Mainnet #107783807-814 (20 Oct): only 26 or 27 trusted validations of quorum 28 reached us for eight ledgers
+    /// in a row, so cycle 183 signed none of them, though .39 validated each and our own hash of each was its hash.
+    #[test]
+    fn a_ledger_short_of_quorum_here_is_signed_on_39s_word_and_our_own_hash() {
+        let mut t = Tally::default();
+        t.set_unl(&unl(35));
+        let validated = [0xC1u8; 32];
+        for i in 1..=27 {
+            t.vote(&sk(i), 300, validated, true, 0);
+        }
+        assert_eq!(t.next_to_sign(299, true), None, "27 of quorum 28, and no witness yet");
+        t.witness(300, validated);
+        assert_eq!(t.next_to_sign(299, true), Some((300, validated, Basis::Witness)));
+        assert_eq!(t.next_to_sign(299, false), None, "the witness is off");
+        assert_eq!(t.next_to_sign(300, true), None, "already taken");
+        t.vote(&sk(28), 300, validated, true, 0);
+        assert_eq!(t.next_to_sign(299, true), Some((300, validated, Basis::Quorum)), "the quorum, once it is there");
+    }
+
+    #[test]
+    fn the_witness_never_signs_past_a_quorum_or_against_one() {
+        let mut t = Tally::default();
+        t.set_unl(&unl(35));
+        for i in 1..=28 {
+            t.vote(&sk(i), 401, [41; 32], true, 0);
+            t.vote(&sk(i), 402, [42; 32], true, 0);
+        }
+        t.witness(400, [40; 32]);
+        t.witness(402, [7; 32]);
+        assert_eq!(t.next_to_sign(399, true), Some((400, [40; 32], Basis::Witness)), "the oldest first, whichever says so");
+        assert_eq!(t.next_to_sign(400, true), Some((401, [41; 32], Basis::Quorum)));
+        assert_eq!(t.next_to_sign(401, true), Some((402, [42; 32], Basis::Quorum)), "a quorum on another hash wins");
+        t.vote(&sk(1), 404, [44; 32], true, 0);
+        t.witness(403, [7; 32]);
+        for i in 1..=28 {
+            t.vote(&sk(i), 403, [43; 32], true, 0);
+        }
+        assert_eq!(t.next_to_sign(402, true), Some((403, [43; 32], Basis::Quorum)), "never against the quorum here");
+        t.witness(404, [44; 32]);
+        assert_eq!(t.next_to_sign(403, true), Some((404, [44; 32], Basis::Witness)));
+        t.witness(404 + GIVE_UP + 1, [9; 32]);
+        assert_eq!(t.next_to_sign(403, true), Some((404 + GIVE_UP + 1, [9; 32], Basis::Witness)),
+            "#404 is more than GIVE_UP behind the newest: not signed late");
     }
 
     #[test]
