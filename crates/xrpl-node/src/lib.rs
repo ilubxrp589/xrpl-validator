@@ -22,6 +22,7 @@ pub mod independence_days;
 pub mod own_hash;
 pub mod own_validated;
 pub mod peer_fetch;
+pub mod peer_source;
 pub mod peer_state;
 #[cfg(feature = "ffi")]
 pub mod native_shadow;

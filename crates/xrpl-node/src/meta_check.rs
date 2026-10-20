@@ -112,6 +112,12 @@ pub fn result_code(name: &str) -> Option<u64> {
     RESULTS.get(name).copied()
 }
 
+/// Result number → its name: rippled's JSON names a transaction's result where the binary holds its number.
+pub fn result_name(code: u64) -> Option<&'static str> {
+    static NAMES: LazyLock<HashMap<u64, String>> = LazyLock::new(|| RESULTS.iter().map(|(k, v)| (*v, k.clone())).collect());
+    NAMES.get(&code).map(String::as_str)
+}
+
 /// The TransactionIndex in mainnet's metadata bytes.
 pub fn tx_index(theirs: &[u8]) -> Option<u64> {
     xrpl_core::codec::decode::decode_transaction_binary(theirs).ok()?["TransactionIndex"].as_u64()

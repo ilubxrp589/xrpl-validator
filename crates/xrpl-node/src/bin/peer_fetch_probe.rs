@@ -16,6 +16,13 @@
 //! and peer rotation) over sessions to each of --peers, fed every validated ledger the RPC server reports,
 //! for MINUTES. Prints the driver's counters every minute.
 //!
+//!   peer_fetch_probe --assemble COUNT [--rpc URL] [--ledger SEQ] [--pace SECONDS]
+//!
+//! Independence Step 4, stage A: for COUNT ledgers back from the latest validated one (or --ledger), the RPC
+//! server's binary copy (the bytes a peer sends: header and transaction tree) made into the engine's inputs
+//! (peer_source::assemble) and held against the same server's JSON, field by field. One ledger every --pace
+//! seconds (default 8): two full `ledger` reads a ledger cost a non-admin client heavily at the server.
+//!
 //!   peer_fetch_probe --validated MINUTES [--peers ...] [--rpc URL] [--log FILE]
 //!
 //! Independence 4.5: own_validated's tally over the validations the --peers sessions relay (each signature
@@ -55,6 +62,90 @@ async fn their_copy(url: &str, seq: u32) -> Result<(String, Vec<(Vec<u8>, Vec<u8
         pairs.push((tx, meta));
     }
     Ok((hash, pairs))
+}
+
+/// One ledger: the RPC server's binary reply made into the engine's inputs, held against its JSON reply.
+/// The number of transactions, and up to 200 differences (none: the same).
+fn assemble_one(bin: Result<Value, String>, js: Result<Value, String>) -> Result<(usize, Vec<String>), String> {
+    let (bin, js) = (bin?, js?);
+    if bin["validated"].as_bool() != Some(true) || js["validated"].as_bool() != Some(true) {
+        return Err("not validated".to_string());
+    }
+    let raw = hex::decode(bin["ledger"]["ledger_data"].as_str().ok_or("no ledger_data")?).map_err(|e| e.to_string())?;
+    let header = xrpl_ledger::ledger::header::LedgerHeader::deserialize(&raw).map_err(|e| format!("header: {e:?}"))?;
+    let mut pairs = Vec::new();
+    for t in bin["ledger"]["transactions"].as_array().ok_or("no transactions")? {
+        let tx = hex::decode(t["tx_blob"].as_str().ok_or("no tx_blob")?).map_err(|e| e.to_string())?;
+        let meta = hex::decode(t["meta"].as_str().ok_or("no meta")?).map_err(|e| e.to_string())?;
+        pairs.push((tx, meta));
+    }
+    let ours = xrpl_node::peer_source::assemble(&header, pairs)?;
+    let (h, account, theirs) = xrpl_node::peer_source::their_inputs(&js["ledger"])?;
+    Ok((ours.txs.len(), xrpl_node::peer_source::differences(&ours, &h, &account, &theirs, 200)))
+}
+
+/// Stage A over COUNT ledgers: the RPC server's bytes made into the engine's inputs, against its JSON.
+async fn run_assemble(url: &str, count: u32, from: Option<u32>, pace: u64) -> i32 {
+    let latest = match from {
+        Some(s) => s,
+        None => match rpc(url, json!({"method": "ledger", "params": [{"ledger_index": "validated"}]})).await {
+            Ok(r) => r["ledger_index"].as_u64().or_else(|| r["ledger"]["ledger_index"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0) as u32,
+            Err(e) => {
+                eprintln!("RPC: {e}");
+                return 2;
+            }
+        },
+    };
+    let (mut same, mut differ, mut failed, mut txs) = (0u32, 0u32, 0u32, 0usize);
+    let mut kinds: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+    for seq in (latest.saturating_sub(count) + 1..=latest).rev() {
+        let bin = rpc(url, json!({"method": "ledger", "params": [{"ledger_index": seq, "transactions": true, "expand": true, "binary": true}]})).await;
+        let js = rpc(url, json!({"method": "ledger", "params": [{"ledger_index": seq, "transactions": true, "expand": true, "binary": false}]})).await;
+        let verdict = assemble_one(bin, js).map(|(n, v)| {
+            txs += n;
+            v
+        });
+        match verdict {
+            Ok(d) if d.is_empty() => same += 1,
+            Ok(d) => {
+                differ += 1;
+                eprintln!("#{seq}: DIFFERS in {} place{}, first: {}", d.len(), if d.len() == 1 { "" } else { "s" }, d[0]);
+                for one in &d {
+                    // the kind: the path without the transaction and the array positions
+                    let path = one.split_once(") ").map_or(one.as_str(), |(_, k)| k);
+                    let path = path.split(':').next().unwrap_or(path);
+                    let mut kind = String::with_capacity(path.len());
+                    let mut in_brackets = false;
+                    for c in path.chars() {
+                        match c {
+                            '[' => {
+                                in_brackets = true;
+                                kind.push('[');
+                            }
+                            ']' => {
+                                in_brackets = false;
+                                kind.push(']');
+                            }
+                            _ if in_brackets => {}
+                            _ => kind.push(c),
+                        }
+                    }
+                    *kinds.entry(kind).or_default() += 1;
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!("#{seq}: NOT ASSEMBLED: {e}");
+                *kinds.entry(format!("not assembled: {}", e.split(':').next().unwrap_or(&e))).or_default() += 1;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(pace)).await;
+    }
+    for (k, n) in &kinds {
+        eprintln!("  {n:>5} × {k}");
+    }
+    eprintln!("ASSEMBLE SUMMARY: {same} ledgers the same as the RPC server's JSON, {differ} differ, {failed} not assembled ({txs} transactions)");
+    if differ == 0 && failed == 0 { 0 } else { 1 }
 }
 
 fn frame(msg: &PeerMessage) -> Vec<u8> {
@@ -233,7 +324,7 @@ async fn run_driver(url: &str, minutes: u64) -> i32 {
                 match their_copy(url, seq).await {
                     Ok((h, pairs)) => {
                         if let Some(hash) = hex::decode(&h).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()) {
-                            xrpl_node::peer_fetch::offer_network(seq, hash, &pairs);
+                            xrpl_node::peer_fetch::offer_network(seq, hash, &pairs, None);
                         }
                     }
                     Err(e) => eprintln!("#{seq}: RPC copy: {e}"),
@@ -262,6 +353,10 @@ async fn main() {
         std::env::set_var("XRPL_OWN_VALIDATED_LOG", arg("--log").unwrap_or_else(|| "/tmp/own_validated_probe.jsonl".into()));
         let url = arg("--rpc").unwrap_or_else(|| "https://s2.ripple.com:51234".into());
         std::process::exit(run_validated(&url, minutes).await);
+    }
+    if let Some(count) = arg("--assemble").and_then(|c| c.parse::<u32>().ok()) {
+        let url = arg("--rpc").unwrap_or_else(|| "https://s2.ripple.com:51234".into());
+        std::process::exit(run_assemble(&url, count, arg("--ledger").and_then(|s| s.parse().ok()), arg("--pace").and_then(|s| s.parse().ok()).unwrap_or(8)).await);
     }
     if let Some(minutes) = arg("--driver").and_then(|m| m.parse::<u64>().ok()) {
         std::env::set_var("XRPL_PEER_FETCH", "1");

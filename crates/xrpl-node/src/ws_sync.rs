@@ -735,7 +735,14 @@ pub async fn start_ws_sync(
                                 if root_ok && ids_ok {
                                     // Independence 4.1: the same ledger, fetched from peers, is compared with
                                     // this proven copy (XRPL_PEER_FETCH=1; nothing when off).
-                                    crate::peer_fetch::offer_network(process_seq, ledger_header.ledger_hash, &triples);
+                                    // Step 4 stage A: with what the engine takes from .39 (header, state root, JSON), so the
+                                    // peers' copy is also made into the engine's inputs and held against these.
+                                    let inputs = crate::peer_fetch::enabled().then(|| crate::peer_fetch::Inputs {
+                                        header: ledger_header.clone(),
+                                        account_hash: account_hash.clone(),
+                                        txs: sorted_txs.clone(),
+                                    });
+                                    crate::peer_fetch::offer_network(process_seq, ledger_header.ledger_hash, &triples, inputs);
                                     let v = TXGATE_VERIFIED.fetch_add(1, Ordering::Relaxed) + 1;
                                     // Heartbeat every 256 ledgers so burn-in can confirm the gate
                                     // is live and read the running tallies (the happy path is

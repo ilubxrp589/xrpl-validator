@@ -206,6 +206,13 @@ pub struct FetchStats {
     pub peers: AtomicU64,
     pub last_seq: AtomicU64,
     pub ms_last: AtomicU64,
+    /// Step 4 stage A: fetched ledgers made into the engine's inputs ([`crate::peer_source`]), and held against
+    /// what .39 gave it: the same, different, or not made (a record the codec could not read back).
+    pub assembled_same: AtomicU64,
+    pub assembled_differ: AtomicU64,
+    pub assembly_failed: AtomicU64,
+    /// Fetches keyed by the hash our own tally of trusted validations reached quorum on, not .39's.
+    pub keyed_by_quorum: AtomicU64,
 }
 
 pub fn stats() -> &'static FetchStats {
@@ -232,9 +239,10 @@ pub fn summary() -> String {
     let st = stats();
     let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
     format!(
-        "wanted {} fetched {} | match {} differ {} | failed {} skipped {} | requests {} rejected nodes {} bad headers {} | peers {}",
+        "wanted {} fetched {} | match {} differ {} | failed {} skipped {} | requests {} rejected nodes {} bad headers {} | peers {} | inputs same {} differ {} not made {} | keyed by quorum {}",
         l(&st.wanted), l(&st.fetched), l(&st.matched), l(&st.differ), l(&st.failed), l(&st.skipped), l(&st.requests),
-        l(&st.rejected_nodes), l(&st.bad_headers), l(&st.peers)
+        l(&st.rejected_nodes), l(&st.bad_headers), l(&st.peers), l(&st.assembled_same), l(&st.assembled_differ),
+        l(&st.assembly_failed), l(&st.keyed_by_quorum)
     )
 }
 
@@ -246,7 +254,8 @@ pub fn json() -> Value {
         "enabled": enabled(), "last_seq": l(&st.last_seq), "wanted": l(&st.wanted), "fetched": l(&st.fetched),
         "matched": l(&st.matched), "differ": l(&st.differ), "failed": l(&st.failed), "requests": l(&st.requests),
         "rejected_nodes": l(&st.rejected_nodes), "bad_headers": l(&st.bad_headers), "skipped": l(&st.skipped),
-        "peers": l(&st.peers), "ms_last": l(&st.ms_last),
+        "peers": l(&st.peers), "ms_last": l(&st.ms_last), "keyed_by_quorum": l(&st.keyed_by_quorum),
+        "inputs": {"same": l(&st.assembled_same), "differ": l(&st.assembled_differ), "not_made": l(&st.assembly_failed)},
     })
 }
 
@@ -262,6 +271,9 @@ pub fn metrics_text() -> String {
         ("xrpl_peer_fetch_failed_total", "Ledgers no peer delivered in time.", l(&st.failed)),
         ("xrpl_peer_fetch_requests_total", "TMGetLedger requests sent.", l(&st.requests)),
         ("xrpl_peer_fetch_rejected_nodes_total", "Nodes a peer sent that were not what their parent names.", l(&st.rejected_nodes)),
+        ("xrpl_peer_fetch_inputs_same_total", "Fetched ledgers made into the engine's inputs, the same as .39's.", l(&st.assembled_same)),
+        ("xrpl_peer_fetch_inputs_differ_total", "Fetched ledgers made into the engine's inputs, different from .39's.", l(&st.assembled_differ)),
+        ("xrpl_peer_fetch_inputs_not_made_total", "Fetched ledgers that could not be made into the engine's inputs.", l(&st.assembly_failed)),
     ] {
         s.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n{name} {v}\n"));
     }
@@ -360,7 +372,7 @@ impl Pacer {
 enum Event {
     Peer { addr: String, frames: Option<tokio::sync::mpsc::Sender<Vec<u8>>> },
     Data { addr: String, data: TmLedgerData },
-    Want { seq: u32, hash: [u8; 32], theirs: Vec<(Vec<u8>, Vec<u8>)> },
+    Want { seq: u32, hash: [u8; 32], theirs: Vec<(Vec<u8>, Vec<u8>)>, inputs: Option<std::sync::Arc<Inputs>> },
 }
 
 static EVENTS: OnceLock<tokio::sync::mpsc::UnboundedSender<Event>> = OnceLock::new();
@@ -404,12 +416,31 @@ pub fn on_ledger_data(addr: &str, d: &TmLedgerData) {
     }
 }
 
+/// What the engine took from .39 for a ledger: the header, the state root (hex) and every transaction as
+/// rippled's JSON in TransactionIndex order (Step 4 stage A holds the inputs made from the peers' copy to it).
+#[derive(Debug, Clone)]
+pub struct Inputs {
+    pub header: crate::ws_sync::LedgerHeader,
+    pub account_hash: String,
+    pub txs: Vec<Value>,
+}
+
 /// .39's copy of validated ledger `seq` (its hash, and every transaction with its metadata, already checked
-/// against the header's transaction root): fetch the same ledger from peers and compare.
-pub fn offer_network(seq: u32, hash: [u8; 32], theirs: &[(Vec<u8>, Vec<u8>)]) {
+/// against the header's transaction root): fetch the same ledger from peers and compare. The fetch asks for the
+/// hash our own tally of trusted validations reached quorum on when it has one, else .39's. With `inputs`, the
+/// fetched ledger is also made into the engine's inputs and held against those.
+pub fn offer_network(seq: u32, hash: [u8; 32], theirs: &[(Vec<u8>, Vec<u8>)], inputs: Option<Inputs>) {
     if EVENTS.get().is_some() && hash != [0; 32] {
-        stats().wanted.fetch_add(1, Ordering::Relaxed);
-        send(Event::Want { seq, hash, theirs: theirs.to_vec() });
+        let st = stats();
+        st.wanted.fetch_add(1, Ordering::Relaxed);
+        let hash = match crate::own_validated::quorum_hash(seq) {
+            Some(q) => {
+                st.keyed_by_quorum.fetch_add(1, Ordering::Relaxed);
+                q
+            }
+            None => hash,
+        };
+        send(Event::Want { seq, hash, theirs: theirs.to_vec(), inputs: inputs.map(std::sync::Arc::new) });
     }
 }
 
@@ -428,6 +459,7 @@ struct Active {
     seq: u32,
     fetch: LedgerFetch,
     theirs: Vec<(Vec<u8>, Vec<u8>)>,
+    inputs: Option<std::sync::Arc<Inputs>>,
     started: Instant,
     /// The peer last asked, and when; None when the next request is due.
     asked: Option<(String, Instant)>,
@@ -438,7 +470,7 @@ async fn drive(mut rx: tokio::sync::mpsc::UnboundedReceiver<Event>, log: std::pa
     let st = stats();
     let mut pacer = Pacer::default();
     let mut frames: HashMap<String, tokio::sync::mpsc::Sender<Vec<u8>>> = HashMap::new();
-    let mut queue: VecDeque<(u32, [u8; 32], Vec<(Vec<u8>, Vec<u8>)>)> = VecDeque::new();
+    let mut queue: VecDeque<(u32, [u8; 32], Vec<(Vec<u8>, Vec<u8>)>, Option<std::sync::Arc<Inputs>>)> = VecDeque::new();
     let mut cur: Option<Active> = None;
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -454,8 +486,8 @@ async fn drive(mut rx: tokio::sync::mpsc::UnboundedReceiver<Event>, log: std::pa
                     pacer.remove(&addr);
                     frames.remove(&addr);
                 }
-                Some(Event::Want { seq, hash, theirs }) => {
-                    queue.push_back((seq, hash, theirs));
+                Some(Event::Want { seq, hash, theirs, inputs }) => {
+                    queue.push_back((seq, hash, theirs, inputs));
                     while queue.len() > QUEUE_CAP {
                         queue.pop_front();
                         st.skipped.fetch_add(1, Ordering::Relaxed);
@@ -491,8 +523,8 @@ async fn drive(mut rx: tokio::sync::mpsc::UnboundedReceiver<Event>, log: std::pa
         st.peers.store(pacer.len() as u64, Ordering::Relaxed);
         let now = Instant::now();
         if cur.is_none() {
-            if let Some((seq, hash, theirs)) = queue.pop_front() {
-                cur = Some(Active { seq, fetch: LedgerFetch::new(hash), theirs, started: now, asked: None, peers_used: Vec::new() });
+            if let Some((seq, hash, theirs, inputs)) = queue.pop_front() {
+                cur = Some(Active { seq, fetch: LedgerFetch::new(hash), theirs, inputs, started: now, asked: None, peers_used: Vec::new() });
             }
         }
         let Some(a) = cur.as_mut() else { continue };
@@ -553,10 +585,35 @@ fn finish(a: Active, log: &std::path::Path) {
             if n % 256 == 1 {
                 eprintln!("[peer-fetch] heartbeat #{}: {}", a.seq, summary());
             }
+            if let Some(inputs) = a.inputs {
+                // Step 4 stage A, off the driver's thread: decoding and re-encoding a big ledger takes tens of ms.
+                let (seq, hash, log) = (a.seq, hash.clone(), log.to_path_buf());
+                tokio::task::spawn_blocking(move || check_inputs(seq, &hash, &header, ours, &inputs, &log));
+            }
         }
         None => {
             st.failed.fetch_add(1, Ordering::Relaxed);
             log_receipt(log, &json!({"seq": a.seq, "hash": hash, "failed": "not complete within the deadline", "requests": requests, "peers": peers, "ms": ms}));
+        }
+    }
+}
+
+/// Step 4 stage A: the fetched ledger made into the engine's inputs, against what .39 gave the engine.
+fn check_inputs(seq: u32, hash: &str, header: &LedgerHeader, pairs: Vec<(Vec<u8>, Vec<u8>)>, inputs: &Inputs, log: &std::path::Path) {
+    let st = stats();
+    match crate::peer_source::assemble(header, pairs) {
+        Ok(a) => match crate::peer_source::compare(&a, &inputs.header, &inputs.account_hash, &inputs.txs) {
+            None => {
+                st.assembled_same.fetch_add(1, Ordering::Relaxed);
+            }
+            Some(d) => {
+                st.assembled_differ.fetch_add(1, Ordering::Relaxed);
+                log_receipt(log, &json!({"seq": seq, "hash": hash, "inputs": d}));
+            }
+        },
+        Err(e) => {
+            st.assembly_failed.fetch_add(1, Ordering::Relaxed);
+            log_receipt(log, &json!({"seq": seq, "hash": hash, "inputs_not_made": e}));
         }
     }
 }
@@ -730,6 +787,29 @@ mod tests {
         let fr = frame(&f.base_request());
         let len = u32::from_be_bytes(fr[..4].try_into().unwrap()) as usize;
         assert_eq!((len + 6, u16::from_be_bytes([fr[4], fr[5]])), (fr.len(), 31));
+    }
+
+    #[test]
+    fn a_fetched_ledger_is_made_into_the_engines_inputs_and_held_against_39s() {
+        use crate::peer_source::fixtures::{ledger, theirs};
+        let (h, pairs) = ledger();
+        let a = crate::peer_source::assemble(&h, pairs.clone()).unwrap();
+        let (th, ta, tt) = theirs(&a);
+        let log = std::env::temp_dir().join(format!("peer_fetch_inputs_{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&log);
+        let st = stats();
+        let (same, differ) = (st.assembled_same.load(Ordering::Relaxed), st.assembled_differ.load(Ordering::Relaxed));
+        check_inputs(1, "AB", &h, pairs.clone(), &Inputs { header: th.clone(), account_hash: ta.clone(), txs: tt.clone() }, &log);
+        assert!(st.assembled_same.load(Ordering::Relaxed) > same);
+        assert!(!log.exists(), "nothing to report");
+        let mut odd = tt.clone();
+        odd[0]["Fee"] = json!("99");
+        check_inputs(2, "CD", &h, pairs, &Inputs { header: th, account_hash: ta, txs: odd }, &log);
+        assert!(st.assembled_differ.load(Ordering::Relaxed) > differ);
+        let line: Value = serde_json::from_str(std::fs::read_to_string(&log).unwrap().lines().next().unwrap()).unwrap();
+        assert_eq!(line["seq"], 2);
+        assert!(line["inputs"].as_str().unwrap().contains("Fee: ours \"12\", .39's \"99\""), "{line}");
+        let _ = std::fs::remove_file(&log);
     }
 
     #[test]
