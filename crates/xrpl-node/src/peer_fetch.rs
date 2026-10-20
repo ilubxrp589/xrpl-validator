@@ -268,6 +268,13 @@ pub fn metrics_text() -> String {
     s
 }
 
+/// Step 4's source switch: the ledger data the engine applies comes from peers, with .39 only checking it. Not
+/// built yet — today the driver only fetches each ledger again and compares — so the Independence page's day
+/// count ([`crate::independence_days`]) does not start.
+pub fn is_source() -> bool {
+    false
+}
+
 // ---- the live driver (XRPL_PEER_FETCH=1) -------------------------------------------------------------------
 
 /// Gap between two requests to one peer. About three requests a ledger, spread over the peers, keep each

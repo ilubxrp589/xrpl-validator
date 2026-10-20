@@ -17,7 +17,9 @@
 //!
 //! The validator signs on it: on the quorum's hash (cycle 183, `XRPL_SIGN_ON_QUORUM`), or, when the quorum falls
 //! short here, on the hash .39 called validated and our own engine computed too (cycle 184, `XRPL_SIGN_ON_WITNESS`,
-//! [`Tally::next_to_sign`]). `XRPL_OWN_VALIDATED=1` switches it on (off by default); differences go to
+//! [`Tally::next_to_sign`]). With independence 5a (cycle 185, `XRPL_SIGN_OWN=1`) only on our own hash of the
+//! ledger, once the quorum or .39 names it too ([`Tally::next_own_to_sign`]). `XRPL_OWN_VALIDATED=1` switches it
+//! on (off by default); differences go to
 //! `XRPL_OWN_VALIDATED_LOG` (default /mnt/xrpl-data/own_validated.jsonl, capped at 20 MB).
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -65,6 +67,9 @@ pub struct Tally {
     first_seq: Option<u32>,
     /// Ledgers .39 called validated whose hash our own engine computed too (independence 5.5, [`Self::witness`]).
     witnessed: BTreeMap<u32, [u8; 32]>,
+    /// Our own hash of each ledger ws-sync landed, made from every part we compute; None when a part was borrowed
+    /// (independence 5a, [`Self::own_ledger`]).
+    own: BTreeMap<u32, Option<[u8; 32]>>,
 }
 
 /// Why the validator may sign a ledger ([`Tally::next_to_sign`]).
@@ -74,7 +79,14 @@ pub enum Basis {
     Quorum,
     /// They fell short, but .39 called it validated and our own hash of it is that hash.
     Witness,
+    /// Our own hash of it, which the trusted validations reaching us reached quorum on too (independence 5a).
+    Own,
 }
+
+/// Independence 5a's fallback: when the validator has had nothing of its own to sign for a while, it signs the
+/// quorum's hash for a ledger it cannot make, and for one ws-sync has not landed while ledgers this many sequences
+/// past the newest it did land are heard (a stall).
+pub const STALL: u32 = 2;
 
 /// One judged ledger.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,6 +278,72 @@ impl Tally {
         }
     }
 
+    /// ws-sync landed ledger `seq`: our own hash of it, or None when a part of it was borrowed.
+    pub fn own_ledger(&mut self, seq: u32, ours: Option<[u8; 32]>) {
+        self.own.insert(seq, ours);
+        while self.own.len() as u32 > KEEP {
+            self.own.pop_first();
+        }
+    }
+
+    /// Independence 5a: the oldest recent ledger after `after` whose hash the validator computed itself and may
+    /// sign: ours when the trusted validations reaching us reached quorum on it ([`Basis::Own`]), or, short of
+    /// quorum and with `witness`, when .39 validated that hash too ([`Basis::Witness`]). It waits for a ledger
+    /// ws-sync has not landed yet and passes over one it cannot sign (a borrowed part, or ours differs). With
+    /// `breaker` (the validator has had nothing of its own to sign for a while) those it passes over, and those
+    /// ws-sync stalls on ([`STALL`]), get the quorum's hash ([`Basis::Quorum`]); ours still goes first. Only the
+    /// last [`GIVE_UP`] sequences heard count.
+    pub fn next_own_to_sign(&self, after: u32, witness: bool, breaker: bool) -> Option<(u32, [u8; 32], Basis)> {
+        let newest = [self.seqs.keys().next_back(), self.witnessed.keys().next_back(), self.own.keys().next_back()]
+            .into_iter()
+            .flatten()
+            .max()
+            .copied()?;
+        let from = after.max(newest.saturating_sub(GIVE_UP)) + 1;
+        // ws-sync lands a ledger a few tens of ms after the quorum on it: hearing of ledgers well past the newest it
+        // landed means it has stalled.
+        let stalled = self.own.keys().next_back().is_none_or(|l| newest > l + STALL);
+        for seq in from..=newest {
+            let s = self.seqs.get(&seq);
+            let quorum = s.and_then(|s| (s.reached.len() == 1).then(|| s.reached.keys().next().copied()).flatten());
+            let contested = s.is_some_and(|s| s.reached.len() > 1);
+            match self.own.get(&seq) {
+                Some(Some(ours)) => {
+                    if quorum == Some(*ours) {
+                        return Some((seq, *ours, Basis::Own));
+                    }
+                    if quorum.is_some() || contested {
+                        if let (true, Some(q)) = (breaker, quorum) {
+                            return Some((seq, q, Basis::Quorum));
+                        }
+                        continue; // ours differs from the quorum's
+                    }
+                    if self.witnessed.get(&seq) != Some(ours) {
+                        continue; // ours is not .39's either
+                    }
+                    if witness {
+                        return Some((seq, *ours, Basis::Witness));
+                    }
+                    return None; // .39 agrees with us: wait for the quorum
+                }
+                Some(None) => {
+                    if let (true, Some(q)) = (breaker, quorum) {
+                        return Some((seq, q, Basis::Quorum));
+                    }
+                }
+                None => {
+                    if !(breaker && stalled) {
+                        return None; // not landed yet: wait for it
+                    }
+                    if let Some(q) = quorum {
+                        return Some((seq, q, Basis::Quorum));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// The median of the recent leads (ms we were ahead of .39; negative: behind).
     pub fn median_lead(&self) -> Option<i64> {
         let mut v: Vec<i64> = self.leads.iter().copied().collect();
@@ -381,6 +459,24 @@ pub fn next_to_sign(after: u32, witness: bool) -> Option<(u32, [u8; 32], Basis)>
         return None;
     }
     tally().lock().unwrap_or_else(|p| p.into_inner()).next_to_sign(after, witness)
+}
+
+/// ws-sync landed ledger `seq`: our own hash of it, made from every part we compute, or None when a part was
+/// borrowed (independence 5a, own_hash).
+pub fn own_ledger(seq: u32, ours: Option<[u8; 32]>) {
+    if !enabled() {
+        return;
+    }
+    tally().lock().unwrap_or_else(|p| p.into_inner()).own_ledger(seq, ours);
+}
+
+/// Independence 5a: the oldest recent ledger after `after` whose hash we computed ourselves and may sign, its hash
+/// and why ([`Tally::next_own_to_sign`]; None also when off).
+pub fn next_own_to_sign(after: u32, witness: bool, breaker: bool) -> Option<(u32, [u8; 32], Basis)> {
+    if !enabled() {
+        return None;
+    }
+    tally().lock().unwrap_or_else(|p| p.into_inner()).next_own_to_sign(after, witness, breaker)
 }
 
 /// The transaction set more than half the trusted validators accepted for ledger `seq` (None also when off).
@@ -705,6 +801,71 @@ mod tests {
         t.witness(404 + GIVE_UP + 1, [9; 32]);
         assert_eq!(t.next_to_sign(403, true), Some((404 + GIVE_UP + 1, [9; 32], Basis::Witness)),
             "#404 is more than GIVE_UP behind the newest: not signed late");
+    }
+
+    fn quorum_on(t: &mut Tally, seq: u32, hash: [u8; 32]) {
+        for i in 1..=28 {
+            t.vote(&sk(i), seq, hash, true, 0);
+        }
+    }
+
+    /// Independence 5a: the validator signs a ledger only with a hash it made itself, once the quorum names it too.
+    #[test]
+    fn under_5a_a_ledger_is_signed_with_our_own_hash_once_it_lands_and_the_quorum_agrees() {
+        let mut t = Tally::default();
+        t.set_unl(&unl(35));
+        own_and_quorum(&mut t, 499, [49; 32], Some([49; 32]));
+        quorum_on(&mut t, 500, [50; 32]);
+        assert_eq!(t.next_own_to_sign(499, true, false), None, "the quorum is in, our own hash not yet: wait");
+        assert_eq!(t.next_own_to_sign(499, true, true), None, "waiting is not a stall, even with the breaker");
+        t.own_ledger(500, Some([50; 32]));
+        assert_eq!(t.next_own_to_sign(499, true, false), Some((500, [50; 32], Basis::Own)));
+        own_and_quorum(&mut t, 501, [51; 32], Some([66; 32]));
+        own_and_quorum(&mut t, 502, [52; 32], None);
+        own_and_quorum(&mut t, 503, [53; 32], Some([53; 32]));
+        assert_eq!(t.next_own_to_sign(500, true, false), Some((503, [53; 32], Basis::Own)),
+            "#501 ours differs and #502 borrowed a part: neither is signed");
+        assert_eq!(t.next_own_to_sign(500, true, true), Some((501, [51; 32], Basis::Quorum)),
+            "with the breaker, the quorum's hash for a ledger we cannot make");
+    }
+
+    fn own_and_quorum(t: &mut Tally, seq: u32, quorum: [u8; 32], ours: Option<[u8; 32]>) {
+        quorum_on(t, seq, quorum);
+        t.own_ledger(seq, ours);
+    }
+
+    #[test]
+    fn under_5a_short_of_quorum_our_hash_is_signed_only_when_39_validated_it_too() {
+        let mut t = Tally::default();
+        t.set_unl(&unl(35));
+        for i in 1..=27 {
+            t.vote(&sk(i), 600, [60; 32], true, 0);
+            t.vote(&sk(i), 601, [61; 32], true, 0);
+        }
+        t.own_ledger(600, Some([60; 32]));
+        t.witness(600, [60; 32]);
+        t.own_ledger(601, Some([61; 32])); // .39 validated another hash: no witness
+        assert_eq!(t.next_own_to_sign(599, true, false), Some((600, [60; 32], Basis::Witness)));
+        assert_eq!(t.next_own_to_sign(599, false, false), None, "no witness: wait for the quorum");
+        assert_eq!(t.next_own_to_sign(600, true, true), None, "ours is not .39's, and no quorum to fall back on");
+    }
+
+    #[test]
+    fn under_5a_a_stalled_ws_sync_is_waited_for_until_the_breaker_signs_the_quorums_hash() {
+        let mut t = Tally::default();
+        t.set_unl(&unl(35));
+        own_and_quorum(&mut t, 700, [70; 32], Some([70; 32]));
+        for seq in 701..=704 {
+            quorum_on(&mut t, seq, [seq as u8; 32]);
+        }
+        assert_eq!(t.next_own_to_sign(700, true, false), None, "never a hash we did not make");
+        assert_eq!(t.next_own_to_sign(700, true, true), Some((701, [701u16 as u8; 32], Basis::Quorum)),
+            "ledgers 4 past the newest landed: a stall");
+        let mut fresh = Tally::default();
+        fresh.set_unl(&unl(35));
+        quorum_on(&mut fresh, 800, [80; 32]);
+        assert_eq!(fresh.next_own_to_sign(0, true, false), None, "nothing landed since the start: wait");
+        assert_eq!(fresh.next_own_to_sign(0, true, true), Some((800, [80; 32], Basis::Quorum)));
     }
 
     #[test]

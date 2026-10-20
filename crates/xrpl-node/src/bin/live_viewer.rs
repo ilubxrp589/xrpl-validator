@@ -326,6 +326,11 @@ async fn main() {
     } else if sign_on_quorum() {
         eprintln!("[validator] short of quorum here, signs nothing (XRPL_SIGN_ON_WITNESS=0, or XRPL_OWN_HASH is off)");
     }
+    if sign_own() {
+        eprintln!("[validator] independence 5a: signs a ledger only with our own hash of it (XRPL_SIGN_OWN=1); breaker after {} s with nothing of ours signed", OWN_BREAK.as_secs());
+    } else if std::env::var("XRPL_SIGN_OWN").as_deref() == Ok("1") {
+        eprintln!("[validator] XRPL_SIGN_OWN=1 needs the quorum gate and XRPL_OWN_HASH=1: independence 5a is off");
+    }
     let outbound_tx2 = outbound_tx.clone();
 
     // Message dedup: hash of recent messages to avoid duplicates from multiple peers
@@ -1166,6 +1171,8 @@ async fn main() {
     let mut last_validated_seq: u32 = 0;
     // With the quorum gate: the hash the first peer announced as accepted, for the last ledgers, to compare.
     let mut first_peer: std::collections::BTreeMap<u32, [u8; 32]> = std::collections::BTreeMap::new();
+    // Independence 5a: when the validator last signed a hash of its own (the start, until it does).
+    let mut last_own_at = std::time::Instant::now();
     // Buffer raw transactions per round for full ledger close
     let mut round_raw_txs: Vec<(xrpl_core::types::Hash256, Vec<u8>)> = Vec::new();
     tokio::spawn(async move {
@@ -1401,8 +1408,24 @@ async fn main() {
                             }
                         }
                         if event.msg_type == "Validation" {
-                            xrpl_node::own_validated::next_to_sign(last_validated_seq, sign_on_witness()).map(|(seq, hash, basis)| {
-                                (seq, hash, if basis == xrpl_node::own_validated::Basis::Witness { "WITNESS" } else { "QUORUM" })
+                            use xrpl_node::own_validated::Basis;
+                            let picked = if sign_own() {
+                                // 5a's breaker: nothing of our own to sign for OWN_BREAK, so the quorum's hash for the
+                                // ledgers we cannot make, until ours signs again.
+                                let breaker = last_own_at.elapsed() > OWN_BREAK;
+                                if breaker != SIGN_BREAKER.swap(breaker, std::sync::atomic::Ordering::Relaxed) {
+                                    eprintln!("[validator] 5a breaker {}", if breaker {
+                                        "ON: nothing of our own signed for a while, signing the quorum's hash for ledgers we cannot make"
+                                    } else {
+                                        "off: signing our own hash again"
+                                    });
+                                }
+                                xrpl_node::own_validated::next_own_to_sign(last_validated_seq, sign_on_witness(), breaker)
+                            } else {
+                                xrpl_node::own_validated::next_to_sign(last_validated_seq, sign_on_witness())
+                            };
+                            picked.map(|(seq, hash, basis)| {
+                                (seq, hash, match basis { Basis::Own => "OWN", Basis::Witness => "WITNESS", Basis::Quorum => "QUORUM" })
                             })
                         } else {
                             None
@@ -1420,7 +1443,11 @@ async fn main() {
                                 SIGN_FIRST_PEER_DIFFERED.fetch_add(1, Ordering::Relaxed);
                                 eprintln!("[validator] #{seq}: the first peer to announce it named {}..., the {} named {}... (signing that)",
                                     hex::encode(&peer[..8]),
-                                    if named_by == "WITNESS" { ".39 and our own hash" } else { "trusted validators' quorum" },
+                                    match named_by {
+                                        "OWN" => "trusted validators' quorum and our own hash",
+                                        "WITNESS" => ".39 and our own hash",
+                                        _ => "trusted validators' quorum",
+                                    },
                                     hex::encode(&network_hash_bytes[..8]));
                             }
                         }
@@ -1626,6 +1653,15 @@ async fn main() {
                             if named_by == "WITNESS" {
                                 SIGN_WITNESSED.fetch_add(1, Ordering::Relaxed);
                             }
+                            // Our own hash of the ledger was checked (5a, or 184's witness), or it was not.
+                            let own = matches!(named_by, "OWN" | "WITNESS");
+                            if own {
+                                SIGN_OWN.fetch_add(1, Ordering::Relaxed);
+                                last_own_at = std::time::Instant::now();
+                            } else {
+                                SIGN_BORROWED.fetch_add(1, Ordering::Relaxed);
+                            }
+                            xrpl_node::independence_days::signed(seq, own);
                         }
                         } // gate-passed scope
                     }
@@ -1874,15 +1910,21 @@ async fn main() {
                     json["peer_fetch"] = xrpl_node::peer_fetch::json();
                     // Independence 4.5: "validated" from our own count of trusted validations.
                     json["own_validated"] = xrpl_node::own_validated::json();
-                    // Cycles 183-184: what the validator signs, and how often the first peer's hash was another.
+                    // Cycles 183-185: what the validator signs, and how often the first peer's hash was another.
                     json["signing"] = serde_json::json!({
                         "on_quorum": sign_on_quorum(),
                         "on_witness": sign_on_witness(),
+                        "own_only": sign_own(),
+                        "breaker": SIGN_BREAKER.load(std::sync::atomic::Ordering::Relaxed),
                         "signed": SIGNED.load(std::sync::atomic::Ordering::Relaxed),
+                        "own": SIGN_OWN.load(std::sync::atomic::Ordering::Relaxed),
+                        "borrowed": SIGN_BORROWED.load(std::sync::atomic::Ordering::Relaxed),
                         "witnessed": SIGN_WITNESSED.load(std::sync::atomic::Ordering::Relaxed),
                         "first_peer_differed": SIGN_FIRST_PEER_DIFFERED.load(std::sync::atomic::Ordering::Relaxed),
                         "no_quorum": SIGN_NO_QUORUM.load(std::sync::atomic::Ordering::Relaxed),
                     });
+                    // The Independence page's count: days signing our own hash, from peer data.
+                    json["independence"] = xrpl_node::independence_days::json();
                     // Independence 5.5: our own ledger hash, from the parts we made, trailing the network.
                     json["own_hash"] = xrpl_node::own_hash::json();
                     // Independence Step 9: the clock's offset from the time servers (XRPL_CLOCK_CHECK=1).
@@ -2250,9 +2292,25 @@ fn sign_on_witness() -> bool {
     })
 }
 
-/// Since the start (/api/engine "signing"): ledgers signed; of those, signed on .39's word and our own hash; ledgers
-/// the first peer announced with another hash than the one signed; ledgers passed over with nothing to sign them on.
+/// Independence 5a (cycle 185, `XRPL_SIGN_OWN=1`): sign a ledger only with our own hash of it (own_hash, every part
+/// ours), once the trusted validators' quorum names it too, or, short of quorum, .39 validated it. A ledger whose
+/// hash we cannot make, or make differently, is not signed. After [`OWN_BREAK`] with nothing of our own signed, a
+/// breaker signs the quorum's hash for those until ours signs again. Needs the quorum gate and XRPL_OWN_HASH=1.
+fn sign_own() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XRPL_SIGN_OWN").as_deref() == Ok("1") && sign_on_quorum() && xrpl_node::own_hash::enabled())
+}
+
+/// 5a's breaker: this long with nothing of our own signed (a restart's warm-up, about four minutes, stays under it).
+const OWN_BREAK: std::time::Duration = std::time::Duration::from_secs(900);
+static SIGN_BREAKER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Since the start (/api/engine "signing"): ledgers signed; of those, signed with our own hash of the ledger checked
+/// (5a, or the witness), without it, and on .39's word and our own hash; ledgers the first peer announced with another
+/// hash than the one signed; ledgers passed over with nothing to sign them on.
 static SIGNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SIGN_OWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SIGN_BORROWED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SIGN_WITNESSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SIGN_FIRST_PEER_DIFFERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SIGN_NO_QUORUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
