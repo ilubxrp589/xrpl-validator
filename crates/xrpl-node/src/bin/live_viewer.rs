@@ -1650,6 +1650,7 @@ async fn main() {
                             });
                             eprintln!("[validator] Signed validation for ledger #{seq} hash={hash_short}... (src={hash_source})");
                             SIGNED.fetch_add(1, Ordering::Relaxed);
+                            xrpl_node::own_validated::note_signed(seq);
                             if named_by == "WITNESS" {
                                 SIGN_WITNESSED.fetch_add(1, Ordering::Relaxed);
                             }

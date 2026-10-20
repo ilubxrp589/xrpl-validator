@@ -349,7 +349,7 @@ fn parse_addr(addr: &str) -> Result<(&str, u16), NodeError> {
 
 /// Encode a 33-byte public key as a base58check node public key.
 /// Uses prefix byte `0x1C` (28), producing strings starting with 'n'.
-fn encode_node_public_key(pubkey: &[u8]) -> String {
+pub(crate) fn encode_node_public_key(pubkey: &[u8]) -> String {
     use sha2::{Digest, Sha256};
 
     const XRPL_ALPHABET: &[u8; 58] =

@@ -22,7 +22,7 @@
 //! on (off by default); differences go to
 //! `XRPL_OWN_VALIDATED_LOG` (default /mnt/xrpl-data/own_validated.jsonl, capped at 20 MB).
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -70,6 +70,8 @@ pub struct Tally {
     /// Our own hash of each ledger ws-sync landed, made from every part we compute; None when a part was borrowed
     /// (independence 5a, [`Self::own_ledger`]).
     own: BTreeMap<u32, Option<[u8; 32]>>,
+    /// Ledgers the validator signed ([`Self::note_signed`]), so a short ledger's receipt says whether it was.
+    signed: BTreeSet<u32>,
 }
 
 /// Why the validator may sign a ledger ([`Tally::next_to_sign`]).
@@ -101,7 +103,9 @@ pub const CATCH_UP: u32 = 64;
 pub enum Verdict {
     Agree { lead_ms: i64 },
     Differ { ours: [u8; 32] },
-    Short { count: usize, quorum: usize },
+    /// `missing`: the trusted validators (master keys, less the negative UNL) whose full validation for .39's
+    /// hash never reached us.
+    Short { count: usize, quorum: usize, missing: Vec<Vec<u8>> },
 }
 
 impl Tally {
@@ -229,7 +233,13 @@ impl Tally {
             } else if let Some((other, _)) = s.and_then(|s| s.reached.iter().find(|(h, _)| **h != hash)) {
                 Some(Verdict::Differ { ours: *other })
             } else if newest >= seq + GIVE_UP {
-                Some(Verdict::Short { count: self.count(seq, &hash), quorum: self.quorum() })
+                let missing = self
+                    .masters
+                    .iter()
+                    .filter(|m| !self.negative.contains(*m) && s.and_then(|s| s.votes.get(*m)).map(|(h, _)| *h) != Some(hash))
+                    .cloned()
+                    .collect();
+                Some(Verdict::Short { count: self.count(seq, &hash), quorum: self.quorum(), missing })
             } else {
                 None
             };
@@ -301,6 +311,14 @@ impl Tally {
             _ => newest,
         };
         after.max(base.saturating_sub(GIVE_UP)) + 1
+    }
+
+    /// The validator signed ledger `seq`.
+    pub fn note_signed(&mut self, seq: u32) {
+        self.signed.insert(seq);
+        while self.signed.len() as u32 > KEEP {
+            self.signed.pop_first();
+        }
     }
 
     /// ws-sync landed ledger `seq`: our own hash of it, or None when a part of it was borrowed.
@@ -486,6 +504,14 @@ pub fn next_to_sign(after: u32, witness: bool) -> Option<(u32, [u8; 32], Basis)>
     tally().lock().unwrap_or_else(|p| p.into_inner()).next_to_sign(after, witness)
 }
 
+/// The validator signed ledger `seq` (a short ledger's receipt says whether it was).
+pub fn note_signed(seq: u32) {
+    if !enabled() {
+        return;
+    }
+    tally().lock().unwrap_or_else(|p| p.into_inner()).note_signed(seq);
+}
+
 /// ws-sync landed ledger `seq`: our own hash of it, made from every part we compute, or None when a part was
 /// borrowed (independence 5a, own_hash).
 pub fn own_ledger(seq: u32, ours: Option<[u8; 32]>) {
@@ -528,9 +554,10 @@ fn settle(judged: Vec<(u32, Verdict)>) {
         return;
     }
     let st = stats();
-    let (q, unl, neg) = {
+    let (q, unl, neg, signed) = {
         let t = tally().lock().unwrap_or_else(|p| p.into_inner());
-        (t.quorum(), t.unl_size(), t.negative_size())
+        let signed: HashSet<u32> = judged.iter().map(|(s, _)| *s).filter(|s| t.signed.contains(s)).collect();
+        (t.quorum(), t.unl_size(), t.negative_size(), signed)
     };
     for (seq, v) in judged {
         let n = st.judged.fetch_add(1, Ordering::Relaxed) + 1;
@@ -544,9 +571,13 @@ fn settle(judged: Vec<(u32, Verdict)>) {
                 st.differ.fetch_add(1, Ordering::Relaxed);
                 Some(json!({"seq": seq, "differ": hex::encode_upper(ours), "quorum": q, "unl": unl, "negative_unl": neg}))
             }
-            Verdict::Short { count, quorum } => {
+            Verdict::Short { count, quorum, missing } => {
                 st.short.fetch_add(1, Ordering::Relaxed);
-                Some(json!({"seq": seq, "short": count, "quorum": quorum, "unl": unl, "negative_unl": neg}))
+                // Which validators' validations did not reach us, and whether the ledger was signed anyway (cycle 184's
+                // witness, or 5a's): what a drill of a short run needs first.
+                let missing: Vec<String> = missing.iter().map(|m| crate::peer::handshake::encode_node_public_key(m)).collect();
+                Some(json!({"seq": seq, "short": count, "quorum": quorum, "unl": unl, "negative_unl": neg,
+                            "missing": missing, "signed": signed.contains(&seq)}))
             }
         };
         if let Some(l) = line {
@@ -715,7 +746,10 @@ mod tests {
         assert!(t.network_validated(60, theirs, 10).is_empty(), "nobody voted yet: wait");
         assert!(t.network_validated(60 + GIVE_UP - 1, theirs, 10).iter().all(|(s, _)| *s != 60));
         let late = t.network_validated(60 + GIVE_UP, theirs, 10);
-        assert!(late.contains(&(60, Verdict::Short { count: 0, quorum: 28 })), "{late:?}");
+        assert!(
+            late.iter().any(|(s, v)| *s == 60 && matches!(v, Verdict::Short { count: 0, quorum: 28, missing } if missing.len() == 35)),
+            "{late:?}"
+        );
     }
 
     #[test]
@@ -855,6 +889,26 @@ mod tests {
         quorum_on(&mut far, 1_000 + CATCH_UP + 1, [2; 32]);
         assert_eq!(far.next_to_sign(1_000, true), Some((1_000 + CATCH_UP + 1, [2; 32], Basis::Quorum)),
             "ws-sync more than CATCH_UP behind: no waiting");
+    }
+
+    /// Mainnet #107786161-196 (20 Oct): 25 to 27 of quorum 28 reached us for 36 ledgers; the receipt names who.
+    #[test]
+    fn a_short_ledger_names_the_trusted_validators_whose_validations_never_reached_us() {
+        let mut t = Tally::default();
+        t.set_unl(&unl(35));
+        let hash = [0x77; 32];
+        t.vote(&sk(1), 899, [0x11; 32], true, 0); // the tally listens from #899 on
+        for i in 1..=27 {
+            t.vote(&sk(i), 900, hash, true, 0);
+        }
+        t.vote(&sk(28), 900, [0x66; 32], true, 0); // another hash: still not ours
+        assert!(t.network_validated(900, hash, 0).is_empty(), "short so far: wait");
+        let judged = t.network_validated(900 + GIVE_UP, [0x88; 32], 0);
+        let (_, v) = judged.iter().find(|(s, _)| *s == 900).expect("judged");
+        let Verdict::Short { count, missing, .. } = v else { panic!("{v:?}") };
+        assert_eq!(*count, 27);
+        assert_eq!(missing.len(), 8, "28 on another hash, 29 to 35 silent");
+        assert!(missing.contains(&hex::decode(&unl(35)[27].0).unwrap()));
     }
 
     fn quorum_on(t: &mut Tally, seq: u32, hash: [u8; 32]) {
