@@ -16,7 +16,7 @@
 //! its kind). Stage A changes nothing live: [`compare`] holds the inputs made
 //! from the peers' copy against .39's, field by field, for every ledger peer_fetch completes.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use serde_json::{json, Value};
@@ -46,10 +46,13 @@ pub const ADDED_TO_META: &[&str] = &["delivered_amount", "nftoken_id", "nftoken_
 
 /// UInt64 fields rippled's JSON spells as hex without leading zeros, in lower case (`STUInt64::getJson`); the
 /// codec pads them to 16 upper-case digits. The four it spells in base 10 (`kSmdBaseTen`) are left as they are.
+static DEFS: LazyLock<Value> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("../../../../XRPL Rust SDK/tests/vectors/definitions.json")).unwrap_or_default()
+});
+
 static UINT64_HEX: LazyLock<HashSet<String>> = LazyLock::new(|| {
     const BASE_TEN: &[&str] = &["MaximumAmount", "OutstandingAmount", "MPTAmount", "LockedAmount"];
-    let defs: Value = serde_json::from_str(include_str!("../../../../XRPL Rust SDK/tests/vectors/definitions.json")).unwrap_or_default();
-    defs["FIELDS"]
+    DEFS["FIELDS"]
         .as_array()
         .map(|f| {
             f.iter()
@@ -62,8 +65,30 @@ static UINT64_HEX: LazyLock<HashSet<String>> = LazyLock::new(|| {
         .unwrap_or_default()
 });
 
-/// The codec's JSON respelled as rippled's: UInt64 hex short and in lower case, and each path step with its
-/// `type` (account 0x01, currency 0x10, issuer 0x20; `STPathSet::getJson`), which the bytes hold as flags.
+/// `PermissionValue` as rippled's JSON names it (`STUInt32::getJson` → `Permission::getPermissionName`): a
+/// transaction type's code plus one, or a granular permission (permissions.macro, 65537 on). The codec gives the
+/// number: mainnet #107804444 4A242D3BBE51 (DelegateSet), ours 28, .39's "NFTokenCreateOffer".
+static PERMISSION_NAMES: LazyLock<HashMap<u64, String>> = LazyLock::new(|| {
+    let mut m: HashMap<u64, String> = DEFS["TRANSACTION_TYPES"]
+        .as_object()
+        .map(|t| t.iter().filter_map(|(n, c)| c.as_u64().map(|c| (c + 1, n.clone()))).collect())
+        .unwrap_or_default();
+    for (i, n) in [
+        "TrustlineAuthorize", "TrustlineFreeze", "TrustlineUnfreeze", "AccountDomainSet", "AccountEmailHashSet",
+        "AccountMessageKeySet", "AccountTransferRateSet", "AccountTickSizeSet", "PaymentMint", "PaymentBurn",
+        "MPTokenIssuanceLock", "MPTokenIssuanceUnlock",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        m.insert(65_537 + i as u64, n.to_string());
+    }
+    m
+});
+
+/// The codec's JSON respelled as rippled's: UInt64 hex short and in lower case, each path step with its
+/// `type` (account 0x01, currency 0x10, issuer 0x20; `STPathSet::getJson`), which the bytes hold as flags, and
+/// `PermissionValue` by name.
 pub fn respell(v: &mut Value) {
     match v {
         Value::Object(o) => {
@@ -76,6 +101,10 @@ pub fn respell(v: &mut Value) {
                                 | (if e.contains_key("issuer") { 0x20 } else { 0 });
                             e.insert("type".into(), json!(t));
                         }
+                    }
+                } else if k == "PermissionValue" {
+                    if let Some(name) = x.as_u64().and_then(|n| PERMISSION_NAMES.get(&n)) {
+                        *x = json!(name);
                     }
                 } else if UINT64_HEX.contains(k.as_str()) {
                     if let Some(h) = x.as_str().filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit())) {
@@ -391,8 +420,12 @@ mod tests {
             "MaximumAmount": "100", "Sequence": 5,
             "Paths": [[{"currency": "USD", "issuer": "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe"}, {"account": "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe"}]],
             "AffectedNodes": [{"ModifiedNode": {"FinalFields": {"HighNode": "000000000000032F"}}}],
+            "Permissions": [{"Permission": {"PermissionValue": 28}}, {"Permission": {"PermissionValue": 65_537}},
+                            {"Permission": {"PermissionValue": 70_000}}],
         });
         respell(&mut v);
+        let names: Vec<&Value> = (0..3).map(|i| &v["Permissions"][i]["Permission"]["PermissionValue"]).collect();
+        assert_eq!(names, [&json!("NFTokenCreateOffer"), &json!("TrustlineAuthorize"), &json!(70_000)], "#107804444");
         assert_eq!(v["OwnerNode"], "e30");
         assert_eq!(v["IndexNext"], "0");
         assert_eq!(v["ExchangeRate"], "4f205adbf46f1800");
