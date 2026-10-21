@@ -276,8 +276,23 @@ fn try_remove_at(
         // unless keepRoot is not set and the directory is empty"
         // (ApplyView.h dirRemove doc; ApplyView.cpp:324 `if (keepRoot) return`).
         // With keep_root the page stays as a Modified empty directory.
-        if empty && num == 0 && !keep_root && page.get("IndexNext").map(page_num).unwrap_or(0) == 0
-        {
+        let (mut next, mut prev) = (link(&page, "IndexNext"), link(&page, "IndexPrevious"));
+        // "Older versions of the code would, in some cases, allow the last page to be empty. Remove such pages if
+        // we stumble on them" (ApplyView.cpp dirRemove, root branch): the root's links drop to 0, then that page goes.
+        let legacy = empty && num == 0 && next == prev && next != 0 && {
+            let last_key = page_key(root_key, next);
+            read_dir(sandbox, &last_key).is_some_and(|last| !has_entries(&last)) && {
+                set_link(&mut page, "IndexNext", 0);
+                set_link(&mut page, "IndexPrevious", 0);
+                sandbox.delete(last_key);
+                (next, prev) = (0, 0);
+                true
+            }
+        };
+        if empty && num == 0 && !keep_root && next == 0 && prev == 0 {
+            if legacy {
+                sandbox.write(cur_key, serde_json::to_vec(&page).unwrap_or_default());
+            }
             sandbox.delete(*root_key); // only page, now empty → delete directory
         } else {
             sandbox.write(cur_key, serde_json::to_vec(&page).unwrap_or_default());
@@ -328,7 +343,39 @@ fn try_remove_at(
             sandbox.write(*root_key, serde_json::to_vec(&root).unwrap_or_default());
         }
     }
+    // rippled then checks "whether the next page is the last page and, if so, whether it's empty. If it is, delete
+    // it" (ApplyView.cpp dirRemove): an empty last page older code left behind. The previous page becomes the last,
+    // the root points back to it, and a root left with no links or entries goes too unless it is kept. Mainnet
+    // #107794217 A9E17FDC53F0 (OfferCancel): page 5 of root 083659DD emptied, page 7 (2D605925) was empty and last;
+    // we unlinked page 5 only and left the root's links at 7/7.
+    let mut next = next;
+    if next != 0 {
+        let nk = page_key(root_key, next);
+        if read_dir(sandbox, &nk).is_some_and(|np| link(&np, "IndexNext") == 0 && !has_entries(&np)) {
+            sandbox.delete(nk);
+            if let Some(mut pp) = read_dir(sandbox, &prev_key) {
+                set_link(&mut pp, "IndexNext", 0);
+                sandbox.write(prev_key, serde_json::to_vec(&pp).unwrap_or_default());
+            }
+            if let Some(mut root) = read_dir(sandbox, root_key) {
+                set_link(&mut root, "IndexPrevious", prev);
+                sandbox.write(*root_key, serde_json::to_vec(&root).unwrap_or_default());
+            }
+            next = 0;
+        }
+    }
+    if !keep_root && next == 0 && prev == 0 && read_dir(sandbox, &prev_key).is_some_and(|p| !has_entries(&p)) {
+        sandbox.delete(prev_key);
+    }
     true
+}
+
+fn link(page: &serde_json::Value, field: &str) -> u64 {
+    page.get(field).map(page_num).unwrap_or(0)
+}
+
+fn has_entries(page: &serde_json::Value) -> bool {
+    page.get("Indexes").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty())
 }
 
 /// Remove `object_key` from the directory rooted at `root_key` (owner dir OR
@@ -394,13 +441,10 @@ pub fn owner_dir_remove(
 /// rippled does: no root, entries on the root or the last page. A root still linked to other pages stays.
 pub fn empty_dir_delete(sandbox: &mut Sandbox, root_key: &Hash256) -> bool {
     let Some(mut root) = read_dir(sandbox, root_key) else { return false };
-    let has_entries =
-        |p: &serde_json::Value| p.get("Indexes").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty());
     if has_entries(&root) {
         return false;
     }
-    let mut prev = root.get("IndexPrevious").map(page_num).unwrap_or(0);
-    let mut next = root.get("IndexNext").map(page_num).unwrap_or(0);
+    let (mut next, mut prev) = (link(&root, "IndexNext"), link(&root, "IndexPrevious"));
     if next == prev && next != 0 {
         let last_key = page_key(root_key, next);
         let Some(last) = read_dir(sandbox, &last_key) else { return false };
@@ -500,5 +544,68 @@ mod tests {
             Some(0),
             "root should remain, emptied"
         );
+    }
+
+    /// A directory page written straight into `sb` (a pre-existing ledger page).
+    fn put_page(sb: &mut Sandbox, root: &Hash256, num: u64, entries: &[Hash256], next: Option<u64>, prev: Option<u64>) -> Hash256 {
+        let mut p = serde_json::json!({
+            "LedgerEntryType": "DirectoryNode", "Flags": 0, "RootIndex": hex::encode_upper(root.0),
+            "Indexes": entries.iter().map(|k| hex::encode_upper(k.0)).collect::<Vec<_>>(),
+        });
+        if let Some(n) = next {
+            p["IndexNext"] = serde_json::json!(format!("{n:x}"));
+        }
+        if let Some(n) = prev {
+            p["IndexPrevious"] = serde_json::json!(format!("{n:x}"));
+        }
+        let key = page_key(root, num);
+        sb.write(key, serde_json::to_vec(&p).unwrap());
+        key
+    }
+
+    /// Mainnet #107794217 A9E17FDC53F0 (OfferCancel): root 083659DD links 5/7, the offer alone on page 5, page 7 empty
+    /// and last. rippled's dirRemove unlinks page 5, then finds page 7 empty and last: erased too, root links 0/0.
+    #[test]
+    fn removing_a_middle_page_takes_an_empty_last_page_after_it() {
+        let state = empty_state();
+        let owner = [0x22u8; 20];
+        let root = keylet::owner_dir_key(&owner);
+        let (other, offer) = (Hash256([0x01; 32]), Hash256([0x02; 32]));
+        let mut sb = Sandbox::new(&state);
+        put_page(&mut sb, &root, 0, &[other], Some(5), Some(7));
+        let p5 = put_page(&mut sb, &root, 5, &[offer], Some(7), Some(0));
+        let p7 = put_page(&mut sb, &root, 7, &[], None, Some(5));
+        owner_dir_remove(&mut sb, &owner, &offer, Some(5), false);
+        assert!(!sb.exists(&p5) && !sb.exists(&p7), "page 5 and the empty last page 7 both go");
+        let r: serde_json::Value = serde_json::from_slice(&sb.read(&root).expect("root keeps its entry")).unwrap();
+        assert_eq!((link(&r, "IndexNext"), link(&r, "IndexPrevious")), (0, 0));
+        assert_eq!(r["Indexes"].as_array().unwrap().len(), 1);
+    }
+
+    /// The root branch of the same rule: the root's last entry leaves, its links name one empty page (6/6).
+    #[test]
+    fn emptying_the_root_takes_an_empty_last_page_and_then_the_root_unless_kept() {
+        let state = empty_state();
+        let owner = [0x33u8; 20];
+        let root = keylet::owner_dir_key(&owner);
+        let offer = Hash256([0x03; 32]);
+        for keep in [false, true] {
+            let mut sb = Sandbox::new(&state);
+            put_page(&mut sb, &root, 0, &[offer], Some(6), Some(6));
+            let p6 = put_page(&mut sb, &root, 6, &[], None, Some(0));
+            owner_dir_remove(&mut sb, &owner, &offer, Some(0), keep);
+            assert!(!sb.exists(&p6), "keep_root {keep}: the empty last page goes");
+            assert_eq!(sb.exists(&root), keep);
+            if keep {
+                let r: serde_json::Value = serde_json::from_slice(&sb.read(&root).unwrap()).unwrap();
+                assert_eq!((link(&r, "IndexNext"), link(&r, "IndexPrevious")), (0, 0));
+            }
+        }
+        // A last page that still holds an entry stays, and so does the root.
+        let mut sb = Sandbox::new(&state);
+        put_page(&mut sb, &root, 0, &[offer], Some(6), Some(6));
+        let p6 = put_page(&mut sb, &root, 6, &[Hash256([0x04; 32])], None, Some(0));
+        owner_dir_remove(&mut sb, &owner, &offer, Some(0), false);
+        assert!(sb.exists(&p6) && sb.exists(&root));
     }
 }
