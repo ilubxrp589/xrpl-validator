@@ -79,8 +79,17 @@ pub fn record(
 /// Ledger `seq` is applied: judge our records against the network's `(tx_blob, meta)` pairs and our tree
 /// against the header's root. Returns our tree's root when every record was built (independence 5.5 hashes it).
 pub fn check_ledger(seq: u32, network: &[(Vec<u8>, Vec<u8>)], header_root: &[u8; 32]) -> Option<[u8; 32]> {
-    let (s, ours) = RECORDS.lock().unwrap_or_else(|e| e.into_inner()).take()?;
-    if s != seq || network.is_empty() {
+    let taken = RECORDS.lock().unwrap_or_else(|e| e.into_inner()).take();
+    // A ledger that filed no transaction has the empty tree, whose root rippled's SHAMap hashes as zero, and no
+    // record of ours to hold against the network's: that root is ours as much as any. Before this, an empty ledger
+    // had no tree of ours, own_hash borrowed its transactions, and under 5a it went unsigned (mainnet
+    // #107806253-258, six empty ledgers as the network resumed after the 21 Oct stall). Only when the header says
+    // empty: no pairs under a non-zero root means the ledger's transactions did not reach us.
+    if network.is_empty() {
+        return (*header_root == [0; 32]).then_some([0; 32]);
+    }
+    let (s, ours) = taken?;
+    if s != seq {
         return None;
     }
     let st = stats();
@@ -195,5 +204,13 @@ mod tests {
         assert_eq!(stats().ledgers.load(Ordering::Relaxed), 0, "no gate pairs (lag, gate off): not judged");
         check_ledger(8, &[(vec![1], vec![2])], &[0; 32]); // no records begun for #8
         assert_eq!(stats().ledgers.load(Ordering::Relaxed), 0);
+    }
+
+    /// Mainnet #107806253-258 (21 Oct): six empty ledgers as the network resumed after a stall. Their tree is the
+    /// empty one, root zero, and ours; under a non-zero root, no pairs mean the transactions did not reach us.
+    #[test]
+    fn an_empty_ledgers_tree_is_the_empty_root_and_ours() {
+        assert_eq!(check_ledger(9, &[], &[0; 32]), Some([0; 32]));
+        assert_eq!(check_ledger(9, &[], &[7; 32]), None);
     }
 }

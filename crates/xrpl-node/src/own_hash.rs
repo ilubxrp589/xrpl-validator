@@ -137,7 +137,8 @@ impl Tracker {
         };
         let tx = match parts.tx_root {
             Some(r) => {
-                if parts.order_ours != Some(true) {
+                // An empty set has no order to borrow: the native order judges no ledger it has nothing to apply in.
+                if parts.order_ours != Some(true) && r != [0; 32] {
                     borrowed.push("order");
                 }
                 r
@@ -397,6 +398,24 @@ mod tests {
         assert_eq!(j2.ours, n2.ledger_hash, "our parent, total, resolution and parent close time: mainnet's hash");
         assert!(j2.borrowed.is_empty(), "{:?}", j2.borrowed);
         assert_eq!((j2.network, j2.validators, t.streak), (true, Some(true), 1));
+    }
+
+    /// An empty ledger (mainnet #107806253-258, 21 Oct) files no transaction, so the native order judges nothing:
+    /// its empty tree borrows no order, and the ledger is ours as any other.
+    #[test]
+    fn an_empty_ledger_borrows_no_order() {
+        let [(s1, n1, a1), (s2, mut n2, a2)] = mainnet();
+        let mut t = Tracker::default();
+        t.judge(s1, &n1, &a1, &ours(&n1, a1, 0), None);
+        n2.transaction_hash = [0; 32];
+        n2.ledger_hash = compute_ledger_hash(s2, n2.total_drops, &n2.parent_hash, &[0; 32], &a2, n2.parent_close_time, n2.close_time, n2.close_resolution, n2.close_flags).0;
+        let empty = Parts { order_ours: None, ..ours(&n2, a2, 1_074) }; // the mainnet pair's burn keeps the total chained
+        let j = t.judge(s2, &n2, &a2, &empty, None);
+        assert!(j.borrowed.is_empty() && j.network, "{:?} {:?}", j.borrowed, j.differs_in);
+        let mut full = n2.clone();
+        full.transaction_hash = [5; 32];
+        let j = Tracker::default().judge(s2, &full, &a2, &Parts { order_ours: None, ..ours(&full, a2, 0) }, None);
+        assert!(j.borrowed.contains(&"order"), "a set with transactions still needs our order");
     }
 
     #[test]
