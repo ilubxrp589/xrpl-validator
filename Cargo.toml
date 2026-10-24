@@ -7,7 +7,8 @@ members = [
 ]
 
 [workspace.dependencies]
-# Core types, codec, and crypto from the XRPL Rust SDK
+# Core types, codec, and crypto from the XRPL Rust SDK. Its secp256k1 signing must be on k256 0.14
+# (crypto-bigint 0.7.6+, RUSTSEC-2026-0387): the checkout this path points at has to carry that port.
 xrpl-core = { path = "../XRPL Rust SDK/crates/xrpl-core" }
 
 # Serialization
