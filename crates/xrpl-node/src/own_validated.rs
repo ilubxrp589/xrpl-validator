@@ -13,7 +13,8 @@
 //! its verdict against .39's for every ledger ws-sync takes:
 //! - **agree**: we reached quorum on the same hash, and how long before (or after) .39 said so;
 //! - **differ**: we reached quorum on another hash for that sequence (a healthy network never does);
-//! - **short**: we never reached quorum for that hash, judged once the ledger is [`GIVE_UP`] ledgers old.
+//! - **short**: we never reached quorum for that hash, judged once the ledger is [`GIVE_UP`] ledgers old;
+//! - **late**: not judged, .39's word came after the tally had let the ledger's votes go ([`Verdict::Late`]).
 //!
 //! The validator signs on it: on the quorum's hash (cycle 183, `XRPL_SIGN_ON_QUORUM`), or, when the quorum falls
 //! short here, on the hash .39 called validated and our own engine computed too (cycle 184, `XRPL_SIGN_ON_WITNESS`,
@@ -34,6 +35,12 @@ use serde_json::{json, Value};
 pub const GIVE_UP: u32 = 8;
 /// Sequences of votes kept.
 const KEEP: u32 = 256;
+/// Sequences whose agreed set is kept once their votes are let go: as far back as .39 keeps ledgers (its
+/// `[ledger_history]` is 6000), so a ledger ws-sync lands long after it closed still gets the validators' set.
+/// Mainnet #107886516 and #107886898 (25 Oct): .39's xrpld was out for about an hour, ws-sync landed them late,
+/// their votes were gone, so Step 3 salted with the ledgers' own roots (not the validators' sets) and the order
+/// differed at position 0; 30 trusted validations (quorum 28) had named each set.
+pub const AGREED_KEEP: u32 = 6000;
 
 /// `XRPL_OWN_VALIDATED=1`, read once.
 pub fn enabled() -> bool {
@@ -72,6 +79,8 @@ pub struct Tally {
     own: BTreeMap<u32, Option<[u8; 32]>>,
     /// Ledgers the validator signed ([`Self::note_signed`]), so a short ledger's receipt says whether it was.
     signed: BTreeSet<u32>,
+    /// The agreed set of each sequence whose votes were let go, [`AGREED_KEEP`] back ([`Self::agreed_set`]).
+    agreed: BTreeMap<u32, [u8; 32]>,
 }
 
 /// Why the validator may sign a ledger ([`Tally::next_to_sign`]).
@@ -106,6 +115,9 @@ pub enum Verdict {
     /// `missing`: the trusted validators (master keys, less the negative UNL) whose full validation for .39's
     /// hash never reached us.
     Short { count: usize, quorum: usize, missing: Vec<Vec<u8>> },
+    /// Not judged: the tally had let the ledger's votes go before .39's word on it came (ws-sync landed it long
+    /// after it closed, as in a catch-up). Before cycle 189 these were judged short with a count of 0.
+    Late,
 }
 
 impl Tally {
@@ -175,10 +187,22 @@ impl Tally {
                 s.reached.insert(hash, now_ms);
             }
         }
-        while self.seqs.len() as u32 > KEEP {
-            self.seqs.pop_first();
-        }
+        self.let_go();
         self.judge_pending(None)
+    }
+
+    /// Lets the oldest votes go past [`KEEP`] sequences, keeping each one's agreed set.
+    fn let_go(&mut self) {
+        while self.seqs.len() as u32 > KEEP {
+            let Some(&old) = self.seqs.keys().next() else { break };
+            if let Some(set) = self.agreed_set(old) {
+                self.agreed.insert(old, set);
+            }
+            self.seqs.remove(&old);
+        }
+        while self.agreed.len() as u32 > AGREED_KEEP {
+            self.agreed.pop_first();
+        }
     }
 
     /// The transaction set a full, trusted validation for `seq` says its validator accepted (`sfConsensusHash`).
@@ -195,10 +219,10 @@ impl Tally {
     /// not a full quorum: two sets can never both have that many, and when a few validations reach us late the ones
     /// that do still name the one set (mainnet #107700728: only 27 of quorum 28 reached us on #107700727-734, so the
     /// order fell back to the ledger's own root, and #107700728's set held a transaction the ledger never filed).
-    /// None until then.
+    /// None until then. Kept [`AGREED_KEEP`] sequences back, past the votes themselves.
     pub fn agreed_set(&self, seq: u32) -> Option<[u8; 32]> {
         let effective = self.masters.len() - self.negative_size();
-        let s = self.seqs.get(&seq)?;
+        let Some(s) = self.seqs.get(&seq) else { return self.agreed.get(&seq).copied() };
         let mut counts: HashMap<[u8; 32], usize> = HashMap::new();
         for (m, set) in &s.sets {
             if !self.negative.contains(m) {
@@ -223,6 +247,7 @@ impl Tally {
 
     fn judge_pending(&mut self, newest: Option<u32>) -> Vec<(u32, Verdict)> {
         let newest = newest.or_else(|| self.pending.keys().next_back().copied()).unwrap_or(0);
+        let oldest = self.seqs.keys().next().copied();
         let mut out = Vec::new();
         let seqs: Vec<u32> = self.pending.keys().copied().collect();
         for seq in seqs {
@@ -232,6 +257,8 @@ impl Tally {
                 Some(Verdict::Agree { lead_ms: net_ms as i64 - *at as i64 })
             } else if let Some((other, _)) = s.and_then(|s| s.reached.iter().find(|(h, _)| **h != hash)) {
                 Some(Verdict::Differ { ours: *other })
+            } else if s.is_none() && oldest.is_some_and(|o| seq < o) {
+                Some(Verdict::Late) // its votes were let go: a count now would read 0
             } else if newest >= seq + GIVE_UP {
                 let missing = self
                     .masters
@@ -263,6 +290,12 @@ impl Tally {
         let newest = *self.seqs.keys().next_back()?;
         let from = after.max(newest.saturating_sub(GIVE_UP)) + 1;
         self.seqs.range(from..).find_map(|(seq, s)| (s.reached.len() == 1).then(|| s.reached.keys().next().map(|h| (*seq, *h))).flatten())
+    }
+
+    /// Of the ledgers in `seqs`, how many the trusted validations reaching us reached quorum on. A ledger whose votes
+    /// were let go counts as not.
+    pub fn reached_in(&self, seqs: std::ops::Range<u32>) -> u64 {
+        self.seqs.range(seqs).filter(|(_, s)| !s.reached.is_empty()).count() as u64
     }
 
     /// .39 called ledger `seq` validated with `hash`, and our own engine computed that same hash.
@@ -413,6 +446,8 @@ pub struct OwnStats {
     pub agree: AtomicU64,
     pub differ: AtomicU64,
     pub short: AtomicU64,
+    /// Ledgers .39 validated after the tally had let their votes go ([`Verdict::Late`]): not judged.
+    pub late: AtomicU64,
     pub last_seq: AtomicU64,
 }
 
@@ -540,6 +575,15 @@ pub fn agreed_set(seq: u32) -> Option<[u8; 32]> {
     tally().lock().unwrap_or_else(|p| p.into_inner()).agreed_set(seq)
 }
 
+/// Of ledgers `from..to`, how many the trusted validations reaching us reached quorum on (0 also when off). The
+/// validator passed those over for want of a hash of its own to sign, not for want of a quorum.
+pub fn reached_in(from: u32, to: u32) -> u64 {
+    if !enabled() || to <= from {
+        return 0;
+    }
+    tally().lock().unwrap_or_else(|p| p.into_inner()).reached_in(from..to)
+}
+
 /// .39 called ledger `seq` validated (ws-sync, as it takes the ledger).
 pub fn network_validated(seq: u32, hash: [u8; 32]) {
     if !enabled() || hash == [0; 32] {
@@ -560,6 +604,10 @@ fn settle(judged: Vec<(u32, Verdict)>) {
         (t.quorum(), t.unl_size(), t.negative_size(), signed)
     };
     for (seq, v) in judged {
+        if v == Verdict::Late {
+            st.late.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         let n = st.judged.fetch_add(1, Ordering::Relaxed) + 1;
         st.last_seq.fetch_max(u64::from(seq), Ordering::Relaxed);
         let line = match v {
@@ -571,6 +619,7 @@ fn settle(judged: Vec<(u32, Verdict)>) {
                 st.differ.fetch_add(1, Ordering::Relaxed);
                 Some(json!({"seq": seq, "differ": hex::encode_upper(ours), "quorum": q, "unl": unl, "negative_unl": neg}))
             }
+            Verdict::Late => None, // counted above, not judged
             Verdict::Short { count, quorum, missing } => {
                 st.short.fetch_add(1, Ordering::Relaxed);
                 // Which validators' validations did not reach us, and whether the ledger was signed anyway (cycle 184's
@@ -604,8 +653,8 @@ pub fn summary() -> String {
     let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
     let t = tally().lock().unwrap_or_else(|p| p.into_inner());
     format!(
-        "judged {} agree {} differ {} short {} | lead median {} ms | quorum {} of {} (negative UNL {}) | validations {} untrusted {} partial {}",
-        l(&st.judged), l(&st.agree), l(&st.differ), l(&st.short),
+        "judged {} agree {} differ {} short {} late {} | lead median {} ms | quorum {} of {} (negative UNL {}) | validations {} untrusted {} partial {}",
+        l(&st.judged), l(&st.agree), l(&st.differ), l(&st.short), l(&st.late),
         t.median_lead().map_or("-".into(), |m| m.to_string()), t.quorum(), t.unl_size(), t.negative_size(),
         l(&st.validations), l(&st.untrusted), l(&st.partial)
     )
@@ -621,7 +670,7 @@ pub fn json() -> Value {
         "differ": l(&st.differ), "short": l(&st.short), "lead_ms_median": t.median_lead(),
         "quorum": t.quorum(), "unl": t.unl_size(), "negative_unl": t.negative_size(),
         "validations": l(&st.validations), "untrusted": l(&st.untrusted), "partial": l(&st.partial),
-        "unjudged": l(&st.unjudged),
+        "unjudged": l(&st.unjudged), "late": l(&st.late),
     })
 }
 
@@ -697,6 +746,42 @@ mod tests {
             t.note_set(&sk(i), 100, set);
         }
         assert_eq!(t.agreed_set(100), Some(set), "and a full quorum names it too");
+    }
+
+    /// Mainnet #107886516 and #107886898 (25 Oct): ws-sync landed them an hour late, after a .39 outage, and their
+    /// votes were gone, so Step 3 salted with the ledgers' own roots. The agreed set outlives the votes, and a ledger
+    /// .39 calls validated after its votes went is not judged short with a count of 0.
+    #[test]
+    fn a_ledger_landed_after_its_votes_were_let_go_keeps_its_agreed_set_and_is_not_judged() {
+        let mut t = Tally::default();
+        t.set_unl(&unl(35));
+        let (ledger, set) = ([7u8; 32], [0xA5u8; 32]);
+        t.vote(&sk(1), 99, [9; 32], true, 0); // listening since #99
+        for i in 1..=30 {
+            t.vote(&sk(i), 100, ledger, true, 0);
+            t.note_set(&sk(i), 100, set);
+        }
+        assert_eq!(t.reached_in(100..101), 1);
+        for seq in 101..=100 + KEEP {
+            t.vote(&sk(1), seq, [1; 32], true, 0);
+        }
+        assert!(!t.seqs.contains_key(&100), "its votes were let go");
+        assert_eq!(t.agreed_set(100), Some(set), "its agreed set was not");
+        assert_eq!(t.reached_in(100..101), 0, "a ledger whose votes went counts as not reached");
+        assert_eq!(t.network_validated(100, ledger, 0), vec![(100, Verdict::Late)], "not short with a count of 0");
+        assert!(t.pending.is_empty());
+
+        let newest = 100 + KEEP;
+        assert!(t.network_validated(newest - 5, [3; 32], 0).is_empty(), "one inside the window still waits");
+        let judged = t.network_validated(newest + GIVE_UP, [3; 32], 0);
+        assert!(judged.iter().any(|(s, v)| *s == newest - 5 && matches!(v, Verdict::Short { count: 0, .. })), "{judged:?}");
+
+        for seq in 0..AGREED_KEEP + 10 {
+            t.agreed.insert(1_000_000 + seq, set);
+        }
+        t.let_go();
+        assert_eq!(t.agreed.len() as u32, AGREED_KEEP, "kept {AGREED_KEEP} back");
+        assert_eq!(t.agreed_set(100), None, "the oldest went first");
     }
 
     #[test]

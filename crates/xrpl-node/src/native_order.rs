@@ -166,6 +166,8 @@ pub struct Walked {
     pub failed: Vec<String>,
     pub left: Vec<String>,
     pub attempts: u64,
+    /// The order was salted with the validators' agreed set; false: with the root of the ledger's own transactions.
+    pub salt_agreed: bool,
 }
 
 /// One ledger's comparison with the network's.
@@ -263,6 +265,7 @@ pub fn judge(seq: u32, mode: Mode, v: &Verdict, walked: &Walked, bytes: Option<(
         let mut line = json!({
             "seq": seq, "mode": mode.name(), "order": v.order, "results": v.results.iter().take(5).collect::<Vec<_>>(),
             "results_n": v.results.len(), "passes": v.per_pass, "attempts": walked.attempts, "ms": ms,
+            "salt": if walked.salt_agreed { "agreed" } else { "own" },
         });
         if let Some(c) = &v.coins {
             line["coins"] = json!(c);

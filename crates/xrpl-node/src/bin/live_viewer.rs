@@ -1437,7 +1437,12 @@ async fn main() {
                         use std::sync::atomic::Ordering;
                         if sign_on_quorum() {
                             if last_validated_seq > 0 && seq > last_validated_seq + 1 {
-                                SIGN_NO_QUORUM.fetch_add(u64::from(seq - last_validated_seq - 1), Ordering::Relaxed);
+                                // Passed over: those the quorum here named went unsigned for want of a hash of our
+                                // own (5a, until the breaker), the rest for want of a quorum.
+                                let passed = u64::from(seq - last_validated_seq - 1);
+                                let named = xrpl_node::own_validated::reached_in(last_validated_seq + 1, seq).min(passed);
+                                SIGN_NO_OWN.fetch_add(named, Ordering::Relaxed);
+                                SIGN_NO_QUORUM.fetch_add(passed - named, Ordering::Relaxed);
                             }
                             if let Some(peer) = first_peer.get(&seq).filter(|p| **p != network_hash_bytes) {
                                 SIGN_FIRST_PEER_DIFFERED.fetch_add(1, Ordering::Relaxed);
@@ -1923,6 +1928,7 @@ async fn main() {
                         "witnessed": SIGN_WITNESSED.load(std::sync::atomic::Ordering::Relaxed),
                         "first_peer_differed": SIGN_FIRST_PEER_DIFFERED.load(std::sync::atomic::Ordering::Relaxed),
                         "no_quorum": SIGN_NO_QUORUM.load(std::sync::atomic::Ordering::Relaxed),
+                        "no_own": SIGN_NO_OWN.load(std::sync::atomic::Ordering::Relaxed),
                     });
                     // The Independence page's count: days signing our own hash, from peer data.
                     json["independence"] = xrpl_node::independence_days::json();
@@ -2308,13 +2314,16 @@ static SIGN_BREAKER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 
 /// Since the start (/api/engine "signing"): ledgers signed; of those, signed with our own hash of the ledger checked
 /// (5a, or the witness), without it, and on .39's word and our own hash; ledgers the first peer announced with another
-/// hash than the one signed; ledgers passed over with nothing to sign them on.
+/// hash than the one signed; ledgers passed over with nothing to sign them on: short of quorum here, or (since cycle
+/// 189, counted apart) named by the quorum but with no hash of our own to sign (#107886399-620, 25 Oct: .39's xrpld
+/// was down, so ws-sync landed nothing for the 15 minutes before the breaker, though 30 of quorum 28 named each).
 static SIGNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SIGN_OWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SIGN_BORROWED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SIGN_WITNESSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SIGN_FIRST_PEER_DIFFERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SIGN_NO_QUORUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SIGN_NO_OWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Regular peer sessions opened since the start, and the pings they answered (/api/peers).
 static PEER_HANDSHAKES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

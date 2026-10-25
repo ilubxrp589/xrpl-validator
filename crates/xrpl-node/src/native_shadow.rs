@@ -1029,7 +1029,8 @@ impl NativeShadow {
         let mut walked = None;
         if ours {
             use xrpl_ledger::ledger::close::{apply_in_passes, ApplyOutcome};
-            let set = crate::native_order::canonical_set(ordered, &cx.attribution.skip, crate::own_validated::agreed_set(cx.seq));
+            let agreed = crate::own_validated::agreed_set(cx.seq);
+            let set = crate::native_order::canonical_set(ordered, &cx.attribution.skip, agreed);
             let mut codes: HashMap<String, String> = HashMap::new();
             let mut attempts = 0u64;
             let passes = apply_in_passes(set, |e, certain_retry| {
@@ -1064,6 +1065,7 @@ impl NativeShadow {
                 failed: passes.failed.iter().map(id).collect(),
                 left: passes.left.iter().map(id).collect(),
                 attempts,
+                salt_agreed: agreed.is_some(),
             });
         } else {
             for tx in ordered {
@@ -2731,6 +2733,7 @@ mod tests {
         assert_eq!(got[0]["results"][0], json!("ABABABABABAB not applied by us, network=tefPAST_SEQ"));
         assert_eq!(got[0]["bytes"]["differ"], json!(0), "the copy changes nothing either way");
         assert_eq!(got[0]["passes"], json!([1, 0, 0]));
+        assert_eq!(got[0]["salt"], json!("own"), "no validators' set for this ledger: the receipt says so");
     }
 
     #[test]
