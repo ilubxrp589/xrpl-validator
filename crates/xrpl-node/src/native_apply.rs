@@ -202,6 +202,7 @@ fn batch_changes(
         keys.sort_unstable_by_key(|h| h.0);
         keys.dedup();
         let mut own: HashMap<Hash256, SandboxEntry> = HashMap::new();
+        let mut unchanged = HashSet::new();
         let mut deleted_final = v.deleted_final.clone();
         for k in keys {
             match (eff(&v.before, &k), eff(&v.after, &k)) {
@@ -217,16 +218,36 @@ fn batch_changes(
                 (Some(b), Some(a)) if !semantically_equal(&b, &a) => {
                     own.insert(k, SandboxEntry::Modified(restamp(&k, &b, a)));
                 }
+                // Written back as the inner found it (a Payment's destination, rippled's `view().update(sleDst)`):
+                // no change, but rippled's inner table holds it as modified, so a threadOwners stamp before it gives
+                // it FinalFields (`tx_meta::affected_node`). Mainnet #107920533 67F550DD42ED and #107920565
+                // 60700BDAEF38: Batch inners redeem to the issuer and delete the line; the issuer's root had no
+                // FinalFields in our record. A write of the same bytes over an earlier inner's entry leaves no trace
+                // in the snapshots and is still missed.
+                (Some(_), Some(_)) if rewrote(&v.before, &v.after, &k) => {
+                    unchanged.insert(k);
+                }
                 _ => {}
             }
         }
         let mut st = own.clone();
         stamp_threading(&mut st, &before_of, id, ledger_seq);
-        let changes = node_changes_over(&before_of, &st, &SandboxChanges { mods: own, deleted_final, ..Default::default() });
+        let changes = node_changes_over(&before_of, &st, &SandboxChanges { mods: own, deleted_final, unchanged });
         lay(&mut overlay, &st);
         inners.push(InnerChanges { id: id.clone(), result: result.clone(), changes, delivered: v.delivered.clone() });
     }
     (outer, inners)
+}
+
+/// Whether an inner wrote `k`: its sandbox entry after the inner holds other bytes than before it (or is new).
+fn rewrote(before: &HashMap<Hash256, SandboxEntry>, after: &HashMap<Hash256, SandboxEntry>, k: &Hash256) -> bool {
+    fn bytes(e: Option<&SandboxEntry>) -> Option<&Vec<u8>> {
+        match e {
+            Some(SandboxEntry::Created(b)) | Some(SandboxEntry::Modified(b)) => Some(b),
+            _ => None,
+        }
+    }
+    after.contains_key(k) && bytes(before.get(k)) != bytes(after.get(k))
 }
 
 thread_local! {
@@ -775,6 +796,82 @@ pub fn fold_batch_mutset(nodes: &[(String, u8)]) -> HashSet<(String, u8)> {
         out.insert((key.to_string(), kind));
     }
     out
+}
+
+#[cfg(test)]
+mod batch_meta_tests {
+    use super::*;
+    use xrpl_ledger::ledger::header::LedgerHeader;
+    use xrpl_ledger::tx::batch::{BatchViews, InnerView};
+
+    const HOLDER: [u8; 20] = [0x22; 20];
+    const ISSUER: [u8; 20] = [0x11; 20];
+
+    fn root(account: [u8; 20], owners: u32, prev: u8) -> Value {
+        json!({"LedgerEntryType": "AccountRoot", "Account": hex::encode_upper(account), "Balance": "50000000", "Flags": 0,
+               "OwnerCount": owners, "Sequence": 7, "PreviousTxnID": format!("{prev:02X}").repeat(32), "PreviousTxnLgrSeq": 100})
+    }
+
+    /// The issuer's root in the metadata of a Batch inner that redeems to the issuer and deletes the line (stored
+    /// at `line_key`), as mainnet #107920533 67F550DD42ED does; `written_back`: the Payment wrote the destination
+    /// back unchanged.
+    fn issuer_node(line_key: Hash256, written_back: bool) -> Value {
+        let (issuer_key, holder_key) = (keylet::account_root_key(&ISSUER), keylet::account_root_key(&HOLDER));
+        let usd = |issuer: [u8; 20]| json!({"currency": "USD", "issuer": hex::encode_upper(issuer), "value": "0"});
+        let line = json!({"LedgerEntryType": "RippleState", "Balance": usd([0; 20]), "Flags": 0x0022_0000,
+                          "LowLimit": usd(ISSUER), "HighLimit": usd(HOLDER), "LowNode": "0", "HighNode": "0",
+                          "PreviousTxnID": "33".repeat(32), "PreviousTxnLgrSeq": 99});
+        let mut state = LedgerState::new_unverified(LedgerHeader {
+            sequence: 199,
+            total_coins: 0,
+            parent_hash: Hash256([0; 32]),
+            transaction_hash: Hash256([0; 32]),
+            account_hash: Hash256([0; 32]),
+            parent_close_time: 0,
+            close_time: 0,
+            close_time_resolution: 10,
+            close_flags: 0,
+        });
+        for (k, v) in [(issuer_key, root(ISSUER, 0, 0x44)), (holder_key, root(HOLDER, 1, 0x55)), (line_key, line.clone())] {
+            state.state_map.insert(k, v.to_string().into_bytes()).expect("insert");
+        }
+        let mut after = HashMap::from([
+            (line_key, SandboxEntry::Deleted),
+            (holder_key, SandboxEntry::Modified(root(HOLDER, 0, 0x55).to_string().into_bytes())),
+        ]);
+        if written_back {
+            after.insert(issuer_key, SandboxEntry::Modified(root(ISSUER, 0, 0x44).to_string().into_bytes()));
+        }
+        let inner = InnerView {
+            after,
+            deleted_final: HashMap::from([(line_key, line.to_string().into_bytes())]),
+            ..InnerView::default()
+        };
+        let views = BatchViews { outer: HashMap::new(), inners: vec![inner] };
+        let (_, inners) = batch_changes(&state, &"AA".repeat(32), 200, &views, &["BB".repeat(32)], &["tesSUCCESS".to_string()]);
+        let nodes = xrpl_ledger::ledger::tx_meta::affected_nodes(&inners[0].changes);
+        let at = hex::encode_upper(issuer_key.0);
+        nodes.into_iter().find(|n| n["ModifiedNode"]["LedgerIndex"] == json!(at)).expect("the line's deletion threads the issuer")
+            ["ModifiedNode"]
+            .clone()
+    }
+
+    /// Step 2 receipts #107920533 67F550DD42ED and #107920565 60700BDAEF38: the inner's record left out the
+    /// issuer's FinalFields. As for a lone Payment (de5fd94), the write-back gives them only when the deleted line
+    /// sorts before the root.
+    #[test]
+    fn a_batch_inners_unchanged_destination_gets_final_fields_when_a_deleted_line_threads_it_first() {
+        let first = issuer_node(Hash256([0x00; 32]), true);
+        assert_eq!(first["FinalFields"]["Account"], json!(hex::encode_upper(ISSUER)), "{first}");
+        assert_eq!(first["PreviousTxnID"], json!("44".repeat(32)), "{first}");
+        assert!(first.get("PreviousFields").is_none(), "{first}");
+        // 0xFF…FF is the sandbox's AUX_KEY, never a ledger object: the latest key a line can take here is 0xFE…FE.
+        assert!(keylet::account_root_key(&ISSUER).0 < [0xFE; 32]);
+        let line_after = issuer_node(Hash256([0xFE; 32]), true);
+        assert!(line_after.get("FinalFields").is_none(), "the line sorts after the root: threading only: {line_after}");
+        let not_written = issuer_node(Hash256([0x00; 32]), false);
+        assert!(not_written.get("FinalFields").is_none(), "not written back: threading only: {not_written}");
+    }
 }
 
 #[cfg(test)]
