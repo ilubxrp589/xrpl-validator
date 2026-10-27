@@ -963,7 +963,7 @@ pub async fn start_ws_sync(
 }
 
 /// Count AccountRoot creates minus deletes in one tx's metadata.
-fn count_wallet_delta(body: &serde_json::Value) -> i64 {
+pub(crate) fn count_wallet_delta(body: &serde_json::Value) -> i64 {
     let meta = if body["meta"].is_object() { &body["meta"] }
         else if body["metaData"].is_object() { &body["metaData"] }
         else { return 0; };
@@ -985,7 +985,7 @@ fn count_wallet_delta(body: &serde_json::Value) -> i64 {
     delta
 }
 
-fn extract_affected_nodes(body: &serde_json::Value, modified: &mut HashSet<String>, deleted: &mut HashSet<String>) {
+pub(crate) fn extract_affected_nodes(body: &serde_json::Value, modified: &mut HashSet<String>, deleted: &mut HashSet<String>) {
     let meta = if body["meta"].is_object() { &body["meta"] }
         else if body["metaData"].is_object() { &body["metaData"] }
         else { return; };

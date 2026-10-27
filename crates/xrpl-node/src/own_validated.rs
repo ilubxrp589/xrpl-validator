@@ -293,6 +293,14 @@ impl Tally {
             .find_map(|(seq, s)| (s.reached.len() == 1).then(|| s.reached.keys().next().map(|h| (*seq, *h))).flatten())
     }
 
+    /// The lowest ledger at or after `from` that reached quorum here on one hash, with that hash, among the votes
+    /// still held. Step 4's peer source walks back from it by parent hash to a ledger that has no quorum here.
+    pub fn first_quorum_from(&self, from: u32) -> Option<(u32, [u8; 32])> {
+        self.seqs
+            .range(from..)
+            .find_map(|(seq, s)| (s.reached.len() == 1).then(|| s.reached.keys().next().map(|h| (*seq, *h))).flatten())
+    }
+
     /// The oldest ledger after `after` that reached quorum here on one hash, with that hash. Only the last
     /// [`GIVE_UP`] sequences heard count: a ledger older than that is not signed late.
     pub fn next_quorum_after(&self, after: u32) -> Option<(u32, [u8; 32])> {
@@ -548,6 +556,15 @@ pub fn newest_quorum() -> Option<(u32, [u8; 32])> {
     tally().lock().unwrap_or_else(|p| p.into_inner()).newest_quorum()
 }
 
+/// The lowest ledger at or after `from` the trusted validators reached quorum on, among the votes still held, and its
+/// hash (None also when off).
+pub fn first_quorum_from(from: u32) -> Option<(u32, [u8; 32])> {
+    if !enabled() {
+        return None;
+    }
+    tally().lock().unwrap_or_else(|p| p.into_inner()).first_quorum_from(from)
+}
+
 /// The oldest recent ledger after `after` that the trusted validators reached quorum on, and its hash (None also
 /// when off). With `XRPL_SIGN_ON_QUORUM` the validator signs that hash, not the first one a peer announces.
 pub fn next_quorum_after(after: u32) -> Option<(u32, [u8; 32])> {
@@ -754,6 +771,9 @@ mod tests {
         assert_eq!(t.newest_quorum(), Some((10, h10)), "3 of quorum 4 is not yet");
         t.vote(&sk(4), 11, h11, true, 0);
         assert_eq!(t.newest_quorum(), Some((11, h11)));
+        assert_eq!(t.first_quorum_from(5), Some((10, h10)));
+        assert_eq!(t.first_quorum_from(11), Some((11, h11)));
+        assert_eq!(t.first_quorum_from(12), None);
     }
 
     #[tokio::test]
