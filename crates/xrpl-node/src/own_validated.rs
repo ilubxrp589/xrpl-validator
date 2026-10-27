@@ -25,7 +25,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::Write as _;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Value};
@@ -284,6 +284,15 @@ impl Tally {
         out
     }
 
+    /// The newest ledger that reached quorum here on one hash, with that hash. Step 4's peer source takes ledgers up
+    /// to it.
+    pub fn newest_quorum(&self) -> Option<(u32, [u8; 32])> {
+        self.seqs
+            .iter()
+            .rev()
+            .find_map(|(seq, s)| (s.reached.len() == 1).then(|| s.reached.keys().next().map(|h| (*seq, *h))).flatten())
+    }
+
     /// The oldest ledger after `after` that reached quorum here on one hash, with that hash. Only the last
     /// [`GIVE_UP`] sequences heard count: a ledger older than that is not signed late.
     pub fn next_quorum_after(&self, after: u32) -> Option<(u32, [u8; 32])> {
@@ -430,6 +439,23 @@ impl Tally {
 
 // ---- the live tally, counters, receipts, /api/engine and /metrics ---------------------------------------------
 
+/// Woken when a newer ledger reaches quorum ([`newest_quorum`] rose): Step 4's peer source waits on it. One waiter
+/// (the source's trigger), so a wake while it is busy is kept for its next wait.
+pub fn quorum_moved() -> &'static tokio::sync::Notify {
+    static N: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    N.get_or_init(tokio::sync::Notify::new)
+}
+
+/// The newest quorum ledger after a vote: wakes [`quorum_moved`] when it is newer than any before.
+fn moved(newest: Option<u32>) {
+    static LAST: AtomicU32 = AtomicU32::new(0);
+    if let Some(seq) = newest {
+        if LAST.fetch_max(seq, Ordering::Relaxed) < seq {
+            quorum_moved().notify_one();
+        }
+    }
+}
+
 fn tally() -> &'static Mutex<Tally> {
     static T: OnceLock<Mutex<Tally>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(Tally::default()))
@@ -490,14 +516,15 @@ pub fn on_validation(blob: &[u8]) {
     }
     let now = now_ms();
     let Some(v) = crate::consensus_record::parse_validation(blob, now) else { return };
-    let judged = {
+    let (judged, newest) = {
         let mut t = tally().lock().unwrap_or_else(|p| p.into_inner());
         let judged = t.vote(&v.signing_key, v.ledger_seq, v.ledger_hash, v.full, now);
         if let (true, Some(set)) = (v.full, v.consensus_hash) {
             t.note_set(&v.signing_key, v.ledger_seq, set);
         }
-        judged
+        (judged, t.newest_quorum().map(|(seq, _)| seq))
     };
+    moved(newest);
     settle(judged);
 }
 
@@ -511,6 +538,14 @@ pub fn quorum_hash(seq: u32) -> Option<[u8; 32]> {
     let s = t.seqs.get(&seq)?;
     // Two hashes at quorum for one sequence (never on a healthy network): no single answer.
     (s.reached.len() == 1).then(|| s.reached.keys().next().copied()).flatten()
+}
+
+/// The newest ledger the trusted validators reached quorum on, and its hash (None also when off).
+pub fn newest_quorum() -> Option<(u32, [u8; 32])> {
+    if !enabled() {
+        return None;
+    }
+    tally().lock().unwrap_or_else(|p| p.into_inner()).newest_quorum()
 }
 
 /// The oldest recent ledger after `after` that the trusted validators reached quorum on, and its hash (None also
@@ -701,6 +736,38 @@ mod tests {
 
     fn sk(i: u8) -> Vec<u8> {
         vec![100 + i; 33]
+    }
+
+    #[test]
+    fn newest_quorum_follows_the_highest_reached_seq() {
+        let mut t = Tally::default();
+        t.set_unl(&unl(4));
+        let (h10, h11) = ([10u8; 32], [11u8; 32]);
+        assert_eq!(t.newest_quorum(), None);
+        for i in 1..=4 {
+            t.vote(&sk(i), 10, h10, true, 0);
+        }
+        assert_eq!(t.newest_quorum(), Some((10, h10)));
+        for i in 1..=3 {
+            t.vote(&sk(i), 11, h11, true, 0);
+        }
+        assert_eq!(t.newest_quorum(), Some((10, h10)), "3 of quorum 4 is not yet");
+        t.vote(&sk(4), 11, h11, true, 0);
+        assert_eq!(t.newest_quorum(), Some((11, h11)));
+    }
+
+    #[tokio::test]
+    async fn the_notify_fires_when_a_newer_seq_reaches_quorum() {
+        let wait = || tokio::time::timeout(std::time::Duration::from_millis(100), quorum_moved().notified());
+        moved(Some(900_000_010));
+        assert!(wait().await.is_ok(), "a newer quorum ledger wakes the waiter");
+        moved(Some(900_000_010));
+        moved(Some(900_000_009));
+        assert!(wait().await.is_err(), "the same or an older one does not");
+        moved(None);
+        assert!(wait().await.is_err());
+        moved(Some(900_000_011));
+        assert!(wait().await.is_ok());
     }
 
     #[test]
