@@ -30,6 +30,8 @@ export MALLOC_CONF=background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0
 export _RJEM_MALLOC_CONF=background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0
 export XRPL_SIG_ENFORCE=1 XRPL_UNL_PINNED_KEY="$PIN" XRPL_UNL_ENFORCE=1 XRPL_UNL_REFRESH=1
 export XRPL_PEER_FETCH=1 XRPL_OWN_VALIDATED=1 XRPL_OWN_HASH=1 XRPL_SIGN_OWN=1
+# The 30-day count's setting: what we cannot make goes unsigned, never signed with the quorum's hash.
+export XRPL_OWN_BREAK=${TWIN_OWN_BREAK:-off}
 export XRPL_PEER_PONG=1 XRPL_NODE_IDENTITY=1 XRPL_PEER_PRIVATE=1 XRPL_CLOCK_CHECK=1 XRPL_CLOCK_GATE=1 XRPL_VOTE_PENDING_ONLY=1
 
 CAP=${TWIN_MEMORY_MAX:-52G}

@@ -327,7 +327,10 @@ async fn main() {
         eprintln!("[validator] short of quorum here, signs nothing (XRPL_SIGN_ON_WITNESS=0, or XRPL_OWN_HASH is off)");
     }
     if sign_own() {
-        eprintln!("[validator] independence 5a: signs a ledger only with our own hash of it (XRPL_SIGN_OWN=1); breaker after {} s with nothing of ours signed", OWN_BREAK.as_secs());
+        match own_break() {
+            Some(b) => eprintln!("[validator] independence 5a: signs a ledger only with our own hash of it (XRPL_SIGN_OWN=1); breaker after {} s with nothing of ours signed", b.as_secs()),
+            None => eprintln!("[validator] independence 5a: signs a ledger only with our own hash of it (XRPL_SIGN_OWN=1); breaker OFF (XRPL_OWN_BREAK=off): what we cannot make goes unsigned"),
+        }
     } else if std::env::var("XRPL_SIGN_OWN").as_deref() == Ok("1") {
         eprintln!("[validator] XRPL_SIGN_OWN=1 needs the quorum gate and XRPL_OWN_HASH=1: independence 5a is off");
     }
@@ -1460,7 +1463,7 @@ async fn main() {
                             let picked = if sign_own() {
                                 // 5a's breaker: nothing of our own to sign for OWN_BREAK, so the quorum's hash for the
                                 // ledgers we cannot make, until ours signs again.
-                                let breaker = last_own_at.elapsed() > OWN_BREAK;
+                                let breaker = own_break().is_some_and(|b| last_own_at.elapsed() > b);
                                 if breaker != SIGN_BREAKER.swap(breaker, std::sync::atomic::Ordering::Relaxed) {
                                     eprintln!("[validator] 5a breaker {}", if breaker {
                                         "ON: nothing of our own signed for a while, signing the quorum's hash for ledgers we cannot make"
@@ -2371,6 +2374,18 @@ fn sign_own() -> bool {
 
 /// 5a's breaker: this long with nothing of our own signed (a restart's warm-up, about four minutes, stays under it).
 const OWN_BREAK: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// `XRPL_OWN_BREAK`: the breaker's wait in seconds (default [`OWN_BREAK`]), or `off` — never sign the quorum's hash
+/// for want of our own. The 30-day count wants it off: a ledger left unsigned costs only coverage (a day may miss 2%),
+/// a borrowed signature costs the whole day.
+fn own_break() -> Option<std::time::Duration> {
+    static B: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *B.get_or_init(|| match std::env::var("XRPL_OWN_BREAK").ok().map(|v| v.trim().to_ascii_lowercase()) {
+        Some(v) if v == "off" || v == "0" => None,
+        Some(v) => Some(v.parse().map(std::time::Duration::from_secs).unwrap_or(OWN_BREAK)),
+        None => Some(OWN_BREAK),
+    })
+}
 static SIGN_BREAKER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Since the start (/api/engine "signing"): ledgers signed; of those, signed with our own hash of the ledger checked
