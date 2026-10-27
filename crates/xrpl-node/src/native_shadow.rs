@@ -1877,6 +1877,39 @@ impl NativeShadow {
         Some(Proposal { overlay, refusal })
     }
 
+    /// Independence Step 4 (peer source): the system objects our apply of `seq` changed, as canonical bytes (None:
+    /// deleted). These are the skip list, the 256-ledger hash list, the negative UNL, and the amendments and fees a
+    /// pseudo-transaction changed. With .39 as the source ws-sync writes these from the network's bytes; from peers
+    /// it writes ours, and the state hash still checks them. Empty when no proposal for `seq` is held.
+    pub fn singleton_writes(&self, seq: u32) -> LedgerOverlay {
+        let mut out = LedgerOverlay::new();
+        let Some(held) = self.held.as_ref().filter(|h| h.seq == seq) else { return out };
+        let ws: HashSet<[u8; 32]> = crate::stage3::singleton_keys_for(seq)
+            .iter()
+            .filter_map(|h| hex::decode(h).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()))
+            .collect();
+        for (k, pre) in &held.undo {
+            if !(is_singleton_key(k, seq) || ws.contains(&k.0)) {
+                continue;
+            }
+            let post = self.state.state_map.lookup(k);
+            match (pre.as_deref(), post) {
+                (None, None) => {}
+                (Some(_), None) => {
+                    out.insert(k.0, None);
+                }
+                (pre, Some(jb)) => {
+                    if let Ok(b) = encode_entry(jb) {
+                        if pre.and_then(|p| encode_entry(p).ok()).as_ref() != Some(&b) {
+                            out.insert(k.0, Some(b));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Our writes for the ledger, and the reason we cannot vouch for them, if
     /// any: a result that disagrees with the metadata, an entry that will not
     /// encode, or a key set that is not the metadata's exactly (a created or
@@ -2323,6 +2356,34 @@ mod tests {
 
     fn reencoded(sh: &NativeShadow, k: &[u8; 32]) -> Option<Vec<u8>> {
         sh.state.state_map.lookup(&Hash256(*k)).map(|jb| encode_entry(jb).unwrap())
+    }
+
+    #[test]
+    fn singleton_writes_cover_every_changed_system_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, trigger) = (dir.path().join("receipts.jsonl"), dir.path().join("native_shadow.canary"));
+        let (seq, parent, pct, drops, tx, state, overlay) = payment_ledger();
+        let (keys, deleted) = meta_of(&overlay);
+        let mut sh = shadow(state.clone(), seq - 1, &log, &trigger);
+        assert!(sh.singleton_writes(seq).is_empty(), "nothing held yet");
+        sh.propose(seq, &parent, pct, drops, &[tx], &keys, &deleted, None).unwrap();
+        let w = sh.singleton_writes(seq);
+        let skip = keylet::skip_list_key();
+        assert_eq!(w.get(&skip.0), Some(&reencoded(&sh, &skip.0)), "the skip list, as the mirror holds it");
+        assert!(reencoded(&sh, &skip.0).is_some());
+        let amendments: [u8; 32] = hex::decode(crate::stage3::STATIC_SINGLETON_KEYS[2]).unwrap().try_into().unwrap();
+        assert!(!w.contains_key(&amendments), "an unchanged system object is left out");
+        assert!(w.keys().all(|k| !overlay.contains_key(k)), "only system objects");
+        assert!(sh.singleton_writes(seq + 1).is_empty(), "only for the ledger held");
+
+        // An empty ledger right after a multiple of 256 also writes the 256-ledger hash list.
+        let flag_next = 107_937_281;
+        let mut sh = shadow(state, flag_next - 1, &log, &trigger);
+        sh.propose(flag_next, &parent, pct, drops, &[], &HashSet::new(), &HashSet::new(), None).unwrap();
+        let w = sh.singleton_writes(flag_next);
+        let every = crate::native_apply::skip_every_key(flag_next - 1);
+        assert!(w.contains_key(&skip.0) && w.contains_key(&every.0), "{:?}", w.keys().map(hex::encode_upper).collect::<Vec<_>>());
+        assert_eq!(w.get(&every.0), Some(&reencoded(&sh, &every.0)));
     }
 
     #[test]
