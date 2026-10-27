@@ -43,6 +43,8 @@ use crate::ffi_engine::{
 pub struct FfiVerifier {
     stats: SharedFfiStats,
     rpc_urls: Vec<String>,
+    /// Independence Step 4: with peers as the ledger source, the amendments come from our own state, not RPC.
+    state_db: Option<Arc<rocksdb::DB>>,
     /// Active mainnet amendments. Behind a lock so the flag-ledger refresh
     /// (reaudit F6/va-07) can swap in a new set mid-run without blocking readers.
     amendments: Arc<parking_lot::RwLock<Vec<[u8; 32]>>>,
@@ -69,6 +71,18 @@ impl FfiVerifier {
             count = amendments.len(),
             "ffi_verifier: loaded active mainnet amendments"
         );
+        Self::with_amendments(rpc_urls, amendments, None)
+    }
+
+    /// Independence Step 4 (`XRPL_LEDGER_SOURCE=peers`): the active amendments from our own state.rocks, now and at
+    /// each flag ledger. No RPC.
+    pub fn from_state(rpc_urls: Vec<String>, db: Arc<rocksdb::DB>) -> Self {
+        let amendments = crate::ffi_engine::amendments_from_state(&db);
+        tracing::info!(count = amendments.len(), "ffi_verifier: loaded active amendments from our own state");
+        Self::with_amendments(rpc_urls, amendments, Some(db))
+    }
+
+    fn with_amendments(rpc_urls: Vec<String>, amendments: Vec<[u8; 32]>, state_db: Option<Arc<rocksdb::DB>>) -> Self {
         let silent_path = std::env::var("XRPL_FFI_SILENT_DIVERGENCE_LOG")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::path::PathBuf::from("logs/silent_divergences.jsonl"));
@@ -78,6 +92,7 @@ impl FfiVerifier {
         Self {
             stats: new_stats(),
             rpc_urls,
+            state_db,
             amendments: Arc::new(parking_lot::RwLock::new(amendments)),
             refresh_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             divergence_log: Arc::new(DivergenceLog::new()),
@@ -106,8 +121,12 @@ impl FfiVerifier {
         let amendments = Arc::clone(&self.amendments);
         let in_flight = Arc::clone(&self.refresh_in_flight);
         let rpc_url = self.rpc_urls[0].clone();
+        let state_db = self.state_db.clone();
         std::thread::spawn(move || {
-            let fetched = fetch_mainnet_amendments(&rpc_url);
+            let fetched = match state_db {
+                Some(db) => crate::ffi_engine::amendments_from_state(&db),
+                None => fetch_mainnet_amendments(&rpc_url),
+            };
             if !fetched.is_empty() {
                 let delta = {
                     let current = amendments.read();

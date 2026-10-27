@@ -437,8 +437,15 @@ pub async fn start_ws_sync(
                     #[cfg(feature = "ffi")]
                     let skip_shadow_for_catchup =
                         closed_seq.saturating_sub(process_seq) > ffi_catchup_budget;
+                    // From peers the FFI leg runs only on the snapshot of our own state: its other path reads every
+                    // object over RPC.
                     #[cfg(feature = "ffi")]
-                    if meta_ok && !skip_shadow_for_catchup {
+                    let ffi_from_snapshot = {
+                        let synced = last_synced.load(Ordering::Acquire);
+                        synced > 0 && process_seq.saturating_sub(synced) <= 2
+                    };
+                    #[cfg(feature = "ffi")]
+                    if meta_ok && !skip_shadow_for_catchup && (!peers || ffi_from_snapshot) {
                         if let Some(ref verifier) = ffi_verifier {
                             // A: tx_blobs was started in parallel with metadata
                             // (when lag<=25 and ffi_verifier present). Just await
@@ -1012,6 +1019,7 @@ pub async fn start_ws_sync(
                     last_processed = process_seq;
                     if peers {
                         crate::ledger_source::stats().from_peers.fetch_add(1, Ordering::Relaxed);
+                        crate::ledger_source::LAST_TOTAL_DROPS.store(ledger_header.total_drops, Ordering::Relaxed);
                     }
                     // SECURITY(5.3): Use Release ordering so Acquire loads see this
                     last_synced.store(process_seq, Ordering::Release);

@@ -64,6 +64,10 @@ pub fn stats() -> &'static SourceStats {
     STATS.get_or_init(SourceStats::default)
 }
 
+/// The total XRP (drops) of the newest ledger landed from peers: from its proven header, so the engine's network
+/// total needs no .39 poll. 0 before the first.
+pub static LAST_TOTAL_DROPS: AtomicU64 = AtomicU64::new(0);
+
 /// The `ledger_source` section of /api/engine.
 pub fn json() -> Value {
     let s = stats();

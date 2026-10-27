@@ -732,8 +732,18 @@ async fn main() {
             .or_else(|_| std::env::var("XRPL_RPC_URL"))
             .unwrap_or_else(|_| "http://127.0.0.1:5005".to_string())
             .split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-        eprintln!("[ffi] initializing FfiVerifier with {} RPC endpoint(s)", rpc_urls.len());
-        Arc::new(xrpl_node::ffi_verifier::FfiVerifier::new(rpc_urls))
+        // Independence Step 4: from peers the amendments come from our own state, not RPC.
+        let state_db = if xrpl_node::ledger_source::peers() { live_engine.lock().as_ref().map(|e| e.db_arc()) } else { None };
+        match state_db {
+            Some(db) => {
+                eprintln!("[ffi] initializing FfiVerifier: peer source, amendments from our own state");
+                Arc::new(xrpl_node::ffi_verifier::FfiVerifier::from_state(rpc_urls, db))
+            }
+            None => {
+                eprintln!("[ffi] initializing FfiVerifier with {} RPC endpoint(s)", rpc_urls.len());
+                Arc::new(xrpl_node::ffi_verifier::FfiVerifier::new(rpc_urls))
+            }
+        }
     };
     #[cfg(not(feature = "ffi"))]
     let ffi_verifier: Option<Arc<()>> = None;
@@ -754,6 +764,12 @@ async fn main() {
             let sync_done = std::path::Path::new(&marker_path).exists();
 
             let warm_requested = std::env::var("XRPL_WARM_RESUME").map(|v| v == "1").unwrap_or(false);
+            // Independence Step 4: from peers there is no .39 to download a state from or to backfill with. A start
+            // that is not a warm resume needs a state from peers first (scripts/peer_cold_start.sh).
+            if xrpl_node::ledger_source::peers() && !warm_requested {
+                eprintln!("[startup] peer source: no state to resume (XRPL_WARM_RESUME unset) — run scripts/peer_cold_start.sh, then start warm");
+                std::process::exit(xrpl_node::resume::FALLBACK_EXIT_CODE);
+            }
             if warm_requested {
                 // Warm restart (docs/superpowers/specs/2026-09-24-warm-restart-design.md). Step 0: the
                 // peer-driven legacy incremental syncer stays off for good, as in the bulk branch — it
@@ -768,9 +784,17 @@ async fn main() {
                 #[cfg(not(feature = "ffi"))]
                 let warm_ffi: Option<Arc<()>> = None;
                 tokio::spawn(async move {
-                    let net = xrpl_node::resume::RpcNetwork::new();
                     let ticket_path = xrpl_node::paths::resume_ticket_path();
-                    match xrpl_node::resume::run_warm_resume(&net, &warm_db, &warm_hash, clean, std::path::Path::new(&ticket_path)).await {
+                    let ticket_path = std::path::Path::new(&ticket_path);
+                    // From peers, the validated ledger and its account hash come from our own quorum and the peers.
+                    let resumed = if xrpl_node::ledger_source::peers() {
+                        let net = xrpl_node::resume::PeerNetwork { wait: Duration::from_secs(120) };
+                        xrpl_node::resume::run_warm_resume(&net, &warm_db, &warm_hash, clean, ticket_path).await
+                    } else {
+                        let net = xrpl_node::resume::RpcNetwork::new();
+                        xrpl_node::resume::run_warm_resume(&net, &warm_db, &warm_hash, clean, ticket_path).await
+                    };
+                    match resumed {
                         Ok(v) => {
                             let _ = std::fs::write(xrpl_node::paths::sync_complete_marker_path(), v.entries.to_string());
                             eprintln!(
@@ -973,7 +997,22 @@ async fn main() {
     // (using local node — no rate limits, faster feedback on hash matching)
     let coins_engine = engine_state.clone();
     let hash_computer = state_hash_computer.clone();
-    tokio::spawn(async move {
+    // Independence Step 4: from peers, the total is the newest landed ledger's own (its proven header).
+    if xrpl_node::ledger_source::peers() {
+        let coins_engine = coins_engine.clone();
+        tokio::spawn(async move {
+            loop {
+                let coins = xrpl_node::ledger_source::LAST_TOTAL_DROPS.load(std::sync::atomic::Ordering::Relaxed);
+                if coins > 0 {
+                    let mut state = coins_engine.lock();
+                    state.network_total_coins = coins;
+                    state.lifetime_burned = ORIGINAL_SUPPLY_DROPS.saturating_sub(coins);
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+    }
+    if !xrpl_node::ledger_source::peers() { tokio::spawn(async move {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -1005,7 +1044,7 @@ async fn main() {
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
-    });
+    }); }
 
     // Persist engine stats to disk every 60s
     let persist_engine = engine_state.clone();

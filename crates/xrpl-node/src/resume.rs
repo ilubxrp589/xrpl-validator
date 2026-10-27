@@ -129,6 +129,51 @@ impl Network for RpcNetwork {
     }
 }
 
+/// Independence Step 4 (`XRPL_LEDGER_SOURCE=peers`): the network as our own tally of trusted validations and the
+/// peers see it, with no .39. The validated ledger is the newest one that reached quorum here (waiting up to `wait`
+/// for the list, the peers and their validations to come in after a start), and a ledger's account hash comes from
+/// its header, fetched from peers by the hash the quorum (or the parent chain from a quorum ledger) names.
+pub struct PeerNetwork {
+    pub wait: Duration,
+}
+
+impl Network for PeerNetwork {
+    async fn validated_seq(&self) -> Option<u32> {
+        wait_for_quorum(self.wait, crate::own_validated::newest_quorum).await
+    }
+
+    async fn account_hash(&self, seq: u32) -> Option<String> {
+        let hash = match crate::peer_ledgers::hash_for(seq).await {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("[resume] peer source: no hash for #{seq}: {e}");
+                return None;
+            }
+        };
+        match crate::peer_fetch::fetch_header(hash).await {
+            Ok(h) => Some(hex::encode_upper(h.account_hash.0)),
+            Err(e) => {
+                eprintln!("[resume] peer source: the header of #{seq}: {e}");
+                None
+            }
+        }
+    }
+}
+
+/// The newest quorum ledger once there is one, looking every half second for up to `wait`; None after that.
+pub(crate) async fn wait_for_quorum(wait: Duration, newest: impl Fn() -> Option<(u32, [u8; 32])>) -> Option<u32> {
+    let t0 = tokio::time::Instant::now();
+    loop {
+        if let Some((seq, _)) = newest() {
+            return Some(seq);
+        }
+        if t0.elapsed() >= wait {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 /// What a successful check verified.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Verified {
@@ -209,6 +254,21 @@ mod tests {
 
     fn ticket(seq: u32, hash: &str) -> ResumeTicket {
         ResumeTicket { seq, account_hash: hash.to_string(), written_at_unix: 1_758_700_000 }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn peer_network_gives_the_newest_quorum_seq() {
+        assert_eq!(wait_for_quorum(Duration::from_secs(120), || Some((107_900_000, [1; 32]))).await, Some(107_900_000));
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let later = || (calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 4).then_some((7, [2; 32]));
+        assert_eq!(wait_for_quorum(Duration::from_secs(120), later).await, Some(7), "it waits for the first quorum");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn peer_network_without_a_quorum_gives_none_after_the_wait() {
+        let t0 = tokio::time::Instant::now();
+        assert_eq!(wait_for_quorum(Duration::from_secs(120), || None).await, None);
+        assert!(t0.elapsed() >= Duration::from_secs(120) && t0.elapsed() < Duration::from_secs(122));
     }
 
     #[test]

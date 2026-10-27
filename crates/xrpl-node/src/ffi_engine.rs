@@ -52,6 +52,22 @@ impl<'a> SleProvider for RocksDbProvider<'a> {
 ///
 /// Retries up to 10 times with exponential backoff to handle rippled overload
 /// at startup — a ledger with 0 amendments would cause massive divergence.
+/// The enabled amendments in our own state (the Amendments object in state.rocks), for the FFI leg when peers are
+/// the ledger source. Empty when the object is absent or will not decode.
+pub fn amendments_from_state(db: &rocksdb::DB) -> Vec<[u8; 32]> {
+    let key = hex::decode("7DB0788C020F02780A673DC74757F23823FA3014C1866E72CC4CD8B226CD6EF4").unwrap_or_default();
+    let Some(bytes) = db.get(&key).ok().flatten() else { return Vec::new() };
+    let Ok(v) = xrpl_core::codec::decode::decode_transaction_binary(&bytes) else { return Vec::new() };
+    v["Amendments"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|h| h.as_str().and_then(|s| hex::decode(s).ok()).and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn fetch_mainnet_amendments(rpc_url: &str) -> Vec<[u8; 32]> {
     fetch_mainnet_amendments_at(rpc_url, "validated")
 }
@@ -2284,12 +2300,16 @@ pub fn apply_ledger_in_order_with_net(
     // drained (memory: project_validator_wssync_lag_2026_09_01). Eight
     // keeps the detector sampling; raise XRPL_STATE_ROCKS_CONSULT_BUDGET
     // for a catch-up investigation where the store may have gaps.
-    let ledger_rpc_budget = std::sync::atomic::AtomicU32::new(
+    // From peers (independence Step 4) there is no RPC to consult: a miss is read as absent, which every
+    // consult so far has confirmed.
+    let ledger_rpc_budget = std::sync::atomic::AtomicU32::new(if crate::ledger_source::peers() {
+        0
+    } else {
         std::env::var("XRPL_STATE_ROCKS_CONSULT_BUDGET")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(8),
-    );
+            .unwrap_or(8)
+    });
     // Batch (BatchV1_1): rippled records each inner transaction as its own
     // ledger entry — own hash, own meta with ParentBatchID, the indices right
     // after the outer — and applies them INSIDE the outer's application. The
@@ -3008,6 +3028,20 @@ pub fn apply_live_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn amendments_from_state_reads_the_enabled_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = rocksdb::DB::open_default(dir.path()).unwrap();
+        assert!(amendments_from_state(&db).is_empty(), "no object, no amendments");
+        let ids = ["AA".repeat(32), "BB".repeat(32), "0C".repeat(32)];
+        let sle = serde_json::json!({"LedgerEntryType": "Amendments", "Flags": 0, "Amendments": ids});
+        let bytes = crate::meta_check::encode(&sle).unwrap();
+        db.put(hex::decode("7DB0788C020F02780A673DC74757F23823FA3014C1866E72CC4CD8B226CD6EF4").unwrap(), bytes).unwrap();
+        let got = amendments_from_state(&db);
+        let want: Vec<[u8; 32]> = ids.iter().map(|h| hex::decode(h).unwrap().try_into().unwrap()).collect();
+        assert_eq!(got, want);
+    }
 
     /// OwnedSnapshot must isolate reads from concurrent writes to the DB.
     /// This is the exact invariant ws_sync depends on when FFI verify runs
