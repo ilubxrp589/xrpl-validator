@@ -53,6 +53,8 @@ mod tests {
 
     #[test]
     fn observe_never_touches_the_seed_file() {
+        // Key generation draws on rustls's process-wide provider, which live_viewer installs at start.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let dir = tempfile::tempdir().unwrap();
         let seed = dir.path().join("validator_seed.hex");
         let seed = seed.to_str().unwrap();
