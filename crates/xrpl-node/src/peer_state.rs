@@ -238,6 +238,124 @@ fn key_of(p: NodeId) -> Key {
     (p.depth, p.id)
 }
 
+/// Independence Step 4: a few state objects of a ledger, fetched from peers and proven back to its `account_hash`.
+///
+/// The peer source writes a ledger from these when our engine cannot vouch for its own writes (a refusal, or the
+/// mirror not loaded yet): the objects the ledger's records name, and the system objects. Only the positions on
+/// those keys' paths are asked for, one level a request (query depth 0, so a reply holds the positions asked plus
+/// any chain of single-child inner nodes below them, as `getNodeFat` sends). Each node must be the one its proven
+/// parent names ([`check_node`]). A key whose path ends at an empty branch, or at a leaf holding another key, is
+/// not in the ledger's state: its answer is `None`.
+#[derive(Debug)]
+pub struct KeyedStateFetch {
+    keys: Vec<[u8; 32]>,
+    /// Positions on some key's path a proven parent named, not received yet, and the hash it holds there.
+    wanted: std::collections::BTreeMap<NodeId, [u8; 32]>,
+    found: HashMap<[u8; 32], Option<Vec<u8>>>,
+    /// Requests made.
+    pub requests: u32,
+}
+
+impl KeyedStateFetch {
+    /// Start from the ledger's state root, for `keys` (duplicates are fine).
+    pub fn new(account_hash: [u8; 32], keys: &[[u8; 32]]) -> Self {
+        let mut keys = keys.to_vec();
+        keys.sort_unstable();
+        keys.dedup();
+        let mut f = KeyedStateFetch { keys, wanted: Default::default(), found: HashMap::new(), requests: 0 };
+        if account_hash == [0; 32] {
+            for k in &f.keys {
+                f.found.insert(*k, None);
+            }
+        } else if !f.keys.is_empty() {
+            f.wanted.insert(NodeId::ROOT, account_hash);
+        }
+        f
+    }
+
+    /// The next request for ledger `ledger_hash`: every position still wanted (up to [`MAX_IDS`]), at query depth
+    /// 0. None when done.
+    pub fn next_request(&mut self, ledger_hash: &[u8; 32]) -> Option<TmGetLedger> {
+        if self.wanted.is_empty() {
+            return None;
+        }
+        self.requests += 1;
+        Some(TmGetLedger {
+            itype: TmLedgerInfoType::LiAsNode as i32,
+            ltype: None,
+            ledger_hash: Some(ledger_hash.to_vec()),
+            ledger_seq: None,
+            node_i_ds: self.wanted.keys().take(MAX_IDS).map(NodeId::to_raw).collect(),
+            request_cookie: None,
+            query_type: None,
+            query_depth: Some(0),
+        })
+    }
+
+    /// Take a reply's nodes. A node at a position not wanted is ignored; a node that is not the one its parent
+    /// names is refused, and its position stays wanted.
+    pub fn offer(&mut self, nodes: impl IntoIterator<Item = (NodeId, Vec<u8>)>) -> Offered {
+        let mut o = Offered::default();
+        let mut left: Vec<(NodeId, Vec<u8>)> = nodes.into_iter().collect();
+        // A reply lists a parent before its children, but take them in any order: a child becomes wanted only
+        // once its parent proves out.
+        loop {
+            let before = left.len();
+            let mut rest = Vec::new();
+            for (pos, data) in left {
+                let Some(want) = self.wanted.get(&pos).copied() else {
+                    rest.push((pos, data));
+                    continue;
+                };
+                match check_node(pos, &want, &data) {
+                    Err(_) => o.rejected += 1,
+                    Ok(Checked::Inner(children)) => {
+                        self.wanted.remove(&pos);
+                        o.accepted += 1;
+                        let under: Vec<[u8; 32]> = self.open_keys_under(pos);
+                        for k in under {
+                            let b = nibble(&k, pos.depth as usize) as usize;
+                            if children[b] == [0; 32] {
+                                self.found.insert(k, None);
+                            } else {
+                                self.wanted.insert(position_of(&k, pos.depth + 1), children[b]);
+                            }
+                        }
+                    }
+                    Ok(Checked::Leaf { key, item }) => {
+                        self.wanted.remove(&pos);
+                        o.accepted += 1;
+                        let item = item.to_vec();
+                        for k in self.open_keys_under(pos) {
+                            self.found.insert(k, (k == key).then(|| item.clone()));
+                        }
+                    }
+                }
+            }
+            if rest.len() == before || rest.is_empty() {
+                o.unasked += rest.len();
+                break;
+            }
+            left = rest;
+        }
+        o
+    }
+
+    /// Keys under `pos` with no answer yet.
+    fn open_keys_under(&self, pos: NodeId) -> Vec<[u8; 32]> {
+        self.keys.iter().filter(|k| !self.found.contains_key(*k) && position_of(k, pos.depth) == pos).copied().collect()
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.wanted.is_empty()
+    }
+
+    /// Every key's object, or None for one not in the ledger's state, once done.
+    pub fn into_result(self) -> Option<HashMap<[u8; 32], Option<Vec<u8>>>> {
+        (self.wanted.is_empty() && self.found.len() == self.keys.len()).then_some(self.found)
+    }
+}
+
 /// A ledger's state tree, assembled from fetched nodes, each proven against its parent.
 #[derive(Debug)]
 pub struct StateTreeFetch {
@@ -724,7 +842,7 @@ pub fn dialable(endpoint: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::HashSet;
     use xrpl_core::types::Hash256;
@@ -733,7 +851,7 @@ mod tests {
     use crate::peer::protocol::TmLedgerNode;
 
     /// Distinct, well-spread keys, plus a few that share long prefixes (deep leaves and chains of inner nodes).
-    fn leaves(n: usize) -> Vec<([u8; 32], Vec<u8>)> {
+    pub(crate) fn leaves(n: usize) -> Vec<([u8; 32], Vec<u8>)> {
         let mut v: Vec<([u8; 32], Vec<u8>)> = (0..n)
             .map(|i| {
                 let k = sha512_half_prefixed(b"KEY\0", &(i as u64).to_be_bytes()).0;
@@ -756,7 +874,7 @@ mod tests {
     }
 
     /// Every node of the state tree of `leaves`, at its position, in wire form; and the root hash.
-    fn state_tree(leaves: &[([u8; 32], Vec<u8>)]) -> (HashMap<NodeId, Vec<u8>>, [u8; 32]) {
+    pub(crate) fn state_tree(leaves: &[([u8; 32], Vec<u8>)]) -> (HashMap<NodeId, Vec<u8>>, [u8; 32]) {
         let mut sorted: Vec<&([u8; 32], Vec<u8>)> = leaves.iter().collect();
         sorted.sort_by(|a, b| a.0.cmp(&b.0));
         let mut out = HashMap::new();
@@ -792,16 +910,16 @@ mod tests {
     /// A peer that answers as rippled does: `SHAMap::getNodeFat` per position (fat leaves; the depth drops by one a
     /// level, except through an inner node with a single child; a node it lacks anywhere on the way or below fails
     /// the whole position), and `processLedgerRequest`'s caps. None when it found nothing (rippled sends nothing).
-    struct Peer<'t> {
+    pub(crate) struct Peer<'t> {
         tree: &'t HashMap<NodeId, Vec<u8>>,
-        lacks: HashSet<NodeId>,
+        pub(crate) lacks: HashSet<NodeId>,
         soft: usize,
         hard: usize,
         asked: usize,
     }
 
     impl<'t> Peer<'t> {
-        fn new(tree: &'t HashMap<NodeId, Vec<u8>>) -> Self {
+        pub(crate) fn new(tree: &'t HashMap<NodeId, Vec<u8>>) -> Self {
             Peer { tree, lacks: HashSet::new(), soft: SOFT_MAX_REPLY_NODES, hard: HARD_MAX_REPLY_NODES, asked: 0 }
         }
 
@@ -841,7 +959,7 @@ mod tests {
             Some(out)
         }
 
-        fn serve(&mut self, req: &TmGetLedger, hash: &[u8; 32]) -> Option<TmLedgerData> {
+        pub(crate) fn serve(&mut self, req: &TmGetLedger, hash: &[u8; 32]) -> Option<TmLedgerData> {
             self.asked += 1;
             assert_eq!(req.itype, TmLedgerInfoType::LiAsNode as i32);
             assert!(req.query_depth.unwrap() <= MAX_QUERY_DEPTH);
@@ -892,6 +1010,84 @@ mod tests {
             }
         }
         (got, requests)
+    }
+
+    fn keyed_run(f: &mut KeyedStateFetch, peer: &mut Peer, hash: [u8; 32]) -> HashMap<[u8; 32], Option<Vec<u8>>> {
+        let mut n = 0;
+        while let Some(req) = f.next_request(&hash) {
+            n += 1;
+            assert!(n < 64, "no end in sight");
+            if let Some(d) = peer.serve(&req, &hash) {
+                let o = f.offer(d.nodes.iter().filter_map(|x| Some((NodeId::from_raw(x.nodeid.as_deref()?)?, x.nodedata.clone()))));
+                assert_eq!(o.rejected, 0);
+            }
+        }
+        f.found.clone()
+    }
+
+    #[test]
+    fn keyed_fetch_returns_the_named_objects_and_none_for_absent_ones() {
+        let lv = leaves(2_000);
+        let (tree, root) = state_tree(&lv);
+        let present = [lv[5].clone(), lv[1_500].clone(), lv[2_001].clone()]; // the last is one of the deep leaves
+        let mut absent = lv[7].0;
+        absent[31] ^= 0x55;
+        let keys: Vec<[u8; 32]> = present.iter().map(|p| p.0).chain([absent]).collect();
+        let mut f = KeyedStateFetch::new(root, &keys);
+        let mut peer = Peer::new(&tree);
+        let got = keyed_run(&mut f, &mut peer, [9; 32]);
+        for (k, item) in &present {
+            assert_eq!(got.get(k), Some(&Some(item.clone())), "the exact object");
+        }
+        assert_eq!(got.get(&absent), Some(&None));
+        assert!(f.requests <= 8, "{} requests", f.requests);
+        assert_eq!(f.into_result().map(|r| r.len()), Some(4));
+    }
+
+    #[test]
+    fn a_forged_node_on_a_key_path_is_refused_and_asked_again() {
+        let lv = leaves(500);
+        let (tree, root) = state_tree(&lv);
+        let key = lv[3].0;
+        let mut f = KeyedStateFetch::new(root, &[key]);
+        let hash = [9; 32];
+        let req = f.next_request(&hash).unwrap();
+        let d = Peer::new(&tree).serve(&req, &hash).unwrap();
+        let nodes = |d: &TmLedgerData| d.nodes.iter().map(|x| (NodeId::from_raw(x.nodeid.as_deref().unwrap()).unwrap(), x.nodedata.clone())).collect::<Vec<_>>();
+        assert_eq!(f.offer(nodes(&d)).rejected, 0);
+        let req = f.next_request(&hash).unwrap();
+        let mut d = Peer::new(&tree).serve(&req, &hash).unwrap();
+        d.nodes[0].nodedata[3] ^= 1;
+        let forged_at = NodeId::from_raw(d.nodes[0].nodeid.as_deref().unwrap()).unwrap();
+        assert_eq!(f.offer(nodes(&d)).rejected, 1);
+        let again = f.next_request(&hash).unwrap();
+        assert!(again.node_i_ds.contains(&forged_at.to_raw()), "the position is asked again");
+        let mut peer = Peer::new(&tree);
+        let got = keyed_run(&mut f, &mut peer, hash);
+        assert_eq!(got.get(&key), Some(&Some(lv[3].1.clone())));
+    }
+
+    #[test]
+    fn keys_sharing_a_path_share_its_requests() {
+        let lv = leaves(4_000);
+        let (tree, root) = state_tree(&lv);
+        let branch = nibble(&lv[0].0, 0);
+        let same: Vec<[u8; 32]> = lv.iter().map(|l| l.0).filter(|k| nibble(k, 0) == branch).take(50).collect();
+        let mut one = KeyedStateFetch::new(root, &same[..1]);
+        keyed_run(&mut one, &mut Peer::new(&tree), [9; 32]);
+        let mut fifty = KeyedStateFetch::new(root, &same);
+        let got = keyed_run(&mut fifty, &mut Peer::new(&tree), [9; 32]);
+        assert!(got.values().all(Option::is_some));
+        assert!(fifty.requests <= one.requests + 2, "50 keys {} requests, 1 key {}", fifty.requests, one.requests);
+    }
+
+    #[test]
+    fn an_empty_state_or_no_keys_needs_no_request() {
+        let mut f = KeyedStateFetch::new([0; 32], &[[1; 32]]);
+        assert!(f.next_request(&[9; 32]).is_none());
+        assert_eq!(f.into_result().unwrap().get(&[1; 32]), Some(&None));
+        let mut f = KeyedStateFetch::new([5; 32], &[]);
+        assert!(f.next_request(&[9; 32]).is_none());
     }
 
     fn sorted(mut v: Vec<([u8; 32], Vec<u8>)>) -> Vec<([u8; 32], Vec<u8>)> {
