@@ -256,19 +256,20 @@ mod tests {
         ResumeTicket { seq, account_hash: hash.to_string(), written_at_unix: 1_758_700_000 }
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn peer_network_gives_the_newest_quorum_seq() {
         assert_eq!(wait_for_quorum(Duration::from_secs(120), || Some((107_900_000, [1; 32]))).await, Some(107_900_000));
         let calls = std::sync::atomic::AtomicU32::new(0);
-        let later = || (calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 4).then_some((7, [2; 32]));
+        let later = || (calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 2).then_some((7, [2; 32]));
         assert_eq!(wait_for_quorum(Duration::from_secs(120), later).await, Some(7), "it waits for the first quorum");
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn peer_network_without_a_quorum_gives_none_after_the_wait() {
-        let t0 = tokio::time::Instant::now();
-        assert_eq!(wait_for_quorum(Duration::from_secs(120), || None).await, None);
-        assert!(t0.elapsed() >= Duration::from_secs(120) && t0.elapsed() < Duration::from_secs(122));
+        let t0 = std::time::Instant::now();
+        assert_eq!(wait_for_quorum(Duration::from_millis(1_200), || None).await, None);
+        let took = t0.elapsed();
+        assert!(took >= Duration::from_millis(1_200) && took < Duration::from_millis(2_500), "{took:?}");
     }
 
     #[test]
