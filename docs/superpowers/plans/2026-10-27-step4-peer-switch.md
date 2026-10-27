@@ -370,7 +370,7 @@ A warm restart catches up the same way. A cold start loads a state tree that pee
   - It exits non-zero on `rpc_refused > 0`, `own_hash.differ` growing, or the twin's last seq more than 10 behind the live validator's.
 
 - [ ] **Step 1: Write the failing test** `scripts/twin/test_twin_check.py`. Feed two canned `/api/engine` JSONs: a healthy one exits 0; `rpc_refused: 3` exits 1 and names it.
-- [ ] **Step 2:** Run `python3 -m pytest scripts/twin/test_twin_check.py -q`. Expect a FAIL.
+- [ ] **Step 2:** Run `python3 scripts/twin/test_twin_check.py` (standard library unittest: neither .39 nor .220 has pytest). Expect a FAIL.
 - [ ] **Step 3:** Implement both scripts and the `/api/engine` sections.
 - [ ] **Step 4:** Run the test. Expect a PASS. Also run `bash -n scripts/twin/run-twin.sh`.
 - [ ] **Step 5:** Commit `feat(step4): the twin — a peer-fed, non-signing copy and its daily check`.
@@ -388,3 +388,26 @@ A warm restart catches up the same way. A cold start loads a state tree that pee
 3. **Day 7 (about 11-03): cycle 190** = this branch, with batch-meta-190 already under it. The launcher gets `XRPL_LEDGER_SOURCE=peers` and `XRPL_WITNESS_RPC=http://<old-server>:5005`. James's tap is needed. Rollback = `XRPL_LEDGER_SOURCE=rpc` plus a warm restart.
 4. **Rehearsal, then .39 off.** The Rust SDK session stops .39's xrpld for an hour, with James's tap. Then the witness URL is dropped and .39 is switched off.
 5. **Monitoring off .39.** step_watch, the health checks, the soak verdict and post_deploy's references are rewritten against public servers or the validator's own numbers. This is a separate small change to the ops scripts.
+
+## As built (2026-10-27): where the build departs from the plan
+
+- **Task 7, start-up.** No hydrate-first step. The mirror loads as it does today (at the live edge). Until it is
+  loaded, each ledger lands by the keyed peer fetch (`peer_state_bytes`), exactly where the rpc path used .39's
+  bytes. Review Focus 5 then needs no special case.
+- **Task 7, tests.** The loop's decisions sit inline, as in the rpc path, so the two decision-helper tests became
+  `fallback_keys_add_the_system_objects` and `ws_syncs_system_objects_are_stage3s`. The twin run covers the hold and
+  fallback paths live.
+- **Signing basis.** In peer mode own_hash still calls `own_validated::witness` when our hash equals the header's.
+  The header's hash is the quorum's, or proven as the parent of a quorum ledger, so a WITNESS signature there means
+  "our own hash, of a ledger the network validated". That is sound, and the GIVE_UP window still keeps it recent.
+- **Task 2.** `quorum_moved()` returns a `&'static tokio::sync::Notify` (one permit), not a `pub static`.
+- **Task 5.** `hash_for(seq)` is a module function over a shared `Chain` (the walk's hashes serve the warm start and
+  the loop alike); `Chain::hash_for` takes the `Headers` source and the quorum lookup, for tests.
+- **Task 8.** The quorum-wait tests run on real time (the crate has no tokio `test-util`).
+- **Task 12.** The conversion lives in the library (`cold_start::convert`, tested there); the bin is a thin wrapper.
+  It reads proven.json beside header.bin.
+- **Added: the data directory.** Nine library defaults (consensus record, native meta, independence days, native
+  order, UNL last-good, native shadow, own hash, own validated, peer fetch) were fixed `/mnt/xrpl-data` paths. They
+  now follow `XRPL_DATA_DIR` (unchanged live, where it is unset), so a twin on m3060 can never write over the live
+  validator's files.
+- **Added:** `XRPL_MAX_PEERS` (default 125; the twin uses 40).
