@@ -2529,7 +2529,9 @@ pub fn apply_ledger_in_order_with_net(
         // AccountDelete tefBAD_LEDGER in the same ledger — see m3060 log
         // analysis 2026-04-21. The single-try version (69bc726) dropped the
         // rate ~80x but left multi-missing-SLE AccountDeletes unrecovered.
-        if outcome.ter_name == "tefBAD_LEDGER" {
+        // From peers (independence Step 4) there is no RPC to repair from: the FFI leg is a comparison only, and the
+        // result stands as libxrpl gave it.
+        if outcome.ter_name == "tefBAD_LEDGER" && !crate::ledger_source::peers() {
             const MAX_ITERATIONS: u32 = 20;
             let mut iter_count = 0u32;
             let mut last_missing_key: Option<[u8; 32]> = None;
@@ -2639,7 +2641,7 @@ pub fn apply_ledger_in_order_with_net(
         // ledger (post-state) from a fresh RPC call and inject into overlay.
         // This prevents cascading terPRE_SEQ for all subsequent txs from
         // this sender in this ledger.
-        if outcome.ter_name == "terPRE_SEQ" {
+        if outcome.ter_name == "terPRE_SEQ" && !crate::ledger_source::peers() {
             let sender_key = extract_sender_account_root_key(tx_bytes);
             if let Some(key) = sender_key {
                 // DIAGNOSTIC: dump sender state from overlay+snapshot+RPC at moment of failure

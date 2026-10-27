@@ -744,6 +744,10 @@ async fn main() {
                 eprintln!("[ffi] initializing FfiVerifier: peer source, amendments from our own state");
                 Arc::new(xrpl_node::ffi_verifier::FfiVerifier::from_state(rpc_urls, db))
             }
+            None if xrpl_node::ledger_source::peers() => {
+                eprintln!("[ffi] FATAL: XRPL_LEDGER_SOURCE=peers with no state store open");
+                std::process::exit(1);
+            }
             None => {
                 eprintln!("[ffi] initializing FfiVerifier with {} RPC endpoint(s)", rpc_urls.len());
                 Arc::new(xrpl_node::ffi_verifier::FfiVerifier::new(rpc_urls))

@@ -43,6 +43,12 @@ impl SyncStop {
         }
     }
 
+    /// Whether a stop was requested: a long wait inside a ledger (the peer source's state fetch) gives up on it, so
+    /// the stop still parks within its timeout.
+    pub fn stop_requested(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
+    }
+
     /// ws-sync, after a ledger landed and its root matched the network's account hash.
     pub fn record_verified(&self, seq: u32, account_hash: &str) {
         *self.last_verified.lock() = Some((seq, account_hash.to_string()));

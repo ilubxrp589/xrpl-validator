@@ -147,6 +147,18 @@ pub async fn start_ws_sync(
     if native_shadow.is_some() && !stage3_cfg.enabled && !native_writer {
         eprintln!("[native-shadow] WARNING: XRPL_NATIVE_SHADOW set but Stage 3 is OFF — shadow will never run");
     }
+    // Independence Step 4: from peers the native writer makes every ledger's bytes (the system objects too), and the
+    // keyed peer fetch stands in only for ledgers it cannot vouch for. Without it nothing could land.
+    #[cfg(feature = "ffi")]
+    if peers && !native_writer {
+        eprintln!("[ws-sync] FATAL: XRPL_LEDGER_SOURCE=peers needs the native writer (XRPL_NATIVE_SHADOW=1 and XRPL_NATIVE_WRITER=1)");
+        std::process::exit(1);
+    }
+    #[cfg(not(feature = "ffi"))]
+    if peers {
+        eprintln!("[ws-sync] FATAL: XRPL_LEDGER_SOURCE=peers needs the ffi build (the native writer)");
+        std::process::exit(1);
+    }
     // Independence 5.5: our own ledger hash is judged at the writer's commit, so it needs the writer.
     #[cfg(feature = "ffi")]
     if crate::own_hash::enabled() {
@@ -275,17 +287,10 @@ pub async fn start_ws_sync(
                 }
 
                 for process_seq in start_seq..=closed_seq {
-                    // Warm restart: hold the stop gate for the whole ledger. After a SIGTERM stop
-                    // request, park here — at a ledger boundary — and process nothing more.
-                    let Some(_ledger_gate) = crate::sync_stop::SYNC_STOP.enter_ledger().await else {
-                        eprintln!("[ws-sync] stop requested — parked after #{}", last_synced.load(Ordering::Acquire));
-                        loop {
-                            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-                        }
-                    };
                     // Independence Step 4: from peers, the whole ledger now (its hash from our own quorum, or the
-                    // parent chain from one). A ledger peers have not delivered holds position like a failed
-                    // metadata fetch: the next trigger re-drives this same seq.
+                    // parent chain from one), before the stop gate: nothing is written while it comes, so a warm stop
+                    // need not wait for it. A ledger peers have not delivered holds position like a failed metadata
+                    // fetch: the next trigger re-drives this same seq.
                     let peer_ledger = if peers {
                         match crate::peer_ledgers::ledger(process_seq).await {
                             Ok(p) => Some(p),
@@ -304,6 +309,14 @@ pub async fn start_ws_sync(
                             watchdog_live_edge.store(newest, Ordering::Release);
                         }
                     }
+                    // Warm restart: hold the stop gate for the whole ledger. After a SIGTERM stop
+                    // request, park here — at a ledger boundary — and process nothing more.
+                    let Some(_ledger_gate) = crate::sync_stop::SYNC_STOP.enter_ledger().await else {
+                        eprintln!("[ws-sync] stop requested — parked after #{}", last_synced.load(Ordering::Acquire));
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                        }
+                    };
                     // Fetch account_hash for EVERY ledger so every one can be
                     // hash-verified (not just the latest in a gap-fill batch).
                     let account_hash = match &peer_ledger {
@@ -336,6 +349,7 @@ pub async fn start_ws_sync(
                     };
 
                     let mut meta_ok = false;
+                    let mut peer_wallet_delta: i64 = 0;
                     let mut ledger_header: LedgerHeader = LedgerHeader::default();
                     // B: capture sorted_txs so we can extract outcomes/mutations
                     // from the same JSON later, instead of making a duplicate RPC.
@@ -369,8 +383,14 @@ pub async fn start_ws_sync(
                                 }
                                 #[cfg(feature = "ffi")]
                                 { sorted_txs = _txs; }
+                                // From peers a ledger is held more often after its records are in (a keyed fetch
+                                // not delivered), so its wallet count waits until it lands.
                                 if wallet_delta != 0 {
-                                    hash_comp.adjust_wallet_count(wallet_delta, process_seq);
+                                    if peers {
+                                        peer_wallet_delta = wallet_delta;
+                                    } else {
+                                        hash_comp.adjust_wallet_count(wallet_delta, process_seq);
+                                    }
                                 }
                                 meta_ok = true;
                                 break;
@@ -1017,6 +1037,9 @@ pub async fn start_ws_sync(
                         crate::ledger_source::stats().from_peers.fetch_add(1, Ordering::Relaxed);
                         crate::ledger_source::LAST_TOTAL_DROPS.store(ledger_header.total_drops, Ordering::Relaxed);
                         crate::witness::landed(process_seq, ledger_header.ledger_hash);
+                        if peer_wallet_delta != 0 {
+                            hash_comp.adjust_wallet_count(peer_wallet_delta, process_seq);
+                        }
                     }
                     // SECURITY(5.3): Use Release ordering so Acquire loads see this
                     last_synced.store(process_seq, Ordering::Release);
@@ -1099,7 +1122,17 @@ async fn peer_state_bytes(
         .ok()
         .and_then(|b| b.try_into().ok())
         .ok_or_else(|| format!("no state root for #{seq}"))?;
-    let got = crate::peer_fetch::fetch_state_keys(header.ledger_hash, root, fallback_keys(seq, modified, deleted)).await?;
+    let fetch = crate::peer_fetch::fetch_state_keys(header.ledger_hash, root, fallback_keys(seq, modified, deleted));
+    // Inside the stop gate: a requested stop must not wait out the fetch's deadline.
+    let stop = async {
+        while !crate::sync_stop::SYNC_STOP.stop_requested() {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    };
+    let got = tokio::select! {
+        r = fetch => r?,
+        _ = stop => return Err("a stop was requested".into()),
+    };
     crate::ledger_source::stats().keyed_fallbacks.fetch_add(1, Ordering::Relaxed);
     Ok(got.into_iter().collect())
 }
