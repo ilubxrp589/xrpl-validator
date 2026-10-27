@@ -364,19 +364,22 @@ async fn main() {
         // VALAUDIT Phase 4 (va-04) — seed hygiene. Fatal on bad mode, atomic
         // 0600 create, fatal on malformed seed (no silent identity rotation).
         // See xrpl_node::paths::load_or_create_seed for full audit rationale.
-        let (seed, was_created) = match xrpl_node::paths::load_or_create_seed(&seed_path) {
+        // XRPL_OBSERVE=1 (a twin that signs nothing): a fresh identity for the run, the seed file untouched.
+        let observe = xrpl_node::observe::enabled();
+        let (identity, was_created) = match xrpl_node::observe::validator_identity(observe, &seed_path) {
             Ok(pair) => pair,
             Err(msg) => {
                 eprintln!("{msg}");
                 std::process::exit(1);
             }
         };
-        if was_created {
+        if observe {
+            eprintln!("[validator] OBSERVE: a fresh identity for this run, no seed read or written, nothing signed or sent");
+        } else if was_created {
             eprintln!("[validator] Generated NEW seed (saved to {seed_path}, mode 0600)");
         } else {
             eprintln!("[validator] Loaded persistent seed from {seed_path}");
         }
-        let identity = NodeIdentity::from_seed(&seed).expect("identity from seed failed");
         eprintln!("[validator] Signing key (Secp256k1): {}", identity.public_key_hex());
         eprintln!("[validator] Master key (Ed25519):    {}", hex::encode(identity.master_public_key()));
         identity
@@ -406,7 +409,8 @@ async fn main() {
     // Dedicated validation senders — multiple peers for redundancy. Each slot's status is shared with
     // /api/connections.
     let relay_status: Vec<Arc<Mutex<relay::RelayStatus>>> = relay::RELAY_HUBS.iter().map(|_| Arc::default()).collect();
-    for (hubs, status) in relay::RELAY_HUBS.into_iter().zip(relay_status.iter().cloned()) {
+    // Observing, no relay sessions: nothing of ours goes to the hubs.
+    for (hubs, status) in relay::RELAY_HUBS.into_iter().zip(relay_status.iter().cloned()).filter(|_| !xrpl_node::observe::enabled()) {
         let val_send_outbound = outbound_tx.clone();
         let val_send_manifest = manifest_frame.clone();
         tokio::spawn(async move {
@@ -495,12 +499,12 @@ async fn main() {
     // Periodically broadcast manifest so all peers get it
     let manifest_broadcast = manifest_frame.clone();
     let manifest_outbound = outbound_tx.clone();
-    tokio::spawn(async move {
+    if !xrpl_node::observe::enabled() { tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
             let _ = manifest_outbound.send(manifest_broadcast.to_vec());
         }
-    });
+    }); }
 
     // Live engine — opens RocksDB and applies transactions to real state
     // (created early so peer connections can serve ledger data)
@@ -1658,6 +1662,15 @@ async fn main() {
                             None
                         };
 
+                        // XRPL_OBSERVE: everything up to here ran; count it instead of signing and sending.
+                        if xrpl_node::observe::enabled() {
+                            xrpl_node::observe::WOULD_SIGN.fetch_add(1, Ordering::Relaxed);
+                            if matches!(named_by, "OWN" | "WITNESS") {
+                                xrpl_node::observe::WOULD_SIGN_OWN.fetch_add(1, Ordering::Relaxed);
+                                last_own_at = std::time::Instant::now();
+                            }
+                            continue;
+                        }
                         let validation_bytes = xrpl_node::validation::sign_validation(
                             &val_identity, seq, &ledger_hash_bytes,
                             amendments.as_deref(),
@@ -1813,6 +1826,7 @@ async fn main() {
                     body.push_str(&xrpl_node::native_order::metrics_text());
                     body.push_str(&xrpl_node::peer_fetch::metrics_text());
                     body.push_str(&xrpl_node::own_validated::metrics_text());
+                    body.push_str(&xrpl_node::ledger_source::metrics_text());
                     body.push_str(&xrpl_node::own_hash::metrics_text());
                     (
                         axum::http::StatusCode::OK,
@@ -1953,6 +1967,9 @@ async fn main() {
                     json["native_order"] = xrpl_node::native_order::json();
                     // Independence 4.1: ledgers fetched from peers.
                     json["peer_fetch"] = xrpl_node::peer_fetch::json();
+                    json["ledger_source"] = xrpl_node::ledger_source::json();
+                    json["witness"] = xrpl_node::witness::json();
+                    json["observe"] = xrpl_node::observe::json();
                     // Independence 4.5: "validated" from our own count of trusted validations.
                     json["own_validated"] = xrpl_node::own_validated::json();
                     // Cycles 183-185: what the validator signs, and how often the first peer's hash was another.

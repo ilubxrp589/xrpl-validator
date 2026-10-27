@@ -1020,6 +1020,7 @@ pub async fn start_ws_sync(
                     if peers {
                         crate::ledger_source::stats().from_peers.fetch_add(1, Ordering::Relaxed);
                         crate::ledger_source::LAST_TOTAL_DROPS.store(ledger_header.total_drops, Ordering::Relaxed);
+                        crate::witness::landed(process_seq, ledger_header.ledger_hash);
                     }
                     // SECURITY(5.3): Use Release ordering so Acquire loads see this
                     last_synced.store(process_seq, Ordering::Release);
