@@ -62,6 +62,8 @@ pub struct RippledClient {
     rpc_override: Option<String>,
     /// Optional env-var override for primary WS URL.
     ws_override: Option<String>,
+    /// Peer mode (`XRPL_LEDGER_SOURCE=peers`): every call is refused and counted, nothing goes out.
+    refuse: Arc<AtomicBool>,
 }
 
 impl RippledClient {
@@ -92,7 +94,26 @@ impl RippledClient {
             ws_fallback_stints: Arc::new(AtomicU64::new(0)),
             rpc_override,
             ws_override,
+            refuse: Arc::new(AtomicBool::new(crate::ledger_source::peers())),
         }
+    }
+
+    /// Peer mode's refusal, for tests (live, it follows `XRPL_LEDGER_SOURCE`).
+    #[cfg(test)]
+    pub fn set_peer_mode_for_test(&self, on: bool) {
+        self.refuse.store(on, Ordering::Relaxed);
+    }
+
+    /// In peer mode, a call that would have gone out: counted, and the error the caller gets.
+    fn refused(&self, what: &str) -> Option<String> {
+        if !self.refuse.load(Ordering::Relaxed) {
+            return None;
+        }
+        let n = crate::ledger_source::stats().rpc_refused.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            eprintln!("[rpc] peer source: refused {what} (refusal #{n})");
+        }
+        Some(format!("peer source: no RPC ({what})"))
     }
 
     /// Get the current RPC endpoint URL.
@@ -122,6 +143,9 @@ impl RippledClient {
     /// Make an RPC request with automatic failover.
     /// Tries the current endpoint first, then falls back to alternatives.
     pub async fn rpc_request(&self, body: &serde_json::Value) -> Result<serde_json::Value, String> {
+        if let Some(e) = self.refused(body["method"].as_str().unwrap_or("request")) {
+            return Err(e);
+        }
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         let start_idx = self.active_rpc.load(Ordering::Relaxed) as usize;
 
@@ -204,6 +228,10 @@ impl RippledClient {
 
     /// Switch to the next WS endpoint (called when WS disconnects).
     pub fn next_ws_endpoint(&self) -> &str {
+        // Peer mode never moves to a public WebSocket.
+        if self.refuse.load(Ordering::Relaxed) {
+            return self.ws_url();
+        }
         let old = self.active_ws.fetch_add(1, Ordering::Relaxed) as usize;
         let new_idx = (old + 1) % WS_ENDPOINTS.len();
         self.active_ws.store(new_idx as u64, Ordering::Relaxed);
@@ -262,6 +290,9 @@ impl RippledClient {
     /// `server_info` straight from the primary RPC endpoint, bypassing failover: its `info` object,
     /// or `None` if the primary did not answer within `wait`.
     pub async fn primary_server_info(&self, wait: std::time::Duration) -> Option<serde_json::Value> {
+        if self.refused("server_info").is_some() {
+            return None;
+        }
         let url = self.rpc_override.as_deref().unwrap_or(ENDPOINTS[0]);
         let body = serde_json::json!({"method": "server_info", "params": [{}]});
         let resp = self.client.post(url).json(&body).timeout(wait).send().await.ok()?;
@@ -332,6 +363,20 @@ pub fn check_signing_endpoints(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn peer_mode_refuses_every_call_and_counts_it() {
+        let rpc = RippledClient::new();
+        rpc.set_peer_mode_for_test(true);
+        let before = crate::ledger_source::stats().rpc_refused.load(Ordering::Relaxed);
+        let err = rpc.rpc_request(&serde_json::json!({"method": "server_info"})).await.unwrap_err();
+        assert!(err.contains("peer source: no RPC"), "{err}");
+        assert!(rpc.primary_server_info(std::time::Duration::from_millis(10)).await.is_none());
+        assert_eq!(crate::ledger_source::stats().rpc_refused.load(Ordering::Relaxed), before + 2);
+        assert_eq!(rpc.total_requests.load(Ordering::Relaxed), 0, "nothing went out");
+        assert_eq!(rpc.next_ws_endpoint(), rpc.ws_url(), "no move to a public WebSocket");
+        assert!(!rpc.ws_on_fallback());
+    }
 
     #[test]
     fn non_signing_node_allows_default_endpoints() {

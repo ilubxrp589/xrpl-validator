@@ -21,6 +21,7 @@ pub mod native_order;
 pub mod independence_days;
 pub mod own_hash;
 pub mod own_validated;
+pub mod ledger_source;
 pub mod peer_fetch;
 pub mod peer_source;
 pub mod peer_state;
