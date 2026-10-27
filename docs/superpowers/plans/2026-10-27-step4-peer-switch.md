@@ -411,3 +411,11 @@ A warm restart catches up the same way. A cold start loads a state tree that pee
   now follow `XRPL_DATA_DIR` (unchanged live, where it is unset), so a twin on m3060 can never write over the live
   validator's files.
 - **Added:** `XRPL_MAX_PEERS` (default 125; the twin uses 40).
+- **Final review (one reviewer, the whole branch), four defects, all fixed in ba1f8cf:**
+  1. The FFI leg's tefBAD_LEDGER and terPRE_SEQ repairs read .39 directly, past the budget and the refusal count:
+     they are now off in peer mode.
+  2. The fetch from peers held the warm-stop gate, past SIGTERM's 20 s wait. It now runs before the gate, and the
+     keyed fetch inside the gate gives up when a stop is requested.
+  3. Peer mode without the native writer could not land ledgers: it now refuses to start.
+  4. The wallet count was adjusted twice for a held, re-driven ledger: from peers it is now adjusted on landing.
+  Result: ffi lib 421/0, lib 364/0, bins check, clippy 247 = base 247.
