@@ -877,7 +877,12 @@ pub async fn start_ws_sync(
                         match native_shadow.as_mut() {
                             Some(shadow) => {
                                 let lag_now = closed_seq.saturating_sub(process_seq);
-                                if !shadow.is_active() && !shadow.writer_tripped() && shadow.can_hydrate(lag_now) {
+                                // From peers, load the mirror at once, however far behind: until it is in, every
+                                // ledger needs the keyed state fetch, about ten peer requests, too slow to catch up on
+                                // (the twin, 10-27: 3 ledgers a minute to the network's 15). Ledgers landed while it
+                                // loads are queued and replayed (pending).
+                                let hydrate_lag = if peers { 0 } else { lag_now };
+                                if !shadow.is_active() && !shadow.writer_tripped() && shadow.can_hydrate(hydrate_lag) {
                                     shadow.hydrate(&db, process_seq - 1);
                                 }
                                 let key = |h: &String| -> Option<[u8; 32]> {
