@@ -1053,6 +1053,8 @@ impl Run {
                     "elapsed_s": el.as_secs(), "peers_used": self.used.len(),
                 });
                 let _ = std::fs::write(self.args.out.join("proven.json"), format!("{marker:#}\n"));
+                // The proven header itself, for the cold start (leaves_to_rocks checks it against proven.json).
+                let _ = std::fs::write(self.args.out.join("header.bin"), h.serialize());
                 0
             }
             _ => {
