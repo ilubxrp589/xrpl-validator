@@ -191,11 +191,7 @@ pub async fn start_ws_sync(
     loop {
         // From .39: its WebSocket's ledger stream. From peers: our own quorum, said the same way.
         let (mut sink, mut stream): (Option<_>, Msgs) = if peers {
-            let closed = crate::peer_ledgers::trigger().map(|seq| {
-                Ok(tokio_tungstenite::tungstenite::Message::Text(
-                    serde_json::json!({"type": "ledgerClosed", "ledger_index": seq}).to_string(),
-                ))
-            });
+            let closed = crate::peer_ledgers::trigger().map(ledger_closed);
             (None, Box::pin(closed))
         } else {
             let ws_url = rpc.ws_url();
@@ -1080,6 +1076,15 @@ pub async fn start_ws_sync(
     }
 }
 
+/// Independence Step 4 (peer source): our own quorum's newest ledger, said as .39's ledger stream says it, so
+/// ws-sync's loop runs unchanged. The Err type is the WebSocket's, for the one stream type both sources share.
+#[allow(clippy::result_large_err)]
+fn ledger_closed(seq: u32) -> Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error> {
+    Ok(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({"type": "ledgerClosed", "ledger_index": seq}).to_string(),
+    ))
+}
+
 /// Independence Step 4 (peer source): the bytes to write for a ledger the engine could not vouch for, from peers:
 /// [`fallback_keys`], each proven to the ledger's state root.
 #[cfg(feature = "ffi")]
@@ -1102,6 +1107,7 @@ async fn peer_state_bytes(
 /// Independence Step 4 (peer source): the state objects to fetch from peers for a ledger the engine could not
 /// vouch for: every object its records name, and the system objects (as ws-sync names them for `seq`). Sorted, no
 /// repeats.
+#[cfg_attr(not(feature = "ffi"), allow(dead_code))]
 pub(crate) fn fallback_keys(seq: u32, modified: &HashSet<String>, deleted: &HashSet<String>) -> Vec<[u8; 32]> {
     let mut keys: Vec<[u8; 32]> = modified
         .iter()
@@ -2248,6 +2254,7 @@ mod undo_tests {
     /// Both rollbacks restore the ledger's pre-images AND rewind the bookmark, so a warm restart
     /// never trusts a `meta:last_seq` one ledger ahead of the state (the "no hash root" rollback
     /// used to leave it at `seq`).
+    #[cfg(feature = "ffi")]
     #[test]
     fn fallback_keys_add_the_system_objects() {
         let seq = 107_937_280;
@@ -2262,6 +2269,7 @@ mod undo_tests {
         }
     }
 
+    #[cfg(feature = "ffi")]
     #[test]
     fn ws_syncs_system_objects_are_stage3s() {
         for seq in [1, 65_535, 65_536, 107_937_280, 107_937_281] {
