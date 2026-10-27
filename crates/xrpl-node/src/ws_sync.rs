@@ -77,7 +77,10 @@ pub async fn start_ws_sync(
     // and lets the existing hash-verified gap-fill code catch up cleanly.
     let watchdog_live_edge: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
     let watchdog_alarms: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
-    {
+    // Independence Step 4: with peers as the source (XRPL_LEDGER_SOURCE=peers) nothing here asks .39. The live
+    // edge is our own newest quorum ledger, and each ledger comes from peers (peer_ledgers).
+    let peers = crate::ledger_source::peers();
+    if !peers {
         let live_edge_w = watchdog_live_edge.clone();
         let rpc_w = rpc.clone();
         tokio::spawn(async move {
@@ -175,29 +178,50 @@ pub async fn start_ws_sync(
     // until a warm restart moved it back.
     let mut last_primary_probe_ms: u64 = 0;
 
+    if peers {
+        eprintln!("[ws-sync] peer source: each ledger from peers, by the hash our own quorum names; no .39");
+        if !crate::own_validated::enabled() {
+            eprintln!("[ws-sync] WARNING: the peer source needs XRPL_OWN_VALIDATED=1 (our own quorum names each ledger) — nothing will be taken");
+        }
+        if !crate::peer_fetch::start() {
+            eprintln!("[ws-sync] WARNING: the peer fetch driver did not start — nothing will be taken");
+        }
+    }
+    type Msgs = std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>> + Send>>;
     loop {
-        let ws_url = rpc.ws_url();
-        eprintln!("[ws-sync] Connecting to {ws_url}...");
-        let ws = match connect_async(ws_url).await {
-            Ok((ws, _)) => ws,
-            Err(e) => {
-                eprintln!("[ws-sync] Connect failed: {e}");
-                let next = rpc.next_ws_endpoint();
-                eprintln!("[ws-sync] Switching to {next}");
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        // From .39: its WebSocket's ledger stream. From peers: our own quorum, said the same way.
+        let (mut sink, mut stream): (Option<_>, Msgs) = if peers {
+            let closed = crate::peer_ledgers::trigger().map(|seq| {
+                Ok(tokio_tungstenite::tungstenite::Message::Text(
+                    serde_json::json!({"type": "ledgerClosed", "ledger_index": seq}).to_string(),
+                ))
+            });
+            (None, Box::pin(closed))
+        } else {
+            let ws_url = rpc.ws_url();
+            eprintln!("[ws-sync] Connecting to {ws_url}...");
+            let ws = match connect_async(ws_url).await {
+                Ok((ws, _)) => ws,
+                Err(e) => {
+                    eprintln!("[ws-sync] Connect failed: {e}");
+                    let next = rpc.next_ws_endpoint();
+                    eprintln!("[ws-sync] Switching to {next}");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+            let (mut sink, stream) = ws.split();
+
+            // Subscribe to ledger stream only — we fetch tx metadata via RPC
+            // (streaming txs arrive BEFORE ledgerClosed, causing timing issues)
+            let sub = serde_json::json!({"command":"subscribe","streams":["ledger"]});
+            if let Err(e) = sink.send(tokio_tungstenite::tungstenite::Message::Text(sub.to_string())).await {
+                eprintln!("[ws-sync] Subscribe failed: {e}");
                 continue;
             }
+            eprintln!("[ws-sync] Connected + subscribed");
+            (Some(sink), Box::pin(stream))
         };
-        let (mut sink, mut stream) = ws.split();
-
-        // Subscribe to ledger stream only — we fetch tx metadata via RPC
-        // (streaming txs arrive BEFORE ledgerClosed, causing timing issues)
-        let sub = serde_json::json!({"command":"subscribe","streams":["ledger"]});
-        if let Err(e) = sink.send(tokio_tungstenite::tungstenite::Message::Text(sub.to_string())).await {
-            eprintln!("[ws-sync] Subscribe failed: {e}");
-            continue;
-        }
-        eprintln!("[ws-sync] Connected + subscribed");
 
         // Flat cache builds from RocksDB on first call — no invalidation needed.
 
@@ -214,7 +238,9 @@ pub async fn start_ws_sync(
             let text = match msg {
                 Ok(tokio_tungstenite::tungstenite::Message::Text(t)) => t,
                 Ok(tokio_tungstenite::tungstenite::Message::Ping(data)) => {
-                    let _ = sink.send(tokio_tungstenite::tungstenite::Message::Pong(data)).await;
+                    if let Some(sink) = sink.as_mut() {
+                        let _ = sink.send(tokio_tungstenite::tungstenite::Message::Pong(data)).await;
+                    }
                     continue;
                 }
                 Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
@@ -261,9 +287,33 @@ pub async fn start_ws_sync(
                             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
                         }
                     };
+                    // Independence Step 4: from peers, the whole ledger now (its hash from our own quorum, or the
+                    // parent chain from one). A ledger peers have not delivered holds position like a failed
+                    // metadata fetch: the next trigger re-drives this same seq.
+                    let peer_ledger = if peers {
+                        match crate::peer_ledgers::ledger(process_seq).await {
+                            Ok(p) => Some(p),
+                            Err(e) => {
+                                crate::ledger_source::stats().holds.fetch_add(1, Ordering::Relaxed);
+                                eprintln!("[ws-sync] peer source #{process_seq}: {e} — holding position, will retry");
+                                last_processed = process_seq.saturating_sub(1);
+                                break;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if peers {
+                        if let Some((newest, _)) = crate::own_validated::newest_quorum() {
+                            watchdog_live_edge.store(newest, Ordering::Release);
+                        }
+                    }
                     // Fetch account_hash for EVERY ledger so every one can be
                     // hash-verified (not just the latest in a gap-fill batch).
-                    let account_hash = fetch_account_hash(&rpc, process_seq).await.unwrap_or_default();
+                    let account_hash = match &peer_ledger {
+                        Some(p) => p.account_hash.clone(),
+                        None => fetch_account_hash(&rpc, process_seq).await.unwrap_or_default(),
+                    };
 
                     acc_modified.clear();
                     acc_deleted.clear();
@@ -278,7 +328,7 @@ pub async fn start_ws_sync(
                     #[cfg(feature = "ffi")]
                     let tx_blobs_handle = {
                         let lag = closed_seq.saturating_sub(process_seq);
-                        if lag <= 25 && ffi_verifier.is_some() {
+                        if lag <= 25 && ffi_verifier.is_some() && !peers {
                             let rpc_c = rpc.clone();
                             let seq_c = process_seq;
                             Some(tokio::spawn(async move {
@@ -296,7 +346,16 @@ pub async fn start_ws_sync(
                     #[cfg(feature = "ffi")]
                     let mut sorted_txs: Vec<serde_json::Value> = Vec::new();
                     for attempt in 0..3u32 {
-                        match fetch_ledger_metadata(&rpc, process_seq, &mut acc_modified, &mut acc_deleted, &mut acc_tx_count).await {
+                        let got = match &peer_ledger {
+                            Some(p) => {
+                                acc_modified = p.modified.clone();
+                                acc_deleted = p.deleted.clone();
+                                acc_tx_count = p.tx_count;
+                                Ok((p.txs.clone(), p.header.clone(), p.wallet_delta))
+                            }
+                            None => fetch_ledger_metadata(&rpc, process_seq, &mut acc_modified, &mut acc_deleted, &mut acc_tx_count).await,
+                        };
+                        match got {
                             Ok((_txs, hdr, wallet_delta)) => {
                                 ledger_header = hdr;
                                 // 5.2(a): one channel send, and nothing at all unless XRPL_CONSENSUS_RECORD=1.
@@ -307,7 +366,10 @@ pub async fn start_ws_sync(
                                 if crate::own_validated::enabled() {
                                     let nunl = db.get(xrpl_ledger::ledger::keylet::negative_unl_key().0).ok().flatten();
                                     crate::own_validated::set_negative_unl(nunl.as_deref());
-                                    crate::own_validated::network_validated(process_seq, ledger_header.ledger_hash);
+                                    // From peers the hash is the quorum's own: nothing to judge (a witness may, later).
+                                    if !peers {
+                                        crate::own_validated::network_validated(process_seq, ledger_header.ledger_hash);
+                                    }
                                 }
                                 #[cfg(feature = "ffi")]
                                 { sorted_txs = _txs; }
@@ -337,17 +399,10 @@ pub async fn start_ws_sync(
                     // Include protocol-level singletons BEFORE FFI shadow hash
                     // so the shadow overlay covers ALL state changes.
                     if meta_ok {
-                        acc_modified.insert("B4979A36CDC7F3D3D5C31A4EAE2AC7D7209DDA877588B9AFC66799692AB0D66B".to_string()); // LedgerHashes
-                        acc_modified.insert("2E8A59AA9D3B5B186B0B9E0F62E6C02587CA74A4D778938E957B6357D364B244".to_string()); // NegativeUNL
-                        acc_modified.insert("7DB0788C020F02780A673DC74757F23823FA3014C1866E72CC4CD8B226CD6EF4".to_string()); // Amendments
-                        acc_modified.insert("4BC50C9B0D8515D3EAAE1E74B29A95804346C491EE1A95BF25E4AAB854A6A651".to_string()); // FeeSettings
-                        {
-                            use sha2::{Sha512, Digest};
-                            let group = process_seq / 65536;
-                            let mut data = vec![0x00u8, 0x73];
-                            data.extend_from_slice(&group.to_be_bytes());
-                            let hash = Sha512::digest(&data);
-                            acc_modified.insert(hex::encode(&hash[..32]).to_uppercase());
+                        // From .39 the network's bytes for these are fetched with the rest. From peers the engine
+                        // writes its own (native_shadow::singleton_writes), checked by the state hash.
+                        if !peers {
+                            acc_modified.extend(singleton_hex(process_seq));
                         }
                         for d in acc_deleted.iter().cloned().collect::<Vec<_>>() {
                             acc_modified.remove(&d);
@@ -389,9 +444,10 @@ pub async fn start_ws_sync(
                             // (when lag<=25 and ffi_verifier present). Just await
                             // the spawned task here. Sequential path remains as
                             // fallback for the rare case the handle wasn't created.
-                            let tx_blobs = match tx_blobs_handle {
-                                Some(h) => h.await.unwrap_or_default(),
-                                None => fetch_ledger_tx_blobs(&rpc, process_seq).await,
+                            let tx_blobs = match (&peer_ledger, tx_blobs_handle) {
+                                (Some(p), _) => p.pairs.iter().map(|(tx, _)| tx.clone()).collect(),
+                                (None, Some(h)) => h.await.unwrap_or_default(),
+                                (None, None) => fetch_ledger_tx_blobs(&rpc, process_seq).await,
                             };
                             if !tx_blobs.is_empty() {
                                 let v = verifier.clone();
@@ -464,7 +520,12 @@ pub async fn start_ws_sync(
                                 // buffer_unordered(16) caps concurrent in-flight requests at 16,
                                 // which rippled handles fine on its IO thread pool.
                                 let mut shadow_fetch_ok = true;
-                                let proto_modified: Vec<(String, Option<String>)> = {
+                                // From peers the FFI leg still applies and compares every result and object; only
+                                // this extra root check, which reads .39's copy of each changed object, is left out.
+                                let proto_modified: Vec<(String, Option<String>)> = if peers {
+                                    shadow_fetch_ok = false;
+                                    Vec::new()
+                                } else {
                                     let mut keys: Vec<String> = acc_modified.iter().cloned().collect();
                                     keys.extend(acc_deleted.iter().map(|k| k.clone()));
                                     keys.retain(|k| k.len() == 64);
@@ -710,7 +771,10 @@ pub async fn start_ws_sync(
                     {
                         let gate = txgate_mode();
                         if gate != TxGate::Off && closed_seq.saturating_sub(process_seq) <= 25 {
-                            let triples = fetch_ledger_tx_meta_all(&rpc, process_seq).await;
+                            let triples = match &peer_ledger {
+                                Some(p) => p.pairs.clone(),
+                                None => fetch_ledger_tx_meta_all(&rpc, process_seq).await,
+                            };
                             if crate::native_meta::enabled() {
                                 gate_pairs = triples.clone();
                             }
@@ -737,12 +801,14 @@ pub async fn start_ws_sync(
                                     // this proven copy (XRPL_PEER_FETCH=1; nothing when off).
                                     // Step 4 stage A: with what the engine takes from .39 (header, state root, JSON), so the
                                     // peers' copy is also made into the engine's inputs and held against these.
-                                    let inputs = crate::peer_fetch::enabled().then(|| crate::peer_fetch::Inputs {
-                                        header: ledger_header.clone(),
-                                        account_hash: account_hash.clone(),
-                                        txs: sorted_txs.clone(),
-                                    });
-                                    crate::peer_fetch::offer_network(process_seq, ledger_header.ledger_hash, &triples, inputs);
+                                    if !peers {
+                                        let inputs = crate::peer_fetch::enabled().then(|| crate::peer_fetch::Inputs {
+                                            header: ledger_header.clone(),
+                                            account_hash: account_hash.clone(),
+                                            txs: sorted_txs.clone(),
+                                        });
+                                        crate::peer_fetch::offer_network(process_seq, ledger_header.ledger_hash, &triples, inputs);
+                                    }
                                     let v = TXGATE_VERIFIED.fetch_add(1, Ordering::Relaxed) + 1;
                                     // Heartbeat every 256 ledgers so burn-in can confirm the gate
                                     // is live and read the running tallies (the happy path is
@@ -810,7 +876,11 @@ pub async fn start_ws_sync(
                                     Some(p) => match p.refusal {
                                         None => {
                                             wrote_native = true;
-                                            Some(p.overlay)
+                                            let mut overlay = p.overlay;
+                                            if peers {
+                                                overlay.extend(shadow.singleton_writes(process_seq));
+                                            }
+                                            Some(overlay)
                                         }
                                         Some(why) => {
                                             eprintln!("[native-writer] #{process_seq}: network bytes — {why}");
@@ -825,6 +895,27 @@ pub async fn start_ws_sync(
                     } else {
                         ffi_overlay_opt.take()
                     };
+                    // Independence Step 4: from peers there are no network bytes to fall back on over RPC. A ledger
+                    // the engine could not vouch for (a refusal, the mirror not loaded yet) is written from the
+                    // objects its records name and the system objects, each fetched from peers and proven to the
+                    // ledger's state root. Not delivered: hold, like a failed fetch.
+                    #[cfg(feature = "ffi")]
+                    let authoritative = match authoritative {
+                        None if peers => match peer_state_bytes(process_seq, &ledger_header, &account_hash, &acc_modified, &acc_deleted).await {
+                            Ok(o) => Some(o),
+                            Err(e) => {
+                                crate::ledger_source::stats().holds.fetch_add(1, Ordering::Relaxed);
+                                eprintln!("[ws-sync] peer source #{process_seq}: state objects: {e} — holding position, will retry");
+                                if let Some(shadow) = native_shadow.as_mut() {
+                                    shadow.abort(process_seq, false);
+                                }
+                                last_processed = process_seq.saturating_sub(1);
+                                break;
+                            }
+                        },
+                        a => a,
+                    };
+                    let rpc_for_bytes = (!peers).then_some(&rpc);
 
                     // Hash-check EVERY ledger (gap or tip). Validation count requires it,
                     // and root recompute is only ~50ms per ledger (dirty-bucket parallel).
@@ -836,7 +927,7 @@ pub async fn start_ws_sync(
                     let mut landed = LedgerWrite::default();
                     #[allow(unused_mut)]
                     let mut result = process_ledger(
-                        &rpc, &db, &hash_comp,
+                        rpc_for_bytes, &db, &hash_comp,
                         process_seq, &acc_modified, &acc_deleted,
                         &account_hash, acc_tx_count, compute_hash,
                         &history,
@@ -854,15 +945,30 @@ pub async fn start_ws_sync(
                         }
                         wrote_native = false;
                         landed = LedgerWrite { keep: true, ..LedgerWrite::default() };
-                        result = process_ledger(
-                            &rpc, &db, &hash_comp,
+                        let redo = if peers {
+                            match peer_state_bytes(process_seq, &ledger_header, &account_hash, &acc_modified, &acc_deleted).await {
+                                Ok(o) => Some(o),
+                                Err(e) => {
+                                    eprintln!("[ws-sync] peer source #{process_seq}: state objects for the redo: {e}");
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        result = if peers && redo.is_none() {
+                            false
+                        } else {
+                            process_ledger(
+                            rpc_for_bytes, &db, &hash_comp,
                             process_seq, &acc_modified, &acc_deleted,
                             &account_hash, acc_tx_count, compute_hash,
                             &history,
-                            None,
+                            redo,
                             &watchdog_live_edge,
                             &mut landed,
-                        ).await;
+                        ).await
+                        };
                     }
                     // Phase B: the mirror follows what was written, or undoes
                     // its own writes when nothing landed.
@@ -904,6 +1010,9 @@ pub async fn start_ws_sync(
                         break;
                     }
                     last_processed = process_seq;
+                    if peers {
+                        crate::ledger_source::stats().from_peers.fetch_add(1, Ordering::Relaxed);
+                    }
                     // SECURITY(5.3): Use Release ordering so Acquire loads see this
                     last_synced.store(process_seq, Ordering::Release);
                 } // end for process_seq
@@ -914,7 +1023,7 @@ pub async fn start_ws_sync(
                 // a reconnect so the next subscribe lands at the real live edge
                 // and the existing gap-fill code catches us up cleanly.
                 let live = watchdog_live_edge.load(Ordering::Acquire);
-                if live > 0 && last_processed > 0 {
+                if live > 0 && last_processed > 0 && !peers {
                     let lag = live.saturating_sub(last_processed);
                     if lag > 50 {
                         let now_ms = std::time::SystemTime::now()
@@ -960,6 +1069,60 @@ pub async fn start_ws_sync(
         eprintln!("[ws-sync] Disconnected. Reconnecting in 3s...");
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
+}
+
+/// Independence Step 4 (peer source): the bytes to write for a ledger the engine could not vouch for, from peers:
+/// [`fallback_keys`], each proven to the ledger's state root.
+#[cfg(feature = "ffi")]
+async fn peer_state_bytes(
+    seq: u32,
+    header: &LedgerHeader,
+    account_hash: &str,
+    modified: &HashSet<String>,
+    deleted: &HashSet<String>,
+) -> Result<crate::ffi_engine::LedgerOverlay, String> {
+    let root: [u8; 32] = hex::decode(account_hash)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| format!("no state root for #{seq}"))?;
+    let got = crate::peer_fetch::fetch_state_keys(header.ledger_hash, root, fallback_keys(seq, modified, deleted)).await?;
+    crate::ledger_source::stats().keyed_fallbacks.fetch_add(1, Ordering::Relaxed);
+    Ok(got.into_iter().collect())
+}
+
+/// Independence Step 4 (peer source): the state objects to fetch from peers for a ledger the engine could not
+/// vouch for: every object its records name, and the system objects (as ws-sync names them for `seq`). Sorted, no
+/// repeats.
+pub(crate) fn fallback_keys(seq: u32, modified: &HashSet<String>, deleted: &HashSet<String>) -> Vec<[u8; 32]> {
+    let mut keys: Vec<[u8; 32]> = modified
+        .iter()
+        .chain(deleted.iter())
+        .cloned()
+        .chain(singleton_hex(seq))
+        .filter_map(|h| hex::decode(h).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()))
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+/// The system objects ws-sync writes for `seq` besides the records' objects: the four static ones and the
+/// 65,536-group hash list (upper-case hex).
+fn singleton_hex(seq: u32) -> Vec<String> {
+    use sha2::{Digest, Sha512};
+    let mut v: Vec<String> = [
+        "B4979A36CDC7F3D3D5C31A4EAE2AC7D7209DDA877588B9AFC66799692AB0D66B", // LedgerHashes
+        "2E8A59AA9D3B5B186B0B9E0F62E6C02587CA74A4D778938E957B6357D364B244", // NegativeUNL
+        "7DB0788C020F02780A673DC74757F23823FA3014C1866E72CC4CD8B226CD6EF4", // Amendments
+        "4BC50C9B0D8515D3EAAE1E74B29A95804346C491EE1A95BF25E4AAB854A6A651", // FeeSettings
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let mut data = vec![0x00u8, 0x73];
+    data.extend_from_slice(&(seq / 65536).to_be_bytes());
+    v.push(hex::encode(&Sha512::digest(&data)[..32]).to_uppercase());
+    v
 }
 
 /// Count AccountRoot creates minus deletes in one tx's metadata.
@@ -1351,7 +1514,7 @@ struct LedgerWrite {
 }
 
 async fn process_ledger(
-    rpc: &RippledClient,
+    rpc: Option<&RippledClient>,
     db: &Arc<rocksdb::DB>,
     hash_comp: &Arc<crate::state_hash::StateHashComputer>,
     seq: u32,
@@ -1419,6 +1582,14 @@ async fn process_ledger(
             let mut k = [0u8; 32];
             k.copy_from_slice(&kb);
             if stage3_overlay_keys.contains(&k) { continue; }
+            // From peers (no RPC): the overlay holds every object that changed. A system object it leaves out did
+            // not change; anything else missing is a failure, and the ledger is held.
+            let Some(rpc) = rpc else {
+                if !singleton_hex(seq).contains(&index_hex.to_uppercase()) {
+                    failed += 1;
+                }
+                continue;
+            };
             let mut got = false;
             for attempt in 0..3u32 {
                 let resp = rpc.client.post(rpc.rpc_url())
@@ -1455,6 +1626,10 @@ async fn process_ledger(
     }
 
     if !stage3_used {
+        let Some(rpc) = rpc else {
+            eprintln!("[ws-sync] Ledger #{seq}: no bytes to write (peer source, no overlay) — holding position");
+            return false;
+        };
         // Fetch all modified objects in parallel — 64 concurrent requests max.
         // Previous sequential approach: 500 objs × 3ms = 1.5s
         // Parallel with 64 concurrent: ~50ms
@@ -1701,6 +1876,8 @@ async fn process_ledger(
                     }
                     return false;
                     // --- unreachable retry+scan code below, kept for reference ---
+                    #[allow(unreachable_code)]
+                    let Some(rpc) = rpc else { return false };
                     #[allow(unreachable_code)]
                     let mut healed = false;
                     #[allow(unreachable_code)]
@@ -2062,6 +2239,31 @@ mod undo_tests {
     /// Both rollbacks restore the ledger's pre-images AND rewind the bookmark, so a warm restart
     /// never trusts a `meta:last_seq` one ledger ahead of the state (the "no hash root" rollback
     /// used to leave it at `seq`).
+    #[test]
+    fn fallback_keys_add_the_system_objects() {
+        let seq = 107_937_280;
+        let modified: HashSet<String> = ["AA".repeat(32), "BB".repeat(32)].into_iter().collect();
+        let deleted: HashSet<String> = ["CC".repeat(32), "aa".repeat(32)].into_iter().collect();
+        let keys = fallback_keys(seq, &modified, &deleted);
+        assert_eq!(keys.len(), 3 + 5, "the records' three objects (one named twice) and the five system objects");
+        assert!(keys.windows(2).all(|w| w[0] < w[1]), "sorted, no repeats");
+        for h in crate::stage3::singleton_keys_for(seq) {
+            let k: [u8; 32] = hex::decode(&h).unwrap().try_into().unwrap();
+            assert!(keys.contains(&k), "{h}");
+        }
+    }
+
+    #[test]
+    fn ws_syncs_system_objects_are_stage3s() {
+        for seq in [1, 65_535, 65_536, 107_937_280, 107_937_281] {
+            let mut ours = singleton_hex(seq);
+            let mut theirs: Vec<String> = crate::stage3::singleton_keys_for(seq).iter().map(|h| h.to_uppercase()).collect();
+            ours.sort();
+            theirs.sort();
+            assert_eq!(ours, theirs, "#{seq}");
+        }
+    }
+
     #[test]
     fn undo_batch_restores_pre_images_and_rewinds_the_bookmark() {
         let dir = tempfile::tempdir().unwrap();
