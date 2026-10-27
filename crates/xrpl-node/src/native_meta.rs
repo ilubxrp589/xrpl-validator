@@ -144,7 +144,7 @@ pub fn check_ledger(seq: u32, network: &[(Vec<u8>, Vec<u8>)], header_root: &[u8;
 }
 
 fn log_receipts(receipts: &[Value]) {
-    let path = std::env::var("XRPL_NATIVE_META_LOG").unwrap_or_else(|_| "/mnt/xrpl-data/native_meta.jsonl".into());
+    let path = std::env::var("XRPL_NATIVE_META_LOG").unwrap_or_else(|_| format!("{}/native_meta.jsonl", crate::paths::data_dir()));
     if std::fs::metadata(&path).map(|m| m.len() > 20 << 20).unwrap_or(false) {
         return;
     }

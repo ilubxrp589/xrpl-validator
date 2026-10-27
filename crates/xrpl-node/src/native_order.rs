@@ -291,7 +291,7 @@ pub fn judge(seq: u32, mode: Mode, v: &Verdict, walked: &Walked, bytes: Option<(
 
 /// `XRPL_NATIVE_ORDER_LOG`, else /mnt/xrpl-data/native_order.jsonl.
 pub fn log_path() -> std::path::PathBuf {
-    std::env::var_os("XRPL_NATIVE_ORDER_LOG").map(Into::into).unwrap_or_else(|| "/mnt/xrpl-data/native_order.jsonl".into())
+    std::env::var_os("XRPL_NATIVE_ORDER_LOG").map(Into::into).unwrap_or_else(|| format!("{}/native_order.jsonl", crate::paths::data_dir()).into())
 }
 
 /// Append one receipt line, unless the file has passed 20 MB.

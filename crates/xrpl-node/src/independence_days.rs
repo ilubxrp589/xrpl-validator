@@ -149,7 +149,7 @@ struct Live {
 }
 
 fn path() -> String {
-    std::env::var("XRPL_INDEPENDENCE_DAYS").unwrap_or_else(|_| "/mnt/xrpl-data/independence_days.json".into())
+    std::env::var("XRPL_INDEPENDENCE_DAYS").unwrap_or_else(|_| format!("{}/independence_days.json", crate::paths::data_dir()))
 }
 
 fn live() -> &'static Mutex<Live> {

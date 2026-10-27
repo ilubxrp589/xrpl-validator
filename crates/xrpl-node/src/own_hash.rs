@@ -283,7 +283,7 @@ pub fn ledger(seq: u32, net: &LedgerHeader, net_account: &str, parts: &Parts) {
 }
 
 fn log_receipt(line: &Value) {
-    let path = std::env::var("XRPL_OWN_HASH_LOG").unwrap_or_else(|_| "/mnt/xrpl-data/own_hash.jsonl".into());
+    let path = std::env::var("XRPL_OWN_HASH_LOG").unwrap_or_else(|_| format!("{}/own_hash.jsonl", crate::paths::data_dir()));
     if std::fs::metadata(&path).map(|m| m.len() > 20 << 20).unwrap_or(false) {
         return;
     }

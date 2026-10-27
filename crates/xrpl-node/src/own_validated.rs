@@ -691,7 +691,7 @@ fn settle(judged: Vec<(u32, Verdict)>) {
 }
 
 fn log_receipt(line: &Value) {
-    let path = std::env::var("XRPL_OWN_VALIDATED_LOG").unwrap_or_else(|_| "/mnt/xrpl-data/own_validated.jsonl".into());
+    let path = std::env::var("XRPL_OWN_VALIDATED_LOG").unwrap_or_else(|_| format!("{}/own_validated.jsonl", crate::paths::data_dir()));
     if std::fs::metadata(&path).map(|m| m.len() > 20 << 20).unwrap_or(false) {
         return;
     }

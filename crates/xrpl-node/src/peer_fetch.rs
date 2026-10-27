@@ -222,7 +222,7 @@ pub fn stats() -> &'static FetchStats {
 
 /// `XRPL_PEER_FETCH_LOG`, else /mnt/xrpl-data/peer_fetch.jsonl.
 pub fn log_path() -> std::path::PathBuf {
-    std::env::var_os("XRPL_PEER_FETCH_LOG").map(Into::into).unwrap_or_else(|| "/mnt/xrpl-data/peer_fetch.jsonl".into())
+    std::env::var_os("XRPL_PEER_FETCH_LOG").map(Into::into).unwrap_or_else(|| format!("{}/peer_fetch.jsonl", crate::paths::data_dir()).into())
 }
 
 /// Append one receipt line, unless the file has passed 20 MB.

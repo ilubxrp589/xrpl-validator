@@ -534,7 +534,7 @@ impl NativeShadow {
         }
         stats().enabled.store(1, Ordering::Relaxed);
         let path = std::env::var("XRPL_NATIVE_SHADOW_LOG")
-            .unwrap_or_else(|_| "/mnt/xrpl-data/native_shadow.jsonl".to_string());
+            .unwrap_or_else(|_| format!("{}/native_shadow.jsonl", crate::paths::data_dir()));
         let log = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
         let canary = std::env::var("XRPL_NATIVE_SHADOW_CANARY")
             .ok()
@@ -595,7 +595,7 @@ impl NativeShadow {
         stats().writer_enabled.store(1, Ordering::Relaxed);
         let path = std::env::var("XRPL_NATIVE_WRITER_LOG").unwrap_or_else(|_| {
             let receipts = std::env::var("XRPL_NATIVE_SHADOW_LOG")
-                .unwrap_or_else(|_| "/mnt/xrpl-data/native_shadow.jsonl".to_string());
+                .unwrap_or_else(|_| format!("{}/native_shadow.jsonl", crate::paths::data_dir()));
             std::path::Path::new(&receipts)
                 .parent()
                 .map(|d| d.join("native_writer.jsonl").display().to_string())

@@ -246,7 +246,7 @@ pub async fn fetch_default_unl_verified() -> Result<Vec<UnlEntry>, String> {
 fn unl_env() -> (Option<String>, String) {
     let pinned = std::env::var("XRPL_UNL_PINNED_KEY").ok();
     let state_path = std::env::var("XRPL_UNL_STATE")
-        .unwrap_or_else(|_| "/mnt/xrpl-data/unl-last-good.json".to_string());
+        .unwrap_or_else(|_| format!("{}/unl-last-good.json", crate::paths::data_dir()));
     (pinned, state_path)
 }
 

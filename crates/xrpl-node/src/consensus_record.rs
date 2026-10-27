@@ -112,7 +112,8 @@ use crate::ws_sync::LedgerHeader;
 
 /// File format version, on every line as `ver`.
 pub const FORMAT_VERSION: u64 = 1;
-/// Where the file goes unless `XRPL_CONSENSUS_RECORD_PATH` says otherwise.
+/// Where the file goes unless `XRPL_CONSENSUS_RECORD_PATH` says otherwise, with the default data directory
+/// (`XRPL_DATA_DIR` moves it there).
 pub const DEFAULT_PATH: &str = "/mnt/xrpl-data/consensus_rounds.jsonl";
 /// The file rotates when the next line would take it past this many bytes.
 pub const ROTATE_BYTES: u64 = 200_000_000;
@@ -915,7 +916,7 @@ fn recorder() -> Option<&'static Recorder> {
                 return None;
             }
             let path = std::env::var("XRPL_CONSENSUS_RECORD_PATH")
-                .unwrap_or_else(|_| DEFAULT_PATH.to_string());
+                .unwrap_or_else(|_| format!("{}/consensus_rounds.jsonl", crate::paths::data_dir()));
             match Recorder::start(PathBuf::from(&path), ROTATE_BYTES, KEEP) {
                 Ok(r) => {
                     eprintln!(
