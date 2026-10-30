@@ -882,7 +882,7 @@ pub async fn start_ws_sync(
                                 // (the twin, 10-27: 3 ledgers a minute to the network's 15). Ledgers landed while it
                                 // loads are queued and replayed (pending).
                                 let hydrate_lag = if peers { 0 } else { lag_now };
-                                if !shadow.is_active() && !shadow.writer_tripped() && shadow.can_hydrate(hydrate_lag) {
+                                if !shadow.is_active() && shadow.can_hydrate(hydrate_lag) {
                                     shadow.hydrate(&db, process_seq - 1);
                                 }
                                 let key = |h: &String| -> Option<[u8; 32]> {

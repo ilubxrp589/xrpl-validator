@@ -2048,8 +2048,11 @@ async fn main() {
                                 "refused": s.writer_refused.load(Relaxed),
                                 "distrusted": s.writer_distrusted.load(Relaxed),
                                 "mismatch": s.writer_mismatch.load(Relaxed),
-                                // 1: repeated hash failures turned the writer off until restart.
-                                "breaker": s.writer_breaker.load(Relaxed) == 1,
+                                // Hash failures on our bytes in the last 1000 ledgers (3 or more: the
+                                // alarm; the writer stays on), and how many the mirror came through
+                                // by patching in place.
+                                "strikes": s.writer_strikes.load(Relaxed),
+                                "patched": s.writer_patched.load(Relaxed),
                             },
                         });
                     }

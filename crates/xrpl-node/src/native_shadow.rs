@@ -107,9 +107,12 @@ pub struct ShadowStats {
     pub writer_refused: AtomicU64,
     pub writer_distrusted: AtomicU64,
     pub writer_mismatch: AtomicU64,
-    /// 1 once BREAKER_FAILS hash failures on our bytes landed within
-    /// BREAKER_WINDOW ledgers: the writer is off until the next restart.
-    pub writer_breaker: AtomicU64,
+    /// Hash failures on our bytes within the last BREAKER_WINDOW ledgers;
+    /// BREAKER_FAILS or more is an alarm. The writer stays on either way.
+    pub writer_strikes: AtomicU64,
+    /// Hash failures the mirror came through by taking the retry's network
+    /// bytes in place, with no rebuild.
+    pub writer_patched: AtomicU64,
 }
 
 pub fn stats() -> &'static ShadowStats {
@@ -276,9 +279,11 @@ pub struct NativeShadow {
     bad_keys: HashSet<[u8; 32]>,
     /// More bad keys than BAD_KEYS_CAP: vouch for nothing until a re-hydrate.
     bad_overflow: bool,
-    /// Ledgers whose writes from our bytes failed the state hash (the breaker's window).
+    /// Ledgers whose writes from our bytes failed the state hash (the alarm's window).
     writer_fails: Vec<u32>,
-    writer_tripped: bool,
+    /// The ledger our bytes just failed the state hash on: its retry from the network's bytes patches the mirror in
+    /// place (commit) instead of a rebuild.
+    patching: Option<u32>,
     /// Independence 3.3: `XRPL_NATIVE_ORDER` (off, shadow, on), and where its receipts go.
     order_mode: crate::native_order::Mode,
     order_log: std::path::PathBuf,
@@ -415,10 +420,18 @@ struct HydrateOutcome {
 /// for a ledger that writes one; past this many it vouches for nothing.
 const BAD_KEYS_CAP: usize = 4096;
 
-/// Phase B breaker: this many hash failures on our bytes within
-/// BREAKER_WINDOW ledgers turns the writer off until the next restart.
+/// Phase B alarm: this many hash failures on our bytes within BREAKER_WINDOW
+/// ledgers. Until cycle 191 it turned the writer off until the next restart;
+/// since 5a signs only our own hash that would stop the signing too, so it is an
+/// alarm now (James, 2026-10-29: "an alarm for it would be better than just
+/// shutting it down"). Every write is still held to the network's state hash.
 const BREAKER_FAILS: usize = 3;
 const BREAKER_WINDOW: u32 = 1000;
+
+/// A hash failure within this many ledgers of the last one rebuilds the mirror
+/// instead of patching it: a stale entry the engine only READ is not among the
+/// retry's written keys, so patching would not reach it, and it would fail again.
+const PATCH_GAP: u32 = 20;
 
 /// A ledger the sync loop processed while the mirror was still building.
 enum PendingLedger {
@@ -515,7 +528,7 @@ impl NativeShadow {
             bad_keys: HashSet::new(),
             bad_overflow: false,
             writer_fails: Vec::new(),
-            writer_tripped: false,
+            patching: None,
             order_mode,
             order_log,
             totals: [(0, 0), parent_total.map_or((0, 0), |t| (at_seq, t))],
@@ -580,7 +593,7 @@ impl NativeShadow {
             bad_keys: HashSet::new(),
             bad_overflow: false,
             writer_fails: Vec::new(),
-            writer_tripped: false,
+            patching: None,
             order_mode: crate::native_order::mode(),
             order_log: crate::native_order::log_path(),
             totals: [(0, 0); 2],
@@ -729,9 +742,10 @@ impl NativeShadow {
         self.hydrated || self.hydrating.is_some()
     }
 
-    /// Phase B: the breaker turned the writer off; the mirror has no further use.
-    pub fn writer_tripped(&self) -> bool {
-        self.writer_tripped
+    /// Phase B: BREAKER_FAILS hash failures on our bytes inside BREAKER_WINDOW ledgers. An alarm only: the writer
+    /// stays on.
+    pub fn writer_alarm(&self) -> bool {
+        self.writer_fails.len() >= BREAKER_FAILS
     }
 
     /// Land a finished build: install the mirror and replay everything the
@@ -1849,10 +1863,6 @@ impl NativeShadow {
             st.writer_distrusted.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        if self.writer_tripped {
-            st.writer_unready.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
         let t0 = std::time::Instant::now();
         let ordered = apply_order(txs);
         let applied = self.apply_ledger(seq, parent_hash, parent_close_time, total_drops, &ordered);
@@ -2022,6 +2032,9 @@ impl NativeShadow {
         }
         self.own_state = Some((seq, Some("no mirror to apply on".into())));
         self.poll_hydrate();
+        self.writer_fails.retain(|s| seq.saturating_sub(*s) < BREAKER_WINDOW);
+        st.writer_strikes.store(self.writer_fails.len() as u64, Ordering::Relaxed);
+        let patching = self.patching.take() == Some(seq);
         if !self.hydrated {
             self.held = None;
             if self.distrust == Some(seq) {
@@ -2057,6 +2070,10 @@ impl NativeShadow {
         self.reconcile(seq, undo, written, true);
         if self.distrust == Some(seq) {
             self.distrust = None;
+        }
+        if patching && !ours {
+            st.writer_patched.fetch_add(1, Ordering::Relaxed);
+            eprintln!("[native-shadow] #{seq}: mirror patched from the network's bytes — kept, no rebuild");
         }
         self.read_amendments(seq);
     }
@@ -2113,10 +2130,13 @@ impl NativeShadow {
     /// Nothing landed for `seq` (the write was held back or rolled back):
     /// undo our writes so the mirror is the parent ledger again.
     /// `mismatch_on_ours`: our bytes were written and failed the state hash.
-    /// The retry is written from the network's bytes; the mirror is dropped
-    /// (a stale entry the engine only READ would repeat the failure) and
-    /// re-hydrates after the cooldown; BREAKER_FAILS of these within
-    /// BREAKER_WINDOW ledgers turn the writer off until the next restart.
+    /// The retry is written from the network's bytes, and the mirror takes
+    /// them in place (commit), so the next ledger is ours again. Until cycle
+    /// 191 the mirror was dropped and rebuilt instead (about 4 minutes, every
+    /// ledger in them unsigned: 40 after #107989363). A second failure within
+    /// PATCH_GAP ledgers still rebuilds it (a stale entry the engine only READ
+    /// would repeat the failure). BREAKER_FAILS of these within BREAKER_WINDOW
+    /// ledgers raise the alarm; the writer stays on.
     pub fn abort(&mut self, seq: u32, mismatch_on_ours: bool) {
         if let Some(h) = self.held.take() {
             self.revert(h.undo);
@@ -2125,21 +2145,26 @@ impl NativeShadow {
             let st = stats();
             st.writer_mismatch.fetch_add(1, Ordering::Relaxed);
             self.distrust = Some(seq);
+            let last = self.writer_fails.last().copied();
             self.writer_fails.retain(|s| seq.saturating_sub(*s) < BREAKER_WINDOW);
             self.writer_fails.push(seq);
-            let tripped = self.writer_fails.len() >= BREAKER_FAILS && !self.writer_tripped;
+            st.writer_strikes.store(self.writer_fails.len() as u64, Ordering::Relaxed);
             eprintln!("[native-writer] #{seq}: our bytes failed the state hash — rolled back; the retry uses the network's");
             self.writer_note(json!({ "seq": seq, "mismatch": true, "recent": self.writer_fails }));
-            if tripped {
-                self.writer_tripped = true;
-                st.writer_breaker.store(1, Ordering::Relaxed);
+            if self.writer_alarm() {
                 eprintln!(
-                    "[native-writer] BREAKER: {} hash failures on our bytes within {BREAKER_WINDOW} ledgers — writer OFF until restart; state comes from the network",
+                    "[native-writer] ALARM: {} hash failures on our bytes within {BREAKER_WINDOW} ledgers — the writer stays on, each retried from the network's bytes",
                     self.writer_fails.len()
                 );
-                self.writer_note(json!({ "seq": seq, "breaker": true, "fails": self.writer_fails }));
+                self.writer_note(json!({ "seq": seq, "alarm": true, "fails": self.writer_fails }));
             }
-            self.drop_mirror("hash failure on our bytes");
+            match last {
+                Some(p) if seq.saturating_sub(p) < PATCH_GAP => {
+                    self.patching = None;
+                    self.drop_mirror(&format!("hash failure on our bytes, the second within {PATCH_GAP} ledgers"));
+                }
+                _ => self.patching = Some(seq),
+            }
         }
     }
 
@@ -2335,7 +2360,7 @@ mod tests {
             bad_keys: HashSet::new(),
             bad_overflow: false,
             writer_fails: Vec::new(),
-            writer_tripped: false,
+            patching: None,
             order_mode: crate::native_order::Mode::Off,
             order_log: log.with_file_name("native_order.jsonl"),
             totals: [(0, 0); 2],
@@ -2503,49 +2528,74 @@ mod tests {
     }
 
     #[test]
-    fn a_hash_failure_on_our_bytes_drops_the_mirror_and_the_retry_is_the_networks() {
+    fn a_hash_failure_on_our_bytes_patches_the_mirror_from_the_networks_retry() {
         let dir = tempfile::tempdir().unwrap();
         let (log, trigger) = (dir.path().join("receipts.jsonl"), dir.path().join("native_shadow.canary"));
         let (seq, parent, pct, drops, tx, state, overlay) = payment_ledger();
         let (keys, deleted) = meta_of(&overlay);
         let mut sh = shadow(state, seq - 1, &log, &trigger);
-        let failed = stats().writer_mismatch.load(Ordering::Relaxed);
+        let (failed, patched) = (stats().writer_mismatch.load(Ordering::Relaxed), stats().writer_patched.load(Ordering::Relaxed));
         let txs = [tx];
         sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).unwrap();
         sh.abort(seq, true);
         assert!(stats().writer_mismatch.load(Ordering::Relaxed) > failed);
-        assert!(!sh.hydrated, "a mirror that produced wrong bytes is not trusted again: re-hydrate");
+        assert!(sh.hydrated, "kept: the retry's bytes patch it (cycle 191; #107989363 cost 40 unsigned ledgers to a rebuild)");
+        assert_eq!(sh.at_seq, seq - 1, "our writes undone: still the parent");
         assert_eq!(sh.distrust, Some(seq));
-        assert!(sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).is_none());
+        assert!(sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).is_none(), "the retry is the network's");
         sh.commit(seq, &overlay, false);
         assert_eq!(sh.distrust, None, "the network's write clears it");
+        assert_eq!(sh.at_seq, seq, "the mirror follows the network's bytes");
+        assert!(stats().writer_patched.load(Ordering::Relaxed) > patched);
+        assert_eq!(sh.state_not_ours(seq).as_deref(), Some("the network's bytes"), "that ledger itself is not ours to sign");
+        for (k, want) in &overlay {
+            let have = sh.state.state_map.lookup(&Hash256(*k)).map(encode_entry).transpose().unwrap();
+            assert_eq!(&have, want, "key {} is the network's", hex::encode_upper(k));
+        }
     }
 
     #[test]
-    fn the_breaker_turns_the_writer_off_after_repeated_hash_failures() {
+    fn a_second_hash_failure_soon_after_rebuilds_the_mirror() {
         let dir = tempfile::tempdir().unwrap();
         let (log, trigger) = (dir.path().join("receipts.jsonl"), dir.path().join("native_shadow.canary"));
         let (seq, parent, pct, drops, tx, state, overlay) = payment_ledger();
         let (keys, deleted) = meta_of(&overlay);
-        let mut sh = shadow(LedgerState::new_unverified(state.header.clone()), 0, &log, &trigger);
+        let mut sh = shadow(state, seq - 1, &log, &trigger);
+        sh.writer_fails.push(seq - PATCH_GAP + 1);
+        sh.propose(seq, &parent, pct, drops, &[tx], &keys, &deleted, None).unwrap();
+        sh.abort(seq, true);
+        assert!(!sh.hydrated, "a stale entry the engine only read would fail again: rebuild");
+        assert_eq!(sh.patching, None);
+        assert_eq!(sh.distrust, Some(seq));
+    }
+
+    #[test]
+    fn repeated_hash_failures_raise_the_alarm_and_the_writer_stays_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, trigger) = (dir.path().join("receipts.jsonl"), dir.path().join("native_shadow.canary"));
+        let (seq, parent, pct, drops, tx, state, overlay) = payment_ledger();
+        let (keys, deleted) = meta_of(&overlay);
+        let mut sh = shadow(state, seq - 1, &log, &trigger);
+        // Two earlier failures inside the window, far enough apart to have been patched.
+        sh.writer_fails = vec![seq - 3 * PATCH_GAP, seq - 2 * PATCH_GAP];
+        assert!(!sh.writer_alarm());
         let txs = [tx];
-        for n in 0..BREAKER_FAILS {
-            let (_, _, _, _, _, fresh, _) = payment_ledger();
-            sh.state = fresh;
-            sh.hydrated = true;
-            sh.at_seq = seq - 1;
-            sh.distrust = None;
-            assert!(!sh.writer_tripped(), "not yet, after {n}");
-            sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).unwrap();
-            sh.abort(seq, true);
-        }
-        assert!(sh.writer_tripped(), "{BREAKER_FAILS} failures inside the window");
-        assert_eq!(stats().writer_breaker.load(Ordering::Relaxed), 1);
-        sh.state = state;
-        sh.hydrated = true;
+        sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).unwrap();
+        sh.abort(seq, true);
+        assert!(sh.writer_alarm(), "{BREAKER_FAILS} failures inside {BREAKER_WINDOW} ledgers");
+        assert!(sh.hydrated, "patched, not rebuilt: the last failure was {} ledgers back", 2 * PATCH_GAP);
+        // The next try is ours again: the writer did not turn off (until cycle 191 it stayed off until a restart).
+        let (_, _, _, _, _, fresh, _) = payment_ledger();
+        sh.state = fresh;
         sh.at_seq = seq - 1;
         sh.distrust = None;
-        assert!(sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).is_none(), "the writer stays off");
+        assert!(
+            sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).is_some(),
+            "the writer stays on: no restart needed (James, 2026-10-29)"
+        );
+        sh.abort(seq, false);
+        sh.commit(seq + BREAKER_WINDOW, &LedgerOverlay::new(), false);
+        assert!(!sh.writer_alarm(), "and the alarm clears once the window has passed");
     }
 
     #[test]
