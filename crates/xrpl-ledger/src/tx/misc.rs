@@ -219,26 +219,25 @@ impl Transactor for SignerListSetTransactor {
                 }
             }
             if let Some(data) = sandbox.read(&signer_list_key) {
-                let node_hint = serde_json::from_slice::<serde_json::Value>(&data)
-                    .ok()
-                    .and_then(|l| {
-                        l.get("OwnerNode")
-                            .and_then(|v| v.as_str())
-                            .and_then(|h| u64::from_str_radix(h, 16).ok())
-                    });
+                let old = serde_json::from_slice::<serde_json::Value>(&data).ok();
+                let node_hint = old.as_ref().and_then(|l| {
+                    l.get("OwnerNode")
+                        .and_then(|v| v.as_str())
+                        .and_then(|h| u64::from_str_radix(h, 16).ok())
+                });
+                // removeSignersFromLedger, as in a replacement below: one unit with lsfOneOwnerCount, else a legacy
+                // list's 2 + entries. #107989363 0A9A6F552C51 deleted a 2-entry list from before MultiSignReserve:
+                // mainnet's OwnerCount went 14 → 10, ours 14 → 13.
+                let dec: i64 = match old.as_ref() {
+                    Some(l) if l["Flags"].as_u64().unwrap_or(0) & 0x0001_0000 != 0 => 1,
+                    Some(l) => 2 + l["SignerEntries"].as_array().map_or(0, |a| a.len()) as i64,
+                    None => 1,
+                };
                 sandbox.delete(signer_list_key);
                 crate::ledger::directory::owner_dir_remove(
                     sandbox, &tx.account, &signer_list_key, node_hint, false,
                 );
-                if let Some(data) = sandbox.read(&acct_key) {
-                    if let Ok(mut acct) = serde_json::from_slice::<serde_json::Value>(&data) {
-                        let count = acct["OwnerCount"].as_u64().unwrap_or(0);
-                        if count > 0 {
-                            acct["OwnerCount"] = serde_json::Value::Number((count - 1).into());
-                        }
-                        sandbox.write(acct_key, serde_json::to_vec(&acct).unwrap());
-                    }
-                }
+                crate::tx::offer::owner_count_add(sandbox, &tx.account, -dec);
             }
         } else {
             let mut signers = tx.fields.get("SignerEntries")
@@ -1144,6 +1143,49 @@ mod tests {
 
         assert_eq!(SignerListSetTransactor.do_apply(&remove_tx, &mut sandbox), TxResult::Success);
         assert_eq!(read_owner_count(&sandbox, &alice), 0);
+    }
+
+    /// #107989363 0A9A6F552C51: deleting a list from before MultiSignReserve (no lsfOneOwnerCount) gives back
+    /// 2 + its entries, not one. Mainnet's OwnerCount went 14 → 10 for a 2-entry list; ours went 14 → 13.
+    #[test]
+    fn removing_a_legacy_signer_list_gives_back_two_plus_its_entries() {
+        let alice = [0x01u8; 20];
+        let state = make_state(&[(alice, 50_000_000)]);
+        let mut sandbox = Sandbox::new(&state);
+        let tx = |sequence, fields| TxFields {
+            account: alice,
+            tx_type: "SignerListSet".to_string(),
+            fee: 12,
+            sequence,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields,
+            inner_batch: false,
+        };
+        let set = tx(
+            1,
+            serde_json::json!({
+                "SignerQuorum": 2,
+                "SignerEntries": [
+                    {"SignerEntry": {"Account": hex::encode([0x02u8; 20]), "SignerWeight": 1}},
+                    {"SignerEntry": {"Account": hex::encode([0x03u8; 20]), "SignerWeight": 1}},
+                ]
+            }),
+        );
+        assert_eq!(SignerListSetTransactor.do_apply(&set, &mut sandbox), TxResult::Success);
+
+        // Make it a legacy list: no lsfOneOwnerCount, charged 2 + 2 entries, beside 10 other objects.
+        let key = keylet::signers_key(&alice);
+        let mut list: serde_json::Value = serde_json::from_slice(&sandbox.read(&key).unwrap()).unwrap();
+        list["Flags"] = 0.into();
+        sandbox.write(key, serde_json::to_vec(&list).unwrap());
+        crate::tx::offer::owner_count_add(&mut sandbox, &alice, 13);
+        assert_eq!(read_owner_count(&sandbox, &alice), 14);
+
+        let remove = tx(2, serde_json::json!({"SignerQuorum": 0}));
+        assert_eq!(SignerListSetTransactor.do_apply(&remove, &mut sandbox), TxResult::Success);
+        assert_eq!(read_owner_count(&sandbox, &alice), 10);
+        assert!(!sandbox.exists(&key));
     }
 
     #[test]
