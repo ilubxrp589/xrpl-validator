@@ -136,13 +136,38 @@ impl Transactor for AMMCreateTransactor {
         if sandbox.exists(&pool) {
             return TxResult::Duplicate;
         }
+        // 2. requireAuth (the default Legacy check) on Amount then Amount2,
+        //    checkFrozen on Amount then Amount2, then an issuer without
+        //    lsfDefaultRipple is terNO_RIPPLE (:107-146) — all before the
+        //    reserve and funds. #108008726 34C1C80B45F6: a PLX/BEEP create
+        //    by an account whose BEEP line its issuer froze — mainnet
+        //    tecFROZEN, we skipped the freeze check and called it
+        //    tecUNFUNDED_AMM (frozen funds count as zero).
+        for leg in [&l1, &l2] {
+            if let Some(t) = ox::require_auth_ter(sandbox, leg, &tx.account, false) {
+                if t != TxResult::Success { return t; }
+            }
+        }
+        for leg in [&l1, &l2] {
+            if let Some(t) = ox::frozen_ter(sandbox, leg, &tx.account) {
+                if t != TxResult::Success { return t; }
+            }
+        }
+        const LSF_DEFAULT_RIPPLE: u64 = 0x0080_0000;
+        if [&l1, &l2].iter().any(|leg| {
+            !leg.xrp
+                && ox::json_at(sandbox, &keylet::account_root_key(&leg.issuer))
+                    .is_some_and(|r| r["Flags"].as_u64().unwrap_or(0) & LSF_DEFAULT_RIPPLE == 0)
+        }) {
+            return TxResult::NoRipple;
+        }
         let Some(acct) = ox::json_at(sandbox, &acct_key) else {
             return TxResult::NoAccount;
         };
         let bal: u128 =
             acct["Balance"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
         let oc = acct["OwnerCount"].as_u64().unwrap_or(0);
-        // 2. The creator must clear the reserve WITH the LPToken line it is
+        // 3. The creator must clear the reserve WITH the LPToken line it is
         //    about to open: xrpLiquid(account, +1) ≤ 0 is
         //    tecINSUF_RESERVE_LINE (:150-157). Preclaim runs pre-fee, which
         //    IS rippled's view of it.
@@ -151,7 +176,7 @@ impl Transactor for AMMCreateTransactor {
         if liquid == 0 {
             return TxResult::InsufReserveLine;
         }
-        // 3. Funds (:159-175): the XRP side against that same liquid; an IOU
+        // 4. Funds (:159-175): the XRP side against that same liquid; an IOU
         //    side via accountFunds under ZeroIfFrozen — offer::available's
         //    exact semantics (ZeroIfUnauthorized is not modeled; require-auth
         //    issuers do not appear on the corpora). Falling short is
@@ -172,7 +197,7 @@ impl Transactor for AMMCreateTransactor {
                 return TxResult::UnfundedAmm;
             }
         }
-        // 4. Neither side may itself be an LP token: an issuer whose
+        // 5. Neither side may itself be an LP token: an issuer whose
         //    AccountRoot carries AMMID refuses with tecAMM_INVALID_TOKENS
         //    (:177-186). Only a READABLE issuer condemns (collect_issuers
         //    hydrates every named issuer).
@@ -3795,6 +3820,85 @@ mod tests {
             TxResult::UnfundedAmm,
             "short with the line already there is funds, not reserve",
         );
+    }
+
+    /// #108008726 34C1C80B45F6: AMMCreate refuses a frozen asset before it looks at funds — the issuer's freeze on the
+    /// creator's line (the issuer's side of it) or the issuer's global freeze is tecFROZEN; the holder's own freeze
+    /// bit is not. An issuer without lsfDefaultRipple is terNO_RIPPLE, also before funds (AMMCreate.cpp:119-146).
+    #[test]
+    fn amm_create_refuses_a_frozen_asset_before_funds() {
+        let issuer = [0x01u8; 20];
+        let holder = [0x05u8; 20];
+        let mut state = make_state(&holder, 100_000_000);
+        let put_root = |state: &mut LedgerState, flags: u64| {
+            let a = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": hex::encode(issuer), "Flags": flags,
+                "Balance": "500000000", "Sequence": 1, "OwnerCount": 0,
+            });
+            state.state_map.insert(keylet::account_root_key(&issuer), serde_json::to_vec(&a).unwrap()).unwrap();
+        };
+        let leg = crate::tx::offer::leg_of(
+            &serde_json::json!({"currency": "BEP", "issuer": hex::encode(issuer), "value": "1"}),
+        )
+        .unwrap();
+        // The issuer is the LOW side: the holder's 50 BEP is a negative Balance, and the issuer's freeze is lsfLowFreeze.
+        let put_line = |state: &mut LedgerState, flags: u64| {
+            let c = hex::encode_upper(leg.cur);
+            let line = serde_json::json!({
+                "LedgerEntryType": "RippleState", "Flags": flags,
+                "Balance": {"currency": c, "issuer": "0000000000000000000000000000000000000000", "value": "-50"},
+                "LowLimit": {"currency": c, "issuer": hex::encode(issuer), "value": "0"},
+                "HighLimit": {"currency": c, "issuer": hex::encode(holder), "value": "1000"},
+            });
+            state
+                .state_map
+                .insert(keylet::ripple_state_key(&holder, &issuer, &leg.cur), serde_json::to_vec(&line).unwrap())
+                .unwrap();
+        };
+        const DEFAULT_RIPPLE: u64 = 0x0080_0000;
+        const GLOBAL_FREEZE: u64 = 0x0040_0000;
+        const HIGH_RESERVE: u64 = 0x0002_0000;
+        const LOW_FREEZE: u64 = 0x0040_0000;
+        const HIGH_FREEZE: u64 = 0x0080_0000;
+        let tx = TxFields {
+            account: holder,
+            tx_type: "AMMCreate".to_string(),
+            fee: 12,
+            sequence: 5,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Amount": "1000000",
+                "Amount2": {"currency": "BEP", "issuer": hex::encode(issuer), "value": "10"},
+                "TradingFee": 250,
+            }),
+            inner_batch: false,
+        };
+        let verdict = |state: &LedgerState| AMMCreateTransactor.preclaim(&tx, &Sandbox::new(state));
+
+        put_root(&mut state, DEFAULT_RIPPLE);
+        put_line(&mut state, HIGH_RESERVE);
+        assert_eq!(verdict(&state), TxResult::Success, "funded, nothing frozen");
+
+        put_line(&mut state, HIGH_RESERVE | LOW_FREEZE);
+        assert_eq!(verdict(&state), TxResult::Frozen, "the issuer froze the holder's line: tecFROZEN, not tecUNFUNDED_AMM");
+
+        put_line(&mut state, HIGH_RESERVE | HIGH_FREEZE);
+        assert_eq!(verdict(&state), TxResult::Success, "the holder's own freeze bit does not bind the holder");
+
+        put_line(&mut state, HIGH_RESERVE);
+        put_root(&mut state, DEFAULT_RIPPLE | GLOBAL_FREEZE);
+        assert_eq!(verdict(&state), TxResult::Frozen, "the issuer's global freeze");
+
+        put_root(&mut state, 0);
+        assert_eq!(verdict(&state), TxResult::NoRipple, "an issuer without DefaultRipple");
+
+        // Frozen and short of funds at once: the freeze is judged first.
+        put_root(&mut state, DEFAULT_RIPPLE);
+        put_line(&mut state, HIGH_RESERVE | LOW_FREEZE);
+        let mut short = tx.clone();
+        short.fields["Amount2"]["value"] = serde_json::json!("79901");
+        assert_eq!(AMMCreateTransactor.preclaim(&short, &Sandbox::new(&state)), TxResult::Frozen);
     }
 
     /// Finding 419 (mainnet #107572028 AC9F1F115224): an issuer pooling two of its own tokens files all three new
