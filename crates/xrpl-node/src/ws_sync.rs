@@ -468,7 +468,17 @@ pub async fn start_ws_sync(
                             // the spawned task here. Sequential path remains as
                             // fallback for the rare case the handle wasn't created.
                             let tx_blobs = match (&peer_ledger, tx_blobs_handle) {
-                                (Some(p), _) => p.pairs.iter().map(|(tx, _)| tx.clone()).collect(),
+                                // The peers' pairs carry the pseudo-txs too; skip them as the RPC path does.
+                                // #108012288 / #108020224: libxrpl applied a flag ledger's UNLModify to the
+                                // parent's NegativeUNL without the flag ledger's own rotation (rippled's
+                                // updateNegativeUNL, before any tx), so a pending change from the last flag
+                                // ledger refused it tefFAILURE where the network had tesSUCCESS.
+                                (Some(p), _) => p
+                                    .pairs
+                                    .iter()
+                                    .filter(|(tx, _)| !is_pseudo_tx_blob(tx))
+                                    .map(|(tx, _)| tx.clone())
+                                    .collect(),
                                 (None, Some(h)) => h.await.unwrap_or_default(),
                                 (None, None) => fetch_ledger_tx_blobs(&rpc, process_seq).await,
                             };
@@ -1409,6 +1419,14 @@ async fn fetch_ledger_metadata(
     Ok((sorted_txs, header, wallet_delta))
 }
 
+/// A network-generated pseudo-tx (EnableAmendment, SetFee, UNLModify): no signature, and the FFI leg skips it. Its blob
+/// opens with sfTransactionType (0x12) and the type as a u16.
+#[cfg(feature = "ffi")]
+fn is_pseudo_tx_blob(bytes: &[u8]) -> bool {
+    const PSEUDO_TX_TYPES: [u16; 3] = [100, 101, 102]; // EnableAmendment, SetFee, UNLModify
+    bytes.len() >= 3 && bytes[0] == 0x12 && PSEUDO_TX_TYPES.contains(&u16::from_be_bytes([bytes[1], bytes[2]]))
+}
+
 /// Fetch binary tx_blobs for every tx in the ledger, sorted by TransactionIndex.
 /// Used only when FFI verification is enabled — adds one extra RPC per ledger.
 /// Returns an empty Vec on error (FFI verification skipped for this ledger).
@@ -1452,18 +1470,12 @@ async fn fetch_ledger_tx_blobs(rpc: &RippledClient, seq: u32) -> Vec<Vec<u8>> {
     let txs = body["result"]["ledger"]["transactions"].as_array().unwrap_or(&empty);
     // Pair each blob with its TransactionIndex extracted from the meta blob.
     // Meta prefix: sfTransactionIndex = 0x20 0x1C + u32 big-endian.
-    // Pseudo-tx type IDs (network-generated, no signature, skip FFI verify)
-    const PSEUDO_TX_TYPES: [u16; 3] = [100, 101, 102]; // EnableAmendment, SetFee, UNLModify
     let mut ordered: Vec<(u32, Vec<u8>)> = Vec::with_capacity(txs.len());
     for tx in txs.iter() {
         let tx_blob_hex = tx["tx_blob"].as_str().or_else(|| tx.as_str());
         let Some(hex_str) = tx_blob_hex else { continue; };
         let Ok(bytes) = hex::decode(hex_str) else { continue; };
-        // Skip pseudo-txs: first byte 0x12 (sfTransactionType), next 2 bytes = type u16
-        if bytes.len() >= 3 && bytes[0] == 0x12 {
-            let tt = u16::from_be_bytes([bytes[1], bytes[2]]);
-            if PSEUDO_TX_TYPES.contains(&tt) { continue; }
-        }
+        if is_pseudo_tx_blob(&bytes) { continue; }
         let meta_hex = tx["meta"].as_str().or_else(|| tx["metaData"].as_str()).unwrap_or("");
         let idx = if meta_hex.len() >= 12 {
             let meta_bytes = hex::decode(&meta_hex[..12]).unwrap_or_default();
@@ -2166,6 +2178,24 @@ pub(crate) async fn fetch_account_hash(rpc: &RippledClient, seq: u32) -> Option<
 #[cfg(all(test, feature = "ffi"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pseudo_tx_blobs_are_told_apart_by_their_type() {
+        // UNLModify (102) from #108020224, EnableAmendment (100), SetFee (101): skipped.
+        for tt in [100u16, 101, 102] {
+            let mut blob = vec![0x12];
+            blob.extend_from_slice(&tt.to_be_bytes());
+            blob.extend_from_slice(&[0x24, 0, 0, 0, 0]);
+            assert!(is_pseudo_tx_blob(&blob), "type {tt}");
+        }
+        // Payment (0), AMMCreate (35): verified.
+        for tt in [0u16, 35] {
+            let mut blob = vec![0x12];
+            blob.extend_from_slice(&tt.to_be_bytes());
+            assert!(!is_pseudo_tx_blob(&blob), "type {tt}");
+        }
+        assert!(!is_pseudo_tx_blob(&[0x12, 0x00]), "too short to name a type");
+    }
 
     fn key_hex_for(seed: u8) -> String {
         // 32 bytes = 64 hex chars; fill with the seed for deterministic test keys.
