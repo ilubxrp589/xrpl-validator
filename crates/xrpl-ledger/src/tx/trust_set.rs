@@ -405,7 +405,9 @@ impl Transactor for TrustSetTransactor {
             let limit_zero = tx.fields["LimitAmount"]["value"].as_str().unwrap_or("0") == "0";
             let q_in = tx.fields.get("QualityIn").and_then(|v| v.as_u64());
             let q_out = tx.fields.get("QualityOut").and_then(|v| v.as_u64());
-            let setting_q_in = matches!(q_in, Some(q) if q != 0 && q != QUALITY_ONE);
+            // Only QualityOut is folded to 0 when it is QUALITY_ONE (TrustSet.cpp:340); a QualityIn of
+            // QUALITY_ONE is a setting, so it is not redundant (#108119206).
+            let setting_q_in = matches!(q_in, Some(q) if q != 0);
             let setting_q_out = matches!(q_out, Some(q) if q != 0 && q != QUALITY_ONE);
             let set_auth = txf & TF_SETF_AUTH != 0;
             if limit_zero && !setting_q_in && !setting_q_out && !set_auth {
@@ -453,6 +455,11 @@ impl Transactor for TrustSetTransactor {
                 // quality never reached its side field. #106800767 5DDFFF08DAD2
                 // (rKYS7VMBjX, QualityIn 0, QualityOut 0 on an existing
                 // Greyhound line): mainnet 211 bytes, ours 223.
+                //
+                // Finding 422: only QualityOut folds QUALITY_ONE to 0 first
+                // (TrustSet.cpp:340); `uQualityIn` keeps it, so a QualityIn
+                // of 1e9 is STORED. #108119206/208/211 (rJ3EcP8X, RLUSD lines,
+                // QualityIn 1000000000): mainnet set HighQualityIn, we cleared it.
                 {
                     const QUALITY_ONE: u64 = 1_000_000_000;
                     let sender_low = tx.account < issuer;
@@ -461,9 +468,9 @@ impl Transactor for TrustSetTransactor {
                     } else {
                         ("HighQualityIn", "HighQualityOut")
                     };
-                    for (txf, lf) in [("QualityIn", qin_f), ("QualityOut", qout_f)] {
+                    for (txf, lf, folds_one) in [("QualityIn", qin_f, false), ("QualityOut", qout_f, true)] {
                         if let Some(q) = tx.fields.get(txf).and_then(|v| v.as_u64()) {
-                            if q == 0 || q == QUALITY_ONE {
+                            if q == 0 || (folds_one && q == QUALITY_ONE) {
                                 if let Some(o) = line.as_object_mut() {
                                     o.remove(lf);
                                 }
@@ -766,7 +773,8 @@ impl Transactor for TrustSetTransactor {
             });
             let mut line_obj = line_obj;
             // Finding 188 (creation): `trustCreate(…, uQualityIn, uQualityOut)`
-            // stores the sender-side quality when non-zero and not QUALITY_ONE.
+            // stores the sender-side quality when non-zero (RippleStateHelpers.cpp:254-258).
+            // Finding 422: only QualityOut had QUALITY_ONE folded to 0 before the call.
             {
                 const QUALITY_ONE: u64 = 1_000_000_000;
                 let sender_low = tx.account < issuer;
@@ -775,9 +783,9 @@ impl Transactor for TrustSetTransactor {
                 } else {
                     ("HighQualityIn", "HighQualityOut")
                 };
-                for (txf, lf) in [("QualityIn", qin_f), ("QualityOut", qout_f)] {
+                for (txf, lf, folds_one) in [("QualityIn", qin_f, false), ("QualityOut", qout_f, true)] {
                     if let Some(q) = tx.fields.get(txf).and_then(|v| v.as_u64()) {
-                        if q != 0 && q != QUALITY_ONE {
+                        if q != 0 && !(folds_one && q == QUALITY_ONE) {
                             line_obj[lf] = serde_json::json!(q);
                         }
                     }
@@ -1086,5 +1094,80 @@ mod tests {
                 serde_json::from_slice(&sandbox.read(&line_key).expect("line stays")).unwrap();
             assert_ne!(line["Flags"].as_u64().unwrap() & 0x0010_0000, 0, "lsfLowNoRipple set at {v}");
         }
+    }
+
+    /// Finding 422 — TrustSet.cpp:337-341 folds QUALITY_ONE to 0 for QualityOut
+    /// only, so a QualityIn of 1e9 is stored on the sender's side and a QualityOut
+    /// of 1e9 clears it. #108119211 97AFE67D5E53: mainnet HighQualityIn 1000000000,
+    /// ours absent.
+    #[test]
+    fn a_quality_in_of_one_is_stored_and_a_quality_out_of_one_is_cleared() {
+        let sender = [0x05u8; 20];
+        let issuer = [0x02u8; 20];
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+        let (lo, hi) = if sender < issuer { (sender, issuer) } else { (issuer, sender) };
+        let (q_in_f, q_out_f) =
+            if sender < issuer { ("LowQualityIn", "LowQualityOut") } else { ("HighQualityIn", "HighQualityOut") };
+
+        let mut state = make_state(&[(sender, 100_000_000), (issuer, 100_000_000)]);
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Flags": 0x0001_0000u64,
+            "Balance": {"currency": hex::encode_upper(cur),
+                        "issuer": "0000000000000000000000000000000000000000", "value": "0"},
+            "LowLimit":  {"currency": hex::encode_upper(cur), "issuer": hex::encode(lo), "value": "20"},
+            "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(hi), "value": "20"},
+            q_in_f: 900_000_000u64,
+            q_out_f: 900_000_000u64,
+        });
+        let line_key = keylet::ripple_state_key(&sender, &issuer, &cur);
+        state.state_map.insert(line_key, serde_json::to_vec(&line).unwrap()).unwrap();
+
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: sender, tx_type: "TrustSet".to_string(), fee: 12, sequence: 3,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "LimitAmount": {"currency": "USD", "issuer": hex::encode(issuer), "value": "20"},
+                "QualityIn": 1_000_000_000u64,
+                "QualityOut": 1_000_000_000u64,
+            }),
+            inner_batch: false,
+        };
+        assert_eq!(TrustSetTransactor.do_apply(&tx, &mut sandbox), TxResult::Success);
+        let after: serde_json::Value =
+            serde_json::from_slice(&sandbox.read(&line_key).expect("line stays")).unwrap();
+        assert_eq!(after[q_in_f].as_u64(), Some(1_000_000_000), "QualityIn of one is stored");
+        assert!(after.get(q_out_f).is_none(), "QualityOut of one is cleared");
+    }
+
+    /// Finding 422 — the same rule on a new line: trustCreate stores a QualityIn of
+    /// one, so a zero-limit TrustSet that sets it is not tecNO_LINE_REDUNDANT
+    /// (TrustSet.cpp:678-686 tests the unfolded `uQualityIn`).
+    #[test]
+    fn a_new_line_with_a_quality_in_of_one_is_created_with_it() {
+        let alice = [0x01u8; 20];
+        let issuer = [0x02u8; 20];
+        let state = make_state(&[(alice, 50_000_000), (issuer, 50_000_000)]);
+        let tx = |q_field: &str| TxFields {
+            account: alice, tx_type: "TrustSet".to_string(), fee: 12, sequence: 1,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "LimitAmount": {"currency": "USD", "issuer": hex::encode(issuer), "value": "0"},
+                q_field: 1_000_000_000u64,
+            }),
+            inner_batch: false,
+        };
+        let sandbox = Sandbox::new(&state);
+        assert_eq!(TrustSetTransactor.preclaim(&tx("QualityOut"), &sandbox), TxResult::NoLineRedundant);
+        assert_eq!(TrustSetTransactor.preclaim(&tx("QualityIn"), &sandbox), TxResult::Success);
+
+        let mut sandbox = Sandbox::new(&state);
+        assert_eq!(TrustSetTransactor.do_apply(&tx("QualityIn"), &mut sandbox), TxResult::Success);
+        let line_key = keylet::ripple_state_key(&alice, &issuer, &TrustSetTransactor::currency_code("USD"));
+        let line: serde_json::Value =
+            serde_json::from_slice(&sandbox.read(&line_key).expect("line created")).unwrap();
+        assert_eq!(line["LowQualityIn"].as_u64(), Some(1_000_000_000));
     }
 }
