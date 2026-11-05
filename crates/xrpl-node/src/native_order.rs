@@ -74,9 +74,11 @@ pub struct OrderStats {
     pub attempts: AtomicU64,
     pub last_seq: AtomicU64,
     pub ms_last: AtomicU64,
-    /// Ledgers salted with the set more than half the trusted validators accepted, and those salted with the root of
-    /// the ledger's own transactions (not enough of them had named a set yet).
+    /// Ledgers salted with the set more than half the trusted validators accepted, those salted with the set this
+    /// ledger's own validators named (no set had more than half), and those salted with the root of the ledger's own
+    /// transactions (no validator of it had named a set yet).
     pub salt_agreed: AtomicU64,
+    pub salt_ledger: AtomicU64,
     pub salt_own: AtomicU64,
 }
 
@@ -95,16 +97,85 @@ pub fn exact_for(seq: u32) -> Option<bool> {
     last.filter(|(s, _)| *s == seq).map(|(_, e)| e)
 }
 
+/// Which set salted a ledger's canonical order ([`seed`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Salt {
+    /// The set more than half the trusted validators named.
+    Agreed,
+    /// The set the trusted validators of this exact ledger named, when no set had more than half.
+    Ledger,
+    /// The root of the ledger's own transactions.
+    #[default]
+    Own,
+}
+
+impl Salt {
+    pub fn name(self) -> &'static str {
+        match self {
+            Salt::Agreed => "agreed",
+            Salt::Ledger => "ledger",
+            Salt::Own => "own",
+        }
+    }
+}
+
+/// The seed for the order, in this preference: the set more than half the trusted validators named (`agreed`), the
+/// set this ledger's own trusted validators named (`ledger`), else none, so the root of the ledger's own
+/// transactions.
+pub fn pick_seed(agreed: Option<[u8; 32]>, ledger: Option<[u8; 32]>) -> (Option<[u8; 32]>, Salt) {
+    match (agreed, ledger) {
+        (Some(a), _) => (Some(a), Salt::Agreed),
+        (None, Some(l)) => (Some(l), Salt::Ledger),
+        (None, None) => (None, Salt::Own),
+    }
+}
+
+/// Ledger `seq`'s seed for [`canonical_set`] and which set it is, counted. The set of this ledger's own validators
+/// needs its hash, which ws-sync notes before the apply ([`note_building`]).
+pub fn seed(seq: u32) -> (Option<[u8; 32]>, Salt) {
+    let agreed = crate::own_validated::agreed_set(seq);
+    let ledger = if agreed.is_none() { building(seq).and_then(|h| crate::own_validated::ledger_set(seq, &h)) } else { None };
+    let (set, salt) = pick_seed(agreed, ledger);
+    let st = stats();
+    match salt {
+        Salt::Agreed => &st.salt_agreed,
+        Salt::Ledger => &st.salt_ledger,
+        Salt::Own => &st.salt_own,
+    }
+    .fetch_add(1, Ordering::Relaxed);
+    (set, salt)
+}
+
+/// Ledger hashes kept by sequence: more than the shadow's hydrate queue holds (400), so a ledger replayed after the
+/// mirror loads still finds its own.
+pub const BUILDING_KEEP: u32 = 512;
+
+static BUILDING: std::sync::Mutex<std::collections::BTreeMap<u32, [u8; 32]>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// ws-sync is about to apply ledger `seq`, whose hash is `hash`.
+pub fn note_building(seq: u32, hash: [u8; 32]) {
+    let mut b = BUILDING.lock().unwrap_or_else(|e| e.into_inner());
+    b.insert(seq, hash);
+    while b.len() as u32 > BUILDING_KEEP {
+        b.pop_first();
+    }
+}
+
+/// The hash ws-sync noted for ledger `seq`, if it is still kept.
+pub fn building(seq: u32) -> Option<[u8; 32]> {
+    BUILDING.lock().unwrap_or_else(|e| e.into_inner()).get(&seq).copied()
+}
+
 /// The consensus set a ledger was built from, in rippled's canonical order: every transaction but the Batch
 /// inners (`skip`, which apply inside their outer). A pseudo-transaction's account is zero (EnableAmendment spells
 /// it rrrrrrrrrrrrrrrrrrrrrhoLvTp, UNLModify as "").
 ///
 /// rippled salts with the consensus set's root (`CanonicalTXSet{result.txns.map_->getHash()}`), and that set can
 /// hold transactions the ledger never filed: a tef drops out, a ter still waiting after the last pass carries over.
-/// So `agreed`, the set more than half the trusted validators named in their `sfConsensusHash`, is the salt when we
-/// have it; without it, the root of the ledger's own transactions, which is the same set whenever every one was filed.
-/// Mainnet #107652744, #107652745, #107652752 (soak #48): our order differed at position 0 on exactly the three
-/// ledgers whose own root was not the validators' set (13 neighbours agreed).
+/// So `agreed`, the validators' `sfConsensusHash` ([`seed`]), is the salt when we have it; without it, the root of
+/// the ledger's own transactions, which is the same set whenever every one was filed. Mainnet #107652744,
+/// #107652745, #107652752 (soak #48): our order differed at position 0 on exactly the three ledgers whose own root
+/// was not the validators' set (13 neighbours agreed).
 pub fn canonical_set(ordered: &[&Value], skip: &HashSet<String>, agreed: Option<[u8; 32]>) -> Vec<TransactionEntry> {
     let mut entries: Vec<TransactionEntry> = ordered
         .iter()
@@ -123,14 +194,8 @@ pub fn canonical_set(ordered: &[&Value], skip: &HashSet<String>, agreed: Option<
         })
         .collect();
     let salt = match agreed {
-        Some(set) => {
-            stats().salt_agreed.fetch_add(1, Ordering::Relaxed);
-            Hash256(set)
-        }
-        None => {
-            stats().salt_own.fetch_add(1, Ordering::Relaxed);
-            xrpl_ledger::ledger::close::consensus_salt(&entries.iter().map(|e| e.hash).collect::<Vec<_>>())
-        }
+        Some(set) => Hash256(set),
+        None => xrpl_ledger::ledger::close::consensus_salt(&entries.iter().map(|e| e.hash).collect::<Vec<_>>()),
     };
     xrpl_ledger::ledger::close::canonical_order(&mut entries, &salt);
     entries
@@ -166,8 +231,8 @@ pub struct Walked {
     pub failed: Vec<String>,
     pub left: Vec<String>,
     pub attempts: u64,
-    /// The order was salted with the validators' agreed set; false: with the root of the ledger's own transactions.
-    pub salt_agreed: bool,
+    /// Which set salted the order ([`seed`]).
+    pub salt: Salt,
 }
 
 /// One ledger's comparison with the network's.
@@ -265,7 +330,7 @@ pub fn judge(seq: u32, mode: Mode, v: &Verdict, walked: &Walked, bytes: Option<(
         let mut line = json!({
             "seq": seq, "mode": mode.name(), "order": v.order, "results": v.results.iter().take(5).collect::<Vec<_>>(),
             "results_n": v.results.len(), "passes": v.per_pass, "attempts": walked.attempts, "ms": ms,
-            "salt": if walked.salt_agreed { "agreed" } else { "own" },
+            "salt": walked.salt.name(),
         });
         if let Some(c) = &v.coins {
             line["coins"] = json!(c);
@@ -322,7 +387,7 @@ pub fn json() -> Value {
         "mode": mode().name(), "last_seq": l(&st.last_seq), "ledgers": l(&st.ledgers), "exact": l(&st.exact),
         "order_differ": l(&st.order_differ), "result_differ": l(&st.result_differ), "bytes_differ": l(&st.bytes_differ),
         "coins_match": l(&st.coins_match), "coins_differ": l(&st.coins_differ), "refused": l(&st.refused), "txs": l(&st.txs), "retried": l(&st.retried), "attempts": l(&st.attempts),
-        "ms_last": l(&st.ms_last), "salt_agreed": l(&st.salt_agreed), "salt_own": l(&st.salt_own),
+        "ms_last": l(&st.ms_last), "salt_agreed": l(&st.salt_agreed), "salt_ledger": l(&st.salt_ledger), "salt_own": l(&st.salt_own),
     })
 }
 
@@ -413,6 +478,77 @@ mod tests {
             canonical_order(&mut want, &Hash256(agreed));
             assert_eq!(order(&canonical_set(&ordered, &HashSet::new(), Some(agreed))), order(&want));
         }
+    }
+
+    /// Mainnet #108137503 (5 Nov): the trusted validators split, 17 of 35 validating this ledger and 15 another; no
+    /// set had more than half, so the order was salted with the ledger's own root and differed at position 0. Salted
+    /// with the set this ledger's own validators named, the network's order is our order taken in its passes (at
+    /// most one ascending run a pass); the other ledger's set and the own root give neither its first transaction.
+    #[test]
+    fn in_the_split_of_108137503_the_set_this_ledgers_validators_named_gives_the_networks_order() {
+        let v: Value = serde_json::from_str(include_str!("../tests/vectors/canonical_order_split_108137503.json")).unwrap();
+        let txs = v["transactions"].as_array().unwrap();
+        let ordered: Vec<&Value> = txs.iter().collect();
+        let network = network_order(&ordered, &HashSet::new());
+        let set = |k: &str| <[u8; 32]>::try_from(hex::decode(v[k].as_str().unwrap()).unwrap().as_slice()).unwrap();
+        let runs = |salt: Option<[u8; 32]>| {
+            let ours = canonical_set(&ordered, &HashSet::new(), salt);
+            let rank: HashMap<String, usize> = ours.iter().enumerate().map(|(i, e)| (hex::encode_upper(e.hash.0), i)).collect();
+            let r: Vec<usize> = network.iter().map(|h| rank[h]).collect();
+            (1 + r.windows(2).filter(|w| w[1] < w[0]).count(), hex::encode_upper(ours[0].hash.0))
+        };
+        assert_eq!(network.len(), 516);
+        let (n, first) = runs(Some(set("this_ledgers_set")));
+        assert!(n <= LEDGER_TOTAL_PASSES as usize, "{n} runs");
+        assert_eq!(first, network[0], "position 0 is the network's");
+        for salt in [Some(set("other_ledgers_set")), None] {
+            let (n, first) = runs(salt);
+            assert!(n > 100, "{n} runs");
+            assert_ne!(first, network[0]);
+        }
+    }
+
+    /// Which set seeds the order: the one more than half the trusted validators named, else the one this ledger's own
+    /// validators named, else the root of the ledger's own transactions.
+    #[test]
+    fn the_seed_is_the_agreed_set_then_this_ledgers_set_then_its_own_root() {
+        let (agreed, ledger) = ([1u8; 32], [2u8; 32]);
+        assert_eq!(pick_seed(Some(agreed), Some(ledger)), (Some(agreed), Salt::Agreed));
+        assert_eq!(pick_seed(None, Some(ledger)), (Some(ledger), Salt::Ledger));
+        assert_eq!(pick_seed(None, None), (None, Salt::Own));
+    }
+
+    #[test]
+    fn the_ledger_being_built_is_kept_by_sequence() {
+        let (seq, h) = (900_100_000u32, [0xC3u8; 32]);
+        note_building(seq, h);
+        note_building(seq + 1, [0xC4; 32]);
+        assert_eq!(building(seq), Some(h), "a ledger replayed after a newer one was noted");
+        assert_eq!(building(seq + 1), Some([0xC4; 32]));
+        assert_eq!(building(seq + 2), None);
+        for s in seq + 2..seq + 2 + BUILDING_KEEP {
+            note_building(s, [0xC5; 32]);
+        }
+        assert_eq!(building(seq), None, "the oldest go past BUILDING_KEEP");
+    }
+
+    #[test]
+    fn the_receipt_names_the_set_that_salted_the_order() {
+        let (a, b) = ("A".repeat(64), "B".repeat(64));
+        let network = vec![a.clone(), b.clone()];
+        let result = |_: &str| Some("tesSUCCESS".to_string());
+        let mut walked = Walked {
+            applied: vec![(0, b.clone(), "tesSUCCESS".into()), (0, a.clone(), "tesSUCCESS".into())],
+            attempts: 2,
+            ..Default::default()
+        };
+        let v = verdict(&walked, &network, &result);
+        let salt = |w: &Walked| judge(900_100_900, Mode::On, &v, w, None, 1).receipt.unwrap()["salt"].clone();
+        assert_eq!(salt(&walked), json!("own"));
+        walked.salt = Salt::Ledger;
+        assert_eq!(salt(&walked), json!("ledger"));
+        walked.salt = Salt::Agreed;
+        assert_eq!(salt(&walked), json!("agreed"));
     }
 
     #[test]

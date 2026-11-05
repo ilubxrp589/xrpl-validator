@@ -232,6 +232,24 @@ impl Tally {
         counts.into_iter().find(|(_, n)| effective > 0 && *n > effective / 2).map(|(set, _)| set)
     }
 
+    /// The transaction set the trusted validators of ledger `ledger` (this exact hash) at `seq` accepted: the one
+    /// most of them named, None on a tie or with none. When no set has more than half ([`Self::agreed_set`]) because
+    /// the validators split between two ledgers, the ones that validated the ledger being built still name the set
+    /// it was built from (mainnet #108137503, 5 Nov: 17 of 35 on it, 15 on another ledger, no set over half).
+    pub fn ledger_set(&self, seq: u32, ledger: &[u8; 32]) -> Option<[u8; 32]> {
+        let s = self.seqs.get(&seq)?;
+        let mut counts: HashMap<[u8; 32], usize> = HashMap::new();
+        for (m, set) in &s.sets {
+            if !self.negative.contains(m) && s.votes.get(m).is_some_and(|(h, _)| h == ledger) {
+                *counts.entry(*set).or_default() += 1;
+            }
+        }
+        let most = *counts.values().max()?;
+        let mut top = counts.into_iter().filter(|(_, n)| *n == most);
+        let (set, _) = top.next()?;
+        top.next().is_none().then_some(set)
+    }
+
     /// .39 called ledger `seq` validated with `hash`. Judges it now if it can, and every pending ledger that is
     /// now too old to wait for.
     pub fn network_validated(&mut self, seq: u32, hash: [u8; 32], now_ms: u64) -> Vec<(u32, Verdict)> {
@@ -627,6 +645,15 @@ pub fn agreed_set(seq: u32) -> Option<[u8; 32]> {
     tally().lock().unwrap_or_else(|p| p.into_inner()).agreed_set(seq)
 }
 
+/// The transaction set the trusted validators of ledger `ledger` (this exact hash) accepted for `seq`
+/// ([`Tally::ledger_set`]; None also when off). Step 3's seed when no set has more than half.
+pub fn ledger_set(seq: u32, ledger: &[u8; 32]) -> Option<[u8; 32]> {
+    if !enabled() {
+        return None;
+    }
+    tally().lock().unwrap_or_else(|p| p.into_inner()).ledger_set(seq, ledger)
+}
+
 /// Of ledgers `from..to`, how many the trusted validations reaching us reached quorum on (0 also when off). The
 /// validator passed those over for want of a hash of its own to sign, not for want of a quorum.
 pub fn reached_in(from: u32, to: u32) -> u64 {
@@ -833,6 +860,53 @@ mod tests {
             t.note_set(&sk(i), 100, set);
         }
         assert_eq!(t.agreed_set(100), Some(set), "and a full quorum names it too");
+    }
+
+    /// Mainnet #108137503 (5 Nov): the trusted validators split, 17 of 35 validating this ledger and 15 another, so no
+    /// set had more than half and Step 3 salted with the ledger's own root. The validators of this exact ledger name
+    /// the set it was built from; another ledger's validators name theirs. Untrusted keys and the negative UNL never
+    /// count.
+    #[test]
+    fn in_a_split_the_set_is_the_one_this_ledgers_own_validators_named() {
+        let mut t = Tally::default();
+        t.set_unl(&unl(35));
+        let (ours, theirs, third) = ([7u8; 32], [8u8; 32], [9u8; 32]);
+        let (set, other, odd) = ([0xA5u8; 32], [0x5Au8; 32], [0x33u8; 32]);
+        for i in 1..=17 {
+            t.vote(&sk(i), 100, ours, true, 0);
+            t.note_set(&sk(i), 100, set);
+        }
+        for i in 18..=32 {
+            t.vote(&sk(i), 100, theirs, true, 0);
+            t.note_set(&sk(i), 100, other);
+        }
+        t.vote(&sk(33), 100, third, true, 0);
+        t.note_set(&sk(33), 100, odd);
+        assert_eq!(t.agreed_set(100), None, "17 of 35 is not more than half");
+        assert_eq!(t.ledger_set(100, &ours), Some(set));
+        assert_eq!(t.ledger_set(100, &theirs), Some(other));
+        assert_eq!(t.ledger_set(100, &third), Some(odd), "one trusted validation of that ledger is enough");
+        assert_eq!(t.ledger_set(100, &[1u8; 32]), None, "no trusted validation of that ledger");
+        assert_eq!(t.ledger_set(101, &ours), None);
+        t.vote(&[200; 33], 100, ours, true, 0);
+        t.note_set(&[200; 33], 100, odd);
+        assert_eq!(t.ledger_set(100, &ours), Some(set), "an untrusted key adds nothing");
+        t.vote(&sk(34), 100, ours, true, 0);
+        t.note_set(&sk(34), 100, odd);
+        assert_eq!(t.ledger_set(100, &ours), Some(set), "the set most of this ledger's validators named");
+
+        let x = [0x11u8; 32];
+        let (a, b) = ([0xAAu8; 32], [0xBBu8; 32]);
+        t.vote(&sk(1), 102, x, true, 0);
+        t.note_set(&sk(1), 102, a);
+        t.vote(&sk(2), 102, x, true, 0);
+        t.note_set(&sk(2), 102, b);
+        assert_eq!(t.ledger_set(102, &x), None, "a tie names no set");
+        t.vote(&sk(3), 102, x, true, 0);
+        t.note_set(&sk(3), 102, b);
+        assert_eq!(t.ledger_set(102, &x), Some(b));
+        t.set_negative_unl(vec![vec![2; 33], vec![3; 33]]);
+        assert_eq!(t.ledger_set(102, &x), Some(a), "the two on the negative UNL don't count");
     }
 
     /// Mainnet #107886516 and #107886898 (25 Oct): ws-sync landed them an hour late, after a .39 outage, and their

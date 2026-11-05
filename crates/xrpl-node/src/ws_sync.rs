@@ -370,6 +370,8 @@ pub async fn start_ws_sync(
                                 ledger_header = hdr;
                                 // 5.2(a): one channel send, and nothing at all unless XRPL_CONSENSUS_RECORD=1.
                                 crate::consensus_record::record_header(process_seq, &ledger_header);
+                                // Step 3: the order's seed may be the set this ledger's own validators named.
+                                crate::native_order::note_building(process_seq, ledger_header.ledger_hash);
                                 // Independence 4.5 (XRPL_OWN_VALIDATED=1): .39 calls this ledger validated; our own
                                 // tally of trusted validations is held against it, under the negative UNL the
                                 // newest written ledger carries.
