@@ -263,6 +263,52 @@ impl Transactor for CheckCashTransactor {
         if !sandbox.exists(&acct_key) {
             return TxResult::NoAccount;
         }
+        // rippled's CheckCash::preclaim up to the expiry, in its order (CheckCash.cpp:88-137): the
+        // check, its destination, both accounts, the destination's tag, then hasExpired. Where the
+        // expiry is found decides the pass: a preclaim tecEXPIRED waits for the last pass under
+        // tapRETRY like any tec, a do_apply one is claimed at once. Ours was in do_apply, so mainnet
+        // #108167573 7D9C347F165F and #108167575 D8719C579BDD (rP8N1iBN cashing check 1A235388 after
+        // its Expiration) were claimed in pass 0, the network's in the retry pass: same results,
+        // another order, both ledgers unsigned. A check to self (tecINTERNAL) is left out:
+        // CheckCreate refuses one. A CheckID or Check that won't parse is do_apply's to refuse.
+        let Some(check_key) = tx
+            .fields
+            .get("CheckID")
+            .and_then(|v| v.as_str())
+            .and_then(|s| hex::decode(s).ok())
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            .map(xrpl_core::types::Hash256)
+        else {
+            return TxResult::Success;
+        };
+        let Some(data) = sandbox.read(&check_key) else {
+            return TxResult::NoEntry;
+        };
+        let Ok(check) = serde_json::from_slice::<serde_json::Value>(&data) else {
+            return TxResult::Success;
+        };
+        let (Some(src), Some(dest)) =
+            (check.get("Account").and_then(parse_account_id), check.get("Destination").and_then(parse_account_id))
+        else {
+            return TxResult::Success;
+        };
+        if dest != tx.account {
+            return TxResult::NoPermission;
+        }
+        let dst = sandbox
+            .read(&keylet::account_root_key(&dest))
+            .and_then(|d| serde_json::from_slice::<serde_json::Value>(&d).ok());
+        let Some(dst) = dst.filter(|_| sandbox.exists(&keylet::account_root_key(&src))) else {
+            return TxResult::NoEntry;
+        };
+        if dst["Flags"].as_u64().unwrap_or(0) & 0x0002_0000 != 0 && check.get("DestinationTag").is_none() {
+            return TxResult::DstTagNeeded; // lsfRequireDestTag
+        }
+        if let Some(exp) = check.get("Expiration").and_then(|v| v.as_u64()) {
+            if exp != 0 && sandbox.base().header.close_time as u64 >= exp {
+                return TxResult::Expired;
+            }
+        }
         TxResult::Success
     }
 
@@ -304,7 +350,8 @@ impl Transactor for CheckCashTransactor {
         // #106744882 0BFD2FD7C45E (rJPSUEG8 cashing 8B269A63 for 25 FLL, and
         // again at #106744885): the check had expired; mainnet returns
         // tecEXPIRED and touches nothing but the fee, we cashed it — nine
-        // mutations mainnet never made.
+        // mutations mainnet never made. Preclaim refuses it first (where the
+        // pass is decided); this stays for callers that run do_apply alone.
         if let Some(exp) = check.get("Expiration").and_then(|v| v.as_u64()) {
             if exp != 0 && sandbox.base().header.close_time as u64 >= exp {
                 return TxResult::Expired;
@@ -946,6 +993,52 @@ mod tests {
         assert!(!listed(&sandbox, &dest), "destination's dir still lists a cancelled check");
         // The reserve is the writer's alone (adjustOwnerCount(sleSrc, -1)).
         assert_eq!(read_field_u64(&sandbox, &sender, "OwnerCount"), 0);
+    }
+
+    /// rippled refuses an expired check in CheckCash::preclaim (CheckCash.cpp:88-137), after the
+    /// check, the destination and the destination's tag. A preclaim tecEXPIRED waits for the last
+    /// pass under tapRETRY like any tec; only a doApply one is claimed at once. Mainnet #108167573
+    /// 7D9C347F165F and #108167575 D8719C579BDD: rP8N1iBN cashes check 1A235388 after its
+    /// Expiration; the network applied each in the retry pass. We found the expiry in do_apply,
+    /// claimed it in pass 0, and the order differed, so both ledgers went unsigned.
+    #[test]
+    fn an_expired_check_is_refused_in_preclaim() {
+        let writer = [0x01u8; 20];
+        let casher = [0x02u8; 20];
+        let state = make_state_with_accounts(&[(&writer, 50_000_000), (&casher, 10_000_000)]);
+        let mut sandbox = Sandbox::new(&state);
+        // The parent closed at 10: a check expiring at 11 is live, one expiring at 10 is not.
+        for (seq, exp) in [(1u32, 11u64), (2, 10)] {
+            let create = TxFields {
+                account: writer, tx_type: "CheckCreate".into(), fee: 12, sequence: seq,
+                ticket_seq: None, last_ledger_seq: None,
+                fields: serde_json::json!({ "Destination": hex::encode(casher), "SendMax": "5000000", "Expiration": exp }),
+                inner_batch: false,
+            };
+            assert_eq!(CheckCreateTransactor.do_apply(&create, &mut sandbox), TxResult::Success);
+        }
+        let cash = |account: [u8; 20], check: Hash256| TxFields {
+            account, tx_type: "CheckCash".into(), fee: 12, sequence: 1,
+            ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({ "CheckID": hex::encode(check.0), "Amount": "3000000" }),
+            inner_batch: false,
+        };
+        let (live, expired) = (keylet::check_key(&writer, 1), keylet::check_key(&writer, 2));
+
+        assert_eq!(CheckCashTransactor.preclaim(&cash(casher, live), &sandbox), TxResult::Success);
+        assert_eq!(CheckCashTransactor.preclaim(&cash(casher, expired), &sandbox), TxResult::Expired);
+        // rippled's order: no check, then the wrong casher, then the tag, then the expiry.
+        assert_eq!(CheckCashTransactor.preclaim(&cash(casher, Hash256([9; 32])), &sandbox), TxResult::NoEntry);
+        assert_eq!(CheckCashTransactor.preclaim(&cash(writer, expired), &sandbox), TxResult::NoPermission);
+        let dkey = keylet::account_root_key(&casher);
+        let mut d: serde_json::Value = serde_json::from_slice(&sandbox.read(&dkey).unwrap()).unwrap();
+        d["Flags"] = serde_json::json!(0x0002_0000u64);
+        sandbox.write(dkey, serde_json::to_vec(&d).unwrap());
+        assert_eq!(
+            CheckCashTransactor.preclaim(&cash(casher, expired), &sandbox),
+            TxResult::DstTagNeeded,
+            "a destination that now requires a tag refuses an untagged check before its expiry",
+        );
     }
 
     #[test]
