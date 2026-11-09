@@ -677,13 +677,19 @@ pub fn stamp_account_txn_id(tx: &TxFields, sandbox: &mut Sandbox, armed_before: 
 }
 
 /// Finding 390: rippled stamps sfAccountTxnID in `Transactor::apply`, AHEAD of
-/// doApply (Transactor.cpp:906-909). For every transaction but a Batch outer
-/// the position is invisible — doApply never reads the field and a tec
-/// discards the stamp with the rest — so the pipelines stamp after a
-/// successful do_apply. A Batch outer's doApply runs its inners, each of which
-/// stamps its OWN id; the outer's stamp must land first or it overwrites them.
+/// doApply (Transactor.cpp:906-909). For most transactions the position is
+/// invisible — doApply never reads the field and a tec discards the stamp with
+/// the rest — so the pipelines stamp after a successful do_apply. Two are not:
+/// - a Batch outer's doApply runs its inners, each of which stamps its OWN id;
+///   the outer's stamp must land first or it overwrites them.
+/// - an AccountDelete's doApply erases the sender's root, so a stamp after it
+///   finds no root and is lost. rippled's erase carries the stamped root, and
+///   the DeletedNode's FinalFields show the deleting tx's own id (mainnet
+///   #108199014 D4EB8BCF3A07: ours kept the prior 4D1DEBA0…, the tx tree
+///   differed, the ledger went unsigned). A tec still restores the
+///   post-common snapshot, which drops the stamp as rippled's reset does.
 pub fn stamps_before_apply(tx: &TxFields) -> bool {
-    tx.tx_type == "Batch"
+    matches!(tx.tx_type.as_str(), "Batch" | "AccountDelete")
 }
 
 /// Whether the sender's root carries AccountTxnID right now — read before

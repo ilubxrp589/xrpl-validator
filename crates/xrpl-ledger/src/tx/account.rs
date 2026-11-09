@@ -931,6 +931,45 @@ mod tests {
         assert!(fin.get("TicketCount").is_none(), "the last ticket drops the field: {fin}");
     }
 
+    /// Mainnet #108199014 D4EB8BCF3A07: an AccountDelete by a root carrying AccountTxnID. rippled stamps the
+    /// field ahead of doApply (Transactor.cpp:906-909), so the erased root's FinalFields show the deleting tx's
+    /// own id. We stamped after do_apply, found no root, and kept the prior id (4D1DEBA0…) in the metadata.
+    #[test]
+    fn account_delete_final_fields_carry_its_own_account_txn_id() {
+        let alice = [0x01u8; 20];
+        let bob = [0x02u8; 20];
+        let mut state = make_state(&alice, 50_000_000);
+        state.header.sequence = 1_000; // AccountDelete wants Sequence + 255 behind the ledger
+        let ak = keylet::account_root_key(&alice);
+        let mut a: serde_json::Value = serde_json::from_slice(&state.state_map.lookup(&ak).unwrap().to_vec()).unwrap();
+        a["AccountTxnID"] = serde_json::json!("4D".repeat(32));
+        state.state_map.insert(ak, serde_json::to_vec(&a).unwrap()).unwrap();
+        let bob_acct = serde_json::json!({
+            "LedgerEntryType": "AccountRoot", "Account": hex::encode(bob), "Balance": "10000000",
+            "Sequence": 1, "OwnerCount": 0, "Flags": 0,
+        });
+        state.state_map.insert(keylet::account_root_key(&bob), serde_json::to_vec(&bob_acct).unwrap()).unwrap();
+
+        let mut sandbox = Sandbox::new(&state);
+        let tx = TxFields {
+            account: alice,
+            tx_type: "AccountDelete".to_string(),
+            fee: 2_000_000,
+            sequence: 1,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({"Destination": hex::encode(bob), "hash": "D4".repeat(32)}),
+            inner_batch: false,
+        };
+        crate::tx::reset_thread_state();
+        let (r, applied) = crate::tx::dispatch::apply_on_sandbox(&tx, &mut sandbox);
+        assert_eq!((r, applied), (TxResult::Success, true));
+        assert!(!sandbox.exists(&ak));
+        let fin: serde_json::Value = serde_json::from_slice(sandbox.deleted_content(&ak).expect("deleted content")).unwrap();
+        assert_eq!(fin["AccountTxnID"], serde_json::json!("D4".repeat(32)), "the deleting tx's own id: {fin}");
+        assert_eq!(fin["Balance"], serde_json::json!("0"));
+    }
+
     /// Mainnet #107787681 DE319724D91B: an account last touched in #60152829 kept an empty page 6 after its
     /// root (links 6/6). rippled's emptyDirDelete drops the root's links, erases page 6, then the root.
     #[test]
