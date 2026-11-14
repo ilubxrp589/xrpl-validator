@@ -167,10 +167,9 @@ pub(crate) fn pool_would_offer_again(sandbox: &Sandbox, amm: &Amm, pays_leg: &Le
             return false;
         }
     }
-    if anchored_slice(sandbox, amm, pays_leg, gets_leg, clob).is_some() {
-        return true;
-    }
-    max_offer(sandbox, amm, pays_leg, gets_leg).is_some_and(|(i, o)| rate_of(i, o) < clob)
+    // `anchored_slice` carries the fixAMMv1_2 maxOffer fallback itself, and
+    // withholds it when the anchored offer came out empty.
+    anchored_slice(sandbox, amm, pays_leg, gets_leg, clob).is_some()
 }
 
 pub(crate) fn set_pool_offer_at_tip(t: bool) {
@@ -1088,6 +1087,7 @@ fn lp_tokens_in_frac(balance: Me, withdraw: Me, total_lp: Me, tfee: u16) -> Opti
 /// it only became reachable once IOU addition stopped truncating
 /// (`stamount_signed_add`); a one-ulp-low pool balance had been putting the
 /// same offer just INSIDE the target.
+#[cfg(test)]
 fn anchored_offer(
     pool_in: Me,
     pool_out: Me,
@@ -1096,11 +1096,55 @@ fn anchored_offer(
     target: u64,
     tfee: u16,
 ) -> Option<(Me, Me)> {
-    let (i, o) = anchored_offer_generate(pool_in, pool_out, in_xrp, out_xrp, target, tfee)?;
-    if rate_of(i, o) > target {
-        return None;
+    match anchored(pool_in, pool_out, in_xrp, out_xrp, target, tfee) {
+        Anchored::Offer(i, o) => Some((i, o)),
+        Anchored::Empty | Anchored::Failed => None,
     }
-    Some((i, o))
+}
+
+/// What `changeSpotPriceQuality` came back with.
+///
+/// `Empty` is the case that matters: rippled's generators round the proposed
+/// amount DOWN and return it even when that leaves nothing (a 2-drop pool
+/// whose root is 0.66 of a drop). `changeSpotPriceQuality` passes such
+/// amounts on — `Quality` of a zero amount is 0, never "worse" — so
+/// `AMMLiquidity::getOffer` builds the offer, finds it not positive, and
+/// answers "no valid offer". It does NOT go on to the fixAMMv1_2 `maxOffer`
+/// fallback: that is reached only when `changeSpotPriceQuality` itself
+/// returns nullopt (`Failed`).
+///
+/// #108328631 7EFCDA7C861F: the xOracleGG/XRP pool held 2 drops; rippled left
+/// them and took one drop from the book tip D82C0E84, we sold one of the two
+/// through the 99% `maxOffer`.
+enum Anchored {
+    Offer(Me, Me),
+    Empty,
+    Failed,
+}
+
+fn anchored(pool_in: Me, pool_out: Me, in_xrp: bool, out_xrp: bool, target: u64, tfee: u16) -> Anchored {
+    match anchored_offer_generate(pool_in, pool_out, in_xrp, out_xrp, target, tfee) {
+        Anchored::Offer(i, o) if rate_of(i, o) > target => Anchored::Failed,
+        other => other,
+    }
+}
+
+/// The anchored offer, else — only when `changeSpotPriceQuality` failed, not
+/// when it produced an empty offer — the fixAMMv1_2 fallback.
+fn anchored_or(
+    pool_in: Me,
+    pool_out: Me,
+    in_xrp: bool,
+    out_xrp: bool,
+    target: u64,
+    tfee: u16,
+    fallback: impl FnOnce() -> Option<(Me, Me)>,
+) -> Option<(Me, Me)> {
+    match anchored(pool_in, pool_out, in_xrp, out_xrp, target, tfee) {
+        Anchored::Offer(i, o) => Some((i, o)),
+        Anchored::Empty => None,
+        Anchored::Failed => fallback(),
+    }
 }
 
 fn anchored_offer_generate(
@@ -1110,10 +1154,10 @@ fn anchored_offer_generate(
     out_xrp: bool,
     target: u64,
     tfee: u16,
-) -> Option<(Me, Me)> {
+) -> Anchored {
     let r = decode_rate(target);
     if r.0 == 0 {
-        return None;
+        return Anchored::Failed;
     }
     let f = n_sub(N_ONE, fee_n(tfee), Rnd::Near);
     if out_xrp {
@@ -1126,13 +1170,16 @@ fn anchored_offer_generate(
         let o2 = n_mul(pool_out, pool_out, Rnd::Near);
         let io_r = n_div(n_mul(pool_in, pool_out, Rnd::Near), r, Rnd::Near);
         if n_cmp(o2, io_r) != Ordering::Greater {
-            return None;
+            return Anchored::Failed;
         }
         let c_mag = n_sub(o2, io_r, Rnd::Near);
         let b2 = n_mul(b_mag, b_mag, Rnd::Near);
         let fourc = n_mul(N_FOUR, c_mag, Rnd::Near);
-        if n_cmp(b2, fourc) != Ordering::Greater {
-            return None;
+        // solveQuadraticEqSmallest refuses only d < 0. d == 0 is a root: a
+        // pool so lopsided that I·O/r vanishes beside O² gives b² = 4c
+        // exactly, and the root is the whole pool (#108321579).
+        if n_cmp(b2, fourc) == Ordering::Less {
+            return Anchored::Failed;
         }
         let d = n_sub(b2, fourc, Rnd::Near);
         // citardauq, b<0 c>0: root = 2c/(−b + √d) = 2c/(|b| + √d)
@@ -1143,33 +1190,41 @@ fn anchored_offer_generate(
         );
         let ocon = n_sub(pool_out, n_div(pool_in, n_mul(r, f, Rnd::Near), Rnd::Near), Rnd::Near);
         if ocon.0 == 0 {
-            return None;
+            return Anchored::Failed;
         }
         let pick = if n_cmp(ocon, root) == Ordering::Less { ocon } else { root };
-        let make = |o_prop: Me| -> Option<(Me, Me)> {
+        // getAmounts: the proposal rounded down, and what that costs. A
+        // take of nothing (or one that costs nothing) is an empty offer.
+        let make = |o_prop: Me| -> Anchored {
             let o = to_amount(o_prop, true, Rnd::Down);
             if o.0 == 0 || n_cmp(o, pool_out) != Ordering::Less {
-                return None;
+                return Anchored::Empty;
             }
-            let i = swap_asset_out(pool_in, pool_out, o, tfee, in_xrp)?;
-            if i.0 == 0 {
-                return None;
+            match swap_asset_out(pool_in, pool_out, o, tfee, in_xrp) {
+                Some(i) if i.0 != 0 => Anchored::Offer(i, o),
+                _ => Anchored::Empty,
             }
-            Some((i, o))
         };
-        let (i, o) = make(pick)?;
-        if rate_of(i, o) > target {
-            // reduceOffer: shave 0.01% (truncating) and retry once
-            return make(n_mul(o, (9_999_000_000_000_000, -16), Rnd::Down));
+        // reduceOffer: shave 0.01% (truncating) and retry once
+        let reduced = |o: Me| n_mul(o, (9_999_000_000_000_000, -16), Rnd::Down);
+        let o_first = to_amount(pick, true, Rnd::Down);
+        if o_first.0 != 0 && n_cmp(o_first, pool_out) != Ordering::Less {
+            // The proposed take is the whole pool: `swapAssetOut` answers
+            // that (denom <= 0) with the maximum amount, an offer no target
+            // quality accepts, so rippled goes on to the reduced retry.
+            return make(reduced(o_first));
         }
-        Some((i, o))
+        match make(pick) {
+            Anchored::Offer(i, o) if rate_of(i, o) > target => make(reduced(o)),
+            other => other,
+        }
     } else {
         // getAMMOfferStartWithTakerPays: a=f, b=I(1+f) (>0), c=I²−IOr (<0)
         let b = n_mul(pool_in, n_add(N_ONE, f, Rnd::Near), Rnd::Near);
         let i2 = n_mul(pool_in, pool_in, Rnd::Near);
         let ior = n_mul(n_mul(pool_in, pool_out, Rnd::Near), r, Rnd::Near);
         if n_cmp(ior, i2) != Ordering::Greater {
-            return None;
+            return Anchored::Failed;
         }
         let c_mag = n_sub(ior, i2, Rnd::Near);
         let d = n_add(
@@ -1185,25 +1240,24 @@ fn anchored_offer_generate(
         );
         let icon = n_sub(n_mul(pool_out, r, Rnd::Near), n_div(pool_in, f, Rnd::Near), Rnd::Near);
         if icon.0 == 0 {
-            return None;
+            return Anchored::Failed;
         }
         let pick = if n_cmp(icon, root) == Ordering::Less { icon } else { root };
-        let make = |i_prop: Me| -> Option<(Me, Me)> {
+        let make = |i_prop: Me| -> Anchored {
             let i = to_amount(i_prop, in_xrp, Rnd::Down);
             if i.0 == 0 {
-                return None;
+                return Anchored::Empty;
             }
             let o = swap_asset_in(pool_in, pool_out, i, tfee, out_xrp);
             if o.0 == 0 {
-                return None;
+                return Anchored::Empty;
             }
-            Some((i, o))
+            Anchored::Offer(i, o)
         };
-        let (i, o) = make(pick)?;
-        if rate_of(i, o) > target {
-            return make(n_mul(i, (9_999_000_000_000_000, -16), Rnd::Down));
+        match make(pick) {
+            Anchored::Offer(i, o) if rate_of(i, o) > target => make(n_mul(i, (9_999_000_000_000_000, -16), Rnd::Down)),
+            other => other,
         }
-        Some((i, o))
     }
 }
 
@@ -1397,7 +1451,7 @@ pub(crate) fn anchored_offer_quality(
     if n_cmp(dist, (LO, -22)) == Ordering::Less {
         return None; // within 1e-7
     }
-    let offer = anchored_offer(pool_in, pool_out, gets_leg.xrp, pays_leg.xrp, clob, amm.tfee).or_else(|| {
+    let offer = anchored_or(pool_in, pool_out, gets_leg.xrp, pays_leg.xrp, clob, amm.tfee, || {
         let out = to_amount(n_mul(pool_out, (9_900_000_000_000_000, -16), Rnd::Near), pays_leg.xrp, Rnd::Down);
         if out.0 == 0 || n_cmp(out, pool_out) != Ordering::Less {
             return None;
@@ -1968,7 +2022,7 @@ pub(crate) fn anchored_slice(
     if n_cmp(dist, (LO, -22)) == Ordering::Less {
         return None; // within 1e-7 of the book — the pool stands aside
     }
-    anchored_offer(pool_in, pool_out, gets_leg.xrp, pays_leg.xrp, clob, amm.tfee).or_else(|| {
+    anchored_or(pool_in, pool_out, gets_leg.xrp, pays_leg.xrp, clob, amm.tfee, || {
         max_offer_amounts(pool_in, pool_out, amm.tfee, pays_leg.xrp, gets_leg.xrp)
             .filter(|(i, o)| rate_of(*i, *o) < clob)
     })
@@ -2226,7 +2280,7 @@ pub(crate) fn consume(
             swap_asset_out(pool_in, pool_out, out, amm.tfee, gets_leg.xrp).map(|i| (i, out))
         })()
     } else if let Some(qb) = clob {
-        anchored_offer(pool_in, pool_out, gets_leg.xrp, pays_leg.xrp, qb, amm.tfee).or_else(|| {
+        anchored_or(pool_in, pool_out, gets_leg.xrp, pays_leg.xrp, qb, amm.tfee, || {
             // fixAMMv1_2: fall back to maxOffer when it still beats the book
             max_offer().filter(|(i, o)| rate_of(*i, *o) < qb)
         })
@@ -2725,6 +2779,64 @@ mod tests {
         // spot = 1e-6 out per in; a limit demanding 1e-3 out per in is
         // unreachable (rate = 1000 in per out).
         assert_eq!(amm.out_from_avg_q(me("1000")), None);
+    }
+
+    /// A quality-anchored offer whose proposed take rounds to the WHOLE pool
+    /// is shaved by `reduceOffer` and retried, not abandoned.
+    ///
+    /// rippled `getAMMOfferStartWithTakerGets` (AMMHelpers.h): `swapAssetOut`
+    /// answers a request for all of `pool.out` (denom <= 0) with the maximum
+    /// amount, no target quality accepts that, so `getAmounts(reduceOffer(out))`
+    /// follows. We returned no anchored offer at all and fell back to the 99%
+    /// `maxOffer`.
+    ///
+    /// #108321579 A32085229A09 (a Batch inner Payment draining the
+    /// xOracleGG/XRP pool against a book tip of 0.001 xOracleGG per drop):
+    /// pool 9201636610000000e-29 xOracleGG / 1 623 197 drops, fee 1000. The
+    /// ledger's own numbers fix the two turns: 1 623 197 -> 163 -> 1 drop, the
+    /// pool's xOracleGG ending at 1523838140949577e-22 (we walked
+    /// 1 623 197 -> 16 232 -> 1 and ended at 1523779831658831e-22).
+    #[test]
+    fn an_anchored_take_of_the_whole_pool_is_reduced_not_dropped() {
+        let target = 0x5203_8d7e_a4c6_8000u64;
+        let pool_in: Me = (9_201_636_610_000_000u128, -29i32);
+        let pool_out: Me = (1_623_197u128, 0i32);
+        let (in1, out1) = anchored_offer(pool_in, pool_out, false, true, target, 1000)
+            .expect("the reduced offer stands");
+        assert_eq!(out1, (1_623_034u128, 0i32), "1 623 197 x 0.9999, truncated");
+
+        let pool_in2 = n_add(pool_in, in1, Rnd::Near);
+        let (in2, out2) = anchored_offer(pool_in2, (163u128, 0i32), false, true, target, 1000)
+            .expect("the second turn needs no reduction");
+        assert_eq!(out2, (162u128, 0i32), "leaves the pool its last drop");
+        assert_eq!(
+            n_norm(n_add(pool_in2, in2, Rnd::Near)),
+            n_norm((1_523_838_140_949_577u128, -22i32)),
+            "the pool's xOracleGG balance in ledger #108321579"
+        );
+    }
+
+    /// An anchored offer that rounds down to nothing is "no valid offer":
+    /// the fixAMMv1_2 `maxOffer` fallback is NOT tried (see [`Anchored`]).
+    ///
+    /// #108328631 7EFCDA7C861F, second turn: the pool is down to
+    /// 8961960769624399e-19 xOracleGG / 2 drops against the same 0.001 tip.
+    /// The quadratic's root is 0.66 of a drop, so takerGets is 0; rippled left
+    /// the two drops (AccountRoot E4E40C5A FinalFields.Balance "2") and took
+    /// its next drop from the book. We sold one through the 99% maxOffer.
+    #[test]
+    fn an_empty_anchored_offer_does_not_fall_back_to_max_offer() {
+        let target = 0x5203_8d7e_a4c6_8000u64;
+        let pool_in: Me = (8_961_960_769_624_399u128, -19i32);
+        let pool_out: Me = (2u128, 0i32);
+        assert!(matches!(anchored(pool_in, pool_out, false, true, target, 1000), Anchored::Empty));
+        let fell_back = std::cell::Cell::new(false);
+        let offer = anchored_or(pool_in, pool_out, false, true, target, 1000, || {
+            fell_back.set(true);
+            max_offer_amounts(pool_in, pool_out, 1000, true, false)
+        });
+        assert_eq!(offer, None);
+        assert!(!fell_back.get(), "the fallback is for a FAILED anchored offer only");
     }
 
     /// `max_offer` must reproduce rippled's `AMMLiquidity::maxOffer` exactly.

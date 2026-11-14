@@ -194,14 +194,11 @@ impl AmmLiquidity {
             Some(s)
         } else if clob_quality.is_none() {
             amm_swap::max_offer(sb, &self.amm, &pays_leg, &gets_leg)
-        } else if let Some(s) = amm_swap::anchored_slice(sb, &self.amm, &pays_leg, &gets_leg, clob_quality.map(|q| q.0).unwrap_or(0)) {
-            Some(s)
         } else {
-            // fixAMMv1_2: the largest offer, when its quality beats the CLOB.
-            let clob = clob_quality.map(|q| q.0).unwrap_or(u64::MAX);
-            amm_swap::max_offer(sb, &self.amm, &pays_leg, &gets_leg).filter(|s| {
-                quality_of_me(s.0, s.1, self.asset_in.is_xrp(), self.asset_out.is_xrp()).is_some_and(|q| q.0 < clob)
-            })
+            // changeSpotPriceQuality, then (fixAMMv1_2, and only when that
+            // FAILED rather than came out empty) the largest offer if its
+            // quality beats the CLOB — both inside `anchored_slice`.
+            amm_swap::anchored_slice(sb, &self.amm, &pays_leg, &gets_leg, clob_quality.map(|q| q.0).unwrap_or(0))
         };
         let (inp, out) = amounts?;
         if inp.0 == 0 || out.0 == 0 {
@@ -211,7 +208,7 @@ impl AmmLiquidity {
         // changeSpotPriceQuality offers, but `Quality{balances}` — the SPOT
         // price — for maxOffer (AMMLiquidity.cpp: `AMMOffer(*this,
         // {swapAssetOut(balances, out), out}, balances, Quality{balances})`).
-        let is_max_offer = !multi && (clob_quality.is_none() || amm_swap::anchored_slice(sb, &self.amm, &pays_leg, &gets_leg, clob_quality.map(|q| q.0).unwrap_or(0)).is_none());
+        let is_max_offer = !multi && clob_quality.is_none();
         let quality = if is_max_offer {
             quality_of_me(balances.0, balances.1, self.asset_in.is_xrp(), self.asset_out.is_xrp())?
         } else {
