@@ -1428,14 +1428,17 @@ async fn fetch_ledger_metadata(
 /// loop can catch up.
 #[cfg_attr(not(feature = "ffi"), allow(dead_code))]
 fn ffi_catchup_budget(native_writer: bool, shadow_active: bool) -> u32 {
-    if !native_writer && shadow_active { 200 } else { 25 }
+    // Under the native writer (Phase B) the compare decides nothing: the mirror follows what ws-sync writes. Its
+    // 3 s wait sits inside the ledger loop, so past the edge it only holds the loop back (2026-11-18).
+    if native_writer { 2 } else if shadow_active { 200 } else { 25 }
 }
 
 /// Whether the tx-set gate reads this ledger's `(tx, meta)` pairs. Our own transaction tree (and so our own hash,
 /// and under 5a our signature) is checked against these pairs, so a ledger without them goes unsigned.
 #[cfg_attr(not(feature = "ffi"), allow(dead_code))]
-fn gate_reads_pairs(_from_peers: bool, lag: u32) -> bool {
-    lag <= 25
+fn gate_reads_pairs(from_peers: bool, lag: u32) -> bool {
+    // From peers the pairs came with the ledger. Over RPC they cost a request, kept to the edge.
+    from_peers || lag <= 25
 }
 
 fn is_pseudo_tx_blob(bytes: &[u8]) -> bool {
