@@ -162,6 +162,21 @@ fn canon_amount(f: &mut serde_json::Value) {
                     o.insert("value".into(), serde_json::Value::String(c));
                 }
             }
+            // A currency is its 160-bit code, not a spelling: the decoder writes a standard code as three
+            // letters and the engine writes a line it creates with the code in hex. A line deleted at zero and
+            // created again inside one payment then listed its unchanged Balance and limits in PreviousFields
+            // (mainnet #108404174 CECC0874D5F7). Only an amount or an issue is read this way: it has no other keys.
+            let issue_keys = o.keys().all(|k| matches!(k.as_str(), "currency" | "issuer" | "value"));
+            if let (true, Some(serde_json::Value::String(c))) = (issue_keys, o.get("currency")) {
+                if c.len() == 3 && c.is_ascii() {
+                    let code = if c == "XRP" {
+                        "0".repeat(40)
+                    } else {
+                        format!("{}{}{}", "0".repeat(24), hex::encode_upper(c.as_bytes()), "0".repeat(10))
+                    };
+                    o.insert("currency".into(), serde_json::Value::String(code));
+                }
+            }
         }
         serde_json::Value::String(v) if v.bytes().all(|b| b.is_ascii_digit()) && !v.is_empty() => {
             if let Some(c) = canon(v) {
