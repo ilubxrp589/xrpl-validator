@@ -552,6 +552,31 @@ mod tests {
         let moved = json!([{"PriceData": {"AssetPrice": "16869a1", "BaseAsset": "ADA", "QuoteAsset": "USD", "Scale": 8}}]);
         assert!(!same_field("PriceDataSeries", &stored, &moved));
         assert!(same_field("OwnerNode", &json!("0000000000000003"), &json!("3")));
+    }
+
+    /// Mainnet #108404174 CECC0874D5F7 (and #108404061, #108404072, #108404083): a self-payment sent the whole of
+    /// a trust line's balance and took it back from the sender's own offer. The line was deleted at zero and
+    /// created again inside the one payment, and the engine writes a new line's currency as its 160-bit code
+    /// where the stored line spells it "BRT". Same currency, so the line's amounts did not change: the network's
+    /// record carries no PreviousFields for it.
+    #[test]
+    fn a_currency_code_and_its_iso_spelling_are_the_same_field() {
+        let code = "0000000000000000000000004252540000000000";
+        let stored = json!({"currency": "BRT", "issuer": "0000000000000000000000000000000000000001", "value": "-9522.9679075003"});
+        let engine = json!({"currency": code, "issuer": "0000000000000000000000000000000000000001", "value": "-9522.9679075003"});
+        assert!(same_field("Balance", &stored, &engine));
+        let other = json!({"currency": "BRL", "issuer": "0000000000000000000000000000000000000001", "value": "-9522.9679075003"});
+        assert!(!same_field("Balance", &other, &engine));
+        // An issue: XRP is the all-zero code.
+        assert!(same_field("Asset", &json!({"currency": "XRP"}), &json!({"currency": "0000000000000000000000000000000000000000"})));
+        let line = |cur: &str| {
+            serde_json::to_vec(&json!({"LedgerEntryType": "RippleState", "Flags": 2228224, "LowNode": "3", "HighNode": "0",
+                "Balance": {"currency": cur, "issuer": "0000000000000000000000000000000000000001", "value": "-9522.9679075003"},
+                "LowLimit": {"currency": cur, "issuer": "2C5940CBDC0B44824AF50941FB9B9404F88B3BC3", "value": "0"},
+                "HighLimit": {"currency": cur, "issuer": "5F09635750859373DCFBE0F734EEB1D166A3D93F", "value": "0"}}))
+            .unwrap()
+        };
+        assert!(semantically_equal(&line("BRT"), &line(code)));
         assert!(!same_field("OutstandingAmount", &json!("100"), &json!("256")));
     }
 
