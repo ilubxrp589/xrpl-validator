@@ -451,7 +451,7 @@ pub async fn start_ws_sync(
                     // optional and keeps the plain 25.
                     #[cfg(feature = "ffi")]
                     let ffi_catchup_budget: u32 =
-                        if !native_writer && native_shadow.as_ref().map_or(false, |s| s.is_active()) { 200 } else { 25 };
+                        ffi_catchup_budget(native_writer, native_shadow.as_ref().map_or(false, |s| s.is_active()));
                     #[cfg(feature = "ffi")]
                     let skip_shadow_for_catchup =
                         closed_seq.saturating_sub(process_seq) > ffi_catchup_budget;
@@ -805,7 +805,7 @@ pub async fn start_ws_sync(
                     #[cfg(feature = "ffi")]
                     {
                         let gate = txgate_mode();
-                        if gate != TxGate::Off && closed_seq.saturating_sub(process_seq) <= 25 {
+                        if gate != TxGate::Off && gate_reads_pairs(peer_ledger.is_some(), closed_seq.saturating_sub(process_seq)) {
                             let triples = match &peer_ledger {
                                 Some(p) => p.pairs.clone(),
                                 None => fetch_ledger_tx_meta_all(&rpc, process_seq).await,
@@ -1424,6 +1424,20 @@ async fn fetch_ledger_metadata(
 /// A network-generated pseudo-tx (EnableAmendment, SetFee, UNLModify): no signature, and the FFI leg skips it. Its blob
 /// opens with sfTransactionType (0x12) and the type as a u16.
 #[cfg(feature = "ffi")]
+/// How many ledgers behind the newest one the libxrpl (FFI) compare still runs; further back it is skipped so the
+/// loop can catch up.
+#[cfg_attr(not(feature = "ffi"), allow(dead_code))]
+fn ffi_catchup_budget(native_writer: bool, shadow_active: bool) -> u32 {
+    if !native_writer && shadow_active { 200 } else { 25 }
+}
+
+/// Whether the tx-set gate reads this ledger's `(tx, meta)` pairs. Our own transaction tree (and so our own hash,
+/// and under 5a our signature) is checked against these pairs, so a ledger without them goes unsigned.
+#[cfg_attr(not(feature = "ffi"), allow(dead_code))]
+fn gate_reads_pairs(_from_peers: bool, lag: u32) -> bool {
+    lag <= 25
+}
+
 fn is_pseudo_tx_blob(bytes: &[u8]) -> bool {
     const PSEUDO_TX_TYPES: [u16; 3] = [100, 101, 102]; // EnableAmendment, SetFee, UNLModify
     bytes.len() >= 3 && bytes[0] == 0x12 && PSEUDO_TX_TYPES.contains(&u16::from_be_bytes([bytes[1], bytes[2]]))
@@ -2324,6 +2338,32 @@ mod undo_tests {
     /// Both rollbacks restore the ledger's pre-images AND rewind the bookmark, so a warm restart
     /// never trusts a `meta:last_seq` one ledger ahead of the state (the "no hash root" rollback
     /// used to leave it at `seq`).
+    /// 2026-11-18, #108412660 on: mainnet closed ledgers of 450-1,200 transactions, libxrpl's compare ran past its
+    /// 3 s wait on each, and the loop sat 25-42 ledgers behind for as long as the bursts lasted, because the
+    /// compare was only left out more than 25 behind. Under the native writer the compare decides nothing, so it
+    /// runs at the edge only.
+    #[test]
+    fn under_the_native_writer_the_ffi_compare_runs_only_at_the_edge() {
+        assert_eq!(ffi_catchup_budget(true, true), 2);
+        assert_eq!(ffi_catchup_budget(true, false), 2);
+        // Without the writer the mirror follows the FFI overlay: unchanged.
+        assert_eq!(ffi_catchup_budget(false, true), 200);
+        assert_eq!(ffi_catchup_budget(false, false), 25);
+    }
+
+    /// The same episode: every ledger processed more than 25 behind (#108412801-808, 835-848, 875-877, 904-909)
+    /// went unsigned. The gate did not read its pairs, so our transaction tree had nothing to be held against and
+    /// own_hash borrowed the transactions. From peers the pairs are already in hand at any distance; over RPC
+    /// they are an extra request, still only near the edge.
+    #[test]
+    fn a_peer_ledger_has_its_pairs_read_however_far_behind() {
+        assert!(gate_reads_pairs(true, 0));
+        assert!(gate_reads_pairs(true, 26));
+        assert!(gate_reads_pairs(true, 400));
+        assert!(gate_reads_pairs(false, 25));
+        assert!(!gate_reads_pairs(false, 26));
+    }
+
     #[cfg(feature = "ffi")]
     #[test]
     fn fallback_keys_add_the_system_objects() {
