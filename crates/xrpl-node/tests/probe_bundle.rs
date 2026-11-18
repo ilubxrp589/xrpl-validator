@@ -43,6 +43,19 @@ fn probe_bundle() {
     let tx = &bundle["tx"];
     let tx_hash = tx["hash"].as_str().unwrap();
     let txf = build_txfields(tx).expect("txfields");
+    // PROBE_META=1: the transaction record our engine writes (a Batch outer's, then each inner's), as JSON:
+    // a record receipt's drill reads PreviousFields and FinalFields here.
+    if std::env::var("PROBE_META").is_ok() {
+        let mut txf_m = txf.clone();
+        if txf_m.fields.get("hash").is_none() {
+            txf_m.fields["hash"] = Value::String(tx_hash.to_uppercase());
+        }
+        let tc = xrpl_node::native_apply::native_apply_one_changes(&state, &txf_m, tx_hash, seq);
+        println!("PROBE META {} {}", &tx_hash[..12], xrpl_node::meta_check::our_meta(&tc, 0));
+        for inner in &tc.inners {
+            println!("PROBE META inner {} {}", &inner.id[..12.min(inner.id.len())], xrpl_node::meta_check::inner_meta(inner, 0, tx_hash));
+        }
+    }
     let (ter, mut mods) = native_apply_one(&state, &txf);
     // A Batch outer's inners ran inside do_apply: drain their verdicts and
     // touched sets now, before anything else can reuse the thread-locals.
