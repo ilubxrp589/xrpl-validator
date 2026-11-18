@@ -1421,9 +1421,6 @@ async fn fetch_ledger_metadata(
     Ok((sorted_txs, header, wallet_delta))
 }
 
-/// A network-generated pseudo-tx (EnableAmendment, SetFee, UNLModify): no signature, and the FFI leg skips it. Its blob
-/// opens with sfTransactionType (0x12) and the type as a u16.
-#[cfg(feature = "ffi")]
 /// How many ledgers behind the newest one the libxrpl (FFI) compare still runs; further back it is skipped so the
 /// loop can catch up.
 #[cfg_attr(not(feature = "ffi"), allow(dead_code))]
@@ -1441,6 +1438,9 @@ fn gate_reads_pairs(from_peers: bool, lag: u32) -> bool {
     from_peers || lag <= 25
 }
 
+/// A network-generated pseudo-tx (EnableAmendment, SetFee, UNLModify): no signature, and the FFI leg skips it. Its blob
+/// opens with sfTransactionType (0x12) and the type as a u16.
+#[cfg(feature = "ffi")]
 fn is_pseudo_tx_blob(bytes: &[u8]) -> bool {
     const PSEUDO_TX_TYPES: [u16; 3] = [100, 101, 102]; // EnableAmendment, SetFee, UNLModify
     bytes.len() >= 3 && bytes[0] == 0x12 && PSEUDO_TX_TYPES.contains(&u16::from_be_bytes([bytes[1], bytes[2]]))
