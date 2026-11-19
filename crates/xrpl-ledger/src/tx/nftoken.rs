@@ -2013,6 +2013,83 @@ mod tests {
         );
     }
 
+    /// A token minted WITHOUT `tfTransferable` (NFTokenID flags lack 0x0008) can be offered only by
+    /// its issuer or by the issuer's current `NFTokenMinter`. rippled `nft::tokenOfferCreatePreclaim`
+    /// (NFTokenHelpers.cpp:853-860 in 3.4.1):
+    ///
+    /// ```text
+    /// if (nftIssuer != acctID && ((nftFlags & nft::kFlagTransferable) == 0)) {
+    ///     auto const root = view.read(keylet::account(nftIssuer));
+    ///     if (auto minter = (*root)[~sfNFTokenMinter]; minter != acctID)
+    ///         return tefNFTOKEN_IS_NOT_TRANSFERABLE;
+    /// }
+    /// ```
+    ///
+    /// A tef never reaches a ledger on its own, but it does decide one: an inner of an AllOrNothing
+    /// Batch that fails with it discards the whole batch. #108425329 Batch E55428066A4D
+    /// (rKRQCkc9, three NFTokenCreateOffer sell inners): inner 2E0214E69CD3 offers
+    /// 00000000E450FC6F…05F34804, issued by rMFNnkPv which has no NFTokenMinter. Mainnet applied the
+    /// outer alone (1 node); we created all three offers (8 nodes) and the ledger went unsigned.
+    #[test]
+    fn a_non_transferable_token_offered_by_a_stranger_is_tef_not_transferable() {
+        let issuer = [0x01u8; 20];
+        let holder = [0x02u8; 20];
+        let state = make_state(&[(issuer, 500_000_000), (holder, 500_000_000)]);
+        let mut sb = Sandbox::new(&state);
+        let ikey = keylet::account_root_key(&issuer);
+        let set_minter = |sb: &mut Sandbox, minter: Option<[u8; 20]>| {
+            let mut a: serde_json::Value = serde_json::from_slice(&sb.read(&ikey).unwrap()).unwrap();
+            match minter {
+                Some(m) => a["NFTokenMinter"] = serde_json::json!(hex::encode(m)),
+                None => {
+                    a.as_object_mut().unwrap().remove("NFTokenMinter");
+                }
+            }
+            sb.write(ikey, serde_json::to_vec(&a).unwrap());
+        };
+
+        // The holder mints on the issuer's behalf, without tfTransferable: the token sits in the
+        // HOLDER's page and names the ISSUER.
+        set_minter(&mut sb, Some(holder));
+        let mut mint = mint_tx(holder, 0);
+        mint.fields["Flags"] = serde_json::json!(0);
+        mint.fields["Issuer"] = serde_json::json!(hex::encode(issuer));
+        assert_eq!(NFTokenMintTransactor.do_apply(&mint, &mut sb), TxResult::Success);
+        let id = page_tokens(&sb, &holder).first().expect("token minted").clone();
+        assert_eq!(&id[..4], "0000", "the token is not transferable");
+        assert_eq!(&id[8..48], hex::encode_upper(issuer).as_str(), "and names the issuer");
+
+        let tx = TxFields {
+            account: holder,
+            tx_type: "NFTokenCreateOffer".into(),
+            fee: 0,
+            sequence: 8,
+            ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({ "NFTokenID": id, "Amount": "0", "Flags": 1 }),
+            inner_batch: true,
+        };
+        assert_eq!(
+            NFTokenCreateOfferTransactor.preclaim(&tx, &sb),
+            TxResult::Success,
+            "the issuer's current minter may offer it",
+        );
+
+        // Nothing else changes — only the issuer no longer names the holder as its minter.
+        set_minter(&mut sb, None);
+        let got = NFTokenCreateOfferTransactor.preclaim(&tx, &sb);
+        assert_eq!(got, TxResult::NftokenIsNotTransferable, "a stranger may not");
+        assert_eq!(got.code_str(), "tefNFTOKEN_IS_NOT_TRANSFERABLE");
+        assert!(!got.is_claimed(), "a tef claims no fee and never stands in a ledger");
+
+        set_minter(&mut sb, Some(issuer));
+        assert_eq!(
+            NFTokenCreateOfferTransactor.preclaim(&tx, &sb),
+            TxResult::NftokenIsNotTransferable,
+            "nor when the minter is somebody else",
+        );
+    }
+
     #[test]
     fn decode20_resolves_base58_issuer() {
         // The probe does NOT hex-normalise the Issuer field, so the engine sees

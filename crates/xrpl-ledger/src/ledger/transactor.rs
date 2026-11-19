@@ -280,6 +280,9 @@ pub enum TxResult {
     WrongPrior,
     /// tefNO_AUTH_REQUIRED — tfSetfAuth on an account without lsfRequireAuth.
     NoAuthRequired,
+    /// tefNFTOKEN_IS_NOT_TRANSFERABLE — an NFT offer for a token without tfTransferable, by an account that is
+    /// neither its issuer nor the issuer's NFTokenMinter (`nft::tokenOfferCreatePreclaim`).
+    NftokenIsNotTransferable,
     /// tefALREADY — EnableAmendment: the amendment is already enabled, already has the majority it claims, or
     /// lacks the one it loses (Change::applyAmendment).
     Already,
@@ -495,6 +498,7 @@ impl TxResult {
             TxResult::WrongPrior => "tefWRONG_PRIOR",
             TxResult::NoDelegatePermission => "terNO_DELEGATE_PERMISSION",
             TxResult::NoAuthRequired => "tefNO_AUTH_REQUIRED",
+            TxResult::NftokenIsNotTransferable => "tefNFTOKEN_IS_NOT_TRANSFERABLE",
             TxResult::Already => "tefALREADY",
             TxResult::PreSeq => "terPRE_SEQ",
             TxResult::PreTicket => "terPRE_TICKET",
