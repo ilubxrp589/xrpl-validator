@@ -584,6 +584,7 @@ fn token_offer_create_preclaim(
 ) -> TxResult {
     use crate::tx::offer as ox;
     const K_FLAG_CREATE_TRUST_LINES: u16 = 0x0004;
+    const K_FLAG_TRANSFERABLE: u16 = 0x0008;
     let (acct, nft_issuer) = (*acct, *nft_issuer);
     let Some(leg) = ox::leg_of(amount) else {
         return TxResult::Malformed;
@@ -604,8 +605,20 @@ fn token_offer_create_preclaim(
             return TxResult::Frozen;
         }
     }
-    // (`tefNFTOKEN_IS_NOT_TRANSFERABLE` for a non-transferable token offered
-    // by a stranger is a tef — it never reaches a validated ledger.)
+    // NFTokenHelpers.cpp:853-860: a token without tfTransferable can be offered
+    // only by its issuer or the issuer's CURRENT NFTokenMinter; anyone else is
+    // tefNFTOKEN_IS_NOT_TRANSFERABLE. A tef never stands in a ledger by itself,
+    // but as an inner it fails its Batch: #108425329 E55428066A4D (AllOrNothing)
+    // was discarded on mainnet for inner 2E0214E69CD3, and we had skipped this
+    // test as unreachable. (rippled asserts the issuer's root exists; a missing
+    // root has no minter, so it refuses too.)
+    if nft_issuer != acct && nft_flags & K_FLAG_TRANSFERABLE == 0 {
+        let minter = ox::json_at(sandbox, &keylet::account_root_key(&nft_issuer))
+            .and_then(|root| root.get("NFTokenMinter").and_then(decode_account_id));
+        if minter != Some(acct) {
+            return TxResult::NftokenIsNotTransferable;
+        }
+    }
     // NFTokenHelpers.cpp:866: `isFrozen(view, acct, currency, issuer)` reads
     // the ISSUER's lsfGlobalFreeze even when acct is the issuer itself —
     // tecFROZEN on an issuer offering in its own frozen IOU. fixCleanup3_4_0
