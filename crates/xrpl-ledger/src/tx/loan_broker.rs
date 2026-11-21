@@ -730,6 +730,106 @@ impl Transactor for LoanBrokerCoverWithdrawTransactor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// LoanBrokerCoverClawback (LoanBrokerCoverClawback.cpp)
+// ---------------------------------------------------------------------------
+
+/// LoanBrokerCoverClawback (type 78): the ISSUER of the vault's asset takes
+/// first-loss capital back from a broker's pseudo-account, down to the
+/// minimum cover the broker's debt requires. The broker is named by
+/// sfLoanBrokerID, or — for an IOU — by an sfAmount whose `issuer` is the
+/// broker's pseudo-account (the trust line seen from the issuer's side). No
+/// amount, or zero, means everything above the minimum; a larger amount is
+/// clamped to it.
+///
+/// Fee: the plain base fee. No reserve change.
+pub struct LoanBrokerCoverClawbackTransactor;
+
+/// `determineBrokerID(view, tx)` (LoanBrokerCoverClawback.cpp:86-127):
+/// sfLoanBrokerID when given; else the sfLoanBrokerID of the account the IOU
+/// sfAmount names as issuer — tecNO_ENTRY without that account,
+/// tecOBJECT_NOT_FOUND when it is not a broker's pseudo-account (another
+/// kind of pseudo-account included).
+fn determine_broker_id(sandbox: &Sandbox, tx: &TxFields) -> Result<Hash256, TxResult> {
+    if let Some(id) = broker_id(tx) {
+        return Ok(id);
+    }
+    // Preflight refused a missing or non-IOU amount without a broker id.
+    let Some(Amount { asset: HeldAsset::Iou { issuer: maybe_pseudo, .. }, .. }) = tx.fields.get("Amount").and_then(tx_amount) else {
+        return Err(TxResult::TecInternal);
+    };
+    let Some(root) = json_at(sandbox, &keylet::account_root_key(&maybe_pseudo)) else { return Err(TxResult::NoEntry) };
+    mpt::key_field(&root, "LoanBrokerID").ok_or(TxResult::ObjectNotFound)
+}
+
+/// `determineAsset(view, account, brokerPseudoAccountID, amount)`
+/// (LoanBrokerCoverClawback.cpp:129-157): the asset the transaction means.
+/// An MPT amount is its own asset. An IOU amount names one end of the trust
+/// line as issuer: the submitter (the real issuer) — the asset as written —
+/// or the broker's pseudo-account — the same currency issued by the
+/// submitter. Anyone else: tecWRONG_ASSET.
+fn determine_asset(account: &[u8; 20], broker_pseudo: &[u8; 20], amount: &Amount) -> Result<HeldAsset, TxResult> {
+    match amount.asset {
+        HeldAsset::Iou { currency, issuer: holder } => {
+            if holder == *account {
+                Ok(amount.asset)
+            } else if holder == *broker_pseudo {
+                Ok(HeldAsset::Iou { currency, issuer: *account })
+            } else {
+                Err(TxResult::WrongAsset)
+            }
+        }
+        other => Ok(other),
+    }
+}
+
+/// `determineClawAmount(sleBroker, vaultAsset, amount, vaultSle, rules)`
+/// (LoanBrokerCoverClawback.cpp:159-196): the most that may be clawed back
+/// is sfCoverAvailable less the minimum cover — `minimumBrokerCover` under
+/// fixCleanup3_2_0, before it the unrounded rate of the debt taken Upward —
+/// the subtraction rounded Downward. Nothing above the minimum:
+/// tecINSUFFICIENT_FUNDS. No amount or zero takes all of it; a larger amount
+/// is clamped to it. The result is in the VAULT's asset whatever issuer the
+/// transaction's amount named.
+fn determine_claw_amount(
+    sandbox: &Sandbox,
+    broker: &Value,
+    vault: &Value,
+    asset: HeldAsset,
+    amount: Option<&Amount>,
+) -> Result<Result<Amount, TxResult>, StError> {
+    let debt_total = number_field(broker, "DebtTotal");
+    let rate = uint_field(broker, "CoverRateMinimum") as u32;
+    let min_required = if am::fix_cleanup_3_2_0(sandbox) {
+        lh::minimum_broker_cover(debt_total, rate, vault)?
+    } else {
+        arith(tenth_bips_of_value(debt_total, rate, Rounding::Upward))?
+    };
+    let max_claw = arith(number_field(broker, "CoverAvailable").sub(min_required, Rounding::Downward))?;
+    if max_claw.is_zero() || max_claw.negative {
+        return Ok(Err(TxResult::InsufficientFunds));
+    }
+    let claw = match amount {
+        Some(amount) if !amount.is_zero() && amount.number() <= max_claw => amount.number(),
+        _ => max_claw,
+    };
+    Ok(Ok(amount_of(asset, claw)?))
+}
+
+impl Transactor for LoanBrokerCoverClawbackTransactor {
+    fn preflight(&self, _tx: &TxFields) -> TxResult {
+        TxResult::Unsupported
+    }
+
+    fn preclaim(&self, _tx: &TxFields, _sandbox: &Sandbox) -> TxResult {
+        TxResult::Unsupported
+    }
+
+    fn do_apply(&self, _tx: &TxFields, _sandbox: &mut Sandbox) -> TxResult {
+        TxResult::Unsupported
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1855,5 +1955,203 @@ mod tests {
         // fixCleanup3_4_0 (canAddHolding), not half-way through do_apply.
         edit(&mut st, ikey, |i| i["Flags"] = json!(i["Flags"].as_u64().unwrap() & !mpt::LSF_MPT_CAN_TRANSFER));
         assert_eq!(result(&st, &cover_withdraw(OWNER, &broker, mpt_json(&id, 60))), TxResult::NoAuth);
+    }
+
+    // -----------------------------------------------------------------------
+    // LoanBrokerCoverClawback
+    // -----------------------------------------------------------------------
+
+    /// A LoanBrokerCoverClawback with whichever of the two fields is given.
+    fn cover_clawback(account: [u8; 20], broker: Option<&Hash256>, amount: Option<Value>) -> TxFields {
+        let mut fields = json!({});
+        if let Some(broker) = broker {
+            fields["LoanBrokerID"] = json!(key_hex(broker));
+        }
+        if let Some(amount) = amount {
+            fields["Amount"] = amount;
+        }
+        tx("LoanBrokerCoverClawback", account, fields)
+    }
+
+    /// An IOU amount naming `holder` as its issuer: the trust line seen from
+    /// the real issuer's side.
+    fn held_by(holder: &[u8; 20], value: &str) -> Value {
+        json!({"currency": hex::encode_upper(USD_CODE), "issuer": hex::encode(holder), "value": value})
+    }
+
+    /// LoanBrokerCoverClawback.cpp:42-84 (LoanBroker_test.cpp:331-338: neither
+    /// field, a zero broker id, an XRP amount, a negative amount, an MPT
+    /// amount without a broker id).
+    #[test]
+    fn cover_clawback_preflight() {
+        let st = state();
+        let broker = Hash256([0xCD; 32]);
+        let id = mptid(7, ISSUER);
+        assert_eq!(result(&st, &cover_clawback(ISSUER, None, None)), TxResult::InvalidTx, "one of the two is needed");
+        assert_eq!(result(&st, &cover_clawback(ISSUER, Some(&Hash256([0; 32])), None)), TxResult::InvalidTx);
+        assert_eq!(result(&st, &cover_clawback(ISSUER, Some(&broker), Some(json!("1000")))), TxResult::BadAmount, "XRP");
+        assert_eq!(result(&st, &cover_clawback(ISSUER, None, Some(json!("1000")))), TxResult::BadAmount, "XRP, no broker id");
+        assert_eq!(result(&st, &cover_clawback(ISSUER, Some(&broker), Some(usd_json("-10")))), TxResult::BadAmount);
+        assert_eq!(result(&st, &cover_clawback(ISSUER, None, Some(mpt_json(&id, 1)))), TxResult::InvalidTx, "an MPT needs the broker id");
+        // Without a broker id the amount's issuer is the holder: not the
+        // submitter itself.
+        assert_eq!(result(&st, &cover_clawback(ISSUER, None, Some(usd_json("1")))), TxResult::InvalidTx);
+        // Zero is "all"; past preflight.
+        assert_eq!(result(&st, &cover_clawback(ISSUER, Some(&broker), Some(usd_json("0")))), TxResult::NoEntry);
+        assert_eq!(result(&st, &cover_clawback(ISSUER, Some(&broker), None)), TxResult::NoEntry);
+    }
+
+    /// LoanBrokerCoverClawback.cpp:86-127, :236-294 (LoanBroker_test.cpp:339-370):
+    /// finding the broker, who may claw back, which asset.
+    #[test]
+    fn cover_clawback_preclaim_broker_issuer_and_asset() {
+        let mut st = state();
+        let (broker, pseudo, vault) = usd_broker_with_cover(&mut st, "100");
+        let vault_pseudo = account_of(&get(&Sandbox::new(&st), &vault).unwrap(), "Account").unwrap();
+        // No broker id: the amount's issuer must be a broker's pseudo-account.
+        assert_eq!(result(&st, &cover_clawback(ISSUER, None, Some(held_by(&[0x99; 20], "1")))), TxResult::NoEntry, "no such account");
+        assert_eq!(result(&st, &cover_clawback(ISSUER, None, Some(held_by(&BOB, "1")))), TxResult::ObjectNotFound, "an ordinary account");
+        assert_eq!(
+            result(&st, &cover_clawback(ISSUER, None, Some(held_by(&vault_pseudo, "1")))),
+            TxResult::ObjectNotFound,
+            "a pseudo-account, but a vault's"
+        );
+        assert_eq!(result(&st, &cover_clawback(ISSUER, None, Some(held_by(&pseudo, "1")))), TxResult::Success);
+        // A broker id that is not a broker.
+        assert_eq!(result(&st, &cover_clawback(ISSUER, Some(&vault), None)), TxResult::NoEntry);
+        // Only the issuer.
+        assert_eq!(result(&st, &cover_clawback(OWNER, Some(&broker), None)), TxResult::NoPermission);
+        assert_eq!(result(&st, &cover_clawback(BOB, Some(&broker), Some(usd_json("1")))), TxResult::NoPermission);
+        // With a broker id the amount may name either end of the line —
+        // but no third account and no other currency.
+        assert_eq!(result(&st, &cover_clawback(ISSUER, Some(&broker), Some(usd_json("1")))), TxResult::Success);
+        assert_eq!(result(&st, &cover_clawback(ISSUER, Some(&broker), Some(held_by(&pseudo, "1")))), TxResult::Success);
+        assert_eq!(result(&st, &cover_clawback(ISSUER, Some(&broker), Some(held_by(&vault_pseudo, "1")))), TxResult::WrongAsset);
+        let wat = hex::encode_upper([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x57, 0x41, 0x54, 0, 0, 0, 0, 0]);
+        let other_currency = json!({"currency": wat, "issuer": hex::encode(pseudo), "value": "1"});
+        assert_eq!(result(&st, &cover_clawback(ISSUER, Some(&broker), Some(other_currency))), TxResult::WrongAsset);
+        let mpt_amount = mpt_json(&mptid(7, ISSUER), 1);
+        assert_eq!(result(&st, &cover_clawback(ISSUER, Some(&broker), Some(mpt_amount))), TxResult::WrongAsset);
+
+        // XRP is never clawed back.
+        let mut st = state();
+        let (broker, _, _) = xrp_broker_with_cover(&mut st, 10_000);
+        assert_eq!(result(&st, &cover_clawback(ISSUER, Some(&broker), None)), TxResult::NoPermission);
+        assert_eq!(result(&st, &cover_clawback(OWNER, Some(&broker), None)), TxResult::NoPermission);
+    }
+
+    /// LoanBrokerCoverClawback.cpp:203-234, :296-334 (LoanBroker_test.cpp:371-377:
+    /// nothing deposited tecINSUFFICIENT_FUNDS): the issuer's clawback
+    /// permission, and something above the minimum cover to take.
+    #[test]
+    fn cover_clawback_preclaim_permission_and_funds() {
+        // No cover at all.
+        let mut st = state();
+        let (broker, _, _) = usd_broker(&mut st);
+        assert_eq!(result(&st, &cover_clawback(ISSUER, Some(&broker), Some(usd_json("10")))), TxResult::InsufficientFunds);
+        // A cover exactly at its minimum.
+        let mut st = state();
+        let (broker, _, _) = usd_broker_with_cover(&mut st, "100");
+        let mut at_minimum = st.clone();
+        edit(&mut at_minimum, broker, |b| {
+            b["DebtTotal"] = json!("1000");
+            b["CoverRateMinimum"] = json!(10_000);
+            b["CoverRateLiquidation"] = json!(5_000);
+        });
+        assert_eq!(result(&at_minimum, &cover_clawback(ISSUER, Some(&broker), None)), TxResult::InsufficientFunds);
+        // The IOU issuer must allow clawback and must not have given up freezing.
+        let mut no_clawback = st.clone();
+        edit(&mut no_clawback, keylet::account_root_key(&ISSUER), |a| a["Flags"] = json!(LSF_DEFAULT_RIPPLE));
+        assert_eq!(result(&no_clawback, &cover_clawback(ISSUER, Some(&broker), None)), TxResult::NoPermission);
+        let mut no_freeze = st.clone();
+        edit(&mut no_freeze, keylet::account_root_key(&ISSUER), |a| {
+            a["Flags"] = json!(LSF_DEFAULT_RIPPLE | LSF_ALLOW_TRUST_LINE_CLAWBACK | LSF_NO_FREEZE)
+        });
+        assert_eq!(result(&no_freeze, &cover_clawback(ISSUER, Some(&broker), None)), TxResult::NoPermission);
+        assert_eq!(result(&st, &cover_clawback(ISSUER, Some(&broker), None)), TxResult::Success);
+        // The pseudo-account holding less than the cover says: tecINTERNAL.
+        let mut short = st.clone();
+        edit(&mut short, broker, |b| b["CoverAvailable"] = json!("200"));
+        assert_eq!(result(&short, &cover_clawback(ISSUER, Some(&broker), None)), TxResult::TecInternal);
+
+        // An MPT must be clawable.
+        let mut st = state();
+        let (broker, _, id) = mpt_broker_with_cover(&mut st, 100);
+        assert_eq!(result(&st, &cover_clawback(ISSUER, Some(&broker), None)), TxResult::Success);
+        edit(&mut st, keylet::mpt_issuance_key(&id), |i| i["Flags"] = json!(mpt::LSF_MPT_CAN_TRANSFER));
+        assert_eq!(result(&st, &cover_clawback(ISSUER, Some(&broker), None)), TxResult::NoPermission);
+    }
+
+    /// LoanBrokerCoverClawback.cpp:159-196, :336-376 (LoanBroker_test.cpp:457-
+    /// 508: 2 of 6 clawed back; then all of it four ways — no amount, zero,
+    /// the exact amount, more than there is).
+    #[test]
+    fn cover_clawback_takes_the_amount_or_everything_above_the_minimum() {
+        let mut st = state();
+        let (broker, pseudo, _) = usd_broker_with_cover(&mut st, "100");
+        let before = Sandbox::new(&st);
+        assert_eq!(holds(&before, &pseudo, &USD), usd("100"));
+        let (r, sb) = apply(&st, &cover_clawback(ISSUER, Some(&broker), Some(usd_json("30"))));
+        assert_eq!(r, TxResult::Success);
+        assert!(number_field(&broker_of(&sb), "CoverAvailable") == n("70"));
+        assert_eq!(holds(&sb, &pseudo, &USD), usd("70"), "the issuer redeemed 30");
+        assert_eq!(holds(&sb, &OWNER, &USD), holds(&before, &OWNER, &USD), "the owner's own balance is not touched");
+        assert_eq!(xrp_of(&sb, &ISSUER), BALANCE - FEE);
+        // Everything, four ways.
+        for amount in [None, Some(usd_json("0")), Some(usd_json("100")), Some(usd_json("5000")), Some(held_by(&pseudo, "0"))] {
+            let (r, sb) = apply(&st, &cover_clawback(ISSUER, Some(&broker), amount.clone()));
+            assert_eq!(r, TxResult::Success, "{amount:?}");
+            assert!(broker_of(&sb).get("CoverAvailable").is_none(), "{amount:?}: the cover is gone (SoeDefault)");
+            assert!(holds(&sb, &pseudo, &USD).is_zero(), "{amount:?}");
+            assert!(sb.exists(&keylet::ripple_state_key(&pseudo, &ISSUER, &USD_CODE)), "the pseudo-account's line stays");
+        }
+        // Without the broker id, through the pseudo-account's side of the line.
+        let (r, sb) = apply(&st, &cover_clawback(ISSUER, None, Some(held_by(&pseudo, "12.5"))));
+        assert_eq!(r, TxResult::Success);
+        assert!(number_field(&broker_of(&sb), "CoverAvailable") == n("87.5"));
+        assert_eq!(holds(&sb, &pseudo, &USD), usd("87.5"));
+
+        // A debt keeps its minimum cover: 10% of 250 = 25 stays.
+        edit(&mut st, broker, |b| {
+            b["DebtTotal"] = json!("250");
+            b["CoverRateMinimum"] = json!(10_000);
+            b["CoverRateLiquidation"] = json!(5_000);
+        });
+        for amount in [None, Some(usd_json("5000")), Some(usd_json("75"))] {
+            let (r, sb) = apply(&st, &cover_clawback(ISSUER, Some(&broker), amount.clone()));
+            assert_eq!(r, TxResult::Success, "{amount:?}");
+            assert!(number_field(&broker_of(&sb), "CoverAvailable") == n("25"), "{amount:?}");
+            assert_eq!(holds(&sb, &pseudo, &USD), usd("25"), "{amount:?}");
+        }
+        let (_, sb) = apply(&st, &cover_clawback(ISSUER, Some(&broker), Some(usd_json("74"))));
+        assert!(number_field(&broker_of(&sb), "CoverAvailable") == n("26"));
+
+        // MPT.
+        let mut st = state();
+        let (broker, pseudo, id) = mpt_broker_with_cover(&mut st, 100);
+        let asset = HeldAsset::Mpt(id);
+        let (r, sb) = apply(&st, &cover_clawback(ISSUER, Some(&broker), Some(mpt_json(&id, 40))));
+        assert_eq!(r, TxResult::Success);
+        assert!(number_field(&broker_of(&sb), "CoverAvailable") == n("60"));
+        assert_eq!(holds(&sb, &pseudo, &asset).mantissa, 60);
+        let issuance = get(&sb, &keylet::mpt_issuance_key(&id)).unwrap();
+        assert_eq!(mpt::dec_field(&issuance, "OutstandingAmount"), 1000 - 40, "clawed-back MPT is redeemed");
+        let (r, sb) = apply(&st, &cover_clawback(ISSUER, Some(&broker), None));
+        assert_eq!(r, TxResult::Success);
+        assert!(broker_of(&sb).get("CoverAvailable").is_none());
+        assert_eq!(holds(&sb, &pseudo, &asset).mantissa, 0);
+    }
+
+    /// LoanBrokerCoverClawback.cpp:311-313 → LendingHelpers.cpp:38-67
+    /// (LoanBroker_test.cpp:2903 "Cover precision guard: Clawback").
+    #[test]
+    fn cover_clawback_of_dust_below_the_cover_scale_is_precision_loss() {
+        let mut st = state();
+        line(&mut st, OWNER, 0, "200000", "1000000");
+        let (vault, _) = make_vault(&mut st, json!({"Asset": usd_asset()}));
+        let (broker, _) = make_broker(&mut st, &vault, json!({}));
+        commit(&mut st, &cover_deposit(OWNER, &broker, usd_json("100000")));
+        assert_eq!(result(&st, &cover_clawback(ISSUER, Some(&broker), Some(usd_json("0.00000000001")))), TxResult::PrecisionLoss);
+        assert_eq!(result(&st, &cover_clawback(ISSUER, Some(&broker), Some(usd_json("0.0000000001")))), TxResult::Success);
     }
 }
