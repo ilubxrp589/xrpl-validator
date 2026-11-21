@@ -83,7 +83,11 @@ pub fn fix_cleanup_3_4_0(sandbox: &Sandbox) -> bool {
 /// holders; and in the loan-broker transactors (`tx::loan_broker`): LoanBrokerSet's DebtMaximum
 /// range check (tecPRECISION_LOSS), LoanBrokerDelete's transfer / authorization checks on the
 /// cover payout, its owner count released before the payout and the owner's holding created
-/// for it. Nothing else of 3.5.0 is ported.
+/// for it; and in the loan transactors (`tx::loan`): LoanSet's out-of-range value fields refused
+/// tecPRECISION_LOSS instead of thrown. It also stands in — our choice, not a gate of rippled's —
+/// for "this ledger is made by 3.5.x servers" in LoanPay's fund-conservation balances
+/// (`tx::loan::ConservationModel`), which 3.5.0 changed without an amendment. Nothing else of
+/// 3.5.0 is ported.
 pub const FIX_CLEANUP_3_5_0: &str =
     "7300E10109D19BF1E87ACE63D3A79CD4ED6B9851C37D93ED94DE9BD41CF56835";
 
@@ -127,7 +131,8 @@ pub const DYNAMIC_MPT: &str =
 /// SingleAssetVault / LendingProtocol — enabled on devnet, NOT on mainnet as
 /// of 2026-11-21. SingleAssetVault gates the six vault transactors
 /// (`tx::vault`); LendingProtocol — with SingleAssetVault and MPTokensV1 —
-/// the five loan-broker transactors (`tx::loan_broker`). Either one also
+/// the five loan-broker transactors (`tx::loan_broker`) and the four loan
+/// transactors (`tx::loan`: LoanSet, LoanDelete, LoanManage, LoanPay). Either one also
 /// makes a pseudo-account (AMM, Vault, LoanBroker) start at Sequence 0
 /// instead of the ledger sequence (AccountRootHelpers.cpp:581-589).
 pub const SINGLE_ASSET_VAULT: &str =
@@ -140,8 +145,11 @@ pub const LENDING_PROTOCOL: &str =
 /// "LendingProtocolV1_1"). NOT on mainnet. Vault kinds and phases, cash-basis
 /// accounting for new vaults, and the Loan / Vault immutability invariants
 /// (InvariantCheck.cpp:1189-1233). Read by the vault transactors (kinds,
-/// phases, sfLEVersion, VaultDelete's sfMemoData) and by LoanBrokerSet (a
-/// broker only on a closed-ended vault, LoanBrokerSet.cpp:149-161).
+/// phases, sfLEVersion, VaultDelete's sfMemoData), by LoanBrokerSet (a
+/// broker only on a closed-ended vault, LoanBrokerSet.cpp:149-161) and by
+/// LoanSet (a closed-ended vault lends in its Investment phase only, and
+/// not past its redemption date, LoanSet.cpp:274-293). The loan maths'
+/// accounting model follows the vault's sfLEVersion, not this amendment.
 pub const LENDING_PROTOCOL_V1_1: &str =
     "A360E2BFD775A5B0DCE1C36C16DF31B72735A57584FD163655D2F9564F8E7AC8";
 
