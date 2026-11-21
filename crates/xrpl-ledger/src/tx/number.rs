@@ -1160,11 +1160,16 @@ mod tests {
         (x.negative, x.mantissa, x.exponent)
     }
 
-    /// The exact integer a Number with a non-negative external exponent holds.
+    /// The exact integer a Number holds (the suite's `toBigInt`, T:53-67): a
+    /// negative external exponent only strips trailing zeros.
     fn int(x: Number) -> i128 {
         let (m, e) = x.external();
-        assert!(e >= 0, "{x:?} is not an integer");
-        m as i128 * 10i128.pow(e as u32)
+        if e >= 0 {
+            return m as i128 * 10i128.pow(e as u32);
+        }
+        let p = 10i128.pow((-e) as u32);
+        assert_eq!(m as i128 % p, 0, "{x:?} is not an integer");
+        m as i128 / p
     }
 
     /// Number.cpp:32-33, Number.h:962-976 (the guard), Rules.cpp:43-71 (the
