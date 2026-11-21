@@ -139,9 +139,12 @@ pub fn get_transactor(tx_type: &str) -> Option<Box<dyn Transactor>> {
         "VaultDelete" => Some(Box::new(crate::tx::vault::VaultDeleteTransactor)),
         // while LendingProtocol, SingleAssetVault or MPTokensV1 is off.
         "LoanBrokerSet" => Some(Box::new(crate::tx::loan_broker::LoanBrokerSetTransactor)),
+        // while LendingProtocol, SingleAssetVault or MPTokensV1 is off.
+        "LoanBrokerSet" => Some(Box::new(crate::tx::loan_broker::LoanBrokerSetTransactor)),
         // The loan-broker family (LendingProtocol): each refuses itself temDISABLED in preflight
         // while LendingProtocol, SingleAssetVault or MPTokensV1 is off.
         "LoanBrokerSet" => Some(Box::new(crate::tx::loan_broker::LoanBrokerSetTransactor)),
+        "LoanBrokerCoverDeposit" => Some(Box::new(crate::tx::loan_broker::LoanBrokerCoverDepositTransactor)),
         "UNLModify" => Some(Box::new(UNLModifyTransactor)),
         "SetFee" => Some(Box::new(SetFeeTransactor)),
         "EnableAmendment" => Some(Box::new(EnableAmendmentTransactor)),

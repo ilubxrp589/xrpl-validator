@@ -411,6 +411,44 @@ impl Transactor for LoanBrokerSetTransactor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// LoanBrokerCoverDeposit (LoanBrokerCoverDeposit.cpp)
+// ---------------------------------------------------------------------------
+
+/// LoanBrokerCoverDeposit (type 76): the broker's owner adds first-loss
+/// capital — the vault's asset moves from the owner to the broker's
+/// pseudo-account and sfCoverAvailable rises by the same amount.
+///
+/// Fee: the plain base fee. No reserve change (the pseudo-account's holding
+/// exists since LoanBrokerSet).
+pub struct LoanBrokerCoverDepositTransactor;
+
+/// The amount a cover deposit moves (LoanBrokerCoverDeposit.cpp:106-114,
+/// :157-165): under fixCleanup3_2_0 sfAmount floored (Downward) to the scale
+/// of sfCoverAvailable, so that `sfCoverAvailable += amount` cannot round to
+/// more than the depositor paid; before the fix sfAmount as it is.
+fn cover_deposit_amount(sandbox: &Sandbox, broker: &Value, asset: HeldAsset, amount: Amount) -> Result<Amount, StError> {
+    if !am::fix_cleanup_3_2_0(sandbox) {
+        return Ok(amount);
+    }
+    let cover_scale = scale(number_field(broker, "CoverAvailable"), asset, AMBIENT)?;
+    round_to_scale(amount, cover_scale, Rounding::Downward)
+}
+
+impl Transactor for LoanBrokerCoverDepositTransactor {
+    fn preflight(&self, _tx: &TxFields) -> TxResult {
+        TxResult::Unsupported
+    }
+
+    fn preclaim(&self, _tx: &TxFields, _sandbox: &Sandbox) -> TxResult {
+        TxResult::Unsupported
+    }
+
+    fn do_apply(&self, _tx: &TxFields, _sandbox: &mut Sandbox) -> TxResult {
+        TxResult::Unsupported
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1036,5 +1074,203 @@ mod tests {
         let (r, sb) = update(json!({}));
         assert_eq!(r, TxResult::Success);
         assert_eq!(broker_of(&sb), before);
+    }
+
+    // -----------------------------------------------------------------------
+    // LoanBrokerCoverDeposit
+    // -----------------------------------------------------------------------
+
+    fn cover_deposit(account: [u8; 20], broker: &Hash256, amount: Value) -> TxFields {
+        tx("LoanBrokerCoverDeposit", account, json!({"LoanBrokerID": key_hex(broker), "Amount": amount}))
+    }
+
+    /// An XRP vault of OWNER with a broker on it.
+    fn xrp_broker(state: &mut LedgerState) -> (Hash256, [u8; 20], Hash256) {
+        let (vault, _) = xrp_vault(state);
+        let (broker, pseudo) = make_broker(state, &vault, json!({}));
+        (broker, pseudo, vault)
+    }
+
+    /// A USD vault of OWNER (holding 1000 USD) with a broker on it.
+    fn usd_broker(state: &mut LedgerState) -> (Hash256, [u8; 20], Hash256) {
+        let (vault, _) = usd_vault(state);
+        let (broker, pseudo) = make_broker(state, &vault, json!({}));
+        (broker, pseudo, vault)
+    }
+
+    /// A vault of ISSUER's MPT (OWNER holding 1000) with a broker on it.
+    fn mpt_broker(state: &mut LedgerState) -> (Hash256, [u8; 20], [u8; 24]) {
+        let (vault, _, id) = mpt_vault(state);
+        let (broker, pseudo) = make_broker(state, &vault, json!({}));
+        (broker, pseudo, id)
+    }
+
+    /// LoanBrokerCoverDeposit.cpp:27-41 (LoanBroker_test.cpp:323-326:
+    /// a zero broker id temINVALID; a zero or negative amount temBAD_AMOUNT).
+    #[test]
+    fn cover_deposit_preflight() {
+        let st = state();
+        let broker = Hash256([0xCD; 32]);
+        assert_eq!(result(&st, &cover_deposit(OWNER, &Hash256([0; 32]), json!("10"))), TxResult::InvalidTx);
+        for amount in [json!("0"), json!("-10"), usd_json("0"), usd_json("-10")] {
+            assert_eq!(result(&st, &cover_deposit(OWNER, &broker, amount.clone())), TxResult::BadAmount, "{amount}");
+        }
+        // The broker id is judged before the amount.
+        assert_eq!(result(&st, &cover_deposit(OWNER, &Hash256([0; 32]), json!("0"))), TxResult::InvalidTx);
+        // XRP beyond the legal range.
+        assert_eq!(result(&st, &cover_deposit(OWNER, &broker, json!("100000000000000001"))), TxResult::BadAmount);
+        assert_eq!(result(&st, &cover_deposit(OWNER, &broker, json!("10"))), TxResult::NoEntry, "past preflight");
+    }
+
+    /// LoanBrokerCoverDeposit.cpp:43-76 (LoanBroker_test.cpp:324, :327: not
+    /// the owner tecNO_PERMISSION; an id that is not a broker tecNO_ENTRY).
+    #[test]
+    fn cover_deposit_preclaim_broker_owner_and_asset() {
+        let mut st = state();
+        let (broker, _, vault) = xrp_broker(&mut st);
+        assert_eq!(result(&st, &cover_deposit(OWNER, &vault, json!("10"))), TxResult::NoEntry, "a vault's id");
+        assert_eq!(result(&st, &cover_deposit(BOB, &broker, json!("10"))), TxResult::NoPermission);
+        assert_eq!(result(&st, &cover_deposit(OWNER, &broker, usd_json("10"))), TxResult::WrongAsset);
+        // The vault gone from under the broker.
+        let mut orphan = st.clone();
+        edit(&mut orphan, broker, |b| b["VaultID"] = json!("EE".repeat(32)));
+        assert_eq!(result(&orphan, &cover_deposit(OWNER, &broker, json!("10"))), TxResult::TefBadLedger);
+        // More XRP than the owner can spare above its reserve.
+        assert_eq!(result(&st, &cover_deposit(OWNER, &broker, json!(BALANCE.to_string()))), TxResult::InsufficientFunds);
+        assert_eq!(result(&st, &cover_deposit(OWNER, &broker, json!("10"))), TxResult::Success);
+    }
+
+    /// LoanBrokerCoverDeposit.cpp:78-98 (LoanBroker_test.cpp:1953
+    /// "LoanBrokerCoverDeposit IOU freeze checks", :2020 "MPT lock checks").
+    #[test]
+    fn cover_deposit_freezes_and_authorization() {
+        // IOU: a global freeze; the depositor's line frozen; the
+        // pseudo-account's line frozen.
+        let mut st = state();
+        let (broker, pseudo, _) = usd_broker(&mut st);
+        let deposit = cover_deposit(OWNER, &broker, usd_json("10"));
+        assert_eq!(result(&st, &deposit), TxResult::Success);
+        let mut global = st.clone();
+        edit(&mut global, keylet::account_root_key(&ISSUER), |a| a["Flags"] = json!(a["Flags"].as_u64().unwrap() | LSF_GLOBAL_FREEZE));
+        assert_eq!(result(&global, &deposit), TxResult::Frozen);
+        let freeze = |st: &LedgerState, holder: [u8; 20]| {
+            let mut st = st.clone();
+            let issuer_side = if ISSUER < holder { LSF_LOW_FREEZE } else { LSF_HIGH_FREEZE };
+            edit(&mut st, keylet::ripple_state_key(&holder, &ISSUER, &USD_CODE), |l| {
+                l["Flags"] = json!(l["Flags"].as_u64().unwrap() | issuer_side)
+            });
+            st
+        };
+        assert_eq!(result(&freeze(&st, OWNER), &deposit), TxResult::Frozen, "the depositor frozen");
+        assert_eq!(result(&freeze(&st, pseudo), &deposit), TxResult::Frozen, "the pseudo-account frozen");
+        // Before fixCleanup3_3_0 a plain freeze of the pseudo-account's
+        // line did not stop a deposit (only a deep freeze did).
+        let mut st = state_with(&rules_without(&[am::FIX_CLEANUP_3_3_0]));
+        let (broker, pseudo, _) = usd_broker(&mut st);
+        let deposit = cover_deposit(OWNER, &broker, usd_json("10"));
+        assert_eq!(result(&freeze(&st, pseudo), &deposit), TxResult::Success);
+        assert_eq!(result(&freeze(&st, OWNER), &deposit), TxResult::Frozen);
+
+        // MPT: locked for the depositor; an issuance that is no longer
+        // transferable.
+        let mut st = state();
+        let (broker, _, id) = mpt_broker(&mut st);
+        let deposit = cover_deposit(OWNER, &broker, mpt_json(&id, 10));
+        assert_eq!(result(&st, &deposit), TxResult::Success);
+        let ikey = keylet::mpt_issuance_key(&id);
+        let mut locked = st.clone();
+        edit(&mut locked, keylet::mptoken_key(&ikey, &OWNER), |t| t["Flags"] = json!(mpt::LSF_MPT_LOCKED));
+        assert_eq!(result(&locked, &deposit), TxResult::Locked);
+        let mut not_transferable = st.clone();
+        edit(&mut not_transferable, ikey, |i| i["Flags"] = json!(mpt::LSF_MPT_CAN_CLAWBACK));
+        assert_eq!(result(&not_transferable, &deposit), TxResult::NoAuth, "lsfMPTCanTransfer cleared");
+    }
+
+    /// LoanBrokerCoverDeposit.cpp:100-131 (LoanBroker_test.cpp:2813 "Cover
+    /// precision guard: Deposit zero-at-scale", :2828 "Deposit rounds down"):
+    /// under fixCleanup3_2_0 the amount is floored at the cover's scale.
+    #[test]
+    fn cover_deposit_is_floored_at_the_scale_of_the_cover() {
+        let mut st = state();
+        let (broker, pseudo, _) = usd_broker(&mut st);
+        // A cover of 100000 has its sixteenth digit at 1e-10.
+        line(&mut st, OWNER, 0, "200000", "1000000");
+        commit(&mut st, &cover_deposit(OWNER, &broker, usd_json("100000")));
+        assert_eq!(result(&st, &cover_deposit(OWNER, &broker, usd_json("0.00000000001"))), TxResult::PrecisionLoss, "dust");
+        let (r, sb) = apply(&st, &cover_deposit(OWNER, &broker, usd_json("1.00000000019")));
+        assert_eq!(r, TxResult::Success);
+        assert!(number_field(&broker_of(&sb), "CoverAvailable") == n("100001.0000000001"), "floored to 1.0000000001");
+        assert_eq!(holds(&sb, &pseudo, &USD), usd("100001.0000000001"), "the same amount moved");
+        assert_eq!(holds(&sb, &OWNER, &USD), usd("99998.9999999999"));
+        // More than the owner holds or could draw: the line's balance plus
+        // the issuer's limit (zero).
+        assert_eq!(result(&st, &cover_deposit(OWNER, &broker, usd_json("100001"))), TxResult::InsufficientFunds);
+
+        // Before the fix the amount goes in as asked.
+        let mut st = state_with(&rules_without(&[am::FIX_CLEANUP_3_2_0]));
+        let (broker, _, _) = usd_broker(&mut st);
+        line(&mut st, OWNER, 0, "200000", "1000000");
+        commit(&mut st, &cover_deposit(OWNER, &broker, usd_json("100000")));
+        assert_eq!(result(&st, &cover_deposit(OWNER, &broker, usd_json("0.00000000001"))), TxResult::Success);
+    }
+
+    /// LoanBrokerCoverDeposit.cpp:136-189 (LoanBroker_test.cpp:383-386
+    /// `verifyCoverAmount`: sfCoverAvailable and the pseudo-account's
+    /// balance both show the deposit) — XRP, IOU and MPT.
+    #[test]
+    fn cover_deposit_moves_the_asset_to_the_pseudo_account_and_raises_the_cover() {
+        // XRP.
+        let mut st = state();
+        let (broker, pseudo, _) = xrp_broker(&mut st);
+        let before = Sandbox::new(&st);
+        let (r, sb) = apply(&st, &cover_deposit(OWNER, &broker, json!("10000")));
+        assert_eq!(r, TxResult::Success);
+        assert!(number_field(&broker_of(&sb), "CoverAvailable") == n("10000"));
+        assert_eq!(xrp_of(&sb, &pseudo), 10_000);
+        assert_eq!(xrp_of(&sb, &OWNER), xrp_of(&before, &OWNER) - 10_000 - FEE);
+        assert_eq!(owners(&sb, &OWNER), owners(&before, &OWNER), "no reserve change");
+        // A second deposit adds.
+        commit(&mut st, &cover_deposit(OWNER, &broker, json!("10000")));
+        let (_, sb) = apply(&st, &cover_deposit(OWNER, &broker, json!("5")));
+        assert!(number_field(&broker_of(&sb), "CoverAvailable") == n("10005"));
+        assert_eq!(xrp_of(&sb, &pseudo), 10_005);
+
+        // IOU.
+        let mut st = state();
+        let (broker, pseudo, _) = usd_broker(&mut st);
+        let (r, sb) = apply(&st, &cover_deposit(OWNER, &broker, usd_json("250.5")));
+        assert_eq!(r, TxResult::Success);
+        assert!(number_field(&broker_of(&sb), "CoverAvailable") == n("250.5"));
+        assert_eq!(holds(&sb, &pseudo, &USD), usd("250.5"));
+        assert_eq!(holds(&sb, &OWNER, &USD), usd("749.5"));
+
+        // MPT.
+        let mut st = state();
+        let (broker, pseudo, id) = mpt_broker(&mut st);
+        let asset = HeldAsset::Mpt(id);
+        let (r, sb) = apply(&st, &cover_deposit(OWNER, &broker, mpt_json(&id, 400)));
+        assert_eq!(r, TxResult::Success);
+        assert!(number_field(&broker_of(&sb), "CoverAvailable") == n("400"));
+        assert_eq!(holds(&sb, &pseudo, &asset).mantissa, 400);
+        assert_eq!(holds(&sb, &OWNER, &asset).mantissa, 600);
+        assert_eq!(result(&st, &cover_deposit(OWNER, &broker, mpt_json(&id, 1001))), TxResult::InsufficientFunds);
+    }
+
+    /// The asset's issuer as broker owner deposits what it issues
+    /// (`accountHolds(…, FullBalance)`, LoanBrokerCoverDeposit.cpp:123-131:
+    /// an issuer's spendable balance is not its line).
+    #[test]
+    fn cover_deposit_by_the_issuer_of_the_asset_mints_into_the_cover() {
+        let mut st = state();
+        // ISSUER owns the vault and the broker.
+        let vault = keylet::vault_key(&ISSUER, 5);
+        commit(&mut st, &tx("VaultCreate", ISSUER, json!({"Asset": usd_asset()})));
+        commit(&mut st, &broker_set(ISSUER, &vault, json!({})));
+        let broker = keylet::loan_broker_key(&ISSUER, 5);
+        let pseudo = account_of(&get(&Sandbox::new(&st), &broker).unwrap(), "Account").unwrap();
+        let (r, sb) = apply(&st, &cover_deposit(ISSUER, &broker, usd_json("77")));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(holds(&sb, &pseudo, &USD), usd("77"));
+        assert!(number_field(&get(&sb, &broker).unwrap(), "CoverAvailable") == n("77"));
     }
 }
