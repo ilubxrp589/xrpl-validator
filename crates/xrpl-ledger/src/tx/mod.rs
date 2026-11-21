@@ -18,6 +18,7 @@ pub mod holding;
 pub mod ledger_state_fix;
 pub mod lending_helpers;
 pub mod loan_broker;
+pub mod loan_math;
 pub mod misc;
 pub mod mpt;
 pub mod nftoken;
