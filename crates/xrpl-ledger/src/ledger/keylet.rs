@@ -252,6 +252,47 @@ pub fn mptoken_key(issuance_key: &Hash256, holder: &[u8; 20]) -> Hash256 {
     sha512_half(&buf)
 }
 
+/// Vault key — rippled `keylet::vault(owner, seq)` (Indexes.cpp:581-585;
+/// namespace `LedgerNameSpace::Vault = 'V'`, :103):
+/// `sha512Half(uint16 0x0056, owner, uint32 seq)`. `seq` is the creating
+/// transaction's `getSeqProxy().value()` (VaultCreate.cpp:157) — the
+/// TicketSequence when it consumed a ticket. `keylet::vault(uint256)`
+/// (Indexes.h:360-364) is the key itself: `sfVaultID` on a pseudo-account,
+/// a LoanBroker or a transaction is this value.
+pub fn vault_key(owner: &[u8; 20], sequence: u32) -> Hash256 {
+    let mut buf = [0u8; 26];
+    buf[..2].copy_from_slice(&[0x00, 0x56]);
+    buf[2..22].copy_from_slice(owner);
+    buf[22..26].copy_from_slice(&sequence.to_be_bytes());
+    sha512_half(&buf)
+}
+
+/// LoanBroker key — rippled `keylet::loanBroker(owner, seq)`
+/// (Indexes.cpp:587-591; namespace `LoanBroker = 'l'`, lower-case L, :104):
+/// `sha512Half(uint16 0x006C, owner, uint32 seq)`, `seq` the creating
+/// LoanBrokerSet's sequence or ticket. `sfLoanBrokerID` is this value.
+pub fn loan_broker_key(owner: &[u8; 20], sequence: u32) -> Hash256 {
+    let mut buf = [0u8; 26];
+    buf[..2].copy_from_slice(&[0x00, 0x6C]);
+    buf[2..22].copy_from_slice(owner);
+    buf[22..26].copy_from_slice(&sequence.to_be_bytes());
+    sha512_half(&buf)
+}
+
+/// Loan key — rippled `keylet::loan(loanBrokerID, loanSeq)`
+/// (Indexes.cpp:593-597; namespace `Loan = 'L'`, :105):
+/// `sha512Half(uint16 0x004C, loanBrokerID uint256, uint32 loanSeq)`. It
+/// hashes the BROKER's key, not an account, with the broker's
+/// `sfLoanSequence` as it stood when the loan was created
+/// (LoanSet.cpp:651-655). A Loan carries no sfSequence of its own.
+pub fn loan_key(loan_broker_id: &Hash256, loan_sequence: u32) -> Hash256 {
+    let mut buf = [0u8; 38];
+    buf[..2].copy_from_slice(&[0x00, 0x4C]);
+    buf[2..34].copy_from_slice(&loan_broker_id.0);
+    buf[34..38].copy_from_slice(&loan_sequence.to_be_bytes());
+    sha512_half(&buf)
+}
+
 /// Compute the state tree key for a Check.
 /// `key = SHA512Half(0x0043 || account_id || sequence_be32)`
 pub fn check_key(account_id: &[u8; 20], sequence: u32) -> Hash256 {
