@@ -417,3 +417,38 @@ fn vault_clawback_usd_all_b_devnet_7046728() {
 fn vault_clawback_usd_all_devnet_6791425() {
     run(include_str!("vectors/vault_clawback_usd_all_devnet_6791425.json"));
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// The harness itself
+// ---------------------------------------------------------------------------------------------------------------
+
+/// A vector with a different recorded result fails.
+#[test]
+#[should_panic(expected = "devnet recorded this transaction result")]
+fn the_harness_refuses_a_different_result() {
+    let mut bundle: Value = serde_json::from_str(include_str!("vectors/vault_deposit_xrp_first_devnet_7112017.json")).unwrap();
+    bundle["result"] = Value::String("tecFROZEN".to_string());
+    run(&bundle.to_string());
+}
+
+/// A vector whose expected Vault differs in one digit of sfAssetsTotal fails, as does one that leaves out an
+/// object the transaction wrote.
+#[test]
+#[should_panic(expected = "difference(s)")]
+fn the_harness_refuses_one_different_byte() {
+    let mut bundle: Value = serde_json::from_str(include_str!("vectors/vault_deposit_xrp_first_devnet_7112017.json")).unwrap();
+    let vault = bundle["tx"]["VaultID"].as_str().unwrap().to_string();
+    let image = bundle["expect"][&vault].as_str().unwrap().to_string();
+    let last = if image.ends_with('0') { "1" } else { "0" };
+    bundle["expect"][&vault] = Value::String(format!("{}{last}", &image[..image.len() - 1]));
+    run(&bundle.to_string());
+}
+
+#[test]
+#[should_panic(expected = "does not name")]
+fn the_harness_refuses_an_unnamed_write() {
+    let mut bundle: Value = serde_json::from_str(include_str!("vectors/vault_deposit_xrp_first_devnet_7112017.json")).unwrap();
+    let vault = bundle["tx"]["VaultID"].as_str().unwrap().to_string();
+    bundle["expect"].as_object_mut().unwrap().remove(&vault);
+    run(&bundle.to_string());
+}
