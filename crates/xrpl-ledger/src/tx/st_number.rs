@@ -40,6 +40,8 @@ const NUMBER_MAX_EXPONENT: i32 = 32768;
 /// `STAmount::kMinOffset` / `kMaxOffset`: an IOU's exponent range.
 const IOU_MIN_OFFSET: i32 = -96;
 const IOU_MAX_OFFSET: i32 = 80;
+/// The exponent of a zero `IOUAmount` (IOUAmount.h: `beast::kZero` is mantissa 0, exponent -100).
+pub const IOU_ZERO_EXPONENT: i32 = -100;
 /// `kMaxNativeN` (STAmount.h): 1e17 drops.
 const MAX_NATIVE: u64 = 100_000_000_000_000_000;
 /// `kMaxMpTokenAmount` (Protocol.h:296).
@@ -426,9 +428,15 @@ pub fn round_to_asset(asset: HeldAsset, value: Number, scale: i32, rounding: Rou
 
 /// `scale(number, asset)` (STAmount.h:793-796): the exponent of
 /// `STAmount{asset, number}` — 0 for XRP and MPT, the sixteen-digit exponent
-/// for an IOU — converted under `mode`.
+/// for an IOU, -100 for a zero IOU amount — converted under `mode`.
 pub fn scale(number: Number, asset: HeldAsset, mode: Rounding) -> Result<i32, StError> {
-    Ok(Amount::from_number(asset, number, mode)?.exponent)
+    let amount = Amount::from_number(asset, number, mode)?;
+    // A zero IOU amount is `IOUAmount{beast::kZero}`, exponent -100 (STAmount::canonicalize's
+    // `*this = iou()`); [`Amount`] spells every zero with exponent 0.
+    if amount.is_zero() && !amount.integral() {
+        return Ok(IOU_ZERO_EXPONENT);
+    }
+    Ok(amount.exponent)
 }
 
 /// `associateAsset(sle, asset)` (STTakesAsset.cpp:13-50): every present
