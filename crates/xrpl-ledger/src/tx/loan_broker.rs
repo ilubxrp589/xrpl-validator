@@ -567,16 +567,166 @@ fn withdraw_minimum_cover(sandbox: &Sandbox, broker: &Value, vault: &Value, asse
 }
 
 impl Transactor for LoanBrokerCoverWithdrawTransactor {
-    fn preflight(&self, _tx: &TxFields) -> TxResult {
-        TxResult::Unsupported
+    /// `LoanBrokerCoverWithdraw::preflight` (LoanBrokerCoverWithdraw.cpp:36-61),
+    /// less the credential fields (they need the rules:
+    /// [`Self::preflight_in`]).
+    fn preflight(&self, tx: &TxFields) -> TxResult {
+        if broker_id(tx).is_none_or(|id| is_zero_key(&id)) {
+            return TxResult::InvalidTx;
+        }
+        match tx.fields.get("Amount").and_then(tx_amount) {
+            Some(amount) if positive(&amount) => {}
+            _ => return TxResult::BadAmount,
+        }
+        if has(tx, "Destination") && withdraw_destination(tx).is_none_or(|d| d == [0u8; 20]) {
+            return TxResult::Malformed;
+        }
+        TxResult::Success
     }
 
-    fn preclaim(&self, _tx: &TxFields, _sandbox: &Sandbox) -> TxResult {
-        TxResult::Unsupported
+    fn preflight_in(&self, tx: &TxFields, rules: &Sandbox) -> TxResult {
+        // `checkExtraFeatures` (:26-34): sfCredentialIDs needs Credentials
+        // and fixCleanup3_4_0.
+        let extra = lh::check_lending_protocol_dependencies(rules, tx)
+            && (!has(tx, "CredentialIDs") || (enabled(rules, am::CREDENTIALS) && am::fix_cleanup_3_4_0(rules)));
+        if let Some(refused) = gate(tx, rules, extra, TF_UNIVERSAL_MASK) {
+            return refused;
+        }
+        let basic = self.preflight(tx);
+        if basic != TxResult::Success {
+            return basic;
+        }
+        // `credentials::checkFields` (:57-58).
+        if !credential_fields_ok(tx, rules) {
+            return TxResult::Malformed;
+        }
+        TxResult::Success
     }
 
-    fn do_apply(&self, _tx: &TxFields, _sandbox: &mut Sandbox) -> TxResult {
-        TxResult::Unsupported
+    /// `LoanBrokerCoverWithdraw::preclaim` (LoanBrokerCoverWithdraw.cpp:63-206).
+    fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        let fix320 = am::fix_cleanup_3_2_0(sandbox);
+        let fix330 = am::fix_cleanup_3_3_0(sandbox);
+        let fix340 = am::fix_cleanup_3_4_0(sandbox);
+        let account = tx.account;
+        let (Some(id), Some(amount), Some(dst)) =
+            (broker_id(tx), tx.fields.get("Amount").and_then(tx_amount), withdraw_destination(tx))
+        else {
+            return TxResult::TefInternal;
+        };
+        // Before anything else: never into a pseudo-account.
+        if crate::tx::misc::is_pseudo_account(sandbox, &dst) {
+            return TxResult::TecPseudoAccount;
+        }
+        let Some(broker) = read_broker(sandbox, &id) else { return TxResult::NoEntry };
+        if account_of(&broker, "Owner") != Some(account) {
+            return TxResult::NoPermission;
+        }
+        let Some(vault) = vault_of(sandbox, &broker) else { return TxResult::TefBadLedger };
+        let Some(asset) = vault_asset(&vault) else { return TxResult::TefInternal };
+        if amount.asset != asset {
+            return TxResult::WrongAsset;
+        }
+        match lh::can_apply_to_broker_cover(sandbox, &broker, asset, &amount) {
+            Ok(TxResult::Success) => {}
+            Ok(refused) => return refused,
+            Err(_) => return TxResult::TefException,
+        }
+        // The broker's pseudo-account is the source of funds.
+        let Some(pseudo) = account_of(&broker, "Account") else { return TxResult::TefInternal };
+        // fixCleanup3_2_0: a cover withdrawal is a recovery path — the
+        // asset's lsfMPTCanTransfer is not consulted, so an issuer cannot
+        // trap a broker's first-loss capital. IOU rippling, freezes and
+        // authorization still apply.
+        let transferable = holding::can_transfer_waive(sandbox, &asset, &pseudo, &dst, fix320);
+        if transferable != TxResult::Success {
+            return transferable;
+        }
+        // Credentials first: canWithdraw assumes they exist.
+        let credentials = crate::tx::credential::credentials_valid(sandbox, tx, &account);
+        if credentials != TxResult::Success {
+            return credentials;
+        }
+        // To a third party it is a transfer: destination, tag, deposit
+        // authorization, trust limit — and the destination must already hold
+        // the asset's line or MPToken.
+        let mut auth = AuthType::WeakAuth;
+        if account != dst {
+            let allowed = holding::can_withdraw_tx(sandbox, tx);
+            if allowed != TxResult::Success {
+                return allowed;
+            }
+            auth = AuthType::StrongAuth;
+        }
+        let authorized = holding::require_auth(sandbox, &asset, &dst, auth);
+        if authorized != TxResult::Success {
+            return authorized;
+        }
+        // fixCleanup3_4_0: fail early when the self-withdrawal would have to
+        // create a holding that cannot be created.
+        if fix340 && account == dst && !holding::holding_exists(sandbox, &dst, &asset) {
+            let holdable = holding::can_add_holding(sandbox, &asset);
+            if holdable != TxResult::Success {
+                return holdable;
+            }
+        }
+        let issuer = holding::asset_issuer(&asset);
+        if fix330 {
+            let frozen = holding::check_withdraw_freeze(sandbox, &pseudo, &account, &dst, &asset);
+            if frozen != TxResult::Success {
+                return frozen;
+            }
+        } else if dst != issuer {
+            // Unless sending straight to the issuer.
+            let source = holding::check_frozen(sandbox, &pseudo, &asset);
+            if source != TxResult::Success {
+                return source;
+            }
+            let destination = holding::check_deep_frozen(sandbox, &dst, &asset);
+            if destination != TxResult::Success {
+                return destination;
+            }
+        }
+
+        let cover = number_field(&broker, "CoverAvailable");
+        let Ok(minimum) = withdraw_minimum_cover(sandbox, &broker, &vault, asset) else { return TxResult::TefException };
+        if cover < amount.number() {
+            return TxResult::InsufficientFunds;
+        }
+        let Ok(left) = cover.sub(amount.number(), AMBIENT) else { return TxResult::TefException };
+        if left < minimum {
+            return TxResult::InsufficientFunds;
+        }
+        // fixCleanup3_3_0: a payout to the issuer ignores freezes.
+        let zero_if_frozen = !(fix330 && dst == issuer);
+        if less(&holding::account_holds(sandbox, &pseudo, &asset, zero_if_frozen, true), &amount) {
+            return TxResult::InsufficientFunds;
+        }
+        TxResult::Success
+    }
+
+    /// `LoanBrokerCoverWithdraw::doApply` (LoanBrokerCoverWithdraw.cpp:208-243).
+    fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        let (Some(id), Some(amount), Some(dst)) =
+            (broker_id(tx), tx.fields.get("Amount").and_then(tx_amount), withdraw_destination(tx))
+        else {
+            return TxResult::TecInternal;
+        };
+        let Some(mut broker) = read_broker(sandbox, &id) else { return TxResult::TecInternal };
+        let Some(vault) = vault_of(sandbox, &broker) else { return TxResult::TecInternal };
+        let (Some(asset), Some(pseudo)) = (vault_asset(&vault), account_of(&broker, "Account")) else {
+            return TxResult::TecInternal;
+        };
+        let prior = prior_balance(sandbox, tx);
+        let Ok(cover) = number_field(&broker, "CoverAvailable").sub(amount.number(), AMBIENT) else {
+            return TxResult::TefException;
+        };
+        set_number_field(&mut broker, "CoverAvailable", cover, Soe::Default);
+        let stored = store_broker(sandbox, id, &mut broker, asset);
+        if stored != TxResult::Success {
+            return stored;
+        }
+        holding::do_withdraw(sandbox, tx, &tx.account, &dst, &pseudo, prior, &amount)
     }
 }
 
