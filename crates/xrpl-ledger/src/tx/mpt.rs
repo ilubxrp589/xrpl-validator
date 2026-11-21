@@ -899,6 +899,19 @@ fn owner_count(sandbox: &Sandbox, acct: &[u8; 20]) -> u64 {
         .unwrap_or(0)
 }
 
+/// A UInt256 in JSON that is all zeros (`beast::kZero`).
+fn is_zero_hash(v: &serde_json::Value) -> bool {
+    v.as_str().is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b == b'0'))
+}
+
+/// `sfDomainID` on an MPT issuance transaction needs PermissionedDomains AND
+/// SingleAssetVault (`checkExtraFeatures`: MPTokenIssuanceCreate.cpp:33-36,
+/// MPTokenIssuanceSet.cpp:29-32).
+fn domain_field_enabled(rules: &Sandbox) -> bool {
+    use crate::ledger::amendments::{enabled, PERMISSIONED_DOMAINS, SINGLE_ASSET_VAULT};
+    enabled(rules, PERMISSIONED_DOMAINS) && enabled(rules, SINGLE_ASSET_VAULT)
+}
+
 /// MPTokenIssuanceCreate — mint a new issuance object under the creator.
 pub struct MPTokenIssuanceCreateTransactor;
 
@@ -914,10 +927,35 @@ impl Transactor for MPTokenIssuanceCreateTransactor {
         // A8A08D3E (l105864866) carries an explicit "TransferFee": 0 with no
         // CanTransfer flag and mainnet accepts it — the flag requirement is
         // `fee > 0` only (MPTokenIssuanceCreate.cpp preflight). Further tem
-        // checks (metadata length, DomainID rules) unported — no specimen.
+        // checks (metadata length) unported — no specimen; the DomainID rules
+        // need the ledger's amendments and live in `preflight_in`.
         let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
         if let Some(f) = tx.fields.get("TransferFee").and_then(|v| v.as_u64()) {
             if f > 50_000 || (f > 0 && flags & LSF_MPT_CAN_TRANSFER == 0) {
+                return TxResult::Malformed;
+            }
+        }
+        TxResult::Success
+    }
+
+    /// G12 — `checkExtraFeatures` (MPTokenIssuanceCreate.cpp:30-36) runs
+    /// before every other preflight step: sfDomainID without both
+    /// PermissionedDomains and SingleAssetVault is temDISABLED. With them,
+    /// :94-102: the domain must be non-zero and the issuance must carry
+    /// tfMPTRequireAuth ("domain present implies not public"), else
+    /// temMALFORMED.
+    fn preflight_in(&self, tx: &TxFields, rules: &Sandbox) -> TxResult {
+        let domain = tx.fields.get("DomainID");
+        if domain.is_some() && !domain_field_enabled(rules) {
+            return TxResult::Disabled;
+        }
+        let basic = self.preflight(tx);
+        if basic != TxResult::Success {
+            return basic;
+        }
+        if let Some(domain) = domain {
+            let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+            if is_zero_hash(domain) || flags & LSF_MPT_REQUIRE_AUTH == 0 {
                 return TxResult::Malformed;
             }
         }
@@ -1181,13 +1219,17 @@ impl Transactor for MPTokenAuthorizeTransactor {
 }
 
 /// MPTokenIssuanceSet — issuer locks/unlocks the issuance (or one holder's
-/// MPToken) and adjusts mutable metadata. The DynamicMPT MutableFlags
-/// mutation arms are unported (no specimen; the tmf constants would be
-/// guesses) — lock/unlock, TransferFee and MPTokenMetadata updates are.
+/// MPToken), sets or clears its DomainID (SingleAssetVault with
+/// PermissionedDomains) and adjusts mutable metadata. The DynamicMPT
+/// capability-flag mutation arms are unported (no specimen) — lock/unlock,
+/// DomainID, TransferFee and MPTokenMetadata updates are.
 pub struct MPTokenIssuanceSetTransactor;
 
 const TF_MPT_LOCK: u64 = 0x0000_0001;
 const TF_MPT_UNLOCK: u64 = 0x0000_0002;
+/// `tfMPTokenIssuanceSetEnableFlagMask` (TxFlags.h:383-385): tfMPTSetCanLock
+/// 0x04 … tfMPTSetCanHoldConfidentialBalance 0x100.
+const TF_MPT_SET_ENABLE_FLAG_MASK: u64 = 0x0000_01FC;
 pub const LSF_MPT_CAN_LOCK: u64 = 0x0000_0002;
 
 impl Transactor for MPTokenIssuanceSetTransactor {
@@ -1204,6 +1246,48 @@ impl Transactor for MPTokenIssuanceSetTransactor {
         let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
         if flags & TF_MPT_LOCK != 0 && flags & TF_MPT_UNLOCK != 0 {
             return TxResult::Malformed;
+        }
+        TxResult::Success
+    }
+
+    /// The amendment-gated part of MPTokenIssuanceSet's preflight, in
+    /// rippled's order around the checks above:
+    /// - G13, `checkExtraFeatures` (MPTokenIssuanceSet.cpp:27-32), first:
+    ///   sfDomainID without both PermissionedDomains and SingleAssetVault is
+    ///   temDISABLED;
+    /// - :68-69 sfDomainID together with sfHolder is temMALFORMED;
+    /// - G14, :82-89: once SingleAssetVault, DynamicMPT or
+    ///   ConfidentialTransfer is enabled, a transaction that changes nothing
+    ///   — sfFlags zero (the raw word: tfFullyCanonicalSig alone is not
+    ///   zero), no sfDomainID, no encryption key, no mutation — is
+    ///   temMALFORMED. Before, such a set was a successful no-op (testnet
+    ///   DE84A64282BE, #20976482).
+    fn preflight_in(&self, tx: &TxFields, rules: &Sandbox) -> TxResult {
+        use crate::ledger::amendments::{enabled, CONFIDENTIAL_TRANSFER, DYNAMIC_MPT, SINGLE_ASSET_VAULT};
+        let has = |f: &str| tx.fields.get(f).is_some();
+        let has_domain = has("DomainID");
+        if has_domain && !domain_field_enabled(rules) {
+            return TxResult::Disabled;
+        }
+        if has_domain && has("Holder") {
+            return TxResult::Malformed;
+        }
+        let basic = self.preflight(tx);
+        if basic != TxResult::Success {
+            return basic;
+        }
+        if enabled(rules, SINGLE_ASSET_VAULT) || enabled(rules, DYNAMIC_MPT) || enabled(rules, CONFIDENTIAL_TRANSFER) {
+            let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+            // :45-49 `isMutate`: a capability-enabling flag, or a new
+            // metadata, transfer fee or immutable-flags value.
+            let is_mutate = flags & TF_MPT_SET_ENABLE_FLAG_MASK != 0
+                || has("MPTokenMetadata")
+                || has("TransferFee")
+                || has("ImmutableFlags");
+            let has_key = has("IssuerEncryptionKey") || has("AuditorEncryptionKey");
+            if flags == 0 && !has_domain && !has_key && !is_mutate {
+                return TxResult::Malformed;
+            }
         }
         TxResult::Success
     }
@@ -1260,6 +1344,25 @@ impl Transactor for MPTokenIssuanceSetTransactor {
             }
             None => (ikey, iss),
         };
+        // G13 — preclaim (MPTokenIssuanceSet.cpp:166-177): a DomainID needs
+        // lsfMPTRequireAuth on the issuance (tecNO_PERMISSION) and, unless it
+        // is the zero that clears the field, an existing PermissionedDomain
+        // (tecOBJECT_NOT_FOUND). Preflight refused the field without both
+        // amendments, and with a Holder.
+        let domain = tx.fields.get("DomainID");
+        if let Some(d) = domain {
+            if iflags & LSF_MPT_REQUIRE_AUTH == 0 {
+                return TxResult::NoPermission;
+            }
+            if !is_zero_hash(d) {
+                let found = key_field(&tx.fields, "DomainID")
+                    .and_then(|k| read_json(sandbox, &k))
+                    .is_some_and(|pd| pd.get("LedgerEntryType").and_then(|t| t.as_str()) == Some("PermissionedDomain"));
+                if !found {
+                    return TxResult::ObjectNotFound;
+                }
+            }
+        }
         let fin = target.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
         let mut fout = fin;
         if flags & TF_MPT_LOCK != 0 {
@@ -1285,6 +1388,14 @@ impl Transactor for MPTokenIssuanceSetTransactor {
                     target.as_object_mut().map(|o| o.remove("MPTokenMetadata"));
                 } else {
                     target["MPTokenMetadata"] = serde_json::Value::String(m.to_string());
+                }
+            }
+            // doApply :360-376: a non-zero domain is set, the zero one clears.
+            if let Some(d) = domain {
+                if is_zero_hash(d) {
+                    target.as_object_mut().map(|o| o.remove("DomainID"));
+                } else {
+                    target["DomainID"] = d.clone();
                 }
             }
         }
