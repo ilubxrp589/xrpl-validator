@@ -172,3 +172,33 @@ fn loan_pay_xrp_interest_overpayment_devnet_7129506() {
 fn loan_pay_tec_insufficient_payment_devnet_7129508() {
     run(include_str!("vectors/loan_pay_tec_insufficient_payment_devnet_7129508.json"));
 }
+
+/// 3945B76FB7…: tfLoanDefault on an unpaid loan past its grace period: the first-loss capital moves to the vault, the rest is written off. Devnet: tesSUCCESS.
+#[test]
+fn loan_manage_default_devnet_7129649() {
+    run(include_str!("vectors/loan_manage_default_devnet_7129649.json"));
+}
+
+/// 32F27BD10A…: the defaulted loan deleted by its borrower. Devnet: tesSUCCESS.
+#[test]
+fn loan_delete_defaulted_devnet_7129650() {
+    run(include_str!("vectors/loan_delete_defaulted_devnet_7129650.json"));
+}
+
+/// 2C47CF7E62…: no flag: tesSUCCESS and only the fee. Devnet: tesSUCCESS.
+#[test]
+fn loan_manage_no_flag_devnet_7129530() {
+    run(include_str!("vectors/loan_manage_no_flag_devnet_7129530.json"));
+}
+
+/// E2C28921D1…: tfLoanDefault before the grace period is over; tecTOO_SOON. Devnet: tecTOO_SOON.
+#[test]
+fn loan_manage_default_tec_too_soon_devnet_7129512() {
+    run(include_str!("vectors/loan_manage_default_tec_too_soon_devnet_7129512.json"));
+}
+
+/// 05FD313016…: a paid-off loan deleted: out of both directories, the borrower's reserve back, the broker's last loan. Devnet: tesSUCCESS.
+#[test]
+fn loan_delete_paid_devnet_7129497() {
+    run(include_str!("vectors/loan_delete_paid_devnet_7129497.json"));
+}
