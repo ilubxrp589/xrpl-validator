@@ -436,16 +436,106 @@ fn cover_deposit_amount(sandbox: &Sandbox, broker: &Value, asset: HeldAsset, amo
 }
 
 impl Transactor for LoanBrokerCoverDepositTransactor {
-    fn preflight(&self, _tx: &TxFields) -> TxResult {
-        TxResult::Unsupported
+    /// `LoanBrokerCoverDeposit::preflight` (LoanBrokerCoverDeposit.cpp:27-41).
+    fn preflight(&self, tx: &TxFields) -> TxResult {
+        if broker_id(tx).is_none_or(|id| is_zero_key(&id)) {
+            return TxResult::InvalidTx;
+        }
+        // Positive, and a legal amount (`isLegalNet`: an XRP amount in range).
+        match tx.fields.get("Amount").and_then(tx_amount) {
+            Some(amount) if positive(&amount) => TxResult::Success,
+            _ => TxResult::BadAmount,
+        }
     }
 
-    fn preclaim(&self, _tx: &TxFields, _sandbox: &Sandbox) -> TxResult {
-        TxResult::Unsupported
+    fn preflight_in(&self, tx: &TxFields, rules: &Sandbox) -> TxResult {
+        // `checkExtraFeatures` (:21-25).
+        gate(tx, rules, lh::check_lending_protocol_dependencies(rules, tx), TF_UNIVERSAL_MASK).unwrap_or_else(|| self.preflight(tx))
     }
 
-    fn do_apply(&self, _tx: &TxFields, _sandbox: &mut Sandbox) -> TxResult {
-        TxResult::Unsupported
+    /// `LoanBrokerCoverDeposit::preclaim` (LoanBrokerCoverDeposit.cpp:43-134).
+    fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        let fix320 = am::fix_cleanup_3_2_0(sandbox);
+        let fix330 = am::fix_cleanup_3_3_0(sandbox);
+        let account = tx.account;
+        let (Some(id), Some(amount)) = (broker_id(tx), tx.fields.get("Amount").and_then(tx_amount)) else {
+            return TxResult::TefInternal;
+        };
+        let Some(broker) = read_broker(sandbox, &id) else { return TxResult::NoEntry };
+        if account_of(&broker, "Owner") != Some(account) {
+            return TxResult::NoPermission;
+        }
+        let Some(vault) = vault_of(sandbox, &broker) else { return TxResult::TefBadLedger };
+        let Some(asset) = vault_asset(&vault) else { return TxResult::TefInternal };
+        if amount.asset != asset {
+            return TxResult::WrongAsset;
+        }
+        let Some(pseudo) = account_of(&broker, "Account") else { return TxResult::TefInternal };
+        // A non-transferable asset cannot be deposited.
+        let transferable = holding::can_transfer(sandbox, &asset, &account, &pseudo);
+        if transferable != TxResult::Success {
+            return transferable;
+        }
+        if fix330 {
+            let frozen = holding::check_deposit_freeze(sandbox, &account, &pseudo, &asset);
+            if frozen != TxResult::Success {
+                return frozen;
+            }
+        } else {
+            let source = holding::check_frozen(sandbox, &account, &asset);
+            if source != TxResult::Success {
+                return source;
+            }
+            let destination = holding::check_deep_frozen(sandbox, &pseudo, &asset);
+            if destination != TxResult::Success {
+                return destination;
+            }
+        }
+        // An asset the depositor is not authorized to hold cannot be deposited.
+        let authorized = holding::require_auth(sandbox, &asset, &account, AuthType::StrongAuth);
+        if authorized != TxResult::Success {
+            return authorized;
+        }
+        // Dust below the cover's scale is refused here rather than in do_apply.
+        let Ok(rounded) = cover_deposit_amount(sandbox, &broker, asset, amount) else { return TxResult::TefException };
+        if fix320 && rounded.is_zero() {
+            return TxResult::PrecisionLoss;
+        }
+        let Ok(balance) = holding::account_holds_full(sandbox, &account, &asset, true, true) else {
+            return TxResult::TefException;
+        };
+        if less(&balance, &rounded) {
+            return TxResult::InsufficientFunds;
+        }
+        TxResult::Success
+    }
+
+    /// `LoanBrokerCoverDeposit::doApply` (LoanBrokerCoverDeposit.cpp:136-189).
+    fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        let (Some(id), Some(requested)) = (broker_id(tx), tx.fields.get("Amount").and_then(tx_amount)) else {
+            return TxResult::TecInternal;
+        };
+        let Some(mut broker) = read_broker(sandbox, &id) else { return TxResult::TecInternal };
+        let Some(vault) = vault_of(sandbox, &broker) else { return TxResult::TecInternal };
+        let (Some(asset), Some(pseudo)) = (vault_asset(&vault), account_of(&broker, "Account")) else {
+            return TxResult::TecInternal;
+        };
+        // Rounded as in preclaim: the same amount drives the transfer and
+        // the cover.
+        let Ok(amount) = cover_deposit_amount(sandbox, &broker, asset, requested) else { return TxResult::TefException };
+        // Preclaim refused a zero; one here is tecINTERNAL.
+        if amount.is_zero() {
+            return TxResult::TecInternal;
+        }
+        let paid = holding::account_send(sandbox, &tx.account, &pseudo, &amount, true);
+        if paid != TxResult::Success {
+            return paid;
+        }
+        let Ok(cover) = number_field(&broker, "CoverAvailable").add(amount.number(), AMBIENT) else {
+            return TxResult::TefException;
+        };
+        set_number_field(&mut broker, "CoverAvailable", cover, Soe::Default);
+        store_broker(sandbox, id, &mut broker, asset)
     }
 }
 
