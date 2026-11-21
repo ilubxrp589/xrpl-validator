@@ -297,6 +297,13 @@ pub enum TxResult {
     /// tefINTERNAL — a ledger object rippled expects is missing (a vault share's issuer
     /// root or its vault, MPTokenHelpers.cpp:420, :426).
     TefInternal,
+    /// tefBAD_LEDGER — the ledger is not in the state a transactor's own bookkeeping left it
+    /// (VaultDelete.cpp:117, :155, :169, :203, :212).
+    TefBadLedger,
+    /// tefEXCEPTION — rippled's transactor threw (applySteps.cpp:485-488); nothing is applied.
+    /// A VaultCreate / VaultSet AssetsMaximum beyond the asset's range throws in
+    /// `associateAsset` before fixCleanup3_5_0.
+    TefException,
     // ter — retry, not applied
     /// terADDRESS_COLLISION — none of a pseudo-account's 256 candidate addresses is free
     /// (AMMCreate.cpp:190-193 under SingleAssetVault).
@@ -442,6 +449,8 @@ impl TxResult {
             TxResult::TecInternal => "tecINTERNAL",
             TxResult::Disabled => "temDISABLED",
             TxResult::TefInternal => "tefINTERNAL",
+            TxResult::TefBadLedger => "tefBAD_LEDGER",
+            TxResult::TefException => "tefEXCEPTION",
             TxResult::AddressCollision => "terADDRESS_COLLISION",
             TxResult::PathPartial => "tecPATH_PARTIAL",
             TxResult::DstTagNeeded => "tecDST_TAG_NEEDED",
@@ -912,6 +921,8 @@ mod vault_port_code_tests {
             (TxResult::TecInternal, "tecINTERNAL", true),
             (TxResult::Disabled, "temDISABLED", false),
             (TxResult::TefInternal, "tefINTERNAL", false),
+            (TxResult::TefBadLedger, "tefBAD_LEDGER", false),
+            (TxResult::TefException, "tefEXCEPTION", false),
             (TxResult::AddressCollision, "terADDRESS_COLLISION", false),
         ] {
             assert_eq!(r.code_str(), code);

@@ -75,6 +75,29 @@ pub fn fix_cleanup_3_4_0(sandbox: &Sandbox) -> bool {
     enabled(sandbox, FIX_CLEANUP_3_4_0)
 }
 
+/// fixCleanup3_5_0 — rippled 3.5.0-rc1 (`XRPL_FIX(Cleanup3_5_0, Supported::Yes, DefaultNo)`), unknown to
+/// 3.4.1: OFF on mainnet, ON on devnet (3.5.0-rc5, read 2026-11-21). The ID is
+/// sha512Half("fixCleanup3_5_0"). Ported sites, all in the vault transactors (`tx::vault`):
+/// VaultCreate's AssetsMaximum range check (temMALFORMED), VaultSet's (tecPRECISION_LOSS),
+/// VaultClawback's missing holder (terNO_ACCOUNT), VaultWithdraw's transfer fee between two
+/// holders. Nothing else of 3.5.0 is ported.
+pub const FIX_CLEANUP_3_5_0: &str =
+    "7300E10109D19BF1E87ACE63D3A79CD4ED6B9851C37D93ED94DE9BD41CF56835";
+
+pub fn fix_cleanup_3_5_0(sandbox: &Sandbox) -> bool {
+    enabled(sandbox, FIX_CLEANUP_3_5_0)
+}
+
+/// MPTokensV1 — on mainnet. VaultCreate needs it (`VaultCreate::checkExtraFeatures`,
+/// VaultCreate.cpp:41-42): a vault's shares are an MPT.
+pub const MPTOKENS_V1: &str =
+    "950AE2EA4654E47F04AA8739C0B214E242097E802FD372D24047A89AB1F5EC38";
+
+/// Credentials — on mainnet. VaultWithdraw's sfCredentialIDs needs it and fixCleanup3_4_0
+/// (`VaultWithdraw::checkExtraFeatures`, VaultWithdraw.cpp:33-38).
+pub const CREDENTIALS: &str =
+    "1CB67D082CF7D9102412D34258CEDB400E659352D3B207348889297A6D90F5EF";
+
 /// fixBatchV1_2 — rippled 3.4.1 (`features.macro`: `XRPL_FIX(BatchV1_2, …)`,
 /// so the name hashed is "fixBatchV1_2"). ON on mainnet by #107540484
 /// (2026-10-09), ahead of BatchV1_1 (#107540996), so no mainnet ledger ever
@@ -239,6 +262,13 @@ mod tests {
             ("MPTokensV2", MPTOKENS_V2),
             ("ConfidentialTransfer", CONFIDENTIAL_TRANSFER),
             ("DynamicMPT", DYNAMIC_MPT),
+            ("fixCleanup3_5_0", FIX_CLEANUP_3_5_0),
+            ("fixCleanup3_1_3", FIX_CLEANUP_3_1_3),
+            ("fixCleanup3_2_0", FIX_CLEANUP_3_2_0),
+            ("fixCleanup3_3_0", FIX_CLEANUP_3_3_0),
+            ("fixCleanup3_4_0", FIX_CLEANUP_3_4_0),
+            ("MPTokensV1", MPTOKENS_V1),
+            ("Credentials", CREDENTIALS),
         ] {
             let h = crate::shamap::hash::sha512_half(name.as_bytes());
             assert_eq!(hex::encode_upper(h.0), id, "{name}");
