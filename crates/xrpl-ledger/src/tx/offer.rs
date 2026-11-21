@@ -636,6 +636,17 @@ pub(crate) fn me_to_value_string(a: Me) -> String {
     if a.0 == 0 {
         return "0".into();
     }
+    // Large330 only: a pair that still carries a Number's nineteen digits is
+    // rounded to an amount's sixteen at nearest, never truncated. Every
+    // audited path has already made it an amount (`amm_swap::to_amount`,
+    // `st_iou`); this is the net under the ones that have not.
+    let a = if a.0 >= 10_000_000_000_000_000
+        && crate::tx::number::mantissa_scale() != crate::tx::number::MantissaScale::Small
+    {
+        crate::tx::amm_swap::round16(a.0, a.1, false, crate::tx::amm_swap::Rnd::Near)
+    } else {
+        a
+    };
     // Finding 258: spell the value the way the decoder (rippled
     // STAmount::getText, STAmount.cpp:696) spells it, so an engine write and
     // a decoded pre-image of the SAME number are the same text: canonical
@@ -2078,6 +2089,11 @@ pub(crate) fn st_divide(num: Me, den: Me, xrp: bool) -> Me {
     if num.0 == 0 || den.0 == 0 {
         return (0, 0);
     }
+    if !xrp && crate::tx::number::mantissa_scale() != crate::tx::number::MantissaScale::Small {
+        // Large330: the quotient is a `Number` and stays one — nineteen
+        // digits, division's stages 2 and 3 included (Number.cpp:1292-1354).
+        return crate::tx::amm_swap::n_div(num, den, crate::tx::amm_swap::Rnd::Near);
+    }
     let (nm, ne) = norm16(num);
     let (dm, de) = norm16(den);
     if xrp {
@@ -2129,6 +2145,14 @@ pub(crate) fn st_divide_legacy(num: Me, den: Me) -> Me {
 pub(crate) fn st_multiply(a: Me, b: Me, xrp: bool) -> Me {
     if a.0 == 0 || b.0 == 0 {
         return (0, 0);
+    }
+    if crate::tx::number::mantissa_scale() != crate::tx::number::MantissaScale::Small {
+        // Large330: `Number{v1} * Number{v2}` at nineteen digits, then
+        // `STAmount{asset, r}` (STAmount.cpp:1304-1305; fromNumber, under the
+        // ambient ToNearest): drops through `operator rep()`, an IOU rounded
+        // once to sixteen digits.
+        use crate::tx::amm_swap::{n_mul, to_amount, Rnd};
+        return to_amount(n_mul(a, b, Rnd::Near), xrp, Rnd::Near);
     }
     let (am, ae) = norm16(a);
     let (bm, be) = norm16(b);

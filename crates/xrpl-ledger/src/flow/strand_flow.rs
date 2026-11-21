@@ -265,7 +265,10 @@ fn within_relative_distance_amt(a: EitherAmount, b: EitherAmount) -> bool {
     if mxm.0 == 0 {
         return true;
     }
-    let rel = n_div(n_sub(mxm, mnm, Rnd::Near), mxm, Rnd::Near);
+    // `(max - min) / max`: the difference is an amount (an IOUAmount's
+    // sixteen digits), the quotient a Number (AMMHelpers.h:144-152).
+    let diff = crate::tx::amm_swap::st_amount(n_sub(mxm, mnm, Rnd::Near), matches!(mx, EitherAmount::Xrp(_)), Rnd::Near);
+    let rel = n_div(diff, mxm, Rnd::Near);
     n_cmp(rel, (1_000_000_000_000_000, -24)).is_lt()
 }
 

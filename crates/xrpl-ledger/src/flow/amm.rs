@@ -308,8 +308,10 @@ impl AmmOffer {
         use amm_swap::{n_add, n_cmp, n_div, n_mul, n_sub, Rnd};
         let (bi, bo) = (me(self.balances_in), me(self.balances_out));
         let product = n_mul(bi, bo, Rnd::Near);
-        let nbi = n_add(bi, me(consumed_in), Rnd::Near);
-        let nbo = n_sub(bo, me(consumed_out), Rnd::Near);
+        // `balances_.in + consumed.in`, `balances_.out - consumed.out`: amount
+        // arithmetic (AMMOffer.cpp checkInvariant), an IOUAmount again each.
+        let nbi = amm_swap::st_amount(n_add(bi, me(consumed_in), Rnd::Near), self.asset_in.is_xrp(), Rnd::Near);
+        let nbo = amm_swap::st_amount(n_sub(bo, me(consumed_out), Rnd::Near), self.asset_out.is_xrp(), Rnd::Near);
         let new_product = n_mul(nbi, nbo, Rnd::Near);
         if n_cmp(new_product, product).is_ge() {
             return true;

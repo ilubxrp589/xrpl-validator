@@ -16,6 +16,7 @@
 use super::offer::{self as ox, Leg, Me};
 use crate::ledger::keylet;
 use crate::ledger::sandbox::Sandbox;
+use crate::tx::number::{Number, NumberError, Rounding};
 use std::cmp::Ordering;
 
 // ─── AMMContext (rippled AMMContext.h): ONE iteration counter for a whole
@@ -345,12 +346,49 @@ pub(crate) fn round16(m: u128, e: i32, sticky: bool, rnd: Rnd) -> Me {
     (q, e)
 }
 
+/// A value as an IOU amount's sixteen digits, at nearest: `n_norm` at the
+/// Small scale, and the same sixteen digits at Large330, where `n_norm`
+/// keeps a Number's nineteen.
 pub(crate) fn n_norm_pub(x: Me) -> Me {
-    n_norm(x)
+    round16(x.0, x.1, false, Rnd::Near)
 }
 
 fn n_norm(x: Me) -> Me {
+    if large_scale() {
+        return number_me(Number::from_parts(false, x.0, x.1, Rounding::ToNearest));
+    }
     round16(x.0, x.1, false, Rnd::Near)
+}
+
+/// Whether `Number` runs at the 19-digit Large330 scale on this thread
+/// (`tx::number::mantissa_scale`; SingleAssetVault or LendingProtocol
+/// enabled, Rules.cpp:35-74).
+///
+/// The `n_*` helpers below are rippled's `Number` operations on unsigned
+/// `Me` pairs. At the Small scale they are the hand-written 16-digit
+/// arithmetic this file has always had, untouched. At Large330 each one goes
+/// through `tx::number` and hands back the Number's own mantissa and
+/// exponent, so a chain of `n_*` calls carries nineteen digits from one
+/// operation to the next exactly as a rippled formula carries its `Number`
+/// intermediates — and the value becomes a 16-digit amount only where
+/// rippled builds an STAmount: [`to_amount`].
+fn large_scale() -> bool {
+    crate::tx::number::mantissa_scale() != crate::tx::number::MantissaScale::Small
+}
+
+/// A `Me` as a non-negative `Number` at the thread's scale, built under `mode`.
+fn me_number(x: Me, mode: Rounding) -> Result<Number, NumberError> {
+    Number::from_parts(false, x.0, x.1, mode)
+}
+
+/// A non-negative `Number` result as a `Me` holding its internal mantissa
+/// and exponent; zero for a negative value, a zero or a throw (the unsigned
+/// helpers clamp, their callers carrying the signs).
+fn number_me(r: Result<Number, NumberError>) -> Me {
+    match r {
+        Ok(n) if !n.negative && !n.is_zero() => (n.mantissa as u128, n.exponent),
+        _ => (0, 0),
+    }
 }
 
 pub(crate) fn n_cmp(a: Me, b: Me) -> Ordering {
@@ -368,6 +406,10 @@ pub(crate) fn n_cmp(a: Me, b: Me) -> Ordering {
 pub(crate) fn n_mul(a: Me, b: Me, rnd: Rnd) -> Me {
     if a.0 == 0 || b.0 == 0 {
         return (0, 0);
+    }
+    if large_scale() {
+        let mode = rounding(rnd);
+        return number_me(me_number(a, mode).and_then(|x| me_number(b, mode).and_then(|y| x.mul(y, mode))));
     }
     let a = n_norm(a);
     let b = n_norm(b);
@@ -396,6 +438,11 @@ pub(crate) fn n_pow(f: Me, n: u32) -> Me {
 pub(crate) fn n_div(a: Me, b: Me, rnd: Rnd) -> Me {
     if a.0 == 0 || b.0 == 0 {
         return (0, 0);
+    }
+    if large_scale() {
+        // `Number::operator/=` with its Large stages 2 and 3 (Number.cpp:1292-1354).
+        let mode = rounding(rnd);
+        return number_me(me_number(a, mode).and_then(|x| me_number(b, mode).and_then(|y| x.div(y, mode))));
     }
     let a = n_norm(a);
     let b = n_norm(b);
@@ -437,8 +484,9 @@ pub(crate) fn n_div_rate(a: Me, b: Me) -> Me {
     if a.0 == 0 || b.0 == 0 {
         return (0, 0);
     }
-    let a = n_norm(a);
-    let b = n_norm(b);
+    // STAmount operands: sixteen digits whatever Number's scale.
+    let a = round16(a.0, a.1, false, Rnd::Near);
+    let b = round16(b.0, b.1, false, Rnd::Near);
     let num = a.0 * 100_000_000_000_000_000u128; // ×1e17 ≤ 1e33, fits u128
     let q = num / b.0 + 5;
     // Finding 129 (#106736593 3D845265, #106734110 790B4EA7 — r9Vf7UMf's
@@ -473,10 +521,10 @@ pub(crate) fn n_add(a: Me, b: Me, rnd: Rnd) -> Me {
     let (Ok(x), Ok(y)) = (Number::from_parts(false, a.0, a.1, mode), Number::from_parts(false, b.0, b.1, mode)) else {
         return (0, 0);
     };
-    // Back to the engine's 16-digit pair (`iou_parts`: the Number's own
-    // fields at the Small scale).
-    match x.add(y, mode).and_then(|r| r.iou_parts(mode)) {
-        Ok((_, m, e)) => (m as u128, e),
+    // The Number's own mantissa and exponent: sixteen digits at the Small
+    // scale, nineteen at Large330 (see `large_scale`).
+    match x.add(y, mode) {
+        Ok(r) => (r.mantissa as u128, r.exponent),
         Err(_) => (0, 0),
     }
 }
@@ -494,9 +542,9 @@ pub(crate) fn n_sub(a: Me, b: Me, rnd: Rnd) -> Me {
     let (Ok(x), Ok(y)) = (Number::from_parts(false, a.0, a.1, mode), Number::from_parts(false, b.0, b.1, mode)) else {
         return (0, 0);
     };
-    match x.sub(y, mode).and_then(|r| r.iou_parts(mode)) {
-        Ok((negative, m, _)) if negative || m == 0 => (0, 0),
-        Ok((_, m, e)) => (m as u128, e),
+    match x.sub(y, mode) {
+        Ok(r) if r.negative || r.is_zero() => (0, 0),
+        Ok(r) => (r.mantissa as u128, r.exponent),
         Err(_) => (0, 0),
     }
 }
@@ -538,7 +586,10 @@ pub(crate) fn n_sqrt(x: Me) -> Me {
 /// `"10000000"` drops and mainnet mints `sqrt(100 * 10000000) = sqrt(1e9) =
 /// 31622.77660168379` — reading that side as 10 XRP gives 31.6, off by 1000x.
 pub(crate) fn amm_lp_tokens(a: Me, b: Me) -> Me {
-    n_sqrt_rnd(n_mul(a, b, Rnd::Down), Rnd::Down)
+    // `toSTAmount(lptIssue, tokens)` inside the Downward guard
+    // (AMMHelpers.cpp:43-52): at Large330 the root's nineteen digits round
+    // down to the LP token amount's sixteen.
+    st_iou(n_sqrt_rnd(n_mul(a, b, Rnd::Down), Rnd::Down), Rnd::Down)
 }
 
 fn n_sqrt_rnd(x: Me, rnd: Rnd) -> Me {
@@ -567,6 +618,11 @@ fn n_sqrt_rnd(x: Me, rnd: Rnd) -> Me {
     // which localised it to `solveQuadraticEq`'s root2.
     if x.0 == 0 {
         return (0, 0);
+    }
+    if large_scale() {
+        // `root2` itself (Number.cpp:1610-1653), at nineteen digits under the ambient mode.
+        let mode = rounding(rnd);
+        return number_me(me_number(x, mode).and_then(|f| f.root2(mode)));
     }
     let f0 = n_norm(x);
     let mut e = f0.1 + 16; // exponent + mantissaLog(15) + 1
@@ -650,7 +706,9 @@ pub(crate) fn lp_tokens_out(balance: Me, deposit: Me, lpt: Me, tfee: u16) -> Me 
     if num.0 == 0 {
         return (0, 0);
     }
-    n_mul(lpt, n_div(num, n_add(N_ONE, c, Rnd::Near), Rnd::Near), Rnd::Down)
+    // `multiply(lptAMMBalance, frac, Downward)` (AMMHelpers.cpp:78, 292-298):
+    // the product and its `toSTAmount` under one Downward guard.
+    st_iou(n_mul(lpt, n_div(num, n_add(N_ONE, c, Rnd::Near), Rnd::Near), Rnd::Down), Rnd::Down)
 }
 
 /// rippled `ammAssetIn` (AMMHelpers.cpp, "Equation 4") — the single-asset
@@ -773,8 +831,9 @@ pub(crate) fn adjust_asset_in_by_tokens(
         // 2 drops, the adjusted amount is 0, and mainnet answers
         // tecAMM_INVALID_TOKENS, fee only. We bailed out with the original
         // tokens and minted them.
-        let over = n_sub(asset_adj, amount, Rnd::Near);
-        let adj_amount = n_sub(amount, over, Rnd::Near);
+        // `amount - (assetAdj - amount)` on STAmounts (AMMHelpers.cpp:381).
+        let over = st_amount(n_sub(asset_adj, amount, Rnd::Near), xrp, Rnd::Near);
+        let adj_amount = st_amount(n_sub(amount, over, Rnd::Near), xrp, Rnd::Near);
         if adj_amount.0 == 0 {
             return ((0, 0), amount);
         }
@@ -816,8 +875,9 @@ pub(crate) fn adjust_asset_out_by_tokens(
     };
     let mut tokens_adj = tokens;
     if n_cmp(asset_adj, amount) == Ordering::Greater {
-        let over = n_sub(asset_adj, amount, Rnd::Near);
-        let adj_amount = n_sub(amount, over, Rnd::Near);
+        // `amount - (assetAdj - amount)` on STAmounts (AMMHelpers.cpp:405).
+        let over = st_amount(n_sub(asset_adj, amount, Rnd::Near), xrp, Rnd::Near);
+        let adj_amount = st_amount(n_sub(amount, over, Rnd::Near), xrp, Rnd::Near);
         if adj_amount.0 == 0 {
             return (tokens, amount);
         }
@@ -864,15 +924,17 @@ pub(crate) fn adjust_lp_tokens(lpt: Me, tokens: Me, deposit: bool) -> Me {
     if lpt.0 == 0 || tokens.0 == 0 {
         return tokens;
     }
+    // STAmount arithmetic under Downward (AMMHelpers.cpp:181-190): each sum
+    // and difference is an LP token amount again (`st_iou`).
     if deposit {
-        return n_sub(n_add(lpt, tokens, Rnd::Down), lpt, Rnd::Down);
+        return st_iou(n_sub(st_iou(n_add(lpt, tokens, Rnd::Down), Rnd::Down), lpt, Rnd::Down), Rnd::Down);
     }
     // Withdraw is `(tokens - lptAMMBalance) + lptAMMBalance`, and that
     // intermediate is NEGATIVE. Downward means toward -inf, so it rounds the
     // intermediate's MAGNITUDE UP and the positive result back DOWN — which is
     // not what feeding both steps through an unsigned `n_sub` would do.
     match n_cmp(tokens, lpt) {
-        Ordering::Less => n_sub(lpt, n_sub(lpt, tokens, Rnd::Up), Rnd::Down),
+        Ordering::Less => st_iou(n_sub(lpt, st_iou(n_sub(lpt, tokens, Rnd::Up), Rnd::Up), Rnd::Down), Rnd::Down),
         _ => tokens,
     }
 }
@@ -883,10 +945,52 @@ pub(crate) fn adjust_lp_tokens_out(lpt: Me, tokens: Me) -> Me {
 }
 
 pub(crate) fn to_amount(x: Me, xrp: bool, rnd: Rnd) -> Me {
+    to_amount_ambient(x, xrp, rnd, rnd)
+}
+
+/// A non-zero IOU `Number` as rippled stores it in an `STAmount` /
+/// `IOUAmount` under the ambient rounding mode `rnd` — the result of
+/// `toSTAmount`, of `STAmount ± STAmount`, of `IOUAmount ± IOUAmount`. At the
+/// Small scale the pair already is that amount and comes back as it is; at
+/// Large330 its nineteen digits are rounded to sixteen.
+pub(crate) fn st_iou(x: Me, rnd: Rnd) -> Me {
+    if large_scale() {
+        to_amount_ambient(x, false, rnd, rnd)
+    } else {
+        x
+    }
+}
+
+/// [`st_iou`] for an amount that may be XRP: whole drops are left alone
+/// (integer arithmetic on both sides).
+pub(crate) fn st_amount(x: Me, xrp: bool, rnd: Rnd) -> Me {
+    if xrp {
+        x
+    } else {
+        st_iou(x, rnd)
+    }
+}
+
+/// `toAmount<T>(asset, n, mode)` (AmountConversions.h:152-183) where the
+/// caller's ambient rounding mode differs from `mode`: `toAmount` installs
+/// `mode` for integral assets only (:155-157), so XRP converts under `rnd`
+/// (`operator rep()`) and an IOU under `ambient` (`IOUAmount{Number}`). The
+/// ambient mode only matters at Large330, where the IOU conversion rounds
+/// nineteen digits to sixteen; at Small an IOU Number already has sixteen.
+pub(crate) fn to_amount_ambient(x: Me, xrp: bool, rnd: Rnd, ambient: Rnd) -> Me {
     if x.0 == 0 {
         return (0, 0);
     }
     if !xrp {
+        if large_scale() {
+            // `IOUAmount{Number}` / `STAmount(asset, Number)`: nineteen digits
+            // to an amount's sixteen (IOUAmount.cpp:28-37, STAmount.h:567-583).
+            let mode = rounding(ambient);
+            return match me_number(x, mode).and_then(|n| n.iou_parts(mode)) {
+                Ok((false, m, e)) => (m as u128, e),
+                _ => (0, 0),
+            };
+        }
         return n_norm(x);
     }
     // `XRPAmount{Number}` is `Number::operator rep()` (tx::number `to_drops`):
@@ -909,7 +1013,8 @@ fn encode_rate(n: Me) -> u64 {
     if n.0 == 0 {
         return 0;
     }
-    let n = n_norm(n);
+    // A quality's mantissa is an STAmount's: sixteen digits at any scale.
+    let n = n_norm_pub(n);
     (((n.1 + 100) as u64) << 56) | n.0 as u64
 }
 
@@ -931,8 +1036,9 @@ fn rate_of(pays: Me, gets: Me) -> u64 {
     if pays.0 == 0 || gets.0 == 0 {
         return 0;
     }
-    let (nm, ne) = n_norm(pays);
-    let (dm, de) = n_norm(gets);
+    // `getRate` divides STAmounts: sixteen-digit operands at any scale.
+    let (nm, ne) = n_norm_pub(pays);
+    let (dm, de) = n_norm_pub(gets);
     let v = nm * 100_000_000_000_000_000u128 / dm + 5;
     let mut e = ne - de - 17;
     let mut k = 0u32;
@@ -1040,7 +1146,8 @@ pub(crate) fn lp_tokens_in(balance: Me, withdraw: Me, total_lp: Me, tfee: u16) -
     if frac.0 == 0 {
         return None;
     }
-    Some(n_mul(total_lp, frac, Rnd::Up))
+    // `multiply(lptAMMBalance, frac, Upward)` (AMMHelpers.cpp:136).
+    Some(st_iou(n_mul(total_lp, frac, Rnd::Up), Rnd::Up))
 }
 
 /// `lpTokensIn` as rippled returns it: a withdrawal too small for the
@@ -1052,7 +1159,8 @@ pub(crate) fn lp_tokens_in_or_zero(balance: Me, withdraw: Me, total_lp: Me, tfee
     if frac.0 == 0 {
         return Some((0, 0));
     }
-    Some(n_mul(total_lp, frac, Rnd::Up))
+    // `multiply(lptAMMBalance, frac, Upward)` (AMMHelpers.cpp:136).
+    Some(st_iou(n_mul(total_lp, frac, Rnd::Up), Rnd::Up))
 }
 
 fn lp_tokens_in_frac(balance: Me, withdraw: Me, total_lp: Me, tfee: u16) -> Option<Me> {
@@ -1246,7 +1354,9 @@ fn anchored_offer_generate(
         }
         let pick = if n_cmp(icon, root) == Ordering::Less { icon } else { root };
         let make = |i_prop: Me| -> Anchored {
-            let i = to_amount(i_prop, in_xrp, Rnd::Down);
+            // `toAmount<TIn>(…, Downward)` under the function's ToNearest
+            // guard (AMMHelpers.h:210, 233-234).
+            let i = to_amount_ambient(i_prop, in_xrp, Rnd::Down, Rnd::Near);
             if i.0 == 0 {
                 return Anchored::Empty;
             }
@@ -1788,7 +1898,9 @@ pub(crate) fn fib_slice(
     // …272, the product rounded up landed …273 — and one ulp of the seed
     // moved the slice's encoded rate from …277 to …278 and the
     // SendMax-limited fill from mainnet's 1115.89833868976 to …759.
-    let base_in = to_amount(n_mul(init.0, pct, Rnd::Near), gets_leg.xrp, Rnd::Up);
+    // `toAmount<TIn>(…, Upward)`, no guard: the path engine's ambient mode
+    // is ToNearest (AMMLiquidity.cpp:65-69).
+    let base_in = to_amount_ambient(n_mul(init.0, pct, Rnd::Near), gets_leg.xrp, Rnd::Up, Rnd::Near);
     if base_in.0 == 0 {
         return None;
     }
@@ -1799,10 +1911,16 @@ pub(crate) fn fib_slice(
     } else {
         let out0 = swap_asset_in(init.0, init.1, base_in, amm.tfee, pays_leg.xrp);
         let idx = iters as usize - 1;
-        s_out = to_amount(
-            n_mul(out0, ((FIB[idx] as u128) * LO, -15), Rnd::Down),
+        // `toAmount<TOut>(…, cur.out * fib, Downward)` (AMMLiquidity.cpp:83-86),
+        // ambient ToNearest as above.
+        s_out = to_amount_ambient(
+            // `cur.out * kFib[…]` is a Number product outside any guard:
+            // ToNearest in rippled. The Small arm keeps the Downward this
+            // engine has always used there (see the slice 0B report).
+            n_mul(out0, ((FIB[idx] as u128) * LO, -15), if large_scale() { Rnd::Near } else { Rnd::Down }),
             pays_leg.xrp,
             Rnd::Down,
+            Rnd::Near,
         );
         if s_out.0 == 0 || n_cmp(s_out, pool_out) != Ordering::Less {
             return None;
@@ -1961,7 +2079,9 @@ pub(crate) fn max_offer_amounts(
     // (1.692470077908021 * 0.99) truncates to …128940 where rippled traces
     // …128941. #106137477's BBRL pool is insensitive (its tail is an exact
     // half), so ONE specimen alone would not have caught this.
-    let out = to_amount(n_mul(pool_out, (9_900_000_000_000_000, -16), Rnd::Near), out_xrp, Rnd::Down);
+    // `maxOut`: `toAmount<T>(asset, out * 0.99, Downward)`, ambient ToNearest
+    // (AMMLiquidity.cpp:118-123).
+    let out = to_amount_ambient(n_mul(pool_out, (9_900_000_000_000_000, -16), Rnd::Near), out_xrp, Rnd::Down, Rnd::Near);
     if out.0 == 0 || n_cmp(out, pool_out) != Ordering::Less {
         return None;
     }
@@ -2963,5 +3083,80 @@ mod tests {
             hex::encode_upper(key.0),
             "6DAA4FDF97EBFFF94E197FFAF09E9982E1CDE2A0F3D3AF4CB5539BF3A28C8502"
         );
+    }
+}
+
+#[cfg(test)]
+mod large330_tests {
+    use super::*;
+    use crate::tx::number::{MantissaScale, ScaleGuard};
+
+    /// AMMCreate on devnet #5595244 (campaign 25, 0-13): 200 CLW against
+    /// 20 XRP. `ammLPTokens` is `root2(200 × 20000000)` under Downward, then
+    /// `toSTAmount` (AMMHelpers.cpp:43-52): 63245.55320336758 on devnet, where
+    /// Number runs at nineteen digits, 63245.55320336755 at mainnet's sixteen.
+    #[test]
+    fn the_initial_lp_mint_follows_the_number_scale() {
+        let (clw, drops): (Me, Me) = ((2_000_000_000_000_000, -13), (20_000_000, 0));
+        assert_eq!(amm_lp_tokens(clw, drops), (6_324_555_320_336_755, -11));
+        let _scale = ScaleGuard::new(MantissaScale::Large330);
+        assert_eq!(amm_lp_tokens(clw, drops), (6_324_555_320_336_758, -11));
+    }
+
+    /// At Large330 the `n_*` helpers are `Number` operations whose results
+    /// keep nineteen digits from one call to the next (the vectors are
+    /// rippled's own, src/tests/libxrpl/basics/Number.cpp:787-789, 1095,
+    /// 1247, 276-279), and a value becomes a 16-digit amount only through
+    /// `to_amount` / `st_iou`, under the mode given.
+    #[test]
+    fn the_helpers_carry_nineteen_digits_and_amounts_keep_sixteen() {
+        let _scale = ScaleGuard::new(MantissaScale::Large330);
+        let third: Me = (3_333_333_333_333_333_333, -19);
+        assert_eq!(n_div((1, 0), (3, 0), Rnd::Near), third);
+        assert_eq!(n_div((2, 0), (3, 0), Rnd::Up), (6_666_666_666_666_666_667, -19));
+        assert_eq!(n_div((2, 0), (3, 0), Rnd::Down), (6_666_666_666_666_666_666, -19));
+        let root2: Me = (1_414_213_562_373_095, -15);
+        assert_eq!(n_mul(root2, root2, Rnd::Near), (1_999_999_999_999_999_862, -18));
+        assert_eq!(n_mul(root2, root2, Rnd::Down), (1_999_999_999_999_999_861, -18));
+        assert_eq!(n_sqrt((2, 0)), (1_414_213_562_373_095_049, -18));
+        assert_eq!(n_add((1_000_000_000_000_000, -15), (6_555_555_555_555_555, -29), Rnd::Near), (1_000_000_000_000_065_556, -18));
+        assert_eq!(n_sub((1, 0), third, Rnd::Near), (6_666_666_666_666_666_667, -19));
+        assert_eq!(n_sub(third, (1, 0), Rnd::Near), (0, 0));
+        assert_eq!(n_cmp(third, (3_333_333_333_333_333, -16)), Ordering::Greater);
+        assert_eq!(n_pow((2, 0), 10), (1_024_000_000_000_000_000, -15));
+
+        assert_eq!(to_amount(third, false, Rnd::Up), (3_333_333_333_333_334, -16));
+        assert_eq!(to_amount(third, false, Rnd::Down), (3_333_333_333_333_333, -16));
+        assert_eq!(to_amount(third, false, Rnd::Near), (3_333_333_333_333_333, -16));
+        // `toAmount` installs its mode for XRP only: an IOU follows the ambient one.
+        assert_eq!(to_amount_ambient(third, false, Rnd::Up, Rnd::Near), (3_333_333_333_333_333, -16));
+        assert_eq!(to_amount_ambient((25, -1), true, Rnd::Up, Rnd::Near), (3, 0));
+        assert_eq!(to_amount_ambient((25, -1), true, Rnd::Down, Rnd::Up), (2, 0));
+        assert_eq!(st_iou(third, Rnd::Up), (3_333_333_333_333_334, -16));
+        assert_eq!(st_amount(third, false, Rnd::Up), (3_333_333_333_333_334, -16));
+        assert_eq!(st_amount((1_234_567, 0), true, Rnd::Up), (1_234_567, 0));
+        // A quality and an IOU amount stay at sixteen digits.
+        assert_eq!(n_norm_pub(third), (3_333_333_333_333_333, -16));
+        assert_eq!(rate_of((1, 0), (3, 0)), rate_of((1_000_000_000_000_000, -15), (3_000_000_000_000_000, -15)));
+        // `adjustLPTokens`: (T + t) − T under Downward, each an LP amount.
+        let lpt: Me = (6_324_555_320_336_758, -11);
+        assert_eq!(adjust_lp_tokens(lpt, (1_000_000_000_000_000, -15), true), (1_000_000_000_000_000, -15));
+        assert_eq!(adjust_lp_tokens(lpt, (1_234_567_890_123_456, -20), true), (1_234_500_000_000_000, -20));
+    }
+
+    /// Outside a guard — mainnet — nothing has moved: sixteen digits in,
+    /// sixteen out, and the amount conversions hand the pair back.
+    #[test]
+    fn the_small_scale_is_untouched() {
+        assert_eq!(n_div((1, 0), (3, 0), Rnd::Near), (3_333_333_333_333_333, -16));
+        let root2: Me = (1_414_213_562_373_095, -15);
+        assert_eq!(n_mul(root2, root2, Rnd::Near), (2_000_000_000_000_000, -15));
+        assert_eq!(n_sqrt((2, 0)), root2);
+        assert_eq!(st_iou((123, 0), Rnd::Up), (123, 0));
+        assert_eq!(st_amount((3_333_333_333_333_333, -16), false, Rnd::Up), (3_333_333_333_333_333, -16));
+        assert_eq!(to_amount_ambient((3_333_333_333_333_333, -16), false, Rnd::Up, Rnd::Down), (3_333_333_333_333_333, -16));
+        assert!(!crate::flow::payment_flow::port_enabled() || std::env::var("XRPL_FLOW_ENGINE").is_ok());
+        let _scale = ScaleGuard::new(MantissaScale::Large330);
+        assert!(crate::flow::payment_flow::port_enabled());
     }
 }

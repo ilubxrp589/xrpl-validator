@@ -603,6 +603,15 @@ fn mul_directed(a: ox::Me, b: ox::Me, up: bool, xrp: bool) -> ox::Me {
     if a.0 == 0 || b.0 == 0 {
         return (0, 0);
     }
+    if crate::tx::number::mantissa_scale() != crate::tx::number::MantissaScale::Small {
+        // Large330: `multiply(amount, frac, rm)` as written (AMMHelpers.cpp:
+        // 292-298) — the Number product under `rm`, then `toSTAmount` under
+        // the same guard (drops through `operator rep()`, an IOU's nineteen
+        // digits to sixteen).
+        use crate::tx::amm_swap::{n_mul, to_amount, Rnd};
+        let rm = if up { Rnd::Up } else { Rnd::Down };
+        return to_amount(n_mul(a, b, rm), xrp, rm);
+    }
     let (am, ae) = ox::norm16(a);
     let (bm, be) = ox::norm16(b);
     // Both mantissas are < 1e16, so the product is < 1e32 and fits a u128.
@@ -982,7 +991,7 @@ fn single_deposit_eprice_solve(
     // under the Downward guard, toSTAmount (an IOU keeps the Number), then
     // adjustLPTokens. (Zero tokens come back from adjustAssetInByTokens as
     // zero, the tecAMM_INVALID_TOKENS below.)
-    let tokens = solved.div(e, Rounding::Downward).map_err(nerr)?;
+    let tokens = solved.div(e, Rounding::Downward).and_then(|n| n.iou_rounded(Rounding::Downward)).map_err(nerr)?;
     let tokens = adjust_lp_tokens_n(t, tokens, true).map_err(nerr)?;
     let (tokens_adj, amount_deposit_adj) = crate::tx::amm_swap::adjust_asset_in_by_tokens(
         amount_balance,
@@ -2112,8 +2121,9 @@ fn adjust_lp_tokens_in(tokens: (u128, i32), total_lp: (u128, i32)) -> (u128, i32
     if ox::me_cmp(tokens, total_lp).is_ge() {
         return tokens;
     }
-    let d = n_sub(total_lp, tokens, Rnd::Up);
-    n_sub(total_lp, d, Rnd::Down)
+    // Two STAmount operations: each result is an LP token amount (`st_iou`).
+    let d = crate::tx::amm_swap::st_iou(n_sub(total_lp, tokens, Rnd::Up), Rnd::Up);
+    crate::tx::amm_swap::st_iou(n_sub(total_lp, d, Rnd::Down), Rnd::Down)
 }
 /// tfLPToken path (tokens = the requested LPTokenIn).
 fn payout_proportional(
@@ -3432,7 +3442,8 @@ impl Transactor for AMMBidTransactor {
             }
             if refund.0 > 0 {
                 if let Some(o) = owner {
-                    ox::move_leg(sandbox, &tx.account, &o, &lp_leg, refund);
+                    // `toSTAmount(lpTokens.asset(), refund)` (AMMBid.cpp), ambient ToNearest.
+                    ox::move_leg(sandbox, &tx.account, &o, &lp_leg, crate::tx::amm_swap::st_iou(refund, Rnd::Near));
                 }
             }
             (pay, n_sub(pay, refund, Rnd::Near))
@@ -3445,7 +3456,8 @@ impl Transactor for AMMBidTransactor {
             "Price": {
                 "currency": hex::encode_upper(lp_leg.cur),
                 "issuer": hex::encode(lp_leg.issuer),
-                "value": ox::me_to_value_string(pay_price),
+                // `toSTAmount(lpTokens.asset(), minPrice)` (AMMBid.cpp), ambient ToNearest.
+                "value": ox::me_to_value_string(crate::tx::amm_swap::st_iou(pay_price, Rnd::Near)),
             },
         });
         if discounted_fee != 0 {
@@ -3472,7 +3484,8 @@ impl Transactor for AMMBidTransactor {
         }
         amm["AuctionSlot"] = new_slot;
         ox::put_json(sandbox, amm_key, &amm);
-        let sa_burn = crate::tx::amm_swap::adjust_lp_tokens(lpt_amm, burn, false);
+        // `adjustLPTokens(lptAMMBalance, toSTAmount(lptAMMBalance.asset(), burn), IsDeposit::No)`.
+        let sa_burn = crate::tx::amm_swap::adjust_lp_tokens(lpt_amm, crate::tx::amm_swap::st_iou(burn, Rnd::Near), false);
         if !ox::me_cmp(sa_burn, lpt_amm).is_lt() {
             return TxResult::AmmFailed; // burn >= pool balance: tecINTERNAL shape
         }
@@ -4644,7 +4657,8 @@ impl Transactor for AMMClawbackTransactor {
                     return TxResult::AmmBalance;
                 }
                 let frac = ox::st_divide(amount, bal1, false);
-                let lp_w = n_mul(total_lp, frac, Rnd::Near);
+                // `toSTAmount(lptAMMBalance.asset(), lptAMMBalance * frac)` (AMMClawback.cpp:327), ambient ToNearest.
+                let lp_w = crate::tx::amm_swap::st_iou(n_mul(total_lp, frac, Rnd::Near), Rnd::Near);
                 let all = if fix340 { ox::me_cmp(lp_w, hold).is_ge() } else { ox::me_cmp(lp_w, hold).is_gt() };
                 if all {
                     Plan::All

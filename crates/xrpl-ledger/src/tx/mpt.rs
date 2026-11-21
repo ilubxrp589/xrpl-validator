@@ -480,8 +480,11 @@ fn rate_as_iou(rate: u64) -> (u128, i32) {
 /// rippled `multiply(STAmount mpt, Rate)` (Rate2.cpp:34 → STAmount.cpp
 /// multiply → `Number{v1} * Number{v2}` → `STAmount{asset, Number}` =
 /// fromNumber's `static_cast<int64>`): the product rounded to Number's
-/// 16-digit mantissa, then to an integer, both to nearest (ties even).
-/// Parity returns the amount untouched.
+/// mantissa at the thread's scale (sixteen digits, nineteen at Large330),
+/// then to an integer, both to nearest (ties even). `fromNumber`
+/// (STAmount.h:567-583) converts the magnitude and carries the sign; the
+/// operands here are never negative, so `to_drops` is that conversion at
+/// either scale. Parity returns the amount untouched.
 pub(crate) fn mpt_multiply_rate(v: u64, rate: u64) -> Option<u64> {
     use crate::tx::number::{Number, Rounding::ToNearest};
     if rate == 1_000_000_000 || v == 0 {

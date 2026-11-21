@@ -29,8 +29,15 @@ use crate::tx::offer::{decode20, Me};
 use xrpl_core::types::Hash256;
 
 /// `XRPL_FLOW_ENGINE=port` selects this engine for a transaction.
+///
+/// At Number's Large330 scale (SingleAssetVault or LendingProtocol enabled)
+/// this engine is selected whatever the variable says: it takes its
+/// arithmetic from `tx::number` and the AMM formulas that follow the scale,
+/// while the model engine in `tx::offer` / `tx::payment` is calibrated at
+/// sixteen digits and has not been audited for nineteen.
 pub fn port_enabled() -> bool {
-    std::env::var("XRPL_FLOW_ENGINE").map(|v| v == "port").unwrap_or(false)
+    crate::tx::number::mantissa_scale() != crate::tx::number::MantissaScale::Small
+        || std::env::var("XRPL_FLOW_ENGINE").map(|v| v == "port").unwrap_or(false)
 }
 
 /// An amount from a transaction field: XRP drops or an IOU with its asset.
