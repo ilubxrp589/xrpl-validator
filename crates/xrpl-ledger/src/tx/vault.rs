@@ -1493,6 +1493,7 @@ mod tests {
             tx("VaultSet", OWNER, json!({"VaultID": vault, "Data": "00"})),
             tx("VaultDeposit", OWNER, json!({"VaultID": vault, "Amount": "100"})),
             tx("VaultWithdraw", OWNER, json!({"VaultID": vault, "Amount": "100"})),
+            tx("VaultClawback", OWNER, json!({"VaultID": vault, "Holder": hex::encode(BOB)})),
         ]
     }
 
@@ -2746,5 +2747,198 @@ mod tests {
         let (domain, _) = domain_with_member(&mut st, BOB, None);
         let (key, _, _) = make_vault(&mut st, json!({"Asset": xrp_asset()}));
         assert_eq!(result(&st, &vault_set(OWNER, &key, json!({"DomainID": hex::encode_upper(domain.0)}))), TxResult::NoPermission);
+    }
+
+    // -----------------------------------------------------------------------
+    // VaultClawback
+    // -----------------------------------------------------------------------
+
+    const LSF_ALLOW_CLAWBACK: u64 = 0x8000_0000;
+    const LSF_NO_FREEZE_FLAG: u64 = 0x0020_0000;
+
+    fn clawback(account: [u8; 20], key: &Hash256, holder: [u8; 20], amount: Option<Value>) -> TxFields {
+        let mut fields = json!({"VaultID": vault_hex(key), "Holder": hex::encode(holder)});
+        if let Some(amount) = amount {
+            fields["Amount"] = amount;
+        }
+        tx("VaultClawback", account, fields)
+    }
+
+    /// A USD vault (the issuer allows clawback) holding BOB's 500 USD and,
+    /// optionally, CAROL's 500.
+    fn usd_vault_with_deposits(rules: &[&str], carol_too: bool) -> (LedgerState, Hash256, [u8; 20], [u8; 24]) {
+        let mut st = state_with(rules);
+        root_in(&mut st, ISSUER, LSF_DEFAULT_RIPPLE | LSF_ALLOW_CLAWBACK, json!({}));
+        line(&mut st, BOB, 0, "500", "1000");
+        line(&mut st, CAROL, 0, "500", "1000");
+        let (key, pseudo, share) = make_vault(&mut st, json!({"Asset": usd_asset()}));
+        commit(&mut st, &deposit(BOB, &key, usd_json("500")));
+        if carol_too {
+            commit(&mut st, &deposit(CAROL, &key, usd_json("500")));
+        }
+        (st, key, pseudo, share)
+    }
+
+    /// VaultClawback.cpp:35-60 (VaultValidation_test.cpp:509 "invalid clawback").
+    #[test]
+    fn vault_clawback_preflight() {
+        let st = state();
+        let key = Hash256([0xAB; 32]);
+        assert_eq!(result(&st, &clawback(ISSUER, &Hash256([0; 32]), BOB, None)), TxResult::Malformed);
+        assert_eq!(result(&st, &clawback(ISSUER, &key, BOB, Some(usd_json("-1")))), TxResult::BadAmount);
+        assert_eq!(result(&st, &clawback(ISSUER, &key, BOB, Some(json!("10")))), TxResult::Malformed, "XRP cannot be clawed back");
+        assert_eq!(result(&st, &clawback(ISSUER, &key, BOB, Some(json!("0")))), TxResult::Malformed);
+        assert_eq!(result(&st, &clawback(ISSUER, &key, BOB, Some(usd_json("0")))), TxResult::NoEntry, "zero means all");
+        assert_eq!(result(&st, &clawback(ISSUER, &key, BOB, None)), TxResult::NoEntry);
+    }
+
+    /// VaultClawback.cpp:78-231, the asset side: only the issuer, not from
+    /// itself, and only an asset that allows clawback.
+    #[test]
+    fn vault_clawback_preclaim_asset() {
+        let (st, key, pseudo, _) = usd_vault_with_deposits(&MAINNET_WITH_VAULTS, false);
+        assert_eq!(result(&st, &clawback(CAROL, &key, BOB, None)), TxResult::NoPermission, "not the issuer");
+        assert_eq!(result(&st, &clawback(OWNER, &key, BOB, Some(usd_json("10")))), TxResult::NoPermission, "the owner is not the issuer");
+        assert_eq!(result(&st, &clawback(ISSUER, &key, ISSUER, None)), TxResult::NoPermission, "from itself");
+        assert_eq!(result(&st, &clawback(ISSUER, &key, pseudo, None)), TxResult::TecPseudoAccount);
+        let foreign = json!({"currency": hex::encode_upper(USD_CODE), "issuer": hex::encode(CAROL), "value": "5"});
+        assert_eq!(result(&st, &clawback(ISSUER, &key, BOB, Some(foreign))), TxResult::WrongAsset);
+        assert_eq!(result(&st, &clawback(ISSUER, &key, BOB, None)), TxResult::Success);
+
+        // The issuer never enabled clawback, or gave up freezing.
+        for flags in [LSF_DEFAULT_RIPPLE, LSF_DEFAULT_RIPPLE | LSF_ALLOW_CLAWBACK | LSF_NO_FREEZE_FLAG] {
+            let (mut st, key, _, _) = usd_vault_with_deposits(&MAINNET_WITH_VAULTS, false);
+            root_in(&mut st, ISSUER, flags, json!({}));
+            assert_eq!(result(&st, &clawback(ISSUER, &key, BOB, None)), TxResult::NoPermission);
+        }
+        // An XRP vault: nothing to claw back.
+        let mut st = state();
+        let (key, _, _) = xrp_vault_with_deposit(&mut st, 1000);
+        assert_eq!(result(&st, &clawback(CAROL, &key, BOB, None)), TxResult::NoPermission);
+        // An MPT without lsfMPTCanClawback, and with it.
+        for (flags, want) in [(mpt::LSF_MPT_CAN_TRANSFER, TxResult::NoPermission), (mpt::LSF_MPT_CAN_TRANSFER | mpt::LSF_MPT_CAN_CLAWBACK, TxResult::Success)] {
+            let mut st = state();
+            let id = issuance(&mut st, flags, json!({}));
+            token(&mut st, &id, BOB, 0, 900);
+            let (key, _, _) = make_vault(&mut st, json!({"Asset": {"mpt_issuance_id": hex::encode_upper(id)}}));
+            commit(&mut st, &deposit(BOB, &key, mpt_json(&id, 300)));
+            assert_eq!(result(&st, &clawback(ISSUER, &key, BOB, None)), want);
+        }
+        // Issuer and owner in one: the amount must say which clawback (:112-117).
+        let mut st = state();
+        root_in(&mut st, OWNER, LSF_DEFAULT_RIPPLE | LSF_ALLOW_CLAWBACK, json!({}));
+        let own = json!({"currency": hex::encode_upper(USD_CODE), "issuer": hex::encode(OWNER)});
+        let (key, _, _) = make_vault(&mut st, json!({"Asset": own}));
+        assert_eq!(result(&st, &clawback(OWNER, &key, BOB, None)), TxResult::WrongAsset);
+    }
+
+    /// fixCleanup3_5_0 (3.5.0-rc1 VaultClawback.cpp:100-106): a holder with
+    /// no account is terNO_ACCOUNT — a retry, nothing claimed; before the
+    /// fix do_apply finds no shares: tecPRECISION_LOSS, the fee charged.
+    #[test]
+    fn vault_clawback_missing_holder() {
+        let ghost = [0x99u8; 20];
+        let (st, key, _, _) = usd_vault_with_deposits(&rules_with(&[am::FIX_CLEANUP_3_5_0]), false);
+        let (r, sb) = apply(&st, &clawback(ISSUER, &key, ghost, None));
+        assert_eq!(r, TxResult::NoAccount);
+        assert_eq!(sb.modification_count(), 0);
+        let (st, key, _, _) = usd_vault_with_deposits(&MAINNET_WITH_VAULTS, false);
+        let (r, sb) = apply(&st, &clawback(ISSUER, &key, ghost, None));
+        assert_eq!(r, TxResult::PrecisionLoss);
+        assert_eq!(sb.modification_count(), 1);
+    }
+
+    /// VaultClawback.cpp:389-542: everything (no Amount, or zero) and a part.
+    /// The holder's shares are burned, the assets go to the issuer (out of
+    /// existence), the vault's totals fall, an emptied MPToken is removed.
+    #[test]
+    fn vault_clawback_all_and_part() {
+        let (st, key, pseudo, share) = usd_vault_with_deposits(&MAINNET_WITH_VAULTS, true);
+        for amount in [None, Some(usd_json("0"))] {
+            let (r, sb) = apply(&st, &clawback(ISSUER, &key, BOB, amount));
+            assert_eq!(r, TxResult::Success);
+            assert_eq!(shares_of(&sb, &share, &BOB), None, "the emptied MPToken is removed");
+            assert_eq!(shares_of(&sb, &share, &CAROL), Some(500_000_000));
+            assert_eq!(outstanding(&sb, &share), 500_000_000);
+            assert_eq!(usd_held(&sb, &pseudo), usd("500"));
+            let vault = get(&sb, &key).unwrap();
+            assert_eq!((&vault["AssetsTotal"], &vault["AssetsAvailable"]), (&json!("500"), &json!("500")));
+            assert_eq!(usd_held(&sb, &BOB), usd("0"), "nothing goes back to the holder");
+        }
+        let (r, sb) = apply(&st, &clawback(ISSUER, &key, BOB, Some(usd_json("120.5"))));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(shares_of(&sb, &share, &BOB), Some(379_500_000));
+        assert_eq!(usd_held(&sb, &pseudo), usd("879.5"));
+        assert_eq!(get(&sb, &key).unwrap()["AssetsTotal"], json!("879.5"));
+        // More than the holder's stake is worth: the holder's shares do not cover it.
+        assert_eq!(result(&st, &clawback(ISSUER, &key, BOB, Some(usd_json("600")))), TxResult::InsufficientFunds);
+        // A holder with no shares: tecPRECISION_LOSS (:436-439).
+        assert_eq!(result(&st, &clawback(ISSUER, &key, OWNER, None)), TxResult::PrecisionLoss);
+    }
+
+    /// The clamp to sfAssetsAvailable (VaultClawback.cpp:326-357): with 300
+    /// of 1000 out on loan a clawback of all of BOB's 500 recovers what is
+    /// on hand, 700 x ... no — BOB's stake is worth 500 and 700 are
+    /// available, so all 500 come back; with 400 available only 400 do, for
+    /// the 400,000,000 shares they are worth.
+    #[test]
+    fn vault_clawback_is_clamped_to_assets_available() {
+        let (mut st, key, pseudo, share) = usd_vault_with_deposits(&MAINNET_WITH_VAULTS, true);
+        edit(&mut st, key, |v| v["AssetsAvailable"] = json!("400"));
+        let line_key = keylet::ripple_state_key(&pseudo, &ISSUER, &USD_CODE);
+        edit(&mut st, line_key, |l| {
+            let negative = l["Balance"]["value"].as_str().unwrap().starts_with('-');
+            l["Balance"]["value"] = json!(if negative { "-400" } else { "400" });
+        });
+        let (r, sb) = apply(&st, &clawback(ISSUER, &key, BOB, None));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(shares_of(&sb, &share, &BOB), Some(100_000_000), "400 of the 500 USD stake recovered");
+        let vault = get(&sb, &key).unwrap();
+        assert_eq!(vault["AssetsTotal"], json!("600"));
+        assert!(vault.get("AssetsAvailable").is_none(), "nothing left on hand");
+        assert_eq!(usd_held(&sb, &pseudo), usd("0"));
+
+        // Before fixCleanup3_1_3 a zero-amount clawback was not clamped: it
+        // asks the vault for 500 with 400 on hand, and the send fails.
+        let (mut st, key, pseudo, _) = usd_vault_with_deposits(&rules_without(&[am::FIX_CLEANUP_3_1_3]), true);
+        edit(&mut st, key, |v| v["AssetsAvailable"] = json!("400"));
+        let line_key = keylet::ripple_state_key(&pseudo, &ISSUER, &USD_CODE);
+        edit(&mut st, line_key, |l| {
+            let negative = l["Balance"]["value"].as_str().unwrap().starts_with('-');
+            l["Balance"]["value"] = json!(if negative { "-400" } else { "400" });
+        });
+        let (r, sb) = apply(&st, &clawback(ISSUER, &key, BOB, None));
+        assert_eq!(r, TxResult::TefInternal, "the vault's balance went negative (:523-536)");
+        assert_eq!(sb.modification_count(), 0);
+    }
+
+    /// The owner's clawback of shares (VaultClawback.cpp:125-167, :418-423):
+    /// only in a vault with shares outstanding and no assets at all; a
+    /// non-zero amount must be the holder's whole balance.
+    #[test]
+    fn vault_clawback_owner_burns_shares() {
+        let mut st = state();
+        let (key, pseudo, share) = xrp_vault_with_deposit(&mut st, 1000);
+        // The vault still has assets.
+        assert_eq!(result(&st, &clawback(OWNER, &key, BOB, None)), TxResult::NoPermission);
+        // The assets were lost (a defaulted loan): shares remain, assets do not.
+        edit(&mut st, key, |v| {
+            v.as_object_mut().unwrap().remove("AssetsTotal");
+            v.as_object_mut().unwrap().remove("AssetsAvailable");
+        });
+        edit(&mut st, keylet::account_root_key(&pseudo), |v| v["Balance"] = json!("0"));
+        assert_eq!(result(&st, &clawback(BOB, &key, BOB, Some(mpt_json(&share, 1000)))), TxResult::NoPermission, "only the owner");
+        assert_eq!(result(&st, &clawback(OWNER, &key, BOB, Some(mpt_json(&share, 999)))), TxResult::LimitExceeded, "all or nothing");
+        for amount in [None, Some(mpt_json(&share, 0)), Some(mpt_json(&share, 1000))] {
+            let (r, sb) = apply(&st, &clawback(OWNER, &key, BOB, amount));
+            assert_eq!(r, TxResult::Success);
+            assert_eq!(outstanding(&sb, &share), 0);
+            assert_eq!(shares_of(&sb, &share, &BOB), None);
+            assert_eq!(owners(&sb, &BOB), 0);
+        }
+        // Nobody holds shares: the owner has nothing to burn.
+        let mut st = state();
+        let (key, _, _) = make_vault(&mut st, json!({"Asset": xrp_asset()}));
+        assert_eq!(result(&st, &clawback(OWNER, &key, BOB, None)), TxResult::NoPermission, "no shares outstanding");
     }
 }
