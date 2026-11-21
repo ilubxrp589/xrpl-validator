@@ -108,3 +108,31 @@ fn run(bundle_json: &str) {
     assert!(differences.is_empty(), "{} difference(s):\n{}", differences.len(), differences.join("\n"));
 }
 
+
+// ---------------------------------------------------------------------------------------------------------------
+// The vectors
+// ---------------------------------------------------------------------------------------------------------------
+
+/// D3EC180861…: an interest-free XRP loan of 10000 drops over three payments that takes overpayments, the broker's owner submitting: the Loan, both directory links, the borrower's reserve, the vault's and the broker's books. Devnet: tesSUCCESS.
+#[test]
+fn loan_set_xrp_overpayment_devnet_7129585() {
+    run(include_str!("vectors/loan_set_xrp_overpayment_devnet_7129585.json"));
+}
+
+/// 0BE9AAC97F…: the same loan: 6668 drops with tfLoanOverpayment — one scheduled payment (3334) and an overpayment of the rest, the loan re-amortized. Devnet: tesSUCCESS.
+#[test]
+fn loan_pay_xrp_overpayment_devnet_7129587() {
+    run(include_str!("vectors/loan_pay_xrp_overpayment_devnet_7129587.json"));
+}
+
+/// 29230D2666…: the same loan: the remaining 3332 drops in one payment — paid off, its balances and due date cleared. Devnet: tesSUCCESS.
+#[test]
+fn loan_pay_xrp_final_devnet_7129588() {
+    run(include_str!("vectors/loan_pay_xrp_final_devnet_7129588.json"));
+}
+
+/// 1E1F0E2C73…: 1000 USD at 100% a year over three payments 400 s apart: the periodic payment, the total value rounded up, the loan scale, accrual on the vault. Devnet: tesSUCCESS.
+#[test]
+fn loan_set_iou_interest_devnet_7129539() {
+    run(include_str!("vectors/loan_set_iou_interest_devnet_7129539.json"));
+}
