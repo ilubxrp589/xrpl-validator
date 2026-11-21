@@ -949,6 +949,37 @@ impl Transactor for LoanBrokerCoverClawbackTransactor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// LoanBrokerDelete (LoanBrokerDelete.cpp)
+// ---------------------------------------------------------------------------
+
+/// LoanBrokerDelete (type 75): the owner removes a broker with no loans and
+/// no debt — whatever cover is left goes back to the owner, then the
+/// pseudo-account's holding, the pseudo-account and the LoanBroker go.
+///
+/// Fee: the plain base fee. Reserve: the owner's OwnerCount falls by 2, the
+/// LoanBroker and its pseudo-account (LoanBrokerDelete.cpp:189-196) —
+/// after the pseudo-account is erased in 3.4.1, BEFORE the cover is paid out
+/// under fixCleanup3_5_0, so that the holding it may then create for the
+/// owner can use the reserve the broker frees. Directories: the broker
+/// leaves the owner's directory (sfOwnerNode) and the vault
+/// pseudo-account's (sfVaultNode).
+pub struct LoanBrokerDeleteTransactor;
+
+impl Transactor for LoanBrokerDeleteTransactor {
+    fn preflight(&self, _tx: &TxFields) -> TxResult {
+        TxResult::Unsupported
+    }
+
+    fn preclaim(&self, _tx: &TxFields, _sandbox: &Sandbox) -> TxResult {
+        TxResult::Unsupported
+    }
+
+    fn do_apply(&self, _tx: &TxFields, _sandbox: &mut Sandbox) -> TxResult {
+        TxResult::Unsupported
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2272,5 +2303,284 @@ mod tests {
         commit(&mut st, &cover_deposit(OWNER, &broker, usd_json("100000")));
         assert_eq!(result(&st, &cover_clawback(ISSUER, Some(&broker), Some(usd_json("0.00000000001")))), TxResult::PrecisionLoss);
         assert_eq!(result(&st, &cover_clawback(ISSUER, Some(&broker), Some(usd_json("0.0000000001")))), TxResult::Success);
+    }
+
+    // -----------------------------------------------------------------------
+    // LoanBrokerDelete
+    // -----------------------------------------------------------------------
+
+    fn broker_delete(account: [u8; 20], broker: &Hash256) -> TxFields {
+        tx("LoanBrokerDelete", account, json!({"LoanBrokerID": key_hex(broker)}))
+    }
+
+    /// LoanBrokerDelete.cpp:28-35, :37-93 (LoanBroker_test.cpp:501-503: a
+    /// vault's id tecNO_ENTRY, not the owner tecNO_PERMISSION; :1185 "Invalid
+    /// LoanBrokerDelete").
+    #[test]
+    fn loan_broker_delete_preflight_and_preclaim() {
+        let mut st = state();
+        let (broker, _, vault) = xrp_broker(&mut st);
+        assert_eq!(result(&st, &broker_delete(OWNER, &Hash256([0; 32]))), TxResult::InvalidTx);
+        assert_eq!(result(&st, &broker_delete(OWNER, &vault)), TxResult::NoEntry, "a vault's id");
+        assert_eq!(result(&st, &broker_delete(BOB, &broker)), TxResult::NoPermission);
+        // Live loans.
+        let mut with_loans = st.clone();
+        edit(&mut with_loans, broker, |b| b["OwnerCount"] = json!(1));
+        assert_eq!(result(&with_loans, &broker_delete(OWNER, &broker)), TxResult::HasObligations);
+        // Debt left.
+        let mut in_debt = st.clone();
+        edit(&mut in_debt, broker, |b| b["DebtTotal"] = json!("1"));
+        assert_eq!(result(&in_debt, &broker_delete(OWNER, &broker)), TxResult::HasObligations);
+        // The vault gone from under the broker.
+        let mut orphan = st.clone();
+        edit(&mut orphan, broker, |b| b["VaultID"] = json!("EE".repeat(32)));
+        assert_eq!(result(&orphan, &broker_delete(OWNER, &broker)), TxResult::TefBadLedger);
+        assert_eq!(result(&st, &broker_delete(OWNER, &broker)), TxResult::Success);
+    }
+
+    /// LoanBrokerDelete.cpp:75-92: a sfDebtTotal that is dust below the
+    /// vault's scale does not hold the broker back.
+    #[test]
+    fn loan_broker_delete_ignores_debt_that_rounds_to_zero_at_the_vault_scale() {
+        let mut st = state();
+        let (broker, _, vault) = usd_broker(&mut st);
+        // A vault total of 100000 has its sixteenth digit at 1e-10.
+        edit(&mut st, vault, |v| {
+            v["AssetsTotal"] = json!("100000");
+            v["AssetsAvailable"] = json!("100000");
+        });
+        let with_debt = |debt: &str| {
+            let mut st = st.clone();
+            edit(&mut st, broker, |b| b["DebtTotal"] = json!(debt));
+            result(&st, &broker_delete(OWNER, &broker))
+        };
+        assert_eq!(with_debt("0.00000000009"), TxResult::Success, "below one unit of the scale: truncated to zero");
+        assert_eq!(with_debt("0.0000000001"), TxResult::HasObligations, "one unit of the scale");
+        assert_eq!(with_debt("5"), TxResult::HasObligations);
+    }
+
+    /// LoanBrokerDelete.cpp:95-118 (LoanBroker_test.cpp:1646 "LoanBrokerDelete
+    /// - locked broker pseudo-account MPT", :1767 "frozen broker
+    /// pseudo-account IOU"): with cover to pay out, the owner must be able to
+    /// receive it and — fixCleanup3_2_0 — the pseudo-account to send it.
+    #[test]
+    fn loan_broker_delete_freezes() {
+        let mut st = state();
+        let (broker, pseudo, _) = usd_broker_with_cover(&mut st, "100");
+        let delete = broker_delete(OWNER, &broker);
+        let set_flags = |st: &LedgerState, holder: [u8; 20], deep: bool| {
+            let mut st = st.clone();
+            let holder_low = holder < ISSUER;
+            // The issuer's freeze; a deep freeze adds lsfLow/HighDeepFreeze.
+            let (freeze, deep_freeze) = if holder_low { (LSF_HIGH_FREEZE, 0x0400_0000u64) } else { (LSF_LOW_FREEZE, 0x0200_0000u64) };
+            edit(&mut st, keylet::ripple_state_key(&holder, &ISSUER, &USD_CODE), |l| {
+                l["Flags"] = json!(l["Flags"].as_u64().unwrap() | freeze | if deep { deep_freeze } else { 0 })
+            });
+            st
+        };
+        assert_eq!(result(&set_flags(&st, OWNER, true), &delete), TxResult::Frozen, "the owner deep-frozen");
+        assert_eq!(result(&set_flags(&st, OWNER, false), &delete), TxResult::Success, "a plain freeze still receives");
+        assert_eq!(result(&set_flags(&st, pseudo, false), &delete), TxResult::Frozen, "the pseudo-account frozen");
+        // Nothing to pay out: no freeze matters.
+        let mut st = state();
+        let (broker, pseudo, _) = usd_broker(&mut st);
+        let delete = broker_delete(OWNER, &broker);
+        assert_eq!(result(&set_flags(&st, pseudo, true), &delete), TxResult::Success);
+        // Before fixCleanup3_2_0 the pseudo-account's freeze was not asked.
+        let mut st = state_with(&rules_without(&[am::FIX_CLEANUP_3_2_0]));
+        let (broker, pseudo, _) = usd_broker_with_cover(&mut st, "100");
+        let delete = broker_delete(OWNER, &broker);
+        assert_eq!(result(&set_flags(&st, pseudo, false), &delete), TxResult::Success);
+        assert_eq!(result(&set_flags(&st, OWNER, true), &delete), TxResult::Frozen);
+
+        // MPT: the issuance locked.
+        let mut st = state();
+        let (broker, _, id) = mpt_broker_with_cover(&mut st, 100);
+        edit(&mut st, keylet::mpt_issuance_key(&id), |i| i["Flags"] = json!(i["Flags"].as_u64().unwrap() | mpt::LSF_MPT_LOCKED));
+        assert_eq!(result(&st, &broker_delete(OWNER, &broker)), TxResult::Locked);
+    }
+
+    /// LoanBrokerDelete.cpp:123-200 (LoanBroker_test.cpp:509-548: the broker
+    /// and its pseudo-account are gone, the owner has the cover back): XRP,
+    /// IOU and MPT, with and without cover.
+    #[test]
+    fn loan_broker_delete_returns_the_cover_and_removes_everything_the_set_made() {
+        // XRP, with cover.
+        let mut st = state();
+        let (vault, vault_pseudo) = xrp_vault(&mut st);
+        let before_broker = Sandbox::new(&st);
+        let (owners_before, xrp_before) = (owners(&before_broker, &OWNER), xrp_of(&before_broker, &OWNER));
+        let (broker, pseudo) = make_broker(&mut st, &vault, json!({}));
+        commit(&mut st, &cover_deposit(OWNER, &broker, json!("10000")));
+        let (r, sb) = apply(&st, &broker_delete(OWNER, &broker));
+        assert_eq!(r, TxResult::Success);
+        assert!(!sb.exists(&broker), "the LoanBroker");
+        assert!(!sb.exists(&keylet::account_root_key(&pseudo)), "its pseudo-account");
+        assert!(!dir_has(&sb, &OWNER, &broker) && !dir_has(&sb, &vault_pseudo, &broker), "both directory links");
+        assert_eq!(owners(&sb, &OWNER), owners_before, "the two reserve units are back");
+        assert_eq!(xrp_of(&sb, &OWNER), xrp_before - 3 * FEE, "the cover is back; three fees were paid");
+        assert!(sb.exists(&vault), "the vault stays");
+
+        // IOU, with cover: the pseudo-account's line goes too.
+        let mut st = state();
+        let (broker, pseudo, vault) = usd_broker_with_cover(&mut st, "100");
+        let vault_pseudo = account_of(&get(&Sandbox::new(&st), &vault).unwrap(), "Account").unwrap();
+        let (r, sb) = apply(&st, &broker_delete(OWNER, &broker));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(holds(&sb, &OWNER, &USD), usd("1000"));
+        assert!(!sb.exists(&keylet::ripple_state_key(&pseudo, &ISSUER, &USD_CODE)), "the pseudo-account's line");
+        assert!(!sb.exists(&keylet::owner_dir_key(&pseudo)), "the pseudo-account's directory");
+        assert!(!sb.exists(&keylet::account_root_key(&pseudo)) && !sb.exists(&broker));
+        assert!(!dir_has(&sb, &vault_pseudo, &broker));
+        // Without cover.
+        let mut st = state();
+        let (broker, pseudo, _) = usd_broker(&mut st);
+        let (r, sb) = apply(&st, &broker_delete(OWNER, &broker));
+        assert_eq!(r, TxResult::Success);
+        assert!(!sb.exists(&keylet::account_root_key(&pseudo)) && !sb.exists(&broker));
+        assert_eq!(holds(&sb, &OWNER, &USD), usd("1000"));
+
+        // MPT, with cover.
+        let mut st = state();
+        let (broker, pseudo, id) = mpt_broker_with_cover(&mut st, 100);
+        let asset = HeldAsset::Mpt(id);
+        let (r, sb) = apply(&st, &broker_delete(OWNER, &broker));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(holds(&sb, &OWNER, &asset).mantissa, 1000);
+        assert!(!sb.exists(&keylet::mptoken_key(&keylet::mpt_issuance_key(&id), &pseudo)), "the pseudo-account's MPToken");
+        assert!(!sb.exists(&keylet::account_root_key(&pseudo)) && !sb.exists(&broker));
+    }
+
+    /// 3.5.0-rc1 LoanBrokerDelete.cpp:100-119, :172-200 (fixCleanup3_5_0): an
+    /// owner without a holding of the asset gets one for the cover payout,
+    /// out of the reserve the broker frees. Before the fix the payout goes
+    /// straight to accountSend: tecNO_AUTH for an MPT.
+    #[test]
+    fn loan_broker_delete_under_fix_cleanup_3_5_0_creates_the_owners_holding_for_the_payout() {
+        let build = |rules: &[&'static str]| {
+            let mut st = state_with(rules);
+            let (broker, _, id) = mpt_broker_with_cover(&mut st, 100);
+            let ikey = keylet::mpt_issuance_key(&id);
+            // The owner's MPToken emptied and gone.
+            edit(&mut st, ikey, |i| i["OutstandingAmount"] = json!("100"));
+            st.state_map.delete(&keylet::mptoken_key(&ikey, &OWNER)).unwrap();
+            (st, broker, id)
+        };
+        let (st, broker, _) = build(&MAINNET_WITH_LENDING);
+        let (r, sb) = apply(&st, &broker_delete(OWNER, &broker));
+        assert_eq!(r, TxResult::NoAuth, "3.4.1: no MPToken to pay into");
+        assert!(sb.exists(&broker), "a tec keeps the broker");
+
+        let (st, broker, id) = build(&rules_with(&[am::FIX_CLEANUP_3_5_0]));
+        let owners_before = owners(&Sandbox::new(&st), &OWNER);
+        let (r, sb) = apply(&st, &broker_delete(OWNER, &broker));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(holds(&sb, &OWNER, &HeldAsset::Mpt(id)).mantissa, 100);
+        assert_eq!(owners(&sb, &OWNER), owners_before - 2 + 1, "two units freed, one taken by the new MPToken");
+        assert!(!sb.exists(&broker));
+        // The reserve for the new holding is judged AFTER the broker's two
+        // units are released: an owner exactly at its reserve still succeeds.
+        let mut tight = st.clone();
+        let reserve = crate::ledger::fees::account_reserve(&Sandbox::new(&st), owners_before - 1);
+        edit(&mut tight, keylet::account_root_key(&OWNER), |a| a["Balance"] = json!(reserve.to_string()));
+        assert_eq!(result(&tight, &broker_delete(OWNER, &broker)), TxResult::Success);
+        // fixCleanup3_5_0's preclaim: an issuance that takes no new holders.
+        let mut closed = st.clone();
+        edit(&mut closed, keylet::mpt_issuance_key(&id), |i| {
+            i["Flags"] = json!(i["Flags"].as_u64().unwrap() & !mpt::LSF_MPT_CAN_TRANSFER)
+        });
+        assert_eq!(result(&closed, &broker_delete(OWNER, &broker)), TxResult::NoAuth);
+    }
+
+    /// VaultDelete.cpp:160-162 with a LoanBroker in the vault
+    /// pseudo-account's directory (LoanBrokerSet.cpp:252): an empty vault
+    /// that still hosts a broker cannot be deleted; once the broker is gone
+    /// it can.
+    #[test]
+    fn a_vault_cannot_be_deleted_while_a_broker_is_attached() {
+        let mut st = state();
+        let (broker, _, vault) = xrp_broker(&mut st);
+        let vault_delete = tx("VaultDelete", OWNER, json!({"VaultID": key_hex(&vault)}));
+        let (r, sb) = apply(&st, &vault_delete);
+        assert_eq!(r, TxResult::HasObligations);
+        assert!(sb.exists(&vault) && sb.exists(&broker));
+        commit(&mut st, &broker_delete(OWNER, &broker));
+        let (r, sb) = apply(&st, &vault_delete);
+        assert_eq!(r, TxResult::Success);
+        assert!(!sb.exists(&vault));
+        assert_eq!(owners(&sb, &OWNER), 0, "everything the vault and the broker charged is released");
+    }
+
+    // -----------------------------------------------------------------------
+    // The amendment gate, all five
+    // -----------------------------------------------------------------------
+
+    fn one_of_each() -> Vec<TxFields> {
+        let vault = Hash256([0xAB; 32]);
+        let broker = Hash256([0xCD; 32]);
+        vec![
+            broker_set(OWNER, &vault, json!({})),
+            broker_delete(OWNER, &broker),
+            cover_deposit(OWNER, &broker, json!("100")),
+            cover_withdraw(OWNER, &broker, json!("100")),
+            cover_clawback(OWNER, Some(&broker), None),
+        ]
+    }
+
+    /// Transactor.h:644-647 with transactions.macro:887-960
+    /// (featureLendingProtocol) and each type's `checkExtraFeatures`
+    /// (LoanBroker_test.cpp:84 "Disabled"): a loan-broker type is temDISABLED
+    /// in preflight — not applied, no fee, no sequence — unless
+    /// LendingProtocol, SingleAssetVault and MPTokensV1 are all enabled.
+    /// Mainnet's rules today have none of the first two.
+    #[test]
+    fn every_loan_broker_type_is_tem_disabled_without_the_amendments() {
+        let mainnet_today = vec![am::FIX_CLEANUP_3_1_3, am::FIX_CLEANUP_3_2_0, am::FIX_CLEANUP_3_3_0, am::FIX_CLEANUP_3_4_0, am::MPTOKENS_V1, am::PERMISSIONED_DOMAINS, am::CREDENTIALS];
+        for rules in [
+            mainnet_today,
+            rules_without(&[am::LENDING_PROTOCOL]),
+            rules_without(&[am::SINGLE_ASSET_VAULT]),
+            rules_without(&[am::MPTOKENS_V1]),
+            vec![am::LENDING_PROTOCOL],
+            vec![],
+        ] {
+            let st = state_with(&rules);
+            for t in one_of_each() {
+                let (result, sb) = apply(&st, &t);
+                assert_eq!(result, TxResult::Disabled, "{}", t.tx_type);
+                assert_eq!(sb.modification_count(), 0, "{}: nothing is written, the fee included", t.tx_type);
+            }
+        }
+    }
+
+    /// The five are registered, and each passes the gate once the
+    /// amendments are on.
+    #[test]
+    fn every_loan_broker_type_is_dispatched_with_the_amendments() {
+        let st = state();
+        for t in one_of_each() {
+            assert!(crate::tx::dispatch::is_supported(&t.tx_type), "{}", t.tx_type);
+            assert_eq!(result(&st, &t), TxResult::NoEntry, "{}: past preflight, nothing there", t.tx_type);
+        }
+    }
+
+    /// Transactor.cpp:234-250: none of the five is delegable — temINVALID;
+    /// preflight0: none has a flag of its own — temINVALID_FLAG. Batch.h:60-76:
+    /// none may be a Batch inner.
+    #[test]
+    fn a_delegated_flagged_or_batched_loan_broker_transaction_is_refused() {
+        let st = state();
+        for mut t in one_of_each() {
+            t.fields["Delegate"] = json!(hex::encode(BOB));
+            assert_eq!(result(&st, &t), TxResult::InvalidTx, "{} delegated", t.tx_type);
+        }
+        for mut t in one_of_each() {
+            t.fields["Flags"] = json!(0x0001_0000u64);
+            assert_eq!(result(&st, &t), TxResult::InvalidFlag, "{}", t.tx_type);
+            // tfFullyCanonicalSig is universal.
+            t.fields["Flags"] = json!(0x8000_0000u64);
+            assert_ne!(result(&st, &t), TxResult::InvalidFlag, "{}", t.tx_type);
+            assert!(crate::tx::batch::DISABLED_INNER_TYPES.contains(&t.tx_type.as_str()), "{}", t.tx_type);
+        }
     }
 }
