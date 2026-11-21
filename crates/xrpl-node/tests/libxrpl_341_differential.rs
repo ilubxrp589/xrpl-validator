@@ -56,6 +56,11 @@ use xrpl_node::native_apply::{build_txfields, canon_for_encode, decode_address, 
 const REMOVED: &[&str] =
     &["fixCleanup3_5_0", "Sponsor", "DynamicMPT", "ConfidentialTransfer", "XChainBridge", "fixXChainRewardRounding"];
 
+/// rippled's `tapDRY_RUN` (ApplyView.h), the `simulate` path: an unsigned transaction (empty SigningPubKey, no
+/// TxnSignature) skips the signature checks and nothing else (Transactor.cpp:135-170, :954); the shim's
+/// `apply_maybe_dry` still lands the result. Used for the mutants whose transaction fields are changed.
+const TAP_DRY_RUN: u32 = 0x1000;
+
 /// Devnet's network id (below 1025: transactions carry no NetworkID field).
 const NETWORK_ID: u32 = 2;
 
@@ -192,6 +197,16 @@ fn tx_bytes_of(bundle: &Value) -> Result<Vec<u8>, String> {
 }
 
 fn libxrpl_leg(ledger: &Ledger, pre: &BTreeMap<Key, Vec<u8>>, tx_bytes: &[u8]) -> Result<(String, String, MutMap, Vec<Key>), String> {
+    libxrpl_leg_flags(ledger, pre, tx_bytes, 0)
+}
+
+/// `flags` = rippled's ApplyFlags: 0 (`tapNONE`) for a signed transaction, [`TAP_DRY_RUN`] for an unsigned mutant.
+fn libxrpl_leg_flags(
+    ledger: &Ledger,
+    pre: &BTreeMap<Key, Vec<u8>>,
+    tx_bytes: &[u8],
+    flags: u32,
+) -> Result<(String, String, MutMap, Vec<Key>), String> {
     let (base, reserve, increment) = fees_of(pre)?;
     let amendments = amendments_of(pre)?;
     let info = xrpl_ffi::LedgerInfo {
@@ -204,7 +219,7 @@ fn libxrpl_leg(ledger: &Ledger, pre: &BTreeMap<Key, Vec<u8>>, tx_bytes: &[u8]) -
         increment_drops: increment,
     };
     let provider = BundleProvider { pre, misses: RefCell::new(BTreeSet::new()) };
-    let out = xrpl_ffi::apply_with_mutations(tx_bytes, &amendments, &info, &provider, 0, NETWORK_ID)
+    let out = xrpl_ffi::apply_with_mutations(tx_bytes, &amendments, &info, &provider, flags, NETWORK_ID)
         .ok_or("the shim returned no result")?;
     let muts: MutMap = out
         .mutations
@@ -259,9 +274,9 @@ fn our_leg(ledger: &Ledger, pre: &BTreeMap<Key, Vec<u8>>, tx: &Value) -> Result<
     Ok((ter, muts, misses))
 }
 
-fn both_legs(bundle: &Value, pre: &BTreeMap<Key, Vec<u8>>, tx_bytes: &[u8]) -> Result<Legs, String> {
+fn both_legs(bundle: &Value, pre: &BTreeMap<Key, Vec<u8>>, tx_bytes: &[u8], flags: u32) -> Result<Legs, String> {
     let ledger = ledger_of(bundle);
-    let (lib_ter, lib_fatal, lib, lib_misses) = libxrpl_leg(&ledger, pre, tx_bytes)?;
+    let (lib_ter, lib_fatal, lib, lib_misses) = libxrpl_leg_flags(&ledger, pre, tx_bytes, flags)?;
     let (our_ter, ours, our_misses) = our_leg(&ledger, pre, &bundle["tx"])?;
     Ok(Legs { lib_ter, lib_fatal, lib, lib_misses, our_ter, ours, our_misses })
 }
@@ -458,7 +473,7 @@ fn run_bundle(name: &str, bundle: &Value) -> Result<Row, String> {
     }
     rewrite_amendments(&mut pre)?;
     let tx_bytes = tx_bytes_of(bundle)?;
-    let mut legs = both_legs(bundle, &pre, &tx_bytes)?;
+    let mut legs = both_legs(bundle, &pre, &tx_bytes, 0)?;
     let shim_close_time = tx_type == "LoanSet" && adjust_loan_start(&mut legs, ledger_of(bundle).resolution as u64);
     let mut class = classify(&legs, &pre);
     let vs_devnet = same_as_devnet(bundle, &legs, &pre);
@@ -475,6 +490,79 @@ fn run_bundle(name: &str, bundle: &Value) -> Result<Row, String> {
         }
     }
     Ok(Row { class, tx_type, devnet, lib_ter: legs.lib_ter, our_ter: legs.our_ter, vs_devnet, detail })
+}
+
+/// Set `a.b.c` in a JSON object (null removes the field).
+fn set_path(obj: &mut Value, path: &str, value: &Value) {
+    let mut at = obj;
+    let parts: Vec<&str> = path.split('.').collect();
+    for p in &parts[..parts.len() - 1] {
+        at = &mut at[*p];
+    }
+    let last = parts[parts.len() - 1];
+    if value.is_null() {
+        if let Some(o) = at.as_object_mut() {
+            o.remove(last);
+        }
+    } else {
+        at[last] = value.clone();
+    }
+}
+
+/// One entry of `vectors/diff341_mutants.json`: a pinned vector with fields of its pre-state objects and / or
+/// of its transaction changed, to reach a branch of the mainnet arm no recorded transaction took. A changed
+/// transaction is no longer validly signed and runs unsigned under [`TAP_DRY_RUN`]; a changed pre-state alone
+/// keeps the real signature and `tapNONE`. Returns (row, libxrpl's log).
+fn run_mutant(m: &Value) -> Result<(Row, String), String> {
+    let base = m["base"].as_str().ok_or("mutant without a base")?;
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/vectors/{base}.json"));
+    let mut bundle: Value = serde_json::from_str(&std::fs::read_to_string(&path).map_err(|e| format!("{base}: {e}"))?).unwrap();
+    let mut pre = pre_of(&bundle);
+    for (k, v) in extra_pre(base) {
+        pre.entry(k).or_insert(v);
+    }
+    rewrite_amendments(&mut pre)?;
+    for (key, edits) in m["pre"].as_object().into_iter().flatten() {
+        edit_object(&mut pre, &key32(key), |jv| {
+            for (path, value) in edits.as_object().into_iter().flatten() {
+                set_path(jv, path, value);
+            }
+        })?;
+    }
+    let tx_edits = m["tx"].as_object().filter(|o| !o.is_empty());
+    let (tx_bytes, flags) = match tx_edits {
+        None => (tx_bytes_of(&bundle)?, 0),
+        Some(edits) => {
+            let tx = bundle["tx"].as_object_mut().unwrap();
+            for (path, value) in edits {
+                if value.is_null() {
+                    tx.remove(path);
+                } else {
+                    tx.insert(path.clone(), value.clone());
+                }
+            }
+            for k in ["hash", "ctid", "TxnSignature", "date", "inLedger", "ledger_index", "validated"] {
+                tx.remove(k);
+            }
+            tx.insert("SigningPubKey".into(), Value::String(String::new()));
+            if tx.contains_key("CounterpartySignature") {
+                tx.insert("CounterpartySignature".into(), serde_json::json!({"SigningPubKey": ""}));
+            }
+            let bytes = encode(&bundle["tx"]).map_err(|e| format!("the mutant does not encode: {e}"))?;
+            let id = hex::encode_upper(sha512_half_prefixed(&HASH_PREFIX_TRANSACTION_ID, &bytes).0);
+            bundle["tx"]["hash"] = Value::String(id);
+            (bytes, TAP_DRY_RUN)
+        }
+    };
+    let tx_type = bundle["tx"]["TransactionType"].as_str().unwrap_or("?").to_string();
+    let mut legs = both_legs(&bundle, &pre, &tx_bytes, flags)?;
+    if tx_type == "LoanSet" {
+        adjust_loan_start(&mut legs, ledger_of(&bundle).resolution as u64);
+    }
+    let class = classify(&legs, &pre);
+    let detail = if class == "AGREE" { Vec::new() } else { describe(&legs) };
+    let log = legs.lib_fatal.chars().take(400).collect();
+    Ok((Row { class, tx_type, devnet: "-".into(), lib_ter: legs.lib_ter, our_ter: legs.our_ter, vs_devnet: false, detail }, log))
 }
 
 fn collect(path: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -638,6 +726,31 @@ fn libxrpl_341_against_our_engine_on_the_mainnet_arm() {
                 *tally.entry((tx_type, class)).or_default() += 1;
                 if !sponsored {
                     failing.push(name.clone());
+                }
+            }
+        }
+    }
+    // The mutants: only with the default (pinned) input, whose vectors they are built on.
+    if std::env::var("DIFF341_BUNDLES").is_err() {
+        let mutants: Value = serde_json::from_str(include_str!("vectors/diff341_mutants.json")).unwrap();
+        for m in mutants.as_array().unwrap() {
+            let name = format!("{} [{}]", m["base"].as_str().unwrap_or("?"), m["label"].as_str().unwrap_or("?"));
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_mutant(m))).unwrap_or_else(|p| {
+                Err(format!("panic: {}", p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default()))
+            });
+            match out {
+                Ok((r, log)) => {
+                    println!("D341 MUTANT {} {name} {} libxrpl={} ours={} | {log}", r.class, r.tx_type, r.lib_ter, r.our_ter);
+                    r.detail.iter().for_each(|l| println!("D341   {l}"));
+                    *tally.entry((format!("mutant {}", r.tx_type), r.class)).or_default() += 1;
+                    if matches!(r.class, "TER" | "MUT" | "BYTE") {
+                        failing.push(name);
+                    }
+                }
+                Err(e) => {
+                    println!("D341 MUTANT HARNESS {name}: {e}");
+                    *tally.entry(("mutant".to_string(), "HARNESS")).or_default() += 1;
+                    failing.push(name);
                 }
             }
         }

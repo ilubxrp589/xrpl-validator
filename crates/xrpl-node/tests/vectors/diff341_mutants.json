@@ -1,0 +1,277 @@
+[
+ {
+  "base": "loan_broker_set_xrp_devnet_7129515",
+  "label": "DebtMaximum 1e17+1 drops (above the XRP maximum)",
+  "tx": {
+   "DebtMaximum": "100000000000000001"
+  },
+  "pre": {}
+ },
+ {
+  "base": "loan_broker_set_xrp_devnet_7129515",
+  "label": "DebtMaximum 1e17 drops",
+  "tx": {
+   "DebtMaximum": "100000000000000000"
+  },
+  "pre": {}
+ },
+ {
+  "base": "loan_broker_set_xrp_devnet_7129515",
+  "label": "DebtMaximum 2^63-1",
+  "tx": {
+   "DebtMaximum": "9223372036854775807"
+  },
+  "pre": {}
+ },
+ {
+  "base": "loan_broker_set_xrp_devnet_7129515",
+  "label": "DebtMaximum 1.5 drops",
+  "tx": {
+   "DebtMaximum": "1.5"
+  },
+  "pre": {}
+ },
+ {
+  "base": "loan_broker_set_mpt_devnet_7129450",
+  "label": "DebtMaximum 2^63-1 on MPT",
+  "tx": {
+   "DebtMaximum": "9223372036854775807"
+  },
+  "pre": {}
+ },
+ {
+  "base": "loan_broker_set_mpt_devnet_7129450",
+  "label": "DebtMaximum 10.5 on MPT",
+  "tx": {
+   "DebtMaximum": "10.5"
+  },
+  "pre": {}
+ },
+ {
+  "base": "loan_broker_set_iou_devnet_7129447",
+  "label": "DebtMaximum 9e18 on IOU",
+  "tx": {
+   "DebtMaximum": "9000000000000000000"
+  },
+  "pre": {}
+ },
+ {
+  "base": "loan_broker_set_iou_devnet_7129447",
+  "label": "DebtMaximum with 19 digits on IOU",
+  "tx": {
+   "DebtMaximum": "1234567890123456789"
+  },
+  "pre": {}
+ },
+ {
+  "base": "loan_set_xrp_overpayment_devnet_7129585",
+  "label": "unsigned, otherwise unchanged (control)",
+  "tx": {
+   "PaymentTotal": 3
+  },
+  "pre": {}
+ },
+ {
+  "base": "loan_set_xrp_overpayment_devnet_7129585",
+  "label": "LoanServiceFee 1e17+1 drops",
+  "tx": {
+   "LoanServiceFee": "100000000000000001"
+  },
+  "pre": {}
+ },
+ {
+  "base": "loan_set_xrp_overpayment_devnet_7129585",
+  "label": "LoanServiceFee 1.5 drops",
+  "tx": {
+   "LoanServiceFee": "1.5"
+  },
+  "pre": {}
+ },
+ {
+  "base": "loan_set_xrp_overpayment_devnet_7129585",
+  "label": "LatePaymentFee 1e17+1 drops",
+  "tx": {
+   "LatePaymentFee": "100000000000000001"
+  },
+  "pre": {}
+ },
+ {
+  "base": "loan_set_xrp_overpayment_devnet_7129585",
+  "label": "LatePaymentFee 1.5 drops",
+  "tx": {
+   "LatePaymentFee": "1.5"
+  },
+  "pre": {}
+ },
+ {
+  "base": "loan_set_xrp_overpayment_devnet_7129585",
+  "label": "ClosePaymentFee 1e17+1 drops",
+  "tx": {
+   "ClosePaymentFee": "100000000000000001"
+  },
+  "pre": {}
+ },
+ {
+  "base": "loan_set_xrp_overpayment_devnet_7129585",
+  "label": "ClosePaymentFee 1.5 drops",
+  "tx": {
+   "ClosePaymentFee": "1.5"
+  },
+  "pre": {}
+ },
+ {
+  "base": "loan_set_xrp_overpayment_devnet_7129585",
+  "label": "PrincipalRequested 1e17+1 drops",
+  "tx": {
+   "PrincipalRequested": "100000000000000001"
+  },
+  "pre": {}
+ },
+ {
+  "base": "loan_set_xrp_overpayment_devnet_7129585",
+  "label": "PrincipalRequested 10000.5 drops",
+  "tx": {
+   "PrincipalRequested": "10000.5"
+  },
+  "pre": {}
+ },
+ {
+  "base": "loan_set_xrp_overpayment_devnet_7129585",
+  "label": "LoanOriginationFee 1.5 drops",
+  "tx": {
+   "LoanOriginationFee": "1.5"
+  },
+  "pre": {}
+ },
+ {
+  "base": "loan_set_iou_interest_devnet_7129539",
+  "label": "unsigned, otherwise unchanged (control)",
+  "tx": {
+   "PaymentTotal": 3
+  },
+  "pre": {}
+ },
+ {
+  "base": "loan_set_iou_interest_devnet_7129539",
+  "label": "LoanServiceFee with 19 digits on IOU",
+  "tx": {
+   "LoanServiceFee": "1.234567890123456789"
+  },
+  "pre": {}
+ },
+ {
+  "base": "loan_set_iou_interest_devnet_7129539",
+  "label": "PrincipalRequested with 19 digits on IOU",
+  "tx": {
+   "PrincipalRequested": "100.0000000000000001"
+  },
+  "pre": {}
+ },
+ {
+  "base": "loan_broker_delete_iou_devnet_7129651",
+  "label": "5 USD of cover left: paid out to the owner (the issuer)",
+  "tx": {},
+  "pre": {
+   "4FCCB62164A538F0FBE969E13E2D0A65841F0090160DF343EE32729F80EA97F4": {
+    "CoverAvailable": "5"
+   },
+   "F75989C47A18CCA67E6A771AC8E2DF51253558F1D6A5844A8271BEA128A1857C": {
+    "Balance": {
+     "currency": "USD",
+     "issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji",
+     "value": "-5"
+    }
+   }
+  }
+ },
+ {
+  "base": "loan_broker_delete_iou_devnet_7129651",
+  "label": "5 USD of cover left, the pseudo-account's line frozen by the issuer",
+  "tx": {},
+  "pre": {
+   "4FCCB62164A538F0FBE969E13E2D0A65841F0090160DF343EE32729F80EA97F4": {
+    "CoverAvailable": "5"
+   },
+   "F75989C47A18CCA67E6A771AC8E2DF51253558F1D6A5844A8271BEA128A1857C": {
+    "Balance": {
+     "currency": "USD",
+     "issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji",
+     "value": "-5"
+    },
+    "Flags": 6422528
+   }
+  }
+ },
+ {
+  "base": "loan_broker_delete_iou_devnet_7129651",
+  "label": "DebtTotal 0.0000001 left (rounds to zero at the vault scale)",
+  "tx": {},
+  "pre": {
+   "4FCCB62164A538F0FBE969E13E2D0A65841F0090160DF343EE32729F80EA97F4": {
+    "DebtTotal": "0.0000001"
+   }
+  }
+ },
+ {
+  "base": "loan_broker_delete_iou_devnet_7129651",
+  "label": "OwnerCount 1 left on the broker",
+  "tx": {},
+  "pre": {
+   "4FCCB62164A538F0FBE969E13E2D0A65841F0090160DF343EE32729F80EA97F4": {
+    "OwnerCount": 1
+   }
+  }
+ },
+ {
+  "base": "loan_pay_iou_interest_devnet_7129541",
+  "label": "B1: issuer-side limit 9e95 on the borrower's and the broker owner's lines",
+  "tx": {},
+  "pre": {
+   "9B843E20EF0D2FAA26CED739169E487BF3BDF6D56000529B24EAE6A0BD15A786": {
+    "LowLimit.value": "9000000000000000e80"
+   },
+   "6D62A29BC2ABD306295B67DF6ECB22E82B179B6F930C0733AC0E02FCBBD438E5": {
+    "LowLimit.value": "9000000000000000e80"
+   }
+  }
+ },
+ {
+  "base": "loan_pay_iou_interest_devnet_7129541",
+  "label": "B1: issuer-side limit 9e95 on the borrower's and the vault pseudo-account's lines",
+  "tx": {},
+  "pre": {
+   "9B843E20EF0D2FAA26CED739169E487BF3BDF6D56000529B24EAE6A0BD15A786": {
+    "LowLimit.value": "9000000000000000e80"
+   },
+   "22B0661B6B030DD356B2E615A44102BB8DADE56FD09DCCBCC43C59376C4CD2E5": {
+    "HighLimit.value": "9000000000000000e80"
+   }
+  }
+ },
+ {
+  "base": "loan_pay_iou_interest_devnet_7129541",
+  "label": "B1: issuer-side limit 9e95 on the borrower's, vault's and broker pseudo-account's lines",
+  "tx": {},
+  "pre": {
+   "9B843E20EF0D2FAA26CED739169E487BF3BDF6D56000529B24EAE6A0BD15A786": {
+    "LowLimit.value": "9000000000000000e80"
+   },
+   "22B0661B6B030DD356B2E615A44102BB8DADE56FD09DCCBCC43C59376C4CD2E5": {
+    "HighLimit.value": "9000000000000000e80"
+   },
+   "EC0DEE98A1E890AA6D6C512FA22D42335E4E95C9F7BAF9D790F8AF4038875421": {
+    "HighLimit.value": "9000000000000000e80"
+   }
+  }
+ },
+ {
+  "base": "loan_pay_iou_interest_devnet_7129541",
+  "label": "B1: issuer-side limit 9e95 on the borrower's line only",
+  "tx": {},
+  "pre": {
+   "9B843E20EF0D2FAA26CED739169E487BF3BDF6D56000529B24EAE6A0BD15A786": {
+    "LowLimit.value": "9000000000000000e80"
+   }
+  }
+ }
+]
