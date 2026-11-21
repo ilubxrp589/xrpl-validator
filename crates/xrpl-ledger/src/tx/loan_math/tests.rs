@@ -523,6 +523,69 @@ fn a_schedule_paid_to_the_end_leaves_exactly_zero() {
     }
 }
 
+/// The same property over a spread of loans (a fixed pseudo-random walk over
+/// principal, rate, schedule, fee rate, asset and minimum scale): every loan
+/// `checkLoanGuards` accepts pays out to exactly zero in exactly its number
+/// of payments, each payment no more than the rounded periodic payment. The
+/// closed form (`power`) and the binomial branch both come up.
+#[test]
+fn every_admitted_loan_amortizes_to_zero() {
+    let _g = large();
+    let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = |bound: u64| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) % bound
+    };
+    let (mut admitted, mut refused, mut binomial) = (0, 0, 0);
+    for _ in 0..400 {
+        let asset = [IOU, MPT, HeldAsset::Xrp][next(3) as usize];
+        let principal = [1, 7, 100, 1000, 12_345, 1_000_000, 987_654_321][next(7) as usize] as i64;
+        let rate = [0, 1, 10, 500, 5_000, 10_000, 50_000, 100_000][next(8) as usize] as u32;
+        let payments = [1, 2, 3, 5, 12, 36, 120][next(7) as usize] as u32;
+        let interval = [60, 400, 3600, 86_400, MONTH][next(5) as usize];
+        let fee_rate = [0, 100, 1_000, 10_000][next(4) as usize] as u32;
+        let min_scale = if asset == IOU { [-15, -12, -10, -6, -2][next(5) as usize] } else { 0 };
+        let what = format!("{asset:?} {principal} at {rate} over {payments} x {interval}s, fee {fee_rate}, scale {min_scale}");
+        let p = compute_loan_properties(&R, asset, i(principal), rate, interval, payments, fee_rate, min_scale).unwrap();
+        if check_loan_guards(asset, i(principal), rate != 0, payments, &p).unwrap() != TxResult::Success
+            || !is_rounded(asset, i(principal), p.loan_scale).unwrap()
+        {
+            refused += 1;
+            continue;
+        }
+        admitted += 1;
+        let periodic_rate = loan_periodic_rate(rate, interval).unwrap();
+        if rate != 0 && periodic_rate.mul(num(payments as u64), A).unwrap() < n(1, -9) {
+            binomial += 1;
+        }
+        let mut loan = loan_of(asset, principal, rate, payments, fee_rate, min_scale, 1000, interval);
+        let broker = json!({"ManagementFeeRate": fee_rate});
+        let total_value = number_field(&loan, "TotalValueOutstanding");
+        let mut paid = LoanPaymentParts::ZERO;
+        let mut made = 0;
+        while uint(&loan, "PaymentRemaining") > 0 {
+            let due = round_periodic_payment(asset, number_field(&loan, "PeriodicPayment"), loan_scale_of(&loan)).unwrap();
+            let left = number_field(&loan, "TotalValueOutstanding");
+            let offer = if uint(&loan, "PaymentRemaining") == 1 { left } else { nmin(due, left) };
+            let parts = loan_make_payment(&R, 1001, asset, &mut loan, &broker, &amount(asset, offer), LoanPaymentType::Regular)
+                .unwrap()
+                .unwrap_or_else(|refused| panic!("{what}: payment {made} refused {refused:?}"));
+            let total = parts.principal_paid.add(parts.interest_paid, A).unwrap().add(parts.fee_paid, A).unwrap();
+            assert!(total <= offer && is_positive(&total), "{what}: payment {made} took {} of {}", show(total), show(offer));
+            paid.accumulate(&parts).unwrap();
+            made += 1;
+            assert!(made <= payments, "{what}: more payments than scheduled");
+        }
+        assert_eq!(made, payments, "{what}");
+        for field in ["PrincipalOutstanding", "TotalValueOutstanding", "ManagementFeeOutstanding"] {
+            assert!(loan.get(field).is_none(), "{what}: {field} left");
+        }
+        assert_eq!(paid.principal_paid, i(principal), "{what}: principal repaid");
+        assert_eq!(paid.principal_paid.add(paid.interest_paid, A).unwrap().add(paid.fee_paid, A).unwrap(), total_value, "{what}: value repaid");
+    }
+    assert!(admitted >= 60 && refused >= 1 && binomial >= 1, "{admitted} admitted, {refused} refused, {binomial} on the binomial branch");
+}
+
 /// LendingHelpers.cpp:1661-1733: several scheduled payments in one LoanPay,
 /// the service fee on each, the leftover ignored without tfLoanOverpayment.
 #[test]
