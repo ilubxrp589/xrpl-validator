@@ -2163,4 +2163,237 @@ mod tests {
         assert_eq!(alice_token["MPTAmount"], json!("25"), "the MPToken was created and paid");
         assert_eq!(do_withdraw(&mut sb, &tx, &ALICE, &ALICE, &PSEUDO, BALANCE, &units(&id, 1)), TxResult::TefInternal);
     }
+
+    // -----------------------------------------------------------------------
+    // The vault transactors' additions
+    // -----------------------------------------------------------------------
+
+    const LSF_LOW_FREEZE: u64 = 0x0040_0000;
+    const LSF_HIGH_FREEZE: u64 = 0x0080_0000;
+    const LSF_GLOBAL_FREEZE: u64 = 0x0040_0000;
+
+    /// TokenHelpers.cpp:219-262 (`checkDepositFreeze`): the issuer's global
+    /// freeze, the depositor's individual freeze unless it is the issuer,
+    /// and the pseudo-account's individual freeze each refuse — tecFROZEN
+    /// for an IOU, tecLOCKED for an MPT. XRP freezes nothing.
+    #[test]
+    fn check_deposit_freeze_reads_the_three_freezes() {
+        let st = state();
+        let sb = Sandbox::new(&st);
+        assert_eq!(check_deposit_freeze(&sb, &ALICE, &PSEUDO, &HeldAsset::Xrp), TxResult::Success);
+        assert_eq!(check_deposit_freeze(&sb, &ALICE, &PSEUDO, &USD), TxResult::Success, "no lines, no freeze");
+
+        // ALICE is the low account of her line: the issuer's side is High.
+        let mut st = state();
+        line(&mut st, ALICE, LSF_HIGH_FREEZE, "50", "1000");
+        let sb = Sandbox::new(&st);
+        assert_eq!(check_deposit_freeze(&sb, &ALICE, &PSEUDO, &USD), TxResult::Frozen, "the depositor's line is frozen");
+        assert_eq!(check_deposit_freeze(&sb, &BOB, &PSEUDO, &USD), TxResult::Success);
+        assert_eq!(check_deposit_freeze(&sb, &ISSUER, &PSEUDO, &USD), TxResult::Success, "the issuer deposits freely");
+
+        // PSEUDO sorts above ISSUER: the issuer's side of its line is Low.
+        let mut st = state();
+        line(&mut st, PSEUDO, LSF_LOW_FREEZE, "50", "0");
+        let sb = Sandbox::new(&st);
+        assert_eq!(check_deposit_freeze(&sb, &ALICE, &PSEUDO, &USD), TxResult::Frozen, "the vault's line is frozen");
+        assert_eq!(check_deposit_freeze(&sb, &ISSUER, &PSEUDO, &USD), TxResult::Frozen, "even for the issuer");
+
+        let mut st = state();
+        root_in(&mut st, ISSUER, LSF_DEFAULT_RIPPLE | LSF_GLOBAL_FREEZE, json!({}));
+        let sb = Sandbox::new(&st);
+        assert_eq!(check_deposit_freeze(&sb, &ALICE, &PSEUDO, &USD), TxResult::Frozen, "global");
+        assert_eq!(check_deposit_freeze(&sb, &ISSUER, &PSEUDO, &USD), TxResult::Frozen, "global, the issuer too");
+
+        let mut st = state();
+        let id = issuance(&mut st, mpt::LSF_MPT_CAN_TRANSFER, json!({}));
+        token(&mut st, &id, ALICE, mpt::LSF_MPT_LOCKED, 5);
+        token(&mut st, &id, BOB, 0, 5);
+        token(&mut st, &id, PSEUDO, 0, 5);
+        let sb = Sandbox::new(&st);
+        assert_eq!(check_deposit_freeze(&sb, &ALICE, &PSEUDO, &HeldAsset::Mpt(id)), TxResult::Locked);
+        assert_eq!(check_deposit_freeze(&sb, &BOB, &PSEUDO, &HeldAsset::Mpt(id)), TxResult::Success);
+        let mut st = state();
+        let id = issuance(&mut st, mpt::LSF_MPT_CAN_TRANSFER | mpt::LSF_MPT_LOCKED, json!({}));
+        let sb = Sandbox::new(&st);
+        assert_eq!(check_deposit_freeze(&sb, &ISSUER, &PSEUDO, &HeldAsset::Mpt(id)), TxResult::Locked, "a locked issuance");
+    }
+
+    /// TokenHelpers.cpp:160-217 (`checkWithdrawFreeze`): to the issuer always;
+    /// else the global freeze, the pseudo-account's individual freeze, the
+    /// submitter's individual freeze unless it withdraws to itself, and the
+    /// destination's deep freeze.
+    #[test]
+    fn check_withdraw_freeze_lets_a_frozen_holder_withdraw_to_itself() {
+        const LSF_LOW_DEEP_FREEZE: u64 = 0x0200_0000;
+        let mut st = state();
+        line(&mut st, ALICE, LSF_HIGH_FREEZE, "50", "1000");
+        line(&mut st, PSEUDO, 0, "50", "0");
+        let sb = Sandbox::new(&st);
+        assert_eq!(check_withdraw_freeze(&sb, &PSEUDO, &ALICE, &ALICE, &USD), TxResult::Success, "a plain freeze, to oneself");
+        assert_eq!(check_withdraw_freeze(&sb, &PSEUDO, &ALICE, &BOB, &USD), TxResult::Frozen, "the submitter is frozen");
+        assert_eq!(check_withdraw_freeze(&sb, &PSEUDO, &ALICE, &ISSUER, &USD), TxResult::Success, "to the issuer always");
+        assert_eq!(check_withdraw_freeze(&sb, &PSEUDO, &BOB, &ALICE, &USD), TxResult::Success, "a plain freeze still receives");
+        assert_eq!(check_withdraw_freeze(&sb, &PSEUDO, &BOB, &BOB, &HeldAsset::Xrp), TxResult::Success);
+
+        let mut st = state();
+        line(&mut st, ALICE, LSF_LOW_DEEP_FREEZE | LSF_HIGH_FREEZE, "50", "1000");
+        let sb = Sandbox::new(&st);
+        assert_eq!(check_withdraw_freeze(&sb, &PSEUDO, &ALICE, &ALICE, &USD), TxResult::Frozen, "deep-frozen destination");
+        assert_eq!(check_withdraw_freeze(&sb, &PSEUDO, &BOB, &ALICE, &USD), TxResult::Frozen);
+
+        let mut st = state();
+        line(&mut st, PSEUDO, LSF_LOW_FREEZE, "50", "0");
+        let sb = Sandbox::new(&st);
+        assert_eq!(check_withdraw_freeze(&sb, &PSEUDO, &ALICE, &ALICE, &USD), TxResult::Frozen, "the vault's line is frozen");
+        assert_eq!(check_withdraw_freeze(&sb, &PSEUDO, &ALICE, &ISSUER, &USD), TxResult::Success);
+
+        let mut st = state();
+        root_in(&mut st, ISSUER, LSF_DEFAULT_RIPPLE | LSF_GLOBAL_FREEZE, json!({}));
+        let sb = Sandbox::new(&st);
+        assert_eq!(check_withdraw_freeze(&sb, &PSEUDO, &ALICE, &ALICE, &USD), TxResult::Frozen);
+        assert_eq!(check_withdraw_freeze(&sb, &PSEUDO, &ALICE, &ISSUER, &USD), TxResult::Success, "the issuer under a global freeze");
+
+        let mut st = state();
+        let id = issuance(&mut st, mpt::LSF_MPT_CAN_TRANSFER, json!({}));
+        token(&mut st, &id, ALICE, mpt::LSF_MPT_LOCKED, 5);
+        token(&mut st, &id, PSEUDO, 0, 5);
+        let sb = Sandbox::new(&st);
+        // An MPT has no deeper freeze: a locked holder cannot receive either.
+        assert_eq!(check_withdraw_freeze(&sb, &PSEUDO, &ALICE, &ALICE, &HeldAsset::Mpt(id)), TxResult::Locked);
+        assert_eq!(check_withdraw_freeze(&sb, &PSEUDO, &ALICE, &BOB, &HeldAsset::Mpt(id)), TxResult::Locked);
+        assert_eq!(check_withdraw_freeze(&sb, &PSEUDO, &BOB, &BOB, &HeldAsset::Mpt(id)), TxResult::Success);
+        assert_eq!(check_withdraw_freeze(&sb, &PSEUDO, &ALICE, &ISSUER, &HeldAsset::Mpt(id)), TxResult::Success);
+    }
+
+    /// MPTokenHelpers.cpp:603-656: `WaiveMPTCanTransfer::Yes` passes an MPT
+    /// without lsfMPTCanTransfer (VaultWithdraw under fixCleanup3_2_0); a
+    /// missing issuance is still tecOBJECT_NOT_FOUND, and an IOU's rippling
+    /// rule is not waived.
+    #[test]
+    fn can_transfer_waived_skips_only_the_mpt_flag() {
+        let mut st = state();
+        root_in(&mut st, ISSUER, 0, json!({}));
+        line(&mut st, BOB, LSF_HIGH_NO_RIPPLE, "50", "1000");
+        let fixed = issuance(&mut st, 0, json!({}));
+        let sb = Sandbox::new(&st);
+        let asset = HeldAsset::Mpt(fixed);
+        assert_eq!(can_transfer_waive(&sb, &asset, &ALICE, &BOB, false), TxResult::NoAuth);
+        assert_eq!(can_transfer_waive(&sb, &asset, &ALICE, &BOB, true), TxResult::Success);
+        assert_eq!(can_transfer_waive(&sb, &HeldAsset::Mpt(mptid(99, ISSUER)), &ALICE, &BOB, true), TxResult::ObjectNotFound);
+        assert_eq!(can_transfer_waive(&sb, &USD, &BOB, &PSEUDO, true), TxResult::NoRipple);
+        assert_eq!(can_transfer(&sb, &asset, &ALICE, &BOB), TxResult::NoAuth, "the default is not waived");
+    }
+
+    /// TokenHelpers.cpp:325-476 with `SpendableHandling::FullBalance`: an
+    /// IOU holder's balance PLUS the limit the issuer set on its own side of
+    /// the line; the IOU issuer the largest IOU amount; an MPT issuer what it
+    /// may still mint; XRP and an MPT holder as the simple balance.
+    #[test]
+    fn account_holds_full_adds_what_the_issuer_allows() {
+        let _scale = large();
+        let mut st = state();
+        // ALICE is low: her limit is LowLimit, the issuer's is HighLimit.
+        let key = line(&mut st, ALICE, 0, "50", "1000");
+        let mut l: Value = serde_json::from_slice(&st.state_map.lookup(&key).unwrap()).unwrap();
+        l["HighLimit"]["value"] = json!("25");
+        put(&mut st, key, &l);
+        let id = issuance(&mut st, mpt::LSF_MPT_CAN_TRANSFER, json!({"MaximumAmount": "5000"}));
+        token(&mut st, &id, ALICE, 0, 7);
+        let sb = Sandbox::new(&st);
+        assert_eq!(account_holds_full(&sb, &ALICE, &USD, true, true).unwrap(), usd("75"));
+        assert_eq!(account_holds(&sb, &ALICE, &USD, true, true), usd("50"), "SimpleBalance is the line alone");
+        let issuer = account_holds_full(&sb, &ISSUER, &USD, true, true).unwrap();
+        assert_eq!((issuer.mantissa, issuer.exponent, issuer.negative), (9_999_999_999_999_999, 80, false));
+        assert_eq!(account_holds_full(&sb, &BOB, &USD, true, true).unwrap(), Amount::zero(USD), "no line");
+        assert_eq!(account_holds_full(&sb, &ISSUER, &HeldAsset::Mpt(id), true, true).unwrap(), units(&id, 4000), "5000 - 1000 outstanding");
+        assert_eq!(account_holds_full(&sb, &ALICE, &HeldAsset::Mpt(id), true, true).unwrap(), units(&id, 7));
+        assert_eq!(
+            account_holds_full(&sb, &ISSUER, &HeldAsset::Mpt(mptid(99, ISSUER)), true, true).unwrap(),
+            units(&mptid(99, ISSUER), 0),
+            "no issuance"
+        );
+        assert_eq!(account_holds_full(&sb, &ALICE, &HeldAsset::Xrp, true, true).unwrap(), account_holds(&sb, &ALICE, &HeldAsset::Xrp, true, true));
+
+        // A frozen line reads zero with ZeroIfFrozen — the limit is not added.
+        let mut st = state();
+        let key = line(&mut st, ALICE, LSF_HIGH_FREEZE, "50", "1000");
+        let mut l: Value = serde_json::from_slice(&st.state_map.lookup(&key).unwrap()).unwrap();
+        l["HighLimit"]["value"] = json!("25");
+        put(&mut st, key, &l);
+        let sb = Sandbox::new(&st);
+        assert_eq!(account_holds_full(&sb, &ALICE, &USD, true, true).unwrap(), Amount::zero(USD));
+        assert_eq!(account_holds_full(&sb, &ALICE, &USD, false, true).unwrap(), usd("75"));
+    }
+
+    /// 3.5.0-rc1 TokenHelpers.cpp:541-569 and STAmount.cpp:1766-1782:
+    /// `addTransferFee` is the amount times rate / 1e9 rounded UP,
+    /// `subtractTransferFee` the amount times 1e9 / rate rounded DOWN, both
+    /// exact (`mulRatio`); parity returns the amount.
+    #[test]
+    fn transfer_fee_is_added_up_and_subtracted_down() {
+        let _scale = large();
+        let mut st = state();
+        root_in(&mut st, ISSUER, LSF_DEFAULT_RIPPLE, json!({"TransferRate": 1_250_000_000u64}));
+        let id = issuance(&mut st, mpt::LSF_MPT_CAN_TRANSFER, json!({"TransferFee": 1000}));
+        let sb = Sandbox::new(&st);
+        assert_eq!(asset_transfer_rate(&sb, &HeldAsset::Xrp), 1_000_000_000);
+        assert_eq!(asset_transfer_rate(&sb, &USD), 1_250_000_000);
+        assert_eq!(asset_transfer_rate(&sb, &HeldAsset::Mpt(id)), 1_010_000_000, "1000 = 1%");
+        assert_eq!(asset_transfer_rate(&sb, &HeldAsset::Mpt(mptid(99, ISSUER))), 1_000_000_000, "no issuance");
+
+        assert_eq!(add_transfer_fee(&usd("100"), 1_250_000_000).unwrap(), usd("125"));
+        assert_eq!(subtract_transfer_fee(&usd("125"), 1_250_000_000).unwrap(), usd("100"));
+        assert_eq!(add_transfer_fee(&usd("100"), 1_000_000_000).unwrap(), usd("100"));
+        // 1/1.25 of 1 = 0.8; of 0.0000000000000001e-80 it underflows towards zero.
+        assert_eq!(subtract_transfer_fee(&usd("1"), 1_250_000_000).unwrap(), usd("0.8"));
+        // MPT: whole units. 1001 × 1.01 = 1011.01 → 1012 up; 1012 / 1.01 = 1001.98… → 1001 down.
+        assert_eq!(add_transfer_fee(&units(&id, 1001), 1_010_000_000).unwrap(), units(&id, 1012));
+        assert_eq!(subtract_transfer_fee(&units(&id, 1012), 1_010_000_000).unwrap(), units(&id, 1001));
+        assert_eq!(subtract_transfer_fee(&units(&id, 1), 1_010_000_000).unwrap(), units(&id, 0), "the fee eats one unit");
+        assert!(add_transfer_fee(&units(&id, mpt::MAX_MPT_AMOUNT), 2_000_000_000).is_err(), "past the largest MPT amount");
+    }
+
+    /// 3.5.0-rc1 View.cpp:507-588: with a source amount above the delivered
+    /// one the payout goes source → issuer for the gross and issuer →
+    /// destination for the net, each a direct leg; equal amounts take the old
+    /// path. The source must hold the gross amount.
+    #[test]
+    fn do_withdraw_split_redeems_the_gross_and_issues_the_net() {
+        let _scale = large();
+        let mut st = state();
+        line(&mut st, PSEUDO, 0, "500", "0");
+        line(&mut st, BOB, 0, "0", "1000");
+        let tx = withdraw_tx(json!({"Destination": hex::encode(BOB)}));
+        let mut sb = Sandbox::new(&st);
+        assert_eq!(do_withdraw_split(&mut sb, &tx, &ALICE, &BOB, &PSEUDO, BALANCE, &usd("80"), &usd("100")), TxResult::Success);
+        assert_eq!(account_holds(&sb, &PSEUDO, &USD, false, false), usd("400"), "the vault paid the gross 100");
+        assert_eq!(account_holds(&sb, &BOB, &USD, false, false), usd("80"), "BOB got the net 80");
+        assert_eq!(
+            do_withdraw_split(&mut sb, &tx, &ALICE, &BOB, &PSEUDO, BALANCE, &usd("400"), &usd("401")),
+            TxResult::TefInternal,
+            "the source holds less than the gross"
+        );
+        // Equal amounts: the plain send.
+        assert_eq!(do_withdraw_split(&mut sb, &tx, &ALICE, &BOB, &PSEUDO, BALANCE, &usd("10"), &usd("10")), TxResult::Success);
+        assert_eq!(account_holds(&sb, &PSEUDO, &USD, false, false), usd("390"));
+        assert_eq!(account_holds(&sb, &BOB, &USD, false, false), usd("90"));
+    }
+
+    /// 3.5.0-rc1 STAmount.cpp:448-462 (`isRepresentable`): whether
+    /// `STAmount{asset, value}` constructs — XRP up to 1e17 drops, an MPT up
+    /// to the largest MPT amount, an IOU up to exponent 80.
+    #[test]
+    fn is_representable_is_the_assets_range() {
+        let _scale = large();
+        let n = |m: u128, e: i32| crate::tx::number::Number::from_parts(false, m, e, crate::tx::number::Rounding::ToNearest).unwrap();
+        assert!(is_representable(&HeldAsset::Xrp, n(1, 17)));
+        assert!(!is_representable(&HeldAsset::Xrp, n(1_000_000_000_000_000_01, 0)), "1e17 + 1 drops");
+        assert!(is_representable(&HeldAsset::Xrp, n(0, 0)));
+        let id = HeldAsset::Mpt(mptid(7, ISSUER));
+        assert!(is_representable(&id, n(mpt::MAX_MPT_AMOUNT as u128, 0)));
+        assert!(!is_representable(&id, n(mpt::MAX_MPT_AMOUNT as u128 + 1, 0)));
+        assert!(is_representable(&USD, n(9_999_999_999_999_999, 80)));
+        assert!(!is_representable(&USD, n(1, 97)));
+        assert!(is_representable(&USD, n(1, -200)), "an IOU underflow is zero, not a throw");
+    }
 }
