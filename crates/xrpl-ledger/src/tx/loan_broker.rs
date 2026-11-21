@@ -539,6 +539,47 @@ impl Transactor for LoanBrokerCoverDepositTransactor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// LoanBrokerCoverWithdraw (LoanBrokerCoverWithdraw.cpp)
+// ---------------------------------------------------------------------------
+
+/// LoanBrokerCoverWithdraw (type 77): the broker's owner takes first-loss
+/// capital out, to itself or to sfDestination, down to the minimum cover the
+/// broker's debt requires (sfDebtTotal × sfCoverRateMinimum).
+///
+/// Fee: the plain base fee. Reserve: a withdrawal to oneself may create the
+/// holding the assets land in (`doWithdraw` → `addEmptyHolding`).
+pub struct LoanBrokerCoverWithdrawTransactor;
+
+/// The cover a broker must keep (LoanBrokerCoverWithdraw.cpp:172-186):
+/// under fixCleanup3_2_0 `minimumBrokerCover` — rounded up at the VAULT's
+/// scale; before it the same product rounded up at the scale of sfDebtTotal
+/// itself, all under one Upward guard.
+fn withdraw_minimum_cover(sandbox: &Sandbox, broker: &Value, vault: &Value, asset: HeldAsset) -> Result<Number, StError> {
+    let debt_total = number_field(broker, "DebtTotal");
+    let rate = uint_field(broker, "CoverRateMinimum") as u32;
+    if am::fix_cleanup_3_2_0(sandbox) {
+        return lh::minimum_broker_cover(debt_total, rate, vault);
+    }
+    let up = Rounding::Upward;
+    let raw = arith(tenth_bips_of_value(debt_total, rate, up))?;
+    round_to_asset(asset, raw, scale(debt_total, asset, up)?, up)
+}
+
+impl Transactor for LoanBrokerCoverWithdrawTransactor {
+    fn preflight(&self, _tx: &TxFields) -> TxResult {
+        TxResult::Unsupported
+    }
+
+    fn preclaim(&self, _tx: &TxFields, _sandbox: &Sandbox) -> TxResult {
+        TxResult::Unsupported
+    }
+
+    fn do_apply(&self, _tx: &TxFields, _sandbox: &mut Sandbox) -> TxResult {
+        TxResult::Unsupported
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1362,5 +1403,307 @@ mod tests {
         assert_eq!(r, TxResult::Success);
         assert_eq!(holds(&sb, &pseudo, &USD), usd("77"));
         assert!(number_field(&get(&sb, &broker).unwrap(), "CoverAvailable") == n("77"));
+    }
+
+    // -----------------------------------------------------------------------
+    // LoanBrokerCoverWithdraw
+    // -----------------------------------------------------------------------
+
+    fn cover_withdraw(account: [u8; 20], broker: &Hash256, amount: Value) -> TxFields {
+        tx("LoanBrokerCoverWithdraw", account, json!({"LoanBrokerID": key_hex(broker), "Amount": amount}))
+    }
+
+    fn cover_withdraw_to(account: [u8; 20], broker: &Hash256, amount: Value, destination: [u8; 20]) -> TxFields {
+        tx(
+            "LoanBrokerCoverWithdraw",
+            account,
+            json!({"LoanBrokerID": key_hex(broker), "Amount": amount, "Destination": hex::encode(destination)}),
+        )
+    }
+
+    /// An XRP broker of OWNER holding a cover of `drops`.
+    fn xrp_broker_with_cover(state: &mut LedgerState, drops: u64) -> (Hash256, [u8; 20], Hash256) {
+        let made = xrp_broker(state);
+        commit(state, &cover_deposit(OWNER, &made.0, json!(drops.to_string())));
+        made
+    }
+
+    /// A USD broker of OWNER holding a cover of `value` (OWNER keeps the rest
+    /// of its 1000 USD).
+    fn usd_broker_with_cover(state: &mut LedgerState, value: &str) -> (Hash256, [u8; 20], Hash256) {
+        let made = usd_broker(state);
+        commit(state, &cover_deposit(OWNER, &made.0, usd_json(value)));
+        made
+    }
+
+    /// An MPT broker of OWNER holding a cover of `value`.
+    fn mpt_broker_with_cover(state: &mut LedgerState, value: u64) -> (Hash256, [u8; 20], [u8; 24]) {
+        let made = mpt_broker(state);
+        commit(state, &cover_deposit(OWNER, &made.0, mpt_json(&made.2, value)));
+        made
+    }
+
+    /// LoanBrokerCoverWithdraw.cpp:26-61 (LoanBroker_test.cpp:417-421, :434-437:
+    /// a zero broker id temINVALID, a zero or negative amount temBAD_AMOUNT,
+    /// the zero destination temMALFORMED).
+    #[test]
+    fn cover_withdraw_preflight() {
+        let st = state();
+        let broker = Hash256([0xCD; 32]);
+        assert_eq!(result(&st, &cover_withdraw(OWNER, &Hash256([0; 32]), json!("10"))), TxResult::InvalidTx);
+        for amount in [json!("0"), json!("-10"), usd_json("0"), usd_json("-10")] {
+            assert_eq!(result(&st, &cover_withdraw(OWNER, &broker, amount.clone())), TxResult::BadAmount, "{amount}");
+        }
+        assert_eq!(result(&st, &cover_withdraw_to(OWNER, &broker, json!("10"), [0u8; 20])), TxResult::Malformed);
+        // sfCredentialIDs: needs Credentials and fixCleanup3_4_0; then the
+        // array's own rules (credentials::checkFields).
+        let with_credentials = |ids: Value| {
+            let mut t = cover_withdraw(OWNER, &broker, json!("10"));
+            t.fields["CredentialIDs"] = ids;
+            t
+        };
+        for off in [am::CREDENTIALS, am::FIX_CLEANUP_3_4_0] {
+            let st = state_with(&rules_without(&[off]));
+            assert_eq!(result(&st, &with_credentials(json!(["A1".repeat(32)]))), TxResult::Disabled, "{off}");
+            assert_ne!(result(&st, &cover_withdraw(OWNER, &broker, json!("10"))), TxResult::Disabled);
+        }
+        assert_eq!(result(&st, &with_credentials(json!([]))), TxResult::Malformed, "an empty array");
+        assert_eq!(result(&st, &with_credentials(json!(["A1".repeat(32), "A1".repeat(32)]))), TxResult::Malformed, "a repeated id");
+        assert_eq!(result(&st, &cover_withdraw(OWNER, &broker, json!("10"))), TxResult::NoEntry, "past preflight");
+    }
+
+    /// LoanBrokerCoverWithdraw.cpp:75-104 (LoanBroker_test.cpp:418, :421):
+    /// the pseudo-account destination comes first, then the broker, its
+    /// owner, the asset.
+    #[test]
+    fn cover_withdraw_preclaim_destination_broker_owner_and_asset() {
+        let mut st = state();
+        let (broker, pseudo, vault) = xrp_broker_with_cover(&mut st, 10_000);
+        let vault_pseudo = account_of(&get(&Sandbox::new(&st), &vault).unwrap(), "Account").unwrap();
+        for dst in [pseudo, vault_pseudo] {
+            assert_eq!(result(&st, &cover_withdraw_to(OWNER, &broker, json!("10"), dst)), TxResult::TecPseudoAccount);
+            // Before the broker is even looked up.
+            assert_eq!(result(&st, &cover_withdraw_to(OWNER, &Hash256([0xEE; 32]), json!("10"), dst)), TxResult::TecPseudoAccount);
+        }
+        assert_eq!(result(&st, &cover_withdraw(OWNER, &vault, json!("10"))), TxResult::NoEntry, "a vault's id");
+        assert_eq!(result(&st, &cover_withdraw(BOB, &broker, json!("10"))), TxResult::NoPermission);
+        assert_eq!(result(&st, &cover_withdraw(OWNER, &broker, usd_json("10"))), TxResult::WrongAsset);
+        assert_eq!(result(&st, &cover_withdraw(OWNER, &broker, json!("10"))), TxResult::Success);
+    }
+
+    /// LoanBrokerCoverWithdraw.cpp:127-148 (LoanBroker_test.cpp:424-432: to a
+    /// bystander with no line tecNO_LINE, with no MPToken tecNO_AUTH): a
+    /// payout to someone else is a transfer.
+    #[test]
+    fn cover_withdraw_to_a_third_party_is_checked_as_a_transfer() {
+        // XRP: the destination must exist; a required tag must be given.
+        let mut st = state();
+        let (broker, _, _) = xrp_broker_with_cover(&mut st, 10_000);
+        assert_eq!(result(&st, &cover_withdraw_to(OWNER, &broker, json!("10"), [0x99; 20])), TxResult::NoDst);
+        let mut tagged = st.clone();
+        edit(&mut tagged, keylet::account_root_key(&BOB), |a| a["Flags"] = json!(LSF_REQUIRE_DEST_TAG));
+        let to_bob = cover_withdraw_to(OWNER, &broker, json!("10"), BOB);
+        assert_eq!(result(&tagged, &to_bob), TxResult::DstTagNeeded);
+        let mut with_tag = to_bob.clone();
+        with_tag.fields["DestinationTag"] = json!(3);
+        assert_eq!(result(&tagged, &with_tag), TxResult::Success);
+        // A destination with lsfDepositAuth that has not preauthorized the owner.
+        let mut guarded = st.clone();
+        edit(&mut guarded, keylet::account_root_key(&BOB), |a| a["Flags"] = json!(0x0100_0000u64));
+        assert_eq!(result(&guarded, &to_bob), TxResult::NoPermission);
+        assert_eq!(result(&st, &to_bob), TxResult::Success);
+
+        // IOU: no line at the destination.
+        let mut st = state();
+        let (broker, _, _) = usd_broker_with_cover(&mut st, "100");
+        let to_bob = cover_withdraw_to(OWNER, &broker, usd_json("1"), BOB);
+        assert_eq!(result(&st, &to_bob), TxResult::NoLine);
+        // A line with room takes it; one without room does not.
+        let mut roomy = st.clone();
+        line(&mut roomy, BOB, 0, "0", "50");
+        assert_eq!(result(&roomy, &to_bob), TxResult::Success);
+        assert_eq!(result(&roomy, &cover_withdraw_to(OWNER, &broker, usd_json("51"), BOB)), TxResult::NoLine, "above the limit");
+
+        // MPT: no MPToken at the destination.
+        let mut st = state();
+        let (broker, _, id) = mpt_broker_with_cover(&mut st, 100);
+        let to_bob = cover_withdraw_to(OWNER, &broker, mpt_json(&id, 1), BOB);
+        assert_eq!(result(&st, &to_bob), TxResult::NoAuth);
+        let mut holder = st.clone();
+        token(&mut holder, &id, BOB, 0, 0);
+        assert_eq!(result(&holder, &to_bob), TxResult::Success);
+    }
+
+    /// LoanBrokerCoverWithdraw.cpp:150-167 (LoanBroker_test.cpp:2094
+    /// "LoanBrokerCoverWithdraw IOU self-withdrawal while individually
+    /// frozen", :2169 "IOU freeze checks", :2281 "MPT lock checks").
+    #[test]
+    fn cover_withdraw_freezes() {
+        let mut st = state();
+        let (broker, pseudo, _) = usd_broker_with_cover(&mut st, "100");
+        line(&mut st, BOB, 0, "0", "50");
+        let to_self = cover_withdraw(OWNER, &broker, usd_json("1"));
+        let to_bob = cover_withdraw_to(OWNER, &broker, usd_json("1"), BOB);
+        let to_issuer = cover_withdraw_to(OWNER, &broker, usd_json("1"), ISSUER);
+        let freeze = |st: &LedgerState, holder: [u8; 20]| {
+            let mut st = st.clone();
+            let issuer_side = if ISSUER < holder { LSF_LOW_FREEZE } else { LSF_HIGH_FREEZE };
+            edit(&mut st, keylet::ripple_state_key(&holder, &ISSUER, &USD_CODE), |l| {
+                l["Flags"] = json!(l["Flags"].as_u64().unwrap() | issuer_side)
+            });
+            st
+        };
+        // A global freeze stops everything but a payout to the issuer.
+        let mut global = st.clone();
+        edit(&mut global, keylet::account_root_key(&ISSUER), |a| a["Flags"] = json!(a["Flags"].as_u64().unwrap() | LSF_GLOBAL_FREEZE));
+        assert_eq!(result(&global, &to_self), TxResult::Frozen);
+        assert_eq!(result(&global, &to_bob), TxResult::Frozen);
+        assert_eq!(result(&global, &to_issuer), TxResult::Success);
+        // The pseudo-account frozen: nothing leaves, except to the issuer.
+        let frozen_pseudo = freeze(&st, pseudo);
+        assert_eq!(result(&frozen_pseudo, &to_self), TxResult::Frozen);
+        assert_eq!(result(&frozen_pseudo, &to_issuer), TxResult::Success);
+        // The owner individually frozen: it may still take its own funds
+        // out, but not send them on.
+        let frozen_owner = freeze(&st, OWNER);
+        assert_eq!(result(&frozen_owner, &to_self), TxResult::Success);
+        assert_eq!(result(&frozen_owner, &to_bob), TxResult::Frozen);
+
+        // MPT: the issuance locked.
+        let mut st = state();
+        let (broker, _, id) = mpt_broker_with_cover(&mut st, 100);
+        edit(&mut st, keylet::mpt_issuance_key(&id), |i| i["Flags"] = json!(i["Flags"].as_u64().unwrap() | mpt::LSF_MPT_LOCKED));
+        assert_eq!(result(&st, &cover_withdraw(OWNER, &broker, mpt_json(&id, 1))), TxResult::Locked);
+        assert_eq!(result(&st, &cover_withdraw_to(OWNER, &broker, mpt_json(&id, 1), ISSUER)), TxResult::Success);
+    }
+
+    /// LoanBrokerCoverWithdraw.cpp:106-119 with fixCleanup3_2_0: a cover
+    /// withdrawal does not consult lsfMPTCanTransfer ("an issuer cannot trap
+    /// a broker's first-loss capital"); before the fix it did.
+    #[test]
+    fn cover_withdraw_waives_mpt_can_transfer_under_fix_cleanup_3_2_0() {
+        let build = |rules: &[&'static str]| {
+            let mut st = state_with(rules);
+            let (broker, _, id) = mpt_broker_with_cover(&mut st, 100);
+            token(&mut st, &id, BOB, 0, 0);
+            edit(&mut st, keylet::mpt_issuance_key(&id), |i| {
+                i["Flags"] = json!(i["Flags"].as_u64().unwrap() & !mpt::LSF_MPT_CAN_TRANSFER)
+            });
+            (st, broker, id)
+        };
+        let (st, broker, id) = build(&MAINNET_WITH_LENDING);
+        assert_eq!(result(&st, &cover_withdraw_to(OWNER, &broker, mpt_json(&id, 1), BOB)), TxResult::Success);
+        let (st, broker, id) = build(&rules_without(&[am::FIX_CLEANUP_3_2_0]));
+        assert_eq!(result(&st, &cover_withdraw_to(OWNER, &broker, mpt_json(&id, 1), BOB)), TxResult::NoAuth);
+    }
+
+    /// LoanBrokerCoverWithdraw.cpp:169-203 (LoanBroker_test.cpp:422: more
+    /// than the cover tecINSUFFICIENT_FUNDS): the cover may not fall below
+    /// sfDebtTotal × sfCoverRateMinimum, rounded up at the vault's scale.
+    #[test]
+    fn cover_withdraw_keeps_the_minimum_cover() {
+        let mut st = state();
+        let (broker, _, _) = xrp_broker_with_cover(&mut st, 10_000);
+        assert_eq!(result(&st, &cover_withdraw(OWNER, &broker, json!("10001"))), TxResult::InsufficientFunds, "more than the cover");
+        assert_eq!(result(&st, &cover_withdraw(OWNER, &broker, json!("10000"))), TxResult::Success, "all of it, with no debt");
+        // A debt of 15 drops at 10%: the minimum is 1.5 → 2 drops.
+        edit(&mut st, broker, |b| {
+            b["DebtTotal"] = json!("15");
+            b["CoverRateMinimum"] = json!(10_000);
+            b["CoverRateLiquidation"] = json!(5_000);
+        });
+        assert_eq!(result(&st, &cover_withdraw(OWNER, &broker, json!("9999"))), TxResult::InsufficientFunds, "leaves 1 < 2");
+        assert_eq!(result(&st, &cover_withdraw(OWNER, &broker, json!("9998"))), TxResult::Success, "leaves exactly the minimum");
+        // The pseudo-account holding less than the cover says: refused.
+        let mut short = st.clone();
+        edit(&mut short, broker, |b| b["CoverAvailable"] = json!("20000"));
+        assert_eq!(result(&short, &cover_withdraw(OWNER, &broker, json!("15000"))), TxResult::InsufficientFunds);
+    }
+
+    /// LoanBrokerCoverWithdraw.cpp:106-109 → LendingHelpers.cpp:38-67
+    /// (LoanBroker_test.cpp:2886 "Cover precision guard: Withdraw").
+    #[test]
+    fn cover_withdraw_of_dust_below_the_cover_scale_is_precision_loss() {
+        let mut st = state();
+        line(&mut st, OWNER, 0, "200000", "1000000");
+        let (vault, _) = make_vault(&mut st, json!({"Asset": usd_asset()}));
+        let (broker, _) = make_broker(&mut st, &vault, json!({}));
+        commit(&mut st, &cover_deposit(OWNER, &broker, usd_json("100000")));
+        assert_eq!(result(&st, &cover_withdraw(OWNER, &broker, usd_json("0.00000000001"))), TxResult::PrecisionLoss);
+        assert_eq!(result(&st, &cover_withdraw(OWNER, &broker, usd_json("0.0000000001"))), TxResult::Success);
+    }
+
+    /// LoanBrokerCoverWithdraw.cpp:208-243 (LoanBroker_test.cpp:438-455:
+    /// withdraw 7 of 10, then 1 to evan, then 1 to evan with a tag): the
+    /// cover falls and the asset arrives — XRP, IOU, MPT; self and third party.
+    #[test]
+    fn cover_withdraw_pays_out_of_the_pseudo_account_and_lowers_the_cover() {
+        // XRP to oneself.
+        let mut st = state();
+        let (broker, pseudo, _) = xrp_broker_with_cover(&mut st, 10_000);
+        let before = Sandbox::new(&st);
+        let (r, sb) = apply(&st, &cover_withdraw(OWNER, &broker, json!("7000")));
+        assert_eq!(r, TxResult::Success);
+        assert!(number_field(&broker_of(&sb), "CoverAvailable") == n("3000"));
+        assert_eq!(xrp_of(&sb, &pseudo), 3_000);
+        assert_eq!(xrp_of(&sb, &OWNER), xrp_of(&before, &OWNER) + 7_000 - FEE);
+        // XRP to BOB.
+        let (r, sb) = apply(&st, &cover_withdraw_to(OWNER, &broker, json!("1000"), BOB));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(xrp_of(&sb, &BOB), BALANCE + 1_000);
+        assert_eq!(xrp_of(&sb, &OWNER), xrp_of(&before, &OWNER) - FEE);
+        assert!(number_field(&broker_of(&sb), "CoverAvailable") == n("9000"));
+        // All of it: the field goes (SoeDefault).
+        let (r, sb) = apply(&st, &cover_withdraw(OWNER, &broker, json!("10000")));
+        assert_eq!(r, TxResult::Success);
+        assert!(broker_of(&sb).get("CoverAvailable").is_none());
+        assert_eq!(xrp_of(&sb, &pseudo), 0);
+
+        // IOU, to oneself and to BOB.
+        let mut st = state();
+        let (broker, pseudo, _) = usd_broker_with_cover(&mut st, "100");
+        line(&mut st, BOB, 0, "0", "50");
+        let (r, sb) = apply(&st, &cover_withdraw(OWNER, &broker, usd_json("70.5")));
+        assert_eq!(r, TxResult::Success);
+        assert!(number_field(&broker_of(&sb), "CoverAvailable") == n("29.5"));
+        assert_eq!(holds(&sb, &pseudo, &USD), usd("29.5"));
+        assert_eq!(holds(&sb, &OWNER, &USD), usd("970.5"));
+        let (r, sb) = apply(&st, &cover_withdraw_to(OWNER, &broker, usd_json("10"), BOB));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(holds(&sb, &BOB, &USD), usd("10"));
+        assert_eq!(holds(&sb, &pseudo, &USD), usd("90"));
+        assert_eq!(holds(&sb, &OWNER, &USD), usd("900"), "the owner's own balance is untouched");
+
+        // MPT.
+        let mut st = state();
+        let (broker, pseudo, id) = mpt_broker_with_cover(&mut st, 100);
+        let asset = HeldAsset::Mpt(id);
+        let (r, sb) = apply(&st, &cover_withdraw(OWNER, &broker, mpt_json(&id, 60)));
+        assert_eq!(r, TxResult::Success);
+        assert!(number_field(&broker_of(&sb), "CoverAvailable") == n("40"));
+        assert_eq!(holds(&sb, &pseudo, &asset).mantissa, 40);
+        assert_eq!(holds(&sb, &OWNER, &asset).mantissa, 960);
+    }
+
+    /// LoanBrokerCoverWithdraw.cpp:144-148 and View.cpp:535-598 (`doWithdraw`):
+    /// an owner that no longer has the holding gets one with the payout.
+    #[test]
+    fn cover_withdraw_to_oneself_creates_the_missing_holding() {
+        let mut st = state();
+        let (broker, _, id) = mpt_broker_with_cover(&mut st, 100);
+        let asset = HeldAsset::Mpt(id);
+        let ikey = keylet::mpt_issuance_key(&id);
+        // The owner's MPToken emptied and gone.
+        edit(&mut st, ikey, |i| i["OutstandingAmount"] = json!("100"));
+        st.state_map.delete(&keylet::mptoken_key(&ikey, &OWNER)).unwrap();
+        let before = owners(&Sandbox::new(&st), &OWNER);
+        let (r, sb) = apply(&st, &cover_withdraw(OWNER, &broker, mpt_json(&id, 60)));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(holds(&sb, &OWNER, &asset).mantissa, 60);
+        assert_eq!(owners(&sb, &OWNER), before + 1, "the new MPToken is the owner's");
+        // An issuance that takes no new holders: refused in preclaim under
+        // fixCleanup3_4_0 (canAddHolding), not half-way through do_apply.
+        edit(&mut st, ikey, |i| i["Flags"] = json!(i["Flags"].as_u64().unwrap() & !mpt::LSF_MPT_CAN_TRANSFER));
+        assert_eq!(result(&st, &cover_withdraw(OWNER, &broker, mpt_json(&id, 60))), TxResult::NoAuth);
     }
 }
