@@ -1388,6 +1388,7 @@ mod tests {
         let _ = &vault;
         vec![
             tx("VaultCreate", OWNER, json!({"Asset": xrp_asset()})),
+            tx("VaultSet", OWNER, json!({"VaultID": vault, "Data": "00"})),
             tx("VaultDeposit", OWNER, json!({"VaultID": vault, "Amount": "100"})),
             tx("VaultWithdraw", OWNER, json!({"VaultID": vault, "Amount": "100"})),
         ]
@@ -2543,5 +2544,105 @@ mod tests {
             edit(&mut st, keylet::mpt_issuance_key(&id), |i| i["Flags"] = json!(0));
             assert_eq!(result(&st, &withdraw(BOB, &key, mpt_json(&id, 100))), want);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // VaultSet
+    // -----------------------------------------------------------------------
+
+    fn vault_set(account: [u8; 20], key: &Hash256, fields: Value) -> TxFields {
+        let mut all = json!({"VaultID": vault_hex(key)});
+        for (k, v) in fields.as_object().unwrap() {
+            all[k] = v.clone();
+        }
+        tx("VaultSet", account, all)
+    }
+
+    /// VaultSet.cpp:20-61 (VaultValidation_test.cpp:249 "disabled permissioned
+    /// domain", :376 "create or set invalid data", :409 "set nothing updated",
+    /// :442 "set negative maximum").
+    #[test]
+    fn vault_set_preflight() {
+        let st = state();
+        let key = Hash256([0xAB; 32]);
+        assert_eq!(result(&st, &vault_set(OWNER, &Hash256([0; 32]), json!({"Data": "00"}))), TxResult::Malformed);
+        assert_eq!(result(&st, &vault_set(OWNER, &key, json!({}))), TxResult::Malformed, "nothing to update");
+        assert_eq!(result(&st, &vault_set(OWNER, &key, json!({"Data": ""}))), TxResult::Malformed);
+        assert_eq!(result(&st, &vault_set(OWNER, &key, json!({"Data": "00".repeat(257)}))), TxResult::Malformed);
+        assert_eq!(result(&st, &vault_set(OWNER, &key, json!({"AssetsMaximum": "-1"}))), TxResult::Malformed);
+        assert_eq!(result(&st, &vault_set(OWNER, &key, json!({"Data": "00".repeat(256)}))), TxResult::NoEntry, "VaultValidation_test.cpp:598");
+        assert_eq!(result(&st, &vault_set(OWNER, &key, json!({"DomainID": "00".repeat(32)}))), TxResult::NoEntry, "a zero DomainID is legal here");
+        let st = state_with(&rules_without(&[am::PERMISSIONED_DOMAINS]));
+        assert_eq!(result(&st, &vault_set(OWNER, &key, json!({"DomainID": "D0".repeat(32)}))), TxResult::Disabled);
+        assert_eq!(result(&st, &vault_set(OWNER, &key, json!({"Data": "00"}))), TxResult::NoEntry);
+    }
+
+    /// VaultSet.cpp:63-178: only the owner; Data replaced; AssetsMaximum set,
+    /// cleared with zero, refused below the vault's total (tecLIMIT_EXCEEDED).
+    #[test]
+    fn vault_set_data_and_assets_maximum() {
+        let mut st = state();
+        let (key, _, _) = xrp_vault_with_deposit(&mut st, 1000);
+        assert_eq!(result(&st, &vault_set(BOB, &key, json!({"Data": "00"}))), TxResult::NoPermission);
+        let (r, sb) = apply(&st, &vault_set(OWNER, &key, json!({"Data": "beef", "AssetsMaximum": "1000"})));
+        assert_eq!(r, TxResult::Success);
+        let vault = get(&sb, &key).unwrap();
+        assert_eq!((&vault["Data"], &vault["AssetsMaximum"]), (&json!("BEEF"), &json!("1000")), "the total itself is allowed");
+        assert_eq!(result(&st, &vault_set(OWNER, &key, json!({"AssetsMaximum": "999"}))), TxResult::LimitExceeded);
+        commit(&mut st, &vault_set(OWNER, &key, json!({"AssetsMaximum": "5000"})));
+        let (r, sb) = apply(&st, &vault_set(OWNER, &key, json!({"AssetsMaximum": "0"})));
+        assert_eq!(r, TxResult::Success);
+        assert!(get(&sb, &key).unwrap().get("AssetsMaximum").is_none(), "zero is no limit: SoeDefault, absent");
+        // A fraction of a drop rounds to the asset (associateAsset).
+        let (r, sb) = apply(&st, &vault_set(OWNER, &key, json!({"AssetsMaximum": "2000.6"})));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(get(&sb, &key).unwrap()["AssetsMaximum"], json!("2001"));
+    }
+
+    /// 3.5.0-rc1 VaultSet.cpp:80-88: with fixCleanup3_5_0 an AssetsMaximum out
+    /// of the asset's range is tecPRECISION_LOSS; without it rippled throws
+    /// in associateAsset — tefEXCEPTION.
+    #[test]
+    fn vault_set_assets_maximum_out_of_range() {
+        let mut st = state_with(&rules_with(&[am::FIX_CLEANUP_3_5_0]));
+        let (key, _, _) = make_vault(&mut st, json!({"Asset": xrp_asset()}));
+        let (r, sb) = apply(&st, &vault_set(OWNER, &key, json!({"AssetsMaximum": "1e18"})));
+        assert_eq!(r, TxResult::PrecisionLoss);
+        assert_eq!(sb.modification_count(), 1, "the fee is claimed");
+        let mut st = state();
+        let (key, _, _) = make_vault(&mut st, json!({"Asset": xrp_asset()}));
+        let (r, sb) = apply(&st, &vault_set(OWNER, &key, json!({"AssetsMaximum": "1e18"})));
+        assert_eq!(r, TxResult::TefException);
+        assert_eq!(sb.modification_count(), 0);
+    }
+
+    /// VaultSet.cpp:87-111, :152-168: the domain of a private vault lives on
+    /// its share issuance — set, replaced, cleared with zero; a public vault
+    /// has none (tecNO_PERMISSION); the domain must exist.
+    #[test]
+    fn vault_set_domain() {
+        let mut st = state();
+        let (domain, _) = domain_with_member(&mut st, BOB, None);
+        let other = Hash256([0xD1; 32]);
+        put(&mut st, other, &json!({"LedgerEntryType": "PermissionedDomain", "Owner": hex::encode(ISSUER), "Flags": 0, "AcceptedCredentials": []}));
+        let (key, _, share) = make_vault(&mut st, json!({"Asset": xrp_asset(), "Flags": TF_VAULT_PRIVATE}));
+        let share_key = keylet::mpt_issuance_key(&share);
+        assert_eq!(result(&st, &vault_set(OWNER, &key, json!({"DomainID": "EE".repeat(32)}))), TxResult::ObjectNotFound);
+        let (r, sb) = apply(&st, &vault_set(OWNER, &key, json!({"DomainID": hex::encode_upper(domain.0)})));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(get(&sb, &share_key).unwrap()["DomainID"], json!(hex::encode_upper(domain.0)));
+        assert!(!sb.modifications().contains_key(&key) || get(&sb, &key).unwrap().get("DomainID").is_none(), "nothing of it on the vault");
+        commit(&mut st, &vault_set(OWNER, &key, json!({"DomainID": hex::encode_upper(domain.0)})));
+        let (r, sb) = apply(&st, &vault_set(OWNER, &key, json!({"DomainID": hex::encode_upper(other.0)})));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(get(&sb, &share_key).unwrap()["DomainID"], json!(hex::encode_upper(other.0)));
+        let (r, sb) = apply(&st, &vault_set(OWNER, &key, json!({"DomainID": "00".repeat(32)})));
+        assert_eq!(r, TxResult::Success);
+        assert!(get(&sb, &share_key).unwrap().get("DomainID").is_none());
+
+        let mut st = state();
+        let (domain, _) = domain_with_member(&mut st, BOB, None);
+        let (key, _, _) = make_vault(&mut st, json!({"Asset": xrp_asset()}));
+        assert_eq!(result(&st, &vault_set(OWNER, &key, json!({"DomainID": hex::encode_upper(domain.0)}))), TxResult::NoPermission);
     }
 }
