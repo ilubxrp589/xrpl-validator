@@ -1114,3 +1114,73 @@ mod tests {
         assert_eq!(cred["Expiration"], 10u64);
     }
 }
+
+/// fixCleanup3_3_0 — CredentialCreate.cpp:101-105: a pseudo-account (an AMM
+/// pool's account today; a vault's or loan broker's later) cannot be a
+/// credential's subject — tecPSEUDO_ACCOUNT, after the tecNO_TARGET and
+/// tecDUPLICATE tests.
+#[cfg(test)]
+mod pseudo_subject_tests {
+    use super::*;
+    use crate::ledger::amendments as am;
+    use crate::ledger::header::LedgerHeader;
+    use crate::ledger::sandbox::Sandbox;
+    use crate::ledger::state::LedgerState;
+    use xrpl_core::types::Hash256;
+
+    #[test]
+    fn fixcleanup330_refuses_a_credential_whose_subject_is_a_pseudo_account() {
+        let issuer = [0x01u8; 20];
+        let plain = [0x02u8; 20];
+        let pseudos = [([0x41u8; 20], "AMMID"), ([0x42u8; 20], "VaultID"), ([0x43u8; 20], "LoanBrokerID")];
+        let build = |amendments: &[&str]| {
+            let mut state = LedgerState::new_unverified(LedgerHeader {
+                sequence: 100, total_coins: 100_000_000_000_000_000,
+                parent_hash: Hash256([0; 32]), transaction_hash: Hash256([0; 32]), account_hash: Hash256([0; 32]),
+                parent_close_time: 0, close_time: 10, close_time_resolution: 10, close_flags: 0,
+            });
+            let mut put = |id: [u8; 20], designator: Option<&str>| {
+                let mut a = serde_json::json!({
+                    "LedgerEntryType": "AccountRoot", "Account": hex::encode(id), "Balance": "50000000",
+                    "Sequence": 1, "OwnerCount": 0, "Flags": 0,
+                });
+                if let Some(f) = designator {
+                    a[f] = serde_json::json!("AB".repeat(32));
+                }
+                state.state_map.insert(keylet::account_root_key(&id), serde_json::to_vec(&a).unwrap()).unwrap();
+            };
+            put(issuer, None);
+            put(plain, None);
+            for (id, f) in pseudos {
+                put(id, Some(f));
+            }
+            let amend = serde_json::json!({"LedgerEntryType": "Amendments", "Flags": 0, "Amendments": amendments});
+            state.state_map.insert(keylet::amendments_key(), serde_json::to_vec(&amend).unwrap()).unwrap();
+            state
+        };
+        let create = |subject: [u8; 20]| TxFields {
+            account: issuer, tx_type: "CredentialCreate".to_string(), fee: 12, sequence: 1, ticket_seq: None,
+            last_ledger_seq: None,
+            fields: serde_json::json!({"Subject": hex::encode(subject), "CredentialType": "KYC"}),
+            inner_batch: false,
+        };
+        let apply = |state: &LedgerState, subject: [u8; 20]| {
+            let mut sb = Sandbox::new(state);
+            let r = CredentialCreateTransactor.do_apply(&create(subject), &mut sb);
+            (r, sb.exists(&credential_key(&subject, &issuer, b"KYC")))
+        };
+        let before = build(&[]);
+        let after = build(&[am::FIX_CLEANUP_3_3_0]);
+        for (id, f) in pseudos {
+            assert_eq!(apply(&before, id), (TxResult::Success, true), "before the amendment {f}");
+            assert_eq!(apply(&after, id), (TxResult::TecPseudoAccount, false), "{f}");
+        }
+        assert_eq!(apply(&after, plain), (TxResult::Success, true), "an ordinary subject");
+        assert_eq!(apply(&after, [0x99u8; 20]).0, TxResult::NoTarget, "a missing subject is judged first");
+        // The duplicate test comes before the pseudo-account one (:95-99).
+        let mut dup = after.clone();
+        let amm = pseudos[0].0;
+        dup.state_map.insert(credential_key(&amm, &issuer, b"KYC"), b"{}".to_vec()).unwrap();
+        assert_eq!(apply(&dup, amm).0, TxResult::Duplicate);
+    }
+}

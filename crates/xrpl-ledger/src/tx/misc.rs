@@ -1986,3 +1986,69 @@ impl Transactor for PermissionedDomainDeleteTransactor {
 
 
 }
+
+/// fixCleanup3_3_0 — DepositPreauth.cpp:110-114: a pseudo-account cannot be
+/// preauthorized — tecPSEUDO_ACCOUNT, after tecNO_TARGET and before
+/// tecDUPLICATE.
+#[cfg(test)]
+mod pseudo_preauth_tests {
+    use super::*;
+    use crate::ledger::amendments as am;
+    use crate::ledger::header::LedgerHeader;
+    use crate::ledger::state::LedgerState;
+    use xrpl_core::types::Hash256;
+
+    #[test]
+    fn fixcleanup330_refuses_to_preauthorize_a_pseudo_account() {
+        let owner = [0x01u8; 20];
+        let plain = [0x02u8; 20];
+        let pseudos = [([0x41u8; 20], "AMMID"), ([0x42u8; 20], "VaultID"), ([0x43u8; 20], "LoanBrokerID")];
+        let build = |amendments: &[&str]| {
+            let mut state = LedgerState::new_unverified(LedgerHeader {
+                sequence: 100, total_coins: 100_000_000_000_000_000,
+                parent_hash: Hash256([0; 32]), transaction_hash: Hash256([0; 32]), account_hash: Hash256([0; 32]),
+                parent_close_time: 0, close_time: 10, close_time_resolution: 10, close_flags: 0,
+            });
+            let mut put = |id: [u8; 20], designator: Option<&str>| {
+                let mut a = serde_json::json!({
+                    "LedgerEntryType": "AccountRoot", "Account": hex::encode(id), "Balance": "50000000",
+                    "Sequence": 1, "OwnerCount": 0, "Flags": 0,
+                });
+                if let Some(f) = designator {
+                    a[f] = serde_json::json!("AB".repeat(32));
+                }
+                state.state_map.insert(keylet::account_root_key(&id), serde_json::to_vec(&a).unwrap()).unwrap();
+            };
+            put(owner, None);
+            put(plain, None);
+            for (id, f) in pseudos {
+                put(id, Some(f));
+            }
+            let amend = serde_json::json!({"LedgerEntryType": "Amendments", "Flags": 0, "Amendments": amendments});
+            state.state_map.insert(keylet::amendments_key(), serde_json::to_vec(&amend).unwrap()).unwrap();
+            state
+        };
+        let verdict = |state: &LedgerState, authorize: [u8; 20]| {
+            let tx = TxFields {
+                account: owner, tx_type: "DepositPreauth".to_string(), fee: 12, sequence: 1, ticket_seq: None,
+                last_ledger_seq: None, fields: serde_json::json!({"Authorize": hex::encode(authorize)}), inner_batch: false,
+            };
+            DepositPreauthTransactor.preclaim(&tx, &Sandbox::new(state))
+        };
+        let before = build(&[]);
+        let after = build(&[am::FIX_CLEANUP_3_3_0]);
+        for (id, f) in pseudos {
+            assert_eq!(verdict(&before, id), TxResult::Success, "before the amendment {f}");
+            assert_eq!(verdict(&after, id), TxResult::TecPseudoAccount, "{f}");
+        }
+        assert_eq!(verdict(&after, plain), TxResult::Success, "an ordinary account");
+        assert_eq!(verdict(&after, [0x99u8; 20]), TxResult::NoTarget, "a missing account is judged first");
+        // The pseudo-account test comes before the duplicate one (:110-119).
+        let mut dup = after.clone();
+        let amm = pseudos[0].0;
+        dup.state_map.insert(keylet::deposit_preauth_key(&owner, &amm), b"{}".to_vec()).unwrap();
+        assert_eq!(verdict(&dup, amm), TxResult::TecPseudoAccount);
+        dup.state_map.insert(keylet::deposit_preauth_key(&owner, &plain), b"{}".to_vec()).unwrap();
+        assert_eq!(verdict(&dup, plain), TxResult::Duplicate);
+    }
+}
