@@ -791,7 +791,7 @@ pub(crate) fn stamount_signed_add(aneg: bool, a: Me, bneg: bool, b: Me) -> (bool
     // `IOUAmount::fromNumber`: back to sixteen digits (a no-op at the Small
     // scale, the sum's one rounding at Large330).
     match x.add(y, Rounding::ToNearest).and_then(|r| r.iou_parts(Rounding::ToNearest)) {
-        Ok((_, m, e)) if m == 0 || e < -96 || e > 80 => (false, (0, 0)),
+        Ok((_, m, e)) if m == 0 || !(-96..=80).contains(&e) => (false, (0, 0)),
         Ok((negative, m, e)) => (negative, (m as u128, e)),
         Err(_) => (false, (0, 0)),
     }

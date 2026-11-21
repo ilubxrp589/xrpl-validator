@@ -523,7 +523,7 @@ fn rep_of(negative: bool, mantissa: u128, exponent: i32, mode: Rounding, range: 
 /// `upper_limit`, and only then drop what is left.
 fn adjust(g: &mut Guard, upper_limit: u128, expand_m: &mut u128, expand_e: &mut i32, shrink_m: &mut u128, shrink_e: &mut i32) {
     if g.range.fix330 {
-        while *shrink_e < *expand_e && *shrink_m % 10 == 0 {
+        while *shrink_e < *expand_e && (*shrink_m).is_multiple_of(10) {
             g.drop_digit(shrink_m, shrink_e);
         }
         while *shrink_e < *expand_e && *expand_e > K_MIN_EXPONENT && *expand_m < upper_limit {
@@ -591,7 +591,7 @@ impl Number {
         *self == Number::ZERO
             || (scale.min_mantissa() <= self.mantissa
                 && self.mantissa <= scale.max_mantissa()
-                && (m <= K_MAX_REP || m % 10 == 0)
+                && (m <= K_MAX_REP || m.is_multiple_of(10))
                 && (K_MIN_EXPONENT..=K_MAX_EXPONENT).contains(&self.exponent))
     }
 
@@ -753,7 +753,7 @@ impl Number {
                     zm = zm * CORRECTION + correction;
                     ze -= 5;
                 }
-                dropped = partial % dm != 0;
+                dropped = !partial.is_multiple_of(dm);
             }
         }
         normalize(&mut zn, &mut zm, &mut ze, Range::of(scale), dropped, mode)?;
@@ -784,7 +784,7 @@ impl Number {
         }
         let mut r = self.power(n / 2, mode)?;
         r = r.mul(r, mode)?;
-        if n % 2 != 0 {
+        if !n.is_multiple_of(2) {
             r = r.mul(self, mode)?;
         }
         Ok(r)
@@ -809,7 +809,7 @@ impl Number {
             }
             return Err(NumberError::Overflow);
         }
-        if f.negative && !f.is_zero() && d % 2 == 0 {
+        if f.negative && !f.is_zero() && d.is_multiple_of(2) {
             return Err(NumberError::Overflow);
         }
         if f.is_zero() {
@@ -913,7 +913,7 @@ impl Number {
             return Ok(one);
         }
         let (n, d) = (n / g, d / g);
-        if n % 2 == 1 && d % 2 == 0 && self.negative && !self.is_zero() {
+        if !n.is_multiple_of(2) && d.is_multiple_of(2) && self.negative && !self.is_zero() {
             return Err(NumberError::Overflow);
         }
         self.power(n, mode)?.root(d, mode)

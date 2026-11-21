@@ -42,7 +42,7 @@ impl IouAmount {
         let Ok((negative, mantissa, exponent)) = n.iou_parts(Rounding::ToNearest) else {
             return IouAmount::ZERO;
         };
-        if mantissa == 0 || exponent < K_MIN_OFFSET || exponent > K_MAX_OFFSET {
+        if mantissa == 0 || !(K_MIN_OFFSET..=K_MAX_OFFSET).contains(&exponent) {
             return IouAmount::ZERO;
         }
         IouAmount { negative, mantissa, exponent }
