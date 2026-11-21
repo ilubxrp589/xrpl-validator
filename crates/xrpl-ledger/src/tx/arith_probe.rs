@@ -56,7 +56,9 @@ pub fn number_op(op: u8, a: Me, b: Me, mode: u8) -> Me {
 }
 /// `Number` ops through the literal port (`tx::number`), signed: 0 add, 1 sub,
 /// 2 mul, 3 div, 4 root2 (unary; `b` ignored); mode 0 nearest, 1 towards-zero, 2 down, 3 up. `Err` where
-/// rippled throws (overflow, divide by zero).
+/// rippled throws (overflow, divide by zero). Runs at the thread's mantissa
+/// scale (`tx::number::ScaleGuard`) and returns the EXTERNAL mantissa and
+/// exponent, as the shim's `Number::mantissa()` / `exponent()` do.
 pub fn number_op_signed(op: u8, a: (i64, i32), b: (i64, i32), mode: u8) -> Result<(i64, i32), String> {
     use super::number::{Number, Rounding};
     let mode = match mode { 1 => Rounding::TowardsZero, 2 => Rounding::Downward, 3 => Rounding::Upward, _ => Rounding::ToNearest };
@@ -70,7 +72,7 @@ pub fn number_op_signed(op: u8, a: (i64, i32), b: (i64, i32), mode: u8) -> Resul
         _ => x.root2(mode),
     }
     .map_err(|e| format!("{e:?}"))?;
-    Ok((r.signed_mantissa(), r.exponent))
+    Ok(r.external())
 }
 /// `XRPAmount{Number}` — `Number::operator rep()` under `mode` (0 nearest,
 /// 1 towards-zero, 2 down, 3 up), through the port.

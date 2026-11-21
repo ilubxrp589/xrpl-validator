@@ -280,3 +280,144 @@ fn arithmetic_agrees_with_libxrpl() {
     }
     assert_eq!(total_mismatch, 0, "arithmetic disagrees with libxrpl — see the table above");
 }
+
+/// One operand for the Large330 fuzz: a signed 64-bit mantissa and an
+/// exponent, as `Number(rep, int)` takes them. The shapes aim at what the
+/// 19-digit scale adds: the range ends (1e18, 1e19 − 1), the int64 cusp
+/// (`kMaxRep` = 2^63 − 1 and the three values up to `kMaxRepUp`, which only
+/// an exponent of +1 can spell), mantissas above `kMaxRep` (held as a
+/// multiple of ten), and ordinary 16-digit IOU mantissas being widened.
+fn large_operand(rng: &mut Rng) -> (i64, i32) {
+    const K_MAX: u64 = i64::MAX as u64;
+    let (m, lift): (u64, i32) = match rng.next() % 12 {
+        0 => (1_000_000_000_000_000_000, 0),
+        1 => (K_MAX - rng.range(0, 12), 0),
+        // (kMaxRep/10 − 2 ..= kMaxRep/10 + 3) × 10: straddles kMaxRep and kMaxRepUp.
+        2 => (K_MAX / 10 - 2 + rng.range(0, 5), 1),
+        // 18 digits × 10 above kMaxRep: an internal mantissa past int64.
+        3 => (rng.range(K_MAX / 10 + 1, 999_999_999_999_999_999), 1),
+        4 => (rng.range(1_000_000_000_000_000_000, 1_000_000_000_000_000_999), 0),
+        5 => (rng.range(1, 999), 0),
+        // A canonical IOU mantissa (16 digits).
+        6 => (rng.mantissa(), 0),
+        // Any digit count.
+        7 => ((rng.next() >> (rng.next() % 60)).clamp(1, K_MAX), 0),
+        // Trailing zeros: Enabled330's alignment strips them first.
+        8 => (rng.range(1, 9_999_999) * 1_000_000_000_000, 0),
+        _ => (rng.range(1_000_000_000_000_000_000, K_MAX), 0),
+    };
+    let e = match rng.next() % 50 {
+        0 => rng.exponent(-32768, -32700),
+        1 => rng.exponent(32700, 32767),
+        2..=20 => rng.exponent(-3, 3),
+        _ => rng.exponent(-45, 45),
+    };
+    let m = m as i64;
+    (if rng.next() % 4 == 0 { -m } else { m }, e + lift)
+}
+
+/// `Number` at the 19-digit Large330 scale — the scale rippled switches every
+/// transaction to once SingleAssetVault or LendingProtocol is enabled
+/// (Rules.cpp:35-74) — against libxrpl's own, operation by operation: add,
+/// sub, mul, div, root2 and `operator rep()` under all four rounding modes,
+/// plus the IOU sum and difference (`IOUAmount::operator+=`: nineteen digits
+/// rounded once to sixteen). Both sides see the external mantissa and
+/// exponent; a throw on one side must be a throw on the other.
+///
+/// Deterministic like the Small test: ARITH_FUZZ_SEED, ARITH_FUZZ_N.
+#[test]
+fn number_agrees_with_libxrpl_at_large330() {
+    use xrpl_ledger::tx::number::{mantissa_scale, MantissaScale, ScaleGuard};
+    let seed = std::env::var("ARITH_FUZZ_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0x9E37_79B9_7F4A_7C15u64);
+    let n: u64 = std::env::var("ARITH_FUZZ_N").ok().and_then(|s| s.parse().ok()).unwrap_or(20_000);
+    // libxrpl's scale is a thread-local, as ours is: both set for this test's thread.
+    arith::set_scale(true);
+    let _scale = ScaleGuard::new(MantissaScale::Large330);
+    assert_eq!(mantissa_scale(), MantissaScale::Large330);
+    let mut rng = Rng(seed ^ 0x330);
+    let mut t: std::collections::BTreeMap<String, Tally> = Default::default();
+    let mut both_threw = 0u64;
+    const MODE: [&str; 4] = ["nearest", "towards-zero", "down", "up"];
+    const OP: [&str; 5] = ["add", "sub", "mul", "div", "root2"];
+
+    for _ in 0..n {
+        let a = large_operand(&mut rng);
+        let b = large_operand(&mut rng);
+        // A second partner close to `a`: the alignment and the borrow loop
+        // only work when the exponents are within a few digits.
+        let near = {
+            let c = large_operand(&mut rng);
+            (c.0, a.1 + rng.exponent(-22, 22))
+        };
+        let drops = (large_operand(&mut rng).0, rng.exponent(-25, 2));
+        for mode in 0u8..4 {
+            for (op, name) in OP.iter().enumerate() {
+                for (label, y) in [("", b), (" near", near)] {
+                    // root2 is unary and throws below zero: one positive run.
+                    let x = if op == 4 { (a.0.abs(), a.1) } else { a };
+                    if op == 4 && !label.is_empty() {
+                        continue;
+                    }
+                    let key = format!("L330 Number {name}{label} {}", MODE[mode as usize]);
+                    let theirs = arith::number_op(op as i32, x, y, mode as i32);
+                    let mine = ours::number_op_signed(op as u8, x, y, mode);
+                    let ok = match (&theirs, &mine) {
+                        (Ok((m, e)), Ok((om, oe))) => om == m && (*m == 0 || oe == e),
+                        (Err(_), Err(_)) => {
+                            both_threw += 1;
+                            true
+                        }
+                        _ => false,
+                    };
+                    t.entry(key).or_default().note(ok, || format!("{}e{} {name} {}e{} mode {} -> libxrpl {:?} ours {:?}", x.0, x.1, y.0, y.1, MODE[mode as usize], theirs, mine));
+                }
+            }
+            // `operator rep()`: XRP drops and MPT units out of a Number.
+            let key = format!("L330 Number to_drops {}", MODE[mode as usize]);
+            let theirs = arith::number_op(NUM_TO_DROPS, drops, (1, 0), mode as i32).map(|(d, _)| d);
+            let mine = ours::number_to_drops(drops, mode);
+            let ok = match (&theirs, &mine) {
+                (Ok(d), Ok(od)) => d == od,
+                (Err(_), Err(_)) => {
+                    both_threw += 1;
+                    true
+                }
+                _ => false,
+            };
+            t.entry(key).or_default().note(ok, || format!("{}e{} mode {} -> libxrpl {:?} ours {:?}", drops.0, drops.1, MODE[mode as usize], theirs, mine));
+        }
+        // --- STAmount add / sub (IOU) at Large330: 16-digit operands, the sum
+        // held at nineteen digits and rounded once (IOUAmount.cpp:28-37, 69-84).
+        let (am, ae) = (rng.mantissa(), rng.exponent(-30, 10));
+        let (cm, ce) = (rng.mantissa(), ae + if rng.next() % 2 == 0 { rng.exponent(-3, 3) } else { rng.exponent(-20, 20) });
+        for (shim_op, negate, name) in [(ARITH_ADD, false, "L330 STAmount add"), (ARITH_SUB, true, "L330 STAmount sub")] {
+            match arith::stamount_op(shim_op, iou(am, ae), iou(cm, ce), false, false) {
+                Ok(r) => {
+                    let (neg, o) = ours::stamount_signed_add(false, (am as u128, ae), negate, (cm as u128, ce));
+                    let ok = r.mantissa as u128 == o.0 && (r.mantissa == 0 || (r.exponent == o.1 && (r.negative != 0) == neg));
+                    t.entry(name.to_string()).or_default().note(ok, || format!("{}e{} {} {}e{} -> libxrpl {} ours {}{}e{}", am, ae, if negate { "-" } else { "+" }, cm, ce, fmt_amt(&r), if neg { "-" } else { "" }, o.0, o.1));
+                }
+                Err(_) => t.entry(name.to_string()).or_default().oracle_errors += 1,
+            }
+        }
+    }
+    // Leave the thread as the Small test expects to find it.
+    arith::set_scale(false);
+
+    let mut total_mismatch = 0;
+    let mut total_cases = 0;
+    eprintln!("\n[arith_fuzz] Number scale: Large330 (19 digits), {n} iterations");
+    eprintln!("{:<40} {:>8} {:>10} {:>8}", "op", "cases", "mismatch", "oracleErr");
+    for (k, v) in &t {
+        eprintln!("{:<40} {:>8} {:>10} {:>8}", k, v.cases, v.mismatches, v.oracle_errors);
+        total_mismatch += v.mismatches;
+        total_cases += v.cases;
+    }
+    eprintln!("L330 total: {total_cases} cases, {total_mismatch} mismatches, {both_threw} where both sides threw");
+    for (k, v) in &t {
+        for ex in &v.examples {
+            eprintln!("  [{k}] {ex}");
+        }
+    }
+    assert_eq!(total_mismatch, 0, "Number at Large330 disagrees with libxrpl — see the table above");
+}
