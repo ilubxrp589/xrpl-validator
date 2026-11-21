@@ -434,11 +434,19 @@ fn pre_of(bundle: &Value) -> BTreeMap<Key, Vec<u8>> {
 /// ValidVault looks up for every vault a transaction updates ("updated vault must have shares"). Fetched from
 /// devnet at each bundle's parent ledger and kept beside the vectors, keyed by vector name.
 fn extra_pre(name: &str) -> BTreeMap<Key, Vec<u8>> {
-    let all: Value = serde_json::from_str(include_str!("vectors/diff341_extra_pre.json")).unwrap();
-    all.get(name)
-        .and_then(Value::as_object)
-        .map(|o| o.iter().map(|(k, v)| (key32(k), hex::decode(v.as_str().unwrap()).unwrap())).collect())
-        .unwrap_or_default()
+    let mut out = BTreeMap::new();
+    let mut take = |text: &str| {
+        let all: Value = serde_json::from_str(text).unwrap();
+        for (k, v) in all.get(name).and_then(Value::as_object).into_iter().flatten() {
+            out.insert(key32(k), hex::decode(v.as_str().unwrap()).unwrap());
+        }
+    };
+    take(include_str!("vectors/diff341_extra_pre.json"));
+    // `DIFF341_EXTRA`: a file of the same shape, for bundles that are not pinned vectors.
+    if let Ok(path) = std::env::var("DIFF341_EXTRA") {
+        take(&std::fs::read_to_string(path).unwrap());
+    }
+    out
 }
 
 fn run_bundle(name: &str, bundle: &Value) -> Result<Row, String> {
