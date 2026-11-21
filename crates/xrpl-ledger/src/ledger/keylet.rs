@@ -836,3 +836,129 @@ mod tests {
         println!("Our amendments_key: {:?}", amendments_key());
     }
 }
+
+/// The vault-family keylets against REAL objects: XRPL Devnet ledger
+/// 7131244 (SingleAssetVault, LendingProtocol and LendingProtocolV1_1
+/// enabled; server rippled 3.5.0-rc5), fetched by `ledger_entry` from the
+/// public JSON-RPC on 2026-11-21 and kept, JSON and binary, in
+/// `tests/data/vault/devnet_7131244.json`. Each `index` there is the key
+/// rippled filed the object under.
+#[cfg(test)]
+pub(crate) mod vault_devnet_fixture {
+    use serde_json::Value;
+
+    /// The fixture file, parsed.
+    pub(crate) fn fixture() -> Value {
+        serde_json::from_str(include_str!("../../tests/data/vault/devnet_7131244.json")).expect("fixture parses")
+    }
+
+    /// One fixture object by name: its JSON as devnet answered it (`index`
+    /// included) and its serialized bytes.
+    pub(crate) fn object(name: &str) -> (Value, Vec<u8>) {
+        let all = fixture();
+        let o = all["objects"]
+            .as_array()
+            .expect("objects")
+            .iter()
+            .find(|o| o["name"] == name)
+            .unwrap_or_else(|| panic!("no fixture object {name}"))
+            .clone();
+        (o["node"].clone(), hex::decode(o["node_binary"].as_str().expect("node_binary")).expect("hex"))
+    }
+}
+
+#[cfg(test)]
+mod vault_keylet_tests {
+    use super::vault_devnet_fixture::object;
+    use super::*;
+    use serde_json::Value;
+
+    fn account(v: &Value) -> [u8; 20] {
+        crate::tx::offer::decode20(v.as_str().expect("account")).expect("address")
+    }
+
+    fn index(node: &Value) -> String {
+        node["index"].as_str().expect("index").to_string()
+    }
+
+    fn hex_key(k: &Hash256) -> String {
+        hex::encode_upper(k.0)
+    }
+
+    fn hash(v: &Value) -> Hash256 {
+        Hash256(hex::decode(v.as_str().expect("hash")).expect("hex").as_slice().try_into().expect("32 bytes"))
+    }
+
+    /// `keylet::vault(owner, seq)` (Indexes.cpp:581-585): namespace 'V',
+    /// the owner, the creating transaction's sequence.
+    #[test]
+    fn vault_key_reproduces_devnet_vaults() {
+        for name in ["vault_xrp", "vault_usd_closed_ended"] {
+            let (node, _) = object(name);
+            let key = vault_key(&account(&node["Owner"]), node["Sequence"].as_u64().unwrap() as u32);
+            assert_eq!(hex_key(&key), index(&node), "{name}");
+        }
+    }
+
+    /// `keylet::loanBroker(owner, seq)` (Indexes.cpp:587-591): namespace 'l'
+    /// (lower-case L).
+    #[test]
+    fn loan_broker_key_reproduces_devnet_loan_brokers() {
+        for name in ["loan_broker_xrp", "loan_broker_usd"] {
+            let (node, _) = object(name);
+            let key = loan_broker_key(&account(&node["Owner"]), node["Sequence"].as_u64().unwrap() as u32);
+            assert_eq!(hex_key(&key), index(&node), "{name}");
+        }
+    }
+
+    /// `keylet::loan(loanBrokerID, loanSeq)` (Indexes.cpp:593-597): namespace
+    /// 'L', the BROKER's key (not an account) and the broker's LoanSequence
+    /// at creation. The fixture's loan belongs to the fixture's USD broker.
+    #[test]
+    fn loan_key_reproduces_a_devnet_loan() {
+        let (node, _) = object("loan_usd");
+        let (broker, _) = object("loan_broker_usd");
+        assert_eq!(node["LoanBrokerID"], broker["index"]);
+        let key = loan_key(&hash(&node["LoanBrokerID"]), node["LoanSequence"].as_u64().unwrap() as u32);
+        assert_eq!(hex_key(&key), index(&node));
+        // The three namespaces differ: the same inputs do not collide.
+        let owner = account(&broker["Owner"]);
+        assert_ne!(vault_key(&owner, 7), loan_broker_key(&owner, 7));
+    }
+
+    /// The keys a vault's other objects sit under, all existing keylets: the
+    /// share issuance by its ShareMPTID (= sequence 1 ‖ the pseudo-account,
+    /// VaultCreate.cpp:233-246), the pseudo-account's root, the broker's
+    /// pseudo-account's root, and — for a vault of an IOU — the share's
+    /// sfReferenceHolding, which is the pseudo-account's trust line for the
+    /// asset (VaultCreate.cpp:226-232).
+    #[test]
+    fn the_objects_around_a_vault_sit_at_the_existing_keylets() {
+        for (vault, issuance, pseudo) in [
+            ("vault_xrp", "share_issuance_xrp", "vault_pseudo_xrp"),
+            ("vault_usd_closed_ended", "share_issuance_usd", "vault_pseudo_usd"),
+        ] {
+            let (vault, _) = object(vault);
+            let (issuance, _) = object(issuance);
+            let (pseudo, _) = object(pseudo);
+            let pseudo_id = account(&vault["Account"]);
+            let share: [u8; 24] = hex::decode(vault["ShareMPTID"].as_str().unwrap()).unwrap().try_into().unwrap();
+            assert_eq!(share[..4], 1u32.to_be_bytes());
+            assert_eq!(share[4..], pseudo_id);
+            assert_eq!(hex_key(&mpt_issuance_key(&share)), index(&issuance));
+            assert_eq!(account(&issuance["Issuer"]), pseudo_id);
+            assert_eq!(hex_key(&account_root_key(&pseudo_id)), index(&pseudo));
+            assert_eq!(pseudo["VaultID"], vault["index"]);
+        }
+        let (broker, _) = object("loan_broker_usd");
+        let (broker_pseudo, _) = object("loan_broker_pseudo_usd");
+        assert_eq!(hex_key(&account_root_key(&account(&broker["Account"]))), index(&broker_pseudo));
+        assert_eq!(broker_pseudo["LoanBrokerID"], broker["index"]);
+
+        let (vault, _) = object("vault_usd_closed_ended");
+        let (issuance, _) = object("share_issuance_usd");
+        let currency = crate::tx::offer::amount_currency20(&vault["Asset"]).unwrap();
+        let line = ripple_state_key(&account(&vault["Account"]), &account(&vault["Asset"]["issuer"]), &currency);
+        assert_eq!(Value::String(hex_key(&line)), issuance["ReferenceHolding"]);
+    }
+}
