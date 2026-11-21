@@ -2208,7 +2208,7 @@ mod tests {
         assert_eq!(shares_of(&sb, &share, &BOB), Some(600));
         assert_eq!(outstanding(&sb, &share), 600);
         assert_eq!(xrp_of(&sb, &pseudo), 600);
-        assert_eq!(xrp_of(&sb, &BOB), BALANCE - 1000 - FEE + 400);
+        assert_eq!(xrp_of(&sb, &BOB), BALANCE - 1000 - 2 * FEE + 400, "two fees: the deposit's and this one");
         let vault = get(&sb, &key).unwrap();
         assert_eq!((&vault["AssetsTotal"], &vault["AssetsAvailable"]), (&json!("600"), &json!("600")));
 
@@ -2226,7 +2226,7 @@ mod tests {
         assert_eq!(owners(&sb, &BOB), 0);
         assert_eq!(outstanding(&sb, &share), 0);
         assert_eq!(xrp_of(&sb, &pseudo), 0);
-        assert_eq!(xrp_of(&sb, &BOB), BALANCE - FEE);
+        assert_eq!(xrp_of(&sb, &BOB), BALANCE - 2 * FEE);
 
         // More shares than held; a holder of none; the wrong asset.
         assert_eq!(result(&st, &withdraw(BOB, &key, mpt_json(&share, 1001))), TxResult::InsufficientFunds);
@@ -2322,7 +2322,7 @@ mod tests {
         let (r, sb) = apply(&st, &withdraw_to(BOB, &key, json!("400"), CAROL));
         assert_eq!(r, TxResult::Success);
         assert_eq!(xrp_of(&sb, &CAROL), BALANCE + 400);
-        assert_eq!(xrp_of(&sb, &BOB), BALANCE - 1000 - FEE);
+        assert_eq!(xrp_of(&sb, &BOB), BALANCE - 1000 - 2 * FEE);
         assert_eq!(shares_of(&sb, &share, &BOB), Some(600));
         assert_eq!(result(&st, &withdraw_to(BOB, &key, json!("400"), [0x99; 20])), TxResult::NoDst);
         assert_eq!(result(&st, &withdraw_to(BOB, &key, json!("400"), pseudo)), TxResult::TecPseudoAccount);

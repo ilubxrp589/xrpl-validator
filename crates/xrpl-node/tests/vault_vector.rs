@@ -149,3 +149,103 @@ fn vault_create_mpt_private_domain_devnet_6966508() {
 fn vault_create_mpt_public_devnet_6630795() {
     run(include_str!("vectors/vault_create_mpt_public_devnet_6630795.json"));
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// VaultDeposit
+// ---------------------------------------------------------------------------------------------------------------
+
+/// CA2356A0A9…: VaultDeposit of 100 EUR, tesSUCCESS.
+#[test]
+fn vault_deposit_eur_100_devnet_6630191() {
+    run(include_str!("vectors/vault_deposit_eur_100_devnet_6630191.json"));
+}
+
+/// AE8397151E…: VaultDeposit of 20 EUR, tesSUCCESS.
+#[test]
+fn vault_deposit_eur_20_second_devnet_6630193() {
+    run(include_str!("vectors/vault_deposit_eur_20_second_devnet_6630193.json"));
+}
+
+/// 5F6FF6FFA8…: VaultDeposit of 1 EUR, tesSUCCESS.
+#[test]
+fn vault_deposit_eur_after_unfreeze_devnet_6630244() {
+    run(include_str!("vectors/vault_deposit_eur_after_unfreeze_devnet_6630244.json"));
+}
+
+/// 4A34004588…: VaultDeposit of 1 EUR, tesSUCCESS.
+#[test]
+fn vault_deposit_eur_last_devnet_6630271() {
+    run(include_str!("vectors/vault_deposit_eur_last_devnet_6630271.json"));
+}
+
+/// E638E87D2C…: VaultDeposit of 1 EUR, tecFROZEN.
+#[test]
+fn vault_deposit_eur_tec_frozen_again_devnet_6630254() {
+    run(include_str!("vectors/vault_deposit_eur_tec_frozen_again_devnet_6630254.json"));
+}
+
+/// 50A0AE50F9…: VaultDeposit of 1 EUR, tecFROZEN.
+#[test]
+fn vault_deposit_eur_tec_frozen_devnet_6630227() {
+    run(include_str!("vectors/vault_deposit_eur_tec_frozen_devnet_6630227.json"));
+}
+
+/// 90BBDCF4AF…: VaultDeposit of 10000 USD, tesSUCCESS.
+#[test]
+fn vault_deposit_iou_first_devnet_6471759() {
+    run(include_str!("vectors/vault_deposit_iou_first_devnet_6471759.json"));
+}
+
+/// 3390694B19…: VaultDeposit of 10000 MPT, tesSUCCESS.
+#[test]
+fn vault_deposit_mpt_first_devnet_6418435() {
+    run(include_str!("vectors/vault_deposit_mpt_first_devnet_6418435.json"));
+}
+
+/// B411C976DF…: VaultDeposit of 10000 MPT, tesSUCCESS.
+#[test]
+fn vault_deposit_mpt_private_domain_devnet_6966509() {
+    run(include_str!("vectors/vault_deposit_mpt_private_domain_devnet_6966509.json"));
+}
+
+/// D8F5FBBCB5…: VaultDeposit of 100.5 USD, tesSUCCESS.
+#[test]
+fn vault_deposit_usd_100_5_devnet_6791424() {
+    run(include_str!("vectors/vault_deposit_usd_100_5_devnet_6791424.json"));
+}
+
+/// 63029D6FC5…: VaultDeposit of 1000000000000000e2 USD, tesSUCCESS.
+#[test]
+fn vault_deposit_usd_1e17_scale_0_devnet_6858220() {
+    run(include_str!("vectors/vault_deposit_usd_1e17_scale_0_devnet_6858220.json"));
+}
+
+/// D3C20C23B7…: VaultDeposit of 10000 USD, tesSUCCESS.
+#[test]
+fn vault_deposit_usd_private_domain_devnet_6966503() {
+    run(include_str!("vectors/vault_deposit_usd_private_domain_devnet_6966503.json"));
+}
+
+/// A789702CE8…: VaultDeposit of 10000 drops, tesSUCCESS.
+#[test]
+fn vault_deposit_xrp_first_devnet_7112017() {
+    run(include_str!("vectors/vault_deposit_xrp_first_devnet_7112017.json"));
+}
+
+/// EE6DB857D9…: VaultDeposit of 10000 drops, tesSUCCESS.
+#[test]
+fn vault_deposit_xrp_private_closed_ended_devnet_6485842() {
+    run(include_str!("vectors/vault_deposit_xrp_private_closed_ended_devnet_6485842.json"));
+}
+
+/// B47D5F17EC…: VaultDeposit of 10000 drops, tesSUCCESS.
+#[test]
+fn vault_deposit_xrp_private_devnet_6966497() {
+    run(include_str!("vectors/vault_deposit_xrp_private_devnet_6966497.json"));
+}
+
+/// 49C709E03F…: VaultDeposit of 10000 drops, tesSUCCESS.
+#[test]
+fn vault_deposit_xrp_second_devnet_7112018() {
+    run(include_str!("vectors/vault_deposit_xrp_second_devnet_7112018.json"));
+}
