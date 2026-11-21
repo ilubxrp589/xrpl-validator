@@ -29,7 +29,7 @@
 //!      the STRICT division installs that guard; the legacy one keeps
 //!      ToNearest;
 //!   5. `roundUp && !resultNegative && result == 0` → the minimum unit.
-use crate::tx::number::{Number, Rounding};
+use crate::tx::number::{mantissa_scale, MantissaScale, Number, Rounding};
 
 /// The mantissa range STAmount keeps for an IOU.
 pub const K_MIN_VALUE: u64 = 1_000_000_000_000_000;
@@ -88,6 +88,13 @@ impl StAmount {
     /// `XRPAmount{num}` (`Number::operator rep()`); IOU: `IOUAmount(Number)`.
     pub fn construct(native: bool, negative: bool, mantissa: u128, exponent: i32, mode: Rounding) -> Result<StAmount, StError> {
         if native {
+            // STAmount.h:359-370: off Number's Small scale an integral
+            // amount built from a mantissa above int64's maximum throws
+            // ("STAmount mantissa is too large"); at Small rippled only
+            // asserts and goes on.
+            if mantissa_scale() != MantissaScale::Small && mantissa > i64::MAX as u128 {
+                return Err(StError::Overflow);
+            }
             if mantissa == 0 || exponent <= -20 {
                 return Ok(StAmount::zero(true));
             }
@@ -115,6 +122,43 @@ impl StAmount {
             return Err(StError::Overflow);
         }
         Ok(StAmount { native: false, negative, mantissa, exponent })
+    }
+
+    /// `STAmount(asset, Number)` — the constructor, which is `fromNumber`
+    /// (STAmount.h:141, 567-583) at every scale: the MAGNITUDE is converted
+    /// under `mode` — `operator rep()` for an integral asset,
+    /// `normalizeToRange` to sixteen digits for an IOU — and the sign is
+    /// carried beside it into `STAmount(asset, value, offset, negative)`. So
+    /// a directed mode rounds a negative amount by its magnitude. This is
+    /// `toSTAmount` / `toAmount<STAmount>` (AmountConversions.h:152-183) and
+    /// `multiply`'s result (STAmount.cpp:1304-1305).
+    pub fn from_number(native: bool, n: Number, mode: Rounding) -> Result<StAmount, StError> {
+        let negative = n.negative && !n.is_zero();
+        let working = n.abs();
+        if native {
+            let value = working.to_drops(mode).map_err(|_| StError::Overflow)?;
+            return Self::construct(true, negative, value.unsigned_abs() as u128, 0, mode);
+        }
+        let (_, mantissa, exponent) =
+            working.normalize_to_range(K_MIN_VALUE, K_MAX_VALUE, mode).map_err(|_| StError::Overflow)?;
+        Self::construct(false, negative, mantissa as u128, exponent, mode)
+    }
+
+    /// `STAmount::operator=(Number)` (STAmount.cpp:332-349): while neither
+    /// SingleAssetVault nor LendingProtocol is enabled, the Number's
+    /// external mantissa and exponent copied raw and canonicalised; with
+    /// either, `fromNumber`. The condition is the one that puts Number at
+    /// the Large scale (Rules.cpp:46-47), so the thread's scale stands for
+    /// it. (rippled also takes the `fromNumber` arm with no transaction
+    /// rules installed, where its Number runs at Large330 too.)
+    pub fn assign_number(native: bool, n: Number, mode: Rounding) -> Result<StAmount, StError> {
+        match mantissa_scale() {
+            MantissaScale::Small => {
+                let (mantissa, exponent) = n.external();
+                Self::construct(native, mantissa < 0, mantissa.unsigned_abs() as u128, exponent, mode)
+            }
+            MantissaScale::Large330 => Self::from_number(native, n, mode),
+        }
     }
 }
 
