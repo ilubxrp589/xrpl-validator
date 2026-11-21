@@ -424,7 +424,7 @@ mod tests {
         /// Where rippled 3.4.1 returns one of the ALWAYS_CLAIMED codes from preclaim, which waits under tapRETRY
         /// like any tec (found by searching the transactors for those returns; mainnet #106793245's
         /// NFTokenCreateOffer tecEXPIRED is one).
-        const PRECLAIM_TEC: [(&str, &str); 10] = [
+        const PRECLAIM_TEC: [(&str, &str); 11] = [
             ("OfferCreate", "tecEXPIRED"),
             ("NFTokenMint", "tecEXPIRED"),
             ("NFTokenCreateOffer", "tecEXPIRED"),
@@ -432,6 +432,8 @@ mod tests {
             ("CheckCash", "tecEXPIRED"),
             ("VaultCreate", "tecEXPIRED"),
             ("VaultDeposit", "tecEXPIRED"),
+            // VaultWithdraw.cpp:241-247: checkVaultDomain with SuppressExpired::No, in preclaim.
+            ("VaultWithdraw", "tecEXPIRED"),
             ("LoanSet", "tecEXPIRED"),
             ("LoanSet", "tecKILLED"),
             ("LoanPay", "tecKILLED"),

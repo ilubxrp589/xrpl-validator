@@ -133,6 +133,7 @@ pub fn get_transactor(tx_type: &str) -> Option<Box<dyn Transactor>> {
         // while the amendment is off.
         "VaultCreate" => Some(Box::new(crate::tx::vault::VaultCreateTransactor)),
         "VaultDeposit" => Some(Box::new(crate::tx::vault::VaultDepositTransactor)),
+        "VaultWithdraw" => Some(Box::new(crate::tx::vault::VaultWithdrawTransactor)),
         "UNLModify" => Some(Box::new(UNLModifyTransactor)),
         "SetFee" => Some(Box::new(SetFeeTransactor)),
         "EnableAmendment" => Some(Box::new(EnableAmendmentTransactor)),

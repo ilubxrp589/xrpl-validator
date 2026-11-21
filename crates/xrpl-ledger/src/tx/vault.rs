@@ -782,6 +782,379 @@ impl Transactor for VaultDepositTransactor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// VaultWithdraw (VaultWithdraw.cpp)
+// ---------------------------------------------------------------------------
+
+/// VaultWithdraw (type 69): shares back into the vault, assets out of it —
+/// to the submitter or to sfDestination.
+///
+/// Fee: the plain base fee. Reserve: a withdrawal to oneself may create the
+/// holding the assets land in (`doWithdraw` → `addEmptyHolding`).
+///
+/// Invariants: with fixCleanup3_2_0 OFF a final withdrawal from a vault
+/// carrying an unrealized loss leaves shares at zero with assets remaining;
+/// rippled's result is then the ValidVault invariant's
+/// (tecINVARIANT_FAILED), which this engine does not model. With the fix on
+/// the transactor refuses it itself (tecINSUFFICIENT_FUNDS).
+pub struct VaultWithdrawTransactor;
+
+/// `shouldWaiveWithdrawal(view, account, issuance)` (VaultWithdraw.cpp:40-50):
+/// under fixCleanup3_2_0 a sole shareholder's withdrawal is struck against
+/// the whole sfAssetsTotal, the unrealized loss not subtracted.
+fn should_waive_withdrawal(sandbox: &Sandbox, account: &[u8; 20], issuance: &Value) -> WaiveUnrealizedLoss {
+    if am::fix_cleanup_3_2_0(sandbox) && vh::is_sole_shareholder(sandbox, account, issuance) {
+        WaiveUnrealizedLoss::Yes
+    } else {
+        WaiveUnrealizedLoss::No
+    }
+}
+
+/// `withdrawalTransferRate(view, account, destination, asset)` (3.5.0-rc1
+/// VaultWithdraw.cpp:55-73): before fixCleanup3_5_0 every withdrawal waives
+/// the asset's transfer fee; with it the fee applies when a holder other
+/// than the issuer withdraws to another such holder.
+fn withdrawal_transfer_rate(sandbox: &Sandbox, account: &[u8; 20], destination: &[u8; 20], asset: &HeldAsset) -> u64 {
+    if !am::fix_cleanup_3_5_0(sandbox) {
+        return holding::PARITY_RATE;
+    }
+    let issuer = holding::asset_issuer(asset);
+    if *asset == HeldAsset::Xrp || destination == account || *account == issuer || *destination == issuer {
+        return holding::PARITY_RATE;
+    }
+    holding::asset_transfer_rate(sandbox, asset)
+}
+
+/// `tx[~sfDestination].value_or(account)`.
+fn withdraw_destination(tx: &TxFields) -> Option<[u8; 20]> {
+    match tx.fields.get("Destination") {
+        Some(destination) => destination.as_str().and_then(decode20),
+        None => Some(tx.account),
+    }
+}
+
+/// `credentials::checkFields(tx, rules)` (CredentialHelpers.cpp:130-163):
+/// sfCredentialIDs, when present, holds one to eight ids, none repeated and
+/// — under fixCleanup3_4_0 — none zero; else temMALFORMED.
+fn credential_fields_ok(tx: &TxFields, rules: &Sandbox) -> bool {
+    let Some(ids) = tx.fields.get("CredentialIDs") else { return true };
+    let Some(ids) = ids.as_array() else { return false };
+    if ids.is_empty() || ids.len() > 8 {
+        return false;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for id in ids {
+        let Some(id) = id.as_str().map(|s| s.to_uppercase()) else { return false };
+        if am::fix_cleanup_3_4_0(rules) && id.bytes().all(|b| b == b'0') {
+            return false;
+        }
+        if !seen.insert(id) {
+            return false;
+        }
+    }
+    true
+}
+
+impl Transactor for VaultWithdrawTransactor {
+    /// `VaultWithdraw::preflight` (VaultWithdraw.cpp:52-76), less the
+    /// credential fields (they need the rules: [`Self::preflight_in`]).
+    fn preflight(&self, tx: &TxFields) -> TxResult {
+        if vault_id(tx).is_none_or(|id| is_zero_key(&id)) {
+            return TxResult::Malformed;
+        }
+        match tx.fields.get("Amount").and_then(tx_amount) {
+            Some(amount) if positive(&amount) => {}
+            _ => return TxResult::BadAmount,
+        }
+        if has(tx, "Destination") && withdraw_destination(tx).is_none_or(|d| d == [0u8; 20]) {
+            return TxResult::Malformed;
+        }
+        TxResult::Success
+    }
+
+    fn preflight_in(&self, tx: &TxFields, rules: &Sandbox) -> TxResult {
+        // `VaultWithdraw::checkExtraFeatures` (:33-38): sfCredentialIDs needs
+        // Credentials and fixCleanup3_4_0.
+        let extra = !has(tx, "CredentialIDs") || (enabled(rules, am::CREDENTIALS) && am::fix_cleanup_3_4_0(rules));
+        if let Some(refused) = gate(tx, rules, extra, TF_UNIVERSAL_MASK) {
+            return refused;
+        }
+        let basic = self.preflight(tx);
+        if basic != TxResult::Success {
+            return basic;
+        }
+        if !credential_fields_ok(tx, rules) {
+            return TxResult::Malformed;
+        }
+        TxResult::Success
+    }
+
+    /// `VaultWithdraw::preclaim` (VaultWithdraw.cpp:78-275).
+    fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        let fix313 = enabled(sandbox, am::FIX_CLEANUP_3_1_3);
+        let fix320 = am::fix_cleanup_3_2_0(sandbox);
+        let fix330 = am::fix_cleanup_3_3_0(sandbox);
+        let fix340 = am::fix_cleanup_3_4_0(sandbox);
+        let Some((_, vault)) = read_vault(sandbox, tx) else { return TxResult::NoEntry };
+        if enabled(sandbox, am::LENDING_PROTOCOL_V1_1) && vh::vault_phase(sandbox, &vault) == VaultPhase::Investment {
+            return TxResult::TooSoon;
+        }
+        let (Some(amount), Some(asset), Some((share_id, _, share_issuance))) =
+            (tx.fields.get("Amount").and_then(tx_amount), vault_asset(&vault), read_share(sandbox, &vault))
+        else {
+            return TxResult::TefInternal;
+        };
+        let share = HeldAsset::Mpt(share_id);
+        if amount.asset != asset && amount.asset != share {
+            return TxResult::WrongAsset;
+        }
+        let (Some(vault_account), Some(dst)) = (account_of(&vault, "Account"), withdraw_destination(tx)) else {
+            return TxResult::TefInternal;
+        };
+        let account = tx.account;
+        // fixCleanup3_2_0: a withdrawal is a recovery path — the asset's
+        // lsfMPTCanTransfer is not consulted, so an issuer cannot trap funds.
+        // IOU rippling, freezes and authorization still apply.
+        let transferable = holding::can_transfer_waive(sandbox, &asset, &vault_account, &dst, fix320);
+        if transferable != TxResult::Success {
+            return transferable;
+        }
+        if vault.get("WithdrawalPolicy").and_then(|p| p.as_u64()) != Some(VAULT_STRATEGY_FIRST_COME_FIRST_SERVE as u64) {
+            return TxResult::TefInternal;
+        }
+        // Credentials first: canWithdraw assumes they exist.
+        let credentials = crate::tx::credential::credentials_valid(sandbox, tx, &account);
+        if credentials != TxResult::Success {
+            return credentials;
+        }
+        // fixCleanup3_4_0: a pseudo-account never receives a user's funds.
+        // (Its lsfDepositAuth would refuse too, as tecNO_PERMISSION.)
+        if fix340 && crate::tx::misc::is_pseudo_account(sandbox, &dst) {
+            return TxResult::TecPseudoAccount;
+        }
+        if fix313 && amount.asset == share {
+            // fixCleanup3_1_3: a share-denominated withdrawal is checked
+            // against the destination's limits by the assets it pays; before
+            // the fix the check ran on the share amount (and found no limit).
+            let Some(share_issuance) = &share_issuance else { return TxResult::TefInternal };
+            let waive = should_waive_withdrawal(sandbox, &account, share_issuance);
+            let checked = || -> Result<TxResult, StError> {
+                let Some(assets) = vh::shares_to_assets_withdraw(&vault, share_issuance, &amount, waive, AMBIENT)? else {
+                    return Ok(TxResult::TefInternal);
+                };
+                // fixCleanup3_5_0: what arrives is the payout less the fee.
+                let rate = withdrawal_transfer_rate(sandbox, &account, &dst, &asset);
+                let received = holding::subtract_transfer_fee(&assets, rate)?;
+                let ids = holding::credential_ids(tx);
+                Ok(holding::can_withdraw(sandbox, &account, &dst, &received, has(tx, "DestinationTag"), ids.as_deref()))
+            };
+            match checked() {
+                Ok(TxResult::Success) => {}
+                Ok(refused) => return refused,
+                Err(_) => return TxResult::PathDry,
+            }
+        } else {
+            let allowed = holding::can_withdraw_tx(sandbox, tx);
+            if allowed != TxResult::Success {
+                return allowed;
+            }
+        }
+        // To oneself the holding may be created in do_apply (a weak check);
+        // anyone else must already hold the asset's line or MPToken.
+        let auth = if account == dst { AuthType::WeakAuth } else { AuthType::StrongAuth };
+        let authorized = holding::require_auth(sandbox, &asset, &dst, auth);
+        if authorized != TxResult::Success {
+            return authorized;
+        }
+        // fixCleanup3_4_0: fail early when the self-withdrawal would have to
+        // create a holding that cannot be created.
+        if fix340 && account == dst && !holding::holding_exists(sandbox, &dst, &asset) {
+            let holdable = holding::can_add_holding(sandbox, &asset);
+            if holdable != TxResult::Success {
+                return holdable;
+            }
+        }
+        // fixCleanup3_4_0: a private vault pays a third party only when both
+        // ends are in its domain. To oneself and to the asset's issuer always.
+        if fix340 && obj_flags(&vault) & LSF_VAULT_PRIVATE != 0 && dst != account && dst != holding::asset_issuer(&asset) {
+            let Some(share_issuance) = &share_issuance else { return TxResult::TefInternal };
+            for party in [&account, &dst] {
+                // tecEXPIRED is not suppressed: nothing here would delete the credential.
+                let member = vh::check_vault_domain(sandbox, share_issuance, party, SuppressExpired::No);
+                if member != TxResult::Success {
+                    return member;
+                }
+            }
+        }
+        if fix330 {
+            holding::check_withdraw_freeze(sandbox, &vault_account, &account, &dst, &asset)
+        } else {
+            let destination = holding::check_frozen(sandbox, &dst, &asset);
+            if destination != TxResult::Success {
+                return destination;
+            }
+            holding::check_frozen(sandbox, &account, &share)
+        }
+    }
+
+    /// `VaultWithdraw::doApply` (VaultWithdraw.cpp:277-589; the transfer-fee
+    /// lines are 3.5.0-rc1's, inert at parity).
+    fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        let fix320 = am::fix_cleanup_3_2_0(sandbox);
+        let fix330 = am::fix_cleanup_3_3_0(sandbox);
+        let fix340 = am::fix_cleanup_3_4_0(sandbox);
+        let Some((vault_key, mut vault)) = read_vault(sandbox, tx) else { return TxResult::TefInternal };
+        let Some((share_id, _, Some(share_issuance))) = read_share(sandbox, &vault) else { return TxResult::TefInternal };
+        let (Some(amount), Some(asset), Some(dst)) =
+            (tx.fields.get("Amount").and_then(tx_amount), vault_asset(&vault), withdraw_destination(tx))
+        else {
+            return TxResult::TefInternal;
+        };
+        let (Some(vault_account), Some(owner)) = (account_of(&vault, "Account"), account_of(&vault, "Owner")) else {
+            return TxResult::TefInternal;
+        };
+        let account = tx.account;
+        let prior = prior_balance(sandbox, tx);
+        let share = HeldAsset::Mpt(share_id);
+        let rate = withdrawal_transfer_rate(sandbox, &account, &dst, &asset);
+        let waive = should_waive_withdrawal(sandbox, &account, &share_issuance);
+
+        let exchange = || -> Result<Result<(Amount, Amount), TxResult>, StError> {
+            if amount.asset == asset {
+                // Fixed assets, variable shares. fixCleanup3_4_0 truncates
+                // the shares, so the assets paid for them never exceed the
+                // amount asked; before it they were rounded to nearest.
+                let truncate = if fix340 { TruncateShares::Yes } else { TruncateShares::No };
+                let gross = holding::add_transfer_fee(&amount, rate)?;
+                let Some(shares) = vh::assets_to_shares_withdraw(&vault, &share_issuance, &gross, truncate, waive, AMBIENT)? else {
+                    return Ok(Err(TxResult::TecInternal));
+                };
+                if shares.is_zero() {
+                    return Ok(Err(TxResult::PrecisionLoss));
+                }
+                // The payout is what the burned shares are worth.
+                let Some(assets) = vh::shares_to_assets_withdraw(&vault, &share_issuance, &shares, waive, AMBIENT)? else {
+                    return Ok(Err(TxResult::TecInternal));
+                };
+                Ok(Ok((shares, assets)))
+            } else if amount.asset == share {
+                // Fixed shares, variable assets.
+                let Some(assets) = vh::shares_to_assets_withdraw(&vault, &share_issuance, &amount, waive, AMBIENT)? else {
+                    return Ok(Err(TxResult::TecInternal));
+                };
+                Ok(Ok((amount, assets)))
+            } else {
+                Ok(Err(TxResult::TefInternal))
+            }
+        };
+        let (shares_redeemed, mut assets_withdrawn) = match exchange() {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(refused)) => return refused,
+            Err(_) => return TxResult::PathDry,
+        };
+
+        // Burning every outstanding share: the vault's last withdrawal.
+        let is_final = shares_redeemed.mantissa == mpt::dec_field(&share_issuance, "OutstandingAmount");
+        let assets_available = number_field(&vault, "AssetsAvailable");
+        let assets_total = number_field(&vault, "AssetsTotal");
+
+        if fix340 && !is_final {
+            // Shares that round to no assets while the vault has value.
+            if amount.asset == share && assets_withdrawn.is_zero() {
+                match vh::assets_total_for_withdrawal(&vault, waive, AMBIENT) {
+                    Ok(total) if !total.is_zero() => return TxResult::PrecisionLoss,
+                    Ok(_) => {}
+                    Err(_) => return TxResult::TefException,
+                }
+            }
+            // A payout too small to move the stored total.
+            match vh::debit_is_non_zero_dust(asset, assets_total, assets_withdrawn.number(), AMBIENT) {
+                Ok(true) => return TxResult::PrecisionLoss,
+                Ok(false) => {}
+                Err(_) => return TxResult::PathDry,
+            }
+        }
+
+        // fixCleanup3_3_0: preclaim has judged every freeze; a share frozen
+        // through its asset must not read as zero here.
+        let held = holding::account_holds(sandbox, &account, &share, !fix330, false);
+        if less(&held, &shares_redeemed) {
+            return TxResult::InsufficientFunds;
+        }
+
+        if fix340 && !is_final && positive(&assets_withdrawn) {
+            // Availability first, on the unclamped amount: over-asking is
+            // tecINSUFFICIENT_FUNDS even where the clamp would call it dust.
+            if assets_available < assets_withdrawn.number() {
+                return TxResult::InsufficientFunds;
+            }
+            // Floored at the scale the total will have; the shares stay.
+            assets_withdrawn = match vh::clamp_to_assets_total_scale(&vault, &assets_withdrawn.negated(), AMBIENT) {
+                Ok(Ok(clamped)) => clamped,
+                Ok(Err(refused)) => return refused,
+                Err(_) => return TxResult::PathDry,
+            };
+        }
+
+        if assets_available < assets_withdrawn.number() {
+            return TxResult::InsufficientFunds;
+        }
+
+        // fixCleanup3_2_0: the last withdrawal pays out exactly what is
+        // available and leaves no dust behind.
+        let final_payout = fix320 && is_final;
+        if final_payout {
+            // Unreachable: a loss means total > available, refused above.
+            if !number_field(&vault, "LossUnrealized").is_zero() {
+                return TxResult::TefInternal;
+            }
+            assets_withdrawn = match Amount::from_number(asset, assets_available, AMBIENT) {
+                Ok(all) => all,
+                Err(_) => return TxResult::TefException,
+            };
+        }
+
+        // fixCleanup3_5_0: the destination receives the payout less the fee;
+        // a fee that eats it whole is refused.
+        let Ok(assets_delivered) = holding::subtract_transfer_fee(&assets_withdrawn, rate) else {
+            return TxResult::TefException;
+        };
+        if positive(&assets_withdrawn) && assets_delivered.is_zero() {
+            return TxResult::PrecisionLoss;
+        }
+
+        if final_payout {
+            set_number_field(&mut vault, "AssetsTotal", Number::ZERO, Soe::Default);
+            set_number_field(&mut vault, "AssetsAvailable", Number::ZERO, Soe::Default);
+        } else {
+            // Both by the same amount.
+            let sub = |n: Number| n.sub(assets_withdrawn.number(), AMBIENT);
+            let (Ok(total), Ok(available)) = (sub(assets_total), sub(assets_available)) else {
+                return TxResult::TefException;
+            };
+            set_number_field(&mut vault, "AssetsTotal", total, Soe::Default);
+            set_number_field(&mut vault, "AssetsAvailable", available, Soe::Default);
+        }
+
+        let burned = holding::account_send(sandbox, &account, &vault_account, &shares_redeemed, true);
+        if burned != TxResult::Success {
+            return burned;
+        }
+        // An emptied MPToken of the share goes, except the vault owner's.
+        if account != owner {
+            let removed = holding::remove_empty_holding(sandbox, &account, &share);
+            if removed != TxResult::Success && removed != TxResult::HasObligations {
+                return removed;
+            }
+        }
+        let stored = store_vault(sandbox, vault_key, &mut vault, asset);
+        if stored != TxResult::Success {
+            return stored;
+        }
+        holding::do_withdraw_split(sandbox, tx, &account, &dst, &vault_account, prior, &assets_delivered, &assets_withdrawn)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
