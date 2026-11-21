@@ -93,21 +93,21 @@ use xrpl_core::types::Hash256;
 /// The thread's rounding mode in every vault transactor: rippled's default,
 /// `Number::RoundingMode::ToNearest` (none of the six installs a guard that
 /// outlives a helper call).
-const AMBIENT: Rounding = Rounding::ToNearest;
+pub(super) const AMBIENT: Rounding = Rounding::ToNearest;
 
 // ---------------------------------------------------------------------------
 // Shared plumbing
 // ---------------------------------------------------------------------------
 
-fn tx_flags(tx: &TxFields) -> u64 {
+pub(super) fn tx_flags(tx: &TxFields) -> u64 {
     tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0)
 }
 
-fn has(tx: &TxFields, field: &str) -> bool {
+pub(super) fn has(tx: &TxFields, field: &str) -> bool {
     tx.fields.get(field).is_some()
 }
 
-fn obj_flags(obj: &Value) -> u64 {
+pub(super) fn obj_flags(obj: &Value) -> u64 {
     obj.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0)
 }
 
@@ -134,7 +134,7 @@ fn gate(tx: &TxFields, rules: &Sandbox, extra: bool, mask: u64) -> Option<TxResu
     None
 }
 
-fn is_zero_key(key: &Hash256) -> bool {
+pub(super) fn is_zero_key(key: &Hash256) -> bool {
     key.0 == [0u8; 32]
 }
 
@@ -144,7 +144,7 @@ fn vault_id(tx: &TxFields) -> Option<Hash256> {
 }
 
 /// A VL field's length in bytes (the field is hex in JSON); None when absent.
-fn blob_len(tx: &TxFields, field: &str) -> Option<usize> {
+pub(super) fn blob_len(tx: &TxFields, field: &str) -> Option<usize> {
     tx.fields.get(field).map(|v| v.as_str().map(|s| s.len() / 2).unwrap_or(0))
 }
 
@@ -159,7 +159,7 @@ fn valid_data_length(tx: &TxFields, field: &str, max: usize) -> bool {
 
 /// An amount field of the transaction; a negative MPT value included (the
 /// engine's amount reader takes MPT values as unsigned).
-fn tx_amount(v: &Value) -> Option<Amount> {
+pub(super) fn tx_amount(v: &Value) -> Option<Amount> {
     if let Some(amount) = Amount::from_json(v) {
         return Some(amount);
     }
@@ -171,7 +171,7 @@ fn tx_amount(v: &Value) -> Option<Amount> {
 
 /// `tx.getSeqProxy().value()`: the Sequence, or the TicketSequence of a
 /// ticketed transaction.
-fn seq_proxy_value(tx: &TxFields) -> u32 {
+pub(super) fn seq_proxy_value(tx: &TxFields) -> u32 {
     if tx.uses_ticket() {
         tx.ticket_seq.unwrap_or(0)
     } else {
@@ -181,14 +181,14 @@ fn seq_proxy_value(tx: &TxFields) -> u32 {
 
 /// rippled's `preFeeBalance_`: the account's XRP before this transaction's
 /// fee (the fee is already taken when do_apply runs).
-fn prior_balance(sandbox: &Sandbox, tx: &TxFields) -> u64 {
+pub(super) fn prior_balance(sandbox: &Sandbox, tx: &TxFields) -> u64 {
     json_at(sandbox, &keylet::account_root_key(&tx.account))
         .and_then(|a| a["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()))
         .unwrap_or(0)
         .saturating_add(tx.account_fee())
 }
 
-fn account_of(obj: &Value, field: &str) -> Option<[u8; 20]> {
+pub(super) fn account_of(obj: &Value, field: &str) -> Option<[u8; 20]> {
     obj.get(field).and_then(|v| v.as_str()).and_then(decode20)
 }
 
@@ -207,11 +207,11 @@ fn read_share(sandbox: &Sandbox, vault: &Value) -> Option<([u8; 24], Hash256, Op
 }
 
 /// `a < b` for two amounts of one asset (`STAmount::operator<`).
-fn less(a: &Amount, b: &Amount) -> bool {
+pub(super) fn less(a: &Amount, b: &Amount) -> bool {
     a.number() < b.number()
 }
 
-fn positive(a: &Amount) -> bool {
+pub(super) fn positive(a: &Amount) -> bool {
     !a.is_zero() && !a.negative
 }
 
@@ -826,7 +826,7 @@ fn withdrawal_transfer_rate(sandbox: &Sandbox, account: &[u8; 20], destination: 
 }
 
 /// `tx[~sfDestination].value_or(account)`.
-fn withdraw_destination(tx: &TxFields) -> Option<[u8; 20]> {
+pub(super) fn withdraw_destination(tx: &TxFields) -> Option<[u8; 20]> {
     match tx.fields.get("Destination") {
         Some(destination) => destination.as_str().and_then(decode20),
         None => Some(tx.account),
@@ -836,7 +836,7 @@ fn withdraw_destination(tx: &TxFields) -> Option<[u8; 20]> {
 /// `credentials::checkFields(tx, rules)` (CredentialHelpers.cpp:130-163):
 /// sfCredentialIDs, when present, holds one to eight ids, none repeated and
 /// — under fixCleanup3_4_0 — none zero; else temMALFORMED.
-fn credential_fields_ok(tx: &TxFields, rules: &Sandbox) -> bool {
+pub(super) fn credential_fields_ok(tx: &TxFields, rules: &Sandbox) -> bool {
     let Some(ids) = tx.fields.get("CredentialIDs") else { return true };
     let Some(ids) = ids.as_array() else { return false };
     if ids.is_empty() || ids.len() > 8 {
