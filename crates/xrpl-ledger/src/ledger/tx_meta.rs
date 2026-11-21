@@ -255,7 +255,7 @@ fn section(node: &mut Map<String, Value>, name: &str, object: &Value, which: Sec
 /// `STAmount::isDefault`); an empty blob, array, object, Vector256 or path set; the XRP issue or currency. An
 /// account that is present is set, so never the default (`STAccount::default_`), and neither is a bridge,
 /// whose doors are accounts.
-fn is_default(type_code: u16, v: &Value) -> bool {
+pub(crate) fn is_default(type_code: u16, v: &Value) -> bool {
     match type_code {
         1..=5 | 10 | 11 | 16 | 17 | 20..=23 => is_zero(v),
         6 => !v.is_object() && is_zero(v),

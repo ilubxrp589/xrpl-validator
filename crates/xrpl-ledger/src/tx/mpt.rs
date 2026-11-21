@@ -99,7 +99,7 @@ pub const MAX_ASSET_CHECK_DEPTH: u8 = 5;
 
 /// An `Asset` as a Vault's `sfAsset` or a share's reference holding names it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum HeldAsset {
+pub enum HeldAsset {
     Xrp,
     Iou { currency: [u8; 20], issuer: [u8; 20] },
     Mpt([u8; 24]),
