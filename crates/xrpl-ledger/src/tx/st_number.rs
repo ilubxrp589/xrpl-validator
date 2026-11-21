@@ -675,7 +675,12 @@ mod tests {
         // 10000.15696446053 as an IOU is 1000015696446053e-11.
         assert_eq!(scale(n(1_000_015_696_446_053, -11), USD, Rounding::ToNearest), Ok(-11));
         assert_eq!(scale(n(1, 0), USD, Rounding::ToNearest), Ok(-15));
-        assert_eq!(scale(Number::ZERO, USD, Rounding::ToNearest), Ok(0));
+        // A zero IOU amount is `IOUAmount{beast::kZero}`: mantissa 0, exponent -100 (IOUAmount.h,
+        // STAmount::canonicalize's `*this = iou()`), so its scale is -100 — below every real
+        // scale, which is what makes `roundToScale(x, scale(0))` leave x alone.
+        assert_eq!(scale(Number::ZERO, USD, Rounding::ToNearest), Ok(-100));
+        assert_eq!(scale(n(1, -200), USD, Rounding::ToNearest), Ok(-100), "an underflow is that zero");
+        assert_eq!(scale(Number::ZERO, HeldAsset::Xrp, Rounding::ToNearest), Ok(0));
         assert_eq!(round_number_to_asset(USD, n(1_234_567_890_123_456_789, -18), Rounding::ToNearest), Ok(n(1_234_567_890_123_457, -15)));
     }
 
