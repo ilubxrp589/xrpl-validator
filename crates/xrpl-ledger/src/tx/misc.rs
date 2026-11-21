@@ -1935,6 +1935,66 @@ pub(crate) fn pseudo_account_address(sandbox: &Sandbox, owner_key: &xrpl_core::t
         .find(|id| !sandbox.exists(&keylet::account_root_key(id)))
 }
 
+/// The three pseudo-account designator fields — the AccountRoot fields
+/// flagged `SField::kSmdPseudoAccount` (sfields.macro:186, :206, :209;
+/// `getPseudoAccountFields`, AccountRootHelpers.cpp:521-546) — and so the
+/// three kinds of object that own a pseudo-account.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PseudoOwner {
+    /// `sfAMMID`: an AMM pool.
+    Amm,
+    /// `sfVaultID`: a Vault (VaultCreate.cpp:197).
+    Vault,
+    /// `sfLoanBrokerID`: a LoanBroker (LoanBrokerSet.cpp:261).
+    LoanBroker,
+}
+
+impl PseudoOwner {
+    /// The designator field's JSON name.
+    pub const fn field_name(self) -> &'static str {
+        match self {
+            PseudoOwner::Amm => "AMMID",
+            PseudoOwner::Vault => "VaultID",
+            PseudoOwner::LoanBroker => "LoanBrokerID",
+        }
+    }
+}
+
+/// rippled `createPseudoAccount(view, pseudoOwnerKey, ownerField)`
+/// (AccountRootHelpers.cpp:556-599): the AccountRoot of the object at
+/// `owner_key`, written at the first free of the 256 candidate addresses
+/// (`pseudoAccountAddress`, :499-513) — tecDUPLICATE when none is free
+/// (:563-567). The root (:575-596): a zero XRP balance; Sequence 0 once
+/// SingleAssetVault or LendingProtocol is enabled, the sequence of the
+/// ledger being built before (:581-589); lsfDisableMaster | lsfDefaultRipple
+/// | lsfDepositAuth; and `owner_field` holding the owner object's key.
+/// Returns the new account's id; the caller links and funds it.
+pub(crate) fn create_pseudo_account(
+    sandbox: &mut Sandbox,
+    owner_key: &xrpl_core::types::Hash256,
+    owner_field: PseudoOwner,
+) -> Result<[u8; 20], TxResult> {
+    const LSF_DISABLE_MASTER: u64 = 0x0010_0000;
+    const LSF_DEFAULT_RIPPLE: u64 = 0x0080_0000;
+    const LSF_DEPOSIT_AUTH: u64 = 0x0100_0000;
+    let Some(account) = pseudo_account_address(sandbox, owner_key) else {
+        return Err(TxResult::Duplicate);
+    };
+    let sequence =
+        if crate::ledger::amendments::pseudo_account_sequence_is_zero(sandbox) { 0 } else { sandbox.base().header.sequence + 1 };
+    let mut root = serde_json::json!({
+        "LedgerEntryType": "AccountRoot",
+        "Account": hex::encode(account),
+        "Balance": "0",
+        "Sequence": sequence,
+        "OwnerCount": 0,
+        "Flags": LSF_DISABLE_MASTER | LSF_DEFAULT_RIPPLE | LSF_DEPOSIT_AUTH,
+    });
+    root[owner_field.field_name()] = serde_json::Value::String(hex::encode_upper(owner_key.0));
+    sandbox.write(keylet::account_root_key(&account), serde_json::to_vec(&root).unwrap_or_default());
+    Ok(account)
+}
+
 pub(crate) fn is_pseudo_account(sandbox: &Sandbox, account: &[u8; 20]) -> bool {
     crate::tx::offer::json_at(sandbox, &keylet::account_root_key(account))
         .is_some_and(|a| a.get("AMMID").is_some() || a.get("VaultID").is_some() || a.get("LoanBrokerID").is_some())

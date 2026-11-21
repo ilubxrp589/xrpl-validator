@@ -288,26 +288,17 @@ impl Transactor for AMMCreateTransactor {
         // With none free `createPseudoAccount` is tecDUPLICATE
         // (AccountRootHelpers.cpp:563-567, returned by AMMCreate's
         // applyCreate); under SingleAssetVault preclaim caught it first.
-        let Some(amm_acct) = crate::tx::misc::pseudo_account_address(sandbox, &amm_hash) else {
-            return TxResult::Duplicate;
+        // `createPseudoAccount(view, ammKeylet.key, sfAMMID)` (AMMCreate.cpp
+        // applyCreate): lsfDisableMaster | lsfDepositAuth | lsfDefaultRipple,
+        // Sequence = the ledger being built (view.seq(), parent + 1) until
+        // SingleAssetVault or LendingProtocol makes it 0
+        // (AccountRootHelpers.cpp:581-589; devnet #5488138 77C8DE46, Finding
+        // 350 — mainnet has neither yet). The one function Vault and
+        // LoanBroker share.
+        let amm_acct = match crate::tx::misc::create_pseudo_account(sandbox, &amm_hash, crate::tx::misc::PseudoOwner::Amm) {
+            Ok(account) => account,
+            Err(ter) => return ter,
         };
-        let amm_acct_key = keylet::account_root_key(&amm_acct);
-
-        // AMM AccountRoot: lsfDisableMaster | lsfDepositAuth | lsfDefaultRipple.
-        let amm_root = serde_json::json!({
-            "LedgerEntryType": "AccountRoot",
-            "Account": hex::encode(amm_acct),
-            "Balance": "0",
-            // view.seq() is the ledger BEING BUILT — parent + 1; once
-            // SingleAssetVault or LendingProtocol is enabled a pseudo-account
-            // gets Sequence 0 (AccountRootHelpers.cpp:581-589; devnet
-            // #5488138 77C8DE46, Finding 350 — mainnet has neither yet).
-            "Sequence": if crate::ledger::amendments::pseudo_account_sequence_is_zero(sandbox) { 0 } else { sandbox.base().header.sequence + 1 },
-            "OwnerCount": 0,
-            "Flags": 0x0110_0000u64 | 0x0080_0000,
-            "AMMID": hex::encode_upper(amm_hash.0),
-        });
-        sandbox.write(amm_acct_key, serde_json::to_vec(&amm_root).unwrap_or_default());
 
         // Mint the creator's LP tokens: `ammLPTokens` = sqrt(Amount * Amount2),
         // XRP counted in DROPS. This was a hardcoded 1e7 placeholder, which
