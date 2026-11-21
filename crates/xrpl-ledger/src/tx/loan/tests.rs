@@ -1275,6 +1275,48 @@ fn a_whole_loan_life() {
     assert!(stored(&fx.state, &fx.broker).get("OwnerCount").is_none());
 }
 
+/// What the vault and loan-broker transactors (ported earlier) read of the
+/// state a loan leaves: VaultWithdraw against sfAssetsAvailable
+/// (VaultWithdraw.cpp:440-499), VaultDelete's and LoanBrokerDelete's
+/// obligations (VaultDelete.cpp:57-62, LoanBrokerDelete.cpp:59-63),
+/// LoanBrokerCoverWithdraw's minimum cover on sfDebtTotal
+/// (LoanBrokerCoverWithdraw.cpp:171-195).
+#[test]
+fn the_vault_and_the_broker_see_the_loan() {
+    let mut fx = Fx::new(Kind::Xrp, &MAINNET_WITH_LENDING, json!({"CoverRateMinimum": 10_000, "CoverRateLiquidation": 10_000})).with_loan(json!({}));
+    let (vault, broker) = (key_hex(&fx.vault), key_hex(&fx.broker));
+    // 9,000,000 drops are on hand; 1,000,000 are out on loan.
+    let withdraw = |drops: u64| tx("VaultWithdraw", OWNER, json!({"VaultID": vault, "Amount": drops.to_string()}));
+    assert_eq!(result(&fx.state, &withdraw(9_000_001)), TxResult::InsufficientFunds);
+    assert_eq!(result(&fx.state, &withdraw(9_000_000)), TxResult::Success);
+    assert_eq!(result(&fx.state, &tx("VaultDelete", OWNER, json!({"VaultID": vault}))), TxResult::HasObligations);
+    assert_eq!(result(&fx.state, &tx("LoanBrokerDelete", OWNER, json!({"LoanBrokerID": broker}))), TxResult::HasObligations);
+    // 10% of the 1,000,000 debt must stay as cover.
+    let cover_out = |drops: u64| tx("LoanBrokerCoverWithdraw", OWNER, json!({"LoanBrokerID": broker, "Amount": drops.to_string()}));
+    assert_eq!(result(&fx.state, &cover_out(900_001)), TxResult::InsufficientFunds);
+    assert_eq!(result(&fx.state, &cover_out(900_000)), TxResult::Success);
+    // An impaired loan's exposure is an unrealized loss: the same shares are worth less.
+    let late = Fx::new(Kind::Xrp, &MAINNET_WITH_LENDING, json!({})).with_loan(json!({})).at(START + 601);
+    let mut impaired = Fx::new(Kind::Xrp, &MAINNET_WITH_LENDING, json!({})).with_loan(json!({})).at(START + 601);
+    impaired.commit(impaired.manage(TF_LOAN_IMPAIR));
+    let share = stored(&late.state, &late.vault)["ShareMPTID"].as_str().unwrap().to_string();
+    let redeem = |fx: &Fx| {
+        let before = xrp_of(&Sandbox::new(&fx.state), &OWNER);
+        let t = tx("VaultWithdraw", OWNER, json!({"VaultID": key_hex(&fx.vault), "Amount": {"mpt_issuance_id": share, "value": "1000000"}}));
+        let (r, sb) = apply(&fx.state, &t);
+        assert_eq!(r, TxResult::Success);
+        xrp_of(&sb, &OWNER) + FEE - before
+    };
+    assert!(redeem(&impaired) < redeem(&late), "the loss discounts a withdrawal");
+    // Paid off and deleted, the broker can go.
+    fx.commit(fx.pay(1000, 0));
+    assert_eq!(result(&fx.state, &tx("LoanBrokerDelete", OWNER, json!({"LoanBrokerID": broker}))), TxResult::HasObligations, "the Loan object is still there");
+    fx.commit(fx.delete(OWNER));
+    let (r, sb) = apply(&fx.state, &tx("LoanBrokerDelete", OWNER, json!({"LoanBrokerID": broker})));
+    assert_eq!(r, TxResult::Success);
+    assert!(get(&sb, &fx.broker).is_none() && root_of(&sb, &fx.broker_pseudo).is_none());
+}
+
 // ---------------------------------------------------------------------------
 // Base fees
 // ---------------------------------------------------------------------------
