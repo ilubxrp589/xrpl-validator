@@ -95,3 +95,8 @@ required-features = ["ffi"]
 name = "arith_fuzz"
 path = "tests/arith_fuzz.rs"
 required-features = ["ffi"]
+
+[[test]]
+name = "libxrpl_341_differential"
+path = "tests/libxrpl_341_differential.rs"
+required-features = ["ffi"]
