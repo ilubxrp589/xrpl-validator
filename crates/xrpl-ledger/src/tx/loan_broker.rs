@@ -817,16 +817,135 @@ fn determine_claw_amount(
 }
 
 impl Transactor for LoanBrokerCoverClawbackTransactor {
-    fn preflight(&self, _tx: &TxFields) -> TxResult {
-        TxResult::Unsupported
+    /// `LoanBrokerCoverClawback::preflight` (LoanBrokerCoverClawback.cpp:42-84).
+    fn preflight(&self, tx: &TxFields) -> TxResult {
+        // One of the two is needed.
+        if !has(tx, "LoanBrokerID") && !has(tx, "Amount") {
+            return TxResult::InvalidTx;
+        }
+        if has(tx, "LoanBrokerID") && broker_id(tx).is_none_or(|id| is_zero_key(&id)) {
+            return TxResult::InvalidTx;
+        }
+        if let Some(amount) = tx.fields.get("Amount") {
+            let Some(amount) = tx_amount(amount) else { return TxResult::BadAmount };
+            // XRP has no issuer: nobody can claw it back.
+            if amount.asset == HeldAsset::Xrp {
+                return TxResult::BadAmount;
+            }
+            // Zero is fine: "all of it", down to the minimum cover.
+            if amount.negative && !amount.is_zero() {
+                return TxResult::BadAmount;
+            }
+            if !has(tx, "LoanBrokerID") {
+                // Without a broker id the amount must be an IOU naming the
+                // broker's pseudo-account as its issuer — not the submitter,
+                // not nobody.
+                let HeldAsset::Iou { issuer: holder, .. } = amount.asset else { return TxResult::InvalidTx };
+                if holder == tx.account || holder == [0u8; 20] {
+                    return TxResult::InvalidTx;
+                }
+            }
+        }
+        TxResult::Success
     }
 
-    fn preclaim(&self, _tx: &TxFields, _sandbox: &Sandbox) -> TxResult {
-        TxResult::Unsupported
+    fn preflight_in(&self, tx: &TxFields, rules: &Sandbox) -> TxResult {
+        // `checkExtraFeatures` (:36-40).
+        gate(tx, rules, lh::check_lending_protocol_dependencies(rules, tx), TF_UNIVERSAL_MASK).unwrap_or_else(|| self.preflight(tx))
     }
 
-    fn do_apply(&self, _tx: &TxFields, _sandbox: &mut Sandbox) -> TxResult {
-        TxResult::Unsupported
+    /// `LoanBrokerCoverClawback::preclaim` (LoanBrokerCoverClawback.cpp:236-334).
+    fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        let account = tx.account;
+        let id = match determine_broker_id(sandbox, tx) {
+            Ok(id) => id,
+            Err(refused) => return refused,
+        };
+        let amount = tx.fields.get("Amount").and_then(tx_amount);
+        let Some(broker) = read_broker(sandbox, &id) else { return TxResult::NoEntry };
+        let Some(pseudo) = account_of(&broker, "Account") else { return TxResult::TefInternal };
+        let Some(vault) = vault_of(sandbox, &broker) else { return TxResult::TefBadLedger };
+        let Some(asset) = vault_asset(&vault) else { return TxResult::TefInternal };
+        if asset == HeldAsset::Xrp {
+            return TxResult::NoPermission;
+        }
+        // Only the asset's issuer claws back.
+        let issuer = holding::asset_issuer(&asset);
+        if issuer != account {
+            return TxResult::NoPermission;
+        }
+        if let Some(amount) = &amount {
+            match determine_asset(&account, &pseudo, amount) {
+                // The right issuer, the wrong asset.
+                Ok(tx_asset) if tx_asset != asset => return TxResult::WrongAsset,
+                Ok(_) => {}
+                Err(refused) => return refused,
+            }
+        }
+        let claw = match determine_claw_amount(sandbox, &broker, &vault, asset, amount.as_ref()) {
+            // The cover is already at its minimum.
+            Ok(Err(refused)) => return refused,
+            Ok(Ok(claw)) => claw,
+            Err(_) => return TxResult::TefException,
+        };
+        match lh::can_apply_to_broker_cover(sandbox, &broker, asset, &claw) {
+            Ok(TxResult::Success) => {}
+            Ok(refused) => return refused,
+            Err(_) => return TxResult::TefException,
+        }
+        // The balance must really be there; it always equals sfCoverAvailable.
+        if less(&holding::account_holds(sandbox, &pseudo, &asset, false, false), &claw) {
+            return TxResult::TecInternal;
+        }
+        let Some(issuer_root) = json_at(sandbox, &keylet::account_root_key(&issuer)) else { return TxResult::TefBadLedger };
+        match asset {
+            // `preclaimHelper<MPTIssue>` (:215-234).
+            HeldAsset::Mpt(mpt_id) => match json_at(sandbox, &keylet::mpt_issuance_key(&mpt_id)) {
+                None => TxResult::ObjectNotFound,
+                Some(issuance) if obj_flags(&issuance) & mpt::LSF_MPT_CAN_CLAWBACK == 0 => TxResult::NoPermission,
+                Some(issuance) if mpt::issuance_issuer(&issuance) != Some(issuer) => TxResult::TecInternal,
+                Some(_) => TxResult::Success,
+            },
+            // `preclaimHelper<Issue>` (:203-212): lsfAllowTrustLineClawback
+            // and not lsfNoFreeze.
+            _ => {
+                let flags = obj_flags(&issuer_root);
+                if flags & LSF_ALLOW_TRUST_LINE_CLAWBACK == 0 || flags & LSF_NO_FREEZE != 0 {
+                    TxResult::NoPermission
+                } else {
+                    TxResult::Success
+                }
+            }
+        }
+    }
+
+    /// `LoanBrokerCoverClawback::doApply` (LoanBrokerCoverClawback.cpp:336-376).
+    fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        let Ok(id) = determine_broker_id(sandbox, tx) else { return TxResult::TecInternal };
+        let amount = tx.fields.get("Amount").and_then(tx_amount);
+        let Some(mut broker) = read_broker(sandbox, &id) else { return TxResult::TecInternal };
+        let Some(vault) = vault_of(sandbox, &broker) else { return TxResult::TecInternal };
+        let (Some(asset), Some(pseudo)) = (vault_asset(&vault), account_of(&broker, "Account")) else {
+            return TxResult::TecInternal;
+        };
+        let claw = match determine_claw_amount(sandbox, &broker, &vault, asset, amount.as_ref()) {
+            Ok(Ok(claw)) => claw,
+            Ok(Err(_)) => return TxResult::TecInternal,
+            Err(_) => return TxResult::TefException,
+        };
+        if claw.asset == HeldAsset::Xrp {
+            return TxResult::TecInternal;
+        }
+        let Ok(cover) = number_field(&broker, "CoverAvailable").sub(claw.number(), AMBIENT) else {
+            return TxResult::TefException;
+        };
+        set_number_field(&mut broker, "CoverAvailable", cover, Soe::Default);
+        let stored = store_broker(sandbox, id, &mut broker, asset);
+        if stored != TxResult::Success {
+            return stored;
+        }
+        // From the pseudo-account to the issuer.
+        holding::account_send(sandbox, &pseudo, &tx.account, &claw, true)
     }
 }
 
