@@ -121,7 +121,7 @@ pub(crate) fn parse_asset(v: &serde_json::Value) -> Option<HeldAsset> {
 /// A UInt256 field (hex) as a ledger key — `sfVaultID`, `sfReferenceHolding`,
 /// `sfDomainID`: `keylet::vault(id)`, `keylet::unchecked(id)` and
 /// `keylet::permissionedDomain(id)` are the id itself.
-fn key_field(obj: &serde_json::Value, field: &str) -> Option<Hash256> {
+pub(crate) fn key_field(obj: &serde_json::Value, field: &str) -> Option<Hash256> {
     let bytes = hex::decode(obj.get(field)?.as_str()?).ok()?;
     Some(Hash256(bytes.as_slice().try_into().ok()?))
 }
@@ -271,6 +271,19 @@ pub(crate) fn any_frozen(
     any_frozen_at(sandbox, issuance_key, Some(issuance), accounts, 0)
 }
 
+/// [`any_frozen`] for an issuance that may be missing — `isFrozen(view,
+/// account, mptIssue, depth = 0)` (MPTokenHelpers.cpp:74-83): without the
+/// issuance only an account's own MPToken lock, or the vault preconditions
+/// (View.cpp:157-171), can freeze.
+pub(crate) fn any_frozen_opt(
+    sandbox: &Sandbox,
+    issuance_key: &Hash256,
+    issuance: Option<&serde_json::Value>,
+    accounts: &[&[u8; 20]],
+) -> bool {
+    any_frozen_at(sandbox, issuance_key, issuance, accounts, 0)
+}
+
 fn any_frozen_at(
     sandbox: &Sandbox,
     issuance_key: &Hash256,
@@ -417,7 +430,7 @@ fn can_transfer_at(sandbox: &Sandbox, issuance: &serde_json::Value, from: &[u8; 
 /// lines with the issuer (the issuer's side's NoRipple; without a line, the
 /// issuer's lsfDefaultRipple stands in) — terNO_RIPPLE. tefINTERNAL without
 /// the issuer's root.
-fn iou_can_transfer(sandbox: &Sandbox, currency: &[u8; 20], issuer: &[u8; 20], from: &[u8; 20], to: &[u8; 20]) -> TxResult {
+pub(crate) fn iou_can_transfer(sandbox: &Sandbox, currency: &[u8; 20], issuer: &[u8; 20], from: &[u8; 20], to: &[u8; 20]) -> TxResult {
     const LSF_DEFAULT_RIPPLE: u64 = 0x0080_0000;
     const LSF_LOW_NO_RIPPLE: u64 = 0x0010_0000;
     const LSF_HIGH_NO_RIPPLE: u64 = 0x0020_0000;

@@ -14,6 +14,7 @@ pub mod delegate;
 pub mod direct_step;
 pub mod dispatch;
 pub mod escrow;
+pub mod holding;
 pub mod ledger_state_fix;
 pub mod misc;
 pub mod mpt;
@@ -27,6 +28,7 @@ pub mod pseudo;
 pub mod st_number;
 pub mod ticket;
 pub mod trust_set;
+pub mod vault_helpers;
 pub mod xchain;
 
 /// Clear every per-transaction thread-local the transactors keep — the

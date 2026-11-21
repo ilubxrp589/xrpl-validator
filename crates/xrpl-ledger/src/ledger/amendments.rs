@@ -29,6 +29,15 @@ pub fn enabled(sandbox: &Sandbox, id_hex: &str) -> bool {
         .is_some_and(|a| a.iter().any(|x| x.as_str().is_some_and(|s| s.eq_ignore_ascii_case(id_hex))))
 }
 
+/// fixCleanup3_1_3 — `XRPL_FIX(Cleanup3_1_3, Supported::Yes, DefaultYes)`
+/// (features.macro:27); the ID is sha512Half("fixCleanup3_1_3"). Named where
+/// the vault helpers branch on it: an MPToken's sfLockedAmount counts as an
+/// obligation in `removeEmptyHolding` / `authorizeMPToken`
+/// (MPTokenHelpers.cpp:227-229, :349-351). Its mainnet status is not
+/// recorded in this tree (inventory Q1), so both arms are carried.
+pub const FIX_CLEANUP_3_1_3: &str =
+    "303ACB16CF8DBD3B5C34F131A9D19A7DE01AE05F480A8A682B869D1B4AAC8CFC";
+
 /// fixCleanup3_2_0 — enabled on mainnet. Gates LedgerStateFix's
 /// BookExchangeRate fix type (among other 3.2.0 cleanups ported earlier).
 pub const FIX_CLEANUP_3_2_0: &str =
