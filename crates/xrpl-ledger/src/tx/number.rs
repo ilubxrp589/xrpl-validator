@@ -1,5 +1,6 @@
-//! rippled's `Number` (libxrpl/basics/Number.cpp, 3.3.0), ported line for
-//! line at the 16-digit "Small" mantissa scale.
+//! rippled's `Number` (libxrpl/basics/Number.cpp + Number.h, 3.4.1), ported
+//! line for line at two mantissa scales: the 16-digit "Small" scale mainnet
+//! runs today and the 19-digit "Large330" scale.
 //!
 //! `Number` is the decimal float every IOU balance moves through: STAmount
 //! addition and subtraction are `IOUAmount::operator+=`, which is
@@ -7,23 +8,59 @@
 //! not "round the exact result to 16 digits": operands are aligned by
 //! dropping digits into a four-bit-per-digit `Guard` (sixteen digits plus a
 //! sticky bit), the mantissas are added or subtracted, the guard decides the
-//! last-digit adjustment under the thread's rounding mode, and the mantissa
-//! is then pulled back into `[1e15, 1e16)` WITHOUT re-rounding — so a
-//! subtraction that borrows across the 1e15 cusp loses a digit
-//! (`1e15 − ε` rounding down is `9999999999999990e-1`, not `…9999e-1`), and a
-//! subtrahend more than sixteen digits below the minuend cannot borrow at
-//! all (`1e11 − 2.27e-5` at nearest is `1e11`). Track-1 fuzz, 2026-09-14:
+//! last-digit adjustment under the thread's rounding mode, and — at the Small
+//! scale — the mantissa is then pulled back into `[1e15, 1e16)` WITHOUT
+//! re-rounding, so a subtraction that borrows across the 1e15 cusp loses a
+//! digit (`1e15 − ε` rounding down is `9999999999999990e-1`, not `…9999e-1`),
+//! and a subtrahend more than sixteen digits below the minuend cannot borrow
+//! at all (`1e11 − 2.27e-5` at nearest is `1e11`). Track-1 fuzz, 2026-09-14:
 //! 1,277 / 115 / 91 of 20,000 subtractions (down / nearest / up) differed from
 //! the engine's exact-then-round model; every other operation agreed.
 //!
-//! The mantissa scale is amendment-gated in rippled (`Rules.cpp`
-//! `setCurrentTransactionRules`): the 19-digit "Large" scale switches on with
-//! SingleAssetVault or LendingProtocol, neither enabled on mainnet. This port
-//! is the Small scale only — `CuspRoundingFix::Disabled` on every branch, so
-//! the Enabled320/330 arms of the original are omitted, not approximated.
+//! # The mantissa scale
+//!
+//! rippled keeps the scale in a thread-local (`Number::kRange`,
+//! Number.cpp:32-33) that `setCurrentTransactionRules` sets for every
+//! transaction step from the ledger's rules (Rules.cpp:35-74): Small while
+//! neither SingleAssetVault nor LendingProtocol is enabled, a Large scale as
+//! soon as either is. This port keeps the same shape — [`mantissa_scale`] is a
+//! thread-local, [`ScaleGuard`] sets it for a scope and restores the previous
+//! value (rippled's `NumberMantissaScaleGuard`, Number.h:962-976) — so every
+//! operation below runs at the scale its transaction was given and no call
+//! site names one. The thread's default here is **Small** (mainnet's scale);
+//! rippled's default outside any guard is Large330.
+//!
+//! Of rippled's three Large scales only **Large330** is ported: Large320 and
+//! LargeLegacy apply when fixCleanup3_3_0 / fixCleanup3_2_0 are off, and both
+//! are on at mainnet, so a ledger that enables a vault amendment lands on
+//! Large330 (Rules.cpp:58-71). What Large330 changes, beside the range
+//! `[1e18, 1e19)` (Number.h:198-245; `CuspRoundingFix::Enabled330`):
+//!
+//!  * a mantissa above `kMaxRep` (2^63 − 1) is held as a multiple of ten, so
+//!    the signed 64-bit external view is `mantissa / 10`, `exponent + 1`
+//!    (Number.h:691-726) — see [`Number::external`];
+//!  * `Guard::round()` answers `Exact` for an empty guard, `doRoundUp` never
+//!    increments past the range (it snaps to `kMaxRepUp` or drops a digit and
+//!    rounds again), `doRoundDown` decrements on ANY remainder, and
+//!    `pushOverflow` rounds the three values between `kMaxRep` and
+//!    `kMaxRepUp` (Number.cpp:445-688);
+//!  * addition aligns in three steps and hands `doNormalize` a `dropped`
+//!    flag (Number.cpp:963-1123), so the result is the correctly rounded sum;
+//!  * division appends a second stage (the remainder × 1e5) and a sticky
+//!    third (Number.cpp:1292-1354).
+//!
+//! The Small arms are the 3.3.0 port unchanged. 3.4.1's only edit to
+//! Number.cpp is `Guard::doDropDigitWithTarget` (Number.cpp:426-443), a
+//! shortcut for the alignment loop: once the mantissa is zero and the guard
+//! holds no digit, further drops push zeros onto zeros, so it jumps to the
+//! target exponent. The guard and the result are the same either way.
 //!
 //! Overflow (`exponent > 32768`) is an error, as rippled throws; the caller
 //! decides what a throw means for its transaction.
+
+use std::cell::Cell;
+use std::cmp::Ordering;
+use std::marker::PhantomData;
 
 /// rippled's `Number::RoundingMode` (a thread-local there; explicit here).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -34,8 +71,93 @@ pub enum Rounding {
     Upward,
 }
 
+/// rippled's `MantissaRange::MantissaScale` (Number.h:136-150), the two the
+/// engine can meet: `Small` (mantissa in `[1e15, 1e16)`) and `Large330`
+/// (`[1e18, 1e19)` with `CuspRoundingFix::Enabled330`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MantissaScale {
+    Small,
+    Large330,
+}
+
+impl MantissaScale {
+    /// `setCurrentTransactionRules`' choice (Rules.cpp:43-71): Small unless
+    /// SingleAssetVault or LendingProtocol is enabled. With either enabled
+    /// rippled picks Large330 when fixCleanup3_3_0 is on, Large320 when only
+    /// fixCleanup3_2_0 is, LargeLegacy otherwise; both fixes are on at
+    /// mainnet, and Large330 is the only Large scale this port has.
+    pub fn for_rules(single_asset_vault: bool, lending_protocol: bool) -> MantissaScale {
+        if single_asset_vault || lending_protocol {
+            MantissaScale::Large330
+        } else {
+            MantissaScale::Small
+        }
+    }
+
+    /// `MantissaRange::min` (Number.h:173): 1e15 or 1e18.
+    pub const fn min_mantissa(self) -> u64 {
+        match self {
+            MantissaScale::Small => 1_000_000_000_000_000,
+            MantissaScale::Large330 => 1_000_000_000_000_000_000,
+        }
+    }
+
+    /// `MantissaRange::max` (Number.h:174): `min * 10 - 1`.
+    pub const fn max_mantissa(self) -> u64 {
+        self.min_mantissa() * 10 - 1
+    }
+
+    /// `MantissaRange::log` (Number.h:198-216): the digits of `min`, less one.
+    pub const fn log(self) -> i32 {
+        match self {
+            MantissaScale::Small => 15,
+            MantissaScale::Large330 => 18,
+        }
+    }
+}
+
+thread_local! {
+    /// `Number::kRange` (Number.cpp:32-33). Small unless a [`ScaleGuard`] is
+    /// alive on this thread.
+    static SCALE: Cell<MantissaScale> = const { Cell::new(MantissaScale::Small) };
+}
+
+/// `Number::getMantissaScale()`: the scale this thread's arithmetic runs at.
+pub fn mantissa_scale() -> MantissaScale {
+    SCALE.with(|s| s.get())
+}
+
+/// rippled's `NumberMantissaScaleGuard` (Number.h:962-976): sets the thread's
+/// scale and restores the previous one when dropped. One is taken at each
+/// transaction entry from the ledger's amendments
+/// (`ledger::amendments::number_scale_guard`); tests take one to run at
+/// Large330.
+#[must_use = "the scale is restored when the guard is dropped"]
+pub struct ScaleGuard {
+    saved: MantissaScale,
+    /// The scale is a thread-local: the guard must be dropped where it was made.
+    _not_send: PhantomData<*const ()>,
+}
+
+impl ScaleGuard {
+    pub fn new(scale: MantissaScale) -> ScaleGuard {
+        ScaleGuard { saved: SCALE.with(|s| s.replace(scale)), _not_send: PhantomData }
+    }
+}
+
+impl Drop for ScaleGuard {
+    fn drop(&mut self) {
+        SCALE.with(|s| s.set(self.saved));
+    }
+}
+
 /// A normalised decimal float: `(−1)^negative × mantissa × 10^exponent`, with
-/// the mantissa in `[1e15, 1e16)` or the canonical zero `(false, 0, 0)`.
+/// the mantissa in the range of the scale it was made at (`[1e15, 1e16)`
+/// Small; `[1e18, 1e19)` Large330, a multiple of ten above 2^63 − 1) or the
+/// canonical zero `(false, 0, 0)`. The fields are the INTERNAL
+/// representation: read a value out through [`Number::external`],
+/// [`Number::iou_parts`] or [`Number::to_drops`], which are right at either
+/// scale.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Number {
     pub negative: bool,
@@ -52,15 +174,54 @@ pub enum NumberError {
     DivideByZero,
 }
 
-const MIN_MANTISSA: u128 = 1_000_000_000_000_000;
-const MAX_MANTISSA: u128 = 9_999_999_999_999_999;
+/// STAmount / IOUAmount's canonical mantissa range (`STAmount::kMinValue`,
+/// `kMaxValue`): sixteen digits whatever scale `Number` runs at.
+pub const IOU_MIN_MANTISSA: u64 = 1_000_000_000_000_000;
+pub const IOU_MAX_MANTISSA: u64 = 9_999_999_999_999_999;
+
 /// `kMaxRep`: the largest magnitude the signed 64-bit external mantissa holds.
 const K_MAX_REP: u128 = i64::MAX as u128;
+/// `kMaxRepUp` (Number.h:367): `kMaxRep` rounded up to the next multiple of
+/// ten, 9,223,372,036,854,775,810 — the largest Large330 mantissa below the
+/// "multiple of ten" region that rounding can land on.
+const K_MAX_REP_UP: u128 = (K_MAX_REP / 10 + 1) * 10;
 const K_MIN_EXPONENT: i32 = -32768;
 const K_MAX_EXPONENT: i32 = 32768;
 
+/// What an operation needs of a `MantissaRange`: the bounds and whether the
+/// cusp rounding fix is `Enabled330`. `normalizeToRange` passes its own
+/// bounds with the fix disabled (Number.h:866-869).
+#[derive(Clone, Copy)]
+struct Range {
+    min: u128,
+    max: u128,
+    fix330: bool,
+}
+
+impl Range {
+    const fn of(scale: MantissaScale) -> Range {
+        Range {
+            min: scale.min_mantissa() as u128,
+            max: scale.max_mantissa() as u128,
+            fix330: matches!(scale, MantissaScale::Large330),
+        }
+    }
+
+    /// `repLimit` (Number.cpp:763-765, 957-958, 1166-1167).
+    const fn rep_limit(self) -> u128 {
+        if self.fix330 {
+            K_MAX_REP_UP
+        } else {
+            K_MAX_REP
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Round {
+    /// The guard is empty: nothing was dropped. Enabled330 only
+    /// (Number.cpp:315-329).
+    Exact,
     Down,
     Even,
     Up,
@@ -74,15 +235,21 @@ struct Guard {
     xbit: bool,
     sbit: bool,
     mode: Rounding,
+    range: Range,
 }
 
 impl Guard {
-    fn new(mode: Rounding) -> Self {
-        Guard { digits: 0, xbit: false, sbit: false, mode }
+    fn new(mode: Rounding, range: Range) -> Self {
+        Guard { digits: 0, xbit: false, sbit: false, mode, range }
     }
 
     fn set_negative(&mut self) {
         self.sbit = true;
+    }
+
+    /// `setDropped`: non-zero digits were lost before this guard saw them.
+    fn set_dropped(&mut self) {
+        self.xbit = true;
     }
 
     /// `doPush`: shift a digit in at the top, the bottom nibble falling into
@@ -101,8 +268,14 @@ impl Guard {
         d
     }
 
+    /// `unrecoverable` (Number.cpp:393-397): no digit left to pop, though the
+    /// sticky bit may be set.
+    fn unrecoverable(&self) -> bool {
+        self.digits == 0
+    }
+
     fn empty(&self) -> bool {
-        self.digits == 0 && !self.xbit
+        self.unrecoverable() && !self.xbit
     }
 
     /// `doDropDigit`: move the mantissa's ones digit into the guard.
@@ -112,8 +285,46 @@ impl Guard {
         *exponent += 1;
     }
 
+    /// `doDropDigitWithTarget` (Number.cpp:426-443): drop digits until the
+    /// exponent reaches `target`. Once the mantissa is zero and the guard has
+    /// no digit to lose, every further drop pushes a zero onto zeros — the
+    /// guard cannot change — so the exponent jumps straight to the target.
+    fn drop_digit_with_target(&mut self, mantissa: &mut u128, exponent: &mut i32, target: i32) {
+        while *exponent < target {
+            if *mantissa == 0 && self.unrecoverable() {
+                *exponent = target;
+                return;
+            }
+            self.drop_digit(mantissa, exponent);
+        }
+    }
+
+    /// `pushOverflow` (Number.cpp:445-501), Enabled330 only: a mantissa in
+    /// `[kMaxRep, kMaxRepUp)` can only be stored as `kMaxRep` or `kMaxRepUp`,
+    /// so its position between the two is pushed onto the guard as if it
+    /// were a dropped digit (0, 3 or 6 of the spread of 3) — after the digits
+    /// already in the guard have had their say on a value below the top.
+    /// `mantissa` is rippled's by-value copy: the caller's is not changed.
+    fn push_overflow(&mut self, mantissa: u128) {
+        if self.range.fix330 && (K_MAX_REP..K_MAX_REP_UP).contains(&mantissa) {
+            let mut m = mantissa;
+            if m % 10 < 9 {
+                let r = self.round();
+                if r == Round::Up || (r == Round::Even && m == K_MAX_REP + 1) {
+                    m += 1;
+                }
+            }
+            let spread = K_MAX_REP_UP - K_MAX_REP;
+            let digit = ((m - K_MAX_REP) * 10) / spread;
+            self.push(digit as u64);
+        }
+    }
+
     /// `round()`: what the guard says the last digit should do under `mode`.
     fn round(&self) -> Round {
+        if self.range.fix330 && self.empty() {
+            return Round::Exact;
+        }
         match self.mode {
             Rounding::TowardsZero => Round::Down,
             Rounding::Downward if !self.sbit => Round::Down,
@@ -139,32 +350,53 @@ impl Guard {
         }
     }
 
-    /// `bringIntoRange` (cusp fix disabled): one ×10 if the mantissa fell
-    /// below 1e15 — no re-rounding of the digit that appears — and the
-    /// canonical zero once the exponent underflows.
+    /// `bringIntoRange` (Number.cpp:551-576): one ×10 if the mantissa fell
+    /// below the minimum — no re-rounding of the digit that appears — and
+    /// the canonical zero once the exponent underflows. Enabled330 leaves a
+    /// zero mantissa alone and makes it the canonical zero.
     fn bring_into_range(&self, negative: &mut bool, mantissa: &mut u128, exponent: &mut i32) {
-        if *mantissa < MIN_MANTISSA {
+        if *mantissa < self.range.min && (!self.range.fix330 || *mantissa != 0) {
             *mantissa *= 10;
             *exponent -= 1;
         }
-        if *exponent < K_MIN_EXPONENT {
+        if *exponent < K_MIN_EXPONENT || (self.range.fix330 && *mantissa == 0) {
             *negative = false;
             *mantissa = 0;
             *exponent = 0;
         }
     }
 
-    /// `doRoundUp` (cusp fix disabled; `pushOverflow` is a no-op there): bump
-    /// the mantissa when the guard says so, sliding a digit off if that
-    /// overflows the range, then bring it into range.
-    fn round_up(&self, negative: &mut bool, mantissa: &mut u128, exponent: &mut i32) -> Result<(), NumberError> {
+    /// `doRoundUp` (Number.cpp:578-652): bump the mantissa when the guard
+    /// says so, then bring it into range.
+    ///
+    /// Cusp fix disabled: increment, and slide a digit off (unrounded) if
+    /// that left the range. Enabled330: increment only when the result stays
+    /// inside both the range and `kMaxRep`; a value between `kMaxRep` and
+    /// `kMaxRepUp` snaps to `kMaxRepUp` (up) or `kMaxRep` (down); otherwise
+    /// drop a digit and round again — once, the shortened mantissa being far
+    /// below both limits.
+    fn round_up(&mut self, negative: &mut bool, mantissa: &mut u128, exponent: &mut i32) -> Result<(), NumberError> {
+        self.push_overflow(*mantissa);
         let r = self.round();
         if r == Round::Up || (r == Round::Even && (*mantissa & 1) == 1) {
-            *mantissa += 1;
-            if *mantissa > MAX_MANTISSA || *mantissa > K_MAX_REP {
-                *mantissa /= 10;
-                *exponent += 1;
+            if self.range.fix330 {
+                if *mantissa < self.range.max && *mantissa < K_MAX_REP {
+                    *mantissa += 1;
+                } else if *mantissa > K_MAX_REP && *mantissa < K_MAX_REP_UP {
+                    *mantissa = K_MAX_REP_UP;
+                } else {
+                    self.drop_digit(mantissa, exponent);
+                    return self.round_up(negative, mantissa, exponent);
+                }
+            } else {
+                *mantissa += 1;
+                if *mantissa > self.range.max || *mantissa > K_MAX_REP {
+                    *mantissa /= 10;
+                    *exponent += 1;
+                }
             }
+        } else if self.range.fix330 && *mantissa > K_MAX_REP && *mantissa < K_MAX_REP_UP {
+            *mantissa = K_MAX_REP;
         }
         self.bring_into_range(negative, mantissa, exponent);
         if *exponent > K_MAX_EXPONENT {
@@ -173,13 +405,20 @@ impl Guard {
         Ok(())
     }
 
-    /// `doRoundDown` (cusp fix disabled): the subtraction side — a guard that
-    /// says "up" means the true magnitude is smaller, so decrement.
+    /// `doRoundDown` (Number.cpp:654-688), the subtraction side. Cusp fix
+    /// disabled: a guard that says "up" means the true magnitude is smaller,
+    /// so decrement. Enabled330: ANY remainder decrements (the caller then
+    /// tells `doNormalize` digits were dropped, which rounds it back up
+    /// where the mode asks).
     fn round_down(&self, negative: &mut bool, mantissa: &mut u128, exponent: &mut i32) {
         let r = self.round();
-        if r == Round::Up || (r == Round::Even && (*mantissa & 1) == 1) {
+        if self.range.fix330 {
+            if r != Round::Exact {
+                *mantissa = mantissa.wrapping_sub(1);
+            }
+        } else if r == Round::Up || (r == Round::Even && (*mantissa & 1) == 1) {
             *mantissa -= 1;
-            if *mantissa < MIN_MANTISSA {
+            if *mantissa < self.range.min {
                 *mantissa *= 10;
                 *exponent -= 1;
             }
@@ -188,58 +427,172 @@ impl Guard {
     }
 }
 
-/// `doNormalize` (cusp fix disabled, `dropped = false` on every Small-scale
-/// path): scale an arbitrary magnitude into `[1e15, 1e16)`, the digits
-/// shifted out deciding the last digit under `mode`.
-fn normalize(negative: &mut bool, mantissa: &mut u128, exponent: &mut i32, mode: Rounding) -> Result<(), NumberError> {
+/// `doNormalize` (Number.cpp:750-833): scale an arbitrary magnitude into
+/// `range`, the digits shifted out deciding the last digit under `mode`.
+/// `dropped` says non-zero digits were already lost (division's trailing
+/// remainder, an Enabled330 addition's leftover guard).
+fn normalize(
+    negative: &mut bool,
+    mantissa: &mut u128,
+    exponent: &mut i32,
+    range: Range,
+    dropped: bool,
+    mode: Rounding,
+) -> Result<(), NumberError> {
     if *mantissa == 0 {
         *negative = false;
         *exponent = 0;
         return Ok(());
     }
     let mut m = *mantissa;
-    while m < MIN_MANTISSA && *exponent > K_MIN_EXPONENT {
+    while m < range.min && *exponent > K_MIN_EXPONENT {
         m *= 10;
         *exponent -= 1;
     }
-    let mut g = Guard::new(mode);
+    let mut g = Guard::new(mode, range);
     if *negative {
         g.set_negative();
     }
-    while m > MAX_MANTISSA {
+    if dropped {
+        g.set_dropped();
+    }
+    while m > range.max {
         if *exponent >= K_MAX_EXPONENT {
             return Err(NumberError::Overflow);
         }
         g.drop_digit(&mut m, exponent);
     }
-    if *exponent < K_MIN_EXPONENT || m < MIN_MANTISSA {
+    if *exponent < K_MIN_EXPONENT || m < range.min {
         *negative = false;
         *mantissa = 0;
         *exponent = 0;
         return Ok(());
     }
-    // `m > repLimit` cannot hold below MAX_MANTISSA; rippled's `normalize 1.5`
-    // guard is for the 19-digit scale.
+    // `Number::normalize 1.5` (Number.cpp:802-820): at the Large scale the
+    // mantissa must fit the signed 64-bit view while it is rounded, so one
+    // more digit comes off; `bringIntoRange` puts a zero back in its place.
+    // Never true below 1e16 (the Small scale, `normalizeToRange`).
+    if m > range.rep_limit() {
+        if *exponent >= K_MAX_EXPONENT {
+            return Err(NumberError::Overflow);
+        }
+        g.drop_digit(&mut m, exponent);
+    }
     *mantissa = m;
     g.round_up(negative, mantissa, exponent)
+}
+
+/// `Number::operator rep()` on a magnitude and exponent (Number.cpp:1365-1392):
+/// digits below the ones place dropped into the guard, `doRound` deciding the
+/// last unit under `mode`.
+fn rep_of(negative: bool, mantissa: u128, exponent: i32, mode: Rounding, range: Range) -> Result<i64, NumberError> {
+    let mut drops = mantissa;
+    let mut offset = exponent;
+    let mut g = Guard::new(mode, range);
+    if drops != 0 {
+        if negative {
+            g.set_negative();
+        }
+        if offset < 0 {
+            g.drop_digit_with_target(&mut drops, &mut offset, 0);
+        }
+        while offset > 0 {
+            if drops > K_MAX_REP / 10 {
+                return Err(NumberError::Overflow);
+            }
+            drops *= 10;
+            offset -= 1;
+        }
+        // `doRound` (Number.cpp:690-716).
+        let r = g.round();
+        if r == Round::Up || (r == Round::Even && (drops & 1) == 1) {
+            if drops >= K_MAX_REP {
+                return Err(NumberError::Overflow);
+            }
+            drops += 1;
+        }
+    }
+    let d = drops as i64;
+    Ok(if negative { -d } else { d })
+}
+
+/// The `adjust` lambda of `operator+=` (Number.cpp:970-1002): bring the
+/// operand with the smaller exponent (`shrink`) up to the other's. Cusp fix
+/// disabled: drop its digits into the guard. Enabled330: first strip its
+/// trailing zeros, then grow the other operand (`expand`) up to
+/// `upper_limit`, and only then drop what is left.
+fn adjust(g: &mut Guard, upper_limit: u128, expand_m: &mut u128, expand_e: &mut i32, shrink_m: &mut u128, shrink_e: &mut i32) {
+    if g.range.fix330 {
+        while *shrink_e < *expand_e && *shrink_m % 10 == 0 {
+            g.drop_digit(shrink_m, shrink_e);
+        }
+        while *shrink_e < *expand_e && *expand_e > K_MIN_EXPONENT && *expand_m < upper_limit {
+            *expand_m *= 10;
+            *expand_e -= 1;
+        }
+    }
+    if *shrink_e < *expand_e {
+        g.drop_digit_with_target(shrink_m, shrink_e, *expand_e);
+    }
+}
+
+fn gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
 }
 
 impl Number {
     pub const ZERO: Number = Number { negative: false, mantissa: 0, exponent: 0 };
 
     /// `Number(rep mantissa, int exponent)`: a signed mantissa and exponent,
-    /// normalised under `mode`.
+    /// normalised under `mode` at the thread's scale.
     pub fn new(mantissa: i64, exponent: i32, mode: Rounding) -> Result<Number, NumberError> {
         Self::from_parts(mantissa < 0, mantissa.unsigned_abs() as u128, exponent, mode)
     }
 
-    /// A sign, magnitude and exponent, normalised under `mode`. The engine's
-    /// `(u128, i32)` pairs enter here; an over-precise magnitude is rounded
-    /// exactly as `Number`'s constructor rounds it.
+    /// A sign, magnitude and exponent, normalised under `mode` at the
+    /// thread's scale (`Number{negative, mantissa, exponent, Normalized{}}`).
+    /// The engine's `(u128, i32)` pairs enter here; an over-precise magnitude
+    /// is rounded exactly as `Number`'s constructor rounds it.
     pub fn from_parts(negative: bool, mantissa: u128, exponent: i32, mode: Rounding) -> Result<Number, NumberError> {
         let (mut n, mut m, mut e) = (negative, mantissa, exponent);
-        normalize(&mut n, &mut m, &mut e, mode)?;
+        normalize(&mut n, &mut m, &mut e, Range::of(mantissa_scale()), false, mode)?;
         Ok(Number { negative: n, mantissa: m as u64, exponent: e })
+    }
+
+    /// `Number::one()` (Number.cpp:743-748): `min × 10^-log` at the thread's scale.
+    pub fn one() -> Number {
+        let scale = mantissa_scale();
+        Number { negative: false, mantissa: scale.min_mantissa(), exponent: -scale.log() }
+    }
+
+    /// `Number::min()` (Number.h:812-816): the smallest positive value.
+    pub fn min_value() -> Number {
+        Number { negative: false, mantissa: mantissa_scale().min_mantissa(), exponent: K_MIN_EXPONENT }
+    }
+
+    /// `Number::max()` (Number.h:818-822): the mantissa is capped at `kMaxRep`.
+    pub fn max_value() -> Number {
+        let m = (mantissa_scale().max_mantissa() as u128).min(K_MAX_REP) as u64;
+        Number { negative: false, mantissa: m, exponent: K_MAX_EXPONENT }
+    }
+
+    /// `Number::lowest()` (Number.h:824-828).
+    pub fn lowest() -> Number {
+        Number { negative: true, ..Self::max_value() }
+    }
+
+    /// `isnormal()` (Number.h:830-838) at the thread's scale.
+    pub fn is_normal(&self) -> bool {
+        let scale = mantissa_scale();
+        let m = self.mantissa as u128;
+        *self == Number::ZERO
+            || (scale.min_mantissa() <= self.mantissa
+                && self.mantissa <= scale.max_mantissa()
+                && (m <= K_MAX_REP || m % 10 == 0)
+                && (K_MIN_EXPONENT..=K_MAX_EXPONENT).contains(&self.exponent))
     }
 
     pub fn is_zero(&self) -> bool {
@@ -254,7 +607,12 @@ impl Number {
         }
     }
 
-    /// `operator+=`.
+    /// `abs(Number)` (Number.h:875-881).
+    pub fn abs(self) -> Number {
+        Number { negative: false, ..self }
+    }
+
+    /// `operator+=` (Number.cpp:919-1129).
     pub fn add(self, y: Number, mode: Rounding) -> Result<Number, NumberError> {
         if y.is_zero() {
             return Ok(self);
@@ -265,38 +623,44 @@ impl Number {
         if self == y.negated() {
             return Ok(Number::ZERO);
         }
+        let range = Range::of(mantissa_scale());
+        let fix330 = range.fix330;
         let mut xn = self.negative;
         let mut xm = self.mantissa as u128;
         let mut xe = self.exponent;
         let yn = y.negative;
         let mut ym = y.mantissa as u128;
         let mut ye = y.exponent;
-        let mut g = Guard::new(mode);
+        let mut g = Guard::new(mode, range);
+        let upper_limit = range.min * 1000;
 
-        // `adjust`: drop the smaller-exponent operand's digits into the guard
-        // until the exponents meet (the Enabled330 pre-passes do not apply).
+        // Bring the exponents into agreement; the guard takes the sign of
+        // the operand whose digits it holds.
         if xe < ye {
             if xn {
                 g.set_negative();
             }
-            while xe < ye {
-                g.drop_digit(&mut xm, &mut xe);
-            }
+            adjust(&mut g, upper_limit, &mut ym, &mut ye, &mut xm, &mut xe);
         } else if xe > ye {
             if yn {
                 g.set_negative();
             }
-            while ye < xe {
-                g.drop_digit(&mut ym, &mut ye);
-            }
+            adjust(&mut g, upper_limit, &mut xm, &mut xe, &mut ym, &mut ye);
+        } else if fix330 && ((xm < ym && xn) || (ym < xm && yn)) {
+            // Same exponent (Number.cpp:1020-1027): the sign of the operand
+            // with the smaller mantissa.
+            g.set_negative();
         }
 
         if xn == yn {
             xm += ym;
-            if xm > MAX_MANTISSA || xm > K_MAX_REP {
-                g.drop_digit(&mut xm, &mut xe);
+            // Enabled330 leaves the sum to `doNormalize` (Number.cpp:1033-1045).
+            if !fix330 {
+                if xm > range.max || xm > range.rep_limit() {
+                    g.drop_digit(&mut xm, &mut xe);
+                }
+                g.round_up(&mut xn, &mut xm, &mut xe)?;
             }
-            g.round_up(&mut xn, &mut xm, &mut xe)?;
         } else {
             if xm > ym {
                 xm -= ym;
@@ -305,16 +669,27 @@ impl Number {
                 xe = ye;
                 xn = yn;
             }
-            // Pull the difference back up to sixteen digits, borrowing the
-            // guard digits back one at a time (wrapping as rippled's unsigned
-            // arithmetic would if the difference were zero).
-            while xm < MIN_MANTISSA && xm.wrapping_mul(10) <= K_MAX_REP {
-                xm = xm.wrapping_mul(10).wrapping_sub(g.pop() as u128);
-                xe -= 1;
+            if fix330 {
+                // Pull guard digits back until the difference carries a few
+                // digits more than the range, or the guard is empty
+                // (Number.cpp:1069-1086): `doNormalize` then has what it
+                // needs to round correctly.
+                while xm < upper_limit && !g.empty() {
+                    xm = xm.wrapping_mul(10).wrapping_sub(g.pop() as u128);
+                    xe -= 1;
+                }
+            } else {
+                // Pull the difference back up to sixteen digits, borrowing the
+                // guard digits back one at a time (wrapping as rippled's unsigned
+                // arithmetic would if the difference were zero).
+                while xm < range.min && xm.wrapping_mul(10) <= range.rep_limit() {
+                    xm = xm.wrapping_mul(10).wrapping_sub(g.pop() as u128);
+                    xe -= 1;
+                }
             }
             g.round_down(&mut xn, &mut xm, &mut xe);
         }
-        normalize(&mut xn, &mut xm, &mut xe, mode)?;
+        normalize(&mut xn, &mut xm, &mut xe, range, fix330 && !g.empty(), mode)?;
         Ok(Number { negative: xn, mantissa: xm as u64, exponent: xe })
     }
 
@@ -323,7 +698,7 @@ impl Number {
         self.add(y.negated(), mode)
     }
 
-    /// `operator*=`.
+    /// `operator*=` (Number.cpp:1131-1183).
     pub fn mul(self, y: Number, mode: Rounding) -> Result<Number, NumberError> {
         if self.is_zero() {
             return Ok(self);
@@ -331,24 +706,28 @@ impl Number {
         if y.is_zero() {
             return Ok(y);
         }
+        let range = Range::of(mantissa_scale());
         let mut zm = self.mantissa as u128 * y.mantissa as u128;
         let mut ze = self.exponent + y.exponent;
         let mut zn = self.negative != y.negative;
-        let mut g = Guard::new(mode);
+        let mut g = Guard::new(mode, range);
         if zn {
             g.set_negative();
         }
-        while zm > MAX_MANTISSA || zm > K_MAX_REP {
+        while zm > range.max || zm > range.rep_limit() {
             g.drop_digit(&mut zm, &mut ze);
         }
         g.round_up(&mut zn, &mut zm, &mut ze)?;
         // `normalize(g)`: a fresh doNormalize, the guard's digits not carried.
-        normalize(&mut zn, &mut zm, &mut ze, mode)?;
+        normalize(&mut zn, &mut zm, &mut ze, range, false, mode)?;
         Ok(Number { negative: zn, mantissa: zm as u64, exponent: ze })
     }
 
-    /// `operator/=` (Small scale: stage 1 only — the quotient of the
-    /// numerator scaled by 1e17, its remainder discarded).
+    /// `operator/=` (Number.cpp:1185-1363). Small scale: stage 1 only — the
+    /// quotient of the numerator scaled by 1e17, its remainder discarded.
+    /// Large330: stage 2 appends the remainder's quotient scaled by 1e5 (an
+    /// effective factor of 1e22) and stage 3 tells `doNormalize` whether
+    /// anything is still left over.
     pub fn div(self, y: Number, mode: Rounding) -> Result<Number, NumberError> {
         if y.is_zero() {
             return Err(NumberError::DivideByZero);
@@ -356,12 +735,28 @@ impl Number {
         if self.is_zero() {
             return Ok(self);
         }
+        let scale = mantissa_scale();
         const FACTOR: u128 = 100_000_000_000_000_000; // 1e17
+        let dm = y.mantissa as u128;
         let numerator = self.mantissa as u128 * FACTOR;
-        let mut zm = numerator / y.mantissa as u128;
+        let mut zm = numerator / dm;
         let mut ze = self.exponent - y.exponent - 17;
         let mut zn = self.negative != y.negative;
-        normalize(&mut zn, &mut zm, &mut ze, mode)?;
+        let mut dropped = false;
+        if scale != MantissaScale::Small {
+            const CORRECTION: u128 = 100_000; // 1e5
+            let remainder = numerator % dm;
+            if remainder != 0 {
+                let partial = remainder * CORRECTION;
+                let correction = partial / dm;
+                if correction != 0 {
+                    zm = zm * CORRECTION + correction;
+                    ze -= 5;
+                }
+                dropped = partial % dm != 0;
+            }
+        }
+        normalize(&mut zn, &mut zm, &mut ze, Range::of(scale), dropped, mode)?;
         Ok(Number { negative: zn, mantissa: zm as u64, exponent: ze })
     }
 
@@ -378,13 +773,92 @@ impl Number {
         Ok(Number { exponent: e, ..self })
     }
 
+    /// `power(f, n)` (Number.cpp:1513-1525): square-and-multiply in rippled's
+    /// order, one rounding per multiplication.
+    pub fn power(self, n: u32, mode: Rounding) -> Result<Number, NumberError> {
+        if n == 0 {
+            return Ok(Number::one());
+        }
+        if n == 1 {
+            return Ok(self);
+        }
+        let mut r = self.power(n / 2, mode)?;
+        r = r.mul(r, mode)?;
+        if n % 2 != 0 {
+            r = r.mul(self, mode)?;
+        }
+        Ok(r)
+    }
+
+    /// `root(f, d)` (Number.cpp:1536-1608): `f^(1/d)` by Newton's iteration
+    /// in Number arithmetic from a quadratic first guess, run until two
+    /// successive iterates repeat. `Number::root infinity` and
+    /// `Number::root nan` are the `Overflow` error.
+    pub fn root(self, d: u32, mode: Rounding) -> Result<Number, NumberError> {
+        let one = Number::one();
+        let mut f = self;
+        if f == one || d == 1 {
+            return Ok(f);
+        }
+        if d == 0 {
+            if f == one.negated() {
+                return Ok(one);
+            }
+            if f.abs() < one {
+                return Ok(Number::ZERO);
+            }
+            return Err(NumberError::Overflow);
+        }
+        if f.negative && !f.is_zero() && d % 2 == 0 {
+            return Err(NumberError::Overflow);
+        }
+        if f.is_zero() {
+            return Ok(f);
+        }
+        // Scale f into (0, 1) with an exponent that is a multiple of d.
+        let di = d as i64;
+        let mut e = f.exponent as i64 + mantissa_scale().log() as i64 + 1;
+        let k = (if e >= 0 { e } else { e - (di - 1) }) / di;
+        let k2 = e - k * di;
+        e += if k2 == 0 { 0 } else { di - k2 };
+        const SHIFT_CAP: i64 = 1 << 30;
+        f = f.shift_exponent((-e).clamp(-SHIFT_CAP, SHIFT_CAP) as i32)?;
+        let neg = f.negative;
+        if neg {
+            f = f.negated();
+        }
+        // Quadratic least-squares fit of f^(1/d) on [0, 1].
+        let dw = di as i128;
+        let big_d = ((((6 * dw + 11) * dw + 6) * dw) + 1) as i64;
+        let a0 = (3 * dw * (((2 * dw - 3) * dw) + 1)) as i64;
+        let a1 = (24 * dw * ((2 * dw) - 1)) as i64;
+        let a2 = (-30 * (dw - 1) * dw) as i64;
+        let n = |v: i64| Number::new(v, 0, mode);
+        let mut r = n(a2)?.mul(f, mode)?.add(n(a1)?, mode)?.mul(f, mode)?.add(n(a0)?, mode)?.div(n(big_d)?, mode)?;
+        if neg {
+            f = f.negated();
+            r = r.negated();
+        }
+        let mut rm1 = Number::ZERO;
+        let mut rm2;
+        loop {
+            rm2 = rm1;
+            rm1 = r;
+            r = n(di - 1)?.mul(r, mode)?.add(f.div(r.power(d - 1, mode)?, mode)?, mode)?.div(n(di)?, mode)?;
+            if r == rm1 || r == rm2 {
+                break;
+            }
+        }
+        r.shift_exponent((e / di).clamp(-SHIFT_CAP, SHIFT_CAP) as i32)
+    }
+
     /// `root2`: Newton's iteration in Number arithmetic from a quadratic
     /// first guess, run until two successive iterates repeat — every
     /// intermediate rounded as `Number` rounds it, so the last digit is
     /// rippled's, not the true square root's. A negative argument is
     /// rippled's `Number::root nan` throw.
     pub fn root2(self, mode: Rounding) -> Result<Number, NumberError> {
-        let one = Number { negative: false, mantissa: MIN_MANTISSA as u64, exponent: -15 };
+        let one = Number::one();
         if self == one {
             return Ok(self);
         }
@@ -394,7 +868,7 @@ impl Number {
         if self.is_zero() {
             return Ok(self);
         }
-        let mut e = self.exponent + 15 + 1;
+        let mut e = self.exponent + mantissa_scale().log() + 1;
         if e % 2 != 0 {
             e += 1;
         }
@@ -414,80 +888,181 @@ impl Number {
         r.shift_exponent(e / 2)
     }
 
-    /// `operator rep()`: the value as whole drops, the fraction rounded under
-    /// `mode` through the guard (`XRPAmount{Number}`).
-    pub fn to_drops(self, mode: Rounding) -> Result<i64, NumberError> {
-        let mut drops = self.mantissa as u128;
-        let mut offset = self.exponent;
-        let mut g = Guard::new(mode);
-        if drops != 0 {
-            if self.negative {
-                g.set_negative();
-            }
-            while offset < 0 {
-                g.drop_digit(&mut drops, &mut offset);
-            }
-            while offset > 0 {
-                if drops > K_MAX_REP / 10 {
-                    return Err(NumberError::Overflow);
-                }
-                drops *= 10;
-                offset -= 1;
-            }
-            let r = g.round();
-            if r == Round::Up || (r == Round::Even && (drops & 1) == 1) {
-                if drops >= K_MAX_REP {
-                    return Err(NumberError::Overflow);
-                }
-                drops += 1;
-            }
+    /// `power(f, n, d)` (Number.cpp:1657-1684): `f^(n/d)` as
+    /// `root(power(f, n), d)` after reducing the fraction. `Number::power
+    /// nan` and `Number::power infinity` are the `Overflow` error.
+    pub fn power_frac(self, n: u32, d: u32, mode: Rounding) -> Result<Number, NumberError> {
+        let one = Number::one();
+        if self == one {
+            return Ok(self);
         }
-        let d = drops as i64;
-        Ok(if self.negative { -d } else { d })
+        let g = gcd(n, d);
+        if g == 0 {
+            return Err(NumberError::Overflow);
+        }
+        if d == 0 {
+            if self == one.negated() {
+                return Ok(one);
+            }
+            if self.abs() < one {
+                return Ok(Number::ZERO);
+            }
+            return Err(NumberError::Overflow);
+        }
+        if n == 0 {
+            return Ok(one);
+        }
+        let (n, d) = (n / g, d / g);
+        if n % 2 == 1 && d % 2 == 0 && self.negative && !self.is_zero() {
+            return Err(NumberError::Overflow);
+        }
+        self.power(n, mode)?.root(d, mode)
+    }
+
+    /// `truncate()` (Number.cpp:1394-1410): the integer part, towards zero.
+    /// The digits are cut from the internal mantissa; the re-normalisation
+    /// only pads, so no rounding mode is involved.
+    pub fn truncate(self) -> Number {
+        if self.exponent >= 0 || self.mantissa == 0 {
+            return self;
+        }
+        let (mut m, mut e) = (self.mantissa, self.exponent);
+        while e < 0 && m != 0 {
+            e += 1;
+            m /= 10;
+        }
+        Number::from_parts(self.negative, m as u128, e, Rounding::ToNearest).unwrap_or(Number::ZERO)
+    }
+
+    /// The external view (`Number::mantissa()` / `exponent()`,
+    /// Number.h:691-726): a signed 64-bit mantissa and its exponent. A
+    /// Large330 mantissa above 2^63 − 1 is a multiple of ten held one digit
+    /// longer than the view allows, so it reads as `mantissa / 10`,
+    /// `exponent + 1`. STNumber serialises this pair, and `operator rep()`
+    /// starts from it.
+    pub fn external(&self) -> (i64, i32) {
+        let (mut m, mut e) = (self.mantissa as u128, self.exponent);
+        if m > K_MAX_REP {
+            m /= 10;
+            e += 1;
+        }
+        let m = m as i64;
+        (if self.negative { -m } else { m }, e)
+    }
+
+    /// The signed external mantissa (`Number::mantissa()`).
+    pub fn signed_mantissa(&self) -> i64 {
+        self.external().0
+    }
+
+    /// The external exponent (`Number::exponent()`).
+    pub fn external_exponent(&self) -> i32 {
+        self.external().1
+    }
+
+    /// `operator rep()`: the value as whole drops, the fraction rounded under
+    /// `mode` through the guard (`XRPAmount{Number}`, `MPTAmount{Number}`).
+    /// It reads the external view, so every integer up to 2^63 − 1 comes
+    /// back exactly at Large330.
+    pub fn to_drops(self, mode: Rounding) -> Result<i64, NumberError> {
+        let (m, e) = self.external();
+        rep_of(self.negative, m.unsigned_abs() as u128, e, mode, Range::of(mantissa_scale()))
     }
 
     /// `XRPAmount{Number{negative, mantissa, exponent, Unchecked}}` — the
     /// STAmount constructor's native canonicalisation: `operator rep()` on
     /// the RAW pair, digits below the ones place dropped one at a time into
-    /// the guard (no 16-digit normalisation first), `mode` deciding the drop.
+    /// the guard (no normalisation first), `mode` deciding the drop. The
+    /// same at either scale: nothing is normalised, and `doRound` treats an
+    /// exact guard and a rounded-down one alike.
     pub fn rep_from_raw(negative: bool, mantissa: u128, exponent: i32, mode: Rounding) -> Result<i64, NumberError> {
-        let mut drops = mantissa;
-        let mut offset = exponent;
-        let mut g = Guard::new(mode);
-        if drops != 0 {
-            if negative {
-                g.set_negative();
-            }
-            while offset < 0 {
-                g.drop_digit(&mut drops, &mut offset);
-            }
-            while offset > 0 {
-                if drops > K_MAX_REP / 10 {
-                    return Err(NumberError::Overflow);
-                }
-                drops *= 10;
-                offset -= 1;
-            }
-            let r = g.round();
-            if r == Round::Up || (r == Round::Even && (drops & 1) == 1) {
-                if drops >= K_MAX_REP {
-                    return Err(NumberError::Overflow);
-                }
-                drops += 1;
-            }
-        }
-        let d = drops as i64;
-        Ok(if negative { -d } else { d })
+        rep_of(negative, mantissa, exponent, mode, Range::of(mantissa_scale()))
     }
 
-    /// The signed external mantissa (`Number::mantissa()`).
-    pub fn signed_mantissa(&self) -> i64 {
-        let m = self.mantissa as i64;
-        if self.negative {
-            -m
-        } else {
-            m
+    /// `normalizeToRange<min, max>()` (Number.h:840-873): this value's sign,
+    /// mantissa and exponent with the mantissa in `[min, max]`, rounded under
+    /// `mode` with the cusp fix disabled whatever the thread's scale.
+    pub fn normalize_to_range(self, min: u64, max: u64, mode: Rounding) -> Result<(bool, u64, i32), NumberError> {
+        let (mut n, mut m, mut e) = (self.negative, self.mantissa as u128, self.exponent);
+        normalize(&mut n, &mut m, &mut e, Range { min: min as u128, max: max as u128, fix330: false }, false, mode)?;
+        Ok((n, m as u64, e))
+    }
+
+    /// `IOUAmount::fromNumber` (IOUAmount.cpp:28-37): the value as an IOU's
+    /// sign, 16-digit mantissa and exponent, `normalizeToRange<1e15,
+    /// 1e16 − 1>` under `mode`. At the Small scale a Number already is that
+    /// triple and comes back untouched; at Large330 this is where nineteen
+    /// digits are rounded to sixteen. The caller applies IOUAmount's exponent
+    /// clamp.
+    pub fn iou_parts(self, mode: Rounding) -> Result<(bool, u64, i32), NumberError> {
+        match mantissa_scale() {
+            MantissaScale::Small => Ok((self.negative, self.mantissa, self.exponent)),
+            MantissaScale::Large330 => self.normalize_to_range(IOU_MIN_MANTISSA, IOU_MAX_MANTISSA, mode),
         }
+    }
+
+    /// `Number{IOUAmount}` (IOUAmount.h:120-124): an IOU's sign, mantissa and
+    /// exponent as a Number at the thread's scale. A canonical IOU is a Small
+    /// Number as it stands; at Large330 its sixteen digits are padded to
+    /// nineteen, exactly.
+    pub fn from_iou(negative: bool, mantissa: u64, exponent: i32) -> Number {
+        match mantissa_scale() {
+            MantissaScale::Small => Number { negative, mantissa, exponent },
+            MantissaScale::Large330 => {
+                Number::from_parts(negative, mantissa as u128, exponent, Rounding::ToNearest).unwrap_or(Number::ZERO)
+            }
+        }
+    }
+
+    /// `Number{IOUAmount{n}}`: the value rounded to an IOU's sixteen digits
+    /// under `mode` and taken back as a Number — what a `Number` becomes when
+    /// rippled stores it in an STAmount and reads it again. The identity at
+    /// the Small scale.
+    pub fn iou_rounded(self, mode: Rounding) -> Result<Number, NumberError> {
+        match mantissa_scale() {
+            MantissaScale::Small => Ok(self),
+            MantissaScale::Large330 => {
+                let (negative, mantissa, exponent) = self.iou_parts(mode)?;
+                Ok(Number::from_iou(negative, mantissa, exponent))
+            }
+        }
+    }
+}
+
+/// `operator<` (Number.h:452-487): sign, then exponent, then mantissa. Both
+/// operands must be normal at the same scale.
+fn less(l: &Number, r: &Number) -> bool {
+    if l.negative != r.negative {
+        return l.negative;
+    }
+    if l.mantissa == 0 {
+        return r.mantissa > 0;
+    }
+    if r.mantissa == 0 {
+        return false;
+    }
+    if l.exponent > r.exponent {
+        return l.negative;
+    }
+    if l.exponent < r.exponent {
+        return !l.negative;
+    }
+    if l.negative {
+        l.mantissa > r.mantissa
+    } else {
+        l.mantissa < r.mantissa
+    }
+}
+
+impl PartialOrd for Number {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(if self == other {
+            Ordering::Equal
+        } else if less(self, other) {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        })
     }
 }
 
