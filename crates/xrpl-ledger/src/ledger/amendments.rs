@@ -113,6 +113,12 @@ pub fn fix_batch_v1_2(sandbox: &Sandbox) -> bool {
     enabled(sandbox, FIX_BATCH_V1_2)
 }
 
+/// BatchV1_1 — the Batch amendment (`features.macro:21`, `XRPL_FEATURE(BatchV1_1, …)`). ON on
+/// mainnet since #107540996 (2026-10-09). Named here for the one place a lending transactor reads
+/// it: LoanSet's inner-batch rule (LoanSet.cpp:68-74).
+pub const BATCH_V1_1: &str =
+    "9F287AED3CDB50A7BD1ACEC24296A30C9B5230CCD136219317AC790E3B884377";
+
 /// DynamicMPT — not enabled on mainnet or testnet (2026-09-23). Widens what
 /// an MPTokenIssuanceSet may do on an issuance without lsfMPTCanLock.
 pub const DYNAMIC_MPT: &str =
@@ -276,6 +282,7 @@ mod tests {
             ("fixCleanup3_4_0", FIX_CLEANUP_3_4_0),
             ("MPTokensV1", MPTOKENS_V1),
             ("Credentials", CREDENTIALS),
+            ("BatchV1_1", BATCH_V1_1),
         ] {
             let h = crate::shamap::hash::sha512_half(name.as_bytes());
             assert_eq!(hex::encode_upper(h.0), id, "{name}");

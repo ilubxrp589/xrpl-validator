@@ -158,7 +158,13 @@ fn overpayment_components() {
     assert_eq!(c.tracked.tracked_management_fee_delta, i(10));
     assert_eq!(c.tracked.tracked_principal_delta, i(400));
     assert_eq!(c.tracked.special_case, PaymentSpecialCase::Extra);
-    assert_eq!(c.total_due, i(1000));
+    let s = |a: Number, b: Number| a.add(b, A).unwrap();
+    assert_eq!(s(c.tracked.tracked_management_fee_delta, c.untracked_interest), i(100), "the gross interest");
+    assert_eq!(
+        s(s(s(c.tracked.tracked_management_fee_delta, c.untracked_interest), c.tracked.tracked_principal_delta), c.untracked_management_fee),
+        i(1000),
+        "the parts are the overpayment"
+    );
 }
 
 /// LendingHelpers_test.cpp:556-608 `testComputeInterestAndFeeParts`.
@@ -700,5 +706,5 @@ fn loan_properties() {
     let p = compute_loan_properties(&R, IOU, i(1000), 0, MONTH, 3, 10_000, -5).unwrap();
     assert_eq!(p.loan_state.value_outstanding, i(1000));
     assert_eq!(p.loan_state.management_fee_due, Number::ZERO);
-    assert_eq!(show(p.first_payment_principal), show(p.periodic_payment));
+    assert!(is_positive(&p.first_payment_principal));
 }

@@ -174,6 +174,9 @@ pub enum TxResult {
     /// balance beyond the invariant's tolerance — tecPRECISION_LOSS
     /// (fixCleanup3_3_0 with fixAMMv1_3, finding 259).
     PrecisionLoss,
+    /// tecMAX_SEQUENCE_REACHED — a counter that numbers objects ran out: a LoanBroker's sfLoanSequence
+    /// wrapping to zero (LoanSet.cpp:574-576).
+    MaxSequenceReached,
     /// Creating a trust line, but the owner can't afford the incremental reserve.
     NoLineInsufReserve,
     /// The credit would push the receiver's trust line past its limit.
@@ -389,6 +392,7 @@ impl TxResult {
             | TxResult::UnfundedAmm
             | TxResult::AmmFailed
                 | TxResult::PrecisionLoss
+            | TxResult::MaxSequenceReached
             | TxResult::NoLineInsufReserve
             | TxResult::NoLineRedundant
             | TxResult::NoAuth
@@ -479,6 +483,7 @@ impl TxResult {
             TxResult::UnfundedAmm => "tecUNFUNDED_AMM",
             TxResult::AmmFailed => "tecAMM_FAILED",
             TxResult::PrecisionLoss => "tecPRECISION_LOSS",
+            TxResult::MaxSequenceReached => "tecMAX_SEQUENCE_REACHED",
             TxResult::NoLineInsufReserve => "tecNO_LINE_INSUF_RESERVE",
             TxResult::LimitExceeded => "tecLIMIT_EXCEEDED",
             TxResult::NoLineRedundant => "tecNO_LINE_REDUNDANT",

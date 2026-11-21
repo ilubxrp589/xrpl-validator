@@ -178,6 +178,11 @@ pub fn get_transactor(tx_type: &str) -> Option<Box<dyn Transactor>> {
         "LoanBrokerCoverWithdraw" => Some(Box::new(crate::tx::loan_broker::LoanBrokerCoverWithdrawTransactor)),
         "LoanBrokerCoverClawback" => Some(Box::new(crate::tx::loan_broker::LoanBrokerCoverClawbackTransactor)),
         "LoanBrokerDelete" => Some(Box::new(crate::tx::loan_broker::LoanBrokerDeleteTransactor)),
+        // The loan family (LendingProtocol): the same gate.
+        "LoanSet" => Some(Box::new(crate::tx::loan::LoanSetTransactor)),
+        "LoanDelete" => Some(Box::new(crate::tx::loan::LoanDeleteTransactor)),
+        "LoanManage" => Some(Box::new(crate::tx::loan::LoanManageTransactor)),
+        "LoanPay" => Some(Box::new(crate::tx::loan::LoanPayTransactor)),
         "UNLModify" => Some(Box::new(UNLModifyTransactor)),
         "SetFee" => Some(Box::new(SetFeeTransactor)),
         "EnableAmendment" => Some(Box::new(EnableAmendmentTransactor)),
