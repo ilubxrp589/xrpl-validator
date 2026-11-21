@@ -3141,7 +3141,7 @@ mod large330_tests {
         // `adjustLPTokens`: (T + t) − T under Downward, each an LP amount.
         let lpt: Me = (6_324_555_320_336_758, -11);
         assert_eq!(adjust_lp_tokens(lpt, (1_000_000_000_000_000, -15), true), (1_000_000_000_000_000, -15));
-        assert_eq!(adjust_lp_tokens(lpt, (1_234_567_890_123_456, -20), true), (1_234_500_000_000_000, -20));
+        assert_eq!(adjust_lp_tokens(lpt, (1_234_567_890_123_456, -20), true), (1_234_567_000_000_000, -20));
     }
 
     /// Outside a guard — mainnet — nothing has moved: sixteen digits in,
