@@ -1788,6 +1788,7 @@ mod tests {
         vec![
             tx("VaultCreate", OWNER, json!({"Asset": xrp_asset()})),
             tx("VaultSet", OWNER, json!({"VaultID": vault, "Data": "00"})),
+            tx("VaultDelete", OWNER, json!({"VaultID": vault})),
             tx("VaultDeposit", OWNER, json!({"VaultID": vault, "Amount": "100"})),
             tx("VaultWithdraw", OWNER, json!({"VaultID": vault, "Amount": "100"})),
             tx("VaultClawback", OWNER, json!({"VaultID": vault, "Holder": hex::encode(BOB)})),
@@ -3237,5 +3238,109 @@ mod tests {
         let mut st = state();
         let (key, _, _) = make_vault(&mut st, json!({"Asset": xrp_asset()}));
         assert_eq!(result(&st, &clawback(OWNER, &key, BOB, None)), TxResult::NoPermission, "no shares outstanding");
+    }
+
+    // -----------------------------------------------------------------------
+    // VaultDelete
+    // -----------------------------------------------------------------------
+
+    fn vault_delete(account: [u8; 20], key: &Hash256) -> TxFields {
+        tx("VaultDelete", account, json!({"VaultID": vault_hex(key)}))
+    }
+
+    /// VaultDelete.cpp:24-41 (VaultValidation_test.cpp:947-983): sfMemoData
+    /// is temDISABLED without LendingProtocolV1_1, and with it must be 1 to
+    /// 256 bytes.
+    #[test]
+    fn vault_delete_preflight() {
+        let st = state();
+        let key = Hash256([0xAB; 32]);
+        assert_eq!(result(&st, &vault_delete(OWNER, &Hash256([0; 32]))), TxResult::Malformed);
+        assert_eq!(result(&st, &vault_delete(OWNER, &key)), TxResult::NoEntry, "VaultValidation_test.cpp:637");
+        let with_memo = |memo: String| {
+            let mut t = vault_delete(OWNER, &key);
+            t.fields["MemoData"] = json!(memo);
+            t
+        };
+        assert_eq!(result(&st, &with_memo("00".to_string())), TxResult::Disabled);
+        let st = state_with(&rules_with(&[am::LENDING_PROTOCOL_V1_1]));
+        assert_eq!(result(&st, &with_memo(String::new())), TxResult::Malformed);
+        assert_eq!(result(&st, &with_memo("00".repeat(257))), TxResult::Malformed);
+        assert_eq!(result(&st, &with_memo("00".repeat(256))), TxResult::NoEntry);
+    }
+
+    /// VaultDelete.cpp:43-94: only the owner, only an empty vault with no
+    /// shares outstanding.
+    #[test]
+    fn vault_delete_preclaim() {
+        let mut st = state();
+        let (key, pseudo, share) = xrp_vault_with_deposit(&mut st, 1000);
+        assert_eq!(result(&st, &vault_delete(BOB, &key)), TxResult::NoPermission);
+        assert_eq!(result(&st, &vault_delete(OWNER, &key)), TxResult::HasObligations, "assets");
+        // Assets gone, shares still out.
+        edit(&mut st, key, |v| {
+            v.as_object_mut().unwrap().remove("AssetsTotal");
+            v.as_object_mut().unwrap().remove("AssetsAvailable");
+        });
+        edit(&mut st, keylet::account_root_key(&pseudo), |v| v["Balance"] = json!("0"));
+        assert_eq!(result(&st, &vault_delete(OWNER, &key)), TxResult::HasObligations, "shares outstanding");
+        // Only one of the two totals non-zero is still an obligation.
+        edit(&mut st, key, |v| v["AssetsTotal"] = json!("5"));
+        assert_eq!(result(&st, &vault_delete(OWNER, &key)), TxResult::HasObligations);
+        let _ = share;
+    }
+
+    /// VaultDelete.cpp:96-223: everything VaultCreate made goes — the Vault,
+    /// the pseudo-account and its directory, its holding of the asset, the
+    /// share issuance, the owner's MPToken — and the owner's OwnerCount is
+    /// back where it was. XRP, IOU and MPT vaults; after a full round trip
+    /// of deposit and withdrawal too.
+    #[test]
+    fn vault_delete_removes_everything_vault_create_made() {
+        let mut with_mpt = state();
+        let id = issuance(&mut with_mpt, mpt::LSF_MPT_CAN_TRANSFER, json!({}));
+        token(&mut with_mpt, &id, BOB, 0, 900);
+        let mut with_usd = state();
+        line(&mut with_usd, BOB, 0, "500", "1000");
+        for (mut st, asset, amount) in [
+            (state(), xrp_asset(), json!("1000")),
+            (with_usd, usd_asset(), usd_json("100")),
+            (with_mpt, json!({"mpt_issuance_id": hex::encode_upper(id)}), mpt_json(&id, 300)),
+        ] {
+            let (key, pseudo, share) = make_vault(&mut st, json!({"Asset": asset.clone()}));
+            commit(&mut st, &deposit(BOB, &key, amount.clone()));
+            assert_eq!(result(&st, &vault_delete(OWNER, &key)), TxResult::HasObligations, "{asset}");
+            commit(&mut st, &withdraw(BOB, &key, amount));
+            let (r, sb) = apply(&st, &vault_delete(OWNER, &key));
+            assert_eq!(r, TxResult::Success, "{asset}");
+            let share_key = keylet::mpt_issuance_key(&share);
+            for (gone, what) in [
+                (key, "the Vault"),
+                (keylet::account_root_key(&pseudo), "the pseudo-account"),
+                (keylet::owner_dir_key(&pseudo), "the pseudo-account's directory"),
+                (share_key, "the share issuance"),
+                (keylet::mptoken_key(&share_key, &OWNER), "the owner's MPToken"),
+                (keylet::ripple_state_key(&pseudo, &ISSUER, &USD_CODE), "the vault's trust line"),
+                (keylet::mptoken_key(&keylet::mpt_issuance_key(&id), &pseudo), "the vault's MPToken of the asset"),
+                (keylet::owner_dir_key(&OWNER), "the owner's emptied directory"),
+            ] {
+                assert!(get(&sb, &gone).is_none(), "{asset}: {what}");
+            }
+            assert_eq!(owners(&sb, &OWNER), 0, "{asset}");
+            assert_eq!(xrp_of(&sb, &OWNER), BALANCE - 2 * FEE, "{asset}: the reserve is free again; two fees paid");
+        }
+    }
+
+    /// A vault nobody ever deposited into deletes at once; a private one too.
+    #[test]
+    fn vault_delete_of_a_fresh_vault() {
+        for fields in [json!({"Asset": xrp_asset()}), json!({"Asset": xrp_asset(), "Flags": TF_VAULT_PRIVATE}), json!({"Asset": usd_asset()})] {
+            let mut st = state();
+            let (key, pseudo, _) = make_vault(&mut st, fields);
+            let (r, sb) = apply(&st, &vault_delete(OWNER, &key));
+            assert_eq!(r, TxResult::Success);
+            assert!(get(&sb, &key).is_none() && get(&sb, &keylet::account_root_key(&pseudo)).is_none());
+            assert_eq!(owners(&sb, &OWNER), 0);
+        }
     }
 }
