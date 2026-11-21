@@ -249,3 +249,171 @@ fn vault_deposit_xrp_private_devnet_6966497() {
 fn vault_deposit_xrp_second_devnet_7112018() {
     run(include_str!("vectors/vault_deposit_xrp_second_devnet_7112018.json"));
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// VaultWithdraw
+// ---------------------------------------------------------------------------------------------------------------
+
+/// ECE98F83EB…: VaultWithdraw 1000000 shares; tesSUCCESS.
+#[test]
+fn vault_withdraw_eur_a_devnet_6630240() {
+    run(include_str!("vectors/vault_withdraw_eur_a_devnet_6630240.json"));
+}
+
+/// 9F83532A5F…: VaultWithdraw 1000000 shares; tesSUCCESS.
+#[test]
+fn vault_withdraw_eur_b_devnet_6630242() {
+    run(include_str!("vectors/vault_withdraw_eur_b_devnet_6630242.json"));
+}
+
+/// E1556C9435…: VaultWithdraw 2000000 shares; tesSUCCESS.
+#[test]
+fn vault_withdraw_eur_by_shares_2m_devnet_6630214() {
+    run(include_str!("vectors/vault_withdraw_eur_by_shares_2m_devnet_6630214.json"));
+}
+
+/// CB6A92FB10…: VaultWithdraw 5000000 shares; tesSUCCESS.
+#[test]
+fn vault_withdraw_eur_by_shares_5m_devnet_6630199() {
+    run(include_str!("vectors/vault_withdraw_eur_by_shares_5m_devnet_6630199.json"));
+}
+
+/// C21A7816DA…: VaultWithdraw 1000000 shares; tesSUCCESS.
+#[test]
+fn vault_withdraw_eur_c_devnet_6630252() {
+    run(include_str!("vectors/vault_withdraw_eur_c_devnet_6630252.json"));
+}
+
+/// 51A4283750…: VaultWithdraw 1000000 shares; tesSUCCESS.
+#[test]
+fn vault_withdraw_eur_d_devnet_6630263() {
+    run(include_str!("vectors/vault_withdraw_eur_d_devnet_6630263.json"));
+}
+
+/// 2F5FD7FA46…: VaultWithdraw 1000000 shares; tesSUCCESS.
+#[test]
+fn vault_withdraw_eur_e_devnet_6630267() {
+    run(include_str!("vectors/vault_withdraw_eur_e_devnet_6630267.json"));
+}
+
+/// 69920D4346…: VaultWithdraw 1000000 shares; tesSUCCESS.
+#[test]
+fn vault_withdraw_eur_f_devnet_6630269() {
+    run(include_str!("vectors/vault_withdraw_eur_f_devnet_6630269.json"));
+}
+
+/// F0C6CBCDAB…: VaultWithdraw 1000000 shares; tesSUCCESS.
+#[test]
+fn vault_withdraw_eur_g_devnet_6630281() {
+    run(include_str!("vectors/vault_withdraw_eur_g_devnet_6630281.json"));
+}
+
+/// E338073741…: VaultWithdraw 1000000 shares; tecFROZEN.
+#[test]
+fn vault_withdraw_eur_tec_frozen_again_devnet_6630234() {
+    run(include_str!("vectors/vault_withdraw_eur_tec_frozen_again_devnet_6630234.json"));
+}
+
+/// 245D58D729…: VaultWithdraw 1000000 shares; tecFROZEN.
+#[test]
+fn vault_withdraw_eur_tec_frozen_devnet_6630223() {
+    run(include_str!("vectors/vault_withdraw_eur_tec_frozen_devnet_6630223.json"));
+}
+
+/// B7B26A05C9…: VaultWithdraw 1000000 shares, Destination; tesSUCCESS.
+#[test]
+fn vault_withdraw_eur_to_the_issuer_again_devnet_6630283() {
+    run(include_str!("vectors/vault_withdraw_eur_to_the_issuer_again_devnet_6630283.json"));
+}
+
+/// D31E3064A2…: VaultWithdraw 1000000 shares, Destination; tesSUCCESS.
+#[test]
+fn vault_withdraw_eur_to_the_issuer_devnet_6630225() {
+    run(include_str!("vectors/vault_withdraw_eur_to_the_issuer_devnet_6630225.json"));
+}
+
+/// 2E48681C69…: VaultWithdraw 10000000 shares, Destination; tecNO_LINE.
+#[test]
+fn vault_withdraw_shares_tec_no_line_devnet_6911782() {
+    run(include_str!("vectors/vault_withdraw_shares_tec_no_line_devnet_6911782.json"));
+}
+
+/// 59E833E1D4…: VaultWithdraw 99999999999999999 shares; tesSUCCESS.
+#[test]
+fn vault_withdraw_usd_all_but_one_share_devnet_6858221() {
+    run(include_str!("vectors/vault_withdraw_usd_all_but_one_share_devnet_6858221.json"));
+}
+
+/// CF048CB4FB…: VaultWithdraw 1 shares; tesSUCCESS.
+#[test]
+fn vault_withdraw_usd_last_share_devnet_6858222() {
+    run(include_str!("vectors/vault_withdraw_usd_last_share_devnet_6858222.json"));
+}
+
+/// 295CB4BFB7…: VaultWithdraw 10 USD, Destination; tecNO_LINE.
+#[test]
+fn vault_withdraw_usd_tec_no_line_devnet_6911781() {
+    run(include_str!("vectors/vault_withdraw_usd_tec_no_line_devnet_6911781.json"));
+}
+
+/// 3754A28B4B…: VaultWithdraw 10000 USD, Destination; tesSUCCESS.
+#[test]
+fn vault_withdraw_usd_to_destination_devnet_6884285() {
+    run(include_str!("vectors/vault_withdraw_usd_to_destination_devnet_6884285.json"));
+}
+
+/// 290496BE4E…: VaultWithdraw 10000 shares; tesSUCCESS.
+#[test]
+fn vault_withdraw_xrp_by_shares_devnet_7112019() {
+    run(include_str!("vectors/vault_withdraw_xrp_by_shares_devnet_7112019.json"));
+}
+
+/// 37D9CAEECC…: VaultWithdraw 10000 shares; tesSUCCESS.
+#[test]
+fn vault_withdraw_xrp_final_devnet_7112020() {
+    run(include_str!("vectors/vault_withdraw_xrp_final_devnet_7112020.json"));
+}
+
+/// B07A804D5D…: VaultWithdraw 5000 drops, Destination, CredentialIDs; tesSUCCESS.
+#[test]
+fn vault_withdraw_xrp_to_destination_with_credentials_devnet_6561305() {
+    run(include_str!("vectors/vault_withdraw_xrp_to_destination_with_credentials_devnet_6561305.json"));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// VaultSet
+// ---------------------------------------------------------------------------------------------------------------
+
+/// A096F37A23…: VaultSet Data; tesSUCCESS.
+#[test]
+fn vault_set_data_devnet_6792042() {
+    run(include_str!("vectors/vault_set_data_devnet_6792042.json"));
+}
+
+/// 6CA18586C6…: VaultSet Data; tesSUCCESS.
+#[test]
+fn vault_set_data_usd_devnet_6966282() {
+    run(include_str!("vectors/vault_set_data_usd_devnet_6966282.json"));
+}
+
+/// ACE7776EC1…: VaultSet DomainID; tesSUCCESS.
+#[test]
+fn vault_set_domain_devnet_6791927() {
+    run(include_str!("vectors/vault_set_domain_devnet_6791927.json"));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// VaultClawback
+// ---------------------------------------------------------------------------------------------------------------
+
+/// 9443620DE4…: VaultClawback Holder; tesSUCCESS.
+#[test]
+fn vault_clawback_usd_all_b_devnet_7046728() {
+    run(include_str!("vectors/vault_clawback_usd_all_b_devnet_7046728.json"));
+}
+
+/// 671FAD045D…: VaultClawback Holder; tesSUCCESS.
+#[test]
+fn vault_clawback_usd_all_devnet_6791425() {
+    run(include_str!("vectors/vault_clawback_usd_all_devnet_6791425.json"));
+}
