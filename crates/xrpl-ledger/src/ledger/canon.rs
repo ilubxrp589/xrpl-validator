@@ -138,9 +138,10 @@ mod vault_devnet_round_trip_tests {
         survives("vault_xrp");
     }
 
-    /// Fails on the SDK the validator builds against today — see the reason.
+    /// Needs the SDK codec of branch validator-k256-vault (48828ff): sfSubscriptionDate,
+    /// sfRedemptionDate, sfLEVersion, sfVaultKind, sfReferenceHolding and STI_INT32. On the
+    /// older codec (validator-k256 6711d13 / c6fd55d) this fails.
     #[test]
-    #[ignore = "SDK gap: xrpl-core at c6fd55d (branch validator-k256) has no sfSubscriptionDate (UINT32 75), sfRedemptionDate (UINT32 76), sfLEVersion (UINT8 6) or sfVaultKind (UINT8 22) in tests/vectors/definitions.json; decode skips the two UINT32s and stops at LEVersion: CodecError(\"decoded 158 bytes but input has 235 bytes\")"]
     fn a_closed_ended_iou_vault_survives() {
         survives("vault_usd_closed_ended");
     }
@@ -151,9 +152,10 @@ mod vault_devnet_round_trip_tests {
         survives("loan_broker_usd");
     }
 
-    /// Fails on the SDK the validator builds against today — see the reason.
+    /// Needs the SDK codec of branch validator-k256-vault (48828ff): sfSubscriptionDate,
+    /// sfRedemptionDate, sfLEVersion, sfVaultKind, sfReferenceHolding and STI_INT32. On the
+    /// older codec (validator-k256 6711d13 / c6fd55d) this fails.
     #[test]
-    #[ignore = "SDK gap: xrpl-core at c6fd55d (branch validator-k256) has no STI_INT32 (type 10) codec; sfLoanScale decodes as CodecError(\"unsupported type code None for field 'LoanScale'\")"]
     fn a_loan_survives() {
         survives("loan_usd");
     }
@@ -163,10 +165,11 @@ mod vault_devnet_round_trip_tests {
         survives("share_issuance_xrp");
     }
 
-    /// Fails on the SDK the validator builds against today — see the reason.
-    /// This one is silent: decode succeeds without the field.
+    /// Needs the SDK codec of branch validator-k256-vault (48828ff): sfSubscriptionDate,
+    /// sfRedemptionDate, sfLEVersion, sfVaultKind, sfReferenceHolding and STI_INT32. On the
+    /// older codec (validator-k256 6711d13 / c6fd55d) this fails — or, for this object,
+    /// would decode without the field and say nothing.
     #[test]
-    #[ignore = "SDK gap: xrpl-core at c6fd55d (branch validator-k256) has no sfReferenceHolding (UINT256 39) in tests/vectors/definitions.json; decode skips its 32 bytes without an error and the object would re-encode 34 bytes short"]
     fn a_share_issuance_with_a_reference_holding_survives() {
         survives("share_issuance_usd");
     }
@@ -217,8 +220,8 @@ mod vault_devnet_round_trip_tests {
     /// Inventory Q5 — STInt32 (STInteger.cpp; `sfLoanScale`, INT32 1): four
     /// bytes, two's complement, big-endian; a JSON number. The bytes are the
     /// devnet Loan's own (`A1 FFFFFFF5` = -11).
+    /// Needs the SDK codec of branch validator-k256-vault (48828ff); fails on the older one.
     #[test]
-    #[ignore = "SDK gap: xrpl-core at c6fd55d (branch validator-k256) has no STI_INT32 (type 10) codec; encode answers CodecError(\"unsupported type code 10 for field 'LoanScale'\")"]
     fn the_codec_round_trips_stint32_byte_exactly() {
         for (value, bytes) in [(-11i64, "A1FFFFFFF5"), (0, "A100000000"), (7, "A100000007"), (i32::MIN as i64, "A180000000")] {
             let encoded = encode_transaction_json(&json!({"LoanScale": value}), false).unwrap_or_else(|e| panic!("{value}: {e:?}"));

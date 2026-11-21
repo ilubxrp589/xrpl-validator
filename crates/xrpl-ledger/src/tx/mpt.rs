@@ -1015,10 +1015,14 @@ impl Transactor for MPTokenIssuanceCreateTransactor {
         if let Some(m) = tx.fields.get("MaximumAmount") {
             obj["MaximumAmount"] = m.clone();
         }
-        // AssetScale/TransferFee/MutableFlags are soeDEFAULT on the ledger
+        // AssetScale/TransferFee/ImmutableFlags are soeDEFAULT on the ledger
         // object: an explicit zero in the tx (A8A08D3E carries both) is
         // serialized AWAY by rippled — the stored object omits the field.
-        for f in ["AssetScale", "TransferFee", "MutableFlags"] {
+        // UINT32 53 is sfImmutableFlags (sfields.macro:98); "MutableFlags"
+        // was the SDK codec's stale name for it, gone from SDK branch
+        // validator-k256-vault on, where an object key the codec does not
+        // know is skipped at encode without an error.
+        for f in ["AssetScale", "TransferFee", "ImmutableFlags"] {
             match tx.fields.get(f).and_then(|v| v.as_u64()) {
                 Some(v) if v > 0 => obj[f] = serde_json::Value::Number(v.into()),
                 _ => {}
