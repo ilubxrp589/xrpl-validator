@@ -742,6 +742,7 @@ mod tests {
         let _ = &vault;
         vec![
             tx("VaultCreate", OWNER, json!({"Asset": xrp_asset()})),
+            tx("VaultDeposit", OWNER, json!({"VaultID": vault, "Amount": "100"})),
         ]
     }
 
@@ -1169,5 +1170,319 @@ mod tests {
         let vault = get(&sb, &keylet::vault_key(&OWNER, 3)).unwrap();
         assert_eq!(vault["Sequence"], json!(3));
         assert_eq!(owners(&sb, &OWNER), 3, "the ticket went, three came");
+    }
+
+    // -----------------------------------------------------------------------
+    // VaultDeposit
+    // -----------------------------------------------------------------------
+
+    /// A vault of `asset` made by OWNER (sequence 5) in `state`, committed:
+    /// its key, pseudo-account and share id.
+    fn make_vault(state: &mut LedgerState, fields: Value) -> (Hash256, [u8; 20], [u8; 24]) {
+        let (key, pseudo) = expected_vault(state);
+        commit(state, &tx("VaultCreate", OWNER, fields));
+        (key, pseudo, mptid(1, pseudo))
+    }
+
+    fn vault_hex(key: &Hash256) -> String {
+        hex::encode_upper(key.0)
+    }
+
+    fn edit(state: &mut LedgerState, key: Hash256, change: impl FnOnce(&mut Value)) {
+        let mut v: Value = serde_json::from_slice(&state.state_map.lookup(&key).unwrap()).unwrap();
+        change(&mut v);
+        put(state, key, &v);
+    }
+
+    fn deposit(account: [u8; 20], key: &Hash256, amount: Value) -> TxFields {
+        tx("VaultDeposit", account, json!({"VaultID": vault_hex(key), "Amount": amount}))
+    }
+
+    fn shares_of(sb: &Sandbox, share: &[u8; 24], holder: &[u8; 20]) -> Option<u64> {
+        get(sb, &keylet::mptoken_key(&keylet::mpt_issuance_key(share), holder)).map(|t| mpt::dec_field(&t, "MPTAmount"))
+    }
+
+    fn outstanding(sb: &Sandbox, share: &[u8; 24]) -> u64 {
+        mpt::dec_field(&get(sb, &keylet::mpt_issuance_key(share)).unwrap(), "OutstandingAmount")
+    }
+
+    fn usd_held(sb: &Sandbox, holder: &[u8; 20]) -> Amount {
+        holding::account_holds(sb, holder, &USD, false, false)
+    }
+
+    /// A permissioned domain accepting ISSUER's credential "KYC", and that
+    /// credential held (accepted) by `subject`, expiring as given.
+    fn domain_with_member(state: &mut LedgerState, subject: [u8; 20], expiration: Option<u32>) -> (Hash256, Hash256) {
+        let domain = Hash256([0xD0; 32]);
+        let kind = "4B5943";
+        put(state, domain, &json!({
+            "LedgerEntryType": "PermissionedDomain", "Owner": hex::encode(ISSUER), "Flags": 0, "Sequence": 3, "OwnerNode": "0",
+            "AcceptedCredentials": [{"Credential": {"Issuer": hex::encode(ISSUER), "CredentialType": kind}}],
+        }));
+        let cred_key = crate::tx::credential::credential_key(&subject, &ISSUER, &hex::decode(kind).unwrap());
+        let mut cred = json!({
+            "LedgerEntryType": "Credential", "Subject": hex::encode(subject), "Issuer": hex::encode(ISSUER), "CredentialType": kind,
+            "Flags": 0x0001_0000, "IssuerNode": "0", "SubjectNode": "0",
+        });
+        if let Some(exp) = expiration {
+            cred["Expiration"] = json!(exp);
+        }
+        put(state, cred_key, &cred);
+        (domain, cred_key)
+    }
+
+    /// VaultDeposit.cpp:85-98 (VaultValidation_test.cpp:274 "use zero vault",
+    /// :455 "invalid deposit amount").
+    #[test]
+    fn vault_deposit_preflight() {
+        let st = state();
+        let key = Hash256([0xAB; 32]);
+        assert_eq!(result(&st, &deposit(BOB, &Hash256([0; 32]), json!("100"))), TxResult::Malformed);
+        for amount in [json!("0"), json!("-1"), usd_json("0"), usd_json("-5"), json!({"mpt_issuance_id": "00".repeat(24), "value": "0"}),
+            json!({"mpt_issuance_id": "00".repeat(24), "value": "-3"})]
+        {
+            assert_eq!(result(&st, &deposit(BOB, &key, amount.clone())), TxResult::BadAmount, "{amount}");
+        }
+        assert_eq!(result(&st, &deposit(BOB, &key, json!("100"))), TxResult::NoEntry, "VaultValidation_test.cpp:611");
+    }
+
+    /// VaultDeposit.cpp:229-427 on an XRP vault. The first deposit mints one
+    /// share per drop (Scale 0); the depositor's MPToken is created; the
+    /// vault's totals, the pseudo-account's XRP and the share's outstanding
+    /// amount all move by the deposit.
+    #[test]
+    fn vault_deposit_xrp_first_and_second() {
+        let mut st = state();
+        let (key, pseudo, share) = make_vault(&mut st, json!({"Asset": xrp_asset()}));
+        let (r, sb) = apply(&st, &deposit(BOB, &key, json!("1000")));
+        assert_eq!(r, TxResult::Success);
+        let vault = get(&sb, &key).unwrap();
+        assert_eq!((&vault["AssetsTotal"], &vault["AssetsAvailable"]), (&json!("1000"), &json!("1000")));
+        assert_eq!(xrp_of(&sb, &pseudo), 1000);
+        assert_eq!(xrp_of(&sb, &BOB), BALANCE - FEE - 1000);
+        assert_eq!(shares_of(&sb, &share, &BOB), Some(1000));
+        assert_eq!(outstanding(&sb, &share), 1000);
+        assert_eq!(owners(&sb, &BOB), 1, "the MPToken");
+        assert_eq!(owners(&sb, &pseudo), 1);
+
+        // The owner deposits into its own vault: its MPToken is already there.
+        let (r, sb) = apply(&st, &deposit(OWNER, &key, json!("250")));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(shares_of(&sb, &share, &OWNER), Some(250));
+        assert_eq!(owners(&sb, &OWNER), 3);
+
+        // The vault has earned: 1500 drops behind 1000 shares. A deposit of
+        // 100 buys floor(1000 × 100 / 1500) = 66 shares, which cost
+        // 1500 × 66 / 1000 = 99 drops: the depositor is charged 99, not 100.
+        commit(&mut st, &deposit(BOB, &key, json!("1000")));
+        edit(&mut st, key, |v| {
+            v["AssetsTotal"] = json!("1500");
+            v["AssetsAvailable"] = json!("1500");
+        });
+        edit(&mut st, keylet::account_root_key(&pseudo), |v| v["Balance"] = json!("1500"));
+        let (r, sb) = apply(&st, &deposit(CAROL, &key, json!("100")));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(shares_of(&sb, &share, &CAROL), Some(66));
+        assert_eq!(xrp_of(&sb, &CAROL), BALANCE - FEE - 99);
+        let vault = get(&sb, &key).unwrap();
+        assert_eq!((&vault["AssetsTotal"], &vault["AssetsAvailable"]), (&json!("1599"), &json!("1599")));
+        assert_eq!(outstanding(&sb, &share), 1066);
+
+        // One drop buys no share: tecPRECISION_LOSS (:322-323), fee only.
+        let (r, sb) = apply(&st, &deposit(CAROL, &key, json!("1")));
+        assert_eq!(r, TxResult::PrecisionLoss);
+        assert_eq!(sb.modification_count(), 1);
+    }
+
+    /// An IOU vault: Scale 6, so the first deposit of 100 USD mints
+    /// 100,000,000 shares; the depositor's line is debited and the vault's
+    /// credited (no transfer fee: WaiveTransferFee::Yes).
+    #[test]
+    fn vault_deposit_iou() {
+        let mut st = state();
+        root_in(&mut st, ISSUER, LSF_DEFAULT_RIPPLE, json!({"TransferRate": 1_200_000_000u64}));
+        line(&mut st, BOB, 0, "500", "1000");
+        let (key, pseudo, share) = make_vault(&mut st, json!({"Asset": usd_asset()}));
+        let (r, sb) = apply(&st, &deposit(BOB, &key, usd_json("100")));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(shares_of(&sb, &share, &BOB), Some(100_000_000));
+        assert_eq!(usd_held(&sb, &BOB), usd("400"), "no transfer fee on a deposit");
+        assert_eq!(usd_held(&sb, &pseudo), usd("100"));
+        let vault = get(&sb, &key).unwrap();
+        assert_eq!((&vault["AssetsTotal"], &vault["AssetsAvailable"]), (&json!("100"), &json!("100")));
+
+        // More than the line holds: tecINSUFFICIENT_FUNDS — the issuer's own
+        // limit on the line would count (FullBalance), and it is zero.
+        assert_eq!(result(&st, &deposit(BOB, &key, usd_json("500.01"))), TxResult::InsufficientFunds);
+        assert_eq!(result(&st, &deposit(CAROL, &key, usd_json("1"))), TxResult::InsufficientFunds, "no line at all");
+        // The issuer deposits what it issues.
+        let (r, sb) = apply(&st, &deposit(ISSUER, &key, usd_json("7")));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(usd_held(&sb, &pseudo), usd("7"));
+        assert_eq!(shares_of(&sb, &share, &ISSUER), Some(7_000_000));
+
+        // fixCleanup3_2_0 (:190-197): an amount below what the vault's total
+        // can record is tecPRECISION_LOSS. With 1e15 USD in the vault the
+        // total's last digit is 0.1 USD; 0.01 USD floors to nothing.
+        line(&mut st, CAROL, 0, "2000000000000000", "0");
+        commit(&mut st, &deposit(CAROL, &key, usd_json("1000000000000000")));
+        assert_eq!(result(&st, &deposit(BOB, &key, usd_json("0.01"))), TxResult::PrecisionLoss);
+        assert_eq!(result(&st, &deposit(BOB, &key, usd_json("0.1"))), TxResult::Success);
+    }
+
+    /// An MPT vault: the depositor must hold (and, where required, be
+    /// authorized for) the asset; MPT moves through the issuance.
+    #[test]
+    fn vault_deposit_mpt() {
+        let mut st = state();
+        let id = issuance(&mut st, mpt::LSF_MPT_CAN_TRANSFER, json!({"TransferFee": 5000}));
+        token(&mut st, &id, BOB, 0, 900);
+        let (key, pseudo, share) = make_vault(&mut st, json!({"Asset": {"mpt_issuance_id": hex::encode_upper(id)}}));
+        let (r, sb) = apply(&st, &deposit(BOB, &key, mpt_json(&id, 300)));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(shares_of(&sb, &id, &BOB), Some(600));
+        assert_eq!(shares_of(&sb, &id, &pseudo), Some(300), "no transfer fee");
+        assert_eq!(shares_of(&sb, &share, &BOB), Some(300));
+        assert_eq!(outstanding(&sb, &id), 900);
+        assert_eq!(result(&st, &deposit(BOB, &key, mpt_json(&id, 901))), TxResult::InsufficientFunds);
+        assert_eq!(result(&st, &deposit(CAROL, &key, mpt_json(&id, 1))), TxResult::NoAuth, "no MPToken of the asset");
+        // The wrong asset.
+        assert_eq!(result(&st, &deposit(BOB, &key, json!("100"))), TxResult::WrongAsset);
+        assert_eq!(result(&st, &deposit(BOB, &key, mpt_json(&share, 1))), TxResult::WrongAsset, "the share is not the asset");
+    }
+
+    /// VaultDeposit.cpp:128-132, :161-175: transferability and freezes.
+    /// Under fixCleanup3_3_0 `checkDepositFreeze`; before it the two
+    /// `isFrozen` tests.
+    #[test]
+    fn vault_deposit_transfer_and_freeze_checks() {
+        const LSF_HIGH_NO_RIPPLE: u64 = 0x0020_0000;
+        // BOB's line with rippling off on the issuer's side and the vault's
+        // too (an issuer that dropped DefaultRipple after the vault was made).
+        let mut st = state();
+        line(&mut st, BOB, LSF_HIGH_NO_RIPPLE, "500", "1000");
+        let (key, pseudo, _) = make_vault(&mut st, json!({"Asset": usd_asset()}));
+        let vault_line = keylet::ripple_state_key(&pseudo, &ISSUER, &USD_CODE);
+        let issuer_side_no_ripple = if ISSUER > pseudo { LSF_HIGH_NO_RIPPLE } else { 0x0010_0000 };
+        edit(&mut st, vault_line, |l| l["Flags"] = json!(l["Flags"].as_u64().unwrap() | issuer_side_no_ripple));
+        assert_eq!(result(&st, &deposit(BOB, &key, usd_json("1"))), TxResult::NoRipple);
+
+        for fix330 in [true, false] {
+            let rules = if fix330 { MAINNET_WITH_VAULTS.to_vec() } else { rules_without(&[am::FIX_CLEANUP_3_3_0]) };
+            // The depositor's line frozen by the issuer.
+            let mut st = state_with(&rules);
+            line(&mut st, BOB, LSF_HIGH_FREEZE, "500", "1000");
+            let (key, pseudo, _) = make_vault(&mut st, json!({"Asset": usd_asset()}));
+            assert_eq!(result(&st, &deposit(BOB, &key, usd_json("1"))), TxResult::Frozen, "fix330 {fix330}");
+            // The vault's line frozen: refused under fix330 (a pseudo-account
+            // may not take deposits it could not pay back); before it the
+            // depositor's shares read as frozen through the asset — tecLOCKED.
+            let mut st = state_with(&rules);
+            line(&mut st, BOB, 0, "500", "1000");
+            let (key, pseudo2, _) = make_vault(&mut st, json!({"Asset": usd_asset()}));
+            let _ = pseudo;
+            let vault_line = keylet::ripple_state_key(&pseudo2, &ISSUER, &USD_CODE);
+            let freeze = if ISSUER > pseudo2 { LSF_HIGH_FREEZE } else { LSF_LOW_FREEZE };
+            edit(&mut st, vault_line, |l| l["Flags"] = json!(l["Flags"].as_u64().unwrap() | freeze));
+            let want = if fix330 { TxResult::Frozen } else { TxResult::Locked };
+            assert_eq!(result(&st, &deposit(BOB, &key, usd_json("1"))), want, "fix330 {fix330}");
+            // A global freeze stops even the issuer under fix330; before it
+            // the issuer's own asset is not frozen for it, but its shares are.
+            edit(&mut st, vault_line, |l| l["Flags"] = json!(l["Flags"].as_u64().unwrap() & !freeze));
+            root_in(&mut st, ISSUER, LSF_DEFAULT_RIPPLE | LSF_GLOBAL_FREEZE, json!({}));
+            assert_eq!(result(&st, &deposit(BOB, &key, usd_json("1"))), TxResult::Frozen, "fix330 {fix330}");
+        }
+
+        // A locked MPT.
+        let mut st = state();
+        let id = issuance(&mut st, mpt::LSF_MPT_CAN_TRANSFER, json!({}));
+        token(&mut st, &id, BOB, mpt::LSF_MPT_LOCKED, 900);
+        let (key, _, _) = make_vault(&mut st, json!({"Asset": {"mpt_issuance_id": hex::encode_upper(id)}}));
+        assert_eq!(result(&st, &deposit(BOB, &key, mpt_json(&id, 1))), TxResult::Locked);
+    }
+
+    /// A private vault (VaultDeposit.cpp:177-184, :265-307): the owner always
+    /// deposits; anyone else must hold a credential the share's domain
+    /// accepts — tecNO_AUTH otherwise — and gets its MPToken through
+    /// `enforceMPTokenAuthorization`. An expired credential passes preclaim,
+    /// is deleted in do_apply and the result is tecEXPIRED.
+    #[test]
+    fn vault_deposit_private() {
+        let mut st = state();
+        let (domain, _) = domain_with_member(&mut st, BOB, None);
+        let (key, _, share) = make_vault(&mut st, json!({"Asset": xrp_asset(), "Flags": TF_VAULT_PRIVATE, "DomainID": hex::encode_upper(domain.0)}));
+        assert_eq!(result(&st, &deposit(CAROL, &key, json!("100"))), TxResult::NoAuth, "not in the domain");
+        let (r, sb) = apply(&st, &deposit(BOB, &key, json!("100")));
+        assert_eq!(r, TxResult::Success);
+        let token = get(&sb, &keylet::mptoken_key(&keylet::mpt_issuance_key(&share), &BOB)).unwrap();
+        assert_eq!(mpt::dec_field(&token, "MPTAmount"), 100);
+        assert_eq!(obj_flags(&token) & mpt::LSF_MPT_AUTHORIZED, 0, "authorized by the domain, not by the flag");
+        let (r, sb) = apply(&st, &deposit(OWNER, &key, json!("100")));
+        assert_eq!(r, TxResult::Success);
+        let token = get(&sb, &keylet::mptoken_key(&keylet::mpt_issuance_key(&share), &OWNER)).unwrap();
+        assert_eq!(obj_flags(&token) & mpt::LSF_MPT_AUTHORIZED, mpt::LSF_MPT_AUTHORIZED);
+
+        // A private vault without a domain: only the owner.
+        let mut st = state();
+        let (key, _, _) = make_vault(&mut st, json!({"Asset": xrp_asset(), "Flags": TF_VAULT_PRIVATE}));
+        assert_eq!(result(&st, &deposit(BOB, &key, json!("100"))), TxResult::NoAuth);
+        assert_eq!(result(&st, &deposit(OWNER, &key, json!("100"))), TxResult::Success);
+
+        // An expired credential: tecEXPIRED from do_apply, the credential gone.
+        let mut st = state();
+        let (domain, cred) = domain_with_member(&mut st, BOB, Some(NOW - 1));
+        let (key, _, share) = make_vault(&mut st, json!({"Asset": xrp_asset(), "Flags": TF_VAULT_PRIVATE, "DomainID": hex::encode_upper(domain.0)}));
+        let (r, sb) = apply(&st, &deposit(BOB, &key, json!("100")));
+        assert_eq!(r, TxResult::Expired);
+        assert!(get(&sb, &cred).is_none(), "the expired credential is deleted");
+        assert_eq!(shares_of(&sb, &share, &BOB), None);
+        assert_eq!(xrp_of(&sb, &BOB), BALANCE - FEE);
+    }
+
+    /// VaultDeposit.cpp:385-388: tecLIMIT_EXCEEDED past sfAssetsMaximum —
+    /// the limit itself may be reached.
+    #[test]
+    fn vault_deposit_respects_assets_maximum() {
+        let mut st = state();
+        let (key, _, _) = make_vault(&mut st, json!({"Asset": xrp_asset(), "AssetsMaximum": "1000"}));
+        assert_eq!(result(&st, &deposit(BOB, &key, json!("1001"))), TxResult::LimitExceeded);
+        commit(&mut st, &deposit(BOB, &key, json!("1000")));
+        assert_eq!(result(&st, &deposit(BOB, &key, json!("1"))), TxResult::LimitExceeded);
+    }
+
+    /// VaultDeposit.cpp:110-119 under LendingProtocolV1_1: a closed-ended
+    /// vault takes deposits while `now <= SubscriptionDate`; in its
+    /// Investment and Redemption phases the deposit is tecEXPIRED.
+    #[test]
+    fn vault_deposit_closed_ended_phases() {
+        for (subscription, redemption, want) in [
+            (NOW + 100, NOW + 5000, TxResult::Success),
+            (NOW, NOW + 5000, TxResult::Success),
+            (NOW - 1, NOW + 5000, TxResult::Expired),
+            (NOW - 500, NOW, TxResult::Expired),
+        ] {
+            let mut st = state_with(&rules_with(&[am::LENDING_PROTOCOL_V1_1]));
+            let (key, _, _) = make_vault(&mut st, json!({
+                "Asset": xrp_asset(), "VaultKind": 1, "SubscriptionDate": NOW + 100, "RedemptionDate": NOW + 5000,
+            }));
+            edit(&mut st, key, |v| {
+                v["SubscriptionDate"] = json!(subscription);
+                v["RedemptionDate"] = json!(redemption);
+            });
+            assert_eq!(result(&st, &deposit(BOB, &key, json!("100"))), want, "{subscription} {redemption}");
+        }
+    }
+
+    /// The reserve for the depositor's MPToken (MPTokenHelpers.cpp:259-266):
+    /// tested only from the third owned object on.
+    #[test]
+    fn vault_deposit_reserve_for_the_share_token() {
+        let mut st = state();
+        let (key, _, _) = make_vault(&mut st, json!({"Asset": xrp_asset()}));
+        // Two objects owned already, 1.5 XRP: a third needs 1.6.
+        root_in(&mut st, BOB, 0, json!({"OwnerCount": 2, "Balance": "1500000"}));
+        assert_eq!(result(&st, &deposit(BOB, &key, json!("10"))), TxResult::InsufficientReserve);
+        root_in(&mut st, BOB, 0, json!({"OwnerCount": 1, "Balance": "1500000"}));
+        assert_eq!(result(&st, &deposit(BOB, &key, json!("10"))), TxResult::Success);
     }
 }
