@@ -103,15 +103,18 @@ impl StAmount {
             return Ok(StAmount { native: true, negative: drops < 0, mantissa: drops.unsigned_abs() as u64, exponent: 0 });
         }
         // `*this = iou()`: IOUAmount(Number{mantissa, offset}) — normalised
-        // under `mode`, then IOUAmount's clamp.
+        // under `mode` at Number's scale, `fromNumber`'s sixteen digits
+        // under `mode` again (the same value at the Small scale), then
+        // IOUAmount's clamp.
         let n = Number::from_parts(negative, mantissa, exponent, mode).map_err(|_| StError::Overflow)?;
-        if n.is_zero() || n.exponent < K_MIN_OFFSET {
+        let (negative, mantissa, exponent) = n.iou_parts(mode).map_err(|_| StError::Overflow)?;
+        if mantissa == 0 || exponent < K_MIN_OFFSET {
             return Ok(StAmount::zero(false));
         }
-        if n.exponent > 80 {
+        if exponent > 80 {
             return Err(StError::Overflow);
         }
-        Ok(StAmount { native: false, negative: n.negative, mantissa: n.mantissa, exponent: n.exponent })
+        Ok(StAmount { native: false, negative, mantissa, exponent })
     }
 }
 

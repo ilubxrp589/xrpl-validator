@@ -127,6 +127,9 @@ pub fn apply_transaction_set(
     let mut total_fees: u64 = 0;
 
     for (tx_hash, tx) in &transactions {
+        // Number's mantissa scale for this transaction, from the ledger's
+        // amendments (rippled's CurrentTransactionRulesGuard).
+        let _number_scale = super::amendments::number_scale_guard(&Sandbox::new(&new_state));
         // Dispatch to the correct transactor
         let transactor = match get_transactor(&tx.tx_type) {
             Some(t) => t,

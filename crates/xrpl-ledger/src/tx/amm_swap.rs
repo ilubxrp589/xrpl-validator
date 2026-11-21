@@ -473,8 +473,10 @@ pub(crate) fn n_add(a: Me, b: Me, rnd: Rnd) -> Me {
     let (Ok(x), Ok(y)) = (Number::from_parts(false, a.0, a.1, mode), Number::from_parts(false, b.0, b.1, mode)) else {
         return (0, 0);
     };
-    match x.add(y, mode) {
-        Ok(r) => (r.mantissa as u128, r.exponent),
+    // Back to the engine's 16-digit pair (`iou_parts`: the Number's own
+    // fields at the Small scale).
+    match x.add(y, mode).and_then(|r| r.iou_parts(mode)) {
+        Ok((_, m, e)) => (m as u128, e),
         Err(_) => (0, 0),
     }
 }
@@ -492,9 +494,9 @@ pub(crate) fn n_sub(a: Me, b: Me, rnd: Rnd) -> Me {
     let (Ok(x), Ok(y)) = (Number::from_parts(false, a.0, a.1, mode), Number::from_parts(false, b.0, b.1, mode)) else {
         return (0, 0);
     };
-    match x.sub(y, mode) {
-        Ok(r) if r.negative || r.is_zero() => (0, 0),
-        Ok(r) => (r.mantissa as u128, r.exponent),
+    match x.sub(y, mode).and_then(|r| r.iou_parts(mode)) {
+        Ok((negative, m, _)) if negative || m == 0 => (0, 0),
+        Ok((_, m, e)) => (m as u128, e),
         Err(_) => (0, 0),
     }
 }

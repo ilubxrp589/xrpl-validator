@@ -802,11 +802,15 @@ fn num_i(v: i64) -> Number {
 }
 
 /// The engine magnitude of a `Number` (callers have ruled out negatives).
+///
+/// The pair is the engine's 16-digit amount, so this is where a `Number`
+/// becomes an STAmount (`IOUAmount::fromNumber`): its own fields at the
+/// Small scale, a rounding to sixteen digits at Large330 — exact when the
+/// value already passed `to_st_amount`.
 fn me_of(n: Number) -> ox::Me {
-    if n.is_zero() || n.negative {
-        (0, 0)
-    } else {
-        (n.mantissa as u128, n.exponent)
+    match n.iou_parts(Rounding::ToNearest) {
+        Ok((false, m, e)) if m != 0 => (m as u128, e),
+        _ => (0, 0),
     }
 }
 
@@ -859,11 +863,18 @@ fn solve_quadratic_eq(a: Number, b: Number, c: Number) -> Result<Number, NumberE
 
 /// `toSTAmount(asset, n, rm)` (AmountConversions.h:152-183): an IOU keeps the
 /// `Number`; XRP becomes whole drops through `operator rep()` under `rm`.
+///
+/// At the Small scale an IOU's Number already has an STAmount's sixteen
+/// digits. At Large330 `STAmount(asset, n)` rounds nineteen to sixteen under
+/// the AMBIENT rounding mode — `toAmount` installs `rm` for integral assets
+/// only (AmountConversions.h:155-157) — and both callers here sit inside a
+/// guard of the same `rm` (`multiply`'s, AMMHelpers.cpp:292-298; the
+/// Downward guard of `getRoundedAsset`), so `rm` it is.
 fn to_st_amount(n: Number, rm: Rounding, xrp: bool) -> Result<Number, NumberError> {
     if xrp {
         Number::new(n.to_drops(rm)?, 0, rm)
     } else {
-        Ok(n)
+        n.iou_rounded(rm)
     }
 }
 
@@ -877,11 +888,14 @@ fn multiply_n(amount: Number, frac: Number, rm: Rounding, xrp: bool) -> Result<N
 /// 181-190), signed: `(lpt + t) - lpt` on a deposit, `(t - lpt) + lpt` on a
 /// withdrawal, both under Downward.
 fn adjust_lp_tokens_n(lpt: Number, tokens: Number, deposit: bool) -> Result<Number, NumberError> {
+    // STAmount arithmetic: each sum and difference is an IOUAmount again
+    // (`iou_rounded`: sixteen digits under the guard's mode; the identity at
+    // the Small scale).
     let d = Rounding::Downward;
     if deposit {
-        lpt.add(tokens, d)?.sub(lpt, d)
+        lpt.add(tokens, d)?.iou_rounded(d)?.sub(lpt, d)?.iou_rounded(d)
     } else {
-        tokens.sub(lpt, d)?.add(lpt, d)
+        tokens.sub(lpt, d)?.iou_rounded(d)?.add(lpt, d)?.iou_rounded(d)
     }
 }
 

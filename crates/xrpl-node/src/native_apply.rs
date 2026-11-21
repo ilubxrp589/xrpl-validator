@@ -275,6 +275,9 @@ pub fn native_apply_one_changes_staged(state: &LedgerState, tx: &TxFields, tx_ha
 
 fn apply_core(state: &LedgerState, tx: &TxFields) -> Applied {
     xrpl_ledger::tx::reset_thread_state();
+    // Number's mantissa scale for this transaction, from the ledger's amendments (rippled's
+    // CurrentTransactionRulesGuard, Rules.cpp:35-74): Small unless SingleAssetVault or LendingProtocol is on.
+    let _number_scale = xrpl_ledger::ledger::amendments::number_scale_guard(&Sandbox::new(state));
     let transactor = match get_transactor(&tx.tx_type) {
         Some(t) => t,
         None => {

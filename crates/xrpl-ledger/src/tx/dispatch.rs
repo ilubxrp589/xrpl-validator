@@ -152,6 +152,10 @@ pub fn is_supported(tx_type: &str) -> bool {
 /// Mirrors `xrpl_node::native_apply::native_apply_one`, which runs the
 /// same pipeline on a fresh sandbox over a `LedgerState`.
 pub fn apply_on_sandbox(tx: &TxFields, sb: &mut Sandbox) -> (TxResult, bool) {
+    // Number's mantissa scale for this transaction, from the ledger's
+    // amendments (rippled's CurrentTransactionRulesGuard). A Batch inner
+    // arrives here under its outer's guard and takes the same scale again.
+    let _number_scale = crate::ledger::amendments::number_scale_guard(sb);
     let entry = sb.snapshot();
     let Some(transactor) = get_transactor(&tx.tx_type) else {
         // An unsupported type is applied as its common changes only.

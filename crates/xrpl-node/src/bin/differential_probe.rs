@@ -2606,6 +2606,8 @@ fn native_apply_one(state: &LedgerState, tx: &TxFields) -> (String, HashMap<Hash
     // through its own copy and did not (1AD9E8033191 in #107093372 read a
     // flag C932E2C004EA's tail turn left behind).
     xrpl_ledger::tx::reset_thread_state();
+    // As native_apply.rs: Number's mantissa scale from the ledger's amendments.
+    let _number_scale = xrpl_ledger::ledger::amendments::number_scale_guard(&Sandbox::new(state));
     let transactor = match get_transactor(&tx.tx_type) {
         Some(t) => t,
         None => {

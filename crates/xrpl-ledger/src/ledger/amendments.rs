@@ -12,6 +12,7 @@
 
 use super::keylet;
 use super::sandbox::Sandbox;
+use crate::tx::number::{MantissaScale, ScaleGuard};
 
 /// fixCleanup3_3_0 — AMM deposit/withdraw freeze scope, AMM precision-loss
 /// guard, CheckID zero, pseudo-account signers, domain-book validation.
@@ -102,6 +103,28 @@ pub fn pseudo_account_sequence_is_zero(sandbox: &Sandbox) -> bool {
     enabled(sandbox, SINGLE_ASSET_VAULT) || enabled(sandbox, LENDING_PROTOCOL)
 }
 
+/// The mantissa scale `Number` runs at in the ledger the sandbox is built
+/// on — rippled `setCurrentTransactionRules` (Rules.cpp:35-74): the 16-digit
+/// Small scale while neither SingleAssetVault nor LendingProtocol is
+/// enabled, the 19-digit Large330 scale once either is. (rippled's two older
+/// Large scales need fixCleanup3_3_0 or fixCleanup3_2_0 OFF with a vault
+/// amendment ON; both fixes are on at mainnet and those scales are not
+/// ported — see `tx::number`.) The day either amendment activates, every
+/// transaction's IOU and AMM arithmetic changes, vault transaction or not.
+pub fn number_scale(sandbox: &Sandbox) -> MantissaScale {
+    MantissaScale::for_rules(enabled(sandbox, SINGLE_ASSET_VAULT), enabled(sandbox, LENDING_PROTOCOL))
+}
+
+/// rippled's `CurrentTransactionRulesGuard` as far as `Number` goes
+/// (Transactor.cpp:1562 for doApply; applySteps.cpp:60-75 for preflight,
+/// preclaim and the fee): hold the returned guard for the whole of one
+/// transaction's application and its arithmetic runs at the ledger's scale.
+/// Taken at each outer entry (`ledger::apply`, `tx::dispatch`, the node's
+/// `native_apply`); a Batch inner taking it again inside is harmless.
+pub fn number_scale_guard(sandbox: &Sandbox) -> ScaleGuard {
+    ScaleGuard::new(number_scale(sandbox))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,6 +159,35 @@ mod tests {
         state.state_map.insert(keylet::amendments_key(), serde_json::to_vec(&obj).unwrap()).unwrap();
         assert!(fix_cleanup_3_3_0(&Sandbox::new(&state)));
         assert!(!enabled(&Sandbox::new(&state), "00000000000000000000000000000000000000000000000000000000000000BB"));
+    }
+
+    /// Rules.cpp:43-71: Small with neither vault amendment, Large330 with
+    /// either — and the guard holds that scale for its scope only.
+    #[test]
+    fn number_scale_follows_the_two_vault_amendments() {
+        use crate::tx::number::mantissa_scale;
+        let with = |ids: &[&str]| {
+            let mut state = test_state();
+            let obj = serde_json::json!({ "LedgerEntryType": "Amendments", "Flags": 0, "Amendments": ids });
+            state.state_map.insert(keylet::amendments_key(), serde_json::to_vec(&obj).unwrap()).unwrap();
+            state
+        };
+        assert_eq!(number_scale(&Sandbox::new(&test_state())), MantissaScale::Small, "no singleton");
+        // Mainnet today: the cleanups are on, the vault amendments are not.
+        let mainnet = with(&[FIX_CLEANUP_3_2_0, FIX_CLEANUP_3_3_0, FIX_CLEANUP_3_4_0]);
+        assert_eq!(number_scale(&Sandbox::new(&mainnet)), MantissaScale::Small);
+        for ids in [vec![SINGLE_ASSET_VAULT], vec![LENDING_PROTOCOL], vec![SINGLE_ASSET_VAULT, LENDING_PROTOCOL]] {
+            let mut all = vec![FIX_CLEANUP_3_2_0, FIX_CLEANUP_3_3_0];
+            all.extend(ids);
+            let state = with(&all);
+            assert_eq!(number_scale(&Sandbox::new(&state)), MantissaScale::Large330, "{all:?}");
+            assert_eq!(mantissa_scale(), MantissaScale::Small);
+            {
+                let _scale = number_scale_guard(&Sandbox::new(&state));
+                assert_eq!(mantissa_scale(), MantissaScale::Large330);
+            }
+            assert_eq!(mantissa_scale(), MantissaScale::Small);
+        }
     }
 
     /// An amendment's ID is SHA-512Half of its registered name; fixBatchV1_2's

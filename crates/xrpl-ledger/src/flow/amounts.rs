@@ -2,11 +2,13 @@
 //! `IOUAmount` and the `EitherAmount` variant the `Step` interface speaks
 //! (`include/xrpl/tx/paths/detail/EitherAmount.h`).
 //!
-//! An `IOUAmount` is a signed 16-digit decimal — rippled's `Number` at the
-//! Small scale with STAmount's exponent range — so its arithmetic is
-//! `tx::number` at ToNearest, exactly `IOUAmount::operator+=` (IOUAmount.cpp:
-//! `Number{*this} + Number{other}`, then `IOUAmount(Number)` clamps the
-//! exponent to [kMinOffset, kMaxOffset]).
+//! An `IOUAmount` is a signed 16-digit decimal with STAmount's exponent
+//! range, and its arithmetic is `tx::number` at ToNearest, exactly
+//! `IOUAmount::operator+=` (IOUAmount.cpp: `Number{*this} + Number{other}`,
+//! then `IOUAmount(Number)` rounds to sixteen digits and clamps the exponent
+//! to [kMinOffset, kMaxOffset]). At Number's Small scale the operands, the
+//! sum and the IOUAmount all have sixteen digits; at Large330 the sum is
+//! held at nineteen and rounded once on the way back.
 use crate::tx::number::{Number, Rounding};
 use crate::tx::offer::Me;
 
@@ -30,11 +32,20 @@ impl IouAmount {
     /// kMinOffset is zero; above kMaxOffset rippled throws (unreachable from
     /// in-range operands; mapped to zero here and logged nowhere, as the
     /// engine's `stamount_signed_add` already does).
+    ///
+    /// `IOUAmount::fromNumber` (IOUAmount.cpp:28-37) is `normalizeToRange`
+    /// to sixteen digits under the thread's rounding mode — ToNearest
+    /// wherever the path engine builds an IOUAmount. At the Small scale the
+    /// Number already has sixteen and `iou_parts` hands its fields back; at
+    /// Large330 this is the one rounding of a nineteen-digit result.
     pub fn from_number(n: Number) -> IouAmount {
-        if n.is_zero() || n.exponent < K_MIN_OFFSET || n.exponent > K_MAX_OFFSET {
+        let Ok((negative, mantissa, exponent)) = n.iou_parts(Rounding::ToNearest) else {
+            return IouAmount::ZERO;
+        };
+        if mantissa == 0 || exponent < K_MIN_OFFSET || exponent > K_MAX_OFFSET {
             return IouAmount::ZERO;
         }
-        IouAmount { negative: n.negative, mantissa: n.mantissa, exponent: n.exponent }
+        IouAmount { negative, mantissa, exponent }
     }
 
     /// The engine's unsigned `Me` pair with a sign, normalised.
@@ -45,8 +56,10 @@ impl IouAmount {
         }
     }
 
+    /// `Number{IOUAmount}` (IOUAmount.h:120-124) at the thread's scale: the
+    /// fields as they stand at Small, padded to nineteen digits at Large330.
     pub fn number(self) -> Number {
-        Number { negative: self.negative, mantissa: self.mantissa, exponent: self.exponent }
+        Number::from_iou(self.negative, self.mantissa, self.exponent)
     }
 
     /// `STAmount::getText()` for an IOU: plain decimal when the exponent
@@ -291,6 +304,40 @@ mod tests {
         assert!(iou(-3, 0) < iou(2, 0));
         assert!(iou(3, 0) > IouAmount::ZERO);
         assert!(iou(-3, 0) < IouAmount::ZERO);
+    }
+
+    /// At Number's Large330 scale `IOUAmount::operator+=` holds the result at
+    /// nineteen digits and rounds it once to sixteen (IOUAmount.cpp:28-37,
+    /// 69-84): the Small scale's cusp quirk — 1e11 − 2.27e-5 stays 1e11 — is
+    /// gone, and what comes back is still a 16-digit IOUAmount. Outside the
+    /// guard nothing has changed.
+    #[test]
+    fn iou_arithmetic_follows_the_number_scale() {
+        use crate::tx::number::{MantissaScale, ScaleGuard};
+        let a = IouAmount { negative: false, mantissa: 1_000_000_000_000_000, exponent: -4 };
+        let b = IouAmount { negative: false, mantissa: 2_273_254_535_757_127, exponent: -20 };
+        let small = a.sub(b);
+        assert_eq!((small.negative, small.mantissa, small.exponent), (false, 1_000_000_000_000_000, -4));
+        {
+            let _scale = ScaleGuard::new(MantissaScale::Large330);
+            // 99999999999.99997726745… to sixteen digits.
+            let r = a.sub(b);
+            assert_eq!((r.negative, r.mantissa, r.exponent), (false, 9_999_999_999_999_998, -5));
+            let r = b.sub(a);
+            assert_eq!((r.negative, r.mantissa, r.exponent), (true, 9_999_999_999_999_998, -5));
+            // Finding 47's pool sum is 2000992.389764256651 exactly: …257 at either scale.
+            let r = iou(2_000_892_236_615_386, -9).add(iou(1_001_531_488_706_510, -13));
+            assert_eq!((r.mantissa, r.exponent), (2_000_992_389_764_257, -9));
+            assert_eq!(iou(5, 0).sub(iou(5, 0)), IouAmount::ZERO);
+            assert!(iou(1_000_000_000_000_000, -110).is_zero());
+            // Number{IOUAmount} pads to nineteen digits and comes back unchanged.
+            assert_eq!(a.number(), Number::new(1, 11, Rounding::ToNearest).unwrap());
+            assert_eq!((a.number().mantissa, a.number().exponent), (1_000_000_000_000_000_000, -7));
+            assert_eq!(IouAmount::from_number(a.number()), a);
+            assert_eq!(IouAmount::from_number(b.negated().number()), b.negated());
+        }
+        assert_eq!(a.sub(b), small);
+        assert_eq!((a.number().mantissa, a.number().exponent), (1_000_000_000_000_000, -4));
     }
 
     /// rippled 3.4.1 MathUtilities.h `checkedAdd`'s static_asserts, on the
