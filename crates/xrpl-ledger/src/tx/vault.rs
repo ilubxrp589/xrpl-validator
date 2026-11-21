@@ -1257,6 +1257,303 @@ impl Transactor for VaultSetTransactor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// VaultClawback (VaultClawback.cpp)
+// ---------------------------------------------------------------------------
+
+/// VaultClawback (type 70): the asset's issuer takes back a holder's stake —
+/// the holder's shares are burned and the assets behind them go to the
+/// issuer — or the vault's owner burns shares left behind in a vault with no
+/// assets.
+///
+/// Fee: the plain base fee. Reserve: a holder's emptied MPToken of the share
+/// is removed (its owner count falls).
+///
+/// Invariants: before fixCleanup3_4_0 a clawback naming a pseudo-account as
+/// holder with an explicit amount "debits the vault and trips the 'shares
+/// must move' invariant" (VaultClawback.cpp:99-103) — rippled's result there
+/// is the invariant's, which this engine does not model. With the fix the
+/// transactor refuses it (tecPSEUDO_ACCOUNT).
+pub struct VaultClawbackTransactor;
+
+const LSF_ALLOW_TRUST_LINE_CLAWBACK: u64 = 0x8000_0000;
+const LSF_NO_FREEZE: u64 = 0x0020_0000;
+
+/// `clawbackAmount(vault, maybeAmount, account)` (VaultClawback.cpp:62-76):
+/// sfAmount when given; else zero ("all") of the share for the vault's
+/// owner, of the asset for anyone else.
+fn clawback_amount(vault: &Value, amount: Option<Amount>, account: &[u8; 20]) -> Option<Amount> {
+    if let Some(amount) = amount {
+        return Some(amount);
+    }
+    if account_of(vault, "Owner") == Some(*account) {
+        return vault_share(vault).map(Amount::zero);
+    }
+    vault_asset(vault).map(Amount::zero)
+}
+
+/// `VaultClawback::assetsToClawback` (VaultClawback.cpp:233-387): the assets
+/// recovered and the shares destroyed for a clawback of `amount` of the
+/// vault's asset from `holder` (zero = everything the holder has).
+fn assets_to_clawback(sandbox: &Sandbox, vault: &Value, share_issuance: &Value, holder: &[u8; 20], amount: &Amount) -> Result<(Amount, Amount), TxResult> {
+    let fix340 = am::fix_cleanup_3_4_0(sandbox);
+    let (Some(asset), Some(share)) = (vault_asset(vault), vault_share(vault)) else { return Err(TxResult::TecInternal) };
+    if amount.asset != asset {
+        return Err(TxResult::TecInternal);
+    }
+    let assets_available = number_field(vault, "AssetsAvailable");
+    let held = || holding::account_holds(sandbox, holder, &share, false, false);
+
+    // Before fixCleanup3_1_3 a zero-amount clawback returned here, unclamped
+    // to sfAssetsAvailable — more than the vault had on hand when part of it
+    // was out on loan. Kept for replay. (Outside rippled's try: a throw is
+    // tefEXCEPTION.)
+    if !enabled(sandbox, am::FIX_CLEANUP_3_1_3) && amount.is_zero() {
+        let shares = held();
+        return match vh::shares_to_assets_withdraw(vault, share_issuance, &shares, WaiveUnrealizedLoss::No, AMBIENT) {
+            Ok(Some(assets)) => Ok((assets, shares)),
+            Ok(None) => Err(TxResult::TecInternal),
+            Err(_) => Err(TxResult::TefException),
+        };
+    }
+
+    let compute = || -> Result<Result<(Amount, Amount), TxResult>, StError> {
+        // fixCleanup3_4_0: a sole holder's shares are not discounted by the
+        // unrealized loss — at the discounted rate a clawback of
+        // sfAssetsAvailable could burn every share with loan assets left.
+        let waive = if fix340 && vh::is_sole_shareholder(sandbox, holder, share_issuance) {
+            WaiveUnrealizedLoss::Yes
+        } else {
+            WaiveUnrealizedLoss::No
+        };
+        let to_assets = |shares: &Amount| vh::shares_to_assets_withdraw(vault, share_issuance, shares, waive, AMBIENT);
+        let (mut shares, mut assets);
+        if amount.is_zero() {
+            // Everything the holder has; a sole holder has the whole supply.
+            shares = if waive == WaiveUnrealizedLoss::Yes {
+                Amount { asset: share, negative: false, mantissa: mpt::dec_field(share_issuance, "OutstandingAmount"), exponent: 0 }
+            } else {
+                held()
+            };
+            let Some(worth) = to_assets(&shares)? else { return Ok(Err(TxResult::TecInternal)) };
+            assets = worth;
+        } else {
+            // fixCleanup3_4_0 truncates the shares so the assets recovered
+            // never exceed the amount asked; before it, to nearest.
+            let truncate = if fix340 { TruncateShares::Yes } else { TruncateShares::No };
+            let Some(burned) = vh::assets_to_shares_withdraw(vault, share_issuance, amount, truncate, waive, AMBIENT)? else {
+                return Ok(Err(TxResult::TecInternal));
+            };
+            shares = burned;
+            let Some(worth) = to_assets(&shares)? else { return Ok(Err(TxResult::TecInternal)) };
+            assets = worth;
+        }
+        // No more than the vault has on hand: clamp, then re-derive the pair.
+        if assets.number() > assets_available {
+            assets = Amount::from_number(asset, assets_available, AMBIENT)?;
+            let Some(burned) =
+                vh::assets_to_shares_withdraw(vault, share_issuance, &assets, TruncateShares::Yes, waive, AMBIENT)?
+            else {
+                return Ok(Err(TxResult::TecInternal));
+            };
+            shares = burned;
+            let Some(worth) = to_assets(&shares)? else { return Ok(Err(TxResult::TecInternal)) };
+            assets = worth;
+            if assets.number() > assets_available {
+                return Ok(Err(TxResult::TecInternal));
+            }
+        }
+        // fixCleanup3_4_0: floored at the scale the total will have; the
+        // shares are burned for their value before the floor.
+        if fix340 && positive(&assets) {
+            assets = match vh::clamp_to_assets_total_scale(vault, &assets.negated(), AMBIENT)? {
+                Ok(clamped) => clamped,
+                Err(refused) => return Ok(Err(refused)),
+            };
+        }
+        Ok(Ok((assets, shares)))
+    };
+    match compute() {
+        Ok(pair) => pair,
+        Err(_) => Err(TxResult::PathDry),
+    }
+}
+
+impl Transactor for VaultClawbackTransactor {
+    /// `VaultClawback::preflight` (VaultClawback.cpp:35-60).
+    fn preflight(&self, tx: &TxFields) -> TxResult {
+        if vault_id(tx).is_none_or(|id| is_zero_key(&id)) {
+            return TxResult::Malformed;
+        }
+        if account_of(&tx.fields, "Holder").is_none() {
+            return TxResult::Malformed;
+        }
+        if let Some(amount) = tx.fields.get("Amount") {
+            // Zero is valid: it means "all", and is the default.
+            let Some(amount) = tx_amount(amount) else { return TxResult::BadAmount };
+            if amount.negative && !amount.is_zero() {
+                return TxResult::BadAmount;
+            }
+            if amount.asset == HeldAsset::Xrp {
+                return TxResult::Malformed;
+            }
+        }
+        TxResult::Success
+    }
+
+    fn preflight_in(&self, tx: &TxFields, rules: &Sandbox) -> TxResult {
+        gate(tx, rules, true, TF_UNIVERSAL_MASK).unwrap_or_else(|| self.preflight(tx))
+    }
+
+    /// `VaultClawback::preclaim` (VaultClawback.cpp:78-231; the missing
+    /// holder is 3.5.0-rc1's :100-106).
+    fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        let Some((_, vault)) = read_vault(sandbox, tx) else { return TxResult::NoEntry };
+        let (Some(asset), Some(holder)) = (vault_asset(&vault), account_of(&tx.fields, "Holder")) else {
+            return TxResult::TefInternal;
+        };
+        let account = tx.account;
+        let given = tx.fields.get("Amount").and_then(tx_amount);
+        let Some((share_id, _, Some(share_issuance))) = read_share(sandbox, &vault) else { return TxResult::TefInternal };
+        // fixCleanup3_5_0: a holder that does not exist is refused here, as
+        // the other clawbacks do. Before the fix it fails in do_apply
+        // (tecPRECISION_LOSS: no shares) and the fee is charged.
+        if am::fix_cleanup_3_5_0(sandbox) && !sandbox.exists(&keylet::account_root_key(&holder)) {
+            return TxResult::NoAccount;
+        }
+        // fixCleanup3_4_0: a pseudo-account holds no vault shares.
+        if am::fix_cleanup_3_4_0(sandbox) && crate::tx::misc::is_pseudo_account(sandbox, &holder) {
+            return TxResult::TecPseudoAccount;
+        }
+        let share = HeldAsset::Mpt(share_id);
+        let owner = account_of(&vault, "Owner");
+        // Issuer and owner at once: which of the two clawbacks is meant?
+        if given.is_none() && asset != HeldAsset::Xrp && Some(holding::asset_issuer(&asset)) == owner {
+            return TxResult::WrongAsset;
+        }
+        let Some(amount) = clawback_amount(&vault, given, &account) else { return TxResult::TefInternal };
+
+        if amount.asset == share {
+            // The owner burning shares of a vault that has shares but no assets.
+            if Some(account) != owner {
+                return TxResult::NoPermission;
+            }
+            let shares_total = mpt::dec_field(&share_issuance, "OutstandingAmount");
+            if shares_total == 0 || !number_field(&vault, "AssetsTotal").is_zero() || !number_field(&vault, "AssetsAvailable").is_zero() {
+                return TxResult::NoPermission;
+            }
+            // A non-zero amount must be all the holder has.
+            if !amount.is_zero() {
+                let held = holding::account_holds(sandbox, &holder, &share, false, false);
+                if amount != held {
+                    return TxResult::LimitExceeded;
+                }
+            }
+            return TxResult::Success;
+        }
+
+        if amount.asset == asset {
+            if asset == HeldAsset::Xrp {
+                return TxResult::NoPermission;
+            }
+            // Only the asset's issuer, and not from itself.
+            if account != holding::asset_issuer(&asset) || account == holder {
+                return TxResult::NoPermission;
+            }
+            return match asset {
+                HeldAsset::Mpt(id) => match json_at(sandbox, &keylet::mpt_issuance_key(&id)) {
+                    None => TxResult::ObjectNotFound,
+                    Some(issuance) if obj_flags(&issuance) & mpt::LSF_MPT_CAN_CLAWBACK == 0 => TxResult::NoPermission,
+                    Some(_) => TxResult::Success,
+                },
+                _ => match json_at(sandbox, &keylet::account_root_key(&account)) {
+                    None => TxResult::TefInternal,
+                    Some(issuer) => {
+                        let flags = obj_flags(&issuer);
+                        if flags & LSF_ALLOW_TRUST_LINE_CLAWBACK == 0 || flags & LSF_NO_FREEZE != 0 {
+                            TxResult::NoPermission
+                        } else {
+                            TxResult::Success
+                        }
+                    }
+                },
+            };
+        }
+        TxResult::WrongAsset
+    }
+
+    /// `VaultClawback::doApply` (VaultClawback.cpp:389-542).
+    fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        let Some((vault_key, mut vault)) = read_vault(sandbox, tx) else { return TxResult::TefInternal };
+        let Some((share_id, _, Some(share_issuance))) = read_share(sandbox, &vault) else { return TxResult::TefInternal };
+        let share = HeldAsset::Mpt(share_id);
+        let (Some(asset), Some(holder)) = (vault_asset(&vault), account_of(&tx.fields, "Holder")) else {
+            return TxResult::TefInternal;
+        };
+        let (Some(vault_account), Some(owner)) = (account_of(&vault, "Account"), account_of(&vault, "Owner")) else {
+            return TxResult::TefInternal;
+        };
+        let account = tx.account;
+        let Some(amount) = clawback_amount(&vault, tx.fields.get("Amount").and_then(tx_amount), &account) else {
+            return TxResult::TefInternal;
+        };
+        let assets_total = number_field(&vault, "AssetsTotal");
+        let assets_available = number_field(&vault, "AssetsAvailable");
+
+        let (assets_recovered, shares_destroyed) = if account == owner && amount.asset == share {
+            // The owner is burning shares.
+            (Amount::zero(asset), holding::account_holds(sandbox, &holder, &share, false, false))
+        } else {
+            // The issuer is clawing back the vault's asset.
+            match assets_to_clawback(sandbox, &vault, &share_issuance, &holder, &amount) {
+                Ok(parts) => parts,
+                Err(refused) => return refused,
+            }
+        };
+        // No shares to burn (or the recovery clamped to nothing).
+        if shares_destroyed.is_zero() {
+            return TxResult::PrecisionLoss;
+        }
+        if am::fix_cleanup_3_4_0(sandbox) {
+            // A recovery too small to move the stored total.
+            match vh::debit_is_non_zero_dust(asset, assets_total, assets_recovered.number(), AMBIENT) {
+                Ok(true) => return TxResult::PrecisionLoss,
+                Ok(false) => {}
+                Err(_) => return TxResult::PathDry,
+            }
+        }
+        let sub = |n: Number| n.sub(assets_recovered.number(), AMBIENT);
+        let (Ok(total), Ok(available)) = (sub(assets_total), sub(assets_available)) else {
+            return TxResult::TefException;
+        };
+        set_number_field(&mut vault, "AssetsTotal", total, Soe::Default);
+        set_number_field(&mut vault, "AssetsAvailable", available, Soe::Default);
+
+        let burned = holding::account_send(sandbox, &holder, &vault_account, &shares_destroyed, true);
+        if burned != TxResult::Success {
+            return burned;
+        }
+        // The holder's emptied MPToken goes, except the vault owner's.
+        if holder != owner {
+            let removed = holding::remove_empty_holding(sandbox, &holder, &share);
+            if removed != TxResult::Success && removed != TxResult::HasObligations {
+                return removed;
+            }
+        }
+        if positive(&assets_recovered) {
+            let recovered = holding::account_send(sandbox, &vault_account, &account, &assets_recovered, true);
+            if recovered != TxResult::Success {
+                return recovered;
+            }
+            let left = holding::account_holds(sandbox, &vault_account, &asset, false, false);
+            if left.negative && !left.is_zero() {
+                return TxResult::TefInternal;
+            }
+        }
+        store_vault(sandbox, vault_key, &mut vault, asset)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
