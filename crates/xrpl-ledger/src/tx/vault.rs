@@ -1554,6 +1554,129 @@ impl Transactor for VaultClawbackTransactor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// VaultDelete (VaultDelete.cpp)
+// ---------------------------------------------------------------------------
+
+/// VaultDelete (type 67): the owner removes an empty vault — the
+/// pseudo-account's holding of the asset, the share issuance, the owner's
+/// MPToken of the share, the pseudo-account and the Vault.
+///
+/// Fee: the plain base fee. Reserve: the owner's OwnerCount falls by 2 (the
+/// Vault and its pseudo-account, VaultDelete.cpp:216-217) and by 1 for its
+/// MPToken.
+pub struct VaultDeleteTransactor;
+
+impl Transactor for VaultDeleteTransactor {
+    /// `VaultDelete::preflight` (VaultDelete.cpp:24-41), without the rules:
+    /// sfMemoData's amendment test is in [`Self::preflight_in`].
+    fn preflight(&self, tx: &TxFields) -> TxResult {
+        if vault_id(tx).is_none_or(|id| is_zero_key(&id)) {
+            return TxResult::Malformed;
+        }
+        // sfMemoData: an optional reason for the deletion.
+        if !valid_data_length(tx, "MemoData", MAX_DATA_PAYLOAD_LENGTH) {
+            return TxResult::Malformed;
+        }
+        TxResult::Success
+    }
+
+    fn preflight_in(&self, tx: &TxFields, rules: &Sandbox) -> TxResult {
+        if let Some(refused) = gate(tx, rules, true, TF_UNIVERSAL_MASK) {
+            return refused;
+        }
+        if vault_id(tx).is_none_or(|id| is_zero_key(&id)) {
+            return TxResult::Malformed;
+        }
+        // :33-34 — in preflight proper, after the VaultID test.
+        if has(tx, "MemoData") && !enabled(rules, am::LENDING_PROTOCOL_V1_1) {
+            return TxResult::Disabled;
+        }
+        self.preflight(tx)
+    }
+
+    /// `VaultDelete::preclaim` (VaultDelete.cpp:43-94).
+    fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        let Some((_, vault)) = read_vault(sandbox, tx) else { return TxResult::NoEntry };
+        if account_of(&vault, "Owner") != Some(tx.account) {
+            return TxResult::NoPermission;
+        }
+        if !number_field(&vault, "AssetsAvailable").is_zero() || !number_field(&vault, "AssetsTotal").is_zero() {
+            return TxResult::HasObligations;
+        }
+        // The share issuance must be destroyable.
+        let Some((_, _, Some(share_issuance))) = read_share(sandbox, &vault) else { return TxResult::ObjectNotFound };
+        if mpt::issuance_issuer(&share_issuance) != account_of(&vault, "Account") {
+            return TxResult::NoPermission;
+        }
+        if mpt::dec_field(&share_issuance, "OutstandingAmount") != 0 {
+            return TxResult::HasObligations;
+        }
+        TxResult::Success
+    }
+
+    /// `VaultDelete::doApply` (VaultDelete.cpp:96-223).
+    fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        let Some((vault_key, vault)) = read_vault(sandbox, tx) else { return TxResult::TefInternal };
+        let (Some(asset), Some(pseudo)) = (vault_asset(&vault), account_of(&vault, "Account")) else {
+            return TxResult::TefInternal;
+        };
+        // The pseudo-account's holding of the asset.
+        let released = holding::remove_empty_holding(sandbox, &pseudo, &asset);
+        if released != TxResult::Success {
+            return released;
+        }
+        if !sandbox.exists(&keylet::account_root_key(&pseudo)) {
+            return TxResult::TefBadLedger;
+        }
+        // The share issuance — not through MPTokenIssuanceDestroy.
+        let Some((share_id, share_key, Some(share_issuance))) = read_share(sandbox, &vault) else { return TxResult::TefInternal };
+        let share = HeldAsset::Mpt(share_id);
+        // The owner's MPToken of the share, if it has one.
+        if sandbox.exists(&keylet::mptoken_key(&share_key, &tx.account)) {
+            let removed = holding::remove_empty_holding(sandbox, &tx.account, &share);
+            if removed != TxResult::Success {
+                return removed;
+            }
+        }
+        let hint = |obj: &Value| {
+            obj.get("OwnerNode").and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| u64::from_str_radix(s, 16).ok())))
+        };
+        owner_dir_remove(sandbox, &pseudo, &share_key, hint(&share_issuance), false);
+        holding::decrease_owner_count_for_object(sandbox, &pseudo, &share_issuance, 1);
+        sandbox.delete(share_key);
+
+        // The pseudo-account's directory should have gone with its last entry.
+        if sandbox.exists(&keylet::owner_dir_key(&pseudo)) {
+            return TxResult::HasObligations;
+        }
+        // The pseudo-account itself: this vault's, empty-handed.
+        let pseudo_key = keylet::account_root_key(&pseudo);
+        let Some(pseudo_root) = json_at(sandbox, &pseudo_key) else { return TxResult::TefBadLedger };
+        if mpt::key_field(&pseudo_root, "VaultID") != Some(vault_key) {
+            return TxResult::TefBadLedger;
+        }
+        if pseudo_root.get("Balance").and_then(|b| b.as_str()).is_some_and(|b| b != "0") {
+            return TxResult::HasObligations;
+        }
+        if pseudo_root.get("OwnerCount").and_then(|c| c.as_u64()).unwrap_or(0) != 0 {
+            return TxResult::HasObligations;
+        }
+        sandbox.delete(pseudo_key);
+
+        // The vault, out of its owner's directory.
+        let Some(owner) = account_of(&vault, "Owner") else { return TxResult::TefBadLedger };
+        owner_dir_remove(sandbox, &owner, &vault_key, hint(&vault), false);
+        if !sandbox.exists(&keylet::account_root_key(&owner)) {
+            return TxResult::TefBadLedger;
+        }
+        // The Vault and its pseudo-account: two owned objects.
+        holding::decrease_owner_count_for_object(sandbox, &owner, &vault, 2);
+        sandbox.delete(vault_key);
+        TxResult::Success
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

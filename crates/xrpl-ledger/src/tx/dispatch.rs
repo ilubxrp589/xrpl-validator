@@ -136,6 +136,7 @@ pub fn get_transactor(tx_type: &str) -> Option<Box<dyn Transactor>> {
         "VaultWithdraw" => Some(Box::new(crate::tx::vault::VaultWithdrawTransactor)),
         "VaultSet" => Some(Box::new(crate::tx::vault::VaultSetTransactor)),
         "VaultClawback" => Some(Box::new(crate::tx::vault::VaultClawbackTransactor)),
+        "VaultDelete" => Some(Box::new(crate::tx::vault::VaultDeleteTransactor)),
         "UNLModify" => Some(Box::new(UNLModifyTransactor)),
         "SetFee" => Some(Box::new(SetFeeTransactor)),
         "EnableAmendment" => Some(Box::new(EnableAmendmentTransactor)),
