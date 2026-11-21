@@ -380,6 +380,41 @@ fn same_as_devnet(bundle: &Value, legs: &Legs, pre: &BTreeMap<Key, Vec<u8>>) -> 
     wrote && named
 }
 
+/// The shim hands libxrpl a ledger header whose `closeTime` is the PARENT's close time (xrpl_shim.cpp: closed-ledger
+/// view, `header.closeTime = parent_close_time`). On the network the ledger being built carries the parent's close
+/// time plus the resolution, and `LoanSet` dates the loan from exactly that (`view.header().closeTime`,
+/// LoanSet.cpp:228; nothing else in the vault or lending transactors reads it). So libxrpl through the shim
+/// writes `StartDate` and `NextPaymentDueDate` one resolution early. When that is the whole difference on the
+/// created Loan, libxrpl's two fields are moved forward so that the rest of the object still compares byte for
+/// byte. Returns whether it did.
+fn adjust_loan_start(legs: &mut Legs, resolution: u64) -> bool {
+    let mut adjusted = false;
+    for (k, (kind, lib_bytes)) in legs.lib.iter_mut() {
+        let Some((_, our_bytes)) = legs.ours.get(k) else { continue };
+        if *kind != 0 || entry_type(lib_bytes) != "Loan" {
+            continue;
+        }
+        let (mut lib, ours) = (decode(lib_bytes), decode(our_bytes));
+        let early = |f: &str| match (lib[f].as_u64(), ours[f].as_u64()) {
+            (Some(l), Some(o)) => l + resolution == o,
+            (None, None) => true,
+            _ => false,
+        };
+        if lib["StartDate"].as_u64().is_some() && early("StartDate") && early("NextPaymentDueDate") {
+            for f in ["StartDate", "NextPaymentDueDate"] {
+                if let Some(v) = lib[f].as_u64() {
+                    lib[f] = Value::from(v + resolution);
+                }
+            }
+            if let Ok(b) = encode(&lib) {
+                *lib_bytes = b;
+                adjusted = true;
+            }
+        }
+    }
+    adjusted
+}
+
 struct Row {
     class: &'static str,
     tx_type: String,
@@ -415,10 +450,14 @@ fn run_bundle(name: &str, bundle: &Value) -> Result<Row, String> {
     }
     rewrite_amendments(&mut pre)?;
     let tx_bytes = tx_bytes_of(bundle)?;
-    let legs = both_legs(bundle, &pre, &tx_bytes)?;
+    let mut legs = both_legs(bundle, &pre, &tx_bytes)?;
+    let shim_close_time = tx_type == "LoanSet" && adjust_loan_start(&mut legs, ledger_of(bundle).resolution as u64);
     let mut class = classify(&legs, &pre);
     let vs_devnet = same_as_devnet(bundle, &legs, &pre);
     let mut detail = if class == "AGREE" { Vec::new() } else { describe(&legs) };
+    if shim_close_time {
+        detail.push("shim: libxrpl's Loan dated from the parent close time; StartDate and NextPaymentDueDate moved by the resolution before comparing".into());
+    }
     if bundle["tx"].get("Sponsor").is_some() && !matches!(class, "AGREE" | "NOOP") {
         class = "SPONSOR";
     }
