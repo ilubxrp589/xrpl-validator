@@ -1512,6 +1512,45 @@ mod f374_tests {
         let iss: serde_json::Value = serde_json::from_slice(&sb.read(&keylet::mpt_issuance_key(&id)).unwrap()).unwrap();
         assert_eq!(iss["Flags"].as_u64(), Some(0x22), "only the issuance flags survive: {iss}");
     }
+
+    /// MPTokenIssuanceCreate.cpp:179-180, :226: the transaction's
+    /// sfImmutableFlags (UINT32 53) is copied to the issuance under that
+    /// name. rippled 3.4.1 has no field called MutableFlags; the SDK codec
+    /// knew UINT32 53 by that stale name until branch validator-k256-vault,
+    /// and an object key the codec does not know is skipped without an error
+    /// when the object is encoded — the issuance would be stored, and
+    /// hashed, without the field.
+    #[test]
+    fn an_issuance_keeps_the_transactions_immutable_flags_under_that_name() {
+        let issuer = [0x07u8; 20];
+        let mut state = LedgerState::new_unverified(LedgerHeader {
+            sequence: 100, total_coins: 100_000_000_000_000_000,
+            parent_hash: Hash256([0; 32]), transaction_hash: Hash256([0; 32]), account_hash: Hash256([0; 32]),
+            parent_close_time: 0, close_time: 10, close_time_resolution: 10, close_flags: 0,
+        });
+        let acct = serde_json::json!({"LedgerEntryType": "AccountRoot", "Account": hex::encode(issuer),
+            "Balance": "50000000", "Sequence": 5, "OwnerCount": 0, "Flags": 0});
+        state.state_map.insert(keylet::account_root_key(&issuer), serde_json::to_vec(&acct).unwrap()).unwrap();
+        let mut id = [0u8; 24];
+        id[..4].copy_from_slice(&5u32.to_be_bytes());
+        id[4..].copy_from_slice(&issuer);
+        let created = |fields: serde_json::Value| -> serde_json::Value {
+            let tx = TxFields {
+                account: issuer, tx_type: "MPTokenIssuanceCreate".to_string(), fee: 12, sequence: 5,
+                ticket_seq: None, last_ledger_seq: None, fields, inner_batch: false,
+            };
+            let mut sb = Sandbox::new(&state);
+            assert_eq!(MPTokenIssuanceCreateTransactor.do_apply(&tx, &mut sb), TxResult::Success);
+            serde_json::from_slice(&sb.read(&keylet::mpt_issuance_key(&id)).unwrap()).unwrap()
+        };
+        // tifMPTCanLock (lsifMPTCanLock, 0x02).
+        let iss = created(serde_json::json!({"Flags": 0x02, "ImmutableFlags": 0x02}));
+        assert_eq!(iss["ImmutableFlags"].as_u64(), Some(0x02), "{iss}");
+        assert!(iss.get("MutableFlags").is_none(), "no such field in rippled 3.4.1: {iss}");
+        // soeDEFAULT on the object: absent in the transaction, absent on it.
+        let iss = created(serde_json::json!({"Flags": 0x02}));
+        assert!(iss.get("ImmutableFlags").is_none() && iss.get("MutableFlags").is_none(), "{iss}");
+    }
 }
 
 /// SingleAssetVault's gates on the MPT helpers every ordinary MPT transaction
