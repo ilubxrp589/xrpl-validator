@@ -1155,6 +1155,108 @@ impl Transactor for VaultWithdrawTransactor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// VaultSet (VaultSet.cpp)
+// ---------------------------------------------------------------------------
+
+/// VaultSet (type 66): the owner changes the vault's sfData, its
+/// sfAssetsMaximum, or the share issuance's sfDomainID (a private vault's
+/// permissioned domain; zero clears it).
+///
+/// Fee: the plain base fee. No reserve change.
+pub struct VaultSetTransactor;
+
+impl Transactor for VaultSetTransactor {
+    /// `VaultSet::preflight` (VaultSet.cpp:26-61), every refusal temMALFORMED.
+    fn preflight(&self, tx: &TxFields) -> TxResult {
+        if vault_id(tx).is_none_or(|id| is_zero_key(&id)) {
+            return TxResult::Malformed;
+        }
+        if !valid_data_length(tx, "Data", MAX_DATA_PAYLOAD_LENGTH) {
+            return TxResult::Malformed;
+        }
+        if let Some(maximum) = tx.fields.get("AssetsMaximum") {
+            match number_from_json(maximum) {
+                Some(maximum) if !number_is_negative(&maximum) => {}
+                _ => return TxResult::Malformed,
+            }
+        }
+        if has(tx, "DomainID") && mpt::key_field(&tx.fields, "DomainID").is_none() {
+            return TxResult::Malformed;
+        }
+        // Nothing is being updated.
+        if !has(tx, "DomainID") && !has(tx, "AssetsMaximum") && !has(tx, "Data") {
+            return TxResult::Malformed;
+        }
+        TxResult::Success
+    }
+
+    fn preflight_in(&self, tx: &TxFields, rules: &Sandbox) -> TxResult {
+        // `VaultSet::checkExtraFeatures` (:20-24).
+        let extra = !has(tx, "DomainID") || enabled(rules, am::PERMISSIONED_DOMAINS);
+        gate(tx, rules, extra, TF_UNIVERSAL_MASK).unwrap_or_else(|| self.preflight(tx))
+    }
+
+    /// `VaultSet::preclaim` (VaultSet.cpp:63-114; the range check is
+    /// 3.5.0-rc1's :80-88).
+    fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        let Some((_, vault)) = read_vault(sandbox, tx) else { return TxResult::NoEntry };
+        if account_of(&vault, "Owner") != Some(tx.account) {
+            return TxResult::NoPermission;
+        }
+        // fixCleanup3_5_0: an AssetsMaximum the vault's asset cannot hold.
+        // Before the fix it throws in do_apply's associateAsset.
+        if am::fix_cleanup_3_5_0(sandbox) {
+            if let (Some(maximum), Some(asset)) = (tx.fields.get("AssetsMaximum").and_then(number_from_json), vault_asset(&vault)) {
+                if !holding::is_representable(&asset, maximum) {
+                    return TxResult::PrecisionLoss;
+                }
+            }
+        }
+        let Some((_, _, Some(share_issuance))) = read_share(sandbox, &vault) else { return TxResult::TefInternal };
+        if let Some(domain) = mpt::key_field(&tx.fields, "DomainID") {
+            // Only a vault created private has a domain to set.
+            if obj_flags(&vault) & LSF_VAULT_PRIVATE == 0 {
+                return TxResult::NoPermission;
+            }
+            if !is_zero_key(&domain) && !sandbox.exists(&domain) {
+                return TxResult::ObjectNotFound;
+            }
+            // VaultCreate's doing; a sanity check.
+            if obj_flags(&share_issuance) & mpt::LSF_MPT_REQUIRE_AUTH == 0 {
+                return TxResult::TefInternal;
+            }
+        }
+        TxResult::Success
+    }
+
+    /// `VaultSet::doApply` (VaultSet.cpp:116-178).
+    fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        let Some((vault_key, mut vault)) = read_vault(sandbox, tx) else { return TxResult::TefInternal };
+        let Some(asset) = vault_asset(&vault) else { return TxResult::TefInternal };
+        let Some((_, share_key, Some(mut share_issuance))) = read_share(sandbox, &vault) else { return TxResult::TefInternal };
+        if let Some(data) = tx.fields.get("Data").and_then(|d| d.as_str()) {
+            vault["Data"] = Value::String(data.to_uppercase());
+        }
+        if let Some(maximum) = tx.fields.get("AssetsMaximum").and_then(number_from_json) {
+            if !maximum.is_zero() && maximum < number_field(&vault, "AssetsTotal") {
+                return TxResult::LimitExceeded;
+            }
+            set_number_field(&mut vault, "AssetsMaximum", maximum, Soe::Default);
+        }
+        if let Some(domain) = mpt::key_field(&tx.fields, "DomainID") {
+            // The domain lives on the share issuance; the vault stays private.
+            if !is_zero_key(&domain) {
+                share_issuance["DomainID"] = Value::String(hex::encode_upper(domain.0));
+            } else if let Some(map) = share_issuance.as_object_mut() {
+                map.remove("DomainID");
+            }
+            put_json(sandbox, share_key, &share_issuance);
+        }
+        store_vault(sandbox, vault_key, &mut vault, asset)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
