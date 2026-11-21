@@ -132,6 +132,7 @@ pub fn get_transactor(tx_type: &str) -> Option<Box<dyn Transactor>> {
         // The vault family (SingleAssetVault): each refuses itself temDISABLED in preflight
         // while the amendment is off.
         "VaultCreate" => Some(Box::new(crate::tx::vault::VaultCreateTransactor)),
+        "VaultDeposit" => Some(Box::new(crate::tx::vault::VaultDepositTransactor)),
         "UNLModify" => Some(Box::new(UNLModifyTransactor)),
         "SetFee" => Some(Box::new(SetFeeTransactor)),
         "EnableAmendment" => Some(Box::new(EnableAmendmentTransactor)),

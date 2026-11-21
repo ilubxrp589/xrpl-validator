@@ -509,6 +509,279 @@ impl Transactor for VaultCreateTransactor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// VaultDeposit (VaultDeposit.cpp)
+// ---------------------------------------------------------------------------
+
+/// VaultDeposit (type 68): assets into the vault, shares out of it.
+///
+/// Fee: the plain base fee. Reserve: the depositor's first deposit creates
+/// its MPToken of the share (`authorizeMPToken`'s own reserve test).
+pub struct VaultDepositTransactor;
+
+/// `roundToVaultScale(amount, vault)` (VaultDeposit.cpp:34-50): an IOU
+/// amount floored (Downward) to the scale `sfAssetsTotal` will have once the
+/// amount is in it — `scale(AssetsTotal + amount)` taken at ToNearest. XRP
+/// and MPT amounts as they are. (3.5.0-rc1 moves this to
+/// `roundToPosteriorVaultScale` with TowardsZero; the amount is positive, so
+/// the two agree.)
+fn round_to_vault_scale(amount: &Amount, vault: &Value) -> Result<Amount, StError> {
+    if amount.integral() {
+        return Ok(*amount);
+    }
+    let posterior = number_field(vault, "AssetsTotal").add(amount.number(), Rounding::ToNearest).map_err(|_| StError::Overflow)?;
+    let post_scale = scale(posterior, amount.asset, Rounding::ToNearest)?;
+    round_to_scale(*amount, post_scale, Rounding::Downward)
+}
+
+/// `roundsToZeroForDepositor(view, account, assets)` (VaultDeposit.cpp:52-83):
+/// debiting `assets` would leave the depositor's STORED balance where it
+/// was — `balance - assets == balance` at the balance's own precision — so
+/// shares would be minted against a transfer that never happened. Never for
+/// XRP or an MPT.
+fn rounds_to_zero_for_depositor(sandbox: &Sandbox, account: &[u8; 20], assets: &Amount) -> Result<bool, StError> {
+    if assets.integral() {
+        return Ok(false);
+    }
+    let balance = holding::account_holds(sandbox, account, &assets.asset, true, true);
+    Ok(balance.iou_add(assets.negated(), AMBIENT)? == balance)
+}
+
+impl Transactor for VaultDepositTransactor {
+    /// `VaultDeposit::preflight` (VaultDeposit.cpp:85-98).
+    fn preflight(&self, tx: &TxFields) -> TxResult {
+        if vault_id(tx).is_none_or(|id| is_zero_key(&id)) {
+            return TxResult::Malformed;
+        }
+        match tx.fields.get("Amount").and_then(tx_amount) {
+            Some(amount) if positive(&amount) => TxResult::Success,
+            _ => TxResult::BadAmount,
+        }
+    }
+
+    fn preflight_in(&self, tx: &TxFields, rules: &Sandbox) -> TxResult {
+        gate(tx, rules, true, TF_UNIVERSAL_MASK).unwrap_or_else(|| self.preflight(tx))
+    }
+
+    /// `VaultDeposit::preclaim` (VaultDeposit.cpp:100-227).
+    fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        let fix320 = am::fix_cleanup_3_2_0(sandbox);
+        let fix330 = am::fix_cleanup_3_3_0(sandbox);
+        let Some((_, vault)) = read_vault(sandbox, tx) else { return TxResult::NoEntry };
+        if enabled(sandbox, am::LENDING_PROTOCOL_V1_1) {
+            // A closed-ended vault takes deposits only while it subscribes.
+            if matches!(vh::vault_phase(sandbox, &vault), VaultPhase::Investment | VaultPhase::Redemption) {
+                return TxResult::Expired;
+            }
+        }
+        let account = tx.account;
+        let (Some(amount), Some(asset)) = (tx.fields.get("Amount").and_then(tx_amount), vault_asset(&vault)) else {
+            return TxResult::TefInternal;
+        };
+        if amount.asset != asset {
+            return TxResult::WrongAsset;
+        }
+        let Some(vault_account) = account_of(&vault, "Account") else { return TxResult::TefInternal };
+        let transferable = holding::can_transfer(sandbox, &asset, &account, &vault_account);
+        if transferable != TxResult::Success {
+            return transferable;
+        }
+        let Some((share_id, share_key, share_issuance)) = read_share(sandbox, &vault) else { return TxResult::TefInternal };
+        let share = HeldAsset::Mpt(share_id);
+        if share == amount.asset {
+            return TxResult::TefInternal;
+        }
+        let Some(share_issuance) = share_issuance else { return TxResult::TefInternal };
+        if obj_flags(&share_issuance) & mpt::LSF_MPT_LOCKED != 0 {
+            return TxResult::TefInternal;
+        }
+        let _ = share_key;
+        if fix330 {
+            let frozen = holding::check_deposit_freeze(sandbox, &account, &vault_account, &asset);
+            if frozen != TxResult::Success {
+                return frozen;
+            }
+        } else {
+            // The asset frozen for the depositor, or the shares (through the
+            // asset) frozen for it.
+            if holding::is_frozen(sandbox, &account, &asset) {
+                return if matches!(asset, HeldAsset::Mpt(_)) { TxResult::Locked } else { TxResult::Frozen };
+            }
+            if holding::is_frozen(sandbox, &account, &share) {
+                return TxResult::Locked;
+            }
+        }
+        // The owner deposits unconditionally. An expired credential is let
+        // through here: do_apply deletes it and answers tecEXPIRED.
+        let owner = account_of(&vault, "Owner");
+        if obj_flags(&vault) & LSF_VAULT_PRIVATE != 0 && Some(account) != owner {
+            let member = vh::check_vault_domain(sandbox, &share_issuance, &account, SuppressExpired::Yes);
+            if member != TxResult::Success {
+                return member;
+            }
+        }
+        // The depositor's MPToken must exist (and be authorized) for an MPT asset.
+        let authorized = holding::require_auth(sandbox, &asset, &account, AuthType::Legacy);
+        if authorized != TxResult::Success {
+            return authorized;
+        }
+        // An exception in preclaim is tefEXCEPTION (applySteps.cpp).
+        let rounded = if fix320 {
+            match round_to_vault_scale(&amount, &vault) {
+                Ok(rounded) => rounded,
+                Err(_) => return TxResult::TefException,
+            }
+        } else {
+            amount
+        };
+        if fix320 && rounded.is_zero() {
+            return TxResult::PrecisionLoss;
+        }
+        let Ok(balance) = holding::account_holds_full(sandbox, &account, &asset, true, true) else {
+            return TxResult::TefException;
+        };
+        if less(&balance, &rounded) {
+            return TxResult::InsufficientFunds;
+        }
+        // An IOU deposit that vanishes at the depositor's own trust-line
+        // scale. Skipped for the issuer, whose balance reads as the largest
+        // IOU amount.
+        if fix320 && !rounded.integral() && account != holding::asset_issuer(&amount.asset) {
+            let zero_at_scale = scale(balance.number(), asset, AMBIENT)
+                .and_then(|balance_scale| round_to_scale(amount, balance_scale, Rounding::ToNearest))
+                .map(|at_scale| at_scale.is_zero());
+            match zero_at_scale {
+                Ok(true) => return TxResult::PrecisionLoss,
+                Ok(false) => {}
+                Err(_) => return TxResult::TefException,
+            }
+        }
+        TxResult::Success
+    }
+
+    /// `VaultDeposit::doApply` (VaultDeposit.cpp:229-427).
+    fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        let fix320 = am::fix_cleanup_3_2_0(sandbox);
+        let fix340 = am::fix_cleanup_3_4_0(sandbox);
+        let Some((vault_key, mut vault)) = read_vault(sandbox, tx) else { return TxResult::TefInternal };
+        let (Some(requested), Some(asset)) = (tx.fields.get("Amount").and_then(tx_amount), vault_asset(&vault)) else {
+            return TxResult::TefInternal;
+        };
+        let account = tx.account;
+        let prior = prior_balance(sandbox, tx);
+        let amount = if fix320 {
+            match round_to_vault_scale(&requested, &vault) {
+                Ok(amount) => amount,
+                Err(_) => return TxResult::TefException,
+            }
+        } else {
+            requested
+        };
+        // Preclaim refused a zero; one here is tecINTERNAL.
+        if amount.is_zero() {
+            return TxResult::TecInternal;
+        }
+        let Some((share_id, share_key, Some(share_issuance))) = read_share(sandbox, &vault) else { return TxResult::TefInternal };
+        let (Some(vault_account), Some(owner)) = (account_of(&vault, "Account"), account_of(&vault, "Owner")) else {
+            return TxResult::TefInternal;
+        };
+        let private = obj_flags(&vault) & LSF_VAULT_PRIVATE != 0;
+        if private && account != owner {
+            let authorized = holding::enforce_mptoken_authorization(sandbox, &share_id, &account, prior);
+            if authorized != TxResult::Success {
+                return authorized;
+            }
+        } else {
+            // No authorization needed, but the depositor must have an MPToken.
+            if !sandbox.exists(&keylet::mptoken_key(&share_key, &account)) {
+                let created = holding::authorize_mptoken(sandbox, prior, &share_id, &account, 0, None);
+                if created != TxResult::Success {
+                    return created;
+                }
+            }
+            // A private vault's owner: its MPToken is authorized by the
+            // share's issuer.
+            if private {
+                let Some(issuer) = mpt::issuance_issuer(&share_issuance) else { return TxResult::TefInternal };
+                let authorized = holding::authorize_mptoken(sandbox, prior, &share_id, &issuer, 0, Some(&account));
+                if authorized != TxResult::Success {
+                    return authorized;
+                }
+            }
+        }
+
+        // The exchange, before anything moves. An overflow in it is
+        // tecPATH_DRY (:365-375).
+        let exchange = || -> Result<Result<(Amount, Amount), TxResult>, StError> {
+            let Some(shares) = vh::assets_to_shares_deposit(&vault, &share_issuance, &amount, AMBIENT)? else {
+                return Ok(Err(TxResult::TecInternal));
+            };
+            if shares.is_zero() {
+                return Ok(Err(TxResult::PrecisionLoss));
+            }
+            // What the minted shares cost: the depositor is debited that,
+            // not the amount asked, or the difference would be a gift to the
+            // vault.
+            let Some(mut assets) = vh::shares_to_assets_deposit(&vault, &share_issuance, &shares, AMBIENT)? else {
+                return Ok(Err(TxResult::TecInternal));
+            };
+            if less(&amount, &assets) {
+                return Ok(Err(TxResult::TecInternal));
+            }
+            if fix340 {
+                // Floored at the scale the total will have, so the trust
+                // line (or MPT), sfAssetsAvailable and sfAssetsTotal all move
+                // by the same representable amount; the share count stays.
+                assets = match vh::clamp_to_assets_total_scale(&vault, &assets, AMBIENT)? {
+                    Ok(clamped) => clamped,
+                    Err(refused) => return Ok(Err(refused)),
+                };
+                if rounds_to_zero_for_depositor(sandbox, &account, &assets)? {
+                    return Ok(Err(TxResult::PrecisionLoss));
+                }
+            }
+            Ok(Ok((shares, assets)))
+        };
+        let (shares_created, assets_deposited) = match exchange() {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(refused)) => return refused,
+            Err(_) => return TxResult::PathDry,
+        };
+
+        let add = |vault: &Value, field: &str| number_field(vault, field).add(assets_deposited.number(), AMBIENT);
+        let (Ok(total), Ok(available)) = (add(&vault, "AssetsTotal"), add(&vault, "AssetsAvailable")) else {
+            return TxResult::TefException;
+        };
+        set_number_field(&mut vault, "AssetsTotal", total, Soe::Default);
+        set_number_field(&mut vault, "AssetsAvailable", available, Soe::Default);
+
+        // A deposit must not push the vault over its limit.
+        let maximum = number_field(&vault, "AssetsMaximum");
+        if !maximum.is_zero() && total > maximum {
+            return TxResult::LimitExceeded;
+        }
+
+        let paid = holding::account_send(sandbox, &account, &vault_account, &assets_deposited, true);
+        if paid != TxResult::Success {
+            return paid;
+        }
+        // "This check is wrong. Disable it with fixCleanup3_2_0." (:396-416):
+        // for an IOU it fires exactly when the deposit drew on the issuer's
+        // credit, which preclaim allows.
+        if !fix320 {
+            let left = holding::account_holds(sandbox, &account, &asset, false, false);
+            if left.negative && !left.is_zero() {
+                return TxResult::TefInternal;
+            }
+        }
+        let minted = holding::account_send(sandbox, &vault_account, &account, &shares_created, true);
+        if minted != TxResult::Success {
+            return minted;
+        }
+        store_vault(sandbox, vault_key, &mut vault, asset)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
