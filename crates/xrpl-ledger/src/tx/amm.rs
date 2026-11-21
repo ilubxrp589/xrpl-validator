@@ -5194,3 +5194,162 @@ mod campaign16_tests {
         assert_eq!(run(&AMMWithdrawTransactor, &min_2, &st).0, TxResult::AmmFailed);
     }
 }
+
+/// A pseudo-account's address (rippled `pseudoAccountAddress`,
+/// AccountRootHelpers.cpp:499-513) as AMMCreate uses it: the first of 256
+/// candidates with no AccountRoot, and what happens when none is free —
+/// inventory G18.
+#[cfg(test)]
+mod vault_pseudo_address_tests {
+    use super::*;
+    use crate::ledger::amendments as am;
+    use crate::ledger::header::LedgerHeader;
+    use crate::ledger::state::LedgerState;
+    use crate::tx::misc::pseudo_account_candidate;
+    use xrpl_core::types::Hash256;
+
+    const ALICE: [u8; 20] = [0x01; 20];
+    const ISSUER: [u8; 20] = [0x02; 20];
+    const PARENT: Hash256 = Hash256([0x5A; 32]);
+
+    fn state(amendments: &[&str]) -> LedgerState {
+        let mut state = LedgerState::new_unverified(LedgerHeader {
+            sequence: 100, total_coins: 100_000_000_000_000_000,
+            parent_hash: PARENT, transaction_hash: Hash256([0; 32]), account_hash: Hash256([0; 32]),
+            parent_close_time: 0, close_time: 10, close_time_resolution: 10, close_flags: 0,
+        });
+        let acct = serde_json::json!({
+            "LedgerEntryType": "AccountRoot", "Account": hex::encode(ALICE), "Balance": "100000000",
+            "Sequence": 1, "OwnerCount": 0,
+        });
+        state.state_map.insert(keylet::account_root_key(&ALICE), serde_json::to_vec(&acct).unwrap()).unwrap();
+        let amend = serde_json::json!({"LedgerEntryType": "Amendments", "Flags": 0, "Amendments": amendments});
+        state.state_map.insert(keylet::amendments_key(), serde_json::to_vec(&amend).unwrap()).unwrap();
+        state
+    }
+
+    /// `amm_create_and_delete`'s transaction: 50 XRP against 100 USD.
+    fn create() -> TxFields {
+        TxFields {
+            account: ALICE, tx_type: "AMMCreate".to_string(), fee: 12, sequence: 1, ticket_seq: None, last_ledger_seq: None,
+            fields: serde_json::json!({
+                "Amount": "50000000",
+                "Amount2": {"currency": "USD", "issuer": hex::encode(ISSUER), "value": "100"},
+                "TradingFee": 500,
+            }),
+            inner_batch: false,
+        }
+    }
+
+    fn pool_key() -> Hash256 {
+        let tx = create();
+        let l1 = crate::tx::offer::leg_of(&tx.fields["Amount"]).unwrap();
+        let l2 = crate::tx::offer::leg_of(&tx.fields["Amount2"]).unwrap();
+        keylet::amm_key(&l1.cur, &l1.issuer, &l2.cur, &l2.issuer)
+    }
+
+    /// Someone funded the candidate address before the create applied.
+    fn occupy(state: &mut LedgerState, attempt: u16) -> [u8; 20] {
+        let id = pseudo_account_candidate(&PARENT, &pool_key(), attempt);
+        let acct = serde_json::json!({
+            "LedgerEntryType": "AccountRoot", "Account": hex::encode(id), "Balance": "1000000",
+            "Sequence": 77, "OwnerCount": 0, "Flags": 0,
+        });
+        state.state_map.insert(keylet::account_root_key(&id), serde_json::to_vec(&acct).unwrap()).unwrap();
+        id
+    }
+
+    const MAINNET: [&str; 3] = [am::FIX_CLEANUP_3_2_0, am::FIX_CLEANUP_3_3_0, am::FIX_CLEANUP_3_4_0];
+    const WITH_SAV: [&str; 4] = [am::FIX_CLEANUP_3_2_0, am::FIX_CLEANUP_3_3_0, am::FIX_CLEANUP_3_4_0, am::SINGLE_ASSET_VAULT];
+
+    /// The 256 candidates are distinct addresses, and attempt 0 is the
+    /// derivation the engine has always used (prefix bytes 00 00).
+    #[test]
+    fn the_candidates_are_the_hashes_of_attempt_parent_and_owner_key() {
+        let key = pool_key();
+        let mut pre = [0u8; 66];
+        pre[2..34].copy_from_slice(&PARENT.0);
+        pre[34..66].copy_from_slice(&key.0);
+        let seed = crate::shamap::hash::sha512_half(&pre);
+        assert_eq!(pseudo_account_candidate(&PARENT, &key, 0), xrpl_core::crypto::signing::public_key_to_account_id(&seed.0));
+        pre[..2].copy_from_slice(&[0x01, 0x02]);
+        let seed = crate::shamap::hash::sha512_half(&pre);
+        assert_eq!(pseudo_account_candidate(&PARENT, &key, 0x0102), xrpl_core::crypto::signing::public_key_to_account_id(&seed.0));
+        let all: std::collections::HashSet<[u8; 20]> = (0..256).map(|i| pseudo_account_candidate(&PARENT, &key, i)).collect();
+        assert_eq!(all.len(), 256);
+    }
+
+    /// G18 — AMMCreate.cpp:188-193: under SingleAssetVault, preclaim answers
+    /// terADDRESS_COLLISION when none of the 256 candidate addresses is free.
+    /// Without the amendment preclaim does not look.
+    #[test]
+    fn g18_amm_create_preclaim_is_address_collision_when_no_candidate_is_free() {
+        for (amendments, sav) in [(&MAINNET[..], false), (&WITH_SAV[..], true)] {
+            let mut st = state(amendments);
+            let issuer = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": hex::encode(ISSUER), "Balance": "100000000",
+                "Sequence": 1, "OwnerCount": 0, "Flags": 0x0080_0000u64,
+            });
+            st.state_map.insert(keylet::account_root_key(&ISSUER), serde_json::to_vec(&issuer).unwrap()).unwrap();
+            let cur = crate::tx::offer::leg_of(&create().fields["Amount2"]).unwrap().cur;
+            let line = serde_json::json!({
+                "LedgerEntryType": "RippleState", "Flags": 0x0001_0000u64,
+                "Balance": {"currency": hex::encode_upper(cur), "issuer": "0000000000000000000000000000000000000001", "value": "500"},
+                "LowLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(ALICE), "value": "1000"},
+                "HighLimit": {"currency": hex::encode_upper(cur), "issuer": hex::encode(ISSUER), "value": "0"},
+            });
+            st.state_map.insert(keylet::ripple_state_key(&ALICE, &ISSUER, &cur), serde_json::to_vec(&line).unwrap()).unwrap();
+            let verdict = |st: &LedgerState| AMMCreateTransactor.preclaim(&create(), &Sandbox::new(st));
+            assert_eq!(verdict(&st), TxResult::Success, "a fundable create (sav {sav})");
+            for i in 0..255 {
+                occupy(&mut st, i);
+            }
+            assert_eq!(verdict(&st), TxResult::Success, "the last candidate is free (sav {sav})");
+            occupy(&mut st, 255);
+            let want = if sav { TxResult::AddressCollision } else { TxResult::Success };
+            assert_eq!(verdict(&st), want, "no candidate is free (sav {sav})");
+            assert_eq!(TxResult::AddressCollision.code_str(), "terADDRESS_COLLISION");
+            assert!(!TxResult::AddressCollision.is_claimed(), "a ter is not claimed");
+        }
+    }
+
+    /// `createPseudoAccount` (AccountRootHelpers.cpp:563-567, not gated): the
+    /// pool's account is the first candidate with no AccountRoot, and with
+    /// none free the create is tecDUPLICATE (AMMCreate.cpp applyCreate returns
+    /// the error). An address someone funded first is left alone.
+    #[test]
+    fn amm_create_takes_the_first_free_candidate_address() {
+        for amendments in [&MAINNET[..], &WITH_SAV[..]] {
+            let key = pool_key();
+            let account_of = |sb: &Sandbox| {
+                let amm = crate::tx::offer::json_at(sb, &key).expect("the AMM object");
+                crate::tx::offer::decode20(amm["Account"].as_str().unwrap()).unwrap()
+            };
+            // Nothing in the way: attempt 0.
+            let st = state(amendments);
+            let mut sb = Sandbox::new(&st);
+            assert_eq!(AMMCreateTransactor.do_apply(&create(), &mut sb), TxResult::Success);
+            assert_eq!(account_of(&sb), pseudo_account_candidate(&PARENT, &key, 0));
+
+            // Attempts 0 and 1 taken: attempt 2, and the squatters keep their roots.
+            let mut st = state(amendments);
+            let squatter = occupy(&mut st, 0);
+            occupy(&mut st, 1);
+            let mut sb = Sandbox::new(&st);
+            assert_eq!(AMMCreateTransactor.do_apply(&create(), &mut sb), TxResult::Success);
+            assert_eq!(account_of(&sb), pseudo_account_candidate(&PARENT, &key, 2));
+            let kept = crate::tx::offer::json_at(&sb, &keylet::account_root_key(&squatter)).unwrap();
+            assert!(kept.get("AMMID").is_none() && kept["Sequence"] == 77 && kept["Balance"] == "1000000", "{kept}");
+            let pool = crate::tx::offer::json_at(&sb, &keylet::account_root_key(&account_of(&sb))).unwrap();
+            assert_eq!(pool["AMMID"], serde_json::json!(hex::encode_upper(key.0)));
+
+            // All 256 taken: tecDUPLICATE.
+            let mut st = state(amendments);
+            for i in 0..256 {
+                occupy(&mut st, i);
+            }
+            let mut sb = Sandbox::new(&st);
+            assert_eq!(AMMCreateTransactor.do_apply(&create(), &mut sb), TxResult::Duplicate);
+        }
+    }
+}
