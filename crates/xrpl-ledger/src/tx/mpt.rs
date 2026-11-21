@@ -1108,3 +1108,734 @@ mod f374_tests {
         assert_eq!(iss["Flags"].as_u64(), Some(0x22), "only the issuance flags survive: {iss}");
     }
 }
+
+/// SingleAssetVault's gates on the MPT helpers every ordinary MPT transaction
+/// goes through (inventory G6, G7, G8, G12, G13, G14): the vault objects are
+/// seated directly, in the JSON form of rippled's ledger_entries.macro (Vault
+/// 0x0084; an AccountRoot's `VaultID` marks the vault's pseudo-account).
+#[cfg(test)]
+mod vault_gate_tests {
+    use super::*;
+    use crate::ledger::amendments as am;
+    use crate::ledger::header::LedgerHeader;
+    use crate::ledger::state::LedgerState;
+    use serde_json::{json, Value};
+
+    const HOLDER: [u8; 20] = [0x11; 20];
+    const HOLDER2: [u8; 20] = [0x12; 20];
+    /// Issues the vault's underlying asset.
+    const ISSUER: [u8; 20] = [0x21; 20];
+    /// The vault's pseudo-account: issues the vault's shares.
+    const PSEUDO: [u8; 20] = [0x31; 20];
+    const VAULT_KEY: Hash256 = Hash256([0x84; 32]);
+    /// Mainnet today: the three cleanups on, no vault amendment.
+    const MAINNET: [&str; 3] = [am::FIX_CLEANUP_3_2_0, am::FIX_CLEANUP_3_3_0, am::FIX_CLEANUP_3_4_0];
+
+    const LSF_HIGH_FREEZE: u64 = 0x0080_0000;
+    const LSF_HIGH_AUTH: u64 = 0x0008_0000;
+    const LSF_HIGH_NO_RIPPLE: u64 = 0x0020_0000;
+    const LSF_GLOBAL_FREEZE: u64 = 0x0040_0000;
+    const LSF_REQUIRE_AUTH: u64 = 0x0004_0000;
+    const LSF_DEFAULT_RIPPLE: u64 = 0x0080_0000;
+    const USD: &str = "0000000000000000000000005553440000000000";
+
+    fn state() -> LedgerState {
+        let mut state = LedgerState::new_unverified(LedgerHeader {
+            sequence: 100, total_coins: 100_000_000_000_000_000,
+            parent_hash: Hash256([0; 32]), transaction_hash: Hash256([0; 32]), account_hash: Hash256([0; 32]),
+            parent_close_time: 0, close_time: 10, close_time_resolution: 10, close_flags: 0,
+        });
+        for id in [HOLDER, HOLDER2] {
+            root(&mut state, id, 0, json!({}));
+        }
+        root(&mut state, ISSUER, LSF_DEFAULT_RIPPLE, json!({}));
+        state
+    }
+
+    fn put(state: &mut LedgerState, key: Hash256, v: &Value) {
+        state.state_map.insert(key, serde_json::to_vec(v).unwrap()).unwrap();
+    }
+
+    fn with(base: &LedgerState, ids: &[&str]) -> LedgerState {
+        let mut state = base.clone();
+        put(&mut state, keylet::amendments_key(), &json!({"LedgerEntryType": "Amendments", "Flags": 0, "Amendments": ids}));
+        state
+    }
+
+    /// Mainnet's cleanups plus the named amendments.
+    fn mainnet_plus(base: &LedgerState, ids: &[&str]) -> LedgerState {
+        let mut all = MAINNET.to_vec();
+        all.extend(ids);
+        with(base, &all)
+    }
+
+    fn root(state: &mut LedgerState, id: [u8; 20], flags: u64, extra: Value) {
+        let mut a = json!({
+            "LedgerEntryType": "AccountRoot", "Account": hex::encode(id), "Balance": "50000000",
+            "Sequence": 1, "OwnerCount": 0, "Flags": flags,
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            a[k] = v.clone();
+        }
+        put(state, keylet::account_root_key(&id), &a);
+    }
+
+    fn mptid(seq: u32, issuer: [u8; 20]) -> [u8; 24] {
+        let mut id = [0u8; 24];
+        id[..4].copy_from_slice(&seq.to_be_bytes());
+        id[4..].copy_from_slice(&issuer);
+        id
+    }
+
+    fn issuance(state: &mut LedgerState, id: &[u8; 24], flags: u64, extra: Value) -> Hash256 {
+        let issuer: [u8; 20] = id[4..].try_into().unwrap();
+        let mut o = json!({
+            "LedgerEntryType": "MPTokenIssuance", "Issuer": hex::encode(issuer), "Flags": flags,
+            "Sequence": u32::from_be_bytes(id[..4].try_into().unwrap()), "OutstandingAmount": "1000", "OwnerNode": "0",
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            o[k] = v.clone();
+        }
+        let key = keylet::mpt_issuance_key(id);
+        put(state, key, &o);
+        key
+    }
+
+    fn token(state: &mut LedgerState, id: &[u8; 24], holder: [u8; 20], flags: u64, amount: u64) -> Hash256 {
+        let key = keylet::mptoken_key(&keylet::mpt_issuance_key(id), &holder);
+        put(state, key, &json!({
+            "LedgerEntryType": "MPToken", "Account": hex::encode(holder), "MPTokenIssuanceID": hex::encode_upper(id),
+            "MPTAmount": amount.to_string(), "Flags": flags, "OwnerNode": "0",
+        }));
+        key
+    }
+
+    /// A USD line between `holder` and ISSUER. Every holder here sorts below
+    /// ISSUER, so ISSUER is the HIGH side: its freeze, its authorization and
+    /// its no-ripple are the lsfHigh* bits.
+    fn line(state: &mut LedgerState, holder: [u8; 20], flags: u64) -> Hash256 {
+        assert!(holder < ISSUER);
+        let cur: [u8; 20] = hex::decode(USD).unwrap().try_into().unwrap();
+        let key = keylet::ripple_state_key(&holder, &ISSUER, &cur);
+        put(state, key, &json!({
+            "LedgerEntryType": "RippleState", "Flags": flags,
+            "Balance": {"currency": USD, "issuer": "0000000000000000000000000000000000000001", "value": "50"},
+            "LowLimit": {"currency": USD, "issuer": hex::encode(holder), "value": "1000"},
+            "HighLimit": {"currency": USD, "issuer": hex::encode(ISSUER), "value": "0"},
+        }));
+        key
+    }
+
+    fn usd() -> Value {
+        json!({"currency": USD, "issuer": hex::encode(ISSUER)})
+    }
+
+    /// The vault on `asset`: PSEUDO's AccountRoot carries `VaultID`, the Vault
+    /// sits at that key, and PSEUDO issues the share (transferable, no auth).
+    /// Returns the share's id.
+    fn vault(state: &mut LedgerState, asset: Value) -> [u8; 24] {
+        root(state, PSEUDO, 0x0110_0000 | LSF_DEFAULT_RIPPLE, json!({"Sequence": 0, "VaultID": hex::encode_upper(VAULT_KEY.0)}));
+        let share = mptid(1, PSEUDO);
+        put(state, VAULT_KEY, &json!({
+            "LedgerEntryType": "Vault", "Flags": 0, "Sequence": 7, "OwnerNode": "0", "Owner": hex::encode(HOLDER2),
+            "Account": hex::encode(PSEUDO), "Asset": asset, "ShareMPTID": hex::encode_upper(share), "WithdrawalPolicy": 1,
+        }));
+        issuance(state, &share, LSF_MPT_CAN_TRANSFER, json!({}));
+        share
+    }
+
+    fn frozen(state: &LedgerState, id: &[u8; 24], who: &[&[u8; 20]]) -> bool {
+        let sb = Sandbox::new(state);
+        let key = keylet::mpt_issuance_key(id);
+        any_frozen(&sb, &key, &json_at(&sb, &key).unwrap(), who)
+    }
+
+    fn auth(state: &LedgerState, id: &[u8; 24], who: &[u8; 20], ty: AuthType) -> TxResult {
+        let sb = Sandbox::new(state);
+        let key = keylet::mpt_issuance_key(id);
+        require_auth_at(&sb, &key, &json_at(&sb, &key).unwrap(), who, ty, 0)
+    }
+
+    /// G6 — View.cpp:66-139: a vault share is frozen for a holder when the
+    /// vault's underlying MPT is locked for that holder or for the share's
+    /// issuer (the vault pseudo-account), or locked globally. Only under
+    /// SingleAssetVault (:70).
+    #[test]
+    fn g6_a_vault_share_is_frozen_when_its_underlying_mpt_is_locked() {
+        let mut base = state();
+        let under = mptid(1, ISSUER);
+        let ukey = issuance(&mut base, &under, LSF_MPT_CAN_TRANSFER, json!({}));
+        let share = vault(&mut base, json!({"mpt_issuance_id": hex::encode_upper(under)}));
+        token(&mut base, &under, PSEUDO, 0, 500);
+        token(&mut base, &under, HOLDER, LSF_MPT_LOCKED, 0);
+        token(&mut base, &under, HOLDER2, 0, 0);
+        token(&mut base, &share, HOLDER, 0, 100);
+        token(&mut base, &share, HOLDER2, 0, 100);
+
+        assert!(!frozen(&base, &share, &[&HOLDER]), "no amendments: the share's own locks only");
+        assert!(!frozen(&with(&base, &MAINNET), &share, &[&HOLDER]), "mainnet today: unchanged");
+        let sav = mainnet_plus(&base, &[am::SINGLE_ASSET_VAULT]);
+        assert!(frozen(&sav, &share, &[&HOLDER]), "the underlying is locked for the holder");
+        assert!(!frozen(&sav, &share, &[&HOLDER2]), "another holder is not");
+        assert!(frozen(&sav, &share, &[&HOLDER2, &HOLDER]), "any of the accounts");
+        assert!(!frozen(&mainnet_plus(&base, &[am::LENDING_PROTOCOL]), &share, &[&HOLDER]), "LendingProtocol alone does not gate it");
+
+        // The share's issuer is checked too (View.cpp:138 `{issuer, account}`).
+        let mut pseudo_locked = base.clone();
+        token(&mut pseudo_locked, &under, PSEUDO, LSF_MPT_LOCKED, 500);
+        assert!(frozen(&mainnet_plus(&pseudo_locked, &[am::SINGLE_ASSET_VAULT]), &share, &[&HOLDER2]));
+        assert!(!frozen(&with(&pseudo_locked, &MAINNET), &share, &[&HOLDER2]));
+
+        // The underlying's global lock.
+        let mut global = base.clone();
+        token(&mut global, &under, HOLDER, 0, 0);
+        assert!(!frozen(&mainnet_plus(&global, &[am::SINGLE_ASSET_VAULT]), &share, &[&HOLDER]), "nothing locked");
+        let mut iss = json_at(&Sandbox::new(&global), &ukey).unwrap();
+        iss["Flags"] = json!(LSF_MPT_CAN_TRANSFER | LSF_MPT_LOCKED);
+        put(&mut global, ukey, &iss);
+        assert!(frozen(&mainnet_plus(&global, &[am::SINGLE_ASSET_VAULT]), &share, &[&HOLDER]));
+        assert!(!frozen(&with(&global, &MAINNET), &share, &[&HOLDER]));
+
+        // An ordinary issuance (its issuer is no vault) is untouched.
+        assert!(!frozen(&sav, &under, &[&HOLDER2]));
+        assert!(frozen(&sav, &under, &[&HOLDER]));
+    }
+
+    /// G6 — the underlying may be an IOU (frozen line, global freeze) or XRP
+    /// (never frozen): `isAnyFrozen(view, {issuer, account}, vault->at(sfAsset))`
+    /// (View.cpp:138, TokenHelpers.cpp:115-125).
+    #[test]
+    fn g6_a_vault_share_follows_an_iou_underlyings_freeze() {
+        let mut base = state();
+        let share = vault(&mut base, usd());
+        token(&mut base, &share, HOLDER, 0, 100);
+        line(&mut base, HOLDER, 0);
+        let sav = |s: &LedgerState| mainnet_plus(s, &[am::SINGLE_ASSET_VAULT]);
+        assert!(!frozen(&sav(&base), &share, &[&HOLDER]), "nothing frozen");
+
+        let mut line_frozen = base.clone();
+        line(&mut line_frozen, HOLDER, LSF_HIGH_FREEZE);
+        assert!(frozen(&sav(&line_frozen), &share, &[&HOLDER]), "the issuer froze the holder's line");
+        assert!(!frozen(&with(&line_frozen, &MAINNET), &share, &[&HOLDER]), "mainnet today: unchanged");
+        assert!(!frozen(&line_frozen, &share, &[&HOLDER]));
+
+        let mut global = base.clone();
+        root(&mut global, ISSUER, LSF_DEFAULT_RIPPLE | LSF_GLOBAL_FREEZE, json!({}));
+        assert!(frozen(&sav(&global), &share, &[&HOLDER]), "the issuer's global freeze");
+        assert!(!frozen(&with(&global, &MAINNET), &share, &[&HOLDER]));
+
+        let mut xrp = state();
+        let share = vault(&mut xrp, json!({"currency": "XRP"}));
+        token(&mut xrp, &share, HOLDER, 0, 100);
+        assert!(!frozen(&sav(&xrp), &share, &[&HOLDER]), "XRP is never frozen");
+    }
+
+    /// G6 — a share issuance carrying sfReferenceHolding (vaults created
+    /// under fixCleanup3_2_0) names the vault's own MPToken or RippleState for
+    /// the underlying; the asset is read from that holding (View.cpp:101-116,
+    /// `assetOfHolding` MPTokenHelpers.cpp:580-601) and neither the issuer's
+    /// root nor the Vault is consulted. A dangling reference is not frozen.
+    #[test]
+    fn g6_a_share_with_a_reference_holding_reads_the_underlying_from_it() {
+        let sav = |s: &LedgerState| mainnet_plus(s, &[am::SINGLE_ASSET_VAULT]);
+        // MPT underlying: the reference is PSEUDO's MPToken of it.
+        let mut base = state();
+        root(&mut base, PSEUDO, 0x0110_0000, json!({"Sequence": 0, "VaultID": hex::encode_upper(VAULT_KEY.0)}));
+        let under = mptid(1, ISSUER);
+        issuance(&mut base, &under, LSF_MPT_CAN_TRANSFER, json!({}));
+        let holding = token(&mut base, &under, PSEUDO, 0, 500);
+        token(&mut base, &under, HOLDER, LSF_MPT_LOCKED, 0);
+        let share = mptid(1, PSEUDO);
+        issuance(&mut base, &share, LSF_MPT_CAN_TRANSFER, json!({"ReferenceHolding": hex::encode_upper(holding.0)}));
+        token(&mut base, &share, HOLDER, 0, 100);
+        assert!(frozen(&sav(&base), &share, &[&HOLDER]), "no Vault object is needed: the holding names the asset");
+        assert!(!frozen(&sav(&base), &share, &[&HOLDER2]));
+        assert!(!frozen(&with(&base, &MAINNET), &share, &[&HOLDER]));
+
+        // IOU underlying: the reference is PSEUDO's trust line; the IOU's
+        // issuer is the limit issuer that is not the share's issuer.
+        let mut base = state();
+        const PSEUDO_L: [u8; 20] = [0x14; 20];
+        root(&mut base, PSEUDO_L, 0x0110_0000, json!({"Sequence": 0, "VaultID": hex::encode_upper(VAULT_KEY.0)}));
+        let holding = line(&mut base, PSEUDO_L, 0);
+        line(&mut base, HOLDER, LSF_HIGH_FREEZE);
+        let share = mptid(1, PSEUDO_L);
+        issuance(&mut base, &share, LSF_MPT_CAN_TRANSFER, json!({"ReferenceHolding": hex::encode_upper(holding.0)}));
+        token(&mut base, &share, HOLDER, 0, 100);
+        assert!(frozen(&sav(&base), &share, &[&HOLDER]));
+        assert!(!frozen(&sav(&base), &share, &[&HOLDER2]));
+
+        let mut dangling = base.clone();
+        issuance(&mut dangling, &share, LSF_MPT_CAN_TRANSFER, json!({"ReferenceHolding": "EE".repeat(32)}));
+        assert!(!frozen(&sav(&dangling), &share, &[&HOLDER]), "View.cpp:106-112");
+    }
+
+    /// G6 — the recursion stops at kMaxAssetCheckDepth (5) and answers
+    /// "frozen" there (View.cpp:73-79). A vault on its own share never ends.
+    #[test]
+    fn g6_the_asset_recursion_is_frozen_at_depth_five() {
+        let mut base = state();
+        let share = mptid(1, PSEUDO);
+        vault(&mut base, json!({"mpt_issuance_id": hex::encode_upper(share)}));
+        token(&mut base, &share, HOLDER, 0, 100);
+        assert!(frozen(&mainnet_plus(&base, &[am::SINGLE_ASSET_VAULT]), &share, &[&HOLDER]));
+        assert!(!frozen(&with(&base, &MAINNET), &share, &[&HOLDER]));
+    }
+
+    fn payment(from: [u8; 20]) -> TxFields {
+        TxFields {
+            account: from, tx_type: "Payment".to_string(), fee: 12, sequence: 1, ticket_seq: None, last_ledger_seq: None,
+            fields: json!({}), inner_batch: false,
+        }
+    }
+
+    /// G6 through an ordinary transaction — Payment.cpp:709: a holder to
+    /// holder payment of a vault share is tecLOCKED while the vault's
+    /// underlying asset is frozen for either party.
+    #[test]
+    fn g6_a_payment_of_vault_shares_is_locked_by_the_underlyings_freeze() {
+        let mut base = state();
+        let share = vault(&mut base, usd());
+        token(&mut base, &share, HOLDER, 0, 100);
+        token(&mut base, &share, HOLDER2, 0, 0);
+        line(&mut base, HOLDER, 0);
+        line(&mut base, HOLDER2, LSF_HIGH_FREEZE);
+        let pay = |state: &LedgerState| {
+            let mut sb = Sandbox::new(state);
+            apply_mpt_payment(&payment(HOLDER), &mut sb, &HOLDER2, share, 10, false)
+        };
+        assert_eq!(pay(&with(&base, &MAINNET)), TxResult::Success, "mainnet today");
+        assert_eq!(pay(&base), TxResult::Success, "no amendments");
+        assert_eq!(pay(&mainnet_plus(&base, &[am::SINGLE_ASSET_VAULT])), TxResult::Locked);
+    }
+
+    /// G7 (a) — MPTokenHelpers.cpp:388-389, :404, :469: under SingleAssetVault
+    /// (or MPTokensV2) a pseudo-account is implicitly authorized. With
+    /// fixCleanup3_3_0 the exemption comes before the MPToken test; without
+    /// it, after — so a pseudo-account without an MPToken still fails a
+    /// Legacy or Strong check there.
+    #[test]
+    fn g7_a_pseudo_account_is_implicitly_authorized() {
+        let mut base = state();
+        let id = mptid(1, ISSUER);
+        issuance(&mut base, &id, LSF_MPT_REQUIRE_AUTH, json!({}));
+        const AMM: [u8; 20] = [0x41; 20];
+        const BROKER: [u8; 20] = [0x42; 20];
+        root(&mut base, AMM, 0, json!({"AMMID": "AA".repeat(32)}));
+        root(&mut base, BROKER, 0, json!({"LoanBrokerID": "BB".repeat(32)}));
+        token(&mut base, &id, AMM, 0, 5);
+        token(&mut base, &id, HOLDER, 0, 5);
+
+        for ty in [AuthType::Legacy, AuthType::StrongAuth, AuthType::WeakAuth] {
+            assert_eq!(auth(&with(&base, &MAINNET), &id, &AMM, ty), TxResult::NoAuth, "mainnet today {ty:?}");
+            assert_eq!(auth(&base, &id, &AMM, ty), TxResult::NoAuth, "no amendments {ty:?}");
+            for gate in [am::SINGLE_ASSET_VAULT, am::MPTOKENS_V2] {
+                let on = mainnet_plus(&base, &[gate]);
+                assert_eq!(auth(&on, &id, &AMM, ty), TxResult::Success, "{ty:?}");
+                assert_eq!(auth(&on, &id, &BROKER, ty), TxResult::Success, "no MPToken, exempt first {ty:?}");
+                assert_eq!(auth(&on, &id, &HOLDER, ty), TxResult::NoAuth, "an ordinary holder is not exempt {ty:?}");
+            }
+            assert_eq!(auth(&mainnet_plus(&base, &[am::LENDING_PROTOCOL]), &id, &AMM, ty), TxResult::NoAuth, "{ty:?}");
+        }
+        // Without fixCleanup3_3_0 the MPToken test comes first (:440-443).
+        let pre330 = with(&base, &[am::SINGLE_ASSET_VAULT]);
+        assert_eq!(auth(&pre330, &id, &AMM, AuthType::Legacy), TxResult::Success);
+        assert_eq!(auth(&pre330, &id, &BROKER, AuthType::Legacy), TxResult::NoAuth);
+        assert_eq!(auth(&pre330, &id, &BROKER, AuthType::StrongAuth), TxResult::NoAuth);
+        assert_eq!(auth(&pre330, &id, &BROKER, AuthType::WeakAuth), TxResult::Success);
+    }
+
+    /// G7 (b) — MPTokenHelpers.cpp:407-437: when the issuer is a vault
+    /// pseudo-account, authorization is first required on the vault's
+    /// underlying asset, with the same AuthType; tefINTERNAL when the issuer's
+    /// root or the vault is missing; tecINTERNAL past depth five.
+    #[test]
+    fn g7_a_vault_share_requires_auth_on_the_underlying_first() {
+        let sav = |s: &LedgerState| mainnet_plus(s, &[am::SINGLE_ASSET_VAULT]);
+        // IOU underlying whose issuer requires authorization.
+        let mut base = state();
+        root(&mut base, ISSUER, LSF_DEFAULT_RIPPLE | LSF_REQUIRE_AUTH, json!({}));
+        let share = vault(&mut base, usd());
+        token(&mut base, &share, HOLDER, 0, 100);
+        for ty in [AuthType::Legacy, AuthType::StrongAuth, AuthType::WeakAuth] {
+            assert_eq!(auth(&with(&base, &MAINNET), &share, &HOLDER, ty), TxResult::Success, "mainnet today {ty:?}");
+            assert_eq!(auth(&base, &share, &HOLDER, ty), TxResult::Success, "no amendments {ty:?}");
+            assert_eq!(auth(&sav(&base), &share, &HOLDER, ty), TxResult::NoLine, "no line to a RequireAuth issuer {ty:?}");
+        }
+        let mut unauthorized = base.clone();
+        line(&mut unauthorized, HOLDER, 0);
+        assert_eq!(auth(&sav(&unauthorized), &share, &HOLDER, AuthType::Legacy), TxResult::NoAuth);
+        assert_eq!(auth(&with(&unauthorized, &MAINNET), &share, &HOLDER, AuthType::Legacy), TxResult::Success);
+        let mut authorized = base.clone();
+        line(&mut authorized, HOLDER, LSF_HIGH_AUTH);
+        assert_eq!(auth(&sav(&authorized), &share, &HOLDER, AuthType::Legacy), TxResult::Success);
+        // The share's own rule still applies afterwards: no MPToken of the share.
+        assert_eq!(auth(&sav(&authorized), &share, &HOLDER2, AuthType::WeakAuth), TxResult::NoLine);
+        line(&mut authorized, HOLDER2, LSF_HIGH_AUTH);
+        assert_eq!(auth(&sav(&authorized), &share, &HOLDER2, AuthType::WeakAuth), TxResult::Success);
+        assert_eq!(auth(&sav(&authorized), &share, &HOLDER2, AuthType::Legacy), TxResult::NoAuth);
+        // The issuer itself is always authorized, before any recursion.
+        assert_eq!(auth(&sav(&base), &share, &PSEUDO, AuthType::StrongAuth), TxResult::Success);
+
+        // An issuer that does not require auth: only a Strong check wants the line.
+        let mut open = state();
+        let share = vault(&mut open, usd());
+        token(&mut open, &share, HOLDER, 0, 100);
+        assert_eq!(auth(&sav(&open), &share, &HOLDER, AuthType::Legacy), TxResult::Success);
+        assert_eq!(auth(&sav(&open), &share, &HOLDER, AuthType::StrongAuth), TxResult::NoLine);
+
+        // MPT underlying with lsfMPTRequireAuth.
+        let mut base = state();
+        let under = mptid(1, ISSUER);
+        issuance(&mut base, &under, LSF_MPT_REQUIRE_AUTH, json!({}));
+        let share = vault(&mut base, json!({"mpt_issuance_id": hex::encode_upper(under)}));
+        token(&mut base, &share, HOLDER, 0, 100);
+        token(&mut base, &under, HOLDER, 0, 0);
+        assert_eq!(auth(&sav(&base), &share, &HOLDER, AuthType::Legacy), TxResult::NoAuth);
+        assert_eq!(auth(&with(&base, &MAINNET), &share, &HOLDER, AuthType::Legacy), TxResult::Success);
+        token(&mut base, &under, HOLDER, LSF_MPT_AUTHORIZED, 0);
+        assert_eq!(auth(&sav(&base), &share, &HOLDER, AuthType::Legacy), TxResult::Success);
+
+        // XRP underlying asks nothing.
+        let mut xrp = state();
+        let share = vault(&mut xrp, json!({"currency": "XRP"}));
+        token(&mut xrp, &share, HOLDER, 0, 100);
+        assert_eq!(auth(&sav(&xrp), &share, &HOLDER, AuthType::StrongAuth), TxResult::Success);
+
+        // :418-420 the issuer's root is missing; :424-426 its vault is.
+        let mut orphan = state();
+        let id = mptid(1, [0x77; 20]);
+        issuance(&mut orphan, &id, 0, json!({}));
+        token(&mut orphan, &id, HOLDER, 0, 1);
+        assert_eq!(auth(&sav(&orphan), &id, &HOLDER, AuthType::Legacy), TxResult::TefInternal);
+        assert_eq!(auth(&with(&orphan, &MAINNET), &id, &HOLDER, AuthType::Legacy), TxResult::Success);
+        let mut no_vault = state();
+        root(&mut no_vault, PSEUDO, 0, json!({"VaultID": "CC".repeat(32)}));
+        let id = mptid(1, PSEUDO);
+        issuance(&mut no_vault, &id, 0, json!({}));
+        token(&mut no_vault, &id, HOLDER, 0, 1);
+        assert_eq!(auth(&sav(&no_vault), &id, &HOLDER, AuthType::Legacy), TxResult::TefInternal);
+
+        // :407-414 a vault on its own share: tecINTERNAL at depth five.
+        let mut cyclic = state();
+        let share = mptid(1, PSEUDO);
+        vault(&mut cyclic, json!({"mpt_issuance_id": hex::encode_upper(share)}));
+        token(&mut cyclic, &share, HOLDER, 0, 1);
+        assert_eq!(auth(&sav(&cyclic), &share, &HOLDER, AuthType::Legacy), TxResult::TecInternal);
+    }
+
+    /// G7 through an ordinary transaction — Payment.cpp:684-688: paying vault
+    /// shares to an account the underlying's issuer has not authorized.
+    #[test]
+    fn g7_a_payment_of_vault_shares_needs_the_underlyings_authorization() {
+        let mut base = state();
+        root(&mut base, ISSUER, LSF_DEFAULT_RIPPLE | LSF_REQUIRE_AUTH, json!({}));
+        let share = vault(&mut base, usd());
+        token(&mut base, &share, HOLDER, 0, 100);
+        token(&mut base, &share, HOLDER2, 0, 0);
+        line(&mut base, HOLDER, LSF_HIGH_AUTH);
+        line(&mut base, HOLDER2, 0);
+        let pay = |state: &LedgerState| {
+            let mut sb = Sandbox::new(state);
+            apply_mpt_payment(&payment(HOLDER), &mut sb, &HOLDER2, share, 10, false)
+        };
+        assert_eq!(pay(&with(&base, &MAINNET)), TxResult::Success, "mainnet today");
+        assert_eq!(pay(&mainnet_plus(&base, &[am::SINGLE_ASSET_VAULT])), TxResult::NoAuth);
+        line(&mut base, HOLDER2, LSF_HIGH_AUTH);
+        assert_eq!(pay(&mainnet_plus(&base, &[am::SINGLE_ASSET_VAULT])), TxResult::Success);
+    }
+
+    /// The DomainID branch of MPT `requireAuth` (MPTokenHelpers.cpp:445-466)
+    /// — not amendment-gated in rippled: an issuance can only carry DomainID
+    /// once G12/G13 let one be written. An accepted credential of the domain
+    /// authorizes, MPToken or not; without one, an existing MPToken falls
+    /// through to its own lsfMPTAuthorized, and no MPToken returns
+    /// validDomain's verdict.
+    #[test]
+    fn g7_an_issuance_with_a_domain_authorizes_by_credential() {
+        let mut base = state();
+        let domain = Hash256([0x6D; 32]);
+        const CRED_ISSUER: [u8; 20] = [0x51; 20];
+        put(&mut base, domain, &json!({
+            "LedgerEntryType": "PermissionedDomain", "Flags": 0, "Owner": hex::encode(ISSUER), "Sequence": 1,
+            "AcceptedCredentials": [{"Credential": {"Issuer": hex::encode(CRED_ISSUER), "CredentialType": "ABCD"}}],
+        }));
+        let cred = |state: &mut LedgerState, who: [u8; 20], flags: u64, expiration: Option<u64>| {
+            let mut c = json!({
+                "LedgerEntryType": "Credential", "Subject": hex::encode(who), "Issuer": hex::encode(CRED_ISSUER),
+                "CredentialType": "ABCD", "Flags": flags,
+            });
+            if let Some(e) = expiration {
+                c["Expiration"] = json!(e);
+            }
+            put(state, crate::tx::credential::credential_key(&who, &CRED_ISSUER, &[0xAB, 0xCD]), &c);
+        };
+        const ACCEPTED: u64 = 0x0001_0000;
+        let id = mptid(1, ISSUER);
+        issuance(&mut base, &id, LSF_MPT_REQUIRE_AUTH, json!({"DomainID": hex::encode_upper(domain.0)}));
+        cred(&mut base, HOLDER, ACCEPTED, None);
+
+        for s in [base.clone(), with(&base, &MAINNET), mainnet_plus(&base, &[am::SINGLE_ASSET_VAULT])] {
+            // In the domain, no MPToken: a weak check passes, a Legacy or
+            // Strong one wants the MPToken first (:440-443).
+            assert_eq!(auth(&s, &id, &HOLDER, AuthType::WeakAuth), TxResult::Success);
+            assert_eq!(auth(&s, &id, &HOLDER, AuthType::Legacy), TxResult::NoAuth);
+            assert_eq!(auth(&s, &id, &HOLDER, AuthType::StrongAuth), TxResult::NoAuth);
+            // Outside the domain, no MPToken: validDomain's tecNO_AUTH.
+            assert_eq!(auth(&s, &id, &HOLDER2, AuthType::WeakAuth), TxResult::NoAuth);
+        }
+        // In the domain with an unauthorized MPToken: the credential decides.
+        let mut held = base.clone();
+        token(&mut held, &id, HOLDER, 0, 5);
+        assert_eq!(auth(&held, &id, &HOLDER, AuthType::Legacy), TxResult::Success);
+        // Outside it with an MPToken: the token's own flag decides.
+        token(&mut held, &id, HOLDER2, 0, 5);
+        assert_eq!(auth(&held, &id, &HOLDER2, AuthType::Legacy), TxResult::NoAuth);
+        token(&mut held, &id, HOLDER2, LSF_MPT_AUTHORIZED, 5);
+        assert_eq!(auth(&held, &id, &HOLDER2, AuthType::Legacy), TxResult::Success);
+        // An expired credential and no MPToken: tecEXPIRED; a deleted domain: tecOBJECT_NOT_FOUND.
+        let mut expired = base.clone();
+        cred(&mut expired, HOLDER2, ACCEPTED, Some(5));
+        assert_eq!(auth(&expired, &id, &HOLDER2, AuthType::WeakAuth), TxResult::Expired);
+        let mut gone = base.clone();
+        issuance(&mut gone, &id, LSF_MPT_REQUIRE_AUTH, json!({"DomainID": "9A".repeat(32)}));
+        assert_eq!(auth(&gone, &id, &HOLDER, AuthType::WeakAuth), TxResult::ObjectNotFound);
+    }
+
+    /// G8 — TokenHelpers.cpp:449-468: MPT `accountHolds` with
+    /// ZeroIfUnauthorized zeroes on the full `requireAuth(StrongAuth)` once
+    /// SingleAssetVault (or ConfidentialTransfer) is on; before, only on the
+    /// issuance's lsfMPTRequireAuth with the token's lsfMPTAuthorized clear.
+    #[test]
+    fn g8_account_holds_zeroes_on_the_full_auth_check() {
+        // A share whose underlying IOU the holder is not authorized for.
+        let mut base = state();
+        root(&mut base, ISSUER, LSF_DEFAULT_RIPPLE | LSF_REQUIRE_AUTH, json!({}));
+        let share = vault(&mut base, usd());
+        token(&mut base, &share, HOLDER, 0, 100);
+        line(&mut base, HOLDER, 0);
+        let holds = |s: &LedgerState, id: &[u8; 24], frozen: bool, auth: bool| account_holds(&Sandbox::new(s), id, &HOLDER, frozen, auth);
+        assert_eq!(holds(&with(&base, &MAINNET), &share, false, true), 100, "mainnet today: the share's own flags pass");
+        assert_eq!(holds(&base, &share, false, true), 100);
+        let sav = mainnet_plus(&base, &[am::SINGLE_ASSET_VAULT]);
+        assert_eq!(holds(&sav, &share, false, true), 0, "requireAuth fails on the underlying");
+        assert_eq!(holds(&sav, &share, false, false), 100, "IgnoreAuth");
+        assert_eq!(account_holds(&Sandbox::new(&sav), &share, &HOLDER2, false, false), 0, "no MPToken");
+        // ZeroIfFrozen under the vault recursion (G6): the holder's line frozen.
+        let mut frozen_line = base.clone();
+        line(&mut frozen_line, HOLDER, LSF_HIGH_FREEZE | LSF_HIGH_AUTH);
+        let sav = mainnet_plus(&frozen_line, &[am::SINGLE_ASSET_VAULT]);
+        assert_eq!(holds(&sav, &share, true, false), 0);
+        assert_eq!(holds(&sav, &share, false, true), 100, "authorized, and the freeze is ignored");
+        assert_eq!(holds(&with(&frozen_line, &MAINNET), &share, true, true), 100);
+
+        // The old flag test, unchanged with the gates off.
+        let mut plain = state();
+        let id = mptid(1, ISSUER);
+        issuance(&mut plain, &id, LSF_MPT_REQUIRE_AUTH, json!({}));
+        token(&mut plain, &id, HOLDER, 0, 7);
+        for s in [plain.clone(), with(&plain, &MAINNET), mainnet_plus(&plain, &[am::SINGLE_ASSET_VAULT])] {
+            assert_eq!(holds(&s, &id, false, true), 0);
+            assert_eq!(holds(&s, &id, false, false), 7);
+        }
+        token(&mut plain, &id, HOLDER, LSF_MPT_AUTHORIZED | LSF_MPT_LOCKED, 7);
+        for s in [plain.clone(), with(&plain, &MAINNET), mainnet_plus(&plain, &[am::SINGLE_ASSET_VAULT])] {
+            assert_eq!(holds(&s, &id, false, true), 7);
+            assert_eq!(holds(&s, &id, true, true), 0, "locked");
+        }
+
+        // ConfidentialTransfer alone takes the full check too: a domain
+        // credential authorizes an MPToken whose own flag is clear.
+        let mut dom = state();
+        let domain = Hash256([0x6D; 32]);
+        put(&mut dom, domain, &json!({
+            "LedgerEntryType": "PermissionedDomain", "Flags": 0, "Owner": hex::encode(HOLDER), "Sequence": 1,
+            "AcceptedCredentials": [{"Credential": {"Issuer": hex::encode(ISSUER), "CredentialType": "ABCD"}}],
+        }));
+        put(&mut dom, crate::tx::credential::credential_key(&HOLDER, &ISSUER, &[0xAB, 0xCD]), &json!({
+            "LedgerEntryType": "Credential", "Subject": hex::encode(HOLDER), "Issuer": hex::encode(ISSUER),
+            "CredentialType": "ABCD", "Flags": 0x0001_0000u64,
+        }));
+        issuance(&mut dom, &id, LSF_MPT_REQUIRE_AUTH, json!({"DomainID": hex::encode_upper(domain.0)}));
+        token(&mut dom, &id, HOLDER, 0, 9);
+        assert_eq!(holds(&with(&dom, &MAINNET), &id, false, true), 0, "the flag test");
+        assert_eq!(holds(&mainnet_plus(&dom, &[am::CONFIDENTIAL_TRANSFER]), &id, false, true), 9);
+        assert_eq!(holds(&mainnet_plus(&dom, &[am::SINGLE_ASSET_VAULT]), &id, false, true), 9);
+    }
+
+    /// `canTransfer` (MPTokenHelpers.cpp:603-656, fixCleanup3_2_0): a share
+    /// carrying sfReferenceHolding inherits its underlying's transferability
+    /// for a third-party transfer — an MPT without lsfMPTCanTransfer is
+    /// tecNO_AUTH, an IOU both of whose lines forbid rippling is terNO_RIPPLE.
+    #[test]
+    fn can_transfer_follows_the_reference_holding_under_fixcleanup320() {
+        let ct = |s: &LedgerState, id: &[u8; 24], from: &[u8; 20], to: &[u8; 20]| {
+            let sb = Sandbox::new(s);
+            can_transfer_ter(&sb, &json_at(&sb, &keylet::mpt_issuance_key(id)).unwrap(), from, to)
+        };
+        let mut base = state();
+        root(&mut base, PSEUDO, 0x0110_0000, json!({"Sequence": 0, "VaultID": hex::encode_upper(VAULT_KEY.0)}));
+        let under = mptid(1, ISSUER);
+        issuance(&mut base, &under, 0, json!({}));
+        let holding = token(&mut base, &under, PSEUDO, 0, 500);
+        let share = mptid(1, PSEUDO);
+        issuance(&mut base, &share, LSF_MPT_CAN_TRANSFER, json!({"ReferenceHolding": hex::encode_upper(holding.0)}));
+        assert_eq!(ct(&base, &share, &HOLDER, &HOLDER2), TxResult::Success, "before fixCleanup3_2_0");
+        let on = with(&base, &MAINNET);
+        assert_eq!(ct(&on, &share, &HOLDER, &HOLDER2), TxResult::NoAuth, "the underlying is not transferable");
+        assert_eq!(ct(&on, &share, &HOLDER, &PSEUDO), TxResult::Success, "to the share's issuer");
+        assert_eq!(ct(&on, &share, &PSEUDO, &HOLDER), TxResult::Success, "from the share's issuer");
+        assert_eq!(ct(&on, &under, &HOLDER, &HOLDER2), TxResult::NoAuth);
+        assert_eq!(ct(&on, &under, &HOLDER, &ISSUER), TxResult::Success);
+        let mut dangling = base.clone();
+        issuance(&mut dangling, &share, LSF_MPT_CAN_TRANSFER, json!({"ReferenceHolding": "EE".repeat(32)}));
+        assert_eq!(ct(&with(&dangling, &MAINNET), &share, &HOLDER, &HOLDER2), TxResult::TefInternal);
+        let mut plain = base.clone();
+        issuance(&mut plain, &share, 0, json!({"ReferenceHolding": hex::encode_upper(holding.0)}));
+        assert_eq!(ct(&plain, &share, &HOLDER, &HOLDER2), TxResult::NoAuth, "the share's own flag first");
+
+        // IOU underlying (RippleStateHelpers.cpp:603-631).
+        let mut iou = state();
+        const PSEUDO_L: [u8; 20] = [0x14; 20];
+        root(&mut iou, PSEUDO_L, 0x0110_0000, json!({"Sequence": 0, "VaultID": hex::encode_upper(VAULT_KEY.0)}));
+        let holding = line(&mut iou, PSEUDO_L, 0);
+        let share = mptid(1, PSEUDO_L);
+        issuance(&mut iou, &share, LSF_MPT_CAN_TRANSFER, json!({"ReferenceHolding": hex::encode_upper(holding.0)}));
+        line(&mut iou, HOLDER, LSF_HIGH_NO_RIPPLE);
+        line(&mut iou, HOLDER2, LSF_HIGH_NO_RIPPLE);
+        let on = with(&iou, &MAINNET);
+        assert_eq!(ct(&on, &share, &HOLDER, &HOLDER2), TxResult::NoRipple, "rippling off on both lines");
+        assert_eq!(ct(&iou, &share, &HOLDER, &HOLDER2), TxResult::Success, "before fixCleanup3_2_0");
+        line(&mut iou, HOLDER2, 0);
+        assert_eq!(ct(&with(&iou, &MAINNET), &share, &HOLDER, &HOLDER2), TxResult::Success, "one line ripples");
+        // No line: the issuer's lsfDefaultRipple stands in for it.
+        let mut bare = state();
+        root(&mut bare, PSEUDO_L, 0x0110_0000, json!({"Sequence": 0, "VaultID": hex::encode_upper(VAULT_KEY.0)}));
+        let holding = line(&mut bare, PSEUDO_L, 0);
+        issuance(&mut bare, &share, LSF_MPT_CAN_TRANSFER, json!({"ReferenceHolding": hex::encode_upper(holding.0)}));
+        assert_eq!(ct(&with(&bare, &MAINNET), &share, &HOLDER, &HOLDER2), TxResult::Success);
+        root(&mut bare, ISSUER, 0, json!({}));
+        assert_eq!(ct(&with(&bare, &MAINNET), &share, &HOLDER, &HOLDER2), TxResult::NoRipple);
+    }
+
+    fn tx(ty: &str, account: [u8; 20], fields: Value) -> TxFields {
+        TxFields {
+            account, tx_type: ty.to_string(), fee: 12, sequence: 5, ticket_seq: None, last_ledger_seq: None,
+            fields, inner_batch: false,
+        }
+    }
+
+    const TF_MPT_REQUIRE_AUTH: u64 = 0x04;
+
+    /// G12 — MPTokenIssuanceCreate.cpp:30-36 (`checkExtraFeatures`): sfDomainID
+    /// is temDISABLED unless PermissionedDomains AND SingleAssetVault are on;
+    /// then :94-102 a zero domain or a domain without tfMPTRequireAuth is
+    /// temMALFORMED, and the issuance stores the domain (:176-177).
+    #[test]
+    fn g12_issuance_create_takes_a_domain_only_with_both_amendments() {
+        let base = state();
+        let domain = "6D".repeat(32);
+        let create = tx("MPTokenIssuanceCreate", ISSUER, json!({"Flags": TF_MPT_REQUIRE_AUTH, "DomainID": domain}));
+        let plain = tx("MPTokenIssuanceCreate", ISSUER, json!({"Flags": TF_MPT_REQUIRE_AUTH}));
+        let pf = |s: &LedgerState, t: &TxFields| MPTokenIssuanceCreateTransactor.preflight_in(t, &Sandbox::new(s));
+        for off in [base.clone(), with(&base, &MAINNET), mainnet_plus(&base, &[am::SINGLE_ASSET_VAULT]),
+            mainnet_plus(&base, &[am::PERMISSIONED_DOMAINS]), mainnet_plus(&base, &[am::PERMISSIONED_DOMAINS, am::LENDING_PROTOCOL])] {
+            assert_eq!(pf(&off, &create), TxResult::Disabled);
+            assert_eq!(pf(&off, &plain), TxResult::Success, "without the field nothing changes");
+        }
+        let on = mainnet_plus(&base, &[am::PERMISSIONED_DOMAINS, am::SINGLE_ASSET_VAULT]);
+        assert_eq!(pf(&on, &create), TxResult::Success);
+        assert_eq!(pf(&on, &plain), TxResult::Success);
+        let zero = tx("MPTokenIssuanceCreate", ISSUER, json!({"Flags": TF_MPT_REQUIRE_AUTH, "DomainID": "00".repeat(32)}));
+        assert_eq!(pf(&on, &zero), TxResult::Malformed, "a zero domain");
+        let public = tx("MPTokenIssuanceCreate", ISSUER, json!({"Flags": 0, "DomainID": domain}));
+        assert_eq!(pf(&on, &public), TxResult::Malformed, "a domain implies tfMPTRequireAuth");
+
+        let mut sb = Sandbox::new(&on);
+        assert_eq!(MPTokenIssuanceCreateTransactor.do_apply(&create, &mut sb), TxResult::Success);
+        let made = json_at(&sb, &keylet::mpt_issuance_key(&mptid(5, ISSUER))).unwrap();
+        assert_eq!(made["DomainID"], json!(domain));
+        assert_eq!(made["Flags"], json!(LSF_MPT_REQUIRE_AUTH));
+    }
+
+    /// G13 — MPTokenIssuanceSet.cpp:27-32: sfDomainID is temDISABLED unless
+    /// PermissionedDomains AND SingleAssetVault are on; :68-69 with sfHolder it
+    /// is temMALFORMED; preclaim :166-177 wants lsfMPTRequireAuth on the
+    /// issuance (tecNO_PERMISSION) and, for a non-zero domain, the
+    /// PermissionedDomain object (tecOBJECT_NOT_FOUND); doApply :360-376 sets
+    /// the field, a zero domain clears it.
+    #[test]
+    fn g13_issuance_set_takes_a_domain_only_with_both_amendments() {
+        let mut base = state();
+        let id = mptid(1, ISSUER);
+        let ikey = issuance(&mut base, &id, LSF_MPT_REQUIRE_AUTH, json!({}));
+        let open = mptid(2, ISSUER);
+        issuance(&mut base, &open, 0, json!({}));
+        let domain = Hash256([0x6D; 32]);
+        put(&mut base, domain, &json!({
+            "LedgerEntryType": "PermissionedDomain", "Flags": 0, "Owner": hex::encode(ISSUER), "Sequence": 1,
+            "AcceptedCredentials": [{"Credential": {"Issuer": hex::encode(ISSUER), "CredentialType": "ABCD"}}],
+        }));
+        token(&mut base, &id, HOLDER, 0, 0);
+        let set = |id: &[u8; 24], d: String| tx("MPTokenIssuanceSet", ISSUER, json!({"MPTokenIssuanceID": hex::encode_upper(id), "DomainID": d}));
+        let dhex = hex::encode_upper(domain.0);
+        let pf = |s: &LedgerState, t: &TxFields| MPTokenIssuanceSetTransactor.preflight_in(t, &Sandbox::new(s));
+        for off in [base.clone(), with(&base, &MAINNET), mainnet_plus(&base, &[am::SINGLE_ASSET_VAULT]),
+            mainnet_plus(&base, &[am::PERMISSIONED_DOMAINS])] {
+            assert_eq!(pf(&off, &set(&id, dhex.clone())), TxResult::Disabled);
+        }
+        let on = mainnet_plus(&base, &[am::PERMISSIONED_DOMAINS, am::SINGLE_ASSET_VAULT]);
+        assert_eq!(pf(&on, &set(&id, dhex.clone())), TxResult::Success);
+        assert_eq!(pf(&on, &set(&id, "00".repeat(32))), TxResult::Success, "a zero domain clears");
+        let mut held = set(&id, dhex.clone());
+        held.fields["Holder"] = json!(hex::encode(HOLDER));
+        assert_eq!(pf(&on, &held), TxResult::Malformed, "DomainID with Holder");
+
+        let apply = |s: &LedgerState, t: &TxFields| {
+            let mut sb = Sandbox::new(s);
+            let r = MPTokenIssuanceSetTransactor.do_apply(t, &mut sb);
+            (r, json_at(&sb, &ikey).unwrap())
+        };
+        assert_eq!(apply(&on, &set(&open, dhex.clone())).0, TxResult::NoPermission, "the issuance does not require auth");
+        assert_eq!(apply(&on, &set(&id, "9A".repeat(32))).0, TxResult::ObjectNotFound, "no such domain");
+        let (r, after) = apply(&on, &set(&id, dhex.clone()));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(after["DomainID"], json!(dhex));
+        let mut with_domain = on.clone();
+        put(&mut with_domain, ikey, &after);
+        let (r, cleared) = apply(&with_domain, &set(&id, "00".repeat(32)));
+        assert_eq!(r, TxResult::Success);
+        assert!(cleared.get("DomainID").is_none(), "{cleared}");
+        let (r, same) = apply(&on, &set(&id, "00".repeat(32)));
+        assert_eq!(r, TxResult::Success, "clearing an absent domain");
+        assert!(same.get("DomainID").is_none());
+    }
+
+    /// G14 — MPTokenIssuanceSet.cpp:82-89: once SingleAssetVault, DynamicMPT or
+    /// ConfidentialTransfer is on, a set that changes nothing (sfFlags zero, no
+    /// DomainID, no keys, no mutation) is temMALFORMED. The test is on the raw
+    /// flags word: tfFullyCanonicalSig alone is not "zero".
+    #[test]
+    fn g14_an_issuance_set_that_changes_nothing_is_malformed() {
+        let base = state();
+        let id = hex::encode_upper(mptid(1, ISSUER));
+        let pf = |s: &LedgerState, fields: Value| {
+            MPTokenIssuanceSetTransactor.preflight_in(&tx("MPTokenIssuanceSet", ISSUER, fields), &Sandbox::new(s))
+        };
+        for off in [base.clone(), with(&base, &MAINNET), mainnet_plus(&base, &[am::LENDING_PROTOCOL, am::PERMISSIONED_DOMAINS])] {
+            assert_eq!(pf(&off, json!({"MPTokenIssuanceID": id, "Flags": 0})), TxResult::Success, "testnet 6F5A4B7BDA4B's shape");
+            assert_eq!(pf(&off, json!({"MPTokenIssuanceID": id})), TxResult::Success);
+        }
+        for gate in [am::SINGLE_ASSET_VAULT, am::DYNAMIC_MPT, am::CONFIDENTIAL_TRANSFER] {
+            let on = mainnet_plus(&base, &[gate, am::PERMISSIONED_DOMAINS]);
+            assert_eq!(pf(&on, json!({"MPTokenIssuanceID": id, "Flags": 0})), TxResult::Malformed, "{gate}");
+            assert_eq!(pf(&on, json!({"MPTokenIssuanceID": id})), TxResult::Malformed, "{gate}");
+            assert_eq!(pf(&on, json!({"MPTokenIssuanceID": id, "Flags": 0, "Holder": hex::encode(HOLDER)})), TxResult::Malformed, "{gate}");
+            assert_eq!(pf(&on, json!({"MPTokenIssuanceID": id, "Flags": 1})), TxResult::Success, "a lock changes something");
+            assert_eq!(pf(&on, json!({"MPTokenIssuanceID": id, "Flags": 2, "Holder": hex::encode(HOLDER)})), TxResult::Success);
+            assert_eq!(pf(&on, json!({"MPTokenIssuanceID": id, "Flags": 0x8000_0000u64})), TxResult::Success, "txFlags is not zero");
+        }
+        let on = mainnet_plus(&base, &[am::SINGLE_ASSET_VAULT, am::PERMISSIONED_DOMAINS]);
+        assert_eq!(pf(&on, json!({"MPTokenIssuanceID": id, "Flags": 0, "DomainID": "6D".repeat(32)})), TxResult::Success, "a domain changes something");
+    }
+}
