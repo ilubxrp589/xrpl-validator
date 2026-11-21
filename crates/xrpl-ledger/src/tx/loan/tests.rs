@@ -1307,12 +1307,13 @@ fn the_vault_and_the_broker_see_the_loan() {
         assert_eq!(r, TxResult::Success);
         xrp_of(&sb, &OWNER) + FEE - before
     };
-    // fixCleanup3_4_0 waives the discount for the vault's only shareholder
-    // (VaultHelpers `isSoleShareholder`); before it the loss lowers the rate.
+    // fixCleanup3_2_0 waives the discount for the vault's only shareholder
+    // (VaultWithdraw.cpp:40-50 `shouldWaiveWithdrawal`); before it the loss
+    // lowers the rate.
     assert_eq!(redeem(&impaired), redeem(&late), "a sole shareholder is not discounted");
     let (mut late, mut impaired) = (late, impaired);
-    set_rules(&mut late.state, &rules_without(&[am::FIX_CLEANUP_3_4_0]));
-    set_rules(&mut impaired.state, &rules_without(&[am::FIX_CLEANUP_3_4_0]));
+    set_rules(&mut late.state, &rules_without(&[am::FIX_CLEANUP_3_2_0]));
+    set_rules(&mut impaired.state, &rules_without(&[am::FIX_CLEANUP_3_2_0]));
     assert!(redeem(&impaired) < redeem(&late), "the loss discounts a withdrawal");
     // Paid off and deleted, the broker can go.
     fx.commit(fx.pay(1000, 0));
