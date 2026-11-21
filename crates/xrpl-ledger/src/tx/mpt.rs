@@ -75,30 +75,53 @@ pub(crate) fn issuance_issuer(issuance: &serde_json::Value) -> Option<[u8; 20]> 
     issuance.get("Issuer").and_then(|v| v.as_str()).and_then(crate::tx::offer::decode20)
 }
 
-/// `requireAuth` (MPTokenHelpers.cpp:304, Legacy auth): the issuer is always
-/// authorized; anyone else must HOLD an MPToken at all, and — when the
-/// issuance carries lsfMPTRequireAuth — that token must be lsfMPTAuthorized.
-/// DomainID credential auth and vault recursion are unported (no specimen).
+/// rippled `AuthType` (TokenHelpers.h): how strict `requireAuth` is about an
+/// account that holds no MPToken (or trust line) yet. Legacy is the default
+/// argument (MPTokenHelpers.h:148).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AuthType {
+    Legacy,
+    StrongAuth,
+    WeakAuth,
+}
+
+/// `requireAuth(view, mptIssue, account, authType, depth)` — scaffold: the
+/// pre-port behaviour (flags only), to be replaced by the full port.
+pub(crate) fn require_auth_at(
+    sandbox: &Sandbox,
+    issuance_key: &Hash256,
+    issuance: &serde_json::Value,
+    account: &[u8; 20],
+    auth: AuthType,
+    _depth: u8,
+) -> TxResult {
+    let Some(issuer) = issuance_issuer(issuance) else { return TxResult::Success };
+    if issuer == *account {
+        return TxResult::Success;
+    }
+    let token = json_at(sandbox, &keylet::mptoken_key(issuance_key, account));
+    if token.is_none() && auth != AuthType::WeakAuth {
+        return TxResult::NoAuth;
+    }
+    let iflags = issuance.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+    let authorized =
+        token.is_some_and(|t| t.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & LSF_MPT_AUTHORIZED != 0);
+    if iflags & LSF_MPT_REQUIRE_AUTH != 0 && !authorized {
+        return TxResult::NoAuth;
+    }
+    TxResult::Success
+}
+
+/// `requireAuth(view, mptIssue, account)` with the default Legacy type: None
+/// when authorized, else the refusal.
 pub fn require_auth(
     sandbox: &Sandbox,
     issuance_key: &Hash256,
     issuance: &serde_json::Value,
     account: &[u8; 20],
 ) -> Option<TxResult> {
-    let issuer = issuance_issuer(issuance)?;
-    if issuer == *account {
-        return None;
-    }
-    let Some(token) = json_at(sandbox, &keylet::mptoken_key(issuance_key, account)) else {
-        return Some(TxResult::NoAuth);
-    };
-    let iflags = issuance.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
-    if iflags & LSF_MPT_REQUIRE_AUTH != 0
-        && token.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & LSF_MPT_AUTHORIZED == 0
-    {
-        return Some(TxResult::NoAuth);
-    }
-    None
+    let r = require_auth_at(sandbox, issuance_key, issuance, account, AuthType::Legacy, 0);
+    (r != TxResult::Success).then_some(r)
 }
 
 /// `isAnyFrozen` for MPT: issuance lsfMPTLocked, or either party's MPToken
@@ -133,19 +156,8 @@ pub(crate) fn require_auth_weak(
     issuance: &serde_json::Value,
     account: &[u8; 20],
 ) -> Option<TxResult> {
-    let issuer = issuance_issuer(issuance)?;
-    if issuer == *account {
-        return None;
-    }
-    let iflags = issuance.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
-    if iflags & LSF_MPT_REQUIRE_AUTH == 0 {
-        return None;
-    }
-    let authorized = json_at(sandbox, &keylet::mptoken_key(issuance_key, account))
-        .and_then(|t| t.get("Flags").and_then(|f| f.as_u64()))
-        .map(|f| f & LSF_MPT_AUTHORIZED != 0)
-        .unwrap_or(false);
-    (!authorized).then_some(TxResult::NoAuth)
+    let r = require_auth_at(sandbox, issuance_key, issuance, account, AuthType::WeakAuth, 0);
+    (r != TxResult::Success).then_some(r)
 }
 
 /// `canTransfer(view, mptIssue, from, to)`: without lsfMPTCanTransfer only
@@ -155,6 +167,40 @@ pub(crate) fn can_transfer(issuance: &serde_json::Value, from: &[u8; 20], to: &[
     issuance.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & LSF_MPT_CAN_TRANSFER != 0
         || *from == issuer
         || *to == issuer
+}
+
+/// `canTransfer(view, mptIssue, from, to)` as a verdict — scaffold: the
+/// pre-port behaviour (lsfMPTCanTransfer only).
+pub(crate) fn can_transfer_ter(
+    _sandbox: &Sandbox,
+    issuance: &serde_json::Value,
+    from: &[u8; 20],
+    to: &[u8; 20],
+) -> TxResult {
+    if can_transfer(issuance, from, to) { TxResult::Success } else { TxResult::NoAuth }
+}
+
+/// `accountHolds(view, account, mptIssue, zeroIfFrozen, zeroIfUnauthorized)`
+/// — scaffold: the pre-SingleAssetVault arm only.
+pub fn account_holds(
+    sandbox: &Sandbox,
+    mptid: &[u8; 24],
+    account: &[u8; 20],
+    zero_if_frozen: bool,
+    zero_if_unauthorized: bool,
+) -> u64 {
+    let ikey = keylet::mpt_issuance_key(mptid);
+    let Some(token) = json_at(sandbox, &keylet::mptoken_key(&ikey, account)) else { return 0 };
+    let issuance = json_at(sandbox, &ikey);
+    let tflags = token.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+    let iflags = issuance.as_ref().and_then(|i| i.get("Flags").and_then(|f| f.as_u64())).unwrap_or(0);
+    if zero_if_frozen && (iflags | tflags) & LSF_MPT_LOCKED != 0 {
+        return 0;
+    }
+    if zero_if_unauthorized && issuance.is_some() && iflags & LSF_MPT_REQUIRE_AUTH != 0 && tflags & LSF_MPT_AUTHORIZED == 0 {
+        return 0;
+    }
+    dec_field(&token, "MPTAmount")
 }
 
 /// `transferRate(view, MPTID)` (View.cpp:851): 1e9 + 10,000 × TransferFee

@@ -1900,6 +1900,28 @@ pub(crate) fn verify_deposit_preauth(
     TxResult::Success
 }
 
+/// One candidate of rippled `pseudoAccountAddress` (AccountRootHelpers.cpp:
+/// 499-513): `ripesha(sha512Half(attempt, parentHash, pseudoOwnerKey))`, the
+/// attempt a big-endian u16. Attempt 0 is mainnet-verified (AMM rNgZoYRTk…,
+/// #105666951).
+pub(crate) fn pseudo_account_candidate(
+    parent_hash: &xrpl_core::types::Hash256,
+    owner_key: &xrpl_core::types::Hash256,
+    attempt: u16,
+) -> [u8; 20] {
+    let mut pre = [0u8; 66];
+    pre[..2].copy_from_slice(&attempt.to_be_bytes());
+    pre[2..34].copy_from_slice(&parent_hash.0);
+    pre[34..66].copy_from_slice(&owner_key.0);
+    let seed = crate::shamap::hash::sha512_half(&pre);
+    xrpl_core::crypto::signing::public_key_to_account_id(&seed.0)
+}
+
+/// rippled `pseudoAccountAddress` — scaffold: attempt 0 only, as before.
+pub(crate) fn pseudo_account_address(sandbox: &Sandbox, owner_key: &xrpl_core::types::Hash256) -> Option<[u8; 20]> {
+    Some(pseudo_account_candidate(&sandbox.base().header.parent_hash, owner_key, 0))
+}
+
 pub(crate) fn is_pseudo_account(sandbox: &Sandbox, account: &[u8; 20]) -> bool {
     crate::tx::offer::json_at(sandbox, &keylet::account_root_key(account))
         .is_some_and(|a| a.get("AMMID").is_some() || a.get("VaultID").is_some() || a.get("LoanBrokerID").is_some())
