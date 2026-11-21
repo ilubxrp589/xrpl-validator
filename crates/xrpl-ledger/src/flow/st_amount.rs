@@ -341,6 +341,101 @@ mod tests {
 }
 
 #[cfg(test)]
+mod number_conversion_tests {
+    use super::*;
+    use crate::tx::number::{MantissaScale, ScaleGuard};
+    use Rounding::{Downward, ToNearest, TowardsZero, Upward};
+
+    const SCALES: [MantissaScale; 2] = [MantissaScale::Small, MantissaScale::Large330];
+
+    fn xrp(negative: bool, drops: u64) -> StAmount {
+        StAmount { native: true, negative, mantissa: drops, exponent: 0 }
+    }
+
+    /// rippled's own `NumberTest.to_st_amount`
+    /// (src/tests/libxrpl/basics/Number.cpp:1940-1964), run there at every
+    /// mantissa scale: `STAmount{xrpIssue, 7518783.80596}` under each mode.
+    #[test]
+    fn an_xrp_amount_from_a_number_rounds_under_the_mode() {
+        for scale in SCALES {
+            let _scale = ScaleGuard::new(scale);
+            for (mode, drops) in [(ToNearest, 7_518_784), (TowardsZero, 7_518_783), (Downward, 7_518_783), (Upward, 7_518_784)] {
+                let n = Number::new(751_878_380_596, -5, mode).unwrap();
+                assert_eq!(StAmount::from_number(true, n, mode), Ok(StAmount::drops(drops)), "{scale:?} {mode:?}");
+            }
+        }
+    }
+
+    /// `fromNumber` (STAmount.h:567-583) converts the MAGNITUDE and carries
+    /// the sign beside it: −1.5 drops under Upward is −2, where `operator
+    /// rep()` on −1.5 itself answers −1. For an IOU at Large330 the same
+    /// holds of the nineteen digits rounded to sixteen.
+    #[test]
+    fn from_number_rounds_the_magnitude_and_carries_the_sign() {
+        for scale in SCALES {
+            let _scale = ScaleGuard::new(scale);
+            let n = Number::new(-15, -1, ToNearest).unwrap();
+            assert_eq!(n.to_drops(Upward), Ok(-1), "{scale:?}");
+            assert_eq!(StAmount::from_number(true, n, Upward), Ok(xrp(true, 2)), "{scale:?}");
+            assert_eq!(StAmount::from_number(true, n, Downward), Ok(xrp(true, 1)), "{scale:?}");
+            assert_eq!(StAmount::from_number(true, n, ToNearest), Ok(xrp(true, 2)), "{scale:?}");
+            // A magnitude that rounds to nothing is the unsigned zero.
+            let tiny = Number::new(-4, -1, ToNearest).unwrap();
+            assert_eq!(StAmount::from_number(true, tiny, TowardsZero), Ok(StAmount::zero(true)), "{scale:?}");
+            // An IOU of sixteen digits is itself at either scale.
+            let v = Number::new(-1_234_567_890_123_456, -7, ToNearest).unwrap();
+            for mode in [ToNearest, TowardsZero, Downward, Upward] {
+                assert_eq!(StAmount::from_number(false, v, mode), Ok(StAmount { native: false, negative: true, mantissa: 1_234_567_890_123_456, exponent: -7 }), "{scale:?} {mode:?}");
+            }
+            assert_eq!(StAmount::from_number(false, Number::ZERO, Upward), Ok(StAmount::zero(false)), "{scale:?}");
+        }
+        let _scale = ScaleGuard::new(MantissaScale::Large330);
+        let v = Number::new(-1_000_000_000_000_065_556, -18, ToNearest).unwrap();
+        let iou = |mantissa: u64| StAmount { native: false, negative: true, mantissa, exponent: -15 };
+        assert_eq!(StAmount::from_number(false, v, Upward), Ok(iou(1_000_000_000_000_066)));
+        assert_eq!(StAmount::from_number(false, v, Downward), Ok(iou(1_000_000_000_000_065)));
+        assert_eq!(StAmount::from_number(false, v, ToNearest), Ok(iou(1_000_000_000_000_066)));
+        // `IOUAmount::fromNumber` (Number::iou_parts) keeps the sign in the rounding.
+        assert_eq!(v.iou_parts(Upward), Ok((true, 1_000_000_000_000_065, -15)));
+    }
+
+    /// `STAmount::operator=(Number)` (STAmount.cpp:332-349): the raw
+    /// mantissa and exponent, canonicalised, until SingleAssetVault or
+    /// LendingProtocol — the amendments that put Number at the Large scale —
+    /// then `fromNumber`. The two differ on a negative integral amount
+    /// under a directed mode.
+    #[test]
+    fn assigning_a_number_is_a_raw_copy_until_the_vault_amendments() {
+        let n = Number::new(-15, -1, ToNearest).unwrap();
+        assert_eq!(StAmount::assign_number(true, n, Upward), Ok(xrp(true, 1)));
+        assert_eq!(StAmount::assign_number(true, n, Downward), Ok(xrp(true, 2)));
+        let v = Number::new(1_234_567_890_123_456, -7, ToNearest).unwrap();
+        assert_eq!(StAmount::assign_number(false, v, Upward), Ok(StAmount::iou(false, 1_234_567_890_123_456, -7)));
+        let _scale = ScaleGuard::new(MantissaScale::Large330);
+        let n = Number::new(-15, -1, ToNearest).unwrap();
+        assert_eq!(StAmount::assign_number(true, n, Upward), Ok(xrp(true, 2)));
+        assert_eq!(StAmount::assign_number(true, n, Downward), Ok(xrp(true, 1)));
+        // 2^63 − 1 drops are past kMaxNativeN; one below 1e17 survives exactly.
+        let big = Number::new(99_999_999_999_999_999, 0, ToNearest).unwrap();
+        assert_eq!(StAmount::assign_number(true, big, ToNearest), Ok(StAmount::drops(99_999_999_999_999_999)));
+    }
+
+    /// STAmount.h:359-370: once Number is off the Small scale, an integral
+    /// amount built from a mantissa above int64's maximum throws
+    /// ("STAmount mantissa is too large") instead of going on.
+    #[test]
+    fn a_native_mantissa_past_int64_is_refused_off_the_small_scale() {
+        let past = i64::MAX as u128 + 1;
+        assert_eq!(StAmount::construct(true, false, past, -5, ToNearest), Ok(StAmount::drops(92_233_720_368_548)));
+        let _scale = ScaleGuard::new(MantissaScale::Large330);
+        assert_eq!(StAmount::construct(true, false, past, -5, ToNearest), Err(StError::Overflow));
+        assert_eq!(StAmount::construct(true, false, past - 1, -5, ToNearest), Ok(StAmount::drops(92_233_720_368_548)));
+        // An IOU mantissa is not held to int64.
+        assert!(StAmount::construct(false, false, past, -5, ToNearest).is_ok());
+    }
+}
+
+#[cfg(test)]
 mod gross_budget_tests {
     use super::*;
 
