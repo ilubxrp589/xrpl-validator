@@ -212,6 +212,18 @@ impl Transactor for AMMCreateTransactor {
                 return TxResult::AmmInvalidTokens;
             }
         }
+        // 6. G18 — under SingleAssetVault (AMMCreate.cpp:188-193): when none
+        //    of the pool account's 256 candidate addresses is free the create
+        //    is terADDRESS_COLLISION here, a retry, instead of doApply's
+        //    tecDUPLICATE. The other half of that block (:194-211,
+        //    tecWRONG_ASSET for an MPT issued by a pseudo-account — a vault
+        //    share) needs an MPT pool asset, which `checkExtraFeatures`
+        //    (:45-47) refuses without MPTokensV2; this engine has no MPT pools.
+        if crate::ledger::amendments::enabled(sandbox, crate::ledger::amendments::SINGLE_ASSET_VAULT)
+            && crate::tx::misc::pseudo_account_address(sandbox, &pool).is_none()
+        {
+            return TxResult::AddressCollision;
+        }
         TxResult::Success
     }
 
@@ -270,15 +282,15 @@ impl Transactor for AMMCreateTransactor {
 
         use crate::tx::offer as ox;
         // The AMM operating account is derived ripesha-style from the PARENT
-        // ledger hash and the AMM keylet (rippled ammAccountID, prefix 0;
-        // higher prefixes only on address collision). Mainnet-verified
-        // against #105666951 (rNgZoYRTk…).
-        let parent = sandbox.base().header.parent_hash;
-        let mut pre = [0u8; 66];
-        pre[2..34].copy_from_slice(&parent.0);
-        pre[34..66].copy_from_slice(&amm_hash.0);
-        let seed = crate::shamap::hash::sha512_half(&pre);
-        let amm_acct = xrpl_core::crypto::signing::public_key_to_account_id(&seed.0);
+        // ledger hash and the AMM keylet (rippled `pseudoAccountAddress`):
+        // attempt 0 — mainnet-verified against #105666951 (rNgZoYRTk…) —
+        // unless an account already sits there, then the next free of 256.
+        // With none free `createPseudoAccount` is tecDUPLICATE
+        // (AccountRootHelpers.cpp:563-567, returned by AMMCreate's
+        // applyCreate); under SingleAssetVault preclaim caught it first.
+        let Some(amm_acct) = crate::tx::misc::pseudo_account_address(sandbox, &amm_hash) else {
+            return TxResult::Duplicate;
+        };
         let amm_acct_key = keylet::account_root_key(&amm_acct);
 
         // AMM AccountRoot: lsfDisableMaster | lsfDepositAuth | lsfDefaultRipple.

@@ -1917,9 +1917,17 @@ pub(crate) fn pseudo_account_candidate(
     xrpl_core::crypto::signing::public_key_to_account_id(&seed.0)
 }
 
-/// rippled `pseudoAccountAddress` — scaffold: attempt 0 only, as before.
+/// rippled `pseudoAccountAddress` (AccountRootHelpers.cpp:499-513): the first
+/// of `kMaxAccountAttempts` = 256 candidates that has no AccountRoot; None
+/// (rippled's zero account) when every one is taken. An address is only a
+/// hash of the parent ledger and the owner object's key, so anyone who has
+/// seen the parent close can fund a candidate ahead of the transaction.
 pub(crate) fn pseudo_account_address(sandbox: &Sandbox, owner_key: &xrpl_core::types::Hash256) -> Option<[u8; 20]> {
-    Some(pseudo_account_candidate(&sandbox.base().header.parent_hash, owner_key, 0))
+    const MAX_ACCOUNT_ATTEMPTS: u16 = 256;
+    let parent = sandbox.base().header.parent_hash;
+    (0..MAX_ACCOUNT_ATTEMPTS)
+        .map(|attempt| pseudo_account_candidate(&parent, owner_key, attempt))
+        .find(|id| !sandbox.exists(&keylet::account_root_key(id)))
 }
 
 pub(crate) fn is_pseudo_account(sandbox: &Sandbox, account: &[u8; 20]) -> bool {
