@@ -77,10 +77,13 @@ pub fn fix_cleanup_3_4_0(sandbox: &Sandbox) -> bool {
 
 /// fixCleanup3_5_0 — rippled 3.5.0-rc1 (`XRPL_FIX(Cleanup3_5_0, Supported::Yes, DefaultNo)`), unknown to
 /// 3.4.1: OFF on mainnet, ON on devnet (3.5.0-rc5, read 2026-11-21). The ID is
-/// sha512Half("fixCleanup3_5_0"). Ported sites, all in the vault transactors (`tx::vault`):
+/// sha512Half("fixCleanup3_5_0"). Ported sites, in the vault transactors (`tx::vault`):
 /// VaultCreate's AssetsMaximum range check (temMALFORMED), VaultSet's (tecPRECISION_LOSS),
 /// VaultClawback's missing holder (terNO_ACCOUNT), VaultWithdraw's transfer fee between two
-/// holders. Nothing else of 3.5.0 is ported.
+/// holders; and in the loan-broker transactors (`tx::loan_broker`): LoanBrokerSet's DebtMaximum
+/// range check (tecPRECISION_LOSS), LoanBrokerDelete's transfer / authorization checks on the
+/// cover payout, its owner count released before the payout and the owner's holding created
+/// for it. Nothing else of 3.5.0 is ported.
 pub const FIX_CLEANUP_3_5_0: &str =
     "7300E10109D19BF1E87ACE63D3A79CD4ED6B9851C37D93ED94DE9BD41CF56835";
 
@@ -116,8 +119,10 @@ pub const DYNAMIC_MPT: &str =
     "58E92F338758479C06084E1B6BA366BAD8F75E5329A7F0EEAFFFDA51E5106B7F";
 
 /// SingleAssetVault / LendingProtocol — enabled on devnet, NOT on mainnet as
-/// of 2026-09-21. Their one effect on the transactors we dispatch: a
-/// pseudo-account (AMM, Vault, LoanBroker) is created with Sequence 0
+/// of 2026-11-21. SingleAssetVault gates the six vault transactors
+/// (`tx::vault`); LendingProtocol — with SingleAssetVault and MPTokensV1 —
+/// the five loan-broker transactors (`tx::loan_broker`). Either one also
+/// makes a pseudo-account (AMM, Vault, LoanBroker) start at Sequence 0
 /// instead of the ledger sequence (AccountRootHelpers.cpp:581-589).
 pub const SINGLE_ASSET_VAULT: &str =
     "81BD2619B6B3C8625AC5D0BC01DE17F06C3F0AB95C7C87C93715B87A4FD240D8";
@@ -128,7 +133,9 @@ pub const LENDING_PROTOCOL: &str =
 /// `XRPL_FEATURE(LendingProtocolV1_1, …)`, so the name hashed is
 /// "LendingProtocolV1_1"). NOT on mainnet. Vault kinds and phases, cash-basis
 /// accounting for new vaults, and the Loan / Vault immutability invariants
-/// (InvariantCheck.cpp:1189-1233). No transactor we dispatch reads it yet.
+/// (InvariantCheck.cpp:1189-1233). Read by the vault transactors (kinds,
+/// phases, sfLEVersion, VaultDelete's sfMemoData) and by LoanBrokerSet (a
+/// broker only on a closed-ended vault, LoanBrokerSet.cpp:149-161).
 pub const LENDING_PROTOCOL_V1_1: &str =
     "A360E2BFD775A5B0DCE1C36C16DF31B72735A57584FD163655D2F9564F8E7AC8";
 
