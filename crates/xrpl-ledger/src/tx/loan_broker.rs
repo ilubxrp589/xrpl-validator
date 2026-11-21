@@ -1,0 +1,841 @@
+//! The five loan-broker transactors of the LendingProtocol amendment, ported
+//! from rippled 3.4.1 `src/libxrpl/tx/transactors/lending/`:
+//!
+//! | here | rippled | type |
+//! |---|---|---|
+//! | [`LoanBrokerSetTransactor`] | LoanBrokerSet.cpp | 74 |
+//! | [`LoanBrokerDeleteTransactor`] | LoanBrokerDelete.cpp | 75 |
+//! | [`LoanBrokerCoverDepositTransactor`] | LoanBrokerCoverDeposit.cpp | 76 |
+//! | [`LoanBrokerCoverWithdrawTransactor`] | LoanBrokerCoverWithdraw.cpp | 77 |
+//! | [`LoanBrokerCoverClawbackTransactor`] | LoanBrokerCoverClawback.cpp | 78 |
+//!
+//! Each is refused temDISABLED unless LendingProtocol is enabled in the
+//! ledger (transactions.macro:887-960, `Transactor::invokePreflight`,
+//! Transactor.h:640-647) AND SingleAssetVault and MPTokensV1 are
+//! (`checkLendingProtocolDependencies`, each type's `checkExtraFeatures`):
+//! with the amendment off — mainnet today — nothing here runs past that line.
+//!
+//! # The objects
+//!
+//! A LoanBroker (ltLOAN_BROKER, `tx::protocol::LOAN_BROKER`) hangs off one
+//! Vault. It sits in TWO owner directories — its owner's (sfOwnerNode) and
+//! the vault pseudo-account's (sfVaultNode) — and has a pseudo-account of
+//! its own (sfAccount, an AccountRoot carrying sfLoanBrokerID) that holds
+//! the first-loss capital: sfCoverAvailable is that pseudo-account's holding
+//! of the vault's asset (its XRP balance, trust line or MPToken). The owner
+//! is charged two reserve units — the LoanBroker and its pseudo-account
+//! (LoanBrokerSet.cpp:255-259, LoanBrokerDelete.cpp:193-195). The broker's
+//! own sfOwnerCount counts its live Loans and is written by the Loan
+//! transactors only; here it is read (LoanBrokerDelete refuses while it is
+//! not zero).
+//!
+//! # What stands under them
+//!
+//! `tx::lending_helpers` (the LendingHelpers parts the brokers call),
+//! `tx::holding` (holdings, sends, freeze and authorization checks,
+//! `canWithdraw` / `doWithdraw`), `tx::st_number` (STNumber fields,
+//! `associateAsset`), `tx::protocol` (limits, the LoanBroker template),
+//! `tx::misc::create_pseudo_account`, `tx::vault_helpers` (the vault's kind).
+//!
+//! # Amendment arms
+//!
+//! - fixCleanup3_2_0, 3_3_0, 3_4_0 (all on at mainnet): both arms of every
+//!   branch, as rippled 3.4.1 has them;
+//! - LendingProtocolV1_1 (off at mainnet): LoanBrokerSet attaches a broker to
+//!   a closed-ended vault only (LoanBrokerSet.cpp:149-161);
+//! - fixCleanup3_5_0 (3.5.0-rc1, off at mainnet, on at devnet):
+//!   LoanBrokerSet's sfDebtMaximum range check, LoanBrokerDelete's transfer /
+//!   authorization checks on the cover payout, its owner count released
+//!   before the payout, and the owner's holding created for it.
+//!
+//! NOT ported: LendingProtocolV1_2 (`Supported::No` in 3.5.0-rc1, enabled on
+//! no network). It would hook in at: LoanBrokerSet's sfDomainID /
+//! tfLoanBrokerPrivate / lsfLoanBrokerPrivate (3.5.0-rc1
+//! LoanBrokerSet.cpp:34-38, :64-94, :123-132, :187-188, :216-223, :277-288,
+//! :360-366 — without V1_2 a LoanBrokerSet carrying sfDomainID is
+//! temDISABLED and its flag mask is the universal one), and at every
+//! `getVaultVersion(vault) == VaultVersion::FixedPrecision` branch of
+//! LoanBrokerSet (:233-235), LoanBrokerCoverDeposit (:108-114, :135-137,
+//! :172-179), LoanBrokerCoverWithdraw (:107-128, :253-256) and
+//! LoanBrokerCoverClawback (:202-209, :322-329). featureSponsor (reserve
+//! sponsors) is not ported either, as in `tx::holding`.
+//!
+//! # Rounding
+//!
+//! Outside the guards the helpers install themselves, `Number` arithmetic
+//! and `STAmount = Number` conversions run at the thread's default,
+//! ToNearest ([`AMBIENT`]).
+//!
+//! # Exceptions
+//!
+//! An `Err` of a helper is a C++ exception leaving the transactor:
+//! tefEXCEPTION (applySteps.cpp:485-488), nothing applied.
+//!
+//! # Not the transactors' job
+//!
+//! The loan-broker invariant (ValidLoanBroker, LoanBrokerInvariant.cpp) is
+//! not ported; each of the five has empty `visitInvariantEntry` /
+//! `finalizeInvariants` of its own. What it enforces after every transaction
+//! that touches a broker, its pseudo-account or the pseudo-account's holding:
+//! sfCoverAvailable equal to the pseudo-account's balance of the vault's
+//! asset (:262-289; the upper bound under fixCleanup3_1_3 and not on
+//! LoanBrokerDelete), sfDebtTotal and sfCoverAvailable not negative, a
+//! sfLoanSequence that never falls, a zero-OwnerCount broker whose
+//! pseudo-account directory is one page with at most one trust line or
+//! MPToken, and — LendingProtocolV1_1 — a broker deleted only by
+//! LoanBrokerDelete with zero OwnerCount and a DebtTotal that rounds to zero.
+//! The five transactors keep all of that by construction (cover and holding
+//! always move by the same amount), so no path was found here where
+//! rippled's final result is the invariant's; were the two ever to differ
+//! on a ledger (a holding changed behind the broker's back), rippled would
+//! answer tecINVARIANT_FAILED where this engine returns the transactor's
+//! result.
+
+use crate::flow::st_amount::StError;
+use crate::ledger::amendments::{self as am, enabled};
+use crate::ledger::directory::{owner_dir_insert, owner_dir_remove};
+use crate::ledger::keylet;
+use crate::ledger::sandbox::Sandbox;
+use crate::ledger::transactor::{Transactor, TxFields, TxResult};
+use crate::tx::holding;
+use crate::tx::lending_helpers::{self as lh, gate};
+use crate::tx::mpt::{self, AuthType, HeldAsset};
+use crate::tx::number::{Number, Rounding};
+use crate::tx::offer::{json_at, put_json};
+use crate::tx::protocol::{
+    tenth_bips_of_value, Soe, VaultKind, LOAN_BROKER, MAX_COVER_RATE, MAX_DATA_PAYLOAD_LENGTH, MAX_MANAGEMENT_FEE_RATE,
+    TF_UNIVERSAL_MASK,
+};
+use crate::tx::st_number::{associate_asset, number_field, number_from_json, round_to_asset, round_to_scale, scale, set_number_field, Amount};
+use crate::tx::vault::{
+    account_of, blob_len, credential_fields_ok, has, is_zero_key, less, obj_flags, positive, prior_balance, seq_proxy_value,
+    tx_amount, withdraw_destination, AMBIENT,
+};
+use crate::tx::vault_helpers::{self as vh, vault_asset};
+use serde_json::Value;
+use xrpl_core::types::Hash256;
+
+// ---------------------------------------------------------------------------
+// Shared plumbing
+// ---------------------------------------------------------------------------
+
+const LSF_ALLOW_TRUST_LINE_CLAWBACK: u64 = 0x8000_0000;
+const LSF_NO_FREEZE: u64 = 0x0020_0000;
+
+/// `tx[~sfLoanBrokerID]`.
+fn broker_id(tx: &TxFields) -> Option<Hash256> {
+    mpt::key_field(&tx.fields, "LoanBrokerID")
+}
+
+/// `view.read(keylet::loanBroker(id))`: the object at the key, when it is a
+/// LoanBroker (a keylet read of another type is null).
+fn read_broker(sandbox: &Sandbox, id: &Hash256) -> Option<Value> {
+    json_at(sandbox, id).filter(|o| o.get("LedgerEntryType").and_then(|t| t.as_str()) == Some("LoanBroker"))
+}
+
+/// `view.read(keylet::vault(id))`.
+fn read_vault(sandbox: &Sandbox, id: &Hash256) -> Option<Value> {
+    json_at(sandbox, id).filter(|o| o.get("LedgerEntryType").and_then(|t| t.as_str()) == Some("Vault"))
+}
+
+/// `view.read(keylet::vault(broker->at(sfVaultID)))`.
+fn vault_of(sandbox: &Sandbox, broker: &Value) -> Option<Value> {
+    read_vault(sandbox, &mpt::key_field(broker, "VaultID")?)
+}
+
+/// An unsigned integer field of a ledger object, zero when absent.
+fn uint_field(obj: &Value, field: &str) -> u64 {
+    obj.get(field).and_then(|v| v.as_u64()).unwrap_or(0)
+}
+
+/// A directory page hint (sfOwnerNode, sfVaultNode): a hex string in the
+/// engine's JSON.
+fn node_hint(obj: &Value, field: &str) -> Option<u64> {
+    obj.get(field).and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| u64::from_str_radix(s, 16).ok())))
+}
+
+/// `view.update(broker)` and `associateAsset(*broker, vaultAsset)`
+/// (STTakesAsset.cpp:13-50): the broker's asset-valued Number fields
+/// (sfDebtTotal, sfDebtMaximum, sfCoverAvailable) rounded to the asset's
+/// precision, SoeDefault fields at their default dropped, the object stored.
+/// rippled calls `associateAsset` on the SLE it has already handed to the
+/// view; the stored object is the rounded one. An amount out of the asset's
+/// range is rippled's throw there: tefEXCEPTION.
+fn store_broker(sandbox: &mut Sandbox, key: Hash256, broker: &mut Value, asset: HeldAsset) -> TxResult {
+    if associate_asset(broker, asset, AMBIENT).is_err() {
+        return TxResult::TefException;
+    }
+    if LOAN_BROKER.finish(broker).is_err() {
+        return TxResult::TefInternal;
+    }
+    put_json(sandbox, key, broker);
+    TxResult::Success
+}
+
+/// `STAmount{asset, number}` at the thread's rounding mode.
+fn amount_of(asset: HeldAsset, n: Number) -> Result<Amount, StError> {
+    Amount::from_number(asset, n, AMBIENT)
+}
+
+fn arith<T>(r: Result<T, crate::tx::number::NumberError>) -> Result<T, StError> {
+    r.map_err(|_| StError::Overflow)
+}
+
+// ---------------------------------------------------------------------------
+// LoanBrokerSet (LoanBrokerSet.cpp)
+// ---------------------------------------------------------------------------
+
+/// LoanBrokerSet (type 74): the owner of a Vault creates a LoanBroker on it
+/// — the broker, its pseudo-account and the pseudo-account's holding of the
+/// vault's asset — or, naming sfLoanBrokerID, changes an existing broker's
+/// sfData and sfDebtMaximum.
+///
+/// Fee: the plain base fee (no `calculateBaseFee` override). Reserve: a new
+/// broker raises the owner's OwnerCount by 2, for the LoanBroker and its
+/// pseudo-account (LoanBrokerSet.cpp:255-259); the pseudo-account's trust
+/// line or MPToken is counted on the pseudo-account. Directories: the broker
+/// is linked into the owner's directory (sfOwnerNode) and then into the
+/// vault pseudo-account's (sfVaultNode) (:250-253).
+pub struct LoanBrokerSetTransactor;
+
+impl Transactor for LoanBrokerSetTransactor {
+    fn preflight(&self, _tx: &TxFields) -> TxResult {
+        TxResult::Unsupported
+    }
+
+    fn preclaim(&self, _tx: &TxFields, _sandbox: &Sandbox) -> TxResult {
+        TxResult::Unsupported
+    }
+
+    fn do_apply(&self, _tx: &TxFields, _sandbox: &mut Sandbox) -> TxResult {
+        TxResult::Unsupported
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ledger::header::LedgerHeader;
+    use crate::ledger::state::LedgerState;
+    use crate::tx::dispatch::apply_on_sandbox;
+    use crate::tx::st_number::number_from_str;
+    use serde_json::json;
+
+    /// Owns the vault and the broker.
+    const OWNER: [u8; 20] = [0x11; 20];
+    /// Somebody else.
+    const BOB: [u8; 20] = [0x12; 20];
+    /// A third party.
+    const CAROL: [u8; 20] = [0x13; 20];
+    /// Issues USD and the MPT.
+    const ISSUER: [u8; 20] = [0x21; 20];
+    const USD_CODE: [u8; 20] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x55, 0x53, 0x44, 0, 0, 0, 0, 0];
+    const USD: HeldAsset = HeldAsset::Iou { currency: USD_CODE, issuer: ISSUER };
+    const BALANCE: u64 = 50_000_000;
+    const FEE: u64 = 10;
+    const LSF_DEFAULT_RIPPLE: u64 = 0x0080_0000;
+    const LSF_GLOBAL_FREEZE: u64 = 0x0040_0000;
+    const LSF_LOW_FREEZE: u64 = 0x0040_0000;
+    const LSF_HIGH_FREEZE: u64 = 0x0080_0000;
+    const LSF_REQUIRE_DEST_TAG: u64 = 0x0002_0000;
+    /// The parent ledger's close time in every test state.
+    const NOW: u32 = 1000;
+
+    /// Mainnet's rules today plus what a loan broker needs: every
+    /// fixCleanup up to 3.4.0, SingleAssetVault, LendingProtocol,
+    /// MPTokensV1, PermissionedDomains, Credentials.
+    const MAINNET_WITH_LENDING: [&str; 9] = [
+        am::FIX_CLEANUP_3_1_3, am::FIX_CLEANUP_3_2_0, am::FIX_CLEANUP_3_3_0, am::FIX_CLEANUP_3_4_0, am::SINGLE_ASSET_VAULT,
+        am::LENDING_PROTOCOL, am::MPTOKENS_V1, am::PERMISSIONED_DOMAINS, am::CREDENTIALS,
+    ];
+
+    fn rules_with(extra: &[&'static str]) -> Vec<&'static str> {
+        let mut all = MAINNET_WITH_LENDING.to_vec();
+        all.extend_from_slice(extra);
+        all
+    }
+
+    fn rules_without(off: &[&str]) -> Vec<&'static str> {
+        MAINNET_WITH_LENDING.iter().copied().filter(|a| !off.contains(a)).collect()
+    }
+
+    fn put(state: &mut LedgerState, key: Hash256, v: &Value) {
+        state.state_map.insert(key, serde_json::to_vec(v).unwrap()).unwrap();
+    }
+
+    fn root_in(state: &mut LedgerState, id: [u8; 20], flags: u64) {
+        let a = json!({
+            "LedgerEntryType": "AccountRoot", "Account": hex::encode(id), "Balance": BALANCE.to_string(),
+            "Sequence": 5, "OwnerCount": 0, "Flags": flags,
+        });
+        put(state, keylet::account_root_key(&id), &a);
+    }
+
+    fn state_with(amendments: &[&str]) -> LedgerState {
+        let mut state = LedgerState::new_unverified(LedgerHeader {
+            sequence: 100, total_coins: 100_000_000_000_000_000,
+            parent_hash: Hash256([0x77; 32]), transaction_hash: Hash256([0; 32]), account_hash: Hash256([0; 32]),
+            parent_close_time: 0, close_time: NOW, close_time_resolution: 10, close_flags: 0,
+        });
+        put(&mut state, keylet::amendments_key(), &json!({"LedgerEntryType": "Amendments", "Flags": 0, "Amendments": amendments}));
+        root_in(&mut state, OWNER, 0);
+        root_in(&mut state, BOB, 0);
+        root_in(&mut state, CAROL, 0);
+        root_in(&mut state, ISSUER, LSF_DEFAULT_RIPPLE | LSF_ALLOW_TRUST_LINE_CLAWBACK);
+        state
+    }
+
+    fn state() -> LedgerState {
+        state_with(&MAINNET_WITH_LENDING)
+    }
+
+    fn mptid(seq: u32, issuer: [u8; 20]) -> [u8; 24] {
+        let mut id = [0u8; 24];
+        id[..4].copy_from_slice(&seq.to_be_bytes());
+        id[4..].copy_from_slice(&issuer);
+        id
+    }
+
+    /// An MPT issued by ISSUER (sequence 7).
+    fn issuance(state: &mut LedgerState, flags: u64) -> [u8; 24] {
+        let id = mptid(7, ISSUER);
+        let o = json!({
+            "LedgerEntryType": "MPTokenIssuance", "Issuer": hex::encode(ISSUER), "Flags": flags, "Sequence": 7,
+            "OutstandingAmount": "0", "OwnerNode": "0",
+        });
+        put(state, keylet::mpt_issuance_key(&id), &o);
+        id
+    }
+
+    /// `holder`'s MPToken of `id` holding `amount`; the issuance's
+    /// OutstandingAmount grows by it.
+    fn token(state: &mut LedgerState, id: &[u8; 24], holder: [u8; 20], flags: u64, amount: u64) {
+        let ikey = keylet::mpt_issuance_key(id);
+        let mut t = json!({
+            "LedgerEntryType": "MPToken", "Account": hex::encode(holder), "MPTokenIssuanceID": hex::encode_upper(id),
+            "Flags": flags, "OwnerNode": "0",
+        });
+        if amount != 0 {
+            t["MPTAmount"] = json!(amount.to_string());
+            let mut i: Value = serde_json::from_slice(&state.state_map.lookup(&ikey).unwrap()).unwrap();
+            let outstanding = mpt::dec_field(&i, "OutstandingAmount") + amount;
+            i["OutstandingAmount"] = json!(outstanding.to_string());
+            put(state, ikey, &i);
+        }
+        put(state, keylet::mptoken_key(&ikey, &holder), &t);
+    }
+
+    /// A USD line between `holder` and ISSUER, the holder holding `balance`
+    /// with its own limit `limit`.
+    fn line(state: &mut LedgerState, holder: [u8; 20], flags: u64, balance: &str, limit: &str) -> Hash256 {
+        let key = keylet::ripple_state_key(&holder, &ISSUER, &USD_CODE);
+        let cur = hex::encode_upper(USD_CODE);
+        let holder_low = holder < ISSUER;
+        let (low, high) = if holder_low { (holder, ISSUER) } else { (ISSUER, holder) };
+        let stored = if holder_low || balance == "0" { balance.to_string() } else { format!("-{balance}") };
+        let (low_limit, high_limit) = if holder_low { (limit, "0") } else { ("0", limit) };
+        put(state, key, &json!({
+            "LedgerEntryType": "RippleState", "Flags": flags,
+            "Balance": {"currency": cur, "issuer": "0000000000000000000000000000000000000001", "value": stored},
+            "LowLimit": {"currency": cur, "issuer": hex::encode(low), "value": low_limit},
+            "HighLimit": {"currency": cur, "issuer": hex::encode(high), "value": high_limit},
+            "LowNode": "0", "HighNode": "0",
+        }));
+        key
+    }
+
+    fn usd_json(value: &str) -> Value {
+        json!({"currency": hex::encode_upper(USD_CODE), "issuer": hex::encode(ISSUER), "value": value})
+    }
+
+    fn usd(value: &str) -> Amount {
+        Amount::from_json(&usd_json(value)).unwrap()
+    }
+
+    fn mpt_json(id: &[u8; 24], value: u64) -> Value {
+        json!({"mpt_issuance_id": hex::encode_upper(id), "value": value.to_string()})
+    }
+
+    fn get(sb: &Sandbox, key: &Hash256) -> Option<Value> {
+        json_at(sb, key)
+    }
+
+    fn root_of(sb: &Sandbox, id: &[u8; 20]) -> Value {
+        get(sb, &keylet::account_root_key(id)).unwrap()
+    }
+
+    fn owners(sb: &Sandbox, id: &[u8; 20]) -> u64 {
+        root_of(sb, id)["OwnerCount"].as_u64().unwrap()
+    }
+
+    fn xrp_of(sb: &Sandbox, id: &[u8; 20]) -> u64 {
+        root_of(sb, id)["Balance"].as_str().unwrap().parse().unwrap()
+    }
+
+    fn dir_has(sb: &Sandbox, owner: &[u8; 20], key: &Hash256) -> bool {
+        get(sb, &keylet::owner_dir_key(owner))
+            .is_some_and(|d| d["Indexes"].as_array().is_some_and(|a| a.iter().any(|k| k == &json!(hex::encode_upper(key.0)))))
+    }
+
+    /// What `holder` holds of `asset` (freezes and authorization ignored).
+    fn holds(sb: &Sandbox, holder: &[u8; 20], asset: &HeldAsset) -> Amount {
+        holding::account_holds(sb, holder, asset, false, false)
+    }
+
+    fn n(s: &str) -> Number {
+        number_from_str(s).unwrap()
+    }
+
+    /// A transaction of `account` at the account's sequence in the test
+    /// state (5), with the type's own fields.
+    fn tx(tx_type: &str, account: [u8; 20], fields: Value) -> TxFields {
+        let mut all = json!({
+            "TransactionType": tx_type, "Account": hex::encode(account), "Fee": FEE.to_string(), "Sequence": 5,
+            "hash": "AB".repeat(32),
+        });
+        for (k, v) in fields.as_object().unwrap() {
+            all[k] = v.clone();
+        }
+        TxFields::from_json(&all).unwrap()
+    }
+
+    /// Apply on a fresh sandbox, the whole pipeline; the sandbox comes back
+    /// for inspection.
+    fn apply<'a>(state: &'a LedgerState, tx: &TxFields) -> (TxResult, Sandbox<'a>) {
+        let mut sb = Sandbox::new(state);
+        let (result, _) = apply_on_sandbox(tx, &mut sb);
+        (result, sb)
+    }
+
+    fn result(state: &LedgerState, tx: &TxFields) -> TxResult {
+        apply(state, tx).0
+    }
+
+    /// Apply and keep: the state after a transaction that must succeed.
+    fn commit(state: &mut LedgerState, tx: &TxFields) {
+        let (result, sb) = apply(state, tx);
+        assert_eq!(result, TxResult::Success, "{} must apply", tx.tx_type);
+        let mods = sb.into_modifications();
+        crate::ledger::sandbox::apply_modifications(state, mods).unwrap();
+        // The next transaction of this account in a test uses the same
+        // Sequence field; put the root's back.
+        let key = keylet::account_root_key(&tx.account);
+        let mut root: Value = serde_json::from_slice(&state.state_map.lookup(&key).unwrap()).unwrap();
+        root["Sequence"] = json!(5);
+        put(state, key, &root);
+    }
+
+    fn edit(state: &mut LedgerState, key: Hash256, change: impl FnOnce(&mut Value)) {
+        let mut v: Value = serde_json::from_slice(&state.state_map.lookup(&key).unwrap()).unwrap();
+        change(&mut v);
+        put(state, key, &v);
+    }
+
+    fn key_hex(key: &Hash256) -> String {
+        hex::encode_upper(key.0)
+    }
+
+    fn xrp_asset() -> Value {
+        json!({"currency": "XRP"})
+    }
+
+    fn usd_asset() -> Value {
+        json!({"currency": hex::encode_upper(USD_CODE), "issuer": hex::encode(ISSUER)})
+    }
+
+    /// A vault made by OWNER (sequence 5), committed: its key and
+    /// pseudo-account.
+    fn make_vault(state: &mut LedgerState, fields: Value) -> (Hash256, [u8; 20]) {
+        let key = keylet::vault_key(&OWNER, 5);
+        commit(state, &tx("VaultCreate", OWNER, fields));
+        let vault: Value = serde_json::from_slice(&state.state_map.lookup(&key).unwrap()).unwrap();
+        (key, account_of(&vault, "Account").unwrap())
+    }
+
+    /// An open-ended XRP vault of OWNER.
+    fn xrp_vault(state: &mut LedgerState) -> (Hash256, [u8; 20]) {
+        make_vault(state, json!({"Asset": xrp_asset()}))
+    }
+
+    /// An open-ended USD vault of OWNER, who holds 1000 USD (limit 100000).
+    fn usd_vault(state: &mut LedgerState) -> (Hash256, [u8; 20]) {
+        line(state, OWNER, 0, "1000", "100000");
+        make_vault(state, json!({"Asset": usd_asset()}))
+    }
+
+    /// An open-ended vault of ISSUER's MPT (transferable, clawable), of
+    /// which OWNER holds 1000.
+    fn mpt_vault(state: &mut LedgerState) -> (Hash256, [u8; 20], [u8; 24]) {
+        let id = issuance(state, mpt::LSF_MPT_CAN_TRANSFER | mpt::LSF_MPT_CAN_CLAWBACK);
+        token(state, &id, OWNER, 0, 1000);
+        let (key, pseudo) = make_vault(state, json!({"Asset": {"mpt_issuance_id": hex::encode_upper(id)}}));
+        (key, pseudo, id)
+    }
+
+    fn broker_set(account: [u8; 20], vault: &Hash256, fields: Value) -> TxFields {
+        let mut all = json!({"VaultID": key_hex(vault)});
+        for (k, v) in fields.as_object().unwrap() {
+            all[k] = v.clone();
+        }
+        tx("LoanBrokerSet", account, all)
+    }
+
+    /// The key of the broker a LoanBrokerSet of OWNER at sequence 5 makes.
+    fn broker_key() -> Hash256 {
+        keylet::loan_broker_key(&OWNER, 5)
+    }
+
+    /// A broker of OWNER on `vault`, committed: its key and pseudo-account.
+    fn make_broker(state: &mut LedgerState, vault: &Hash256, fields: Value) -> (Hash256, [u8; 20]) {
+        commit(state, &broker_set(OWNER, vault, fields));
+        let broker: Value = serde_json::from_slice(&state.state_map.lookup(&broker_key()).unwrap()).unwrap();
+        (broker_key(), account_of(&broker, "Account").unwrap())
+    }
+
+    fn broker_of(sb: &Sandbox) -> Value {
+        get(sb, &broker_key()).unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // LoanBrokerSet
+    // -----------------------------------------------------------------------
+
+    /// LoanBrokerSet.cpp:36-83, every refusal temINVALID
+    /// (LoanBroker_test.cpp:1199 "Invalid LoanBrokerSet", :872 testLoanBroker's
+    /// field-range cases).
+    #[test]
+    fn loan_broker_set_preflight() {
+        let st = state();
+        let vault = Hash256([0xAB; 32]);
+        let invalid = |fields: Value, why: &str| {
+            let (r, sb) = apply(&st, &broker_set(OWNER, &vault, fields));
+            assert_eq!(r, TxResult::InvalidTx, "{why}");
+            assert_eq!(sb.modification_count(), 0, "{why}: a tem charges nothing");
+        };
+        let passes = |fields: Value, why: &str| {
+            // Past preflight: the vault does not exist.
+            assert_eq!(result(&st, &broker_set(OWNER, &vault, fields)), TxResult::NoEntry, "{why}");
+        };
+        invalid(json!({"Data": "AB".repeat(257)}), "sfData over 256 bytes");
+        passes(json!({"Data": "AB".repeat(256)}), "sfData of 256 bytes");
+        passes(json!({"Data": ""}), "an empty sfData clears the field");
+        invalid(json!({"ManagementFeeRate": 10_001}), "a management fee above 10%");
+        passes(json!({"ManagementFeeRate": 10_000}), "a management fee of 10%");
+        invalid(json!({"CoverRateMinimum": 100_001, "CoverRateLiquidation": 1}), "a minimum cover rate above 100%");
+        invalid(json!({"CoverRateMinimum": 1, "CoverRateLiquidation": 100_001}), "a liquidation cover rate above 100%");
+        passes(json!({"CoverRateMinimum": 100_000, "CoverRateLiquidation": 100_000}), "both cover rates at 100%");
+        invalid(json!({"DebtMaximum": "-1"}), "a negative sfDebtMaximum");
+        invalid(json!({"DebtMaximum": "9223372036854775808"}), "sfDebtMaximum above the largest MPT amount");
+        passes(json!({"DebtMaximum": "9223372036854775807"}), "sfDebtMaximum at the largest MPT amount");
+        passes(json!({"DebtMaximum": "0"}), "a zero sfDebtMaximum");
+        // The fixed fields cannot accompany sfLoanBrokerID.
+        let broker = "CD".repeat(32);
+        for fixed in ["ManagementFeeRate", "CoverRateMinimum", "CoverRateLiquidation"] {
+            let mut fields = json!({"LoanBrokerID": broker});
+            fields[fixed] = json!(0);
+            invalid(fields, fixed);
+        }
+        invalid(json!({"LoanBrokerID": "00".repeat(32)}), "a zero sfLoanBrokerID");
+        let (r, _) = apply(&st, &broker_set(OWNER, &Hash256([0; 32]), json!({})));
+        assert_eq!(r, TxResult::InvalidTx, "a zero sfVaultID");
+        // Both cover rates zero, or neither.
+        invalid(json!({"CoverRateMinimum": 1}), "a minimum cover rate without a liquidation rate");
+        invalid(json!({"CoverRateLiquidation": 1}), "a liquidation rate without a minimum cover rate");
+        invalid(json!({"CoverRateMinimum": 1, "CoverRateLiquidation": 0}), "one of the two rates zero");
+        passes(json!({"CoverRateMinimum": 0, "CoverRateLiquidation": 0}), "both rates zero");
+    }
+
+    /// LoanBrokerSet.cpp:30-34 with LendingHelpers.cpp:69-82
+    /// (LoanBroker_test.cpp:84 "Disabled"); sfDomainID is 3.5.0-rc1
+    /// LoanBrokerSet.cpp:34-38 — LendingProtocolV1_2, not ported.
+    #[test]
+    fn loan_broker_set_extra_features() {
+        let vault = Hash256([0xAB; 32]);
+        for off in [am::LENDING_PROTOCOL, am::SINGLE_ASSET_VAULT, am::MPTOKENS_V1] {
+            let st = state_with(&rules_without(&[off]));
+            assert_eq!(result(&st, &broker_set(OWNER, &vault, json!({}))), TxResult::Disabled, "{off}");
+        }
+        let st = state();
+        assert_eq!(result(&st, &broker_set(OWNER, &vault, json!({"DomainID": "D0".repeat(32)}))), TxResult::Disabled);
+    }
+
+    /// LoanBrokerSet.cpp:93-146: the vault, its owner; changing a broker —
+    /// the broker, its vault, its owner, sfDebtMaximum against sfDebtTotal
+    /// (LoanBroker_test.cpp:1379 "testLoanBrokerSetDebtMaximum").
+    #[test]
+    fn loan_broker_set_preclaim_vault_and_broker() {
+        let mut st = state();
+        let (vault, _) = xrp_vault(&mut st);
+        assert_eq!(result(&st, &broker_set(OWNER, &Hash256([0xAB; 32]), json!({}))), TxResult::NoEntry, "no such vault");
+        assert_eq!(result(&st, &broker_set(BOB, &vault, json!({}))), TxResult::NoPermission, "not the vault's owner");
+        // A broker id naming nothing, or something that is not a broker.
+        assert_eq!(result(&st, &broker_set(OWNER, &vault, json!({"LoanBrokerID": "CD".repeat(32)}))), TxResult::NoEntry);
+        assert_eq!(result(&st, &broker_set(OWNER, &vault, json!({"LoanBrokerID": key_hex(&vault)}))), TxResult::NoEntry);
+
+        let (broker, _) = make_broker(&mut st, &vault, json!({}));
+        let update = |st: &LedgerState, fields: Value| {
+            let mut all = json!({"LoanBrokerID": key_hex(&broker)});
+            for (k, v) in fields.as_object().unwrap() {
+                all[k] = v.clone();
+            }
+            result(st, &broker_set(OWNER, &vault, all))
+        };
+        assert_eq!(update(&st, json!({})), TxResult::Success, "a no-op change");
+        // The broker's vault cannot be changed: a second vault of OWNER's.
+        let mut other = st.clone();
+        let second = keylet::vault_key(&OWNER, 6);
+        let mut copy: Value = serde_json::from_slice(&other.state_map.lookup(&vault).unwrap()).unwrap();
+        copy["Sequence"] = json!(6);
+        put(&mut other, second, &copy);
+        assert_eq!(
+            result(&other, &broker_set(OWNER, &second, json!({"LoanBrokerID": key_hex(&broker)}))),
+            TxResult::NoPermission,
+            "another vault than the broker's"
+        );
+        // The broker of someone else, on a vault that is the submitter's.
+        let mut foreign = st.clone();
+        edit(&mut foreign, broker, |b| b["Owner"] = json!(hex::encode(BOB)));
+        assert_eq!(
+            result(&foreign, &broker_set(OWNER, &vault, json!({"LoanBrokerID": key_hex(&broker)}))),
+            TxResult::NoPermission,
+            "not the broker's owner"
+        );
+        // sfDebtMaximum may not fall below what is lent; zero lifts the limit.
+        let mut lent = st.clone();
+        edit(&mut lent, broker, |b| b["DebtTotal"] = json!("500"));
+        assert_eq!(update(&lent, json!({"DebtMaximum": "499"})), TxResult::LimitExceeded);
+        assert_eq!(update(&lent, json!({"DebtMaximum": "500"})), TxResult::Success);
+        assert_eq!(update(&lent, json!({"DebtMaximum": "0"})), TxResult::Success);
+    }
+
+    /// LoanBrokerSet.cpp:149-171: a new broker — LendingProtocolV1_1's
+    /// closed-ended vault, an asset the pseudo-account can hold, a vault
+    /// pseudo-account that is not frozen (LoanBroker_test.cpp:1623 "RIPD-4466
+    /// - LoanBrokerSet disallows frozen vaults").
+    #[test]
+    fn loan_broker_set_preclaim_new_broker() {
+        // LendingProtocolV1_1: open-ended is refused, closed-ended passes.
+        let mut st = state_with(&rules_with(&[am::LENDING_PROTOCOL_V1_1]));
+        let (vault, _) = xrp_vault(&mut st);
+        assert_eq!(result(&st, &broker_set(OWNER, &vault, json!({}))), TxResult::NoPermission, "an open-ended vault under V1_1");
+        let mut st = state_with(&rules_with(&[am::LENDING_PROTOCOL_V1_1]));
+        let (vault, _) = make_vault(
+            &mut st,
+            json!({"Asset": xrp_asset(), "VaultKind": 1, "SubscriptionDate": NOW + 100, "RedemptionDate": NOW + 5000}),
+        );
+        assert_eq!(result(&st, &broker_set(OWNER, &vault, json!({}))), TxResult::Success, "a closed-ended vault under V1_1");
+        // Without V1_1 an open-ended vault hosts a broker.
+        let mut st = state();
+        let (vault, _) = xrp_vault(&mut st);
+        assert_eq!(result(&st, &broker_set(OWNER, &vault, json!({}))), TxResult::Success);
+
+        // canAddHolding: the MPT lost lsfMPTCanTransfer; the IOU's issuer
+        // lost lsfDefaultRipple.
+        let mut st = state();
+        let (vault, _, id) = mpt_vault(&mut st);
+        edit(&mut st, keylet::mpt_issuance_key(&id), |i| i["Flags"] = json!(mpt::LSF_MPT_CAN_CLAWBACK));
+        assert_eq!(result(&st, &broker_set(OWNER, &vault, json!({}))), TxResult::NoAuth);
+        let mut st = state();
+        let (vault, _) = usd_vault(&mut st);
+        edit(&mut st, keylet::account_root_key(&ISSUER), |a| a["Flags"] = json!(0));
+        assert_eq!(result(&st, &broker_set(OWNER, &vault, json!({}))), TxResult::NoRipple);
+
+        // The vault pseudo-account frozen: globally, or on its own line; an
+        // MPT locked.
+        let mut st = state();
+        let (vault, _) = usd_vault(&mut st);
+        edit(&mut st, keylet::account_root_key(&ISSUER), |a| a["Flags"] = json!(LSF_DEFAULT_RIPPLE | LSF_GLOBAL_FREEZE));
+        assert_eq!(result(&st, &broker_set(OWNER, &vault, json!({}))), TxResult::Frozen);
+        let mut st = state();
+        let (vault, vault_pseudo) = usd_vault(&mut st);
+        let issuer_side = if ISSUER < vault_pseudo { LSF_LOW_FREEZE } else { LSF_HIGH_FREEZE };
+        edit(&mut st, keylet::ripple_state_key(&vault_pseudo, &ISSUER, &USD_CODE), |l| {
+            l["Flags"] = json!(l["Flags"].as_u64().unwrap() | issuer_side)
+        });
+        assert_eq!(result(&st, &broker_set(OWNER, &vault, json!({}))), TxResult::Frozen);
+        let mut st = state();
+        let (vault, _, id) = mpt_vault(&mut st);
+        edit(&mut st, keylet::mpt_issuance_key(&id), |i| i["Flags"] = json!(i["Flags"].as_u64().unwrap() | mpt::LSF_MPT_LOCKED));
+        assert_eq!(result(&st, &broker_set(OWNER, &vault, json!({}))), TxResult::Locked);
+    }
+
+    /// LoanBrokerSet.cpp:173-183 (`getValueFields`): sfDebtMaximum must be
+    /// exact in the vault's asset; fixCleanup3_5_0 (3.5.0-rc1 :225-242)
+    /// turns the out-of-range throw into tecPRECISION_LOSS.
+    #[test]
+    fn loan_broker_set_debt_maximum_must_be_representable_in_the_asset() {
+        let mut st = state();
+        let (vault, _) = xrp_vault(&mut st);
+        let with = |st: &LedgerState, maximum: &str| result(st, &broker_set(OWNER, &vault, json!({"DebtMaximum": maximum})));
+        assert_eq!(with(&st, "1000"), TxResult::Success);
+        assert_eq!(with(&st, "1000.5"), TxResult::PrecisionLoss, "half a drop");
+        // Above the XRP range (1e17 drops): STAmount throws.
+        assert_eq!(with(&st, "200000000000000000"), TxResult::TefException);
+        let mut st = state_with(&rules_with(&[am::FIX_CLEANUP_3_5_0]));
+        let (vault, _) = xrp_vault(&mut st);
+        let with = |st: &LedgerState, maximum: &str| result(st, &broker_set(OWNER, &vault, json!({"DebtMaximum": maximum})));
+        assert_eq!(with(&st, "200000000000000000"), TxResult::PrecisionLoss);
+        assert_eq!(with(&st, "1000.5"), TxResult::PrecisionLoss);
+        assert_eq!(with(&st, "1000"), TxResult::Success);
+        // An IOU holds sixteen digits; an MPT whole units.
+        let mut st = state();
+        let (vault, _) = usd_vault(&mut st);
+        let with = |st: &LedgerState, maximum: &str| result(st, &broker_set(OWNER, &vault, json!({"DebtMaximum": maximum})));
+        assert_eq!(with(&st, "1000.5"), TxResult::Success);
+        assert_eq!(with(&st, "1234567890123456"), TxResult::Success);
+        assert_eq!(with(&st, "12345678901234567"), TxResult::PrecisionLoss, "seventeen digits");
+        let mut st = state();
+        let (vault, _, _) = mpt_vault(&mut st);
+        assert_eq!(result(&st, &broker_set(OWNER, &vault, json!({"DebtMaximum": "0.5"}))), TxResult::PrecisionLoss);
+    }
+
+    /// LoanBrokerSet.cpp:222-292 on an XRP vault (LoanBroker_test.cpp:216-270,
+    /// the broker and its pseudo-account after create): the LoanBroker, its
+    /// pseudo-account, both directory links, two reserve units.
+    #[test]
+    fn loan_broker_set_creates_the_broker_its_pseudo_account_and_both_directory_links() {
+        let mut st = state();
+        let (vault, vault_pseudo) = xrp_vault(&mut st);
+        let owners_before = owners(&Sandbox::new(&st), &OWNER);
+        let (r, sb) = apply(&st, &broker_set(OWNER, &vault, json!({})));
+        assert_eq!(r, TxResult::Success);
+        let key = broker_key();
+        let broker = get(&sb, &key).expect("the LoanBroker");
+        let pseudo = account_of(&broker, "Account").unwrap();
+        assert_eq!(
+            broker,
+            json!({
+                "LedgerEntryType": "LoanBroker", "Flags": 0, "Sequence": 5, "LoanSequence": 1,
+                "VaultID": key_hex(&vault), "Owner": hex::encode(OWNER), "Account": hex::encode(pseudo),
+                "OwnerNode": "0", "VaultNode": "0",
+            }),
+            "sfOwnerCount, sfDebtTotal, sfCoverAvailable and the optional fields are at their defaults: absent"
+        );
+        assert_eq!(Some(pseudo), crate::tx::misc::pseudo_account_address(&Sandbox::new(&st), &key));
+        assert_ne!(pseudo, vault_pseudo);
+        // The pseudo-account: no key, deposits by authorization only,
+        // sequence 0, nothing owned (XRP needs no holding).
+        let root = root_of(&sb, &pseudo);
+        assert_eq!(root["Flags"], json!(0x0010_0000u64 | 0x0080_0000 | 0x0100_0000));
+        assert_eq!((root["Sequence"].as_u64(), root["Balance"].as_str(), root["OwnerCount"].as_u64()), (Some(0), Some("0"), Some(0)));
+        assert_eq!(root["LoanBrokerID"], json!(key_hex(&key)));
+        assert!(root.get("VaultID").is_none() && root.get("AMMID").is_none());
+        assert!(!sb.exists(&keylet::owner_dir_key(&pseudo)));
+        // Two directories; two reserve units on the owner; the fee.
+        assert!(dir_has(&sb, &OWNER, &key), "the owner's directory");
+        assert!(dir_has(&sb, &vault_pseudo, &key), "the vault pseudo-account's directory");
+        assert_eq!(owners(&sb, &OWNER), owners_before + 2);
+        assert_eq!(owners(&sb, &vault_pseudo), owners(&Sandbox::new(&st), &vault_pseudo), "the vault pseudo-account is charged nothing");
+        assert_eq!(xrp_of(&sb, &OWNER), xrp_of(&Sandbox::new(&st), &OWNER) - FEE);
+        // The vault itself is not written.
+        assert!(sb.modifications().get(&vault).is_none());
+    }
+
+    /// LoanBrokerSet.cpp:267-287: the optional fields are stored, zeros are
+    /// not (SoeDefault); an IOU or MPT vault's broker pseudo-account gets
+    /// its holding (LoanBroker_test.cpp:253: OwnerCount 1 unless XRP).
+    #[test]
+    fn loan_broker_set_stores_the_optional_fields_and_gives_the_pseudo_account_its_holding() {
+        let mut st = state();
+        let (vault, _) = usd_vault(&mut st);
+        let fields = json!({
+            "Data": "abcdef", "ManagementFeeRate": 123, "DebtMaximum": "5000.25", "CoverRateMinimum": 1000, "CoverRateLiquidation": 500,
+        });
+        let (r, sb) = apply(&st, &broker_set(OWNER, &vault, fields));
+        assert_eq!(r, TxResult::Success);
+        let broker = broker_of(&sb);
+        assert_eq!(broker["Data"], json!("ABCDEF"));
+        assert_eq!((&broker["ManagementFeeRate"], &broker["CoverRateMinimum"], &broker["CoverRateLiquidation"]), (&json!(123), &json!(1000), &json!(500)));
+        assert!(number_field(&broker, "DebtMaximum") == n("5000.25"));
+        let pseudo = account_of(&broker, "Account").unwrap();
+        // A zero-balance, zero-limit line of the pseudo-account, counted on it.
+        let line_key = keylet::ripple_state_key(&pseudo, &ISSUER, &USD_CODE);
+        assert!(sb.exists(&line_key), "the pseudo-account's trust line");
+        assert!(holds(&sb, &pseudo, &USD).is_zero());
+        assert_eq!(owners(&sb, &pseudo), 1);
+        assert!(dir_has(&sb, &pseudo, &line_key));
+
+        // Zeros and an empty sfData are the defaults: not stored.
+        let fields = json!({"Data": "", "ManagementFeeRate": 0, "DebtMaximum": "0", "CoverRateMinimum": 0, "CoverRateLiquidation": 0});
+        let (r, sb) = apply(&st, &broker_set(OWNER, &vault, fields));
+        assert_eq!(r, TxResult::Success);
+        let broker = broker_of(&sb);
+        for field in ["Data", "ManagementFeeRate", "DebtMaximum", "CoverRateMinimum", "CoverRateLiquidation"] {
+            assert!(broker.get(field).is_none(), "{field}");
+        }
+
+        // An MPT vault: the pseudo-account's MPToken.
+        let mut st = state();
+        let (vault, _, id) = mpt_vault(&mut st);
+        let (r, sb) = apply(&st, &broker_set(OWNER, &vault, json!({})));
+        assert_eq!(r, TxResult::Success);
+        let pseudo = account_of(&broker_of(&sb), "Account").unwrap();
+        assert!(sb.exists(&keylet::mptoken_key(&keylet::mpt_issuance_key(&id), &pseudo)), "the pseudo-account's MPToken");
+        assert_eq!(owners(&sb, &pseudo), 1);
+    }
+
+    /// LoanBrokerSet.cpp:255-259: the two reserve units are judged against
+    /// the balance before the fee; a failure keeps only the fee.
+    #[test]
+    fn loan_broker_set_needs_the_reserve_for_two_more_objects() {
+        let mut st = state();
+        let (vault, _) = xrp_vault(&mut st);
+        let sb = Sandbox::new(&st);
+        let count = owners(&sb, &OWNER);
+        let needed = crate::ledger::fees::account_reserve(&sb, count + 2);
+        let poor = |st: &LedgerState, balance: u64| {
+            let mut st = st.clone();
+            edit(&mut st, keylet::account_root_key(&OWNER), |a| a["Balance"] = json!(balance.to_string()));
+            st
+        };
+        let short = poor(&st, needed - 1);
+        let (r, sb) = apply(&short, &broker_set(OWNER, &vault, json!({})));
+        assert_eq!(r, TxResult::InsufficientReserve);
+        assert!(!sb.exists(&broker_key()), "nothing of the broker stays");
+        assert_eq!(owners(&sb, &OWNER), count);
+        assert_eq!(xrp_of(&sb, &OWNER), needed - 1 - FEE, "the fee is charged");
+        let enough = poor(&st, needed);
+        assert_eq!(result(&enough, &broker_set(OWNER, &vault, json!({}))), TxResult::Success, "exactly the reserve, before the fee");
+    }
+
+    /// LoanBrokerSet.cpp:194-221 (LoanBroker_test.cpp:480-497: "Verify that
+    /// fields get removed when set to default values"): sfData and
+    /// sfDebtMaximum change; nothing else does.
+    #[test]
+    fn loan_broker_set_changes_data_and_debt_maximum_of_an_existing_broker() {
+        let mut st = state();
+        let (vault, _) = usd_vault(&mut st);
+        let (broker, pseudo) = make_broker(&mut st, &vault, json!({"ManagementFeeRate": 7, "Data": "AA", "DebtMaximum": "100"}));
+        let before = broker_of(&Sandbox::new(&st));
+        let owners_before = owners(&Sandbox::new(&st), &OWNER);
+        let update = |fields: Value| {
+            let mut all = json!({"LoanBrokerID": key_hex(&broker)});
+            for (k, v) in fields.as_object().unwrap() {
+                all[k] = v.clone();
+            }
+            apply(&st, &broker_set(OWNER, &vault, all))
+        };
+        let (r, sb) = update(json!({"Data": "bbcc", "DebtMaximum": "250.5"}));
+        assert_eq!(r, TxResult::Success);
+        let after = broker_of(&sb);
+        assert_eq!(after["Data"], json!("BBCC"));
+        assert!(number_field(&after, "DebtMaximum") == n("250.5"));
+        for field in ["ManagementFeeRate", "Sequence", "LoanSequence", "VaultID", "Owner", "Account", "OwnerNode", "VaultNode", "Flags"] {
+            assert_eq!(after[field], before[field], "{field}");
+        }
+        assert_eq!(owners(&sb, &OWNER), owners_before, "no reserve change");
+        assert_eq!(account_of(&after, "Account"), Some(pseudo));
+        // Only one of the two.
+        let (_, sb) = update(json!({"Data": "DD"}));
+        assert!(number_field(&broker_of(&sb), "DebtMaximum") == n("100"));
+        // The defaults remove the fields.
+        let (r, sb) = update(json!({"Data": "", "DebtMaximum": "0"}));
+        assert_eq!(r, TxResult::Success);
+        let after = broker_of(&sb);
+        assert!(after.get("Data").is_none() && after.get("DebtMaximum").is_none());
+        // A no-op still rewrites (and re-threads) the broker.
+        let (r, sb) = update(json!({}));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(broker_of(&sb), before);
+    }
+}
