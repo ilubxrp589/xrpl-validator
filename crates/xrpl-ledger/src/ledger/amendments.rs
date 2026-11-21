@@ -92,6 +92,34 @@ pub const SINGLE_ASSET_VAULT: &str =
 pub const LENDING_PROTOCOL: &str =
     "565B90CA1AB2B9D42208ED10884188C64F9E19083DECB9634AAF06EB03299509";
 
+/// LendingProtocolV1_1 — rippled 3.4.1 (`features.macro:22`,
+/// `XRPL_FEATURE(LendingProtocolV1_1, …)`, so the name hashed is
+/// "LendingProtocolV1_1"). NOT on mainnet. Vault kinds and phases, cash-basis
+/// accounting for new vaults, and the Loan / Vault immutability invariants
+/// (InvariantCheck.cpp:1189-1233). No transactor we dispatch reads it yet.
+pub const LENDING_PROTOCOL_V1_1: &str =
+    "A360E2BFD775A5B0DCE1C36C16DF31B72735A57584FD163655D2F9564F8E7AC8";
+
+/// PermissionedDomains — on mainnet. With SingleAssetVault it makes
+/// `sfDomainID` legal on MPTokenIssuanceCreate / MPTokenIssuanceSet
+/// (MPTokenIssuanceCreate.cpp:33-36, MPTokenIssuanceSet.cpp:29-32).
+pub const PERMISSIONED_DOMAINS: &str =
+    "A730EB18A9D4BB52502C898589558B4CCEB4BE10044500EE5581137A2E80E849";
+
+/// MPTokensV2 — `Supported::No` in 3.4.1 (features.macro:26), on no network.
+/// Named only where rippled ORs it into a SingleAssetVault gate (MPT
+/// `requireAuth`'s pseudo-account exemption, MPTokenHelpers.cpp:388-389);
+/// nothing else of it is ported.
+pub const MPTOKENS_V2: &str =
+    "BE2D87DF21B690ED1497B593FDC013CC04276302380B1BD50A033DCF8DEFB2EB";
+
+/// ConfidentialTransfer — not on mainnet. Named only where rippled ORs it
+/// into a SingleAssetVault gate (MPT `accountHolds`, TokenHelpers.cpp:452-455;
+/// MPTokenIssuanceSet's no-op refusal, MPTokenIssuanceSet.cpp:82-89) and
+/// where its fields are refused without it (MPTokenIssuanceSet.cpp:61-66).
+pub const CONFIDENTIAL_TRANSFER: &str =
+    "2110E4A19966E2EF517C0A8C56A5F35099D7665B0BB89D7B126B30D50B86AAD5";
+
 /// XRPFees — on mainnet: fees and reserves in drops (BaseFeeDrops, ReserveBaseDrops, ReserveIncrementDrops)
 /// replace the legacy fee units. Gates SetFee's fields (Change::preclaim, Change::applyFee).
 pub const XRP_FEES: &str =
@@ -187,6 +215,24 @@ mod tests {
                 assert_eq!(mantissa_scale(), MantissaScale::Large330);
             }
             assert_eq!(mantissa_scale(), MantissaScale::Small);
+        }
+    }
+
+    /// The IDs named for the vault port are the hashes of their registered
+    /// names (features.macro: `XRPL_FEATURE(Name, …)` hashes "Name").
+    #[test]
+    fn the_vault_port_amendment_ids_are_the_hashes_of_their_names() {
+        for (name, id) in [
+            ("SingleAssetVault", SINGLE_ASSET_VAULT),
+            ("LendingProtocol", LENDING_PROTOCOL),
+            ("LendingProtocolV1_1", LENDING_PROTOCOL_V1_1),
+            ("PermissionedDomains", PERMISSIONED_DOMAINS),
+            ("MPTokensV2", MPTOKENS_V2),
+            ("ConfidentialTransfer", CONFIDENTIAL_TRANSFER),
+            ("DynamicMPT", DYNAMIC_MPT),
+        ] {
+            let h = crate::shamap::hash::sha512_half(name.as_bytes());
+            assert_eq!(hex::encode_upper(h.0), id, "{name}");
         }
     }
 

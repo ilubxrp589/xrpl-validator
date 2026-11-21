@@ -82,6 +82,12 @@ pub enum TxResult {
     TecPseudoAccount,
     /// tecAMM_ACCOUNT — Clawback from an AMM account.
     TecAmmAccount,
+    /// tecWRONG_ASSET — AMMCreate on an MPT whose issuer is a pseudo-account (a vault
+    /// share), under SingleAssetVault (AMMCreate.cpp:194-211).
+    WrongAsset,
+    /// tecINTERNAL — a state rippled marks unreachable (the asset-check recursion past
+    /// kMaxAssetCheckDepth). Older sites of this engine answer `Malformed` for it.
+    TecInternal,
     /// terNO_DELEGATE_PERMISSION — a delegated transaction the Delegate
     /// object does not authorize (never filed; a refused Batch inner).
     NoDelegatePermission,
@@ -268,6 +274,8 @@ pub enum TxResult {
     InvalidTx,
     /// temBAD_SRC_ACCOUNT — a pseudo-transaction whose Account is not the zero account (Change::preflight).
     BadSrcAccount,
+    /// temDISABLED — a field or mode whose amendment is not enabled (`checkExtraFeatures`).
+    Disabled,
 
     // tef — failed, not applied
     /// Sequence already past.
@@ -286,7 +294,13 @@ pub enum TxResult {
     /// tefALREADY — EnableAmendment: the amendment is already enabled, already has the majority it claims, or
     /// lacks the one it loses (Change::applyAmendment).
     Already,
+    /// tefINTERNAL — a ledger object rippled expects is missing (a vault share's issuer
+    /// root or its vault, MPTokenHelpers.cpp:420, :426).
+    TefInternal,
     // ter — retry, not applied
+    /// terADDRESS_COLLISION — none of a pseudo-account's 256 candidate addresses is free
+    /// (AMMCreate.cpp:190-193 under SingleAssetVault).
+    AddressCollision,
     /// terPRE_SEQ — a future Sequence.
     PreSeq,
     /// terPRE_TICKET — a TicketSequence not yet created.
@@ -338,6 +352,8 @@ impl TxResult {
             | TxResult::TecFailedProcessing
             | TxResult::TecPseudoAccount
             | TxResult::TecAmmAccount
+            | TxResult::WrongAsset
+            | TxResult::TecInternal
             | TxResult::TooSoon
             | TxResult::PathPartial
             | TxResult::DstTagNeeded
@@ -422,6 +438,11 @@ impl TxResult {
             TxResult::TecFailedProcessing => "tecFAILED_PROCESSING",
             TxResult::TecPseudoAccount => "tecPSEUDO_ACCOUNT",
             TxResult::TecAmmAccount => "tecAMM_ACCOUNT",
+            TxResult::WrongAsset => "tecWRONG_ASSET",
+            TxResult::TecInternal => "tecINTERNAL",
+            TxResult::Disabled => "temDISABLED",
+            TxResult::TefInternal => "tefINTERNAL",
+            TxResult::AddressCollision => "terADDRESS_COLLISION",
             TxResult::PathPartial => "tecPATH_PARTIAL",
             TxResult::DstTagNeeded => "tecDST_TAG_NEEDED",
             TxResult::ArrayTooLarge => "tecARRAY_TOO_LARGE",
@@ -876,6 +897,27 @@ pub fn apply_common(tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
     sandbox.write(acct_key, serialized);
 
     TxResult::Success
+}
+
+#[cfg(test)]
+mod vault_port_code_tests {
+    use super::*;
+
+    /// The result codes the vault port's gates on existing transactions
+    /// return (TER.h), each in its class: only a tec claims the fee.
+    #[test]
+    fn the_gate_result_codes_are_spelled_and_classed_as_rippled_has_them() {
+        for (r, code, claimed) in [
+            (TxResult::WrongAsset, "tecWRONG_ASSET", true),
+            (TxResult::TecInternal, "tecINTERNAL", true),
+            (TxResult::Disabled, "temDISABLED", false),
+            (TxResult::TefInternal, "tefINTERNAL", false),
+            (TxResult::AddressCollision, "terADDRESS_COLLISION", false),
+        ] {
+            assert_eq!(r.code_str(), code);
+            assert_eq!(r.is_claimed(), claimed, "{code}");
+        }
+    }
 }
 
 #[cfg(test)]
