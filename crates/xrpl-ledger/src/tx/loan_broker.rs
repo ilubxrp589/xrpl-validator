@@ -198,17 +198,216 @@ fn arith<T>(r: Result<T, crate::tx::number::NumberError>) -> Result<T, StError> 
 /// vault pseudo-account's (sfVaultNode) (:250-253).
 pub struct LoanBrokerSetTransactor;
 
+impl LoanBrokerSetTransactor {
+    /// `LoanBrokerSet::checkExtraFeatures` (LoanBrokerSet.cpp:30-34; the
+    /// sfDomainID line is 3.5.0-rc1's :34-38). sfDomainID is a
+    /// LendingProtocolV1_2 field: 3.4.1's transaction format does not have
+    /// it at all, and 3.5.0-rc1 refuses it while V1_2 is off — which it is
+    /// on every network.
+    fn extra_features(tx: &TxFields, rules: &Sandbox) -> bool {
+        if has(tx, "DomainID") {
+            return false;
+        }
+        lh::check_lending_protocol_dependencies(rules, tx)
+    }
+
+    /// `getValueFields()` (LoanBrokerSet.cpp:85-91): sfDebtMaximum must be
+    /// representable in the vault's asset — whole units for XRP and MPT,
+    /// sixteen digits for an IOU: tecPRECISION_LOSS. A value the asset
+    /// cannot hold at all (XRP above 1e17 drops) throws in 3.4.1
+    /// (tefEXCEPTION); fixCleanup3_5_0 refuses it tecPRECISION_LOSS
+    /// (3.5.0-rc1 :225-242).
+    fn check_value_fields(tx: &TxFields, sandbox: &Sandbox, asset: HeldAsset) -> TxResult {
+        let Some(value) = tx.fields.get("DebtMaximum").and_then(number_from_json) else { return TxResult::Success };
+        match amount_of(asset, value) {
+            Ok(amount) if amount.number() == value => TxResult::Success,
+            Ok(_) => TxResult::PrecisionLoss,
+            Err(_) if am::fix_cleanup_3_5_0(sandbox) => TxResult::PrecisionLoss,
+            Err(_) => TxResult::TefException,
+        }
+    }
+}
+
 impl Transactor for LoanBrokerSetTransactor {
-    fn preflight(&self, _tx: &TxFields) -> TxResult {
-        TxResult::Unsupported
+    /// `LoanBrokerSet::preflight` (LoanBrokerSet.cpp:36-83); every refusal
+    /// is temINVALID.
+    fn preflight(&self, tx: &TxFields) -> TxResult {
+        // sfData: empty is allowed (it clears the field), else at most 256 bytes.
+        if blob_len(tx, "Data").is_some_and(|len| len > MAX_DATA_PAYLOAD_LENGTH) {
+            return TxResult::InvalidTx;
+        }
+        let uint = |field: &str| tx.fields.get(field).map(|v| v.as_u64());
+        // `validNumericRange(value, max)`: absent is fine.
+        let in_range = |field: &str, max: u64| match uint(field) {
+            None => true,
+            Some(value) => value.is_some_and(|v| v <= max),
+        };
+        if !in_range("ManagementFeeRate", MAX_MANAGEMENT_FEE_RATE as u64) {
+            return TxResult::InvalidTx;
+        }
+        if !in_range("CoverRateMinimum", MAX_COVER_RATE as u64) {
+            return TxResult::InvalidTx;
+        }
+        if !in_range("CoverRateLiquidation", MAX_COVER_RATE as u64) {
+            return TxResult::InvalidTx;
+        }
+        // 0 <= DebtMaximum <= kMaxMpTokenAmount.
+        if let Some(maximum) = tx.fields.get("DebtMaximum") {
+            let Some(maximum) = number_from_json(maximum) else { return TxResult::InvalidTx };
+            let Ok(largest) = Number::from_parts(false, mpt::MAX_MPT_AMOUNT as u128, 0, AMBIENT) else { return TxResult::InvalidTx };
+            if (maximum.negative && !maximum.is_zero()) || maximum > largest {
+                return TxResult::InvalidTx;
+            }
+        }
+        if has(tx, "LoanBrokerID") {
+            // The fixed fields cannot be given when changing a broker.
+            if has(tx, "ManagementFeeRate") || has(tx, "CoverRateMinimum") || has(tx, "CoverRateLiquidation") {
+                return TxResult::InvalidTx;
+            }
+            if broker_id(tx).is_none_or(|id| is_zero_key(&id)) {
+                return TxResult::InvalidTx;
+            }
+        }
+        // sfVaultID is required by the format; zero is refused here.
+        if mpt::key_field(&tx.fields, "VaultID").is_none_or(|id| is_zero_key(&id)) {
+            return TxResult::InvalidTx;
+        }
+        // Both cover rates zero, or neither.
+        let zero = |field: &str| uint(field).flatten().unwrap_or(0) == 0;
+        if zero("CoverRateMinimum") != zero("CoverRateLiquidation") {
+            return TxResult::InvalidTx;
+        }
+        TxResult::Success
     }
 
-    fn preclaim(&self, _tx: &TxFields, _sandbox: &Sandbox) -> TxResult {
-        TxResult::Unsupported
+    fn preflight_in(&self, tx: &TxFields, rules: &Sandbox) -> TxResult {
+        // 3.5.0-rc1's `getFlagsMask` (:123-132) is tfLoanBrokerSetMask only
+        // under LendingProtocolV1_2; otherwise the universal mask, as 3.4.1.
+        gate(tx, rules, Self::extra_features(tx, rules), TF_UNIVERSAL_MASK).unwrap_or_else(|| self.preflight(tx))
     }
 
-    fn do_apply(&self, _tx: &TxFields, _sandbox: &mut Sandbox) -> TxResult {
-        TxResult::Unsupported
+    /// `LoanBrokerSet::preclaim` (LoanBrokerSet.cpp:93-186).
+    fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        let account = tx.account;
+        let Some(vault_id) = mpt::key_field(&tx.fields, "VaultID") else { return TxResult::TefInternal };
+        let Some(vault) = read_vault(sandbox, &vault_id) else { return TxResult::NoEntry };
+        let Some(asset) = vault_asset(&vault) else { return TxResult::TefInternal };
+        if account_of(&vault, "Owner") != Some(account) {
+            return TxResult::NoPermission;
+        }
+        if let Some(id) = broker_id(tx) {
+            // Changing an existing broker.
+            let Some(broker) = read_broker(sandbox, &id) else { return TxResult::NoEntry };
+            // The vault of a broker cannot be changed.
+            if mpt::key_field(&broker, "VaultID") != Some(vault_id) {
+                return TxResult::NoPermission;
+            }
+            if account_of(&broker, "Owner") != Some(account) {
+                return TxResult::NoPermission;
+            }
+            if let Some(maximum) = tx.fields.get("DebtMaximum").and_then(number_from_json) {
+                // Not below what is already lent; zero means no limit.
+                if !maximum.is_zero() && maximum < number_field(&broker, "DebtTotal") {
+                    return TxResult::LimitExceeded;
+                }
+            }
+        } else {
+            // LendingProtocolV1_1: only a closed-ended vault may host a
+            // broker — the lending protocol relies on its Subscription /
+            // Investment / Redemption phases.
+            if enabled(sandbox, am::LENDING_PROTOCOL_V1_1) && vh::vault_kind(&vault) != VaultKind::ClosedEnded {
+                return TxResult::NoPermission;
+            }
+            let holdable = holding::can_add_holding(sandbox, &asset);
+            if holdable != TxResult::Success {
+                return holdable;
+            }
+            let Some(vault_account) = account_of(&vault, "Account") else { return TxResult::TefInternal };
+            let frozen = holding::check_frozen(sandbox, &vault_account, &asset);
+            if frozen != TxResult::Success {
+                return frozen;
+            }
+        }
+        Self::check_value_fields(tx, sandbox, asset)
+    }
+
+    /// `LoanBrokerSet::doApply` (LoanBrokerSet.cpp:188-295).
+    fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        let data = tx.fields.get("Data").and_then(|d| d.as_str()).map(|d| d.to_uppercase());
+        let maximum = tx.fields.get("DebtMaximum").and_then(number_from_json);
+        if let Some(id) = broker_id(tx) {
+            // Change an existing broker.
+            let Some(mut broker) = read_broker(sandbox, &id) else { return TxResult::TefBadLedger };
+            let Some(vault) = vault_of(sandbox, &broker) else { return TxResult::TecInternal };
+            let Some(asset) = vault_asset(&vault) else { return TxResult::TecInternal };
+            // An empty sfData / a zero sfDebtMaximum is the default: the
+            // field goes (SoeDefault).
+            if let Some(data) = data {
+                broker["Data"] = Value::String(data);
+            }
+            if let Some(maximum) = maximum {
+                set_number_field(&mut broker, "DebtMaximum", maximum, Soe::Default);
+            }
+            return store_broker(sandbox, id, &mut broker, asset);
+        }
+
+        // Create a broker on the vault.
+        let Some(vault_id) = mpt::key_field(&tx.fields, "VaultID") else { return TxResult::TefBadLedger };
+        let Some(vault) = read_vault(sandbox, &vault_id) else { return TxResult::TefBadLedger };
+        let (Some(vault_account), Some(asset)) = (account_of(&vault, "Account"), vault_asset(&vault)) else {
+            return TxResult::TefBadLedger;
+        };
+        let account = tx.account;
+        let sequence = seq_proxy_value(tx);
+        let Some(owner) = json_at(sandbox, &keylet::account_root_key(&account)) else { return TxResult::TefBadLedger };
+        let prior = prior_balance(sandbox, tx);
+        let broker_key = keylet::loan_broker_key(&account, sequence);
+
+        // dirLink: the owner's directory, then the vault pseudo-account's.
+        let owner_node = owner_dir_insert(sandbox, &account, &broker_key);
+        let vault_node = owner_dir_insert(sandbox, &vault_account, &broker_key);
+
+        // The LoanBroker and its pseudo-account count as two owned objects;
+        // the reserve is judged with both already counted.
+        let owner_count = uint_field(&owner, "OwnerCount") + 2;
+        crate::tx::offer::owner_count_add(sandbox, &account, 2);
+        if prior < crate::ledger::fees::account_reserve(sandbox, owner_count) {
+            return TxResult::InsufficientReserve;
+        }
+
+        let pseudo = match crate::tx::misc::create_pseudo_account(sandbox, &broker_key, crate::tx::misc::PseudoOwner::LoanBroker) {
+            Ok(pseudo) => pseudo,
+            Err(refused) => return refused,
+        };
+        let held = holding::add_empty_holding(sandbox, &pseudo, prior, &asset);
+        if held != TxResult::Success {
+            return held;
+        }
+
+        let mut broker = serde_json::json!({
+            "LedgerEntryType": "LoanBroker",
+            "Flags": 0,
+            "Sequence": sequence,
+            "VaultID": hex::encode_upper(vault_id.0),
+            "Owner": hex::encode(account),
+            "Account": hex::encode(pseudo),
+            "OwnerNode": format!("{owner_node:x}"),
+            "VaultNode": format!("{vault_node:x}"),
+            // The broker's loans are numbered from 1.
+            "LoanSequence": 1,
+        });
+        if let Some(data) = data {
+            broker["Data"] = Value::String(data);
+        }
+        for field in ["ManagementFeeRate", "CoverRateMinimum", "CoverRateLiquidation"] {
+            if let Some(rate) = tx.fields.get(field) {
+                broker[field] = rate.clone();
+            }
+        }
+        if let Some(maximum) = maximum {
+            set_number_field(&mut broker, "DebtMaximum", maximum, Soe::Default);
+        }
+        store_broker(sandbox, broker_key, &mut broker, asset)
     }
 }
 
