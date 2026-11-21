@@ -1016,6 +1016,7 @@ mod tests {
         vec![
             tx("VaultCreate", OWNER, json!({"Asset": xrp_asset()})),
             tx("VaultDeposit", OWNER, json!({"VaultID": vault, "Amount": "100"})),
+            tx("VaultWithdraw", OWNER, json!({"VaultID": vault, "Amount": "100"})),
         ]
     }
 
@@ -1770,5 +1771,404 @@ mod tests {
         assert_eq!(result(&st, &deposit(BOB, &key, json!("10"))), TxResult::InsufficientReserve);
         root_in(&mut st, BOB, 0, json!({"OwnerCount": 1, "Balance": "1500000"}));
         assert_eq!(result(&st, &deposit(BOB, &key, json!("10"))), TxResult::Success);
+    }
+
+    // -----------------------------------------------------------------------
+    // VaultWithdraw
+    // -----------------------------------------------------------------------
+
+    fn withdraw(account: [u8; 20], key: &Hash256, amount: Value) -> TxFields {
+        tx("VaultWithdraw", account, json!({"VaultID": vault_hex(key), "Amount": amount}))
+    }
+
+    fn withdraw_to(account: [u8; 20], key: &Hash256, amount: Value, destination: [u8; 20]) -> TxFields {
+        tx("VaultWithdraw", account, json!({"VaultID": vault_hex(key), "Amount": amount, "Destination": hex::encode(destination)}))
+    }
+
+    /// An XRP vault holding BOB's deposit of `drops`.
+    fn xrp_vault_with_deposit(state: &mut LedgerState, drops: u64) -> (Hash256, [u8; 20], [u8; 24]) {
+        let made = make_vault(state, json!({"Asset": xrp_asset()}));
+        commit(state, &deposit(BOB, &made.0, json!(drops.to_string())));
+        made
+    }
+
+    /// VaultWithdraw.cpp:33-38, :52-76 (VaultValidation_test.cpp:315
+    /// "withdraw to bad destination", :487 "invalid withdraw amount").
+    #[test]
+    fn vault_withdraw_preflight() {
+        let st = state();
+        let key = Hash256([0xAB; 32]);
+        assert_eq!(result(&st, &withdraw(BOB, &Hash256([0; 32]), json!("100"))), TxResult::Malformed);
+        for amount in [json!("0"), json!("-1"), usd_json("0"), usd_json("-5")] {
+            assert_eq!(result(&st, &withdraw(BOB, &key, amount.clone())), TxResult::BadAmount, "{amount}");
+        }
+        assert_eq!(result(&st, &withdraw_to(BOB, &key, json!("100"), [0u8; 20])), TxResult::Malformed, "a zero Destination");
+        let with_ids = |ids: Value| {
+            let mut t = withdraw(BOB, &key, json!("100"));
+            t.fields["CredentialIDs"] = ids;
+            t
+        };
+        assert_eq!(result(&st, &with_ids(json!([]))), TxResult::Malformed, "an empty array");
+        let nine: Vec<String> = (1..=9u8).map(|i| hex::encode_upper([i; 32])).collect();
+        assert_eq!(result(&st, &with_ids(json!(nine))), TxResult::Malformed, "more than eight");
+        assert_eq!(result(&st, &with_ids(json!(["C1".repeat(32), "C1".repeat(32)]))), TxResult::Malformed, "a duplicate");
+        assert_eq!(result(&st, &with_ids(json!(["00".repeat(32)]))), TxResult::Malformed, "a zero id (fixCleanup3_4_0)");
+        assert_eq!(result(&st, &with_ids(json!(["C1".repeat(32)]))), TxResult::NoEntry, "well-formed: on to preclaim");
+        assert_eq!(result(&st, &withdraw(BOB, &key, json!("100"))), TxResult::NoEntry, "VaultValidation_test.cpp:624");
+        // sfCredentialIDs needs Credentials and fixCleanup3_4_0.
+        for off in [am::CREDENTIALS, am::FIX_CLEANUP_3_4_0] {
+            let st = state_with(&rules_without(&[off]));
+            assert_eq!(result(&st, &with_ids(json!(["C1".repeat(32)]))), TxResult::Disabled);
+            assert_eq!(result(&st, &withdraw(BOB, &key, json!("100"))), TxResult::NoEntry);
+        }
+    }
+
+    /// VaultWithdraw.cpp:277-589 on an XRP vault: by assets and by shares;
+    /// the last withdrawal empties the vault and takes a non-owner's MPToken
+    /// with it.
+    #[test]
+    fn vault_withdraw_xrp_by_assets_and_by_shares() {
+        let mut st = state();
+        let (key, pseudo, share) = xrp_vault_with_deposit(&mut st, 1000);
+        let (r, sb) = apply(&st, &withdraw(BOB, &key, json!("400")));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(shares_of(&sb, &share, &BOB), Some(600));
+        assert_eq!(outstanding(&sb, &share), 600);
+        assert_eq!(xrp_of(&sb, &pseudo), 600);
+        assert_eq!(xrp_of(&sb, &BOB), BALANCE - 1000 - FEE + 400);
+        let vault = get(&sb, &key).unwrap();
+        assert_eq!((&vault["AssetsTotal"], &vault["AssetsAvailable"]), (&json!("600"), &json!("600")));
+
+        let (r, sb) = apply(&st, &withdraw(BOB, &key, mpt_json(&share, 250)));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(shares_of(&sb, &share, &BOB), Some(750));
+        assert_eq!(xrp_of(&sb, &pseudo), 750);
+
+        // Everything: the totals go (SoeDefault at zero), BOB's MPToken too.
+        let (r, sb) = apply(&st, &withdraw(BOB, &key, mpt_json(&share, 1000)));
+        assert_eq!(r, TxResult::Success);
+        let vault = get(&sb, &key).unwrap();
+        assert!(vault.get("AssetsTotal").is_none() && vault.get("AssetsAvailable").is_none());
+        assert_eq!(shares_of(&sb, &share, &BOB), None, "the emptied MPToken is removed");
+        assert_eq!(owners(&sb, &BOB), 0);
+        assert_eq!(outstanding(&sb, &share), 0);
+        assert_eq!(xrp_of(&sb, &pseudo), 0);
+        assert_eq!(xrp_of(&sb, &BOB), BALANCE - FEE);
+
+        // More shares than held; a holder of none; the wrong asset.
+        assert_eq!(result(&st, &withdraw(BOB, &key, mpt_json(&share, 1001))), TxResult::InsufficientFunds);
+        assert_eq!(result(&st, &withdraw(BOB, &key, json!("1001"))), TxResult::InsufficientFunds);
+        assert_eq!(result(&st, &withdraw(CAROL, &key, json!("10"))), TxResult::InsufficientFunds);
+        assert_eq!(result(&st, &withdraw(BOB, &key, usd_json("10"))), TxResult::WrongAsset);
+
+        // The owner's MPToken stays when emptied (:556-559).
+        let mut st = state();
+        let (key, _, share) = make_vault(&mut st, json!({"Asset": xrp_asset()}));
+        commit(&mut st, &deposit(OWNER, &key, json!("500")));
+        let (r, sb) = apply(&st, &withdraw(OWNER, &key, json!("500")));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(shares_of(&sb, &share, &OWNER), Some(0));
+        assert_eq!(owners(&sb, &OWNER), 3);
+    }
+
+    /// The exchange after the vault has earned (1500 drops behind 1000
+    /// shares). fixCleanup3_4_0 truncates the shares for a fixed-asset
+    /// withdrawal — 100 drops burn floor(66.67) = 66 shares and pay 99;
+    /// before it they round to nearest — 67 shares, paying 100.5 → 100.
+    #[test]
+    fn vault_withdraw_rounding_of_shares() {
+        for (fix340, shares_left, paid) in [(true, 1000 - 66, 99u64), (false, 1000 - 67, 100)] {
+            let rules = if fix340 { MAINNET_WITH_VAULTS.to_vec() } else { rules_without(&[am::FIX_CLEANUP_3_4_0]) };
+            let mut st = state_with(&rules);
+            let (key, pseudo, share) = xrp_vault_with_deposit(&mut st, 1000);
+            edit(&mut st, key, |v| {
+                v["AssetsTotal"] = json!("1500");
+                v["AssetsAvailable"] = json!("1500");
+            });
+            edit(&mut st, keylet::account_root_key(&pseudo), |v| v["Balance"] = json!("1500"));
+            let (r, sb) = apply(&st, &withdraw(BOB, &key, json!("100")));
+            assert_eq!(r, TxResult::Success, "fix340 {fix340}");
+            assert_eq!(shares_of(&sb, &share, &BOB), Some(shares_left), "fix340 {fix340}");
+            assert_eq!(xrp_of(&sb, &pseudo), 1500 - paid, "fix340 {fix340}");
+            // Less than one share's worth: nothing to burn.
+            let want = if fix340 { TxResult::PrecisionLoss } else { TxResult::Success };
+            assert_eq!(result(&st, &withdraw(BOB, &key, json!("1"))), want, "fix340 {fix340}: 0.67 share");
+        }
+    }
+
+    /// An unrealized loss (VaultWithdraw.cpp:40-50, :495-538). Total 1000,
+    /// loss 200, available 800, BOB the only shareholder with 1000 shares.
+    /// - fixCleanup3_2_0: BOB's rate ignores the loss — 500 shares pay 500.
+    ///   All 1000 would pay 1000 with 800 on hand: tecINSUFFICIENT_FUNDS.
+    /// - before it the loss is subtracted: 500 shares pay 400.
+    /// - a second shareholder ends the waiver.
+    #[test]
+    fn vault_withdraw_with_unrealized_loss() {
+        let lossy = |rules: &[&str], second_holder: bool| {
+            let mut st = state_with(rules);
+            let (key, pseudo, share) = xrp_vault_with_deposit(&mut st, 1000);
+            if second_holder {
+                commit(&mut st, &deposit(CAROL, &key, json!("1000")));
+            }
+            let total = if second_holder { 2000 } else { 1000 };
+            edit(&mut st, key, |v| {
+                v["LossUnrealized"] = json!("200");
+                v["AssetsAvailable"] = json!((total - 200).to_string());
+            });
+            edit(&mut st, keylet::account_root_key(&pseudo), |v| v["Balance"] = json!((total - 200).to_string()));
+            (st, key, pseudo, share)
+        };
+        let (st, key, pseudo, share) = lossy(&MAINNET_WITH_VAULTS, false);
+        let (r, sb) = apply(&st, &withdraw(BOB, &key, mpt_json(&share, 500)));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(xrp_of(&sb, &pseudo), 300, "500 paid: the sole shareholder's loss is waived");
+        assert_eq!(result(&st, &withdraw(BOB, &key, mpt_json(&share, 1000))), TxResult::InsufficientFunds);
+
+        let (st, key, pseudo, share) = lossy(&rules_without(&[am::FIX_CLEANUP_3_2_0]), false);
+        let (r, sb) = apply(&st, &withdraw(BOB, &key, mpt_json(&share, 500)));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(xrp_of(&sb, &pseudo), 400, "400 paid: (1000 - 200) x 500 / 1000");
+
+        let (st, key, pseudo, share) = lossy(&MAINNET_WITH_VAULTS, true);
+        let (r, sb) = apply(&st, &withdraw(BOB, &key, mpt_json(&share, 500)));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(xrp_of(&sb, &pseudo), 1800 - 450, "(2000 - 200) x 500 / 2000");
+    }
+
+    /// The destination (View.cpp:438-533, VaultWithdraw.cpp:136-145,
+    /// :201-206): it must exist (tecNO_DST), have its tag if it requires one
+    /// (tecDST_TAG_NEEDED), accept the submitter if it has DepositAuth
+    /// (tecNO_PERMISSION), and not be a pseudo-account (tecPSEUDO_ACCOUNT
+    /// under fixCleanup3_4_0; its DepositAuth refuses before the fix).
+    #[test]
+    fn vault_withdraw_to_a_destination() {
+        const LSF_REQUIRE_DEST_TAG: u64 = 0x0002_0000;
+        const LSF_DEPOSIT_AUTH: u64 = 0x0100_0000;
+        let mut st = state();
+        let (key, pseudo, share) = xrp_vault_with_deposit(&mut st, 1000);
+        let (r, sb) = apply(&st, &withdraw_to(BOB, &key, json!("400"), CAROL));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(xrp_of(&sb, &CAROL), BALANCE + 400);
+        assert_eq!(xrp_of(&sb, &BOB), BALANCE - 1000 - FEE);
+        assert_eq!(shares_of(&sb, &share, &BOB), Some(600));
+        assert_eq!(result(&st, &withdraw_to(BOB, &key, json!("400"), [0x99; 20])), TxResult::NoDst);
+        assert_eq!(result(&st, &withdraw_to(BOB, &key, json!("400"), pseudo)), TxResult::TecPseudoAccount);
+
+        root_in(&mut st, CAROL, LSF_REQUIRE_DEST_TAG, json!({}));
+        assert_eq!(result(&st, &withdraw_to(BOB, &key, json!("400"), CAROL)), TxResult::DstTagNeeded);
+        let mut tagged = withdraw_to(BOB, &key, json!("400"), CAROL);
+        tagged.fields["DestinationTag"] = json!(7);
+        assert_eq!(result(&st, &tagged), TxResult::Success);
+
+        root_in(&mut st, CAROL, LSF_DEPOSIT_AUTH, json!({}));
+        assert_eq!(result(&st, &withdraw_to(BOB, &key, json!("400"), CAROL)), TxResult::NoPermission);
+        put(&mut st, keylet::deposit_preauth_key(&CAROL, &BOB), &json!({
+            "LedgerEntryType": "DepositPreauth", "Account": hex::encode(CAROL), "Authorize": hex::encode(BOB), "Flags": 0, "OwnerNode": "0",
+        }));
+        assert_eq!(result(&st, &withdraw_to(BOB, &key, json!("400"), CAROL)), TxResult::Success);
+
+        let st2 = {
+            let mut st = state_with(&rules_without(&[am::FIX_CLEANUP_3_4_0]));
+            let made = xrp_vault_with_deposit(&mut st, 1000);
+            (st, made)
+        };
+        let (st_old, (key, pseudo, _)) = st2;
+        assert_eq!(result(&st_old, &withdraw_to(BOB, &key, json!("400"), pseudo)), TxResult::NoPermission, "DepositAuth, before the fix");
+    }
+
+    /// An IOU vault (VaultWithdraw.cpp:201-215; View.cpp:535-598): to oneself
+    /// the trust line is created if it is gone; a third party must already
+    /// hold one (tecNO_LINE, a strong check) and have room under its limit
+    /// (tecNO_LINE again, `withdrawToDestExceedsLimit`).
+    #[test]
+    fn vault_withdraw_iou() {
+        let mut st = state();
+        line(&mut st, BOB, 0, "500", "1000");
+        let (key, pseudo, share) = make_vault(&mut st, json!({"Asset": usd_asset()}));
+        commit(&mut st, &deposit(BOB, &key, usd_json("500")));
+        // The deposit emptied BOB's line; with a limit it is not in its
+        // default state and stays.
+        let (r, sb) = apply(&st, &withdraw(BOB, &key, usd_json("200")));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(usd_held(&sb, &BOB), usd("200"));
+        assert_eq!(usd_held(&sb, &pseudo), usd("300"));
+        assert_eq!(shares_of(&sb, &share, &BOB), Some(300_000_000));
+
+        // CAROL has no line.
+        assert_eq!(result(&st, &withdraw_to(BOB, &key, usd_json("200"), CAROL)), TxResult::NoLine);
+        // With a line but a limit of 150: 200 does not fit.
+        line(&mut st, CAROL, 0, "0", "150");
+        assert_eq!(result(&st, &withdraw_to(BOB, &key, usd_json("200"), CAROL)), TxResult::NoLine);
+        let (r, sb) = apply(&st, &withdraw_to(BOB, &key, usd_json("150"), CAROL));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(usd_held(&sb, &CAROL), usd("150"));
+        // To the issuer: always.
+        let (r, sb) = apply(&st, &withdraw_to(BOB, &key, usd_json("500"), ISSUER));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(usd_held(&sb, &pseudo), usd("0"));
+
+        // BOB's line deleted meanwhile: a withdrawal to himself re-creates it.
+        let line_key = keylet::ripple_state_key(&BOB, &ISSUER, &USD_CODE);
+        st.state_map.delete(&line_key).unwrap();
+        let (r, sb) = apply(&st, &withdraw(BOB, &key, usd_json("200")));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(usd_held(&sb, &BOB), usd("200"));
+        assert_eq!(owners(&sb, &BOB), 2, "the share MPToken and the new line");
+    }
+
+    /// fixCleanup3_5_0 (3.5.0-rc1 VaultWithdraw.cpp:55-73, :361, :557-563):
+    /// a holder withdrawing to ANOTHER holder pays the asset's transfer fee.
+    /// Rate 1.25: asking 100 USD burns the shares of 125, the vault pays out
+    /// 125 and the destination receives 100. To oneself, to the issuer, or
+    /// before the fix: no fee.
+    #[test]
+    fn vault_withdraw_transfer_fee_under_fix_cleanup_3_5_0() {
+        let build = |rules: &[&str]| {
+            let mut st = state_with(rules);
+            root_in(&mut st, ISSUER, LSF_DEFAULT_RIPPLE, json!({"TransferRate": 1_250_000_000u64}));
+            line(&mut st, BOB, 0, "500", "1000");
+            line(&mut st, CAROL, 0, "0", "1000");
+            let made = make_vault(&mut st, json!({"Asset": usd_asset()}));
+            commit(&mut st, &deposit(BOB, &made.0, usd_json("500")));
+            (st, made)
+        };
+        let (st, (key, pseudo, share)) = build(&rules_with(&[am::FIX_CLEANUP_3_5_0]));
+        let (r, sb) = apply(&st, &withdraw_to(BOB, &key, usd_json("100"), CAROL));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(usd_held(&sb, &CAROL), usd("100"));
+        assert_eq!(usd_held(&sb, &pseudo), usd("375"), "the vault paid 125");
+        assert_eq!(shares_of(&sb, &share, &BOB), Some(375_000_000));
+        assert_eq!(get(&sb, &key).unwrap()["AssetsTotal"], json!("375"));
+        // By shares: 125,000,000 shares are worth 125; 100 arrive.
+        let (r, sb) = apply(&st, &withdraw_to(BOB, &key, mpt_json(&share, 125_000_000), CAROL));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(usd_held(&sb, &CAROL), usd("100"));
+        assert_eq!(usd_held(&sb, &pseudo), usd("375"));
+        // To oneself and to the issuer: parity.
+        let (_, sb) = apply(&st, &withdraw(BOB, &key, usd_json("100")));
+        assert_eq!(usd_held(&sb, &pseudo), usd("400"));
+        let (_, sb) = apply(&st, &withdraw_to(BOB, &key, usd_json("100"), ISSUER));
+        assert_eq!(usd_held(&sb, &pseudo), usd("400"));
+
+        let (st, (key, pseudo, share)) = build(&MAINNET_WITH_VAULTS);
+        let (r, sb) = apply(&st, &withdraw_to(BOB, &key, usd_json("100"), CAROL));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(usd_held(&sb, &CAROL), usd("100"));
+        assert_eq!(usd_held(&sb, &pseudo), usd("400"), "3.4.1: every withdrawal waives the fee");
+        assert_eq!(shares_of(&sb, &share, &BOB), Some(400_000_000));
+    }
+
+    /// Freezes (VaultWithdraw.cpp:250-273). Under fixCleanup3_3_0
+    /// (`checkWithdrawFreeze`) a holder whose line the issuer froze still
+    /// withdraws to itself and to the issuer, not to a third party; a frozen
+    /// vault line or a global freeze stops all but the path to the issuer.
+    /// Before the fix a frozen destination, or shares frozen through the
+    /// asset, refuse.
+    #[test]
+    fn vault_withdraw_freezes() {
+        let build = |rules: &[&str]| {
+            let mut st = state_with(rules);
+            line(&mut st, BOB, 0, "500", "1000");
+            line(&mut st, CAROL, 0, "0", "1000");
+            let made = make_vault(&mut st, json!({"Asset": usd_asset()}));
+            commit(&mut st, &deposit(BOB, &made.0, usd_json("500")));
+            (st, made)
+        };
+        let bob_line = keylet::ripple_state_key(&BOB, &ISSUER, &USD_CODE);
+        let (mut st, (key, pseudo, _)) = build(&MAINNET_WITH_VAULTS);
+        edit(&mut st, bob_line, |l| l["Flags"] = json!(l["Flags"].as_u64().unwrap() | LSF_HIGH_FREEZE));
+        assert_eq!(result(&st, &withdraw(BOB, &key, usd_json("100"))), TxResult::Success, "a frozen holder takes its own funds out");
+        assert_eq!(result(&st, &withdraw_to(BOB, &key, usd_json("100"), CAROL)), TxResult::Frozen);
+        assert_eq!(result(&st, &withdraw_to(BOB, &key, usd_json("100"), ISSUER)), TxResult::Success);
+        let vault_line = keylet::ripple_state_key(&pseudo, &ISSUER, &USD_CODE);
+        let freeze = if ISSUER > pseudo { LSF_HIGH_FREEZE } else { LSF_LOW_FREEZE };
+        let (mut st, (key, _, _)) = build(&MAINNET_WITH_VAULTS);
+        edit(&mut st, vault_line, |l| l["Flags"] = json!(l["Flags"].as_u64().unwrap() | freeze));
+        assert_eq!(result(&st, &withdraw(BOB, &key, usd_json("100"))), TxResult::Frozen, "the vault's line is frozen");
+        assert_eq!(result(&st, &withdraw_to(BOB, &key, usd_json("100"), ISSUER)), TxResult::Success);
+        let (mut st, (key, _, _)) = build(&MAINNET_WITH_VAULTS);
+        root_in(&mut st, ISSUER, LSF_DEFAULT_RIPPLE | LSF_GLOBAL_FREEZE, json!({}));
+        assert_eq!(result(&st, &withdraw(BOB, &key, usd_json("100"))), TxResult::Frozen);
+        assert_eq!(result(&st, &withdraw_to(BOB, &key, usd_json("100"), ISSUER)), TxResult::Success);
+
+        // Before fixCleanup3_3_0: the destination's plain freeze refuses,
+        // even a withdrawal to oneself.
+        let old = rules_without(&[am::FIX_CLEANUP_3_3_0]);
+        let (mut st, (key, _, _)) = build(&old);
+        edit(&mut st, bob_line, |l| l["Flags"] = json!(l["Flags"].as_u64().unwrap() | LSF_HIGH_FREEZE));
+        assert_eq!(result(&st, &withdraw(BOB, &key, usd_json("100"))), TxResult::Frozen);
+        let (mut st, (key, _, _)) = build(&old);
+        edit(&mut st, vault_line, |l| l["Flags"] = json!(l["Flags"].as_u64().unwrap() | freeze));
+        assert_eq!(result(&st, &withdraw(BOB, &key, usd_json("100"))), TxResult::Locked, "the shares are frozen through the asset");
+    }
+
+    /// fixCleanup3_4_0 (VaultWithdraw.cpp:217-248): a private vault pays a
+    /// third party only if submitter and destination are both in its domain
+    /// — tecNO_AUTH — and to oneself or the asset's issuer regardless.
+    #[test]
+    fn vault_withdraw_private_vault_to_a_third_party() {
+        let build = |rules: &[&str]| {
+            let mut st = state_with(rules);
+            let (domain, _) = domain_with_member(&mut st, BOB, None);
+            let made = make_vault(&mut st, json!({"Asset": xrp_asset(), "Flags": TF_VAULT_PRIVATE, "DomainID": hex::encode_upper(domain.0)}));
+            commit(&mut st, &deposit(BOB, &made.0, json!("1000")));
+            (st, made)
+        };
+        let (mut st, (key, _, _)) = build(&MAINNET_WITH_VAULTS);
+        assert_eq!(result(&st, &withdraw(BOB, &key, json!("100"))), TxResult::Success);
+        assert_eq!(result(&st, &withdraw_to(BOB, &key, json!("100"), CAROL)), TxResult::NoAuth, "CAROL is not in the domain");
+        let kind = hex::decode("4B5943").unwrap();
+        put(&mut st, crate::tx::credential::credential_key(&CAROL, &ISSUER, &kind), &json!({
+            "LedgerEntryType": "Credential", "Subject": hex::encode(CAROL), "Issuer": hex::encode(ISSUER), "CredentialType": "4B5943",
+            "Flags": 0x0001_0000, "IssuerNode": "0", "SubjectNode": "0",
+        }));
+        assert_eq!(result(&st, &withdraw_to(BOB, &key, json!("100"), CAROL)), TxResult::Success);
+        // BOB loses his credential: he still withdraws to himself, not to CAROL.
+        st.state_map.delete(&crate::tx::credential::credential_key(&BOB, &ISSUER, &kind)).unwrap();
+        assert_eq!(result(&st, &withdraw(BOB, &key, json!("100"))), TxResult::Success);
+        assert_eq!(result(&st, &withdraw_to(BOB, &key, json!("100"), CAROL)), TxResult::NoAuth);
+
+        let (st, (key, _, _)) = build(&rules_without(&[am::FIX_CLEANUP_3_4_0]));
+        assert_eq!(result(&st, &withdraw_to(BOB, &key, json!("100"), CAROL)), TxResult::Success, "before the fix: no domain check");
+    }
+
+    /// VaultWithdraw.cpp:90-98 under LendingProtocolV1_1: no withdrawal in a
+    /// closed-ended vault's Investment phase (tecTOO_SOON); before and after
+    /// it, yes.
+    #[test]
+    fn vault_withdraw_closed_ended_phases() {
+        for (subscription, redemption, want) in [
+            (NOW + 100, NOW + 5000, TxResult::Success),
+            (NOW - 1, NOW + 5000, TxResult::TooSoon),
+            (NOW - 500, NOW + 1, TxResult::TooSoon),
+            (NOW - 500, NOW, TxResult::Success),
+        ] {
+            let mut st = state_with(&rules_with(&[am::LENDING_PROTOCOL_V1_1]));
+            let (key, _, _) = make_vault(&mut st, json!({
+                "Asset": xrp_asset(), "VaultKind": 1, "SubscriptionDate": NOW + 100, "RedemptionDate": NOW + 5000,
+            }));
+            commit(&mut st, &deposit(BOB, &key, json!("1000")));
+            edit(&mut st, key, |v| {
+                v["SubscriptionDate"] = json!(subscription);
+                v["RedemptionDate"] = json!(redemption);
+            });
+            assert_eq!(result(&st, &withdraw(BOB, &key, json!("100"))), want, "{subscription} {redemption}");
+        }
+    }
+
+    /// An MPT vault whose asset is not transferable any more
+    /// (VaultWithdraw.cpp:109-119): fixCleanup3_2_0 waives lsfMPTCanTransfer
+    /// for a withdrawal; before it the funds are stuck (tecNO_AUTH).
+    #[test]
+    fn vault_withdraw_waives_mpt_can_transfer() {
+        for (rules, want) in [(MAINNET_WITH_VAULTS.to_vec(), TxResult::Success), (rules_without(&[am::FIX_CLEANUP_3_2_0]), TxResult::NoAuth)] {
+            let mut st = state_with(&rules);
+            let id = issuance(&mut st, mpt::LSF_MPT_CAN_TRANSFER, json!({}));
+            token(&mut st, &id, BOB, 0, 900);
+            let (key, _, _) = make_vault(&mut st, json!({"Asset": {"mpt_issuance_id": hex::encode_upper(id)}}));
+            commit(&mut st, &deposit(BOB, &key, mpt_json(&id, 300)));
+            edit(&mut st, keylet::mpt_issuance_key(&id), |i| i["Flags"] = json!(0));
+            assert_eq!(result(&st, &withdraw(BOB, &key, mpt_json(&id, 100))), want);
+        }
     }
 }
