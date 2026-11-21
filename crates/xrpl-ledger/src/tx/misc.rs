@@ -439,6 +439,11 @@ impl Transactor for DepositPreauthTransactor {
             if !sandbox.exists(&keylet::account_root_key(&authorized)) {
                 return TxResult::NoTarget;
             }
+            // fixCleanup3_3_0 (DepositPreauth.cpp:110-114): a pseudo-account
+            // cannot be preauthorized — before the duplicate test.
+            if crate::ledger::amendments::fix_cleanup_3_3_0(sandbox) && is_pseudo_account(sandbox, &authorized) {
+                return TxResult::TecPseudoAccount;
+            }
             if sandbox.exists(&keylet::deposit_preauth_key(&tx.account, &authorized)) {
                 return TxResult::Duplicate;
             }

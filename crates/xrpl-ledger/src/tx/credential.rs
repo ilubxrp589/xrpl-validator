@@ -111,6 +111,12 @@ impl Transactor for CredentialCreateTransactor {
         if sandbox.exists(&cred_key) {
             return TxResult::Duplicate;
         }
+        // fixCleanup3_3_0 (CredentialCreate.cpp:101-105): a pseudo-account —
+        // an AMM pool's, a vault's or a loan broker's — cannot be a
+        // credential's subject. After the duplicate test, as in preclaim.
+        if crate::ledger::amendments::fix_cleanup_3_3_0(sandbox) && crate::tx::misc::is_pseudo_account(sandbox, &subject) {
+            return TxResult::TecPseudoAccount;
+        }
         // Finding 196: an Expiration already behind the parent close is
         // tecEXPIRED — CredentialCreate::doApply, BEFORE the reserve check:
         //     std::uint32_t const closeTime =
