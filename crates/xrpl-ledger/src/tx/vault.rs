@@ -236,6 +236,279 @@ fn number_is_negative(n: &Number) -> bool {
     n.negative && !n.is_zero()
 }
 
+// ---------------------------------------------------------------------------
+// VaultCreate (VaultCreate.cpp)
+// ---------------------------------------------------------------------------
+
+/// VaultCreate (type 65): a vault of one asset, its pseudo-account, the
+/// pseudo-account's holding of the asset, the share MPTokenIssuance and the
+/// owner's MPToken of the share.
+///
+/// Fee: the plain base fee (no `calculateBaseFee` override). Reserve: the
+/// owner's OwnerCount rises by 2 for the Vault and its pseudo-account
+/// (VaultCreate.cpp:192-195) and by 1 more for its share MPToken.
+pub struct VaultCreateTransactor;
+
+impl VaultCreateTransactor {
+    /// `VaultCreate::checkExtraFeatures` (VaultCreate.cpp:38-53).
+    fn extra_features(tx: &TxFields, rules: &Sandbox) -> bool {
+        if !enabled(rules, am::MPTOKENS_V1) {
+            return false;
+        }
+        if has(tx, "DomainID") && !enabled(rules, am::PERMISSIONED_DOMAINS) {
+            return false;
+        }
+        if !enabled(rules, am::LENDING_PROTOCOL_V1_1)
+            && (has(tx, "VaultKind") || has(tx, "SubscriptionDate") || has(tx, "RedemptionDate"))
+        {
+            return false;
+        }
+        true
+    }
+
+    /// `std::uint8_t scale` of doApply (VaultCreate.cpp:208-210): zero for
+    /// XRP and MPT, else sfScale or kVaultDefaultIouScale.
+    fn share_scale(tx: &TxFields, asset: &HeldAsset) -> u8 {
+        match asset {
+            HeldAsset::Iou { .. } => tx.fields.get("Scale").and_then(|s| s.as_u64()).map(|s| s as u8).unwrap_or(VAULT_DEFAULT_IOU_SCALE),
+            _ => 0,
+        }
+    }
+}
+
+impl Transactor for VaultCreateTransactor {
+    /// `VaultCreate::preflight` (VaultCreate.cpp:61-125); every refusal is
+    /// temMALFORMED.
+    fn preflight(&self, tx: &TxFields) -> TxResult {
+        let Some(asset) = tx.fields.get("Asset").and_then(mpt::parse_asset) else { return TxResult::Malformed };
+        if !valid_data_length(tx, "Data", MAX_DATA_PAYLOAD_LENGTH) {
+            return TxResult::Malformed;
+        }
+        if let Some(policy) = tx.fields.get("WithdrawalPolicy") {
+            if policy.as_u64() != Some(VAULT_STRATEGY_FIRST_COME_FIRST_SERVE as u64) {
+                return TxResult::Malformed;
+            }
+        }
+        if has(tx, "DomainID") {
+            let Some(domain) = mpt::key_field(&tx.fields, "DomainID") else { return TxResult::Malformed };
+            // DomainID only allowed on private vaults.
+            if is_zero_key(&domain) || tx_flags(tx) & TF_VAULT_PRIVATE == 0 {
+                return TxResult::Malformed;
+            }
+        }
+        if let Some(maximum) = tx.fields.get("AssetsMaximum") {
+            match number_from_json(maximum) {
+                Some(maximum) if !number_is_negative(&maximum) => {}
+                _ => return TxResult::Malformed,
+            }
+        }
+        if let Some(len) = blob_len(tx, "MPTokenMetadata") {
+            if len == 0 || len > MAX_MPTOKEN_METADATA_LENGTH {
+                return TxResult::Malformed;
+            }
+        }
+        if let Some(scale) = tx.fields.get("Scale") {
+            if !matches!(asset, HeldAsset::Iou { .. }) {
+                return TxResult::Malformed;
+            }
+            if scale.as_u64().is_none_or(|s| s > VAULT_MAXIMUM_IOU_SCALE as u64) {
+                return TxResult::Malformed;
+            }
+        }
+        if !vh::is_valid_vault_kind(&tx.fields) {
+            return TxResult::Malformed;
+        }
+        let date = |field: &str| tx.fields.get(field).and_then(|d| d.as_u64()).map(|d| d as u32);
+        let (subscription, redemption) = (date("SubscriptionDate"), date("RedemptionDate"));
+        let closed_ended = vh::tx_vault_kind(&tx.fields) == VaultKind::ClosedEnded;
+        if !closed_ended && (has(tx, "SubscriptionDate") || has(tx, "RedemptionDate")) {
+            return TxResult::Malformed;
+        }
+        if closed_ended {
+            let (Some(subscription), Some(redemption)) = (subscription, redemption) else { return TxResult::Malformed };
+            if !vh::is_valid_closed_ended_gap(subscription, redemption) {
+                return TxResult::Malformed;
+            }
+        }
+        TxResult::Success
+    }
+
+    fn preflight_in(&self, tx: &TxFields, rules: &Sandbox) -> TxResult {
+        if let Some(refused) = gate(tx, rules, Self::extra_features(tx, rules), TF_VAULT_CREATE_MASK) {
+            return refused;
+        }
+        let basic = self.preflight(tx);
+        if basic != TxResult::Success {
+            return basic;
+        }
+        // fixCleanup3_5_0 (3.5.0-rc1 VaultCreate.cpp:93-96): an AssetsMaximum
+        // out of range for the asset — XRP above 1e17 drops — is refused
+        // here. Before the fix it reaches doApply and throws in
+        // associateAsset (tefEXCEPTION). temMALFORMED like every other
+        // refusal of this preflight, so its place among them does not show.
+        if am::fix_cleanup_3_5_0(rules) {
+            let asset = tx.fields.get("Asset").and_then(mpt::parse_asset);
+            let maximum = tx.fields.get("AssetsMaximum").and_then(number_from_json);
+            if let (Some(asset), Some(maximum)) = (asset, maximum) {
+                if !holding::is_representable(&asset, maximum) {
+                    return TxResult::Malformed;
+                }
+            }
+        }
+        TxResult::Success
+    }
+
+    /// `VaultCreate::preclaim` (VaultCreate.cpp:127-172).
+    fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        let Some(asset) = tx.fields.get("Asset").and_then(mpt::parse_asset) else { return TxResult::Malformed };
+        let holdable = holding::can_add_holding(sandbox, &asset);
+        if holdable != TxResult::Success {
+            return holdable;
+        }
+        // A vault may not hold an asset a pseudo-account issues (another
+        // vault's shares, AMM LP tokens): it could never be clawed back.
+        if asset != HeldAsset::Xrp && crate::tx::misc::is_pseudo_account(sandbox, &holding::asset_issuer(&asset)) {
+            return TxResult::WrongAsset;
+        }
+        if holding::is_frozen(sandbox, &tx.account, &asset) {
+            return if matches!(asset, HeldAsset::Mpt(_)) { TxResult::Locked } else { TxResult::Frozen };
+        }
+        if let Some(domain) = mpt::key_field(&tx.fields, "DomainID") {
+            // keylet::permissionedDomain(id) is the id.
+            if !sandbox.exists(&domain) {
+                return TxResult::ObjectNotFound;
+            }
+        }
+        let vault_key = keylet::vault_key(&tx.account, seq_proxy_value(tx));
+        if crate::tx::misc::pseudo_account_address(sandbox, &vault_key).is_none() {
+            return TxResult::AddressCollision;
+        }
+        let date = |field: &str| tx.fields.get(field).and_then(|d| d.as_u64()).map(|d| d as u32);
+        if holding::has_expired(sandbox, date("SubscriptionDate"), ExpiryComparison::Inclusive)
+            || holding::has_expired(sandbox, date("RedemptionDate"), ExpiryComparison::Inclusive)
+        {
+            return TxResult::Expired;
+        }
+        TxResult::Success
+    }
+
+    /// `VaultCreate::doApply` (VaultCreate.cpp:174-314).
+    fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        let Some(asset) = tx.fields.get("Asset").and_then(mpt::parse_asset) else { return TxResult::TefInternal };
+        let sequence = seq_proxy_value(tx);
+        let Some(owner) = json_at(sandbox, &keylet::account_root_key(&tx.account)) else { return TxResult::TefInternal };
+        let prior = prior_balance(sandbox, tx);
+        let vault_key = keylet::vault_key(&tx.account, sequence);
+
+        // dirLink, then the Vault and its pseudo-account count as two owned
+        // objects; the reserve is judged with both already counted.
+        let owner_node = owner_dir_insert(sandbox, &tx.account, &vault_key);
+        let owner_count = owner.get("OwnerCount").and_then(|c| c.as_u64()).unwrap_or(0) + 2;
+        crate::tx::offer::owner_count_add(sandbox, &tx.account, 2);
+        if prior < crate::ledger::fees::account_reserve(sandbox, owner_count) {
+            return TxResult::InsufficientReserve;
+        }
+
+        let pseudo = match crate::tx::misc::create_pseudo_account(sandbox, &vault_key, crate::tx::misc::PseudoOwner::Vault) {
+            Ok(pseudo) => pseudo,
+            Err(refused) => return refused,
+        };
+        let held = holding::add_empty_holding(sandbox, &pseudo, prior, &asset);
+        if held != TxResult::Success {
+            return held;
+        }
+
+        let scale = Self::share_scale(tx, &asset);
+        let flags = tx_flags(tx);
+        let mut share_flags = 0u64;
+        if flags & TF_VAULT_SHARE_NON_TRANSFERABLE == 0 {
+            share_flags |= mpt::LSF_MPT_CAN_ESCROW | LSF_MPT_CAN_TRADE | mpt::LSF_MPT_CAN_TRANSFER;
+        }
+        if flags & TF_VAULT_PRIVATE != 0 {
+            share_flags |= mpt::LSF_MPT_REQUIRE_AUTH;
+        }
+        // fixCleanup3_2_0 (:223-232): the share names the pseudo-account's
+        // holding of the asset — its MPToken or trust line — as
+        // sfReferenceHolding; an XRP vault has none.
+        let reference_holding = if !am::fix_cleanup_3_2_0(sandbox) {
+            None
+        } else {
+            match &asset {
+                HeldAsset::Xrp => None,
+                HeldAsset::Mpt(id) => Some(keylet::mptoken_key(&keylet::mpt_issuance_key(id), &pseudo)),
+                HeldAsset::Iou { currency, issuer } => Some(keylet::ripple_state_key(&pseudo, issuer, currency)),
+            }
+        };
+        let share = match holding::create_mpt_issuance(
+            sandbox,
+            &holding::MptCreateArgs {
+                prior_balance: None,
+                account: pseudo,
+                sequence: 1,
+                flags: share_flags,
+                asset_scale: Some(scale),
+                transfer_fee: None,
+                metadata: tx.fields.get("MPTokenMetadata").and_then(|m| m.as_str()).map(|m| m.to_uppercase()),
+                domain_id: mpt::key_field(&tx.fields, "DomainID"),
+                reference_holding,
+                ..Default::default()
+            },
+        ) {
+            Ok(share) => share,
+            Err(refused) => return refused,
+        };
+
+        let mut vault = serde_json::json!({
+            "LedgerEntryType": "Vault",
+            "Flags": flags & TF_VAULT_PRIVATE,
+            "Sequence": sequence,
+            "Owner": hex::encode(tx.account),
+            "Account": hex::encode(pseudo),
+            "Asset": asset_to_json(&asset),
+            "ShareMPTID": hex::encode_upper(share),
+            "OwnerNode": format!("{owner_node:x}"),
+            // Required; kVaultStrategyFirstComeFirstServe unless given
+            // (preflight admits no other value).
+            "WithdrawalPolicy": tx.fields.get("WithdrawalPolicy").and_then(|p| p.as_u64()).unwrap_or(VAULT_STRATEGY_FIRST_COME_FIRST_SERVE as u64),
+        });
+        // sfAssetsTotal, sfAssetsAvailable and sfLossUnrealized are zero: SoeDefault, absent.
+        if let Some(maximum) = tx.fields.get("AssetsMaximum").and_then(number_from_json) {
+            set_number_field(&mut vault, "AssetsMaximum", maximum, Soe::Default);
+        }
+        if let Some(data) = tx.fields.get("Data").and_then(|d| d.as_str()) {
+            vault["Data"] = Value::String(data.to_uppercase());
+        }
+        if scale != 0 {
+            vault["Scale"] = Value::from(scale);
+        }
+        if enabled(sandbox, am::LENDING_PROTOCOL_V1_1) {
+            vault["LEVersion"] = Value::from(VaultVersion::CashBasis as u8);
+            let kind = vh::tx_vault_kind(&tx.fields);
+            if kind != VaultKind::OpenEnded {
+                // SoeDefault: OpenEnded (0) is not written.
+                vault["VaultKind"] = Value::from(kind as u8);
+            }
+            if kind == VaultKind::ClosedEnded {
+                vault["SubscriptionDate"] = tx.fields["SubscriptionDate"].clone();
+                vault["RedemptionDate"] = tx.fields["RedemptionDate"].clone();
+            }
+        }
+
+        // The owner's MPToken of the share, authorized at once on a private vault.
+        let token = holding::authorize_mptoken(sandbox, prior, &share, &tx.account, 0, None);
+        if token != TxResult::Success {
+            return token;
+        }
+        if flags & TF_VAULT_PRIVATE != 0 {
+            let authorized = holding::authorize_mptoken(sandbox, prior, &share, &pseudo, 0, Some(&tx.account));
+            if authorized != TxResult::Success {
+                return authorized;
+            }
+        }
+        store_vault(sandbox, vault_key, &mut vault, asset)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
