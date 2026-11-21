@@ -136,3 +136,39 @@ fn loan_pay_xrp_final_devnet_7129588() {
 fn loan_set_iou_interest_devnet_7129539() {
     run(include_str!("vectors/loan_set_iou_interest_devnet_7129539.json"));
 }
+
+/// 8022CFE5C5…: the same loan: 334 USD, its first scheduled payment — principal up, interest down at the loan scale. Devnet: tesSUCCESS.
+#[test]
+fn loan_pay_iou_interest_devnet_7129541() {
+    run(include_str!("vectors/loan_pay_iou_interest_devnet_7129541.json"));
+}
+
+/// 9A2D81DB10…: 1 USD at 50% a year over five payments. Devnet: tesSUCCESS.
+#[test]
+fn loan_set_iou_interest_five_payments_devnet_7129555() {
+    run(include_str!("vectors/loan_set_iou_interest_five_payments_devnet_7129555.json"));
+}
+
+/// ECC468D0C9…: the same loan: 1 USD offered, one scheduled payment taken. Devnet: tesSUCCESS.
+#[test]
+fn loan_pay_iou_interest_first_of_five_devnet_7129558() {
+    run(include_str!("vectors/loan_pay_iou_interest_first_of_five_devnet_7129558.json"));
+}
+
+/// 1B28858AA2…: 200000 drops at 50% a year over three payments, overpayments allowed: interest in whole drops. Devnet: tesSUCCESS.
+#[test]
+fn loan_set_xrp_interest_overpayment_devnet_7129504() {
+    run(include_str!("vectors/loan_set_xrp_interest_overpayment_devnet_7129504.json"));
+}
+
+/// CF9E4E3428…: the same loan: 100002 drops with tfLoanOverpayment. Devnet: tesSUCCESS.
+#[test]
+fn loan_pay_xrp_interest_overpayment_devnet_7129506() {
+    run(include_str!("vectors/loan_pay_xrp_interest_overpayment_devnet_7129506.json"));
+}
+
+/// CEFBED9BF7…: the same loan: 33334 drops is less than the re-amortized payment; tecINSUFFICIENT_PAYMENT. Devnet: tecINSUFFICIENT_PAYMENT.
+#[test]
+fn loan_pay_tec_insufficient_payment_devnet_7129508() {
+    run(include_str!("vectors/loan_pay_tec_insufficient_payment_devnet_7129508.json"));
+}
