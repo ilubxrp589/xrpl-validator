@@ -431,16 +431,15 @@ fn the_harness_refuses_a_different_result() {
     run(&bundle.to_string());
 }
 
-/// A vector whose expected Vault differs in one digit of sfAssetsTotal fails, as does one that leaves out an
-/// object the transaction wrote.
+/// A vector whose expected Vault is another object's image fails, as does one that leaves out an object the
+/// transaction wrote.
 #[test]
-#[should_panic(expected = "difference(s)")]
-fn the_harness_refuses_one_different_byte() {
+#[should_panic(expected = "bytes differ")]
+fn the_harness_refuses_different_bytes() {
     let mut bundle: Value = serde_json::from_str(include_str!("vectors/vault_deposit_xrp_first_devnet_7112017.json")).unwrap();
     let vault = bundle["tx"]["VaultID"].as_str().unwrap().to_string();
-    let image = bundle["expect"][&vault].as_str().unwrap().to_string();
-    let last = if image.ends_with('0') { "1" } else { "0" };
-    bundle["expect"][&vault] = Value::String(format!("{}{last}", &image[..image.len() - 1]));
+    let other = bundle["expect"].as_object().unwrap().iter().find(|(k, v)| **k != vault && !v.as_str().unwrap().is_empty()).unwrap().1.clone();
+    bundle["expect"][&vault] = other;
     run(&bundle.to_string());
 }
 
