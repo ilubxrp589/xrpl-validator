@@ -3297,11 +3297,10 @@ mod tests {
         assert_eq!(result(&st, &clawback(ISSUER, &key, OWNER, None)), TxResult::PrecisionLoss);
     }
 
-    /// The clamp to sfAssetsAvailable (VaultClawback.cpp:326-357): with 300
-    /// of 1000 out on loan a clawback of all of BOB's 500 recovers what is
-    /// on hand, 700 x ... no — BOB's stake is worth 500 and 700 are
-    /// available, so all 500 come back; with 400 available only 400 do, for
-    /// the 400,000,000 shares they are worth.
+    /// The clamp to sfAssetsAvailable (VaultClawback.cpp:326-357): BOB's
+    /// stake is worth 500 USD of the vault's 1000, but only 400 are on hand
+    /// (the rest is out on loan). A clawback of everything recovers the 400
+    /// and burns the 400,000,000 shares they are worth; BOB keeps the rest.
     #[test]
     fn vault_clawback_is_clamped_to_assets_available() {
         let (mut st, key, pseudo, share) = usd_vault_with_deposits(&MAINNET_WITH_VAULTS, true);
