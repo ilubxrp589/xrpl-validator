@@ -1595,12 +1595,25 @@ mod tests {
         assert_eq!(shares_of(&sb, &share, &ISSUER), Some(7_000_000));
 
         // fixCleanup3_2_0 (:190-197): an amount below what the vault's total
-        // can record is tecPRECISION_LOSS. With 1e15 USD in the vault the
-        // total's last digit is 0.1 USD; 0.01 USD floors to nothing.
+        // can record is tecPRECISION_LOSS. With 1e15 USD in a Scale-0 vault
+        // the total's last digit is 1 USD; half a dollar floors to nothing.
+        let mut st = state();
+        line(&mut st, BOB, 0, "500", "1000");
         line(&mut st, CAROL, 0, "2000000000000000", "0");
+        let (key, _, share) = make_vault(&mut st, json!({"Asset": usd_asset(), "Scale": 0}));
         commit(&mut st, &deposit(CAROL, &key, usd_json("1000000000000000")));
-        assert_eq!(result(&st, &deposit(BOB, &key, usd_json("0.01"))), TxResult::PrecisionLoss);
-        assert_eq!(result(&st, &deposit(BOB, &key, usd_json("0.1"))), TxResult::Success);
+        assert_eq!(result(&st, &deposit(BOB, &key, usd_json("0.5"))), TxResult::PrecisionLoss);
+        let (r, sb) = apply(&st, &deposit(BOB, &key, usd_json("1.5")));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(shares_of(&sb, &share, &BOB), Some(1), "1.5 floors to 1 at the vault's scale");
+        assert_eq!(usd_held(&sb, &BOB), usd("499"));
+
+        // Scale 6 and 1e15 USD would be 1e21 shares, past the largest MPT
+        // amount: the overflow is tecPATH_DRY (:365-375).
+        let mut st = state();
+        line(&mut st, CAROL, 0, "2000000000000000", "0");
+        let (key, _, _) = make_vault(&mut st, json!({"Asset": usd_asset()}));
+        assert_eq!(result(&st, &deposit(CAROL, &key, usd_json("1000000000000000"))), TxResult::PathDry);
     }
 
     /// An MPT vault: the depositor must hold (and, where required, be
