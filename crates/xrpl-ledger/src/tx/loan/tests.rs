@@ -287,10 +287,6 @@ impl Fx {
         (units * self.unit).to_string()
     }
 
-    fn number(&self, units: u64) -> Number {
-        n(&self.value(units))
-    }
-
     /// A LoanSet by BORROWER (the broker's owner countersigning) for 1,000
     /// units over four payments ten minutes apart, plus `fields`.
     fn loan_set(&self, fields: Value) -> TxFields {
