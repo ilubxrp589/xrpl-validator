@@ -335,8 +335,9 @@ impl Transactor for EscrowCreateTransactor {
                     return TxResult::Locked;
                 }
             }
-            if !mp::can_transfer(&issuance, &tx.account, &dest_id) {
-                return TxResult::NoAuth;
+            let transferable = mp::can_transfer_ter(sandbox, &issuance, &tx.account, &dest_id);
+            if transferable != TxResult::Success {
+                return transferable;
             }
             // accountHolds(IGNORE_FREEZE, IGNORE_AUTH) = the token's MPTAmount.
             let spendable = mp::dec_field(&token, "MPTAmount");

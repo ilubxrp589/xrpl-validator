@@ -11,9 +11,17 @@
 //!   written as "0"); sfMPTAmount is SoeDefault (a zero is OMITTED).
 //!
 //! Out of scope, stated: MPTokensV2 (flow-engine MPT strands, overflow
-//! waivers), vault ReferenceHolding recursion in canTransfer, DomainID
-//! credential auth, LockedAmount escrow arithmetic. Each is amendment- or
-//! feature-gated territory no specimen exercises; the entry points note them.
+//! waivers), DynamicMPT's capability mutations, ConfidentialTransfer. Each is
+//! amendment-gated territory no specimen exercises; the entry points note
+//! them.
+//!
+//! SingleAssetVault's gates on these helpers (rippled 3.4.1) are ported: a
+//! vault share — an MPT whose issuer is a vault's pseudo-account — inherits
+//! the freeze, the authorization and the transferability of the vault's
+//! underlying asset (`any_frozen`, `require_auth_at`, `can_transfer_ter`),
+//! and `sfDomainID` on an issuance authorizes by credential. No vault exists
+//! before the amendment, so each is unit-tested against objects seated in
+//! their ledger_entries.macro JSON form, not against a ledger specimen.
 
 use crate::ledger::keylet;
 use crate::ledger::sandbox::Sandbox;
@@ -85,23 +93,148 @@ pub enum AuthType {
     WeakAuth,
 }
 
-/// `requireAuth(view, mptIssue, account, authType, depth)` — scaffold: the
-/// pre-port behaviour (flags only), to be replaced by the full port.
+/// rippled `kMaxAssetCheckDepth` (Protocol.h:376): how far the freeze, auth
+/// and transfer checks follow a share to its vault's underlying asset.
+pub const MAX_ASSET_CHECK_DEPTH: u8 = 5;
+
+/// An `Asset` as a Vault's `sfAsset` or a share's reference holding names it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HeldAsset {
+    Xrp,
+    Iou { currency: [u8; 20], issuer: [u8; 20] },
+    Mpt([u8; 24]),
+}
+
+/// An STIssue in JSON: `{"mpt_issuance_id": …}`, `{"currency": "XRP"}` or
+/// `{"currency": …, "issuer": …}`.
+pub(crate) fn parse_asset(v: &serde_json::Value) -> Option<HeldAsset> {
+    if let Some(id) = v.get("mpt_issuance_id").and_then(|x| x.as_str()) {
+        return Some(HeldAsset::Mpt(hex::decode(id).ok()?.as_slice().try_into().ok()?));
+    }
+    let currency = crate::tx::offer::amount_currency20(v)?;
+    match v.get("issuer") {
+        None => (currency == [0u8; 20]).then_some(HeldAsset::Xrp),
+        Some(_) => Some(HeldAsset::Iou { currency, issuer: crate::tx::offer::amount_issuer20(v)? }),
+    }
+}
+
+/// A UInt256 field (hex) as a ledger key — `sfVaultID`, `sfReferenceHolding`,
+/// `sfDomainID`: `keylet::vault(id)`, `keylet::unchecked(id)` and
+/// `keylet::permissionedDomain(id)` are the id itself.
+fn key_field(obj: &serde_json::Value, field: &str) -> Option<Hash256> {
+    let bytes = hex::decode(obj.get(field)?.as_str()?).ok()?;
+    Some(Hash256(bytes.as_slice().try_into().ok()?))
+}
+
+/// `assetOfHolding(sleShareIssuance, sleHolding)` (MPTokenHelpers.cpp:580-601):
+/// the asset a vault pseudo-account's holding is of — an MPToken's issuance,
+/// or for a trust line its currency with the limit issuer that is not the
+/// share's issuer (the pseudo-account).
+fn asset_of_holding(share_issuance: &serde_json::Value, holding: &serde_json::Value) -> Option<HeldAsset> {
+    if holding.get("LedgerEntryType").and_then(|t| t.as_str()) == Some("MPToken") {
+        let id = hex::decode(holding.get("MPTokenIssuanceID")?.as_str()?).ok()?;
+        return Some(HeldAsset::Mpt(id.as_slice().try_into().ok()?));
+    }
+    let pseudo = issuance_issuer(share_issuance)?;
+    let low = holding.get("LowLimit")?;
+    let low_issuer = crate::tx::offer::amount_issuer20(low)?;
+    let issuer = if low_issuer != pseudo {
+        low_issuer
+    } else {
+        crate::tx::offer::amount_issuer20(holding.get("HighLimit")?)?
+    };
+    Some(HeldAsset::Iou { currency: crate::tx::offer::amount_currency20(low)?, issuer })
+}
+
+/// `requireAuth(view, mptIssue, account, authType, depth)` by id
+/// (MPTokenHelpers.cpp:374-396): tecOBJECT_NOT_FOUND without the issuance.
+pub(crate) fn require_auth_id(sandbox: &Sandbox, mptid: &[u8; 24], account: &[u8; 20], auth: AuthType, depth: u8) -> TxResult {
+    let issuance_key = keylet::mpt_issuance_key(mptid);
+    match json_at(sandbox, &issuance_key) {
+        Some(issuance) => require_auth_at(sandbox, &issuance_key, &issuance, account, auth, depth),
+        None => TxResult::ObjectNotFound,
+    }
+}
+
+/// `requireAuth(view, mptIssue, account, authType, depth)`
+/// (MPTokenHelpers.cpp:374-477), in rippled's order:
+/// - the issuer is always authorized (:399-400);
+/// - with fixCleanup3_3_0, a pseudo-account is exempt here (:402-404) — the
+///   exemption exists under SingleAssetVault or MPTokensV2 (:388-389);
+/// - under SingleAssetVault, when the issuer is a vault pseudo-account
+///   (its root carries sfVaultID) authorization is first required on the
+///   vault's underlying asset with the same AuthType, recursively to depth
+///   five; a missing issuer root or vault is tefINTERNAL (:406-437);
+/// - no MPToken fails a Strong or Legacy check (:439-444);
+/// - an issuance with sfDomainID asks `credentials::validDomain`: success
+///   authorizes (MPToken or not); a failure is returned when there is no
+///   MPToken and ignored when there is one (:446-466). Not amendment-gated:
+///   the field can only be written once G12/G13 allow it;
+/// - without fixCleanup3_3_0, the pseudo-account exemption comes here (:468-470);
+/// - lsfMPTRequireAuth wants an lsfMPTAuthorized MPToken (:472-475).
 pub(crate) fn require_auth_at(
     sandbox: &Sandbox,
     issuance_key: &Hash256,
     issuance: &serde_json::Value,
     account: &[u8; 20],
     auth: AuthType,
-    _depth: u8,
+    depth: u8,
 ) -> TxResult {
+    use crate::ledger::amendments::{enabled, fix_cleanup_3_3_0, MPTOKENS_V2, SINGLE_ASSET_VAULT};
     let Some(issuer) = issuance_issuer(issuance) else { return TxResult::Success };
     if issuer == *account {
         return TxResult::Success;
     }
+    let sav = enabled(sandbox, SINGLE_ASSET_VAULT);
+    let fix330 = fix_cleanup_3_3_0(sandbox);
+    let pseudo_exempt =
+        || (sav || enabled(sandbox, MPTOKENS_V2)) && crate::tx::misc::is_pseudo_account(sandbox, account);
+    if fix330 && pseudo_exempt() {
+        return TxResult::Success;
+    }
+    if sav {
+        if depth >= MAX_ASSET_CHECK_DEPTH {
+            return TxResult::TecInternal;
+        }
+        let Some(issuer_root) = json_at(sandbox, &keylet::account_root_key(&issuer)) else {
+            return TxResult::TefInternal;
+        };
+        if issuer_root.get("VaultID").is_some() {
+            let vault = key_field(&issuer_root, "VaultID").and_then(|k| json_at(sandbox, &k));
+            // sfAsset is SoeRequired on a Vault: one we cannot read is no vault.
+            let Some(asset) = vault.as_ref().and_then(|v| v.get("Asset")).and_then(parse_asset) else {
+                return TxResult::TefInternal;
+            };
+            let underlying = match asset {
+                HeldAsset::Xrp => TxResult::Success,
+                // RippleStateHelpers.cpp:565-598; only a Strong check wants
+                // the line to exist. An issuer root we cannot read asks nothing.
+                HeldAsset::Iou { currency, issuer } => crate::tx::offer::require_auth_ter(
+                    sandbox,
+                    &crate::tx::offer::Leg { xrp: false, cur: currency, issuer },
+                    account,
+                    auth == AuthType::StrongAuth,
+                )
+                .unwrap_or(TxResult::Success),
+                HeldAsset::Mpt(id) => require_auth_id(sandbox, &id, account, auth, depth + 1),
+            };
+            if underlying != TxResult::Success {
+                return underlying;
+            }
+        }
+    }
     let token = json_at(sandbox, &keylet::mptoken_key(issuance_key, account));
     if token.is_none() && auth != AuthType::WeakAuth {
         return TxResult::NoAuth;
+    }
+    if let Some(domain) = key_field(issuance, "DomainID") {
+        let ter = crate::tx::misc::valid_domain(sandbox, &domain, account);
+        if ter == TxResult::Success || token.is_none() {
+            return ter;
+        }
+    }
+    if !fix330 && pseudo_exempt() {
+        return TxResult::Success;
     }
     let iflags = issuance.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
     let authorized =
@@ -124,23 +257,98 @@ pub fn require_auth(
     (r != TxResult::Success).then_some(r)
 }
 
-/// `isAnyFrozen` for MPT: issuance lsfMPTLocked, or either party's MPToken
-/// lsfMPTLocked. (Vault pseudo-account freeze recursion unported.)
+/// `isAnyFrozen(view, accounts, mptIssue)` (MPTokenHelpers.cpp:113-140):
+/// the issuance's lsfMPTLocked, any party's MPToken lsfMPTLocked, or — under
+/// SingleAssetVault, for a vault share — the vault's underlying asset frozen
+/// for the share's issuer or for a party (`vault_pseudo_frozen`). With one
+/// account it is `isFrozen(view, account, issuance)` (:76-112).
 pub(crate) fn any_frozen(
     sandbox: &Sandbox,
     issuance_key: &Hash256,
     issuance: &serde_json::Value,
     accounts: &[&[u8; 20]],
 ) -> bool {
-    if issuance.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & LSF_MPT_LOCKED != 0 {
+    any_frozen_at(sandbox, issuance_key, Some(issuance), accounts, 0)
+}
+
+fn any_frozen_at(
+    sandbox: &Sandbox,
+    issuance_key: &Hash256,
+    issuance: Option<&serde_json::Value>,
+    accounts: &[&[u8; 20]],
+    depth: u8,
+) -> bool {
+    let locked = |obj: &serde_json::Value| obj.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & LSF_MPT_LOCKED != 0;
+    if issuance.is_some_and(locked) {
         return true;
     }
-    accounts.iter().any(|a| {
-        json_at(sandbox, &keylet::mptoken_key(issuance_key, a))
-            .and_then(|t| t.get("Flags").and_then(|f| f.as_u64()))
-            .map(|f| f & LSF_MPT_LOCKED != 0)
-            .unwrap_or(false)
-    })
+    if accounts.iter().any(|a| json_at(sandbox, &keylet::mptoken_key(issuance_key, a)).is_some_and(|t| locked(&t))) {
+        return true;
+    }
+    match issuance {
+        Some(issuance) => accounts.iter().any(|a| vault_pseudo_frozen(sandbox, a, issuance, depth)),
+        // View.cpp:157-171: the preconditions still speak for a missing
+        // issuance; past them it is not frozen.
+        None => !accounts.is_empty() && vault_frozen_preconditions(sandbox, depth) == Some(true),
+    }
+}
+
+/// `checkVaultPseudoAccountFrozenPreconditions` (View.cpp:66-82): not frozen
+/// without SingleAssetVault; frozen at the depth bound; else undecided.
+fn vault_frozen_preconditions(sandbox: &Sandbox, depth: u8) -> Option<bool> {
+    use crate::ledger::amendments::{enabled, SINGLE_ASSET_VAULT};
+    if !enabled(sandbox, SINGLE_ASSET_VAULT) {
+        return Some(false);
+    }
+    if depth >= MAX_ASSET_CHECK_DEPTH {
+        return Some(true);
+    }
+    None
+}
+
+/// `isVaultPseudoAccountFrozen(view, account, issuanceSle, depth)`
+/// (View.cpp:84-154): a share is frozen for `account` when the vault's
+/// underlying asset is frozen for the share's issuer or for `account`. The
+/// underlying comes from the share's sfReferenceHolding when it has one
+/// (vaults created under fixCleanup3_2_0; a dangling reference is not
+/// frozen), else from the issuer's sfVaultID → the Vault's sfAsset; an issuer
+/// that is not a vault pseudo-account — the common case — is not frozen.
+fn vault_pseudo_frozen(sandbox: &Sandbox, account: &[u8; 20], issuance: &serde_json::Value, depth: u8) -> bool {
+    if let Some(decided) = vault_frozen_preconditions(sandbox, depth) {
+        return decided;
+    }
+    let Some(issuer) = issuance_issuer(issuance) else { return false };
+    let asset = if issuance.get("ReferenceHolding").is_some() {
+        key_field(issuance, "ReferenceHolding")
+            .and_then(|k| json_at(sandbox, &k))
+            .and_then(|holding| asset_of_holding(issuance, &holding))
+    } else {
+        json_at(sandbox, &keylet::account_root_key(&issuer))
+            .and_then(|root| key_field(&root, "VaultID"))
+            .and_then(|k| json_at(sandbox, &k))
+            .and_then(|vault| vault.get("Asset").and_then(parse_asset))
+    };
+    match asset {
+        Some(asset) => asset_any_frozen(sandbox, &[&issuer, account], asset, depth + 1),
+        None => false,
+    }
+}
+
+/// `isAnyFrozen(view, accounts, asset, depth)` (TokenHelpers.cpp:103-125):
+/// XRP never; an IOU by the issuer's global freeze or the issuer's side of
+/// each account's line (RippleStateHelpers.cpp:126-146); an MPT as above.
+fn asset_any_frozen(sandbox: &Sandbox, accounts: &[&[u8; 20]], asset: HeldAsset, depth: u8) -> bool {
+    match asset {
+        HeldAsset::Xrp => false,
+        HeldAsset::Iou { currency, issuer } => {
+            let asset = crate::flow::steps::Asset { currency, issuer: Some(issuer) };
+            accounts.iter().any(|a| crate::flow::view::is_frozen(sandbox, a, &asset))
+        }
+        HeldAsset::Mpt(id) => {
+            let key = keylet::mpt_issuance_key(&id);
+            any_frozen_at(sandbox, &key, json_at(sandbox, &key).as_ref(), accounts, depth)
+        }
+    }
 }
 
 pub const LSF_MPT_CAN_ESCROW: u64 = 0x0000_0008;
@@ -148,8 +356,8 @@ pub const LSF_MPT_CAN_ESCROW: u64 = 0x0000_0008;
 /// `requireAuth(view, mptIssue, account, AuthType::WeakAuth)` (View.cpp):
 /// the issuer is always authorized; a WEAK check lets an account WITHOUT an
 /// MPToken through unless the issuance carries lsfMPTRequireAuth, in which
-/// case a missing or unauthorized token is tecNO_AUTH. The DomainID
-/// credential branch and the vault recursion are unported (no specimen).
+/// case a missing or unauthorized token is tecNO_AUTH — plus the vault and
+/// DomainID rules of `require_auth_at`.
 pub(crate) fn require_auth_weak(
     sandbox: &Sandbox,
     issuance_key: &Hash256,
@@ -160,28 +368,93 @@ pub(crate) fn require_auth_weak(
     (r != TxResult::Success).then_some(r)
 }
 
-/// `canTransfer(view, mptIssue, from, to)`: without lsfMPTCanTransfer only
-/// issuer-adjacent moves are allowed (tecNO_AUTH otherwise).
-pub(crate) fn can_transfer(issuance: &serde_json::Value, from: &[u8; 20], to: &[u8; 20]) -> bool {
-    let Some(issuer) = issuance_issuer(issuance) else { return false };
-    issuance.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & LSF_MPT_CAN_TRANSFER != 0
-        || *from == issuer
-        || *to == issuer
-}
-
-/// `canTransfer(view, mptIssue, from, to)` as a verdict — scaffold: the
-/// pre-port behaviour (lsfMPTCanTransfer only).
+/// `canTransfer(view, mptIssue, from, to)` (MPTokenHelpers.cpp:603-656):
+/// issuer endpoints always may; third parties need lsfMPTCanTransfer
+/// (tecNO_AUTH); and under fixCleanup3_2_0 a share carrying
+/// sfReferenceHolding inherits the transferability of the vault's underlying
+/// asset — tefINTERNAL on a dangling reference, tecINTERNAL past depth five.
+/// (`WaiveMPTCanTransfer::Yes` has no caller among the ported transactors.)
 pub(crate) fn can_transfer_ter(
-    _sandbox: &Sandbox,
+    sandbox: &Sandbox,
     issuance: &serde_json::Value,
     from: &[u8; 20],
     to: &[u8; 20],
 ) -> TxResult {
-    if can_transfer(issuance, from, to) { TxResult::Success } else { TxResult::NoAuth }
+    can_transfer_at(sandbox, issuance, from, to, 0)
+}
+
+fn can_transfer_at(sandbox: &Sandbox, issuance: &serde_json::Value, from: &[u8; 20], to: &[u8; 20], depth: u8) -> TxResult {
+    let Some(issuer) = issuance_issuer(issuance) else { return TxResult::NoAuth };
+    if *from == issuer || *to == issuer {
+        return TxResult::Success;
+    }
+    if issuance.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & LSF_MPT_CAN_TRANSFER == 0 {
+        return TxResult::NoAuth;
+    }
+    if issuance.get("ReferenceHolding").is_some() && crate::ledger::amendments::fix_cleanup_3_2_0(sandbox) {
+        if depth >= MAX_ASSET_CHECK_DEPTH {
+            return TxResult::TecInternal;
+        }
+        let Some(holding) = key_field(issuance, "ReferenceHolding").and_then(|k| json_at(sandbox, &k)) else {
+            return TxResult::TefInternal;
+        };
+        return match asset_of_holding(issuance, &holding) {
+            Some(HeldAsset::Mpt(id)) => match json_at(sandbox, &keylet::mpt_issuance_key(&id)) {
+                Some(underlying) => can_transfer_at(sandbox, &underlying, from, to, depth + 1),
+                None => TxResult::ObjectNotFound,
+            },
+            Some(HeldAsset::Iou { currency, issuer }) => iou_can_transfer(sandbox, &currency, &issuer, from, to),
+            // A holding is an MPToken or a RippleState (assetOfHolding's assert).
+            Some(HeldAsset::Xrp) => TxResult::Success,
+            None => TxResult::TefInternal,
+        };
+    }
+    TxResult::Success
+}
+
+/// `canTransfer(view, issue, from, to)` (RippleStateHelpers.cpp:603-631): an
+/// IOU moves between two non-issuers unless rippling is off on BOTH their
+/// lines with the issuer (the issuer's side's NoRipple; without a line, the
+/// issuer's lsfDefaultRipple stands in) — terNO_RIPPLE. tefINTERNAL without
+/// the issuer's root.
+fn iou_can_transfer(sandbox: &Sandbox, currency: &[u8; 20], issuer: &[u8; 20], from: &[u8; 20], to: &[u8; 20]) -> TxResult {
+    const LSF_DEFAULT_RIPPLE: u64 = 0x0080_0000;
+    const LSF_LOW_NO_RIPPLE: u64 = 0x0010_0000;
+    const LSF_HIGH_NO_RIPPLE: u64 = 0x0020_0000;
+    if issuer == from || issuer == to {
+        return TxResult::Success;
+    }
+    let Some(issuer_root) = json_at(sandbox, &keylet::account_root_key(issuer)) else {
+        return TxResult::TefInternal;
+    };
+    let default_ripple = issuer_root.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & LSF_DEFAULT_RIPPLE != 0;
+    let ripple_disabled = |account: &[u8; 20]| match json_at(sandbox, &keylet::ripple_state_key(account, issuer, currency)) {
+        Some(line) => {
+            let bit = if issuer > account { LSF_HIGH_NO_RIPPLE } else { LSF_LOW_NO_RIPPLE };
+            line.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & bit != 0
+        }
+        None => !default_ripple,
+    };
+    if ripple_disabled(from) && ripple_disabled(to) {
+        return TxResult::NoRipple;
+    }
+    TxResult::Success
 }
 
 /// `accountHolds(view, account, mptIssue, zeroIfFrozen, zeroIfUnauthorized)`
-/// — scaffold: the pre-SingleAssetVault arm only.
+/// (TokenHelpers.cpp:409-476) — the holder's MPTAmount; zero without an
+/// MPToken, zero when frozen (`isFrozen(view, account, sleMpt)`, vault
+/// recursion included) under ZeroIfFrozen, and under ZeroIfUnauthorized zero
+/// when unauthorized: by the full `requireAuth(StrongAuth)` once
+/// SingleAssetVault or ConfidentialTransfer is enabled (:452-459), before
+/// that by the issuance's lsfMPTRequireAuth against the token's
+/// lsfMPTAuthorized alone (:460-468).
+///
+/// Not ported: the issuer's own FullBalance arm (:423-438) and MPTokensV2's
+/// balance hook (:472-474). No transactor this engine dispatches calls this
+/// with ZeroIfUnauthorized on an MPT — in rippled those callers (OfferCreate,
+/// the AMM family, CheckCash, the offer stream) only see an MPT under
+/// MPTokensV2; the vault and loan transactors are its first users.
 pub fn account_holds(
     sandbox: &Sandbox,
     mptid: &[u8; 24],
@@ -189,16 +462,26 @@ pub fn account_holds(
     zero_if_frozen: bool,
     zero_if_unauthorized: bool,
 ) -> u64 {
+    use crate::ledger::amendments::{enabled, CONFIDENTIAL_TRANSFER, SINGLE_ASSET_VAULT};
     let ikey = keylet::mpt_issuance_key(mptid);
     let Some(token) = json_at(sandbox, &keylet::mptoken_key(&ikey, account)) else { return 0 };
     let issuance = json_at(sandbox, &ikey);
-    let tflags = token.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
-    let iflags = issuance.as_ref().and_then(|i| i.get("Flags").and_then(|f| f.as_u64())).unwrap_or(0);
-    if zero_if_frozen && (iflags | tflags) & LSF_MPT_LOCKED != 0 {
+    let flags = |obj: &serde_json::Value| obj.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+    let iflags = issuance.as_ref().map(flags).unwrap_or(0);
+    if zero_if_frozen
+        && ((iflags | flags(&token)) & LSF_MPT_LOCKED != 0
+            || issuance.as_ref().is_some_and(|i| vault_pseudo_frozen(sandbox, account, i, 0)))
+    {
         return 0;
     }
-    if zero_if_unauthorized && issuance.is_some() && iflags & LSF_MPT_REQUIRE_AUTH != 0 && tflags & LSF_MPT_AUTHORIZED == 0 {
-        return 0;
+    if zero_if_unauthorized {
+        if enabled(sandbox, SINGLE_ASSET_VAULT) || enabled(sandbox, CONFIDENTIAL_TRANSFER) {
+            if require_auth_id(sandbox, mptid, account, AuthType::StrongAuth, 0) != TxResult::Success {
+                return 0;
+            }
+        } else if issuance.is_some() && iflags & LSF_MPT_REQUIRE_AUTH != 0 && flags(&token) & LSF_MPT_AUTHORIZED == 0 {
+            return 0;
+        }
     }
     dec_field(&token, "MPTAmount")
 }
@@ -390,13 +673,11 @@ pub fn apply_mpt_payment(
     }
     let Some(issuer) = issuance_issuer(&issuance) else { return TxResult::Malformed };
 
-    // canTransfer: issuer endpoints always may; third parties need
-    // lsfMPTCanTransfer. (ReferenceHolding vault recursion unported.)
-    if tx.account != issuer
-        && *dest != issuer
-        && issuance.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0) & LSF_MPT_CAN_TRANSFER == 0
-    {
-        return TxResult::NoAuth;
+    // canTransfer (Payment.cpp:690-692): issuer endpoints always may; third
+    // parties need lsfMPTCanTransfer, and a vault share its underlying's.
+    let transferable = can_transfer_ter(sandbox, &issuance, &tx.account, dest);
+    if transferable != TxResult::Success {
+        return transferable;
     }
 
     // verifyDepositPreauth — unconditional on this arm (Payment.cpp:693).
