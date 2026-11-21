@@ -1021,3 +1021,57 @@ mod tests {
         assert!(kept.exists(&dir) && kept.exists(&page6));
     }
 }
+
+/// Inventory Q8 — AccountDelete.cpp:193-216 `nonObligationDeleter` names
+/// neither ltVAULT, ltLOAN_BROKER nor ltLOAN, and preclaim :340-341 answers
+/// tecHAS_OBLIGATIONS on a null deleter: an account whose owner directory
+/// holds one cannot be deleted.
+#[cfg(test)]
+mod vault_obligation_tests {
+    use super::*;
+    use crate::ledger::header::LedgerHeader;
+    use crate::ledger::sandbox::Sandbox;
+    use crate::ledger::state::LedgerState;
+    use xrpl_core::types::Hash256;
+
+    #[test]
+    fn a_vault_loan_broker_or_loan_in_the_owner_directory_is_an_obligation() {
+        let alice = [0x01u8; 20];
+        let bob = [0x02u8; 20];
+        let build = |entry_type: &str| {
+            let mut state = LedgerState::new_unverified(LedgerHeader {
+                sequence: 1000, total_coins: 100_000_000_000_000_000,
+                parent_hash: Hash256([0; 32]), transaction_hash: Hash256([0; 32]), account_hash: Hash256([0; 32]),
+                parent_close_time: 0, close_time: 10, close_time_resolution: 10, close_flags: 0,
+            });
+            for id in [alice, bob] {
+                let a = serde_json::json!({
+                    "LedgerEntryType": "AccountRoot", "Account": hex::encode(id), "Balance": "50000000",
+                    "Sequence": 1, "OwnerCount": 1, "Flags": 0,
+                });
+                state.state_map.insert(keylet::account_root_key(&id), serde_json::to_vec(&a).unwrap()).unwrap();
+            }
+            let item = Hash256([0x84; 32]);
+            let obj = serde_json::json!({"LedgerEntryType": entry_type, "Flags": 0, "Owner": hex::encode(alice), "OwnerNode": "0"});
+            state.state_map.insert(item, serde_json::to_vec(&obj).unwrap()).unwrap();
+            let dir = keylet::owner_dir_key(&alice);
+            let page = serde_json::json!({
+                "LedgerEntryType": "DirectoryNode", "Owner": hex::encode(alice), "RootIndex": hex::encode_upper(dir.0),
+                "Indexes": [hex::encode_upper(item.0)], "Flags": 0,
+            });
+            state.state_map.insert(dir, serde_json::to_vec(&page).unwrap()).unwrap();
+            state
+        };
+        let tx = TxFields {
+            account: alice, tx_type: "AccountDelete".to_string(), fee: 2_000_000, sequence: 1, ticket_seq: None,
+            last_ledger_seq: None, fields: serde_json::json!({"Destination": hex::encode(bob)}), inner_batch: false,
+        };
+        for kind in ["Vault", "LoanBroker", "Loan"] {
+            let state = build(kind);
+            assert_eq!(AccountDeleteTransactor.preclaim(&tx, &Sandbox::new(&state)), TxResult::HasObligations, "{kind}");
+        }
+        // The same directory holding something deletable passes.
+        let state = build("Ticket");
+        assert_eq!(AccountDeleteTransactor.preclaim(&tx, &Sandbox::new(&state)), TxResult::Success);
+    }
+}
