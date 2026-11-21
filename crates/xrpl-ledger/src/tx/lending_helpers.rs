@@ -29,7 +29,6 @@
 //! not ported; without that version each of them is the 3.4.1 code or a
 //! no-op.
 
-#![allow(unused_variables, unused_imports)]
 use crate::flow::st_amount::StError;
 use crate::ledger::amendments::{self as am, enabled};
 use crate::ledger::sandbox::Sandbox;
@@ -45,7 +44,16 @@ use serde_json::Value;
 /// every lending transaction needs SingleAssetVault and MPTokensV1, and
 /// PermissionedDomains when it carries sfDomainID.
 pub fn check_lending_protocol_dependencies(rules: &Sandbox, tx: &TxFields) -> bool {
-    unimplemented!("RED")
+    if !enabled(rules, am::SINGLE_ASSET_VAULT) {
+        return false;
+    }
+    if !enabled(rules, am::MPTOKENS_V1) {
+        return false;
+    }
+    if tx.fields.get("DomainID").is_some() && !enabled(rules, am::PERMISSIONED_DOMAINS) {
+        return false;
+    }
+    true
 }
 
 /// The head of `Transactor::invokePreflight` (Transactor.h:640-653) and
@@ -59,7 +67,17 @@ pub fn check_lending_protocol_dependencies(rules: &Sandbox, tx: &TxFields) -> bo
 ///   one is temINVALID (Transactor.cpp:245-250);
 /// - a flag outside the type's mask: temINVALID_FLAG.
 pub fn gate(tx: &TxFields, rules: &Sandbox, extra: bool, mask: u64) -> Option<TxResult> {
-    unimplemented!("RED")
+    if !enabled(rules, am::LENDING_PROTOCOL) || !extra {
+        return Some(TxResult::Disabled);
+    }
+    if tx.delegate().is_some() {
+        return Some(TxResult::InvalidTx);
+    }
+    let flags = tx.fields.get("Flags").and_then(|f| f.as_u64()).unwrap_or(0);
+    if invalid_flags(flags, mask) {
+        return Some(TxResult::InvalidFlag);
+    }
+    None
 }
 
 /// `STAmount::isZeroAtScale(scale)` (STAmount.cpp:1737-1741):
@@ -67,7 +85,7 @@ pub fn gate(tx: &TxFields, rules: &Sandbox, extra: bool, mask: u64) -> Option<Tx
 /// non-zero XRP or MPT amount (`roundToScale` leaves an integral amount as
 /// it is).
 pub fn is_zero_at_scale(amount: &Amount, at_scale: i32) -> Result<bool, StError> {
-    unimplemented!("RED")
+    Ok(round_to_scale(*amount, at_scale, Rounding::ToNearest)?.is_zero())
 }
 
 /// `canApplyToBrokerCover(view, sleBroker, vaultAsset, amount)`
@@ -82,7 +100,17 @@ pub fn is_zero_at_scale(amount: &Amount, at_scale: i32) -> Result<bool, StError>
 /// The `Err` is rippled's STAmount throw (a stored cover out of the asset's
 /// range): tefEXCEPTION in the callers' preclaim.
 pub fn can_apply_to_broker_cover(sandbox: &Sandbox, broker: &Value, asset: HeldAsset, amount: &Amount) -> Result<TxResult, StError> {
-    unimplemented!("RED")
+    if !am::fix_cleanup_3_2_0(sandbox) {
+        return Ok(TxResult::Success);
+    }
+    if amount.is_zero() {
+        return Ok(TxResult::PrecisionLoss);
+    }
+    let cover_scale = scale(number_field(broker, "CoverAvailable"), asset, Rounding::ToNearest)?;
+    if is_zero_at_scale(amount, cover_scale)? {
+        return Ok(TxResult::PrecisionLoss);
+    }
+    Ok(TxResult::Success)
 }
 
 /// `getAssetsTotalScale(vaultSle)` (LendingHelpers.h:257-263):
@@ -90,7 +118,8 @@ pub fn can_apply_to_broker_cover(sandbox: &Sandbox, broker: &Value, asset: HeldA
 /// sixteen-digit exponent of the total for an IOU vault (-100 while it is
 /// empty) — converted under `mode`, the thread's rounding mode at the call.
 pub fn assets_total_scale(vault: &Value, mode: Rounding) -> Result<i32, StError> {
-    unimplemented!("RED")
+    let asset = vault_asset(vault).ok_or(StError::Overflow)?;
+    scale(number_field(vault, "AssetsTotal"), asset, mode)
 }
 
 /// `minimumBrokerCover(debtTotal, coverRateMinimum, vaultSle)`
@@ -100,7 +129,10 @@ pub fn assets_total_scale(vault: &Value, mode: Rounding) -> Result<i32, StError>
 /// `roundToAsset` (whose rounding argument defaults to the thread's mode) —
 /// runs under one `NumberRoundModeGuard(Upward)`.
 pub fn minimum_broker_cover(debt_total: Number, cover_rate_minimum: u32, vault: &Value) -> Result<Number, StError> {
-    unimplemented!("RED")
+    let up = Rounding::Upward;
+    let asset = vault_asset(vault).ok_or(StError::Overflow)?;
+    let raw = tenth_bips_of_value(debt_total, cover_rate_minimum, up).map_err(|_| StError::Overflow)?;
+    round_to_asset(asset, raw, assets_total_scale(vault, up)?, up)
 }
 
 #[cfg(test)]
