@@ -6,10 +6,13 @@
 //! finished and cancelled inside batches, including clawback while part of the balance is locked. AllOrNothing
 //! discards throughout. Same harness as campaigns 23 and 24.
 //!
-//! Result: 37 of 40 byte-exact under both flow engines, no engine finding. The other three differ only because devnet
-//! enables SingleAssetVault and LendingProtocol, which run rippled's `Number` at 19 digits (`setCurrentTransactionRules`,
-//! Rules.cpp); mainnet enables neither and the engine models the 16-digit scale. libxrpl 3.4.0 under devnet's rules
-//! reproduces devnet (parity_probe). They stay pinned, ignored, for the day either amendment nears mainnet.
+//! Result: 40 of 40 byte-exact, no engine finding. Devnet enables SingleAssetVault and LendingProtocol, which run
+//! rippled's `Number` at 19 digits (`setCurrentTransactionRules`, Rules.cpp); every bundle here carries devnet's
+//! Amendments object, so the engine takes the Large330 scale from it (`amendments::number_scale`) as it would on a
+//! ledger. Three of the vectors differ in the last digits between the two scales and were parked, ignored, while the
+//! engine modelled only mainnet's 16: 0-13 (the initial LP mint, root2(200 x 20000000) = 63245.55320336758; …755 at
+//! 16 digits), 6-1 (a single-asset deposit minting 1541.92632150251; 1541.92481545477 at 16) and 3-2 (the same
+//! deposit inside a Batch, then clawed back: the pool's CLW 186.163102167096; 186.1631058885331 at 16).
 use serde_json::Value;
 use std::collections::HashMap;
 use xrpl_core::types::Hash256;
@@ -220,7 +223,6 @@ fn c25_0_12_m_pays_b_5000_mpt_devnet_5595242() {
 
 /// Campaign 25 — 0-13 A creates the CLW/XRP pool (DE042814DC09, AMMCreate tesSUCCESS).
 #[test]
-#[ignore = "devnet runs Number at 19 digits (SingleAssetVault, LendingProtocol): the initial LP mint root2(200 x 20000000) is 63245.55320336758 there, 63245.55320336755 at mainnet's 16"]
 fn c25_0_13_a_creates_the_clw_xrp_pool_devnet_5595244() {
     run_batch_bundle(include_str!("vectors/c25_0_13_a_creates_the_clw_xrp_pool_devnet_5595244.json"));
 }
@@ -293,7 +295,6 @@ fn c25_3_1_independent_i_claws_10_clw_of_a_s_pool_share_then_pays_a_devnet_55952
 
 /// Campaign 25 — 3-2 independent outer B: B deposits 1 XRP single-asset, I claws back all of B's LP (B90D26CC84CC, Batch tesSUCCESS).
 #[test]
-#[ignore = "devnet runs Number at 19 digits: B's single-asset deposit mints different LP tokens (as in 6-1), so clawing all of B's LP leaves the pool's CLW at 186.163102167096 there, 186.1631058885331 here"]
 fn c25_3_2_independent_outer_b_b_deposits_1_xrp_single_asset_i_claw_devnet_5595287() {
     run_batch_bundle(include_str!("vectors/c25_3_2_independent_outer_b_b_deposits_1_xrp_single_asset_i_claw_devnet_5595287.json"));
 }
@@ -372,7 +373,6 @@ fn c25_5_1_independent_i_claws_both_assets_of_a_s_clw_clx_share_las_devnet_55953
 
 /// Campaign 25 — 6-1 B deposits 1 XRP single-asset (plain) (EA54024A6C14, AMMDeposit tesSUCCESS).
 #[test]
-#[ignore = "devnet runs Number at 19 digits: at 16, fixAMMv1_3's adjustAssetInByTokens prices the tokens for 1 XRP over 1,000,000 drops and re-mints for 999,999 (1541.92481545477); devnet mints 1541.92632150251"]
 fn c25_6_1_b_deposits_1_xrp_single_asset_plain_devnet_5596640() {
     run_batch_bundle(include_str!("vectors/c25_6_1_b_deposits_1_xrp_single_asset_plain_devnet_5596640.json"));
 }
