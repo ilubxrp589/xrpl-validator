@@ -28,6 +28,7 @@ pub mod pseudo;
 pub mod st_number;
 pub mod ticket;
 pub mod trust_set;
+pub mod vault;
 pub mod vault_helpers;
 pub mod xchain;
 
