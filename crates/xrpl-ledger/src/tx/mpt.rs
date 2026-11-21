@@ -347,6 +347,15 @@ fn vault_pseudo_frozen(sandbox: &Sandbox, account: &[u8; 20], issuance: &serde_j
     }
 }
 
+/// `isVaultPseudoAccountFrozen(view, account, mptIssue, 0)` by id: false without the issuance
+/// past the preconditions (View.cpp:157-171).
+pub(crate) fn vault_pseudo_account_frozen(sandbox: &Sandbox, account: &[u8; 20], mptid: &[u8; 24]) -> bool {
+    match json_at(sandbox, &keylet::mpt_issuance_key(mptid)) {
+        Some(issuance) => vault_pseudo_frozen(sandbox, account, &issuance, 0),
+        None => vault_frozen_preconditions(sandbox, 0) == Some(true),
+    }
+}
+
 /// `isAnyFrozen(view, accounts, asset, depth)` (TokenHelpers.cpp:103-125):
 /// XRP never; an IOU by the issuer's global freeze or the issuer's side of
 /// each account's line (RippleStateHelpers.cpp:126-146); an MPT as above.

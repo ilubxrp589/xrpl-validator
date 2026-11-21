@@ -14,6 +14,10 @@
 //! | [`account_send`] | TokenHelpers.cpp:1552-1570 (`accountSend`) |
 //! | [`account_send_multi`] | TokenHelpers.cpp:1573-1590 (`accountSendMulti`) |
 //! | [`can_withdraw`], [`do_withdraw`] | View.cpp:438-598 |
+//! | [`check_withdraw_freeze`], [`check_deposit_freeze`] | TokenHelpers.cpp:160-262 |
+//! | [`can_transfer_waive`] | TokenHelpers.cpp:659-673, MPTokenHelpers.cpp:603-656 |
+//! | [`account_holds_full`] | TokenHelpers.cpp:325-476 (`SpendableHandling::FullBalance`) |
+//! | [`add_transfer_fee`], [`subtract_transfer_fee`], [`asset_transfer_rate`], [`do_withdraw_split`], [`is_representable`] | 3.5.0-rc1: TokenHelpers.cpp:541-569, View.cpp:507-588, STAmount.cpp:448-462 |
 //! | [`decrease_owner_count_for_object`] | AccountRootHelpers.cpp:359-376 |
 //! | [`has_expired`] | View.cpp:48-63 |
 //!
@@ -29,8 +33,8 @@
 //! and the sponsor arguments are the no-sponsor case throughout) and
 //! MPTokensV2's balance hooks.
 //!
-//! No transactor the engine dispatches calls any of this: with the vault
-//! amendments off nothing changes.
+//! Only the vault transactors (`tx::vault`, behind SingleAssetVault) call any
+//! of this: with the vault amendments off nothing changes.
 
 use crate::flow::steps::Asset as IouAsset;
 use crate::ledger::amendments::{self, enabled};
@@ -1141,10 +1145,328 @@ pub fn do_withdraw(
     prior_balance: u64,
     amount: &Amount,
 ) -> TxResult {
+    do_withdraw_split(sandbox, tx, sender, dst, source, prior_balance, amount, amount)
+}
+
+// ---------------------------------------------------------------------------
+// What the vault transactors needed beyond the first pass
+// ---------------------------------------------------------------------------
+
+const LSF_LOW_FREEZE: u64 = 0x0040_0000;
+const LSF_HIGH_FREEZE: u64 = 0x0080_0000;
+
+fn frozen_code(asset: &HeldAsset) -> TxResult {
+    if matches!(asset, HeldAsset::Mpt(_)) {
+        TxResult::Locked
+    } else {
+        TxResult::Frozen
+    }
+}
+
+/// `isGlobalFrozen(view, asset)` (TokenHelpers.cpp:46-52): the IOU issuer's
+/// lsfGlobalFreeze, or the MPT issuance's lsfMPTLocked (MPTokenHelpers.cpp:
+/// 41-56; a missing issuance is not frozen). XRP never.
+pub fn is_global_frozen(sandbox: &Sandbox, asset: &HeldAsset) -> bool {
+    match asset {
+        HeldAsset::Xrp => false,
+        HeldAsset::Iou { issuer, .. } => crate::flow::view::is_global_frozen(sandbox, issuer),
+        HeldAsset::Mpt(id) => {
+            json_at(sandbox, &keylet::mpt_issuance_key(id)).is_some_and(|i| flags(&i) & mpt::LSF_MPT_LOCKED != 0)
+        }
+    }
+}
+
+/// `checkGlobalFrozen(view, asset)` (TokenHelpers.cpp:54-60).
+pub fn check_global_frozen(sandbox: &Sandbox, asset: &HeldAsset) -> TxResult {
+    if is_global_frozen(sandbox, asset) {
+        frozen_code(asset)
+    } else {
+        TxResult::Success
+    }
+}
+
+/// `isIndividualFrozen(view, account, asset)` (TokenHelpers.cpp:62-67): the
+/// ISSUER's side of the account's trust line carries the freeze bit — never
+/// for the issuer itself or without a line (RippleStateHelpers.cpp:107-124)
+/// — or the account's MPToken is locked (MPTokenHelpers.cpp:58-72).
+pub fn is_individual_frozen(sandbox: &Sandbox, account: &[u8; 20], asset: &HeldAsset) -> bool {
+    match asset {
+        HeldAsset::Xrp => false,
+        HeldAsset::Iou { currency, issuer } => {
+            account != issuer
+                && json_at(sandbox, &keylet::ripple_state_key(account, issuer, currency))
+                    .is_some_and(|line| flags(&line) & (if issuer > account { LSF_HIGH_FREEZE } else { LSF_LOW_FREEZE }) != 0)
+        }
+        HeldAsset::Mpt(id) => json_at(sandbox, &keylet::mptoken_key(&keylet::mpt_issuance_key(id), account))
+            .is_some_and(|token| flags(&token) & mpt::LSF_MPT_LOCKED != 0),
+    }
+}
+
+/// `checkIndividualFrozen(view, account, asset)` (TokenHelpers.cpp:69-75).
+pub fn check_individual_frozen(sandbox: &Sandbox, account: &[u8; 20], asset: &HeldAsset) -> TxResult {
+    if is_individual_frozen(sandbox, account, asset) {
+        frozen_code(asset)
+    } else {
+        TxResult::Success
+    }
+}
+
+/// The last arm of both checks below (TokenHelpers.cpp:205-213, :251-259):
+/// a pseudo-account whose asset is itself a vault share frozen through its
+/// own vault — rippled's UNREACHABLE (a vault may not hold another vault's
+/// shares), tecINTERNAL.
+fn pseudo_holds_frozen_shares(sandbox: &Sandbox, pseudo: &[u8; 20], asset: &HeldAsset) -> bool {
+    match asset {
+        HeldAsset::Mpt(id) => mpt::vault_pseudo_account_frozen(sandbox, pseudo, id),
+        _ => false,
+    }
+}
+
+/// `checkWithdrawFreeze(view, pseudoAcct, submitterAcct, dstAcct, asset)`
+/// (TokenHelpers.cpp:160-217), a payout from a pseudo-account on the
+/// submitter's behalf:
+/// - to the asset's issuer: always allowed;
+/// - the asset globally frozen;
+/// - the pseudo-account individually frozen;
+/// - the submitter individually frozen — only when it is not the
+///   destination (a plain freeze does not stop a holder taking its own
+///   funds out);
+/// - the destination deep-frozen;
+/// each tecFROZEN (IOU) or tecLOCKED (MPT).
+pub fn check_withdraw_freeze(sandbox: &Sandbox, pseudo: &[u8; 20], submitter: &[u8; 20], dst: &[u8; 20], asset: &HeldAsset) -> TxResult {
+    if *dst == asset_issuer(asset) {
+        return TxResult::Success;
+    }
+    let global = check_global_frozen(sandbox, asset);
+    if global != TxResult::Success {
+        return global;
+    }
+    let source = check_individual_frozen(sandbox, pseudo, asset);
+    if source != TxResult::Success {
+        return source;
+    }
+    if submitter != dst {
+        let own = check_individual_frozen(sandbox, submitter, asset);
+        if own != TxResult::Success {
+            return own;
+        }
+    }
+    let deep = check_deep_frozen_individual(sandbox, dst, asset);
+    if deep != TxResult::Success {
+        return deep;
+    }
+    if pseudo_holds_frozen_shares(sandbox, pseudo, asset) {
+        return TxResult::TecInternal;
+    }
+    TxResult::Success
+}
+
+/// `checkDeepFrozen(view, account, asset)` as [`check_deep_frozen`] has it.
+fn check_deep_frozen_individual(sandbox: &Sandbox, account: &[u8; 20], asset: &HeldAsset) -> TxResult {
+    check_deep_frozen(sandbox, account, asset)
+}
+
+/// `checkDepositFreeze(view, srcAcct, pseudoAcct, asset)`
+/// (TokenHelpers.cpp:219-262), a deposit into a pseudo-account: the asset
+/// globally frozen; the depositor individually frozen unless it is the
+/// issuer; the pseudo-account individually frozen ("pseudo-accounts cannot
+/// receive deposits under a regular freeze because those funds cannot be
+/// later withdrawn") — tecFROZEN (IOU) or tecLOCKED (MPT).
+pub fn check_deposit_freeze(sandbox: &Sandbox, src: &[u8; 20], pseudo: &[u8; 20], asset: &HeldAsset) -> TxResult {
+    let global = check_global_frozen(sandbox, asset);
+    if global != TxResult::Success {
+        return global;
+    }
+    if *src != asset_issuer(asset) {
+        let own = check_individual_frozen(sandbox, src, asset);
+        if own != TxResult::Success {
+            return own;
+        }
+    }
+    let destination = check_individual_frozen(sandbox, pseudo, asset);
+    if destination != TxResult::Success {
+        return destination;
+    }
+    if pseudo_holds_frozen_shares(sandbox, pseudo, asset) {
+        return TxResult::TecInternal;
+    }
+    TxResult::Success
+}
+
+/// `canTransfer(view, asset, from, to, waive)` (TokenHelpers.cpp:659-673)
+/// with an explicit `WaiveMPTCanTransfer`: waived, an MPT moves between
+/// holders whatever lsfMPTCanTransfer says and without consulting a
+/// reference holding (MPTokenHelpers.cpp:617-618) — the missing issuance is
+/// still tecOBJECT_NOT_FOUND. An IOU's rule is never waived.
+pub fn can_transfer_waive(sandbox: &Sandbox, asset: &HeldAsset, from: &[u8; 20], to: &[u8; 20], waive: bool) -> TxResult {
+    match asset {
+        HeldAsset::Mpt(id) if waive => match json_at(sandbox, &keylet::mpt_issuance_key(id)) {
+            Some(_) => TxResult::Success,
+            None => TxResult::ObjectNotFound,
+        },
+        _ => can_transfer(sandbox, asset, from, to),
+    }
+}
+
+/// `accountHolds(…, SpendableHandling::FullBalance)` (TokenHelpers.cpp:
+/// 366-497): what the account could spend, not just what it holds.
+/// - XRP: [`xrp_liquid`], as ever (:386-389);
+/// - the IOU's issuer: `STAmount::kMaxValue` at `kMaxOffset`,
+///   9999999999999999e80 (:392-397);
+/// - an IOU holder: the line's balance in its terms plus the OPPOSITE limit
+///   — the one the issuer set on its side (:343-346) — or zero without a
+///   usable line (the limit is not added to a missing or frozen line);
+/// - the MPT's issuer: MaximumAmount less OutstandingAmount, zero without
+///   the issuance (:423-438);
+/// - an MPT holder: the simple balance.
+///
+/// The `Err` is the IOU addition's overflow (rippled throws).
+pub fn account_holds_full(
+    sandbox: &Sandbox,
+    account: &[u8; 20],
+    asset: &HeldAsset,
+    zero_if_frozen: bool,
+    zero_if_unauthorized: bool,
+) -> Result<Amount, crate::flow::st_amount::StError> {
+    match asset {
+        HeldAsset::Xrp => Ok(account_holds(sandbox, account, asset, zero_if_frozen, zero_if_unauthorized)),
+        HeldAsset::Iou { currency, issuer } => {
+            if account == issuer {
+                return Ok(Amount { asset: *asset, negative: false, mantissa: 9_999_999_999_999_999, exponent: 80 });
+            }
+            let simple = account_holds(sandbox, account, asset, zero_if_frozen, zero_if_unauthorized);
+            let view_asset = iou_asset(currency, issuer);
+            let Some(line) = json_at(sandbox, &keylet::ripple_state_key(account, issuer, currency)) else { return Ok(simple) };
+            if zero_if_frozen
+                && (crate::flow::view::is_frozen(sandbox, account, &view_asset)
+                    || crate::flow::view::is_deep_frozen(sandbox, account, &view_asset))
+            {
+                return Ok(simple);
+            }
+            let opposite = if account > issuer { "LowLimit" } else { "HighLimit" };
+            let (negative, magnitude) = crate::tx::offer::signed_value(&line[opposite]);
+            let limit = Amount::new(*asset, magnitude.0, magnitude.1, negative, crate::tx::number::Rounding::ToNearest)?;
+            simple.iou_add(limit, crate::tx::number::Rounding::ToNearest)
+        }
+        HeldAsset::Mpt(id) => {
+            if *account != asset_issuer(asset) {
+                return Ok(account_holds(sandbox, account, asset, zero_if_frozen, zero_if_unauthorized));
+            }
+            let Some(issuance) = json_at(sandbox, &keylet::mpt_issuance_key(id)) else { return Ok(Amount::zero(*asset)) };
+            let max = issuance.get("MaximumAmount").map(|_| mpt::dec_field(&issuance, "MaximumAmount")).unwrap_or(mpt::MAX_MPT_AMOUNT);
+            let available = max.saturating_sub(mpt::dec_field(&issuance, "OutstandingAmount"));
+            Ok(Amount { asset: *asset, negative: false, mantissa: available, exponent: 0 })
+        }
+    }
+}
+
+/// `QUALITY_ONE`: a transfer rate of exactly one, no fee.
+pub const PARITY_RATE: u64 = 1_000_000_000;
+
+/// `transferRate(view, asset)` (3.5.0-rc1 TokenHelpers.cpp:541-547): the
+/// IOU issuer's TransferRate, 1e9 + 10,000 × the MPT issuance's TransferFee,
+/// parity for XRP or when neither is set.
+pub fn asset_transfer_rate(sandbox: &Sandbox, asset: &HeldAsset) -> u64 {
+    match asset {
+        HeldAsset::Xrp => PARITY_RATE,
+        HeldAsset::Iou { issuer, .. } => crate::flow::view::transfer_rate(sandbox, issuer) as u64,
+        HeldAsset::Mpt(id) => json_at(sandbox, &keylet::mpt_issuance_key(id))
+            .map(|issuance| mpt::issuance_transfer_rate(&issuance))
+            .unwrap_or(PARITY_RATE),
+    }
+}
+
+/// `mulRatio(STAmount, num, den, rounding)` (3.5.0-rc1 STAmount.cpp:
+/// 1766-1782): the amount times `num / den`, exact, rounded up or down —
+/// `mulRatio(IOUAmount)` for an IOU, 128-bit integer arithmetic for XRP and
+/// MPT (XRPAmount.h:269-292, MPTAmount.h:154-176; past int64 is the throw).
+fn mul_ratio(amount: &Amount, num: u64, den: u64, round_up: bool) -> Result<Amount, crate::flow::st_amount::StError> {
+    use crate::flow::st_amount::StError;
+    if den == 0 {
+        return Err(StError::DivideByZero);
+    }
+    if let HeldAsset::Iou { .. } = amount.asset {
+        let iou = crate::flow::amounts::IouAmount { negative: amount.negative, mantissa: amount.mantissa, exponent: amount.exponent };
+        let out = crate::flow::view::mul_ratio_iou(iou, num as u32, den as u32, round_up);
+        if out.mantissa == 0 {
+            return Ok(Amount::zero(amount.asset));
+        }
+        return Ok(Amount { asset: amount.asset, negative: out.negative, mantissa: out.mantissa, exponent: out.exponent });
+    }
+    let negative = amount.negative && !amount.is_zero();
+    let product = amount.mantissa as u128 * num as u128;
+    let mut quotient = product / den as u128;
+    // Signed division truncates towards zero: up adds one to a positive
+    // quotient, down adds one to a negative one's magnitude.
+    if product % den as u128 != 0 && (negative != round_up) {
+        quotient += 1;
+    }
+    if quotient > i64::MAX as u128 {
+        return Err(StError::Overflow);
+    }
+    let limit = if matches!(amount.asset, HeldAsset::Xrp) { 100_000_000_000_000_000u128 } else { mpt::MAX_MPT_AMOUNT as u128 };
+    if quotient > limit {
+        return Err(StError::Overflow);
+    }
+    Ok(Amount { asset: amount.asset, negative: negative && quotient != 0, mantissa: quotient as u64, exponent: 0 })
+}
+
+/// `addTransferFee(amount, rate)` (3.5.0-rc1 TokenHelpers.cpp:555-561): what
+/// a sender must part with for the receiver to get `amount` — the amount
+/// times rate / 1e9, rounded UP; the amount itself at parity.
+pub fn add_transfer_fee(amount: &Amount, rate: u64) -> Result<Amount, crate::flow::st_amount::StError> {
+    if rate == PARITY_RATE {
+        return Ok(*amount);
+    }
+    mul_ratio(amount, rate, PARITY_RATE, true)
+}
+
+/// `subtractTransferFee(amount, rate)` (3.5.0-rc1 TokenHelpers.cpp:563-569):
+/// what arrives of `amount` sent — times 1e9 / rate, rounded DOWN.
+pub fn subtract_transfer_fee(amount: &Amount, rate: u64) -> Result<Amount, crate::flow::st_amount::StError> {
+    if rate == PARITY_RATE {
+        return Ok(*amount);
+    }
+    mul_ratio(amount, PARITY_RATE, rate, false)
+}
+
+/// `isRepresentable(asset, value)` (3.5.0-rc1 STAmount.cpp:448-462):
+/// whether `STAmount{asset, value}` constructs at all — false where the
+/// Number, the IOU exponent or the XRP / MPT range throws.
+pub fn is_representable(asset: &HeldAsset, value: crate::tx::number::Number) -> bool {
+    Amount::from_number(*asset, value, crate::tx::number::Rounding::ToNearest).is_ok()
+}
+
+/// `doWithdraw(ctx, senderAcct, dstAcct, sourceAcct, priorBalance,
+/// destinationAmount, sourceAmount)` (3.5.0-rc1 View.cpp:507-588) — 3.4.1's
+/// `doWithdraw` (View.cpp:535-598) is this with the two amounts equal:
+///
+/// - to oneself: an empty holding is added first when something is
+///   DELIVERED — or always, before fixCleanup3_4_0 — an existing one
+///   (tecDUPLICATE) being fine;
+/// - to someone else: `verifyDepositPreauth`;
+/// - `source` must hold the SOURCE amount (freezes and authorization
+///   ignored): tefINTERNAL otherwise;
+/// - the amounts differ (a transfer fee, fixCleanup3_5_0): the gross goes
+///   source → issuer and the net issuer → destination, each one direct leg
+///   (`directSendNoFee`; an `account_send` with the issuer at one end is
+///   exactly that leg);
+/// - else `accountSend(source → dst, amount, WaiveTransferFee::Yes)`.
+#[allow(clippy::too_many_arguments)]
+pub fn do_withdraw_split(
+    sandbox: &mut Sandbox,
+    tx: &TxFields,
+    sender: &[u8; 20],
+    dst: &[u8; 20],
+    source: &[u8; 20],
+    prior_balance: u64,
+    destination_amount: &Amount,
+    source_amount: &Amount,
+) -> TxResult {
     if dst == sender {
-        let positive = !amount.is_zero() && !amount.negative;
+        let positive = !destination_amount.is_zero() && !destination_amount.negative;
         if positive || !amendments::fix_cleanup_3_4_0(sandbox) {
-            let added = add_empty_holding(sandbox, sender, prior_balance, &amount.asset);
+            let added = add_empty_holding(sandbox, sender, prior_balance, &destination_amount.asset);
             if added != TxResult::Success && added != TxResult::Duplicate {
                 return added;
             }
@@ -1159,11 +1481,19 @@ pub fn do_withdraw(
             return verdict;
         }
     }
-    let held = account_holds(sandbox, source, &amount.asset, false, false);
-    if held.number() < amount.number() {
+    let held = account_holds(sandbox, source, &destination_amount.asset, false, false);
+    if held.number() < source_amount.number() {
         return TxResult::TefInternal;
     }
-    account_send(sandbox, source, dst, amount, true)
+    if source_amount != destination_amount {
+        let issuer = asset_issuer(&destination_amount.asset);
+        let redeemed = account_send(sandbox, source, &issuer, source_amount, true);
+        if redeemed != TxResult::Success {
+            return redeemed;
+        }
+        return account_send(sandbox, &issuer, dst, destination_amount, true);
+    }
+    account_send(sandbox, source, dst, destination_amount, true)
 }
 
 #[cfg(test)]
