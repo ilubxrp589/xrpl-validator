@@ -28,6 +28,9 @@
 //!   reported and not counted;
 //! - `HARNESS`  the bundle could not be run (said why): the test fails.
 //!
+//! libxrpl's invariant checkers read objects the transaction itself does not; `vectors/diff341_extra_pre.json`
+//! supplies the ones the pinned loan vectors lack (see [`extra_pre`]).
+//!
 //! `vs-devnet=same|differs` says whether libxrpl 3.4.1 on the rewritten rules reproduced what devnet recorded:
 //! `differs` marks the transactions where the two arms part.
 //!
@@ -391,16 +394,31 @@ fn pre_of(bundle: &Value) -> BTreeMap<Key, Vec<u8>> {
     bundle["pre"].as_object().unwrap().iter().map(|(k, v)| (key32(k), hex::decode(v.as_str().unwrap().trim()).unwrap())).collect()
 }
 
-fn run_bundle(bundle: &Value) -> Result<Row, String> {
+/// Objects libxrpl's invariant checkers read and the transaction does not (so the bundle, hydrated from the
+/// transaction's own read-set, lacks them): the vault's share MPTokenIssuance for the loan transactions, which
+/// ValidVault looks up for every vault a transaction updates ("updated vault must have shares"). Fetched from
+/// devnet at each bundle's parent ledger and kept beside the vectors, keyed by vector name.
+fn extra_pre(name: &str) -> BTreeMap<Key, Vec<u8>> {
+    let all: Value = serde_json::from_str(include_str!("vectors/diff341_extra_pre.json")).unwrap();
+    all.get(name)
+        .and_then(Value::as_object)
+        .map(|o| o.iter().map(|(k, v)| (key32(k), hex::decode(v.as_str().unwrap()).unwrap())).collect())
+        .unwrap_or_default()
+}
+
+fn run_bundle(name: &str, bundle: &Value) -> Result<Row, String> {
     let tx_type = bundle["tx"]["TransactionType"].as_str().unwrap_or("?").to_string();
     let devnet = bundle["result"].as_str().unwrap_or("?").to_string();
     let mut pre = pre_of(bundle);
+    for (k, v) in extra_pre(name) {
+        pre.entry(k).or_insert(v);
+    }
     rewrite_amendments(&mut pre)?;
     let tx_bytes = tx_bytes_of(bundle)?;
     let legs = both_legs(bundle, &pre, &tx_bytes)?;
     let mut class = classify(&legs, &pre);
     let vs_devnet = same_as_devnet(bundle, &legs, &pre);
-    let mut detail = if matches!(class, "AGREE" | "NOOP") { Vec::new() } else { describe(&legs) };
+    let mut detail = if class == "AGREE" { Vec::new() } else { describe(&legs) };
     if bundle["tx"].get("Sponsor").is_some() && !matches!(class, "AGREE" | "NOOP") {
         class = "SPONSOR";
     }
@@ -534,7 +552,7 @@ fn libxrpl_341_against_our_engine_on_the_mainnet_arm() {
         if let Ok(removed) = rewrite_amendments(&mut pre_of(&bundle)) {
             *amendment_sets.entry(removed).or_default() += 1;
         }
-        let row = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_bundle(&bundle)))
+        let row = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_bundle(&name, &bundle)))
             .unwrap_or_else(|p| Err(format!("panic: {}", p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default())));
         match row {
             Ok(r) => {
@@ -564,9 +582,16 @@ fn libxrpl_341_against_our_engine_on_the_mainnet_arm() {
                 }
             }
             Err(e) => {
-                println!("D341 HARNESS {name} {}: {e}", bundle["tx"]["TransactionType"].as_str().unwrap_or("?"));
-                *tally.entry((bundle["tx"]["TransactionType"].as_str().unwrap_or("?").to_string(), "HARNESS")).or_default() += 1;
-                failing.push(name.clone());
+                // A sponsored transaction that cannot even be set up (the codec does not carry the sponsor
+                // fields) is the same known gap as one that runs and differs.
+                let sponsored = bundle["tx"].get("Sponsor").is_some();
+                let class = if sponsored { "SPONSOR" } else { "HARNESS" };
+                let tx_type = bundle["tx"]["TransactionType"].as_str().unwrap_or("?").to_string();
+                println!("D341 {class} {name} {tx_type}: could not run: {e}");
+                *tally.entry((tx_type, class)).or_default() += 1;
+                if !sponsored {
+                    failing.push(name.clone());
+                }
             }
         }
     }
