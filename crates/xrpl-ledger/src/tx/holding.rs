@@ -2721,7 +2721,11 @@ mod tests {
         assert!(is_representable(&HeldAsset::Xrp, n(0, 0)));
         let id = HeldAsset::Mpt(mptid(7, ISSUER));
         assert!(is_representable(&id, n(mpt::MAX_MPT_AMOUNT as u128, 0)));
-        assert!(!is_representable(&id, n(mpt::MAX_MPT_AMOUNT as u128 + 1, 0)));
+        // 2^63 itself is not a Large330 mantissa: Number rounds it to the nearest one, 2^63 - 1
+        // (Number.h:367 `kMaxRepUp`), which is the largest MPT amount.
+        assert!(is_representable(&id, n(mpt::MAX_MPT_AMOUNT as u128 + 1, 0)));
+        assert!(!is_representable(&id, n(mpt::MAX_MPT_AMOUNT as u128 + 4, 0)), "rounds to ...810");
+        assert!(!is_representable(&id, n(1, 19)));
         assert!(is_representable(&USD, n(9_999_999_999_999_999, 80)));
         assert!(!is_representable(&USD, n(1, 97)));
         assert!(is_representable(&USD, n(1, -200)), "an IOU underflow is zero, not a throw");
