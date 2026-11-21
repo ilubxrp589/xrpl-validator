@@ -40,7 +40,7 @@
 //! and the modes they pass to `roundToAsset`, everything runs at the
 //! thread's default, ToNearest ([`A`]): no loan transactor calls these
 //! functions from inside a guard of its own, and LoanPay asserts as much
-//! (LoanPay.cpp:747-750). The order of the operations of every expression is
+//! (LoanPay.cpp:751-754). The order of the operations of every expression is
 //! C++'s (left to right, one rounding per operation).
 //!
 //! # Exceptions

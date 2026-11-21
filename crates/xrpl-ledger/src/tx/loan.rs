@@ -19,8 +19,8 @@
 //! A Loan (ltLOAN, `tx::protocol::LOAN`) is keyed by its LoanBroker and the
 //! broker's sfLoanSequence at the time. It sits in TWO owner directories —
 //! the broker pseudo-account's (sfLoanBrokerNode) and the borrower's
-//! (sfOwnerNode), linked in that order (LoanSet.cpp:580-583) — and costs
-//! the BORROWER one reserve unit (:473, LoanDelete.cpp:130). It has no
+//! (sfOwnerNode), linked in that order (LoanSet.cpp:713-718) — and costs
+//! the BORROWER one reserve unit (:580, LoanDelete.cpp:131). It has no
 //! sfAccount and no sfDestination, so creating or deleting it threads no
 //! owner (`threadOwners`, ApplyStateTable.cpp:637-667): the borrower's
 //! AccountRoot is threaded because its OwnerCount changes, the broker
@@ -42,29 +42,29 @@
 //! - fixCleanup3_1_3, 3_2_0, 3_3_0, 3_4_0 (all on at mainnet): both arms of
 //!   every branch, as 3.4.1 has them;
 //! - LendingProtocolV1_1 (off at mainnet, on at devnet): LoanSet's vault
-//!   phase checks (LoanSet.cpp:274-293); everything else of V1_1 here is the
+//!   phase checks (LoanSet.cpp:319-344); everything else of V1_1 here is the
 //!   vault's sfLEVersion;
 //! - fixCleanup3_5_0 (3.5.0-rc1, off at mainnet, on at devnet): LoanSet's
 //!   out-of-range value fields refused tecPRECISION_LOSS instead of thrown
-//!   (rc1 LoanSet.cpp:383-390) — and, as OUR proxy for "this ledger is made
+//!   (rc1 LoanSet.cpp:385-395) — and, as OUR proxy for "this ledger is made
 //!   by 3.5.x servers", the ungated 3.5.0 change to LoanPay's conservation
 //!   balances ([`ConservationModel`]);
-//! - featureBatchV1_1: LoanSet's inner-batch rule (LoanSet.cpp:68-74). A
+//! - featureBatchV1_1: LoanSet's inner-batch rule (LoanSet.cpp:75-82). A
 //!   Loan type cannot be a Batch inner in 3.4.1 at all
 //!   (`tx::batch::DISABLED_INNER_TYPES`), so the rule is unreachable through
 //!   Batch; it is ported for a LoanSet that carries tfInnerBatchTxn.
 //!
 //! NOT ported: LendingProtocolV1_2 (`Supported::No` in 3.5.0-rc1, on no
 //! network). It would hook in at every `VaultVersion::FixedPrecision` branch
-//! — LoanSet (rc1 LoanSet.cpp:306-314 the coarsened-vault refusal, :479-489
-//! the open-zone limit, :612-624 `adjustVaultBalances`), LoanPay and
+//! — LoanSet (rc1 LoanSet.cpp:365-373 the coarsened-vault refusal, :590-602
+//! the open-zone limit, :753-765 `adjustVaultBalances`), LoanPay and
 //! LoanManage (their FixedPrecision arms) — at LoanSet's private-broker
-//! domain check (rc1 :397-414, `lsfLoanBrokerPrivate`), and in Batch (rc1
+//! domain check (rc1 :491-507, `lsfLoanBrokerPrivate`), and in Batch (rc1
 //! Batch.cpp:312-316 stops refusing vault and lending inners). featureSponsor
-//! (reserve sponsors: LoanSet.cpp:63-66 `sfSponsorFlags`, the sponsor arms
+//! (reserve sponsors: LoanSet.cpp:68-72 `sfSponsorFlags`, the sponsor arms
 //! of `increaseOwnerCount` / `accountReserve`) is not ported either, as in
 //! the rest of the family. 3.5.0-rc1's Cosign (`TapProposal` skipping the
-//! counterparty-signature presence check, rc1 LoanSet.cpp:84) is
+//! counterparty-signature presence check, rc1 LoanSet.cpp:96) is
 //! `Supported::No` and not ported.
 //!
 //! # Signatures and fees
@@ -158,7 +158,7 @@ pub const DEFAULT_PAYMENT_TOTAL: u32 = 1;
 /// `LoanSet::kDefaultGracePeriod` (LoanSet.h:72).
 pub const DEFAULT_GRACE_PERIOD: u32 = 60;
 
-/// `LoanSet::getValueFields()` (LoanSet.cpp:183-196): the Number fields of a
+/// `LoanSet::getValueFields()` (LoanSet.cpp:210-223): the Number fields of a
 /// LoanSet that are amounts of the vault's asset.
 const VALUE_FIELDS: [&str; 5] = ["PrincipalRequested", "LoanOriginationFee", "LoanServiceFee", "LatePaymentFee", "ClosePaymentFee"];
 
@@ -229,7 +229,7 @@ fn parent_close_time(sandbox: &Sandbox) -> u32 {
     sandbox.base().header.close_time
 }
 
-/// `view.header().closeTime` of the ledger being built (LoanSet.cpp:198-202
+/// `view.header().closeTime` of the ledger being built (LoanSet.cpp:225-229
 /// `getStartDate`): while transactions are applied the open view's close
 /// time is `parent.closeTime + closeTimeResolution` (Ledger.cpp:262-278; the
 /// agreed close time replaces it only when the ledger is accepted). The
@@ -274,8 +274,8 @@ fn applied(sandbox: &mut Sandbox, body: impl FnOnce(&mut Sandbox) -> M<TxResult>
 /// The cover a broker must keep for `debt_total` as LoanSet and LoanPay
 /// compute it: `minimumBrokerCover` under fixCleanup3_2_0 (the rate of the
 /// debt rounded UP at the vault's scale); before it the unrounded rate of
-/// the debt (LoanSet.cpp:455-467) or that rounded UP at the LOAN's scale
-/// (LoanPay.cpp:284-295), all under one Upward guard.
+/// the debt (LoanSet.cpp:559-572) or that rounded UP at the LOAN's scale
+/// (LoanPay.cpp:373-391), all under one Upward guard.
 fn minimum_cover(sandbox: &Sandbox, debt_total: Number, rate: u32, vault: &Value, pre_fix_scale: Option<(HeldAsset, i32)>) -> M<Number> {
     if am::fix_cleanup_3_2_0(sandbox) {
         return lh::minimum_broker_cover(debt_total, rate, vault);
@@ -302,7 +302,7 @@ pub fn transactor_base_fee(tx_fields: &Value, base_fee: u64) -> u64 {
     base_fee.saturating_add((signers + sponsor_signers).saturating_mul(base_fee))
 }
 
-/// `LoanSet::calculateBaseFee` (LoanSet.cpp:165-181): the normal cost plus
+/// `LoanSet::calculateBaseFee` (LoanSet.cpp:183-208): the normal cost plus
 /// one base fee per counterparty signer — the number of sfSigners inside
 /// sfCounterpartySignature, or 1 for a single sfTxnSignature there, or 0
 /// when it carries neither (or is absent: `getFieldObject` of a missing
@@ -318,7 +318,7 @@ pub fn loan_set_base_fee(tx_fields: &Value, base_fee: u64) -> u64 {
     normal.saturating_add(signer_count.saturating_mul(base_fee))
 }
 
-/// `LoanPay::calculateBaseFee` (LoanPay.cpp:99-202): one base fee per
+/// `LoanPay::calculateBaseFee` (LoanPay.cpp:112-226): one base fee per
 /// kLoanPaymentsPerFeeIncrement (5) scheduled payments the amount could
 /// make, at least one.
 ///
@@ -397,24 +397,24 @@ pub fn loan_pay_base_fee(sandbox: &Sandbox, tx: &TxFields, base_fee: u64) -> M<u
 /// `preflight` (structure), `STTx::checkSign` through `preflight2` (the
 /// cryptography) and `LoanSet::checkSign` (that the key is the
 /// counterparty's master or regular key, or its signer list is satisfied —
-/// LoanSet.cpp:142-163). This engine checks, as it does for the primary
+/// LoanSet.cpp:155-181). This engine checks, as it does for the primary
 /// signature, NO cryptography and NO key authorization. What IS checked:
 ///
 /// - a LoanSet that is not a Batch inner without sfCounterpartySignature:
-///   temBAD_SIGNER (:76-85);
+///   temBAD_SIGNER (:85-94);
 /// - a Batch inner (tfInnerBatchTxn) without sfCounterparty under
-///   BatchV1_1: temBAD_SIGNER (:68-74);
+///   BatchV1_1: temBAD_SIGNER (:75-82);
 /// - a non-empty sfSigningPubKey inside sfCounterpartySignature that is not
 ///   a public key (33 bytes, ed25519 `ED…` or secp256k1 `02…` / `03…`):
-///   temBAD_SIGNATURE (:87-91, `preflightCheckSigningKey`);
+///   temBAD_SIGNATURE (:96-100, `preflightCheckSigningKey`);
 /// - `checkSign`'s one state lookup: no sfCounterparty and no LoanBroker to
-///   take the owner from: temBAD_SIGNER (:148-158), before preclaim's own
+///   take the owner from: temBAD_SIGNER (:164-173), before preclaim's own
 ///   checks.
 ///
 /// Fee: [`loan_set_base_fee`]. Reserve: the borrower's OwnerCount rises by
 /// 1 for the Loan, judged against the submitter's balance before the fee
 /// when the borrower submits and the borrower's current balance otherwise
-/// (:473-481); the borrower's holding of the asset (and, with an origination
+/// (:580-587); the borrower's holding of the asset (and, with an origination
 /// fee, the broker owner's) is created when missing, at their own reserve.
 pub struct LoanSetTransactor;
 
@@ -428,7 +428,7 @@ fn is_public_key(hex_key: &str) -> bool {
 }
 
 impl LoanSetTransactor {
-    /// `LoanSet::preflight` (LoanSet.cpp:57-140) under `batch_v1_1`
+    /// `LoanSet::preflight` (LoanSet.cpp:61-153) under `batch_v1_1`
     /// (featureBatchV1_1).
     fn preflight_rules(tx: &TxFields, batch_v1_1: bool) -> TxResult {
         let inner = tx_flags(tx) & TF_INNER_BATCH_TXN != 0;
@@ -505,14 +505,14 @@ impl LoanSetTransactor {
 
     /// The borrower and the broker's owner: `counterparty` is sfCounterparty
     /// or the broker's owner; the borrower is the submitter when the
-    /// counterparty is the owner, else the counterparty (LoanSet.cpp:257-268).
+    /// counterparty is the owner, else the counterparty (LoanSet.cpp:293-303).
     fn parties(tx: &TxFields, broker_owner: [u8; 20]) -> ([u8; 20], [u8; 20]) {
         let counterparty = account_of(&tx.fields, "Counterparty").unwrap_or(broker_owner);
         let borrower = if counterparty == broker_owner { tx.account } else { counterparty };
         (counterparty, borrower)
     }
 
-    /// `LoanSet::doApply` (LoanSet.cpp:341-590).
+    /// `LoanSet::doApply` (LoanSet.cpp:430-725).
     fn apply(tx: &TxFields, sandbox: &mut Sandbox) -> M<TxResult> {
         let rules = LoanRules::of(sandbox);
         let Some(broker_id) = mpt::key_field(&tx.fields, "LoanBrokerID") else { return Ok(TxResult::TefBadLedger) };
@@ -696,13 +696,13 @@ impl Transactor for LoanSetTransactor {
     }
 
     fn preflight_in(&self, tx: &TxFields, rules: &Sandbox) -> TxResult {
-        // `checkExtraFeatures` (:45-49), `getFlagsMask` (:51-55).
+        // `checkExtraFeatures` (:49-53), `getFlagsMask` (:55-59).
         gate(tx, rules, lh::check_lending_protocol_dependencies(rules, tx), TF_LOAN_SET_MASK)
             .unwrap_or_else(|| Self::preflight_rules(tx, enabled(rules, am::BATCH_V1_1)))
     }
 
-    /// `LoanSet::checkSign`'s state lookup (LoanSet.cpp:142-158), then
-    /// `LoanSet::preclaim` (:204-339).
+    /// `LoanSet::checkSign`'s state lookup (LoanSet.cpp:155-173), then
+    /// `LoanSet::preclaim` (:231-428).
     fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
         let Some(broker_id) = mpt::key_field(&tx.fields, "LoanBrokerID") else { return TxResult::TefInternal };
         let broker = read_broker(sandbox, &broker_id);
@@ -828,9 +828,9 @@ impl Transactor for LoanSetTransactor {
 /// Fee: the plain base fee. No reserve change.
 pub struct LoanManageTransactor;
 
-/// `LoanManage::unimpairLoan` (LoanManage.cpp:324-374) on the Loan and the
+/// `LoanManage::unimpairLoan` (LoanManage.cpp:338-390) on the Loan and the
 /// Vault in hand — also LoanPay's first step on an impaired loan
-/// (LoanPay.cpp:316-322): the loss the impairment booked
+/// (LoanPay.cpp:413-419): the loss the impairment booked
 /// ([`lm::loan_vault_exposure`]) leaves sfLossUnrealized (tefBAD_LEDGER when
 /// more than is booked) and lsfLoanImpaired is cleared. Before
 /// fixCleanup3_4_0 the next due date is put back: the normal one
@@ -861,7 +861,7 @@ fn unimpair_loan(sandbox: &Sandbox, loan: &mut Value, vault: &mut Value, asset: 
 }
 
 impl LoanManageTransactor {
-    /// `LoanManage::impairLoan` (LoanManage.cpp:272-321): the vault's
+    /// `LoanManage::impairLoan` (LoanManage.cpp:286-336): the vault's
     /// exposure to the loan becomes an unrealized loss — refused
     /// tecLIMIT_EXCEEDED when that is more than the vault has lent out
     /// (`AssetsTotal − AssetsAvailable`). fixCleanup3_4_0: only a late loan
@@ -887,7 +887,7 @@ impl LoanManageTransactor {
         Ok(TxResult::Success)
     }
 
-    /// `LoanManage::defaultLoan` (LoanManage.cpp:117-270): the vault's
+    /// `LoanManage::defaultLoan` (LoanManage.cpp:134-284): the vault's
     /// exposure to the loan is written off.
     ///
     /// - the first-loss capital that covers it: `DebtTotal ×
@@ -992,7 +992,7 @@ impl LoanManageTransactor {
         Ok(holding::account_send(sandbox, &broker_pseudo, &vault_pseudo, &covered, true))
     }
 
-    /// `LoanManage::doApply` (LoanManage.cpp:376-413).
+    /// `LoanManage::doApply` (LoanManage.cpp:392-436).
     fn apply(tx: &TxFields, sandbox: &mut Sandbox) -> M<TxResult> {
         let Some(loan_key) = loan_id(tx) else { return Ok(TxResult::TefBadLedger) };
         let Some(mut loan) = read_loan(sandbox, &loan_key) else { return Ok(TxResult::TefBadLedger) };
@@ -1001,7 +1001,7 @@ impl LoanManageTransactor {
         let Some((vault_key, mut vault)) = vault_of(sandbox, &broker) else { return Ok(TxResult::TefBadLedger) };
         let Some(asset) = vault_asset(&vault) else { return Ok(TxResult::TefBadLedger) };
         // fixCleanup3_1_3: the objects written are rounded to the asset
-        // (`associateAsset`, :405-410).
+        // (`associateAsset`, :426-433).
         let associate = enabled(sandbox, am::FIX_CLEANUP_3_1_3);
         let asset_if = associate.then_some(asset);
         let flags = tx_flags(tx);
@@ -1032,7 +1032,7 @@ impl LoanManageTransactor {
 }
 
 impl Transactor for LoanManageTransactor {
-    /// `LoanManage::preflight` (LoanManage.cpp:43-60): a zero sfLoanID is
+    /// `LoanManage::preflight` (LoanManage.cpp:43-62): a zero sfLoanID is
     /// temINVALID; more than one of the three flags temINVALID_FLAG.
     fn preflight(&self, tx: &TxFields) -> TxResult {
         if loan_id(tx).is_none_or(|id| is_zero_key(&id)) {
@@ -1050,7 +1050,7 @@ impl Transactor for LoanManageTransactor {
         gate(tx, rules, lh::check_lending_protocol_dependencies(rules, tx), TF_LOAN_MANAGE_MASK).unwrap_or_else(|| self.preflight(tx))
     }
 
-    /// `LoanManage::preclaim` (LoanManage.cpp:62-115).
+    /// `LoanManage::preclaim` (LoanManage.cpp:64-132).
     fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
         let Some(loan) = loan_id(tx).and_then(|id| read_loan(sandbox, &id)) else { return TxResult::NoEntry };
         let loan_flags = obj_flags(&loan);
@@ -1105,12 +1105,12 @@ impl Transactor for LoanManageTransactor {
 /// 3.4.1 and 3.5.0-rc1 differ here WITHOUT an amendment gate
 /// (`xrpl-ops/vaultport/diff-341-vs-350rc.md`, item B1):
 ///
-/// - [`ConservationModel::V341`] (LoanPay.cpp:46-65): every non-XRP
+/// - [`ConservationModel::V341`] (LoanPay.cpp:54-72): every non-XRP
 ///   balance is `accountHolds(…, SpendableHandling::FullBalance)` — for a
 ///   trust-line holder the balance PLUS the limit the issuer set on its own
 ///   side of the line. An issuer who set limits of 5e95 or more toward the
 ///   borrower and the fee's payee makes the sum overflow: tefEXCEPTION.
-/// - [`ConservationModel::V350`] (rc1 LoanPay.cpp:50-90): a holder's
+/// - [`ConservationModel::V350`] (rc1 LoanPay.cpp:53-90): a holder's
 ///   balance is the stored one (`SimpleBalance`); only the issuer itself is
 ///   read with FullBalance. The same LoanPay applies.
 ///
@@ -1205,11 +1205,11 @@ fn conservation_arithmetic(before: &[Amount; 3], after: &[Amount; 3]) -> M<()> {
 /// receive the asset, to the broker's pseudo-account as more cover.
 ///
 /// Fee: [`loan_pay_base_fee`]. Reserve: none, except the holding created
-/// for a submitter who is also the fee's payee (LoanPay.cpp:652-668).
+/// for a submitter who is also the fee's payee (LoanPay.cpp:654-669).
 pub struct LoanPayTransactor;
 
 impl LoanPayTransactor {
-    /// `LoanPay::doApply` (LoanPay.cpp:263-853).
+    /// `LoanPay::doApply` (LoanPay.cpp:331-848).
     fn apply(tx: &TxFields, sandbox: &mut Sandbox) -> M<TxResult> {
         let rules = LoanRules::of(sandbox);
         let account = tx.account;
@@ -1288,7 +1288,7 @@ impl LoanPayTransactor {
             set_number_field(&mut broker, "CoverAvailable", arith(cover_available.add(paid_to_broker, AMBIENT))?, Soe::Default);
         }
 
-        // associateAsset on the three (:572-574), then the vault's totals
+        // associateAsset on the three (:566-568), then the vault's totals
         // are read back as stored.
         for (key, obj, format) in [(loan_key, &mut loan, &LOAN), (broker_key, &mut broker, &LOAN_BROKER), (vault_key, &mut vault, &VAULT)] {
             let stored = store(sandbox, key, obj, format, Some(asset))?;
@@ -1362,7 +1362,7 @@ impl LoanPayTransactor {
 }
 
 impl Transactor for LoanPayTransactor {
-    /// `LoanPay::preflight` (LoanPay.cpp:79-97): a zero sfLoanID is
+    /// `LoanPay::preflight` (LoanPay.cpp:87-110): a zero sfLoanID is
     /// temINVALID, a non-positive amount temBAD_AMOUNT, more than one of
     /// the three payment flags temINVALID_FLAG.
     fn preflight(&self, tx: &TxFields) -> TxResult {
@@ -1381,12 +1381,12 @@ impl Transactor for LoanPayTransactor {
     }
 
     fn preflight_in(&self, tx: &TxFields, rules: &Sandbox) -> TxResult {
-        // `checkExtraFeatures` (:67-71), `getFlagsMask` (:73-77).
+        // `checkExtraFeatures` (:75-79), `getFlagsMask` (:81-85).
         gate(tx, rules, lh::check_lending_protocol_dependencies(rules, tx), TF_LOAN_PAY_MASK).unwrap_or_else(|| self.preflight(tx))
     }
 
     /// `LoanPay::calculateBaseFee`'s throw (see [`loan_pay_base_fee`]), then
-    /// `LoanPay::preclaim` (LoanPay.cpp:204-261).
+    /// `LoanPay::preclaim` (LoanPay.cpp:228-329).
     fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
         if loan_pay_base_fee(sandbox, tx, 10).is_err() {
             return TxResult::TefException;
@@ -1453,7 +1453,7 @@ impl Transactor for LoanPayTransactor {
 pub struct LoanDeleteTransactor;
 
 impl LoanDeleteTransactor {
-    /// `LoanDelete::doApply` (LoanDelete.cpp:76-135).
+    /// `LoanDelete::doApply` (LoanDelete.cpp:72-136).
     fn apply(tx: &TxFields, sandbox: &mut Sandbox) -> M<TxResult> {
         let Some(loan_key) = loan_id(tx) else { return Ok(TxResult::TefBadLedger) };
         let Some(loan) = read_loan(sandbox, &loan_key) else { return Ok(TxResult::TefBadLedger) };
@@ -1480,7 +1480,7 @@ impl LoanDeleteTransactor {
             set_number_field(&mut broker, "DebtTotal", Number::ZERO, Soe::Default);
         }
         // The broker is updated without `associateAsset`; the vault is only
-        // peeked (its `associateAsset` at :132 changes nothing that is stored).
+        // peeked (its `associateAsset` at :133 changes nothing that is stored).
         let stored = store(sandbox, broker_key, &mut broker, &LOAN_BROKER, None)?;
         if stored != TxResult::Success {
             return Ok(stored);
@@ -1491,7 +1491,7 @@ impl LoanDeleteTransactor {
 }
 
 impl Transactor for LoanDeleteTransactor {
-    /// `LoanDelete::preflight` (LoanDelete.cpp:28-35).
+    /// `LoanDelete::preflight` (LoanDelete.cpp:27-34).
     fn preflight(&self, tx: &TxFields) -> TxResult {
         if loan_id(tx).is_none_or(|id| is_zero_key(&id)) {
             return TxResult::InvalidTx;
@@ -1500,11 +1500,11 @@ impl Transactor for LoanDeleteTransactor {
     }
 
     fn preflight_in(&self, tx: &TxFields, rules: &Sandbox) -> TxResult {
-        // `checkExtraFeatures` (:22-26); no flags of its own.
+        // `checkExtraFeatures` (:21-25); no flags of its own.
         gate(tx, rules, lh::check_lending_protocol_dependencies(rules, tx), TF_UNIVERSAL_MASK).unwrap_or_else(|| self.preflight(tx))
     }
 
-    /// `LoanDelete::preclaim` (LoanDelete.cpp:37-74).
+    /// `LoanDelete::preclaim` (LoanDelete.cpp:36-70).
     fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
         let Some(loan) = loan_id(tx).and_then(|id| read_loan(sandbox, &id)) else { return TxResult::NoEntry };
         if uint(&loan, "PaymentRemaining") > 0 {

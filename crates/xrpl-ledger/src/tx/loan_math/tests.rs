@@ -1,8 +1,15 @@
-//! The loan maths against rippled's own expectations: every case of
-//! `src/test/app/lending/LendingHelpers_test.cpp` (3.4.1) that names a
-//! number, at the Large330 scale the lending amendments run at, plus the
-//! consistency properties rippled's tests rely on (a schedule paid to the
-//! end leaves exactly nothing).
+//! The loan maths against rippled's own expectations: the cases of
+//! `src/test/app/lending/LendingHelpers_test.cpp` (3.4.1) :39-1667 that
+//! name a number, at the Large330 scale the lending amendments run at —
+//! each test cites the lines it ports — plus tests written from the
+//! functions themselves (they cite LendingHelpers.cpp / .h) and the
+//! consistency property a schedule must have (paid to the end it leaves
+//! exactly nothing). Not ported from that file: the dispatcher tests
+//! (:1669-1803), `testCanApplyToBrokerCover` (:1805, in
+//! `tx::lending_helpers`) and `testLoanDefaultFreezeExemptAccounts` (:1888,
+//! an invariant's helper). rippled's other lending test files (LoanPay_test,
+//! LoanSet_test, LoanRounding_test, … — ledger-level `Env` tests) were not
+//! ported.
 
 use super::*;
 use crate::tx::number::{MantissaScale, ScaleGuard};
@@ -328,40 +335,42 @@ fn try_overpayment_loan_interest_and_fee_overpayment_interest_and_fee_both_arms(
     assert_eq!(show(diff(legacy.new.management_fee_due, legacy.old.management_fee_due)), show(n(-18304, -5)));
 }
 
-/// LendingHelpers_test.cpp:1484-1667: the two accounting models.
+/// LendingHelpers_test.cpp:1484-1667: the two accounting models, rippled's
+/// cases.
 #[test]
 fn accounting_models() {
     let _g = large();
-    // accrual::loanOriginationDeltas (:1485-1520).
-    for (principal, interest) in [(1000, 50), (1000, 0), (0, 0)] {
+    // testAccrualLoanOriginationDeltas (:1485-1520).
+    for (principal, interest) in [(1000, 0), (1000, 75)] {
         let d = accrual::loan_origination_deltas(i(principal), i(interest)).unwrap();
         assert_eq!((d.assets_total_delta, d.debt_total_delta), (i(interest), i(principal + interest)));
     }
-    // cash_basis: interest is ignored (:1522-1540).
+    // testCashBasisLoanOriginationDeltas (:1522-1540): interest is ignored.
     let d = cash_basis::loan_origination_deltas(i(1000));
     assert_eq!((d.assets_total_delta, d.debt_total_delta), (Number::ZERO, i(1000)));
-    // accrual::loanOriginationExceedsVaultMaximum (:1542-1620): no maximum
-    // never exceeds; else interest > maximum - total.
+    // testAccrualLoanOriginationExceedsVaultMaximum (:1542-1590).
     let exceeds = |max: i64, total: i64, interest: i64| accrual::loan_origination_exceeds_vault_maximum(i(max), i(total), i(interest)).unwrap();
-    assert!(!exceeds(0, 1000, 500));
-    assert!(!exceeds(1000, 900, 100));
-    assert!(exceeds(1000, 900, 101));
-    assert!(!exceeds(1000, 900, 0));
-    assert!(exceeds(1000, 1000, 1));
-    // Exposure (:1622-1638).
-    let loan = json!({"TotalValueOutstanding": "1100", "PrincipalOutstanding": "1000", "ManagementFeeOutstanding": "10"});
-    assert_eq!(accrual::loan_vault_exposure(&loan).unwrap(), i(1090));
-    assert_eq!(cash_basis::loan_vault_exposure(&loan), i(1000));
-    // Payment deltas (:1640-1667).
-    let parts = LoanPaymentParts { principal_paid: i(100), interest_paid: i(10), value_change: i(3), fee_paid: i(1) };
+    assert!(!exceeds(0, 900, 1000), "no maximum configured");
+    assert!(!exceeds(1000, 900, 50), "interest fits under headroom");
+    assert!(!exceeds(1000, 900, 100), "interest exactly fills headroom");
+    assert!(exceeds(1000, 900, 101), "interest exceeds headroom");
+    // testAccrualLoanVaultExposure / testCashBasisLoanVaultExposure (:1622-1638).
+    let loan = json!({"TotalValueOutstanding": "1000", "PrincipalOutstanding": "800", "ManagementFeeOutstanding": "50"});
+    assert_eq!(accrual::loan_vault_exposure(&loan).unwrap(), i(950));
+    assert_eq!(cash_basis::loan_vault_exposure(&loan), i(800));
+    // testLoanPaymentDeltas (:1640-1667).
+    let parts = LoanPaymentParts { principal_paid: i(100), interest_paid: i(20), value_change: i(5), fee_paid: i(3) };
     let d = accrual::loan_payment_deltas(&parts).unwrap();
-    assert_eq!((d.assets_total_delta, d.debt_total_delta), (i(3), i(107)));
+    assert_eq!((d.assets_total_delta, d.debt_total_delta), (i(5), i(115)));
     let d = cash_basis::loan_payment_deltas(&parts);
-    assert_eq!((d.assets_total_delta, d.debt_total_delta), (i(10), i(100)));
+    assert_eq!((d.assets_total_delta, d.debt_total_delta), (i(20), i(100)));
 }
 
-/// LendingHelpers_test.cpp:1669-1803: the dispatchers follow the vault's
-/// LEVersion alone.
+/// LendingHelpers.cpp:255-301: the dispatchers follow the vault's
+/// sfLEVersion alone. (rippled's own dispatcher tests are
+/// LendingHelpers_test.cpp:1669-1803, which also turn the amendment on and
+/// off around the same two vaults; these cases are written from the
+/// functions.)
 #[test]
 fn the_accounting_model_is_the_vaults_version() {
     let _g = large();
@@ -460,9 +469,9 @@ fn amount(asset: HeldAsset, value: Number) -> Amount {
     Amount::from_number(asset, value, Rounding::Upward).unwrap()
 }
 
-/// The property rippled's loan tests check after every schedule
-/// (LoanTestBase.h `makeLoanPayments` and its callers): paying the rounded
-/// periodic payment each period ends with nothing outstanding after exactly
+/// The schedule's defining property, from `computePaymentComponents`,
+/// `doPayment` and `checkLoanGuards` (guard 4 pins the number of payments):
+/// paying the rounded periodic payment each period ends with nothing outstanding after exactly
 /// PaymentTotal payments, the parts of every payment add up to what was
 /// paid, the principal paid in total is the principal lent, and interest
 /// plus fee is the total value less the principal.

@@ -1,6 +1,10 @@
-//! The four Loan transactors on hand-built ledgers: every result code and
-//! branch of LoanSet.cpp, LoanPay.cpp, LoanManage.cpp and LoanDelete.cpp
-//! (3.4.1), the objects they leave, and the two custom base fees.
+//! The four Loan transactors on hand-built ledgers: the result codes and
+//! branches of LoanSet.cpp, LoanPay.cpp, LoanManage.cpp and LoanDelete.cpp
+//! (3.4.1), the objects they leave, and the two custom base fees. The cases
+//! are written from the transactors' source (each test cites its lines);
+//! rippled's own ledger-level tests (src/test/app/lending/Loan*_test.cpp)
+//! were not ported. Real devnet transactions are in
+//! `crates/xrpl-node/tests/loan_vector.rs`.
 
 use super::*;
 use crate::ledger::header::LedgerHeader;
@@ -436,8 +440,7 @@ fn delegation_and_flags() {
 // LoanSet
 // ---------------------------------------------------------------------------
 
-/// LoanSet.cpp:57-140 (LoanSet_test.cpp / LoanValidation_test.cpp's
-/// preflight cases).
+/// LoanSet.cpp:61-153.
 #[test]
 fn loan_set_preflight() {
     let fx = Fx::xrp();
@@ -503,7 +506,7 @@ fn loan_set_preflight() {
     refused(json!({"LoanBrokerID": "00".repeat(32)}), TxResult::InvalidTx, "a zero sfLoanBrokerID");
 }
 
-/// LoanSet.cpp:142-158 (checkSign's lookup) and :204-270: the broker, the
+/// LoanSet.cpp:155-173 (checkSign's lookup) and :231-317: the broker, the
 /// two parties, the borrower's account, the clock.
 #[test]
 fn loan_set_preclaim_parties_and_time() {
@@ -535,7 +538,7 @@ fn loan_set_preclaim_parties_and_time() {
     assert_eq!(result(&late.state, &late.loan_set(json!({}))), TxResult::Killed, "the interval does not fit");
 }
 
-/// LoanSet.cpp:274-293: under LendingProtocolV1_1 a closed-ended vault
+/// LoanSet.cpp:319-344: under LendingProtocolV1_1 a closed-ended vault
 /// lends only in its Investment phase, and only loans whose last payment
 /// falls due kLoanRedemptionBuffer (60 s) before the redemption date.
 #[test]
@@ -563,7 +566,7 @@ fn loan_set_vault_phases() {
     assert_eq!(r(&closed(NOW - 1, NOW, &MAINNET_WITH_LENDING)), TxResult::Success);
 }
 
-/// LoanSet.cpp:295-339: the vault's maximum, the value fields in the asset,
+/// LoanSet.cpp:346-428: the vault's maximum, the value fields in the asset,
 /// holdings and freezes.
 #[test]
 fn loan_set_preclaim_vault_and_asset() {
@@ -617,9 +620,8 @@ fn loan_set_preclaim_vault_and_asset() {
     assert_eq!(untransferable(&rules_without(&[am::FIX_CLEANUP_3_4_0]), true), TxResult::NoAuth);
 }
 
-/// LoanSet.cpp:341-590, an interest-free loan of XRP: every object it
-/// writes (LoanSet_test.cpp's lifecycle checks; LoanTestBase.h
-/// `verifyLoanStatus`).
+/// LoanSet.cpp:430-725, an interest-free loan of XRP: every object it
+/// writes.
 #[test]
 fn loan_set_creates_the_loan() {
     let fx = Fx::xrp();
@@ -656,7 +658,7 @@ fn loan_set_creates_the_loan() {
     assert_eq!(sb.modification_count(), 7);
 }
 
-/// LoanSet.cpp:441-443, :524-545, :551-564: fees, rates, flags and the
+/// LoanSet.cpp:546-548, :640-648, :660-691: fees, rates, flags and the
 /// origination fee, which the broker's owner receives out of the principal.
 #[test]
 fn loan_set_terms_and_origination_fee() {
@@ -698,7 +700,7 @@ fn loan_set_terms_and_origination_fee() {
     assert_eq!(holds(&sb, &fx.vault_pseudo, &USD), n("9000"));
 }
 
-/// LendingHelpers.cpp:222-247 through LoanSet.cpp:446-449, :566-567: a
+/// LendingHelpers.cpp:222-247 through LoanSet.cpp:550-551, :695-696: a
 /// cash-basis vault books the principal only.
 #[test]
 fn loan_set_on_a_cash_basis_vault() {
@@ -713,7 +715,7 @@ fn loan_set_on_a_cash_basis_vault() {
     assert_eq!(nf(&fx.broker_obj(&sb), "DebtTotal"), n("1000"));
 }
 
-/// LoanSet.cpp:385-388, :415-418, :419-426, :428-436, :446-467: what the
+/// LoanSet.cpp:471-475, :503-508, :511-519, :524-531, :550-578: what the
 /// vault, the broker and the loan's own arithmetic refuse.
 #[test]
 fn loan_set_limits() {
@@ -748,7 +750,7 @@ fn loan_set_limits() {
     assert_eq!(result(&thin.state, &thin.loan_set(json!({"PrincipalRequested": "1000000"}))), TxResult::Success);
 }
 
-/// LoanSet.cpp:473-481: the borrower's reserve for the Loan — against the
+/// LoanSet.cpp:580-587: the borrower's reserve for the Loan — against the
 /// balance before the fee when the borrower submits, the current balance
 /// when the owner does.
 #[test]
@@ -771,7 +773,7 @@ fn loan_set_reserve() {
     assert_eq!(result(&fx.state, &fx.loan_set_by(OWNER, json!({"Counterparty": hex::encode(BORROWER)}))), TxResult::InsufficientReserve);
 }
 
-/// LoanSet.cpp:487-521: the borrower's holding is created (an MPToken; a
+/// LoanSet.cpp:600-637: the borrower's holding is created (an MPToken; a
 /// trust line), and an unauthorized borrower is refused.
 #[test]
 fn loan_set_creates_the_borrowers_holding() {
@@ -804,7 +806,7 @@ fn loan_set_creates_the_borrowers_holding() {
     only_the_fee(&sb, &BORROWER);
 }
 
-/// LoanSet.cpp:569-576: the broker's loan sequence must not wrap.
+/// LoanSet.cpp:706-710: the broker's loan sequence must not wrap.
 #[test]
 fn loan_set_at_the_last_loan_sequence() {
     let mut fx = Fx::xrp();
@@ -818,7 +820,7 @@ fn loan_set_at_the_last_loan_sequence() {
 // LoanPay
 // ---------------------------------------------------------------------------
 
-/// LoanPay.cpp:79-97.
+/// LoanPay.cpp:87-110.
 #[test]
 fn loan_pay_preflight() {
     let fx = Fx::xrp().with_loan(json!({}));
@@ -833,8 +835,8 @@ fn loan_pay_preflight() {
     }
 }
 
-/// LoanPay.cpp:204-261 (LoanPay_test.cpp's refusal cases; devnet has
-/// tecWRONG_ASSET, tecFROZEN and tecINSUFFICIENT_PAYMENT examples).
+/// LoanPay.cpp:228-329 (devnet has tecWRONG_ASSET, tecFROZEN, tecEXPIRED
+/// and tecINSUFFICIENT_PAYMENT examples; the last is a vector).
 #[test]
 fn loan_pay_preclaim() {
     let fx = Fx::xrp().with_loan(json!({}));
@@ -869,9 +871,9 @@ fn loan_pay_preclaim() {
     assert_eq!(result(&broke.state, &broke.pay(250, 0)), TxResult::InsufficientFunds);
 }
 
-/// LoanPay.cpp:263-853 on an interest-free XRP loan with a service fee:
+/// LoanPay.cpp:331-848 on an interest-free XRP loan with a service fee:
 /// one scheduled payment, then the rest, then nothing left
-/// (LoanLifecycle_test.cpp; LoanPay_test.cpp).
+/// (devnet: the three vectors on loan 5FEE8B895C).
 #[test]
 fn loan_pay_regular_payments_to_payoff() {
     let mut fx = Fx::xrp().with_loan(json!({"LoanServiceFee": "100"}));
@@ -911,7 +913,7 @@ fn loan_pay_regular_payments_to_payoff() {
     assert_eq!(xrp_of(&sb, &BORROWER), xrp_of(&Sandbox::new(&fx.state), &BORROWER) - FEE - 750_300);
 }
 
-/// LoanPay.cpp:282-314, :565-569: while the cover is below its minimum (or
+/// LoanPay.cpp:373-406, :561-564: while the cover is below its minimum (or
 /// the owner cannot receive the asset) the fee tops the cover up instead.
 #[test]
 fn loan_pay_fee_goes_to_the_cover_when_it_is_short() {
@@ -1018,7 +1020,7 @@ fn loan_pay_overpayment() {
     assert_eq!(nf(&broker, "DebtTotal"), nf(&loan, "TotalValueOutstanding"));
 }
 
-/// LoanPay.cpp:316-322: paying an impaired loan unimpairs it.
+/// LoanPay.cpp:413-419: paying an impaired loan unimpairs it.
 #[test]
 fn loan_pay_unimpairs() {
     let mut fx = Fx::xrp().with_loan(json!({})).at(START + 601);
@@ -1030,7 +1032,7 @@ fn loan_pay_unimpairs() {
     assert!(fx.vault_obj(&sb).get("LossUnrealized").is_none());
 }
 
-/// LoanPay.cpp:46-65, :634-640, :761 against 3.5.0-rc1 :50-90 — item B1 of
+/// LoanPay.cpp:54-72, :634-640, :761 against 3.5.0-rc1 :53-90 — item B1 of
 /// the 3.4.1 / 3.5.0 diff: with issuer-side limits of 9e95 on the
 /// borrower's and the fee payee's lines, 3.4.1's conservation balances
 /// overflow (tefEXCEPTION, nothing applied, no fee); with fixCleanup3_5_0
@@ -1060,7 +1062,7 @@ fn loan_pay_conservation_balances_3_4_1_against_3_5_0() {
 // LoanManage
 // ---------------------------------------------------------------------------
 
-/// LoanManage.cpp:43-115.
+/// LoanManage.cpp:43-132.
 #[test]
 fn loan_manage_preflight_and_preclaim() {
     let fx = Fx::xrp().with_loan(json!({}));
@@ -1095,7 +1097,7 @@ fn loan_manage_preflight_and_preclaim() {
     assert_eq!(result(&paid.state, &paid.manage(0)), TxResult::NoPermission);
 }
 
-/// LoanManage.cpp:376-413: no flag — a success that changes nothing but
+/// LoanManage.cpp:392-436: no flag — a success that changes nothing but
 /// the fee (devnet 2C47CF7E6248 @ 7129530).
 #[test]
 fn loan_manage_without_a_flag_changes_nothing() {
@@ -1105,7 +1107,7 @@ fn loan_manage_without_a_flag_changes_nothing() {
     only_the_fee(&sb, &OWNER);
 }
 
-/// LoanManage.cpp:272-374 (LoanLifecycle_test.cpp impair / unimpair).
+/// LoanManage.cpp:286-390. (No devnet example of either.)
 #[test]
 fn loan_manage_impair_and_unimpair() {
     // fixCleanup3_4_0: only a late loan.
@@ -1145,7 +1147,7 @@ fn loan_manage_impair_and_unimpair() {
     assert_eq!(pre.loan(&sb)["NextPaymentDueDate"], json!(START + 1200), "it has: one interval from now");
 }
 
-/// LoanManage.cpp:117-270 (LoanLifecycle_test.cpp default; devnet
+/// LoanManage.cpp:134-284 (devnet
 /// 3945B76FB7B0 @ 7129649): the first-loss capital covers part, the vault
 /// loses the rest.
 #[test]
@@ -1195,7 +1197,7 @@ fn loan_manage_default() {
 // LoanDelete
 // ---------------------------------------------------------------------------
 
-/// LoanDelete.cpp:28-135 (devnet 05FD3130167F @ 7129497, 32F27BD10A22 @
+/// LoanDelete.cpp:27-136 (devnet 05FD3130167F @ 7129497, 32F27BD10A22 @
 /// 7129650).
 #[test]
 fn loan_delete() {
@@ -1237,7 +1239,7 @@ fn loan_delete() {
 /// A whole life on a USD loan with interest and a management fee: made,
 /// paid period by period to the end, deleted — the vault ends with its
 /// principal back plus the interest, the broker with no debt
-/// (LoanLifecycle_test.cpp).
+/// (LoanSet.cpp, LoanPay.cpp, LoanDelete.cpp end to end).
 #[test]
 fn a_whole_loan_life() {
     let mut fx = Fx::new(Kind::Usd, &MAINNET_WITH_LENDING, json!({"ManagementFeeRate": 10_000}))
@@ -1274,7 +1276,7 @@ fn a_whole_loan_life() {
 /// What the vault and loan-broker transactors (ported earlier) read of the
 /// state a loan leaves: VaultWithdraw against sfAssetsAvailable
 /// (VaultWithdraw.cpp:440-499), VaultDelete's and LoanBrokerDelete's
-/// obligations (VaultDelete.cpp:57-62, LoanBrokerDelete.cpp:59-63),
+/// obligations (VaultDelete.cpp:56-66, LoanBrokerDelete.cpp:59-63),
 /// LoanBrokerCoverWithdraw's minimum cover on sfDebtTotal
 /// (LoanBrokerCoverWithdraw.cpp:171-195).
 #[test]
@@ -1324,7 +1326,7 @@ fn the_vault_and_the_broker_see_the_loan() {
 // Base fees
 // ---------------------------------------------------------------------------
 
-/// Transactor.cpp:449-474, LoanSet.cpp:165-181.
+/// Transactor.cpp:449-474, LoanSet.cpp:183-208.
 #[test]
 fn loan_set_base_fee_counts_the_counterpartys_signers() {
     let signer = json!({"Signer": {"Account": hex::encode(CAROL), "SigningPubKey": "", "TxnSignature": ""}});
@@ -1340,7 +1342,7 @@ fn loan_set_base_fee_counts_the_counterpartys_signers() {
     assert_eq!(transactor_base_fee(&json!({"SponsorSignature": {"Signers": [signer]}, "Signers": [signer]}), 10), 30);
 }
 
-/// LoanPay.cpp:99-202.
+/// LoanPay.cpp:112-226.
 #[test]
 fn loan_pay_base_fee_is_one_increment_per_five_payments() {
     // 100 payments of 1000 drops.

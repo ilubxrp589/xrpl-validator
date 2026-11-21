@@ -175,7 +175,7 @@ pub enum TxResult {
     /// (fixCleanup3_3_0 with fixAMMv1_3, finding 259).
     PrecisionLoss,
     /// tecMAX_SEQUENCE_REACHED — a counter that numbers objects ran out: a LoanBroker's sfLoanSequence
-    /// wrapping to zero (LoanSet.cpp:574-576).
+    /// wrapping to zero (LoanSet.cpp:706-710).
     MaxSequenceReached,
     /// Creating a trust line, but the owner can't afford the incremental reserve.
     NoLineInsufReserve,

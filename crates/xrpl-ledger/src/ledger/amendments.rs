@@ -119,7 +119,7 @@ pub fn fix_batch_v1_2(sandbox: &Sandbox) -> bool {
 
 /// BatchV1_1 — the Batch amendment (`features.macro:21`, `XRPL_FEATURE(BatchV1_1, …)`). ON on
 /// mainnet since #107540996 (2026-10-09). Named here for the one place a lending transactor reads
-/// it: LoanSet's inner-batch rule (LoanSet.cpp:68-74).
+/// it: LoanSet's inner-batch rule (LoanSet.cpp:75-82).
 pub const BATCH_V1_1: &str =
     "9F287AED3CDB50A7BD1ACEC24296A30C9B5230CCD136219317AC790E3B884377";
 
@@ -148,7 +148,7 @@ pub const LENDING_PROTOCOL: &str =
 /// phases, sfLEVersion, VaultDelete's sfMemoData), by LoanBrokerSet (a
 /// broker only on a closed-ended vault, LoanBrokerSet.cpp:149-161) and by
 /// LoanSet (a closed-ended vault lends in its Investment phase only, and
-/// not past its redemption date, LoanSet.cpp:274-293). The loan maths'
+/// not past its redemption date, LoanSet.cpp:319-344). The loan maths'
 /// accounting model follows the vault's sfLEVersion, not this amendment.
 pub const LENDING_PROTOCOL_V1_1: &str =
     "A360E2BFD775A5B0DCE1C36C16DF31B72735A57584FD163655D2F9564F8E7AC8";
