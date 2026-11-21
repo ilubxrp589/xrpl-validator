@@ -967,16 +967,154 @@ impl Transactor for LoanBrokerCoverClawbackTransactor {
 pub struct LoanBrokerDeleteTransactor;
 
 impl Transactor for LoanBrokerDeleteTransactor {
-    fn preflight(&self, _tx: &TxFields) -> TxResult {
-        TxResult::Unsupported
+    /// `LoanBrokerDelete::preflight` (LoanBrokerDelete.cpp:28-35).
+    fn preflight(&self, tx: &TxFields) -> TxResult {
+        if broker_id(tx).is_none_or(|id| is_zero_key(&id)) {
+            return TxResult::InvalidTx;
+        }
+        TxResult::Success
     }
 
-    fn preclaim(&self, _tx: &TxFields, _sandbox: &Sandbox) -> TxResult {
-        TxResult::Unsupported
+    fn preflight_in(&self, tx: &TxFields, rules: &Sandbox) -> TxResult {
+        // `checkExtraFeatures` (:22-26).
+        gate(tx, rules, lh::check_lending_protocol_dependencies(rules, tx), TF_UNIVERSAL_MASK).unwrap_or_else(|| self.preflight(tx))
     }
 
-    fn do_apply(&self, _tx: &TxFields, _sandbox: &mut Sandbox) -> TxResult {
-        TxResult::Unsupported
+    /// `LoanBrokerDelete::preclaim` (LoanBrokerDelete.cpp:37-121; the
+    /// transfer and authorization checks are 3.5.0-rc1's :100-119).
+    fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
+        let account = tx.account;
+        let Some(id) = broker_id(tx) else { return TxResult::TefInternal };
+        let Some(broker) = read_broker(sandbox, &id) else { return TxResult::NoEntry };
+        let Some(owner) = account_of(&broker, "Owner") else { return TxResult::TefInternal };
+        if account != owner {
+            return TxResult::NoPermission;
+        }
+        // The broker's own OwnerCount: its live loans.
+        if uint_field(&broker, "OwnerCount") != 0 {
+            return TxResult::HasObligations;
+        }
+        let Some(vault) = vault_of(sandbox, &broker) else { return TxResult::TefBadLedger };
+        let Some(asset) = vault_asset(&vault) else { return TxResult::TefInternal };
+        let debt_total = number_field(&broker, "DebtTotal");
+        if !debt_total.is_zero() {
+            // The last LoanDelete should have wiped the debt out; what is
+            // left may be dust below the vault's scale. (3.5.0-rc1 calls the
+            // same scale `getVaultScale`.)
+            let rounded = lh::assets_total_scale(&vault, AMBIENT)
+                .and_then(|vault_scale| round_to_asset(asset, debt_total, vault_scale, Rounding::TowardsZero));
+            match rounded {
+                Ok(rounded) if rounded.is_zero() => {}
+                Ok(_) => return TxResult::HasObligations,
+                Err(_) => return TxResult::TefException,
+            }
+        }
+        let Ok(cover) = amount_of(asset, number_field(&broker, "CoverAvailable")) else { return TxResult::TefException };
+        // What is left of the cover goes to the owner on deletion.
+        if positive(&cover) {
+            let Some(pseudo) = account_of(&broker, "Account") else { return TxResult::TefInternal };
+            // fixCleanup3_5_0: the payout is checked as a cover withdrawal to
+            // oneself is — transferable (lsfMPTCanTransfer waived, so an
+            // issuer cannot trap the cover), the owner authorized, and a
+            // holding the owner lacks creatable.
+            if am::fix_cleanup_3_5_0(sandbox) {
+                let transferable = holding::can_transfer_waive(sandbox, &asset, &pseudo, &owner, true);
+                if transferable != TxResult::Success {
+                    return transferable;
+                }
+                let authorized = holding::require_auth(sandbox, &asset, &owner, AuthType::WeakAuth);
+                if authorized != TxResult::Success {
+                    return authorized;
+                }
+                if !holding::holding_exists(sandbox, &owner, &asset) {
+                    let holdable = holding::can_add_holding(sandbox, &asset);
+                    if holdable != TxResult::Success {
+                        return holdable;
+                    }
+                }
+            }
+            // The owner must be able to receive it.
+            let receivable = holding::check_deep_frozen(sandbox, &owner, &asset);
+            if receivable != TxResult::Success {
+                return receivable;
+            }
+            // fixCleanup3_2_0: and the pseudo-account able to send it.
+            if am::fix_cleanup_3_2_0(sandbox) {
+                let sendable = holding::check_frozen(sandbox, &pseudo, &asset);
+                if sendable != TxResult::Success {
+                    return sendable;
+                }
+            }
+        }
+        TxResult::Success
+    }
+
+    /// `LoanBrokerDelete::doApply` (LoanBrokerDelete.cpp:123-200; the
+    /// fixCleanup3_5_0 arms are 3.5.0-rc1's :172-200, :234-235).
+    fn do_apply(&self, tx: &TxFields, sandbox: &mut Sandbox) -> TxResult {
+        let account = tx.account;
+        let Some(id) = broker_id(tx) else { return TxResult::TefBadLedger };
+        let Some(broker) = read_broker(sandbox, &id) else { return TxResult::TefBadLedger };
+        let Some(vault) = vault_of(sandbox, &broker) else { return TxResult::TefBadLedger };
+        let (Some(vault_account), Some(asset), Some(pseudo)) =
+            (account_of(&vault, "Account"), vault_asset(&vault), account_of(&broker, "Account"))
+        else {
+            return TxResult::TefBadLedger;
+        };
+        let prior = prior_balance(sandbox, tx);
+        // Out of the owner's directory, then the vault pseudo-account's.
+        owner_dir_remove(sandbox, &account, &id, node_hint(&broker, "OwnerNode"), false);
+        owner_dir_remove(sandbox, &vault_account, &id, node_hint(&broker, "VaultNode"), false);
+
+        if !sandbox.exists(&keylet::account_root_key(&account)) {
+            return TxResult::TefBadLedger;
+        }
+        // The LoanBroker and its pseudo-account: two owned objects.
+        let fix350 = am::fix_cleanup_3_5_0(sandbox);
+        if fix350 {
+            holding::decrease_owner_count_for_object(sandbox, &account, &broker, 2);
+        }
+
+        let Ok(cover) = amount_of(asset, number_field(&broker, "CoverAvailable")) else { return TxResult::TefException };
+        // fixCleanup3_5_0: an owner without a holding gets one first, as a
+        // withdrawal to oneself does. Before the fix the cover goes straight
+        // to accountSend, and an MPT payout to an owner with no MPToken
+        // fails tecNO_AUTH.
+        if fix350 && positive(&cover) && !holding::holding_exists(sandbox, &account, &asset) {
+            let added = holding::add_empty_holding(sandbox, &account, prior, &asset);
+            if added != TxResult::Success {
+                return added;
+            }
+        }
+        let paid = holding::account_send(sandbox, &pseudo, &account, &cover, true);
+        if paid != TxResult::Success {
+            return paid;
+        }
+        let released = holding::remove_empty_holding(sandbox, &pseudo, &asset);
+        if released != TxResult::Success {
+            return released;
+        }
+
+        // The payout and the holding's removal should have left the
+        // pseudo-account with nothing.
+        let pseudo_key = keylet::account_root_key(&pseudo);
+        let Some(pseudo_root) = json_at(sandbox, &pseudo_key) else { return TxResult::TefBadLedger };
+        if pseudo_root.get("Balance").and_then(|b| b.as_str()).is_some_and(|b| b != "0") {
+            return TxResult::HasObligations;
+        }
+        if uint_field(&pseudo_root, "OwnerCount") != 0 {
+            return TxResult::HasObligations;
+        }
+        if sandbox.exists(&keylet::owner_dir_key(&pseudo)) {
+            return TxResult::HasObligations;
+        }
+        sandbox.delete(pseudo_key);
+
+        if !fix350 {
+            holding::decrease_owner_count_for_object(sandbox, &account, &broker, 2);
+        }
+        sandbox.delete(id);
+        TxResult::Success
     }
 }
 
