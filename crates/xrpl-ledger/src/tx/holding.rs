@@ -12,6 +12,7 @@
 //! | [`create_mpt_issuance`] | MPTokenIssuanceCreate.cpp:123-200 (`MPTokenIssuanceCreate::create`) |
 //! | [`account_holds`], [`xrp_liquid`] | TokenHelpers.cpp:366-497, AccountRootHelpers.cpp:269-302 |
 //! | [`account_send`] | TokenHelpers.cpp:1552-1570 (`accountSend`) |
+//! | [`account_send_multi`] | TokenHelpers.cpp:1573-1590 (`accountSendMulti`) |
 //! | [`can_withdraw`], [`do_withdraw`] | View.cpp:438-598 |
 //! | [`decrease_owner_count_for_object`] | AccountRootHelpers.cpp:359-376 |
 //! | [`has_expired`] | View.cpp:48-63 |
@@ -26,7 +27,7 @@
 //!
 //! Not ported: featureSponsor (reserve sponsors — `getEffectiveTxReserveSponsor`
 //! and the sponsor arguments are the no-sponsor case throughout) and
-//! MPTokensV2's balance hooks. `accountSendMulti` is not here yet.
+//! MPTokensV2's balance hooks.
 //!
 //! No transactor the engine dispatches calls any of this: with the vault
 //! amendments off nothing changes.
@@ -828,6 +829,177 @@ fn send_mpt(sandbox: &mut Sandbox, from: &[u8; 20], to: &[u8; 20], mptid: &[u8; 
         return delivered;
     }
     mpt::direct_send_no_fee(sandbox, &issuance_key, from, &issuer, actual)
+}
+
+/// `accountSendMulti(view, senderID, asset, receivers, journal, waiveFee)`
+/// (TokenHelpers.cpp:1573-1590): one sender paying several receivers of one
+/// asset, the sender debited ONCE for what went through the issuer.
+/// `receivers` pairs an account with a `Number`, which becomes an amount of
+/// the asset under `ambient` (rippled's thread rounding mode) — the `Err` is
+/// that conversion's throw. LoanSet and LoanPay are the callers.
+///
+/// XRP — `accountSendMultiIOU` (:1084-1213): a negative amount is
+/// tecINTERNAL; zero, or the sender itself, is skipped; each receiver that
+/// exists is credited as the loop goes (a running total past int64 is
+/// tecINTERNAL); then the sender is debited the total —
+/// tecFAILED_PROCESSING when it holds less. Failures return at once.
+///
+/// IOU — `directSendNoLimitMultiIOU` (:887-964): a leg with the issuer on
+/// either end is one direct line adjustment; any other leg credits the
+/// receiver from the issuer and adds the amount (times the transfer rate
+/// unless waived) to what the sender owes the issuer, which is settled in
+/// ONE adjustment after the loop.
+///
+/// MPT — `directSendNoLimitMultiMPT` (:1361-1487): tecOBJECT_NOT_FOUND
+/// without the issuance; a negative amount is tecINTERNAL. The issuer as
+/// sender is held to MaximumAmount — under fixCleanup3_1_3 by the running
+/// total of this call (this send, the aggregate, then outstanding plus the
+/// aggregate: tecPATH_DRY), before it by each send alone against the
+/// outstanding amount read at the start. Legs with the issuer are direct;
+/// the others credit the receiver from the issuer and the sender pays the
+/// issuer once at the end. A running total past the 64-bit range is
+/// tecINTERNAL.
+pub fn account_send_multi(
+    sandbox: &mut Sandbox,
+    sender: &[u8; 20],
+    asset: &HeldAsset,
+    receivers: &[([u8; 20], crate::tx::number::Number)],
+    waive_fee: bool,
+    ambient: crate::tx::number::Rounding,
+) -> Result<TxResult, crate::flow::st_amount::StError> {
+    let negative = |amount: &Amount| amount.negative && !amount.is_zero();
+    match asset {
+        HeldAsset::Xrp => {
+            let zero = [0u8; 20];
+            let mut take: u64 = 0;
+            for (receiver, value) in receivers {
+                let amount = Amount::from_number(*asset, *value, ambient)?;
+                if negative(&amount) {
+                    return Ok(TxResult::TecInternal);
+                }
+                if amount.is_zero() || sender == receiver {
+                    continue;
+                }
+                let key = keylet::account_root_key(receiver);
+                let Some(mut receiver_root) = (*receiver != zero).then(|| json_at(sandbox, &key)).flatten() else { continue };
+                // checkedAdd over int64 drops.
+                let Some(total) = take.checked_add(amount.mantissa).filter(|t| *t <= i64::MAX as u64) else {
+                    return Ok(TxResult::TecInternal);
+                };
+                let balance = receiver_root["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                receiver_root["Balance"] = serde_json::Value::String(balance.saturating_add(amount.mantissa).to_string());
+                put_json(sandbox, key, &receiver_root);
+                take = total;
+            }
+            if *sender != zero {
+                let key = keylet::account_root_key(sender);
+                if let Some(mut sender_root) = json_at(sandbox, &key) {
+                    let balance = sender_root["Balance"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                    if balance < take {
+                        return Ok(TxResult::TecFailedProcessing);
+                    }
+                    sender_root["Balance"] = serde_json::Value::String((balance - take).to_string());
+                    put_json(sandbox, key, &sender_root);
+                }
+            }
+            Ok(TxResult::Success)
+        }
+        HeldAsset::Iou { currency, issuer } => {
+            let leg = Leg { xrp: false, cur: *currency, issuer: *issuer };
+            let mut take = Amount::zero(*asset);
+            for (receiver, value) in receivers {
+                let amount = Amount::from_number(*asset, *value, ambient)?;
+                if amount.is_zero() || sender == receiver {
+                    continue;
+                }
+                let magnitude = (amount.mantissa as u128, amount.exponent);
+                if sender == issuer {
+                    crate::tx::offer::line_adjust(sandbox, receiver, &leg, magnitude, true);
+                    continue;
+                }
+                if receiver == issuer {
+                    crate::tx::offer::line_adjust(sandbox, sender, &leg, magnitude, false);
+                    continue;
+                }
+                let actual = match crate::tx::offer::transfer_rate(sandbox, &leg) {
+                    Some(rate) if !waive_fee && rate != 1_000_000_000 => {
+                        let product = crate::tx::amm_swap::n_mul(magnitude, (rate as u128, -9), crate::tx::amm_swap::Rnd::Near);
+                        let fee_paid = crate::flow::amounts::IouAmount::from_me(false, product);
+                        Amount { asset: *asset, negative: false, mantissa: fee_paid.mantissa, exponent: fee_paid.exponent }
+                    }
+                    _ => amount,
+                };
+                take = take.iou_add(actual, ambient)?;
+                crate::tx::offer::line_adjust(sandbox, receiver, &leg, magnitude, true);
+            }
+            if sender != issuer && !take.is_zero() {
+                crate::tx::offer::line_adjust(sandbox, sender, &leg, (take.mantissa as u128, take.exponent), false);
+            }
+            Ok(TxResult::Success)
+        }
+        HeldAsset::Mpt(id) => {
+            let issuance_key = keylet::mpt_issuance_key(id);
+            let Some(issuance) = json_at(sandbox, &issuance_key) else { return Ok(TxResult::ObjectNotFound) };
+            let Some(issuer) = mpt::issuance_issuer(&issuance) else { return Ok(TxResult::ObjectNotFound) };
+            let maximum = issuance.get("MaximumAmount").map(|_| mpt::dec_field(&issuance, "MaximumAmount")).unwrap_or(mpt::MAX_MPT_AMOUNT);
+            let outstanding = mpt::dec_field(&issuance, "OutstandingAmount");
+            let aggregate_cap = enabled(sandbox, amendments::FIX_CLEANUP_3_1_3);
+            let rate = mpt::issuance_transfer_rate(&issuance);
+            let (mut total_sent, mut actual, mut take): (u64, u64, u64) = (0, 0, 0);
+            for (receiver, value) in receivers {
+                let amount = Amount::from_number(*asset, *value, ambient)?;
+                if negative(&amount) {
+                    return Ok(TxResult::TecInternal);
+                }
+                if amount.is_zero() || sender == receiver {
+                    continue;
+                }
+                let send = amount.mantissa;
+                if *sender == issuer || *receiver == issuer {
+                    if *sender == issuer {
+                        if aggregate_cap {
+                            // The order guards each subtraction against underflow (:1410-1417).
+                            if send > maximum || total_sent > maximum - send || outstanding > maximum - send - total_sent {
+                                return Ok(TxResult::PathDry);
+                            }
+                            total_sent += send;
+                        } else if send > maximum || outstanding > maximum - send {
+                            return Ok(TxResult::PathDry);
+                        }
+                    }
+                    let Some(sum) = actual.checked_add(send) else { return Ok(TxResult::TecInternal) };
+                    let sent = mpt::direct_send_no_fee(sandbox, &issuance_key, sender, receiver, send);
+                    if sent != TxResult::Success {
+                        return Ok(sent);
+                    }
+                    actual = sum;
+                    continue;
+                }
+                let actual_send = if waive_fee {
+                    send
+                } else {
+                    match mpt::mpt_multiply_rate(send, rate) {
+                        Some(with_fee) => with_fee,
+                        None => return Ok(TxResult::TecInternal),
+                    }
+                };
+                let Some(sum) = actual.checked_add(actual_send) else { return Ok(TxResult::TecInternal) };
+                actual = sum;
+                take += actual_send;
+                let sent = mpt::direct_send_no_fee(sandbox, &issuance_key, &issuer, receiver, send);
+                if sent != TxResult::Success {
+                    return Ok(sent);
+                }
+            }
+            if *sender != issuer && take != 0 {
+                let settled = mpt::direct_send_no_fee(sandbox, &issuance_key, sender, &issuer, take);
+                if settled != TxResult::Success {
+                    return Ok(settled);
+                }
+            }
+            Ok(TxResult::Success)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1755,6 +1927,105 @@ mod tests {
         assert_eq!(account_send(&mut sb, &ALICE, &ISSUER, &units(&id, 140), true), TxResult::Success);
         assert_eq!((balance(&sb, &ALICE), outstanding(&sb)), (0, 960));
         assert_eq!(account_send(&mut sb, &ALICE, &ALICE, &units(&id, 5), true), TxResult::Success);
+    }
+
+    /// TokenHelpers.cpp:1573-1590 and its three arms (:887-964, :1084-1213,
+    /// :1361-1487).
+    #[test]
+    fn account_send_multi_debits_the_sender_once() {
+        use crate::tx::number::{Number, Rounding};
+        let _scale = large();
+        let n = |m: i64, e: i32| Number::new(m, e, Rounding::ToNearest).unwrap();
+        let near = Rounding::ToNearest;
+
+        // XRP: each receiver credited, the sender debited the total; zero and the sender itself skipped.
+        let st = state();
+        let mut sb = Sandbox::new(&st);
+        let pay = [(BOB, n(300, 0)), (PSEUDO, n(200, 0)), (ALICE, n(999, 0)), (ISSUER, Number::ZERO)];
+        assert_eq!(account_send_multi(&mut sb, &ALICE, &HeldAsset::Xrp, &pay, true, near), Ok(TxResult::Success));
+        assert_eq!(root(&sb, &ALICE).unwrap()["Balance"], json!((BALANCE - 500).to_string()));
+        assert_eq!(root(&sb, &BOB).unwrap()["Balance"], json!((BALANCE + 300).to_string()));
+        assert_eq!(root(&sb, &PSEUDO).unwrap()["Balance"], json!("200"));
+        assert_eq!(root(&sb, &ISSUER).unwrap()["Balance"], json!(BALANCE.to_string()));
+        // More than the sender has: tecFAILED_PROCESSING; a negative amount: tecINTERNAL.
+        let too_much = [(BOB, n(BALANCE as i64, 0)), (ISSUER, n(1, 0))];
+        assert_eq!(account_send_multi(&mut Sandbox::new(&st), &ALICE, &HeldAsset::Xrp, &too_much, true, near), Ok(TxResult::TecFailedProcessing));
+        let negative = [(BOB, n(1, 0)), (ISSUER, n(-1, 0))];
+        assert_eq!(account_send_multi(&mut Sandbox::new(&st), &ALICE, &HeldAsset::Xrp, &negative, true, near), Ok(TxResult::TecInternal));
+        // A fraction of a drop is rounded as the ambient mode says.
+        let fraction = [(BOB, n(15, -1)), (ISSUER, n(25, -1))];
+        let mut sb = Sandbox::new(&st);
+        assert_eq!(account_send_multi(&mut sb, &ALICE, &HeldAsset::Xrp, &fraction, true, Rounding::Upward), Ok(TxResult::Success));
+        assert_eq!(root(&sb, &ALICE).unwrap()["Balance"], json!((BALANCE - 5).to_string()));
+
+        // IOU out of the pseudo-account: ALICE and BOB through the issuer, the issuer directly.
+        let mut st = state();
+        root_in(&mut st, ISSUER, LSF_DEFAULT_RIPPLE, json!({"TransferRate": 1_200_000_000u64}));
+        let pseudo_line = line(&mut st, PSEUDO, LSF_HIGH_RESERVE | LSF_HIGH_NO_RIPPLE, "100", "0");
+        let alice_line = line(&mut st, ALICE, LSF_LOW_RESERVE, "1", "1000");
+        let bob_line = keylet::ripple_state_key(&BOB, &ISSUER, &USD_CODE);
+        let pay = [(ALICE, n(10, 0)), (ISSUER, n(5, 0)), (BOB, n(25, -1)), (PSEUDO, n(50, 0))];
+        let value = |sb: &Sandbox, key: &Hash256| get(sb, key).unwrap()["Balance"]["value"].clone();
+        let mut sb = Sandbox::new(&st);
+        assert_eq!(account_send_multi(&mut sb, &PSEUDO, &USD, &pay, true, near), Ok(TxResult::Success));
+        assert_eq!(value(&sb, &alice_line), json!("11"));
+        assert_eq!(value(&sb, &bob_line), json!("2.5"), "a line is made for a receiver without one");
+        assert_eq!(value(&sb, &pseudo_line), json!("-82.5"), "100 less 5 direct and 12.5 through the issuer");
+        // Not waived: the 20% falls on the through-the-issuer legs only.
+        let mut sb = Sandbox::new(&st);
+        assert_eq!(account_send_multi(&mut sb, &PSEUDO, &USD, &pay, false, near), Ok(TxResult::Success));
+        assert_eq!(value(&sb, &alice_line), json!("11"));
+        assert_eq!(value(&sb, &pseudo_line), json!("-80"), "100 less 5 and 15");
+        // The issuer as sender: every leg direct.
+        let mut sb = Sandbox::new(&st);
+        assert_eq!(account_send_multi(&mut sb, &ISSUER, &USD, &pay, false, near), Ok(TxResult::Success));
+        assert_eq!((value(&sb, &alice_line), value(&sb, &bob_line), value(&sb, &pseudo_line)), (json!("11"), json!("2.5"), json!("-150")));
+
+        // MPT between holders and back to the issuer.
+        let mut st = state();
+        let id = issuance(&mut st, mpt::LSF_MPT_CAN_TRANSFER, json!({"MaximumAmount": "1100", "TransferFee": 10_000}));
+        token(&mut st, &id, PSEUDO, 0, 100);
+        token(&mut st, &id, ALICE, 0, 0);
+        token(&mut st, &id, BOB, 0, 0);
+        let asset = HeldAsset::Mpt(id);
+        let ikey = keylet::mpt_issuance_key(&id);
+        let balance = |sb: &Sandbox, who: &[u8; 20]| mpt::dec_field(&get(sb, &keylet::mptoken_key(&ikey, who)).unwrap(), "MPTAmount");
+        let outstanding = |sb: &Sandbox| mpt::dec_field(&get(sb, &ikey).unwrap(), "OutstandingAmount");
+        let pay = [(ALICE, n(10, 0)), (ISSUER, n(5, 0)), (BOB, n(20, 0))];
+        let mut sb = Sandbox::new(&st);
+        assert_eq!(account_send_multi(&mut sb, &PSEUDO, &asset, &pay, true, near), Ok(TxResult::Success));
+        assert_eq!((balance(&sb, &ALICE), balance(&sb, &BOB), balance(&sb, &PSEUDO), outstanding(&sb)), (10, 20, 65, 995));
+        let mut sb = Sandbox::new(&st);
+        assert_eq!(account_send_multi(&mut sb, &PSEUDO, &asset, &pay, false, near), Ok(TxResult::Success));
+        assert_eq!((balance(&sb, &ALICE), balance(&sb, &BOB), balance(&sb, &PSEUDO), outstanding(&sb)), (10, 20, 62, 992), "33 for the 30 in transit");
+        // The sender cannot cover the total; a receiver has no MPToken; no issuance; a negative amount.
+        let heavy = [(ALICE, n(60, 0)), (BOB, n(41, 0))];
+        assert_eq!(account_send_multi(&mut Sandbox::new(&st), &PSEUDO, &asset, &heavy, true, near), Ok(TxResult::InsufficientFunds));
+        let stranger = [(ALICE, n(1, 0)), ([0x78; 20], n(1, 0))];
+        assert_eq!(account_send_multi(&mut Sandbox::new(&st), &PSEUDO, &asset, &stranger, true, near), Ok(TxResult::NoAuth));
+        let missing = HeldAsset::Mpt(mptid(99, ISSUER));
+        assert_eq!(account_send_multi(&mut Sandbox::new(&st), &PSEUDO, &missing, &pay, true, near), Ok(TxResult::ObjectNotFound));
+        let negative = [(ALICE, n(1, 0)), (BOB, n(-1, 0))];
+        assert_eq!(account_send_multi(&mut Sandbox::new(&st), &PSEUDO, &asset, &negative, true, near), Ok(TxResult::TecInternal));
+
+        // The issuer minting to two receivers against MaximumAmount 1100 with 1000 outstanding:
+        // 60 + 60 is over the cap in aggregate. fixCleanup3_1_3 sees it; before the fix each
+        // send is judged alone against the outstanding amount read at the start.
+        let mint = [(ALICE, n(60, 0)), (BOB, n(60, 0))];
+        assert_eq!(account_send_multi(&mut Sandbox::new(&st), &ISSUER, &asset, &mint, true, near), Ok(TxResult::PathDry));
+        let within = [(ALICE, n(60, 0)), (BOB, n(40, 0))];
+        let mut sb = Sandbox::new(&st);
+        assert_eq!(account_send_multi(&mut sb, &ISSUER, &asset, &within, true, near), Ok(TxResult::Success));
+        assert_eq!(outstanding(&sb), 1100);
+        let mut old = state_with(&[am::SINGLE_ASSET_VAULT, am::LENDING_PROTOCOL]);
+        let id = issuance(&mut old, mpt::LSF_MPT_CAN_TRANSFER, json!({"MaximumAmount": "1100"}));
+        token(&mut old, &id, ALICE, 0, 0);
+        token(&mut old, &id, BOB, 0, 0);
+        let mut sb = Sandbox::new(&old);
+        assert_eq!(account_send_multi(&mut sb, &ISSUER, &HeldAsset::Mpt(id), &mint, true, near), Ok(TxResult::Success));
+        assert_eq!(mpt::dec_field(&get(&sb, &keylet::mpt_issuance_key(&id)).unwrap(), "OutstandingAmount"), 1120);
+        let alone = [(ALICE, n(101, 0)), (BOB, n(1, 0))];
+        assert_eq!(account_send_multi(&mut Sandbox::new(&old), &ISSUER, &HeldAsset::Mpt(id), &alone, true, near), Ok(TxResult::PathDry));
     }
 
     fn withdraw_tx(fields: Value) -> TxFields {

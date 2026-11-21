@@ -318,7 +318,7 @@ impl Amount {
     /// `operator+(STAmount, STAmount)` for two IOU amounts of one asset
     /// (STAmount.cpp:372-394): a zero operand returns the other; else
     /// `IOUAmount{Number{a} + Number{b}}` (IOUAmount.cpp:63-78) under `mode`.
-    fn iou_add(self, other: Amount, mode: Rounding) -> Result<Amount, StError> {
+    pub fn iou_add(self, other: Amount, mode: Rounding) -> Result<Amount, StError> {
         if other.is_zero() {
             return Ok(self);
         }
