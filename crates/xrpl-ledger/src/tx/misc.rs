@@ -2057,3 +2057,124 @@ mod pseudo_preauth_tests {
         assert_eq!(verdict(&dup, plain), TxResult::Duplicate);
     }
 }
+
+/// rippled `createPseudoAccount(view, pseudoOwnerKey, ownerField)`
+/// (AccountRootHelpers.cpp:556-599) for the two new owners — a Vault
+/// (`sfVaultID`, VaultCreate.cpp:197) and a LoanBroker (`sfLoanBrokerID`,
+/// LoanBrokerSet.cpp:261). AMMCreate's use of it is covered where it always
+/// was (`tx::amm`).
+#[cfg(test)]
+mod create_pseudo_account_tests {
+    use super::*;
+    use crate::ledger::amendments as am;
+    use crate::ledger::header::LedgerHeader;
+    use crate::ledger::keylet::vault_devnet_fixture::object;
+    use crate::ledger::state::LedgerState;
+    use serde_json::json;
+    use xrpl_core::types::Hash256;
+
+    const PARENT: Hash256 = Hash256([0x5A; 32]);
+    const OWNER_KEY: Hash256 = Hash256([0x84; 32]);
+
+    fn state(amendments: &[&str]) -> LedgerState {
+        let mut state = LedgerState::new_unverified(LedgerHeader {
+            sequence: 100, total_coins: 100_000_000_000_000_000,
+            parent_hash: PARENT, transaction_hash: Hash256([0; 32]), account_hash: Hash256([0; 32]),
+            parent_close_time: 0, close_time: 10, close_time_resolution: 10, close_flags: 0,
+        });
+        let amend = json!({"LedgerEntryType": "Amendments", "Flags": 0, "Amendments": amendments});
+        state.state_map.insert(keylet::amendments_key(), serde_json::to_vec(&amend).unwrap()).unwrap();
+        state
+    }
+
+    fn occupy(state: &mut LedgerState, attempt: u16) -> [u8; 20] {
+        let id = pseudo_account_candidate(&PARENT, &OWNER_KEY, attempt);
+        let root = json!({"LedgerEntryType": "AccountRoot", "Account": hex::encode(id), "Balance": "1000000", "Sequence": 77, "OwnerCount": 0, "Flags": 0});
+        state.state_map.insert(keylet::account_root_key(&id), serde_json::to_vec(&root).unwrap()).unwrap();
+        id
+    }
+
+    /// The root rippled builds (:575-596): the account, a zero XRP balance,
+    /// Sequence 0 once SingleAssetVault or LendingProtocol is enabled (the
+    /// sequence of the ledger being built before), lsfDisableMaster |
+    /// lsfDefaultRipple | lsfDepositAuth, and the owner field holding the
+    /// owner object's key. OwnerCount is a required field of an AccountRoot
+    /// and so present at zero.
+    #[test]
+    fn the_root_is_rippleds_for_each_owner_field() {
+        for (field, amendments, sequence) in [
+            (PseudoOwner::Vault, vec![am::SINGLE_ASSET_VAULT], 0),
+            (PseudoOwner::LoanBroker, vec![am::SINGLE_ASSET_VAULT, am::LENDING_PROTOCOL], 0),
+            (PseudoOwner::LoanBroker, vec![am::LENDING_PROTOCOL], 0),
+            (PseudoOwner::Amm, vec![am::SINGLE_ASSET_VAULT], 0),
+            (PseudoOwner::Amm, vec![], 101),
+        ] {
+            let st = state(&amendments);
+            let mut sb = Sandbox::new(&st);
+            let id = create_pseudo_account(&mut sb, &OWNER_KEY, field).expect("created");
+            assert_eq!(id, pseudo_account_candidate(&PARENT, &OWNER_KEY, 0));
+            let root = crate::tx::offer::json_at(&sb, &keylet::account_root_key(&id)).unwrap();
+            assert_eq!(root, json!({
+                "LedgerEntryType": "AccountRoot", "Account": hex::encode(id), "Balance": "0", "Sequence": sequence,
+                "OwnerCount": 0, "Flags": 0x0190_0000u64, field.field_name(): hex::encode_upper(OWNER_KEY.0),
+            }), "{field:?}");
+            assert!(is_pseudo_account(&sb, &id));
+        }
+        assert_eq!(
+            [PseudoOwner::Amm.field_name(), PseudoOwner::Vault.field_name(), PseudoOwner::LoanBroker.field_name()],
+            ["AMMID", "VaultID", "LoanBrokerID"]
+        );
+    }
+
+    /// :563-567 — the first of the 256 candidate addresses with no
+    /// AccountRoot; tecDUPLICATE when every one is taken, and nothing is
+    /// written.
+    #[test]
+    fn the_address_is_the_first_free_candidate_or_tec_duplicate() {
+        let mut st = state(&[am::SINGLE_ASSET_VAULT]);
+        let squatter = occupy(&mut st, 0);
+        occupy(&mut st, 1);
+        let mut sb = Sandbox::new(&st);
+        let id = create_pseudo_account(&mut sb, &OWNER_KEY, PseudoOwner::Vault).expect("created");
+        assert_eq!(id, pseudo_account_candidate(&PARENT, &OWNER_KEY, 2));
+        let kept = crate::tx::offer::json_at(&sb, &keylet::account_root_key(&squatter)).unwrap();
+        assert!(kept.get("VaultID").is_none() && kept["Sequence"] == 77, "{kept}");
+
+        for i in 2..256 {
+            occupy(&mut st, i);
+        }
+        let mut sb = Sandbox::new(&st);
+        assert_eq!(create_pseudo_account(&mut sb, &OWNER_KEY, PseudoOwner::Vault), Err(TxResult::Duplicate));
+        assert_eq!(sb.modification_count(), 0);
+    }
+
+    /// The real pseudo-accounts on devnet (ledger 7131244) carry exactly the
+    /// fields this writes — plus the stamp, and a balance and owner count
+    /// that have moved since: Sequence 0, Flags 0x01900000, and the owner
+    /// field holding the Vault's / LoanBroker's index.
+    #[test]
+    fn devnet_pseudo_accounts_have_this_shape() {
+        for (name, owner, field) in [
+            ("vault_pseudo_xrp", "vault_xrp", PseudoOwner::Vault),
+            ("vault_pseudo_usd", "vault_usd_closed_ended", PseudoOwner::Vault),
+            ("loan_broker_pseudo_usd", "loan_broker_usd", PseudoOwner::LoanBroker),
+        ] {
+            let (theirs, _) = object(name);
+            let (owner, _) = object(owner);
+            let owner_key = Hash256(hex::decode(owner["index"].as_str().unwrap()).unwrap().try_into().unwrap());
+            let st = state(&[am::SINGLE_ASSET_VAULT, am::LENDING_PROTOCOL]);
+            let mut sb = Sandbox::new(&st);
+            let id = create_pseudo_account(&mut sb, &owner_key, field).unwrap();
+            let ours = crate::tx::offer::json_at(&sb, &keylet::account_root_key(&id)).unwrap();
+            let mut names: Vec<&str> = theirs.as_object().unwrap().keys().map(String::as_str).collect();
+            names.retain(|k| !["index", "PreviousTxnID", "PreviousTxnLgrSeq"].contains(k));
+            let mut our_names: Vec<&str> = ours.as_object().unwrap().keys().map(String::as_str).collect();
+            names.sort_unstable();
+            our_names.sort_unstable();
+            assert_eq!(our_names, names, "{name}");
+            for same in ["Flags", "Sequence", "LedgerEntryType", field.field_name()] {
+                assert_eq!(ours[same], theirs[same], "{name}.{same}");
+            }
+        }
+    }
+}
