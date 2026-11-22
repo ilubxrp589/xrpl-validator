@@ -12318,6 +12318,21 @@ mod tests {
         );
     }
 
+    /// Mainnet #106867574's offer, 10027343714655998 drops for 1253417.964332 BAWK, placed under an issuer TickSize
+    /// (3, 5 and 8 all round its rate up to 8e9 drops a unit). rippled's `divide` takes a native mantissa as it
+    /// is, all seventeen digits (STAmount.cpp:1235-1247 only scale an integral one UP): 10027343714655998e17 /
+    /// 8e15 = 125341796433199975, + 5, canonicalized to 1253417.964332. libxrpl 3.4.1 files exactly that TakerGets
+    /// at either Number scale (the Large330 campaign's TickSize mutants). Cut to sixteen digits first, the drops
+    /// lose their last 8 and the offer rests on 1253417.964331999, one book level off.
+    #[test]
+    fn tick_rounding_divides_the_full_seventeen_digit_drops() {
+        for tick in [3, 5, 8] {
+            let (pays, gets) = apply_tick_size((10_027_343_714_655_998, 0), (1_253_417_964_332_000, -9), false, tick, true, false);
+            assert_eq!(pays, (10_027_343_714_655_998, 0));
+            assert_eq!(norm16(gets), (1_253_417_964_332_000, -9), "TickSize {tick}");
+        }
+    }
+
     /// Mainnet tx 9BA91A9E… (ledger 105777146): the WETH issuer publishes
     /// TickSize 6, so the rate rounds up to 6 significant digits and the
     /// non-exact side is re-derived. rippled re-derives with the STAmount
