@@ -593,6 +593,11 @@ fn libxrpl_against_our_engine_at_both_number_scales() {
         if types.as_ref().is_some_and(|t| !t.contains(&tx_type)) {
             continue;
         }
+        // A Batch's inner transactions thread the objects they touch with their OWN ids; this harness stamps one
+        // id per bundle, so every Batch would differ in PreviousTxnID alone (batch_vector.rs is their test).
+        if tx_type == "Batch" && types.is_none() {
+            continue;
+        }
         ran += 1;
         let recorded = bundle["result"].as_str().unwrap_or("?").to_string();
         let mut small_lib: Option<(String, MutMap)> = None;
