@@ -100,3 +100,8 @@ required-features = ["ffi"]
 name = "libxrpl_341_differential"
 path = "tests/libxrpl_341_differential.rs"
 required-features = ["ffi"]
+
+[[test]]
+name = "libxrpl_large330_differential"
+path = "tests/libxrpl_large330_differential.rs"
+required-features = ["ffi"]
