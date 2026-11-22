@@ -90,6 +90,12 @@
 //! on a ledger (a holding changed behind the broker's back), rippled would
 //! answer tecINVARIANT_FAILED where this engine returns the transactor's
 //! result.
+//!
+//! One GENERIC invariant does decide a result here: ValidMPTTransfer
+//! (MPTInvariant.cpp:889-1020). Before fixCleanup3_5_0, LoanBrokerDelete
+//! pays its MPT cover to an owner it never asked about, and the invariant
+//! fails the transaction when that owner is not authorized (or the issuance
+//! no longer transfers): see `cover_payout_fails_mpt_transfer_invariant`.
 
 use crate::flow::st_amount::StError;
 use crate::ledger::amendments::{self as am, enabled};
@@ -1114,8 +1120,57 @@ impl Transactor for LoanBrokerDeleteTransactor {
             holding::decrease_owner_count_for_object(sandbox, &account, &broker, 2);
         }
         sandbox.delete(id);
+        // 3.4.1 (no fixCleanup3_5_0) paid the cover without asking whether
+        // the owner may be paid; rippled's generic MPT transfer invariant
+        // asks afterwards.
+        if !fix350 && cover_payout_fails_mpt_transfer_invariant(sandbox, &asset, &pseudo, &account, &cover) {
+            return TxResult::InvariantFailed;
+        }
         TxResult::Success
     }
+}
+
+/// `ValidMPTTransfer::finalize` (MPTInvariant.cpp:889-1020) for the one
+/// transfer a LoanBrokerDelete makes that 3.4.1's preclaim did not vet: the
+/// cover, an MPT, from the broker's pseudo-account to the owner. The
+/// invariant is generic (it runs after every transaction) and is not ported
+/// as such; this is its verdict on that transfer, judged as rippled judges
+/// it, on the state the transaction leaves:
+///
+/// - it only logs unless fixCleanup3_4_0 or MPTokensV2 is enabled (:934-936);
+/// - MPT moved between two HOLDERS (the issuer has no MPToken, so a payout
+///   to the issuer is not one) is invalid when the issuance lacks
+///   lsfMPTCanTransfer — LoanBrokerDelete is not among the types 3.4.1 lets
+///   through (:962-967) — or when either holder is locked or not authorized
+///   (:1001-1006; a pseudo-account is authorized by definition, :870-874);
+/// - the transaction then ends tecINVARIANT_FAILED: the fee, nothing else.
+///
+/// Before fixCleanup3_5_0 only: its preclaim refuses the unauthorized owner
+/// (tecNO_AUTH) and 3.5.0's invariant waives lsfMPTCanTransfer for this
+/// transaction. Found by campaign 28 (libxrpl 3.4.1 on devnet's
+/// 88B06D2CE7DC… with fixCleanup3_5_0 removed).
+fn cover_payout_fails_mpt_transfer_invariant(
+    sandbox: &Sandbox,
+    asset: &HeldAsset,
+    pseudo: &[u8; 20],
+    owner: &[u8; 20],
+    cover: &Amount,
+) -> bool {
+    let HeldAsset::Mpt(id) = asset else { return false };
+    if !(am::fix_cleanup_3_4_0(sandbox) || enabled(sandbox, am::MPTOKENS_V2)) {
+        return false;
+    }
+    // No balance moved, or it went back to the issuer: no transfer between holders.
+    if !positive(cover) || owner[..] == id[4..] {
+        return false;
+    }
+    let Some(issuance) = json_at(sandbox, &keylet::mpt_issuance_key(id)) else { return false };
+    if uint_field(&issuance, "Flags") & mpt::LSF_MPT_CAN_TRANSFER == 0 {
+        return true;
+    }
+    holding::is_frozen(sandbox, pseudo, asset)
+        || holding::is_frozen(sandbox, owner, asset)
+        || holding::require_auth(sandbox, asset, owner, AuthType::Legacy) != TxResult::Success
 }
 
 #[cfg(test)]
