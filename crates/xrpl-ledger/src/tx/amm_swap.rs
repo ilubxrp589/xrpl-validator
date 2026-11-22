@@ -3144,6 +3144,19 @@ mod large330_tests {
         assert_eq!(adjust_lp_tokens(lpt, (1_234_567_890_123_456, -20), true), (1_234_567_000_000_000, -20));
     }
 
+    /// `swapAssetOut` at Large330: `pool.out - assetOut` is `TOut - TOut`, an AMOUNT (AMMHelpers.h:555-556) — for
+    /// an IOU `IOUAmount::operator-=`, the difference cut to sixteen digits under the Downward mode in force —
+    /// while every other step mixes a Number in and keeps nineteen. The numbers are libxrpl 3.4.1's own
+    /// (`AMMLiquidity::getOffer` trace, mainnet #106743104 F8084760 replayed with SingleAssetVault enabled, second
+    /// Fibonacci slice): balances 1717.88520463883 / 24.06851082715967, out 0.005956956429722, fee 1 % →
+    /// in 0.4295776216216354. All nineteen digits throughout give …210586, sixteen throughout …222223.
+    #[test]
+    fn swap_asset_out_subtracts_the_out_amounts_as_amounts() {
+        let _scale = ScaleGuard::new(MantissaScale::Large330);
+        let inp = swap_asset_out((171_788_520_463_883, -11), (2_406_851_082_715_967, -14), (5_956_956_429_722_000, -18), 1000, false);
+        assert_eq!(inp.map(n_norm_pub), Some((4_295_776_216_216_354, -16)));
+    }
+
     /// Outside a guard — mainnet — nothing has moved: sixteen digits in,
     /// sixteen out, and the amount conversions hand the pair back.
     #[test]
