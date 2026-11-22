@@ -1874,6 +1874,20 @@ pub(crate) fn pool_balances(sandbox: &Sandbox, amm: &Amm, pays_leg: &Leg, gets_l
     )
 }
 
+/// The out of the n-th Fibonacci slice: `toAmount<TOut>(asset, cur.out * kFib[n - 1], Downward)`
+/// (AMMLiquidity.cpp:83-86), ambient ToNearest (the path engine sets no rounding guard).
+fn fib_slice_out(out0: Me, fib: u32, out_xrp: bool) -> Me {
+    to_amount_ambient(
+        // `cur.out * kFib[…]` is a Number product outside any guard:
+        // ToNearest in rippled. The Small arm keeps the Downward this
+        // engine has always used there (see the slice 0B report).
+        n_mul(out0, ((fib as u128) * LO, -15), if large_scale() { Rnd::Near } else { Rnd::Down }),
+        out_xrp,
+        Rnd::Down,
+        Rnd::Near,
+    )
+}
+
 /// The current fib-sequence slice (in, out) for a pool, without applying it.
 pub(crate) fn fib_slice(
     sandbox: &Sandbox,
@@ -1921,17 +1935,7 @@ pub(crate) fn fib_slice(
     } else {
         let out0 = swap_asset_in(init.0, init.1, base_in, amm.tfee, pays_leg.xrp);
         let idx = iters as usize - 1;
-        // `toAmount<TOut>(…, cur.out * fib, Downward)` (AMMLiquidity.cpp:83-86),
-        // ambient ToNearest as above.
-        s_out = to_amount_ambient(
-            // `cur.out * kFib[…]` is a Number product outside any guard:
-            // ToNearest in rippled. The Small arm keeps the Downward this
-            // engine has always used there (see the slice 0B report).
-            n_mul(out0, ((FIB[idx] as u128) * LO, -15), if large_scale() { Rnd::Near } else { Rnd::Down }),
-            pays_leg.xrp,
-            Rnd::Down,
-            Rnd::Near,
-        );
+        s_out = fib_slice_out(out0, FIB[idx], pays_leg.xrp);
         if s_out.0 == 0 || n_cmp(s_out, pool_out) != Ordering::Less {
             return None;
         }
@@ -3165,6 +3169,27 @@ mod large330_tests {
         let _scale = ScaleGuard::new(MantissaScale::Large330);
         let inp = swap_asset_out((171_788_520_463_883, -11), (2_406_851_082_715_967, -14), (5_956_956_429_722_000, -18), 1000, false, false);
         assert_eq!(inp.map(n_norm_pub), Some((4_295_776_216_216_354, -16)));
+    }
+
+    /// `cur.out * kFib[n]` is `Number{IOUAmount} * Number{uint32}` under the ambient mode, and the path engine
+    /// runs at ToNearest: libxrpl 3.4.1's own slices (`AMMLiquidity::getOffer, created …` in its flow trace of
+    /// mainnet multi-path payments replayed at Large330) are the product rounded to NEAREST in 68 of 68 slices
+    /// where nearest and downward differ, e.g. 558.517350148429 × 21 = 11728.864353117009 → 11728.86435311701.
+    /// Nothing in that expression depends on the scale but Number's width, so at the Small scale it is the
+    /// sixteen-digit product at nearest too (Number's multiply is fuzzed against libxrpl at both scales).
+    ///
+    /// At the Small scale the choice is almost never visible: the first slice's out is `pool.out - ratio`, twelve
+    /// or thirteen digits, and no slice larger than out0 × 2584 fits in a pool, so the product is exact. It shows
+    /// only when out0 carries fourteen digits (the pool's out balance within 0.025 % above a power of ten) from
+    /// the fifteenth iteration on: 2500.1234567891 × 987 = 2467621.8518508417.
+    #[test]
+    fn a_fibonacci_slice_multiplies_at_nearest() {
+        let out0: Me = (2_500_123_456_789_100, -12);
+        assert_eq!(fib_slice_out(out0, 8, false), (2_000_098_765_431_280, -11), "exact: nothing to round");
+        assert_eq!(fib_slice_out(out0, 987, false), (2_467_621_851_850_842, -9), "Small: nearest, not …841");
+        assert_eq!(fib_slice_out((6_862_360, 0), 21, true), (144_109_560, 0), "XRP slices are whole drops");
+        let _scale = ScaleGuard::new(MantissaScale::Large330);
+        assert_eq!(fib_slice_out((5_585_173_501_484_290, -13), 21, false), (1_172_886_435_311_701, -11), "libxrpl's own slice");
     }
 
     /// Outside a guard — mainnet — nothing has moved: sixteen digits in,
