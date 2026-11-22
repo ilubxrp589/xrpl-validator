@@ -393,3 +393,32 @@ fn c26c_p6_x1_autobridged_sell_usd_for_eur_bridge_then_direct_pages0_1_into_2_te
     port();
     run_bundle(include_str!("vectors/c26c_p6_x1_autobridged_sell_usd_for_eur_bridge_then_direct_pages0_1_into_2_testnet_21249107.json"));
 }
+
+/// Devnet #6830636 56FB9911F31B (organic, rippled 3.5.0-rc5; found by the Large330 campaign, 2026-11-22): a
+/// tfSell | tfImmediateOrCancel OfferCreate with a DomainID sells 6 NBAMZN into the domain book's tip (25 NBAMZN for
+/// 6667.5 NBUSD) while an AMM exists for the same pair with a better spot price. rippled never offers a pool on a
+/// domain book, and under fixCleanup3_3_0 `getAMMOffer` returns nothing for one (BookStep.cpp:976-977), so the
+/// step's tip and quality function are the book's alone: one pass, 6 in, 1600.2 out, the maker's line 3875 → 3881.
+/// The engine left the pool out of the crossing (`tryAMM`) but still let it set the strand's quality function:
+/// `limitOut` then cut each pass to 415.28 NBUSD and the fill came out in four passes, 3880.999999999999. libxrpl
+/// 3.4.1 with mainnet's rules gives the devnet bytes at either Number scale. PermissionedDEX and fixCleanup3_3_0
+/// are both enabled on mainnet.
+#[test]
+fn offer_permissioned_domain_book_ignores_the_pool_devnet_6830636() {
+    port();
+    run_bundle(include_str!("vectors/offer_permissioned_domain_book_ignores_the_pool_devnet_6830636.json"));
+}
+
+/// Devnet #6766809 AB9D2B78C780: as above, 5 NBAMZN sold into the domain book beside the pool.
+#[test]
+fn offer_permissioned_domain_book_ignores_the_pool_devnet_6766809() {
+    port();
+    run_bundle(include_str!("vectors/offer_permissioned_domain_book_ignores_the_pool_devnet_6766809.json"));
+}
+
+/// Devnet #6940016 E59BA5B95A4A: as above, the other way round (an IoC buy of 7 NBMSFT for NBUSD).
+#[test]
+fn offer_permissioned_domain_book_ignores_the_pool_devnet_6940016() {
+    port();
+    run_bundle(include_str!("vectors/offer_permissioned_domain_book_ignores_the_pool_devnet_6940016.json"));
+}
