@@ -38,7 +38,8 @@
 //! `tests/vectors/*.json` bundle that is not a vault / lending one (those are `libxrpl_341_differential.rs`'s).
 //! `L330_TYPES` = comma-separated transaction types to keep. `L330_PIN_DIR` = a directory to write each Large
 //! AGREE / NOOP bundle to, in the form `large330_vector.rs` replays (rewritten pre-state, libxrpl's result and
-//! objects as the expectation). `L330_REPORT_ONLY=1`: print, do not fail. Needs `--features ffi`; one test,
+//! objects as the expectation). `L330_REPORT_ONLY=1`: print, do not fail. `L330_ENGINE=model`: the Small run uses
+//! the fallback model flow engine instead of the port the live validator runs. Needs `--features ffi`; one test,
 //! sequential (libxrpl's Number scale and current rules are process state).
 use serde_json::{json, Value};
 use std::cell::RefCell;
@@ -529,8 +530,15 @@ fn panic_text(p: Box<dyn std::any::Any + Send>) -> String {
 
 #[test]
 fn libxrpl_against_our_engine_at_both_number_scales() {
+    // The live validator runs the ported flow engine (`XRPL_FLOW_ENGINE=port`); the Small run is its control, so
+    // it must run the same one. `L330_ENGINE=model` leaves the fallback model in at the Small scale. (At Large330
+    // the port is the only engine, whatever the variable says.)
+    if std::env::var("L330_ENGINE").map(|v| v != "model").unwrap_or(true) {
+        std::env::set_var("XRPL_FLOW_ENGINE", "port");
+    }
     let version = xrpl_ffi::libxrpl_version();
     println!("D330 libxrpl version linked: {version}");
+    println!("D330 Small-scale flow engine: {}", std::env::var("XRPL_FLOW_ENGINE").unwrap_or_else(|_| "model".into()));
     assert!(
         version.contains("3.4.1") || std::env::var("L330_ANY_VERSION").is_ok(),
         "this differential is about rippled 3.4.1; the shim links {version}"
