@@ -2923,23 +2923,16 @@ impl Transactor for AMMWithdrawTransactor {
         // of record; a shortfall past the invariant's 1e-11 relative tolerance
         // is tecPRECISION_LOSS and nothing moves.
         if crate::ledger::amendments::fix_cleanup_3_3_0(sandbox) {
-            use crate::tx::amm_swap::{n_cmp, n_mul, n_sqrt, n_sub, Rnd};
+            use crate::tx::amm_swap::{n_mul, n_sqrt, Rnd};
             let pools: Vec<ox::Me> = ["Asset", "Asset2"]
                 .iter()
                 .filter_map(|f| tx.fields.get(*f).and_then(asset_leg))
                 .map(|l| crate::tx::amm_swap::holds(sandbox, &amm_acct, &l))
                 .collect();
             if let (Some(new_lpt), [p1, p2]) = (pool_lpt(sandbox), pools.as_slice()) {
-                if new_lpt.0 > 0 {
-                    let mean = n_sqrt(n_mul(*p1, *p2, Rnd::Near));
-                    if n_cmp(mean, new_lpt) == std::cmp::Ordering::Less {
-                        let short = n_sub(new_lpt, mean, Rnd::Near);
-                        let tol = n_mul(new_lpt, (1, -11), Rnd::Near);
-                        if n_cmp(short, tol) == std::cmp::Ordering::Greater {
-                            sandbox.restore_snapshot(snap);
-                            return TxResult::PrecisionLoss;
-                        }
-                    }
+                if amm_precision_lost(n_sqrt(n_mul(*p1, *p2, Rnd::Near)), new_lpt) {
+                    sandbox.restore_snapshot(snap);
+                    return TxResult::PrecisionLoss;
                 }
             }
         }
@@ -3211,6 +3204,38 @@ impl Transactor for AMMVoteTransactor {
         let _ = amm_acct;
         crate::tx::offer::put_json(sandbox, amm_key, &amm);
         TxResult::Success
+    }
+}
+
+/// rippled `checkAMMPrecisionLoss(poolProductMean, newLPTokenBalance)` (AMMHelpers.cpp:437-450): whether the pool's
+/// geometric mean falls short of the LP token balance by more than the invariant's relative tolerance.
+fn amm_precision_lost(mean: crate::tx::offer::Me, new_lpt: crate::tx::offer::Me) -> bool {
+    use crate::tx::amm_swap::{n_cmp, n_mul, n_sub, Rnd};
+    if new_lpt.0 == 0 || n_cmp(mean, new_lpt) != std::cmp::Ordering::Less {
+        return false;
+    }
+    let short = n_sub(new_lpt, mean, Rnd::Near);
+    let tol = n_mul(new_lpt, (1, -11), Rnd::Near);
+    n_cmp(short, tol) == std::cmp::Ordering::Greater
+}
+
+#[cfg(test)]
+mod precision_loss_tests {
+    use super::*;
+
+    /// The weak check is `withinRelativeDistance(mean, lpt, 1e-11)` = `(max - min) / max < dist` (AMMHelpers.h:
+    /// 160-166): a shortfall of EXACTLY one part in 1e11 is not within the distance, so it is tecPRECISION_LOSS.
+    /// A mean of 0.99999999999 under an LP balance of 1 is that case; one digit closer passes, as does a mean at
+    /// or above the balance.
+    #[test]
+    fn a_shortfall_of_exactly_the_tolerance_is_a_precision_loss() {
+        let lpt: crate::tx::offer::Me = (1_000_000_000_000_000, -15);
+        assert!(amm_precision_lost((9_999_999_999_900_000, -16), lpt), "(1 - 0.99999999999) / 1 = 1e-11, not < 1e-11");
+        assert!(amm_precision_lost((9_999_999_999_800_000, -16), lpt));
+        assert!(!amm_precision_lost((9_999_999_999_900_001, -16), lpt));
+        assert!(!amm_precision_lost(lpt, lpt));
+        assert!(!amm_precision_lost((1_000_000_000_000_001, -15), lpt));
+        assert!(!amm_precision_lost((5, -1), (0, 0)), "an emptied pool is not checked");
     }
 }
 
@@ -4780,14 +4805,9 @@ impl Transactor for AMMClawbackTransactor {
             // Finding 259's precision test, as AMMWithdraw runs it.
             let p1 = crate::tx::amm_swap::holds(sandbox, &amm_acct, &a1);
             let p2 = crate::tx::amm_swap::holds(sandbox, &amm_acct, &a2);
-            let mean = n_sqrt(n_mul(p1, p2, Rnd::Near));
-            if n_cmp(mean, new_lpt) == std::cmp::Ordering::Less {
-                let short = n_sub(new_lpt, mean, Rnd::Near);
-                let tol = n_mul(new_lpt, (1, -11), Rnd::Near);
-                if n_cmp(short, tol) == std::cmp::Ordering::Greater {
-                    sandbox.restore_snapshot(snap);
-                    return TxResult::PrecisionLoss;
-                }
+            if amm_precision_lost(n_sqrt(n_mul(p1, p2, Rnd::Near)), new_lpt) {
+                sandbox.restore_snapshot(snap);
+                return TxResult::PrecisionLoss;
             }
         }
         // The claw: Asset (and Asset2 under tfClawTwoAssets) holder -> issuer.
