@@ -32,7 +32,8 @@
 //!
 //! A mutant bundle (`"mutant_of": "<pinned vector>"`: amounts of the vector's pre-state and / or transaction changed)
 //! has no network outcome; libxrpl is its only reference. A mutant that differs AND asked for a key its base
-//! vector's run never asked for is counted `outside`: its walk left the hydrated state.
+//! vector's run never asked for is counted `outside`: its walk left the hydrated state. So is one in which libxrpl
+//! asked for an object a directory page lists and the bundle does not hold.
 //!
 //! One `D330` line per bundle and scale, classes as `libxrpl_341_differential.rs` (AGREE / NOOP / TER / MUT / BYTE /
 //! HARNESS). `sens=1` on a Large line: libxrpl's own answer at Large differs from its answer at Small, i.e. the
@@ -479,7 +480,20 @@ fn left_the_hydrated_state(bundle: &Value, row: &Row, large: bool) -> bool {
     let Some(base_bundle) = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) else { return true };
     let Ok(b) = run_scale(base, &base_bundle, large) else { return true };
     let known: BTreeSet<&Key> = b.lib_misses.iter().chain(&b.our_misses).collect();
-    row.lib_misses.iter().chain(&row.our_misses).any(|k| !known.contains(k))
+    row.lib_misses.iter().chain(&row.our_misses).any(|k| !known.contains(k)) || dangling(row)
+}
+
+/// Whether libxrpl asked for an object that a directory page of the pre-state lists and the pre-state does not
+/// hold: a "bad offer" to rippled's OfferStream, which then removes the entry and walks on, where the object simply
+/// was never fetched (the vector's own transaction stopped before it).
+fn dangling(row: &Row) -> bool {
+    let missed: BTreeSet<String> = row.lib_misses.iter().map(hex::encode_upper).collect();
+    !missed.is_empty()
+        && row.pre.values().any(|b| {
+            let jv = decode(b);
+            jv["LedgerEntryType"] == "DirectoryNode"
+                && jv["Indexes"].as_array().is_some_and(|a| a.iter().filter_map(Value::as_str).any(|k| missed.contains(&k.to_uppercase())))
+        })
 }
 
 /// The bundle as `large330_vector.rs` replays it: the rewritten pre-state, libxrpl's result, and as the
