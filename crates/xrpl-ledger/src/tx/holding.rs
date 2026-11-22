@@ -1232,6 +1232,7 @@ fn pseudo_holds_frozen_shares(sandbox: &Sandbox, pseudo: &[u8; 20], asset: &Held
 ///   destination (a plain freeze does not stop a holder taking its own
 ///   funds out);
 /// - the destination deep-frozen;
+///
 /// each tecFROZEN (IOU) or tecLOCKED (MPT).
 pub fn check_withdraw_freeze(sandbox: &Sandbox, pseudo: &[u8; 20], submitter: &[u8; 20], dst: &[u8; 20], asset: &HeldAsset) -> TxResult {
     if *dst == asset_issuer(asset) {
@@ -1398,7 +1399,7 @@ fn mul_ratio(amount: &Amount, num: u64, den: u64, round_up: bool) -> Result<Amou
     let mut quotient = product / den as u128;
     // Signed division truncates towards zero: up adds one to a positive
     // quotient, down adds one to a negative one's magnitude.
-    if product % den as u128 != 0 && (negative != round_up) {
+    if !product.is_multiple_of(den as u128) && (negative != round_up) {
         quotient += 1;
     }
     if quotient > i64::MAX as u128 {

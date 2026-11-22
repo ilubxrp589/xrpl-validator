@@ -4663,7 +4663,7 @@ impl Transactor for AMMClawbackTransactor {
         //   issuer with no transfer fee (directSendNoFee).
         // The old model burned `lpt × frac` and paid the proportional payout,
         // which misrounded every partial specimen and mis-sized withdraw-all.
-        use crate::tx::amm_swap::{n_cmp, n_mul, n_sqrt, n_sub, Rnd};
+        use crate::tx::amm_swap::{n_mul, n_sqrt, Rnd};
         let fix340 = crate::ledger::amendments::fix_cleanup_3_4_0(sandbox);
         let claw_rounding = crate::ledger::amendments::enabled(sandbox, FIX_AMM_CLAWBACK_ROUNDING);
         let v13 = crate::ledger::amendments::enabled(sandbox, FIX_AMM_V1_3);
