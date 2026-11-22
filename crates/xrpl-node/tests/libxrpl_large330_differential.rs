@@ -357,7 +357,9 @@ fn describe(legs: &Legs) -> Vec<String> {
         }
     }
     if !legs.lib_fatal.is_empty() {
-        lines.push(format!("libxrpl log: {}", legs.lib_fatal.chars().take(1500).collect::<String>()));
+        // `L330_LOG_CHARS`: how much of libxrpl's log to print (with XRPL_FFI_TRACE=1 it is the flow engine's trace).
+        let n = std::env::var("L330_LOG_CHARS").ok().and_then(|s| s.parse().ok()).unwrap_or(1500);
+        lines.push(format!("libxrpl log: {}", legs.lib_fatal.chars().take(n).collect::<String>()));
     }
     let keys = |v: &[Key]| v.iter().map(hex::encode_upper).collect::<Vec<_>>().join(" ");
     lines.push(format!("keys libxrpl asked for and the bundle lacks: [{}]", keys(&legs.lib_misses)));
@@ -527,7 +529,8 @@ fn libxrpl_against_our_engine_at_both_number_scales() {
                         r.our_ter,
                         if large { format!(" sens={}", sensitive as u8) } else { String::new() }
                     );
-                    r.detail.iter().for_each(|l| println!("D330   {}", l.chars().take(3000).collect::<String>()));
+                    let cap = std::env::var("L330_LOG_CHARS").ok().and_then(|s| s.parse().ok()).unwrap_or(3000);
+                    r.detail.iter().for_each(|l| println!("D330   {}", l.chars().take(cap).collect::<String>()));
                     *tally.entry((scale, tx_type.clone(), r.class)).or_default() += 1;
                     if matches!(r.class, "TER" | "MUT" | "BYTE") {
                         failing.push(format!("{name}@{scale}"));
