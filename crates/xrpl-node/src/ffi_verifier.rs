@@ -149,6 +149,10 @@ impl FfiVerifier {
         read
     }
 
+    /// ws-sync's word on a ledger it has read: whether it carries an EnableAmendment pseudo-transaction, the only
+    /// thing that rewrites the Amendments object. (The seam only: nothing is done with it yet.)
+    pub fn note_ledger(&self, _ledger_seq: u32, _changes_amendments: bool) {}
+
     /// Apply and verify every tx in a ledger, in `TransactionIndex` order,
     /// against mainnet's recorded TER via libxrpl. Blocking — call from a
     /// spawn_blocking task or a dedicated thread. Each diverged result is
@@ -392,5 +396,165 @@ mod tests {
         db.put(hex::decode(AMENDMENTS_KEY).unwrap(), b"not an object").unwrap();
         let garbled = OwnedSnapshot::new(db.clone());
         assert_eq!(v.ledger_amendments(256 * 400_000 + 3, Some(&garbled)), known);
+    }
+
+    /// A stand-in for the RPC endpoint the catch-up path reads the parent's Amendments object from. `answer` maps
+    /// the `ledger_index` asked for to the enabled list (None: accept the connection and never reply, as a hung
+    /// rippled does). Returns the URL and the count of requests received.
+    fn endpoint(answer: impl Fn(u32) -> Option<Vec<[u8; 32]>> + Send + 'static) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = requests.clone();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                // One request per connection: headers, then a body of Content-Length bytes.
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let body = loop {
+                    let Ok(n) = stream.read(&mut chunk) else { break None };
+                    if n == 0 {
+                        break None;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                    let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse().unwrap()))
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + len {
+                        break Some(buf[end + 4..end + 4 + len].to_vec());
+                    }
+                };
+                let Some(body) = body else { continue };
+                counted.fetch_add(1, Ordering::SeqCst);
+                let asked: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(asked["method"], "ledger_entry", "{asked}");
+                assert_eq!(asked["params"][0]["index"], AMENDMENTS_KEY, "{asked}");
+                let at: u32 = asked["params"][0]["ledger_index"].as_str().unwrap().parse().unwrap();
+                match answer(at) {
+                    Some(enabled) => {
+                        let ids: Vec<String> = enabled.iter().map(hex::encode_upper).collect();
+                        let reply = serde_json::json!({"result": {"ledger_index": at, "validated": true, "status": "success",
+                            "node": {"LedgerEntryType": "Amendments", "Flags": 0, "Amendments": ids}}})
+                        .to_string();
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                            reply.len()
+                        );
+                    }
+                    None => held.push(stream),
+                }
+            }
+        });
+        (url, requests)
+    }
+
+    /// A verifier on the RPC catch-up path (no state of its own), started with `startup`.
+    fn rpc_verifier(url: String, startup: &[[u8; 32]]) -> FfiVerifier {
+        FfiVerifier::with_amendments(vec![url], startup.to_vec(), None)
+    }
+
+    /// The Amendments object's enabled list is rewritten only by an EnableAmendment pseudo-transaction
+    /// (Change::applyAmendment), so once the parent's list is known, every following ledger that ws-sync reports
+    /// as carrying none runs under the same list: the catch-up path must not ask the endpoint again for it.
+    #[test]
+    fn ledgers_that_carry_no_amendment_change_cost_the_catch_up_path_no_read() {
+        use std::sync::atomic::Ordering;
+        let on_chain = vec![id(0xAA), id(0xBB), id(0xCC)];
+        let served = on_chain.clone();
+        let (url, requests) = endpoint(move |_| Some(served.clone()));
+        let v = rpc_verifier(url, &[id(0xAA)]);
+        let first = 256 * 400_000 + 7;
+        for seq in first..first + 6 {
+            assert_eq!(v.ledger_amendments(seq, None), on_chain, "#{seq}");
+            v.note_ledger(seq, false);
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "one read for the first ledger's parent, none after it");
+        // A ledger re-driven (held, then processed again) is still covered.
+        assert_eq!(v.ledger_amendments(first + 3, None), on_chain);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    /// The ledger that carries the EnableAmendment runs under its parent's list; the one after it must be read
+    /// again (its parent's object was rewritten), and from there the new list is the known one.
+    #[test]
+    fn the_ledger_after_an_amendment_change_is_read_again_on_the_catch_up_path() {
+        use std::sync::atomic::Ordering;
+        let (old, new) = (vec![id(0xAA), id(0xBB)], vec![id(0xAA), id(0xBB), id(0xCC)]);
+        let activation = 256 * 400_000 + 1;
+        let (was, is) = (old.clone(), new.clone());
+        let (url, requests) = endpoint(move |at| Some(if at < activation { was.clone() } else { is.clone() }));
+        let v = rpc_verifier(url, &old);
+
+        assert_eq!(v.ledger_amendments(activation - 1, None), old);
+        v.note_ledger(activation - 1, false);
+        assert_eq!(v.ledger_amendments(activation, None), old, "the activation ledger runs under its parent's set");
+        v.note_ledger(activation, true);
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "nothing changed up to the activation ledger's parent");
+
+        assert_eq!(v.ledger_amendments(activation + 1, None), new, "the ledger after it runs under the new set");
+        v.note_ledger(activation + 1, false);
+        assert_eq!(requests.load(Ordering::SeqCst), 2, "its parent carried the change: read");
+        assert_eq!(v.ledger_amendments(activation + 2, None), new);
+        v.note_ledger(activation + 2, false);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+
+        // Re-driven on the far side of the change: not covered by what is known now, so read, and right.
+        assert_eq!(v.ledger_amendments(activation, None), old);
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+    }
+
+    /// Ledgers ws-sync did not report (a jump: reconnect, resync) may hide a change: the first ledger past the
+    /// gap reads its parent's object. So does a ledger whose predecessor was never noted at all.
+    #[test]
+    fn a_gap_in_the_ledgers_seen_is_read_across_on_the_catch_up_path() {
+        use std::sync::atomic::Ordering;
+        let (old, new) = (vec![id(0xAA)], vec![id(0xAA), id(0xDD)]);
+        let seq = 256 * 400_000 + 40;
+        let (was, is) = (old.clone(), new.clone());
+        let (url, requests) = endpoint(move |at| Some(if at < seq + 3 { was.clone() } else { is.clone() }));
+        let v = rpc_verifier(url, &old);
+        assert_eq!(v.ledger_amendments(seq, None), old);
+        v.note_ledger(seq, false);
+        assert_eq!(v.ledger_amendments(seq + 5, None), new, "ledgers {}..{} were never seen", seq + 1, seq + 4);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        // Verified but never noted: the next ledger cannot lean on it.
+        assert_eq!(v.ledger_amendments(seq + 6, None), new);
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+    }
+
+    /// An endpoint that accepts and never answers must cost the libxrpl leg a small, bounded wait: the whole leg
+    /// (this read, then the apply) runs inside ws-sync's 3 s compare wait under the native writer, and a ledger
+    /// past it goes uncompared. The last set known stays in force, and once the endpoint answers again the read
+    /// is made and used.
+    #[test]
+    fn a_dead_endpoint_costs_the_catch_up_path_a_bounded_wait_and_keeps_the_last_known_set() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (known, on_chain) = (vec![id(0xAA), id(0xBB)], vec![id(0xAA), id(0xBB), id(0xCC)]);
+        let alive = Arc::new(AtomicBool::new(false));
+        let (up, served) = (alive.clone(), on_chain.clone());
+        let (url, requests) = endpoint(move |_| up.load(Ordering::SeqCst).then(|| served.clone()));
+        let v = rpc_verifier(url, &known);
+        let seq = 256 * 400_000 + 9;
+        for seq in seq..seq + 2 {
+            let t0 = std::time::Instant::now();
+            assert_eq!(v.ledger_amendments(seq, None), known, "#{seq}: the last known set stays in force");
+            let waited = t0.elapsed();
+            assert!(waited < std::time::Duration::from_millis(1500), "#{seq}: waited {waited:?} on a dead endpoint");
+            v.note_ledger(seq, false);
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 2, "a failed read vouches for nothing: the next ledger asks again");
+        alive.store(true, Ordering::SeqCst);
+        assert_eq!(v.ledger_amendments(seq + 2, None), on_chain, "the endpoint answers again");
+        // Nothing listening at all: refused at once, same outcome.
+        let refused = rpc_verifier("http://127.0.0.1:1".into(), &known);
+        assert_eq!(refused.ledger_amendments(seq, None), known);
     }
 }
