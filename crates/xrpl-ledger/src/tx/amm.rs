@@ -3214,26 +3214,20 @@ impl Transactor for AMMVoteTransactor {
     }
 }
 
-/// A vote slot's `VoteWeight` for a holder of `lp` of the pool's `lpt_amm` LP tokens (AMMVote.cpp:124-126, :151-154).
-// VoteWeight = lp × 100000 / lptAMM, exact i128, Number half-even.
+/// A vote slot's `VoteWeight` for a holder of `lp` of the pool's `lpt_amm` LP tokens:
+/// `static_cast<std::int64_t>(Number(lpTokens) * kVoteWeightScaleFactor / lptAMMBalance)` (AMMVote.cpp:124-126,
+/// :151-154). Three Number steps, each as rippled rounds it: the product (exact, a power of ten), the division
+/// (to the scale's digits; at Small the remainder is discarded), and `operator rep()` on that quotient (nearest,
+/// an exact half to even). Rounding the exact quotient once instead differs when it lies within the division's
+/// last digit of a half.
 fn vote_weight(lp: crate::tx::offer::Me, lpt_amm: crate::tx::offer::Me) -> u64 {
-    if lp.0 == 0 {
+    use crate::tx::amm_swap::{n_div, n_mul, to_amount, Rnd};
+    if lp.0 == 0 || lpt_amm.0 == 0 {
         return 0;
     }
-    let (mut num, mut den) = (lp.0 as i128 * 100_000, lpt_amm.0 as i128);
-    let mut d = lp.1 - lpt_amm.1;
-    while d > 0 {
-        num *= 10;
-        d -= 1;
-    }
-    while d < 0 {
-        den *= 10;
-        d += 1;
-    }
-    let q = num / den;
-    let r = num % den;
-    let q = if 2 * r > den || (2 * r == den && q % 2 == 1) { q + 1 } else { q };
-    q as u64
+    let quotient = n_div(n_mul(lp, (100_000, 0), Rnd::Near), lpt_amm, Rnd::Near);
+    // `to_amount(…, xrp = true, …)` is `Number::operator rep()`.
+    to_amount(quotient, true, Rnd::Near).0 as u64
 }
 
 #[cfg(test)]
