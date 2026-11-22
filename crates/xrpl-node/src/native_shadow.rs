@@ -2419,6 +2419,56 @@ mod tests {
         assert!(p.refusal.is_some(), "a 10 s ledger: 305 s past its close time is tecINVALID_UPDATE_TIME, not the tesSUCCESS given");
     }
 
+    /// rippled builds a ledger's Rules from its PARENT (`rules_(prevLedger.rules_)`, Ledger.cpp:259) and reads
+    /// them again from the state only once the ledger is closed (`setup`, Ledger.cpp:549): every transaction
+    /// of the ledger that carries an EnableAmendment pseudo-transaction still runs under the old rules, the
+    /// ones ordered after it included; the amendment is live from the NEXT ledger.
+    /// A real devnet VaultCreate (campaign 27, B0F88311FD4D, tesSUCCESS) over a parent state with
+    /// SingleAssetVault taken out: in the ledger whose first transaction enables the amendment it is still
+    /// temDISABLED; in the ledger after it applies, byte for byte as devnet wrote it.
+    #[test]
+    fn an_amendment_enabled_in_a_ledger_rules_from_the_next_ledger_on() {
+        use xrpl_ledger::ledger::amendments::SINGLE_ASSET_VAULT;
+        let dir = tempfile::tempdir().unwrap();
+        let (log, trigger) = (dir.path().join("receipts.jsonl"), dir.path().join("native_shadow.canary"));
+        let (seq, parent, pct, drops, vault_create, mut state, overlay) = bundle_ledger(include_str!(
+            "../tests/vectors/c27_vault_create_create_reserve3_xrp_exact_devnet_7134186.json"
+        ));
+        let (keys, deleted) = meta_of(&overlay);
+        let ak = keylet::amendments_key();
+        let listed = |st: &LedgerState| -> Vec<String> {
+            let o: Value = serde_json::from_slice(st.state_map.lookup(&ak).unwrap()).unwrap();
+            o["Amendments"].as_array().unwrap().iter().map(|a| a.as_str().unwrap().to_uppercase()).collect()
+        };
+        // The parent of the activation ledger: devnet's amendments without SingleAssetVault.
+        let mut am: Value = serde_json::from_slice(state.state_map.lookup(&ak).unwrap()).unwrap();
+        assert!(listed(&state).iter().any(|a| a == SINGLE_ASSET_VAULT), "the bundle is from a ledger with the vault on");
+        am["Amendments"].as_array_mut().unwrap().retain(|a| !a.as_str().unwrap().eq_ignore_ascii_case(SINGLE_ASSET_VAULT));
+        state.state_map.insert(ak, serde_json::to_vec(&am).unwrap()).unwrap();
+
+        // The activation ledger: the pseudo-transaction first, the VaultCreate after it.
+        let enable = json!({
+            "TransactionType": "EnableAmendment", "Account": "rrrrrrrrrrrrrrrrrrrrrhoLvTp", "Amendment": SINGLE_ASSET_VAULT,
+            "Fee": "0", "Sequence": 0, "SigningPubKey": "", "LedgerSequence": seq - 1,
+            "hash": "E".repeat(64),
+            "metaData": { "TransactionResult": "tesSUCCESS", "TransactionIndex": 0, "AffectedNodes": [] },
+        });
+        let mut refused = vault_create.clone();
+        refused["metaData"] = json!({ "TransactionResult": "temDISABLED", "TransactionIndex": 1, "AffectedNodes": [] });
+        let mut sh = shadow(state, seq - 2, &log, &trigger);
+        let none = HashSet::new();
+        let p = sh.propose(seq - 1, &[9; 32], pct - 10, 10, drops, &[enable, refused], &none, &none, None).unwrap();
+        assert_eq!(p.refusal, None, "the VaultCreate ordered after the EnableAmendment still runs under the parent's rules");
+        assert!(p.overlay.is_empty(), "and writes nothing: {:?}", p.overlay.keys().map(hex::encode_upper).collect::<Vec<_>>());
+        assert!(listed(&sh.state).iter().any(|a| a == SINGLE_ASSET_VAULT), "the pseudo-transaction itself did enable it in the state");
+        sh.commit(seq - 1, &p.overlay, true);
+
+        // The next ledger is built on a parent that has the amendment.
+        let p = sh.propose(seq, &parent, pct, 10, drops, &[vault_create], &keys, &deleted, None).unwrap();
+        assert_eq!(p.refusal, None, "one ledger on, the vault rules apply");
+        assert_eq!(p.overlay, overlay, "and the vault is created as devnet created it");
+    }
+
     // ---- Phase B: the native writer ----
 
     /// The keys the network's metadata names for the payment ledger: exactly
