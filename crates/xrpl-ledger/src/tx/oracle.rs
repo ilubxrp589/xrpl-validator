@@ -159,8 +159,10 @@ impl Transactor for OracleSetTransactor {
         // which every hasExpired test uses and which our header carries as
         // `close_time`. -296 s from the parent close is -306 s from the
         // provisional one: mainnet tec, ours tes (and the mirror at +308).
-        let h = &sandbox.base().header;
-        let close = h.parent_close_time as u64 + h.close_time_resolution as u64;
+        // `LedgerHeader::building_close_time`, the one expression LoanSet's
+        // start date shares: the base header's close_time (the parent's) plus
+        // the resolution of the ledger being built.
+        let close = u64::from(sandbox.base().header.building_close_time());
         if close >= MAX_DELTA
             && (lut_ripple < close - MAX_DELTA || lut_ripple > close + MAX_DELTA)
         {
@@ -488,5 +490,38 @@ mod tests {
         let mut empty = set_tx(id, vec![pd("AAA", None), pd("BTC", None), pd("ETH", None)]);
         empty.fields["LastUpdateTime"] = serde_json::json!(1_780_000_200u64);
         assert_eq!(tr.preclaim(&empty, &sb), TxResult::TecArrayEmpty);
+    }
+
+    /// OracleSet.cpp:74-83: the window is `view.header().closeTime` ± 300 s, and that close time is the
+    /// base header's `close_time` (the parent's) plus the resolution of the ledger being built
+    /// (`LedgerHeader::building_close_time`, the expression LoanSet's start date uses) — whatever the
+    /// header's `parent_close_time` holds (in a real parent header, the grandparent's close).
+    #[test]
+    fn the_update_window_is_centred_on_the_close_time_of_the_ledger_being_built() {
+        const EPOCH_OFFSET: u64 = 946_684_800;
+        let id = [0x54u8; 20];
+        let tr = OracleSetTransactor;
+        let parent_close = 833_000_000u32;
+        let at = |resolution: u8, offset: i64| {
+            let mut state = state_with_account(&id);
+            state.header.close_time = parent_close;
+            state.header.parent_close_time = parent_close - 1_000; // the grandparent's: not read
+            state.header.close_time_resolution = resolution;
+            assert_eq!(state.header.building_close_time(), parent_close + u32::from(resolution));
+            let mut tx = set_tx(id, vec![pd("BTC", Some("1"))]);
+            let lut = (i64::from(parent_close) + offset) as u64 + EPOCH_OFFSET;
+            tx.fields["LastUpdateTime"] = serde_json::json!(lut);
+            tr.preclaim(&tx, &Sandbox::new(&state))
+        };
+        // A 10 s ledger: [parent - 290, parent + 310].
+        assert_eq!(at(10, -290), TxResult::Success);
+        assert_eq!(at(10, -291), TxResult::InvalidUpdateTime);
+        assert_eq!(at(10, 310), TxResult::Success);
+        assert_eq!(at(10, 311), TxResult::InvalidUpdateTime);
+        // A 20 s ledger: [parent - 280, parent + 320].
+        assert_eq!(at(20, -280), TxResult::Success);
+        assert_eq!(at(20, -281), TxResult::InvalidUpdateTime);
+        assert_eq!(at(20, 320), TxResult::Success);
+        assert_eq!(at(20, 321), TxResult::InvalidUpdateTime);
     }
 }

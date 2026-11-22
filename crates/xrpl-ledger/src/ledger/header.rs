@@ -42,6 +42,24 @@ pub struct LedgerHeader {
 }
 
 impl LedgerHeader {
+    /// rippled's `view.header().closeTime` while a ledger's transactions are
+    /// applied, read off the BASE header the apply pipelines hand the engine.
+    ///
+    /// That base header describes the parent ledger: `close_time` is the
+    /// parent's close time (what every expiry test reads, rippled's
+    /// `parentCloseTime`), and `close_time_resolution` is the one field that
+    /// belongs to the ledger being BUILT (its own resolution,
+    /// `ledger::close_time::next_resolution`). rippled gives a ledger under
+    /// construction `closeTime = parent.closeTime + closeTimeResolution`
+    /// (the `Ledger(prevLedger, closeTime)` constructor, Ledger.cpp:262-278);
+    /// the agreed close time replaces it only when the ledger is accepted,
+    /// after the transactions. Two transactors read it: OracleSet's
+    /// LastUpdateTime window (OracleSet.cpp:74-83) and LoanSet's start date
+    /// (LoanSet.cpp:225-229). Everything else reads `close_time`.
+    pub fn building_close_time(&self) -> u32 {
+        self.close_time.wrapping_add(u32::from(self.close_time_resolution))
+    }
+
     /// Serialize the header to exactly 118 bytes (big-endian).
     pub fn serialize(&self) -> [u8; HEADER_SIZE] {
         let mut buf = [0u8; HEADER_SIZE];

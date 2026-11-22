@@ -239,8 +239,7 @@ fn parent_close_time(sandbox: &Sandbox) -> u32 {
 /// (`ledger::close_time::next_resolution`), or sfStartDate and every due
 /// date derived from it are off by the difference.
 pub fn ledger_close_time(sandbox: &Sandbox) -> u32 {
-    let header = &sandbox.base().header;
-    header.close_time.wrapping_add(header.close_time_resolution as u32)
+    sandbox.base().header.building_close_time()
 }
 
 /// `view.update(sle)` — and, when `asset` is given, `associateAsset(*sle,
