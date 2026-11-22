@@ -13,7 +13,7 @@ use crate::ledger::transactor::{Transactor, TxFields, TxResult};
 use crate::tx::dispatch::{apply_on_sandbox, is_pseudo};
 use serde_json::Value;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use xrpl_core::types::Hash256;
 
 // Result codes below track rippled 3.3.0
@@ -83,6 +83,11 @@ pub struct InnerView {
     pub after: HashMap<Hash256, SandboxEntry>,
     pub deleted_final: HashMap<Hash256, Vec<u8>>,
     pub delivered: Option<Value>,
+    /// Keys this inner erased and then wrote again: rippled's erase-then-insert leaves a FRESH SLE in the
+    /// inner's table (ApplyStateTable::insert over an erased item), one with no PreviousTxnID of its own. The
+    /// snapshots cannot show it when the object had no threading in the sandbox either (an earlier inner
+    /// created it).
+    pub recreated: HashSet<Hash256>,
 }
 
 /// The views of the last Batch `do_apply` on this thread, drained on read (cleared with the thread state).
@@ -592,7 +597,7 @@ impl Transactor for BatchTransactor {
                 })
                 .collect();
             touched.push(t);
-            views.inners.push(InnerView { before, after, deleted_final, delivered });
+            views.inners.push(InnerView { before, after, deleted_final, delivered, recreated: HashSet::new() });
             // An AllOrNothing revert clears `results`, so the inner that sank
             // the batch is otherwise invisible to every caller.
             if std::env::var("DX_BATCH").is_ok() {

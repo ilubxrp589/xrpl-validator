@@ -875,6 +875,57 @@ mod batch_meta_tests {
         let not_written = issuer_node(Hash256([0x00; 32]), false);
         assert!(not_written.get("FinalFields").is_none(), "not written back: threading only: {not_written}");
     }
+
+    /// Step 2 receipt #108499447 A8B4782985AB (Batch 2D72AC556DE8): inner [1], an NFTokenCreateOffer, created its
+    /// account's owner directory root; inner [2], an NFTokenAcceptOffer, removed that offer (the page emptied and
+    /// was erased) and added a trust line (the page inserted again). rippled's erase-then-insert leaves a fresh
+    /// SLE in the inner's table (ApplyStateTable::insert, Action::erase -> modify), `threadItem` finds no
+    /// PreviousTxnID on it, and the ModifiedNode carries none. Ours named inner [1].
+    fn page_node(recreated: bool) -> Value {
+        let state = LedgerState::new_unverified(LedgerHeader {
+            sequence: 199,
+            total_coins: 0,
+            parent_hash: Hash256([0; 32]),
+            transaction_hash: Hash256([0; 32]),
+            account_hash: Hash256([0; 32]),
+            parent_close_time: 0,
+            close_time: 0,
+            close_time_resolution: 10,
+            close_flags: 0,
+        });
+        let page_key = Hash256([0x69; 32]);
+        let page = |entry: u8| {
+            json!({"LedgerEntryType": "DirectoryNode", "Flags": 0, "Owner": hex::encode_upper(HOLDER),
+                   "RootIndex": hex::encode_upper(page_key.0), "Indexes": [format!("{entry:02X}").repeat(32)]})
+                .to_string()
+                .into_bytes()
+        };
+        let made = HashMap::from([(page_key, SandboxEntry::Created(page(0x01)))]);
+        let again = HashMap::from([(page_key, SandboxEntry::Created(page(0x02)))]);
+        let first = InnerView { after: made.clone(), ..InnerView::default() };
+        let second = InnerView {
+            before: made,
+            after: again,
+            recreated: if recreated { HashSet::from([page_key]) } else { HashSet::new() },
+            ..InnerView::default()
+        };
+        let views = BatchViews { outer: HashMap::new(), inners: vec![first, second] };
+        let ids = ["B1".repeat(32), "B2".repeat(32)];
+        let (_, inners) = batch_changes(&state, &"AA".repeat(32), 200, &views, &ids, &["tesSUCCESS".to_string(), "tesSUCCESS".to_string()]);
+        let nodes = xrpl_ledger::ledger::tx_meta::affected_nodes(&inners[1].changes);
+        assert_eq!(nodes.len(), 1, "{nodes:?}");
+        nodes[0]["ModifiedNode"].clone()
+    }
+
+    #[test]
+    fn a_page_a_batch_inner_erased_and_made_again_carries_no_node_threading() {
+        let fresh = page_node(true);
+        assert_eq!(fresh["FinalFields"]["Owner"], json!(hex::encode_upper(HOLDER)), "{fresh}");
+        assert!(fresh.get("PreviousTxnID").is_none() && fresh.get("PreviousTxnLgrSeq").is_none(), "a fresh page has no threading: {fresh}");
+        let in_place = page_node(false);
+        assert_eq!(in_place["PreviousTxnID"], json!("B1".repeat(32)), "modified in place: the earlier inner's stamp: {in_place}");
+        assert_eq!(in_place["PreviousTxnLgrSeq"], json!(200), "{in_place}");
+    }
 }
 
 #[cfg(test)]
