@@ -244,8 +244,15 @@ impl BookStep {
 
     // ---- the AMM hook (slice 3) ----------------------------------------
 
-    /// `getAMMOffer(view, clobQuality)`.
+    /// `getAMMOffer(view, clobQuality)` (BookStep.cpp:967-981). AMM does not support domain books: `tryAMM` never
+    /// takes a pool offer on one, and under fixCleanup3_3_0 this returns nothing for one either, so that the
+    /// step's tip, quality upper bound and quality function are the book's alone ("exclude AMM liquidity so quality
+    /// estimation matches actual crossing"). Without that gate a pool with a better spot price than a domain
+    /// book's tip gave the strand a sloped quality function, and `limitOut` cut the crossing into passes.
     fn amm_offer(&self, sb: &PaymentSandbox, clob_quality: Option<Quality>) -> Option<Offer> {
+        if self.book.domain.is_some() && crate::ledger::amendments::fix_cleanup_3_3_0(sb.sandbox()) {
+            return None;
+        }
         self.amm.as_ref().and_then(|l| l.get_offer(sb.sandbox(), clob_quality)).map(Offer::from_amm)
     }
 
