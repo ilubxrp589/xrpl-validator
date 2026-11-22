@@ -167,6 +167,7 @@ fn replay_on_post_state_skips_verify_instead_of_logging_false_divergences() {
         &amendments,
         parent_hash,
         PARENT_CLOSE_TIME,
+        10, // close-time resolution: not recorded with this fixture; the usual 10 s
         TOTAL_DROPS,
         None, // divergence_log
         None, // db_snapshot → LayeredProvider path (pure RPC)

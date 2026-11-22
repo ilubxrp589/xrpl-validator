@@ -97,6 +97,7 @@ fn run_ledger(blobs_tsv: &str, expected_json: &str) {
         &amendments,
         parent_hash,
         pct,
+        hdr["close_time_resolution"].as_u64().filter(|r| *r != 0).unwrap_or(10) as u8,
         drops,
         None,
         None, // no snapshot -> LayeredProvider (overlay -> RPC pinned seq-1)

@@ -31,6 +31,10 @@
 //! libxrpl's invariant checkers read objects the transaction itself does not; `vectors/diff341_extra_pre.json`
 //! supplies the ones the pinned loan vectors lack (see [`extra_pre`]).
 //!
+//! `D341 CLOSE-TIME` (default input only): the close time libxrpl sees through the shim, on an OracleSet at the edge
+//! of its LastUpdateTime window in a 20 s and in a 10 s ledger (see [`oracle_close_time_check`]). The shim's ledger
+//! header is not compensated for anywhere in this harness: a LoanSet's `StartDate` compares as libxrpl wrote it.
+//!
 //! `vs-devnet=same|differs` says whether libxrpl 3.4.1 on the rewritten rules reproduced what devnet recorded:
 //! `differs` marks the transactions where the two arms part.
 //!
@@ -207,11 +211,22 @@ fn libxrpl_leg_flags(
     tx_bytes: &[u8],
     flags: u32,
 ) -> Result<(String, String, MutMap, Vec<Key>), String> {
-    let (base, reserve, increment) = fees_of(pre)?;
+    libxrpl_leg_fees(ledger, pre, tx_bytes, flags, fees_of(pre)?)
+}
+
+/// As [`libxrpl_leg_flags`], the ledger's fees (base, reserve, increment) given by the caller.
+fn libxrpl_leg_fees(
+    ledger: &Ledger,
+    pre: &BTreeMap<Key, Vec<u8>>,
+    tx_bytes: &[u8],
+    flags: u32,
+    (base, reserve, increment): (u64, u64, u64),
+) -> Result<(String, String, MutMap, Vec<Key>), String> {
     let amendments = amendments_of(pre)?;
     let info = xrpl_ffi::LedgerInfo {
         seq: ledger.seq,
         parent_close_time: ledger.pct,
+        close_time_resolution: ledger.resolution as u32,
         total_drops: ledger.total_coins,
         parent_hash: ledger.parent_hash,
         base_fee_drops: base,
@@ -395,41 +410,6 @@ fn same_as_devnet(bundle: &Value, legs: &Legs, pre: &BTreeMap<Key, Vec<u8>>) -> 
     wrote && named
 }
 
-/// The shim hands libxrpl a ledger header whose `closeTime` is the PARENT's close time (xrpl_shim.cpp: closed-ledger
-/// view, `header.closeTime = parent_close_time`). On the network the ledger being built carries the parent's close
-/// time plus the resolution, and `LoanSet` dates the loan from exactly that (`view.header().closeTime`,
-/// LoanSet.cpp:228; nothing else in the vault or lending transactors reads it). So libxrpl through the shim
-/// writes `StartDate` and `NextPaymentDueDate` one resolution early. When that is the whole difference on the
-/// created Loan, libxrpl's two fields are moved forward so that the rest of the object still compares byte for
-/// byte. Returns whether it did.
-fn adjust_loan_start(legs: &mut Legs, resolution: u64) -> bool {
-    let mut adjusted = false;
-    for (k, (kind, lib_bytes)) in legs.lib.iter_mut() {
-        let Some((_, our_bytes)) = legs.ours.get(k) else { continue };
-        if *kind != 0 || entry_type(lib_bytes) != "Loan" {
-            continue;
-        }
-        let (mut lib, ours) = (decode(lib_bytes), decode(our_bytes));
-        let early = |f: &str| match (lib[f].as_u64(), ours[f].as_u64()) {
-            (Some(l), Some(o)) => l + resolution == o,
-            (None, None) => true,
-            _ => false,
-        };
-        if lib["StartDate"].as_u64().is_some() && early("StartDate") && early("NextPaymentDueDate") {
-            for f in ["StartDate", "NextPaymentDueDate"] {
-                if let Some(v) = lib[f].as_u64() {
-                    lib[f] = Value::from(v + resolution);
-                }
-            }
-            if let Ok(b) = encode(&lib) {
-                *lib_bytes = b;
-                adjusted = true;
-            }
-        }
-    }
-    adjusted
-}
-
 struct Row {
     class: &'static str,
     tx_type: String,
@@ -473,14 +453,10 @@ fn run_bundle(name: &str, bundle: &Value) -> Result<Row, String> {
     }
     rewrite_amendments(&mut pre)?;
     let tx_bytes = tx_bytes_of(bundle)?;
-    let mut legs = both_legs(bundle, &pre, &tx_bytes, 0)?;
-    let shim_close_time = tx_type == "LoanSet" && adjust_loan_start(&mut legs, ledger_of(bundle).resolution as u64);
+    let legs = both_legs(bundle, &pre, &tx_bytes, 0)?;
     let mut class = classify(&legs, &pre);
     let vs_devnet = same_as_devnet(bundle, &legs, &pre);
     let mut detail = if class == "AGREE" { Vec::new() } else { describe(&legs) };
-    if shim_close_time {
-        detail.push("shim: libxrpl's Loan dated from the parent close time; StartDate and NextPaymentDueDate moved by the resolution before comparing".into());
-    }
     if bundle["tx"].get("Sponsor").is_some() && !matches!(class, "AGREE" | "NOOP") {
         class = "SPONSOR";
     }
@@ -555,10 +531,7 @@ fn run_mutant(m: &Value) -> Result<(Row, String), String> {
         }
     };
     let tx_type = bundle["tx"]["TransactionType"].as_str().unwrap_or("?").to_string();
-    let mut legs = both_legs(&bundle, &pre, &tx_bytes, flags)?;
-    if tx_type == "LoanSet" {
-        adjust_loan_start(&mut legs, ledger_of(&bundle).resolution as u64);
-    }
+    let legs = both_legs(&bundle, &pre, &tx_bytes, flags)?;
     let class = classify(&legs, &pre);
     let detail = if class == "AGREE" { Vec::new() } else { describe(&legs) };
     let log = legs.lib_fatal.chars().take(400).collect();
@@ -660,6 +633,47 @@ fn controls(bundle: &Value) -> Result<Vec<String>, String> {
     Ok(lines)
 }
 
+/// The close time libxrpl sees through the shim, shown on the one transaction type live on mainnet that reads it.
+/// rippled applies a ledger's transactions with `header().closeTime` = the parent's close time + the NEW ledger's
+/// close-time resolution (Ledger.cpp:262-278) and OracleSet accepts a LastUpdateTime within 300 s of that
+/// (OracleSet.cpp:74-83). A real testnet OracleSet (campaign 19, 92B605BAFB05, tesSUCCESS) is placed in a ledger
+/// whose parent closed 315 s before its LastUpdateTime: 295 s past the close time of a 20 s ledger (inside the
+/// window), 305 s past a 10 s one's (outside). Both legs must give rippled's answer in both ledgers, and write the
+/// same Oracle. Returns the report lines and whether all of it held.
+fn oracle_close_time_check() -> Result<(Vec<String>, bool), String> {
+    // The vector carries no FeeSettings object (its transaction reads none): testnet's fees at that ledger.
+    const TESTNET_FEES: (u64, u64, u64) = (10, 1_000_000, 200_000);
+    let bundle: Value = serde_json::from_str(include_str!(
+        "vectors/c19_5_4_dj_oracleset_create_pre_fee_balance_reserve_oc_1_testnet_20976466.json"
+    ))
+    .unwrap();
+    let mut pre = pre_of(&bundle);
+    rewrite_amendments(&mut pre)?;
+    let tx_bytes = tx_bytes_of(&bundle)?;
+    let last_update = bundle["tx"]["LastUpdateTime"].as_u64().ok_or("no LastUpdateTime")? - 946_684_800;
+    let pct = (last_update - 315) as u32;
+    let (mut lines, mut ok) = (Vec::new(), true);
+    for (resolution, want) in [(20u8, "tesSUCCESS"), (10u8, "tecINVALID_UPDATE_TIME")] {
+        let ledger = Ledger { pct, resolution, ..ledger_of(&bundle) };
+        let (lib_ter, lib_fatal, lib, lib_misses) = libxrpl_leg_fees(&ledger, &pre, &tx_bytes, 0, TESTNET_FEES)?;
+        let (our_ter, ours, our_misses) = our_leg(&ledger, &pre, &bundle["tx"])?;
+        let legs = Legs { lib_ter, lib_fatal, lib, lib_misses, our_ter, ours, our_misses };
+        let class = classify(&legs, &pre);
+        let held = legs.lib_ter == want && legs.our_ter == want && matches!(class, "AGREE" | "NOOP");
+        ok &= held;
+        lines.push(format!(
+            "OracleSet LastUpdateTime = parent close + 315 s, resolution {resolution} s: rippled {want}, libxrpl {}, ours {} ({class}){}",
+            legs.lib_ter,
+            legs.our_ter,
+            if held { "" } else { " <-- WRONG" }
+        ));
+        if !held {
+            lines.extend(describe(&legs));
+        }
+    }
+    Ok((lines, ok))
+}
+
 #[test]
 fn libxrpl_341_against_our_engine_on_the_mainnet_arm() {
     let version = xrpl_ffi::libxrpl_version();
@@ -752,6 +766,21 @@ fn libxrpl_341_against_our_engine_on_the_mainnet_arm() {
                     *tally.entry(("mutant".to_string(), "HARNESS")).or_default() += 1;
                     failing.push(name);
                 }
+            }
+        }
+    }
+    // The close time the shim gives libxrpl: only with the default input, as the mutants.
+    if std::env::var("DIFF341_BUNDLES").is_err() {
+        match oracle_close_time_check() {
+            Ok((lines, ok)) => {
+                lines.iter().for_each(|l| println!("D341 CLOSE-TIME {l}"));
+                if !ok {
+                    failing.push("close-time [OracleSet window]".into());
+                }
+            }
+            Err(e) => {
+                println!("D341 CLOSE-TIME HARNESS could not run: {e}");
+                failing.push("close-time [OracleSet window]".into());
             }
         }
     }

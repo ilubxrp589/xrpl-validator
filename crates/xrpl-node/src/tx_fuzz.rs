@@ -60,6 +60,8 @@ impl FuzzTally {
 pub struct FuzzCtx {
     pub seq: u32,
     pub pct: u32,
+    /// The fuzzed ledger's own close-time resolution (the fixture header's; 10 when it records none).
+    pub resolution: u32,
     pub parent_hash: [u8; 32],
     pub total_drops: u64,
     pub net: NetParams,
@@ -85,6 +87,7 @@ impl FuzzCtx {
         Self {
             seq,
             pct: hdr["parent_close_time"].as_u64().unwrap_or(0) as u32,
+            resolution: hdr["close_time_resolution"].as_u64().filter(|r| *r != 0).unwrap_or(10) as u32,
             parent_hash,
             total_drops: hdr["total_drops"].as_u64().unwrap_or(100_000_000_000_000_000),
             net,
@@ -130,6 +133,7 @@ impl FuzzCtx {
             let ledger = xrpl_ffi::LedgerInfo {
                 seq: self.seq,
                 parent_close_time: self.pct,
+                close_time_resolution: self.resolution,
                 total_drops: self.total_drops,
                 parent_hash: self.parent_hash,
                 base_fee_drops: self.net.base_fee_drops,

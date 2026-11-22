@@ -149,7 +149,7 @@ async fn main() {
                 let hdr_resp = client.post(&rpc_url)
                     .json(&serde_json::json!({"method":"ledger","params":[{"ledger_index":seq}]}))
                     .send().await;
-                let (parent_hash, parent_close_time, total_drops) = if let Ok(r) = hdr_resp {
+                let (parent_hash, parent_close_time, close_resolution, total_drops) = if let Ok(r) = hdr_resp {
                     if let Ok(body) = r.json::<serde_json::Value>().await {
                         let lg = &body["result"]["ledger"];
                         let ph = lg["parent_hash"].as_str()
@@ -158,9 +158,10 @@ async fn main() {
                             .unwrap_or([0u8; 32]);
                         let pct = lg["parent_close_time"].as_u64().unwrap_or(0) as u32;
                         let td = lg["total_coins"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0u64);
-                        (ph, pct, td)
-                    } else { ([0u8;32], 0, 0) }
-                } else { ([0u8;32], 0, 0) };
+                        let res = lg["close_time_resolution"].as_u64().unwrap_or(0) as u8;
+                        (ph, pct, res, td)
+                    } else { ([0u8;32], 0, 0, 0) }
+                } else { ([0u8;32], 0, 0, 0) };
                 info!(ledger_seq = seq, txs = sorted_blobs.len(), total_drops, "applying ledger in transaction-index order");
 
                 let apply_stats = live_stats.clone();
@@ -176,6 +177,7 @@ async fn main() {
                         &amendments_owned,
                         parent_hash,
                         parent_close_time,
+                        close_resolution,
                         total_drops,
                         Some(dlog.as_ref()),
                         None, // no snapshot — sidecar uses pure RPC path

@@ -136,6 +136,7 @@ fn ticket_create_advances_sequence_by_count_plus_one() {
     let ledger = LedgerInfo {
         seq: 103_515_367,
         parent_close_time: 797_804_900, // approximate; not hash-sensitive for apply
+        close_time_resolution: 10,
         total_drops: 99_985_687_626_634_189,
         parent_hash: [0u8; 32],
         base_fee_drops: 10,
@@ -238,6 +239,7 @@ fn ticket_create_followed_by_next_sequence_tx_succeeds() {
     let ledger = LedgerInfo {
         seq: 103_515_367,
         parent_close_time: 797_804_900,
+        close_time_resolution: 10,
         total_drops: 99_985_687_626_634_189,
         parent_hash: [0u8; 32],
         base_fee_drops: 10,

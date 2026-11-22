@@ -288,6 +288,10 @@ pub struct SleMutation {
 pub struct LedgerInfo {
     pub seq: u32,
     pub parent_close_time: u32,
+    /// The close-time resolution, in seconds, of the ledger being applied (`seq`'s own header field, not its
+    /// parent's). rippled applies a ledger's transactions with `header().closeTime` = the parent's close time +
+    /// this (Ledger.cpp:262-278); OracleSet and LoanSet read that value.
+    pub close_time_resolution: u32,
     pub total_drops: u64,
     pub parent_hash: [u8; 32],
     pub base_fee_drops: u64,

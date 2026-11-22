@@ -633,7 +633,7 @@ pub async fn start_ws_sync(
                                     tokio::task::spawn_blocking(move || {
                                         let overlay = v.verify_ledger_with_snapshot(
                                             seq, &tx_blobs,
-                                            hdr.parent_hash, hdr.parent_close_time, hdr.total_drops,
+                                            hdr.parent_hash, hdr.parent_close_time, hdr.close_resolution, hdr.total_drops,
                                             Some(snap.as_ref()),
                                             expected.as_ref(),
                                             expected_mut.as_ref(),
@@ -675,7 +675,7 @@ pub async fn start_ws_sync(
                                     tokio::task::spawn_blocking(move || {
                                         let overlay = v.verify_ledger(
                                             seq, &tx_blobs,
-                                            hdr.parent_hash, hdr.parent_close_time, hdr.total_drops,
+                                            hdr.parent_hash, hdr.parent_close_time, hdr.close_resolution, hdr.total_drops,
                                             expected.as_ref(),
                                             expected_mut.as_ref(),
                                             parents.as_ref(),

@@ -89,6 +89,7 @@ fn apply_mainnet_payment_returns_mutations() {
     let ledger = LedgerInfo {
         seq: 103354511,
         parent_close_time: 797193960,
+        close_time_resolution: 10,
         total_drops: 99985687626634189,
         parent_hash: [0u8; 32],
         base_fee_drops: 10,

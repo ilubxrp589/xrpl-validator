@@ -6,7 +6,7 @@ For ledger N, writes into crates/xrpl-node/tests/data/:
   l<N>_blobs.txt      one `<TransactionIndex>\t<tx_blob_hex>` per real tx
                       (pseudo-txs skipped), same format ticket_cluster_reapply uses
   l<N>_expected.json  {"header": {ledger_seq, parent_hash, parent_close_time,
-                                  total_drops},
+                                  total_drops, close_time_resolution},
                        "txs": {"<HASH>": {"ter": "...",
                                           "nodes": [["<LedgerIndex>", kind], ...]}}}
                       kind: 0=Created 1=Modified 2=Deleted (ws_sync encoding)
@@ -90,6 +90,8 @@ def fetch_one(url, seq, outdir):
         "parent_hash": lg["parent_hash"].upper(),
         "parent_close_time": int(parent["ledger"]["close_time"]),
         "total_drops": int(lg["total_coins"]),
+        # ledger N's own resolution: libxrpl applies N with closeTime = parent close + this
+        "close_time_resolution": int(lg.get("close_time_resolution", 10)),
     }
     header.update(net_params(url))
 

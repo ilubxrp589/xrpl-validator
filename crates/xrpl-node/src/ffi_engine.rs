@@ -1939,6 +1939,7 @@ pub fn health_check(stats: &SharedFfiStats) -> bool {
     let ledger = LedgerInfo {
         seq: 103354511,
         parent_close_time: 797193960,
+        close_time_resolution: 10,
         total_drops: 99985687626634189,
         parent_hash: [0u8; 32],
         base_fee_drops: 10,
@@ -2176,6 +2177,7 @@ pub fn apply_ledger_in_order(
     amendments: &[[u8; 32]],
     parent_hash: [u8; 32],
     parent_close_time: u32,
+    close_resolution: u8,
     total_drops: u64,
     divergence_log: Option<&DivergenceLog>,
     db_snapshot: Option<&OwnedSnapshot>,
@@ -2186,7 +2188,7 @@ pub fn apply_ledger_in_order(
 ) -> LedgerOverlay {
     apply_ledger_in_order_with_net(
         stats, txs_in_order, ledger_seq, rpc_urls, amendments, parent_hash,
-        parent_close_time, total_drops, divergence_log, db_snapshot,
+        parent_close_time, close_resolution, total_drops, divergence_log, db_snapshot,
         silent_divergence_log, expected_outcomes, mutation_divergence_log,
         expected_mutations, None, None, &NetParams::default(),
     )
@@ -2201,6 +2203,9 @@ pub fn apply_ledger_in_order_with_net(
     amendments: &[[u8; 32]],
     parent_hash: [u8; 32],
     parent_close_time: u32,
+    // Ledger `ledger_seq`'s OWN close-time resolution (its header's): libxrpl applies the ledger's transactions
+    // with header().closeTime = parent close + this (Ledger.cpp:262-278; read by OracleSet and LoanSet).
+    close_resolution: u8,
     total_drops: u64,
     divergence_log: Option<&DivergenceLog>,
     db_snapshot: Option<&OwnedSnapshot>,
@@ -2263,9 +2268,17 @@ pub fn apply_ledger_in_order_with_net(
 
     let overlay: parking_lot::Mutex<std::collections::HashMap<[u8; 32], Option<Vec<u8>>>> =
         parking_lot::Mutex::new(std::collections::HashMap::new());
+    // A header that carried no resolution (0 is none) gets the usual 10, as the native leg does (`apply_ledger`).
+    let close_time_resolution = if close_resolution == 0 {
+        eprintln!("[ffi] #{ledger_seq}: the header carries no close-time resolution — using 10");
+        10
+    } else {
+        u32::from(close_resolution)
+    };
     let ledger = LedgerInfo {
         seq: ledger_seq,
         parent_close_time,
+        close_time_resolution,
         total_drops,
         parent_hash,
         base_fee_drops: net.base_fee_drops,
@@ -2997,6 +3010,7 @@ pub fn apply_live_tx(
     let ledger = LedgerInfo {
         seq: ledger_seq,
         parent_close_time: 0,
+        close_time_resolution: 10,
         total_drops: 99_985_687_626_634_189,
         parent_hash: [0u8; 32],
         base_fee_drops: 10,

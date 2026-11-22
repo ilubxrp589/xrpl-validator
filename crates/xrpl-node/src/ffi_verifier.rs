@@ -28,7 +28,7 @@
 //! ## API (same shape as old TxEngine)
 //!
 //! - `FfiVerifier::new(rpc_urls)` — constructor
-//! - `verify_ledger(seq, tx_blobs, parent_hash, parent_close_time, total_drops)`
+//! - `verify_ledger(seq, tx_blobs, parent_hash, parent_close_time, close_resolution, total_drops)`
 //! - `stats()` → `FfiStats`
 
 use std::any::Any;
@@ -164,6 +164,7 @@ impl FfiVerifier {
         sorted_tx_blobs: &[Vec<u8>],
         parent_hash: [u8; 32],
         parent_close_time: u32,
+        close_resolution: u8,
         total_drops: u64,
         expected_outcomes: Option<&std::collections::HashMap<String, String>>,
         expected_mutations: Option<&std::collections::HashMap<String, Vec<(String, u8)>>>,
@@ -179,6 +180,7 @@ impl FfiVerifier {
             &amendments,
             parent_hash,
             parent_close_time,
+            close_resolution,
             total_drops,
             Some(self.divergence_log.as_ref()),
             None,
@@ -203,6 +205,7 @@ impl FfiVerifier {
         sorted_tx_blobs: &[Vec<u8>],
         parent_hash: [u8; 32],
         parent_close_time: u32,
+        close_resolution: u8,
         total_drops: u64,
         snapshot: Option<&OwnedSnapshot>,
         expected_outcomes: Option<&std::collections::HashMap<String, String>>,
@@ -219,6 +222,7 @@ impl FfiVerifier {
             &amendments,
             parent_hash,
             parent_close_time,
+            close_resolution,
             total_drops,
             Some(self.divergence_log.as_ref()),
             snapshot,

@@ -182,6 +182,8 @@ fn run() -> i32 {
         &amendments,
         parent_hash,
         pct as u32,
+        // the fixture's own resolution; an older fixture without one was a 10 s ledger as far as it records
+        hdr["close_time_resolution"].as_u64().filter(|r| *r != 0).unwrap_or(10) as u8,
         drops,
         None,
         None,
