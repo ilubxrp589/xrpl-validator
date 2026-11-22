@@ -43,6 +43,10 @@ pub const ENGINE_KNOWN: &[&str] = &[
     "fixTakerDryOfferRemoval", "fixTokenEscrowV1", "fixTrustLinesToSelf", "fixUniversalNumber",
     // Not yet enabled on mainnet; ported.
     "fixCleanup3_4_0",
+    // Not yet enabled on mainnet; ported on branch port/vault (the six Vault transactors, the LoanBroker and
+    // Loan families, the Number scale and the existing-transaction gates; xrpl-ledger tx/vault.rs,
+    // tx/loan_broker.rs, tx/loan.rs). Known to the guard is not a yes vote: `validation` decides that.
+    "SingleAssetVault", "LendingProtocol", "LendingProtocolV1_1",
 ];
 
 /// Enabled on mainnet but not yet ported: shown, not alarmed. Empty since fixBatchV1_2 was ported (cycle 168).
@@ -50,8 +54,7 @@ pub const KNOWN_GAP: &[&str] = &[];
 
 /// Amendments xrpld 3.4.1 knows that the engine has not built, named only so a page can say which one it is.
 const OTHER_NAMES: &[&str] = &[
-    "ConfidentialTransfer", "CryptoConditionsSuite", "DynamicMPT", "LendingProtocol", "LendingProtocolV1_1",
-    "SingleAssetVault", "Sponsor", "XChainBridge", "fixXChainRewardRounding",
+    "ConfidentialTransfer", "CryptoConditionsSuite", "DynamicMPT", "Sponsor", "XChainBridge", "fixXChainRewardRounding",
 ];
 
 /// An amendment's 256-bit ID: SHA-512Half of its name (rippled `Feature.cpp`).
@@ -223,6 +226,27 @@ mod tests {
         assert_eq!(r.enabled, 97);
         assert_eq!(r.status(), "ok", "{r:?}");
         assert!(r.majority_unknown.is_empty(), "fixCleanup3_4_0 has majority and is ported: {r:?}");
+    }
+
+    /// The vault and lending amendments are ported: switched on (or holding a majority) they are no alarm and
+    /// no warning, and the guard's names are the IDs the engine gates on.
+    #[test]
+    fn the_vault_and_lending_amendments_are_known() {
+        use xrpl_ledger::ledger::amendments::{LENDING_PROTOCOL, LENDING_PROTOCOL_V1_1, SINGLE_ASSET_VAULT};
+        let ported = [("SingleAssetVault", SINGLE_ASSET_VAULT), ("LendingProtocol", LENDING_PROTOCOL), ("LendingProtocolV1_1", LENDING_PROTOCOL_V1_1)];
+        let mut sle = live();
+        for (i, (name, id)) in ported.iter().enumerate() {
+            assert_eq!(amendment_id(name), *id, "{name}");
+            assert!(ENGINE_KNOWN.contains(name), "{name}");
+            if i == 0 {
+                sle["Majorities"].as_array_mut().unwrap().push(json!({"Majority": {"Amendment": id, "CloseTime": 1}}));
+            } else {
+                sle["Amendments"].as_array_mut().unwrap().push(json!(id));
+            }
+        }
+        let r = assess(1, &sle);
+        assert_eq!((r.enabled, r.status()), (99, "ok"), "{r:?}");
+        assert!(r.unknown_enabled.is_empty() && r.majority_unknown.is_empty(), "{r:?}");
     }
 
     #[test]
