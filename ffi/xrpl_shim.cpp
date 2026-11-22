@@ -34,7 +34,7 @@
 #include <unordered_set>
 
 namespace {
-constexpr const char *SHIM_VERSION = "0.3.0";  // 3.2.0 Application/ServiceRegistry port (conan ed25519/secp256k1, xrpl namespace, MinimalApp 62 virtuals)
+constexpr const char *SHIM_VERSION = "0.4.0";  // apply takes the ledger's close-time resolution (0.3.0: the 3.2.0 Application/ServiceRegistry port)
 }
 
 struct XrplEngine {
@@ -199,6 +199,13 @@ extern "C" {
 const char *xrpl_shim_version(void) {
     return SHIM_VERSION;
 }
+
+// The apply ABI, by name: 2 = xrpl_apply / xrpl_apply_with_mutations take
+// close_time_resolution after parent_close_time. C symbols carry no signature,
+// so a Rust side built for one argument list would link against a shim built
+// for another and pass shifted arguments; xrpl-ffi references this symbol, and
+// an older libxrpl_shim.a then fails at link time instead.
+uint32_t xrpl_shim_apply_abi_2(void) { return 2; }
 
 const char *xrpl_rippled_version(void) {
     // 3.4.0: the namespace was renamed from BuildInfo to build_info.
@@ -378,6 +385,7 @@ int32_t xrpl_apply(
     const uint8_t *amendments_bytes, size_t amendments_len,
     uint32_t ledger_seq,
     uint32_t parent_close_time,
+    uint32_t close_time_resolution,
     uint64_t total_drops,
     const uint8_t parent_hash[32],
     uint64_t base_fee_drops,
@@ -418,20 +426,27 @@ int32_t xrpl_apply(
         // into tefPAST_SEQ. Setting header.seq = ledger_seq makes view.seq()
         // match the network's apply view.
         header.seq = ledger_seq;
-        // header represents ledger N-1 (the parent of the ledger being applied
-        // to). When OpenView wraps it via the open_ledger overload, it copies
-        // header.closeTime into info_.parentCloseTime (see OpenView.cpp:105).
-        // Time-based checks during apply (offer Expiration, escrow FinishAfter,
-        // check Expiration, loan due-date) all read view.parentCloseTime(), so
-        // header.closeTime MUST be the parent ledger's close_time. We don't
-        // separately need to set header.parentCloseTime — OpenView discards
-        // base.parentCloseTime — but we set both for diagnostic readers that
-        // might inspect the LedgerHeader directly.
-        header.closeTime = xrpl::NetClock::time_point(xrpl::NetClock::duration(parent_close_time));
+        // The header is the one rippled gives the ledger it is BUILDING
+        // (Ledger.cpp:262-278, the ctor BuildLedger applies on), and the
+        // closed-ledger OpenView ctor below copies it unchanged
+        // (OpenView.cpp:107-116):
+        //   parentCloseTime     = the parent's close time. Every expiry test
+        //                         reads it through view.parentCloseTime()
+        //                         (offers, escrows, checks, channels, loan
+        //                         due dates).
+        //   closeTimeResolution = this ledger's own resolution, from the caller.
+        //   closeTime           = the parent's close time + that resolution.
+        //                         view.header().closeTime is read by OracleSet
+        //                         (LastUpdateTime window, OracleSet.cpp:74-83)
+        //                         and LoanSet (the loan's start date,
+        //                         LoanSet.cpp:225-229), nothing else.
+        // rippled's genesis special case (a parent that never closed takes the
+        // rounded wall clock) does not arise on a ledger with transactions.
         header.parentCloseTime = xrpl::NetClock::time_point(xrpl::NetClock::duration(parent_close_time));
+        header.closeTimeResolution = xrpl::NetClock::duration(close_time_resolution);
+        header.closeTime = header.parentCloseTime + header.closeTimeResolution;
         std::memcpy(header.parentHash.data(), parent_hash, 32);
         header.drops = xrpl::XRPAmount(static_cast<std::int64_t>(total_drops));
-        header.closeTimeResolution = xrpl::NetClock::duration(10);
 
         xrpl::Fees fees;
         fees.base = xrpl::XRPAmount(static_cast<std::int64_t>(base_fee_drops));
@@ -495,6 +510,7 @@ XrplApplyResult *xrpl_apply_with_mutations(
     const uint8_t *amendments_bytes, size_t amendments_len,
     uint32_t ledger_seq,
     uint32_t parent_close_time,
+    uint32_t close_time_resolution,
     uint64_t total_drops,
     const uint8_t parent_hash[32],
     uint64_t base_fee_drops,
@@ -535,20 +551,27 @@ XrplApplyResult *xrpl_apply_with_mutations(
         // into tefPAST_SEQ. Setting header.seq = ledger_seq makes view.seq()
         // match the network's apply view.
         header.seq = ledger_seq;
-        // header represents ledger N-1 (the parent of the ledger being applied
-        // to). When OpenView wraps it via the open_ledger overload, it copies
-        // header.closeTime into info_.parentCloseTime (see OpenView.cpp:105).
-        // Time-based checks during apply (offer Expiration, escrow FinishAfter,
-        // check Expiration, loan due-date) all read view.parentCloseTime(), so
-        // header.closeTime MUST be the parent ledger's close_time. We don't
-        // separately need to set header.parentCloseTime — OpenView discards
-        // base.parentCloseTime — but we set both for diagnostic readers that
-        // might inspect the LedgerHeader directly.
-        header.closeTime = xrpl::NetClock::time_point(xrpl::NetClock::duration(parent_close_time));
+        // The header is the one rippled gives the ledger it is BUILDING
+        // (Ledger.cpp:262-278, the ctor BuildLedger applies on), and the
+        // closed-ledger OpenView ctor below copies it unchanged
+        // (OpenView.cpp:107-116):
+        //   parentCloseTime     = the parent's close time. Every expiry test
+        //                         reads it through view.parentCloseTime()
+        //                         (offers, escrows, checks, channels, loan
+        //                         due dates).
+        //   closeTimeResolution = this ledger's own resolution, from the caller.
+        //   closeTime           = the parent's close time + that resolution.
+        //                         view.header().closeTime is read by OracleSet
+        //                         (LastUpdateTime window, OracleSet.cpp:74-83)
+        //                         and LoanSet (the loan's start date,
+        //                         LoanSet.cpp:225-229), nothing else.
+        // rippled's genesis special case (a parent that never closed takes the
+        // rounded wall clock) does not arise on a ledger with transactions.
         header.parentCloseTime = xrpl::NetClock::time_point(xrpl::NetClock::duration(parent_close_time));
+        header.closeTimeResolution = xrpl::NetClock::duration(close_time_resolution);
+        header.closeTime = header.parentCloseTime + header.closeTimeResolution;
         std::memcpy(header.parentHash.data(), parent_hash, 32);
         header.drops = xrpl::XRPAmount(static_cast<std::int64_t>(total_drops));
-        header.closeTimeResolution = xrpl::NetClock::duration(10);
 
         xrpl::Fees fees;
         fees.base = xrpl::XRPAmount(static_cast<std::int64_t>(base_fee_drops));

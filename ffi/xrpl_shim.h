@@ -84,6 +84,11 @@ void xrpl_engine_destroy(XrplEngine *engine);
 const char *xrpl_shim_version(void);      /* e.g. "0.1.0" */
 const char *xrpl_rippled_version(void);   /* e.g. "3.0.0" */
 
+/* The apply ABI, by name (returns 2): xrpl_apply / xrpl_apply_with_mutations take
+ * close_time_resolution after parent_close_time. Referenced by the Rust side so
+ * that a shim library built for the older argument list fails to link. */
+uint32_t xrpl_shim_apply_abi_2(void);
+
 /* ============================================================
  * Ledger construction
  *
@@ -234,7 +239,8 @@ int32_t xrpl_apply(
     const uint8_t *amendments_bytes, size_t amendments_len,
     /* Ledger header */
     uint32_t ledger_seq,
-    uint32_t parent_close_time,
+    uint32_t parent_close_time,        /* the PARENT ledger's close time */
+    uint32_t close_time_resolution,    /* this ledger's own resolution, seconds: closeTime = parent + this */
     uint64_t total_drops,
     const uint8_t parent_hash[32],
     /* Fees for this ledger */
@@ -265,6 +271,7 @@ XrplApplyResult *xrpl_apply_with_mutations(
     const uint8_t *amendments_bytes, size_t amendments_len,
     uint32_t ledger_seq,
     uint32_t parent_close_time,
+    uint32_t close_time_resolution,
     uint64_t total_drops,
     const uint8_t parent_hash[32],
     uint64_t base_fee_drops,

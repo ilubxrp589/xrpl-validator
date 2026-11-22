@@ -132,6 +132,7 @@ int test_main(int argc, char **argv) {
         NULL, 0,                       /* empty rules */
         103354511,                     /* ledger seq */
         797193960,                     /* parent_close_time (approx, NetClock) */
+        10,                            /* close_time_resolution */
         99985687626634189ULL,          /* total_drops */
         parent_hash,
         10,                            /* base_fee */

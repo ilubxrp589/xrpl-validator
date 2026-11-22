@@ -49,6 +49,10 @@ pub type SuccFn = unsafe extern "C" fn(
 #[link(name = "xrpl_shim", kind = "static")]
 extern "C" {
     pub fn xrpl_shim_version() -> *const c_char;
+    /// The apply ABI, by name: `xrpl_apply_with_mutations` takes `close_time_resolution` after
+    /// `parent_close_time`. A `libxrpl_shim.a` built before that does not define this symbol, so linking against
+    /// it fails instead of passing shifted arguments (C symbols carry no signature).
+    pub fn xrpl_shim_apply_abi_2() -> u32;
     pub fn xrpl_rippled_version() -> *const c_char;
 
     pub fn xrpl_engine_create() -> *mut XrplEngine;
@@ -82,6 +86,7 @@ extern "C" {
         amendments_len: usize,
         ledger_seq: u32,
         parent_close_time: u32,
+        close_time_resolution: u32,
         total_drops: u64,
         parent_hash: *const u8, // [u8; 32]
         base_fee_drops: u64,
@@ -398,6 +403,8 @@ pub fn apply_with_mutations<P: SleProvider>(
     };
 
     let result_ptr = unsafe {
+        // Keeps the ABI marker referenced in every build profile: an older shim library must not link.
+        let _apply_abi = xrpl_shim_apply_abi_2();
         xrpl_apply_with_mutations(
             tx_bytes.as_ptr(),
             tx_bytes.len(),
@@ -405,6 +412,7 @@ pub fn apply_with_mutations<P: SleProvider>(
             amendments_flat.len(),
             ledger.seq,
             ledger.parent_close_time,
+            ledger.close_time_resolution,
             ledger.total_drops,
             ledger.parent_hash.as_ptr(),
             ledger.base_fee_drops,
