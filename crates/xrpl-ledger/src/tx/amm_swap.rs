@@ -1875,17 +1875,13 @@ pub(crate) fn pool_balances(sandbox: &Sandbox, amm: &Amm, pays_leg: &Leg, gets_l
 }
 
 /// The out of the n-th Fibonacci slice: `toAmount<TOut>(asset, cur.out * kFib[n - 1], Downward)`
-/// (AMMLiquidity.cpp:83-86), ambient ToNearest (the path engine sets no rounding guard).
+/// (AMMLiquidity.cpp:83-86). `cur.out * kFib[…]` is evaluated before `toAmount` is entered, a Number product
+/// (`IOUAmount` has no `operator*`; both operands convert) under the AMBIENT mode, and the path engine installs no
+/// rounding guard: ToNearest, at either scale. `toAmount`'s Downward then applies to an XRP conversion only
+/// (AmountConversions.h:155-157). Until the Large330 campaign the Small arm rounded the product down, which no
+/// recorded transaction could tell from nearest (see `a_fibonacci_slice_multiplies_at_nearest`).
 fn fib_slice_out(out0: Me, fib: u32, out_xrp: bool) -> Me {
-    to_amount_ambient(
-        // `cur.out * kFib[…]` is a Number product outside any guard:
-        // ToNearest in rippled. The Small arm keeps the Downward this
-        // engine has always used there (see the slice 0B report).
-        n_mul(out0, ((fib as u128) * LO, -15), if large_scale() { Rnd::Near } else { Rnd::Down }),
-        out_xrp,
-        Rnd::Down,
-        Rnd::Near,
-    )
+    to_amount_ambient(n_mul(out0, ((fib as u128) * LO, -15), Rnd::Near), out_xrp, Rnd::Down, Rnd::Near)
 }
 
 /// The current fib-sequence slice (in, out) for a pool, without applying it.
