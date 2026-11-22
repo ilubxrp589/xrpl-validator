@@ -1103,6 +1103,55 @@ fn nft_royalty_drops(drops: u64, fee_units: u128) -> u128 {
     }
 }
 
+/// The NFT transfer-fee cut of an IOU price.
+// Same rippled call as the XRP flavor — multiply(amount, rate), the
+// Number pipeline: ONE half-even reduction of the FULL product to 16
+// significant digits; the /100000 is exponent arithmetic, exact.
+// me_muldiv(…, false) truncated instead — invisible on the exact
+// #106047462 HADA specimen (950000×2500/100000 has no remainder).
+fn nft_royalty_iou(seller_side: crate::tx::offer::Me, fee_units: u128) -> crate::tx::offer::Me {
+    let (m, e) = seller_side;
+    let p = m * fee_units; // ≤ 1e16 × 5e4, exact
+    let mut t = p;
+    let mut k = 0i32;
+    while t >= 10_000_000_000_000_000 {
+        t /= 10;
+        k += 1;
+    }
+    let mut m2 = if k > 0 { div_half_even(p, 10u128.pow(k as u32)) } else { p };
+    if m2 >= 10_000_000_000_000_000 {
+        m2 /= 10; // rounding carried to exactly 1e16 — exact shift
+        k += 1;
+    }
+    crate::tx::offer::norm16((m2, e + k - 5))
+}
+
+#[cfg(test)]
+mod royalty_scale_tests {
+    use super::*;
+    use crate::tx::number::{MantissaScale, ScaleGuard};
+
+    /// `multiply(amount, nft::transferFeeAsRate(fee))` is `Number{v1} * Number{v2}` then `STAmount{asset, r}`
+    /// (STAmount.cpp:1304-1305). At the Small scale the product is rounded once, to sixteen digits. At Large330 it
+    /// is rounded to NINETEEN and the amount conversion rounds that to sixteen (an IOU) or to whole drops (XRP).
+    /// 4.102798089215371 at a fee of 12.345 %: the product 0.506490424113637549995 is …375 rounded once and
+    /// …376 through nineteen digits (…37550 is a tie, to even). 2,000,000,000.069999 XRP at 0.005 %:
+    /// 100000000003.49995 drops is …004 through sixteen digits (…3.5, to even) and …003 at nineteen.
+    #[test]
+    fn the_royalty_follows_the_number_scale() {
+        let price: crate::tx::offer::Me = (4_102_798_089_215_371, -15);
+        assert_eq!(nft_royalty_iou(price, 12_345), (5_064_904_241_136_375, -16));
+        assert_eq!(nft_royalty_iou((9_500_000_000_000_000, -10), 2_500), (2_375_000_000_000_000, -11));
+        assert_eq!(nft_royalty_drops(2_000_000_000_069_999, 5), 100_000_000_004);
+        assert_eq!(nft_royalty_drops(40_417_398, 3_000), 1_212_522);
+        let _scale = ScaleGuard::new(MantissaScale::Large330);
+        assert_eq!(nft_royalty_iou(price, 12_345), (5_064_904_241_136_376, -16));
+        assert_eq!(nft_royalty_iou((9_500_000_000_000_000, -10), 2_500), (2_375_000_000_000_000, -11));
+        assert_eq!(nft_royalty_drops(2_000_000_000_069_999, 5), 100_000_000_003);
+        assert_eq!(nft_royalty_drops(40_417_398, 3_000), 1_212_522);
+    }
+}
+
 /// Move `drops` from buyer to seller, carving the NFTokenID-embedded transfer
 /// fee (1/100000 units) out for the issuer when NEITHER party is the issuer.
 ///
@@ -1621,25 +1670,7 @@ fn pay_iou_with_transfer_fee(
     // Same issuer gate as the XRP flavor: no royalty when the buyer or the
     // seller IS the issuer (NFTokenAcceptOffer.cpp:542, finding 94).
     let nft_cut = if fee_units > 0 && nft_issuer != *seller && nft_issuer != *buyer {
-        // Same rippled call as the XRP flavor — multiply(amount, rate), the
-        // Number pipeline: ONE half-even reduction of the FULL product to 16
-        // significant digits; the /100000 is exponent arithmetic, exact.
-        // me_muldiv(…, false) truncated instead — invisible on the exact
-        // #106047462 HADA specimen (950000×2500/100000 has no remainder).
-        let (m, e) = seller_side;
-        let p = m * fee_units; // ≤ 1e16 × 5e4, exact
-        let mut t = p;
-        let mut k = 0i32;
-        while t >= 10_000_000_000_000_000 {
-            t /= 10;
-            k += 1;
-        }
-        let mut m2 = if k > 0 { div_half_even(p, 10u128.pow(k as u32)) } else { p };
-        if m2 >= 10_000_000_000_000_000 {
-            m2 /= 10; // rounding carried to exactly 1e16 — exact shift
-            k += 1;
-        }
-        ox::norm16((m2, e + k - 5))
+        nft_royalty_iou(seller_side, fee_units)
     } else {
         (0, 0)
     };
