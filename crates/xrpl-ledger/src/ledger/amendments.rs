@@ -6,12 +6,26 @@
 //! under and the live mirror applies the amendment from the flag ledger
 //! that enabled it.
 //!
+//! Which ledger the answer is for. rippled gives a ledger the Rules of its
+//! PARENT when it starts building it (`rules_(prevLedger.rules_)`,
+//! Ledger.cpp:259) and reads them from the state again only when the ledger
+//! is closed (`setup`, Ledger.cpp:549): every transaction of a ledger runs
+//! under the same rules, the ones ordered after an EnableAmendment
+//! pseudo-transaction included. A pipeline that applies a whole ledger on one
+//! state, settling each transaction before the next, therefore takes a
+//! [`LedgerRules`] snapshot before the first transaction
+//! (`LedgerState::freeze_rules`) and every question here is answered from it.
+//! A state with no snapshot (a single transaction over a bundle's pre-images,
+//! a unit test, the probe) is the parent state itself, and reading its
+//! Amendments object directly is the same answer.
+//!
 //! Finding 259: fixCleanup3_3_0 went live on mainnet at flag ledger
 //! 106912768 (2026-09-11 ~12:51 UTC) with deploy117 already running. Until
 //! then the engine hard-coded the pre-amendment rules it had specimens for.
 
 use super::keylet;
 use super::sandbox::Sandbox;
+use super::state::LedgerState;
 use crate::tx::number::{MantissaScale, ScaleGuard};
 
 /// fixCleanup3_3_0 — AMM deposit/withdraw freeze scope, AMM precision-loss
@@ -19,9 +33,52 @@ use crate::tx::number::{MantissaScale, ScaleGuard};
 pub const FIX_CLEANUP_3_3_0: &str =
     "3298D47E1F3A8A24FECAA30F699B8FE1DD234E072834BA099AD8180FFCE0FEC4";
 
+/// The rules one ledger is built under — rippled's `Rules` as far as the
+/// engine uses it: the amendment IDs enabled in the PARENT ledger's
+/// Amendments object, fixed for every transaction of the ledger.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LedgerRules {
+    /// `sfAmendments` of the parent's Amendments object, as stored.
+    enabled: Vec<String>,
+}
+
+impl LedgerRules {
+    /// The rules an Amendments object gives (`None`: the state has none, so
+    /// nothing is enabled). An object that does not parse enables nothing,
+    /// as [`enabled`] reads it.
+    pub fn from_object(amendments_object: Option<&[u8]>) -> Self {
+        let enabled = amendments_object
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+            .and_then(|v| v.get("Amendments").and_then(|a| a.as_array()).cloned())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        Self { enabled }
+    }
+
+    /// The rules of the ledger built on `parent`: its Amendments object as it stands now.
+    pub fn of_parent(parent: &LedgerState) -> Self {
+        Self::from_object(parent.read_json(&keylet::amendments_key()).as_deref())
+    }
+
+    /// Whether the amendment with this 256-bit ID (hex, either case) is enabled.
+    pub fn enabled(&self, id_hex: &str) -> bool {
+        self.enabled.iter().any(|s| s.eq_ignore_ascii_case(id_hex))
+    }
+}
+
 /// Whether the amendment with this 256-bit ID (upper-case hex) is enabled
-/// in the ledger the sandbox is built on.
+/// for the ledger being built on the sandbox's base: from the base's frozen
+/// [`LedgerRules`] when the pipeline took them (`LedgerState::freeze_rules`),
+/// else from the Amendments object as the sandbox sees it.
+///
+/// `Change::applyAmendment` is the one reader that must NOT come through
+/// here: it peeks the Amendments object itself (Change.cpp:165-177), so a
+/// second EnableAmendment of the same ID in one ledger is tefALREADY —
+/// `tx::pseudo` reads the sandbox directly.
 pub fn enabled(sandbox: &Sandbox, id_hex: &str) -> bool {
+    if let Some(rules) = &sandbox.base().rules {
+        return rules.enabled(id_hex);
+    }
     let Some(bytes) = sandbox.read(&keylet::amendments_key()) else { return false };
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return false };
     v.get("Amendments")
@@ -240,6 +297,59 @@ mod tests {
         state.state_map.insert(keylet::amendments_key(), serde_json::to_vec(&obj).unwrap()).unwrap();
         assert!(fix_cleanup_3_3_0(&Sandbox::new(&state)));
         assert!(!enabled(&Sandbox::new(&state), "00000000000000000000000000000000000000000000000000000000000000BB"));
+    }
+
+    /// Ledger.cpp:259 / :549: a ledger's rules are its parent's for every
+    /// transaction; an Amendments object rewritten mid-ledger (the
+    /// EnableAmendment pseudo-transaction, settled into the state the next
+    /// transaction applies on) changes nothing until the next ledger.
+    #[test]
+    fn frozen_rules_answer_for_the_whole_ledger_whatever_the_state_holds_by_then() {
+        use crate::tx::number::mantissa_scale;
+        let object = |ids: &[&str]| {
+            serde_json::to_vec(&serde_json::json!({ "LedgerEntryType": "Amendments", "Flags": 0, "Amendments": ids })).unwrap()
+        };
+        let mut state = test_state();
+        state.state_map.insert(keylet::amendments_key(), object(&[FIX_CLEANUP_3_3_0])).unwrap();
+        assert!(state.rules.is_none(), "no pipeline has frozen anything: the state answers for itself");
+
+        // The ledger starts: the parent has fixCleanup3_3_0 only.
+        state.freeze_rules();
+        // Mid-ledger the pseudo-transaction's write lands in the base, and a later transaction's sandbox
+        // even rewrites the object again.
+        state.state_map.insert(keylet::amendments_key(), object(&[FIX_CLEANUP_3_3_0, SINGLE_ASSET_VAULT])).unwrap();
+        {
+            let mut sb = Sandbox::new(&state);
+            sb.write(keylet::amendments_key(), object(&[LENDING_PROTOCOL]));
+            assert!(enabled(&sb, FIX_CLEANUP_3_3_0) && fix_cleanup_3_3_0(&sb), "the parent's amendment stays on");
+            assert!(!enabled(&sb, SINGLE_ASSET_VAULT) && !enabled(&sb, LENDING_PROTOCOL), "nothing enabled in this ledger is on yet");
+            assert!(!pseudo_account_sequence_is_zero(&sb));
+            assert_eq!(number_scale(&sb), MantissaScale::Small, "and Number keeps the parent's scale");
+            let _g = number_scale_guard(&sb);
+            assert_eq!(mantissa_scale(), MantissaScale::Small);
+            // What the state holds is still there to be read directly, as Change::applyAmendment reads it.
+            assert_eq!(sb.read(&keylet::amendments_key()), Some(object(&[LENDING_PROTOCOL])));
+        }
+        // A clone made mid-ledger (an order shadow, a what-if) is the same ledger.
+        assert!(!enabled(&Sandbox::new(&state.clone()), SINGLE_ASSET_VAULT));
+
+        // The ledger is closed: its own state gives the next ledger's rules.
+        state.thaw_rules();
+        assert!(enabled(&Sandbox::new(&state), SINGLE_ASSET_VAULT), "unfrozen, the state answers for itself again");
+        state.freeze_rules();
+        let sb = Sandbox::new(&state);
+        assert!(enabled(&sb, SINGLE_ASSET_VAULT) && enabled(&sb, &FIX_CLEANUP_3_3_0.to_lowercase()));
+        assert_eq!(number_scale(&sb), MantissaScale::Large330);
+    }
+
+    /// A state with no Amendments object, or one that does not parse, enables nothing — frozen or not.
+    #[test]
+    fn rules_of_a_state_without_an_amendments_object_enable_nothing() {
+        let mut state = test_state();
+        assert_eq!(LedgerRules::of_parent(&state), LedgerRules::default());
+        state.freeze_rules();
+        assert!(!enabled(&Sandbox::new(&state), FIX_CLEANUP_3_3_0));
+        assert!(!LedgerRules::from_object(Some(b"not json")).enabled(FIX_CLEANUP_3_3_0));
     }
 
     /// Rules.cpp:43-71: Small with neither vault amendment, Large330 with

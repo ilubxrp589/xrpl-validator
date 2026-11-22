@@ -25,6 +25,11 @@ pub struct LedgerState {
     pub leaf_decoder: Option<fn(&Hash256, &[u8]) -> Option<Vec<u8>>>,
     /// Every object of the ledger is present (a full scan of state.rocks), not "the parts loaded are right"; false from every constructor.
     pub complete: bool,
+    /// The rules of the ledger being built on this state, frozen before its first transaction
+    /// ([`freeze_rules`](Self::freeze_rules)); `None` from every constructor: the amendments are then read
+    /// from the Amendments object per question (`ledger::amendments::enabled`), which is right wherever
+    /// the state IS the parent ledger (one transaction over a bundle's pre-images, a unit test).
+    pub rules: Option<std::sync::Arc<super::amendments::LedgerRules>>,
 }
 
 impl LedgerState {
@@ -41,6 +46,7 @@ impl LedgerState {
             validated: false,
             leaf_decoder: None,
             complete: false,
+            rules: None,
         };
 
         state.verify()?;
@@ -56,7 +62,22 @@ impl LedgerState {
             validated: false,
             leaf_decoder: None,
             complete: false,
+            rules: None,
         }
+    }
+
+    /// Fix the rules of the ledger about to be built on this state: the amendments its Amendments object
+    /// holds NOW, i.e. the parent ledger's (rippled `rules_(prevLedger.rules_)`, Ledger.cpp:259). Call it
+    /// before the first transaction of a ledger whose transactions are settled into this state one by
+    /// one; until [`thaw_rules`](Self::thaw_rules) an EnableAmendment settled into the state changes no
+    /// rule and no Number scale. Calling it again takes a new snapshot from the state as it stands.
+    pub fn freeze_rules(&mut self) {
+        self.rules = Some(std::sync::Arc::new(super::amendments::LedgerRules::of_parent(self)));
+    }
+
+    /// The ledger is done (rippled `Ledger::setup`, Ledger.cpp:549): the state answers for itself again.
+    pub fn thaw_rules(&mut self) {
+        self.rules = None;
     }
 
     /// Read a state leaf as engine JSON bytes, decoding a raw serialized leaf

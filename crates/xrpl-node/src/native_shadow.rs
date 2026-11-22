@@ -950,6 +950,20 @@ impl NativeShadow {
             close_time_resolution,
             close_flags: 0,
         };
+        // The rules of ledger `seq` are its PARENT's, for every transaction in it (rippled
+        // `rules_(prevLedger.rules_)`, Ledger.cpp:259; re-read only when the ledger is closed, :549). The
+        // mirror is the parent's post-state right now; from here on each transaction is settled into it,
+        // an EnableAmendment's Amendments object included, so the amendments (and with them Number's
+        // scale) are frozen first and released when every walk of this ledger is done. Between ledgers
+        // the mirror answers for itself: the next ledger freezes what this one enabled.
+        self.state.freeze_rules();
+        let applied = self.apply_walks(seq, parent_hash, total_drops, ordered);
+        self.state.thaw_rules();
+        applied
+    }
+
+    /// [`apply_ledger`](Self::apply_ledger) once the base header and the ledger's rules are in place.
+    fn apply_walks(&mut self, seq: u32, parent_hash: &[u8; 32], total_drops: u64, ordered: &[&Value]) -> Applied {
         let parent_hash_hex = hex::encode_upper(parent_hash);
 
         // Batch (BatchV1_1): the ledger records every inner transaction as its
@@ -2467,6 +2481,21 @@ mod tests {
         let p = sh.propose(seq, &parent, pct, 10, drops, &[vault_create], &keys, &deleted, None).unwrap();
         assert_eq!(p.refusal, None, "one ledger on, the vault rules apply");
         assert_eq!(p.overlay, overlay, "and the vault is created as devnet created it");
+    }
+
+    /// The frozen rules last exactly one ledger's apply: between ledgers the mirror carries none, so whatever
+    /// reads it then (the amendment guard, a what-if apply) sees the state's own Amendments object.
+    #[test]
+    fn the_mirror_carries_no_frozen_rules_between_ledgers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, trigger) = (dir.path().join("receipts.jsonl"), dir.path().join("native_shadow.canary"));
+        let (seq, parent, pct, drops, tx, state, overlay) = payment_ledger();
+        let (keys, deleted) = meta_of(&overlay);
+        let mut sh = shadow(state, seq - 1, &log, &trigger);
+        assert!(sh.state.rules.is_none());
+        let p = sh.propose(seq, &parent, pct, 10, drops, &[tx], &keys, &deleted, None).unwrap();
+        assert_eq!(p.refusal, None);
+        assert!(sh.state.rules.is_none(), "released when the ledger's walks are done");
     }
 
     // ---- Phase B: the native writer ----

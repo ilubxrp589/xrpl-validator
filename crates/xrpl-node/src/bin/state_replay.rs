@@ -386,6 +386,10 @@ fn run() -> i32 {
             close_time_resolution,
             close_flags: 0,
         };
+        // This ledger's rules are its parent's for every transaction (rippled Ledger.cpp:259): frozen
+        // here, before the first one, from the state as the previous ledger left it; an EnableAmendment
+        // settled below changes nothing until the next ledger freezes again.
+        state.freeze_rules();
 
         let mut dirty: HashSet<Hash256> = HashSet::new();
 
