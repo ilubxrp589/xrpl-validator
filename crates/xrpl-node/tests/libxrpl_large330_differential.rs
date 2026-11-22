@@ -455,7 +455,8 @@ fn run_scale(name: &str, bundle: &Value, large: bool) -> Result<Row, String> {
     let (our_ter, ours, our_misses) = our_leg(&ledger, &pre, &bundle["tx"])?;
     let legs = Legs { lib_ter, lib_fatal, lib, lib_misses, our_ter, ours, our_misses };
     let class = classify(&legs, &pre);
-    let detail = if class == "AGREE" { Vec::new() } else { describe(&legs) };
+    // `L330_LOG_ALWAYS`: libxrpl's log for an agreeing bundle too (its flow trace under XRPL_FFI_TRACE=1).
+    let detail = if class == "AGREE" && std::env::var("L330_LOG_ALWAYS").is_err() { Vec::new() } else { describe(&legs) };
     Ok(Row {
         lib_misses: legs.lib_misses,
         our_misses: legs.our_misses,
