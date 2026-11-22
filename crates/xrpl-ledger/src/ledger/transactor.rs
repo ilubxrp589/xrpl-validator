@@ -410,6 +410,9 @@ impl TxResult {
             | TxResult::NoAlternativeKey
             | TxResult::NeedMasterKey
             | TxResult::Owners
+            // Set by an invariant checker (Transactor.cpp:1638-1645) or thrown
+            // by the payment engine (BookStep.cpp:920): a tec like any other.
+            | TxResult::InvariantFailed
             | TxResult::Unsupported => true,
             // tem/tef: not claimed
             _ => false,
