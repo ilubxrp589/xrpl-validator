@@ -2265,7 +2265,8 @@ pub(crate) fn apply_tick_size(pays: Me, gets: Me, sell: bool, tick: u32, pays_xr
     if tick >= 16 {
         return (pays, gets);
     }
-    let Some(rate) = rate_of_me(pays, gets) else {
+    // `Quality{saTakerGets, saTakerPays}`: getRate on the amounts as they are, a native one whole.
+    let Some(rate) = rate_of_me_native(pays, pays_xrp, gets, gets_xrp) else {
         return (pays, gets);
     };
     let rounded = quality_round_up(rate, tick);
@@ -2292,7 +2293,7 @@ pub(crate) fn apply_tick_size(pays: Me, gets: Me, sell: bool, tick: u32, pays_xr
         if p.0 == 0 { (pays, gets) } else { (p, gets) }
     } else {
         // Hold TakerPays, re-derive TakerGets = TakerPays ÷ rate.
-        let g = stamount_divide(pays, rate_me, gets_xrp);
+        let g = stamount_divide(pays, pays_xrp, rate_me, gets_xrp);
         if g.0 == 0 { (pays, gets) } else { (pays, g) }
     }
 }
@@ -2331,11 +2332,19 @@ fn fold16(v: u128, e0: i32) -> Me {
 /// rippled `STAmount divide(num, den, asset)`: truncating muldiv at 10^17,
 /// `+5`, canonicalize. Distinct from [`st_divide`], which implements Number's
 /// exact half-even for the flow/fill path — see [`keylet::rate_encode`].
-fn stamount_divide(num: Me, den: Me, xrp: bool) -> Me {
+///
+/// `num_native`: the numerator is XRP. rippled takes the mantissas as they stand and only scales an integral one
+/// UP toward kMinValue (STAmount.cpp:1235-1247), so a native numerator of seventeen digits (1e16 drops and more)
+/// reaches the muldiv whole; an IOU's is already sixteen.
+fn stamount_divide(num: Me, num_native: bool, den: Me, xrp: bool) -> Me {
     if num.0 == 0 || den.0 == 0 {
         return (0, 0);
     }
-    let (nm, ne) = norm16(num);
+    let (nm, ne) = if num_native && num.1 == 0 && num.0 >= 10_000_000_000_000_000 && num.0 < 1_000_000_000_000_000_000 {
+        num
+    } else {
+        norm16(num)
+    };
     let (dm, de) = norm16(den);
     let v = nm * 100_000_000_000_000_000u128 / dm + 5;
     let e = ne - de - 17;
