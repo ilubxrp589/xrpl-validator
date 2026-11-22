@@ -2475,7 +2475,12 @@ mod tests {
         assert_eq!(p.refusal, None, "the VaultCreate ordered after the EnableAmendment still runs under the parent's rules");
         assert!(p.overlay.is_empty(), "and writes nothing: {:?}", p.overlay.keys().map(hex::encode_upper).collect::<Vec<_>>());
         assert!(listed(&sh.state).iter().any(|a| a == SINGLE_ASSET_VAULT), "the pseudo-transaction itself did enable it in the state");
-        sh.commit(seq - 1, &p.overlay, true);
+        // The ledger lands as ws-sync writes it: our overlay plus the system objects, the Amendments object
+        // among them (a commit puts back any singleton of ours that was not written).
+        let mut written = p.overlay.clone();
+        written.insert(ak.0, reencoded(&sh, &ak.0));
+        sh.commit(seq - 1, &written, true);
+        assert!(listed(&sh.state).iter().any(|a| a == SINGLE_ASSET_VAULT), "the committed parent of the next ledger has it");
 
         // The next ledger is built on a parent that has the amendment.
         let p = sh.propose(seq, &parent, pct, 10, drops, &[vault_create], &keys, &deleted, None).unwrap();
