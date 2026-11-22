@@ -151,7 +151,7 @@ int test_main(int argc, char **argv) {
     XrplApplyResult *result = xrpl_apply_with_mutations(
         tx_bytes, tx_len,
         NULL, 0,
-        103354511, 797193960, 99985687626634189ULL,
+        103354511, 797193960, 10 /* close_time_resolution */, 99985687626634189ULL,
         parent_hash, 10, 10000000, 2000000,
         0, 0,
         sle_lookup, &db,
