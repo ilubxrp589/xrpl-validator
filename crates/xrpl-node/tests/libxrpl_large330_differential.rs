@@ -30,6 +30,10 @@
 //! `L330_EXTRA`, a file of the same shape) supplies objects libxrpl asked for that a mainnet bundle lacked, fetched
 //! at the bundle's parent ledger.
 //!
+//! A mutant bundle (`"mutant_of": "<pinned vector>"`: amounts of the vector's pre-state and / or transaction changed)
+//! has no network outcome; libxrpl is its only reference. A mutant that differs AND asked for a key its base
+//! vector's run never asked for is counted `outside`: its walk left the hydrated state.
+//!
 //! One `D330` line per bundle and scale, classes as `libxrpl_341_differential.rs` (AGREE / NOOP / TER / MUT / BYTE /
 //! HARNESS). `sens=1` on a Large line: libxrpl's own answer at Large differs from its answer at Small, i.e. the
 //! bundle is one whose bytes the 19-digit scale changes (an AGREE on a `sens=0` bundle says little about rounding).
@@ -381,6 +385,8 @@ fn pre_of(bundle: &Value) -> BTreeMap<Key, Vec<u8>> {
 }
 
 struct Row {
+    lib_misses: Vec<Key>,
+    our_misses: Vec<Key>,
     class: &'static str,
     lib_ter: String,
     our_ter: String,
@@ -450,7 +456,29 @@ fn run_scale(name: &str, bundle: &Value, large: bool) -> Result<Row, String> {
     let legs = Legs { lib_ter, lib_fatal, lib, lib_misses, our_ter, ours, our_misses };
     let class = classify(&legs, &pre);
     let detail = if class == "AGREE" { Vec::new() } else { describe(&legs) };
-    Ok(Row { class, lib_ter: legs.lib_ter, our_ter: legs.our_ter, detail, lib: legs.lib, pre, tx: bundle["tx"].clone() })
+    Ok(Row {
+        lib_misses: legs.lib_misses,
+        our_misses: legs.our_misses,
+        class,
+        lib_ter: legs.lib_ter,
+        our_ter: legs.our_ter,
+        detail,
+        lib: legs.lib,
+        pre,
+        tx: bundle["tx"].clone(),
+    })
+}
+
+/// A mutant (`mutant_of` = a pinned vector) whose run asked for a key the base vector's run at the same scale did
+/// not: its walk left the state the bundle was hydrated for (a deeper book level, another maker's line), where an
+/// absent object means "not fetched", not "not on the ledger". Such a difference says nothing about either engine.
+fn left_the_hydrated_state(bundle: &Value, row: &Row, large: bool) -> bool {
+    let Some(base) = bundle["mutant_of"].as_str() else { return false };
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/vectors/{base}.json"));
+    let Some(base_bundle) = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) else { return true };
+    let Ok(b) = run_scale(base, &base_bundle, large) else { return true };
+    let known: BTreeSet<&Key> = b.lib_misses.iter().chain(&b.our_misses).collect();
+    row.lib_misses.iter().chain(&row.our_misses).any(|k| !known.contains(k))
 }
 
 /// The bundle as `large330_vector.rs` replays it: the rewritten pre-state, libxrpl's result, and as the
@@ -590,10 +618,16 @@ fn libxrpl_against_our_engine_at_both_number_scales() {
                     let cap = std::env::var("L330_LOG_CHARS").ok().and_then(|s| s.parse().ok()).unwrap_or(3000);
                     r.detail.iter().for_each(|l| println!("D330   {}", l.chars().take(cap).collect::<String>()));
                     let differs = matches!(r.class, "TER" | "MUT" | "BYTE");
-                    let class = match (differs, faithful) {
-                        (true, false) => "unfaithful",
+                    let outside = differs && left_the_hydrated_state(&bundle, &r, large);
+                    let class = match (differs, faithful, outside) {
+                        (true, _, true) => "outside",
+                        (true, false, _) => "unfaithful",
                         _ => r.class,
                     };
+                    if outside {
+                        println!("D330   ^ outside: this mutant read a key its base bundle's run never asked for (not hydrated: not comparable)");
+                    }
+                    let faithful = faithful && !outside;
                     *tally.entry((scale, tx_type.clone(), class)).or_default() += 1;
                     *faith_tally.entry((scale, tx_type.clone(), faithful)).or_default() += 1;
                     if differs && faithful {
