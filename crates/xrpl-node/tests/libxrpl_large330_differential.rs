@@ -22,6 +22,14 @@
 //! Small run is the control: it is mainnet today, and a difference there is a finding on the live path or a bundle
 //! that lacks an object libxrpl reads (the keys each leg asked for and did not find are printed).
 //!
+//! `net=same|differs` on a Small line: whether libxrpl, on the bundle and mainnet's present rules, reproduced what the
+//! network recorded (result and every object the bundle expects). `differs` is a bundle libxrpl cannot replay as the
+//! network did: it lacks objects libxrpl reads and our engine did not (older bundles hold what OUR walk asked for), or
+//! it comes from a ledger or a network whose rules were not today's mainnet rules. Such a bundle's comparison is
+//! printed and counted apart (`unfaithful`) and never fails the test. `vectors/large330_extra_pre.json` (and
+//! `L330_EXTRA`, a file of the same shape) supplies objects libxrpl asked for that a mainnet bundle lacked, fetched
+//! at the bundle's parent ledger.
+//!
 //! One `D330` line per bundle and scale, classes as `libxrpl_341_differential.rs` (AGREE / NOOP / TER / MUT / BYTE /
 //! HARNESS). `sens=1` on a Large line: libxrpl's own answer at Large differs from its answer at Small, i.e. the
 //! bundle is one whose bytes the 19-digit scale changes (an AGREE on a `sens=0` bundle says little about rounding).
@@ -394,9 +402,45 @@ fn network_id(name: &str, bundle: &Value) -> u32 {
     }
 }
 
+/// Objects a bundle lacks and libxrpl reads: `{vector name: {key: object hex}}`.
+fn extra_pre(name: &str) -> BTreeMap<Key, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    let mut take = |text: &str| {
+        let all: Value = serde_json::from_str(text).unwrap();
+        for (k, v) in all.get(name).and_then(Value::as_object).into_iter().flatten() {
+            out.insert(key32(k), hex::decode(v.as_str().unwrap()).unwrap());
+        }
+    };
+    take(include_str!("vectors/large330_extra_pre.json"));
+    if let Ok(path) = std::env::var("L330_EXTRA") {
+        take(&std::fs::read_to_string(path).unwrap());
+    }
+    out
+}
+
+/// Whether libxrpl's outcome is the one the network recorded: the result code, and every object the bundle
+/// expects either written by libxrpl with those bytes (deleted for an empty expectation) or left as its pre-image.
+fn same_as_network(bundle: &Value, row: &Row) -> bool {
+    if bundle["result"].as_str().is_some_and(|r| r != row.lib_ter) {
+        return false;
+    }
+    let Some(expect) = bundle["expect"].as_object().filter(|e| !e.is_empty()) else { return false };
+    expect.iter().all(|(k, w)| {
+        let (k, w) = (key32(k), w.as_str().unwrap_or_default().trim().to_uppercase());
+        match row.lib.get(&k) {
+            Some((2, _)) => w.is_empty(),
+            Some((_, b)) => hex::encode_upper(b) == w,
+            None => row.pre.get(&k).is_some_and(|p| hex::encode_upper(p) == w),
+        }
+    })
+}
+
 fn run_scale(name: &str, bundle: &Value, large: bool) -> Result<Row, String> {
     let mut bundle = bundle.clone();
     let mut pre = pre_of(&bundle);
+    for (k, v) in extra_pre(name) {
+        pre.entry(k).or_insert(v);
+    }
     set_rules(&mut pre, large)?;
     let (tx_bytes, flags) = tx_of(name, &mut bundle)?;
     let ledger = ledger_of(&bundle);
@@ -500,6 +544,7 @@ fn libxrpl_against_our_engine_at_both_number_scales() {
     assert!(!files.is_empty(), "no bundles");
     let mut tally: BTreeMap<(&'static str, String, &'static str), u32> = BTreeMap::new();
     let mut sens_tally: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+    let mut faith_tally: BTreeMap<(&'static str, String, bool), u32> = BTreeMap::new();
     let mut failing = Vec::new();
     let mut ran = 0;
     for path in &files {
@@ -515,6 +560,7 @@ fn libxrpl_against_our_engine_at_both_number_scales() {
         ran += 1;
         let recorded = bundle["result"].as_str().unwrap_or("?").to_string();
         let mut small_lib: Option<(String, MutMap)> = None;
+        let mut faithful = false;
         for (scale, large) in [("Small", false), ("Large", true)] {
             let row = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_scale(&name, &bundle, large)))
                 .unwrap_or_else(|p| Err(format!("panic: {}", panic_text(p))));
@@ -522,17 +568,27 @@ fn libxrpl_against_our_engine_at_both_number_scales() {
                 Ok(r) => {
                     // Threading stamps carry the transaction's id and ledger, the same at both scales.
                     let sensitive = large && small_lib.as_ref().is_some_and(|(t, m)| *t != r.lib_ter || *m != r.lib);
+                    if !large {
+                        // A mutant (`mutant_of`) has no network outcome: libxrpl is its only reference.
+                        faithful = bundle.get("mutant_of").is_some() || same_as_network(&bundle, &r);
+                    }
                     println!(
                         "D330 {} {scale} {name} {tx_type} recorded={recorded} libxrpl={} ours={}{}",
                         r.class,
                         r.lib_ter,
                         r.our_ter,
-                        if large { format!(" sens={}", sensitive as u8) } else { String::new() }
+                        if large { format!(" sens={}", sensitive as u8) } else { format!(" net={}", if faithful { "same" } else { "differs" }) }
                     );
                     let cap = std::env::var("L330_LOG_CHARS").ok().and_then(|s| s.parse().ok()).unwrap_or(3000);
                     r.detail.iter().for_each(|l| println!("D330   {}", l.chars().take(cap).collect::<String>()));
-                    *tally.entry((scale, tx_type.clone(), r.class)).or_default() += 1;
-                    if matches!(r.class, "TER" | "MUT" | "BYTE") {
+                    let differs = matches!(r.class, "TER" | "MUT" | "BYTE");
+                    let class = match (differs, faithful) {
+                        (true, false) => "unfaithful",
+                        _ => r.class,
+                    };
+                    *tally.entry((scale, tx_type.clone(), class)).or_default() += 1;
+                    *faith_tally.entry((scale, tx_type.clone(), faithful)).or_default() += 1;
+                    if differs && faithful {
                         failing.push(format!("{name}@{scale}"));
                     }
                     if large {
@@ -557,6 +613,9 @@ fn libxrpl_against_our_engine_at_both_number_scales() {
     println!("D330 SUMMARY {ran} bundles");
     for ((scale, t, c), n) in &tally {
         println!("D330 SUMMARY {scale} {t} {c} {n}");
+    }
+    for ((scale, t, f), n) in &faith_tally {
+        println!("D330 SUMMARY {scale} {t} libxrpl-reproduces-the-network={f} {n}");
     }
     for (t, (n, s)) in &sens_tally {
         println!("D330 SUMMARY scale-sensitive {t} {s} of {n}");
