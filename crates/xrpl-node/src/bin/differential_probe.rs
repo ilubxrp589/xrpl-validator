@@ -2853,7 +2853,7 @@ fn run_shadow(pre: &LedgerState, store: &str, seq: u32, rpc_url: &str) {
         let log = dir.join(format!("{mode:?}.jsonl"));
         let mut sh = xrpl_node::native_shadow::NativeShadow::replay(pre.clone(), seq - 1, mode, log.clone(), parent_total);
         let t0 = std::time::Instant::now();
-        let Some(p) = sh.propose(seq, &parent_hash, pct, drops, &txs, &keys, &deleted, None) else {
+        let Some(p) = sh.propose(seq, &parent_hash, pct, 10, drops, &txs, &keys, &deleted, None) else {
             eprintln!("SHADOW #{seq} {mode:?}: no proposal");
             continue;
         };

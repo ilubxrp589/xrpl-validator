@@ -440,6 +440,7 @@ enum PendingLedger {
         seq: u32,
         parent_hash: [u8; 32],
         parent_close_time: u32,
+        close_resolution: u8,
         total_drops: u64,
         txs: Vec<Value>,
         overlay: LedgerOverlay,
@@ -778,8 +779,8 @@ impl NativeShadow {
                 continue;
             }
             match p {
-                PendingLedger::Shadow { seq, parent_hash, parent_close_time, total_drops, txs, overlay } => {
-                    self.on_ledger(seq, &parent_hash, parent_close_time, total_drops, &txs, &overlay);
+                PendingLedger::Shadow { seq, parent_hash, parent_close_time, close_resolution, total_drops, txs, overlay } => {
+                    self.on_ledger(seq, &parent_hash, parent_close_time, close_resolution, total_drops, &txs, &overlay);
                 }
                 PendingLedger::Written { seq, written } => {
                     if self.at_seq + 1 != seq {
@@ -838,12 +839,14 @@ impl NativeShadow {
     /// Apply ledger `seq` natively and compare against the FFI overlay.
     /// `txs` are the parsed `metaData`-bearing tx JSONs, `parent_hash_hex`
     /// the header's parent hash (skip-list input), `close_time` the header
-    /// close time (the engine reads it off the mirror's base header).
+    /// close time (the engine reads it off the mirror's base header),
+    /// `close_resolution` ledger `seq`'s own close-time resolution.
     pub fn on_ledger(
         &mut self,
         seq: u32,
         parent_hash: &[u8; 32],
         parent_close_time: u32,
+        close_resolution: u8,
         total_drops: u64,
         txs: &[Value],
         ffi_overlay: &LedgerOverlay,
@@ -861,6 +864,7 @@ impl NativeShadow {
                     seq,
                     parent_hash: *parent_hash,
                     parent_close_time,
+                    close_resolution,
                     total_drops,
                     txs: txs.to_vec(),
                     overlay: ffi_overlay.clone(),
@@ -895,7 +899,7 @@ impl NativeShadow {
         }
         let t0 = std::time::Instant::now();
         let ordered = apply_order(txs);
-        let applied = self.apply_ledger(seq, parent_hash, parent_close_time, total_drops, &ordered);
+        let applied = self.apply_ledger(seq, parent_hash, parent_close_time, close_resolution, total_drops, &ordered);
         self.compare_and_report(seq, &ordered, &applied, ffi_overlay, t0);
         self.reconcile(seq, applied.undo, ffi_overlay, false);
         self.read_amendments(seq);
@@ -917,6 +921,7 @@ impl NativeShadow {
         seq: u32,
         parent_hash: &[u8; 32],
         parent_close_time: u32,
+        _close_resolution: u8,
         total_drops: u64,
         ordered: &[&Value],
     ) -> Applied {
@@ -1830,12 +1835,15 @@ impl NativeShadow {
     /// deleted ones; `ffi_overlay`, when the FFI leg verified this ledger,
     /// keeps the overlay-vs-overlay compare (receipts, canary) running.
     /// Every Some must be settled with [`commit`](Self::commit) or
-    /// [`abort`](Self::abort) before the next call.
+    /// [`abort`](Self::abort) before the next call. `close_resolution` is
+    /// ledger `seq`'s own close-time resolution (its header's).
+    #[allow(clippy::too_many_arguments)]
     pub fn propose(
         &mut self,
         seq: u32,
         parent_hash: &[u8; 32],
         parent_close_time: u32,
+        close_resolution: u8,
         total_drops: u64,
         txs: &[Value],
         meta_keys: &HashSet<[u8; 32]>,
@@ -1865,7 +1873,7 @@ impl NativeShadow {
         }
         let t0 = std::time::Instant::now();
         let ordered = apply_order(txs);
-        let applied = self.apply_ledger(seq, parent_hash, parent_close_time, total_drops, &ordered);
+        let applied = self.apply_ledger(seq, parent_hash, parent_close_time, close_resolution, total_drops, &ordered);
         self.burned = Some((seq, applied.burned));
         // Taken BEFORE the compare: a planted canary must never be written.
         let (overlay, refusal) = self.vouch(seq, &applied, meta_keys, meta_deleted);
@@ -2304,10 +2312,13 @@ mod tests {
     /// fed to the shadow the way ws-sync feeds it: the mirror hydrated from
     /// the bundle's pre-images, the FFI overlay = the network's post bytes.
     fn payment_ledger() -> (u32, [u8; 32], u32, u64, Value, LedgerState, LedgerOverlay) {
-        let b: Value = serde_json::from_str(include_str!(
-            "../tests/vectors/deposit_c14_preauthorized_payment_473859FA8AF3.json"
-        ))
-        .unwrap();
+        bundle_ledger(include_str!("../tests/vectors/deposit_c14_preauthorized_payment_473859FA8AF3.json"))
+    }
+
+    /// A one-transaction vector bundle as a ledger for the shadow: (seq, parent hash, parent close time, total
+    /// drops, the transaction with a metaData carrying the network's result, the pre-state, the post bytes).
+    fn bundle_ledger(bundle: &str) -> (u32, [u8; 32], u32, u64, Value, LedgerState, LedgerOverlay) {
+        let b: Value = serde_json::from_str(bundle).unwrap();
         let seq = b["seq"].as_u64().unwrap() as u32;
         let parent: [u8; 32] = hex::decode(b["parent_hash"].as_str().unwrap()).unwrap().try_into().unwrap();
         let mut state = LedgerState::new_unverified(LedgerHeader {
@@ -2369,6 +2380,34 @@ mod tests {
         }
     }
 
+    /// rippled centres OracleSet's LastUpdateTime window on `view.header().closeTime` of the ledger being
+    /// built: the parent's close time plus THAT ledger's close-time resolution (Ledger.cpp:262-278,
+    /// OracleSet.cpp:74-83). The resolution is 10 s on almost every ledger and steps to 20 (and on) after a
+    /// ledger closed without close-time agreement, so the node must hand the engine the header's own value.
+    /// A real testnet OracleSet (campaign 19, 92B605BAFB05, tesSUCCESS), moved so its LastUpdateTime is 315 s
+    /// past the parent close: inside the window of a 20 s ledger (parent + 20 + 300), outside a 10 s one's.
+    #[test]
+    fn the_engine_gets_the_close_time_resolution_of_the_ledger_being_built() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, trigger) = (dir.path().join("receipts.jsonl"), dir.path().join("native_shadow.canary"));
+        let (seq, parent, _, drops, tx, state, overlay) = bundle_ledger(include_str!(
+            "../tests/vectors/c19_5_4_dj_oracleset_create_pre_fee_balance_reserve_oc_1_testnet_20976466.json"
+        ));
+        let (keys, deleted) = meta_of(&overlay);
+        let last_update = tx["LastUpdateTime"].as_u64().unwrap() - 946_684_800;
+        let pct = (last_update - 315) as u32;
+        let txs = [tx];
+
+        let mut sh = shadow(state.clone(), seq - 1, &log, &trigger);
+        let p = sh.propose(seq, &parent, pct, 20, drops, &txs, &keys, &deleted, None).unwrap();
+        assert_eq!(p.refusal, None, "a 20 s ledger: 315 s past the parent close is 295 s past the ledger's close time");
+        assert_eq!(p.overlay, overlay, "and the Oracle is written as the network wrote it");
+
+        let mut sh = shadow(state, seq - 1, &log, &trigger);
+        let p = sh.propose(seq, &parent, pct, 10, drops, &txs, &keys, &deleted, None).unwrap();
+        assert!(p.refusal.is_some(), "a 10 s ledger: 305 s past its close time is tecINVALID_UPDATE_TIME, not the tesSUCCESS given");
+    }
+
     // ---- Phase B: the native writer ----
 
     /// The keys the network's metadata names for the payment ledger: exactly
@@ -2391,7 +2430,7 @@ mod tests {
         let (keys, deleted) = meta_of(&overlay);
         let mut sh = shadow(state.clone(), seq - 1, &log, &trigger);
         assert!(sh.singleton_writes(seq).is_empty(), "nothing held yet");
-        sh.propose(seq, &parent, pct, drops, &[tx], &keys, &deleted, None).unwrap();
+        sh.propose(seq, &parent, pct, 10, drops, &[tx], &keys, &deleted, None).unwrap();
         let w = sh.singleton_writes(seq);
         let skip = keylet::skip_list_key();
         assert_eq!(w.get(&skip.0), Some(&reencoded(&sh, &skip.0)), "the skip list, as the mirror holds it");
@@ -2404,7 +2443,7 @@ mod tests {
         // An empty ledger right after a multiple of 256 also writes the 256-ledger hash list.
         let flag_next = 107_937_281;
         let mut sh = shadow(state, flag_next - 1, &log, &trigger);
-        sh.propose(flag_next, &parent, pct, drops, &[], &HashSet::new(), &HashSet::new(), None).unwrap();
+        sh.propose(flag_next, &parent, pct, 10, drops, &[], &HashSet::new(), &HashSet::new(), None).unwrap();
         let w = sh.singleton_writes(flag_next);
         let every = crate::native_apply::skip_every_key(flag_next - 1);
         assert!(w.contains_key(&skip.0) && w.contains_key(&every.0), "{:?}", w.keys().map(hex::encode_upper).collect::<Vec<_>>());
@@ -2418,7 +2457,7 @@ mod tests {
         let (seq, parent, pct, drops, tx, state, overlay) = payment_ledger();
         let (keys, deleted) = meta_of(&overlay);
         let mut sh = shadow(state, seq - 1, &log, &trigger);
-        let p = sh.propose(seq, &parent, pct, drops, &[tx], &keys, &deleted, Some(&overlay)).unwrap();
+        let p = sh.propose(seq, &parent, pct, 10, drops, &[tx], &keys, &deleted, Some(&overlay)).unwrap();
         assert_eq!(p.refusal, None, "every result and every key agrees");
         assert_eq!(p.overlay, overlay, "our writes are the network's post-state bytes, byte for byte");
         sh.commit(seq, &p.overlay, true);
@@ -2441,7 +2480,7 @@ mod tests {
 
         // Our proposal, and the skip list ws-sync fetched equal to the one our apply built: all ours.
         let mut sh = shadow(state.clone(), seq - 1, &log, &trigger);
-        let p = sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).unwrap();
+        let p = sh.propose(seq, &parent, pct, 10, drops, &txs, &keys, &deleted, None).unwrap();
         assert_eq!(sh.burned(seq), Some(fee), "a plain payment burns its fee");
         assert_eq!(sh.burned(seq + 1), None);
         let mut written = p.overlay.clone();
@@ -2453,7 +2492,7 @@ mod tests {
 
         // The network's skip list is not ours.
         let mut sh = shadow(state.clone(), seq - 1, &log, &trigger);
-        let p = sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).unwrap();
+        let p = sh.propose(seq, &parent, pct, 10, drops, &txs, &keys, &deleted, None).unwrap();
         let mut written = p.overlay.clone();
         written.insert(skip, None);
         sh.commit(seq, &written, true);
@@ -2462,13 +2501,13 @@ mod tests {
 
         // A skip list our apply changed and nobody wrote.
         let mut sh = shadow(state.clone(), seq - 1, &log, &trigger);
-        let p = sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).unwrap();
+        let p = sh.propose(seq, &parent, pct, 10, drops, &txs, &keys, &deleted, None).unwrap();
         sh.commit(seq, &p.overlay, true);
         assert!(sh.state_not_ours(seq).unwrap().contains("changed by us, not written"));
 
         // The network's bytes written instead of ours.
         let mut sh = shadow(state, seq - 1, &log, &trigger);
-        sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).unwrap();
+        sh.propose(seq, &parent, pct, 10, drops, &txs, &keys, &deleted, None).unwrap();
         sh.commit(seq, &overlay, false);
         assert_eq!(sh.state_not_ours(seq).as_deref(), Some("the network's bytes"));
     }
@@ -2482,7 +2521,7 @@ mod tests {
         let dropped = *keys.iter().min().unwrap();
         keys.remove(&dropped);
         let mut sh = shadow(state, seq - 1, &log, &trigger);
-        let p = sh.propose(seq, &parent, pct, drops, &[tx], &keys, &deleted, None).unwrap();
+        let p = sh.propose(seq, &parent, pct, 10, drops, &[tx], &keys, &deleted, None).unwrap();
         let why = p.refusal.expect("one object the network never touched: no vouch");
         assert!(why.starts_with("keys: 1 ours only"), "{why}");
         // ws-sync writes the network's bytes instead; the mirror follows them.
@@ -2501,7 +2540,7 @@ mod tests {
         tx["metaData"]["TransactionResult"] = json!("tecUNFUNDED_PAYMENT");
         let (keys, deleted) = meta_of(&overlay);
         let mut sh = shadow(state, seq - 1, &log, &trigger);
-        let p = sh.propose(seq, &parent, pct, drops, &[tx], &keys, &deleted, None).unwrap();
+        let p = sh.propose(seq, &parent, pct, 10, drops, &[tx], &keys, &deleted, None).unwrap();
         let why = p.refusal.expect("a result that disagrees: no vouch");
         assert!(why.starts_with("result ") && why.contains("tecUNFUNDED_PAYMENT"), "{why}");
     }
@@ -2517,12 +2556,12 @@ mod tests {
         watched.push(keylet::skip_list_key());
         let before: Vec<Option<Vec<u8>>> = watched.iter().map(|k| sh.state.state_map.lookup(k).map(|b| b.to_vec())).collect();
         let txs = [tx];
-        sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).unwrap();
+        sh.propose(seq, &parent, pct, 10, drops, &txs, &keys, &deleted, None).unwrap();
         sh.abort(seq, false);
         assert_eq!(sh.at_seq, seq - 1, "nothing landed: still the parent");
         let after: Vec<Option<Vec<u8>>> = watched.iter().map(|k| sh.state.state_map.lookup(k).map(|b| b.to_vec())).collect();
         assert_eq!(after, before, "every pre-image restored, the skip list's too");
-        let p = sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).unwrap();
+        let p = sh.propose(seq, &parent, pct, 10, drops, &txs, &keys, &deleted, None).unwrap();
         assert_eq!(p.refusal, None, "a plain abort leaves the retry to us");
         assert_eq!(p.overlay, overlay, "and the retry offers the same bytes");
     }
@@ -2536,13 +2575,13 @@ mod tests {
         let mut sh = shadow(state, seq - 1, &log, &trigger);
         let (failed, patched) = (stats().writer_mismatch.load(Ordering::Relaxed), stats().writer_patched.load(Ordering::Relaxed));
         let txs = [tx];
-        sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).unwrap();
+        sh.propose(seq, &parent, pct, 10, drops, &txs, &keys, &deleted, None).unwrap();
         sh.abort(seq, true);
         assert!(stats().writer_mismatch.load(Ordering::Relaxed) > failed);
         assert!(sh.hydrated, "kept: the retry's bytes patch it (cycle 191; #107989363 cost 40 unsigned ledgers to a rebuild)");
         assert_eq!(sh.at_seq, seq - 1, "our writes undone: still the parent");
         assert_eq!(sh.distrust, Some(seq));
-        assert!(sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).is_none(), "the retry is the network's");
+        assert!(sh.propose(seq, &parent, pct, 10, drops, &txs, &keys, &deleted, None).is_none(), "the retry is the network's");
         sh.commit(seq, &overlay, false);
         assert_eq!(sh.distrust, None, "the network's write clears it");
         assert_eq!(sh.at_seq, seq, "the mirror follows the network's bytes");
@@ -2562,7 +2601,7 @@ mod tests {
         let (keys, deleted) = meta_of(&overlay);
         let mut sh = shadow(state, seq - 1, &log, &trigger);
         sh.writer_fails.push(seq - PATCH_GAP + 1);
-        sh.propose(seq, &parent, pct, drops, &[tx], &keys, &deleted, None).unwrap();
+        sh.propose(seq, &parent, pct, 10, drops, &[tx], &keys, &deleted, None).unwrap();
         sh.abort(seq, true);
         assert!(!sh.hydrated, "a stale entry the engine only read would fail again: rebuild");
         assert_eq!(sh.patching, None);
@@ -2580,7 +2619,7 @@ mod tests {
         sh.writer_fails = vec![seq - 3 * PATCH_GAP, seq - 2 * PATCH_GAP];
         assert!(!sh.writer_alarm());
         let txs = [tx];
-        sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).unwrap();
+        sh.propose(seq, &parent, pct, 10, drops, &txs, &keys, &deleted, None).unwrap();
         sh.abort(seq, true);
         assert!(sh.writer_alarm(), "{BREAKER_FAILS} failures inside {BREAKER_WINDOW} ledgers");
         assert!(sh.hydrated, "patched, not rebuilt: the last failure was {} ledgers back", 2 * PATCH_GAP);
@@ -2590,7 +2629,7 @@ mod tests {
         sh.at_seq = seq - 1;
         sh.distrust = None;
         assert!(
-            sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).is_some(),
+            sh.propose(seq, &parent, pct, 10, drops, &txs, &keys, &deleted, None).is_some(),
             "the writer stays on: no restart needed (James, 2026-10-29)"
         );
         sh.abort(seq, false);
@@ -2607,7 +2646,7 @@ mod tests {
         let mut sh = shadow(state, seq - 1, &log, &trigger);
         let bad = *overlay.keys().min().unwrap();
         sh.bad_keys.insert(bad);
-        let p = sh.propose(seq, &parent, pct, drops, &[tx], &keys, &deleted, None).unwrap();
+        let p = sh.propose(seq, &parent, pct, 10, drops, &[tx], &keys, &deleted, None).unwrap();
         let why = p.refusal.expect("a bad entry in the write set: no vouch");
         assert!(why.contains(&hex::encode_upper(bad)) && why.contains("could not load cleanly"), "{why}");
     }
@@ -2620,7 +2659,7 @@ mod tests {
         let (seq, parent, pct, drops, tx, state, overlay) = payment_ledger();
         let (keys, deleted) = meta_of(&overlay);
         let mut sh = shadow(state, seq - 1, &log, &trigger);
-        let p = sh.propose(seq, &parent, pct, drops, &[tx], &keys, &deleted, Some(&overlay)).unwrap();
+        let p = sh.propose(seq, &parent, pct, 10, drops, &[tx], &keys, &deleted, Some(&overlay)).unwrap();
         assert_eq!(p.overlay, overlay, "the offered bytes carry no plant");
         let got = lines(&log);
         assert_eq!(got.len(), 1, "{got:?}");
@@ -2653,7 +2692,7 @@ mod tests {
                 bad_overflow: false,
             })
         }));
-        assert!(sh.propose(seq, &parent, pct, drops, &[tx], &keys, &deleted, None).is_none(), "no mirror yet");
+        assert!(sh.propose(seq, &parent, pct, 10, drops, &[tx], &keys, &deleted, None).is_none(), "no mirror yet");
         sh.commit(seq, &overlay, false);
         assert_eq!(sh.pending.len(), 1, "queued behind the build");
         go.send(()).unwrap();
@@ -2714,7 +2753,7 @@ mod tests {
         let (log, trigger) = (dir.path().join("receipts.jsonl"), dir.path().join("native_shadow.canary"));
         let (seq, parent, pct, drops, tx, state, overlay) = payment_ledger();
         let mut sh = shadow(state, seq - 1, &log, &trigger);
-        sh.on_ledger(seq, &parent, pct, drops, &[tx], &overlay);
+        sh.on_ledger(seq, &parent, pct, 10, drops, &[tx], &overlay);
         assert_eq!(sh.at_seq, seq, "the ledger was applied");
         assert!(lines(&log).is_empty(), "a clean ledger leaves no receipt: {:?}", lines(&log));
     }
@@ -2727,7 +2766,7 @@ mod tests {
         let (seq, parent, pct, drops, tx, state, overlay) = payment_ledger();
         let mut sh = shadow(state, seq - 1, &log, &trigger);
         let fired = stats().canary_fired.load(Ordering::Relaxed);
-        sh.on_ledger(seq, &parent, pct, drops, &[tx], &overlay);
+        sh.on_ledger(seq, &parent, pct, 10, drops, &[tx], &overlay);
 
         let got = lines(&log);
         assert_eq!(got.len(), 1, "exactly one line, the canary's — no receipt: {got:?}");
@@ -2769,7 +2808,7 @@ mod tests {
         let (seq, parent, pct, drops, tx, state, _overlay) = payment_ledger();
         let mut sh = shadow(state, seq - 1, &log, &trigger);
         let before = stats().skipped_unverified.load(Ordering::Relaxed);
-        sh.on_ledger(seq, &parent, pct, drops, &[tx], &LedgerOverlay::new());
+        sh.on_ledger(seq, &parent, pct, 10, drops, &[tx], &LedgerOverlay::new());
         assert!(lines(&log).is_empty(), "no compare against a ledger the FFI leg did not verify: {:?}", lines(&log));
         assert!(!sh.hydrated, "the mirror is dropped; the caller re-hydrates from state.rocks");
         assert!(stats().skipped_unverified.load(Ordering::Relaxed) > before);
@@ -2782,7 +2821,7 @@ mod tests {
         std::fs::write(&trigger, b"").unwrap();
         let (seq, parent, pct, drops, _tx, state, _overlay) = payment_ledger();
         let mut sh = shadow(state, seq - 1, &log, &trigger);
-        sh.on_ledger(seq, &parent, pct, drops, &[], &LedgerOverlay::new());
+        sh.on_ledger(seq, &parent, pct, 10, drops, &[], &LedgerOverlay::new());
         assert!(lines(&log).is_empty(), "nothing to plant on, nothing written");
         assert!(trigger.exists(), "the trigger waits for the next ledger");
     }
@@ -2813,7 +2852,7 @@ mod tests {
             // The parent's total XRP: this ledger's plus the one fee it burned (task 3.4's check).
             let fee: u64 = tx["Fee"].as_str().unwrap().parse().unwrap();
             sh.totals = [(0, 0), (seq - 1, drops + fee)];
-            let p = sh.propose(seq, &parent, pct, drops, &[tx], &keys, &deleted, Some(&overlay)).unwrap();
+            let p = sh.propose(seq, &parent, pct, 10, drops, &[tx], &keys, &deleted, Some(&overlay)).unwrap();
             assert_eq!(p.refusal, None, "{mode:?}");
             assert_eq!(p.overlay, overlay, "{mode:?}: the network's post-state bytes");
             assert!(lines(&dir.path().join("native_order.jsonl")).is_empty(), "{mode:?}: nothing differed, no receipt");
@@ -2833,7 +2872,7 @@ mod tests {
         let (keys, deleted) = meta_of(&overlay);
         let mut sh = shadow(state, seq - 1, &log, &trigger);
         sh.order_mode = crate::native_order::Mode::Shadow;
-        let p = sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).unwrap();
+        let p = sh.propose(seq, &parent, pct, 10, drops, &txs, &keys, &deleted, None).unwrap();
         assert_eq!(p.refusal, None, "in shadow our order never refuses");
         assert_eq!(p.overlay, overlay, "the network order's bytes, untouched by the undone walk");
         let got = lines(&dir.path().join("native_order.jsonl"));
@@ -2856,7 +2895,7 @@ mod tests {
         let mut sh = shadow(state, seq - 1, &log, &trigger);
         sh.order_mode = crate::native_order::Mode::On;
         sh.totals = [(0, 0), (seq - 1, drops + 1_000_000)];
-        let p = sh.propose(seq, &parent, pct, drops, &[tx], &keys, &deleted, None).unwrap();
+        let p = sh.propose(seq, &parent, pct, 10, drops, &[tx], &keys, &deleted, None).unwrap();
         assert_eq!(p.refusal, None, "the total is the header's, not the state's: the state hash judges the writes");
         let got = lines(&dir.path().join("native_order.jsonl"));
         assert_eq!(got.len(), 1, "{got:?}");
@@ -2873,7 +2912,7 @@ mod tests {
         let (keys, deleted) = meta_of(&overlay);
         let mut sh = shadow(state, seq - 1, &log, &trigger);
         sh.order_mode = crate::native_order::Mode::On;
-        let p = sh.propose(seq, &parent, pct, drops, &txs, &keys, &deleted, None).unwrap();
+        let p = sh.propose(seq, &parent, pct, 10, drops, &txs, &keys, &deleted, None).unwrap();
         let why = p.refusal.expect("our order is not the network's: the network's bytes are written");
         assert!(why.starts_with("order differs at position 1"), "{why}");
         sh.commit(seq, &overlay, false);
