@@ -35,7 +35,7 @@
 //! `differs` marks the transactions where the two arms part.
 //!
 //! Input: `DIFF341_BUNDLES` = `:`-separated files or directories (searched recursively for `*.json`); default the
-//! pinned devnet vectors `tests/vectors/{vault,loan,c27}_*.json`. `DIFF341_VERBOSE=1` prints libxrpl's objects
+//! pinned devnet vectors `tests/vectors/{vault,loan,c27,c28}_*.json`. `DIFF341_VERBOSE=1` prints libxrpl's objects
 //! for every bundle where it parts from devnet. Needs `--features ffi`; one test, sequential (libxrpl's Number
 //! scale and current rules are process state).
 use serde_json::Value;
@@ -585,7 +585,7 @@ fn bundle_files() -> Vec<std::path::PathBuf> {
             collect(&dir, &mut all);
             files.extend(all.into_iter().filter(|p| {
                 let n = p.file_name().unwrap().to_string_lossy();
-                n.contains("_devnet_") && ["vault_", "loan_", "c27_"].iter().any(|pre| n.starts_with(pre))
+                n.contains("_devnet_") && ["vault_", "loan_", "c27_", "c28_"].iter().any(|pre| n.starts_with(pre))
             }));
         }
     }
