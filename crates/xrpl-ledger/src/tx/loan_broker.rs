@@ -2630,6 +2630,61 @@ mod tests {
         assert_eq!(result(&closed, &broker_delete(OWNER, &broker)), TxResult::NoAuth);
     }
 
+    /// 3.4.1's LoanBrokerDelete (fixCleanup3_5_0 off) asks only about
+    /// freezes before it pays the cover out (LoanBrokerDelete.cpp:102-121),
+    /// and accountSend does not look at authorization. An owner whose
+    /// MPToken exists but is not authorized (lsfMPTRequireAuth, the issuer
+    /// revoked it) is paid — and the generic ValidMPTTransfer invariant
+    /// (MPTInvariant.cpp:889-1020: MPT moved between two holders, one of
+    /// them unauthorized, or an issuance without lsfMPTCanTransfer) then
+    /// fails the transaction: tecINVARIANT_FAILED, the fee and nothing else.
+    /// Measured: libxrpl 3.4.1 on devnet's 88B06D2CE7DC… @7156252 with
+    /// fixCleanup3_5_0 removed (campaign 28; devnet itself, fixCleanup3_5_0
+    /// on, answered tecNO_AUTH from preclaim). By reading only: the
+    /// invariant just logs without fixCleanup3_4_0 and MPTokensV2 (:934-936),
+    /// and LoanBrokerDelete is not one of the types it lets move a
+    /// non-transferable MPT (:962-967).
+    #[test]
+    fn loan_broker_delete_paying_an_unauthorized_owner_fails_the_mpt_transfer_invariant_before_fix_cleanup_3_5_0() {
+        let build = |rules: &[&'static str], owner_flags: u64, issuance_flags: u64| {
+            let mut st = state_with(rules);
+            let (broker, _, id) = mpt_broker_with_cover(&mut st, 100);
+            let ikey = keylet::mpt_issuance_key(&id);
+            edit(&mut st, ikey, |i| i["Flags"] = json!(issuance_flags));
+            edit(&mut st, keylet::mptoken_key(&ikey, &OWNER), |t| t["Flags"] = json!(owner_flags));
+            (st, broker, id)
+        };
+        let auth_required = mpt::LSF_MPT_CAN_TRANSFER | mpt::LSF_MPT_CAN_CLAWBACK | mpt::LSF_MPT_REQUIRE_AUTH;
+        // 3.4.1: the owner's authorization revoked.
+        let (st, broker, id) = build(&MAINNET_WITH_LENDING, 0, auth_required);
+        let (r, sb) = apply(&st, &broker_delete(OWNER, &broker));
+        assert_eq!(r, TxResult::InvariantFailed, "3.4.1: paid, then refused by ValidMPTTransfer");
+        assert!(sb.exists(&broker), "a tec keeps the broker");
+        assert_eq!(holds(&sb, &OWNER, &HeldAsset::Mpt(id)).mantissa, 900, "and the cover where it was");
+        // An authorized owner is paid.
+        let (st, broker, id) = build(&MAINNET_WITH_LENDING, mpt::LSF_MPT_AUTHORIZED, auth_required);
+        let (r, sb) = apply(&st, &broker_delete(OWNER, &broker));
+        assert_eq!(r, TxResult::Success);
+        assert_eq!(holds(&sb, &OWNER, &HeldAsset::Mpt(id)).mantissa, 1000);
+        // Nothing to pay out: no transfer, no invariant.
+        let mut st = state();
+        let (broker, _, id) = mpt_broker(&mut st);
+        edit(&mut st, keylet::mpt_issuance_key(&id), |i| i["Flags"] = json!(auth_required));
+        assert_eq!(result(&st, &broker_delete(OWNER, &broker)), TxResult::Success);
+        // Without fixCleanup3_4_0 (and MPTokensV2) the invariant only logs.
+        let (st, broker, _) = build(&rules_without(&[am::FIX_CLEANUP_3_4_0]), 0, auth_required);
+        assert_eq!(result(&st, &broker_delete(OWNER, &broker)), TxResult::Success);
+        // fixCleanup3_5_0 asks in preclaim.
+        let (st, broker, _) = build(&rules_with(&[am::FIX_CLEANUP_3_5_0]), 0, auth_required);
+        assert_eq!(result(&st, &broker_delete(OWNER, &broker)), TxResult::NoAuth);
+        // An issuance that no longer transfers: the same invariant on 3.4.1;
+        // fixCleanup3_5_0 waives lsfMPTCanTransfer for this payout.
+        let (st, broker, _) = build(&MAINNET_WITH_LENDING, 0, mpt::LSF_MPT_CAN_CLAWBACK);
+        assert_eq!(result(&st, &broker_delete(OWNER, &broker)), TxResult::InvariantFailed);
+        let (st, broker, _) = build(&rules_with(&[am::FIX_CLEANUP_3_5_0]), 0, mpt::LSF_MPT_CAN_CLAWBACK);
+        assert_eq!(result(&st, &broker_delete(OWNER, &broker)), TxResult::Success);
+    }
+
     /// VaultDelete.cpp:160-162 with a LoanBroker in the vault
     /// pseudo-account's directory (LoanBrokerSet.cpp:252): an empty vault
     /// that still hosts a broker cannot be deleted; once the broker is gone
