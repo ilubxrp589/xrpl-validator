@@ -369,6 +369,8 @@ fn run() -> i32 {
             .map(Hash256)
             .unwrap_or(Hash256([0; 32]));
         let parent_close = lgr["parent_close_time"].as_u64().unwrap_or(0) as u32;
+        // The resolution of the ledger being replayed (OracleSet and LoanSet read parent close + this).
+        let close_time_resolution = lgr["close_time_resolution"].as_u64().filter(|r| *r != 0).unwrap_or(10) as u8;
         let total_coins = lgr["total_coins"]
             .as_str()
             .and_then(|s| s.parse().ok())
@@ -381,7 +383,7 @@ fn run() -> i32 {
             account_hash: Hash256([0; 32]),
             parent_close_time: parent_close,
             close_time: parent_close,
-            close_time_resolution: 10,
+            close_time_resolution,
             close_flags: 0,
         };
 

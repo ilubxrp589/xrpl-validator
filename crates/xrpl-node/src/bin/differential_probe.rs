@@ -2835,6 +2835,7 @@ fn run_shadow(pre: &LedgerState, store: &str, seq: u32, rpc_url: &str) {
     let keys: HashSet<[u8; 32]> = modified.union(&deleted).copied().collect();
     let parent_hash: [u8; 32] = ledger["parent_hash"].as_str().and_then(|h| hex::decode(h).ok()).and_then(|b| b.try_into().ok()).unwrap_or([0; 32]);
     let pct = ledger["parent_close_time"].as_u64().unwrap_or(0) as u32;
+    let resolution = ledger["close_time_resolution"].as_u64().filter(|r| *r != 0).unwrap_or(10) as u8;
     let drops = total(&ledger).unwrap_or(0);
     let dir = std::env::temp_dir().join(format!("dx-shadow-{seq}-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
@@ -2853,7 +2854,7 @@ fn run_shadow(pre: &LedgerState, store: &str, seq: u32, rpc_url: &str) {
         let log = dir.join(format!("{mode:?}.jsonl"));
         let mut sh = xrpl_node::native_shadow::NativeShadow::replay(pre.clone(), seq - 1, mode, log.clone(), parent_total);
         let t0 = std::time::Instant::now();
-        let Some(p) = sh.propose(seq, &parent_hash, pct, 10, drops, &txs, &keys, &deleted, None) else {
+        let Some(p) = sh.propose(seq, &parent_hash, pct, resolution, drops, &txs, &keys, &deleted, None) else {
             eprintln!("SHADOW #{seq} {mode:?}: no proposal");
             continue;
         };

@@ -921,13 +921,24 @@ impl NativeShadow {
         seq: u32,
         parent_hash: &[u8; 32],
         parent_close_time: u32,
-        _close_resolution: u8,
+        close_resolution: u8,
         total_drops: u64,
         ordered: &[&Value],
     ) -> Applied {
         // The engine reads the BASE header: sequence/close_time of the PARENT
         // ledger (BookStep streams price expiry off sb.parentCloseTime) —
-        // byte-identical recipe to state_replay's per-ledger header.
+        // byte-identical recipe to state_replay's per-ledger header. The
+        // resolution is the one field that is ledger `seq`'s OWN: rippled
+        // applies a ledger's transactions with header().closeTime = the
+        // parent's close time + the new ledger's resolution (Ledger.cpp:262-278),
+        // which OracleSet and LoanSet read (`LedgerHeader::building_close_time`).
+        // A header that carried none (0 is no resolution) gets the usual 10.
+        let close_time_resolution = if close_resolution == 0 {
+            eprintln!("[native-shadow] #{seq}: the header carries no close-time resolution — using 10");
+            10
+        } else {
+            close_resolution
+        };
         self.state.header = LedgerHeader {
             sequence: seq - 1,
             total_coins: total_drops,
@@ -936,7 +947,7 @@ impl NativeShadow {
             account_hash: Hash256([0; 32]),
             parent_close_time,
             close_time: parent_close_time,
-            close_time_resolution: 10,
+            close_time_resolution,
             close_flags: 0,
         };
         let parent_hash_hex = hex::encode_upper(parent_hash);
