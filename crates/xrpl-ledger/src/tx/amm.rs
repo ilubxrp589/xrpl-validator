@@ -3266,17 +3266,23 @@ mod vote_weight_tests {
 
     /// `static_cast<std::int64_t>(Number(lpTokens) * kVoteWeightScaleFactor / lptAMMBalance)` rounds TWICE: the
     /// division to a Number (sixteen digits and the remainder discarded at the Small scale, Number.cpp:1185-1363),
-    /// then `operator rep()` to an integer, an exact half going to even (Number.cpp:1366-1392). 0.00001 LP tokens of
-    /// 1.999999999999999 is a weight of 0.50000000000000025: the Small quotient is 0.5000000000000000 and the
-    /// integer 0; the exact quotient rounded once is 1. At Large330 the quotient keeps the 25 and the weight is 1.
+    /// then `operator rep()` to an integer, an exact half going to even (Number.cpp:1366-1392). 0.2469300000000001
+    /// LP tokens of 2 is a weight of 12346.500000000005: the Small quotient is 12346.50000000000 and the integer
+    /// 12346 (the tie goes to even); the exact quotient rounded once is 12347. At Large330 the quotient keeps the
+    /// 5 and the weight is 12347.
+    ///
+    /// (The first form of this test, in the RED commit, used 0.00001 of 1.999999999999999 and expected 0 at Small.
+    /// That was a miscalculation: 0.50000000000000025 keeps its sixteenth digit, 0.5000000000000002, and is 1 by
+    /// either rule. The pair below does separate the two rules: the engine before the fix answers 12347 at Small.)
     #[test]
     fn a_vote_weight_is_the_integer_of_the_rounded_number_quotient() {
-        let (lp, lpt): (crate::tx::offer::Me, crate::tx::offer::Me) = ((1, -5), (1_999_999_999_999_999, -15));
+        let (lp, lpt): (crate::tx::offer::Me, crate::tx::offer::Me) = ((2_469_300_000_000_001, -16), (2, 0));
         assert_eq!(vote_weight((25, 0), (100, 0)), 25_000);
         assert_eq!(vote_weight((1, 0), (3, 0)), 33_333);
-        assert_eq!(vote_weight(lp, lpt), 0, "Small: the quotient is exactly one half as a Number");
+        assert_eq!(vote_weight((1, -5), (1_999_999_999_999_999, -15)), 1);
+        assert_eq!(vote_weight(lp, lpt), 12_346, "Small: the quotient is exactly 12346.5 as a Number, to even");
         let _scale = ScaleGuard::new(MantissaScale::Large330);
-        assert_eq!(vote_weight(lp, lpt), 1, "Large330: the quotient keeps its nineteenth digit");
+        assert_eq!(vote_weight(lp, lpt), 12_347, "Large330: the quotient keeps its nineteenth digit");
     }
 }
 
