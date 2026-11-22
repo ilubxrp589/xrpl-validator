@@ -3065,26 +3065,7 @@ impl Transactor for AMMVoteTransactor {
                 None => (0, 0),
             }
         };
-        // VoteWeight = lp × 100000 / lptAMM, exact i128, Number half-even.
-        let weight_of = |lp: crate::tx::offer::Me| -> u64 {
-            if lp.0 == 0 {
-                return 0;
-            }
-            let (mut num, mut den) = (lp.0 as i128 * 100_000, lpt_amm.0 as i128);
-            let mut d = lp.1 - lpt_amm.1;
-            while d > 0 {
-                num *= 10;
-                d -= 1;
-            }
-            while d < 0 {
-                den *= 10;
-                d += 1;
-            }
-            let q = num / den;
-            let r = num % den;
-            let q = if 2 * r > den || (2 * r == den && q % 2 == 1) { q + 1 } else { q };
-            q as u64
-        };
+        let weight_of = |lp: crate::tx::offer::Me| -> u64 { vote_weight(lp, lpt_amm) };
         // Finding 49 (#106678645, XPM/XRP AMMVote): the loop below is
         // applyVote ported line-for-line. The old form dropped every entry
         // whose ROUNDED weight was zero (rippled drops only holders whose LP
@@ -3230,6 +3211,49 @@ impl Transactor for AMMVoteTransactor {
         let _ = amm_acct;
         crate::tx::offer::put_json(sandbox, amm_key, &amm);
         TxResult::Success
+    }
+}
+
+/// A vote slot's `VoteWeight` for a holder of `lp` of the pool's `lpt_amm` LP tokens (AMMVote.cpp:124-126, :151-154).
+// VoteWeight = lp × 100000 / lptAMM, exact i128, Number half-even.
+fn vote_weight(lp: crate::tx::offer::Me, lpt_amm: crate::tx::offer::Me) -> u64 {
+    if lp.0 == 0 {
+        return 0;
+    }
+    let (mut num, mut den) = (lp.0 as i128 * 100_000, lpt_amm.0 as i128);
+    let mut d = lp.1 - lpt_amm.1;
+    while d > 0 {
+        num *= 10;
+        d -= 1;
+    }
+    while d < 0 {
+        den *= 10;
+        d += 1;
+    }
+    let q = num / den;
+    let r = num % den;
+    let q = if 2 * r > den || (2 * r == den && q % 2 == 1) { q + 1 } else { q };
+    q as u64
+}
+
+#[cfg(test)]
+mod vote_weight_tests {
+    use super::*;
+    use crate::tx::number::{MantissaScale, ScaleGuard};
+
+    /// `static_cast<std::int64_t>(Number(lpTokens) * kVoteWeightScaleFactor / lptAMMBalance)` rounds TWICE: the
+    /// division to a Number (sixteen digits and the remainder discarded at the Small scale, Number.cpp:1185-1363),
+    /// then `operator rep()` to an integer, an exact half going to even (Number.cpp:1366-1392). 0.00001 LP tokens of
+    /// 1.999999999999999 is a weight of 0.50000000000000025: the Small quotient is 0.5000000000000000 and the
+    /// integer 0; the exact quotient rounded once is 1. At Large330 the quotient keeps the 25 and the weight is 1.
+    #[test]
+    fn a_vote_weight_is_the_integer_of_the_rounded_number_quotient() {
+        let (lp, lpt): (crate::tx::offer::Me, crate::tx::offer::Me) = ((1, -5), (1_999_999_999_999_999, -15));
+        assert_eq!(vote_weight((25, 0), (100, 0)), 25_000);
+        assert_eq!(vote_weight((1, 0), (3, 0)), 33_333);
+        assert_eq!(vote_weight(lp, lpt), 0, "Small: the quotient is exactly one half as a Number");
+        let _scale = ScaleGuard::new(MantissaScale::Large330);
+        assert_eq!(vote_weight(lp, lpt), 1, "Large330: the quotient keeps its nineteenth digit");
     }
 }
 
