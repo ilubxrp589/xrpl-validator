@@ -215,6 +215,16 @@ fn batch_changes(
                     }
                     own.insert(k, SandboxEntry::Deleted);
                 }
+                // Erased and written again by this inner with no threading of its own: a fresh SLE to rippled
+                // (ApplyStateTable::insert over an erased item), which `threadItem` then finds unthreaded, so the
+                // ModifiedNode names no PreviousTxnID. Where the sandbox held the object unthreaded too (an earlier
+                // inner created it) `restamp` could not tell it from one modified in place and gave it that inner's
+                // stamp: Step 2 receipt #108499447 A8B4782985AB, an owner directory root an NFTokenAcceptOffer
+                // inner emptied (its sell offer) and filled again (a new trust line). Different from the view even
+                // when the content is the same, as the view's copy is threaded.
+                (Some(_), Some(a)) if v.recreated.contains(&k) && threading(&a).is_none() => {
+                    own.insert(k, SandboxEntry::Modified(a));
+                }
                 (Some(b), Some(a)) if !semantically_equal(&b, &a) => {
                     own.insert(k, SandboxEntry::Modified(restamp(&k, &b, a)));
                 }

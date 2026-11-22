@@ -94,6 +94,11 @@ pub struct Sandbox<'a> {
     /// consumed and then deleted shows the consumed amounts. Kept beside the modifications rather than
     /// inside `SandboxEntry::Deleted`, so snapshots stay as they are; the last deletion of a key wins.
     deleted_final: HashMap<Hash256, Vec<u8>>,
+    /// Keys deleted since the last [`Self::erased_begin`], for a Batch inner's record: a key erased and then
+    /// written again is a FRESH object to rippled (ApplyStateTable::insert over an erased item), and the
+    /// modifications alone cannot show that. `restore_snapshot` drops the keys whose entry it changes, so a
+    /// deletion a rollback undid is not reported.
+    erased: Vec<Hash256>,
 }
 
 impl<'a> Sandbox<'a> {
@@ -103,6 +108,7 @@ impl<'a> Sandbox<'a> {
             base,
             modifications: HashMap::new(),
             deleted_final: HashMap::new(),
+            erased: Vec::new(),
         }
     }
 
@@ -187,6 +193,7 @@ impl<'a> Sandbox<'a> {
             // created version's). A single transaction's `into_changes` drops it, as the key has no modification.
             if let Some(SandboxEntry::Created(last)) = self.modifications.remove(&key) {
                 self.deleted_final.insert(key, last);
+                self.erased.push(key);
             }
         } else {
             // Read without the read log: the delete is not a read of the transactor's.
@@ -197,6 +204,7 @@ impl<'a> Sandbox<'a> {
             };
             if let Some(last) = last {
                 self.deleted_final.insert(key, last);
+                self.erased.push(key);
             }
             self.modifications.insert(key, SandboxEntry::Deleted);
         }
@@ -228,7 +236,32 @@ impl<'a> Sandbox<'a> {
     ///
     /// Any modifications made after the snapshot was taken are discarded.
     pub fn restore_snapshot(&mut self, snapshot: HashMap<Hash256, SandboxEntry>) {
+        // A logged deletion is kept only where the rollback leaves the key's entry as it is: where the entry
+        // changes, the deletion may be among what is undone (or the object was touched after it), and the
+        // record then falls back to reading the object as modified in place.
+        let same = |a: Option<&SandboxEntry>, b: Option<&SandboxEntry>| match (a, b) {
+            (None, None) | (Some(SandboxEntry::Deleted), Some(SandboxEntry::Deleted)) => true,
+            (Some(SandboxEntry::Created(x)), Some(SandboxEntry::Created(y)))
+            | (Some(SandboxEntry::Modified(x)), Some(SandboxEntry::Modified(y))) => x == y,
+            _ => false,
+        };
+        let now = &self.modifications;
+        self.erased.retain(|k| same(now.get(k), snapshot.get(k)));
         self.modifications = snapshot;
+    }
+
+    /// Start a new log of deletions (a Batch calls it before each inner).
+    pub fn erased_begin(&mut self) {
+        self.erased.clear();
+    }
+
+    /// The keys deleted since [`Self::erased_begin`] that hold an object again: erased, then written anew.
+    pub fn recreated(&self) -> HashSet<Hash256> {
+        self.erased
+            .iter()
+            .filter(|k| matches!(self.modifications.get(*k), Some(SandboxEntry::Created(_)) | Some(SandboxEntry::Modified(_))))
+            .copied()
+            .collect()
     }
 
     /// Extract all modifications, consuming the sandbox.
@@ -239,7 +272,7 @@ impl<'a> Sandbox<'a> {
 
     /// [`Self::into_modifications`], plus what a transaction's metadata also needs (independence task 2.2).
     pub fn into_changes(self) -> SandboxChanges {
-        let Sandbox { base, modifications, mut deleted_final } = self;
+        let Sandbox { base, modifications, mut deleted_final, .. } = self;
         let (mods, unchanged) = Self::changed_only(base, modifications);
         deleted_final.retain(|k, _| matches!(mods.get(k), Some(SandboxEntry::Deleted)));
         SandboxChanges { mods, deleted_final, unchanged }
@@ -450,6 +483,54 @@ mod tests {
         let SandboxChanges { mods: m, deleted_final: finals, .. } = sb.into_changes();
         assert!(m.get(&fresh).is_none());
         assert!(finals.is_empty());
+    }
+
+    #[test]
+    fn a_key_erased_and_written_again_is_reported_as_recreated() {
+        // Step 2 receipt #108499447: a Batch inner emptied an owner directory root an earlier inner had
+        // created (erase) and filled it again (insert).
+        let mut state = test_state();
+        let (in_base, made_here, only_deleted, in_place) = (key(1), key(2), key(3), key(4));
+        for k in [in_base, only_deleted, in_place] {
+            state.state_map.insert(k, br#"{"v":1}"#.to_vec()).unwrap();
+        }
+        let mut sb = Sandbox::new(&state);
+        sb.write(made_here, br#"{"v":2}"#.to_vec());
+        sb.delete(in_base); // before the log starts: an earlier inner's
+        sb.write(in_base, br#"{"v":9}"#.to_vec());
+        sb.erased_begin();
+        assert!(sb.recreated().is_empty());
+        sb.delete(in_base);
+        sb.write(in_base, br#"{"v":10}"#.to_vec());
+        sb.delete(made_here);
+        sb.write(made_here, br#"{"v":20}"#.to_vec());
+        sb.delete(only_deleted);
+        sb.write(in_place, br#"{"v":40}"#.to_vec());
+        assert_eq!(sb.recreated(), HashSet::from([in_base, made_here]));
+        sb.erased_begin();
+        assert!(sb.recreated().is_empty(), "the next inner starts clean");
+    }
+
+    #[test]
+    fn a_deletion_a_rollback_undid_is_not_reported_as_recreated() {
+        let state = test_state();
+        let k = key(2);
+        let mut sb = Sandbox::new(&state);
+        sb.write(k, br#"{"v":2}"#.to_vec());
+        sb.erased_begin();
+        let snap = sb.snapshot();
+        sb.delete(k);
+        sb.write(k, br#"{"v":3}"#.to_vec());
+        sb.restore_snapshot(snap); // the attempt is rolled back
+        sb.write(k, br#"{"v":4}"#.to_vec()); // then the object is modified in place
+        assert!(sb.recreated().is_empty());
+        // A rollback that leaves the key alone keeps the report.
+        sb.delete(k);
+        sb.write(k, br#"{"v":5}"#.to_vec());
+        let snap = sb.snapshot();
+        sb.write(key(7), br#"{"v":7}"#.to_vec());
+        sb.restore_snapshot(snap);
+        assert_eq!(sb.recreated(), HashSet::from([k]));
     }
 
     #[test]

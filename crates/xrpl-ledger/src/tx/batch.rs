@@ -581,6 +581,7 @@ impl Transactor for BatchTransactor {
                 f.fields["hash"] = Value::String(id);
             }
             let before = sandbox.snapshot();
+            sandbox.erased_begin();
             let _ = crate::tx::take_delivered();
             let (r, _applied) = apply_on_sandbox(&f, sandbox);
             let delivered = crate::tx::take_delivered().filter(|_| r.is_success());
@@ -588,6 +589,7 @@ impl Transactor for BatchTransactor {
             // its leaves binary behind a `leaf_decoder`.
             let base = |k: &Hash256| sandbox.base().read_json(k);
             let after = sandbox.snapshot();
+            let recreated = sandbox.recreated();
             let t = touched_keys(&before, &after, &base);
             let deleted_final = t
                 .iter()
@@ -597,7 +599,7 @@ impl Transactor for BatchTransactor {
                 })
                 .collect();
             touched.push(t);
-            views.inners.push(InnerView { before, after, deleted_final, delivered, recreated: HashSet::new() });
+            views.inners.push(InnerView { before, after, deleted_final, delivered, recreated });
             // An AllOrNothing revert clears `results`, so the inner that sank
             // the batch is otherwise invisible to every caller.
             if std::env::var("DX_BATCH").is_ok() {
