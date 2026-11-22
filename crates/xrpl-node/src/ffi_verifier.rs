@@ -36,9 +36,33 @@ use std::any::Any;
 use std::sync::Arc;
 
 use crate::ffi_engine::{
-    amendments_in_object, amendments_object_key, apply_ledger_in_order_with_net, fetch_amendments_at, fetch_mainnet_amendments, new_stats,
+    amendments_in_object, amendments_object_key, apply_ledger_in_order_with_net, fetch_amendments_within, fetch_mainnet_amendments, new_stats,
     DivergenceLog, FfiStats, LedgerOverlay, NetParams, OwnedSnapshot, SharedFfiStats,
 };
+
+/// The longest the RPC catch-up path waits for the parent's Amendments object (one `ledger_entry`, one try).
+///
+/// The read is the first thing the libxrpl leg of a ledger does; the apply, which on this path reads every
+/// object over RPC, comes after it, and under the native writer ws-sync gives the two together 3 s
+/// (`tokio::time::timeout(Duration::from_secs(3), task)` around the verify task in ws_sync.rs) before the ledger
+/// goes uncompared. Half a second leaves the apply five sixths of that when the endpoint is silent. It is not
+/// tight for a live endpoint: ws-sync counts a whole-ledger request at ~50 ms ("Saves ~50ms per ledger", the
+/// tx_blobs fetch) and retries its own per-key `ledger_entry` reads 50 ms apart, so this allows ten times that
+/// for one small object. A read that fails costs nothing but the wait: the last known set stays in force and the
+/// next ledger asks again.
+pub const AMENDMENT_READ_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The amendment set the verifier holds, and what it knows about where that set is the chain's.
+struct KnownAmendments {
+    /// The set last read from a parent ledger's Amendments object (at start: the one loaded then). What a ledger
+    /// falls back to when its own read yields nothing.
+    set: Vec<[u8; 32]>,
+    /// RPC catch-up path only: ledgers `lo..=hi` whose Amendments object is known to hold `set` as its enabled
+    /// list. It starts at a successful read (`lo = hi =` the ledger read at) and `note_ledger` moves `hi` over
+    /// each next ledger that carries no EnableAmendment. A ledger whose parent lies inside is handed `set` with
+    /// no read. None: nothing vouched for (at start, and after another path replaced the set).
+    vouched: Option<(u32, u32)>,
+}
 
 /// FFI-based per-ledger tx verifier. Send + Sync, cheap to `Arc`-clone.
 pub struct FfiVerifier {
@@ -46,9 +70,12 @@ pub struct FfiVerifier {
     rpc_urls: Vec<String>,
     /// Independence Step 4: with peers as the ledger source, the amendments come from our own state, not RPC.
     state_db: Option<Arc<rocksdb::DB>>,
-    /// The amendment set last read from a parent ledger's Amendments object (at start: the one loaded then). Each
-    /// ledger reads its own (`ledger_amendments`); this is what a ledger falls back to when its read yields nothing.
-    amendments: parking_lot::RwLock<Vec<[u8; 32]>>,
+    /// The amendment set last read from a parent ledger's Amendments object. Each ledger gets its own from
+    /// `ledger_amendments`.
+    amendments: parking_lot::RwLock<KnownAmendments>,
+    /// The RPC catch-up path's last read of the Amendments object failed: its log line is written once, not per
+    /// ledger, until a read succeeds.
+    rpc_read_failing: std::sync::atomic::AtomicBool,
     divergence_log: Arc<DivergenceLog>,
     /// Separate log for `tec*`/`tesSUCCESS` divergences — cases the main
     /// `divergence_log` skips because libxrpl returned a "claimed" or
@@ -92,7 +119,8 @@ impl FfiVerifier {
             stats: new_stats(),
             rpc_urls,
             state_db,
-            amendments: parking_lot::RwLock::new(amendments),
+            amendments: parking_lot::RwLock::new(KnownAmendments { set: amendments, vouched: None }),
+            rpc_read_failing: std::sync::atomic::AtomicBool::new(false),
             divergence_log: Arc::new(DivergenceLog::new()),
             silent_divergence_log: Arc::new(DivergenceLog::with_path(silent_path)),
             mutation_divergence_log: Arc::new(DivergenceLog::with_path(mutation_path)),
@@ -108,30 +136,61 @@ impl FfiVerifier {
     /// - `snapshot`, when the caller verifies on one: it is the pre-ledger state, so its object is the parent's;
     /// - otherwise our own state as it stands, when peers are the ledger source (no RPC in that mode; the state
     ///   is not pinned to the parent there, as the rest of that path's reads are not);
-    /// - otherwise `ledger_entry` at `ledger_seq - 1` on the first RPC endpoint (the same ledger the RPC path
-    ///   reads every other object at), three tries.
+    /// - otherwise (the RPC catch-up path) `ledger_entry` at `ledger_seq - 1` on the first RPC endpoint (the same
+    ///   ledger the RPC path reads every other object at) — but only when the object can have changed since the
+    ///   set held was read. The enabled list is rewritten by an EnableAmendment pseudo-transaction and by nothing
+    ///   else (Change::applyAmendment), and ws-sync reports every ledger it reads (`note_ledger`), so a ledger
+    ///   whose parent is covered by that record is handed the set held with no request at all. When a read is
+    ///   needed (the first ledger, the ledger after a change, a gap in what ws-sync reported) it is one try that
+    ///   returns within [`AMENDMENT_READ_BUDGET`].
     ///
-    /// A source that yields no enabled amendment (object absent or unreadable, RPC failed) leaves the last set
-    /// known in force: an empty Rules would turn every amendment-gated transaction into a divergence.
+    /// A source that yields no enabled amendment (object absent or unreadable, RPC failed or too slow) leaves the
+    /// last set known in force: an empty Rules would turn every amendment-gated transaction into a divergence.
+    /// On the RPC path that is logged once until a read succeeds, and nothing is vouched for, so the next ledger
+    /// asks again.
     ///
     /// SCOPING: this covers amendments the linked libxrpl already implements. One introduced by a newer rippled
     /// still needs the rebuild: an id cannot supply engine semantics.
     pub fn ledger_amendments(&self, ledger_seq: u32, snapshot: Option<&OwnedSnapshot>) -> Vec<[u8; 32]> {
-        let read = match (snapshot, &self.state_db) {
-            (Some(snap), _) => snap
-                .get(&amendments_object_key())
-                .ok()
-                .flatten()
-                .map(|bytes| amendments_in_object(&bytes))
-                .unwrap_or_default(),
-            (None, Some(db)) => crate::ffi_engine::amendments_from_state(db),
-            (None, None) => fetch_amendments_at(&self.rpc_urls[0], &ledger_seq.saturating_sub(1).to_string(), 3),
+        use std::sync::atomic::Ordering;
+        let parent = ledger_seq.saturating_sub(1);
+        let (read, over_rpc) = match (snapshot, &self.state_db) {
+            (Some(snap), _) => (
+                snap.get(&amendments_object_key())
+                    .ok()
+                    .flatten()
+                    .map(|bytes| amendments_in_object(&bytes))
+                    .unwrap_or_default(),
+                false,
+            ),
+            (None, Some(db)) => (crate::ffi_engine::amendments_from_state(db), false),
+            (None, None) => {
+                {
+                    let known = self.amendments.read();
+                    if known.vouched.is_some_and(|(lo, hi)| (lo..=hi).contains(&parent)) {
+                        return known.set.clone();
+                    }
+                }
+                (fetch_amendments_within(&self.rpc_urls[0], &parent.to_string(), AMENDMENT_READ_BUDGET), true)
+            }
         };
         if read.is_empty() {
-            eprintln!("[ffi-amendments] #{ledger_seq}: no enabled amendments readable from the parent state — keeping the last known set");
-            return self.amendments.read().clone();
+            if !over_rpc {
+                eprintln!("[ffi-amendments] #{ledger_seq}: no enabled amendments readable from the parent state — keeping the last known set");
+            } else if !self.rpc_read_failing.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[ffi-amendments] #{ledger_seq}: the Amendments object at #{parent} was not read from {} within {} ms — keeping the last known set, and asking again each ledger (this line is not repeated until a read succeeds)",
+                    self.rpc_urls[0],
+                    AMENDMENT_READ_BUDGET.as_millis(),
+                );
+            }
+            return self.amendments.read().set.clone();
         }
-        let delta = crate::amendments::diff_amendment_sets(&self.amendments.read(), &read);
+        if over_rpc && self.rpc_read_failing.swap(false, Ordering::Relaxed) {
+            eprintln!("[ffi-amendments] #{ledger_seq}: the Amendments object is readable again (at #{parent})");
+        }
+        let mut known = self.amendments.write();
+        let delta = crate::amendments::diff_amendment_sets(&known.set, &read);
         if !delta.is_empty() {
             eprintln!(
                 "[ffi-amendments] #{ledger_seq}: the parent's enabled set differs from the last one used — {} added, {} removed",
@@ -144,14 +203,33 @@ impl FfiVerifier {
             for a in &delta.removed {
                 eprintln!("[ffi-amendments]   - {}", hex::encode_upper(a));
             }
-            *self.amendments.write() = read.clone();
+            known.set = read.clone();
+            // A snapshot (or our own state) may trail the parent by a ledger or two, so it vouches for no
+            // particular ledger; and what the RPC path vouched for was the set just replaced.
+            known.vouched = None;
+        }
+        if over_rpc {
+            known.vouched = Some((parent, parent));
         }
         read
     }
 
     /// ws-sync's word on a ledger it has read: whether it carries an EnableAmendment pseudo-transaction, the only
-    /// thing that rewrites the Amendments object. (The seam only: nothing is done with it yet.)
-    pub fn note_ledger(&self, _ledger_seq: u32, _changes_amendments: bool) {}
+    /// thing that rewrites the Amendments object's enabled list. (The verifier cannot see this for itself: its tx
+    /// blobs come without the pseudo-transactions.) A ledger that carries none leaves the list as its parent had
+    /// it, so where the parent is the newest ledger vouched for, this one is vouched for too. One that carries a
+    /// change is not, and neither is anything past a ledger never reported: the RPC catch-up path then reads.
+    pub fn note_ledger(&self, ledger_seq: u32, changes_amendments: bool) {
+        if changes_amendments {
+            return;
+        }
+        let mut known = self.amendments.write();
+        if let Some((lo, hi)) = known.vouched {
+            if hi.checked_add(1) == Some(ledger_seq) {
+                known.vouched = Some((lo, ledger_seq));
+            }
+        }
+    }
 
     /// Apply and verify every tx in a ledger, in `TransactionIndex` order,
     /// against mainnet's recorded TER via libxrpl. Blocking — call from a

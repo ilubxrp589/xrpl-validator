@@ -414,6 +414,16 @@ pub async fn start_ws_sync(
                             }
                         }
                     }
+                    // The libxrpl leg's amendment set: tell the verifier about every ledger read here, compared or not,
+                    // so its RPC catch-up path asks the endpoint for the Amendments object only past a ledger that can
+                    // have rewritten it (or past one never read). A held ledger is reported again when re-driven: the
+                    // same fact twice.
+                    #[cfg(feature = "ffi")]
+                    if meta_ok {
+                        if let Some(ref verifier) = ffi_verifier {
+                            verifier.note_ledger(process_seq, carries_amendment_change(&sorted_txs));
+                        }
+                    }
                     // Include protocol-level singletons BEFORE FFI shadow hash
                     // so the shadow overlay covers ALL state changes.
                     if meta_ok {
@@ -1448,6 +1458,15 @@ fn is_pseudo_tx_blob(bytes: &[u8]) -> bool {
     bytes.len() >= 3 && bytes[0] == 0x12 && PSEUDO_TX_TYPES.contains(&u16::from_be_bytes([bytes[1], bytes[2]]))
 }
 
+/// Whether a ledger's transactions (expanded JSON, pseudo-transactions included) hold an EnableAmendment: the one
+/// transaction that rewrites the Amendments object (Change::applyAmendment). Its majority-gained and majority-lost
+/// forms rewrite the object's Majorities and leave the enabled list alone; they count too, which costs the libxrpl
+/// leg one spare read and never a missed change.
+#[cfg(feature = "ffi")]
+fn carries_amendment_change(sorted_txs: &[serde_json::Value]) -> bool {
+    sorted_txs.iter().any(|tx| tx["TransactionType"].as_str() == Some("EnableAmendment"))
+}
+
 /// Fetch binary tx_blobs for every tx in the ledger, sorted by TransactionIndex.
 /// Used only when FFI verification is enabled — adds one extra RPC per ledger.
 /// Returns an empty Vec on error (FFI verification skipped for this ledger).
@@ -2216,6 +2235,18 @@ mod tests {
             assert!(!is_pseudo_tx_blob(&blob), "type {tt}");
         }
         assert!(!is_pseudo_tx_blob(&[0x12, 0x00]), "too short to name a type");
+    }
+
+    #[test]
+    fn a_ledger_with_an_enable_amendment_is_reported_as_changing_the_amendments() {
+        let payment = serde_json::json!({"TransactionType": "Payment", "hash": "AA", "metaData": {"TransactionResult": "tesSUCCESS"}});
+        let set_fee = serde_json::json!({"TransactionType": "SetFee", "hash": "BB"});
+        let enable = serde_json::json!({"TransactionType": "EnableAmendment", "hash": "CC", "Amendment": "DD".repeat(32)});
+        let got_majority = serde_json::json!({"TransactionType": "EnableAmendment", "hash": "EE", "Flags": 65536, "Amendment": "DD".repeat(32)});
+        assert!(!carries_amendment_change(&[]));
+        assert!(!carries_amendment_change(&[payment.clone(), set_fee.clone()]), "a flag ledger's SetFee is no amendment change");
+        assert!(carries_amendment_change(&[payment.clone(), enable]));
+        assert!(carries_amendment_change(&[got_majority, payment]), "a majority change counts: one spare read, never a missed change");
     }
 
     fn key_hex_for(seed: u8) -> String {

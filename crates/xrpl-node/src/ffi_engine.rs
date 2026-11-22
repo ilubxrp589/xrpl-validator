@@ -120,57 +120,85 @@ pub fn fetch_amendments_at(rpc_url: &str, ledger_index: &str, attempts: u32) -> 
             std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
             backoff_ms = (backoff_ms * 2).min(8000);
         }
-        // Amendments singleton keylet
-        let resp = match client
-            .post(rpc_url)
-            .json(&serde_json::json!({
-                "method": "ledger_entry",
-                "params": [{
-                    "index": "7DB0788C020F02780A673DC74757F23823FA3014C1866E72CC4CD8B226CD6EF4",
-                    "ledger_index": ledger_index,
-                    "binary": false
-                }]
-            }))
-            .send()
-        {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let body_text = match resp.text() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        let tt = body_text.trim();
-        if tt.starts_with("Server is overloaded") || tt.starts_with("Server too busy") {
-            continue;
+        // None: no usable reply (most likely rippled returned an error) — retry
+        if let Some(out) = amendments_request(&client, rpc_url, ledger_index) {
+            return out;
         }
-        let body: serde_json::Value = match serde_json::from_str(&body_text) {
-            Ok(b) => b,
-            Err(_) => continue,
+    }
+    Vec::new()
+}
+
+/// One try of [`fetch_amendments_at`] that returns within `budget` whatever the endpoint does (empty when it has
+/// not answered by then). The request runs on a thread of its own and the caller waits on a channel: reqwest's
+/// blocking timeout bounds the wait for the reply and each read of its body, not the whole exchange, so a reply
+/// that trickles in could outlast it. A thread left behind ends on that same timeout.
+pub fn fetch_amendments_within(rpc_url: &str, ledger_index: &str, budget: std::time::Duration) -> Vec<[u8; 32]> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (rpc_url, ledger_index) = (rpc_url.to_string(), ledger_index.to_string());
+    let spawned = std::thread::Builder::new().name("ffi-amendments".into()).spawn(move || {
+        let out = match reqwest::blocking::Client::builder().timeout(budget).build() {
+            Ok(client) => amendments_request(&client, &rpc_url, &ledger_index).unwrap_or_default(),
+            Err(_) => Vec::new(),
         };
-        let empty = Vec::new();
-        let amendments = body["result"]["node"]["Amendments"]
-            .as_array()
-            .unwrap_or(&empty);
-        if amendments.is_empty() {
-            // Most likely rippled returned an error — retry
-            continue;
-        }
-        let mut out = Vec::with_capacity(amendments.len());
-        for a in amendments {
-            if let Some(hex_str) = a.as_str() {
-                if let Ok(bytes) = hex::decode(hex_str) {
-                    if bytes.len() == 32 {
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&bytes);
-                        out.push(arr);
-                    }
+        let _ = tx.send(out);
+    });
+    if spawned.is_err() {
+        return Vec::new();
+    }
+    rx.recv_timeout(budget).unwrap_or_default()
+}
+
+/// One `ledger_entry` request for the Amendments object at `ledger_index`: the ids of its enabled list, or None
+/// on any failure (no reply, an overloaded server, an error reply, no list or an empty one).
+fn amendments_request(client: &reqwest::blocking::Client, rpc_url: &str, ledger_index: &str) -> Option<Vec<[u8; 32]>> {
+    // Amendments singleton keylet
+    let resp = match client
+        .post(rpc_url)
+        .json(&serde_json::json!({
+            "method": "ledger_entry",
+            "params": [{
+                "index": "7DB0788C020F02780A673DC74757F23823FA3014C1866E72CC4CD8B226CD6EF4",
+                "ledger_index": ledger_index,
+                "binary": false
+            }]
+        }))
+        .send()
+    {
+        Ok(r) => r,
+        Err(_) => return None,
+    };
+    let body_text = match resp.text() {
+        Ok(t) => t,
+        Err(_) => return None,
+    };
+    let tt = body_text.trim();
+    if tt.starts_with("Server is overloaded") || tt.starts_with("Server too busy") {
+        return None;
+    }
+    let body: serde_json::Value = match serde_json::from_str(&body_text) {
+        Ok(b) => b,
+        Err(_) => return None,
+    };
+    let empty = Vec::new();
+    let amendments = body["result"]["node"]["Amendments"]
+        .as_array()
+        .unwrap_or(&empty);
+    if amendments.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(amendments.len());
+    for a in amendments {
+        if let Some(hex_str) = a.as_str() {
+            if let Ok(bytes) = hex::decode(hex_str) {
+                if bytes.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&bytes);
+                    out.push(arr);
                 }
             }
         }
-        return out;
     }
-    Vec::new()
+    Some(out)
 }
 
 /// Result of an RpcProvider read with disambiguated miss reasons.
