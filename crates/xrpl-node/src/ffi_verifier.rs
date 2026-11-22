@@ -151,6 +151,13 @@ impl FfiVerifier {
         });
     }
 
+    /// The amendment set ledger `ledger_seq` is applied under. `snapshot` is the pre-ledger state the caller
+    /// verifies on (the parent ledger's), when it has one.
+    pub fn ledger_amendments(&self, ledger_seq: u32, _snapshot: Option<&OwnedSnapshot>) -> Vec<[u8; 32]> {
+        self.maybe_refresh_amendments(ledger_seq);
+        self.amendments.read().clone()
+    }
+
     /// Apply and verify every tx in a ledger, in `TransactionIndex` order,
     /// against mainnet's recorded TER via libxrpl. Blocking — call from a
     /// spawn_blocking task or a dedicated thread. Each diverged result is
@@ -170,8 +177,7 @@ impl FfiVerifier {
         expected_mutations: Option<&std::collections::HashMap<String, Vec<(String, u8)>>>,
         batch_parents: Option<&std::collections::HashMap<String, String>>,
     ) -> LedgerOverlay {
-        self.maybe_refresh_amendments(ledger_seq);
-        let amendments = self.amendments.read().clone();
+        let amendments = self.ledger_amendments(ledger_seq, None);
         apply_ledger_in_order_with_net(
             &self.stats,
             sorted_tx_blobs,
@@ -212,8 +218,7 @@ impl FfiVerifier {
         expected_mutations: Option<&std::collections::HashMap<String, Vec<(String, u8)>>>,
         batch_parents: Option<&std::collections::HashMap<String, String>>,
     ) -> LedgerOverlay {
-        self.maybe_refresh_amendments(ledger_seq);
-        let amendments = self.amendments.read().clone();
+        let amendments = self.ledger_amendments(ledger_seq, snapshot);
         apply_ledger_in_order_with_net(
             &self.stats,
             sorted_tx_blobs,
@@ -321,5 +326,80 @@ impl FfiVerifier {
     /// avoid cloning each time, e.g. Prometheus render).
     pub fn shared_stats(&self) -> SharedFfiStats {
         Arc::clone(&self.stats)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AMENDMENTS_KEY: &str = "7DB0788C020F02780A673DC74757F23823FA3014C1866E72CC4CD8B226CD6EF4";
+
+    fn id(byte: u8) -> [u8; 32] {
+        [byte; 32]
+    }
+
+    /// Write an Amendments object with this enabled list into the state, as ws-sync does with the network's bytes.
+    fn put_amendments(db: &rocksdb::DB, enabled: &[[u8; 32]]) {
+        let ids: Vec<String> = enabled.iter().map(hex::encode_upper).collect();
+        let sle = serde_json::json!({"LedgerEntryType": "Amendments", "Flags": 0, "Amendments": ids});
+        db.put(hex::decode(AMENDMENTS_KEY).unwrap(), crate::meta_check::encode(&sle).unwrap()).unwrap();
+    }
+
+    /// A verifier that started with `startup` as its amendment set. Its RPC endpoint answers nothing.
+    fn verifier(db: &Arc<rocksdb::DB>, startup: &[[u8; 32]]) -> FfiVerifier {
+        FfiVerifier::with_amendments(vec!["http://127.0.0.1:1".into()], startup.to_vec(), Some(db.clone()))
+    }
+
+    /// rippled builds a ledger under its PARENT's rules (`rules_(prevLedger.rules_)`, Ledger.cpp:259): the ledger
+    /// that carries the EnableAmendment pseudo-transaction runs under the old set to its last transaction, and
+    /// the very next ledger under the new one. The native leg freezes its rules that way (ba74cb9); the libxrpl
+    /// leg gets its Rules from the list the verifier hands the shim, one list per ledger, so the verifier must
+    /// read that list from the pre-ledger state it verifies on, for every ledger and not only for flag ledgers.
+    #[test]
+    fn a_ledger_is_verified_under_its_parents_amendments() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(rocksdb::DB::open_default(dir.path()).unwrap());
+        let (old, new) = (vec![id(0xAA), id(0xBB)], vec![id(0xAA), id(0xBB), id(0xCC)]);
+        // An amendment is enabled in the ledger after a flag ledger.
+        let activation = 256 * 400_000 + 1;
+
+        put_amendments(&db, &old);
+        let v = verifier(&db, &old);
+        let before_activation = OwnedSnapshot::new(db.clone());
+        // The activation ledger's writes land (its EnableAmendment rewrote the Amendments object).
+        put_amendments(&db, &new);
+        let after_activation = OwnedSnapshot::new(db.clone());
+
+        assert_eq!(
+            v.ledger_amendments(activation, Some(&before_activation)),
+            old,
+            "the activation ledger itself runs under its parent's set, whatever the state holds by now"
+        );
+        assert_eq!(
+            v.ledger_amendments(activation + 1, Some(&after_activation)),
+            new,
+            "the ledger after the activation runs under the new set (it is not a flag ledger: the next one is 255 away)"
+        );
+        assert_eq!(
+            v.ledger_amendments(activation, Some(&before_activation)),
+            old,
+            "a ledger re-driven on its own pre-state still gets its parent's set, not the last one seen"
+        );
+    }
+
+    /// A pre-state with no readable Amendments object must not empty the rules (every amendment-gated
+    /// transaction would diverge): the last set known stays in force.
+    #[test]
+    fn a_pre_state_without_an_amendments_object_keeps_the_last_known_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(rocksdb::DB::open_default(dir.path()).unwrap());
+        let known = vec![id(0xAA), id(0xBB)];
+        let v = verifier(&db, &known);
+        let empty_state = OwnedSnapshot::new(db.clone());
+        assert_eq!(v.ledger_amendments(256 * 400_000 + 2, Some(&empty_state)), known);
+        db.put(hex::decode(AMENDMENTS_KEY).unwrap(), b"not an object").unwrap();
+        let garbled = OwnedSnapshot::new(db.clone());
+        assert_eq!(v.ledger_amendments(256 * 400_000 + 3, Some(&garbled)), known);
     }
 }
