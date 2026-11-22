@@ -957,6 +957,21 @@ mod claim_tests {
             assert!(r.is_claimed(), "{:?} must claim", r);
         }
     }
+
+    /// Campaign 28: tecINVARIANT_FAILED was the one tec code still missing
+    /// from the list (every `=> "tec…"` arm of `code_str` was checked against
+    /// it). rippled claims the fee and consumes the sequence for it like for
+    /// any tec — `isTecClaim` (TER.h:683) is a range test — whether an
+    /// invariant checker set it (Transactor.cpp:1638-1645) or the payment
+    /// engine threw it (BookStep.cpp:920, fixAMMOverflowOffer: "AMM pool
+    /// product invariant failed"). Unclaimed, the transaction wrote nothing:
+    /// no fee, the sequence left in place.
+    #[test]
+    fn tec_invariant_failed_is_claimed() {
+        assert_eq!(TxResult::InvariantFailed.code_str(), "tecINVARIANT_FAILED");
+        assert!(TxResult::InvariantFailed.is_claimed(), "a tec claims the fee and consumes the sequence");
+        assert!(!TxResult::InvariantFailed.is_success());
+    }
 }
 
 #[cfg(test)]

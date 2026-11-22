@@ -2716,6 +2716,8 @@ mod tests {
         assert_eq!(r, TxResult::InvariantFailed, "3.4.1: paid, then refused by ValidMPTTransfer");
         assert!(sb.exists(&broker), "a tec keeps the broker");
         assert_eq!(holds(&sb, &OWNER, &HeldAsset::Mpt(id)).mantissa, 900, "and the cover where it was");
+        assert_eq!(xrp_of(&sb, &OWNER), xrp_of(&Sandbox::new(&st), &OWNER) - FEE, "the fee is claimed");
+        assert_eq!(root_of(&sb, &OWNER)["Sequence"], json!(6), "and the sequence consumed");
         // An authorized owner is paid.
         let (st, broker, id) = build(&MAINNET_WITH_LENDING, mpt::LSF_MPT_AUTHORIZED, auth_required);
         let (r, sb) = apply(&st, &broker_delete(OWNER, &broker));
