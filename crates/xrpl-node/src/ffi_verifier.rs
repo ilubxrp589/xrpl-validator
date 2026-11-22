@@ -11,8 +11,9 @@
 //!
 //! - One `FfiVerifier` instance per validator process, cloned via `Arc` into
 //!   each sync task.
-//! - Holds the active mainnet amendments (fetched once at startup) and a
-//!   shared `FfiStats` snapshot exposed on `/api/status`.
+//! - Reads each ledger's amendment set from its parent's Amendments object
+//!   (`ledger_amendments`; the set loaded at startup is only the fallback) and
+//!   holds a shared `FfiStats` snapshot exposed on `/api/status`.
 //! - `verify_ledger(...)` takes a pre-ordered list of tx blobs plus the
 //!   ledger header fields and delegates to `ffi_engine::apply_ledger_in_order`.
 //! - Every diverged result is recorded to `logs/divergences.jsonl` via
@@ -35,7 +36,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use crate::ffi_engine::{
-    apply_ledger_in_order_with_net, fetch_mainnet_amendments, new_stats,
+    amendments_in_object, amendments_object_key, apply_ledger_in_order_with_net, fetch_amendments_at, fetch_mainnet_amendments, new_stats,
     DivergenceLog, FfiStats, LedgerOverlay, NetParams, OwnedSnapshot, SharedFfiStats,
 };
 
@@ -45,11 +46,9 @@ pub struct FfiVerifier {
     rpc_urls: Vec<String>,
     /// Independence Step 4: with peers as the ledger source, the amendments come from our own state, not RPC.
     state_db: Option<Arc<rocksdb::DB>>,
-    /// Active mainnet amendments. Behind a lock so the flag-ledger refresh
-    /// (reaudit F6/va-07) can swap in a new set mid-run without blocking readers.
-    amendments: Arc<parking_lot::RwLock<Vec<[u8; 32]>>>,
-    /// True while a background amendment refresh is in flight (coalesces refreshes).
-    refresh_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    /// The amendment set last read from a parent ledger's Amendments object (at start: the one loaded then). Each
+    /// ledger reads its own (`ledger_amendments`); this is what a ledger falls back to when its read yields nothing.
+    amendments: parking_lot::RwLock<Vec<[u8; 32]>>,
     divergence_log: Arc<DivergenceLog>,
     /// Separate log for `tec*`/`tesSUCCESS` divergences — cases the main
     /// `divergence_log` skips because libxrpl returned a "claimed" or
@@ -74,8 +73,8 @@ impl FfiVerifier {
         Self::with_amendments(rpc_urls, amendments, None)
     }
 
-    /// Independence Step 4 (`XRPL_LEDGER_SOURCE=peers`): the active amendments from our own state.rocks, now and at
-    /// each flag ledger. No RPC.
+    /// Independence Step 4 (`XRPL_LEDGER_SOURCE=peers`): the active amendments from our own state.rocks, now and for
+    /// every ledger. No RPC.
     pub fn from_state(rpc_urls: Vec<String>, db: Arc<rocksdb::DB>) -> Self {
         let amendments = crate::ffi_engine::amendments_from_state(&db);
         tracing::info!(count = amendments.len(), "ffi_verifier: loaded active amendments from our own state");
@@ -93,69 +92,61 @@ impl FfiVerifier {
             stats: new_stats(),
             rpc_urls,
             state_db,
-            amendments: Arc::new(parking_lot::RwLock::new(amendments)),
-            refresh_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            amendments: parking_lot::RwLock::new(amendments),
             divergence_log: Arc::new(DivergenceLog::new()),
             silent_divergence_log: Arc::new(DivergenceLog::with_path(silent_path)),
             mutation_divergence_log: Arc::new(DivergenceLog::with_path(mutation_path)),
         }
     }
 
-    /// Reaudit F6/va-07: on each flag ledger, re-fetch the active mainnet amendment
-    /// set in the background and swap it in if it changed. Non-blocking — the fetch
-    /// (which can take ~40s on rippled overload) runs on a dedicated thread so it
-    /// never stalls per-ledger verification; at most one refresh runs at a time.
+    /// The amendment set ledger `ledger_seq` is applied under: the enabled list of its PARENT ledger's Amendments
+    /// object, read for every ledger. rippled builds a ledger under its parent's rules (`rules_(prevLedger.rules_)`,
+    /// Ledger.cpp:259), so the ledger that carries an EnableAmendment runs under the old set throughout and the
+    /// next ledger under the new one; the shim turns this list into libxrpl's `Rules` for the whole ledger.
     ///
-    /// SCOPING: this rescues amendments already compiled into the linked libxrpl
-    /// that reach majority and activate mid-run. Amendments introduced in a newer
-    /// rippled still require the rebuild — runtime IDs cannot supply engine semantics.
-    pub fn maybe_refresh_amendments(&self, ledger_seq: u32) {
-        use std::sync::atomic::Ordering;
-        if !crate::amendments::is_flag_ledger(ledger_seq) {
-            return;
+    /// Where the parent's object is read from:
+    /// - `snapshot`, when the caller verifies on one: it is the pre-ledger state, so its object is the parent's;
+    /// - otherwise our own state as it stands, when peers are the ledger source (no RPC in that mode; the state
+    ///   is not pinned to the parent there, as the rest of that path's reads are not);
+    /// - otherwise `ledger_entry` at `ledger_seq - 1` on the first RPC endpoint (the same ledger the RPC path
+    ///   reads every other object at), three tries.
+    ///
+    /// A source that yields no enabled amendment (object absent or unreadable, RPC failed) leaves the last set
+    /// known in force: an empty Rules would turn every amendment-gated transaction into a divergence.
+    ///
+    /// SCOPING: this covers amendments the linked libxrpl already implements. One introduced by a newer rippled
+    /// still needs the rebuild: an id cannot supply engine semantics.
+    pub fn ledger_amendments(&self, ledger_seq: u32, snapshot: Option<&OwnedSnapshot>) -> Vec<[u8; 32]> {
+        let read = match (snapshot, &self.state_db) {
+            (Some(snap), _) => snap
+                .get(&amendments_object_key())
+                .ok()
+                .flatten()
+                .map(|bytes| amendments_in_object(&bytes))
+                .unwrap_or_default(),
+            (None, Some(db)) => crate::ffi_engine::amendments_from_state(db),
+            (None, None) => fetch_amendments_at(&self.rpc_urls[0], &ledger_seq.saturating_sub(1).to_string(), 3),
+        };
+        if read.is_empty() {
+            eprintln!("[ffi-amendments] #{ledger_seq}: no enabled amendments readable from the parent state — keeping the last known set");
+            return self.amendments.read().clone();
         }
-        // Coalesce: if a refresh is already running, skip this flag ledger.
-        if self.refresh_in_flight.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let amendments = Arc::clone(&self.amendments);
-        let in_flight = Arc::clone(&self.refresh_in_flight);
-        let rpc_url = self.rpc_urls[0].clone();
-        let state_db = self.state_db.clone();
-        std::thread::spawn(move || {
-            let fetched = match state_db {
-                Some(db) => crate::ffi_engine::amendments_from_state(&db),
-                None => fetch_mainnet_amendments(&rpc_url),
-            };
-            if !fetched.is_empty() {
-                let delta = {
-                    let current = amendments.read();
-                    crate::amendments::diff_amendment_sets(&current, &fetched)
-                };
-                if !delta.is_empty() {
-                    eprintln!(
-                        "[ffi-amendments] FLAG LEDGER {ledger_seq}: active set changed — {} added, {} removed (swapping live set)",
-                        delta.added.len(),
-                        delta.removed.len(),
-                    );
-                    for a in &delta.added {
-                        eprintln!("[ffi-amendments]   + {}", hex::encode_upper(a));
-                    }
-                    for a in &delta.removed {
-                        eprintln!("[ffi-amendments]   - {}", hex::encode_upper(a));
-                    }
-                    *amendments.write() = fetched;
-                }
+        let delta = crate::amendments::diff_amendment_sets(&self.amendments.read(), &read);
+        if !delta.is_empty() {
+            eprintln!(
+                "[ffi-amendments] #{ledger_seq}: the parent's enabled set differs from the last one used — {} added, {} removed",
+                delta.added.len(),
+                delta.removed.len(),
+            );
+            for a in &delta.added {
+                eprintln!("[ffi-amendments]   + {}", hex::encode_upper(a));
             }
-            in_flight.store(false, Ordering::Release);
-        });
-    }
-
-    /// The amendment set ledger `ledger_seq` is applied under. `snapshot` is the pre-ledger state the caller
-    /// verifies on (the parent ledger's), when it has one.
-    pub fn ledger_amendments(&self, ledger_seq: u32, _snapshot: Option<&OwnedSnapshot>) -> Vec<[u8; 32]> {
-        self.maybe_refresh_amendments(ledger_seq);
-        self.amendments.read().clone()
+            for a in &delta.removed {
+                eprintln!("[ffi-amendments]   - {}", hex::encode_upper(a));
+            }
+            *self.amendments.write() = read.clone();
+        }
+        read
     }
 
     /// Apply and verify every tx in a ledger, in `TransactionIndex` order,

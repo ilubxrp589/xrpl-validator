@@ -55,9 +55,18 @@ impl<'a> SleProvider for RocksDbProvider<'a> {
 /// The enabled amendments in our own state (the Amendments object in state.rocks), for the FFI leg when peers are
 /// the ledger source. Empty when the object is absent or will not decode.
 pub fn amendments_from_state(db: &rocksdb::DB) -> Vec<[u8; 32]> {
-    let key = hex::decode("7DB0788C020F02780A673DC74757F23823FA3014C1866E72CC4CD8B226CD6EF4").unwrap_or_default();
-    let Some(bytes) = db.get(&key).ok().flatten() else { return Vec::new() };
-    let Ok(v) = xrpl_core::codec::decode::decode_transaction_binary(&bytes) else { return Vec::new() };
+    let Some(bytes) = db.get(amendments_object_key()).ok().flatten() else { return Vec::new() };
+    amendments_in_object(&bytes)
+}
+
+/// The Amendments singleton's key.
+pub fn amendments_object_key() -> Vec<u8> {
+    hex::decode("7DB0788C020F02780A673DC74757F23823FA3014C1866E72CC4CD8B226CD6EF4").unwrap_or_default()
+}
+
+/// The enabled amendments listed in a serialized Amendments object. Empty when it will not decode.
+pub fn amendments_in_object(bytes: &[u8]) -> Vec<[u8; 32]> {
+    let Ok(v) = xrpl_core::codec::decode::decode_transaction_binary(bytes) else { return Vec::new() };
     v["Amendments"]
         .as_array()
         .map(|a| {
@@ -93,6 +102,11 @@ pub fn fetch_mainnet_amendments(rpc_url: &str) -> Vec<[u8; 32]> {
 /// `fetch_mainnet_amendments` keeps `"validated"` because its production
 /// caller (`ffi_verifier`) really does run at the live tip.
 pub fn fetch_mainnet_amendments_at(rpc_url: &str, ledger_index: &str) -> Vec<[u8; 32]> {
+    fetch_amendments_at(rpc_url, ledger_index, 10)
+}
+
+/// As [`fetch_mainnet_amendments_at`], giving up after `attempts` tries (empty then).
+pub fn fetch_amendments_at(rpc_url: &str, ledger_index: &str, attempts: u32) -> Vec<[u8; 32]> {
     let client = match reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -101,7 +115,7 @@ pub fn fetch_mainnet_amendments_at(rpc_url: &str, ledger_index: &str) -> Vec<[u8
         Err(_) => return Vec::new(),
     };
     let mut backoff_ms: u64 = 250;
-    for attempt in 0..10 {
+    for attempt in 0..attempts {
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
             backoff_ms = (backoff_ms * 2).min(8000);
