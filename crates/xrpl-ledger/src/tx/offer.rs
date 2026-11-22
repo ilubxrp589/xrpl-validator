@@ -4011,7 +4011,7 @@ fn cross_bridged(
                 if pin.0 == 0 || pout.0 == 0 {
                     return lin;
                 }
-                crate::tx::amm_swap::swap_asset_out(pin, pout, pays_out, am.tfee, xrp_leg.xrp)
+                crate::tx::amm_swap::swap_asset_out(pin, pout, pays_out, am.tfee, xrp_leg.xrp, pays_leg.xrp)
                     .filter(|v| v.0 != 0)
                     .unwrap_or(lin)
             }
@@ -4038,7 +4038,7 @@ fn cross_bridged(
                 if pin.0 == 0 || pout.0 == 0 {
                     return lin;
                 }
-                match crate::tx::amm_swap::swap_asset_out(pin, pout, xrp, am.tfee, gets_leg.xrp) {
+                match crate::tx::amm_swap::swap_asset_out(pin, pout, xrp, am.tfee, gets_leg.xrp, xrp_leg.xrp) {
                     Some(v) if v.0 != 0 => v,
                     _ => lin,
                 }

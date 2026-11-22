@@ -273,7 +273,7 @@ impl AmmOffer {
         if self.multi_path {
             return super::offer_stream::ceil_out_strict(self.quality, amt_in, amt_out, limit, round_up);
         }
-        let inp = amm_swap::swap_asset_out(me(self.balances_in), me(self.balances_out), me(limit), self.tfee, self.asset_in.is_xrp())
+        let inp = amm_swap::swap_asset_out(me(self.balances_in), me(self.balances_out), me(limit), self.tfee, self.asset_in.is_xrp(), self.asset_out.is_xrp())
             .map(|m| either(self.asset_in.is_xrp(), m))
             .unwrap_or(amt_in);
         (inp, limit)

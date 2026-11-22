@@ -1077,9 +1077,19 @@ pub(crate) fn swap_asset_in(pool_in: Me, pool_out: Me, asset_in: Me, tfee: u16, 
 
 /// swapAssetOut (fixAMMv1_1): `in` required to take `asset_out` from the
 /// pool. None when the request would drain the pool.
-pub(crate) fn swap_asset_out(pool_in: Me, pool_out: Me, asset_out: Me, tfee: u16, in_xrp: bool) -> Option<Me> {
+///
+/// `pool.out - assetOut` is a difference of two AMOUNTS (`TOut - TOut`,
+/// AMMHelpers.h:555-556), not of two Numbers: for an IOU it is
+/// `IOUAmount::operator-=`, which is `IOUAmount{Number{a} + Number{-b}}`
+/// (IOUAmount.cpp:70-84, :127-131) — the difference rounded to an amount's
+/// sixteen digits under the Downward mode in force. At the Small scale the
+/// Number already has sixteen; at Large330 its nineteen are cut here, before
+/// the division. (`ratio - pool.in` and the other steps mix a Number in and
+/// stay Numbers.) XRP amounts subtract as integers.
+pub(crate) fn swap_asset_out(pool_in: Me, pool_out: Me, asset_out: Me, tfee: u16, in_xrp: bool, out_xrp: bool) -> Option<Me> {
     let num = n_mul(pool_in, pool_out, Rnd::Up);
     let den = n_sub(pool_out, asset_out, Rnd::Down);
+    let den = if out_xrp { den } else { to_amount_ambient(den, false, Rnd::Down, Rnd::Down) };
     if den.0 == 0 {
         return None;
     }
@@ -1310,7 +1320,7 @@ fn anchored_offer_generate(
             if o.0 == 0 || n_cmp(o, pool_out) != Ordering::Less {
                 return Anchored::Empty;
             }
-            match swap_asset_out(pool_in, pool_out, o, tfee, in_xrp) {
+            match swap_asset_out(pool_in, pool_out, o, tfee, in_xrp, out_xrp) {
                 Some(i) if i.0 != 0 => Anchored::Offer(i, o),
                 _ => Anchored::Empty,
             }
@@ -1568,7 +1578,7 @@ pub(crate) fn anchored_offer_quality(
         if out.0 == 0 || n_cmp(out, pool_out) != Ordering::Less {
             return None;
         }
-        swap_asset_out(pool_in, pool_out, out, amm.tfee, gets_leg.xrp)
+        swap_asset_out(pool_in, pool_out, out, amm.tfee, gets_leg.xrp, pays_leg.xrp)
             .map(|i| (i, out))
             .filter(|(i, o)| rate_of(*i, *o) < clob)
     })?;
@@ -1925,7 +1935,7 @@ pub(crate) fn fib_slice(
         if s_out.0 == 0 || n_cmp(s_out, pool_out) != Ordering::Less {
             return None;
         }
-        match swap_asset_out(pool_in, pool_out, s_out, amm.tfee, gets_leg.xrp) {
+        match swap_asset_out(pool_in, pool_out, s_out, amm.tfee, gets_leg.xrp, pays_leg.xrp) {
             Some(i) => s_in = i,
             None => return None,
         }
@@ -2085,7 +2095,7 @@ pub(crate) fn max_offer_amounts(
     if out.0 == 0 || n_cmp(out, pool_out) != Ordering::Less {
         return None;
     }
-    let inp = swap_asset_out(pool_in, pool_out, out, tfee, in_xrp)?;
+    let inp = swap_asset_out(pool_in, pool_out, out, tfee, in_xrp, out_xrp)?;
     (inp.0 > 0).then_some((inp, out))
 }
 
@@ -2385,7 +2395,7 @@ pub(crate) fn consume(
         if out.0 == 0 || n_cmp(out, pool_out) != Ordering::Less {
             return None;
         }
-        swap_asset_out(pool_in, pool_out, out, amm.tfee, gets_leg.xrp).map(|i| (i, out))
+        swap_asset_out(pool_in, pool_out, out, amm.tfee, gets_leg.xrp, pays_leg.xrp).map(|i| (i, out))
     };
     set_pool_offer_at_tip(false);
     let offer = if limit_anchor && threshold != u64::MAX {
@@ -2399,7 +2409,7 @@ pub(crate) fn consume(
             if out.0 == 0 || n_cmp(out, pool_out) != Ordering::Less {
                 return None;
             }
-            swap_asset_out(pool_in, pool_out, out, amm.tfee, gets_leg.xrp).map(|i| (i, out))
+            swap_asset_out(pool_in, pool_out, out, amm.tfee, gets_leg.xrp, pays_leg.xrp).map(|i| (i, out))
         })()
     } else if let Some(qb) = clob {
         anchored_or(pool_in, pool_out, gets_leg.xrp, pays_leg.xrp, qb, amm.tfee, || {
@@ -2431,7 +2441,7 @@ pub(crate) fn consume(
     let mut deliver_cap: Option<Me> = None;
     if !sell && n_cmp(take_out, rem_pays) == Ordering::Greater {
         take_out = rem_pays;
-        match swap_asset_out(pool_in, pool_out, take_out, amm.tfee, gets_leg.xrp) {
+        match swap_asset_out(pool_in, pool_out, take_out, amm.tfee, gets_leg.xrp, pays_leg.xrp) {
             Some(i) => take_in = i,
             None => {
                 // Finding 341: the pool took the iteration (getOffer created
@@ -2544,7 +2554,7 @@ pub(crate) fn consume(
         // `rem_pays` is the downstream reverse need, rippled's cached out.
         let sell_crossing = sell && threshold != u64::MAX;
         if n_cmp(take_out, rem_pays) == Ordering::Greater && !sell_crossing {
-            if let Some(in_req) = swap_asset_out(pool_in, pool_out, rem_pays, amm.tfee, gets_leg.xrp) {
+            if let Some(in_req) = swap_asset_out(pool_in, pool_out, rem_pays, amm.tfee, gets_leg.xrp, pays_leg.xrp) {
                 if n_cmp(ox::gross_in(in_gross_rate, in_req), ox::gross_in(in_gross_rate, take_in)) == Ordering::Equal {
                     if std::env::var("DX_AMM").is_ok() {
                         eprintln!("DX_AMM F210 fwd re-anchored to the cached out {rem_pays:?} (swap gave {take_out:?})");
@@ -2627,7 +2637,7 @@ pub(crate) fn consume(
         if out_amt.0 == 0 {
             return (rem_pays, rem_gets, false);
         }
-        let Some(in_req) = swap_asset_out(pool_in, pool_out, out_amt, amm.tfee, gets_leg.xrp) else {
+        let Some(in_req) = swap_asset_out(pool_in, pool_out, out_amt, amm.tfee, gets_leg.xrp, pays_leg.xrp) else {
             return (rem_pays, rem_gets, false);
         };
         take_in = in_req;
@@ -3062,7 +3072,7 @@ mod tests {
         let pool_out = (241_780_980u128, 0);
         let inp = me("27.1356091373919");
         let out = swap_asset_in(pool_in, pool_out, inp, 0, true);
-        let back = swap_asset_out(pool_in, pool_out, out, 0, false).unwrap();
+        let back = swap_asset_out(pool_in, pool_out, out, 0, false, false).unwrap();
         assert!(n_cmp(back, inp) != Ordering::Greater);
     }
 
@@ -3153,7 +3163,7 @@ mod large330_tests {
     #[test]
     fn swap_asset_out_subtracts_the_out_amounts_as_amounts() {
         let _scale = ScaleGuard::new(MantissaScale::Large330);
-        let inp = swap_asset_out((171_788_520_463_883, -11), (2_406_851_082_715_967, -14), (5_956_956_429_722_000, -18), 1000, false);
+        let inp = swap_asset_out((171_788_520_463_883, -11), (2_406_851_082_715_967, -14), (5_956_956_429_722_000, -18), 1000, false, false);
         assert_eq!(inp.map(n_norm_pub), Some((4_295_776_216_216_354, -16)));
     }
 
