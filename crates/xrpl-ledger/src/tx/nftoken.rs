@@ -1051,19 +1051,6 @@ fn delete_offer(sandbox: &mut Sandbox, offer: &OfferSle) {
     decrement_owner_count(&offer.owner, sandbox);
 }
 
-/// `n/d` rounded half-even — Number's to_nearest with the FULL remainder in
-/// the tie (multiply semantics; contrast `div_nearest_16`'s small-scale
-/// divide, which discards it).
-fn div_half_even(n: u128, d: u128) -> u128 {
-    let q = n / d;
-    let r = n % d;
-    match (r * 2).cmp(&d) {
-        std::cmp::Ordering::Greater => q + 1,
-        std::cmp::Ordering::Less => q,
-        std::cmp::Ordering::Equal => q + (q & 1),
-    }
-}
-
 /// The NFT transfer-fee cut of an XRP price, rippled's arithmetic exactly:
 /// `multiply(amount, nft::transferFeeAsRate(fee))` (NFTokenAcceptOffer.cpp
 /// :420/:540) runs the Number pipeline — asAmount(rate) is NON-native, so
@@ -1078,52 +1065,22 @@ fn div_half_even(n: u128, d: u128) -> u128 {
 /// roots, invisible to the probe's key-set compare, cascading the replay's
 /// account_hash from ledger 241 of the window on.
 fn nft_royalty_drops(drops: u64, fee_units: u128) -> u128 {
-    if fee_units == 0 {
+    if fee_units == 0 || drops == 0 {
         return 0;
     }
-    let p = drops as u128 * fee_units; // exact: ≤ 1e17 × 5e4
-    // Stage 1: Number multiply rounds the product mantissa to 16 significant
-    // digits half-even; the shed power of ten stays as exponent.
-    let mut k = 0u32;
-    let mut t = p;
-    while t >= 10_000_000_000_000_000 {
-        t /= 10;
-        k += 1;
-    }
-    let (mut m, mut k) = if k > 0 { (div_half_even(p, 10u128.pow(k)), k) } else { (p, 0) };
-    if m >= 10_000_000_000_000_000 {
-        m /= 10; // rounding carried to 1e16 exactly — one exact shift
-        k += 1;
-    }
-    // Stage 2: value = m·10^k / 10^5 to integer drops, half-even.
-    if k >= 5 {
-        m * 10u128.pow(k - 5)
-    } else {
-        div_half_even(m, 10u128.pow(5 - k))
-    }
+    // `offer::st_multiply` with an XRP result: the two half-even roundings above at the Small scale; at Large330
+    // the product keeps nineteen digits and only the conversion to whole drops rounds.
+    crate::tx::offer::st_multiply((drops as u128, 0), (fee_units, -5), true).0
 }
 
-/// The NFT transfer-fee cut of an IOU price.
-// Same rippled call as the XRP flavor — multiply(amount, rate), the
-// Number pipeline: ONE half-even reduction of the FULL product to 16
-// significant digits; the /100000 is exponent arithmetic, exact.
-// me_muldiv(…, false) truncated instead — invisible on the exact
-// #106047462 HADA specimen (950000×2500/100000 has no remainder).
+/// The NFT transfer-fee cut of an IOU price: `multiply(amount, nft::transferFeeAsRate(fee))`
+/// (NFTokenAcceptOffer.cpp:422, :541), i.e. STAmount `multiply` = `Number{v1} * Number{v2}` then
+/// `STAmount{asset, r}` (STAmount.cpp:1304-1305) with the rate fee/100000 — `offer::st_multiply`, which carries
+/// both scales: one half-even reduction of the product to sixteen digits at Small (the /100000 is exponent
+/// arithmetic; #106047462 HADA, 950000 × 2500), the product at nineteen digits and then the amount's sixteen at
+/// Large330.
 fn nft_royalty_iou(seller_side: crate::tx::offer::Me, fee_units: u128) -> crate::tx::offer::Me {
-    let (m, e) = seller_side;
-    let p = m * fee_units; // ≤ 1e16 × 5e4, exact
-    let mut t = p;
-    let mut k = 0i32;
-    while t >= 10_000_000_000_000_000 {
-        t /= 10;
-        k += 1;
-    }
-    let mut m2 = if k > 0 { div_half_even(p, 10u128.pow(k as u32)) } else { p };
-    if m2 >= 10_000_000_000_000_000 {
-        m2 /= 10; // rounding carried to exactly 1e16 — exact shift
-        k += 1;
-    }
-    crate::tx::offer::norm16((m2, e + k - 5))
+    crate::tx::offer::st_multiply(seller_side, (fee_units, -5), false)
 }
 
 #[cfg(test)]
