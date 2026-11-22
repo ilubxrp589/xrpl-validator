@@ -14,7 +14,7 @@
 //!    without an Amendments object gets one;
 //! 2. libxrpl applies the transaction on that state (`tapNONE` and the real signature; a bundle marked
 //!    `"unsigned": true`, a mutant whose transaction was edited, runs under `tapDRY_RUN` with its signature fields
-//!    removed);
+//!    removed; so does a `_fuzz_` vector, whose transaction was built by the fuzzer and never signed);
 //! 3. our engine applies it on the same bytes;
 //! 4. result code, the set of created / modified / deleted objects and every object's bytes are compared.
 //!
@@ -175,8 +175,8 @@ fn set_rules(pre: &mut BTreeMap<Key, Vec<u8>>, large: bool) -> Result<(), String
 
 /// The transaction's bytes and the ApplyFlags it runs under. A signed transaction must hash to the id the bundle
 /// records; an `"unsigned": true` bundle loses its signature fields, takes the id of what is left and runs dry.
-fn tx_of(bundle: &mut Value) -> Result<(Vec<u8>, u32), String> {
-    let unsigned = bundle["unsigned"].as_bool().unwrap_or(false);
+fn tx_of(name: &str, bundle: &mut Value) -> Result<(Vec<u8>, u32), String> {
+    let unsigned = bundle["unsigned"].as_bool().unwrap_or(false) || name.contains("_fuzz_");
     let want = bundle["tx"]["hash"].as_str().unwrap_or_default().to_uppercase();
     let tx = bundle["tx"].as_object_mut().ok_or("no tx")?;
     for k in ["hash", "ctid", "date", "inLedger", "ledger_index", "validated", "meta", "metaData"] {
@@ -396,7 +396,7 @@ fn run_scale(name: &str, bundle: &Value, large: bool) -> Result<Row, String> {
     let mut bundle = bundle.clone();
     let mut pre = pre_of(&bundle);
     set_rules(&mut pre, large)?;
-    let (tx_bytes, flags) = tx_of(&mut bundle)?;
+    let (tx_bytes, flags) = tx_of(name, &mut bundle)?;
     let ledger = ledger_of(&bundle);
     let (lib_ter, lib_fatal, lib, lib_misses) = libxrpl_leg(&ledger, &pre, &tx_bytes, flags, network_id(name, &bundle))?;
     let (our_ter, ours, our_misses) = our_leg(&ledger, &pre, &bundle["tx"])?;
