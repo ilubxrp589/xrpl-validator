@@ -3209,14 +3209,18 @@ impl Transactor for AMMVoteTransactor {
 
 /// rippled `checkAMMPrecisionLoss(poolProductMean, newLPTokenBalance)` (AMMHelpers.cpp:437-450): whether the pool's
 /// geometric mean falls short of the LP token balance by more than the invariant's relative tolerance.
+///
+/// The strong check passes a mean at or above the balance. The weak one is `withinRelativeDistance(mean,
+/// Number{lpt}, kAMMInvariantRelativeTolerance)` = `((max - min) / max) < dist` (AMMHelpers.h:160-166), max being
+/// the LP balance here: a Number subtraction, a Number DIVISION and a strict less-than, so a shortfall of exactly
+/// 1e-11 of the balance is a loss.
 fn amm_precision_lost(mean: crate::tx::offer::Me, new_lpt: crate::tx::offer::Me) -> bool {
-    use crate::tx::amm_swap::{n_cmp, n_mul, n_sub, Rnd};
+    use crate::tx::amm_swap::{n_cmp, n_div, n_sub, Rnd};
     if new_lpt.0 == 0 || n_cmp(mean, new_lpt) != std::cmp::Ordering::Less {
         return false;
     }
-    let short = n_sub(new_lpt, mean, Rnd::Near);
-    let tol = n_mul(new_lpt, (1, -11), Rnd::Near);
-    n_cmp(short, tol) == std::cmp::Ordering::Greater
+    let relative = n_div(n_sub(new_lpt, mean, Rnd::Near), new_lpt, Rnd::Near);
+    n_cmp(relative, (1, -11)) != std::cmp::Ordering::Less
 }
 
 #[cfg(test)]
