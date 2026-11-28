@@ -835,6 +835,28 @@ impl Transactor for EscrowFinishTransactor {
         TxResult::Success
     }
 
+    /// fixCleanup3_5_0 (3.5.0-rc1 EscrowFinish.cpp:137-153,
+    /// `preflightSigValidated`): with both fields present, a pair that fails
+    /// `checkCondition` is temMALFORMED when the Condition itself does not
+    /// deserialize — only a parsed condition reaches doApply's
+    /// tecCRYPTOCONDITION_ERROR (:331). A condition that fails to parse
+    /// always fails the check, so the parse alone decides.
+    fn preflight_in(&self, tx: &TxFields, rules: &Sandbox) -> TxResult {
+        let basic = self.preflight(tx);
+        if basic != TxResult::Success {
+            return basic;
+        }
+        if crate::ledger::amendments::fix_cleanup_3_5_0(rules) {
+            if let (Some(c), Some(_)) = (tx.fields.get("Condition"), tx.fields.get("Fulfillment")) {
+                let parsed = c.as_str().and_then(|h| hex::decode(h).ok()).and_then(|b| parse_preimage_condition(&b));
+                if parsed.is_none() {
+                    return TxResult::Malformed;
+                }
+            }
+        }
+        TxResult::Success
+    }
+
     /// val-074: State validation — escrow must exist.
     fn preclaim(&self, tx: &TxFields, sandbox: &Sandbox) -> TxResult {
         // Finding 349 (devnet #5488110 32C544D4, an EscrowFinish naming a
@@ -2272,4 +2294,6 @@ mod tests {
         let (r, _) = run_tx(&state, &EscrowFinishTransactor, &finish(finisher));
         assert_eq!(r, TxResult::Success, "a preauthorized finisher may");
     }
+
+    mod cleanup350;
 }
