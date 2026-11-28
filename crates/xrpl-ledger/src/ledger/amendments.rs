@@ -143,8 +143,16 @@ pub fn fix_cleanup_3_4_0(sandbox: &Sandbox) -> bool {
 /// for it; and in the loan transactors (`tx::loan`): LoanSet's out-of-range value fields refused
 /// tecPRECISION_LOSS instead of thrown. It also stands in — our choice, not a gate of rippled's —
 /// for "this ledger is made by 3.5.x servers" in LoanPay's fund-conservation balances
-/// (`tx::loan::ConservationModel`), which 3.5.0 changed without an amendment. Nothing else of
-/// 3.5.0 is ported.
+/// (`tx::loan::ConservationModel`), which 3.5.0 changed without an amendment. Ported on branch
+/// port-3.5.0: the direct MPT Payment between holders with a transfer fee (`tx::mpt`, integer
+/// cost / partial delivery, Payment.cpp:722-749) and accountSend / accountSendMulti's MPT fee
+/// (`tx::holding`, addTransferFee, TokenHelpers.cpp:1363-1373, :1485-1500); EscrowFinish's
+/// undeserializable Condition (temMALFORMED, EscrowFinish.cpp:137-153) and the MPT escrow fee's
+/// Number divRound (STAmount.cpp:1670-1685, reached while fixCleanup3_4_0 is off); Quality's
+/// ceil_out keeping an out-of-range XRP product as the offer's in (Quality.cpp:88-127,
+/// `flow::offer_stream`). Unported: the XRPAmount / MPTAmount operator overflow throws
+/// (XRPAmount.cpp, MPTAmount.cpp — no reachable sum found), SponsorshipTransfer (Sponsor is
+/// unported), the invariant changes (no invariant layer).
 pub const FIX_CLEANUP_3_5_0: &str =
     "7300E10109D19BF1E87ACE63D3A79CD4ED6B9851C37D93ED94DE9BD41CF56835";
 

@@ -43,6 +43,11 @@ pub const ENGINE_KNOWN: &[&str] = &[
     "fixTakerDryOfferRemoval", "fixTokenEscrowV1", "fixTrustLinesToSelf", "fixUniversalNumber",
     // Not yet enabled on mainnet; ported.
     "fixCleanup3_4_0",
+    // rippled 3.5.0 (unknown to 3.4.1); ported on branch port-3.5.0 (the vault, loan-broker and loan sites, the
+    // direct MPT payment's fee, EscrowFinish's malformed condition, Quality's ceil_out, the MPT divRound; the
+    // unported parts — invariants, Sponsor, the XRPAmount / MPTAmount operator throws — are listed in xrpl-ledger
+    // amendments.rs). Known to the guard is not a yes vote: `validation` decides that.
+    "fixCleanup3_5_0",
     // Not yet enabled on mainnet; ported on branch port/vault (the six Vault transactors, the LoanBroker and
     // Loan families, the Number scale and the existing-transaction gates; xrpl-ledger tx/vault.rs,
     // tx/loan_broker.rs, tx/loan.rs). Known to the guard is not a yes vote: `validation` decides that.
@@ -247,6 +252,21 @@ mod tests {
         let r = assess(1, &sle);
         assert_eq!((r.enabled, r.status()), (99, "ok"), "{r:?}");
         assert!(r.unknown_enabled.is_empty() && r.majority_unknown.is_empty(), "{r:?}");
+    }
+
+    /// fixCleanup3_5_0 (rippled 3.5.0) is ported: enabled it is no alarm, with a majority no warning, and the
+    /// guard's name is the ID the engine gates on. It is not voted for.
+    #[test]
+    fn fixcleanup350_is_known_and_not_voted_for() {
+        use xrpl_ledger::ledger::amendments::FIX_CLEANUP_3_5_0;
+        assert_eq!(amendment_id("fixCleanup3_5_0"), FIX_CLEANUP_3_5_0);
+        let mut sle = live();
+        sle["Majorities"].as_array_mut().unwrap().push(json!({"Majority": {"Amendment": FIX_CLEANUP_3_5_0, "CloseTime": 1}}));
+        assert_eq!(assess(1, &sle).status(), "ok");
+        sle["Amendments"].as_array_mut().unwrap().push(json!(FIX_CLEANUP_3_5_0));
+        let r = assess(1, &sle);
+        assert_eq!((r.enabled, r.status()), (98, "ok"), "{r:?}");
+        assert!(!crate::validation::SUPPORTED_AMENDMENT_NAMES.contains(&"fixCleanup3_5_0"));
     }
 
     #[test]
