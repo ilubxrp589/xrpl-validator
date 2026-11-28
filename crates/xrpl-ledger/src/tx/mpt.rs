@@ -742,22 +742,57 @@ pub fn apply_mpt_payment(
     // the sender is debited `multiply(amountDeliver, rate)` recomputed in
     // accountSend — which may exceed SendMax (3-19). We floored all three and
     // debited `required`.
-    let Some(mut required) = mpt_multiply_rate(value, rate) else { return TxResult::PathPartial };
+    //
+    // 3.4.1 Payment.cpp:720, :729: either one THROWS where its result does
+    // not fit — a cost past int64 (`STAmount{asset, Number}`'s
+    // `operator rep()`), a divide whose `muldiv` passes 64 bits — and the
+    // throw is tefEXCEPTION (applySteps.cpp:485-488), nothing applied. We
+    // answered tecPATH_PARTIAL (3.5.0-rc1 MPToken_test.cpp:7918-8059 pins
+    // both without fixCleanup3_5_0).
+    //
+    // fixCleanup3_5_0 (3.5.0-rc1 Payment.cpp:722-749): integer arithmetic.
+    // The cost is `tryMulRatio(dstAmount, rate, QUALITY_ONE, roundUp)` — one
+    // past int64 exceeds any SendMax — and a partial delivery
+    // `mulRatio(SendMax, QUALITY_ONE, rate, roundDown)`; one of zero is
+    // tecPATH_PARTIAL. The debit is accountSend's `addTransferFee` below.
+    let fix_cleanup_3_5_0 = crate::ledger::amendments::fix_cleanup_3_5_0(sandbox);
     let mut deliver = value;
-    if partial && required > max_source {
-        required = max_source;
-        let Some(d) = mpt_divide_rate(max_source, rate) else { return TxResult::PathPartial };
-        deliver = d;
-    }
+    let exceeds_send_max = if fix_cleanup_3_5_0 {
+        let required = mpt_mul_ratio(value, rate, 1_000_000_000, true);
+        let mut exceeds = required.is_none_or(|r| max_source < r);
+        if partial && exceeds {
+            // A rate is at least parity, so this never passes int64.
+            let Some(delivered) = mpt_mul_ratio(max_source, 1_000_000_000, rate, false) else { return TxResult::TefException };
+            if delivered == 0 {
+                return TxResult::PathPartial;
+            }
+            deliver = delivered;
+            exceeds = false;
+        }
+        exceeds
+    } else {
+        let Some(mut required) = mpt_multiply_rate(value, rate) else { return TxResult::TefException };
+        if partial && required > max_source {
+            required = max_source;
+            let Some(d) = mpt_divide_rate(max_source, rate) else { return TxResult::TefException };
+            deliver = d;
+        }
+        required > max_source
+    };
     let deliver_min = tx.fields.get("DeliverMin").and_then(parse_mpt_amount).map(|(_, v)| v);
-    if required > max_source || deliver_min.is_some_and(|m| deliver < m) {
+    if exceeds_send_max || deliver_min.is_some_and(|m| deliver < m) {
         return TxResult::PathPartial;
     }
 
     // accountSend → directSendNoLimitMPT: issuer-adjacent moves are one leg
     // (with the V1 mint cap); holder→holder transits via the issuer bridge —
-    // issuer→receiver the delivery, sender→issuer the cost.
-    let res = if tx.account == issuer || *dest == issuer {
+    // issuer→receiver the delivery, sender→issuer the cost. Nothing to send
+    // is tesSUCCESS with nothing touched (accountSendMPT, 3.4.1
+    // TokenHelpers.cpp:1503-1504): 3.4.1's divide can deliver zero when its
+    // `muldiv(…) + 5` wraps past 2^64.
+    let res = if deliver == 0 {
+        TxResult::Success
+    } else if tx.account == issuer || *dest == issuer {
         if tx.account == issuer {
             let max = issuance
                 .get("MaximumAmount")
@@ -774,7 +809,13 @@ pub fn apply_mpt_payment(
         if leg != TxResult::Success {
             leg
         } else {
-            let Some(debit) = mpt_multiply_rate(deliver, rate) else { return TxResult::PathPartial };
+            // accountSend's own cost (directSendNoLimitMPT): 3.4.1's
+            // `multiply(saAmount, rate)` (TokenHelpers.cpp:1347), whose
+            // throw is tefEXCEPTION too; under fixCleanup3_5_0
+            // `addTransferFee(saAmount, rate)`, rounded up (3.5.0-rc1
+            // TokenHelpers.cpp:1363-1373, :555-561) — at most SendMax here.
+            let debit = if fix_cleanup_3_5_0 { mpt_mul_ratio(deliver, rate, 1_000_000_000, true) } else { mpt_multiply_rate(deliver, rate) };
+            let Some(debit) = debit else { return TxResult::TefException };
             direct_send_no_fee(sandbox, &issuance_key, &tx.account, &issuer, debit)
         }
     };
@@ -846,12 +887,32 @@ pub(crate) fn mpt_multiply_rate(v: u64, rate: u64) -> Option<u64> {
     u64::try_from(p).ok()
 }
 
+/// rippled `mulRatio(MPTAmount, num, den, roundUp)` (3.5.0-rc1
+/// MPTAmount.h:154-176) for a non-negative amount: `v · num / den` exact in
+/// 128 bits, rounded up or down. `None` past int64 — the `std::overflow_error`
+/// that `tryMulRatio` (:178-189) turns into `std::nullopt`.
+pub(crate) fn mpt_mul_ratio(v: u64, num: u64, den: u64, round_up: bool) -> Option<u64> {
+    let product = v as u128 * num as u128;
+    let mut r = product / den as u128;
+    if round_up && !product.is_multiple_of(den as u128) {
+        r += 1;
+    }
+    (r <= i64::MAX as u128).then_some(r as u64)
+}
+
 /// rippled `divide(STAmount mpt, Rate)` (Rate2.cpp → STAmount.cpp divide):
 /// the integral numerator scaled up to >= 1e15, `muldiv(num, 1e17, den) + 5`
 /// at offset `num − den − 17`, canonicalised through
 /// `MPTAmount{Number{…, Unchecked}}` — operator rep, to nearest.
+///
+/// 3.4.1 STAmount.cpp:1226-1269 in 64 bits: `muldiv` throws past
+/// `UINT64_MAX` (:1194-1198), and the `+ 5` is uint64 arithmetic, so a
+/// quotient within five of `UINT64_MAX` wraps to a mantissa of 0..4 — zero
+/// once canonicalised (3.5.0-rc1 MPToken_test.cpp:7899-7966). Off Number's
+/// Small scale the STAmount constructor also throws on a mantissa past
+/// int64 (STAmount.h:359-370). `None` is every throw.
 pub(crate) fn mpt_divide_rate(v: u64, rate: u64) -> Option<u64> {
-    use crate::tx::number::{Number, Rounding::ToNearest};
+    use crate::tx::number::{mantissa_scale, MantissaScale, Number, Rounding::ToNearest};
     if rate == 1_000_000_000 || v == 0 {
         return Some(v);
     }
@@ -861,8 +922,15 @@ pub(crate) fn mpt_divide_rate(v: u64, rate: u64) -> Option<u64> {
         no -= 1;
     }
     let (dv, doff) = rate_as_iou(rate);
-    let q = nv.checked_mul(100_000_000_000_000_000)? / dv + 5;
-    let r = Number::rep_from_raw(false, q, no - doff - 17, ToNearest).ok()?;
+    let quotient = nv * 100_000_000_000_000_000 / dv;
+    if quotient > u64::MAX as u128 {
+        return None;
+    }
+    let q = (quotient as u64).wrapping_add(5);
+    if mantissa_scale() != MantissaScale::Small && q > i64::MAX as u64 {
+        return None;
+    }
+    let r = Number::rep_from_raw(false, q as u128, no - doff - 17, ToNearest).ok()?;
     u64::try_from(r).ok()
 }
 
@@ -2296,3 +2364,6 @@ mod vault_gate_tests {
         assert_eq!(pf(&on, json!({"MPTokenIssuanceID": id, "Flags": 0, "DomainID": "6D".repeat(32)})), TxResult::Success, "a domain changes something");
     }
 }
+
+#[cfg(test)]
+mod payment_fee_tests;
