@@ -820,12 +820,19 @@ fn send_mpt(sandbox: &mut Sandbox, from: &[u8; 20], to: &[u8; 20], mptid: &[u8; 
         }
         return mpt::direct_send_no_fee(sandbox, &issuance_key, from, to, value);
     }
+    // The cost (directSendNoLimitMPT): 3.4.1's `multiply(saAmount, rate)`
+    // (TokenHelpers.cpp:1345-1347), to nearest; under fixCleanup3_5_0
+    // `addTransferFee(saAmount, rate)` (3.5.0-rc1 TokenHelpers.cpp:1363-1373,
+    // :555-561), exact and rounded up. Either one past int64 throws:
+    // tefEXCEPTION.
     let actual = if waive_fee {
         value
     } else {
-        match mpt::mpt_multiply_rate(value, mpt::issuance_transfer_rate(&issuance)) {
+        let rate = mpt::issuance_transfer_rate(&issuance);
+        let cost = if amendments::fix_cleanup_3_5_0(sandbox) { mpt::mpt_mul_ratio(value, rate, PARITY_RATE, true) } else { mpt::mpt_multiply_rate(value, rate) };
+        match cost {
             Some(actual) => actual,
-            None => return TxResult::TecInternal,
+            None => return TxResult::TefException,
         }
     };
     let delivered = mpt::direct_send_no_fee(sandbox, &issuance_key, &issuer, to, value);
@@ -948,6 +955,7 @@ pub fn account_send_multi(
             let maximum = issuance.get("MaximumAmount").map(|_| mpt::dec_field(&issuance, "MaximumAmount")).unwrap_or(mpt::MAX_MPT_AMOUNT);
             let outstanding = mpt::dec_field(&issuance, "OutstandingAmount");
             let aggregate_cap = enabled(sandbox, amendments::FIX_CLEANUP_3_1_3);
+            let fix_cleanup_3_5_0 = amendments::fix_cleanup_3_5_0(sandbox);
             let rate = mpt::issuance_transfer_rate(&issuance);
             let (mut total_sent, mut actual, mut take): (u64, u64, u64) = (0, 0, 0);
             for (receiver, value) in receivers {
@@ -979,13 +987,14 @@ pub fn account_send_multi(
                     actual = sum;
                     continue;
                 }
+                // 3.4.1 `multiply(amount, rate)` (TokenHelpers.cpp:1458-1460);
+                // fixCleanup3_5_0 `addTransferFee` (3.5.0-rc1 :1485-1500). Past
+                // int64 either throws.
                 let actual_send = if waive_fee {
                     send
                 } else {
-                    match mpt::mpt_multiply_rate(send, rate) {
-                        Some(with_fee) => with_fee,
-                        None => return Ok(TxResult::TecInternal),
-                    }
+                    let cost = if fix_cleanup_3_5_0 { mpt::mpt_mul_ratio(send, rate, PARITY_RATE, true) } else { mpt::mpt_multiply_rate(send, rate) };
+                    cost.ok_or(crate::flow::st_amount::StError::Overflow)?
                 };
                 let Some(sum) = actual.checked_add(actual_send) else { return Ok(TxResult::TecInternal) };
                 actual = sum;
@@ -2731,4 +2740,6 @@ mod tests {
         assert!(!is_representable(&USD, n(1, 97)));
         assert!(is_representable(&USD, n(1, -200)), "an IOU underflow is zero, not a throw");
     }
+
+    mod transfer_fee_350;
 }
