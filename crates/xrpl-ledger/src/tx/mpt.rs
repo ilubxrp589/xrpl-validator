@@ -934,6 +934,25 @@ pub(crate) fn mpt_divide_rate(v: u64, rate: u64) -> Option<u64> {
     u64::try_from(r).ok()
 }
 
+/// rippled `divideRound(mpt, Rate, asset, roundUp = true)` on the Number
+/// path (3.5.0-rc1 STAmount.cpp:1670-1685, taken with an MPT operand under
+/// MPTokensV2 or fixCleanup3_5_0): `Number{amount} / Number{rate}` under
+/// `NumberRoundModeGuard(Upward)` — both operands normalised and the quotient
+/// rounded upward at the thread's scale — then `roundNumberResult`
+/// (:1479-1513) materialises the MPT amount at Upward too (`operator rep()`).
+/// Parity returns the amount (Rate2.cpp:94-95).
+pub(crate) fn mpt_divide_round_up_number(v: u64, rate: u64) -> Option<u64> {
+    use crate::tx::number::{Number, Rounding::Upward};
+    if rate == 1_000_000_000 || v == 0 {
+        return Some(v);
+    }
+    let (rm, re) = rate_as_iou(rate);
+    let n = Number::from_parts(false, v as u128, 0, Upward).ok()?;
+    let d = Number::from_parts(false, rm, re, Upward).ok()?;
+    let q = n.div(d, Upward).ok()?.to_drops(Upward).ok()?;
+    u64::try_from(q).ok()
+}
+
 /// rippled `divideRound(mpt, Rate, asset, roundUp = true)` on the LEGACY
 /// path (divRoundImpl without MPTokensV2): `muldivRound` rounding up, then
 /// `canonicalizeRound` for an integral asset — cut to one decimal and add 9

@@ -637,6 +637,11 @@ fn mpt_unlock_plan(
         // Amendments singleton, as fixCleanup3_3_0 does.
         if crate::ledger::amendments::fix_cleanup_3_4_0(sandbox) {
             ((want as u128 * 1_000_000_000u128) / locked as u128) as u64
+        } else if crate::ledger::amendments::fix_cleanup_3_5_0(sandbox) {
+            // 3.5.0-rc1 STAmount.cpp:1670-1685: divRound with an MPT operand
+            // takes the Number path under fixCleanup3_5_0 (as under
+            // MPTokensV2) — the quotient at Upward, materialised at Upward.
+            crate::tx::mpt::mpt_divide_round_up_number(want, locked).unwrap_or(want)
         } else {
             // Finding 371 (campaign 18 6-12 / 6-14): divideRound's legacy
             // canonicalizeRound, not a ceiling — 73 @1.25% delivers 72, and

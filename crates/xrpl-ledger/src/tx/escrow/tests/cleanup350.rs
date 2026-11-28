@@ -8,6 +8,11 @@
 //! no fee. Before it, preflight passes and doApply answers
 //! tecCRYPTOCONDITION_ERROR (EscrowFinish.cpp:331), claiming the fee.
 //! Escrow_test.cpp:943-950, :1047-1053 and :1102-1135 pin all three shapes.
+//!
+//! The MPT fee — divRound with an MPT operand runs on `Number` under
+//! fixCleanup3_5_0 as under MPTokensV2 (3.5.0-rc1 STAmount.cpp:1670-1685),
+//! which reaches an MPT escrow's transfer fee while fixCleanup3_4_0 is off
+//! (EscrowHelpers.h:549-553, `divideRound(amount, lockedRate, asset, up)`).
 use super::*;
 use crate::ledger::amendments as am;
 use sha2::{Digest, Sha256};
@@ -107,5 +112,52 @@ fn a_well_formed_condition_still_fails_in_do_apply_under_fixcleanup350() {
     let tx = finish(&condition(), &fulfillment());
     for fix in [false, true] {
         assert_eq!(apply(&escrow_state(fix), &tx).0, TxResult::Success, "fix {fix}");
+    }
+}
+
+/// 73 units escrowed at a 1.25% fee. The legacy divRound's
+/// canonicalizeRound delivers 72 (finding 371); Number's quotient,
+/// 72.0987…, rounded up delivers 73 — no fee. fixCleanup3_4_0's floor
+/// (EscrowHelpers.h:540-548) is 72 whatever fixCleanup3_5_0 says.
+#[test]
+fn an_mpt_escrow_fee_divides_on_number_under_fixcleanup350() {
+    let issuer = [0x0Au8; 20];
+    let holder = [0x0Bu8; 20];
+    let dest = [0x0Cu8; 20];
+    let mut state = make_state();
+    add_account(&mut state, &issuer, 100_000_000, 5);
+    add_account(&mut state, &holder, 100_000_000, 3);
+    add_account(&mut state, &dest, 100_000_000, 9);
+    let id = mpt_fixture(&mut state, &issuer, &holder, &dest, Some(1_250));
+    let ikey = keylet::mpt_issuance_key(&id);
+    let create = TxFields {
+        account: holder, tx_type: "EscrowCreate".into(), fee: 12, sequence: 3, last_ledger_seq: None, ticket_seq: None,
+        fields: serde_json::json!({
+            "Amount": {"mpt_issuance_id": hex::encode_upper(id), "value": "73"},
+            "Destination": hex::encode(dest), "FinishAfter": 15,
+        }),
+        inner_batch: false,
+    };
+    let (r, sb) = run_tx(&state, &EscrowCreateTransactor, &create);
+    assert_eq!(r, TxResult::Success);
+    let mods = sb.into_modifications();
+    apply_modifications(&mut state, mods).unwrap();
+    state.header.close_time = 20;
+    let finish = TxFields {
+        account: dest, tx_type: "EscrowFinish".into(), fee: 12, sequence: 9, last_ledger_seq: None, ticket_seq: None,
+        fields: serde_json::json!({"Owner": hex::encode(holder), "OfferSequence": 3}),
+        inner_batch: false,
+    };
+    for (rules, delivered) in [
+        (vec![], "72"),
+        (vec![am::FIX_CLEANUP_3_5_0], "73"),
+        (vec![am::FIX_CLEANUP_3_4_0], "72"),
+        (vec![am::FIX_CLEANUP_3_4_0, am::FIX_CLEANUP_3_5_0], "72"),
+    ] {
+        let amendments = serde_json::json!({"LedgerEntryType": "Amendments", "Flags": 0, "Amendments": rules});
+        state.state_map.insert(keylet::amendments_key(), serde_json::to_vec(&amendments).unwrap()).unwrap();
+        let (r, sb) = run_tx(&state, &EscrowFinishTransactor, &finish);
+        assert_eq!(r, TxResult::Success, "{rules:?}");
+        assert_eq!(mpt_json(&sb, &keylet::mptoken_key(&ikey, &dest))["MPTAmount"], delivered, "{rules:?}");
     }
 }
