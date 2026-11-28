@@ -9996,6 +9996,12 @@ impl Transactor for OfferCreateTransactor {
             let asset_of = |l: &Leg| crate::flow::steps::Asset { currency: l.cur, issuer: if l.xrp { None } else { Some(l.issuer) } };
             let amt_of = |l: &Leg, m: Me| if l.xrp { crate::flow::amounts::EitherAmount::Xrp(me_rescale(m, 0, false) as i128) } else { crate::flow::amounts::EitherAmount::Iou(crate::flow::amounts::IouAmount::from_me(false, m)) };
             let r = crate::flow::offer_cross::flow_cross(sandbox, &tx.account, asset_of(&gets_leg), amt_of(&gets_leg, tg0), asset_of(&pays_leg), amt_of(&pays_leg, tp0), flags, domain);
+            // The crossing threw: applyGuts returns flowCross's tecINTERNAL
+            // (3.4.1 OfferCreate.cpp:773, :794-798) — no offer placed, only
+            // the fee kept.
+            if r.ter == TxResult::TecInternal {
+                return TxResult::TecInternal;
+            }
             for k in &r.removed {
                 if !stale.contains(k) {
                     stale.push(*k);

@@ -127,6 +127,11 @@ pub fn flow_cross(sandbox: &mut Sandbox, account: &[u8; 20], asset_in: Asset, ta
     let deliver_j = StAmountJson { asset: asset_out, amount: deliver };
     let send_max_j = StAmountJson { asset: asset_in, amount: send_max };
     let result = flow(&mut ps, &deliver_j, *account, *account, &paths, true, !tf_fill_or_kill, true, offer_crossing, Some(threshold), Some(&send_max_j), domain);
+    // The flow threw: `catch (std::exception)` → `{tecINTERNAL, takerAmount}`
+    // (3.4.1 OfferCreate.cpp:577-581), before any removal below.
+    if result.ter == TxResult::TecInternal {
+        return CrossResult { ter: TxResult::TecInternal, after_in: taker_in, after_out: taker_out, actual_in: EitherAmount::zero(taker_in.is_xrp()), actual_out: EitherAmount::zero(taker_out.is_xrp()), removed: Vec::new() };
+    }
     // `for toRemove in result.removableOffers: offerDelete(psb, …)` — on
     // success the flow already deleted them in its view; on failure they
     // are deleted here, and the caller's kill path re-deletes them after

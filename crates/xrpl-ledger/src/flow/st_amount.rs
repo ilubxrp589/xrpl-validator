@@ -51,10 +51,23 @@ pub struct StAmount {
     pub exponent: i32,
 }
 
+/// What rippled's STAmount arithmetic throws. The C++ type matters where a
+/// caller catches one and not the other (3.5.0-rc1 Quality.cpp:88-113,
+/// `tryMulRound`, catches `std::runtime_error` but rethrows
+/// `std::overflow_error`, which derives from it).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StError {
+    /// `std::runtime_error("division by zero")`.
     DivideByZero,
+    /// `std::overflow_error`: a 128-bit `muldiv` past 64 bits, `Number`'s
+    /// normalisation or `operator rep()`, IOUAmount's exponent, an integral
+    /// mantissa past int64 off the Small scale.
     Overflow,
+    /// A `std::runtime_error` that is not an overflow: an XRP amount outside
+    /// STAmount's range ("Native currency amount out of range",
+    /// STAmount.cpp:836-837 and :862-864; "Native value overflow",
+    /// :1517-1523).
+    OutOfRange,
 }
 
 impl StAmount {
@@ -99,13 +112,13 @@ impl StAmount {
                 return Ok(StAmount::zero(true));
             }
             if exponent > 17 {
-                return Err(StError::Overflow); // "Native currency amount out of range"
+                return Err(StError::OutOfRange); // "Native currency amount out of range"
             }
             // Number(isNegative_, value_, offset_, Unchecked): the raw pair is
             // NOT normalised before operator rep() drops its digits.
             let drops = to_drops_unchecked(negative, mantissa, exponent, mode)?;
             if drops.unsigned_abs() > K_MAX_NATIVE as u128 {
-                return Err(StError::Overflow);
+                return Err(StError::OutOfRange); // the same, past kMaxNativeN
             }
             return Ok(StAmount { native: true, negative: drops < 0, mantissa: drops.unsigned_abs() as u64, exponent: 0 });
         }
@@ -266,7 +279,7 @@ fn mul_round_impl(v1: &StAmount, v2: &StAmount, result_native: bool, round_up: b
     if v1.native && v2.native && result_native {
         let (min_v, max_v) = (v1.mantissa.min(v2.mantissa), v1.mantissa.max(v2.mantissa));
         if min_v > 3_000_000_000 || ((max_v >> 32) * min_v) > 2_095_475_792 {
-            return Err(StError::Overflow); // "Native value overflow"
+            return Err(StError::OutOfRange); // "Native value overflow", a std::runtime_error
         }
         return Ok(StAmount::drops(min_v * max_v));
     }

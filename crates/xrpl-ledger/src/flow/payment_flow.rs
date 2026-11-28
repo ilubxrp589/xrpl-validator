@@ -139,7 +139,14 @@ pub fn flow(
     amm_ctx.borrow_mut().set_multi_path(strands.len() > 1);
     // The flow's own view: a layer over the caller's, applied on success.
     ps.push();
-    let r = flow_strands(ps, &mut strands, deliver.amount, partial_payment, offer_crossing, limit_quality, send_max.map(|s| s.amount), &amm_ctx);
+    // A throw anywhere in the flow is tecINTERNAL, nothing applied and no
+    // offer removed (3.4.1 RippleCalc.cpp:95-103, OfferCreate.cpp:577-581).
+    let guard = super::exception::FlowGuard::enter(crate::ledger::amendments::fix_cleanup_3_5_0(ps.sandbox()));
+    let mut r = flow_strands(ps, &mut strands, deliver.amount, partial_payment, offer_crossing, limit_quality, send_max.map(|s| s.amount), &amm_ctx);
+    if super::exception::thrown() {
+        r = FlowResult { input: EitherAmount::zero(src_issue.is_xrp()), out: EitherAmount::zero(deliver.asset.is_xrp()), removable_offers: Default::default(), ter: TxResult::TecInternal };
+    }
+    drop(guard);
     if r.ter == TxResult::Success {
         ps.apply_to_parent();
     } else {

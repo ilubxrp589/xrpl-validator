@@ -335,13 +335,40 @@ fn un_st(a: StAmount) -> EitherAmount {
     }
 }
 
+/// `ceilOutImpl`'s product (Quality.cpp:88-127): `limit · rate` in the IN
+/// asset. Where the arithmetic throws, 3.4.1 propagates (Quality.cpp:90): the
+/// flow leaves with tecINTERNAL ([`super::exception`]), the offer's own in
+/// standing in until then. 3.5.0-rc1's `tryMulRound` (:88-113) catches only
+/// a `std::runtime_error` that is not a `std::overflow_error`, only for an
+/// XRP in side, and only under fixCleanup3_5_0: an XRP product past
+/// STAmount's range is `amount.in` — what the clamp returns anyway.
+fn ceil_out_product(product: Result<StAmount, super::st_amount::StError>, amt_in: EitherAmount) -> EitherAmount {
+    match product {
+        Ok(p) => un_st(p),
+        Err(super::st_amount::StError::OutOfRange) if amt_in.is_xrp() && super::exception::fix_cleanup_3_5_0() => amt_in,
+        Err(_) => {
+            super::exception::throw();
+            amt_in
+        }
+    }
+}
+
+/// `ceilInImpl`'s quotient (Quality.cpp:60-73): `limit / rate` in the OUT
+/// asset. Never caught, under either rule: a throw leaves the flow.
+fn ceil_in_quotient(quotient: Result<StAmount, super::st_amount::StError>, amt_out: EitherAmount) -> EitherAmount {
+    quotient.map(un_st).unwrap_or_else(|_| {
+        super::exception::throw();
+        amt_out
+    })
+}
+
 /// `Quality::ceil_out_impl<mulRoundStrict>`: when `amount.out > limit`,
 /// `in = mulRoundStrict(limit, rate, in.asset, roundUp)` clamped to the
 /// offer's in, out = limit.
 pub fn ceil_out_strict(quality: Quality, amt_in: EitherAmount, amt_out: EitherAmount, limit: EitherAmount, round_up: bool) -> (EitherAmount, EitherAmount) {
     if amt_out.gt(&limit) {
         let rate = super::st_amount::rate_amount(quality.0);
-        let mut r_in = mul_round_strict(&st(limit), &rate, amt_in.is_xrp(), round_up).map(un_st).unwrap_or(amt_in);
+        let mut r_in = ceil_out_product(mul_round_strict(&st(limit), &rate, amt_in.is_xrp(), round_up), amt_in);
         if r_in.gt(&amt_in) {
             r_in = amt_in;
         }
@@ -354,7 +381,7 @@ pub fn ceil_out_strict(quality: Quality, amt_in: EitherAmount, amt_out: EitherAm
 pub fn ceil_out(quality: Quality, amt_in: EitherAmount, amt_out: EitherAmount, limit: EitherAmount) -> (EitherAmount, EitherAmount) {
     if amt_out.gt(&limit) {
         let rate = super::st_amount::rate_amount(quality.0);
-        let mut r_in = mul_round(&st(limit), &rate, amt_in.is_xrp(), true).map(un_st).unwrap_or(amt_in);
+        let mut r_in = ceil_out_product(mul_round(&st(limit), &rate, amt_in.is_xrp(), true), amt_in);
         if r_in.gt(&amt_in) {
             r_in = amt_in;
         }
@@ -369,7 +396,7 @@ pub fn ceil_out(quality: Quality, amt_in: EitherAmount, amt_out: EitherAmount, l
 pub fn ceil_in(quality: Quality, amt_in: EitherAmount, amt_out: EitherAmount, limit: EitherAmount) -> (EitherAmount, EitherAmount) {
     if amt_in.gt(&limit) {
         let rate = super::st_amount::rate_amount(quality.0);
-        let mut r_out = super::st_amount::div_round(&st(limit), &rate, amt_out.is_xrp(), true).map(un_st).unwrap_or(amt_out);
+        let mut r_out = ceil_in_quotient(super::st_amount::div_round(&st(limit), &rate, amt_out.is_xrp(), true), amt_out);
         if r_out.gt(&amt_out) {
             r_out = amt_out;
         }
@@ -382,7 +409,7 @@ pub fn ceil_in(quality: Quality, amt_in: EitherAmount, amt_out: EitherAmount, li
 pub fn ceil_in_strict(quality: Quality, amt_in: EitherAmount, amt_out: EitherAmount, limit: EitherAmount, round_up: bool) -> (EitherAmount, EitherAmount) {
     if amt_in.gt(&limit) {
         let rate = super::st_amount::rate_amount(quality.0);
-        let mut r_out = super::st_amount::div_round_strict(&st(limit), &rate, amt_out.is_xrp(), round_up).map(un_st).unwrap_or(amt_out);
+        let mut r_out = ceil_in_quotient(super::st_amount::div_round_strict(&st(limit), &rate, amt_out.is_xrp(), round_up), amt_out);
         if r_out.gt(&amt_out) {
             r_out = amt_out;
         }

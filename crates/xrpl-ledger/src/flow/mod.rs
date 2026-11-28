@@ -22,6 +22,7 @@ pub mod amm;
 pub mod amounts;
 pub mod book_step;
 pub mod direct_step;
+pub mod exception;
 pub mod offer_cross;
 pub mod offer_stream;
 pub mod pay_steps;
@@ -33,3 +34,6 @@ pub mod steps;
 pub mod strand_flow;
 pub mod view;
 pub mod xrp_endpoint_step;
+
+#[cfg(test)]
+mod ceil_out_tests;

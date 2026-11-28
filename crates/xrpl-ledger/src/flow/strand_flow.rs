@@ -429,6 +429,15 @@ pub fn flow_strands(
             if std::env::var("XRPL_FLOW_TRACE").is_ok() {
                 eprintln!("FLOW iter {} strand {} -> success={} in={:?} out={:?} inactive={} rm={}", cur_try - 1, si, f.success, f.input, f.out, f.inactive, f.ofrs_to_rm.len());
             }
+            // A step threw (not a FlowException): rippled has left flow()
+            // altogether — nothing of it is kept, not even the offers found
+            // dead (`super::exception`).
+            if super::exception::thrown() {
+                if f.success {
+                    sb.discard();
+                }
+                return FlowResult { input: EitherAmount::zero(in_xrp), out: EitherAmount::zero(out_xrp), removable_offers: OffersToRemove::new(), ter: TxResult::TecInternal };
+            }
             // rm bad offers even if the strand fails
             ofrs_to_rm.extend(f.ofrs_to_rm.iter().copied());
             offers_considered += f.ofrs_used;
